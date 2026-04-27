@@ -1,0 +1,721 @@
+package p2p
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"flexserver/internal/logutil"
+	storage2 "flexserver/service/storage"
+	"flexserver/service/storage/memstore"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/adnl"
+	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
+	"github.com/xssnick/tonutils-go/adnl/keys"
+	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
+	"github.com/xssnick/tonutils-go/adnl/rldp"
+	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/ton"
+)
+
+type dhtBackend interface {
+	Close()
+	FindOverlayNodes(ctx context.Context, overlayKey []byte, continuation ...*dht.Continuation) (*overlay.NodesList, *dht.Continuation, error)
+	FindAddresses(ctx context.Context, key []byte) (*adnladdr.List, ed25519.PublicKey, error)
+	FindValue(ctx context.Context, key *dht.Key, continuation ...*dht.Continuation) (*dht.Value, *dht.Continuation, error)
+	StoreAddress(ctx context.Context, addresses adnladdr.List, ttl time.Duration, ownerKey ed25519.PrivateKey) (storedCount int, idKey []byte, err error)
+	StoreOverlayNodes(ctx context.Context, overlayKey []byte, nodes *overlay.NodesList, ttl time.Duration) (storedCount int, idKey []byte, err error)
+}
+
+var _ dhtBackend = (*dht.Client)(nil)
+
+type Node struct {
+	log         zerolog.Logger
+	cfgPath     string
+	listenAddr  string
+	externalIP  net.IP
+	privKey     ed25519.PrivateKey
+	dhtPrivKey  ed25519.PrivateKey
+	gateway     *adnl.Gateway
+	dhtGateway  *adnl.Gateway
+	dhtServer   *dht.Server
+	dht         dhtBackend
+	pool        *peerPool
+	events      chan BroadcastEvent
+	eventQueue  *unboundedQueue[BroadcastEvent]
+	ingestQueue *unboundedQueue[inboundBroadcastIngest]
+	deduper     *eventDeduper
+	onceStop    sync.Once
+	stopped     chan struct{}
+	wg          sync.WaitGroup
+
+	inboundMx       sync.Mutex
+	inboundStopping bool
+	inboundWG       sync.WaitGroup
+
+	runCtx            context.Context
+	zeroStateFileHash []byte
+	trustedInitBlock  ton.BlockIDExt
+	externalPort      uint16
+	dhtListenAddr     string
+	storage           storage2.Storage
+	peerStorage       storage2.PeerServingStorage
+	rebroadcastQueue  *unboundedQueue[rebroadcastRequest]
+	rebroadcastQuiet  atomic.Bool
+
+	rebroadcastThrottleMu   sync.Mutex
+	rebroadcastThrottleLast map[string]time.Time
+
+	subscriptionsMx sync.RWMutex
+	subscriptions   map[string]*overlaySubscription
+
+	latestBlocksMx          sync.RWMutex
+	latestMasterchain       *ton.BlockIDExt
+	latestBasechain         *ton.BlockIDExt
+	latestMasterchainNotify chan struct{}
+	latestBasechainNotify   chan struct{}
+	stateDownloadDir        string
+	stateDownloadDirOwned   bool
+	statePeerLeasesMx       sync.RWMutex
+	statePeerLeases         map[string]int
+	archivePeerLeasesMx     sync.RWMutex
+	archivePeerLeases       map[string]int
+	stateCellImportSlot     chan struct{}
+}
+
+func New(opts Options) (*Node, error) {
+	logger := logutil.WithComponent(opts.Logger, "p2p")
+	if rldp.MaxFECDataSize < persistentStateChunkAnswerMax {
+		rldp.MaxFECDataSize = persistentStateChunkAnswerMax
+	}
+	rldp.Logger = func(args ...any) {
+		msg := strings.TrimSpace(fmt.Sprintln(args...))
+		if strings.Contains(msg, "received out of order part") ||
+			strings.Contains(msg, "unsupported peer query") {
+			return
+		}
+		if strings.Contains(msg, "error") ||
+			strings.Contains(msg, "failed") ||
+			strings.Contains(msg, "invalid") ||
+			strings.Contains(msg, "too big") {
+			if len(msg) > 2000 {
+				msg = msg[:2000] + "...(truncated)"
+			}
+			logger.Debug().Str("rldp", msg).Msg("rldp diagnostic")
+		}
+	}
+
+	cfgPath := opts.GlobalConfigPath
+	if cfgPath == "" {
+		cfgPath = DefaultGlobalConfigPath
+	}
+
+	priv, err := privateKeyOrGenerate(opts.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("load ADNL key: %w", err)
+	}
+
+	var dhtPriv ed25519.PrivateKey
+	if len(opts.DHTPrivateKey) > 0 {
+		dhtPriv, err = privateKeyOrGenerate(opts.DHTPrivateKey)
+		if err != nil {
+			return nil, fmt.Errorf("load DHT ADNL key: %w", err)
+		}
+	}
+	if opts.DHTListenAddr != "" {
+		if len(dhtPriv) == 0 {
+			dhtPriv, err = privateKeyOrGenerate(nil)
+			if err != nil {
+				return nil, fmt.Errorf("generate DHT ADNL key: %w", err)
+			}
+		}
+	}
+
+	gateway := adnl.NewGateway(priv)
+
+	peerStorage := opts.PeerServingStorage
+	storage := opts.Storage
+	if storage != nil {
+		peerStorage = storage
+	}
+	if peerStorage == nil {
+		mem := memstore.New()
+		storage = mem
+		peerStorage = mem
+	}
+
+	stateDownloadDir, stateDownloadDirOwned, err := prepareStateDownloadDir(opts.StateDownloadDir)
+	if err != nil {
+		return nil, fmt.Errorf("prepare state download dir: %w", err)
+	}
+
+	return &Node{
+		log:                     logger,
+		cfgPath:                 cfgPath,
+		listenAddr:              opts.ListenAddr,
+		externalIP:              append(net.IP(nil), opts.ExternalIP...),
+		externalPort:            opts.ExternalPort,
+		privKey:                 priv,
+		dhtPrivKey:              dhtPriv,
+		gateway:                 gateway,
+		dhtListenAddr:           opts.DHTListenAddr,
+		pool:                    newPeerPool(gateway),
+		events:                  make(chan BroadcastEvent, broadcastEventBuffer),
+		eventQueue:              newUnboundedQueue[BroadcastEvent](),
+		ingestQueue:             newUnboundedQueue[inboundBroadcastIngest](),
+		deduper:                 newEventDeduper(10 * time.Minute),
+		stopped:                 make(chan struct{}),
+		subscriptions:           map[string]*overlaySubscription{},
+		latestMasterchainNotify: make(chan struct{}),
+		latestBasechainNotify:   make(chan struct{}),
+		storage:                 storage,
+		peerStorage:             peerStorage,
+		rebroadcastQueue:        newUnboundedQueue[rebroadcastRequest](),
+		rebroadcastThrottleLast: map[string]time.Time{},
+		stateDownloadDir:        stateDownloadDir,
+		stateDownloadDirOwned:   stateDownloadDirOwned,
+		statePeerLeases:         map[string]int{},
+		archivePeerLeases:       map[string]int{},
+		stateCellImportSlot:     make(chan struct{}, 1),
+	}, nil
+}
+
+func prepareStateDownloadDir(dir string) (string, bool, error) {
+	if strings.TrimSpace(dir) != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", false, err
+		}
+		if err := removeIncompleteStateDownloadFiles(dir); err != nil {
+			return "", false, err
+		}
+		return dir, false, nil
+	}
+
+	dir, err := os.MkdirTemp("", "flexserver-state-downloads-*")
+	return dir, true, err
+}
+
+func privateKeyOrGenerate(key ed25519.PrivateKey) (ed25519.PrivateKey, error) {
+	if len(key) == 0 {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		return priv, nil
+	}
+
+	if len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("expected %d bytes, got %d", ed25519.PrivateKeySize, len(key))
+	}
+
+	return append(ed25519.PrivateKey(nil), key...), nil
+}
+
+func (n *Node) Events() <-chan BroadcastEvent {
+	return n.events
+}
+
+func (n *Node) Start(ctx context.Context) error {
+	cfg, err := liteclient.GetConfigFromFile(n.cfgPath)
+	if err != nil {
+		return fmt.Errorf("load TON config: %w", err)
+	}
+
+	n.runCtx = ctx
+	n.zeroStateFileHash = append([]byte(nil), cfg.Validator.ZeroState.FileHash...)
+	n.trustedInitBlock = ton.BlockIDExt(cfg.Validator.InitBlock)
+
+	specs, err := buildOverlaySpecs(n.zeroStateFileHash)
+	if err != nil {
+		return err
+	}
+	for _, spec := range specs {
+		n.getOrCreateSubscription(spec)
+	}
+
+	n.gateway.SetConnectionHandler(n.handleInboundPeer)
+	if err = n.startGateway(); err != nil {
+		return fmt.Errorf("start ADNL gateway: %w", err)
+	}
+
+	if err = n.startDHT(ctx, cfg); err != nil {
+		_ = n.gateway.Close()
+		return err
+	}
+
+	for _, spec := range specs {
+		sub, _ := n.getOrCreateSubscription(spec)
+		n.runAsync(func() {
+			sub.run(ctx)
+		})
+	}
+	n.runAsync(func() {
+		n.runEventLoop(ctx)
+	})
+	for i := 0; i < inboundIngestWorkerCount; i++ {
+		n.runAsync(func() {
+			n.runInboundIngestLoop(ctx)
+		})
+	}
+	for i := 0; i < rebroadcastWorkerCount; i++ {
+		n.runAsync(func() {
+			n.runRebroadcastLoop(ctx)
+		})
+	}
+	if n.isPublicServer() {
+		n.runAsync(func() {
+			n.runAnnounceLoop(ctx)
+		})
+	}
+
+	go func() {
+		<-ctx.Done()
+		n.stop()
+	}()
+
+	return nil
+}
+
+func (n *Node) runAsync(fn func()) {
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		fn()
+	}()
+}
+
+func (n *Node) Wait() {
+	<-n.stopped
+}
+
+func (n *Node) stop() {
+	n.onceStop.Do(func() {
+		defer close(n.stopped)
+
+		n.stopAcceptingInbound()
+
+		if n.dhtServer != nil {
+			_ = n.dhtServer.Close()
+		}
+		if n.dhtServer == nil && n.dht != nil {
+			n.dht.Close()
+		}
+		if n.dhtGateway != nil {
+			_ = n.dhtGateway.Close()
+		}
+		_ = n.gateway.Close()
+
+		n.eventQueue.Close()
+		n.ingestQueue.Close()
+		n.rebroadcastQueue.Close()
+
+		n.wg.Wait()
+		n.inboundWG.Wait()
+
+		if n.stateDownloadDir != "" && n.stateDownloadDirOwned {
+			_ = os.RemoveAll(n.stateDownloadDir)
+		} else if n.stateDownloadDir != "" {
+			_ = removeIncompleteStateDownloadFiles(n.stateDownloadDir)
+		}
+	})
+}
+
+func (n *Node) stopAcceptingInbound() {
+	n.inboundMx.Lock()
+	n.inboundStopping = true
+	n.inboundMx.Unlock()
+}
+
+func (n *Node) beginInbound() bool {
+	n.inboundMx.Lock()
+	defer n.inboundMx.Unlock()
+
+	if n.inboundStopping {
+		return false
+	}
+	n.inboundWG.Add(1)
+	return true
+}
+
+func (n *Node) finishInbound() {
+	n.inboundWG.Done()
+}
+
+func (n *Node) trackLatestBlock(event BroadcastEvent) {
+	if event.Block.Shard != topShard {
+		return
+	}
+
+	switch event.Block.Workchain {
+	case -1:
+		n.trackLatestMasterchain(event.Block)
+	case 0:
+		n.trackLatestBasechain(event.Block)
+	}
+}
+
+func (n *Node) trackLatestMasterchain(block ton.BlockIDExt) {
+	n.latestBlocksMx.Lock()
+	defer n.latestBlocksMx.Unlock()
+
+	if n.latestMasterchain != nil && n.latestMasterchain.SeqNo >= block.SeqNo {
+		return
+	}
+
+	n.latestMasterchain = &block
+	close(n.latestMasterchainNotify)
+	n.latestMasterchainNotify = make(chan struct{})
+}
+
+func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
+	n.latestBlocksMx.Lock()
+	defer n.latestBlocksMx.Unlock()
+
+	if n.latestBasechain != nil && n.latestBasechain.SeqNo >= block.SeqNo {
+		return
+	}
+
+	n.latestBasechain = &block
+	close(n.latestBasechainNotify)
+	n.latestBasechainNotify = make(chan struct{})
+}
+
+func (n *Node) WaitMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
+	startedAt := time.Now()
+	progressTicker := time.NewTicker(masterchainWaitLogEvery)
+	defer progressTicker.Stop()
+
+	for {
+		n.latestBlocksMx.RLock()
+		current := n.latestMasterchain
+		wait := n.latestMasterchainNotify
+		n.latestBlocksMx.RUnlock()
+
+		if current != nil {
+			return *current, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ton.BlockIDExt{}, ctx.Err()
+		case <-wait:
+		case <-progressTicker.C:
+			n.logMasterchainWaitProgress(startedAt)
+		}
+	}
+}
+
+func (n *Node) WaitBasechainBlock(ctx context.Context) (ton.BlockIDExt, error) {
+	startedAt := time.Now()
+	progressTicker := time.NewTicker(masterchainWaitLogEvery)
+	defer progressTicker.Stop()
+
+	for {
+		n.latestBlocksMx.RLock()
+		current := n.latestBasechain
+		wait := n.latestBasechainNotify
+		n.latestBlocksMx.RUnlock()
+
+		if current != nil {
+			return *current, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ton.BlockIDExt{}, ctx.Err()
+		case <-wait:
+		case <-progressTicker.C:
+			n.logBasechainWaitProgress(startedAt)
+		}
+	}
+}
+
+func (n *Node) logMasterchainWaitProgress(startedAt time.Time) {
+	n.logLatestBlockWaitProgress(startedAt, "masterchain")
+}
+
+func (n *Node) logBasechainWaitProgress(startedAt time.Time) {
+	n.logLatestBlockWaitProgress(startedAt, "basechain")
+}
+
+func (n *Node) logLatestBlockWaitProgress(startedAt time.Time, chain string) {
+	subscriptions := n.subscriptionsSnapshot()
+
+	var knownPeers, alivePeers, activeNeighbours, aliveNeighbours int
+	for _, sub := range subscriptions {
+		status := sub.statusSnapshot()
+		knownPeers += status.KnownPeers
+		alivePeers += status.AliveKnownPeers
+		activeNeighbours += status.ActiveNeighbours
+		aliveNeighbours += status.AliveNeighbours
+	}
+
+	n.log.Info().
+		Dur("elapsed", time.Since(startedAt)).
+		Int("overlays", len(subscriptions)).
+		Int("known_peers", knownPeers).
+		Int("alive_peers", alivePeers).
+		Int("active_neighbours", activeNeighbours).
+		Int("alive_neighbours", aliveNeighbours).
+		Msgf("waiting for latest %s block broadcast", chain)
+}
+
+func (n *Node) TrustedInitBlock() (ton.BlockIDExt, bool) {
+	if n.trustedInitBlock.SeqNo == 0 && n.trustedInitBlock.Workchain == 0 && n.trustedInitBlock.Shard == 0 {
+		return ton.BlockIDExt{}, false
+	}
+	return n.trustedInitBlock, true
+}
+
+func (n *Node) startDHT(ctx context.Context, cfg *liteclient.GlobalConfig) error {
+	if n.dhtListenAddr != "" {
+		return n.startDHTServer(ctx, cfg)
+	}
+	return n.startDHTClient(cfg)
+}
+
+func (n *Node) startDHTClient(cfg *liteclient.GlobalConfig) error {
+	dhtGateway := adnl.NewGateway(n.privKey)
+
+	if err := dhtGateway.StartClient(); err != nil {
+		return fmt.Errorf("start DHT gateway: %w", err)
+	}
+
+	client, err := dht.NewClientFromConfig(dhtGateway, cfg)
+	if err != nil {
+		_ = dhtGateway.Close()
+		return fmt.Errorf("init DHT client: %w", err)
+	}
+
+	n.dhtGateway = dhtGateway
+	n.dht = client
+
+	return nil
+}
+
+type peerPool struct {
+	gateway *adnl.Gateway
+	mx      sync.RWMutex
+	peers   map[string]*pooledPeer
+}
+
+type pooledPeer struct {
+	id      string
+	shortID []byte
+	addr    string
+	pub     ed25519.PublicKey
+	adnl    *overlay.ADNLWrapper
+	rldp    *overlay.RLDPWrapper
+}
+
+func newPeerPool(gateway *adnl.Gateway) *peerPool {
+	return &peerPool{
+		gateway: gateway,
+		peers:   map[string]*pooledPeer{},
+	}
+}
+
+func (p *peerPool) Get(addr string, key ed25519.PublicKey) (*pooledPeer, error) {
+	peer, err := p.gateway.RegisterClient(addr, key)
+	if err != nil {
+		return nil, err
+	}
+	pooled, _, err := p.wrap(peer)
+	if err != nil {
+		return nil, err
+	}
+	return pooled, nil
+}
+
+func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
+	peerID := peer.GetID()
+	id := hex.EncodeToString(peerID)
+
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if pooled := p.peers[id]; pooled != nil {
+		return pooled, false, nil
+	}
+
+	wrapper := overlay.CreateExtendedADNL(peer)
+	rldpClient := overlay.CreateExtendedRLDP(rldp.NewClientV2(wrapper))
+
+	pooled := &pooledPeer{
+		id:      id,
+		shortID: append([]byte(nil), peerID...),
+		addr:    peer.RemoteAddr(),
+		pub:     append(ed25519.PublicKey(nil), peer.GetPubKey()...),
+		adnl:    wrapper,
+		rldp:    rldpClient,
+	}
+	rldpClient.SetOnDisconnect(func() {
+		p.mx.Lock()
+		delete(p.peers, id)
+		p.mx.Unlock()
+	})
+	p.peers[id] = pooled
+	return pooled, true, nil
+}
+
+func (p *peerPool) snapshot() []*pooledPeer {
+	p.mx.RLock()
+	defer p.mx.RUnlock()
+
+	list := make([]*pooledPeer, 0, len(p.peers))
+	for _, peer := range p.peers {
+		list = append(list, peer)
+	}
+	return list
+}
+
+type eventDeduper struct {
+	ttl  time.Duration
+	mx   sync.Mutex
+	seen map[string]time.Time
+}
+
+func newEventDeduper(ttl time.Duration) *eventDeduper {
+	return &eventDeduper{
+		ttl:  ttl,
+		seen: map[string]time.Time{},
+	}
+}
+
+func (d *eventDeduper) Mark(key string, now time.Time) bool {
+	d.mx.Lock()
+	defer d.mx.Unlock()
+
+	if when, ok := d.seen[key]; ok && now.Sub(when) < d.ttl {
+		return false
+	}
+	d.seen[key] = now
+
+	if len(d.seen) > 2048 {
+		for k, when := range d.seen {
+			if now.Sub(when) >= d.ttl {
+				delete(d.seen, k)
+			}
+		}
+	}
+
+	return true
+}
+
+func buildOverlaySpecs(zeroStateFileHash []byte) ([]overlaySpec, error) {
+	masterSpec, err := buildOverlaySpec(zeroStateFileHash, -1, topShard, "masterchain")
+	if err != nil {
+		return nil, fmt.Errorf("build masterchain overlay: %w", err)
+	}
+	baseSpec, err := buildOverlaySpec(zeroStateFileHash, 0, topShard, "basechain")
+	if err != nil {
+		return nil, fmt.Errorf("build basechain overlay: %w", err)
+	}
+
+	return []overlaySpec{masterSpec, baseSpec}, nil
+}
+
+func buildOverlaySpec(zeroStateFileHash []byte, workchain int32, shard int64, name string) (overlaySpec, error) {
+	fullID, err := tl.Hash(tonnodeapi.ShardPublicOverlayID{
+		Workchain:         workchain,
+		Shard:             shard,
+		ZeroStateFileHash: zeroStateFileHash,
+	})
+	if err != nil {
+		return overlaySpec{}, err
+	}
+
+	shortID, err := tl.Hash(keys.PublicKeyOverlay{Key: fullID})
+	if err != nil {
+		return overlaySpec{}, err
+	}
+
+	protoMajor := int32(shardchainProtoVersionMajor)
+	protoMinor := int32(shardchainProtoVersionMinor)
+	if workchain == -1 {
+		protoMajor = int32(masterchainProtoVersionMajor)
+		protoMinor = int32(masterchainProtoVersionMinor)
+	}
+
+	return overlaySpec{
+		Name:              name,
+		FullID:            fullID,
+		ShortID:           shortID,
+		ProtoVersionMajor: protoMajor,
+		ProtoVersionMinor: protoMinor,
+	}, nil
+}
+
+func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, bool) {
+	key := hex.EncodeToString(spec.ShortID)
+
+	n.subscriptionsMx.Lock()
+	if sub := n.subscriptions[key]; sub != nil {
+		n.subscriptionsMx.Unlock()
+		return sub, false
+	}
+
+	sub := &overlaySubscription{
+		node:         n,
+		spec:         spec,
+		log:          n.log.With().Str("overlay", spec.Name).Logger(),
+		peers:        map[string]*overlayPeer{},
+		archivePeers: map[string]*archivePeerState{},
+	}
+	n.subscriptions[key] = sub
+	n.subscriptionsMx.Unlock()
+
+	n.attachSubscriptionPeers(sub)
+	return sub, true
+}
+
+func (n *Node) subscriptionForBlock(block ton.BlockIDExt) (*overlaySubscription, error) {
+	if n.runCtx == nil || len(n.zeroStateFileHash) == 0 {
+		return nil, errors.New("node is not started")
+	}
+
+	spec, err := buildOverlaySpec(n.zeroStateFileHash, block.Workchain, block.Shard, overlayName(block.Workchain, block.Shard))
+	if err != nil {
+		return nil, fmt.Errorf("build overlay for %s: %w", formatBlockRef(block), err)
+	}
+
+	sub, created := n.getOrCreateSubscription(spec)
+	if created {
+		go sub.run(n.runCtx)
+	}
+	return sub, nil
+}
+
+func overlayName(workchain int32, shard int64) string {
+	switch {
+	case workchain == -1 && shard == topShard:
+		return "masterchain"
+	case workchain == 0 && shard == topShard:
+		return "basechain"
+	default:
+		return fmt.Sprintf("wc=%d shard=%016x", workchain, uint64(shard))
+	}
+}
+
+func (n *Node) subscriptionsSnapshot() []*overlaySubscription {
+	n.subscriptionsMx.RLock()
+	defer n.subscriptionsMx.RUnlock()
+
+	list := make([]*overlaySubscription, 0, len(n.subscriptions))
+	for _, sub := range n.subscriptions {
+		list = append(list, sub)
+	}
+	return list
+}

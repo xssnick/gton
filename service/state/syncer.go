@@ -1,0 +1,420 @@
+package state
+
+import (
+	"context"
+	"errors"
+	"flexserver/service/p2p"
+	storage2 "flexserver/service/storage"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/ton"
+)
+
+const stateSnapshotRetryDelay = time.Second
+
+const shardStateDownloadParallelism = 4
+
+type Syncer struct {
+	source   Source
+	storage  storage2.StateStorage
+	importer *stateImportCoordinator
+	log      zerolog.Logger
+}
+
+func NewSyncer(source Source, storage storage2.StateStorage, logger ...*zerolog.Logger) *Syncer {
+	log := zerolog.Nop()
+	if len(logger) > 0 && logger[0] != nil {
+		log = logger[0].With().Str("component", "state").Logger()
+	}
+
+	return &Syncer{
+		source:   source,
+		storage:  storage,
+		importer: newStateImportCoordinator(log),
+		log:      log,
+	}
+}
+
+func (s *Syncer) SyncCurrent(ctx context.Context) (*storage2.CurrentState, error) {
+	progress, err := s.storage.StateSyncProgress(ctx)
+	switch {
+	case err == nil:
+		master := progress.Masterchain.Block
+		s.log.Info().
+			Str("masterchain", storage2.FormatBlockRef(master)).
+			Int("completed_shards", len(progress.Shards)).
+			Msg("resuming pending state snapshot sync")
+
+		masterState, err := s.storage.BlockState(ctx, master)
+		if err != nil {
+			return nil, fmt.Errorf("load pending masterchain state %s: %w", storage2.FormatBlockRef(master), err)
+		}
+		return s.shardStatesStage(ctx, masterState, progress)
+	case errors.Is(err, storage2.ErrNotFound):
+	default:
+		return nil, fmt.Errorf("load pending state snapshot sync progress: %w", err)
+	}
+
+	masterState, err := s.masterchainStateStage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.shardStatesStage(ctx, masterState, nil)
+}
+
+func (s *Syncer) masterchainStateStage(ctx context.Context) (*storage2.BlockState, error) {
+	latest, err := s.source.LatestMasterchainBlock(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load latest masterchain block: %w", err)
+	}
+
+	master, err := s.source.PersistentMasterchainBlock(ctx, latest)
+	if err != nil {
+		return nil, fmt.Errorf("choose persistent masterchain state before %s: %w", storage2.FormatBlockRef(latest), err)
+	}
+
+	s.log.Info().
+		Str("masterchain", storage2.FormatBlockRef(master)).
+		Msg("downloading selected masterchain state snapshot")
+	if state, ok, err := s.storedBlockState(ctx, master); err != nil {
+		return nil, fmt.Errorf("load stored masterchain state %s: %w", storage2.FormatBlockRef(master), err)
+	} else if ok {
+		s.log.Info().
+			Str("masterchain", storage2.FormatBlockRef(master)).
+			Msg("using stored masterchain state snapshot")
+		return state, nil
+	}
+
+	for {
+		masterState, err := s.downloadBlockState(ctx, master, master, 0)
+		if err == nil {
+			s.log.Info().
+				Str("masterchain", storage2.FormatBlockRef(masterState.Block)).
+				Msg("masterchain state snapshot stage completed")
+			return masterState, nil
+		}
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		if !errors.Is(err, p2p.ErrStateNotAvailable) {
+			return nil, err
+		}
+
+		s.log.Debug().
+			Err(err).
+			Str("masterchain", storage2.FormatBlockRef(master)).
+			Dur("retry_in", stateSnapshotRetryDelay).
+			Msg("masterchain state snapshot is not available, retrying selected masterchain state")
+
+		if err = waitStateSnapshotRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (s *Syncer) SyncMasterchainBlock(ctx context.Context, master ton.BlockIDExt) (*storage2.CurrentState, error) {
+	masterState, err := s.downloadBlockState(ctx, master, master, 0)
+	if err != nil {
+		return nil, fmt.Errorf("download masterchain state %s: %w", storage2.FormatBlockRef(master), err)
+	}
+
+	return s.syncMasterchainState(ctx, masterState)
+}
+
+func (s *Syncer) syncMasterchainState(ctx context.Context, masterState *storage2.BlockState) (*storage2.CurrentState, error) {
+	return s.shardStatesStage(ctx, masterState, nil)
+}
+
+func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.BlockState, progress *storage2.CurrentState) (*storage2.CurrentState, error) {
+	master := masterState.Block
+	if progress != nil && !progress.Masterchain.Block.Equals(&master) {
+		return nil, fmt.Errorf(
+			"pending state sync masterchain mismatch: progress=%s selected=%s",
+			storage2.FormatBlockRef(progress.Masterchain.Block),
+			storage2.FormatBlockRef(master),
+		)
+	}
+
+	next := &storage2.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain:      blockStateWithoutCells(masterState),
+		Shards:           map[storage2.ShardKey]storage2.BlockState{},
+	}
+	if progress != nil {
+		next.SyncedAt = progress.SyncedAt
+	}
+	if err := s.storage.SaveStateSyncProgress(ctx, next); err != nil {
+		return nil, fmt.Errorf("persist pending state sync progress for %s: %w", storage2.FormatBlockRef(master), err)
+	}
+
+	s.log.Info().
+		Str("masterchain", storage2.FormatBlockRef(master)).
+		Msg("loading shard list from masterchain state")
+	shardBlocks, err := ShardBlocksFromMasterState(masterState)
+	if err != nil && (masterState.Parsed == nil || masterState.Parsed.McStateExtra == nil) {
+		shardBlocks, err = s.source.ShardBlocks(ctx, master)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load shard blocks for %s: %w", storage2.FormatBlockRef(master), err)
+	}
+
+	type shardPlan struct {
+		block      ton.BlockIDExt
+		key        storage2.ShardKey
+		splitDepth uint32
+	}
+	plans := make([]shardPlan, 0, len(shardBlocks))
+	planByKey := make(map[storage2.ShardKey]shardPlan, len(shardBlocks))
+	for _, shardBlock := range shardBlocks {
+		splitDepth, err := persistentStateSplitDepth(masterState, shardBlock.Workchain)
+		if err != nil {
+			return nil, fmt.Errorf("load persistent state split depth for %s: %w", storage2.FormatBlockRef(shardBlock), err)
+		}
+		plan := shardPlan{
+			block:      shardBlock,
+			key:        storage2.ShardKeyFromBlock(shardBlock),
+			splitDepth: splitDepth,
+		}
+		plans = append(plans, plan)
+		planByKey[plan.key] = plan
+	}
+
+	if progress != nil {
+		for _, key := range storage2.SortedShardKeys(progress.Shards) {
+			shard := progress.Shards[key]
+			plan, ok := planByKey[key]
+			if !ok || !shard.Block.Equals(&plan.block) {
+				continue
+			}
+
+			stored, err := s.storage.BlockState(ctx, shard.Block)
+			if err != nil {
+				return nil, fmt.Errorf("load pending shard state %s: %w", storage2.FormatBlockRef(shard.Block), err)
+			}
+			next.Shards[key] = blockStateWithoutCells(stored)
+		}
+	}
+
+	masterState.Cell = nil
+	masterState.Parsed = nil
+
+	pendingPlans := make([]shardPlan, 0, len(plans))
+	for _, plan := range plans {
+		if state, ok := next.Shards[plan.key]; ok && state.Block.Equals(&plan.block) {
+			s.log.Info().
+				Str("block", storage2.FormatBlockRef(plan.block)).
+				Str("masterchain", storage2.FormatBlockRef(master)).
+				Msg("shard state already completed in pending sync")
+			continue
+		}
+		pendingPlans = append(pendingPlans, plan)
+	}
+	if err := s.storage.SaveStateSyncProgress(ctx, next); err != nil {
+		return nil, fmt.Errorf("persist pending state sync progress for %s: %w", storage2.FormatBlockRef(master), err)
+	}
+
+	workers := shardStateDownloadParallelism
+	if len(pendingPlans) < workers {
+		workers = len(pendingPlans)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	s.log.Info().
+		Str("masterchain", storage2.FormatBlockRef(master)).
+		Int("shards", len(plans)).
+		Int("pending_shards", len(pendingPlans)).
+		Int("workers", workers).
+		Msg("syncing shard states")
+
+	type shardStateResult struct {
+		state *storage2.BlockState
+		err   error
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan shardStateResult, len(pendingPlans))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+
+	for _, plan := range pendingPlans {
+		plan := plan
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results <- shardStateResult{err: ctx.Err()}
+				return
+			}
+			defer func() { <-sem }()
+
+			s.log.Info().
+				Str("block", storage2.FormatBlockRef(plan.block)).
+				Str("masterchain", storage2.FormatBlockRef(master)).
+				Uint32("split_depth", plan.splitDepth).
+				Msg("syncing shard state")
+
+			shardState, ok, err := s.storedBlockState(ctx, plan.block)
+			if err == nil && ok {
+				s.log.Info().
+					Str("block", storage2.FormatBlockRef(plan.block)).
+					Str("masterchain", storage2.FormatBlockRef(master)).
+					Msg("using stored shard state")
+				results <- shardStateResult{state: shardState}
+				return
+			}
+			if err != nil {
+				err = fmt.Errorf("load stored shard state %s: %w", storage2.FormatBlockRef(plan.block), err)
+			} else {
+				shardState, err = s.downloadShardState(ctx, plan.block, master, plan.splitDepth)
+			}
+			if err != nil && !errors.Is(err, context.Canceled) {
+				cancel()
+			}
+			results <- shardStateResult{state: shardState, err: err}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for res := range results {
+		switch {
+		case res.err == nil:
+			next.Shards[storage2.ShardKeyFromBlock(res.state.Block)] = blockStateWithoutCells(res.state)
+			res.state.Cell = nil
+			res.state.Parsed = nil
+			if err = s.storage.SaveStateSyncProgress(ctx, next); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("persist pending state sync progress for %s: %w", storage2.FormatBlockRef(master), err)
+				cancel()
+			}
+		case errors.Is(res.err, context.Canceled):
+			if firstErr == nil && ctx.Err() != nil {
+				firstErr = ctx.Err()
+			}
+		case firstErr == nil:
+			firstErr = res.err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	next.SyncedAt = time.Now()
+	if err = s.storage.SaveBlockStateAndCurrentState(ctx, &next.Masterchain, next); err != nil {
+		return nil, fmt.Errorf("persist current state: %w", err)
+	}
+	if err = s.storage.ClearStateSyncProgress(ctx); err != nil {
+		return nil, fmt.Errorf("clear pending state sync progress: %w", err)
+	}
+
+	return next, nil
+}
+
+func (s *Syncer) storedBlockState(ctx context.Context, block ton.BlockIDExt) (*storage2.BlockState, bool, error) {
+	state, err := s.storage.BlockState(ctx, block)
+	if err == nil {
+		return state, true, nil
+	}
+	if errors.Is(err, storage2.ErrNotFound) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+func blockStateWithoutCells(state *storage2.BlockState) storage2.BlockState {
+	return storage2.BlockState{
+		Block:         state.Block,
+		StateRootHash: state.StateRootHash,
+		StateCellHash: state.StateCellHash,
+		StateFileHash: state.StateFileHash,
+		CellsCount:    state.CellsCount,
+		DownloadedAt:  state.DownloadedAt,
+	}
+}
+
+func (s *Syncer) downloadShardState(ctx context.Context, shardBlock ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (*storage2.BlockState, error) {
+	for {
+		shardState, err := s.downloadBlockState(ctx, shardBlock, master, splitDepth)
+		if err == nil {
+			return shardState, nil
+		}
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		if !errors.Is(err, p2p.ErrStateNotAvailable) {
+			return nil, err
+		}
+
+		s.log.Debug().
+			Err(err).
+			Str("block", storage2.FormatBlockRef(shardBlock)).
+			Str("masterchain", storage2.FormatBlockRef(master)).
+			Dur("retry_in", stateSnapshotRetryDelay).
+			Msg("shard state snapshot is not available, retrying shard state")
+
+		if err = waitStateSnapshotRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func waitStateSnapshotRetry(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(stateSnapshotRetryDelay):
+		return nil
+	}
+}
+
+func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (*storage2.BlockState, error) {
+	state, err := s.storage.BlockState(ctx, block)
+	if err == nil {
+		s.log.Info().
+			Str("block", storage2.FormatBlockRef(block)).
+			Msg("using stored block state")
+		return state, nil
+	}
+	if !errors.Is(err, storage2.ErrNotFound) {
+		return nil, fmt.Errorf("load block state %s: %w", storage2.FormatBlockRef(block), err)
+	}
+
+	downloaded, err := s.source.DownloadState(ctx, block, master, splitDepth)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cleanupErr := downloaded.Cleanup(); cleanupErr != nil {
+			s.log.Warn().
+				Err(cleanupErr).
+				Str("block", storage2.FormatBlockRef(block)).
+				Msg("failed to cleanup temporary state snapshot")
+		}
+	}()
+
+	s.log.Info().
+		Str("block", storage2.FormatBlockRef(block)).
+		Msg("importing downloaded state snapshot")
+	state, err = s.importer.ImportAndPersist(ctx, downloaded, s.storage)
+	if err != nil {
+		return nil, fmt.Errorf("import block state %s: %w", storage2.FormatBlockRef(block), err)
+	}
+	s.log.Info().
+		Str("block", storage2.FormatBlockRef(block)).
+		Msg("block state persisted")
+	return state, nil
+}
