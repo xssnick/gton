@@ -205,9 +205,9 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case GetPersistentStateSizeV2:
 		return PersistentStateSizeNotFound{}, nil
 	case GetArchiveInfo:
-		return s.serveArchiveInfo(ctx, query.MasterchainSeqno)
+		return s.serveArchiveInfo(ctx, query.MasterchainSeqno, -1, topShard)
 	case GetShardArchiveInfo:
-		return ArchiveNotFound{}, nil
+		return s.serveArchiveInfo(ctx, query.MasterchainSeqno, query.ShardPrefix.Workchain, query.ShardPrefix.Shard)
 	case GetArchiveSlice:
 		return s.serveArchiveSlice(ctx, query.ArchiveID, query.Offset, query.MaxSize)
 	default:
@@ -308,8 +308,8 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 	return TonNodeData{Data: proof}, nil
 }
 
-func (s *overlaySubscription) serveArchiveInfo(ctx context.Context, masterchainSeqno int32) (tl.Serializable, error) {
-	id, err := s.node.peerStorage.ArchiveInfo(ctx, masterchainSeqno)
+func (s *overlaySubscription) serveArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (tl.Serializable, error) {
+	id, err := s.node.peerStorage.ArchiveInfo(ctx, masterchainSeqno, workchain, shard)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return ArchiveNotFound{}, nil
 	}
@@ -320,6 +320,9 @@ func (s *overlaySubscription) serveArchiveInfo(ctx context.Context, masterchainS
 }
 
 func (s *overlaySubscription) serveArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) (tl.Serializable, error) {
+	if maxSize < 0 || maxSize > 1<<24 {
+		return nil, fmt.Errorf("invalid archive slice max_size %d", maxSize)
+	}
 	data, err := s.node.peerStorage.ArchiveSlice(ctx, archiveID, offset, maxSize)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return TonNodeData{}, nil

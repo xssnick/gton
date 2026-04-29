@@ -11,7 +11,15 @@ import (
 
 type StateCellTreeImporter interface {
 	ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error)
+	ImportStateCellTrees(ctx context.Context, trees []StateCellTreeImport) ([]*cell.Cell, error)
 	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error)
+}
+
+type StateCellTreeImport struct {
+	Block       ton.BlockIDExt
+	Root        *cell.Cell
+	ParsedCells []cell.Cell
+	TotalCells  uint64
 }
 
 type StateStorage interface {
@@ -23,6 +31,7 @@ type StateStorage interface {
 	ClearStateSyncProgress(ctx context.Context) error
 	SaveBlockState(ctx context.Context, state *BlockState) error
 	SaveBlockStateAndCurrentState(ctx context.Context, block *BlockState, current *CurrentState) error
+	SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*BlockState, current *CurrentState) error
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
 }
 

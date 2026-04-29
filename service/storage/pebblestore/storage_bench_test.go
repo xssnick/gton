@@ -46,7 +46,10 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for i := 0; i < b.N; i++ {
-			loaded := storage.LazyCellRecord(decodeCellRecordTrusted(hash, encoded))
+			loaded, err := storage.LazyCellRecord(decodeCellRecordTrusted(hash, encoded))
+			if err != nil {
+				b.Fatalf("lazy cell record: %v", err)
+			}
 			if loaded.HashKey() != root.HashKey() {
 				b.Fatalf("lazy cell hash mismatch")
 			}
@@ -56,14 +59,7 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 
 func BenchmarkStateCellEncoder(b *testing.B) {
 	root, _ := benchmarkCellGraph(b, 256, 4)
-	refs := make([]*cell.Cell, int(root.RefsNum()))
-	for i := range refs {
-		ref, err := root.PeekRef(i)
-		if err != nil {
-			b.Fatalf("peek ref %d: %v", i, err)
-		}
-		refs[i] = ref
-	}
+	refs := root.GetMetadata().Refs
 
 	b.Run("cell-record", func(b *testing.B) {
 		b.ReportAllocs()
@@ -160,7 +156,7 @@ func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := store.saveStateCellTree(context.Background(), block, root, parsedCells, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), block, root, parsedCells, uint64(cells), nil, nil); err != nil {
 				b.Fatalf("save parsed state cell tree: %v", err)
 			}
 		}
@@ -176,7 +172,7 @@ func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := store.saveStateCellTree(context.Background(), block, root, nil, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), block, root, nil, uint64(cells), nil, nil); err != nil {
 				b.Fatalf("save dfs state cell tree: %v", err)
 			}
 		}
@@ -199,7 +195,7 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := store.saveStateCellTree(context.Background(), block, root, parsedCells, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), block, root, parsedCells, uint64(cells), nil, nil); err != nil {
 				b.Fatalf("save parsed state cell tree: %v", err)
 			}
 		}
@@ -215,7 +211,7 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if err := store.saveStateCellTree(context.Background(), block, root, nil, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), block, root, nil, uint64(cells), nil, nil); err != nil {
 				b.Fatalf("save dfs state cell tree: %v", err)
 			}
 		}
@@ -245,8 +241,8 @@ func BenchmarkPebbleLoadCell(b *testing.B) {
 			if err != nil {
 				b.Fatalf("load lazy root: %v", err)
 			}
-			if !loaded.IsLazy() || loaded.HashKey() != rootHash {
-				b.Fatalf("lazy root metadata mismatch")
+			if loaded.IsLazy() || loaded.HashKey() != rootHash {
+				b.Fatalf("loaded root metadata mismatch")
 			}
 		}
 	})

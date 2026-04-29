@@ -11,17 +11,17 @@ type PeerServingStorage interface {
 	NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*ServedBlockFull, error)
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	BlockProof(ctx context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error)
-	ArchiveInfo(ctx context.Context, masterchainSeqno int32) (int64, error)
+	ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error)
 	ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error)
 }
 
 type PeerServingStorageWriter interface {
 	SaveBlockFull(block *ServedBlockFull) error
+	SaveArchiveImport(imported *ServedArchiveImport) error
 	LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt)
-	SaveBlockData(block ton.BlockIDExt, data []byte)
-	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte)
-	SaveArchiveInfo(masterchainSeqno int32, archiveID int64)
-	SaveArchiveSlice(archiveID, offset int64, data []byte)
+	SaveBlockData(block ton.BlockIDExt, data []byte, ref *ArtifactRef)
+	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte, ref *ArtifactRef)
+	SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error)
 }
 
 type ServedProofKind string
@@ -34,11 +34,55 @@ const (
 )
 
 type ServedBlockFull struct {
-	ID     ton.BlockIDExt
-	Proof  []byte
-	Block  []byte
-	Meta   *BlockMeta
-	IsLink bool
+	ID       ton.BlockIDExt
+	Proof    []byte
+	Block    []byte
+	ProofRef *ArtifactRef
+	BlockRef *ArtifactRef
+	Meta     *BlockMeta
+	IsLink   bool
+}
+
+type ServedBlockData struct {
+	ID   ton.BlockIDExt
+	Data []byte
+	Ref  *ArtifactRef
+}
+
+type ServedBlockProof struct {
+	Kind ServedProofKind
+	ID   ton.BlockIDExt
+	Data []byte
+	Ref  *ArtifactRef
+}
+
+type ServedBlockLink struct {
+	Prev ton.BlockIDExt
+	Next ton.BlockIDExt
+}
+
+type ServedArchiveImport struct {
+	FullBlocks []*ServedBlockFull
+	BlockData  []ServedBlockData
+	Proofs     []ServedBlockProof
+	Links      []ServedBlockLink
+}
+
+type ArtifactRef struct {
+	Path   string
+	Offset int64
+	Size   int64
+}
+
+func (r *ArtifactRef) Clone() *ArtifactRef {
+	if r == nil {
+		return nil
+	}
+	return &ArtifactRef{
+		Path:   r.Path,
+		Offset: r.Offset,
+		Size:   r.Size,
+	}
 }
 
 func (b *ServedBlockFull) Clone() *ServedBlockFull {
@@ -46,10 +90,12 @@ func (b *ServedBlockFull) Clone() *ServedBlockFull {
 		return nil
 	}
 	return &ServedBlockFull{
-		ID:     b.ID,
-		Proof:  append([]byte(nil), b.Proof...),
-		Block:  append([]byte(nil), b.Block...),
-		Meta:   b.Meta.Clone(),
-		IsLink: b.IsLink,
+		ID:       b.ID,
+		Proof:    append([]byte(nil), b.Proof...),
+		Block:    append([]byte(nil), b.Block...),
+		ProofRef: b.ProofRef.Clone(),
+		BlockRef: b.BlockRef.Clone(),
+		Meta:     b.Meta.Clone(),
+		IsLink:   b.IsLink,
 	}
 }

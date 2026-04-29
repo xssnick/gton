@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"flexserver/service/archive/packfile"
 	"flexserver/service/storage"
 	"flexserver/service/storage/pebblestore"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,8 +35,21 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 		t.Fatalf("save block full: %v", err)
 	}
 	store.LinkNextBlock(prev, block)
-	store.SaveArchiveInfo(int32(block.SeqNo), 777)
-	store.SaveArchiveSlice(777, 0, []byte{0x55, 0x44})
+	archivePath := filepath.Join(t.TempDir(), "archive.pack")
+	archiveFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("create archive pack: %v", err)
+	}
+	archivePtr, err := packfile.Append(archiveFile, "test", []byte{0x55, 0x44}, true)
+	if closeErr := archiveFile.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("write archive pack: %v", err)
+	}
+	if _, err = store.SaveArchiveFile(int32(block.SeqNo), -1, topShard, 777, archivePath); err != nil {
+		t.Fatalf("save archive file: %v", err)
+	}
 
 	got, err := store.BlockFull(ctx, block)
 	if err != nil {
@@ -52,12 +67,19 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected next block: got=%v want=%v", next.ID, block)
 	}
 
-	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo))
+	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo), -1, topShard)
 	if err != nil || archiveID != 777 {
 		t.Fatalf("archive info mismatch: err=%v id=%d", err, archiveID)
 	}
 
-	archive, err := store.ArchiveSlice(ctx, 777, 0, 16)
+	archiveHeader, err := store.ArchiveSlice(ctx, 777, 0, packfile.HeaderSize)
+	var wantMagic [packfile.HeaderSize]byte
+	binary.LittleEndian.PutUint32(wantMagic[:], packfile.PackageMagic)
+	if err != nil || !bytes.Equal(archiveHeader, wantMagic[:]) {
+		t.Fatalf("archive header mismatch: err=%v data=%x", err, archiveHeader)
+	}
+
+	archive, err := store.ArchiveSlice(ctx, 777, archivePtr.Offset, 16)
 	if err != nil || !bytes.Equal(archive, []byte{0x55, 0x44}) {
 		t.Fatalf("archive slice mismatch: err=%v data=%x", err, archive)
 	}
@@ -243,8 +265,8 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy root: %v", err)
 	}
-	if !loaded.IsLazy() {
-		t.Fatalf("expected lazy root")
+	if loaded.IsLazy() {
+		t.Fatalf("loaded root should have body")
 	}
 	if loaded.HashKey() != root.HashKey() || loaded.Depth() != root.Depth() {
 		t.Fatalf("loaded root metadata mismatch")
@@ -325,8 +347,8 @@ func openTestPebbleStorage(t *testing.T) *pebblestore.Store {
 func requireLazyCellBOC(t testing.TB, loaded *cell.Cell, want *cell.Cell) {
 	t.Helper()
 
-	if !loaded.IsLazy() {
-		t.Fatalf("expected lazy loaded cell")
+	if loaded.IsLazy() {
+		t.Fatalf("expected loaded cell body")
 	}
 
 	materialized := materializeLazyCell(t, loaded)

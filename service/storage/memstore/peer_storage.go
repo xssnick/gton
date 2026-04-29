@@ -4,30 +4,33 @@ import (
 	"context"
 	"flexserver/service/storage"
 	"fmt"
+	"os"
 	"sync"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
 
+const archivePackageMasterchainBlocks = 100
+
 type PeerStore struct {
 	mu sync.RWMutex
 
-	blocks        map[string]*storage.ServedBlockFull
-	nextBlocks    map[string]string
-	blockData     map[string][]byte
-	proofs        map[string][]byte
-	archiveInfos  map[int32]int64
-	archiveSlices map[string][]byte
+	blocks       map[string]*storage.ServedBlockFull
+	nextBlocks   map[string]string
+	blockData    map[string][]byte
+	proofs       map[string][]byte
+	archiveInfos map[string]int64
+	archiveFiles map[int64][]byte
 }
 
 func NewPeerStore() *PeerStore {
 	return &PeerStore{
-		blocks:        map[string]*storage.ServedBlockFull{},
-		nextBlocks:    map[string]string{},
-		blockData:     map[string][]byte{},
-		proofs:        map[string][]byte{},
-		archiveInfos:  map[int32]int64{},
-		archiveSlices: map[string][]byte{},
+		blocks:       map[string]*storage.ServedBlockFull{},
+		nextBlocks:   map[string]string{},
+		blockData:    map[string][]byte{},
+		proofs:       map[string][]byte{},
+		archiveInfos: map[string]int64{},
+		archiveFiles: map[int64][]byte{},
 	}
 }
 
@@ -38,7 +41,11 @@ func (s *PeerStore) SaveBlockFull(block *storage.ServedBlockFull) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.saveBlockFullLocked(block)
+	return nil
+}
 
+func (s *PeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
 	cloned := block.Clone()
 	s.blocks[storage.BlockKey(block.ID)] = cloned
 	if len(cloned.Block) > 0 {
@@ -53,6 +60,28 @@ func (s *PeerStore) SaveBlockFull(block *storage.ServedBlockFull) error {
 			s.proofs[s.proofKey(kind, cloned.ID)] = append([]byte(nil), cloned.Proof...)
 		}
 	}
+}
+
+func (s *PeerStore) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
+	if imported == nil {
+		return fmt.Errorf("served archive import is nil")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, full := range imported.FullBlocks {
+		s.saveBlockFullLocked(full)
+	}
+	for _, block := range imported.BlockData {
+		s.blockData[storage.BlockKey(block.ID)] = append([]byte(nil), block.Data...)
+	}
+	for _, proof := range imported.Proofs {
+		s.proofs[s.proofKey(proof.Kind, proof.ID)] = append([]byte(nil), proof.Data...)
+	}
+	for _, link := range imported.Links {
+		s.nextBlocks[storage.BlockKey(link.Prev)] = storage.BlockKey(link.Next)
+	}
 	return nil
 }
 
@@ -62,28 +91,29 @@ func (s *PeerStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) {
 	s.nextBlocks[storage.BlockKey(prev)] = storage.BlockKey(next)
 }
 
-func (s *PeerStore) SaveBlockData(block ton.BlockIDExt, data []byte) {
+func (s *PeerStore) SaveBlockData(block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.blockData[storage.BlockKey(block)] = append([]byte(nil), data...)
 }
 
-func (s *PeerStore) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) {
+func (s *PeerStore) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.proofs[s.proofKey(kind, block)] = append([]byte(nil), data...)
 }
 
-func (s *PeerStore) SaveArchiveInfo(masterchainSeqno int32, archiveID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.archiveInfos[masterchainSeqno] = archiveID
-}
+func (s *PeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
 
-func (s *PeerStore) SaveArchiveSlice(archiveID, offset int64, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.archiveSlices[archiveSliceKey(archiveID, offset)] = append([]byte(nil), data...)
+	s.archiveInfos[archiveInfoKey(masterchainSeqno, workchain, shard)] = archiveID
+	s.archiveFiles[archiveID] = data
+	return path, nil
 }
 
 func (s *PeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
@@ -131,22 +161,41 @@ func (s *PeerStore) BlockProof(_ context.Context, kind storage.ServedProofKind, 
 	return append([]byte(nil), value...), nil
 }
 
-func (s *PeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32) (int64, error) {
+func (s *PeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.archiveInfos[masterchainSeqno]
+	value, ok := s.archiveInfos[archiveInfoKey(masterchainSeqno, workchain, shard)]
+	if !ok {
+		rounded := roundArchiveMasterchainSeqno(masterchainSeqno)
+		if rounded != masterchainSeqno {
+			value, ok = s.archiveInfos[archiveInfoKey(rounded, workchain, shard)]
+		}
+	}
 	if !ok {
 		return 0, storage.ErrNotFound
 	}
 	return value, nil
 }
 
-func (s *PeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64, _ int32) ([]byte, error) {
+func (s *PeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64, maxSize int32) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.archiveSlices[archiveSliceKey(archiveID, offset)]
+	value, ok := s.archiveFiles[archiveID]
 	if !ok {
 		return nil, storage.ErrNotFound
+	}
+	if offset < 0 || maxSize < 0 {
+		return nil, fmt.Errorf("invalid archive range offset=%d max_size=%d", offset, maxSize)
+	}
+	if maxSize == 0 {
+		return []byte{}, nil
+	}
+	if offset >= int64(len(value)) {
+		return nil, nil
+	}
+	value = value[offset:]
+	if len(value) > int(maxSize) {
+		value = value[:maxSize]
 	}
 	return append([]byte(nil), value...), nil
 }
@@ -155,6 +204,13 @@ func (s *PeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt)
 	return string(kind) + ":" + storage.BlockKey(block)
 }
 
-func archiveSliceKey(archiveID, offset int64) string {
-	return fmt.Sprintf("%d:%d", archiveID, offset)
+func archiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) string {
+	return fmt.Sprintf("%d:%d:%016x", masterchainSeqno, workchain, uint64(shard))
+}
+
+func roundArchiveMasterchainSeqno(seqno int32) int32 {
+	if seqno <= 0 {
+		return seqno
+	}
+	return seqno - seqno%archivePackageMasterchainBlocks
 }

@@ -34,9 +34,10 @@ type overlaySubscription struct {
 }
 
 type archivePeerState struct {
-	peer    *overlayPeer
-	speed   float64
-	probeAt time.Time
+	peer        *overlayPeer
+	speed       float64
+	probeAt     time.Time
+	deniedPeers map[string]time.Time
 }
 
 type overlayPeer struct {

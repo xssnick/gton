@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"testing"
 
+	"flexserver/service/archive/packfile"
 	"flexserver/service/storage"
 	"flexserver/service/storage/memstore"
 
@@ -77,6 +79,45 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 	}
 	if !next.ID.Equals(&block11) {
 		t.Fatalf("unexpected next block: got=%s want=%s", storage.FormatBlockRef(next.ID), storage.FormatBlockRef(block11))
+	}
+}
+
+func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
+	store := memstore.New()
+
+	block := testBlockID(0, topShard, 12)
+	path := writeTestPackage(t, []testEntry{
+		{name: testEntryName("block", block), data: []byte{0x12, 0x01}},
+		{name: testEntryName("proof", block), data: []byte{0x12, 0x02}},
+	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read test package: %v", err)
+	}
+
+	imported, err := ImportStream(context.Background(), &Downloaded{
+		MasterchainSeqno: 100,
+		ArchiveID:        778,
+		Shard:            ShardID{Workchain: 0, Shard: topShard},
+	}, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("stream import archive: %v", err)
+	}
+	if len(imported.FullBlocks) != 1 {
+		t.Fatalf("expected one full block, got %d", len(imported.FullBlocks))
+	}
+
+	imported.SetArtifactPath(path)
+	if err = imported.Store(ImportSink{Writer: store}); err != nil {
+		t.Fatalf("store streamed import: %v", err)
+	}
+
+	full, err := store.BlockFull(context.Background(), block)
+	if err != nil {
+		t.Fatalf("load streamed block: %v", err)
+	}
+	if string(full.Block) != string([]byte{0x12, 0x01}) || string(full.Proof) != string([]byte{0x12, 0x02}) {
+		t.Fatalf("unexpected streamed full block: %#v", full)
 	}
 }
 
@@ -208,11 +249,11 @@ func writeTestPackage(t *testing.T, entries []testEntry) string {
 	}
 	defer func() { _ = file.Close() }()
 
-	if err = binary.Write(file, binary.LittleEndian, uint32(packageMagic)); err != nil {
+	if err = binary.Write(file, binary.LittleEndian, uint32(packfile.PackageMagic)); err != nil {
 		t.Fatalf("write archive magic: %v", err)
 	}
 	for _, entry := range entries {
-		header := uint32(entryMagic) | uint32(len(entry.name))<<16
+		header := uint32(packfile.EntryMagic) | uint32(len(entry.name))<<16
 		if err = binary.Write(file, binary.LittleEndian, header); err != nil {
 			t.Fatalf("write entry header: %v", err)
 		}

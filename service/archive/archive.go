@@ -26,6 +26,7 @@ type Downloaded struct {
 	Path             string
 	Bytes            int64
 	DownloadElapsed  time.Duration
+	Imported         *Imported
 }
 
 type ImportStats struct {

@@ -1105,7 +1105,7 @@ func (n *Node) downloadSplitPersistentStatePart(ctx context.Context, downloader 
 
 	if n.storage != nil {
 		partBlock := splitStatePartStorageBlock(downloader.block, part)
-		staged, _, ok, err := n.tryImportReusableStagedStateFileAs(ctx, downloader.block, partBlock, int64(part.effectiveShard), part.rootHash)
+		staged, _, ok, err := n.tryImportReusableStagedStateFileAs(ctx, downloader.block, partBlock, int64(part.effectiveShard), part.rootHash, stagedStateCellHash)
 		if err != nil {
 			return splitStatePartResult{
 				index: idx,
@@ -1169,7 +1169,7 @@ func (n *Node) downloadSplitPersistentStatePart(ctx context.Context, downloader 
 			Msg("importing staged split persistent state part cells")
 
 		partBlock := splitStatePartStorageBlock(downloader.block, part)
-		if _, err = n.decodeAndImportStagedStateCellTreeAs(ctx, downloader.block, partBlock, staged, part.rootHash); err != nil {
+		if _, err = n.decodeAndImportStagedStateCellTreeAs(ctx, downloader.block, partBlock, staged, part.rootHash, stagedStateCellHash); err != nil {
 			return splitStatePartResult{
 				index: idx,
 				err:   fmt.Errorf("import split state part %d cells: %w", idx+1, err),
@@ -1196,9 +1196,13 @@ func (n *Node) loadImportedSplitPersistentStatePart(ctx context.Context, downloa
 	}
 
 	partBlock := splitStatePartStorageBlock(downloader.block, part)
-	root, cellsCount, err := n.storage.LoadStateCellTree(ctx, partBlock, part.rootHash)
+	root, cellsCount, err := n.storage.LoadStateCellTree(ctx, partBlock, nil)
 	if err != nil {
 		return nil, err
+	}
+	rootHash := root.HashKey()
+	if !bytes.Equal(rootHash[:], part.rootHash) {
+		return nil, storage.ErrNotFound
 	}
 
 	n.log.Info().

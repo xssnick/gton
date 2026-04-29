@@ -154,12 +154,11 @@ func BlockMetaFlagForProof(kind ServedProofKind) BlockMetaFlags {
 }
 
 type CellRecord struct {
-	Hash     []byte
-	RefCount int32
-	D1       byte
-	D2       byte
-	Data     []byte
-	Refs     []CellRefRecord
+	Hash []byte
+	D1   byte
+	D2   byte
+	Data []byte
+	Refs []CellRefRecord
 }
 
 type CellRefRecord struct {
@@ -173,12 +172,11 @@ func (r *CellRecord) Clone() *CellRecord {
 		return nil
 	}
 	cloned := &CellRecord{
-		Hash:     bytes.Clone(r.Hash),
-		RefCount: r.RefCount,
-		D1:       r.D1,
-		D2:       r.D2,
-		Data:     bytes.Clone(r.Data),
-		Refs:     make([]CellRefRecord, len(r.Refs)),
+		Hash: bytes.Clone(r.Hash),
+		D1:   r.D1,
+		D2:   r.D2,
+		Data: bytes.Clone(r.Data),
+		Refs: make([]CellRefRecord, len(r.Refs)),
 	}
 	for i := range r.Refs {
 		cloned.Refs[i] = CellRefRecord{
@@ -383,12 +381,11 @@ func CellRecordFromCell(cl *cell.Cell) (*CellRecord, error) {
 	}
 
 	return &CellRecord{
-		Hash:     bytes.Clone(hash[:]),
-		RefCount: 1,
-		D1:       d1,
-		D2:       d2,
-		Data:     data,
-		Refs:     refs,
+		Hash: bytes.Clone(hash[:]),
+		D1:   d1,
+		D2:   d2,
+		Data: data,
+		Refs: refs,
 	}, nil
 }
 

@@ -79,6 +79,10 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 	return prioritized
 }
 
+func (s *overlaySubscription) archiveQueryCandidates() []*overlayPeer {
+	return s.preferredNeighbourPeers(0, 0)
+}
+
 func archivePeerTier(stats peerStats, basechain bool, now time.Time) int {
 	if stats.archiveSlowUntil.After(now) {
 		return 3
@@ -139,6 +143,11 @@ func (s *overlaySubscription) currentArchivePeer(shard archive.ShardID, peers []
 	}
 
 	stickyKey := archivePeerKey(state.peer)
+	if archivePeerDeniedLocked(state, stickyKey, now) {
+		s.clearArchivePreferredPeerLocked(stateKey, state)
+		return nil
+	}
+
 	for _, peer := range peers {
 		if archivePeerKey(peer) != stickyKey {
 			continue
@@ -146,7 +155,7 @@ func (s *overlaySubscription) currentArchivePeer(shard archive.ShardID, peers []
 
 		stats := peer.statsSnapshot()
 		if stats.archiveSlowUntil.After(now) || !stats.alive {
-			delete(s.archivePeers, stateKey)
+			s.clearArchivePreferredPeerLocked(stateKey, state)
 			return nil
 		}
 
@@ -157,7 +166,7 @@ func (s *overlaySubscription) currentArchivePeer(shard archive.ShardID, peers []
 		return peer
 	}
 
-	delete(s.archivePeers, stateKey)
+	s.clearArchivePreferredPeerLocked(stateKey, state)
 	return nil
 }
 
@@ -178,6 +187,11 @@ func (s *overlaySubscription) chooseArchivePeer(shard archive.ShardID, peers []*
 	}
 
 	stickyKey := archivePeerKey(state.peer)
+	if archivePeerDeniedLocked(state, stickyKey, now) {
+		s.clearArchivePreferredPeerLocked(stateKey, state)
+		return peers[0]
+	}
+
 	var sticky *overlayPeer
 	for _, peer := range peers {
 		if archivePeerKey(peer) == stickyKey {
@@ -186,13 +200,13 @@ func (s *overlaySubscription) chooseArchivePeer(shard archive.ShardID, peers []*
 		}
 	}
 	if sticky == nil {
-		delete(s.archivePeers, stateKey)
+		s.clearArchivePreferredPeerLocked(stateKey, state)
 		return peers[0]
 	}
 
 	stats := sticky.statsSnapshot()
 	if stats.archiveSlowUntil.After(now) || !stats.alive {
-		delete(s.archivePeers, stateKey)
+		s.clearArchivePreferredPeerLocked(stateKey, state)
 		return peers[0]
 	}
 
@@ -306,7 +320,7 @@ func (s *overlaySubscription) noteArchivePeerFailure(shard archive.ShardID, peer
 		Str("archive_pool", stateKey).
 		Msg("archive peer failed, clearing preferred peer")
 
-	delete(s.archivePeers, stateKey)
+	s.clearArchivePreferredPeerLocked(stateKey, state)
 }
 
 func (s *overlaySubscription) archivePeerState(key string) *archivePeerState {
@@ -321,6 +335,114 @@ func (s *overlaySubscription) archivePeerState(key string) *archivePeerState {
 	return state
 }
 
+func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
+	if len(peers) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	stateKey := archivePeerPoolKey(shard)
+
+	s.archivePeerMx.Lock()
+	defer s.archivePeerMx.Unlock()
+
+	state := s.archivePeers[stateKey]
+	if state == nil || len(state.deniedPeers) == 0 {
+		return peers
+	}
+
+	available := make([]*overlayPeer, 0, len(peers))
+	for _, peer := range peers {
+		if !archivePeerDeniedLocked(state, archivePeerKey(peer), now) {
+			available = append(available, peer)
+		}
+	}
+	if len(state.deniedPeers) == 0 && state.peer == nil {
+		delete(s.archivePeers, stateKey)
+	}
+	return available
+}
+
+func (s *overlaySubscription) denyArchivePeer(shard archive.ShardID, peer *overlayPeer, reason string) {
+	if peer == nil {
+		return
+	}
+
+	until := time.Now().Add(archiveSlowPeerPenalty)
+	stateKey := archivePeerPoolKey(shard)
+	peerKey := archivePeerKey(peer)
+
+	s.archivePeerMx.Lock()
+	state := s.archivePeerState(stateKey)
+	if state.deniedPeers == nil {
+		state.deniedPeers = map[string]time.Time{}
+	}
+	state.deniedPeers[peerKey] = until
+	if state.peer != nil && archivePeerKey(state.peer) == peerKey {
+		s.clearArchivePreferredPeerLocked(stateKey, state)
+	}
+	s.archivePeerMx.Unlock()
+
+	s.log.Debug().
+		Str("peer", peer.addr).
+		Str("archive_pool", stateKey).
+		Str("reason", reason).
+		Dur("duration", archiveSlowPeerPenalty).
+		Msg("temporarily denied archive peer")
+}
+
+func (s *overlaySubscription) archivePeerDenied(shard archive.ShardID, peer *overlayPeer) bool {
+	if peer == nil {
+		return false
+	}
+
+	now := time.Now()
+	stateKey := archivePeerPoolKey(shard)
+
+	s.archivePeerMx.Lock()
+	defer s.archivePeerMx.Unlock()
+
+	state := s.archivePeers[stateKey]
+	if state == nil {
+		return false
+	}
+	denied := archivePeerDeniedLocked(state, archivePeerKey(peer), now)
+	if len(state.deniedPeers) == 0 && state.peer == nil {
+		delete(s.archivePeers, stateKey)
+	}
+	return denied
+}
+
+func (s *overlaySubscription) clearArchivePreferredPeerLocked(stateKey string, state *archivePeerState) {
+	if state == nil {
+		return
+	}
+
+	state.peer = nil
+	state.speed = 0
+	state.probeAt = time.Time{}
+	if len(state.deniedPeers) == 0 {
+		delete(s.archivePeers, stateKey)
+	}
+}
+
+func archivePeerDeniedLocked(state *archivePeerState, peerKey string, now time.Time) bool {
+	if state == nil || len(state.deniedPeers) == 0 {
+		return false
+	}
+
+	until, ok := state.deniedPeers[peerKey]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+
+	delete(state.deniedPeers, peerKey)
+	return false
+}
+
 func archivePeerPoolKey(shard archive.ShardID) string {
 	if shard.Workchain == -1 {
 		return "master"
@@ -333,6 +455,29 @@ func archiveSlowThreshold(basechain bool) float64 {
 		return basechainSlowPeerSpeed
 	}
 	return archiveSlowPeerSpeed
+}
+
+func archiveGoodThreshold(basechain bool) float64 {
+	if basechain {
+		return basechainGoodPeerSpeed
+	}
+	return archiveGoodPeerSpeed
+}
+
+func shouldRaceArchiveDownload(shard archive.ShardID, peers []*overlayPeer) bool {
+	if len(peers) < 2 {
+		return false
+	}
+
+	stats := peers[0].statsSnapshot()
+	now := time.Now()
+	if !stats.alive || stats.archiveSlowUntil.After(now) {
+		return true
+	}
+	if stats.archiveDownloads == 0 {
+		return true
+	}
+	return stats.archiveBytesSec < archiveGoodThreshold(shard.Workchain == 0)
 }
 
 func archivePeerKey(peer *overlayPeer) string {

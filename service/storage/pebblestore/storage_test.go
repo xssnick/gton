@@ -36,6 +36,56 @@ func TestCellRecordCodecStoresOrdinaryDescriptor(t *testing.T) {
 	}
 }
 
+func TestCellRecordCodecCompactsCommonRefs(t *testing.T) {
+	left := cell.BeginCell().MustStoreUInt(0x01, 8).EndCell()
+	right := cell.BeginCell().MustStoreUInt(0x02, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(left).MustStoreRef(right).EndCell()
+
+	record, err := storage.CellRecordFromCell(root)
+	if err != nil {
+		t.Fatalf("cell record from cell: %v", err)
+	}
+
+	encoded := encodeCellRecord(record)
+	if encoded[0]&cellRecordCompactRefsFlag == 0 {
+		t.Fatalf("compact refs flag is not set")
+	}
+	if got, want := encoded[0]&^cellRecordCompactRefsFlag, record.D1; got != want {
+		t.Fatalf("stored descriptor mismatch after clearing compact flag: got=%d want=%d", got, want)
+	}
+
+	bodyLen := int(record.D2/2 + record.D2%2)
+	layoutPos := 2 + bodyLen
+	if got := encoded[layoutPos]; got != 0 {
+		t.Fatalf("common refs slow mask mismatch: got=%d want=0", got)
+	}
+	if got, want := len(encoded), 2+bodyLen+1+2*(cellRecordHashSize+cellRecordDepthSize); got != want {
+		t.Fatalf("compact encoded length mismatch: got=%d want=%d", got, want)
+	}
+
+	decoded, err := decodeCellRecord(record.Hash, encoded)
+	if err != nil {
+		t.Fatalf("decode cell record: %v", err)
+	}
+	if decoded.D1 != record.D1 {
+		t.Fatalf("decoded descriptor mismatch: got=%d want=%d", decoded.D1, record.D1)
+	}
+	if len(decoded.Refs) != len(record.Refs) {
+		t.Fatalf("decoded refs count mismatch: got=%d want=%d", len(decoded.Refs), len(record.Refs))
+	}
+	for i := range record.Refs {
+		if decoded.Refs[i].LevelMask != 0 {
+			t.Fatalf("decoded ref %d level mask mismatch: got=%d want=0", i, decoded.Refs[i].LevelMask)
+		}
+		if !bytes.Equal(decoded.Refs[i].Hashes, record.Refs[i].Hashes) {
+			t.Fatalf("decoded ref %d hashes mismatch", i)
+		}
+		if !bytes.Equal(decoded.Refs[i].Depths, record.Refs[i].Depths) {
+			t.Fatalf("decoded ref %d depths mismatch", i)
+		}
+	}
+}
+
 func TestCellRecordCodecStoresRefMerkleMetadata(t *testing.T) {
 	hidden := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
 	hiddenHash := hidden.HashKey(0)
@@ -118,19 +168,8 @@ func TestStateCellDirectEncoderMatchesCellRecordCodec(t *testing.T) {
 		MustStoreRef(pruned).
 		EndCell()
 
-	refs := make([]*cell.Cell, int(root.RefsNum()))
-	for i := range refs {
-		refs[i], err = root.PeekRef(i)
-		if err != nil {
-			t.Fatalf("peek ref %d: %v", i, err)
-		}
-	}
-
-	record, err := storage.CellRecordFromCell(root)
-	if err != nil {
-		t.Fatalf("cell record from cell: %v", err)
-	}
-	want := encodeCellRecord(record)
+	rootMeta := root.GetMetadata()
+	refs := rootMeta.Refs
 
 	valueLen, d1, d2, err := stateCellEncodedLen(root, refs)
 	if err != nil {
@@ -139,8 +178,27 @@ func TestStateCellDirectEncoderMatchesCellRecordCodec(t *testing.T) {
 	got := make([]byte, valueLen)
 	encodeStateCellRecordTo(got, root, refs, d1, d2)
 
-	if !bytes.Equal(got, want) {
-		t.Fatalf("direct state cell encoding mismatch:\ngot  %x\nwant %x", got, want)
+	record, err := decodeCellRecord(rootMeta.Hash[:], got)
+	if err != nil {
+		t.Fatalf("decode direct state cell record: %v", err)
+	}
+	if len(record.Refs) != len(refs) {
+		t.Fatalf("direct state refs count mismatch: got=%d want=%d", len(record.Refs), len(refs))
+	}
+	for i, ref := range refs {
+		gotRef := record.Refs[i]
+		if gotRef.LevelMask != ref.LevelMask.Mask {
+			t.Fatalf("ref %d level mask mismatch: got=%d want=%d", i, gotRef.LevelMask, ref.LevelMask.Mask)
+		}
+		for j, hash := range ref.Hashes {
+			if !bytes.Equal(gotRef.Hashes[j*32:(j+1)*32], hash[:]) {
+				t.Fatalf("ref %d hash %d mismatch", i, j)
+			}
+			depth := binary.BigEndian.Uint16(gotRef.Depths[j*2 : (j+1)*2])
+			if depth != ref.Depths[j] {
+				t.Fatalf("ref %d depth %d mismatch: got=%d want=%d", i, j, depth, ref.Depths[j])
+			}
+		}
 	}
 }
 
@@ -165,7 +223,7 @@ func TestSaveStateCellTreeDeduplicatesSharedRefs(t *testing.T) {
 		SeqNo:     1,
 	}
 
-	if err = store.saveStateCellTree(context.Background(), block, root, nil, 2, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(context.Background(), block, root, nil, 2, nil, nil); err != nil {
 		t.Fatalf("save state cell tree: %v", err)
 	}
 
@@ -197,7 +255,7 @@ func TestSaveStateCellTreeDeduplicatesSharedRefs(t *testing.T) {
 	}
 }
 
-func TestImportStateCellTreeSyncsCellsWithoutForcedFlush(t *testing.T) {
+func TestImportStateCellTreeFlushesCellsBeforeSyncMarker(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -234,7 +292,7 @@ func TestImportStateCellTreeSyncsCellsWithoutForcedFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import state cell tree: %v", err)
 	}
-	if !lazyRoot.IsLazy() || lazyRoot.HashKey() != rootHash {
+	if lazyRoot.IsLazy() || lazyRoot.HashKey() != rootHash {
 		t.Fatalf("lazy root metadata mismatch")
 	}
 
@@ -251,7 +309,7 @@ func TestImportStateCellTreeSyncsCellsWithoutForcedFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load imported state cell tree: %v", err)
 	}
-	if !loadedRoot.IsLazy() || loadedRoot.HashKey() != rootHash {
+	if loadedRoot.IsLazy() || loadedRoot.HashKey() != rootHash {
 		t.Fatalf("loaded lazy root metadata mismatch")
 	}
 	if loadedCells != 2 {
@@ -262,10 +320,11 @@ func TestImportStateCellTreeSyncsCellsWithoutForcedFlush(t *testing.T) {
 	if _, _, err = store.LoadStateCellTree(ctx, block, wrongHash); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("load imported state cell tree with wrong hash error = %v, want ErrNotFound", err)
 	}
-	if got := store.hot.Metrics().Flush.Count; got != 0 {
-		t.Fatalf("state import forced memtable flush: got flush count %d", got)
+	cellMetrics := store.cells.metrics()
+	if cellMetrics.flushCount == 0 {
+		t.Fatal("state import did not flush cell db before sync marker")
 	}
-	if got := store.hot.Metrics().Ingest.Count; got != 0 {
+	if got := cellMetrics.ingestCount; got != 0 {
 		t.Fatalf("state import unexpectedly used pebble ingest: got ingest count %d", got)
 	}
 }
@@ -447,8 +506,8 @@ func TestSaveStateCellTreeSkipsReusedLazySubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load old right ref: %v", err)
 	}
-	if !oldRightRef.IsLazy() {
-		t.Fatal("expected imported old right subtree to be lazy")
+	if oldRightRef.IsLazy() {
+		t.Fatal("expected imported old right subtree to have body")
 	}
 
 	newLeft := cell.BeginCell().MustStoreUInt(0x44, 8).EndCell()
@@ -467,7 +526,7 @@ func TestSaveStateCellTreeSkipsReusedLazySubtree(t *testing.T) {
 		LogicalHash: oldRightHash,
 		RawCell:     oldRightRef,
 	}}
-	if err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, reused, reusedRefs); err != nil {
 		t.Fatalf("save new state: %v", err)
 	}
 
@@ -517,7 +576,7 @@ func TestSaveStateCellTreePersistsReusedSubtreeMissingFromDB(t *testing.T) {
 		LogicalHash: rightHash,
 		RawCell:     right,
 	}}
-	if err = store.saveStateCellTree(ctx, block, root, nil, 4, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, block, root, nil, 4, reused, reusedRefs); err != nil {
 		t.Fatalf("save state with reused in-memory subtree: %v", err)
 	}
 
@@ -586,7 +645,7 @@ func TestSaveStateCellTreePersistsVirtualReusedSubtreeByLogicalHash(t *testing.T
 		LogicalHash: logicalHash,
 		RawCell:     virtualRight,
 	}}
-	if err = store.saveStateCellTree(ctx, block, root, nil, 4, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, block, root, nil, 4, reused, reusedRefs); err != nil {
 		t.Fatalf("save state with virtual reused subtree: %v", err)
 	}
 
@@ -611,7 +670,71 @@ func TestSaveStateCellTreePersistsVirtualReusedSubtreeByLogicalHash(t *testing.T
 	}
 }
 
-func TestSaveStateCellTreeRejectsMissingReusedLazySubtree(t *testing.T) {
+func TestSaveStateCellTreeRekeysLazyVirtualSubtreeByLogicalHash(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     3,
+	}
+
+	hidden := cell.BeginCell().MustStoreUInt(0x77, 8).EndCell()
+	hiddenHash := hidden.HashKey(0)
+	depth := make([]byte, 2)
+	binary.BigEndian.PutUint16(depth, hidden.Depth(0))
+	prunedData := append([]byte{byte(cell.PrunedCellType), 0x01}, hiddenHash[:]...)
+	prunedData = append(prunedData, depth...)
+	pruned, err := cell.BeginCell().MustStoreSlice(prunedData, uint(len(prunedData))*8).EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("build pruned branch: %v", err)
+	}
+
+	rawRight := cell.BeginCell().MustStoreUInt(0x66, 8).MustStoreRef(pruned).EndCell()
+	if rawRight.Level() == 0 {
+		t.Fatal("test right subtree must have a non-zero level")
+	}
+	rawHash := rawRight.HashKey()
+	if _, err = store.ImportStateCellTree(ctx, block, rawRight, nil, 2); err != nil {
+		t.Fatalf("import raw subtree: %v", err)
+	}
+
+	oldLoader := cell.LazyLoader
+	cell.LazyLoader = store.LazyCellLoader()
+	defer func() { cell.LazyLoader = oldLoader }()
+
+	lazyRawRight, err := store.loadLazyCell(ctx, rawHash[:])
+	if err != nil {
+		t.Fatalf("load raw lazy subtree: %v", err)
+	}
+	virtualLazyRight := lazyRawRight.Virtualize(0)
+	if virtualLazyRight.IsLazy() || !virtualLazyRight.IsVirtualized() {
+		t.Fatal("expected virtual subtree with body")
+	}
+
+	mergedBlock := block
+	mergedBlock.SeqNo = 4
+	root := cell.BeginCell().MustStoreRef(virtualLazyRight).EndCell()
+	logicalHash := virtualLazyRight.HashKey()
+	if logicalHash == rawHash {
+		t.Fatal("test subtree must have distinct logical and raw hashes")
+	}
+
+	if _, err = store.saveStateCellTree(ctx, mergedBlock, root, nil, 3, nil, nil); err != nil {
+		t.Fatalf("save state with lazy virtual subtree: %v", err)
+	}
+
+	if _, err = store.loadLazyCell(ctx, logicalHash[:]); err != nil {
+		t.Fatalf("lazy virtual subtree was not persisted by logical hash: %v", err)
+	}
+}
+
+func TestSaveStateCellTreePersistsMissingReusedLazyDataCell(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -625,8 +748,9 @@ func TestSaveStateCellTreeRejectsMissingReusedLazySubtree(t *testing.T) {
 		SeqNo:     1,
 	}
 
-	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).EndCell()
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 2)
+	oldLeaf := cell.BeginCell().MustStoreUInt(0x44, 8).EndCell()
+	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(oldLeaf).EndCell()
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 3)
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
@@ -638,12 +762,16 @@ func TestSaveStateCellTreeRejectsMissingReusedLazySubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
 	}
-	if !lazyRight.IsLazy() {
-		t.Fatal("expected lazy right ref")
+	if lazyRight.IsLazy() {
+		t.Fatal("expected right ref body")
 	}
 
 	rightHash := lazyRight.HashKey()
-	if err = store.hot.Delete(hotKeyCell(rightHash[:]), pebble.NoSync); err != nil {
+	_, shard, err := store.cells.shardForHash(rightHash[:])
+	if err != nil {
+		t.Fatalf("route reused cell shard: %v", err)
+	}
+	if err = shard.db.Delete(cellKey(rightHash[:]), pebble.NoSync); err != nil {
 		t.Fatalf("delete reused cell: %v", err)
 	}
 
@@ -660,13 +788,15 @@ func TestSaveStateCellTreeRejectsMissingReusedLazySubtree(t *testing.T) {
 		LogicalHash: rightHash,
 		RawCell:     lazyRight,
 	}}
-	err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 1, reused, reusedRefs)
-	if err == nil || !strings.Contains(err.Error(), "reused lazy state cell") {
-		t.Fatalf("expected missing reused lazy subtree error, got %v", err)
+	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, reused, reusedRefs); err != nil {
+		t.Fatalf("save state with missing reused lazy data cell: %v", err)
+	}
+	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
+		t.Fatalf("reused lazy data cell was not persisted: %v", err)
 	}
 }
 
-func TestSaveStateCellTreeRejectsMissingLazySubtree(t *testing.T) {
+func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -680,8 +810,9 @@ func TestSaveStateCellTreeRejectsMissingLazySubtree(t *testing.T) {
 		SeqNo:     1,
 	}
 
-	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).EndCell()
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 2)
+	oldLeaf := cell.BeginCell().MustStoreUInt(0x44, 8).EndCell()
+	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(oldLeaf).EndCell()
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 3)
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
@@ -693,18 +824,97 @@ func TestSaveStateCellTreeRejectsMissingLazySubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
 	}
+	lazyRightMeta := lazyRight.GetMetadata()
+	if len(lazyRightMeta.Refs) != 1 {
+		t.Fatalf("unexpected lazy right refs: got=%d", len(lazyRightMeta.Refs))
+	}
+	lazyLeaf := lazyRightMeta.Refs[0]
+	if !lazyLeaf.Lazy {
+		t.Fatal("expected lazy leaf boundary")
+	}
 
 	rightHash := lazyRight.HashKey()
-	if err = store.hot.Delete(hotKeyCell(rightHash[:]), pebble.NoSync); err != nil {
+	_, shard, err := store.cells.shardForHash(rightHash[:])
+	if err != nil {
+		t.Fatalf("route lazy cell shard: %v", err)
+	}
+	if err = shard.db.Delete(cellKey(rightHash[:]), pebble.NoSync); err != nil {
 		t.Fatalf("delete lazy cell: %v", err)
+	}
+	leafHash := lazyLeaf.Hash
+	_, leafShard, err := store.cells.shardForHash(leafHash[:])
+	if err != nil {
+		t.Fatalf("route lazy leaf shard: %v", err)
+	}
+	if err = leafShard.db.Delete(cellKey(leafHash[:]), pebble.NoSync); err != nil {
+		t.Fatalf("delete lazy leaf: %v", err)
+	}
+	if exists, err := store.cells.has(leafHash[:]); err != nil {
+		t.Fatalf("check deleted lazy leaf: %v", err)
+	} else if exists {
+		t.Fatal("lazy leaf still exists after delete")
 	}
 
 	nextBlock := block
 	nextBlock.SeqNo = 2
 	newRoot := cell.BeginCell().MustStoreRef(lazyRight).EndCell()
-	err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 1, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "lazy state ref") {
-		t.Fatalf("expected missing lazy subtree error, got %v", err)
+	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 3, nil, nil); err != nil {
+		t.Fatalf("save state with missing virtual lazy pruned subtree: %v", err)
+	}
+	if _, err = store.loadLazyCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("virtual lazy pruned subtree was restored from boundary: %v", err)
+	}
+}
+
+func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     1,
+	}
+
+	oldLeaf := cell.BeginCell().MustStoreUInt(0x44, 8).EndCell()
+	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(oldLeaf).EndCell()
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 3)
+	if err != nil {
+		t.Fatalf("import old state: %v", err)
+	}
+	oldLoader := cell.LazyLoader
+	cell.LazyLoader = store.LazyCellLoader()
+	defer func() { cell.LazyLoader = oldLoader }()
+
+	lazyRight, err := lazyRoot.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load lazy right ref: %v", err)
+	}
+	if lazyRight.IsLazy() {
+		t.Fatal("expected lazy data cell body")
+	}
+
+	rightHash := lazyRight.HashKey()
+	_, shard, err := store.cells.shardForHash(rightHash[:])
+	if err != nil {
+		t.Fatalf("route lazy cell shard: %v", err)
+	}
+	if err = shard.db.Delete(cellKey(rightHash[:]), pebble.NoSync); err != nil {
+		t.Fatalf("delete lazy data cell: %v", err)
+	}
+
+	nextBlock := block
+	nextBlock.SeqNo = 2
+	newRoot := cell.BeginCell().MustStoreRef(lazyRight).EndCell()
+	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, nil, nil); err != nil {
+		t.Fatalf("save state with missing lazy data cell: %v", err)
+	}
+	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
+		t.Fatalf("lazy data cell was not persisted: %v", err)
 	}
 }
 
@@ -734,8 +944,8 @@ func TestSaveStateCellTreeSkipsExistingLazyRootWithoutLoading(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import state: %v", err)
 	}
-	if !lazyRoot.IsLazy() {
-		t.Fatal("expected imported root to be lazy")
+	if lazyRoot.IsLazy() {
+		t.Fatal("expected imported root body")
 	}
 
 	oldLoader := cell.LazyLoader
@@ -744,7 +954,7 @@ func TestSaveStateCellTreeSkipsExistingLazyRootWithoutLoading(t *testing.T) {
 
 	nextBlock := block
 	nextBlock.SeqNo = 2
-	if err = store.saveStateCellTree(ctx, nextBlock, lazyRoot, nil, 1, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(ctx, nextBlock, lazyRoot, nil, 1, nil, nil); err != nil {
 		t.Fatalf("save existing lazy root: %v", err)
 	}
 }
@@ -758,7 +968,7 @@ func TestClosedStoreReturnsError(t *testing.T) {
 		t.Fatalf("close store: %v", err)
 	}
 
-	if _, err = store.ArchiveInfo(context.Background(), 1); err == nil {
+	if _, err = store.ArchiveInfo(context.Background(), 1, -1, int64(-1<<63)); err == nil {
 		t.Fatal("expected closed store error")
 	}
 }

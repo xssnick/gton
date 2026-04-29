@@ -70,11 +70,21 @@ type Service struct {
 	storage   storage.Storage
 	stateSync *state.Syncer
 
+	archiveCatchUpCheckpointBlocks uint32
+	archiveCatchUpCheckpointPeriod time.Duration
+	archiveCatchUpPrefetchWindows  int
+
 	stateMu sync.Mutex
 
 	startOnce sync.Once
 	startErr  error
 	wg        sync.WaitGroup
+}
+
+type Options struct {
+	ArchiveCatchUpCheckpointBlocks uint32
+	ArchiveCatchUpCheckpointPeriod time.Duration
+	ArchiveCatchUpPrefetchWindows  int
 }
 
 type StatusSnapshot struct {
@@ -85,13 +95,26 @@ type StatusSnapshot struct {
 	LocalStateError  string
 }
 
-func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, store storage.Storage, stateSync *state.Syncer) *Service {
+func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, store storage.Storage, stateSync *state.Syncer, opts Options) *Service {
+	if opts.ArchiveCatchUpCheckpointBlocks == 0 {
+		opts.ArchiveCatchUpCheckpointBlocks = DefaultArchiveCatchUpCheckpointBlocks
+	}
+	if opts.ArchiveCatchUpCheckpointPeriod == 0 {
+		opts.ArchiveCatchUpCheckpointPeriod = DefaultArchiveCatchUpCheckpointPeriod
+	}
+	if opts.ArchiveCatchUpPrefetchWindows == 0 {
+		opts.ArchiveCatchUpPrefetchWindows = DefaultArchiveCatchUpPrefetchWindows
+	}
+
 	return &Service{
-		log:       logger,
-		node:      node,
-		blockSync: blockSync,
-		storage:   store,
-		stateSync: stateSync,
+		log:                            logger,
+		node:                           node,
+		blockSync:                      blockSync,
+		storage:                        store,
+		stateSync:                      stateSync,
+		archiveCatchUpCheckpointBlocks: opts.ArchiveCatchUpCheckpointBlocks,
+		archiveCatchUpCheckpointPeriod: opts.ArchiveCatchUpCheckpointPeriod,
+		archiveCatchUpPrefetchWindows:  opts.ArchiveCatchUpPrefetchWindows,
 	}
 }
 
@@ -374,17 +397,18 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 		}
 
 		if target.SeqNo > current.ShardClientSeqno && target.SeqNo-current.ShardClientSeqno >= nextBlockCatchUpMaxRemaining {
-			current, err = s.catchUpShardClientFromArchives(ctx, current, target)
-			if err != nil {
-				return err
-			}
-			if current.Masterchain.Block.SeqNo >= target.SeqNo {
+			archiveTarget, ok := archiveCatchUpTarget(current, target)
+			if ok {
 				s.log.Info().
-					Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
-					Uint32("shard_client_seqno", current.ShardClientSeqno).
-					Int("shards", len(current.Shards)).
-					Msg("current state caught up")
-				return nil
+					Str("target", storage.FormatBlockRef(target)).
+					Str("archive_target", storage.FormatBlockRef(archiveTarget)).
+					Uint32("tail_blocks", archiveCatchUpTailBlocks).
+					Msg("starting archive catch-up before live tail")
+
+				current, err = s.catchUpShardClientFromArchives(ctx, current, archiveTarget)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -1287,6 +1311,10 @@ func formatCatchUpProgress(done, total uint32) string {
 }
 
 func formatBlockRate(done uint32, elapsed time.Duration) string {
+	return formatBlockRate64(uint64(done), elapsed)
+}
+
+func formatBlockRate64(done uint64, elapsed time.Duration) string {
 	if done == 0 || elapsed <= 0 {
 		return "0 blocks/s"
 	}

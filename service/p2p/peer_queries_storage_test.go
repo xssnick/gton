@@ -3,8 +3,11 @@ package p2p
 import (
 	"bytes"
 	"context"
+	"flexserver/service/archive"
 	tnstore "flexserver/service/storage"
 	"flexserver/service/storage/memstore"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -47,7 +50,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("save block full: %v", err)
 	}
 	storage.LinkNextBlock(block, next)
-	storage.SaveBlockProof(tnstore.ServedProofBlockLink, block, []byte{0x01, 0x02, 0x03})
+	storage.SaveBlockProof(tnstore.ServedProofBlockLink, block, []byte{0x01, 0x02, 0x03}, nil)
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: next})
 	if err != nil {
@@ -138,8 +141,20 @@ func TestDispatchPeerQueryDoesNotServeStateSnapshots(t *testing.T) {
 		MasterchainBlock: master,
 		EffectiveShard:   block.Shard,
 	}
-	storage.SaveArchiveInfo(21, 777)
-	storage.SaveArchiveSlice(777, 0, []byte{9, 8, 7, 6})
+	archivePath := filepath.Join(t.TempDir(), "archive.pack")
+	if err = os.WriteFile(archivePath, []byte{9, 8, 7, 6}, 0o644); err != nil {
+		t.Fatalf("write archive file: %v", err)
+	}
+	if _, err = storage.SaveArchiveFile(21, -1, topShard, 777, archivePath); err != nil {
+		t.Fatalf("save archive file: %v", err)
+	}
+	shardArchivePath := filepath.Join(t.TempDir(), "shard-archive.pack")
+	if err = os.WriteFile(shardArchivePath, []byte{6, 5, 4}, 0o644); err != nil {
+		t.Fatalf("write shard archive file: %v", err)
+	}
+	if _, err = storage.SaveArchiveFile(21, 0, topShard, 778, shardArchivePath); err != nil {
+		t.Fatalf("save shard archive file: %v", err)
+	}
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareZeroState{Block: block})
 	if err != nil {
@@ -197,6 +212,18 @@ func TestDispatchPeerQueryDoesNotServeStateSnapshots(t *testing.T) {
 	info, ok := resp.(ArchiveInfo)
 	if !ok || info.ID != 777 {
 		t.Fatalf("unexpected archive info %#v", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetShardArchiveInfo{
+		MasterchainSeqno: 21,
+		ShardPrefix:      archive.ShardID{Workchain: 0, Shard: topShard},
+	})
+	if err != nil {
+		t.Fatalf("getShardArchiveInfo: %v", err)
+	}
+	info, ok = resp.(ArchiveInfo)
+	if !ok || info.ID != 778 {
+		t.Fatalf("unexpected shard archive info %#v", resp)
 	}
 
 	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetArchiveSlice{

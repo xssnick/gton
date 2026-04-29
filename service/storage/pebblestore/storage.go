@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"flexserver/internal/logutil"
+	"flexserver/service/archive/packfile"
 	"flexserver/service/storage"
 	"fmt"
 	"io"
@@ -13,7 +14,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -24,48 +28,70 @@ import (
 )
 
 const (
-	defaultPebbleHotCacheSize     = 1 << 30
-	defaultPebbleBlobCacheSize    = 64 << 20
-	defaultPebbleHotMemTableSize  = 256 << 20
-	defaultPebbleBlobMemTableSize = 64 << 20
-	defaultPebbleBytesPerSync     = 8 << 20
-	defaultPebbleWALBytesSync     = 8 << 20
+	defaultPebbleMetaCacheSize      = 64 << 20
+	defaultPebbleCellTotalCacheSize = 4 << 30
 
-	defaultPebbleTargetFileSize        = 64 << 20
-	defaultPebbleMemTableStopThreshold = 8
-	defaultPebbleL0CompactionThreshold = 8
-	defaultPebbleL0FileThreshold       = 16
-	defaultPebbleL0StopWritesThreshold = 64
-	stateCellImportBatchTargetBytes    = 128 << 20
-	stateCellSaveProgressInterval      = 5 * time.Second
+	defaultPebbleMetaMemTableSize      = 16 << 20
+	defaultPebbleCellTotalMemTableSize = 2 << 30
+
+	defaultPebbleBytesPerSync = 8 << 20
+	defaultPebbleWALBytesSync = 8 << 20
+
+	defaultPebbleMetaTargetFileSize = 16 << 20
+	defaultPebbleCellTargetFileSize = 256 << 20
+
+	defaultPebbleMetaMemTableStopThreshold = 4
+	defaultPebbleCellMemTableStopThreshold = 8
+
+	defaultPebbleMetaL0CompactionThreshold = 4
+	defaultPebbleCellL0CompactionThreshold = 16
+
+	defaultPebbleMetaL0FileThreshold = 8
+	defaultPebbleCellL0FileThreshold = 64
+
+	defaultPebbleMetaL0StopWritesThreshold = 32
+	defaultPebbleCellL0StopWritesThreshold = 256
+
+	defaultPebbleCellLBaseMaxBytes = 1 << 30
+
+	stateCellImportBatchTargetBytes = 128 << 20
+	stateCellSaveProgressInterval   = 5 * time.Second
+	archivePackageMasterchainBlocks = 100
 
 	blockStateMetaVersion = 1
+	artifactRefVersion    = 1
+
+	cellRecordCompactRefsFlag = 0x10
+	cellRecordHashSize        = 32
+	cellRecordDepthSize       = 2
 )
 
 var errPebbleClosed = errors.New("pebble storage is closed")
 
 type Options struct {
-	Dir             string
-	Logger          *zerolog.Logger
-	HotCacheSize    int64
-	BlobCacheSize   int64
-	MemTableSize    int
-	BytesPerSync    int
-	WALBytesPerSync int
+	Dir              string
+	Logger           *zerolog.Logger
+	MetaCacheSize    int64
+	CellCacheSize    int64
+	MetaMemTableSize int
+	CellMemTableSize int
+	BytesPerSync     int
+	WALBytesPerSync  int
 }
 
 type Store struct {
 	log zerolog.Logger
 
-	hot       *pebble.DB
-	blob      *pebble.DB
-	dir       string
-	hotOpts   *pebble.Options
-	hotCache  *pebble.Cache
-	blobCache *pebble.Cache
+	hot      *pebble.DB
+	cells    *cellStore
+	dir      string
+	hotOpts  *pebble.Options
+	hotCache *pebble.Cache
 
-	mu     sync.RWMutex
-	closed bool
+	mu                 sync.RWMutex
+	artifactMu         sync.Mutex
+	pendingArchiveSync map[string]struct{}
+	closed             bool
 }
 
 func Open(opts Options) (*Store, error) {
@@ -73,11 +99,11 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("storage dir is empty")
 	}
 	logger := logutil.WithComponent(opts.Logger, "pebblestore")
-	if opts.HotCacheSize <= 0 {
-		opts.HotCacheSize = defaultPebbleHotCacheSize
+	if opts.MetaCacheSize <= 0 {
+		opts.MetaCacheSize = defaultPebbleMetaCacheSize
 	}
-	if opts.BlobCacheSize <= 0 {
-		opts.BlobCacheSize = defaultPebbleBlobCacheSize
+	if opts.CellCacheSize <= 0 {
+		opts.CellCacheSize = defaultPebbleCellTotalCacheSize
 	}
 	if opts.BytesPerSync <= 0 {
 		opts.BytesPerSync = defaultPebbleBytesPerSync
@@ -85,92 +111,140 @@ func Open(opts Options) (*Store, error) {
 	if opts.WALBytesPerSync <= 0 {
 		opts.WALBytesPerSync = defaultPebbleWALBytesSync
 	}
-	hotMemTableSize := opts.MemTableSize
-	if hotMemTableSize <= 0 {
-		hotMemTableSize = defaultPebbleHotMemTableSize
+	metaMemTableSize := opts.MetaMemTableSize
+	if metaMemTableSize <= 0 {
+		metaMemTableSize = defaultPebbleMetaMemTableSize
 	}
-	blobMemTableSize := opts.MemTableSize
-	if blobMemTableSize <= 0 {
-		blobMemTableSize = defaultPebbleBlobMemTableSize
+	cellMemTableSize := opts.CellMemTableSize
+	if cellMemTableSize <= 0 {
+		cellMemTableSize = defaultPebbleCellTotalMemTableSize
 	}
 
-	hotDir := filepath.Join(opts.Dir, "hotdb")
-	blobDir := filepath.Join(opts.Dir, "blobdb")
+	hotDir := filepath.Join(opts.Dir, "metadb")
 	if err := os.MkdirAll(hotDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create hotdb dir: %w", err)
+		return nil, fmt.Errorf("create metadb dir: %w", err)
 	}
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create blobdb dir: %w", err)
+	if err := os.MkdirAll(filepath.Join(opts.Dir, "packs", "archive"), 0o755); err != nil {
+		return nil, fmt.Errorf("create archive pack dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(opts.Dir, "packs", "loose"), 0o755); err != nil {
+		return nil, fmt.Errorf("create loose pack dir: %w", err)
 	}
 
-	hotCache := pebble.NewCache(opts.HotCacheSize)
-	blobCache := pebble.NewCache(opts.BlobCacheSize)
-	hotLogger := logger.With().Str("db", "hotdb").Logger()
-	blobLogger := logger.With().Str("db", "blobdb").Logger()
+	hotCache := pebble.NewCache(opts.MetaCacheSize)
+	hotLogger := logger.With().Str("db", "metadb").Logger()
 
-	hotOpts := newPebbleOptions(hotCache, hotMemTableSize, opts.BytesPerSync, opts.WALBytesPerSync, 4<<10, pebble.NoCompression, hotLogger)
+	hotOpts := newMetaPebbleOptions(hotCache, metaMemTableSize, opts.BytesPerSync, opts.WALBytesPerSync, hotLogger)
 	hot, err := pebble.Open(hotDir, hotOpts)
 	if err != nil {
 		hotCache.Unref()
-		blobCache.Unref()
-		return nil, fmt.Errorf("open hotdb: %w", err)
+		return nil, fmt.Errorf("open metadb: %w", err)
 	}
-	blob, err := pebble.Open(blobDir, newPebbleOptions(blobCache, blobMemTableSize, opts.BytesPerSync, opts.WALBytesPerSync, 32<<10, pebble.SnappyCompression, blobLogger))
+
+	cellShardMemTable := cellShardMemTableSize(cellMemTableSize)
+	cells, err := openCellStore(opts.Dir, opts.CellCacheSize, cellShardMemTable, opts.BytesPerSync, logger)
 	if err != nil {
 		_ = hot.Close()
 		hotCache.Unref()
-		blobCache.Unref()
-		return nil, fmt.Errorf("open blobdb: %w", err)
+		return nil, err
 	}
 
 	store := &Store{
-		log:       logger,
-		hot:       hot,
-		blob:      blob,
-		dir:       opts.Dir,
-		hotOpts:   hotOpts,
-		hotCache:  hotCache,
-		blobCache: blobCache,
+		log:                logger,
+		hot:                hot,
+		cells:              cells,
+		dir:                opts.Dir,
+		hotOpts:            hotOpts,
+		hotCache:           hotCache,
+		pendingArchiveSync: map[string]struct{}{},
 	}
 	logger.Info().
-		Int64("hot_cache_size", opts.HotCacheSize).
-		Int64("blob_cache_size", opts.BlobCacheSize).
-		Int("hot_memtable_size", hotMemTableSize).
-		Int("blob_memtable_size", blobMemTableSize).
-		Int("target_file_size", defaultPebbleTargetFileSize).
+		Int64("meta_cache_size", opts.MetaCacheSize).
+		Int64("cell_total_cache_size", opts.CellCacheSize).
+		Int("meta_memtable_size", metaMemTableSize).
+		Int("cell_total_memtable_size", cellMemTableSize).
+		Int("cell_shard_memtable_size", cellShardMemTable).
+		Int("cell_shards", cellDBShardCount).
+		Bool("cell_disable_wal", true).
+		Int("meta_target_file_size", defaultPebbleMetaTargetFileSize).
+		Int("cell_target_file_size", defaultPebbleCellTargetFileSize).
+		Int64("cell_lbase_max_bytes", defaultPebbleCellLBaseMaxBytes).
 		Int("state_cell_import_batch_target_bytes", stateCellImportBatchTargetBytes).
-		Int("memtable_stop_writes_threshold", defaultPebbleMemTableStopThreshold).
-		Int("l0_compaction_threshold", defaultPebbleL0CompactionThreshold).
-		Int("l0_file_threshold", defaultPebbleL0FileThreshold).
-		Int("l0_stop_writes_threshold", defaultPebbleL0StopWritesThreshold).
+		Int("cell_memtable_stop_writes_threshold", defaultPebbleCellMemTableStopThreshold).
+		Int("cell_l0_compaction_threshold", defaultPebbleCellL0CompactionThreshold).
+		Int("cell_l0_file_threshold", defaultPebbleCellL0FileThreshold).
+		Int("cell_l0_stop_writes_threshold", defaultPebbleCellL0StopWritesThreshold).
+		Int("cell_max_concurrent_compactions", pebbleCellMaxConcurrentCompactions()).
 		Int("max_concurrent_compactions", pebbleMaxConcurrentCompactions()).
 		Msg("configured pebble storage tuning")
 	// Do not scan the full cell DB on startup just to populate console stats.
 	return store, nil
 }
 
-func newPebbleOptions(cache *pebble.Cache, memTableSize, bytesPerSync, walBytesPerSync, blockSize int, compression pebble.Compression, logger zerolog.Logger) *pebble.Options {
+type pebbleOptionsTuning struct {
+	blockSize                   int
+	compression                 pebble.Compression
+	targetFileSize              int
+	memTableStopWritesThreshold int
+	l0CompactionThreshold       int
+	l0CompactionFileThreshold   int
+	l0StopWritesThreshold       int
+	lBaseMaxBytes               int64
+	disableWAL                  bool
+}
+
+func newMetaPebbleOptions(cache *pebble.Cache, memTableSize, bytesPerSync, walBytesPerSync int, logger zerolog.Logger) *pebble.Options {
+	return newPebbleOptions(cache, memTableSize, bytesPerSync, walBytesPerSync, pebbleOptionsTuning{
+		blockSize:                   4 << 10,
+		compression:                 pebble.NoCompression,
+		targetFileSize:              defaultPebbleMetaTargetFileSize,
+		memTableStopWritesThreshold: defaultPebbleMetaMemTableStopThreshold,
+		l0CompactionThreshold:       defaultPebbleMetaL0CompactionThreshold,
+		l0CompactionFileThreshold:   defaultPebbleMetaL0FileThreshold,
+		l0StopWritesThreshold:       defaultPebbleMetaL0StopWritesThreshold,
+	}, logger)
+}
+
+func newCellPebbleOptions(cache *pebble.Cache, memTableSize, bytesPerSync int, logger zerolog.Logger) *pebble.Options {
+	opts := newPebbleOptions(cache, memTableSize, bytesPerSync, 0, pebbleOptionsTuning{
+		blockSize:                   4 << 10,
+		compression:                 pebble.NoCompression,
+		targetFileSize:              defaultPebbleCellTargetFileSize,
+		memTableStopWritesThreshold: defaultPebbleCellMemTableStopThreshold,
+		l0CompactionThreshold:       defaultPebbleCellL0CompactionThreshold,
+		l0CompactionFileThreshold:   defaultPebbleCellL0FileThreshold,
+		l0StopWritesThreshold:       defaultPebbleCellL0StopWritesThreshold,
+		lBaseMaxBytes:               defaultPebbleCellLBaseMaxBytes,
+		disableWAL:                  true,
+	}, logger)
+	opts.MaxConcurrentCompactions = pebbleCellMaxConcurrentCompactions
+	return opts
+}
+
+func newPebbleOptions(cache *pebble.Cache, memTableSize, bytesPerSync, walBytesPerSync int, tuning pebbleOptionsTuning, logger zerolog.Logger) *pebble.Options {
 	levels := make([]pebble.LevelOptions, 7)
 	for i := range levels {
 		levels[i] = pebble.LevelOptions{
-			BlockSize:      blockSize,
-			IndexBlockSize: blockSize,
+			BlockSize:      tuning.blockSize,
+			IndexBlockSize: tuning.blockSize,
 			FilterPolicy:   bloom.FilterPolicy(10),
 			FilterType:     pebble.TableFilter,
-			TargetFileSize: defaultPebbleTargetFileSize,
-			Compression:    compression,
+			TargetFileSize: int64(tuning.targetFileSize),
+			Compression:    tuning.compression,
 		}
 	}
 	opts := &pebble.Options{
 		Cache:                       cache,
 		MemTableSize:                uint64(memTableSize),
-		MemTableStopWritesThreshold: defaultPebbleMemTableStopThreshold,
+		MemTableStopWritesThreshold: tuning.memTableStopWritesThreshold,
 		BytesPerSync:                bytesPerSync,
 		WALBytesPerSync:             walBytesPerSync,
-		FlushSplitBytes:             defaultPebbleTargetFileSize,
-		L0CompactionThreshold:       defaultPebbleL0CompactionThreshold,
-		L0CompactionFileThreshold:   defaultPebbleL0FileThreshold,
-		L0StopWritesThreshold:       defaultPebbleL0StopWritesThreshold,
+		FlushSplitBytes:             int64(tuning.targetFileSize),
+		L0CompactionThreshold:       tuning.l0CompactionThreshold,
+		L0CompactionFileThreshold:   tuning.l0CompactionFileThreshold,
+		L0StopWritesThreshold:       tuning.l0StopWritesThreshold,
+		LBaseMaxBytes:               tuning.lBaseMaxBytes,
+		DisableWAL:                  tuning.disableWAL,
 		Logger:                      pebbleDebugLogger{log: logger},
 		MaxConcurrentCompactions:    pebbleMaxConcurrentCompactions,
 		Levels:                      levels,
@@ -202,27 +276,32 @@ func pebbleMaxConcurrentCompactions() int {
 	return n
 }
 
+func pebbleCellMaxConcurrentCompactions() int {
+	return 1
+}
+
 func (s *Store) Close() error {
+	var firstErr error
+	if err := s.syncPendingArchiveFiles(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.closed {
-		return nil
+		return firstErr
 	}
 	s.closed = true
 
-	var firstErr error
 	if err := s.hot.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := s.blob.Close(); err != nil && firstErr == nil {
+	if err := s.cells.close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if s.hotCache != nil {
 		s.hotCache.Unref()
-	}
-	if s.blobCache != nil {
-		s.blobCache.Unref()
 	}
 	return firstErr
 }
@@ -232,6 +311,20 @@ func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
 		return fmt.Errorf("served block is nil")
 	}
 
+	meta, proofKinds := servedBlockFullMeta(block)
+	blockRef, proofRef, err := s.servedBlockFullArtifactRefs(block, proofKinds)
+	if err != nil {
+		return err
+	}
+	return s.withHotBatch(func(batch *pebble.Batch) error {
+		if err := s.setServedBlockFullArtifactRefs(batch, block, proofKinds, blockRef, proofRef); err != nil {
+			return err
+		}
+		return s.setMergedBlockMeta(batch, meta)
+	})
+}
+
+func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []storage.ServedProofKind) {
 	meta := &storage.BlockMeta{
 		ID:        block.ID,
 		Flags:     blockMetaServedFlags(block.IsLink),
@@ -255,33 +348,173 @@ func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
 			meta.Mark(storage.BlockMetaFlagForProof(kind))
 		}
 	}
-
-	if err := s.persistServedBlockFullBlobs(block, proofKinds); err != nil {
-		return err
-	}
-	return s.mergeAndStoreBlockMeta(meta)
+	return meta, proofKinds
 }
 
-func (s *Store) persistServedBlockFullBlobs(block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind) error {
-	if len(block.Block) == 0 && len(block.Proof) == 0 {
-		return nil
+func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
+	if imported == nil {
+		return fmt.Errorf("served archive import is nil")
 	}
 
-	return s.withBlobBatch(func(batch *pebble.Batch) error {
-		if len(block.Block) > 0 {
-			if err := s.setBlobUnique(batch, blobKeyBlockData(block.ID), block.Block); err != nil {
+	type fullWrite struct {
+		block      *storage.ServedBlockFull
+		proofKinds []storage.ServedProofKind
+		blockRef   *storage.ArtifactRef
+		proofRef   *storage.ArtifactRef
+	}
+	type blockDataWrite struct {
+		block ton.BlockIDExt
+		ref   *storage.ArtifactRef
+	}
+	type proofWrite struct {
+		kind  storage.ServedProofKind
+		block ton.BlockIDExt
+		ref   *storage.ArtifactRef
+	}
+
+	metas := make(map[string]*storage.BlockMeta, len(imported.FullBlocks)+len(imported.BlockData)+len(imported.Proofs))
+	fullWrites := make([]fullWrite, 0, len(imported.FullBlocks))
+	for _, full := range imported.FullBlocks {
+		meta, proofKinds := servedBlockFullMeta(full)
+		blockRef, proofRef, err := s.servedBlockFullArtifactRefs(full, proofKinds)
+		if err != nil {
+			return err
+		}
+		mergeArchiveImportMeta(metas, meta)
+		fullWrites = append(fullWrites, fullWrite{
+			block:      full,
+			proofKinds: proofKinds,
+			blockRef:   blockRef,
+			proofRef:   proofRef,
+		})
+	}
+
+	blockDataWrites := make([]blockDataWrite, 0, len(imported.BlockData))
+	for _, block := range imported.BlockData {
+		if len(block.Data) == 0 {
+			continue
+		}
+		ref := block.Ref
+		if ref == nil {
+			var err error
+			ref, err = s.appendArtifactEntry(packfile.KindBlock, block.ID, block.Data)
+			if err != nil {
 				return err
 			}
 		}
-		if len(block.Proof) > 0 {
-			for _, kind := range proofKinds {
-				if err := s.setBlobUnique(batch, blobKeyProof(kind, block.ID), block.Proof); err != nil {
-					return err
-				}
+		meta := &storage.BlockMeta{
+			ID:        block.ID,
+			Flags:     storage.BlockMetaHasBlockData,
+			UpdatedAt: time.Now(),
+		}
+		mergeArchiveImportMeta(metas, storage.MergeBlockMetaFromBlockData(meta, block.ID, block.Data))
+		blockDataWrites = append(blockDataWrites, blockDataWrite{block: block.ID, ref: ref})
+	}
+
+	proofWrites := make([]proofWrite, 0, len(imported.Proofs))
+	for _, proof := range imported.Proofs {
+		if len(proof.Data) == 0 {
+			continue
+		}
+		ref := proof.Ref
+		if ref == nil {
+			var err error
+			ref, err = s.appendArtifactEntry(packEntryKindForProofKind(proof.Kind), proof.ID, proof.Data)
+			if err != nil {
+				return err
+			}
+		}
+		mergeArchiveImportMeta(metas, &storage.BlockMeta{
+			ID:        proof.ID,
+			Flags:     storage.BlockMetaFlagForProof(proof.Kind),
+			UpdatedAt: time.Now(),
+		})
+		proofWrites = append(proofWrites, proofWrite{kind: proof.Kind, block: proof.ID, ref: ref})
+	}
+
+	metaKeys := make([]string, 0, len(metas))
+	for key := range metas {
+		metaKeys = append(metaKeys, key)
+	}
+	sort.Strings(metaKeys)
+
+	return s.withHotBatch(func(batch *pebble.Batch) error {
+		for _, write := range fullWrites {
+			if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRef); err != nil {
+				return err
+			}
+		}
+		for _, write := range blockDataWrites {
+			if err := s.setHotUnique(batch, hotKeyBlockDataRef(write.block), encodeArtifactRef(write.ref)); err != nil {
+				return err
+			}
+		}
+		for _, write := range proofWrites {
+			if err := s.setHotUnique(batch, hotKeyProofRef(write.kind, write.block), encodeArtifactRef(write.ref)); err != nil {
+				return err
+			}
+		}
+		for _, link := range imported.Links {
+			if err := s.setHotUnique(batch, hotKeyNextBlock(link.Prev), encodeBlockID(link.Next)); err != nil {
+				return err
+			}
+		}
+		for _, key := range metaKeys {
+			if err := s.setMergedBlockMeta(batch, metas[key]); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
+}
+
+func (s *Store) servedBlockFullArtifactRefs(block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind) (*storage.ArtifactRef, *storage.ArtifactRef, error) {
+	if len(block.Block) == 0 && len(block.Proof) == 0 {
+		return nil, nil, nil
+	}
+
+	blockRef := block.BlockRef
+	if len(block.Block) > 0 && blockRef == nil {
+		ref, err := s.appendArtifactEntry(packfile.KindBlock, block.ID, block.Block)
+		if err != nil {
+			return nil, nil, err
+		}
+		blockRef = ref
+	}
+
+	proofRef := block.ProofRef
+	if len(block.Proof) > 0 && proofRef == nil {
+		ref, err := s.appendArtifactEntry(packEntryKindForProof(block.IsLink), block.ID, block.Proof)
+		if err != nil {
+			return nil, nil, err
+		}
+		proofRef = ref
+	}
+
+	return blockRef, proofRef, nil
+}
+
+func (s *Store) setServedBlockFullArtifactRefs(batch *pebble.Batch, block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind, blockRef *storage.ArtifactRef, proofRef *storage.ArtifactRef) error {
+	if blockRef != nil {
+		if err := s.setHotUnique(batch, hotKeyBlockDataRef(block.ID), encodeArtifactRef(blockRef)); err != nil {
+			return err
+		}
+	}
+	if proofRef != nil {
+		for _, kind := range proofKinds {
+			if err := s.setHotUnique(batch, hotKeyProofRef(kind, block.ID), encodeArtifactRef(proofRef)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func mergeArchiveImportMeta(metas map[string]*storage.BlockMeta, meta *storage.BlockMeta) {
+	key := storage.BlockKey(meta.ID)
+	merged := storage.MergeBlockMeta(metas[key], meta)
+	merged.ID = meta.ID
+	metas[key] = merged
 }
 
 func (s *Store) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) {
@@ -298,8 +531,8 @@ func (s *Store) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) {
 	}
 }
 
-func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte) {
-	if err := s.persistBlockData(block, data); err != nil {
+func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) {
+	if err := s.persistBlockData(block, data, ref); err != nil {
 		s.log.Warn().
 			Err(err).
 			Str("block", storage.FormatBlockRef(block)).
@@ -307,12 +540,19 @@ func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte) {
 	}
 }
 
-func (s *Store) persistBlockData(block ton.BlockIDExt, data []byte) error {
+func (s *Store) persistBlockData(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
 	if len(data) == 0 {
 		return nil
 	}
-	if err := s.withBlobBatch(func(batch *pebble.Batch) error {
-		return s.setBlobUnique(batch, blobKeyBlockData(block), data)
+	if ref == nil {
+		var err error
+		ref, err = s.appendArtifactEntry(packfile.KindBlock, block, data)
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.withHotBatch(func(batch *pebble.Batch) error {
+		return s.setHotUnique(batch, hotKeyBlockDataRef(block), encodeArtifactRef(ref))
 	}); err != nil {
 		return err
 	}
@@ -326,8 +566,8 @@ func (s *Store) persistBlockData(block ton.BlockIDExt, data []byte) error {
 	return s.mergeAndStoreBlockMeta(meta)
 }
 
-func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) {
-	if err := s.persistBlockProof(kind, block, data); err != nil {
+func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) {
+	if err := s.persistBlockProof(kind, block, data, ref); err != nil {
 		s.log.Warn().
 			Err(err).
 			Str("kind", string(kind)).
@@ -336,12 +576,19 @@ func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDEx
 	}
 }
 
-func (s *Store) persistBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) error {
+func (s *Store) persistBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
 	if len(data) == 0 {
 		return nil
 	}
-	if err := s.withBlobBatch(func(batch *pebble.Batch) error {
-		return s.setBlobUnique(batch, blobKeyProof(kind, block), data)
+	if ref == nil {
+		var err error
+		ref, err = s.appendArtifactEntry(packEntryKindForProofKind(kind), block, data)
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.withHotBatch(func(batch *pebble.Batch) error {
+		return s.setHotUnique(batch, hotKeyProofRef(kind, block), encodeArtifactRef(ref))
 	}); err != nil {
 		return err
 	}
@@ -352,33 +599,97 @@ func (s *Store) persistBlockProof(kind storage.ServedProofKind, block ton.BlockI
 	})
 }
 
-func (s *Store) SaveArchiveInfo(masterchainSeqno int32, archiveID int64) {
-	if err := s.withHotBatch(func(batch *pebble.Batch) error {
-		key := hotKeyArchiveInfo(masterchainSeqno)
-		val := encodeInt64(archiveID)
-		return s.setHotMaybeReplace(batch, key, val)
-	}); err != nil {
-		s.log.Warn().
-			Err(err).
-			Int32("masterchain_seqno", masterchainSeqno).
-			Int64("archive_id", archiveID).
-			Msg("failed to persist archive info")
+func (s *Store) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error) {
+	storedPath := s.archivePackPath(archiveID)
+	s.artifactMu.Lock()
+	stored, err := storeArchivePack(path, storedPath)
+	if err != nil {
+		s.artifactMu.Unlock()
+		return "", err
 	}
+	if stored {
+		s.pendingArchiveSync[storedPath] = struct{}{}
+	}
+	stat, err := os.Stat(storedPath)
+	s.artifactMu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	ref := &storage.ArtifactRef{
+		Path: s.relativeArtifactPath(storedPath),
+		Size: stat.Size(),
+	}
+	if err := s.withHotBatch(func(batch *pebble.Batch) error {
+		if err := s.setHotMaybeReplace(batch, hotKeyArchiveInfo(masterchainSeqno, workchain, shard), encodeInt64(archiveID)); err != nil {
+			return err
+		}
+		return s.setHotMaybeReplace(batch, hotKeyArchiveFile(archiveID), encodeArtifactRef(ref))
+	}); err != nil {
+		return "", err
+	}
+	return storedPath, nil
 }
 
-func (s *Store) SaveArchiveSlice(archiveID, offset int64, data []byte) {
-	if len(data) == 0 {
-		return
+func (s *Store) syncPendingArchiveFiles() error {
+	s.artifactMu.Lock()
+	if len(s.pendingArchiveSync) == 0 {
+		s.artifactMu.Unlock()
+		return nil
 	}
-	if err := s.withBlobBatch(func(batch *pebble.Batch) error {
-		return s.setBlobUnique(batch, blobKeyArchiveChunk(archiveID, offset), data)
-	}); err != nil {
-		s.log.Warn().
-			Err(err).
-			Int64("archive_id", archiveID).
-			Int64("offset", offset).
-			Msg("failed to persist archive chunk")
+
+	paths := make([]string, 0, len(s.pendingArchiveSync))
+	for path := range s.pendingArchiveSync {
+		paths = append(paths, path)
 	}
+	s.artifactMu.Unlock()
+
+	sort.Strings(paths)
+	dirs := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if err := syncFile(path); err != nil {
+			return fmt.Errorf("sync archive pack %s: %w", path, err)
+		}
+		dirs[filepath.Dir(path)] = struct{}{}
+	}
+
+	dirPaths := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		dirPaths = append(dirPaths, dir)
+	}
+	sort.Strings(dirPaths)
+	for _, dir := range dirPaths {
+		if err := syncDir(dir); err != nil {
+			return fmt.Errorf("sync archive pack dir %s: %w", dir, err)
+		}
+	}
+
+	s.artifactMu.Lock()
+	for _, path := range paths {
+		delete(s.pendingArchiveSync, path)
+	}
+	s.artifactMu.Unlock()
+	return nil
+}
+
+func syncFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	return file.Sync()
+}
+
+func syncDir(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	if err = file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
@@ -430,15 +741,21 @@ func (s *Store) NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*storag
 }
 
 func (s *Store) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	return s.getBlobCopy(ctx, blobKeyBlockData(block))
+	return s.readArtifact(ctx, hotKeyBlockDataRef(block))
 }
 
 func (s *Store) BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	return s.getBlobCopy(ctx, blobKeyProof(kind, block))
+	return s.readArtifact(ctx, hotKeyProofRef(kind, block))
 }
 
-func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32) (int64, error) {
-	raw, err := s.getHotCopy(ctx, hotKeyArchiveInfo(masterchainSeqno))
+func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
+	raw, err := s.getHotCopy(ctx, hotKeyArchiveInfo(masterchainSeqno, workchain, shard))
+	if errors.Is(err, storage.ErrNotFound) {
+		rounded := roundArchiveMasterchainSeqno(masterchainSeqno)
+		if rounded != masterchainSeqno {
+			raw, err = s.getHotCopy(ctx, hotKeyArchiveInfo(rounded, workchain, shard))
+		}
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -448,15 +765,186 @@ func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32) (int64,
 	return int64(binary.BigEndian.Uint64(raw)), nil
 }
 
+func roundArchiveMasterchainSeqno(seqno int32) int32 {
+	if seqno <= 0 {
+		return seqno
+	}
+	return seqno - seqno%archivePackageMasterchainBlocks
+}
+
 func (s *Store) ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error) {
-	data, err := s.getBlobCopy(ctx, blobKeyArchiveChunk(archiveID, offset))
+	raw, err := s.getHotCopy(ctx, hotKeyArchiveFile(archiveID))
 	if err != nil {
 		return nil, err
 	}
-	if maxSize > 0 && len(data) > int(maxSize) {
-		data = data[:maxSize]
+	ref, err := decodeArtifactRef(raw)
+	if err != nil {
+		return nil, err
+	}
+	if offset < 0 || maxSize < 0 {
+		return nil, fmt.Errorf("invalid archive range offset=%d max_size=%d", offset, maxSize)
+	}
+	if maxSize == 0 {
+		return []byte{}, nil
+	}
+	if offset >= ref.Size {
+		return nil, nil
+	}
+	size := ref.Size - offset
+	if size > int64(maxSize) {
+		size = int64(maxSize)
+	}
+	return packfile.ReadRange(s.artifactPath(ref.Path), offset, size)
+}
+
+func (s *Store) appendArtifactEntry(kind string, block ton.BlockIDExt, data []byte) (*storage.ArtifactRef, error) {
+	s.artifactMu.Lock()
+	defer s.artifactMu.Unlock()
+
+	path := s.loosePackPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	ptr, err := packfile.Append(file, packfile.EntryName(kind, block), data, true)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.ArtifactRef{
+		Path:   s.relativeArtifactPath(path),
+		Offset: ptr.Offset,
+		Size:   ptr.Size,
+	}, nil
+}
+
+func (s *Store) readArtifact(ctx context.Context, key []byte) ([]byte, error) {
+	raw, err := s.getHotCopy(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	ref, err := decodeArtifactRef(raw)
+	if err != nil {
+		return nil, err
+	}
+	data, err := packfile.ReadRange(s.artifactPath(ref.Path), ref.Offset, ref.Size)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != ref.Size {
+		return nil, fmt.Errorf("artifact %s range offset=%d size=%d is truncated", ref.Path, ref.Offset, ref.Size)
 	}
 	return data, nil
+}
+
+func (s *Store) artifactPath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(s.dir, path)
+}
+
+func (s *Store) relativeArtifactPath(path string) string {
+	rel, err := filepath.Rel(s.dir, path)
+	if err != nil {
+		return path
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return path
+	}
+	return rel
+}
+
+func (s *Store) loosePackPath() string {
+	return filepath.Join(s.dir, "packs", "loose", "blocks.pack")
+}
+
+func (s *Store) archivePackPath(archiveID int64) string {
+	return filepath.Join(s.dir, "packs", "archive", fmt.Sprintf("%d.pack", archiveID))
+}
+
+func packEntryKindForProof(isLink bool) string {
+	if isLink {
+		return packfile.KindProofLink
+	}
+	return packfile.KindProof
+}
+
+func packEntryKindForProofKind(kind storage.ServedProofKind) string {
+	switch kind {
+	case storage.ServedProofBlockLink, storage.ServedProofKeyBlockLink:
+		return packfile.KindProofLink
+	default:
+		return packfile.KindProof
+	}
+}
+
+func storeArchivePack(src string, dst string) (bool, error) {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return false, err
+	}
+	if filepath.Clean(src) == filepath.Clean(dst) {
+		return false, validateArchivePack(dst)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		if err = validateArchivePack(dst); err != nil {
+			return false, err
+		}
+		_ = os.Remove(src)
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if err := os.Rename(src, dst); err == nil {
+		return true, validateArchivePack(dst)
+	}
+	if err := copyFileSync(src, dst); err != nil {
+		return false, err
+	}
+	if err := validateArchivePack(dst); err != nil {
+		return false, err
+	}
+	return true, os.Remove(src)
+}
+
+func validateArchivePack(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+
+	var magic [packfile.HeaderSize]byte
+	if _, err = io.ReadFull(file, magic[:]); err != nil {
+		return fmt.Errorf("read archive package magic: %w", err)
+	}
+	if binary.LittleEndian.Uint32(magic[:]) != packfile.PackageMagic {
+		return fmt.Errorf("archive package magic mismatch")
+	}
+	return nil
+}
+
+func copyFileSync(src string, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 func (s *Store) SaveCurrentState(ctx context.Context, state *storage.CurrentState) error {
@@ -568,46 +1056,78 @@ func (s *Store) currentStateRecord(ctx context.Context, key []byte, label string
 	return state, nil
 }
 
+type preparedBlockStateSave struct {
+	original     *storage.BlockState
+	saved        storage.BlockState
+	lazyRoot     *cell.Cell
+	cellSyncHash cell.Hash
+	syncCells    bool
+	flushCells   bool
+}
+
 func (s *Store) SaveBlockState(ctx context.Context, state *storage.BlockState) error {
-	saved, lazyRoot, cellSyncHash, syncCells, err := s.prepareBlockStateForSave(ctx, state)
+	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, []*storage.BlockState{state})
 	if err != nil {
 		return err
 	}
-	if err = s.saveBlockStateRecords(saved, cellSyncHash, syncCells, nil); err != nil {
+	if err = s.savePreparedBlockStateRecords(prepared, nil, cellsElapsed); err != nil {
 		return err
 	}
-	if saved.Cell != nil && saved.Parsed != nil {
-		if err := s.replaceBlockStateWithLazyRoot(state, saved, lazyRoot); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.replacePreparedBlockStatesWithLazyRoots(prepared)
 }
 
 func (s *Store) SaveBlockStateAndCurrentState(ctx context.Context, block *storage.BlockState, current *storage.CurrentState) error {
+	var blocks []*storage.BlockState
+	if block != nil {
+		blocks = []*storage.BlockState{block}
+	}
+	return s.SaveBlockStatesAndCurrentState(ctx, blocks, current)
+}
+
+func (s *Store) SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}
 
-	saved, lazyRoot, cellSyncHash, syncCells, err := s.prepareBlockStateForSave(ctx, block)
+	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, blocks)
 	if err != nil {
 		return err
 	}
-	if err = s.saveBlockStateRecords(saved, cellSyncHash, syncCells, current); err != nil {
+	if err = s.savePreparedBlockStateRecords(prepared, current, cellsElapsed); err != nil {
 		return err
 	}
-	if saved.Cell != nil && saved.Parsed != nil {
-		if err := s.replaceBlockStateWithLazyRoot(block, saved, lazyRoot); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.replacePreparedBlockStatesWithLazyRoots(prepared)
 }
 
-func (s *Store) prepareBlockStateForSave(ctx context.Context, state *storage.BlockState) (storage.BlockState, *cell.Cell, cell.Hash, bool, error) {
+func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState) ([]preparedBlockStateSave, time.Duration, error) {
+	started := time.Now()
+	prepared := make([]preparedBlockStateSave, 0, len(states))
+	seen := make(map[string]struct{}, len(states))
+	exists := newStateCellExistenceCache()
+	for _, state := range states {
+		if state == nil {
+			continue
+		}
+		key := storage.BlockKey(state.Block)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		next, err := s.prepareBlockStateForSave(ctx, state, exists)
+		if err != nil {
+			return nil, 0, err
+		}
+		prepared = append(prepared, next)
+	}
+	return prepared, time.Since(started), nil
+}
+
+func (s *Store) prepareBlockStateForSave(ctx context.Context, state *storage.BlockState, exists *stateCellExistenceCache) (preparedBlockStateSave, error) {
 	var zero cell.Hash
+	var prepared preparedBlockStateSave
 	if state == nil {
-		return storage.BlockState{}, nil, zero, false, fmt.Errorf("block state is nil")
+		return prepared, fmt.Errorf("block state is nil")
 	}
 	saved := *state
 	if len(saved.StateRootHash) == 0 && saved.Cell != nil {
@@ -619,19 +1139,20 @@ func (s *Store) prepareBlockStateForSave(ctx context.Context, state *storage.Blo
 		saved.StateCellHash = hash[:]
 	}
 	if len(saved.StateRootHash) == 0 {
-		return storage.BlockState{}, nil, zero, false, fmt.Errorf("block state root hash is empty")
+		return prepared, fmt.Errorf("block state root hash is empty")
 	}
 	if len(saved.StateCellHash) == 0 {
-		return storage.BlockState{}, nil, zero, false, fmt.Errorf("block state cell hash is empty")
+		return prepared, fmt.Errorf("block state cell hash is empty")
 	}
 	if len(saved.StateCellHash) != len(zero) {
-		return storage.BlockState{}, nil, zero, false, fmt.Errorf("block state cell hash size mismatch: got %d", len(saved.StateCellHash))
+		return prepared, fmt.Errorf("block state cell hash size mismatch: got %d", len(saved.StateCellHash))
 	}
 
 	var cellSyncHash cell.Hash
 	copy(cellSyncHash[:], saved.StateCellHash)
 	var lazyRoot *cell.Cell
 	syncCells := false
+	flushCells := false
 
 	if saved.Cell != nil {
 		syncCells = true
@@ -639,21 +1160,49 @@ func (s *Store) prepareBlockStateForSave(ctx context.Context, state *storage.Blo
 			lazyRoot = saved.Cell
 		} else {
 			cellSyncHash = saved.Cell.HashKey()
-			if err := s.saveStateCellTree(ctx, saved.Block, saved.Cell, nil, saved.CellsCount, saved.ReusedStateCells, saved.ReusedStateRefs); err != nil {
-				return storage.BlockState{}, nil, zero, false, err
-			}
 			var err error
+			flushCells, err = s.saveStateCellTreeWithCache(ctx, saved.Block, saved.Cell, nil, saved.CellsCount, saved.ReusedStateCells, saved.ReusedStateRefs, exists)
+			if err != nil {
+				return prepared, err
+			}
 			lazyRoot, err = s.loadLazyCell(ctx, cellSyncHash[:])
 			if err != nil {
-				return storage.BlockState{}, nil, zero, false, fmt.Errorf("load persisted lazy state root: %w", err)
+				return prepared, fmt.Errorf("load persisted lazy state root: %w", err)
 			}
 		}
 	}
 
-	return saved, lazyRoot, cellSyncHash, syncCells, nil
+	return preparedBlockStateSave{
+		original:     state,
+		saved:        saved,
+		lazyRoot:     lazyRoot,
+		cellSyncHash: cellSyncHash,
+		syncCells:    syncCells,
+		flushCells:   flushCells,
+	}, nil
 }
 
-func (s *Store) saveBlockStateRecords(saved storage.BlockState, cellSyncHash cell.Hash, syncCells bool, current *storage.CurrentState) error {
+func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave, current *storage.CurrentState, cellsElapsed time.Duration) error {
+	flushCells := false
+	for _, state := range prepared {
+		if state.flushCells {
+			flushCells = true
+			break
+		}
+	}
+
+	flushStarted := time.Now()
+	if flushCells {
+		if err := s.flushCellDBs(); err != nil {
+			return fmt.Errorf("flush state cells before metadata marker: %w", err)
+		}
+	}
+	flushElapsed := time.Since(flushStarted)
+
+	if err := s.syncPendingArchiveFiles(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -664,53 +1213,171 @@ func (s *Store) saveBlockStateRecords(saved storage.BlockState, cellSyncHash cel
 	batch := s.hot.NewBatch()
 	defer func() { _ = batch.Close() }()
 
-	if syncCells {
-		if err := batch.Set(hotKeyStateCellSync(saved.Block), encodeStateCellSync(cellSyncHash, saved.CellsCount), pebble.NoSync); err != nil {
+	for _, state := range prepared {
+		if state.syncCells {
+			if err := batch.Set(hotKeyStateCellSync(state.saved.Block), encodeStateCellSync(state.cellSyncHash, state.saved.CellsCount), pebble.NoSync); err != nil {
+				return err
+			}
+		}
+		if err := s.setHotMaybeReplace(batch, hotKeyStateMeta(state.saved.Block), encodeBlockStateMeta(&state.saved)); err != nil {
 			return err
 		}
-	}
-	if err := s.setHotMaybeReplace(batch, hotKeyStateMeta(saved.Block), encodeBlockStateMeta(&saved)); err != nil {
-		return err
-	}
-	if err := s.setMergedBlockMeta(batch, storage.BuildBlockMetaFromState(saved)); err != nil {
-		return err
+		if err := s.setMergedBlockMeta(batch, storage.BuildBlockMetaFromState(state.saved)); err != nil {
+			return err
+		}
 	}
 	if current != nil {
 		if err := s.setHotMaybeReplace(batch, hotKeyCurrentState(), encodeCurrentState(current)); err != nil {
 			return err
 		}
 	}
-	return batch.Commit(pebble.Sync)
+
+	hotSyncStarted := time.Now()
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	hotSyncElapsed := time.Since(hotSyncStarted)
+
+	s.logBlockStateCheckpoint(prepared, current, flushCells, cellsElapsed, flushElapsed, hotSyncElapsed)
+	return nil
+}
+
+func (s *Store) replacePreparedBlockStatesWithLazyRoots(prepared []preparedBlockStateSave) error {
+	for _, state := range prepared {
+		if state.saved.Cell == nil || state.saved.Parsed == nil {
+			continue
+		}
+		if err := s.replaceBlockStateWithLazyRoot(state.original, state.saved, state.lazyRoot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) logBlockStateCheckpoint(prepared []preparedBlockStateSave, current *storage.CurrentState, flushCells bool, cellsElapsed time.Duration, flushElapsed time.Duration, hotSyncElapsed time.Duration) {
+	metrics := s.cells.metrics()
+	event := s.log.Debug().
+		Int("states", len(prepared)).
+		Bool("flush_cells", flushCells).
+		Dur("save_cells_batch_elapsed", cellsElapsed).
+		Dur("flush_cell_dbs_elapsed", flushElapsed).
+		Dur("hot_metadata_sync_elapsed", hotSyncElapsed).
+		Int64("cell_flush_count", metrics.flushCount).
+		Uint64("cell_ingest_count", metrics.ingestCount).
+		Int64("cell_l0_files", metrics.l0Files).
+		Int64("cell_l0_size", metrics.l0Size).
+		Uint64("cell_compaction_debt", metrics.compactionDebt).
+		Int64("cell_compactions_in_progress", metrics.compactionsInProgress).
+		Int64("cell_compaction_bytes_pending", metrics.compactionBytesPending).
+		Uint64("cell_memtable_size", metrics.memTableSize).
+		Int64("cell_memtable_count", metrics.memTableCount)
+
+	if current != nil {
+		event.
+			Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+			Uint32("shard_client_seqno", current.ShardClientSeqno).
+			Int("shards", len(current.Shards))
+	}
+
+	event.Msg("block state checkpoint persisted")
 }
 
 func (s *Store) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	return s.importStateCellTree(ctx, block, root, parsedCells, totalCells, nil, nil)
+	roots, err := s.importStateCellTrees(ctx, []stateCellTreeImport{{
+		block:       block,
+		root:        root,
+		parsedCells: parsedCells,
+		totalCells:  totalCells,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return roots[0], nil
+}
+
+func (s *Store) ImportStateCellTrees(ctx context.Context, trees []storage.StateCellTreeImport) ([]*cell.Cell, error) {
+	imports := make([]stateCellTreeImport, len(trees))
+	for i, tree := range trees {
+		imports[i] = stateCellTreeImport{
+			block:       tree.Block,
+			root:        tree.Root,
+			parsedCells: tree.ParsedCells,
+			totalCells:  tree.TotalCells,
+		}
+	}
+	return s.importStateCellTrees(ctx, imports)
+}
+
+type stateCellTreeImport struct {
+	block            ton.BlockIDExt
+	root             *cell.Cell
+	parsedCells      []cell.Cell
+	totalCells       uint64
+	reusedStateCells []cell.MerkleUpdateReusedCell
+	reusedStateRefs  []cell.MerkleUpdateReusedRef
+}
+
+type stateCellTreeSync struct {
+	block     ton.BlockIDExt
+	rootHash  cell.Hash
+	cellCount uint64
 }
 
 func (s *Store) importStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64, reusedStateCells []cell.MerkleUpdateReusedCell, reusedStateRefs []cell.MerkleUpdateReusedRef) (*cell.Cell, error) {
-	if root == nil {
-		return nil, fmt.Errorf("state cell tree root is nil")
-	}
-
-	rootCellHash := root.HashKey()
-	if err := s.saveStateCellTree(ctx, block, root, parsedCells, totalCells, reusedStateCells, reusedStateRefs); err != nil {
+	roots, err := s.importStateCellTrees(ctx, []stateCellTreeImport{{
+		block:            block,
+		root:             root,
+		parsedCells:      parsedCells,
+		totalCells:       totalCells,
+		reusedStateCells: reusedStateCells,
+		reusedStateRefs:  reusedStateRefs,
+	}})
+	if err != nil {
 		return nil, err
 	}
+	return roots[0], nil
+}
 
-	if err := s.syncStateCellTree(block, rootCellHash, totalCells); err != nil {
+func (s *Store) importStateCellTrees(ctx context.Context, trees []stateCellTreeImport) ([]*cell.Cell, error) {
+	if len(trees) == 0 {
+		return nil, nil
+	}
+
+	roots := make([]*cell.Cell, len(trees))
+	syncs := make([]stateCellTreeSync, len(trees))
+	for i, tree := range trees {
+		if tree.root == nil {
+			return nil, fmt.Errorf("state cell tree root is nil")
+		}
+
+		rootCellHash := tree.root.HashKey()
+		if _, err := s.saveStateCellTree(ctx, tree.block, tree.root, tree.parsedCells, tree.totalCells, tree.reusedStateCells, tree.reusedStateRefs); err != nil {
+			return nil, err
+		}
+		syncs[i] = stateCellTreeSync{
+			block:     tree.block,
+			rootHash:  rootCellHash,
+			cellCount: tree.totalCells,
+		}
+	}
+
+	if err := s.syncStateCellTrees(syncs); err != nil {
 		return nil, fmt.Errorf("sync state cells: %w", err)
 	}
 
-	lazyRoot, err := s.loadLazyCell(ctx, rootCellHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("load persisted lazy state root: %w", err)
-	}
+	for i, sync := range syncs {
+		lazyRoot, err := s.loadLazyCell(ctx, sync.rootHash[:])
+		if err != nil {
+			return nil, fmt.Errorf("load persisted lazy state root: %w", err)
+		}
+		roots[i] = lazyRoot
 
-	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Uint64("cells", totalCells).
-		Msg("state cell tree imported and switched to lazy celldb root")
-	return lazyRoot, nil
+		s.log.Debug().
+			Str("block", storage.FormatBlockRef(sync.block)).
+			Uint64("cells", sync.cellCount).
+			Msg("state cell tree imported and switched to lazy celldb root")
+	}
+	return roots, nil
 }
 
 func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {
@@ -738,6 +1405,18 @@ func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 }
 
 func (s *Store) syncStateCellTree(block ton.BlockIDExt, rootHash cell.Hash, totalCells uint64) error {
+	return s.syncStateCellTrees([]stateCellTreeSync{{
+		block:     block,
+		rootHash:  rootHash,
+		cellCount: totalCells,
+	}})
+}
+
+func (s *Store) syncStateCellTrees(syncs []stateCellTreeSync) error {
+	if err := s.flushCellDBs(); err != nil {
+		return fmt.Errorf("flush state cells before sync marker: %w", err)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -746,15 +1425,16 @@ func (s *Store) syncStateCellTree(block ton.BlockIDExt, rootHash cell.Hash, tota
 	}
 
 	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Uint64("cells", totalCells).
-		Msg("syncing persisted state cells before returning lazy root")
+		Int("trees", len(syncs)).
+		Msg("syncing persisted state cells before returning lazy roots")
 
 	batch := s.hot.NewBatch()
 	defer func() { _ = batch.Close() }()
 
-	if err := batch.Set(hotKeyStateCellSync(block), encodeStateCellSync(rootHash, totalCells), pebble.NoSync); err != nil {
-		return err
+	for _, sync := range syncs {
+		if err := batch.Set(hotKeyStateCellSync(sync.block), encodeStateCellSync(sync.rootHash, sync.cellCount), pebble.NoSync); err != nil {
+			return err
+		}
 	}
 	return batch.Commit(pebble.Sync)
 }
@@ -786,26 +1466,35 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 	return nil
 }
 
-func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64, reusedStateCells []cell.MerkleUpdateReusedCell, reusedStateRefs []cell.MerkleUpdateReusedRef) error {
+func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64, reusedStateCells []cell.MerkleUpdateReusedCell, reusedStateRefs []cell.MerkleUpdateReusedRef) (bool, error) {
+	return s.saveStateCellTreeWithCache(ctx, block, root, parsedCells, totalCells, reusedStateCells, reusedStateRefs, nil)
+}
+
+func (s *Store) saveStateCellTreeWithCache(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64, reusedStateCells []cell.MerkleUpdateReusedCell, reusedStateRefs []cell.MerkleUpdateReusedRef, exists *stateCellExistenceCache) (bool, error) {
+	return s.saveStateCellTreeWithCacheLogging(ctx, block, root, parsedCells, totalCells, reusedStateCells, reusedStateRefs, exists, "dfs", false)
+}
+
+func (s *Store) saveStateCellTreeWithCacheLogging(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64, reusedStateCells []cell.MerkleUpdateReusedCell, reusedStateRefs []cell.MerkleUpdateReusedRef, exists *stateCellExistenceCache, source string, quiet bool) (bool, error) {
 	if len(parsedCells) > 0 {
 		return s.saveParsedStateCellsBatch(ctx, block, parsedCells, totalCells)
 	}
 
 	started := time.Now()
 	lastLog := started
-	source := "dfs"
 
-	event := s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Str("source", source).
-		Uint64("total_cells", totalCells).
-		Int("reused_state_cells", len(reusedStateCells))
-	addCellProgress(event, 0, totalCells)
-	event.Msg("persisting state cells")
+	if !quiet {
+		event := s.log.Debug().
+			Str("block", storage.FormatBlockRef(block)).
+			Str("source", source).
+			Uint64("total_cells", totalCells).
+			Int("reused_state_cells", len(reusedStateCells))
+		addCellProgress(event, 0, totalCells)
+		event.Msg("persisting state cells")
+	}
 
-	writer, err := s.newStateCellBatchWriter()
+	writer, err := s.newStateCellBatchWriter(exists)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer writer.close()
 
@@ -816,6 +1505,9 @@ func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 	var skippedExisting int64
 
 	logProgress := func(done bool) {
+		if quiet {
+			return
+		}
 		event := s.log.Debug().
 			Str("block", storage.FormatBlockRef(block)).
 			Str("source", source).
@@ -832,7 +1524,7 @@ func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 			event.Msg("state cells persisted")
 			return
 		}
-		event.Int("pending_batch_cells", writer.cellsInBatch).Msg("state cell persistence progress")
+		event.Int("pending_batch_cells", writer.pendingCells()).Msg("state cell persistence progress")
 	}
 
 	flush := func() error {
@@ -872,12 +1564,12 @@ func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 		if !ok {
 			return false, nil
 		}
-		exists, err := pebbleReaderHas(writer.db, hotKeyCell(hash[:]))
+		if raw.IsLazy() {
+			return true, nil
+		}
+		exists, err := writer.has(hash)
 		if err != nil {
 			return false, err
-		}
-		if !exists && raw.IsLazy() {
-			return false, fmt.Errorf("reused lazy state cell %x is missing from storage", hash[:])
 		}
 		return exists, nil
 	}
@@ -892,7 +1584,7 @@ func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 		if processed&0x3fff == 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return false, ctx.Err()
 			default:
 			}
 		}
@@ -900,52 +1592,56 @@ func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 		idx := len(stack) - 1
 		current := stack[idx]
 		stack = stack[:idx]
-		currentHash := stateCellStorageHash(current)
+		currentMeta := current.GetMetadata()
+		currentHash := currentMeta.Hash
 
 		if exists, err := reusedCellExists(currentHash); err != nil {
-			return err
+			return false, err
 		} else if exists {
 			skippedReusedState++
 			processed++
 			continue
 		}
 		if current.IsLazy() {
-			exists, err := pebbleReaderHas(writer.db, hotKeyCell(currentHash[:]))
-			if err != nil {
-				return err
-			}
-			if exists {
-				skippedExisting++
-				processed++
-				continue
-			}
-			return fmt.Errorf("lazy state cell %x is missing from storage", currentHash[:])
+			skippedExisting++
+			processed++
+			continue
 		}
 
-		var refs [4]*cell.Cell
-		refsCount := int(current.RefsNum())
-		if refsCount > len(refs) {
-			return fmt.Errorf("cell refs count is too large: %d", refsCount)
-		}
-		for i := 0; i < refsCount; i++ {
+		refs := currentMeta.Refs
+		for i := 0; i < len(refs); i++ {
+			refFromReused := false
+			var refCell *cell.Cell
 			if reusedRef, ok := reusedStateRefEdges[stateCellReusedRefKey{parentHash: currentHash, refIndex: i}]; ok {
-				refs[i] = reusedRef.RawCell
+				refCell = reusedRef.RawCell
+				refs[i] = stateCellRefMetadata(reusedRef.RawCell)
+				refFromReused = true
 			} else {
-				ref, err := current.PeekRef(i)
-				if err != nil {
-					return fmt.Errorf("load state cell ref hash=%x ref=%d: %w", currentHash[:], i, err)
-				}
-				refs[i] = ref
-				refHash := stateCellStorageHash(ref)
+				refHash := refs[i].Hash
 				if raw, ok := reusedStateCellRefs[refHash]; ok {
-					refs[i] = raw
+					refCell = raw
+					refs[i] = stateCellRefMetadata(raw)
+					refFromReused = true
 				}
 			}
 
 			ref := refs[i]
-			refHash := stateCellStorageHash(ref)
-			if exists, err := reusedCellExists(refHash); err != nil {
-				return err
+			refHash := ref.Hash
+			if refFromReused {
+				if ref.Lazy {
+					skippedReusedState++
+					continue
+				}
+				exists, err := writer.has(refHash)
+				if err != nil {
+					return false, err
+				}
+				if exists {
+					skippedReusedState++
+					continue
+				}
+			} else if exists, err := reusedCellExists(refHash); err != nil {
+				return false, err
 			} else if exists {
 				skippedReusedState++
 				continue
@@ -953,42 +1649,44 @@ func (s *Store) saveStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 			if _, ok := visited[refHash]; ok {
 				continue
 			}
-			if ref.IsLazy() {
-				exists, err := pebbleReaderHas(writer.db, hotKeyCell(refHash[:]))
+			if ref.Lazy {
+				skippedExisting++
+				continue
+			}
+			if refCell == nil {
+				refCell, err = current.PeekRef(i)
 				if err != nil {
-					return err
+					return false, fmt.Errorf("load state ref %x from parent %x ref=%d: %w", refHash[:], currentHash[:], i, err)
 				}
-				if exists {
-					skippedExisting++
-					continue
-				}
-				return fmt.Errorf("lazy state ref %x from parent %x ref=%d is missing from storage", refHash[:], currentHash[:], i)
+			}
+			if refCell == nil || refCell.IsLazy() {
+				return false, fmt.Errorf("state ref %x from parent %x ref=%d has no body", refHash[:], currentHash[:], i)
 			}
 
 			visited[refHash] = struct{}{}
-			stack = append(stack, ref)
+			stack = append(stack, refCell)
 		}
 
-		if err := writer.add(current, refs[:refsCount]); err != nil {
-			return err
+		if err := writer.add(current, currentMeta, refs); err != nil {
+			return false, err
 		}
 		processed++
 
-		if writer.bytesInBatch >= stateCellImportBatchTargetBytes {
+		if writer.pendingBytes() >= stateCellImportBatchTargetBytes {
 			if err := flush(); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
 
 	if err := flush(); err != nil {
-		return err
+		return false, err
 	}
 	logProgress(true)
-	return nil
+	return applied > 0, nil
 }
 
-func (s *Store) saveParsedStateCellsBatch(ctx context.Context, block ton.BlockIDExt, parsedCells []cell.Cell, totalCells uint64) error {
+func (s *Store) saveParsedStateCellsBatch(ctx context.Context, block ton.BlockIDExt, parsedCells []cell.Cell, totalCells uint64) (bool, error) {
 	if totalCells == 0 {
 		totalCells = uint64(len(parsedCells))
 	}
@@ -1004,9 +1702,9 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, block ton.BlockID
 	addCellProgress(event, 0, totalCells)
 	event.Msg("persisting state cells")
 
-	writer, err := s.newStateCellBatchWriter()
+	writer, err := s.newStateCellBatchWriter(nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer writer.close()
 
@@ -1029,7 +1727,7 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, block ton.BlockID
 			event.Msg("state cells persisted")
 			return
 		}
-		event.Int("pending_batch_cells", writer.cellsInBatch).Msg("state cell persistence progress")
+		event.Int("pending_batch_cells", writer.pendingCells()).Msg("state cell persistence progress")
 	}
 
 	flush := func() error {
@@ -1051,55 +1749,58 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, block ton.BlockID
 		if processed&0x3fff == 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return false, ctx.Err()
 			default:
 			}
 		}
 
 		current := &parsedCells[i]
-		var refs [4]*cell.Cell
-		refsSlice, err := stateCellRefs(current, &refs)
+		refsSlice, err := stateCellRefs(current)
 		if err != nil {
 			hash := stateCellStorageHash(current)
-			return fmt.Errorf("load parsed state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", hash[:], current.IsLazy(), current.IsVirtualized(), current.GetType(), err)
+			return false, fmt.Errorf("load parsed state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", hash[:], current.IsLazy(), current.IsVirtualized(), current.GetType(), err)
 		}
 
-		if err := writer.add(current, refsSlice); err != nil {
-			return err
+		if err := writer.add(current, current.GetMetadata(), refsSlice); err != nil {
+			return false, err
 		}
 		processed++
 
-		if writer.bytesInBatch >= stateCellImportBatchTargetBytes {
+		if writer.pendingBytes() >= stateCellImportBatchTargetBytes {
 			if err := flush(); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
 
 	if err := flush(); err != nil {
-		return err
+		return false, err
 	}
 	logProgress(true)
-	return nil
+	return applied > 0, nil
 }
 
-func stateCellRefs(cl *cell.Cell, refs *[4]*cell.Cell) ([]*cell.Cell, error) {
-	refsCount := int(cl.RefsNum())
-	if refsCount > len(refs) {
-		return nil, fmt.Errorf("cell refs count is too large: %d", refsCount)
+func stateCellRefs(cl *cell.Cell) ([]cell.RefMetadata, error) {
+	meta := cl.GetMetadata()
+	if len(meta.Refs) > 4 {
+		return nil, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
 	}
-	for i := 0; i < refsCount; i++ {
-		ref, err := cl.PeekRef(i)
-		if err != nil {
-			return nil, err
-		}
-		refs[i] = ref
-	}
-	return refs[:refsCount], nil
+	return meta.Refs, nil
 }
 
 func stateCellStorageHash(cl *cell.Cell) cell.Hash {
-	return cl.HashKey()
+	return cl.GetMetadata().Hash
+}
+
+func stateCellRefMetadata(cl *cell.Cell) cell.RefMetadata {
+	meta := cl.GetMetadata()
+	return cell.RefMetadata{
+		Hash:      meta.Hash,
+		LevelMask: meta.LevelMask,
+		Hashes:    meta.Hashes,
+		Depths:    meta.Depths,
+		Lazy:      cl.IsLazy(),
+	}
 }
 
 type stateCellReusedRefKey struct {
@@ -1127,50 +1828,70 @@ type stateCellWriteStats struct {
 	bytes int64
 }
 
-type stateCellBatchWriter struct {
-	db    *pebble.DB
-	batch *pebble.Batch
-
-	cellsInBatch int
-	bytesInBatch int
+type stateCellExistenceCache struct {
+	values map[cell.Hash]bool
 }
 
-func (s *Store) newStateCellBatchWriter() (*stateCellBatchWriter, error) {
+func newStateCellExistenceCache() *stateCellExistenceCache {
+	return &stateCellExistenceCache{values: map[cell.Hash]bool{}}
+}
+
+func (c *stateCellExistenceCache) get(hash cell.Hash) (bool, bool) {
+	if c == nil {
+		return false, false
+	}
+	exists, ok := c.values[hash]
+	return exists, ok
+}
+
+func (c *stateCellExistenceCache) set(hash cell.Hash, exists bool) {
+	if c == nil {
+		return
+	}
+	c.values[hash] = exists
+}
+
+func (c *stateCellExistenceCache) clear() {
+	if c == nil {
+		return
+	}
+	clear(c.values)
+}
+
+type stateCellBatchWriter struct {
+	cells  *cellBatchWriter
+	exists *stateCellExistenceCache
+}
+
+func (s *Store) newStateCellBatchWriter(exists *stateCellExistenceCache) (*stateCellBatchWriter, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return nil, errPebbleClosed
 	}
-	db := s.hot
 
 	return &stateCellBatchWriter{
-		db:    db,
-		batch: db.NewBatch(),
+		cells:  s.cells.newBatchWriter(),
+		exists: exists,
 	}, nil
 }
 
-func (w *stateCellBatchWriter) add(cl *cell.Cell, refs []*cell.Cell) error {
+func (w *stateCellBatchWriter) add(cl *cell.Cell, meta cell.Metadata, refs []cell.RefMetadata) error {
 	valueLen, d1, d2, err := stateCellEncodedLen(cl, refs)
 	if err != nil {
 		return err
 	}
-	hash := cl.HashKey()
-
-	op := w.batch.SetDeferred(len(hotPrefixCell)+len(hash), valueLen)
-	copy(op.Key, hotPrefixCell)
-	copy(op.Key[len(hotPrefixCell):], hash[:])
-
-	encodeStateCellRecordTo(op.Value, cl, refs, d1, d2)
-	if err = op.Finish(); err != nil {
+	hash := meta.Hash
+	if err = w.cells.setDeferred(hash[:], valueLen, func(value []byte) {
+		encodeStateCellRecordTo(value, cl, refs, d1, d2)
+	}); err != nil {
 		return err
 	}
-
-	w.cellsInBatch++
-	w.bytesInBatch += len(op.Value)
+	w.exists.set(hash, true)
 	return nil
 }
 
-func stateCellEncodedLen(cl *cell.Cell, refs []*cell.Cell) (int, byte, byte, error) {
+func stateCellEncodedLen(cl *cell.Cell, refs []cell.RefMetadata) (int, byte, byte, error) {
 	cellBits := cl.BitsSize()
 	if cellBits > 1023 {
 		return 0, 0, 0, fmt.Errorf("cell bits length is too large: %d", cellBits)
@@ -1180,11 +1901,57 @@ func stateCellEncodedLen(cl *cell.Cell, refs []*cell.Cell) (int, byte, byte, err
 	}
 
 	d1, d2 := stateCellRecordDescriptors(cl, len(refs), cellBits)
-	size := uvarintLen(1) + 2 + cl.SerializedBOCBodySize()
+	size := 2 + cl.SerializedBOCBodySize()
+	refsSize := 0
+	compactRefsSize := 1
+	hasCommonRef := false
 	for _, ref := range refs {
-		size += 1 + storage.CellRefHashesCount(ref.LevelMask().Mask)*(32+2)
+		hashesCount := storage.CellRefHashesCount(ref.LevelMask.Mask)
+		if len(ref.Hashes) != hashesCount || len(ref.Depths) != hashesCount {
+			return 0, 0, 0, fmt.Errorf("invalid ref metadata for %x: hashes=%d depths=%d want=%d", ref.Hash[:], len(ref.Hashes), len(ref.Depths), hashesCount)
+		}
+		refSize := 1 + hashesCount*(cellRecordHashSize+cellRecordDepthSize)
+		refsSize += refSize
+		if stateCellRefCommon(ref) {
+			hasCommonRef = true
+			compactRefsSize += cellRecordHashSize + cellRecordDepthSize
+			continue
+		}
+		compactRefsSize += refSize
+	}
+	if hasCommonRef && compactRefsSize <= refsSize {
+		size += compactRefsSize
+	} else {
+		size += refsSize
 	}
 	return size, d1, d2, nil
+}
+
+func stateCellRefCommon(ref cell.RefMetadata) bool {
+	return ref.LevelMask.Mask == 0 && len(ref.Hashes) == 1 && len(ref.Depths) == 1
+}
+
+func stateCellCompactRefLayout(refs []cell.RefMetadata) (byte, bool) {
+	if len(refs) == 0 {
+		return 0, false
+	}
+
+	refsSize := 0
+	compactRefsSize := 1
+	hasCommonRef := false
+	var slowRefs byte
+	for i, ref := range refs {
+		refSize := 1 + len(ref.Hashes)*(cellRecordHashSize+cellRecordDepthSize)
+		refsSize += refSize
+		if stateCellRefCommon(ref) {
+			hasCommonRef = true
+			compactRefsSize += cellRecordHashSize + cellRecordDepthSize
+			continue
+		}
+		slowRefs |= 1 << uint(i)
+		compactRefsSize += refSize
+	}
+	return slowRefs, hasCommonRef && compactRefsSize <= refsSize
 }
 
 func stateCellRecordDescriptors(cl *cell.Cell, refsCount int, bitLen uint) (byte, byte) {
@@ -1201,60 +1968,75 @@ func stateCellRecordDescriptors(cl *cell.Cell, refsCount int, bitLen uint) (byte
 	return d1, d2
 }
 
-func encodeStateCellRecordTo(buf []byte, cl *cell.Cell, refs []*cell.Cell, d1 byte, d2 byte) {
-	pos := binary.PutUvarint(buf, 1)
+func encodeStateCellRecordTo(buf []byte, cl *cell.Cell, refs []cell.RefMetadata, d1 byte, d2 byte) {
+	slowRefs, compactRefs := stateCellCompactRefLayout(refs)
+	pos := 0
+	if compactRefs {
+		d1 |= cellRecordCompactRefsFlag
+	}
 	buf[pos] = d1
 	buf[pos+1] = d2
 	pos += 2
 
 	pos += cl.SerializeBOCBodyTo(buf[pos:])
-	for _, ref := range refs {
-		levelMask := ref.LevelMask()
-		buf[pos] = levelMask.Mask
+	if compactRefs {
+		buf[pos] = slowRefs
+		pos++
+	}
+	for i, ref := range refs {
+		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+			copy(buf[pos:pos+cellRecordHashSize], ref.Hashes[0][:])
+			pos += cellRecordHashSize
+			binary.BigEndian.PutUint16(buf[pos:pos+cellRecordDepthSize], ref.Depths[0])
+			pos += cellRecordDepthSize
+			continue
+		}
+
+		buf[pos] = ref.LevelMask.Mask
 		pos++
 
-		for level := 0; level <= levelMask.GetLevel(); level++ {
-			if !levelMask.IsSignificant(level) {
-				continue
-			}
-			hash := ref.HashKey(level)
+		for _, hash := range ref.Hashes {
 			copy(buf[pos:pos+32], hash[:])
 			pos += 32
 		}
-		for level := 0; level <= levelMask.GetLevel(); level++ {
-			if !levelMask.IsSignificant(level) {
-				continue
-			}
-			binary.BigEndian.PutUint16(buf[pos:pos+2], ref.Depth(level))
+		for _, depth := range ref.Depths {
+			binary.BigEndian.PutUint16(buf[pos:pos+2], depth)
 			pos += 2
 		}
 	}
 }
 
 func (w *stateCellBatchWriter) flush() (stateCellWriteStats, error) {
-	stats := stateCellWriteStats{
-		cells: int64(w.cellsInBatch),
-		bytes: int64(w.bytesInBatch),
-	}
-	if w.cellsInBatch == 0 {
-		return stats, nil
-	}
-
-	batch := w.batch
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	stats, err := w.cells.flush()
+	if err != nil {
 		return stateCellWriteStats{}, err
 	}
-	_ = batch.Close()
-	w.batch = w.db.NewBatch()
-	w.cellsInBatch = 0
-	w.bytesInBatch = 0
+	w.exists.clear()
 	return stats, nil
 }
 
 func (w *stateCellBatchWriter) close() {
-	if w.batch != nil {
-		_ = w.batch.Close()
+	w.cells.close()
+}
+
+func (w *stateCellBatchWriter) has(hash cell.Hash) (bool, error) {
+	if exists, ok := w.exists.get(hash); ok {
+		return exists, nil
 	}
+	exists, err := w.cells.store.has(hash[:])
+	if err != nil {
+		return false, err
+	}
+	w.exists.set(hash, exists)
+	return exists, nil
+}
+
+func (w *stateCellBatchWriter) pendingCells() int {
+	return w.cells.cellsInBatch
+}
+
+func (w *stateCellBatchWriter) pendingBytes() int {
+	return w.cells.bytesInBatch
 }
 
 func addCellProgress(event *zerolog.Event, processed int64, total uint64) {
@@ -1476,10 +2258,9 @@ func (s *Store) saveCellRecordBatch(records []*storage.CellRecord) (cellRecordBa
 	if s.closed {
 		return stats, errPebbleClosed
 	}
-	db := s.hot
 
-	batch := db.NewBatch()
-	defer func() { _ = batch.Close() }()
+	writer := s.cells.newBatchWriter()
+	defer writer.close()
 
 	written := make(map[cell.Hash]struct{}, len(records))
 	for _, record := range records {
@@ -1498,7 +2279,7 @@ func (s *Store) saveCellRecordBatch(records []*storage.CellRecord) (cellRecordBa
 		}
 
 		val := encodeCellRecord(record)
-		if err := batch.Set(hotKeyCell(record.Hash), val, pebble.NoSync); err != nil {
+		if err := writer.set(record.Hash, val); err != nil {
 			return stats, err
 		}
 		stats.written++
@@ -1506,14 +2287,17 @@ func (s *Store) saveCellRecordBatch(records []*storage.CellRecord) (cellRecordBa
 		written[hashKey] = struct{}{}
 	}
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if _, err := writer.flush(); err != nil {
+		return stats, err
+	}
+	if err := s.cells.flush(); err != nil {
 		return stats, err
 	}
 	return stats, nil
 }
 
 func (s *Store) CellRecord(ctx context.Context, hash []byte) (*storage.CellRecord, error) {
-	raw, err := s.getHotCopy(ctx, hotKeyCell(hash))
+	raw, err := s.getCellCopy(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -1545,11 +2329,15 @@ func (l lazyCellLoader) LoadCell(hash cell.Hash) (*cell.Cell, error) {
 }
 
 func (s *Store) loadLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	raw, err := s.getHotCopy(ctx, hotKeyCell(hash))
+	raw, err := s.getCellCopy(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
-	return storage.LazyCellRecord(decodeCellRecordTrusted(hash, raw)), nil
+	loaded, err := storage.LazyCellRecord(decodeCellRecordTrusted(hash, raw))
+	if err != nil {
+		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
+	}
+	return loaded, nil
 }
 
 func (s *Store) SaveAccountTxIndex(entry storage.AccountTxIndexEntry) error {
@@ -1787,23 +2575,6 @@ func (s *Store) deleteHotRecord(ctx context.Context, key []byte, writeOptions *p
 	return batch.Commit(writeOptions)
 }
 
-func (s *Store) withBlobBatch(fn func(batch *pebble.Batch) error) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
-		return errPebbleClosed
-	}
-	db := s.blob
-
-	batch := db.NewBatch()
-	defer func() { _ = batch.Close() }()
-	if err := fn(batch); err != nil {
-		return err
-	}
-	return batch.Commit(pebble.NoSync)
-}
-
 func (s *Store) getHotCopy(ctx context.Context, key []byte) ([]byte, error) {
 	select {
 	case <-ctx.Done():
@@ -1820,7 +2591,7 @@ func (s *Store) getHotCopy(ctx context.Context, key []byte) ([]byte, error) {
 	return pebbleReaderGetCopy(s.hot, key)
 }
 
-func (s *Store) getBlobCopy(ctx context.Context, key []byte) ([]byte, error) {
+func (s *Store) getCellCopy(ctx context.Context, hash []byte) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1833,25 +2604,21 @@ func (s *Store) getBlobCopy(ctx context.Context, key []byte) ([]byte, error) {
 	if s.closed {
 		return nil, errPebbleClosed
 	}
-	return pebbleReaderGetCopy(s.blob, key)
+	return s.cells.getCopy(hash)
+}
+
+func (s *Store) flushCellDBs() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return errPebbleClosed
+	}
+	return s.cells.flush()
 }
 
 func (s *Store) setHotUnique(batch *pebble.Batch, key, value []byte) error {
 	exists, err := pebbleReaderHas(s.hot, key)
-	if err != nil {
-		return err
-	}
-	if exists {
-		return nil
-	}
-	if err = batch.Set(key, value, pebble.NoSync); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) setBlobUnique(batch *pebble.Batch, key, value []byte) error {
-	exists, err := pebbleReaderHas(s.blob, key)
 	if err != nil {
 		return err
 	}
@@ -1921,14 +2688,13 @@ var (
 	hotPrefixBlockUTime    = []byte{0x05}
 	hotPrefixCurrentState  = []byte{0x06}
 	hotPrefixStateMeta     = []byte{0x07}
-	hotPrefixCell          = []byte{0x08}
 	hotPrefixAccountTx     = []byte{0x09}
 	hotPrefixStateCellSync = []byte{0x0A}
 	hotPrefixArchiveInfo   = []byte{0x0B}
 	hotPrefixStateSync     = []byte{0x0C}
-	blobPrefixBlockData    = []byte{0x21}
-	blobPrefixProof        = []byte{0x22}
-	blobPrefixArchive      = []byte{0x25}
+	hotPrefixBlockDataRef  = []byte{0x0D}
+	hotPrefixProofRef      = []byte{0x0E}
+	hotPrefixArchiveFile   = []byte{0x0F}
 )
 
 func hotKeyBlockMeta(id ton.BlockIDExt) []byte {
@@ -2000,11 +2766,6 @@ func hotKeyStateMetaMasterchainPrefix() []byte {
 	return binary.BigEndian.AppendUint64(buf, uint64(1)<<63)
 }
 
-func hotKeyCell(hash []byte) []byte {
-	buf := append([]byte(nil), hotPrefixCell...)
-	return append(buf, hash...)
-}
-
 func hotKeyStateCellSync(id ton.BlockIDExt) []byte {
 	return appendPrefixAndBlockID(hotPrefixStateCellSync, id)
 }
@@ -2021,25 +2782,26 @@ func hotKeyAccountTx(accountKey []byte, lt uint64, hash []byte) []byte {
 	return append(buf, hash...)
 }
 
-func hotKeyArchiveInfo(masterchainSeqno int32) []byte {
+func hotKeyArchiveInfo(masterchainSeqno int32, workchain int32, shard int64) []byte {
 	buf := append([]byte(nil), hotPrefixArchiveInfo...)
-	return binary.BigEndian.AppendUint32(buf, uint32(masterchainSeqno))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(masterchainSeqno))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(workchain))
+	return binary.BigEndian.AppendUint64(buf, uint64(shard))
 }
 
-func blobKeyBlockData(id ton.BlockIDExt) []byte {
-	return appendPrefixAndBlockID(blobPrefixBlockData, id)
+func hotKeyBlockDataRef(id ton.BlockIDExt) []byte {
+	return appendPrefixAndBlockID(hotPrefixBlockDataRef, id)
 }
 
-func blobKeyProof(kind storage.ServedProofKind, id ton.BlockIDExt) []byte {
-	buf := append([]byte(nil), blobPrefixProof...)
+func hotKeyProofRef(kind storage.ServedProofKind, id ton.BlockIDExt) []byte {
+	buf := append([]byte(nil), hotPrefixProofRef...)
 	buf = append(buf, byte(proofKindOrder(kind)))
 	return append(buf, encodeBlockID(id)...)
 }
 
-func blobKeyArchiveChunk(archiveID, offset int64) []byte {
-	buf := append([]byte(nil), blobPrefixArchive...)
-	buf = binary.BigEndian.AppendUint64(buf, uint64(archiveID))
-	return binary.BigEndian.AppendUint64(buf, uint64(offset))
+func hotKeyArchiveFile(archiveID int64) []byte {
+	buf := append([]byte(nil), hotPrefixArchiveFile...)
+	return binary.BigEndian.AppendUint64(buf, uint64(archiveID))
 }
 
 func appendHistoryPrefix(prefix []byte, key storage.BlockHistoryKey) []byte {
@@ -2288,29 +3050,37 @@ func decodeCurrentState(data []byte) (*storage.CurrentState, error) {
 }
 
 func encodeCellRecord(record *storage.CellRecord) []byte {
-	refCount := cellRecordRefCount(record)
-	buf := make([]byte, cellRecordEncodedLen(refCount, record.D2, record.Refs))
-	encodeCellRecordTo(buf, record, refCount)
+	buf := make([]byte, cellRecordEncodedLen(record.D2, record.Refs))
+	encodeCellRecordTo(buf, record)
 	return buf
 }
 
-func cellRecordRefCount(record *storage.CellRecord) int32 {
-	refCount := record.RefCount
-	if refCount <= 0 {
-		refCount = 1
+func encodeCellRecordTo(buf []byte, record *storage.CellRecord) {
+	slowRefs, compactRefs := cellRecordCompactRefLayout(record.Refs)
+	pos := 0
+	d1 := record.D1
+	if compactRefs {
+		d1 |= cellRecordCompactRefsFlag
 	}
-	return refCount
-}
-
-func encodeCellRecordTo(buf []byte, record *storage.CellRecord, refCount int32) {
-	pos := binary.PutUvarint(buf, uint64(refCount))
-	buf[pos] = record.D1
+	buf[pos] = d1
 	buf[pos+1] = record.D2
 	pos += 2
 
 	copy(buf[pos:], record.Data)
 	pos += len(record.Data)
-	for _, ref := range record.Refs {
+	if compactRefs {
+		buf[pos] = slowRefs
+		pos++
+	}
+	for i, ref := range record.Refs {
+		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+			copy(buf[pos:pos+cellRecordHashSize], ref.Hashes)
+			pos += cellRecordHashSize
+			copy(buf[pos:pos+cellRecordDepthSize], ref.Depths)
+			pos += cellRecordDepthSize
+			continue
+		}
+
 		buf[pos] = ref.LevelMask
 		pos++
 		copy(buf[pos:], ref.Hashes)
@@ -2320,37 +3090,64 @@ func encodeCellRecordTo(buf []byte, record *storage.CellRecord, refCount int32) 
 	}
 }
 
-func cellRecordEncodedLen(refCount int32, d2 byte, refs []storage.CellRefRecord) int {
-	size := uvarintLen(uint64(refCount)) + 2 + int(d2/2+d2%2)
-	for _, ref := range refs {
+func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) int {
+	size := 2 + int(d2/2+d2%2)
+	slowRefs, compactRefs := cellRecordCompactRefLayout(refs)
+	if compactRefs {
+		size++
+	}
+	for i, ref := range refs {
+		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+			size += cellRecordHashSize + cellRecordDepthSize
+			continue
+		}
 		size += 1 + len(ref.Hashes) + len(ref.Depths)
 	}
 	return size
 }
 
-func uvarintLen(v uint64) int {
-	n := 1
-	for v >= 0x80 {
-		v >>= 7
-		n++
+func cellRecordRefCommon(ref storage.CellRefRecord) bool {
+	return ref.LevelMask == 0 && len(ref.Hashes) == cellRecordHashSize && len(ref.Depths) == cellRecordDepthSize
+}
+
+func cellRecordCompactRefLayout(refs []storage.CellRefRecord) (byte, bool) {
+	if len(refs) == 0 {
+		return 0, false
 	}
-	return n
+
+	refsSize := 0
+	compactRefsSize := 1
+	hasCommonRef := false
+	var slowRefs byte
+	for i, ref := range refs {
+		refSize := 1 + len(ref.Hashes) + len(ref.Depths)
+		refsSize += refSize
+		if cellRecordRefCommon(ref) {
+			hasCommonRef = true
+			compactRefsSize += cellRecordHashSize + cellRecordDepthSize
+			continue
+		}
+		slowRefs |= 1 << uint(i)
+		compactRefsSize += refSize
+	}
+	return slowRefs, hasCommonRef && compactRefsSize <= refsSize
 }
 
 func decodeCellRecord(hash []byte, data []byte) (*storage.CellRecord, error) {
-	if len(data) < 3 {
+	if len(data) < 2 {
 		return nil, fmt.Errorf("cell record payload too small")
 	}
 	return decodeCellRecordBytes(hash, data, true)
 }
 
 func decodeCellRecordTrusted(hash []byte, data []byte) *storage.CellRecord {
-	refCount, pos := binary.Uvarint(data)
+	pos := 0
+	storedD1 := data[pos]
+	compactRefs := storedD1&cellRecordCompactRefsFlag != 0
 	record := &storage.CellRecord{
-		Hash:     hash,
-		RefCount: int32(refCount),
-		D1:       data[pos],
-		D2:       data[pos+1],
+		Hash: hash,
+		D1:   storedD1 &^ cellRecordCompactRefsFlag,
+		D2:   data[pos+1],
 	}
 	pos += 2
 
@@ -2360,7 +3157,26 @@ func decodeCellRecordTrusted(hash []byte, data []byte) *storage.CellRecord {
 
 	refsCount := int(record.D1 & 7)
 	record.Refs = make([]storage.CellRefRecord, refsCount)
+	var slowRefs byte
+	if compactRefs && refsCount > 0 {
+		slowRefs = data[pos]
+		pos++
+	}
 	for i := 0; i < refsCount; i++ {
+		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+			hashes := data[pos : pos+cellRecordHashSize]
+			pos += cellRecordHashSize
+			depths := data[pos : pos+cellRecordDepthSize]
+			pos += cellRecordDepthSize
+
+			record.Refs[i] = storage.CellRefRecord{
+				LevelMask: 0,
+				Hashes:    hashes,
+				Depths:    depths,
+			}
+			continue
+		}
+
 		levelMask := data[pos]
 		pos++
 
@@ -2386,22 +3202,17 @@ func decodeCellRecordBytes(hash []byte, data []byte, clone bool) (*storage.CellR
 		return nil, fmt.Errorf("cell hash size mismatch: %d", len(hash))
 	}
 
-	refCount, pos := binary.Uvarint(data)
-	if pos <= 0 {
-		return nil, fmt.Errorf("invalid cell refcount")
-	}
-	if refCount == 0 || refCount > 1<<31-1 {
-		return nil, fmt.Errorf("invalid cell refcount %d", refCount)
-	}
+	pos := 0
 	if len(data)-pos < 2 {
 		return nil, fmt.Errorf("cell record payload too small")
 	}
 
+	storedD1 := data[pos]
+	compactRefs := storedD1&cellRecordCompactRefsFlag != 0
 	record := &storage.CellRecord{
-		Hash:     hash,
-		RefCount: int32(refCount),
-		D1:       data[pos],
-		D2:       data[pos+1],
+		Hash: hash,
+		D1:   storedD1 &^ cellRecordCompactRefsFlag,
+		D2:   data[pos+1],
 	}
 	if clone {
 		record.Hash = bytes.Clone(hash)
@@ -2423,7 +3234,38 @@ func decodeCellRecordBytes(hash []byte, data []byte, clone bool) (*storage.CellR
 	pos += dataLen
 
 	record.Refs = make([]storage.CellRefRecord, 0, refsCount)
+	var slowRefs byte
+	if compactRefs && refsCount > 0 {
+		if pos >= len(data) {
+			return nil, fmt.Errorf("cell record compact ref layout truncated")
+		}
+		slowRefs = data[pos]
+		pos++
+		if slowRefs&^byte((1<<uint(refsCount))-1) != 0 {
+			return nil, fmt.Errorf("cell record compact ref layout has invalid slow refs mask %d", slowRefs)
+		}
+	}
 	for i := 0; i < refsCount; i++ {
+		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+			if len(data)-pos < cellRecordHashSize+cellRecordDepthSize {
+				return nil, fmt.Errorf("cell record compact ref metadata truncated")
+			}
+			hashes := data[pos : pos+cellRecordHashSize]
+			pos += cellRecordHashSize
+			depths := data[pos : pos+cellRecordDepthSize]
+			pos += cellRecordDepthSize
+			if clone {
+				hashes = bytes.Clone(hashes)
+				depths = bytes.Clone(depths)
+			}
+			record.Refs = append(record.Refs, storage.CellRefRecord{
+				LevelMask: 0,
+				Hashes:    hashes,
+				Depths:    depths,
+			})
+			continue
+		}
+
 		if pos >= len(data) {
 			return nil, fmt.Errorf("cell record ref metadata truncated")
 		}
@@ -2459,6 +3301,40 @@ func encodeInt64(v int64) []byte {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(v))
 	return buf[:]
+}
+
+func encodeArtifactRef(ref *storage.ArtifactRef) []byte {
+	path := []byte(ref.Path)
+	buf := make([]byte, 0, 1+8+8+4+len(path))
+	buf = append(buf, artifactRefVersion)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(ref.Offset))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(ref.Size))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(path)))
+	return append(buf, path...)
+}
+
+func decodeArtifactRef(data []byte) (*storage.ArtifactRef, error) {
+	const fixed = 1 + 8 + 8 + 4
+	if len(data) < fixed {
+		return nil, fmt.Errorf("artifact ref payload truncated")
+	}
+	if data[0] != artifactRefVersion {
+		return nil, fmt.Errorf("artifact ref version mismatch")
+	}
+	offset := int64(binary.BigEndian.Uint64(data[1:9]))
+	size := int64(binary.BigEndian.Uint64(data[9:17]))
+	pathLen := int(binary.BigEndian.Uint32(data[17:21]))
+	if len(data) != fixed+pathLen {
+		return nil, fmt.Errorf("artifact ref payload size mismatch")
+	}
+	if offset < 0 || size < 0 {
+		return nil, fmt.Errorf("artifact ref has invalid range")
+	}
+	return &storage.ArtifactRef{
+		Path:   string(data[fixed:]),
+		Offset: offset,
+		Size:   size,
+	}, nil
 }
 
 func appendLenBytes(dst []byte, data []byte) []byte {

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	tnstore "flexserver/service/storage"
 	"flexserver/service/storage/memstore"
+	"flexserver/service/storage/pebblestore"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -228,7 +230,7 @@ func TestLoadImportedSplitPersistentStatePart(t *testing.T) {
 		SeqNo:     63272132,
 	}
 	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
-	partRootHash := partRoot.HashKey(0)
+	partRootHash := partRoot.HashKey()
 	part := splitStatePart{
 		effectiveShard: 0x0800000000000000,
 		rootHash:       partRootHash[:],
@@ -259,7 +261,7 @@ func TestLoadImportedSplitPersistentStatePart(t *testing.T) {
 	if imported.staged.effectiveShard != int64(part.effectiveShard) {
 		t.Fatalf("unexpected effective shard %016x", uint64(imported.staged.effectiveShard))
 	}
-	if imported.staged.lazyRoot.HashKey(0) != partRootHash {
+	if imported.staged.lazyRoot.HashKey() != partRootHash {
 		t.Fatalf("unexpected lazy root hash")
 	}
 }
@@ -274,7 +276,7 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
 	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
-	partRootHash := partRoot.HashKey(0)
+	partRootHash := partRoot.HashKey()
 	part := splitStatePart{
 		effectiveShard: uint64(block.Shard),
 		rootHash:       partRootHash[:],
@@ -294,7 +296,7 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	if err != nil {
 		t.Fatalf("load split part cell tree: %v", err)
 	}
-	if loadedPart.HashKey(0) != partRootHash {
+	if loadedPart.HashKey() != partRootHash {
 		t.Fatalf("unexpected split part root hash")
 	}
 
@@ -304,6 +306,141 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	}
 	if loadedFull.HashKey(0) != fullRootHash {
 		t.Fatalf("unexpected full root hash")
+	}
+}
+
+func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272132,
+	}
+	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	splitDepth := uint32(4)
+	fullRoot := mustTestShardStateCellWithAccountIDs(
+		t,
+		block,
+		big.NewInt(0),
+		new(big.Int).Lsh(big.NewInt(15), 252),
+	)
+	fullRootHash := fullRoot.HashKey(0)
+	fullCellHash := fullRoot.HashKey()
+
+	var fullState tlb.ShardStateUnsplit
+	if err := tlb.LoadFromCell(&fullState, fullRoot.BeginParse()); err != nil {
+		t.Fatalf("parse full state: %v", err)
+	}
+
+	store, err := pebblestore.Open(pebblestore.Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open pebble store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	oldLoader := cell.LazyLoader
+	cell.LazyLoader = store.LazyCellLoader()
+	defer func() { cell.LazyLoader = oldLoader }()
+
+	node := &Node{
+		log:     zerolog.Nop(),
+		storage: store,
+	}
+	header := &downloadedSplitStateHeader{
+		state: &fullState,
+		parts: mustSplitStatePartsFromFullState(t, block, &fullState, splitDepth),
+	}
+	if len(header.parts) != 2 {
+		t.Fatalf("unexpected split parts count %d want 2", len(header.parts))
+	}
+
+	partArtifacts := make([]splitPersistentStatePartArtifact, 0, len(header.parts))
+	for i, part := range header.parts {
+		partRoot := mustSplitStatePartRoot(t, &fullState, part, splitDepth)
+		if partRoot.GetType() == cell.MerkleProofCellType {
+			t.Fatalf("part %d root should be account dict wrapper, got merkle proof", i+1)
+		}
+		partHash := partRoot.HashKey()
+		if !bytes.Equal(partHash[:], part.rootHash) {
+			t.Fatalf("part %d storage hash mismatch: got=%x want=%x", i+1, partHash, part.rootHash)
+		}
+
+		partBlock := splitStatePartStorageBlock(block, part)
+		lazyPartRoot, err := store.ImportStateCellTree(ctx, partBlock, partRoot, nil, 0)
+		if err != nil {
+			t.Fatalf("import split part %d cells: %v", i+1, err)
+		}
+		if lazyPartRoot.GetType() == cell.MerkleProofCellType {
+			t.Fatalf("lazy part %d root should not be merkle proof", i+1)
+		}
+		if lazyPartRoot.HashKey() != partHash {
+			t.Fatalf("lazy part %d hash mismatch", i+1)
+		}
+
+		imported, err := node.loadImportedSplitPersistentStatePart(ctx, persistentStateSnapshotDownloader{
+			block:  block,
+			master: master,
+		}, i, len(header.parts), part)
+		if err != nil {
+			t.Fatalf("load imported split part %d: %v", i+1, err)
+		}
+		if imported.staged.lazyRoot == nil {
+			t.Fatalf("imported split part %d has no lazy root", i+1)
+		}
+		if imported.staged.lazyRoot.GetType() == cell.MerkleProofCellType {
+			t.Fatalf("imported split part %d should be part root, not proof header", i+1)
+		}
+
+		partArtifacts = append(partArtifacts, splitPersistentStatePartArtifact{
+			part:   part,
+			staged: imported.staged,
+		})
+	}
+
+	artifact := &splitPersistentStateSnapshotArtifact{
+		node:          node,
+		block:         block,
+		master:        master,
+		stateRootHash: fullRootHash[:],
+		header:        header,
+		parts:         partArtifacts,
+	}
+	state, err := artifact.Decode(ctx, store)
+	if err != nil {
+		t.Fatalf("decode merged split state from pebble parts: %v", err)
+	}
+	if state.Cell.GetType() == cell.MerkleProofCellType {
+		t.Fatal("merged state root should not be proof header")
+	}
+	if state.Cell.IsVirtualized() {
+		t.Fatal("merged state root should be materialized, not virtualized")
+	}
+	if !bytes.Equal(state.StateRootHash, fullRootHash[:]) {
+		t.Fatalf("merged state root hash mismatch: got=%x want=%x", state.StateRootHash, fullRootHash)
+	}
+	if !bytes.Equal(state.StateCellHash, fullCellHash[:]) {
+		t.Fatalf("merged state cell hash mismatch: got=%x want=%x", state.StateCellHash, fullCellHash)
+	}
+
+	loadedRoot, _, err := store.LoadStateCellTree(ctx, block, fullRootHash[:])
+	if err != nil {
+		t.Fatalf("load merged state from pebble: %v", err)
+	}
+	if loadedRoot.GetType() == cell.MerkleProofCellType {
+		t.Fatal("loaded merged state should not be proof header")
+	}
+	if loadedRoot.IsVirtualized() {
+		t.Fatal("loaded merged state should not be virtualized")
+	}
+	if loadedRoot.HashKey() != fullCellHash {
+		t.Fatalf("loaded merged state cell hash mismatch")
+	}
+
+	parsed, err := tnstore.ParseStateCell(&block, loadedRoot, nil, fullRootHash[:], nil)
+	if err != nil {
+		t.Fatalf("parse loaded merged state: %v", err)
+	}
+	if parsed.Parsed.Seqno != block.SeqNo {
+		t.Fatalf("unexpected parsed seqno %d", parsed.Parsed.Seqno)
 	}
 }
 
@@ -382,21 +519,31 @@ func mustTestShardStateCell(t *testing.T, block ton.BlockIDExt) *cell.Cell {
 func mustTestShardStateCellWithAccounts(t *testing.T, block ton.BlockIDExt, keys ...uint64) *cell.Cell {
 	t.Helper()
 
+	accountIDs := make([]*big.Int, 0, len(keys))
+	for _, key := range keys {
+		accountIDs = append(accountIDs, new(big.Int).SetUint64(key))
+	}
+	return mustTestShardStateCellWithAccountIDs(t, block, accountIDs...)
+}
+
+func mustTestShardStateCellWithAccountIDs(t *testing.T, block ton.BlockIDExt, accountIDs ...*big.Int) *cell.Cell {
+	t.Helper()
+
 	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
 	if err != nil {
 		t.Fatalf("create accounts dict: %v", err)
 	}
 
-	for _, key := range keys {
+	for i, accountID := range accountIDs {
 		account, err := tlb.ToCell(&tlb.ShardAccount{
 			Account:       cell.BeginCell().MustStoreBoolBit(false).EndCell(),
 			LastTransHash: make([]byte, 32),
-			LastTransLT:   key + 1,
+			LastTransLT:   uint64(i + 1),
 		})
 		if err != nil {
 			t.Fatalf("build shard account: %v", err)
 		}
-		if err = accounts.Set(cell.BeginCell().MustStoreBigInt(new(big.Int).SetUint64(key), 256).EndCell(), account); err != nil {
+		if err = accounts.Set(cell.BeginCell().MustStoreBigInt(accountID, 256).EndCell(), account); err != nil {
 			t.Fatalf("set shard account: %v", err)
 		}
 	}
@@ -419,4 +566,61 @@ func mustTestShardStateCellWithAccounts(t *testing.T, block ton.BlockIDExt, keys
 		t.Fatalf("build shard state cell: %v", err)
 	}
 	return root
+}
+
+func mustSplitStatePartRoot(t *testing.T, header *tlb.ShardStateUnsplit, part splitStatePart, splitDepth uint32) *cell.Cell {
+	t.Helper()
+
+	prefix := cell.BeginCell().MustStoreUInt(part.effectiveShard>>(64-splitDepth), uint(splitDepth)).EndCell()
+	partRoot, err := header.Accounts.ShardAccounts.ExtractPrefixSubdictRoot(prefix, false)
+	if err != nil {
+		t.Fatalf("extract split part root: %v", err)
+	}
+	if partRoot == nil {
+		t.Fatal("split part root is empty")
+	}
+
+	wrapped, err := wrapShardAccountsRoot(partRoot)
+	if err != nil {
+		t.Fatalf("wrap split part root: %v", err)
+	}
+	return wrapped
+}
+
+func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header *tlb.ShardStateUnsplit, splitDepth uint32) []splitStatePart {
+	t.Helper()
+
+	shardPrefixLen := shardPrefixLength(block.Shard)
+	if splitDepth <= uint32(shardPrefixLen) || splitDepth > 63 {
+		t.Fatalf("invalid split depth %d for shard prefix length %d", splitDepth, shardPrefixLen)
+	}
+
+	partsCount := 1 << (splitDepth - uint32(shardPrefixLen))
+	effectiveShard := uint64(block.Shard) ^ (uint64(1) << (63 - shardPrefixLen)) ^ (uint64(1) << (63 - splitDepth))
+	increment := uint64(1) << (64 - splitDepth)
+
+	parts := make([]splitStatePart, 0, partsCount)
+	for i := 0; i < partsCount; i++ {
+		prefix := cell.BeginCell().MustStoreUInt(effectiveShard>>(64-splitDepth), uint(splitDepth)).EndCell()
+		partRoot, err := header.Accounts.ShardAccounts.ExtractPrefixSubdictRoot(prefix, false)
+		if err != nil {
+			t.Fatalf("extract split part %d root: %v", i+1, err)
+		}
+		if partRoot != nil {
+			wrapped, err := wrapShardAccountsRoot(partRoot)
+			if err != nil {
+				t.Fatalf("wrap split part %d root: %v", i+1, err)
+			}
+			rootHash := wrapped.HashKey()
+			parts = append(parts, splitStatePart{
+				effectiveShard: effectiveShard,
+				rootHash:       rootHash[:],
+			})
+		}
+		effectiveShard += increment
+	}
+	if len(parts) == 0 {
+		t.Fatal("expected non-empty split parts")
+	}
+	return parts
 }

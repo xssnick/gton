@@ -57,7 +57,7 @@ func splitStateParts(block ton.BlockIDExt, proof *cell.Cell, splitDepth uint32, 
 			if err != nil {
 				return nil, nil, fmt.Errorf("build split state part root %016x: %w", effectiveShard, err)
 			}
-			rootHash := wrappedPartRoot.HashKey(0)
+			rootHash := wrappedPartRoot.HashKey()
 			parts = append(parts, splitStatePart{
 				effectiveShard: effectiveShard,
 				rootHash:       rootHash[:],

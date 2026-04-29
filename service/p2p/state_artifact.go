@@ -142,11 +142,18 @@ func (n *Node) acquireStateCellImportSlot(ctx context.Context, block ton.BlockID
 	}
 }
 
+type stagedStateHashKind uint8
+
+const (
+	stagedStateRootHash stagedStateHashKind = iota
+	stagedStateCellHash
+)
+
 func (n *Node) decodeAndImportStagedStateCellTree(ctx context.Context, block ton.BlockIDExt, staged *stagedStateFile, wantRootHash []byte) (*cell.Cell, error) {
-	return n.decodeAndImportStagedStateCellTreeAs(ctx, block, blockWithEffectiveShard(block, staged.effectiveShard), staged, wantRootHash)
+	return n.decodeAndImportStagedStateCellTreeAs(ctx, block, blockWithEffectiveShard(block, staged.effectiveShard), staged, wantRootHash, stagedStateRootHash)
 }
 
-func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBlock ton.BlockIDExt, storageBlock ton.BlockIDExt, staged *stagedStateFile, wantRootHash []byte) (*cell.Cell, error) {
+func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBlock ton.BlockIDExt, storageBlock ton.BlockIDExt, staged *stagedStateFile, wantRootHash []byte, hashKind stagedStateHashKind) (*cell.Cell, error) {
 	release, err := n.acquireStateCellImportSlot(ctx, logBlock, staged)
 	if err != nil {
 		return nil, err
@@ -158,7 +165,7 @@ func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBloc
 		return nil, fmt.Errorf("%w: parse staged state boc: %w", errStateSnapshotInvalid, err)
 	}
 	if len(wantRootHash) > 0 {
-		rootHash := root.HashKey(0)
+		rootHash := stagedStateHash(root, hashKind)
 		if !bytes.Equal(rootHash[:], wantRootHash) {
 			root = nil
 			parsedCells = nil
@@ -177,11 +184,18 @@ func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBloc
 	return lazyRoot, nil
 }
 
-func (n *Node) tryImportReusableStagedStateFile(ctx context.Context, block ton.BlockIDExt, effectiveShard int64, wantRootHash []byte) (*stagedStateFile, *cell.Cell, bool, error) {
-	return n.tryImportReusableStagedStateFileAs(ctx, block, blockWithEffectiveShard(block, effectiveShard), effectiveShard, wantRootHash)
+func stagedStateHash(root *cell.Cell, kind stagedStateHashKind) cell.Hash {
+	if kind == stagedStateCellHash {
+		return root.HashKey()
+	}
+	return root.HashKey(0)
 }
 
-func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton.BlockIDExt, storageBlock ton.BlockIDExt, effectiveShard int64, wantRootHash []byte) (*stagedStateFile, *cell.Cell, bool, error) {
+func (n *Node) tryImportReusableStagedStateFile(ctx context.Context, block ton.BlockIDExt, effectiveShard int64, wantRootHash []byte) (*stagedStateFile, *cell.Cell, bool, error) {
+	return n.tryImportReusableStagedStateFileAs(ctx, block, blockWithEffectiveShard(block, effectiveShard), effectiveShard, wantRootHash, stagedStateRootHash)
+}
+
+func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton.BlockIDExt, storageBlock ton.BlockIDExt, effectiveShard int64, wantRootHash []byte, hashKind stagedStateHashKind) (*stagedStateFile, *cell.Cell, bool, error) {
 	paths, err := n.reusableStagedStateFiles(block, effectiveShard)
 	if err != nil {
 		return nil, nil, false, err
@@ -209,7 +223,7 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 			Msg("importing reusable staged state snapshot cells")
 
 		stagedPath := staged.path
-		lazyRoot, err := n.decodeAndImportStagedStateCellTreeAs(ctx, block, storageBlock, staged, wantRootHash)
+		lazyRoot, err := n.decodeAndImportStagedStateCellTreeAs(ctx, block, storageBlock, staged, wantRootHash, hashKind)
 		if err == nil {
 			n.log.Info().
 				Str("block", formatPersistentStateBlockRef(block, effectiveShard)).
@@ -391,7 +405,7 @@ func (a *splitPersistentStateSnapshotArtifact) Decode(ctx context.Context, cells
 			return nil, fmt.Errorf("%w: parse split state part %d boc: %w", errStateSnapshotInvalid, i+1, err)
 		}
 
-		partRootHash := root.HashKey(0)
+		partRootHash := root.HashKey()
 		if !bytes.Equal(partRootHash[:], part.part.rootHash) {
 			err = fmt.Errorf("split state part %d root hash mismatch", i+1)
 			a.node.log.Error().

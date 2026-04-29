@@ -70,7 +70,7 @@ func (n *Node) rememberInboundBroadcast(msg any) {
 			return
 		}
 		if writer, _ := n.peerStorage.(storage.PeerServingStorageWriter); writer != nil {
-			writer.SaveBlockData(data.Block.ID, raw)
+			writer.SaveBlockData(data.Block.ID, raw, nil)
 		}
 	}
 }

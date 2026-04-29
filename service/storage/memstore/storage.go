@@ -41,6 +41,45 @@ func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
 		return err
 	}
 
+	return s.SaveBlockMeta(servedBlockFullMeta(block))
+}
+
+func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
+	if imported == nil {
+		return fmt.Errorf("served archive import is nil")
+	}
+	if err := s.PeerStore.SaveArchiveImport(imported); err != nil {
+		return err
+	}
+
+	for _, full := range imported.FullBlocks {
+		if err := s.SaveBlockMeta(servedBlockFullMeta(full)); err != nil {
+			return err
+		}
+	}
+	for _, block := range imported.BlockData {
+		meta := storage.MergeBlockMetaFromBlockData(&storage.BlockMeta{
+			ID:        block.ID,
+			Flags:     storage.BlockMetaHasBlockData,
+			UpdatedAt: time.Now(),
+		}, block.ID, block.Data)
+		if err := s.SaveBlockMeta(meta); err != nil {
+			return err
+		}
+	}
+	for _, proof := range imported.Proofs {
+		if err := s.SaveBlockMeta(&storage.BlockMeta{
+			ID:        proof.ID,
+			Flags:     storage.BlockMetaFlagForProof(proof.Kind),
+			UpdatedAt: time.Now(),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func servedBlockFullMeta(block *storage.ServedBlockFull) *storage.BlockMeta {
 	meta := &storage.BlockMeta{
 		ID:        block.ID,
 		Flags:     storage.BlockMetaHasServedFull,
@@ -60,11 +99,11 @@ func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
 			meta.Mark(storage.BlockMetaFlagForProof(kind))
 		}
 	}
-	return s.SaveBlockMeta(meta)
+	return meta
 }
 
-func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte) {
-	s.PeerStore.SaveBlockData(block, data)
+func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) {
+	s.PeerStore.SaveBlockData(block, data, ref)
 
 	meta := storage.MergeBlockMetaFromBlockData(&storage.BlockMeta{
 		ID:        block,
@@ -74,8 +113,8 @@ func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte) {
 	_ = s.SaveBlockMeta(meta)
 }
 
-func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) {
-	s.PeerStore.SaveBlockProof(kind, block, data)
+func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) {
+	s.PeerStore.SaveBlockProof(kind, block, data, ref)
 	_ = s.SaveBlockMeta(&storage.BlockMeta{
 		ID:        block,
 		Flags:     storage.BlockMetaFlagForProof(kind),
@@ -107,42 +146,70 @@ func (s *Store) SaveBlockState(ctx context.Context, state *storage.BlockState) e
 }
 
 func (s *Store) SaveBlockStateAndCurrentState(ctx context.Context, block *storage.BlockState, current *storage.CurrentState) error {
-	if err := s.StateStore.SaveBlockStateAndCurrentState(ctx, block, current); err != nil {
+	var blocks []*storage.BlockState
+	if block != nil {
+		blocks = []*storage.BlockState{block}
+	}
+	return s.SaveBlockStatesAndCurrentState(ctx, blocks, current)
+}
+
+func (s *Store) SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+	if err := s.StateStore.SaveBlockStatesAndCurrentState(ctx, blocks, current); err != nil {
 		return err
 	}
-	if block == nil {
-		return nil
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		if err := s.saveBlockStateArtifacts(block); err != nil {
+			return err
+		}
 	}
-	return s.saveBlockStateArtifacts(block)
+	return nil
 }
 
 func (s *Store) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	lazyRoot, err := s.StateStore.ImportStateCellTree(ctx, block, root, parsedCells, totalCells)
+	lazyRoots, err := s.ImportStateCellTrees(ctx, []storage.StateCellTreeImport{{
+		Block:       block,
+		Root:        root,
+		ParsedCells: parsedCells,
+		TotalCells:  totalCells,
+	}})
 	if err != nil {
 		return nil, err
 	}
+	return lazyRoots[0], nil
+}
 
+func (s *Store) ImportStateCellTrees(ctx context.Context, trees []storage.StateCellTreeImport) ([]*cell.Cell, error) {
+	lazyRoots, err := s.StateStore.ImportStateCellTrees(ctx, trees)
+	if err != nil {
+		return nil, err
+	}
 	var records []*storage.CellRecord
-	if len(parsedCells) > 0 {
-		records = make([]*storage.CellRecord, 0, len(parsedCells))
-		for i := range parsedCells {
-			record, err := storage.CellRecordFromCell(&parsedCells[i])
-			if err != nil {
-				return nil, err
+	for _, tree := range trees {
+		if len(tree.ParsedCells) > 0 {
+			for i := range tree.ParsedCells {
+				record, err := storage.CellRecordFromCell(&tree.ParsedCells[i])
+				if err != nil {
+					return nil, err
+				}
+				records = append(records, record)
 			}
-			records = append(records, record)
+			continue
 		}
-	} else {
-		records, err = storage.CollectCellRecords(root)
+
+		next, err := storage.CollectCellRecords(tree.Root)
 		if err != nil {
 			return nil, err
 		}
+		records = append(records, next...)
 	}
 
 	if err = s.SaveCells(records); err != nil {
 		return nil, err
 	}
-	return lazyRoot, nil
+	return lazyRoots, nil
 }
 
 func (s *Store) saveBlockStateArtifacts(state *storage.BlockState) error {

@@ -49,6 +49,13 @@ func (s *StateStore) SaveCurrentState(_ context.Context, state *storage.CurrentS
 }
 
 func (s *StateStore) SaveBlockStateAndCurrentState(_ context.Context, block *storage.BlockState, current *storage.CurrentState) error {
+	if block == nil {
+		return s.SaveBlockStatesAndCurrentState(context.Background(), nil, current)
+	}
+	return s.SaveBlockStatesAndCurrentState(context.Background(), []*storage.BlockState{block}, current)
+}
+
+func (s *StateStore) SaveBlockStatesAndCurrentState(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}
@@ -56,7 +63,10 @@ func (s *StateStore) SaveBlockStateAndCurrentState(_ context.Context, block *sto
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
-	if block != nil {
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
 		clonedBlock := storage.CloneBlockState(block)
 		fillBlockStateHashes(clonedBlock)
 		s.blocks[storage.BlockKey(clonedBlock.Block)] = clonedBlock
@@ -122,6 +132,18 @@ func (s *StateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt
 	}
 	s.mx.Unlock()
 	return root, nil
+}
+
+func (s *StateStore) ImportStateCellTrees(ctx context.Context, trees []storage.StateCellTreeImport) ([]*cell.Cell, error) {
+	roots := make([]*cell.Cell, len(trees))
+	for i, tree := range trees {
+		root, err := s.ImportStateCellTree(ctx, tree.Block, tree.Root, tree.ParsedCells, tree.TotalCells)
+		if err != nil {
+			return nil, err
+		}
+		roots[i] = root
+	}
+	return roots, nil
 }
 
 func (s *StateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {

@@ -14,10 +14,10 @@ const (
 )
 
 // LazyCellRecord rebuilds only the requested cell and leaves refs as lazy placeholders.
-func LazyCellRecord(record *CellRecord) *cell.Cell {
+func LazyCellRecord(record *CellRecord) (*cell.Cell, error) {
 	hashes, depths := lazyCellHashesDepths(record)
 	descriptors := uint16(record.D1)<<8 | uint16(record.D2)
-	return cell.CreateLazy(descriptors, record.Data, hashes, depths, lazyRefsFromRecord(record))
+	return cell.CreateWithLazyRefsUnsafe(descriptors, record.Data, hashes, depths, lazyRefsFromRecord(record))
 }
 
 func lazyRefsFromRecord(record *CellRecord) []cell.LazyRef {
