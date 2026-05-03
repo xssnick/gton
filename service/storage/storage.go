@@ -20,7 +20,6 @@ type Storage interface {
 	StateStorage
 	BlockMetaStorage
 	CellStorage
-	TxIndexStorage
 	Close() error
 }
 
@@ -36,11 +35,6 @@ type CellStorage interface {
 	SaveCells(records []*CellRecord) error
 	CellRecord(ctx context.Context, hash []byte) (*CellRecord, error)
 	LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error)
-}
-
-type TxIndexStorage interface {
-	SaveAccountTxIndex(entry AccountTxIndexEntry) error
-	ListAccountTx(ctx context.Context, accountKey []byte, beforeLT uint64, limit int) ([]AccountTxIndexEntry, error)
 }
 
 type BlockHistoryKey struct {
@@ -188,22 +182,6 @@ func (r *CellRecord) Clone() *CellRecord {
 	return cloned
 }
 
-type AccountTxIndexEntry struct {
-	AccountKey []byte
-	LT         uint64
-	Hash       []byte
-	Block      ton.BlockIDExt
-}
-
-func (e AccountTxIndexEntry) Clone() AccountTxIndexEntry {
-	return AccountTxIndexEntry{
-		AccountKey: bytes.Clone(e.AccountKey),
-		LT:         e.LT,
-		Hash:       bytes.Clone(e.Hash),
-		Block:      e.Block,
-	}
-}
-
 func MergeBlockMeta(base *BlockMeta, next *BlockMeta) *BlockMeta {
 	if base == nil {
 		return next.Clone()
@@ -278,12 +256,46 @@ func BuildBlockMetaFromBlockData(id ton.BlockIDExt, data []byte) (*BlockMeta, er
 }
 
 func BuildBlockMetaFromBlockCell(id ton.BlockIDExt, root *cell.Cell) (*BlockMeta, error) {
-	var block tlb.Block
-	if err := tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
-		return nil, fmt.Errorf("parse block tlb: %w", err)
+	block, err := ParseVerifiedBlockCell(id, root)
+	if err != nil {
+		return nil, err
 	}
 
-	return BuildBlockMetaFromParsedBlock(id, &block)
+	return BuildBlockMetaFromParsedBlock(id, block)
+}
+
+func ParseVerifiedBlockCell(id ton.BlockIDExt, root *cell.Cell) (*tlb.Block, error) {
+	if root == nil {
+		return nil, fmt.Errorf("block root is nil for %s", FormatBlockRef(id))
+	}
+
+	var block tlb.Block
+	if err := tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
+		return nil, fmt.Errorf("load tlb block %s: %w", FormatBlockRef(id), err)
+	}
+	if err := VerifyBlockIdentity(id, &block); err != nil {
+		return nil, err
+	}
+	return &block, nil
+}
+
+func VerifyBlockIdentity(id ton.BlockIDExt, block *tlb.Block) error {
+	if block == nil {
+		return fmt.Errorf("block is nil for %s", FormatBlockRef(id))
+	}
+
+	workchain, shard := tlb.ConvertShardIdentToShard(block.BlockInfo.Shard)
+	if block.BlockInfo.SeqNo != id.SeqNo || workchain != id.Workchain || shard != uint64(id.Shard) {
+		return fmt.Errorf(
+			"block identity mismatch: expected %s, got wc=%d shard=%016x seqno=%d",
+			FormatBlockRef(id),
+			workchain,
+			shard,
+			block.BlockInfo.SeqNo,
+		)
+	}
+
+	return nil
 }
 
 func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockMeta, error) {
@@ -343,6 +355,9 @@ func BuildBlockMetaFromState(state BlockState) *BlockMeta {
 		StateRootHash: bytes.Clone(state.StateRootHash),
 		StateFileHash: bytes.Clone(state.StateFileHash),
 		UpdatedAt:     time.Now(),
+	}
+	if state.Parsed != nil {
+		meta.GenUTime = state.Parsed.GenUTime
 	}
 	return meta
 }

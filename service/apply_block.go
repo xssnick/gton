@@ -5,53 +5,63 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"flexserver/service/p2p"
-	tnstore "flexserver/service/storage"
 	"fmt"
 	"time"
 
-	"github.com/xssnick/tonutils-go/tlb"
+	"flexserver/service/p2p"
+	tnstore "flexserver/service/storage"
+
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func prepareDownloadedBlock(downloaded p2p.DownloadedBlock) (p2p.DownloadedBlock, error) {
-	if downloaded.Parsed != nil && downloaded.Meta != nil {
+	if downloaded.Parsed == nil {
+		root, err := downloadedBlockRoot(downloaded)
+		if err != nil {
+			return p2p.DownloadedBlock{}, err
+		}
+
+		block, err := tnstore.ParseVerifiedBlockCell(downloaded.ID, root)
+		if err != nil {
+			return p2p.DownloadedBlock{}, err
+		}
+		downloaded.Parsed = block
+	}
+	if err := tnstore.VerifyBlockIdentity(downloaded.ID, downloaded.Parsed); err != nil {
+		return p2p.DownloadedBlock{}, err
+	}
+	if downloaded.Parsed.StateUpdate == nil {
+		return p2p.DownloadedBlock{}, fmt.Errorf("block %s does not contain state update", tnstore.FormatBlockRef(downloaded.ID))
+	}
+	if downloaded.Meta != nil {
 		return downloaded, nil
 	}
 
-	root := downloaded.Block
-	if root == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("downloaded block %s is missing parsed cell", downloaded.BlockRef())
-	}
-
-	var err error
-	if downloaded.IsLink && root.GetType() == cell.MerkleProofCellType {
-		root, err = cell.UnwrapProof(root, downloaded.ID.RootHash)
-		if err != nil {
-			return p2p.DownloadedBlock{}, fmt.Errorf("unwrap merkle proof link for %s: %w", downloaded.BlockRef(), err)
-		}
-	}
-
-	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("load tlb block %s: %w", tnstore.FormatBlockRef(downloaded.ID), err)
-	}
-	if err = verifyBlockIdentity(downloaded.ID, &block); err != nil {
-		return p2p.DownloadedBlock{}, err
-	}
-	if block.StateUpdate == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("block %s does not contain state update", tnstore.FormatBlockRef(downloaded.ID))
-	}
-
-	meta, err := tnstore.BuildBlockMetaFromParsedBlock(downloaded.ID, &block)
+	meta, err := tnstore.BuildBlockMetaFromParsedBlock(downloaded.ID, downloaded.Parsed)
 	if err != nil {
 		return p2p.DownloadedBlock{}, fmt.Errorf("build block meta %s: %w", downloaded.BlockRef(), err)
 	}
 
-	downloaded.Parsed = &block
 	downloaded.Meta = meta
 	return downloaded, nil
+}
+
+func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
+	root := downloaded.Block
+	if root == nil {
+		return nil, fmt.Errorf("downloaded block %s is missing parsed cell", downloaded.BlockRef())
+	}
+
+	if !downloaded.IsLink || root.GetType() != cell.MerkleProofCellType {
+		return root, nil
+	}
+
+	unwrapped, err := cell.UnwrapProof(root, downloaded.ID.RootHash)
+	if err != nil {
+		return nil, fmt.Errorf("unwrap merkle proof link for %s: %w", downloaded.BlockRef(), err)
+	}
+	return unwrapped, nil
 }
 
 func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (p2p.DownloadedBlock, error) {

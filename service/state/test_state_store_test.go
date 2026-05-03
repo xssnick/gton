@@ -1,37 +1,39 @@
-package memstore
+package state
 
 import (
 	"bytes"
 	"context"
-	"flexserver/service/storage"
 	"fmt"
 	"sync"
+
+	"flexserver/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-type StateStore struct {
+type testStateStore struct {
 	mx       sync.RWMutex
 	current  *storage.CurrentState
 	progress *storage.CurrentState
+	seen     *ton.BlockIDExt
 	blocks   map[string]*storage.BlockState
-	trees    map[string]stateCellTree
+	trees    map[string]testStateCellTree
 }
 
-type stateCellTree struct {
+type testStateCellTree struct {
 	root  *cell.Cell
 	cells uint64
 }
 
-func NewStateStore() *StateStore {
-	return &StateStore{
+func newTestStateStore() *testStateStore {
+	return &testStateStore{
 		blocks: map[string]*storage.BlockState{},
-		trees:  map[string]stateCellTree{},
+		trees:  map[string]testStateCellTree{},
 	}
 }
 
-func (s *StateStore) SaveCurrentState(_ context.Context, state *storage.CurrentState) error {
+func (s *testStateStore) SaveCurrentState(_ context.Context, state *storage.CurrentState) error {
 	if state == nil {
 		return fmt.Errorf("current state is nil")
 	}
@@ -48,14 +50,14 @@ func (s *StateStore) SaveCurrentState(_ context.Context, state *storage.CurrentS
 	return nil
 }
 
-func (s *StateStore) SaveBlockStateAndCurrentState(_ context.Context, block *storage.BlockState, current *storage.CurrentState) error {
+func (s *testStateStore) SaveBlockStateAndCurrentState(_ context.Context, block *storage.BlockState, current *storage.CurrentState) error {
 	if block == nil {
 		return s.SaveBlockStatesAndCurrentState(context.Background(), nil, current)
 	}
 	return s.SaveBlockStatesAndCurrentState(context.Background(), []*storage.BlockState{block}, current)
 }
 
-func (s *StateStore) SaveBlockStatesAndCurrentState(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+func (s *testStateStore) SaveBlockStatesAndCurrentState(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}
@@ -68,7 +70,7 @@ func (s *StateStore) SaveBlockStatesAndCurrentState(_ context.Context, blocks []
 			continue
 		}
 		clonedBlock := storage.CloneBlockState(block)
-		fillBlockStateHashes(clonedBlock)
+		fillTestBlockStateHashes(clonedBlock)
 		s.blocks[storage.BlockKey(clonedBlock.Block)] = clonedBlock
 	}
 
@@ -81,7 +83,7 @@ func (s *StateStore) SaveBlockStatesAndCurrentState(_ context.Context, blocks []
 	return nil
 }
 
-func (s *StateStore) CurrentState(_ context.Context) (*storage.CurrentState, error) {
+func (s *testStateStore) CurrentState(_ context.Context) (*storage.CurrentState, error) {
 	s.mx.RLock()
 	defer s.mx.RUnlock()
 
@@ -91,7 +93,7 @@ func (s *StateStore) CurrentState(_ context.Context) (*storage.CurrentState, err
 	return storage.CloneCurrentState(s.current), nil
 }
 
-func (s *StateStore) SaveStateSyncProgress(_ context.Context, state *storage.CurrentState) error {
+func (s *testStateStore) SaveStateSyncProgress(_ context.Context, state *storage.CurrentState) error {
 	if state == nil {
 		return fmt.Errorf("state sync progress is nil")
 	}
@@ -103,7 +105,7 @@ func (s *StateStore) SaveStateSyncProgress(_ context.Context, state *storage.Cur
 	return nil
 }
 
-func (s *StateStore) StateSyncProgress(_ context.Context) (*storage.CurrentState, error) {
+func (s *testStateStore) StateSyncProgress(_ context.Context) (*storage.CurrentState, error) {
 	s.mx.RLock()
 	defer s.mx.RUnlock()
 
@@ -113,7 +115,7 @@ func (s *StateStore) StateSyncProgress(_ context.Context) (*storage.CurrentState
 	return storage.CloneCurrentState(s.progress), nil
 }
 
-func (s *StateStore) ClearStateSyncProgress(_ context.Context) error {
+func (s *testStateStore) ClearStateSyncProgress(_ context.Context) error {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
@@ -121,12 +123,35 @@ func (s *StateStore) ClearStateSyncProgress(_ context.Context) error {
 	return nil
 }
 
-func (s *StateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt, root *cell.Cell, _ []cell.Cell, totalCells uint64) (*cell.Cell, error) {
+func (s *testStateStore) SaveSeenMasterchainBlock(_ context.Context, block ton.BlockIDExt) error {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if s.seen != nil && s.seen.SeqNo >= block.SeqNo {
+		return nil
+	}
+
+	next := block
+	s.seen = &next
+	return nil
+}
+
+func (s *testStateStore) SeenMasterchainBlock(_ context.Context) (ton.BlockIDExt, error) {
+	s.mx.RLock()
+	defer s.mx.RUnlock()
+
+	if s.seen == nil {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return *s.seen, nil
+}
+
+func (s *testStateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt, root *cell.Cell, _ []cell.Cell, totalCells uint64) (*cell.Cell, error) {
 	if root == nil {
 		return nil, fmt.Errorf("state cell tree root is nil")
 	}
 	s.mx.Lock()
-	s.trees[storage.BlockKey(block)] = stateCellTree{
+	s.trees[storage.BlockKey(block)] = testStateCellTree{
 		root:  root,
 		cells: totalCells,
 	}
@@ -134,7 +159,7 @@ func (s *StateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt
 	return root, nil
 }
 
-func (s *StateStore) ImportStateCellTrees(ctx context.Context, trees []storage.StateCellTreeImport) ([]*cell.Cell, error) {
+func (s *testStateStore) ImportStateCellTrees(ctx context.Context, trees []storage.StateCellTreeImport) ([]*cell.Cell, error) {
 	roots := make([]*cell.Cell, len(trees))
 	for i, tree := range trees {
 		root, err := s.ImportStateCellTree(ctx, tree.Block, tree.Root, tree.ParsedCells, tree.TotalCells)
@@ -146,7 +171,7 @@ func (s *StateStore) ImportStateCellTrees(ctx context.Context, trees []storage.S
 	return roots, nil
 }
 
-func (s *StateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {
+func (s *testStateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {
 	s.mx.RLock()
 	tree, ok := s.trees[storage.BlockKey(block)]
 	s.mx.RUnlock()
@@ -162,31 +187,29 @@ func (s *StateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, 
 	return tree.root, tree.cells, nil
 }
 
-func (s *StateStore) SaveBlockState(_ context.Context, state *storage.BlockState) error {
+func (s *testStateStore) SaveBlockState(_ context.Context, state *storage.BlockState) error {
 	if state == nil {
 		return fmt.Errorf("block state is nil")
 	}
 
 	s.mx.Lock()
 	defer s.mx.Unlock()
+
 	cloned := storage.CloneBlockState(state)
-	fillBlockStateHashes(cloned)
+	fillTestBlockStateHashes(cloned)
 	s.blocks[storage.BlockKey(state.Block)] = cloned
 	return nil
 }
 
-func fillBlockStateHashes(state *storage.BlockState) {
-	if len(state.StateRootHash) == 0 && state.Cell != nil {
-		hash := state.Cell.HashKey(0)
-		state.StateRootHash = hash[:]
-	}
-	if len(state.StateCellHash) == 0 && state.Cell != nil {
-		hash := state.Cell.HashKey()
-		state.StateCellHash = hash[:]
-	}
+func (s *testStateStore) StageBlockState(ctx context.Context, state *storage.BlockState) error {
+	return s.SaveBlockState(ctx, state)
 }
 
-func (s *StateStore) BlockState(_ context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+func (s *testStateStore) FlushStagedBlockStates(context.Context) error {
+	return nil
+}
+
+func (s *testStateStore) BlockState(_ context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
 	s.mx.RLock()
 	defer s.mx.RUnlock()
 
@@ -195,4 +218,15 @@ func (s *StateStore) BlockState(_ context.Context, block ton.BlockIDExt) (*stora
 		return nil, storage.ErrNotFound
 	}
 	return storage.CloneBlockState(state), nil
+}
+
+func fillTestBlockStateHashes(state *storage.BlockState) {
+	if len(state.StateRootHash) == 0 && state.Cell != nil {
+		hash := state.Cell.HashKey(0)
+		state.StateRootHash = hash[:]
+	}
+	if len(state.StateCellHash) == 0 && state.Cell != nil {
+		hash := state.Cell.HashKey()
+		state.StateCellHash = hash[:]
+	}
 }

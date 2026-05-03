@@ -144,11 +144,49 @@ func TestPingTargetsRotateNeighbours(t *testing.T) {
 	}
 }
 
+func TestEnsurePeersReturnsWhenFirstPeerArrives(t *testing.T) {
+	sub := &overlaySubscription{
+		log:        discardLogger(),
+		peers:      map[string]*overlayPeer{},
+		peerNotify: make(chan struct{}, 1),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sub.ensurePeers(ctx)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	sub.mx.Lock()
+	sub.peers["peer-1"] = &overlayPeer{
+		id:            "peer-1",
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub.notifyPeersChangedLocked()
+	sub.mx.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensure peers: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for ensurePeers")
+	}
+}
+
 func TestAnnounceSelfRetriesAfterDHTWarmup(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:     &logger,
-		ListenAddr: "127.0.0.1:30303",
+		Logger:             &logger,
+		ListenAddr:         "127.0.0.1:30303",
+		PeerServingStorage: newTestPeerStore(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

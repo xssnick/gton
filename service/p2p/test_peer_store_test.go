@@ -1,40 +1,43 @@
-package memstore
+package p2p
 
 import (
 	"context"
-	"flexserver/service/storage"
 	"fmt"
 	"os"
 	"sync"
 
+	"flexserver/service/storage"
+
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-const archivePackageMasterchainBlocks = 100
+const testArchivePackageMasterchainBlocks = 100
 
-type PeerStore struct {
+type testPeerStore struct {
 	mu sync.RWMutex
 
 	blocks       map[string]*storage.ServedBlockFull
 	nextBlocks   map[string]string
 	blockData    map[string][]byte
 	proofs       map[string][]byte
+	zeroStates   map[string][]byte
 	archiveInfos map[string]int64
 	archiveFiles map[int64][]byte
 }
 
-func NewPeerStore() *PeerStore {
-	return &PeerStore{
+func newTestPeerStore() *testPeerStore {
+	return &testPeerStore{
 		blocks:       map[string]*storage.ServedBlockFull{},
 		nextBlocks:   map[string]string{},
 		blockData:    map[string][]byte{},
 		proofs:       map[string][]byte{},
+		zeroStates:   map[string][]byte{},
 		archiveInfos: map[string]int64{},
 		archiveFiles: map[int64][]byte{},
 	}
 }
 
-func (s *PeerStore) SaveBlockFull(block *storage.ServedBlockFull) error {
+func (s *testPeerStore) SaveBlockFull(block *storage.ServedBlockFull) error {
 	if block == nil {
 		return fmt.Errorf("served block is nil")
 	}
@@ -45,7 +48,7 @@ func (s *PeerStore) SaveBlockFull(block *storage.ServedBlockFull) error {
 	return nil
 }
 
-func (s *PeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
+func (s *testPeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
 	cloned := block.Clone()
 	s.blocks[storage.BlockKey(block.ID)] = cloned
 	if len(cloned.Block) > 0 {
@@ -62,7 +65,7 @@ func (s *PeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
 	}
 }
 
-func (s *PeerStore) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
+func (s *testPeerStore) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 	if imported == nil {
 		return fmt.Errorf("served archive import is nil")
 	}
@@ -85,25 +88,35 @@ func (s *PeerStore) SaveArchiveImport(imported *storage.ServedArchiveImport) err
 	return nil
 }
 
-func (s *PeerStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) {
+func (s *testPeerStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextBlocks[storage.BlockKey(prev)] = storage.BlockKey(next)
+	return nil
 }
 
-func (s *PeerStore) SaveBlockData(block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) {
+func (s *testPeerStore) SaveBlockData(block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.blockData[storage.BlockKey(block)] = append([]byte(nil), data...)
+	return nil
 }
 
-func (s *PeerStore) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) {
+func (s *testPeerStore) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.proofs[s.proofKey(kind, block)] = append([]byte(nil), data...)
+	return nil
 }
 
-func (s *PeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error) {
+func (s *testPeerStore) SaveZeroState(block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.zeroStates[storage.BlockKey(block)] = append([]byte(nil), data...)
+	return nil
+}
+
+func (s *testPeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -111,22 +124,23 @@ func (s *PeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, sha
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.archiveInfos[archiveInfoKey(masterchainSeqno, workchain, shard)] = archiveID
+	s.archiveInfos[testArchiveInfoKey(masterchainSeqno, workchain, shard)] = archiveID
 	s.archiveFiles[archiveID] = data
 	return path, nil
 }
 
-func (s *PeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
+func (s *testPeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.blocks[storage.BlockKey(block)]
-	if !ok {
+
+	value := s.blocks[storage.BlockKey(block)]
+	if value == nil {
 		return nil, storage.ErrNotFound
 	}
 	return value.Clone(), nil
 }
 
-func (s *PeerStore) NextBlockFull(_ context.Context, prev ton.BlockIDExt) (*storage.ServedBlockFull, error) {
+func (s *testPeerStore) NextBlockFull(_ context.Context, prev ton.BlockIDExt) (*storage.ServedBlockFull, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -134,16 +148,17 @@ func (s *PeerStore) NextBlockFull(_ context.Context, prev ton.BlockIDExt) (*stor
 	if !ok {
 		return nil, storage.ErrNotFound
 	}
-	value, ok := s.blocks[nextKey]
-	if !ok {
+	value := s.blocks[nextKey]
+	if value == nil {
 		return nil, storage.ErrNotFound
 	}
 	return value.Clone(), nil
 }
 
-func (s *PeerStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
+func (s *testPeerStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	value, ok := s.blockData[storage.BlockKey(block)]
 	if !ok {
 		return nil, storage.ErrNotFound
@@ -151,9 +166,10 @@ func (s *PeerStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, 
 	return append([]byte(nil), value...), nil
 }
 
-func (s *PeerStore) BlockProof(_ context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
+func (s *testPeerStore) BlockProof(_ context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	value, ok := s.proofs[s.proofKey(kind, block)]
 	if !ok {
 		return nil, storage.ErrNotFound
@@ -161,14 +177,26 @@ func (s *PeerStore) BlockProof(_ context.Context, kind storage.ServedProofKind, 
 	return append([]byte(nil), value...), nil
 }
 
-func (s *PeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
+func (s *testPeerStore) ZeroState(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.archiveInfos[archiveInfoKey(masterchainSeqno, workchain, shard)]
+
+	value, ok := s.zeroStates[storage.BlockKey(block)]
 	if !ok {
-		rounded := roundArchiveMasterchainSeqno(masterchainSeqno)
+		return nil, storage.ErrNotFound
+	}
+	return append([]byte(nil), value...), nil
+}
+
+func (s *testPeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	value, ok := s.archiveInfos[testArchiveInfoKey(masterchainSeqno, workchain, shard)]
+	if !ok {
+		rounded := testRoundArchiveMasterchainSeqno(masterchainSeqno)
 		if rounded != masterchainSeqno {
-			value, ok = s.archiveInfos[archiveInfoKey(rounded, workchain, shard)]
+			value, ok = s.archiveInfos[testArchiveInfoKey(rounded, workchain, shard)]
 		}
 	}
 	if !ok {
@@ -177,9 +205,10 @@ func (s *PeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32, workc
 	return value, nil
 }
 
-func (s *PeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64, maxSize int32) ([]byte, error) {
+func (s *testPeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64, maxSize int32) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	value, ok := s.archiveFiles[archiveID]
 	if !ok {
 		return nil, storage.ErrNotFound
@@ -200,17 +229,17 @@ func (s *PeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64, max
 	return append([]byte(nil), value...), nil
 }
 
-func (s *PeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) string {
+func (s *testPeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) string {
 	return string(kind) + ":" + storage.BlockKey(block)
 }
 
-func archiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) string {
+func testArchiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) string {
 	return fmt.Sprintf("%d:%d:%016x", masterchainSeqno, workchain, uint64(shard))
 }
 
-func roundArchiveMasterchainSeqno(seqno int32) int32 {
+func testRoundArchiveMasterchainSeqno(seqno int32) int32 {
 	if seqno <= 0 {
 		return seqno
 	}
-	return seqno - seqno%archivePackageMasterchainBlocks
+	return seqno - seqno%testArchivePackageMasterchainBlocks
 }

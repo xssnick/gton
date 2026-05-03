@@ -23,6 +23,7 @@ const (
 	KindBlock     = "block"
 	KindProof     = "proof"
 	KindProofLink = "prooflink"
+	KindZeroState = "zerostate"
 )
 
 type Entry struct {

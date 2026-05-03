@@ -7,7 +7,7 @@ import (
 
 func TestPrioritizeStateSnapshotPeers(t *testing.T) {
 	node := &Node{
-		statePeerLeases: map[string]int{
+		downloadPeerLeases: map[string]int{
 			"peer-a": 2,
 			"peer-b": 0,
 			"peer-c": 0,
@@ -33,9 +33,35 @@ func TestPrioritizeStateSnapshotPeers(t *testing.T) {
 	}
 }
 
+func TestPrioritizeBlockDownloadPeersUsesDownloadScore(t *testing.T) {
+	node := &Node{
+		downloadPeerLeases: map[string]int{
+			"busy": 2,
+		},
+	}
+	now := time.Now()
+	peers := []*overlayPeer{
+		{id: "slow", addr: "slow", alive: true, downloadBytesSec: 20 << 20, downloadSlowUntil: now.Add(time.Minute)},
+		{id: "unknown", addr: "unknown", alive: true},
+		{id: "busy", addr: "busy", alive: true, downloadBytesSec: 10 << 20, roundtrip: 20 * time.Millisecond},
+		{id: "fast", addr: "fast", alive: true, downloadBytesSec: 8 << 20, roundtrip: 20 * time.Millisecond},
+	}
+
+	prioritized := node.prioritizeBlockDownloadPeers(peers)
+	if len(prioritized) != len(peers) {
+		t.Fatalf("unexpected peers count: %d", len(prioritized))
+	}
+	if prioritized[0].addr != "fast" || prioritized[1].addr != "busy" || prioritized[2].addr != "unknown" || prioritized[3].addr != "slow" {
+		t.Fatalf("unexpected prioritized order: %q, %q, %q, %q", prioritized[0].addr, prioritized[1].addr, prioritized[2].addr, prioritized[3].addr)
+	}
+	if peers[0].addr != "slow" || peers[1].addr != "unknown" || peers[2].addr != "busy" || peers[3].addr != "fast" {
+		t.Fatal("prioritizeBlockDownloadPeers mutated original slice order")
+	}
+}
+
 func TestAcquirePreferredStateSnapshotProbePrefersLessBusyPeer(t *testing.T) {
 	node := &Node{
-		statePeerLeases: map[string]int{},
+		downloadPeerLeases: map[string]int{},
 	}
 
 	peerA := &overlayPeer{addr: "peer-a"}

@@ -121,6 +121,31 @@ func TestArchiveQueryCandidatesDoNotUseKnownPeersWithoutNeighbours(t *testing.T)
 	}
 }
 
+func TestArchiveQueryCandidatesSkipDeadKnownPeers(t *testing.T) {
+	now := int32(time.Now().Unix())
+	overlayWrapper := &overlay.ADNLOverlayWrapper{}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		spec: overlaySpec{
+			ProtoVersionMajor: shardchainProtoVersionMajor,
+			ProtoVersionMinor: shardchainProtoVersionMinor,
+		},
+		peers: map[string]*overlayPeer{
+			"alive": {id: "alive", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			"dead":  {id: "dead", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: false},
+		},
+		neighbours: []string{"dead", "alive"},
+	}
+
+	got := sub.archiveQueryCandidates()
+	if len(got) != 1 {
+		t.Fatalf("unexpected archive candidate count: got %d want 1", len(got))
+	}
+	if got[0].id != "alive" {
+		t.Fatalf("expected only alive peer, got %q", got[0].id)
+	}
+}
+
 func TestShouldRaceArchiveDownloadForUnknownOrMediocrePeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	unknown := &overlayPeer{id: "unknown", addr: "unknown", alive: true}
@@ -134,8 +159,8 @@ func TestShouldRaceArchiveDownloadForUnknownOrMediocrePeer(t *testing.T) {
 		id:               "mediocre",
 		addr:             "mediocre",
 		alive:            true,
-		archiveDownloads: 3,
-		archiveBytesSec:  2 << 20,
+		downloadCount:    3,
+		downloadBytesSec: 2 << 20,
 	}
 	if !shouldRaceArchiveDownload(shard, []*overlayPeer{mediocre, alternative}) {
 		t.Fatal("mediocre sticky peer should trigger archive probe race")
@@ -148,12 +173,42 @@ func TestShouldNotRaceArchiveDownloadForGoodPeer(t *testing.T) {
 		id:               "fast",
 		addr:             "fast",
 		alive:            true,
-		archiveDownloads: 4,
-		archiveBytesSec:  16 << 20,
+		downloadCount:    4,
+		downloadBytesSec: 16 << 20,
 	}
 	alternative := &overlayPeer{id: "alternative", addr: "alternative", alive: true}
 
 	if shouldRaceArchiveDownload(shard, []*overlayPeer{fast, alternative}) {
 		t.Fatal("good sticky peer should not trigger archive probe race")
+	}
+}
+
+func TestCurrentArchivePeerNeedsGoodSpeedForExclusiveUse(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	unknown := &overlayPeer{id: "unknown", addr: "unknown", alive: true}
+	if shouldUseCurrentArchivePeerWithoutRace(shard, unknown) {
+		t.Fatal("unknown current peer should still race archive probes")
+	}
+
+	mediocre := &overlayPeer{
+		id:               "mediocre",
+		addr:             "mediocre",
+		alive:            true,
+		downloadCount:    2,
+		downloadBytesSec: 4 << 20,
+	}
+	if shouldUseCurrentArchivePeerWithoutRace(shard, mediocre) {
+		t.Fatal("mediocre current peer should still race archive probes")
+	}
+
+	fast := &overlayPeer{
+		id:               "fast",
+		addr:             "fast",
+		alive:            true,
+		downloadCount:    2,
+		downloadBytesSec: 12 << 20,
+	}
+	if !shouldUseCurrentArchivePeerWithoutRace(shard, fast) {
+		t.Fatal("good current peer should be used without archive probe race")
 	}
 }

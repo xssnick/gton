@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,13 +15,13 @@ import (
 
 	"flexserver/service/archive/packfile"
 	"flexserver/service/storage"
-	"flexserver/service/storage/memstore"
+	"flexserver/service/storage/pebblestore"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
-	store := memstore.New()
+	store := openTestPebbleStore(t)
 
 	block10 := testBlockID(0, topShard, 10)
 	block11 := testBlockID(0, topShard, 11)
@@ -83,7 +84,7 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 }
 
 func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
-	store := memstore.New()
+	store := openTestPebbleStore(t)
 
 	block := testBlockID(0, topShard, 12)
 	path := writeTestPackage(t, []testEntry{
@@ -123,20 +124,21 @@ func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 
 func TestParseEntryName(t *testing.T) {
 	block := testBlockID(-1, topShard, 42)
-	ref, ok, err := parseEntryName(testEntryName("proof", block))
+	ref, err := parseEntryName(testEntryName("proof", block))
 	if err != nil {
 		t.Fatalf("parse archive entry name: %v", err)
-	}
-	if !ok {
-		t.Fatal("entry was not recognized")
 	}
 	if ref.kind != "proof" || !ref.id.Equals(&block) {
 		t.Fatalf("unexpected ref: %#v", ref)
 	}
+
+	if _, err = parseEntryName("unrelated"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("parse unrelated entry error = %v, want ErrNotFound", err)
+	}
 }
 
 func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
-	store := memstore.New()
+	store := openTestPebbleStore(t)
 
 	master := testBlockID(-1, topShard, 42)
 	base := testBlockID(0, topShard, 1000)
@@ -163,6 +165,17 @@ func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
 	if stats.MasterchainFirstSeqno != master.SeqNo || stats.MasterchainLastSeqno != master.SeqNo {
 		t.Fatalf("unexpected masterchain stats range: first=%d last=%d", stats.MasterchainFirstSeqno, stats.MasterchainLastSeqno)
 	}
+}
+
+func openTestPebbleStore(tb testing.TB) *pebblestore.Store {
+	tb.Helper()
+
+	store, err := pebblestore.Open(pebblestore.Options{Dir: tb.TempDir()})
+	if err != nil {
+		tb.Fatalf("open pebble store: %v", err)
+	}
+	tb.Cleanup(func() { _ = store.Close() })
+	return store
 }
 
 func TestObserveMasterchainBlockShardsFromFixture(t *testing.T) {

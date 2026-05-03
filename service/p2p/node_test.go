@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"flexserver/service/storage"
 	"net"
 	"testing"
 	"time"
@@ -14,7 +16,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestNodeWaitMasterchainBlock(t *testing.T) {
+func TestNodeWaitObservedMasterchainBlockAfterVerifiedSeen(t *testing.T) {
 	node := newTestNode(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -22,21 +24,18 @@ func TestNodeWaitMasterchainBlock(t *testing.T) {
 
 	done := make(chan ton.BlockIDExt, 1)
 	go func() {
-		block, err := node.WaitMasterchainBlock(ctx)
+		block, err := node.WaitObservedMasterchainBlock(ctx)
 		if err != nil {
-			t.Errorf("wait masterchain block: %v", err)
+			t.Errorf("wait observed masterchain block: %v", err)
 			return
 		}
 		done <- block
 	}()
 
-	node.trackLatestBlock(BroadcastEvent{
-		Overlay: "masterchain",
-		Block: ton.BlockIDExt{
-			Workchain: -1,
-			Shard:     topShard,
-			SeqNo:     123,
-		},
+	node.RememberSeenMasterchainBlock(ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     123,
 	})
 
 	select {
@@ -52,7 +51,7 @@ func TestNodeWaitMasterchainBlock(t *testing.T) {
 func TestStatusSnapshotTracksLatestBasechainBlock(t *testing.T) {
 	node := newTestNode(t)
 
-	node.trackLatestBlock(BroadcastEvent{
+	node.trackUnverifiedBroadcastBlock(BroadcastEvent{
 		Overlay: "basechain",
 		Block: ton.BlockIDExt{
 			Workchain: 0,
@@ -67,6 +66,110 @@ func TestStatusSnapshotTracksLatestBasechainBlock(t *testing.T) {
 	}
 	if snapshot.LatestBasechain.SeqNo != 77 {
 		t.Fatalf("unexpected latest basechain seqno %d", snapshot.LatestBasechain.SeqNo)
+	}
+}
+
+func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
+	logger := discardLogger()
+	store := newTestPebbleStore(t)
+	node, err := New(Options{Logger: &logger, Storage: store})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+
+	block10 := testBlockID(-1, topShard, 10)
+	block9 := testBlockID(-1, topShard, 9)
+
+	node.trackUnverifiedBroadcastBlock(BroadcastEvent{Overlay: "masterchain", Block: block10})
+	node.trackUnverifiedBroadcastBlock(BroadcastEvent{Overlay: "masterchain", Block: block9})
+
+	if _, err = node.ObservedMasterchainBlock(); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("raw broadcast moved observed masterchain: %v", err)
+	}
+
+	if _, err = node.SeenMasterchainBlock(); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("raw broadcast moved seen masterchain: %v", err)
+	}
+
+	if _, err = store.SeenMasterchainBlock(context.Background()); err == nil {
+		t.Fatal("broadcast seen block was persisted before validation")
+	}
+}
+
+func TestTrustedInitBlockRequiresFullBlockID(t *testing.T) {
+	node := newTestNode(t)
+
+	if _, err := node.TrustedInitBlock(); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty trusted init block error = %v, want ErrNotFound", err)
+	}
+
+	node.trustedInitBlock = testBlockID(-1, topShard, 0)
+	got, err := node.TrustedInitBlock()
+	if err != nil {
+		t.Fatalf("trusted init block: %v", err)
+	}
+	if !got.Equals(&node.trustedInitBlock) {
+		t.Fatalf("trusted init block = %+v, want %+v", got, node.trustedInitBlock)
+	}
+}
+
+func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
+	logger := discardLogger()
+	store := newTestPebbleStore(t)
+	node, err := New(Options{Logger: &logger, Storage: store})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+
+	block10 := testBlockID(-1, topShard, 10)
+	block9 := testBlockID(-1, topShard, 9)
+
+	ctx := context.Background()
+	node.RememberSeenMasterchainBlock(block10)
+	node.RememberSeenMasterchainBlock(block9)
+
+	latest, err := node.SeenMasterchainBlock()
+	if err != nil {
+		t.Fatalf("runtime latest masterchain: %v", err)
+	}
+	if !latest.Equals(&block10) {
+		t.Fatalf("runtime latest = %+v, want %+v", latest, block10)
+	}
+	observed, err := node.ObservedMasterchainBlock()
+	if err != nil {
+		t.Fatalf("runtime observed masterchain: %v", err)
+	}
+	if !observed.Equals(&block10) {
+		t.Fatalf("runtime observed = %+v, want %+v", observed, block10)
+	}
+	if _, err = store.SeenMasterchainBlock(ctx); err == nil {
+		t.Fatal("runtime seen block was persisted by p2p node")
+	}
+}
+
+func TestMasterchainDownloadCacheRequiresVerifiedPath(t *testing.T) {
+	logger := discardLogger()
+	store := newTestPeerStore()
+	node, err := New(Options{Logger: &logger, PeerServingStorage: store})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+
+	block := testBlockID(-1, topShard, 10)
+	downloaded := &DownloadedBlock{
+		ID:       block,
+		BlockBOC: []byte{1, 2, 3},
+		ProofBOC: []byte{4, 5, 6},
+	}
+
+	node.rememberDownloadedBlock(nil, downloaded)
+	if _, err = store.BlockFull(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unverified masterchain block cache = %v, want ErrNotFound", err)
+	}
+
+	node.RememberVerifiedBlockFull(nil, *downloaded)
+	if _, err = store.BlockFull(context.Background(), block); err != nil {
+		t.Fatalf("verified masterchain block was not cached: %v", err)
 	}
 }
 
@@ -86,7 +189,7 @@ func TestNodeWaitBasechainBlock(t *testing.T) {
 		done <- block
 	}()
 
-	node.trackLatestBlock(BroadcastEvent{
+	node.trackUnverifiedBroadcastBlock(BroadcastEvent{
 		Overlay: "basechain",
 		Block: ton.BlockIDExt{
 			Workchain: 0,
@@ -116,9 +219,10 @@ func TestNewUsesConfiguredADNLKeys(t *testing.T) {
 	}
 
 	node, err := New(Options{
-		PrivateKey:    priv,
-		DHTPrivateKey: dhtPriv,
-		DHTListenAddr: "127.0.0.1:30304",
+		PrivateKey:         priv,
+		DHTPrivateKey:      dhtPriv,
+		DHTListenAddr:      "127.0.0.1:30304",
+		PeerServingStorage: newTestPeerStore(),
 	})
 	if err != nil {
 		t.Fatalf("new node: %v", err)

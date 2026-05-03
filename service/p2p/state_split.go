@@ -131,7 +131,7 @@ func mergeSplitState(header *tlb.ShardStateUnsplit, parts []*cell.Cell) (*cell.C
 	}
 
 	for i, root := range parts {
-		partAccounts, err := root.BeginParse().LoadAugDictWithAugmentation(256, shardAccountsAugmentation{})
+		partAccounts, err := loadSplitStatePartAccounts(root)
 		if err != nil {
 			return nil, fmt.Errorf("parse split state part %d accounts: %w", i+1, err)
 		}
@@ -152,6 +152,12 @@ func mergeSplitStateAccounts(header *tlb.ShardStateUnsplit, accounts *cell.Augme
 	full := *header
 	full.Accounts.ShardAccounts = &tlb.ShardAccountsAugDict{AugmentedDictionary: accounts}
 	return tlb.ToCell(&full)
+}
+
+func loadSplitStatePartAccounts(root *cell.Cell) (*cell.AugmentedDictionary, error) {
+	return root.BeginParse().LoadAugDict(256, cell.ReadOnlyAugmentation{
+		SkipExtraFn: shardAccountsAugmentation{}.SkipExtra,
+	}, true)
 }
 
 type shardAccountsAugmentation struct{}

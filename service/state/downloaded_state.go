@@ -2,19 +2,13 @@ package state
 
 import (
 	"context"
-	storage2 "flexserver/service/storage"
 	"runtime"
 	"time"
 
-	"github.com/rs/zerolog"
-	"github.com/xssnick/tonutils-go/ton"
-)
+	"flexserver/service/storage"
 
-type DownloadedState interface {
-	Block() ton.BlockIDExt
-	Decode(ctx context.Context, cells storage2.StateCellTreeImporter) (*storage2.BlockState, error)
-	Cleanup() error
-}
+	"github.com/rs/zerolog"
+)
 
 type stateImportCoordinator struct {
 	log  zerolog.Logger
@@ -30,11 +24,11 @@ func newStateImportCoordinator(logger zerolog.Logger) *stateImportCoordinator {
 
 func (c *stateImportCoordinator) ImportAndPersist(
 	ctx context.Context,
-	downloaded DownloadedState,
-	store storage2.StateStorage,
-) (*storage2.BlockState, error) {
+	downloaded storage.DownloadedState,
+	store storage.StateStorage,
+) (*storage.BlockState, error) {
 	block := downloaded.Block()
-	blockRef := storage2.FormatBlockRef(block)
+	blockRef := storage.FormatBlockRef(block)
 
 	select {
 	case <-ctx.Done():
@@ -58,7 +52,7 @@ func (c *stateImportCoordinator) ImportAndPersist(
 		Str("block", blockRef).
 		Msg("decoding staged state snapshot")
 
-	state, err := downloaded.Decode(ctx, store)
+	state, err := downloaded.ImportCells(ctx, store)
 	if err != nil {
 		return nil, err
 	}
@@ -73,28 +67,4 @@ func (c *stateImportCoordinator) ImportAndPersist(
 	}
 	runtime.GC()
 	return state, nil
-}
-
-type immediateDownloadedState struct {
-	state *storage2.BlockState
-}
-
-func newImmediateDownloadedState(state *storage2.BlockState) DownloadedState {
-	return &immediateDownloadedState{state: storage2.CloneBlockState(state)}
-}
-
-func (d *immediateDownloadedState) Block() ton.BlockIDExt {
-	if d.state == nil {
-		return ton.BlockIDExt{}
-	}
-	return d.state.Block
-}
-
-func (d *immediateDownloadedState) Decode(context.Context, storage2.StateCellTreeImporter) (*storage2.BlockState, error) {
-	return storage2.CloneBlockState(d.state), nil
-}
-
-func (d *immediateDownloadedState) Cleanup() error {
-	d.state = nil
-	return nil
 }

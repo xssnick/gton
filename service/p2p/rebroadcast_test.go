@@ -74,7 +74,10 @@ func TestCalcFECRebroadcastPartsMatchesCppNodeFormula(t *testing.T) {
 
 func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
 	logger := discardLogger()
-	node, err := New(Options{Logger: &logger})
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}

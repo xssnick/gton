@@ -25,6 +25,7 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 
 	blockData := []byte{0xAA, 0xBB, 0xCC}
 	proofData := []byte{0x10, 0x20, 0x30}
+	zeroStateData := []byte{0x01, 0x00, 0x02}
 
 	if err := store.SaveBlockFull(&storage.ServedBlockFull{
 		ID:     block,
@@ -34,7 +35,13 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
-	store.LinkNextBlock(prev, block)
+	if err := store.LinkNextBlock(prev, block); err != nil {
+		t.Fatalf("link next block: %v", err)
+	}
+	if err := store.SaveZeroState(prev, zeroStateData, nil); err != nil {
+		t.Fatalf("save zero state: %v", err)
+	}
+
 	archivePath := filepath.Join(t.TempDir(), "archive.pack")
 	archiveFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -65,6 +72,14 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	}
 	if !next.ID.Equals(&block) {
 		t.Fatalf("unexpected next block: got=%v want=%v", next.ID, block)
+	}
+
+	zeroState, err := store.ZeroState(ctx, prev)
+	if err != nil {
+		t.Fatalf("zero state: %v", err)
+	}
+	if !bytes.Equal(zeroState, zeroStateData) {
+		t.Fatalf("unexpected zero state: %x", zeroState)
 	}
 
 	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo), -1, topShard)
@@ -159,22 +174,6 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 		t.Fatalf("shard block mismatch")
 	}
 
-	entry := storage.AccountTxIndexEntry{
-		AccountKey: bytes.Repeat([]byte{0x11}, 32),
-		LT:         555,
-		Hash:       bytes.Repeat([]byte{0x22}, 32),
-		Block:      blockB,
-	}
-	if err = store.SaveAccountTxIndex(entry); err != nil {
-		t.Fatalf("save account tx index: %v", err)
-	}
-	entries, err := store.ListAccountTx(ctx, entry.AccountKey, 0, 10)
-	if err != nil {
-		t.Fatalf("list account tx: %v", err)
-	}
-	if len(entries) != 1 || entries[0].LT != entry.LT || !entries[0].Block.Equals(&blockB) {
-		t.Fatalf("unexpected account tx entries: %#v", entries)
-	}
 }
 
 func TestPebbleStorageLoadsCellsByRepresentationHash(t *testing.T) {
@@ -333,10 +332,7 @@ func openTestPebbleStorage(t *testing.T) *pebblestore.Store {
 	if err != nil {
 		t.Fatalf("open pebble storage: %v", err)
 	}
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
 	t.Cleanup(func() {
-		cell.LazyLoader = oldLoader
 		if err := store.Close(); err != nil {
 			t.Fatalf("close pebble storage: %v", err)
 		}

@@ -11,6 +11,7 @@ type PeerServingStorage interface {
 	NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*ServedBlockFull, error)
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	BlockProof(ctx context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error)
+	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error)
 	ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error)
 }
@@ -18,9 +19,10 @@ type PeerServingStorage interface {
 type PeerServingStorageWriter interface {
 	SaveBlockFull(block *ServedBlockFull) error
 	SaveArchiveImport(imported *ServedArchiveImport) error
-	LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt)
-	SaveBlockData(block ton.BlockIDExt, data []byte, ref *ArtifactRef)
-	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte, ref *ArtifactRef)
+	LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error
+	SaveBlockData(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
+	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
+	SaveZeroState(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error)
 }
 

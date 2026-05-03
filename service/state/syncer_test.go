@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flexserver/service/p2p"
 	"flexserver/service/storage"
-	"flexserver/service/storage/memstore"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,7 +32,7 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 		},
 	}
 
-	store := memstore.NewStateStore()
+	store := newTestStateStore()
 	syncer := NewSyncer(source, store)
 
 	snapshot, err := syncer.SyncCurrent(context.Background())
@@ -75,6 +74,9 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 	if got := source.downloadCount[storage.BlockKey(master)]; got != 1 {
 		t.Fatalf("expected master state to be downloaded once, got %d", got)
 	}
+	if got := source.latestCalls; got != 0 {
+		t.Fatalf("expected latest masterchain lookup to be skipped, got %d", got)
+	}
 }
 
 func TestSyncerReturnsShardDownloadError(t *testing.T) {
@@ -92,7 +94,7 @@ func TestSyncerReturnsShardDownloadError(t *testing.T) {
 		},
 	}
 
-	syncer := NewSyncer(source, memstore.NewStateStore())
+	syncer := NewSyncer(source, newTestStateStore())
 
 	if _, err := syncer.SyncCurrent(context.Background()); err == nil {
 		t.Fatal("expected sync error")
@@ -111,7 +113,7 @@ func TestSyncerRetriesSelectedStateWithoutReselectingKeyBlock(t *testing.T) {
 		},
 	}
 
-	syncer := NewSyncer(source, memstore.NewStateStore())
+	syncer := NewSyncer(source, newTestStateStore())
 
 	snapshot, err := syncer.SyncCurrent(context.Background())
 	if err != nil {
@@ -120,8 +122,8 @@ func TestSyncerRetriesSelectedStateWithoutReselectingKeyBlock(t *testing.T) {
 	if snapshot.Masterchain.Block.SeqNo != master.SeqNo {
 		t.Fatalf("unexpected masterchain seqno %d", snapshot.Masterchain.Block.SeqNo)
 	}
-	if source.persistentCalls != 1 {
-		t.Fatalf("expected one persistent key block selection, got %d", source.persistentCalls)
+	if source.trustedInitCalls != 1 {
+		t.Fatalf("expected one trusted init lookup, got %d", source.trustedInitCalls)
 	}
 }
 
@@ -141,7 +143,7 @@ func TestSyncerRetriesShardStateWithoutRepeatingMasterStage(t *testing.T) {
 		},
 	}
 
-	syncer := NewSyncer(source, memstore.NewStateStore())
+	syncer := NewSyncer(source, newTestStateStore())
 	snapshot, err := syncer.SyncCurrent(context.Background())
 	if err != nil {
 		t.Fatalf("sync current: %v", err)
@@ -155,8 +157,8 @@ func TestSyncerRetriesShardStateWithoutRepeatingMasterStage(t *testing.T) {
 	if got := source.downloadCount[storage.BlockKey(master)]; got != 1 {
 		t.Fatalf("expected master state to be downloaded once, got %d", got)
 	}
-	if got := source.persistentCalls; got != 1 {
-		t.Fatalf("expected one persistent key block selection, got %d", got)
+	if got := source.trustedInitCalls; got != 1 {
+		t.Fatalf("expected one trusted init lookup, got %d", got)
 	}
 }
 
@@ -172,7 +174,7 @@ func TestSyncerUsesStoredShardStateWithoutCurrentCheckpoint(t *testing.T) {
 		},
 	}
 
-	store := memstore.NewStateStore()
+	store := newTestStateStore()
 	if err := store.SaveBlockState(context.Background(), &storage.BlockState{Block: master}); err != nil {
 		t.Fatalf("save stored master: %v", err)
 	}
@@ -210,7 +212,7 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 		},
 	}
 
-	store := memstore.NewStateStore()
+	store := newTestStateStore()
 	if err := store.SaveBlockState(context.Background(), &storage.BlockState{Block: pendingMaster}); err != nil {
 		t.Fatalf("save pending master: %v", err)
 	}
@@ -246,8 +248,8 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	if got := source.latestCalls; got != 0 {
 		t.Fatalf("expected latest masterchain lookup to be skipped, got %d", got)
 	}
-	if got := source.persistentCalls; got != 0 {
-		t.Fatalf("expected persistent key block selection to be skipped, got %d", got)
+	if got := source.trustedInitCalls; got != 0 {
+		t.Fatalf("expected trusted init lookup to be skipped, got %d", got)
 	}
 	if got := source.downloadCount[storage.BlockKey(doneShard)]; got != 0 {
 		t.Fatalf("expected completed shard not to be downloaded, got %d", got)
@@ -274,7 +276,7 @@ func TestSyncerIgnoresIncompleteStoredMasterchainState(t *testing.T) {
 		},
 	}
 
-	store := memstore.NewStateStore()
+	store := newTestStateStore()
 	if err := store.SaveBlockState(context.Background(), &storage.BlockState{Block: storedMaster}); err != nil {
 		t.Fatalf("save stored master: %v", err)
 	}
@@ -290,8 +292,8 @@ func TestSyncerIgnoresIncompleteStoredMasterchainState(t *testing.T) {
 	if got := source.downloadCount[storage.BlockKey(newerMaster)]; got != 1 {
 		t.Fatalf("expected newer master to be downloaded once, got %d", got)
 	}
-	if got := source.persistentCalls; got != 1 {
-		t.Fatalf("expected persistent key block selection, got %d", got)
+	if got := source.trustedInitCalls; got != 1 {
+		t.Fatalf("expected trusted init lookup, got %d", got)
 	}
 }
 
@@ -311,7 +313,7 @@ func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 			storage.BlockKey(shardA): {Block: shardA},
 			storage.BlockKey(shardB): {Block: shardB},
 		},
-		downloadedFactory: func(block ton.BlockIDExt) DownloadedState {
+		downloadedFactory: func(block ton.BlockIDExt) storage.DownloadedState {
 			return &trackingDownloadedState{
 				block:          block,
 				currentDecodes: &currentDecodes,
@@ -321,7 +323,7 @@ func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 		},
 	}
 
-	syncer := NewSyncer(source, memstore.NewStateStore())
+	syncer := NewSyncer(source, newTestStateStore())
 	if _, err := syncer.SyncCurrent(context.Background()); err != nil {
 		t.Fatalf("sync current: %v", err)
 	}
@@ -330,17 +332,54 @@ func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 	}
 }
 
+func TestSyncerWalksKeyBlocksToTailWithoutLatestLookup(t *testing.T) {
+	init := ton.BlockIDExt{Workchain: -1, Shard: topShard, SeqNo: 10}
+	key20 := ton.BlockIDExt{Workchain: -1, Shard: topShard, SeqNo: 20}
+	key30 := ton.BlockIDExt{Workchain: -1, Shard: topShard, SeqNo: 30}
+	key40 := ton.BlockIDExt{Workchain: -1, Shard: topShard, SeqNo: 40}
+
+	source := &fakeSource{
+		master: init,
+		keyBlockBatches: map[uint32]p2p.KeyBlockBatch{
+			10: {Blocks: []ton.BlockIDExt{key20, key30}},
+			30: {Blocks: []ton.BlockIDExt{key40}, Incomplete: true},
+			40: {Incomplete: true},
+		},
+	}
+
+	syncer := NewSyncer(source, newTestStateStore())
+	blocks, err := syncer.keyBlockIDs(context.Background(), init)
+	if err != nil {
+		t.Fatalf("walk key blocks: %v", err)
+	}
+
+	if got, want := len(blocks), 4; got != want {
+		t.Fatalf("unexpected key block count %d, want %d", got, want)
+	}
+	if !blocks[0].Equals(&init) || !blocks[1].Equals(&key20) || !blocks[2].Equals(&key30) || !blocks[3].Equals(&key40) {
+		t.Fatalf("unexpected key block chain %#v", blocks)
+	}
+	if got := source.nextKeyBlockCalls; got != 3 {
+		t.Fatalf("unexpected next key block calls %d", got)
+	}
+	if got := source.latestCalls; got != 0 {
+		t.Fatalf("expected latest masterchain lookup to be skipped, got %d", got)
+	}
+}
+
 type fakeSource struct {
 	mu                 sync.Mutex
 	master             ton.BlockIDExt
 	shards             []ton.BlockIDExt
 	states             map[string]*storage.BlockState
-	downloadedFactory  func(block ton.BlockIDExt) DownloadedState
+	keyBlockBatches    map[uint32]p2p.KeyBlockBatch
+	downloadedFactory  func(block ton.BlockIDExt) storage.DownloadedState
 	errByBlock         map[string]error
 	errSequenceByBlock map[string][]error
 	downloadCount      map[string]int
+	nextKeyBlockCalls  int
 	latestCalls        int
-	persistentCalls    int
+	trustedInitCalls   int
 }
 
 func (f *fakeSource) LatestMasterchainBlock(context.Context) (ton.BlockIDExt, error) {
@@ -348,16 +387,32 @@ func (f *fakeSource) LatestMasterchainBlock(context.Context) (ton.BlockIDExt, er
 	return f.master, nil
 }
 
-func (f *fakeSource) PersistentMasterchainBlock(context.Context, ton.BlockIDExt) (ton.BlockIDExt, error) {
-	f.persistentCalls++
+func (f *fakeSource) TrustedInitBlock(context.Context) (ton.BlockIDExt, error) {
+	f.trustedInitCalls++
 	return f.master, nil
+}
+
+func (f *fakeSource) NextKeyBlocks(_ context.Context, from ton.BlockIDExt, _ int32) (p2p.KeyBlockBatch, error) {
+	f.nextKeyBlockCalls++
+	if f.keyBlockBatches == nil {
+		return p2p.KeyBlockBatch{}, nil
+	}
+	return f.keyBlockBatches[from.SeqNo], nil
+}
+
+func (f *fakeSource) TrustedInitProof(context.Context, ton.BlockIDExt) ([]byte, error) {
+	return nil, errors.New("unexpected trusted init proof download")
+}
+
+func (f *fakeSource) MasterchainProof(context.Context, ton.BlockIDExt, bool) ([]byte, error) {
+	return nil, errors.New("unexpected masterchain proof download")
 }
 
 func (f *fakeSource) ShardBlocks(context.Context, ton.BlockIDExt) ([]ton.BlockIDExt, error) {
 	return append([]ton.BlockIDExt(nil), f.shards...), nil
 }
 
-func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (DownloadedState, error) {
+func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (storage.DownloadedState, error) {
 	key := storage.BlockKey(block)
 
 	f.mu.Lock()
@@ -399,7 +454,7 @@ func (d *trackingDownloadedState) Block() ton.BlockIDExt {
 	return d.block
 }
 
-func (d *trackingDownloadedState) Decode(ctx context.Context, _ storage.StateCellTreeImporter) (*storage.BlockState, error) {
+func (d *trackingDownloadedState) Decode(ctx context.Context) (*storage.BlockState, error) {
 	current := d.currentDecodes.Add(1)
 	defer d.currentDecodes.Add(-1)
 
@@ -422,6 +477,38 @@ func (d *trackingDownloadedState) Decode(ctx context.Context, _ storage.StateCel
 	}, nil
 }
 
+func (d *trackingDownloadedState) ImportCells(ctx context.Context, _ storage.StateCellTreeImporter) (*storage.BlockState, error) {
+	return d.Decode(ctx)
+}
+
 func (d *trackingDownloadedState) Cleanup() error {
+	return nil
+}
+
+type immediateDownloadedState struct {
+	state *storage.BlockState
+}
+
+func newImmediateDownloadedState(state *storage.BlockState) storage.DownloadedState {
+	return &immediateDownloadedState{state: storage.CloneBlockState(state)}
+}
+
+func (d *immediateDownloadedState) Block() ton.BlockIDExt {
+	if d.state == nil {
+		return ton.BlockIDExt{}
+	}
+	return d.state.Block
+}
+
+func (d *immediateDownloadedState) Decode(context.Context) (*storage.BlockState, error) {
+	return storage.CloneBlockState(d.state), nil
+}
+
+func (d *immediateDownloadedState) ImportCells(ctx context.Context, _ storage.StateCellTreeImporter) (*storage.BlockState, error) {
+	return d.Decode(ctx)
+}
+
+func (d *immediateDownloadedState) Cleanup() error {
+	d.state = nil
 	return nil
 }

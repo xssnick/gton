@@ -17,6 +17,7 @@ const (
 	defaultOutputBuffer = 256
 	defaultRetryCount   = 3
 	defaultRetryDelay   = 500 * time.Millisecond
+	masterchainShard    = int64(-1 << 63)
 )
 
 type Source interface {
@@ -29,9 +30,30 @@ type Fetcher interface {
 }
 
 type SyncedBlock struct {
-	Trigger    p2p.BroadcastEvent
-	Downloaded p2p.DownloadedBlock
-	CatchUp    bool
+	Trigger         p2p.BroadcastEvent
+	Downloaded      p2p.DownloadedBlock
+	CatchUp         bool
+	DownloadElapsed time.Duration
+	ack             chan bool
+}
+
+func (b SyncedBlock) Accept() {
+	b.ackResult(true)
+}
+
+func (b SyncedBlock) Reject() {
+	b.ackResult(false)
+}
+
+func (b SyncedBlock) ackResult(accepted bool) {
+	if b.ack == nil {
+		return
+	}
+
+	select {
+	case b.ack <- accepted:
+	default:
+	}
 }
 
 type Service struct {
@@ -125,12 +147,48 @@ func (s *Service) Run(ctx context.Context) {
 				return
 			}
 
+			if s.emitDirectMasterchainBroadcast(ctx, ev) {
+				continue
+			}
+			if !isMasterchainBlock(ev.Block) {
+				s.log.Debug().
+					Str("block", ev.BlockRef()).
+					Str("overlay", ev.Overlay).
+					Str("kind", ev.Kind).
+					Msg("ignoring non-masterchain broadcast in block sync")
+				continue
+			}
+
 			chain := s.getOrCreateChain(ctx, &wg, ev.Block)
 			if !chain.enqueue(ev) {
 				return
 			}
 		}
 	}
+}
+
+func (s *Service) emitDirectMasterchainBroadcast(ctx context.Context, ev p2p.BroadcastEvent) bool {
+	if !isMasterchainBlock(ev.Block) {
+		return false
+	}
+	if ev.Downloaded == nil || !ev.Downloaded.ID.Equals(&ev.Block) {
+		return false
+	}
+	if !fullBlockBroadcastKind(ev.Kind) {
+		return false
+	}
+
+	downloaded := *ev.Downloaded
+	s.emitAsync(ctx, &SyncedBlock{
+		Trigger:    ev,
+		Downloaded: downloaded,
+		CatchUp:    false,
+	})
+	return true
+}
+
+func isMasterchainBlock(block ton.BlockIDExt) bool {
+	return block.Workchain == -1 && block.Shard == masterchainShard
 }
 
 func (s *Service) getOrCreateChain(ctx context.Context, wg *sync.WaitGroup, block ton.BlockIDExt) *chain {
@@ -251,15 +309,18 @@ func shouldReplacePending(current, next p2p.BroadcastEvent) bool {
 
 func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 	if c.last == nil {
+		downloadStarted := time.Now()
 		downloaded, ok := c.waitForBlock(ctx, ev)
+		downloadElapsed := time.Since(downloadStarted)
 		if !ok {
 			return
 		}
 
-		if !c.service.emit(ctx, SyncedBlock{
-			Trigger:    ev,
-			Downloaded: downloaded,
-			CatchUp:    false,
+		if !c.service.emit(ctx, &SyncedBlock{
+			Trigger:         ev,
+			Downloaded:      downloaded,
+			CatchUp:         false,
+			DownloadElapsed: downloadElapsed,
 		}) {
 			return
 		}
@@ -292,7 +353,9 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 	for c.last.SeqNo < ev.Block.SeqNo {
 		prev := *c.last
 
+		downloadStarted := time.Now()
 		downloaded, ok := c.waitForNextBlock(ctx, ev, prev)
+		downloadElapsed := time.Since(downloadStarted)
 		if !ok {
 			return
 		}
@@ -318,10 +381,11 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 			return
 		}
 
-		if !c.service.emit(ctx, SyncedBlock{
-			Trigger:    ev,
-			Downloaded: downloaded,
-			CatchUp:    true,
+		if !c.service.emit(ctx, &SyncedBlock{
+			Trigger:         ev,
+			Downloaded:      downloaded,
+			CatchUp:         true,
+			DownloadElapsed: downloadElapsed,
 		}) {
 			return
 		}
@@ -355,6 +419,18 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 }
 
 func (c *chain) waitForBlock(ctx context.Context, ev p2p.BroadcastEvent) (p2p.DownloadedBlock, bool) {
+	if ev.Downloaded != nil && ev.Downloaded.ID.Equals(&ev.Block) {
+		return *ev.Downloaded, true
+	}
+	if fullBlockBroadcastKind(ev.Kind) {
+		c.service.log.Debug().
+			Str("block", ev.BlockRef()).
+			Str("overlay", ev.Overlay).
+			Str("kind", ev.Kind).
+			Msg("dropping full block broadcast without decoded payload")
+		return p2p.DownloadedBlock{}, false
+	}
+
 	for attempt := 1; ; attempt++ {
 		downloaded, err := c.service.downloadBlockWithRetry(ctx, ev.Block)
 		if err == nil {
@@ -375,6 +451,19 @@ func (c *chain) waitForBlock(ctx context.Context, ev p2p.BroadcastEvent) (p2p.Do
 }
 
 func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, prev ton.BlockIDExt) (p2p.DownloadedBlock, bool) {
+	if ev.Downloaded != nil && ev.Downloaded.ID.Equals(&ev.Block) && ev.Downloaded.ID.SeqNo == prev.SeqNo+1 {
+		return *ev.Downloaded, true
+	}
+	if fullBlockBroadcastKind(ev.Kind) && ev.Block.SeqNo == prev.SeqNo+1 {
+		c.service.log.Debug().
+			Str("from", formatBlockRef(prev)).
+			Str("target", ev.BlockRef()).
+			Str("overlay", ev.Overlay).
+			Str("kind", ev.Kind).
+			Msg("dropping full block broadcast without decoded next payload")
+		return p2p.DownloadedBlock{}, false
+	}
+
 	for attempt := 1; ; attempt++ {
 		downloaded, err := c.service.downloadNextBlockWithRetry(ctx, prev)
 		if err == nil {
@@ -395,41 +484,60 @@ func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, pre
 	}
 }
 
-func (s *Service) emit(ctx context.Context, block SyncedBlock) bool {
+func fullBlockBroadcastKind(kind string) bool {
+	switch kind {
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) emit(ctx context.Context, block *SyncedBlock) bool {
+	block.ack = make(chan bool, 1)
+
 	select {
 	case <-ctx.Done():
 		return false
-	case s.out <- block:
+	case s.out <- *block:
+	}
+
+	select {
+	case <-ctx.Done():
+		return false
+	case accepted := <-block.ack:
+		return accepted
+	}
+}
+
+func (s *Service) emitAsync(ctx context.Context, block *SyncedBlock) bool {
+	block.ack = nil
+
+	select {
+	case <-ctx.Done():
+		return false
+	case s.out <- *block:
 		return true
 	}
 }
 
 func (s *Service) downloadBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	var lastErr error
-
-	for attempt := 1; attempt <= s.retryCount; attempt++ {
-		downloaded, err := s.fetcher.DownloadBlockFull(ctx, block)
-		if err == nil {
-			return downloaded, nil
-		}
-		lastErr = err
-
-		if attempt == s.retryCount {
-			break
-		}
-		if err = waitOrDone(ctx, s.retryDelay); err != nil {
-			return p2p.DownloadedBlock{}, err
-		}
-	}
-
-	return p2p.DownloadedBlock{}, fmt.Errorf("download block %s: %w", formatBlockRef(block), lastErr)
+	return s.downloadWithRetry(ctx, fmt.Sprintf("download block %s", formatBlockRef(block)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
+		return s.fetcher.DownloadBlockFull(ctx, block)
+	})
 }
 
 func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+	return s.downloadWithRetry(ctx, fmt.Sprintf("download next block after %s", formatBlockRef(prev)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
+		return s.fetcher.DownloadNextBlockFull(ctx, prev)
+	})
+}
+
+func (s *Service) downloadWithRetry(ctx context.Context, label string, download func(context.Context) (p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= s.retryCount; attempt++ {
-		downloaded, err := s.fetcher.DownloadNextBlockFull(ctx, prev)
+		downloaded, err := download(ctx)
 		if err == nil {
 			return downloaded, nil
 		}
@@ -443,7 +551,7 @@ func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.Block
 		}
 	}
 
-	return p2p.DownloadedBlock{}, fmt.Errorf("download next block after %s: %w", formatBlockRef(prev), lastErr)
+	return p2p.DownloadedBlock{}, fmt.Errorf("%s: %w", label, lastErr)
 }
 
 func waitOrDone(ctx context.Context, delay time.Duration) error {

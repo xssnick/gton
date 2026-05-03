@@ -8,8 +8,6 @@ import (
 	"io"
 	"sync"
 	"time"
-
-	"github.com/xssnick/tonutils-go/ton"
 )
 
 const persistentStateReadPrefixLimit = 64
@@ -18,11 +16,10 @@ type persistentStateChunkReader struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	downloader   persistentStateSnapshotDownloader
 	node         *Node
-	sub          *overlaySubscription
 	peer         *overlayPeer
 	id           PersistentStateIDV2
-	block        ton.BlockIDExt
 	blockRef     string
 	size         int64
 	workers      int
@@ -44,7 +41,9 @@ type persistentStateChunkReader struct {
 	lastProgressDownloaded int64
 }
 
-func (n *Node) newPersistentStateChunkReader(ctx context.Context, sub *overlaySubscription, peer *overlayPeer, id PersistentStateIDV2, block ton.BlockIDExt, size int64, workers int, chunkLimiter chan struct{}, seed *persistentStateChunkSeed) (*persistentStateChunkReader, error) {
+func (d persistentStateSnapshotDownloader) newPersistentStateChunkReader(ctx context.Context, peer *overlayPeer, id PersistentStateIDV2, size int64, workers int, chunkLimiter chan struct{}, seed *persistentStateChunkSeed) (*persistentStateChunkReader, error) {
+	n := d.node
+
 	ctx, cancel := context.WithCancel(ctx)
 	chunkCount := int((size + persistentStateChunkSize - 1) / persistentStateChunkSize)
 	now := time.Now()
@@ -56,12 +55,11 @@ func (n *Node) newPersistentStateChunkReader(ctx context.Context, sub *overlaySu
 	r := &persistentStateChunkReader{
 		ctx:          ctx,
 		cancel:       cancel,
+		downloader:   d,
 		node:         n,
-		sub:          sub,
 		peer:         peer,
 		id:           id,
-		block:        block,
-		blockRef:     formatPersistentStateBlockRef(block, id.EffectiveShard),
+		blockRef:     formatPersistentStateBlockRef(d.block, id.EffectiveShard),
 		size:         size,
 		workers:      workers,
 		chunkLimiter: chunkLimiter,
@@ -97,7 +95,7 @@ func (n *Node) newPersistentStateChunkReader(ctx context.Context, sub *overlaySu
 			Int64("chunk_size_bytes", probeChunkSize).
 			Msg("checking state snapshot availability")
 
-		first := n.downloadPersistentStateChunk(ctx, sub, peer, id, block, 0, size, chunkLimiter)
+		first := d.downloadPersistentStateChunk(ctx, peer, id, 0, size, chunkLimiter)
 		if first.err != nil {
 			cancel()
 			if !errors.Is(first.err, context.Canceled) {
@@ -228,7 +226,7 @@ func (r *persistentStateChunkReader) start() {
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				res := r.node.downloadPersistentStateChunk(r.ctx, r.sub, r.peer, r.id, r.block, idx, r.size, r.chunkLimiter)
+				res := r.downloader.downloadPersistentStateChunk(r.ctx, r.peer, r.id, idx, r.size, r.chunkLimiter)
 				select {
 				case results <- res:
 				case <-r.ctx.Done():

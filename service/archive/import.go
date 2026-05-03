@@ -3,8 +3,7 @@ package archive
 import (
 	"context"
 	"encoding/hex"
-	"flexserver/service/archive/packfile"
-	"flexserver/service/storage"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +11,9 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"flexserver/service/archive/packfile"
+	"flexserver/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -88,14 +90,14 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 	var blockIDs []ton.BlockIDExt
 
 	started := time.Now()
-	err := ReadPackageEntries(ctx, r, func(entry packfile.Entry) error {
-		ref, ok, err := parseEntryName(entry.Name)
-		if err != nil {
-			return err
-		}
-		if !ok {
+	err := packfile.Read(ctx, r, func(entry packfile.Entry) error {
+		ref, err := parseEntryName(entry.Name)
+		if errors.Is(err, storage.ErrNotFound) {
 			stats.IgnoredEntries++
 			return nil
+		}
+		if err != nil {
+			return err
 		}
 
 		stats.Entries++
@@ -409,16 +411,6 @@ func buildBlockLinks(blocks []ton.BlockIDExt) []storage.ServedBlockLink {
 	return links
 }
 
-func ReadPackage(ctx context.Context, r io.Reader, handle func(name string, data []byte) error) error {
-	return ReadPackageEntries(ctx, r, func(entry packfile.Entry) error {
-		return handle(entry.Name, entry.Data)
-	})
-}
-
-func ReadPackageEntries(ctx context.Context, r io.Reader, handle func(packfile.Entry) error) error {
-	return packfile.Read(ctx, r, handle)
-}
-
 func artifactRefFromEntry(path string, entry packfile.Entry) *storage.ArtifactRef {
 	if entry.DataSize <= 0 {
 		return nil
@@ -430,31 +422,31 @@ func artifactRefFromEntry(path string, entry packfile.Entry) *storage.ArtifactRe
 	}
 }
 
-func parseEntryName(name string) (entryRef, bool, error) {
+func parseEntryName(name string) (entryRef, error) {
 	matches := entryNameRE.FindStringSubmatch(name)
 	if matches == nil {
-		return entryRef{}, false, nil
+		return entryRef{}, storage.ErrNotFound
 	}
 
 	workchain, err := strconv.ParseInt(matches[2], 10, 32)
 	if err != nil {
-		return entryRef{}, false, fmt.Errorf("parse archive workchain from %q: %w", name, err)
+		return entryRef{}, fmt.Errorf("parse archive workchain from %q: %w", name, err)
 	}
 	shard, err := strconv.ParseUint(matches[3], 16, 64)
 	if err != nil {
-		return entryRef{}, false, fmt.Errorf("parse archive shard from %q: %w", name, err)
+		return entryRef{}, fmt.Errorf("parse archive shard from %q: %w", name, err)
 	}
 	seqno, err := strconv.ParseUint(matches[4], 10, 32)
 	if err != nil {
-		return entryRef{}, false, fmt.Errorf("parse archive seqno from %q: %w", name, err)
+		return entryRef{}, fmt.Errorf("parse archive seqno from %q: %w", name, err)
 	}
 	rootHash, err := hex.DecodeString(matches[5])
 	if err != nil {
-		return entryRef{}, false, fmt.Errorf("parse archive root hash from %q: %w", name, err)
+		return entryRef{}, fmt.Errorf("parse archive root hash from %q: %w", name, err)
 	}
 	fileHash, err := hex.DecodeString(matches[6])
 	if err != nil {
-		return entryRef{}, false, fmt.Errorf("parse archive file hash from %q: %w", name, err)
+		return entryRef{}, fmt.Errorf("parse archive file hash from %q: %w", name, err)
 	}
 
 	return entryRef{
@@ -466,5 +458,5 @@ func parseEntryName(name string) (entryRef, bool, error) {
 			RootHash:  rootHash,
 			FileHash:  fileHash,
 		},
-	}, true, nil
+	}, nil
 }

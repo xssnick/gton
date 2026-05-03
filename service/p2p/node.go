@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flexserver/internal/logutil"
 	storage2 "flexserver/service/storage"
-	"flexserver/service/storage/memstore"
 	"fmt"
 	"net"
 	"os"
@@ -42,38 +41,41 @@ type dhtBackend interface {
 var _ dhtBackend = (*dht.Client)(nil)
 
 type Node struct {
-	log         zerolog.Logger
-	cfgPath     string
-	listenAddr  string
-	externalIP  net.IP
-	privKey     ed25519.PrivateKey
-	dhtPrivKey  ed25519.PrivateKey
-	gateway     *adnl.Gateway
-	dhtGateway  *adnl.Gateway
-	dhtServer   *dht.Server
-	dht         dhtBackend
-	pool        *peerPool
-	events      chan BroadcastEvent
-	eventQueue  *unboundedQueue[BroadcastEvent]
-	ingestQueue *unboundedQueue[inboundBroadcastIngest]
-	deduper     *eventDeduper
-	onceStop    sync.Once
-	stopped     chan struct{}
-	wg          sync.WaitGroup
+	log        zerolog.Logger
+	cfgPath    string
+	listenAddr string
+	externalIP net.IP
+	privKey    ed25519.PrivateKey
+	dhtPrivKey ed25519.PrivateKey
+	gateway    *adnl.Gateway
+	dhtGateway *adnl.Gateway
+	dhtServer  *dht.Server
+	dht        dhtBackend
+	pool       *peerPool
+	events     chan BroadcastEvent
+	eventQueue *unboundedQueue[BroadcastEvent]
+	deduper    *eventDeduper
+	onceStop   sync.Once
+	stopped    chan struct{}
+	wg         sync.WaitGroup
 
 	inboundMx       sync.Mutex
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx            context.Context
-	zeroStateFileHash []byte
-	trustedInitBlock  ton.BlockIDExt
-	externalPort      uint16
-	dhtListenAddr     string
-	storage           storage2.Storage
-	peerStorage       storage2.PeerServingStorage
-	rebroadcastQueue  *unboundedQueue[rebroadcastRequest]
-	rebroadcastQuiet  atomic.Bool
+	runCtx             context.Context
+	zeroStateFileHash  []byte
+	zeroStateBlock     ton.BlockIDExt
+	trustedInitBlock   ton.BlockIDExt
+	externalPort       uint16
+	dhtListenAddr      string
+	storage            storage2.Storage
+	peerStorage        storage2.PeerServingStorage
+	compressedState    CompressedBlockStateProvider
+	blockCacheObserver BlockCacheObserver
+	blockCacheSlots    chan struct{}
+	rebroadcastQueue   *unboundedQueue[rebroadcastRequest]
+	rebroadcastQuiet   atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
@@ -81,18 +83,20 @@ type Node struct {
 	subscriptionsMx sync.RWMutex
 	subscriptions   map[string]*overlaySubscription
 
-	latestBlocksMx          sync.RWMutex
-	latestMasterchain       *ton.BlockIDExt
-	latestBasechain         *ton.BlockIDExt
-	latestMasterchainNotify chan struct{}
-	latestBasechainNotify   chan struct{}
-	stateDownloadDir        string
-	stateDownloadDirOwned   bool
-	statePeerLeasesMx       sync.RWMutex
-	statePeerLeases         map[string]int
-	archivePeerLeasesMx     sync.RWMutex
-	archivePeerLeases       map[string]int
-	stateCellImportSlot     chan struct{}
+	latestBlocksMx            sync.RWMutex
+	observedMasterchain       *ton.BlockIDExt
+	seenMasterchain           *ton.BlockIDExt
+	latestBasechain           *ton.BlockIDExt
+	rawMasterchainBroadcast   *ton.BlockIDExt
+	observedMasterchainNotify chan struct{}
+	seenMasterchainNotify     chan struct{}
+	latestBasechainNotify     chan struct{}
+	rawMasterchainNotify      chan struct{}
+	stateDownloadDir          string
+	stateDownloadDirOwned     bool
+	downloadPeerMx            sync.RWMutex
+	downloadPeerLeases        map[string]int
+	stateCellImportSlot       chan struct{}
 }
 
 func New(opts Options) (*Node, error) {
@@ -151,9 +155,7 @@ func New(opts Options) (*Node, error) {
 		peerStorage = storage
 	}
 	if peerStorage == nil {
-		mem := memstore.New()
-		storage = mem
-		peerStorage = mem
+		return nil, fmt.Errorf("peer serving storage is required")
 	}
 
 	stateDownloadDir, stateDownloadDirOwned, err := prepareStateDownloadDir(opts.StateDownloadDir)
@@ -162,33 +164,34 @@ func New(opts Options) (*Node, error) {
 	}
 
 	return &Node{
-		log:                     logger,
-		cfgPath:                 cfgPath,
-		listenAddr:              opts.ListenAddr,
-		externalIP:              append(net.IP(nil), opts.ExternalIP...),
-		externalPort:            opts.ExternalPort,
-		privKey:                 priv,
-		dhtPrivKey:              dhtPriv,
-		gateway:                 gateway,
-		dhtListenAddr:           opts.DHTListenAddr,
-		pool:                    newPeerPool(gateway),
-		events:                  make(chan BroadcastEvent, broadcastEventBuffer),
-		eventQueue:              newUnboundedQueue[BroadcastEvent](),
-		ingestQueue:             newUnboundedQueue[inboundBroadcastIngest](),
-		deduper:                 newEventDeduper(10 * time.Minute),
-		stopped:                 make(chan struct{}),
-		subscriptions:           map[string]*overlaySubscription{},
-		latestMasterchainNotify: make(chan struct{}),
-		latestBasechainNotify:   make(chan struct{}),
-		storage:                 storage,
-		peerStorage:             peerStorage,
-		rebroadcastQueue:        newUnboundedQueue[rebroadcastRequest](),
-		rebroadcastThrottleLast: map[string]time.Time{},
-		stateDownloadDir:        stateDownloadDir,
-		stateDownloadDirOwned:   stateDownloadDirOwned,
-		statePeerLeases:         map[string]int{},
-		archivePeerLeases:       map[string]int{},
-		stateCellImportSlot:     make(chan struct{}, 1),
+		log:                       logger,
+		cfgPath:                   cfgPath,
+		listenAddr:                opts.ListenAddr,
+		externalIP:                append(net.IP(nil), opts.ExternalIP...),
+		externalPort:              opts.ExternalPort,
+		privKey:                   priv,
+		dhtPrivKey:                dhtPriv,
+		gateway:                   gateway,
+		dhtListenAddr:             opts.DHTListenAddr,
+		pool:                      newPeerPool(gateway),
+		events:                    make(chan BroadcastEvent, broadcastEventBuffer),
+		eventQueue:                newUnboundedQueue[BroadcastEvent](),
+		deduper:                   newEventDeduper(10 * time.Minute),
+		stopped:                   make(chan struct{}),
+		subscriptions:             map[string]*overlaySubscription{},
+		observedMasterchainNotify: make(chan struct{}),
+		seenMasterchainNotify:     make(chan struct{}),
+		latestBasechainNotify:     make(chan struct{}),
+		rawMasterchainNotify:      make(chan struct{}),
+		storage:                   storage,
+		peerStorage:               peerStorage,
+		blockCacheSlots:           make(chan struct{}, 2),
+		rebroadcastQueue:          newUnboundedQueue[rebroadcastRequest](),
+		rebroadcastThrottleLast:   map[string]time.Time{},
+		stateDownloadDir:          stateDownloadDir,
+		stateDownloadDirOwned:     stateDownloadDirOwned,
+		downloadPeerLeases:        map[string]int{},
+		stateCellImportSlot:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -235,6 +238,13 @@ func (n *Node) Start(ctx context.Context) error {
 
 	n.runCtx = ctx
 	n.zeroStateFileHash = append([]byte(nil), cfg.Validator.ZeroState.FileHash...)
+	n.zeroStateBlock = ton.BlockIDExt{
+		Workchain: cfg.Validator.ZeroState.Workchain,
+		Shard:     cfg.Validator.ZeroState.Shard,
+		SeqNo:     cfg.Validator.ZeroState.SeqNo,
+		RootHash:  append([]byte(nil), cfg.Validator.ZeroState.RootHash...),
+		FileHash:  append([]byte(nil), cfg.Validator.ZeroState.FileHash...),
+	}
 	n.trustedInitBlock = ton.BlockIDExt(cfg.Validator.InitBlock)
 
 	specs, err := buildOverlaySpecs(n.zeroStateFileHash)
@@ -264,16 +274,14 @@ func (n *Node) Start(ctx context.Context) error {
 	n.runAsync(func() {
 		n.runEventLoop(ctx)
 	})
-	for i := 0; i < inboundIngestWorkerCount; i++ {
-		n.runAsync(func() {
-			n.runInboundIngestLoop(ctx)
-		})
-	}
 	for i := 0; i < rebroadcastWorkerCount; i++ {
 		n.runAsync(func() {
 			n.runRebroadcastLoop(ctx)
 		})
 	}
+	n.runAsync(func() {
+		n.runZeroStateBootstrap(ctx)
+	})
 	if n.isPublicServer() {
 		n.runAsync(func() {
 			n.runAnnounceLoop(ctx)
@@ -318,7 +326,6 @@ func (n *Node) stop() {
 		_ = n.gateway.Close()
 
 		n.eventQueue.Close()
-		n.ingestQueue.Close()
 		n.rebroadcastQueue.Close()
 
 		n.wg.Wait()
@@ -353,30 +360,108 @@ func (n *Node) finishInbound() {
 	n.inboundWG.Done()
 }
 
-func (n *Node) trackLatestBlock(event BroadcastEvent) {
+func (n *Node) trackUnverifiedBroadcastBlock(event BroadcastEvent) {
 	if event.Block.Shard != topShard {
 		return
 	}
 
-	switch event.Block.Workchain {
-	case -1:
-		n.trackLatestMasterchain(event.Block)
-	case 0:
+	if event.Block.Workchain == -1 {
+		n.trackRawMasterchainBroadcast(event.Block)
+		return
+	}
+
+	// Masterchain observed/seen heads are advanced only after consensus
+	// signature validation through RememberSeenMasterchainBlock.
+	if event.Block.Workchain == 0 {
 		n.trackLatestBasechain(event.Block)
 	}
 }
 
-func (n *Node) trackLatestMasterchain(block ton.BlockIDExt) {
-	n.latestBlocksMx.Lock()
-	defer n.latestBlocksMx.Unlock()
-
-	if n.latestMasterchain != nil && n.latestMasterchain.SeqNo >= block.SeqNo {
+func (n *Node) trackRawMasterchainBroadcast(block ton.BlockIDExt) {
+	if block.Workchain != -1 || block.Shard != topShard {
 		return
 	}
 
-	n.latestMasterchain = &block
-	close(n.latestMasterchainNotify)
-	n.latestMasterchainNotify = make(chan struct{})
+	n.latestBlocksMx.Lock()
+	if n.rawMasterchainBroadcast == nil || n.rawMasterchainBroadcast.SeqNo < block.SeqNo {
+		n.rawMasterchainBroadcast = &block
+		close(n.rawMasterchainNotify)
+		n.rawMasterchainNotify = make(chan struct{})
+	}
+	n.latestBlocksMx.Unlock()
+}
+
+func (n *Node) MasterchainBroadcastAfter(seqno uint32) (<-chan struct{}, bool) {
+	n.latestBlocksMx.RLock()
+	defer n.latestBlocksMx.RUnlock()
+
+	if n.rawMasterchainBroadcast != nil && n.rawMasterchainBroadcast.SeqNo > seqno {
+		return nil, true
+	}
+	return n.rawMasterchainNotify, false
+}
+
+func (n *Node) RememberSeenMasterchainBlock(block ton.BlockIDExt) {
+	n.observeMasterchainBlock(block)
+	n.observeSeenMasterchainBlock(block)
+}
+
+func (n *Node) observeMasterchainBlock(block ton.BlockIDExt) bool {
+	if block.Workchain != -1 || block.Shard != topShard {
+		return false
+	}
+
+	updated := false
+
+	n.latestBlocksMx.Lock()
+	if n.observedMasterchain == nil || n.observedMasterchain.SeqNo < block.SeqNo {
+		n.observedMasterchain = &block
+		close(n.observedMasterchainNotify)
+		n.observedMasterchainNotify = make(chan struct{})
+		updated = true
+	}
+	n.latestBlocksMx.Unlock()
+
+	return updated
+}
+
+func (n *Node) observeSeenMasterchainBlock(block ton.BlockIDExt) bool {
+	if block.Workchain != -1 || block.Shard != topShard {
+		return false
+	}
+
+	updated := false
+
+	n.latestBlocksMx.Lock()
+	if n.seenMasterchain == nil || n.seenMasterchain.SeqNo < block.SeqNo {
+		n.seenMasterchain = &block
+		close(n.seenMasterchainNotify)
+		n.seenMasterchainNotify = make(chan struct{})
+		updated = true
+	}
+	n.latestBlocksMx.Unlock()
+
+	return updated
+}
+
+func (n *Node) SeenMasterchainBlock() (ton.BlockIDExt, error) {
+	n.latestBlocksMx.RLock()
+	defer n.latestBlocksMx.RUnlock()
+
+	if n.seenMasterchain == nil {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+	return *n.seenMasterchain, nil
+}
+
+func (n *Node) ObservedMasterchainBlock() (ton.BlockIDExt, error) {
+	n.latestBlocksMx.RLock()
+	defer n.latestBlocksMx.RUnlock()
+
+	if n.observedMasterchain == nil {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+	return *n.observedMasterchain, nil
 }
 
 func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
@@ -392,15 +477,15 @@ func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
 	n.latestBasechainNotify = make(chan struct{})
 }
 
-func (n *Node) WaitMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
+func (n *Node) WaitObservedMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
 	startedAt := time.Now()
 	progressTicker := time.NewTicker(masterchainWaitLogEvery)
 	defer progressTicker.Stop()
 
 	for {
 		n.latestBlocksMx.RLock()
-		current := n.latestMasterchain
-		wait := n.latestMasterchainNotify
+		current := n.observedMasterchain
+		wait := n.observedMasterchainNotify
 		n.latestBlocksMx.RUnlock()
 
 		if current != nil {
@@ -472,11 +557,96 @@ func (n *Node) logLatestBlockWaitProgress(startedAt time.Time, chain string) {
 		Msgf("waiting for latest %s block broadcast", chain)
 }
 
-func (n *Node) TrustedInitBlock() (ton.BlockIDExt, bool) {
-	if n.trustedInitBlock.SeqNo == 0 && n.trustedInitBlock.Workchain == 0 && n.trustedInitBlock.Shard == 0 {
+func (n *Node) TrustedInitBlock() (ton.BlockIDExt, error) {
+	if !validBlockID(n.trustedInitBlock) {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+	return n.trustedInitBlock, nil
+}
+
+func (n *Node) configuredZeroStateBlock() (ton.BlockIDExt, bool) {
+	if n.zeroStateBlock.SeqNo != 0 || !validBlockID(n.zeroStateBlock) {
 		return ton.BlockIDExt{}, false
 	}
-	return n.trustedInitBlock, true
+	return n.zeroStateBlock, true
+}
+
+func (n *Node) runZeroStateBootstrap(ctx context.Context) {
+	block, ok := n.configuredZeroStateBlock()
+	if !ok {
+		return
+	}
+
+	writer, _ := n.peerStorage.(storage2.PeerServingStorageWriter)
+	if writer == nil {
+		return
+	}
+
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		if err := n.ensureZeroState(ctx, block, writer); err == nil {
+			return
+		} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			n.log.Debug().
+				Err(err).
+				Str("block", formatBlockRef(block)).
+				Msg("zero state bootstrap attempt failed")
+		}
+
+		timer.Reset(zeroStateBootstrapRetry)
+	}
+}
+
+func (n *Node) ensureZeroState(ctx context.Context, block ton.BlockIDExt, writer storage2.PeerServingStorageWriter) error {
+	if data, err := n.peerStorage.ZeroState(ctx, block); err == nil && len(data) > 0 {
+		return nil
+	} else if err != nil && !errors.Is(err, storage2.ErrNotFound) {
+		return err
+	}
+
+	artifact, err := n.DownloadState(ctx, block, block, 0, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := artifact.Cleanup(); cleanupErr != nil {
+			n.log.Debug().
+				Err(cleanupErr).
+				Str("block", formatBlockRef(block)).
+				Msg("failed to cleanup zero state artifact")
+		}
+	}()
+
+	zero, ok := artifact.(*zeroStateSnapshotArtifact)
+	if !ok {
+		return fmt.Errorf("unexpected zero state artifact %T", artifact)
+	}
+	data := append([]byte(nil), zero.data...)
+
+	state, err := artifact.Decode(ctx)
+	if err != nil {
+		return fmt.Errorf("verify zero state: %w", err)
+	}
+	if err = writer.SaveZeroState(block, data, nil); err != nil {
+		return fmt.Errorf("store zero state: %w", err)
+	}
+
+	logEvent := n.log.Info().
+		Str("block", formatBlockRef(block)).
+		Int("bytes", len(data))
+	if state != nil {
+		logEvent = logEvent.Uint64("cells", state.CellsCount)
+	}
+	logEvent.Msg("zero state downloaded and stored")
+	return nil
 }
 
 func (n *Node) startDHT(ctx context.Context, cfg *liteclient.GlobalConfig) error {
@@ -673,6 +843,7 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 		log:          n.log.With().Str("overlay", spec.Name).Logger(),
 		peers:        map[string]*overlayPeer{},
 		archivePeers: map[string]*archivePeerState{},
+		peerNotify:   make(chan struct{}, 1),
 	}
 	n.subscriptions[key] = sub
 	n.subscriptionsMx.Unlock()

@@ -16,41 +16,55 @@ import (
 const (
 	DefaultGlobalConfigPath = "global.config.json"
 
-	topShard                  = int64(-1 << 63)
-	maxPeersPerOverlay        = 20
-	maxQueryNeighbours        = 16
-	maxOverlayPayloadSize     = 16 << 20
-	simpleBroadcastSkew       = 20 * time.Second
-	dhtRefreshInterval        = 45 * time.Second
-	peerRefreshMinDelay       = time.Second
-	peerRefreshJitter         = 0
-	peerRefreshFanout         = 1
-	neighbourReloadMinDelay   = 10 * time.Second
-	neighbourReloadJitter     = 20 * time.Second
-	peerPingMinDelay          = 500 * time.Millisecond
-	peerPingJitter            = 500 * time.Millisecond
-	peerPingFanout            = 6
-	overlayPeerTTL            = 10 * time.Minute
-	overlayFutureSkew         = 60 * time.Second
-	downloadQueryTimeout      = 15 * time.Second
-	downloadNextQueryTimeout  = 5 * time.Second
-	downloadRetryDelay        = 1500 * time.Millisecond
-	downloadQueryParallelism  = 4
-	downloadQueryHedgeDelay   = 350 * time.Millisecond
-	keyBlockLookupTimeout     = time.Second
-	keyBlockLookupParallelism = 2
-	keyBlockLookupHedgeDelay  = 250 * time.Millisecond
-	broadcastEventBuffer      = 4096
-	publicAnnounceTTL         = 12 * time.Minute
-	publicAnnounceEvery       = 4 * time.Minute
-	publicAnnounceRetryDelay  = 15 * time.Second
-	dhtStoreTimeout           = 45 * time.Second
-	dhtFindTimeout            = 30 * time.Second
-	masterchainWaitLogEvery   = 5 * time.Second
-	peerQueryTimeout          = 10 * time.Second
-	rebroadcastWorkerCount    = 4
-	inboundIngestWorkerCount  = 4
-	dhtServerStoreMaxKeys     = 300000
+	topShard                   = int64(-1 << 63)
+	maxPeersPerOverlay         = 20
+	maxQueryNeighbours         = 16
+	maxOverlayPayloadSize      = 16 << 20
+	simpleBroadcastSkew        = 20 * time.Second
+	dhtRefreshInterval         = 45 * time.Second
+	peerRefreshMinDelay        = time.Second
+	peerRefreshJitter          = 0
+	peerRefreshFanout          = 1
+	neighbourReloadMinDelay    = 10 * time.Second
+	neighbourReloadJitter      = 20 * time.Second
+	peerPingMinDelay           = 500 * time.Millisecond
+	peerPingJitter             = 500 * time.Millisecond
+	peerPingFanout             = 6
+	overlayPeerTTL             = 10 * time.Minute
+	overlayFutureSkew          = 60 * time.Second
+	downloadQueryTimeout       = 15 * time.Second
+	downloadNextQueryTimeout   = 5 * time.Second
+	downloadNextDescTimeout    = 1500 * time.Millisecond
+	downloadRetryDelay         = 1500 * time.Millisecond
+	downloadQueryParallelism   = 4
+	downloadQueryHedgeDelay    = 350 * time.Millisecond
+	proofPrepareTimeout        = time.Second
+	proofDownloadTimeout       = 3 * time.Second
+	proofDownloadParallelism   = 6
+	proofDownloadPeerLimit     = 24
+	proofDownloadHedgeDelay    = 250 * time.Millisecond
+	proofDownloadWaves         = 3
+	proofPeerDiscoveryDelay    = time.Second
+	keyBlockLookupTimeout      = time.Second
+	keyBlockLookupRoundTimeout = 5 * time.Second
+	keyBlockLookupParallelism  = 6
+	keyBlockLookupPeerLimit    = 24
+	keyBlockLookupHedgeDelay   = 150 * time.Millisecond
+	bootstrapDiscoveryTarget   = 64
+	dhtSeedConnectParallelism  = 8
+	dhtSeedPeerTimeout         = 5 * time.Second
+	attachWarmupTimeout        = 3 * time.Second
+	broadcastEventBuffer       = 4096
+	publicAnnounceTTL          = 12 * time.Minute
+	publicAnnounceEvery        = 4 * time.Minute
+	publicAnnounceRetryDelay   = 15 * time.Second
+	dhtStoreTimeout            = 45 * time.Second
+	dhtFindTimeout             = 30 * time.Second
+	masterchainWaitLogEvery    = 5 * time.Second
+	peerQueryTimeout           = 10 * time.Second
+	zeroStateBootstrapRetry    = 30 * time.Second
+	rebroadcastWorkerCount     = 4
+	dhtServerStoreMaxKeys      = 300000
 
 	maxBlockDownloadAnswerSize  = 32 << 20
 	maxKeyBlockLookupAnswerSize = 1 << 20
@@ -65,6 +79,10 @@ const (
 
 	peerStopUnreliability = 5.0
 	peerFailUnreliability = 10.0
+
+	blockUnknownPeerSpeed = float64(256 << 10)
+	blockSlowPeerSpeed    = float64(64 << 10)
+	blockSlowPeerPenalty  = 30 * time.Second
 )
 
 type Delivery string
@@ -80,6 +98,7 @@ type BroadcastEvent struct {
 	Delivery   Delivery
 	Trusted    bool
 	Block      ton.BlockIDExt
+	Downloaded *DownloadedBlock
 	SourceKey  string
 	ReceivedAt time.Time
 }
@@ -102,6 +121,10 @@ type Options struct {
 	PeerServingStorage storage.PeerServingStorage
 }
 
+type BlockCacheObserver interface {
+	MarkLiveBlockFlushed(block ton.BlockIDExt)
+}
+
 type overlaySpec struct {
 	Name              string
 	FullID            []byte
@@ -118,8 +141,12 @@ type DownloadedBlock struct {
 	Proof    *cell.Cell
 	BlockBOC []byte
 	ProofBOC []byte
-	Parsed   *tlb.Block
-	Meta     *storage.BlockMeta
+	// BroadcastSignatures is the validator signature set received with block broadcasts.
+	// It is not proof of validity by itself; service consensus validation checks it
+	// against the validator set before the block is used as verified.
+	BroadcastSignatures *cell.Cell
+	Parsed              *tlb.Block
+	Meta                *storage.BlockMeta
 
 	IsLink bool
 

@@ -18,7 +18,10 @@ func TestIntegrationReceivesBroadcasts(t *testing.T) {
 	defer cancel()
 
 	logger := stdoutLogger(zerolog.InfoLevel)
-	node, err := New(Options{Logger: &logger})
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
@@ -56,7 +59,10 @@ func TestIntegrationDownloadsBlockFull(t *testing.T) {
 	defer cancel()
 
 	logger := stdoutLogger(zerolog.InfoLevel)
-	node, err := New(Options{Logger: &logger})
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
@@ -100,7 +106,10 @@ func TestIntegrationDownloadsNextBlockFull(t *testing.T) {
 	defer cancel()
 
 	logger := stdoutLogger(zerolog.InfoLevel)
-	node, err := New(Options{Logger: &logger})
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}

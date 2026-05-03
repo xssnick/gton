@@ -5,7 +5,6 @@ import (
 	"context"
 	"flexserver/service/archive"
 	tnstore "flexserver/service/storage"
-	"flexserver/service/storage/memstore"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,7 +17,7 @@ import (
 )
 
 func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
-	storage := memstore.NewPeerStore()
+	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,
@@ -49,8 +48,12 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	if err := storage.SaveBlockFull(full); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
-	storage.LinkNextBlock(block, next)
-	storage.SaveBlockProof(tnstore.ServedProofBlockLink, block, []byte{0x01, 0x02, 0x03}, nil)
+	if err = storage.LinkNextBlock(block, next); err != nil {
+		t.Fatalf("link next block: %v", err)
+	}
+	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, block, []byte{0x01, 0x02, 0x03}, nil); err != nil {
+		t.Fatalf("save block proof: %v", err)
+	}
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: next})
 	if err != nil {
@@ -74,6 +77,18 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	}
 	if !nextResp.ID.Equals(&next) {
 		t.Fatalf("unexpected next block %v", nextResp.ID.SeqNo)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextBlockDescription{PrevBlock: block})
+	if err != nil {
+		t.Fatalf("getNextBlockDescription: %v", err)
+	}
+	desc, ok := resp.(BlockDescription)
+	if !ok {
+		t.Fatalf("unexpected getNextBlockDescription response %T", resp)
+	}
+	if !desc.ID.Equals(&next) {
+		t.Fatalf("unexpected next description %v", desc.ID.SeqNo)
 	}
 
 	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlock{Block: next})
@@ -113,8 +128,8 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	}
 }
 
-func TestDispatchPeerQueryDoesNotServeStateSnapshots(t *testing.T) {
-	storage := memstore.NewPeerStore()
+func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
+	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,
@@ -135,6 +150,12 @@ func TestDispatchPeerQueryDoesNotServeStateSnapshots(t *testing.T) {
 	}
 
 	block := testStoredBlockID(20)
+	zeroBlock := testStoredBlockID(0)
+	zeroState := []byte{5, 4, 3, 2, 1}
+	if err = storage.SaveZeroState(zeroBlock, zeroState, nil); err != nil {
+		t.Fatalf("save zero state: %v", err)
+	}
+
 	master := testStoredMasterBlockID(21)
 	stateID := PersistentStateIDV2{
 		Block:            block,
@@ -156,20 +177,20 @@ func TestDispatchPeerQueryDoesNotServeStateSnapshots(t *testing.T) {
 		t.Fatalf("save shard archive file: %v", err)
 	}
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareZeroState{Block: block})
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareZeroState{Block: zeroBlock})
 	if err != nil {
 		t.Fatalf("prepareZeroState: %v", err)
 	}
-	if _, ok := resp.(NotFoundState); !ok {
+	if _, ok := resp.(PreparedState); !ok {
 		t.Fatalf("unexpected prepareZeroState response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadZeroState{Block: block})
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadZeroState{Block: zeroBlock})
 	if err != nil {
 		t.Fatalf("downloadZeroState: %v", err)
 	}
 	zero, ok := resp.(TonNodeData)
-	if !ok || len(zero.Data) != 0 {
+	if !ok || !bytes.Equal(zero.Data, zeroState) {
 		t.Fatalf("unexpected zero state response %T", resp)
 	}
 
@@ -240,8 +261,62 @@ func TestDispatchPeerQueryDoesNotServeStateSnapshots(t *testing.T) {
 	}
 }
 
+func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
+	store := newTestPebbleStore(t)
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:  &logger,
+		Storage: store,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "masterchain",
+			ProtoVersionMajor: masterchainProtoVersionMajor,
+			ProtoVersionMinor: masterchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+
+	for seqno := uint32(11); seqno <= 14; seqno++ {
+		block := testStoredMasterBlockID(seqno)
+		meta := &tnstore.BlockMeta{ID: block}
+		if seqno == 12 || seqno == 14 {
+			meta.Mark(tnstore.BlockMetaIsKeyBlock)
+		}
+		if err = store.SaveBlockMeta(meta); err != nil {
+			t.Fatalf("save block meta %d: %v", seqno, err)
+		}
+	}
+	if err = store.SaveSeenMasterchainBlock(context.Background(), testStoredMasterBlockID(14)); err != nil {
+		t.Fatalf("save seen masterchain: %v", err)
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
+		Block:   testStoredMasterBlockID(10),
+		MaxSize: 2,
+	})
+	if err != nil {
+		t.Fatalf("getNextKeyBlockIds: %v", err)
+	}
+	keyBlocks, ok := resp.(KeyBlocks)
+	if !ok {
+		t.Fatalf("unexpected getNextKeyBlockIds response %T", resp)
+	}
+	if keyBlocks.Error || keyBlocks.Incomplete || len(keyBlocks.Blocks) != 2 {
+		t.Fatalf("unexpected key blocks response %#v", keyBlocks)
+	}
+	if keyBlocks.Blocks[0].SeqNo != 12 || keyBlocks.Blocks[1].SeqNo != 14 {
+		t.Fatalf("unexpected key block seqnos %#v", keyBlocks.Blocks)
+	}
+}
+
 func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
-	storage := memstore.NewPeerStore()
+	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,
@@ -279,7 +354,7 @@ func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 }
 
 func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
-	storage := memstore.NewPeerStore()
+	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,

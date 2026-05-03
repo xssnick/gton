@@ -11,10 +11,10 @@ import (
 )
 
 type acceptedBroadcast struct {
-	fingerprint string
-	event       *BroadcastEvent
-	ingest      *inboundBroadcastIngest
-	rebroadcast *rebroadcastRequest
+	fingerprint     string
+	event           *BroadcastEvent
+	masterchainWake *ton.BlockIDExt
+	rebroadcast     *rebroadcastRequest
 }
 
 type rebroadcastRequest struct {
@@ -54,22 +54,22 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 		if !validBlockBroadcast(data.ID, data.Proof, data.Data) {
 			return nil
 		}
-		return s.acceptedBlockBroadcast(fingerprint, payload, delivery, trusted, "tonNode.blockBroadcast", data.ID, sourceKey, msg)
+		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, "tonNode.blockBroadcast", data.ID, sourceKey, msg)
 	case BlockBroadcastCompressed:
 		if !validCompressedBroadcast(data.ID, data.Compressed) {
 			return nil
 		}
-		return s.acceptedBlockBroadcast(fingerprint, payload, delivery, trusted, "tonNode.blockBroadcastCompressed", data.ID, sourceKey, msg)
+		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, "tonNode.blockBroadcastCompressed", data.ID, sourceKey, msg)
 	case BlockBroadcastCompressedV2:
 		if !validCompressedBroadcast(data.ID, data.DataCompressed) || len(data.Proof) == 0 {
 			return nil
 		}
-		return s.acceptedBlockBroadcast(fingerprint, payload, delivery, trusted, "tonNode.blockBroadcastCompressedV2", data.ID, sourceKey, msg)
+		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, "tonNode.blockBroadcastCompressedV2", data.ID, sourceKey, msg)
 	case tonnodeapi.NewShardBlockBroadcast:
 		if !validCompressedBroadcast(data.Block.ID, data.Block.Data) {
 			return nil
 		}
-		return s.acceptedBlockBroadcast(fingerprint, payload, delivery, trusted, "tonNode.newShardBlockBroadcast", data.Block.ID, sourceKey, msg)
+		return s.acceptedBlockBroadcast(fingerprint, delivery, trusted, "tonNode.newShardBlockBroadcast", data.Block.ID, sourceKey)
 	case tonnodeapi.NewExternalMessageBroadcast:
 		if len(data.Message.Data) == 0 {
 			return nil
@@ -99,7 +99,7 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 	}
 }
 
-func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, payload []byte, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string, msg any) *acceptedBroadcast {
+func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string) *acceptedBroadcast {
 	return &acceptedBroadcast{
 		fingerprint: fingerprint,
 		event: &BroadcastEvent{
@@ -111,15 +111,30 @@ func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, payload
 			SourceKey:  sourceKey,
 			ReceivedAt: time.Now(),
 		},
-		ingest: &inboundBroadcastIngest{
-			msg: msg,
-		},
-		rebroadcast: &rebroadcastRequest{
-			subscription: s,
-			kind:         kind,
-			payload:      payload,
-		},
 	}
+}
+
+func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string, msg any) *acceptedBroadcast {
+	downloaded, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Str("kind", kind).
+			Msg("dropping block broadcast because payload decode failed")
+		if block.Workchain == -1 && block.Shard == topShard {
+			wake := block
+			return &acceptedBroadcast{
+				fingerprint:     fingerprint,
+				masterchainWake: &wake,
+			}
+		}
+		return nil
+	}
+
+	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourceKey)
+	accepted.event.Downloaded = downloaded
+	return accepted
 }
 
 func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
@@ -130,13 +145,13 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		return
 	}
 
-	if accepted.event != nil {
-		n.trackLatestBlock(*accepted.event)
-		_ = n.eventQueue.Push(*accepted.event)
+	if accepted.masterchainWake != nil {
+		n.trackRawMasterchainBroadcast(*accepted.masterchainWake)
 	}
 
-	if accepted.ingest != nil {
-		_ = n.ingestQueue.Push(*accepted.ingest)
+	if accepted.event != nil {
+		n.trackUnverifiedBroadcastBlock(*accepted.event)
+		_ = n.eventQueue.Push(*accepted.event)
 	}
 
 	if accepted.rebroadcast != nil && n.allowRebroadcast(accepted.rebroadcast) {

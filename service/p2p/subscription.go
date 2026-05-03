@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -26,11 +27,16 @@ type overlaySubscription struct {
 
 	mx                  sync.Mutex
 	seedMx              sync.Mutex
+	seedRunning         bool
+	seedTarget          int
 	archivePeerMx       sync.Mutex
+	chainDownloadMx     sync.Mutex
 	peers               map[string]*overlayPeer
 	neighbours          []string
 	lastPingedNeighbour string
 	archivePeers        map[string]*archivePeerState
+	chainDownloads      map[chainDownloadKey]*chainDownloadState
+	peerNotify          chan struct{}
 }
 
 type archivePeerState struct {
@@ -38,6 +44,11 @@ type archivePeerState struct {
 	speed       float64
 	probeAt     time.Time
 	deniedPeers map[string]time.Time
+}
+
+type chainDownloadState struct {
+	peer  *overlayPeer
+	speed float64
 }
 
 type overlayPeer struct {
@@ -60,14 +71,14 @@ type overlayPeer struct {
 	lastReceiveAt     time.Time
 	lastSuccessAt     time.Time
 	failedQueries     uint64
-	archiveBytesSec   float64
-	archiveDownloads  uint64
-	archiveSlowUntil  time.Time
+	downloadBytesSec  float64
+	downloadCount     uint64
+	downloadSlowUntil time.Time
 }
 
 func (s *overlaySubscription) run(ctx context.Context) {
 	s.log.Info().Msg("starting overlay peer discovery")
-	s.seedFromDHT(ctx)
+	s.startSeedFromDHT(ctx)
 
 	dhtTicker := time.NewTicker(dhtRefreshInterval)
 	defer dhtTicker.Stop()
@@ -83,7 +94,7 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-dhtTicker.C:
-			s.seedFromDHT(ctx)
+			s.startSeedFromDHT(ctx)
 		case <-refreshTimer.C:
 			s.refreshPeers(ctx)
 			refreshTimer.Reset(nextPeerRefreshDelay())
@@ -97,16 +108,71 @@ func (s *overlaySubscription) run(ctx context.Context) {
 	}
 }
 
-func (s *overlaySubscription) seedFromDHT(ctx context.Context) {
+func (s *overlaySubscription) startSeedFromDHT(ctx context.Context) {
+	s.startSeedFromDHTTarget(ctx, maxPeersPerOverlay)
+}
+
+func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, targetPeers int) {
+	if targetPeers < maxPeersPerOverlay {
+		targetPeers = maxPeersPerOverlay
+	}
+
+	s.seedMx.Lock()
+	if s.seedRunning {
+		if targetPeers > s.seedTarget {
+			s.seedTarget = targetPeers
+		}
+		s.seedMx.Unlock()
+		return
+	}
+	s.seedRunning = true
+	s.seedTarget = targetPeers
+	s.seedMx.Unlock()
+
+	run := func() {
+		defer s.finishSeedFromDHT()
+		s.seedFromDHT(ctx, targetPeers)
+	}
+	if s.node != nil {
+		s.node.runAsync(run)
+		return
+	}
+	go run()
+}
+
+func (s *overlaySubscription) finishSeedFromDHT() {
+	s.seedMx.Lock()
+	s.seedRunning = false
+	s.seedTarget = 0
+	s.seedMx.Unlock()
+}
+
+func (s *overlaySubscription) currentSeedTarget(defaultTarget int) int {
 	s.seedMx.Lock()
 	defer s.seedMx.Unlock()
+
+	if s.seedTarget > defaultTarget {
+		return s.seedTarget
+	}
+	return defaultTarget
+}
+
+type seedConnectResult struct {
+	attached bool
+	err      error
+}
+
+func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) {
+	if s.node == nil || s.node.dht == nil {
+		return
+	}
 
 	var (
 		cont       *dht.Continuation
 		err        error
 		requests   int
 		nodesSeen  int
-		connected  int
+		connected  atomic.Int64
 		startedAt  = time.Now()
 		knownStart = len(s.knownPeersSnapshot())
 		aliveStart = s.aliveKnownPeerCount()
@@ -120,7 +186,81 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context) {
 			Msg("searching overlay peers in DHT")
 	}
 
-	for i := 0; i < 8 && s.aliveKnownPeerCount() < maxPeersPerOverlay; i++ {
+	jobs := make(chan overlay.Node)
+	results := make(chan seedConnectResult, dhtSeedConnectParallelism)
+	var workers sync.WaitGroup
+	for i := 0; i < dhtSeedConnectParallelism; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for node := range jobs {
+				attached, err := s.connectDHTOverlayNode(ctx, node)
+				results <- seedConnectResult{attached: attached, err: err}
+			}
+		}()
+	}
+
+	var collector sync.WaitGroup
+	collector.Add(1)
+	collectorCtx, cancelCollector := context.WithCancel(ctx)
+	go func() {
+		defer collector.Done()
+		for {
+			select {
+			case res, ok := <-results:
+				if !ok {
+					return
+				}
+				if res.err != nil {
+					s.log.Debug().Err(res.err).Msg("failed to connect overlay node")
+					continue
+				}
+				if res.attached {
+					connected.Add(1)
+				}
+			case <-collectorCtx.Done():
+				for res := range results {
+					if res.err != nil {
+						s.log.Debug().Err(res.err).Msg("failed to connect overlay node")
+						continue
+					}
+					if res.attached {
+						connected.Add(1)
+					}
+				}
+				return
+			}
+		}
+	}()
+	jobsClosed := false
+	seedFinished := false
+	finishWorkers := func() {
+		if !jobsClosed {
+			close(jobs)
+			jobsClosed = true
+		}
+		workers.Wait()
+		close(results)
+		cancelCollector()
+		collector.Wait()
+		seedFinished = true
+	}
+	defer func() {
+		if !seedFinished {
+			finishWorkers()
+		}
+	}()
+
+	sendNode := func(node overlay.Node) bool {
+		select {
+		case jobs <- node:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	for i := 0; i < 8 && s.aliveKnownPeerCount() < s.currentSeedTarget(targetPeers); i++ {
 		lookupCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
 		var nodes *overlay.NodesList
 		if cont == nil {
@@ -146,16 +286,11 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context) {
 		nodesSeen += len(nodes.List)
 
 		for _, node := range nodes.List {
-			if s.aliveKnownPeerCount() >= maxPeersPerOverlay {
+			if s.aliveKnownPeerCount() >= s.currentSeedTarget(targetPeers) {
 				break
 			}
-			attached, err := s.connectOverlayNodeV1(ctx, node)
-			if err != nil {
-				s.log.Debug().Err(err).Msg("failed to connect overlay node")
-				continue
-			}
-			if attached {
-				connected++
+			if !sendNode(node) {
+				break
 			}
 		}
 
@@ -164,16 +299,24 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context) {
 		}
 	}
 
-	if logSearch || connected > 0 {
+	finishWorkers()
+
+	if logSearch || connected.Load() > 0 {
 		s.log.Debug().
 			Dur("elapsed", time.Since(startedAt)).
 			Int("dht_requests", requests).
 			Int("dht_nodes", nodesSeen).
-			Int("connected_peers", connected).
+			Int64("connected_peers", connected.Load()).
 			Int("known_peers", len(s.knownPeersSnapshot())).
 			Int("alive_peers", s.aliveKnownPeerCount()).
 			Msg("overlay peer DHT search finished")
 	}
+}
+
+func (s *overlaySubscription) connectDHTOverlayNode(ctx context.Context, node overlay.Node) (bool, error) {
+	connectCtx, cancel := context.WithTimeout(ctx, dhtSeedPeerTimeout)
+	defer cancel()
+	return s.connectOverlayNodeV1(connectCtx, node)
 }
 
 func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node overlay.Node) (bool, error) {
@@ -264,13 +407,51 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		lastReceiveAt: time.Now(),
 	}
 	s.peers[pooled.id] = state
+	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 
 	s.installHandlers(state)
 	if announced != nil {
 		s.reloadNeighbours()
+		s.startPeerWarmup(state)
 	}
 	return true
+}
+
+func (s *overlaySubscription) peerNotifySnapshot() <-chan struct{} {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if s.peerNotify == nil {
+		s.peerNotify = make(chan struct{}, 1)
+	}
+	return s.peerNotify
+}
+
+func (s *overlaySubscription) notifyPeersChangedLocked() {
+	if s.peerNotify == nil {
+		s.peerNotify = make(chan struct{}, 1)
+	}
+	select {
+	case s.peerNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
+	if s.node == nil || s.node.runCtx == nil || peer == nil {
+		return
+	}
+
+	s.node.runAsync(func() {
+		ctx, cancel := context.WithTimeout(s.node.runCtx, attachWarmupTimeout)
+		defer cancel()
+
+		s.pingPeer(ctx, peer)
+		if ctx.Err() == nil {
+			s.exchangeRandomPeers(ctx, peer)
+		}
+	})
 }
 
 func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
@@ -456,6 +637,7 @@ func (s *overlaySubscription) removePeer(id string) {
 	s.mx.Lock()
 	delete(s.peers, id)
 	s.removeNeighbourLocked(id)
+	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 }
 
@@ -475,20 +657,21 @@ func (s *overlaySubscription) aliveKnownPeerCount() int {
 }
 
 func (s *overlaySubscription) ensurePeers(ctx context.Context) error {
+	s.startSeedFromDHT(ctx)
+
 	for {
 		if s.aliveKnownPeerCount() > 0 {
 			return nil
 		}
 
-		s.seedFromDHT(ctx)
-		if s.aliveKnownPeerCount() > 0 {
-			return nil
-		}
+		notify := s.peerNotifySnapshot()
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-notify:
 		case <-time.After(downloadRetryDelay):
+			s.startSeedFromDHT(ctx)
 		}
 	}
 }

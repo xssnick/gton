@@ -86,7 +86,7 @@ func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wa
 
 	var fileHash []byte
 	if len(rawBOC) == 0 && len(wantFileHash) > 0 {
-		rawBOC = root.ToBOCWithOptions(cell.BOCOptions{WithCRC32C: false})
+		rawBOC = root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	}
 	if len(wantRootHash) > 0 && !bytes.Equal(rootHash[:], wantRootHash) {
 		return nil, fmt.Errorf("state root hash mismatch for %s", FormatBlockRef(*expected))

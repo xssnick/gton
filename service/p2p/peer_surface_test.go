@@ -4,19 +4,27 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"flexserver/service/archive"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 	logger := discardLogger()
-	node, err := New(Options{Logger: &logger})
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
@@ -67,13 +75,129 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 	if _, ok = resp.(ArchiveNotFound); !ok {
 		t.Fatalf("unexpected getArchiveInfo response %T", resp)
 	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetOutMsgQueueProof{
+		DstShard: archive.ShardID{Workchain: 0, Shard: topShard},
+		Limits:   ImportedMsgQueueLimits{MaxBytes: 1 << 20, MaxMsgs: 128},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not supported yet") {
+		t.Fatalf("getOutMsgQueueProof error = %v, want not supported yet", err)
+	}
+	if resp != nil {
+		t.Fatalf("unexpected getOutMsgQueueProof response %T", resp)
+	}
+}
+
+func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	node.runCtx = runCtx
+	node.zeroStateFileHash = make([]byte, 32)
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "basechain",
+			ShortID:           make([]byte, 32),
+			ProtoVersionMajor: shardchainProtoVersionMajor,
+			ProtoVersionMinor: shardchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+	data := testExternalMessageBOC(t)
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, SendExtMessage{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	})
+	if err != nil {
+		t.Fatalf("sendExtMessage: %v", err)
+	}
+	if _, ok := resp.(Success); !ok {
+		t.Fatalf("unexpected sendExtMessage response %T", resp)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	req, ok := node.rebroadcastQueue.Pop(ctx)
+	if !ok {
+		t.Fatal("expected external message rebroadcast request")
+	}
+	if req.kind != "tonNode.externalMessageBroadcast" {
+		t.Fatalf("unexpected rebroadcast kind %q", req.kind)
+	}
+	if req.subscription.spec.Name != "basechain" {
+		t.Fatalf("unexpected rebroadcast subscription %q", req.subscription.spec.Name)
+	}
+
+	var parsed any
+	if _, err = tl.Parse(&parsed, req.payload, true); err != nil {
+		t.Fatalf("parse broadcast payload: %v", err)
+	}
+	broadcast, ok := parsed.(tonnodeapi.NewExternalMessageBroadcast)
+	if !ok {
+		t.Fatalf("unexpected broadcast payload type %T", parsed)
+	}
+	if string(broadcast.Message.Data) != string(data) {
+		t.Fatalf("unexpected external message data %x", broadcast.Message.Data)
+	}
+}
+
+func TestDispatchPeerQuerySendExtMessageRejectsInvalidMessage(t *testing.T) {
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "basechain"},
+		log:  discardLogger(),
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, SendExtMessage{
+		Message: tonnodeapi.ExternalMessage{Data: []byte{0xAA, 0xBB}},
+	})
+	if err == nil {
+		t.Fatal("expected invalid external message error")
+	}
+	if resp != nil {
+		t.Fatalf("unexpected sendExtMessage response %T", resp)
+	}
+}
+
+func testExternalMessageBOC(t *testing.T) []byte {
+	t.Helper()
+
+	root, err := tlb.ToCell(&tlb.ExternalMessage{
+		DstAddr:   address.MustParseRawAddr("0:1111111111111111111111111111111111111111111111111111111111111111"),
+		ImportFee: tlb.ZeroCoins,
+		Body:      cell.BeginCell().EndCell(),
+	})
+	if err != nil {
+		t.Fatalf("build external message: %v", err)
+	}
+	return root.ToBOCWithFlags(false)
 }
 
 func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:     &logger,
-		ListenAddr: "127.0.0.1:30303",
+		Logger:             &logger,
+		ListenAddr:         "127.0.0.1:30303",
+		PeerServingStorage: newTestPeerStore(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -141,7 +265,10 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 
 func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 	logger := discardLogger()
-	node, err := New(Options{Logger: &logger})
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: newTestPeerStore(),
+	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}

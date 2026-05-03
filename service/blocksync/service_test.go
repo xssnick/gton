@@ -118,6 +118,210 @@ func TestServiceIgnoresDuplicatesAndOlderBroadcasts(t *testing.T) {
 	}
 }
 
+func TestServiceUsesDecodedBroadcastPayloadWhenPresent(t *testing.T) {
+	source := &stubSource{events: make(chan p2p.BroadcastEvent, 4)}
+	fetcher := newStubFetcher()
+
+	block10 := testBlockID(-1, topShard, 10)
+	block11 := testBlockID(-1, topShard, 11)
+
+	service := New(discardLogger(), source, fetcher)
+	service.retryCount = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.Run(ctx)
+	}()
+
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block10, Downloaded: &p2p.DownloadedBlock{ID: block10}}
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block11, Downloaded: &p2p.DownloadedBlock{ID: block11}}
+	close(source.events)
+
+	got := collectSyncedBlocks(service.Blocks())
+	wg.Wait()
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 synced blocks, got %d", len(got))
+	}
+	if !got[0].Downloaded.ID.Equals(&block10) || !got[1].Downloaded.ID.Equals(&block11) {
+		t.Fatalf("unexpected synced blocks: %+v", got)
+	}
+	if len(fetcher.exactCalls) != 0 || len(fetcher.nextCalls) != 0 {
+		t.Fatalf("expected broadcast payload to avoid downloads, exact=%d next=%d", len(fetcher.exactCalls), len(fetcher.nextCalls))
+	}
+}
+
+func TestServiceEmitsDecodedMasterchainBroadcastsWithoutCoalescing(t *testing.T) {
+	source := &stubSource{events: make(chan p2p.BroadcastEvent, 4)}
+	fetcher := newStubFetcher()
+
+	block10 := testBlockID(-1, topShard, 10)
+	block12 := testBlockID(-1, topShard, 12)
+
+	service := New(discardLogger(), source, fetcher)
+	service.retryCount = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.Run(ctx)
+	}()
+
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "tonNode.blockBroadcastCompressedV2", Block: block12, Downloaded: &p2p.DownloadedBlock{ID: block12}}
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "tonNode.blockBroadcastCompressedV2", Block: block10, Downloaded: &p2p.DownloadedBlock{ID: block10}}
+	close(source.events)
+
+	var got []SyncedBlock
+	for block := range service.Blocks() {
+		got = append(got, block)
+		if block.Downloaded.ID.Equals(&block12) {
+			block.Reject()
+			continue
+		}
+		block.Accept()
+	}
+	wg.Wait()
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 direct broadcasts, got %d", len(got))
+	}
+	if !got[0].Downloaded.ID.Equals(&block12) || !got[1].Downloaded.ID.Equals(&block10) {
+		t.Fatalf("unexpected direct broadcast order: %+v", got)
+	}
+	if len(fetcher.exactCalls) != 0 || len(fetcher.nextCalls) != 0 {
+		t.Fatalf("expected direct broadcasts to avoid downloads, exact=%d next=%d", len(fetcher.exactCalls), len(fetcher.nextCalls))
+	}
+}
+
+func TestServiceDoesNotAdvanceAfterRejectedBlock(t *testing.T) {
+	source := &stubSource{events: make(chan p2p.BroadcastEvent, 4)}
+	fetcher := newStubFetcher()
+
+	block10 := testBlockID(-1, topShard, 10)
+	block12 := testBlockID(-1, topShard, 12)
+
+	fetcher.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
+	fetcher.exact[blockKey(block12)] = &p2p.DownloadedBlock{ID: block12}
+
+	service := New(discardLogger(), source, fetcher)
+	service.retryCount = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.Run(ctx)
+	}()
+
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block10}
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block12}
+	close(source.events)
+
+	var got []SyncedBlock
+	for block := range service.Blocks() {
+		got = append(got, block)
+		if len(got) == 1 {
+			block.Reject()
+			continue
+		}
+		block.Accept()
+	}
+	wg.Wait()
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 emitted blocks, got %d", len(got))
+	}
+	if !got[0].Downloaded.ID.Equals(&block10) || !got[1].Downloaded.ID.Equals(&block12) {
+		t.Fatalf("unexpected synced blocks: %+v", got)
+	}
+	if len(fetcher.nextCalls) != 0 {
+		t.Fatalf("rejected block advanced catch-up state, next calls: %+v", fetcher.nextCalls)
+	}
+}
+
+func TestServiceDropsFullBlockBroadcastWithoutDecodedPayload(t *testing.T) {
+	source := &stubSource{events: make(chan p2p.BroadcastEvent, 2)}
+	fetcher := newStubFetcher()
+
+	block10 := testBlockID(-1, topShard, 10)
+	fetcher.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
+
+	service := New(discardLogger(), source, fetcher)
+	service.retryCount = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.Run(ctx)
+	}()
+
+	source.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "tonNode.blockBroadcast", Block: block10}
+	close(source.events)
+
+	got := collectSyncedBlocks(service.Blocks())
+	wg.Wait()
+
+	if len(got) != 0 {
+		t.Fatalf("expected full block broadcast without payload to be dropped, got %+v", got)
+	}
+	if len(fetcher.exactCalls) != 0 || len(fetcher.nextCalls) != 0 {
+		t.Fatalf("expected no download fallback, exact=%d next=%d", len(fetcher.exactCalls), len(fetcher.nextCalls))
+	}
+}
+
+func TestServiceIgnoresNonMasterchainBroadcasts(t *testing.T) {
+	source := &stubSource{events: make(chan p2p.BroadcastEvent, 4)}
+	fetcher := newStubFetcher()
+
+	base10 := testBlockID(0, topShard, 10)
+	base11 := testBlockID(0, topShard, 11)
+	fetcher.exact[blockKey(base10)] = &p2p.DownloadedBlock{ID: base10}
+	fetcher.next[blockKey(base10)] = &p2p.DownloadedBlock{ID: base11}
+
+	service := New(discardLogger(), source, fetcher)
+	service.retryCount = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.Run(ctx)
+	}()
+
+	source.events <- p2p.BroadcastEvent{Overlay: "basechain", Kind: "tonNode.newShardBlockBroadcast", Block: base10}
+	source.events <- p2p.BroadcastEvent{Overlay: "basechain", Kind: "tonNode.newShardBlockBroadcast", Block: base11}
+	close(source.events)
+
+	got := collectSyncedBlocks(service.Blocks())
+	wg.Wait()
+
+	if len(got) != 0 {
+		t.Fatalf("expected non-masterchain broadcasts to be ignored, got %+v", got)
+	}
+	if len(fetcher.exactCalls) != 0 || len(fetcher.nextCalls) != 0 {
+		t.Fatalf("expected no non-masterchain downloads, exact=%d next=%d", len(fetcher.exactCalls), len(fetcher.nextCalls))
+	}
+}
+
 func TestServiceRetriesGapUntilRecovered(t *testing.T) {
 	source := &stubSource{events: make(chan p2p.BroadcastEvent, 4)}
 	fetcher := newStubFetcher()
@@ -224,6 +428,7 @@ func collectSyncedBlocks(ch <-chan SyncedBlock) []SyncedBlock {
 	var out []SyncedBlock
 	for block := range ch {
 		out = append(out, block)
+		block.Accept()
 	}
 	return out
 }

@@ -3,211 +3,85 @@ package service
 import (
 	"context"
 	"errors"
-	"flexserver/service/archive"
-	"flexserver/service/storage"
 	"fmt"
 	"math/big"
 	"math/bits"
-	"os"
 	"sync"
+
+	"flexserver/service/archive"
+	"flexserver/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 const (
-	nextBlockCatchUpMaxRemaining = 100_000
-	archiveCatchUpTailBlocks     = 16
-	maxArchiveMonitorSplitDepth  = 12
-	archiveShardDownloadWorkers  = 4
-	archiveShardImportWorkers    = 4
+	shardNextBlockCatchUpMaxRemaining = 100_000
+	archiveToNextLagSeconds           = 600
+	nextToArchiveLagSeconds           = 1000
+	archiveTimeLagLookaheadBlocks     = 5000
+	maxArchiveMonitorSplitDepth       = 12
+	archiveShardDownloadWorkers       = 4
 )
 
-func archiveCatchUpTarget(current *storage.CurrentState, target ton.BlockIDExt) (ton.BlockIDExt, bool) {
-	if target.SeqNo <= current.ShardClientSeqno {
-		return ton.BlockIDExt{}, false
+func masterchainBlockLagSeconds(blockUTime int64, nowUnix int64) (int64, bool) {
+	if blockUTime == 0 {
+		return 0, false
 	}
-	if target.SeqNo-current.ShardClientSeqno <= archiveCatchUpTailBlocks {
-		return ton.BlockIDExt{}, false
-	}
-	archiveTarget := target
-	archiveTarget.SeqNo -= archiveCatchUpTailBlocks
-	return archiveTarget, true
+	return nowUnix - blockUTime, true
 }
 
-func (s *Service) downloadShardArchives(ctx context.Context, masterchainSeqno uint32, shards []archive.ShardID) ([]*archive.Downloaded, error) {
-	if len(shards) == 0 {
-		return nil, nil
-	}
-
-	downloadCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	workers := archiveShardDownloadWorkers
-	if len(shards) < workers {
-		workers = len(shards)
-	}
-
-	type archiveFileResult struct {
-		idx        int
-		downloaded *archive.Downloaded
-		err        error
-	}
-
-	jobs := make(chan int)
-	results := make(chan archiveFileResult, len(shards))
-	var wg sync.WaitGroup
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				downloaded, err := s.node.DownloadArchive(downloadCtx, masterchainSeqno, shards[idx], "")
-				res := archiveFileResult{idx: idx, downloaded: downloaded, err: err}
-				select {
-				case results <- res:
-				case <-downloadCtx.Done():
-					if downloaded != nil {
-						_ = os.Remove(downloaded.Path)
-					}
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		defer close(jobs)
-		for idx := range shards {
-			select {
-			case jobs <- idx:
-			case <-downloadCtx.Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	files := make([]*archive.Downloaded, len(shards))
-	var firstErr error
-	for res := range results {
-		if res.err != nil {
-			cancel()
-			if res.downloaded != nil {
-				_ = os.Remove(res.downloaded.Path)
-			}
-			if firstErr == nil || errors.Is(firstErr, context.Canceled) {
-				firstErr = res.err
-			}
-			continue
-		}
-		files[res.idx] = res.downloaded
-	}
-	if firstErr != nil {
-		for _, file := range files {
-			if file != nil {
-				_ = os.Remove(file.Path)
-			}
-		}
-		return files, firstErr
-	}
-	for _, file := range files {
-		if file == nil {
-			for _, cleanup := range files {
-				if cleanup != nil {
-					_ = os.Remove(cleanup.Path)
-				}
-			}
-			return files, archive.ErrNotAvailable
-		}
-	}
-	return files, nil
+func shouldUseArchiveCatchUpByLag(lagSeconds int64) bool {
+	return lagSeconds > nextToArchiveLagSeconds
 }
 
-func (s *Service) importShardArchiveFiles(ctx context.Context, masterchainSeqno uint32, files []*archive.Downloaded) ([]*archiveImportResult, error) {
-	if len(files) == 0 {
-		return nil, nil
-	}
-
-	importCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	workers := archiveShardImportWorkers
-	if len(files) < workers {
-		workers = len(files)
-	}
-
-	type archiveImportFileResult struct {
-		idx      int
-		imported *archiveImportResult
-		err      error
-	}
-
-	jobs := make(chan int)
-	results := make(chan archiveImportFileResult, len(files))
-	var wg sync.WaitGroup
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				imported, err := s.importArchiveBlocks(importCtx, files[idx])
-				res := archiveImportFileResult{idx: idx, imported: imported, err: err}
-				results <- res
-			}
-		}()
-	}
-
-	go func() {
-		defer close(jobs)
-		for idx := range files {
-			select {
-			case jobs <- idx:
-			case <-importCtx.Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	imports := make([]*archiveImportResult, len(files))
-	var firstErr error
-	completed := 0
-	for res := range results {
-		if res.err != nil {
-			cancel()
-			if firstErr == nil || errors.Is(firstErr, context.Canceled) {
-				firstErr = fmt.Errorf("import shard archive #%d %s: %w", masterchainSeqno, files[res.idx].Shard.String(), res.err)
-			}
-			continue
-		}
-		imports[res.idx] = res.imported
-		completed++
-	}
-	if firstErr != nil {
-		for _, cleanup := range files {
-			if cleanup != nil {
-				_ = os.Remove(cleanup.Path)
-			}
-		}
-		return nil, firstErr
-	}
-	if completed != len(files) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("import shard archive #%d: incomplete import results got=%d want=%d", masterchainSeqno, completed, len(files))
-	}
-	return imports, nil
+func shouldStopArchiveCatchUpByLag(lagSeconds int64) bool {
+	return lagSeconds < archiveToNextLagSeconds
 }
 
-func (s *Service) downloadAndImportShardArchives(ctx context.Context, masterchainSeqno uint32, shards []archive.ShardID, importCache *archiveImportCache) ([]*archiveImportResult, error) {
+func archiveCatchUpTargetByTime(current *storage.CurrentState, nowUnix int64) (ton.BlockIDExt, int64, bool) {
+	if current.Masterchain.Parsed == nil || current.Masterchain.Parsed.GenUTime == 0 {
+		return ton.BlockIDExt{}, 0, false
+	}
+
+	return archiveCatchUpTargetByBlockTime(current, int64(current.Masterchain.Parsed.GenUTime), nowUnix)
+}
+
+func archiveCatchUpTargetByKnownTargetTime(current *storage.CurrentState, target ton.BlockIDExt, blockUTime int64, nowUnix int64) (ton.BlockIDExt, int64, bool) {
+	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, nowUnix)
+	if !ok || !shouldUseArchiveCatchUpByLag(lagSeconds) {
+		return ton.BlockIDExt{}, lagSeconds, false
+	}
+	if target.SeqNo <= current.Masterchain.Block.SeqNo {
+		return ton.BlockIDExt{}, lagSeconds, false
+	}
+	return target, lagSeconds, true
+}
+
+func archiveCatchUpTargetByBlockTime(current *storage.CurrentState, blockUTime int64, nowUnix int64) (ton.BlockIDExt, int64, bool) {
+	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, nowUnix)
+	if !ok || !shouldUseArchiveCatchUpByLag(lagSeconds) {
+		return ton.BlockIDExt{}, lagSeconds, false
+	}
+
+	lookaheadSeconds := lagSeconds - archiveToNextLagSeconds
+	if lookaheadSeconds <= 0 {
+		lookaheadSeconds = 1
+	}
+	lookahead := uint32(lookaheadSeconds)
+	if lookahead > archiveTimeLagLookaheadBlocks {
+		lookahead = archiveTimeLagLookaheadBlocks
+	}
+	if ^uint32(0)-current.Masterchain.Block.SeqNo < lookahead {
+		return ton.BlockIDExt{}, lagSeconds, false
+	}
+
+	target := current.Masterchain.Block
+	target.SeqNo += lookahead
+	return target, lagSeconds, true
+}
+
+func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, masterchainSeqno uint32, shards []archive.ShardID) ([]*archiveImportResult, error) {
 	if len(shards) == 0 {
 		return nil, nil
 	}
@@ -234,8 +108,8 @@ func (s *Service) downloadAndImportShardArchives(ctx context.Context, masterchai
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				imported, _, err := s.downloadAndImportArchive(preloadCtx, masterchainSeqno, shards[idx], importCache)
-				res := archivePreloadResult{idx: idx, imported: imported, err: err}
+				downloaded, err := r.downloadAndImportArchive(preloadCtx, masterchainSeqno, shards[idx])
+				res := archivePreloadResult{idx: idx, imported: downloaded.imported, err: err}
 				select {
 				case results <- res:
 				case <-preloadCtx.Done():

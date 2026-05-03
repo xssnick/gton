@@ -19,9 +19,9 @@ type peerStats struct {
 	lastReceiveAt     time.Time
 	lastSuccessAt     time.Time
 	failedQueries     uint64
-	archiveBytesSec   float64
-	archiveDownloads  uint64
-	archiveSlowUntil  time.Time
+	downloadBytesSec  float64
+	downloadCount     uint64
+	downloadSlowUntil time.Time
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
@@ -84,9 +84,9 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 		lastReceiveAt:     p.lastReceiveAt,
 		lastSuccessAt:     p.lastSuccessAt,
 		failedQueries:     p.failedQueries,
-		archiveBytesSec:   p.archiveBytesSec,
-		archiveDownloads:  p.archiveDownloads,
-		archiveSlowUntil:  p.archiveSlowUntil,
+		downloadBytesSec:  p.downloadBytesSec,
+		downloadCount:     p.downloadCount,
+		downloadSlowUntil: p.downloadSlowUntil,
 	}
 }
 
@@ -134,7 +134,7 @@ func (p *overlayPeer) queryFailed() {
 	}
 }
 
-func (p *overlayPeer) archiveDownloadSuccess(bytes int64, elapsed time.Duration, slowThreshold float64) {
+func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowThreshold float64, slowPenalty time.Duration) {
 	if p == nil || bytes <= 0 || elapsed <= 0 {
 		return
 	}
@@ -145,20 +145,20 @@ func (p *overlayPeer) archiveDownloadSuccess(bytes int64, elapsed time.Duration,
 	defer p.statsMx.Unlock()
 
 	now := time.Now()
-	p.archiveDownloads++
-	if p.archiveBytesSec == 0 {
-		p.archiveBytesSec = speed
+	p.downloadCount++
+	if p.downloadBytesSec == 0 {
+		p.downloadBytesSec = speed
 	} else {
-		p.archiveBytesSec = p.archiveBytesSec*0.7 + speed*0.3
+		p.downloadBytesSec = p.downloadBytesSec*0.7 + speed*0.3
 	}
 	if speed < slowThreshold {
-		p.archiveSlowUntil = now.Add(archiveSlowPeerPenalty)
+		p.downloadSlowUntil = now.Add(slowPenalty)
 	} else {
-		p.archiveSlowUntil = time.Time{}
+		p.downloadSlowUntil = time.Time{}
 	}
 }
 
-func (p *overlayPeer) archiveDownloadFailed() {
+func (p *overlayPeer) downloadFailed(slowPenalty time.Duration) {
 	if p == nil {
 		return
 	}
@@ -166,7 +166,7 @@ func (p *overlayPeer) archiveDownloadFailed() {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
-	p.archiveSlowUntil = time.Now().Add(archiveSlowPeerPenalty)
+	p.downloadSlowUntil = time.Now().Add(slowPenalty)
 }
 
 func (p *overlayPeer) noteReceive() {
@@ -419,6 +419,44 @@ func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVers
 		}
 		res = append(res, peer)
 	}
+	return res
+}
+
+func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requiredVersionMinor int32, limit int) []*overlayPeer {
+	peers := s.queryCandidates(requiredVersionMajor, requiredVersionMinor)
+	if limit <= 0 || len(peers) <= limit {
+		return peers
+	}
+
+	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
+	neighbourSlots := limit / 2
+	if neighbourSlots < 1 {
+		neighbourSlots = 1
+	}
+	if len(neighbours) < neighbourSlots {
+		neighbourSlots = len(neighbours)
+	}
+
+	res := make([]*overlayPeer, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	for _, peer := range neighbours[:neighbourSlots] {
+		seen[peer.id] = struct{}{}
+		res = append(res, peer)
+	}
+
+	preferred := s.preferredPeers(requiredVersionMajor, requiredVersionMinor, nil)
+	sortPeersByPreference(preferred)
+	for _, peer := range preferred {
+		if len(res) >= limit {
+			break
+		}
+		if _, ok := seen[peer.id]; ok {
+			continue
+		}
+		seen[peer.id] = struct{}{}
+		res = append(res, peer)
+	}
+
 	return res
 }
 

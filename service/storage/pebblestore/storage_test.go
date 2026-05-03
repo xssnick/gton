@@ -223,7 +223,11 @@ func TestSaveStateCellTreeDeduplicatesSharedRefs(t *testing.T) {
 		SeqNo:     1,
 	}
 
-	if _, err = store.saveStateCellTree(context.Background(), block, root, nil, 2, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(context.Background(), stateCellTreeSave{
+		block:      block,
+		root:       root,
+		totalCells: 2,
+	}); err != nil {
 		t.Fatalf("save state cell tree: %v", err)
 	}
 
@@ -278,7 +282,7 @@ func TestImportStateCellTreeFlushesCellsBeforeSyncMarker(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
 
-	roots, parsedCells, err := cell.FromBOCMultiRootReader(bytes.NewReader(root.ToBOC()))
+	roots, parsedCells, err := cell.FromBOCMultiRootReader(bytes.NewReader(root.ToBOC()), cell.BOCParseOptions{})
 	if err != nil {
 		t.Fatalf("parse state boc: %v", err)
 	}
@@ -326,6 +330,54 @@ func TestImportStateCellTreeFlushesCellsBeforeSyncMarker(t *testing.T) {
 	}
 	if got := cellMetrics.ingestCount; got != 0 {
 		t.Fatalf("state import unexpectedly used pebble ingest: got ingest count %d", got)
+	}
+}
+
+func TestLoadStateCellTreeUsesRootHashWithoutSyncMarker(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	leaf := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(leaf).EndCell()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     2,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:      block,
+		root:       root,
+		totalCells: 2,
+	}); err != nil {
+		t.Fatalf("save state cells: %v", err)
+	}
+
+	if ok, err := pebbleReaderHas(store.hot, hotKeyStateCellSync(block)); err != nil || ok {
+		t.Fatalf("sync marker exists=%t err=%v, want missing", ok, err)
+	}
+
+	rootHash := root.HashKey(0)
+	loadedRoot, loadedCells, err := store.LoadStateCellTree(ctx, block, rootHash[:])
+	if err != nil {
+		t.Fatalf("load state by root hash: %v", err)
+	}
+	if loadedRoot.HashKey() != root.HashKey() {
+		t.Fatalf("loaded root hash mismatch")
+	}
+	if loadedCells != 0 {
+		t.Fatalf("loaded cells = %d, want 0 without sync marker", loadedCells)
+	}
+
+	wrongHash := bytes.Repeat([]byte{0x44}, 32)
+	if _, _, err = store.LoadStateCellTree(ctx, block, wrongHash); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("load state by wrong root hash err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -391,6 +443,200 @@ func TestSaveBlockStateAndCurrentStatePersistsOneDurableState(t *testing.T) {
 	}
 	if !loadedCurrent.Masterchain.Block.Equals(&block) {
 		t.Fatalf("current masterchain block = %s, want %s", storage.FormatBlockRef(loadedCurrent.Masterchain.Block), storage.FormatBlockRef(block))
+	}
+}
+
+func TestStageBlockStateIsVisibleButNotDurableBeforeFlush(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     7,
+		RootHash:  bytes.Repeat([]byte{7}, 32),
+		FileHash:  bytes.Repeat([]byte{8}, 32),
+	}
+	state := blockStateWithSingleCell(block, 0x77)
+	if err = store.StageBlockState(ctx, state); err != nil {
+		t.Fatalf("stage block state: %v", err)
+	}
+
+	if ok, err := pebbleReaderHas(store.hot, hotKeyStateMeta(block)); err != nil || ok {
+		t.Fatalf("hot state meta before flush ok=%v err=%v, want false nil", ok, err)
+	}
+	if ok, err := pebbleReaderHas(store.hot, hotKeyStateCellSync(block)); err != nil || ok {
+		t.Fatalf("hot state cell sync before flush ok=%v err=%v, want false nil", ok, err)
+	}
+
+	loaded, err := store.blockStateMeta(ctx, block)
+	if err != nil {
+		t.Fatalf("load staged block state: %v", err)
+	}
+	if !loaded.Block.Equals(&block) {
+		t.Fatalf("loaded staged block = %s, want %s", storage.FormatBlockRef(loaded.Block), storage.FormatBlockRef(block))
+	}
+	if _, _, err = store.LoadStateCellTree(ctx, block, state.StateRootHash); err != nil {
+		t.Fatalf("load staged state cell tree: %v", err)
+	}
+
+	meta, err := store.BlockMeta(ctx, block)
+	if err != nil {
+		t.Fatalf("load staged block meta: %v", err)
+	}
+	if !meta.Has(storage.BlockMetaHasStateSnapshot) {
+		t.Fatal("staged block meta should expose state snapshot flag")
+	}
+
+	indexed, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo)
+	if err != nil {
+		t.Fatalf("lookup staged block by seqno: %v", err)
+	}
+	if !indexed.Equals(&block) {
+		t.Fatalf("indexed staged block = %s, want %s", storage.FormatBlockRef(indexed), storage.FormatBlockRef(block))
+	}
+
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if _, err = store.blockStateMeta(ctx, block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("staged state after reopen = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDetachedPendingFlushStaysVisibleAndAcceptsNewStages(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	first := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     17,
+		RootHash:  bytes.Repeat([]byte{17}, 32),
+		FileHash:  bytes.Repeat([]byte{18}, 32),
+	}
+	second := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     18,
+		RootHash:  bytes.Repeat([]byte{19}, 32),
+		FileHash:  bytes.Repeat([]byte{20}, 32),
+	}
+
+	firstState := blockStateWithSingleCell(first, 0x17)
+	if err = store.StageBlockState(ctx, firstState); err != nil {
+		t.Fatalf("stage first block state: %v", err)
+	}
+
+	flush, ok := store.takePendingStateFlush()
+	if !ok {
+		t.Fatal("expected pending state flush")
+	}
+
+	if _, err = store.blockStateMeta(ctx, first); err != nil {
+		t.Fatalf("load detached pending block state: %v", err)
+	}
+	if _, _, err = store.LoadStateCellTree(ctx, first, firstState.StateRootHash); err != nil {
+		t.Fatalf("load detached pending state cell tree: %v", err)
+	}
+	meta, err := store.BlockMeta(ctx, first)
+	if err != nil {
+		t.Fatalf("load detached pending block meta: %v", err)
+	}
+	if !meta.Has(storage.BlockMetaHasStateSnapshot) {
+		t.Fatal("detached pending block meta should expose state snapshot flag")
+	}
+
+	secondState := blockStateWithSingleCell(second, 0x18)
+	if err = store.StageBlockState(ctx, secondState); err != nil {
+		t.Fatalf("stage second block state: %v", err)
+	}
+	for _, block := range []ton.BlockIDExt{first, second} {
+		indexed, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo)
+		if err != nil {
+			t.Fatalf("lookup pending block %s by seqno: %v", storage.FormatBlockRef(block), err)
+		}
+		if !indexed.Equals(&block) {
+			t.Fatalf("indexed pending block = %s, want %s", storage.FormatBlockRef(indexed), storage.FormatBlockRef(block))
+		}
+	}
+
+	store.requeuePendingStateFlush(flush)
+	for _, block := range []ton.BlockIDExt{first, second} {
+		if _, err = store.blockStateMeta(ctx, block); err != nil {
+			t.Fatalf("load requeued pending block %s: %v", storage.FormatBlockRef(block), err)
+		}
+	}
+}
+
+func TestFlushStagedBlockStatesMakesMetadataDurableAfterCells(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     8,
+		RootHash:  bytes.Repeat([]byte{9}, 32),
+		FileHash:  bytes.Repeat([]byte{10}, 32),
+	}
+	state := blockStateWithSingleCell(block, 0x88)
+	if err = store.StageBlockState(ctx, state); err != nil {
+		t.Fatalf("stage block state: %v", err)
+	}
+	if err = store.FlushStagedBlockStates(ctx); err != nil {
+		t.Fatalf("flush staged block states: %v", err)
+	}
+
+	if ok, err := pebbleReaderHas(store.hot, hotKeyStateMeta(block)); err != nil || !ok {
+		t.Fatalf("hot state meta after flush ok=%v err=%v, want true nil", ok, err)
+	}
+	if ok, err := pebbleReaderHas(store.hot, hotKeyStateCellSync(block)); err != nil || !ok {
+		t.Fatalf("hot state cell sync after flush ok=%v err=%v, want true nil", ok, err)
+	}
+	if metrics := store.cells.metrics(); metrics.flushCount == 0 {
+		t.Fatal("staged state checkpoint did not flush cell db before metadata")
+	}
+
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	loaded, err := store.blockStateMeta(ctx, block)
+	if err != nil {
+		t.Fatalf("load flushed staged state after reopen: %v", err)
+	}
+	if !loaded.Block.Equals(&block) {
+		t.Fatalf("loaded flushed block = %s, want %s", storage.FormatBlockRef(loaded.Block), storage.FormatBlockRef(block))
+	}
+	if _, _, err = store.LoadStateCellTree(ctx, block, state.StateRootHash); err != nil {
+		t.Fatalf("load flushed staged state cells after reopen: %v", err)
 	}
 }
 
@@ -460,6 +706,65 @@ func TestStateSyncProgressPersistsAndClears(t *testing.T) {
 	}
 }
 
+func TestSeenMasterchainBlockPersistsOnlyNewestHint(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	block10 := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+		RootHash:  bytes.Repeat([]byte{10}, 32),
+		FileHash:  bytes.Repeat([]byte{11}, 32),
+	}
+	block9 := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     9,
+		RootHash:  bytes.Repeat([]byte{9}, 32),
+		FileHash:  bytes.Repeat([]byte{8}, 32),
+	}
+
+	if _, err = store.SeenMasterchainBlock(ctx); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("seen masterchain before save = %v, want ErrNotFound", err)
+	}
+	if err = store.SaveSeenMasterchainBlock(ctx, block10); err != nil {
+		t.Fatalf("save seen masterchain: %v", err)
+	}
+	if err = store.SaveSeenMasterchainBlock(ctx, block9); err != nil {
+		t.Fatalf("save older seen masterchain: %v", err)
+	}
+
+	loaded, err := store.SeenMasterchainBlock(ctx)
+	if err != nil {
+		t.Fatalf("load seen masterchain: %v", err)
+	}
+	if !loaded.Equals(&block10) {
+		t.Fatalf("seen masterchain = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block10))
+	}
+
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	loaded, err = store.SeenMasterchainBlock(ctx)
+	if err != nil {
+		t.Fatalf("load seen masterchain after reopen: %v", err)
+	}
+	if !loaded.Equals(&block10) {
+		t.Fatalf("seen masterchain after reopen = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block10))
+	}
+}
+
 func blockStateWithSingleCell(block ton.BlockIDExt, value uint64) *storage.BlockState {
 	root := cell.BeginCell().MustStoreUInt(value, 8).EndCell()
 	rootHash := root.HashKey(0)
@@ -498,10 +803,6 @@ func TestSaveStateCellTreeSkipsReusedLazySubtree(t *testing.T) {
 		t.Fatalf("import old state: %v", err)
 	}
 
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
-
 	oldRightRef, err := lazyOldRoot.PeekRef(1)
 	if err != nil {
 		t.Fatalf("load old right ref: %v", err)
@@ -526,7 +827,13 @@ func TestSaveStateCellTreeSkipsReusedLazySubtree(t *testing.T) {
 		LogicalHash: oldRightHash,
 		RawCell:     oldRightRef,
 	}}
-	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:            nextBlock,
+		root:             newRoot,
+		totalCells:       2,
+		reusedStateCells: reused,
+		reusedStateRefs:  reusedRefs,
+	}); err != nil {
 		t.Fatalf("save new state: %v", err)
 	}
 
@@ -576,17 +883,19 @@ func TestSaveStateCellTreePersistsReusedSubtreeMissingFromDB(t *testing.T) {
 		LogicalHash: rightHash,
 		RawCell:     right,
 	}}
-	if _, err = store.saveStateCellTree(ctx, block, root, nil, 4, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:            block,
+		root:             root,
+		totalCells:       4,
+		reusedStateCells: reused,
+		reusedStateRefs:  reusedRefs,
+	}); err != nil {
 		t.Fatalf("save state with reused in-memory subtree: %v", err)
 	}
 
 	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
 		t.Fatalf("reused subtree was not persisted: %v", err)
 	}
-
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
 
 	lazyRoot, err := store.loadLazyCell(ctx, root.Hash())
 	if err != nil {
@@ -645,17 +954,19 @@ func TestSaveStateCellTreePersistsVirtualReusedSubtreeByLogicalHash(t *testing.T
 		LogicalHash: logicalHash,
 		RawCell:     virtualRight,
 	}}
-	if _, err = store.saveStateCellTree(ctx, block, root, nil, 4, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:            block,
+		root:             root,
+		totalCells:       4,
+		reusedStateCells: reused,
+		reusedStateRefs:  reusedRefs,
+	}); err != nil {
 		t.Fatalf("save state with virtual reused subtree: %v", err)
 	}
 
 	if _, err = store.loadLazyCell(ctx, logicalHash[:]); err != nil {
 		t.Fatalf("virtual reused subtree was not persisted by logical hash: %v", err)
 	}
-
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
 
 	lazyRoot, err := store.loadLazyCell(ctx, root.Hash())
 	if err != nil {
@@ -704,10 +1015,6 @@ func TestSaveStateCellTreeRekeysLazyVirtualSubtreeByLogicalHash(t *testing.T) {
 		t.Fatalf("import raw subtree: %v", err)
 	}
 
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
-
 	lazyRawRight, err := store.loadLazyCell(ctx, rawHash[:])
 	if err != nil {
 		t.Fatalf("load raw lazy subtree: %v", err)
@@ -725,7 +1032,11 @@ func TestSaveStateCellTreeRekeysLazyVirtualSubtreeByLogicalHash(t *testing.T) {
 		t.Fatal("test subtree must have distinct logical and raw hashes")
 	}
 
-	if _, err = store.saveStateCellTree(ctx, mergedBlock, root, nil, 3, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:      mergedBlock,
+		root:       root,
+		totalCells: 3,
+	}); err != nil {
 		t.Fatalf("save state with lazy virtual subtree: %v", err)
 	}
 
@@ -754,10 +1065,6 @@ func TestSaveStateCellTreePersistsMissingReusedLazyDataCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
-
 	lazyRight, err := lazyRoot.PeekRef(0)
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
@@ -788,7 +1095,13 @@ func TestSaveStateCellTreePersistsMissingReusedLazyDataCell(t *testing.T) {
 		LogicalHash: rightHash,
 		RawCell:     lazyRight,
 	}}
-	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, reused, reusedRefs); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:            nextBlock,
+		root:             newRoot,
+		totalCells:       2,
+		reusedStateCells: reused,
+		reusedStateRefs:  reusedRefs,
+	}); err != nil {
 		t.Fatalf("save state with missing reused lazy data cell: %v", err)
 	}
 	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
@@ -816,10 +1129,6 @@ func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
-
 	lazyRight, err := lazyRoot.PeekRef(0)
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
@@ -858,7 +1167,11 @@ func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 	nextBlock := block
 	nextBlock.SeqNo = 2
 	newRoot := cell.BeginCell().MustStoreRef(lazyRight).EndCell()
-	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 3, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:      nextBlock,
+		root:       newRoot,
+		totalCells: 3,
+	}); err != nil {
 		t.Fatalf("save state with missing virtual lazy pruned subtree: %v", err)
 	}
 	if _, err = store.loadLazyCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
@@ -886,10 +1199,6 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = store.LazyCellLoader()
-	defer func() { cell.LazyLoader = oldLoader }()
-
 	lazyRight, err := lazyRoot.PeekRef(0)
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
@@ -910,7 +1219,11 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	nextBlock := block
 	nextBlock.SeqNo = 2
 	newRoot := cell.BeginCell().MustStoreRef(lazyRight).EndCell()
-	if _, err = store.saveStateCellTree(ctx, nextBlock, newRoot, nil, 2, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:      nextBlock,
+		root:       newRoot,
+		totalCells: 2,
+	}); err != nil {
 		t.Fatalf("save state with missing lazy data cell: %v", err)
 	}
 	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
@@ -918,9 +1231,7 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	}
 }
 
-type rejectingLazyLoader struct{}
-
-func (rejectingLazyLoader) LoadCell(cell.Hash) (*cell.Cell, error) {
+func rejectingLazyLoader(cell.Hash) (*cell.Cell, error) {
 	return nil, errors.New("unexpected lazy load")
 }
 
@@ -940,21 +1251,29 @@ func TestSaveStateCellTreeSkipsExistingLazyRootWithoutLoading(t *testing.T) {
 
 	leaf := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(leaf).EndCell()
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, nil, 2)
-	if err != nil {
+	if _, err := store.ImportStateCellTree(ctx, block, root, nil, 2); err != nil {
 		t.Fatalf("import state: %v", err)
+	}
+
+	record, err := store.CellRecord(ctx, root.Hash())
+	if err != nil {
+		t.Fatalf("load root cell record: %v", err)
+	}
+	lazyRoot, err := storage.LazyCellRecord(record, rejectingLazyLoader)
+	if err != nil {
+		t.Fatalf("create lazy root: %v", err)
 	}
 	if lazyRoot.IsLazy() {
 		t.Fatal("expected imported root body")
 	}
 
-	oldLoader := cell.LazyLoader
-	cell.LazyLoader = rejectingLazyLoader{}
-	defer func() { cell.LazyLoader = oldLoader }()
-
 	nextBlock := block
 	nextBlock.SeqNo = 2
-	if _, err = store.saveStateCellTree(ctx, nextBlock, lazyRoot, nil, 1, nil, nil); err != nil {
+	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:      nextBlock,
+		root:       lazyRoot,
+		totalCells: 1,
+	}); err != nil {
 		t.Fatalf("save existing lazy root: %v", err)
 	}
 }

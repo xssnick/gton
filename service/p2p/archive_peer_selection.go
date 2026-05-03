@@ -6,42 +6,12 @@ import (
 	"time"
 )
 
-func (n *Node) acquireArchivePeer(peer *overlayPeer) func() {
-	if peer == nil {
-		return func() {}
-	}
-
-	key := archivePeerKey(peer)
-
-	n.archivePeerLeasesMx.Lock()
-	n.archivePeerLeases[key]++
-	n.archivePeerLeasesMx.Unlock()
-
-	return func() {
-		n.archivePeerLeasesMx.Lock()
-		defer n.archivePeerLeasesMx.Unlock()
-
-		count := n.archivePeerLeases[key]
-		if count <= 1 {
-			delete(n.archivePeerLeases, key)
-			return
-		}
-		n.archivePeerLeases[key] = count - 1
-	}
-}
-
 func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
 	if len(peers) < 2 {
 		return peers
 	}
 
-	n.archivePeerLeasesMx.RLock()
-	leases := make(map[string]int, len(peers))
-	for _, peer := range peers {
-		leases[archivePeerKey(peer)] = n.archivePeerLeases[archivePeerKey(peer)]
-	}
-	n.archivePeerLeasesMx.RUnlock()
-
+	leases := n.downloadPeerLeaseSnapshot(peers)
 	now := time.Now()
 	basechain := shard.Workchain == 0
 	prioritized := append([]*overlayPeer(nil), peers...)
@@ -52,8 +22,8 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 		leftStats := left.statsSnapshot()
 		rightStats := right.statsSnapshot()
 
-		leftLeases := leases[archivePeerKey(left)]
-		rightLeases := leases[archivePeerKey(right)]
+		leftLeases := leases[downloadPeerKey(left)]
+		rightLeases := leases[downloadPeerKey(right)]
 
 		leftTier := archivePeerTier(leftStats, basechain, now)
 		rightTier := archivePeerTier(rightStats, basechain, now)
@@ -63,16 +33,16 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 
 		leftSpeed := archivePeerSpeed(leftStats, basechain)
 		rightSpeed := archivePeerSpeed(rightStats, basechain)
-		leftScore := archivePeerScore(leftStats, leftSpeed, leftLeases, now)
-		rightScore := archivePeerScore(rightStats, rightSpeed, rightLeases, now)
+		leftScore := downloadPeerScore(leftStats, leftSpeed, leftLeases, now)
+		rightScore := downloadPeerScore(rightStats, rightSpeed, rightLeases, now)
 		if leftScore != rightScore {
 			return leftScore > rightScore
 		}
 		if leftLeases != rightLeases {
 			return leftLeases < rightLeases
 		}
-		if leftStats.archiveBytesSec != rightStats.archiveBytesSec {
-			return leftStats.archiveBytesSec > rightStats.archiveBytesSec
+		if leftStats.downloadBytesSec != rightStats.downloadBytesSec {
+			return leftStats.downloadBytesSec > rightStats.downloadBytesSec
 		}
 		return false
 	})
@@ -80,28 +50,28 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 }
 
 func (s *overlaySubscription) archiveQueryCandidates() []*overlayPeer {
-	return s.preferredNeighbourPeers(0, 0)
+	return s.aliveNeighbourPeers(0, 0)
 }
 
 func archivePeerTier(stats peerStats, basechain bool, now time.Time) int {
-	if stats.archiveSlowUntil.After(now) {
+	if stats.downloadSlowUntil.After(now) {
 		return 3
 	}
 	if !basechain {
 		return 0
 	}
-	if stats.archiveDownloads == 0 {
+	if stats.downloadCount == 0 {
 		return 2
 	}
-	if stats.archiveBytesSec >= archiveSlowThreshold(basechain) {
+	if stats.downloadBytesSec >= archiveSlowThreshold(basechain) {
 		return 0
 	}
 	return 1
 }
 
 func archivePeerSpeed(stats peerStats, basechain bool) float64 {
-	if stats.archiveBytesSec > 0 {
-		return stats.archiveBytesSec
+	if stats.downloadBytesSec > 0 {
+		return stats.downloadBytesSec
 	}
 	if basechain {
 		return archiveUnknownPeerSpeed
@@ -109,7 +79,7 @@ func archivePeerSpeed(stats peerStats, basechain bool) float64 {
 	return defaultArchivePeerSpeed
 }
 
-func archivePeerScore(stats peerStats, speed float64, leases int, now time.Time) float64 {
+func downloadPeerScore(stats peerStats, speed float64, leases int, now time.Time) float64 {
 	score := speed / float64(leases+1)
 	if stats.unreliability > 0 {
 		score /= 1 + stats.unreliability
@@ -154,14 +124,14 @@ func (s *overlaySubscription) currentArchivePeer(shard archive.ShardID, peers []
 		}
 
 		stats := peer.statsSnapshot()
-		if stats.archiveSlowUntil.After(now) || !stats.alive {
+		if stats.downloadSlowUntil.After(now) || !stats.alive {
 			s.clearArchivePreferredPeerLocked(stateKey, state)
 			return nil
 		}
 
 		state.peer = peer
-		if state.speed == 0 && stats.archiveBytesSec > 0 {
-			state.speed = stats.archiveBytesSec
+		if state.speed == 0 && stats.downloadBytesSec > 0 {
+			state.speed = stats.downloadBytesSec
 		}
 		return peer
 	}
@@ -205,7 +175,7 @@ func (s *overlaySubscription) chooseArchivePeer(shard archive.ShardID, peers []*
 	}
 
 	stats := sticky.statsSnapshot()
-	if stats.archiveSlowUntil.After(now) || !stats.alive {
+	if stats.downloadSlowUntil.After(now) || !stats.alive {
 		s.clearArchivePreferredPeerLocked(stateKey, state)
 		return peers[0]
 	}
@@ -276,7 +246,7 @@ func (s *overlaySubscription) noteArchivePeerSuccess(shard archive.ShardID, peer
 	currentSpeed := state.speed
 	if currentSpeed == 0 {
 		stats := state.peer.statsSnapshot()
-		currentSpeed = stats.archiveBytesSec
+		currentSpeed = stats.downloadBytesSec
 	}
 	if currentSpeed == 0 {
 		currentSpeed = defaultArchivePeerSpeed
@@ -471,21 +441,30 @@ func shouldRaceArchiveDownload(shard archive.ShardID, peers []*overlayPeer) bool
 
 	stats := peers[0].statsSnapshot()
 	now := time.Now()
-	if !stats.alive || stats.archiveSlowUntil.After(now) {
+	if !stats.alive || stats.downloadSlowUntil.After(now) {
 		return true
 	}
-	if stats.archiveDownloads == 0 {
+	if stats.downloadCount == 0 {
 		return true
 	}
-	return stats.archiveBytesSec < archiveGoodThreshold(shard.Workchain == 0)
+	return stats.downloadBytesSec < archiveGoodThreshold(shard.Workchain == 0)
+}
+
+func shouldUseCurrentArchivePeerWithoutRace(shard archive.ShardID, peer *overlayPeer) bool {
+	if peer == nil {
+		return false
+	}
+
+	stats := peer.statsSnapshot()
+	if !stats.alive || stats.downloadSlowUntil.After(time.Now()) {
+		return false
+	}
+	if stats.downloadCount == 0 {
+		return false
+	}
+	return stats.downloadBytesSec >= archiveGoodThreshold(shard.Workchain == 0)
 }
 
 func archivePeerKey(peer *overlayPeer) string {
-	if peer == nil {
-		return ""
-	}
-	if peer.id != "" {
-		return peer.id
-	}
-	return peer.addr
+	return downloadPeerKey(peer)
 }

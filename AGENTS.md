@@ -66,6 +66,9 @@
 - Keep the control flow linear and easy to read.
 - Avoid unnecessary indirection.
 
+- Logic must be explicit, no fallbacks if it is not directly asked
+- Tri-state is bad, use ErrNotFound if needed
+
 ## Protocol types
 
 - Any type used in `tl.Register(...)` must be public and named with a capital letter.

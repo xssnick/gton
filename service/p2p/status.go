@@ -40,8 +40,8 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	}
 
 	n.latestBlocksMx.RLock()
-	if n.latestMasterchain != nil {
-		block := *n.latestMasterchain
+	if n.observedMasterchain != nil {
+		block := *n.observedMasterchain
 		snapshot.LatestMasterchain = &block
 	}
 	if n.latestBasechain != nil {

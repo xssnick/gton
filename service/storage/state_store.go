@@ -15,6 +15,13 @@ type StateCellTreeImporter interface {
 	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error)
 }
 
+type DownloadedState interface {
+	Block() ton.BlockIDExt
+	Decode(ctx context.Context) (*BlockState, error)
+	ImportCells(ctx context.Context, cells StateCellTreeImporter) (*BlockState, error)
+	Cleanup() error
+}
+
 type StateCellTreeImport struct {
 	Block       ton.BlockIDExt
 	Root        *cell.Cell
@@ -29,7 +36,11 @@ type StateStorage interface {
 	SaveStateSyncProgress(ctx context.Context, state *CurrentState) error
 	StateSyncProgress(ctx context.Context) (*CurrentState, error)
 	ClearStateSyncProgress(ctx context.Context) error
+	SaveSeenMasterchainBlock(ctx context.Context, block ton.BlockIDExt) error
+	SeenMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error)
 	SaveBlockState(ctx context.Context, state *BlockState) error
+	StageBlockState(ctx context.Context, state *BlockState) error
+	FlushStagedBlockStates(ctx context.Context) error
 	SaveBlockStateAndCurrentState(ctx context.Context, block *BlockState, current *CurrentState) error
 	SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*BlockState, current *CurrentState) error
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
@@ -68,6 +79,21 @@ func CloneBlockState(state *BlockState) *BlockState {
 		DownloadedAt:     state.DownloadedAt,
 		ReusedStateCells: append([]cell.MerkleUpdateReusedCell(nil), state.ReusedStateCells...),
 		ReusedStateRefs:  append([]cell.MerkleUpdateReusedRef(nil), state.ReusedStateRefs...),
+	}
+}
+
+func BlockStateWithoutCells(state *BlockState) BlockState {
+	if state == nil {
+		return BlockState{}
+	}
+
+	return BlockState{
+		Block:         state.Block,
+		StateRootHash: bytes.Clone(state.StateRootHash),
+		StateCellHash: bytes.Clone(state.StateCellHash),
+		StateFileHash: bytes.Clone(state.StateFileHash),
+		CellsCount:    state.CellsCount,
+		DownloadedAt:  state.DownloadedAt,
 	}
 }
 

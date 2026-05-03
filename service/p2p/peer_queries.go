@@ -180,6 +180,8 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 		}, nil
 	case tonnodeapi.DownloadBlockFull:
 		return s.serveBlockFull(ctx, query.Block)
+	case GetNextBlockDescription:
+		return s.serveNextBlockDescription(ctx, query.PrevBlock)
 	case DownloadNextBlockFull:
 		return s.serveNextBlockFull(ctx, query.PrevBlock)
 	case tonnodeapi.DownloadBlock:
@@ -198,9 +200,19 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 		return s.serveProofData(ctx, tnstore.ServedProofBlockLink, query.Block)
 	case DownloadKeyBlockProofLink:
 		return s.serveProofData(ctx, tnstore.ServedProofKeyBlockLink, query.Block)
-	case PrepareZeroState, PreparePersistentState:
+	case PrepareZeroState:
+		return s.servePrepareZeroState(ctx, query.Block)
+	case DownloadZeroState:
+		return s.serveZeroStateData(ctx, query.Block)
+	case GetNextKeyBlockIDs:
+		return s.serveNextKeyBlockIDs(ctx, query.Block, query.MaxSize)
+	case SendExtMessage:
+		return s.serveSendExtMessage(ctx, query.Message)
+	case GetOutMsgQueueProof:
+		return nil, errors.New("not supported yet")
+	case PreparePersistentState:
 		return NotFoundState{}, nil
-	case DownloadZeroState, DownloadPersistentStateSliceV2:
+	case DownloadPersistentStateSliceV2:
 		return TonNodeData{}, nil
 	case GetPersistentStateSizeV2:
 		return PersistentStateSizeNotFound{}, nil
@@ -230,6 +242,17 @@ func (s *overlaySubscription) serveBlockFull(ctx context.Context, block ton.Bloc
 		Block:  append([]byte(nil), full.Block...),
 		IsLink: full.IsLink,
 	}, nil
+}
+
+func (s *overlaySubscription) serveNextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (tl.Serializable, error) {
+	full, err := s.node.peerStorage.NextBlockFull(ctx, prev)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return BlockDescriptionEmpty{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return BlockDescription{ID: full.ID}, nil
 }
 
 func (s *overlaySubscription) serveNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (tl.Serializable, error) {
@@ -306,6 +329,111 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 		return nil, err
 	}
 	return TonNodeData{Data: proof}, nil
+}
+
+func (s *overlaySubscription) servePrepareZeroState(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
+	data, err := s.node.peerStorage.ZeroState(ctx, block)
+	if err == nil && len(data) > 0 {
+		return PreparedState{}, nil
+	}
+	if err == nil {
+		return NotFoundState{}, nil
+	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+	return NotFoundState{}, nil
+}
+
+func (s *overlaySubscription) serveZeroStateData(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
+	data, err := s.node.peerStorage.ZeroState(ctx, block)
+	if err != nil {
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return TonNodeData{}, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		return TonNodeData{}, nil
+	}
+	return TonNodeData{Data: data}, nil
+}
+
+func (s *overlaySubscription) serveNextKeyBlockIDs(ctx context.Context, block ton.BlockIDExt, maxSize int32) (tl.Serializable, error) {
+	if s.node.storage == nil || block.Workchain != -1 || block.Shard != topShard {
+		return KeyBlocks{Error: true}, nil
+	}
+
+	limit := int(maxSize)
+	if maxSize < 0 || limit > 8 {
+		limit = 8
+	}
+	if limit == 0 {
+		return KeyBlocks{}, nil
+	}
+
+	latestSeqno, err := s.seenMasterchainSeqnoForKeyBlockScan(ctx)
+	if err != nil {
+		return KeyBlocks{Error: true}, nil
+	}
+	if latestSeqno <= block.SeqNo || block.SeqNo == ^uint32(0) {
+		return KeyBlocks{Incomplete: true}, nil
+	}
+
+	key := tnstore.BlockHistoryKey{Workchain: -1, Shard: topShard}
+	blocks := make([]ton.BlockIDExt, 0, limit)
+	for seqno := block.SeqNo + 1; seqno <= latestSeqno && len(blocks) < limit; seqno++ {
+		next, err := s.node.storage.LookupBlockBySeqNo(ctx, key, seqno)
+		if errors.Is(err, tnstore.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return KeyBlocks{Error: true}, nil
+		}
+
+		meta, err := s.node.storage.BlockMeta(ctx, next)
+		if errors.Is(err, tnstore.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return KeyBlocks{Error: true}, nil
+		}
+		if meta.Has(tnstore.BlockMetaIsKeyBlock) {
+			blocks = append(blocks, next)
+		}
+	}
+
+	return KeyBlocks{
+		Blocks:     blocks,
+		Incomplete: len(blocks) < limit,
+	}, nil
+}
+
+func (s *overlaySubscription) seenMasterchainSeqnoForKeyBlockScan(ctx context.Context) (uint32, error) {
+	latest, err := s.node.SeenMasterchainBlock()
+	if err == nil {
+		return latest.SeqNo, nil
+	}
+	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
+		return 0, err
+	}
+
+	stored, err := s.node.storage.SeenMasterchainBlock(ctx)
+	if err == nil {
+		return stored.SeqNo, nil
+	}
+	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
+		return 0, err
+	}
+
+	current, err := s.node.storage.CurrentState(ctx)
+	if err == nil && validBlockID(current.Masterchain.Block) {
+		return current.Masterchain.Block.SeqNo, nil
+	}
+	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
+		return 0, err
+	}
+	return 0, tnstore.ErrNotFound
 }
 
 func (s *overlaySubscription) serveArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (tl.Serializable, error) {

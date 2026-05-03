@@ -35,7 +35,7 @@ func TestApplyBlockFromFixture(t *testing.T) {
 		Workchain: oldWC,
 		Shard:     int64(oldShard),
 		SeqNo:     oldParsed.Seqno,
-	}, oldStateCell, oldStateCell.ToBOCWithOptions(cell.BOCOptions{}), oldStateHash[:], nil)
+	}, oldStateCell, oldStateCell.ToBOCWithOptions(cell.BOCSerializeOptions{}), oldStateHash[:], nil)
 	if err != nil {
 		t.Fatalf("build current state from old update branch: %v", err)
 	}

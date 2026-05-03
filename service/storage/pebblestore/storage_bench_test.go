@@ -46,7 +46,7 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for i := 0; i < b.N; i++ {
-			loaded, err := storage.LazyCellRecord(decodeCellRecordTrusted(hash, encoded))
+			loaded, err := storage.LazyCellRecord(decodeCellRecordTrusted(hash, encoded), nil)
 			if err != nil {
 				b.Fatalf("lazy cell record: %v", err)
 			}
@@ -156,7 +156,12 @@ func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.saveStateCellTree(context.Background(), block, root, parsedCells, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
+				block:       block,
+				root:        root,
+				parsedCells: parsedCells,
+				totalCells:  uint64(cells),
+			}); err != nil {
 				b.Fatalf("save parsed state cell tree: %v", err)
 			}
 		}
@@ -172,7 +177,11 @@ func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.saveStateCellTree(context.Background(), block, root, nil, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
+				block:      block,
+				root:       root,
+				totalCells: uint64(cells),
+			}); err != nil {
 				b.Fatalf("save dfs state cell tree: %v", err)
 			}
 		}
@@ -195,7 +204,12 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.saveStateCellTree(context.Background(), block, root, parsedCells, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
+				block:       block,
+				root:        root,
+				parsedCells: parsedCells,
+				totalCells:  uint64(cells),
+			}); err != nil {
 				b.Fatalf("save parsed state cell tree: %v", err)
 			}
 		}
@@ -211,7 +225,11 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.saveStateCellTree(context.Background(), block, root, nil, uint64(cells), nil, nil); err != nil {
+			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
+				block:      block,
+				root:       root,
+				totalCells: uint64(cells),
+			}); err != nil {
 				b.Fatalf("save dfs state cell tree: %v", err)
 			}
 		}
@@ -252,10 +270,6 @@ func BenchmarkPebbleLoadCell(b *testing.B) {
 		if err := store.SaveCells(records); err != nil {
 			b.Fatalf("save cells: %v", err)
 		}
-		oldLoader := cell.LazyLoader
-		cell.LazyLoader = store.LazyCellLoader()
-		b.Cleanup(func() { cell.LazyLoader = oldLoader })
-
 		b.ReportAllocs()
 		b.ResetTimer()
 
@@ -326,7 +340,7 @@ func benchmarkParsedCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell
 	tb.Helper()
 
 	root, cells := benchmarkCellGraph(tb, leaves, fanout)
-	roots, parsedCells, err := cell.FromBOCMultiRootReader(bytes.NewReader(root.ToBOC()))
+	roots, parsedCells, err := cell.FromBOCMultiRootReader(bytes.NewReader(root.ToBOC()), cell.BOCParseOptions{})
 	if err != nil {
 		tb.Fatalf("parse benchmark boc: %v", err)
 	}

@@ -1,10 +1,10 @@
 package service
 
 import (
-	"errors"
+	"fmt"
+
 	"flexserver/service/p2p"
 	tnstore "flexserver/service/storage"
-	"fmt"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -18,39 +18,26 @@ type BlockStats struct {
 
 func StatsFromDownloadedBlock(downloaded p2p.DownloadedBlock) (BlockStats, error) {
 	if downloaded.Parsed != nil {
+		if err := tnstore.VerifyBlockIdentity(downloaded.ID, downloaded.Parsed); err != nil {
+			return BlockStats{}, err
+		}
 		return statsFromParsedBlock(downloaded.ID, downloaded.Parsed)
 	}
 
-	root := downloaded.Block
-	if root == nil {
-		return BlockStats{}, fmt.Errorf("downloaded block %s is missing parsed cell", downloaded.BlockRef())
-	}
-
-	var err error
-	if downloaded.IsLink && root.GetType() == cell.MerkleProofCellType {
-		root, err = cell.UnwrapProof(root, downloaded.ID.RootHash)
-		if err != nil {
-			return BlockStats{}, fmt.Errorf("unwrap merkle proof link for %s: %w", downloaded.BlockRef(), err)
-		}
+	root, err := downloadedBlockRoot(downloaded)
+	if err != nil {
+		return BlockStats{}, err
 	}
 
 	return StatsFromBlockCell(downloaded.ID, root)
 }
 
 func StatsFromBlockCell(id ton.BlockIDExt, root *cell.Cell) (BlockStats, error) {
-	if root == nil {
-		return BlockStats{}, errors.New("block root is nil")
-	}
-
-	var block tlb.Block
-	if err := tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
-		return BlockStats{}, fmt.Errorf("load tlb block %s: %w", tnstore.FormatBlockRef(id), err)
-	}
-
-	if err := verifyBlockIdentity(id, &block); err != nil {
+	block, err := tnstore.ParseVerifiedBlockCell(id, root)
+	if err != nil {
 		return BlockStats{}, err
 	}
-	return statsFromParsedBlock(id, &block)
+	return statsFromParsedBlock(id, block)
 }
 
 func statsFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (BlockStats, error) {
@@ -67,21 +54,6 @@ func statsFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (BlockStats, erro
 		ID:           id,
 		Transactions: txCount,
 	}, nil
-}
-
-func verifyBlockIdentity(id ton.BlockIDExt, block *tlb.Block) error {
-	workchain, shard := tlb.ConvertShardIdentToShard(block.BlockInfo.Shard)
-	if block.BlockInfo.SeqNo != id.SeqNo || workchain != id.Workchain || shard != uint64(id.Shard) {
-		return fmt.Errorf(
-			"downloaded block identity mismatch: expected %s, got wc=%d shard=%016x seqno=%d",
-			tnstore.FormatBlockRef(id),
-			workchain,
-			shard,
-			block.BlockInfo.SeqNo,
-		)
-	}
-
-	return nil
 }
 
 func countBlockTransactions(root *cell.Cell) (int, error) {
