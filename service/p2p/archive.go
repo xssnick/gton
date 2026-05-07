@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flexserver/service/archive"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strings"
@@ -18,6 +17,7 @@ import (
 const (
 	archiveSliceSize         = 2 << 20
 	archiveSliceMaxAnswer    = archiveSliceSize + 4096
+	archivePackMaxBytes      = int64(2 << 30)
 	archiveInfoTimeout       = 3 * time.Second
 	archiveSliceProbeTimeout = 3 * time.Second
 	archiveSliceTimeout      = 15 * time.Second
@@ -50,11 +50,6 @@ type archiveDownloadProbe struct {
 	candidate archiveCandidate
 	bytes     int64
 	elapsed   time.Duration
-}
-
-type archiveStreamImportResult struct {
-	imported *archive.Imported
-	err      error
 }
 
 type archiveCandidate struct {
@@ -493,16 +488,10 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 	lastLog := startedAt
 	var offset int64
 	var lastLogBytes int64
-	importWriter, importDone := startArchiveStreamImport(ctx, archive.Downloaded{
-		MasterchainSeqno: resolved.MasterchainSeqno,
-		Shard:            resolved.Shard,
-		ArchiveID:        archiveID,
-		Peer:             peer.addr,
-	})
+	var downloadElapsed time.Duration
+	var lastLogDownloadElapsed time.Duration
 
 	fail := func(err error) (*archive.Downloaded, error) {
-		_ = importWriter.CloseWithError(err)
-		<-importDone
 		cleanup()
 		return nil, err
 	}
@@ -519,6 +508,9 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		if len(data) == 0 {
 			return nil
 		}
+		if sizeErr := checkArchivePackDownloadSize(offset, len(data)); sizeErr != nil {
+			return sizeErr
+		}
 		n, err := file.Write(data)
 		if err != nil {
 			return fmt.Errorf("write archive temp file: %w", err)
@@ -526,9 +518,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		if n != len(data) {
 			return fmt.Errorf("short archive temp file write: %d of %d", n, len(data))
 		}
-		if _, err = importWriter.Write(data); err != nil {
-			return fmt.Errorf("stream archive import: %w", err)
-		}
+		offset += int64(len(data))
 		return nil
 	}
 
@@ -537,10 +527,10 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		if len(candidate.seedSlice) > archiveSliceSize {
 			return fail(fmt.Errorf("archive seed response too large: %d", len(candidate.seedSlice)))
 		}
+		downloadElapsed += candidate.seedElapsed
 		if err = writeSlice(candidate.seedSlice); err != nil {
 			return fail(err)
 		}
-		offset = int64(len(candidate.seedSlice))
 		seedComplete = len(candidate.seedSlice) < archiveSliceSize
 	}
 
@@ -548,7 +538,9 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		if seedComplete {
 			break
 		}
+		queryStarted := time.Now()
 		data, err := s.queryArchiveSlice(ctx, peer, archiveID, offset)
+		downloadElapsed += time.Since(queryStarted)
 		if err != nil {
 			return fail(fmt.Errorf("download archive offset=%d: %w", offset, err))
 		}
@@ -559,9 +551,8 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 			return fail(err)
 		}
 
-		offset += int64(len(data))
-
 		if elapsed := time.Since(lastLog); elapsed >= 10*time.Second {
+			logDownloadElapsed := downloadElapsed - lastLogDownloadElapsed
 			s.log.Debug().
 				Uint32("masterchain_seqno", resolved.MasterchainSeqno).
 				Int32("workchain", resolved.Shard.Workchain).
@@ -569,26 +560,19 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 				Int64("archive_id", archiveID).
 				Int64("bytes", offset).
 				Str("peer", peer.addr).
-				Str("speed", formatByteRate(offset-lastLogBytes, elapsed)).
+				Dur("elapsed", logDownloadElapsed).
+				Dur("wall_elapsed", elapsed).
+				Str("speed", formatByteRate(offset-lastLogBytes, logDownloadElapsed)).
 				Msg("archive slice download progress")
 
 			lastLog = time.Now()
 			lastLogBytes = offset
+			lastLogDownloadElapsed = downloadElapsed
 		}
 
 		if len(data) < archiveSliceSize {
 			break
 		}
-	}
-
-	if err = importWriter.Close(); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("finish archive stream import: %w", err)
-	}
-	importResult := <-importDone
-	if importResult.err != nil {
-		cleanup()
-		return nil, fmt.Errorf("stream archive import: %w", importResult.err)
 	}
 
 	if err = file.Close(); err != nil {
@@ -600,14 +584,9 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		return nil, fmt.Errorf("rename archive temp file: %w", err)
 	}
 
-	elapsed := time.Since(startedAt)
-	downloadElapsed := elapsed
+	wallElapsed := time.Since(startedAt)
 	if candidate.hasSeed && candidate.seedElapsed > 0 {
-		downloadElapsed += candidate.seedElapsed
-	}
-	if importResult.imported != nil && importResult.imported.Stats != nil {
-		importResult.imported.Stats.Bytes = offset
-		importResult.imported.Stats.DownloadElapsed = downloadElapsed
+		wallElapsed += candidate.seedElapsed
 	}
 	slowThreshold := archiveSlowThreshold(resolved.Shard.Workchain == 0)
 	peer.downloadSuccess(offset, downloadElapsed, slowThreshold, archiveSlowPeerPenalty)
@@ -621,6 +600,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 			Str("peer", peer.addr).
 			Int64("bytes", offset).
 			Dur("elapsed", downloadElapsed).
+			Dur("wall_elapsed", wallElapsed).
 			Str("speed", formatByteRate(offset, downloadElapsed)).
 			Msg("archive download peer too slow")
 	} else {
@@ -634,23 +614,9 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		Int64("archive_id", archiveID).
 		Int64("bytes", offset).
 		Dur("elapsed", downloadElapsed).
+		Dur("wall_elapsed", wallElapsed).
 		Str("speed", formatByteRate(offset, downloadElapsed)).
 		Str("peer", peer.addr)
-	if importResult.imported != nil && importResult.imported.Stats != nil {
-		stats := importResult.imported.Stats
-		downloadEvent.
-			Int("entries", stats.Entries).
-			Int("blocks", stats.Blocks).
-			Int("full_blocks", stats.FullBlocks).
-			Int("proofs", stats.Proofs).
-			Int("proof_links", stats.ProofLinks).
-			Dur("archive_import_elapsed", stats.ImportElapsed).
-			Dur("archive_process_elapsed", stats.ProcessingElapsed).
-			Dur("block_prepare_elapsed", stats.BlockPrepareElapsed).
-			Dur("master_shard_parse_elapsed", stats.MasterchainShardParse).
-			Uint64("state_update_cells", stats.StateUpdateCells).
-			Dur("state_update_cell_prepare", stats.StateUpdateCellPrepare)
-	}
 	downloadEvent.Msg("archive slice downloaded")
 
 	return &archive.Downloaded{
@@ -661,23 +627,21 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		Path:             path,
 		Bytes:            offset,
 		DownloadElapsed:  downloadElapsed,
-		Imported:         importResult.imported,
 	}, nil
 }
 
-func startArchiveStreamImport(ctx context.Context, downloaded archive.Downloaded) (*io.PipeWriter, <-chan archiveStreamImportResult) {
-	reader, writer := io.Pipe()
-	done := make(chan archiveStreamImportResult, 1)
-	go func() {
-		defer func() { _ = reader.Close() }()
-
-		imported, err := archive.ImportStream(ctx, &downloaded, reader)
-		done <- archiveStreamImportResult{
-			imported: imported,
-			err:      err,
-		}
-	}()
-	return writer, done
+func checkArchivePackDownloadSize(offset int64, nextBytes int) error {
+	if offset < 0 {
+		return fmt.Errorf("archive download offset is invalid: %d", offset)
+	}
+	if nextBytes < 0 {
+		return fmt.Errorf("archive download slice size is invalid: %d", nextBytes)
+	}
+	next := int64(nextBytes)
+	if next > archivePackMaxBytes || offset > archivePackMaxBytes-next {
+		return fmt.Errorf("archive pack exceeds max size: offset=%d slice=%d max=%d", offset, nextBytes, archivePackMaxBytes)
+	}
+	return nil
 }
 
 func (s *overlaySubscription) queryArchiveSlice(ctx context.Context, peer *overlayPeer, archiveID int64, offset int64) ([]byte, error) {

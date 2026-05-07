@@ -3,6 +3,7 @@ package archive
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -11,11 +12,10 @@ import (
 )
 
 const (
-	importedBlockPrepareWorkers = 8
-	importedBlockPrepareQueue   = 16
+	importedBlockPrepareQueuePerWorker = 2
 )
 
-var importedBlockPrepareSlots = make(chan struct{}, importedBlockPrepareWorkers)
+var importedBlockPrepareSlots = make(chan struct{}, importedBlockPrepareParallelism())
 
 type importedBlockPrepareJob struct {
 	order int
@@ -48,22 +48,31 @@ type importedBlockPreparer struct {
 
 func newImportedBlockPreparer(ctx context.Context) *importedBlockPreparer {
 	prepareCtx, cancel := context.WithCancel(ctx)
+	workers := importedBlockPrepareParallelism()
 	p := &importedBlockPreparer{
 		ctx:     prepareCtx,
 		cancel:  cancel,
-		jobs:    make(chan importedBlockPrepareJob, importedBlockPrepareQueue),
-		results: make(chan importedBlockPrepareResult, importedBlockPrepareQueue),
+		jobs:    make(chan importedBlockPrepareJob, workers*importedBlockPrepareQueuePerWorker),
+		results: make(chan importedBlockPrepareResult, workers*importedBlockPrepareQueuePerWorker),
 		stopped: make(chan struct{}),
 	}
 
 	p.collector.Add(1)
 	go p.collectResults()
 
-	for worker := 0; worker < importedBlockPrepareWorkers; worker++ {
+	for worker := 0; worker < workers; worker++ {
 		p.workers.Add(1)
 		go p.runWorker()
 	}
 	return p
+}
+
+func importedBlockPrepareParallelism() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		return 1
+	}
+	return workers
 }
 
 func (p *importedBlockPreparer) submit(full *storage.ServedBlockFull) error {

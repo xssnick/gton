@@ -55,6 +55,9 @@ const (
 	dhtSeedPeerTimeout         = 5 * time.Second
 	attachWarmupTimeout        = 3 * time.Second
 	broadcastEventBuffer       = 4096
+	broadcastQueueMaxItems     = 1024
+	broadcastQueueMaxBytes     = int64(128 << 20)
+	broadcastDeduperMaxEntries = 4096
 	publicAnnounceTTL          = 12 * time.Minute
 	publicAnnounceEvery        = 4 * time.Minute
 	publicAnnounceRetryDelay   = 15 * time.Second
@@ -64,6 +67,10 @@ const (
 	peerQueryTimeout           = 10 * time.Second
 	zeroStateBootstrapRetry    = 30 * time.Second
 	rebroadcastWorkerCount     = 4
+	rebroadcastQueueMaxItems   = 1024
+	rebroadcastQueueMaxBytes   = int64(128 << 20)
+	localExternalQueueMaxItems = 1024
+	localExternalQueueMaxBytes = int64(128 << 20)
 	dhtServerStoreMaxKeys      = 300000
 
 	maxBlockDownloadAnswerSize  = 32 << 20

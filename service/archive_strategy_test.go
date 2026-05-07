@@ -110,6 +110,34 @@ func TestArchiveCatchUpTargetByTimeCapsLookahead(t *testing.T) {
 	}
 }
 
+func TestArchivePipelineSchedulingUsesPendingWindowLimit(t *testing.T) {
+	runner := &archiveCatchUpRunner{
+		service: &Service{archiveCatchUpPrefetchWindows: 2},
+		target:  testMasterBlockID(1000),
+	}
+	planning := &storage.CurrentState{ShardClientSeqno: 100}
+
+	if !runner.canScheduleArchiveWindow(planning, 0) {
+		t.Fatal("pipeline should schedule the first window immediately")
+	}
+
+	if runner.canScheduleArchiveWindow(planning, archiveMasterLookaheadWindows) {
+		t.Fatal("pipeline should stop scheduling at the pending window limit")
+	}
+
+	planning.ShardClientSeqno = runner.target.SeqNo
+	if runner.canScheduleArchiveWindow(planning, 0) {
+		t.Fatal("pipeline should stop scheduling at target")
+	}
+}
+
+func TestArchivePipelinePendingWindowLimitAllowsWideShardImportAhead(t *testing.T) {
+	runner := &archiveCatchUpRunner{service: &Service{}}
+	if got := runner.archivePendingWindowLimit(); got != archiveMasterLookaheadWindows {
+		t.Fatalf("pending window limit = %d, want %d", got, archiveMasterLookaheadWindows)
+	}
+}
+
 func TestArchiveImportAppendKeepsAllImportedBlocks(t *testing.T) {
 	master1 := testMasterBlockID(11)
 	master2 := testMasterBlockID(12)

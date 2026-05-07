@@ -23,6 +23,18 @@ type rebroadcastRequest struct {
 	payload      []byte
 }
 
+func broadcastEventBytes(event BroadcastEvent) int64 {
+	bytes := int64(256)
+	if event.Downloaded != nil {
+		bytes += int64(len(event.Downloaded.BlockBOC) + len(event.Downloaded.ProofBOC))
+	}
+	return bytes
+}
+
+func rebroadcastRequestBytes(req rebroadcastRequest) int64 {
+	return int64(len(req.payload)) + 256
+}
+
 func (s *overlaySubscription) handleOverlayBroadcast(peer *overlayPeer, msg any, delivery Delivery, trusted bool, sourceKey string) error {
 	if peer != nil {
 		peer.noteReceive()
@@ -154,7 +166,9 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		if accepted.event.Downloaded != nil && accepted.event.Downloaded.ID.Equals(&accepted.event.Block) {
 			n.rememberDownloadedBlockAsync(nil, accepted.event.Downloaded)
 		}
-		_ = n.eventQueue.Push(*accepted.event)
+		if !n.eventQueue.Push(*accepted.event) {
+			return
+		}
 	}
 
 	if accepted.rebroadcast != nil && n.allowRebroadcast(accepted.rebroadcast) {

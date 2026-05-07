@@ -53,7 +53,7 @@ type Node struct {
 	dht        dhtBackend
 	pool       *peerPool
 	events     chan BroadcastEvent
-	eventQueue *unboundedQueue[BroadcastEvent]
+	eventQueue *boundedQueue[BroadcastEvent]
 	deduper    *eventDeduper
 	onceStop   sync.Once
 	stopped    chan struct{}
@@ -63,19 +63,20 @@ type Node struct {
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx             context.Context
-	zeroStateFileHash  []byte
-	zeroStateBlock     ton.BlockIDExt
-	initBlock          ton.BlockIDExt
-	externalPort       uint16
-	dhtListenAddr      string
-	storage            storage2.Storage
-	peerStorage        storage2.PeerServingStorage
-	compressedState    CompressedBlockStateProvider
-	blockCacheObserver BlockCacheObserver
-	blockCacheSlots    chan struct{}
-	rebroadcastQueue   *unboundedQueue[rebroadcastRequest]
-	rebroadcastQuiet   atomic.Bool
+	runCtx                context.Context
+	zeroStateFileHash     []byte
+	zeroStateBlock        ton.BlockIDExt
+	initBlock             ton.BlockIDExt
+	externalPort          uint16
+	dhtListenAddr         string
+	storage               storage2.Storage
+	peerStorage           storage2.PeerServingStorage
+	compressedState       CompressedBlockStateProvider
+	blockCacheObserver    BlockCacheObserver
+	blockCacheSlots       chan struct{}
+	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
+	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
+	rebroadcastQuiet      atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
@@ -180,8 +181,8 @@ func New(opts Options) (*Node, error) {
 		dhtListenAddr:             opts.DHTListenAddr,
 		pool:                      newPeerPool(gateway),
 		events:                    make(chan BroadcastEvent, broadcastEventBuffer),
-		eventQueue:                newUnboundedQueue[BroadcastEvent](),
-		deduper:                   newEventDeduper(10 * time.Minute),
+		eventQueue:                newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
+		deduper:                   newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
 		stopped:                   make(chan struct{}),
 		subscriptions:             map[string]*overlaySubscription{},
 		observedMasterchainNotify: make(chan struct{}),
@@ -191,7 +192,8 @@ func New(opts Options) (*Node, error) {
 		storage:                   storage,
 		peerStorage:               peerStorage,
 		blockCacheSlots:           make(chan struct{}, 2),
-		rebroadcastQueue:          newUnboundedQueue[rebroadcastRequest](),
+		rebroadcastQueue:          newBoundedQueue(rebroadcastQueueMaxItems, rebroadcastQueueMaxBytes, rebroadcastRequestBytes),
+		localRebroadcastQueue:     newBoundedQueue(localExternalQueueMaxItems, localExternalQueueMaxBytes, rebroadcastRequestBytes),
 		rebroadcastThrottleLast:   map[string]time.Time{},
 		stateDownloadDir:          stateDownloadDir,
 		stateDownloadDirOwned:     stateDownloadDirOwned,
@@ -352,6 +354,7 @@ func (n *Node) stop() {
 		_ = n.gateway.Close()
 
 		n.eventQueue.Close()
+		n.localRebroadcastQueue.Close()
 		n.rebroadcastQueue.Close()
 
 		n.wg.Wait()
@@ -824,15 +827,17 @@ func (p *peerPool) snapshot() []*pooledPeer {
 }
 
 type eventDeduper struct {
-	ttl  time.Duration
-	mx   sync.Mutex
-	seen map[string]time.Time
+	ttl        time.Duration
+	maxEntries int
+	mx         sync.Mutex
+	seen       map[string]time.Time
 }
 
-func newEventDeduper(ttl time.Duration) *eventDeduper {
+func newEventDeduper(ttl time.Duration, maxEntries int) *eventDeduper {
 	return &eventDeduper{
-		ttl:  ttl,
-		seen: map[string]time.Time{},
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		seen:       map[string]time.Time{},
 	}
 }
 
@@ -845,10 +850,25 @@ func (d *eventDeduper) Mark(key string, now time.Time) bool {
 	}
 	d.seen[key] = now
 
-	if len(d.seen) > 2048 {
+	pruneAt := d.maxEntries
+	if pruneAt <= 0 {
+		pruneAt = 2048
+	}
+	if len(d.seen) > pruneAt {
 		for k, when := range d.seen {
 			if now.Sub(when) >= d.ttl {
 				delete(d.seen, k)
+			}
+		}
+	}
+	if d.maxEntries > 0 && len(d.seen) > d.maxEntries {
+		for k := range d.seen {
+			if k == key {
+				continue
+			}
+			delete(d.seen, k)
+			if len(d.seen) <= d.maxEntries {
+				break
 			}
 		}
 	}

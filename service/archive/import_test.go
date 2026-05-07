@@ -245,59 +245,6 @@ func openTestPebbleStore(tb testing.TB) *pebblestore.Store {
 	return store
 }
 
-func TestObserveMasterchainBlockShardsFromFixture(t *testing.T) {
-	rawFixture, err := os.ReadFile("../testdata/masterchain_block_fixture.json")
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-
-	var fixture struct {
-		Block struct {
-			Workchain   int32  `json:"workchain"`
-			Shard       string `json:"shard"`
-			SeqNo       uint32 `json:"seqno"`
-			RootHashHex string `json:"root_hash_hex"`
-			FileHashHex string `json:"file_hash_hex"`
-		} `json:"block"`
-		RawBOCBase64 string `json:"raw_boc_base64"`
-	}
-	if err = json.Unmarshal(rawFixture, &fixture); err != nil {
-		t.Fatalf("decode fixture: %v", err)
-	}
-
-	blockData, err := base64.StdEncoding.DecodeString(fixture.RawBOCBase64)
-	if err != nil {
-		t.Fatalf("decode block boc base64: %v", err)
-	}
-	rootHash, err := hex.DecodeString(fixture.Block.RootHashHex)
-	if err != nil {
-		t.Fatalf("decode root hash: %v", err)
-	}
-	fileHash, err := hex.DecodeString(fixture.Block.FileHashHex)
-	if err != nil {
-		t.Fatalf("decode file hash: %v", err)
-	}
-	shard, err := strconv.ParseUint(fixture.Block.Shard, 16, 64)
-	if err != nil {
-		t.Fatalf("parse shard: %v", err)
-	}
-
-	stats := &ImportStats{}
-	err = observeMasterchainBlockShards(stats, ton.BlockIDExt{
-		Workchain: fixture.Block.Workchain,
-		Shard:     int64(shard),
-		SeqNo:     fixture.Block.SeqNo,
-		RootHash:  rootHash,
-		FileHash:  fileHash,
-	}, blockData)
-	if err != nil {
-		t.Fatalf("observe masterchain block shards: %v", err)
-	}
-	if len(stats.MasterchainShardBlocks) == 0 {
-		t.Fatal("expected shard blocks from masterchain block fixture")
-	}
-}
-
 func TestShardIDContainsBlock(t *testing.T) {
 	left := ShardID{Workchain: 0, Shard: int64(0x4000000000000000)}
 	right := testBlockID(0, int64(-0x4000000000000000), 1)

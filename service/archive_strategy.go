@@ -21,7 +21,6 @@ const (
 	nextToArchiveLagSeconds           = 1000
 	archiveTimeLagLookaheadBlocks     = 5000
 	maxArchiveMonitorSplitDepth       = 12
-	archiveShardDownloadWorkers       = 4
 )
 
 func masterchainBlockLagSeconds(blockUTime int64, nowUnix int64) (int64, bool) {
@@ -81,7 +80,7 @@ func archiveCatchUpTargetByBlockTime(current *storage.CurrentState, blockUTime i
 	return target, lagSeconds, true
 }
 
-func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, masterchainSeqno uint32, shards []archive.ShardID) ([]*archiveImportResult, error) {
+func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, shards []archive.ShardID, priority archiveImportPriority) ([]*archiveImportResult, error) {
 	if len(shards) == 0 {
 		return nil, nil
 	}
@@ -89,46 +88,49 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 	preloadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	workers := archiveShardDownloadWorkers
-	if len(shards) < workers {
-		workers = len(shards)
-	}
-
 	type archivePreloadResult struct {
 		idx      int
 		imported *archiveImportResult
 		err      error
 	}
 
-	jobs := make(chan int)
+	type archivePreloadJob struct {
+		idx  int
+		done <-chan archiveImportQueueResult
+	}
+
+	jobs := make([]archivePreloadJob, 0, len(shards))
+	for idx, shard := range shards {
+		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, priority)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shard.String(), err)
+		}
+		jobs = append(jobs, archivePreloadJob{idx: idx, done: done})
+	}
+
 	results := make(chan archivePreloadResult, len(shards))
 	var wg sync.WaitGroup
-	for worker := 0; worker < workers; worker++ {
+	for _, job := range jobs {
+		job := job
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
-				downloaded, err := r.downloadAndImportArchive(preloadCtx, masterchainSeqno, shards[idx])
-				res := archivePreloadResult{idx: idx, imported: downloaded.imported, err: err}
-				select {
-				case results <- res:
-				case <-preloadCtx.Done():
-					return
-				}
+			var res archivePreloadResult
+			select {
+			case result := <-job.done:
+				res = archivePreloadResult{idx: job.idx, imported: result.imported, err: result.err}
+			case <-preloadCtx.Done():
+				res = archivePreloadResult{idx: job.idx, err: preloadCtx.Err()}
+			}
+			select {
+			case results <- res:
+			case <-preloadCtx.Done():
+				return
 			}
 		}()
 	}
 
-	go func() {
-		defer close(jobs)
-		for idx := range shards {
-			select {
-			case jobs <- idx:
-			case <-preloadCtx.Done():
-				return
-			}
-		}
-	}()
 	go func() {
 		wg.Wait()
 		close(results)
@@ -180,7 +182,6 @@ func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
 	total.ImportElapsed += next.ImportElapsed
 	total.ProcessingElapsed += next.ProcessingElapsed
 	total.BlockPrepareElapsed += next.BlockPrepareElapsed
-	total.MasterchainShardParse += next.MasterchainShardParse
 	total.StateUpdateCells += next.StateUpdateCells
 	total.StateUpdateCellPrepare += next.StateUpdateCellPrepare
 

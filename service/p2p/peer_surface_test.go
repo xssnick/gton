@@ -128,7 +128,7 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	req, ok := node.rebroadcastQueue.Pop(ctx)
+	req, ok := node.localRebroadcastQueue.Pop(ctx)
 	if !ok {
 		t.Fatal("expected external message rebroadcast request")
 	}
@@ -149,6 +149,49 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 	}
 	if string(broadcast.Message.Data) != string(data) {
 		t.Fatalf("unexpected external message data %x", broadcast.Message.Data)
+	}
+}
+
+func TestLocalExternalRebroadcastQueueHasPriority(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "basechain"},
+		log:  discardLogger(),
+	}
+
+	if !node.rebroadcastQueue.Push(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.newShardBlockBroadcast",
+		payload:      []byte{0x01},
+	}) {
+		t.Fatal("enqueue ordinary rebroadcast")
+	}
+	if !node.localRebroadcastQueue.Push(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x02},
+	}) {
+		t.Fatal("enqueue local external rebroadcast")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	first, ok := popPriority(ctx, node.localRebroadcastQueue, node.rebroadcastQueue)
+	if !ok {
+		t.Fatal("expected priority rebroadcast")
+	}
+	if first.kind != "tonNode.externalMessageBroadcast" {
+		t.Fatalf("first rebroadcast kind = %q, want local external", first.kind)
+	}
+
+	second, ok := popPriority(ctx, node.localRebroadcastQueue, node.rebroadcastQueue)
+	if !ok {
+		t.Fatal("expected ordinary rebroadcast")
+	}
+	if second.kind != "tonNode.newShardBlockBroadcast" {
+		t.Fatalf("second rebroadcast kind = %q, want ordinary broadcast", second.kind)
 	}
 }
 
@@ -354,10 +397,10 @@ func TestBuildOverlaySpecUsesCppNodeProtoVersions(t *testing.T) {
 	}
 }
 
-func TestAcceptBroadcastUsesUnboundedBacklog(t *testing.T) {
+func TestAcceptBroadcastDropsWhenQueueIsFull(t *testing.T) {
 	node := newTestNode(t)
 
-	const total = 5000
+	total := broadcastQueueMaxItems + 10
 	for i := 0; i < total; i++ {
 		node.acceptBroadcast(acceptedBroadcast{
 			fingerprint: fmt.Sprintf("fp-%d", i),
@@ -379,7 +422,7 @@ func TestAcceptBroadcastUsesUnboundedBacklog(t *testing.T) {
 	defer cancel()
 
 	count := 0
-	for count < total {
+	for count < broadcastQueueMaxItems {
 		_, ok := node.eventQueue.Pop(ctx)
 		if !ok {
 			t.Fatalf("queue closed early after %d items", count)
@@ -387,8 +430,28 @@ func TestAcceptBroadcastUsesUnboundedBacklog(t *testing.T) {
 		count++
 	}
 
-	if count != total {
-		t.Fatalf("unexpected number of queued broadcasts: got %d want %d", count, total)
+	if count != broadcastQueueMaxItems {
+		t.Fatalf("unexpected number of queued broadcasts: got %d want %d", count, broadcastQueueMaxItems)
+	}
+
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer shortCancel()
+	if _, ok := node.eventQueue.Pop(shortCtx); ok {
+		t.Fatal("expected broadcasts over queue limit to be dropped")
+	}
+}
+
+func TestEventDeduperHasHardCap(t *testing.T) {
+	deduper := newEventDeduper(time.Hour, 16)
+	now := time.Now()
+
+	for i := 0; i < 64; i++ {
+		if !deduper.Mark(fmt.Sprintf("fp-%d", i), now) {
+			t.Fatalf("unexpected duplicate for key %d", i)
+		}
+	}
+	if len(deduper.seen) > 16 {
+		t.Fatalf("deduper exceeded hard cap: got %d want <= 16", len(deduper.seen))
 	}
 }
 

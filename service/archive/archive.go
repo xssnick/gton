@@ -54,11 +54,9 @@ type ImportStats struct {
 	ImportElapsed          time.Duration
 	ProcessingElapsed      time.Duration
 	BlockPrepareElapsed    time.Duration
-	MasterchainShardParse  time.Duration
 	StateUpdateCells       uint64
 	StateUpdateCellPrepare time.Duration
 	ContainsShardBlocks    bool
-	MasterchainShardBlocks []ton.BlockIDExt
 }
 
 type PreparedBlock struct {

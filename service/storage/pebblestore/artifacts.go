@@ -827,6 +827,9 @@ func storeArchivePack(src string, dst string) (bool, error) {
 		return false, validateArchivePack(dst)
 	}
 
+	if err := validateArchivePack(src); err != nil {
+		return false, err
+	}
 	if err := os.Rename(src, dst); err == nil {
 		return true, validateArchivePack(dst)
 	}

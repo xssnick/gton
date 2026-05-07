@@ -142,7 +142,7 @@ func calcFECRebroadcastParts(payloadLen int, symbolSize uint32) uint32 {
 
 func (n *Node) runRebroadcastLoop(ctx context.Context) {
 	for {
-		req, ok := n.rebroadcastQueue.Pop(ctx)
+		req, ok := popPriority(ctx, n.localRebroadcastQueue, n.rebroadcastQueue)
 		if !ok {
 			return
 		}
