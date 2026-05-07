@@ -16,9 +16,11 @@ import (
 
 type Source interface {
 	LatestMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error)
-	TrustedInitBlock(ctx context.Context) (ton.BlockIDExt, error)
+	InitBlock(ctx context.Context) (ton.BlockIDExt, error)
+	ZeroStateBlock(ctx context.Context) (ton.BlockIDExt, error)
+	ZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error)
 	NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (p2p.KeyBlockBatch, error)
-	TrustedInitProof(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
+	InitBlockProof(ctx context.Context, block ton.BlockIDExt) (p2p.ProofDownload, error)
 	MasterchainProof(ctx context.Context, block ton.BlockIDExt, requireKey bool) ([]byte, error)
 	ShardBlocks(ctx context.Context, master ton.BlockIDExt) ([]ton.BlockIDExt, error)
 	DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (storage.DownloadedState, error)
@@ -62,18 +64,53 @@ func (s *P2PSource) LatestMasterchainBlock(ctx context.Context) (ton.BlockIDExt,
 	return block, nil
 }
 
-func (s *P2PSource) TrustedInitBlock(ctx context.Context) (ton.BlockIDExt, error) {
+func (s *P2PSource) ZeroStateBlock(ctx context.Context) (ton.BlockIDExt, error) {
 	_ = ctx
 
-	initBlock, err := s.node.TrustedInitBlock()
+	block, err := s.node.ZeroStateBlock()
 	if errors.Is(err, storage.ErrNotFound) {
-		return ton.BlockIDExt{}, fmt.Errorf("trusted init block is not configured")
+		return ton.BlockIDExt{}, fmt.Errorf("zero state is not configured")
 	}
-	return initBlock, err
+	return block, err
+}
+
+func (s *P2PSource) InitBlock(ctx context.Context) (ton.BlockIDExt, error) {
+	_ = ctx
+
+	block, err := s.node.InitBlock()
+	if errors.Is(err, storage.ErrNotFound) {
+		return ton.BlockIDExt{}, fmt.Errorf("init block is not configured")
+	}
+	return block, err
+}
+
+func (s *P2PSource) ZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
+	s.log.Info().
+		Str("block", storage.FormatBlockRef(block)).
+		Msg("requesting zero state")
+
+	return s.node.DownloadState(ctx, block, block, 0, nil)
 }
 
 func (s *P2PSource) NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (p2p.KeyBlockBatch, error) {
 	return s.node.NextKeyBlocks(ctx, from, limit)
+}
+
+func (s *P2PSource) InitBlockProof(ctx context.Context, block ton.BlockIDExt) (p2p.ProofDownload, error) {
+	s.log.Debug().
+		Str("block", storage.FormatBlockRef(block)).
+		Msg("requesting trusted init block proof link")
+
+	return s.node.DownloadBlockProof(ctx, block, true)
+}
+
+func (s *P2PSource) keyBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (p2p.ProofDownload, error) {
+	s.log.Debug().
+		Str("block", storage.FormatBlockRef(block)).
+		Bool("allow_partial", allowPartial).
+		Msg("requesting key block proof")
+
+	return s.node.DownloadKeyBlockProof(ctx, block, allowPartial)
 }
 
 func (s *P2PSource) ShardBlocks(ctx context.Context, master ton.BlockIDExt) ([]ton.BlockIDExt, error) {

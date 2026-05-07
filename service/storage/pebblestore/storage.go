@@ -53,9 +53,11 @@ const (
 	stateCellImportBatchTargetBytes = 128 << 20
 	stateCellSaveProgressInterval   = 5 * time.Second
 	archivePackageMasterchainBlocks = 100
+	keyArchiveMasterchainBlocks     = 200000
 
-	blockStateMetaVersion = 1
-	artifactRefVersion    = 1
+	blockStateMetaVersion  = 1
+	artifactRefVersion     = 1
+	persistentStateVersion = 1
 
 	cellRecordCompactRefsFlag = 0x10
 	cellRecordHashSize        = 32
@@ -78,33 +80,19 @@ type Options struct {
 type Store struct {
 	log zerolog.Logger
 
-	hot      *pebble.DB
-	cells    *cellStore
-	dir      string
-	hotOpts  *pebble.Options
-	hotCache *pebble.Cache
+	hot       *pebble.DB
+	cells     *cellStore
+	cellCache *decodedCellCache
+	dir       string
+	hotOpts   *pebble.Options
+	hotCache  *pebble.Cache
 
-	mu                 sync.RWMutex
-	pendingMu          sync.RWMutex
-	flushMu            sync.Mutex
-	pendingState       pendingStateOverlay
-	pendingFlushes     []pendingStateFlush
-	nextPendingFlushID uint64
-	artifactMu         sync.Mutex
-	pendingArchiveSync map[string]struct{}
-	closed             bool
-}
-
-type pendingStateFlush struct {
-	id    uint64
-	state pendingStateOverlay
-}
-
-type pendingStateOverlay struct {
-	states     map[string]storage.BlockState
-	blockMetas map[string]*storage.BlockMeta
-	seqIndex   map[storage.BlockHistoryKey]map[uint32]ton.BlockIDExt
-	syncs      map[string]stateCellTreeSync
+	mu                  sync.RWMutex
+	artifactMu          sync.Mutex
+	pendingLooseSync    map[string]struct{}
+	pendingArchiveSync  map[string]struct{}
+	pendingKeyProofSync map[string]struct{}
+	closed              bool
 }
 
 func Open(opts Options) (*Store, error) {
@@ -143,6 +131,12 @@ func Open(opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(opts.Dir, "packs", "loose"), 0o755); err != nil {
 		return nil, fmt.Errorf("create loose pack dir: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(opts.Dir, "packs", "key"), 0o755); err != nil {
+		return nil, fmt.Errorf("create key pack dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(opts.Dir, "states"), 0o755); err != nil {
+		return nil, fmt.Errorf("create states dir: %w", err)
+	}
 
 	hotCache := pebble.NewCache(opts.MetaCacheSize)
 	hotLogger := logger.With().Str("db", "metadb").Logger()
@@ -163,14 +157,16 @@ func Open(opts Options) (*Store, error) {
 	}
 
 	store := &Store{
-		log:                logger,
-		hot:                hot,
-		cells:              cells,
-		dir:                opts.Dir,
-		hotOpts:            hotOpts,
-		hotCache:           hotCache,
-		pendingState:       newPendingStateOverlay(),
-		pendingArchiveSync: map[string]struct{}{},
+		log:                 logger,
+		hot:                 hot,
+		cells:               cells,
+		cellCache:           newDecodedCellCache(opts.CellCacheSize),
+		dir:                 opts.Dir,
+		hotOpts:             hotOpts,
+		hotCache:            hotCache,
+		pendingLooseSync:    map[string]struct{}{},
+		pendingArchiveSync:  map[string]struct{}{},
+		pendingKeyProofSync: map[string]struct{}{},
 	}
 	logger.Info().
 		Int64("meta_cache_size", opts.MetaCacheSize).
@@ -296,7 +292,7 @@ func pebbleCellMaxConcurrentCompactions() int {
 
 func (s *Store) Close() error {
 	var firstErr error
-	if err := s.syncPendingArchiveFiles(); err != nil && firstErr == nil {
+	if err := s.syncPendingArtifactFiles(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 
@@ -318,6 +314,10 @@ func (s *Store) Close() error {
 		s.hotCache.Unref()
 	}
 	return firstErr
+}
+
+func (s *Store) StateFilesDir() string {
+	return filepath.Join(s.dir, "states")
 }
 
 func (s *Store) withHotBatch(fn func(batch *pebble.Batch) error) error {
@@ -502,6 +502,9 @@ var (
 	hotPrefixArchiveFile   = []byte{0x0F}
 	hotPrefixSeenMaster    = []byte{0x10}
 	hotPrefixZeroStateRef  = []byte{0x11}
+	hotPrefixKeyProofRef   = []byte{0x12}
+	hotPrefixStateFileRef  = []byte{0x13}
+	hotPrefixVerifiedKey   = []byte{0x14}
 )
 
 func hotKeyBlockMeta(id ton.BlockIDExt) []byte {
@@ -567,6 +570,10 @@ func hotKeySeenMasterchainBlock() []byte {
 	return bytes.Clone(hotPrefixSeenMaster)
 }
 
+func hotKeyVerifiedKeyBlockProgress() []byte {
+	return bytes.Clone(hotPrefixVerifiedKey)
+}
+
 func hotKeyStateMeta(id ton.BlockIDExt) []byte {
 	return appendPrefixAndBlockID(hotPrefixStateMeta, id)
 }
@@ -598,8 +605,27 @@ func hotKeyProofRef(kind storage.ServedProofKind, id ton.BlockIDExt) []byte {
 	return append(buf, encodeBlockID(id)...)
 }
 
+func hotKeyStoredProofRef(kind storage.ServedProofKind, id ton.BlockIDExt) []byte {
+	if isKeyProofKind(kind) {
+		return hotKeyKeyProofRef(kind, id)
+	}
+	return hotKeyProofRef(kind, id)
+}
+
+func hotKeyKeyProofRef(kind storage.ServedProofKind, id ton.BlockIDExt) []byte {
+	buf := append([]byte(nil), hotPrefixKeyProofRef...)
+	buf = append(buf, byte(proofKindOrder(kind)))
+	return append(buf, encodeBlockID(id)...)
+}
+
 func hotKeyZeroStateRef(id ton.BlockIDExt) []byte {
 	return appendPrefixAndBlockID(hotPrefixZeroStateRef, id)
+}
+
+func hotKeyPersistentStateFile(block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) []byte {
+	buf := appendPrefixAndBlockID(hotPrefixStateFileRef, block)
+	buf = append(buf, encodeBlockID(masterchainBlock)...)
+	return binary.BigEndian.AppendUint64(buf, uint64(effectiveShard))
 }
 
 func hotKeyArchiveFile(archiveID int64) []byte {
@@ -701,19 +727,25 @@ func decodeBlockMeta(data []byte) (*storage.BlockMeta, error) {
 	if pos >= len(data) {
 		return nil, fmt.Errorf("block meta truncated")
 	}
-	if data[pos] == 1 {
+	switch data[pos] {
+	case 0:
 		pos++
+	case 1:
+		pos++
+		if pos+80 > len(data) {
+			return nil, fmt.Errorf("block meta masterchain ref truncated")
+		}
 		ref, err := decodeBlockID(data[pos : pos+80])
 		if err != nil {
 			return nil, err
 		}
 		meta.MasterchainRef = &ref
 		pos += 80
-	} else {
-		pos++
+	default:
+		return nil, fmt.Errorf("invalid block meta masterchain ref flag %d", data[pos])
 	}
 	if pos >= len(data) {
-		return meta, nil
+		return nil, fmt.Errorf("block meta prev refs count missing")
 	}
 	prevCount := int(data[pos])
 	pos++
@@ -728,6 +760,9 @@ func decodeBlockMeta(data []byte) (*storage.BlockMeta, error) {
 		}
 		meta.PrevRefs = append(meta.PrevRefs, ref)
 		pos += 80
+	}
+	if pos != len(data) {
+		return nil, fmt.Errorf("block meta has %d trailing bytes", len(data)-pos)
 	}
 	return meta, nil
 }
@@ -1137,6 +1172,67 @@ func decodeArtifactRef(data []byte) (*storage.ArtifactRef, error) {
 		Path:   string(data[fixed:]),
 		Offset: offset,
 		Size:   size,
+	}, nil
+}
+
+type persistentStateFileRecord struct {
+	ref           *storage.ArtifactRef
+	fileHash      []byte
+	stateRootHash []byte
+	cellsCount    uint64
+}
+
+func encodePersistentStateFileRecord(file *storage.PersistentStateFile) []byte {
+	ref := encodeArtifactRef(file.Ref)
+	buf := make([]byte, 0, 1+8+1+len(file.FileHash)+1+len(file.StateRootHash)+4+len(ref))
+	buf = append(buf, persistentStateVersion)
+	buf = binary.BigEndian.AppendUint64(buf, file.CellsCount)
+	buf = appendLenBytes(buf, file.FileHash)
+	buf = appendLenBytes(buf, file.StateRootHash)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(ref)))
+	return append(buf, ref...)
+}
+
+func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, error) {
+	if len(data) < 1+8+1+1+4 {
+		return nil, fmt.Errorf("persistent state file payload truncated")
+	}
+	if data[0] != persistentStateVersion {
+		return nil, fmt.Errorf("persistent state file version mismatch")
+	}
+	pos := 1
+	cellsCount := binary.BigEndian.Uint64(data[pos : pos+8])
+	pos += 8
+
+	fileHash, next, err := readLenBytes(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	pos = next
+
+	stateRootHash, next, err := readLenBytes(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	pos = next
+
+	if len(data)-pos < 4 {
+		return nil, fmt.Errorf("persistent state file payload truncated")
+	}
+	refLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+	if refLen <= 0 || len(data)-pos != refLen {
+		return nil, fmt.Errorf("persistent state file payload size mismatch")
+	}
+	ref, err := decodeArtifactRef(data[pos:])
+	if err != nil {
+		return nil, err
+	}
+	return &persistentStateFileRecord{
+		ref:           ref,
+		fileHash:      fileHash,
+		stateRootHash: stateRootHash,
+		cellsCount:    cellsCount,
 	}, nil
 }
 

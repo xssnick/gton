@@ -42,12 +42,10 @@ func (s *Store) ImportStateCellTrees(ctx context.Context, trees []storage.StateC
 }
 
 type stateCellTreeImport struct {
-	block            ton.BlockIDExt
-	root             *cell.Cell
-	parsedCells      []cell.Cell
-	totalCells       uint64
-	reusedStateCells []cell.MerkleUpdateReusedCell
-	reusedStateRefs  []cell.MerkleUpdateReusedRef
+	block       ton.BlockIDExt
+	root        *cell.Cell
+	parsedCells []cell.Cell
+	totalCells  uint64
 }
 
 type stateCellTreeSync struct {
@@ -70,12 +68,10 @@ func (s *Store) importStateCellTrees(ctx context.Context, trees []stateCellTreeI
 
 		rootCellHash := tree.root.HashKey()
 		if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{
-			block:            tree.block,
-			root:             tree.root,
-			parsedCells:      tree.parsedCells,
-			totalCells:       tree.totalCells,
-			reusedStateCells: tree.reusedStateCells,
-			reusedStateRefs:  tree.reusedStateRefs,
+			block:       tree.block,
+			root:        tree.root,
+			parsedCells: tree.parsedCells,
+			totalCells:  tree.totalCells,
 		}); err != nil {
 			return nil, err
 		}
@@ -106,18 +102,24 @@ func (s *Store) importStateCellTrees(ctx context.Context, trees []stateCellTreeI
 }
 
 func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {
-	if sync, ok := s.pendingStateCellSync(block); ok {
-		root, err := s.loadLazyCell(ctx, sync.rootHash[:])
+	state, err := s.blockStateMeta(ctx, block)
+	if err == nil {
+		if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
+			return nil, 0, storage.ErrNotFound
+		}
+
+		root, err := s.loadLazyCell(ctx, state.StateCellHash)
 		if err != nil {
 			return nil, 0, err
 		}
-		if len(rootHash) > 0 {
-			hash := root.HashKey(0)
-			if !bytes.Equal(hash[:], rootHash) {
-				return nil, 0, storage.ErrNotFound
-			}
+		hash := root.HashKey(0)
+		if !bytes.Equal(hash[:], state.StateRootHash) {
+			return nil, 0, storage.ErrNotFound
 		}
-		return root, sync.cellCount, nil
+		return root, state.CellsCount, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, 0, err
 	}
 
 	raw, err := s.getHotCopy(ctx, hotKeyStateCellSync(block))
@@ -203,7 +205,7 @@ func (s *Store) syncStateCellTrees(syncs []stateCellTreeSync) error {
 	return batch.Commit(pebble.Sync)
 }
 
-func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, root *cell.Cell) error {
+func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) error {
 	var err error
 	if root == nil {
 		root, err = s.loadLazyCell(context.Background(), saved.StateCellHash)
@@ -219,9 +221,10 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 	state.CellsCount = saved.CellsCount
 	state.Cell = root
 	state.Parsed = saved.Parsed
+	if parsed != nil {
+		state.Parsed = parsed.Parsed
+	}
 	state.DownloadedAt = saved.DownloadedAt
-	state.ReusedStateCells = nil
-	state.ReusedStateRefs = nil
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(saved.Block)).
@@ -236,16 +239,17 @@ const (
 )
 
 type stateCellTreeSave struct {
-	block            ton.BlockIDExt
-	root             *cell.Cell
-	parsedCells      []cell.Cell
-	totalCells       uint64
-	reusedStateCells []cell.MerkleUpdateReusedCell
-	reusedStateRefs  []cell.MerkleUpdateReusedRef
-	exists           *stateCellExistenceCache
+	block       ton.BlockIDExt
+	root        *cell.Cell
+	parsedCells []cell.Cell
+	totalCells  uint64
+	exists      *stateCellExistenceCache
 }
 
 func (s *Store) saveStateCellTree(ctx context.Context, req stateCellTreeSave) (bool, error) {
+	if req.root != nil && req.root.GetType() == cell.PrunedCellType {
+		return false, fmt.Errorf("state cell tree root is pruned")
+	}
 	if len(req.parsedCells) > 0 {
 		return s.saveParsedStateCellsBatch(ctx, req)
 	}
@@ -253,21 +257,45 @@ func (s *Store) saveStateCellTree(ctx context.Context, req stateCellTreeSave) (b
 }
 
 func (s *Store) saveStateCellTreeDFS(ctx context.Context, req stateCellTreeSave) (bool, error) {
-	writer, err := s.newStateCellBatchWriter(req.exists)
+	return s.saveStateCellTreesDFSBatch(ctx, []stateCellTreeSave{req}, req.exists)
+}
+
+func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCellTreeSave, exists *stateCellExistenceCache) (bool, error) {
+	if len(trees) == 0 {
+		return false, nil
+	}
+
+	writer, err := s.newStateCellBatchWriter(exists)
 	if err != nil {
 		return false, err
 	}
 	defer writer.close()
 
-	progress := newStateCellSaveProgress(s.log, req.block, stateCellSaveSourceDFS, req.totalCells, writer, zerolog.DebugLevel)
-	progress.logStart(len(req.reusedStateCells))
+	totalCells := uint64(0)
+	for _, tree := range trees {
+		if tree.root == nil {
+			return false, fmt.Errorf("state cell tree root is nil")
+		}
+		if tree.root.GetType() == cell.PrunedCellType {
+			return false, fmt.Errorf("state cell tree root is pruned")
+		}
+		totalCells += tree.totalCells
+	}
 
-	reuse := newStateCellReuseIndex(req.reusedStateCells, req.reusedStateRefs)
-	stack := make([]*cell.Cell, 0, 1024)
-	stack = append(stack, req.root)
-	visited := make(map[cell.Hash]struct{}, cellVisitSetCapacity(req.totalCells))
-	rootHash := stateCellStorageHash(req.root)
-	visited[rootHash] = struct{}{}
+	progress := newStateCellSaveProgress(s.log, trees[0].block, stateCellSaveSourceDFS, totalCells, writer, zerolog.DebugLevel)
+	progress.logStart()
+
+	stack := make([]*cell.Cell, 0, len(trees))
+	visited := make(map[cell.Hash]struct{}, cellVisitSetCapacity(totalCells))
+	lazyBoundaries := map[cell.Hash]struct{}{}
+	for _, tree := range trees {
+		rootHash := stateCellStorageHash(tree.root)
+		if _, ok := visited[rootHash]; ok {
+			continue
+		}
+		visited[rootHash] = struct{}{}
+		stack = append(stack, tree.root)
+	}
 
 	for len(stack) > 0 {
 		if progress.processed&0x3fff == 0 {
@@ -284,57 +312,25 @@ func (s *Store) saveStateCellTreeDFS(ctx context.Context, req stateCellTreeSave)
 		currentMeta := current.GetMetadata()
 		currentHash := currentMeta.Hash
 
-		if exists, err := reuse.cellExists(writer, currentHash); err != nil {
-			return false, err
-		} else if exists {
-			progress.skippedReusedState++
-			progress.processed++
-			continue
-		}
 		if current.IsLazy() {
 			progress.skippedExisting++
 			progress.processed++
 			continue
 		}
+		if current.GetType() == cell.PrunedCellType {
+			progress.skippedExisting++
+			progress.processed++
+			continue
+		}
 
-		refs := currentMeta.Refs
+		refs, refCells, err := stateCellRefs(current, currentMeta)
+		if err != nil {
+			return false, fmt.Errorf("load state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", currentHash[:], current.IsLazy(), current.IsVirtualized(), current.GetType(), err)
+		}
+		rememberLazyStateBoundaries(lazyBoundaries, refs)
 		for i := 0; i < len(refs); i++ {
-			refFromReused := false
-			var refCell *cell.Cell
-			if reusedRef, ok := reuse.ref(currentHash, i); ok {
-				refCell = reusedRef.RawCell
-				refs[i] = stateCellRefMetadata(reusedRef.RawCell)
-				refFromReused = true
-			} else {
-				refHash := refs[i].Hash
-				if raw, ok := reuse.cell(refHash); ok {
-					refCell = raw
-					refs[i] = stateCellRefMetadata(raw)
-					refFromReused = true
-				}
-			}
-
 			ref := refs[i]
 			refHash := ref.Hash
-			if refFromReused {
-				if ref.Lazy {
-					progress.skippedReusedState++
-					continue
-				}
-				exists, err := writer.has(refHash)
-				if err != nil {
-					return false, err
-				}
-				if exists {
-					progress.skippedReusedState++
-					continue
-				}
-			} else if exists, err := reuse.cellExists(writer, refHash); err != nil {
-				return false, err
-			} else if exists {
-				progress.skippedReusedState++
-				continue
-			}
 			if _, ok := visited[refHash]; ok {
 				continue
 			}
@@ -342,12 +338,7 @@ func (s *Store) saveStateCellTreeDFS(ctx context.Context, req stateCellTreeSave)
 				progress.skippedExisting++
 				continue
 			}
-			if refCell == nil {
-				refCell, err = current.PeekRef(i)
-				if err != nil {
-					return false, fmt.Errorf("load state ref %x from parent %x ref=%d: %w", refHash[:], currentHash[:], i, err)
-				}
-			}
+			refCell := refCells[i]
 			if refCell == nil || refCell.IsLazy() {
 				return false, fmt.Errorf("state ref %x from parent %x ref=%d has no body", refHash[:], currentHash[:], i)
 			}
@@ -371,6 +362,9 @@ func (s *Store) saveStateCellTreeDFS(ctx context.Context, req stateCellTreeSave)
 	if err := progress.flush(); err != nil {
 		return false, err
 	}
+	if err := validateLazyStateBoundaries(writer, lazyBoundaries); err != nil {
+		return false, fmt.Errorf("validate state lazy boundaries for %s: %w", storage.FormatBlockRef(trees[0].block), err)
+	}
 	progress.logDone()
 	return progress.applied > 0, nil
 }
@@ -388,7 +382,7 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, req stateCellTree
 	defer writer.close()
 
 	progress := newStateCellSaveProgress(s.log, req.block, stateCellSaveSourceParsedBatch, totalCells, writer, zerolog.InfoLevel)
-	progress.logStart(0)
+	progress.logStart()
 
 	for i := range req.parsedCells {
 		if progress.processed&0x3fff == 0 {
@@ -400,14 +394,25 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, req stateCellTree
 		}
 
 		current := &req.parsedCells[i]
-		refsSlice, err := stateCellRefs(current)
-		if err != nil {
-			hash := stateCellStorageHash(current)
-			return false, fmt.Errorf("load parsed state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", hash[:], current.IsLazy(), current.IsVirtualized(), current.GetType(), err)
+		if current.GetType() == cell.PrunedCellType {
+			progress.skippedExisting++
+			progress.processed++
+			continue
 		}
 
-		if err := writer.add(current, current.GetMetadata(), refsSlice); err != nil {
+		_, err := writer.addStateCell(current)
+		if err != nil {
 			return false, err
+		}
+		for level := 0; level < current.Level(); level++ {
+			view := current.Virtualize(uint8(level))
+			if view == current {
+				continue
+			}
+			_, err := writer.addStateCell(view)
+			if err != nil {
+				return false, err
+			}
 		}
 		progress.processed++
 
@@ -425,6 +430,27 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, req stateCellTree
 	return progress.applied > 0, nil
 }
 
+func rememberLazyStateBoundaries(boundaries map[cell.Hash]struct{}, refs []cell.RefMetadata) {
+	for _, ref := range refs {
+		if ref.Lazy {
+			boundaries[ref.Hash] = struct{}{}
+		}
+	}
+}
+
+func validateLazyStateBoundaries(writer *stateCellBatchWriter, boundaries map[cell.Hash]struct{}) error {
+	for hash := range boundaries {
+		exists, err := writer.has(hash)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("lazy boundary %x is missing from state cell db", hash[:])
+		}
+	}
+	return nil
+}
+
 type stateCellSaveProgress struct {
 	log      zerolog.Logger
 	writer   *stateCellBatchWriter
@@ -435,11 +461,10 @@ type stateCellSaveProgress struct {
 	started  time.Time
 	lastLog  time.Time
 
-	processed          int64
-	applied            int64
-	bytesWritten       int64
-	skippedReusedState int64
-	skippedExisting    int64
+	processed       int64
+	applied         int64
+	bytesWritten    int64
+	skippedExisting int64
 }
 
 func newStateCellSaveProgress(log zerolog.Logger, block ton.BlockIDExt, source string, total uint64, writer *stateCellBatchWriter, level zerolog.Level) stateCellSaveProgress {
@@ -456,14 +481,11 @@ func newStateCellSaveProgress(log zerolog.Logger, block ton.BlockIDExt, source s
 	}
 }
 
-func (p *stateCellSaveProgress) logStart(reusedStateCells int) {
+func (p *stateCellSaveProgress) logStart() {
 	event := p.log.Debug().
 		Str("block", p.blockRef).
 		Str("source", p.source).
 		Uint64("total_cells", p.total)
-	if reusedStateCells > 0 {
-		event.Int("reused_state_cells", reusedStateCells)
-	}
 	addCellProgress(event, 0, p.total)
 	event.Msg("persisting state cells")
 }
@@ -495,7 +517,6 @@ func (p *stateCellSaveProgress) logProgress(done bool, now time.Time) {
 		Str("source", p.source).
 		Int64("processed_cells", p.processed).
 		Int64("applied_cells", p.applied).
-		Int64("skipped_reused_state_cells", p.skippedReusedState).
 		Int64("skipped_existing_cells", p.skippedExisting).
 		Int64("bytes", p.bytesWritten).
 		Uint64("total_cells", p.total).
@@ -509,96 +530,47 @@ func (p *stateCellSaveProgress) logProgress(done bool, now time.Time) {
 	event.Int("pending_batch_cells", p.writer.pendingCells()).Msg("state cell persistence progress")
 }
 
-type stateCellReuseIndex struct {
-	cells map[cell.Hash]*cell.Cell
-	refs  map[stateCellReusedRefKey]cell.MerkleUpdateReusedRef
-}
-
-func newStateCellReuseIndex(cells []cell.MerkleUpdateReusedCell, refs []cell.MerkleUpdateReusedRef) stateCellReuseIndex {
-	var index stateCellReuseIndex
-	if len(cells) > 0 {
-		index.cells = make(map[cell.Hash]*cell.Cell, len(cells))
-		for _, reused := range cells {
-			if reused.Cell != nil {
-				index.cells[reused.Hash] = reused.Cell
-			}
-		}
-	}
-	if len(refs) > 0 {
-		index.refs = make(map[stateCellReusedRefKey]cell.MerkleUpdateReusedRef, len(refs))
-		for _, reusedRef := range refs {
-			if reusedRef.RawCell == nil || reusedRef.RefIndex < 0 || reusedRef.RefIndex >= 4 {
-				continue
-			}
-			index.refs[stateCellReusedRefKey{
-				parentHash: reusedRef.ParentHash,
-				refIndex:   reusedRef.RefIndex,
-			}] = reusedRef
-		}
-	}
-	return index
-}
-
-func (r stateCellReuseIndex) cell(hash cell.Hash) (*cell.Cell, bool) {
-	if r.cells == nil {
-		return nil, false
-	}
-	raw, ok := r.cells[hash]
-	return raw, ok
-}
-
-func (r stateCellReuseIndex) ref(parentHash cell.Hash, refIndex int) (cell.MerkleUpdateReusedRef, bool) {
-	if r.refs == nil {
-		return cell.MerkleUpdateReusedRef{}, false
-	}
-	reusedRef, ok := r.refs[stateCellReusedRefKey{
-		parentHash: parentHash,
-		refIndex:   refIndex,
-	}]
-	return reusedRef, ok
-}
-
-func (r stateCellReuseIndex) cellExists(writer *stateCellBatchWriter, hash cell.Hash) (bool, error) {
-	raw, ok := r.cell(hash)
-	if !ok {
-		return false, nil
-	}
-	if raw.IsLazy() {
-		return true, nil
-	}
-	exists, err := writer.has(hash)
-	if err != nil {
-		return false, err
-	}
-	return exists, nil
-}
-
-func stateCellRefs(cl *cell.Cell) ([]cell.RefMetadata, error) {
-	meta := cl.GetMetadata()
+func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*cell.Cell, error) {
 	if len(meta.Refs) > 4 {
-		return nil, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
+		return nil, [4]*cell.Cell{}, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
 	}
-	return meta.Refs, nil
+
+	refs := append([]cell.RefMetadata(nil), meta.Refs...)
+	var refCells [4]*cell.Cell
+	for i := range refs {
+		if refs[i].Lazy {
+			continue
+		}
+
+		refCell, err := cl.PeekRef(i)
+		if err != nil {
+			return nil, [4]*cell.Cell{}, err
+		}
+		refCell = stateCellRefView(cl, refCell)
+		if refCell.GetType() == cell.PrunedCellType {
+			refs[i].Lazy = true
+			continue
+		}
+		refCells[i] = refCell
+	}
+	return refs, refCells, nil
 }
 
 func stateCellStorageHash(cl *cell.Cell) cell.Hash {
 	return cl.GetMetadata().Hash
 }
 
-func stateCellRefMetadata(cl *cell.Cell) cell.RefMetadata {
-	meta := cl.GetMetadata()
-	return cell.RefMetadata{
-		Hash:      meta.Hash,
-		LevelMask: meta.LevelMask,
-		Hashes:    meta.Hashes,
-		Depths:    meta.Depths,
-		Lazy:      cl.IsLazy(),
+func stateCellRefView(parent *cell.Cell, ref *cell.Cell) *cell.Cell {
+	if parent.IsVirtualized() {
+		return ref
 	}
-}
 
-type stateCellReusedRefKey struct {
-	parentHash cell.Hash
-	refIndex   int
+	effectiveLevel := uint8(0)
+	switch parent.GetType() {
+	case cell.MerkleProofCellType, cell.MerkleUpdateCellType:
+		effectiveLevel = 1
+	}
+	return ref.Virtualize(effectiveLevel)
 }
 
 func cellVisitSetCapacity(totalCells uint64) int {
@@ -682,6 +654,19 @@ func (w *stateCellBatchWriter) add(cl *cell.Cell, meta cell.Metadata, refs []cel
 	}
 	w.exists.set(hash, true)
 	return nil
+}
+
+func (w *stateCellBatchWriter) addStateCell(cl *cell.Cell) ([]cell.RefMetadata, error) {
+	meta := cl.GetMetadata()
+	refs, _, err := stateCellRefs(cl, meta)
+	if err != nil {
+		hash := stateCellStorageHash(cl)
+		return nil, fmt.Errorf("load state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", hash[:], cl.IsLazy(), cl.IsVirtualized(), cl.GetType(), err)
+	}
+	if err := w.add(cl, meta, refs); err != nil {
+		return nil, err
+	}
+	return refs, nil
 }
 
 func stateCellEncodedLen(cl *cell.Cell, refs []cell.RefMetadata) (int, byte, byte, error) {
@@ -866,7 +851,24 @@ func formatCellRate(cells int64, elapsed time.Duration) string {
 }
 
 func (s *Store) SaveCells(records []*storage.CellRecord) error {
-	_, err := s.saveCellRecordBatch(records)
+	encoded := make([]storage.EncodedCellRecord, 0, len(records))
+	for _, record := range records {
+		if record == nil {
+			return fmt.Errorf("cell record is nil")
+		}
+		if len(record.Hash) != 32 {
+			return fmt.Errorf("cell record hash size mismatch: %d", len(record.Hash))
+		}
+
+		var hash cell.Hash
+		copy(hash[:], record.Hash)
+		encoded = append(encoded, storage.EncodedCellRecord{
+			Hash: hash,
+			Data: encodeCellRecord(record),
+		})
+	}
+
+	_, err := s.saveCellRecordBatch(context.Background(), encoded, true)
 	return err
 }
 
@@ -876,7 +878,15 @@ type cellRecordBatchStats struct {
 	bytes   int64
 }
 
-func (s *Store) saveCellRecordBatch(records []*storage.CellRecord) (cellRecordBatchStats, error) {
+func (s *Store) savePreparedStateCellRecords(ctx context.Context, records []storage.EncodedCellRecord) (bool, error) {
+	stats, err := s.saveCellRecordBatch(ctx, records, false)
+	if err != nil {
+		return false, err
+	}
+	return stats.written > 0, nil
+}
+
+func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.EncodedCellRecord, sync bool) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
 	if len(records) == 0 {
 		return stats, nil
@@ -893,35 +903,45 @@ func (s *Store) saveCellRecordBatch(records []*storage.CellRecord) (cellRecordBa
 	defer writer.close()
 
 	written := make(map[cell.Hash]struct{}, len(records))
-	for _, record := range records {
-		switch {
-		case record == nil:
-			return stats, fmt.Errorf("cell record is nil")
-		case len(record.Hash) != 32:
-			return stats, fmt.Errorf("cell record hash size mismatch: %d", len(record.Hash))
+	for i, record := range records {
+		if i&0x3fff == 0 {
+			select {
+			case <-ctx.Done():
+				return stats, ctx.Err()
+			default:
+			}
 		}
 
-		var hashKey cell.Hash
-		copy(hashKey[:], record.Hash)
-		if _, ok := written[hashKey]; ok {
+		if len(record.Data) == 0 {
+			return stats, fmt.Errorf("encoded cell record is empty")
+		}
+
+		if _, ok := written[record.Hash]; ok {
 			stats.skipped++
 			continue
 		}
 
-		val := encodeCellRecord(record)
-		if err := writer.set(record.Hash, val); err != nil {
+		if err := writer.set(record.Hash[:], record.Data); err != nil {
 			return stats, err
 		}
 		stats.written++
-		stats.bytes += int64(len(val))
-		written[hashKey] = struct{}{}
+		stats.bytes += int64(len(record.Data))
+		written[record.Hash] = struct{}{}
+
+		if writer.bytesInBatch >= stateCellImportBatchTargetBytes {
+			if _, err := writer.flush(); err != nil {
+				return stats, err
+			}
+		}
 	}
 
 	if _, err := writer.flush(); err != nil {
 		return stats, err
 	}
-	if err := s.cells.flush(); err != nil {
-		return stats, err
+	if sync {
+		if err := s.cells.flush(); err != nil {
+			return stats, err
+		}
 	}
 	return stats, nil
 }
@@ -953,6 +973,10 @@ func (s *Store) LazyCellLoader() cell.LazyCellLoader {
 }
 
 func (s *Store) loadLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	if loaded, ok := s.cellCache.get(hash); ok {
+		return loaded, nil
+	}
+
 	raw, err := s.getCellCopy(ctx, hash)
 	if err != nil {
 		return nil, err
@@ -961,5 +985,6 @@ func (s *Store) loadLazyCell(ctx context.Context, hash []byte) (*cell.Cell, erro
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}
+	s.cellCache.set(hash, loaded)
 	return loaded, nil
 }

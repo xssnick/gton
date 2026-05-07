@@ -110,7 +110,7 @@ func TestArchiveCatchUpTargetByTimeCapsLookahead(t *testing.T) {
 	}
 }
 
-func TestFilteredArchiveImportKeepsOnlyAppliedBlocks(t *testing.T) {
+func TestArchiveImportAppendKeepsAllImportedBlocks(t *testing.T) {
 	master1 := testMasterBlockID(11)
 	master2 := testMasterBlockID(12)
 	future := testMasterBlockID(13)
@@ -128,25 +128,21 @@ func TestFilteredArchiveImportKeepsOnlyAppliedBlocks(t *testing.T) {
 			{Prev: master2, Next: future},
 		},
 	}
-	allowed := map[string]struct{}{
-		storage.BlockKey(master1): {},
-		storage.BlockKey(master2): {},
-		storage.BlockKey(shard):   {},
-	}
 
 	dst := &storage.ServedArchiveImport{}
-	appendFilteredArchiveImport(dst, src, allowed, map[string]struct{}{}, map[string]struct{}{})
+	appendArchiveImport(dst, src, map[string]struct{}{}, map[string]struct{}{})
 
-	if len(dst.FullBlocks) != 3 {
-		t.Fatalf("stored full blocks = %d, want 3", len(dst.FullBlocks))
+	if len(dst.FullBlocks) != 4 {
+		t.Fatalf("stored full blocks = %d, want 4", len(dst.FullBlocks))
 	}
 	if storage.BlockKey(dst.FullBlocks[0].ID) != storage.BlockKey(master1) ||
 		storage.BlockKey(dst.FullBlocks[1].ID) != storage.BlockKey(master2) ||
-		storage.BlockKey(dst.FullBlocks[2].ID) != storage.BlockKey(shard) {
+		storage.BlockKey(dst.FullBlocks[2].ID) != storage.BlockKey(future) ||
+		storage.BlockKey(dst.FullBlocks[3].ID) != storage.BlockKey(shard) {
 		t.Fatalf("unexpected stored full block order: %v", dst.FullBlocks)
 	}
-	if len(dst.Links) != 1 || !dst.Links[0].Prev.Equals(&master1) || !dst.Links[0].Next.Equals(&master2) {
-		t.Fatalf("stored links = %+v, want only master1->master2", dst.Links)
+	if len(dst.Links) != 2 {
+		t.Fatalf("stored links = %+v, want all links", dst.Links)
 	}
 }
 

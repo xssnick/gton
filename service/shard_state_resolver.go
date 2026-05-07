@@ -11,19 +11,22 @@ import (
 	"flexserver/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const shardStateResolverCacheLimit = 2048
 
 type shardStateApplyFunc func(context.Context, ton.BlockIDExt, []*storage.BlockState, p2p.DownloadedBlock) (*storage.BlockState, error)
+type shardStateAfterApplyFunc func(context.Context, *storage.BlockState, p2p.DownloadedBlock, time.Duration) error
 
 type shardStateResolverConfig struct {
-	current   map[storage.ShardKey]storage.BlockState
-	cache     map[string]*storage.BlockState
-	loadState func(context.Context, storage.BlockState) (*storage.BlockState, error)
-	loadBlock shardBlockLoader
-	apply     shardStateApplyFunc
-	save      func(context.Context, *storage.BlockState) error
+	current         map[storage.ShardKey]storage.BlockState
+	cache           map[string]*storage.BlockState
+	loadState       func(context.Context, storage.BlockState) (*storage.BlockState, error)
+	loadBlock       shardBlockLoader
+	apply           shardStateApplyFunc
+	afterApplyState shardStateAfterApplyFunc
+	save            func(context.Context, *storage.BlockState) error
 }
 
 type shardStateResolverTask struct {
@@ -36,18 +39,18 @@ type shardStateResolverStats struct {
 	applyElapsed  time.Duration
 	blocksApplied int
 	blocksReused  int
-	appliedBlocks []ton.BlockIDExt
 }
 
 type shardStateResolver struct {
 	ctx context.Context
 
-	current   map[storage.ShardKey]storage.BlockState
-	cache     map[string]*storage.BlockState
-	loadState func(context.Context, storage.BlockState) (*storage.BlockState, error)
-	loadBlock shardBlockLoader
-	apply     shardStateApplyFunc
-	save      func(context.Context, *storage.BlockState) error
+	current         map[storage.ShardKey]storage.BlockState
+	cache           map[string]*storage.BlockState
+	loadState       func(context.Context, storage.BlockState) (*storage.BlockState, error)
+	loadBlock       shardBlockLoader
+	apply           shardStateApplyFunc
+	afterApplyState shardStateAfterApplyFunc
+	save            func(context.Context, *storage.BlockState) error
 
 	mu    sync.Mutex
 	tasks map[string]*shardStateResolverTask
@@ -61,14 +64,15 @@ func newShardStateResolver(ctx context.Context, cfg shardStateResolverConfig) *s
 	}
 
 	return &shardStateResolver{
-		ctx:       ctx,
-		current:   cfg.current,
-		cache:     cache,
-		loadState: cfg.loadState,
-		loadBlock: cfg.loadBlock,
-		apply:     cfg.apply,
-		save:      cfg.save,
-		tasks:     map[string]*shardStateResolverTask{},
+		ctx:             ctx,
+		current:         cfg.current,
+		cache:           cache,
+		loadState:       cfg.loadState,
+		loadBlock:       cfg.loadBlock,
+		apply:           cfg.apply,
+		afterApplyState: cfg.afterApplyState,
+		save:            cfg.save,
+		tasks:           map[string]*shardStateResolverTask{},
 	}
 }
 
@@ -167,7 +171,13 @@ func (r *shardStateResolver) resolveOwned(block ton.BlockIDExt) (*storage.BlockS
 	if err != nil {
 		return nil, err
 	}
-	r.markApplied(block, applyElapsed)
+	r.markApplied(next, applyElapsed)
+
+	if r.afterApplyState != nil {
+		if err = r.afterApplyState(r.ctx, next, downloaded, applyElapsed); err != nil {
+			return nil, err
+		}
+	}
 
 	if r.save != nil {
 		if err = r.save(r.ctx, next); err != nil {
@@ -230,20 +240,17 @@ func (r *shardStateResolver) markReused() {
 	r.mu.Unlock()
 }
 
-func (r *shardStateResolver) markApplied(block ton.BlockIDExt, elapsed time.Duration) {
+func (r *shardStateResolver) markApplied(state *storage.BlockState, elapsed time.Duration) {
 	r.mu.Lock()
 	r.stats.blocksApplied++
 	r.stats.applyElapsed += elapsed
-	r.stats.appliedBlocks = append(r.stats.appliedBlocks, block)
 	r.mu.Unlock()
 }
 
 func (r *shardStateResolver) statsSnapshot() shardStateResolverStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	stats := r.stats
-	stats.appliedBlocks = append([]ton.BlockIDExt(nil), r.stats.appliedBlocks...)
-	return stats
+	return r.stats
 }
 
 func (r *shardStateResolver) cachedState(block ton.BlockIDExt) (*storage.BlockState, bool) {
@@ -267,7 +274,11 @@ func (r *shardStateResolver) rememberState(state *storage.BlockState) {
 	r.mu.Unlock()
 }
 
-func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, error) {
+func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, error) {
+	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells)
+}
+
+func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock, applier stateUpdateApplier) (*storage.BlockState, error) {
 	downloaded, err := prepareDownloadedBlock(downloaded)
 	if err != nil {
 		return nil, err
@@ -296,11 +307,18 @@ func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDE
 	}
 	event.Msg("applying shard state dependency")
 
-	next, err := ApplyBlockWithPreviousStates(previous, downloaded)
+	next, err := applyBlockWithPreviousStates(previous, downloaded, applier)
 	if err != nil {
 		return nil, fmt.Errorf("apply shard block %s: %w", downloaded.BlockRef(), err)
 	}
 	return next, nil
+}
+
+func (s *Service) stateCellLoader() cell.LazyCellLoader {
+	if s == nil || s.storage == nil {
+		return nil
+	}
+	return s.storage.LazyCellLoader()
 }
 
 func shardTransitionKind(target ton.BlockIDExt, prevRefs []ton.BlockIDExt) string {

@@ -29,10 +29,6 @@ type BlockState struct {
 	Cell          *cell.Cell
 	Parsed        *tlb.ShardStateUnsplit
 	DownloadedAt  time.Time
-	// ReusedStateCells contains old-state subtree roots reused by MERKLE_UPDATE application.
-	ReusedStateCells []cell.MerkleUpdateReusedCell
-	// ReusedStateRefs contains parent ref edges whose child was reused by MERKLE_UPDATE application.
-	ReusedStateRefs []cell.MerkleUpdateReusedRef
 }
 
 type CurrentState struct {

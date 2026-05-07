@@ -274,8 +274,18 @@ func TestSimpleBroadcastSignatureMatchesReferenceShape(t *testing.T) {
 }
 
 func TestDecodeCompressedBlock(t *testing.T) {
-	proofCell := cell.BeginCell().MustStoreUInt(0xAA, 8).EndCell()
 	blockCell := cell.BeginCell().MustStoreUInt(0xBB, 8).EndCell()
+	blockData := serializeCompressedBlockRoot(blockCell)
+	fileHash := sha256.Sum256(blockData)
+	blockHash := blockCell.HashKey()
+	id := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     1,
+		RootHash:  blockHash[:],
+		FileHash:  fileHash[:],
+	}
+	proofCell := testBlockProofCell(t, id, nil)
 
 	multiRoot := cell.ToBOCWithOptions([]*cell.Cell{proofCell, blockCell}, cell.BOCSerializeOptions{WithCRC32C: true})
 	compressed := make([]byte, lz4.CompressBlockBound(len(multiRoot)))
@@ -285,19 +295,10 @@ func TestDecodeCompressedBlock(t *testing.T) {
 	}
 	compressed = compressed[:n]
 
-	blockData := blockCell.ToBOCWithOptions(cell.BOCSerializeOptions{})
-	fileHash := sha256.Sum256(blockData)
-	blockHash := blockCell.HashKey()
-
 	res, err := decodeCompressedBlock(DataFullCompressed{
-		ID: ton.BlockIDExt{
-			Workchain: 0,
-			Shard:     topShard,
-			SeqNo:     1,
-			RootHash:  blockHash[:],
-			FileHash:  fileHash[:],
-		},
+		ID:         id,
 		Compressed: compressed,
+		IsLink:     true,
 	})
 	if err != nil {
 		t.Fatalf("decode compressed block: %v", err)
@@ -326,28 +327,29 @@ func TestDecodeCompressedBlock(t *testing.T) {
 }
 
 func TestDecodeCompressedBlockV2(t *testing.T) {
-	proofCell := cell.BeginCell().MustStoreUInt(0xCC, 8).EndCell()
 	blockCell := cell.BeginCell().MustStoreUInt(0xDD, 8).EndCell()
+	blockData := serializeCompressedBlockRoot(blockCell)
+	fileHash := sha256.Sum256(blockData)
+	blockHash := blockCell.HashKey()
+	id := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     2,
+		RootHash:  blockHash[:],
+		FileHash:  fileHash[:],
+	}
+	proofCell := testBlockProofCell(t, id, nil)
 
 	compressed, err := cell.CompressBOC([]*cell.Cell{blockCell}, cell.CompressionImprovedStructureLZ4, nil)
 	if err != nil {
 		t.Fatalf("compress block boc v2: %v", err)
 	}
 
-	blockData := blockCell.ToBOCWithOptions(cell.BOCSerializeOptions{})
-	fileHash := sha256.Sum256(blockData)
-	blockHash := blockCell.HashKey()
-
 	res, err := decodeCompressedBlockV2(DataFullCompressedV2{
-		ID: ton.BlockIDExt{
-			Workchain: 0,
-			Shard:     topShard,
-			SeqNo:     2,
-			RootHash:  blockHash[:],
-			FileHash:  fileHash[:],
-		},
+		ID:              id,
 		Proof:           proofCell.ToBOC(),
 		BlockCompressed: compressed,
+		IsLink:          true,
 	}, nil)
 	if err != nil {
 		t.Fatalf("decode compressed block v2: %v", err)
@@ -362,4 +364,35 @@ func TestDecodeCompressedBlockV2(t *testing.T) {
 	if res.Block == nil || res.Block.HashKey() != blockCell.HashKey() {
 		t.Fatalf("block hash mismatch")
 	}
+}
+
+func testBlockProofCell(t *testing.T, id ton.BlockIDExt, signatures *cell.Cell) *cell.Cell {
+	t.Helper()
+	if id.Shard != topShard {
+		t.Fatalf("test proof helper supports only top shard, got %016x", uint64(id.Shard))
+	}
+
+	return cell.BeginCell().
+		MustStoreUInt(0xc3, 8).
+		MustStoreUInt(0, 2).
+		MustStoreUInt(0, 6).
+		MustStoreUInt(uint64(uint32(id.Workchain)), 32).
+		MustStoreUInt(0, 64).
+		MustStoreUInt(uint64(id.SeqNo), 32).
+		MustStoreSlice(id.RootHash, 256).
+		MustStoreSlice(id.FileHash, 256).
+		MustStoreRef(cell.BeginCell().EndCell()).
+		MustStoreMaybeRef(signatures).
+		EndCell()
+}
+
+func testProofSignatureSet() *cell.Cell {
+	return cell.BeginCell().
+		MustStoreUInt(0x11, 8).
+		MustStoreUInt(0, 32).
+		MustStoreUInt(0, 32).
+		MustStoreUInt(0, 32).
+		MustStoreUInt(0, 64).
+		MustStoreDict(nil).
+		EndCell()
 }

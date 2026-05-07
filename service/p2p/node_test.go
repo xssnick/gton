@@ -96,20 +96,56 @@ func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
 	}
 }
 
-func TestTrustedInitBlockRequiresFullBlockID(t *testing.T) {
+func TestZeroStateBlockRequiresConfiguredZeroState(t *testing.T) {
 	node := newTestNode(t)
 
-	if _, err := node.TrustedInitBlock(); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("empty trusted init block error = %v, want ErrNotFound", err)
+	if _, err := node.ZeroStateBlock(); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty zero state block error = %v, want ErrNotFound", err)
 	}
 
-	node.trustedInitBlock = testBlockID(-1, topShard, 0)
-	got, err := node.TrustedInitBlock()
+	node.zeroStateBlock = testBlockID(-1, topShard, 0)
+	got, err := node.ZeroStateBlock()
 	if err != nil {
-		t.Fatalf("trusted init block: %v", err)
+		t.Fatalf("zero state block: %v", err)
 	}
-	if !got.Equals(&node.trustedInitBlock) {
-		t.Fatalf("trusted init block = %+v, want %+v", got, node.trustedInitBlock)
+	if !got.Equals(&node.zeroStateBlock) {
+		t.Fatalf("zero state block = %+v, want %+v", got, node.zeroStateBlock)
+	}
+}
+
+func TestInitBlockRequiresConfiguredInitBlock(t *testing.T) {
+	node := newTestNode(t)
+
+	if _, err := node.InitBlock(); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty init block error = %v, want ErrNotFound", err)
+	}
+
+	node.initBlock = testBlockID(-1, topShard, 100)
+	got, err := node.InitBlock()
+	if err != nil {
+		t.Fatalf("init block: %v", err)
+	}
+	if !got.Equals(&node.initBlock) {
+		t.Fatalf("init block = %+v, want %+v", got, node.initBlock)
+	}
+}
+
+func TestInitBlockFromConfigFallsBackToZeroStateWhenMissing(t *testing.T) {
+	zeroConfig := liteclient.ConfigBlock{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     0,
+		RootHash:  bytes.Repeat([]byte{0x01}, 32),
+		FileHash:  bytes.Repeat([]byte{0x02}, 32),
+	}
+	zero := blockIDFromConfig(zeroConfig)
+
+	init, err := initBlockFromConfig(liteclient.ConfigBlock{}, zero)
+	if err != nil {
+		t.Fatalf("init block from empty config: %v", err)
+	}
+	if !init.Equals(&zero) {
+		t.Fatalf("init block = %+v, want zero %+v", init, zero)
 	}
 }
 

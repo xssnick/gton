@@ -7,6 +7,7 @@ import (
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -41,7 +42,7 @@ func decodeBroadcastBlock(msg any) (*DownloadedBlock, error) {
 			return nil, err
 		}
 
-		block, err := normalizeDownloadedBlock("tonNode.blockBroadcast", data.ID, data.Proof, data.Data, false, true, nil)
+		block, err := normalizeDownloadedBlock("tonNode.blockBroadcast", data.ID, data.Proof, data.Data, broadcastProofIsLink(data.ID), true, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -85,9 +86,9 @@ func decodeBlockBroadcastCompressed(data BlockBroadcastCompressed) (*DownloadedB
 	}
 
 	proof := cell.ToBOCWithOptions([]*cell.Cell{roots[0]}, cell.BOCSerializeOptions{WithCRC32C: false})
-	blockBOC, _ := serializeBlockRootBestEffort(roots[1], data.ID.FileHash)
+	blockBOC := serializeCompressedBlockRoot(roots[1])
 
-	block, err := normalizeDownloadedBlock("tonNode.blockBroadcastCompressed", data.ID, proof, blockBOC, false, false, roots[1])
+	block, err := normalizeDownloadedBlock("tonNode.blockBroadcastCompressed", data.ID, proof, blockBOC, broadcastProofIsLink(data.ID), true, roots[1])
 	if err != nil {
 		return nil, err
 	}
@@ -117,13 +118,17 @@ func decodeBlockBroadcastCompressedV2(data BlockBroadcastCompressedV2, state *ce
 		return nil, fmt.Errorf("expected 1 root in tonNode.blockBroadcastCompressedV2, got %d", len(roots))
 	}
 
-	blockBOC, _ := serializeBlockRootBestEffort(roots[0], data.ID.FileHash)
-	block, err := normalizeDownloadedBlock("tonNode.blockBroadcastCompressedV2", data.ID, data.Proof, blockBOC, false, false, roots[0])
+	blockBOC := serializeCompressedBlockRoot(roots[0])
+	block, err := normalizeDownloadedBlock("tonNode.blockBroadcastCompressedV2", data.ID, data.Proof, blockBOC, broadcastProofIsLink(data.ID), true, roots[0])
 	if err != nil {
 		return nil, err
 	}
 	block.BroadcastSignatures = signatures
 	return block, nil
+}
+
+func broadcastProofIsLink(id ton.BlockIDExt) bool {
+	return id.Workchain != -1 || id.Shard != topShard
 }
 
 func broadcastSignatureSetCell(sigSet any) (*cell.Cell, error) {

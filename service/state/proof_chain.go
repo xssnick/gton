@@ -5,15 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
-	"os"
 	"time"
 
-	"flexserver/service/archive"
 	"flexserver/service/blockproof"
 	"flexserver/service/p2p"
 	"flexserver/service/storage"
 
-	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -41,33 +38,26 @@ type keyBlockCandidate struct {
 }
 
 func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	initBlock, err := s.source.TrustedInitBlock(ctx)
+	trusted, err := s.trustedKeyBlockAnchor(ctx)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
 
-	blocks, err := s.keyBlockIDs(ctx, initBlock)
+	blocks, err := s.keyBlockIDs(ctx, trusted.block)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
-	if len(blocks) == 0 {
-		return ton.BlockIDExt{}, fmt.Errorf("key block walk returned no blocks")
-	}
-
-	latestKey := blocks[len(blocks)-1]
-	if len(blocks) == 1 {
-		s.log.Debug().
-			Str("block", storage.FormatBlockRef(initBlock)).
-			Msg("using trusted init masterchain block for state snapshot")
-		return initBlock, nil
+	latestKey := trusted.block
+	if len(blocks) > 0 {
+		latestKey = blocks[len(blocks)-1]
 	}
 
 	s.log.Info().
-		Str("from", storage.FormatBlockRef(initBlock)).
+		Str("from", storage.FormatBlockRef(trusted.block)).
 		Str("latest_key", storage.FormatBlockRef(latestKey)).
 		Msg("verifying key block chain for persistent state selection")
 
-	candidates, trusted, err := s.verifiedKeyBlockCandidates(ctx, initBlock, blocks)
+	candidates, trusted, err := s.verifiedKeyBlockCandidates(ctx, trusted, blocks)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -80,27 +70,125 @@ func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt
 		return block, nil
 	}
 
-	s.log.Info().
-		Str("block", storage.FormatBlockRef(trusted.block)).
-		Int("key_blocks", len(candidates)).
-		Msg("using latest verified key block for state snapshot")
-	return trusted.block, nil
+	return ton.BlockIDExt{}, fmt.Errorf(
+		"no persistent key block state snapshot candidate: latest_verified=%s key_blocks=%d min_age=%s download_window=%s",
+		storage.FormatBlockRef(trusted.block),
+		len(candidates),
+		initialStateMinAge,
+		initialStateDownloadWindow,
+	)
 }
 
-func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, initBlock ton.BlockIDExt, blocks []ton.BlockIDExt) ([]keyBlockCandidate, trustedKeyBlock, error) {
-	trusted, err := s.trustedInitKeyBlock(ctx, initBlock)
+func (s *Syncer) trustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, error) {
+	var trusted trustedKeyBlock
+	var err error
+	if s.fromZero {
+		zeroBlock, err := s.source.ZeroStateBlock(ctx)
+		if err != nil {
+			return trustedKeyBlock{}, err
+		}
+		trusted, err = s.trustedZeroState(ctx, zeroBlock)
+	} else {
+		initBlock, err := s.source.InitBlock(ctx)
+		if err != nil {
+			return trustedKeyBlock{}, err
+		}
+		if initBlock.SeqNo == 0 {
+			trusted, err = s.trustedZeroState(ctx, initBlock)
+		} else {
+			trusted, err = s.trustedInitBlock(ctx, initBlock)
+		}
+	}
 	if err != nil {
-		return nil, trustedKeyBlock{}, err
+		return trustedKeyBlock{}, err
 	}
 
-	candidates := []keyBlockCandidate{{
-		block: trusted.block,
-		utime: trusted.utime,
-	}}
+	resumed, err := s.resumeTrustedKeyBlockAnchor(ctx, trusted)
+	if err == nil {
+		return resumed, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return trustedKeyBlock{}, err
+	}
+	return trusted, nil
+}
 
-	latest := blocks[len(blocks)-1]
+func (s *Syncer) resumeTrustedKeyBlockAnchor(ctx context.Context, trusted trustedKeyBlock) (trustedKeyBlock, error) {
+	progress, err := s.storage.VerifiedKeyBlockProgress(ctx)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return trustedKeyBlock{}, storage.ErrNotFound
+		}
+		return trustedKeyBlock{}, fmt.Errorf("load verified key block progress: %w", err)
+	}
+	if progress.Workchain != -1 || progress.Shard != masterchainShard || progress.SeqNo <= trusted.block.SeqNo {
+		return trustedKeyBlock{}, storage.ErrNotFound
+	}
+
+	resumed, err := s.trustedKeyBlockFromStoredProof(ctx, progress)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			s.log.Debug().
+				Str("block", storage.FormatBlockRef(progress)).
+				Msg("verified key block progress has no stored full proof, starting from configured anchor")
+			return trustedKeyBlock{}, storage.ErrNotFound
+		}
+		return trustedKeyBlock{}, err
+	}
+
 	s.log.Info().
-		Str("from", storage.FormatBlockRef(initBlock)).
+		Str("configured_anchor", storage.FormatBlockRef(trusted.block)).
+		Str("verified_key", storage.FormatBlockRef(resumed.block)).
+		Uint32("utime", resumed.utime).
+		Msg("resuming key block proof verification from stored progress")
+	return resumed, nil
+}
+
+func (s *Syncer) trustedKeyBlockFromStoredProof(ctx context.Context, block ton.BlockIDExt) (trustedKeyBlock, error) {
+	proofs, ok := s.storage.(storage.PeerServingStorage)
+	if !ok {
+		return trustedKeyBlock{}, storage.ErrNotFound
+	}
+
+	proof, err := proofs.BlockProof(ctx, storage.ServedProofKeyBlock, block)
+	if err != nil {
+		return trustedKeyBlock{}, err
+	}
+
+	parsed, err := blockproof.ParseBOC(block, proof)
+	if err != nil {
+		return trustedKeyBlock{}, fmt.Errorf("parse stored verified key block proof %s: %w", storage.FormatBlockRef(block), err)
+	}
+	if !parsed.Block.BlockInfo.KeyBlock {
+		return trustedKeyBlock{}, fmt.Errorf("stored verified key block proof %s is not a key block", storage.FormatBlockRef(block))
+	}
+
+	cfg, err := blockproof.ConfigFromKeyBlock(parsed.Block)
+	if err != nil {
+		return trustedKeyBlock{}, fmt.Errorf("load stored verified key block config %s: %w", storage.FormatBlockRef(block), err)
+	}
+	return trustedKeyBlock{
+		block:  block,
+		config: cfg,
+		utime:  parsed.Block.BlockInfo.GenUtime,
+	}, nil
+}
+
+func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trustedKeyBlock, blocks []ton.BlockIDExt) ([]keyBlockCandidate, trustedKeyBlock, error) {
+	candidates := make([]keyBlockCandidate, 0, len(blocks)+1)
+	if trusted.block.SeqNo > 0 {
+		candidates = append(candidates, keyBlockCandidate{
+			block: trusted.block,
+			utime: trusted.utime,
+		})
+	}
+
+	latest := trusted.block
+	if len(blocks) > 0 {
+		latest = blocks[len(blocks)-1]
+	}
+	s.log.Info().
+		Str("from", storage.FormatBlockRef(trusted.block)).
 		Str("latest_key", storage.FormatBlockRef(latest)).
 		Int("key_blocks", len(blocks)).
 		Msg("downloaded key block ids for persistent state selection")
@@ -133,12 +221,17 @@ func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, initBlock ton.B
 		})
 		verified++
 
-		if shouldLogKeyBlockProgress(verified, len(blocks)-1) {
+		if shouldSaveKeyBlockProgress(verified, len(blocks)) {
+			if err = s.storage.SaveVerifiedKeyBlockProgress(ctx, trusted.block); err != nil {
+				return nil, trustedKeyBlock{}, fmt.Errorf("save verified key block progress %s: %w", storage.FormatBlockRef(trusted.block), err)
+			}
+		}
+		if shouldLogKeyBlockProgress(verified, len(blocks)) {
 			s.log.Info().
 				Str("block", storage.FormatBlockRef(trusted.block)).
 				Str("latest", storage.FormatBlockRef(latest)).
 				Int("verified", verified).
-				Int("key_blocks", len(blocks)-1).
+				Int("key_blocks", len(blocks)).
 				Msg("key block proof verification progress")
 		}
 	}
@@ -151,109 +244,93 @@ func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, initBlock ton.B
 	return candidates, trusted, nil
 }
 
-func (s *Syncer) trustedInitKeyBlock(ctx context.Context, initBlock ton.BlockIDExt) (trustedKeyBlock, error) {
+func (s *Syncer) trustedZeroState(ctx context.Context, zeroBlock ton.BlockIDExt) (trustedKeyBlock, error) {
 	s.log.Info().
-		Str("block", storage.FormatBlockRef(initBlock)).
-		Msg("downloading trusted init block proof link")
+		Str("block", storage.FormatBlockRef(zeroBlock)).
+		Msg("loading trusted zero state")
 
-	proof, err := s.source.TrustedInitProof(ctx, initBlock)
+	downloaded, err := s.source.ZeroState(ctx, zeroBlock)
 	if err != nil {
-		return trustedKeyBlock{}, fmt.Errorf("download trusted init block proof link %s: %w", storage.FormatBlockRef(initBlock), err)
+		return trustedKeyBlock{}, fmt.Errorf("download zero state %s: %w", storage.FormatBlockRef(zeroBlock), err)
+	}
+	defer func() {
+		if cleanupErr := downloaded.Cleanup(); cleanupErr != nil {
+			s.log.Warn().
+				Err(cleanupErr).
+				Str("block", storage.FormatBlockRef(zeroBlock)).
+				Msg("failed to cleanup zero state")
+		}
+	}()
+
+	downloadedBlock := downloaded.Block()
+	if !downloadedBlock.Equals(&zeroBlock) {
+		return trustedKeyBlock{}, fmt.Errorf("zero state artifact is for %s, expected %s", storage.FormatBlockRef(downloadedBlock), storage.FormatBlockRef(zeroBlock))
 	}
 
-	parsed, err := blockproof.ParseBOC(initBlock, proof)
+	state, err := downloaded.Decode(ctx)
 	if err != nil {
-		return trustedKeyBlock{}, fmt.Errorf("parse trusted init block proof link %s: %w", storage.FormatBlockRef(initBlock), err)
+		return trustedKeyBlock{}, fmt.Errorf("decode zero state %s: %w", storage.FormatBlockRef(zeroBlock), err)
+	}
+	cfg, err := blockproof.ConfigFromMasterchainState(state)
+	if err != nil {
+		return trustedKeyBlock{}, fmt.Errorf("load zero state config %s: %w", storage.FormatBlockRef(zeroBlock), err)
+	}
+
+	utime := uint32(0)
+	if state.Parsed != nil {
+		utime = state.Parsed.GenUTime
+	}
+	s.log.Info().
+		Str("block", storage.FormatBlockRef(zeroBlock)).
+		Uint32("utime", utime).
+		Msg("trusted zero state config loaded")
+	return trustedKeyBlock{
+		block:  zeroBlock,
+		config: cfg,
+		utime:  utime,
+	}, nil
+}
+
+func (s *Syncer) trustedInitBlock(ctx context.Context, block ton.BlockIDExt) (trustedKeyBlock, error) {
+	if block.Workchain != -1 || block.Shard != masterchainShard {
+		return trustedKeyBlock{}, fmt.Errorf("expected masterchain init block, got %s", storage.FormatBlockRef(block))
+	}
+
+	s.log.Info().
+		Str("block", storage.FormatBlockRef(block)).
+		Msg("loading trusted init block proof link")
+
+	proof, err := s.source.InitBlockProof(ctx, block)
+	if err != nil {
+		return trustedKeyBlock{}, fmt.Errorf("download trusted init block proof %s: %w", storage.FormatBlockRef(block), err)
+	}
+
+	parsed, err := blockproof.ParseBOC(block, proof.Data)
+	if err != nil {
+		return trustedKeyBlock{}, err
 	}
 	if !parsed.Block.BlockInfo.KeyBlock {
-		return trustedKeyBlock{}, fmt.Errorf("trusted init block %s is not a key block", storage.FormatBlockRef(initBlock))
+		return trustedKeyBlock{}, fmt.Errorf("trusted init block %s is not a key block", storage.FormatBlockRef(block))
 	}
 
 	cfg, err := blockproof.ConfigFromKeyBlock(parsed.Block)
 	if err != nil {
-		return trustedKeyBlock{}, fmt.Errorf("load trusted init key block config %s: %w", storage.FormatBlockRef(initBlock), err)
+		return trustedKeyBlock{}, fmt.Errorf("load trusted init block config %s: %w", storage.FormatBlockRef(block), err)
+	}
+	if err = s.saveKeyBlockProofDownload(block, proof); err != nil {
+		return trustedKeyBlock{}, err
 	}
 
 	s.log.Info().
-		Str("block", storage.FormatBlockRef(initBlock)).
+		Str("block", storage.FormatBlockRef(block)).
 		Uint32("utime", parsed.Block.BlockInfo.GenUtime).
-		Msg("trusted init block proof link verified by global config hash")
+		Bool("proof_link", proof.Link).
+		Msg("trusted init block config loaded")
 	return trustedKeyBlock{
-		block:  initBlock,
+		block:  block,
 		config: cfg,
 		utime:  parsed.Block.BlockInfo.GenUtime,
 	}, nil
-}
-
-func (s *P2PSource) TrustedInitProof(ctx context.Context, initBlock ton.BlockIDExt) ([]byte, error) {
-	downloaded, err := s.node.DownloadBlockProof(ctx, initBlock, true)
-	if err == nil {
-		return downloaded.Data, nil
-	}
-	if errors.Is(err, context.Canceled) {
-		return nil, err
-	}
-
-	s.log.Info().
-		Err(err).
-		Str("block", storage.FormatBlockRef(initBlock)).
-		Msg("trusted init proof unavailable from proof endpoint, trying archive package")
-
-	return s.trustedInitProofFromArchive(ctx, initBlock)
-}
-
-func (s *P2PSource) trustedInitProofFromArchive(ctx context.Context, initBlock ton.BlockIDExt) ([]byte, error) {
-	downloaded, err := s.node.DownloadArchive(ctx, initBlock.SeqNo, archive.ShardIDFromBlock(initBlock), "")
-	if err != nil {
-		return nil, err
-	}
-	defer cleanupDownloadedArchiveFile(s.log, downloaded)
-
-	proof, err := trustedInitProofFromArchiveImport(initBlock, downloaded.Imported)
-	if err != nil {
-		return nil, fmt.Errorf("read trusted init proof from archive #%d: %w", downloaded.ArchiveID, err)
-	}
-
-	s.log.Info().
-		Str("block", storage.FormatBlockRef(initBlock)).
-		Int64("archive_id", downloaded.ArchiveID).
-		Str("peer", downloaded.Peer).
-		Msg("loaded trusted init proof from archive package")
-	return proof, nil
-}
-
-func trustedInitProofFromArchiveImport(block ton.BlockIDExt, imported *archive.Imported) ([]byte, error) {
-	if imported == nil {
-		return nil, storage.ErrNotFound
-	}
-
-	for _, full := range imported.FullBlocks {
-		if full.ID.Equals(&block) && len(full.Proof) > 0 {
-			return append([]byte(nil), full.Proof...), nil
-		}
-	}
-
-	for _, kind := range []storage.ServedProofKind{storage.ServedProofBlockLink, storage.ServedProofBlock, storage.ServedProofKeyBlockLink, storage.ServedProofKeyBlock} {
-		for _, proof := range imported.Proofs {
-			if proof.Kind == kind && proof.ID.Equals(&block) && len(proof.Data) > 0 {
-				return append([]byte(nil), proof.Data...), nil
-			}
-		}
-	}
-
-	return nil, storage.ErrNotFound
-}
-
-func cleanupDownloadedArchiveFile(log zerolog.Logger, downloaded *archive.Downloaded) {
-	if downloaded == nil || downloaded.Path == "" {
-		return
-	}
-	if err := os.Remove(downloaded.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Debug().
-			Err(err).
-			Str("path", downloaded.Path).
-			Msg("failed to remove temporary trusted init archive package")
-	}
 }
 
 func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trusted trustedKeyBlock, block ton.BlockIDExt, requireKey bool) (trustedKeyBlock, error) {
@@ -310,6 +387,9 @@ func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trust
 			return trustedKeyBlock{}, fmt.Errorf("load key block config %s: %w", storage.FormatBlockRef(block), err)
 		}
 		next.config = cfg
+		if err = s.saveVerifiedKeyBlockProof(block, proof); err != nil {
+			return trustedKeyBlock{}, err
+		}
 	}
 
 	s.log.Debug().
@@ -320,13 +400,43 @@ func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trust
 	return next, nil
 }
 
+func (s *Syncer) saveVerifiedKeyBlockProof(block ton.BlockIDExt, proof []byte) error {
+	return s.saveKeyBlockProofDownload(block, p2p.ProofDownload{Data: proof})
+}
+
+func (s *Syncer) saveKeyBlockProofDownload(block ton.BlockIDExt, proof p2p.ProofDownload) error {
+	writer, ok := s.storage.(storage.PeerServingStorageWriter)
+	if !ok {
+		return nil
+	}
+
+	if proof.Link {
+		if err := writer.SaveBlockProof(storage.ServedProofKeyBlockLink, block, proof.Data, nil); err != nil {
+			return fmt.Errorf("store key block proof link %s: %w", storage.FormatBlockRef(block), err)
+		}
+		return nil
+	}
+
+	if err := writer.SaveBlockProof(storage.ServedProofKeyBlock, block, proof.Data, nil); err != nil {
+		return fmt.Errorf("store key block proof %s: %w", storage.FormatBlockRef(block), err)
+	}
+	link, err := blockproof.LinkBOC(block, proof.Data)
+	if err != nil {
+		return fmt.Errorf("derive key block proof link %s: %w", storage.FormatBlockRef(block), err)
+	}
+	if err = writer.SaveBlockProof(storage.ServedProofKeyBlockLink, block, link, nil); err != nil {
+		return fmt.Errorf("store key block proof link %s: %w", storage.FormatBlockRef(block), err)
+	}
+	return nil
+}
+
 func (s *P2PSource) MasterchainProof(ctx context.Context, block ton.BlockIDExt, requireKey bool) ([]byte, error) {
 	if requireKey {
 		s.log.Debug().
 			Str("block", storage.FormatBlockRef(block)).
 			Msg("requesting key block proof")
 
-		downloaded, err := s.node.DownloadKeyBlockProof(ctx, block, false)
+		downloaded, err := s.keyBlockProof(ctx, block, false)
 		if err == nil && !downloaded.Link {
 			return downloaded.Data, nil
 		}
@@ -358,14 +468,14 @@ func (s *P2PSource) MasterchainProof(ctx context.Context, block ton.BlockIDExt, 
 	return downloaded.ProofBOC, nil
 }
 
-func (s *Syncer) keyBlockIDs(ctx context.Context, initBlock ton.BlockIDExt) ([]ton.BlockIDExt, error) {
-	all := []ton.BlockIDExt{initBlock}
-	from := initBlock
+func (s *Syncer) keyBlockIDs(ctx context.Context, fromBlock ton.BlockIDExt) ([]ton.BlockIDExt, error) {
+	var all []ton.BlockIDExt
+	from := fromBlock
 	retries := 0
 
 	for {
 		logEvent := s.log.Debug()
-		if len(all) == 1 || (len(all)-1)%keyBlockProgressInfoEvery == 0 {
+		if len(all) == 0 || len(all)%keyBlockProgressInfoEvery == 0 {
 			logEvent = s.log.Info()
 		}
 		logEvent.
@@ -436,7 +546,7 @@ func (s *Syncer) keyBlockIDs(ctx context.Context, initBlock ton.BlockIDExt) ([]t
 			Int("accepted", accepted).
 			Int("key_blocks", len(all)).
 			Bool("incomplete", batch.Incomplete)
-		if accepted > 0 && (len(all)-1)%keyBlockProgressInfoEvery == 0 {
+		if accepted > 0 && len(all)%keyBlockProgressInfoEvery == 0 {
 			evt = s.log.Info().
 				Str("current", storage.FormatBlockRef(from)).
 				Int("batch", len(batch.Blocks)).
@@ -505,6 +615,10 @@ func persistentStateTTL(ts uint32) uint64 {
 
 func shouldLogKeyBlockProgress(done, total int) bool {
 	return done == 1 || done == total || done%keyBlockProgressInfoEvery == 0
+}
+
+func shouldSaveKeyBlockProgress(done, total int) bool {
+	return shouldLogKeyBlockProgress(done, total)
 }
 
 func isExpectedProofUnavailable(err error) bool {

@@ -189,9 +189,9 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case PrepareBlock:
 		return s.servePrepareBlock(ctx, query.Block)
 	case PrepareBlockProof:
-		return s.servePrepareProof(ctx, query.Block, query.AllowPartial, tnstore.ServedProofBlock, tnstore.ServedProofBlockLink)
+		return s.servePrepareBlockProof(ctx, query.Block, query.AllowPartial)
 	case PrepareKeyBlockProof:
-		return s.servePrepareProof(ctx, query.Block, query.AllowPartial, tnstore.ServedProofKeyBlock, tnstore.ServedProofKeyBlockLink)
+		return s.servePrepareKeyBlockProof(ctx, query.Block, query.AllowPartial)
 	case DownloadBlockProof:
 		return s.serveProofData(ctx, tnstore.ServedProofBlock, query.Block)
 	case DownloadKeyBlockProof:
@@ -211,11 +211,11 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case GetOutMsgQueueProof:
 		return nil, errors.New("not supported yet")
 	case PreparePersistentState:
-		return NotFoundState{}, nil
+		return s.servePreparePersistentState(ctx, query.Block, query.MasterchainBlock)
 	case DownloadPersistentStateSliceV2:
-		return TonNodeData{}, nil
+		return s.servePersistentStateSlice(ctx, query.State, query.Offset, query.MaxSize)
 	case GetPersistentStateSizeV2:
-		return PersistentStateSizeNotFound{}, nil
+		return s.servePersistentStateSize(ctx, query.State)
 	case GetArchiveInfo:
 		return s.serveArchiveInfo(ctx, query.MasterchainSeqno, -1, topShard)
 	case GetShardArchiveInfo:
@@ -245,6 +245,10 @@ func (s *overlaySubscription) serveBlockFull(ctx context.Context, block ton.Bloc
 }
 
 func (s *overlaySubscription) serveNextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (tl.Serializable, error) {
+	if !s.isMasterchainOverlay() && !isMasterchainBlock(prev) {
+		return nil, errors.New("next block allowed only for masterchain")
+	}
+
 	full, err := s.node.peerStorage.NextBlockFull(ctx, prev)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return BlockDescriptionEmpty{}, nil
@@ -275,7 +279,7 @@ func (s *overlaySubscription) serveNextBlockFull(ctx context.Context, prev ton.B
 func (s *overlaySubscription) serveBlockData(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
 	data, err := s.loadStoredBlockData(ctx, block)
 	if errors.Is(err, tnstore.ErrNotFound) {
-		return TonNodeData{}, nil
+		return nil, errors.New("unknown block")
 	}
 	if err != nil {
 		return nil, err
@@ -296,34 +300,68 @@ func (s *overlaySubscription) servePrepareBlock(ctx context.Context, block ton.B
 	return NotFound{}, nil
 }
 
-func (s *overlaySubscription) servePrepareProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool, fullKind tnstore.ServedProofKind, linkKind tnstore.ServedProofKind) (tl.Serializable, error) {
-	_, err := s.node.peerStorage.BlockProof(ctx, fullKind, block)
-	if err == nil {
+func (s *overlaySubscription) servePrepareBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (tl.Serializable, error) {
+	if block.SeqNo == 0 {
+		return nil, errors.New("cannot download proof for zero state")
+	}
+
+	hasFull, err := s.hasStoredProof(ctx, tnstore.ServedProofBlock, block)
+	if err != nil {
+		return nil, err
+	}
+	if isMasterchainBlock(block) && hasFull {
 		return PreparedProof{}, nil
 	}
 
-	if !errors.Is(err, tnstore.ErrNotFound) {
-		return nil, err
+	if !allowPartial && !hasFull {
+		return PreparedProofEmpty{}, nil
 	}
 
-	if allowPartial {
-		_, err = s.node.peerStorage.BlockProof(ctx, linkKind, block)
-		if err == nil {
-			return PreparedProofLink{}, nil
-		}
-
-		if !errors.Is(err, tnstore.ErrNotFound) {
-			return nil, err
-		}
+	hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofBlockLink, block)
+	if err != nil {
+		return nil, err
+	}
+	if hasLink {
+		return PreparedProofLink{}, nil
 	}
 
 	return PreparedProofEmpty{}, nil
 }
 
+func (s *overlaySubscription) servePrepareKeyBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (tl.Serializable, error) {
+	if block.SeqNo == 0 {
+		return nil, errors.New("cannot download proof for zero state")
+	}
+
+	if allowPartial {
+		hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlockLink, block)
+		if err != nil {
+			return nil, err
+		}
+		if hasLink {
+			return PreparedProofLink{}, nil
+		}
+		return PreparedProofEmpty{}, nil
+	}
+
+	hasFull, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlock, block)
+	if err != nil {
+		return nil, err
+	}
+	if hasFull {
+		return PreparedProof{}, nil
+	}
+	return PreparedProofEmpty{}, nil
+}
+
 func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (tl.Serializable, error) {
+	if block.SeqNo == 0 && isKeyBlockProofKind(kind) {
+		return nil, errors.New("cannot download proof for zero state")
+	}
+
 	proof, err := s.node.peerStorage.BlockProof(ctx, kind, block)
 	if errors.Is(err, tnstore.ErrNotFound) {
-		return TonNodeData{}, nil
+		return nil, errors.New("unknown block proof")
 	}
 	if err != nil {
 		return nil, err
@@ -349,14 +387,75 @@ func (s *overlaySubscription) serveZeroStateData(ctx context.Context, block ton.
 	data, err := s.node.peerStorage.ZeroState(ctx, block)
 	if err != nil {
 		if errors.Is(err, tnstore.ErrNotFound) {
-			return TonNodeData{}, nil
+			return nil, errors.New("failed to get state from db")
 		}
 		return nil, err
 	}
 	if len(data) == 0 {
-		return TonNodeData{}, nil
+		return nil, errors.New("failed to get state from db")
 	}
 	return TonNodeData{Data: data}, nil
+}
+
+func (s *overlaySubscription) servePreparePersistentState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt) (tl.Serializable, error) {
+	size, err := s.node.peerStorage.PersistentStateSize(ctx, block, master, 0)
+	if err == nil && size > 0 {
+		return PreparedState{}, nil
+	}
+	if err == nil {
+		return NotFoundState{}, nil
+	}
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return NotFoundState{}, nil
+	}
+	return nil, err
+}
+
+func (s *overlaySubscription) servePersistentStateSize(ctx context.Context, state PersistentStateIDV2) (tl.Serializable, error) {
+	effectiveShard := persistentStateEffectiveShardForQuery(state.Block, state.EffectiveShard)
+	size, err := s.node.peerStorage.PersistentStateSize(ctx, state.Block, state.MasterchainBlock, effectiveShard)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return PersistentStateSizeNotFound{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return PersistentStateSize{Size: size}, nil
+}
+
+func (s *overlaySubscription) servePersistentStateSlice(ctx context.Context, state PersistentStateIDV2, offset int64, maxSize int64) (tl.Serializable, error) {
+	if maxSize < 0 || maxSize > 1<<24 {
+		return nil, fmt.Errorf("invalid max_size %d", maxSize)
+	}
+	effectiveShard := persistentStateEffectiveShardForQuery(state.Block, state.EffectiveShard)
+	data, err := s.node.peerStorage.PersistentStateSlice(ctx, state.Block, state.MasterchainBlock, effectiveShard, offset, maxSize)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return nil, errors.New("failed to get state from db")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return TonNodeData{Data: data}, nil
+}
+
+func persistentStateEffectiveShardForQuery(block ton.BlockIDExt, effectiveShard int64) int64 {
+	if effectiveShard == 0 || !shardIsAncestor(block.Shard, effectiveShard) {
+		return 0
+	}
+	return effectiveShard
+}
+
+func shardIsAncestor(shard int64, child int64) bool {
+	shardPrefixLen := shardPrefixLength(shard)
+	childPrefixLen := shardPrefixLength(child)
+	if shardPrefixLen > childPrefixLen {
+		return false
+	}
+	if shardPrefixLen == 0 {
+		return true
+	}
+	mask := ^uint64(0) << (64 - shardPrefixLen)
+	return uint64(shard)&mask == uint64(child)&mask
 }
 
 func (s *overlaySubscription) serveNextKeyBlockIDs(ctx context.Context, block ton.BlockIDExt, maxSize int32) (tl.Serializable, error) {
@@ -453,7 +552,7 @@ func (s *overlaySubscription) serveArchiveSlice(ctx context.Context, archiveID, 
 	}
 	data, err := s.node.peerStorage.ArchiveSlice(ctx, archiveID, offset, maxSize)
 	if errors.Is(err, tnstore.ErrNotFound) {
-		return TonNodeData{}, nil
+		return nil, errors.New("unknown archive")
 	}
 	if err != nil {
 		return nil, err
@@ -521,4 +620,27 @@ func (s *overlaySubscription) loadStoredBlockData(ctx context.Context, block ton
 		return nil, err
 	}
 	return full.Block, nil
+}
+
+func (s *overlaySubscription) hasStoredProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (bool, error) {
+	_, err := s.node.peerStorage.BlockProof(ctx, kind, block)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (s *overlaySubscription) isMasterchainOverlay() bool {
+	return s.spec.Name == "masterchain"
+}
+
+func isMasterchainBlock(block ton.BlockIDExt) bool {
+	return block.Workchain == -1 && block.Shard == topShard
+}
+
+func isKeyBlockProofKind(kind tnstore.ServedProofKind) bool {
+	return kind == tnstore.ServedProofKeyBlock || kind == tnstore.ServedProofKeyBlockLink
 }

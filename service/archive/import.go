@@ -1,7 +1,9 @@
 package archive
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -51,7 +53,8 @@ type ImportSink struct {
 type Imported struct {
 	Stats *ImportStats
 	storage.ServedArchiveImport
-	ArtifactPath string
+	ArtifactPath   string
+	PreparedBlocks map[string]PreparedBlock
 }
 
 func ImportFile(ctx context.Context, archive *Downloaded, sink ImportSink) (*ImportStats, error) {
@@ -82,15 +85,27 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 		DownloadElapsed:  archive.DownloadElapsed,
 	}
 	imported := &Imported{
-		Stats:        stats,
-		ArtifactPath: archive.Path,
+		Stats:          stats,
+		ArtifactPath:   archive.Path,
+		PreparedBlocks: map[string]PreparedBlock{},
 	}
 	parts := map[string]*blockParts{}
 	seenBlocks := map[string]struct{}{}
 	var blockIDs []ton.BlockIDExt
+	preparer := newImportedBlockPreparer(ctx)
+	defer preparer.abort()
 
 	started := time.Now()
 	err := packfile.Read(ctx, r, func(entry packfile.Entry) error {
+		if err := preparer.err(); err != nil {
+			return err
+		}
+
+		processingStarted := time.Now()
+		defer func() {
+			stats.ProcessingElapsed += time.Since(processingStarted)
+		}()
+
 		ref, err := parseEntryName(entry.Name)
 		if errors.Is(err, storage.ErrNotFound) {
 			stats.IgnoredEntries++
@@ -142,7 +157,7 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 			return nil
 		}
 
-		if err = flushBlockPart(imported, part, stats); err != nil {
+		if err = flushBlockPart(preparer, part, stats); err != nil {
 			return err
 		}
 		if part.savedFull {
@@ -181,6 +196,10 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 				Ref:  part.linkRef,
 			})
 		}
+	}
+
+	if err = preparer.finish(imported, stats); err != nil {
+		return nil, err
 	}
 
 	imported.Links = buildBlockLinks(blockIDs)
@@ -277,7 +296,9 @@ func observeMasterchainBlockShards(stats *ImportStats, id ton.BlockIDExt, data [
 		return nil
 	}
 
+	started := time.Now()
 	shards, err := MasterchainBlockShards(id, data)
+	stats.MasterchainShardParse += time.Since(started)
 	if err != nil {
 		return err
 	}
@@ -288,64 +309,76 @@ func observeMasterchainBlockShards(stats *ImportStats, id ton.BlockIDExt, data [
 func MasterchainBlockShards(id ton.BlockIDExt, data []byte) ([]ton.BlockIDExt, error) {
 	root, err := cell.FromBOC(data)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("parse masterchain block %s BOC: %w", storage.FormatBlockRef(id), err)
 	}
 
 	loader := root.BeginParse()
 	magic, err := loader.LoadUInt(32)
-	if err != nil || magic != 0x11ef55aa {
-		return nil, nil
+	if err != nil {
+		return nil, fmt.Errorf("load masterchain block %s magic: %w", storage.FormatBlockRef(id), err)
+	}
+	if magic != 0x11ef55aa {
+		return nil, fmt.Errorf("unexpected masterchain block %s magic 0x%x", storage.FormatBlockRef(id), magic)
 	}
 	if _, err = loader.LoadUInt(32); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s global id: %w", storage.FormatBlockRef(id), err)
 	}
 	if _, err = loader.LoadRefCell(); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s info ref: %w", storage.FormatBlockRef(id), err)
 	}
 	if _, err = loader.LoadRefCell(); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s value flow ref: %w", storage.FormatBlockRef(id), err)
 	}
 	if _, err = loader.LoadRefCell(); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s state update ref: %w", storage.FormatBlockRef(id), err)
 	}
 
 	extraCell, err := loader.LoadRefCell()
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s extra ref: %w", storage.FormatBlockRef(id), err)
 	}
 	extra := extraCell.BeginParse()
 	magic, err = extra.LoadUInt(32)
-	if err != nil || magic != 0x4a33f6fd {
-		return nil, nil
+	if err != nil {
+		return nil, fmt.Errorf("load masterchain block %s extra magic: %w", storage.FormatBlockRef(id), err)
+	}
+	if magic != 0x4a33f6fd {
+		return nil, fmt.Errorf("unexpected masterchain block %s extra magic 0x%x", storage.FormatBlockRef(id), magic)
 	}
 	for i := 0; i < 3; i++ {
 		if _, err = extra.LoadRefCell(); err != nil {
-			return nil, nil
+			return nil, fmt.Errorf("load masterchain block %s extra ref %d: %w", storage.FormatBlockRef(id), i, err)
 		}
 	}
 	if _, err = extra.LoadSlice(512); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s extra rand seed and created-by: %w", storage.FormatBlockRef(id), err)
 	}
 
 	custom, err := extra.LoadMaybeRef()
-	if err != nil || custom == nil {
-		return nil, nil
+	if err != nil {
+		return nil, fmt.Errorf("load masterchain block %s custom extra: %w", storage.FormatBlockRef(id), err)
+	}
+	if custom == nil {
+		return nil, fmt.Errorf("masterchain block %s custom extra is missing", storage.FormatBlockRef(id))
 	}
 	magic, err = custom.LoadUInt(16)
-	if err != nil || magic != 0xcca5 {
-		return nil, nil
+	if err != nil {
+		return nil, fmt.Errorf("load masterchain block %s custom magic: %w", storage.FormatBlockRef(id), err)
+	}
+	if magic != 0xcca5 {
+		return nil, fmt.Errorf("unexpected masterchain block %s custom magic 0x%x", storage.FormatBlockRef(id), magic)
 	}
 	if _, err = custom.LoadUInt(1); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("load masterchain block %s previous block signed flag: %w", storage.FormatBlockRef(id), err)
 	}
 
 	shardHashes, err := custom.LoadDict(32)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load masterchain block %s shard hashes: %w", storage.FormatBlockRef(id), err)
 	}
 	loadedShards, err := ton.LoadShardsFromHashes(shardHashes, false)
 	if err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("parse masterchain block %s shard hashes: %w", storage.FormatBlockRef(id), err)
 	}
 
 	shards := make([]ton.BlockIDExt, 0, len(loadedShards))
@@ -355,7 +388,7 @@ func MasterchainBlockShards(id ton.BlockIDExt, data []byte) ([]ton.BlockIDExt, e
 	return shards, nil
 }
 
-func flushBlockPart(imported *Imported, part *blockParts, stats *ImportStats) error {
+func flushBlockPart(preparer *importedBlockPreparer, part *blockParts, stats *ImportStats) error {
 	if part.savedFull || len(part.block) == 0 {
 		return nil
 	}
@@ -379,10 +412,64 @@ func flushBlockPart(imported *Imported, part *blockParts, stats *ImportStats) er
 		return nil
 	}
 
-	imported.FullBlocks = append(imported.FullBlocks, full)
+	if err := preparer.submit(full); err != nil {
+		return err
+	}
 	part.savedFull = true
 	stats.FullBlocks++
 	return nil
+}
+
+func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error) {
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		return PreparedBlock{}, fmt.Errorf("parse block BOC: %w", err)
+	}
+	rootHash := root.HashKey()
+	if !bytes.Equal(rootHash[:], id.RootHash) {
+		return PreparedBlock{}, fmt.Errorf("root hash mismatch")
+	}
+	sum := sha256.Sum256(data)
+	if !bytes.Equal(sum[:], id.FileHash) {
+		return PreparedBlock{}, fmt.Errorf("file hash mismatch")
+	}
+
+	block, err := storage.ParseVerifiedBlockCell(id, root)
+	if err != nil {
+		return PreparedBlock{}, err
+	}
+	meta, err := storage.BuildBlockMetaFromParsedBlock(id, block)
+	if err != nil {
+		return PreparedBlock{}, err
+	}
+
+	updateTo, err := block.StateUpdate.PeekRef(1)
+	if err != nil {
+		return PreparedBlock{}, fmt.Errorf("load block state update target: %w", err)
+	}
+	stateRoot := updateTo.Virtualize(0)
+	stateRootHash := stateRoot.HashKey(0)
+	stateCellHash := stateRoot.HashKey()
+
+	started := time.Now()
+	cells, err := storage.PrepareStateUpdateCells(block.StateUpdate)
+	if err != nil {
+		return PreparedBlock{}, err
+	}
+	return PreparedBlock{
+		Block:  root,
+		Parsed: block,
+		Meta:   meta,
+		State: &storage.BlockState{
+			Block:         id,
+			StateRootHash: append([]byte(nil), stateRootHash[:]...),
+			StateCellHash: append([]byte(nil), stateCellHash[:]...),
+			CellsCount:    uint64(len(cells)),
+			DownloadedAt:  time.Now(),
+		},
+		StateUpdateToCells:        cells,
+		StateUpdateToCellsElapsed: time.Since(started),
+	}, nil
 }
 
 func buildBlockLinks(blocks []ton.BlockIDExt) []storage.ServedBlockLink {

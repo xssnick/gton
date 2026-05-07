@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flexserver/service/storage"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -28,10 +27,6 @@ func (s *Store) SaveStateSyncProgress(ctx context.Context, state *storage.Curren
 }
 
 func (s *Store) saveCurrentStateRecord(ctx context.Context, key []byte, state *storage.CurrentState, writeOptions *pebble.WriteOptions) error {
-	if err := s.FlushStagedBlockStates(ctx); err != nil {
-		return err
-	}
-
 	if err := s.saveBlockStateIfMissing(ctx, &state.Masterchain); err != nil {
 		return err
 	}
@@ -89,8 +84,24 @@ func (s *Store) ClearStateSyncProgress(ctx context.Context) error {
 }
 
 func (s *Store) SaveSeenMasterchainBlock(ctx context.Context, block ton.BlockIDExt) error {
+	return s.saveMasterchainBlockHint(ctx, hotKeySeenMasterchainBlock(), "seen masterchain block", block)
+}
+
+func (s *Store) SeenMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
+	return s.masterchainBlockHint(ctx, hotKeySeenMasterchainBlock())
+}
+
+func (s *Store) SaveVerifiedKeyBlockProgress(ctx context.Context, block ton.BlockIDExt) error {
+	return s.saveMasterchainBlockHint(ctx, hotKeyVerifiedKeyBlockProgress(), "verified key block progress", block)
+}
+
+func (s *Store) VerifiedKeyBlockProgress(ctx context.Context) (ton.BlockIDExt, error) {
+	return s.masterchainBlockHint(ctx, hotKeyVerifiedKeyBlockProgress())
+}
+
+func (s *Store) saveMasterchainBlockHint(ctx context.Context, key []byte, label string, block ton.BlockIDExt) error {
 	if block.Workchain != -1 || block.Shard != int64(-1<<63) {
-		return fmt.Errorf("seen masterchain block is not masterchain: %s", storage.FormatBlockRef(block))
+		return fmt.Errorf("%s is not masterchain: %s", label, storage.FormatBlockRef(block))
 	}
 
 	select {
@@ -106,7 +117,6 @@ func (s *Store) SaveSeenMasterchainBlock(ctx context.Context, block ton.BlockIDE
 		return errPebbleClosed
 	}
 
-	key := hotKeySeenMasterchainBlock()
 	raw, err := pebbleReaderGetCopy(s.hot, key)
 	if err == nil {
 		current, err := decodeBlockID(raw)
@@ -128,8 +138,8 @@ func (s *Store) SaveSeenMasterchainBlock(ctx context.Context, block ton.BlockIDE
 	return batch.Commit(pebble.NoSync)
 }
 
-func (s *Store) SeenMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	raw, err := s.getHotCopy(ctx, hotKeySeenMasterchainBlock())
+func (s *Store) masterchainBlockHint(ctx context.Context, key []byte) (ton.BlockIDExt, error) {
+	raw, err := s.getHotCopy(ctx, key)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -177,18 +187,14 @@ func (s *Store) currentStateRecord(ctx context.Context, key []byte, label string
 type preparedBlockStateSave struct {
 	original     *storage.BlockState
 	saved        storage.BlockState
+	parsed       *storage.BlockState
 	lazyRoot     *cell.Cell
 	cellSyncHash cell.Hash
-	syncCells    bool
 	flushCells   bool
 }
 
 func (s *Store) SaveBlockState(ctx context.Context, state *storage.BlockState) error {
-	if err := s.FlushStagedBlockStates(ctx); err != nil {
-		return err
-	}
-
-	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, []*storage.BlockState{state})
+	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, []*storage.BlockState{state}, nil)
 	if err != nil {
 		return err
 	}
@@ -198,323 +204,16 @@ func (s *Store) SaveBlockState(ctx context.Context, state *storage.BlockState) e
 	return s.replacePreparedBlockStatesWithLazyRoots(prepared)
 }
 
-func (s *Store) StageBlockState(ctx context.Context, state *storage.BlockState) error {
-	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, []*storage.BlockState{state})
-	if err != nil {
-		return err
-	}
-	return s.stagePreparedBlockStates(prepared, cellsElapsed)
+func (s *Store) SaveStateCheckpoint(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+	return s.SaveStateCheckpointWithCells(ctx, blocks, current, nil)
 }
 
-func (s *Store) FlushStagedBlockStates(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	s.flushMu.Lock()
-	defer s.flushMu.Unlock()
-
-	flush, ok := s.takePendingStateFlush()
-	if !ok {
-		return nil
-	}
-
-	flushStarted := time.Now()
-	if err := s.flushCellDBs(); err != nil {
-		s.requeuePendingStateFlush(flush)
-		return fmt.Errorf("flush staged state cells before metadata marker: %w", err)
-	}
-	flushElapsed := time.Since(flushStarted)
-
-	if err := s.syncPendingArchiveFiles(); err != nil {
-		s.requeuePendingStateFlush(flush)
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		s.requeuePendingStateFlush(flush)
-		return errPebbleClosed
-	}
-
-	batch := s.hot.NewBatch()
-	defer func() { _ = batch.Close() }()
-
-	keys := make([]string, 0, len(flush.state.states))
-	for key := range flush.state.states {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	prepared := make([]preparedBlockStateSave, 0, len(keys))
-	for _, key := range keys {
-		state := flush.state.states[key]
-		sync := flush.state.syncs[key]
-		if err := batch.Set(hotKeyStateCellSync(sync.block), encodeStateCellSync(sync.rootHash, sync.cellCount), pebble.NoSync); err != nil {
-			s.requeuePendingStateFlush(flush)
-			return err
-		}
-		if err := s.setHotMaybeReplace(batch, hotKeyStateMeta(state.Block), encodeBlockStateMeta(&state)); err != nil {
-			s.requeuePendingStateFlush(flush)
-			return err
-		}
-		if err := s.setMergedBlockMeta(batch, storage.BuildBlockMetaFromState(state)); err != nil {
-			s.requeuePendingStateFlush(flush)
-			return err
-		}
-		prepared = append(prepared, preparedBlockStateSave{
-			saved:      state,
-			syncCells:  true,
-			flushCells: true,
-		})
-	}
-
-	hotSyncStarted := time.Now()
-	if err := batch.Commit(pebble.Sync); err != nil {
-		s.requeuePendingStateFlush(flush)
-		return err
-	}
-	hotSyncElapsed := time.Since(hotSyncStarted)
-
-	s.finishPendingStateFlush(flush.id)
-
-	s.logBlockStateCheckpoint(prepared, nil, true, 0, flushElapsed, hotSyncElapsed)
-	return nil
-}
-
-func (s *Store) stagePreparedBlockStates(prepared []preparedBlockStateSave, cellsElapsed time.Duration) error {
-	if len(prepared) == 0 {
-		return nil
-	}
-
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	s.ensurePendingStateLocked()
-
-	for _, preparedState := range prepared {
-		state := storage.BlockStateWithoutCells(&preparedState.saved)
-		key := storage.BlockKey(state.Block)
-		s.pendingState.states[key] = state
-		s.pendingState.syncs[key] = stateCellTreeSync{
-			block:     state.Block,
-			rootHash:  preparedState.cellSyncHash,
-			cellCount: state.CellsCount,
-		}
-
-		meta := storage.BuildBlockMetaFromState(state)
-		s.pendingState.blockMetas[key] = storage.MergeBlockMeta(s.pendingState.blockMetas[key], meta)
-
-		historyKey := storage.BlockHistoryKey{Workchain: state.Block.Workchain, Shard: state.Block.Shard}
-		seqIndex := s.pendingState.seqIndex[historyKey]
-		if seqIndex == nil {
-			seqIndex = map[uint32]ton.BlockIDExt{}
-			s.pendingState.seqIndex[historyKey] = seqIndex
-		}
-		seqIndex[state.Block.SeqNo] = state.Block
-	}
-
-	s.log.Debug().
-		Int("states", len(prepared)).
-		Dur("save_cells_batch_elapsed", cellsElapsed).
-		Int("pending_states", len(s.pendingState.states)).
-		Msg("block states staged for checkpoint")
-	return nil
-}
-
-func (s *Store) ensurePendingStateLocked() {
-	if s.pendingState.states == nil {
-		s.pendingState.states = map[string]storage.BlockState{}
-	}
-	if s.pendingState.blockMetas == nil {
-		s.pendingState.blockMetas = map[string]*storage.BlockMeta{}
-	}
-	if s.pendingState.seqIndex == nil {
-		s.pendingState.seqIndex = map[storage.BlockHistoryKey]map[uint32]ton.BlockIDExt{}
-	}
-	if s.pendingState.syncs == nil {
-		s.pendingState.syncs = map[string]stateCellTreeSync{}
-	}
-}
-
-func newPendingStateOverlay() pendingStateOverlay {
-	return pendingStateOverlay{
-		states:     map[string]storage.BlockState{},
-		blockMetas: map[string]*storage.BlockMeta{},
-		seqIndex:   map[storage.BlockHistoryKey]map[uint32]ton.BlockIDExt{},
-		syncs:      map[string]stateCellTreeSync{},
-	}
-}
-
-func (s *Store) takePendingStateFlush() (pendingStateFlush, bool) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-
-	if len(s.pendingState.states) == 0 {
-		return pendingStateFlush{}, false
-	}
-
-	s.nextPendingFlushID++
-	flush := pendingStateFlush{
-		id:    s.nextPendingFlushID,
-		state: s.pendingState,
-	}
-	s.pendingFlushes = append(s.pendingFlushes, flush)
-	s.pendingState = newPendingStateOverlay()
-	return flush, true
-}
-
-func (s *Store) finishPendingStateFlush(id uint64) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-
-	s.removePendingStateFlushLocked(id)
-}
-
-func (s *Store) requeuePendingStateFlush(flush pendingStateFlush) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-
-	s.removePendingStateFlushLocked(flush.id)
-	s.pendingState = mergePendingStateOverlays(flush.state, s.pendingState)
-}
-
-func (s *Store) removePendingStateFlushLocked(id uint64) {
-	for i := range s.pendingFlushes {
-		if s.pendingFlushes[i].id != id {
-			continue
-		}
-		copy(s.pendingFlushes[i:], s.pendingFlushes[i+1:])
-		s.pendingFlushes = s.pendingFlushes[:len(s.pendingFlushes)-1]
-		return
-	}
-}
-
-func mergePendingStateOverlays(base pendingStateOverlay, next pendingStateOverlay) pendingStateOverlay {
-	merged := newPendingStateOverlay()
-	mergePendingStateOverlayInto(&merged, base)
-	mergePendingStateOverlayInto(&merged, next)
-	return merged
-}
-
-func mergePendingStateOverlayInto(dst *pendingStateOverlay, src pendingStateOverlay) {
-	for key, state := range src.states {
-		dst.states[key] = state
-	}
-	for key, sync := range src.syncs {
-		dst.syncs[key] = sync
-	}
-	for key, meta := range src.blockMetas {
-		dst.blockMetas[key] = mergePendingBlockMeta(dst.blockMetas[key], meta)
-	}
-	for historyKey, blocks := range src.seqIndex {
-		dstBlocks := dst.seqIndex[historyKey]
-		if dstBlocks == nil {
-			dstBlocks = map[uint32]ton.BlockIDExt{}
-			dst.seqIndex[historyKey] = dstBlocks
-		}
-		for seqno, block := range blocks {
-			dstBlocks[seqno] = block
-		}
-	}
-}
-
-func (s *Store) pendingBlockState(block ton.BlockIDExt) (storage.BlockState, bool) {
-	s.pendingMu.RLock()
-	defer s.pendingMu.RUnlock()
-
-	key := storage.BlockKey(block)
-	if state, ok := s.pendingState.states[key]; ok {
-		return *storage.CloneBlockState(&state), true
-	}
-	for i := len(s.pendingFlushes) - 1; i >= 0; i-- {
-		if state, ok := s.pendingFlushes[i].state.states[key]; ok {
-			return *storage.CloneBlockState(&state), true
-		}
-	}
-	return storage.BlockState{}, false
-}
-
-func (s *Store) pendingStateCellSync(block ton.BlockIDExt) (stateCellTreeSync, bool) {
-	s.pendingMu.RLock()
-	defer s.pendingMu.RUnlock()
-
-	key := storage.BlockKey(block)
-	if sync, ok := s.pendingState.syncs[key]; ok {
-		return sync, true
-	}
-	for i := len(s.pendingFlushes) - 1; i >= 0; i-- {
-		if sync, ok := s.pendingFlushes[i].state.syncs[key]; ok {
-			return sync, true
-		}
-	}
-	return stateCellTreeSync{}, false
-}
-
-func (s *Store) pendingBlockMeta(block ton.BlockIDExt) *storage.BlockMeta {
-	s.pendingMu.RLock()
-	defer s.pendingMu.RUnlock()
-
-	key := storage.BlockKey(block)
-	var meta *storage.BlockMeta
-	for i := range s.pendingFlushes {
-		meta = mergePendingBlockMeta(meta, s.pendingFlushes[i].state.blockMetas[key])
-	}
-	meta = mergePendingBlockMeta(meta, s.pendingState.blockMetas[key])
-	return meta
-}
-
-func mergePendingBlockMeta(base *storage.BlockMeta, next *storage.BlockMeta) *storage.BlockMeta {
-	if next == nil {
-		if base == nil {
-			return nil
-		}
-		return base.Clone()
-	}
-	return storage.MergeBlockMeta(base, next)
-}
-
-func (s *Store) pendingBlockSeq(key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, bool) {
-	s.pendingMu.RLock()
-	defer s.pendingMu.RUnlock()
-
-	if blocks := s.pendingState.seqIndex[key]; blocks != nil {
-		if block, ok := blocks[seqno]; ok {
-			return block, true
-		}
-	}
-	for i := len(s.pendingFlushes) - 1; i >= 0; i-- {
-		blocks := s.pendingFlushes[i].state.seqIndex[key]
-		if blocks == nil {
-			continue
-		}
-		if block, ok := blocks[seqno]; ok {
-			return block, true
-		}
-	}
-	return ton.BlockIDExt{}, false
-}
-
-func (s *Store) SaveBlockStateAndCurrentState(ctx context.Context, block *storage.BlockState, current *storage.CurrentState) error {
-	var blocks []*storage.BlockState
-	if block != nil {
-		blocks = []*storage.BlockState{block}
-	}
-	return s.SaveBlockStatesAndCurrentState(ctx, blocks, current)
-}
-
-func (s *Store) SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+func (s *Store) SaveStateCheckpointWithCells(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState, cells []storage.EncodedCellRecord) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}
-	if err := s.FlushStagedBlockStates(ctx); err != nil {
-		return err
-	}
 
-	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, blocks)
+	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, blocks, cells)
 	if err != nil {
 		return err
 	}
@@ -524,11 +223,14 @@ func (s *Store) SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*st
 	return s.replacePreparedBlockStatesWithLazyRoots(prepared)
 }
 
-func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState) ([]preparedBlockStateSave, time.Duration, error) {
+func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState, cells []storage.EncodedCellRecord) ([]preparedBlockStateSave, time.Duration, error) {
 	started := time.Now()
 	prepared := make([]preparedBlockStateSave, 0, len(states))
 	seen := make(map[string]struct{}, len(states))
 	exists := newStateCellExistenceCache()
+	trees := make([]stateCellTreeSave, 0, len(states))
+	treePreparedIndexes := make([]int, 0, len(states))
+	usePreparedCells := len(cells) > 0
 	for _, state := range states {
 		if state == nil {
 			continue
@@ -539,21 +241,72 @@ func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage
 		}
 		seen[key] = struct{}{}
 
-		next, err := s.prepareBlockStateForSave(ctx, state, exists)
+		saved, cellSyncHash, err := prepareBlockStateHeader(state)
 		if err != nil {
 			return nil, 0, err
 		}
+
+		next := preparedBlockStateSave{
+			original:     state,
+			saved:        saved,
+			cellSyncHash: cellSyncHash,
+		}
+		if saved.Cell != nil {
+			if saved.Cell.IsLazy() {
+				next.lazyRoot = saved.Cell
+			} else {
+				next.cellSyncHash = saved.Cell.HashKey()
+				if !usePreparedCells {
+					trees = append(trees, stateCellTreeSave{
+						block:      saved.Block,
+						root:       saved.Cell,
+						totalCells: saved.CellsCount,
+						exists:     exists,
+					})
+				}
+				treePreparedIndexes = append(treePreparedIndexes, len(prepared))
+			}
+		}
 		prepared = append(prepared, next)
+	}
+
+	preparedCellsFlushed, err := s.savePreparedStateCellRecords(ctx, cells)
+	if err != nil {
+		return nil, 0, err
+	}
+	dfsFlushed, err := s.saveStateCellTreesDFSBatch(ctx, trees, exists)
+	if err != nil {
+		return nil, 0, err
+	}
+	flushCells := preparedCellsFlushed || dfsFlushed
+	for _, idx := range treePreparedIndexes {
+		prepared[idx].flushCells = flushCells
+		lazyRoot, err := s.loadLazyCell(ctx, prepared[idx].cellSyncHash[:])
+		if err != nil {
+			return nil, 0, fmt.Errorf("load persisted lazy state root: %w", err)
+		}
+		prepared[idx].lazyRoot = lazyRoot
+	}
+	for i := range prepared {
+		if prepared[i].lazyRoot == nil || !shouldParseSavedLazyState(prepared[i].saved) {
+			continue
+		}
+		parsed, err := storage.ParseStateProof(&prepared[i].saved.Block, prepared[i].lazyRoot, nil, prepared[i].saved.StateRootHash, nil)
+		if err != nil {
+			return nil, 0, fmt.Errorf("parse persisted lazy state root: %w", err)
+		}
+		prepared[i].parsed = parsed
 	}
 	return prepared, time.Since(started), nil
 }
 
-func (s *Store) prepareBlockStateForSave(ctx context.Context, state *storage.BlockState, exists *stateCellExistenceCache) (preparedBlockStateSave, error) {
+func prepareBlockStateHeader(state *storage.BlockState) (storage.BlockState, cell.Hash, error) {
 	var zero cell.Hash
-	var prepared preparedBlockStateSave
+	var cellSyncHash cell.Hash
 	if state == nil {
-		return prepared, fmt.Errorf("block state is nil")
+		return storage.BlockState{}, cellSyncHash, fmt.Errorf("block state is nil")
 	}
+
 	saved := *state
 	if len(saved.StateRootHash) == 0 && saved.Cell != nil {
 		hash := saved.Cell.HashKey(0)
@@ -564,54 +317,20 @@ func (s *Store) prepareBlockStateForSave(ctx context.Context, state *storage.Blo
 		saved.StateCellHash = hash[:]
 	}
 	if len(saved.StateRootHash) == 0 {
-		return prepared, fmt.Errorf("block state root hash is empty")
+		return storage.BlockState{}, cellSyncHash, fmt.Errorf("block state root hash is empty")
 	}
 	if len(saved.StateCellHash) == 0 {
-		return prepared, fmt.Errorf("block state cell hash is empty")
+		return storage.BlockState{}, cellSyncHash, fmt.Errorf("block state cell hash is empty")
 	}
 	if len(saved.StateCellHash) != len(zero) {
-		return prepared, fmt.Errorf("block state cell hash size mismatch: got %d", len(saved.StateCellHash))
+		return storage.BlockState{}, cellSyncHash, fmt.Errorf("block state cell hash size mismatch: got %d", len(saved.StateCellHash))
 	}
-
-	var cellSyncHash cell.Hash
 	copy(cellSyncHash[:], saved.StateCellHash)
-	var lazyRoot *cell.Cell
-	syncCells := false
-	flushCells := false
+	return saved, cellSyncHash, nil
+}
 
-	if saved.Cell != nil {
-		syncCells = true
-		if saved.Cell.IsLazy() {
-			lazyRoot = saved.Cell
-		} else {
-			cellSyncHash = saved.Cell.HashKey()
-			var err error
-			flushCells, err = s.saveStateCellTree(ctx, stateCellTreeSave{
-				block:            saved.Block,
-				root:             saved.Cell,
-				totalCells:       saved.CellsCount,
-				reusedStateCells: saved.ReusedStateCells,
-				reusedStateRefs:  saved.ReusedStateRefs,
-				exists:           exists,
-			})
-			if err != nil {
-				return prepared, err
-			}
-			lazyRoot, err = s.loadLazyCell(ctx, cellSyncHash[:])
-			if err != nil {
-				return prepared, fmt.Errorf("load persisted lazy state root: %w", err)
-			}
-		}
-	}
-
-	return preparedBlockStateSave{
-		original:     state,
-		saved:        saved,
-		lazyRoot:     lazyRoot,
-		cellSyncHash: cellSyncHash,
-		syncCells:    syncCells,
-		flushCells:   flushCells,
-	}, nil
+func shouldParseSavedLazyState(state storage.BlockState) bool {
+	return state.Parsed != nil && (state.Block.Workchain != -1 || state.Parsed.McStateExtra != nil)
 }
 
 func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave, current *storage.CurrentState, cellsElapsed time.Duration) error {
@@ -631,7 +350,7 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	}
 	flushElapsed := time.Since(flushStarted)
 
-	if err := s.syncPendingArchiveFiles(); err != nil {
+	if err := s.syncPendingArtifactFiles(); err != nil {
 		return err
 	}
 
@@ -646,11 +365,6 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	defer func() { _ = batch.Close() }()
 
 	for _, state := range prepared {
-		if state.syncCells {
-			if err := batch.Set(hotKeyStateCellSync(state.saved.Block), encodeStateCellSync(state.cellSyncHash, state.saved.CellsCount), pebble.NoSync); err != nil {
-				return err
-			}
-		}
 		if err := s.setHotMaybeReplace(batch, hotKeyStateMeta(state.saved.Block), encodeBlockStateMeta(&state.saved)); err != nil {
 			return err
 		}
@@ -676,10 +390,10 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 
 func (s *Store) replacePreparedBlockStatesWithLazyRoots(prepared []preparedBlockStateSave) error {
 	for _, state := range prepared {
-		if state.saved.Cell == nil || state.saved.Parsed == nil {
+		if state.saved.Cell == nil {
 			continue
 		}
-		if err := s.replaceBlockStateWithLazyRoot(state.original, state.saved, state.lazyRoot); err != nil {
+		if err := s.replaceBlockStateWithLazyRoot(state.original, state.saved, state.parsed, state.lazyRoot); err != nil {
 			return err
 		}
 	}

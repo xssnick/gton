@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"flexserver/service/p2p"
 	"flexserver/service/storage"
@@ -88,6 +89,42 @@ func TestShardStateResolverResolvesMergeFromTwoChildren(t *testing.T) {
 	stats := resolver.statsSnapshot()
 	if stats.blocksApplied != 1 || stats.blocksReused != 2 {
 		t.Fatalf("unexpected stats applied=%d reused=%d", stats.blocksApplied, stats.blocksReused)
+	}
+}
+
+func TestShardStateResolverCallsAfterApplyState(t *testing.T) {
+	ctx := context.Background()
+	parent := testBlockID(0, topShard, 25)
+	target := testBlockID(0, topShard, 26)
+
+	env := newFakeShardStateResolverEnv()
+	env.addState(parent)
+	env.addBlock(target, parent)
+
+	var callbackState ton.BlockIDExt
+	var callbackBlock ton.BlockIDExt
+	resolver := newShardStateResolver(ctx, shardStateResolverConfig{
+		current: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(parent): {Block: parent},
+		},
+		loadState: env.loadState,
+		loadBlock: env.loadBlock,
+		apply:     env.apply,
+		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded p2p.DownloadedBlock, _ time.Duration) error {
+			callbackState = state.Block
+			callbackBlock = downloaded.ID
+			return nil
+		},
+	})
+
+	if _, err := resolver.resolve(target); err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	if !callbackState.Equals(&target) {
+		t.Fatalf("callback state = %s, want %s", storage.FormatBlockRef(callbackState), storage.FormatBlockRef(target))
+	}
+	if !callbackBlock.Equals(&target) {
+		t.Fatalf("callback block = %s, want %s", storage.FormatBlockRef(callbackBlock), storage.FormatBlockRef(target))
 	}
 }
 

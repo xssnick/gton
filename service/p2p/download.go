@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"flexserver/service/blockproof"
 	tnstore "flexserver/service/storage"
 	"fmt"
 	"time"
@@ -641,9 +642,9 @@ func decodeCompressedBlock(data DataFullCompressed) (*DownloadedBlock, error) {
 	}
 
 	proof := cell.ToBOCWithOptions([]*cell.Cell{roots[0]}, cell.BOCSerializeOptions{WithCRC32C: false})
-	block, _ := serializeBlockRootBestEffort(roots[1], data.ID.FileHash)
+	block := serializeCompressedBlockRoot(roots[1])
 
-	return normalizeDownloadedBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, false, roots[1])
+	return normalizeDownloadedBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, true, roots[1])
 }
 
 func decodeCompressedBlockV2(data DataFullCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
@@ -663,8 +664,8 @@ func decodeCompressedBlockV2(data DataFullCompressedV2, state *cell.Cell) (*Down
 		return nil, fmt.Errorf("expected 1 root in tonNode.dataFullCompressedV2, got %d", len(roots))
 	}
 
-	block, _ := serializeBlockRootBestEffort(roots[0], data.ID.FileHash)
-	return normalizeDownloadedBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, false, roots[0])
+	block := serializeCompressedBlockRoot(roots[0])
+	return normalizeDownloadedBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, true, roots[0])
 }
 
 func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block ton.BlockIDExt, proof []byte) (*cell.Cell, error) {
@@ -740,6 +741,9 @@ func normalizeDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data
 	if err != nil {
 		return nil, fmt.Errorf("%s proof is not a valid BOC: %w", kind, err)
 	}
+	if err = blockproof.CheckProofShape(id, proofRoot, isLink); err != nil {
+		return nil, fmt.Errorf("%s proof shape: %w", kind, err)
+	}
 
 	if parsedBlock == nil {
 		parsedBlock, err = cell.FromBOC(data)
@@ -800,42 +804,12 @@ func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
 	}
 }
 
-func serializeBlockRootBestEffort(root *cell.Cell, expectedFileHash []byte) ([]byte, bool) {
-	first := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+func serializeCompressedBlockRoot(root *cell.Cell) []byte {
+	return root.ToBOCWithOptions(cell.BOCSerializeOptions{
 		WithCRC32C:    true,
 		WithIndex:     true,
 		WithCacheBits: true,
 		WithTopHash:   true,
 		WithIntHashes: true,
 	})
-	if bocFileHashMatches(first, expectedFileHash) {
-		return first, true
-	}
-
-	candidate := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-	if bocFileHashMatches(candidate, expectedFileHash) {
-		return candidate, true
-	}
-
-	candidate = root.ToBOC()
-	if bocFileHashMatches(candidate, expectedFileHash) {
-		return candidate, true
-	}
-
-	candidate = cell.ToBOCWithOptions([]*cell.Cell{root}, cell.BOCSerializeOptions{WithIndex: true})
-	if bocFileHashMatches(candidate, expectedFileHash) {
-		return candidate, true
-	}
-
-	candidate = cell.ToBOCWithOptions([]*cell.Cell{root}, cell.BOCSerializeOptions{WithCRC32C: true, WithIndex: true})
-	if bocFileHashMatches(candidate, expectedFileHash) {
-		return candidate, true
-	}
-
-	return first, false
-}
-
-func bocFileHashMatches(boc []byte, want []byte) bool {
-	sum := sha256.Sum256(boc)
-	return bytes.Equal(sum[:], want)
 }

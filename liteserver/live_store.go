@@ -405,10 +405,7 @@ func liveBlockHasData(block *liveBlock) bool {
 	if block == nil {
 		return false
 	}
-	if len(block.data) > 0 {
-		return true
-	}
-	return block.root != nil
+	return len(block.data) > 0
 }
 
 func (s *LiveStore) waitSnapshot() (*storage.CurrentState, uint32, bool, <-chan struct{}) {

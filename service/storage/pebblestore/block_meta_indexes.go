@@ -52,10 +52,6 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 }
 
 func (s *Store) blockStateMeta(ctx context.Context, block ton.BlockIDExt) (storage.BlockState, error) {
-	if state, ok := s.pendingBlockState(block); ok {
-		return state, nil
-	}
-
 	metaRaw, err := s.getHotCopy(ctx, hotKeyStateMeta(block))
 	if err != nil {
 		return storage.BlockState{}, err
@@ -83,30 +79,18 @@ func (s *Store) SaveBlockMeta(meta *storage.BlockMeta) error {
 }
 
 func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error) {
-	pending := s.pendingBlockMeta(block)
-
 	raw, err := s.getHotCopy(ctx, hotKeyBlockMeta(block))
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) && pending != nil {
-			return pending, nil
-		}
 		return nil, err
 	}
 	meta, err := decodeBlockMeta(raw)
 	if err != nil {
 		return nil, err
 	}
-	if pending != nil {
-		return storage.MergeBlockMeta(meta, pending), nil
-	}
 	return meta, nil
 }
 
 func (s *Store) LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
-	if block, ok := s.pendingBlockSeq(key, seqno); ok {
-		return block, nil
-	}
-
 	raw, err := s.getHotCopy(ctx, hotKeyBlockSeqIndex(key, seqno))
 	if err != nil {
 		return ton.BlockIDExt{}, err

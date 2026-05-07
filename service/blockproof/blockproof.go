@@ -74,6 +74,57 @@ func ParseBOC(id ton.BlockIDExt, proofBOC []byte) (*Parsed, error) {
 	return ParseCell(id, root)
 }
 
+func LinkBOC(id ton.BlockIDExt, proofBOC []byte) ([]byte, error) {
+	parsed, err := ParseBOC(id, proofBOC)
+	if err != nil {
+		return nil, err
+	}
+
+	root, err := tlb.ToCell(&BlockProof{
+		ProofFor: parsed.Proof.ProofFor,
+		Root:     parsed.Proof.Root,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("serialize block proof link %s: %w", tnstore.FormatBlockRef(id), err)
+	}
+	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
+}
+
+func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error {
+	if proofRoot == nil {
+		return fmt.Errorf("block proof %s root is nil", tnstore.FormatBlockRef(id))
+	}
+
+	var proof BlockProof
+	if err := tlb.LoadFromCell(&proof, proofRoot.BeginParse()); err != nil {
+		return fmt.Errorf("parse block proof %s: %w", tnstore.FormatBlockRef(id), err)
+	}
+
+	proofFor := proof.ProofFor.blockID()
+	if !proofFor.Equals(&id) {
+		return fmt.Errorf("block proof is for %s, expected %s", tnstore.FormatBlockRef(proofFor), tnstore.FormatBlockRef(id))
+	}
+	if id.Workchain != -1 {
+		if !isLink {
+			return fmt.Errorf("non-masterchain block %s must be served with a proof link", tnstore.FormatBlockRef(id))
+		}
+		if proof.Signatures != nil {
+			return fmt.Errorf("invalid ProofLink for non-masterchain block %s with validator signatures present", tnstore.FormatBlockRef(id))
+		}
+		return nil
+	}
+	if isLink {
+		if proof.Signatures != nil {
+			return fmt.Errorf("invalid masterchain proof link %s with validator signatures present", tnstore.FormatBlockRef(id))
+		}
+		return nil
+	}
+	if proof.Signatures == nil {
+		return fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(id))
+	}
+	return nil
+}
+
 func ParseCell(id ton.BlockIDExt, proofRoot *cell.Cell) (*Parsed, error) {
 	if proofRoot == nil {
 		return nil, fmt.Errorf("block proof %s root is nil", tnstore.FormatBlockRef(id))
@@ -87,6 +138,9 @@ func ParseCell(id ton.BlockIDExt, proofRoot *cell.Cell) (*Parsed, error) {
 	proofFor := proof.ProofFor.blockID()
 	if !proofFor.Equals(&id) {
 		return nil, fmt.Errorf("block proof is for %s, expected %s", tnstore.FormatBlockRef(proofFor), tnstore.FormatBlockRef(id))
+	}
+	if proof.Signatures != nil && proofFor.Workchain != -1 {
+		return nil, fmt.Errorf("invalid ProofLink for non-masterchain block %s with validator signatures present", tnstore.FormatBlockRef(id))
 	}
 
 	block, err := ton.CheckBlockProof(proof.Root, id.RootHash)
@@ -184,6 +238,32 @@ func CheckMasterchainSignaturesWithValidators(blockID ton.BlockIDExt, block *tlb
 		return err
 	}
 	return checkMasterchainSignatureSet(blockID, sigSet, validators)
+}
+
+func LiteSignatureSet(signatures *cell.Cell) (any, error) {
+	if signatures == nil {
+		return nil, fmt.Errorf("masterchain block proof has no validator signatures")
+	}
+
+	sigSet, err := parseSignatureSet(signatures)
+	if err != nil {
+		return nil, err
+	}
+	if len(sigSet.candidateData) > 0 {
+		return ton.SignatureSetSimplex{
+			CCSeqno:          int32(sigSet.catchainSeqno),
+			ValidatorSetHash: int32(sigSet.validatorSetHash),
+			Signatures:       sigSet.signatures,
+			SessionID:        bytes.Clone(sigSet.sessionID),
+			Slot:             sigSet.slot,
+			Candidate:        bytes.Clone(sigSet.candidateData),
+		}, nil
+	}
+	return ton.SignatureSetOrdinary{
+		ValidatorSetHash: int32(sigSet.validatorSetHash),
+		CatchainSeqno:    int32(sigSet.catchainSeqno),
+		Signatures:       sigSet.signatures,
+	}, nil
 }
 
 func validateMasterchainSignatureInputs(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) error {

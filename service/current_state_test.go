@@ -10,6 +10,7 @@ import (
 	tnstore "flexserver/service/storage"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -28,7 +29,7 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 		Block: base,
 		Cell:  testShardStateCell(t, base),
 	}
-	err := store.SaveBlockStatesAndCurrentState(ctx, []*tnstore.BlockState{
+	err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{
 		masterState,
 		baseState,
 	}, &tnstore.CurrentState{
@@ -62,6 +63,140 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 	}
 	if _, err = store.BlockState(ctx, next.Block); err != nil {
 		t.Fatalf("load persisted next shard: %v", err)
+	}
+}
+
+func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+
+	master := testBlockID(-1, topShard, 60)
+	shard := testBlockID(0, topShard, 120)
+	shardKey := tnstore.ShardKeyFromBlock(shard)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+			Cell:  testShardStateCell(t, master),
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{
+			shardKey: {
+				Block:  shard,
+				Cell:   testShardStateCell(t, shard),
+				Parsed: &tlb.ShardStateUnsplit{},
+			},
+		},
+	}
+	runner := &archiveCatchUpRunner{
+		service: &Service{log: zerolog.Nop(), storage: store},
+		ctx:     ctx,
+	}
+
+	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, currentBlockStates(current), nil)
+	if err != nil {
+		t.Fatalf("persist archive current state: %v", err)
+	}
+	if persisted.Masterchain.Cell == nil {
+		t.Fatal("persisted masterchain state lost saved root")
+	}
+	shardState := persisted.Shards[shardKey]
+	if shardState.Cell == nil {
+		t.Fatal("persisted shard state lost saved root")
+	}
+	if shardState.Parsed == nil {
+		t.Fatal("persisted shard state lost parsed state")
+	}
+	if shardState.Parsed.Seqno != shard.SeqNo {
+		t.Fatalf("persisted shard state was not reparsed from saved root, seqno=%d", shardState.Parsed.Seqno)
+	}
+}
+
+func TestPersistArchiveCurrentStateStoresHistoricalAppliedStates(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+
+	master := testBlockID(-1, topShard, 70)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+			Cell:  testShardStateCell(t, master),
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	historical := &tnstore.BlockState{
+		Block: testBlockID(0, topShard, 130),
+		Cell:  testShardStateCell(t, testBlockID(0, topShard, 130)),
+	}
+	states := append([]*tnstore.BlockState{historical}, currentBlockStates(current)...)
+	runner := &archiveCatchUpRunner{
+		service: &Service{log: zerolog.Nop(), storage: store},
+		ctx:     ctx,
+	}
+
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, states, nil); err != nil {
+		t.Fatalf("persist archive current state: %v", err)
+	}
+	if _, err := store.BlockState(ctx, historical.Block); err != nil {
+		t.Fatalf("load historical archive state: %v", err)
+	}
+}
+
+func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+
+	master := testBlockID(-1, topShard, 71)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+			Cell:  testShardStateCell(t, master),
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	historicalBlock := testBlockID(0, topShard, 131)
+	historicalRoot := testShardStateCell(t, historicalBlock)
+	preparedCells, err := tnstore.PrepareReachableStateCells(historicalRoot)
+	if err != nil {
+		t.Fatalf("prepare historical cells: %v", err)
+	}
+	stateRootHash := historicalRoot.HashKey(0)
+	stateCellHash := historicalRoot.HashKey()
+	historical := &tnstore.BlockState{
+		Block:         historicalBlock,
+		StateRootHash: stateRootHash[:],
+		StateCellHash: stateCellHash[:],
+		CellsCount:    uint64(len(preparedCells)),
+	}
+
+	overlay := newArchiveStateCellOverlay(store.LazyCellLoader())
+	currentCells, err := tnstore.PrepareReachableStateCells(current.Masterchain.Cell)
+	if err != nil {
+		t.Fatalf("prepare current cells: %v", err)
+	}
+	overlay.rememberPreparedCells(currentCells)
+	overlay.rememberPreparedCells(preparedCells)
+	checkpointCells := overlay.beginCheckpoint()
+	states := append([]*tnstore.BlockState{historical}, currentBlockStates(current)...)
+	runner := &archiveCatchUpRunner{
+		service: &Service{log: zerolog.Nop(), storage: store},
+		ctx:     ctx,
+	}
+
+	if _, err = runner.persistArchiveCurrentState(current, 1, 0, states, checkpointCells); err != nil {
+		t.Fatalf("persist archive current state: %v", err)
+	}
+	if _, err = store.BlockState(ctx, historical.Block); err != nil {
+		t.Fatalf("load historical archive state: %v", err)
+	}
+	if _, _, err = store.LoadStateCellTree(ctx, historical.Block, historical.StateRootHash); err != nil {
+		t.Fatalf("load historical archive state cells: %v", err)
 	}
 }
 

@@ -40,7 +40,7 @@ func (s *Service) publishLiveBlock(downloaded p2p.DownloadedBlock, flushed bool)
 	cacheFlushed := flushed
 	if !downloaded.VerifiedFileHash {
 		blockData = nil
-		cacheFlushed = true
+		cacheFlushed = false
 	}
 	if err = cache.SetLiveBlock(downloaded.ID, root, blockData, cacheFlushed); err != nil {
 		s.log.Debug().

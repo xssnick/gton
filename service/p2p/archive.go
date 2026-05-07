@@ -627,7 +627,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		s.noteArchivePeerSuccess(resolved.Shard, peer, offset, downloadElapsed)
 	}
 
-	s.log.Info().
+	downloadEvent := s.log.Info().
 		Uint32("masterchain_seqno", resolved.MasterchainSeqno).
 		Int32("workchain", resolved.Shard.Workchain).
 		Str("shard", fmt.Sprintf("%016x", uint64(resolved.Shard.Shard))).
@@ -635,8 +635,23 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		Int64("bytes", offset).
 		Dur("elapsed", downloadElapsed).
 		Str("speed", formatByteRate(offset, downloadElapsed)).
-		Str("peer", peer.addr).
-		Msg("archive slice downloaded")
+		Str("peer", peer.addr)
+	if importResult.imported != nil && importResult.imported.Stats != nil {
+		stats := importResult.imported.Stats
+		downloadEvent.
+			Int("entries", stats.Entries).
+			Int("blocks", stats.Blocks).
+			Int("full_blocks", stats.FullBlocks).
+			Int("proofs", stats.Proofs).
+			Int("proof_links", stats.ProofLinks).
+			Dur("archive_import_elapsed", stats.ImportElapsed).
+			Dur("archive_process_elapsed", stats.ProcessingElapsed).
+			Dur("block_prepare_elapsed", stats.BlockPrepareElapsed).
+			Dur("master_shard_parse_elapsed", stats.MasterchainShardParse).
+			Uint64("state_update_cells", stats.StateUpdateCells).
+			Dur("state_update_cell_prepare", stats.StateUpdateCellPrepare)
+	}
+	downloadEvent.Msg("archive slice downloaded")
 
 	return &archive.Downloaded{
 		MasterchainSeqno: resolved.MasterchainSeqno,

@@ -17,6 +17,7 @@ type testStateStore struct {
 	current  *storage.CurrentState
 	progress *storage.CurrentState
 	seen     *ton.BlockIDExt
+	keyBlock *ton.BlockIDExt
 	blocks   map[string]*storage.BlockState
 	trees    map[string]testStateCellTree
 }
@@ -50,14 +51,11 @@ func (s *testStateStore) SaveCurrentState(_ context.Context, state *storage.Curr
 	return nil
 }
 
-func (s *testStateStore) SaveBlockStateAndCurrentState(_ context.Context, block *storage.BlockState, current *storage.CurrentState) error {
-	if block == nil {
-		return s.SaveBlockStatesAndCurrentState(context.Background(), nil, current)
-	}
-	return s.SaveBlockStatesAndCurrentState(context.Background(), []*storage.BlockState{block}, current)
+func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+	return s.SaveStateCheckpointWithCells(context.Background(), blocks, current, nil)
 }
 
-func (s *testStateStore) SaveBlockStatesAndCurrentState(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+func (s *testStateStore) SaveStateCheckpointWithCells(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState, _ []storage.EncodedCellRecord) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}
@@ -146,6 +144,29 @@ func (s *testStateStore) SeenMasterchainBlock(_ context.Context) (ton.BlockIDExt
 	return *s.seen, nil
 }
 
+func (s *testStateStore) SaveVerifiedKeyBlockProgress(_ context.Context, block ton.BlockIDExt) error {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if s.keyBlock != nil && s.keyBlock.SeqNo >= block.SeqNo {
+		return nil
+	}
+
+	next := block
+	s.keyBlock = &next
+	return nil
+}
+
+func (s *testStateStore) VerifiedKeyBlockProgress(_ context.Context) (ton.BlockIDExt, error) {
+	s.mx.RLock()
+	defer s.mx.RUnlock()
+
+	if s.keyBlock == nil {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return *s.keyBlock, nil
+}
+
 func (s *testStateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt, root *cell.Cell, _ []cell.Cell, totalCells uint64) (*cell.Cell, error) {
 	if root == nil {
 		return nil, fmt.Errorf("state cell tree root is nil")
@@ -198,14 +219,6 @@ func (s *testStateStore) SaveBlockState(_ context.Context, state *storage.BlockS
 	cloned := storage.CloneBlockState(state)
 	fillTestBlockStateHashes(cloned)
 	s.blocks[storage.BlockKey(state.Block)] = cloned
-	return nil
-}
-
-func (s *testStateStore) StageBlockState(ctx context.Context, state *storage.BlockState) error {
-	return s.SaveBlockState(ctx, state)
-}
-
-func (s *testStateStore) FlushStagedBlockStates(context.Context) error {
 	return nil
 }
 

@@ -18,19 +18,17 @@ import (
 	"flexserver/service/storage/pebblestore"
 
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 	store := openTestPebbleStore(t)
 
-	block10 := testBlockID(0, topShard, 10)
-	block11 := testBlockID(0, topShard, 11)
+	block10, block10Data := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
-		{name: testEntryName("block", block10), data: []byte{0x10, 0x01}},
+		{name: testEntryName("block", block10), data: block10Data},
 		{name: testEntryName("prooflink", block10), data: []byte{0x10, 0x02}},
-		{name: testEntryName("proof", block11), data: []byte{0x11, 0x01}},
 		{name: "ignored_file", data: []byte{0x99}},
-		{name: testEntryName("block", block11), data: []byte{0x11, 0x02}},
 	})
 
 	var imported []ton.BlockIDExt
@@ -51,10 +49,10 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 		t.Fatalf("import archive: %v", err)
 	}
 
-	if stats.Entries != 4 || stats.IgnoredEntries != 1 || stats.Blocks != 2 || stats.Proofs != 1 || stats.ProofLinks != 1 || stats.FullBlocks != 2 || stats.Links != 1 {
+	if stats.Entries != 2 || stats.IgnoredEntries != 1 || stats.Blocks != 1 || stats.Proofs != 0 || stats.ProofLinks != 1 || stats.FullBlocks != 1 || stats.Links != 0 {
 		t.Fatalf("unexpected stats: %#v", stats)
 	}
-	if len(imported) != 2 || !imported[0].Equals(&block10) || !imported[1].Equals(&block11) {
+	if len(imported) != 1 || !imported[0].Equals(&block10) {
 		t.Fatalf("unexpected direct imports: %#v", imported)
 	}
 
@@ -66,29 +64,14 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 		t.Fatalf("unexpected block 10 full: %#v", full10)
 	}
 
-	full11, err := store.BlockFull(context.Background(), block11)
-	if err != nil {
-		t.Fatalf("load block 11: %v", err)
-	}
-	if full11.IsLink || string(full11.Proof) != string([]byte{0x11, 0x01}) {
-		t.Fatalf("unexpected block 11 full: %#v", full11)
-	}
-
-	next, err := store.NextBlockFull(context.Background(), block10)
-	if err != nil {
-		t.Fatalf("load next block: %v", err)
-	}
-	if !next.ID.Equals(&block11) {
-		t.Fatalf("unexpected next block: got=%s want=%s", storage.FormatBlockRef(next.ID), storage.FormatBlockRef(block11))
-	}
 }
 
 func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 	store := openTestPebbleStore(t)
 
-	block := testBlockID(0, topShard, 12)
+	block, blockData := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
-		{name: testEntryName("block", block), data: []byte{0x12, 0x01}},
+		{name: testEntryName("block", block), data: blockData},
 		{name: testEntryName("proof", block), data: []byte{0x12, 0x02}},
 	})
 	data, err := os.ReadFile(path)
@@ -107,6 +90,15 @@ func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 	if len(imported.FullBlocks) != 1 {
 		t.Fatalf("expected one full block, got %d", len(imported.FullBlocks))
 	}
+	if len(imported.PreparedBlocks) != 1 {
+		t.Fatalf("expected one prepared block, got %d", len(imported.PreparedBlocks))
+	}
+	if imported.Stats.StateUpdateCells == 0 {
+		t.Fatal("expected prepared state update cells")
+	}
+	if imported.Stats.BlockPrepareElapsed <= 0 {
+		t.Fatal("expected block prepare timing")
+	}
 
 	imported.SetArtifactPath(path)
 	if err = imported.Store(ImportSink{Writer: store}); err != nil {
@@ -117,8 +109,38 @@ func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load streamed block: %v", err)
 	}
-	if string(full.Block) != string([]byte{0x12, 0x01}) || string(full.Proof) != string([]byte{0x12, 0x02}) {
+	if string(full.Block) != string(blockData) || string(full.Proof) != string([]byte{0x12, 0x02}) {
 		t.Fatalf("unexpected streamed full block: %#v", full)
+	}
+}
+
+func TestPrepareImportedBlockBuildsStateMetaAndPreparedCells(t *testing.T) {
+	block, blockData := readMasterchainBlockFixture(t)
+
+	prepared, err := prepareImportedBlock(block, blockData)
+	if err != nil {
+		t.Fatalf("prepare imported block: %v", err)
+	}
+	if prepared.State == nil {
+		t.Fatal("state meta was not prepared")
+	}
+	if prepared.State.Cell != nil {
+		t.Fatal("archive-imported state meta should not retain materialized cell root")
+	}
+	if !bytes.Equal(prepared.State.StateRootHash, prepared.Meta.StateRootHash) {
+		t.Fatalf("state root hash mismatch: got=%x want=%x", prepared.State.StateRootHash, prepared.Meta.StateRootHash)
+	}
+	if got := len(prepared.State.StateCellHash); got != 32 {
+		t.Fatalf("state cell hash len = %d, want 32", got)
+	}
+	if prepared.State.CellsCount != uint64(len(prepared.StateUpdateToCells)) {
+		t.Fatalf("state cells count = %d, want %d", prepared.State.CellsCount, len(prepared.StateUpdateToCells))
+	}
+
+	var stateCellHash cell.Hash
+	copy(stateCellHash[:], prepared.State.StateCellHash)
+	if len(prepared.StateUpdateToCells[stateCellHash]) == 0 {
+		t.Fatalf("prepared update_to cells do not contain state root %x", prepared.State.StateCellHash)
 	}
 }
 
@@ -140,17 +162,14 @@ func TestParseEntryName(t *testing.T) {
 func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
 	store := openTestPebbleStore(t)
 
-	master := testBlockID(-1, topShard, 42)
-	base := testBlockID(0, topShard, 1000)
+	master, masterData := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
-		{name: testEntryName("block", base), data: []byte{0x10}},
-		{name: testEntryName("proof", base), data: []byte{0x11}},
-		{name: testEntryName("block", master), data: []byte{0x20}},
+		{name: testEntryName("block", master), data: masterData},
 		{name: testEntryName("proof", master), data: []byte{0x21}},
 	})
 
 	stats, err := ImportFile(context.Background(), &Downloaded{
-		MasterchainSeqno: 42,
+		MasterchainSeqno: master.SeqNo,
 		Shard:            ShardID{Workchain: -1, Shard: topShard},
 		Path:             path,
 	}, ImportSink{
@@ -165,6 +184,54 @@ func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
 	if stats.MasterchainFirstSeqno != master.SeqNo || stats.MasterchainLastSeqno != master.SeqNo {
 		t.Fatalf("unexpected masterchain stats range: first=%d last=%d", stats.MasterchainFirstSeqno, stats.MasterchainLastSeqno)
 	}
+}
+
+func readMasterchainBlockFixture(t *testing.T) (ton.BlockIDExt, []byte) {
+	t.Helper()
+
+	rawFixture, err := os.ReadFile("../testdata/masterchain_block_fixture.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	var fixture struct {
+		Block struct {
+			Workchain   int32  `json:"workchain"`
+			Shard       string `json:"shard"`
+			SeqNo       uint32 `json:"seqno"`
+			RootHashHex string `json:"root_hash_hex"`
+			FileHashHex string `json:"file_hash_hex"`
+		} `json:"block"`
+		RawBOCBase64 string `json:"raw_boc_base64"`
+	}
+	if err = json.Unmarshal(rawFixture, &fixture); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+
+	blockData, err := base64.StdEncoding.DecodeString(fixture.RawBOCBase64)
+	if err != nil {
+		t.Fatalf("decode block boc base64: %v", err)
+	}
+	rootHash, err := hex.DecodeString(fixture.Block.RootHashHex)
+	if err != nil {
+		t.Fatalf("decode root hash: %v", err)
+	}
+	fileHash, err := hex.DecodeString(fixture.Block.FileHashHex)
+	if err != nil {
+		t.Fatalf("decode file hash: %v", err)
+	}
+	shard, err := strconv.ParseUint(fixture.Block.Shard, 16, 64)
+	if err != nil {
+		t.Fatalf("parse shard: %v", err)
+	}
+
+	return ton.BlockIDExt{
+		Workchain: fixture.Block.Workchain,
+		Shard:     int64(shard),
+		SeqNo:     fixture.Block.SeqNo,
+		RootHash:  rootHash,
+		FileHash:  fileHash,
+	}, blockData
 }
 
 func openTestPebbleStore(tb testing.TB) *pebblestore.Store {

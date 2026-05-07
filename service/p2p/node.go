@@ -66,7 +66,7 @@ type Node struct {
 	runCtx             context.Context
 	zeroStateFileHash  []byte
 	zeroStateBlock     ton.BlockIDExt
-	trustedInitBlock   ton.BlockIDExt
+	initBlock          ton.BlockIDExt
 	externalPort       uint16
 	dhtListenAddr      string
 	storage            storage2.Storage
@@ -97,6 +97,10 @@ type Node struct {
 	downloadPeerMx            sync.RWMutex
 	downloadPeerLeases        map[string]int
 	stateCellImportSlot       chan struct{}
+}
+
+type stateFileDirectoryProvider interface {
+	StateFilesDir() string
 }
 
 func New(opts Options) (*Node, error) {
@@ -158,7 +162,8 @@ func New(opts Options) (*Node, error) {
 		return nil, fmt.Errorf("peer serving storage is required")
 	}
 
-	stateDownloadDir, stateDownloadDirOwned, err := prepareStateDownloadDir(opts.StateDownloadDir)
+	stateDirProvider, _ := peerStorage.(stateFileDirectoryProvider)
+	stateDownloadDir, stateDownloadDirOwned, err := prepareStateDownloadDir(opts.StateDownloadDir, stateDirProvider)
 	if err != nil {
 		return nil, fmt.Errorf("prepare state download dir: %w", err)
 	}
@@ -195,7 +200,7 @@ func New(opts Options) (*Node, error) {
 	}, nil
 }
 
-func prepareStateDownloadDir(dir string) (string, bool, error) {
+func prepareStateDownloadDir(dir string, provider stateFileDirectoryProvider) (string, bool, error) {
 	if strings.TrimSpace(dir) != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", false, err
@@ -206,8 +211,26 @@ func prepareStateDownloadDir(dir string) (string, bool, error) {
 		return dir, false, nil
 	}
 
-	dir, err := os.MkdirTemp("", "flexserver-state-downloads-*")
-	return dir, true, err
+	if provider != nil {
+		dir = provider.StateFilesDir()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", false, err
+		}
+		if err := removeIncompleteStateDownloadFiles(dir); err != nil {
+			return "", false, err
+		}
+		return dir, false, nil
+	}
+
+	dir, err := os.MkdirTemp("", "flexserver-states-*")
+	if err != nil {
+		return "", false, err
+	}
+	if err := removeIncompleteStateDownloadFiles(dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", false, err
+	}
+	return dir, true, nil
 }
 
 func privateKeyOrGenerate(key ed25519.PrivateKey) (ed25519.PrivateKey, error) {
@@ -236,17 +259,20 @@ func (n *Node) Start(ctx context.Context) error {
 		return fmt.Errorf("load TON config: %w", err)
 	}
 
-	n.runCtx = ctx
-	n.zeroStateFileHash = append([]byte(nil), cfg.Validator.ZeroState.FileHash...)
-	n.zeroStateBlock = ton.BlockIDExt{
-		Workchain: cfg.Validator.ZeroState.Workchain,
-		Shard:     cfg.Validator.ZeroState.Shard,
-		SeqNo:     cfg.Validator.ZeroState.SeqNo,
-		RootHash:  append([]byte(nil), cfg.Validator.ZeroState.RootHash...),
-		FileHash:  append([]byte(nil), cfg.Validator.ZeroState.FileHash...),
+	zeroBlock := blockIDFromConfig(cfg.Validator.ZeroState)
+	if zeroBlock.Workchain != -1 || zeroBlock.Shard != topShard || zeroBlock.SeqNo != 0 || !validBlockID(zeroBlock) {
+		return fmt.Errorf("global config contains invalid zero_state")
 	}
-	n.trustedInitBlock = ton.BlockIDExt(cfg.Validator.InitBlock)
 
+	initBlock, err := initBlockFromConfig(cfg.Validator.InitBlock, zeroBlock)
+	if err != nil {
+		return err
+	}
+
+	n.runCtx = ctx
+	n.zeroStateFileHash = append([]byte(nil), zeroBlock.FileHash...)
+	n.zeroStateBlock = zeroBlock
+	n.initBlock = initBlock
 	specs, err := buildOverlaySpecs(n.zeroStateFileHash)
 	if err != nil {
 		return err
@@ -557,11 +583,20 @@ func (n *Node) logLatestBlockWaitProgress(startedAt time.Time, chain string) {
 		Msgf("waiting for latest %s block broadcast", chain)
 }
 
-func (n *Node) TrustedInitBlock() (ton.BlockIDExt, error) {
-	if !validBlockID(n.trustedInitBlock) {
+func (n *Node) ZeroStateBlock() (ton.BlockIDExt, error) {
+	block, ok := n.configuredZeroStateBlock()
+	if !ok {
 		return ton.BlockIDExt{}, storage2.ErrNotFound
 	}
-	return n.trustedInitBlock, nil
+	return block, nil
+}
+
+func (n *Node) InitBlock() (ton.BlockIDExt, error) {
+	block, ok := n.configuredInitBlock()
+	if !ok {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+	return block, nil
 }
 
 func (n *Node) configuredZeroStateBlock() (ton.BlockIDExt, bool) {
@@ -569,6 +604,43 @@ func (n *Node) configuredZeroStateBlock() (ton.BlockIDExt, bool) {
 		return ton.BlockIDExt{}, false
 	}
 	return n.zeroStateBlock, true
+}
+
+func (n *Node) configuredInitBlock() (ton.BlockIDExt, bool) {
+	if n.initBlock.Workchain != -1 || n.initBlock.Shard != topShard || !validBlockID(n.initBlock) {
+		return ton.BlockIDExt{}, false
+	}
+	return n.initBlock, true
+}
+
+func blockIDFromConfig(block liteclient.ConfigBlock) ton.BlockIDExt {
+	return ton.BlockIDExt{
+		Workchain: block.Workchain,
+		Shard:     block.Shard,
+		SeqNo:     block.SeqNo,
+		RootHash:  append([]byte(nil), block.RootHash...),
+		FileHash:  append([]byte(nil), block.FileHash...),
+	}
+}
+
+func initBlockFromConfig(block liteclient.ConfigBlock, zeroBlock ton.BlockIDExt) (ton.BlockIDExt, error) {
+	if emptyConfigBlock(block) {
+		return zeroBlock, nil
+	}
+
+	initBlock := blockIDFromConfig(block)
+	if initBlock.Workchain != -1 || initBlock.Shard != topShard || !validBlockID(initBlock) {
+		return ton.BlockIDExt{}, fmt.Errorf("global config contains invalid init_block")
+	}
+	return initBlock, nil
+}
+
+func emptyConfigBlock(block liteclient.ConfigBlock) bool {
+	return block.Workchain == 0 &&
+		block.Shard == 0 &&
+		block.SeqNo == 0 &&
+		len(block.RootHash) == 0 &&
+		len(block.FileHash) == 0
 }
 
 func (n *Node) runZeroStateBootstrap(ctx context.Context) {

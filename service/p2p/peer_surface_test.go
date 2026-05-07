@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -388,6 +389,77 @@ func TestAcceptBroadcastUsesUnboundedBacklog(t *testing.T) {
 
 	if count != total {
 		t.Fatalf("unexpected number of queued broadcasts: got %d want %d", count, total)
+	}
+}
+
+func TestAcceptBroadcastCachesDecodedShardBlock(t *testing.T) {
+	store := newTestPeerStore()
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: store,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	node.blockCacheSlots = nil
+
+	block := testBlockID(0, topShard, 42)
+	downloaded := &DownloadedBlock{
+		ID:               block,
+		BlockBOC:         []byte{0xAA, 0xBB},
+		ProofBOC:         []byte{0xCC},
+		VerifiedFileHash: true,
+	}
+	node.acceptBroadcast(acceptedBroadcast{
+		fingerprint: "shard-full-block",
+		event: &BroadcastEvent{
+			Overlay:    "basechain",
+			Kind:       "tonNode.blockBroadcast",
+			Block:      block,
+			Downloaded: downloaded,
+		},
+	})
+
+	full, err := store.BlockFull(context.Background(), block)
+	if err != nil {
+		t.Fatalf("load cached block: %v", err)
+	}
+	if !bytes.Equal(full.Block, downloaded.BlockBOC) || !bytes.Equal(full.Proof, downloaded.ProofBOC) {
+		t.Fatalf("unexpected cached payload %#v", full)
+	}
+}
+
+func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
+	store := newTestPeerStore()
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: store,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	node.blockCacheSlots = nil
+
+	block := testBlockID(-1, topShard, 42)
+	node.acceptBroadcast(acceptedBroadcast{
+		fingerprint: "master-full-block",
+		event: &BroadcastEvent{
+			Overlay: "masterchain",
+			Kind:    "tonNode.blockBroadcast",
+			Block:   block,
+			Downloaded: &DownloadedBlock{
+				ID:               block,
+				BlockBOC:         []byte{0xAA, 0xBB},
+				ProofBOC:         []byte{0xCC},
+				VerifiedFileHash: true,
+			},
+		},
+	})
+
+	if _, err := store.BlockFull(context.Background(), block); err == nil {
+		t.Fatal("unverified masterchain broadcast was cached")
 	}
 }
 

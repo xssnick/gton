@@ -6,7 +6,11 @@ import (
 	"math/bits"
 	"time"
 
+	"flexserver/service/storage"
+
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const topShard = int64(-1 << 63)
@@ -48,8 +52,22 @@ type ImportStats struct {
 	ShardArchives          int
 	DownloadElapsed        time.Duration
 	ImportElapsed          time.Duration
+	ProcessingElapsed      time.Duration
+	BlockPrepareElapsed    time.Duration
+	MasterchainShardParse  time.Duration
+	StateUpdateCells       uint64
+	StateUpdateCellPrepare time.Duration
 	ContainsShardBlocks    bool
 	MasterchainShardBlocks []ton.BlockIDExt
+}
+
+type PreparedBlock struct {
+	Block                     *cell.Cell
+	Parsed                    *tlb.Block
+	Meta                      *storage.BlockMeta
+	State                     *storage.BlockState
+	StateUpdateToCells        map[cell.Hash][]byte
+	StateUpdateToCellsElapsed time.Duration
 }
 
 func ShardIDFromBlock(block ton.BlockIDExt) ShardID {

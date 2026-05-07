@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"flexserver/service/p2p"
@@ -46,6 +47,9 @@ type nextSyncRunner struct {
 
 	timing                       catchUpTiming
 	stagedBlocks                 uint32
+	checkpointMu                 sync.Mutex
+	checkpointStates             appliedStateSet
+	stateCells                   *stateCellWindowCache
 	shardCache                   map[string]*storage.BlockState
 	shardResolver                *shardStateResolver
 	shardResolverSeen            shardStateResolverStats
@@ -135,16 +139,18 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 		totalBlocks:                  totalBlocks,
 		maxBlocks:                    maxBlocks,
 		timing:                       newCatchUpTiming(now),
+		stateCells:                   newStateCellWindowCache(s.stateCellLoader()),
 		shardCache:                   map[string]*storage.BlockState{},
 		lastProgressMasterSeqno:      master.Block.SeqNo,
 		lastProgressShardClientSeqno: current.Masterchain.Block.SeqNo,
 	}
 	r.shardResolver = newShardStateResolver(runCtx, shardStateResolverConfig{
-		current:   r.current.Shards,
-		cache:     r.shardCache,
-		loadState: s.loadBlockStateForApply,
-		loadBlock: s.loadOrDownloadBlockForApply,
-		apply:     s.applyResolvedShardBlock,
+		current:         r.current.Shards,
+		cache:           r.shardCache,
+		loadState:       s.loadBlockStateForApply,
+		loadBlock:       s.loadOrDownloadBlockForApply,
+		apply:           r.applyResolvedShardBlock,
+		afterApplyState: r.afterApplyShardState,
 	})
 	return r.run()
 }
@@ -321,17 +327,17 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 		downloadElapsed: item.downloadElapsed,
 	}
 
-	nextMaster, applyTiming, err := r.service.applyMasterchainTransition(master, item.block)
+	nextMaster, applyTiming, err := r.service.applyMasterchainTransitionWithConsensusProof(master, item.block, nil, r.stateCells)
 	applied.applyTiming = applyTiming
 	if err != nil {
 		applied.err = err
 		return applied, err
 	}
 
-	previous := master.Block
 	r.service.publishLiveBlock(item.block, false)
-	if r.service.node != nil {
-		r.service.node.RememberVerifiedBlockFullAsync(&previous, item.block)
+	if err = r.service.stageAppliedBlockArtifact(r.ctx, item.block); err != nil {
+		applied.err = err
+		return applied, err
 	}
 	if err = r.service.rememberSeenMasterchainBlock(r.ctx, nextMaster.Block); err != nil {
 		applied.err = err
@@ -523,7 +529,9 @@ func (r *nextSyncRunner) flushStagedCurrent() error {
 	if r.stagedBlocks == 0 {
 		return nil
 	}
-	next, err := r.service.persistNextBlockCurrentState(r.current, &r.timing)
+	states := r.takeCheckpointStates(r.current)
+	cells := r.stateCells.beginCheckpoint()
+	next, err := r.service.persistNextBlockCurrentState(r.current, &r.timing, states, cells)
 	if err != nil {
 		return err
 	}
@@ -536,7 +544,9 @@ func (r *nextSyncRunner) flushStagedCurrentSync(reason string) error {
 	if r.stagedBlocks == 0 {
 		return nil
 	}
-	next, err := r.service.persistNextBlockCurrentStateSync(r.current, &r.timing, reason)
+	states := r.takeCheckpointStates(r.current)
+	cells := r.stateCells.beginCheckpoint()
+	next, err := r.service.persistNextBlockCurrentStateSync(r.current, &r.timing, reason, states, cells)
 	if err != nil {
 		return err
 	}
@@ -570,14 +580,10 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	shardStats.apply += resolverStats.applyElapsed
 	shardStats.applied += resolverStats.blocksApplied
 	shardStats.reused += resolverStats.blocksReused
+	r.rememberCheckpointState(item.master)
 
 	r.current = nextCurrent
 	r.shardResolver.updateCurrent(r.current.Shards)
-	stageStarted := time.Now()
-	if err := r.service.stageCurrentBlockStates(r.ctx, r.current); err != nil {
-		return fmt.Errorf("stage live current state %s: %w", storage.FormatBlockRef(r.current.Masterchain.Block), err)
-	}
-	r.timing.persist += time.Since(stageStarted)
 	r.service.publishLiveCurrentState(r.current)
 	if r.service.liveState != nil {
 		r.service.liveState.SetLiveCurrentState(r.current)
@@ -591,7 +597,9 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	r.stagedBlocks++
 
 	if r.stagedBlocks >= nextBlockCatchUpCheckpointBlocks || r.reachedTarget() {
-		r.current, err = r.service.persistNextBlockCurrentState(r.current, &r.timing)
+		states := r.takeCheckpointStates(r.current)
+		cells := r.stateCells.beginCheckpoint()
+		r.current, err = r.service.persistNextBlockCurrentState(r.current, &r.timing, states, cells)
 		if err != nil {
 			return err
 		}
@@ -612,6 +620,26 @@ func (r *nextSyncRunner) takeShardResolverStats() shardStateResolverStats {
 	}
 	r.shardResolverSeen = stats
 	return delta
+}
+
+func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded p2p.DownloadedBlock, _ time.Duration) error {
+	if err := r.service.stageAppliedBlockArtifact(ctx, downloaded); err != nil {
+		return err
+	}
+	r.rememberCheckpointState(state)
+	return nil
+}
+
+func (r *nextSyncRunner) rememberCheckpointState(state *storage.BlockState) {
+	r.checkpointMu.Lock()
+	r.checkpointStates.remember(state)
+	r.checkpointMu.Unlock()
+}
+
+func (r *nextSyncRunner) takeCheckpointStates(current *storage.CurrentState) []*storage.BlockState {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+	return r.checkpointStates.takeWithCurrent(current)
 }
 
 func (r *nextSyncRunner) reachedTarget() bool {

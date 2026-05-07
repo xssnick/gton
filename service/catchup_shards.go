@@ -93,7 +93,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				return
 			}
 
-			downloaded, err = prepareDownloadedBlock(downloaded)
+			downloaded, err = prepareDownloadedBlockStateCells(downloaded)
 			if err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
 				return
@@ -211,8 +211,8 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 				downloadStarted := time.Now()
 				downloaded, err := s.downloadExactChainBlockWithRetry(ctx, job.block)
 				downloadElapsed := time.Since(downloadStarted)
-				if err == nil && downloaded.Parsed == nil {
-					downloaded, err = prepareDownloadedBlock(downloaded)
+				if err == nil {
+					downloaded, err = prepareDownloadedBlockStateCells(downloaded)
 				}
 				item := shardStateDownload{
 					prev:            job.prev,

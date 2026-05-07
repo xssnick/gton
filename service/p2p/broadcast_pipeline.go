@@ -151,6 +151,9 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 
 	if accepted.event != nil {
 		n.trackUnverifiedBroadcastBlock(*accepted.event)
+		if accepted.event.Downloaded != nil && accepted.event.Downloaded.ID.Equals(&accepted.event.Block) {
+			n.rememberDownloadedBlockAsync(nil, accepted.event.Downloaded)
+		}
 		_ = n.eventQueue.Push(*accepted.event)
 	}
 

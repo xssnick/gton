@@ -38,11 +38,11 @@ type StateStorage interface {
 	ClearStateSyncProgress(ctx context.Context) error
 	SaveSeenMasterchainBlock(ctx context.Context, block ton.BlockIDExt) error
 	SeenMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error)
+	SaveVerifiedKeyBlockProgress(ctx context.Context, block ton.BlockIDExt) error
+	VerifiedKeyBlockProgress(ctx context.Context) (ton.BlockIDExt, error)
 	SaveBlockState(ctx context.Context, state *BlockState) error
-	StageBlockState(ctx context.Context, state *BlockState) error
-	FlushStagedBlockStates(ctx context.Context) error
-	SaveBlockStateAndCurrentState(ctx context.Context, block *BlockState, current *CurrentState) error
-	SaveBlockStatesAndCurrentState(ctx context.Context, blocks []*BlockState, current *CurrentState) error
+	SaveStateCheckpoint(ctx context.Context, blocks []*BlockState, current *CurrentState) error
+	SaveStateCheckpointWithCells(ctx context.Context, blocks []*BlockState, current *CurrentState, cells []EncodedCellRecord) error
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
 }
 
@@ -69,16 +69,14 @@ func CloneBlockState(state *BlockState) *BlockState {
 	}
 
 	return &BlockState{
-		Block:            state.Block,
-		StateRootHash:    bytes.Clone(state.StateRootHash),
-		StateCellHash:    bytes.Clone(state.StateCellHash),
-		StateFileHash:    bytes.Clone(state.StateFileHash),
-		CellsCount:       state.CellsCount,
-		Cell:             state.Cell,
-		Parsed:           state.Parsed,
-		DownloadedAt:     state.DownloadedAt,
-		ReusedStateCells: append([]cell.MerkleUpdateReusedCell(nil), state.ReusedStateCells...),
-		ReusedStateRefs:  append([]cell.MerkleUpdateReusedRef(nil), state.ReusedStateRefs...),
+		Block:         state.Block,
+		StateRootHash: bytes.Clone(state.StateRootHash),
+		StateCellHash: bytes.Clone(state.StateCellHash),
+		StateFileHash: bytes.Clone(state.StateFileHash),
+		CellsCount:    state.CellsCount,
+		Cell:          state.Cell,
+		Parsed:        state.Parsed,
+		DownloadedAt:  state.DownloadedAt,
 	}
 }
 

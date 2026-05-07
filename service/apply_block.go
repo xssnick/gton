@@ -15,6 +15,10 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+type stateUpdateApplier interface {
+	applyBlockStateUpdate(previous []*tnstore.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error)
+}
+
 func prepareDownloadedBlock(downloaded p2p.DownloadedBlock) (p2p.DownloadedBlock, error) {
 	if downloaded.Parsed == nil {
 		root, err := downloadedBlockRoot(downloaded)
@@ -47,6 +51,25 @@ func prepareDownloadedBlock(downloaded p2p.DownloadedBlock) (p2p.DownloadedBlock
 	return downloaded, nil
 }
 
+func prepareDownloadedBlockStateCells(downloaded p2p.DownloadedBlock) (p2p.DownloadedBlock, error) {
+	downloaded, err := prepareDownloadedBlock(downloaded)
+	if err != nil {
+		return p2p.DownloadedBlock{}, err
+	}
+	if downloaded.StateUpdateToCells != nil {
+		return downloaded, nil
+	}
+
+	started := time.Now()
+	cells, err := tnstore.PrepareStateUpdateCells(downloaded.Parsed.StateUpdate)
+	if err != nil {
+		return p2p.DownloadedBlock{}, fmt.Errorf("prepare state update target cells for %s: %w", downloaded.BlockRef(), err)
+	}
+	downloaded.StateUpdateToCells = cells
+	downloaded.StateUpdateToCellsElapsed = time.Since(started)
+	return downloaded, nil
+}
+
 func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
 	root := downloaded.Block
 	if root == nil {
@@ -64,7 +87,7 @@ func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
 	return unwrapped, nil
 }
 
-func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (p2p.DownloadedBlock, error) {
+func prepareBlockData(kind string, id ton.BlockIDExt, data []byte) (p2p.DownloadedBlock, error) {
 	root, err := cell.FromBOC(data)
 	if err != nil {
 		return p2p.DownloadedBlock{}, fmt.Errorf("parse %s boc %s: %w", kind, tnstore.FormatBlockRef(id), err)
@@ -88,6 +111,14 @@ func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (p2p.
 		VerifiedFileHash: true,
 	}
 	return prepareDownloadedBlock(downloaded)
+}
+
+func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (p2p.DownloadedBlock, error) {
+	downloaded, err := prepareBlockData(kind, id, data)
+	if err != nil {
+		return p2p.DownloadedBlock{}, err
+	}
+	return prepareDownloadedBlockStateCells(downloaded)
 }
 
 func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt, persistMeta bool) (p2p.DownloadedBlock, error) {
@@ -118,27 +149,35 @@ func ApplyBlock(current *tnstore.BlockState, downloaded p2p.DownloadedBlock) (*t
 }
 
 func ApplyBlockWithPreviousStates(previous []*tnstore.BlockState, downloaded p2p.DownloadedBlock) (*tnstore.BlockState, error) {
+	return applyBlockWithPreviousStates(previous, downloaded, nil)
+}
+
+func applyBlockWithPreviousStates(previous []*tnstore.BlockState, downloaded p2p.DownloadedBlock, applier stateUpdateApplier) (*tnstore.BlockState, error) {
 	downloaded, err := prepareDownloadedBlock(downloaded)
 	if err != nil {
 		return nil, err
 	}
 
-	currentRoot, err := previousStateRoot(previous)
-	if err != nil {
-		return nil, err
+	stateUpdate := downloaded.Parsed.StateUpdate
+	var nextRoot *cell.Cell
+	if applier != nil {
+		nextRoot, err = applier.applyBlockStateUpdate(previous, downloaded)
+	} else {
+		var currentRoot *cell.Cell
+		currentRoot, err = previousStateRoot(previous)
+		if err == nil {
+			nextRoot, _, err = cell.ApplyMerkleUpdate(currentRoot, stateUpdate)
+		}
 	}
-
-	nextRoot, reusedState, err := cell.ApplyMerkleUpdate(currentRoot, downloaded.Parsed.StateUpdate)
 	if err != nil {
 		return nil, fmt.Errorf("apply state update for %s: %w", tnstore.FormatBlockRef(downloaded.ID), err)
 	}
+
 	next, err := tnstore.ParseStateProof(&downloaded.ID, nextRoot, nil, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("parse next state from %s: %w", tnstore.FormatBlockRef(downloaded.ID), err)
 	}
 	next.DownloadedAt = time.Now()
-	next.ReusedStateCells = reusedState.Cells
-	next.ReusedStateRefs = reusedState.Refs
 	return next, nil
 }
 

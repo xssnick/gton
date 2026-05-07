@@ -6,6 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"net"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +29,7 @@ const (
 
 type Store interface {
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
+	BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error)
 	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	CurrentState(ctx context.Context) (*storage.CurrentState, error)
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error)
@@ -116,6 +120,8 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("liteserver already started")
 	}
 
+	configureLiteclientLogger(s.log)
+
 	srv := liteclient.NewServer([]ed25519.PrivateKey{s.privateKey})
 	srv.SetMessageHandler(s.handleMessage)
 	srv.SetConnectionHook(func(client *liteclient.ServerClient) error {
@@ -179,6 +185,50 @@ func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
+func configureLiteclientLogger(logger zerolog.Logger) {
+	liteclient.Logger = func(args ...any) {
+		msg := strings.TrimSpace(fmt.Sprintln(args...))
+		if msg == "" {
+			return
+		}
+
+		remoteAddr, msg := splitLiteclientLogRemote(args, msg)
+		event := logger.Debug()
+		if strings.Contains(msg, "failed to accept connection") {
+			event = logger.Warn()
+		}
+		if !event.Enabled() {
+			return
+		}
+
+		if remoteAddr != "" {
+			event = event.Str("remote_addr", remoteAddr)
+			if host, port, err := net.SplitHostPort(remoteAddr); err == nil {
+				event = event.Str("remote_ip", host).Str("remote_port", port)
+			}
+		}
+		event.Str("source", "tonutils-go/liteclient").Msg(msg)
+	}
+}
+
+func splitLiteclientLogRemote(args []any, fallback string) (string, string) {
+	if len(args) == 0 {
+		return "", fallback
+	}
+
+	first, ok := args[0].(string)
+	if !ok || len(first) < 3 || first[0] != '[' || first[len(first)-1] != ']' {
+		return "", fallback
+	}
+
+	remoteAddr := first[1 : len(first)-1]
+	msg := strings.TrimSpace(fmt.Sprintln(args[1:]...))
+	if msg == "" {
+		msg = fallback
+	}
+	return remoteAddr, msg
+}
+
 func (s *Server) handleMessage(ctx context.Context, client *liteclient.ServerClient, msg tl.Serializable) error {
 	switch m := msg.(type) {
 	case adnl.MessageQuery:
@@ -186,7 +236,11 @@ func (s *Server) handleMessage(ctx context.Context, client *liteclient.ServerCli
 	case liteclient.TCPPing:
 		return client.Send(liteclient.TCPPong{RandomID: m.RandomID})
 	case liteclient.TCPAuthenticate:
-		return client.Send(liteclient.TCPAuthenticationNonce{Nonce: randomNonce()})
+		nonce, err := randomNonce()
+		if err != nil {
+			return fmt.Errorf("generate liteserver authentication nonce: %w", err)
+		}
+		return client.Send(liteclient.TCPAuthenticationNonce{Nonce: nonce})
 	case liteclient.TCPAuthenticationComplete:
 		return nil
 	default:
@@ -195,13 +249,79 @@ func (s *Server) handleMessage(ctx context.Context, client *liteclient.ServerCli
 }
 
 func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.ServerClient, id []byte, data any) error {
-	return client.Send(adnl.MessageAnswer{ID: id, Data: s.handleQueryData(ctx, data)})
+	event := s.log.Debug()
+	if !event.Enabled() {
+		return client.Send(adnl.MessageAnswer{ID: id, Data: s.handleQueryData(ctx, data)})
+	}
+
+	query := liteserverQueryLogName(data)
+	started := time.Now()
+	resp := s.handleQueryData(ctx, data)
+	err := client.Send(adnl.MessageAnswer{ID: id, Data: resp})
+
+	event = event.
+		Str("query", query).
+		Str("response", liteserverTypeName(resp)).
+		Dur("duration", time.Since(started)).
+		Str("remote_ip", client.IP()).
+		Uint16("remote_port", client.Port()).
+		Err(err)
+	if lsErr, ok := resp.(ton.LSError); ok {
+		event = event.Int32("error_code", lsErr.Code)
+	}
+	event.Msg("handled liteserver query")
+
+	return err
 }
 
-func randomNonce() []byte {
+func randomNonce() ([]byte, error) {
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
-		return make([]byte, 32)
+		return nil, err
 	}
-	return nonce
+	return nonce, nil
+}
+
+func liteserverQueryLogName(data any) string {
+	switch q := data.(type) {
+	case liteclient.LiteServerQuery:
+		return liteserverQueryLogName(q.Data)
+	case tl.Raw:
+		items, err := parseQuerySequence(q)
+		if err != nil {
+			return "raw"
+		}
+		return liteserverQuerySequenceLogName(items)
+	case []tl.Serializable:
+		return liteserverQuerySequenceLogName(q)
+	default:
+		return liteserverTypeName(q)
+	}
+}
+
+func liteserverQuerySequenceLogName(items []tl.Serializable) string {
+	if len(items) == 0 {
+		return "empty"
+	}
+
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, liteserverQueryLogName(item))
+	}
+	return strings.Join(names, "+")
+}
+
+func liteserverTypeName(v any) string {
+	if v == nil {
+		return "nil"
+	}
+
+	t := reflect.TypeOf(v)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if name := t.Name(); name != "" {
+		return name
+	}
+	return t.String()
 }

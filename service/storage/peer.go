@@ -12,6 +12,8 @@ type PeerServingStorage interface {
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	BlockProof(ctx context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error)
 	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
+	PersistentStateSize(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (int64, error)
+	PersistentStateSlice(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64, offset int64, maxSize int64) ([]byte, error)
 	ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error)
 	ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error)
 }
@@ -23,6 +25,7 @@ type PeerServingStorageWriter interface {
 	SaveBlockData(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SaveZeroState(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
+	SavePersistentStateFile(file *PersistentStateFile) error
 	SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error)
 }
 
@@ -68,6 +71,16 @@ type ServedArchiveImport struct {
 	BlockData  []ServedBlockData
 	Proofs     []ServedBlockProof
 	Links      []ServedBlockLink
+}
+
+type PersistentStateFile struct {
+	Block            ton.BlockIDExt
+	MasterchainBlock ton.BlockIDExt
+	EffectiveShard   int64
+	Ref              *ArtifactRef
+	FileHash         []byte
+	StateRootHash    []byte
+	CellsCount       uint64
 }
 
 type ArtifactRef struct {

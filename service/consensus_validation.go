@@ -101,14 +101,24 @@ func (s *Service) validateMasterchainBlockConsensusWithProof(current *tnstore.Bl
 		return nil
 	}
 
-	signatures := downloaded.broadcastSignatures
-	if signatures == nil {
-		signatures = parsed.Proof.Signatures
-	}
-	if signatures == nil {
+	if parsed.Proof.Signatures == nil {
 		return fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(downloaded.block))
 	}
-	return s.checkMasterchainProofSignatures(current, downloaded.block, proof, signatures)
+
+	validators, err := s.masterchainValidatorsForConsensus(current, downloaded.block, parsed.Block)
+	if err != nil {
+		return err
+	}
+	if downloaded.broadcastSignatures != nil {
+		if err = blockproof.CheckMasterchainSignaturesWithValidators(downloaded.block, parsed.Block, downloaded.broadcastSignatures, validators); err != nil {
+			return fmt.Errorf("check broadcast signatures for %s: %w", tnstore.FormatBlockRef(downloaded.block), err)
+		}
+	}
+	if err = blockproof.CheckMasterchainSignaturesWithValidators(downloaded.block, parsed.Block, parsed.Proof.Signatures, validators); err != nil {
+		return err
+	}
+	proof.signaturesChecked = true
+	return nil
 }
 
 func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofBOC []byte) (*masterchainConsensusProof, error) {
@@ -117,18 +127,6 @@ func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofBOC []byte) (*m
 		return nil, err
 	}
 	return &masterchainConsensusProof{block: block, parsed: parsed}, nil
-}
-
-func (s *Service) checkMasterchainProofSignatures(current *tnstore.BlockState, blockID ton.BlockIDExt, proof *masterchainConsensusProof, signatures *cell.Cell) error {
-	validators, err := s.masterchainValidatorsForConsensus(current, blockID, proof.parsed.Block)
-	if err != nil {
-		return err
-	}
-	if err = blockproof.CheckMasterchainSignaturesWithValidators(blockID, proof.parsed.Block, signatures, validators); err != nil {
-		return err
-	}
-	proof.signaturesChecked = true
-	return nil
 }
 
 func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, block *tlb.Block) ([]*tlb.ValidatorAddr, error) {

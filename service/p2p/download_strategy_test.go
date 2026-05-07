@@ -507,7 +507,7 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 	block.RootHash = append([]byte(nil), rootHash[:]...)
 	block.FileHash = append([]byte(nil), fileHash[:]...)
 
-	proofData := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell().ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+	proofData := testBlockProofCell(t, block, testProofSignatureSet()).ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	if err = store.SaveBlockFull(&storage.ServedBlockFull{
 		ID:     block,
 		Block:  blockData,

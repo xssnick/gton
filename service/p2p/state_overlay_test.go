@@ -99,7 +99,7 @@ func TestPrepareStateDownloadDirPreservesCompletedFiles(t *testing.T) {
 		t.Fatalf("write incomplete file: %v", err)
 	}
 
-	got, owned, err := prepareStateDownloadDir(dir)
+	got, owned, err := prepareStateDownloadDir(dir, nil)
 	if err != nil {
 		t.Fatalf("prepare state download dir: %v", err)
 	}
@@ -125,9 +125,14 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		Shard:     int64(0x0800000000000000),
 		SeqNo:     63272132,
 	}
+	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
 	root := mustTestShardStateCell(t, block)
 	rootHash := root.HashKey(0)
-	path := filepath.Join(dir, "wc0-shard0800000000000000-seqno63272132-eff0000000000000000-reuse.boc")
+	name, err := persistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), 0o644); err != nil {
 		t.Fatalf("write reusable state file: %v", err)
 	}
@@ -138,7 +143,7 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		storage:          store,
 		stateDownloadDir: dir,
 	}
-	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, 0, rootHash[:])
+	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
 	if err != nil {
 		t.Fatalf("import reusable staged state file: %v", err)
 	}
@@ -152,13 +157,13 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		t.Fatalf("expected reusable state to be imported: %v", err)
 	}
 	if _, err = os.Stat(path); err != nil {
-		t.Fatalf("reusable staged file should stay until artifact cleanup: %v", err)
+		t.Fatalf("reusable state file should stay on disk: %v", err)
 	}
 	if err = staged.cleanup(); err != nil {
-		t.Fatalf("cleanup reusable staged file: %v", err)
+		t.Fatalf("cleanup reusable state file: %v", err)
 	}
-	if _, err = os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("cleanup should remove reusable staged file, got %v", err)
+	if _, err = os.Stat(path); err != nil {
+		t.Fatalf("cleanup should keep reusable state file, got %v", err)
 	}
 }
 
@@ -179,7 +184,12 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 		t.Fatalf("create split header proof: %v", err)
 	}
 
-	path := filepath.Join(dir, "wc0-shard8000000000000000-seqno63272132-eff8000000000000000-reuse.boc")
+	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	name, err := persistentStateFileName(block, master, block.Shard)
+	if err != nil {
+		t.Fatalf("split header file name: %v", err)
+	}
+	path := filepath.Join(dir, name)
 	if err = os.WriteFile(path, proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), 0o644); err != nil {
 		t.Fatalf("write reusable split header file: %v", err)
 	}
@@ -193,7 +203,7 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	header, err := persistentStateSnapshotDownloader{
 		node:          node,
 		block:         block,
-		master:        ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo},
+		master:        master,
 		stateRootHash: rootHash[:],
 	}.tryLoadReusableSplitHeader(ctx, 4)
 	if err != nil {
@@ -213,6 +223,9 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	}
 	if err = header.staged.cleanup(); err != nil {
 		t.Fatalf("cleanup reusable split header file: %v", err)
+	}
+	if _, err = os.Stat(path); err != nil {
+		t.Fatalf("cleanup should keep reusable split header file, got %v", err)
 	}
 }
 

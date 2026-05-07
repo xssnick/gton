@@ -21,6 +21,7 @@ type testPeerStore struct {
 	blockData    map[string][]byte
 	proofs       map[string][]byte
 	zeroStates   map[string][]byte
+	stateFiles   map[string][]byte
 	archiveInfos map[string]int64
 	archiveFiles map[int64][]byte
 }
@@ -32,6 +33,7 @@ func newTestPeerStore() *testPeerStore {
 		blockData:    map[string][]byte{},
 		proofs:       map[string][]byte{},
 		zeroStates:   map[string][]byte{},
+		stateFiles:   map[string][]byte{},
 		archiveInfos: map[string]int64{},
 		archiveFiles: map[int64][]byte{},
 	}
@@ -116,6 +118,25 @@ func (s *testPeerStore) SaveZeroState(block ton.BlockIDExt, data []byte, _ *stor
 	return nil
 }
 
+func (s *testPeerStore) SavePersistentStateFile(file *storage.PersistentStateFile) error {
+	if file == nil || file.Ref == nil {
+		return fmt.Errorf("persistent state file is nil")
+	}
+	data, err := os.ReadFile(file.Ref.Path)
+	if err != nil {
+		return err
+	}
+	if file.Ref.Offset < 0 || file.Ref.Size < 0 || file.Ref.Offset+file.Ref.Size > int64(len(data)) {
+		return fmt.Errorf("invalid persistent state file ref")
+	}
+	data = data[file.Ref.Offset : file.Ref.Offset+file.Ref.Size]
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stateFiles[s.persistentStateKey(file.Block, file.MasterchainBlock, file.EffectiveShard)] = append([]byte(nil), data...)
+	return nil
+}
+
 func (s *testPeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -188,6 +209,41 @@ func (s *testPeerStore) ZeroState(_ context.Context, block ton.BlockIDExt) ([]by
 	return append([]byte(nil), value...), nil
 }
 
+func (s *testPeerStore) PersistentStateSize(_ context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	value, ok := s.stateFiles[s.persistentStateKey(block, masterchainBlock, effectiveShard)]
+	if !ok {
+		return 0, storage.ErrNotFound
+	}
+	return int64(len(value)), nil
+}
+
+func (s *testPeerStore) PersistentStateSlice(_ context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64, offset int64, maxSize int64) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	value, ok := s.stateFiles[s.persistentStateKey(block, masterchainBlock, effectiveShard)]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	if offset < 0 || maxSize < 0 {
+		return nil, fmt.Errorf("invalid persistent state range offset=%d max_size=%d", offset, maxSize)
+	}
+	if maxSize == 0 {
+		return []byte{}, nil
+	}
+	if offset >= int64(len(value)) {
+		return nil, nil
+	}
+	value = value[offset:]
+	if len(value) > int(maxSize) {
+		value = value[:maxSize]
+	}
+	return append([]byte(nil), value...), nil
+}
+
 func (s *testPeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -231,6 +287,10 @@ func (s *testPeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64,
 
 func (s *testPeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) string {
 	return string(kind) + ":" + storage.BlockKey(block)
+}
+
+func (s *testPeerStore) persistentStateKey(block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) string {
+	return storage.BlockKey(block) + ":" + storage.BlockKey(masterchainBlock) + ":" + fmt.Sprintf("%016x", uint64(effectiveShard))
 }
 
 func testArchiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) string {

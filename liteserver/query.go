@@ -18,6 +18,7 @@ import (
 )
 
 const (
+	errCodeUnspecified    int32 = 0
 	errCodeProtoViolation int32 = -400
 	errCodeTonProtoError  int32 = 621
 	errCodeNotReady       int32 = 651
@@ -53,12 +54,18 @@ func (s *Server) handleQuery(ctx context.Context, query any) tl.Serializable {
 		return s.handleBlockData(ctx, q.ID)
 	case ton.GetBlockHeader:
 		return s.handleBlockHeader(ctx, q.ID, q.Mode)
+	case ton.GetBlockProof:
+		return s.handleBlockProof(ctx, q)
+	case ton.GetShardBlockProof:
+		return s.handleShardBlockProof(ctx, q)
 	case ton.GetState:
 		return s.handleState(ctx, q.ID)
 	case ton.SendMessage:
 		return s.handleSendMessage(ctx, q)
 	case ton.LookupBlock:
 		return s.handleLookupBlock(ctx, q)
+	case ton.LookupBlockWithProof:
+		return s.handleLookupBlockWithProof(ctx, q)
 	case ton.GetAccountState:
 		return s.handleAccountState(ctx, q.ID, q.Account, false)
 	case ton.GetAccountStatePruned:
@@ -91,6 +98,8 @@ func (s *Server) handleQuery(ctx context.Context, query any) tl.Serializable {
 		return s.handleBlockOutMsgQueueSize(ctx, q)
 	case ton.GetOutMsgQueueSizes:
 		return s.handleOutMsgQueueSizes(ctx, q)
+	case ton.NonfinalGetValidatorGroups, ton.NonfinalGetCandidate, ton.NonfinalGetPendingShardBlocks:
+		return ton.LSError{Code: errCodeUnspecified, Text: "query is not allowed"}
 	default:
 		return ton.LSError{Code: errCodeTonProtoError, Text: "unknown query"}
 	}

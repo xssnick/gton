@@ -147,6 +147,11 @@ type DownloadedBlock struct {
 	BroadcastSignatures *cell.Cell
 	Parsed              *tlb.Block
 	Meta                *storage.BlockMeta
+	// StateUpdateToCells contains encoded non-pruned cells reachable from block.state_update.to,
+	// keyed by their logical state hash. The live shard-client path prepares it after parsing
+	// the block so liteserver can see new state cells before the checkpoint reaches disk.
+	StateUpdateToCells        map[cell.Hash][]byte
+	StateUpdateToCellsElapsed time.Duration
 
 	IsLink bool
 

@@ -23,9 +23,14 @@ type Syncer struct {
 	storage  storage2.StateStorage
 	importer *stateImportCoordinator
 	log      zerolog.Logger
+	fromZero bool
 }
 
-func NewSyncer(source Source, storage storage2.StateStorage, logger ...*zerolog.Logger) *Syncer {
+type SyncerOptions struct {
+	FromZero bool
+}
+
+func NewSyncer(source Source, storage storage2.StateStorage, opts SyncerOptions, logger ...*zerolog.Logger) *Syncer {
 	log := zerolog.Nop()
 	if len(logger) > 0 && logger[0] != nil {
 		log = logger[0].With().Str("component", "state").Logger()
@@ -36,6 +41,7 @@ func NewSyncer(source Source, storage storage2.StateStorage, logger ...*zerolog.
 		storage:  storage,
 		importer: newStateImportCoordinator(log),
 		log:      log,
+		fromZero: opts.FromZero,
 	}
 }
 
@@ -147,9 +153,6 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.Blo
 		Str("masterchain", storage2.FormatBlockRef(master)).
 		Msg("loading shard list from masterchain state")
 	shardBlocks, err := ShardBlocksFromMasterState(masterState)
-	if err != nil && (masterState.Parsed == nil || masterState.Parsed.McStateExtra == nil) {
-		shardBlocks, err = s.source.ShardBlocks(ctx, master)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("load shard blocks for %s: %w", storage2.FormatBlockRef(master), err)
 	}
@@ -306,7 +309,12 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.Blo
 	}
 
 	next.SyncedAt = time.Now()
-	if err = s.storage.SaveBlockStateAndCurrentState(ctx, &next.Masterchain, next); err != nil {
+	states := []*storage2.BlockState{&next.Masterchain}
+	for _, key := range storage2.SortedShardKeys(next.Shards) {
+		shard := next.Shards[key]
+		states = append(states, &shard)
+	}
+	if err = s.storage.SaveStateCheckpoint(ctx, states, next); err != nil {
 		return nil, fmt.Errorf("persist current state: %w", err)
 	}
 	if err = s.storage.ClearStateSyncProgress(ctx); err != nil {

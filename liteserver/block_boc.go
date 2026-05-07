@@ -1,7 +1,6 @@
 package liteserver
 
 import (
-	"bytes"
 	"fmt"
 
 	"flexserver/service/storage"
@@ -11,7 +10,10 @@ import (
 )
 
 func parseTrustedBlockBOC(block ton.BlockIDExt, data []byte) (*cell.Cell, error) {
-	roots, _, err := cell.FromBOCMultiRootReader(bytes.NewReader(data), cell.BOCParseOptions{TrustedHashes: true})
+	roots, _, err := cell.FromBOCMultiRootReader(cell.NewBOCNoCopyReader(data), cell.BOCParseOptions{
+		TrustedHashes: true,
+		Lazy:          true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("parse block boc %s: %w", storage.FormatBlockRef(block), err)
 	}

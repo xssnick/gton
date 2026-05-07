@@ -104,6 +104,8 @@ type Service struct {
 	stateSync *state.Syncer
 	liveState CurrentStatePublisher
 
+	appliedArtifacts *appliedBlockArtifactWriter
+
 	archiveCatchUpCheckpointBlocks uint32
 	archiveCatchUpCheckpointPeriod time.Duration
 	archiveCatchUpPrefetchWindows  int
@@ -173,6 +175,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		storage:                        store,
 		stateSync:                      stateSync,
 		liveState:                      opts.CurrentStatePublisher,
+		appliedArtifacts:               newAppliedBlockArtifactWriter(logger, store, appliedBlockArtifactFlusher(opts.CurrentStatePublisher)),
 		archiveCatchUpCheckpointBlocks: opts.ArchiveCatchUpCheckpointBlocks,
 		archiveCatchUpCheckpointPeriod: opts.ArchiveCatchUpCheckpointPeriod,
 		archiveCatchUpPrefetchWindows:  opts.ArchiveCatchUpPrefetchWindows,
@@ -185,6 +188,11 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 
 func (s *Service) Start(ctx context.Context) error {
 	s.startOnce.Do(func() {
+		if s.appliedArtifacts != nil {
+			s.runAsync(func() {
+				s.appliedArtifacts.run(ctx)
+			})
+		}
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
 		})
@@ -388,6 +396,10 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		if !verified {
 			return errSyncedBlockNotVerified
 		}
+		downloaded, err = prepareDownloadedBlockStateCells(downloaded)
+		if err != nil {
+			return err
+		}
 		if err := s.rememberSeenMasterchainBlock(ctx, downloaded.ID); err != nil {
 			return err
 		}
@@ -509,6 +521,22 @@ func formatBlockRate64(done uint64, elapsed time.Duration) string {
 		return fmt.Sprintf("%.1f blocks/s", rate)
 	default:
 		return fmt.Sprintf("%.2f blocks/s", rate)
+	}
+}
+
+func formatCellRate64(cells uint64, elapsed time.Duration) string {
+	if cells == 0 || elapsed <= 0 {
+		return "0 cells/s"
+	}
+
+	rate := float64(cells) / elapsed.Seconds()
+	switch {
+	case rate >= 1_000_000:
+		return fmt.Sprintf("%.2f Mcells/s", rate/1_000_000)
+	case rate >= 1_000:
+		return fmt.Sprintf("%.2f Kcells/s", rate/1_000)
+	default:
+		return fmt.Sprintf("%.0f cells/s", rate)
 	}
 }
 

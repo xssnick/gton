@@ -55,6 +55,10 @@ func init() {
 	tl.Register(DownloadPersistentStateSliceV2{}, "tonNode.downloadPersistentStateSliceV2 state:tonNode.persistentStateIdV2 offset:long max_size:long = tonNode.Data")
 	tl.Register(GetPersistentStateSizeV2{}, "tonNode.getPersistentStateSizeV2 state:tonNode.persistentStateIdV2 = tonNode.PersistentStateSize")
 	tl.Register(PersistentStateIDV2{}, "tonNode.persistentStateIdV2 block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt effective_shard:long = tonNode.PersistentStateIdV2")
+
+	tl.Register(DbFileDBKeyPersistentStateFile{}, "db.filedb.key.persistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key")
+	tl.Register(DbFileDBKeySplitAccountStateFile{}, "db.filedb.key.splitAccountStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt effective_shard:long = db.filedb.Key")
+	tl.Register(DbFileDBKeySplitPersistentStateFile{}, "db.filedb.key.splitPersistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key")
 }
 
 type PreparedState struct{}
@@ -98,6 +102,22 @@ type PersistentStateIDV2 struct {
 	Block            ton.BlockIDExt `tl:"struct"`
 	MasterchainBlock ton.BlockIDExt `tl:"struct"`
 	EffectiveShard   int64          `tl:"long"`
+}
+
+type DbFileDBKeyPersistentStateFile struct {
+	BlockID            ton.BlockIDExt `tl:"struct"`
+	MasterchainBlockID ton.BlockIDExt `tl:"struct"`
+}
+
+type DbFileDBKeySplitAccountStateFile struct {
+	BlockID            ton.BlockIDExt `tl:"struct"`
+	MasterchainBlockID ton.BlockIDExt `tl:"struct"`
+	EffectiveShard     int64          `tl:"long"`
+}
+
+type DbFileDBKeySplitPersistentStateFile struct {
+	BlockID            ton.BlockIDExt `tl:"struct"`
+	MasterchainBlockID ton.BlockIDExt `tl:"struct"`
 }
 
 func (n *Node) DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
@@ -204,14 +224,18 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 	n := d.node
 
 	if n.storage != nil && (d.block.Workchain == -1 || splitDepth <= uint32(shardPrefixLength(d.block.Shard))) {
-		staged, lazyRoot, err := n.tryImportReusableStagedStateFile(ctx, d.block, 0, d.stateRootHash)
+		staged, lazyRoot, err := n.tryImportReusableStagedStateFile(ctx, d.block, d.master, 0, d.stateRootHash)
 		if err == nil {
 			if err = n.cacheImportedStagedBlockState(d.block, staged, lazyRoot, d.stateRootHash); err != nil {
 				return nil, fmt.Errorf("prepare imported reusable staged state: %w", err)
 			}
+			if err = n.savePersistentStateFile(d.block, d.master, staged, d.stateRootHash); err != nil {
+				return nil, fmt.Errorf("store reusable staged state file: %w", err)
+			}
 			return &persistentStateSnapshotArtifact{
 				node:          n,
 				block:         d.block,
+				master:        d.master,
 				stateRootHash: d.stateRootHash,
 				staged:        staged,
 			}, nil
@@ -262,6 +286,9 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 		if err = n.cacheImportedStagedBlockState(d.block, staged, lazyRoot, d.stateRootHash); err != nil {
 			return nil, fmt.Errorf("prepare imported staged state: %w", err)
 		}
+		if err = n.savePersistentStateFile(d.block, d.master, staged, d.stateRootHash); err != nil {
+			return nil, fmt.Errorf("store staged state file: %w", err)
+		}
 
 		n.log.Info().
 			Str("peer", staged.peerAddr).
@@ -272,6 +299,7 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 	return &persistentStateSnapshotArtifact{
 		node:          n,
 		block:         d.block,
+		master:        d.master,
 		stateRootHash: d.stateRootHash,
 		staged:        staged,
 	}, nil
@@ -823,6 +851,12 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 			return nil, fmt.Errorf("import split persistent state header cells: %w", err)
 		}
 	}
+	if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+		root = nil
+		parsedCells = nil
+		runtime.GC()
+		return nil, fmt.Errorf("store split persistent state header file: %w", err)
+	}
 	root = nil
 	parsedCells = nil
 	runtime.GC()
@@ -832,7 +866,7 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx context.Context, splitDepth uint32) (*downloadedSplitStateHeader, error) {
 	n := d.node
 
-	paths, err := n.reusableStagedStateFiles(d.block, d.block.Shard)
+	paths, err := n.reusableStagedStateFiles(d.block, d.master, d.block.Shard)
 	if err != nil {
 		return nil, err
 	}
@@ -857,6 +891,7 @@ func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx contex
 			parsedCells = nil
 			runtime.GC()
 			if errors.Is(err, errStateSnapshotInvalid) {
+				staged.keep = false
 				if cleanupErr := staged.cleanup(); cleanupErr != nil {
 					n.log.Warn().
 						Err(cleanupErr).
@@ -884,6 +919,12 @@ func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx contex
 				runtime.GC()
 				return nil, fmt.Errorf("import reusable split persistent state header cells: %w", err)
 			}
+		}
+		if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+			root = nil
+			parsedCells = nil
+			runtime.GC()
+			return nil, fmt.Errorf("store reusable split persistent state header file: %w", err)
 		}
 		root = nil
 		parsedCells = nil
@@ -1118,8 +1159,14 @@ func (d persistentStateSnapshotDownloader) downloadSplitPart(ctx context.Context
 
 	if n.storage != nil {
 		partBlock := splitStatePartStorageBlock(d.block, part)
-		staged, _, err := n.tryImportReusableStagedStateFileAs(ctx, d.block, partBlock, int64(part.effectiveShard), part.rootHash, stagedStateCellHash)
+		staged, _, err := n.tryImportReusableStagedStateFileAs(ctx, d.block, d.master, partBlock, int64(part.effectiveShard), part.rootHash, stagedStateCellHash)
 		if err == nil {
+			if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+				return splitStatePartResult{
+					index: idx,
+					err:   fmt.Errorf("store reusable split state part %d file: %w", idx+1, err),
+				}
+			}
 			return splitStatePartResult{
 				index: idx,
 				part:  &downloadedSplitStatePart{staged: staged},
@@ -1186,6 +1233,12 @@ func (d persistentStateSnapshotDownloader) downloadSplitPart(ctx context.Context
 			return splitStatePartResult{
 				index: idx,
 				err:   fmt.Errorf("import split state part %d cells: %w", idx+1, err),
+			}
+		}
+		if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+			return splitStatePartResult{
+				index: idx,
+				err:   fmt.Errorf("store split state part %d file: %w", idx+1, err),
 			}
 		}
 

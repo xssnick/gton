@@ -16,6 +16,7 @@ import (
 
 	"flexserver/service/storage"
 
+	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -66,10 +67,15 @@ type stagedStateFile struct {
 	prefix         []byte
 	lazyRoot       *cell.Cell
 	state          *storage.BlockState
+	keep           bool
+	persisted      bool
 }
 
 func (f *stagedStateFile) cleanup() error {
 	if f == nil || f.path == "" {
+		return nil
+	}
+	if f.keep {
 		return nil
 	}
 	err := os.Remove(f.path)
@@ -197,12 +203,12 @@ func stagedStateHash(root *cell.Cell, kind stagedStateHashKind) cell.Hash {
 	return root.HashKey(0)
 }
 
-func (n *Node) tryImportReusableStagedStateFile(ctx context.Context, block ton.BlockIDExt, effectiveShard int64, wantRootHash []byte) (*stagedStateFile, *cell.Cell, error) {
-	return n.tryImportReusableStagedStateFileAs(ctx, block, blockWithEffectiveShard(block, effectiveShard), effectiveShard, wantRootHash, stagedStateRootHash)
+func (n *Node) tryImportReusableStagedStateFile(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64, wantRootHash []byte) (*stagedStateFile, *cell.Cell, error) {
+	return n.tryImportReusableStagedStateFileAs(ctx, block, master, blockWithEffectiveShard(block, effectiveShard), effectiveShard, wantRootHash, stagedStateRootHash)
 }
 
-func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton.BlockIDExt, storageBlock ton.BlockIDExt, effectiveShard int64, wantRootHash []byte, hashKind stagedStateHashKind) (*stagedStateFile, *cell.Cell, error) {
-	paths, err := n.reusableStagedStateFiles(block, effectiveShard)
+func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, storageBlock ton.BlockIDExt, effectiveShard int64, wantRootHash []byte, hashKind stagedStateHashKind) (*stagedStateFile, *cell.Cell, error) {
+	paths, err := n.reusableStagedStateFiles(block, master, effectiveShard)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -242,6 +248,7 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 			return nil, nil, err
 		}
 		if errors.Is(err, errStateSnapshotInvalid) {
+			staged.keep = false
 			if cleanupErr := staged.cleanup(); cleanupErr != nil {
 				n.log.Warn().
 					Err(cleanupErr).
@@ -300,9 +307,41 @@ func (n *Node) cacheImportedStagedBlockState(block ton.BlockIDExt, staged *stage
 	return nil
 }
 
+func (n *Node) savePersistentStateFile(block ton.BlockIDExt, master ton.BlockIDExt, staged *stagedStateFile, stateRootHash []byte) error {
+	if staged == nil || staged.path == "" || staged.persisted {
+		return nil
+	}
+
+	writer, _ := n.peerStorage.(storage.PeerServingStorageWriter)
+	if writer == nil {
+		return nil
+	}
+
+	if err := writer.SavePersistentStateFile(&storage.PersistentStateFile{
+		Block:            block,
+		MasterchainBlock: master,
+		EffectiveShard:   staged.effectiveShard,
+		Ref: &storage.ArtifactRef{
+			Path:   staged.path,
+			Offset: 0,
+			Size:   staged.size,
+		},
+		FileHash:      bytes.Clone(staged.fileHash),
+		StateRootHash: bytes.Clone(stateRootHash),
+		CellsCount:    staged.cells,
+	}); err != nil {
+		return err
+	}
+
+	staged.keep = true
+	staged.persisted = true
+	return nil
+}
+
 type persistentStateSnapshotArtifact struct {
 	node          *Node
 	block         ton.BlockIDExt
+	master        ton.BlockIDExt
 	stateRootHash []byte
 	staged        *stagedStateFile
 }
@@ -328,6 +367,9 @@ func (a *persistentStateSnapshotArtifact) decode(ctx context.Context, cells stor
 		Msg("decoding state snapshot from temp file")
 
 	if a.staged.state != nil {
+		if err := a.node.savePersistentStateFile(a.block, a.master, a.staged, a.stateRootHash); err != nil {
+			return nil, fmt.Errorf("store persistent state file: %w", err)
+		}
 		return storage.CloneBlockState(a.staged.state), nil
 	}
 
@@ -368,7 +410,14 @@ func (a *persistentStateSnapshotArtifact) decode(ctx context.Context, cells stor
 		Str("state_root_hash", hex.EncodeToString(state.StateRootHash)).
 		Str("state_file_hash", hex.EncodeToString(a.staged.fileHash)).
 		Msg("state snapshot parsed")
-	return importBlockStateCells(ctx, cells, state, parsedCells)
+	state, err = importBlockStateCells(ctx, cells, state, parsedCells)
+	if err != nil {
+		return nil, err
+	}
+	if err = a.node.savePersistentStateFile(a.block, a.master, a.staged, a.stateRootHash); err != nil {
+		return nil, fmt.Errorf("store persistent state file: %w", err)
+	}
+	return state, nil
 }
 
 func (a *persistentStateSnapshotArtifact) Cleanup() error {
@@ -406,6 +455,11 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
 	if err != nil {
 		return nil, err
+	}
+	if a.header != nil && a.header.staged != nil {
+		if err = a.node.savePersistentStateFile(a.block, a.master, a.header.staged, nil); err != nil {
+			return nil, fmt.Errorf("store split persistent state header file: %w", err)
+		}
 	}
 
 	for i, part := range a.parts {
@@ -472,6 +526,9 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		}
 		if !merged {
 			return nil, fmt.Errorf("%w: duplicate account in split state part %d", errStateSnapshotInvalid, i+1)
+		}
+		if err = a.node.savePersistentStateFile(a.block, a.master, part.staged, nil); err != nil {
+			return nil, fmt.Errorf("store split persistent state part %d file: %w", i+1, err)
 		}
 
 		totalCells += part.staged.cells
@@ -609,25 +666,67 @@ func (a *splitPersistentStateSnapshotArtifact) Cleanup() error {
 	return errors.Join(errs...)
 }
 
-func stateDownloadFilePattern(block ton.BlockIDExt, effectiveShard int64) string {
-	return fmt.Sprintf(
-		"wc%d-shard%016x-seqno%d-eff%016x-*.boc",
-		block.Workchain,
-		uint64(block.Shard),
-		block.SeqNo,
-		uint64(effectiveShard),
-	)
+func persistentStateFileName(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
+	hash, err := persistentStateFileKeyHash(block, master, effectiveShard)
+	if err != nil {
+		return "", err
+	}
+	hashHex := hex.EncodeToString(hash)
+
+	switch {
+	case effectiveShard == 0:
+		return fmt.Sprintf("state_%d_%d_%x_%s", master.SeqNo, block.Workchain, uint64(block.Shard), hashHex), nil
+	case effectiveShard == block.Shard:
+		return fmt.Sprintf("statesplit_%d_%d_%016x_%s", master.SeqNo, block.Workchain, uint64(block.Shard), hashHex), nil
+	default:
+		return fmt.Sprintf("stateaccount_%d_%d_%016x_%016x_%s", master.SeqNo, block.Workchain, uint64(block.Shard), uint64(effectiveShard), hashHex), nil
+	}
 }
 
-func (n *Node) stateDownloadFileGlob(block ton.BlockIDExt, effectiveShard int64) string {
-	return filepath.Join(n.stateDownloadDir, stateDownloadFilePattern(block, effectiveShard))
+func persistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]byte, error) {
+	switch {
+	case effectiveShard == 0:
+		return tl.Hash(DbFileDBKeyPersistentStateFile{
+			BlockID:            block,
+			MasterchainBlockID: master,
+		})
+	case effectiveShard == block.Shard:
+		return tl.Hash(DbFileDBKeySplitPersistentStateFile{
+			BlockID:            block,
+			MasterchainBlockID: master,
+		})
+	default:
+		return tl.Hash(DbFileDBKeySplitAccountStateFile{
+			BlockID:            block,
+			MasterchainBlockID: master,
+			EffectiveShard:     effectiveShard,
+		})
+	}
 }
 
-func (n *Node) reusableStagedStateFiles(block ton.BlockIDExt, effectiveShard int64) ([]string, error) {
+func (n *Node) persistentStateFilePath(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
+	name, err := persistentStateFileName(block, master, effectiveShard)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(n.stateDownloadDir, name), nil
+}
+
+func (n *Node) reusableStagedStateFiles(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]string, error) {
 	if strings.TrimSpace(n.stateDownloadDir) == "" {
 		return nil, nil
 	}
-	return filepath.Glob(n.stateDownloadFileGlob(block, effectiveShard))
+	path, err := n.persistentStateFilePath(block, master, effectiveShard)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return []string{path}, nil
 }
 
 func (n *Node) loadReusableStagedStateFile(path string, effectiveShard int64) (*stagedStateFile, error) {
@@ -673,6 +772,7 @@ func (n *Node) loadReusableStagedStateFile(path string, effectiveShard int64) (*
 		cells:          cellsCount,
 		fileHash:       hash.Sum(nil),
 		prefix:         prefix,
+		keep:           true,
 	}, nil
 }
 
@@ -692,13 +792,25 @@ func (n *Node) removeInvalidReusableStateFile(block ton.BlockIDExt, effectiveSha
 		Msg("removed invalid staged state snapshot file")
 }
 
-func (n *Node) createStateDownloadFile(block ton.BlockIDExt, effectiveShard int64) (*os.File, string, string, error) {
+func (n *Node) createStateDownloadFile(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*os.File, string, string, error) {
 	dir := n.stateDownloadDir
 	if dir == "" {
 		return nil, "", "", fmt.Errorf("state download dir is empty")
 	}
 
-	file, err := os.CreateTemp(dir, stateDownloadFilePattern(block, effectiveShard)+stateDownloadTempSuffix)
+	finalPath, err := n.persistentStateFilePath(block, master, effectiveShard)
+	if err != nil {
+		return nil, "", "", err
+	}
+	finalPath, err = filepath.Abs(finalPath)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if err = os.MkdirAll(dir, 0o755); err != nil {
+		return nil, "", "", err
+	}
+	name := filepath.Base(finalPath)
+	file, err := os.CreateTemp(dir, name+stateDownloadTempSuffix+"-")
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -708,12 +820,11 @@ func (n *Node) createStateDownloadFile(block ton.BlockIDExt, effectiveShard int6
 		_ = os.Remove(file.Name())
 		return nil, "", "", err
 	}
-	if !strings.HasSuffix(path, stateDownloadTempSuffix) {
+	if !strings.Contains(filepath.Base(path), stateDownloadTempSuffix) {
 		_ = file.Close()
 		_ = os.Remove(file.Name())
-		return nil, "", "", fmt.Errorf("state download temp file has unexpected suffix: %s", path)
+		return nil, "", "", fmt.Errorf("state download temp file has unexpected name: %s", path)
 	}
-	finalPath := strings.TrimSuffix(path, stateDownloadTempSuffix)
 	return file, path, finalPath, nil
 }
 
@@ -731,7 +842,7 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 	}
 	defer reader.Close()
 
-	file, path, finalPath, err := n.createStateDownloadFile(d.block, candidate.id.EffectiveShard)
+	file, path, finalPath, err := n.createStateDownloadFile(d.block, d.master, candidate.id.EffectiveShard)
 	if err != nil {
 		return nil, err
 	}
@@ -768,6 +879,12 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		return nil, err
 	}
 	closed = true
+	if _, err = os.Stat(finalPath); err == nil {
+		_ = os.Remove(path)
+		return n.loadReusableStagedStateFile(finalPath, candidate.id.EffectiveShard)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	if err = os.Rename(path, finalPath); err != nil {
 		return nil, err
 	}
@@ -785,7 +902,7 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		Str("block", formatPersistentStateBlockRef(d.block, candidate.id.EffectiveShard)).
 		Str("size", formatByteSize(candidate.size)).
 		Str("path", path).
-		Msg("state snapshot staged to temp file")
+		Msg("state snapshot stored to states file")
 
 	return &stagedStateFile{
 		effectiveShard: candidate.id.EffectiveShard,
@@ -802,7 +919,7 @@ func removeIncompleteStateDownloadFiles(dir string) error {
 	if strings.TrimSpace(dir) == "" {
 		return nil
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, "*"+stateDownloadTempSuffix))
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+stateDownloadTempSuffix+"*"))
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package pebblestore
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -25,12 +26,12 @@ func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
 	}
 
 	meta, proofKinds := servedBlockFullMeta(block)
-	blockRef, proofRef, err := s.servedBlockFullArtifactRefs(block, proofKinds)
+	blockRef, proofRefs, err := s.servedBlockFullArtifactRefs(block, proofKinds)
 	if err != nil {
 		return err
 	}
 	return s.withHotBatch(func(batch *pebble.Batch) error {
-		if err := s.setServedBlockFullArtifactRefs(batch, block, proofKinds, blockRef, proofRef); err != nil {
+		if err := s.setServedBlockFullArtifactRefs(batch, block, proofKinds, blockRef, proofRefs); err != nil {
 			return err
 		}
 		return s.setMergedBlockMeta(batch, meta)
@@ -73,7 +74,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		block      *storage.ServedBlockFull
 		proofKinds []storage.ServedProofKind
 		blockRef   *storage.ArtifactRef
-		proofRef   *storage.ArtifactRef
+		proofRefs  map[storage.ServedProofKind]*storage.ArtifactRef
 	}
 	type blockDataWrite struct {
 		block ton.BlockIDExt
@@ -89,7 +90,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 	fullWrites := make([]fullWrite, 0, len(imported.FullBlocks))
 	for _, full := range imported.FullBlocks {
 		meta, proofKinds := servedBlockFullMeta(full)
-		blockRef, proofRef, err := s.servedBlockFullArtifactRefs(full, proofKinds)
+		blockRef, proofRefs, err := s.servedBlockFullArtifactRefs(full, proofKinds)
 		if err != nil {
 			return err
 		}
@@ -98,7 +99,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 			block:      full,
 			proofKinds: proofKinds,
 			blockRef:   blockRef,
-			proofRef:   proofRef,
+			proofRefs:  proofRefs,
 		})
 	}
 
@@ -135,14 +136,20 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		ref := proof.Ref
 		if ref == nil {
 			var err error
-			ref, err = s.appendArtifactEntry(packEntryKindForProofKind(proof.Kind), proof.ID, proof.Data)
+			ref, err = s.appendProofEntry(proof.Kind, proof.ID, proof.Data)
+			if err != nil {
+				return err
+			}
+		} else if isKeyProofKind(proof.Kind) {
+			var err error
+			ref, err = s.copyProofRefToKeyPack(proof.Kind, proof.ID, ref)
 			if err != nil {
 				return err
 			}
 		}
 		mergeArchiveImportMeta(metas, &storage.BlockMeta{
 			ID:        proof.ID,
-			Flags:     storage.BlockMetaFlagForProof(proof.Kind),
+			Flags:     blockMetaFlagsForProofKind(proof.Kind),
 			UpdatedAt: time.Now(),
 		})
 		proofWrites = append(proofWrites, proofWrite{kind: proof.Kind, block: proof.ID, ref: ref})
@@ -156,7 +163,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 
 	return s.withHotBatch(func(batch *pebble.Batch) error {
 		for _, write := range fullWrites {
-			if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRef); err != nil {
+			if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRefs); err != nil {
 				return err
 			}
 		}
@@ -166,7 +173,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 			}
 		}
 		for _, write := range proofWrites {
-			if err := s.setHotUnique(batch, hotKeyProofRef(write.kind, write.block), encodeArtifactRef(write.ref)); err != nil {
+			if err := s.setHotUnique(batch, hotKeyStoredProofRef(write.kind, write.block), encodeArtifactRef(write.ref)); err != nil {
 				return err
 			}
 		}
@@ -184,7 +191,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 	})
 }
 
-func (s *Store) servedBlockFullArtifactRefs(block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind) (*storage.ArtifactRef, *storage.ArtifactRef, error) {
+func (s *Store) servedBlockFullArtifactRefs(block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind) (*storage.ArtifactRef, map[storage.ServedProofKind]*storage.ArtifactRef, error) {
 	if len(block.Block) == 0 && len(block.Proof) == 0 && block.BlockRef == nil && block.ProofRef == nil {
 		return nil, nil, nil
 	}
@@ -198,29 +205,47 @@ func (s *Store) servedBlockFullArtifactRefs(block *storage.ServedBlockFull, proo
 		blockRef = ref
 	}
 
-	proofRef := block.ProofRef
-	if len(block.Proof) > 0 && proofRef == nil {
-		ref, err := s.appendArtifactEntry(packEntryKindForProof(block.IsLink), block.ID, block.Proof)
-		if err != nil {
-			return nil, nil, err
+	proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
+	if len(proofKinds) > 0 {
+		if len(block.Proof) > 0 {
+			for _, kind := range proofKinds {
+				ref, err := s.appendProofEntry(kind, block.ID, block.Proof)
+				if err != nil {
+					return nil, nil, err
+				}
+				proofRefs[kind] = ref
+			}
+		} else if block.ProofRef != nil {
+			for _, kind := range proofKinds {
+				ref := block.ProofRef
+				if isKeyProofKind(kind) {
+					var err error
+					ref, err = s.copyProofRefToKeyPack(kind, block.ID, block.ProofRef)
+					if err != nil {
+						return nil, nil, err
+					}
+				}
+				proofRefs[kind] = ref
+			}
 		}
-		proofRef = ref
 	}
 
-	return blockRef, proofRef, nil
+	return blockRef, proofRefs, nil
 }
 
-func (s *Store) setServedBlockFullArtifactRefs(batch *pebble.Batch, block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind, blockRef *storage.ArtifactRef, proofRef *storage.ArtifactRef) error {
+func (s *Store) setServedBlockFullArtifactRefs(batch *pebble.Batch, block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind, blockRef *storage.ArtifactRef, proofRefs map[storage.ServedProofKind]*storage.ArtifactRef) error {
 	if blockRef != nil {
 		if err := s.setHotUnique(batch, hotKeyBlockDataRef(block.ID), encodeArtifactRef(blockRef)); err != nil {
 			return err
 		}
 	}
-	if proofRef != nil {
-		for _, kind := range proofKinds {
-			if err := s.setHotUnique(batch, hotKeyProofRef(kind, block.ID), encodeArtifactRef(proofRef)); err != nil {
-				return err
-			}
+	for _, kind := range proofKinds {
+		ref := proofRefs[kind]
+		if ref == nil {
+			continue
+		}
+		if err := s.setHotUnique(batch, hotKeyStoredProofRef(kind, block.ID), encodeArtifactRef(ref)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -276,24 +301,30 @@ func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDEx
 }
 
 func (s *Store) persistBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
-	if len(data) == 0 {
+	if len(data) == 0 && ref == nil {
 		return nil
 	}
 	if ref == nil {
 		var err error
-		ref, err = s.appendArtifactEntry(packEntryKindForProofKind(kind), block, data)
+		ref, err = s.appendProofEntry(kind, block, data)
+		if err != nil {
+			return err
+		}
+	} else if isKeyProofKind(kind) {
+		var err error
+		ref, err = s.copyProofRefToKeyPack(kind, block, ref)
 		if err != nil {
 			return err
 		}
 	}
 	if err := s.withHotBatch(func(batch *pebble.Batch) error {
-		return s.setHotUnique(batch, hotKeyProofRef(kind, block), encodeArtifactRef(ref))
+		return s.setHotUnique(batch, hotKeyStoredProofRef(kind, block), encodeArtifactRef(ref))
 	}); err != nil {
 		return err
 	}
 	return s.mergeAndStoreBlockMeta(&storage.BlockMeta{
 		ID:        block,
-		Flags:     storage.BlockMetaFlagForProof(kind),
+		Flags:     blockMetaFlagsForProofKind(kind),
 		UpdatedAt: time.Now(),
 	})
 }
@@ -315,6 +346,45 @@ func (s *Store) persistZeroState(block ton.BlockIDExt, data []byte, ref *storage
 	}
 	return s.withHotBatch(func(batch *pebble.Batch) error {
 		return s.setHotUnique(batch, hotKeyZeroStateRef(block), encodeArtifactRef(ref))
+	})
+}
+
+func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error {
+	if file == nil {
+		return fmt.Errorf("persistent state file is nil")
+	}
+	if file.Ref == nil {
+		return fmt.Errorf("persistent state file ref is nil")
+	}
+	if file.Ref.Size <= 0 {
+		return fmt.Errorf("persistent state file size is invalid")
+	}
+	if file.Ref.Offset < 0 {
+		return fmt.Errorf("persistent state file offset is invalid")
+	}
+
+	stored := *file
+	stored.Ref = file.Ref.Clone()
+	stored.Ref.Path = s.relativeArtifactPath(stored.Ref.Path)
+
+	meta := &storage.BlockMeta{
+		ID:            stored.Block,
+		Flags:         storage.BlockMetaHasStateSnapshot,
+		StateRootHash: bytes.Clone(stored.StateRootHash),
+		StateFileHash: bytes.Clone(stored.FileHash),
+		UpdatedAt:     time.Now(),
+	}
+	record := encodePersistentStateFileRecord(&stored)
+	key := hotKeyPersistentStateFile(stored.Block, stored.MasterchainBlock, stored.EffectiveShard)
+
+	return s.withHotBatch(func(batch *pebble.Batch) error {
+		if err := s.setHotMaybeReplace(batch, key, record); err != nil {
+			return err
+		}
+		if stored.EffectiveShard == 0 {
+			return s.setMergedBlockMeta(batch, meta)
+		}
+		return nil
 	})
 }
 
@@ -349,15 +419,37 @@ func (s *Store) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard i
 	return storedPath, nil
 }
 
+func (s *Store) syncPendingArtifactFiles() error {
+	if err := s.syncPendingArchiveFiles(); err != nil {
+		return err
+	}
+	if err := s.syncPendingLooseFiles(); err != nil {
+		return err
+	}
+	return s.syncPendingKeyProofFiles()
+}
+
+func (s *Store) syncPendingLooseFiles() error {
+	return s.syncPendingPackFiles(s.pendingLooseSync, "loose")
+}
+
 func (s *Store) syncPendingArchiveFiles() error {
+	return s.syncPendingPackFiles(s.pendingArchiveSync, "archive")
+}
+
+func (s *Store) syncPendingKeyProofFiles() error {
+	return s.syncPendingPackFiles(s.pendingKeyProofSync, "key proof")
+}
+
+func (s *Store) syncPendingPackFiles(pending map[string]struct{}, label string) error {
 	s.artifactMu.Lock()
-	if len(s.pendingArchiveSync) == 0 {
+	if len(pending) == 0 {
 		s.artifactMu.Unlock()
 		return nil
 	}
 
-	paths := make([]string, 0, len(s.pendingArchiveSync))
-	for path := range s.pendingArchiveSync {
+	paths := make([]string, 0, len(pending))
+	for path := range pending {
 		paths = append(paths, path)
 	}
 	s.artifactMu.Unlock()
@@ -366,7 +458,7 @@ func (s *Store) syncPendingArchiveFiles() error {
 	dirs := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
 		if err := syncFile(path); err != nil {
-			return fmt.Errorf("sync archive pack %s: %w", path, err)
+			return fmt.Errorf("sync %s pack %s: %w", label, path, err)
 		}
 		dirs[filepath.Dir(path)] = struct{}{}
 	}
@@ -378,13 +470,13 @@ func (s *Store) syncPendingArchiveFiles() error {
 	sort.Strings(dirPaths)
 	for _, dir := range dirPaths {
 		if err := syncDir(dir); err != nil {
-			return fmt.Errorf("sync archive pack dir %s: %w", dir, err)
+			return fmt.Errorf("sync %s pack dir %s: %w", label, dir, err)
 		}
 	}
 
 	s.artifactMu.Lock()
 	for _, path := range paths {
-		delete(s.pendingArchiveSync, path)
+		delete(pending, path)
 	}
 	s.artifactMu.Unlock()
 	return nil
@@ -464,11 +556,62 @@ func (s *Store) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, er
 }
 
 func (s *Store) BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	return s.readArtifact(ctx, hotKeyProofRef(kind, block))
+	data, err := s.readArtifact(ctx, hotKeyStoredProofRef(kind, block))
+	if err != nil && isKeyProofKind(kind) && isMissingProofArtifact(err) {
+		return nil, storage.ErrNotFound
+	}
+	return data, err
 }
 
 func (s *Store) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	return s.readArtifact(ctx, hotKeyZeroStateRef(block))
+}
+
+func (s *Store) PersistentStateSize(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (int64, error) {
+	record, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return 0, err
+	}
+	stat, err := os.Stat(s.artifactPath(record.ref.Path))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, storage.ErrNotFound
+		}
+		return 0, err
+	}
+	if stat.Size() < record.ref.Offset+record.ref.Size {
+		return 0, storage.ErrNotFound
+	}
+	return record.ref.Size, nil
+}
+
+func (s *Store) PersistentStateSlice(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64, offset int64, maxSize int64) ([]byte, error) {
+	record, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return nil, err
+	}
+	if offset < 0 || maxSize < 0 {
+		return nil, fmt.Errorf("invalid persistent state range offset=%d max_size=%d", offset, maxSize)
+	}
+	if maxSize == 0 {
+		return []byte{}, nil
+	}
+	if offset >= record.ref.Size {
+		return nil, nil
+	}
+	size := record.ref.Size - offset
+	if size > maxSize {
+		size = maxSize
+	}
+	return packfile.ReadRange(s.artifactPath(record.ref.Path), record.ref.Offset+offset, size)
+}
+
+func (s *Store) persistentStateFileRecord(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*persistentStateFileRecord, error) {
+	raw, err := s.getHotCopy(ctx, hotKeyPersistentStateFile(block, masterchainBlock, effectiveShard))
+	if err != nil {
+		return nil, err
+	}
+	return decodePersistentStateFileRecord(raw)
 }
 
 func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
@@ -534,15 +677,71 @@ func (s *Store) appendArtifactEntry(kind string, block ton.BlockIDExt, data []by
 	}
 	defer func() { _ = file.Close() }()
 
-	ptr, err := packfile.Append(file, packfile.EntryName(kind, block), data, true)
+	ptr, err := packfile.Append(file, packfile.EntryName(kind, block), data, false)
 	if err != nil {
 		return nil, err
 	}
+	s.pendingLooseSync[path] = struct{}{}
 	return &storage.ArtifactRef{
 		Path:   s.relativeArtifactPath(path),
 		Offset: ptr.Offset,
 		Size:   ptr.Size,
 	}, nil
+}
+
+func (s *Store) appendProofEntry(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) (*storage.ArtifactRef, error) {
+	if isKeyProofKind(kind) {
+		return s.appendKeyBlockProofEntry(kind, block, data)
+	}
+	return s.appendArtifactEntry(packEntryKindForProofKind(kind), block, data)
+}
+
+func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) (*storage.ArtifactRef, error) {
+	s.artifactMu.Lock()
+	defer s.artifactMu.Unlock()
+
+	path := s.keyBlockProofPackPath(block.SeqNo)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	ptr, err := packfile.Append(file, packfile.EntryName(packEntryKindForProofKind(kind), block), data, false)
+	if err != nil {
+		return nil, err
+	}
+	s.pendingKeyProofSync[path] = struct{}{}
+	return &storage.ArtifactRef{
+		Path:   s.relativeArtifactPath(path),
+		Offset: ptr.Offset,
+		Size:   ptr.Size,
+	}, nil
+}
+
+func (s *Store) copyProofRefToKeyPack(kind storage.ServedProofKind, block ton.BlockIDExt, ref *storage.ArtifactRef) (*storage.ArtifactRef, error) {
+	data, err := s.readArtifactRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	return s.appendKeyBlockProofEntry(kind, block, data)
+}
+
+func (s *Store) readArtifactRef(ref *storage.ArtifactRef) ([]byte, error) {
+	if ref == nil {
+		return nil, storage.ErrNotFound
+	}
+	data, err := packfile.ReadRange(s.artifactPath(ref.Path), ref.Offset, ref.Size)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != ref.Size {
+		return nil, fmt.Errorf("artifact %s range offset=%d size=%d is truncated", ref.Path, ref.Offset, ref.Size)
+	}
+	return data, nil
 }
 
 func (s *Store) readArtifact(ctx context.Context, key []byte) ([]byte, error) {
@@ -554,14 +753,7 @@ func (s *Store) readArtifact(ctx context.Context, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := packfile.ReadRange(s.artifactPath(ref.Path), ref.Offset, ref.Size)
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) != ref.Size {
-		return nil, fmt.Errorf("artifact %s range offset=%d size=%d is truncated", ref.Path, ref.Offset, ref.Size)
-	}
-	return data, nil
+	return s.readArtifactRef(ref)
 }
 
 func (s *Store) artifactPath(path string) string {
@@ -590,11 +782,32 @@ func (s *Store) archivePackPath(archiveID int64) string {
 	return filepath.Join(s.dir, "packs", "archive", fmt.Sprintf("%d.pack", archiveID))
 }
 
-func packEntryKindForProof(isLink bool) string {
-	if isLink {
-		return packfile.KindProofLink
+func (s *Store) keyBlockProofPackPath(seqno uint32) string {
+	packageID := seqno - seqno%keyArchiveMasterchainBlocks
+	group := packageID / 1000000
+	return filepath.Join(
+		s.dir,
+		"packs",
+		"key",
+		fmt.Sprintf("key%03d", group),
+		fmt.Sprintf("key.archive.%06d.pack", packageID),
+	)
+}
+
+func isKeyProofKind(kind storage.ServedProofKind) bool {
+	return kind == storage.ServedProofKeyBlock || kind == storage.ServedProofKeyBlockLink
+}
+
+func blockMetaFlagsForProofKind(kind storage.ServedProofKind) storage.BlockMetaFlags {
+	flags := storage.BlockMetaFlagForProof(kind)
+	if isKeyProofKind(kind) {
+		flags |= storage.BlockMetaIsKeyBlock
 	}
-	return packfile.KindProof
+	return flags
+}
+
+func isMissingProofArtifact(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "is truncated")
 }
 
 func packEntryKindForProofKind(kind storage.ServedProofKind) string {

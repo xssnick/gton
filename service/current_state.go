@@ -307,8 +307,10 @@ func (s *Service) currentStateForMasterState(ctx context.Context, current *stora
 		current:   current.Shards,
 		loadState: s.loadBlockStateForApply,
 		loadBlock: s.loadOrDownloadBlockForApply,
-		apply:     s.applyResolvedShardBlock,
-		save:      s.storage.SaveBlockState,
+		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, error) {
+			return s.applyResolvedShardBlock(ctx, target, previous, downloaded, nil)
+		},
+		save: s.storage.SaveBlockState,
 	})
 
 	for _, target := range targets {
@@ -500,7 +502,7 @@ func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.Blo
 	if err != nil {
 		return p2p.DownloadedBlock{}, err
 	}
-	downloaded, err = prepareDownloadedBlock(downloaded)
+	downloaded, err = prepareDownloadedBlockStateCells(downloaded)
 	if err != nil {
 		return p2p.DownloadedBlock{}, err
 	}

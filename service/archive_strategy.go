@@ -178,6 +178,11 @@ func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
 	total.Links += next.Links
 	total.DownloadElapsed += next.DownloadElapsed
 	total.ImportElapsed += next.ImportElapsed
+	total.ProcessingElapsed += next.ProcessingElapsed
+	total.BlockPrepareElapsed += next.BlockPrepareElapsed
+	total.MasterchainShardParse += next.MasterchainShardParse
+	total.StateUpdateCells += next.StateUpdateCells
+	total.StateUpdateCellPrepare += next.StateUpdateCellPrepare
 
 	if includeSeqRange {
 		if total.FirstSeqno == 0 || next.FirstSeqno != 0 && next.FirstSeqno < total.FirstSeqno {
