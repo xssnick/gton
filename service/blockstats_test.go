@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"flexserver/service/p2p"
+	"github.com/xssnick/gton/service/p2p"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"

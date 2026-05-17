@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	"flexserver/service/p2p"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -177,7 +177,6 @@ func applyBlockWithPreviousStates(previous []*tnstore.BlockState, downloaded p2p
 	if err != nil {
 		return nil, fmt.Errorf("parse next state from %s: %w", tnstore.FormatBlockRef(downloaded.ID), err)
 	}
-	next.DownloadedAt = time.Now()
 	return next, nil
 }
 

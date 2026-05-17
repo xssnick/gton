@@ -3,7 +3,7 @@ package p2p
 import (
 	"context"
 	"crypto/sha256"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 	"testing"
 	"time"
 
@@ -494,6 +494,7 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 	node, err := New(Options{
 		Logger:             &logger,
 		PeerServingStorage: store,
+		StateFilesDir:      t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -38,6 +38,7 @@ type LiveStore struct {
 	notify           chan struct{}
 	blocks           map[string]*liveBlock
 	metas            map[string]*storage.BlockMeta
+	states           map[liveBlockLookupKey]storage.BlockState
 	seqIndex         map[liveSeqKey]ton.BlockIDExt
 	flushed          map[string]struct{}
 	masterOrder      []string
@@ -68,6 +69,7 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 		notify:          make(chan struct{}),
 		blocks:          map[string]*liveBlock{},
 		metas:           map[string]*storage.BlockMeta{},
+		states:          map[liveBlockLookupKey]storage.BlockState{},
 		seqIndex:        map[liveSeqKey]ton.BlockIDExt{},
 		flushed:         map[string]struct{}{},
 		masterCacheSize: cfg.MasterBlockCache,
@@ -191,9 +193,21 @@ func (s *LiveStore) BlockState(ctx context.Context, block ton.BlockIDExt) (*stor
 	return s.Store.BlockState(ctx, block)
 }
 
-func (s *LiveStore) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {
+func (s *LiveStore) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
+	if state := s.cachedBlockState(block); state != nil && state.Cell != nil {
+		if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
+			return nil, storage.ErrNotFound
+		}
+
+		hash := state.Cell.HashKey(0)
+		if !bytes.Equal(hash[:], state.StateRootHash) {
+			return nil, storage.ErrNotFound
+		}
+		return state.Cell, nil
+	}
+
 	if s.Store == nil {
-		return nil, 0, storage.ErrNotFound
+		return nil, storage.ErrNotFound
 	}
 	return s.Store.LoadStateCellTree(ctx, block, rootHash)
 }
@@ -217,7 +231,7 @@ func (s *LiveStore) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*stora
 		}
 		return nil, err
 	}
-	return storage.MergeBlockMeta(stored, cached), nil
+	return storage.MergeBlockMeta(cached, stored), nil
 }
 
 func (s *LiveStore) LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
@@ -426,11 +440,18 @@ func currentMasterchainSeqno(current *storage.CurrentState) uint32 {
 }
 
 func (s *LiveStore) cachedBlockState(block ton.BlockIDExt) *storage.BlockState {
-	s.mu.RLock()
-	state := blockStateFromCurrent(s.current, block)
-	defer s.mu.RUnlock()
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil
+	}
 
-	return state
+	s.mu.RLock()
+	state, ok := s.states[key]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return storage.CloneBlockState(&state)
 }
 
 func (s *LiveStore) cachedBlockMeta(block ton.BlockIDExt) *storage.BlockMeta {
@@ -571,6 +592,7 @@ func (s *LiveStore) trimBlocksLocked(kind liveBlockCacheKind) {
 			}
 
 			delete(s.blocks, key)
+			s.removeBlockStateLocked(cached.id)
 			*order = append((*order)[:i], (*order)[i+1:]...)
 			removed = true
 			break
@@ -585,23 +607,37 @@ func (s *LiveStore) rebuildIndexesLocked() {
 	s.metas = map[string]*storage.BlockMeta{}
 	s.seqIndex = map[liveSeqKey]ton.BlockIDExt{}
 
-	if s.current != nil {
-		s.indexBlockStateLocked(s.current.Masterchain)
-		for _, shard := range s.current.Shards {
-			s.indexBlockStateLocked(shard)
-		}
-	}
-
 	for _, block := range s.blocks {
 		s.indexBlockLocked(block.id, block.meta)
 	}
+
+	if s.current != nil {
+		s.rememberBlockStateLocked(s.current.Masterchain)
+		for _, shard := range s.current.Shards {
+			s.rememberBlockStateLocked(shard)
+		}
+	}
+
+	for _, state := range s.states {
+		meta := storage.BuildBlockMetaFromState(state)
+		s.indexBlockLocked(state.Block, meta)
+	}
 }
 
-func (s *LiveStore) indexBlockStateLocked(state storage.BlockState) {
+func (s *LiveStore) rememberBlockStateLocked(state storage.BlockState) {
 	if !isFullBlockID(&state.Block) {
 		return
 	}
-	s.indexBlockLocked(state.Block, storage.BuildBlockMetaFromState(state))
+	if key, ok := liveBlockLookupKeyFromBlock(state.Block); ok {
+		s.states[key] = *storage.CloneBlockState(&state)
+	}
+}
+
+func (s *LiveStore) removeBlockStateLocked(block ton.BlockIDExt) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if ok {
+		delete(s.states, key)
+	}
 }
 
 func (s *LiveStore) indexBlockLocked(block ton.BlockIDExt, meta *storage.BlockMeta) {
@@ -674,7 +710,7 @@ func (s *LiveStore) storedBlockReady(ctx context.Context, state storage.BlockSta
 	if _, err := s.Store.BlockData(ctx, block); err != nil {
 		return err
 	}
-	_, _, err := s.Store.LoadStateCellTree(ctx, block, state.StateRootHash)
+	_, err := s.Store.LoadStateCellTree(ctx, block, state.StateRootHash)
 	return err
 }
 
@@ -701,6 +737,29 @@ type liveSeqKey struct {
 	workchain int32
 	shard     int64
 	seqno     uint32
+}
+
+type liveBlockLookupKey struct {
+	workchain int32
+	shard     int64
+	seqno     uint32
+	rootHash  [32]byte
+	fileHash  [32]byte
+}
+
+func liveBlockLookupKeyFromBlock(block ton.BlockIDExt) (liveBlockLookupKey, bool) {
+	if len(block.RootHash) != 32 || len(block.FileHash) != 32 {
+		return liveBlockLookupKey{}, false
+	}
+
+	key := liveBlockLookupKey{
+		workchain: block.Workchain,
+		shard:     block.Shard,
+		seqno:     block.SeqNo,
+	}
+	copy(key.rootHash[:], block.RootHash)
+	copy(key.fileHash[:], block.FileHash)
+	return key, true
 }
 
 func blockStateFromCurrent(current *storage.CurrentState, block ton.BlockIDExt) *storage.BlockState {

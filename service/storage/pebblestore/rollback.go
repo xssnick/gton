@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 	"fmt"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -28,45 +28,44 @@ func (s *Store) Rollback(ctx context.Context, current *storage.CurrentState) (Ro
 
 	keepStates := rollbackKeepStates(current)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return RollbackStats{}, errPebbleClosed
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return RollbackStats{}, err
 	}
+	defer s.releaseHotDB()
 
-	batch := s.hot.NewBatch()
+	s.hotWriteMu.Lock()
+	defer s.hotWriteMu.Unlock()
+
+	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
 
-	futureBlocks, stats, err := s.rollbackDeleteBlockMeta(ctx, batch, target.SeqNo, keepStates)
+	futureBlocks, stats, err := s.rollbackDeleteBlockMeta(ctx, db, batch, target.SeqNo, keepStates)
 	if err != nil {
 		return RollbackStats{}, err
 	}
-	deleted, err := s.rollbackDeleteStateMeta(ctx, batch, target.SeqNo, keepStates)
-	if err != nil {
-		return RollbackStats{}, err
-	}
-	stats.DeletedKeys += deleted
-	deleted, err = s.rollbackDeleteIndexedBlocks(ctx, batch, futureBlocks, target.SeqNo)
+	deleted, err := s.rollbackDeleteStateMeta(ctx, db, batch, target.SeqNo, keepStates)
 	if err != nil {
 		return RollbackStats{}, err
 	}
 	stats.DeletedKeys += deleted
-
-	deleted, err = s.rollbackDeleteHotKey(batch, hotKeyStateSyncProgress())
-	if err != nil {
-		return RollbackStats{}, err
-	}
-	stats.DeletedKeys += deleted
-	deleted, err = s.rollbackDeleteHotKey(batch, hotKeyVerifiedKeyBlockProgress())
+	deleted, err = s.rollbackDeleteIndexedBlocks(ctx, db, batch, futureBlocks, target.SeqNo)
 	if err != nil {
 		return RollbackStats{}, err
 	}
 	stats.DeletedKeys += deleted
 
-	if err = batch.Set(hotKeySeenMasterchainBlock(), encodeBlockID(target), pebble.NoSync); err != nil {
+	deleted, err = s.rollbackDeleteHotKey(db, batch, hotKeyStateSyncProgress())
+	if err != nil {
 		return RollbackStats{}, err
 	}
+	stats.DeletedKeys += deleted
+	deleted, err = s.rollbackDeleteHotKey(db, batch, hotKeyVerifiedKeyBlockProgress())
+	if err != nil {
+		return RollbackStats{}, err
+	}
+	stats.DeletedKeys += deleted
+
 	if err = batch.Set(hotKeyCurrentState(), encodeCurrentState(current), pebble.NoSync); err != nil {
 		return RollbackStats{}, err
 	}
@@ -77,8 +76,8 @@ func (s *Store) Rollback(ctx context.Context, current *storage.CurrentState) (Ro
 	return stats, nil
 }
 
-func (s *Store) rollbackDeleteHotKey(batch *pebble.Batch, key []byte) (int, error) {
-	exists, err := pebbleReaderHas(s.hot, key)
+func (s *Store) rollbackDeleteHotKey(db *pebble.DB, batch *pebble.Batch, key []byte) (int, error) {
+	exists, err := pebbleReaderHas(db, key)
 	if err != nil {
 		return 0, err
 	}
@@ -101,15 +100,15 @@ func rollbackKeepStates(current *storage.CurrentState) map[string]struct{} {
 	return keep
 }
 
-func (s *Store) rollbackDeleteBlockMeta(ctx context.Context, batch *pebble.Batch, cutoff uint32, keepStates map[string]struct{}) (map[string]struct{}, RollbackStats, error) {
+func (s *Store) rollbackDeleteBlockMeta(ctx context.Context, db *pebble.DB, batch *pebble.Batch, cutoff uint32, keepStates map[string]struct{}) (map[string]struct{}, RollbackStats, error) {
 	futureBlocks := map[string]struct{}{}
 	var stats RollbackStats
-	err := s.rollbackScanPrefix(ctx, hotPrefixBlockMeta, func(key []byte, value []byte) error {
+	err := s.rollbackScanPrefix(ctx, db, hotPrefixBlockMeta, func(key []byte, value []byte) error {
 		block, err := decodeRollbackBlockKey(hotPrefixBlockMeta, key)
 		if err != nil {
 			return err
 		}
-		meta, err := decodeBlockMeta(value)
+		meta, err := decodeBlockMeta(block, value)
 		if err != nil {
 			return err
 		}
@@ -140,26 +139,24 @@ func rollbackDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, cuto
 	return false
 }
 
-func (s *Store) rollbackDeleteStateMeta(ctx context.Context, batch *pebble.Batch, cutoff uint32, keepStates map[string]struct{}) (int, error) {
+func (s *Store) rollbackDeleteStateMeta(ctx context.Context, db *pebble.DB, batch *pebble.Batch, cutoff uint32, keepStates map[string]struct{}) (int, error) {
 	deleted := 0
-	for _, prefix := range [][]byte{hotPrefixStateMeta, hotPrefixStateCellSync} {
-		err := s.rollbackScanPrefix(ctx, prefix, func(key []byte, _ []byte) error {
-			block, err := decodeRollbackBlockKey(prefix, key)
-			if err != nil {
-				return err
-			}
-			if !rollbackDeleteState(block, cutoff, keepStates) {
-				return nil
-			}
-			if err = batch.Delete(key, pebble.NoSync); err != nil {
-				return err
-			}
-			deleted++
-			return nil
-		})
+	err := s.rollbackScanPrefix(ctx, db, hotPrefixStateMeta, func(key []byte, _ []byte) error {
+		block, err := decodeRollbackBlockKey(hotPrefixStateMeta, key)
 		if err != nil {
-			return deleted, err
+			return err
 		}
+		if !rollbackDeleteState(block, cutoff, keepStates) {
+			return nil
+		}
+		if err = batch.Delete(key, pebble.NoSync); err != nil {
+			return err
+		}
+		deleted++
+		return nil
+	})
+	if err != nil {
+		return deleted, err
 	}
 	return deleted, nil
 }
@@ -174,7 +171,7 @@ func rollbackDeleteState(block ton.BlockIDExt, cutoff uint32, keepStates map[str
 	return true
 }
 
-func (s *Store) rollbackDeleteIndexedBlocks(ctx context.Context, batch *pebble.Batch, futureBlocks map[string]struct{}, cutoff uint32) (int, error) {
+func (s *Store) rollbackDeleteIndexedBlocks(ctx context.Context, db *pebble.DB, batch *pebble.Batch, futureBlocks map[string]struct{}, cutoff uint32) (int, error) {
 	deleted := 0
 	scans := []rollbackScan{
 		{prefix: hotPrefixNextBlock, delete: rollbackDeleteNextBlock(futureBlocks, cutoff)},
@@ -188,7 +185,7 @@ func (s *Store) rollbackDeleteIndexedBlocks(ctx context.Context, batch *pebble.B
 		{prefix: hotPrefixArchiveInfo, delete: rollbackDeleteArchiveInfo(cutoff)},
 	}
 	for _, scan := range scans {
-		err := s.rollbackScanPrefix(ctx, scan.prefix, func(key []byte, value []byte) error {
+		err := s.rollbackScanPrefix(ctx, db, scan.prefix, func(key []byte, value []byte) error {
 			yes, err := scan.delete(key, value)
 			if err != nil || !yes {
 				return err
@@ -295,8 +292,8 @@ func rollbackFutureBlock(block ton.BlockIDExt, futureBlocks map[string]struct{},
 	return ok
 }
 
-func (s *Store) rollbackScanPrefix(ctx context.Context, prefix []byte, fn func(key []byte, value []byte) error) error {
-	iter, err := s.hot.NewIter(&pebble.IterOptions{
+func (s *Store) rollbackScanPrefix(ctx context.Context, db *pebble.DB, prefix []byte, fn func(key []byte, value []byte) error) error {
+	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixUpperBound(prefix),
 	})

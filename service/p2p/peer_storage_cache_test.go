@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -19,7 +19,7 @@ func TestRememberBlockFullSkipsPayloadWhenFileHashIsNotVerified(t *testing.T) {
 		blockCacheObserver: observer,
 	}
 
-	block := testBlockID(0, topShard, 42)
+	block := testBlockID(-1, topShard, 42)
 	node.rememberBlockFull(nil, &DownloadedBlock{
 		ID:               block,
 		ProofBOC:         []byte{0xaa, 0xbb},

@@ -5,42 +5,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	tnstore "flexserver/service/storage"
-	"flexserver/service/storage/pebblestore"
+	tnstore "github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
-
-func TestFormatByteRate(t *testing.T) {
-	tests := []struct {
-		name    string
-		bytes   int64
-		elapsed time.Duration
-		want    string
-	}{
-		{name: "zero bytes", bytes: 0, elapsed: time.Second, want: "0 B/s"},
-		{name: "bytes", bytes: 512, elapsed: time.Second, want: "512 B/s"},
-		{name: "kibibytes", bytes: 1536, elapsed: time.Second, want: "1.50 KB/s"},
-		{name: "mebibytes", bytes: 5 << 20, elapsed: 2 * time.Second, want: "2.50 MB/s"},
-		{name: "gibibytes", bytes: 3 << 30, elapsed: time.Second, want: "3.00 GB/s"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := formatByteRate(tt.bytes, tt.elapsed); got != tt.want {
-				t.Fatalf("formatByteRate() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
 
 func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 	block := ton.BlockIDExt{
@@ -62,7 +38,6 @@ func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 	staged := &stagedStateFile{
 		effectiveShard: 0,
 		peerAddr:       "127.0.0.1:30303",
-		cells:          1,
 		fileHash:       fileHash[:],
 	}
 
@@ -79,18 +54,15 @@ func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 	if !bytes.Equal(staged.state.StateCellHash, cellHash[:]) {
 		t.Fatalf("unexpected state cell hash %x want %x", staged.state.StateCellHash, cellHash[:])
 	}
-	if staged.state.CellsCount != staged.cells {
-		t.Fatalf("unexpected cells count %d want %d", staged.state.CellsCount, staged.cells)
-	}
 	if _, err := store.BlockState(context.Background(), block); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("staged metadata should not be persisted by p2p, got %v", err)
 	}
 }
 
-func TestPrepareStateDownloadDirPreservesCompletedFiles(t *testing.T) {
+func TestPrepareStateFilesDirPreservesCompletedFiles(t *testing.T) {
 	dir := t.TempDir()
 	completedPath := filepath.Join(dir, "state.boc")
-	incompletePath := filepath.Join(dir, "state.boc"+stateDownloadTempSuffix)
+	incompletePath := filepath.Join(dir, "state.boc"+stateFileTempSuffix)
 
 	if err := os.WriteFile(completedPath, []byte("complete"), 0o644); err != nil {
 		t.Fatalf("write completed file: %v", err)
@@ -99,15 +71,12 @@ func TestPrepareStateDownloadDirPreservesCompletedFiles(t *testing.T) {
 		t.Fatalf("write incomplete file: %v", err)
 	}
 
-	got, owned, err := prepareStateDownloadDir(dir, nil)
+	got, err := prepareStateFilesDir(dir)
 	if err != nil {
-		t.Fatalf("prepare state download dir: %v", err)
+		t.Fatalf("prepare state files dir: %v", err)
 	}
 	if got != dir {
 		t.Fatalf("unexpected dir %q want %q", got, dir)
-	}
-	if owned {
-		t.Fatal("configured state download dir should not be owned")
 	}
 	if _, err = os.Stat(completedPath); err != nil {
 		t.Fatalf("completed state file should be preserved: %v", err)
@@ -128,7 +97,7 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
 	root := mustTestShardStateCell(t, block)
 	rootHash := root.HashKey(0)
-	name, err := persistentStateFileName(block, master, 0)
+	name, err := PersistentStateFileName(block, master, 0)
 	if err != nil {
 		t.Fatalf("persistent state file name: %v", err)
 	}
@@ -139,9 +108,9 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 
 	store := newTestPebbleStore(t)
 	node := &Node{
-		log:              zerolog.Nop(),
-		storage:          store,
-		stateDownloadDir: dir,
+		log:           zerolog.Nop(),
+		storage:       store,
+		stateFilesDir: dir,
 	}
 	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
 	if err != nil {
@@ -153,8 +122,8 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	if lazyRoot == nil || lazyRoot.HashKey(0) != rootHash {
 		t.Fatal("unexpected imported root")
 	}
-	if _, _, err = store.LoadStateCellTree(ctx, block, rootHash[:]); err != nil {
-		t.Fatalf("expected reusable state to be imported: %v", err)
+	if _, err = store.LoadStateCellTree(ctx, block, rootHash[:]); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("reusable state should stay uncommitted until metadata save, got %v", err)
 	}
 	if _, err = os.Stat(path); err != nil {
 		t.Fatalf("reusable state file should stay on disk: %v", err)
@@ -177,15 +146,10 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	}
 	root := mustTestShardStateCellWithAccounts(t, block, 0, 1)
 	rootHash := root.HashKey(0)
-	skeleton := cell.CreateProofSkeleton()
-	skeleton.SetRecursive()
-	proof, err := root.CreateProof(skeleton)
-	if err != nil {
-		t.Fatalf("create split header proof: %v", err)
-	}
+	proof := testFullMerkleProof(t, root)
 
 	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
-	name, err := persistentStateFileName(block, master, block.Shard)
+	name, err := PersistentStateFileName(block, master, block.Shard)
 	if err != nil {
 		t.Fatalf("split header file name: %v", err)
 	}
@@ -196,9 +160,9 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 
 	store := newTestPebbleStore(t)
 	node := &Node{
-		log:              zerolog.Nop(),
-		storage:          store,
-		stateDownloadDir: dir,
+		log:           zerolog.Nop(),
+		storage:       store,
+		stateFilesDir: dir,
 	}
 	header, err := persistentStateSnapshotDownloader{
 		node:          node,
@@ -215,9 +179,6 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	if len(header.parts) == 0 {
 		t.Fatal("expected split header parts")
 	}
-	if _, _, err = store.LoadStateCellTree(ctx, splitStateHeaderStorageBlock(block), nil); err != nil {
-		t.Fatalf("expected split header cells to be imported: %v", err)
-	}
 	if _, err = os.Stat(path); err != nil {
 		t.Fatalf("reusable split header file should stay until artifact cleanup: %v", err)
 	}
@@ -226,51 +187,6 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	}
 	if _, err = os.Stat(path); err != nil {
 		t.Fatalf("cleanup should keep reusable split header file, got %v", err)
-	}
-}
-
-func TestLoadImportedSplitPersistentStatePart(t *testing.T) {
-	ctx := context.Background()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(-1 << 63),
-		SeqNo:     63272132,
-	}
-	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
-	partRootHash := partRoot.HashKey()
-	part := splitStatePart{
-		effectiveShard: 0x0800000000000000,
-		rootHash:       partRootHash[:],
-	}
-
-	store := newTestPebbleStore(t)
-	if _, err := store.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, part), partRoot, nil, 7); err != nil {
-		t.Fatalf("import split part cell tree: %v", err)
-	}
-
-	node := &Node{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
-	imported, err := persistentStateSnapshotDownloader{
-		node:   node,
-		block:  block,
-		master: ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo},
-	}.loadImportedSplitPart(ctx, 1, 4, part)
-	if err != nil {
-		t.Fatalf("load imported split persistent state part: %v", err)
-	}
-	if imported.staged == nil || imported.staged.lazyRoot == nil {
-		t.Fatal("expected staged lazy root")
-	}
-	if imported.staged.cells != 7 {
-		t.Fatalf("unexpected cells count %d want 7", imported.staged.cells)
-	}
-	if imported.staged.effectiveShard != int64(part.effectiveShard) {
-		t.Fatalf("unexpected effective shard %016x", uint64(imported.staged.effectiveShard))
-	}
-	if imported.staged.lazyRoot.HashKey() != partRootHash {
-		t.Fatalf("unexpected lazy root hash")
 	}
 }
 
@@ -299,8 +215,26 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	if _, err := store.ImportStateCellTree(ctx, block, fullRoot, nil, 1); err != nil {
 		t.Fatalf("import full state cell tree: %v", err)
 	}
+	partLevelHash := partRoot.HashKey(0)
+	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
+		Block:          splitStatePartStorageBlock(block, part),
+		StateRootHash:  partLevelHash[:],
+		StateCellHash:  partRootHash[:],
+		CellGeneration: 1,
+	}); err != nil {
+		t.Fatalf("save split part metadata: %v", err)
+	}
+	fullCellHash := fullRoot.HashKey()
+	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
+		Block:          block,
+		StateRootHash:  fullRootHash[:],
+		StateCellHash:  fullCellHash[:],
+		CellGeneration: 1,
+	}); err != nil {
+		t.Fatalf("save full state metadata: %v", err)
+	}
 
-	loadedPart, _, err := store.LoadStateCellTree(ctx, splitStatePartStorageBlock(block, part), partRootHash[:])
+	loadedPart, err := store.LoadStateCellTree(ctx, splitStatePartStorageBlock(block, part), partLevelHash[:])
 	if err != nil {
 		t.Fatalf("load split part cell tree: %v", err)
 	}
@@ -308,7 +242,7 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 		t.Fatalf("unexpected split part root hash")
 	}
 
-	loadedFull, _, err := store.LoadStateCellTree(ctx, block, fullRootHash[:])
+	loadedFull, err := store.LoadStateCellTree(ctx, block, fullRootHash[:])
 	if err != nil {
 		t.Fatalf("load full state cell tree: %v", err)
 	}
@@ -336,7 +270,7 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	fullCellHash := fullRoot.HashKey()
 
 	var fullState tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&fullState, fullRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&fullState, fullRoot.MustBeginParse()); err != nil {
 		t.Fatalf("parse full state: %v", err)
 	}
 
@@ -381,24 +315,13 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 			t.Fatalf("lazy part %d hash mismatch", i+1)
 		}
 
-		imported, err := persistentStateSnapshotDownloader{
-			node:   node,
-			block:  block,
-			master: master,
-		}.loadImportedSplitPart(ctx, i, len(header.parts), part)
-		if err != nil {
-			t.Fatalf("load imported split part %d: %v", i+1, err)
-		}
-		if imported.staged.lazyRoot == nil {
-			t.Fatalf("imported split part %d has no lazy root", i+1)
-		}
-		if imported.staged.lazyRoot.GetType() == cell.MerkleProofCellType {
-			t.Fatalf("imported split part %d should be part root, not proof header", i+1)
-		}
-
 		partArtifacts = append(partArtifacts, splitPersistentStatePartArtifact{
-			part:   part,
-			staged: imported.staged,
+			part: part,
+			staged: &stagedStateFile{
+				effectiveShard: int64(part.effectiveShard),
+				peerAddr:       "celldb",
+				lazyRoot:       lazyPartRoot,
+			},
 		})
 	}
 
@@ -426,8 +349,11 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	if !bytes.Equal(state.StateCellHash, fullCellHash[:]) {
 		t.Fatalf("merged state cell hash mismatch: got=%x want=%x", state.StateCellHash, fullCellHash)
 	}
+	if err = store.SaveBlockState(ctx, state); err != nil {
+		t.Fatalf("commit merged state metadata: %v", err)
+	}
 
-	loadedRoot, _, err := store.LoadStateCellTree(ctx, block, fullRootHash[:])
+	loadedRoot, err := store.LoadStateCellTree(ctx, block, fullRootHash[:])
 	if err != nil {
 		t.Fatalf("load merged state from pebble: %v", err)
 	}
@@ -450,6 +376,88 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	}
 }
 
+func TestSplitStatePartsMatchesSerializedProofHeaderPartHashes(t *testing.T) {
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272132,
+	}
+	splitDepth := uint32(4)
+	fullRoot := mustTestShardStateCellWithAccountIDs(
+		t,
+		block,
+		big.NewInt(0),
+		new(big.Int).Lsh(big.NewInt(3), 252),
+		new(big.Int).Lsh(big.NewInt(9), 252),
+		new(big.Int).Lsh(big.NewInt(15), 252),
+	)
+	fullRootHash := fullRoot.HashKey(0)
+
+	headerProof, expected := testSplitPersistentStateHeaderProof(t, block, fullRoot, splitDepth)
+
+	_, headerParts, err := splitStateParts(block, headerProof, splitDepth, fullRootHash[:])
+	if err != nil {
+		t.Fatalf("parse split state header proof: %v", err)
+	}
+	if len(headerParts) != len(expected) {
+		t.Fatalf("unexpected header parts count %d want %d", len(headerParts), len(expected))
+	}
+	for _, part := range headerParts {
+		want, ok := expected[part.effectiveShard]
+		if !ok {
+			t.Fatalf("unexpected split part shard %016x", part.effectiveShard)
+		}
+		if !bytes.Equal(part.rootHash, want[:]) {
+			t.Fatalf("split part %016x hash mismatch: got=%x want=%x", part.effectiveShard, part.rootHash, want)
+		}
+	}
+}
+
+func testSplitPersistentStateHeaderProof(t *testing.T, block ton.BlockIDExt, fullRoot *cell.Cell, splitDepth uint32) (*cell.Cell, map[uint64]cell.Hash) {
+	t.Helper()
+
+	proofBuilder := cell.NewMerkleProofBuilder(fullRoot)
+	proofRoot := proofBuilder.Root()
+
+	var header tlb.ShardStateUnsplit
+	if err := tlb.LoadFromCell(&header, proofRoot.MustBeginParse()); err != nil {
+		t.Fatalf("parse proof root: %v", err)
+	}
+
+	parts := mustSplitStatePartsFromFullState(t, block, &header, splitDepth)
+	expected := make(map[uint64]cell.Hash, len(parts))
+	for _, part := range parts {
+		partRoot := mustSplitStatePartRoot(t, &header, part, splitDepth)
+		expected[part.effectiveShard] = partRoot.HashKey()
+	}
+
+	testMarkSplitHeaderStateExceptAccounts(t, proofRoot)
+	proof, err := proofBuilder.CreateProof()
+	if err != nil {
+		t.Fatalf("create split header proof: %v", err)
+	}
+	return proof, expected
+}
+
+func testMarkSplitHeaderStateExceptAccounts(t *testing.T, root *cell.Cell) {
+	t.Helper()
+
+	refs := int(root.RefsNum())
+	if refs < 3 {
+		t.Fatalf("shard state root refs=%d, want at least 3", refs)
+	}
+	for i := 0; i < refs; i++ {
+		if i == 1 {
+			continue
+		}
+		ref, err := root.PeekRef(i)
+		if err != nil {
+			t.Fatalf("peek shard state ref %d: %v", i, err)
+		}
+		testMarkFullProofSubtree(t, ref)
+	}
+}
+
 func TestMergeSplitStateDoesNotExpandLazySplitPartAccounts(t *testing.T) {
 	ctx := context.Background()
 	block := ton.BlockIDExt{
@@ -467,7 +475,7 @@ func TestMergeSplitStateDoesNotExpandLazySplitPartAccounts(t *testing.T) {
 	fullRootHash := fullRoot.HashKey(0)
 
 	var fullState tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&fullState, fullRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&fullState, fullRoot.MustBeginParse()); err != nil {
 		t.Fatalf("parse full state: %v", err)
 	}
 
@@ -504,48 +512,31 @@ func TestMergeSplitStateDoesNotExpandLazySplitPartAccounts(t *testing.T) {
 	}
 }
 
-func TestLoadImportedSplitPersistentStateHeader(t *testing.T) {
-	ctx := context.Background()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(-1 << 63),
-		SeqNo:     63272132,
-	}
-	root := mustTestShardStateCellWithAccounts(t, block, 0, 1)
-	rootHash := root.HashKey(0)
-	skeleton := cell.CreateProofSkeleton()
-	skeleton.SetRecursive()
-	proof, err := root.CreateProof(skeleton)
-	if err != nil {
-		t.Fatalf("create split header proof: %v", err)
-	}
+func testFullMerkleProof(t *testing.T, root *cell.Cell) *cell.Cell {
+	t.Helper()
 
-	store := newTestPebbleStore(t)
-	if _, err = store.ImportStateCellTree(ctx, splitStateHeaderStorageBlock(block), proof, nil, 11); err != nil {
-		t.Fatalf("import split header cell tree: %v", err)
-	}
-
-	node := &Node{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
-	header, err := persistentStateSnapshotDownloader{
-		node:          node,
-		block:         block,
-		master:        ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo},
-		stateRootHash: rootHash[:],
-	}.loadImportedSplitHeader(ctx, 4)
+	proofBuilder := cell.NewMerkleProofBuilder(root)
+	testMarkFullProofSubtree(t, proofBuilder.Root())
+	proof, err := proofBuilder.CreateProof()
 	if err != nil {
-		t.Fatalf("load imported split persistent state header: %v", err)
+		t.Fatalf("create full proof: %v", err)
 	}
-	if header.cells != 11 {
-		t.Fatalf("unexpected header cells %d want 11", header.cells)
+	return proof
+}
+
+func testMarkFullProofSubtree(t *testing.T, root *cell.Cell) {
+	t.Helper()
+
+	loader, err := root.BeginParse()
+	if err != nil {
+		t.Fatalf("begin proof subtree: %v", err)
 	}
-	if len(header.parts) == 0 {
-		t.Fatal("expected split header parts")
-	}
-	if header.state == nil || header.state.Seqno != block.SeqNo {
-		t.Fatal("unexpected imported split header state")
+	for i := 0; i < loader.RefsNum(); i++ {
+		ref, err := loader.PeekRefCellAt(i)
+		if err != nil {
+			t.Fatalf("proof subtree ref %d: %v", i, err)
+		}
+		testMarkFullProofSubtree(t, ref)
 	}
 }
 

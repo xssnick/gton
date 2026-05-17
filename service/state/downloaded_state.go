@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 )

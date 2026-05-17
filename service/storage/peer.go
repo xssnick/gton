@@ -26,7 +26,12 @@ type PeerServingStorageWriter interface {
 	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SaveZeroState(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SavePersistentStateFile(file *PersistentStateFile) error
-	SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error)
+	SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (SavedArchiveFile, error)
+}
+
+type SavedArchiveFile struct {
+	Path           string
+	ReusedExisting bool
 }
 
 type ServedProofKind string
@@ -39,13 +44,14 @@ const (
 )
 
 type ServedBlockFull struct {
-	ID       ton.BlockIDExt
-	Proof    []byte
-	Block    []byte
-	ProofRef *ArtifactRef
-	BlockRef *ArtifactRef
-	Meta     *BlockMeta
-	IsLink   bool
+	ID                     ton.BlockIDExt
+	Proof                  []byte
+	Block                  []byte
+	ProofRef               *ArtifactRef
+	BlockRef               *ArtifactRef
+	Meta                   *BlockMeta
+	IsLink                 bool
+	ArchiveShardSplitDepth uint32
 }
 
 type ServedBlockData struct {
@@ -73,6 +79,17 @@ type ServedArchiveImport struct {
 	Links      []ServedBlockLink
 }
 
+type ArchivePruneStats struct {
+	CutoffUnix            uint32
+	DeletedBeforeSeqno    uint32
+	ScannedPackages       int
+	DeletedPackages       int
+	DeletedPackageFiles   int
+	DeletedBlockMeta      int
+	DeletedMetadataKeys   int
+	RetainedBoundarySeqno uint32
+}
+
 type PersistentStateFile struct {
 	Block            ton.BlockIDExt
 	MasterchainBlock ton.BlockIDExt
@@ -80,7 +97,6 @@ type PersistentStateFile struct {
 	Ref              *ArtifactRef
 	FileHash         []byte
 	StateRootHash    []byte
-	CellsCount       uint64
 }
 
 type ArtifactRef struct {
@@ -105,12 +121,13 @@ func (b *ServedBlockFull) Clone() *ServedBlockFull {
 		return nil
 	}
 	return &ServedBlockFull{
-		ID:       b.ID,
-		Proof:    append([]byte(nil), b.Proof...),
-		Block:    append([]byte(nil), b.Block...),
-		ProofRef: b.ProofRef.Clone(),
-		BlockRef: b.BlockRef.Clone(),
-		Meta:     b.Meta.Clone(),
-		IsLink:   b.IsLink,
+		ID:                     b.ID,
+		Proof:                  append([]byte(nil), b.Proof...),
+		Block:                  append([]byte(nil), b.Block...),
+		ProofRef:               b.ProofRef.Clone(),
+		BlockRef:               b.BlockRef.Clone(),
+		Meta:                   b.Meta.Clone(),
+		IsLink:                 b.IsLink,
+		ArchiveShardSplitDepth: b.ArchiveShardSplitDepth,
 	}
 }

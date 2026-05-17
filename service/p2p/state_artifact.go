@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -22,13 +22,15 @@ import (
 )
 
 const (
-	stateDownloadTempSuffix       = ".part"
+	stateFileTempSuffix           = ".part"
 	stateArtifactProgressInterval = 5 * time.Second
 )
 
 type zeroStateSnapshotArtifact struct {
-	block ton.BlockIDExt
-	data  []byte
+	block  ton.BlockIDExt
+	data   []byte
+	writer storage.PeerServingStorageWriter
+	stored bool
 }
 
 func (a *zeroStateSnapshotArtifact) Block() ton.BlockIDExt {
@@ -48,8 +50,25 @@ func (a *zeroStateSnapshotArtifact) decode(ctx context.Context, cells storage.St
 	if err != nil {
 		return nil, err
 	}
-	state.DownloadedAt = time.Now()
-	return importBlockStateCells(ctx, cells, state, nil)
+	state, err = importBlockStateCells(ctx, cells, state, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err = a.save(); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (a *zeroStateSnapshotArtifact) save() error {
+	if a.writer == nil || a.stored {
+		return nil
+	}
+	if err := a.writer.SaveZeroState(a.block, a.data, nil); err != nil {
+		return fmt.Errorf("store zero state: %w", err)
+	}
+	a.stored = true
+	return nil
 }
 
 func (a *zeroStateSnapshotArtifact) Cleanup() error {
@@ -62,13 +81,132 @@ type stagedStateFile struct {
 	peerAddr       string
 	path           string
 	size           int64
-	cells          uint64
 	fileHash       []byte
 	prefix         []byte
 	lazyRoot       *cell.Cell
 	state          *storage.BlockState
 	keep           bool
 	persisted      bool
+}
+
+type PersistentStateFileLoader func(effectiveShard int64) (*storage.PersistentStateFile, error)
+
+func NewPersistentStateSnapshotArtifactFromFile(node *Node, file *storage.PersistentStateFile) (storage.DownloadedState, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node is nil")
+	}
+	staged, err := stagedStateFileFromPersistentStateFile(file)
+	if err != nil {
+		return nil, err
+	}
+	stateRootHash := file.StateRootHash
+	if len(stateRootHash) == 0 {
+		return nil, fmt.Errorf("persistent state file root hash is empty")
+	}
+	return &persistentStateSnapshotArtifact{
+		node:          node,
+		block:         file.Block,
+		master:        file.MasterchainBlock,
+		stateRootHash: bytes.Clone(stateRootHash),
+		staged:        staged,
+	}, nil
+}
+
+func NewSplitPersistentStateSnapshotArtifactFromStoredFiles(
+	ctx context.Context,
+	node *Node,
+	block ton.BlockIDExt,
+	master ton.BlockIDExt,
+	splitDepth uint32,
+	stateRootHash []byte,
+	loadFile PersistentStateFileLoader,
+) (storage.DownloadedState, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node is nil")
+	}
+	if loadFile == nil {
+		return nil, fmt.Errorf("persistent state file loader is nil")
+	}
+	if len(stateRootHash) == 0 {
+		return nil, fmt.Errorf("persistent state root hash is empty")
+	}
+
+	headerFile, err := loadFile(block.Shard)
+	if err != nil {
+		return nil, fmt.Errorf("load split persistent state header file: %w", err)
+	}
+	headerStaged, err := stagedStateFileFromPersistentStateFile(headerFile)
+	if err != nil {
+		return nil, err
+	}
+
+	downloader := persistentStateSnapshotDownloader{
+		node:          node,
+		block:         block,
+		master:        master,
+		stateRootHash: bytes.Clone(stateRootHash),
+	}
+	header, err := downloader.parseStagedSplitHeader(splitDepth, headerStaged)
+	runtime.GC()
+	if err != nil {
+		return nil, err
+	}
+
+	parts := make([]splitPersistentStatePartArtifact, 0, len(header.parts))
+	for _, part := range header.parts {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		file, err := loadFile(int64(part.effectiveShard))
+		if err != nil {
+			return nil, fmt.Errorf("load split persistent state part %016x file: %w", part.effectiveShard, err)
+		}
+		staged, err := stagedStateFileFromPersistentStateFile(file)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, splitPersistentStatePartArtifact{
+			part:   part,
+			staged: staged,
+		})
+	}
+
+	return &splitPersistentStateSnapshotArtifact{
+		node:          node,
+		block:         block,
+		master:        master,
+		stateRootHash: bytes.Clone(stateRootHash),
+		header:        header,
+		parts:         parts,
+	}, nil
+}
+
+func stagedStateFileFromPersistentStateFile(file *storage.PersistentStateFile) (*stagedStateFile, error) {
+	if file == nil {
+		return nil, fmt.Errorf("persistent state file is nil")
+	}
+	if file.Ref == nil {
+		return nil, fmt.Errorf("persistent state file ref is nil")
+	}
+	if file.Ref.Path == "" {
+		return nil, fmt.Errorf("persistent state file path is empty")
+	}
+	if file.Ref.Offset != 0 {
+		return nil, fmt.Errorf("persistent state file offset %d is not supported for local import", file.Ref.Offset)
+	}
+	if file.Ref.Size <= 0 {
+		return nil, fmt.Errorf("persistent state file size is invalid")
+	}
+	return &stagedStateFile{
+		effectiveShard: file.EffectiveShard,
+		peerAddr:       "local",
+		path:           file.Ref.Path,
+		size:           file.Ref.Size,
+		fileHash:       bytes.Clone(file.FileHash),
+		keep:           true,
+		persisted:      true,
+	}, nil
 }
 
 func (f *stagedStateFile) cleanup() error {
@@ -142,7 +280,6 @@ func (n *Node) acquireStateCellImportSlot(ctx context.Context, block ton.BlockID
 		n.log.Info().
 			Str("block", formatPersistentStateBlockRef(block, staged.effectiveShard)).
 			Str("size", formatByteSize(staged.size)).
-			Uint64("cells", staged.cells).
 			Msg("staged state snapshot is ready, waiting for cell import slot")
 
 		select {
@@ -150,6 +287,31 @@ func (n *Node) acquireStateCellImportSlot(ctx context.Context, block ton.BlockID
 			return nil, ctx.Err()
 		case n.stateCellImportSlot <- struct{}{}:
 			return func() { <-n.stateCellImportSlot }, nil
+		}
+	}
+}
+
+func (n *Node) acquireStateSplitPartDecodeSlot(ctx context.Context, block ton.BlockIDExt, staged *stagedStateFile) (func(), error) {
+	if n.stateSplitPartDecodeSlot == nil {
+		return func() {}, nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case n.stateSplitPartDecodeSlot <- struct{}{}:
+		return func() { <-n.stateSplitPartDecodeSlot }, nil
+	default:
+		n.log.Info().
+			Str("block", formatPersistentStateBlockRef(block, staged.effectiveShard)).
+			Str("size", formatByteSize(staged.size)).
+			Msg("staged split state part is ready, waiting for decode slot")
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case n.stateSplitPartDecodeSlot <- struct{}{}:
+			return func() { <-n.stateSplitPartDecodeSlot }, nil
 		}
 	}
 }
@@ -182,9 +344,56 @@ func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBloc
 			root = nil
 			parsedCells = nil
 			runtime.GC()
-			return nil, fmt.Errorf("%w: staged state root hash mismatch", errStateSnapshotInvalid)
+			return nil, fmt.Errorf("%w: staged state root hash mismatch: got=%s want=%s", errStateSnapshotInvalid, hex.EncodeToString(rootHash[:]), hex.EncodeToString(wantRootHash))
 		}
 	}
+
+	lazyRoot, err := n.importStagedStateCellTree(ctx, storageBlock, staged, root, parsedCells)
+	root = nil
+	parsedCells = nil
+	runtime.GC()
+	if err != nil {
+		return nil, err
+	}
+	return lazyRoot, nil
+}
+
+func (n *Node) decodeAndImportSplitPartStagedStateCellTree(ctx context.Context, logBlock ton.BlockIDExt, storageBlock ton.BlockIDExt, staged *stagedStateFile, wantRootHash []byte) (*cell.Cell, error) {
+	releaseDecode, err := n.acquireStateSplitPartDecodeSlot(ctx, logBlock, staged)
+	if err != nil {
+		return nil, err
+	}
+	decodeReleased := false
+	defer func() {
+		if !decodeReleased {
+			releaseDecode()
+		}
+	}()
+
+	root, parsedCells, err := staged.decodeRootCells()
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse staged state boc: %w", errStateSnapshotInvalid, err)
+	}
+	if len(wantRootHash) > 0 {
+		rootHash := stagedStateHash(root, stagedStateCellHash)
+		if !bytes.Equal(rootHash[:], wantRootHash) {
+			root = nil
+			parsedCells = nil
+			runtime.GC()
+			return nil, fmt.Errorf("%w: staged state root hash mismatch: got=%s want=%s", errStateSnapshotInvalid, hex.EncodeToString(rootHash[:]), hex.EncodeToString(wantRootHash))
+		}
+	}
+
+	releaseImport, err := n.acquireStateCellImportSlot(ctx, logBlock, staged)
+	if err != nil {
+		root = nil
+		parsedCells = nil
+		runtime.GC()
+		return nil, err
+	}
+	releaseDecode()
+	decodeReleased = true
+	defer releaseImport()
 
 	lazyRoot, err := n.importStagedStateCellTree(ctx, storageBlock, staged, root, parsedCells)
 	root = nil
@@ -230,7 +439,6 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 		n.log.Info().
 			Str("block", formatPersistentStateBlockRef(block, effectiveShard)).
 			Str("size", formatByteSize(staged.size)).
-			Uint64("cells", staged.cells).
 			Str("path", staged.path).
 			Msg("importing reusable staged state snapshot cells")
 
@@ -239,7 +447,6 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 		if err == nil {
 			n.log.Info().
 				Str("block", formatPersistentStateBlockRef(block, effectiveShard)).
-				Uint64("cells", staged.cells).
 				Str("path", stagedPath).
 				Msg("reusable staged state snapshot switched to lazy celldb root")
 			return staged, lazyRoot, nil
@@ -274,7 +481,7 @@ func (n *Node) importStagedStateCellTree(ctx context.Context, storageBlock ton.B
 		return root, nil
 	}
 
-	lazyRoot, err := n.storage.ImportStateCellTree(ctx, storageBlock, root, parsedCells, staged.cells)
+	lazyRoot, err := n.storage.ImportStateCellTree(ctx, storageBlock, root, parsedCells, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -291,16 +498,13 @@ func (n *Node) cacheImportedStagedBlockState(block ton.BlockIDExt, staged *stage
 	if err != nil {
 		return fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
-	state.CellsCount = staged.cells
 	state.StateFileHash = staged.fileHash
-	state.DownloadedAt = time.Now()
 
 	staged.state = storage.CloneBlockState(state)
 
 	n.log.Info().
 		Str("peer", staged.peerAddr).
 		Str("block", formatPersistentStateBlockRef(block, staged.effectiveShard)).
-		Uint64("cells", state.CellsCount).
 		Str("state_root_hash", hex.EncodeToString(state.StateRootHash)).
 		Str("state_file_hash", hex.EncodeToString(state.StateFileHash)).
 		Msg("imported state snapshot metadata prepared")
@@ -328,7 +532,6 @@ func (n *Node) savePersistentStateFile(block ton.BlockIDExt, master ton.BlockIDE
 		},
 		FileHash:      bytes.Clone(staged.fileHash),
 		StateRootHash: bytes.Clone(stateRootHash),
-		CellsCount:    staged.cells,
 	}); err != nil {
 		return err
 	}
@@ -398,15 +601,12 @@ func (a *persistentStateSnapshotArtifact) decode(ctx context.Context, cells stor
 			Msg("failed to parse downloaded state snapshot")
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
-	state.CellsCount = a.staged.cells
 	state.StateFileHash = a.staged.fileHash
-	state.DownloadedAt = time.Now()
 
 	a.node.log.Info().
 		Str("peer", a.staged.peerAddr).
 		Str("block", formatPersistentStateBlockRef(a.block, a.staged.effectiveShard)).
 		Str("size", formatByteSize(a.staged.size)).
-		Uint64("cells", state.CellsCount).
 		Str("state_root_hash", hex.EncodeToString(state.StateRootHash)).
 		Str("state_file_hash", hex.EncodeToString(a.staged.fileHash)).
 		Msg("state snapshot parsed")
@@ -451,7 +651,6 @@ func (a *splitPersistentStateSnapshotArtifact) ImportCells(ctx context.Context, 
 }
 
 func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells storage.StateCellTreeImporter) (*storage.BlockState, error) {
-	totalCells := a.header.cells
 	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
 	if err != nil {
 		return nil, err
@@ -494,7 +693,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 
 		if cells != nil && !root.IsLazy() {
 			partBlock := splitStatePartStorageBlock(a.block, part.part)
-			lazyRoot, err := cells.ImportStateCellTree(ctx, partBlock, root, parsedCells, part.staged.cells)
+			lazyRoot, err := cells.ImportStateCellTree(ctx, partBlock, root, parsedCells, 0)
 			if err != nil {
 				return nil, fmt.Errorf("import split state part %d cells: %w", i+1, err)
 			}
@@ -507,7 +706,6 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 				Str("block", formatPersistentStateBlockRef(a.block, int64(part.part.effectiveShard))).
 				Int("part", i+1).
 				Int("parts", len(a.parts)).
-				Uint64("cells", part.staged.cells).
 				Msg("split persistent state part switched to lazy celldb root")
 		}
 
@@ -531,14 +729,12 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 			return nil, fmt.Errorf("store split persistent state part %d file: %w", i+1, err)
 		}
 
-		totalCells += part.staged.cells
 		a.node.log.Info().
 			Str("peer", part.staged.peerAddr).
 			Str("block", formatPersistentStateBlockRef(a.block, int64(part.part.effectiveShard))).
 			Int("part", i+1).
 			Int("parts", len(a.parts)).
 			Str("size", formatByteSize(part.staged.size)).
-			Uint64("cells", part.staged.cells).
 			Str("state_file_hash", hex.EncodeToString(part.staged.fileHash)).
 			Msg("split persistent state part parsed")
 	}
@@ -547,12 +743,14 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		Str("block", formatBlockRef(a.block)).
 		Str("masterchain", formatBlockRef(a.master)).
 		Int("parts", len(a.parts)).
-		Uint64("cells", totalCells).
 		Msg("merging split persistent state parts")
 
 	stateRoot, err := mergeSplitStateAccounts(a.header.state, accounts)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
+	}
+	if stateRoot.IsVirtualized() {
+		return nil, fmt.Errorf("%w: merged split state root is virtualized", errStateSnapshotInvalid)
 	}
 	stateRootHash := stateRoot.HashKey(0)
 	if !bytes.Equal(stateRootHash[:], a.stateRootHash) {
@@ -560,7 +758,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 	}
 
 	if cells != nil {
-		lazyRoot, err := cells.ImportStateCellTree(ctx, a.block, stateRoot, nil, totalCells)
+		lazyRoot, err := cells.ImportStateCellTree(ctx, a.block, stateRoot, nil, 0)
 		if err != nil {
 			return nil, fmt.Errorf("import merged split state cells: %w", err)
 		}
@@ -570,7 +768,6 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		a.node.log.Info().
 			Str("block", formatBlockRef(a.block)).
 			Str("masterchain", formatBlockRef(a.master)).
-			Uint64("cells", totalCells).
 			Msg("merged split state switched to lazy celldb root")
 	}
 
@@ -578,12 +775,9 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
-	state.CellsCount = totalCells
-	state.DownloadedAt = time.Now()
 
 	a.node.log.Info().
 		Str("block", formatBlockRef(a.block)).
-		Uint64("cells", state.CellsCount).
 		Str("state_root_hash", hex.EncodeToString(state.StateRootHash)).
 		Msg("split state snapshot parsed")
 	return state, nil
@@ -597,7 +791,7 @@ func importBlockStateCells(ctx context.Context, cells storage.StateCellTreeImpor
 		return state, nil
 	}
 
-	lazyRoot, err := cells.ImportStateCellTree(ctx, state.Block, state.Cell, parsedCells, state.CellsCount)
+	lazyRoot, err := cells.ImportStateCellTree(ctx, state.Block, state.Cell, parsedCells, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -611,8 +805,6 @@ func importBlockStateCells(ctx context.Context, cells storage.StateCellTreeImpor
 		return nil, err
 	}
 	lazyState.StateFileHash = state.StateFileHash
-	lazyState.CellsCount = state.CellsCount
-	lazyState.DownloadedAt = state.DownloadedAt
 	return lazyState, nil
 }
 
@@ -635,7 +827,6 @@ func (a *splitPersistentStateSnapshotArtifact) startSplitStatePartProgress(ctx c
 					Int("parts", len(a.parts)).
 					Str("phase", phase).
 					Str("size", formatByteSize(part.staged.size)).
-					Uint64("cells", part.staged.cells).
 					Dur("elapsed", time.Since(started)).
 					Msg("split persistent state part decode progress")
 			case <-done:
@@ -666,8 +857,8 @@ func (a *splitPersistentStateSnapshotArtifact) Cleanup() error {
 	return errors.Join(errs...)
 }
 
-func persistentStateFileName(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
-	hash, err := persistentStateFileKeyHash(block, master, effectiveShard)
+func PersistentStateFileName(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
+	hash, err := PersistentStateFileKeyHash(block, master, effectiveShard)
 	if err != nil {
 		return "", err
 	}
@@ -683,7 +874,7 @@ func persistentStateFileName(block ton.BlockIDExt, master ton.BlockIDExt, effect
 	}
 }
 
-func persistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]byte, error) {
+func PersistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]byte, error) {
 	switch {
 	case effectiveShard == 0:
 		return tl.Hash(DbFileDBKeyPersistentStateFile{
@@ -705,15 +896,15 @@ func persistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, eff
 }
 
 func (n *Node) persistentStateFilePath(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
-	name, err := persistentStateFileName(block, master, effectiveShard)
+	name, err := PersistentStateFileName(block, master, effectiveShard)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(n.stateDownloadDir, name), nil
+	return filepath.Join(n.stateFilesDir, name), nil
 }
 
 func (n *Node) reusableStagedStateFiles(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]string, error) {
-	if strings.TrimSpace(n.stateDownloadDir) == "" {
+	if strings.TrimSpace(n.stateFilesDir) == "" {
 		return nil, nil
 	}
 	path, err := n.persistentStateFilePath(block, master, effectiveShard)
@@ -751,11 +942,6 @@ func (n *Node) loadReusableStagedStateFile(path string, effectiveShard int64) (*
 	}
 	prefix = prefix[:nn]
 
-	cellsCount, err := storage.BOCCellsCount(prefix)
-	if err != nil {
-		return nil, fmt.Errorf("%w: parse staged state boc header: %w", errStateSnapshotInvalid, err)
-	}
-
 	if _, err = file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -769,7 +955,6 @@ func (n *Node) loadReusableStagedStateFile(path string, effectiveShard int64) (*
 		peerAddr:       "disk",
 		path:           path,
 		size:           stat.Size(),
-		cells:          cellsCount,
 		fileHash:       hash.Sum(nil),
 		prefix:         prefix,
 		keep:           true,
@@ -792,10 +977,10 @@ func (n *Node) removeInvalidReusableStateFile(block ton.BlockIDExt, effectiveSha
 		Msg("removed invalid staged state snapshot file")
 }
 
-func (n *Node) createStateDownloadFile(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*os.File, string, string, error) {
-	dir := n.stateDownloadDir
+func (n *Node) createStateFile(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*os.File, string, string, error) {
+	dir := n.stateFilesDir
 	if dir == "" {
-		return nil, "", "", fmt.Errorf("state download dir is empty")
+		return nil, "", "", fmt.Errorf("state files dir is empty")
 	}
 
 	finalPath, err := n.persistentStateFilePath(block, master, effectiveShard)
@@ -810,7 +995,7 @@ func (n *Node) createStateDownloadFile(block ton.BlockIDExt, master ton.BlockIDE
 		return nil, "", "", err
 	}
 	name := filepath.Base(finalPath)
-	file, err := os.CreateTemp(dir, name+stateDownloadTempSuffix+"-")
+	file, err := os.CreateTemp(dir, name+stateFileTempSuffix+"-")
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -820,7 +1005,7 @@ func (n *Node) createStateDownloadFile(block ton.BlockIDExt, master ton.BlockIDE
 		_ = os.Remove(file.Name())
 		return nil, "", "", err
 	}
-	if !strings.Contains(filepath.Base(path), stateDownloadTempSuffix) {
+	if !strings.Contains(filepath.Base(path), stateFileTempSuffix) {
 		_ = file.Close()
 		_ = os.Remove(file.Name())
 		return nil, "", "", fmt.Errorf("state download temp file has unexpected name: %s", path)
@@ -842,7 +1027,7 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 	}
 	defer reader.Close()
 
-	file, path, finalPath, err := n.createStateDownloadFile(d.block, d.master, candidate.id.EffectiveShard)
+	file, path, finalPath, err := n.createStateFile(d.block, d.master, candidate.id.EffectiveShard)
 	if err != nil {
 		return nil, err
 	}
@@ -879,9 +1064,9 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		return nil, err
 	}
 	closed = true
+	replacedExisting := false
 	if _, err = os.Stat(finalPath); err == nil {
-		_ = os.Remove(path)
-		return n.loadReusableStagedStateFile(finalPath, candidate.id.EffectiveShard)
+		replacedExisting = true
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -890,18 +1075,13 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 	}
 	path = finalPath
 
-	prefix := reader.Prefix()
-	cellsCount, err := storage.BOCCellsCount(prefix)
-	if err != nil {
-		return nil, fmt.Errorf("%w: parse state boc header: %w", errStateSnapshotInvalid, err)
-	}
-
 	success = true
 	n.log.Info().
 		Str("peer", candidate.peer.addr).
 		Str("block", formatPersistentStateBlockRef(d.block, candidate.id.EffectiveShard)).
 		Str("size", formatByteSize(candidate.size)).
 		Str("path", path).
+		Bool("replaced_existing", replacedExisting).
 		Msg("state snapshot stored to states file")
 
 	return &stagedStateFile{
@@ -909,17 +1089,16 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		peerAddr:       candidate.peer.addr,
 		path:           path,
 		size:           candidate.size,
-		cells:          cellsCount,
 		fileHash:       reader.FileHash(),
-		prefix:         prefix,
+		prefix:         reader.Prefix(),
 	}, nil
 }
 
-func removeIncompleteStateDownloadFiles(dir string) error {
+func removeIncompleteStateFiles(dir string) error {
 	if strings.TrimSpace(dir) == "" {
 		return nil
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, "*"+stateDownloadTempSuffix+"*"))
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+stateFileTempSuffix+"*"))
 	if err != nil {
 		return err
 	}

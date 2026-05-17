@@ -3,22 +3,26 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
-	nodeconfig "flexserver/cmd/node/config"
-	"flexserver/internal/logutil"
-	"flexserver/liteserver"
-	service2 "flexserver/service"
-	"flexserver/service/blocksync"
-	"flexserver/service/p2p"
-	"flexserver/service/state"
-	"flexserver/service/storage"
-	"flexserver/service/storage/pebblestore"
+	nodeconfig "github.com/xssnick/gton/cmd/node/config"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/internal/metrics"
+	"github.com/xssnick/gton/liteserver"
+	service2 "github.com/xssnick/gton/service"
+	"github.com/xssnick/gton/service/blocksync"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/state"
+	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 	"fmt"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,17 +37,20 @@ import (
 const (
 	maxNodeBOCCells = 4_000_000_000
 	topShard        = int64(-1 << 63)
+
+	startupZeroStateRetry          = 5 * time.Second
+	startupZeroStateAttemptTimeout = 45 * time.Second
 )
 
 func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
+	configPathShort := flag.String("C", "", "path to node config JSON (alias for --config)")
 	logLevelFlag := flag.String("log-level", "info", "log level: trace, debug, info, warn, error")
 	logLevelsFlag := flag.String("log-levels", "", "category log level overrides, comma-separated: liteserver=debug,p2p=warn")
 	logJSONFlag := flag.Bool("log-json", false, "write logs as JSON instead of pretty console")
 	globalConfigURLFlag := flag.String("global-config", "", "download TON global config from URL and replace the configured file before start")
 	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	fromZeroFlag := flag.Bool("from-zero", false, "verify initial key block chain from zerostate instead of global config init_block")
-	rollbackFlag := flag.Uint("rollback", 0, "rollback local current state to this masterchain seqno before starting")
 	archiveCheckpointBlocksFlag := flag.Uint("archive-checkpoint-blocks", service2.DefaultArchiveCatchUpCheckpointBlocks, "archive catch-up current-state checkpoint interval in masterchain blocks")
 	archiveCheckpointPeriodFlag := flag.Duration("archive-checkpoint-period", service2.DefaultArchiveCatchUpCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
 	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
@@ -64,12 +71,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid archive checkpoint blocks %d: exceeds uint32\n", *archiveCheckpointBlocksFlag)
 		os.Exit(1)
 	}
-	rollbackSeqno := uint32(*rollbackFlag)
-	if uint(rollbackSeqno) != *rollbackFlag {
-		fmt.Fprintf(os.Stderr, "invalid rollback seqno %d: exceeds uint32\n", *rollbackFlag)
-		os.Exit(1)
-	}
-
 	logs := logutil.NewFactory(os.Stdout, logutil.Config{
 		Level:     level,
 		Overrides: logLevelOverrides,
@@ -83,13 +84,17 @@ func main() {
 	defer stop()
 	startPprof(ctx, logger, strings.TrimSpace(*pprofAddrFlag))
 
-	cfg, createdConfig, err := nodeconfig.LoadOrCreate(ctx, *configPath, nodeconfig.DetectExternalIP)
+	selectedConfigPath := resolveConfigPath(*configPath, *configPathShort)
+	cfg, createdConfig, err := nodeconfig.LoadOrCreate(ctx, selectedConfigPath, nodeconfig.DetectExternalIP)
 	if err != nil {
-		logger.Error().Err(err).Str("config", *configPath).Msg("failed to load config")
+		logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
 		os.Exit(1)
 	}
 	if createdConfig {
-		logger.Info().Str("config", *configPath).Msg("created default config")
+		logger.Info().
+			Str("config", displayConfigPath(selectedConfigPath)).
+			Msg("created default config; review and approve config.json settings, then start the node again")
+		return
 	}
 
 	globalConfigURL := nodeconfig.DefaultGlobalConfigURL
@@ -115,6 +120,11 @@ func main() {
 			Bool("replace", replaceGlobalConfig).
 			Msg("downloaded global config")
 	}
+	globalConfigZeroState, err := zeroStateBlockFromGlobalConfig(globalConfigPath)
+	if err != nil {
+		logger.Error().Err(err).Str("global_config", globalConfigPath).Msg("failed to load global config zerostate")
+		os.Exit(1)
+	}
 
 	opts, err := cfg.P2POptions()
 	if err != nil {
@@ -128,53 +138,92 @@ func main() {
 		logger.Error().Err(err).Msg("failed to load liteserver options")
 		os.Exit(1)
 	}
+	metricsOpts, err := cfg.MetricsOptions()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load metrics options")
+		os.Exit(1)
+	}
+	var runtimeMetrics *metrics.Metrics
+	var syncLagObserver service2.SyncLagObserver
+	var queryObserver liteserver.QueryObserver
+	if metricsOpts.Enabled {
+		runtimeMetrics = metrics.New()
+		if err = startMetricsServer(ctx, logger, metricsOpts.ListenAddr, runtimeMetrics.Handler()); err != nil {
+			logger.Error().Err(err).Str("metrics_addr", metricsOpts.ListenAddr).Msg("failed to start metrics server")
+			os.Exit(1)
+		}
+		syncLagObserver = runtimeMetrics
+		queryObserver = runtimeMetrics
+	}
+	syncBefore, err := cfg.SyncBefore()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load sync options")
+		os.Exit(1)
+	}
+	stateTTL, err := cfg.StateTTL()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load state ttl option")
+		os.Exit(1)
+	}
+	archiveTTL, err := cfg.ArchiveTTL()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load archive ttl option")
+		os.Exit(1)
+	}
 
 	storageDir := cfg.StorageDir()
-	stateDownloadDir := ""
 	if storageDir == "" {
 		logger.Error().Msg("storage.dir is required")
 		os.Exit(1)
 	}
-
+	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage cell cache option")
+		os.Exit(1)
+	}
+	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage cell memtable option")
+		os.Exit(1)
+	}
+	storageOpenStarted := time.Now()
+	logger.Info().
+		Str("storage", "pebble").
+		Str("dir", storageDir).
+		Int64("cell_total_cache_size", cellTotalCacheSize).
+		Int("cell_shard_memtable_size", cellShardMemTableSize).
+		Msg("opening storage")
 	store, err := pebblestore.Open(pebblestore.Options{
-		Dir:    storageDir,
-		Logger: logs.CategoryPtr("pebblestore"),
+		Dir:                   storageDir,
+		Logger:                logs.CategoryPtr("pebblestore"),
+		CellCacheSize:         cellTotalCacheSize,
+		CellShardMemTableSize: cellShardMemTableSize,
 	})
 	if err != nil {
 		logger.Error().Err(err).Str("dir", storageDir).Msg("failed to open pebble storage")
 		os.Exit(1)
 	}
-	stateDownloadDir = filepath.Join(storageDir, "runtime", "state-downloads")
+	stateFilesDir := store.StateFilesDir()
 	opts.Storage = store
 	opts.PeerServingStorage = store
 	logger.Info().
 		Str("storage", "pebble").
 		Str("dir", storageDir).
+		Dur("elapsed", time.Since(storageOpenStarted)).
 		Msg("configured storage")
-	opts.StateDownloadDir = stateDownloadDir
+	opts.StateFilesDir = stateFilesDir
 	defer func() {
 		if opts.Storage != nil {
 			closeStorage(logger, opts.Storage)
 		}
 	}()
-
-	if rollbackSeqno != 0 {
-		current, err := rollbackCurrentState(ctx, store, rollbackSeqno)
-		if err != nil {
-			logger.Error().Err(err).Uint32("rollback_seqno", rollbackSeqno).Msg("failed to prepare rollback")
-			os.Exit(1)
-		}
-		stats, err := store.Rollback(ctx, current)
-		if err != nil {
-			logger.Error().Err(err).Uint32("rollback_seqno", rollbackSeqno).Msg("failed to rollback storage")
-			os.Exit(1)
-		}
-		logger.Info().
-			Uint32("rollback_seqno", rollbackSeqno).
-			Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
-			Int("shards", len(current.Shards)).
-			Int("deleted_metadata_keys", stats.DeletedKeys).
-			Msg("storage rolled back")
+	if err = ensureStoredZeroStateMatchesGlobalConfig(ctx, store, globalConfigZeroState); err != nil {
+		logger.Error().
+			Err(err).
+			Str("global_config", globalConfigPath).
+			Str("configured_zerostate", formatBlockID(globalConfigZeroState)).
+			Msg("stored zerostate does not match global config")
+		os.Exit(1)
 	}
 
 	node, err := p2p.New(opts)
@@ -189,7 +238,8 @@ func main() {
 	stateSource := state.NewP2PSource(node, stateLogger)
 
 	stateSync := state.NewSyncer(stateSource, opts.Storage, state.SyncerOptions{
-		FromZero: *fromZeroFlag,
+		FromZero:   *fromZeroFlag,
+		SyncBefore: syncBefore,
 	}, stateLogger)
 
 	var liveLiteStore *liteserver.LiveStore
@@ -209,24 +259,24 @@ func main() {
 		ArchiveCatchUpPrefetchWindows:  *archivePrefetchWindowsFlag,
 		CurrentStatePublisher:          currentStatePublisher,
 		ShutdownContext:                shutdownCtx,
+		StateFilesDir:                  stateFilesDir,
+		StateTTL:                       stateTTL,
+		ArchiveTTL:                     archiveTTL,
+		DisableStateSerialization:      cfg.DisableStateSerialization,
+		SyncLagObserver:                syncLagObserver,
 	})
 	node.SetCompressedBlockStateProvider(svc)
 
 	var liteSrv *liteserver.Server
 	if liteOpts.Enabled {
-		zeroState, err := zeroStateFromGlobalConfig(globalConfigPath)
-		if err != nil {
-			logger.Error().Err(err).Str("global_config", globalConfigPath).Msg("failed to load liteserver zerostate")
-			os.Exit(1)
-		}
-
 		liteSrv, err = liteserver.New(liteserver.Options{
 			Logger:        logs.CategoryPtr("liteserver"),
 			Store:         liveLiteStore,
 			MessageSender: node,
+			QueryObserver: queryObserver,
 			PrivateKey:    liteOpts.PrivateKey,
 			ListenAddr:    liteOpts.ListenAddr,
-			ZeroState:     zeroState,
+			ZeroState:     zeroStateIDFromBlock(globalConfigZeroState),
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to initialize liteserver")
@@ -237,6 +287,25 @@ func main() {
 	if err = node.Start(ctx); err != nil {
 		logger.Error().Err(err).Msg("failed to start p2p node")
 		os.Exit(1)
+	}
+	initBlock, err := node.InitBlock()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load configured init block")
+		stop()
+		node.Wait()
+		os.Exit(1)
+	}
+	if startupZeroStateRequired(*fromZeroFlag, initBlock) {
+		if err = ensureZeroStateBeforeInitialSync(ctx, logger, node); err != nil {
+			if errors.Is(err, context.Canceled) {
+				node.Wait()
+				return
+			}
+			logger.Error().Err(err).Msg("failed to prepare zero state before initial sync")
+			stop()
+			node.Wait()
+			os.Exit(1)
+		}
 	}
 
 	var blockSyncWG sync.WaitGroup
@@ -266,7 +335,7 @@ func main() {
 	}
 
 	logger.Info().
-		Str("config", *configPath).
+		Str("config", selectedConfigPath).
 		Str("log_level", level.String()).
 		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(logLevelOverrides), "<none>")).
 		Str("log_format", logFormat(*logJSONFlag)).
@@ -276,14 +345,20 @@ func main() {
 		Str("dht_listen_addr", fallbackString(opts.DHTListenAddr, "<client-mode>")).
 		Bool("liteserver", liteOpts.Enabled).
 		Str("liteserver_listen_addr", fallbackString(liteOpts.ListenAddr, "<disabled>")).
+		Bool("metrics", metricsOpts.Enabled).
+		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
 		Str("pprof_addr", fallbackString(strings.TrimSpace(*pprofAddrFlag), "<disabled>")).
 		Bool("from_zero", *fromZeroFlag).
+		Dur("sync_before", syncBefore).
+		Dur("state_ttl", stateTTL).
+		Dur("archive_ttl", archiveTTL).
 		Uint32("archive_checkpoint_blocks", archiveCheckpointBlocks).
 		Dur("archive_checkpoint_period", *archiveCheckpointPeriodFlag).
 		Int("archive_prefetch_windows", *archivePrefetchWindowsFlag).
+		Bool("disable_state_serialization", cfg.DisableStateSerialization).
 		Msg("service started")
 
-	go runConsole(ctx, logger, svc)
+	go runConsole(ctx, logger, svc, store)
 
 	<-ctx.Done()
 	logger.Info().Msg("shutting down")
@@ -337,49 +412,106 @@ func signalContexts() (context.Context, context.Context, func()) {
 	return runCtx, shutdownCtx, stop
 }
 
-func zeroStateFromGlobalConfig(path string) (ton.ZeroStateIDExt, error) {
-	cfg, err := liteclient.GetConfigFromFile(path)
-	if err != nil {
-		return ton.ZeroStateIDExt{}, err
-	}
-
-	return ton.ZeroStateIDExt{
-		Workchain: cfg.Validator.ZeroState.Workchain,
-		RootHash:  append([]byte(nil), cfg.Validator.ZeroState.RootHash...),
-		FileHash:  append([]byte(nil), cfg.Validator.ZeroState.FileHash...),
-	}, nil
+type storedZeroStateReader interface {
+	StoredZeroStateBlocks(ctx context.Context) ([]ton.BlockIDExt, error)
 }
 
-func rollbackCurrentState(ctx context.Context, store *pebblestore.Store, seqno uint32) (*storage.CurrentState, error) {
-	master, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, seqno)
+func zeroStateBlockFromGlobalConfig(path string) (ton.BlockIDExt, error) {
+	cfg, err := liteclient.GetConfigFromFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("lookup rollback masterchain block #%d: %w", seqno, err)
+		return ton.BlockIDExt{}, err
 	}
 
-	masterState, err := store.BlockState(ctx, master)
+	block := ton.BlockIDExt{
+		Workchain: cfg.Validator.ZeroState.Workchain,
+		Shard:     topShard,
+		SeqNo:     0,
+		RootHash:  append([]byte(nil), cfg.Validator.ZeroState.RootHash...),
+		FileHash:  append([]byte(nil), cfg.Validator.ZeroState.FileHash...),
+	}
+	if block.Workchain != -1 || !validBlockID(block) {
+		return ton.BlockIDExt{}, fmt.Errorf("global config contains invalid zero_state")
+	}
+	return block, nil
+}
+
+func zeroStateIDFromBlock(block ton.BlockIDExt) ton.ZeroStateIDExt {
+	return ton.ZeroStateIDExt{
+		Workchain: block.Workchain,
+		RootHash:  append([]byte(nil), block.RootHash...),
+		FileHash:  append([]byte(nil), block.FileHash...),
+	}
+}
+
+func ensureStoredZeroStateMatchesGlobalConfig(ctx context.Context, store storedZeroStateReader, configured ton.BlockIDExt) error {
+	stored, err := store.StoredZeroStateBlocks(ctx)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("load rollback masterchain state %s: %w", storage.FormatBlockRef(master), err)
+		return fmt.Errorf("load stored zerostate: %w", err)
 	}
 
-	shardBlocks, err := state.ShardBlocksFromMasterState(masterState)
-	if err != nil {
-		return nil, fmt.Errorf("load rollback shard blocks from %s: %w", storage.FormatBlockRef(master), err)
-	}
-
-	current := &storage.CurrentState{
-		SyncedAt:         time.Now(),
-		ShardClientSeqno: master.SeqNo,
-		Masterchain:      storage.BlockStateWithoutCells(masterState),
-		Shards:           make(map[storage.ShardKey]storage.BlockState, len(shardBlocks)),
-	}
-	for _, shardBlock := range shardBlocks {
-		shardState, err := store.BlockState(ctx, shardBlock)
-		if err != nil {
-			return nil, fmt.Errorf("load rollback shard state %s: %w", storage.FormatBlockRef(shardBlock), err)
+	for _, block := range stored {
+		if !block.Equals(&configured) {
+			return fmt.Errorf("stored zerostate %s does not match global config zerostate %s",
+				formatBlockID(block), formatBlockID(configured))
 		}
-		current.Shards[storage.ShardKeyFromBlock(shardBlock)] = storage.BlockStateWithoutCells(shardState)
 	}
-	return current, nil
+	return nil
+}
+
+func startupZeroStateRequired(fromZero bool, initBlock ton.BlockIDExt) bool {
+	return fromZero || initBlock.SeqNo == 0
+}
+
+func ensureZeroStateBeforeInitialSync(ctx context.Context, logger zerolog.Logger, node *p2p.Node) error {
+	logger.Info().Msg("preparing zero state before initial sync")
+
+	for attempt := 1; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, startupZeroStateAttemptTimeout)
+		err := node.EnsureZeroState(attemptCtx)
+		cancel()
+		if err == nil {
+			logger.Info().Msg("zero state is ready")
+			return nil
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
+
+		event := logger.Warn()
+		event.
+			Err(err).
+			Int("attempt", attempt).
+			Dur("attempt_timeout", startupZeroStateAttemptTimeout).
+			Dur("retry_in", startupZeroStateRetry).
+			Msg("zero state is not ready, will retry before initial sync")
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(startupZeroStateRetry):
+		}
+	}
+}
+
+func validBlockID(block ton.BlockIDExt) bool {
+	return len(block.RootHash) == 32 && len(block.FileHash) == 32
+}
+
+func formatBlockID(block ton.BlockIDExt) string {
+	return fmt.Sprintf(
+		"wc=%d shard=%016x seqno=%d root=%x file=%x",
+		block.Workchain,
+		uint64(block.Shard),
+		block.SeqNo,
+		block.RootHash,
+		block.FileHash,
+	)
 }
 
 type closeableStorage interface {
@@ -427,7 +559,51 @@ func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 	}()
 }
 
-func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Service) {
+func startMetricsServer(ctx context.Context, logger zerolog.Logger, addr string, handler http.Handler) error {
+	if addr == "" || handler == nil {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", handler)
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Warn().Err(err).Str("metrics_addr", addr).Msg("failed to stop metrics server")
+		}
+	}()
+
+	go func() {
+		logger.Info().
+			Str("metrics_addr", addr).
+			Str("metrics_url", "http://"+addr+"/metrics").
+			Msg("started prometheus metrics server")
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			logger.Error().Err(err).Str("metrics_addr", addr).Msg("metrics server stopped")
+		}
+	}()
+
+	return nil
+}
+
+type pebbleDBStatusReader interface {
+	DBStatus(ctx context.Context) (pebblestore.DBStatus, error)
+}
+
+func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Service, dbStatus pebbleDBStatusReader) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		if !scanner.Scan() {
@@ -447,6 +623,20 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 
 		switch cmd[0] {
 		case "status":
+			if len(cmd) == 2 && cmd[1] == "db" {
+				if dbStatus == nil {
+					fmt.Fprintln(os.Stdout, formatDBStatus(pebblestore.DBStatus{}))
+					continue
+				}
+				status, err := dbStatus.DBStatus(ctx)
+				if err != nil {
+					logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("failed to load db status")
+					continue
+				}
+				fmt.Fprintln(os.Stdout, formatDBStatus(status))
+				continue
+			}
+
 			showPeers := len(cmd) > 1 && cmd[1] == "full"
 			if len(cmd) > 2 {
 				logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
@@ -457,14 +647,161 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 				continue
 			}
 			fmt.Fprintln(os.Stdout, formatStatus(svc.StatusSnapshot(), showPeers))
+		case "serialize":
+			if len(cmd) != 2 && len(cmd) != 3 {
+				logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
+				continue
+			}
+			if len(cmd) == 2 && cmd[1] == "cancel" {
+				if err := svc.CancelPersistentStateSerialization(ctx); err != nil {
+					logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("failed to cancel persistent state serialization")
+					continue
+				}
+				fmt.Fprintln(os.Stdout, "persistent state serialization canceled")
+				continue
+			}
+
+			seqno, err := parseMasterchainSeqno(cmd[1])
+			if err != nil {
+				logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("invalid serialize command")
+				continue
+			}
+
+			scope := service2.PersistentStateSerializationAll
+			if len(cmd) == 3 {
+				if cmd[2] != "basechain" {
+					logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown serialize scope")
+					continue
+				}
+				scope = service2.PersistentStateSerializationBasechain
+			}
+
+			if err = svc.StartPersistentStateSerialization(ctx, seqno, scope); err != nil {
+				logger.Warn().Err(err).Uint32("masterchain_seqno", seqno).Msg("failed to start persistent state serialization")
+				continue
+			}
+			if scope == service2.PersistentStateSerializationBasechain {
+				fmt.Fprintf(os.Stdout, "persistent basechain state serialization started for masterchain seqno %d\n", seqno)
+			} else {
+				fmt.Fprintf(os.Stdout, "persistent state serialization started for masterchain seqno %d\n", seqno)
+			}
+		case "migrate":
+			if len(cmd) != 2 {
+				logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
+				continue
+			}
+			seqno, err := parseMasterchainSeqno(cmd[1])
+			if err != nil {
+				logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("invalid migrate command")
+				continue
+			}
+
+			if err = svc.StartCellGenerationMigration(ctx, seqno); err != nil {
+				logger.Warn().Err(err).Uint32("masterchain_seqno", seqno).Msg("failed to start cell generation migration")
+				continue
+			}
+			fmt.Fprintf(os.Stdout, "cell generation migration started for masterchain seqno %d\n", seqno)
 		default:
 			logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
 		}
 	}
 }
 
+func parseMasterchainSeqno(value string) (uint32, error) {
+	seqno, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(seqno), nil
+}
+
 func formatStatus(snapshot service2.StatusSnapshot, showPeers bool) string {
 	return formatStatusWithNow(snapshot, showPeers, time.Now())
+}
+
+func formatDBStatus(status pebblestore.DBStatus) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "DB Status\n")
+	fmt.Fprintf(&b, "\n")
+	fmt.Fprintf(&b, "Cell DB\n")
+	if len(status.CellGenerations) == 0 {
+		fmt.Fprintf(&b, "  unavailable\n")
+		return b.String()
+	}
+
+	for _, generation := range status.CellGenerations {
+		role := fallbackString(generation.Role, "open")
+		fmt.Fprintf(&b, "  generation %d role=%s", generation.ID, role)
+		if validBlockID(generation.Origin) {
+			fmt.Fprintf(&b, " origin=%s", formatBlock(&generation.Origin))
+		}
+		fmt.Fprintf(&b, "\n")
+		fmt.Fprintf(
+			&b,
+			"    cache block=%s file=%s file_tables=%d block_hit=%s\n",
+			formatDBBytes(uint64(generation.Cache.BlockCacheSize)),
+			formatDBBytes(uint64(generation.Cache.FileCacheSize)),
+			generation.Cache.FileCacheTableCount,
+			formatDBCacheHitRate(generation.Cache.BlockCacheHits, generation.Cache.BlockCacheMisses),
+		)
+		fmt.Fprintf(&b, "    %-5s %9s %9s %7s %5s %9s %9s %9s %10s %10s %8s\n",
+			"shard", "disk", "live", "tables", "amp", "l0 f/s", "l0 size", "debt", "comp", "mem", "fl/ing")
+		for _, shard := range generation.Shards {
+			formatCellDBShardStatus(&b, fmt.Sprintf("%d", shard.Shard), shard)
+		}
+		formatCellDBShardStatus(&b, "total", generation.Total)
+	}
+
+	return b.String()
+}
+
+func formatCellDBShardStatus(b *strings.Builder, label string, shard pebblestore.CellDBShardStatus) {
+	fmt.Fprintf(b, "    %-5s %9s %9s %7d %5d %9s %9s %9s %10s %10s %8s\n",
+		label,
+		formatDBBytes(shard.DiskSize),
+		formatDBBytes(shard.LiveSize),
+		shard.LiveTables,
+		shard.ReadAmp,
+		fmt.Sprintf("%d/%d", shard.L0Files, shard.L0Sublevels),
+		formatDBBytesInt(shard.L0Size),
+		formatDBBytes(shard.CompactionDebt),
+		fmt.Sprintf("%d/%s", shard.CompactionsInProgress, formatDBBytesInt(shard.CompactionInProgressSize)),
+		fmt.Sprintf("%s/%d", formatDBBytes(shard.MemTableSize), shard.MemTableCount),
+		fmt.Sprintf("%d/%d", shard.Flushes, shard.Ingests),
+	)
+}
+
+func formatDBCacheHitRate(hits int64, misses int64) string {
+	total := hits + misses
+	if total <= 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", float64(hits)*100/float64(total))
+}
+
+func formatDBBytesInt(value int64) string {
+	if value <= 0 {
+		return "0B"
+	}
+	return formatDBBytes(uint64(value))
+}
+
+func formatDBBytes(value uint64) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
+	size := float64(value)
+	unit := 0
+	for size >= 1024 && unit+1 < len(units) {
+		size /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%dB", value)
+	}
+	if size >= 100 {
+		return fmt.Sprintf("%.0f%s", size, units[unit])
+	}
+	return fmt.Sprintf("%.1f%s", size, units[unit])
 }
 
 func formatStatusWithNow(snapshot service2.StatusSnapshot, showPeers bool, now time.Time) string {
@@ -642,6 +979,30 @@ func fallbackString(value string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func resolveConfigPath(longPath string, shortPath string) string {
+	shortPath = strings.TrimSpace(shortPath)
+	if shortPath != "" {
+		return shortPath
+	}
+	longPath = strings.TrimSpace(longPath)
+	if longPath == "" {
+		return nodeconfig.DefaultPath
+	}
+	return longPath
+}
+
+func displayConfigPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = nodeconfig.DefaultPath
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
 }
 
 func logFormat(useJSON bool) string {

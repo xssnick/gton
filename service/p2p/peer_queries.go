@@ -3,8 +3,8 @@ package p2p
 import (
 	"context"
 	"errors"
-	"flexserver/service/archive"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/service/archive"
+	tnstore "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"time"
 
@@ -284,7 +284,7 @@ func (s *overlaySubscription) serveBlockData(ctx context.Context, block ton.Bloc
 	if err != nil {
 		return nil, err
 	}
-	return TonNodeData{Data: data}, nil
+	return tl.Raw(data), nil
 }
 
 func (s *overlaySubscription) servePrepareBlock(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
@@ -366,19 +366,13 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 	if err != nil {
 		return nil, err
 	}
-	return TonNodeData{Data: proof}, nil
+	return tl.Raw(proof), nil
 }
 
 func (s *overlaySubscription) servePrepareZeroState(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
 	data, err := s.node.peerStorage.ZeroState(ctx, block)
 	if err == nil && len(data) > 0 {
 		return PreparedState{}, nil
-	}
-	if err == nil {
-		return NotFoundState{}, nil
-	}
-	if !errors.Is(err, tnstore.ErrNotFound) {
-		return nil, err
 	}
 	return NotFoundState{}, nil
 }
@@ -394,7 +388,7 @@ func (s *overlaySubscription) serveZeroStateData(ctx context.Context, block ton.
 	if len(data) == 0 {
 		return nil, errors.New("failed to get state from db")
 	}
-	return TonNodeData{Data: data}, nil
+	return tl.Raw(data), nil
 }
 
 func (s *overlaySubscription) servePreparePersistentState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt) (tl.Serializable, error) {
@@ -435,7 +429,7 @@ func (s *overlaySubscription) servePersistentStateSlice(ctx context.Context, sta
 	if err != nil {
 		return nil, err
 	}
-	return TonNodeData{Data: data}, nil
+	return tl.Raw(data), nil
 }
 
 func persistentStateEffectiveShardForQuery(block ton.BlockIDExt, effectiveShard int64) int64 {
@@ -517,14 +511,6 @@ func (s *overlaySubscription) seenMasterchainSeqnoForKeyBlockScan(ctx context.Co
 		return 0, err
 	}
 
-	stored, err := s.node.storage.SeenMasterchainBlock(ctx)
-	if err == nil {
-		return stored.SeqNo, nil
-	}
-	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
-		return 0, err
-	}
-
 	current, err := s.node.storage.CurrentState(ctx)
 	if err == nil && validBlockID(current.Masterchain.Block) {
 		return current.Masterchain.Block.SeqNo, nil
@@ -560,7 +546,7 @@ func (s *overlaySubscription) serveArchiveSlice(ctx context.Context, archiveID, 
 	if maxSize > 0 && len(data) > int(maxSize) {
 		data = data[:maxSize]
 	}
-	return TonNodeData{Data: data}, nil
+	return tl.Raw(data), nil
 }
 
 func (s *overlaySubscription) handleGetRandomPeers(_ context.Context, query overlay.GetRandomPeers) overlay.NodesList {

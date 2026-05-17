@@ -8,8 +8,8 @@ import (
 	"math/bits"
 	"sync"
 
-	"flexserver/service/archive"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -18,8 +18,7 @@ import (
 const (
 	shardNextBlockCatchUpMaxRemaining = 100_000
 	archiveToNextLagSeconds           = 600
-	nextToArchiveLagSeconds           = 1000
-	archiveTimeLagLookaheadBlocks     = 5000
+	nextToArchiveLagSeconds           = 1200
 	maxArchiveMonitorSplitDepth       = 12
 )
 
@@ -30,57 +29,37 @@ func masterchainBlockLagSeconds(blockUTime int64, nowUnix int64) (int64, bool) {
 	return nowUnix - blockUTime, true
 }
 
-func shouldUseArchiveCatchUpByLag(lagSeconds int64) bool {
+func shouldSwitchNextToArchiveByLag(lagSeconds int64) bool {
 	return lagSeconds > nextToArchiveLagSeconds
 }
 
-func shouldStopArchiveCatchUpByLag(lagSeconds int64) bool {
+func shouldSwitchArchiveToNextByLag(lagSeconds int64) bool {
 	return lagSeconds < archiveToNextLagSeconds
 }
 
-func archiveCatchUpTargetByTime(current *storage.CurrentState, nowUnix int64) (ton.BlockIDExt, int64, bool) {
-	if current.Masterchain.Parsed == nil || current.Masterchain.Parsed.GenUTime == 0 {
-		return ton.BlockIDExt{}, 0, false
+func remainingLagSeconds(lagSeconds int64) int64 {
+	remaining := lagSeconds - archiveToNextLagSeconds
+	if remaining < 0 {
+		return 0
 	}
-
-	return archiveCatchUpTargetByBlockTime(current, int64(current.Masterchain.Parsed.GenUTime), nowUnix)
+	return remaining
 }
 
-func archiveCatchUpTargetByKnownTargetTime(current *storage.CurrentState, target ton.BlockIDExt, blockUTime int64, nowUnix int64) (ton.BlockIDExt, int64, bool) {
-	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, nowUnix)
-	if !ok || !shouldUseArchiveCatchUpByLag(lagSeconds) {
-		return ton.BlockIDExt{}, lagSeconds, false
-	}
-	if target.SeqNo <= current.Masterchain.Block.SeqNo {
-		return ton.BlockIDExt{}, lagSeconds, false
-	}
-	return target, lagSeconds, true
-}
-
-func archiveCatchUpTargetByBlockTime(current *storage.CurrentState, blockUTime int64, nowUnix int64) (ton.BlockIDExt, int64, bool) {
-	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, nowUnix)
-	if !ok || !shouldUseArchiveCatchUpByLag(lagSeconds) {
-		return ton.BlockIDExt{}, lagSeconds, false
+func archiveCatchUpTargetByLag(current *storage.CurrentState, lagSeconds int64) (ton.BlockIDExt, bool) {
+	if !shouldSwitchNextToArchiveByLag(lagSeconds) {
+		return ton.BlockIDExt{}, false
 	}
 
-	lookaheadSeconds := lagSeconds - archiveToNextLagSeconds
-	if lookaheadSeconds <= 0 {
-		lookaheadSeconds = 1
-	}
-	lookahead := uint32(lookaheadSeconds)
-	if lookahead > archiveTimeLagLookaheadBlocks {
-		lookahead = archiveTimeLagLookaheadBlocks
-	}
-	if ^uint32(0)-current.Masterchain.Block.SeqNo < lookahead {
-		return ton.BlockIDExt{}, lagSeconds, false
+	if current.Masterchain.Block.SeqNo == ^uint32(0) {
+		return ton.BlockIDExt{}, false
 	}
 
 	target := current.Masterchain.Block
-	target.SeqNo += lookahead
-	return target, lagSeconds, true
+	target.SeqNo = ^uint32(0)
+	return target, true
 }
 
-func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, shards []archive.ShardID, priority archiveImportPriority) ([]*archiveImportResult, error) {
+func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, shards []archive.ShardID, splitDepth uint32, priority archiveImportPriority) ([]*archiveImportResult, error) {
 	if len(shards) == 0 {
 		return nil, nil
 	}
@@ -101,7 +80,7 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 
 	jobs := make([]archivePreloadJob, 0, len(shards))
 	for idx, shard := range shards {
-		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, priority)
+		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, splitDepth, priority)
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shard.String(), err)
@@ -238,7 +217,11 @@ func monitorMinSplitDepth(state *storage.BlockState, workchain int32) (uint32, e
 	}
 
 	var extra tlb.McStateExtra
-	if err := tlb.LoadFromCell(&extra, state.Parsed.McStateExtra.BeginParse()); err != nil {
+	loader, err := state.Parsed.McStateExtra.BeginParse()
+	if err != nil {
+		return 0, fmt.Errorf("parse mc_state_extra for %s: %w", storage.FormatBlockRef(state.Block), err)
+	}
+	if err := tlb.LoadFromCell(&extra, loader); err != nil {
 		return 0, fmt.Errorf("parse mc_state_extra for %s: %w", storage.FormatBlockRef(state.Block), err)
 	}
 	if extra.ConfigParams.Config.Params == nil {

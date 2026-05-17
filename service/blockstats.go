@@ -3,8 +3,8 @@ package service
 import (
 	"fmt"
 
-	"flexserver/service/p2p"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -58,7 +58,11 @@ func statsFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (BlockStats, erro
 
 func countBlockTransactions(root *cell.Cell) (int, error) {
 	var shardAccounts tlb.ShardAccountBlocks
-	if err := tlb.LoadFromCell(&shardAccounts, root.BeginParse()); err != nil {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return 0, fmt.Errorf("load shard account blocks: %w", err)
+	}
+	if err := tlb.LoadFromCell(&shardAccounts, loader); err != nil {
 		return 0, fmt.Errorf("load shard account blocks: %w", err)
 	}
 	if shardAccounts.Accounts == nil {

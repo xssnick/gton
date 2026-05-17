@@ -2,8 +2,7 @@ package p2p
 
 import (
 	"crypto/ed25519"
-	"flexserver/service/storage"
-	"fmt"
+	"github.com/xssnick/gton/service/storage"
 	"net"
 	"time"
 
@@ -53,6 +52,8 @@ const (
 	bootstrapDiscoveryTarget   = 64
 	dhtSeedConnectParallelism  = 8
 	dhtSeedPeerTimeout         = 5 * time.Second
+	dhtSeedCooldownMinDelay    = 6 * time.Second
+	dhtSeedCooldownJitter      = 4 * time.Second
 	attachWarmupTimeout        = 3 * time.Second
 	broadcastEventBuffer       = 4096
 	broadcastQueueMaxItems     = 1024
@@ -65,7 +66,6 @@ const (
 	dhtFindTimeout             = 30 * time.Second
 	masterchainWaitLogEvery    = 5 * time.Second
 	peerQueryTimeout           = 10 * time.Second
-	zeroStateBootstrapRetry    = 30 * time.Second
 	rebroadcastWorkerCount     = 4
 	rebroadcastQueueMaxItems   = 1024
 	rebroadcastQueueMaxBytes   = int64(128 << 20)
@@ -100,18 +100,24 @@ const (
 )
 
 type BroadcastEvent struct {
-	Overlay    string
-	Kind       string
-	Delivery   Delivery
-	Trusted    bool
-	Block      ton.BlockIDExt
-	Downloaded *DownloadedBlock
-	SourceKey  string
-	ReceivedAt time.Time
+	Overlay          string
+	Kind             string
+	Delivery         Delivery
+	Trusted          bool
+	Block            ton.BlockIDExt
+	Downloaded       *DownloadedBlock
+	ShardDescription *ShardBlockDescription
+	SourceKey        string
+	ReceivedAt       time.Time
 }
 
 func (e BroadcastEvent) BlockRef() string {
 	return formatBlockRef(e.Block)
+}
+
+type ShardBlockDescription struct {
+	CatchainSeqno int32
+	Data          []byte
 }
 
 type Options struct {
@@ -123,7 +129,7 @@ type Options struct {
 	ExternalPort       uint16
 	DHTPrivateKey      ed25519.PrivateKey
 	DHTListenAddr      string
-	StateDownloadDir   string
+	StateFilesDir      string
 	Storage            storage.Storage
 	PeerServingStorage storage.PeerServingStorage
 }
@@ -155,8 +161,8 @@ type DownloadedBlock struct {
 	Parsed              *tlb.Block
 	Meta                *storage.BlockMeta
 	// StateUpdateToCells contains encoded non-pruned cells reachable from block.state_update.to,
-	// keyed by their logical state hash. The live shard-client path prepares it after parsing
-	// the block so liteserver can see new state cells before the checkpoint reaches disk.
+	// keyed by their logical state hash. Service apply code treats it as output of
+	// storage.PrepareStateUpdateCells and only checks that the update matches the current root.
 	StateUpdateToCells        map[cell.Hash][]byte
 	StateUpdateToCellsElapsed time.Duration
 
@@ -171,7 +177,7 @@ func (b DownloadedBlock) BlockRef() string {
 }
 
 func formatBlockRef(block ton.BlockIDExt) string {
-	return fmt.Sprintf("wc=%d shard=%016x seqno=%d", block.Workchain, uint64(block.Shard), block.SeqNo)
+	return storage.FormatBlockRef(block)
 }
 
 func blockWithEffectiveShard(block ton.BlockIDExt, effectiveShard int64) ton.BlockIDExt {

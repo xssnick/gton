@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sync"
 
-	"flexserver/service/blockproof"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/service/blockproof"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -58,10 +58,6 @@ func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, valida
 	}
 	c.entries[key] = validators
 	return validators
-}
-
-func (s *Service) validateMasterchainBlockConsensus(current *tnstore.BlockState, downloaded tonBlockForConsensus) error {
-	return s.validateMasterchainBlockConsensusWithProof(current, downloaded, nil)
 }
 
 func (s *Service) validateMasterchainBlockConsensusWithProof(current *tnstore.BlockState, downloaded tonBlockForConsensus, proof *masterchainConsensusProof) error {

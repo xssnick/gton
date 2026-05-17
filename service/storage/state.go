@@ -25,10 +25,17 @@ type BlockState struct {
 	StateRootHash []byte
 	StateCellHash []byte
 	StateFileHash []byte
-	CellsCount    uint64
-	Cell          *cell.Cell
-	Parsed        *tlb.ShardStateUnsplit
-	DownloadedAt  time.Time
+	// MasterchainRef matches C++ BlockHandle::masterchain_ref_block:
+	// the masterchain block that first included this shard block.
+	MasterchainRef *ton.BlockIDExt
+	CellGeneration uint64
+	Cell           *cell.Cell
+	Parsed         *tlb.ShardStateUnsplit
+}
+
+type CellGenerationInfo struct {
+	ID                    uint64
+	OriginPersistentState ton.BlockIDExt
 }
 
 type CurrentState struct {

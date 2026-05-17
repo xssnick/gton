@@ -22,8 +22,13 @@ func splitStateParts(block ton.BlockIDExt, proof *cell.Cell, splitDepth uint32, 
 		return nil, nil, fmt.Errorf("unwrap split state header proof: %w", err)
 	}
 
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin parse split state header: %w", err)
+	}
+
 	var header tlb.ShardStateUnsplit
-	if err = tlb.LoadFromCell(&header, root.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&header, loader); err != nil {
 		return nil, nil, fmt.Errorf("parse split state header: %w", err)
 	}
 	if err = validateSplitStateHeader(block, &header); err != nil {
@@ -155,9 +160,13 @@ func mergeSplitStateAccounts(header *tlb.ShardStateUnsplit, accounts *cell.Augme
 }
 
 func loadSplitStatePartAccounts(root *cell.Cell) (*cell.AugmentedDictionary, error) {
-	return root.BeginParse().LoadAugDict(256, cell.ReadOnlyAugmentation{
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+	return loader.LoadAugDict(256, cell.ReadOnlyAugmentation{
 		SkipExtraFn: shardAccountsAugmentation{}.SkipExtra,
-	}, true)
+	}, false)
 }
 
 type shardAccountsAugmentation struct{}
@@ -182,8 +191,13 @@ func (shardAccountsAugmentation) LeafExtra(value *cell.Slice) (*cell.Cell, error
 		return storeDepthBalanceInfo(0, tlb.ZeroCoins, nil)
 	}
 
+	loader, err := account.Account.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
 	var state tlb.AccountState
-	if err := tlb.LoadFromCell(&state, account.Account.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&state, loader); err != nil {
 		return nil, err
 	}
 	if !state.IsValid {

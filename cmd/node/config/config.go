@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,33 +16,45 @@ import (
 	"strings"
 	"time"
 
-	"flexserver/liteserver"
-	"flexserver/service/p2p"
+	"github.com/xssnick/gton/liteserver"
+	"github.com/xssnick/gton/service/p2p"
 )
 
 const (
-	DefaultPath            = "config.json"
-	DefaultGlobalConfigURL = "https://ton-blockchain.github.io/global.config.json"
-	defaultStorageDir      = "data"
-	defaultADNLPort        = 30303
-	defaultADNLListen      = "0.0.0.0:30303"
-	defaultDHTListen       = "0.0.0.0:30304"
-	defaultLiteListen      = "0.0.0.0:7445"
-	externalIPHTTPClient   = 5 * time.Second
-	globalConfigHTTPClient = 30 * time.Second
-	ipAPILookupURL         = "http://ip-api.com/json/?fields=status,message,query"
+	DefaultPath              = "config.json"
+	DefaultGlobalConfigURL   = "https://ton-blockchain.github.io/global.config.json"
+	DefaultSyncBefore        = time.Hour
+	DefaultStateTTL          = 3 * 24 * time.Hour
+	DefaultArchiveTTL        = 7 * 24 * time.Hour
+	DefaultCellTotalCache    = int64(8 << 30)
+	DefaultCellShardMemTable = int64(512 << 20)
+	defaultStorageDir        = "data"
+	defaultADNLPort          = 30303
+	defaultADNLListen        = "0.0.0.0:30303"
+	defaultDHTListen         = "0.0.0.0:30304"
+	defaultLiteListen        = "0.0.0.0:7445"
+	externalIPHTTPClient     = 5 * time.Second
+	globalConfigHTTPClient   = 30 * time.Second
+	ipAPILookupURL           = "http://ip-api.com/json/?fields=status,message,query"
 )
 
+var ErrConfigMissingWithExistingStorage = errors.New("config file is missing while storage metadata exists")
+
 type Config struct {
-	TON     TON     `json:"ton"`
-	ADNL    ADNL    `json:"adnl"`
-	DHT     DHT     `json:"dht"`
-	Lite    Lite    `json:"liteserver"`
-	Storage Storage `json:"storage"`
+	TON                       TON     `json:"ton"`
+	ADNL                      ADNL    `json:"adnl"`
+	DHT                       DHT     `json:"dht"`
+	Lite                      Lite    `json:"liteserver"`
+	Storage                   Storage `json:"storage"`
+	Metrics                   Metrics `json:"metrics"`
+	DisableStateSerialization bool    `json:"disable_state_serialization"`
 }
 
 type TON struct {
 	GlobalConfigPath string `json:"global_config_path"`
+	SyncBefore       int64  `json:"sync_before"`
+	StateTTL         int64  `json:"state_ttl"`
+	ArchiveTTL       int64  `json:"archive_ttl"`
 }
 
 type ADNL struct {
@@ -64,17 +77,31 @@ type Lite struct {
 }
 
 type Storage struct {
-	Dir string `json:"dir"`
+	Dir                   string `json:"dir"`
+	CellTotalCacheSize    int64  `json:"cell_total_cache_size"`
+	CellShardMemTableSize int64  `json:"cell_shard_memtable_size"`
+}
+
+type Metrics struct {
+	Enabled    bool   `json:"enabled"`
+	ListenAddr string `json:"listen_addr"`
 }
 
 func defaultConfig() Config {
 	return Config{
 		TON: TON{
 			GlobalConfigPath: p2p.DefaultGlobalConfigPath,
+			SyncBefore:       int64(DefaultSyncBefore / time.Second),
+			StateTTL:         int64(DefaultStateTTL / time.Second),
+			ArchiveTTL:       int64(DefaultArchiveTTL / time.Second),
 		},
 		Lite: Lite{
 			MasterBlockCache: liteserver.DefaultMasterBlockCache,
 			ShardBlockCache:  liteserver.DefaultShardBlockCache,
+		},
+		Storage: Storage{
+			CellTotalCacheSize:    DefaultCellTotalCache,
+			CellShardMemTableSize: DefaultCellShardMemTable,
 		},
 	}
 }
@@ -129,7 +156,9 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		ShardBlockCache:  liteserver.DefaultShardBlockCache,
 	}
 	cfg.Storage = Storage{
-		Dir: storageDir,
+		Dir:                   storageDir,
+		CellTotalCacheSize:    DefaultCellTotalCache,
+		CellShardMemTableSize: DefaultCellShardMemTable,
 	}
 
 	return cfg, nil
@@ -150,6 +179,15 @@ func LoadOrCreate(
 	}
 	if !os.IsNotExist(err) {
 		return Config{}, false, err
+	}
+
+	metadataExists, metadataPath, err := defaultStorageMetadataExists()
+	if err != nil {
+		return Config{}, false, err
+	}
+	if metadataExists {
+		return Config{}, false, fmt.Errorf("%w: config %s was not found, storage metadata exists at %s",
+			ErrConfigMissingWithExistingStorage, path, metadataPath)
 	}
 
 	cfg, err = generate(ctx, externalIPLookup)
@@ -227,6 +265,11 @@ type LiteserverOptions struct {
 	ShardBlockCache  int
 }
 
+type MetricsOptions struct {
+	Enabled    bool
+	ListenAddr string
+}
+
 func (cfg Config) LiteserverOptions() (LiteserverOptions, error) {
 	opts := LiteserverOptions{
 		Enabled:          cfg.Lite.Enabled,
@@ -256,6 +299,17 @@ func (cfg Config) LiteserverOptions() (LiteserverOptions, error) {
 	return opts, nil
 }
 
+func (cfg Config) MetricsOptions() (MetricsOptions, error) {
+	opts := MetricsOptions{
+		Enabled:    cfg.Metrics.Enabled,
+		ListenAddr: strings.TrimSpace(cfg.Metrics.ListenAddr),
+	}
+	if opts.Enabled && opts.ListenAddr == "" {
+		return MetricsOptions{}, fmt.Errorf("metrics.listen_addr is required when metrics.enabled is true")
+	}
+	return opts, nil
+}
+
 func parseExternalAddr(raw string) (net.IP, uint16, error) {
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
@@ -279,12 +333,70 @@ func (cfg Config) StorageDir() string {
 	return strings.TrimSpace(cfg.Storage.Dir)
 }
 
+func (cfg Config) CellTotalCacheSize() (int64, error) {
+	if cfg.Storage.CellTotalCacheSize < 0 {
+		return 0, fmt.Errorf("storage.cell_total_cache_size cannot be negative")
+	}
+	if cfg.Storage.CellTotalCacheSize == 0 {
+		return DefaultCellTotalCache, nil
+	}
+	return cfg.Storage.CellTotalCacheSize, nil
+}
+
+func (cfg Config) CellShardMemTableSize() (int, error) {
+	if cfg.Storage.CellShardMemTableSize < 0 {
+		return 0, fmt.Errorf("storage.cell_shard_memtable_size cannot be negative")
+	}
+	value := cfg.Storage.CellShardMemTableSize
+	if value == 0 {
+		value = DefaultCellShardMemTable
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if value > maxInt {
+		return 0, fmt.Errorf("storage.cell_shard_memtable_size is too large")
+	}
+	return int(value), nil
+}
+
 func (cfg Config) GlobalConfigPath() string {
 	path := strings.TrimSpace(cfg.TON.GlobalConfigPath)
 	if path == "" {
 		return p2p.DefaultGlobalConfigPath
 	}
 	return path
+}
+
+func (cfg Config) SyncBefore() (time.Duration, error) {
+	if cfg.TON.SyncBefore <= 0 {
+		return 0, fmt.Errorf("ton.sync_before should be positive seconds")
+	}
+	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
+	if cfg.TON.SyncBefore > maxDurationSeconds {
+		return 0, fmt.Errorf("ton.sync_before is too large")
+	}
+	return time.Duration(cfg.TON.SyncBefore) * time.Second, nil
+}
+
+func (cfg Config) StateTTL() (time.Duration, error) {
+	if cfg.TON.StateTTL <= 0 {
+		return 0, fmt.Errorf("ton.state_ttl should be positive seconds")
+	}
+	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
+	if cfg.TON.StateTTL > maxDurationSeconds {
+		return 0, fmt.Errorf("ton.state_ttl is too large")
+	}
+	return time.Duration(cfg.TON.StateTTL) * time.Second, nil
+}
+
+func (cfg Config) ArchiveTTL() (time.Duration, error) {
+	if cfg.TON.ArchiveTTL <= 0 {
+		return 0, fmt.Errorf("ton.archive_ttl should be positive seconds")
+	}
+	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
+	if cfg.TON.ArchiveTTL > maxDurationSeconds {
+		return 0, fmt.Errorf("ton.archive_ttl is too large")
+	}
+	return time.Duration(cfg.TON.ArchiveTTL) * time.Second, nil
 }
 
 func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bool) (bool, error) {
@@ -309,6 +421,22 @@ func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bo
 		return false, err
 	}
 	return true, nil
+}
+
+func defaultStorageMetadataExists() (bool, string, error) {
+	storageDir, err := filepath.Abs(defaultStorageDir)
+	if err != nil {
+		return false, "", fmt.Errorf("resolve storage dir: %w", err)
+	}
+	metadataPath := filepath.Join(storageDir, "metadb")
+	_, err = os.Stat(metadataPath)
+	if err == nil {
+		return true, metadataPath, nil
+	}
+	if os.IsNotExist(err) {
+		return false, metadataPath, nil
+	}
+	return false, metadataPath, fmt.Errorf("stat storage metadata %s: %w", metadataPath, err)
 }
 
 func write(path string, cfg Config) error {

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 )
 
 const (

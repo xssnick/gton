@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
@@ -29,7 +29,7 @@ func TestAppliedBlockArtifactWriterWaitsUntilBlockAndProofStored(t *testing.T) {
 
 	prev := testBlockID(0, topShard, 10)
 	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 11), prev, false)
-	if err := writer.enqueue(ctx, block); err != nil {
+	if err := writer.enqueue(ctx, block, 4); err != nil {
 		t.Fatalf("enqueue block: %v", err)
 	}
 	target := writer.target()
@@ -82,7 +82,7 @@ func TestAppliedBlockArtifactWriterFailsWhenProofIsMissing(t *testing.T) {
 
 	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 21), testBlockID(0, topShard, 20), false)
 	block.ProofBOC = nil
-	if err := writer.enqueue(ctx, block); err != nil {
+	if err := writer.enqueue(ctx, block, 4); err != nil {
 		t.Fatalf("enqueue block: %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestAppliedBlockArtifactWriterRetriesLinkAfterPartialSave(t *testing.T) {
 
 	prev := testBlockID(0, topShard, 24)
 	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 25), prev, false)
-	if err := writer.enqueue(ctx, block); err != nil {
+	if err := writer.enqueue(ctx, block, 4); err != nil {
 		t.Fatalf("enqueue block: %v", err)
 	}
 
@@ -142,7 +142,7 @@ func TestAppliedBlockArtifactWriterAcceptsAlreadyDurableBlock(t *testing.T) {
 		t.Fatalf("pre-save full block: %v", err)
 	}
 
-	if err := writer.enqueue(ctx, p2p.DownloadedBlock{ID: block.ID}); err != nil {
+	if err := writer.enqueue(ctx, p2p.DownloadedBlock{ID: block.ID}, 4); err != nil {
 		t.Fatalf("enqueue durable block: %v", err)
 	}
 	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)

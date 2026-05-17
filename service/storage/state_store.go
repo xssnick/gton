@@ -11,8 +11,7 @@ import (
 
 type StateCellTreeImporter interface {
 	ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error)
-	ImportStateCellTrees(ctx context.Context, trees []StateCellTreeImport) ([]*cell.Cell, error)
-	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error)
+	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error)
 }
 
 type DownloadedState interface {
@@ -22,13 +21,6 @@ type DownloadedState interface {
 	Cleanup() error
 }
 
-type StateCellTreeImport struct {
-	Block       ton.BlockIDExt
-	Root        *cell.Cell
-	ParsedCells []cell.Cell
-	TotalCells  uint64
-}
-
 type StateStorage interface {
 	StateCellTreeImporter
 	SaveCurrentState(ctx context.Context, state *CurrentState) error
@@ -36,8 +28,6 @@ type StateStorage interface {
 	SaveStateSyncProgress(ctx context.Context, state *CurrentState) error
 	StateSyncProgress(ctx context.Context) (*CurrentState, error)
 	ClearStateSyncProgress(ctx context.Context) error
-	SaveSeenMasterchainBlock(ctx context.Context, block ton.BlockIDExt) error
-	SeenMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error)
 	SaveVerifiedKeyBlockProgress(ctx context.Context, block ton.BlockIDExt) error
 	VerifiedKeyBlockProgress(ctx context.Context) (ton.BlockIDExt, error)
 	SaveBlockState(ctx context.Context, state *BlockState) error
@@ -69,14 +59,14 @@ func CloneBlockState(state *BlockState) *BlockState {
 	}
 
 	return &BlockState{
-		Block:         state.Block,
-		StateRootHash: bytes.Clone(state.StateRootHash),
-		StateCellHash: bytes.Clone(state.StateCellHash),
-		StateFileHash: bytes.Clone(state.StateFileHash),
-		CellsCount:    state.CellsCount,
-		Cell:          state.Cell,
-		Parsed:        state.Parsed,
-		DownloadedAt:  state.DownloadedAt,
+		Block:          state.Block,
+		StateRootHash:  bytes.Clone(state.StateRootHash),
+		StateCellHash:  bytes.Clone(state.StateCellHash),
+		StateFileHash:  bytes.Clone(state.StateFileHash),
+		MasterchainRef: cloneBlockIDPtr(state.MasterchainRef),
+		CellGeneration: state.CellGeneration,
+		Cell:           state.Cell,
+		Parsed:         state.Parsed,
 	}
 }
 
@@ -86,13 +76,21 @@ func BlockStateWithoutCells(state *BlockState) BlockState {
 	}
 
 	return BlockState{
-		Block:         state.Block,
-		StateRootHash: bytes.Clone(state.StateRootHash),
-		StateCellHash: bytes.Clone(state.StateCellHash),
-		StateFileHash: bytes.Clone(state.StateFileHash),
-		CellsCount:    state.CellsCount,
-		DownloadedAt:  state.DownloadedAt,
+		Block:          state.Block,
+		StateRootHash:  bytes.Clone(state.StateRootHash),
+		StateCellHash:  bytes.Clone(state.StateCellHash),
+		StateFileHash:  bytes.Clone(state.StateFileHash),
+		MasterchainRef: cloneBlockIDPtr(state.MasterchainRef),
+		CellGeneration: state.CellGeneration,
 	}
+}
+
+func cloneBlockIDPtr(block *ton.BlockIDExt) *ton.BlockIDExt {
+	if block == nil {
+		return nil
+	}
+	cloned := *block
+	return &cloned
 }
 
 func BlockKey(block ton.BlockIDExt) string {

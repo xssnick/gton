@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/pebble"
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -28,30 +28,47 @@ func (s *Store) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, r
 	return roots[0], nil
 }
 
-func (s *Store) ImportStateCellTrees(ctx context.Context, trees []storage.StateCellTreeImport) ([]*cell.Cell, error) {
-	imports := make([]stateCellTreeImport, len(trees))
-	for i, tree := range trees {
-		imports[i] = stateCellTreeImport{
-			block:       tree.Block,
-			root:        tree.Root,
-			parsedCells: tree.ParsedCells,
-			totalCells:  tree.TotalCells,
-		}
+func (s *Store) ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error) {
+	if generation == 0 {
+		return nil, fmt.Errorf("cell generation is zero")
 	}
-	return s.importStateCellTrees(ctx, imports)
+	if root == nil {
+		return nil, fmt.Errorf("state cell tree root is nil")
+	}
+
+	rootCellHash := root.HashKey()
+	if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{
+		block:          block,
+		root:           root,
+		parsedCells:    parsedCells,
+		totalCells:     totalCells,
+		cellGeneration: generation,
+	}); err != nil {
+		return nil, err
+	}
+	if err := s.flushCellDBs(generation); err != nil {
+		return nil, fmt.Errorf("flush generation %d state cells before candidate lazy root: %w", generation, err)
+	}
+
+	lazyRoot, err := s.loadLazyCellFromGeneration(ctx, generation, rootCellHash[:])
+	if err != nil {
+		return nil, fmt.Errorf("load candidate lazy state root: %w", err)
+	}
+
+	s.log.Debug().
+		Str("block", storage.FormatBlockRef(block)).
+		Uint64("cell_generation", generation).
+		Uint64("cells", totalCells).
+		Msg("candidate state cell tree imported and switched to lazy celldb root")
+	return lazyRoot, nil
 }
 
 type stateCellTreeImport struct {
-	block       ton.BlockIDExt
-	root        *cell.Cell
-	parsedCells []cell.Cell
-	totalCells  uint64
-}
-
-type stateCellTreeSync struct {
-	block     ton.BlockIDExt
-	rootHash  cell.Hash
-	cellCount uint64
+	block          ton.BlockIDExt
+	root           *cell.Cell
+	parsedCells    []cell.Cell
+	totalCells     uint64
+	cellGeneration uint64
 }
 
 func (s *Store) importStateCellTrees(ctx context.Context, trees []stateCellTreeImport) ([]*cell.Cell, error) {
@@ -60,155 +77,81 @@ func (s *Store) importStateCellTrees(ctx context.Context, trees []stateCellTreeI
 	}
 
 	roots := make([]*cell.Cell, len(trees))
-	syncs := make([]stateCellTreeSync, len(trees))
+	rootHashes := make([]cell.Hash, len(trees))
+	generations := make([]uint64, len(trees))
+	flushGenerations := map[uint64]struct{}{}
+	cellGeneration, err := s.activeCellGenerationID()
+	if err != nil {
+		return nil, err
+	}
 	for i, tree := range trees {
 		if tree.root == nil {
 			return nil, fmt.Errorf("state cell tree root is nil")
 		}
+		if tree.cellGeneration == 0 {
+			tree.cellGeneration = cellGeneration
+		}
 
 		rootCellHash := tree.root.HashKey()
 		if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{
-			block:       tree.block,
-			root:        tree.root,
-			parsedCells: tree.parsedCells,
-			totalCells:  tree.totalCells,
+			block:          tree.block,
+			root:           tree.root,
+			parsedCells:    tree.parsedCells,
+			totalCells:     tree.totalCells,
+			cellGeneration: tree.cellGeneration,
 		}); err != nil {
 			return nil, err
 		}
-		syncs[i] = stateCellTreeSync{
-			block:     tree.block,
-			rootHash:  rootCellHash,
-			cellCount: tree.totalCells,
+		rootHashes[i] = rootCellHash
+		generations[i] = tree.cellGeneration
+		flushGenerations[tree.cellGeneration] = struct{}{}
+	}
+
+	for generation := range flushGenerations {
+		if err := s.flushCellDBs(generation); err != nil {
+			return nil, fmt.Errorf("flush generation %d state cells before returning lazy roots: %w", generation, err)
 		}
 	}
 
-	if err := s.syncStateCellTrees(syncs); err != nil {
-		return nil, fmt.Errorf("sync state cells: %w", err)
-	}
-
-	for i, sync := range syncs {
-		lazyRoot, err := s.loadLazyCell(ctx, sync.rootHash[:])
+	for i, tree := range trees {
+		lazyRoot, err := s.loadLazyCellFromGeneration(ctx, generations[i], rootHashes[i][:])
 		if err != nil {
 			return nil, fmt.Errorf("load persisted lazy state root: %w", err)
 		}
 		roots[i] = lazyRoot
 
 		s.log.Debug().
-			Str("block", storage.FormatBlockRef(sync.block)).
-			Uint64("cells", sync.cellCount).
+			Str("block", storage.FormatBlockRef(tree.block)).
 			Msg("state cell tree imported and switched to lazy celldb root")
 	}
 	return roots, nil
 }
 
-func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error) {
+func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
 	state, err := s.blockStateMeta(ctx, block)
-	if err == nil {
-		if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
-			return nil, 0, storage.ErrNotFound
-		}
-
-		root, err := s.loadLazyCell(ctx, state.StateCellHash)
-		if err != nil {
-			return nil, 0, err
-		}
-		hash := root.HashKey(0)
-		if !bytes.Equal(hash[:], state.StateRootHash) {
-			return nil, 0, storage.ErrNotFound
-		}
-		return root, state.CellsCount, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, 0, err
-	}
-
-	raw, err := s.getHotCopy(ctx, hotKeyStateCellSync(block))
-	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, 0, err
-		}
-
-		root, err := s.loadStateCellTreeByRootHash(ctx, rootHash)
-		if err != nil {
-			return nil, 0, err
-		}
-		return root, 0, nil
-	}
-
-	cellHash, cellsCount, err := decodeStateCellSync(raw)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	root, err := s.loadLazyCell(ctx, cellHash[:])
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(rootHash) > 0 {
-		hash := root.HashKey(0)
-		if !bytes.Equal(hash[:], rootHash) {
-			return nil, 0, storage.ErrNotFound
-		}
-	}
-	return root, cellsCount, nil
-}
-
-func (s *Store) loadStateCellTreeByRootHash(ctx context.Context, rootHash []byte) (*cell.Cell, error) {
-	if len(rootHash) != 32 {
-		return nil, storage.ErrNotFound
-	}
-
-	root, err := s.loadLazyCell(ctx, rootHash)
 	if err != nil {
 		return nil, err
 	}
 
-	hash := root.HashKey(0)
-	if !bytes.Equal(hash[:], rootHash) {
+	if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
+		return nil, storage.ErrNotFound
+	}
+
+	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateCellHash)
+	if err != nil {
+		return nil, err
+	}
+	hash := root.HashKey()
+	if !bytes.Equal(hash[:], state.StateCellHash) {
 		return nil, storage.ErrNotFound
 	}
 	return root, nil
 }
 
-func (s *Store) syncStateCellTree(block ton.BlockIDExt, rootHash cell.Hash, totalCells uint64) error {
-	return s.syncStateCellTrees([]stateCellTreeSync{{
-		block:     block,
-		rootHash:  rootHash,
-		cellCount: totalCells,
-	}})
-}
-
-func (s *Store) syncStateCellTrees(syncs []stateCellTreeSync) error {
-	if err := s.flushCellDBs(); err != nil {
-		return fmt.Errorf("flush state cells before sync marker: %w", err)
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
-		return errPebbleClosed
-	}
-
-	s.log.Debug().
-		Int("trees", len(syncs)).
-		Msg("syncing persisted state cells before returning lazy roots")
-
-	batch := s.hot.NewBatch()
-	defer func() { _ = batch.Close() }()
-
-	for _, sync := range syncs {
-		if err := batch.Set(hotKeyStateCellSync(sync.block), encodeStateCellSync(sync.rootHash, sync.cellCount), pebble.NoSync); err != nil {
-			return err
-		}
-	}
-	return batch.Commit(pebble.Sync)
-}
-
 func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) error {
 	var err error
 	if root == nil {
-		root, err = s.loadLazyCell(context.Background(), saved.StateCellHash)
+		root, err = s.loadLazyCellFromGeneration(context.Background(), saved.CellGeneration, saved.StateCellHash)
 		if err != nil {
 			return fmt.Errorf("load persisted lazy state root: %w", err)
 		}
@@ -218,17 +161,21 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 	state.StateRootHash = bytes.Clone(saved.StateRootHash)
 	state.StateCellHash = bytes.Clone(saved.StateCellHash)
 	state.StateFileHash = bytes.Clone(saved.StateFileHash)
-	state.CellsCount = saved.CellsCount
+	if saved.MasterchainRef == nil {
+		state.MasterchainRef = nil
+	} else {
+		ref := *saved.MasterchainRef
+		state.MasterchainRef = &ref
+	}
+	state.CellGeneration = saved.CellGeneration
 	state.Cell = root
 	state.Parsed = saved.Parsed
 	if parsed != nil {
 		state.Parsed = parsed.Parsed
 	}
-	state.DownloadedAt = saved.DownloadedAt
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(saved.Block)).
-		Uint64("cells", saved.CellsCount).
 		Msg("block state switched to lazy celldb root")
 	return nil
 }
@@ -239,16 +186,19 @@ const (
 )
 
 type stateCellTreeSave struct {
-	block       ton.BlockIDExt
-	root        *cell.Cell
-	parsedCells []cell.Cell
-	totalCells  uint64
-	exists      *stateCellExistenceCache
+	block          ton.BlockIDExt
+	root           *cell.Cell
+	parsedCells    []cell.Cell
+	totalCells     uint64
+	cellGeneration uint64
 }
 
 func (s *Store) saveStateCellTree(ctx context.Context, req stateCellTreeSave) (bool, error) {
 	if req.root != nil && req.root.GetType() == cell.PrunedCellType {
 		return false, fmt.Errorf("state cell tree root is pruned")
+	}
+	if req.root != nil && req.root.IsVirtualized() {
+		return false, fmt.Errorf("state cell tree root is virtualized")
 	}
 	if len(req.parsedCells) > 0 {
 		return s.saveParsedStateCellsBatch(ctx, req)
@@ -257,15 +207,26 @@ func (s *Store) saveStateCellTree(ctx context.Context, req stateCellTreeSave) (b
 }
 
 func (s *Store) saveStateCellTreeDFS(ctx context.Context, req stateCellTreeSave) (bool, error) {
-	return s.saveStateCellTreesDFSBatch(ctx, []stateCellTreeSave{req}, req.exists)
+	return s.saveStateCellTreesDFSBatch(ctx, []stateCellTreeSave{req})
 }
 
-func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCellTreeSave, exists *stateCellExistenceCache) (bool, error) {
+func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCellTreeSave) (bool, error) {
 	if len(trees) == 0 {
 		return false, nil
 	}
 
-	writer, err := s.newStateCellBatchWriter(exists)
+	generation := trees[0].cellGeneration
+	for _, tree := range trees {
+		if generation == 0 {
+			generation = tree.cellGeneration
+			continue
+		}
+		if tree.cellGeneration != 0 && tree.cellGeneration != generation {
+			return false, fmt.Errorf("mixed cell generations in state cell tree batch: %d and %d", generation, tree.cellGeneration)
+		}
+	}
+
+	writer, err := s.newStateCellBatchWriter(ctx, generation)
 	if err != nil {
 		return false, err
 	}
@@ -279,6 +240,9 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 		if tree.root.GetType() == cell.PrunedCellType {
 			return false, fmt.Errorf("state cell tree root is pruned")
 		}
+		if tree.root.IsVirtualized() {
+			return false, fmt.Errorf("state cell tree root is virtualized")
+		}
 		totalCells += tree.totalCells
 	}
 
@@ -287,7 +251,6 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 
 	stack := make([]*cell.Cell, 0, len(trees))
 	visited := make(map[cell.Hash]struct{}, cellVisitSetCapacity(totalCells))
-	lazyBoundaries := map[cell.Hash]struct{}{}
 	for _, tree := range trees {
 		rootHash := stateCellStorageHash(tree.root)
 		if _, ok := visited[rootHash]; ok {
@@ -313,21 +276,13 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 		currentHash := currentMeta.Hash
 
 		if current.IsLazy() {
-			progress.skippedExisting++
 			progress.processed++
 			continue
 		}
-		if current.GetType() == cell.PrunedCellType {
-			progress.skippedExisting++
-			progress.processed++
-			continue
-		}
-
 		refs, refCells, err := stateCellRefs(current, currentMeta)
 		if err != nil {
 			return false, fmt.Errorf("load state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", currentHash[:], current.IsLazy(), current.IsVirtualized(), current.GetType(), err)
 		}
-		rememberLazyStateBoundaries(lazyBoundaries, refs)
 		for i := 0; i < len(refs); i++ {
 			ref := refs[i]
 			refHash := ref.Hash
@@ -335,7 +290,6 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 				continue
 			}
 			if ref.Lazy {
-				progress.skippedExisting++
 				continue
 			}
 			refCell := refCells[i]
@@ -362,9 +316,6 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 	if err := progress.flush(); err != nil {
 		return false, err
 	}
-	if err := validateLazyStateBoundaries(writer, lazyBoundaries); err != nil {
-		return false, fmt.Errorf("validate state lazy boundaries for %s: %w", storage.FormatBlockRef(trees[0].block), err)
-	}
 	progress.logDone()
 	return progress.applied > 0, nil
 }
@@ -375,7 +326,7 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, req stateCellTree
 		totalCells = uint64(len(req.parsedCells))
 	}
 
-	writer, err := s.newStateCellBatchWriter(nil)
+	writer, err := s.newStateCellBatchWriter(ctx, req.cellGeneration)
 	if err != nil {
 		return false, err
 	}
@@ -394,25 +345,9 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, req stateCellTree
 		}
 
 		current := &req.parsedCells[i]
-		if current.GetType() == cell.PrunedCellType {
-			progress.skippedExisting++
-			progress.processed++
-			continue
-		}
-
 		_, err := writer.addStateCell(current)
 		if err != nil {
 			return false, err
-		}
-		for level := 0; level < current.Level(); level++ {
-			view := current.Virtualize(uint8(level))
-			if view == current {
-				continue
-			}
-			_, err := writer.addStateCell(view)
-			if err != nil {
-				return false, err
-			}
 		}
 		progress.processed++
 
@@ -430,27 +365,6 @@ func (s *Store) saveParsedStateCellsBatch(ctx context.Context, req stateCellTree
 	return progress.applied > 0, nil
 }
 
-func rememberLazyStateBoundaries(boundaries map[cell.Hash]struct{}, refs []cell.RefMetadata) {
-	for _, ref := range refs {
-		if ref.Lazy {
-			boundaries[ref.Hash] = struct{}{}
-		}
-	}
-}
-
-func validateLazyStateBoundaries(writer *stateCellBatchWriter, boundaries map[cell.Hash]struct{}) error {
-	for hash := range boundaries {
-		exists, err := writer.has(hash)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return fmt.Errorf("lazy boundary %x is missing from state cell db", hash[:])
-		}
-	}
-	return nil
-}
-
 type stateCellSaveProgress struct {
 	log      zerolog.Logger
 	writer   *stateCellBatchWriter
@@ -461,10 +375,9 @@ type stateCellSaveProgress struct {
 	started  time.Time
 	lastLog  time.Time
 
-	processed       int64
-	applied         int64
-	bytesWritten    int64
-	skippedExisting int64
+	processed    int64
+	applied      int64
+	bytesWritten int64
 }
 
 func newStateCellSaveProgress(log zerolog.Logger, block ton.BlockIDExt, source string, total uint64, writer *stateCellBatchWriter, level zerolog.Level) stateCellSaveProgress {
@@ -517,11 +430,10 @@ func (p *stateCellSaveProgress) logProgress(done bool, now time.Time) {
 		Str("source", p.source).
 		Int64("processed_cells", p.processed).
 		Int64("applied_cells", p.applied).
-		Int64("skipped_existing_cells", p.skippedExisting).
 		Int64("bytes", p.bytesWritten).
 		Uint64("total_cells", p.total).
 		Dur("elapsed", elapsed).
-		Str("speed", formatCellRate(p.processed, elapsed))
+		Str("speed", logutil.FormatCellRate(uint64(p.processed), elapsed))
 	addCellProgress(event, p.processed, p.total)
 	if done {
 		event.Msg("state cells persisted")
@@ -535,10 +447,11 @@ func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*c
 		return nil, [4]*cell.Cell{}, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
 	}
 
-	refs := append([]cell.RefMetadata(nil), meta.Refs...)
+	refs := make([]cell.RefMetadata, len(meta.Refs))
 	var refCells [4]*cell.Cell
-	for i := range refs {
-		if refs[i].Lazy {
+	for i, metaRef := range meta.Refs {
+		if metaRef.Lazy {
+			refs[i] = metaRef
 			continue
 		}
 
@@ -546,10 +459,13 @@ func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*c
 		if err != nil {
 			return nil, [4]*cell.Cell{}, err
 		}
-		refCell = stateCellRefView(cl, refCell)
-		if refCell.GetType() == cell.PrunedCellType {
-			refs[i].Lazy = true
-			continue
+		refMeta := refCell.GetMetadata()
+		refs[i] = cell.RefMetadata{
+			Hash:      refMeta.Hash,
+			LevelMask: refMeta.LevelMask,
+			Hashes:    refMeta.Hashes,
+			Depths:    refMeta.Depths,
+			Lazy:      refCell.IsLazy(),
 		}
 		refCells[i] = refCell
 	}
@@ -558,19 +474,6 @@ func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*c
 
 func stateCellStorageHash(cl *cell.Cell) cell.Hash {
 	return cl.GetMetadata().Hash
-}
-
-func stateCellRefView(parent *cell.Cell, ref *cell.Cell) *cell.Cell {
-	if parent.IsVirtualized() {
-		return ref
-	}
-
-	effectiveLevel := uint8(0)
-	switch parent.GetType() {
-	case cell.MerkleProofCellType, cell.MerkleUpdateCellType:
-		effectiveLevel = 1
-	}
-	return ref.Virtualize(effectiveLevel)
 }
 
 func cellVisitSetCapacity(totalCells uint64) int {
@@ -593,66 +496,39 @@ type stateCellWriteStats struct {
 	bytes int64
 }
 
-type stateCellExistenceCache struct {
-	values map[cell.Hash]bool
-}
-
-func newStateCellExistenceCache() *stateCellExistenceCache {
-	return &stateCellExistenceCache{values: map[cell.Hash]bool{}}
-}
-
-func (c *stateCellExistenceCache) get(hash cell.Hash) (bool, bool) {
-	if c == nil {
-		return false, false
-	}
-	exists, ok := c.values[hash]
-	return exists, ok
-}
-
-func (c *stateCellExistenceCache) set(hash cell.Hash, exists bool) {
-	if c == nil {
-		return
-	}
-	c.values[hash] = exists
-}
-
-func (c *stateCellExistenceCache) clear() {
-	if c == nil {
-		return
-	}
-	clear(c.values)
-}
-
 type stateCellBatchWriter struct {
-	cells  *cellBatchWriter
-	exists *stateCellExistenceCache
+	cells          *cellBatchWriter
+	cellStore      *cellStore
+	cellGeneration uint64
 }
 
-func (s *Store) newStateCellBatchWriter(exists *stateCellExistenceCache) (*stateCellBatchWriter, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return nil, errPebbleClosed
+func (s *Store) newStateCellBatchWriter(ctx context.Context, generation uint64) (*stateCellBatchWriter, error) {
+	cells, err := s.acquireCellStore(ctx, generation)
+	if err != nil {
+		return nil, err
 	}
 
 	return &stateCellBatchWriter{
-		cells:  s.cells.newBatchWriter(),
-		exists: exists,
+		cells:          cells.newBatchWriter(),
+		cellStore:      cells,
+		cellGeneration: cells.generation,
 	}, nil
 }
 
 func (w *stateCellBatchWriter) add(cl *cell.Cell, meta cell.Metadata, refs []cell.RefMetadata) error {
+	return w.addWithHash(meta.Hash, cl, refs)
+}
+
+func (w *stateCellBatchWriter) addWithHash(hash cell.Hash, cl *cell.Cell, refs []cell.RefMetadata) error {
 	valueLen, d1, d2, err := stateCellEncodedLen(cl, refs)
 	if err != nil {
 		return err
 	}
-	hash := meta.Hash
 	if err = w.cells.setDeferred(hash[:], valueLen, func(value []byte) {
 		encodeStateCellRecordTo(value, cl, refs, d1, d2)
 	}); err != nil {
 		return err
 	}
-	w.exists.set(hash, true)
 	return nil
 }
 
@@ -789,24 +665,12 @@ func (w *stateCellBatchWriter) flush() (stateCellWriteStats, error) {
 	if err != nil {
 		return stateCellWriteStats{}, err
 	}
-	w.exists.clear()
 	return stats, nil
 }
 
 func (w *stateCellBatchWriter) close() {
 	w.cells.close()
-}
-
-func (w *stateCellBatchWriter) has(hash cell.Hash) (bool, error) {
-	if exists, ok := w.exists.get(hash); ok {
-		return exists, nil
-	}
-	exists, err := w.cells.store.has(hash[:])
-	if err != nil {
-		return false, err
-	}
-	w.exists.set(hash, exists)
-	return exists, nil
+	w.cellStore.release()
 }
 
 func (w *stateCellBatchWriter) pendingCells() int {
@@ -835,22 +699,11 @@ func formatPercent(processed int64, total uint64) string {
 	return fmt.Sprintf("%.1f%%", progress)
 }
 
-func formatCellRate(cells int64, elapsed time.Duration) string {
-	if cells <= 0 || elapsed <= 0 {
-		return "0 cells/s"
-	}
-	rate := float64(cells) / elapsed.Seconds()
-	switch {
-	case rate >= 1_000_000:
-		return fmt.Sprintf("%.2f Mcells/s", rate/1_000_000)
-	case rate >= 1_000:
-		return fmt.Sprintf("%.2f Kcells/s", rate/1_000)
-	default:
-		return fmt.Sprintf("%.0f cells/s", rate)
-	}
+func (s *Store) SaveCells(records []*storage.CellRecord) error {
+	return s.SaveCellsInGeneration(context.Background(), 0, records)
 }
 
-func (s *Store) SaveCells(records []*storage.CellRecord) error {
+func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error {
 	encoded := make([]storage.EncodedCellRecord, 0, len(records))
 	for _, record := range records {
 		if record == nil {
@@ -868,7 +721,12 @@ func (s *Store) SaveCells(records []*storage.CellRecord) error {
 		})
 	}
 
-	_, err := s.saveCellRecordBatch(context.Background(), encoded, true)
+	_, err := s.saveCellRecordBatch(ctx, encoded, true, generation)
+	return err
+}
+
+func (s *Store) SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error {
+	_, err := s.saveCellRecordBatch(ctx, records, sync, generation)
 	return err
 }
 
@@ -878,28 +736,30 @@ type cellRecordBatchStats struct {
 	bytes   int64
 }
 
-func (s *Store) savePreparedStateCellRecords(ctx context.Context, records []storage.EncodedCellRecord) (bool, error) {
-	stats, err := s.saveCellRecordBatch(ctx, records, false)
+func (s *Store) savePreparedStateCellRecords(ctx context.Context, records []storage.EncodedCellRecord, generation uint64) (bool, error) {
+	stats, err := s.saveCellRecordBatch(ctx, records, false, generation)
 	if err != nil {
 		return false, err
 	}
 	return stats.written > 0, nil
 }
 
-func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.EncodedCellRecord, sync bool) (cellRecordBatchStats, error) {
+func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.EncodedCellRecord, sync bool, generation uint64) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
 	if len(records) == 0 {
 		return stats, nil
 	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
-		return stats, errPebbleClosed
+	if err := s.ensureWritable(); err != nil {
+		return stats, err
 	}
 
-	writer := s.cells.newBatchWriter()
+	cells, err := s.acquireCellStore(ctx, generation)
+	if err != nil {
+		return stats, err
+	}
+	defer cells.release()
+
+	writer := cells.newBatchWriter()
 	defer writer.close()
 
 	written := make(map[cell.Hash]struct{}, len(records))
@@ -939,7 +799,7 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 		return stats, err
 	}
 	if sync {
-		if err := s.cells.flush(); err != nil {
+		if err := cells.flush(); err != nil {
 			return stats, err
 		}
 	}
@@ -947,7 +807,11 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 }
 
 func (s *Store) CellRecord(ctx context.Context, hash []byte) (*storage.CellRecord, error) {
-	raw, err := s.getCellCopy(ctx, hash)
+	return s.CellRecordInGeneration(ctx, 0, hash)
+}
+
+func (s *Store) CellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*storage.CellRecord, error) {
+	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -963,8 +827,16 @@ func (s *Store) LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
 }
 
 func (s *Store) LazyCellLoader() cell.LazyCellLoader {
+	return s.lazyCellLoaderForGeneration(0)
+}
+
+func (s *Store) LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader {
+	return s.lazyCellLoaderForGeneration(generation)
+}
+
+func (s *Store) lazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
 	return func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := s.loadLazyCell(context.Background(), hash[:])
+		loaded, err := s.loadLazyCellFromGeneration(context.Background(), generation, hash[:])
 		if err != nil {
 			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
 		}
@@ -973,18 +845,50 @@ func (s *Store) LazyCellLoader() cell.LazyCellLoader {
 }
 
 func (s *Store) loadLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	if loaded, ok := s.cellCache.get(hash); ok {
+	return s.loadLazyCellFromGeneration(ctx, 0, hash)
+}
+
+func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
+	requestedGeneration := generation
+	if generation == 0 {
+		var err error
+		generation, err = s.activeCellGenerationID()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	cacheGeneration := generation
+	loaderGeneration := generation
+	if requestedGeneration == 0 || s.isActiveCellGeneration(generation) {
+		cacheGeneration = 0
+		loaderGeneration = 0
+	}
+	if loaded, ok := s.cellCache.get(cacheGeneration, hash); ok {
 		return loaded, nil
 	}
 
-	raw, err := s.getCellCopy(ctx, hash)
+	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
 	if err != nil {
+		if requestedGeneration != 0 && errors.Is(err, errCellGenerationNotOpen) {
+			return s.loadLazyCellFromGeneration(ctx, 0, hash)
+		}
 		return nil, err
 	}
-	loaded, err := storage.LazyCellRecord(decodeCellRecordTrusted(hash, raw), s.LazyCellLoader())
+	loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(loaderGeneration))
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}
-	s.cellCache.set(hash, loaded)
+	s.cellCache.set(cacheGeneration, hash, loaded)
 	return loaded, nil
+}
+
+func (s *Store) isActiveCellGeneration(generation uint64) bool {
+	if generation == 0 {
+		return true
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.closed && s.activeCellGeneration == generation
 }

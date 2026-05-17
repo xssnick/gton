@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tl"

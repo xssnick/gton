@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -67,6 +67,6 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 		return nil, storage.ErrNotFound
 	}
 
-	root, _, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
+	root, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
 	return root, err
 }

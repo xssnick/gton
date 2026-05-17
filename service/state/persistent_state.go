@@ -2,7 +2,7 @@ package state
 
 import (
 	"errors"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"math/big"
 
@@ -10,13 +10,18 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func persistentStateSplitDepth(master *storage.BlockState, workchain int32) (uint32, error) {
+func PersistentStateSplitDepth(master *storage.BlockState, workchain int32) (uint32, error) {
 	if workchain == -1 || master == nil || master.Parsed == nil || master.Parsed.McStateExtra == nil {
 		return 0, nil
 	}
 
+	loader, err := master.Parsed.McStateExtra.BeginParse()
+	if err != nil {
+		return 0, fmt.Errorf("begin parse masterchain extra: %w", err)
+	}
+
 	var extra tlb.McStateExtra
-	if err := tlb.LoadFromCell(&extra, master.Parsed.McStateExtra.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&extra, loader); err != nil {
 		return 0, fmt.Errorf("parse masterchain extra: %w", err)
 	}
 	if extra.ConfigParams.Config.Params == nil {

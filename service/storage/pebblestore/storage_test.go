@@ -6,12 +6,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -33,6 +35,244 @@ func TestCellRecordCodecStoresOrdinaryDescriptor(t *testing.T) {
 	}
 	if record.D1&7 != 0 {
 		t.Fatalf("ordinary cell refs leaked from dirty buffer: %d", record.D1&7)
+	}
+}
+
+func TestLargeBOCLoadRecords(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	partial := cell.BeginCell().MustStoreUInt(0b10101, 5).EndCell()
+	shared := cell.BeginCell().MustStoreUInt(0xAA, 8).MustStoreRef(partial).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0b111, 3).MustStoreRef(shared).MustStoreRef(shared).EndCell()
+	records := make([]*storage.CellRecord, 0, 3)
+	for _, cl := range []*cell.Cell{partial, shared, root} {
+		record, err := storage.CellRecordFromCell(cl)
+		if err != nil {
+			t.Fatalf("cell record: %v", err)
+		}
+		records = append(records, record)
+	}
+	if err = store.SaveCells(records); err != nil {
+		t.Fatalf("save cells: %v", err)
+	}
+
+	byHash := make(map[cell.Hash]*storage.CellRecord, len(records))
+	hashes := make([]cell.Hash, 0, len(records))
+	for i := len(records) - 1; i >= 0; i-- {
+		record := records[i]
+		var hash cell.Hash
+		copy(hash[:], record.Hash)
+		byHash[hash] = record
+		hashes = append(hashes, hash)
+	}
+
+	metaRecords, err := store.LargeBOCLoadMeta(context.Background(), hashes, nil)
+	if err != nil {
+		t.Fatalf("load meta: %v", err)
+	}
+	payloadRecords, err := store.LargeBOCLoadPayload(context.Background(), hashes, nil)
+	if err != nil {
+		t.Fatalf("load payload: %v", err)
+	}
+	cellRecords, err := store.LargeBOCLoadCells(context.Background(), hashes, nil)
+	if err != nil {
+		t.Fatalf("load cells: %v", err)
+	}
+	for i, hash := range hashes {
+		record := byHash[hash]
+		wantMeta, err := storage.LargeBOCMetaRecordFromCellRecord(record)
+		if err != nil {
+			t.Fatalf("meta from record: %v", err)
+		}
+		if metaRecords[i] != wantMeta {
+			t.Fatalf("meta[%d] mismatch", i)
+		}
+		if cellRecords[i].Meta != wantMeta {
+			t.Fatalf("one-pass meta[%d] mismatch", i)
+		}
+
+		wantPayload, err := storage.LargeBOCPayloadRecordFromCellRecord(record)
+		if err != nil {
+			t.Fatalf("payload from record: %v", err)
+		}
+		if !bytes.Equal(payloadRecords[i].Data, wantPayload.Data) {
+			t.Fatalf("payload[%d] mismatch", i)
+		}
+		if !bytes.Equal(cellRecords[i].Payload.Data, wantPayload.Data) {
+			t.Fatalf("one-pass payload[%d] mismatch", i)
+		}
+	}
+}
+
+func TestLargeBOCLoadPayloadAndCellsWithWorkerLocalArenas(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	records := make([]*storage.CellRecord, 0, largeBOCShardReadWorkerMinCell)
+	hashes := make([]cell.Hash, 0, largeBOCShardReadWorkerMinCell)
+	for nonce := uint64(0); len(records) < largeBOCShardReadWorkerMinCell && nonce < 1_000_000; nonce++ {
+		cl := cell.BeginCell().MustStoreUInt(nonce, 64).EndCell()
+		hash := cl.HashKey()
+		if int(hash[0]>>5) != 0 {
+			continue
+		}
+
+		record, err := storage.CellRecordFromCell(cl)
+		if err != nil {
+			t.Fatalf("cell record: %v", err)
+		}
+		records = append(records, record)
+		hashes = append(hashes, hash)
+	}
+	if len(records) != largeBOCShardReadWorkerMinCell {
+		t.Fatalf("generated %d records in one shard, want %d", len(records), largeBOCShardReadWorkerMinCell)
+	}
+	if err = store.SaveCells(records); err != nil {
+		t.Fatalf("save cells: %v", err)
+	}
+
+	payloadRecords, err := store.LargeBOCLoadPayload(context.Background(), hashes, nil)
+	if err != nil {
+		t.Fatalf("load payload: %v", err)
+	}
+	cellRecords, err := store.LargeBOCLoadCells(context.Background(), hashes, nil)
+	if err != nil {
+		t.Fatalf("load cells: %v", err)
+	}
+
+	if len(payloadRecords) != len(records) {
+		t.Fatalf("payload records = %d, want %d", len(payloadRecords), len(records))
+	}
+	if len(cellRecords) != len(records) {
+		t.Fatalf("cell records = %d, want %d", len(cellRecords), len(records))
+	}
+	for i, record := range records {
+		wantMeta, err := storage.LargeBOCMetaRecordFromCellRecord(record)
+		if err != nil {
+			t.Fatalf("meta from record %d: %v", i, err)
+		}
+		if cellRecords[i].Meta != wantMeta {
+			t.Fatalf("one-pass meta[%d] mismatch", i)
+		}
+
+		wantPayload, err := storage.LargeBOCPayloadRecordFromCellRecord(record)
+		if err != nil {
+			t.Fatalf("payload from record %d: %v", i, err)
+		}
+		if !bytes.Equal(payloadRecords[i].Data, wantPayload.Data) {
+			t.Fatalf("payload[%d] mismatch", i)
+		}
+		if !bytes.Equal(cellRecords[i].Payload.Data, wantPayload.Data) {
+			t.Fatalf("one-pass payload[%d] mismatch", i)
+		}
+	}
+}
+
+func TestHotMetaCodecsAvoidDuplicatedKeys(t *testing.T) {
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     42,
+		RootHash:  bytes.Repeat([]byte{0x42}, 32),
+		FileHash:  bytes.Repeat([]byte{0x24}, 32),
+	}
+	prev := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     41,
+		RootHash:  bytes.Repeat([]byte{0x41}, 32),
+		FileHash:  bytes.Repeat([]byte{0x14}, 32),
+	}
+	meta := &storage.BlockMeta{
+		ID:       block,
+		Flags:    storage.BlockMetaHasBlockData,
+		GenUTime: 1000,
+		StartLT:  2000,
+		EndLT:    3000,
+		PrevRefs: []ton.BlockIDExt{prev},
+	}
+
+	encodedMeta := encodeBlockMeta(meta)
+	if bytes.Contains(encodedMeta, encodeBlockID(block)) {
+		t.Fatal("block meta payload stores duplicated block id")
+	}
+	decodedMeta, err := decodeBlockMeta(block, encodedMeta)
+	if err != nil {
+		t.Fatalf("decode block meta: %v", err)
+	}
+	if !decodedMeta.ID.Equals(&block) {
+		t.Fatalf("decoded block id = %s, want %s", storage.FormatBlockRef(decodedMeta.ID), storage.FormatBlockRef(block))
+	}
+
+	current := &storage.CurrentState{
+		SyncedAt:         time.Unix(123, 456).UTC(),
+		ShardClientSeqno: block.SeqNo,
+		Masterchain: storage.BlockState{Block: ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+			SeqNo:     block.SeqNo,
+			RootHash:  bytes.Repeat([]byte{0xaa}, 32),
+			FileHash:  bytes.Repeat([]byte{0xbb}, 32),
+		}},
+		Shards: map[storage.ShardKey]storage.BlockState{
+			{Workchain: 123, Shard: 456}: {Block: block},
+		},
+	}
+	encodedCurrent := encodeCurrentState(current)
+	oldCurrentLen := 1 + 8 + 4 + 80 + 4 + len(current.Shards)*(12+80)
+	wantCurrentLen := oldCurrentLen - len(current.Shards)*12
+	if len(encodedCurrent) != wantCurrentLen {
+		t.Fatalf("encoded current state size = %d, want %d", len(encodedCurrent), wantCurrentLen)
+	}
+
+	decodedCurrent, err := decodeCurrentState(encodedCurrent)
+	if err != nil {
+		t.Fatalf("decode current state: %v", err)
+	}
+	if _, ok := decodedCurrent.Shards[storage.ShardKey{Workchain: 123, Shard: 456}]; ok {
+		t.Fatal("decoded current state used stale encoded shard key")
+	}
+	shard, ok := decodedCurrent.Shards[storage.ShardKeyFromBlock(block)]
+	if !ok {
+		t.Fatalf("decoded current state misses shard key from block %s", storage.FormatBlockRef(block))
+	}
+	if !shard.Block.Equals(&block) {
+		t.Fatalf("decoded shard block = %s, want %s", storage.FormatBlockRef(shard.Block), storage.FormatBlockRef(block))
+	}
+}
+
+func TestOpenRejectsMetaDBWithoutCellGenerationManifest(t *testing.T) {
+	dir := t.TempDir()
+	hotDir := filepath.Join(dir, "metadb")
+	if err := os.MkdirAll(hotDir, 0o755); err != nil {
+		t.Fatalf("create metadb dir: %v", err)
+	}
+
+	db, err := pebble.Open(hotDir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open raw metadb: %v", err)
+	}
+	if err = db.Set(hotKeyVerifiedKeyBlockProgress(), []byte{0x01}, pebble.Sync); err != nil {
+		t.Fatalf("write raw metadb record: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("close raw metadb: %v", err)
+	}
+
+	store, err := Open(Options{Dir: dir})
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("opened non-empty metadb without cell generation manifest")
+	}
+	if !strings.Contains(err.Error(), "cell generation manifest is missing") {
+		t.Fatalf("open error = %v, want missing manifest", err)
 	}
 }
 
@@ -259,7 +499,7 @@ func TestSaveStateCellTreeDeduplicatesSharedRefs(t *testing.T) {
 	}
 }
 
-func TestImportStateCellTreeFlushesCellsBeforeSyncMarker(t *testing.T) {
+func TestImportStateCellTreeFlushesCellsBeforeReturningLazyRoot(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -300,40 +540,20 @@ func TestImportStateCellTreeFlushesCellsBeforeSyncMarker(t *testing.T) {
 		t.Fatalf("lazy root metadata mismatch")
 	}
 
-	marker, err := store.getHotCopy(ctx, hotKeyStateCellSync(block))
-	if err != nil {
-		t.Fatalf("load state cell sync marker: %v", err)
-	}
-	if want := encodeStateCellSync(rootHash, 2); !bytes.Equal(marker, want) {
-		t.Fatalf("state cell sync marker mismatch: got=%x want=%x", marker, want)
-	}
-
 	rootLevelHash := root.HashKey(0)
-	loadedRoot, loadedCells, err := store.LoadStateCellTree(ctx, block, rootLevelHash[:])
-	if err != nil {
-		t.Fatalf("load imported state cell tree: %v", err)
-	}
-	if loadedRoot.IsLazy() || loadedRoot.HashKey() != rootHash {
-		t.Fatalf("loaded lazy root metadata mismatch")
-	}
-	if loadedCells != 2 {
-		t.Fatalf("loaded cells count mismatch: got=%d want=2", loadedCells)
-	}
-
-	wrongHash := bytes.Repeat([]byte{0x44}, 32)
-	if _, _, err = store.LoadStateCellTree(ctx, block, wrongHash); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("load imported state cell tree with wrong hash error = %v, want ErrNotFound", err)
+	if _, err = store.LoadStateCellTree(ctx, block, rootLevelHash[:]); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("load imported state without metadata error = %v, want ErrNotFound", err)
 	}
 	cellMetrics := store.cells.metrics()
 	if cellMetrics.flushCount == 0 {
-		t.Fatal("state import did not flush cell db before sync marker")
+		t.Fatal("state import did not flush cell db before returning lazy root")
 	}
 	if got := cellMetrics.ingestCount; got != 0 {
 		t.Fatalf("state import unexpectedly used pebble ingest: got ingest count %d", got)
 	}
 }
 
-func TestLoadStateCellTreeUsesRootHashWithoutSyncMarker(t *testing.T) {
+func TestLoadStateCellTreeRequiresCommittedStateMeta(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -341,43 +561,34 @@ func TestLoadStateCellTreeUsesRootHashWithoutSyncMarker(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	ctx := context.Background()
-	leaf := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
-	root := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(leaf).EndCell()
 	block := ton.BlockIDExt{
 		Workchain: -1,
 		Shard:     int64(-1 << 63),
-		SeqNo:     2,
+		SeqNo:     3,
 		RootHash:  bytes.Repeat([]byte{0x11}, 32),
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
-
-	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
-		block:      block,
-		root:       root,
-		totalCells: 2,
-	}); err != nil {
-		t.Fatalf("save state cells: %v", err)
-	}
-
-	if ok, err := pebbleReaderHas(store.hot, hotKeyStateCellSync(block)); err != nil || ok {
-		t.Fatalf("sync marker exists=%t err=%v, want missing", ok, err)
-	}
-
+	root := cell.BeginCell().MustStoreUInt(0xcc, 8).EndCell()
 	rootHash := root.HashKey(0)
-	loadedRoot, loadedCells, err := store.LoadStateCellTree(ctx, block, rootHash[:])
-	if err != nil {
-		t.Fatalf("load state by root hash: %v", err)
+	cellHash := root.HashKey()
+
+	if _, err = store.ImportStateCellTree(ctx, block, root, nil, 1); err != nil {
+		t.Fatalf("import state cell tree: %v", err)
 	}
-	if loadedRoot.HashKey() != root.HashKey() {
-		t.Fatalf("loaded root hash mismatch")
-	}
-	if loadedCells != 0 {
-		t.Fatalf("loaded cells = %d, want 0 without sync marker", loadedCells)
+	if _, err = store.LoadStateCellTree(ctx, block, rootHash[:]); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("load state before metadata = %v, want ErrNotFound", err)
 	}
 
-	wrongHash := bytes.Repeat([]byte{0x44}, 32)
-	if _, _, err = store.LoadStateCellTree(ctx, block, wrongHash); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("load state by wrong root hash err = %v, want ErrNotFound", err)
+	if err = store.SaveBlockState(ctx, &storage.BlockState{
+		Block:         block,
+		StateRootHash: rootHash[:],
+		StateCellHash: cellHash[:],
+	}); err != nil {
+		t.Fatalf("save block state metadata: %v", err)
+	}
+
+	if _, err = store.LoadStateCellTree(ctx, block, rootHash[:]); err != nil {
+		t.Fatalf("load state by state meta: %v", err)
 	}
 }
 
@@ -404,9 +615,7 @@ func TestSaveStateCheckpointPersistsOneDurableState(t *testing.T) {
 		Block:         block,
 		StateRootHash: rootHash[:],
 		StateCellHash: cellHash[:],
-		CellsCount:    1,
 		Cell:          root,
-		DownloadedAt:  time.Now(),
 	}
 	current := &storage.CurrentState{
 		SyncedAt:    time.Now(),
@@ -425,16 +634,9 @@ func TestSaveStateCheckpointPersistsOneDurableState(t *testing.T) {
 	if !bytes.Equal(meta.StateCellHash, cellHash[:]) {
 		t.Fatalf("state cell hash mismatch: got=%x want=%x", meta.StateCellHash, cellHash)
 	}
-	if ok, err := pebbleReaderHas(store.hot, hotKeyStateCellSync(block)); err != nil || ok {
-		t.Fatalf("checkpoint state sync marker exists=%t err=%v, want missing", ok, err)
-	}
-
-	loadedRoot, cells, err := store.LoadStateCellTree(ctx, block, rootHash[:])
+	loadedRoot, err := store.LoadStateCellTree(ctx, block, rootHash[:])
 	if err != nil {
 		t.Fatalf("load state cell tree by state meta: %v", err)
-	}
-	if cells != 1 {
-		t.Fatalf("loaded cells = %d, want 1", cells)
 	}
 	if loadedRoot.HashKey(0) != rootHash {
 		t.Fatalf("loaded root hash mismatch: got=%x want=%x", loadedRoot.HashKey(0), rootHash)
@@ -446,6 +648,95 @@ func TestSaveStateCheckpointPersistsOneDurableState(t *testing.T) {
 	}
 	if !loadedCurrent.Masterchain.Block.Equals(&block) {
 		t.Fatalf("current masterchain block = %s, want %s", storage.FormatBlockRef(loadedCurrent.Masterchain.Block), storage.FormatBlockRef(block))
+	}
+}
+
+func TestDecodeBlockStateMetaRejectsPayloadWithoutMasterchainRefFlag(t *testing.T) {
+	buf := make([]byte, 0, 1+33+33+33)
+	buf = append(buf, blockStateMetaVersion)
+	buf = appendLenBytes(buf, bytes.Repeat([]byte{0x11}, 32))
+	buf = appendLenBytes(buf, bytes.Repeat([]byte{0x22}, 32))
+	buf = appendLenBytes(buf, bytes.Repeat([]byte{0x33}, 32))
+
+	_, _, _, _, err := decodeBlockStateMeta(buf)
+	if err == nil || !strings.Contains(err.Error(), "masterchain ref flag missing") {
+		t.Fatalf("decode block state meta error = %v, want missing masterchain ref flag", err)
+	}
+}
+
+func TestSaveStateCheckpointStoresShardInclusionMasterRef(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 20}, 0x20)
+	shard.MasterchainRef = &master.Block
+
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
+		},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master, shard}, current); err != nil {
+		t.Fatalf("save state checkpoint: %v", err)
+	}
+
+	meta, err := store.BlockMeta(ctx, shard.Block)
+	if err != nil {
+		t.Fatalf("load shard meta: %v", err)
+	}
+	if meta.MasterchainRef == nil || !meta.MasterchainRef.Equals(&master.Block) {
+		t.Fatalf("masterchain ref = %+v, want %s", meta.MasterchainRef, storage.FormatBlockRef(master.Block))
+	}
+}
+
+func TestSaveStateCheckpointKeepsExistingShardMasterchainRef(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 20}, 0x20)
+	oldMaster := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     9,
+		RootHash:  bytes.Repeat([]byte{0x09}, 32),
+		FileHash:  bytes.Repeat([]byte{0x19}, 32),
+	}
+	shard.MasterchainRef = &master.Block
+	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: shard.Block, MasterchainRef: &oldMaster}); err != nil {
+		t.Fatalf("save old shard meta: %v", err)
+	}
+
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
+		},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master, shard}, current); err != nil {
+		t.Fatalf("save state checkpoint: %v", err)
+	}
+
+	meta, err := store.BlockMeta(ctx, shard.Block)
+	if err != nil {
+		t.Fatalf("load shard meta: %v", err)
+	}
+	if meta.MasterchainRef == nil || !meta.MasterchainRef.Equals(&oldMaster) {
+		t.Fatalf("masterchain ref = %+v, want %s", meta.MasterchainRef, storage.FormatBlockRef(oldMaster))
 	}
 }
 
@@ -515,7 +806,7 @@ func TestStateSyncProgressPersistsAndClears(t *testing.T) {
 	}
 }
 
-func TestSeenMasterchainBlockPersistsOnlyNewestHint(t *testing.T) {
+func TestOpenReadOnlyRejectsWrites(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(Options{Dir: dir})
 	if err != nil {
@@ -524,41 +815,29 @@ func TestSeenMasterchainBlockPersistsOnlyNewestHint(t *testing.T) {
 
 	ctx := context.Background()
 	block10 := testMasterBlockID(10, 10)
-	block9 := testMasterBlockID(9, 9)
-
-	if _, err = store.SeenMasterchainBlock(ctx); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("seen masterchain before save = %v, want ErrNotFound", err)
+	block11 := testMasterBlockID(11, 11)
+	if err = store.SaveVerifiedKeyBlockProgress(ctx, block10); err != nil {
+		t.Fatalf("save verified key progress: %v", err)
 	}
-	if err = store.SaveSeenMasterchainBlock(ctx, block10); err != nil {
-		t.Fatalf("save seen masterchain: %v", err)
-	}
-	if err = store.SaveSeenMasterchainBlock(ctx, block9); err != nil {
-		t.Fatalf("save older seen masterchain: %v", err)
-	}
-
-	loaded, err := store.SeenMasterchainBlock(ctx)
-	if err != nil {
-		t.Fatalf("load seen masterchain: %v", err)
-	}
-	if !loaded.Equals(&block10) {
-		t.Fatalf("seen masterchain = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block10))
-	}
-
 	if err = store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
-	store, err = Open(Options{Dir: dir})
+
+	store, err = Open(Options{Dir: dir, ReadOnly: true})
 	if err != nil {
-		t.Fatalf("reopen store: %v", err)
+		t.Fatalf("open read-only store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
 
-	loaded, err = store.SeenMasterchainBlock(ctx)
+	loaded, err := store.VerifiedKeyBlockProgress(ctx)
 	if err != nil {
-		t.Fatalf("load seen masterchain after reopen: %v", err)
+		t.Fatalf("load verified key progress: %v", err)
 	}
 	if !loaded.Equals(&block10) {
-		t.Fatalf("seen masterchain after reopen = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block10))
+		t.Fatalf("verified key progress = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block10))
+	}
+	if err = store.SaveVerifiedKeyBlockProgress(ctx, block11); !errors.Is(err, pebble.ErrReadOnly) {
+		t.Fatalf("save in read-only store = %v, want pebble.ErrReadOnly", err)
 	}
 }
 
@@ -647,9 +926,6 @@ func TestRollbackRestoresCurrentAndDeletesFutureMetadata(t *testing.T) {
 	if err = store.LinkNextBlock(master10.Block, master11.Block); err != nil {
 		t.Fatalf("link future master: %v", err)
 	}
-	if err = store.SaveSeenMasterchainBlock(ctx, master11.Block); err != nil {
-		t.Fatalf("save seen master: %v", err)
-	}
 	if err = store.SaveVerifiedKeyBlockProgress(ctx, master11.Block); err != nil {
 		t.Fatalf("save verified key progress: %v", err)
 	}
@@ -693,13 +969,6 @@ func TestRollbackRestoresCurrentAndDeletesFutureMetadata(t *testing.T) {
 	}
 	if _, err = store.NextBlockFull(ctx, master10.Block); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("future next block link still exists: %v", err)
-	}
-	seen, err := store.SeenMasterchainBlock(ctx)
-	if err != nil {
-		t.Fatalf("load seen master after rollback: %v", err)
-	}
-	if !seen.Equals(&master10.Block) {
-		t.Fatalf("seen master = %s, want %s", storage.FormatBlockRef(seen), storage.FormatBlockRef(master10.Block))
 	}
 	if _, err = store.VerifiedKeyBlockProgress(ctx); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("verified key progress after rollback = %v, want ErrNotFound", err)
@@ -746,11 +1015,8 @@ func TestSaveStateCheckpointPersistsAllAppliedStates(t *testing.T) {
 		if _, err = store.blockStateMeta(ctx, state.Block); err != nil {
 			t.Fatalf("state meta for %s missing: %v", storage.FormatBlockRef(state.Block), err)
 		}
-		if _, _, err = store.LoadStateCellTree(ctx, state.Block, state.StateRootHash); err != nil {
+		if _, err = store.LoadStateCellTree(ctx, state.Block, state.StateRootHash); err != nil {
 			t.Fatalf("state cells for %s missing: %v", storage.FormatBlockRef(state.Block), err)
-		}
-		if ok, err := pebbleReaderHas(store.hot, hotKeyStateCellSync(state.Block)); err != nil || ok {
-			t.Fatalf("checkpoint state sync marker for %s exists=%t err=%v, want missing", storage.FormatBlockRef(state.Block), ok, err)
 		}
 	}
 
@@ -763,12 +1029,76 @@ func TestSaveStateCheckpointPersistsAllAppliedStates(t *testing.T) {
 	}
 }
 
-func blockStateWithSingleCell(block ton.BlockIDExt, value uint64) *storage.BlockState {
-	root := cell.BeginCell().MustStoreUInt(value, 8).EndCell()
-	return blockStateWithRoot(block, root, 1)
+func TestSaveStateCheckpointRejectsCurrentShardWithoutStateMeta(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 100}, 0x20)
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
+		},
+	}
+
+	err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master}, current)
+	if err == nil || !strings.Contains(err.Error(), "current shard state") || !strings.Contains(err.Error(), "metadata is missing") {
+		t.Fatalf("save checkpoint error = %v, want missing current shard metadata", err)
+	}
+	if _, err = store.CurrentState(ctx); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("current after failed checkpoint = %v, want ErrNotFound", err)
+	}
 }
 
-func blockStateWithRoot(block ton.BlockIDExt, root *cell.Cell, cellsCount uint64) *storage.BlockState {
+func TestSaveStateCheckpointAllowsExistingCurrentShardStateMeta(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 100}, 0x20)
+	if err = store.SaveBlockState(ctx, shard); err != nil {
+		t.Fatalf("save existing shard state: %v", err)
+	}
+
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
+		},
+	}
+
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master}, current); err != nil {
+		t.Fatalf("save checkpoint with existing shard state: %v", err)
+	}
+	loaded, err := store.CurrentState(ctx)
+	if err != nil {
+		t.Fatalf("load current: %v", err)
+	}
+	loadedShard := loaded.Shards[storage.ShardKeyFromBlock(shard.Block)]
+	if !loadedShard.Block.Equals(&shard.Block) {
+		t.Fatalf("current shard was not loaded from existing metadata")
+	}
+}
+
+func blockStateWithSingleCell(block ton.BlockIDExt, value uint64) *storage.BlockState {
+	root := cell.BeginCell().MustStoreUInt(value, 8).EndCell()
+	return blockStateWithRoot(block, root)
+}
+
+func blockStateWithRoot(block ton.BlockIDExt, root *cell.Cell) *storage.BlockState {
 	rootHash := root.HashKey(0)
 	cellHash := root.HashKey()
 	if len(block.RootHash) == 0 {
@@ -781,9 +1111,7 @@ func blockStateWithRoot(block ton.BlockIDExt, root *cell.Cell, cellsCount uint64
 		Block:         block,
 		StateRootHash: rootHash[:],
 		StateCellHash: cellHash[:],
-		CellsCount:    cellsCount,
 		Cell:          root,
-		DownloadedAt:  time.Now(),
 	}
 }
 
@@ -851,6 +1179,17 @@ func assertResolvedCellTreeEqual(tb testing.TB, got *cell.Cell, want *cell.Cell)
 func assertResolvedCellTreeEqualAt(tb testing.TB, got *cell.Cell, want *cell.Cell, seen map[cell.Hash]struct{}) {
 	tb.Helper()
 
+	gotSlice, err := got.BeginParse()
+	if err != nil {
+		tb.Fatalf("materialize got cell: %v", err)
+	}
+	wantSlice, err := want.BeginParse()
+	if err != nil {
+		tb.Fatalf("materialize want cell: %v", err)
+	}
+	got = gotSlice.BaseCell()
+	want = wantSlice.BaseCell()
+
 	gotHash := got.HashKey(0)
 	wantHash := want.HashKey(0)
 	if gotHash != wantHash {
@@ -889,7 +1228,7 @@ func assertStateCellExists(tb testing.TB, store *Store, hash cell.Hash, want boo
 	}
 }
 
-func TestSaveStateCellTreeStoresPrunedRefAsLazyBoundary(t *testing.T) {
+func TestSaveStateCellTreeStoresPrunedRefAsRawCell(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -904,53 +1243,42 @@ func TestSaveStateCellTreeStoresPrunedRefAsLazyBoundary(t *testing.T) {
 	}
 
 	hidden := cell.BeginCell().MustStoreUInt(0x77, 8).EndCell()
-	hiddenHash := hidden.HashKey(0)
-	if _, err = store.ImportStateCellTree(ctx, block, hidden, nil, 1); err != nil {
-		t.Fatalf("import represented subtree: %v", err)
-	}
-
 	pruned := testPrunedBranch(t, hidden)
-	prunedHash := pruned.HashKey()
-	if prunedHash == hiddenHash {
-		t.Fatal("test pruned cell hash must differ from represented hash")
-	}
-
-	nextBlock := block
-	nextBlock.SeqNo = 2
 	root := cell.BeginCell().MustStoreUInt(0x44, 8).MustStoreRef(pruned).EndCell()
-	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
-		block:      nextBlock,
+	persisted, err := store.saveStateCellTree(ctx, stateCellTreeSave{
+		block:      block,
 		root:       root,
 		totalCells: 2,
-	}); err != nil {
-		t.Fatalf("save state with pruned boundary: %v", err)
-	}
-
-	if _, err = store.loadLazyCell(ctx, prunedHash[:]); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("raw pruned cell body was persisted: %v", err)
-	}
-
-	lazyRoot, err := store.loadLazyCell(ctx, root.Hash())
+	})
 	if err != nil {
-		t.Fatalf("load patch root: %v", err)
+		t.Fatalf("save state tree with raw pruned ref: %v", err)
 	}
-	rootMeta := lazyRoot.GetMetadata()
-	if len(rootMeta.Refs) != 1 {
-		t.Fatalf("unexpected root refs count %d", len(rootMeta.Refs))
-	}
-	if !rootMeta.Refs[0].Lazy {
-		t.Fatal("expected pruned ref to be stored as lazy boundary")
-	}
-	if rootMeta.Refs[0].Hash != hiddenHash {
-		t.Fatalf("boundary hash mismatch: got=%x want=%x", rootMeta.Refs[0].Hash, hiddenHash)
+	if !persisted {
+		t.Fatal("expected state cells to be persisted")
 	}
 
-	loadedHidden, err := lazyRoot.PeekRef(0)
-	if err != nil {
-		t.Fatalf("load represented subtree through boundary: %v", err)
+	assertStateCellExists(t, store, root.HashKey(), true)
+	assertStateCellExists(t, store, pruned.HashKey(), true)
+	if hidden.HashKey(0) != pruned.HashKey() {
+		assertStateCellExists(t, store, hidden.HashKey(0), false)
 	}
-	if loadedHidden.HashKey(0) != hiddenHash {
-		t.Fatalf("represented subtree hash mismatch: got=%x want=%x", loadedHidden.HashKey(0), hiddenHash)
+
+	if err = store.flushCellDBs(initialCellGenerationID); err != nil {
+		t.Fatalf("flush cells: %v", err)
+	}
+	loadedRoot, err := store.loadLazyCell(ctx, root.Hash())
+	if err != nil {
+		t.Fatalf("load root: %v", err)
+	}
+	loadedRef, err := loadedRoot.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load raw pruned ref: %v", err)
+	}
+	if loadedRef.GetType() != cell.PrunedCellType {
+		t.Fatalf("loaded ref type = %d, want pruned", loadedRef.GetType())
+	}
+	if loadedRef.HashKey() != pruned.HashKey() {
+		t.Fatalf("loaded pruned hash mismatch: got=%x want=%x", loadedRef.HashKey(), pruned.HashKey())
 	}
 }
 
@@ -968,31 +1296,19 @@ func TestSaveBlockStateSwitchesStateToLazyRoot(t *testing.T) {
 		SeqNo:     1,
 	}
 
-	hidden := cell.BeginCell().MustStoreUInt(0x77, 8).EndCell()
-	hiddenHash := hidden.HashKey(0)
-	if _, err = store.ImportStateCellTree(ctx, block, hidden, nil, 1); err != nil {
-		t.Fatalf("import represented subtree: %v", err)
-	}
-
-	pruned := testPrunedBranch(t, hidden)
-	prunedHash := pruned.HashKey()
-	nextBlock := block
-	nextBlock.SeqNo = 2
-	root := cell.BeginCell().MustStoreUInt(0x44, 8).MustStoreRef(pruned).EndCell()
+	child := cell.BeginCell().MustStoreUInt(0x77, 8).EndCell()
+	childHash := child.HashKey()
+	root := cell.BeginCell().MustStoreUInt(0x44, 8).MustStoreRef(child).EndCell()
 	state := &storage.BlockState{
-		Block:      nextBlock,
-		Cell:       root,
-		CellsCount: 2,
+		Block: block,
+		Cell:  root,
 	}
 	if err = store.SaveBlockState(ctx, state); err != nil {
-		t.Fatalf("save state with pruned boundary: %v", err)
+		t.Fatalf("save state: %v", err)
 	}
 
 	if state.Cell == root {
-		t.Fatal("saved state still points to original proof-shaped root")
-	}
-	if _, err = store.loadLazyCell(ctx, prunedHash[:]); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("raw pruned cell body was persisted: %v", err)
+		t.Fatal("saved state still points to original root")
 	}
 	rootMeta := state.Cell.GetMetadata()
 	if len(rootMeta.Refs) != 1 {
@@ -1001,19 +1317,19 @@ func TestSaveBlockStateSwitchesStateToLazyRoot(t *testing.T) {
 	if !rootMeta.Refs[0].Lazy {
 		t.Fatal("expected saved root ref to become lazy boundary")
 	}
-	if rootMeta.Refs[0].Hash != hiddenHash {
-		t.Fatalf("boundary hash mismatch: got=%x want=%x", rootMeta.Refs[0].Hash, hiddenHash)
+	if rootMeta.Refs[0].Hash != childHash {
+		t.Fatalf("boundary hash mismatch: got=%x want=%x", rootMeta.Refs[0].Hash, childHash)
 	}
-	loadedHidden, err := state.Cell.PeekRef(0)
+	loadedChild, err := state.Cell.PeekRef(0)
 	if err != nil {
-		t.Fatalf("load represented subtree through saved lazy root: %v", err)
+		t.Fatalf("load child through saved lazy root: %v", err)
 	}
-	if loadedHidden.HashKey(0) != hiddenHash {
-		t.Fatalf("represented subtree hash mismatch: got=%x want=%x", loadedHidden.HashKey(0), hiddenHash)
+	if loadedChild.HashKey() != childHash {
+		t.Fatalf("child hash mismatch: got=%x want=%x", loadedChild.HashKey(), childHash)
 	}
 }
 
-func TestSaveStateCellTreeDirectMerkleUpdateMatchesApplyMerkleUpdate(t *testing.T) {
+func TestPreparedMerkleUpdateCellsMatchApplyMerkleUpdate(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1101,15 +1417,30 @@ func TestSaveStateCellTreeDirectMerkleUpdateMatchesApplyMerkleUpdate(t *testing.
 		Block:         nextBlock,
 		StateRootHash: stateRootHash[:],
 		StateCellHash: stateCellHash[:],
-		CellsCount:    4,
 		Cell:          directRoot,
-		DownloadedAt:  time.Now(),
 	}
-	if err = store.SaveBlockState(ctx, nextState); err != nil {
-		t.Fatalf("save direct state root: %v", err)
+	preparedCellsByHash, err := storage.PrepareStateUpdateCells(update)
+	if err != nil {
+		t.Fatalf("prepare state update cells: %v", err)
+	}
+	preparedCells := make([]storage.EncodedCellRecord, 0, len(preparedCellsByHash))
+	for hash, data := range preparedCellsByHash {
+		preparedCells = append(preparedCells, storage.EncodedCellRecord{
+			Hash: hash,
+			Data: data,
+		})
+	}
+	nextCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: nextBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(nextState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpointWithCells(ctx, []*storage.BlockState{nextState}, nextCurrent, preparedCells); err != nil {
+		t.Fatalf("save prepared state update target: %v", err)
 	}
 
-	loaded, _, err := store.LoadStateCellTree(ctx, nextBlock, stateRootHash[:])
+	loaded, err := store.LoadStateCellTree(ctx, nextState.Block, stateRootHash[:])
 	if err != nil {
 		t.Fatalf("load direct state root: %v", err)
 	}
@@ -1211,20 +1542,20 @@ func TestApplyMerkleUpdateCheckpointKeepsIntermediateCells(t *testing.T) {
 
 	directBlock := block
 	directBlock.SeqNo = 2
-	directState := blockStateWithRoot(directBlock, update2To.Virtualize(0), 4)
+	directState := blockStateWithRoot(directBlock, update2To.Virtualize(0))
 	if err = store.SaveBlockState(ctx, directState); err == nil {
 		t.Fatal("direct proof-shaped state with unsaved pruned boundary was accepted")
 	}
 
 	nextBlock := block
 	nextBlock.SeqNo = 3
-	nextState := blockStateWithRoot(nextBlock, state2, 5)
+	nextState := blockStateWithRoot(nextBlock, state2)
 	if err = store.SaveBlockState(ctx, nextState); err != nil {
 		t.Fatalf("save merged state: %v", err)
 	}
 
 	stateRootHash := state2.HashKey(0)
-	loaded, _, err := store.LoadStateCellTree(ctx, nextBlock, stateRootHash[:])
+	loaded, err := store.LoadStateCellTree(ctx, nextState.Block, stateRootHash[:])
 	if err != nil {
 		t.Fatalf("load merged state root: %v", err)
 	}
@@ -1232,7 +1563,7 @@ func TestApplyMerkleUpdateCheckpointKeepsIntermediateCells(t *testing.T) {
 	assertStateCellExists(t, store, newBranch.HashKey(), true)
 }
 
-func TestSaveStateCheckpointDoesNotCommitMissingLazyBoundary(t *testing.T) {
+func TestSaveStateCheckpointDoesNotCommitProofShapedRoot(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1258,10 +1589,13 @@ func TestSaveStateCheckpointDoesNotCommitMissingLazyBoundary(t *testing.T) {
 
 	hidden := cell.BeginCell().MustStoreUInt(0x99, 8).EndCell()
 	pruned := testPrunedBranch(t, hidden)
-	badRoot := cell.BeginCell().MustStoreUInt(0x22, 8).MustStoreRef(pruned).EndCell()
+	badRoot := cell.BeginCell().MustStoreUInt(0x22, 8).MustStoreRef(pruned).EndCell().Virtualize(0)
+	if !badRoot.IsVirtualized() {
+		t.Fatal("test root must be proof-shaped")
+	}
 	badBlock := block
 	badBlock.SeqNo = 2
-	badState := blockStateWithRoot(badBlock, badRoot, 2)
+	badState := blockStateWithRoot(badBlock, badRoot)
 	badCurrent := &storage.CurrentState{
 		SyncedAt:         time.Now(),
 		ShardClientSeqno: badBlock.SeqNo,
@@ -1269,7 +1603,7 @@ func TestSaveStateCheckpointDoesNotCommitMissingLazyBoundary(t *testing.T) {
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{badState}, badCurrent); err == nil {
-		t.Fatal("checkpoint with missing lazy boundary was accepted")
+		t.Fatal("checkpoint with proof-shaped root was accepted")
 	}
 
 	loaded, err := store.CurrentState(ctx)
@@ -1299,7 +1633,7 @@ func TestSaveStateCheckpointWithPreparedCellsLoadsLazyRoot(t *testing.T) {
 	}
 	child := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	root := cell.BeginCell().MustStoreUInt(0x22, 8).MustStoreRef(child).EndCell()
-	state := blockStateWithRoot(block, root, 2)
+	state := blockStateWithRoot(block, root)
 	current := &storage.CurrentState{
 		SyncedAt:         time.Now(),
 		ShardClientSeqno: block.SeqNo,
@@ -1315,7 +1649,7 @@ func TestSaveStateCheckpointWithPreparedCellsLoadsLazyRoot(t *testing.T) {
 		t.Fatalf("save checkpoint with prepared cells: %v", err)
 	}
 
-	loaded, _, err := store.LoadStateCellTree(ctx, block, state.StateRootHash)
+	loaded, err := store.LoadStateCellTree(ctx, state.Block, state.StateRootHash)
 	if err != nil {
 		t.Fatalf("load saved state: %v", err)
 	}
@@ -1325,6 +1659,600 @@ func TestSaveStateCheckpointWithPreparedCellsLoadsLazyRoot(t *testing.T) {
 	}
 	if loadedChild.HashKey() != child.HashKey() {
 		t.Fatalf("loaded child hash mismatch: got=%x want=%x", loadedChild.HashKey(), child.HashKey())
+	}
+}
+
+func TestSaveStateCheckpointWithPreparedCellsAllowsExternalBoundary(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     1,
+	}
+	external := cell.BeginCell().MustStoreUInt(0x33, 8).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0x44, 8).MustStoreRef(external).EndCell()
+	nextBlock := block
+	nextBlock.SeqNo = 2
+	state := blockStateWithRoot(nextBlock, root)
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: nextBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(state),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+
+	records := []storage.EncodedCellRecord{mustEncodedCellRecord(t, root)}
+	if err = store.SaveStateCheckpointWithCells(ctx, []*storage.BlockState{state}, current, records); err != nil {
+		t.Fatalf("save checkpoint with external boundary: %v", err)
+	}
+
+	loaded, err := store.LoadStateCellTree(ctx, state.Block, state.StateRootHash)
+	if err != nil {
+		t.Fatalf("load saved state root: %v", err)
+	}
+	if loaded.HashKey() != root.HashKey() {
+		t.Fatalf("loaded root mismatch: got=%x want=%x", loaded.HashKey(), root.HashKey())
+	}
+	loadedMeta := loaded.GetMetadata()
+	if len(loadedMeta.Refs) != 1 {
+		t.Fatalf("loaded root refs = %d, want 1", len(loadedMeta.Refs))
+	}
+	if loadedMeta.Refs[0].Hash != external.HashKey() {
+		t.Fatalf("loaded external boundary mismatch: got=%x want=%x", loadedMeta.Refs[0].Hash, external.HashKey())
+	}
+}
+
+func TestSwitchCellGenerationAtomicallyPublishesCandidateState(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	oldRoot := cell.BeginCell().MustStoreUInt(0x10, 8).EndCell()
+	oldState := blockStateWithRoot(oldBlock, oldRoot)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation: %v", err)
+	}
+	if active.ID != initialCellGenerationID {
+		t.Fatalf("active generation = %d, want %d", active.ID, initialCellGenerationID)
+	}
+	if !active.OriginPersistentState.Equals(&oldState.Block) {
+		t.Fatalf("active origin = %s, want %s", storage.FormatBlockRef(active.OriginPersistentState), storage.FormatBlockRef(oldState.Block))
+	}
+
+	newBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	generation, err := store.BeginCellGeneration(ctx, newBlock)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, nil, 1)
+	if err != nil {
+		t.Fatalf("import candidate state: %v", err)
+	}
+	newState := blockStateWithRoot(newBlock, newRoot)
+	newState.Cell = lazyRoot
+	newState.CellGeneration = generation
+	newCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+
+	historicalBlock := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-1 << 63),
+		SeqNo:     15,
+	}
+	historicalRoot := cell.BeginCell().MustStoreUInt(0x15, 8).EndCell()
+	lazyHistoricalRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, historicalBlock, historicalRoot, nil, 1)
+	if err != nil {
+		t.Fatalf("import candidate historical state: %v", err)
+	}
+	historicalState := blockStateWithRoot(historicalBlock, historicalRoot)
+	historicalState.Cell = lazyHistoricalRoot
+	historicalState.CellGeneration = generation
+
+	durableNewState := blockStateWithRoot(newBlock, newRoot)
+	durableHistoricalState := blockStateWithRoot(historicalBlock, historicalRoot)
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableHistoricalState, durableNewState}, newCurrent); err != nil {
+		t.Fatalf("save durable current before switch: %v", err)
+	}
+
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent)
+	if err != nil {
+		t.Fatalf("switch generation: %v", err)
+	}
+	if oldGeneration != initialCellGenerationID {
+		t.Fatalf("old generation = %d, want %d", oldGeneration, initialCellGenerationID)
+	}
+
+	active, err = store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation after switch: %v", err)
+	}
+	if active.ID != generation {
+		t.Fatalf("active generation after switch = %d, want %d", active.ID, generation)
+	}
+	if !active.OriginPersistentState.Equals(&newState.Block) {
+		t.Fatalf("active origin after switch = %s, want %s", storage.FormatBlockRef(active.OriginPersistentState), storage.FormatBlockRef(newState.Block))
+	}
+
+	loadedCurrent, err := store.CurrentState(ctx)
+	if err != nil {
+		t.Fatalf("load current after switch: %v", err)
+	}
+	if !loadedCurrent.Masterchain.Block.Equals(&newState.Block) {
+		t.Fatalf("current master after switch = %s, want %s", storage.FormatBlockRef(loadedCurrent.Masterchain.Block), storage.FormatBlockRef(newState.Block))
+	}
+	loadedRoot, err := store.LoadStateCellTree(ctx, newState.Block, newState.StateRootHash)
+	if err != nil {
+		t.Fatalf("load candidate state after switch: %v", err)
+	}
+	if loadedRoot.HashKey() != newRoot.HashKey() {
+		t.Fatalf("candidate root hash mismatch: got=%x want=%x", loadedRoot.HashKey(), newRoot.HashKey())
+	}
+	loadedHistoricalRoot, err := store.LoadStateCellTree(ctx, historicalState.Block, historicalState.StateRootHash)
+	if err != nil {
+		t.Fatalf("load candidate historical state after switch: %v", err)
+	}
+	if loadedHistoricalRoot.HashKey() != historicalRoot.HashKey() {
+		t.Fatalf("historical root hash mismatch: got=%x want=%x", loadedHistoricalRoot.HashKey(), historicalRoot.HashKey())
+	}
+
+	if err = store.CleanupCellGeneration(ctx, oldGeneration); err != nil {
+		t.Fatalf("cleanup old generation: %v", err)
+	}
+	if _, err = store.blockStateMeta(ctx, oldState.Block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("old state metadata after cleanup err=%v, want not found", err)
+	}
+	if _, err = store.blockStateMeta(ctx, historicalState.Block); err != nil {
+		t.Fatalf("load candidate historical state meta after old cleanup: %v", err)
+	}
+
+	if _, err = store.CellRecordInGeneration(ctx, oldGeneration, oldState.StateCellHash); err == nil {
+		t.Fatal("old generation cell still loads after delete")
+	}
+}
+
+func TestPendingCellGenerationMigrationSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	oldState := blockStateWithSingleCell(oldBlock, 0x10)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	origin := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+		RootHash:  bytes.Repeat([]byte{0x20}, 32),
+		FileHash:  bytes.Repeat([]byte{0x21}, 32),
+	}
+	generation, err := store.BeginCellGeneration(ctx, origin)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	if generation <= initialCellGenerationID {
+		t.Fatalf("candidate generation = %d, want above %d", generation, initialCellGenerationID)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	pending, err := store.PendingCellGenerationMigration(ctx)
+	if err != nil {
+		t.Fatalf("load pending migration: %v", err)
+	}
+	if pending.ID != generation {
+		t.Fatalf("pending generation = %d, want %d", pending.ID, generation)
+	}
+	if !pending.OriginPersistentState.Equals(&origin) {
+		t.Fatalf("pending origin = %s, want %s", storage.FormatBlockRef(pending.OriginPersistentState), storage.FormatBlockRef(origin))
+	}
+
+	reused, err := store.BeginCellGeneration(ctx, origin)
+	if err != nil {
+		t.Fatalf("reuse pending generation: %v", err)
+	}
+	if reused != generation {
+		t.Fatalf("reused generation = %d, want %d", reused, generation)
+	}
+
+	root := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
+	if _, err = store.ImportStateCellTreeInGeneration(ctx, generation, origin, root, nil, 1); err != nil {
+		t.Fatalf("import into reopened pending generation: %v", err)
+	}
+
+	otherOrigin := origin
+	otherOrigin.SeqNo++
+	if _, err = store.BeginCellGeneration(ctx, otherOrigin); err == nil {
+		t.Fatal("begin generation with different origin reused pending migration")
+	}
+}
+
+func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	oldState := blockStateWithSingleCell(oldBlock, 0x10)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	newBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	generation, err := store.BeginCellGeneration(ctx, newBlock)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, nil, 1)
+	if err != nil {
+		t.Fatalf("import candidate state: %v", err)
+	}
+	newState := blockStateWithRoot(newBlock, newRoot)
+	newState.Cell = lazyRoot
+	newState.CellGeneration = generation
+	newCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	durableNewState := blockStateWithRoot(newBlock, newRoot)
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+		t.Fatalf("save durable current before switch: %v", err)
+	}
+
+	advancedBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     21,
+	}
+	advancedState := blockStateWithSingleCell(advancedBlock, 0x21)
+	advancedCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: advancedBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(advancedState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{advancedState}, advancedCurrent); err != nil {
+		t.Fatalf("save advanced checkpoint: %v", err)
+	}
+
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); !errors.Is(err, storage.ErrCurrentStateAdvanced) {
+		t.Fatalf("switch advanced current err=%v, want ErrCurrentStateAdvanced", err)
+	}
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation: %v", err)
+	}
+	if active.ID != initialCellGenerationID {
+		t.Fatalf("active generation = %d, want %d", active.ID, initialCellGenerationID)
+	}
+}
+
+func TestSwitchCellGenerationRejectsMissingCandidateCurrentCellsBeforeCleanup(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	oldState := blockStateWithSingleCell(oldBlock, 0x10)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	newBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	generation, err := store.BeginCellGeneration(ctx, newBlock)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	newState := blockStateWithSingleCell(newBlock, 0x20)
+	newCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newState.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
+		t.Fatalf("save durable current before switch: %v", err)
+	}
+
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); err == nil {
+		t.Fatal("switch succeeded without candidate current cells")
+	}
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation: %v", err)
+	}
+	if active.ID != initialCellGenerationID {
+		t.Fatalf("active generation = %d, want %d", active.ID, initialCellGenerationID)
+	}
+	if _, err = store.blockStateMeta(ctx, oldState.Block); err != nil {
+		t.Fatalf("old state metadata was deleted before rejected switch: %v", err)
+	}
+	if _, err = store.blockStateMeta(ctx, newState.Block); err != nil {
+		t.Fatalf("current state metadata was deleted before rejected switch: %v", err)
+	}
+}
+
+func TestOpenReconcilesRetiredCellGenerationCleanup(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	oldRoot := cell.BeginCell().MustStoreUInt(0x10, 8).EndCell()
+	oldState := blockStateWithRoot(oldBlock, oldRoot)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	newBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	generation, err := store.BeginCellGeneration(ctx, newBlock)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, nil, 1)
+	if err != nil {
+		t.Fatalf("import candidate state: %v", err)
+	}
+	newState := blockStateWithRoot(newBlock, newRoot)
+	newState.Cell = lazyRoot
+	newState.CellGeneration = generation
+	newCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	durableNewState := blockStateWithRoot(newBlock, newRoot)
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+		t.Fatalf("save durable current before switch: %v", err)
+	}
+
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent)
+	if err != nil {
+		t.Fatalf("switch generation: %v", err)
+	}
+	if oldGeneration != initialCellGenerationID {
+		t.Fatalf("old generation = %d, want %d", oldGeneration, initialCellGenerationID)
+	}
+	if _, err = store.PendingCellGenerationMigration(ctx); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("pending migration after switch err=%v, want not found", err)
+	}
+	if _, err = store.blockStateMeta(ctx, oldState.Block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("old state metadata after switch err=%v, want not found", err)
+	}
+	assertCellGenerationShardDirs(t, dir, oldGeneration, true)
+
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation after reopen: %v", err)
+	}
+	if active.ID != generation {
+		t.Fatalf("active generation after reopen = %d, want %d", active.ID, generation)
+	}
+	if _, err = store.PendingCellGenerationMigration(ctx); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("pending migration after reopen err=%v, want not found", err)
+	}
+	if _, err = store.blockStateMeta(ctx, oldState.Block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("old state metadata after startup cleanup err=%v, want not found", err)
+	}
+	if _, err = store.blockStateMeta(ctx, newState.Block); err != nil {
+		t.Fatalf("new state metadata after startup cleanup: %v", err)
+	}
+	if _, err = store.LoadStateCellTree(ctx, newState.Block, newState.StateRootHash); err != nil {
+		t.Fatalf("load new state after startup cleanup: %v", err)
+	}
+	assertCellGenerationShardDirs(t, dir, oldGeneration, false)
+}
+
+func TestActiveLazyRootSurvivesPreviousGenerationDeleteWhenCellExistsInNewGeneration(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	child := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0x22, 8).MustStoreRef(child).EndCell()
+	oldState := blockStateWithRoot(oldBlock, root)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	oldLazyRoot, err := store.LoadStateCellTree(ctx, oldState.Block, oldState.StateRootHash)
+	if err != nil {
+		t.Fatalf("load old lazy root: %v", err)
+	}
+
+	newBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	generation, err := store.BeginCellGeneration(ctx, newBlock)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, root, nil, 2)
+	if err != nil {
+		t.Fatalf("import candidate state: %v", err)
+	}
+	newState := blockStateWithRoot(newBlock, root)
+	newState.Cell = lazyRoot
+	newState.CellGeneration = generation
+	newCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	durableNewState := blockStateWithRoot(newBlock, root)
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+		t.Fatalf("save durable current before switch: %v", err)
+	}
+
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent)
+	if err != nil {
+		t.Fatalf("switch generation: %v", err)
+	}
+	if err = store.CleanupCellGeneration(ctx, oldGeneration); err != nil {
+		t.Fatalf("cleanup old generation: %v", err)
+	}
+
+	loadedChild, err := oldLazyRoot.PeekRef(0)
+	if err != nil {
+		t.Fatalf("old active lazy root did not fall through to current generation: %v", err)
+	}
+	if loadedChild.HashKey() != child.HashKey() {
+		t.Fatalf("loaded child hash mismatch: got=%x want=%x", loadedChild.HashKey(), child.HashKey())
+	}
+}
+
+func assertCellGenerationShardDirs(tb testing.TB, dir string, generation uint64, wantExists bool) {
+	tb.Helper()
+
+	for shard := 0; shard < cellDBShardCount; shard++ {
+		_, err := os.Stat(cellGenerationShardDir(dir, generation, shard))
+		if wantExists {
+			if err != nil {
+				tb.Fatalf("cell generation %d shard %d dir missing: %v", generation, shard, err)
+			}
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			tb.Fatalf("cell generation %d shard %d dir exists or stat failed: %v", generation, shard, err)
+		}
 	}
 }
 
@@ -1343,7 +2271,7 @@ func TestSaveStateCheckpointWithPreparedCellsRejectsMissingRoot(t *testing.T) {
 	}
 	child := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	root := cell.BeginCell().MustStoreUInt(0x22, 8).MustStoreRef(child).EndCell()
-	state := blockStateWithRoot(block, root, 2)
+	state := blockStateWithRoot(block, root)
 	current := &storage.CurrentState{
 		SyncedAt:         time.Now(),
 		ShardClientSeqno: block.SeqNo,
@@ -1359,7 +2287,7 @@ func TestSaveStateCheckpointWithPreparedCellsRejectsMissingRoot(t *testing.T) {
 	}
 }
 
-func TestSaveStateCellTreeStoresConcretePrunedParentByLogicalHash(t *testing.T) {
+func TestSaveStateCellTreeStoresConcretePrunedParentByRawHash(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1374,59 +2302,60 @@ func TestSaveStateCellTreeStoresConcretePrunedParentByLogicalHash(t *testing.T) 
 	}
 
 	hidden := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
-	if _, err = store.ImportStateCellTree(ctx, block, hidden, nil, 1); err != nil {
-		t.Fatalf("import represented leaf: %v", err)
-	}
-
 	pruned := testPrunedBranch(t, hidden)
 	rawChild := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(pruned).EndCell()
 	if rawChild.Level() == 0 {
 		t.Fatal("test child must have a non-zero level")
 	}
-	logicalChild := rawChild.Virtualize(0)
-	if logicalChild.HashKey() == rawChild.HashKey() {
-		t.Fatal("test child must have distinct logical and raw hashes")
-	}
 	root := cell.BeginCell().MustStoreRef(rawChild).EndCell()
 
-	nextBlock := block
-	nextBlock.SeqNo = 2
 	if _, err = store.saveStateCellTree(ctx, stateCellTreeSave{
-		block:      nextBlock,
+		block:      block,
 		root:       root,
 		totalCells: 3,
 	}); err != nil {
-		t.Fatalf("save state with concrete pruned parent: %v", err)
+		t.Fatalf("save state tree with raw pruned descendant: %v", err)
 	}
 
-	if _, err = store.loadLazyCell(ctx, rawChild.Hash()); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("raw child body should not be stored under top hash: %v", err)
+	assertStateCellExists(t, store, root.HashKey(), true)
+	assertStateCellExists(t, store, rawChild.HashKey(), true)
+	if logicalChild := rawChild.Virtualize(0); logicalChild.HashKey() != rawChild.HashKey() {
+		assertStateCellExists(t, store, logicalChild.HashKey(), false)
 	}
-	if _, err = store.loadLazyCell(ctx, logicalChild.Hash()); err != nil {
-		t.Fatalf("logical child body was not persisted: %v", err)
+	assertStateCellExists(t, store, pruned.HashKey(), true)
+	if hidden.HashKey(0) != pruned.HashKey() {
+		assertStateCellExists(t, store, hidden.HashKey(0), false)
 	}
 
-	lazyRoot, err := store.loadLazyCell(ctx, root.Hash())
+	if err = store.flushCellDBs(initialCellGenerationID); err != nil {
+		t.Fatalf("flush cells: %v", err)
+	}
+	loadedRoot, err := store.loadLazyCell(ctx, root.Hash())
 	if err != nil {
 		t.Fatalf("load root: %v", err)
 	}
-	loadedChild, err := lazyRoot.PeekRef(0)
+	loadedChild, err := loadedRoot.PeekRef(0)
 	if err != nil {
-		t.Fatalf("load logical child through parent ref: %v", err)
+		t.Fatalf("load raw child: %v", err)
 	}
-	if loadedChild.HashKey() != logicalChild.HashKey() {
-		t.Fatalf("loaded child hash mismatch: got=%x want=%x", loadedChild.HashKey(), logicalChild.HashKey())
+	if loadedChild.HashKey() != rawChild.HashKey() {
+		t.Fatalf("loaded child hash mismatch: got=%x want=%x", loadedChild.HashKey(), rawChild.HashKey())
 	}
-	loadedHidden, err := loadedChild.PeekRef(0)
+	loadedChildSlice, err := loadedChild.BeginParse()
 	if err != nil {
-		t.Fatalf("load represented leaf through child boundary: %v", err)
+		t.Fatalf("materialize raw child: %v", err)
 	}
-	if loadedHidden.HashKey(0) != hidden.HashKey(0) {
-		t.Fatalf("represented leaf hash mismatch: got=%x want=%x", loadedHidden.HashKey(0), hidden.HashKey(0))
+	loadedChild = loadedChildSlice.BaseCell()
+	loadedPruned, err := loadedChild.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load raw pruned ref: %v", err)
+	}
+	if loadedPruned.HashKey() != pruned.HashKey() {
+		t.Fatalf("loaded pruned hash mismatch: got=%x want=%x", loadedPruned.HashKey(), pruned.HashKey())
 	}
 }
 
-func TestSaveParsedStateCellsBatchKeepsMissingPrunedBoundaryLazy(t *testing.T) {
+func TestSaveParsedStateCellsBatchStoresRawPrunedCell(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1441,125 +2370,28 @@ func TestSaveParsedStateCellsBatchKeepsMissingPrunedBoundaryLazy(t *testing.T) {
 	}
 
 	hidden := cell.BeginCell().MustStoreUInt(0x88, 8).EndCell()
-	hiddenHash := hidden.HashKey(0)
 	pruned := testPrunedBranch(t, hidden)
-	prunedHash := pruned.HashKey()
 	root := cell.BeginCell().MustStoreUInt(0x55, 8).MustStoreRef(pruned).EndCell()
-	parsedCells := []cell.Cell{*root, *pruned}
-
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, parsedCells, uint64(len(parsedCells)))
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, []cell.Cell{*root, *pruned}, 2)
 	if err != nil {
 		t.Fatalf("import parsed state cells: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, prunedHash[:]); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("raw pruned parsed cell body was persisted: %v", err)
-	}
-	if _, err = store.loadLazyCell(ctx, hiddenHash[:]); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("represented pruned boundary placeholder was persisted: %v", err)
-	}
-	if _, err = lazyRoot.PeekRef(0); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("missing represented pruned boundary should stay lazy until resolved: %v", err)
-	}
-}
 
-func TestSaveParsedStateCellsBatchUsesExistingRepresentedCellForPrunedBoundary(t *testing.T) {
-	store, err := Open(Options{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer func() { _ = store.Close() }()
-
-	ctx := context.Background()
-	baseBlock := ton.BlockIDExt{
-		Workchain: -1,
-		Shard:     int64(-1 << 63),
-		SeqNo:     1,
+	assertStateCellExists(t, store, root.HashKey(), true)
+	assertStateCellExists(t, store, pruned.HashKey(), true)
+	if hidden.HashKey(0) != pruned.HashKey() {
+		assertStateCellExists(t, store, hidden.HashKey(0), false)
 	}
 
-	hidden := cell.BeginCell().MustStoreUInt(0x88, 8).EndCell()
-	hiddenHash := hidden.HashKey(0)
-	if _, err = store.ImportStateCellTree(ctx, baseBlock, hidden, nil, 1); err != nil {
-		t.Fatalf("import represented cell: %v", err)
-	}
-
-	pruned := testPrunedBranch(t, hidden)
-	prunedHash := pruned.HashKey()
-	root := cell.BeginCell().MustStoreUInt(0x55, 8).MustStoreRef(pruned).EndCell()
-	parsedCells := []cell.Cell{*root, *pruned}
-
-	block := baseBlock
-	block.SeqNo = 2
-	if _, err = store.ImportStateCellTree(ctx, block, root, parsedCells, uint64(len(parsedCells))); err != nil {
-		t.Fatalf("import parsed state cells: %v", err)
-	}
-	if _, err = store.loadLazyCell(ctx, prunedHash[:]); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("raw pruned parsed cell body was persisted: %v", err)
-	}
-
-	lazyRoot, err := store.loadLazyCell(ctx, root.Hash())
-	if err != nil {
-		t.Fatalf("load parsed root: %v", err)
-	}
 	loadedRef, err := lazyRoot.PeekRef(0)
 	if err != nil {
-		t.Fatalf("load represented ref through parsed parent: %v", err)
+		t.Fatalf("load parsed raw pruned ref: %v", err)
 	}
-	if loadedRef.GetType() == cell.PrunedCellType {
-		t.Fatal("materialized pruned boundary overwrote existing represented cell")
+	if loadedRef.GetType() != cell.PrunedCellType {
+		t.Fatalf("loaded ref type = %d, want pruned", loadedRef.GetType())
 	}
-	if loadedRef.HashKey(0) != hiddenHash {
-		t.Fatalf("represented cell hash mismatch: got=%x want=%x", loadedRef.HashKey(0), hiddenHash)
-	}
-}
-
-func TestSaveParsedStateCellsBatchStoresConcretePrunedParentByLogicalHash(t *testing.T) {
-	store, err := Open(Options{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer func() { _ = store.Close() }()
-
-	ctx := context.Background()
-	block := ton.BlockIDExt{
-		Workchain: -1,
-		Shard:     int64(-1 << 63),
-		SeqNo:     1,
-	}
-
-	hidden := cell.BeginCell().MustStoreUInt(0xcc, 8).EndCell()
-	pruned := testPrunedBranch(t, hidden)
-	rawChild := cell.BeginCell().MustStoreUInt(0xdd, 8).MustStoreRef(pruned).EndCell()
-	if rawChild.Level() == 0 {
-		t.Fatal("test child must have a non-zero level")
-	}
-	logicalChild := rawChild.Virtualize(0)
-	root := cell.BeginCell().MustStoreRef(rawChild).EndCell()
-	parsedCells := []cell.Cell{*root, *rawChild, *pruned, *hidden}
-
-	if _, err = store.ImportStateCellTree(ctx, block, root, parsedCells, uint64(len(parsedCells))); err != nil {
-		t.Fatalf("import parsed state cells: %v", err)
-	}
-	if _, err = store.loadLazyCell(ctx, logicalChild.Hash()); err != nil {
-		t.Fatalf("logical child body was not persisted from parsed batch: %v", err)
-	}
-
-	lazyRoot, err := store.loadLazyCell(ctx, root.Hash())
-	if err != nil {
-		t.Fatalf("load parsed root: %v", err)
-	}
-	loadedChild, err := lazyRoot.PeekRef(0)
-	if err != nil {
-		t.Fatalf("load logical child through parsed parent ref: %v", err)
-	}
-	if loadedChild.HashKey() != logicalChild.HashKey() {
-		t.Fatalf("loaded child hash mismatch: got=%x want=%x", loadedChild.HashKey(), logicalChild.HashKey())
-	}
-	loadedHidden, err := loadedChild.PeekRef(0)
-	if err != nil {
-		t.Fatalf("load represented leaf through parsed child boundary: %v", err)
-	}
-	if loadedHidden.HashKey(0) != hidden.HashKey(0) {
-		t.Fatalf("represented leaf hash mismatch: got=%x want=%x", loadedHidden.HashKey(0), hidden.HashKey(0))
+	if loadedRef.HashKey() != pruned.HashKey() {
+		t.Fatalf("loaded pruned hash mismatch: got=%x want=%x", loadedRef.HashKey(), pruned.HashKey())
 	}
 }
 
@@ -1588,7 +2420,7 @@ func TestSaveStateCellTreeRejectsPrunedRoot(t *testing.T) {
 	}
 }
 
-func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
+func TestSaveStateCellTreeDoesNotValidateMissingLazyBoundary(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1612,6 +2444,11 @@ func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
 	}
+	lazyRightSlice, err := lazyRight.BeginParse()
+	if err != nil {
+		t.Fatalf("materialize lazy right ref: %v", err)
+	}
+	lazyRight = lazyRightSlice.BaseCell()
 	lazyRightMeta := lazyRight.GetMetadata()
 	if len(lazyRightMeta.Refs) != 1 {
 		t.Fatalf("unexpected lazy right refs: got=%d", len(lazyRightMeta.Refs))
@@ -1626,7 +2463,7 @@ func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("route lazy cell shard: %v", err)
 	}
-	if err = shard.db.Delete(cellKey(rightHash[:]), pebble.NoSync); err != nil {
+	if err = shard.db.Delete(rightHash[:], pebble.NoSync); err != nil {
 		t.Fatalf("delete lazy cell: %v", err)
 	}
 	leafHash := lazyLeaf.Hash
@@ -1634,7 +2471,7 @@ func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("route lazy leaf shard: %v", err)
 	}
-	if err = leafShard.db.Delete(cellKey(leafHash[:]), pebble.NoSync); err != nil {
+	if err = leafShard.db.Delete(leafHash[:], pebble.NoSync); err != nil {
 		t.Fatalf("delete lazy leaf: %v", err)
 	}
 	if exists, err := store.cells.has(leafHash[:]); err != nil {
@@ -1650,11 +2487,11 @@ func TestSaveStateCellTreeSkipsMissingVirtualLazyPrunedSubtree(t *testing.T) {
 		block:      nextBlock,
 		root:       newRoot,
 		totalCells: 3,
-	}); err == nil {
-		t.Fatal("state with missing virtual lazy pruned subtree was accepted")
+	}); err != nil {
+		t.Fatalf("save state with missing lazy boundary: %v", err)
 	}
 	if _, err = store.loadLazyCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("virtual lazy pruned subtree was restored from boundary: %v", err)
+		t.Fatalf("lazy boundary was unexpectedly restored: %v", err)
 	}
 }
 
@@ -1682,6 +2519,11 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy right ref: %v", err)
 	}
+	lazyRightSlice, err := lazyRight.BeginParse()
+	if err != nil {
+		t.Fatalf("materialize lazy right ref: %v", err)
+	}
+	lazyRight = lazyRightSlice.BaseCell()
 	if lazyRight.IsLazy() {
 		t.Fatal("expected lazy data cell body")
 	}
@@ -1691,7 +2533,7 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("route lazy cell shard: %v", err)
 	}
-	if err = shard.db.Delete(cellKey(rightHash[:]), pebble.NoSync); err != nil {
+	if err = shard.db.Delete(rightHash[:], pebble.NoSync); err != nil {
 		t.Fatalf("delete lazy data cell: %v", err)
 	}
 

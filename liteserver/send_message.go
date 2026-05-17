@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -69,13 +69,8 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte) error {
 		return err
 	}
 
-	machine := tvm.NewTVM()
-	if err = machine.SetGlobalVersion(config.GlobalVersion); err != nil {
-		return err
-	}
-
 	unpacked, _ := config.Unpacked.(tuple.Tuple)
-	result, err := machine.EmulateTransaction(shardAccount, msgCell, tvm.TransactionEmulationConfig{
+	result, err := s.tvm.EmulateTransaction(shardAccount, msgCell, tvm.TransactionEmulationConfig{
 		Address:             msg.DstAddr,
 		Now:                 header.GenUTime,
 		BlockLT:             int64(header.GenLT),
@@ -109,7 +104,15 @@ func parseExternalMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error)
 	}
 
 	var msg tlb.ExternalMessage
-	if err = tlb.LoadFromCell(&msg, root.BeginParse()); err != nil {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot parse external message: %w", err)
+	}
+	magic, err := loader.PreloadUInt(2)
+	if err != nil || magic != 0b10 {
+		return nil, nil, errors.New("external message must begin with ext_in_msg_info$10")
+	}
+	if err = tlb.LoadFromCell(&msg, loader); err != nil {
 		return nil, nil, fmt.Errorf("cannot parse external message: %w", err)
 	}
 	if msg.DstAddr == nil {
@@ -211,7 +214,11 @@ func emptyShardAccount() *tlb.ShardAccount {
 
 func externalMessageAccountConfig(shard *tlb.ShardAccount) (*cell.Cell, *cell.Dictionary, any, error) {
 	var account tlb.AccountState
-	if err := tlb.LoadFromCell(&account, shard.Account.BeginParse()); err != nil {
+	loader, err := shard.Account.BeginParse()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := tlb.LoadFromCell(&account, loader); err != nil {
 		return nil, nil, nil, err
 	}
 	if !account.IsValid || account.StateInit == nil {

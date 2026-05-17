@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	service2 "flexserver/service"
-	"flexserver/service/p2p"
+	service2 "github.com/xssnick/gton/service"
+	"github.com/xssnick/gton/service/p2p"
 
 	"github.com/xssnick/tonutils-go/ton"
 )

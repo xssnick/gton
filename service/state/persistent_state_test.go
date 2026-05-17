@@ -31,7 +31,7 @@ func TestLoadWorkchainPersistentStateSplitDepth(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			depth, err := loadWorkchainPersistentStateSplitDepth(tt.cell.BeginParse())
+			depth, err := loadWorkchainPersistentStateSplitDepth(tt.cell.MustBeginParse())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -47,7 +47,7 @@ func BenchmarkLoadWorkchainPersistentStateSplitDepth(b *testing.B) {
 
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		depth, err := loadWorkchainPersistentStateSplitDepth(c.BeginParse())
+		depth, err := loadWorkchainPersistentStateSplitDepth(c.MustBeginParse())
 		if err != nil {
 			b.Fatal(err)
 		}

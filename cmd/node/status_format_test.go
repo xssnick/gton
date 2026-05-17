@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	service2 "flexserver/service"
-	"flexserver/service/p2p"
+	service2 "github.com/xssnick/gton/service"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -116,6 +117,68 @@ func TestFormatStatusReadableSections(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("formatted status missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestFormatDBStatusIncludesCellDBShardMetrics(t *testing.T) {
+	out := formatDBStatus(pebblestore.DBStatus{
+		CellGenerations: []pebblestore.CellDBGenerationStatus{
+			{
+				ID:   1,
+				Role: "active",
+				Cache: pebblestore.CellDBCacheStatus{
+					BlockCacheSize:      64 << 20,
+					BlockCacheHits:      90,
+					BlockCacheMisses:    10,
+					FileCacheSize:       32 << 20,
+					FileCacheTableCount: 12,
+				},
+				Shards: []pebblestore.CellDBShardStatus{
+					{
+						Shard:                    0,
+						DiskSize:                 10 << 30,
+						LiveSize:                 9 << 30,
+						LiveTables:               120,
+						ReadAmp:                  7,
+						L0Files:                  4,
+						L0Sublevels:              3,
+						L0Size:                   512 << 20,
+						CompactionDebt:           2 << 30,
+						CompactionsInProgress:    1,
+						CompactionInProgressSize: 256 << 20,
+						MemTableSize:             16 << 20,
+						MemTableCount:            2,
+						TableIters:               3,
+						Flushes:                  4,
+						Ingests:                  5,
+					},
+				},
+				Total: pebblestore.CellDBShardStatus{
+					Shard:       -1,
+					DiskSize:    10 << 30,
+					LiveSize:    9 << 30,
+					LiveTables:  120,
+					ReadAmp:     7,
+					L0Files:     4,
+					L0Sublevels: 3,
+				},
+			},
+		},
+	})
+
+	for _, want := range []string{
+		"DB Status\n\nCell DB\n",
+		"generation 1 role=active",
+		"cache block=64.0MiB file=32.0MiB file_tables=12 block_hit=90.0%",
+		"shard",
+		"0",
+		"4/3",
+		"1/256MiB",
+		"total",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("formatted db status missing %q:\n%s", want, out)
 		}
 	}
 }

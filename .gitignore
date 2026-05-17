@@ -1,6 +1,7 @@
 cppnode
-node
 config.json
 global.config.json
 data/
 .idea
+*.sh
+.DS_Store

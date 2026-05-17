@@ -3,8 +3,9 @@ package blocksync
 import (
 	"context"
 	"encoding/hex"
-	"flexserver/internal/logutil"
-	"flexserver/service/p2p"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"sync"
 	"time"
@@ -14,10 +15,11 @@ import (
 )
 
 const (
-	defaultOutputBuffer = 256
-	defaultRetryCount   = 3
-	defaultRetryDelay   = 500 * time.Millisecond
-	masterchainShard    = int64(-1 << 63)
+	defaultOutputBuffer           = 256
+	defaultShardDescriptionBuffer = 1024
+	defaultRetryCount             = 3
+	defaultRetryDelay             = 500 * time.Millisecond
+	masterchainShard              = int64(-1 << 63)
 )
 
 type Source interface {
@@ -57,12 +59,13 @@ func (b SyncedBlock) ackResult(accepted bool) {
 }
 
 type Service struct {
-	log        zerolog.Logger
-	source     Source
-	fetcher    Fetcher
-	out        chan SyncedBlock
-	retryCount int
-	retryDelay time.Duration
+	log               zerolog.Logger
+	source            Source
+	fetcher           Fetcher
+	out               chan SyncedBlock
+	shardDescriptions chan p2p.BroadcastEvent
+	retryCount        int
+	retryDelay        time.Duration
 
 	chains map[string]*chain
 }
@@ -82,13 +85,14 @@ type chain struct {
 
 func New(logger *zerolog.Logger, source Source, fetcher Fetcher) *Service {
 	return &Service{
-		log:        logutil.WithComponent(logger, "blocksync"),
-		source:     source,
-		fetcher:    fetcher,
-		out:        make(chan SyncedBlock, defaultOutputBuffer),
-		retryCount: defaultRetryCount,
-		retryDelay: defaultRetryDelay,
-		chains:     map[string]*chain{},
+		log:               logutil.WithComponent(logger, "blocksync"),
+		source:            source,
+		fetcher:           fetcher,
+		out:               make(chan SyncedBlock, defaultOutputBuffer),
+		shardDescriptions: make(chan p2p.BroadcastEvent, defaultShardDescriptionBuffer),
+		retryCount:        defaultRetryCount,
+		retryDelay:        defaultRetryDelay,
+		chains:            map[string]*chain{},
 	}
 }
 
@@ -106,7 +110,7 @@ func (f NodeFetcher) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt
 		return p2p.DownloadedBlock{}, err
 	}
 	if downloaded == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("download block %s: empty response", formatBlockRef(block))
+		return p2p.DownloadedBlock{}, fmt.Errorf("download block %s: empty response", storage.FormatBlockRef(block))
 	}
 
 	return *downloaded, nil
@@ -118,7 +122,7 @@ func (f NodeFetcher) DownloadNextBlockFull(ctx context.Context, prev ton.BlockID
 		return p2p.DownloadedBlock{}, err
 	}
 	if downloaded == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("download next block after %s: empty response", formatBlockRef(prev))
+		return p2p.DownloadedBlock{}, fmt.Errorf("download next block after %s: empty response", storage.FormatBlockRef(prev))
 	}
 
 	return *downloaded, nil
@@ -126,6 +130,10 @@ func (f NodeFetcher) DownloadNextBlockFull(ctx context.Context, prev ton.BlockID
 
 func (s *Service) Blocks() <-chan SyncedBlock {
 	return s.out
+}
+
+func (s *Service) ShardDescriptions() <-chan p2p.BroadcastEvent {
+	return s.shardDescriptions
 }
 
 func (s *Service) Run(ctx context.Context) {
@@ -136,6 +144,7 @@ func (s *Service) Run(ctx context.Context) {
 		}
 		wg.Wait()
 		close(s.out)
+		close(s.shardDescriptions)
 	}()
 
 	for {
@@ -148,6 +157,9 @@ func (s *Service) Run(ctx context.Context) {
 			}
 
 			if s.emitDirectMasterchainBroadcast(ctx, ev) {
+				continue
+			}
+			if s.emitShardDescriptionBroadcast(ev) {
 				continue
 			}
 			if !isMasterchainBlock(ev.Block) {
@@ -184,6 +196,22 @@ func (s *Service) emitDirectMasterchainBroadcast(ctx context.Context, ev p2p.Bro
 		Downloaded: downloaded,
 		CatchUp:    false,
 	})
+	return true
+}
+
+func (s *Service) emitShardDescriptionBroadcast(ev p2p.BroadcastEvent) bool {
+	if ev.Kind != "tonNode.newShardBlockBroadcast" || ev.ShardDescription == nil || isMasterchainBlock(ev.Block) {
+		return false
+	}
+
+	select {
+	case s.shardDescriptions <- ev:
+	default:
+		s.log.Debug().
+			Str("block", ev.BlockRef()).
+			Str("overlay", ev.Overlay).
+			Msg("dropping shard description broadcast because queue is full")
+	}
 	return true
 }
 
@@ -337,7 +365,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 	if ev.Block.SeqNo == c.last.SeqNo {
 		if !c.last.Equals(&ev.Block) {
 			c.service.log.Debug().
-				Str("expected", formatBlockRef(*c.last)).
+				Str("expected", storage.FormatBlockRef(*c.last)).
 				Str("got", ev.BlockRef()).
 				Str("expected_root_hash", formatHashPrefix(c.last.RootHash)).
 				Str("expected_file_hash", formatHashPrefix(c.last.FileHash)).
@@ -362,7 +390,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 
 		if downloaded.ID.SeqNo <= prev.SeqNo {
 			c.service.log.Warn().
-				Str("from", formatBlockRef(prev)).
+				Str("from", storage.FormatBlockRef(prev)).
 				Str("got", downloaded.BlockRef()).
 				Str("overlay", ev.Overlay).
 				Str("kind", ev.Kind).
@@ -372,7 +400,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 
 		if chainKey(downloaded.ID) != c.key {
 			c.service.log.Warn().
-				Str("from", formatBlockRef(prev)).
+				Str("from", storage.FormatBlockRef(prev)).
 				Str("got", downloaded.BlockRef()).
 				Str("target", ev.BlockRef()).
 				Str("overlay", ev.Overlay).
@@ -397,7 +425,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 	if !c.last.Equals(&ev.Block) {
 		if sameBlockPosition(*c.last, ev.Block) {
 			c.service.log.Debug().
-				Str("downloaded", formatBlockRef(*c.last)).
+				Str("downloaded", storage.FormatBlockRef(*c.last)).
 				Str("broadcast", ev.BlockRef()).
 				Str("downloaded_root_hash", formatHashPrefix(c.last.RootHash)).
 				Str("downloaded_file_hash", formatHashPrefix(c.last.FileHash)).
@@ -410,7 +438,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 		}
 
 		c.service.log.Warn().
-			Str("downloaded", formatBlockRef(*c.last)).
+			Str("downloaded", storage.FormatBlockRef(*c.last)).
 			Str("broadcast", ev.BlockRef()).
 			Str("overlay", ev.Overlay).
 			Str("kind", ev.Kind).
@@ -456,7 +484,7 @@ func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, pre
 	}
 	if fullBlockBroadcastKind(ev.Kind) && ev.Block.SeqNo == prev.SeqNo+1 {
 		c.service.log.Debug().
-			Str("from", formatBlockRef(prev)).
+			Str("from", storage.FormatBlockRef(prev)).
 			Str("target", ev.BlockRef()).
 			Str("overlay", ev.Overlay).
 			Str("kind", ev.Kind).
@@ -475,7 +503,7 @@ func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, pre
 
 		c.service.log.Debug().
 			Err(err).
-			Str("from", formatBlockRef(prev)).
+			Str("from", storage.FormatBlockRef(prev)).
 			Str("target", ev.BlockRef()).
 			Str("overlay", ev.Overlay).
 			Str("kind", ev.Kind).
@@ -522,13 +550,13 @@ func (s *Service) emitAsync(ctx context.Context, block *SyncedBlock) bool {
 }
 
 func (s *Service) downloadBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	return s.downloadWithRetry(ctx, fmt.Sprintf("download block %s", formatBlockRef(block)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
+	return s.downloadWithRetry(ctx, fmt.Sprintf("download block %s", storage.FormatBlockRef(block)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
 		return s.fetcher.DownloadBlockFull(ctx, block)
 	})
 }
 
 func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	return s.downloadWithRetry(ctx, fmt.Sprintf("download next block after %s", formatBlockRef(prev)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
+	return s.downloadWithRetry(ctx, fmt.Sprintf("download next block after %s", storage.FormatBlockRef(prev)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
 		return s.fetcher.DownloadNextBlockFull(ctx, prev)
 	})
 }
@@ -572,10 +600,6 @@ func chainKey(block ton.BlockIDExt) string {
 
 func sameBlockPosition(a, b ton.BlockIDExt) bool {
 	return a.Workchain == b.Workchain && a.Shard == b.Shard && a.SeqNo == b.SeqNo
-}
-
-func formatBlockRef(block ton.BlockIDExt) string {
-	return fmt.Sprintf("wc=%d shard=%016x seqno=%d", block.Workchain, uint64(block.Shard), block.SeqNo)
 }
 
 func formatHashPrefix(hash []byte) string {

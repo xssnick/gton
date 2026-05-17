@@ -112,6 +112,41 @@ func FormatLevelOverrides(overrides map[string]zerolog.Level) string {
 	return strings.Join(parts, ",")
 }
 
+func FormatByteRate(bytes int64, elapsed time.Duration) string {
+	if bytes <= 0 || elapsed <= 0 {
+		return "0 B/s"
+	}
+
+	rate := float64(bytes) / elapsed.Seconds()
+	units := []string{"B/s", "KB/s", "MB/s", "GB/s"}
+	unit := 0
+	for rate >= 1024 && unit < len(units)-1 {
+		rate /= 1024
+		unit++
+	}
+
+	if unit == 0 {
+		return fmt.Sprintf("%.0f %s", rate, units[unit])
+	}
+	return fmt.Sprintf("%.2f %s", rate, units[unit])
+}
+
+func FormatCellRate(cells uint64, elapsed time.Duration) string {
+	if cells == 0 || elapsed <= 0 {
+		return "0 cells/s"
+	}
+
+	rate := float64(cells) / elapsed.Seconds()
+	switch {
+	case rate >= 1_000_000:
+		return fmt.Sprintf("%.2f Mcells/s", rate/1_000_000)
+	case rate >= 1_000:
+		return fmt.Sprintf("%.2f Kcells/s", rate/1_000)
+	default:
+		return fmt.Sprintf("%.0f cells/s", rate)
+	}
+}
+
 func (f Factory) Category(category string) zerolog.Logger {
 	return newLogger(f.writer, f.LevelFor(category))
 }

@@ -1,12 +1,14 @@
 package service
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -124,17 +126,22 @@ func merkleUpdateToRef(update *cell.Cell) (*cell.Cell, error) {
 	if update == nil {
 		return nil, fmt.Errorf("merkle update cell is nil")
 	}
+	loader, err := update.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("load merkle update cell: %w", err)
+	}
+	update = loader.BaseCell()
 	if update.Level() != 0 {
 		return nil, fmt.Errorf("merkle update has non-zero level")
 	}
 	if update.GetType() != cell.MerkleUpdateCellType {
 		return nil, fmt.Errorf("not a MerkleUpdate cell")
 	}
-	if update.RefsNum() != 2 {
+	if loader.RefsNum() != 2 {
 		return nil, fmt.Errorf("wrong references count for a merkle update special cell")
 	}
 
-	updateTo, err := update.PeekRef(1)
+	updateTo, err := loader.PeekRefCellAt(1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load merkle update second ref: %w", err)
 	}
@@ -170,33 +177,23 @@ func (c *stateCellEncodedCache) addRecords(records map[cell.Hash][]byte) {
 	c.mu.Unlock()
 }
 
-func (c *stateCellEncodedCache) rememberReachable(root *cell.Cell) error {
-	records, err := storage.PrepareReachableStateCells(root)
-	if err != nil {
-		return err
-	}
-	c.addRecords(records)
-	return nil
-}
-
-func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, bool, error) {
+func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, error) {
 	if c == nil {
-		return nil, false, nil
+		return nil, storage.ErrNotFound
 	}
 
 	c.mu.RLock()
 	encoded := c.records[hash]
 	c.mu.RUnlock()
 	if len(encoded) == 0 {
-		return nil, false, nil
+		return nil, storage.ErrNotFound
 	}
 
-	record := storage.DecodeCellRecordTrusted(cellHashBytes(hash), encoded)
-	loaded, err := storage.LazyCellRecord(record, loader)
+	loaded, err := cachedLazyCell(hash, encoded, loader)
 	if err != nil {
-		return nil, true, fmt.Errorf("create cached lazy cell %x: %w", hash[:], err)
+		return nil, fmt.Errorf("create cached lazy cell %x: %w", hash[:], err)
 	}
-	return loaded, true, nil
+	return loaded, nil
 }
 
 func (c *stateCellEncodedCache) appendRecords(records []storage.EncodedCellRecord, seen map[cell.Hash]struct{}) []storage.EncodedCellRecord {
@@ -227,17 +224,7 @@ func (c *stateCellEncodedCache) len() int {
 	return len(c.records)
 }
 
-func cellHashBytes(hash cell.Hash) []byte {
-	out := make([]byte, len(hash))
-	copy(out, hash[:])
-	return out
-}
-
 func (w *stateCellWindowCache) applyMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared map[cell.Hash][]byte) (*cell.Cell, error) {
-	if err := cell.ValidateMerkleUpdate(update); err != nil {
-		return nil, err
-	}
-
 	updateTo, err := merkleUpdateToRef(update)
 	if err != nil {
 		return nil, err
@@ -272,12 +259,11 @@ func (w *stateCellWindowCache) rememberApplied(root *cell.Cell, prepared map[cel
 		return fmt.Errorf("prepared state update cells are missing")
 	}
 
-	active := w.activeCache()
 	hash := root.GetMetadata().Hash
 	if len(prepared[hash]) == 0 {
 		return fmt.Errorf("prepared state update cells do not contain destination root %x", hash[:])
 	}
-	active.addRecords(prepared)
+	w.addPreparedRecords(prepared)
 	return nil
 }
 
@@ -298,24 +284,27 @@ func (w *stateCellWindowCache) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, e
 	return loaded, nil
 }
 
-func (w *stateCellWindowCache) activeCache() *stateCellEncodedCache {
-	if w == nil {
-		return nil
+func (w *stateCellWindowCache) addPreparedRecords(records map[cell.Hash][]byte) {
+	if w == nil || len(records) == 0 {
+		return
 	}
 
 	w.mu.RLock()
 	active := w.active
-	w.mu.RUnlock()
 	if active != nil {
-		return active
+		active.addRecords(records)
+		w.mu.RUnlock()
+		return
 	}
+	w.mu.RUnlock()
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	if w.active == nil {
 		w.active = newStateCellEncodedCache(4096)
 	}
-	return w.active
+	w.active.addRecords(records)
 }
 
 func (w *stateCellWindowCache) loader() cell.LazyCellLoader {
@@ -326,12 +315,20 @@ func (w *stateCellWindowCache) loader() cell.LazyCellLoader {
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
 		active, pending, base := w.loaderSources()
-		if loaded, ok, err := active.loadWith(hash, load); ok || err != nil {
-			return loaded, err
+		loaded, err := active.loadWith(hash, load)
+		if err == nil {
+			return loaded, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
 		}
 		for _, cache := range pending {
-			if loaded, ok, err := cache.loadWith(hash, load); ok || err != nil {
-				return loaded, err
+			loaded, err = cache.loadWith(hash, load)
+			if err == nil {
+				return loaded, nil
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				return nil, err
 			}
 		}
 
@@ -347,7 +344,10 @@ func (w *stateCellWindowCache) loaderSources() (*stateCellEncodedCache, []*state
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	pending := append([]*stateCellEncodedCache(nil), w.pending...)
+	var pending []*stateCellEncodedCache
+	if len(w.pending) > 0 {
+		pending = append([]*stateCellEncodedCache(nil), w.pending...)
+	}
 	return w.active, pending, w.base
 }
 
@@ -431,24 +431,23 @@ func (c *archiveStateCellRecordCache) addRecords(records map[cell.Hash][]byte) {
 	c.mu.Unlock()
 }
 
-func (c *archiveStateCellRecordCache) loadWith(hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, bool, error) {
+func (c *archiveStateCellRecordCache) loadWith(hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, error) {
 	if c == nil {
-		return nil, false, nil
+		return nil, storage.ErrNotFound
 	}
 
 	c.mu.RLock()
 	encoded := c.records[hash]
 	c.mu.RUnlock()
 	if len(encoded) == 0 {
-		return nil, false, nil
+		return nil, storage.ErrNotFound
 	}
 
-	record := storage.DecodeCellRecordTrusted(cellHashBytes(hash), encoded)
-	loaded, err := storage.LazyCellRecord(record, loader)
+	loaded, err := cachedLazyCell(hash, encoded, loader)
 	if err != nil {
-		return nil, true, fmt.Errorf("create cached archive lazy cell %x: %w", hash[:], err)
+		return nil, fmt.Errorf("create cached archive lazy cell %x: %w", hash[:], err)
 	}
-	return loaded, true, nil
+	return loaded, nil
 }
 
 func (c *archiveStateCellRecordCache) appendRecords(records []storage.EncodedCellRecord, seen map[cell.Hash]struct{}) []storage.EncodedCellRecord {
@@ -486,28 +485,6 @@ func (w archiveStateCellApplier) applyBlockStateUpdate(previous []*storage.Block
 	return w.overlay.applyPreparedMerkleUpdate(previous, downloaded.Parsed.StateUpdate, downloaded.StateUpdateToCells, w.stats, downloaded.StateUpdateToCellsElapsed)
 }
 
-func (w *archiveStateCellOverlay) applyMerkleUpdate(previous []*storage.BlockState, update *cell.Cell) (*cell.Cell, error) {
-	return w.applyMerkleUpdateWithStats(previous, update, nil)
-}
-
-func (w *archiveStateCellOverlay) applyMerkleUpdateWithStats(previous []*storage.BlockState, update *cell.Cell, stats *archiveStateCellApplyStats) (*cell.Cell, error) {
-	if err := cell.ValidateMerkleUpdate(update); err != nil {
-		return nil, err
-	}
-
-	updateTo, err := merkleUpdateToRef(update)
-	if err != nil {
-		return nil, err
-	}
-	nextRoot := updateTo.Virtualize(0)
-	started := time.Now()
-	prepared, err := storage.PrepareReachableStateCells(nextRoot)
-	if err != nil {
-		return nil, err
-	}
-	return w.applyPreparedMerkleUpdateToRoot(previous, update, nextRoot, prepared, stats, time.Since(started))
-}
-
 func (w *archiveStateCellOverlay) applyPreparedMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared map[cell.Hash][]byte, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) (*cell.Cell, error) {
 	if len(prepared) == 0 {
 		return nil, fmt.Errorf("archive block state update target cells are not prepared")
@@ -537,7 +514,7 @@ func (w *archiveStateCellOverlay) applyPreparedMerkleUpdateToRoot(previous []*st
 }
 
 func (w *archiveStateCellOverlay) applyBlockStateUpdate(previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
-	return w.applyMerkleUpdateWithStats(previous, downloaded.Parsed.StateUpdate, nil)
+	return w.applyPreparedMerkleUpdate(previous, downloaded.Parsed.StateUpdate, downloaded.StateUpdateToCells, nil, downloaded.StateUpdateToCellsElapsed)
 }
 
 func (w *archiveStateCellOverlay) rememberPrepared(root *cell.Cell, prepared map[cell.Hash][]byte, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) error {
@@ -549,7 +526,7 @@ func (w *archiveStateCellOverlay) rememberPrepared(root *cell.Cell, prepared map
 	if len(prepared[hash]) == 0 {
 		return fmt.Errorf("archive state cell overlay does not contain destination root %x", hash[:])
 	}
-	w.activeCache().addRecords(prepared)
+	w.addPreparedRecords(prepared)
 	stats.observe(len(prepared), prepareElapsed)
 	return nil
 }
@@ -558,7 +535,7 @@ func (w *archiveStateCellOverlay) rememberPreparedCells(prepared map[cell.Hash][
 	if w == nil || len(prepared) == 0 {
 		return
 	}
-	w.activeCache().addRecords(prepared)
+	w.addPreparedRecords(prepared)
 }
 
 func (w *archiveStateCellOverlay) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, error) {
@@ -578,24 +555,27 @@ func (w *archiveStateCellOverlay) reloadAppliedRoot(root *cell.Cell) (*cell.Cell
 	return loaded, nil
 }
 
-func (w *archiveStateCellOverlay) activeCache() *archiveStateCellRecordCache {
-	if w == nil {
-		return nil
+func (w *archiveStateCellOverlay) addPreparedRecords(records map[cell.Hash][]byte) {
+	if w == nil || len(records) == 0 {
+		return
 	}
 
 	w.mu.RLock()
 	active := w.active
-	w.mu.RUnlock()
 	if active != nil {
-		return active
+		active.addRecords(records)
+		w.mu.RUnlock()
+		return
 	}
+	w.mu.RUnlock()
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	if w.active == nil {
 		w.active = newArchiveStateCellRecordCache(4096)
 	}
-	return w.active
+	w.active.addRecords(records)
 }
 
 func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
@@ -606,12 +586,20 @@ func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
 		active, pending, base := w.loaderSources()
-		if loaded, ok, err := active.loadWith(hash, load); ok || err != nil {
-			return loaded, err
+		loaded, err := active.loadWith(hash, load)
+		if err == nil {
+			return loaded, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
 		}
 		for _, cache := range pending {
-			if loaded, ok, err := cache.loadWith(hash, load); ok || err != nil {
-				return loaded, err
+			loaded, err = cache.loadWith(hash, load)
+			if err == nil {
+				return loaded, nil
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				return nil, err
 			}
 		}
 
@@ -623,11 +611,19 @@ func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
 	return load
 }
 
+func cachedLazyCell(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
+	record := storage.DecodeCellRecordTrusted(hash[:], encoded)
+	return storage.LazyCellRecord(record, loader)
+}
+
 func (w *archiveStateCellOverlay) loaderSources() (*archiveStateCellRecordCache, []*archiveStateCellRecordCache, cell.LazyCellLoader) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	pending := append([]*archiveStateCellRecordCache(nil), w.pending...)
+	var pending []*archiveStateCellRecordCache
+	if len(w.pending) > 0 {
+		pending = append([]*archiveStateCellRecordCache(nil), w.pending...)
+	}
 	return w.active, pending, w.base
 }
 
@@ -672,6 +668,27 @@ func (c *archiveStateCellCheckpoint) records() []storage.EncodedCellRecord {
 	return records
 }
 
+func (c *archiveStateCellCheckpoint) loader() cell.LazyCellLoader {
+	if c == nil || len(c.caches) == 0 {
+		return nil
+	}
+
+	var load cell.LazyCellLoader
+	load = func(hash cell.Hash) (*cell.Cell, error) {
+		for _, cache := range c.caches {
+			loaded, err := cache.loadWith(hash, load)
+			if err == nil {
+				return loaded, nil
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				return nil, err
+			}
+		}
+		return nil, storage.ErrNotFound
+	}
+	return load
+}
+
 func (c *archiveStateCellCheckpoint) complete() {
 	if c == nil || c.window == nil || len(c.caches) == 0 {
 		return
@@ -703,7 +720,7 @@ func previousStateRootWithLoader(previous []*storage.BlockState, loader cell.Laz
 		if current == nil {
 			return nil, fmt.Errorf("current state is nil")
 		}
-		return stateRootWithLoader(current.Cell, loader)
+		return stateRootWithLoader(current, loader)
 	case 2:
 		left := previous[0]
 		right := previous[1]
@@ -711,11 +728,11 @@ func previousStateRootWithLoader(previous []*storage.BlockState, loader cell.Laz
 			return nil, fmt.Errorf("merge previous state is nil")
 		}
 
-		leftRoot, err := stateRootWithLoader(left.Cell, loader)
+		leftRoot, err := stateRootWithLoader(left, loader)
 		if err != nil {
 			return nil, fmt.Errorf("load left merge state root: %w", err)
 		}
-		rightRoot, err := stateRootWithLoader(right.Cell, loader)
+		rightRoot, err := stateRootWithLoader(right, loader)
 		if err != nil {
 			return nil, fmt.Errorf("load right merge state root: %w", err)
 		}
@@ -730,12 +747,19 @@ func previousStateRootWithLoader(previous []*storage.BlockState, loader cell.Laz
 	}
 }
 
-func stateRootWithLoader(root *cell.Cell, loader cell.LazyCellLoader) (*cell.Cell, error) {
+func stateRootWithLoader(state *storage.BlockState, loader cell.LazyCellLoader) (*cell.Cell, error) {
+	root := state.Cell
 	if root == nil {
 		return nil, fmt.Errorf("current state cell is missing")
 	}
 
 	view := root.Virtualize(0)
+	if len(state.StateRootHash) > 0 {
+		rootHash := view.HashKey(0)
+		if !bytes.Equal(rootHash[:], state.StateRootHash) {
+			return nil, fmt.Errorf("current state root hash mismatch for %s: got=%x want=%x", storage.FormatBlockRef(state.Block), rootHash[:], state.StateRootHash)
+		}
+	}
 	record, err := storage.CellRecordFromCellMetadata(view, view.GetMetadata())
 	if err != nil {
 		return nil, err

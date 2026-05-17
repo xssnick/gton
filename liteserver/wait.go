@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
@@ -17,6 +17,24 @@ const errCodeTimeout int32 = 652
 
 type masterchainSeqnoWaiter interface {
 	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error
+}
+
+type queryLogTiming struct {
+	query        string
+	sequence     string
+	duration     time.Duration
+	waitDuration time.Duration
+}
+
+func (t queryLogTiming) queryName() string {
+	if t.query == "" {
+		return "unknown"
+	}
+	return t.query
+}
+
+func (t queryLogTiming) totalDuration() time.Duration {
+	return t.duration + t.waitDuration
 }
 
 func (s *Server) handleQueryData(ctx context.Context, data any) tl.Serializable {
@@ -38,6 +56,38 @@ func (s *Server) handleQueryData(ctx context.Context, data any) tl.Serializable 
 	}
 }
 
+func (s *Server) handleQueryDataWithTiming(ctx context.Context, data any) (tl.Serializable, queryLogTiming) {
+	switch q := data.(type) {
+	case liteclient.LiteServerQuery:
+		return s.handleQueryDataWithTiming(ctx, q.Data)
+	case liteclient.LiteServerQueryPrefix:
+		started := time.Now()
+		resp := ton.LSError{Code: errCodeProtoViolation, Text: "missing liteserver function after queryPrefix"}
+		return resp, queryLogTiming{query: liteserverTypeName(q), duration: time.Since(started)}
+	case tl.Raw:
+		started := time.Now()
+		items, err := parseQuerySequence(q)
+		if err != nil {
+			resp := ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
+			return resp, queryLogTiming{query: "raw", duration: time.Since(started)}
+		}
+		return s.handleQuerySequenceWithTiming(ctx, items)
+	case []tl.Serializable:
+		return s.handleQuerySequenceWithTiming(ctx, q)
+	default:
+		return s.handleStandaloneQueryWithTiming(ctx, q)
+	}
+}
+
+func (s *Server) handleStandaloneQueryWithTiming(ctx context.Context, query any) (tl.Serializable, queryLogTiming) {
+	started := time.Now()
+	resp := s.handleQuery(ctx, query)
+	return resp, queryLogTiming{
+		query:    liteserverQueryLogName(query),
+		duration: time.Since(started),
+	}
+}
+
 func parseQuerySequence(raw tl.Raw) ([]tl.Serializable, error) {
 	data := []byte(raw)
 	items := make([]tl.Serializable, 0, 2)
@@ -54,6 +104,56 @@ func parseQuerySequence(raw tl.Raw) ([]tl.Serializable, error) {
 		return nil, fmt.Errorf("empty liteserver query")
 	}
 	return items, nil
+}
+
+func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.Serializable) (tl.Serializable, queryLogTiming) {
+	sequence := liteserverQuerySequenceLogName(items)
+	if len(items) == 0 {
+		resp := ton.LSError{Code: errCodeProtoViolation, Text: "empty liteserver query"}
+		return resp, queryLogTiming{query: "empty", sequence: sequence}
+	}
+
+	var waitDuration time.Duration
+	for i, item := range items {
+		switch q := item.(type) {
+		case liteclient.LiteServerQueryPrefix:
+			continue
+		case ton.WaitMasterchainSeqno:
+			started := time.Now()
+			errResp := s.waitMasterchainSeqno(ctx, q)
+			waitDuration += time.Since(started)
+			if errResp != nil {
+				return *errResp, queryLogTiming{
+					query:        liteserverTypeName(q),
+					sequence:     sequence,
+					waitDuration: waitDuration,
+				}
+			}
+		case liteclient.LiteServerQuery:
+			if i != len(items)-1 {
+				resp := ton.LSError{Code: errCodeProtoViolation, Text: "unexpected query after liteServer.query"}
+				return resp, queryLogTiming{query: liteserverTypeName(q), sequence: sequence, waitDuration: waitDuration}
+			}
+
+			resp, timing := s.handleQueryDataWithTiming(ctx, q.Data)
+			timing.sequence = sequence
+			timing.waitDuration += waitDuration
+			return resp, timing
+		default:
+			if i != len(items)-1 {
+				resp := ton.LSError{Code: errCodeProtoViolation, Text: "unexpected query after liteserver function"}
+				return resp, queryLogTiming{query: liteserverQueryLogName(item), sequence: sequence, waitDuration: waitDuration}
+			}
+
+			resp, timing := s.handleStandaloneQueryWithTiming(ctx, item)
+			timing.sequence = sequence
+			timing.waitDuration += waitDuration
+			return resp, timing
+		}
+	}
+
+	resp := ton.LSError{Code: errCodeProtoViolation, Text: "missing liteserver function after waitMasterchainSeqno"}
+	return resp, queryLogTiming{query: "missing", sequence: sequence, waitDuration: waitDuration}
 }
 
 func (s *Server) handleQuerySequence(ctx context.Context, items []tl.Serializable) tl.Serializable {

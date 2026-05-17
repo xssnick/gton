@@ -21,6 +21,7 @@ func TestIntegrationReceivesBroadcasts(t *testing.T) {
 	node, err := New(Options{
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -62,6 +63,7 @@ func TestIntegrationDownloadsBlockFull(t *testing.T) {
 	node, err := New(Options{
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -109,6 +111,7 @@ func TestIntegrationDownloadsNextBlockFull(t *testing.T) {
 	node, err := New(Options{
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

@@ -21,13 +21,18 @@ type decodedCellCache struct {
 type decodedCellCacheShard struct {
 	mu       sync.Mutex
 	capacity int
-	items    map[[32]byte]*list.Element
+	items    map[decodedCellCacheKey]*list.Element
 	order    *list.List
 }
 
 type decodedCellCacheEntry struct {
-	key  [32]byte
+	key  decodedCellCacheKey
 	cell *cell.Cell
+}
+
+type decodedCellCacheKey struct {
+	generation uint64
+	hash       [32]byte
 }
 
 func newDecodedCellCache(cellCacheBytes int64) *decodedCellCache {
@@ -47,20 +52,20 @@ func newDecodedCellCache(cellCacheBytes int64) *decodedCellCache {
 	for i := range cache.shards {
 		cache.shards[i] = decodedCellCacheShard{
 			capacity: perShard,
-			items:    make(map[[32]byte]*list.Element, perShard),
+			items:    make(map[decodedCellCacheKey]*list.Element, perShard),
 			order:    list.New(),
 		}
 	}
 	return cache
 }
 
-func (c *decodedCellCache) get(hash []byte) (*cell.Cell, bool) {
+func (c *decodedCellCache) get(generation uint64, hash []byte) (*cell.Cell, bool) {
 	if c == nil || len(hash) != 32 {
 		return nil, false
 	}
 
-	key := decodedCellCacheKey(hash)
-	shard := &c.shards[key[0]&byte(decodedCellCacheShards-1)]
+	key := newDecodedCellCacheKey(generation, hash)
+	shard := &c.shards[key.hash[0]&byte(decodedCellCacheShards-1)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -73,13 +78,13 @@ func (c *decodedCellCache) get(hash []byte) (*cell.Cell, bool) {
 	return entry.cell, true
 }
 
-func (c *decodedCellCache) set(hash []byte, loaded *cell.Cell) {
+func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell) {
 	if c == nil || loaded == nil || len(hash) != 32 {
 		return
 	}
 
-	key := decodedCellCacheKey(hash)
-	shard := &c.shards[key[0]&byte(decodedCellCacheShards-1)]
+	key := newDecodedCellCacheKey(generation, hash)
+	shard := &c.shards[key.hash[0]&byte(decodedCellCacheShards-1)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -102,8 +107,9 @@ func (c *decodedCellCache) set(hash []byte, loaded *cell.Cell) {
 	}
 }
 
-func decodedCellCacheKey(hash []byte) [32]byte {
-	var key [32]byte
-	copy(key[:], hash)
+func newDecodedCellCacheKey(generation uint64, hash []byte) decodedCellCacheKey {
+	var key decodedCellCacheKey
+	key.generation = generation
+	copy(key.hash[:], hash)
 	return key
 }

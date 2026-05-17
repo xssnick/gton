@@ -1,7 +1,7 @@
 package p2p
 
 import (
-	"flexserver/service/archive"
+	"github.com/xssnick/gton/service/archive"
 	"testing"
 	"time"
 
@@ -36,34 +36,6 @@ func TestArchivePeerDenylistFiltersOnlyArchivePool(t *testing.T) {
 	got = sub.availableArchivePeers(basechain, []*overlayPeer{peerA, peerB})
 	if len(got) != 2 {
 		t.Fatalf("expired denylist entry was not restored: %#v", got)
-	}
-}
-
-func TestArchivePeerDenylistClearsStickyPeer(t *testing.T) {
-	sub := &overlaySubscription{
-		log:          discardLogger(),
-		archivePeers: map[string]*archivePeerState{},
-	}
-	shard := archive.ShardID{Workchain: 0, Shard: topShard}
-	peerA := &overlayPeer{id: "peer-a", addr: "peer-a"}
-	peerB := &overlayPeer{id: "peer-b", addr: "peer-b"}
-	state := sub.archivePeerState(archivePeerPoolKey(shard))
-	state.peer = peerA
-	state.speed = 42
-
-	sub.denyArchivePeer(shard, peerA, "test")
-
-	if got := sub.currentArchivePeer(shard, []*overlayPeer{peerA, peerB}); got != nil {
-		t.Fatalf("denied sticky peer should not be reused: %#v", got)
-	}
-
-	available := sub.availableArchivePeers(shard, []*overlayPeer{peerA, peerB})
-	if len(available) != 1 || available[0] != peerB {
-		t.Fatalf("unexpected available peers after sticky deny: %#v", available)
-	}
-
-	if got := sub.chooseArchivePeer(shard, available); got != peerB {
-		t.Fatalf("expected non-denied peer to be selected, got %#v", got)
 	}
 }
 
@@ -146,69 +118,141 @@ func TestArchiveQueryCandidatesSkipDeadKnownPeers(t *testing.T) {
 	}
 }
 
-func TestShouldRaceArchiveDownloadForUnknownOrMediocrePeer(t *testing.T) {
+func TestArchiveSmallSeedDoesNotUpdatePeerSpeed(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
-	unknown := &overlayPeer{id: "unknown", addr: "unknown", alive: true}
-	alternative := &overlayPeer{id: "alternative", addr: "alternative", alive: true}
+	peer := &overlayPeer{id: "peer", addr: "peer", alive: true}
 
-	if !shouldRaceArchiveDownload(shard, []*overlayPeer{unknown, alternative}) {
-		t.Fatal("unknown sticky peer should trigger archive probe race")
+	noteArchivePeerSeedSuccess(shard, peer, archiveSpeedSampleMinBytes/4, time.Second)
+
+	if stats := peer.statsSnapshot(); stats.downloadCount != 0 || stats.downloadBytesSec != 0 {
+		t.Fatalf("small archive seed should not update peer speed: %#v", stats)
 	}
 
-	mediocre := &overlayPeer{
-		id:               "mediocre",
-		addr:             "mediocre",
-		alive:            true,
-		downloadCount:    3,
-		downloadBytesSec: 2 << 20,
-	}
-	if !shouldRaceArchiveDownload(shard, []*overlayPeer{mediocre, alternative}) {
-		t.Fatal("mediocre sticky peer should trigger archive probe race")
+	noteArchivePeerSeedSuccess(shard, peer, archiveSpeedSampleMinBytes, time.Second)
+
+	stats := peer.statsSnapshot()
+	if stats.downloadCount != 1 || stats.downloadBytesSec == 0 {
+		t.Fatalf("reliable archive seed should update peer speed: %#v", stats)
 	}
 }
 
-func TestShouldNotRaceArchiveDownloadForGoodPeer(t *testing.T) {
+func TestArchiveSmallDownloadCanMarkPeerSlow(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	peer := &overlayPeer{id: "peer", addr: "peer", alive: true}
+
+	if noteArchivePeerDownload(shard, peer, archiveSpeedSampleMinBytes/4, time.Second) {
+		t.Fatal("fast small archive download should not mark peer slow")
+	}
+	if stats := peer.statsSnapshot(); stats.downloadCount != 0 || stats.downloadBytesSec != 0 {
+		t.Fatalf("small archive download should not update speed score: %#v", stats)
+	}
+
+	if !noteArchivePeerDownload(shard, peer, archiveSpeedSampleMinBytes/4, archiveSmallPackSlowElapsed+time.Second) {
+		t.Fatal("slow small archive download should mark peer slow")
+	}
+	if !peer.statsSnapshot().downloadSlowUntil.After(time.Now()) {
+		t.Fatal("slow small archive download should set slow penalty")
+	}
+}
+
+func TestArchiveLargeDownloadUpdatesLargePackSpeed(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
-	fast := &overlayPeer{
-		id:               "fast",
-		addr:             "fast",
-		alive:            true,
-		downloadCount:    4,
-		downloadBytesSec: 16 << 20,
-	}
-	alternative := &overlayPeer{id: "alternative", addr: "alternative", alive: true}
+	peer := &overlayPeer{id: "peer", addr: "peer", alive: true}
 
-	if shouldRaceArchiveDownload(shard, []*overlayPeer{fast, alternative}) {
-		t.Fatal("good sticky peer should not trigger archive probe race")
+	noteArchivePeerDownload(shard, peer, archiveSpeedSampleMinBytes, time.Second)
+	if stats := peer.statsSnapshot(); stats.archiveLargeDownloads != 0 || stats.archiveLargeBytesSec != 0 {
+		t.Fatalf("regular archive sample should not update large-pack speed: %#v", stats)
+	}
+
+	noteArchivePeerDownload(shard, peer, archiveLargeSpeedSampleMinBytes, time.Second)
+	stats := peer.statsSnapshot()
+	if stats.archiveLargeDownloads != 1 || stats.archiveLargeBytesSec == 0 {
+		t.Fatalf("large archive sample should update large-pack speed: %#v", stats)
 	}
 }
 
-func TestCurrentArchivePeerNeedsGoodSpeedForExclusiveUse(t *testing.T) {
-	shard := archive.ShardID{Workchain: -1, Shard: topShard}
-	unknown := &overlayPeer{id: "unknown", addr: "unknown", alive: true}
-	if shouldUseCurrentArchivePeerWithoutRace(shard, unknown) {
-		t.Fatal("unknown current peer should still race archive probes")
+func TestArchiveLargePackSpeedHasPriorityOverSmallPackSpeed(t *testing.T) {
+	node := &Node{}
+	shard := archive.ShardID{Workchain: 0, Shard: topShard}
+	largePackFast := &overlayPeer{
+		id:                    "large-pack-fast",
+		addr:                  "large-pack-fast",
+		alive:                 true,
+		downloadCount:         2,
+		downloadBytesSec:      float64(5 << 20),
+		archiveLargeBytesSec:  float64(60 << 20),
+		archiveLargeDownloads: 1,
 	}
-
-	mediocre := &overlayPeer{
-		id:               "mediocre",
-		addr:             "mediocre",
+	probeFast := &overlayPeer{
+		id:               "small-pack-fast",
+		addr:             "small-pack-fast",
 		alive:            true,
 		downloadCount:    2,
-		downloadBytesSec: 4 << 20,
-	}
-	if shouldUseCurrentArchivePeerWithoutRace(shard, mediocre) {
-		t.Fatal("mediocre current peer should still race archive probes")
+		downloadBytesSec: float64(100 << 20),
 	}
 
-	fast := &overlayPeer{
-		id:               "fast",
-		addr:             "fast",
+	ordered := node.prioritizeArchivePeers(shard, []*overlayPeer{probeFast, largePackFast})
+	if ordered[0] != largePackFast {
+		t.Fatalf("large-pack speed should outrank small-pack speed, got %q", ordered[0].addr)
+	}
+}
+
+func TestArchiveLargePackPeerCanUseParallelCapacity(t *testing.T) {
+	node := &Node{
+		downloadPeerLeases: map[string]int{
+			"large-pack-fast": 2,
+		},
+	}
+	shard := archive.ShardID{Workchain: 0, Shard: topShard}
+	largePackFast := &overlayPeer{
+		id:                    "large-pack-fast",
+		addr:                  "large-pack-fast",
+		alive:                 true,
+		downloadCount:         3,
+		downloadBytesSec:      float64(20 << 20),
+		archiveLargeBytesSec:  float64(24 << 20),
+		archiveLargeDownloads: 2,
+	}
+	freeMedium := &overlayPeer{
+		id:               "free-medium",
+		addr:             "free-medium",
 		alive:            true,
 		downloadCount:    2,
-		downloadBytesSec: 12 << 20,
+		downloadBytesSec: float64(10 << 20),
 	}
-	if !shouldUseCurrentArchivePeerWithoutRace(shard, fast) {
-		t.Fatal("good current peer should be used without archive probe race")
+
+	ordered := node.prioritizeArchivePeers(shard, []*overlayPeer{freeMedium, largePackFast})
+	if ordered[0] != largePackFast {
+		t.Fatalf("large-pack peer should keep priority within parallel capacity, got %q", ordered[0].addr)
+	}
+}
+
+func TestArchiveLargePackPriorityStopsAfterParallelCapacity(t *testing.T) {
+	node := &Node{
+		downloadPeerLeases: map[string]int{
+			"large-pack-fast": 3,
+		},
+	}
+	shard := archive.ShardID{Workchain: 0, Shard: topShard}
+	largePackFast := &overlayPeer{
+		id:                    "large-pack-fast",
+		addr:                  "large-pack-fast",
+		alive:                 true,
+		downloadCount:         3,
+		downloadBytesSec:      float64(18 << 20),
+		archiveLargeBytesSec:  float64(18 << 20),
+		archiveLargeDownloads: 2,
+	}
+	freeProbeFast := &overlayPeer{
+		id:               "free-probe-fast",
+		addr:             "free-probe-fast",
+		alive:            true,
+		downloadCount:    2,
+		downloadBytesSec: float64(12 << 20),
+	}
+
+	ordered := node.prioritizeArchivePeers(shard, []*overlayPeer{largePackFast, freeProbeFast})
+	if ordered[0] != freeProbeFast {
+		t.Fatalf("large-pack peer at capacity should not have absolute priority, got %q", ordered[0].addr)
 	}
 }

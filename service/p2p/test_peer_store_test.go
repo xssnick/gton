@@ -3,15 +3,21 @@ package p2p
 import (
 	"context"
 	"fmt"
+	"math/bits"
 	"os"
 	"sync"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-const testArchivePackageMasterchainBlocks = 100
+const (
+	testArchiveSliceMasterchainBlocks   = 100
+	testArchivePackIndexSliceStride     = 1 << 20
+	testArchivePackIndexMaxShardDepth   = 12
+	testArchivePackIndexWorkchainStride = 1 << (testArchivePackIndexMaxShardDepth + 1)
+)
 
 type testPeerStore struct {
 	mu sync.RWMutex
@@ -137,17 +143,26 @@ func (s *testPeerStore) SavePersistentStateFile(file *storage.PersistentStateFil
 	return nil
 }
 
-func (s *testPeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (string, error) {
+func (s *testPeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (storage.SavedArchiveFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return storage.SavedArchiveFile{}, err
 	}
+	baseSeqno := uint32(archiveID)
+	masterSeqno := uint32(masterchainSeqno)
+	if masterSeqno < baseSeqno {
+		return storage.SavedArchiveFile{}, fmt.Errorf("archive masterchain seqno %d is before package base %d", masterchainSeqno, baseSeqno)
+	}
+	sliceSeqno := baseSeqno + ((masterSeqno-baseSeqno)/testArchiveSliceMasterchainBlocks)*testArchiveSliceMasterchainBlocks
+	localArchiveID := testArchivePackID(baseSeqno, sliceSeqno, workchain, shard)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.archiveInfos[testArchiveInfoKey(masterchainSeqno, workchain, shard)] = archiveID
-	s.archiveFiles[archiveID] = data
-	return path, nil
+	for i := uint32(0); i < testArchiveSliceMasterchainBlocks; i++ {
+		s.archiveInfos[testArchiveInfoKey(int32(sliceSeqno+i), workchain, shard)] = localArchiveID
+	}
+	s.archiveFiles[localArchiveID] = data
+	return storage.SavedArchiveFile{Path: path}, nil
 }
 
 func (s *testPeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
@@ -250,12 +265,6 @@ func (s *testPeerStore) ArchiveInfo(_ context.Context, masterchainSeqno int32, w
 
 	value, ok := s.archiveInfos[testArchiveInfoKey(masterchainSeqno, workchain, shard)]
 	if !ok {
-		rounded := testRoundArchiveMasterchainSeqno(masterchainSeqno)
-		if rounded != masterchainSeqno {
-			value, ok = s.archiveInfos[testArchiveInfoKey(rounded, workchain, shard)]
-		}
-	}
-	if !ok {
 		return 0, storage.ErrNotFound
 	}
 	return value, nil
@@ -297,9 +306,37 @@ func testArchiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) st
 	return fmt.Sprintf("%d:%d:%016x", masterchainSeqno, workchain, uint64(shard))
 }
 
-func testRoundArchiveMasterchainSeqno(seqno int32) int32 {
-	if seqno <= 0 {
-		return seqno
+func testArchivePackID(baseSeqno uint32, sliceSeqno uint32, workchain int32, shard int64) int64 {
+	sliceIndex := uint32(0)
+	if sliceSeqno > baseSeqno {
+		sliceIndex = (sliceSeqno - baseSeqno) / testArchiveSliceMasterchainBlocks
 	}
-	return seqno - seqno%testArchivePackageMasterchainBlocks
+	idx := sliceIndex * testArchivePackIndexSliceStride
+	if workchain != -1 || shard != topShard {
+		idx += 1 + testArchiveShardIndex(workchain, shard)
+	}
+	return int64(uint64(idx)<<32 | uint64(baseSeqno))
+}
+
+func testArchiveShardIndex(workchain int32, shard int64) uint32 {
+	workchainOffset := uint32(workchain+1) * testArchivePackIndexWorkchainStride
+	depth := testShardPrefixLength(shard)
+	if depth <= 0 {
+		return workchainOffset
+	}
+	if depth > testArchivePackIndexMaxShardDepth {
+		depth = testArchivePackIndexMaxShardDepth
+	}
+
+	prefix := uint64(shard) >> (64 - depth)
+	shardOffset := (uint32(1) << uint(depth)) - 1 + uint32(prefix)
+	return workchainOffset + shardOffset
+}
+
+func testShardPrefixLength(shard int64) int {
+	value := uint64(shard)
+	if value == 0 {
+		return 0
+	}
+	return 63 - bits.TrailingZeros64(value)
 }

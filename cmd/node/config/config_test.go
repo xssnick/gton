@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,9 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
-	"flexserver/liteserver"
-	"flexserver/service/p2p"
+	"github.com/xssnick/gton/liteserver"
+	"github.com/xssnick/gton/service/p2p"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -27,6 +29,154 @@ func TestLoadDefaults(t *testing.T) {
 
 	if cfg.TON.GlobalConfigPath != p2p.DefaultGlobalConfigPath {
 		t.Fatalf("unexpected TON config path %q", cfg.TON.GlobalConfigPath)
+	}
+	if cfg.TON.SyncBefore != int64(DefaultSyncBefore/time.Second) {
+		t.Fatalf("unexpected sync_before %d", cfg.TON.SyncBefore)
+	}
+	syncBefore, err := cfg.SyncBefore()
+	if err != nil {
+		t.Fatalf("sync before: %v", err)
+	}
+	if syncBefore != DefaultSyncBefore {
+		t.Fatalf("unexpected sync before %s", syncBefore)
+	}
+	if cfg.TON.StateTTL != int64(DefaultStateTTL/time.Second) {
+		t.Fatalf("unexpected state_ttl %d", cfg.TON.StateTTL)
+	}
+	stateTTL, err := cfg.StateTTL()
+	if err != nil {
+		t.Fatalf("state ttl: %v", err)
+	}
+	if stateTTL != DefaultStateTTL {
+		t.Fatalf("unexpected state ttl %s", stateTTL)
+	}
+	if cfg.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
+		t.Fatalf("unexpected archive_ttl %d", cfg.TON.ArchiveTTL)
+	}
+	archiveTTL, err := cfg.ArchiveTTL()
+	if err != nil {
+		t.Fatalf("archive ttl: %v", err)
+	}
+	if archiveTTL != DefaultArchiveTTL {
+		t.Fatalf("unexpected archive ttl %s", archiveTTL)
+	}
+	if cfg.DisableStateSerialization {
+		t.Fatal("state serialization should be enabled by default")
+	}
+	if cfg.Metrics.Enabled {
+		t.Fatal("metrics should be disabled by default")
+	}
+	if cfg.Metrics.ListenAddr != "" {
+		t.Fatalf("unexpected metrics listen addr %q", cfg.Metrics.ListenAddr)
+	}
+	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
+	if err != nil {
+		t.Fatalf("cell total cache size: %v", err)
+	}
+	if cellTotalCacheSize != DefaultCellTotalCache {
+		t.Fatalf("unexpected cell total cache size %d", cellTotalCacheSize)
+	}
+	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
+	if err != nil {
+		t.Fatalf("cell shard memtable size: %v", err)
+	}
+	if int64(cellShardMemTableSize) != DefaultCellShardMemTable {
+		t.Fatalf("unexpected cell shard memtable size %d", cellShardMemTableSize)
+	}
+}
+
+func TestLoadSyncOptions(t *testing.T) {
+	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	syncBefore, err := cfg.SyncBefore()
+	if err != nil {
+		t.Fatalf("sync before: %v", err)
+	}
+	if syncBefore != 2*time.Hour {
+		t.Fatalf("unexpected sync before %s", syncBefore)
+	}
+	stateTTL, err := cfg.StateTTL()
+	if err != nil {
+		t.Fatalf("state ttl: %v", err)
+	}
+	if stateTTL != 24*time.Hour {
+		t.Fatalf("unexpected state ttl %s", stateTTL)
+	}
+	archiveTTL, err := cfg.ArchiveTTL()
+	if err != nil {
+		t.Fatalf("archive ttl: %v", err)
+	}
+	if archiveTTL != 48*time.Hour {
+		t.Fatalf("unexpected archive ttl %s", archiveTTL)
+	}
+}
+
+func TestStorageOptions(t *testing.T) {
+	path := writeTestConfig(t, `{
+		"storage": {
+			"dir": "data/node",
+			"cell_total_cache_size": 8589934592,
+			"cell_shard_memtable_size": 1073741824
+		}
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.StorageDir() != "data/node" {
+		t.Fatalf("unexpected storage dir %q", cfg.StorageDir())
+	}
+	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
+	if err != nil {
+		t.Fatalf("cell total cache size: %v", err)
+	}
+	if cellTotalCacheSize != 8<<30 {
+		t.Fatalf("unexpected cell total cache size %d", cellTotalCacheSize)
+	}
+	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
+	if err != nil {
+		t.Fatalf("cell shard memtable size: %v", err)
+	}
+	if cellShardMemTableSize != 1<<30 {
+		t.Fatalf("unexpected cell shard memtable size %d", cellShardMemTableSize)
+	}
+}
+
+func TestMetricsOptions(t *testing.T) {
+	path := writeTestConfig(t, `{"metrics":{"enabled":true,"listen_addr":"127.0.0.1:9090"}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	opts, err := cfg.MetricsOptions()
+	if err != nil {
+		t.Fatalf("metrics options: %v", err)
+	}
+	if !opts.Enabled {
+		t.Fatal("expected metrics to be enabled")
+	}
+	if opts.ListenAddr != "127.0.0.1:9090" {
+		t.Fatalf("unexpected metrics listen addr %q", opts.ListenAddr)
+	}
+}
+
+func TestMetricsOptionsRequireListenAddrWhenEnabled(t *testing.T) {
+	path := writeTestConfig(t, `{"metrics":{"enabled":true}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err = cfg.MetricsOptions(); err == nil {
+		t.Fatal("expected enabled metrics without listen addr to fail")
 	}
 }
 
@@ -179,6 +329,18 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.TON.GlobalConfigPath != wantGlobalConfigPath {
 		t.Fatalf("unexpected global config path %q", cfg.TON.GlobalConfigPath)
 	}
+	if cfg.TON.SyncBefore != int64(DefaultSyncBefore/time.Second) {
+		t.Fatalf("unexpected sync_before %d", cfg.TON.SyncBefore)
+	}
+	if cfg.TON.StateTTL != int64(DefaultStateTTL/time.Second) {
+		t.Fatalf("unexpected state_ttl %d", cfg.TON.StateTTL)
+	}
+	if cfg.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
+		t.Fatalf("unexpected archive_ttl %d", cfg.TON.ArchiveTTL)
+	}
+	if cfg.Metrics.Enabled {
+		t.Fatal("expected generated metrics to be disabled")
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -186,6 +348,19 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("unexpected config permissions %s", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"sync_before"`)) {
+		t.Fatal("generated config should use sync_before key")
+	}
+	if !bytes.Contains(data, []byte(`"state_ttl"`)) {
+		t.Fatal("generated config should use state_ttl key")
+	}
+	if !bytes.Contains(data, []byte(`"archive_ttl"`)) {
+		t.Fatal("generated config should use archive_ttl key")
 	}
 
 	loaded, err := Load(path)
@@ -197,6 +372,61 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if loaded.TON.GlobalConfigPath != wantGlobalConfigPath {
 		t.Fatalf("unexpected persisted global config path %q", loaded.TON.GlobalConfigPath)
+	}
+	if loaded.TON.SyncBefore != int64(DefaultSyncBefore/time.Second) {
+		t.Fatalf("unexpected persisted sync_before %d", loaded.TON.SyncBefore)
+	}
+	if loaded.TON.StateTTL != int64(DefaultStateTTL/time.Second) {
+		t.Fatalf("unexpected persisted state_ttl %d", loaded.TON.StateTTL)
+	}
+	if loaded.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
+		t.Fatalf("unexpected persisted archive_ttl %d", loaded.TON.ArchiveTTL)
+	}
+}
+
+func TestLoadOrCreateRefusesExistingDefaultMetadata(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.MkdirAll(filepath.Join("data", "metadb"), 0o755); err != nil {
+		t.Fatalf("create metadb: %v", err)
+	}
+
+	_, _, err := LoadOrCreate(context.Background(), "config.json", func(context.Context) (string, error) {
+		t.Fatal("external ip lookup should not be called")
+		return "", nil
+	})
+	if !errors.Is(err, ErrConfigMissingWithExistingStorage) {
+		t.Fatalf("expected existing storage error, got %v", err)
+	}
+	if _, statErr := os.Stat("config.json"); !os.IsNotExist(statErr) {
+		t.Fatalf("config should not be created, stat err=%v", statErr)
+	}
+}
+
+func TestSyncBeforeValidation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.TON.SyncBefore = 0
+
+	if _, err := cfg.SyncBefore(); err == nil {
+		t.Fatal("expected zero sync_before to fail")
+	}
+}
+
+func TestStateTTLValidation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.TON.StateTTL = 0
+
+	if _, err := cfg.StateTTL(); err == nil {
+		t.Fatal("expected zero state_ttl to fail")
+	}
+}
+
+func TestArchiveTTLValidation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.TON.ArchiveTTL = 0
+
+	if _, err := cfg.ArchiveTTL(); err == nil {
+		t.Fatal("expected zero archive_ttl to fail")
 	}
 }
 

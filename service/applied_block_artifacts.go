@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
@@ -38,8 +38,9 @@ func appliedBlockArtifactFlusher(publisher CurrentStatePublisher) blockArtifactF
 }
 
 type appliedBlockArtifactJob struct {
-	seq   uint64
-	block p2p.DownloadedBlock
+	seq        uint64
+	block      p2p.DownloadedBlock
+	splitDepth uint32
 }
 
 type appliedBlockArtifactWriter struct {
@@ -94,7 +95,7 @@ func (w *appliedBlockArtifactWriter) run(ctx context.Context) {
 	}
 }
 
-func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block p2p.DownloadedBlock) error {
+func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block p2p.DownloadedBlock, splitDepth uint32) error {
 	if w == nil {
 		return nil
 	}
@@ -116,8 +117,9 @@ func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block p2p.Down
 
 	w.next++
 	w.jobs = append(w.jobs, appliedBlockArtifactJob{
-		seq:   w.next,
-		block: cloneDownloadedBlockForArtifact(block),
+		seq:        w.next,
+		block:      cloneDownloadedBlockForArtifact(block),
+		splitDepth: splitDepth,
 	})
 	w.signalWake()
 	return nil
@@ -190,7 +192,7 @@ func (w *appliedBlockArtifactWriter) popJob() (appliedBlockArtifactJob, bool) {
 func (w *appliedBlockArtifactWriter) process(job appliedBlockArtifactJob) {
 	var err error
 	for attempt := 1; attempt <= appliedBlockArtifactRetryCount; attempt++ {
-		err = w.storeBlock(context.Background(), job.block)
+		err = w.storeBlock(context.Background(), job.block, job.splitDepth)
 		if err == nil {
 			w.markSaved(job.seq)
 			return
@@ -203,7 +205,7 @@ func (w *appliedBlockArtifactWriter) process(job appliedBlockArtifactJob) {
 	w.fail(fmt.Errorf("store applied block artifact %s: %w", storage.FormatBlockRef(job.block.ID), err))
 }
 
-func (w *appliedBlockArtifactWriter) storeBlock(ctx context.Context, block p2p.DownloadedBlock) error {
+func (w *appliedBlockArtifactWriter) storeBlock(ctx context.Context, block p2p.DownloadedBlock, splitDepth uint32) error {
 	if err := w.blockArtifactsReady(ctx, block.ID); err == nil {
 		return w.finishBlock(ctx, block)
 	} else if !errors.Is(err, storage.ErrNotFound) {
@@ -228,11 +230,12 @@ func (w *appliedBlockArtifactWriter) storeBlock(ctx context.Context, block p2p.D
 	}
 
 	full := &storage.ServedBlockFull{
-		ID:     block.ID,
-		Proof:  append([]byte(nil), block.ProofBOC...),
-		Block:  append([]byte(nil), block.BlockBOC...),
-		Meta:   block.Meta.Clone(),
-		IsLink: appliedBlockProofIsLink(block.ID),
+		ID:                     block.ID,
+		Proof:                  append([]byte(nil), block.ProofBOC...),
+		Block:                  append([]byte(nil), block.BlockBOC...),
+		Meta:                   block.Meta.Clone(),
+		IsLink:                 appliedBlockProofIsLink(block.ID),
+		ArchiveShardSplitDepth: splitDepth,
 	}
 	if err := w.store.SaveBlockFull(full); err != nil {
 		return err
@@ -322,11 +325,11 @@ func (w *appliedBlockArtifactWriter) broadcastDone() {
 	w.done = make(chan struct{})
 }
 
-func (s *Service) stageAppliedBlockArtifact(ctx context.Context, block p2p.DownloadedBlock) error {
+func (s *Service) stageAppliedBlockArtifact(ctx context.Context, block p2p.DownloadedBlock, splitDepth uint32) error {
 	if s.appliedArtifacts == nil {
 		return nil
 	}
-	if err := s.appliedArtifacts.enqueue(ctx, block); err != nil {
+	if err := s.appliedArtifacts.enqueue(ctx, block, splitDepth); err != nil {
 		return fmt.Errorf("stage applied block artifact %s: %w", block.BlockRef(), err)
 	}
 	return nil

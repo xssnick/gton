@@ -3,7 +3,7 @@ package blocksync
 import (
 	"context"
 	"errors"
-	"flexserver/service/p2p"
+	"github.com/xssnick/gton/service/p2p"
 	"fmt"
 	"sync"
 	"testing"
@@ -319,6 +319,52 @@ func TestServiceIgnoresNonMasterchainBroadcasts(t *testing.T) {
 	}
 	if len(fetcher.exactCalls) != 0 || len(fetcher.nextCalls) != 0 {
 		t.Fatalf("expected no non-masterchain downloads, exact=%d next=%d", len(fetcher.exactCalls), len(fetcher.nextCalls))
+	}
+}
+
+func TestServiceEmitsShardDescriptionBroadcasts(t *testing.T) {
+	source := &stubSource{events: make(chan p2p.BroadcastEvent, 1)}
+	fetcher := newStubFetcher()
+
+	base10 := testBlockID(0, topShard, 10)
+	service := New(discardLogger(), source, fetcher)
+	service.retryCount = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.Run(ctx)
+	}()
+
+	source.events <- p2p.BroadcastEvent{
+		Overlay: "basechain",
+		Kind:    "tonNode.newShardBlockBroadcast",
+		Block:   base10,
+		ShardDescription: &p2p.ShardBlockDescription{
+			CatchainSeqno: 3,
+			Data:          []byte{0xAA},
+		},
+	}
+	close(source.events)
+
+	var got []p2p.BroadcastEvent
+	for ev := range service.ShardDescriptions() {
+		got = append(got, ev)
+	}
+	wg.Wait()
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 shard description, got %d", len(got))
+	}
+	if !got[0].Block.Equals(&base10) || got[0].ShardDescription == nil || got[0].ShardDescription.CatchainSeqno != 3 {
+		t.Fatalf("unexpected shard description event: %+v", got[0])
+	}
+	if len(fetcher.exactCalls) != 0 || len(fetcher.nextCalls) != 0 {
+		t.Fatalf("expected no shard description downloads, exact=%d next=%d", len(fetcher.exactCalls), len(fetcher.nextCalls))
 	}
 }
 

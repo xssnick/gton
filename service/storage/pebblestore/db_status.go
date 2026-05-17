@@ -1,0 +1,231 @@
+package pebblestore
+
+import (
+	"context"
+	"sort"
+
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/tonutils-go/ton"
+)
+
+type DBStatus struct {
+	CellGenerations []CellDBGenerationStatus
+}
+
+type CellDBGenerationStatus struct {
+	ID     uint64
+	Role   string
+	Origin ton.BlockIDExt
+	Cache  CellDBCacheStatus
+	Shards []CellDBShardStatus
+	Total  CellDBShardStatus
+}
+
+type CellDBCacheStatus struct {
+	BlockCacheSize      int64
+	BlockCacheHits      int64
+	BlockCacheMisses    int64
+	FileCacheSize       int64
+	FileCacheTableCount int64
+}
+
+type CellDBShardStatus struct {
+	Shard                    int
+	DiskSize                 uint64
+	LiveSize                 uint64
+	LiveTables               uint64
+	ReadAmp                  int64
+	L0Files                  int64
+	L0Sublevels              int64
+	L0Size                   int64
+	CompactionDebt           uint64
+	CompactionsInProgress    int64
+	CompactionInProgressSize int64
+	MemTableSize             uint64
+	MemTableCount            int64
+	TableIters               int64
+	Flushes                  int64
+	Ingests                  uint64
+}
+
+func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
+	select {
+	case <-ctx.Done():
+		return DBStatus{}, ctx.Err()
+	default:
+	}
+
+	generations := s.openCellGenerationStatusTargets()
+	status := DBStatus{
+		CellGenerations: make([]CellDBGenerationStatus, 0, len(generations)),
+	}
+	for _, generation := range generations {
+		cells, err := s.acquireCellStore(ctx, generation.id)
+		if err != nil {
+			return DBStatus{}, err
+		}
+		status.CellGenerations = append(status.CellGenerations, cellGenerationDBStatus(cells, generation.role, generation.origin))
+		cells.release()
+	}
+	return status, nil
+}
+
+func (s *Store) MaxReadAmp(ctx context.Context) (int64, error) {
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+	metrics := db.Metrics()
+	maxReadAmp := cellDBReadAmp(metrics.Levels)
+	s.releaseHotDB()
+
+	generations := s.openCellGenerationStatusTargets()
+	for _, generation := range generations {
+		cells, err := s.acquireCellStore(ctx, generation.id)
+		if err != nil {
+			return 0, err
+		}
+		readAmp := cellStoreMaxReadAmp(cells)
+		cells.release()
+		if readAmp > maxReadAmp {
+			maxReadAmp = readAmp
+		}
+	}
+	return maxReadAmp, nil
+}
+
+type cellGenerationStatusTarget struct {
+	id     uint64
+	role   string
+	origin ton.BlockIDExt
+}
+
+func (s *Store) openCellGenerationStatusTargets() []cellGenerationStatusTarget {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil
+	}
+
+	targets := make([]cellGenerationStatusTarget, 0, len(s.cellGenerations))
+	for generation := range s.cellGenerations {
+		target := cellGenerationStatusTarget{
+			id:   generation,
+			role: "open",
+		}
+		switch {
+		case generation == s.activeCellGeneration:
+			target.role = "active"
+			target.origin = s.activeCellOrigin
+		case s.pendingCellMigration != nil && generation == s.pendingCellMigration.generation:
+			target.role = "pending"
+			target.origin = s.pendingCellMigration.origin
+		}
+		targets = append(targets, target)
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].id < targets[j].id
+	})
+	return targets
+}
+
+func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt) CellDBGenerationStatus {
+	status := CellDBGenerationStatus{
+		ID:     cells.generation,
+		Role:   role,
+		Origin: origin,
+		Shards: make([]CellDBShardStatus, 0, cellDBShardCount),
+	}
+
+	cacheLoaded := false
+	for shardIdx, shard := range cells.shards {
+		if shard == nil || shard.db == nil {
+			continue
+		}
+
+		metrics := shard.db.Metrics()
+		if !cacheLoaded {
+			cacheLoaded = true
+			status.Cache = CellDBCacheStatus{
+				BlockCacheSize:      metrics.BlockCache.Size,
+				BlockCacheHits:      metrics.BlockCache.Hits,
+				BlockCacheMisses:    metrics.BlockCache.Misses,
+				FileCacheSize:       metrics.FileCache.Size,
+				FileCacheTableCount: metrics.FileCache.TableCount,
+			}
+		}
+
+		shardStatus := CellDBShardStatus{
+			Shard:                    shardIdx,
+			DiskSize:                 metrics.DiskSpaceUsage(),
+			LiveSize:                 metrics.Table.Local.LiveSize,
+			LiveTables:               metrics.Table.Local.LiveCount,
+			ReadAmp:                  cellDBReadAmp(metrics.Levels),
+			L0Files:                  metrics.Levels[0].TablesCount,
+			L0Sublevels:              int64(metrics.Levels[0].Sublevels),
+			L0Size:                   metrics.Levels[0].TablesSize,
+			CompactionDebt:           metrics.Compact.EstimatedDebt,
+			CompactionsInProgress:    metrics.Compact.NumInProgress,
+			CompactionInProgressSize: metrics.Compact.InProgressBytes,
+			MemTableSize:             metrics.MemTable.Size,
+			MemTableCount:            metrics.MemTable.Count,
+			TableIters:               metrics.TableIters,
+			Flushes:                  metrics.Flush.Count,
+			Ingests:                  metrics.Ingest.Count,
+		}
+		status.Shards = append(status.Shards, shardStatus)
+		status.Total.add(shardStatus)
+	}
+	status.Total.Shard = -1
+	return status
+}
+
+func cellDBReadAmp(levels [7]pebble.LevelMetrics) int64 {
+	var amp int64
+	amp += int64(levels[0].Sublevels)
+	for i := 1; i < len(levels); i++ {
+		if levels[i].TablesCount > 0 {
+			amp++
+		}
+	}
+	return amp
+}
+
+func cellStoreMaxReadAmp(cells *cellStore) int64 {
+	if cells == nil {
+		return 0
+	}
+
+	var maxReadAmp int64
+	for _, shard := range cells.shards {
+		if shard == nil || shard.db == nil {
+			continue
+		}
+		metrics := shard.db.Metrics()
+		readAmp := cellDBReadAmp(metrics.Levels)
+		if readAmp > maxReadAmp {
+			maxReadAmp = readAmp
+		}
+	}
+	return maxReadAmp
+}
+
+func (s *CellDBShardStatus) add(shard CellDBShardStatus) {
+	s.DiskSize += shard.DiskSize
+	s.LiveSize += shard.LiveSize
+	s.LiveTables += shard.LiveTables
+	if shard.ReadAmp > s.ReadAmp {
+		s.ReadAmp = shard.ReadAmp
+	}
+	s.L0Files += shard.L0Files
+	s.L0Sublevels += shard.L0Sublevels
+	s.L0Size += shard.L0Size
+	s.CompactionDebt += shard.CompactionDebt
+	s.CompactionsInProgress += shard.CompactionsInProgress
+	s.CompactionInProgressSize += shard.CompactionInProgressSize
+	s.MemTableSize += shard.MemTableSize
+	s.MemTableCount += shard.MemTableCount
+	s.TableIters += shard.TableIters
+	s.Flushes += shard.Flushes
+	s.Ingests += shard.Ingests
+}

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	tnstore "flexserver/service/storage"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -95,8 +95,13 @@ func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error
 		return fmt.Errorf("block proof %s root is nil", tnstore.FormatBlockRef(id))
 	}
 
+	loader, err := proofRoot.BeginParse()
+	if err != nil {
+		return fmt.Errorf("begin parse block proof %s: %w", tnstore.FormatBlockRef(id), err)
+	}
+
 	var proof BlockProof
-	if err := tlb.LoadFromCell(&proof, proofRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&proof, loader); err != nil {
 		return fmt.Errorf("parse block proof %s: %w", tnstore.FormatBlockRef(id), err)
 	}
 
@@ -130,8 +135,13 @@ func ParseCell(id ton.BlockIDExt, proofRoot *cell.Cell) (*Parsed, error) {
 		return nil, fmt.Errorf("block proof %s root is nil", tnstore.FormatBlockRef(id))
 	}
 
+	loader, err := proofRoot.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse block proof %s: %w", tnstore.FormatBlockRef(id), err)
+	}
+
 	var proof BlockProof
-	if err := tlb.LoadFromCell(&proof, proofRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&proof, loader); err != nil {
 		return nil, fmt.Errorf("parse block proof %s: %w", tnstore.FormatBlockRef(id), err)
 	}
 
@@ -198,8 +208,13 @@ func ConfigFromMasterchainState(current *tnstore.BlockState) (*tlb.BlockchainCon
 		return nil, fmt.Errorf("current masterchain state %s is missing parsed config", tnstore.FormatBlockRef(current.Block))
 	}
 
+	loader, err := current.Parsed.McStateExtra.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse mc_state_extra for %s: %w", tnstore.FormatBlockRef(current.Block), err)
+	}
+
 	var extra tlb.McStateExtra
-	if err := tlb.LoadFromCell(&extra, current.Parsed.McStateExtra.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&extra, loader); err != nil {
 		return nil, fmt.Errorf("parse mc_state_extra for %s: %w", tnstore.FormatBlockRef(current.Block), err)
 	}
 	if extra.ConfigParams.Config.Params == nil {
@@ -340,7 +355,7 @@ func (id blockIDExtTLB) blockID() ton.BlockIDExt {
 
 func parseSignatureSet(root *cell.Cell) (signatureSet, error) {
 	var ordinary blockSignaturesOrdinary
-	if err := tlb.LoadFromCell(&ordinary, root.BeginParse()); err == nil {
+	if ordinaryLoader, err := root.BeginParse(); err == nil && tlb.LoadFromCell(&ordinary, ordinaryLoader) == nil {
 		signatures, err := parseSignaturesDict(ordinary.Signatures, ordinary.SigCount)
 		if err != nil {
 			return signatureSet{}, err
@@ -352,15 +367,24 @@ func parseSignatureSet(root *cell.Cell) (signatureSet, error) {
 		}, nil
 	}
 
+	simplexLoader, err := root.BeginParse()
+	if err != nil {
+		return signatureSet{}, fmt.Errorf("begin parse simplex signatures: %w", err)
+	}
+
 	var simplex blockSignaturesSimplex
-	if err := tlb.LoadFromCell(&simplex, root.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&simplex, simplexLoader); err != nil {
 		return signatureSet{}, err
 	}
 	signatures, err := parseSignaturesDict(simplex.Signatures, simplex.SigCount)
 	if err != nil {
 		return signatureSet{}, err
 	}
-	candidateData, err := simplex.CandidateData.BeginParse().LoadBinarySnake()
+	candidateLoader, err := simplex.CandidateData.BeginParse()
+	if err != nil {
+		return signatureSet{}, fmt.Errorf("begin parse simplex candidate data: %w", err)
+	}
+	candidateData, err := candidateLoader.LoadBinarySnake()
 	if err != nil {
 		return signatureSet{}, fmt.Errorf("load simplex candidate data: %w", err)
 	}

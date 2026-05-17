@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"flexserver/service/archive/packfile"
-	"flexserver/service/storage"
-	"flexserver/service/storage/pebblestore"
+	"errors"
+	"github.com/xssnick/gton/service/archive/packfile"
+	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,7 +55,8 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("write archive pack: %v", err)
 	}
-	if _, err = store.SaveArchiveFile(int32(block.SeqNo), -1, topShard, 777, archivePath); err != nil {
+	archiveSeqno := int32(101)
+	if _, err = store.SaveArchiveFile(archiveSeqno, -1, topShard, 0, archivePath); err != nil {
 		t.Fatalf("save archive file: %v", err)
 	}
 
@@ -82,19 +84,19 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected zero state: %x", zeroState)
 	}
 
-	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo), -1, topShard)
-	if err != nil || archiveID != 777 {
+	archiveID, err := store.ArchiveInfo(ctx, archiveSeqno, -1, topShard)
+	if err != nil {
 		t.Fatalf("archive info mismatch: err=%v id=%d", err, archiveID)
 	}
 
-	archiveHeader, err := store.ArchiveSlice(ctx, 777, 0, packfile.HeaderSize)
+	archiveHeader, err := store.ArchiveSlice(ctx, archiveID, 0, packfile.HeaderSize)
 	var wantMagic [packfile.HeaderSize]byte
 	binary.LittleEndian.PutUint32(wantMagic[:], packfile.PackageMagic)
 	if err != nil || !bytes.Equal(archiveHeader, wantMagic[:]) {
 		t.Fatalf("archive header mismatch: err=%v data=%x", err, archiveHeader)
 	}
 
-	archive, err := store.ArchiveSlice(ctx, 777, archivePtr.Offset, 16)
+	archive, err := store.ArchiveSlice(ctx, archiveID, archivePtr.Offset, 16)
 	if err != nil || !bytes.Equal(archive, []byte{0x55, 0x44}) {
 		t.Fatalf("archive slice mismatch: err=%v data=%x", err, archive)
 	}
@@ -108,20 +110,18 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 	blockB := testPebbleBlockID(0, topShard, 11)
 
 	if err := store.SaveBlockMeta(&storage.BlockMeta{
-		ID:        blockA,
-		GenUTime:  100,
-		StartLT:   1000,
-		EndLT:     1999,
-		UpdatedAt: time.Now(),
+		ID:       blockA,
+		GenUTime: 100,
+		StartLT:  1000,
+		EndLT:    1999,
 	}); err != nil {
 		t.Fatalf("save block meta A: %v", err)
 	}
 	if err := store.SaveBlockMeta(&storage.BlockMeta{
-		ID:        blockB,
-		GenUTime:  120,
-		StartLT:   2000,
-		EndLT:     2999,
-		UpdatedAt: time.Now(),
+		ID:       blockB,
+		GenUTime: 120,
+		StartLT:  2000,
+		EndLT:    2999,
 	}); err != nil {
 		t.Fatalf("save block meta B: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 
 	leaf := cell.BeginCell().MustStoreUInt(0xAA, 8).EndCell()
 	root := cell.BeginCell().MustStoreUInt(0xBB, 8).MustStoreRef(leaf).MustStoreRef(leaf).EndCell()
-	records, err := storage.CollectCellRecords(root)
+	records, err := collectCellRecordsForTest(root)
 	if err != nil {
 		t.Fatalf("collect cell records: %v", err)
 	}
@@ -176,6 +176,90 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 
 }
 
+func TestPebbleStoragePersistentStateSerializerMetadata(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+
+	last := testPebbleBlockID(-1, topShard, 100)
+	written := testPebbleBlockID(-1, topShard, 50)
+	cursor := &storage.PersistentStateSerializerState{
+		LastBlock:             last,
+		LastWrittenBlock:      written,
+		LastWrittenBlockUTime: 123456,
+	}
+	if err := store.SavePersistentStateSerializerState(ctx, cursor); err != nil {
+		t.Fatalf("save serializer state: %v", err)
+	}
+
+	gotCursor, err := store.PersistentStateSerializerState(ctx)
+	if err != nil {
+		t.Fatalf("load serializer state: %v", err)
+	}
+	if !gotCursor.LastBlock.Equals(&last) || !gotCursor.LastWrittenBlock.Equals(&written) || gotCursor.LastWrittenBlockUTime != cursor.LastWrittenBlockUTime {
+		t.Fatalf("unexpected serializer cursor: %#v", gotCursor)
+	}
+
+	active := &storage.PersistentStateSerializerActive{
+		Block:         last,
+		StartedAtUnix: 42,
+	}
+	if err = store.SaveActivePersistentStateSerialization(ctx, active); err != nil {
+		t.Fatalf("save active serializer state: %v", err)
+	}
+	gotActive, err := store.ActivePersistentStateSerialization(ctx)
+	if err != nil {
+		t.Fatalf("load active serializer state: %v", err)
+	}
+	if !gotActive.Block.Equals(&active.Block) || gotActive.StartedAtUnix != active.StartedAtUnix {
+		t.Fatalf("unexpected active serializer state: %#v", gotActive)
+	}
+	if err = store.DeleteActivePersistentStateSerialization(ctx); err != nil {
+		t.Fatalf("delete active serializer state: %v", err)
+	}
+	if _, err = store.ActivePersistentStateSerialization(ctx); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("active serializer state after delete error = %v, want not found", err)
+	}
+
+	expired := &storage.PersistentStateDescription{
+		MasterchainBlock: testPebbleBlockID(-1, topShard, 60),
+		StartTime:        10,
+		EndTime:          20,
+	}
+	if err = store.SavePersistentStateDescription(ctx, expired); err != nil {
+		t.Fatalf("save expired description: %v", err)
+	}
+	descriptions, err := store.PersistentStateDescriptions(ctx)
+	if err != nil {
+		t.Fatalf("load descriptions after expired save: %v", err)
+	}
+	if len(descriptions) != 0 {
+		t.Fatalf("expired description was stored: %#v", descriptions)
+	}
+
+	desc := &storage.PersistentStateDescription{
+		MasterchainBlock: testPebbleBlockID(-1, topShard, 70),
+		StartTime:        uint32(time.Now().Unix()),
+		EndTime:          uint64(time.Now().Add(time.Hour).Unix()),
+		ShardBlocks: []storage.PersistentStateDescriptionShard{{
+			Block:      testPebbleBlockID(0, topShard, 71),
+			SplitDepth: 4,
+		}},
+	}
+	if err = store.SavePersistentStateDescription(ctx, desc); err != nil {
+		t.Fatalf("save description: %v", err)
+	}
+	descriptions, err = store.PersistentStateDescriptions(ctx)
+	if err != nil {
+		t.Fatalf("load descriptions: %v", err)
+	}
+	if len(descriptions) != 1 {
+		t.Fatalf("descriptions count = %d, want 1", len(descriptions))
+	}
+	if !descriptions[0].MasterchainBlock.Equals(&desc.MasterchainBlock) || descriptions[0].ShardBlocks[0].SplitDepth != 4 {
+		t.Fatalf("unexpected description: %#v", descriptions[0])
+	}
+}
+
 func TestPebbleStorageLoadsCellsByRepresentationHash(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
@@ -197,7 +281,7 @@ func TestPebbleStorageLoadsCellsByRepresentationHash(t *testing.T) {
 		t.Fatalf("test fixture must have different level-zero and max-level hashes")
 	}
 
-	records, err := storage.CollectCellRecords(root)
+	records, err := collectCellRecordsForTest(root)
 	if err != nil {
 		t.Fatalf("collect cell records: %v", err)
 	}
@@ -222,7 +306,7 @@ func TestPebbleStorageLoadsCellsByRepresentationHash(t *testing.T) {
 		t.Fatalf("test fixture must have different representation hashes")
 	}
 
-	records, err = storage.CollectCellRecords(fullRoot)
+	records, err = collectCellRecordsForTest(fullRoot)
 	if err != nil {
 		t.Fatalf("collect full cell records: %v", err)
 	}
@@ -251,7 +335,7 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	leaf := cell.BeginCell().MustStoreUInt(0xAA, 8).EndCell()
 	child := cell.BeginCell().MustStoreUInt(0xBB, 8).MustStoreRef(leaf).EndCell()
 	root := cell.BeginCell().MustStoreUInt(0xCC, 8).MustStoreRef(child).EndCell()
-	records, err := storage.CollectCellRecords(root)
+	records, err := collectCellRecordsForTest(root)
 	if err != nil {
 		t.Fatalf("collect cell records: %v", err)
 	}
@@ -275,6 +359,11 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy child: %v", err)
 	}
+	loadedChildSlice, err := loadedChild.BeginParse()
+	if err != nil {
+		t.Fatalf("materialize lazy child: %v", err)
+	}
+	loadedChild = loadedChildSlice.BaseCell()
 	if loadedChild.HashKey() != child.HashKey() || loadedChild.Depth() != child.Depth() {
 		t.Fatalf("loaded child metadata mismatch")
 	}
@@ -286,6 +375,11 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy leaf: %v", err)
 	}
+	loadedLeafSlice, err := loadedLeaf.BeginParse()
+	if err != nil {
+		t.Fatalf("materialize lazy leaf: %v", err)
+	}
+	loadedLeaf = loadedLeafSlice.BaseCell()
 	if loadedLeaf.HashKey() != leaf.HashKey() || loadedLeaf.Depth() != leaf.Depth() {
 		t.Fatalf("loaded leaf metadata mismatch")
 	}
@@ -301,7 +395,7 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 		t.Fatalf("create pruned cell: %v", err)
 	}
 	prunedRoot := cell.BeginCell().MustStoreRef(pruned).EndCell()
-	records, err = storage.CollectCellRecords(prunedRoot)
+	records, err = collectCellRecordsForTest(prunedRoot)
 	if err != nil {
 		t.Fatalf("collect pruned cell records: %v", err)
 	}
@@ -318,6 +412,11 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load lazy pruned ref: %v", err)
 	}
+	loadedPrunedSlice, err := loadedPruned.BeginParse()
+	if err != nil {
+		t.Fatalf("materialize lazy pruned ref: %v", err)
+	}
+	loadedPruned = loadedPrunedSlice.BaseCell()
 	if loadedPruned.HashKey() != pruned.HashKey() || loadedPruned.Depth() != pruned.Depth() {
 		t.Fatalf("loaded pruned metadata mismatch")
 	}
@@ -356,7 +455,9 @@ func requireLazyCellBOC(t testing.TB, loaded *cell.Cell, want *cell.Cell) {
 func materializeLazyCell(t testing.TB, cl *cell.Cell) *cell.Cell {
 	t.Helper()
 
-	bits, data, err := cl.BeginParse().RestBits()
+	loader := cl.MustBeginParse()
+	cl = loader.BaseCell()
+	bits, data, err := loader.RestBits()
 	if err != nil {
 		t.Fatalf("load cell bits: %v", err)
 	}

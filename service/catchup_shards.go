@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -43,7 +43,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				return
 			}
 			if len(indexed) > 0 {
-				if !s.downloadIndexedChainBlocks(ctx, downloads, prev, indexed) {
+				if !s.downloadKnownChainBlocks(ctx, downloads, prev, indexed, "indexed") {
 					return
 				}
 				prev = indexed[len(indexed)-1]
@@ -142,10 +142,6 @@ func (s *Service) lookupIndexedChainBlocks(ctx context.Context, prev ton.BlockID
 	return blocks, nil
 }
 
-func (s *Service) downloadIndexedChainBlocks(ctx context.Context, downloads chan<- shardStateDownload, prev ton.BlockIDExt, blocks []ton.BlockIDExt) bool {
-	return s.downloadKnownChainBlocks(ctx, downloads, prev, blocks, "indexed")
-}
-
 func (s *Service) lookupNextChainBlockDescriptions(ctx context.Context, prev ton.BlockIDExt, target ton.BlockIDExt, limit int) ([]ton.BlockIDExt, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -202,6 +198,9 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 
 	jobs := make(chan shardStateDownloadJob)
 	results := make(chan shardStateDownload, len(blocks))
+	downloadCtx, cancelDownload := context.WithCancel(ctx)
+	defer cancelDownload()
+
 	var wg sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
 		wg.Add(1)
@@ -209,7 +208,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 			defer wg.Done()
 			for job := range jobs {
 				downloadStarted := time.Now()
-				downloaded, err := s.downloadExactChainBlockWithRetry(ctx, job.block)
+				downloaded, err := s.downloadExactChainBlockWithRetry(downloadCtx, job.block)
 				downloadElapsed := time.Since(downloadStarted)
 				if err == nil {
 					downloaded, err = prepareDownloadedBlockStateCells(downloaded)
@@ -223,7 +222,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 				}
 				select {
 				case results <- item:
-				case <-ctx.Done():
+				case <-downloadCtx.Done():
 					return
 				}
 			}
@@ -240,7 +239,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 			}
 			select {
 			case jobs <- job:
-			case <-ctx.Done():
+			case <-downloadCtx.Done():
 				return
 			}
 			jobPrev = block
@@ -253,11 +252,13 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 	for received < len(blocks) {
 		select {
 		case <-ctx.Done():
+			cancelDownload()
 			wg.Wait()
 			return false
 		case item := <-results:
 			received++
 			if item.err != nil {
+				cancelDownload()
 				wg.Wait()
 				return s.sendShardStateDownload(ctx, downloads, item)
 			}
@@ -270,6 +271,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 				}
 				delete(pending, nextSeqno)
 				if !s.sendShardStateDownload(ctx, downloads, item) {
+					cancelDownload()
 					wg.Wait()
 					return false
 				}

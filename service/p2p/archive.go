@@ -2,12 +2,13 @@ package p2p
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
-	"flexserver/service/archive"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/archive/packfile"
 	"fmt"
 	"os"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -20,36 +21,27 @@ const (
 	archivePackMaxBytes      = int64(2 << 30)
 	archiveInfoTimeout       = 3 * time.Second
 	archiveSliceProbeTimeout = 3 * time.Second
-	archiveSliceTimeout      = 15 * time.Second
-	archiveInfoParallelism   = 6
-	archiveInfoHedgeDelay    = 250 * time.Millisecond
+	archiveSliceTimeout      = 6 * time.Second
 
-	archiveDiscoveryPeerTarget        = 8
-	archiveDiscoveryWait              = 2500 * time.Millisecond
-	archiveDownloadProbeParallelism   = 4
-	archiveDownloadProbeCollectWindow = 750 * time.Millisecond
-	archiveBootstrapSlowLog           = 2 * time.Second
+	archiveDiscoveryWait    = 2500 * time.Millisecond
+	archiveBootstrapSlowLog = 2 * time.Second
 
-	archiveStickyProbeInterval = 30 * time.Second
-	archiveStickySwitchRatio   = 1.15
-	defaultArchivePeerSpeed    = float64(1 << 20)
-	archiveSlowPeerSpeed       = float64(1 << 20)
-	basechainSlowPeerSpeed     = float64(3 << 20)
-	archiveGoodPeerSpeed       = float64(8 << 20)
-	basechainGoodPeerSpeed     = float64(8 << 20)
-	archiveSlowPeerPenalty     = 3 * time.Minute
-	archiveUnknownPeerSpeed    = float64(256 << 10)
+	archiveSpeedSampleMinBytes      = int64(archiveSliceSize)
+	archiveLargeSpeedSampleMinBytes = int64(32 << 20)
+	archiveSmallPackSlowElapsed     = 5 * time.Second
+	defaultArchivePeerSpeed         = float64(1 << 20)
+	archiveSlowPeerSpeed            = float64(1 << 20)
+	basechainSlowPeerSpeed          = float64(3 << 20)
+	archiveGoodPeerSpeed            = float64(8 << 20)
+	basechainGoodPeerSpeed          = float64(8 << 20)
+	basechainVeryGoodPeerSpeed      = float64(16 << 20)
+	archiveSlowPeerPenalty          = 3 * time.Minute
+	archiveUnknownPeerSpeed         = float64(256 << 10)
 )
 
 type archiveInfoResult struct {
 	peer      *overlayPeer
 	candidate archiveCandidate
-}
-
-type archiveDownloadProbe struct {
-	candidate archiveCandidate
-	bytes     int64
-	elapsed   time.Duration
 }
 
 type archiveCandidate struct {
@@ -172,13 +164,7 @@ func (s *overlaySubscription) archivePeersReady(shard archive.ShardID) bool {
 
 	peers := s.node.prioritizeArchivePeers(shard, s.archiveQueryCandidates())
 	peers = s.availableArchivePeers(shard, peers)
-	if len(peers) >= archiveDiscoveryPeerTarget {
-		return true
-	}
-	if peer := s.currentArchivePeer(shard, peers); peer != nil {
-		return shouldUseCurrentArchivePeerWithoutRace(shard, peer)
-	}
-	return false
+	return len(peers) > 0
 }
 
 func (s *overlaySubscription) resolveArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID) (resolvedArchive, error) {
@@ -189,34 +175,6 @@ func (s *overlaySubscription) resolveArchive(ctx context.Context, masterchainSeq
 	peers = s.availableArchivePeers(shard, peers)
 	if len(peers) == 0 {
 		return resolvedArchive{}, archive.ErrNotAvailable
-	}
-
-	if peer := s.currentArchivePeer(shard, peers); peer != nil {
-		if len(peers) == 1 || shouldUseCurrentArchivePeerWithoutRace(shard, peer) {
-			candidate, _, _, err := s.queryArchiveCandidateForDownload(ctx, peer, masterchainSeqno, shard)
-			if err == nil {
-				return resolvedArchive{
-					MasterchainSeqno: masterchainSeqno,
-					Shard:            shard,
-					ArchiveID:        candidate.archiveID,
-					Peer:             peer.addr,
-					seedSlice:        append([]byte(nil), candidate.seedSlice...),
-					seedElapsed:      candidate.seedElapsed,
-					hasSeed:          candidate.hasSeed,
-					peer:             peer,
-					peers:            peers,
-				}, nil
-			}
-			if errors.Is(err, context.Canceled) {
-				return resolvedArchive{}, err
-			}
-			if errors.Is(err, archive.ErrNotAvailable) {
-				s.denyArchivePeer(shard, peer, "archive_not_available")
-			} else {
-				peer.downloadFailed(archiveSlowPeerPenalty)
-				s.noteArchivePeerFailure(shard, peer)
-			}
-		}
 	}
 
 	info, err := s.findArchiveInfo(ctx, peers, masterchainSeqno, shard)
@@ -251,7 +209,7 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 		return nil, archive.ErrNotAvailable
 	}
 
-	ordered := make([]*overlayPeer, 0, len(peers)+2)
+	ordered := make([]*overlayPeer, 0, len(peers)+1)
 	seen := make(map[string]struct{}, len(peers)+2)
 	addPeer := func(peer *overlayPeer) {
 		if peer == nil {
@@ -267,7 +225,6 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 		seen[key] = struct{}{}
 		ordered = append(ordered, peer)
 	}
-	addPeer(s.chooseArchivePeer(resolved.Shard, peers))
 	addPeer(resolved.peer)
 	for _, peer := range peers {
 		addPeer(peer)
@@ -283,10 +240,6 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 			hasSeed:     resolved.hasSeed,
 		}
 	}
-	if shouldRaceArchiveDownload(resolved.Shard, ordered) {
-		ordered, candidates = s.probeArchiveDownloadPeers(ctx, resolved, ordered, candidates)
-	}
-
 	return s.downloadArchiveFromPeers(ctx, resolved, ordered, tmpDir, candidates)
 }
 
@@ -304,17 +257,12 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, reso
 		candidate, hasCandidate := candidates[key]
 		if !hasCandidate {
 			var err error
-			candidate, _, _, err = s.queryArchiveCandidateForDownload(ctx, peer, resolved.MasterchainSeqno, resolved.Shard)
+			candidate, err = s.fetchArchiveCandidate(ctx, peer, resolved.MasterchainSeqno, resolved.Shard)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return nil, err
 				}
-				if errors.Is(err, archive.ErrNotAvailable) {
-					s.denyArchivePeer(resolved.Shard, peer, "archive_not_available")
-				} else {
-					peer.downloadFailed(archiveSlowPeerPenalty)
-					s.noteArchivePeerFailure(resolved.Shard, peer)
-				}
+				s.noteArchiveDownloadError(resolved.Shard, peer, err)
 				errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
 				continue
 			}
@@ -328,11 +276,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, reso
 		if errors.Is(err, context.Canceled) {
 			return nil, err
 		}
-
-		peer.downloadFailed(archiveSlowPeerPenalty)
-		s.noteArchivePeerFailure(resolved.Shard, peer)
-		errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
-
+		s.noteArchiveDownloadError(resolved.Shard, peer, err)
 		s.log.Debug().
 			Err(err).
 			Uint32("masterchain_seqno", resolved.MasterchainSeqno).
@@ -341,6 +285,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, reso
 			Int64("archive_id", candidate.archiveID).
 			Str("peer", peer.addr).
 			Msg("archive download peer failed")
+		errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
 	}
 
 	if len(errs) == 0 {
@@ -349,45 +294,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, reso
 	return nil, errors.Join(errs...)
 }
 
-func (s *overlaySubscription) probeArchiveDownloadPeers(ctx context.Context, resolved resolvedArchive, peers []*overlayPeer, candidates map[string]archiveCandidate) ([]*overlayPeer, map[string]archiveCandidate) {
-	probeCount := minInt(archiveDownloadProbeParallelism, len(peers))
-	if probeCount < 2 {
-		return peers, candidates
-	}
-
-	results, _ := runPeerRequests(ctx, peers[:probeCount], peerRequestOptions{
-		parallelism:         probeCount,
-		collectAfterSuccess: archiveDownloadProbeCollectWindow,
-		onFailure: func(peer *overlayPeer, err error) {
-			s.noteArchiveDownloadProbeFailure(resolved.Shard, peer, err)
-		},
-	}, func(probeCtx context.Context, peer *overlayPeer) (archiveDownloadProbe, error) {
-		if candidate, ok := candidates[archivePeerKey(peer)]; ok && candidate.hasSeed {
-			return archiveDownloadProbe{
-				candidate: candidate,
-				bytes:     int64(len(candidate.seedSlice)),
-				elapsed:   candidate.seedElapsed,
-			}, nil
-		}
-
-		candidate, bytes, elapsed, err := s.queryArchiveCandidateForDownload(probeCtx, peer, resolved.MasterchainSeqno, resolved.Shard)
-		return archiveDownloadProbe{
-			candidate: candidate,
-			bytes:     bytes,
-			elapsed:   elapsed,
-		}, err
-	})
-
-	successes := make([]peerRequestResult[archiveDownloadProbe], 0, len(results))
-	for _, res := range results {
-		successes = append(successes, res)
-		candidates[archivePeerKey(res.peer)] = res.value.candidate
-	}
-
-	return s.orderArchiveProbePeers(peers, successes, candidates)
-}
-
-func (s *overlaySubscription) noteArchiveDownloadProbeFailure(shard archive.ShardID, peer *overlayPeer, err error) {
+func (s *overlaySubscription) noteArchiveDownloadError(shard archive.ShardID, peer *overlayPeer, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
@@ -397,72 +304,16 @@ func (s *overlaySubscription) noteArchiveDownloadProbeFailure(shard archive.Shar
 	}
 
 	peer.downloadFailed(archiveSlowPeerPenalty)
-	s.noteArchivePeerFailure(shard, peer)
 }
 
-func (s *overlaySubscription) orderArchiveProbePeers(peers []*overlayPeer, successes []peerRequestResult[archiveDownloadProbe], candidates map[string]archiveCandidate) ([]*overlayPeer, map[string]archiveCandidate) {
-	if len(successes) == 0 {
-		return peers, candidates
+func formatArchiveCandidateRate(candidate archiveCandidate) string {
+	if candidate.seedElapsed > 0 {
+		return logutil.FormatByteRate(int64(len(candidate.seedSlice)), candidate.seedElapsed)
 	}
-
-	sort.SliceStable(successes, func(i, j int) bool {
-		return archiveProbeSpeed(successes[i]) > archiveProbeSpeed(successes[j])
-	})
-
-	ordered := make([]*overlayPeer, 0, len(peers))
-	seen := make(map[string]struct{}, len(peers))
-	addPeer := func(peer *overlayPeer) {
-		key := archivePeerKey(peer)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		ordered = append(ordered, peer)
-	}
-	for _, res := range successes {
-		addPeer(res.peer)
-	}
-	for _, peer := range peers {
-		addPeer(peer)
-	}
-
-	best := successes[0]
-	s.log.Debug().
-		Int64("archive_id", best.value.candidate.archiveID).
-		Int("probes", len(successes)).
-		Str("peer", best.peer.addr).
-		Str("speed", formatArchiveProbeRate(best)).
-		Msg("selected archive download peer from probes")
-
-	return ordered, candidates
-}
-
-func archiveProbeSpeed(res peerRequestResult[archiveDownloadProbe]) float64 {
-	return archiveDownloadSpeed(res.value.candidate, res.value.bytes, res.value.elapsed)
-}
-
-func archiveCandidateSpeed(res peerRequestResult[archiveCandidate]) float64 {
-	return archiveDownloadSpeed(res.value, int64(len(res.value.seedSlice)), res.value.seedElapsed)
-}
-
-func archiveDownloadSpeed(candidate archiveCandidate, bytes int64, elapsed time.Duration) float64 {
 	if candidate.speed > 0 {
-		return candidate.speed
+		return logutil.FormatByteRate(int64(candidate.speed), time.Second)
 	}
-	if bytes <= 0 || elapsed <= 0 {
-		return 0
-	}
-	return float64(bytes) / elapsed.Seconds()
-}
-
-func formatArchiveProbeRate(res peerRequestResult[archiveDownloadProbe]) string {
-	if res.value.elapsed > 0 {
-		return formatByteRate(res.value.bytes, res.value.elapsed)
-	}
-	if res.value.candidate.speed > 0 {
-		return formatByteRate(int64(res.value.candidate.speed), time.Second)
-	}
-	return formatByteRate(0, time.Second)
+	return logutil.FormatByteRate(0, time.Second)
 }
 
 func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resolved resolvedArchive, candidate archiveCandidate, tmpDir string) (*archive.Downloaded, error) {
@@ -473,11 +324,9 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		return nil, fmt.Errorf("create archive temp file: %w", err)
 	}
 
-	partPath := file.Name()
-	path := strings.TrimSuffix(partPath, ".part")
+	path := file.Name()
 	cleanup := func() {
 		_ = file.Close()
-		_ = os.Remove(partPath)
 		_ = os.Remove(path)
 	}
 
@@ -505,6 +354,11 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		Msg("selected archive download peer")
 
 	writeSlice := func(data []byte) error {
+		if offset == 0 {
+			if err := checkArchivePackMagic(data); err != nil {
+				return err
+			}
+		}
 		if len(data) == 0 {
 			return nil
 		}
@@ -559,10 +413,11 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 				Str("shard", fmt.Sprintf("%016x", uint64(resolved.Shard.Shard))).
 				Int64("archive_id", archiveID).
 				Int64("bytes", offset).
+				Str("size", formatByteSize(offset)).
 				Str("peer", peer.addr).
 				Dur("elapsed", logDownloadElapsed).
 				Dur("wall_elapsed", elapsed).
-				Str("speed", formatByteRate(offset-lastLogBytes, logDownloadElapsed)).
+				Str("speed", logutil.FormatByteRate(offset-lastLogBytes, logDownloadElapsed)).
 				Msg("archive slice download progress")
 
 			lastLog = time.Now()
@@ -576,22 +431,15 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 	}
 
 	if err = file.Close(); err != nil {
-		_ = os.Remove(partPath)
+		_ = os.Remove(path)
 		return nil, fmt.Errorf("close archive temp file: %w", err)
-	}
-	if err = os.Rename(partPath, path); err != nil {
-		_ = os.Remove(partPath)
-		return nil, fmt.Errorf("rename archive temp file: %w", err)
 	}
 
 	wallElapsed := time.Since(startedAt)
 	if candidate.hasSeed && candidate.seedElapsed > 0 {
 		wallElapsed += candidate.seedElapsed
 	}
-	slowThreshold := archiveSlowThreshold(resolved.Shard.Workchain == 0)
-	peer.downloadSuccess(offset, downloadElapsed, slowThreshold, archiveSlowPeerPenalty)
-	if downloadElapsed > 0 && float64(offset)/downloadElapsed.Seconds() < slowThreshold {
-		s.noteArchivePeerFailure(resolved.Shard, peer)
+	if noteArchivePeerDownload(resolved.Shard, peer, offset, downloadElapsed) {
 		s.log.Debug().
 			Uint32("masterchain_seqno", resolved.MasterchainSeqno).
 			Int32("workchain", resolved.Shard.Workchain).
@@ -599,12 +447,11 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 			Int64("archive_id", archiveID).
 			Str("peer", peer.addr).
 			Int64("bytes", offset).
+			Str("size", formatByteSize(offset)).
 			Dur("elapsed", downloadElapsed).
 			Dur("wall_elapsed", wallElapsed).
-			Str("speed", formatByteRate(offset, downloadElapsed)).
+			Str("speed", logutil.FormatByteRate(offset, downloadElapsed)).
 			Msg("archive download peer too slow")
-	} else {
-		s.noteArchivePeerSuccess(resolved.Shard, peer, offset, downloadElapsed)
 	}
 
 	downloadEvent := s.log.Info().
@@ -613,9 +460,10 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		Str("shard", fmt.Sprintf("%016x", uint64(resolved.Shard.Shard))).
 		Int64("archive_id", archiveID).
 		Int64("bytes", offset).
+		Str("size", formatByteSize(offset)).
 		Dur("elapsed", downloadElapsed).
 		Dur("wall_elapsed", wallElapsed).
-		Str("speed", formatByteRate(offset, downloadElapsed)).
+		Str("speed", logutil.FormatByteRate(offset, downloadElapsed)).
 		Str("peer", peer.addr)
 	downloadEvent.Msg("archive slice downloaded")
 
@@ -644,6 +492,17 @@ func checkArchivePackDownloadSize(offset int64, nextBytes int) error {
 	return nil
 }
 
+func checkArchivePackMagic(data []byte) error {
+	if len(data) < packfile.HeaderSize {
+		return fmt.Errorf("archive package is too short: %d bytes", len(data))
+	}
+	got := binary.LittleEndian.Uint32(data[:packfile.HeaderSize])
+	if got != packfile.PackageMagic {
+		return fmt.Errorf("archive package magic mismatch: got=%08x want=%08x", got, packfile.PackageMagic)
+	}
+	return nil
+}
+
 func (s *overlaySubscription) queryArchiveSlice(ctx context.Context, peer *overlayPeer, archiveID int64, offset int64) ([]byte, error) {
 	return s.queryArchiveSliceWithTimeout(ctx, peer, archiveID, offset, archiveSliceTimeout)
 }
@@ -657,31 +516,28 @@ func (s *overlaySubscription) queryArchiveSliceWithTimeout(ctx context.Context, 
 	return s.queryRawFromPeerWithLimits(ctx, peer, query, timeout, archiveSliceMaxAnswer)
 }
 
-func (s *overlaySubscription) queryArchiveCandidateForDownload(ctx context.Context, peer *overlayPeer, masterchainSeqno uint32, shard archive.ShardID) (archiveCandidate, int64, time.Duration, error) {
+func (s *overlaySubscription) fetchArchiveCandidate(ctx context.Context, peer *overlayPeer, masterchainSeqno uint32, shard archive.ShardID) (archiveCandidate, error) {
 	info, err := s.queryArchiveInfo(ctx, peer, masterchainSeqno, shard)
 	if err != nil {
-		return archiveCandidate{}, 0, 0, err
+		return archiveCandidate{}, err
 	}
 
 	started := time.Now()
 	data, err := s.queryArchiveSliceWithTimeout(ctx, peer, info.ID, 0, archiveSliceProbeTimeout)
 	if err != nil {
-		return archiveCandidate{}, 0, 0, fmt.Errorf("probe archive offset=0: %w", err)
+		return archiveCandidate{}, fmt.Errorf("download archive seed slice: %w", err)
 	}
 	if len(data) > archiveSliceSize {
-		return archiveCandidate{}, 0, 0, fmt.Errorf("archive probe response too large: %d", len(data))
+		return archiveCandidate{}, fmt.Errorf("archive seed response too large: %d", len(data))
 	}
 
 	elapsed := time.Since(started)
 	bytes := int64(len(data))
 	speed := float64(0)
-	if elapsed > 0 && bytes > 0 {
+	if archiveSpeedSampleReliable(bytes) && elapsed > 0 {
 		speed = float64(bytes) / elapsed.Seconds()
 	}
-	if bytes > 0 {
-		peer.downloadSuccess(bytes, elapsed, archiveSlowThreshold(shard.Workchain == 0), archiveSlowPeerPenalty)
-		s.noteArchivePeerSuccess(shard, peer, bytes, elapsed)
-	}
+	noteArchivePeerSeedSuccess(shard, peer, bytes, elapsed)
 
 	candidate := archiveCandidate{
 		peer:        peer,
@@ -693,59 +549,43 @@ func (s *overlaySubscription) queryArchiveCandidateForDownload(ctx context.Conte
 		candidate.seedSlice = append([]byte(nil), data...)
 		candidate.hasSeed = true
 	}
-	return candidate, bytes, elapsed, nil
+	return candidate, nil
 }
 
 func (s *overlaySubscription) findArchiveInfo(ctx context.Context, peers []*overlayPeer, masterchainSeqno uint32, shard archive.ShardID) (*archiveInfoResult, error) {
-	results, errs := runPeerRequests(ctx, peers, peerRequestOptions{
-		parallelism:         archiveInfoParallelism,
-		hedgeDelay:          archiveInfoHedgeDelay,
-		collectAfterSuccess: archiveDownloadProbeCollectWindow,
-		onFailure: func(peer *overlayPeer, err error) {
-			if errors.Is(err, archive.ErrNotAvailable) {
-				s.denyArchivePeer(shard, peer, "archive_not_available")
-				return
-			}
-			peer.downloadFailed(archiveSlowPeerPenalty)
-			s.noteArchivePeerFailure(shard, peer)
-		},
-	}, func(queryCtx context.Context, peer *overlayPeer) (archiveCandidate, error) {
-		candidate, _, _, err := s.queryArchiveCandidateForDownload(queryCtx, peer, masterchainSeqno, shard)
-		return candidate, err
-	})
-	if len(results) == 0 {
-		if len(errs) == 0 {
-			return nil, archive.ErrNotAvailable
+	var errs []error
+	for _, peer := range peers {
+		candidate, err := s.fetchArchiveCandidate(ctx, peer, masterchainSeqno, shard)
+		if err == nil {
+			s.log.Debug().
+				Uint32("masterchain_seqno", masterchainSeqno).
+				Int32("workchain", shard.Workchain).
+				Str("shard", fmt.Sprintf("%016x", uint64(shard.Shard))).
+				Int64("archive_id", candidate.archiveID).
+				Str("peer", peer.addr).
+				Str("speed", formatArchiveCandidateRate(candidate)).
+				Msg("selected archive info peer")
+
+			return &archiveInfoResult{
+				peer:      peer,
+				candidate: candidate,
+			}, nil
 		}
-		return nil, errors.Join(errs...)
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		if errors.Is(err, archive.ErrNotAvailable) {
+			s.denyArchivePeer(shard, peer, "archive_not_available")
+		} else {
+			peer.downloadFailed(archiveSlowPeerPenalty)
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
 	}
 
-	sort.SliceStable(results, func(i, j int) bool {
-		return archiveCandidateSpeed(results[i]) > archiveCandidateSpeed(results[j])
-	})
-
-	res := results[0]
-	s.log.Debug().
-		Uint32("masterchain_seqno", masterchainSeqno).
-		Int32("workchain", shard.Workchain).
-		Str("shard", fmt.Sprintf("%016x", uint64(shard.Shard))).
-		Int64("archive_id", res.value.archiveID).
-		Int("probes", len(results)).
-		Str("peer", res.peer.addr).
-		Str("speed", formatArchiveProbeRate(peerRequestResult[archiveDownloadProbe]{
-			peer: res.peer,
-			value: archiveDownloadProbe{
-				candidate: res.value,
-				bytes:     int64(len(res.value.seedSlice)),
-				elapsed:   res.value.seedElapsed,
-			},
-		})).
-		Msg("selected archive info peer from probes")
-
-	return &archiveInfoResult{
-		peer:      res.peer,
-		candidate: res.value,
-	}, nil
+	if len(errs) == 0 {
+		return nil, archive.ErrNotAvailable
+	}
+	return nil, errors.Join(errs...)
 }
 
 func (s *overlaySubscription) queryArchiveInfo(ctx context.Context, peer *overlayPeer, masterchainSeqno uint32, shard archive.ShardID) (ArchiveInfo, error) {

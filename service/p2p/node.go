@@ -6,8 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"flexserver/internal/logutil"
-	storage2 "flexserver/service/storage"
+	"github.com/xssnick/gton/internal/logutil"
+	storage2 "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"net"
 	"os"
@@ -72,6 +72,7 @@ type Node struct {
 	storage               storage2.Storage
 	peerStorage           storage2.PeerServingStorage
 	compressedState       CompressedBlockStateProvider
+	shardBroadcastCache   *shardBroadcastBlockCache
 	blockCacheObserver    BlockCacheObserver
 	blockCacheSlots       chan struct{}
 	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
@@ -93,15 +94,12 @@ type Node struct {
 	seenMasterchainNotify     chan struct{}
 	latestBasechainNotify     chan struct{}
 	rawMasterchainNotify      chan struct{}
-	stateDownloadDir          string
-	stateDownloadDirOwned     bool
+	stateFilesDir             string
 	downloadPeerMx            sync.RWMutex
 	downloadPeerLeases        map[string]int
 	stateCellImportSlot       chan struct{}
-}
-
-type stateFileDirectoryProvider interface {
-	StateFilesDir() string
+	stateSplitPartDecodeSlot  chan struct{}
+	zeroStateBootstrapMu      sync.Mutex
 }
 
 func New(opts Options) (*Node, error) {
@@ -163,10 +161,9 @@ func New(opts Options) (*Node, error) {
 		return nil, fmt.Errorf("peer serving storage is required")
 	}
 
-	stateDirProvider, _ := peerStorage.(stateFileDirectoryProvider)
-	stateDownloadDir, stateDownloadDirOwned, err := prepareStateDownloadDir(opts.StateDownloadDir, stateDirProvider)
+	stateFilesDir, err := prepareStateFilesDir(opts.StateFilesDir)
 	if err != nil {
-		return nil, fmt.Errorf("prepare state download dir: %w", err)
+		return nil, fmt.Errorf("prepare state files dir: %w", err)
 	}
 
 	return &Node{
@@ -191,48 +188,29 @@ func New(opts Options) (*Node, error) {
 		rawMasterchainNotify:      make(chan struct{}),
 		storage:                   storage,
 		peerStorage:               peerStorage,
+		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastQueue:          newBoundedQueue(rebroadcastQueueMaxItems, rebroadcastQueueMaxBytes, rebroadcastRequestBytes),
 		localRebroadcastQueue:     newBoundedQueue(localExternalQueueMaxItems, localExternalQueueMaxBytes, rebroadcastRequestBytes),
 		rebroadcastThrottleLast:   map[string]time.Time{},
-		stateDownloadDir:          stateDownloadDir,
-		stateDownloadDirOwned:     stateDownloadDirOwned,
+		stateFilesDir:             stateFilesDir,
 		downloadPeerLeases:        map[string]int{},
 		stateCellImportSlot:       make(chan struct{}, 1),
+		stateSplitPartDecodeSlot:  make(chan struct{}, 1),
 	}, nil
 }
 
-func prepareStateDownloadDir(dir string, provider stateFileDirectoryProvider) (string, bool, error) {
-	if strings.TrimSpace(dir) != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", false, err
-		}
-		if err := removeIncompleteStateDownloadFiles(dir); err != nil {
-			return "", false, err
-		}
-		return dir, false, nil
+func prepareStateFilesDir(dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("state files dir is empty")
 	}
-
-	if provider != nil {
-		dir = provider.StateFilesDir()
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", false, err
-		}
-		if err := removeIncompleteStateDownloadFiles(dir); err != nil {
-			return "", false, err
-		}
-		return dir, false, nil
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
 	}
-
-	dir, err := os.MkdirTemp("", "flexserver-states-*")
-	if err != nil {
-		return "", false, err
+	if err := removeIncompleteStateFiles(dir); err != nil {
+		return "", err
 	}
-	if err := removeIncompleteStateDownloadFiles(dir); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", false, err
-	}
-	return dir, true, nil
+	return dir, nil
 }
 
 func privateKeyOrGenerate(key ed25519.PrivateKey) (ed25519.PrivateKey, error) {
@@ -308,7 +286,7 @@ func (n *Node) Start(ctx context.Context) error {
 		})
 	}
 	n.runAsync(func() {
-		n.runZeroStateBootstrap(ctx)
+		n.runShardBroadcastCacheJanitor(ctx)
 	})
 	if n.isPublicServer() {
 		n.runAsync(func() {
@@ -360,10 +338,8 @@ func (n *Node) stop() {
 		n.wg.Wait()
 		n.inboundWG.Wait()
 
-		if n.stateDownloadDir != "" && n.stateDownloadDirOwned {
-			_ = os.RemoveAll(n.stateDownloadDir)
-		} else if n.stateDownloadDir != "" {
-			_ = removeIncompleteStateDownloadFiles(n.stateDownloadDir)
+		if n.stateFilesDir != "" {
+			_ = removeIncompleteStateFiles(n.stateFilesDir)
 		}
 	})
 }
@@ -603,7 +579,7 @@ func (n *Node) InitBlock() (ton.BlockIDExt, error) {
 }
 
 func (n *Node) configuredZeroStateBlock() (ton.BlockIDExt, bool) {
-	if n.zeroStateBlock.SeqNo != 0 || !validBlockID(n.zeroStateBlock) {
+	if n.zeroStateBlock.Workchain != -1 || n.zeroStateBlock.Shard != topShard || n.zeroStateBlock.SeqNo != 0 || !validBlockID(n.zeroStateBlock) {
 		return ton.BlockIDExt{}, false
 	}
 	return n.zeroStateBlock, true
@@ -646,38 +622,21 @@ func emptyConfigBlock(block liteclient.ConfigBlock) bool {
 		len(block.FileHash) == 0
 }
 
-func (n *Node) runZeroStateBootstrap(ctx context.Context) {
+func (n *Node) EnsureZeroState(ctx context.Context) error {
 	block, ok := n.configuredZeroStateBlock()
 	if !ok {
-		return
+		return storage2.ErrNotFound
 	}
 
 	writer, _ := n.peerStorage.(storage2.PeerServingStorageWriter)
 	if writer == nil {
-		return
+		return storage2.ErrNotFound
 	}
 
-	timer := time.NewTimer(0)
-	defer timer.Stop()
+	n.zeroStateBootstrapMu.Lock()
+	defer n.zeroStateBootstrapMu.Unlock()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-
-		if err := n.ensureZeroState(ctx, block, writer); err == nil {
-			return
-		} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			n.log.Debug().
-				Err(err).
-				Str("block", formatBlockRef(block)).
-				Msg("zero state bootstrap attempt failed")
-		}
-
-		timer.Reset(zeroStateBootstrapRetry)
-	}
+	return n.ensureZeroState(ctx, block, writer)
 }
 
 func (n *Node) ensureZeroState(ctx context.Context, block ton.BlockIDExt, writer storage2.PeerServingStorageWriter) error {
@@ -686,6 +645,10 @@ func (n *Node) ensureZeroState(ctx context.Context, block ton.BlockIDExt, writer
 	} else if err != nil && !errors.Is(err, storage2.ErrNotFound) {
 		return err
 	}
+
+	n.log.Info().
+		Str("block", formatBlockRef(block)).
+		Msg("zero state is missing, downloading zero state")
 
 	artifact, err := n.DownloadState(ctx, block, block, 0, nil)
 	if err != nil {
@@ -704,22 +667,15 @@ func (n *Node) ensureZeroState(ctx context.Context, block ton.BlockIDExt, writer
 	if !ok {
 		return fmt.Errorf("unexpected zero state artifact %T", artifact)
 	}
-	data := append([]byte(nil), zero.data...)
+	zero.writer = writer
 
-	state, err := artifact.Decode(ctx)
-	if err != nil {
+	if _, err = artifact.Decode(ctx); err != nil {
 		return fmt.Errorf("verify zero state: %w", err)
-	}
-	if err = writer.SaveZeroState(block, data, nil); err != nil {
-		return fmt.Errorf("store zero state: %w", err)
 	}
 
 	logEvent := n.log.Info().
 		Str("block", formatBlockRef(block)).
-		Int("bytes", len(data))
-	if state != nil {
-		logEvent = logEvent.Uint64("cells", state.CellsCount)
-	}
+		Int("bytes", len(zero.data))
 	logEvent.Msg("zero state downloaded and stored")
 	return nil
 }

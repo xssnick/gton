@@ -181,12 +181,50 @@ func TestEnsurePeersReturnsWhenFirstPeerArrives(t *testing.T) {
 	}
 }
 
+func TestStartSeedFromDHTSetsCooldownAfterSearch(t *testing.T) {
+	node := newTestNode(t)
+	fake := &fakeDHTClient{}
+	node.dht = fake
+
+	sub := &overlaySubscription{
+		node:  node,
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+
+	before := time.Now()
+	sub.startSeedFromDHT(context.Background())
+	node.wg.Wait()
+
+	if fake.findOverlayNodesCalls != 1 {
+		t.Fatalf("expected one DHT search, got %d", fake.findOverlayNodesCalls)
+	}
+
+	sub.seedMx.Lock()
+	nextSeedAt := sub.nextSeedAt
+	sub.seedMx.Unlock()
+	delay := nextSeedAt.Sub(before)
+	if delay < dhtSeedCooldownMinDelay || delay > dhtSeedCooldownMinDelay+dhtSeedCooldownJitter+time.Second {
+		t.Fatalf("unexpected DHT seed cooldown: %s", delay)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sub.startSeedFromDHT(ctx)
+	node.wg.Wait()
+
+	if fake.findOverlayNodesCalls != 1 {
+		t.Fatalf("cooldown should block immediate DHT search, got %d calls", fake.findOverlayNodesCalls)
+	}
+}
+
 func TestAnnounceSelfRetriesAfterDHTWarmup(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,
 		ListenAddr:         "127.0.0.1:30303",
 		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

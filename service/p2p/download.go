@@ -6,8 +6,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
-	"flexserver/service/blockproof"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/blockproof"
+	tnstore "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"time"
 
@@ -41,6 +42,14 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 			Str("block", formatBlockRef(block)).
 			Msg("failed to load cached full block")
 	}
+	if cached, err := n.popShardBroadcastBlock(block); err == nil {
+		return cached, nil
+	} else if !errors.Is(err, tnstore.ErrNotFound) {
+		n.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Msg("failed to load cached shard broadcast block")
+	}
 
 	res, err := n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
 	if err != nil {
@@ -51,6 +60,26 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 	}
 	n.rememberDownloadedBlockAsync(nil, res)
 	return res, nil
+}
+
+func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt) error {
+	if isMasterchainBlock(block) {
+		return fmt.Errorf("masterchain block %s is not a shard prefetch candidate", formatBlockRef(block))
+	}
+	if n.shardBroadcastCache != nil && n.shardBroadcastCache.HasBlock(block) {
+		return nil
+	}
+
+	res, err := n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+	if err != nil {
+		return err
+	}
+	if !res.ID.Equals(&block) {
+		return fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
+	}
+
+	n.rememberShardBroadcastBlock(res)
+	return nil
 }
 
 func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
@@ -541,7 +570,7 @@ func (s *overlaySubscription) noteChainBlockDownloadSuccess(chain ton.BlockIDExt
 		s.log.Debug().
 			Str("chain", key.String()).
 			Str("peer", peer.addr).
-			Str("speed", formatByteRate(bytes, elapsed)).
+			Str("speed", logutil.FormatByteRate(bytes, elapsed)).
 			Msg("selected chain block download peer")
 	}
 	state.peer = peer
@@ -706,7 +735,7 @@ func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block t
 		return nil, fmt.Errorf("previous state root hash is not known for %s", formatBlockRef(prev))
 	}
 
-	root, _, err := n.storage.LoadStateCellTree(ctx, prev, meta.StateRootHash)
+	root, err := n.storage.LoadStateCellTree(ctx, prev, meta.StateRootHash)
 	if err != nil {
 		return nil, err
 	}

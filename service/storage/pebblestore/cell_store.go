@@ -6,21 +6,35 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/rs/zerolog"
 )
 
 const (
-	cellDBShardCount = 8
-	cellDBDirPrefix  = "celldb"
+	cellDBShardCount              = 8
+	cellDBRootDir                 = "celldb"
+	initialCellGenerationID       = 1
+	cellGenerationManifestVersion = 1
+	cellGenerationDirTemplate     = "gen%d-shard%d"
 )
 
 type cellStore struct {
-	shards [cellDBShardCount]*cellDBShard
-	cache  *pebble.Cache
-	mu     sync.Mutex
-	dirty  [cellDBShardCount]bool
+	generation  uint64
+	shards      [cellDBShardCount]*cellDBShard
+	cache       *pebble.Cache
+	fileCache   *pebble.FileCache
+	compactions *cellCompactionController
+	closeMu     sync.Mutex
+	closing     atomic.Bool
+	refs        atomic.Int64
+	drained     chan struct{}
+	drainOnce   sync.Once
+	closed      bool
+	mu          sync.Mutex
+	dirty       [cellDBShardCount]bool
 }
 
 type cellDBShard struct {
@@ -39,33 +53,109 @@ type cellStoreMetrics struct {
 	memTableCount          int64
 }
 
-func openCellStore(dir string, cacheSize int64, shardMemTableSize, bytesPerSync int, logger zerolog.Logger) (*cellStore, error) {
-	cells := &cellStore{cache: pebble.NewCache(cacheSize)}
-	for i := range cells.shards {
-		shardDir := filepath.Join(dir, fmt.Sprintf("%s-%d", cellDBDirPrefix, i))
-		if err := os.MkdirAll(shardDir, 0o755); err != nil {
-			_ = cells.close()
-			return nil, fmt.Errorf("create celldb shard %d dir: %w", i, err)
-		}
-
-		shardLogger := logger.With().Str("db", "celldb").Int("shard", i).Logger()
-		db, err := pebble.Open(shardDir, newCellPebbleOptions(cells.cache, shardMemTableSize, bytesPerSync, shardLogger))
-		if err != nil {
-			_ = cells.close()
-			return nil, fmt.Errorf("open celldb shard %d: %w", i, err)
-		}
-
-		cells.shards[i] = &cellDBShard{
-			db: db,
-		}
+func openCellStore(dir string, generation uint64, cacheSize int64, shardMemTableSize, bytesPerSync int, readOnly bool, logger zerolog.Logger) (*cellStore, error) {
+	if generation == 0 {
+		return nil, fmt.Errorf("cell generation is zero")
 	}
+
+	started := time.Now()
+	logger.Info().
+		Uint64("generation", generation).
+		Int64("cache_size", cacheSize).
+		Int("shard_memtable_size", shardMemTableSize).
+		Int("bytes_per_sync", bytesPerSync).
+		Int("compaction_parallelism", pebbleCellCompactionParallelism()).
+		Int("max_concurrent_compactions", pebbleCellMaxConcurrentCompactions()).
+		Int("shards", cellDBShardCount).
+		Int("open_parallelism", cellDBShardCount).
+		Bool("read_only", readOnly).
+		Msg("opening celldb generation")
+	cells := &cellStore{
+		generation: generation,
+		cache:      pebble.NewCache(cacheSize),
+		fileCache:  newPebbleFileCache(defaultPebbleCellMaxOpenFiles),
+		drained:    make(chan struct{}),
+	}
+	compactions := newCellCompactionController(pebbleCellCompactionParallelism())
+	cells.compactions = compactions
+
+	var wg sync.WaitGroup
+	errs := make([]error, cellDBShardCount)
+	for i := range cells.shards {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			shardDir := cellGenerationShardDir(dir, generation, i)
+			if !readOnly {
+				if err := os.MkdirAll(shardDir, 0o755); err != nil {
+					errs[i] = fmt.Errorf("create celldb generation %d shard %d dir: %w", generation, i, err)
+					return
+				}
+			}
+
+			shardLogger := logger.With().Str("db", "celldb").Uint64("generation", generation).Int("shard", i).Logger()
+			compactionScheduler := compactions.newScheduler()
+			shardOpts := newCellPebbleOptions(cells.cache, cells.fileCache, shardMemTableSize, bytesPerSync, compactionScheduler, shardLogger)
+			shardOpts.ReadOnly = readOnly
+			shardStarted := time.Now()
+			logger.Info().
+				Uint64("generation", generation).
+				Int("shard", i).
+				Str("dir", shardDir).
+				Msg("opening celldb shard")
+			db, err := pebble.Open(shardDir, shardOpts)
+			if err != nil {
+				errs[i] = fmt.Errorf("open celldb generation %d shard %d: %w", generation, i, err)
+				return
+			}
+			logger.Info().
+				Uint64("generation", generation).
+				Int("shard", i).
+				Str("dir", shardDir).
+				Dur("elapsed", time.Since(shardStarted)).
+				Msg("opened celldb shard")
+
+			cells.shards[i] = &cellDBShard{
+				db: db,
+			}
+		}(i)
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		_ = cells.close()
+		return nil, err
+	}
+	compactions.start()
+
+	logger.Info().
+		Uint64("generation", generation).
+		Int("shards", cellDBShardCount).
+		Dur("elapsed", time.Since(started)).
+		Msg("opened celldb generation")
 	return cells, nil
+}
+
+func cellGenerationShardDir(dir string, generation uint64, shard int) string {
+	return filepath.Join(dir, cellDBRootDir, fmt.Sprintf(cellGenerationDirTemplate, generation, shard))
 }
 
 func (c *cellStore) close() error {
 	if c == nil {
 		return nil
 	}
+
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closing.Store(true)
+	if c.refs.Load() == 0 {
+		c.signalDrained()
+	}
+	<-c.drained
+	c.closed = true
 
 	var err error
 	for i, shard := range c.shards {
@@ -77,11 +167,52 @@ func (c *cellStore) close() error {
 		}
 		c.shards[i] = nil
 	}
+	if c.fileCache != nil {
+		c.fileCache.Unref()
+		c.fileCache = nil
+	}
 	if c.cache != nil {
 		c.cache.Unref()
 		c.cache = nil
 	}
 	return err
+}
+
+func (c *cellStore) acquire() error {
+	if c == nil {
+		return errPebbleClosed
+	}
+	if c.closing.Load() {
+		return errPebbleClosed
+	}
+	c.refs.Add(1)
+	if c.closing.Load() {
+		c.release()
+		return errPebbleClosed
+	}
+	return nil
+}
+
+func (c *cellStore) release() {
+	if c == nil {
+		return
+	}
+	if c.refs.Add(-1) == 0 && c.closing.Load() {
+		c.signalDrained()
+	}
+}
+
+func (c *cellStore) signalDrained() {
+	c.drainOnce.Do(func() {
+		close(c.drained)
+	})
+}
+
+func (c *cellStore) throttleCompactions() func() {
+	if c == nil || c.compactions == nil {
+		return func() {}
+	}
+	return c.compactions.beginForegroundRead()
 }
 
 func (c *cellStore) shardForHash(hash []byte) (int, *cellDBShard, error) {
@@ -101,7 +232,7 @@ func (c *cellStore) getCopy(hash []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pebbleReaderGetCopy(shard.db, cellKey(hash))
+	return pebbleReaderGetCopy(shard.db, hash)
 }
 
 func (c *cellStore) has(hash []byte) (bool, error) {
@@ -109,7 +240,7 @@ func (c *cellStore) has(hash []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return pebbleReaderHas(shard.db, cellKey(hash))
+	return pebbleReaderHas(shard.db, hash)
 }
 
 func (c *cellStore) newBatchWriter() *cellBatchWriter {
@@ -177,8 +308,8 @@ func (c *cellStore) metrics() cellStoreMetrics {
 		dbMetrics := shard.db.Metrics()
 		metrics.flushCount += dbMetrics.Flush.Count
 		metrics.ingestCount += dbMetrics.Ingest.Count
-		metrics.l0Files += dbMetrics.Levels[0].NumFiles
-		metrics.l0Size += dbMetrics.Levels[0].Size
+		metrics.l0Files += dbMetrics.Levels[0].TablesCount
+		metrics.l0Size += dbMetrics.Levels[0].TablesSize
 		metrics.compactionDebt += dbMetrics.Compact.EstimatedDebt
 		metrics.compactionsInProgress += dbMetrics.Compact.NumInProgress
 		metrics.compactionBytesPending += dbMetrics.Compact.InProgressBytes
@@ -206,7 +337,7 @@ func (w *cellBatchWriter) set(hash []byte, value []byte) error {
 		return err
 	}
 
-	if err = w.batches[idx].Set(cellKey(hash), value, pebble.NoSync); err != nil {
+	if err = w.batches[idx].Set(hash, value, pebble.NoSync); err != nil {
 		return err
 	}
 
@@ -292,10 +423,6 @@ func (w *cellBatchWriter) ensureBatch(hash []byte) (int, error) {
 		w.batches[idx] = shard.db.NewBatchWithSize(cellShardBatchInitialSize())
 	}
 	return idx, nil
-}
-
-func cellKey(hash []byte) []byte {
-	return hash
 }
 
 func cellShardMemTableSize(total int) int {

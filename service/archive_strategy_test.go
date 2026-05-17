@@ -1,74 +1,37 @@
 package service
 
 import (
+	"errors"
 	"testing"
+	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestArchiveCatchUpTargetByKnownTargetTimeUsesLagHysteresis(t *testing.T) {
-	current := &storage.CurrentState{
-		Masterchain: storage.BlockState{Block: ton.BlockIDExt{SeqNo: 1000}},
-	}
-	target := ton.BlockIDExt{SeqNo: 5000}
-
-	_, lagSeconds, ok := archiveCatchUpTargetByKnownTargetTime(current, target, 10, 10+nextToArchiveLagSeconds)
-	if ok {
+func TestShouldSwitchNextToArchiveByLagUsesSwitchThreshold(t *testing.T) {
+	if shouldSwitchNextToArchiveByLag(nextToArchiveLagSeconds) {
 		t.Fatal("archive catch-up should not start at the switch boundary")
 	}
-	if lagSeconds != nextToArchiveLagSeconds {
-		t.Fatalf("lag seconds mismatch: got %d want %d", lagSeconds, int64(nextToArchiveLagSeconds))
-	}
 
-	archiveTarget, lagSeconds, ok := archiveCatchUpTargetByKnownTargetTime(current, target, 10, 10+nextToArchiveLagSeconds+1)
-	if !ok {
+	if !shouldSwitchNextToArchiveByLag(nextToArchiveLagSeconds + 1) {
 		t.Fatal("archive catch-up should start above the switch boundary")
-	}
-	if lagSeconds != nextToArchiveLagSeconds+1 {
-		t.Fatalf("lag seconds mismatch: got %d want %d", lagSeconds, int64(nextToArchiveLagSeconds+1))
-	}
-	if !archiveTarget.Equals(&target) {
-		t.Fatalf("archive target = %s, want %s", storage.FormatBlockRef(archiveTarget), storage.FormatBlockRef(target))
 	}
 }
 
-func TestShouldStopArchiveCatchUpUsesLiveTailLag(t *testing.T) {
-	if !shouldStopArchiveCatchUpByLag(archiveToNextLagSeconds - 1) {
-		t.Fatal("archive catch-up should stop below the live tail lag")
+func TestShouldSwitchArchiveToNextUsesLiveTailLag(t *testing.T) {
+	if !shouldSwitchArchiveToNextByLag(archiveToNextLagSeconds - 1) {
+		t.Fatal("archive catch-up should switch below the live tail lag")
 	}
-	if shouldStopArchiveCatchUpByLag(archiveToNextLagSeconds) {
+	if shouldSwitchArchiveToNextByLag(archiveToNextLagSeconds) {
 		t.Fatal("archive catch-up should continue at the live tail boundary")
 	}
 }
 
-func TestArchiveCatchUpTargetByTimeStartsForStaleMasterchain(t *testing.T) {
-	current := &storage.CurrentState{
-		ShardClientSeqno: 1000,
-		Masterchain: storage.BlockState{
-			Block:  ton.BlockIDExt{SeqNo: 1000},
-			Parsed: &tlb.ShardStateUnsplit{GenUTime: 10},
-		},
-	}
-
-	archiveTarget, lagSeconds, ok := archiveCatchUpTargetByTime(current, 10+nextToArchiveLagSeconds+1)
-	if !ok {
-		t.Fatal("archive catch-up should start for stale masterchain time")
-	}
-	if lagSeconds != nextToArchiveLagSeconds+1 {
-		t.Fatalf("lag seconds mismatch: got %d want %d", lagSeconds, int64(nextToArchiveLagSeconds+1))
-	}
-
-	want := current.Masterchain.Block.SeqNo + uint32(nextToArchiveLagSeconds+1-archiveToNextLagSeconds)
-	if archiveTarget.SeqNo != want {
-		t.Fatalf("archive target seqno mismatch: got %d want %d", archiveTarget.SeqNo, want)
-	}
-}
-
-func TestArchiveCatchUpTargetByBlockTimeStartsWithoutParsedState(t *testing.T) {
+func TestArchiveCatchUpTargetByLagStartsAboveNextToArchiveThreshold(t *testing.T) {
 	current := &storage.CurrentState{
 		ShardClientSeqno: 1000,
 		Masterchain: storage.BlockState{
@@ -76,35 +39,32 @@ func TestArchiveCatchUpTargetByBlockTimeStartsWithoutParsedState(t *testing.T) {
 		},
 	}
 
-	archiveTarget, lagSeconds, ok := archiveCatchUpTargetByBlockTime(current, 10, 10+nextToArchiveLagSeconds+1)
+	archiveTarget, ok := archiveCatchUpTargetByLag(current, nextToArchiveLagSeconds+1)
 	if !ok {
-		t.Fatal("archive catch-up should use explicit block time when parsed state is not loaded")
-	}
-	if lagSeconds != nextToArchiveLagSeconds+1 {
-		t.Fatalf("lag seconds mismatch: got %d want %d", lagSeconds, int64(nextToArchiveLagSeconds+1))
+		t.Fatal("archive catch-up should start above the next-to-archive threshold")
 	}
 
-	want := current.Masterchain.Block.SeqNo + uint32(nextToArchiveLagSeconds+1-archiveToNextLagSeconds)
+	want := ^uint32(0)
 	if archiveTarget.SeqNo != want {
 		t.Fatalf("archive target seqno mismatch: got %d want %d", archiveTarget.SeqNo, want)
 	}
 }
 
-func TestArchiveCatchUpTargetByTimeCapsLookahead(t *testing.T) {
+func TestArchiveCatchUpTargetByLagDoesNotGuessTargetFromRemainingLag(t *testing.T) {
 	current := &storage.CurrentState{
 		ShardClientSeqno: 1000,
 		Masterchain: storage.BlockState{
-			Block:  ton.BlockIDExt{SeqNo: 1000},
-			Parsed: &tlb.ShardStateUnsplit{GenUTime: 10},
+			Block: ton.BlockIDExt{SeqNo: 1000},
 		},
 	}
 
-	archiveTarget, _, ok := archiveCatchUpTargetByTime(current, 10+archiveToNextLagSeconds+int64(archiveTimeLagLookaheadBlocks*10))
+	remaining := int64(12_345)
+	archiveTarget, ok := archiveCatchUpTargetByLag(current, archiveToNextLagSeconds+remaining)
 	if !ok {
-		t.Fatal("archive catch-up should start for large stale masterchain time")
+		t.Fatal("archive catch-up should start for large masterchain lag")
 	}
 
-	want := current.Masterchain.Block.SeqNo + archiveTimeLagLookaheadBlocks
+	want := ^uint32(0)
 	if archiveTarget.SeqNo != want {
 		t.Fatalf("archive target seqno mismatch: got %d want %d", archiveTarget.SeqNo, want)
 	}
@@ -117,17 +77,35 @@ func TestArchivePipelineSchedulingUsesPendingWindowLimit(t *testing.T) {
 	}
 	planning := &storage.CurrentState{ShardClientSeqno: 100}
 
-	if !runner.canScheduleArchiveWindow(planning, 0) {
+	if !runner.canScheduleArchiveWindow(planning, 0, runner.target.SeqNo) {
 		t.Fatal("pipeline should schedule the first window immediately")
 	}
 
-	if runner.canScheduleArchiveWindow(planning, archiveMasterLookaheadWindows) {
+	if runner.canScheduleArchiveWindow(planning, archiveMasterLookaheadWindows, runner.target.SeqNo) {
 		t.Fatal("pipeline should stop scheduling at the pending window limit")
 	}
 
 	planning.ShardClientSeqno = runner.target.SeqNo
-	if runner.canScheduleArchiveWindow(planning, 0) {
+	if runner.canScheduleArchiveWindow(planning, 0, runner.target.SeqNo) {
 		t.Fatal("pipeline should stop scheduling at target")
+	}
+}
+
+func TestArchivePipelineSchedulingStopsNearLiveTail(t *testing.T) {
+	runner := &archiveCatchUpRunner{
+		service: &Service{archiveCatchUpPrefetchWindows: 2},
+		target:  testMasterBlockID(1000),
+	}
+	nowUnix := time.Now().Unix()
+	planning := &storage.CurrentState{
+		ShardClientSeqno: 100,
+		Masterchain: storage.BlockState{
+			Parsed: &tlb.ShardStateUnsplit{GenUTime: uint32(nowUnix - archiveToNextLagSeconds + 1)},
+		},
+	}
+
+	if runner.canScheduleArchiveWindow(planning, 0, runner.target.SeqNo) {
+		t.Fatal("pipeline should stop scheduling archive windows below the live-tail lag")
 	}
 }
 
@@ -135,6 +113,70 @@ func TestArchivePipelinePendingWindowLimitAllowsWideShardImportAhead(t *testing.
 	runner := &archiveCatchUpRunner{service: &Service{}}
 	if got := runner.archivePendingWindowLimit(); got != archiveMasterLookaheadWindows {
 		t.Fatalf("pending window limit = %d, want %d", got, archiveMasterLookaheadWindows)
+	}
+}
+
+func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
+	runner := &archiveCatchUpRunner{service: &Service{}}
+
+	if runner.archiveReadyWindowBacklog() != archiveReadyWindowBacklog {
+		t.Fatalf("ready window backlog = %d, want %d", runner.archiveReadyWindowBacklog(), archiveReadyWindowBacklog)
+	}
+
+	if runner.shouldEmitReadyArchiveWindow([]archivePendingWindow{testReadyArchiveWindow(nil)}) {
+		t.Fatal("pipeline should keep building backlog after the first ready window")
+	}
+
+	pending := make([]archivePendingWindow, archiveReadyWindowBacklog)
+	for i := range pending {
+		pending[i] = testReadyArchiveWindow(nil)
+	}
+	if !runner.shouldEmitReadyArchiveWindow(pending) {
+		t.Fatal("pipeline should emit when ready backlog is filled")
+	}
+}
+
+func TestArchivePipelineReadyWindowErrorEmitsImmediately(t *testing.T) {
+	runner := &archiveCatchUpRunner{service: &Service{}}
+	if !runner.shouldEmitReadyArchiveWindow([]archivePendingWindow{testReadyArchiveWindow(errors.New("boom"))}) {
+		t.Fatal("pipeline should emit ready window errors immediately")
+	}
+}
+
+func TestArchiveCheckpointBackpressureWaitsAtDoubleTarget(t *testing.T) {
+	runner := &archiveCatchUpRunner{
+		service:                &Service{archiveCatchUpCheckpointBlocks: 2000},
+		checkpointDone:         make(chan archiveCheckpointResult),
+		checkpointBlocksTarget: 2000,
+		lastCheckpointSeqno:    1000,
+		current:                &storage.CurrentState{ShardClientSeqno: 4999},
+	}
+	if runner.archiveCheckpointBackpressureBlocks() != 4000 {
+		t.Fatalf("checkpoint backpressure blocks = %d, want 4000", runner.archiveCheckpointBackpressureBlocks())
+	}
+	if runner.shouldWaitArchiveCheckpointBackpressure() {
+		t.Fatal("checkpoint backpressure should not wait below double target")
+	}
+
+	runner.current.ShardClientSeqno = 5000
+	if !runner.shouldWaitArchiveCheckpointBackpressure() {
+		t.Fatal("checkpoint backpressure should wait at double target")
+	}
+}
+
+func TestArchiveCheckpointAdaptiveTargetCapsBackpressureAtEightThousand(t *testing.T) {
+	service := &Service{archiveCatchUpCheckpointBlocks: 2000}
+	target := service.adaptArchiveCheckpointBlocks(4000, 2*time.Second)
+	if target != 4000 {
+		t.Fatalf("adaptive checkpoint target = %d, want 4000", target)
+	}
+
+	runner := &archiveCatchUpRunner{
+		service:                service,
+		checkpointBlocksTarget: target,
+	}
+	if runner.archiveCheckpointBackpressureBlocks() != 8000 {
+		t.Fatalf("checkpoint backpressure blocks = %d, want 8000", runner.archiveCheckpointBackpressureBlocks())
 	}
 }
 
@@ -172,6 +214,12 @@ func TestArchiveImportAppendKeepsAllImportedBlocks(t *testing.T) {
 	if len(dst.Links) != 2 {
 		t.Fatalf("stored links = %+v, want all links", dst.Links)
 	}
+}
+
+func testReadyArchiveWindow(err error) archivePendingWindow {
+	done := make(chan error, 1)
+	done <- err
+	return archivePendingWindow{shards: &archiveWindowShardImportTask{done: done}}
 }
 
 func TestArchiveMasterBlockSequenceStopsBeforeNonStartKeyBlock(t *testing.T) {

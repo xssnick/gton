@@ -5,35 +5,97 @@ import (
 	"fmt"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func (s *Service) catchUpShardClientWithNextBlocks(ctx context.Context, current *storage.CurrentState, target ton.BlockIDExt) (*storage.CurrentState, error) {
-	return s.runNextSyncToTarget(ctx, current, target)
-}
-
-func (s *Service) catchUpShardClientBootstrap(ctx context.Context, current *storage.CurrentState) (*storage.CurrentState, bool, error) {
-	return s.runNextSyncBootstrap(ctx, current)
-}
-
 func (s *Service) publishLiveCurrentState(current *storage.CurrentState) {
-	if current == nil {
-		return
-	}
-
-	s.currentStatusMu.Lock()
-	s.currentStatus = storage.CloneCurrentState(current)
-	s.currentStatusMu.Unlock()
+	s.publishLiveCurrentStateChanged(current)
 }
 
 func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
-	s.publishLiveCurrentState(current)
+	if !s.publishLiveCurrentStateChanged(current) {
+		return
+	}
 	if s.liveState != nil {
 		s.liveState.SetLiveCurrentState(current)
 	}
+	s.wakePersistentStateSerializer()
+}
+
+func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) bool {
+	if current == nil {
+		return false
+	}
+
+	next := storage.CloneCurrentState(current)
+
+	s.currentStatusMu.Lock()
+	if currentStateBehind(next, s.currentStatus) {
+		s.currentStatusMu.Unlock()
+		return false
+	}
+	s.currentStatus = next
+	s.currentStatusMu.Unlock()
+
+	s.observeCurrentSyncLag(context.Background(), next, time.Now())
+	return true
+}
+
+func (s *Service) observeCurrentSyncLag(ctx context.Context, current *storage.CurrentState, now time.Time) {
+	if s.syncLag == nil || current == nil {
+		return
+	}
+
+	if lag, ok := blockLagSeconds(ctx, s.storage, &current.Masterchain, now); ok {
+		s.syncLag.SetSyncLag(syncLagChainMasterchain, lag)
+	}
+
+	// One shardchain gauge represents all shards, so expose the slowest shard.
+	var shardLag float64
+	var shardLagKnown bool
+	for _, shard := range current.Shards {
+		lag, ok := blockLagSeconds(ctx, s.storage, &shard, now)
+		if !ok {
+			continue
+		}
+		if !shardLagKnown || lag > shardLag {
+			shardLag = lag
+			shardLagKnown = true
+		}
+	}
+	if shardLagKnown {
+		s.syncLag.SetSyncLag(syncLagChainShardchain, shardLag)
+	}
+}
+
+func blockLagSeconds(ctx context.Context, store storage.Storage, state *storage.BlockState, now time.Time) (float64, bool) {
+	utime := blockStateUtime(ctx, store, state)
+	if utime <= 0 {
+		return 0, false
+	}
+	return float64(now.Unix() - utime), true
+}
+
+func currentStateBehind(next *storage.CurrentState, current *storage.CurrentState) bool {
+	if next == nil || current == nil {
+		return false
+	}
+
+	nextShardClientSeqno := next.ShardClientSeqno
+	if nextShardClientSeqno == 0 {
+		nextShardClientSeqno = next.Masterchain.Block.SeqNo
+	}
+	currentShardClientSeqno := current.ShardClientSeqno
+	if currentShardClientSeqno == 0 {
+		currentShardClientSeqno = current.Masterchain.Block.SeqNo
+	}
+	if nextShardClientSeqno != currentShardClientSeqno {
+		return nextShardClientSeqno < currentShardClientSeqno
+	}
+	return next.Masterchain.Block.SeqNo < current.Masterchain.Block.SeqNo
 }
 
 type masterchainApplyTiming struct {
@@ -41,10 +103,6 @@ type masterchainApplyTiming struct {
 	prepare     time.Duration
 	consensus   time.Duration
 	stateUpdate time.Duration
-}
-
-func (s *Service) applyMasterchainTransition(current *storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, masterchainApplyTiming, error) {
-	return s.applyMasterchainTransitionWithConsensusProof(current, downloaded, nil, nil)
 }
 
 func (s *Service) applyMasterchainTransitionWithConsensusProof(current *storage.BlockState, downloaded p2p.DownloadedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
@@ -93,44 +151,51 @@ func (s *Service) applyMasterchainTransitionWithConsensusProof(current *storage.
 	return next, finish(), nil
 }
 
-func (s *Service) persistNextBlockCurrentState(current *storage.CurrentState, timing *catchUpTiming, states []*storage.BlockState, cells *stateCellCheckpointCache) (*storage.CurrentState, error) {
-	if err := s.takeCurrentStatePersistError(); err != nil {
+func (s *Service) persistNextBlockCurrentState(current *storage.CurrentState, timing *catchUpTiming, states []*storage.BlockState, cells *stateCellCheckpointCache, stateCells []storage.EncodedCellRecord, onCommitted func()) (*storage.CurrentState, error) {
+	if err := s.checkCurrentStatePersistAllowed(); err != nil {
+		return nil, err
+	}
+
+	queuedAt := time.Now()
+	lockStarted := time.Now()
+	s.currentStatePersistMu.Lock()
+	lockElapsed := time.Since(lockStarted)
+	timing.persist += lockElapsed
+
+	return s.persistNextBlockCurrentStateLocked(current, timing, states, cells, stateCells, onCommitted, lockElapsed, queuedAt)
+}
+
+func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, states []*storage.BlockState, cells *stateCellCheckpointCache, stateCells []storage.EncodedCellRecord, onCommitted func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
+	if err := s.checkCurrentStatePersistAllowed(); err != nil {
+		s.currentStatePersistMu.Unlock()
 		return nil, err
 	}
 
 	checkpoint, err := prepareStateCheckpoint(current, states)
 	if err != nil {
+		s.currentStatePersistMu.Unlock()
 		return nil, err
 	}
 	master := current.Masterchain.Block
 	artifactTarget := s.appliedBlockArtifactTarget()
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
-	queuedAt := time.Now()
-
-	lockStarted := time.Now()
-	s.currentStatePersistMu.Lock()
-	timing.persist += time.Since(lockStarted)
-	if err := s.takeCurrentStatePersistError(); err != nil {
-		s.currentStatePersistMu.Unlock()
-		return nil, err
-	}
 	timing.checkpoints++
 
 	s.log.Debug().
 		Str("masterchain", storage.FormatBlockRef(master)).
 		Uint32("shard_client_seqno", shardClientSeqno).
 		Int("shards", shards).
+		Dur("lock_wait", lockElapsed).
 		Msg("next-block shard-client checkpoint scheduled")
 
 	persistCtx := s.currentStatePersistContext()
 	s.runAsync(func() {
-		defer s.currentStatePersistMu.Unlock()
-
 		started := time.Now()
-		cellRecords := cells.records()
+		cellRecords := mergeEncodedCellRecords(cells.records(), stateCells)
 		committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.states, artifactTarget, cellRecords)
 		elapsed := time.Since(started)
+		s.currentStatePersistMu.Unlock()
 		if err != nil {
 			wrapped := fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 			s.setCurrentStatePersistError(wrapped)
@@ -144,6 +209,9 @@ func (s *Service) persistNextBlockCurrentState(current *storage.CurrentState, ti
 			return
 		}
 
+		if onCommitted != nil {
+			onCommitted()
+		}
 		s.log.Debug().
 			Str("masterchain", storage.FormatBlockRef(master)).
 			Uint32("shard_client_seqno", shardClientSeqno).
@@ -159,8 +227,8 @@ func (s *Service) persistNextBlockCurrentState(current *storage.CurrentState, ti
 	return checkpoint.live, nil
 }
 
-func (s *Service) persistNextBlockCurrentStateSync(current *storage.CurrentState, timing *catchUpTiming, reason string, states []*storage.BlockState, cells *stateCellCheckpointCache) (*storage.CurrentState, error) {
-	if err := s.takeCurrentStatePersistError(); err != nil {
+func (s *Service) persistNextBlockCurrentStateSync(current *storage.CurrentState, timing *catchUpTiming, reason string, states []*storage.BlockState, cells *stateCellCheckpointCache, stateCells []storage.EncodedCellRecord) (*storage.CurrentState, error) {
+	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		return nil, err
 	}
 
@@ -176,16 +244,17 @@ func (s *Service) persistNextBlockCurrentStateSync(current *storage.CurrentState
 	lockStarted := time.Now()
 	s.currentStatePersistMu.Lock()
 	timing.persist += time.Since(lockStarted)
-	defer s.currentStatePersistMu.Unlock()
-	if err := s.takeCurrentStatePersistError(); err != nil {
+	if err := s.checkCurrentStatePersistAllowed(); err != nil {
+		s.currentStatePersistMu.Unlock()
 		return nil, err
 	}
 	timing.checkpoints++
 
 	started := time.Now()
 	persistCtx := s.currentStatePersistContext()
-	cellRecords := cells.records()
+	cellRecords := mergeEncodedCellRecords(cells.records(), stateCells)
 	committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.states, artifactTarget, cellRecords)
+	s.currentStatePersistMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 	}
@@ -231,18 +300,20 @@ func (s *Service) takeCurrentStatePersistError() error {
 }
 
 func (s *Service) waitCurrentStatePersist(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
-		s.currentStatePersistMu.Lock()
-		s.currentStatePersistMu.Unlock()
-		close(done)
-	}()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		return s.takeCurrentStatePersistError()
+	for {
+		if s.currentStatePersistMu.TryLock() {
+			s.currentStatePersistMu.Unlock()
+			return s.takeCurrentStatePersistError()
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

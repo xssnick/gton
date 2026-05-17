@@ -7,25 +7,27 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/blocksync"
-	"flexserver/service/p2p"
-	"flexserver/service/state"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/blocksync"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/state"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
 	topShard                         = int64(-1 << 63)
+	syncLagChainMasterchain          = "masterchain"
+	syncLagChainShardchain           = "shardchain"
 	shardStateCatchUpParallelism     = 4
 	shardStateDownloadBuffer         = 32
 	shardStateDownloadWorkers        = 4
 	nextBlockDescriptionLookahead    = shardStateDownloadBuffer
 	shardStateCatchUpRetryDelay      = time.Second
 	currentStateLivePollDelay        = 300 * time.Millisecond
-	nextBlockCatchUpCheckpointBlocks = 300
-	nextBlockIdleCheckpointDelay     = 2 * time.Second
+	nextBlockCatchUpCheckpointBlocks = 600
 	nextBlockBootstrapBlocks         = 0
 	nextBlockBootstrapProbeTimeout   = 2 * time.Second
 	nextBlockBootstrapProbePeers     = 3
@@ -40,6 +42,8 @@ const (
 var (
 	errMasterchainPrevMismatch = errors.New("masterchain previous state is not current")
 	errSyncedBlockNotVerified  = errors.New("synced block was not verified")
+	errShardDescriptionTooOld  = errors.New("shard block description is older than current state")
+	errShardDescriptionTooNew  = errors.New("shard block description is too far ahead of current state")
 )
 var errShardCatchUpNeedsSnapshot = errors.New("shard catch-up requires state snapshot")
 
@@ -65,11 +69,6 @@ type catchUpTiming struct {
 	apply         time.Duration
 	persist       time.Duration
 	checkpoints   uint32
-}
-
-type currentStateResult struct {
-	state   *storage.CurrentState
-	changed bool
 }
 
 type nextShardClientApplyStats struct {
@@ -103,6 +102,7 @@ type Service struct {
 	storage   storage.Storage
 	stateSync *state.Syncer
 	liveState CurrentStatePublisher
+	syncLag   SyncLagObserver
 
 	appliedArtifacts *appliedBlockArtifactWriter
 
@@ -113,7 +113,11 @@ type Service struct {
 
 	stateMu sync.Mutex
 
-	currentStateWake chan struct{}
+	currentStateWake      chan struct{}
+	shardDescriptionWake  chan struct{}
+	shardDescriptionMu    sync.Mutex
+	shardDescriptionHints map[string]shardDescriptionHint
+	shardDescriptionOrder []string
 
 	nextMasterchainMx    sync.Mutex
 	nextMasterchainQueue map[string]p2p.DownloadedBlock
@@ -125,6 +129,17 @@ type Service struct {
 	currentStatePersistMu    sync.Mutex
 	currentStatePersistErrMu sync.Mutex
 	currentStatePersistErr   error
+	stateCellLoaderMu        sync.RWMutex
+	stateCellLoaders         map[uint64]cell.LazyCellLoader
+	nextStateCellLoaderID    uint64
+	stateSerializer          *stateSerializer
+	stateSerializerWake      chan struct{}
+	stateTTL                 time.Duration
+	archiveTTL               time.Duration
+	exclusiveTaskMu          sync.Mutex
+	exclusiveTask            exclusiveServiceTask
+	cellMigrationMu          sync.Mutex
+	cellGenerationSwitching  bool
 	currentStatusMu          sync.RWMutex
 	currentStatus            *storage.CurrentState
 
@@ -138,10 +153,19 @@ type Options struct {
 	ArchiveCatchUpPrefetchWindows  int
 	CurrentStatePublisher          CurrentStatePublisher
 	ShutdownContext                context.Context
+	StateFilesDir                  string
+	StateTTL                       time.Duration
+	ArchiveTTL                     time.Duration
+	DisableStateSerialization      bool
+	SyncLagObserver                SyncLagObserver
 }
 
 type CurrentStatePublisher interface {
 	SetLiveCurrentState(*storage.CurrentState)
+}
+
+type SyncLagObserver interface {
+	SetSyncLag(chain string, seconds float64)
 }
 
 type StatusSnapshot struct {
@@ -167,6 +191,12 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	if opts.ShutdownContext == nil {
 		opts.ShutdownContext = context.Background()
 	}
+	if opts.StateTTL <= 0 {
+		opts.StateTTL = 3 * 24 * time.Hour
+	}
+	if opts.ArchiveTTL <= 0 {
+		opts.ArchiveTTL = 7 * 24 * time.Hour
+	}
 
 	svc := &Service{
 		log:                            logger,
@@ -175,13 +205,20 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		storage:                        store,
 		stateSync:                      stateSync,
 		liveState:                      opts.CurrentStatePublisher,
+		syncLag:                        opts.SyncLagObserver,
 		appliedArtifacts:               newAppliedBlockArtifactWriter(logger, store, appliedBlockArtifactFlusher(opts.CurrentStatePublisher)),
 		archiveCatchUpCheckpointBlocks: opts.ArchiveCatchUpCheckpointBlocks,
 		archiveCatchUpCheckpointPeriod: opts.ArchiveCatchUpCheckpointPeriod,
 		archiveCatchUpPrefetchWindows:  opts.ArchiveCatchUpPrefetchWindows,
 		shutdownContext:                opts.ShutdownContext,
 		currentStateWake:               make(chan struct{}, 1),
+		shardDescriptionWake:           make(chan struct{}, 1),
+		shardDescriptionHints:          map[string]shardDescriptionHint{},
+		stateSerializerWake:            make(chan struct{}, 1),
+		stateTTL:                       opts.StateTTL,
+		archiveTTL:                     opts.ArchiveTTL,
 	}
+	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization)
 	svc.configureLiveBlockPublisher(opts.CurrentStatePublisher)
 	return svc
 }
@@ -199,6 +236,16 @@ func (s *Service) Start(ctx context.Context) error {
 		s.runAsync(func() {
 			s.runBlockProcessor(ctx)
 		})
+		s.runAsync(func() {
+			s.runShardDescriptionProcessor(ctx)
+		})
+		s.runAsync(func() {
+			s.runPersistentStateSerializer(ctx)
+		})
+		s.runAsync(func() {
+			s.runArchiveGC(ctx)
+		})
+		s.resumePendingCellGenerationMigration(ctx)
 	})
 	return nil
 }
@@ -389,20 +436,17 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	}
 
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
-		verified, err := s.validateSyncedMasterchainBlock(ctx, downloaded)
-		if err != nil {
+		if err := s.validateSyncedMasterchainBlock(ctx, downloaded); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return fmt.Errorf("%w: %v", errSyncedBlockNotVerified, err)
+			}
 			return err
-		}
-		if !verified {
-			return errSyncedBlockNotVerified
 		}
 		downloaded, err = prepareDownloadedBlockStateCells(downloaded)
 		if err != nil {
 			return err
 		}
-		if err := s.rememberSeenMasterchainBlock(ctx, downloaded.ID); err != nil {
-			return err
-		}
+		s.rememberSeenMasterchainBlock(downloaded.ID)
 		s.queueVerifiedMasterchainBlock(downloaded)
 		s.wakeCurrentStateSync()
 		return nil
@@ -413,9 +457,9 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	return nil
 }
 
-func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, downloaded p2p.DownloadedBlock) (bool, error) {
+func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, downloaded p2p.DownloadedBlock) error {
 	if downloaded.Meta == nil || len(downloaded.Meta.PrevRefs) != 1 {
-		return false, fmt.Errorf("masterchain block %s has no single previous ref", downloaded.BlockRef())
+		return fmt.Errorf("masterchain block %s has no single previous ref", downloaded.BlockRef())
 	}
 
 	prev := downloaded.Meta.PrevRefs[0]
@@ -425,16 +469,16 @@ func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, downloaded
 			Str("block", downloaded.BlockRef()).
 			Str("prev", storage.FormatBlockRef(prev)).
 			Msg("skipping synced masterchain block until previous state is available for signature validation")
-		return false, nil
+		return fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
 	}
 	if err != nil {
-		return false, fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
+		return fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
 	}
 
-	if err = s.validateMasterchainBlockConsensus(current, tonBlockForConsensus{block: downloaded.ID, proofBOC: downloaded.ProofBOC, broadcastSignatures: downloaded.BroadcastSignatures}); err != nil {
-		return false, fmt.Errorf("validate synced masterchain block %s: %w", downloaded.BlockRef(), err)
+	if err = s.validateMasterchainBlockConsensusWithProof(current, tonBlockForConsensus{block: downloaded.ID, proofBOC: downloaded.ProofBOC, broadcastSignatures: downloaded.BroadcastSignatures}, nil); err != nil {
+		return fmt.Errorf("validate synced masterchain block %s: %w", downloaded.BlockRef(), err)
 	}
-	return true, nil
+	return nil
 }
 
 func waitRetry(ctx context.Context, delay time.Duration) error {
@@ -468,6 +512,14 @@ func (s *Service) wakeCurrentStateSync() {
 	case s.currentStateWake <- struct{}{}:
 	default:
 	}
+	s.wakePersistentStateSerializer()
+}
+
+func (s *Service) wakePersistentStateSerializer() {
+	select {
+	case s.stateSerializerWake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Service) logProcessError(err error) {
@@ -482,6 +534,9 @@ func isExpectedRetryError(err error) bool {
 	if errors.Is(err, p2p.ErrStateNotAvailable) ||
 		errors.Is(err, p2p.ErrBlockNotAvailable) ||
 		errors.Is(err, errSyncedBlockNotVerified) ||
+		errors.Is(err, errCellGenerationMigrationRunning) ||
+		errors.Is(err, errArchiveTTLGCActive) ||
+		errors.Is(err, errStateSerializationCanceled) ||
 		errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
@@ -497,9 +552,27 @@ func formatCatchUpProgress(done, total uint32) string {
 		return "100.0%"
 	}
 
-	progress := float64(done) * 100 / float64(total)
+	return formatCatchUpProgressPercent(float64(done) * 100 / float64(total))
+}
+
+func formatLagCatchUpProgress(startRemaining int64, remaining int64) string {
+	if startRemaining <= 0 || remaining <= 0 {
+		return "100.0%"
+	}
+	if remaining >= startRemaining {
+		return "0.0%"
+	}
+
+	progress := float64(startRemaining-remaining) * 100 / float64(startRemaining)
+	return formatCatchUpProgressPercent(progress)
+}
+
+func formatCatchUpProgressPercent(progress float64) string {
 	if progress > 0 && progress < 0.1 {
 		return fmt.Sprintf("%.3f%%", progress)
+	}
+	if progress > 100 {
+		progress = 100
 	}
 	return fmt.Sprintf("%.1f%%", progress)
 }
@@ -524,41 +597,6 @@ func formatBlockRate64(done uint64, elapsed time.Duration) string {
 	}
 }
 
-func formatCellRate64(cells uint64, elapsed time.Duration) string {
-	if cells == 0 || elapsed <= 0 {
-		return "0 cells/s"
-	}
-
-	rate := float64(cells) / elapsed.Seconds()
-	switch {
-	case rate >= 1_000_000:
-		return fmt.Sprintf("%.2f Mcells/s", rate/1_000_000)
-	case rate >= 1_000:
-		return fmt.Sprintf("%.2f Kcells/s", rate/1_000)
-	default:
-		return fmt.Sprintf("%.0f cells/s", rate)
-	}
-}
-
-func formatByteRate(bytes int64, elapsed time.Duration) string {
-	if bytes <= 0 || elapsed <= 0 {
-		return "0 B/s"
-	}
-
-	rate := float64(bytes) / elapsed.Seconds()
-	units := []string{"B/s", "KB/s", "MB/s", "GB/s"}
-	unit := 0
-	for rate >= 1024 && unit < len(units)-1 {
-		rate /= 1024
-		unit++
-	}
-
-	if unit == 0 {
-		return fmt.Sprintf("%.0f %s", rate, units[unit])
-	}
-	return fmt.Sprintf("%.2f %s", rate, units[unit])
-}
-
 func formatCatchUpETA(done, total uint32, elapsed time.Duration) string {
 	if done == 0 || done >= total || elapsed <= 0 {
 		return "unknown"
@@ -570,6 +608,21 @@ func formatCatchUpETA(done, total uint32, elapsed time.Duration) string {
 	}
 
 	remaining := total - done
+	eta := time.Duration(float64(remaining) / rate * float64(time.Second)).Round(time.Second)
+	return eta.String()
+}
+
+func formatLagCatchUpETA(startRemaining int64, remaining int64, elapsed time.Duration) string {
+	if startRemaining <= 0 || remaining <= 0 || remaining >= startRemaining || elapsed <= 0 {
+		return "unknown"
+	}
+
+	done := startRemaining - remaining
+	rate := float64(done) / elapsed.Seconds()
+	if rate <= 0 {
+		return "unknown"
+	}
+
 	eta := time.Duration(float64(remaining) / rate * float64(time.Second)).Round(time.Second)
 	return eta.String()
 }

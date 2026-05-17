@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -20,18 +20,16 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 	}
 
 	event := s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Uint64("cells", state.CellsCount)
+		Str("block", storage.FormatBlockRef(block))
 	event.Msg("loading block state lazy root from storage")
 
 	rootLoadStarted := time.Now()
-	root, err := s.loadLazyCell(ctx, state.StateCellHash)
+	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateCellHash)
 	if err != nil {
 		return nil, fmt.Errorf("load state root cell: %w", err)
 	}
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(state.Block)).
-		Uint64("cells", state.CellsCount).
 		Dur("elapsed", time.Since(rootLoadStarted)).
 		Msg("block state lazy root loaded")
 
@@ -40,12 +38,10 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 		return nil, fmt.Errorf("parse block state: %w", err)
 	}
 	parsed.StateFileHash = state.StateFileHash
-	parsed.CellsCount = state.CellsCount
-	parsed.DownloadedAt = state.DownloadedAt
+	parsed.MasterchainRef = state.MasterchainRef
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
-		Uint64("cells", parsed.CellsCount).
 		Dur("elapsed", time.Since(started)).
 		Msg("block state loaded")
 	return parsed, nil
@@ -56,7 +52,7 @@ func (s *Store) blockStateMeta(ctx context.Context, block ton.BlockIDExt) (stora
 	if err != nil {
 		return storage.BlockState{}, err
 	}
-	downloadedAt, cellsCount, rootHash, cellHash, fileHash, err := decodeBlockStateMeta(metaRaw)
+	rootHash, cellHash, fileHash, masterRef, err := decodeBlockStateMeta(metaRaw)
 	if err != nil {
 		return storage.BlockState{}, err
 	}
@@ -65,12 +61,11 @@ func (s *Store) blockStateMeta(ctx context.Context, block ton.BlockIDExt) (stora
 	}
 
 	return storage.BlockState{
-		Block:         block,
-		StateRootHash: bytes.Clone(rootHash),
-		StateCellHash: bytes.Clone(cellHash),
-		StateFileHash: bytes.Clone(fileHash),
-		CellsCount:    cellsCount,
-		DownloadedAt:  downloadedAt,
+		Block:          block,
+		StateRootHash:  bytes.Clone(rootHash),
+		StateCellHash:  bytes.Clone(cellHash),
+		StateFileHash:  bytes.Clone(fileHash),
+		MasterchainRef: masterRef,
 	}, nil
 }
 
@@ -83,7 +78,7 @@ func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.B
 	if err != nil {
 		return nil, err
 	}
-	meta, err := decodeBlockMeta(raw)
+	meta, err := decodeBlockMeta(block, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -110,14 +105,13 @@ func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey
 	var ltFound bool
 
 	if err := func() error {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-
-		if s.closed {
-			return errPebbleClosed
+		db, err := s.acquireHotDB(ctx)
+		if err != nil {
+			return err
 		}
+		defer s.releaseHotDB()
 
-		snap := s.hot.NewSnapshot()
+		snap := db.NewSnapshot()
 		defer func() { _ = snap.Close() }()
 
 		iter, err := snap.NewIter(&pebble.IterOptions{
@@ -179,13 +173,15 @@ func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {
 	if next == nil {
 		return fmt.Errorf("block meta is nil")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errPebbleClosed
+	db, err := s.acquireHotDB(context.Background())
+	if err != nil {
+		return err
 	}
+	defer s.releaseHotDB()
 
-	hotBatch := s.hot.NewBatch()
+	s.hotWriteMu.Lock()
+	defer s.hotWriteMu.Unlock()
+	hotBatch := db.NewBatch()
 	defer func() { _ = hotBatch.Close() }()
 
 	if err := s.setMergedBlockMeta(hotBatch, next); err != nil {
@@ -213,13 +209,12 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 
 	var existing *storage.BlockMeta
 	if existed {
-		existing, err = decodeBlockMeta(existingRaw)
+		existing, err = decodeBlockMeta(next.ID, existingRaw)
 		if err != nil {
 			return err
 		}
 	}
 	merged := storage.MergeBlockMeta(existing, next)
-	merged.UpdatedAt = time.Now()
 	encoded := encodeBlockMeta(merged)
 
 	if err = batch.Set(key, encoded, pebble.NoSync); err != nil {
@@ -242,14 +237,13 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 }
 
 func (s *Store) lookupBlockByBoundedIndex(ctx context.Context, prefix []byte, seek []byte) (ton.BlockIDExt, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
-		return ton.BlockIDExt{}, errPebbleClosed
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
 	}
+	defer s.releaseHotDB()
 
-	snap := s.hot.NewSnapshot()
+	snap := db.NewSnapshot()
 	defer func() { _ = snap.Close() }()
 
 	iter, err := snap.NewIter(&pebble.IterOptions{

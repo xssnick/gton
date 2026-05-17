@@ -3,7 +3,7 @@ package p2p
 import (
 	"fmt"
 
-	"flexserver/service/blockproof"
+	"github.com/xssnick/gton/service/blockproof"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"

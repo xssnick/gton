@@ -19,7 +19,7 @@ func (n *Node) decodeBroadcastBlock(ctx context.Context, msg any) (*DownloadedBl
 		return block, err
 	}
 
-	data, ok := msg.(BlockBroadcastCompressedV2)
+	data, ok := msg.(tonnodeapi.BlockBroadcastCompressedV2)
 	if !ok {
 		return nil, err
 	}
@@ -48,22 +48,22 @@ func decodeBroadcastBlock(msg any) (*DownloadedBlock, error) {
 		}
 		block.BroadcastSignatures = signatures
 		return block, nil
-	case BlockBroadcastCompressed:
+	case tonnodeapi.BlockBroadcastCompressed:
 		return decodeBlockBroadcastCompressed(data)
-	case BlockBroadcastCompressedV2:
+	case tonnodeapi.BlockBroadcastCompressedV2:
 		return decodeBlockBroadcastCompressedV2(data, nil)
 	default:
 		return nil, fmt.Errorf("unexpected broadcast block %T", msg)
 	}
 }
 
-func decodeBlockBroadcastCompressed(data BlockBroadcastCompressed) (*DownloadedBlock, error) {
+func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*DownloadedBlock, error) {
 	decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
 	if err != nil {
 		return nil, fmt.Errorf("decompress tonNode.blockBroadcastCompressed: %w", err)
 	}
 
-	var payload BlockBroadcastCompressedData
+	var payload tonnodeapi.BlockBroadcastCompressedData
 	left, err := tl.Parse(&payload, decompressed, true)
 	if err != nil {
 		return nil, fmt.Errorf("parse tonNode.blockBroadcastCompressed.data: %w", err)
@@ -96,7 +96,7 @@ func decodeBlockBroadcastCompressed(data BlockBroadcastCompressed) (*DownloadedB
 	return block, nil
 }
 
-func decodeBlockBroadcastCompressedV2(data BlockBroadcastCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
+func decodeBlockBroadcastCompressedV2(data tonnodeapi.BlockBroadcastCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
 	signatures, err := broadcastSignatureSetCell(data.SignatureSet)
 	if err != nil {
 		return nil, err
@@ -133,9 +133,9 @@ func broadcastProofIsLink(id ton.BlockIDExt) bool {
 
 func broadcastSignatureSetCell(sigSet any) (*cell.Cell, error) {
 	switch sig := sigSet.(type) {
-	case SignatureSetOrdinary:
+	case tonnodeapi.SignatureSetOrdinary:
 		return ordinaryBroadcastSignatureSetCell(sig.CatchainSeqno, sig.ValidatorSetHash, sig.Signatures)
-	case SignatureSetSimplex:
+	case tonnodeapi.SignatureSetSimplex:
 		return simplexBroadcastSignatureSetCell(sig)
 	default:
 		return nil, fmt.Errorf("%w: %T", errBroadcastSignatureSetUnsupported, sigSet)
@@ -158,7 +158,7 @@ func ordinaryBroadcastSignatureSetCell(catchainSeqno int32, validatorSetHash int
 		EndCell(), nil
 }
 
-func simplexBroadcastSignatureSetCell(sig SignatureSetSimplex) (*cell.Cell, error) {
+func simplexBroadcastSignatureSetCell(sig tonnodeapi.SignatureSetSimplex) (*cell.Cell, error) {
 	if !sig.Final {
 		return nil, fmt.Errorf("%w: non-final simplex signature set", errBroadcastSignatureSetUnsupported)
 	}

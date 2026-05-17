@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"path/filepath"
+	"sort"
 	"testing"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -46,7 +47,7 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for i := 0; i < b.N; i++ {
-			loaded, err := storage.LazyCellRecord(decodeCellRecordTrusted(hash, encoded), nil)
+			loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, encoded), nil)
 			if err != nil {
 				b.Fatalf("lazy cell record: %v", err)
 			}
@@ -94,7 +95,7 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 
 func BenchmarkPebbleSaveCells(b *testing.B) {
 	root, cells := benchmarkCellGraph(b, 1024, 4)
-	records, err := storage.CollectCellRecords(root)
+	records, err := collectCellRecordsForBenchmark(root)
 	if err != nil {
 		b.Fatalf("collect cell records: %v", err)
 	}
@@ -238,7 +239,7 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 
 func BenchmarkPebbleLoadCell(b *testing.B) {
 	root, _ := benchmarkCellGraph(b, 4096, 4)
-	records, err := storage.CollectCellRecords(root)
+	records, err := collectCellRecordsForBenchmark(root)
 	if err != nil {
 		b.Fatalf("collect cell records: %v", err)
 	}
@@ -334,6 +335,47 @@ func benchmarkCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell, int)
 	}
 
 	return level[0], total
+}
+
+func collectCellRecordsForBenchmark(root *cell.Cell) ([]*storage.CellRecord, error) {
+	if root == nil {
+		return nil, nil
+	}
+
+	seen := map[cell.Hash]struct{}{}
+	records := make([]*storage.CellRecord, 0, 1024)
+	stack := []*cell.Cell{root}
+
+	for len(stack) > 0 {
+		idx := len(stack) - 1
+		current := stack[idx]
+		stack = stack[:idx]
+
+		hash := current.HashKey()
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+
+		record, err := storage.CellRecordFromCell(current)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+
+		for i := uint(0); i < current.RefsNum(); i++ {
+			ref, err := current.PeekRef(int(i))
+			if err != nil {
+				return nil, err
+			}
+			stack = append(stack, ref)
+		}
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return bytes.Compare(records[i].Hash, records[j].Hash) < 0
+	})
+	return records, nil
 }
 
 func benchmarkParsedCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell, []cell.Cell, int) {

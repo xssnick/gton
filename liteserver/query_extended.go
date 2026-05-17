@@ -11,7 +11,7 @@ import (
 	"math/bits"
 	"sort"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -25,7 +25,10 @@ const (
 	outMsgQueueSizeLimit     = 8000
 )
 
-var errBlockCannotContainAccount = errors.New("obtained a block that cannot contain specified account")
+var (
+	errBlockCannotContainAccount = errors.New("obtained a block that cannot contain specified account")
+	errInMsgEnvelopeNotFound     = errors.New("in message envelope not found")
+)
 
 func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 	if !isFullBlockID(id) {
@@ -68,13 +71,13 @@ func (s *Server) handleSendMessage(ctx context.Context, query ton.SendMessage) a
 	const errorPrefix = "cannot apply external message to current state "
 
 	if s.messageSender == nil {
-		return ton.LSError{Code: errCodeInternal, Text: errorPrefix + ": not configured"}
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": not configured"}
 	}
 	if err := s.checkExternalMessage(ctx, query.Body); err != nil {
-		return errorResponse(err, errorPrefix)
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
 	}
 	if err := s.messageSender.SendExternalMessage(ctx, query.Body); err != nil {
-		return errorResponse(err, errorPrefix)
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
 	}
 	return ton.SendMessageStatus{Status: 1}
 }
@@ -89,19 +92,20 @@ func (s *Server) handleAllShardsInfo(ctx context.Context, id *ton.BlockIDExt) an
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*id))
 	}
 
+	loader, err := root.BeginParse()
+	if err != nil {
+		return errorResponse(err, "cannot unpack block "+storage.FormatBlockRef(*id))
+	}
+
 	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&block, loader); err != nil {
 		return errorResponse(err, "cannot unpack block "+storage.FormatBlockRef(*id))
 	}
 	if block.Extra == nil || block.Extra.Custom == nil || block.Extra.Custom.ShardHashes == nil {
 		return ton.LSError{Code: errCodeInternal, Text: "cannot unpack header of block " + cxxBlockIDExtString(*id)}
 	}
 
-	sk, err := allShardsInfoProofSkeleton(root)
-	if err != nil {
-		return errorResponse(err, "cannot create all shards proof")
-	}
-	proof, err := root.CreateProof(sk)
+	proof, err := allShardsInfoProof(root)
 	if err != nil {
 		return errorResponse(err, "cannot create all shards proof")
 	}
@@ -140,11 +144,11 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return errorResponse(err, "cannot load shard info")
 	}
 
-	stateSk, err := shardHashesProofSkeleton(stateRoot, query.Workchain)
+	stateProof, err := shardHashesProof(stateRoot, query.Workchain)
 	if err != nil {
 		return errorResponse(err, "cannot create shard info proof")
 	}
-	proof, err := s.blockStateProof(ctx, *query.ID, stateRoot, stateSk)
+	proof, err := s.blockStateProof(ctx, *query.ID, stateProof)
 	if err != nil {
 		return errorResponse(err, "cannot create shard info proof")
 	}
@@ -170,24 +174,16 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		effectiveMode |= configModeNeedCapabilities
 	}
 
-	stateRoot, err := s.loadStateRoot(ctx, *id)
+	stateRoot, blockRoot, err := s.loadStateRootWithBlockRoot(ctx, *id)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*id))
 	}
 
-	extra, err := mcStateExtra(stateRoot)
-	if err != nil {
-		return errorResponse(err, "cannot unpack masterchain state")
-	}
-	if extra.ConfigParams.Config.Params == nil {
-		return ton.LSError{Code: errCodeInternal, Text: "cannot extract configuration from last mc state"}
-	}
-
-	stateSk, err := configProofSkeleton(stateRoot, effectiveMode, all, params)
+	stateProof, err := configProof(stateRoot, effectiveMode, all, params)
 	if err != nil {
 		return errorResponse(err, "cannot create config proof")
 	}
-	proof, err := s.blockStateProof(ctx, *id, stateRoot, stateSk)
+	proof, err := blockStateProofFromRoot(blockRoot, stateProof)
 	if err != nil {
 		return errorResponse(err, "cannot create config proof")
 	}
@@ -206,22 +202,7 @@ func (s *Server) handlePreviousKeyBlockConfig(ctx context.Context, id ton.BlockI
 		return errorResponse(err, "cannot load previous key block config")
 	}
 
-	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, keyRoot.BeginParse()); err != nil {
-		return errorResponse(err, "cannot unpack key block "+storage.FormatBlockRef(keyBlock))
-	}
-	if block.Extra == nil || block.Extra.Custom == nil || block.Extra.Custom.ConfigParams == nil {
-		return ton.LSError{Code: errCodeInternal, Text: "cannot extract configuration from last mc state"}
-	}
-	if block.Extra.Custom.ConfigParams.Config.Params == nil {
-		return ton.LSError{Code: errCodeInternal, Text: "cannot extract configuration from last mc state"}
-	}
-
-	sk, err := keyBlockConfigProofSkeleton(keyRoot, mode, all, params)
-	if err != nil {
-		return errorResponse(err, "cannot create key block config proof")
-	}
-	proof, err := keyRoot.CreateProof(sk)
+	proof, err := keyBlockConfigProof(keyRoot, mode, all, params)
 	if err != nil {
 		return errorResponse(err, "cannot create key block config proof")
 	}
@@ -240,8 +221,13 @@ func (s *Server) previousKeyBlockRoot(ctx context.Context, id ton.BlockIDExt) (t
 		return ton.BlockIDExt{}, nil, err
 	}
 
+	loader, err := root.BeginParse()
+	if err != nil {
+		return ton.BlockIDExt{}, nil, err
+	}
+
 	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&block, loader); err != nil {
 		return ton.BlockIDExt{}, nil, err
 	}
 	if block.BlockInfo.KeyBlock {
@@ -261,8 +247,13 @@ func (s *Server) previousKeyBlockRoot(ctx context.Context, id ton.BlockIDExt) (t
 		return ton.BlockIDExt{}, nil, err
 	}
 
+	keyLoader, err := keyRoot.BeginParse()
+	if err != nil {
+		return ton.BlockIDExt{}, nil, err
+	}
+
 	var key tlb.Block
-	if err = tlb.LoadFromCell(&key, keyRoot.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&key, keyLoader); err != nil {
 		return ton.BlockIDExt{}, nil, err
 	}
 	if !key.BlockInfo.KeyBlock {
@@ -305,11 +296,11 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 		return errorResponse(err, "cannot load libraries")
 	}
 
-	stateSk, err := librariesProofSkeleton(root, query.LibraryList, query.Mode)
+	dataProof, err := librariesProof(root, query.LibraryList, query.Mode)
 	if err != nil {
 		return errorResponse(err, "cannot create library proof")
 	}
-	proof, err := s.blockStateProof(ctx, *query.ID, root, stateSk)
+	proof, err := s.blockStateProof(ctx, *query.ID, dataProof)
 	if err != nil {
 		return errorResponse(err, "cannot create library proof")
 	}
@@ -344,16 +335,9 @@ func (s *Server) handleOneTransaction(ctx context.Context, query ton.GetOneTrans
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*query.ID))
 	}
 
-	proof, err := root.CreateProof(blockTransactionsProofSkeleton(false))
+	proof, tx, err := blockTransactionProof(root, query.AccID.ID, uint64(query.LT))
 	if err != nil {
 		return errorResponse(err, "cannot create transaction proof")
-	}
-
-	tx, err := findBlockTransaction(root, query.AccID.ID, uint64(query.LT))
-	if errors.Is(err, storage.ErrNotFound) {
-		tx = nil
-	} else if err != nil {
-		return errorResponse(err, "cannot get transaction")
 	}
 
 	var data []byte
@@ -450,8 +434,13 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 			return ton.LSError{Code: errCodeProtoViolation, Text: "transaction hash mismatch"}
 		}
 
+		txLoader, err := tx.BeginParse()
+		if err != nil {
+			return errorResponse(err, "cannot unpack transaction")
+		}
+
 		var parsed tlb.Transaction
-		if err = tlb.LoadFromCell(&parsed, tx.BeginParse()); err != nil {
+		if err = tlb.LoadFromCell(&parsed, txLoader); err != nil {
 			return errorResponse(err, "cannot unpack transaction")
 		}
 		if parsed.LT != cursorLT {
@@ -584,14 +573,21 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*query.ID))
 	}
 
-	items, incomplete, err := listBlockTransactions(root, query.Mode, query.Count, query.After)
+	proofRoot := root
+	var proofBuilder *cell.MerkleProofBuilder
+	if query.Mode&32 != 0 {
+		proofBuilder = cell.NewMerkleProofBuilder(root)
+		proofRoot = proofBuilder.Root()
+	}
+
+	items, incomplete, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
 	if err != nil {
 		return errorResponse(err, "cannot list block transactions")
 	}
 
 	var proof *cell.Cell
-	if query.Mode&32 != 0 {
-		blockProof, err := root.CreateProof(blockTransactionsProofSkeleton(query.Mode&256 != 0))
+	if proofBuilder != nil {
+		blockProof, err := proofBuilder.CreateProof()
 		if err != nil {
 			return errorResponse(err, "cannot create block transaction proof")
 		}
@@ -636,7 +632,14 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*query.ID))
 	}
 
-	items, incomplete, err := listBlockTransactions(root, query.Mode, query.Count, query.After)
+	proofRoot := root
+	var proofBuilder *cell.MerkleProofBuilder
+	if query.Mode&32 != 0 || query.Mode&256 != 0 {
+		proofBuilder = cell.NewMerkleProofBuilder(root)
+		proofRoot = proofBuilder.Root()
+	}
+
+	items, incomplete, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
 	if err != nil {
 		return errorResponse(err, "cannot list block transactions")
 	}
@@ -647,8 +650,8 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 	}
 
 	var proof []byte
-	if query.Mode&32 != 0 || query.Mode&256 != 0 {
-		blockProof, err := root.CreateProof(blockTransactionsProofSkeleton(query.Mode&256 != 0))
+	if proofBuilder != nil {
+		blockProof, err := proofBuilder.CreateProof()
 		if err != nil {
 			return errorResponse(err, "cannot create block transaction proof")
 		}
@@ -680,16 +683,11 @@ func (s *Server) handleValidatorStats(ctx context.Context, query ton.GetValidato
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	count, complete, err := validatorStatsCount(root, query.Mode, query.Limit, query.StartAfter)
+	dataProof, count, complete, err := validatorStatsProofAndCount(root, query.Mode, query.Limit, query.StartAfter)
 	if err != nil {
 		return errorResponse(err, "cannot load validator stats")
 	}
-
-	stateSk, err := validatorStatsProofSkeleton(root)
-	if err != nil {
-		return errorResponse(err, "cannot create validator stats proof")
-	}
-	proof, err := s.blockStateProof(ctx, *query.ID, root, stateSk)
+	proof, err := s.blockStateProof(ctx, *query.ID, dataProof)
 	if err != nil {
 		return errorResponse(err, "cannot create validator stats proof")
 	}
@@ -725,11 +723,11 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 		Size: int64(size),
 	}
 	if query.Mode&1 != 0 {
-		stateSk, err := outMsgQueueSizeProofSkeleton(root)
+		dataProof, err := outMsgQueueSizeProof(root)
 		if err != nil {
 			return errorResponse(err, "cannot create out msg queue proof")
 		}
-		proof, err := s.blockStateProof(ctx, *query.ID, root, stateSk)
+		proof, err := s.blockStateProof(ctx, *query.ID, dataProof)
 		if err != nil {
 			return errorResponse(err, "cannot create out msg queue proof")
 		}
@@ -799,7 +797,7 @@ type blockTxItem struct {
 }
 
 func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after *ton.TransactionID3) ([]blockTxItem, bool, error) {
-	data, err := blockTransactionData(root)
+	data, err := blockTransactionData(root, mode&256 != 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -845,7 +843,11 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 			return nil, false, fmt.Errorf("lookup account block: %w", err)
 		}
 
-		account, err := accountKeyCell.BeginParse().LoadSlice(256)
+		accountKeyLoader, err := accountKeyCell.BeginParse()
+		if err != nil {
+			return nil, false, fmt.Errorf("begin parse account key: %w", err)
+		}
+		account, err := accountKeyLoader.LoadSlice(256)
 		if err != nil {
 			return nil, false, fmt.Errorf("load account key: %w", err)
 		}
@@ -878,7 +880,11 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 					return nil, false, fmt.Errorf("lookup account transaction: %w", err)
 				}
 
-				lt, err := txKeyCell.BeginParse().LoadUInt(64)
+				txKeyLoader, err := txKeyCell.BeginParse()
+				if err != nil {
+					return nil, false, fmt.Errorf("begin parse transaction lt: %w", err)
+				}
+				lt, err := txKeyLoader.LoadUInt(64)
 				if err != nil {
 					return nil, false, fmt.Errorf("load transaction lt: %w", err)
 				}
@@ -918,30 +924,63 @@ type blockTransactionsData struct {
 }
 
 func blockTransactionAccounts(root *cell.Cell) (*tlb.ShardAccountBlocks, error) {
-	data, err := blockTransactionData(root)
+	data, err := blockTransactionData(root, false)
 	if err != nil {
 		return nil, err
 	}
 	return data.shardAccounts, nil
 }
 
-func blockTransactionData(root *cell.Cell) (blockTransactionsData, error) {
-	var block tlb.Block
-	if err := tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
-		return blockTransactionsData{}, fmt.Errorf("load block: %w", err)
+func blockTransactionData(root *cell.Cell, withMetadata bool) (blockTransactionsData, error) {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return blockTransactionsData{}, fmt.Errorf("begin parse block: %w", err)
 	}
-	if block.Extra == nil || block.Extra.ShardAccountBlocks == nil {
+	magic, err := loader.LoadUInt(32)
+	if err != nil {
+		return blockTransactionsData{}, fmt.Errorf("load block magic: %w", err)
+	}
+	if magic != 0x11ef55aa {
+		return blockTransactionsData{}, fmt.Errorf("invalid block magic %x", magic)
+	}
+	if _, err = loader.LoadUInt(32); err != nil {
+		return blockTransactionsData{}, fmt.Errorf("load block global id: %w", err)
+	}
+
+	extraRoot, err := root.PeekRef(3)
+	if err != nil {
+		return blockTransactionsData{}, fmt.Errorf("load block extra: %w", err)
+	}
+	extraLoader, err := extraRoot.BeginParse()
+	if err != nil {
+		return blockTransactionsData{}, fmt.Errorf("begin parse block extra: %w", err)
+	}
+
+	var extra tlb.BlockExtra
+	if err := tlb.LoadFromCell(&extra, extraLoader); err != nil {
+		return blockTransactionsData{}, fmt.Errorf("load block extra: %w", err)
+	}
+	if extra.ShardAccountBlocks == nil {
 		return blockTransactionsData{}, fmt.Errorf("block does not contain shard account blocks")
 	}
 
+	shardAccountsLoader, err := extra.ShardAccountBlocks.BeginParse()
+	if err != nil {
+		return blockTransactionsData{}, fmt.Errorf("begin parse shard account blocks: %w", err)
+	}
+
 	var shardAccounts tlb.ShardAccountBlocks
-	if err := tlb.LoadFromCell(&shardAccounts, block.Extra.ShardAccountBlocks.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&shardAccounts, shardAccountsLoader); err != nil {
 		return blockTransactionsData{}, fmt.Errorf("load shard account blocks: %w", err)
 	}
 
 	var inMsgDescr *cell.AugmentedDictionary
-	if block.Extra.InMsgDesc != nil && (block.Extra.InMsgDesc.BitsSize() > 0 || block.Extra.InMsgDesc.RefsNum() > 0) {
-		dict, err := block.Extra.InMsgDesc.BeginParse().LoadAugDict(256, cell.ReadOnlyAugmentation{SkipExtraFn: skipImportFees}, false)
+	if withMetadata && extra.InMsgDesc != nil && (extra.InMsgDesc.BitsSize() > 0 || extra.InMsgDesc.RefsNum() > 0) {
+		inMsgLoader, err := extra.InMsgDesc.BeginParse()
+		if err != nil {
+			return blockTransactionsData{}, fmt.Errorf("begin parse inbound message descriptor: %w", err)
+		}
+		dict, err := inMsgLoader.LoadAugDict(256, cell.ReadOnlyAugmentation{SkipExtraFn: skipImportFees}, false)
 		if err != nil {
 			return blockTransactionsData{}, fmt.Errorf("load inbound message descriptor: %w", err)
 		}
@@ -975,8 +1014,13 @@ func transactionCellFromValue(value *cell.Slice) (*cell.Cell, error) {
 }
 
 func transactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell) (*ton.TransactionMetadata, error) {
+	loader, err := txCell.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse transaction: %w", err)
+	}
+
 	var tx tlb.Transaction
-	if err := tlb.LoadFromCell(&tx, txCell.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&tx, loader); err != nil {
 		return nil, fmt.Errorf("load transaction: %w", err)
 	}
 	if tx.IO.In == nil {
@@ -999,8 +1043,11 @@ func transactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell
 		return nil, fmt.Errorf("load inbound message descriptor augmentation: %w", err)
 	}
 
-	envelope, ok, err := inMsgEnvelope(value)
-	if err != nil || !ok {
+	envelope, err := inMsgEnvelope(value)
+	if errors.Is(err, errInMsgEnvelopeNotFound) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 	return msgEnvelopeMetadata(envelope)
@@ -1013,33 +1060,34 @@ func skipImportFees(loader *cell.Slice) error {
 	return tlb.LoadFromCell(new(tlb.CurrencyCollection), loader)
 }
 
-func inMsgEnvelope(loader *cell.Slice) (*cell.Cell, bool, error) {
+func inMsgEnvelope(loader *cell.Slice) (*cell.Cell, error) {
 	tag3, err := loader.LoadUInt(3)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	switch tag3 {
 	case 0b011, 0b100:
-		envelope, err := loader.LoadRefCell()
-		return envelope, true, err
+		return loader.LoadRefCell()
 	case 0b001:
 		tag2, err := loader.LoadUInt(2)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		if tag2 != 0 {
-			return nil, false, nil
+			return nil, errInMsgEnvelopeNotFound
 		}
-		envelope, err := loader.LoadRefCell()
-		return envelope, true, err
+		return loader.LoadRefCell()
 	default:
-		return nil, false, nil
+		return nil, errInMsgEnvelopeNotFound
 	}
 }
 
 func msgEnvelopeMetadata(envelope *cell.Cell) (*ton.TransactionMetadata, error) {
-	loader := envelope.BeginParse()
+	loader, err := envelope.BeginParse()
+	if err != nil {
+		return nil, err
+	}
 	tag, err := loader.LoadUInt(4)
 	if err != nil {
 		return nil, err
@@ -1163,16 +1211,26 @@ func findBlockTransaction(root *cell.Cell, account []byte, lt uint64) (*cell.Cel
 }
 
 func mcStateExtra(root *cell.Cell) (*tlb.McStateExtra, error) {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
 	var state tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&state, root.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&state, loader); err != nil {
 		return nil, err
 	}
 	if state.McStateExtra == nil {
 		return nil, fmt.Errorf("state is missing mc_state_extra")
 	}
 
+	extraLoader, err := state.McStateExtra.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
 	var extra tlb.McStateExtra
-	if err := tlb.LoadFromCell(&extra, state.McStateExtra.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&extra, extraLoader); err != nil {
 		return nil, err
 	}
 	return &extra, nil
@@ -1220,7 +1278,10 @@ func findShardLeaf(root *cell.Cell, shard uint64, exact bool) (int64, *cell.Cell
 	m := uint64(math.MaxUint64)
 	remaining := prefixLen
 	for {
-		loader := node.BeginParse()
+		loader, err := node.BeginParse()
+		if err != nil {
+			return 0, nil, err
+		}
 		typ, err := loader.LoadUInt(1)
 		if err != nil {
 			return 0, nil, err
@@ -1245,7 +1306,10 @@ func findShardLeaf(root *cell.Cell, shard uint64, exact bool) (int64, *cell.Cell
 }
 
 func blockIDFromShardLeaf(wc int32, shard int64, leaf *cell.Cell) (ton.BlockIDExt, error) {
-	loader := leaf.BeginParse()
+	loader, err := leaf.BeginParse()
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
 	typ, err := loader.LoadUInt(1)
 	if err != nil {
 		return ton.BlockIDExt{}, err
@@ -1357,15 +1421,23 @@ func libraryEntries(stateRoot *cell.Cell, hashes [][]byte, mode uint32) ([]*ton.
 }
 
 func librariesDict(stateRoot *cell.Cell) (*cell.Dictionary, error) {
+	stateLoader, err := stateRoot.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
 	var state tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&state, stateRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&state, stateLoader); err != nil {
 		return nil, err
 	}
 	if state.Stats == nil {
 		return nil, fmt.Errorf("state is missing shard state extras")
 	}
 
-	loader := state.Stats.BeginParse()
+	loader, err := state.Stats.BeginParse()
+	if err != nil {
+		return nil, err
+	}
 	if _, err := loader.LoadUInt(64); err != nil {
 		return nil, err
 	}
@@ -1382,7 +1454,7 @@ func librariesDict(stateRoot *cell.Cell) (*cell.Dictionary, error) {
 }
 
 func validatorStatsCount(stateRoot *cell.Cell, mode uint32, limit int32, startAfter []byte) (int32, bool, error) {
-	items, err := blockCreateStatsItems(stateRoot)
+	stats, err := blockCreateStatsDict(stateRoot)
 	if err != nil {
 		return 0, false, err
 	}
@@ -1390,38 +1462,48 @@ func validatorStatsCount(stateRoot *cell.Cell, mode uint32, limit int32, startAf
 	if limit > 1000 {
 		limit = 1000
 	}
-	startHash := make([]byte, 32)
-	if len(startAfter) == 32 {
-		startHash = startAfter
-	}
 
+	cursor := validatorStatsKey(startAfter)
 	allowEqual := mode&3 != 1
-	count := int32(0)
-	for _, item := range items {
-		key, err := item.Key.BeginParse().LoadSlice(256)
+	for count := int32(0); count < limit; count++ {
+		key, value, err := stats.LookupNearestKey(cursor, true, allowEqual, false)
+		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return count, true, nil
+		}
 		if err != nil {
 			return 0, false, err
 		}
-		cmp := bytes.Compare(key, startHash)
-		if cmp < 0 || cmp == 0 && !allowEqual {
-			continue
+		if err = validateCreatorStats(value); err != nil {
+			return 0, false, err
 		}
-		count++
+
+		cursor = key
 		allowEqual = false
-		if count >= limit {
-			return count, false, nil
-		}
 	}
-	return count, true, nil
+	return limit, false, nil
 }
 
-func blockCreateStatsItems(stateRoot *cell.Cell) ([]cell.DictItem, error) {
+func validatorStatsKey(startAfter []byte) *cell.Cell {
+	if len(startAfter) == 32 {
+		return cell.BeginCell().MustStoreSlice(startAfter, 256).EndCell()
+	}
+	return cell.BeginCell().MustStoreUInt(0, 256).EndCell()
+}
+
+type creatorStatsDict interface {
+	LookupNearestKey(key *cell.Cell, fetchNext bool, allowEq bool, invertFirst bool) (*cell.Cell, *cell.Slice, error)
+}
+
+func blockCreateStatsDict(stateRoot *cell.Cell) (creatorStatsDict, error) {
 	prefix, err := loadMcStateExtraPrefix(stateRoot)
 	if err != nil {
 		return nil, err
 	}
 
-	loader := prefix.Info.BeginParse()
+	loader, err := prefix.Info.BeginParse()
+	if err != nil {
+		return nil, err
+	}
 	flags, err := loader.LoadUInt(16)
 	if err != nil {
 		return nil, err
@@ -1451,7 +1533,7 @@ func blockCreateStatsItems(stateRoot *cell.Cell) ([]cell.DictItem, error) {
 		}
 	}
 	if flags&1 == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("state is missing block create stats")
 	}
 
 	magic, err := loader.LoadUInt(8)
@@ -1464,7 +1546,7 @@ func blockCreateStatsItems(stateRoot *cell.Cell) ([]cell.DictItem, error) {
 		if err != nil {
 			return nil, err
 		}
-		return dict.Range(false, false)
+		return dict, nil
 	case 0x34:
 		skipExtra := func(loader *cell.Slice) error {
 			_, err := loader.LoadUInt(32)
@@ -1475,15 +1557,64 @@ func blockCreateStatsItems(stateRoot *cell.Cell) ([]cell.DictItem, error) {
 		if err != nil {
 			return nil, err
 		}
-		return dict.Range(false, false)
+		return dict, nil
 	default:
 		return nil, fmt.Errorf("invalid block create stats magic %x", magic)
 	}
 }
 
+func validateCreatorStats(value *cell.Slice) error {
+	if tag, err := value.LoadUInt(4); err != nil {
+		return err
+	} else if tag != 4 {
+		return fmt.Errorf("invalid CreatorStats tag %x", tag)
+	}
+	if err := validateDiscountedCounter(value); err != nil {
+		return err
+	}
+	if err := validateDiscountedCounter(value); err != nil {
+		return err
+	}
+	if value.BitsLeft() != 0 || value.RefsNum() != 0 {
+		return fmt.Errorf("invalid CreatorStats record")
+	}
+	return nil
+}
+
+func validateDiscountedCounter(value *cell.Slice) error {
+	lastUpdated, err := value.LoadUInt(32)
+	if err != nil {
+		return err
+	}
+	total, err := value.LoadUInt(64)
+	if err != nil {
+		return err
+	}
+	cnt2048, err := value.LoadUInt(64)
+	if err != nil {
+		return err
+	}
+	cnt65536, err := value.LoadUInt(64)
+	if err != nil {
+		return err
+	}
+	if total == 0 && (cnt2048 != 0 || cnt65536 != 0) {
+		return fmt.Errorf("invalid discounted counter")
+	}
+	if total != 0 && lastUpdated == 0 {
+		return fmt.Errorf("invalid discounted counter")
+	}
+	return nil
+}
+
 func outMsgQueueSize(stateRoot *cell.Cell) (uint64, error) {
+	loader, err := stateRoot.BeginParse()
+	if err != nil {
+		return 0, err
+	}
+
 	var state tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&state, stateRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&state, loader); err != nil {
 		return 0, err
 	}
 	if state.OutMsgQueueInfo == nil {

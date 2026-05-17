@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/p2p"
-	storage2 "flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	storage2 "github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
@@ -19,15 +19,17 @@ const stateSnapshotRetryDelay = time.Second
 const shardStateDownloadParallelism = 4
 
 type Syncer struct {
-	source   Source
-	storage  storage2.StateStorage
-	importer *stateImportCoordinator
-	log      zerolog.Logger
-	fromZero bool
+	source     Source
+	storage    storage2.StateStorage
+	importer   *stateImportCoordinator
+	log        zerolog.Logger
+	fromZero   bool
+	syncBefore time.Duration
 }
 
 type SyncerOptions struct {
-	FromZero bool
+	FromZero   bool
+	SyncBefore time.Duration
 }
 
 func NewSyncer(source Source, storage storage2.StateStorage, opts SyncerOptions, logger ...*zerolog.Logger) *Syncer {
@@ -35,13 +37,18 @@ func NewSyncer(source Source, storage storage2.StateStorage, opts SyncerOptions,
 	if len(logger) > 0 && logger[0] != nil {
 		log = logger[0].With().Str("component", "state").Logger()
 	}
+	syncBefore := opts.SyncBefore
+	if syncBefore <= 0 {
+		syncBefore = DefaultSyncBefore
+	}
 
 	return &Syncer{
-		source:   source,
-		storage:  storage,
-		importer: newStateImportCoordinator(log),
-		log:      log,
-		fromZero: opts.FromZero,
+		source:     source,
+		storage:    storage,
+		importer:   newStateImportCoordinator(log),
+		log:        log,
+		fromZero:   opts.FromZero,
+		syncBefore: syncBefore,
 	}
 }
 
@@ -117,15 +124,6 @@ func (s *Syncer) masterchainStateStage(ctx context.Context) (*storage2.BlockStat
 	}
 }
 
-func (s *Syncer) SyncMasterchainBlock(ctx context.Context, master ton.BlockIDExt) (*storage2.CurrentState, error) {
-	masterState, err := s.downloadBlockState(ctx, master, master, 0)
-	if err != nil {
-		return nil, fmt.Errorf("download masterchain state %s: %w", storage2.FormatBlockRef(master), err)
-	}
-
-	return s.shardStatesStage(ctx, masterState, nil)
-}
-
 func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.BlockState, progress *storage2.CurrentState) (*storage2.CurrentState, error) {
 	master := masterState.Block
 	if progress != nil && !progress.Masterchain.Block.Equals(&master) {
@@ -165,7 +163,7 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.Blo
 	plans := make([]shardPlan, 0, len(shardBlocks))
 	planByKey := make(map[storage2.ShardKey]shardPlan, len(shardBlocks))
 	for _, shardBlock := range shardBlocks {
-		splitDepth, err := persistentStateSplitDepth(masterState, shardBlock.Workchain)
+		splitDepth, err := PersistentStateSplitDepth(masterState, shardBlock.Workchain)
 		if err != nil {
 			return nil, fmt.Errorf("load persistent state split depth for %s: %w", storage2.FormatBlockRef(shardBlock), err)
 		}
@@ -289,7 +287,9 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.Blo
 	for res := range results {
 		switch {
 		case res.err == nil:
-			next.Shards[storage2.ShardKeyFromBlock(res.state.Block)] = storage2.BlockStateWithoutCells(res.state)
+			shard := storage2.BlockStateWithoutCells(res.state)
+			setShardMasterchainRef(&shard, master)
+			next.Shards[storage2.ShardKeyFromBlock(res.state.Block)] = shard
 			res.state.Cell = nil
 			res.state.Parsed = nil
 			if err = s.storage.SaveStateSyncProgress(ctx, next); err != nil && firstErr == nil {
@@ -391,8 +391,18 @@ func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, m
 	if err != nil {
 		return nil, fmt.Errorf("import block state %s: %w", storage2.FormatBlockRef(block), err)
 	}
+	setShardMasterchainRef(state, master)
 	s.log.Info().
 		Str("block", storage2.FormatBlockRef(block)).
 		Msg("block state persisted")
 	return state, nil
+}
+
+func setShardMasterchainRef(state *storage2.BlockState, master ton.BlockIDExt) {
+	if state == nil || state.Block.Workchain == -1 || state.MasterchainRef != nil {
+		return
+	}
+
+	ref := master
+	state.MasterchainRef = &ref
 }

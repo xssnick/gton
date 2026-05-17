@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 )
 
 type stateCheckpointData struct {
@@ -20,7 +20,7 @@ func prepareStateCheckpoint(current *storage.CurrentState, states []*storage.Blo
 
 	appliedStates := cloneBlockStateSlice(states)
 	if len(appliedStates) == 0 {
-		appliedStates = currentBlockStates(current)
+		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
 	}
 	return stateCheckpointData{
 		live:      storage.CloneCurrentState(current),
@@ -58,20 +58,6 @@ func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*s
 		}
 	}
 	return next
-}
-
-func currentBlockStates(current *storage.CurrentState) []*storage.BlockState {
-	if current == nil {
-		return nil
-	}
-
-	states := make([]*storage.BlockState, 0, 1+len(current.Shards))
-	states = append(states, storage.CloneBlockState(&current.Masterchain))
-	for _, key := range storage.SortedShardKeys(current.Shards) {
-		shard := current.Shards[key]
-		states = append(states, storage.CloneBlockState(&shard))
-	}
-	return states
 }
 
 func currentStateWithoutCells(current *storage.CurrentState) *storage.CurrentState {

@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -77,6 +78,10 @@ func newShardStateResolver(ctx context.Context, cfg shardStateResolverConfig) *s
 }
 
 func (r *shardStateResolver) resolve(block ton.BlockIDExt) (*storage.BlockState, error) {
+	return r.resolveWithContext(r.ctx, block)
+}
+
+func (r *shardStateResolver) resolveWithContext(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
 	key := storage.BlockKey(block)
 
 	r.mu.Lock()
@@ -96,8 +101,8 @@ func (r *shardStateResolver) resolve(block ton.BlockIDExt) (*storage.BlockState,
 			r.stats.blocksReused++
 			r.mu.Unlock()
 			return task.state, nil
-		case <-r.ctx.Done():
-			return nil, r.ctx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 
@@ -105,7 +110,7 @@ func (r *shardStateResolver) resolve(block ton.BlockIDExt) (*storage.BlockState,
 	r.tasks[key] = task
 	r.mu.Unlock()
 
-	state, err := r.resolveOwned(block)
+	state, err := r.resolveOwned(ctx, block)
 
 	r.mu.Lock()
 	if err == nil {
@@ -120,15 +125,15 @@ func (r *shardStateResolver) resolve(block ton.BlockIDExt) (*storage.BlockState,
 	return state, err
 }
 
-func (r *shardStateResolver) resolveOwned(block ton.BlockIDExt) (*storage.BlockState, error) {
-	if state, err := r.currentExactState(block); err == nil {
+func (r *shardStateResolver) resolveOwned(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+	if state, err := r.currentExactState(ctx, block); err == nil {
 		r.markReused()
 		return state, nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err
 	}
 
-	state, err := r.loadState(r.ctx, storage.BlockState{Block: block})
+	state, err := r.loadState(ctx, storage.BlockState{Block: block})
 	if err == nil {
 		r.markReused()
 		return state, nil
@@ -137,7 +142,7 @@ func (r *shardStateResolver) resolveOwned(block ton.BlockIDExt) (*storage.BlockS
 		return nil, fmt.Errorf("load stored shard state %s: %w", storage.FormatBlockRef(block), err)
 	}
 
-	downloaded, err := r.loadBlock(r.ctx, block)
+	downloaded, err := r.loadBlock(ctx, block)
 	if err != nil {
 		return nil, fmt.Errorf("load shard block %s: %w", storage.FormatBlockRef(block), err)
 	}
@@ -158,7 +163,10 @@ func (r *shardStateResolver) resolveOwned(block ton.BlockIDExt) (*storage.BlockS
 
 	previous := make([]*storage.BlockState, len(prevRefs))
 	for i, prevRef := range prevRefs {
-		prev, err := r.resolve(prevRef)
+		if err := validateShardStatePrevRef(block, prevRef); err != nil {
+			return nil, err
+		}
+		prev, err := r.resolveWithContext(ctx, prevRef)
 		if err != nil {
 			return nil, err
 		}
@@ -166,7 +174,7 @@ func (r *shardStateResolver) resolveOwned(block ton.BlockIDExt) (*storage.BlockS
 	}
 
 	applyStarted := time.Now()
-	next, err := r.apply(r.ctx, block, previous, downloaded)
+	next, err := r.apply(ctx, block, previous, downloaded)
 	applyElapsed := time.Since(applyStarted)
 	if err != nil {
 		return nil, err
@@ -174,20 +182,30 @@ func (r *shardStateResolver) resolveOwned(block ton.BlockIDExt) (*storage.BlockS
 	r.markApplied(next, applyElapsed)
 
 	if r.afterApplyState != nil {
-		if err = r.afterApplyState(r.ctx, next, downloaded, applyElapsed); err != nil {
+		if err = r.afterApplyState(ctx, next, downloaded, applyElapsed); err != nil {
 			return nil, err
 		}
 	}
 
 	if r.save != nil {
-		if err = r.save(r.ctx, next); err != nil {
+		if err = r.save(ctx, next); err != nil {
 			return nil, fmt.Errorf("persist resolved shard state %s: %w", storage.FormatBlockRef(next.Block), err)
 		}
 	}
 	return next, nil
 }
 
-func (r *shardStateResolver) currentExactState(block ton.BlockIDExt) (*storage.BlockState, error) {
+func validateShardStatePrevRef(block ton.BlockIDExt, prev ton.BlockIDExt) error {
+	if prev.Workchain != block.Workchain {
+		return fmt.Errorf("shard block %s has previous ref from another workchain %s", storage.FormatBlockRef(block), storage.FormatBlockRef(prev))
+	}
+	if prev.SeqNo >= block.SeqNo {
+		return fmt.Errorf("shard block %s has non-previous ref %s", storage.FormatBlockRef(block), storage.FormatBlockRef(prev))
+	}
+	return nil
+}
+
+func (r *shardStateResolver) currentExactState(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
 	r.mu.Lock()
 	current, ok := r.current[storage.ShardKeyFromBlock(block)]
 	r.mu.Unlock()
@@ -199,7 +217,7 @@ func (r *shardStateResolver) currentExactState(block ton.BlockIDExt) (*storage.B
 		return storage.CloneBlockState(&current), nil
 	}
 
-	state, err := r.loadState(r.ctx, current)
+	state, err := r.loadState(ctx, current)
 	if err != nil {
 		return nil, fmt.Errorf("load current shard state %s: %w", storage.FormatBlockRef(block), err)
 	}
@@ -210,6 +228,23 @@ func (r *shardStateResolver) updateCurrent(current map[storage.ShardKey]storage.
 	r.mu.Lock()
 	r.current = current
 	r.mu.Unlock()
+}
+
+func (r *shardStateResolver) currentBlocksForBlock(block ton.BlockIDExt) ([]ton.BlockIDExt, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var blocks []ton.BlockIDExt
+	for _, state := range r.current {
+		if !shardBlocksRelated(state.Block, block) {
+			continue
+		}
+		blocks = append(blocks, cloneServiceBlockID(state.Block))
+	}
+	if len(blocks) == 0 {
+		return nil, storage.ErrNotFound
+	}
+	return blocks, nil
 }
 
 func (r *shardStateResolver) evictCacheLocked() {
@@ -311,14 +346,77 @@ func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDE
 	if err != nil {
 		return nil, fmt.Errorf("apply shard block %s: %w", downloaded.BlockRef(), err)
 	}
+	if downloaded.Meta.MasterchainRef != nil {
+		ref := cloneServiceBlockID(*downloaded.Meta.MasterchainRef)
+		next.MasterchainRef = &ref
+	}
 	return next, nil
 }
 
 func (s *Service) stateCellLoader() cell.LazyCellLoader {
-	if s == nil || s.storage == nil {
+	if s == nil {
 		return nil
 	}
-	return s.storage.LazyCellLoader()
+
+	var base cell.LazyCellLoader
+	if s.storage != nil {
+		base = s.storage.LazyCellLoader()
+	}
+
+	return func(hash cell.Hash) (*cell.Cell, error) {
+		for _, loader := range s.stateCellLoadersSnapshot() {
+			loaded, err := loader(hash)
+			if err == nil {
+				return loaded, nil
+			}
+			if !errors.Is(err, storage.ErrNotFound) && !errors.Is(err, cell.ErrLazyRefNotFound) {
+				return nil, err
+			}
+		}
+		if base == nil {
+			return nil, storage.ErrNotFound
+		}
+		return base(hash)
+	}
+}
+
+func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
+	if s == nil || loader == nil {
+		return func() {}
+	}
+
+	s.stateCellLoaderMu.Lock()
+	s.nextStateCellLoaderID++
+	id := s.nextStateCellLoaderID
+	if s.stateCellLoaders == nil {
+		s.stateCellLoaders = map[uint64]cell.LazyCellLoader{}
+	}
+	s.stateCellLoaders[id] = loader
+	s.stateCellLoaderMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.stateCellLoaderMu.Lock()
+			delete(s.stateCellLoaders, id)
+			s.stateCellLoaderMu.Unlock()
+		})
+	}
+}
+
+func (s *Service) stateCellLoadersSnapshot() []cell.LazyCellLoader {
+	s.stateCellLoaderMu.RLock()
+	defer s.stateCellLoaderMu.RUnlock()
+
+	if len(s.stateCellLoaders) == 0 {
+		return nil
+	}
+
+	loaders := make([]cell.LazyCellLoader, 0, len(s.stateCellLoaders))
+	for _, loader := range s.stateCellLoaders {
+		loaders = append(loaders, loader)
+	}
+	return loaders
 }
 
 func shardTransitionKind(target ton.BlockIDExt, prevRefs []ton.BlockIDExt) string {
@@ -329,4 +427,23 @@ func shardTransitionKind(target ton.BlockIDExt, prevRefs []ton.BlockIDExt) strin
 		return "split"
 	}
 	return "linear"
+}
+
+func shardBlocksRelated(a ton.BlockIDExt, b ton.BlockIDExt) bool {
+	if a.Workchain != b.Workchain {
+		return false
+	}
+	aShard := tlb.ShardID(uint64(a.Shard))
+	bShard := tlb.ShardID(uint64(b.Shard))
+	return aShard == bShard || aShard.IsAncestor(bShard) || bShard.IsAncestor(aShard)
+}
+
+func cloneServiceBlockID(block ton.BlockIDExt) ton.BlockIDExt {
+	return ton.BlockIDExt{
+		Workchain: block.Workchain,
+		Shard:     block.Shard,
+		SeqNo:     block.SeqNo,
+		RootHash:  append([]byte(nil), block.RootHash...),
+		FileHash:  append([]byte(nil), block.FileHash...),
+	}
 }

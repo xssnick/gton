@@ -13,9 +13,9 @@ import (
 	"strconv"
 	"testing"
 
-	"flexserver/service/archive/packfile"
-	"flexserver/service/storage"
-	"flexserver/service/storage/pebblestore"
+	"github.com/xssnick/gton/service/archive/packfile"
+	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -133,10 +133,6 @@ func TestPrepareImportedBlockBuildsStateMetaAndPreparedCells(t *testing.T) {
 	if got := len(prepared.State.StateCellHash); got != 32 {
 		t.Fatalf("state cell hash len = %d, want 32", got)
 	}
-	if prepared.State.CellsCount != uint64(len(prepared.StateUpdateToCells)) {
-		t.Fatalf("state cells count = %d, want %d", prepared.State.CellsCount, len(prepared.StateUpdateToCells))
-	}
-
 	var stateCellHash cell.Hash
 	copy(stateCellHash[:], prepared.State.StateCellHash)
 	if len(prepared.StateUpdateToCells[stateCellHash]) == 0 {

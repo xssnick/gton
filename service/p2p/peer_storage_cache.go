@@ -1,7 +1,7 @@
 package p2p
 
 import (
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -30,7 +30,10 @@ func (n *Node) rememberBlockFullAsync(prev *ton.BlockIDExt, downloaded *Download
 	if downloaded == nil {
 		return
 	}
-	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard && !verified {
+	if downloaded.ID.Workchain != -1 || downloaded.ID.Shard != topShard {
+		return
+	}
+	if !verified {
 		return
 	}
 
@@ -69,7 +72,10 @@ func (n *Node) rememberBlockFull(prev *ton.BlockIDExt, downloaded *DownloadedBlo
 	if downloaded == nil {
 		return
 	}
-	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard && !verified {
+	if downloaded.ID.Workchain != -1 || downloaded.ID.Shard != topShard {
+		return
+	}
+	if !verified {
 		return
 	}
 

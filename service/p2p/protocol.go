@@ -2,7 +2,7 @@ package p2p
 
 import (
 	"crypto/sha256"
-	"flexserver/service/archive"
+	"github.com/xssnick/gton/service/archive"
 	"time"
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
@@ -12,11 +12,6 @@ import (
 
 func init() {
 	tl.Register(OverlayBroadcastID{}, "overlay.broadcast.id src:int256 data_hash:int256 flags:int = overlay.broadcast.Id")
-	tl.Register(SignatureSetOrdinary{}, "tonNode.signatureSet.ordinary cc_seqno:int validator_set_hash:int signatures:(vector tonNode.blockSignature) = tonNode.SignatureSet")
-	tl.Register(SignatureSetSimplex{}, "tonNode.signatureSet.simplex final:Bool cc_seqno:int validator_set_hash:int signatures:(vector tonNode.blockSignature) session_id:int256 slot:int candidate:consensus.CandidateHashData = tonNode.SignatureSet")
-	tl.Register(BlockBroadcastCompressed{}, "tonNode.blockBroadcastCompressed id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int flags:# compressed:bytes = tonNode.Broadcast")
-	tl.Register(BlockBroadcastCompressedData{}, "tonNode.blockBroadcastCompressed.data signatures:(vector tonNode.blockSignature) proof_data:bytes = tonNode.blockBroadcaseCompressed.Data")
-	tl.Register(BlockBroadcastCompressedV2{}, "tonNode.blockBroadcastCompressedV2 id:tonNode.blockIdExt signature_set:tonNode.SignatureSet flags:# proof:bytes data_compressed:bytes = tonNode.Broadcast")
 	tl.Register(BlockDescriptionEmpty{}, "tonNode.blockDescriptionEmpty = tonNode.BlockDescription")
 	tl.Register(BlockDescription{}, "tonNode.blockDescription id:tonNode.blockIdExt = tonNode.BlockDescription")
 	tl.Register(GetNextBlockDescription{}, "tonNode.getNextBlockDescription prev_block:tonNode.blockIdExt = tonNode.BlockDescription")
@@ -37,43 +32,6 @@ type OverlayBroadcastID struct {
 	Source   []byte `tl:"int256"`
 	DataHash []byte `tl:"int256"`
 	Flags    int32  `tl:"int"`
-}
-
-type SignatureSetOrdinary struct {
-	CatchainSeqno    int32                       `tl:"int"`
-	ValidatorSetHash int32                       `tl:"int"`
-	Signatures       []tonnodeapi.BlockSignature `tl:"vector struct"`
-}
-
-type SignatureSetSimplex struct {
-	Final            bool                        `tl:"bool"`
-	CatchainSeqno    int32                       `tl:"int"`
-	ValidatorSetHash int32                       `tl:"int"`
-	Signatures       []tonnodeapi.BlockSignature `tl:"vector struct"`
-	SessionID        []byte                      `tl:"int256"`
-	Slot             int32                       `tl:"int"`
-	Candidate        any                         `tl:"struct boxed [consensus.candidateHashDataOrdinary,consensus.candidateHashDataEmpty]"`
-}
-
-type BlockBroadcastCompressed struct {
-	ID               ton.BlockIDExt `tl:"struct"`
-	CatchainSeqno    int32          `tl:"int"`
-	ValidatorSetHash int32          `tl:"int"`
-	Flags            uint32         `tl:"flags"`
-	Compressed       []byte         `tl:"bytes"`
-}
-
-type BlockBroadcastCompressedData struct {
-	Signatures []tonnodeapi.BlockSignature `tl:"vector struct"`
-	ProofData  []byte                      `tl:"bytes"`
-}
-
-type BlockBroadcastCompressedV2 struct {
-	ID             ton.BlockIDExt `tl:"struct"`
-	SignatureSet   any            `tl:"struct boxed [tonNode.signatureSet.ordinary,tonNode.signatureSet.simplex]"` // SignatureSetOrdinary or SignatureSetSimplex after TL decode.
-	Flags          uint32         `tl:"flags"`
-	Proof          []byte         `tl:"bytes"`
-	DataCompressed []byte         `tl:"bytes"`
 }
 
 type BlockDescriptionEmpty struct{}

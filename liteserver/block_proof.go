@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"math"
 
-	"flexserver/service/blockproof"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -16,13 +16,23 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-const maxBlockProofLinks = 16
+const (
+	maxBlockProofLinks            = 16
+	maxBlockProofBaseCacheEntries = 8
+)
+
+type blockProofBase struct {
+	block      ton.BlockIDExt
+	prevBlocks *tlb.OldMcBlocksInfoAugDict
+	isKey      bool
+}
 
 type blockProofRequest struct {
-	from      ton.BlockIDExt
-	to        ton.BlockIDExt
-	base      ton.BlockIDExt
-	baseState *cell.Cell
+	from       ton.BlockIDExt
+	to         ton.BlockIDExt
+	base       ton.BlockIDExt
+	prevBlocks *tlb.OldMcBlocksInfoAugDict
+	baseIsKey  bool
 }
 
 func (s *Server) handleBlockProof(ctx context.Context, query ton.GetBlockProof) tl.Serializable {
@@ -54,24 +64,79 @@ func (s *Server) prepareBlockProofRequest(ctx context.Context, query ton.GetBloc
 	if to.SeqNo > base.SeqNo {
 		return blockProofRequest{}, fmt.Errorf("target block %s is newer than reference masterchain block %s", storage.FormatBlockRef(to), storage.FormatBlockRef(base))
 	}
+	if query.Mode&0x1000 == 0 && blockIDEqual(from, to) && blockIDEqual(from, base) {
+		return blockProofRequest{
+			from: from,
+			to:   to,
+			base: base,
+		}, nil
+	}
 
-	baseState, err := s.loadStateRoot(ctx, base)
+	proofBase, err := s.loadBlockProofBase(ctx, base)
 	if err != nil {
 		return blockProofRequest{}, err
 	}
-	if err = s.checkKnownMasterBlock(base, baseState, from); err != nil {
+	if err = s.checkKnownMasterBlock(proofBase, from); err != nil {
 		return blockProofRequest{}, fmt.Errorf("proof source masterchain block %s is unknown from the perspective of reference block %s: %w", storage.FormatBlockRef(from), storage.FormatBlockRef(base), err)
 	}
-	if err = s.checkKnownMasterBlock(base, baseState, to); err != nil {
+	if err = s.checkKnownMasterBlock(proofBase, to); err != nil {
 		return blockProofRequest{}, fmt.Errorf("proof destination masterchain block %s is unknown from the perspective of reference block %s: %w", storage.FormatBlockRef(to), storage.FormatBlockRef(base), err)
 	}
 
 	return blockProofRequest{
-		from:      from,
-		to:        to,
-		base:      base,
-		baseState: baseState,
+		from:       from,
+		to:         to,
+		base:       base,
+		prevBlocks: proofBase.prevBlocks,
+		baseIsKey:  proofBase.isKey,
 	}, nil
+}
+
+func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (*blockProofBase, error) {
+	key := storage.BlockKey(block)
+	s.blockProofBasesMu.Lock()
+	cached := s.blockProofBases[key]
+	s.blockProofBasesMu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+
+	state, err := s.loadStateRoot(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+	prevBlocks, err := blockProofPrevBlocks(state)
+	if err != nil {
+		return nil, err
+	}
+	isKey, err := s.blockIsKey(ctx, block, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	base := &blockProofBase{
+		block:      block,
+		prevBlocks: prevBlocks,
+		isKey:      isKey,
+	}
+
+	s.blockProofBasesMu.Lock()
+	if s.blockProofBases == nil {
+		s.blockProofBases = make(map[string]*blockProofBase)
+	}
+	if existing := s.blockProofBases[key]; existing != nil {
+		s.blockProofBasesMu.Unlock()
+		return existing, nil
+	}
+	s.blockProofBases[key] = base
+	s.blockProofBaseOrder = append(s.blockProofBaseOrder, key)
+	for len(s.blockProofBaseOrder) > maxBlockProofBaseCacheEntries {
+		delete(s.blockProofBases, s.blockProofBaseOrder[0])
+		s.blockProofBaseOrder = s.blockProofBaseOrder[1:]
+	}
+	s.blockProofBasesMu.Unlock()
+
+	return base, nil
 }
 
 func (s *Server) blockProofTargetAndBase(ctx context.Context, from ton.BlockIDExt, query ton.GetBlockProof) (ton.BlockIDExt, ton.BlockIDExt, error) {
@@ -102,17 +167,12 @@ func (s *Server) blockProofTargetAndBase(ctx context.Context, from ton.BlockIDEx
 	return current.Masterchain.Block, current.Masterchain.Block, nil
 }
 
-func (s *Server) checkKnownMasterBlock(base ton.BlockIDExt, baseState *cell.Cell, id ton.BlockIDExt) error {
-	if blockIDEqual(base, id) {
+func (s *Server) checkKnownMasterBlock(base *blockProofBase, id ton.BlockIDExt) error {
+	if blockIDEqual(base.block, id) {
 		return nil
 	}
 
-	prefix, err := loadMcStateExtraPrefix(baseState)
-	if err != nil {
-		return err
-	}
-
-	_, old, err := oldMasterBlockProofSkeleton(prefix.Info, id.SeqNo)
+	old, err := runMethodOldMasterBlockID(base.prevBlocks, id.SeqNo)
 	if err != nil {
 		return err
 	}
@@ -141,7 +201,7 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 			continue
 		}
 
-		prevKey, err := s.prevKeyBlockInState(ctx, req, current.SeqNo)
+		prevKey, err := s.prevKeyBlockInState(req, current.SeqNo)
 		if err != nil {
 			return ton.PartialBlockProof{}, err
 		}
@@ -158,7 +218,7 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 			continue
 		}
 
-		next, err := s.nextKeyBlockInState(ctx, req, current.SeqNo+1)
+		next, err := s.nextKeyBlockInState(req, current.SeqNo+1)
 		if errors.Is(err, storage.ErrNotFound) {
 			next = req.to
 		} else if err != nil {
@@ -195,20 +255,12 @@ func (s *Server) blockProofLinkForward(ctx context.Context, from ton.BlockIDExt,
 		return ton.BlockLinkForward{}, fmt.Errorf("load target proof for %s: %w", storage.FormatBlockRef(to), err)
 	}
 
-	configSk, err := s.forwardConfigProofSkeleton(from, fromRoot)
-	if err != nil {
-		return ton.BlockLinkForward{}, err
-	}
-	configProof, err := blockProofBOC(fromRoot, configSk)
+	configProof, err := s.forwardConfigProofBOC(from, fromRoot)
 	if err != nil {
 		return ton.BlockLinkForward{}, err
 	}
 
-	destSk, err := blockHeaderProofSkeleton(toRoot, to, 0)
-	if err != nil {
-		return ton.BlockLinkForward{}, err
-	}
-	destProof, err := blockProofBOC(toRoot, destSk)
+	destProof, err := blockHeaderProofBOC(toRoot, to, 0)
 	if err != nil {
 		return ton.BlockLinkForward{}, err
 	}
@@ -248,11 +300,18 @@ func (s *Server) forwardSourceRoot(ctx context.Context, from ton.BlockIDExt) (*c
 	return root, nil
 }
 
-func (s *Server) forwardConfigProofSkeleton(from ton.BlockIDExt, fromRoot *cell.Cell) (*cell.ProofSkeleton, error) {
+func (s *Server) forwardConfigProofBOC(from ton.BlockIDExt, fromRoot *cell.Cell) ([]byte, error) {
+	var proof *cell.Cell
+	var err error
 	if from.SeqNo == 0 {
-		return configProofSkeleton(fromRoot, configModeNeedValidatorSet, false, nil)
+		proof, err = configProof(fromRoot, configModeNeedValidatorSet, false, nil)
+	} else {
+		proof, err = keyBlockConfigProof(fromRoot, configModeNeedValidatorSet, false, nil)
 	}
-	return keyBlockConfigProofSkeleton(fromRoot, configModeNeedValidatorSet, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	return proof.ToBOCWithFlags(false), nil
 }
 
 func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkBackward, error) {
@@ -265,7 +324,7 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 	if err != nil {
 		return ton.BlockLinkBackward{}, err
 	}
-	proof, err := fromRoot.CreateProof(blockStateRootProofSkeleton())
+	proof, err := blockStateRootProof(fromRoot)
 	if err != nil {
 		return ton.BlockLinkBackward{}, err
 	}
@@ -282,11 +341,7 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 		if err != nil {
 			return ton.BlockLinkBackward{}, err
 		}
-		sk, err := blockHeaderProofSkeleton(toRoot, to, 0)
-		if err != nil {
-			return ton.BlockLinkBackward{}, err
-		}
-		destProof, err = blockProofBOC(toRoot, sk)
+		destProof, err = blockHeaderProofBOC(toRoot, to, 0)
 		if err != nil {
 			return ton.BlockLinkBackward{}, err
 		}
@@ -307,22 +362,16 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 }
 
 func oldMasterBlockStateProof(stateRoot *cell.Cell, id ton.BlockIDExt) (*cell.Cell, error) {
-	prefix, err := loadMcStateExtraPrefix(stateRoot)
-	if err != nil {
-		return nil, err
-	}
-
-	infoSk, old, err := oldMasterBlockProofSkeleton(prefix.Info, id.SeqNo)
-	if err != nil {
-		return nil, err
-	}
-	if !blockIDEqual(old, id) {
-		return nil, fmt.Errorf("state contains %s for seqno %d", storage.FormatBlockRef(old), id.SeqNo)
-	}
-
-	stateSk := cell.CreateProofSkeleton()
-	stateSk.ProofRef(3).AttachAt(prefix.infoRefIdx, infoSk)
-	return stateRoot.CreateProof(stateSk)
+	return createUsageProof(stateRoot, func(root *cell.Cell) error {
+		old, err := oldMasterBlockIDFromState(root, id.SeqNo)
+		if err != nil {
+			return err
+		}
+		if !blockIDEqual(old, id) {
+			return fmt.Errorf("state contains %s for seqno %d", storage.FormatBlockRef(old), id.SeqNo)
+		}
+		return nil
+	})
 }
 
 func (s *Server) storedMasterProofRoot(ctx context.Context, id ton.BlockIDExt, link bool) (*cell.Cell, *blockproof.Parsed, error) {
@@ -355,25 +404,32 @@ func (s *Server) storedMasterProof(ctx context.Context, id ton.BlockIDExt, link 
 		return nil, fmt.Errorf("block must be a masterchain block")
 	}
 
+	meta, err := s.store.BlockMeta(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
 	if link {
-		for _, kind := range []storage.ServedProofKind{storage.ServedProofBlockLink, storage.ServedProofKeyBlockLink} {
-			data, err := s.store.BlockProof(ctx, kind, id)
-			if err == nil {
-				return data, nil
-			}
-			if !errors.Is(err, storage.ErrNotFound) {
-				return nil, err
-			}
+		data, err := s.storedMasterProofByKind(ctx, id, storedMasterProofKinds(meta, true))
+		if err == nil {
+			return data, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
 		}
 
-		full, err := s.storedMasterProof(ctx, id, false)
+		full, err := s.storedMasterProofByKind(ctx, id, storedMasterProofKinds(meta, false))
 		if err != nil {
 			return nil, err
 		}
 		return blockproof.LinkBOC(id, full)
 	}
 
-	for _, kind := range []storage.ServedProofKind{storage.ServedProofBlock, storage.ServedProofKeyBlock} {
+	return s.storedMasterProofByKind(ctx, id, storedMasterProofKinds(meta, false))
+}
+
+func (s *Server) storedMasterProofByKind(ctx context.Context, id ton.BlockIDExt, kinds []storage.ServedProofKind) ([]byte, error) {
+	for _, kind := range kinds {
 		data, err := s.store.BlockProof(ctx, kind, id)
 		if err == nil {
 			return data, nil
@@ -383,6 +439,26 @@ func (s *Server) storedMasterProof(ctx context.Context, id ton.BlockIDExt, link 
 		}
 	}
 	return nil, storage.ErrNotFound
+}
+
+func storedMasterProofKinds(meta *storage.BlockMeta, link bool) []storage.ServedProofKind {
+	var kind storage.ServedProofKind
+	if meta.Has(storage.BlockMetaIsKeyBlock) {
+		if link {
+			kind = storage.ServedProofKeyBlockLink
+		} else {
+			kind = storage.ServedProofKeyBlock
+		}
+	} else if link {
+		kind = storage.ServedProofBlockLink
+	} else {
+		kind = storage.ServedProofBlock
+	}
+
+	if !meta.HasProof(kind) {
+		return nil
+	}
+	return []storage.ServedProofKind{kind}
 }
 
 func (s *Server) blockIsKey(ctx context.Context, id ton.BlockIDExt, root *cell.Cell) (bool, error) {
@@ -407,20 +483,12 @@ func (s *Server) blockIsKey(ctx context.Context, id ton.BlockIDExt, root *cell.C
 	return block.BlockInfo.KeyBlock, nil
 }
 
-func (s *Server) prevKeyBlockInState(ctx context.Context, req blockProofRequest, seqno uint32) (ton.BlockIDExt, error) {
-	baseIsKey, err := s.blockIsKey(ctx, req.base, nil)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if baseIsKey && req.base.SeqNo <= seqno {
+func (s *Server) prevKeyBlockInState(req blockProofRequest, seqno uint32) (ton.BlockIDExt, error) {
+	if req.baseIsKey && req.base.SeqNo <= seqno {
 		return req.base, nil
 	}
 
-	prevBlocks, err := blockProofPrevBlocks(req.baseState)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	key, err := keyBlockFromPrevBlocks(prevBlocks, seqno, false)
+	key, err := keyBlockFromPrevBlocks(req.prevBlocks, seqno, false)
 	if errors.Is(err, storage.ErrNotFound) {
 		return ton.BlockIDExt{}, fmt.Errorf("cannot compute previous key block for seqno %d: %w", seqno, err)
 	}
@@ -430,12 +498,8 @@ func (s *Server) prevKeyBlockInState(ctx context.Context, req blockProofRequest,
 	return key, nil
 }
 
-func (s *Server) nextKeyBlockInState(ctx context.Context, req blockProofRequest, seqno uint32) (ton.BlockIDExt, error) {
-	prevBlocks, err := blockProofPrevBlocks(req.baseState)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	key, err := keyBlockFromPrevBlocks(prevBlocks, seqno, true)
+func (s *Server) nextKeyBlockInState(req blockProofRequest, seqno uint32) (ton.BlockIDExt, error) {
+	key, err := keyBlockFromPrevBlocks(req.prevBlocks, seqno, true)
 	if err == nil {
 		return key, nil
 	}
@@ -443,11 +507,7 @@ func (s *Server) nextKeyBlockInState(ctx context.Context, req blockProofRequest,
 		return ton.BlockIDExt{}, err
 	}
 
-	baseIsKey, err := s.blockIsKey(ctx, req.base, nil)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if baseIsKey && req.base.SeqNo >= seqno {
+	if req.baseIsKey && req.base.SeqNo >= seqno {
 		return req.base, nil
 	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
@@ -459,7 +519,10 @@ func blockProofPrevBlocks(stateRoot *cell.Cell) (*tlb.OldMcBlocksInfoAugDict, er
 		return nil, err
 	}
 
-	loader := prefix.Info.BeginParse()
+	loader, err := prefix.Info.BeginParse()
+	if err != nil {
+		return nil, err
+	}
 	if _, err := loader.LoadUInt(16); err != nil {
 		return nil, err
 	}
@@ -555,7 +618,11 @@ func keyPrefixUint32(key *cell.Cell) (uint32, uint, error) {
 		return 0, 0, nil
 	}
 
-	value, err := key.BeginParse().LoadUInt(bitsCount)
+	loader, err := key.BeginParse()
+	if err != nil {
+		return 0, 0, err
+	}
+	value, err := loader.LoadUInt(bitsCount)
 	if err != nil {
 		return 0, 0, err
 	}

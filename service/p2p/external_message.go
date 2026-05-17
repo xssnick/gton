@@ -91,8 +91,13 @@ func externalMessageDestinationWorkchain(data []byte) (int32, error) {
 		return 0, fmt.Errorf("parse external message BOC: %w", err)
 	}
 
+	loader, err := root.BeginParse()
+	if err != nil {
+		return 0, fmt.Errorf("begin parse external message: %w", err)
+	}
+
 	var msg tlb.ExternalMessage
-	if err = tlb.LoadFromCell(&msg, root.BeginParse()); err != nil {
+	if err = tlb.LoadFromCell(&msg, loader); err != nil {
 		return 0, fmt.Errorf("parse external message: %w", err)
 	}
 	if msg.DstAddr == nil {

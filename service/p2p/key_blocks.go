@@ -23,6 +23,10 @@ type KeyBlockBatch struct {
 }
 
 func (n *Node) NextKeyBlocks(ctx context.Context, block ton.BlockIDExt, limit int32) (KeyBlockBatch, error) {
+	if block.Workchain != -1 || block.Shard != topShard {
+		return KeyBlockBatch{}, fmt.Errorf("next key block lookup requires masterchain block, got %s", formatBlockRef(block))
+	}
+
 	if limit <= 0 {
 		limit = 16
 	}

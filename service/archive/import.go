@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"time"
 
-	"flexserver/service/archive/packfile"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/archive/packfile"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -362,8 +362,6 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 			Block:         id,
 			StateRootHash: append([]byte(nil), stateRootHash[:]...),
 			StateCellHash: append([]byte(nil), stateCellHash[:]...),
-			CellsCount:    uint64(len(cells)),
-			DownloadedAt:  time.Now(),
 		},
 		StateUpdateToCells:        cells,
 		StateUpdateToCellsElapsed: time.Since(started),

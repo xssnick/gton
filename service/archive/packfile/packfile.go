@@ -57,8 +57,9 @@ func Read(ctx context.Context, r io.Reader, handle func(Entry) error) error {
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return fmt.Errorf("read archive magic: %w", err)
 	}
-	if binary.LittleEndian.Uint32(magic[:]) != PackageMagic {
-		return fmt.Errorf("archive package magic mismatch")
+	got := binary.LittleEndian.Uint32(magic[:])
+	if got != PackageMagic {
+		return fmt.Errorf("archive package magic mismatch: got=%08x want=%08x", got, PackageMagic)
 	}
 
 	offset := int64(HeaderSize)
@@ -114,6 +115,55 @@ func Read(ctx context.Context, r io.Reader, handle func(Entry) error) error {
 		}
 
 		offset = dataOffset + int64(dataLen)
+	}
+}
+
+func Validate(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+
+	var magic [HeaderSize]byte
+	if _, err = io.ReadFull(file, magic[:]); err != nil {
+		return fmt.Errorf("read archive magic: %w", err)
+	}
+	got := binary.LittleEndian.Uint32(magic[:])
+	if got != PackageMagic {
+		return fmt.Errorf("archive package magic mismatch: got=%08x want=%08x", got, PackageMagic)
+	}
+
+	for {
+		var header [EntryHeaderSize]byte
+		n, err := io.ReadFull(file, header[:])
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) && n == 0 {
+				return nil
+			}
+			return fmt.Errorf("read archive entry header: %w", err)
+		}
+
+		header0 := binary.LittleEndian.Uint32(header[:4])
+		if header0&0xffff != EntryMagic {
+			return fmt.Errorf("archive entry magic mismatch")
+		}
+
+		nameLen := int64(header0 >> 16)
+		dataLen := int64(binary.LittleEndian.Uint32(header[4:]))
+		if dataLen > MaxDataSize {
+			return fmt.Errorf("archive entry %d bytes exceeds limit %d", dataLen, MaxDataSize)
+		}
+
+		if _, err = io.CopyN(io.Discard, file, nameLen); err != nil {
+			return fmt.Errorf("read archive entry name: %w", err)
+		}
+		if _, err = io.CopyN(io.Discard, file, dataLen); err != nil {
+			return fmt.Errorf("read archive entry data: %w", err)
+		}
 	}
 }
 

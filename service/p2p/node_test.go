@@ -6,7 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 	"net"
 	"testing"
 	"time"
@@ -72,7 +72,7 @@ func TestStatusSnapshotTracksLatestBasechainBlock(t *testing.T) {
 func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
 	logger := discardLogger()
 	store := newTestPebbleStore(t)
-	node, err := New(Options{Logger: &logger, Storage: store})
+	node, err := New(Options{Logger: &logger, Storage: store, StateFilesDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -90,10 +90,6 @@ func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
 	if _, err = node.SeenMasterchainBlock(); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("raw broadcast moved seen masterchain: %v", err)
 	}
-
-	if _, err = store.SeenMasterchainBlock(context.Background()); err == nil {
-		t.Fatal("broadcast seen block was persisted before validation")
-	}
 }
 
 func TestZeroStateBlockRequiresConfiguredZeroState(t *testing.T) {
@@ -101,6 +97,11 @@ func TestZeroStateBlockRequiresConfiguredZeroState(t *testing.T) {
 
 	if _, err := node.ZeroStateBlock(); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("empty zero state block error = %v, want ErrNotFound", err)
+	}
+
+	node.zeroStateBlock = testBlockID(0, 0, 0)
+	if _, err := node.ZeroStateBlock(); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("basechain zero state block error = %v, want ErrNotFound", err)
 	}
 
 	node.zeroStateBlock = testBlockID(-1, topShard, 0)
@@ -130,6 +131,14 @@ func TestInitBlockRequiresConfiguredInitBlock(t *testing.T) {
 	}
 }
 
+func TestNextKeyBlocksRejectsNonMasterchainAnchor(t *testing.T) {
+	node := newTestNode(t)
+
+	if _, err := node.NextKeyBlocks(context.Background(), testBlockID(0, 0, 0), 8); err == nil {
+		t.Fatal("expected non-masterchain anchor error")
+	}
+}
+
 func TestInitBlockFromConfigFallsBackToZeroStateWhenMissing(t *testing.T) {
 	zeroConfig := liteclient.ConfigBlock{
 		Workchain: -1,
@@ -152,7 +161,7 @@ func TestInitBlockFromConfigFallsBackToZeroStateWhenMissing(t *testing.T) {
 func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
 	logger := discardLogger()
 	store := newTestPebbleStore(t)
-	node, err := New(Options{Logger: &logger, Storage: store})
+	node, err := New(Options{Logger: &logger, Storage: store, StateFilesDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -160,7 +169,6 @@ func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
 	block10 := testBlockID(-1, topShard, 10)
 	block9 := testBlockID(-1, topShard, 9)
 
-	ctx := context.Background()
 	node.RememberSeenMasterchainBlock(block10)
 	node.RememberSeenMasterchainBlock(block9)
 
@@ -178,15 +186,12 @@ func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
 	if !observed.Equals(&block10) {
 		t.Fatalf("runtime observed = %+v, want %+v", observed, block10)
 	}
-	if _, err = store.SeenMasterchainBlock(ctx); err == nil {
-		t.Fatal("runtime seen block was persisted by p2p node")
-	}
 }
 
 func TestMasterchainDownloadCacheRequiresVerifiedPath(t *testing.T) {
 	logger := discardLogger()
 	store := newTestPeerStore()
-	node, err := New(Options{Logger: &logger, PeerServingStorage: store})
+	node, err := New(Options{Logger: &logger, PeerServingStorage: store, StateFilesDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -259,6 +264,7 @@ func TestNewUsesConfiguredADNLKeys(t *testing.T) {
 		DHTPrivateKey:      dhtPriv,
 		DHTListenAddr:      "127.0.0.1:30304",
 		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("new node: %v", err)

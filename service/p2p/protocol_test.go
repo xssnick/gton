@@ -5,7 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"flexserver/service/archive"
+	"github.com/xssnick/gton/service/archive"
 	"fmt"
 	"testing"
 	"time"
@@ -20,7 +20,7 @@ import (
 )
 
 func TestCustomBroadcastTypesRoundTrip(t *testing.T) {
-	msg := BlockBroadcastCompressed{
+	msg := tonnodeapi.BlockBroadcastCompressed{
 		ID: ton.BlockIDExt{
 			Workchain: 0,
 			Shard:     topShard,
@@ -44,13 +44,13 @@ func TestCustomBroadcastTypesRoundTrip(t *testing.T) {
 		t.Fatalf("parse compressed broadcast: %v", err)
 	}
 
-	if _, ok := parsed.(BlockBroadcastCompressed); !ok {
+	if _, ok := parsed.(tonnodeapi.BlockBroadcastCompressed); !ok {
 		t.Fatalf("unexpected type after parse: %T", parsed)
 	}
 }
 
 func TestCompressedV2BroadcastSignatureSetDecodesAsValueType(t *testing.T) {
-	msg := BlockBroadcastCompressedV2{
+	msg := tonnodeapi.BlockBroadcastCompressedV2{
 		ID: ton.BlockIDExt{
 			Workchain: -1,
 			Shard:     topShard,
@@ -58,7 +58,7 @@ func TestCompressedV2BroadcastSignatureSetDecodesAsValueType(t *testing.T) {
 			RootHash:  make([]byte, 32),
 			FileHash:  make([]byte, 32),
 		},
-		SignatureSet: SignatureSetOrdinary{
+		SignatureSet: tonnodeapi.SignatureSetOrdinary{
 			CatchainSeqno:    10,
 			ValidatorSetHash: 20,
 			Signatures:       []tonnodeapi.BlockSignature{},
@@ -78,11 +78,11 @@ func TestCompressedV2BroadcastSignatureSetDecodesAsValueType(t *testing.T) {
 		t.Fatalf("parse compressed v2 broadcast: %v", err)
 	}
 
-	broadcast, ok := parsed.(BlockBroadcastCompressedV2)
+	broadcast, ok := parsed.(tonnodeapi.BlockBroadcastCompressedV2)
 	if !ok {
 		t.Fatalf("unexpected type after parse: %T", parsed)
 	}
-	if _, ok = broadcast.SignatureSet.(SignatureSetOrdinary); !ok {
+	if _, ok = broadcast.SignatureSet.(tonnodeapi.SignatureSetOrdinary); !ok {
 		t.Fatalf("unexpected signature set type after parse: %T", broadcast.SignatureSet)
 	}
 }

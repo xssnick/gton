@@ -3,16 +3,17 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
-	"flexserver/service/p2p"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 )
 
 func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 	store := openTestPebbleStorage(t)
-	node, err := p2p.New(p2p.Options{Storage: store})
+	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -68,7 +69,7 @@ func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 
 func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	store := openTestPebbleStorage(t)
-	node, err := p2p.New(p2p.Options{Storage: store})
+	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -125,4 +126,38 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	if snapshot.LocalBasechainUtime != 220 {
 		t.Fatalf("unexpected local basechain utime %d", snapshot.LocalBasechainUtime)
 	}
+}
+
+func TestObserveCurrentSyncLagReportsMasterchainAndSlowestShard(t *testing.T) {
+	observer := &fakeSyncLagObserver{values: map[string]float64{}}
+	svc := &Service{syncLag: observer}
+
+	svc.observeCurrentSyncLag(context.Background(), &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{
+			Parsed: &tlb.ShardStateUnsplit{GenUTime: 990},
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{
+			{Workchain: 0, Shard: topShard}: {
+				Parsed: &tlb.ShardStateUnsplit{GenUTime: 980},
+			},
+			{Workchain: 0, Shard: topShard >> 1}: {
+				Parsed: &tlb.ShardStateUnsplit{GenUTime: 995},
+			},
+		},
+	}, time.Unix(1000, 0))
+
+	if got := observer.values[syncLagChainMasterchain]; got != 10 {
+		t.Fatalf("masterchain lag = %v, want 10", got)
+	}
+	if got := observer.values[syncLagChainShardchain]; got != 20 {
+		t.Fatalf("shardchain lag = %v, want 20", got)
+	}
+}
+
+type fakeSyncLagObserver struct {
+	values map[string]float64
+}
+
+func (o *fakeSyncLagObserver) SetSyncLag(chain string, seconds float64) {
+	o.values[chain] = seconds
 }

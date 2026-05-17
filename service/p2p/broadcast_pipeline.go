@@ -28,6 +28,9 @@ func broadcastEventBytes(event BroadcastEvent) int64 {
 	if event.Downloaded != nil {
 		bytes += int64(len(event.Downloaded.BlockBOC) + len(event.Downloaded.ProofBOC))
 	}
+	if event.ShardDescription != nil {
+		bytes += int64(len(event.ShardDescription.Data))
+	}
 	return bytes
 }
 
@@ -67,12 +70,12 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 			return nil
 		}
 		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, "tonNode.blockBroadcast", data.ID, sourceKey, msg)
-	case BlockBroadcastCompressed:
+	case tonnodeapi.BlockBroadcastCompressed:
 		if !validCompressedBroadcast(data.ID, data.Compressed) {
 			return nil
 		}
 		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, "tonNode.blockBroadcastCompressed", data.ID, sourceKey, msg)
-	case BlockBroadcastCompressedV2:
+	case tonnodeapi.BlockBroadcastCompressedV2:
 		if !validCompressedBroadcast(data.ID, data.DataCompressed) || len(data.Proof) == 0 {
 			return nil
 		}
@@ -81,7 +84,7 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 		if !validCompressedBroadcast(data.Block.ID, data.Block.Data) {
 			return nil
 		}
-		return s.acceptedBlockBroadcast(fingerprint, delivery, trusted, "tonNode.newShardBlockBroadcast", data.Block.ID, sourceKey)
+		return s.acceptedShardBlockBroadcast(fingerprint, delivery, trusted, data.Block.ID, sourceKey, data.Block.CCSeqno, data.Block.Data)
 	case tonnodeapi.NewExternalMessageBroadcast:
 		if len(data.Message.Data) == 0 {
 			return nil
@@ -126,6 +129,15 @@ func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, deliver
 	}
 }
 
+func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, block ton.BlockIDExt, sourceKey string, catchainSeqno int32, data []byte) *acceptedBroadcast {
+	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, "tonNode.newShardBlockBroadcast", block, sourceKey)
+	accepted.event.ShardDescription = &ShardBlockDescription{
+		CatchainSeqno: catchainSeqno,
+		Data:          append([]byte(nil), data...),
+	}
+	return accepted
+}
+
 func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string, msg any) *acceptedBroadcast {
 	downloaded, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
 	if err != nil {
@@ -165,6 +177,7 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		n.trackUnverifiedBroadcastBlock(*accepted.event)
 		if accepted.event.Downloaded != nil && accepted.event.Downloaded.ID.Equals(&accepted.event.Block) {
 			n.rememberDownloadedBlockAsync(nil, accepted.event.Downloaded)
+			n.rememberShardBroadcastBlock(accepted.event.Downloaded)
 		}
 		if !n.eventQueue.Push(*accepted.event) {
 			return

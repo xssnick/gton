@@ -1,7 +1,7 @@
 package blocksync
 
 import (
-	"flexserver/internal/logutil"
+	"github.com/xssnick/gton/internal/logutil"
 
 	"github.com/rs/zerolog"
 )

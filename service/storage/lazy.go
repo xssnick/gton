@@ -3,6 +3,7 @@ package storage
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math/bits"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -15,9 +16,84 @@ const (
 
 // LazyCellRecord rebuilds only the requested cell and leaves refs as lazy placeholders.
 func LazyCellRecord(record *CellRecord, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	hashes, depths := lazyCellHashesDepths(record)
+	if lazyCellType(record) == cell.PrunedCellType {
+		return prunedCellRecordView(record.Hash, record.D1, record.D2, record.Data)
+	}
+
+	hashes, depths, err := lazyCellHashesDepths(record)
+	if err != nil {
+		return nil, err
+	}
 	descriptors := uint16(record.D1)<<8 | uint16(record.D2)
-	return cell.CreateWithLazyRefsUnsafe(descriptors, record.Data, hashes, depths, lazyRefsFromRecord(record), loader)
+	loaded, err := cell.CreateWithLazyRefsUnsafe(descriptors, record.Data, hashes, depths, lazyRefsFromRecord(record), loader)
+	if err != nil {
+		return nil, err
+	}
+	return cellViewForRecordHash(loaded, record.Hash)
+}
+
+func prunedCellRecord(record *CellRecord) (*cell.Cell, error) {
+	bits, err := cellRecordBits(record)
+	if err != nil {
+		return nil, err
+	}
+
+	builder := cell.BeginCell()
+	if err = builder.StoreSlice(record.Data, bits); err != nil {
+		return nil, err
+	}
+	return builder.EndCellSpecial(true)
+}
+
+func prunedCellRecordView(hash []byte, d1 byte, d2 byte, data []byte) (*cell.Cell, error) {
+	if d1&8 == 0 {
+		return nil, fmt.Errorf("pruned cell record is not special")
+	}
+	if d1&7 != 0 {
+		return nil, fmt.Errorf("pruned cell record has refs")
+	}
+	if len(data) == 0 || cell.Type(data[0]) != cell.PrunedCellType {
+		return nil, fmt.Errorf("pruned cell record has invalid body")
+	}
+
+	record := &CellRecord{
+		Hash: hash,
+		D1:   d1,
+		D2:   d2,
+		Data: data,
+	}
+	pruned, err := prunedCellRecord(record)
+	if err != nil {
+		return nil, err
+	}
+	view, err := cellViewForRecordHash(pruned, hash)
+	if err != nil {
+		return nil, err
+	}
+	if got, want := view.LevelMask().Mask, d1>>5; got != want {
+		return nil, fmt.Errorf("pruned cell record level mask mismatch: got=%d want=%d", got, want)
+	}
+	return view, nil
+}
+
+func cellViewForRecordHash(cl *cell.Cell, hash []byte) (*cell.Cell, error) {
+	if len(hash) != cellHashSize {
+		return nil, fmt.Errorf("cell record hash size mismatch: %d", len(hash))
+	}
+
+	var want cell.Hash
+	copy(want[:], hash)
+	if cl.HashKey() == want {
+		return cl, nil
+	}
+
+	for level := 0; level < cl.Level(); level++ {
+		view := cl.Virtualize(uint8(level))
+		if view.HashKey() == want {
+			return view, nil
+		}
+	}
+	return nil, fmt.Errorf("cell record hash mismatch: got=%x want=%x", cl.Hash(), hash)
 }
 
 func lazyRefsFromRecord(record *CellRecord) []cell.LazyRef {
@@ -37,17 +113,28 @@ func lazyRefsFromRecord(record *CellRecord) []cell.LazyRef {
 	return refs
 }
 
-func lazyCellHashesDepths(record *CellRecord) ([]byte, []uint16) {
+func lazyCellHashesDepths(record *CellRecord) ([]byte, []uint16, error) {
 	levelMask := cell.LevelMask{Mask: record.D1 >> 5}
 	hashesCount := CellRefHashesCount(levelMask.Mask)
 	typ := lazyCellType(record)
 
 	if typ == cell.PrunedCellType {
-		hashes := make([]byte, hashesCount*cellHashSize)
-		for off := 0; off < len(hashes); off += cellHashSize {
-			copy(hashes[off:off+cellHashSize], record.Hash)
+		view, err := prunedCellRecordView(record.Hash, record.D1, record.D2, record.Data)
+		if err != nil {
+			return nil, nil, err
 		}
-		return hashes, make([]uint16, hashesCount)
+		meta := view.GetMetadata()
+		if len(meta.Hashes) != hashesCount || len(meta.Depths) != hashesCount {
+			return nil, nil, fmt.Errorf("pruned cell metadata size mismatch: hashes=%d depths=%d want=%d", len(meta.Hashes), len(meta.Depths), hashesCount)
+		}
+
+		hashes := make([]byte, hashesCount*cellHashSize)
+		depths := make([]uint16, hashesCount)
+		for i := 0; i < hashesCount; i++ {
+			copy(hashes[i*cellHashSize:(i+1)*cellHashSize], meta.Hashes[i][:])
+			depths[i] = meta.Depths[i]
+		}
+		return hashes, depths, nil
 	}
 
 	hashes := make([]byte, hashesCount*cellHashSize)
@@ -112,7 +199,7 @@ func lazyCellHashesDepths(record *CellRecord) ([]byte, []uint16) {
 		hashIndex++
 	}
 
-	return hashes, depths
+	return hashes, depths, nil
 }
 
 func lazyCellType(record *CellRecord) cell.Type {

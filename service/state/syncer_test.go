@@ -3,8 +3,8 @@ package state
 import (
 	"context"
 	"errors"
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,21 +15,23 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-const topShard = int64(-1 << 63)
+const (
+	topShard   = int64(-1 << 63)
+	leftShard  = int64(1 << 62)
+	rightShard = int64(-1 << 62)
+)
 
 func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 	master := testStateBlock(-1, topShard, 100)
-	base := testStateBlock(0, topShard, 200)
-	aux := testStateBlock(0, int64(0x4000000000000000), 201)
+	base := testStateBlock(0, leftShard, 200)
+	aux := testStateBlock(0, rightShard, 201)
 
-	now := time.Now()
 	source := &fakeSource{
 		master: master,
-		shards: []ton.BlockIDExt{base, aux},
 		states: map[string]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, base, aux),
-			storage.BlockKey(base):   {Block: base, Cell: cell.BeginCell().EndCell(), DownloadedAt: now},
-			storage.BlockKey(aux):    {Block: aux, Cell: cell.BeginCell().EndCell(), DownloadedAt: now},
+			storage.BlockKey(base):   {Block: base, Cell: cell.BeginCell().EndCell()},
+			storage.BlockKey(aux):    {Block: aux, Cell: cell.BeginCell().EndCell()},
 		},
 	}
 
@@ -76,9 +78,6 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 	if got := source.downloadCount[storage.BlockKey(master)]; got != 0 {
 		t.Fatalf("expected pending master state not to be downloaded, got %d", got)
 	}
-	if got := source.latestCalls; got != 0 {
-		t.Fatalf("expected latest masterchain lookup to be skipped, got %d", got)
-	}
 }
 
 func TestSyncerReturnsShardDownloadError(t *testing.T) {
@@ -87,7 +86,6 @@ func TestSyncerReturnsShardDownloadError(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		shards: []ton.BlockIDExt{shard},
 		states: map[string]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, shard),
 		},
@@ -111,7 +109,6 @@ func TestSyncerRetriesShardStateWithoutRepeatingMasterStage(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		shards: []ton.BlockIDExt{shard},
 		states: map[string]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, shard),
 			storage.BlockKey(shard):  {Block: shard},
@@ -148,7 +145,6 @@ func TestSyncerUsesStoredShardStateWithoutCurrentCheckpoint(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		shards: []ton.BlockIDExt{shard},
 		errByBlock: map[string]error{
 			storage.BlockKey(shard): errors.New("shard should not be downloaded"),
 		},
@@ -185,12 +181,11 @@ func TestSyncerUsesStoredShardStateWithoutCurrentCheckpoint(t *testing.T) {
 func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	pendingMaster := testStateBlock(-1, topShard, 10)
 	newerMaster := testStateBlock(-1, topShard, 20)
-	doneShard := testStateBlock(0, topShard, 11)
-	missingShard := testStateBlock(0, int64(0x4000000000000000), 12)
+	doneShard := testStateBlock(0, leftShard, 11)
+	missingShard := testStateBlock(0, rightShard, 12)
 
 	source := &fakeSource{
 		master: newerMaster,
-		shards: []ton.BlockIDExt{doneShard, missingShard},
 		states: map[string]*storage.BlockState{
 			storage.BlockKey(missingShard): {Block: missingShard},
 		},
@@ -232,9 +227,6 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	if _, ok := snapshot.Shards[storage.ShardKeyFromBlock(missingShard)]; !ok {
 		t.Fatalf("downloaded shard %s is missing from current snapshot", storage.FormatBlockRef(missingShard))
 	}
-	if got := source.latestCalls; got != 0 {
-		t.Fatalf("expected latest masterchain lookup to be skipped, got %d", got)
-	}
 	if got := source.zeroStateCalls; got != 0 {
 		t.Fatalf("expected zero state lookup to be skipped, got %d", got)
 	}
@@ -251,15 +243,14 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 
 func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 	master := testStateBlock(-1, topShard, 10)
-	shardA := testStateBlock(0, topShard, 11)
-	shardB := testStateBlock(0, int64(0x4000000000000000), 12)
+	shardA := testStateBlock(0, leftShard, 11)
+	shardB := testStateBlock(0, rightShard, 12)
 
 	var currentDecodes atomic.Int32
 	var maxDecodes atomic.Int32
 
 	source := &fakeSource{
 		master: master,
-		shards: []ton.BlockIDExt{shardA, shardB},
 		states: map[string]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, shardA, shardB),
 			storage.BlockKey(shardA): {Block: shardA},
@@ -316,8 +307,40 @@ func TestSyncerWalksKeyBlocksFromZeroStateToTailWithoutLatestLookup(t *testing.T
 	if got := source.nextKeyBlockCalls; got != 3 {
 		t.Fatalf("unexpected next key block calls %d", got)
 	}
-	if got := source.latestCalls; got != 0 {
-		t.Fatalf("expected latest masterchain lookup to be skipped, got %d", got)
+}
+
+func TestSyncerUsesConfiguredZeroStateWhenInitBlockIsEmpty(t *testing.T) {
+	emptyInit := ton.BlockIDExt{}
+	zero := testStateBlock(-1, topShard, 0)
+	source := &fakeSource{
+		initBlock: &emptyInit,
+		zeroBlock: &zero,
+		zeroState: testMasterState(t, zero),
+	}
+	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
+
+	trusted, err := syncer.trustedKeyBlockAnchor(context.Background())
+	if err != nil {
+		t.Fatalf("trusted key block anchor: %v", err)
+	}
+	if !trusted.block.Equals(&zero) {
+		t.Fatalf("trusted block = %s, want %s", storage.FormatBlockRef(trusted.block), storage.FormatBlockRef(zero))
+	}
+	if got := source.zeroStateCalls; got != 1 {
+		t.Fatalf("zero state block calls = %d, want 1", got)
+	}
+}
+
+func TestSyncerRejectsNonMasterchainKeyBlockAnchor(t *testing.T) {
+	source := &fakeSource{}
+	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
+
+	_, err := syncer.keyBlockIDs(context.Background(), testStateBlock(0, 0, 0))
+	if err == nil {
+		t.Fatal("expected non-masterchain key block anchor error")
+	}
+	if got := source.nextKeyBlockCalls; got != 0 {
+		t.Fatalf("unexpected next key block calls %d", got)
 	}
 }
 
@@ -345,7 +368,6 @@ func testMasterState(t *testing.T, master ton.BlockIDExt, shards ...ton.BlockIDE
 		Parsed: &tlb.ShardStateUnsplit{
 			McStateExtra: testMcStateExtra(t, shards...),
 		},
-		DownloadedAt: time.Now(),
 	}
 	if len(shards) > 0 {
 		got, err := ShardBlocksFromMasterState(state)
@@ -354,6 +376,15 @@ func testMasterState(t *testing.T, master ton.BlockIDExt, shards ...ton.BlockIDE
 		}
 		if len(got) != len(shards) {
 			t.Fatalf("test master state shard count = %d, want %d", len(got), len(shards))
+		}
+		want := make(map[string]ton.BlockIDExt, len(shards))
+		for _, shard := range shards {
+			want[storage.BlockKey(shard)] = shard
+		}
+		for _, shard := range got {
+			if _, ok := want[storage.BlockKey(shard)]; !ok {
+				t.Fatalf("test master state returned unexpected shard %s", storage.FormatBlockRef(shard))
+			}
 		}
 	}
 	return state
@@ -452,7 +483,9 @@ func testStateBlock(workchain int32, shard int64, seqno uint32) ton.BlockIDExt {
 type fakeSource struct {
 	mu                 sync.Mutex
 	master             ton.BlockIDExt
-	shards             []ton.BlockIDExt
+	initBlock          *ton.BlockIDExt
+	zeroBlock          *ton.BlockIDExt
+	zeroState          *storage.BlockState
 	states             map[string]*storage.BlockState
 	keyBlockBatches    map[uint32]p2p.KeyBlockBatch
 	downloadedFactory  func(block ton.BlockIDExt) storage.DownloadedState
@@ -460,25 +493,28 @@ type fakeSource struct {
 	errSequenceByBlock map[string][]error
 	downloadCount      map[string]int
 	nextKeyBlockCalls  int
-	latestCalls        int
 	zeroStateCalls     int
 }
 
-func (f *fakeSource) LatestMasterchainBlock(context.Context) (ton.BlockIDExt, error) {
-	f.latestCalls++
-	return f.master, nil
-}
-
 func (f *fakeSource) InitBlock(context.Context) (ton.BlockIDExt, error) {
+	if f.initBlock != nil {
+		return *f.initBlock, nil
+	}
 	return f.master, nil
 }
 
 func (f *fakeSource) ZeroStateBlock(context.Context) (ton.BlockIDExt, error) {
 	f.zeroStateCalls++
+	if f.zeroBlock != nil {
+		return *f.zeroBlock, nil
+	}
 	return f.master, nil
 }
 
-func (f *fakeSource) ZeroState(context.Context, ton.BlockIDExt) (storage.DownloadedState, error) {
+func (f *fakeSource) ZeroState(_ context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
+	if f.zeroState != nil && f.zeroState.Block.Equals(&block) {
+		return newImmediateDownloadedState(f.zeroState), nil
+	}
 	return nil, errors.New("unexpected zero state download")
 }
 
@@ -496,10 +532,6 @@ func (f *fakeSource) InitBlockProof(context.Context, ton.BlockIDExt) (p2p.ProofD
 
 func (f *fakeSource) MasterchainProof(context.Context, ton.BlockIDExt, bool) ([]byte, error) {
 	return nil, errors.New("unexpected masterchain proof download")
-}
-
-func (f *fakeSource) ShardBlocks(context.Context, ton.BlockIDExt) ([]ton.BlockIDExt, error) {
-	return append([]ton.BlockIDExt(nil), f.shards...), nil
 }
 
 func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (storage.DownloadedState, error) {

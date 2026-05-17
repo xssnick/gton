@@ -6,13 +6,28 @@ import (
 	"testing"
 	"time"
 
-	"flexserver/service/p2p"
-	tnstore "flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func testCurrentBlockStates(current *tnstore.CurrentState) []*tnstore.BlockState {
+	if current == nil {
+		return nil
+	}
+
+	states := make([]*tnstore.BlockState, 0, 1+len(current.Shards))
+	states = append(states, tnstore.CloneBlockState(&current.Masterchain))
+	for _, key := range tnstore.SortedShardKeys(current.Shards) {
+		shard := current.Shards[key]
+		states = append(states, tnstore.CloneBlockState(&shard))
+	}
+	return states
+}
 
 func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 	ctx := context.Background()
@@ -66,6 +81,37 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 	}
 }
 
+func TestPublishCommittedCurrentStateDoesNotRegressStatus(t *testing.T) {
+	svc := &Service{}
+
+	newerMaster := testBlockID(-1, topShard, 101)
+	olderMaster := testBlockID(-1, topShard, 100)
+	newer := &tnstore.CurrentState{
+		ShardClientSeqno: newerMaster.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: newerMaster,
+		},
+	}
+	older := &tnstore.CurrentState{
+		ShardClientSeqno: olderMaster.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: olderMaster,
+		},
+	}
+
+	svc.publishCommittedCurrentState(newer)
+	svc.publishCommittedCurrentState(older)
+
+	svc.currentStatusMu.RLock()
+	defer svc.currentStatusMu.RUnlock()
+	if svc.currentStatus == nil {
+		t.Fatal("current status is nil")
+	}
+	if got := svc.currentStatus.Masterchain.Block.SeqNo; got != newerMaster.SeqNo {
+		t.Fatalf("current status regressed to seqno %d", got)
+	}
+}
+
 func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
@@ -93,7 +139,7 @@ func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, currentBlockStates(current), nil)
+	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testCurrentBlockStates(current), nil, nil)
 	if err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
@@ -131,13 +177,13 @@ func TestPersistArchiveCurrentStateStoresHistoricalAppliedStates(t *testing.T) {
 		Block: testBlockID(0, topShard, 130),
 		Cell:  testShardStateCell(t, testBlockID(0, topShard, 130)),
 	}
-	states := append([]*tnstore.BlockState{historical}, currentBlockStates(current)...)
+	states := append([]*tnstore.BlockState{historical}, testCurrentBlockStates(current)...)
 	runner := &archiveCatchUpRunner{
 		service: &Service{log: zerolog.Nop(), storage: store},
 		ctx:     ctx,
 	}
 
-	if _, err := runner.persistArchiveCurrentState(current, 1, 0, states, nil); err != nil {
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, states, nil, nil); err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
 	if _, err := store.BlockState(ctx, historical.Block); err != nil {
@@ -172,7 +218,6 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 		Block:         historicalBlock,
 		StateRootHash: stateRootHash[:],
 		StateCellHash: stateCellHash[:],
-		CellsCount:    uint64(len(preparedCells)),
 	}
 
 	overlay := newArchiveStateCellOverlay(store.LazyCellLoader())
@@ -183,20 +228,218 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 	overlay.rememberPreparedCells(currentCells)
 	overlay.rememberPreparedCells(preparedCells)
 	checkpointCells := overlay.beginCheckpoint()
-	states := append([]*tnstore.BlockState{historical}, currentBlockStates(current)...)
+	states := append([]*tnstore.BlockState{historical}, testCurrentBlockStates(current)...)
 	runner := &archiveCatchUpRunner{
 		service: &Service{log: zerolog.Nop(), storage: store},
 		ctx:     ctx,
 	}
 
-	if _, err = runner.persistArchiveCurrentState(current, 1, 0, states, checkpointCells); err != nil {
+	if _, err = runner.persistArchiveCurrentState(current, 1, 0, states, checkpointCells, nil); err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
 	if _, err = store.BlockState(ctx, historical.Block); err != nil {
 		t.Fatalf("load historical archive state: %v", err)
 	}
-	if _, _, err = store.LoadStateCellTree(ctx, historical.Block, historical.StateRootHash); err != nil {
+	if _, err = store.LoadStateCellTree(ctx, historical.Block, historical.StateRootHash); err != nil {
 		t.Fatalf("load historical archive state cells: %v", err)
+	}
+}
+
+func TestArchiveCheckpointUsesAppliedStateCellsForRootValidation(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	svc := &Service{log: zerolog.Nop(), storage: store}
+
+	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+	preparedCells := mustPreparedReachableStateCells(t, root)
+	overlayCells := mustPreparedReachableStateCells(t, root)
+	delete(overlayCells, root.HashKey())
+
+	overlay := newArchiveStateCellOverlay(nil)
+	overlay.rememberPreparedCells(overlayCells)
+
+	rootHash := root.HashKey(0)
+	cellHash := root.HashKey()
+	master := testBlockID(-1, topShard, 72)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block:         master,
+			StateRootHash: rootHash[:],
+			StateCellHash: cellHash[:],
+			Cell:          root,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	runner := &archiveCatchUpRunner{
+		service:             svc,
+		ctx:                 ctx,
+		current:             current,
+		lastCheckpointSeqno: master.SeqNo - 1,
+		stateCells:          overlay,
+	}
+	runner.checkpointStates.rememberWithCells(&current.Masterchain, preparedCells)
+	if _, err := runner.startCheckpoint("test"); err != nil {
+		t.Fatalf("start checkpoint: %v", err)
+	}
+	if _, err := runner.finishCheckpoint(true); err != nil {
+		t.Fatalf("finish checkpoint: %v", err)
+	}
+	svc.Wait()
+
+	if _, err := store.LoadStateCellTree(ctx, master, rootHash[:]); err != nil {
+		t.Fatalf("load persisted checkpoint state cells: %v", err)
+	}
+}
+
+func TestNextBlockCheckpointUsesAppliedStateCellsForRootValidation(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	svc := &Service{log: zerolog.Nop(), storage: store, shutdownContext: ctx}
+
+	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+	preparedCells := mustPreparedReachableStateCells(t, root)
+	overlayCells := mustPreparedReachableStateCells(t, root)
+	delete(overlayCells, root.HashKey())
+
+	rootHash := root.HashKey(0)
+	cellHash := root.HashKey()
+	master := testBlockID(-1, topShard, 73)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block:         master,
+			StateRootHash: rootHash[:],
+			StateCellHash: cellHash[:],
+			Cell:          root,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	stateCells := newStateCellWindowCache(nil)
+	stateCells.addPreparedRecords(overlayCells)
+	runner := &nextSyncRunner{
+		service:      svc,
+		ctx:          ctx,
+		current:      current,
+		stagedBlocks: 1,
+		timing:       newCatchUpTiming(time.Now()),
+		stateCells:   stateCells,
+	}
+	runner.checkpointStates.rememberWithCells(&current.Masterchain, preparedCells)
+	if err := runner.flushStagedCurrentSync("test"); err != nil {
+		t.Fatalf("flush staged next-block current: %v", err)
+	}
+
+	if _, err := store.LoadStateCellTree(ctx, master, rootHash[:]); err != nil {
+		t.Fatalf("load persisted next-block checkpoint state cells: %v", err)
+	}
+}
+
+func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	svc := &Service{log: zerolog.Nop(), storage: store, shutdownContext: ctx}
+
+	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+	preparedCells := mustPreparedReachableStateCells(t, root)
+	delete(preparedCells, root.HashKey())
+
+	rootHash := root.HashKey(0)
+	cellHash := root.HashKey()
+	master := testBlockID(-1, topShard, 74)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block:         master,
+			StateRootHash: rootHash[:],
+			StateCellHash: cellHash[:],
+			Cell:          root,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	runner := &nextSyncRunner{
+		service:      svc,
+		ctx:          ctx,
+		current:      current,
+		stagedBlocks: 1,
+		timing:       newCatchUpTiming(time.Now()),
+		stateCells:   newStateCellWindowCache(nil),
+	}
+	runner.checkpointStates.rememberWithCells(&current.Masterchain, preparedCells)
+	if err := runner.flushStagedCurrent(); err != nil {
+		t.Fatalf("schedule staged current flush: %v", err)
+	}
+	svc.Wait()
+
+	if err := svc.takeCurrentStatePersistError(); err == nil {
+		t.Fatal("expected async checkpoint persist error")
+	}
+	remaining := runner.checkpointStates.clone()
+	if len(remaining) != 1 {
+		t.Fatalf("remaining checkpoint states = %d, want 1", len(remaining))
+	}
+	if !remaining[0].Block.Equals(&master) {
+		t.Fatalf("remaining checkpoint block = %s, want %s", tnstore.FormatBlockRef(remaining[0].Block), tnstore.FormatBlockRef(master))
+	}
+}
+
+func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	svc := &Service{log: zerolog.Nop(), storage: store}
+
+	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+	preparedCells := mustPreparedReachableStateCells(t, root)
+	delete(preparedCells, root.HashKey())
+
+	overlay := newArchiveStateCellOverlay(nil)
+	overlay.rememberPreparedCells(preparedCells)
+
+	rootHash := root.HashKey(0)
+	cellHash := root.HashKey()
+	master := testBlockID(-1, topShard, 72)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block:         master,
+			StateRootHash: rootHash[:],
+			StateCellHash: cellHash[:],
+			Cell:          root,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	runner := &archiveCatchUpRunner{
+		service:             svc,
+		ctx:                 ctx,
+		current:             current,
+		lastCheckpointSeqno: master.SeqNo - 1,
+		stateCells:          overlay,
+	}
+	runner.checkpointStates.remember(&current.Masterchain)
+	if _, err := runner.startCheckpoint("test"); err != nil {
+		t.Fatalf("start checkpoint: %v", err)
+	}
+	if _, err := runner.finishCheckpoint(true); err == nil {
+		t.Fatal("checkpoint with missing prepared root succeeded")
+	}
+	svc.Wait()
+
+	svc.stateCellLoaderMu.RLock()
+	defer svc.stateCellLoaderMu.RUnlock()
+	if len(svc.stateCellLoaders) != 0 {
+		t.Fatalf("failed archive checkpoint left %d retained state cell loaders", len(svc.stateCellLoaders))
 	}
 }
 
@@ -342,6 +585,9 @@ func TestFlushStagedCurrentSyncPersistsAfterContextCancel(t *testing.T) {
 		stagedBlocks: 1,
 		timing:       newCatchUpTiming(time.Now()),
 	}
+	for _, state := range testCurrentBlockStates(current) {
+		runner.checkpointStates.remember(state)
+	}
 
 	if err := runner.flushStagedCurrentSync("test_shutdown"); err != nil {
 		t.Fatalf("flush staged current after cancel: %v", err)
@@ -384,6 +630,9 @@ func TestFlushStagedCurrentSyncStopsWhenShutdownContextCanceled(t *testing.T) {
 		current:      current,
 		stagedBlocks: 1,
 		timing:       newCatchUpTiming(time.Now()),
+	}
+	for _, state := range testCurrentBlockStates(current) {
+		runner.checkpointStates.remember(state)
 	}
 
 	err := runner.flushStagedCurrentSync("test_shutdown")

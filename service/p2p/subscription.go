@@ -28,7 +28,9 @@ type overlaySubscription struct {
 	mx                  sync.Mutex
 	seedMx              sync.Mutex
 	seedRunning         bool
+	seedScheduled       bool
 	seedTarget          int
+	nextSeedAt          time.Time
 	archivePeerMx       sync.Mutex
 	chainDownloadMx     sync.Mutex
 	peers               map[string]*overlayPeer
@@ -40,9 +42,6 @@ type overlaySubscription struct {
 }
 
 type archivePeerState struct {
-	peer        *overlayPeer
-	speed       float64
-	probeAt     time.Time
 	deniedPeers map[string]time.Time
 }
 
@@ -60,20 +59,22 @@ type overlayPeer struct {
 	rldp        *overlay.RLDPWrapper
 	rldpOverlay *overlay.RLDPOverlayWrapper
 
-	statsMx           sync.Mutex
-	versionMajor      int32
-	versionMinor      int32
-	capabilitiesFlags uint32
-	roundtrip         time.Duration
-	unreliability     float64
-	missedPings       uint32
-	alive             bool
-	lastReceiveAt     time.Time
-	lastSuccessAt     time.Time
-	failedQueries     uint64
-	downloadBytesSec  float64
-	downloadCount     uint64
-	downloadSlowUntil time.Time
+	statsMx               sync.Mutex
+	versionMajor          int32
+	versionMinor          int32
+	capabilitiesFlags     uint32
+	roundtrip             time.Duration
+	unreliability         float64
+	missedPings           uint32
+	alive                 bool
+	lastReceiveAt         time.Time
+	lastSuccessAt         time.Time
+	failedQueries         uint64
+	downloadBytesSec      float64
+	downloadCount         uint64
+	archiveLargeBytesSec  float64
+	archiveLargeDownloads uint64
+	downloadSlowUntil     time.Time
 }
 
 func (s *overlaySubscription) run(ctx context.Context) {
@@ -117,18 +118,35 @@ func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, target
 		targetPeers = maxPeersPerOverlay
 	}
 
+	now := time.Now()
+
 	s.seedMx.Lock()
+	if targetPeers > s.seedTarget {
+		s.seedTarget = targetPeers
+	}
 	if s.seedRunning {
-		if targetPeers > s.seedTarget {
-			s.seedTarget = targetPeers
-		}
 		s.seedMx.Unlock()
 		return
 	}
+	if !s.nextSeedAt.IsZero() && now.Before(s.nextSeedAt) {
+		if s.seedScheduled {
+			s.seedMx.Unlock()
+			return
+		}
+		delay := time.Until(s.nextSeedAt)
+		s.seedScheduled = true
+		s.seedMx.Unlock()
+		s.scheduleSeedFromDHT(ctx, delay)
+		return
+	}
 	s.seedRunning = true
-	s.seedTarget = targetPeers
+	targetPeers = s.seedTarget
 	s.seedMx.Unlock()
 
+	s.runSeedFromDHT(ctx, targetPeers)
+}
+
+func (s *overlaySubscription) runSeedFromDHT(ctx context.Context, targetPeers int) {
 	run := func() {
 		defer s.finishSeedFromDHT()
 		s.seedFromDHT(ctx, targetPeers)
@@ -140,10 +158,55 @@ func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, target
 	go run()
 }
 
+func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+
+	run := func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		var nodeDone <-chan struct{}
+		if s.node != nil && s.node.runCtx != nil {
+			nodeDone = s.node.runCtx.Done()
+		}
+
+		select {
+		case <-ctx.Done():
+			s.clearScheduledSeedFromDHT()
+			return
+		case <-nodeDone:
+			s.clearScheduledSeedFromDHT()
+			return
+		case <-timer.C:
+		}
+
+		s.seedMx.Lock()
+		targetPeers := s.seedTarget
+		s.seedScheduled = false
+		s.seedMx.Unlock()
+
+		s.startSeedFromDHTTarget(ctx, targetPeers)
+	}
+	if s.node != nil {
+		s.node.runAsync(run)
+		return
+	}
+	go run()
+}
+
+func (s *overlaySubscription) clearScheduledSeedFromDHT() {
+	s.seedMx.Lock()
+	s.seedScheduled = false
+	s.seedMx.Unlock()
+}
+
 func (s *overlaySubscription) finishSeedFromDHT() {
 	s.seedMx.Lock()
 	s.seedRunning = false
 	s.seedTarget = 0
+	s.nextSeedAt = time.Now().Add(nextDHTSeedCooldownDelay())
 	s.seedMx.Unlock()
 }
 
@@ -335,6 +398,9 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 	pub, ok := node.ID.(keys.PublicKeyED25519)
 	if !ok {
 		return false, fmt.Errorf("unsupported overlay node key type %T", node.ID)
+	}
+	if selfPub, ok := s.node.privKey.Public().(ed25519.PublicKey); ok && bytes.Equal(pub.Key, selfPub) {
+		return false, nil
 	}
 
 	nodeID, err := tl.Hash(node.ID)

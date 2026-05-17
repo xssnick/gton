@@ -3,9 +3,9 @@ package storage
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 
+	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -13,11 +13,21 @@ import (
 
 const topShard = int64(-1 << 63)
 
-var (
-	bocMagic          = [4]byte{0xB5, 0xEE, 0x9C, 0x72}
-	bocIdxMagic       = [4]byte{0x68, 0xFF, 0x65, 0xF3}
-	bocIdxCRC32CMagic = [4]byte{0xAC, 0xC3, 0xA7, 0x28}
-)
+func init() {
+	tl.Register(DbFileDBKeyZeroStateFile{}, "db.filedb.key.zeroStateFile block_id:tonNode.blockIdExt = db.filedb.Key")
+}
+
+type DbFileDBKeyZeroStateFile struct {
+	BlockID ton.BlockIDExt `tl:"struct"`
+}
+
+func ZeroStateFileName(block ton.BlockIDExt) (string, error) {
+	hash, err := tl.Hash(DbFileDBKeyZeroStateFile{BlockID: block})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("zerostate_%d_%x", block.Workchain, hash), nil
+}
 
 func StoredProofKinds(blockData []byte, isLink bool) []ServedProofKind {
 	return StoredProofKindsForBlock(isLink, isKeyBlockData(blockData))
@@ -45,25 +55,11 @@ func FormatBlockRef(block ton.BlockIDExt) string {
 }
 
 func ParseStateBOC(expected *ton.BlockIDExt, data []byte, wantRootHash []byte, wantFileHash []byte) (*BlockState, error) {
-	cellsCount, err := BOCCellsCount(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse state boc header: %w", err)
-	}
-
 	root, err := cell.FromBOC(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse state boc: %w", err)
 	}
-	state, err := ParseStateCell(expected, root, data, wantRootHash, wantFileHash)
-	if err != nil {
-		return nil, err
-	}
-	state.CellsCount = cellsCount
-	return state, nil
-}
-
-func BOCCellsCount(data []byte) (uint64, error) {
-	return bocCellsCount(data)
+	return ParseStateCell(expected, root, data, wantRootHash, wantFileHash)
 }
 
 func ParseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wantRootHash []byte, wantFileHash []byte) (*BlockState, error) {
@@ -126,7 +122,6 @@ func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wa
 		StateRootHash: rootHash[:],
 		StateCellHash: rootCellHash[:],
 		StateFileHash: fileHash,
-		CellsCount:    0,
 		Cell:          root,
 		Parsed:        parsed,
 	}, nil
@@ -134,15 +129,25 @@ func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wa
 
 func parseShardState(root *cell.Cell, proof bool) (*tlb.ShardStateUnsplit, error) {
 	if !proof {
+		loader, err := root.BeginParse()
+		if err != nil {
+			return nil, fmt.Errorf("begin parse shard state: %w", err)
+		}
+
 		var parsed tlb.ShardStateUnsplit
-		if err := tlb.LoadFromCell(&parsed, root.BeginParse()); err != nil {
+		if err := tlb.LoadFromCell(&parsed, loader); err != nil {
 			return nil, fmt.Errorf("parse shard state: %w", err)
 		}
 		return &parsed, nil
 	}
 
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse shard state header: %w", err)
+	}
+
 	var header shardStateHeader
-	if err := tlb.LoadFromCell(&header, root.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&header, loader); err != nil {
 		return nil, fmt.Errorf("parse shard state header: %w", err)
 	}
 
@@ -177,54 +182,6 @@ type shardStateHeader struct {
 	McStateExtra    *cell.Cell     `tlb:"maybe ^"`
 }
 
-func bocCellsCount(data []byte) (uint64, error) {
-	if len(data) < 10 {
-		return 0, fmt.Errorf("invalid boc")
-	}
-
-	var magic [4]byte
-	copy(magic[:], data[:4])
-	switch magic {
-	case bocMagic, bocIdxMagic, bocIdxCRC32CMagic:
-	default:
-		return 0, fmt.Errorf("invalid boc magic header")
-	}
-
-	flags := data[4]
-	cellNumSizeBytes := int(flags & 0b00000111)
-	if cellNumSizeBytes < 1 || cellNumSizeBytes > 4 {
-		return 0, fmt.Errorf("invalid boc size descriptor")
-	}
-	dataSizeBytes := int(data[5])
-	if dataSizeBytes < 1 || dataSizeBytes > 8 {
-		return 0, fmt.Errorf("invalid boc offset descriptor")
-	}
-	if len(data) < 6+cellNumSizeBytes {
-		return 0, fmt.Errorf("invalid boc counters")
-	}
-
-	return readBigEndianUint(data[6 : 6+cellNumSizeBytes]), nil
-}
-
-func readBigEndianUint(data []byte) uint64 {
-	switch len(data) {
-	case 1:
-		return uint64(data[0])
-	case 2:
-		return uint64(binary.BigEndian.Uint16(data))
-	case 3:
-		return uint64(data[0])<<16 | uint64(data[1])<<8 | uint64(data[2])
-	case 4:
-		return uint64(binary.BigEndian.Uint32(data))
-	default:
-		var v uint64
-		for _, b := range data {
-			v = (v << 8) | uint64(b)
-		}
-		return v
-	}
-}
-
 func isKeyBlockData(data []byte) bool {
 	root, err := cell.FromBOC(data)
 	if err != nil {
@@ -232,7 +189,11 @@ func isKeyBlockData(data []byte) bool {
 	}
 
 	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return false
+	}
+	if err = tlb.LoadFromCell(&block, loader); err != nil {
 		return false
 	}
 	return block.BlockInfo.KeyBlock

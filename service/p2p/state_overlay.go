@@ -11,30 +11,31 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
-	persistentStateChunkSize             = 1 << 21
-	persistentStateChunkAnswerMax        = persistentStateChunkSize + 1024
-	persistentStateSmallAnswerMax        = 1024
-	persistentStatePrepareTimeout        = time.Second
-	persistentStateSizeTimeout           = 3 * time.Second
-	persistentStateChunkTimeout          = 20 * time.Second
-	persistentStateChunkWorkers          = 10
-	persistentStateChunkRetries          = 3
-	persistentStatePeerProbeCandidates   = 3
-	persistentStatePeerProbeChunks       = 4
-	persistentStatePeerProbeGrace        = 2 * time.Second
-	persistentStateSplitPartWorkers      = 4
-	persistentStateSplitChunkParallelism = 32
-	persistentStateSplitRetryDelay       = time.Second
+	persistentStateChunkSize              = 1 << 21
+	persistentStateChunkAnswerMax         = persistentStateChunkSize + 1024
+	persistentStateSmallAnswerMax         = 1024
+	persistentStatePrepareTimeout         = time.Second
+	persistentStateSizeTimeout            = 3 * time.Second
+	persistentStateChunkTimeout           = 20 * time.Second
+	persistentStateChunkWorkers           = 10
+	persistentStateChunkRetries           = 3
+	persistentStatePeerProbeCandidates    = 3
+	persistentStatePeerProbeChunks        = 4
+	persistentStatePeerProbeGrace         = 2 * time.Second
+	persistentStateSplitPartBacklog       = 4
+	persistentStateSplitPartImportWorkers = 2
+	persistentStateSplitChunkParallelism  = 32
+	persistentStateSplitRetryDelay        = time.Second
 )
 
 var (
@@ -156,10 +157,23 @@ func (n *Node) downloadZeroStateSnapshot(ctx context.Context, block ton.BlockIDE
 		return nil, errors.New("overlay has no connected peers")
 	}
 
+	n.log.Info().
+		Str("block", formatBlockRef(block)).
+		Int("peers", len(peers)).
+		Msg("requesting zero state from overlay peers")
+
 	var errs []error
 	for _, peer := range peers {
+		n.log.Info().
+			Str("peer", peer.addr).
+			Str("block", formatBlockRef(block)).
+			Msg("requesting zero state from peer")
+
 		artifact, err := n.downloadZeroStateSnapshotFromPeer(ctx, sub, peer, block)
 		if err == nil {
+			if zero, ok := artifact.(*zeroStateSnapshotArtifact); ok {
+				zero.writer, _ = n.peerStorage.(storage.PeerServingStorageWriter)
+			}
 			return artifact, nil
 		}
 		if errors.Is(err, context.Canceled) {
@@ -187,21 +201,17 @@ func (n *Node) downloadZeroStateSnapshotFromPeer(ctx context.Context, sub *overl
 		return nil, fmt.Errorf("unexpected prepareZeroState response %T", resp)
 	}
 
-	dataResp, err := sub.queryFromPeer(ctx, peer, DownloadZeroState{Block: block})
+	data, err := sub.queryRawFromPeerWithLimits(ctx, peer, DownloadZeroState{Block: block}, downloadQueryTimeout, maxBlockDownloadAnswerSize)
 	if err != nil {
 		return nil, err
 	}
-	data, ok := dataResp.(TonNodeData)
-	if !ok {
-		return nil, fmt.Errorf("unexpected downloadZeroState response %T", dataResp)
-	}
-	if len(data.Data) == 0 {
+	if len(data) == 0 {
 		return nil, fmt.Errorf("state boc is empty")
 	}
 
 	return &zeroStateSnapshotArtifact{
 		block: block,
-		data:  bytes.Clone(data.Data),
+		data:  bytes.Clone(data),
 	}, nil
 }
 
@@ -275,7 +285,6 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 			Str("peer", staged.peerAddr).
 			Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
 			Str("size", formatByteSize(staged.size)).
-			Uint64("cells", staged.cells).
 			Str("path", staged.path).
 			Msg("importing staged state snapshot cells")
 
@@ -293,7 +302,6 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 		n.log.Info().
 			Str("peer", staged.peerAddr).
 			Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
-			Uint64("cells", staged.cells).
 			Msg("staged state snapshot switched to lazy celldb root")
 	}
 	return &persistentStateSnapshotArtifact{
@@ -519,7 +527,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 			Int64("probe_bytes_bytes", probe.bytes).
 			Dur("elapsed", probe.elapsed).
 			Int("download_leases", d.node.downloadPeerLeaseCount(probe.candidate.peer)).
-			Str("speed", formatByteRate(probe.bytes, probe.elapsed)).
+			Str("speed", logutil.FormatByteRate(probe.bytes, probe.elapsed)).
 			Msg("persistent state snapshot peer probe result")
 	}
 
@@ -535,7 +543,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 			Int("rank", i+1).
 			Int("peers", len(remaining)).
 			Int("download_leases", d.node.downloadPeerLeaseCount(probe.candidate.peer)).
-			Str("speed", formatByteRate(probe.bytes, probe.elapsed)).
+			Str("speed", logutil.FormatByteRate(probe.bytes, probe.elapsed)).
 			Msg("selected persistent state snapshot peer")
 
 		started := time.Now()
@@ -698,7 +706,6 @@ func (d persistentStateSnapshotDownloader) probePersistentStateCandidates(ctx co
 type downloadedSplitStateHeader struct {
 	state  *tlb.ShardStateUnsplit
 	parts  []splitStatePart
-	cells  uint64
 	staged *stagedStateFile
 }
 
@@ -715,16 +722,9 @@ type splitStatePartResult struct {
 func (d persistentStateSnapshotDownloader) downloadSplit(ctx context.Context, splitDepth uint32) (storage.DownloadedState, error) {
 	n := d.node
 
-	header, err := d.loadImportedSplitHeader(ctx, splitDepth)
+	header, err := d.downloadSplitHeader(ctx, splitDepth)
 	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
-
-		header, err = d.downloadSplitHeader(ctx, splitDepth)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	limiter := make(chan struct{}, persistentStateSplitChunkParallelism)
@@ -734,20 +734,17 @@ func (d persistentStateSnapshotDownloader) downloadSplit(ctx context.Context, sp
 	}
 
 	partArtifacts := make([]splitPersistentStatePartArtifact, len(parts))
-	var partCells uint64
 	for i, part := range parts {
 		partArtifacts[i] = splitPersistentStatePartArtifact{
 			part:   header.parts[i],
 			staged: part.staged,
 		}
-		partCells += part.staged.cells
 	}
 
 	n.log.Info().
 		Str("block", formatBlockRef(d.block)).
 		Str("masterchain", formatBlockRef(d.master)).
 		Int("parts", len(parts)).
-		Uint64("cells", header.cells+partCells).
 		Msg("split persistent state parts staged for import")
 
 	return &splitPersistentStateSnapshotArtifact{
@@ -760,48 +757,10 @@ func (d persistentStateSnapshotDownloader) downloadSplit(ctx context.Context, sp
 	}, nil
 }
 
-func splitStateHeaderStorageBlock(block ton.BlockIDExt) ton.BlockIDExt {
-	block.Shard ^= 1
-	return block
-}
-
 func splitStatePartStorageBlock(block ton.BlockIDExt, part splitStatePart) ton.BlockIDExt {
 	block.Shard = int64(part.effectiveShard)
 	block.RootHash = append([]byte(nil), part.rootHash...)
 	return block
-}
-
-func (d persistentStateSnapshotDownloader) loadImportedSplitHeader(ctx context.Context, splitDepth uint32) (*downloadedSplitStateHeader, error) {
-	n := d.node
-	if n.storage == nil {
-		return nil, storage.ErrNotFound
-	}
-
-	headerBlock := splitStateHeaderStorageBlock(d.block)
-	root, cellsCount, err := n.storage.LoadStateCellTree(ctx, headerBlock, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	header, parts, err := splitStateParts(d.block, root, splitDepth, d.stateRootHash)
-	if err != nil {
-		return nil, fmt.Errorf("%w: parse imported split persistent state header: %w", errStateSnapshotInvalid, err)
-	}
-
-	n.log.Info().
-		Str("block", formatBlockRef(d.block)).
-		Str("masterchain", formatBlockRef(d.master)).
-		Str("header_storage_block", formatBlockRef(headerBlock)).
-		Uint32("split_depth", splitDepth).
-		Int("parts", len(parts)).
-		Uint64("cells", cellsCount).
-		Msg("using imported split persistent state header")
-
-	return &downloadedSplitStateHeader{
-		state: header,
-		parts: parts,
-		cells: cellsCount,
-	}, nil
 }
 
 func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Context, splitDepth uint32) (*downloadedSplitStateHeader, error) {
@@ -826,10 +785,8 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 	if err != nil {
 		return nil, err
 	}
-	header, root, parsedCells, err := d.parseStagedSplitHeader(splitDepth, staged)
+	header, err = d.parseStagedSplitHeader(splitDepth, staged)
 	if err != nil {
-		root = nil
-		parsedCells = nil
 		runtime.GC()
 		if errors.Is(err, errStateSnapshotInvalid) {
 			if cleanupErr := staged.cleanup(); cleanupErr != nil {
@@ -843,22 +800,10 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 		return nil, err
 	}
 
-	if n.storage != nil {
-		if err = d.importSplitHeaderCells(ctx, header, root, parsedCells); err != nil {
-			root = nil
-			parsedCells = nil
-			runtime.GC()
-			return nil, fmt.Errorf("import split persistent state header cells: %w", err)
-		}
-	}
 	if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
-		root = nil
-		parsedCells = nil
 		runtime.GC()
 		return nil, fmt.Errorf("store split persistent state header file: %w", err)
 	}
-	root = nil
-	parsedCells = nil
 	runtime.GC()
 	return header, nil
 }
@@ -885,10 +830,8 @@ func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx contex
 			return nil, err
 		}
 
-		header, root, parsedCells, err := d.parseStagedSplitHeader(splitDepth, staged)
+		header, err := d.parseStagedSplitHeader(splitDepth, staged)
 		if err != nil {
-			root = nil
-			parsedCells = nil
 			runtime.GC()
 			if errors.Is(err, errStateSnapshotInvalid) {
 				staged.keep = false
@@ -908,26 +851,13 @@ func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx contex
 			Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
 			Str("masterchain", formatBlockRef(d.master)).
 			Str("size", formatByteSize(staged.size)).
-			Uint64("cells", staged.cells).
 			Str("path", staged.path).
 			Msg("using reusable staged split persistent state header")
 
-		if n.storage != nil {
-			if err = d.importSplitHeaderCells(ctx, header, root, parsedCells); err != nil {
-				root = nil
-				parsedCells = nil
-				runtime.GC()
-				return nil, fmt.Errorf("import reusable split persistent state header cells: %w", err)
-			}
-		}
 		if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
-			root = nil
-			parsedCells = nil
 			runtime.GC()
 			return nil, fmt.Errorf("store reusable split persistent state header file: %w", err)
 		}
-		root = nil
-		parsedCells = nil
 		runtime.GC()
 		return header, nil
 	}
@@ -935,12 +865,12 @@ func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx contex
 	return nil, storage.ErrNotFound
 }
 
-func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uint32, staged *stagedStateFile) (*downloadedSplitStateHeader, *cell.Cell, []cell.Cell, error) {
+func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uint32, staged *stagedStateFile) (*downloadedSplitStateHeader, error) {
 	n := d.node
 
-	root, parsedCells, err := staged.decodeRootCells()
+	root, _, err := staged.decodeRootCells()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("%w: parse staged split persistent state header boc: %w", errStateSnapshotInvalid, err)
+		return nil, fmt.Errorf("%w: parse staged split persistent state header boc: %w", errStateSnapshotInvalid, err)
 	}
 
 	header, parts, err := splitStateParts(d.block, root, splitDepth, d.stateRootHash)
@@ -953,7 +883,7 @@ func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uin
 			Str("state_file_hash", hex.EncodeToString(staged.fileHash)).
 			Str("prefix", firstBytesHex(staged.prefix, 16)).
 			Msg("failed to parse split persistent state header")
-		return nil, root, parsedCells, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
+		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
 
 	n.log.Info().
@@ -963,33 +893,14 @@ func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uin
 		Uint32("split_depth", splitDepth).
 		Int("parts", len(parts)).
 		Int64("header_size", staged.size).
-		Uint64("cells", staged.cells).
 		Str("header_file_hash", hex.EncodeToString(staged.fileHash)).
 		Msg("split persistent state header parsed")
 
 	return &downloadedSplitStateHeader{
 		state:  header,
 		parts:  parts,
-		cells:  staged.cells,
 		staged: staged,
-	}, root, parsedCells, nil
-}
-
-func (d persistentStateSnapshotDownloader) importSplitHeaderCells(ctx context.Context, header *downloadedSplitStateHeader, root *cell.Cell, parsedCells []cell.Cell) error {
-	n := d.node
-	headerBlock := splitStateHeaderStorageBlock(d.block)
-	if _, err := n.storage.ImportStateCellTree(ctx, headerBlock, root, parsedCells, header.cells); err != nil {
-		return err
-	}
-
-	n.log.Info().
-		Str("block", formatBlockRef(d.block)).
-		Str("masterchain", formatBlockRef(d.master)).
-		Str("header_storage_block", formatBlockRef(headerBlock)).
-		Int("parts", len(header.parts)).
-		Uint64("cells", header.cells).
-		Msg("split persistent state header imported")
-	return nil
+	}, nil
 }
 
 func (d persistentStateSnapshotDownloader) downloadSplitParts(ctx context.Context, parts []splitStatePart, chunkLimiter chan struct{}) ([]*downloadedSplitStatePart, error) {
@@ -1015,9 +926,13 @@ func (d persistentStateSnapshotDownloader) downloadSplitParts(ctx context.Contex
 			return nil, errors.New("overlay has no connected peers")
 		}
 
-		workers := persistentStateSplitPartWorkers
-		if missing < workers {
-			workers = missing
+		backlog := persistentStateSplitPartBacklog
+		if missing < backlog {
+			backlog = missing
+		}
+		importWorkers := persistentStateSplitPartImportWorkers
+		if missing < importWorkers {
+			importWorkers = missing
 		}
 
 		n.log.Info().
@@ -1025,20 +940,23 @@ func (d persistentStateSnapshotDownloader) downloadSplitParts(ctx context.Contex
 			Str("masterchain", formatBlockRef(d.master)).
 			Int("missing_parts", missing).
 			Int("parts", len(parts)).
-			Int("part_workers", workers).
+			Int("download_streams", 1).
+			Int("staged_backlog", backlog).
+			Int("import_workers", importWorkers).
 			Int("chunk_parallelism", cap(chunkLimiter)).
 			Int("peers", len(currentPeers)).
 			Msg("downloading split persistent state parts")
 
-		progress, err := d.withPeers(currentPeers).downloadSplitPartsPass(ctx, parts, downloaded, workers, chunkLimiter)
-		if err != nil && errors.Is(err, errStateSnapshotInvalid) {
-			return nil, err
-		}
+		progress, err := d.withPeers(currentPeers).downloadSplitPartsPass(ctx, parts, downloaded, backlog, importWorkers, chunkLimiter)
 		if missingSplitStateParts(downloaded) == 0 {
 			continue
 		}
 
-		event := n.log.Debug().
+		event := n.log.Debug()
+		if err != nil && errors.Is(err, errStateSnapshotInvalid) {
+			event = n.log.Warn()
+		}
+		event = event.
 			Str("block", formatBlockRef(d.block)).
 			Str("masterchain", formatBlockRef(d.master)).
 			Int("downloaded_parts", len(parts)-missingSplitStateParts(downloaded)).
@@ -1069,7 +987,7 @@ func missingSplitStateParts(parts []*downloadedSplitStatePart) int {
 	return missing
 }
 
-func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Context, parts []splitStatePart, downloaded []*downloadedSplitStatePart, workers int, chunkLimiter chan struct{}) (int, error) {
+func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Context, parts []splitStatePart, downloaded []*downloadedSplitStatePart, backlog int, importWorkers int, chunkLimiter chan struct{}) (int, error) {
 	missing := make([]int, 0, len(parts))
 	for i := range parts {
 		if downloaded[i] == nil {
@@ -1083,23 +1001,28 @@ func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Co
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan int)
-	results := make(chan splitStatePartResult, workers)
-	var wg sync.WaitGroup
+	if backlog <= 0 {
+		backlog = 1
+	}
+	if importWorkers <= 0 {
+		importWorkers = 1
+	}
 
-	for i := 0; i < workers; i++ {
-		workerSlot := i
+	staged := make(chan splitStatePartResult, backlog)
+	results := make(chan splitStatePartResult, importWorkers)
+	var wg sync.WaitGroup
+	for i := 0; i < importWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
-				res := d.downloadSplitPart(ctx, idx, len(parts), parts[idx], workerSlot, chunkLimiter)
+			for res := range staged {
+				if res.err == nil {
+					res.err = d.importSplitPart(ctx, res.index, len(parts), parts[res.index], res.part)
+				}
+
 				select {
 				case results <- res:
 				case <-ctx.Done():
-					return
-				}
-				if errors.Is(res.err, errStateSnapshotInvalid) {
 					return
 				}
 			}
@@ -1107,10 +1030,11 @@ func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Co
 	}
 
 	go func() {
-		defer close(jobs)
+		defer close(staged)
 		for _, idx := range missing {
+			res := d.stageSplitPart(ctx, idx, len(parts), parts[idx], chunkLimiter)
 			select {
-			case jobs <- idx:
+			case staged <- res:
 			case <-ctx.Done():
 				return
 			}
@@ -1127,9 +1051,6 @@ func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Co
 	for res := range results {
 		if res.err != nil {
 			errs = append(errs, res.err)
-			if errors.Is(res.err, errStateSnapshotInvalid) {
-				cancel()
-			}
 			continue
 		}
 		if downloaded[res.index] == nil {
@@ -1140,64 +1061,29 @@ func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Co
 	return progress, errors.Join(errs...)
 }
 
-func (d persistentStateSnapshotDownloader) downloadSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart, workerSlot int, chunkLimiter chan struct{}) splitStatePartResult {
+func (d persistentStateSnapshotDownloader) stageSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart, chunkLimiter chan struct{}) splitStatePartResult {
 	n := d.node
 
-	if imported, err := d.loadImportedSplitPart(ctx, idx, partsCount, part); err == nil {
-		return splitStatePartResult{index: idx, part: imported}
+	if reusable, err := d.loadReusableSplitPart(ctx, idx, partsCount, part); err == nil {
+		return splitStatePartResult{index: idx, part: reusable}
 	} else if errors.Is(err, context.Canceled) {
 		return splitStatePartResult{index: idx, err: err}
 	} else if !errors.Is(err, storage.ErrNotFound) {
-		n.log.Warn().
-			Err(err).
-			Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-			Str("masterchain", formatBlockRef(d.master)).
-			Int("part", idx+1).
-			Int("parts", partsCount).
-			Msg("failed to load imported split persistent state part, downloading it again")
-	}
-
-	if n.storage != nil {
-		partBlock := splitStatePartStorageBlock(d.block, part)
-		staged, _, err := n.tryImportReusableStagedStateFileAs(ctx, d.block, d.master, partBlock, int64(part.effectiveShard), part.rootHash, stagedStateCellHash)
-		if err == nil {
-			if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
-				return splitStatePartResult{
-					index: idx,
-					err:   fmt.Errorf("store reusable split state part %d file: %w", idx+1, err),
-				}
-			}
-			return splitStatePartResult{
-				index: idx,
-				part:  &downloadedSplitStatePart{staged: staged},
-			}
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return splitStatePartResult{
-				index: idx,
-				err:   fmt.Errorf("import reusable split state part %d cells: %w", idx+1, err),
-			}
+		return splitStatePartResult{
+			index: idx,
+			err:   fmt.Errorf("load reusable split state part %d file: %w", idx+1, err),
 		}
 	}
-
-	var result *downloadedSplitStatePart
-	peerOffset := 0
-	if len(d.peers) > 0 {
-		peerOffset = (workerSlot * persistentStatePeerProbeCandidates) % len(d.peers)
-	}
-	partDownloader := d.withPeers(rotatedPeers(d.peers, peerOffset))
 
 	n.log.Info().
 		Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
 		Str("masterchain", formatBlockRef(d.master)).
 		Int("part", idx+1).
 		Int("parts", partsCount).
-		Int("peer_group", workerSlot+1).
-		Int("peer_offset", peerOffset).
 		Int64("effective_shard", int64(part.effectiveShard)).
 		Msg("downloading split persistent state part")
 
-	staged, err := partDownloader.downloadStagedValidated(ctx, int64(part.effectiveShard), chunkLimiter)
+	staged, err := d.downloadStagedValidated(ctx, int64(part.effectiveShard), chunkLimiter)
 	if err != nil {
 		return splitStatePartResult{
 			index: idx,
@@ -1211,99 +1097,103 @@ func (d persistentStateSnapshotDownloader) downloadSplitPart(ctx context.Context
 		Int("part", idx+1).
 		Int("parts", partsCount).
 		Str("size", formatByteSize(staged.size)).
-		Uint64("cells", staged.cells).
 		Int64("effective_shard", int64(part.effectiveShard)).
 		Str("state_file_hash", hex.EncodeToString(staged.fileHash)).
 		Str("path", staged.path).
 		Msg("split persistent state part staged")
 
-	if n.storage != nil {
-		n.log.Info().
-			Str("peer", staged.peerAddr).
-			Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-			Int("part", idx+1).
-			Int("parts", partsCount).
-			Str("size", formatByteSize(staged.size)).
-			Uint64("cells", staged.cells).
-			Str("path", staged.path).
-			Msg("importing staged split persistent state part cells")
-
-		partBlock := splitStatePartStorageBlock(d.block, part)
-		if _, err = n.decodeAndImportStagedStateCellTreeAs(ctx, d.block, partBlock, staged, part.rootHash, stagedStateCellHash); err != nil {
-			return splitStatePartResult{
-				index: idx,
-				err:   fmt.Errorf("import split state part %d cells: %w", idx+1, err),
-			}
-		}
-		if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
-			return splitStatePartResult{
-				index: idx,
-				err:   fmt.Errorf("store split state part %d file: %w", idx+1, err),
-			}
-		}
-
-		n.log.Info().
-			Str("peer", staged.peerAddr).
-			Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-			Int("part", idx+1).
-			Int("parts", partsCount).
-			Uint64("cells", staged.cells).
-			Msg("staged split persistent state part switched to lazy celldb root")
+	return splitStatePartResult{
+		index: idx,
+		part:  &downloadedSplitStatePart{staged: staged},
 	}
-
-	result = &downloadedSplitStatePart{staged: staged}
-
-	return splitStatePartResult{index: idx, part: result}
 }
 
-func (d persistentStateSnapshotDownloader) loadImportedSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart) (*downloadedSplitStatePart, error) {
+func (d persistentStateSnapshotDownloader) importSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart, downloaded *downloadedSplitStatePart) error {
 	n := d.node
-	if n.storage == nil {
-		return nil, storage.ErrNotFound
+	if n.storage == nil || downloaded == nil || downloaded.staged == nil || downloaded.staged.lazyRoot != nil {
+		return nil
 	}
+	staged := downloaded.staged
+
+	n.log.Info().
+		Str("peer", staged.peerAddr).
+		Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
+		Int("part", idx+1).
+		Int("parts", partsCount).
+		Str("size", formatByteSize(staged.size)).
+		Str("path", staged.path).
+		Msg("importing staged split persistent state part cells")
 
 	partBlock := splitStatePartStorageBlock(d.block, part)
-	root, cellsCount, err := n.storage.LoadStateCellTree(ctx, partBlock, nil)
-	if err != nil {
-		return nil, err
+	if _, err := n.decodeAndImportSplitPartStagedStateCellTree(ctx, d.block, partBlock, staged, part.rootHash); err != nil {
+		if errors.Is(err, errStateSnapshotInvalid) {
+			path := staged.path
+			staged.keep = false
+			if cleanupErr := staged.cleanup(); cleanupErr != nil {
+				n.log.Warn().
+					Err(cleanupErr).
+					Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
+					Str("path", path).
+					Msg("failed to remove invalid split persistent state part file")
+			} else {
+				n.log.Warn().
+					Err(err).
+					Str("peer", staged.peerAddr).
+					Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
+					Int("part", idx+1).
+					Int("parts", partsCount).
+					Str("path", path).
+					Msg("removed invalid split persistent state part file")
+			}
+		}
+		return fmt.Errorf("import split state part %d cells: %w", idx+1, err)
 	}
-	rootHash := root.HashKey()
-	if !bytes.Equal(rootHash[:], part.rootHash) {
-		return nil, storage.ErrNotFound
+	if err := n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+		return fmt.Errorf("store split state part %d file: %w", idx+1, err)
 	}
 
 	n.log.Info().
+		Str("peer", staged.peerAddr).
 		Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-		Str("masterchain", formatBlockRef(d.master)).
 		Int("part", idx+1).
 		Int("parts", partsCount).
-		Uint64("cells", cellsCount).
-		Int64("effective_shard", int64(part.effectiveShard)).
-		Msg("using imported split persistent state part")
-
-	return &downloadedSplitStatePart{
-		staged: &stagedStateFile{
-			effectiveShard: int64(part.effectiveShard),
-			peerAddr:       "celldb",
-			cells:          cellsCount,
-			lazyRoot:       root,
-		},
-	}, nil
+		Msg("staged split persistent state part switched to lazy celldb root")
+	return nil
 }
 
-func rotatedPeers(peers []*overlayPeer, offset int) []*overlayPeer {
-	if len(peers) == 0 {
-		return peers
+func (d persistentStateSnapshotDownloader) loadReusableSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart) (*downloadedSplitStatePart, error) {
+	n := d.node
+	paths, err := n.reusableStagedStateFiles(d.block, d.master, int64(part.effectiveShard))
+	if err != nil {
+		return nil, err
 	}
 
-	offset %= len(peers)
-	if offset == 0 {
-		return peers
+	for _, path := range paths {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		staged, err := n.loadReusableStagedStateFile(path, int64(part.effectiveShard))
+		if err != nil {
+			if errors.Is(err, errStateSnapshotInvalid) {
+				n.removeInvalidReusableStateFile(d.block, int64(part.effectiveShard), path, err)
+				continue
+			}
+			return nil, err
+		}
+
+		n.log.Info().
+			Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
+			Str("masterchain", formatBlockRef(d.master)).
+			Int("part", idx+1).
+			Int("parts", partsCount).
+			Str("size", formatByteSize(staged.size)).
+			Str("path", staged.path).
+			Msg("using reusable staged split persistent state part")
+		return &downloadedSplitStatePart{staged: staged}, nil
 	}
 
-	rotated := make([]*overlayPeer, 0, len(peers))
-	rotated = append(rotated, peers[offset:]...)
-	return append(rotated, peers[:offset]...)
+	return nil, storage.ErrNotFound
 }
 
 type stateChunkResult struct {
@@ -1418,7 +1308,7 @@ func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.
 func (n *Node) logDownloadStateProgress(peer *overlayPeer, blockRef string, downloaded, size int64, workers int, lastProgress time.Time, lastProgressDownloaded int64) {
 	now := time.Now()
 	progress := float64(downloaded) * 100 / float64(size)
-	speed := formatByteRate(downloaded-lastProgressDownloaded, now.Sub(lastProgress))
+	speed := logutil.FormatByteRate(downloaded-lastProgressDownloaded, now.Sub(lastProgress))
 
 	n.log.Info().
 		Str("peer", peer.addr).
@@ -1448,25 +1338,6 @@ func formatByteSize(size int64) string {
 		return fmt.Sprintf("%.2f %s", value, units[i])
 	}
 	return fmt.Sprintf("%.2f %s", value, units[i])
-}
-
-func formatByteRate(bytes int64, elapsed time.Duration) string {
-	if bytes <= 0 || elapsed <= 0 {
-		return "0 B/s"
-	}
-
-	rate := float64(bytes) / elapsed.Seconds()
-	units := []string{"B/s", "KB/s", "MB/s", "GB/s"}
-	unit := 0
-	for rate >= 1024 && unit < len(units)-1 {
-		rate /= 1024
-		unit++
-	}
-
-	if unit == 0 {
-		return fmt.Sprintf("%.0f %s", rate, units[unit])
-	}
-	return fmt.Sprintf("%.2f %s", rate, units[unit])
 }
 
 func firstBytesHex(data []byte, limit int) string {

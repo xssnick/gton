@@ -7,9 +7,9 @@ import (
 	"math/bits"
 	"time"
 
-	"flexserver/service/blockproof"
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -22,7 +22,7 @@ const (
 	keyBlockProgressInfoEvery  = 64
 	keyBlockLookupRetryDelay   = time.Second
 	keyBlockLookupRetryLogEach = 5
-	initialStateMinAge         = time.Hour
+	DefaultSyncBefore          = time.Hour
 	initialStateDownloadWindow = 8 * time.Hour
 )
 
@@ -61,20 +61,17 @@ func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
-	if err = s.storage.SaveSeenMasterchainBlock(ctx, trusted.block); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("save latest verified key block %s: %w", storage.FormatBlockRef(trusted.block), err)
-	}
 
-	block, ok := choosePersistentKeyBlock(candidates, time.Now())
+	block, ok := choosePersistentKeyBlock(candidates, time.Now(), s.syncBefore)
 	if ok {
 		return block, nil
 	}
 
 	return ton.BlockIDExt{}, fmt.Errorf(
-		"no persistent key block state snapshot candidate: latest_verified=%s key_blocks=%d min_age=%s download_window=%s",
+		"no persistent key block state snapshot candidate: latest_verified=%s key_blocks=%d sync_before=%s download_window=%s",
 		storage.FormatBlockRef(trusted.block),
 		len(candidates),
-		initialStateMinAge,
+		s.syncBefore,
 		initialStateDownloadWindow,
 	)
 }
@@ -94,7 +91,11 @@ func (s *Syncer) trustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, er
 			return trustedKeyBlock{}, err
 		}
 		if initBlock.SeqNo == 0 {
-			trusted, err = s.trustedZeroState(ctx, initBlock)
+			zeroBlock, err := s.source.ZeroStateBlock(ctx)
+			if err != nil {
+				return trustedKeyBlock{}, err
+			}
+			trusted, err = s.trustedZeroState(ctx, zeroBlock)
 		} else {
 			trusted, err = s.trustedInitBlock(ctx, initBlock)
 		}
@@ -105,12 +106,32 @@ func (s *Syncer) trustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, er
 
 	resumed, err := s.resumeTrustedKeyBlockAnchor(ctx, trusted)
 	if err == nil {
+		if err = validateTrustedKeyBlockAnchor(resumed.block); err != nil {
+			return trustedKeyBlock{}, err
+		}
 		return resumed, nil
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return trustedKeyBlock{}, err
 	}
+	if err = validateTrustedKeyBlockAnchor(trusted.block); err != nil {
+		return trustedKeyBlock{}, err
+	}
+	s.log.Info().
+		Str("block", storage.FormatBlockRef(trusted.block)).
+		Uint32("utime", trusted.utime).
+		Msg("using trusted key block anchor")
 	return trusted, nil
+}
+
+func validateTrustedKeyBlockAnchor(block ton.BlockIDExt) error {
+	if block.Workchain != -1 || block.Shard != masterchainShard {
+		return fmt.Errorf("trusted key block anchor is not masterchain: %s", storage.FormatBlockRef(block))
+	}
+	if len(block.RootHash) != 32 || len(block.FileHash) != 32 {
+		return fmt.Errorf("trusted key block anchor has invalid hashes: %s root_hash_len=%d file_hash_len=%d", storage.FormatBlockRef(block), len(block.RootHash), len(block.FileHash))
+	}
+	return nil
 }
 
 func (s *Syncer) resumeTrustedKeyBlockAnchor(ctx context.Context, trusted trustedKeyBlock) (trustedKeyBlock, error) {
@@ -245,6 +266,13 @@ func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trusted
 }
 
 func (s *Syncer) trustedZeroState(ctx context.Context, zeroBlock ton.BlockIDExt) (trustedKeyBlock, error) {
+	if err := validateTrustedKeyBlockAnchor(zeroBlock); err != nil {
+		return trustedKeyBlock{}, err
+	}
+	if zeroBlock.SeqNo != 0 {
+		return trustedKeyBlock{}, fmt.Errorf("trusted zero state anchor is not zerostate: %s", storage.FormatBlockRef(zeroBlock))
+	}
+
 	s.log.Info().
 		Str("block", storage.FormatBlockRef(zeroBlock)).
 		Msg("loading trusted zero state")
@@ -469,6 +497,10 @@ func (s *P2PSource) MasterchainProof(ctx context.Context, block ton.BlockIDExt, 
 }
 
 func (s *Syncer) keyBlockIDs(ctx context.Context, fromBlock ton.BlockIDExt) ([]ton.BlockIDExt, error) {
+	if fromBlock.Workchain != -1 || fromBlock.Shard != masterchainShard {
+		return nil, fmt.Errorf("next key block lookup requires masterchain anchor, got %s", storage.FormatBlockRef(fromBlock))
+	}
+
 	var all []ton.BlockIDExt
 	from := fromBlock
 	retries := 0
@@ -575,9 +607,12 @@ func (s *Syncer) keyBlockIDs(ctx context.Context, fromBlock ton.BlockIDExt) ([]t
 	return all, nil
 }
 
-func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time) (ton.BlockIDExt, bool) {
+func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syncBefore time.Duration) (ton.BlockIDExt, bool) {
+	if syncBefore <= 0 {
+		syncBefore = DefaultSyncBefore
+	}
 	nowUnix := uint64(now.Unix())
-	minAge := uint64(initialStateMinAge / time.Second)
+	minAge := uint64(syncBefore / time.Second)
 	minTTL := uint64(initialStateDownloadWindow / time.Second)
 
 	for i := len(candidates) - 1; i >= 0; i-- {
@@ -586,11 +621,11 @@ func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time) (to
 			continue
 		}
 
-		persistent := i == 0 || isPersistentState(candidate.utime, candidates[i-1].utime)
+		persistent := i == 0 || IsPersistentState(candidate.utime, candidates[i-1].utime)
 		if !persistent {
 			continue
 		}
-		if persistentStateTTL(candidate.utime) <= nowUnix+minTTL {
+		if PersistentStateTTL(candidate.utime) <= nowUnix+minTTL {
 			continue
 		}
 
@@ -600,11 +635,11 @@ func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time) (to
 	return ton.BlockIDExt{}, false
 }
 
-func isPersistentState(ts, prevTS uint32) bool {
+func IsPersistentState(ts, prevTS uint32) bool {
 	return ts/(1<<17) != prevTS/(1<<17)
 }
 
-func persistentStateTTL(ts uint32) uint64 {
+func PersistentStateTTL(ts uint32) uint64 {
 	x := uint64(ts) / (1 << 17)
 	if x == 0 {
 		return uint64(ts)

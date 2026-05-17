@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -68,7 +68,7 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 	account, err := loadRunMethodAccountState(info.accountCell)
 	if err != nil {
 		if query.Mode&2 != 0 {
-			result.StateProof, err = runMethodAccountProof(info.accountCell)
+			result.StateProof, err = s.runMethodInactiveAccountProof(info.accountCell)
 			if err != nil {
 				return errorResponse(err, "cannot create account state proof")
 			}
@@ -81,7 +81,7 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		return errorResponse(err, "cannot load masterchain config")
 	}
 
-	libraries, err := runMethodLibraries(info.masterState, account.StateInit.Lib)
+	libraries, err := runMethodLibraries(info.masterState, nil)
 	if err != nil {
 		return errorResponse(err, "cannot load libraries")
 	}
@@ -100,14 +100,8 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		DuePayment:  accountDuePayment(account),
 	})
 
-	machine := tvm.NewTVM()
-	if err = machine.SetGlobalVersion(config.GlobalVersion); err != nil {
-		return errorResponse(err, "cannot configure tvm")
-	}
-
-	execResult, err := machine.ExecuteDetailedWithLibraries(
-		account.StateInit.Code,
-		account.StateInit.Data,
+	execResult, err := s.tvm.ExecuteDetailedWithAccountProof(
+		info.accountCell,
 		c7,
 		vmcore.GasWithLimit(runMethodGasLimit),
 		stack,
@@ -143,10 +137,7 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		}
 	}
 	if query.Mode&2 != 0 {
-		result.StateProof, err = runMethodAccountProof(info.accountCell)
-		if err != nil {
-			return errorResponse(err, "cannot create account state proof")
-		}
+		result.StateProof = execResult.Proof
 	}
 
 	return result
@@ -159,7 +150,10 @@ func runMethodStack(methodID uint64, params *cell.Cell) (*vmcore.Stack, error) {
 
 	var stack tlb.Stack
 	if params != nil {
-		loader := params.BeginParse()
+		loader, err := params.BeginParse()
+		if err != nil {
+			return nil, fmt.Errorf("parameter list boc cannot be deserialized as a VmStack: %w", err)
+		}
 		if err := stack.LoadFromCell(loader); err != nil {
 			return nil, fmt.Errorf("parameter list boc cannot be deserialized as a VmStack: %w", err)
 		}
@@ -178,8 +172,8 @@ func runMethodStack(methodID uint64, params *cell.Cell) (*vmcore.Stack, error) {
 	}
 
 	vmStack := vmcore.NewStack()
-	for i := len(values) - 1; i >= 0; i-- {
-		if err := pushVMStackValue(vmStack, values[i]); err != nil {
+	for _, value := range values {
+		if err := pushVMStackValue(vmStack, value); err != nil {
 			return nil, err
 		}
 	}
@@ -257,37 +251,75 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 }
 
 func (s *Server) runMethodMasterState(ctx context.Context, shard ton.BlockIDExt) (ton.BlockIDExt, *cell.Cell, error) {
-	meta, err := s.store.BlockMeta(ctx, shard)
-	if err == nil && meta.MasterchainRef != nil {
-		root, err := s.loadStateRoot(ctx, *meta.MasterchainRef)
-		return *meta.MasterchainRef, root, err
-	}
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return ton.BlockIDExt{}, nil, err
-	}
-
-	root, err := s.loadBlockRoot(ctx, shard)
+	shardState, err := s.loadStateRoot(ctx, shard)
 	if err != nil {
 		return ton.BlockIDExt{}, nil, err
 	}
 
-	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
-		return ton.BlockIDExt{}, nil, err
-	}
-	if block.BlockInfo.MasterRef == nil {
+	master, err := shardStateMasterRef(shardState)
+	if errors.Is(err, storage.ErrNotFound) {
 		return ton.BlockIDExt{}, nil, fmt.Errorf("masterchain ref block is not available")
 	}
-
-	master := ton.BlockIDExt{
-		Workchain: masterchainID,
-		Shard:     masterchainShard,
-		SeqNo:     block.BlockInfo.MasterRef.SeqNo,
-		RootHash:  append([]byte(nil), block.BlockInfo.MasterRef.RootHash...),
-		FileHash:  append([]byte(nil), block.BlockInfo.MasterRef.FileHash...),
+	if err != nil {
+		return ton.BlockIDExt{}, nil, err
 	}
 	state, err := s.loadStateRoot(ctx, master)
 	return master, state, err
+}
+
+type shardStateStatsMasterRef struct {
+	Master tlb.ExtBlkRef `tlb:"."`
+}
+
+func shardStateMasterRef(stateRoot *cell.Cell) (ton.BlockIDExt, error) {
+	var state tlb.ShardStateUnsplit
+	loader, err := stateRoot.BeginParse()
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if err = tlb.LoadFromCell(&state, loader); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if state.Stats == nil {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+
+	stats, err := state.Stats.BeginParse()
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if _, err = stats.LoadUInt(64); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if _, err = stats.LoadUInt(64); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+
+	var totalBalance tlb.CurrencyCollection
+	if err = tlb.LoadFromCell(&totalBalance, stats); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	var totalValidatorFees tlb.CurrencyCollection
+	if err = tlb.LoadFromCell(&totalValidatorFees, stats); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if _, err = stats.LoadDict(256); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+
+	masterRef, err := stats.LoadMaybeRef()
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if masterRef == nil {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+
+	var info shardStateStatsMasterRef
+	if err = tlb.LoadFromCell(&info, masterRef); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return blockIDFromExtRef(masterchainID, masterchainShard, info.Master), nil
 }
 
 type runMethodConfigInfo struct {
@@ -296,7 +328,7 @@ type runMethodConfigInfo struct {
 	GlobalVersion int
 	PrevBlocks    any
 	Unpacked      any
-	Precompiled   any
+	Precompiled   *big.Int
 }
 
 func runMethodConfig(master ton.BlockIDExt, masterState *cell.Cell, now uint32, code *cell.Cell) (runMethodConfigInfo, error) {
@@ -406,7 +438,10 @@ func runMethodMasterInfoFromState(masterState *cell.Cell) (runMethodMasterInfo, 
 		return runMethodMasterInfo{}, fmt.Errorf("state is missing mc_state_extra info")
 	}
 
-	loader := extra.Info.BeginParse()
+	loader, err := extra.Info.BeginParse()
+	if err != nil {
+		return runMethodMasterInfo{}, err
+	}
 	if _, err = loader.LoadUInt(16); err != nil {
 		return runMethodMasterInfo{}, err
 	}
@@ -560,7 +595,7 @@ func runMethodConfigParamSlice(config tlb.BlockchainConfig, id uint32) (*cell.Sl
 	if err != nil || param == nil {
 		return nil, err
 	}
-	return param.BeginParse(), nil
+	return param.BeginParse()
 }
 
 func runMethodConfigParamCell(config tlb.BlockchainConfig, id uint32) (*cell.Cell, error) {
@@ -629,8 +664,13 @@ func runMethodLibraries(masterState *cell.Cell, accountLibs *cell.Dictionary) ([
 }
 
 func loadRunMethodAccountState(accountCell *cell.Cell) (tlb.AccountState, error) {
+	loader, err := accountCell.BeginParse()
+	if err != nil {
+		return tlb.AccountState{}, err
+	}
+
 	var account tlb.AccountState
-	if err := tlb.LoadFromCell(&account, accountCell.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&account, loader); err != nil {
 		return tlb.AccountState{}, err
 	}
 	if !account.IsValid || account.Status != tlb.AccountStatusActive || account.StateInit == nil ||
@@ -640,10 +680,17 @@ func loadRunMethodAccountState(accountCell *cell.Cell) (tlb.AccountState, error)
 	return account, nil
 }
 
-func runMethodAccountProof(accountCell *cell.Cell) (*cell.Cell, error) {
-	sk := cell.CreateProofSkeleton()
-	sk.SetRecursive()
-	return accountCell.CreateProof(sk)
+func (s *Server) runMethodInactiveAccountProof(accountCell *cell.Cell) (*cell.Cell, error) {
+	res, err := s.tvm.ExecuteDetailedWithAccountProof(
+		accountCell,
+		tuple.Tuple{},
+		vmcore.GasWithLimit(runMethodGasLimit),
+		vmcore.NewStack(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return res.Proof, nil
 }
 
 type runMethodShardHeader struct {
@@ -657,8 +704,13 @@ type runMethodShardHeader struct {
 }
 
 func runMethodShardStateHeader(stateRoot *cell.Cell) (runMethodShardHeader, error) {
+	loader, err := stateRoot.BeginParse()
+	if err != nil {
+		return runMethodShardHeader{}, err
+	}
+
 	var header runMethodShardHeader
-	if err := tlb.LoadFromCell(&header, stateRoot.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&header, loader); err != nil {
 		return runMethodShardHeader{}, err
 	}
 	return header, nil
@@ -671,7 +723,7 @@ type runMethodC7Config struct {
 	HasConfig   bool
 	PrevBlocks  any
 	Unpacked    any
-	Precompiled any
+	Precompiled *big.Int
 	Now         uint32
 	LT          uint64
 	Balance     tuple.Tuple

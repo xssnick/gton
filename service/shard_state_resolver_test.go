@@ -2,12 +2,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
-	"flexserver/service/p2p"
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -92,6 +93,49 @@ func TestShardStateResolverResolvesMergeFromTwoChildren(t *testing.T) {
 	}
 }
 
+func TestValidateShardDescriptionPrefetchUsesRelatedCurrentShard(t *testing.T) {
+	parent := testBlockID(0, topShard, 10)
+	leftShard := int64(tlb.ShardID(uint64(parent.Shard)).GetChild(true))
+	target := testBlockID(0, leftShard, 12)
+
+	resolver := newShardStateResolver(context.Background(), shardStateResolverConfig{
+		current: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(parent): {Block: parent},
+		},
+	})
+	runner := &nextSyncRunner{shardResolver: resolver}
+
+	desc := &shardTopBlockDescription{
+		Block: target,
+		Chain: []shardTopBlockDescriptionLink{
+			{Block: target, PrevRefs: []ton.BlockIDExt{parent}},
+		},
+	}
+	if err := runner.validateShardDescriptionPrefetch(desc); err != nil {
+		t.Fatalf("validate related shard target: %v", err)
+	}
+
+	unanchored := &shardTopBlockDescription{
+		Block: target,
+		Chain: []shardTopBlockDescriptionLink{
+			{Block: target, PrevRefs: []ton.BlockIDExt{testBlockID(0, leftShard, parent.SeqNo)}},
+		},
+	}
+	if err := runner.validateShardDescriptionPrefetch(unanchored); err == nil {
+		t.Fatal("expected unanchored shard description to be rejected")
+	}
+
+	old := testBlockID(0, leftShard, 10)
+	if err := runner.validateShardDescriptionPrefetch(&shardTopBlockDescription{Block: old}); err != errShardDescriptionTooOld {
+		t.Fatalf("old shard target error = %v, want errShardDescriptionTooOld", err)
+	}
+
+	far := testBlockID(0, leftShard, parent.SeqNo+shardDescriptionPrefetchMaxAhead+1)
+	if err := runner.validateShardDescriptionPrefetch(&shardTopBlockDescription{Block: far}); err != errShardDescriptionTooNew {
+		t.Fatalf("far shard target error = %v, want errShardDescriptionTooNew", err)
+	}
+}
+
 func TestShardStateResolverCallsAfterApplyState(t *testing.T) {
 	ctx := context.Background()
 	parent := testBlockID(0, topShard, 25)
@@ -125,6 +169,71 @@ func TestShardStateResolverCallsAfterApplyState(t *testing.T) {
 	}
 	if !callbackBlock.Equals(&target) {
 		t.Fatalf("callback block = %s, want %s", storage.FormatBlockRef(callbackBlock), storage.FormatBlockRef(target))
+	}
+}
+
+func TestShardStateResolverWaitUsesCallContext(t *testing.T) {
+	ctx := context.Background()
+	parent := testBlockID(0, topShard, 27)
+	target := testBlockID(0, topShard, 28)
+
+	env := newFakeShardStateResolverEnv()
+	env.addState(parent)
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	resolver := newShardStateResolver(ctx, shardStateResolverConfig{
+		current: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(parent): {Block: parent},
+		},
+		loadState: env.loadState,
+		loadBlock: func(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+			close(started)
+			select {
+			case <-unblock:
+				return p2p.DownloadedBlock{}, storage.ErrNotFound
+			case <-ctx.Done():
+				return p2p.DownloadedBlock{}, ctx.Err()
+			}
+		},
+		apply: env.apply,
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := resolver.resolve(target)
+		done <- err
+	}()
+	<-started
+
+	waitCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := resolver.resolveWithContext(waitCtx, target); !errors.Is(err, context.Canceled) {
+		t.Fatalf("shared task wait error = %v, want context.Canceled", err)
+	}
+
+	close(unblock)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("owner resolve did not finish")
+	}
+}
+
+func TestShardStateResolverRejectsNonPreviousRef(t *testing.T) {
+	ctx := context.Background()
+	target := testBlockID(0, topShard, 29)
+
+	env := newFakeShardStateResolverEnv()
+	env.addBlock(target, target)
+	resolver := newShardStateResolver(ctx, shardStateResolverConfig{
+		current:   map[storage.ShardKey]storage.BlockState{},
+		loadState: env.loadState,
+		loadBlock: env.loadBlock,
+		apply:     env.apply,
+	})
+
+	if _, err := resolver.resolve(target); err == nil {
+		t.Fatal("expected non-previous ref to be rejected")
 	}
 }
 

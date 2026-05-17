@@ -12,13 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -33,7 +34,7 @@ type Store interface {
 	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	CurrentState(ctx context.Context) (*storage.CurrentState, error)
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error)
-	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, uint64, error)
+	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error)
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
 	LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error)
 	LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
@@ -44,31 +45,42 @@ type MessageSender interface {
 	SendExternalMessage(ctx context.Context, body []byte) error
 }
 
+type QueryObserver interface {
+	ObserveLiteserverQuery(method string, duration time.Duration)
+}
+
 type Options struct {
 	Logger        *zerolog.Logger
 	Store         Store
 	MessageSender MessageSender
+	QueryObserver QueryObserver
 	PrivateKey    ed25519.PrivateKey
 	ListenAddr    string
 	ZeroState     ton.ZeroStateIDExt
 	Version       int32
 	Capabilities  int64
-	Now           func() time.Time
 }
 
 type Server struct {
 	log           zerolog.Logger
 	store         Store
 	messageSender MessageSender
+	queryObserver QueryObserver
 	privateKey    ed25519.PrivateKey
 	listenAddr    string
 	zeroState     ton.ZeroStateIDExt
 	version       int32
 	capabilities  int64
 	now           func() time.Time
+	tvm           *tvm.TVM
 
 	server *liteclient.Server
+	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	blockProofBasesMu   sync.Mutex
+	blockProofBases     map[string]*blockProofBase
+	blockProofBaseOrder []string
 }
 
 func New(opts Options) (*Server, error) {
@@ -97,21 +109,19 @@ func New(opts Options) (*Server, error) {
 		capabilities = DefaultCapabilities
 	}
 
-	now := opts.Now
-	if now == nil {
-		now = time.Now
-	}
-
 	return &Server{
-		log:           log,
-		store:         opts.Store,
-		messageSender: opts.MessageSender,
-		privateKey:    opts.PrivateKey,
-		listenAddr:    opts.ListenAddr,
-		zeroState:     cloneZeroState(opts.ZeroState),
-		version:       version,
-		capabilities:  capabilities,
-		now:           now,
+		log:             log,
+		store:           opts.Store,
+		messageSender:   opts.MessageSender,
+		queryObserver:   opts.QueryObserver,
+		privateKey:      opts.PrivateKey,
+		listenAddr:      opts.ListenAddr,
+		zeroState:       cloneZeroState(opts.ZeroState),
+		version:         version,
+		capabilities:    capabilities,
+		now:             time.Now,
+		tvm:             tvm.NewTVM(),
+		blockProofBases: make(map[string]*blockProofBase),
 	}, nil
 }
 
@@ -132,6 +142,8 @@ func (s *Server) Start(ctx context.Context) error {
 		s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port()).Msg("closed liteserver connection")
 	})
 	s.server = srv
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
 
 	errCh := make(chan error, 1)
 	s.wg.Add(1)
@@ -142,7 +154,7 @@ func (s *Server) Start(ctx context.Context) error {
 			case errCh <- err:
 			default:
 			}
-			if ctx.Err() == nil {
+			if runCtx.Err() == nil {
 				s.log.Error().Err(err).Str("listen_addr", s.listenAddr).Msg("liteserver listener stopped")
 			}
 		}
@@ -151,7 +163,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		<-ctx.Done()
+		<-runCtx.Done()
 		if err := srv.Close(); err != nil {
 			s.log.Warn().Err(err).Msg("failed to close liteserver listener")
 		}
@@ -159,11 +171,17 @@ func (s *Server) Start(ctx context.Context) error {
 
 	select {
 	case err := <-errCh:
+		cancel()
 		_ = srv.Close()
+		s.server = nil
+		s.cancel = nil
 		return err
-	case <-ctx.Done():
+	case <-runCtx.Done():
+		cancel()
 		_ = srv.Close()
-		return ctx.Err()
+		s.server = nil
+		s.cancel = nil
+		return runCtx.Err()
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -175,6 +193,9 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.server == nil {
 		return nil
 	}
@@ -250,22 +271,32 @@ func (s *Server) handleMessage(ctx context.Context, client *liteclient.ServerCli
 
 func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.ServerClient, id []byte, data any) error {
 	event := s.log.Debug()
-	if !event.Enabled() {
+	if !event.Enabled() && s.queryObserver == nil {
 		return client.Send(adnl.MessageAnswer{ID: id, Data: s.handleQueryData(ctx, data)})
 	}
 
-	query := liteserverQueryLogName(data)
-	started := time.Now()
-	resp := s.handleQueryData(ctx, data)
+	resp, timing := s.handleQueryDataWithTiming(ctx, data)
+	if s.queryObserver != nil {
+		s.queryObserver.ObserveLiteserverQuery(timing.queryName(), timing.totalDuration())
+	}
 	err := client.Send(adnl.MessageAnswer{ID: id, Data: resp})
+	if !event.Enabled() {
+		return err
+	}
 
 	event = event.
-		Str("query", query).
+		Str("query", timing.queryName()).
 		Str("response", liteserverTypeName(resp)).
-		Dur("duration", time.Since(started)).
+		Dur("duration", timing.duration).
 		Str("remote_ip", client.IP()).
 		Uint16("remote_port", client.Port()).
 		Err(err)
+	if timing.sequence != "" && timing.sequence != timing.query {
+		event = event.Str("sequence", timing.sequence)
+	}
+	if timing.waitDuration > 0 {
+		event = event.Dur("wait_duration", timing.waitDuration)
+	}
 	if lsErr, ok := resp.(ton.LSError); ok {
 		event = event.Int32("error_code", lsErr.Code)
 	}

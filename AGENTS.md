@@ -69,6 +69,8 @@
 - Logic must be explicit, no fallbacks if it is not directly asked
 - Tri-state is bad, use ErrNotFound if needed
 
+- Beware of fallbacks, each fallback must have a strong reason why it is necessary and commented.
+
 ## Protocol types
 
 - Any type used in `tl.Register(...)` must be public and named with a capital letter.

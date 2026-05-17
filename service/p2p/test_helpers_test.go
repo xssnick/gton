@@ -4,8 +4,8 @@ import (
 	"os"
 	"testing"
 
-	"flexserver/internal/logutil"
-	"flexserver/service/storage/pebblestore"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
@@ -26,6 +26,7 @@ func newTestNode(tb testing.TB) *Node {
 	node, err := New(Options{
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      tb.TempDir(),
 	})
 	if err != nil {
 		tb.Fatalf("create test node: %v", err)

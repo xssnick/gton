@@ -3,6 +3,7 @@ package logutil
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -85,5 +86,50 @@ func TestFormatLevelOverridesIsStable(t *testing.T) {
 	want := "liteserver=debug,p2p=warn"
 	if got != want {
 		t.Fatalf("formatted overrides = %q, want %q", got, want)
+	}
+}
+
+func TestFormatByteRate(t *testing.T) {
+	tests := []struct {
+		name    string
+		bytes   int64
+		elapsed time.Duration
+		want    string
+	}{
+		{name: "zero bytes", bytes: 0, elapsed: time.Second, want: "0 B/s"},
+		{name: "bytes", bytes: 512, elapsed: time.Second, want: "512 B/s"},
+		{name: "kibibytes", bytes: 1536, elapsed: time.Second, want: "1.50 KB/s"},
+		{name: "mebibytes", bytes: 5 << 20, elapsed: 2 * time.Second, want: "2.50 MB/s"},
+		{name: "gibibytes", bytes: 3 << 30, elapsed: time.Second, want: "3.00 GB/s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FormatByteRate(tt.bytes, tt.elapsed); got != tt.want {
+				t.Fatalf("FormatByteRate() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatCellRate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cells   uint64
+		elapsed time.Duration
+		want    string
+	}{
+		{name: "zero cells", cells: 0, elapsed: time.Second, want: "0 cells/s"},
+		{name: "cells", cells: 512, elapsed: time.Second, want: "512 cells/s"},
+		{name: "kilocells", cells: 1536, elapsed: time.Second, want: "1.54 Kcells/s"},
+		{name: "megacells", cells: 5_000_000, elapsed: 2 * time.Second, want: "2.50 Mcells/s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FormatCellRate(tt.cells, tt.elapsed); got != tt.want {
+				t.Fatalf("FormatCellRate() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

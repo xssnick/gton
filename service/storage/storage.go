@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/bits"
 	"sort"
-	"time"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -57,17 +56,20 @@ const (
 	BlockMetaIsKeyBlock
 )
 
+const masterchainShard = int64(-1 << 63)
+
 type BlockMeta struct {
-	ID             ton.BlockIDExt
-	Flags          BlockMetaFlags
-	GenUTime       uint32
-	StartLT        uint64
-	EndLT          uint64
-	StateRootHash  []byte
-	StateFileHash  []byte
+	ID            ton.BlockIDExt
+	Flags         BlockMetaFlags
+	GenUTime      uint32
+	StartLT       uint64
+	EndLT         uint64
+	StateRootHash []byte
+	StateFileHash []byte
+	// MasterchainRef matches C++ BlockHandle::masterchain_ref_block:
+	// the masterchain block that first included this shard block.
 	MasterchainRef *ton.BlockIDExt
 	PrevRefs       []ton.BlockIDExt
-	UpdatedAt      time.Time
 }
 
 func (m *BlockMeta) Clone() *BlockMeta {
@@ -83,7 +85,6 @@ func (m *BlockMeta) Clone() *BlockMeta {
 		EndLT:         m.EndLT,
 		StateRootHash: bytes.Clone(m.StateRootHash),
 		StateFileHash: bytes.Clone(m.StateFileHash),
-		UpdatedAt:     m.UpdatedAt,
 	}
 	if m.MasterchainRef != nil {
 		ref := *m.MasterchainRef
@@ -219,16 +220,13 @@ func MergeBlockMeta(base *BlockMeta, next *BlockMeta) *BlockMeta {
 	if len(next.StateFileHash) > 0 {
 		merged.StateFileHash = bytes.Clone(next.StateFileHash)
 	}
-	if next.MasterchainRef != nil {
+	if merged.MasterchainRef == nil && next.MasterchainRef != nil {
 		ref := *next.MasterchainRef
 		merged.MasterchainRef = &ref
 	}
 	if len(next.PrevRefs) > 0 {
 		merged.PrevRefs = make([]ton.BlockIDExt, len(next.PrevRefs))
 		copy(merged.PrevRefs, next.PrevRefs)
-	}
-	if !next.UpdatedAt.IsZero() {
-		merged.UpdatedAt = next.UpdatedAt
 	}
 	return merged
 }
@@ -281,8 +279,13 @@ func ParseVerifiedBlockCell(id ton.BlockIDExt, root *cell.Cell) (*tlb.Block, err
 		return nil, fmt.Errorf("block root is nil for %s", FormatBlockRef(id))
 	}
 
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse block %s: %w", FormatBlockRef(id), err)
+	}
+
 	var block tlb.Block
-	if err := tlb.LoadFromCell(&block, root.BeginParse()); err != nil {
+	if err := tlb.LoadFromCell(&block, loader); err != nil {
 		return nil, fmt.Errorf("load tlb block %s: %w", FormatBlockRef(id), err)
 	}
 	if err := VerifyBlockIdentity(id, &block); err != nil {
@@ -312,32 +315,33 @@ func VerifyBlockIdentity(id ton.BlockIDExt, block *tlb.Block) error {
 
 func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockMeta, error) {
 	meta := &BlockMeta{
-		ID:        id,
-		Flags:     BlockMetaHasBlockData,
-		GenUTime:  block.BlockInfo.GenUtime,
-		StartLT:   block.BlockInfo.StartLt,
-		EndLT:     block.BlockInfo.EndLt,
-		UpdatedAt: time.Now(),
+		ID:       id,
+		Flags:    BlockMetaHasBlockData,
+		GenUTime: block.BlockInfo.GenUtime,
+		StartLT:  block.BlockInfo.StartLt,
+		EndLT:    block.BlockInfo.EndLt,
 	}
 	if block.BlockInfo.KeyBlock {
 		meta.Mark(BlockMetaIsKeyBlock)
 	}
 	if block.StateUpdate != nil {
-		nextState, err := block.StateUpdate.PeekRef(1)
+		stateUpdate, err := block.StateUpdate.BeginParse()
+		if err != nil {
+			return nil, fmt.Errorf("load block state update: %w", err)
+		}
+		nextState, err := stateUpdate.PeekRefCellAt(1)
 		if err != nil {
 			return nil, fmt.Errorf("load block state update target: %w", err)
 		}
 		nextStateHash := nextState.HashKey(0)
 		meta.StateRootHash = nextStateHash[:]
 	}
-	if block.BlockInfo.MasterRef != nil {
-		meta.MasterchainRef = &ton.BlockIDExt{
-			Workchain: -1,
-			Shard:     topShard,
-			SeqNo:     block.BlockInfo.MasterRef.SeqNo,
-			RootHash:  bytes.Clone(block.BlockInfo.MasterRef.RootHash),
-			FileHash:  bytes.Clone(block.BlockInfo.MasterRef.FileHash),
+	if block.BlockInfo.NotMaster {
+		if block.BlockInfo.MasterRef == nil {
+			return nil, fmt.Errorf("shard block %s has no masterchain ref", FormatBlockRef(id))
 		}
+		ref := blockRefToBlockIDExt(-1, masterchainShard, *block.BlockInfo.MasterRef)
+		meta.MasterchainRef = &ref
 	}
 
 	prev := make([]ton.BlockIDExt, 0, 2)
@@ -366,10 +370,13 @@ func BuildBlockMetaFromState(state BlockState) *BlockMeta {
 		Flags:         BlockMetaHasStateSnapshot,
 		StateRootHash: bytes.Clone(state.StateRootHash),
 		StateFileHash: bytes.Clone(state.StateFileHash),
-		UpdatedAt:     time.Now(),
 	}
 	if state.Parsed != nil {
 		meta.GenUTime = state.Parsed.GenUTime
+	}
+	if state.MasterchainRef != nil {
+		ref := *state.MasterchainRef
+		meta.MasterchainRef = &ref
 	}
 	return meta
 }
@@ -387,6 +394,13 @@ func blockRefToBlockIDExt(workchain int32, shard int64, ref tlb.ExtBlkRef) ton.B
 func CellRecordFromCell(cl *cell.Cell) (*CellRecord, error) {
 	if cl == nil {
 		return nil, fmt.Errorf("cell is nil")
+	}
+	if cl.IsLazy() {
+		loader, err := cl.BeginParse()
+		if err != nil {
+			return nil, err
+		}
+		cl = loader.BaseCell()
 	}
 
 	cellBits := cl.BitsSize()
@@ -420,6 +434,14 @@ func CellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (*CellRecord,
 	if cl == nil {
 		return nil, fmt.Errorf("cell is nil")
 	}
+	if cl.IsLazy() {
+		loader, err := cl.BeginParse()
+		if err != nil {
+			return nil, err
+		}
+		cl = loader.BaseCell()
+		meta = cl.GetMetadata()
+	}
 
 	cellBits := cl.BitsSize()
 	if cellBits > 1023 {
@@ -429,7 +451,7 @@ func CellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (*CellRecord,
 		return nil, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
 	}
 
-	d1, d2 := cellRecordDescriptors(cl, len(meta.Refs), cellBits)
+	d1, d2 := cellRecordDescriptorsForLevelMask(cl, meta.LevelMask, len(meta.Refs), cellBits)
 	data := cellRecordBody(cl, cellBits, int((cellBits+7)/8))
 
 	refs := make([]CellRefRecord, len(meta.Refs))
@@ -450,17 +472,17 @@ func CellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (*CellRecord,
 	}, nil
 }
 
-func EncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (cell.Hash, []byte, error) {
-	record, err := PrepareEncodedCellRecordFromCellMetadata(cl, meta)
-	if err != nil {
-		return cell.Hash{}, nil, err
-	}
-	return record.Hash, record.Data, nil
-}
-
 func PrepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (EncodedCellRecord, error) {
 	if cl == nil {
 		return EncodedCellRecord{}, fmt.Errorf("cell is nil")
+	}
+	if cl.IsLazy() {
+		loader, err := cl.BeginParse()
+		if err != nil {
+			return EncodedCellRecord{}, err
+		}
+		cl = loader.BaseCell()
+		meta = cl.GetMetadata()
 	}
 
 	cellBits := cl.BitsSize()
@@ -471,7 +493,7 @@ func PrepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata)
 		return EncodedCellRecord{}, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
 	}
 
-	d1, d2 := cellRecordDescriptors(cl, len(meta.Refs), cellBits)
+	d1, d2 := cellRecordDescriptorsForLevelMask(cl, meta.LevelMask, len(meta.Refs), cellBits)
 	size, err := encodedCellRecordLenFromMetadata(d2, meta.Refs)
 	if err != nil {
 		return EncodedCellRecord{}, err
@@ -491,7 +513,146 @@ func PrepareStateUpdateCells(update *cell.Cell) (map[cell.Hash][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return PrepareReachableStateCells(updateTo.Virtualize(0))
+	return prepareReachableStateUpdateCells(updateTo)
+}
+
+func ValidateStateUpdateCells(update *cell.Cell, records map[cell.Hash][]byte) error {
+	if records == nil {
+		return fmt.Errorf("prepared state update cells are missing")
+	}
+
+	expected, err := PrepareStateUpdateCells(update)
+	if err != nil {
+		return err
+	}
+	if len(records) != len(expected) {
+		return fmt.Errorf("prepared state update cells count mismatch: got=%d want=%d", len(records), len(expected))
+	}
+
+	for hash, want := range expected {
+		got := records[hash]
+		if len(got) == 0 {
+			return fmt.Errorf("prepared state update cells are missing %x", hash[:])
+		}
+		if !bytes.Equal(got, want) {
+			return fmt.Errorf("prepared state update cell %x payload mismatch", hash[:])
+		}
+	}
+	for hash := range records {
+		if _, ok := expected[hash]; !ok {
+			return fmt.Errorf("prepared state update cells contain unexpected %x", hash[:])
+		}
+	}
+	return nil
+}
+
+func prepareReachableStateUpdateCells(root *cell.Cell) (map[cell.Hash][]byte, error) {
+	if root == nil {
+		return nil, nil
+	}
+
+	records := map[cell.Hash][]byte{}
+	err := walkReachableStateUpdateCells(root.Virtualize(0), func(current *cell.Cell, meta cell.Metadata) error {
+		record, err := prepareReachableStateUpdateCellRecord(current, meta)
+		if err != nil {
+			return fmt.Errorf("build reachable state update cell record %x: %w", meta.Hash[:], err)
+		}
+		if record.Hash != meta.Hash {
+			return fmt.Errorf("reachable state update cell hash mismatch: got=%x want=%x", record.Hash[:], meta.Hash[:])
+		}
+		records[meta.Hash] = record.Data
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func prepareReachableStateUpdateCellRecord(cl *cell.Cell, meta cell.Metadata) (EncodedCellRecord, error) {
+	if cl.GetType() != cell.PrunedCellType {
+		return PrepareEncodedCellRecordFromCellMetadata(cl, meta)
+	}
+
+	pruned, err := materializePrunedStateCell(cl)
+	if err != nil {
+		return EncodedCellRecord{}, err
+	}
+	return PrepareEncodedCellRecordFromCellMetadata(pruned, meta)
+}
+
+func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {
+	if cl == nil || cl.GetType() != cell.PrunedCellType || !cl.IsVirtualized() {
+		return cl, nil
+	}
+
+	loader, err := cl.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+	bits, data, err := loader.RestBits()
+	if err != nil {
+		return nil, err
+	}
+
+	builder := cell.BeginCell()
+	if err = builder.StoreSlice(data, bits); err != nil {
+		return nil, err
+	}
+	raw, err := builder.EndCellSpecial(true)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func walkReachableStateUpdateCells(root *cell.Cell, visit func(*cell.Cell, cell.Metadata) error) error {
+	stack := []*cell.Cell{root}
+	seen := map[cell.Hash]struct{}{}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if current == nil {
+			continue
+		}
+		if current.IsLazy() {
+			loader, err := current.BeginParse()
+			if err != nil {
+				return fmt.Errorf("load reachable state update cell %x: %w", current.Hash(), err)
+			}
+			current = loader.BaseCell()
+		}
+
+		if current.GetType() == cell.PrunedCellType && current.ActualLevel() == current.EffectiveLevel()+1 {
+			continue
+		}
+
+		meta := current.GetMetadata()
+		hash := meta.Hash
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+
+		if err := visit(current, meta); err != nil {
+			return err
+		}
+		if current.GetType() == cell.PrunedCellType {
+			continue
+		}
+
+		for i, ref := range meta.Refs {
+			if ref.Lazy {
+				return fmt.Errorf("reachable state update ref %d from %x is lazy", i, hash[:])
+			}
+			refCell, err := current.PeekRef(i)
+			if err != nil {
+				return fmt.Errorf("load reachable state update ref %d from %x: %w", i, hash[:], err)
+			}
+			stack = append(stack, refCell)
+		}
+	}
+	return nil
 }
 
 func PrepareReachableStateCells(root *cell.Cell) (map[cell.Hash][]byte, error) {
@@ -523,11 +684,17 @@ func WalkReachableStateCells(root *cell.Cell, visit func(*cell.Cell, cell.Metada
 	for len(stack) > 0 {
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if current == nil || current.IsLazy() || current.GetType() == cell.PrunedCellType {
+		if current == nil {
+			continue
+		}
+		if current.IsLazy() {
 			continue
 		}
 
-		meta := current.GetMetadata()
+		meta, refCells, err := reachableStateCellMetadata(current)
+		if err != nil {
+			return err
+		}
 		hash := meta.Hash
 		if _, ok := seen[hash]; ok {
 			continue
@@ -542,12 +709,9 @@ func WalkReachableStateCells(root *cell.Cell, visit func(*cell.Cell, cell.Metada
 			if ref.Lazy {
 				continue
 			}
-			refCell, err := current.PeekRef(i)
-			if err != nil {
-				return fmt.Errorf("load reachable state ref %d from %x: %w", i, hash[:], err)
-			}
-			if refCell.GetType() == cell.PrunedCellType {
-				continue
+			refCell := refCells[i]
+			if refCell == nil || refCell.IsLazy() {
+				return fmt.Errorf("reachable state ref %d from %x has no body", i, hash[:])
 			}
 			stack = append(stack, refCell)
 		}
@@ -555,21 +719,58 @@ func WalkReachableStateCells(root *cell.Cell, visit func(*cell.Cell, cell.Metada
 	return nil
 }
 
+func reachableStateCellMetadata(cl *cell.Cell) (cell.Metadata, [4]*cell.Cell, error) {
+	meta := cl.GetMetadata()
+	if len(meta.Refs) > 4 {
+		return cell.Metadata{}, [4]*cell.Cell{}, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
+	}
+
+	refs := make([]cell.RefMetadata, len(meta.Refs))
+	var refCells [4]*cell.Cell
+	for i, metaRef := range meta.Refs {
+		if metaRef.Lazy {
+			refs[i] = metaRef
+			continue
+		}
+
+		refCell, err := cl.PeekRef(i)
+		if err != nil {
+			return cell.Metadata{}, [4]*cell.Cell{}, fmt.Errorf("load reachable state ref %d from %x: %w", i, meta.Hash[:], err)
+		}
+		refMeta := refCell.GetMetadata()
+		refs[i] = cell.RefMetadata{
+			Hash:      refMeta.Hash,
+			LevelMask: refMeta.LevelMask,
+			Hashes:    refMeta.Hashes,
+			Depths:    refMeta.Depths,
+			Lazy:      refCell.IsLazy(),
+		}
+		refCells[i] = refCell
+	}
+	meta.Refs = refs
+	return meta, refCells, nil
+}
+
 func merkleUpdateTarget(update *cell.Cell) (*cell.Cell, error) {
 	if update == nil {
 		return nil, fmt.Errorf("merkle update cell is nil")
 	}
+	loader, err := update.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("load merkle update cell: %w", err)
+	}
+	update = loader.BaseCell()
 	if update.Level() != 0 {
 		return nil, fmt.Errorf("merkle update has non-zero level")
 	}
 	if update.GetType() != cell.MerkleUpdateCellType {
 		return nil, fmt.Errorf("not a MerkleUpdate cell")
 	}
-	if update.RefsNum() != 2 {
+	if loader.RefsNum() != 2 {
 		return nil, fmt.Errorf("wrong references count for a merkle update special cell")
 	}
 
-	updateTo, err := update.PeekRef(1)
+	updateTo, err := loader.PeekRefCellAt(1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load merkle update second ref: %w", err)
 	}
@@ -634,11 +835,15 @@ func DecodeCellRecordTrusted(hash []byte, data []byte) *CellRecord {
 }
 
 func cellRecordDescriptors(cl *cell.Cell, refsCount int, bitLen uint) (byte, byte) {
+	return cellRecordDescriptorsForLevelMask(cl, cl.LevelMask(), refsCount, bitLen)
+}
+
+func cellRecordDescriptorsForLevelMask(cl *cell.Cell, levelMask cell.LevelMask, refsCount int, bitLen uint) (byte, byte) {
 	refs := byte(refsCount)
 	if cl.IsSpecial() {
 		refs += 8
 	}
-	d1 := refs + cl.LevelMask().Mask*32
+	d1 := refs + levelMask.Mask*32
 
 	d2 := byte((bitLen / 8) * 2)
 	if bitLen%8 != 0 {
@@ -651,7 +856,7 @@ func cellRecordBody(cl *cell.Cell, cellBits uint, bodyLen int) []byte {
 	if bodyLen == 0 {
 		return nil
 	}
-	data := cl.BeginParse().MustLoadSlice(cellBits)
+	data := cl.MustBeginParse().MustLoadSlice(cellBits)
 	body := make([]byte, bodyLen)
 	copy(body, data)
 	if tailBits := cellBits % 8; tailBits != 0 {
@@ -839,288 +1044,4 @@ func cellRecordBits(record *CellRecord) (uint, error) {
 		return 0, fmt.Errorf("overlong cell bits encoding")
 	}
 	return uint((bodyLen-1)*8 + 7 - terminatorBit), nil
-}
-
-func RebuildCellRecord(record *CellRecord, loadRef func(hash []byte) (*cell.Cell, error)) (*cell.Cell, error) {
-	if record == nil {
-		return nil, fmt.Errorf("cell record is nil")
-	}
-
-	builder := cell.BeginCell()
-	cellBits, err := cellRecordBits(record)
-	if err != nil {
-		return nil, formatCellRebuildError(record, err)
-	}
-	if err := builder.StoreSlice(record.Data, cellBits); err != nil {
-		return nil, err
-	}
-	for _, refRecord := range record.Refs {
-		refHash, err := CellRefHash(refRecord)
-		if err != nil {
-			return nil, formatCellRebuildError(record, err)
-		}
-		ref, err := loadRef(refHash)
-		if err != nil {
-			return nil, err
-		}
-		if err = builder.StoreRef(ref); err != nil {
-			return nil, err
-		}
-	}
-
-	rebuilt, err := builder.EndCellSpecial(record.D1&8 != 0)
-	if err != nil {
-		return nil, formatCellRebuildError(record, err)
-	}
-	gotHash := rebuilt.HashKey()
-	if !bytes.Equal(gotHash[:], record.Hash) {
-		return nil, fmt.Errorf("rebuilt cell hash mismatch: got=%x want=%x", gotHash[:], record.Hash)
-	}
-	return rebuilt, nil
-}
-
-func formatCellRebuildError(record *CellRecord, err error) error {
-	cellBits, _ := cellRecordBits(record)
-	return fmt.Errorf(
-		"rebuild cell %x special=%v bits=%d refs=%d prefix=%x: %w",
-		record.Hash,
-		record.D1&8 != 0,
-		cellBits,
-		len(record.Refs),
-		recordDataPrefix(record.Data, 16),
-		err,
-	)
-}
-
-func recordDataPrefix(data []byte, max int) []byte {
-	if len(data) <= max {
-		return data
-	}
-	return data[:max]
-}
-
-type cellLoadFrame struct {
-	hash      cell.Hash
-	record    *CellRecord
-	refs      [4]cell.Hash
-	refsCount int
-	refsReady bool
-}
-
-type cellGraphCache struct {
-	index map[cell.Hash]uint32
-	cells []*cell.Cell
-}
-
-func newCellGraphCache() cellGraphCache {
-	return cellGraphCache{index: map[cell.Hash]uint32{}}
-}
-
-func (c *cellGraphCache) get(hash cell.Hash) *cell.Cell {
-	idx, ok := c.index[hash]
-	if !ok {
-		return nil
-	}
-	return c.cells[idx]
-}
-
-func (c *cellGraphCache) set(hash cell.Hash, cl *cell.Cell) {
-	c.index[hash] = uint32(len(c.cells))
-	c.cells = append(c.cells, cl)
-}
-
-func (c *cellGraphCache) len() int {
-	return len(c.cells)
-}
-
-type LoadCellGraphProgress struct {
-	RecordsLoaded int64
-	CellsBuilt    int64
-	StackDepth    int
-	CacheSize     int
-	Done          bool
-}
-
-func LoadCellGraph(ctx context.Context, hash []byte, loadRecord func(hash []byte) (*CellRecord, error), progress ...func(LoadCellGraphProgress)) (*cell.Cell, error) {
-	rootHash, err := hashBytesToCellHash(hash)
-	if err != nil {
-		return nil, err
-	}
-
-	cache := newCellGraphCache()
-	stack := []cellLoadFrame{{hash: rootHash}}
-	var recordsLoaded int64
-	var cellsBuilt int64
-	var iterations uint64
-
-	reportProgress := func(done bool) {
-		if len(progress) == 0 || progress[0] == nil {
-			return
-		}
-		progress[0](LoadCellGraphProgress{
-			RecordsLoaded: recordsLoaded,
-			CellsBuilt:    cellsBuilt,
-			StackDepth:    len(stack),
-			CacheSize:     cache.len(),
-			Done:          done,
-		})
-	}
-
-	for len(stack) > 0 {
-		if iterations&0x3fff == 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			default:
-			}
-		}
-		iterations++
-
-		top := &stack[len(stack)-1]
-		if cache.get(top.hash) != nil {
-			stack = stack[:len(stack)-1]
-			continue
-		}
-
-		if top.record == nil {
-			record, err := loadRecord(top.hash[:])
-			if err != nil {
-				return nil, err
-			}
-			top.record = record
-			recordsLoaded++
-			if recordsLoaded&0x1ffff == 0 {
-				reportProgress(false)
-			}
-		}
-
-		if !top.refsReady {
-			if len(top.record.Refs) > len(top.refs) {
-				return nil, fmt.Errorf("invalid cell refs count %d", len(top.record.Refs))
-			}
-			for i := range top.record.Refs {
-				refHashBytes, err := CellRefHash(top.record.Refs[i])
-				if err != nil {
-					return nil, err
-				}
-				refHash, err := hashBytesToCellHash(refHashBytes)
-				if err != nil {
-					return nil, err
-				}
-				top.refs[i] = refHash
-			}
-			top.refsCount = len(top.record.Refs)
-			top.refsReady = true
-		}
-
-		var pushed bool
-		for i := top.refsCount - 1; i >= 0; i-- {
-			refHash := top.refs[i]
-			if cache.get(refHash) != nil {
-				continue
-			}
-			if refHash == top.hash {
-				return nil, fmt.Errorf("recursive cell reference %x", refHash[:])
-			}
-
-			stack = append(stack, cellLoadFrame{hash: refHash})
-			pushed = true
-			break
-		}
-		if pushed {
-			continue
-		}
-
-		builder := cell.BeginCell()
-		cellBits, err := cellRecordBits(top.record)
-		if err != nil {
-			return nil, formatCellRebuildError(top.record, err)
-		}
-		if err := builder.StoreSlice(top.record.Data, cellBits); err != nil {
-			return nil, err
-		}
-		for i := 0; i < top.refsCount; i++ {
-			refHash := top.refs[i]
-			ref := cache.get(refHash)
-			if ref == nil {
-				return nil, fmt.Errorf("missing child cell %x", refHash[:])
-			}
-			if err := builder.StoreRef(ref); err != nil {
-				return nil, err
-			}
-		}
-
-		rebuilt, err := builder.EndCellSpecial(top.record.D1&8 != 0)
-		if err != nil {
-			return nil, formatCellRebuildError(top.record, err)
-		}
-		gotHash := rebuilt.HashKey()
-		if gotHash != top.hash {
-			return nil, fmt.Errorf("rebuilt cell hash mismatch: got=%x want=%x", gotHash[:], top.hash[:])
-		}
-
-		cache.set(top.hash, rebuilt)
-		cellsBuilt++
-		if cellsBuilt&0x1ffff == 0 {
-			reportProgress(false)
-		}
-		stack = stack[:len(stack)-1]
-	}
-
-	root := cache.get(rootHash)
-	if root == nil {
-		return nil, fmt.Errorf("missing root cell %x", hash)
-	}
-	reportProgress(true)
-	return root, nil
-}
-
-func hashBytesToCellHash(hash []byte) (cell.Hash, error) {
-	var key cell.Hash
-	if len(hash) != len(key) {
-		return key, fmt.Errorf("cell hash size mismatch: %d", len(hash))
-	}
-	copy(key[:], hash)
-	return key, nil
-}
-
-func CollectCellRecords(root *cell.Cell) ([]*CellRecord, error) {
-	if root == nil {
-		return nil, nil
-	}
-
-	seen := map[cell.Hash]struct{}{}
-	records := make([]*CellRecord, 0, 1024)
-	stack := []*cell.Cell{root}
-
-	for len(stack) > 0 {
-		idx := len(stack) - 1
-		current := stack[idx]
-		stack = stack[:idx]
-
-		hash := current.HashKey()
-		if _, ok := seen[hash]; ok {
-			continue
-		}
-		seen[hash] = struct{}{}
-
-		record, err := CellRecordFromCell(current)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, record)
-
-		for i := uint(0); i < current.RefsNum(); i++ {
-			ref, err := current.PeekRef(int(i))
-			if err != nil {
-				return nil, err
-			}
-			stack = append(stack, ref)
-		}
-	}
-
-	sort.Slice(records, func(i, j int) bool {
-		return bytes.Compare(records[i].Hash, records[j].Hash) < 0
-	})
-	return records, nil
 }

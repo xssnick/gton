@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"flexserver/service/storage"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -16,6 +16,8 @@ import (
 )
 
 var errInvalidLookupBlockWithProof = errors.New("invalid lookupBlockWithProof request")
+
+const maxShardBlockProofLinks = 8
 
 func (s *Server) handleShardBlockProof(ctx context.Context, query ton.GetShardBlockProof) tl.Serializable {
 	if !isFullBlockID(query.ID) {
@@ -30,7 +32,7 @@ func (s *Server) handleShardBlockProof(ctx context.Context, query ton.GetShardBl
 		}
 	}
 
-	master, err := s.masterRefForBlock(ctx, id, nil)
+	master, err := s.masterRefForBlock(ctx, id)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain reference for "+storage.FormatBlockRef(id))
 	}
@@ -61,11 +63,7 @@ func (s *Server) handleLookupBlockWithProof(ctx context.Context, query ton.Looku
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(target))
 	}
 
-	headerSk, err := blockHeaderProofSkeleton(targetRoot, target, 0)
-	if err != nil {
-		return errorResponse(err, "cannot build block header proof")
-	}
-	header, err := blockProofBOC(targetRoot, headerSk)
+	header, err := blockHeaderProofBOC(targetRoot, target, 0)
 	if err != nil {
 		return errorResponse(err, "cannot build block header proof")
 	}
@@ -78,7 +76,7 @@ func (s *Server) handleLookupBlockWithProof(ctx context.Context, query ton.Looku
 	base := target
 	var links []ton.ShardBlockLink
 	if target.Workchain != masterchainID {
-		base, err = s.masterRefForBlock(ctx, target, targetRoot)
+		base, err = s.masterRefForBlock(ctx, target)
 		if err != nil {
 			return errorResponse(err, "cannot load masterchain reference for "+storage.FormatBlockRef(target))
 		}
@@ -153,11 +151,7 @@ func (s *Server) lookupPrevHeaderProof(ctx context.Context, target ton.BlockIDEx
 	if err != nil {
 		return nil, err
 	}
-	sk, err := blockHeaderProofSkeleton(root, prev, 0)
-	if err != nil {
-		return nil, err
-	}
-	return blockProofBOC(root, sk)
+	return blockHeaderProofBOC(root, prev, 0)
 }
 
 func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockIDExt, proved ton.BlockIDExt) ([]byte, []byte, error) {
@@ -173,16 +167,9 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 		return nil, nil, err
 	}
 
-	prefix, err := loadMcStateExtraPrefix(stateRoot)
+	mcBlock, err := oldMasterBlockStateProof(stateRoot, proved)
 	if err != nil {
 		return nil, nil, err
-	}
-	infoSk, old, err := oldMasterBlockProofSkeleton(prefix.Info, proved.SeqNo)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !blockIDEqual(old, proved) {
-		return nil, nil, fmt.Errorf("client mc blkid is not in prev_blocks")
 	}
 
 	clientMCState, err := s.blockProof(ctx, client)
@@ -190,46 +177,40 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 		return nil, nil, err
 	}
 
-	stateSk := cell.CreateProofSkeleton()
-	stateSk.ProofRef(3).AttachAt(prefix.infoRefIdx, infoSk)
-	mcBlock, err := stateRoot.CreateProof(stateSk)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	return clientMCState.ToBOCWithFlags(false), mcBlock.ToBOCWithFlags(false), nil
 }
 
-func oldMasterBlockProofSkeleton(info *cell.Cell, seqno uint32) (*cell.ProofSkeleton, ton.BlockIDExt, error) {
-	trace := cell.NewProofTrace()
-	loader := info.BeginParse().SetObserver(trace)
+func oldMasterBlockIDFromState(stateRoot *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
+	prefix, err := loadMcStateExtraPrefix(stateRoot)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return oldMasterBlockIDFromInfo(prefix.Info, seqno)
+}
+
+func oldMasterBlockIDFromInfo(info *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
+	loader, err := info.BeginParse()
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
 	if _, err := loader.LoadUInt(16); err != nil {
-		return nil, ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, err
 	}
 	if _, err := loader.LoadUInt(32); err != nil {
-		return nil, ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, err
 	}
 	if _, err := loader.LoadUInt(32); err != nil {
-		return nil, ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, err
 	}
 	if _, err := loader.LoadBoolBit(); err != nil {
-		return nil, ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, err
 	}
 
 	prevBlocks := &tlb.OldMcBlocksInfoAugDict{}
 	if err := prevBlocks.LoadFromCell(loader); err != nil {
-		return nil, ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, err
 	}
-	old, err := runMethodOldMasterBlockID(prevBlocks, seqno)
-	if err != nil {
-		return nil, ton.BlockIDExt{}, err
-	}
-
-	sk := trace.Skeleton()
-	if prevBlocks.AugmentedDictionary != nil && !prevBlocks.IsEmpty() {
-		sk.ProofRef(0).SetRecursive()
-	}
-	return sk, old, nil
+	return runMethodOldMasterBlockID(prevBlocks, seqno)
 }
 
 func (s *Server) shardBlockProofLinks(ctx context.Context, master ton.BlockIDExt, target ton.BlockIDExt) ([]ton.ShardBlockLink, error) {
@@ -262,8 +243,12 @@ func (s *Server) shardBlockProofLinks(ctx context.Context, master ton.BlockIDExt
 		if blockIDEqual(next, target) {
 			return links, nil
 		}
-		if len(links) == 8 {
+		if len(links) == maxShardBlockProofLinks {
 			return nil, fmt.Errorf("proof chain is too long")
+		}
+
+		if current.Workchain != masterchainID && next.SeqNo >= current.SeqNo {
+			return nil, fmt.Errorf("proof chain does not progress")
 		}
 
 		current = next
@@ -312,22 +297,18 @@ func shardLinkProofBOC(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) {
 	if id.Workchain == masterchainID {
 		mode = 16 | 32
 	}
-	sk, err := blockHeaderProofSkeleton(root, id, mode)
-	if err != nil {
-		return nil, err
-	}
-	return blockProofBOC(root, sk)
+	return blockHeaderProofBOC(root, id, mode)
 }
 
-func blockProofBOC(root *cell.Cell, sk *cell.ProofSkeleton) ([]byte, error) {
-	proof, err := root.CreateProof(sk)
+func blockHeaderProofBOC(root *cell.Cell, id ton.BlockIDExt, mode uint32) ([]byte, error) {
+	proof, err := blockHeaderProof(root, id, mode)
 	if err != nil {
 		return nil, err
 	}
 	return proof.ToBOCWithFlags(false), nil
 }
 
-func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt, root *cell.Cell) (ton.BlockIDExt, error) {
+func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt) (ton.BlockIDExt, error) {
 	if id.Workchain == masterchainID {
 		return id, nil
 	}
@@ -339,22 +320,7 @@ func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt, root 
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return ton.BlockIDExt{}, err
 	}
-
-	if root == nil {
-		root, err = s.loadBlockRoot(ctx, id)
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-	}
-
-	parsed, err := storage.ParseVerifiedBlockCell(id, root)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if parsed.BlockInfo.MasterRef == nil {
-		return ton.BlockIDExt{}, fmt.Errorf("block doesn't have masterchain ref")
-	}
-	return blockIDFromExtRef(masterchainID, masterchainShard, *parsed.BlockInfo.MasterRef), nil
+	return ton.BlockIDExt{}, fmt.Errorf("block doesn't have masterchain ref")
 }
 
 func (s *Server) previousBlockForPrefix(ctx context.Context, id ton.BlockIDExt, root *cell.Cell, prefix storage.ShardKey) (ton.BlockIDExt, error) {
