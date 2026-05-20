@@ -3,11 +3,11 @@ package p2p
 import (
 	"context"
 	"errors"
-	"github.com/xssnick/gton/service/archive"
-	tnstore "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
+	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -473,27 +473,19 @@ func (s *overlaySubscription) serveNextKeyBlockIDs(ctx context.Context, block to
 		return KeyBlocks{Incomplete: true}, nil
 	}
 
-	key := tnstore.BlockHistoryKey{Workchain: -1, Shard: topShard}
 	blocks := make([]ton.BlockIDExt, 0, limit)
-	for seqno := block.SeqNo + 1; seqno <= latestSeqno && len(blocks) < limit; seqno++ {
-		next, err := s.node.storage.LookupBlockBySeqNo(ctx, key, seqno)
-		if errors.Is(err, tnstore.ErrNotFound) {
-			continue
+	next, err := s.node.storage.NextKeyBlocks(ctx, block.SeqNo, limit)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return KeyBlocks{Incomplete: true}, nil
+	}
+	if err != nil {
+		return KeyBlocks{Error: true}, nil
+	}
+	for _, nextBlock := range next {
+		if nextBlock.SeqNo > latestSeqno {
+			break
 		}
-		if err != nil {
-			return KeyBlocks{Error: true}, nil
-		}
-
-		meta, err := s.node.storage.BlockMeta(ctx, next)
-		if errors.Is(err, tnstore.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return KeyBlocks{Error: true}, nil
-		}
-		if meta.Has(tnstore.BlockMetaIsKeyBlock) {
-			blocks = append(blocks, next)
-		}
+		blocks = append(blocks, nextBlock)
 	}
 
 	return KeyBlocks{

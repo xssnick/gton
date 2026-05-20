@@ -2,53 +2,92 @@ package state
 
 import (
 	"errors"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"math/big"
 
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func PersistentStateSplitDepth(master *storage.BlockState, workchain int32) (uint32, error) {
-	if workchain == -1 || master == nil || master.Parsed == nil || master.Parsed.McStateExtra == nil {
-		return 0, nil
+	depths, err := persistentStateSplitDepths(master, []int32{workchain})
+	if err != nil {
+		return 0, err
+	}
+	return depths[workchain], nil
+}
+
+func PersistentStateSplitDepths(master *storage.BlockState, blocks []ton.BlockIDExt) (map[int32]uint32, error) {
+	workchains := make([]int32, 0, len(blocks))
+	for _, block := range blocks {
+		workchains = append(workchains, block.Workchain)
+	}
+	return persistentStateSplitDepths(master, workchains)
+}
+
+func persistentStateSplitDepths(master *storage.BlockState, workchains []int32) (map[int32]uint32, error) {
+	depths := make(map[int32]uint32, len(workchains))
+	needed := make(map[int32]struct{}, len(workchains))
+	for _, workchain := range workchains {
+		if workchain == -1 {
+			depths[workchain] = 0
+			continue
+		}
+		needed[workchain] = struct{}{}
+	}
+	if len(needed) == 0 {
+		return depths, nil
+	}
+
+	if master == nil || master.Parsed == nil || master.Parsed.McStateExtra == nil {
+		return depths, nil
 	}
 
 	loader, err := master.Parsed.McStateExtra.BeginParse()
 	if err != nil {
-		return 0, fmt.Errorf("begin parse masterchain extra: %w", err)
+		return nil, fmt.Errorf("begin parse masterchain extra: %w", err)
 	}
 
 	var extra tlb.McStateExtra
 	if err := tlb.LoadFromCell(&extra, loader); err != nil {
-		return 0, fmt.Errorf("parse masterchain extra: %w", err)
+		return nil, fmt.Errorf("parse masterchain extra: %w", err)
 	}
 	if extra.ConfigParams.Config.Params == nil {
-		return 0, nil
+		return depths, nil
 	}
 
 	config := tlb.BlockchainConfig{Root: extra.ConfigParams.Config.Params.AsCell()}
-	workchains, err := config.GetWorkchains()
+	workchainConfig, err := config.GetWorkchains()
 	if err != nil {
 		if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
-			return 0, nil
+			return depths, nil
 		}
-		return 0, err
+		return nil, err
 	}
-	if workchains.Workchains == nil {
-		return 0, nil
+	if workchainConfig.Workchains == nil {
+		return depths, nil
 	}
 
-	value, err := workchains.Workchains.LoadValueByIntKey(big.NewInt(int64(workchain)))
-	if err != nil {
-		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-			return 0, nil
+	for workchain := range needed {
+		value, err := workchainConfig.Workchains.LoadValueByIntKey(big.NewInt(int64(workchain)))
+		if err != nil {
+			if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				depths[workchain] = 0
+				continue
+			}
+			return nil, err
 		}
-		return 0, err
-	}
 
-	return loadWorkchainPersistentStateSplitDepth(value)
+		depth, err := loadWorkchainPersistentStateSplitDepth(value)
+		if err != nil {
+			return nil, err
+		}
+		depths[workchain] = depth
+	}
+	return depths, nil
 }
 
 func loadWorkchainPersistentStateSplitDepth(loader *cell.Slice) (uint32, error) {

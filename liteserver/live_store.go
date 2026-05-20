@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -40,6 +41,8 @@ type LiveStore struct {
 	metas            map[string]*storage.BlockMeta
 	states           map[liveBlockLookupKey]storage.BlockState
 	seqIndex         map[liveSeqKey]ton.BlockIDExt
+	ltIndex          map[liveHistoryKey][]liveLTIndexEntry
+	unixIndex        map[liveHistoryKey][]liveUnixIndexEntry
 	flushed          map[string]struct{}
 	masterOrder      []string
 	shardOrder       []string
@@ -71,6 +74,8 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 		metas:           map[string]*storage.BlockMeta{},
 		states:          map[liveBlockLookupKey]storage.BlockState{},
 		seqIndex:        map[liveSeqKey]ton.BlockIDExt{},
+		ltIndex:         map[liveHistoryKey][]liveLTIndexEntry{},
+		unixIndex:       map[liveHistoryKey][]liveUnixIndexEntry{},
 		flushed:         map[string]struct{}{},
 		masterCacheSize: cfg.MasterBlockCache,
 		shardCacheSize:  cfg.ShardBlockCache,
@@ -85,7 +90,6 @@ func (s *LiveStore) SetLiveCurrentState(current *storage.CurrentState) {
 	s.pendingCurrent = next
 	published := s.publishPendingCurrentLocked()
 	nextSeqno := currentMasterchainSeqno(s.current)
-	s.rebuildIndexesLocked()
 	ready := s.updateReadyMasterSeqnoLocked()
 	if published || ready || nextSeqno > prevSeqno || currentMasterchainSeqno(next) > prevSeqno {
 		close(s.notify)
@@ -153,7 +157,6 @@ func (s *LiveStore) SetLiveBlock(block ton.BlockIDExt, root *cell.Cell, data []b
 	})
 	published := s.publishPendingCurrentLocked()
 	s.trimBlocksLocked(liveBlockKind(block))
-	s.rebuildIndexesLocked()
 	ready := s.updateReadyMasterSeqnoLocked()
 	if published || ready {
 		close(s.notify)
@@ -171,7 +174,6 @@ func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 		cached.flushed = true
 		published := s.publishPendingCurrentLocked()
 		s.trimBlocksLocked(liveBlockKind(block))
-		s.rebuildIndexesLocked()
 		ready := s.updateReadyMasterSeqnoLocked()
 		if published || ready {
 			close(s.notify)
@@ -375,6 +377,7 @@ func (s *LiveStore) publishPendingCurrentLocked() bool {
 
 	s.current = storage.CloneCurrentState(s.pendingCurrent)
 	s.pendingCurrent = nil
+	s.rememberCurrentBlockStatesLocked(s.current)
 	return nextSeqno > prevSeqno
 }
 
@@ -480,24 +483,19 @@ func (s *LiveStore) cachedBlockByLT(key storage.BlockHistoryKey, lt uint64) (ton
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var ge *storage.BlockMeta
-	var floor *storage.BlockMeta
-	for _, meta := range s.metas {
-		if meta.ID.Workchain != key.Workchain || meta.ID.Shard != key.Shard || meta.EndLT == 0 {
-			continue
-		}
-		if meta.EndLT >= lt && (ge == nil || meta.EndLT < ge.EndLT || meta.EndLT == ge.EndLT && meta.ID.SeqNo < ge.ID.SeqNo) {
-			ge = meta
-		}
-		if meta.EndLT <= lt && (floor == nil || meta.EndLT > floor.EndLT || meta.EndLT == floor.EndLT && meta.ID.SeqNo > floor.ID.SeqNo) {
-			floor = meta
-		}
+	entries := s.ltIndex[liveHistoryKey{workchain: key.Workchain, shard: key.Shard}]
+	geIdx := sort.Search(len(entries), func(i int) bool {
+		return entries[i].endLT >= lt
+	})
+	if geIdx < len(entries) && entries[geIdx].startLT <= lt && lt <= entries[geIdx].endLT {
+		return *cloneBlockID(entries[geIdx].block), true
 	}
-	if ge != nil && ge.StartLT <= lt && lt <= ge.EndLT {
-		return *cloneBlockID(ge.ID), true
-	}
-	if floor != nil {
-		return *cloneBlockID(floor.ID), true
+
+	floorIdx := sort.Search(len(entries), func(i int) bool {
+		return entries[i].endLT > lt
+	}) - 1
+	if floorIdx >= 0 {
+		return *cloneBlockID(entries[floorIdx].block), true
 	}
 	return ton.BlockIDExt{}, false
 }
@@ -506,19 +504,14 @@ func (s *LiveStore) cachedBlockByUnixTime(key storage.BlockHistoryKey, utime uin
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var best *storage.BlockMeta
-	for _, meta := range s.metas {
-		if meta.ID.Workchain != key.Workchain || meta.ID.Shard != key.Shard || meta.GenUTime == 0 || meta.GenUTime > utime {
-			continue
-		}
-		if best == nil || meta.GenUTime > best.GenUTime || meta.GenUTime == best.GenUTime && meta.ID.SeqNo > best.ID.SeqNo {
-			best = meta
-		}
-	}
-	if best == nil {
+	entries := s.unixIndex[liveHistoryKey{workchain: key.Workchain, shard: key.Shard}]
+	idx := sort.Search(len(entries), func(i int) bool {
+		return entries[i].genUTime > utime
+	}) - 1
+	if idx < 0 {
 		return ton.BlockIDExt{}, false
 	}
-	return *cloneBlockID(best.ID), true
+	return *cloneBlockID(entries[idx].block), true
 }
 
 func (s *LiveStore) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
@@ -557,6 +550,7 @@ func (s *LiveStore) putBlockLocked(key string, block *liveBlock) {
 	}
 
 	s.blocks[key] = block
+	s.refreshBlockIndexLocked(block.id)
 	if liveBlockKind(block.id) == liveBlockMaster {
 		s.masterOrder = append(s.masterOrder, key)
 		return
@@ -575,53 +569,35 @@ func (s *LiveStore) trimBlocksLocked(kind liveBlockCacheKind) {
 		return
 	}
 
-	for flushedBlocksInOrder(s.blocks, *order) > limit {
-		removed := false
-		for i, key := range *order {
-			cached := s.blocks[key]
-			if cached == nil {
-				*order = append((*order)[:i], (*order)[i+1:]...)
-				removed = true
-				break
-			}
-			if !cached.flushed {
-				continue
-			}
-			if s.currentRefersToBlockLocked(cached.id) {
-				continue
-			}
+	flushed := 0
+	for _, key := range *order {
+		if cached := s.blocks[key]; cached != nil && cached.flushed {
+			flushed++
+		}
+	}
 
+	if flushed <= limit {
+		return
+	}
+
+	remove := flushed - limit
+	next := (*order)[:0]
+	for _, key := range *order {
+		cached := s.blocks[key]
+		if cached == nil {
+			continue
+		}
+
+		if remove > 0 && cached.flushed && !s.currentRefersToBlockLocked(cached.id) {
 			delete(s.blocks, key)
 			s.removeBlockStateLocked(cached.id)
-			*order = append((*order)[:i], (*order)[i+1:]...)
-			removed = true
-			break
+			remove--
+			continue
 		}
-		if !removed {
-			return
-		}
-	}
-}
 
-func (s *LiveStore) rebuildIndexesLocked() {
-	s.metas = map[string]*storage.BlockMeta{}
-	s.seqIndex = map[liveSeqKey]ton.BlockIDExt{}
-
-	for _, block := range s.blocks {
-		s.indexBlockLocked(block.id, block.meta)
+		next = append(next, key)
 	}
-
-	if s.current != nil {
-		s.rememberBlockStateLocked(s.current.Masterchain)
-		for _, shard := range s.current.Shards {
-			s.rememberBlockStateLocked(shard)
-		}
-	}
-
-	for _, state := range s.states {
-		meta := storage.BuildBlockMetaFromState(state)
-		s.indexBlockLocked(state.Block, meta)
-	}
+	*order = next
 }
 
 func (s *LiveStore) rememberBlockStateLocked(state storage.BlockState) {
@@ -630,6 +606,7 @@ func (s *LiveStore) rememberBlockStateLocked(state storage.BlockState) {
 	}
 	if key, ok := liveBlockLookupKeyFromBlock(state.Block); ok {
 		s.states[key] = *storage.CloneBlockState(&state)
+		s.refreshBlockIndexLocked(state.Block)
 	}
 }
 
@@ -638,16 +615,118 @@ func (s *LiveStore) removeBlockStateLocked(block ton.BlockIDExt) {
 	if ok {
 		delete(s.states, key)
 	}
+	s.refreshBlockIndexLocked(block)
 }
 
-func (s *LiveStore) indexBlockLocked(block ton.BlockIDExt, meta *storage.BlockMeta) {
-	s.seqIndex[liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}] = block
+func (s *LiveStore) rememberCurrentBlockStatesLocked(current *storage.CurrentState) {
+	if current == nil {
+		return
+	}
+
+	s.rememberBlockStateLocked(current.Masterchain)
+	for _, shard := range current.Shards {
+		s.rememberBlockStateLocked(shard)
+	}
+}
+
+func (s *LiveStore) refreshBlockIndexLocked(block ton.BlockIDExt) {
+	key := storage.BlockKey(block)
+	if old := s.metas[key]; old != nil {
+		s.removeMetaHistoryIndexLocked(old)
+	}
+	delete(s.metas, key)
+	delete(s.seqIndex, liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo})
+
+	var meta *storage.BlockMeta
+	indexed := false
+	if state, ok := liveBlockLookupKeyFromBlock(block); ok {
+		if cached, ok := s.states[state]; ok {
+			meta = storage.MergeBlockMeta(meta, storage.BuildBlockMetaFromState(cached))
+			indexed = true
+		}
+	}
+	if cached := s.blocks[key]; cached != nil {
+		meta = storage.MergeBlockMeta(meta, cached.meta)
+		indexed = true
+	}
+	if indexed {
+		s.seqIndex[liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}] = block
+	}
 	if meta == nil {
 		return
 	}
 
-	key := storage.BlockKey(block)
-	s.metas[key] = storage.MergeBlockMeta(s.metas[key], meta)
+	s.metas[key] = meta
+	s.addMetaHistoryIndexLocked(meta)
+}
+
+func (s *LiveStore) addMetaHistoryIndexLocked(meta *storage.BlockMeta) {
+	key := liveHistoryKey{workchain: meta.ID.Workchain, shard: meta.ID.Shard}
+	if meta.EndLT != 0 {
+		entry := liveLTIndexEntry{
+			startLT: meta.StartLT,
+			endLT:   meta.EndLT,
+			seqno:   meta.ID.SeqNo,
+			block:   *cloneBlockID(meta.ID),
+		}
+		entries := s.ltIndex[key]
+		idx := sort.Search(len(entries), func(i int) bool {
+			return entries[i].endLT > entry.endLT || entries[i].endLT == entry.endLT && entries[i].seqno >= entry.seqno
+		})
+		entries = append(entries, liveLTIndexEntry{})
+		copy(entries[idx+1:], entries[idx:])
+		entries[idx] = entry
+		s.ltIndex[key] = entries
+	}
+
+	if meta.GenUTime != 0 {
+		entry := liveUnixIndexEntry{
+			genUTime: meta.GenUTime,
+			seqno:    meta.ID.SeqNo,
+			block:    *cloneBlockID(meta.ID),
+		}
+		entries := s.unixIndex[key]
+		idx := sort.Search(len(entries), func(i int) bool {
+			return entries[i].genUTime > entry.genUTime || entries[i].genUTime == entry.genUTime && entries[i].seqno >= entry.seqno
+		})
+		entries = append(entries, liveUnixIndexEntry{})
+		copy(entries[idx+1:], entries[idx:])
+		entries[idx] = entry
+		s.unixIndex[key] = entries
+	}
+}
+
+func (s *LiveStore) removeMetaHistoryIndexLocked(meta *storage.BlockMeta) {
+	key := liveHistoryKey{workchain: meta.ID.Workchain, shard: meta.ID.Shard}
+	if meta.EndLT != 0 {
+		entries := s.ltIndex[key]
+		for i, entry := range entries {
+			if blockIDEqual(entry.block, meta.ID) {
+				entries = append(entries[:i], entries[i+1:]...)
+				if len(entries) == 0 {
+					delete(s.ltIndex, key)
+				} else {
+					s.ltIndex[key] = entries
+				}
+				break
+			}
+		}
+	}
+
+	if meta.GenUTime != 0 {
+		entries := s.unixIndex[key]
+		for i, entry := range entries {
+			if blockIDEqual(entry.block, meta.ID) {
+				entries = append(entries[:i], entries[i+1:]...)
+				if len(entries) == 0 {
+					delete(s.unixIndex, key)
+				} else {
+					s.unixIndex[key] = entries
+				}
+				break
+			}
+		}
+	}
 }
 
 func (s *LiveStore) removeBlockOrderLocked(key string, kind liveBlockCacheKind) {
@@ -675,16 +754,6 @@ func liveBlockKind(block ton.BlockIDExt) liveBlockCacheKind {
 		return liveBlockMaster
 	}
 	return liveBlockShard
-}
-
-func flushedBlocksInOrder(blocks map[string]*liveBlock, order []string) int {
-	count := 0
-	for _, key := range order {
-		if cached := blocks[key]; cached != nil && cached.flushed {
-			count++
-		}
-	}
-	return count
 }
 
 func (s *LiveStore) storedCurrentBlocksReady(ctx context.Context, current *storage.CurrentState) error {
@@ -737,6 +806,24 @@ type liveSeqKey struct {
 	workchain int32
 	shard     int64
 	seqno     uint32
+}
+
+type liveHistoryKey struct {
+	workchain int32
+	shard     int64
+}
+
+type liveLTIndexEntry struct {
+	startLT uint64
+	endLT   uint64
+	seqno   uint32
+	block   ton.BlockIDExt
+}
+
+type liveUnixIndexEntry struct {
+	genUTime uint32
+	seqno    uint32
+	block    ton.BlockIDExt
 }
 
 type liveBlockLookupKey struct {

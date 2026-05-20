@@ -115,6 +115,9 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 	if s.cellGenerationSwitchActive() {
 		return nil, 0, errCellGenerationMigrationRunning
 	}
+	if err := s.waitSyncDiskSpace(ctx, method); err != nil {
+		return nil, 0, err
+	}
 
 	master, err := s.loadBlockStateForApply(ctx, current.Masterchain)
 	if err != nil {

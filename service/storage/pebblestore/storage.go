@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"github.com/xssnick/gton/internal/logutil"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"io"
 	"math"
@@ -21,6 +19,8 @@ import (
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -121,6 +121,8 @@ type Store struct {
 	artifactSyncSeq     uint64
 	pendingArchiveSync  map[string]uint64
 	pendingKeyProofSync map[string]uint64
+	dirtyArchivePacks   map[string]struct{}
+	dirtyKeyProofPacks  map[string]struct{}
 	closed              bool
 }
 
@@ -296,6 +298,8 @@ func Open(opts Options) (*Store, error) {
 		hotDrained:           make(chan struct{}),
 		pendingArchiveSync:   map[string]uint64{},
 		pendingKeyProofSync:  map[string]uint64{},
+		dirtyArchivePacks:    map[string]struct{}{},
+		dirtyKeyProofPacks:   map[string]struct{}{},
 	}
 	if !opts.ReadOnly {
 		stageStarted = time.Now()
@@ -1182,6 +1186,7 @@ var (
 	hotPrefixCellGeneration        = []byte{0x19}
 	hotPrefixArchivePackage        = []byte{0x1A}
 	hotPrefixStateSerializerActive = []byte{0x1B}
+	hotPrefixKeyBlockSeq           = []byte{0x1C}
 )
 
 func hotKeyCellGenerationManifest() []byte {
@@ -1199,6 +1204,10 @@ func hotKeyNextBlock(id ton.BlockIDExt) []byte {
 func hotKeyBlockSeqIndex(key storage.BlockHistoryKey, seqno uint32) []byte {
 	buf := appendHistoryPrefix(hotPrefixBlockSeq, key)
 	return binary.BigEndian.AppendUint32(buf, seqno)
+}
+
+func hotKeyKeyBlockSeqIndex(seqno uint32) []byte {
+	return binary.BigEndian.AppendUint32(bytes.Clone(hotPrefixKeyBlockSeq), seqno)
 }
 
 func hotKeyBlockLTPrefix(key storage.BlockHistoryKey) []byte {

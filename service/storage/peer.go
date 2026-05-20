@@ -85,9 +85,21 @@ type ArchivePruneStats struct {
 	ScannedPackages       int
 	DeletedPackages       int
 	DeletedPackageFiles   int
+	DeletedPackageBytes   uint64
 	DeletedBlockMeta      int
 	DeletedMetadataKeys   int
 	RetainedBoundarySeqno uint32
+}
+
+type PersistentStatePruneStats struct {
+	NowUnix                   uint64
+	ScannedFiles              int
+	DeletedFileRecords        int
+	DeletedDiskFiles          int
+	DeletedDiskBytes          uint64
+	DeletedMasterSeqno        uint32
+	RetainedRecentGroups      int
+	OldestRetainedMasterSeqno uint32
 }
 
 type PersistentStateFile struct {

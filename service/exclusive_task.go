@@ -15,6 +15,7 @@ const (
 )
 
 var (
+	errPersistentStateGCActive         = errors.New("persistent state gc is running")
 	errArchiveTTLGCActive              = errors.New("archive ttl gc is running")
 	errExclusiveServiceTaskHighReadAmp = errors.New("db read amplification is too high")
 	errExclusiveServiceTaskHighLag     = errors.New("sync lag is too high")
@@ -26,6 +27,7 @@ const (
 	exclusiveServiceTaskNone                    exclusiveServiceTask = ""
 	exclusiveServiceTaskStateSerialization      exclusiveServiceTask = "state_serialization"
 	exclusiveServiceTaskCellGenerationMigration exclusiveServiceTask = "cell_generation_migration"
+	exclusiveServiceTaskPersistentStateGC       exclusiveServiceTask = "persistent_state_gc"
 	exclusiveServiceTaskArchiveTTLGC            exclusiveServiceTask = "archive_ttl_gc"
 )
 
@@ -40,40 +42,47 @@ type exclusiveServiceTaskReadAmpStore interface {
 
 func (s *Service) canStartExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask) error {
 	s.exclusiveTaskMu.Lock()
-	err := s.canStartExclusiveServiceTaskLocked(task, nil)
+	err := s.canStartExclusiveServiceTaskLocked(task)
 	s.exclusiveTaskMu.Unlock()
 	if err != nil {
 		return err
 	}
-	return s.canStartExclusiveServiceTaskLimits(ctx)
+	return s.canStartExclusiveServiceTaskLimits(ctx, task)
 }
 
-func (s *Service) beginExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask, handoffFrom ...exclusiveServiceTask) (*exclusiveServiceTaskLease, error) {
+func (s *Service) beginExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask) (*exclusiveServiceTaskLease, error) {
 	s.exclusiveTaskMu.Lock()
-	if err := s.canStartExclusiveServiceTaskLocked(task, handoffFrom); err != nil {
+	if err := s.canStartExclusiveServiceTaskLocked(task); err != nil {
 		s.exclusiveTaskMu.Unlock()
 		return nil, err
 	}
 	s.exclusiveTaskMu.Unlock()
 
-	if err := s.canStartExclusiveServiceTaskLimits(ctx); err != nil {
+	if err := s.canStartExclusiveServiceTaskLimits(ctx, task); err != nil {
 		return nil, err
 	}
 
 	s.exclusiveTaskMu.Lock()
 	defer s.exclusiveTaskMu.Unlock()
-	if err := s.canStartExclusiveServiceTaskLocked(task, handoffFrom); err != nil {
+	if err := s.canStartExclusiveServiceTaskLocked(task); err != nil {
 		return nil, err
 	}
 	s.exclusiveTask = task
 	return &exclusiveServiceTaskLease{service: s, task: task}, nil
 }
 
-func (s *Service) canStartExclusiveServiceTaskLimits(ctx context.Context) error {
+func (s *Service) canStartExclusiveServiceTaskLimits(ctx context.Context, task exclusiveServiceTask) error {
+	if exclusiveServiceTaskIsCleanup(task) {
+		return nil
+	}
 	if err := s.canStartExclusiveServiceTaskReadAmp(ctx); err != nil {
 		return err
 	}
 	return s.canStartExclusiveServiceTaskLag(ctx, time.Now())
+}
+
+func exclusiveServiceTaskIsCleanup(task exclusiveServiceTask) bool {
+	return task == exclusiveServiceTaskPersistentStateGC || task == exclusiveServiceTaskArchiveTTLGC
 }
 
 func (s *Service) canStartExclusiveServiceTaskReadAmp(ctx context.Context) error {
@@ -176,17 +185,12 @@ func exclusiveServiceTaskBlockLag(ctx context.Context, store storage.Storage, st
 	return time.Duration(now.Unix()-int64(meta.GenUTime)) * time.Second, true, nil
 }
 
-func (s *Service) canStartExclusiveServiceTaskLocked(task exclusiveServiceTask, handoffFrom []exclusiveServiceTask) error {
+func (s *Service) canStartExclusiveServiceTaskLocked(task exclusiveServiceTask) error {
 	if task == exclusiveServiceTaskNone {
 		return fmt.Errorf("exclusive service task is empty")
 	}
 	if s.exclusiveTask == exclusiveServiceTaskNone {
 		return nil
-	}
-	for _, allowed := range handoffFrom {
-		if s.exclusiveTask == allowed {
-			return nil
-		}
 	}
 	return exclusiveServiceTaskError(s.exclusiveTask)
 }
@@ -215,6 +219,8 @@ func exclusiveServiceTaskError(task exclusiveServiceTask) error {
 		return errStateSerializationRunning
 	case exclusiveServiceTaskCellGenerationMigration:
 		return errCellGenerationMigrationRunning
+	case exclusiveServiceTaskPersistentStateGC:
+		return errPersistentStateGCActive
 	case exclusiveServiceTaskArchiveTTLGC:
 		return errArchiveTTLGCActive
 	default:

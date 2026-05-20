@@ -92,8 +92,12 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 			EndLT:    uint64(i*100 + 100),
 			GenUTime: uint32(1000 + i),
 		}
-		live.metas[storage.BlockKey(block)] = meta
-		live.seqIndex[liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}] = block
+		live.blocks[storage.BlockKey(block)] = &liveBlock{
+			id:      block,
+			meta:    meta,
+			flushed: true,
+		}
+		live.refreshBlockIndexLocked(block)
 	}
 	return live
 }

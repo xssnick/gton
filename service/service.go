@@ -18,25 +18,28 @@ import (
 )
 
 const (
-	topShard                         = int64(-1 << 63)
-	syncLagChainMasterchain          = "masterchain"
-	syncLagChainShardchain           = "shardchain"
-	shardStateCatchUpParallelism     = 4
-	shardStateDownloadBuffer         = 32
-	shardStateDownloadWorkers        = 4
-	nextBlockDescriptionLookahead    = shardStateDownloadBuffer
-	shardStateCatchUpRetryDelay      = time.Second
-	currentStateLivePollDelay        = 300 * time.Millisecond
-	nextBlockCatchUpCheckpointBlocks = 600
-	nextBlockBootstrapBlocks         = 0
-	nextBlockBootstrapProbeTimeout   = 2 * time.Second
-	nextBlockBootstrapProbePeers     = 3
-	nextBlockBootstrapUrgentPeers    = 8
-	chainBlockDownloadRetries        = 3
-	chainBlockDownloadRetryDelay     = 500 * time.Millisecond
-	nextMasterchainQueueLimit        = 64
-	masterStateCacheLimit            = 2048
-	syncedBlockProcessorWorkers      = 8
+	topShard                           = int64(-1 << 63)
+	syncLagChainMasterchain            = "masterchain"
+	syncLagChainShardchain             = "shardchain"
+	shardStateCatchUpParallelism       = 4
+	shardStateDownloadBuffer           = 32
+	shardStateDownloadWorkers          = 4
+	nextBlockDescriptionLookahead      = shardStateDownloadBuffer
+	shardStateCatchUpRetryDelay        = time.Second
+	currentStateLivePollDelay          = 300 * time.Millisecond
+	syncDiskSpaceRetryDelay            = 5 * time.Second
+	defaultMinSyncDiskFreeBytes        = 10 << 30
+	stateSerializationMinDiskFreeBytes = 30 << 30
+	nextBlockCatchUpCheckpointBlocks   = 600
+	nextBlockBootstrapBlocks           = 0
+	nextBlockBootstrapProbeTimeout     = 2 * time.Second
+	nextBlockBootstrapProbePeers       = 3
+	nextBlockBootstrapUrgentPeers      = 8
+	chainBlockDownloadRetries          = 3
+	chainBlockDownloadRetryDelay       = 500 * time.Millisecond
+	nextMasterchainQueueLimit          = 64
+	masterStateCacheLimit              = 2048
+	syncedBlockProcessorWorkers        = 8
 )
 
 var (
@@ -126,38 +129,46 @@ type Service struct {
 	masterStateCache     map[string]*storage.BlockState
 	masterStateCacheKeys []string
 
-	currentStatePersistMu    sync.Mutex
-	currentStatePersistErrMu sync.Mutex
-	currentStatePersistErr   error
-	stateCellLoaderMu        sync.RWMutex
-	stateCellLoaders         map[uint64]cell.LazyCellLoader
-	nextStateCellLoaderID    uint64
-	stateSerializer          *stateSerializer
-	stateSerializerWake      chan struct{}
-	stateTTL                 time.Duration
-	archiveTTL               time.Duration
-	exclusiveTaskMu          sync.Mutex
-	exclusiveTask            exclusiveServiceTask
-	cellMigrationMu          sync.Mutex
-	cellGenerationSwitching  bool
-	currentStatusMu          sync.RWMutex
-	currentStatus            *storage.CurrentState
+	currentStatePersistMu              sync.Mutex
+	currentStatePersistErrMu           sync.Mutex
+	currentStatePersistErr             error
+	stateCellLoaderMu                  sync.RWMutex
+	stateCellLoaders                   map[uint64]cell.LazyCellLoader
+	nextStateCellLoaderID              uint64
+	stateSerializer                    *stateSerializer
+	maintenanceWake                    chan struct{}
+	stateTTL                           time.Duration
+	archiveTTL                         time.Duration
+	syncDiskSpacePath                  string
+	minSyncDiskFreeBytes               uint64
+	minStateSerializationDiskFreeBytes uint64
+	syncDiskSpaceProbe                 syncDiskSpaceProbe
+	syncDiskSpaceRetryDelay            time.Duration
+	exclusiveTaskMu                    sync.Mutex
+	exclusiveTask                      exclusiveServiceTask
+	cellMigrationMu                    sync.Mutex
+	cellGenerationSwitching            bool
+	currentStatusMu                    sync.RWMutex
+	currentStatus                      *storage.CurrentState
 
 	startOnce sync.Once
 	wg        sync.WaitGroup
 }
 
 type Options struct {
-	ArchiveCatchUpCheckpointBlocks uint32
-	ArchiveCatchUpCheckpointPeriod time.Duration
-	ArchiveCatchUpPrefetchWindows  int
-	CurrentStatePublisher          CurrentStatePublisher
-	ShutdownContext                context.Context
-	StateFilesDir                  string
-	StateTTL                       time.Duration
-	ArchiveTTL                     time.Duration
-	DisableStateSerialization      bool
-	SyncLagObserver                SyncLagObserver
+	ArchiveCatchUpCheckpointBlocks     uint32
+	ArchiveCatchUpCheckpointPeriod     time.Duration
+	ArchiveCatchUpPrefetchWindows      int
+	CurrentStatePublisher              CurrentStatePublisher
+	ShutdownContext                    context.Context
+	StateFilesDir                      string
+	StateTTL                           time.Duration
+	ArchiveTTL                         time.Duration
+	StorageDir                         string
+	MinSyncDiskFreeBytes               uint64
+	MinStateSerializationDiskFreeBytes uint64
+	DisableStateSerialization          bool
+	SyncLagObserver                    SyncLagObserver
 }
 
 type CurrentStatePublisher interface {
@@ -197,26 +208,35 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	if opts.ArchiveTTL <= 0 {
 		opts.ArchiveTTL = 7 * 24 * time.Hour
 	}
+	if opts.MinSyncDiskFreeBytes == 0 {
+		opts.MinSyncDiskFreeBytes = defaultMinSyncDiskFreeBytes
+	}
+	if opts.MinStateSerializationDiskFreeBytes == 0 {
+		opts.MinStateSerializationDiskFreeBytes = stateSerializationMinDiskFreeBytes
+	}
 
 	svc := &Service{
-		log:                            logger,
-		node:                           node,
-		blockSync:                      blockSync,
-		storage:                        store,
-		stateSync:                      stateSync,
-		liveState:                      opts.CurrentStatePublisher,
-		syncLag:                        opts.SyncLagObserver,
-		appliedArtifacts:               newAppliedBlockArtifactWriter(logger, store, appliedBlockArtifactFlusher(opts.CurrentStatePublisher)),
-		archiveCatchUpCheckpointBlocks: opts.ArchiveCatchUpCheckpointBlocks,
-		archiveCatchUpCheckpointPeriod: opts.ArchiveCatchUpCheckpointPeriod,
-		archiveCatchUpPrefetchWindows:  opts.ArchiveCatchUpPrefetchWindows,
-		shutdownContext:                opts.ShutdownContext,
-		currentStateWake:               make(chan struct{}, 1),
-		shardDescriptionWake:           make(chan struct{}, 1),
-		shardDescriptionHints:          map[string]shardDescriptionHint{},
-		stateSerializerWake:            make(chan struct{}, 1),
-		stateTTL:                       opts.StateTTL,
-		archiveTTL:                     opts.ArchiveTTL,
+		log:                                logger,
+		node:                               node,
+		blockSync:                          blockSync,
+		storage:                            store,
+		stateSync:                          stateSync,
+		liveState:                          opts.CurrentStatePublisher,
+		syncLag:                            opts.SyncLagObserver,
+		appliedArtifacts:                   newAppliedBlockArtifactWriter(logger, store, appliedBlockArtifactFlusher(opts.CurrentStatePublisher)),
+		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
+		archiveCatchUpCheckpointPeriod:     opts.ArchiveCatchUpCheckpointPeriod,
+		archiveCatchUpPrefetchWindows:      opts.ArchiveCatchUpPrefetchWindows,
+		shutdownContext:                    opts.ShutdownContext,
+		currentStateWake:                   make(chan struct{}, 1),
+		shardDescriptionWake:               make(chan struct{}, 1),
+		shardDescriptionHints:              map[string]shardDescriptionHint{},
+		maintenanceWake:                    make(chan struct{}, 1),
+		stateTTL:                           opts.StateTTL,
+		archiveTTL:                         opts.ArchiveTTL,
+		syncDiskSpacePath:                  opts.StorageDir,
+		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
+		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
 	}
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization)
 	svc.configureLiveBlockPublisher(opts.CurrentStatePublisher)
@@ -240,12 +260,8 @@ func (s *Service) Start(ctx context.Context) error {
 			s.runShardDescriptionProcessor(ctx)
 		})
 		s.runAsync(func() {
-			s.runPersistentStateSerializer(ctx)
+			s.runServiceMaintenance(ctx)
 		})
-		s.runAsync(func() {
-			s.runArchiveGC(ctx)
-		})
-		s.resumePendingCellGenerationMigration(ctx)
 	})
 	return nil
 }
@@ -516,8 +532,12 @@ func (s *Service) wakeCurrentStateSync() {
 }
 
 func (s *Service) wakePersistentStateSerializer() {
+	s.wakeServiceMaintenance()
+}
+
+func (s *Service) wakeServiceMaintenance() {
 	select {
-	case s.stateSerializerWake <- struct{}{}:
+	case s.maintenanceWake <- struct{}{}:
 	default:
 	}
 }
@@ -535,7 +555,11 @@ func isExpectedRetryError(err error) bool {
 		errors.Is(err, p2p.ErrBlockNotAvailable) ||
 		errors.Is(err, errSyncedBlockNotVerified) ||
 		errors.Is(err, errCellGenerationMigrationRunning) ||
+		errors.Is(err, errPersistentStateGCActive) ||
 		errors.Is(err, errArchiveTTLGCActive) ||
+		errors.Is(err, errExclusiveServiceTaskHighReadAmp) ||
+		errors.Is(err, errExclusiveServiceTaskHighLag) ||
+		errors.Is(err, errStateSerializationLowDiskSpace) ||
 		errors.Is(err, errStateSerializationCanceled) ||
 		errors.Is(err, context.DeadlineExceeded) {
 		return true

@@ -653,6 +653,105 @@ func TestLiveStoreLookupLTAndUnixTimeUseLiveMetaBeforeStorage(t *testing.T) {
 	}
 }
 
+func TestLiveStoreHistoryIndexesMatchLookupRules(t *testing.T) {
+	live := NewLiveStore(&fakeStore{})
+	key := storage.BlockHistoryKey{Workchain: 0, Shard: int64(0x4000000000000000)}
+	first := testLiveStoreIndexBlock(1, key)
+	second := testLiveStoreIndexBlock(2, key)
+
+	live.mu.Lock()
+	live.putBlockLocked(storage.BlockKey(first), &liveBlock{
+		id:      first,
+		meta:    &storage.BlockMeta{ID: first, StartLT: 1, EndLT: 100, GenUTime: 1000},
+		flushed: true,
+	})
+	live.putBlockLocked(storage.BlockKey(second), &liveBlock{
+		id:      second,
+		meta:    &storage.BlockMeta{ID: second, StartLT: 50, EndLT: 100, GenUTime: 1000},
+		flushed: true,
+	})
+	live.mu.Unlock()
+
+	got, err := live.LookupBlockByLT(context.Background(), key, 75)
+	if err != nil {
+		t.Fatalf("lookup live lt: %v", err)
+	}
+	if !blockIDEqual(got, first) {
+		t.Fatalf("lt lookup block = %+v, want %+v", got, first)
+	}
+
+	got, err = live.LookupBlockByLT(context.Background(), key, 101)
+	if err != nil {
+		t.Fatalf("lookup live lt floor: %v", err)
+	}
+	if !blockIDEqual(got, second) {
+		t.Fatalf("lt floor lookup block = %+v, want %+v", got, second)
+	}
+
+	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1000)
+	if err != nil {
+		t.Fatalf("lookup live unix time: %v", err)
+	}
+	if !blockIDEqual(got, second) {
+		t.Fatalf("unix time lookup block = %+v, want %+v", got, second)
+	}
+}
+
+func TestLiveStoreTrimRemovesHistoryIndexEntries(t *testing.T) {
+	store := &fakeStore{}
+	live := NewLiveStore(store, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 2})
+	key := storage.BlockHistoryKey{Workchain: 0, Shard: int64(0x4000000000000000)}
+	blocks := make([]ton.BlockIDExt, 0, 3)
+
+	live.mu.Lock()
+	for seqno := uint32(1); seqno <= 3; seqno++ {
+		block := testLiveStoreIndexBlock(seqno, key)
+		live.putBlockLocked(storage.BlockKey(block), &liveBlock{
+			id: block,
+			meta: &storage.BlockMeta{
+				ID:       block,
+				StartLT:  uint64(seqno*100 + 1),
+				EndLT:    uint64(seqno*100 + 100),
+				GenUTime: 1000 + seqno,
+			},
+			flushed: true,
+		})
+		live.trimBlocksLocked(liveBlockShard)
+		blocks = append(blocks, block)
+	}
+	live.mu.Unlock()
+
+	if _, err := live.LookupBlockByLT(context.Background(), key, 150); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("trimmed lt lookup error = %v, want ErrNotFound", err)
+	}
+	if store.ltLookupCalls != 1 {
+		t.Fatalf("storage lt lookup calls = %d, want 1", store.ltLookupCalls)
+	}
+
+	got, err := live.LookupBlockByLT(context.Background(), key, 350)
+	if err != nil {
+		t.Fatalf("lookup retained live lt: %v", err)
+	}
+	if !blockIDEqual(got, blocks[2]) {
+		t.Fatalf("lt lookup block = %+v, want %+v", got, blocks[2])
+	}
+
+	if _, err = live.LookupBlockByUnixTime(context.Background(), key, 1001); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("trimmed unix time lookup error = %v, want ErrNotFound", err)
+	}
+	if store.utimeLookupCalls != 1 {
+		t.Fatalf("storage unix time lookup calls = %d, want 1", store.utimeLookupCalls)
+	}
+
+	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1003)
+	if err != nil {
+		t.Fatalf("lookup retained live unix time: %v", err)
+	}
+	if !blockIDEqual(got, blocks[2]) {
+		t.Fatalf("unix time lookup block = %+v, want %+v", got, blocks[2])
+	}
+}
+
 func TestLiveStoreStateMethodsUseCurrentStateBeforeStorage(t *testing.T) {
 	stateRoot := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 17, stateRoot)
@@ -2974,6 +3073,16 @@ func testCurrentStateWithLiveBlock(t *testing.T, seqno uint32) (*storage.Current
 		},
 	}
 	return current, root, data
+}
+
+func testLiveStoreIndexBlock(seqno uint32, key storage.BlockHistoryKey) ton.BlockIDExt {
+	return ton.BlockIDExt{
+		Workchain: key.Workchain,
+		Shard:     key.Shard,
+		SeqNo:     seqno,
+		RootHash:  bytes.Repeat([]byte{byte(seqno)}, 32),
+		FileHash:  bytes.Repeat([]byte{byte(seqno + 64)}, 32),
+	}
 }
 
 func serializeWaitPrefixedQuery(t *testing.T, wait ton.WaitMasterchainSeqno, query tl.Serializable) []byte {

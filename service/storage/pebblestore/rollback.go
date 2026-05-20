@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -178,6 +178,7 @@ func (s *Store) rollbackDeleteIndexedBlocks(ctx context.Context, db *pebble.DB, 
 		{prefix: hotPrefixBlockSeq, delete: rollbackDeleteIndexValue(futureBlocks, cutoff)},
 		{prefix: hotPrefixBlockLT, delete: rollbackDeleteIndexValue(futureBlocks, cutoff)},
 		{prefix: hotPrefixBlockUTime, delete: rollbackDeleteIndexValue(futureBlocks, cutoff)},
+		{prefix: hotPrefixKeyBlockSeq, delete: rollbackDeleteIndexValue(futureBlocks, cutoff)},
 		{prefix: hotPrefixBlockDataRef, delete: rollbackDeleteBlockIDKey(hotPrefixBlockDataRef, futureBlocks, cutoff)},
 		{prefix: hotPrefixProofRef, delete: rollbackDeleteProofKey(hotPrefixProofRef, futureBlocks, cutoff)},
 		{prefix: hotPrefixKeyProofRef, delete: rollbackDeleteProofKey(hotPrefixKeyProofRef, futureBlocks, cutoff)},

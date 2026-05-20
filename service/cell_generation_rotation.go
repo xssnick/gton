@@ -77,11 +77,11 @@ func (s *Service) afterPersistentStateSerialized(ctx context.Context, persistent
 		return
 	}
 
-	if err := s.startCellGenerationMigration(ctx, store, persistent, "automatic"); err != nil {
+	if err := s.queueCellGenerationMigration(ctx, store, persistent, "automatic"); err != nil {
 		s.log.Info().
 			Err(err).
 			Str("persistent_state", storage.FormatBlockRef(persistent)).
-			Msg("cell generation migration cannot start")
+			Msg("cell generation migration cannot be queued")
 	}
 }
 
@@ -119,12 +119,25 @@ func (s *Service) durableMasterchainBlockForMigration(ctx context.Context, maste
 	return s.durableMasterchainBlock(ctx, masterSeqno, "cell generation migration")
 }
 
-func (s *Service) startCellGenerationMigration(ctx context.Context, store cellGenerationRotationStore, persistent ton.BlockIDExt, source string) error {
-	migrationLease, err := s.beginCellGenerationMigration(ctx)
-	if err != nil {
-		return err
+func (s *Service) queueCellGenerationMigration(ctx context.Context, store cellGenerationRotationStore, persistent ton.BlockIDExt, source string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
-	return s.startCellGenerationMigrationWithLease(store, persistent, source, migrationLease)
+
+	generation, err := store.BeginCellGeneration(s.currentStatePersistContext(), persistent)
+	if err != nil {
+		return fmt.Errorf("persist cell generation migration intent: %w", err)
+	}
+
+	s.log.Info().
+		Uint64("cell_generation", generation).
+		Str("persistent_state", storage.FormatBlockRef(persistent)).
+		Str("source", source).
+		Msg("cell generation migration queued")
+	s.wakeServiceMaintenance()
+	return nil
 }
 
 func (s *Service) startCellGenerationMigrationWithLease(store cellGenerationRotationStore, persistent ton.BlockIDExt, source string, migrationLease *exclusiveServiceTaskLease) error {
@@ -228,11 +241,7 @@ func (s *Service) shouldStartCellGenerationMigration(ctx context.Context, store 
 }
 
 func (s *Service) beginCellGenerationMigration(ctx context.Context) (*exclusiveServiceTaskLease, error) {
-	return s.beginExclusiveServiceTask(
-		ctx,
-		exclusiveServiceTaskCellGenerationMigration,
-		exclusiveServiceTaskStateSerialization,
-	)
+	return s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskCellGenerationMigration)
 }
 
 func (s *Service) cellGenerationMigrationActive() bool {
@@ -351,60 +360,6 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store cellGene
 	}
 }
 
-func (s *Service) resumePendingCellGenerationMigration(ctx context.Context) {
-	store, ok := s.storage.(cellGenerationRotationStore)
-	if !ok {
-		return
-	}
-
-	pending, err := store.PendingCellGenerationMigration(ctx)
-	if errors.Is(err, storage.ErrNotFound) {
-		return
-	}
-	if err != nil {
-		s.log.Error().
-			Err(err).
-			Msg("failed to load pending cell generation migration")
-		return
-	}
-	migrationLease, err := s.beginCellGenerationMigration(ctx)
-	if err != nil {
-		s.log.Info().
-			Err(err).
-			Str("persistent_state", storage.FormatBlockRef(pending.OriginPersistentState)).
-			Msg("pending cell generation migration cannot resume")
-		return
-	}
-
-	s.runAsync(func() {
-		defer migrationLease.release()
-
-		started := time.Now()
-		if err := s.runCellGenerationMigration(s.currentStatePersistContext(), store, pending.OriginPersistentState); err != nil {
-			if errors.Is(err, context.Canceled) {
-				s.log.Info().
-					Uint64("cell_generation", pending.ID).
-					Str("persistent_state", storage.FormatBlockRef(pending.OriginPersistentState)).
-					Msg("pending cell generation migration stopped")
-				return
-			}
-			s.log.Error().
-				Err(err).
-				Uint64("cell_generation", pending.ID).
-				Str("persistent_state", storage.FormatBlockRef(pending.OriginPersistentState)).
-				Dur("elapsed", time.Since(started)).
-				Msg("pending cell generation migration failed")
-			return
-		}
-
-		s.log.Info().
-			Uint64("cell_generation", pending.ID).
-			Str("persistent_state", storage.FormatBlockRef(pending.OriginPersistentState)).
-			Dur("elapsed", time.Since(started)).
-			Msg("pending cell generation migration finished")
-	})
-}
-
 func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store cellGenerationRotationStore, generation uint64, master ton.BlockIDExt) (*cellGenerationCandidate, error) {
 	masterState, err := s.storage.BlockState(ctx, master)
 	if err != nil {
@@ -428,17 +383,17 @@ func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store c
 		Masterchain:      *storage.CloneBlockState(importedMaster),
 		Shards:           make(map[storage.ShardKey]storage.BlockState, len(shards)),
 	}
-	for _, shard := range shards {
-		splitDepth, err := state2.PersistentStateSplitDepth(importedMaster, shard.Workchain)
-		if err != nil {
-			return nil, fmt.Errorf("load persistent state split depth for %s: %w", storage.FormatBlockRef(shard), err)
-		}
+	splitDepths, err := state2.PersistentStateSplitDepths(importedMaster, shards)
+	if err != nil {
+		return nil, fmt.Errorf("load persistent state split depths for imported persistent state %s: %w", storage.FormatBlockRef(master), err)
+	}
 
+	for _, shard := range shards {
 		canonicalShard, err := s.storage.BlockState(ctx, shard)
 		if err != nil {
 			return nil, fmt.Errorf("load serialized shard state metadata %s: %w", storage.FormatBlockRef(shard), err)
 		}
-		importedShard, err := s.importSerializedPersistentBlockState(ctx, store, importer, generation, shard, master, splitDepth, canonicalShard.StateRootHash)
+		importedShard, err := s.importSerializedPersistentBlockState(ctx, store, importer, generation, shard, master, splitDepths[shard.Workchain], canonicalShard.StateRootHash)
 		if err != nil {
 			return nil, fmt.Errorf("import serialized shard persistent state %s: %w", storage.FormatBlockRef(shard), err)
 		}

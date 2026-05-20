@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/internal/metrics"
@@ -15,7 +16,6 @@ import (
 	"github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
-	"fmt"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -262,6 +262,7 @@ func main() {
 		StateFilesDir:                  stateFilesDir,
 		StateTTL:                       stateTTL,
 		ArchiveTTL:                     archiveTTL,
+		StorageDir:                     storageDir,
 		DisableStateSerialization:      cfg.DisableStateSerialization,
 		SyncLagObserver:                syncLagObserver,
 	})

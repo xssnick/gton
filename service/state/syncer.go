@@ -160,17 +160,18 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.Blo
 		key        storage2.ShardKey
 		splitDepth uint32
 	}
+	splitDepths, err := PersistentStateSplitDepths(masterState, shardBlocks)
+	if err != nil {
+		return nil, fmt.Errorf("load persistent state split depths for %s: %w", storage2.FormatBlockRef(master), err)
+	}
+
 	plans := make([]shardPlan, 0, len(shardBlocks))
 	planByKey := make(map[storage2.ShardKey]shardPlan, len(shardBlocks))
 	for _, shardBlock := range shardBlocks {
-		splitDepth, err := PersistentStateSplitDepth(masterState, shardBlock.Workchain)
-		if err != nil {
-			return nil, fmt.Errorf("load persistent state split depth for %s: %w", storage2.FormatBlockRef(shardBlock), err)
-		}
 		plan := shardPlan{
 			block:      shardBlock,
 			key:        storage2.ShardKeyFromBlock(shardBlock),
-			splitDepth: splitDepth,
+			splitDepth: splitDepths[shardBlock.Workchain],
 		}
 		plans = append(plans, plan)
 		planByKey[plan.key] = plan

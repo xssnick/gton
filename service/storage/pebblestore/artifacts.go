@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"github.com/xssnick/gton/service/archive/packfile"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"io"
 	"math/bits"
@@ -17,6 +15,8 @@ import (
 	"syscall"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/archive/packfile"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -595,15 +595,22 @@ func (s *Store) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard i
 	localArchiveID := archivePackID(baseSeqno, sliceSeqno, workchain, shardPrefix)
 
 	s.artifactMu.Lock()
+	if filepath.Clean(path) != filepath.Clean(storedPath) {
+		if err := s.ensureCleanPackTail(storedPath, s.pendingArchiveSync, s.dirtyArchivePacks); err != nil {
+			s.artifactMu.Unlock()
+			return storage.SavedArchiveFile{}, err
+		}
+	}
 	storeResult, err := storeArchivePack(path, storedPath)
 	if err != nil {
+		s.markDirtyPackTail(s.dirtyArchivePacks, storedPath)
 		s.artifactMu.Unlock()
 		return storage.SavedArchiveFile{}, err
 	}
-	if storeResult.stored {
+	stat, err := os.Stat(storedPath)
+	if err == nil && storeResult.stored {
 		s.markPendingPackSync(s.pendingArchiveSync, storedPath)
 	}
-	stat, err := os.Stat(storedPath)
 	s.artifactMu.Unlock()
 	if err != nil {
 		return storage.SavedArchiveFile{}, err
@@ -990,6 +997,9 @@ func (s *Store) appendArchiveEntry(kind string, block ton.BlockIDExt, meta *stor
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return artifactAppendResult{}, err
 	}
+	if err := s.ensureCleanPackTail(path, s.pendingArchiveSync, s.dirtyArchivePacks); err != nil {
+		return artifactAppendResult{}, err
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return artifactAppendResult{}, err
@@ -998,6 +1008,7 @@ func (s *Store) appendArchiveEntry(kind string, block ton.BlockIDExt, meta *stor
 
 	ptr, err := packfile.Append(file, packfile.EntryName(kind, block), data, false)
 	if err != nil {
+		s.markDirtyPackTail(s.dirtyArchivePacks, path)
 		return artifactAppendResult{}, err
 	}
 	stat, err := file.Stat()
@@ -1048,6 +1059,9 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
+	if err := s.ensureCleanPackTail(path, s.pendingKeyProofSync, s.dirtyKeyProofPacks); err != nil {
+		return nil, err
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -1056,6 +1070,7 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 
 	ptr, err := packfile.Append(file, packfile.EntryName(packEntryKindForProofKind(kind), block), data, false)
 	if err != nil {
+		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
 		return nil, err
 	}
 	s.markPendingPackSync(s.pendingKeyProofSync, path)
@@ -1558,6 +1573,69 @@ func (s *Store) setPackCommittedSize(batch *pebble.Batch, path string, size int6
 	return batch.Set(key, encodeInt64(size), pebble.NoSync)
 }
 
+func (s *Store) packCommittedSize(path string) (int64, error) {
+	raw, err := pebbleReaderGetCopy(s.hot, hotKeyPackCommitted(path))
+	if errors.Is(err, storage.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(raw) != 8 {
+		return 0, fmt.Errorf("invalid committed pack size record")
+	}
+	return int64(binary.BigEndian.Uint64(raw)), nil
+}
+
+func (s *Store) ensureCleanPackTail(path string, pending map[string]uint64, dirty map[string]struct{}) error {
+	if _, ok := pending[path]; ok {
+		return nil
+	}
+	if _, ok := dirty[path]; !ok {
+		return nil
+	}
+
+	if err := s.truncateUncommittedPackTail(path); err != nil {
+		return err
+	}
+	delete(dirty, path)
+	return nil
+}
+
+func (s *Store) truncateUncommittedPackTail(path string) error {
+	if path == "" {
+		return nil
+	}
+
+	stat, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	committedSize, err := s.packCommittedSize(s.relativeArtifactPath(path))
+	if err != nil {
+		return err
+	}
+	if stat.Size() <= committedSize {
+		return nil
+	}
+
+	if err := os.Truncate(path, committedSize); err != nil {
+		return fmt.Errorf("truncate uncommitted pack %s from %d to %d: %w", path, stat.Size(), committedSize, err)
+	}
+	return nil
+}
+
+func (s *Store) markDirtyPackTail(dirty map[string]struct{}, path string) {
+	if path == "" {
+		return
+	}
+	dirty[path] = struct{}{}
+}
+
 func isMissingArtifactError(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
@@ -1699,6 +1777,11 @@ func mergeArchivePack(src string, dst string) (bool, error) {
 		return false, err
 	}
 	defer func() { _ = out.Close() }()
+	stat, err := out.Stat()
+	if err != nil {
+		return false, err
+	}
+	originalSize := stat.Size()
 
 	in, err := os.Open(src)
 	if err != nil {
@@ -1722,6 +1805,9 @@ func mergeArchivePack(src string, dst string) (bool, error) {
 	}
 	if merged {
 		if err = out.Sync(); err != nil {
+			if truncateErr := out.Truncate(originalSize); truncateErr != nil {
+				return false, errors.Join(err, fmt.Errorf("rollback archive pack merge %s to %d: %w", dst, originalSize, truncateErr))
+			}
 			return false, err
 		}
 	}

@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -632,6 +634,7 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	if err = store.syncPendingArtifactFiles(); err != nil {
 		t.Fatalf("sync pending artifacts: %v", err)
 	}
+	wantDeletedBytes := testFileSize(t, oldAPath) + testFileSize(t, oldBPath)
 
 	stats, err := store.PruneArchivePackages(context.Background(), 2500, 0)
 	if err != nil {
@@ -645,6 +648,9 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	}
 	if stats.DeletedPackages != 2 || stats.DeletedPackageFiles != 2 {
 		t.Fatalf("deleted packages/files = %d/%d, want 2/2", stats.DeletedPackages, stats.DeletedPackageFiles)
+	}
+	if stats.DeletedPackageBytes != wantDeletedBytes {
+		t.Fatalf("deleted package bytes = %d, want %d", stats.DeletedPackageBytes, wantDeletedBytes)
 	}
 	if stats.DeletedBlockMeta != 2 {
 		t.Fatalf("deleted block meta = %d, want 2", stats.DeletedBlockMeta)
@@ -739,6 +745,59 @@ func TestOpenRemovesArchivePackAfterCommittedMarkerDeleted(t *testing.T) {
 
 	if _, err = os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("archive pack stat error = %v, want missing", err)
+	}
+}
+
+func TestSaveArchiveFileMarksExistingPackPendingBeyondCommittedSize(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	initialPath := writeTestPackEntries(t, map[string][]byte{
+		"old": {0x01},
+	})
+	saved, err := store.SaveArchiveFile(78, -1, int64(-1<<63), 0, initialPath)
+	if err != nil {
+		t.Fatalf("save initial archive file: %v", err)
+	}
+	if err = store.syncPendingArtifactFiles(); err != nil {
+		t.Fatalf("sync initial archive file: %v", err)
+	}
+
+	file, err := os.OpenFile(saved.Path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open stored archive file: %v", err)
+	}
+	if _, err = packfile.Append(file, "new", []byte{0x02}, false); err != nil {
+		_ = file.Close()
+		t.Fatalf("append unsynced archive entry: %v", err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatalf("close stored archive file: %v", err)
+	}
+	store.artifactMu.Lock()
+	store.dirtyArchivePacks[saved.Path] = struct{}{}
+	store.artifactMu.Unlock()
+
+	fullPath := writeTestPackEntries(t, map[string][]byte{
+		"old": {0x01},
+		"new": {0x02},
+	})
+	merged, err := store.SaveArchiveFile(78, -1, int64(-1<<63), 0, fullPath)
+	if err != nil {
+		t.Fatalf("save full archive file: %v", err)
+	}
+	if !merged.ReusedExisting {
+		t.Fatalf("archive file reuse = false, want true")
+	}
+
+	store.artifactMu.Lock()
+	_, pending := store.pendingArchiveSync[saved.Path]
+	store.artifactMu.Unlock()
+	if !pending {
+		t.Fatalf("existing archive pack beyond committed size was not scheduled for checkpoint sync")
 	}
 }
 
@@ -907,6 +966,175 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 	}
 }
 
+func TestPruneExpiredPersistentStateFilesKeepsTwoNewestGroups(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	nowUnix := uint64(10_000_000)
+	expiredUTime := uint32(1 << 17)
+
+	masters := []ton.BlockIDExt{
+		testArchivePruneBlock(10, 0x10),
+		testArchivePruneBlock(20, 0x20),
+		testArchivePruneBlock(30, 0x30),
+		testArchivePruneBlock(40, 0x40),
+	}
+	paths := make(map[uint32]string, len(masters))
+	for _, master := range masters {
+		saveTestPersistentStatePruneMasterMeta(t, store, master, expiredUTime)
+		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
+	}
+
+	stats, err := store.PruneExpiredPersistentStateFiles(ctx, nowUnix, 2, 1)
+	if err != nil {
+		t.Fatalf("prune persistent states: %v", err)
+	}
+	if stats.ScannedFiles != 4 {
+		t.Fatalf("scanned files = %d, want 4", stats.ScannedFiles)
+	}
+	if stats.DeletedFileRecords != 1 || stats.DeletedDiskFiles != 1 {
+		t.Fatalf("deleted = records:%d disk:%d, want records:1 disk:1", stats.DeletedFileRecords, stats.DeletedDiskFiles)
+	}
+	if stats.DeletedDiskBytes != 1 {
+		t.Fatalf("deleted disk bytes = %d, want 1", stats.DeletedDiskBytes)
+	}
+	assertTestPersistentStatePruned(t, store, masters[0], paths[10])
+	assertTestPersistentStatePresent(t, store, masters[1], paths[20])
+	assertTestPersistentStatePresent(t, store, masters[2], paths[30])
+	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
+
+	stats, err = store.PruneExpiredPersistentStateFiles(ctx, nowUnix, 2, 0)
+	if err != nil {
+		t.Fatalf("prune persistent states second pass: %v", err)
+	}
+	if stats.DeletedFileRecords != 1 || stats.DeletedDiskFiles != 1 {
+		t.Fatalf("second pass deleted = records:%d disk:%d, want records:1 disk:1", stats.DeletedFileRecords, stats.DeletedDiskFiles)
+	}
+	if stats.DeletedDiskBytes != 1 {
+		t.Fatalf("second pass deleted disk bytes = %d, want 1", stats.DeletedDiskBytes)
+	}
+	if stats.RetainedRecentGroups != 2 || stats.OldestRetainedMasterSeqno != 30 {
+		t.Fatalf("retained groups = %d oldest = %d, want 2 and 30", stats.RetainedRecentGroups, stats.OldestRetainedMasterSeqno)
+	}
+	assertTestPersistentStatePruned(t, store, masters[1], paths[20])
+	assertTestPersistentStatePresent(t, store, masters[2], paths[30])
+	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
+}
+
+func TestPrunePreviousPersistentStateFilesDeletesLatestOlderGroup(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	masters := []ton.BlockIDExt{
+		testArchivePruneBlock(10, 0x10),
+		testArchivePruneBlock(20, 0x20),
+		testArchivePruneBlock(30, 0x30),
+		testArchivePruneBlock(40, 0x40),
+	}
+	paths := make(map[uint32]string, len(masters))
+	for _, master := range masters {
+		saveTestPersistentStatePruneMasterMeta(t, store, master, 1<<17)
+		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
+	}
+
+	stats, err := store.PrunePreviousPersistentStateFiles(ctx, 35)
+	if err != nil {
+		t.Fatalf("prune previous persistent state: %v", err)
+	}
+	if stats.DeletedMasterSeqno != 30 {
+		t.Fatalf("deleted master seqno = %d, want 30", stats.DeletedMasterSeqno)
+	}
+	if stats.DeletedFileRecords != 1 || stats.DeletedDiskFiles != 1 || stats.DeletedDiskBytes != 1 {
+		t.Fatalf("deleted = records:%d files:%d bytes:%d, want 1/1/1", stats.DeletedFileRecords, stats.DeletedDiskFiles, stats.DeletedDiskBytes)
+	}
+	assertTestPersistentStatePresent(t, store, masters[0], paths[10])
+	assertTestPersistentStatePresent(t, store, masters[1], paths[20])
+	assertTestPersistentStatePruned(t, store, masters[2], paths[30])
+	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
+}
+
+func saveTestPersistentStatePruneMasterMeta(t *testing.T, store *Store, master ton.BlockIDExt, genUTime uint32) {
+	t.Helper()
+
+	err := store.withHotBatch(func(batch *pebble.Batch) error {
+		return store.setMergedBlockMeta(batch, &storage.BlockMeta{
+			ID:       master,
+			GenUTime: genUTime,
+		})
+	})
+	if err != nil {
+		t.Fatalf("save master meta %s: %v", storage.FormatBlockRef(master), err)
+	}
+}
+
+func saveTestPersistentStatePruneFile(t *testing.T, store *Store, master ton.BlockIDExt) string {
+	t.Helper()
+
+	data := []byte{byte(master.SeqNo)}
+	path := filepath.Join(store.StateFilesDir(), fmt.Sprintf("state-prune-%d", master.SeqNo))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write persistent state file: %v", err)
+	}
+
+	if err := store.SavePersistentStateFile(&storage.PersistentStateFile{
+		Block:            master,
+		MasterchainBlock: master,
+		EffectiveShard:   0,
+		Ref:              &storage.ArtifactRef{Path: path, Size: int64(len(data))},
+		FileHash:         bytes.Repeat([]byte{byte(master.SeqNo)}, 32),
+		StateRootHash:    bytes.Repeat([]byte{byte(master.SeqNo + 1)}, 32),
+	}); err != nil {
+		t.Fatalf("save persistent state file %s: %v", storage.FormatBlockRef(master), err)
+	}
+	return path
+}
+
+func assertTestPersistentStatePruned(t *testing.T, store *Store, master ton.BlockIDExt, path string) {
+	t.Helper()
+
+	if _, err := store.PersistentStateSize(context.Background(), master, master, 0); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("persistent state %s size error = %v, want ErrNotFound", storage.FormatBlockRef(master), err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("persistent state file %s stat error = %v, want not exist", path, err)
+	}
+}
+
+func assertTestPersistentStatePresent(t *testing.T, store *Store, master ton.BlockIDExt, path string) {
+	t.Helper()
+
+	if _, err := store.PersistentStateSize(context.Background(), master, master, 0); err != nil {
+		t.Fatalf("persistent state %s size: %v", storage.FormatBlockRef(master), err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("persistent state file %s stat: %v", path, err)
+	}
+}
+
+func testFileSize(t *testing.T, path string) uint64 {
+	t.Helper()
+
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if stat.Size() <= 0 {
+		return 0
+	}
+	return uint64(stat.Size())
+}
+
 func writeRefOnlyTestPack(t *testing.T, block ton.BlockIDExt, blockData []byte, proofData []byte) (string, packfile.Pointer, packfile.Pointer) {
 	t.Helper()
 
@@ -929,4 +1157,31 @@ func writeRefOnlyTestPack(t *testing.T, block ton.BlockIDExt, blockData []byte, 
 		t.Fatalf("sync pack: %v", err)
 	}
 	return path, blockPtr, proofPtr
+}
+
+func writeTestPackEntries(t *testing.T, entries map[string][]byte) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "archive.pack")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("create archive pack: %v", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		if _, err = packfile.Append(file, name, entries[name], true); err != nil {
+			_ = file.Close()
+			t.Fatalf("append archive entry %s: %v", name, err)
+		}
+	}
+	if err = file.Close(); err != nil {
+		t.Fatalf("close archive pack: %v", err)
+	}
+	return path
 }

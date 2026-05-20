@@ -36,33 +36,6 @@ type masterBlockMetaForStateSerialization struct {
 	meta  *storage.BlockMeta
 }
 
-func (s *Service) runPersistentStateSerializer(ctx context.Context) {
-	if s.stateSerializer == nil {
-		return
-	}
-
-	for {
-		err := s.processPersistentStateSerialization(ctx)
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-
-		delay := stateSerializationIdlePollDelay
-		if err != nil {
-			delay = stateSerializationRetryDelay
-			event := s.log.Warn()
-			if errors.Is(err, errStateSerializationRunning) || isExpectedRetryError(err) {
-				event = s.log.Debug()
-			}
-			event.Err(err).Dur("retry_in", delay).Msg("persistent state serializer iteration failed")
-		}
-
-		if !s.waitPersistentStateSerializerWake(ctx, delay) {
-			return
-		}
-	}
-}
-
 func (s *Service) processPersistentStateSerialization(ctx context.Context) error {
 	scheduler, err := s.stateSerializer.schedulerStore()
 	if err != nil {
@@ -219,11 +192,15 @@ func (s *Service) processPersistentStateKeyBlock(
 		s.stateSerializer.resetAutomaticAttempts(block.SeqNo)
 		return nil
 	}
+	if errors.Is(err, errServiceMaintenanceRescan) {
+		s.stateSerializer.resetAutomaticAttempts(block.SeqNo)
+		return err
+	}
 	if errors.Is(err, errStateSerializationCanceled) {
 		s.stateSerializer.resetAutomaticAttempts(block.SeqNo)
 		return err
 	}
-	if errors.Is(err, errStateSerializationRunning) || errors.Is(err, errCellGenerationMigrationRunning) || errors.Is(err, errArchiveTTLGCActive) {
+	if errors.Is(err, errStateSerializationRunning) || errors.Is(err, errCellGenerationMigrationRunning) || errors.Is(err, errPersistentStateGCActive) || errors.Is(err, errArchiveTTLGCActive) || errors.Is(err, errStateSerializationLowDiskSpace) {
 		return err
 	}
 
@@ -257,11 +234,10 @@ func (s *Service) tryPersistentStateKeyBlock(
 	active *storage.PersistentStateSerializerActive,
 	retryInterrupted bool,
 ) error {
-	if err := s.storePersistentStateDescription(ctx, scheduler, block, meta.GenUTime, ttl); err != nil {
-		return err
-	}
-
 	if s.stateSerializer.disableAutomatic {
+		if err := s.storePersistentStateDescription(ctx, scheduler, block, meta.GenUTime, ttl); err != nil {
+			return err
+		}
 		s.stateSerializer.log.Info().
 			Str("block", storage.FormatBlockRef(block)).
 			Msg("skipping persistent state serialization because it is disabled in config")
@@ -273,6 +249,9 @@ func (s *Service) tryPersistentStateKeyBlock(
 		return savePersistentStateSerializerCursor(ctx, scheduler, cursor, block, &block, meta.GenUTime)
 	}
 	if s.haveNewerPersistentState(meta.GenUTime, latestKeyUTime) {
+		if err := s.storePersistentStateDescription(ctx, scheduler, block, meta.GenUTime, ttl); err != nil {
+			return err
+		}
 		s.stateSerializer.log.Info().
 			Str("block", storage.FormatBlockRef(block)).
 			Uint32("utime", meta.GenUTime).
@@ -304,6 +283,14 @@ func (s *Service) tryPersistentStateKeyBlock(
 	if err != nil {
 		return err
 	}
+	if err = s.ensurePersistentStateSerializationDiskSpace(ctx, block); err != nil {
+		lease.release()
+		return err
+	}
+	if err = s.storePersistentStateDescription(ctx, scheduler, block, meta.GenUTime, ttl); err != nil {
+		lease.release()
+		return err
+	}
 	if err = saveActivePersistentStateSerialization(ctx, scheduler, block); err != nil {
 		lease.release()
 		return err
@@ -313,13 +300,17 @@ func (s *Service) tryPersistentStateKeyBlock(
 		lease.release()
 		return err
 	}
-	s.afterPersistentStateSerialized(ctx, block, PersistentStateSerializationAll)
 	if err = clearActivePersistentStateSerialization(ctx, scheduler, block); err != nil {
 		lease.release()
 		return err
 	}
+	if err = savePersistentStateSerializerCursor(ctx, scheduler, cursor, block, &block, meta.GenUTime); err != nil {
+		lease.release()
+		return err
+	}
 	lease.release()
-	return savePersistentStateSerializerCursor(ctx, scheduler, cursor, block, &block, meta.GenUTime)
+	s.afterPersistentStateSerialized(ctx, block, PersistentStateSerializationAll)
+	return errServiceMaintenanceRescan
 }
 
 func activePersistentStateSerializationMatches(active *storage.PersistentStateSerializerActive, block ton.BlockIDExt) bool {
@@ -388,14 +379,15 @@ func buildPersistentStateDescription(masterState *storage.BlockState, startTime 
 		EndTime:          endTime,
 		ShardBlocks:      make([]storage.PersistentStateDescriptionShard, 0, len(shards)),
 	}
+	splitDepths, err := state2.PersistentStateSplitDepths(masterState, shards)
+	if err != nil {
+		return nil, fmt.Errorf("load persistent state split depths for %s: %w", storage.FormatBlockRef(masterState.Block), err)
+	}
+
 	for _, shard := range shards {
-		splitDepth, err := state2.PersistentStateSplitDepth(masterState, shard.Workchain)
-		if err != nil {
-			return nil, fmt.Errorf("load persistent state split depth for %s: %w", storage.FormatBlockRef(shard), err)
-		}
 		desc.ShardBlocks = append(desc.ShardBlocks, storage.PersistentStateDescriptionShard{
 			Block:      shard,
-			SplitDepth: splitDepth,
+			SplitDepth: splitDepths[shard.Workchain],
 		})
 	}
 	return desc, nil
@@ -520,20 +512,6 @@ func (s *stateSerializer) resetAutomaticAttempts(seqno uint32) {
 	s.attemptMu.Lock()
 	delete(s.automaticAttempts, seqno)
 	s.attemptMu.Unlock()
-}
-
-func (s *Service) waitPersistentStateSerializerWake(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-s.stateSerializerWake:
-		return true
-	case <-timer.C:
-		return true
-	}
 }
 
 func randomStateSerializationDelay() time.Duration {

@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -95,6 +95,70 @@ func (s *Store) LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistory
 		return ton.BlockIDExt{}, err
 	}
 	return block, nil
+}
+
+func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]ton.BlockIDExt, error) {
+	if limit <= 0 || after == ^uint32(0) {
+		return nil, storage.ErrNotFound
+	}
+
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer s.releaseHotDB()
+
+	snap := db.NewSnapshot()
+	defer func() { _ = snap.Close() }()
+
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: bytes.Clone(hotPrefixKeyBlockSeq),
+		UpperBound: appendPrefixUpperBound(hotPrefixKeyBlockSeq),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	blocks := make([]ton.BlockIDExt, 0, limit)
+	for ok := iter.SeekGE(hotKeyKeyBlockSeqIndex(after + 1)); ok && len(blocks) < limit; ok = iter.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		block, err := decodeBlockID(iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		if !isMasterchainBlock(block) {
+			continue
+		}
+
+		raw, err := pebbleReaderGetCopy(snap, hotKeyBlockMeta(block))
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		meta, err := decodeBlockMeta(block, raw)
+		if err != nil {
+			return nil, err
+		}
+		if !meta.Has(storage.BlockMetaIsKeyBlock) {
+			continue
+		}
+		blocks = append(blocks, block)
+	}
+	if err = iter.Error(); err != nil {
+		return nil, err
+	}
+	if len(blocks) == 0 {
+		return nil, storage.ErrNotFound
+	}
+	return blocks, nil
 }
 
 func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
@@ -222,6 +286,11 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 	}
 	if err = batch.Set(hotKeyBlockSeqIndex(storage.BlockHistoryKey{Workchain: merged.ID.Workchain, Shard: merged.ID.Shard}, merged.ID.SeqNo), encodeBlockID(merged.ID), pebble.NoSync); err != nil {
 		return err
+	}
+	if isMasterchainBlock(merged.ID) && merged.Has(storage.BlockMetaIsKeyBlock) {
+		if err = batch.Set(hotKeyKeyBlockSeqIndex(merged.ID.SeqNo), encodeBlockID(merged.ID), pebble.NoSync); err != nil {
+			return err
+		}
 	}
 	if merged.EndLT != 0 {
 		if err = batch.Set(hotKeyBlockLTIndex(merged), encodeBlockID(merged.ID), pebble.NoSync); err != nil {

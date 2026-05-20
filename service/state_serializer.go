@@ -114,6 +114,10 @@ func (s *Service) StartPersistentStateSerialization(ctx context.Context, masterS
 		lease.release()
 		return err
 	}
+	if err = s.ensurePersistentStateSerializationDiskSpace(ctx, master); err != nil {
+		lease.release()
+		return err
+	}
 	if err = s.stateSerializer.start(ctx, master, scope, s.runAsync, s.afterPersistentStateSerialized, lease.release); err != nil {
 		lease.release()
 		return err
@@ -212,11 +216,11 @@ func (s *stateSerializer) start(ctx context.Context, master ton.BlockIDExt, scop
 			Str("masterchain", storage.FormatBlockRef(master)).
 			Str("scope", scope.String()).
 			Msg("persistent state serialization finished")
-		if after != nil {
-			after(runCtx, master, scope)
-		}
 		if done != nil {
 			done()
+		}
+		if after != nil {
+			after(runCtx, master, scope)
 		}
 	})
 	return nil
@@ -536,14 +540,23 @@ func (s *stateSerializer) loadTargets(ctx context.Context, master ton.BlockIDExt
 			kind:  "masterchain",
 		})
 	}
+	splitDepthBlocks := shards
+	if scope == PersistentStateSerializationBasechain {
+		splitDepthBlocks = make([]ton.BlockIDExt, 0, len(shards))
+		for _, shard := range shards {
+			if shard.Workchain == 0 {
+				splitDepthBlocks = append(splitDepthBlocks, shard)
+			}
+		}
+	}
+	splitDepths, err := state2.PersistentStateSplitDepths(masterState, splitDepthBlocks)
+	if err != nil {
+		return nil, fmt.Errorf("load persistent state split depths for %s: %w", storage.FormatBlockRef(master), err)
+	}
+
 	for _, shard := range shards {
 		if scope == PersistentStateSerializationBasechain && shard.Workchain != 0 {
 			continue
-		}
-
-		splitDepth, err := state2.PersistentStateSplitDepth(masterState, shard.Workchain)
-		if err != nil {
-			return nil, fmt.Errorf("load persistent state split depth for %s: %w", storage.FormatBlockRef(shard), err)
 		}
 
 		state, err := s.store.BlockState(ctx, shard)
@@ -558,7 +571,7 @@ func (s *stateSerializer) loadTargets(ctx context.Context, master ton.BlockIDExt
 			block:      shard,
 			state:      state,
 			kind:       kind,
-			splitDepth: splitDepth,
+			splitDepth: splitDepths[shard.Workchain],
 		})
 	}
 	return targets, nil

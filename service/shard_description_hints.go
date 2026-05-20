@@ -133,11 +133,15 @@ func (s *Service) pruneShardDescriptionHintsLocked(now time.Time) {
 	}
 	s.shardDescriptionOrder = s.shardDescriptionOrder[:write]
 
-	for len(s.shardDescriptionOrder) > shardDescriptionHintLimit {
-		key := s.shardDescriptionOrder[0]
-		delete(s.shardDescriptionHints, key)
-		copy(s.shardDescriptionOrder, s.shardDescriptionOrder[1:])
-		s.shardDescriptionOrder = s.shardDescriptionOrder[:len(s.shardDescriptionOrder)-1]
+	if overflow := len(s.shardDescriptionOrder) - shardDescriptionHintLimit; overflow > 0 {
+		for _, key := range s.shardDescriptionOrder[:overflow] {
+			delete(s.shardDescriptionHints, key)
+		}
+		copy(s.shardDescriptionOrder, s.shardDescriptionOrder[overflow:])
+		for i := len(s.shardDescriptionOrder) - overflow; i < len(s.shardDescriptionOrder); i++ {
+			s.shardDescriptionOrder[i] = ""
+		}
+		s.shardDescriptionOrder = s.shardDescriptionOrder[:len(s.shardDescriptionOrder)-overflow]
 	}
 }
 

@@ -472,6 +472,9 @@ func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *s
 	if current.Masterchain.Block.SeqNo != current.ShardClientSeqno {
 		return nil, fmt.Errorf("current masterchain seqno %d differs from shard client seqno %d", current.Masterchain.Block.SeqNo, current.ShardClientSeqno)
 	}
+	if err := s.waitSyncDiskSpace(ctx, "archive_catchup"); err != nil {
+		return nil, err
+	}
 
 	started := time.Now()
 	runner := &archiveCatchUpRunner{

@@ -1,8 +1,13 @@
 package state
 
 import (
+	"math/big"
 	"testing"
 
+	"github.com/xssnick/gton/service/storage"
+
+	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -54,6 +59,80 @@ func BenchmarkLoadWorkchainPersistentStateSplitDepth(b *testing.B) {
 		if depth != 7 {
 			b.Fatalf("depth mismatch: got %d want 7", depth)
 		}
+	}
+}
+
+func TestPersistentStateSplitDepthsReusesMasterConfig(t *testing.T) {
+	master := masterStateWithPersistentSplitDepths(t, map[int32]uint64{
+		0: 7,
+		1: 11,
+	})
+	blocks := []ton.BlockIDExt{
+		{Workchain: 0},
+		{Workchain: 0},
+		{Workchain: 1},
+		{Workchain: 2},
+		{Workchain: -1},
+	}
+
+	depths, err := PersistentStateSplitDepths(master, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for workchain, want := range map[int32]uint32{
+		-1: 0,
+		0:  7,
+		1:  11,
+		2:  0,
+	} {
+		if got := depths[workchain]; got != want {
+			t.Fatalf("workchain %d depth = %d, want %d", workchain, got, want)
+		}
+	}
+
+	depth, err := PersistentStateSplitDepth(master, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if depth != 11 {
+		t.Fatalf("single workchain depth = %d, want 11", depth)
+	}
+}
+
+func masterStateWithPersistentSplitDepths(t *testing.T, depths map[int32]uint64) *storage.BlockState {
+	t.Helper()
+
+	workchains := cell.NewDict(32)
+	for workchain, depth := range depths {
+		if err := workchains.SetIntKey(big.NewInt(int64(workchain)), workchainDescriptorCell(0xa7, true, depth)); err != nil {
+			t.Fatalf("store workchain descriptor %d: %v", workchain, err)
+		}
+	}
+	workchainsCell, err := tlb.ToCell(&tlb.WorkchainsConfig{Workchains: workchains})
+	if err != nil {
+		t.Fatalf("build workchains config: %v", err)
+	}
+
+	configParams := cell.NewDict(32)
+	if err := configParams.SetIntKey(big.NewInt(int64(tlb.ConfigParamWorkchains)), cell.BeginCell().MustStoreRef(workchainsCell).EndCell()); err != nil {
+		t.Fatalf("store workchains config param: %v", err)
+	}
+
+	extra := cell.BeginCell().
+		MustStoreUInt(0xcc26, 16).
+		MustStoreDict(cell.NewDict(32)).
+		MustStoreSlice(make([]byte, 32), 256).
+		MustStoreRef(configParams.AsCell()).
+		MustStoreRef(cell.BeginCell().EndCell()).
+		MustStoreCoins(0).
+		MustStoreDict(nil).
+		EndCell()
+
+	return &storage.BlockState{
+		Parsed: &tlb.ShardStateUnsplit{
+			McStateExtra: extra,
+		},
 	}
 }
 

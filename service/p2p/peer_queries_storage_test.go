@@ -605,6 +605,67 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 	}
 }
 
+func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
+	store := newTestPebbleStore(t)
+	keyBlock := testStoredMasterBlockID(500_000)
+	meta := &tnstore.BlockMeta{ID: keyBlock}
+	meta.Mark(tnstore.BlockMetaIsKeyBlock)
+	if err := store.SaveBlockMeta(meta); err != nil {
+		t.Fatalf("save key block meta: %v", err)
+	}
+
+	countingStore := &countingSeqNoLookupStore{Storage: store}
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:        &logger,
+		Storage:       countingStore,
+		StateFilesDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	node.RememberSeenMasterchainBlock(keyBlock)
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "masterchain",
+			ProtoVersionMajor: masterchainProtoVersionMajor,
+			ProtoVersionMinor: masterchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
+		Block:   testStoredMasterBlockID(10),
+		MaxSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("getNextKeyBlockIds: %v", err)
+	}
+	keyBlocks, ok := resp.(KeyBlocks)
+	if !ok {
+		t.Fatalf("unexpected getNextKeyBlockIds response %T", resp)
+	}
+	if keyBlocks.Error || keyBlocks.Incomplete || len(keyBlocks.Blocks) != 1 || keyBlocks.Blocks[0].SeqNo != keyBlock.SeqNo {
+		t.Fatalf("unexpected key blocks response %#v", keyBlocks)
+	}
+	if countingStore.lookupBlockBySeqNoCalls != 0 {
+		t.Fatalf("LookupBlockBySeqNo calls = %d, want 0", countingStore.lookupBlockBySeqNoCalls)
+	}
+}
+
+type countingSeqNoLookupStore struct {
+	tnstore.Storage
+
+	lookupBlockBySeqNoCalls int
+}
+
+func (s *countingSeqNoLookupStore) LookupBlockBySeqNo(ctx context.Context, key tnstore.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
+	s.lookupBlockBySeqNoCalls++
+	return ton.BlockIDExt{}, tnstore.ErrNotFound
+}
+
 func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()

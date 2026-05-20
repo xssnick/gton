@@ -217,16 +217,13 @@ func Append(file *os.File, name string, data []byte, sync bool) (Pointer, error)
 	binary.LittleEndian.PutUint32(header[4:], uint32(len(data)))
 
 	if _, err = file.WriteAt(header[:], entryOffset); err != nil {
-		_ = file.Truncate(entryOffset)
-		return Pointer{}, err
+		return Pointer{}, rollbackAppend(file, entryOffset, err)
 	}
 	if _, err = file.WriteAt([]byte(name), entryOffset+EntryHeaderSize); err != nil {
-		_ = file.Truncate(entryOffset)
-		return Pointer{}, err
+		return Pointer{}, rollbackAppend(file, entryOffset, err)
 	}
 	if _, err = file.WriteAt(data, dataOffset); err != nil {
-		_ = file.Truncate(entryOffset)
-		return Pointer{}, err
+		return Pointer{}, rollbackAppend(file, entryOffset, err)
 	}
 	if sync {
 		if err = file.Sync(); err != nil {
@@ -238,6 +235,13 @@ func Append(file *os.File, name string, data []byte, sync bool) (Pointer, error)
 		Offset: dataOffset,
 		Size:   int64(len(data)),
 	}, nil
+}
+
+func rollbackAppend(file *os.File, offset int64, err error) error {
+	if truncateErr := file.Truncate(offset); truncateErr != nil {
+		return errors.Join(err, fmt.Errorf("rollback archive append to %d: %w", offset, truncateErr))
+	}
+	return err
 }
 
 func ReadRange(path string, offset int64, size int64) ([]byte, error) {

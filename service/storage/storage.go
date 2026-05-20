@@ -25,6 +25,7 @@ type Storage interface {
 type BlockMetaStorage interface {
 	SaveBlockMeta(meta *BlockMeta) error
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*BlockMeta, error)
+	NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]ton.BlockIDExt, error)
 	LookupBlockBySeqNo(ctx context.Context, key BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error)
 	LookupBlockByLT(ctx context.Context, key BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
