@@ -580,7 +580,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 		proofRoot = proofBuilder.Root()
 	}
 
-	items, incomplete, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
+	txs, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
 	if err != nil {
 		return errorResponse(err, "cannot list block transactions")
 	}
@@ -594,9 +594,9 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 		proof = blockProof
 	}
 
-	ids := make([]ton.TransactionID, len(items))
+	ids := make([]ton.TransactionID, len(txs.items))
 	txIDMode := query.Mode &^ 256
-	for i, item := range items {
+	for i, item := range txs.items {
 		mode := txIDMode
 		if item.metadata != nil {
 			mode |= 256
@@ -613,7 +613,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 	return ton.BlockTransactions{
 		ID:             cloneBlockID(*query.ID),
 		ReqCount:       int32(query.Count),
-		Incomplete:     incomplete,
+		Incomplete:     txs.incomplete,
 		TransactionIds: ids,
 		Proof:          proof,
 	}
@@ -639,13 +639,13 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 		proofRoot = proofBuilder.Root()
 	}
 
-	items, incomplete, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
+	list, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
 	if err != nil {
 		return errorResponse(err, "cannot list block transactions")
 	}
 
-	txs := make([]*cell.Cell, len(items))
-	for i, item := range items {
+	txs := make([]*cell.Cell, len(list.items))
+	for i, item := range list.items {
 		txs[i] = item.cell
 	}
 
@@ -661,7 +661,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 	return ton.BlockTransactionsExt{
 		ID:           cloneBlockID(*query.ID),
 		ReqCount:     int32(query.Count),
-		Incomplete:   incomplete,
+		Incomplete:   list.incomplete,
 		Transactions: txs,
 		Proof:        proof,
 	}
@@ -796,16 +796,21 @@ type blockTxItem struct {
 	metadata *ton.TransactionMetadata
 }
 
-func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after *ton.TransactionID3) ([]blockTxItem, bool, error) {
+type blockTransactionList struct {
+	items      []blockTxItem
+	incomplete bool
+}
+
+func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after *ton.TransactionID3) (blockTransactionList, error) {
 	data, err := blockTransactionData(root, mode&256 != 0)
 	if err != nil {
-		return nil, false, err
+		return blockTransactionList{}, err
 	}
 	if reqCount == 0 {
-		return nil, true, nil
+		return blockTransactionList{incomplete: true}, nil
 	}
 	if data.shardAccounts.Accounts == nil || data.shardAccounts.Accounts.AugmentedDictionary == nil {
-		return nil, false, nil
+		return blockTransactionList{}, nil
 	}
 
 	reverse := mode&64 != 0
@@ -840,20 +845,20 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 			break
 		}
 		if err != nil {
-			return nil, false, fmt.Errorf("lookup account block: %w", err)
+			return blockTransactionList{}, fmt.Errorf("lookup account block: %w", err)
 		}
 
 		accountKeyLoader, err := accountKeyCell.BeginParse()
 		if err != nil {
-			return nil, false, fmt.Errorf("begin parse account key: %w", err)
+			return blockTransactionList{}, fmt.Errorf("begin parse account key: %w", err)
 		}
 		account, err := accountKeyLoader.LoadSlice(256)
 		if err != nil {
-			return nil, false, fmt.Errorf("load account key: %w", err)
+			return blockTransactionList{}, fmt.Errorf("load account key: %w", err)
 		}
 		accountBlock, err := accountBlockFromValue(accountValue)
 		if err != nil {
-			return nil, false, err
+			return blockTransactionList{}, err
 		}
 
 		txStart := startLT
@@ -877,20 +882,20 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 					break
 				}
 				if err != nil {
-					return nil, false, fmt.Errorf("lookup account transaction: %w", err)
+					return blockTransactionList{}, fmt.Errorf("lookup account transaction: %w", err)
 				}
 
 				txKeyLoader, err := txKeyCell.BeginParse()
 				if err != nil {
-					return nil, false, fmt.Errorf("begin parse transaction lt: %w", err)
+					return blockTransactionList{}, fmt.Errorf("begin parse transaction lt: %w", err)
 				}
 				lt, err := txKeyLoader.LoadUInt(64)
 				if err != nil {
-					return nil, false, fmt.Errorf("load transaction lt: %w", err)
+					return blockTransactionList{}, fmt.Errorf("load transaction lt: %w", err)
 				}
 				txCell, err := transactionCellFromValue(txValue)
 				if err != nil {
-					return nil, false, err
+					return blockTransactionList{}, err
 				}
 
 				item := blockTxItem{
@@ -902,7 +907,7 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 				if mode&256 != 0 && data.inMsgDescr != nil {
 					metadata, err := transactionMetadata(data.inMsgDescr, txCell)
 					if err != nil {
-						return nil, false, err
+						return blockTransactionList{}, err
 					}
 					item.metadata = metadata
 				}
@@ -915,7 +920,7 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 		allowSameAccount = false
 	}
 
-	return out, !eof, nil
+	return blockTransactionList{items: out, incomplete: !eof}, nil
 }
 
 type blockTransactionsData struct {

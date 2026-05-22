@@ -142,6 +142,11 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 	ctx, cancel := context.WithTimeout(parent, peerQueryTimeout)
 	defer cancel()
 
+	if !s.isActive() {
+		s.sendForgetPeer(ctx, peer)
+		return errors.New("shard is inactive")
+	}
+
 	resp, err := s.dispatchPeerQuery(ctx, peer, req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -160,6 +165,14 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		return nil
 	}
 	return err
+}
+
+func (s *overlaySubscription) sendForgetPeer(ctx context.Context, peer *overlayPeer) {
+	if peer == nil || peer.overlay == nil {
+		return
+	}
+	_ = peer.overlay.SendCustomMessage(ctx, ForgetPeer{})
+	s.removePeer(peer.id)
 }
 
 func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overlayPeer, req any) (tl.Serializable, error) {
@@ -455,6 +468,13 @@ func shardIsAncestor(shard int64, child int64) bool {
 func (s *overlaySubscription) serveNextKeyBlockIDs(ctx context.Context, block ton.BlockIDExt, maxSize int32) (tl.Serializable, error) {
 	if s.node.storage == nil || block.Workchain != -1 || block.Shard != topShard {
 		return KeyBlocks{Error: true}, nil
+	}
+
+	if block.SeqNo > 0 {
+		meta, err := s.node.storage.BlockMeta(ctx, block)
+		if err != nil || !meta.Has(tnstore.BlockMetaIsKeyBlock) {
+			return KeyBlocks{Error: true}, nil
+		}
 	}
 
 	limit := int(maxSize)

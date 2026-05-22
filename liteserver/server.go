@@ -29,6 +29,8 @@ const (
 )
 
 type Store interface {
+	// BlockData returns bytes that remain valid for the duration of the call
+	// chain. The liteserver treats the returned slice as read-only.
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error)
 	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
@@ -46,7 +48,16 @@ type MessageSender interface {
 }
 
 type QueryObserver interface {
-	ObserveLiteserverQuery(method string, duration time.Duration)
+	AddLiteserverInflight(delta int)
+	ObserveLiteserverQuery(QueryObservation)
+}
+
+type QueryObservation struct {
+	Method       string
+	Response     string
+	ErrorCode    int32
+	Duration     time.Duration
+	WaitDuration time.Duration
 }
 
 type Options struct {
@@ -275,9 +286,23 @@ func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.Serv
 		return client.Send(adnl.MessageAnswer{ID: id, Data: s.handleQueryData(ctx, data)})
 	}
 
+	if s.queryObserver != nil {
+		s.queryObserver.AddLiteserverInflight(1)
+		defer s.queryObserver.AddLiteserverInflight(-1)
+	}
+
 	resp, timing := s.handleQueryDataWithTiming(ctx, data)
 	if s.queryObserver != nil {
-		s.queryObserver.ObserveLiteserverQuery(timing.queryName(), timing.totalDuration())
+		observation := QueryObservation{
+			Method:       timing.queryName(),
+			Response:     liteserverTypeName(resp),
+			Duration:     timing.duration,
+			WaitDuration: timing.waitDuration,
+		}
+		if lsErr, ok := resp.(ton.LSError); ok {
+			observation.ErrorCode = lsErr.Code
+		}
+		s.queryObserver.ObserveLiteserverQuery(observation)
 	}
 	err := client.Send(adnl.MessageAnswer{ID: id, Data: resp})
 	if !event.Enabled() {

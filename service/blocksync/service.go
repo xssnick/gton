@@ -3,12 +3,14 @@ package blocksync
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
-	"fmt"
-	"sync"
-	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
@@ -59,15 +61,28 @@ func (b SyncedBlock) ackResult(accepted bool) {
 }
 
 type Service struct {
-	log               zerolog.Logger
-	source            Source
-	fetcher           Fetcher
-	out               chan SyncedBlock
-	shardDescriptions chan p2p.BroadcastEvent
-	retryCount        int
-	retryDelay        time.Duration
+	log                   zerolog.Logger
+	source                Source
+	fetcher               Fetcher
+	out                   chan SyncedBlock
+	shardDescriptions     chan p2p.BroadcastEvent
+	shardDescriptionDrops atomic.Uint64
+	retryCount            int
+	retryDelay            time.Duration
 
-	chains map[string]*chain
+	chainsMu sync.Mutex
+	chains   map[string]*chain
+}
+
+type StatusSnapshot struct {
+	OutputQueueItems              int
+	OutputQueueCapacity           int
+	ShardDescriptionQueueItems    int
+	ShardDescriptionQueueCapacity int
+	ShardDescriptionDropped       uint64
+	Chains                        int
+	BusyChains                    int
+	PendingChains                 int
 }
 
 type chain struct {
@@ -136,12 +151,42 @@ func (s *Service) ShardDescriptions() <-chan p2p.BroadcastEvent {
 	return s.shardDescriptions
 }
 
+func (s *Service) StatusSnapshot() StatusSnapshot {
+	if s == nil {
+		return StatusSnapshot{}
+	}
+
+	snapshot := StatusSnapshot{
+		OutputQueueItems:              len(s.out),
+		OutputQueueCapacity:           cap(s.out),
+		ShardDescriptionQueueItems:    len(s.shardDescriptions),
+		ShardDescriptionQueueCapacity: cap(s.shardDescriptions),
+		ShardDescriptionDropped:       s.shardDescriptionDrops.Load(),
+	}
+	s.chainsMu.Lock()
+	snapshot.Chains = len(s.chains)
+	for _, chain := range s.chains {
+		chain.mx.Lock()
+		if chain.busy {
+			snapshot.BusyChains++
+		}
+		if chain.current != nil || chain.future != nil {
+			snapshot.PendingChains++
+		}
+		chain.mx.Unlock()
+	}
+	s.chainsMu.Unlock()
+	return snapshot
+}
+
 func (s *Service) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	defer func() {
+		s.chainsMu.Lock()
 		for _, chain := range s.chains {
 			chain.close()
 		}
+		s.chainsMu.Unlock()
 		wg.Wait()
 		close(s.out)
 		close(s.shardDescriptions)
@@ -207,6 +252,7 @@ func (s *Service) emitShardDescriptionBroadcast(ev p2p.BroadcastEvent) bool {
 	select {
 	case s.shardDescriptions <- ev:
 	default:
+		s.shardDescriptionDrops.Add(1)
 		s.log.Debug().
 			Str("block", ev.BlockRef()).
 			Str("overlay", ev.Overlay).
@@ -221,6 +267,8 @@ func isMasterchainBlock(block ton.BlockIDExt) bool {
 
 func (s *Service) getOrCreateChain(ctx context.Context, wg *sync.WaitGroup, block ton.BlockIDExt) *chain {
 	key := chainKey(block)
+	s.chainsMu.Lock()
+	defer s.chainsMu.Unlock()
 	if chain := s.chains[key]; chain != nil {
 		return chain
 	}

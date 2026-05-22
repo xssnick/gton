@@ -1,16 +1,18 @@
 package pebblestore
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"github.com/xssnick/gton/internal/logutil"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -144,6 +146,9 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 	for i := range hashes {
 		byShard[int(hashes[i][0]>>5)] = append(byShard[int(hashes[i][0]>>5)], i)
 	}
+	for _, indexes := range byShard {
+		largeBOCSortRecordIndexes(indexes, hashes)
+	}
 
 	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
@@ -250,6 +255,12 @@ func largeBOCLoadRecordIndexes(ctx context.Context, db *pebble.DB, shardIdx int,
 		}
 	}
 	return nil
+}
+
+func largeBOCSortRecordIndexes(indexes []int, hashes []cell.Hash) {
+	sort.Slice(indexes, func(i, j int) bool {
+		return bytes.Compare(hashes[indexes[i]][:], hashes[indexes[j]][:]) < 0
+	})
 }
 
 func largeBOCPayloadWorkerArenas(shardCounts [cellDBShardCount]int, shardReadWorkers int) [cellDBShardCount][largeBOCMaxShardReadWorkers][]byte {

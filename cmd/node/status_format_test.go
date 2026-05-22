@@ -58,16 +58,28 @@ func TestFormatStatusReadableSections(t *testing.T) {
 				},
 			},
 		},
-		LocalMasterchain: &localMaster,
-		LocalBasechain:   &localBase,
-		LocalStateLoaded: true,
+		LocalMasterchain:      &localMaster,
+		LocalBasechain:        &localBase,
+		LocalStateLoaded:      true,
+		LocalMasterchainTx:    7,
+		LocalBasechainTx:      11,
+		LocalMasterchainHasTx: true,
+		LocalBasechainHasTx:   true,
+		RecentTPS: service2.StatusTPSSnapshot{
+			WindowMasters:   10,
+			Transactions:    1234,
+			DurationSeconds: 45,
+			TPS:             27.422,
+			Complete:        true,
+		},
 	}, false, time.Unix(1000, 0))
 
 	for _, want := range []string{
 		"Status\n\nNode\n",
 		"Chain Lag\n",
-		"masterchain  local=40 latest=42 lag_seconds=unknown",
-		"basechain    local=77 latest=77 lag_seconds=unknown",
+		"masterchain  local=40 latest=42 lag_seconds=unknown block_time=unknown tx=7",
+		"basechain    local=77 latest=77 lag_seconds=unknown block_time=unknown tx=11",
+		"tps          window_masters=10 tx=1234 duration=45s tps=27.42",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("formatted status missing %q:\n%s", want, out)
@@ -114,6 +126,48 @@ func TestFormatStatusReadableSections(t *testing.T) {
 		"  masterchain",
 		"    alive last ok        fail    score  addr",
 		"lag_seconds=10s",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("formatted status missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestFormatStatusListsSplitBasechainShards(t *testing.T) {
+	localMaster := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     100,
+	}
+	localLeft := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(0x4000000000000000),
+		SeqNo:     200,
+	}
+	localRight := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-0x4000000000000000),
+		SeqNo:     201,
+	}
+	latestLeft := localLeft
+	latestLeft.SeqNo = 202
+
+	out := formatStatusWithNow(service2.StatusSnapshot{
+		StatusSnapshot: p2p.StatusSnapshot{
+			LatestBasechain:       &latestLeft,
+			LatestBasechainShards: []ton.BlockIDExt{latestLeft},
+		},
+		LocalMasterchain: &localMaster,
+		LocalStateLoaded: true,
+		LocalBasechainShards: []service2.ShardStatusSnapshot{
+			{Block: localLeft, Utime: 990, Transactions: 21, HasTransactions: true},
+			{Block: localRight, Utime: 980, Transactions: 34, HasTransactions: true},
+		},
+	}, false, time.Unix(1000, 0))
+
+	for _, want := range []string{
+		"basechain/4000000000000000 local=200 latest=202 lag_seconds=10s block_time=1970-01-01T00:16:30Z tx=21",
+		"basechain/c000000000000000 local=201 latest=<none> lag_seconds=20s block_time=1970-01-01T00:16:20Z tx=34",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("formatted status missing %q:\n%s", want, out)

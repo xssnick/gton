@@ -484,12 +484,12 @@ func TestSaveStateCellTreeDeduplicatesSharedRefs(t *testing.T) {
 		if err = json.Unmarshal([]byte(line), &entry); err != nil {
 			t.Fatalf("parse log line %q: %v", line, err)
 		}
-		if entry.Message == "state cells persisted" {
+		if entry.Message == "state cells imported into celldb" {
 			final = entry
 		}
 	}
 	if final.Message == "" {
-		t.Fatal("missing final persistence log")
+		t.Fatal("missing final state cell import log")
 	}
 	if final.Processed != 2 {
 		t.Fatalf("processed duplicate shared ref: got=%d want=2", final.Processed)
@@ -522,17 +522,7 @@ func TestImportStateCellTreeFlushesCellsBeforeReturningLazyRoot(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
 
-	roots, parsedCells, err := cell.FromBOCMultiRootReader(bytes.NewReader(root.ToBOC()), cell.BOCParseOptions{})
-	if err != nil {
-		t.Fatalf("parse state boc: %v", err)
-	}
-	if len(roots) != 1 {
-		t.Fatalf("unexpected roots count: %d", len(roots))
-	}
-	root = roots[0]
-	rootHash = root.HashKey()
-
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, parsedCells, uint64(len(parsedCells)))
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, 0)
 	if err != nil {
 		t.Fatalf("import state cell tree: %v", err)
 	}
@@ -550,6 +540,203 @@ func TestImportStateCellTreeFlushesCellsBeforeReturningLazyRoot(t *testing.T) {
 	}
 	if got := cellMetrics.ingestCount; got != 0 {
 		t.Fatalf("state import unexpectedly used pebble ingest: got ingest count %d", got)
+	}
+}
+
+func TestImportStateBOCViewFromUntrustedBOC(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	shared := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
+	left := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(shared).EndCell()
+	right := cell.BeginCell().MustStoreUInt(0xcc, 8).MustStoreRef(shared).EndCell()
+	root := cell.BeginCell().
+		MustStoreUInt(0xdd, 8).
+		MustStoreRef(left).
+		MustStoreRef(right).
+		MustStoreRef(shared).
+		EndCell()
+	rootHash := root.HashKey()
+
+	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	view, err := cell.OpenBOCView(bytes.NewReader(boc), int64(len(boc)), cell.BOCViewOptions{
+		TrustedHashes: false,
+		RequireIndex:  true,
+		ValidateCRC:   true,
+	})
+	if err != nil {
+		t.Fatalf("open boc view: %v", err)
+	}
+
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     2,
+		RootHash:  bytes.Repeat([]byte{0x33}, 32),
+		FileHash:  bytes.Repeat([]byte{0x44}, 32),
+	}
+	lazyRoot, err := store.ImportStateBOCView(ctx, block, view)
+	if err != nil {
+		t.Fatalf("import boc view state cells: %v", err)
+	}
+	if lazyRoot.IsLazy() || lazyRoot.HashKey() != rootHash {
+		t.Fatalf("lazy root metadata mismatch")
+	}
+
+	assertResolvedCellTreeEqual(t, lazyRoot, root)
+	assertStateCellExists(t, store, root.HashKey(), true)
+	assertStateCellExists(t, store, left.HashKey(), true)
+	assertStateCellExists(t, store, right.HashKey(), true)
+	assertStateCellExists(t, store, shared.HashKey(), true)
+
+	if got := store.cells.metrics().flushCount; got == 0 {
+		t.Fatal("lazy state import did not flush cell db before returning lazy root")
+	}
+}
+
+func TestImportStateBOCViewPreservesPrunedLevels(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	hidden := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
+	pruned := testPrunedBranch(t, hidden)
+	if pruned.Level() == 0 {
+		t.Fatal("test pruned branch must have non-zero level")
+	}
+	branch := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(pruned).EndCell()
+	if branch.Level() == 0 {
+		t.Fatal("test branch must inherit non-zero level")
+	}
+	root := cell.BeginCell().MustStoreUInt(0xaa, 8).MustStoreRef(branch).EndCell()
+
+	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	view, err := cell.OpenBOCView(bytes.NewReader(boc), int64(len(boc)), cell.BOCViewOptions{
+		TrustedHashes: false,
+		RequireIndex:  true,
+		ValidateCRC:   true,
+	})
+	if err != nil {
+		t.Fatalf("open boc view: %v", err)
+	}
+
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     3,
+		RootHash:  bytes.Repeat([]byte{0x55}, 32),
+		FileHash:  bytes.Repeat([]byte{0x66}, 32),
+	}
+	lazyRoot, err := store.ImportStateBOCView(ctx, block, view)
+	if err != nil {
+		t.Fatalf("import boc view state cells with pruned branch: %v", err)
+	}
+
+	assertStateCellExists(t, store, root.HashKey(), true)
+	assertStateCellExists(t, store, branch.HashKey(), true)
+	assertStateCellExists(t, store, pruned.HashKey(), true)
+	if hidden.HashKey(0) != pruned.HashKey() {
+		assertStateCellExists(t, store, hidden.HashKey(0), false)
+	}
+
+	loadedBranch, err := lazyRoot.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load branch from imported lazy root: %v", err)
+	}
+	if loadedBranch.HashKey() != branch.HashKey() || loadedBranch.Level() != branch.Level() {
+		t.Fatalf("loaded branch metadata mismatch")
+	}
+	loadedBranchBody, err := loadedBranch.Prewarm()
+	if err != nil {
+		t.Fatalf("prewarm imported branch: %v", err)
+	}
+	loadedPruned, err := loadedBranchBody.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load pruned ref from imported branch: %v", err)
+	}
+	if loadedPruned.GetType() != cell.PrunedCellType {
+		t.Fatalf("loaded ref type = %d, want pruned", loadedPruned.GetType())
+	}
+	if loadedPruned.HashKey() != pruned.HashKey() || loadedPruned.Level() != pruned.Level() {
+		t.Fatalf("loaded pruned metadata mismatch")
+	}
+}
+
+func TestImportStateBOCViewPersistsIndexedBOC(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	hidden := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
+	pruned := testPrunedBranch(t, hidden)
+	shared := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
+	left := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(shared).EndCell()
+	root := cell.BeginCell().
+		MustStoreUInt(0xcc, 8).
+		MustStoreRef(left).
+		MustStoreRef(shared).
+		MustStoreRef(pruned).
+		EndCell()
+
+	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	view, err := cell.OpenBOCView(bytes.NewReader(boc), int64(len(boc)), cell.BOCViewOptions{
+		RequireIndex: true,
+		ValidateCRC:  true,
+	})
+	if err != nil {
+		t.Fatalf("open boc view: %v", err)
+	}
+
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     4,
+		RootHash:  bytes.Repeat([]byte{0x77}, 32),
+		FileHash:  bytes.Repeat([]byte{0x88}, 32),
+	}
+	lazyRoot, err := store.ImportStateBOCView(ctx, block, view)
+	if err != nil {
+		t.Fatalf("import boc view state cells: %v", err)
+	}
+	if lazyRoot.IsLazy() || lazyRoot.HashKey() != root.HashKey() {
+		t.Fatalf("lazy root metadata mismatch")
+	}
+
+	assertResolvedCellTreeEqual(t, lazyRoot, root)
+	assertStateCellExists(t, store, root.HashKey(), true)
+	assertStateCellExists(t, store, left.HashKey(), true)
+	assertStateCellExists(t, store, shared.HashKey(), true)
+	assertStateCellExists(t, store, pruned.HashKey(), true)
+	if hidden.HashKey(0) != pruned.HashKey() {
+		assertStateCellExists(t, store, hidden.HashKey(0), false)
 	}
 }
 
@@ -572,7 +759,7 @@ func TestLoadStateCellTreeRequiresCommittedStateMeta(t *testing.T) {
 	rootHash := root.HashKey(0)
 	cellHash := root.HashKey()
 
-	if _, err = store.ImportStateCellTree(ctx, block, root, nil, 1); err != nil {
+	if _, err = store.ImportStateCellTree(ctx, block, root, 1); err != nil {
 		t.Fatalf("import state cell tree: %v", err)
 	}
 	if _, err = store.LoadStateCellTree(ctx, block, rootHash[:]); !errors.Is(err, storage.ErrNotFound) {
@@ -1245,7 +1432,7 @@ func TestSaveStateCellTreeStoresPrunedRefAsRawCell(t *testing.T) {
 	hidden := cell.BeginCell().MustStoreUInt(0x77, 8).EndCell()
 	pruned := testPrunedBranch(t, hidden)
 	root := cell.BeginCell().MustStoreUInt(0x44, 8).MustStoreRef(pruned).EndCell()
-	persisted, err := store.saveStateCellTree(ctx, stateCellTreeSave{
+	stats, err := store.saveStateCellTree(ctx, stateCellTreeSave{
 		block:      block,
 		root:       root,
 		totalCells: 2,
@@ -1253,7 +1440,7 @@ func TestSaveStateCellTreeStoresPrunedRefAsRawCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save state tree with raw pruned ref: %v", err)
 	}
-	if !persisted {
+	if !stats.applied {
 		t.Fatal("expected state cells to be persisted")
 	}
 
@@ -1352,7 +1539,7 @@ func TestPreparedMerkleUpdateCellsMatchApplyMerkleUpdate(t *testing.T) {
 		MustStoreRef(stableLeaf).
 		EndCell()
 
-	lazyFromRoot, err := store.ImportStateCellTree(ctx, block, fromRoot, nil, 4)
+	lazyFromRoot, err := store.ImportStateCellTree(ctx, block, fromRoot, 4)
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
@@ -1484,7 +1671,7 @@ func TestApplyMerkleUpdateCheckpointKeepsIntermediateCells(t *testing.T) {
 		MustStoreRef(oldBranch).
 		MustStoreRef(stableLeaf).
 		EndCell()
-	lazyFromRoot, err := store.ImportStateCellTree(ctx, block, fromRoot, nil, 4)
+	lazyFromRoot, err := store.ImportStateCellTree(ctx, block, fromRoot, 4)
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
@@ -1754,7 +1941,7 @@ func TestSwitchCellGenerationAtomicallyPublishesCandidateState(t *testing.T) {
 		t.Fatalf("begin generation: %v", err)
 	}
 	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
-	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, nil, 1)
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, 1)
 	if err != nil {
 		t.Fatalf("import candidate state: %v", err)
 	}
@@ -1774,7 +1961,7 @@ func TestSwitchCellGenerationAtomicallyPublishesCandidateState(t *testing.T) {
 		SeqNo:     15,
 	}
 	historicalRoot := cell.BeginCell().MustStoreUInt(0x15, 8).EndCell()
-	lazyHistoricalRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, historicalBlock, historicalRoot, nil, 1)
+	lazyHistoricalRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, historicalBlock, historicalRoot, 1)
 	if err != nil {
 		t.Fatalf("import candidate historical state: %v", err)
 	}
@@ -1912,7 +2099,7 @@ func TestPendingCellGenerationMigrationSurvivesRestart(t *testing.T) {
 	}
 
 	root := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
-	if _, err = store.ImportStateCellTreeInGeneration(ctx, generation, origin, root, nil, 1); err != nil {
+	if _, err = store.ImportStateCellTreeInGeneration(ctx, generation, origin, root, 1); err != nil {
 		t.Fatalf("import into reopened pending generation: %v", err)
 	}
 
@@ -1957,7 +2144,7 @@ func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 		t.Fatalf("begin generation: %v", err)
 	}
 	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
-	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, nil, 1)
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, 1)
 	if err != nil {
 		t.Fatalf("import candidate state: %v", err)
 	}
@@ -2100,7 +2287,7 @@ func TestOpenReconcilesRetiredCellGenerationCleanup(t *testing.T) {
 		t.Fatalf("begin generation: %v", err)
 	}
 	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
-	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, nil, 1)
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, newRoot, 1)
 	if err != nil {
 		t.Fatalf("import candidate state: %v", err)
 	}
@@ -2204,7 +2391,7 @@ func TestActiveLazyRootSurvivesPreviousGenerationDeleteWhenCellExistsInNewGenera
 	if err != nil {
 		t.Fatalf("begin generation: %v", err)
 	}
-	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, root, nil, 2)
+	lazyRoot, err := store.ImportStateCellTreeInGeneration(ctx, generation, newBlock, root, 2)
 	if err != nil {
 		t.Fatalf("import candidate state: %v", err)
 	}
@@ -2355,7 +2542,7 @@ func TestSaveStateCellTreeStoresConcretePrunedParentByRawHash(t *testing.T) {
 	}
 }
 
-func TestSaveParsedStateCellsBatchStoresRawPrunedCell(t *testing.T) {
+func TestImportStateCellTreeStoresRawPrunedCell(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2372,9 +2559,9 @@ func TestSaveParsedStateCellsBatchStoresRawPrunedCell(t *testing.T) {
 	hidden := cell.BeginCell().MustStoreUInt(0x88, 8).EndCell()
 	pruned := testPrunedBranch(t, hidden)
 	root := cell.BeginCell().MustStoreUInt(0x55, 8).MustStoreRef(pruned).EndCell()
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, []cell.Cell{*root, *pruned}, 2)
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, root, 2)
 	if err != nil {
-		t.Fatalf("import parsed state cells: %v", err)
+		t.Fatalf("import lazy state cells: %v", err)
 	}
 
 	assertStateCellExists(t, store, root.HashKey(), true)
@@ -2385,7 +2572,7 @@ func TestSaveParsedStateCellsBatchStoresRawPrunedCell(t *testing.T) {
 
 	loadedRef, err := lazyRoot.PeekRef(0)
 	if err != nil {
-		t.Fatalf("load parsed raw pruned ref: %v", err)
+		t.Fatalf("load raw pruned ref: %v", err)
 	}
 	if loadedRef.GetType() != cell.PrunedCellType {
 		t.Fatalf("loaded ref type = %d, want pruned", loadedRef.GetType())
@@ -2436,7 +2623,7 @@ func TestSaveStateCellTreeDoesNotValidateMissingLazyBoundary(t *testing.T) {
 
 	oldLeaf := cell.BeginCell().MustStoreUInt(0x44, 8).EndCell()
 	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(oldLeaf).EndCell()
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 3)
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), 3)
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
@@ -2511,7 +2698,7 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 
 	oldLeaf := cell.BeginCell().MustStoreUInt(0x44, 8).EndCell()
 	oldRight := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(oldLeaf).EndCell()
-	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), nil, 3)
+	lazyRoot, err := store.ImportStateCellTree(ctx, block, cell.BeginCell().MustStoreRef(oldRight).EndCell(), 3)
 	if err != nil {
 		t.Fatalf("import old state: %v", err)
 	}
@@ -2572,7 +2759,7 @@ func TestSaveStateCellTreeSkipsExistingLazyRootWithoutLoading(t *testing.T) {
 
 	leaf := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(leaf).EndCell()
-	if _, err := store.ImportStateCellTree(ctx, block, root, nil, 2); err != nil {
+	if _, err := store.ImportStateCellTree(ctx, block, root, 2); err != nil {
 		t.Fatalf("import state: %v", err)
 	}
 
@@ -2596,6 +2783,42 @@ func TestSaveStateCellTreeSkipsExistingLazyRootWithoutLoading(t *testing.T) {
 		totalCells: 1,
 	}); err != nil {
 		t.Fatalf("save existing lazy root: %v", err)
+	}
+}
+
+func TestImportStateCellTreeSkipsExistingLazyBoundaryWithoutLoading(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     1,
+	}
+
+	leaf := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(leaf).EndCell()
+	if _, err := store.ImportStateCellTree(ctx, block, root, 2); err != nil {
+		t.Fatalf("import state: %v", err)
+	}
+
+	record, err := store.CellRecord(ctx, root.Hash())
+	if err != nil {
+		t.Fatalf("load root cell record: %v", err)
+	}
+	lazyRoot, err := storage.LazyCellRecord(record, rejectingLazyLoader)
+	if err != nil {
+		t.Fatalf("create lazy root: %v", err)
+	}
+
+	nextBlock := block
+	nextBlock.SeqNo = 2
+	if _, err = store.ImportStateCellTree(ctx, nextBlock, lazyRoot, 1); err != nil {
+		t.Fatalf("import existing lazy root: %v", err)
 	}
 }
 

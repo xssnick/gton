@@ -4,14 +4,17 @@ import (
 	"sort"
 	"time"
 
+	storage2 "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 type StatusSnapshot struct {
-	ListenAddr        string
-	LatestMasterchain *ton.BlockIDExt
-	LatestBasechain   *ton.BlockIDExt
-	Overlays          []OverlayStatusSnapshot
+	ListenAddr            string
+	LatestMasterchain     *ton.BlockIDExt
+	LatestBasechain       *ton.BlockIDExt
+	LatestBasechainShards []ton.BlockIDExt
+	Overlays              []OverlayStatusSnapshot
+	Queues                []QueueStatusSnapshot
 }
 
 type OverlayStatusSnapshot struct {
@@ -32,6 +35,16 @@ type NeighbourStatusSnapshot struct {
 	Unreliability float64
 }
 
+type QueueStatusSnapshot struct {
+	Name     string
+	Items    int
+	Bytes    int64
+	MaxItems int
+	MaxBytes int64
+	Pushed   uint64
+	Dropped  uint64
+}
+
 func (n *Node) StatusSnapshot() StatusSnapshot {
 	subscriptions := n.subscriptionsSnapshot()
 	snapshot := StatusSnapshot{
@@ -48,7 +61,19 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 		block := *n.latestBasechain
 		snapshot.LatestBasechain = &block
 	}
+	for _, block := range n.latestBasechainShards {
+		snapshot.LatestBasechainShards = append(snapshot.LatestBasechainShards, block)
+	}
 	n.latestBlocksMx.RUnlock()
+
+	sort.Slice(snapshot.LatestBasechainShards, func(i, j int) bool {
+		left := storage2.ShardKeyFromBlock(snapshot.LatestBasechainShards[i])
+		right := storage2.ShardKeyFromBlock(snapshot.LatestBasechainShards[j])
+		if left.Workchain != right.Workchain {
+			return left.Workchain < right.Workchain
+		}
+		return uint64(left.Shard) < uint64(right.Shard)
+	})
 
 	for _, sub := range subscriptions {
 		snapshot.Overlays = append(snapshot.Overlays, sub.statusSnapshot())
@@ -56,8 +81,23 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	sort.SliceStable(snapshot.Overlays, func(i, j int) bool {
 		return snapshot.Overlays[i].Name < snapshot.Overlays[j].Name
 	})
+	snapshot.Queues = n.queueStatusSnapshot()
 
 	return snapshot
+}
+
+func (n *Node) queueStatusSnapshot() []QueueStatusSnapshot {
+	queues := make([]QueueStatusSnapshot, 0, 3)
+	if n.eventQueue != nil {
+		queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
+	}
+	if n.rebroadcastQueue != nil {
+		queues = append(queues, n.rebroadcastQueue.StatusSnapshot("rebroadcast"))
+	}
+	if n.localRebroadcastQueue != nil {
+		queues = append(queues, n.localRebroadcastQueue.StatusSnapshot("local_rebroadcast"))
+	}
+	return queues
 }
 
 func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {

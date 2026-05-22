@@ -2,6 +2,7 @@ package liteserver
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"errors"
 	"sort"
@@ -35,6 +36,7 @@ type LiveStore struct {
 	mu               sync.RWMutex
 	current          *storage.CurrentState
 	pendingCurrent   *storage.CurrentState
+	masterchainInfo  liveMasterchainInfo
 	readyMasterSeqno uint32
 	notify           chan struct{}
 	blocks           map[string]*liveBlock
@@ -44,10 +46,14 @@ type LiveStore struct {
 	ltIndex          map[liveHistoryKey][]liveLTIndexEntry
 	unixIndex        map[liveHistoryKey][]liveUnixIndexEntry
 	flushed          map[string]struct{}
-	masterOrder      []string
-	shardOrder       []string
+	masterOrder      liveBlockOrder
+	shardOrder       liveBlockOrder
+	masterFlushed    int
+	shardFlushed     int
 	masterCacheSize  int
 	shardCacheSize   int
+	blockLoad        liveBlockLoadGroup
+	fragmentLoad     liveBlockLoadGroup
 }
 
 type liveBlock struct {
@@ -56,6 +62,61 @@ type liveBlock struct {
 	data    []byte
 	meta    *storage.BlockMeta
 	flushed bool
+
+	fragments *liveBlockFragments
+}
+
+type liveMasterchainInfo struct {
+	block         ton.BlockIDExt
+	stateRootHash []byte
+	lastUTime     uint32
+	valid         bool
+}
+
+type liveBlockOrder struct {
+	items *list.List
+	index map[string]*list.Element
+}
+
+func newLiveBlockOrder() liveBlockOrder {
+	return liveBlockOrder{
+		items: list.New(),
+		index: map[string]*list.Element{},
+	}
+}
+
+func (o *liveBlockOrder) ensure() {
+	if o.items == nil {
+		o.items = list.New()
+	}
+	if o.index == nil {
+		o.index = map[string]*list.Element{}
+	}
+}
+
+func (o *liveBlockOrder) pushBack(key string) {
+	o.ensure()
+	if elem := o.index[key]; elem != nil {
+		o.items.MoveToBack(elem)
+		return
+	}
+	o.index[key] = o.items.PushBack(key)
+}
+
+func (o *liveBlockOrder) remove(key string) bool {
+	o.ensure()
+	elem := o.index[key]
+	if elem == nil {
+		return false
+	}
+	o.items.Remove(elem)
+	delete(o.index, key)
+	return true
+}
+
+func (o *liveBlockOrder) front() *list.Element {
+	o.ensure()
+	return o.items.Front()
 }
 
 func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
@@ -77,6 +138,8 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 		ltIndex:         map[liveHistoryKey][]liveLTIndexEntry{},
 		unixIndex:       map[liveHistoryKey][]liveUnixIndexEntry{},
 		flushed:         map[string]struct{}{},
+		masterOrder:     newLiveBlockOrder(),
+		shardOrder:      newLiveBlockOrder(),
 		masterCacheSize: cfg.MasterBlockCache,
 		shardCacheSize:  cfg.ShardBlockCache,
 	}
@@ -117,6 +180,29 @@ func (s *LiveStore) CurrentState(ctx context.Context) (*storage.CurrentState, er
 		return nil, err
 	}
 	return current, nil
+}
+
+func (s *LiveStore) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error) {
+	s.mu.RLock()
+	info := s.masterchainInfo
+	s.mu.RUnlock()
+	if info.valid {
+		return info.block, info.stateRootHash, info.lastUTime, nil
+	}
+	if s.Store == nil {
+		return ton.BlockIDExt{}, nil, 0, storage.ErrNotFound
+	}
+
+	current, err := s.CurrentState(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, nil, 0, err
+	}
+
+	block, stateRootHash, lastUTime, err := currentMasterchainInfo(ctx, s, current)
+	if err != nil {
+		return ton.BlockIDExt{}, nil, 0, err
+	}
+	return block, stateRootHash, lastUTime, nil
 }
 
 func (s *LiveStore) SetLiveBlock(block ton.BlockIDExt, root *cell.Cell, data []byte, flushed bool) error {
@@ -171,7 +257,10 @@ func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 
 	s.mu.Lock()
 	if cached := s.blocks[key]; cached != nil {
-		cached.flushed = true
+		if !cached.flushed {
+			cached.flushed = true
+			s.adjustLiveFlushedLocked(liveBlockKind(block), 1)
+		}
 		published := s.publishPendingCurrentLocked()
 		s.trimBlocksLocked(liveBlockKind(block))
 		ready := s.updateReadyMasterSeqnoLocked()
@@ -274,19 +363,11 @@ func (s *LiveStore) BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.
 		return nil, storage.ErrNotFound
 	}
 
-	data, err := s.Store.BlockData(ctx, block)
+	loaded, err := s.loadStoredBlock(ctx, block)
 	if err != nil {
 		return nil, err
 	}
-
-	root, err := parseTrustedBlockBOC(block, data)
-	if err != nil {
-		return nil, err
-	}
-	if err = s.SetLiveBlock(block, root, data, true); err != nil {
-		return nil, err
-	}
-	return root, nil
+	return loaded.root, nil
 }
 
 func (s *LiveStore) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
@@ -297,19 +378,93 @@ func (s *LiveStore) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte
 		return nil, storage.ErrNotFound
 	}
 
-	data, err := s.Store.BlockData(ctx, block)
+	loaded, err := s.loadStoredBlock(ctx, block)
 	if err != nil {
 		return nil, err
+	}
+	return append([]byte(nil), loaded.data...), nil
+}
+
+func (s *LiveStore) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error) {
+	if fragments := s.cachedBlockFragments(block); fragments != nil {
+		return fragments, nil
+	}
+	if s.Store == nil {
+		return nil, storage.ErrNotFound
 	}
 
-	root, err := parseTrustedBlockBOC(block, data)
-	if err == nil {
-		err = s.SetLiveBlock(block, root, data, true)
-	}
+	value, err := s.fragmentLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+		if fragments := s.cachedBlockFragments(block); fragments != nil {
+			return fragments, nil
+		}
+
+		blockRoot, err := s.BlockRoot(ctx, block)
+		if err != nil {
+			return nil, err
+		}
+
+		stateRootHash, err := stateRootHashFromBlock(block, blockRoot)
+		if err != nil {
+			return nil, err
+		}
+
+		stateRoot, err := s.LoadStateCellTree(ctx, block, stateRootHash)
+		if err != nil {
+			return nil, err
+		}
+
+		fragments, err := buildLiveBlockFragments(block, blockRoot, stateRoot)
+		if err != nil {
+			return nil, err
+		}
+		return s.rememberBlockFragments(block, fragments), nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte(nil), data...), nil
+	fragments, ok := value.(*liveBlockFragments)
+	if !ok {
+		return nil, errors.New("invalid live block fragments")
+	}
+	return fragments, nil
+}
+
+func (s *LiveStore) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liveBlockLoadResult, error) {
+	value, err := s.blockLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+		if data, ok := s.cachedBlockData(block); ok {
+			root := s.cachedBlockRoot(block)
+			if root == nil {
+				parsed, err := parseTrustedBlockBOC(block, data)
+				if err != nil {
+					return nil, err
+				}
+				root = parsed
+			}
+			return &liveBlockLoadResult{root: root, data: data}, nil
+		}
+
+		data, err := s.Store.BlockData(ctx, block)
+		if err != nil {
+			return nil, err
+		}
+
+		root, err := parseTrustedBlockBOC(block, data)
+		if err != nil {
+			return nil, err
+		}
+		if err = s.SetLiveBlock(block, root, data, true); err != nil {
+			return nil, err
+		}
+		return &liveBlockLoadResult{root: root, data: data}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	loaded, ok := value.(*liveBlockLoadResult)
+	if !ok {
+		return nil, errors.New("invalid live block load result")
+	}
+	return loaded, nil
 }
 
 func (s *LiveStore) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
@@ -378,7 +533,41 @@ func (s *LiveStore) publishPendingCurrentLocked() bool {
 	s.current = storage.CloneCurrentState(s.pendingCurrent)
 	s.pendingCurrent = nil
 	s.rememberCurrentBlockStatesLocked(s.current)
+	s.updateMasterchainInfoLocked(s.current)
 	return nextSeqno > prevSeqno
+}
+
+func (s *LiveStore) updateMasterchainInfoLocked(current *storage.CurrentState) {
+	s.masterchainInfo = liveMasterchainInfo{}
+	if current == nil {
+		return
+	}
+
+	block := current.Masterchain.Block
+	stateRootHash := bytes.Clone(current.Masterchain.StateRootHash)
+	lastUTime := uint32(0)
+	if current.Masterchain.Parsed != nil {
+		lastUTime = current.Masterchain.Parsed.GenUTime
+	}
+
+	if meta := s.metas[storage.BlockKey(block)]; meta != nil {
+		if len(stateRootHash) == 0 {
+			stateRootHash = bytes.Clone(meta.StateRootHash)
+		}
+		if lastUTime == 0 {
+			lastUTime = meta.GenUTime
+		}
+	}
+	if len(stateRootHash) != 32 {
+		return
+	}
+
+	s.masterchainInfo = liveMasterchainInfo{
+		block:         *cloneBlockID(block),
+		stateRootHash: stateRootHash,
+		lastUTime:     lastUTime,
+		valid:         true,
+	}
 }
 
 func (s *LiveStore) currentStateShardsReadyLocked(current *storage.CurrentState) bool {
@@ -541,63 +730,95 @@ func (s *LiveStore) cachedBlockData(block ton.BlockIDExt) ([]byte, bool) {
 	return nil, false
 }
 
+func (s *LiveStore) cachedBlockFragments(block ton.BlockIDExt) *liveBlockFragments {
+	key := storage.BlockKey(block)
+
+	s.mu.RLock()
+	cached := s.blocks[key]
+	s.mu.RUnlock()
+	if cached == nil {
+		return nil
+	}
+	return cached.fragments
+}
+
+func (s *LiveStore) rememberBlockFragments(block ton.BlockIDExt, fragments *liveBlockFragments) *liveBlockFragments {
+	key := storage.BlockKey(block)
+
+	s.mu.Lock()
+	cached := s.blocks[key]
+	if cached == nil {
+		s.mu.Unlock()
+		return fragments
+	}
+	if cached.fragments != nil {
+		fragments = cached.fragments
+	} else {
+		cached.fragments = fragments
+	}
+	s.mu.Unlock()
+	return fragments
+}
+
 func (s *LiveStore) putBlockLocked(key string, block *liveBlock) {
 	if existing := s.blocks[key]; existing != nil {
 		if existing.flushed && (len(existing.data) > 0 || len(block.data) == 0) {
 			block.flushed = true
 		}
-		s.removeBlockOrderLocked(key, liveBlockKind(existing.id))
+		if block.fragments == nil {
+			block.fragments = existing.fragments
+		}
+		existingKind := liveBlockKind(existing.id)
+		s.removeBlockOrderLocked(key, existingKind)
+		if existing.flushed {
+			s.adjustLiveFlushedLocked(existingKind, -1)
+		}
 	}
 
 	s.blocks[key] = block
 	s.refreshBlockIndexLocked(block.id)
-	if liveBlockKind(block.id) == liveBlockMaster {
-		s.masterOrder = append(s.masterOrder, key)
-		return
+	kind := liveBlockKind(block.id)
+	s.blockOrderLocked(kind).pushBack(key)
+	if block.flushed {
+		s.adjustLiveFlushedLocked(kind, 1)
 	}
-	s.shardOrder = append(s.shardOrder, key)
 }
 
 func (s *LiveStore) trimBlocksLocked(kind liveBlockCacheKind) {
 	limit := s.shardCacheSize
-	order := &s.shardOrder
 	if kind == liveBlockMaster {
 		limit = s.masterCacheSize
-		order = &s.masterOrder
 	}
 	if limit < 0 {
 		return
 	}
 
-	flushed := 0
-	for _, key := range *order {
-		if cached := s.blocks[key]; cached != nil && cached.flushed {
-			flushed++
-		}
-	}
-
+	flushed := s.liveFlushedCountLocked(kind)
 	if flushed <= limit {
 		return
 	}
 
-	remove := flushed - limit
-	next := (*order)[:0]
-	for _, key := range *order {
+	protected := s.protectedLiveBlocksLocked()
+	order := s.blockOrderLocked(kind)
+	for elem := order.front(); elem != nil && flushed > limit; {
+		next := elem.Next()
+		key := elem.Value.(string)
 		cached := s.blocks[key]
 		if cached == nil {
+			order.remove(key)
+			elem = next
 			continue
 		}
 
-		if remove > 0 && cached.flushed && !s.currentRefersToBlockLocked(cached.id) {
-			delete(s.blocks, key)
-			s.removeBlockStateLocked(cached.id)
-			remove--
-			continue
+		if cached.flushed {
+			if _, ok := protected[key]; !ok {
+				s.deleteLiveBlockLocked(key, cached, kind)
+				flushed--
+			}
 		}
 
-		next = append(next, key)
+		elem = next
 	}
-	*order = next
 }
 
 func (s *LiveStore) rememberBlockStateLocked(state storage.BlockState) {
@@ -670,13 +891,17 @@ func (s *LiveStore) addMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 			block:   *cloneBlockID(meta.ID),
 		}
 		entries := s.ltIndex[key]
-		idx := sort.Search(len(entries), func(i int) bool {
-			return entries[i].endLT > entry.endLT || entries[i].endLT == entry.endLT && entries[i].seqno >= entry.seqno
-		})
-		entries = append(entries, liveLTIndexEntry{})
-		copy(entries[idx+1:], entries[idx:])
-		entries[idx] = entry
-		s.ltIndex[key] = entries
+		if len(entries) == 0 || entries[len(entries)-1].endLT < entry.endLT || entries[len(entries)-1].endLT == entry.endLT && entries[len(entries)-1].seqno < entry.seqno {
+			s.ltIndex[key] = append(entries, entry)
+		} else {
+			idx := sort.Search(len(entries), func(i int) bool {
+				return entries[i].endLT > entry.endLT || entries[i].endLT == entry.endLT && entries[i].seqno >= entry.seqno
+			})
+			entries = append(entries, liveLTIndexEntry{})
+			copy(entries[idx+1:], entries[idx:])
+			entries[idx] = entry
+			s.ltIndex[key] = entries
+		}
 	}
 
 	if meta.GenUTime != 0 {
@@ -686,13 +911,17 @@ func (s *LiveStore) addMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 			block:    *cloneBlockID(meta.ID),
 		}
 		entries := s.unixIndex[key]
-		idx := sort.Search(len(entries), func(i int) bool {
-			return entries[i].genUTime > entry.genUTime || entries[i].genUTime == entry.genUTime && entries[i].seqno >= entry.seqno
-		})
-		entries = append(entries, liveUnixIndexEntry{})
-		copy(entries[idx+1:], entries[idx:])
-		entries[idx] = entry
-		s.unixIndex[key] = entries
+		if len(entries) == 0 || entries[len(entries)-1].genUTime < entry.genUTime || entries[len(entries)-1].genUTime == entry.genUTime && entries[len(entries)-1].seqno < entry.seqno {
+			s.unixIndex[key] = append(entries, entry)
+		} else {
+			idx := sort.Search(len(entries), func(i int) bool {
+				return entries[i].genUTime > entry.genUTime || entries[i].genUTime == entry.genUTime && entries[i].seqno >= entry.seqno
+			})
+			entries = append(entries, liveUnixIndexEntry{})
+			copy(entries[idx+1:], entries[idx:])
+			entries[idx] = entry
+			s.unixIndex[key] = entries
+		}
 	}
 }
 
@@ -730,15 +959,62 @@ func (s *LiveStore) removeMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 }
 
 func (s *LiveStore) removeBlockOrderLocked(key string, kind liveBlockCacheKind) {
+	s.blockOrderLocked(kind).remove(key)
+}
+
+func (s *LiveStore) blockOrderLocked(kind liveBlockCacheKind) *liveBlockOrder {
 	order := &s.shardOrder
 	if kind == liveBlockMaster {
 		order = &s.masterOrder
 	}
-	for i, existing := range *order {
-		if existing == key {
-			*order = append((*order)[:i], (*order)[i+1:]...)
-			return
+	return order
+}
+
+func (s *LiveStore) liveFlushedCountLocked(kind liveBlockCacheKind) int {
+	if kind == liveBlockMaster {
+		return s.masterFlushed
+	}
+	return s.shardFlushed
+}
+
+func (s *LiveStore) adjustLiveFlushedLocked(kind liveBlockCacheKind, delta int) {
+	if kind == liveBlockMaster {
+		s.masterFlushed += delta
+		if s.masterFlushed < 0 {
+			s.masterFlushed = 0
 		}
+		return
+	}
+
+	s.shardFlushed += delta
+	if s.shardFlushed < 0 {
+		s.shardFlushed = 0
+	}
+}
+
+func (s *LiveStore) deleteLiveBlockLocked(key string, cached *liveBlock, kind liveBlockCacheKind) {
+	delete(s.blocks, key)
+	s.removeBlockOrderLocked(key, kind)
+	if cached.flushed {
+		s.adjustLiveFlushedLocked(kind, -1)
+	}
+	s.removeBlockStateLocked(cached.id)
+}
+
+func (s *LiveStore) protectedLiveBlocksLocked() map[string]struct{} {
+	protected := make(map[string]struct{})
+	addCurrentLiveBlocks(protected, s.current)
+	addCurrentLiveBlocks(protected, s.pendingCurrent)
+	return protected
+}
+
+func addCurrentLiveBlocks(protected map[string]struct{}, current *storage.CurrentState) {
+	if current == nil {
+		return
+	}
+	protected[storage.BlockKey(current.Masterchain.Block)] = struct{}{}
+	for _, shard := range current.Shards {
+		protected[storage.BlockKey(shard.Block)] = struct{}{}
 	}
 }
 

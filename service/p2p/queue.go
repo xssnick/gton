@@ -11,6 +11,8 @@ type boundedQueue[T any] struct {
 	bytes    int64
 	maxItems int
 	maxBytes int64
+	pushed   uint64
+	dropped  uint64
 	size     func(T) int64
 	notify   chan struct{}
 	closeCh  chan struct{}
@@ -37,19 +39,23 @@ func (q *boundedQueue[T]) Push(item T) bool {
 	defer q.mu.Unlock()
 
 	if q.closed {
+		q.dropped++
 		return false
 	}
 	if q.maxItems > 0 && len(q.items) >= q.maxItems {
+		q.dropped++
 		return false
 	}
 
 	itemBytes := q.itemBytes(item)
 	if q.maxBytes > 0 && (itemBytes > q.maxBytes || q.bytes > q.maxBytes-itemBytes) {
+		q.dropped++
 		return false
 	}
 
 	q.items = append(q.items, queuedItem[T]{value: item, bytes: itemBytes})
 	q.bytes += itemBytes
+	q.pushed++
 	if len(q.items) == 1 {
 		select {
 		case q.notify <- struct{}{}:
@@ -119,6 +125,21 @@ func (q *boundedQueue[T]) popLocked() (T, bool) {
 		}
 	}
 	return item.value, true
+}
+
+func (q *boundedQueue[T]) StatusSnapshot(name string) QueueStatusSnapshot {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return QueueStatusSnapshot{
+		Name:     name,
+		Items:    len(q.items),
+		Bytes:    q.bytes,
+		MaxItems: q.maxItems,
+		MaxBytes: q.maxBytes,
+		Pushed:   q.pushed,
+		Dropped:  q.dropped,
+	}
 }
 
 func (q *boundedQueue[T]) itemBytes(item T) int64 {

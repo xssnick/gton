@@ -12,6 +12,7 @@ import (
 
 type acceptedBroadcast struct {
 	fingerprint     string
+	deduped         bool
 	event           *BroadcastEvent
 	masterchainWake *ton.BlockIDExt
 	rebroadcast     *rebroadcastRequest
@@ -39,6 +40,10 @@ func rebroadcastRequestBytes(req rebroadcastRequest) int64 {
 }
 
 func (s *overlaySubscription) handleOverlayBroadcast(peer *overlayPeer, msg any, delivery Delivery, trusted bool, sourceKey string) error {
+	if !s.isActive() {
+		return nil
+	}
+
 	if peer != nil {
 		peer.noteReceive()
 	}
@@ -139,6 +144,10 @@ func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, de
 }
 
 func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string, msg any) *acceptedBroadcast {
+	if !s.node.deduper.Mark(fingerprint, time.Now()) {
+		return nil
+	}
+
 	downloaded, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
 	if err != nil {
 		s.log.Debug().
@@ -150,6 +159,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			wake := block
 			return &acceptedBroadcast{
 				fingerprint:     fingerprint,
+				deduped:         true,
 				masterchainWake: &wake,
 			}
 		}
@@ -157,6 +167,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	}
 
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourceKey)
+	accepted.deduped = true
 	accepted.event.Downloaded = downloaded
 	return accepted
 }
@@ -165,7 +176,7 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 	if accepted.fingerprint == "" {
 		return
 	}
-	if !n.deduper.Mark(accepted.fingerprint, time.Now()) {
+	if !accepted.deduped && !n.deduper.Mark(accepted.fingerprint, time.Now()) {
 		return
 	}
 

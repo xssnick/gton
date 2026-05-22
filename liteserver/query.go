@@ -138,7 +138,7 @@ func (s *Server) handleBlockData(ctx context.Context, id *ton.BlockIDExt) tl.Ser
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*id))
 	}
 
-	return ton.BlockData{ID: cloneBlockID(*id), Payload: append([]byte(nil), data...)}
+	return ton.BlockData{ID: cloneBlockID(*id), Payload: data}
 }
 
 func (s *Server) handleBlockHeader(ctx context.Context, id *ton.BlockIDExt, mode uint32) tl.Serializable {
@@ -179,9 +179,36 @@ func (s *Server) handleAccountState(ctx context.Context, id *ton.BlockIDExt, acc
 }
 
 func (s *Server) masterchainInfoWithUTime(ctx context.Context) (ton.MasterchainInfo, uint32, error) {
+	if cached, ok := s.store.(interface {
+		CurrentMasterchainInfo(context.Context) (ton.BlockIDExt, []byte, uint32, error)
+	}); ok {
+		block, stateRoot, lastUTime, err := cached.CurrentMasterchainInfo(ctx)
+		if err == nil {
+			info, err := s.masterchainInfo(block, stateRoot)
+			return info, lastUTime, err
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return ton.MasterchainInfo{}, 0, err
+		}
+	}
+
 	current, err := s.store.CurrentState(ctx)
 	if err != nil {
 		return ton.MasterchainInfo{}, 0, err
+	}
+
+	block, stateRoot, lastUTime, err := currentMasterchainInfo(ctx, s.store, current)
+	if err != nil {
+		return ton.MasterchainInfo{}, 0, err
+	}
+
+	info, err := s.masterchainInfo(block, stateRoot)
+	return info, lastUTime, err
+}
+
+func currentMasterchainInfo(ctx context.Context, store Store, current *storage.CurrentState) (ton.BlockIDExt, []byte, uint32, error) {
+	if current == nil {
+		return ton.BlockIDExt{}, nil, 0, storage.ErrNotFound
 	}
 
 	block := current.Masterchain.Block
@@ -191,27 +218,35 @@ func (s *Server) masterchainInfoWithUTime(ctx context.Context) (ton.MasterchainI
 		lastUTime = current.Masterchain.Parsed.GenUTime
 	}
 
-	meta, metaErr := s.store.BlockMeta(ctx, block)
-	if metaErr == nil {
-		if len(stateRoot) == 0 {
-			stateRoot = append([]byte(nil), meta.StateRootHash...)
+	if store != nil {
+		meta, metaErr := store.BlockMeta(ctx, block)
+		if metaErr == nil {
+			if len(stateRoot) == 0 {
+				stateRoot = append([]byte(nil), meta.StateRootHash...)
+			}
+			if lastUTime == 0 {
+				lastUTime = meta.GenUTime
+			}
+		} else if !errors.Is(metaErr, storage.ErrNotFound) {
+			return ton.BlockIDExt{}, nil, 0, metaErr
 		}
-		if lastUTime == 0 {
-			lastUTime = meta.GenUTime
-		}
-	} else if !errors.Is(metaErr, storage.ErrNotFound) {
-		return ton.MasterchainInfo{}, 0, metaErr
 	}
 
 	if len(stateRoot) != 32 {
-		return ton.MasterchainInfo{}, 0, fmt.Errorf("masterchain state root hash is missing")
+		return ton.BlockIDExt{}, nil, 0, fmt.Errorf("masterchain state root hash is missing")
 	}
+	return block, stateRoot, lastUTime, nil
+}
 
+func (s *Server) masterchainInfo(block ton.BlockIDExt, stateRoot []byte) (ton.MasterchainInfo, error) {
+	if len(stateRoot) != 32 {
+		return ton.MasterchainInfo{}, fmt.Errorf("masterchain state root hash is missing")
+	}
 	return ton.MasterchainInfo{
 		Last:          cloneBlockID(block),
-		StateRootHash: stateRoot,
+		StateRootHash: append([]byte(nil), stateRoot...),
 		Init:          cloneZeroStatePtr(s.zeroState),
-	}, lastUTime, nil
+	}, nil
 }
 
 func (s *Server) lookupBlock(ctx context.Context, query ton.LookupBlock) (ton.BlockIDExt, uint32, error) {
@@ -248,6 +283,7 @@ type accountReference struct {
 	shard       ton.BlockIDExt
 	shardProof  []*cell.Cell
 	masterState *cell.Cell
+	masterCache *liveBlockFragments
 }
 
 func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, request string, keepMasterState bool) (accountReference, error) {
@@ -287,18 +323,19 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 	}
 
 	if keepMasterState || account.Workchain != masterchainID {
-		masterState, err := s.loadStateRoot(ctx, base)
+		masterFragments, err := s.blockFragments(ctx, base)
 		if err != nil {
 			return accountReference{}, err
 		}
 		ref.master = base
-		ref.masterState = masterState
+		ref.masterState = masterFragments.stateRoot
+		ref.masterCache = masterFragments
 	}
 	if account.Workchain == masterchainID {
 		return ref, nil
 	}
 
-	proof, shardBlock, err := s.masterShardProof(ctx, base, ref.masterState, addr)
+	proof, shardBlock, err := s.masterShardProof(ctx, base, addr)
 	if errors.Is(err, storage.ErrNotFound) {
 		ref.shard = ton.BlockIDExt{}
 		ref.shardProof = proof

@@ -36,7 +36,7 @@ func TestChoosePersistentKeyBlockUsesSyncBefore(t *testing.T) {
 	recentPersistent := uint32(now.Unix()) - uint32(30*time.Minute/time.Second)
 
 	candidates := []keyBlockCandidate{
-		{block: ton.BlockIDExt{SeqNo: 10}, utime: prev},
+		{block: ton.BlockIDExt{SeqNo: 10}, utime: prev, allowBoundaryWithoutPrev: true},
 		{block: ton.BlockIDExt{SeqNo: 20}, utime: recentPersistent},
 	}
 
@@ -54,5 +54,20 @@ func TestChoosePersistentKeyBlockUsesSyncBefore(t *testing.T) {
 	}
 	if got.SeqNo != 20 {
 		t.Fatalf("unexpected custom sync_before key block seqno %d", got.SeqNo)
+	}
+}
+
+func TestChoosePersistentKeyBlockDoesNotUseResumedAnchorAsBoundary(t *testing.T) {
+	now := time.Unix(13_500_000, 0)
+	bucket := uint32(1 << 17)
+	resumedAnchor := uint32(100*bucket + 1000)
+	nonPersistent := resumedAnchor + 1000
+
+	_, ok := choosePersistentKeyBlock([]keyBlockCandidate{
+		{block: ton.BlockIDExt{SeqNo: 10}, utime: resumedAnchor},
+		{block: ton.BlockIDExt{SeqNo: 20}, utime: nonPersistent},
+	}, now, time.Hour)
+	if ok {
+		t.Fatal("resumed anchor without previous key block must not be selected as persistent boundary")
 	}
 }

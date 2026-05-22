@@ -63,6 +63,10 @@ func findPeerAddresses(ctx context.Context, client dhtBackend, key []byte) (*adn
 		return nil, nil, err
 	}
 
+	// Some public nodes still publish address lists with constructors that are
+	// not exposed by tonutils-go. Keep this fallback as an explicit network
+	// protocol boundary: it accepts those older records but only returns UDP
+	// addresses that the current node can actually dial.
 	value, _, findErr := client.FindValue(ctx, &dht.Key{
 		ID:    key,
 		Name:  []byte("address"),

@@ -51,7 +51,6 @@ func main() {
 	globalConfigURLFlag := flag.String("global-config", "", "download TON global config from URL and replace the configured file before start")
 	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	fromZeroFlag := flag.Bool("from-zero", false, "verify initial key block chain from zerostate instead of global config init_block")
-	archiveCheckpointBlocksFlag := flag.Uint("archive-checkpoint-blocks", service2.DefaultArchiveCatchUpCheckpointBlocks, "archive catch-up current-state checkpoint interval in masterchain blocks")
 	archiveCheckpointPeriodFlag := flag.Duration("archive-checkpoint-period", service2.DefaultArchiveCatchUpCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
 	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
 	flag.Parse()
@@ -64,11 +63,6 @@ func main() {
 	logLevelOverrides, err := logutil.ParseLevelOverrides(*logLevelsFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid log level overrides %q: %v\n", *logLevelsFlag, err)
-		os.Exit(1)
-	}
-	archiveCheckpointBlocks := uint32(*archiveCheckpointBlocksFlag)
-	if uint(archiveCheckpointBlocks) != *archiveCheckpointBlocksFlag {
-		fmt.Fprintf(os.Stderr, "invalid archive checkpoint blocks %d: exceeds uint32\n", *archiveCheckpointBlocksFlag)
 		os.Exit(1)
 	}
 	logs := logutil.NewFactory(os.Stdout, logutil.Config{
@@ -85,12 +79,13 @@ func main() {
 	startPprof(ctx, logger, strings.TrimSpace(*pprofAddrFlag))
 
 	selectedConfigPath := resolveConfigPath(*configPath, *configPathShort)
-	cfg, createdConfig, err := nodeconfig.LoadOrCreate(ctx, selectedConfigPath, nodeconfig.DetectExternalIP)
+	configResult, err := nodeconfig.LoadOrCreate(ctx, selectedConfigPath, nodeconfig.DetectExternalIP)
 	if err != nil {
 		logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
 		os.Exit(1)
 	}
-	if createdConfig {
+	cfg := configResult.Config
+	if configResult.Created {
 		logger.Info().
 			Str("config", displayConfigPath(selectedConfigPath)).
 			Msg("created default config; review and approve config.json settings, then start the node again")
@@ -104,7 +99,7 @@ func main() {
 		replaceGlobalConfig = true
 	}
 	globalConfigPath := cfg.GlobalConfigPath()
-	downloadedGlobalConfig, err := nodeconfig.EnsureGlobalConfig(ctx, globalConfigPath, globalConfigURL, replaceGlobalConfig)
+	globalConfigResult, err := nodeconfig.EnsureGlobalConfig(ctx, globalConfigPath, globalConfigURL, replaceGlobalConfig)
 	if err != nil {
 		logger.Error().
 			Err(err).
@@ -113,7 +108,7 @@ func main() {
 			Msg("failed to prepare global config")
 		os.Exit(1)
 	}
-	if downloadedGlobalConfig {
+	if globalConfigResult.Downloaded {
 		logger.Info().
 			Str("path", globalConfigPath).
 			Str("url", globalConfigURL).
@@ -144,7 +139,7 @@ func main() {
 		os.Exit(1)
 	}
 	var runtimeMetrics *metrics.Metrics
-	var syncLagObserver service2.SyncLagObserver
+	var syncObserver service2.SyncObserver
 	var queryObserver liteserver.QueryObserver
 	if metricsOpts.Enabled {
 		runtimeMetrics = metrics.New()
@@ -152,7 +147,7 @@ func main() {
 			logger.Error().Err(err).Str("metrics_addr", metricsOpts.ListenAddr).Msg("failed to start metrics server")
 			os.Exit(1)
 		}
-		syncLagObserver = runtimeMetrics
+		syncObserver = runtimeMetrics
 		queryObserver = runtimeMetrics
 	}
 	syncBefore, err := cfg.SyncBefore()
@@ -168,6 +163,21 @@ func main() {
 	archiveTTL, err := cfg.ArchiveTTL()
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to load archive ttl option")
+		os.Exit(1)
+	}
+	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load next checkpoint blocks option")
+		os.Exit(1)
+	}
+	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load archive checkpoint blocks option")
+		os.Exit(1)
+	}
+	checkpointBytes, err := cfg.CheckpointBytes()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load checkpoint bytes option")
 		os.Exit(1)
 	}
 
@@ -186,18 +196,32 @@ func main() {
 		logger.Error().Err(err).Msg("failed to load storage cell memtable option")
 		os.Exit(1)
 	}
+	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage cell memtable stop writes threshold option")
+		os.Exit(1)
+	}
+	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage artifact file max open option")
+		os.Exit(1)
+	}
 	storageOpenStarted := time.Now()
 	logger.Info().
 		Str("storage", "pebble").
 		Str("dir", storageDir).
 		Int64("cell_total_cache_size", cellTotalCacheSize).
 		Int("cell_shard_memtable_size", cellShardMemTableSize).
+		Int("cell_memtable_stop_writes_threshold", cellMemTableStopWritesThreshold).
+		Int("artifact_file_max_open", artifactFileMaxOpen).
 		Msg("opening storage")
 	store, err := pebblestore.Open(pebblestore.Options{
-		Dir:                   storageDir,
-		Logger:                logs.CategoryPtr("pebblestore"),
-		CellCacheSize:         cellTotalCacheSize,
-		CellShardMemTableSize: cellShardMemTableSize,
+		Dir:                             storageDir,
+		Logger:                          logs.CategoryPtr("pebblestore"),
+		CellCacheSize:                   cellTotalCacheSize,
+		CellShardMemTableSize:           cellShardMemTableSize,
+		CellMemTableStopWritesThreshold: cellMemTableStopWritesThreshold,
+		ArtifactFileMaxOpen:             artifactFileMaxOpen,
 	})
 	if err != nil {
 		logger.Error().Err(err).Str("dir", storageDir).Msg("failed to open pebble storage")
@@ -206,6 +230,9 @@ func main() {
 	stateFilesDir := store.StateFilesDir()
 	opts.Storage = store
 	opts.PeerServingStorage = store
+	if runtimeMetrics != nil {
+		runtimeMetrics.SetDBStatusReader(store.DBStatus)
+	}
 	logger.Info().
 		Str("storage", "pebble").
 		Str("dir", storageDir).
@@ -257,6 +284,8 @@ func main() {
 		ArchiveCatchUpCheckpointBlocks: archiveCheckpointBlocks,
 		ArchiveCatchUpCheckpointPeriod: *archiveCheckpointPeriodFlag,
 		ArchiveCatchUpPrefetchWindows:  *archivePrefetchWindowsFlag,
+		NextBlockCheckpointBlocks:      nextCheckpointBlocks,
+		CheckpointBytes:                checkpointBytes,
 		CurrentStatePublisher:          currentStatePublisher,
 		ShutdownContext:                shutdownCtx,
 		StateFilesDir:                  stateFilesDir,
@@ -264,8 +293,11 @@ func main() {
 		ArchiveTTL:                     archiveTTL,
 		StorageDir:                     storageDir,
 		DisableStateSerialization:      cfg.DisableStateSerialization,
-		SyncLagObserver:                syncLagObserver,
+		SyncObserver:                   syncObserver,
 	})
+	if runtimeMetrics != nil {
+		runtimeMetrics.SetServiceStatusReader(svc.StatusSnapshot)
+	}
 	node.SetCompressedBlockStateProvider(svc)
 
 	var liteSrv *liteserver.Server
@@ -353,7 +385,9 @@ func main() {
 		Dur("sync_before", syncBefore).
 		Dur("state_ttl", stateTTL).
 		Dur("archive_ttl", archiveTTL).
+		Uint32("next_checkpoint_blocks", nextCheckpointBlocks).
 		Uint32("archive_checkpoint_blocks", archiveCheckpointBlocks).
+		Uint64("checkpoint_bytes", checkpointBytes).
 		Dur("archive_checkpoint_period", *archiveCheckpointPeriodFlag).
 		Int("archive_prefetch_windows", *archivePrefetchWindowsFlag).
 		Bool("disable_state_serialization", cfg.DisableStateSerialization).
@@ -874,17 +908,86 @@ func formatChainLagStatus(b *strings.Builder, snapshot service2.StatusSnapshot, 
 		snapshot.LocalMasterchain,
 		localMasterchainStatus(snapshot),
 		snapshot.LocalMasterchainUtime,
+		snapshot.LocalMasterchainTx,
+		snapshot.LocalMasterchainHasTx,
 		now,
 	)
-	formatChainLag(
+	formatBasechainLagStatus(b, snapshot, now)
+	formatRecentTPSStatus(b, snapshot.RecentTPS)
+}
+
+func formatBasechainLagStatus(b *strings.Builder, snapshot service2.StatusSnapshot, now time.Time) {
+	if len(snapshot.LocalBasechainShards) == 0 {
+		formatChainLag(
+			b,
+			"basechain",
+			snapshot.LatestBasechain,
+			snapshot.LocalBasechain,
+			localBasechainStatus(snapshot),
+			snapshot.LocalBasechainUtime,
+			snapshot.LocalBasechainTx,
+			snapshot.LocalBasechainHasTx,
+			now,
+		)
+		return
+	}
+
+	latest := latestBasechainShardsByKey(snapshot)
+	for _, shard := range snapshot.LocalBasechainShards {
+		var network *ton.BlockIDExt
+		if block, ok := latest[storage.ShardKeyFromBlock(shard.Block)]; ok {
+			network = &block
+		}
+		formatChainLag(
+			b,
+			formatBasechainShardName(shard.Block),
+			network,
+			&shard.Block,
+			localBasechainStatus(snapshot),
+			shard.Utime,
+			shard.Transactions,
+			shard.HasTransactions,
+			now,
+		)
+	}
+}
+
+func formatRecentTPSStatus(b *strings.Builder, snapshot service2.StatusTPSSnapshot) {
+	if snapshot.WindowMasters == 0 {
+		return
+	}
+	if !snapshot.Complete {
+		fmt.Fprintf(b, "  %-12s window_masters=%d tx=unknown duration=unknown tps=unknown\n", "tps", snapshot.WindowMasters)
+		return
+	}
+
+	fmt.Fprintf(
 		b,
-		"basechain",
-		snapshot.LatestBasechain,
-		snapshot.LocalBasechain,
-		localBasechainStatus(snapshot),
-		snapshot.LocalBasechainUtime,
-		now,
+		"  %-12s window_masters=%d tx=%d duration=%s tps=%.2f\n",
+		"tps",
+		snapshot.WindowMasters,
+		snapshot.Transactions,
+		formatLagSeconds(snapshot.DurationSeconds),
+		snapshot.TPS,
 	)
+}
+
+func latestBasechainShardsByKey(snapshot service2.StatusSnapshot) map[storage.ShardKey]ton.BlockIDExt {
+	latest := make(map[storage.ShardKey]ton.BlockIDExt, len(snapshot.LatestBasechainShards))
+	for _, block := range snapshot.LatestBasechainShards {
+		latest[storage.ShardKeyFromBlock(block)] = block
+	}
+	if len(latest) == 0 && snapshot.LatestBasechain != nil {
+		latest[storage.ShardKeyFromBlock(*snapshot.LatestBasechain)] = *snapshot.LatestBasechain
+	}
+	return latest
+}
+
+func formatBasechainShardName(block ton.BlockIDExt) string {
+	if block.Shard == topShard {
+		return "basechain"
+	}
+	return fmt.Sprintf("basechain/%016x", uint64(block.Shard))
 }
 
 func formatChainLag(
@@ -894,6 +997,8 @@ func formatChainLag(
 	local *ton.BlockIDExt,
 	localMissing string,
 	localUtime int64,
+	localTransactions uint32,
+	hasLocalTransactions bool,
 	now time.Time,
 ) {
 	if local == nil {
@@ -903,13 +1008,21 @@ func formatChainLag(
 
 	fmt.Fprintf(
 		b,
-		"  %-12s local=%s latest=%s lag_seconds=%s block_time=%s\n",
+		"  %-12s local=%s latest=%s lag_seconds=%s block_time=%s tx=%s\n",
 		name,
 		formatBlockSeq(local),
 		formatBlockSeq(network),
 		formatLocalLagSeconds(now, localUtime),
 		formatBlockUtime(localUtime),
+		formatTransactionCount(localTransactions, hasLocalTransactions),
 	)
+}
+
+func formatTransactionCount(count uint32, known bool) string {
+	if !known {
+		return "unknown"
+	}
+	return strconv.FormatUint(uint64(count), 10)
 }
 
 func formatLocalLagSeconds(now time.Time, blockUtime int64) string {

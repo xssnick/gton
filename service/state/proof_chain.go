@@ -27,22 +27,53 @@ const (
 )
 
 type trustedKeyBlock struct {
-	block  ton.BlockIDExt
-	config *tlb.BlockchainConfig
-	utime  uint32
+	block   ton.BlockIDExt
+	config  *tlb.BlockchainConfig
+	utime   uint32
+	resumed bool
 }
 
 type keyBlockCandidate struct {
-	block ton.BlockIDExt
-	utime uint32
+	block                    ton.BlockIDExt
+	utime                    uint32
+	allowBoundaryWithoutPrev bool
 }
 
+var errNoPersistentKeyBlockCandidate = errors.New("no persistent key block state snapshot candidate")
+
 func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	trusted, err := s.trustedKeyBlockAnchor(ctx)
+	configured, err := s.configuredTrustedKeyBlockAnchor(ctx)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
 
+	trusted := configured
+	resumed, err := s.resumeTrustedKeyBlockAnchor(ctx, configured)
+	if err == nil {
+		if err = validateTrustedKeyBlockAnchor(resumed.block); err != nil {
+			return ton.BlockIDExt{}, err
+		}
+		trusted = resumed
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return ton.BlockIDExt{}, err
+	}
+
+	block, err := s.persistentMasterchainBlockFromTrusted(ctx, trusted)
+	if err == nil {
+		return block, nil
+	}
+	if !trusted.resumed || !errors.Is(err, errNoPersistentKeyBlockCandidate) {
+		return ton.BlockIDExt{}, err
+	}
+
+	s.log.Info().
+		Str("verified_key", storage.FormatBlockRef(trusted.block)).
+		Str("configured_anchor", storage.FormatBlockRef(configured.block)).
+		Msg("verified key block progress has no persistent state candidate, restarting selection from configured anchor")
+	return s.persistentMasterchainBlockFromTrusted(ctx, configured)
+}
+
+func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trusted trustedKeyBlock) (ton.BlockIDExt, error) {
 	blocks, err := s.keyBlockIDs(ctx, trusted.block)
 	if err != nil {
 		return ton.BlockIDExt{}, err
@@ -68,7 +99,8 @@ func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt
 	}
 
 	return ton.BlockIDExt{}, fmt.Errorf(
-		"no persistent key block state snapshot candidate: latest_verified=%s key_blocks=%d sync_before=%s download_window=%s",
+		"%w: latest_verified=%s key_blocks=%d sync_before=%s download_window=%s",
+		errNoPersistentKeyBlockCandidate,
 		storage.FormatBlockRef(trusted.block),
 		len(candidates),
 		s.syncBefore,
@@ -76,7 +108,7 @@ func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt
 	)
 }
 
-func (s *Syncer) trustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, error) {
+func (s *Syncer) configuredTrustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, error) {
 	var trusted trustedKeyBlock
 	var err error
 	if s.fromZero {
@@ -104,16 +136,6 @@ func (s *Syncer) trustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, er
 		return trustedKeyBlock{}, err
 	}
 
-	resumed, err := s.resumeTrustedKeyBlockAnchor(ctx, trusted)
-	if err == nil {
-		if err = validateTrustedKeyBlockAnchor(resumed.block); err != nil {
-			return trustedKeyBlock{}, err
-		}
-		return resumed, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return trustedKeyBlock{}, err
-	}
 	if err = validateTrustedKeyBlockAnchor(trusted.block); err != nil {
 		return trustedKeyBlock{}, err
 	}
@@ -162,6 +184,7 @@ func (s *Syncer) resumeTrustedKeyBlockAnchor(ctx context.Context, trusted truste
 		Str("verified_key", storage.FormatBlockRef(resumed.block)).
 		Uint32("utime", resumed.utime).
 		Msg("resuming key block proof verification from stored progress")
+	resumed.resumed = true
 	return resumed, nil
 }
 
@@ -197,12 +220,11 @@ func (s *Syncer) trustedKeyBlockFromStoredProof(ctx context.Context, block ton.B
 
 func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trustedKeyBlock, blocks []ton.BlockIDExt) ([]keyBlockCandidate, trustedKeyBlock, error) {
 	candidates := make([]keyBlockCandidate, 0, len(blocks)+1)
-	if trusted.block.SeqNo > 0 {
-		candidates = append(candidates, keyBlockCandidate{
-			block: trusted.block,
-			utime: trusted.utime,
-		})
-	}
+	candidates = append(candidates, keyBlockCandidate{
+		block:                    trusted.block,
+		utime:                    trusted.utime,
+		allowBoundaryWithoutPrev: trusted.block.SeqNo > 0 && !trusted.resumed,
+	})
 
 	latest := trusted.block
 	if len(blocks) > 0 {
@@ -253,7 +275,7 @@ func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trusted
 				Str("latest", storage.FormatBlockRef(latest)).
 				Int("verified", verified).
 				Int("key_blocks", len(blocks)).
-				Msg("key block proof verification progress")
+				Msg("key block proof download and verification progress")
 		}
 	}
 
@@ -621,7 +643,10 @@ func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syn
 			continue
 		}
 
-		persistent := i == 0 || IsPersistentState(candidate.utime, candidates[i-1].utime)
+		persistent := candidate.allowBoundaryWithoutPrev
+		if i > 0 {
+			persistent = IsPersistentState(candidate.utime, candidates[i-1].utime)
+		}
 		if !persistent {
 			continue
 		}

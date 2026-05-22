@@ -10,6 +10,7 @@ import (
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestShouldSwitchNextToArchiveByLagUsesSwitchThreshold(t *testing.T) {
@@ -161,6 +162,83 @@ func TestArchiveCheckpointBackpressureWaitsAtDoubleTarget(t *testing.T) {
 	runner.current.ShardClientSeqno = 5000
 	if !runner.shouldWaitArchiveCheckpointBackpressure() {
 		t.Fatal("checkpoint backpressure should wait at double target")
+	}
+}
+
+func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
+	var first, second cell.Hash
+	first[0] = 1
+	second[0] = 2
+
+	runner := &archiveCatchUpRunner{
+		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024},
+		checkpointDone:         make(chan archiveCheckpointResult),
+		checkpointBlocksTarget: 2000,
+		lastCheckpointSeqno:    1000,
+		current:                &storage.CurrentState{ShardClientSeqno: 1001},
+		stateCells:             newArchiveStateCellOverlay(nil),
+	}
+	runner.stateCells.rememberPreparedCells(map[cell.Hash][]byte{
+		first: make([]byte, 2047),
+	})
+	if runner.shouldWaitArchiveCheckpointBackpressure() {
+		t.Fatal("checkpoint backpressure should not wait below byte limit")
+	}
+
+	runner.stateCells.rememberPreparedCells(map[cell.Hash][]byte{
+		second: make([]byte, 1),
+	})
+	if !runner.shouldWaitArchiveCheckpointBackpressure() {
+		t.Fatal("checkpoint backpressure should wait at byte limit")
+	}
+}
+
+func TestArchiveCheckpointPersistsAtByteTarget(t *testing.T) {
+	service := &Service{
+		archiveCatchUpCheckpointBlocks: 2000,
+		archiveCatchUpCheckpointPeriod: time.Hour,
+		checkpointBytes:                1024,
+	}
+	lastCheckpoint := time.Now()
+
+	if service.shouldPersistArchiveCatchUpCheckpoint(1001, 10_000, 1000, lastCheckpoint, 2000, 1023) {
+		t.Fatal("checkpoint should not persist below byte target")
+	}
+	if !service.shouldPersistArchiveCatchUpCheckpoint(1001, 10_000, 1000, lastCheckpoint, 2000, 1024) {
+		t.Fatal("checkpoint should persist at byte target")
+	}
+}
+
+func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
+	var first, second cell.Hash
+	first[0] = 1
+	second[0] = 2
+
+	runner := &nextSyncRunner{
+		service:      &Service{nextBlockCheckpointBlocks: 10, checkpointBytes: 1024},
+		stagedBlocks: 9,
+		stateCells:   newStateCellWindowCache(nil),
+	}
+	runner.stateCells.addPreparedRecords(map[cell.Hash][]byte{
+		first: make([]byte, 1023),
+	})
+	if runner.shouldCheckpointStagedCurrent() {
+		t.Fatal("next checkpoint should not start below block and byte targets")
+	}
+
+	runner.stateCells.addPreparedRecords(map[cell.Hash][]byte{
+		second: make([]byte, 1),
+	})
+	if !runner.shouldCheckpointStagedCurrent() {
+		t.Fatal("next checkpoint should start at byte target")
+	}
+	if runner.shouldBackpressureStagedCurrent() {
+		t.Fatal("next checkpoint should not backpressure below double byte target")
+	}
+
+	runner.stagedBlocks = 20
+	if !runner.shouldBackpressureStagedCurrent() {
+		t.Fatal("next checkpoint should backpressure at double block target")
 	}
 }
 

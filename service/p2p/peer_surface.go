@@ -141,6 +141,10 @@ func (n *Node) announceSelf(ctx context.Context) error {
 	}
 
 	for _, sub := range n.subscriptionsSnapshot() {
+		if !sub.isActive() {
+			continue
+		}
+
 		self, err := n.selfOverlayNode(sub.spec)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("build overlay node for %s: %w", sub.spec.Name, err))

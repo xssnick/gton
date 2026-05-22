@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/gton/service/p2p"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -60,14 +61,16 @@ func TestStatsFromDownloadedBlockFixture(t *testing.T) {
 		t.Fatalf("parse shard: %v", err)
 	}
 
+	blockID := ton.BlockIDExt{
+		Workchain: fixture.Block.Workchain,
+		Shard:     int64(shard),
+		SeqNo:     fixture.Block.SeqNo,
+		RootHash:  rootHash,
+		FileHash:  fileHash,
+	}
+
 	stats, err := StatsFromDownloadedBlock(p2p.DownloadedBlock{
-		ID: ton.BlockIDExt{
-			Workchain: fixture.Block.Workchain,
-			Shard:     int64(shard),
-			SeqNo:     fixture.Block.SeqNo,
-			RootHash:  rootHash,
-			FileHash:  fileHash,
-		},
+		ID:    blockID,
 		Block: blockCell,
 	})
 	if err != nil {
@@ -85,5 +88,13 @@ func TestStatsFromDownloadedBlockFixture(t *testing.T) {
 	}
 	if stats.Transactions <= 0 {
 		t.Fatalf("expected positive transaction count, got %d", stats.Transactions)
+	}
+
+	txCount, err := tnstore.BlockTransactionCountFromBlockData(blockID, blockData)
+	if err != nil {
+		t.Fatalf("count block transactions: %v", err)
+	}
+	if txCount != uint32(stats.Transactions) {
+		t.Fatalf("transaction count = %d, want %d", txCount, stats.Transactions)
 	}
 }

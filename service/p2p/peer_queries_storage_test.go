@@ -574,6 +574,12 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 		log: discardLogger(),
 	}
 
+	anchor := testStoredMasterBlockID(10)
+	anchorMeta := &tnstore.BlockMeta{ID: anchor}
+	anchorMeta.Mark(tnstore.BlockMetaIsKeyBlock)
+	if err = store.SaveBlockMeta(anchorMeta); err != nil {
+		t.Fatalf("save anchor meta: %v", err)
+	}
 	for seqno := uint32(11); seqno <= 14; seqno++ {
 		block := testStoredMasterBlockID(seqno)
 		meta := &tnstore.BlockMeta{ID: block}
@@ -605,8 +611,64 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 	}
 }
 
+func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
+	store := newTestPebbleStore(t)
+	anchor := testStoredMasterBlockID(10)
+	if err := store.SaveBlockMeta(&tnstore.BlockMeta{ID: anchor}); err != nil {
+		t.Fatalf("save anchor meta: %v", err)
+	}
+	keyBlock := testStoredMasterBlockID(12)
+	meta := &tnstore.BlockMeta{ID: keyBlock}
+	meta.Mark(tnstore.BlockMetaIsKeyBlock)
+	if err := store.SaveBlockMeta(meta); err != nil {
+		t.Fatalf("save key block meta: %v", err)
+	}
+
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:        &logger,
+		Storage:       store,
+		StateFilesDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	node.RememberSeenMasterchainBlock(keyBlock)
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "masterchain",
+			ProtoVersionMajor: masterchainProtoVersionMajor,
+			ProtoVersionMinor: masterchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
+		Block:   anchor,
+		MaxSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("getNextKeyBlockIds: %v", err)
+	}
+	keyBlocks, ok := resp.(KeyBlocks)
+	if !ok {
+		t.Fatalf("unexpected getNextKeyBlockIds response %T", resp)
+	}
+	if !keyBlocks.Error {
+		t.Fatalf("expected error-shaped key blocks response, got %#v", keyBlocks)
+	}
+}
+
 func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 	store := newTestPebbleStore(t)
+	anchor := testStoredMasterBlockID(10)
+	anchorMeta := &tnstore.BlockMeta{ID: anchor}
+	anchorMeta.Mark(tnstore.BlockMetaIsKeyBlock)
+	if err := store.SaveBlockMeta(anchorMeta); err != nil {
+		t.Fatalf("save anchor meta: %v", err)
+	}
 	keyBlock := testStoredMasterBlockID(500_000)
 	meta := &tnstore.BlockMeta{ID: keyBlock}
 	meta.Mark(tnstore.BlockMetaIsKeyBlock)

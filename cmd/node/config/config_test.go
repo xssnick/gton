@@ -60,6 +60,27 @@ func TestLoadDefaults(t *testing.T) {
 	if archiveTTL != DefaultArchiveTTL {
 		t.Fatalf("unexpected archive ttl %s", archiveTTL)
 	}
+	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
+	if err != nil {
+		t.Fatalf("next checkpoint blocks: %v", err)
+	}
+	if int64(nextCheckpointBlocks) != DefaultNextCheckpointBlocks {
+		t.Fatalf("unexpected next checkpoint blocks %d", nextCheckpointBlocks)
+	}
+	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
+	if err != nil {
+		t.Fatalf("archive checkpoint blocks: %v", err)
+	}
+	if int64(archiveCheckpointBlocks) != DefaultArchiveCheckpointBlocks {
+		t.Fatalf("unexpected archive checkpoint blocks %d", archiveCheckpointBlocks)
+	}
+	checkpointBytes, err := cfg.CheckpointBytes()
+	if err != nil {
+		t.Fatalf("checkpoint bytes: %v", err)
+	}
+	if int64(checkpointBytes) != DefaultCheckpointBytes {
+		t.Fatalf("unexpected checkpoint bytes %d", checkpointBytes)
+	}
 	if cfg.DisableStateSerialization {
 		t.Fatal("state serialization should be enabled by default")
 	}
@@ -83,10 +104,24 @@ func TestLoadDefaults(t *testing.T) {
 	if int64(cellShardMemTableSize) != DefaultCellShardMemTable {
 		t.Fatalf("unexpected cell shard memtable size %d", cellShardMemTableSize)
 	}
+	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
+	if err != nil {
+		t.Fatalf("cell memtable stop writes threshold: %v", err)
+	}
+	if int64(cellMemTableStopWritesThreshold) != DefaultCellMemTableStopWritesThreshold {
+		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
+	}
+	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
+	if err != nil {
+		t.Fatalf("artifact file max open: %v", err)
+	}
+	if int64(artifactFileMaxOpen) != DefaultArtifactFileMaxOpen {
+		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
+	}
 }
 
 func TestLoadSyncOptions(t *testing.T) {
-	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800}}`)
+	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789}}`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -114,6 +149,27 @@ func TestLoadSyncOptions(t *testing.T) {
 	if archiveTTL != 48*time.Hour {
 		t.Fatalf("unexpected archive ttl %s", archiveTTL)
 	}
+	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
+	if err != nil {
+		t.Fatalf("next checkpoint blocks: %v", err)
+	}
+	if nextCheckpointBlocks != 700 {
+		t.Fatalf("unexpected next checkpoint blocks %d", nextCheckpointBlocks)
+	}
+	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
+	if err != nil {
+		t.Fatalf("archive checkpoint blocks: %v", err)
+	}
+	if archiveCheckpointBlocks != 2100 {
+		t.Fatalf("unexpected archive checkpoint blocks %d", archiveCheckpointBlocks)
+	}
+	checkpointBytes, err := cfg.CheckpointBytes()
+	if err != nil {
+		t.Fatalf("checkpoint bytes: %v", err)
+	}
+	if checkpointBytes != 123456789 {
+		t.Fatalf("unexpected checkpoint bytes %d", checkpointBytes)
+	}
 }
 
 func TestStorageOptions(t *testing.T) {
@@ -121,7 +177,9 @@ func TestStorageOptions(t *testing.T) {
 		"storage": {
 			"dir": "data/node",
 			"cell_total_cache_size": 8589934592,
-			"cell_shard_memtable_size": 1073741824
+			"cell_shard_memtable_size": 1073741824,
+			"cell_memtable_stop_writes_threshold": 3,
+			"artifact_file_max_open": 123
 		}
 	}`)
 
@@ -145,6 +203,20 @@ func TestStorageOptions(t *testing.T) {
 	}
 	if cellShardMemTableSize != 1<<30 {
 		t.Fatalf("unexpected cell shard memtable size %d", cellShardMemTableSize)
+	}
+	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
+	if err != nil {
+		t.Fatalf("cell memtable stop writes threshold: %v", err)
+	}
+	if cellMemTableStopWritesThreshold != 3 {
+		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
+	}
+	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
+	if err != nil {
+		t.Fatalf("artifact file max open: %v", err)
+	}
+	if artifactFileMaxOpen != 123 {
+		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
 	}
 }
 
@@ -276,15 +348,16 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.json")
 
-	cfg, created, err := LoadOrCreate(context.Background(), path, func(context.Context) (string, error) {
+	result, err := LoadOrCreate(context.Background(), path, func(context.Context) (string, error) {
 		return "203.0.113.20", nil
 	})
 	if err != nil {
 		t.Fatalf("load or create config: %v", err)
 	}
-	if !created {
+	if !result.Created {
 		t.Fatal("expected config to be created")
 	}
+	cfg := result.Config
 	if len(cfg.ADNL.Key) != ed25519.SeedSize {
 		t.Fatal("expected generated ADNL key")
 	}
@@ -322,6 +395,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Storage.Dir != wantStorageDir {
 		t.Fatalf("unexpected storage dir %q", cfg.Storage.Dir)
 	}
+	if cfg.Storage.ArtifactFileMaxOpen != DefaultArtifactFileMaxOpen {
+		t.Fatalf("unexpected artifact file max open %d", cfg.Storage.ArtifactFileMaxOpen)
+	}
 	wantGlobalConfigPath, err := filepath.Abs(p2p.DefaultGlobalConfigPath)
 	if err != nil {
 		t.Fatalf("resolve global config path: %v", err)
@@ -337,6 +413,15 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
 		t.Fatalf("unexpected archive_ttl %d", cfg.TON.ArchiveTTL)
+	}
+	if cfg.TON.NextCheckpointBlocks != DefaultNextCheckpointBlocks {
+		t.Fatalf("unexpected next checkpoint blocks %d", cfg.TON.NextCheckpointBlocks)
+	}
+	if cfg.TON.ArchiveCheckpointBlocks != DefaultArchiveCheckpointBlocks {
+		t.Fatalf("unexpected archive checkpoint blocks %d", cfg.TON.ArchiveCheckpointBlocks)
+	}
+	if cfg.TON.CheckpointBytes != DefaultCheckpointBytes {
+		t.Fatalf("unexpected checkpoint bytes %d", cfg.TON.CheckpointBytes)
 	}
 	if cfg.Metrics.Enabled {
 		t.Fatal("expected generated metrics to be disabled")
@@ -391,7 +476,7 @@ func TestLoadOrCreateRefusesExistingDefaultMetadata(t *testing.T) {
 		t.Fatalf("create metadb: %v", err)
 	}
 
-	_, _, err := LoadOrCreate(context.Background(), "config.json", func(context.Context) (string, error) {
+	_, err := LoadOrCreate(context.Background(), "config.json", func(context.Context) (string, error) {
 		t.Fatal("external ip lookup should not be called")
 		return "", nil
 	})
@@ -473,11 +558,11 @@ func TestEnsureGlobalConfigSkipsExistingFile(t *testing.T) {
 		t.Fatalf("write global config: %v", err)
 	}
 
-	downloaded, err := EnsureGlobalConfig(context.Background(), path, "http://127.0.0.1:1/global.config.json", false)
+	result, err := EnsureGlobalConfig(context.Background(), path, "http://127.0.0.1:1/global.config.json", false)
 	if err != nil {
 		t.Fatalf("ensure global config: %v", err)
 	}
-	if downloaded {
+	if result.Downloaded {
 		t.Fatal("expected existing global config to be reused")
 	}
 }

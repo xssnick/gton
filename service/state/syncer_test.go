@@ -319,7 +319,7 @@ func TestSyncerUsesConfiguredZeroStateWhenInitBlockIsEmpty(t *testing.T) {
 	}
 	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
 
-	trusted, err := syncer.trustedKeyBlockAnchor(context.Background())
+	trusted, err := syncer.configuredTrustedKeyBlockAnchor(context.Background())
 	if err != nil {
 		t.Fatalf("trusted key block anchor: %v", err)
 	}

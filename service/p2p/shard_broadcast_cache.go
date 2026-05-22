@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"sync"
@@ -28,10 +29,13 @@ type shardBroadcastBlockCache struct {
 	maxItems int
 
 	entries map[string]*shardBroadcastBlockCacheEntry
+	order   *list.List
 	bytes   int64
 }
 
 type shardBroadcastBlockCacheEntry struct {
+	key       string
+	element   *list.Element
 	block     ton.BlockIDExt
 	kind      string
 	blockRoot *cell.Cell
@@ -40,7 +44,6 @@ type shardBroadcastBlockCacheEntry struct {
 	proofBOC  []byte
 	isLink    bool
 	meta      *tnstore.BlockMeta
-	inserted  time.Time
 	expiresAt time.Time
 	bytes     int64
 }
@@ -51,6 +54,7 @@ func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int
 		maxBytes: maxBytes,
 		maxItems: maxItems,
 		entries:  map[string]*shardBroadcastBlockCacheEntry{},
+		order:    list.New(),
 	}
 }
 
@@ -97,15 +101,9 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		return fmt.Errorf("block %s is too large for shard broadcast cache: %d > %d", formatBlockRef(downloaded.ID), size, c.maxBytes)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	key := tnstore.BlockKey(downloaded.ID)
-	if old := c.entries[key]; old != nil {
-		c.bytes -= old.bytes
-	}
-
-	c.entries[key] = &shardBroadcastBlockCacheEntry{
+	entry := &shardBroadcastBlockCacheEntry{
+		key:       key,
 		block:     cloneBlockID(downloaded.ID),
 		kind:      downloaded.Kind,
 		blockRoot: blockRoot,
@@ -114,10 +112,19 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		proofBOC:  append([]byte(nil), downloaded.ProofBOC...),
 		isLink:    downloaded.IsLink,
 		meta:      meta.Clone(),
-		inserted:  now,
 		expiresAt: now.Add(c.ttl),
 		bytes:     size,
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if old := c.entries[key]; old != nil {
+		c.deleteEntryLocked(old)
+	}
+
+	entry.element = c.order.PushBack(entry)
+	c.entries[key] = entry
 	c.bytes += size
 
 	c.pruneExpiredLocked(now)
@@ -146,7 +153,7 @@ func (c *shardBroadcastBlockCache) hasBlockAt(block ton.BlockIDExt, now time.Tim
 		return false
 	}
 	if !entry.expiresAt.After(now) {
-		c.deleteLocked(tnstore.BlockKey(block))
+		c.deleteEntryLocked(entry)
 		return false
 	}
 	return true
@@ -164,7 +171,7 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		c.mu.Unlock()
 		return nil, tnstore.ErrNotFound
 	}
-	c.deleteLocked(key)
+	c.deleteEntryLocked(entry)
 	c.mu.Unlock()
 
 	if !entry.expiresAt.After(now) {
@@ -201,41 +208,37 @@ func (c *shardBroadcastBlockCache) Prune(now time.Time) {
 }
 
 func (c *shardBroadcastBlockCache) pruneExpiredLocked(now time.Time) {
-	for key, entry := range c.entries {
+	for elem := c.order.Front(); elem != nil; {
+		entry := elem.Value.(*shardBroadcastBlockCacheEntry)
 		if !entry.expiresAt.After(now) {
-			c.deleteLocked(key)
+			next := elem.Next()
+			c.deleteEntryLocked(entry)
+			elem = next
+			continue
 		}
+		return
 	}
 }
 
 func (c *shardBroadcastBlockCache) pruneOverflowLocked() {
 	for len(c.entries) > c.maxItems || c.bytes > c.maxBytes {
-		key := c.oldestKeyLocked()
-		if key == "" {
+		elem := c.order.Front()
+		if elem == nil {
 			return
 		}
-		c.deleteLocked(key)
+		c.deleteEntryLocked(elem.Value.(*shardBroadcastBlockCacheEntry))
 	}
 }
 
-func (c *shardBroadcastBlockCache) oldestKeyLocked() string {
-	var oldest string
-	var oldestAt time.Time
-	for key, entry := range c.entries {
-		if oldest == "" || entry.inserted.Before(oldestAt) {
-			oldest = key
-			oldestAt = entry.inserted
-		}
-	}
-	return oldest
-}
-
-func (c *shardBroadcastBlockCache) deleteLocked(key string) {
-	entry := c.entries[key]
+func (c *shardBroadcastBlockCache) deleteEntryLocked(entry *shardBroadcastBlockCacheEntry) {
 	if entry == nil {
 		return
 	}
-	delete(c.entries, key)
+	delete(c.entries, entry.key)
+	if entry.element != nil {
+		c.order.Remove(entry.element)
+		entry.element = nil
+	}
 	c.bytes -= entry.bytes
 	if c.bytes < 0 {
 		c.bytes = 0

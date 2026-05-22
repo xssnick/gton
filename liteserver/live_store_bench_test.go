@@ -31,6 +31,23 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 			}
 		})
 
+		b.Run(fmt.Sprintf("masterchain-info/shards-%d", shards), func(b *testing.B) {
+			live, current, _ := benchmarkLiveStoreWithCurrent(b, shards)
+			srv := testServer(live)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				info, _, err := srv.masterchainInfoWithUTime(context.Background())
+				if err != nil {
+					b.Fatalf("load masterchain info: %v", err)
+				}
+				if info.Last == nil || !info.Last.Equals(&current.Masterchain.Block) {
+					b.Fatalf("masterchain block mismatch")
+				}
+			}
+		})
+
 		b.Run(fmt.Sprintf("block-state-current-shard/shards-%d", shards), func(b *testing.B) {
 			live, _, target := benchmarkLiveStoreWithCurrent(b, shards)
 

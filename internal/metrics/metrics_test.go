@@ -6,12 +6,54 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xssnick/gton/liteserver"
+	"github.com/xssnick/gton/service"
+	"github.com/xssnick/gton/service/p2p"
+
+	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestMetricsHandlerExposesLiteserverAndSyncMetrics(t *testing.T) {
+func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	m := New()
-	m.ObserveLiteserverQuery("GetTime", 1500*time.Millisecond)
-	m.SetSyncLag(ChainMasterchain, 12)
+	m.AddLiteserverInflight(1)
+	m.AddLiteserverInflight(-1)
+	m.ObserveLiteserverQuery(liteserver.QueryObservation{
+		Method:       "GetTime",
+		Response:     "CurrentTime",
+		Duration:     1500 * time.Millisecond,
+		WaitDuration: 200 * time.Millisecond,
+	})
+	m.ObserveSyncBlock(service.SyncBlockObservation{
+		Pipeline:         "next_block",
+		Chain:            ChainMasterchain,
+		Source:           "queue",
+		Result:           "success",
+		DownloadDuration: time.Second,
+		ApplyDuration:    500 * time.Millisecond,
+	})
+	m.ObserveSyncPersist(service.SyncPersistObservation{
+		Mode:          "next_block_async",
+		Result:        "success",
+		QueueDuration: 10 * time.Millisecond,
+		Duration:      20 * time.Millisecond,
+	})
+
+	localMaster := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     42,
+	}
+	m.SetServiceStatusReader(func() service.StatusSnapshot {
+		return service.StatusSnapshot{
+			StatusSnapshot: p2p.StatusSnapshot{
+				LatestMasterchain: &localMaster,
+			},
+			LocalMasterchain:      &localMaster,
+			LocalMasterchainUtime: time.Now().Unix() - 12,
+			LocalStateLoaded:      true,
+		}
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -23,8 +65,12 @@ func TestMetricsHandlerExposesLiteserverAndSyncMetrics(t *testing.T) {
 
 	body := rec.Body.String()
 	for _, want := range []string{
-		`flexserver_liteserver_query_duration_seconds_bucket{method="GetTime",le="2.5"} 1`,
-		`flexserver_sync_lag_seconds{chain="masterchain"} 12`,
+		`flexserver_liteserver_query_duration_seconds_bucket{error_code="0",method="GetTime",response="CurrentTime",le="2.5"} 1`,
+		`flexserver_liteserver_query_wait_seconds_bucket{error_code="0",method="GetTime",response="CurrentTime",le="0.25"} 1`,
+		`flexserver_liteserver_queries_total{error_code="0",method="GetTime",response="CurrentTime"} 1`,
+		`flexserver_sync_blocks_total{catch_up="false",chain="masterchain",pipeline="next_block",result="success",source="queue"} 1`,
+		`flexserver_sync_checkpoints_total{mode="next_block_async",result="success"} 1`,
+		`flexserver_sync_lag_seconds{chain="masterchain",shard="masterchain"}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics output does not contain %q\n%s", want, body)
@@ -35,6 +81,9 @@ func TestMetricsHandlerExposesLiteserverAndSyncMetrics(t *testing.T) {
 func TestNilMetricsObserverMethodsAreNoop(t *testing.T) {
 	var m *Metrics
 
-	m.ObserveLiteserverQuery("GetTime", time.Second)
-	m.SetSyncLag(ChainMasterchain, 12)
+	m.AddLiteserverInflight(1)
+	m.ObserveLiteserverQuery(liteserver.QueryObservation{Method: "GetTime", Duration: time.Second})
+	m.ObserveSyncCurrentState(service.SyncCurrentStateObservation{})
+	m.ObserveSyncBlock(service.SyncBlockObservation{})
+	m.ObserveSyncPersist(service.SyncPersistObservation{})
 }

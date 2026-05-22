@@ -6,15 +6,126 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
-	"github.com/xssnick/gton/service/storage"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
+
+func TestEventDeduperEvictsOldestWithCap(t *testing.T) {
+	deduper := newEventDeduper(time.Hour, 2)
+	now := time.Unix(100, 0)
+
+	if !deduper.Mark("a", now) {
+		t.Fatal("first a mark was not accepted")
+	}
+	if !deduper.Mark("b", now.Add(time.Second)) {
+		t.Fatal("first b mark was not accepted")
+	}
+	if !deduper.Mark("c", now.Add(2*time.Second)) {
+		t.Fatal("first c mark was not accepted")
+	}
+
+	if !deduper.Mark("a", now.Add(3*time.Second)) {
+		t.Fatal("oldest entry was not evicted when cap was exceeded")
+	}
+	if deduper.Mark("c", now.Add(4*time.Second)) {
+		t.Fatal("recent entry was not retained")
+	}
+}
+
+func TestOverlayBlockForDownloadUsesMonitorMinSplitDepth(t *testing.T) {
+	node := newTestNode(t)
+	block := testBlockID(0, int64(-0x2000000000000000), 10)
+
+	if got := node.overlayBlockForDownload(block); got.Shard != topShard {
+		t.Fatalf("default overlay shard = %016x, want top shard", uint64(got.Shard))
+	}
+
+	node.SetMonitorMinSplitDepth(0, 1)
+	if got := node.overlayBlockForDownload(block); got.Shard != int64(-0x4000000000000000) {
+		t.Fatalf("depth 1 overlay shard = %016x, want c000000000000000", uint64(got.Shard))
+	}
+
+	node.SetMonitorMinSplitDepth(0, 2)
+	if got := node.overlayBlockForDownload(block); got.Shard != block.Shard {
+		t.Fatalf("depth 2 overlay shard = %016x, want exact %016x", uint64(got.Shard), uint64(block.Shard))
+	}
+}
+
+func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, 32)
+	node.SetMonitorMinSplitDepth(0, 1)
+
+	leftShard := int64(0x4000000000000000)
+	rightShard := int64(-0x4000000000000000)
+	if err := node.SetActiveShardOverlays([]ton.BlockIDExt{{Workchain: 0, Shard: leftShard}}); err != nil {
+		t.Fatalf("set active left overlay: %v", err)
+	}
+
+	leftSub := testSubscriptionForOverlay(t, node, 0, leftShard)
+	if !leftSub.isActive() {
+		t.Fatal("left shard overlay should be active")
+	}
+	baseSub := testSubscriptionForOverlay(t, node, 0, topShard)
+	if !baseSub.isActive() {
+		t.Fatal("basechain parent overlay should be active")
+	}
+
+	if err := node.SetActiveShardOverlays([]ton.BlockIDExt{{Workchain: 0, Shard: rightShard}}); err != nil {
+		t.Fatalf("set active right overlay: %v", err)
+	}
+
+	if leftSub.isActive() {
+		t.Fatal("left shard overlay should be inactive after it leaves the active set")
+	}
+	deleteAt, ok := leftSub.inactiveExpiresAt()
+	if !ok || !deleteAt.After(time.Now()) {
+		t.Fatalf("left shard inactive expiry = %v, ok=%v", deleteAt, ok)
+	}
+	rightSub := testSubscriptionForOverlay(t, node, 0, rightShard)
+	if !rightSub.isActive() {
+		t.Fatal("right shard overlay should be active")
+	}
+	if !baseSub.isActive() {
+		t.Fatal("basechain parent overlay should stay active")
+	}
+
+	node.stopExpiredInactiveSubscriptions(time.Now().Add(inactiveShardOverlayTTL + time.Second))
+	if _, ok := findSubscriptionForOverlay(t, node, 0, leftShard); ok {
+		t.Fatal("expired inactive left shard overlay should be deleted")
+	}
+}
+
+func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
+	node := newTestNode(t)
+	node.runCtx = context.Background()
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "basechain",
+			ProtoVersionMajor: shardchainProtoVersionMajor,
+			ProtoVersionMinor: shardchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+	sub.setActive(false, time.Now().Add(time.Minute))
+
+	err := sub.answerPeerQuery(nil, GetCapabilities{}, func(context.Context, tl.Serializable) error {
+		t.Fatal("inactive subscription should not answer peer query")
+		return nil
+	})
+	if err == nil || err.Error() != "shard is inactive" {
+		t.Fatalf("inactive query error = %v", err)
+	}
+}
 
 func TestNodeWaitObservedMasterchainBlockAfterVerifiedSeen(t *testing.T) {
 	node := newTestNode(t)
@@ -66,6 +177,37 @@ func TestStatusSnapshotTracksLatestBasechainBlock(t *testing.T) {
 	}
 	if snapshot.LatestBasechain.SeqNo != 77 {
 		t.Fatalf("unexpected latest basechain seqno %d", snapshot.LatestBasechain.SeqNo)
+	}
+	if len(snapshot.LatestBasechainShards) != 1 || snapshot.LatestBasechainShards[0].SeqNo != 77 {
+		t.Fatalf("unexpected latest basechain shards %+v", snapshot.LatestBasechainShards)
+	}
+}
+
+func TestStatusSnapshotTracksLatestSplitBasechainBlocks(t *testing.T) {
+	node := newTestNode(t)
+
+	left := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(0x4000000000000000),
+		SeqNo:     77,
+	}
+	right := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-0x4000000000000000),
+		SeqNo:     78,
+	}
+	node.trackUnverifiedBroadcastBlock(BroadcastEvent{Overlay: "basechain", Block: right})
+	node.trackUnverifiedBroadcastBlock(BroadcastEvent{Overlay: "basechain", Block: left})
+
+	snapshot := node.StatusSnapshot()
+	if snapshot.LatestBasechain == nil || snapshot.LatestBasechain.SeqNo != right.SeqNo {
+		t.Fatalf("unexpected latest basechain block %+v", snapshot.LatestBasechain)
+	}
+	if len(snapshot.LatestBasechainShards) != 2 {
+		t.Fatalf("latest basechain shards = %d, want 2", len(snapshot.LatestBasechainShards))
+	}
+	if !snapshot.LatestBasechainShards[0].Equals(&left) || !snapshot.LatestBasechainShards[1].Equals(&right) {
+		t.Fatalf("unexpected split basechain shards %+v", snapshot.LatestBasechainShards)
 	}
 }
 
@@ -281,6 +423,30 @@ func TestNewUsesConfiguredADNLKeys(t *testing.T) {
 	if !bytes.Equal(node.dhtPrivKey, dhtPriv) {
 		t.Fatal("expected configured DHT key to be used")
 	}
+}
+
+func testSubscriptionForOverlay(tb testing.TB, node *Node, workchain int32, shard int64) *overlaySubscription {
+	tb.Helper()
+
+	sub, ok := findSubscriptionForOverlay(tb, node, workchain, shard)
+	if !ok {
+		tb.Fatalf("missing overlay subscription for %d:%016x", workchain, uint64(shard))
+	}
+	return sub
+}
+
+func findSubscriptionForOverlay(tb testing.TB, node *Node, workchain int32, shard int64) (*overlaySubscription, bool) {
+	tb.Helper()
+
+	spec, err := buildOverlaySpec(node.zeroStateFileHash, workchain, shard, overlayName(workchain, shard))
+	if err != nil {
+		tb.Fatalf("build overlay spec: %v", err)
+	}
+
+	node.subscriptionsMx.RLock()
+	sub := node.subscriptions[overlaySpecKey(spec)]
+	node.subscriptionsMx.RUnlock()
+	return sub, sub != nil
 }
 
 func TestStartDHTClientUsesSeparateGateway(t *testing.T) {

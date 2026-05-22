@@ -5,13 +5,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"github.com/xssnick/gton/service/p2p"
-	tnstore "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/xssnick/gton/service/p2p"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -62,6 +63,46 @@ func TestApplyBlockFromFixture(t *testing.T) {
 	newStateHash := newStateCell.HashKey(0)
 	if got, want := hex.EncodeToString(next.StateRootHash), hex.EncodeToString(newStateHash[:]); got != want {
 		t.Fatalf("unexpected next state root hash %s want %s", got, want)
+	}
+}
+
+func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	prepared, err := prepareDownloadedBlock(*downloaded)
+	if err != nil {
+		t.Fatalf("prepare fixture block: %v", err)
+	}
+
+	var block tlb.Block
+	if err := tlb.LoadFromCell(&block, downloaded.Block.MustBeginParse()); err != nil {
+		t.Fatalf("load fixture tlb block: %v", err)
+	}
+
+	oldStateCell := block.StateUpdate.MustPeekRef(0)
+	var oldParsed tlb.ShardStateUnsplit
+	if err := tlb.LoadFromCell(&oldParsed, oldStateCell.MustBeginParse()); err != nil {
+		t.Fatalf("parse old state from update: %v", err)
+	}
+
+	oldWC, oldShard := tlb.ConvertShardIdentToShard(oldParsed.ShardIdent)
+	oldStateHash := oldStateCell.HashKey(0)
+	current, err := tnstore.ParseStateCell(&ton.BlockIDExt{
+		Workchain: oldWC,
+		Shard:     int64(oldShard),
+		SeqNo:     oldParsed.Seqno,
+	}, oldStateCell, oldStateCell.ToBOCWithOptions(cell.BOCSerializeOptions{}), oldStateHash[:], nil)
+	if err != nil {
+		t.Fatalf("build current state from old update branch: %v", err)
+	}
+	current.Block = prepared.Meta.PrevRefs[0]
+
+	downloaded.ProofBOC = nil
+	next, _, err := (&Service{}).applyStoredMasterchainTransition(current, *downloaded, nil)
+	if err != nil {
+		t.Fatalf("apply stored masterchain transition: %v", err)
+	}
+	if !next.Block.Equals(&downloaded.ID) {
+		t.Fatalf("unexpected next block id %s", tnstore.FormatBlockRef(next.Block))
 	}
 }
 
@@ -635,6 +676,122 @@ func TestStateCellWindowCacheRetriesPendingCheckpointCells(t *testing.T) {
 	nextCheckpoint.complete()
 	if stale := window.beginCheckpoint(); stale != nil {
 		t.Fatal("completed checkpoint left pending cells behind")
+	}
+}
+
+func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
+	var first, second cell.Hash
+	first[0] = 1
+	second[0] = 2
+
+	window := newStateCellWindowCache(nil)
+	window.addPreparedRecords(map[cell.Hash][]byte{
+		first: []byte{1, 2, 3},
+	})
+	checkpoint := window.beginCheckpoint()
+	window.addPreparedRecords(map[cell.Hash][]byte{
+		second: []byte{4, 5},
+	})
+
+	if got := window.byteSize(); got != 5 {
+		t.Fatalf("window byte size = %d, want 5", got)
+	}
+
+	checkpoint.complete()
+	if got := window.byteSize(); got != 2 {
+		t.Fatalf("window byte size after checkpoint = %d, want 2", got)
+	}
+
+	window.addPreparedRecords(map[cell.Hash][]byte{
+		second: []byte{6},
+	})
+	if got := window.byteSize(); got != 1 {
+		t.Fatalf("window byte size after replacement = %d, want 1", got)
+	}
+}
+
+func TestStateCellWindowLoaderUsesSourceSnapshot(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
+	cache := newStateCellEncodedCache(1)
+	cache.addRecords(mustPreparedReachableStateCells(t, root))
+
+	window := newStateCellWindowCache(nil)
+	window.mu.Lock()
+	window.active = nil
+	window.pending = []*stateCellEncodedCache{cache}
+	window.mu.Unlock()
+
+	loader := window.loader()
+
+	window.mu.Lock()
+	window.pending = nil
+	window.active = newStateCellEncodedCache(1)
+	window.mu.Unlock()
+
+	loaded, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load cell from snapshot: %v", err)
+	}
+	if loaded.HashKey() != root.HashKey() {
+		t.Fatal("loaded snapshot cell hash mismatch")
+	}
+}
+
+func TestArchiveStateCellOverlayLoaderUsesSourceSnapshot(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
+	cache := newArchiveStateCellRecordCache(1)
+	cache.addRecords(mustPreparedReachableStateCells(t, root))
+
+	overlay := newArchiveStateCellOverlay(nil)
+	overlay.mu.Lock()
+	overlay.active = nil
+	overlay.pending = []*archiveStateCellRecordCache{cache}
+	overlay.mu.Unlock()
+
+	loader := overlay.loader()
+
+	overlay.mu.Lock()
+	overlay.pending = nil
+	overlay.active = newArchiveStateCellRecordCache(1)
+	overlay.mu.Unlock()
+
+	loaded, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load archive cell from snapshot: %v", err)
+	}
+	if loaded.HashKey() != root.HashKey() {
+		t.Fatal("loaded archive snapshot cell hash mismatch")
+	}
+}
+
+func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T) {
+	var first, second cell.Hash
+	first[0] = 1
+	second[0] = 2
+
+	overlay := newArchiveStateCellOverlay(nil)
+	overlay.rememberPreparedCells(map[cell.Hash][]byte{
+		first: []byte{1, 2, 3, 4},
+	})
+	checkpoint := overlay.beginCheckpoint()
+	overlay.rememberPreparedCells(map[cell.Hash][]byte{
+		second: []byte{5, 6},
+	})
+
+	if got := overlay.byteSize(); got != 6 {
+		t.Fatalf("overlay byte size = %d, want 6", got)
+	}
+
+	checkpoint.complete()
+	if got := overlay.byteSize(); got != 2 {
+		t.Fatalf("overlay byte size after checkpoint = %d, want 2", got)
+	}
+
+	overlay.rememberPreparedCells(map[cell.Hash][]byte{
+		second: []byte{7},
+	})
+	if got := overlay.byteSize(); got != 1 {
+		t.Fatalf("overlay byte size after replacement = %d, want 1", got)
 	}
 }
 

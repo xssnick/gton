@@ -295,6 +295,82 @@ func ParseVerifiedBlockCell(id ton.BlockIDExt, root *cell.Cell) (*tlb.Block, err
 	return &block, nil
 }
 
+func BlockTransactionCountFromBlockData(id ton.BlockIDExt, data []byte) (uint32, error) {
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		return 0, fmt.Errorf("parse block boc: %w", err)
+	}
+
+	return BlockTransactionCountFromBlockCell(id, root)
+}
+
+func BlockTransactionCountFromBlockCell(id ton.BlockIDExt, root *cell.Cell) (uint32, error) {
+	block, err := ParseVerifiedBlockCell(id, root)
+	if err != nil {
+		return 0, err
+	}
+
+	return BlockTransactionCountFromParsed(id, block)
+}
+
+func BlockTransactionCountFromParsed(id ton.BlockIDExt, block *tlb.Block) (uint32, error) {
+	if block == nil || block.Extra == nil || block.Extra.ShardAccountBlocks == nil {
+		return 0, fmt.Errorf("block %s does not contain shard account blocks", FormatBlockRef(id))
+	}
+
+	txCount, err := countBlockTransactions(block.Extra.ShardAccountBlocks)
+	if err != nil {
+		return 0, fmt.Errorf("count transactions in %s: %w", FormatBlockRef(id), err)
+	}
+
+	return txCount, nil
+}
+
+func countBlockTransactions(root *cell.Cell) (uint32, error) {
+	var shardAccounts tlb.ShardAccountBlocks
+	loader, err := root.BeginParse()
+	if err != nil {
+		return 0, fmt.Errorf("load shard account blocks: %w", err)
+	}
+	if err := tlb.LoadFromCell(&shardAccounts, loader); err != nil {
+		return 0, fmt.Errorf("load shard account blocks: %w", err)
+	}
+	if shardAccounts.Accounts == nil {
+		return 0, nil
+	}
+
+	accounts, err := shardAccounts.Accounts.Range(false, false)
+	if err != nil {
+		return 0, fmt.Errorf("load shard account dictionary: %w", err)
+	}
+
+	var total uint64
+	for _, kv := range accounts {
+		if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), kv.Value); err != nil {
+			return 0, fmt.Errorf("load account currency collection: %w", err)
+		}
+
+		var accountBlock tlb.AccountBlock
+		if err := tlb.LoadFromCell(&accountBlock, kv.Value); err != nil {
+			return 0, fmt.Errorf("load account block: %w", err)
+		}
+		if accountBlock.Transactions == nil {
+			continue
+		}
+
+		txs, err := accountBlock.Transactions.Range(false, false)
+		if err != nil {
+			return 0, fmt.Errorf("load account transactions: %w", err)
+		}
+		total += uint64(len(txs))
+		if total > uint64(^uint32(0)) {
+			return 0, fmt.Errorf("transaction count overflows uint32")
+		}
+	}
+
+	return uint32(total), nil
+}
+
 func VerifyBlockIdentity(id ton.BlockIDExt, block *tlb.Block) error {
 	if block == nil {
 		return fmt.Errorf("block is nil for %s", FormatBlockRef(id))

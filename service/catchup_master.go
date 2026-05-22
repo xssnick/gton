@@ -40,43 +40,19 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	s.currentStatus = next
 	s.currentStatusMu.Unlock()
 
-	s.observeCurrentSyncLag(context.Background(), next, time.Now())
+	s.observeCurrentSyncState(next)
 	return true
 }
 
-func (s *Service) observeCurrentSyncLag(ctx context.Context, current *storage.CurrentState, now time.Time) {
-	if s.syncLag == nil || current == nil {
+func (s *Service) observeCurrentSyncState(current *storage.CurrentState) {
+	if s.sync == nil || current == nil {
 		return
 	}
 
-	if lag, ok := blockLagSeconds(ctx, s.storage, &current.Masterchain, now); ok {
-		s.syncLag.SetSyncLag(syncLagChainMasterchain, lag)
-	}
-
-	// One shardchain gauge represents all shards, so expose the slowest shard.
-	var shardLag float64
-	var shardLagKnown bool
-	for _, shard := range current.Shards {
-		lag, ok := blockLagSeconds(ctx, s.storage, &shard, now)
-		if !ok {
-			continue
-		}
-		if !shardLagKnown || lag > shardLag {
-			shardLag = lag
-			shardLagKnown = true
-		}
-	}
-	if shardLagKnown {
-		s.syncLag.SetSyncLag(syncLagChainShardchain, shardLag)
-	}
-}
-
-func blockLagSeconds(ctx context.Context, store storage.Storage, state *storage.BlockState, now time.Time) (float64, bool) {
-	utime := blockStateUtime(ctx, store, state)
-	if utime <= 0 {
-		return 0, false
-	}
-	return float64(now.Unix() - utime), true
+	s.sync.ObserveSyncCurrentState(SyncCurrentStateObservation{
+		MasterchainSeqno: current.Masterchain.Block.SeqNo,
+		ShardClientSeqno: current.ShardClientSeqno,
+	})
 }
 
 func currentStateBehind(next *storage.CurrentState, current *storage.CurrentState) bool {
@@ -106,6 +82,14 @@ type masterchainApplyTiming struct {
 }
 
 func (s *Service) applyMasterchainTransitionWithConsensusProof(current *storage.BlockState, downloaded p2p.DownloadedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
+	return s.applyMasterchainTransition(current, downloaded, proof, applier, true)
+}
+
+func (s *Service) applyStoredMasterchainTransition(current *storage.BlockState, downloaded p2p.DownloadedBlock, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
+	return s.applyMasterchainTransition(current, downloaded, nil, applier, false)
+}
+
+func (s *Service) applyMasterchainTransition(current *storage.BlockState, downloaded p2p.DownloadedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier, validateConsensus bool) (*storage.BlockState, masterchainApplyTiming, error) {
 	started := time.Now()
 	var timing masterchainApplyTiming
 	finish := func() masterchainApplyTiming {
@@ -134,12 +118,14 @@ func (s *Service) applyMasterchainTransitionWithConsensusProof(current *storage.
 		return nil, finish(), fmt.Errorf("%w: block=%s prev=%s current=%s", errMasterchainPrevMismatch, downloaded.BlockRef(), storage.FormatBlockRef(prev), storage.FormatBlockRef(current.Block))
 	}
 
-	stageStarted = time.Now()
-	if err = s.validateMasterchainBlockConsensusWithProof(current, tonBlockForConsensus{block: downloaded.ID, proofBOC: downloaded.ProofBOC, broadcastSignatures: downloaded.BroadcastSignatures}, proof); err != nil {
+	if validateConsensus {
+		stageStarted = time.Now()
+		if err = s.validateMasterchainBlockConsensusWithProof(current, tonBlockForConsensus{block: downloaded.ID, proofBOC: downloaded.ProofBOC, broadcastSignatures: downloaded.BroadcastSignatures}, proof); err != nil {
+			timing.consensus += time.Since(stageStarted)
+			return nil, finish(), fmt.Errorf("validate masterchain consensus for %s: %w", downloaded.BlockRef(), err)
+		}
 		timing.consensus += time.Since(stageStarted)
-		return nil, finish(), fmt.Errorf("validate masterchain consensus for %s: %w", downloaded.BlockRef(), err)
 	}
-	timing.consensus += time.Since(stageStarted)
 
 	stageStarted = time.Now()
 	next, err := applyBlockWithPreviousStates([]*storage.BlockState{current}, downloaded, applier)
@@ -197,6 +183,13 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 		elapsed := time.Since(started)
 		s.currentStatePersistMu.Unlock()
 		if err != nil {
+			s.observeSyncPersist(SyncPersistObservation{
+				Mode:          "next_block_async",
+				Result:        "error",
+				QueueDuration: time.Since(queuedAt) - elapsed,
+				Duration:      elapsed,
+				States:        len(checkpoint.states),
+			})
 			wrapped := fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 			s.setCurrentStatePersistError(wrapped)
 			s.log.Error().
@@ -212,6 +205,13 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 		if onCommitted != nil {
 			onCommitted()
 		}
+		s.observeSyncPersist(SyncPersistObservation{
+			Mode:          "next_block_async",
+			Result:        "success",
+			QueueDuration: time.Since(queuedAt) - elapsed,
+			Duration:      elapsed,
+			States:        len(checkpoint.states),
+		})
 		s.log.Debug().
 			Str("masterchain", storage.FormatBlockRef(master)).
 			Uint32("shard_client_seqno", shardClientSeqno).
@@ -243,7 +243,8 @@ func (s *Service) persistNextBlockCurrentStateSync(current *storage.CurrentState
 
 	lockStarted := time.Now()
 	s.currentStatePersistMu.Lock()
-	timing.persist += time.Since(lockStarted)
+	lockElapsed := time.Since(lockStarted)
+	timing.persist += lockElapsed
 	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		s.currentStatePersistMu.Unlock()
 		return nil, err
@@ -254,17 +255,32 @@ func (s *Service) persistNextBlockCurrentStateSync(current *storage.CurrentState
 	persistCtx := s.currentStatePersistContext()
 	cellRecords := mergeEncodedCellRecords(cells.records(), stateCells)
 	committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.states, artifactTarget, cellRecords)
+	elapsed := time.Since(started)
 	s.currentStatePersistMu.Unlock()
 	if err != nil {
+		s.observeSyncPersist(SyncPersistObservation{
+			Mode:          "next_block_sync",
+			Result:        "error",
+			QueueDuration: lockElapsed,
+			Duration:      elapsed,
+			States:        len(checkpoint.states),
+		})
 		return nil, fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 	}
 
+	s.observeSyncPersist(SyncPersistObservation{
+		Mode:          "next_block_sync",
+		Result:        "success",
+		QueueDuration: lockElapsed,
+		Duration:      elapsed,
+		States:        len(checkpoint.states),
+	})
 	s.log.Info().
 		Str("masterchain", storage.FormatBlockRef(master)).
 		Uint32("shard_client_seqno", shardClientSeqno).
 		Int("shards", shards).
 		Str("reason", reason).
-		Dur("elapsed", time.Since(started)).
+		Dur("elapsed", elapsed).
 		Int("states", len(checkpoint.states)).
 		Msg("next-block shard-client checkpoint persisted")
 	cells.complete()

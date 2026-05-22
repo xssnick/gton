@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/rs/zerolog"
 )
 
@@ -53,7 +54,7 @@ type cellStoreMetrics struct {
 	memTableCount          int64
 }
 
-func openCellStore(dir string, generation uint64, cacheSize int64, shardMemTableSize, bytesPerSync int, readOnly bool, logger zerolog.Logger) (*cellStore, error) {
+func openCellStore(dir string, generation uint64, fs vfs.FS, cacheSize int64, shardMemTableSize, memTableStopWritesThreshold, bytesPerSync int, readOnly bool, logger zerolog.Logger) (*cellStore, error) {
 	if generation == 0 {
 		return nil, fmt.Errorf("cell generation is zero")
 	}
@@ -63,6 +64,7 @@ func openCellStore(dir string, generation uint64, cacheSize int64, shardMemTable
 		Uint64("generation", generation).
 		Int64("cache_size", cacheSize).
 		Int("shard_memtable_size", shardMemTableSize).
+		Int("memtable_stop_writes_threshold", memTableStopWritesThreshold).
 		Int("bytes_per_sync", bytesPerSync).
 		Int("compaction_parallelism", pebbleCellCompactionParallelism()).
 		Int("max_concurrent_compactions", pebbleCellMaxConcurrentCompactions()).
@@ -96,7 +98,7 @@ func openCellStore(dir string, generation uint64, cacheSize int64, shardMemTable
 
 			shardLogger := logger.With().Str("db", "celldb").Uint64("generation", generation).Int("shard", i).Logger()
 			compactionScheduler := compactions.newScheduler()
-			shardOpts := newCellPebbleOptions(cells.cache, cells.fileCache, shardMemTableSize, bytesPerSync, compactionScheduler, shardLogger)
+			shardOpts := newCellPebbleOptions(cells.cache, cells.fileCache, fs, shardMemTableSize, memTableStopWritesThreshold, bytesPerSync, compactionScheduler, shardLogger)
 			shardOpts.ReadOnly = readOnly
 			shardStarted := time.Now()
 			logger.Info().

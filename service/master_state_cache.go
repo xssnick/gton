@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 
+	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -13,6 +14,8 @@ func (s *Service) rememberMasterState(state *storage.BlockState) {
 	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
 		return
 	}
+
+	s.updateP2PShardOverlays(state)
 
 	key := storage.BlockKey(state.Block)
 	cloned := storage.CloneBlockState(state)
@@ -33,6 +36,38 @@ func (s *Service) rememberMasterState(state *storage.BlockState) {
 		copy(s.masterStateCacheKeys, s.masterStateCacheKeys[1:])
 		s.masterStateCacheKeys = s.masterStateCacheKeys[:len(s.masterStateCacheKeys)-1]
 		delete(s.masterStateCache, evict)
+	}
+}
+
+func (s *Service) updateP2PShardOverlays(state *storage.BlockState) {
+	if s.node == nil {
+		return
+	}
+
+	depth, err := monitorMinSplitDepth(state, 0)
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("masterchain", storage.FormatBlockRef(state.Block)).
+			Msg("failed to update p2p monitor split depth")
+		return
+	}
+
+	s.node.SetMonitorMinSplitDepth(0, depth)
+
+	shards, err := state2.ShardBlocksFromMasterState(state)
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("masterchain", storage.FormatBlockRef(state.Block)).
+			Msg("failed to update p2p shard overlays")
+		return
+	}
+	if err = s.node.SetActiveShardOverlays(shards); err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("masterchain", storage.FormatBlockRef(state.Block)).
+			Msg("failed to update p2p shard overlays")
 	}
 }
 

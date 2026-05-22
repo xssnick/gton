@@ -78,10 +78,9 @@ func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, 
 		return nil, err
 	}
 
-	sub, created := n.getOrCreateSubscription(spec)
-	if created {
-		go sub.run(n.runCtx)
-	}
+	sub, _ := n.getOrCreateSubscription(spec)
+	sub.setActive(true, time.Time{})
+	n.startSubscription(sub)
 	return sub, nil
 }
 

@@ -109,7 +109,7 @@ func (s *Service) StartPersistentStateSerialization(ctx context.Context, masterS
 		return err
 	}
 
-	master, err := s.durableMasterchainBlockForSerialization(ctx, masterSeqno)
+	master, err := s.durableMasterchainBlock(ctx, masterSeqno, "persistent state serialization")
 	if err != nil {
 		lease.release()
 		return err
@@ -145,10 +145,6 @@ func (s PersistentStateSerializationScope) String() string {
 	default:
 		return fmt.Sprintf("unknown_%d", s)
 	}
-}
-
-func (s *Service) durableMasterchainBlockForSerialization(ctx context.Context, masterSeqno uint32) (ton.BlockIDExt, error) {
-	return s.durableMasterchainBlock(ctx, masterSeqno, "persistent state serialization")
 }
 
 func (s *Service) durableMasterchainBlock(ctx context.Context, masterSeqno uint32, operation string) (ton.BlockIDExt, error) {

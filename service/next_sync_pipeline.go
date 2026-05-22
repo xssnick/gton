@@ -103,9 +103,17 @@ func (s *Service) runNextSyncToTarget(ctx context.Context, current *storage.Curr
 	return next, err
 }
 
-func (s *Service) runNextSyncBootstrap(ctx context.Context, current *storage.CurrentState) (*storage.CurrentState, bool, error) {
+type nextSyncBootstrapResult struct {
+	current *storage.CurrentState
+	changed bool
+}
+
+func (s *Service) runNextSyncBootstrap(ctx context.Context, current *storage.CurrentState) (nextSyncBootstrapResult, error) {
 	next, processed, err := s.runNextSync(ctx, current, nextSyncBootstrap, ton.BlockIDExt{}, nextBlockBootstrapBlocks, "next_block_bootstrap")
-	return next, processed > 0, err
+	if err != nil {
+		return nextSyncBootstrapResult{}, err
+	}
+	return nextSyncBootstrapResult{current: next, changed: processed > 0}, nil
 }
 
 func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState, mode nextSyncMode, target ton.BlockIDExt, maxBlocks uint32, method string) (*storage.CurrentState, uint32, error) {
@@ -229,6 +237,16 @@ func (r *nextSyncRunner) runTargetMasterSource(out chan<- nextMasterDownload) {
 		if next.source == "" {
 			next.source = "unknown"
 		}
+		if next.err != nil {
+			r.service.observeSyncBlock(SyncBlockObservation{
+				Pipeline:         r.method,
+				Chain:            syncChainLabel(item.prev),
+				Source:           next.source,
+				Result:           "error",
+				CatchUp:          true,
+				DownloadDuration: next.downloadElapsed,
+			})
+		}
 		if !r.sendMasterDownload(out, next) {
 			return
 		}
@@ -248,6 +266,14 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		downloaded, source, err := r.service.downloadNextChainBlockProbe(r.ctx, prev)
 		elapsed := time.Since(started)
 		if err != nil {
+			r.service.observeSyncBlock(SyncBlockObservation{
+				Pipeline:         r.method,
+				Chain:            syncChainLabel(prev),
+				Source:           "probe",
+				Result:           "error",
+				CatchUp:          false,
+				DownloadDuration: elapsed,
+			})
 			if isExpectedRetryError(err) {
 				r.service.log.Debug().
 					Err(err).
@@ -340,22 +366,36 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 		downloadSource:  item.source,
 		downloadElapsed: item.downloadElapsed,
 	}
+	observe := func(result string, applyDuration time.Duration) {
+		r.service.observeSyncBlock(SyncBlockObservation{
+			Pipeline:         r.method,
+			Chain:            syncChainLabel(item.block.ID),
+			Source:           item.source,
+			Result:           result,
+			CatchUp:          r.mode == nextSyncToTarget,
+			DownloadDuration: item.downloadElapsed,
+			ApplyDuration:    applyDuration,
+		})
+	}
 
 	nextMaster, applyTiming, err := r.service.applyMasterchainTransitionWithConsensusProof(master, item.block, nil, r.stateCells)
 	applied.applyTiming = applyTiming
 	if err != nil {
 		applied.err = err
+		observe("error", applyTiming.total)
 		return applied, err
 	}
 
 	r.service.publishLiveBlock(item.block, false)
 	if err = r.service.stageAppliedBlockArtifact(r.ctx, item.block, 0); err != nil {
 		applied.err = err
+		observe("error", applyTiming.total)
 		return applied, err
 	}
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
 	r.service.rememberMasterState(nextMaster)
 	applied.master = nextMaster
+	observe("success", applyTiming.total)
 	return applied, nil
 }
 
@@ -722,7 +762,11 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 		if err := r.flushStagedCurrent(); err != nil {
 			return err
 		}
-	} else if r.stagedBlocks >= nextBlockCatchUpCheckpointBlocks {
+	} else if r.shouldBackpressureStagedCurrent() {
+		if err := r.flushStagedCurrent(); err != nil {
+			return err
+		}
+	} else if r.shouldCheckpointStagedCurrent() {
 		if err := r.tryFlushStagedCurrent(); err != nil {
 			return err
 		}
@@ -771,8 +815,33 @@ func (r *nextSyncRunner) logCheckpointDeferred() {
 		Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 		Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 		Uint32("pending_checkpoint_blocks", r.stagedBlocks).
-		Uint32("checkpoint_blocks", nextBlockCatchUpCheckpointBlocks).
+		Uint64("pending_checkpoint_bytes", r.pendingCheckpointBytes()).
+		Uint32("checkpoint_blocks", r.service.nextCheckpointBlocks()).
+		Uint64("checkpoint_bytes", r.service.checkpointBytesTarget()).
+		Uint32("checkpoint_backpressure_blocks", checkpointBackpressureBlocks(r.service.nextCheckpointBlocks())).
+		Uint64("checkpoint_backpressure_bytes", checkpointBackpressureBytes(r.service.checkpointBytesTarget())).
 		Msg("next-block checkpoint deferred because current state persist is busy")
+}
+
+func (r *nextSyncRunner) shouldCheckpointStagedCurrent() bool {
+	if r.stagedBlocks >= r.service.nextCheckpointBlocks() {
+		return true
+	}
+	return r.pendingCheckpointBytes() >= r.service.checkpointBytesTarget()
+}
+
+func (r *nextSyncRunner) shouldBackpressureStagedCurrent() bool {
+	if r.stagedBlocks >= checkpointBackpressureBlocks(r.service.nextCheckpointBlocks()) {
+		return true
+	}
+	return r.pendingCheckpointBytes() >= checkpointBackpressureBytes(r.service.checkpointBytesTarget())
+}
+
+func (r *nextSyncRunner) pendingCheckpointBytes() uint64 {
+	if r.stateCells == nil {
+		return 0
+	}
+	return r.stateCells.byteSize()
 }
 
 func (r *nextSyncRunner) takeShardResolverStats() shardStateResolverStats {
@@ -985,6 +1054,7 @@ func (r *nextSyncRunner) logProgressIfNeeded(item nextAppliedMaster) {
 		Str("shard_client", storage.FormatBlockRef(r.current.Masterchain.Block)).
 		Str("catchup_method", r.method).
 		Uint32("pending_checkpoint_blocks", r.stagedBlocks).
+		Uint64("pending_checkpoint_bytes", r.pendingCheckpointBytes()).
 		Uint32("master_shard_gap_blocks", masterShardGapBlocks).
 		Uint64("shard_blocks_applied", r.shardApplied)
 	if r.mode == nextSyncToTarget {

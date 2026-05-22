@@ -341,7 +341,7 @@ func (d persistentStateSnapshotDownloader) preparePersistentState(ctx context.Co
 	default:
 		return fmt.Errorf("unexpected preparePersistentState response %T", resp)
 	}
-	n.log.Info().
+	n.log.Debug().
 		Str("peer", peer.addr).
 		Str("block", formatBlockRef(d.block)).
 		Str("masterchain", formatBlockRef(d.master)).
@@ -390,7 +390,7 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 	}
 
 	if effectiveShard == 0 {
-		d.node.log.Info().
+		d.node.log.Debug().
 			Str("peer", peer.addr).
 			Str("block", formatBlockRef(d.block)).
 			Str("masterchain", formatBlockRef(d.master)).
@@ -447,7 +447,7 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 		workers = chunkCount
 	}
 
-	d.node.log.Info().
+	d.node.log.Debug().
 		Str("peer", peer.addr).
 		Str("block", formatPersistentStateBlockRef(d.block, id.EffectiveShard)).
 		Str("masterchain", formatBlockRef(d.master)).
@@ -811,64 +811,32 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx context.Context, splitDepth uint32) (*downloadedSplitStateHeader, error) {
 	n := d.node
 
-	paths, err := n.reusableStagedStateFiles(d.block, d.master, d.block.Shard)
+	staged, err := n.loadReusablePersistentStateFile(ctx, d.block, d.master, d.block.Shard)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, path := range paths {
-		if err = ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		staged, err := n.loadReusableStagedStateFile(path, d.block.Shard)
-		if err != nil {
-			if errors.Is(err, errStateSnapshotInvalid) {
-				n.removeInvalidReusableStateFile(d.block, d.block.Shard, path, err)
-				continue
-			}
-			return nil, err
-		}
-
-		header, err := d.parseStagedSplitHeader(splitDepth, staged)
-		if err != nil {
-			runtime.GC()
-			if errors.Is(err, errStateSnapshotInvalid) {
-				staged.keep = false
-				if cleanupErr := staged.cleanup(); cleanupErr != nil {
-					n.log.Warn().
-						Err(cleanupErr).
-						Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
-						Str("path", staged.path).
-						Msg("failed to remove invalid split persistent state header file")
-				}
-				continue
-			}
-			return nil, err
-		}
-
-		n.log.Info().
-			Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
-			Str("masterchain", formatBlockRef(d.master)).
-			Str("size", formatByteSize(staged.size)).
-			Str("path", staged.path).
-			Msg("using reusable staged split persistent state header")
-
-		if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
-			runtime.GC()
-			return nil, fmt.Errorf("store reusable split persistent state header file: %w", err)
-		}
+	header, err := d.parseStagedSplitHeader(splitDepth, staged)
+	if err != nil {
 		runtime.GC()
-		return header, nil
+		return nil, err
 	}
 
-	return nil, storage.ErrNotFound
+	n.log.Info().
+		Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
+		Str("masterchain", formatBlockRef(d.master)).
+		Str("size", formatByteSize(staged.size)).
+		Str("path", staged.path).
+		Msg("using reusable staged split persistent state header")
+
+	runtime.GC()
+	return header, nil
 }
 
 func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uint32, staged *stagedStateFile) (*downloadedSplitStateHeader, error) {
 	n := d.node
 
-	root, _, err := staged.decodeRootCells()
+	root, err := staged.decodeRootCells(stateBOCParseOptions())
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse staged split persistent state header boc: %w", errStateSnapshotInvalid, err)
 	}
@@ -1125,7 +1093,8 @@ func (d persistentStateSnapshotDownloader) importSplitPart(ctx context.Context, 
 		Msg("importing staged split persistent state part cells")
 
 	partBlock := splitStatePartStorageBlock(d.block, part)
-	if _, err := n.decodeAndImportSplitPartStagedStateCellTree(ctx, d.block, partBlock, staged, part.rootHash); err != nil {
+	_, err := n.decodeAndImportSplitPartStagedStateCellTree(ctx, d.block, partBlock, staged, part.rootHash)
+	if err != nil {
 		if errors.Is(err, errStateSnapshotInvalid) {
 			path := staged.path
 			staged.keep = false
@@ -1163,25 +1132,7 @@ func (d persistentStateSnapshotDownloader) importSplitPart(ctx context.Context, 
 
 func (d persistentStateSnapshotDownloader) loadReusableSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart) (*downloadedSplitStatePart, error) {
 	n := d.node
-	paths, err := n.reusableStagedStateFiles(d.block, d.master, int64(part.effectiveShard))
-	if err != nil {
-		return nil, err
-	}
-
-	for _, path := range paths {
-		if err = ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		staged, err := n.loadReusableStagedStateFile(path, int64(part.effectiveShard))
-		if err != nil {
-			if errors.Is(err, errStateSnapshotInvalid) {
-				n.removeInvalidReusableStateFile(d.block, int64(part.effectiveShard), path, err)
-				continue
-			}
-			return nil, err
-		}
-
+	useStaged := func(staged *stagedStateFile) (*downloadedSplitStatePart, error) {
 		n.log.Info().
 			Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
 			Str("masterchain", formatBlockRef(d.master)).
@@ -1190,7 +1141,29 @@ func (d persistentStateSnapshotDownloader) loadReusableSplitPart(ctx context.Con
 			Str("size", formatByteSize(staged.size)).
 			Str("path", staged.path).
 			Msg("using reusable staged split persistent state part")
+		if lazyRoot, err := n.loadImportedSplitStatePartRoot(ctx, d.block, part); err == nil {
+			staged.lazyRoot = lazyRoot
+			n.log.Info().
+				Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
+				Str("masterchain", formatBlockRef(d.master)).
+				Int("part", idx+1).
+				Int("parts", partsCount).
+				Str("path", staged.path).
+				Msg("using imported reusable split persistent state part cells")
+		} else if errors.Is(err, context.Canceled) {
+			return nil, err
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("load imported reusable split state part %d cells: %w", idx+1, err)
+		}
 		return &downloadedSplitStatePart{staged: staged}, nil
+	}
+
+	if staged, err := n.loadReusablePersistentStateFile(ctx, d.block, d.master, int64(part.effectiveShard)); err == nil {
+		return useStaged(staged)
+	} else if errors.Is(err, context.Canceled) {
+		return nil, err
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
 	}
 
 	return nil, storage.ErrNotFound

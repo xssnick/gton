@@ -22,7 +22,8 @@ type cellGenerationRotationStore interface {
 	BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) (uint64, error)
 	AbortCellGeneration(ctx context.Context, generation uint64) error
 	CleanupCellGeneration(ctx context.Context, generation uint64) error
-	ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error)
+	ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error)
+	ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)
 	LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader
 	SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error
 	SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState) (uint64, error)
@@ -40,12 +41,24 @@ type generationStateCellImporter struct {
 	generation uint64
 }
 
-func (i generationStateCellImporter) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, parsedCells []cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	return i.store.ImportStateCellTreeInGeneration(ctx, i.generation, block, root, parsedCells, totalCells)
+func (i generationStateCellImporter) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
+	return i.store.ImportStateCellTreeInGeneration(ctx, i.generation, block, root, totalCells)
+}
+
+func (i generationStateCellImporter) ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
+	return i.store.ImportStateBOCViewInGeneration(ctx, i.generation, block, view)
 }
 
 func (i generationStateCellImporter) LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error) {
 	return nil, storage.ErrNotFound
+}
+
+func (i generationStateCellImporter) TrustImportedStateCellHashes() bool {
+	return true
+}
+
+func (i generationStateCellImporter) ReuseImportedSplitStatePartCells() bool {
+	return false
 }
 
 func (s *Service) afterPersistentStateSerialized(ctx context.Context, persistent ton.BlockIDExt, scope PersistentStateSerializationScope) {
@@ -404,7 +417,7 @@ func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store c
 		Uint64("cell_generation", generation).
 		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
 		Int("shards", len(current.Shards)).
-		Msg("imported serialized persistent state into candidate cell generation")
+		Msg("imported persistent state into next celldb generation")
 
 	candidate := &cellGenerationCandidate{
 		generation: generation,
@@ -469,7 +482,7 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store cell
 		if err != nil {
 			return err
 		}
-		nextMaster, _, err := s.applyMasterchainTransitionWithConsensusProof(&candidate.current.Masterchain, downloaded, nil, candidate.cells)
+		nextMaster, _, err := s.applyStoredMasterchainTransition(&candidate.current.Masterchain, downloaded, candidate.cells)
 		if err != nil {
 			return err
 		}
@@ -489,7 +502,7 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store cell
 		resolver.updateCurrent(candidate.current.Shards)
 		processed++
 
-		if processed%nextBlockCatchUpCheckpointBlocks == 0 {
+		if processed%s.nextCheckpointBlocks() == 0 {
 			if err = s.flushCellGenerationCandidate(ctx, store, candidate); err != nil {
 				return err
 			}

@@ -176,7 +176,11 @@ func (s *testCellGenerationMigrationStore) CleanupCellGeneration(context.Context
 	return nil
 }
 
-func (s *testCellGenerationMigrationStore) ImportStateCellTreeInGeneration(context.Context, uint64, ton.BlockIDExt, *cell.Cell, []cell.Cell, uint64) (*cell.Cell, error) {
+func (s *testCellGenerationMigrationStore) ImportStateCellTreeInGeneration(context.Context, uint64, ton.BlockIDExt, *cell.Cell, uint64) (*cell.Cell, error) {
+	return nil, errCellGenerationMigrationTest
+}
+
+func (s *testCellGenerationMigrationStore) ImportStateBOCViewInGeneration(context.Context, uint64, ton.BlockIDExt, *cell.BOCView) (*cell.Cell, error) {
 	return nil, errCellGenerationMigrationTest
 }
 

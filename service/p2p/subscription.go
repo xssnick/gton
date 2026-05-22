@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,10 @@ type overlaySubscription struct {
 	log  zerolog.Logger
 
 	mx                  sync.Mutex
+	cancel              context.CancelFunc
+	runToken            *struct{}
+	inactive            bool
+	inactiveDeleteAt    time.Time
 	seedMx              sync.Mutex
 	seedRunning         bool
 	seedScheduled       bool
@@ -39,6 +44,113 @@ type overlaySubscription struct {
 	archivePeers        map[string]*archivePeerState
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	peerNotify          chan struct{}
+}
+
+func (s *overlaySubscription) isActive() bool {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	return !s.inactive
+}
+
+func (s *overlaySubscription) setActive(active bool, deleteAt time.Time) bool {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if active {
+		changed := s.inactive
+		s.inactive = false
+		s.inactiveDeleteAt = time.Time{}
+		return changed
+	}
+
+	if s.inactive {
+		if s.inactiveDeleteAt.IsZero() {
+			s.inactiveDeleteAt = deleteAt
+		}
+		return false
+	}
+
+	s.inactive = true
+	s.inactiveDeleteAt = deleteAt
+	return true
+}
+
+func (s *overlaySubscription) inactiveExpiresAt() (time.Time, bool) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if !s.inactive || s.inactiveDeleteAt.IsZero() {
+		return time.Time{}, false
+	}
+	return s.inactiveDeleteAt, true
+}
+
+func (s *overlaySubscription) inactiveExpired(now time.Time) bool {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	return s.inactive && !s.inactiveDeleteAt.IsZero() && !now.Before(s.inactiveDeleteAt)
+}
+
+func (s *overlaySubscription) setRunCancel(cancel context.CancelFunc) (*struct{}, bool) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if s.cancel != nil {
+		return nil, false
+	}
+	token := &struct{}{}
+	s.cancel = cancel
+	s.runToken = token
+	return token, true
+}
+
+func (s *overlaySubscription) clearRunCancel(token *struct{}) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if s.runToken == token {
+		s.cancel = nil
+		s.runToken = nil
+	}
+}
+
+func (s *overlaySubscription) stopRun() bool {
+	s.mx.Lock()
+	cancel := s.cancel
+	s.cancel = nil
+	s.runToken = nil
+	s.mx.Unlock()
+
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (s *overlaySubscription) close() {
+	s.stopRun()
+
+	s.mx.Lock()
+	peers := make([]*overlayPeer, 0, len(s.peers))
+	for _, peer := range s.peers {
+		peers = append(peers, peer)
+	}
+	s.peers = map[string]*overlayPeer{}
+	s.neighbours = nil
+	s.notifyPeersChangedLocked()
+	s.mx.Unlock()
+
+	for _, peer := range peers {
+		if peer.overlay != nil {
+			peer.overlay.Close()
+		}
+		if peer.rldpOverlay != nil {
+			peer.rldpOverlay.Close()
+		}
+	}
 }
 
 type archivePeerState struct {
@@ -114,6 +226,9 @@ func (s *overlaySubscription) startSeedFromDHT(ctx context.Context) {
 }
 
 func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, targetPeers int) {
+	if !s.isActive() {
+		return
+	}
 	if targetPeers < maxPeersPerOverlay {
 		targetPeers = maxPeersPerOverlay
 	}
@@ -227,6 +342,9 @@ type seedConnectResult struct {
 
 func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) {
 	if s.node == nil || s.node.dht == nil {
+		return
+	}
+	if !s.isActive() {
 		return
 	}
 
@@ -383,6 +501,9 @@ func (s *overlaySubscription) connectDHTOverlayNode(ctx context.Context, node ov
 }
 
 func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node overlay.Node) (bool, error) {
+	if !s.isActive() {
+		return false, errors.New("shard is inactive")
+	}
 	if err := node.CheckSignature(); err != nil {
 		return false, fmt.Errorf("overlay node signature: %w", err)
 	}
@@ -505,7 +626,7 @@ func (s *overlaySubscription) notifyPeersChangedLocked() {
 }
 
 func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
-	if s.node == nil || s.node.runCtx == nil || peer == nil {
+	if s.node == nil || s.node.runCtx == nil || peer == nil || !s.isActive() {
 		return
 	}
 
@@ -551,6 +672,9 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 }
 
 func (s *overlaySubscription) refreshPeers(ctx context.Context) {
+	if !s.isActive() {
+		return
+	}
 	peers := s.refreshTargets()
 	if len(peers) == 0 {
 		return
@@ -570,6 +694,9 @@ func (s *overlaySubscription) refreshPeers(ctx context.Context) {
 }
 
 func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *overlayPeer) {
+	if !s.isActive() {
+		return
+	}
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -613,6 +740,9 @@ func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *ove
 }
 
 func (s *overlaySubscription) pingPeers(ctx context.Context) {
+	if !s.isActive() {
+		return
+	}
 	for _, peer := range s.pingTargets() {
 		select {
 		case <-ctx.Done():
@@ -723,6 +853,10 @@ func (s *overlaySubscription) aliveKnownPeerCount() int {
 }
 
 func (s *overlaySubscription) ensurePeers(ctx context.Context) error {
+	if !s.isActive() {
+		return errors.New("shard is inactive")
+	}
+
 	s.startSeedFromDHT(ctx)
 
 	for {

@@ -50,50 +50,30 @@ func (s *Server) blockHeader(ctx context.Context, id ton.BlockIDExt, mode uint32
 }
 
 func (s *Server) accountProof(ctx context.Context, block ton.BlockIDExt, accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
-	stateRoot, blockRoot, err := s.loadStateRootWithBlockRoot(ctx, block)
+	fragments, err := s.blockFragments(ctx, block)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	stateProof, state, err := accountStateProofAndCell(stateRoot, accountID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	proof, err := blockStateProofFromRoot(blockRoot, stateProof)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if state == nil {
-		return proof, nil, nil
-	}
-	if pruned {
-		stateProof, err := accountPrunedProof(state)
-		if err != nil {
-			return nil, nil, err
-		}
-		state = stateProof
-	}
-
-	return proof, state, nil
+	return fragments.accountProof(accountID, pruned)
 }
 
-func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, stateRoot *cell.Cell, addr *address.Address) ([]*cell.Cell, ton.BlockIDExt, error) {
-	extra, err := mcStateExtra(stateRoot)
+func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, addr *address.Address) ([]*cell.Cell, ton.BlockIDExt, error) {
+	fragments, err := s.blockFragments(ctx, master)
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
-	stateProof, err := shardHashesProof(stateRoot, addr.Workchain())
+	extra, err := fragments.mcStateExtra()
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
-	proof, err := s.blockStateProof(ctx, master, stateProof)
+	stateProof, err := fragments.shardHashesProof(addr.Workchain())
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
+
+	proof := []*cell.Cell{fragments.blockStateRootProof, stateProof}
 
 	shardBlock, _, err := shardInfoFromHashes(extra.ShardHashes, addr.Workchain(), accountLeafShard(addr), false)
 	if err != nil {
@@ -193,6 +173,31 @@ func (s *Server) loadStateRootWithBlockRoot(ctx context.Context, id ton.BlockIDE
 		return nil, nil, fmt.Errorf("load state root %x for %s: %w", stateRootHash, storage.FormatBlockRef(id), err)
 	}
 	return root, blockRoot, nil
+}
+
+func (s *Server) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error) {
+	if cached, ok := s.store.(interface {
+		BlockFragments(context.Context, ton.BlockIDExt) (*liveBlockFragments, error)
+	}); ok {
+		return cached.BlockFragments(ctx, block)
+	}
+
+	blockRoot, err := s.loadBlockRoot(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+
+	stateRootHash, err := stateRootHashFromBlock(block, blockRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	stateRoot, err := s.store.LoadStateCellTree(ctx, block, stateRootHash)
+	if err != nil {
+		return nil, fmt.Errorf("load state root %x for %s: %w", stateRootHash, storage.FormatBlockRef(block), err)
+	}
+
+	return buildLiveBlockFragments(block, blockRoot, stateRoot)
 }
 
 func stateRootHashFromBlock(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) {
@@ -383,7 +388,13 @@ func accountCell(stateRoot *cell.Cell, accountID []byte) (*cell.Cell, error) {
 	if err != nil {
 		return nil, err
 	}
+	return accountCellFromAccountsRoot(dictRoot, accountID)
+}
 
+func accountCellFromAccountsRoot(dictRoot *cell.Cell, accountID []byte) (*cell.Cell, error) {
+	if dictRoot == nil {
+		return nil, cell.ErrNoSuchKeyInDict
+	}
 	value, err := dictRoot.AsDict(256).LoadValue(accountKey(accountID))
 	if err != nil {
 		return nil, err

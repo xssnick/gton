@@ -1,13 +1,12 @@
 package p2p
 
 import (
+	"container/list"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"github.com/xssnick/gton/internal/logutil"
-	storage2 "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"net"
 	"os"
@@ -17,6 +16,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/internal/logutil"
+	storage2 "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl"
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
@@ -85,10 +86,14 @@ type Node struct {
 	subscriptionsMx sync.RWMutex
 	subscriptions   map[string]*overlaySubscription
 
+	monitorSplitMx       sync.RWMutex
+	monitorMinSplitDepth map[int32]uint32
+
 	latestBlocksMx            sync.RWMutex
 	observedMasterchain       *ton.BlockIDExt
 	seenMasterchain           *ton.BlockIDExt
 	latestBasechain           *ton.BlockIDExt
+	latestBasechainShards     map[storage2.ShardKey]ton.BlockIDExt
 	rawMasterchainBroadcast   *ton.BlockIDExt
 	observedMasterchainNotify chan struct{}
 	seenMasterchainNotify     chan struct{}
@@ -182,6 +187,8 @@ func New(opts Options) (*Node, error) {
 		deduper:                   newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
 		stopped:                   make(chan struct{}),
 		subscriptions:             map[string]*overlaySubscription{},
+		monitorMinSplitDepth:      map[int32]uint32{},
+		latestBasechainShards:     map[storage2.ShardKey]ton.BlockIDExt{},
 		observedMasterchainNotify: make(chan struct{}),
 		seenMasterchainNotify:     make(chan struct{}),
 		latestBasechainNotify:     make(chan struct{}),
@@ -273,9 +280,7 @@ func (n *Node) Start(ctx context.Context) error {
 
 	for _, spec := range specs {
 		sub, _ := n.getOrCreateSubscription(spec)
-		n.runAsync(func() {
-			sub.run(ctx)
-		})
+		n.startSubscription(sub)
 	}
 	n.runAsync(func() {
 		n.runEventLoop(ctx)
@@ -287,6 +292,9 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	n.runAsync(func() {
 		n.runShardBroadcastCacheJanitor(ctx)
+	})
+	n.runAsync(func() {
+		n.runSubscriptionLifecycleLoop(ctx)
 	})
 	if n.isPublicServer() {
 		n.runAsync(func() {
@@ -308,6 +316,24 @@ func (n *Node) runAsync(fn func()) {
 		defer n.wg.Done()
 		fn()
 	}()
+}
+
+func (n *Node) startSubscription(sub *overlaySubscription) {
+	if sub == nil || n.runCtx == nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(n.runCtx)
+	token, ok := sub.setRunCancel(cancel)
+	if !ok {
+		cancel()
+		return
+	}
+
+	n.runAsync(func() {
+		defer sub.clearRunCancel(token)
+		sub.run(ctx)
+	})
 }
 
 func (n *Node) Wait() {
@@ -366,11 +392,7 @@ func (n *Node) finishInbound() {
 }
 
 func (n *Node) trackUnverifiedBroadcastBlock(event BroadcastEvent) {
-	if event.Block.Shard != topShard {
-		return
-	}
-
-	if event.Block.Workchain == -1 {
+	if event.Block.Workchain == -1 && event.Block.Shard == topShard {
 		n.trackRawMasterchainBroadcast(event.Block)
 		return
 	}
@@ -473,11 +495,19 @@ func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
 	n.latestBlocksMx.Lock()
 	defer n.latestBlocksMx.Unlock()
 
-	if n.latestBasechain != nil && n.latestBasechain.SeqNo >= block.SeqNo {
+	key := storage2.ShardKeyFromBlock(block)
+	if n.latestBasechainShards == nil {
+		n.latestBasechainShards = map[storage2.ShardKey]ton.BlockIDExt{}
+	}
+	current, ok := n.latestBasechainShards[key]
+	if ok && current.SeqNo >= block.SeqNo {
 		return
 	}
 
-	n.latestBasechain = &block
+	n.latestBasechainShards[key] = block
+	if n.latestBasechain == nil || n.latestBasechain.SeqNo < block.SeqNo {
+		n.latestBasechain = &block
+	}
 	close(n.latestBasechainNotify)
 	n.latestBasechainNotify = make(chan struct{})
 }
@@ -786,14 +816,22 @@ type eventDeduper struct {
 	ttl        time.Duration
 	maxEntries int
 	mx         sync.Mutex
-	seen       map[string]time.Time
+	seen       map[string]*eventDeduperEntry
+	order      *list.List
+}
+
+type eventDeduperEntry struct {
+	key     string
+	seenAt  time.Time
+	element *list.Element
 }
 
 func newEventDeduper(ttl time.Duration, maxEntries int) *eventDeduper {
 	return &eventDeduper{
 		ttl:        ttl,
 		maxEntries: maxEntries,
-		seen:       map[string]time.Time{},
+		seen:       map[string]*eventDeduperEntry{},
+		order:      list.New(),
 	}
 }
 
@@ -801,35 +839,63 @@ func (d *eventDeduper) Mark(key string, now time.Time) bool {
 	d.mx.Lock()
 	defer d.mx.Unlock()
 
-	if when, ok := d.seen[key]; ok && now.Sub(when) < d.ttl {
-		return false
-	}
-	d.seen[key] = now
-
-	pruneAt := d.maxEntries
-	if pruneAt <= 0 {
-		pruneAt = 2048
-	}
-	if len(d.seen) > pruneAt {
-		for k, when := range d.seen {
-			if now.Sub(when) >= d.ttl {
-				delete(d.seen, k)
-			}
+	if entry := d.seen[key]; entry != nil {
+		if now.Sub(entry.seenAt) < d.ttl {
+			return false
 		}
-	}
-	if d.maxEntries > 0 && len(d.seen) > d.maxEntries {
-		for k := range d.seen {
-			if k == key {
-				continue
-			}
-			delete(d.seen, k)
-			if len(d.seen) <= d.maxEntries {
-				break
-			}
-		}
+		entry.seenAt = now
+		d.order.MoveToBack(entry.element)
+		d.pruneExpiredLocked(now)
+		d.pruneOverflowLocked()
+		return true
 	}
 
+	entry := &eventDeduperEntry{
+		key:    key,
+		seenAt: now,
+	}
+	entry.element = d.order.PushBack(entry)
+	d.seen[key] = entry
+
+	d.pruneExpiredLocked(now)
+	d.pruneOverflowLocked()
 	return true
+}
+
+func (d *eventDeduper) pruneExpiredLocked(now time.Time) {
+	for elem := d.order.Front(); elem != nil; {
+		entry := elem.Value.(*eventDeduperEntry)
+		if now.Sub(entry.seenAt) < d.ttl {
+			return
+		}
+		next := elem.Next()
+		d.deleteEntryLocked(entry)
+		elem = next
+	}
+}
+
+func (d *eventDeduper) pruneOverflowLocked() {
+	if d.maxEntries <= 0 {
+		return
+	}
+	for len(d.seen) > d.maxEntries {
+		elem := d.order.Front()
+		if elem == nil {
+			return
+		}
+		d.deleteEntryLocked(elem.Value.(*eventDeduperEntry))
+	}
+}
+
+func (d *eventDeduper) deleteEntryLocked(entry *eventDeduperEntry) {
+	if entry == nil {
+		return
+	}
+	delete(d.seen, entry.key)
+	if elem := entry.element; elem != nil {
+		d.order.Remove(elem)
+		entry.element = nil
+	}
 }
 
 func buildOverlaySpecs(zeroStateFileHash []byte) ([]overlaySpec, error) {
@@ -869,6 +935,8 @@ func buildOverlaySpec(zeroStateFileHash []byte, workchain int32, shard int64, na
 
 	return overlaySpec{
 		Name:              name,
+		Workchain:         workchain,
+		Shard:             shard,
 		FullID:            fullID,
 		ShortID:           shortID,
 		ProtoVersionMajor: protoMajor,
@@ -876,8 +944,12 @@ func buildOverlaySpec(zeroStateFileHash []byte, workchain int32, shard int64, na
 	}, nil
 }
 
+func overlaySpecKey(spec overlaySpec) string {
+	return hex.EncodeToString(spec.ShortID)
+}
+
 func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, bool) {
-	key := hex.EncodeToString(spec.ShortID)
+	key := overlaySpecKey(spec)
 
 	n.subscriptionsMx.Lock()
 	if sub := n.subscriptions[key]; sub != nil {
@@ -905,16 +977,210 @@ func (n *Node) subscriptionForBlock(block ton.BlockIDExt) (*overlaySubscription,
 		return nil, errors.New("node is not started")
 	}
 
-	spec, err := buildOverlaySpec(n.zeroStateFileHash, block.Workchain, block.Shard, overlayName(block.Workchain, block.Shard))
+	overlayBlock := n.overlayBlockForDownload(block)
+	spec, err := buildOverlaySpec(n.zeroStateFileHash, overlayBlock.Workchain, overlayBlock.Shard, overlayName(overlayBlock.Workchain, overlayBlock.Shard))
 	if err != nil {
 		return nil, fmt.Errorf("build overlay for %s: %w", formatBlockRef(block), err)
 	}
 
-	sub, created := n.getOrCreateSubscription(spec)
-	if created {
-		go sub.run(n.runCtx)
-	}
+	sub, _ := n.getOrCreateSubscription(spec)
+	sub.setActive(true, time.Time{})
+	n.startSubscription(sub)
 	return sub, nil
+}
+
+func (n *Node) SetMonitorMinSplitDepth(workchain int32, depth uint32) {
+	n.monitorSplitMx.Lock()
+	defer n.monitorSplitMx.Unlock()
+
+	if n.monitorMinSplitDepth == nil {
+		n.monitorMinSplitDepth = map[int32]uint32{}
+	}
+	n.monitorMinSplitDepth[workchain] = depth
+}
+
+func (n *Node) SetActiveShardOverlays(blocks []ton.BlockIDExt) error {
+	if len(n.zeroStateFileHash) == 0 {
+		return nil
+	}
+
+	specs, err := n.activeShardOverlaySpecs(blocks)
+	if err != nil {
+		return err
+	}
+
+	active := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		key := overlaySpecKey(spec)
+		active[key] = struct{}{}
+
+		sub, _ := n.getOrCreateSubscription(spec)
+		if sub.setActive(true, time.Time{}) {
+			n.log.Debug().
+				Str("overlay", spec.Name).
+				Msg("reactivated shard overlay")
+		}
+		n.startSubscription(sub)
+	}
+
+	deleteAt := time.Now().Add(inactiveShardOverlayTTL)
+	for _, entry := range n.subscriptionEntriesSnapshot() {
+		if _, ok := active[entry.key]; ok {
+			continue
+		}
+		if entry.sub.spec.Workchain == -1 && entry.sub.spec.Shard == topShard {
+			continue
+		}
+		if entry.sub.setActive(false, deleteAt) {
+			n.log.Debug().
+				Str("overlay", entry.sub.spec.Name).
+				Dur("ttl", inactiveShardOverlayTTL).
+				Msg("marked shard overlay inactive")
+		}
+	}
+
+	return nil
+}
+
+func (n *Node) activeShardOverlaySpecs(blocks []ton.BlockIDExt) ([]overlaySpec, error) {
+	specs := make([]overlaySpec, 0, len(blocks)+2)
+	seen := map[string]struct{}{}
+
+	add := func(workchain int32, shard int64) error {
+		spec, err := buildOverlaySpec(n.zeroStateFileHash, workchain, shard, overlayName(workchain, shard))
+		if err != nil {
+			return err
+		}
+		key := overlaySpecKey(spec)
+		if _, ok := seen[key]; ok {
+			return nil
+		}
+		seen[key] = struct{}{}
+		specs = append(specs, spec)
+		return nil
+	}
+
+	if err := add(-1, topShard); err != nil {
+		return nil, fmt.Errorf("build active masterchain overlay: %w", err)
+	}
+	if err := add(0, topShard); err != nil {
+		return nil, fmt.Errorf("build active basechain overlay: %w", err)
+	}
+
+	for _, block := range blocks {
+		if block.Workchain == -1 || block.Shard == 0 {
+			continue
+		}
+
+		depth := n.monitorMinSplitDepthForWorkchain(block.Workchain)
+		shard := block.Shard
+		if uint32(shardPrefixLength(shard)) > depth {
+			shard = shardPrefix(shard, depth)
+		}
+
+		for {
+			if err := add(block.Workchain, shard); err != nil {
+				return nil, fmt.Errorf("build active shard overlay %d:%016x: %w", block.Workchain, uint64(shard), err)
+			}
+			if shard == topShard {
+				break
+			}
+			shard = shardParent(shard)
+		}
+	}
+
+	return specs, nil
+}
+
+func (n *Node) runSubscriptionLifecycleLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			n.stopExpiredInactiveSubscriptions(now)
+		}
+	}
+}
+
+func (n *Node) stopExpiredInactiveSubscriptions(now time.Time) {
+	for _, entry := range n.subscriptionEntriesSnapshot() {
+		if !entry.sub.inactiveExpired(now) {
+			continue
+		}
+		if n.deleteInactiveSubscription(entry.key, entry.sub, now) {
+			n.log.Debug().
+				Str("overlay", entry.sub.spec.Name).
+				Msg("deleted inactive shard overlay")
+		}
+	}
+}
+
+func (n *Node) deleteInactiveSubscription(key string, sub *overlaySubscription, now time.Time) bool {
+	if !sub.inactiveExpired(now) {
+		return false
+	}
+
+	n.subscriptionsMx.Lock()
+	if n.subscriptions[key] != sub {
+		n.subscriptionsMx.Unlock()
+		return false
+	}
+	if !sub.inactiveExpired(now) {
+		n.subscriptionsMx.Unlock()
+		return false
+	}
+	delete(n.subscriptions, key)
+	n.subscriptionsMx.Unlock()
+
+	sub.close()
+	return true
+}
+
+func (n *Node) overlayBlockForDownload(block ton.BlockIDExt) ton.BlockIDExt {
+	if block.Workchain == -1 {
+		block.Shard = topShard
+		return block
+	}
+
+	depth := n.monitorMinSplitDepthForWorkchain(block.Workchain)
+	prefixLen := shardPrefixLength(block.Shard)
+	if uint32(prefixLen) <= depth {
+		return block
+	}
+
+	block.Shard = shardPrefix(block.Shard, depth)
+	return block
+}
+
+func (n *Node) monitorMinSplitDepthForWorkchain(workchain int32) uint32 {
+	n.monitorSplitMx.RLock()
+	defer n.monitorSplitMx.RUnlock()
+
+	return n.monitorMinSplitDepth[workchain]
+}
+
+func shardPrefix(shard int64, depth uint32) int64 {
+	if depth == 0 {
+		return topShard
+	}
+	if depth > 63 {
+		depth = 63
+	}
+
+	prefixBits := uint64(shard) >> (64 - depth)
+	return int64((prefixBits << (64 - depth)) | (uint64(1) << (63 - depth)))
+}
+
+func shardParent(shard int64) int64 {
+	depth := shardPrefixLength(shard)
+	if depth <= 0 {
+		return topShard
+	}
+	return shardPrefix(shard, uint32(depth-1))
 }
 
 func overlayName(workchain int32, shard int64) string {
@@ -928,13 +1194,30 @@ func overlayName(workchain int32, shard int64) string {
 	}
 }
 
-func (n *Node) subscriptionsSnapshot() []*overlaySubscription {
+type subscriptionEntry struct {
+	key string
+	sub *overlaySubscription
+}
+
+func (n *Node) subscriptionEntriesSnapshot() []subscriptionEntry {
 	n.subscriptionsMx.RLock()
 	defer n.subscriptionsMx.RUnlock()
 
-	list := make([]*overlaySubscription, 0, len(n.subscriptions))
-	for _, sub := range n.subscriptions {
-		list = append(list, sub)
+	list := make([]subscriptionEntry, 0, len(n.subscriptions))
+	for key, sub := range n.subscriptions {
+		list = append(list, subscriptionEntry{
+			key: key,
+			sub: sub,
+		})
+	}
+	return list
+}
+
+func (n *Node) subscriptionsSnapshot() []*overlaySubscription {
+	entries := n.subscriptionEntriesSnapshot()
+	list := make([]*overlaySubscription, 0, len(entries))
+	for _, entry := range entries {
+		list = append(list, entry.sub)
 	}
 	return list
 }

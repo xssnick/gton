@@ -113,8 +113,22 @@ func BenchmarkPebbleSaveCells(b *testing.B) {
 }
 
 func BenchmarkPebbleImportStateCellTree(b *testing.B) {
-	b.Run("parsed-cells", func(b *testing.B) {
-		root, parsedCells, cells := benchmarkParsedCellGraph(b, 1024, 4)
+	b.Run("boc-view", func(b *testing.B) {
+		root, cells := benchmarkCellGraph(b, 1024, 4)
+		boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+			WithCRC32C:    true,
+			WithIndex:     true,
+			WithCacheBits: true,
+			WithTopHash:   true,
+			WithIntHashes: true,
+		})
+		view, err := cell.OpenBOCView(bytes.NewReader(boc), int64(len(boc)), cell.BOCViewOptions{
+			RequireIndex: true,
+			ValidateCRC:  true,
+		})
+		if err != nil {
+			b.Fatalf("open benchmark boc view: %v", err)
+		}
 		store := openBenchmarkStore(b, Options{})
 		block := benchmarkBlockID(1)
 
@@ -123,13 +137,13 @@ func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.ImportStateCellTree(context.Background(), block, root, parsedCells, uint64(cells)); err != nil {
-				b.Fatalf("import parsed state cell tree: %v", err)
+			if _, err := store.ImportStateBOCView(context.Background(), block, view); err != nil {
+				b.Fatalf("import boc view state cells: %v", err)
 			}
 		}
 	})
 
-	b.Run("dfs-fallback", func(b *testing.B) {
+	b.Run("eager-root", func(b *testing.B) {
 		root, cells := benchmarkCellGraph(b, 1024, 4)
 		store := openBenchmarkStore(b, Options{})
 		block := benchmarkBlockID(1)
@@ -139,36 +153,15 @@ func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.ImportStateCellTree(context.Background(), block, root, nil, uint64(cells)); err != nil {
-				b.Fatalf("import dfs state cell tree: %v", err)
+			if _, err := store.ImportStateCellTree(context.Background(), block, root, uint64(cells)); err != nil {
+				b.Fatalf("import eager-root state cell tree: %v", err)
 			}
 		}
 	})
 }
 
 func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
-	b.Run("parsed-cells", func(b *testing.B) {
-		root, parsedCells, cells := benchmarkParsedCellGraph(b, 1024, 4)
-		store := openBenchmarkStore(b, Options{})
-		block := benchmarkBlockID(1)
-
-		b.ReportAllocs()
-		b.ReportMetric(float64(cells), "cells/op")
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
-				block:       block,
-				root:        root,
-				parsedCells: parsedCells,
-				totalCells:  uint64(cells),
-			}); err != nil {
-				b.Fatalf("save parsed state cell tree: %v", err)
-			}
-		}
-	})
-
-	b.Run("dfs-fallback", func(b *testing.B) {
+	b.Run("dfs", func(b *testing.B) {
 		root, cells := benchmarkCellGraph(b, 1024, 4)
 		store := openBenchmarkStore(b, Options{})
 		block := benchmarkBlockID(1)
@@ -194,27 +187,6 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 		leaves = 750_000
 		fanout = 4
 	)
-
-	b.Run("parsed-cells-batch", func(b *testing.B) {
-		root, parsedCells, cells := benchmarkParsedCellGraph(b, leaves, fanout)
-		store := openBenchmarkStore(b, Options{})
-		block := benchmarkBlockID(1)
-
-		b.ReportAllocs()
-		b.ReportMetric(float64(cells), "cells/op")
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
-				block:       block,
-				root:        root,
-				parsedCells: parsedCells,
-				totalCells:  uint64(cells),
-			}); err != nil {
-				b.Fatalf("save parsed state cell tree: %v", err)
-			}
-		}
-	})
 
 	b.Run("dfs-batch", func(b *testing.B) {
 		root, cells := benchmarkCellGraph(b, leaves, fanout)
@@ -376,23 +348,6 @@ func collectCellRecordsForBenchmark(root *cell.Cell) ([]*storage.CellRecord, err
 		return bytes.Compare(records[i].Hash, records[j].Hash) < 0
 	})
 	return records, nil
-}
-
-func benchmarkParsedCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell, []cell.Cell, int) {
-	tb.Helper()
-
-	root, cells := benchmarkCellGraph(tb, leaves, fanout)
-	roots, parsedCells, err := cell.FromBOCMultiRootReader(bytes.NewReader(root.ToBOC()), cell.BOCParseOptions{})
-	if err != nil {
-		tb.Fatalf("parse benchmark boc: %v", err)
-	}
-	if len(roots) != 1 {
-		tb.Fatalf("unexpected roots count: %d", len(roots))
-	}
-	if len(parsedCells) != cells {
-		tb.Fatalf("unexpected parsed cells count: got=%d want=%d", len(parsedCells), cells)
-	}
-	return roots[0], parsedCells, cells
 }
 
 func benchmarkTouchFirstRefChain(tb testing.TB, root *cell.Cell) {

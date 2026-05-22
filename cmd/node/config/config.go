@@ -17,25 +17,32 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/liteserver"
+	service2 "github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 )
 
 const (
-	DefaultPath              = "config.json"
-	DefaultGlobalConfigURL   = "https://ton-blockchain.github.io/global.config.json"
-	DefaultSyncBefore        = time.Hour
-	DefaultStateTTL          = 3 * 24 * time.Hour
-	DefaultArchiveTTL        = 7 * 24 * time.Hour
-	DefaultCellTotalCache    = int64(8 << 30)
-	DefaultCellShardMemTable = int64(512 << 20)
-	defaultStorageDir        = "data"
-	defaultADNLPort          = 30303
-	defaultADNLListen        = "0.0.0.0:30303"
-	defaultDHTListen         = "0.0.0.0:30304"
-	defaultLiteListen        = "0.0.0.0:7445"
-	externalIPHTTPClient     = 5 * time.Second
-	globalConfigHTTPClient   = 30 * time.Second
-	ipAPILookupURL           = "http://ip-api.com/json/?fields=status,message,query"
+	DefaultPath                            = "config.json"
+	DefaultGlobalConfigURL                 = "https://ton-blockchain.github.io/global.config.json"
+	DefaultSyncBefore                      = time.Hour
+	DefaultStateTTL                        = 3 * 24 * time.Hour
+	DefaultArchiveTTL                      = 7 * 24 * time.Hour
+	DefaultNextCheckpointBlocks            = int64(service2.DefaultNextBlockCheckpointBlocks)
+	DefaultArchiveCheckpointBlocks         = int64(service2.DefaultArchiveCatchUpCheckpointBlocks)
+	DefaultCheckpointBytes                 = int64(service2.DefaultCheckpointBytes)
+	DefaultCellTotalCache                  = int64(8 << 30)
+	DefaultCellShardMemTable               = int64(256 << 20)
+	DefaultCellMemTableStopWritesThreshold = int64(4)
+	DefaultArtifactFileMaxOpen             = int64(pebblestore.DefaultArtifactFileMaxOpen)
+	defaultStorageDir                      = "data"
+	defaultADNLPort                        = 30303
+	defaultADNLListen                      = "0.0.0.0:30303"
+	defaultDHTListen                       = "0.0.0.0:30304"
+	defaultLiteListen                      = "0.0.0.0:7445"
+	externalIPHTTPClient                   = 5 * time.Second
+	globalConfigHTTPClient                 = 30 * time.Second
+	ipAPILookupURL                         = "http://ip-api.com/json/?fields=status,message,query"
 )
 
 var ErrConfigMissingWithExistingStorage = errors.New("config file is missing while storage metadata exists")
@@ -51,10 +58,13 @@ type Config struct {
 }
 
 type TON struct {
-	GlobalConfigPath string `json:"global_config_path"`
-	SyncBefore       int64  `json:"sync_before"`
-	StateTTL         int64  `json:"state_ttl"`
-	ArchiveTTL       int64  `json:"archive_ttl"`
+	GlobalConfigPath        string `json:"global_config_path"`
+	SyncBefore              int64  `json:"sync_before"`
+	StateTTL                int64  `json:"state_ttl"`
+	ArchiveTTL              int64  `json:"archive_ttl"`
+	NextCheckpointBlocks    int64  `json:"next_checkpoint_blocks"`
+	ArchiveCheckpointBlocks int64  `json:"archive_checkpoint_blocks"`
+	CheckpointBytes         int64  `json:"checkpoint_bytes"`
 }
 
 type ADNL struct {
@@ -77,9 +87,11 @@ type Lite struct {
 }
 
 type Storage struct {
-	Dir                   string `json:"dir"`
-	CellTotalCacheSize    int64  `json:"cell_total_cache_size"`
-	CellShardMemTableSize int64  `json:"cell_shard_memtable_size"`
+	Dir                             string `json:"dir"`
+	CellTotalCacheSize              int64  `json:"cell_total_cache_size"`
+	CellShardMemTableSize           int64  `json:"cell_shard_memtable_size"`
+	CellMemTableStopWritesThreshold int64  `json:"cell_memtable_stop_writes_threshold"`
+	ArtifactFileMaxOpen             int64  `json:"artifact_file_max_open"`
 }
 
 type Metrics struct {
@@ -90,18 +102,23 @@ type Metrics struct {
 func defaultConfig() Config {
 	return Config{
 		TON: TON{
-			GlobalConfigPath: p2p.DefaultGlobalConfigPath,
-			SyncBefore:       int64(DefaultSyncBefore / time.Second),
-			StateTTL:         int64(DefaultStateTTL / time.Second),
-			ArchiveTTL:       int64(DefaultArchiveTTL / time.Second),
+			GlobalConfigPath:        p2p.DefaultGlobalConfigPath,
+			SyncBefore:              int64(DefaultSyncBefore / time.Second),
+			StateTTL:                int64(DefaultStateTTL / time.Second),
+			ArchiveTTL:              int64(DefaultArchiveTTL / time.Second),
+			NextCheckpointBlocks:    DefaultNextCheckpointBlocks,
+			ArchiveCheckpointBlocks: DefaultArchiveCheckpointBlocks,
+			CheckpointBytes:         DefaultCheckpointBytes,
 		},
 		Lite: Lite{
 			MasterBlockCache: liteserver.DefaultMasterBlockCache,
 			ShardBlockCache:  liteserver.DefaultShardBlockCache,
 		},
 		Storage: Storage{
-			CellTotalCacheSize:    DefaultCellTotalCache,
-			CellShardMemTableSize: DefaultCellShardMemTable,
+			CellTotalCacheSize:              DefaultCellTotalCache,
+			CellShardMemTableSize:           DefaultCellShardMemTable,
+			CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
+			ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
 		},
 	}
 }
@@ -139,6 +156,9 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 
 	cfg := defaultConfig()
 	cfg.TON.GlobalConfigPath = globalConfigPath
+	cfg.TON.NextCheckpointBlocks = DefaultNextCheckpointBlocks
+	cfg.TON.ArchiveCheckpointBlocks = DefaultArchiveCheckpointBlocks
+	cfg.TON.CheckpointBytes = DefaultCheckpointBytes
 	cfg.ADNL = ADNL{
 		Key:          adnlSeed,
 		ListenAddr:   defaultADNLListen,
@@ -156,9 +176,11 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		ShardBlockCache:  liteserver.DefaultShardBlockCache,
 	}
 	cfg.Storage = Storage{
-		Dir:                   storageDir,
-		CellTotalCacheSize:    DefaultCellTotalCache,
-		CellShardMemTableSize: DefaultCellShardMemTable,
+		Dir:                             storageDir,
+		CellTotalCacheSize:              DefaultCellTotalCache,
+		CellShardMemTableSize:           DefaultCellShardMemTable,
+		CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
+		ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
 	}
 
 	return cfg, nil
@@ -168,38 +190,43 @@ func LoadOrCreate(
 	ctx context.Context,
 	path string,
 	externalIPLookup func(context.Context) (string, error),
-) (Config, bool, error) {
+) (LoadOrCreateResult, error) {
 	if strings.TrimSpace(path) == "" {
 		path = DefaultPath
 	}
 
 	cfg, err := Load(path)
 	if err == nil {
-		return cfg, false, nil
+		return LoadOrCreateResult{Config: cfg}, nil
 	}
 	if !os.IsNotExist(err) {
-		return Config{}, false, err
+		return LoadOrCreateResult{}, err
 	}
 
-	metadataExists, metadataPath, err := defaultStorageMetadataExists()
+	metadata, err := defaultStorageMetadata()
 	if err != nil {
-		return Config{}, false, err
+		return LoadOrCreateResult{}, err
 	}
-	if metadataExists {
-		return Config{}, false, fmt.Errorf("%w: config %s was not found, storage metadata exists at %s",
-			ErrConfigMissingWithExistingStorage, path, metadataPath)
+	if metadata.Exists {
+		return LoadOrCreateResult{}, fmt.Errorf("%w: config %s was not found, storage metadata exists at %s",
+			ErrConfigMissingWithExistingStorage, path, metadata.Path)
 	}
 
 	cfg, err = generate(ctx, externalIPLookup)
 	if err != nil {
-		return Config{}, false, fmt.Errorf("generate default config: %w", err)
+		return LoadOrCreateResult{}, fmt.Errorf("generate default config: %w", err)
 	}
 
 	if err = write(path, cfg); err != nil {
-		return Config{}, false, err
+		return LoadOrCreateResult{}, err
 	}
 
-	return cfg, true, nil
+	return LoadOrCreateResult{Config: cfg, Created: true}, nil
+}
+
+type LoadOrCreateResult struct {
+	Config  Config
+	Created bool
 }
 
 func Load(path string) (Config, error) {
@@ -358,6 +385,36 @@ func (cfg Config) CellShardMemTableSize() (int, error) {
 	return int(value), nil
 }
 
+func (cfg Config) CellMemTableStopWritesThreshold() (int, error) {
+	if cfg.Storage.CellMemTableStopWritesThreshold < 0 {
+		return 0, fmt.Errorf("storage.cell_memtable_stop_writes_threshold cannot be negative")
+	}
+	value := cfg.Storage.CellMemTableStopWritesThreshold
+	if value == 0 {
+		value = DefaultCellMemTableStopWritesThreshold
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if value > maxInt {
+		return 0, fmt.Errorf("storage.cell_memtable_stop_writes_threshold is too large")
+	}
+	return int(value), nil
+}
+
+func (cfg Config) ArtifactFileMaxOpen() (int, error) {
+	if cfg.Storage.ArtifactFileMaxOpen < 0 {
+		return 0, fmt.Errorf("storage.artifact_file_max_open cannot be negative")
+	}
+	value := cfg.Storage.ArtifactFileMaxOpen
+	if value == 0 {
+		value = DefaultArtifactFileMaxOpen
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if value > maxInt {
+		return 0, fmt.Errorf("storage.artifact_file_max_open is too large")
+	}
+	return int(value), nil
+}
+
 func (cfg Config) GlobalConfigPath() string {
 	path := strings.TrimSpace(cfg.TON.GlobalConfigPath)
 	if path == "" {
@@ -399,7 +456,38 @@ func (cfg Config) ArchiveTTL() (time.Duration, error) {
 	return time.Duration(cfg.TON.ArchiveTTL) * time.Second, nil
 }
 
-func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bool) (bool, error) {
+func (cfg Config) NextCheckpointBlocks() (uint32, error) {
+	return uint32ConfigValue("ton.next_checkpoint_blocks", cfg.TON.NextCheckpointBlocks, service2.DefaultNextBlockCheckpointBlocks)
+}
+
+func (cfg Config) ArchiveCheckpointBlocks() (uint32, error) {
+	return uint32ConfigValue("ton.archive_checkpoint_blocks", cfg.TON.ArchiveCheckpointBlocks, service2.DefaultArchiveCatchUpCheckpointBlocks)
+}
+
+func (cfg Config) CheckpointBytes() (uint64, error) {
+	if cfg.TON.CheckpointBytes < 0 {
+		return 0, fmt.Errorf("ton.checkpoint_bytes cannot be negative")
+	}
+	if cfg.TON.CheckpointBytes == 0 {
+		return service2.DefaultCheckpointBytes, nil
+	}
+	return uint64(cfg.TON.CheckpointBytes), nil
+}
+
+func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, error) {
+	if value < 0 {
+		return 0, fmt.Errorf("%s cannot be negative", field)
+	}
+	if value == 0 {
+		return defaultValue, nil
+	}
+	if value > int64(^uint32(0)) {
+		return 0, fmt.Errorf("%s is too large", field)
+	}
+	return uint32(value), nil
+}
+
+func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bool) (EnsureGlobalConfigResult, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		path = p2p.DefaultGlobalConfigPath
@@ -411,32 +499,41 @@ func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bo
 
 	if !replace {
 		if _, err := os.Stat(path); err == nil {
-			return false, nil
+			return EnsureGlobalConfigResult{}, nil
 		} else if !os.IsNotExist(err) {
-			return false, err
+			return EnsureGlobalConfigResult{}, err
 		}
 	}
 
 	if err := downloadFile(ctx, path, url); err != nil {
-		return false, err
+		return EnsureGlobalConfigResult{}, err
 	}
-	return true, nil
+	return EnsureGlobalConfigResult{Downloaded: true}, nil
 }
 
-func defaultStorageMetadataExists() (bool, string, error) {
+type EnsureGlobalConfigResult struct {
+	Downloaded bool
+}
+
+type defaultStorageMetadataStatus struct {
+	Exists bool
+	Path   string
+}
+
+func defaultStorageMetadata() (defaultStorageMetadataStatus, error) {
 	storageDir, err := filepath.Abs(defaultStorageDir)
 	if err != nil {
-		return false, "", fmt.Errorf("resolve storage dir: %w", err)
+		return defaultStorageMetadataStatus{}, fmt.Errorf("resolve storage dir: %w", err)
 	}
 	metadataPath := filepath.Join(storageDir, "metadb")
 	_, err = os.Stat(metadataPath)
 	if err == nil {
-		return true, metadataPath, nil
+		return defaultStorageMetadataStatus{Exists: true, Path: metadataPath}, nil
 	}
 	if os.IsNotExist(err) {
-		return false, metadataPath, nil
+		return defaultStorageMetadataStatus{Path: metadataPath}, nil
 	}
-	return false, metadataPath, fmt.Errorf("stat storage metadata %s: %w", metadataPath, err)
+	return defaultStorageMetadataStatus{Path: metadataPath}, fmt.Errorf("stat storage metadata %s: %w", metadataPath, err)
 }
 
 func write(path string, cfg Config) error {

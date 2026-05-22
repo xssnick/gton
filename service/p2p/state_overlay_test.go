@@ -102,11 +102,34 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		t.Fatalf("persistent state file name: %v", err)
 	}
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), 0o644); err != nil {
+	if err := os.WriteFile(path, root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithIndex:     true,
+		WithCRC32C:    true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	}), 0o644); err != nil {
 		t.Fatalf("write reusable state file: %v", err)
 	}
 
 	store := newTestPebbleStore(t)
+	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
+		Block:            block,
+		MasterchainBlock: master,
+		EffectiveShard:   0,
+		Ref: &tnstore.ArtifactRef{
+			Path: path,
+			Size: int64(len(root.ToBOCWithOptions(cell.BOCSerializeOptions{
+				WithIndex:     true,
+				WithCRC32C:    true,
+				WithTopHash:   true,
+				WithIntHashes: true,
+			}))),
+		},
+		FileHash:      bytes.Repeat([]byte{0x55}, 32),
+		StateRootHash: rootHash[:],
+	}); err != nil {
+		t.Fatalf("save reusable state file metadata: %v", err)
+	}
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
@@ -116,7 +139,7 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import reusable staged state file: %v", err)
 	}
-	if staged == nil || staged.peerAddr != "disk" {
+	if staged == nil || staged.peerAddr != "local" {
 		t.Fatalf("unexpected staged file %+v", staged)
 	}
 	if lazyRoot == nil || lazyRoot.HashKey(0) != rootHash {
@@ -159,6 +182,18 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	}
 
 	store := newTestPebbleStore(t)
+	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
+		Block:            block,
+		MasterchainBlock: master,
+		EffectiveShard:   block.Shard,
+		Ref: &tnstore.ArtifactRef{
+			Path: path,
+			Size: int64(len(proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}))),
+		},
+		FileHash: bytes.Repeat([]byte{0x55}, 32),
+	}); err != nil {
+		t.Fatalf("save reusable split header file metadata: %v", err)
+	}
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
@@ -209,10 +244,10 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	fullRootHash := fullRoot.HashKey(0)
 
 	store := newTestPebbleStore(t)
-	if _, err := store.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, part), partRoot, nil, 1); err != nil {
+	if _, err := store.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, part), partRoot, 1); err != nil {
 		t.Fatalf("import split part cell tree: %v", err)
 	}
-	if _, err := store.ImportStateCellTree(ctx, block, fullRoot, nil, 1); err != nil {
+	if _, err := store.ImportStateCellTree(ctx, block, fullRoot, 1); err != nil {
 		t.Fatalf("import full state cell tree: %v", err)
 	}
 	partLevelHash := partRoot.HashKey(0)
@@ -248,6 +283,216 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	}
 	if loadedFull.HashKey(0) != fullRootHash {
 		t.Fatalf("unexpected full root hash")
+	}
+}
+
+func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272132,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+	master := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272130,
+		RootHash:  bytes.Repeat([]byte{0x33}, 32),
+		FileHash:  bytes.Repeat([]byte{0x44}, 32),
+	}
+	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
+	partRootHash := partRoot.HashKey()
+	part := splitStatePart{
+		effectiveShard: uint64(block.Shard),
+		rootHash:       partRootHash[:],
+	}
+	boc := partRoot.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	dir := t.TempDir()
+	name, err := PersistentStateFileName(block, master, int64(part.effectiveShard))
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	path := filepath.Join(dir, name)
+	if err = os.WriteFile(path, boc, 0o644); err != nil {
+		t.Fatalf("write reusable split part file: %v", err)
+	}
+
+	store := newTestPebbleStore(t)
+	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
+		Block:            block,
+		MasterchainBlock: master,
+		EffectiveShard:   int64(part.effectiveShard),
+		Ref: &tnstore.ArtifactRef{
+			Path: path,
+			Size: int64(len(boc)),
+		},
+		FileHash: bytes.Repeat([]byte{0x55}, 32),
+	}); err != nil {
+		t.Fatalf("save reusable split part file metadata: %v", err)
+	}
+	if _, err := store.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, part), partRoot, 1); err != nil {
+		t.Fatalf("import split part cells: %v", err)
+	}
+
+	node := &Node{
+		log:           zerolog.Nop(),
+		storage:       store,
+		stateFilesDir: dir,
+	}
+	downloader := persistentStateSnapshotDownloader{
+		node:   node,
+		block:  block,
+		master: master,
+	}
+	res := downloader.stageSplitPart(ctx, 0, 1, part, make(chan struct{}, 1))
+	if res.err != nil {
+		t.Fatalf("stage split part: %v", res.err)
+	}
+	if res.part == nil || res.part.staged == nil || res.part.staged.lazyRoot == nil {
+		t.Fatalf("expected staged lazy root from imported cells")
+	}
+	if res.part.staged.lazyRoot.HashKey() != partRootHash {
+		t.Fatalf("unexpected imported split part hash")
+	}
+	if res.part.staged.peerAddr != "local" {
+		t.Fatalf("unexpected staged peer %q", res.part.staged.peerAddr)
+	}
+}
+
+func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272132,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+	master := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272130,
+		RootHash:  bytes.Repeat([]byte{0x33}, 32),
+		FileHash:  bytes.Repeat([]byte{0x44}, 32),
+	}
+	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
+	partRootHash := partRoot.HashKey()
+	part := splitStatePart{
+		effectiveShard: uint64(block.Shard),
+		rootHash:       partRootHash[:],
+	}
+	boc := partRoot.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	path := filepath.Join(t.TempDir(), "part.boc")
+	if err := os.WriteFile(path, boc, 0o644); err != nil {
+		t.Fatalf("write split part boc: %v", err)
+	}
+
+	store := newTestPebbleStore(t)
+	node := &Node{
+		log:           zerolog.Nop(),
+		storage:       store,
+		peerStorage:   store,
+		stateFilesDir: t.TempDir(),
+	}
+	downloader := persistentStateSnapshotDownloader{
+		node:   node,
+		block:  block,
+		master: master,
+	}
+	staged := &stagedStateFile{
+		effectiveShard: int64(part.effectiveShard),
+		peerAddr:       "127.0.0.1:30303",
+		path:           path,
+		size:           int64(len(boc)),
+		fileHash:       bytes.Repeat([]byte{0x55}, 32),
+	}
+	if err := downloader.importSplitPart(ctx, 0, 1, part, &downloadedSplitStatePart{staged: staged}); err != nil {
+		t.Fatalf("import split part: %v", err)
+	}
+
+	loaded, err := node.loadImportedSplitStatePartRoot(ctx, block, part)
+	if err != nil {
+		t.Fatalf("load imported split part cells: %v", err)
+	}
+	if loaded.HashKey() != partRootHash {
+		t.Fatalf("unexpected imported split part hash")
+	}
+	if _, err = store.BlockState(ctx, splitStatePartStorageBlock(block, part)); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("split part import should not save block state metadata, got %v", err)
+	}
+	if _, err = store.PersistentStateFile(ctx, block, master, int64(part.effectiveShard)); err != nil {
+		t.Fatalf("load saved split part file metadata: %v", err)
+	}
+}
+
+func TestSplitStatePartRootImportsWhenImporterDisablesPartReuse(t *testing.T) {
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(-1 << 63),
+		SeqNo:     63272132,
+	}
+	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
+	partRootHash := partRoot.HashKey()
+	part := splitStatePart{
+		effectiveShard: uint64(block.Shard),
+		rootHash:       partRootHash[:],
+	}
+	boc := partRoot.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	path := filepath.Join(t.TempDir(), "part.boc")
+	if err := os.WriteFile(path, boc, 0o644); err != nil {
+		t.Fatalf("write split part boc: %v", err)
+	}
+
+	oldStore := newTestPebbleStore(t)
+	if _, err := oldStore.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, part), partRoot, 1); err != nil {
+		t.Fatalf("import old split part cells: %v", err)
+	}
+
+	importer := &splitPartReuseDisabledImporter{Store: newTestPebbleStore(t)}
+	artifact := &splitPersistentStateSnapshotArtifact{
+		node:   &Node{log: zerolog.Nop(), storage: oldStore},
+		block:  block,
+		master: master,
+	}
+	root, err := artifact.splitStatePartRoot(ctx, importer, splitPersistentStatePartArtifact{
+		part: part,
+		staged: &stagedStateFile{
+			effectiveShard: int64(part.effectiveShard),
+			peerAddr:       "local",
+			path:           path,
+			size:           int64(len(boc)),
+		},
+	}, 0)
+	if err != nil {
+		t.Fatalf("load split part root: %v", err)
+	}
+	if root.HashKey() != partRootHash {
+		t.Fatalf("unexpected split part root hash")
+	}
+	if importer.bocImports != 1 {
+		t.Fatalf("split part imports = %d, want 1", importer.bocImports)
 	}
 }
 
@@ -304,7 +549,7 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 		}
 
 		partBlock := splitStatePartStorageBlock(block, part)
-		lazyPartRoot, err := store.ImportStateCellTree(ctx, partBlock, partRoot, nil, 0)
+		lazyPartRoot, err := store.ImportStateCellTree(ctx, partBlock, partRoot, 0)
 		if err != nil {
 			t.Fatalf("import split part %d cells: %v", i+1, err)
 		}
@@ -374,6 +619,20 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	if parsed.Parsed.Seqno != block.SeqNo {
 		t.Fatalf("unexpected parsed seqno %d", parsed.Parsed.Seqno)
 	}
+}
+
+type splitPartReuseDisabledImporter struct {
+	*pebblestore.Store
+	bocImports int
+}
+
+func (i *splitPartReuseDisabledImporter) ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
+	i.bocImports++
+	return i.Store.ImportStateBOCView(ctx, block, view)
+}
+
+func (i *splitPartReuseDisabledImporter) ReuseImportedSplitStatePartCells() bool {
+	return false
 }
 
 func TestSplitStatePartsMatchesSerializedProofHeaderPartHashes(t *testing.T) {
@@ -486,7 +745,7 @@ func TestMergeSplitStateDoesNotExpandLazySplitPartAccounts(t *testing.T) {
 
 	store := newTestPebbleStore(t)
 	partRoot := mustSplitStatePartRoot(t, &fullState, parts[0], splitDepth)
-	if _, err := store.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, parts[0]), partRoot, nil, 0); err != nil {
+	if _, err := store.ImportStateCellTree(ctx, splitStatePartStorageBlock(block, parts[0]), partRoot, 0); err != nil {
 		t.Fatalf("import split part cells: %v", err)
 	}
 

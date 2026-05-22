@@ -142,7 +142,7 @@ func (s *testStateStore) VerifiedKeyBlockProgress(_ context.Context) (ton.BlockI
 	return *s.keyBlock, nil
 }
 
-func (s *testStateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt, root *cell.Cell, _ []cell.Cell, _ uint64) (*cell.Cell, error) {
+func (s *testStateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt, root *cell.Cell, _ uint64) (*cell.Cell, error) {
 	if root == nil {
 		return nil, fmt.Errorf("state cell tree root is nil")
 	}
@@ -152,6 +152,14 @@ func (s *testStateStore) ImportStateCellTree(_ context.Context, block ton.BlockI
 	}
 	s.mx.Unlock()
 	return root, nil
+}
+
+func (s *testStateStore) ImportStateBOCView(context.Context, ton.BlockIDExt, *cell.BOCView) (*cell.Cell, error) {
+	return nil, fmt.Errorf("state boc view import is not supported by test store")
+}
+
+func (s *testStateStore) TrustImportedStateCellHashes() bool {
+	return false
 }
 
 func (s *testStateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {

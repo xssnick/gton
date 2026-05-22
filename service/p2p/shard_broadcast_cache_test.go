@@ -92,6 +92,43 @@ func TestShardBroadcastCachePrunesOldestOverflow(t *testing.T) {
 	}
 }
 
+func TestShardBroadcastCacheReplacementMovesEntryToBack(t *testing.T) {
+	cache := newShardBroadcastBlockCache(time.Minute, 1<<20, 2)
+	now := time.Unix(250, 0)
+	first := testShardBroadcastDownloadedBlock(t, 16, 0x16)
+	second := testShardBroadcastDownloadedBlock(t, 17, 0x17)
+	third := testShardBroadcastDownloadedBlock(t, 18, 0x18)
+
+	if err := cache.storeAt(first, nil, first.Block, first.Proof, now); err != nil {
+		t.Fatalf("store first block: %v", err)
+	}
+	if err := cache.storeAt(second, nil, second.Block, second.Proof, now.Add(time.Second)); err != nil {
+		t.Fatalf("store second block: %v", err)
+	}
+	first.Kind = "updated"
+	if err := cache.storeAt(first, nil, first.Block, first.Proof, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("replace first block: %v", err)
+	}
+	if err := cache.storeAt(third, nil, third.Block, third.Proof, now.Add(3*time.Second)); err != nil {
+		t.Fatalf("store third block: %v", err)
+	}
+
+	popAt := now.Add(10 * time.Second)
+	got, err := cache.popBlockAt(first.ID, popAt)
+	if err != nil {
+		t.Fatalf("replaced first block was evicted: %v", err)
+	}
+	if got.Kind != "updated" {
+		t.Fatalf("replaced kind = %q, want updated", got.Kind)
+	}
+	if _, err = cache.popBlockAt(second.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("second block error = %v, want ErrNotFound", err)
+	}
+	if _, err = cache.popBlockAt(third.ID, popAt); err != nil {
+		t.Fatalf("third block was evicted: %v", err)
+	}
+}
+
 func TestDownloadBlockFullUsesShardBroadcastCacheBeforeOverlay(t *testing.T) {
 	node := newTestNode(t)
 	downloaded := testShardBroadcastDownloadedBlock(t, 15, 0x15)

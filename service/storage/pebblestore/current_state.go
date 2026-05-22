@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
+	"github.com/xssnick/gton/service/storage"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -293,15 +293,15 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 		prepared = append(prepared, next)
 	}
 
-	preparedCellsFlushed, err := s.savePreparedStateCellRecords(ctx, cells, cellGeneration)
+	preparedStats, err := s.savePreparedStateCellRecords(ctx, cells, cellGeneration)
 	if err != nil {
 		return nil, 0, err
 	}
-	dfsFlushed, err := s.saveStateCellTreesDFSBatch(ctx, trees)
+	dfsStats, err := s.saveStateCellTreesDFSBatch(ctx, trees)
 	if err != nil {
 		return nil, 0, err
 	}
-	flushCells := preparedCellsFlushed || dfsFlushed
+	flushCells := preparedStats.applied || dfsStats.applied
 	if flushCells {
 		for i := range prepared {
 			prepared[i].flushCells = true
@@ -735,28 +735,34 @@ func (s *Store) DeleteStateMetadataMissingInGeneration(ctx context.Context, gene
 	deleted := 0
 	var start []byte
 	for {
-		keys, next, done, err := s.stateMetadataKeysMissingInCellStore(ctx, hotPrefixStateMeta, cells, start, batchLimit)
+		page, err := s.stateMetadataKeysMissingInCellStore(ctx, hotPrefixStateMeta, cells, start, batchLimit)
 		if err != nil {
 			return deleted, err
 		}
-		if len(keys) > 0 {
-			if err = s.deleteHotRecords(ctx, keys, pebble.Sync); err != nil {
+		if len(page.keys) > 0 {
+			if err = s.deleteHotRecords(ctx, page.keys, pebble.Sync); err != nil {
 				return deleted, err
 			}
-			deleted += len(keys)
+			deleted += len(page.keys)
 		}
-		if done {
+		if page.done {
 			break
 		}
-		start = next
+		start = page.next
 	}
 	return deleted, nil
 }
 
-func (s *Store) stateMetadataKeysMissingInCellStore(ctx context.Context, prefix []byte, cells *cellStore, start []byte, limit int) ([][]byte, []byte, bool, error) {
+type stateMetadataMissingPage struct {
+	keys [][]byte
+	next []byte
+	done bool
+}
+
+func (s *Store) stateMetadataKeysMissingInCellStore(ctx context.Context, prefix []byte, cells *cellStore, start []byte, limit int) (stateMetadataMissingPage, error) {
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {
-		return nil, nil, false, err
+		return stateMetadataMissingPage{}, err
 	}
 	defer s.releaseHotDB()
 
@@ -765,11 +771,13 @@ func (s *Store) stateMetadataKeysMissingInCellStore(ctx context.Context, prefix 
 		UpperBound: prefixUpperBound(prefix),
 	})
 	if err != nil {
-		return nil, nil, false, err
+		return stateMetadataMissingPage{}, err
 	}
 	defer func() { _ = iter.Close() }()
 
-	keys := make([][]byte, 0, limit)
+	page := stateMetadataMissingPage{
+		keys: make([][]byte, 0, limit),
+	}
 	valid := iter.First()
 	if len(start) > 0 {
 		valid = iter.SeekGE(start)
@@ -778,32 +786,34 @@ func (s *Store) stateMetadataKeysMissingInCellStore(ctx context.Context, prefix 
 	for ; valid && bytes.HasPrefix(iter.Key(), prefix); valid = iter.Next() {
 		select {
 		case <-ctx.Done():
-			return nil, nil, false, ctx.Err()
+			return stateMetadataMissingPage{}, ctx.Err()
 		default:
 		}
 
 		cellHash, err := stateMetadataCellHash(prefix, iter.Value())
 		if err != nil {
-			return nil, nil, false, err
+			return stateMetadataMissingPage{}, err
 		}
 		exists, err := cells.has(cellHash)
 		if err != nil {
-			return nil, nil, false, err
+			return stateMetadataMissingPage{}, err
 		}
 		if exists {
 			continue
 		}
 
 		key := bytes.Clone(iter.Key())
-		keys = append(keys, key)
-		if len(keys) >= limit {
-			return keys, nextPebbleScanKey(key), false, nil
+		page.keys = append(page.keys, key)
+		if len(page.keys) >= limit {
+			page.next = nextPebbleScanKey(key)
+			return page, nil
 		}
 	}
 	if err := iter.Error(); err != nil {
-		return nil, nil, false, err
+		return stateMetadataMissingPage{}, err
 	}
-	return keys, nil, true, nil
+	page.done = true
+	return page, nil
 }
 
 func nextPebbleScanKey(key []byte) []byte {

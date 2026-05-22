@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -390,6 +391,35 @@ func TestLiveStoreKeepsPendingBlocksOverLimitUntilFlush(t *testing.T) {
 	}
 	if _, err := live.BlockData(context.Background(), ids[2]); err != nil {
 		t.Fatalf("latest flushed block should stay cached: %v", err)
+	}
+}
+
+func TestLiveStoreReplacingFlushedBlockKeepsTrimCountStable(t *testing.T) {
+	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 2})
+
+	firstRoot := cell.BeginCell().MustStoreUInt(0x31, 8).EndCell()
+	firstData := testBlockBOC(firstRoot)
+	first := testBlockIDForData(0, int64(0x4000000000000000), 31, firstRoot, firstData)
+
+	secondRoot := cell.BeginCell().MustStoreUInt(0x32, 8).EndCell()
+	secondData := testBlockBOC(secondRoot)
+	second := testBlockIDForData(0, int64(0x4000000000000000), 32, secondRoot, secondData)
+
+	if err := live.SetLiveBlock(first, firstRoot, firstData, true); err != nil {
+		t.Fatalf("set first live block: %v", err)
+	}
+	if err := live.SetLiveBlock(first, firstRoot, firstData, true); err != nil {
+		t.Fatalf("replace first live block: %v", err)
+	}
+	if err := live.SetLiveBlock(second, secondRoot, secondData, true); err != nil {
+		t.Fatalf("set second live block: %v", err)
+	}
+
+	if _, err := live.BlockData(context.Background(), first); err != nil {
+		t.Fatalf("replaced first block should stay cached: %v", err)
+	}
+	if _, err := live.BlockData(context.Background(), second); err != nil {
+		t.Fatalf("second block should stay cached: %v", err)
 	}
 }
 
@@ -885,6 +915,56 @@ func TestLiveStoreBlockRootAcceptsTrustedStoredRootWithMode31BOC(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatal("unexpected trusted block data")
+	}
+}
+
+func TestLiveStoreBlockDataDeduplicatesColdMiss(t *testing.T) {
+	stateRoot := cell.BeginCell().MustStoreUInt(0xcc, 8).EndCell()
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 19, stateRoot)
+	data := testBlockBOC(blockRoot)
+	store := &blockingBlockDataStore{
+		fakeStore: fakeStore{
+			blocks: map[string][]byte{
+				storage.BlockKey(id): data,
+			},
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	live := NewLiveStore(store)
+
+	const callers = 16
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			got, err := live.BlockData(context.Background(), id)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(got, data) {
+				errs <- errors.New("unexpected block data")
+				return
+			}
+			errs <- nil
+		}()
+	}
+
+	<-store.started
+	close(store.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("load block data: %v", err)
+		}
+	}
+
+	if calls := store.blockDataCalls(); calls != 1 {
+		t.Fatalf("unexpected cold store calls %d", calls)
 	}
 }
 
@@ -1521,6 +1601,49 @@ func TestAccountStateWithMasterReferenceResolvesBasechainShard(t *testing.T) {
 	}
 }
 
+func TestAccountStateWithLiveStoreCachesBlockFragments(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x34}, 32)
+	shardStateRoot, wantAccount := testShardStateWithAccount(t, ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 15}, accountID)
+	shardBlock, shardRoot := testBlockForState(t, 0, masterchainShard, 15, shardStateRoot)
+	shardHashes := testShardHashes(t, shardBlock)
+	masterStateRoot := testMasterStateWithShardHashes(t, ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 16}, shardHashes)
+	masterBlock, masterRoot := testBlockForState(t, masterchainID, masterchainShard, 16, masterStateRoot)
+
+	backing := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(masterBlock): testBlockBOC(masterRoot),
+			storage.BlockKey(shardBlock):  testBlockBOC(shardRoot),
+		},
+		blockStates: map[string]*storage.BlockState{
+			storage.BlockKey(masterBlock): {Block: masterBlock, StateRootHash: masterStateRoot.Hash(0), Cell: masterStateRoot},
+			storage.BlockKey(shardBlock):  {Block: shardBlock, StateRootHash: shardStateRoot.Hash(0), Cell: shardStateRoot},
+		},
+	}
+	srv := testServer(NewLiveStore(backing))
+
+	for range 2 {
+		resp := srv.handleQuery(context.Background(), ton.GetAccountState{
+			ID: cloneBlockID(masterBlock),
+			Account: ton.AccountID{
+				Workchain: 0,
+				ID:        accountID,
+			},
+		})
+
+		accountState, ok := resp.(ton.AccountState)
+		if !ok {
+			t.Fatalf("response type = %T, want ton.AccountState: %+v", resp, resp)
+		}
+		if accountState.State == nil || accountState.State.HashKey() != wantAccount.HashKey() {
+			t.Fatal("returned account state mismatch")
+		}
+	}
+
+	if backing.loadStateCalls != 2 {
+		t.Fatalf("state loads = %d, want 2", backing.loadStateCalls)
+	}
+}
+
 func TestAccountStateUsesLocalShardAliasWithSameHash(t *testing.T) {
 	accountID := bytes.Repeat([]byte{0x33}, 32)
 	shardStateRoot, wantAccount := testShardStateWithAccount(t, ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 15}, accountID)
@@ -1649,6 +1772,53 @@ func TestRunSmcMethodExecutesGetMethodAndReturnsProofs(t *testing.T) {
 	intValue, ok := value.(*big.Int)
 	if !ok || intValue.Int64() != 7 {
 		t.Fatalf("result value = %#v, want 7", value)
+	}
+}
+
+func TestRunSmcMethodWithLiveStoreCachesBlockFragments(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x38}, 32)
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 12}
+	code := testCodeFromBuilders(t,
+		stackop.POP(0).Serialize(),
+		stackop.PUSHINT(big.NewInt(9)).Serialize(),
+		execop.RET().Serialize(),
+	)
+	stateRoot, _ := testMasterStateWithActiveAccount(t, base, accountID, code, cell.BeginCell().EndCell())
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	paramsCell, err := tlb.NewStack().ToCell()
+	if err != nil {
+		t.Fatalf("build params stack: %v", err)
+	}
+	backing := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		blockStates: map[string]*storage.BlockState{
+			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+	}
+	srv := testServer(NewLiveStore(backing))
+
+	for range 2 {
+		resp := srv.handleQuery(context.Background(), ton.RunSmcMethod{
+			Mode:     4,
+			ID:       cloneBlockID(id),
+			Account:  ton.AccountID{Workchain: masterchainID, ID: accountID},
+			MethodID: tlb.MethodNameHash("answer"),
+			Params:   paramsCell,
+		})
+
+		result, ok := resp.(ton.RunMethodResult)
+		if !ok {
+			t.Fatalf("response type = %T, want ton.RunMethodResult: %+v", resp, resp)
+		}
+		if result.ExitCode != 0 {
+			t.Fatalf("exit code = %d, want 0", result.ExitCode)
+		}
+	}
+
+	if backing.loadStateCalls != 1 {
+		t.Fatalf("state loads = %d, want 1", backing.loadStateCalls)
 	}
 }
 
@@ -4539,7 +4709,40 @@ type fakeStore struct {
 	currentCalls     int
 	blockStateCalls  int
 	blockMetaCalls   int
+	loadStateCalls   int
 	proofCalls       []storage.ServedProofKind
+}
+
+type blockingBlockDataStore struct {
+	fakeStore
+
+	mu      sync.Mutex
+	calls   int
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingBlockDataStore) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	s.once.Do(func() {
+		close(s.started)
+	})
+
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.fakeStore.BlockData(ctx, block)
+}
+
+func (s *blockingBlockDataStore) blockDataCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 type fakeLTLookupKey struct {
@@ -4737,6 +4940,7 @@ func (s *fakeStore) BlockState(_ context.Context, block ton.BlockIDExt) (*storag
 }
 
 func (s *fakeStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
+	s.loadStateCalls++
 	if root := s.stateRoots[string(rootHash)]; root != nil {
 		return root, nil
 	}

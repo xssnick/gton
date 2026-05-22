@@ -54,6 +54,7 @@ const (
 	dhtSeedPeerTimeout         = 5 * time.Second
 	dhtSeedCooldownMinDelay    = 6 * time.Second
 	dhtSeedCooldownJitter      = 4 * time.Second
+	inactiveShardOverlayTTL    = overlayPeerTTL + 60*time.Second
 	attachWarmupTimeout        = 3 * time.Second
 	broadcastEventBuffer       = 4096
 	broadcastQueueMaxItems     = 1024
@@ -140,6 +141,8 @@ type BlockCacheObserver interface {
 
 type overlaySpec struct {
 	Name              string
+	Workchain         int32
+	Shard             int64
 	FullID            []byte
 	ShortID           []byte
 	ProtoVersionMajor int32

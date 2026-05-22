@@ -86,3 +86,50 @@ func TestNextArchivePriorityJobDrainsReadyHotBeforePrefetch(t *testing.T) {
 		t.Fatalf("priority job = %d ok=%v want hot job", got, ok)
 	}
 }
+
+func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
+	queue := &archiveImportQueue{
+		downloadHot:      make(chan archiveDownloadJob, 2),
+		downloadPrefetch: make(chan archiveDownloadJob, 2),
+		prepareHot:       make(chan archivePrepareJob, 2),
+		preparePrefetch:  make(chan archivePrepareJob, 2),
+	}
+	queue.downloadHot <- archiveDownloadJob{}
+	queue.downloadPrefetch <- archiveDownloadJob{}
+	queue.preparePrefetch <- archivePrepareJob{}
+	queue.activeDownload.Add(3)
+	queue.activePrepare.Add(5)
+
+	snapshot := queue.snapshot()
+	if snapshot.activeDownload != 3 || snapshot.activePrepare != 5 {
+		t.Fatalf("active jobs = download:%d prepare:%d, want download:3 prepare:5", snapshot.activeDownload, snapshot.activePrepare)
+	}
+	if snapshot.downloadHotQueued != 1 || snapshot.downloadPrefetchQueued != 1 || snapshot.prepareHotQueued != 0 || snapshot.preparePrefetchQueued != 1 {
+		t.Fatalf("queued jobs = download:%d/%d prepare:%d/%d, want download:1/1 prepare:0/1", snapshot.downloadHotQueued, snapshot.downloadPrefetchQueued, snapshot.prepareHotQueued, snapshot.preparePrefetchQueued)
+	}
+}
+
+func TestArchiveWindowPipelineProgressSnapshotTracksFrontWindow(t *testing.T) {
+	task := newArchiveWindowShardImportTask()
+	task.setStage("shard_archives")
+
+	progress := newArchiveWindowPipelineProgress()
+	progress.setPending([]archivePendingWindow{{
+		window: &shardClientArchiveWindow{startSeqno: 42},
+		shards: task,
+	}}, 0, "planning")
+
+	snapshot := progress.snapshot()
+	if snapshot.frontSeqno != 42 || snapshot.stage != "shard_archives" {
+		t.Fatalf("pipeline front = seqno:%d stage:%s, want seqno:42 stage:shard_archives", snapshot.frontSeqno, snapshot.stage)
+	}
+	if snapshot.pendingWindows != 1 || snapshot.readyWindows != 0 {
+		t.Fatalf("pipeline windows = pending:%d ready:%d, want pending:1 ready:0", snapshot.pendingWindows, snapshot.readyWindows)
+	}
+
+	task.finishStage("ready")
+	snapshot = progress.snapshot()
+	if snapshot.stage != "ready" || snapshot.readyWindows != 1 {
+		t.Fatalf("ready pipeline front = stage:%s ready:%d, want stage:ready ready:1", snapshot.stage, snapshot.readyWindows)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,8 +20,6 @@ import (
 
 const (
 	topShard                           = int64(-1 << 63)
-	syncLagChainMasterchain            = "masterchain"
-	syncLagChainShardchain             = "shardchain"
 	shardStateCatchUpParallelism       = 4
 	shardStateDownloadBuffer           = 32
 	shardStateDownloadWorkers          = 4
@@ -30,7 +29,6 @@ const (
 	syncDiskSpaceRetryDelay            = 5 * time.Second
 	defaultMinSyncDiskFreeBytes        = 10 << 30
 	stateSerializationMinDiskFreeBytes = 30 << 30
-	nextBlockCatchUpCheckpointBlocks   = 600
 	nextBlockBootstrapBlocks           = 0
 	nextBlockBootstrapProbeTimeout     = 2 * time.Second
 	nextBlockBootstrapProbePeers       = 3
@@ -40,6 +38,12 @@ const (
 	nextMasterchainQueueLimit          = 64
 	masterStateCacheLimit              = 2048
 	syncedBlockProcessorWorkers        = 8
+	statusTPSMasterWindow              = 10
+)
+
+const (
+	DefaultNextBlockCheckpointBlocks = 600
+	DefaultCheckpointBytes           = uint64(1 << 30)
 )
 
 var (
@@ -105,13 +109,15 @@ type Service struct {
 	storage   storage.Storage
 	stateSync *state.Syncer
 	liveState CurrentStatePublisher
-	syncLag   SyncLagObserver
+	sync      SyncObserver
 
 	appliedArtifacts *appliedBlockArtifactWriter
 
 	archiveCatchUpCheckpointBlocks uint32
 	archiveCatchUpCheckpointPeriod time.Duration
 	archiveCatchUpPrefetchWindows  int
+	nextBlockCheckpointBlocks      uint32
+	checkpointBytes                uint64
 	shutdownContext                context.Context
 
 	stateMu sync.Mutex
@@ -159,6 +165,8 @@ type Options struct {
 	ArchiveCatchUpCheckpointBlocks     uint32
 	ArchiveCatchUpCheckpointPeriod     time.Duration
 	ArchiveCatchUpPrefetchWindows      int
+	NextBlockCheckpointBlocks          uint32
+	CheckpointBytes                    uint64
 	CurrentStatePublisher              CurrentStatePublisher
 	ShutdownContext                    context.Context
 	StateFilesDir                      string
@@ -168,25 +176,114 @@ type Options struct {
 	MinSyncDiskFreeBytes               uint64
 	MinStateSerializationDiskFreeBytes uint64
 	DisableStateSerialization          bool
-	SyncLagObserver                    SyncLagObserver
+	SyncObserver                       SyncObserver
 }
 
 type CurrentStatePublisher interface {
 	SetLiveCurrentState(*storage.CurrentState)
 }
 
-type SyncLagObserver interface {
-	SetSyncLag(chain string, seconds float64)
+type SyncObserver interface {
+	ObserveSyncCurrentState(SyncCurrentStateObservation)
+	ObserveSyncBlock(SyncBlockObservation)
+	ObserveSyncPersist(SyncPersistObservation)
+}
+
+type SyncCurrentStateObservation struct {
+	MasterchainSeqno uint32
+	ShardClientSeqno uint32
+}
+
+type SyncBlockObservation struct {
+	Pipeline         string
+	Chain            string
+	Source           string
+	Result           string
+	CatchUp          bool
+	DownloadDuration time.Duration
+	ApplyDuration    time.Duration
+}
+
+type SyncPersistObservation struct {
+	Mode          string
+	Result        string
+	QueueDuration time.Duration
+	Duration      time.Duration
+	States        int
+}
+
+func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
+	if s.sync == nil {
+		return
+	}
+	if observation.Pipeline == "" {
+		observation.Pipeline = "unknown"
+	}
+	if observation.Chain == "" {
+		observation.Chain = "unknown"
+	}
+	if observation.Source == "" {
+		observation.Source = "unknown"
+	}
+	if observation.Result == "" {
+		observation.Result = "unknown"
+	}
+	s.sync.ObserveSyncBlock(observation)
+}
+
+func (s *Service) observeSyncPersist(observation SyncPersistObservation) {
+	if s.sync == nil {
+		return
+	}
+	if observation.Mode == "" {
+		observation.Mode = "unknown"
+	}
+	if observation.Result == "" {
+		observation.Result = "unknown"
+	}
+	s.sync.ObserveSyncPersist(observation)
+}
+
+func syncChainLabel(block ton.BlockIDExt) string {
+	if block.Workchain == -1 && block.Shard == topShard {
+		return "masterchain"
+	}
+	if block.Workchain == 0 {
+		return "shardchain"
+	}
+	return fmt.Sprintf("workchain_%d", block.Workchain)
 }
 
 type StatusSnapshot struct {
 	p2p.StatusSnapshot
+	BlockSync             blocksync.StatusSnapshot
 	LocalMasterchain      *ton.BlockIDExt
 	LocalBasechain        *ton.BlockIDExt
+	LocalBasechainShards  []ShardStatusSnapshot
 	LocalStateLoaded      bool
 	LocalStateError       string
 	LocalMasterchainUtime int64
 	LocalBasechainUtime   int64
+	LocalMasterchainTx    uint32
+	LocalBasechainTx      uint32
+	LocalMasterchainHasTx bool
+	LocalBasechainHasTx   bool
+	RecentTPS             StatusTPSSnapshot
+}
+
+type ShardStatusSnapshot struct {
+	Block           ton.BlockIDExt
+	Utime           int64
+	Transactions    uint32
+	HasTransactions bool
+}
+
+type StatusTPSSnapshot struct {
+	WindowMasters   int
+	Transactions    uint64
+	DurationSeconds int64
+	TPS             float64
+	Complete        bool
 }
 
 func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, store storage.Storage, stateSync *state.Syncer, opts Options) *Service {
@@ -198,6 +295,12 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	}
 	if opts.ArchiveCatchUpPrefetchWindows == 0 {
 		opts.ArchiveCatchUpPrefetchWindows = DefaultArchiveCatchUpPrefetchWindows
+	}
+	if opts.NextBlockCheckpointBlocks == 0 {
+		opts.NextBlockCheckpointBlocks = DefaultNextBlockCheckpointBlocks
+	}
+	if opts.CheckpointBytes == 0 {
+		opts.CheckpointBytes = DefaultCheckpointBytes
 	}
 	if opts.ShutdownContext == nil {
 		opts.ShutdownContext = context.Background()
@@ -222,11 +325,13 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		storage:                            store,
 		stateSync:                          stateSync,
 		liveState:                          opts.CurrentStatePublisher,
-		syncLag:                            opts.SyncLagObserver,
+		sync:                               opts.SyncObserver,
 		appliedArtifacts:                   newAppliedBlockArtifactWriter(logger, store, appliedBlockArtifactFlusher(opts.CurrentStatePublisher)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
 		archiveCatchUpCheckpointPeriod:     opts.ArchiveCatchUpCheckpointPeriod,
 		archiveCatchUpPrefetchWindows:      opts.ArchiveCatchUpPrefetchWindows,
+		nextBlockCheckpointBlocks:          opts.NextBlockCheckpointBlocks,
+		checkpointBytes:                    opts.CheckpointBytes,
 		shutdownContext:                    opts.ShutdownContext,
 		currentStateWake:                   make(chan struct{}, 1),
 		shardDescriptionWake:               make(chan struct{}, 1),
@@ -241,6 +346,34 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization)
 	svc.configureLiveBlockPublisher(opts.CurrentStatePublisher)
 	return svc
+}
+
+func (s *Service) nextCheckpointBlocks() uint32 {
+	if s.nextBlockCheckpointBlocks != 0 {
+		return s.nextBlockCheckpointBlocks
+	}
+	return DefaultNextBlockCheckpointBlocks
+}
+
+func (s *Service) checkpointBytesTarget() uint64 {
+	if s.checkpointBytes != 0 {
+		return s.checkpointBytes
+	}
+	return DefaultCheckpointBytes
+}
+
+func checkpointBackpressureBlocks(target uint32) uint32 {
+	if target > ^uint32(0)/2 {
+		return ^uint32(0)
+	}
+	return target * 2
+}
+
+func checkpointBackpressureBytes(target uint64) uint64 {
+	if target > ^uint64(0)/2 {
+		return ^uint64(0)
+	}
+	return target * 2
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -282,21 +415,49 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 	snapshot := StatusSnapshot{
 		StatusSnapshot: s.node.StatusSnapshot(),
 	}
+	if s.blockSync != nil {
+		snapshot.BlockSync = s.blockSync.StatusSnapshot()
+	}
 
-	current, err := s.currentStatusSnapshot(context.Background())
+	ctx := context.Background()
+	current, err := s.currentStatusSnapshot(ctx)
 	if err == nil {
 		snapshot.LocalStateLoaded = true
 		master := current.Masterchain.Block
+		masterMetrics := s.blockStatusMetrics(ctx, &current.Masterchain)
 		snapshot.LocalMasterchain = &master
-		if base, ok := current.Shards[storage.ShardKey{Workchain: 0, Shard: topShard}]; ok {
-			block := base.Block
-			snapshot.LocalBasechain = &block
+		snapshot.LocalMasterchainUtime = masterMetrics.Utime
+		snapshot.LocalMasterchainTx = masterMetrics.Transactions
+		snapshot.LocalMasterchainHasTx = masterMetrics.HasTransactions
+		snapshot.RecentTPS = s.recentTPSSnapshot(ctx, current, statusTPSMasterWindow)
+		for _, shard := range current.Shards {
+			if shard.Block.Workchain != 0 {
+				continue
+			}
+
+			block := shard.Block
+			metrics := s.blockStatusMetrics(ctx, &shard)
+			snapshot.LocalBasechainShards = append(snapshot.LocalBasechainShards, ShardStatusSnapshot{
+				Block:           block,
+				Utime:           metrics.Utime,
+				Transactions:    metrics.Transactions,
+				HasTransactions: metrics.HasTransactions,
+			})
+			if block.Shard == topShard {
+				snapshot.LocalBasechain = &block
+				snapshot.LocalBasechainUtime = metrics.Utime
+				snapshot.LocalBasechainTx = metrics.Transactions
+				snapshot.LocalBasechainHasTx = metrics.HasTransactions
+			}
 		}
-		snapshot.LocalMasterchainUtime = blockStateUtime(context.Background(), s.storage, &current.Masterchain)
-		if snapshot.LocalBasechain != nil {
-			base := current.Shards[storage.ShardKey{Workchain: 0, Shard: topShard}]
-			snapshot.LocalBasechainUtime = blockStateUtime(context.Background(), s.storage, &base)
-		}
+		sort.Slice(snapshot.LocalBasechainShards, func(i, j int) bool {
+			left := snapshot.LocalBasechainShards[i].Block
+			right := snapshot.LocalBasechainShards[j].Block
+			if left.Workchain != right.Workchain {
+				return left.Workchain < right.Workchain
+			}
+			return uint64(left.Shard) < uint64(right.Shard)
+		})
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		snapshot.LocalStateError = err.Error()
 	}
@@ -425,7 +586,28 @@ func (s *Service) runBlockProcessorWorker(ctx context.Context, jobs <-chan block
 	}
 }
 
-func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.SyncedBlock) error {
+func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.SyncedBlock) (err error) {
+	started := time.Now()
+	source := "broadcast"
+	if synced.CatchUp {
+		source = "catch_up"
+	}
+	observation := SyncBlockObservation{
+		Pipeline:         "blocksync",
+		Chain:            syncChainLabel(synced.Downloaded.ID),
+		Source:           source,
+		Result:           "success",
+		CatchUp:          synced.CatchUp,
+		DownloadDuration: synced.DownloadElapsed,
+	}
+	defer func() {
+		if err != nil {
+			observation.Result = "error"
+		}
+		observation.ApplyDuration = time.Since(started)
+		s.observeSyncBlock(observation)
+	}()
+
 	downloaded, err := prepareDownloadedBlock(synced.Downloaded)
 	if err != nil {
 		return err

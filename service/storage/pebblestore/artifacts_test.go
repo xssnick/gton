@@ -103,6 +103,56 @@ func TestSaveArchiveImportPublishesRefOnlyFullBlock(t *testing.T) {
 	}
 }
 
+func TestLinkNextBlockAllowsShardSplitChildren(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
+	left := testServedBlockID(0, int64(0x4000000000000000), 101, 2)
+	right := testServedBlockID(0, int64(-0x4000000000000000), 101, 3)
+
+	if err = store.LinkNextBlock(prev, left); err != nil {
+		t.Fatalf("link left split child: %v", err)
+	}
+	if err = store.LinkNextBlock(prev, right); err != nil {
+		t.Fatalf("link right split child: %v", err)
+	}
+
+	raw, err := store.getHotCopy(context.Background(), hotKeyNextBlock(prev))
+	if err != nil {
+		t.Fatalf("load next block link: %v", err)
+	}
+	got, err := decodeBlockID(raw)
+	if err != nil {
+		t.Fatalf("decode next block link: %v", err)
+	}
+	if !got.Equals(&left) {
+		t.Fatalf("next block link changed after split child: got %s want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
+	}
+}
+
+func TestLinkNextBlockRejectsSameShardFork(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
+	next := testServedBlockID(0, int64(-1<<63), 101, 2)
+	fork := testServedBlockID(0, int64(-1<<63), 101, 3)
+
+	if err = store.LinkNextBlock(prev, next); err != nil {
+		t.Fatalf("link next block: %v", err)
+	}
+	if err = store.LinkNextBlock(prev, fork); err == nil {
+		t.Fatal("same-shard next block fork was accepted")
+	}
+}
+
 func TestStoredZeroStateBlocks(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -207,7 +257,7 @@ func TestSaveBlockFullStoresOriginalBlockBOC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode block artifact ref: %v", err)
 	}
-	packed, err := store.readArtifactRef(ref)
+	packed, err := store.readArtifactRef(context.Background(), ref)
 	if err != nil {
 		t.Fatalf("read packed block data: %v", err)
 	}
@@ -805,6 +855,16 @@ func testArchivePruneBlock(seqno uint32, seed byte) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: -1,
 		Shard:     int64(-1 << 63),
+		SeqNo:     seqno,
+		RootHash:  bytes.Repeat([]byte{seed}, 32),
+		FileHash:  bytes.Repeat([]byte{seed + 1}, 32),
+	}
+}
+
+func testServedBlockID(workchain int32, shard int64, seqno uint32, seed byte) ton.BlockIDExt {
+	return ton.BlockIDExt{
+		Workchain: workchain,
+		Shard:     shard,
 		SeqNo:     seqno,
 		RootHash:  bytes.Repeat([]byte{seed}, 32),
 		FileHash:  bytes.Repeat([]byte{seed + 1}, 32),

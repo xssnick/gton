@@ -104,11 +104,11 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 		if s.node != nil {
 			s.node.SetRebroadcastQuiet(false)
 		}
-		next, changed, err := s.runNextSyncBootstrap(ctx, current)
+		next, err := s.runNextSyncBootstrap(ctx, current)
 		if err != nil {
 			return err
 		}
-		if !changed {
+		if !next.changed {
 			if err = s.waitCurrentStatePersist(ctx); err != nil {
 				return err
 			}
@@ -119,7 +119,7 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 				Msg("current state caught up")
 			return nil
 		}
-		current = next
+		current = next.current
 	}
 }
 
