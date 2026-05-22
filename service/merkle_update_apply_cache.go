@@ -104,10 +104,6 @@ func newArchiveStateCellRecordCache(capacity int) *archiveStateCellRecordCache {
 	}
 }
 
-func newArchiveStateCellApplyStats() *archiveStateCellApplyStats {
-	return &archiveStateCellApplyStats{}
-}
-
 func (s *archiveStateCellApplyStats) observe(cells int, elapsed time.Duration) {
 	if s == nil {
 		return

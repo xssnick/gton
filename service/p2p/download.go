@@ -6,11 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"time"
+
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/blockproof"
 	tnstore "github.com/xssnick/gton/service/storage"
-	"fmt"
-	"time"
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/xssnick/tonutils-go/adnl"
@@ -29,8 +30,10 @@ type CompressedBlockStateProvider interface {
 	StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
 }
 
-func (n *Node) SetCompressedBlockStateProvider(provider CompressedBlockStateProvider) {
-	n.compressedState = provider
+type CompressedBlockStateProviderFunc func(context.Context, ton.BlockIDExt) (*cell.Cell, error)
+
+func (f CompressedBlockStateProviderFunc) StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
+	return f(ctx, block)
 }
 
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {

@@ -2110,6 +2110,198 @@ func TestPendingCellGenerationMigrationSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestCellGenerationStateImportMarkerSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	origin := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+		RootHash:  bytes.Repeat([]byte{0x20}, 32),
+		FileHash:  bytes.Repeat([]byte{0x21}, 32),
+	}
+	generation, err := store.BeginCellGeneration(ctx, origin)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	if err = store.MarkCellGenerationStateImported(ctx, generation, origin); err != nil {
+		t.Fatalf("mark imported state: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if err = store.CellGenerationStateImported(ctx, generation, origin); err != nil {
+		t.Fatalf("load imported state marker: %v", err)
+	}
+	other := origin
+	other.SeqNo++
+	if err = store.CellGenerationStateImported(ctx, generation, other); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("other imported state marker error = %v, want ErrNotFound", err)
+	}
+
+	if err = store.AbortCellGeneration(ctx, generation); err != nil {
+		t.Fatalf("abort generation: %v", err)
+	}
+	if err = store.CellGenerationStateImported(ctx, generation, origin); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("aborted generation marker error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCellGenerationMigrationProgressSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	origin := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+		RootHash:  bytes.Repeat([]byte{0x20}, 32),
+		FileHash:  bytes.Repeat([]byte{0x21}, 32),
+	}
+	generation, err := store.BeginCellGeneration(ctx, origin)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	state := blockStateWithSingleCell(origin, 0x33)
+	if err = store.SaveBlockState(ctx, state); err != nil {
+		t.Fatalf("save block state: %v", err)
+	}
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: origin.SeqNo,
+		Masterchain:      *state,
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveCellGenerationMigrationProgress(ctx, generation, current); err != nil {
+		t.Fatalf("save migration progress: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	loaded, err := store.CellGenerationMigrationProgress(ctx, generation)
+	if err != nil {
+		t.Fatalf("load migration progress: %v", err)
+	}
+	if !loaded.Masterchain.Block.Equals(&origin) {
+		t.Fatalf("progress masterchain = %s, want %s", storage.FormatBlockRef(loaded.Masterchain.Block), storage.FormatBlockRef(origin))
+	}
+	if err = store.AbortCellGeneration(ctx, generation); err != nil {
+		t.Fatalf("abort generation: %v", err)
+	}
+	if _, err = store.CellGenerationMigrationProgress(ctx, generation); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("aborted generation progress error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDropPendingCellGenerationDetachesStatus(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	origin := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+		RootHash:  bytes.Repeat([]byte{0x20}, 32),
+		FileHash:  bytes.Repeat([]byte{0x21}, 32),
+	}
+	generation, err := store.BeginCellGeneration(ctx, origin)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	if err = store.MarkCellGenerationStateImported(ctx, generation, origin); err != nil {
+		t.Fatalf("mark imported state: %v", err)
+	}
+	heldCells, err := store.acquireCellStore(ctx, generation)
+	if err != nil {
+		t.Fatalf("hold pending generation ref: %v", err)
+	}
+	heldCellsReleased := false
+	defer func() {
+		if !heldCellsReleased {
+			heldCells.release()
+		}
+	}()
+	if err = store.DropPendingCellGeneration(ctx, generation); err != nil {
+		t.Fatalf("drop pending generation: %v", err)
+	}
+
+	if _, err = store.PendingCellGenerationMigration(ctx); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("pending migration after drop err = %v, want ErrNotFound", err)
+	}
+
+	status, err := store.DBStatus(ctx)
+	if err != nil {
+		t.Fatalf("db status: %v", err)
+	}
+	if len(status.CellGenerations) != 1 {
+		t.Fatalf("cell generations after drop = %d, want only active generation", len(status.CellGenerations))
+	}
+	if status.CellGenerations[0].ID == generation {
+		t.Fatal("dropped pending generation is still visible in db status")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		removed := true
+		for shard := 0; shard < cellDBShardCount; shard++ {
+			if _, err = os.Stat(cellGenerationShardDir(store.dir, generation, shard)); err == nil {
+				removed = false
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stat dropped generation shard dir: %v", err)
+			}
+		}
+		if removed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("dropped pending generation dirs were not removed while cell store ref is held")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	heldCells.release()
+	heldCellsReleased = true
+
+	deadline = time.Now().Add(time.Second)
+	for {
+		err = store.CellGenerationStateImported(ctx, generation, origin)
+		if errors.Is(err, storage.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("import marker after drop err = %v, want ErrNotFound", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {

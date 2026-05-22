@@ -57,6 +57,13 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 		if current.ShardClientSeqno == 0 {
 			current.ShardClientSeqno = current.Masterchain.Block.SeqNo
 		}
+		if s.cellGenerationSwitchRequestActive() {
+			s.log.Info().
+				Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+				Uint32("shard_client_seqno", current.ShardClientSeqno).
+				Msg("yielding current state sync for cell generation switch")
+			return nil
+		}
 
 		nowUnix := time.Now().Unix()
 		masterUTime := blockStateUtime(ctx, s.storage, &current.Masterchain)
@@ -86,6 +93,13 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
+				if s.cellGenerationSwitchRequestActive() {
+					s.log.Info().
+						Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+						Uint32("shard_client_seqno", current.ShardClientSeqno).
+						Msg("yielding archive catch-up loop for cell generation switch")
+					return nil
+				}
 				continue
 			}
 		}
@@ -97,6 +111,13 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 					return err
 				}
 				current = next
+				if s.cellGenerationSwitchRequestActive() {
+					s.log.Info().
+						Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+						Uint32("shard_client_seqno", current.ShardClientSeqno).
+						Msg("yielding targeted next-block catch-up loop for cell generation switch")
+					return nil
+				}
 				continue
 			}
 		}
@@ -120,6 +141,13 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 			return nil
 		}
 		current = next.current
+		if s.cellGenerationSwitchRequestActive() {
+			s.log.Info().
+				Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+				Uint32("shard_client_seqno", current.ShardClientSeqno).
+				Msg("yielding next-block bootstrap loop for cell generation switch")
+			return nil
+		}
 	}
 }
 

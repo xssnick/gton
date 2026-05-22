@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	tnstate "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -746,7 +747,7 @@ func (a *splitPersistentStateSnapshotArtifact) ImportCells(ctx context.Context, 
 }
 
 func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells storage.StateCellTreeImporter) (*storage.BlockState, error) {
-	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
+	accounts, err := tnstate.NewShardAccountsAugDict()
 	if err != nil {
 		return nil, err
 	}
@@ -773,7 +774,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		}
 
 		stopProgress := a.startSplitStatePartProgress(ctx, part, i, "load_accounts")
-		partAccounts, err := loadSplitStatePartAccounts(root)
+		partAccounts, err := tnstate.LoadShardAccountsRoot(root)
 		stopProgress()
 		if err != nil {
 			return nil, fmt.Errorf("%w: parse split state part %d accounts: %w", errStateSnapshotInvalid, i+1, err)
@@ -808,7 +809,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		Int("parts", len(a.parts)).
 		Msg("merging split persistent state parts")
 
-	stateRoot, err := mergeSplitStateAccounts(a.header.state, accounts)
+	stateRoot, err := tnstate.MergeSplitStateAccounts(a.header.state, accounts)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}

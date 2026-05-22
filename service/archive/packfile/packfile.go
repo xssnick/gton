@@ -243,31 +243,3 @@ func rollbackAppend(file *os.File, offset int64, err error) error {
 	}
 	return err
 }
-
-func ReadRange(path string, offset int64, size int64) ([]byte, error) {
-	if offset < 0 || size < 0 {
-		return nil, fmt.Errorf("invalid archive file range offset=%d size=%d", offset, size)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = file.Close() }()
-
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if offset >= stat.Size() {
-		return nil, nil
-	}
-	if offset+size > stat.Size() {
-		size = stat.Size() - offset
-	}
-
-	data := make([]byte, size)
-	if _, err = file.ReadAt(data, offset); err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
-	}
-	return data, nil
-}

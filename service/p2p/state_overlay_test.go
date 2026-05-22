@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	tnstore "github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/gton/service/storage/pebblestore"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+
+	tnstate "github.com/xssnick/gton/service/state"
+	tnstore "github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -759,7 +761,7 @@ func TestMergeSplitStateDoesNotExpandLazySplitPartAccounts(t *testing.T) {
 		t.Fatalf("create counted lazy split part: %v", err)
 	}
 
-	merged, err := mergeSplitState(&fullState, []*cell.Cell{lazyPartRoot})
+	merged, err := tnstate.MergeSplitState(&fullState, []*cell.Cell{lazyPartRoot})
 	if err != nil {
 		t.Fatalf("merge split state: %v", err)
 	}
@@ -812,7 +814,7 @@ func (l *countingLazyCellLoader) LoadCell(hash cell.Hash) (*cell.Cell, error) {
 func mustTestShardStateCell(t *testing.T, block ton.BlockIDExt) *cell.Cell {
 	t.Helper()
 
-	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
+	accounts, err := tnstate.NewShardAccountsAugDict()
 	if err != nil {
 		t.Fatalf("create accounts dict: %v", err)
 	}
@@ -850,7 +852,7 @@ func mustTestShardStateCellWithAccounts(t *testing.T, block ton.BlockIDExt, keys
 func mustTestShardStateCellWithAccountIDs(t *testing.T, block ton.BlockIDExt, accountIDs ...*big.Int) *cell.Cell {
 	t.Helper()
 
-	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
+	accounts, err := tnstate.NewShardAccountsAugDict()
 	if err != nil {
 		t.Fatalf("create accounts dict: %v", err)
 	}
@@ -901,7 +903,7 @@ func mustSplitStatePartRoot(t *testing.T, header *tlb.ShardStateUnsplit, part sp
 		t.Fatal("split part root is empty")
 	}
 
-	wrapped, err := wrapShardAccountsRoot(partRoot)
+	wrapped, err := tnstate.WrapShardAccountsRoot(partRoot)
 	if err != nil {
 		t.Fatalf("wrap split part root: %v", err)
 	}
@@ -911,7 +913,7 @@ func mustSplitStatePartRoot(t *testing.T, header *tlb.ShardStateUnsplit, part sp
 func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header *tlb.ShardStateUnsplit, splitDepth uint32) []splitStatePart {
 	t.Helper()
 
-	shardPrefixLen := shardPrefixLength(block.Shard)
+	shardPrefixLen := tnstate.ShardPrefixLength(block.Shard)
 	if splitDepth <= uint32(shardPrefixLen) || splitDepth > 63 {
 		t.Fatalf("invalid split depth %d for shard prefix length %d", splitDepth, shardPrefixLen)
 	}
@@ -928,7 +930,7 @@ func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header
 			t.Fatalf("extract split part %d root: %v", i+1, err)
 		}
 		if partRoot != nil {
-			wrapped, err := wrapShardAccountsRoot(partRoot)
+			wrapped, err := tnstate.WrapShardAccountsRoot(partRoot)
 			if err != nil {
 				t.Fatalf("wrap split part %d root: %v", i+1, err)
 			}

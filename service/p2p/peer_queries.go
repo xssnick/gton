@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
+	tnstate "github.com/xssnick/gton/service/state"
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
@@ -453,8 +454,8 @@ func persistentStateEffectiveShardForQuery(block ton.BlockIDExt, effectiveShard 
 }
 
 func shardIsAncestor(shard int64, child int64) bool {
-	shardPrefixLen := shardPrefixLength(shard)
-	childPrefixLen := shardPrefixLength(child)
+	shardPrefixLen := tnstate.ShardPrefixLength(shard)
+	childPrefixLen := tnstate.ShardPrefixLength(child)
 	if shardPrefixLen > childPrefixLen {
 		return false
 	}

@@ -69,18 +69,19 @@ func waitPebbleDiskSpace(fs vfs.FS, dir string, logger zerolog.Logger) {
 	}
 }
 
-func newMetaPebbleOptions(cache *pebble.Cache, fs vfs.FS, memTableSize, bytesPerSync, walBytesPerSync int, logger zerolog.Logger) *pebble.Options {
+func newMetaPebbleOptions(cache *pebble.Cache, fs vfs.FS, memTableSize, bytesPerSync, walBytesPerSync int, compactionScheduler pebble.CompactionScheduler, logger zerolog.Logger) *pebble.Options {
 	return newPebbleOptions(cache, memTableSize, bytesPerSync, walBytesPerSync, pebbleOptionsTuning{
 		blockSize:                   4 << 10,
 		compression:                 pebbleNoCompression,
 		filterPolicy:                bloom.FilterPolicy(10),
 		targetFileSize:              defaultPebbleMetaTargetFileSize,
 		maxOpenFiles:                defaultPebbleMetaMaxOpenFiles,
-		maxConcurrentCompactions:    pebbleMaxConcurrentCompactions,
+		maxConcurrentCompactions:    pebbleMetaMaxConcurrentCompactions,
 		memTableStopWritesThreshold: defaultPebbleMetaMemTableStopThreshold,
 		l0CompactionThreshold:       defaultPebbleMetaL0CompactionThreshold,
 		l0CompactionFileThreshold:   defaultPebbleMetaL0FileThreshold,
 		l0StopWritesThreshold:       defaultPebbleMetaL0StopWritesThreshold,
+		compactionScheduler:         compactionScheduler,
 	}, fs, logger)
 }
 
@@ -204,6 +205,10 @@ func pebbleMaxConcurrentCompactions() int {
 		return 1
 	}
 	return n
+}
+
+func pebbleMetaMaxConcurrentCompactions() int {
+	return 1
 }
 
 func pebbleCellMaxConcurrentCompactions() int {

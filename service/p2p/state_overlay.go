@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/logutil"
+	tnstate "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/adnl"
@@ -233,7 +234,7 @@ func (n *Node) downloadPersistentStateSnapshot(ctx context.Context, block ton.Bl
 func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDepth uint32) (storage.DownloadedState, error) {
 	n := d.node
 
-	if n.storage != nil && (d.block.Workchain == -1 || splitDepth <= uint32(shardPrefixLength(d.block.Shard))) {
+	if n.storage != nil && (d.block.Workchain == -1 || splitDepth <= uint32(tnstate.ShardPrefixLength(d.block.Shard))) {
 		staged, lazyRoot, err := n.tryImportReusableStagedStateFile(ctx, d.block, d.master, 0, d.stateRootHash)
 		if err == nil {
 			if err = n.cacheImportedStagedBlockState(d.block, staged, lazyRoot, d.stateRootHash); err != nil {
@@ -272,7 +273,7 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 		Msg("trying peers for persistent state snapshot")
 
 	d.peers = peers
-	if d.block.Workchain != -1 && splitDepth > uint32(shardPrefixLength(d.block.Shard)) {
+	if d.block.Workchain != -1 && splitDepth > uint32(tnstate.ShardPrefixLength(d.block.Shard)) {
 		return d.downloadSplit(ctx, splitDepth)
 	}
 

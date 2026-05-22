@@ -4,19 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/xssnick/gton/liteserver"
-	"github.com/xssnick/gton/service/p2p"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -27,7 +21,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 
-	if cfg.TON.GlobalConfigPath != p2p.DefaultGlobalConfigPath {
+	if cfg.TON.GlobalConfigPath != DefaultGlobalConfigPath {
 		t.Fatalf("unexpected TON config path %q", cfg.TON.GlobalConfigPath)
 	}
 	if cfg.TON.SyncBefore != int64(DefaultSyncBefore/time.Second) {
@@ -220,123 +214,6 @@ func TestStorageOptions(t *testing.T) {
 	}
 }
 
-func TestMetricsOptions(t *testing.T) {
-	path := writeTestConfig(t, `{"metrics":{"enabled":true,"listen_addr":"127.0.0.1:9090"}}`)
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-
-	opts, err := cfg.MetricsOptions()
-	if err != nil {
-		t.Fatalf("metrics options: %v", err)
-	}
-	if !opts.Enabled {
-		t.Fatal("expected metrics to be enabled")
-	}
-	if opts.ListenAddr != "127.0.0.1:9090" {
-		t.Fatalf("unexpected metrics listen addr %q", opts.ListenAddr)
-	}
-}
-
-func TestMetricsOptionsRequireListenAddrWhenEnabled(t *testing.T) {
-	path := writeTestConfig(t, `{"metrics":{"enabled":true}}`)
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if _, err = cfg.MetricsOptions(); err == nil {
-		t.Fatal("expected enabled metrics without listen addr to fail")
-	}
-}
-
-func TestP2POptions(t *testing.T) {
-	adnlSeed := testSeedBase64(1)
-	dhtSeed := testSeedBase64(2)
-	liteSeed := testSeedBase64(3)
-	path := writeTestConfig(t, fmt.Sprintf(`{
-		"ton": {
-			"global_config_path": "configs/global.config.json"
-		},
-		"adnl": {
-			"key": %q,
-			"listen_addr": "0.0.0.0:30303",
-			"external_addr": "203.0.113.10:30303"
-		},
-		"dht": {
-			"key": %q,
-			"listen_addr": "0.0.0.0:30304"
-		},
-			"liteserver": {
-				"enabled": true,
-				"key": %q,
-				"listen_addr": "0.0.0.0:7445",
-				"master_block_cache": 11,
-				"shard_block_cache": 22
-			},
-		"storage": {
-			"dir": "data/node"
-		}
-	}`, adnlSeed, dhtSeed, liteSeed))
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-
-	opts, err := cfg.P2POptions()
-	if err != nil {
-		t.Fatalf("p2p options: %v", err)
-	}
-
-	if opts.GlobalConfigPath != "configs/global.config.json" {
-		t.Fatalf("unexpected TON config path %q", opts.GlobalConfigPath)
-	}
-	if !bytes.Equal(opts.PrivateKey, testPrivateKey(1)) {
-		t.Fatal("unexpected ADNL private key")
-	}
-	if opts.ListenAddr != "0.0.0.0:30303" {
-		t.Fatalf("unexpected listen addr %q", opts.ListenAddr)
-	}
-	if !opts.ExternalIP.Equal(net.ParseIP("203.0.113.10")) {
-		t.Fatalf("unexpected external ip %s", opts.ExternalIP)
-	}
-	if opts.ExternalPort != 30303 {
-		t.Fatalf("unexpected external port %d", opts.ExternalPort)
-	}
-	if !bytes.Equal(opts.DHTPrivateKey, testPrivateKey(2)) {
-		t.Fatal("unexpected DHT private key")
-	}
-	if opts.DHTListenAddr != "0.0.0.0:30304" {
-		t.Fatalf("unexpected DHT listen addr %q", opts.DHTListenAddr)
-	}
-	if cfg.StorageDir() != "data/node" {
-		t.Fatalf("unexpected storage dir %q", cfg.StorageDir())
-	}
-
-	liteOpts, err := cfg.LiteserverOptions()
-	if err != nil {
-		t.Fatalf("liteserver options: %v", err)
-	}
-	if !liteOpts.Enabled {
-		t.Fatal("expected liteserver to be enabled")
-	}
-	if liteOpts.ListenAddr != "0.0.0.0:7445" {
-		t.Fatalf("unexpected liteserver listen addr %q", liteOpts.ListenAddr)
-	}
-	if !bytes.Equal(liteOpts.PrivateKey, testPrivateKey(3)) {
-		t.Fatal("unexpected liteserver private key")
-	}
-	if liteOpts.MasterBlockCache != 11 {
-		t.Fatalf("unexpected liteserver master cache %d", liteOpts.MasterBlockCache)
-	}
-	if liteOpts.ShardBlockCache != 22 {
-		t.Fatalf("unexpected liteserver shard cache %d", liteOpts.ShardBlockCache)
-	}
-}
-
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	path := writeTestConfig(t, `{"logging":{"level":"debug"}}`)
 
@@ -379,13 +256,13 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Lite.Enabled {
 		t.Fatal("expected generated liteserver to be disabled")
 	}
-	if cfg.Lite.ListenAddr != defaultLiteListen {
+	if cfg.Lite.ListenAddr != DefaultLiteListen {
 		t.Fatalf("unexpected liteserver listen addr %q", cfg.Lite.ListenAddr)
 	}
-	if cfg.Lite.MasterBlockCache != liteserver.DefaultMasterBlockCache {
+	if cfg.Lite.MasterBlockCache != DefaultLiteMasterBlockCache {
 		t.Fatalf("unexpected liteserver master cache %d", cfg.Lite.MasterBlockCache)
 	}
-	if cfg.Lite.ShardBlockCache != liteserver.DefaultShardBlockCache {
+	if cfg.Lite.ShardBlockCache != DefaultLiteShardBlockCache {
 		t.Fatalf("unexpected liteserver shard cache %d", cfg.Lite.ShardBlockCache)
 	}
 	wantStorageDir, err := filepath.Abs(defaultStorageDir)
@@ -398,7 +275,7 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Storage.ArtifactFileMaxOpen != DefaultArtifactFileMaxOpen {
 		t.Fatalf("unexpected artifact file max open %d", cfg.Storage.ArtifactFileMaxOpen)
 	}
-	wantGlobalConfigPath, err := filepath.Abs(p2p.DefaultGlobalConfigPath)
+	wantGlobalConfigPath, err := filepath.Abs(DefaultGlobalConfigPath)
 	if err != nil {
 		t.Fatalf("resolve global config path: %v", err)
 	}
@@ -581,16 +458,4 @@ func writeTestConfig(tb testing.TB, body string) string {
 		tb.Fatalf("write config: %v", err)
 	}
 	return path
-}
-
-func testSeedBase64(seedByte byte) string {
-	return base64.StdEncoding.EncodeToString(testSeed(seedByte))
-}
-
-func testPrivateKey(seedByte byte) ed25519.PrivateKey {
-	return ed25519.NewKeyFromSeed(testSeed(seedByte))
-}
-
-func testSeed(seedByte byte) []byte {
-	return bytes.Repeat([]byte{seedByte}, ed25519.SeedSize)
 }

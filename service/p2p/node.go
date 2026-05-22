@@ -17,6 +17,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/internal/logutil"
+	tnstate "github.com/xssnick/gton/service/state"
 	storage2 "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl"
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
@@ -195,6 +196,7 @@ func New(opts Options) (*Node, error) {
 		rawMasterchainNotify:      make(chan struct{}),
 		storage:                   storage,
 		peerStorage:               peerStorage,
+		compressedState:           opts.CompressedState,
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastQueue:          newBoundedQueue(rebroadcastQueueMaxItems, rebroadcastQueueMaxBytes, rebroadcastRequestBytes),
@@ -1074,7 +1076,7 @@ func (n *Node) activeShardOverlaySpecs(blocks []ton.BlockIDExt) ([]overlaySpec, 
 
 		depth := n.monitorMinSplitDepthForWorkchain(block.Workchain)
 		shard := block.Shard
-		if uint32(shardPrefixLength(shard)) > depth {
+		if uint32(tnstate.ShardPrefixLength(shard)) > depth {
 			shard = shardPrefix(shard, depth)
 		}
 
@@ -1147,7 +1149,7 @@ func (n *Node) overlayBlockForDownload(block ton.BlockIDExt) ton.BlockIDExt {
 	}
 
 	depth := n.monitorMinSplitDepthForWorkchain(block.Workchain)
-	prefixLen := shardPrefixLength(block.Shard)
+	prefixLen := tnstate.ShardPrefixLength(block.Shard)
 	if uint32(prefixLen) <= depth {
 		return block
 	}
@@ -1176,7 +1178,7 @@ func shardPrefix(shard int64, depth uint32) int64 {
 }
 
 func shardParent(shard int64) int64 {
-	depth := shardPrefixLength(shard)
+	depth := tnstate.ShardPrefixLength(shard)
 	if depth <= 0 {
 		return topShard
 	}

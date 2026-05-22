@@ -5,11 +5,18 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 type DBStatus struct {
+	Meta            *MetaDBStatus
 	CellGenerations []CellDBGenerationStatus
+}
+
+type MetaDBStatus struct {
+	Cache CellDBCacheStatus
+	DB    CellDBShardStatus
 }
 
 type CellDBGenerationStatus struct {
@@ -59,6 +66,13 @@ func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
 	status := DBStatus{
 		CellGenerations: make([]CellDBGenerationStatus, 0, len(generations)),
 	}
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return DBStatus{}, err
+	}
+	status.Meta = metaDBStatus(db)
+	s.releaseHotDB()
+
 	for _, generation := range generations {
 		cells, err := s.acquireCellStore(ctx, generation.id)
 		if err != nil {
@@ -92,6 +106,16 @@ func (s *Store) MaxReadAmp(ctx context.Context) (int64, error) {
 		}
 	}
 	return maxReadAmp, nil
+}
+
+func (s *Store) CellGenerationDBMetrics(ctx context.Context, generation uint64) (storage.CellGenerationDBMetrics, error) {
+	cells, err := s.acquireCellStore(ctx, generation)
+	if err != nil {
+		return storage.CellGenerationDBMetrics{}, err
+	}
+	defer cells.release()
+
+	return cellStoreDBMetrics(cells), nil
 }
 
 type cellGenerationStatusTarget struct {
@@ -146,38 +170,54 @@ func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt
 		metrics := shard.db.Metrics()
 		if !cacheLoaded {
 			cacheLoaded = true
-			status.Cache = CellDBCacheStatus{
-				BlockCacheSize:      metrics.BlockCache.Size,
-				BlockCacheHits:      metrics.BlockCache.Hits,
-				BlockCacheMisses:    metrics.BlockCache.Misses,
-				FileCacheSize:       metrics.FileCache.Size,
-				FileCacheTableCount: metrics.FileCache.TableCount,
-			}
+			status.Cache = pebbleDBCacheStatus(metrics)
 		}
 
-		shardStatus := CellDBShardStatus{
-			Shard:                    shardIdx,
-			DiskSize:                 metrics.DiskSpaceUsage(),
-			LiveSize:                 metrics.Table.Local.LiveSize,
-			LiveTables:               metrics.Table.Local.LiveCount,
-			ReadAmp:                  cellDBReadAmp(metrics.Levels),
-			L0Files:                  metrics.Levels[0].TablesCount,
-			L0Sublevels:              int64(metrics.Levels[0].Sublevels),
-			L0Size:                   metrics.Levels[0].TablesSize,
-			CompactionDebt:           metrics.Compact.EstimatedDebt,
-			CompactionsInProgress:    metrics.Compact.NumInProgress,
-			CompactionInProgressSize: metrics.Compact.InProgressBytes,
-			MemTableSize:             metrics.MemTable.Size,
-			MemTableCount:            metrics.MemTable.Count,
-			TableIters:               metrics.TableIters,
-			Flushes:                  metrics.Flush.Count,
-			Ingests:                  metrics.Ingest.Count,
-		}
+		shardStatus := pebbleDBShardStatus(shardIdx, metrics)
 		status.Shards = append(status.Shards, shardStatus)
 		status.Total.add(shardStatus)
 	}
 	status.Total.Shard = -1
 	return status
+}
+
+func metaDBStatus(db *pebble.DB) *MetaDBStatus {
+	metrics := db.Metrics()
+	return &MetaDBStatus{
+		Cache: pebbleDBCacheStatus(metrics),
+		DB:    pebbleDBShardStatus(-1, metrics),
+	}
+}
+
+func pebbleDBCacheStatus(metrics *pebble.Metrics) CellDBCacheStatus {
+	return CellDBCacheStatus{
+		BlockCacheSize:      metrics.BlockCache.Size,
+		BlockCacheHits:      metrics.BlockCache.Hits,
+		BlockCacheMisses:    metrics.BlockCache.Misses,
+		FileCacheSize:       metrics.FileCache.Size,
+		FileCacheTableCount: metrics.FileCache.TableCount,
+	}
+}
+
+func pebbleDBShardStatus(shard int, metrics *pebble.Metrics) CellDBShardStatus {
+	return CellDBShardStatus{
+		Shard:                    shard,
+		DiskSize:                 metrics.DiskSpaceUsage(),
+		LiveSize:                 metrics.Table.Local.LiveSize,
+		LiveTables:               metrics.Table.Local.LiveCount,
+		ReadAmp:                  cellDBReadAmp(metrics.Levels),
+		L0Files:                  metrics.Levels[0].TablesCount,
+		L0Sublevels:              int64(metrics.Levels[0].Sublevels),
+		L0Size:                   metrics.Levels[0].TablesSize,
+		CompactionDebt:           metrics.Compact.EstimatedDebt,
+		CompactionsInProgress:    metrics.Compact.NumInProgress,
+		CompactionInProgressSize: metrics.Compact.InProgressBytes,
+		MemTableSize:             metrics.MemTable.Size,
+		MemTableCount:            metrics.MemTable.Count,
+		TableIters:               metrics.TableIters,
+		Flushes:                  metrics.Flush.Count,
+		Ingests:                  metrics.Ingest.Count,
+	}
 }
 
 func cellDBReadAmp(levels [7]pebble.LevelMetrics) int64 {
@@ -208,6 +248,31 @@ func cellStoreMaxReadAmp(cells *cellStore) int64 {
 		}
 	}
 	return maxReadAmp
+}
+
+func cellStoreDBMetrics(cells *cellStore) storage.CellGenerationDBMetrics {
+	var ret storage.CellGenerationDBMetrics
+	if cells == nil {
+		return ret
+	}
+
+	for _, shard := range cells.shards {
+		if shard == nil || shard.db == nil {
+			continue
+		}
+		metrics := shard.db.Metrics()
+		readAmp := cellDBReadAmp(metrics.Levels)
+		if readAmp > ret.MaxReadAmp {
+			ret.MaxReadAmp = readAmp
+		}
+		ret.L0Files += metrics.Levels[0].TablesCount
+		ret.L0Sublevels += int64(metrics.Levels[0].Sublevels)
+		ret.L0Size += metrics.Levels[0].TablesSize
+		ret.CompactionDebt += metrics.Compact.EstimatedDebt
+		ret.CompactionsInProgress += metrics.Compact.NumInProgress
+		ret.CompactionInProgressSize += metrics.Compact.InProgressBytes
+	}
+	return ret
 }
 
 func (s *CellDBShardStatus) add(shard CellDBShardStatus) {

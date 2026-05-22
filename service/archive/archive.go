@@ -68,13 +68,6 @@ type PreparedBlock struct {
 	StateUpdateToCellsElapsed time.Duration
 }
 
-func ShardIDFromBlock(block ton.BlockIDExt) ShardID {
-	return ShardID{
-		Workchain: block.Workchain,
-		Shard:     block.Shard,
-	}
-}
-
 func (s ShardID) IsMasterchain() bool {
 	return s.Workchain == -1 && s.Shard == topShard
 }

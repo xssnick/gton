@@ -115,6 +115,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	}()
 
 	handoffToNext := false
+	yieldToCellGenerationSwitch := false
 	handoffCheckpointBlocks := uint32(0)
 	for r.current.ShardClientSeqno < r.target.SeqNo {
 		before := r.current.ShardClientSeqno
@@ -179,6 +180,29 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 
 		if _, err = r.finishCheckpoint(false); err != nil {
 			return nil, err
+		}
+		if s.cellGenerationSwitchRequestActive() {
+			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
+				s.log.Info().
+					Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
+					Uint32("shard_client_seqno", r.current.ShardClientSeqno).
+					Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
+					Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
+					Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
+					Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
+					Uint64("checkpoint_target_bytes", s.checkpointBytesTarget()).
+					Bool("checkpoint_in_flight", r.checkpointDone != nil).
+					Msg("persisting archive shard-client checkpoint before cell generation switch")
+				if _, err = r.persistCheckpoint("cell_generation_switch"); err != nil {
+					return nil, err
+				}
+			}
+			yieldToCellGenerationSwitch = true
+			s.log.Info().
+				Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
+				Str("target", storage.FormatBlockRef(r.target)).
+				Msg("yielding archive shard-client catch-up for cell generation switch")
+			break
 		}
 		if lagSeconds, ok := r.archiveLiveTailLagSeconds(); ok && shouldSwitchArchiveToNextByLag(lagSeconds) {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
@@ -261,6 +285,9 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	doneMsg := "archive shard-client catch-up completed"
 	if handoffToNext {
 		doneMsg = "archive shard-client catch-up handed off to next-block pipeline"
+	}
+	if yieldToCellGenerationSwitch {
+		doneMsg = "archive shard-client catch-up yielded for cell generation switch"
 	}
 	s.log.Info().
 		Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).

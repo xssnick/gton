@@ -123,14 +123,6 @@ func createUsageProof(root *cell.Cell, visit func(*cell.Cell) error) (*cell.Cell
 	return builder.CreateProof()
 }
 
-func createUsageProofBOC(root *cell.Cell, visit func(*cell.Cell) error) ([]byte, error) {
-	proof, err := createUsageProof(root, visit)
-	if err != nil {
-		return nil, err
-	}
-	return proof.ToBOCWithFlags(false), nil
-}
-
 func (s *Server) loadBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
 	if cached, ok := s.store.(interface {
 		BlockRoot(context.Context, ton.BlockIDExt) (*cell.Cell, error)
@@ -226,11 +218,6 @@ func stateRootHashFromBlock(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) 
 
 	hash := nextState.HashKey(0)
 	return bytes.Clone(hash[:]), nil
-}
-
-func accountStateProof(stateRoot *cell.Cell, accountID []byte) (*cell.Cell, error) {
-	proof, _, err := accountStateProofAndCell(stateRoot, accountID)
-	return proof, err
 }
 
 func accountStateProofAndCell(stateRoot *cell.Cell, accountID []byte) (*cell.Cell, *cell.Cell, error) {
@@ -1383,26 +1370,6 @@ func skipOldMcBlocksInfoAugDict(loader *cell.Slice) (bool, error) {
 		return false, err
 	}
 	return has, nil
-}
-
-func blockTransactionsProof(root *cell.Cell, withMetadata bool) (*cell.Cell, error) {
-	return createUsageProof(root, func(root *cell.Cell) error {
-		data, err := blockTransactionData(root, withMetadata)
-		if err != nil {
-			return err
-		}
-		if data.shardAccounts != nil && data.shardAccounts.Accounts != nil && data.shardAccounts.Accounts.AugmentedDictionary != nil {
-			if err = visitCellRecursive(data.shardAccounts.Accounts.AsCell()); err != nil {
-				return err
-			}
-		}
-		if withMetadata && data.inMsgDescr != nil {
-			if err = visitCellRecursive(data.inMsgDescr.AsCell()); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 }
 
 func blockTransactionProof(root *cell.Cell, account []byte, lt uint64) (*cell.Cell, *cell.Cell, error) {

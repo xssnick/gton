@@ -7,53 +7,53 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 )
 
-type cellCompactionController struct {
+type pebbleCompactionController struct {
 	mu         sync.Mutex
 	cond       *sync.Cond
 	paused     bool
 	maxRunning int
 	running    int
 	foreground int
-	schedulers map[*cellCompactionScheduler]struct{}
+	schedulers map[*pebbleCompactionScheduler]struct{}
 }
 
-type cellCompactionScheduler struct {
-	controller   *cellCompactionController
+type pebbleCompactionScheduler struct {
+	controller   *pebbleCompactionController
 	db           pebble.DBForCompaction
 	running      int
 	unregistered bool
 }
 
-type cellCompactionGrantCandidate struct {
-	scheduler *cellCompactionScheduler
+type pebbleCompactionGrantCandidate struct {
+	scheduler *pebbleCompactionScheduler
 	waiting   pebble.WaitingCompaction
 }
 
-func newCellCompactionController(maxRunning int) *cellCompactionController {
+func newPebbleCompactionController(maxRunning int) *pebbleCompactionController {
 	if maxRunning < 1 {
 		maxRunning = 1
 	}
-	controller := &cellCompactionController{
+	controller := &pebbleCompactionController{
 		paused:     true,
 		maxRunning: maxRunning,
-		schedulers: map[*cellCompactionScheduler]struct{}{},
+		schedulers: map[*pebbleCompactionScheduler]struct{}{},
 	}
 	controller.cond = sync.NewCond(&controller.mu)
 	return controller
 }
 
-func (c *cellCompactionController) newScheduler() *cellCompactionScheduler {
-	return &cellCompactionScheduler{controller: c}
+func (c *pebbleCompactionController) newScheduler() *pebbleCompactionScheduler {
+	return &pebbleCompactionScheduler{controller: c}
 }
 
-func (c *cellCompactionController) start() {
+func (c *pebbleCompactionController) start() {
 	c.mu.Lock()
 	c.paused = false
 	c.mu.Unlock()
 	go c.tryGrant()
 }
 
-func (c *cellCompactionController) reserve(s *cellCompactionScheduler) bool {
+func (c *pebbleCompactionController) reserve(s *pebbleCompactionScheduler) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -65,7 +65,7 @@ func (c *cellCompactionController) reserve(s *cellCompactionScheduler) bool {
 	return true
 }
 
-func (c *cellCompactionController) release(s *cellCompactionScheduler) {
+func (c *pebbleCompactionController) release(s *pebbleCompactionScheduler) {
 	c.mu.Lock()
 	if c.running > 0 {
 		c.running--
@@ -79,7 +79,7 @@ func (c *cellCompactionController) release(s *cellCompactionScheduler) {
 	go c.tryGrant()
 }
 
-func (c *cellCompactionController) tryGrant() {
+func (c *pebbleCompactionController) tryGrant() {
 	for {
 		candidates := c.grantCandidates()
 		if len(candidates) == 0 {
@@ -104,31 +104,31 @@ func (c *cellCompactionController) tryGrant() {
 	}
 }
 
-func (c *cellCompactionController) grantCandidates() []cellCompactionGrantCandidate {
+func (c *pebbleCompactionController) grantCandidates() []pebbleCompactionGrantCandidate {
 	schedulers := c.snapshotGrantSchedulers()
 	if len(schedulers) == 0 {
 		return nil
 	}
 
-	candidates := make([]cellCompactionGrantCandidate, 0, len(schedulers))
+	candidates := make([]pebbleCompactionGrantCandidate, 0, len(schedulers))
 	for _, scheduler := range schedulers {
 		waiting, ok := scheduler.waitingCompaction()
 		if !ok {
 			continue
 		}
-		candidates = append(candidates, cellCompactionGrantCandidate{
+		candidates = append(candidates, pebbleCompactionGrantCandidate{
 			scheduler: scheduler,
 			waiting:   waiting,
 		})
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return cellCompactionCandidateLess(candidates[i], candidates[j])
+		return pebbleCompactionCandidateLess(candidates[i], candidates[j])
 	})
 	return candidates
 }
 
-func (c *cellCompactionController) snapshotGrantSchedulers() []*cellCompactionScheduler {
+func (c *pebbleCompactionController) snapshotGrantSchedulers() []*pebbleCompactionScheduler {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -136,7 +136,7 @@ func (c *cellCompactionController) snapshotGrantSchedulers() []*cellCompactionSc
 		return nil
 	}
 
-	schedulers := make([]*cellCompactionScheduler, 0, len(c.schedulers))
+	schedulers := make([]*pebbleCompactionScheduler, 0, len(c.schedulers))
 	for scheduler := range c.schedulers {
 		if scheduler.unregistered || scheduler.db == nil {
 			continue
@@ -146,7 +146,7 @@ func (c *cellCompactionController) snapshotGrantSchedulers() []*cellCompactionSc
 	return schedulers
 }
 
-func cellCompactionCandidateLess(left, right cellCompactionGrantCandidate) bool {
+func pebbleCompactionCandidateLess(left, right pebbleCompactionGrantCandidate) bool {
 	if left.waiting.Optional != right.waiting.Optional {
 		return !left.waiting.Optional
 	}
@@ -156,7 +156,7 @@ func cellCompactionCandidateLess(left, right cellCompactionGrantCandidate) bool 
 	return left.waiting.Score > right.waiting.Score
 }
 
-func (c *cellCompactionController) beginForegroundRead() func() {
+func (c *pebbleCompactionController) beginForegroundRead() func() {
 	c.mu.Lock()
 	c.foreground++
 	c.cond.Broadcast()
@@ -176,7 +176,7 @@ func (c *cellCompactionController) beginForegroundRead() func() {
 	}
 }
 
-func (c *cellCompactionController) effectiveMaxRunningLocked() int {
+func (c *pebbleCompactionController) effectiveMaxRunningLocked() int {
 	if c.foreground > 0 {
 		maxRunning := c.maxRunning / 2
 		if maxRunning < 1 {
@@ -187,7 +187,7 @@ func (c *cellCompactionController) effectiveMaxRunningLocked() int {
 	return c.maxRunning
 }
 
-func (s *cellCompactionScheduler) Register(_ int, db pebble.DBForCompaction) {
+func (s *pebbleCompactionScheduler) Register(_ int, db pebble.DBForCompaction) {
 	c := s.controller
 	c.mu.Lock()
 	s.db = db
@@ -195,7 +195,7 @@ func (s *cellCompactionScheduler) Register(_ int, db pebble.DBForCompaction) {
 	c.mu.Unlock()
 }
 
-func (s *cellCompactionScheduler) Unregister() {
+func (s *pebbleCompactionScheduler) Unregister() {
 	c := s.controller
 	c.mu.Lock()
 	s.unregistered = true
@@ -206,18 +206,18 @@ func (s *cellCompactionScheduler) Unregister() {
 	c.mu.Unlock()
 }
 
-func (s *cellCompactionScheduler) TrySchedule() (bool, pebble.CompactionGrantHandle) {
+func (s *pebbleCompactionScheduler) TrySchedule() (bool, pebble.CompactionGrantHandle) {
 	if !s.controller.reserve(s) {
 		return false, nil
 	}
 	return true, s
 }
 
-func (s *cellCompactionScheduler) UpdateGetAllowedWithoutPermission() {
+func (s *pebbleCompactionScheduler) UpdateGetAllowedWithoutPermission() {
 	go s.controller.tryGrant()
 }
 
-func (s *cellCompactionScheduler) waitingCompaction() (pebble.WaitingCompaction, bool) {
+func (s *pebbleCompactionScheduler) waitingCompaction() (pebble.WaitingCompaction, bool) {
 	s.controller.mu.Lock()
 	db := s.db
 	unregistered := s.unregistered
@@ -230,12 +230,12 @@ func (s *cellCompactionScheduler) waitingCompaction() (pebble.WaitingCompaction,
 	return compaction, waiting
 }
 
-func (s *cellCompactionScheduler) Started() {}
+func (s *pebbleCompactionScheduler) Started() {}
 
-func (s *cellCompactionScheduler) MeasureCPU(pebble.CompactionGoroutineKind) {}
+func (s *pebbleCompactionScheduler) MeasureCPU(pebble.CompactionGoroutineKind) {}
 
-func (s *cellCompactionScheduler) CumulativeStats(pebble.CompactionGrantHandleStats) {}
+func (s *pebbleCompactionScheduler) CumulativeStats(pebble.CompactionGrantHandleStats) {}
 
-func (s *cellCompactionScheduler) Done() {
+func (s *pebbleCompactionScheduler) Done() {
 	s.controller.release(s)
 }

@@ -12,6 +12,8 @@ import (
 const (
 	exclusiveServiceTaskMaxReadAmp = int64(6)
 	exclusiveServiceTaskMaxLag     = 300 * time.Second
+
+	CellGenerationSwitchMaxReadAmp = int64(12)
 )
 
 var (

@@ -596,6 +596,9 @@ func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64,
 		if err := batch.Set(hotKeyCurrentState(), encodeCurrentState(current), pebble.NoSync); err != nil {
 			return err
 		}
+		if err := batch.Delete(hotKeyCellGenerationCurrent(generation), pebble.NoSync); err != nil {
+			return err
+		}
 		manifest := s.manifestLocked()
 		manifest.active = generation
 		manifest.next = nextCellGeneration

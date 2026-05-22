@@ -3,7 +3,6 @@ package state
 import (
 	"context"
 	"errors"
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 	"sync"
 	"sync/atomic"
@@ -114,7 +113,7 @@ func TestSyncerRetriesShardStateWithoutRepeatingMasterStage(t *testing.T) {
 			storage.BlockKey(shard):  {Block: shard},
 		},
 		errSequenceByBlock: map[string][]error{
-			storage.BlockKey(shard): {p2p.ErrStateNotAvailable},
+			storage.BlockKey(shard): {ErrStateNotAvailable},
 		},
 	}
 
@@ -285,7 +284,7 @@ func TestSyncerWalksKeyBlocksFromZeroStateToTailWithoutLatestLookup(t *testing.T
 
 	source := &fakeSource{
 		master: zero,
-		keyBlockBatches: map[uint32]p2p.KeyBlockBatch{
+		keyBlockBatches: map[uint32]KeyBlockBatch{
 			0:  {Blocks: []ton.BlockIDExt{key20, key30}},
 			30: {Blocks: []ton.BlockIDExt{key40}, Incomplete: true},
 			40: {Incomplete: true},
@@ -487,7 +486,7 @@ type fakeSource struct {
 	zeroBlock          *ton.BlockIDExt
 	zeroState          *storage.BlockState
 	states             map[string]*storage.BlockState
-	keyBlockBatches    map[uint32]p2p.KeyBlockBatch
+	keyBlockBatches    map[uint32]KeyBlockBatch
 	downloadedFactory  func(block ton.BlockIDExt) storage.DownloadedState
 	errByBlock         map[string]error
 	errSequenceByBlock map[string][]error
@@ -518,16 +517,16 @@ func (f *fakeSource) ZeroState(_ context.Context, block ton.BlockIDExt) (storage
 	return nil, errors.New("unexpected zero state download")
 }
 
-func (f *fakeSource) NextKeyBlocks(_ context.Context, from ton.BlockIDExt, _ int32) (p2p.KeyBlockBatch, error) {
+func (f *fakeSource) NextKeyBlocks(_ context.Context, from ton.BlockIDExt, _ int32) (KeyBlockBatch, error) {
 	f.nextKeyBlockCalls++
 	if f.keyBlockBatches == nil {
-		return p2p.KeyBlockBatch{}, nil
+		return KeyBlockBatch{}, nil
 	}
 	return f.keyBlockBatches[from.SeqNo], nil
 }
 
-func (f *fakeSource) InitBlockProof(context.Context, ton.BlockIDExt) (p2p.ProofDownload, error) {
-	return p2p.ProofDownload{}, errors.New("unexpected init block proof download")
+func (f *fakeSource) InitBlockProof(context.Context, ton.BlockIDExt) (ProofDownload, error) {
+	return ProofDownload{}, errors.New("unexpected init block proof download")
 }
 
 func (f *fakeSource) MasterchainProof(context.Context, ton.BlockIDExt, bool) ([]byte, error) {

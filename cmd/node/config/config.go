@@ -2,7 +2,6 @@ package config
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -15,31 +14,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/xssnick/gton/liteserver"
-	service2 "github.com/xssnick/gton/service"
-	"github.com/xssnick/gton/service/p2p"
-	"github.com/xssnick/gton/service/storage/pebblestore"
 )
 
 const (
 	DefaultPath                            = "config.json"
+	DefaultGlobalConfigPath                = "global.config.json"
 	DefaultGlobalConfigURL                 = "https://ton-blockchain.github.io/global.config.json"
 	DefaultSyncBefore                      = time.Hour
 	DefaultStateTTL                        = 3 * 24 * time.Hour
 	DefaultArchiveTTL                      = 7 * 24 * time.Hour
-	DefaultNextCheckpointBlocks            = int64(service2.DefaultNextBlockCheckpointBlocks)
-	DefaultArchiveCheckpointBlocks         = int64(service2.DefaultArchiveCatchUpCheckpointBlocks)
-	DefaultCheckpointBytes                 = int64(service2.DefaultCheckpointBytes)
+	DefaultNextCheckpointBlocks            = int64(600)
+	DefaultArchiveCheckpointBlocks         = int64(2000)
+	DefaultCheckpointBytes                 = int64(1 << 30)
 	DefaultCellTotalCache                  = int64(8 << 30)
 	DefaultCellShardMemTable               = int64(256 << 20)
 	DefaultCellMemTableStopWritesThreshold = int64(4)
-	DefaultArtifactFileMaxOpen             = int64(pebblestore.DefaultArtifactFileMaxOpen)
+	DefaultArtifactFileMaxOpen             = int64(512)
+	DefaultLiteMasterBlockCache            = 128
+	DefaultLiteShardBlockCache             = 4096
+	DefaultLiteListen                      = "0.0.0.0:7445"
 	defaultStorageDir                      = "data"
 	defaultADNLPort                        = 30303
 	defaultADNLListen                      = "0.0.0.0:30303"
 	defaultDHTListen                       = "0.0.0.0:30304"
-	defaultLiteListen                      = "0.0.0.0:7445"
+	privateKeySeedSize                     = 32
 	externalIPHTTPClient                   = 5 * time.Second
 	globalConfigHTTPClient                 = 30 * time.Second
 	ipAPILookupURL                         = "http://ip-api.com/json/?fields=status,message,query"
@@ -102,7 +100,7 @@ type Metrics struct {
 func defaultConfig() Config {
 	return Config{
 		TON: TON{
-			GlobalConfigPath:        p2p.DefaultGlobalConfigPath,
+			GlobalConfigPath:        DefaultGlobalConfigPath,
 			SyncBefore:              int64(DefaultSyncBefore / time.Second),
 			StateTTL:                int64(DefaultStateTTL / time.Second),
 			ArchiveTTL:              int64(DefaultArchiveTTL / time.Second),
@@ -111,8 +109,8 @@ func defaultConfig() Config {
 			CheckpointBytes:         DefaultCheckpointBytes,
 		},
 		Lite: Lite{
-			MasterBlockCache: liteserver.DefaultMasterBlockCache,
-			ShardBlockCache:  liteserver.DefaultShardBlockCache,
+			MasterBlockCache: DefaultLiteMasterBlockCache,
+			ShardBlockCache:  DefaultLiteShardBlockCache,
 		},
 		Storage: Storage{
 			CellTotalCacheSize:              DefaultCellTotalCache,
@@ -144,7 +142,7 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		return Config{}, err
 	}
 
-	globalConfigPath, err := filepath.Abs(p2p.DefaultGlobalConfigPath)
+	globalConfigPath, err := filepath.Abs(DefaultGlobalConfigPath)
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve global config path: %w", err)
 	}
@@ -171,9 +169,9 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	cfg.Lite = Lite{
 		Enabled:          false,
 		Key:              liteSeed,
-		ListenAddr:       defaultLiteListen,
-		MasterBlockCache: liteserver.DefaultMasterBlockCache,
-		ShardBlockCache:  liteserver.DefaultShardBlockCache,
+		ListenAddr:       DefaultLiteListen,
+		MasterBlockCache: DefaultLiteMasterBlockCache,
+		ShardBlockCache:  DefaultLiteShardBlockCache,
 	}
 	cfg.Storage = Storage{
 		Dir:                             storageDir,
@@ -254,108 +252,6 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-func (cfg Config) P2POptions() (p2p.Options, error) {
-	opts := p2p.Options{
-		GlobalConfigPath: strings.TrimSpace(cfg.TON.GlobalConfigPath),
-		ListenAddr:       strings.TrimSpace(cfg.ADNL.ListenAddr),
-		DHTListenAddr:    strings.TrimSpace(cfg.DHT.ListenAddr),
-	}
-
-	var err error
-	opts.PrivateKey, err = privateKeyFromSeed(cfg.ADNL.Key, "adnl.key")
-	if err != nil {
-		return p2p.Options{}, err
-	}
-
-	opts.DHTPrivateKey, err = privateKeyFromSeed(cfg.DHT.Key, "dht.key")
-	if err != nil {
-		return p2p.Options{}, err
-	}
-
-	if rawAddr := strings.TrimSpace(cfg.ADNL.ExternalAddr); rawAddr != "" {
-		ip, port, err := parseExternalAddr(rawAddr)
-		if err != nil {
-			return p2p.Options{}, err
-		}
-		opts.ExternalIP = ip
-		opts.ExternalPort = port
-	}
-
-	return opts, nil
-}
-
-type LiteserverOptions struct {
-	Enabled          bool
-	ListenAddr       string
-	PrivateKey       ed25519.PrivateKey
-	MasterBlockCache int
-	ShardBlockCache  int
-}
-
-type MetricsOptions struct {
-	Enabled    bool
-	ListenAddr string
-}
-
-func (cfg Config) LiteserverOptions() (LiteserverOptions, error) {
-	opts := LiteserverOptions{
-		Enabled:          cfg.Lite.Enabled,
-		ListenAddr:       strings.TrimSpace(cfg.Lite.ListenAddr),
-		MasterBlockCache: cfg.Lite.MasterBlockCache,
-		ShardBlockCache:  cfg.Lite.ShardBlockCache,
-	}
-	if opts.ListenAddr == "" {
-		opts.ListenAddr = defaultLiteListen
-	}
-
-	var err error
-	opts.PrivateKey, err = privateKeyFromSeed(cfg.Lite.Key, "liteserver.key")
-	if err != nil {
-		return LiteserverOptions{}, err
-	}
-	if opts.Enabled && len(opts.PrivateKey) == 0 {
-		return LiteserverOptions{}, fmt.Errorf("liteserver.key is required when liteserver.enabled is true")
-	}
-	if opts.MasterBlockCache < 0 {
-		return LiteserverOptions{}, fmt.Errorf("liteserver.master_block_cache cannot be negative")
-	}
-	if opts.ShardBlockCache < 0 {
-		return LiteserverOptions{}, fmt.Errorf("liteserver.shard_block_cache cannot be negative")
-	}
-
-	return opts, nil
-}
-
-func (cfg Config) MetricsOptions() (MetricsOptions, error) {
-	opts := MetricsOptions{
-		Enabled:    cfg.Metrics.Enabled,
-		ListenAddr: strings.TrimSpace(cfg.Metrics.ListenAddr),
-	}
-	if opts.Enabled && opts.ListenAddr == "" {
-		return MetricsOptions{}, fmt.Errorf("metrics.listen_addr is required when metrics.enabled is true")
-	}
-	return opts, nil
-}
-
-func parseExternalAddr(raw string) (net.IP, uint16, error) {
-	host, portStr, err := net.SplitHostPort(raw)
-	if err != nil {
-		return nil, 0, fmt.Errorf("invalid adnl.external_addr %q: %w", raw, err)
-	}
-
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return nil, 0, fmt.Errorf("invalid adnl.external_addr %q: invalid ip %q", raw, host)
-	}
-
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil || port == 0 {
-		return nil, 0, fmt.Errorf("invalid adnl.external_addr %q: invalid port %q", raw, portStr)
-	}
-
-	return ip, uint16(port), nil
-}
-
 func (cfg Config) StorageDir() string {
 	return strings.TrimSpace(cfg.Storage.Dir)
 }
@@ -418,7 +314,7 @@ func (cfg Config) ArtifactFileMaxOpen() (int, error) {
 func (cfg Config) GlobalConfigPath() string {
 	path := strings.TrimSpace(cfg.TON.GlobalConfigPath)
 	if path == "" {
-		return p2p.DefaultGlobalConfigPath
+		return DefaultGlobalConfigPath
 	}
 	return path
 }
@@ -457,11 +353,11 @@ func (cfg Config) ArchiveTTL() (time.Duration, error) {
 }
 
 func (cfg Config) NextCheckpointBlocks() (uint32, error) {
-	return uint32ConfigValue("ton.next_checkpoint_blocks", cfg.TON.NextCheckpointBlocks, service2.DefaultNextBlockCheckpointBlocks)
+	return uint32ConfigValue("ton.next_checkpoint_blocks", cfg.TON.NextCheckpointBlocks, uint32(DefaultNextCheckpointBlocks))
 }
 
 func (cfg Config) ArchiveCheckpointBlocks() (uint32, error) {
-	return uint32ConfigValue("ton.archive_checkpoint_blocks", cfg.TON.ArchiveCheckpointBlocks, service2.DefaultArchiveCatchUpCheckpointBlocks)
+	return uint32ConfigValue("ton.archive_checkpoint_blocks", cfg.TON.ArchiveCheckpointBlocks, uint32(DefaultArchiveCheckpointBlocks))
 }
 
 func (cfg Config) CheckpointBytes() (uint64, error) {
@@ -469,7 +365,7 @@ func (cfg Config) CheckpointBytes() (uint64, error) {
 		return 0, fmt.Errorf("ton.checkpoint_bytes cannot be negative")
 	}
 	if cfg.TON.CheckpointBytes == 0 {
-		return service2.DefaultCheckpointBytes, nil
+		return uint64(DefaultCheckpointBytes), nil
 	}
 	return uint64(cfg.TON.CheckpointBytes), nil
 }
@@ -490,7 +386,7 @@ func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, 
 func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bool) (EnsureGlobalConfigResult, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		path = p2p.DefaultGlobalConfigPath
+		path = DefaultGlobalConfigPath
 	}
 	url = strings.TrimSpace(url)
 	if url == "" {
@@ -556,21 +452,11 @@ func write(path string, cfg Config) error {
 }
 
 func generateSeed() ([]byte, error) {
-	seed := make([]byte, ed25519.SeedSize)
+	seed := make([]byte, privateKeySeedSize)
 	if _, err := rand.Read(seed); err != nil {
 		return nil, err
 	}
 	return seed, nil
-}
-
-func privateKeyFromSeed(seed []byte, field string) (ed25519.PrivateKey, error) {
-	if len(seed) == 0 {
-		return nil, nil
-	}
-	if len(seed) != ed25519.SeedSize {
-		return nil, fmt.Errorf("invalid %s: expected %d-byte seed, got %d bytes", field, ed25519.SeedSize, len(seed))
-	}
-	return ed25519.NewKeyFromSeed(seed), nil
 }
 
 func DetectExternalIP(ctx context.Context) (string, error) {

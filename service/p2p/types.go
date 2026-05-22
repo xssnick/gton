@@ -133,6 +133,7 @@ type Options struct {
 	StateFilesDir      string
 	Storage            storage.Storage
 	PeerServingStorage storage.PeerServingStorage
+	CompressedState    CompressedBlockStateProvider
 }
 
 type BlockCacheObserver interface {

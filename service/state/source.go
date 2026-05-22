@@ -5,136 +5,33 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
-	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+var ErrStateNotAvailable = errors.New("state snapshot is not available")
+
+type KeyBlockBatch struct {
+	Blocks     []ton.BlockIDExt
+	Incomplete bool
+}
+
+type ProofDownload struct {
+	Data []byte
+	Link bool
+}
+
 type Source interface {
 	InitBlock(ctx context.Context) (ton.BlockIDExt, error)
 	ZeroStateBlock(ctx context.Context) (ton.BlockIDExt, error)
 	ZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error)
-	NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (p2p.KeyBlockBatch, error)
-	InitBlockProof(ctx context.Context, block ton.BlockIDExt) (p2p.ProofDownload, error)
+	NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (KeyBlockBatch, error)
+	InitBlockProof(ctx context.Context, block ton.BlockIDExt) (ProofDownload, error)
 	MasterchainProof(ctx context.Context, block ton.BlockIDExt, requireKey bool) ([]byte, error)
 	DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (storage.DownloadedState, error)
-}
-
-type P2PSource struct {
-	node *p2p.Node
-	log  zerolog.Logger
-}
-
-func NewP2PSource(node *p2p.Node, logger ...*zerolog.Logger) *P2PSource {
-	log := zerolog.Nop()
-	if len(logger) > 0 && logger[0] != nil {
-		log = logger[0].With().Str("component", "state").Logger()
-	}
-
-	return &P2PSource{node: node, log: log}
-}
-
-func (s *P2PSource) ZeroStateBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	_ = ctx
-
-	block, err := s.node.ZeroStateBlock()
-	if errors.Is(err, storage.ErrNotFound) {
-		return ton.BlockIDExt{}, fmt.Errorf("zero state is not configured")
-	}
-	return block, err
-}
-
-func (s *P2PSource) InitBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	_ = ctx
-
-	block, err := s.node.InitBlock()
-	if errors.Is(err, storage.ErrNotFound) {
-		return ton.BlockIDExt{}, fmt.Errorf("init block is not configured")
-	}
-	return block, err
-}
-
-func (s *P2PSource) ZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
-	s.log.Info().
-		Str("block", storage.FormatBlockRef(block)).
-		Msg("requesting zero state")
-
-	return s.node.DownloadState(ctx, block, block, 0, nil)
-}
-
-func (s *P2PSource) NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (p2p.KeyBlockBatch, error) {
-	return s.node.NextKeyBlocks(ctx, from, limit)
-}
-
-func (s *P2PSource) InitBlockProof(ctx context.Context, block ton.BlockIDExt) (p2p.ProofDownload, error) {
-	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Msg("requesting trusted init block proof link")
-
-	return s.node.DownloadBlockProof(ctx, block, true)
-}
-
-func (s *P2PSource) keyBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (p2p.ProofDownload, error) {
-	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Bool("allow_partial", allowPartial).
-		Msg("requesting key block proof")
-
-	return s.node.DownloadKeyBlockProof(ctx, block, allowPartial)
-}
-
-func (s *P2PSource) DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (storage.DownloadedState, error) {
-	s.log.Info().
-		Str("block", storage.FormatBlockRef(block)).
-		Str("masterchain", storage.FormatBlockRef(master)).
-		Uint32("split_depth", splitDepth).
-		Msg("requesting state snapshot")
-
-	stateRootHash, err := s.blockStateRootHash(ctx, block)
-	if err != nil {
-		return nil, fmt.Errorf("load expected state root for %s: %w", storage.FormatBlockRef(block), err)
-	}
-
-	return s.node.DownloadState(ctx, block, master, splitDepth, stateRootHash)
-}
-
-func (s *P2PSource) blockStateRootHash(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	downloaded, err := s.node.DownloadBlockFull(ctx, block)
-	if err != nil {
-		return nil, fmt.Errorf("download block: %w", err)
-	}
-	if downloaded == nil {
-		return nil, fmt.Errorf("download block: empty response")
-	}
-
-	root := downloaded.Block
-	if root == nil {
-		return nil, fmt.Errorf("downloaded block %s is missing parsed cell", storage.FormatBlockRef(block))
-	}
-	if downloaded.IsLink && root.GetType() == cell.MerkleProofCellType {
-		root, err = cell.UnwrapProof(root, downloaded.ID.RootHash)
-		if err != nil {
-			return nil, fmt.Errorf("unwrap block proof link: %w", err)
-		}
-	}
-
-	meta, err := storage.BuildBlockMetaFromBlockCell(downloaded.ID, root)
-	if err != nil {
-		return nil, err
-	}
-	if len(meta.StateRootHash) == 0 {
-		return nil, fmt.Errorf("block has no state update target")
-	}
-
-	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Str("state_root_hash", fmt.Sprintf("%x", meta.StateRootHash)).
-		Msg("resolved block state root for snapshot validation")
-	return meta.StateRootHash, nil
 }
 
 func ShardBlocksFromMasterState(state *storage.BlockState) ([]ton.BlockIDExt, error) {

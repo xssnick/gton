@@ -177,6 +177,33 @@ func TestFormatStatusListsSplitBasechainShards(t *testing.T) {
 
 func TestFormatDBStatusIncludesCellDBShardMetrics(t *testing.T) {
 	out := formatDBStatus(pebblestore.DBStatus{
+		Meta: &pebblestore.MetaDBStatus{
+			Cache: pebblestore.CellDBCacheStatus{
+				BlockCacheSize:      16 << 20,
+				BlockCacheHits:      7,
+				BlockCacheMisses:    3,
+				FileCacheSize:       0,
+				FileCacheTableCount: 0,
+			},
+			DB: pebblestore.CellDBShardStatus{
+				Shard:                    -1,
+				DiskSize:                 128 << 20,
+				LiveSize:                 96 << 20,
+				LiveTables:               18,
+				ReadAmp:                  3,
+				L0Files:                  2,
+				L0Sublevels:              1,
+				L0Size:                   8 << 20,
+				CompactionDebt:           32 << 20,
+				CompactionsInProgress:    1,
+				CompactionInProgressSize: 4 << 20,
+				MemTableSize:             2 << 20,
+				MemTableCount:            1,
+				TableIters:               2,
+				Flushes:                  3,
+				Ingests:                  0,
+			},
+		},
 		CellGenerations: []pebblestore.CellDBGenerationStatus{
 			{
 				ID:   1,
@@ -222,7 +249,11 @@ func TestFormatDBStatusIncludesCellDBShardMetrics(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"DB Status\n\nCell DB\n",
+		"DB Status\n\nMeta DB\n",
+		"cache block=16.0MiB file=0B file_tables=0 block_hit=70.0%",
+		"meta",
+		"1/4.0MiB",
+		"Cell DB\n",
 		"generation 1 role=active",
 		"cache block=64.0MiB file=32.0MiB file_tables=12 block_hit=90.0%",
 		"shard",
@@ -230,6 +261,39 @@ func TestFormatDBStatusIncludesCellDBShardMetrics(t *testing.T) {
 		"4/3",
 		"1/256MiB",
 		"total",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("formatted db status missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestFormatDBStatusShowsPendingCellGenerationSwitchWait(t *testing.T) {
+	out := formatDBStatus(pebblestore.DBStatus{
+		CellGenerations: []pebblestore.CellDBGenerationStatus{
+			{
+				ID:   2,
+				Role: "pending",
+				Total: pebblestore.CellDBShardStatus{
+					Shard:                    -1,
+					ReadAmp:                  service2.CellGenerationSwitchMaxReadAmp + 1,
+					L0Files:                  12,
+					L0Sublevels:              8,
+					L0Size:                   512 << 20,
+					CompactionDebt:           2 << 30,
+					CompactionsInProgress:    1,
+					CompactionInProgressSize: 256 << 20,
+				},
+			},
+		},
+	})
+
+	for _, want := range []string{
+		"generation 2 role=pending",
+		"switch_wait pending read_amp=13 > 12, waiting for compaction",
+		"debt=2.0GiB",
+		"comp=1/256MiB",
+		"l0=12/8 512MiB",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("formatted db status missing %q:\n%s", want, out)

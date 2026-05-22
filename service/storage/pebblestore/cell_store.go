@@ -20,6 +20,7 @@ const (
 	initialCellGenerationID       = 1
 	cellGenerationManifestVersion = 1
 	cellGenerationDirTemplate     = "gen%d-shard%d"
+	cellStoreAggressiveCloseGrace = 500 * time.Millisecond
 )
 
 type cellStore struct {
@@ -27,7 +28,7 @@ type cellStore struct {
 	shards      [cellDBShardCount]*cellDBShard
 	cache       *pebble.Cache
 	fileCache   *pebble.FileCache
-	compactions *cellCompactionController
+	compactions *pebbleCompactionController
 	closeMu     sync.Mutex
 	closing     atomic.Bool
 	refs        atomic.Int64
@@ -78,7 +79,7 @@ func openCellStore(dir string, generation uint64, fs vfs.FS, cacheSize int64, sh
 		fileCache:  newPebbleFileCache(defaultPebbleCellMaxOpenFiles),
 		drained:    make(chan struct{}),
 	}
-	compactions := newCellCompactionController(pebbleCellCompactionParallelism())
+	compactions := newPebbleCompactionController(pebbleCellCompactionParallelism())
 	cells.compactions = compactions
 
 	var wg sync.WaitGroup
@@ -157,6 +158,49 @@ func (c *cellStore) close() error {
 		c.signalDrained()
 	}
 	<-c.drained
+	c.closed = true
+
+	var err error
+	for i, shard := range c.shards {
+		if shard == nil {
+			continue
+		}
+		if shard.db != nil {
+			err = errors.Join(err, shard.db.Close())
+		}
+		c.shards[i] = nil
+	}
+	if c.fileCache != nil {
+		c.fileCache.Unref()
+		c.fileCache = nil
+	}
+	if c.cache != nil {
+		c.cache.Unref()
+		c.cache = nil
+	}
+	return err
+}
+
+func (c *cellStore) closeAggressively() error {
+	if c == nil {
+		return nil
+	}
+
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closing.Store(true)
+	if c.refs.Load() == 0 {
+		c.signalDrained()
+	}
+	timer := time.NewTimer(cellStoreAggressiveCloseGrace)
+	select {
+	case <-c.drained:
+	case <-timer.C:
+	}
+	timer.Stop()
 	c.closed = true
 
 	var err error

@@ -223,14 +223,6 @@ func ConfigFromMasterchainState(current *tnstore.BlockState) (*tlb.BlockchainCon
 	return &tlb.BlockchainConfig{Root: extra.ConfigParams.Config.Params.AsCell()}, nil
 }
 
-func CheckMasterchainSignaturesFromState(current *tnstore.BlockState, blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) error {
-	cfg, err := ConfigFromMasterchainState(current)
-	if err != nil {
-		return err
-	}
-	return CheckMasterchainSignatures(blockID, block, signatures, cfg)
-}
-
 func CheckMasterchainSignatures(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell, cfg *tlb.BlockchainConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("validator config is nil for %s", tnstore.FormatBlockRef(blockID))

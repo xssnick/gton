@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	storage2 "github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
@@ -108,7 +107,7 @@ func (s *Syncer) masterchainStateStage(ctx context.Context) (*storage2.BlockStat
 		if errors.Is(err, context.Canceled) {
 			return nil, err
 		}
-		if !errors.Is(err, p2p.ErrStateNotAvailable) {
+		if !errors.Is(err, ErrStateNotAvailable) {
 			return nil, err
 		}
 
@@ -334,7 +333,7 @@ func (s *Syncer) downloadShardState(ctx context.Context, shardBlock ton.BlockIDE
 		if errors.Is(err, context.Canceled) {
 			return nil, err
 		}
-		if !errors.Is(err, p2p.ErrStateNotAvailable) {
+		if !errors.Is(err, ErrStateNotAvailable) {
 			return nil, err
 		}
 

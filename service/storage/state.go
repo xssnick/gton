@@ -38,6 +38,16 @@ type CellGenerationInfo struct {
 	OriginPersistentState ton.BlockIDExt
 }
 
+type CellGenerationDBMetrics struct {
+	MaxReadAmp               int64
+	L0Files                  int64
+	L0Sublevels              int64
+	L0Size                   int64
+	CompactionDebt           uint64
+	CompactionsInProgress    int64
+	CompactionInProgressSize int64
+}
+
 type CurrentState struct {
 	SyncedAt         time.Time
 	ShardClientSeqno uint32

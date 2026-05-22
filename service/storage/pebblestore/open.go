@@ -112,8 +112,9 @@ func Open(opts Options) (*Store, error) {
 	fs := newPebbleDiskFullRetryFS(opts.Dir, logger)
 	hotCache := pebble.NewCache(opts.MetaCacheSize)
 	hotLogger := logger.With().Str("db", "metadb").Logger()
+	hotCompactions := newPebbleCompactionController(pebbleMetaMaxConcurrentCompactions())
 
-	hotOpts := newMetaPebbleOptions(hotCache, fs, metaMemTableSize, opts.BytesPerSync, opts.WALBytesPerSync, hotLogger)
+	hotOpts := newMetaPebbleOptions(hotCache, fs, metaMemTableSize, opts.BytesPerSync, opts.WALBytesPerSync, hotCompactions.newScheduler(), hotLogger)
 	hotOpts.ReadOnly = opts.ReadOnly
 	stageStarted := time.Now()
 	logger.Info().Str("dir", hotDir).Msg("opening pebble metadb")
@@ -122,6 +123,7 @@ func Open(opts Options) (*Store, error) {
 		hotCache.Unref()
 		return nil, fmt.Errorf("open metadb: %w", err)
 	}
+	hotCompactions.start()
 	logger.Info().Str("dir", hotDir).Dur("elapsed", time.Since(stageStarted)).Msg("opened pebble metadb")
 
 	stageStarted = time.Now()
@@ -258,6 +260,7 @@ func Open(opts Options) (*Store, error) {
 		Int("cell_l0_compaction_threshold", defaultPebbleCellL0CompactionThreshold).
 		Int("cell_l0_file_threshold", defaultPebbleCellL0FileThreshold).
 		Int("cell_l0_stop_writes_threshold", defaultPebbleCellL0StopWritesThreshold).
+		Int("meta_max_concurrent_compactions", pebbleMetaMaxConcurrentCompactions()).
 		Int("cell_compaction_parallelism", pebbleCellCompactionParallelism()).
 		Int("cell_max_concurrent_compactions", pebbleCellMaxConcurrentCompactions()).
 		Int("max_concurrent_compactions", pebbleMaxConcurrentCompactions()).

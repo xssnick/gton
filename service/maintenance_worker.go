@@ -24,6 +24,7 @@ const (
 func (s *Service) runServiceMaintenance(ctx context.Context) {
 	nextPersistentStateGC := time.Now()
 	nextArchiveGC := time.Now()
+	var nextCellGenerationMigrationRetry time.Time
 	var nextStateSerialization time.Time
 	if s.stateSerializer != nil {
 		nextStateSerialization = time.Now()
@@ -53,8 +54,12 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 				continue
 			}
 		}
+		if !migrationPending {
+			nextCellGenerationMigrationRetry = time.Time{}
+		}
 
-		switch nextServiceMaintenanceTask(persistentStateGCDue, archiveGCDue, migrationPending, stateSerializationDue) {
+		cellGenerationMigrationDue := migrationPending && !now.Before(nextCellGenerationMigrationRetry)
+		switch nextServiceMaintenanceTask(persistentStateGCDue, archiveGCDue, cellGenerationMigrationDue, stateSerializationDue) {
 		case serviceMaintenanceTaskPersistentStateGC:
 			delay := persistentStateGCInterval
 			pruned, err := s.runPersistentStateGCOnce(ctx)
@@ -98,6 +103,11 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
+			if errors.Is(err, errPendingCellGenerationCompaction) {
+				nextCellGenerationMigrationRetry = time.Now().Add(stateSerializationRetryDelay)
+				continue
+			}
+			nextCellGenerationMigrationRetry = time.Time{}
 			if err != nil {
 				if ran {
 					continue
@@ -141,7 +151,7 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 			continue
 		}
 
-		if !s.waitServiceMaintenanceWake(ctx, serviceMaintenanceWaitDelay(nextPersistentStateGC, nextArchiveGC, nextStateSerialization)) {
+		if !s.waitServiceMaintenanceWake(ctx, serviceMaintenanceWaitDelay(nextPersistentStateGC, nextArchiveGC, nextCellGenerationMigrationRetry, nextStateSerialization)) {
 			return
 		}
 	}
@@ -193,14 +203,41 @@ func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, 
 		return false, fmt.Errorf("load pending cell generation migration: %w", err)
 	}
 
-	migrationLease, err := s.beginCellGenerationMigration(ctx)
+	metrics, waitingForCompaction, err := s.pendingCellGenerationCompactionWait(ctx, store, pending)
+	if err != nil {
+		return false, err
+	}
+	if waitingForCompaction {
+		s.log.Info().
+			Uint64("cell_generation", pending.ID).
+			Str("persistent_state", storage.FormatBlockRef(pending.OriginPersistentState)).
+			Int64("max_read_amp", metrics.MaxReadAmp).
+			Int64("read_amp_limit", CellGenerationSwitchMaxReadAmp).
+			Int64("l0_files", metrics.L0Files).
+			Int64("l0_sublevels", metrics.L0Sublevels).
+			Int64("l0_size", metrics.L0Size).
+			Uint64("compaction_debt", metrics.CompactionDebt).
+			Int64("compactions_in_progress", metrics.CompactionsInProgress).
+			Int64("compaction_in_progress_bytes", metrics.CompactionInProgressSize).
+			Msg("waiting for pending cell generation compaction before migration resume")
+		return false, errPendingCellGenerationCompaction
+	}
+
+	migrationLease, err := s.beginPendingCellGenerationMigration(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer migrationLease.release()
 
+	runCtx, run, err := s.beginCellGenerationMigrationRun(s.currentStatePersistContext())
+	if err != nil {
+		return false, err
+	}
+
 	started := time.Now()
-	if err = s.runCellGenerationMigration(s.currentStatePersistContext(), store, pending.OriginPersistentState); err != nil {
+	err = s.runCellGenerationMigration(runCtx, store, pending.OriginPersistentState)
+	s.finishCellGenerationMigrationRun(run)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			s.log.Info().
 				Uint64("cell_generation", pending.ID).

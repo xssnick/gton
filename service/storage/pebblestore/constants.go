@@ -48,12 +48,13 @@ const (
 	archiveSliceMasterchainBlocks   = 100
 	keyArchiveMasterchainBlocks     = 200000
 
-	blockMetaVersion       = 1
-	currentStateVersion    = 1
-	blockStateMetaVersion  = 1
-	artifactRefVersion     = 1
-	persistentStateVersion = 1
-	archivePackageVersion  = 1
+	blockMetaVersion                 = 1
+	currentStateVersion              = 1
+	blockStateMetaVersion            = 1
+	artifactRefVersion               = 1
+	persistentStateVersion           = 1
+	archivePackageVersion            = 1
+	cellGenerationStateImportVersion = 1
 
 	cellRecordCompactRefsFlag = 0x10
 	cellRecordHashSize        = 32

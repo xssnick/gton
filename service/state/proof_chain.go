@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -451,10 +450,10 @@ func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trust
 }
 
 func (s *Syncer) saveVerifiedKeyBlockProof(block ton.BlockIDExt, proof []byte) error {
-	return s.saveKeyBlockProofDownload(block, p2p.ProofDownload{Data: proof})
+	return s.saveKeyBlockProofDownload(block, ProofDownload{Data: proof})
 }
 
-func (s *Syncer) saveKeyBlockProofDownload(block ton.BlockIDExt, proof p2p.ProofDownload) error {
+func (s *Syncer) saveKeyBlockProofDownload(block ton.BlockIDExt, proof ProofDownload) error {
 	writer, ok := s.storage.(storage.PeerServingStorageWriter)
 	if !ok {
 		return nil
@@ -478,44 +477,6 @@ func (s *Syncer) saveKeyBlockProofDownload(block ton.BlockIDExt, proof p2p.Proof
 		return fmt.Errorf("store key block proof link %s: %w", storage.FormatBlockRef(block), err)
 	}
 	return nil
-}
-
-func (s *P2PSource) MasterchainProof(ctx context.Context, block ton.BlockIDExt, requireKey bool) ([]byte, error) {
-	if requireKey {
-		s.log.Debug().
-			Str("block", storage.FormatBlockRef(block)).
-			Msg("requesting key block proof")
-
-		downloaded, err := s.keyBlockProof(ctx, block, false)
-		if err == nil && !downloaded.Link {
-			return downloaded.Data, nil
-		}
-		if err != nil && !isExpectedProofUnavailable(err) {
-			return nil, fmt.Errorf("download key block proof %s: %w", storage.FormatBlockRef(block), err)
-		}
-
-		evt := s.log.Debug().
-			Str("block", storage.FormatBlockRef(block)).
-			Bool("proof_link", downloaded.Link)
-		if err != nil {
-			evt = evt.Err(err)
-		}
-		evt.Msg("key block proof unavailable as full proof, downloading block full")
-	}
-
-	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Bool("require_key", requireKey).
-		Msg("requesting masterchain block full for proof")
-
-	downloaded, err := s.node.DownloadBlockFull(ctx, block)
-	if err != nil {
-		return nil, fmt.Errorf("download block full %s: %w", storage.FormatBlockRef(block), err)
-	}
-	if downloaded == nil {
-		return nil, fmt.Errorf("download block full %s: empty response", storage.FormatBlockRef(block))
-	}
-	return downloaded.ProofBOC, nil
 }
 
 func (s *Syncer) keyBlockIDs(ctx context.Context, fromBlock ton.BlockIDExt) ([]ton.BlockIDExt, error) {
@@ -679,8 +640,4 @@ func shouldLogKeyBlockProgress(done, total int) bool {
 
 func shouldSaveKeyBlockProgress(done, total int) bool {
 	return shouldLogKeyBlockProgress(done, total)
-}
-
-func isExpectedProofUnavailable(err error) bool {
-	return errors.Is(err, p2p.ErrBlockNotAvailable)
 }

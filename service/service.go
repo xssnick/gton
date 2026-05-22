@@ -153,6 +153,10 @@ type Service struct {
 	exclusiveTaskMu                    sync.Mutex
 	exclusiveTask                      exclusiveServiceTask
 	cellMigrationMu                    sync.Mutex
+	cellGenerationMigrationRun         *cellGenerationMigrationRun
+	cellGenerationMigrationStopping    bool
+	cellGenerationSwitchRequested      bool
+	cellGenerationNextBlockYieldAt     time.Time
 	cellGenerationSwitching            bool
 	currentStatusMu                    sync.RWMutex
 	currentStatus                      *storage.CurrentState
@@ -737,6 +741,9 @@ func isExpectedRetryError(err error) bool {
 		errors.Is(err, p2p.ErrBlockNotAvailable) ||
 		errors.Is(err, errSyncedBlockNotVerified) ||
 		errors.Is(err, errCellGenerationMigrationRunning) ||
+		errors.Is(err, errCellGenerationMigrationStopping) ||
+		errors.Is(err, errCellGenerationMigrationStopped) ||
+		errors.Is(err, errPendingCellGenerationCompaction) ||
 		errors.Is(err, errPersistentStateGCActive) ||
 		errors.Is(err, errArchiveTTLGCActive) ||
 		errors.Is(err, errExclusiveServiceTaskHighReadAmp) ||

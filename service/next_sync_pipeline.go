@@ -896,6 +896,15 @@ func (r *nextSyncRunner) shouldReturnAfterCommit() bool {
 	if r.reachedTarget() {
 		return true
 	}
+	if r.service.shouldYieldNextBlockForCellGenerationSwitch(time.Now()) {
+		r.service.log.Info().
+			Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
+			Str("catchup_method", r.method).
+			Uint32("pending_checkpoint_blocks", r.stagedBlocks).
+			Uint64("pending_checkpoint_bytes", r.pendingCheckpointBytes()).
+			Msg("yielding next-block pipeline for cell generation switch")
+		return true
+	}
 
 	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
 	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, time.Now().Unix())
