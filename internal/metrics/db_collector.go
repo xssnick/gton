@@ -33,124 +33,138 @@ type dbCollector struct {
 	tableIters                *prometheus.Desc
 	flushes                   *prometheus.Desc
 	ingests                   *prometheus.Desc
+	readCells                 *prometheus.Desc
+	writtenCells              *prometheus.Desc
 }
 
-func newDBCollector(metrics *Metrics) prometheus.Collector {
+func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 	generationLabels := []string{"generation", "role"}
 	shardLabels := []string{"generation", "role", "shard"}
 	return &dbCollector{
 		metrics: metrics,
 		available: prometheus.NewDesc(
-			"flexserver_storage_db_status_available",
+			prometheus.BuildFQName(namespace, "storage", "db_status_available"),
 			"Whether storage DB status was available during the scrape.",
 			nil,
 			nil,
 		),
 		cacheBytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_cache_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_cache_bytes"),
 			"Cell DB cache size by cache kind.",
 			[]string{"generation", "role", "cache"},
 			nil,
 		),
 		cacheRequests: prometheus.NewDesc(
-			"flexserver_storage_cell_db_cache_requests_total",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_cache_requests_total"),
 			"Cell DB block cache requests by result.",
 			[]string{"generation", "role", "result"},
 			nil,
 		),
 		fileCacheTables: prometheus.NewDesc(
-			"flexserver_storage_cell_db_file_cache_tables",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_file_cache_tables"),
 			"Cell DB file cache table count.",
 			generationLabels,
 			nil,
 		),
 		diskBytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_disk_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_disk_bytes"),
 			"Cell DB disk space usage.",
 			shardLabels,
 			nil,
 		),
 		liveBytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_live_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_live_bytes"),
 			"Cell DB live table size.",
 			shardLabels,
 			nil,
 		),
 		liveTables: prometheus.NewDesc(
-			"flexserver_storage_cell_db_live_tables",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_live_tables"),
 			"Cell DB live table count.",
 			shardLabels,
 			nil,
 		),
 		readAmp: prometheus.NewDesc(
-			"flexserver_storage_cell_db_read_amp",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_read_amp"),
 			"Cell DB maximum read amplification.",
 			shardLabels,
 			nil,
 		),
 		l0Files: prometheus.NewDesc(
-			"flexserver_storage_cell_db_l0_files",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_l0_files"),
 			"Cell DB L0 file count.",
 			shardLabels,
 			nil,
 		),
 		l0Sublevels: prometheus.NewDesc(
-			"flexserver_storage_cell_db_l0_sublevels",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_l0_sublevels"),
 			"Cell DB L0 sublevel count.",
 			shardLabels,
 			nil,
 		),
 		l0Bytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_l0_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_l0_bytes"),
 			"Cell DB L0 table size.",
 			shardLabels,
 			nil,
 		),
 		compactionDebtBytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_compaction_debt_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_compaction_debt_bytes"),
 			"Cell DB estimated compaction debt.",
 			shardLabels,
 			nil,
 		),
 		compactionsInProgress: prometheus.NewDesc(
-			"flexserver_storage_cell_db_compactions_in_progress",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_compactions_in_progress"),
 			"Cell DB compactions currently in progress.",
 			shardLabels,
 			nil,
 		),
 		compactionInProgressBytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_compaction_in_progress_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_compaction_in_progress_bytes"),
 			"Cell DB compaction bytes currently in progress.",
 			shardLabels,
 			nil,
 		),
 		memtableBytes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_memtable_bytes",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_memtable_bytes"),
 			"Cell DB memtable size.",
 			shardLabels,
 			nil,
 		),
 		memtableCount: prometheus.NewDesc(
-			"flexserver_storage_cell_db_memtable_count",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_memtable_count"),
 			"Cell DB memtable count.",
 			shardLabels,
 			nil,
 		),
 		tableIters: prometheus.NewDesc(
-			"flexserver_storage_cell_db_table_iters",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_table_iters"),
 			"Cell DB open table iterators.",
 			shardLabels,
 			nil,
 		),
 		flushes: prometheus.NewDesc(
-			"flexserver_storage_cell_db_flushes_total",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_flushes_total"),
 			"Cell DB flush count.",
 			shardLabels,
 			nil,
 		),
 		ingests: prometheus.NewDesc(
-			"flexserver_storage_cell_db_ingests_total",
+			prometheus.BuildFQName(namespace, "storage", "cell_db_ingests_total"),
 			"Cell DB ingest count.",
+			shardLabels,
+			nil,
+		),
+		readCells: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "cell_db_read_cells_total"),
+			"Cell records successfully read from Cell DB.",
+			shardLabels,
+			nil,
+		),
+		writtenCells: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "cell_db_written_cells_total"),
+			"Cell records successfully written to Cell DB.",
 			shardLabels,
 			nil,
 		),
@@ -177,6 +191,8 @@ func (c *dbCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.tableIters
 	ch <- c.flushes
 	ch <- c.ingests
+	ch <- c.readCells
+	ch <- c.writtenCells
 }
 
 func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
@@ -229,4 +245,6 @@ func (c *dbCollector) collectShard(ch chan<- prometheus.Metric, generation strin
 	ch <- prometheus.MustNewConstMetric(c.tableIters, prometheus.GaugeValue, float64(shard.TableIters), generation, role, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.flushes, prometheus.CounterValue, float64(shard.Flushes), generation, role, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.ingests, prometheus.CounterValue, float64(shard.Ingests), generation, role, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.readCells, prometheus.CounterValue, float64(shard.ReadCells), generation, role, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.writtenCells, prometheus.CounterValue, float64(shard.WrittenCells), generation, role, shardLabel)
 }

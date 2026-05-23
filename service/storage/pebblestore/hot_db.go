@@ -11,6 +11,10 @@ import (
 	"github.com/xssnick/gton/service/storage"
 )
 
+type pebbleReader interface {
+	Get(key []byte) ([]byte, io.Closer, error)
+}
+
 func (s *Store) acquireHotDB(ctx context.Context) (*pebble.DB, error) {
 	select {
 	case <-ctx.Done():
@@ -115,12 +119,13 @@ func (s *Store) getHotCopy(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer s.releaseHotDB()
-	return pebbleReaderGetCopy(db, key)
+	return pebbleReaderGetCopy(db, key, nil)
 }
 
 func (s *Store) setHotUnique(batch *pebble.Batch, key, value []byte) error {
-	current, err := pebbleReaderGetCopy(s.hot, key)
+	current, closer, err := pebbleReaderGet(s.hot, key)
 	if err == nil {
+		defer func() { _ = closer.Close() }()
 		if !bytes.Equal(current, value) {
 			return fmt.Errorf("hot unique record %x already has different value", key)
 		}
@@ -132,23 +137,27 @@ func (s *Store) setHotUnique(batch *pebble.Batch, key, value []byte) error {
 	return batch.Set(key, value, pebble.NoSync)
 }
 
-func pebbleReaderGetCopy(reader interface {
-	Get(key []byte) ([]byte, io.Closer, error)
-}, key []byte) ([]byte, error) {
+func pebbleReaderGet(reader pebbleReader, key []byte) ([]byte, io.Closer, error) {
 	value, closer, err := reader.Get(key)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, storage.ErrNotFound
+			return nil, nil, storage.ErrNotFound
 		}
+		return nil, nil, err
+	}
+	return value, closer, nil
+}
+
+func pebbleReaderGetCopy(reader pebbleReader, key []byte, dst []byte) ([]byte, error) {
+	value, closer, err := pebbleReaderGet(reader, key)
+	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = closer.Close() }()
-	return bytes.Clone(value), nil
+	return append(dst[:0], value...), nil
 }
 
-func pebbleReaderHas(reader interface {
-	Get(key []byte) ([]byte, io.Closer, error)
-}, key []byte) (bool, error) {
+func pebbleReaderHas(reader pebbleReader, key []byte) (bool, error) {
 	_, closer, err := reader.Get(key)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {

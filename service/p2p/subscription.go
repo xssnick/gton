@@ -43,6 +43,7 @@ type overlaySubscription struct {
 	lastPingedNeighbour string
 	archivePeers        map[string]*archivePeerState
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
+	liveNextPeers       map[string]*liveNextPeerState
 	peerNotify          chan struct{}
 }
 
@@ -144,6 +145,7 @@ func (s *overlaySubscription) close() {
 	s.mx.Unlock()
 
 	for _, peer := range peers {
+		peer.closeRebroadcastQueues()
 		if peer.overlay != nil {
 			peer.overlay.Close()
 		}
@@ -160,6 +162,14 @@ type archivePeerState struct {
 type chainDownloadState struct {
 	peer  *overlayPeer
 	speed float64
+}
+
+type liveNextPeerState struct {
+	successes        uint64
+	latency          time.Duration
+	bytesSec         float64
+	availability     float64
+	unavailableUntil time.Time
 }
 
 type overlayPeer struct {
@@ -187,6 +197,11 @@ type overlayPeer struct {
 	archiveLargeBytesSec  float64
 	archiveLargeDownloads uint64
 	downloadSlowUntil     time.Time
+
+	rebroadcastMx         sync.Mutex
+	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
+	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
+	rebroadcastClosed     bool
 }
 
 func (s *overlaySubscription) run(ctx context.Context) {
@@ -593,11 +608,13 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
+	state.initRebroadcastQueues()
 	s.peers[pooled.id] = state
 	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 
 	s.installHandlers(state)
+	s.startPeerRebroadcastWorker(state)
 	if announced != nil {
 		s.reloadNeighbours()
 		s.startPeerWarmup(state)
@@ -642,8 +659,12 @@ func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
 }
 
 func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
-	peer.overlay.SetBroadcastHandler(func(msg tl.Serializable, trusted bool) error {
-		return s.handleOverlayBroadcast(peer, msg, DeliveryFEC, trusted, "")
+	peer.overlay.SetBroadcastHandlerWithInfo(func(msg tl.Serializable, info overlay.BroadcastInfo) error {
+		sourceKey := ""
+		if len(info.SourceID) > 0 {
+			sourceKey = hex.EncodeToString(info.SourceID)
+		}
+		return s.handleOverlayBroadcast(peer, msg, DeliveryFEC, info.Trusted, sourceKey)
 	})
 	peer.overlay.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
 		switch data := msg.Data.(type) {
@@ -826,15 +847,20 @@ func (s *overlaySubscription) handleSimpleBroadcast(peer *overlayPeer, msg overl
 		return nil
 	}
 
-	return s.handleOverlayBroadcast(nil, parsed, DeliverySimple, false, hex.EncodeToString(sourceID))
+	return s.handleOverlayBroadcast(peer, parsed, DeliverySimple, false, hex.EncodeToString(sourceID))
 }
 
 func (s *overlaySubscription) removePeer(id string) {
 	s.mx.Lock()
+	peer := s.peers[id]
 	delete(s.peers, id)
 	s.removeNeighbourLocked(id)
 	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
+
+	if peer != nil {
+		peer.closeRebroadcastQueues()
+	}
 }
 
 func (s *overlaySubscription) aliveKnownPeerCount() int {

@@ -22,6 +22,8 @@ type rebroadcastRequest struct {
 	subscription *overlaySubscription
 	kind         string
 	payload      []byte
+	sourcePeerID string
+	local        bool
 }
 
 func broadcastEventBytes(event BroadcastEvent) int64 {
@@ -66,6 +68,9 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 	if len(payload) == 0 {
 		return nil
 	}
+	if sourceKey == "" && peer != nil {
+		sourceKey = downloadPeerKey(peer)
+	}
 
 	fingerprint := broadcastFingerprint(s.spec.ShortID, payload)
 
@@ -94,17 +99,26 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 		if len(data.Message.Data) == 0 {
 			return nil
 		}
+		sourcePeerID := ""
+		if peer != nil {
+			sourcePeerID = peer.id
+		}
 		return &acceptedBroadcast{
 			fingerprint: fingerprint,
 			rebroadcast: &rebroadcastRequest{
 				subscription: s,
 				kind:         "tonNode.externalMessageBroadcast",
 				payload:      payload,
+				sourcePeerID: sourcePeerID,
 			},
 		}
 	case IhrMessageBroadcast:
 		if len(data.Message.Data) == 0 {
 			return nil
+		}
+		sourcePeerID := ""
+		if peer != nil {
+			sourcePeerID = peer.id
 		}
 		return &acceptedBroadcast{
 			fingerprint: fingerprint,
@@ -112,6 +126,7 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 				subscription: s,
 				kind:         "tonNode.ihrMessageBroadcast",
 				payload:      payload,
+				sourcePeerID: sourcePeerID,
 			},
 		}
 	default:
@@ -146,6 +161,9 @@ func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, de
 func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string, msg any) *acceptedBroadcast {
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
 		return nil
+	}
+	if block.Workchain == -1 && block.Shard == topShard {
+		s.node.trackRawMasterchainBroadcast(block)
 	}
 
 	downloaded, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
@@ -196,7 +214,7 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 	}
 
 	if accepted.rebroadcast != nil && n.allowRebroadcast(accepted.rebroadcast) {
-		_ = n.rebroadcastQueue.Push(*accepted.rebroadcast)
+		accepted.rebroadcast.subscription.enqueueRebroadcast(*accepted.rebroadcast)
 	}
 }
 

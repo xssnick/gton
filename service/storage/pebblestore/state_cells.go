@@ -3,7 +3,6 @@ package pebblestore
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/xssnick/gton/service/storage"
@@ -131,12 +130,12 @@ func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 		return nil, storage.ErrNotFound
 	}
 
-	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateCellHash)
+	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateRootHash)
 	if err != nil {
 		return nil, err
 	}
-	hash := root.HashKey()
-	if !bytes.Equal(hash[:], state.StateCellHash) {
+	hash := root.HashKey(0)
+	if !bytes.Equal(hash[:], state.StateRootHash) {
 		return nil, storage.ErrNotFound
 	}
 	return root, nil
@@ -145,7 +144,7 @@ func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) error {
 	var err error
 	if root == nil {
-		root, err = s.loadLazyCellFromGeneration(context.Background(), saved.CellGeneration, saved.StateCellHash)
+		root, err = s.loadLazyCellFromGeneration(context.Background(), saved.CellGeneration, saved.StateRootHash)
 		if err != nil {
 			return fmt.Errorf("load persisted lazy state root: %w", err)
 		}
@@ -153,7 +152,6 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 
 	state.Block = saved.Block
 	state.StateRootHash = bytes.Clone(saved.StateRootHash)
-	state.StateCellHash = bytes.Clone(saved.StateCellHash)
 	state.StateFileHash = bytes.Clone(saved.StateFileHash)
 	if saved.MasterchainRef == nil {
 		state.MasterchainRef = nil
@@ -196,12 +194,12 @@ func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, re
 		})
 	}
 
-	_, err := s.saveCellRecordBatch(ctx, encoded, true, generation)
+	_, err := s.saveCellRecordBatch(ctx, encoded, true, generation, true)
 	return err
 }
 
 func (s *Store) SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error {
-	_, err := s.saveCellRecordBatch(ctx, records, sync, generation)
+	_, err := s.saveCellRecordBatch(ctx, records, sync, generation, true)
 	return err
 }
 
@@ -212,14 +210,14 @@ type cellRecordBatchStats struct {
 }
 
 func (s *Store) savePreparedStateCellRecords(ctx context.Context, records []storage.EncodedCellRecord, generation uint64) (stateCellSaveStats, error) {
-	stats, err := s.saveCellRecordBatch(ctx, records, false, generation)
+	stats, err := s.saveCellRecordBatch(ctx, records, false, generation, false)
 	if err != nil {
 		return stateCellSaveStats{}, err
 	}
 	return stateCellSaveStats{applied: stats.written > 0}, nil
 }
 
-func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.EncodedCellRecord, sync bool, generation uint64) (cellRecordBatchStats, error) {
+func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.EncodedCellRecord, sync bool, generation uint64, dedupe bool) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
 	if len(records) == 0 {
 		return stats, nil
@@ -237,7 +235,10 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 	writer := cells.newBatchWriter()
 	defer writer.close()
 
-	written := make(map[cell.Hash]struct{}, len(records))
+	var written map[cell.Hash]struct{}
+	if dedupe {
+		written = make(map[cell.Hash]struct{}, len(records))
+	}
 	for i, record := range records {
 		if i&0x3fff == 0 {
 			select {
@@ -251,9 +252,12 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 			return stats, fmt.Errorf("encoded cell record is empty")
 		}
 
-		if _, ok := written[record.Hash]; ok {
-			stats.skipped++
-			continue
+		if dedupe {
+			if _, ok := written[record.Hash]; ok {
+				stats.skipped++
+				continue
+			}
+			written[record.Hash] = struct{}{}
 		}
 
 		if err := writer.set(record.Hash[:], record.Data); err != nil {
@@ -261,7 +265,6 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 		}
 		stats.written++
 		stats.bytes += int64(len(record.Data))
-		written[record.Hash] = struct{}{}
 
 		if writer.bytesInBatch >= stateCellImportBatchTargetBytes {
 			if _, err := writer.flush(); err != nil {
@@ -335,7 +338,7 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 
 	cacheGeneration := generation
 	loaderGeneration := generation
-	if requestedGeneration == 0 || s.isActiveCellGeneration(generation) {
+	if requestedGeneration == 0 {
 		cacheGeneration = 0
 		loaderGeneration = 0
 	}
@@ -345,9 +348,6 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 
 	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
 	if err != nil {
-		if requestedGeneration != 0 && errors.Is(err, errCellGenerationNotOpen) {
-			return s.loadLazyCellFromGeneration(ctx, 0, hash)
-		}
 		return nil, err
 	}
 	loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(loaderGeneration))
@@ -356,14 +356,4 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 	}
 	s.cellCache.set(cacheGeneration, hash, loaded)
 	return loaded, nil
-}
-
-func (s *Store) isActiveCellGeneration(generation uint64) bool {
-	if generation == 0 {
-		return true
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return !s.closed && s.activeCellGeneration == generation
 }

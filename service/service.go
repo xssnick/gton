@@ -31,8 +31,17 @@ const (
 	stateSerializationMinDiskFreeBytes = 30 << 30
 	nextBlockBootstrapBlocks           = 0
 	nextBlockBootstrapProbeTimeout     = 2 * time.Second
+	nextBlockBootstrapLiveProbeTimeout = 5 * time.Second
+	nextBlockBootstrapLiveStageDelay   = 1500 * time.Millisecond
 	nextBlockBootstrapProbePeers       = 3
 	nextBlockBootstrapUrgentPeers      = 8
+	nextBlockBootstrapWidePeers        = 16
+	nextBlockBootstrapUrgentMisses     = 1
+	nextBlockBootstrapWideMisses       = 2
+	nextBlockBootstrapUrgentLagSeconds = 3
+	nextBlockBootstrapWideLagSeconds   = 10
+	nextBlockBootstrapWideGapBlocks    = 8
+	nextBlockBootstrapLiveLagSeconds   = 10
 	chainBlockDownloadRetries          = 3
 	chainBlockDownloadRetryDelay       = 500 * time.Millisecond
 	nextMasterchainQueueLimit          = 64
@@ -55,6 +64,10 @@ var (
 var errShardCatchUpNeedsSnapshot = errors.New("shard catch-up requires state snapshot")
 
 type shardBlockLoader func(context.Context, ton.BlockIDExt) (p2p.DownloadedBlock, error)
+
+type timeoutError interface {
+	Timeout() bool
+}
 
 type shardStateDownload struct {
 	prev            ton.BlockIDExt
@@ -128,12 +141,13 @@ type Service struct {
 	shardDescriptionHints map[string]shardDescriptionHint
 	shardDescriptionOrder []string
 
-	nextMasterchainMx    sync.Mutex
-	nextMasterchainQueue map[string]p2p.DownloadedBlock
-	validatorCache       masterchainValidatorCache
-	masterStateCacheMu   sync.Mutex
-	masterStateCache     map[string]*storage.BlockState
-	masterStateCacheKeys []string
+	nextMasterchainMx      sync.Mutex
+	nextMasterchainQueue   map[string]queuedMasterchainBlock
+	nextMasterchainBySeqno map[uint32]string
+	validatorCache         masterchainValidatorCache
+	masterStateCacheMu     sync.Mutex
+	masterStateCache       map[string]*storage.BlockState
+	masterStateCacheKeys   []string
 
 	currentStatePersistMu              sync.Mutex
 	currentStatePersistErrMu           sync.Mutex
@@ -185,6 +199,10 @@ type Options struct {
 
 type CurrentStatePublisher interface {
 	SetLiveCurrentState(*storage.CurrentState)
+}
+
+type CurrentStateFlusher interface {
+	MarkLiveCurrentStateFlushed(*storage.CurrentState)
 }
 
 type SyncObserver interface {
@@ -454,6 +472,7 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 				snapshot.LocalBasechainHasTx = metrics.HasTransactions
 			}
 		}
+		s.populateStatusLatestBasechain(ctx, &snapshot, current)
 		sort.Slice(snapshot.LocalBasechainShards, func(i, j int) bool {
 			left := snapshot.LocalBasechainShards[i].Block
 			right := snapshot.LocalBasechainShards[j].Block
@@ -467,6 +486,76 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 	}
 
 	return snapshot
+}
+
+func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *StatusSnapshot, current *storage.CurrentState) {
+	if snapshot == nil || current == nil {
+		return
+	}
+
+	latestMaster := current.Masterchain.Block
+	if snapshot.LatestMasterchain != nil && snapshot.LatestMasterchain.SeqNo > latestMaster.SeqNo {
+		latestMaster = *snapshot.LatestMasterchain
+	}
+
+	if s != nil && s.storage != nil {
+		shards, err := s.masterShardBlocks(ctx, latestMaster)
+		if err == nil {
+			setStatusLatestBasechain(snapshot, shards)
+			return
+		}
+	}
+	shards := make([]ton.BlockIDExt, 0, len(current.Shards))
+	for _, shard := range current.Shards {
+		shards = append(shards, shard.Block)
+	}
+	setStatusLatestBasechain(snapshot, shards)
+}
+
+func setStatusLatestBasechain(snapshot *StatusSnapshot, shards []ton.BlockIDExt) {
+	latestByShard := make(map[storage.ShardKey]ton.BlockIDExt, len(snapshot.LatestBasechainShards)+len(shards))
+	for _, shard := range snapshot.LatestBasechainShards {
+		if shard.Workchain == 0 {
+			latestByShard[storage.ShardKeyFromBlock(shard)] = shard
+		}
+	}
+	if len(latestByShard) == 0 && snapshot.LatestBasechain != nil && snapshot.LatestBasechain.Workchain == 0 {
+		latestByShard[storage.ShardKeyFromBlock(*snapshot.LatestBasechain)] = *snapshot.LatestBasechain
+	}
+	for _, shard := range shards {
+		if shard.Workchain != 0 {
+			continue
+		}
+		key := storage.ShardKeyFromBlock(shard)
+		if current, ok := latestByShard[key]; !ok || shard.SeqNo > current.SeqNo {
+			latestByShard[key] = shard
+		}
+	}
+	if len(latestByShard) == 0 {
+		return
+	}
+
+	baseShards := make([]ton.BlockIDExt, 0, len(latestByShard))
+	var latest ton.BlockIDExt
+	hasLatest := false
+	for _, shard := range latestByShard {
+		baseShards = append(baseShards, shard)
+		if !hasLatest || shard.SeqNo > latest.SeqNo {
+			latest = shard
+			hasLatest = true
+		}
+	}
+
+	sort.Slice(baseShards, func(i, j int) bool {
+		left := storage.ShardKeyFromBlock(baseShards[i])
+		right := storage.ShardKeyFromBlock(baseShards[j])
+		if left.Workchain != right.Workchain {
+			return left.Workchain < right.Workchain
+		}
+		return uint64(left.Shard) < uint64(right.Shard)
+	})
+	snapshot.LatestBasechain = &latest
+	snapshot.LatestBasechainShards = baseShards
 }
 
 func (s *Service) currentStatusSnapshot(ctx context.Context) (*storage.CurrentState, error) {
@@ -640,6 +729,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
 		if err := s.validateSyncedMasterchainBlock(ctx, downloaded); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
+				s.wakeCurrentStateSync()
 				return fmt.Errorf("%w: %v", errSyncedBlockNotVerified, err)
 			}
 			return err
@@ -649,7 +739,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 			return err
 		}
 		s.rememberSeenMasterchainBlock(downloaded.ID)
-		s.queueVerifiedMasterchainBlock(downloaded)
+		s.queueMasterchainBlockCandidateFromSource(downloaded, synced.Trigger.SourceKey)
 		s.wakeCurrentStateSync()
 		return nil
 	}
@@ -754,9 +844,7 @@ func isExpectedRetryError(err error) bool {
 		return true
 	}
 
-	var timeout interface {
-		Timeout() bool
-	}
+	var timeout timeoutError
 	return errors.As(err, &timeout) && timeout.Timeout()
 }
 

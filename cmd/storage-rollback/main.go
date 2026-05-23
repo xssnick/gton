@@ -23,6 +23,10 @@ const (
 	topShard            = int64(-1 << 63)
 )
 
+type closeableStorage interface {
+	Close() error
+}
+
 func main() {
 	storageDirFlag := flag.String("storage-dir", "", "path to pebble storage directory")
 	seqnoFlag := flag.Uint("seqno", 0, "masterchain seqno to rollback current state to")
@@ -118,7 +122,7 @@ func rollbackCurrentState(ctx context.Context, store *pebblestore.Store, seqno u
 	return current, nil
 }
 
-func closeStorage(logger zerolog.Logger, store interface{ Close() error }) {
+func closeStorage(logger zerolog.Logger, store closeableStorage) {
 	started := time.Now()
 	logger.Info().Msg("closing storage")
 	if err := store.Close(); err != nil {

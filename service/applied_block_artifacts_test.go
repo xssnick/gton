@@ -158,6 +158,46 @@ func TestAppliedBlockArtifactWriterAcceptsAlreadyDurableBlock(t *testing.T) {
 	}
 }
 
+func TestAppliedBlockArtifactWriterBackpressuresQueuedJobs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := newAppliedBlockArtifactTestStore()
+	writer := newAppliedBlockArtifactWriter(zerolog.Nop(), store, nil)
+	prev := testBlockID(0, topShard, 40)
+	for i := 0; i < appliedBlockArtifactQueueJobsLimit; i++ {
+		block := testAppliedDownloadedBlock(testBlockID(0, topShard, uint32(41+i)), prev, false)
+		if err := writer.enqueue(ctx, block, 4); err != nil {
+			t.Fatalf("enqueue block %d: %v", i, err)
+		}
+		prev = block.ID
+	}
+
+	enqueued := make(chan error, 1)
+	go func() {
+		block := testAppliedDownloadedBlock(testBlockID(0, topShard, 41+appliedBlockArtifactQueueJobsLimit), prev, false)
+		enqueued <- writer.enqueue(ctx, block, 4)
+	}()
+
+	select {
+	case err := <-enqueued:
+		t.Fatalf("enqueue passed through full artifact queue: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if _, ok := writer.popJob(); !ok {
+		t.Fatal("pop queued artifact job")
+	}
+	select {
+	case err := <-enqueued:
+		if err != nil {
+			t.Fatalf("enqueue after queue space: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enqueue did not resume after artifact queue space was freed")
+	}
+}
+
 type appliedBlockArtifactTestStore struct {
 	mu sync.Mutex
 

@@ -4,20 +4,8 @@ import (
 	"sort"
 
 	"github.com/xssnick/gton/service/storage"
-
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
-
-func cloneBlockStateSlice(states []*storage.BlockState) []*storage.BlockState {
-	if len(states) == 0 {
-		return nil
-	}
-	cloned := make([]*storage.BlockState, 0, len(states))
-	for _, state := range states {
-		cloned = append(cloned, storage.CloneBlockState(state))
-	}
-	return cloned
-}
 
 type appliedStateSet struct {
 	states map[string]appliedStateEntry
@@ -25,13 +13,12 @@ type appliedStateSet struct {
 
 type appliedStateEntry struct {
 	state *storage.BlockState
-	cells map[cell.Hash][]byte
+	cells []storage.EncodedCellRecord
 }
 
 type appliedStateCheckpoint struct {
-	keys   []string
-	states []*storage.BlockState
-	cells  []storage.EncodedCellRecord
+	keys    []string
+	entries []storage.StateCheckpointBlock
 }
 
 func (s *appliedStateSet) remember(state *storage.BlockState) {
@@ -47,19 +34,13 @@ func (s *appliedStateSet) rememberWithCells(state *storage.BlockState, cells map
 	}
 	s.states[storage.BlockKey(state.Block)] = appliedStateEntry{
 		state: storage.CloneBlockState(state),
-		cells: cells,
-	}
-}
-
-func (s *appliedStateSet) rememberAll(states []*storage.BlockState) {
-	for _, state := range states {
-		s.remember(state)
+		cells: encodedCellRecordsFromMap(cells),
 	}
 }
 
 func (s *appliedStateSet) rememberAllEntries(entries []appliedStateEntry) {
 	for _, entry := range entries {
-		s.rememberWithCells(entry.state, entry.cells)
+		s.rememberEntry(entry)
 	}
 }
 
@@ -78,30 +59,24 @@ func (s *appliedStateSet) takeEntries() []appliedStateEntry {
 	return entries
 }
 
-func (s *appliedStateSet) takeCheckpoint() ([]*storage.BlockState, []storage.EncodedCellRecord) {
-	entries := s.takeEntries()
-	checkpoint := appliedStateCheckpointFromEntries(entries)
-	return checkpoint.states, checkpoint.cells
-}
-
 func (s *appliedStateSet) checkpoint() appliedStateCheckpoint {
 	if len(s.states) == 0 {
 		return appliedStateCheckpoint{}
 	}
 
 	keys := sortedStateEntryKeys(s.states)
-	states := make([]*storage.BlockState, 0, len(keys))
-	totalCells := 0
+	entries := make([]storage.StateCheckpointBlock, 0, len(keys))
 	for _, key := range keys {
 		entry := s.states[key]
-		states = append(states, storage.CloneBlockState(entry.state))
-		totalCells += len(entry.cells)
+		entries = append(entries, storage.StateCheckpointBlock{
+			State: storage.CloneBlockState(entry.state),
+			Cells: cloneEncodedCellRecords(entry.cells),
+		})
 	}
 
 	return appliedStateCheckpoint{
-		keys:   keys,
-		states: states,
-		cells:  encodedCellRecordsFromEntries(keys, s.states, totalCells),
+		keys:    keys,
+		entries: entries,
 	}
 }
 
@@ -116,70 +91,6 @@ func (s *appliedStateSet) completeCheckpoint(checkpoint appliedStateCheckpoint) 
 	if len(s.states) == 0 {
 		s.states = nil
 	}
-}
-
-func appliedStateCheckpointFromEntries(entries []appliedStateEntry) appliedStateCheckpoint {
-	if len(entries) == 0 {
-		return appliedStateCheckpoint{}
-	}
-
-	keys := make([]string, 0, len(entries))
-	states := make([]*storage.BlockState, 0, len(entries))
-	totalCells := 0
-	for _, entry := range entries {
-		if entry.state == nil {
-			continue
-		}
-		keys = append(keys, storage.BlockKey(entry.state.Block))
-		states = append(states, storage.CloneBlockState(entry.state))
-		totalCells += len(entry.cells)
-	}
-
-	return appliedStateCheckpoint{
-		keys:   keys,
-		states: states,
-		cells:  encodedCellRecordsFromEntrySlice(entries, totalCells),
-	}
-}
-
-func encodedCellRecordsFromEntries(keys []string, entries map[string]appliedStateEntry, totalCells int) []storage.EncodedCellRecord {
-	if totalCells == 0 {
-		return nil
-	}
-
-	seen := make(map[cell.Hash]struct{}, totalCells)
-	records := make([]storage.EncodedCellRecord, 0, totalCells)
-	for _, key := range keys {
-		records = appendEncodedCellRecords(records, seen, entries[key].cells)
-	}
-	return records
-}
-
-func encodedCellRecordsFromEntrySlice(entries []appliedStateEntry, totalCells int) []storage.EncodedCellRecord {
-	if totalCells == 0 {
-		return nil
-	}
-
-	seen := make(map[cell.Hash]struct{}, totalCells)
-	records := make([]storage.EncodedCellRecord, 0, totalCells)
-	for _, entry := range entries {
-		records = appendEncodedCellRecords(records, seen, entry.cells)
-	}
-	return records
-}
-
-func appendEncodedCellRecords(records []storage.EncodedCellRecord, seen map[cell.Hash]struct{}, cells map[cell.Hash][]byte) []storage.EncodedCellRecord {
-	for hash, data := range cells {
-		if len(data) == 0 {
-			continue
-		}
-		if _, ok := seen[hash]; ok {
-			continue
-		}
-		seen[hash] = struct{}{}
-		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: data})
-	}
-	return records
 }
 
 func (s *appliedStateSet) clone() []*storage.BlockState {
@@ -198,10 +109,7 @@ func (s *appliedStateSet) cloneEntries() []appliedStateEntry {
 
 	cloned := make(map[string]appliedStateEntry, len(s.states))
 	for key, entry := range s.states {
-		cloned[key] = appliedStateEntry{
-			state: storage.CloneBlockState(entry.state),
-			cells: entry.cells,
-		}
+		cloned[key] = cloneAppliedStateEntry(entry)
 	}
 	return sortedClonedStateEntries(cloned)
 }
@@ -214,10 +122,7 @@ func sortedClonedStateEntries(entries map[string]appliedStateEntry) []appliedSta
 	keys := sortedStateEntryKeys(entries)
 	for _, key := range keys {
 		entry := entries[key]
-		cloned = append(cloned, appliedStateEntry{
-			state: storage.CloneBlockState(entry.state),
-			cells: entry.cells,
-		})
+		cloned = append(cloned, cloneAppliedStateEntry(entry))
 	}
 	return cloned
 }
@@ -229,4 +134,42 @@ func sortedStateEntryKeys(entries map[string]appliedStateEntry) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
+	if entry.state == nil {
+		return
+	}
+	if s.states == nil {
+		s.states = map[string]appliedStateEntry{}
+	}
+	s.states[storage.BlockKey(entry.state.Block)] = cloneAppliedStateEntry(entry)
+}
+
+func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
+	return appliedStateEntry{
+		state: storage.CloneBlockState(entry.state),
+		cells: cloneEncodedCellRecords(entry.cells),
+	}
+}
+
+func cloneEncodedCellRecords(records []storage.EncodedCellRecord) []storage.EncodedCellRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	return append([]storage.EncodedCellRecord(nil), records...)
+}
+
+func encodedCellRecordsFromMap(records map[cell.Hash][]byte) []storage.EncodedCellRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	encoded := make([]storage.EncodedCellRecord, 0, len(records))
+	for hash, data := range records {
+		if len(data) == 0 {
+			continue
+		}
+		encoded = append(encoded, storage.EncodedCellRecord{Hash: hash, Data: data})
+	}
+	return encoded
 }

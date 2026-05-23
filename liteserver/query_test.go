@@ -289,7 +289,7 @@ func TestLiveStoreServesPendingBlockBeforeStorageFlush(t *testing.T) {
 	id := testBlockIDForData(0, int64(0x4000000000000000), 5, root, payload)
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
 
-	if err := live.SetLiveBlock(id, root, payload, false); err != nil {
+	if err := live.publishLiveBlockData(id, root, payload, false); err != nil {
 		t.Fatalf("set live block: %v", err)
 	}
 
@@ -367,7 +367,7 @@ func TestLiveStoreKeepsPendingBlocksOverLimitUntilFlush(t *testing.T) {
 		root := cell.BeginCell().MustStoreUInt(uint64(seqno), 8).EndCell()
 		payload := testBlockBOC(root)
 		id := testBlockIDForData(0, int64(0x4000000000000000), seqno, root, payload)
-		if err := live.SetLiveBlock(id, root, payload, false); err != nil {
+		if err := live.publishLiveBlockData(id, root, payload, false); err != nil {
 			t.Fatalf("set pending live block %d: %v", seqno, err)
 		}
 		ids = append(ids, id)
@@ -405,13 +405,13 @@ func TestLiveStoreReplacingFlushedBlockKeepsTrimCountStable(t *testing.T) {
 	secondData := testBlockBOC(secondRoot)
 	second := testBlockIDForData(0, int64(0x4000000000000000), 32, secondRoot, secondData)
 
-	if err := live.SetLiveBlock(first, firstRoot, firstData, true); err != nil {
+	if err := live.publishLiveBlockData(first, firstRoot, firstData, true); err != nil {
 		t.Fatalf("set first live block: %v", err)
 	}
-	if err := live.SetLiveBlock(first, firstRoot, firstData, true); err != nil {
+	if err := live.publishLiveBlockData(first, firstRoot, firstData, true); err != nil {
 		t.Fatalf("replace first live block: %v", err)
 	}
-	if err := live.SetLiveBlock(second, secondRoot, secondData, true); err != nil {
+	if err := live.publishLiveBlockData(second, secondRoot, secondData, true); err != nil {
 		t.Fatalf("set second live block: %v", err)
 	}
 
@@ -469,7 +469,7 @@ func TestLiveStorePublishesCurrentOnlyAfterShardDataFlushed(t *testing.T) {
 		t.Fatalf("current state before shard data = %v, want ErrNotFound", err)
 	}
 
-	if err := live.SetLiveBlock(shard, shardRoot, shardData, false); err != nil {
+	if err := live.publishLiveBlockData(shard, shardRoot, shardData, false); err != nil {
 		t.Fatalf("set unflushed shard block: %v", err)
 	}
 	if _, err := live.CurrentState(context.Background()); !errors.Is(err, storage.ErrNotFound) {
@@ -481,7 +481,7 @@ func TestLiveStorePublishesCurrentOnlyAfterShardDataFlushed(t *testing.T) {
 		t.Fatalf("current state before master flush = %v, want ErrNotFound", err)
 	}
 
-	if err := live.SetLiveBlock(current.Masterchain.Block, masterRoot, masterData, true); err != nil {
+	if err := live.publishLiveBlockData(current.Masterchain.Block, masterRoot, masterData, true); err != nil {
 		t.Fatalf("set flushed master block: %v", err)
 	}
 	got, err := live.CurrentState(context.Background())
@@ -504,10 +504,10 @@ func TestLiveStorePinsCurrentBlocksOverCacheLimit(t *testing.T) {
 
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
 	live.SetLiveCurrentState(current)
-	if err := live.SetLiveBlock(current.Masterchain.Block, masterRoot, masterData, true); err != nil {
+	if err := live.publishLiveBlockData(current.Masterchain.Block, masterRoot, masterData, true); err != nil {
 		t.Fatalf("set live master block: %v", err)
 	}
-	if err := live.SetLiveBlock(shard, shardRoot, shardData, true); err != nil {
+	if err := live.publishLiveBlockData(shard, shardRoot, shardData, true); err != nil {
 		t.Fatalf("set live shard block: %v", err)
 	}
 
@@ -602,7 +602,7 @@ func TestLiveStoreLookupSeqnoUsesCurrentStateBeforeStorage(t *testing.T) {
 	current, root, data := testCurrentStateWithLiveBlock(t, 11)
 	store := &fakeStore{}
 	live := NewLiveStore(store)
-	if err := live.SetLiveBlock(current.Masterchain.Block, root, data, true); err != nil {
+	if err := live.publishLiveBlockData(current.Masterchain.Block, root, data, true); err != nil {
 		t.Fatalf("set live master block: %v", err)
 	}
 	live.SetLiveCurrentState(current)
@@ -622,8 +622,8 @@ func TestLiveStoreLookupSeqnoUsesCurrentStateBeforeStorage(t *testing.T) {
 	if _, err = live.LookupBlockBySeqNo(context.Background(), key, 12); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("missing seqno error = %v, want ErrNotFound", err)
 	}
-	if store.seqLookupCalls != 1 {
-		t.Fatalf("storage seq lookup calls = %d, want 1", store.seqLookupCalls)
+	if store.seqLookupCalls != 0 {
+		t.Fatalf("storage seq lookup calls = %d, want 0", store.seqLookupCalls)
 	}
 }
 
@@ -633,7 +633,7 @@ func TestLiveStoreLookupSeqnoUsesPendingBlockBeforeStorage(t *testing.T) {
 	id := testBlockIDForData(0, int64(0x4000000000000000), 15, root, payload)
 	store := &fakeStore{}
 	live := NewLiveStore(store, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
-	if err := live.SetLiveBlock(id, root, payload, false); err != nil {
+	if err := live.publishLiveBlockData(id, root, payload, false); err != nil {
 		t.Fatalf("set live block: %v", err)
 	}
 
@@ -655,7 +655,7 @@ func TestLiveStoreLookupLTAndUnixTimeUseLiveMetaBeforeStorage(t *testing.T) {
 	id, root := testBlockForState(t, 0, masterchainShard, 16, stateRoot)
 	store := &fakeStore{}
 	live := NewLiveStore(store, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
-	if err := live.SetLiveBlock(id, root, nil, false); err != nil {
+	if err := live.publishLiveBlockData(id, root, nil, false); err != nil {
 		t.Fatalf("set live block: %v", err)
 	}
 
@@ -691,14 +691,14 @@ func TestLiveStoreHistoryIndexesMatchLookupRules(t *testing.T) {
 
 	live.mu.Lock()
 	live.putBlockLocked(storage.BlockKey(first), &liveBlock{
-		id:      first,
-		meta:    &storage.BlockMeta{ID: first, StartLT: 1, EndLT: 100, GenUTime: 1000},
-		flushed: true,
+		id:               first,
+		meta:             &storage.BlockMeta{ID: first, StartLT: 1, EndLT: 100, GenUTime: 1000},
+		blockDataFlushed: true,
 	})
 	live.putBlockLocked(storage.BlockKey(second), &liveBlock{
-		id:      second,
-		meta:    &storage.BlockMeta{ID: second, StartLT: 50, EndLT: 100, GenUTime: 1000},
-		flushed: true,
+		id:               second,
+		meta:             &storage.BlockMeta{ID: second, StartLT: 50, EndLT: 100, GenUTime: 1000},
+		blockDataFlushed: true,
 	})
 	live.mu.Unlock()
 
@@ -744,7 +744,7 @@ func TestLiveStoreTrimRemovesHistoryIndexEntries(t *testing.T) {
 				EndLT:    uint64(seqno*100 + 100),
 				GenUTime: 1000 + seqno,
 			},
-			flushed: true,
+			blockDataFlushed: true,
 		})
 		live.trimBlocksLocked(liveBlockShard)
 		blocks = append(blocks, block)
@@ -796,7 +796,7 @@ func TestLiveStoreStateMethodsUseCurrentStateBeforeStorage(t *testing.T) {
 	}
 	store := &fakeStore{}
 	live := NewLiveStore(store)
-	if err := live.SetLiveBlock(id, blockRoot, blockData, true); err != nil {
+	if err := live.publishLiveBlockData(id, blockRoot, blockData, true); err != nil {
 		t.Fatalf("set live master block: %v", err)
 	}
 	live.SetLiveCurrentState(current)
@@ -834,6 +834,118 @@ func TestLiveStoreStateMethodsUseCurrentStateBeforeStorage(t *testing.T) {
 	}
 }
 
+func TestLiveStorePublishedArtifactsAreAuthoritative(t *testing.T) {
+	stateRoot := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 18, stateRoot)
+	blockData := testBlockBOC(blockRoot)
+	id = testBlockIDForData(masterchainID, masterchainShard, id.SeqNo, blockRoot, blockData)
+	proofData := []byte("live proof")
+	store := &fakeStore{
+		metas: map[string]*storage.BlockMeta{
+			storage.BlockKey(id): {
+				ID:       id,
+				GenUTime: 99,
+				Flags:    storage.BlockMetaHasProofKeyBlock,
+			},
+		},
+		proofs: map[string][]byte{
+			fakeProofKey(storage.ServedProofKeyBlock, id): []byte("stored proof"),
+		},
+	}
+	live := NewLiveStore(store)
+
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     id,
+		Root:      blockRoot,
+		BlockData: blockData,
+		Meta: &storage.BlockMeta{
+			ID:            id,
+			GenUTime:      1000,
+			StateRootHash: stateRoot.Hash(0),
+		},
+		State: &storage.BlockState{
+			Block:         id,
+			StateRootHash: stateRoot.Hash(0),
+			Cell:          stateRoot,
+		},
+		Proofs: []storage.LiveBlockProofArtifact{{
+			Kind: storage.ServedProofBlock,
+			Data: proofData,
+		}},
+		BlockDataFlushed: true,
+		StateFlushed:     true,
+		ProofsFlushed:    true,
+	}); err != nil {
+		t.Fatalf("publish live artifacts: %v", err)
+	}
+
+	meta, err := live.BlockMeta(context.Background(), id)
+	if err != nil {
+		t.Fatalf("live block meta: %v", err)
+	}
+	if meta.GenUTime != 1000 || !meta.Has(storage.BlockMetaHasProofBlock) || meta.Has(storage.BlockMetaHasProofKeyBlock) {
+		t.Fatalf("unexpected live meta: %+v", meta)
+	}
+	if store.blockMetaCalls != 0 {
+		t.Fatalf("storage block meta calls = %d, want 0", store.blockMetaCalls)
+	}
+
+	proof, err := live.BlockProof(context.Background(), storage.ServedProofBlock, id)
+	if err != nil {
+		t.Fatalf("live proof: %v", err)
+	}
+	if !bytes.Equal(proof, proofData) {
+		t.Fatalf("proof = %q, want %q", proof, proofData)
+	}
+	if len(store.proofCalls) != 0 {
+		t.Fatalf("storage proof calls = %d, want 0", len(store.proofCalls))
+	}
+}
+
+func TestLiveStoreDoesNotReadFutureMasterBlockFromBacking(t *testing.T) {
+	currentRoot := cell.BeginCell().MustStoreUInt(0x10, 8).EndCell()
+	currentID, currentBlockRoot := testBlockForState(t, masterchainID, masterchainShard, 10, currentRoot)
+	currentData := testBlockBOC(currentBlockRoot)
+	currentID = testBlockIDForData(masterchainID, masterchainShard, currentID.SeqNo, currentBlockRoot, currentData)
+
+	futureRoot := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
+	futureID, futureBlockRoot := testBlockForState(t, masterchainID, masterchainShard, 11, futureRoot)
+	futureData := testBlockBOC(futureBlockRoot)
+	futureID = testBlockIDForData(masterchainID, masterchainShard, futureID.SeqNo, futureBlockRoot, futureData)
+
+	store := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(futureID): futureData,
+		},
+	}
+	live := NewLiveStore(store)
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            currentID,
+		Root:             currentBlockRoot,
+		BlockData:        currentData,
+		Meta:             &storage.BlockMeta{ID: currentID, StateRootHash: currentRoot.Hash(0)},
+		State:            &storage.BlockState{Block: currentID, StateRootHash: currentRoot.Hash(0), Cell: currentRoot},
+		BlockDataFlushed: true,
+		StateFlushed:     true,
+	}); err != nil {
+		t.Fatalf("publish current live artifacts: %v", err)
+	}
+	live.SetLiveCurrentState(&storage.CurrentState{
+		Masterchain: storage.BlockState{
+			Block:         currentID,
+			StateRootHash: currentRoot.Hash(0),
+			Cell:          currentRoot,
+		},
+	})
+
+	if _, err := live.BlockData(context.Background(), futureID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("future block data error = %v, want ErrNotFound", err)
+	}
+	if store.blockDataCalls != 0 {
+		t.Fatalf("storage block data calls = %d, want 0", store.blockDataCalls)
+	}
+}
+
 func TestLiveStoreKeepsRecentStateCellsUntilBlockTrimmed(t *testing.T) {
 	type liveState struct {
 		current   *storage.CurrentState
@@ -867,10 +979,11 @@ func TestLiveStoreKeepsRecentStateCellsUntilBlockTrimmed(t *testing.T) {
 	third := makeState(32)
 
 	for _, state := range []liveState{first, second} {
-		if err := live.SetLiveBlock(state.current.Masterchain.Block, state.blockRoot, state.blockData, true); err != nil {
+		if err := live.publishLiveBlockData(state.current.Masterchain.Block, state.blockRoot, state.blockData, true); err != nil {
 			t.Fatalf("set live block %d: %v", state.current.Masterchain.Block.SeqNo, err)
 		}
 		live.SetLiveCurrentState(state.current)
+		live.MarkLiveCurrentStateFlushed(state.current)
 	}
 
 	root, err := live.LoadStateCellTree(context.Background(), first.current.Masterchain.Block, first.stateRoot.Hash(0))
@@ -880,13 +993,49 @@ func TestLiveStoreKeepsRecentStateCellsUntilBlockTrimmed(t *testing.T) {
 	if root != first.stateRoot {
 		t.Fatal("expected recent live state cell tree to be returned")
 	}
-	if err = live.SetLiveBlock(third.current.Masterchain.Block, third.blockRoot, third.blockData, true); err != nil {
+	if err = live.publishLiveBlockData(third.current.Masterchain.Block, third.blockRoot, third.blockData, true); err != nil {
 		t.Fatalf("set live block %d: %v", third.current.Masterchain.Block.SeqNo, err)
 	}
 	live.SetLiveCurrentState(third.current)
+	live.MarkLiveCurrentStateFlushed(third.current)
 
 	if _, err = live.LoadStateCellTree(context.Background(), first.current.Masterchain.Block, first.stateRoot.Hash(0)); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("trimmed live state error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLiveStoreDoesNotTrimUnflushedLiveState(t *testing.T) {
+	stateRoot := cell.BeginCell().MustStoreUInt(33, 32).EndCell()
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 33, stateRoot)
+	blockData := testBlockBOC(blockRoot)
+	id = testBlockIDForData(masterchainID, masterchainShard, 33, blockRoot, blockData)
+	state := storage.BlockState{
+		Block:         id,
+		StateRootHash: stateRoot.Hash(0),
+		Cell:          stateRoot,
+	}
+
+	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            id,
+		Root:             blockRoot,
+		BlockData:        blockData,
+		State:            &state,
+		BlockDataFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish live artifacts: %v", err)
+	}
+
+	if _, err := live.BlockData(context.Background(), id); err != nil {
+		t.Fatalf("unflushed live state block data should stay cached: %v", err)
+	}
+	if _, err := live.LoadStateCellTree(context.Background(), id, stateRoot.Hash(0)); err != nil {
+		t.Fatalf("unflushed live state should stay cached: %v", err)
+	}
+
+	live.MarkLiveCurrentStateFlushed(&storage.CurrentState{Masterchain: state})
+	if _, err := live.BlockData(context.Background(), id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("flushed live state block data error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1128,10 +1277,10 @@ func TestLiveStoreCurrentShardMetaUsesInclusionMasterRef(t *testing.T) {
 	master, masterRoot := testMasterBlockWithShardHashes(t, 16, testShardHashes(t, shard))
 
 	live := NewLiveStore(&fakeStore{})
-	if err := live.SetLiveBlock(shard, shardRoot, testBlockBOC(shardRoot), true); err != nil {
+	if err := live.publishLiveBlockData(shard, shardRoot, testBlockBOC(shardRoot), true); err != nil {
 		t.Fatalf("set live shard block: %v", err)
 	}
-	if err := live.SetLiveBlock(master, masterRoot, testBlockBOC(masterRoot), true); err != nil {
+	if err := live.publishLiveBlockData(master, masterRoot, testBlockBOC(masterRoot), true); err != nil {
 		t.Fatalf("set live master block: %v", err)
 	}
 
@@ -2084,7 +2233,7 @@ func TestRunMethodConfigRejectsOldGlobalVersion(t *testing.T) {
 	}
 }
 
-func TestLoadStateRootUsesStateHashFromBlock(t *testing.T) {
+func TestLoadStateRootUsesStateHashFromMeta(t *testing.T) {
 	stateRoot := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 19, stateRoot)
 	wrongState := cell.BeginCell().MustStoreUInt(0xff, 8).EndCell()
@@ -2093,7 +2242,7 @@ func TestLoadStateRootUsesStateHashFromBlock(t *testing.T) {
 			Masterchain: storage.BlockState{Block: id, StateRootHash: wrongState.Hash(0), Cell: wrongState},
 		},
 		metas: map[string]*storage.BlockMeta{
-			storage.BlockKey(id): {ID: id, StateRootHash: wrongState.Hash(0)},
+			storage.BlockKey(id): {ID: id, StateRootHash: stateRoot.Hash(0)},
 		},
 		blocks: map[string][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
@@ -2112,10 +2261,33 @@ func TestLoadStateRootUsesStateHashFromBlock(t *testing.T) {
 		t.Fatalf("load state root: %v", err)
 	}
 	if root != stateRoot {
-		t.Fatal("expected state root selected by block state update hash")
+		t.Fatal("expected state root selected by metadata hash")
 	}
-	if store.currentCalls != 0 || store.blockStateCalls != 0 || store.blockMetaCalls != 0 {
-		t.Fatalf("unexpected fallback calls: current=%d block_state=%d block_meta=%d", store.currentCalls, store.blockStateCalls, store.blockMetaCalls)
+	if store.currentCalls != 0 || store.blockStateCalls != 0 || store.blockMetaCalls != 1 || store.blockDataCalls != 0 {
+		t.Fatalf("unexpected calls: current=%d block_state=%d block_meta=%d block_data=%d", store.currentCalls, store.blockStateCalls, store.blockMetaCalls, store.blockDataCalls)
+	}
+}
+
+func TestLoadStateRootWithBlockRootRejectsMetaMismatch(t *testing.T) {
+	stateRoot := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 20, stateRoot)
+	wrongState := cell.BeginCell().MustStoreUInt(0xff, 8).EndCell()
+	store := &fakeStore{
+		metas: map[string]*storage.BlockMeta{
+			storage.BlockKey(id): {ID: id, StateRootHash: wrongState.Hash(0)},
+		},
+		blocks: map[string][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		stateRoots: map[string]*cell.Cell{
+			string(wrongState.Hash(0)): wrongState,
+		},
+	}
+	srv := testServer(store)
+
+	_, _, err := srv.loadStateRootWithBlockRoot(context.Background(), id)
+	if err == nil || !strings.Contains(err.Error(), "state root hash mismatch") {
+		t.Fatalf("load state root error = %v, want mismatch", err)
 	}
 }
 
@@ -2701,6 +2873,12 @@ func TestGetTransactionsTraversesPreviousChain(t *testing.T) {
 	if len(roots) != 2 || roots[0].HashKey() != newTx.HashKey() || roots[1].HashKey() != oldTx.HashKey() {
 		t.Fatalf("unexpected transaction roots order")
 	}
+	if store.accountLTLookupCalls != 1 {
+		t.Fatalf("account lt lookup calls = %d, want 1", store.accountLTLookupCalls)
+	}
+	if store.ltLookupCalls != 0 {
+		t.Fatalf("plain lt lookup calls = %d, want 0", store.ltLookupCalls)
+	}
 }
 
 func TestGetTransactionsMissingFirstReturnsError(t *testing.T) {
@@ -2943,7 +3121,7 @@ func TestListBlockTransactionsMode256ReturnsTransactionMetadata(t *testing.T) {
 func TestWaitMasterchainSeqnoPrefixRunsWrappedQueryAfterLiveState(t *testing.T) {
 	live := NewLiveStore(&fakeStore{})
 	current10, root10, data10 := testCurrentStateWithLiveBlock(t, 10)
-	if err := live.SetLiveBlock(current10.Masterchain.Block, root10, data10, true); err != nil {
+	if err := live.publishLiveBlockData(current10.Masterchain.Block, root10, data10, true); err != nil {
 		t.Fatalf("set live block 10: %v", err)
 	}
 	live.SetLiveCurrentState(current10)
@@ -2970,7 +3148,7 @@ func TestWaitMasterchainSeqnoPrefixRunsWrappedQueryAfterLiveState(t *testing.T) 
 	}
 
 	current11, root11, data11 := testCurrentStateWithLiveBlock(t, 11)
-	if err := live.SetLiveBlock(current11.Masterchain.Block, root11, data11, true); err != nil {
+	if err := live.publishLiveBlockData(current11.Masterchain.Block, root11, data11, true); err != nil {
 		t.Fatalf("set live block 11: %v", err)
 	}
 	live.SetLiveCurrentState(current11)
@@ -3028,7 +3206,7 @@ func TestWaitMasterchainSeqnoPrefixWaitsForReadableLiveCurrent(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	if err := live.SetLiveBlock(block, root, payload, true); err != nil {
+	if err := live.publishLiveBlockData(block, root, payload, true); err != nil {
 		t.Fatalf("set target live block: %v", err)
 	}
 
@@ -3049,7 +3227,7 @@ func TestWaitMasterchainSeqnoPrefixWaitsForReadableLiveCurrent(t *testing.T) {
 func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 	live := NewLiveStore(&fakeStore{})
 	current, root, data := testCurrentStateWithLiveBlock(t, 20)
-	if err := live.SetLiveBlock(current.Masterchain.Block, root, data, true); err != nil {
+	if err := live.publishLiveBlockData(current.Masterchain.Block, root, data, true); err != nil {
 		t.Fatalf("set live master block: %v", err)
 	}
 	live.SetLiveCurrentState(current)
@@ -4702,15 +4880,17 @@ type fakeStore struct {
 	zeroStates  map[string][]byte
 	ltLookup    map[fakeLTLookupKey]ton.BlockIDExt
 
-	seqLookup        ton.BlockIDExt
-	seqLookupCalls   int
-	ltLookupCalls    int
-	utimeLookupCalls int
-	currentCalls     int
-	blockStateCalls  int
-	blockMetaCalls   int
-	loadStateCalls   int
-	proofCalls       []storage.ServedProofKind
+	seqLookup            ton.BlockIDExt
+	blockDataCalls       int
+	seqLookupCalls       int
+	ltLookupCalls        int
+	accountLTLookupCalls int
+	utimeLookupCalls     int
+	currentCalls         int
+	blockStateCalls      int
+	blockMetaCalls       int
+	loadStateCalls       int
+	proofCalls           []storage.ServedProofKind
 }
 
 type blockingBlockDataStore struct {
@@ -4800,6 +4980,7 @@ func testImportFeesCell() (*cell.Cell, error) {
 }
 
 func (s *fakeStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
+	s.blockDataCalls++
 	data, ok := s.blocks[storage.BlockKey(block)]
 	if !ok {
 		return nil, storage.ErrNotFound
@@ -4956,8 +5137,12 @@ func (s *fakeStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, r
 
 func (s *fakeStore) BlockMeta(_ context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error) {
 	s.blockMetaCalls++
-	meta, ok := s.metas[storage.BlockKey(block)]
+	key := storage.BlockKey(block)
+	meta, ok := s.metas[key]
 	if !ok {
+		if state := s.blockStates[key]; state != nil {
+			return storage.BuildBlockMetaFromState(*state), nil
+		}
 		return nil, storage.ErrNotFound
 	}
 	return meta.Clone(), nil
@@ -4975,6 +5160,17 @@ func (s *fakeStore) LookupBlockByLT(_ context.Context, key storage.BlockHistoryK
 	s.ltLookupCalls++
 	if block, ok := s.ltLookup[fakeLTKey(key, lt)]; ok {
 		return *cloneBlockID(block), nil
+	}
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func (s *fakeStore) LookupBlockByAccountLT(_ context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
+	s.accountLTLookupCalls++
+	for _, shard := range storage.AccountShardCandidates(workchain, account) {
+		key := storage.BlockHistoryKey{Workchain: workchain, Shard: shard}
+		if block, ok := s.ltLookup[fakeLTKey(key, lt)]; ok {
+			return *cloneBlockID(block), nil
+		}
 	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }

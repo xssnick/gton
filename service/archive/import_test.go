@@ -130,13 +130,10 @@ func TestPrepareImportedBlockBuildsStateMetaAndPreparedCells(t *testing.T) {
 	if !bytes.Equal(prepared.State.StateRootHash, prepared.Meta.StateRootHash) {
 		t.Fatalf("state root hash mismatch: got=%x want=%x", prepared.State.StateRootHash, prepared.Meta.StateRootHash)
 	}
-	if got := len(prepared.State.StateCellHash); got != 32 {
-		t.Fatalf("state cell hash len = %d, want 32", got)
-	}
-	var stateCellHash cell.Hash
-	copy(stateCellHash[:], prepared.State.StateCellHash)
-	if len(prepared.StateUpdateToCells[stateCellHash]) == 0 {
-		t.Fatalf("prepared update_to cells do not contain state root %x", prepared.State.StateCellHash)
+	var stateRootHash cell.Hash
+	copy(stateRootHash[:], prepared.State.StateRootHash)
+	if len(prepared.StateUpdateToCells[stateRootHash]) == 0 {
+		t.Fatalf("prepared update_to cells do not contain state root %x", prepared.State.StateRootHash)
 	}
 }
 

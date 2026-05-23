@@ -5,11 +5,10 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type liveBlockPublisher interface {
-	SetLiveBlock(block ton.BlockIDExt, root *cell.Cell, data []byte, flushed bool) error
+	PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error
 	MarkLiveBlockFlushed(block ton.BlockIDExt)
 }
 
@@ -21,7 +20,7 @@ func (s *Service) configureLiveBlockPublisher(publisher CurrentStatePublisher) {
 	s.node.SetBlockCacheObserver(cache)
 }
 
-func (s *Service) publishLiveBlock(downloaded p2p.DownloadedBlock, flushed bool) {
+func (s *Service) publishLiveBlockArtifacts(downloaded p2p.DownloadedBlock, state *storage.BlockState, flushed bool) {
 	cache, ok := s.liveState.(liveBlockPublisher)
 	if !ok {
 		return
@@ -36,13 +35,41 @@ func (s *Service) publishLiveBlock(downloaded p2p.DownloadedBlock, flushed bool)
 		return
 	}
 
-	blockData := downloaded.BlockBOC
-	cacheFlushed := flushed
-	if !downloaded.VerifiedFileHash {
-		blockData = nil
-		cacheFlushed = false
+	var blockData []byte
+	cacheFlushed := false
+	if downloaded.VerifiedFileHash {
+		blockData = downloaded.BlockBOC
+		cacheFlushed = flushed
 	}
-	if err = cache.SetLiveBlock(downloaded.ID, root, blockData, cacheFlushed); err != nil {
+
+	var proofs []storage.LiveBlockProofArtifact
+	if len(downloaded.ProofBOC) > 0 {
+		isKeyBlock := false
+		if downloaded.Meta != nil {
+			isKeyBlock = downloaded.Meta.Has(storage.BlockMetaIsKeyBlock)
+		}
+		for _, kind := range storage.StoredProofKindsForBlock(appliedBlockProofIsLink(downloaded.ID), isKeyBlock) {
+			proofs = append(proofs, storage.LiveBlockProofArtifact{
+				Kind: kind,
+				Data: downloaded.ProofBOC,
+			})
+		}
+	}
+
+	var meta *storage.BlockMeta
+	if downloaded.Meta != nil {
+		meta = downloaded.Meta.Clone()
+	}
+	if err = cache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            downloaded.ID,
+		Root:             root,
+		BlockData:        blockData,
+		Meta:             meta,
+		State:            state,
+		Proofs:           proofs,
+		BlockDataFlushed: cacheFlushed,
+		ProofsFlushed:    cacheFlushed,
+	}); err != nil {
 		s.log.Debug().
 			Err(err).
 			Str("block", storage.FormatBlockRef(downloaded.ID)).

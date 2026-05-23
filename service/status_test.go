@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/service/p2p"
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -22,7 +23,6 @@ func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 	masterState := &tnstore.BlockState{
 		Block:         master,
 		StateRootHash: master.RootHash,
-		StateCellHash: master.RootHash,
 		Parsed:        &tlb.ShardStateUnsplit{GenUTime: 100},
 	}
 	baseState := &tnstore.BlockState{
@@ -80,13 +80,11 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	err = store.SaveStateCheckpoint(context.Background(), []*tnstore.BlockState{{
 		Block:         storedMaster,
 		StateRootHash: storedMaster.RootHash,
-		StateCellHash: storedMaster.RootHash,
 		Parsed:        &tlb.ShardStateUnsplit{GenUTime: 100},
 	}}, &tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
 			Block:         storedMaster,
 			StateRootHash: storedMaster.RootHash,
-			StateCellHash: storedMaster.RootHash,
 			Parsed:        &tlb.ShardStateUnsplit{GenUTime: 100},
 		},
 		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
@@ -174,6 +172,31 @@ func TestStatusSnapshotIncludesSplitBasechainShards(t *testing.T) {
 	}
 }
 
+func TestStatusSnapshotPrefersLocalShardClientBasechainLatest(t *testing.T) {
+	staleBase := testBlockID(0, topShard, 71)
+	localMaster := testBlockID(-1, topShard, 100)
+	localBase := testBlockID(0, topShard, 82)
+	snapshot := StatusSnapshot{
+		StatusSnapshot: p2p.StatusSnapshot{
+			LatestBasechain: &staleBase,
+		},
+	}
+	svc := &Service{}
+	svc.populateStatusLatestBasechain(context.Background(), &snapshot, &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{Block: localMaster},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{
+			{Workchain: 0, Shard: topShard}: {Block: localBase},
+		},
+	})
+
+	if snapshot.LatestBasechain == nil || !snapshot.LatestBasechain.Equals(&localBase) {
+		t.Fatalf("latest basechain = %+v, want local shard-client basechain %s", snapshot.LatestBasechain, tnstore.FormatBlockRef(localBase))
+	}
+	if len(snapshot.LatestBasechainShards) != 1 || !snapshot.LatestBasechainShards[0].Equals(&localBase) {
+		t.Fatalf("latest basechain shards = %+v, want %s", snapshot.LatestBasechainShards, tnstore.FormatBlockRef(localBase))
+	}
+}
+
 func TestObserveCurrentSyncStateReportsMasterchainAndShardClientSeqno(t *testing.T) {
 	observer := &fakeSyncObserver{}
 	svc := &Service{sync: observer}
@@ -199,6 +222,38 @@ func TestObserveCurrentSyncStateReportsMasterchainAndShardClientSeqno(t *testing
 	}
 	if got := observer.current.ShardClientSeqno; got != 90 {
 		t.Fatalf("shard client seqno = %v, want 90", got)
+	}
+}
+
+func TestCurrentBasechainLagSecondsUsesLocalShardUTime(t *testing.T) {
+	baseFresh := testBlockID(0, topShard, 10)
+	baseStale := testBlockID(0, topShard>>1, 11)
+	master := testBlockID(-1, topShard, 20)
+
+	lag, shards, ok := currentBasechainLagSeconds(time.Unix(1000, 0), &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{
+			Block:  master,
+			Parsed: &tlb.ShardStateUnsplit{GenUTime: 999},
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{
+			{Workchain: 0, Shard: topShard}: {
+				Block:  baseFresh,
+				Parsed: &tlb.ShardStateUnsplit{GenUTime: 990},
+			},
+			{Workchain: 0, Shard: topShard >> 1}: {
+				Block:  baseStale,
+				Parsed: &tlb.ShardStateUnsplit{GenUTime: 970},
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("expected basechain lag")
+	}
+	if shards != 2 {
+		t.Fatalf("basechain shards = %d, want 2", shards)
+	}
+	if lag != 30 {
+		t.Fatalf("basechain lag = %d, want 30", lag)
 	}
 }
 

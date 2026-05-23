@@ -299,25 +299,8 @@ func (w *shardClientArchiveWindow) releaseImportedData() {
 	w.masterProofs = nil
 	w.archiveBlocks = nil
 	w.archiveImports = nil
+	w.stateCells = nil
 	w.appliedStates = appliedStateSet{}
-}
-
-func (r *archiveCatchUpRunner) rememberImportedArchiveData(window *shardClientArchiveWindow, imported *archiveImportResult) error {
-	if window == nil || imported == nil {
-		return nil
-	}
-
-	if r.stateCells == nil {
-		return nil
-	}
-
-	for _, block := range imported.blocks {
-		if block.StateUpdateToCells == nil {
-			return fmt.Errorf("archive block %s state update cells are not prepared", storage.FormatBlockRef(block.ID))
-		}
-		r.stateCells.rememberPreparedCells(block.StateUpdateToCells)
-	}
-	return nil
 }
 
 func (r *archiveCatchUpRunner) storeArchiveWindow(window *shardClientArchiveWindow) error {

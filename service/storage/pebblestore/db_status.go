@@ -3,6 +3,7 @@ package pebblestore
 import (
 	"context"
 	"sort"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/gton/service/storage"
@@ -53,6 +54,10 @@ type CellDBShardStatus struct {
 	TableIters               int64
 	Flushes                  int64
 	Ingests                  uint64
+	ReadCells                uint64
+	WrittenCells             uint64
+	ReadCellsPerSecond       float64
+	WrittenCellsPerSecond    float64
 }
 
 func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
@@ -62,6 +67,7 @@ func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
 	default:
 	}
 
+	now := time.Now()
 	generations := s.openCellGenerationStatusTargets()
 	status := DBStatus{
 		CellGenerations: make([]CellDBGenerationStatus, 0, len(generations)),
@@ -78,7 +84,7 @@ func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
 		if err != nil {
 			return DBStatus{}, err
 		}
-		status.CellGenerations = append(status.CellGenerations, cellGenerationDBStatus(cells, generation.role, generation.origin))
+		status.CellGenerations = append(status.CellGenerations, cellGenerationDBStatus(cells, generation.role, generation.origin, now))
 		cells.release()
 	}
 	return status, nil
@@ -153,7 +159,7 @@ func (s *Store) openCellGenerationStatusTargets() []cellGenerationStatusTarget {
 	return targets
 }
 
-func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt) CellDBGenerationStatus {
+func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt, now time.Time) CellDBGenerationStatus {
 	status := CellDBGenerationStatus{
 		ID:     cells.generation,
 		Role:   role,
@@ -161,6 +167,7 @@ func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt
 		Shards: make([]CellDBShardStatus, 0, cellDBShardCount),
 	}
 
+	ioStatus := cells.ioStatus(now)
 	cacheLoaded := false
 	for shardIdx, shard := range cells.shards {
 		if shard == nil || shard.db == nil {
@@ -174,6 +181,10 @@ func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt
 		}
 
 		shardStatus := pebbleDBShardStatus(shardIdx, metrics)
+		shardStatus.ReadCells = ioStatus[shardIdx].readCells
+		shardStatus.WrittenCells = ioStatus[shardIdx].writtenCells
+		shardStatus.ReadCellsPerSecond = ioStatus[shardIdx].readCellsPerSecond
+		shardStatus.WrittenCellsPerSecond = ioStatus[shardIdx].writtenCellsPerSecond
 		status.Shards = append(status.Shards, shardStatus)
 		status.Total.add(shardStatus)
 	}
@@ -293,4 +304,8 @@ func (s *CellDBShardStatus) add(shard CellDBShardStatus) {
 	s.TableIters += shard.TableIters
 	s.Flushes += shard.Flushes
 	s.Ingests += shard.Ingests
+	s.ReadCells += shard.ReadCells
+	s.WrittenCells += shard.WrittenCells
+	s.ReadCellsPerSecond += shard.ReadCellsPerSecond
+	s.WrittenCellsPerSecond += shard.WrittenCellsPerSecond
 }

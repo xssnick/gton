@@ -12,19 +12,18 @@ func TestNextServiceMaintenanceTaskPriority(t *testing.T) {
 		want             serviceMaintenanceTask
 	}{
 		{
-			name:             "persistent state gc before archive gc migration and serialization",
+			name:             "migration before gc and serialization",
 			persistentGC:     true,
 			archiveGC:        true,
 			migrationPending: true,
 			serialization:    true,
-			want:             serviceMaintenanceTaskPersistentStateGC,
+			want:             serviceMaintenanceTaskCellGenerationMigration,
 		},
 		{
-			name:             "archive gc before migration and serialization",
-			archiveGC:        true,
-			migrationPending: true,
-			serialization:    true,
-			want:             serviceMaintenanceTaskArchiveTTLGC,
+			name:          "archive gc before serialization",
+			archiveGC:     true,
+			serialization: true,
+			want:          serviceMaintenanceTaskArchiveTTLGC,
 		},
 		{
 			name:             "migration before serialization",

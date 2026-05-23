@@ -34,7 +34,7 @@ type StateStorage interface {
 	VerifiedKeyBlockProgress(ctx context.Context) (ton.BlockIDExt, error)
 	SaveBlockState(ctx context.Context, state *BlockState) error
 	SaveStateCheckpoint(ctx context.Context, blocks []*BlockState, current *CurrentState) error
-	SaveStateCheckpointWithCells(ctx context.Context, blocks []*BlockState, current *CurrentState, cells []EncodedCellRecord) error
+	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, current *CurrentState) error
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
 }
 
@@ -63,7 +63,6 @@ func CloneBlockState(state *BlockState) *BlockState {
 	return &BlockState{
 		Block:          state.Block,
 		StateRootHash:  bytes.Clone(state.StateRootHash),
-		StateCellHash:  bytes.Clone(state.StateCellHash),
 		StateFileHash:  bytes.Clone(state.StateFileHash),
 		MasterchainRef: cloneBlockIDPtr(state.MasterchainRef),
 		CellGeneration: state.CellGeneration,
@@ -80,7 +79,6 @@ func BlockStateWithoutCells(state *BlockState) BlockState {
 	return BlockState{
 		Block:          state.Block,
 		StateRootHash:  bytes.Clone(state.StateRootHash),
-		StateCellHash:  bytes.Clone(state.StateCellHash),
 		StateFileHash:  bytes.Clone(state.StateFileHash),
 		MasterchainRef: cloneBlockIDPtr(state.MasterchainRef),
 		CellGeneration: state.CellGeneration,

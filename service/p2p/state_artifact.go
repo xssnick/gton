@@ -374,7 +374,7 @@ type stagedStateHashKind uint8
 
 const (
 	stagedStateRootHash stagedStateHashKind = iota
-	stagedStateCellHash
+	stagedStateConcreteHash
 )
 
 func (n *Node) decodeAndImportStagedStateCellTree(ctx context.Context, block ton.BlockIDExt, staged *stagedStateFile, wantRootHash []byte) (*cell.Cell, error) {
@@ -397,6 +397,9 @@ func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBloc
 	rootMeta, err := singleStateBOCViewRootMeta(view)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse staged state boc: %w", errStateSnapshotInvalid, err)
+	}
+	if hashKind == stagedStateRootHash && rootMeta.Hash != rootMeta.HashAtLevel(0) {
+		return nil, fmt.Errorf("%w: staged state root is not level-0 for %s", errStateSnapshotInvalid, formatBlockRef(logBlock))
 	}
 	if len(wantRootHash) > 0 {
 		rootHash := stagedStateMetaHash(rootMeta, hashKind)
@@ -436,7 +439,7 @@ func (n *Node) decodeAndImportSplitPartStagedStateCellTree(ctx context.Context, 
 		return nil, fmt.Errorf("%w: parse staged state boc: %w", errStateSnapshotInvalid, err)
 	}
 	if len(wantRootHash) > 0 {
-		rootHash := stagedStateMetaHash(rootMeta, stagedStateCellHash)
+		rootHash := stagedStateMetaHash(rootMeta, stagedStateConcreteHash)
 		if !bytes.Equal(rootHash[:], wantRootHash) {
 			return nil, fmt.Errorf("%w: staged state root hash mismatch: got=%s want=%s", errStateSnapshotInvalid, hex.EncodeToString(rootHash[:]), hex.EncodeToString(wantRootHash))
 		}
@@ -459,7 +462,7 @@ func (n *Node) decodeAndImportSplitPartStagedStateCellTree(ctx context.Context, 
 }
 
 func stagedStateMetaHash(meta cell.BOCCellMeta, kind stagedStateHashKind) cell.Hash {
-	if kind == stagedStateCellHash {
+	if kind == stagedStateConcreteHash {
 		return meta.Hash
 	}
 	return meta.HashAtLevel(0)
@@ -668,6 +671,9 @@ func (a *persistentStateSnapshotArtifact) decodeAndImportBOCView(ctx context.Con
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
 	rootHash := rootMeta.HashAtLevel(0)
+	if rootMeta.Hash != rootHash {
+		return nil, fmt.Errorf("%w: state snapshot root is not level-0 for %s", errStateSnapshotInvalid, formatBlockRef(a.block))
+	}
 	if len(a.stateRootHash) > 0 && !bytes.Equal(rootHash[:], a.stateRootHash) {
 		a.node.log.Debug().
 			Str("peer", a.staged.peerAddr).
@@ -682,7 +688,6 @@ func (a *persistentStateSnapshotArtifact) decodeAndImportBOCView(ctx context.Con
 	state := &storage.BlockState{
 		Block:         a.block,
 		StateRootHash: bytes.Clone(rootHash[:]),
-		StateCellHash: bytes.Clone(rootMeta.Hash[:]),
 		StateFileHash: a.staged.fileHash,
 	}
 

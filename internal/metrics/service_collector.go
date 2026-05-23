@@ -35,6 +35,8 @@ type serviceCollector struct {
 	p2pQueueMaxBytes    *prometheus.Desc
 	p2pQueuePushed      *prometheus.Desc
 	p2pQueueDropped     *prometheus.Desc
+	p2pRebroadcastSent  *prometheus.Desc
+	p2pRebroadcastDrop  *prometheus.Desc
 
 	blocksyncQueueItems    *prometheus.Desc
 	blocksyncQueueCapacity *prometheus.Desc
@@ -42,125 +44,137 @@ type serviceCollector struct {
 	blocksyncChains        *prometheus.Desc
 }
 
-func newServiceCollector(metrics *Metrics) prometheus.Collector {
+func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collector {
 	return &serviceCollector{
 		metrics: metrics,
 		syncLagSeconds: prometheus.NewDesc(
-			"flexserver_sync_lag_seconds",
+			prometheus.BuildFQName(namespace, "sync", "lag_seconds"),
 			"Local chain lag in seconds by chain and shard, computed at scrape time.",
 			[]string{"chain", "shard"},
 			nil,
 		),
 		syncBlockUTimeSeconds: prometheus.NewDesc(
-			"flexserver_sync_block_utime_seconds",
+			prometheus.BuildFQName(namespace, "sync", "block_utime_seconds"),
 			"Unix timestamp of the local block generation time by chain and shard.",
 			[]string{"chain", "shard"},
 			nil,
 		),
 		syncLocalSeqno: prometheus.NewDesc(
-			"flexserver_sync_local_seqno",
+			prometheus.BuildFQName(namespace, "sync", "local_seqno"),
 			"Local synchronized block seqno by chain and shard.",
 			[]string{"chain", "shard"},
 			nil,
 		),
 		syncNetworkSeqno: prometheus.NewDesc(
-			"flexserver_sync_network_seqno",
+			prometheus.BuildFQName(namespace, "sync", "network_seqno"),
 			"Latest observed network block seqno by chain and shard.",
 			[]string{"chain", "shard"},
 			nil,
 		),
 		syncGapBlocks: prometheus.NewDesc(
-			"flexserver_sync_gap_blocks",
+			prometheus.BuildFQName(namespace, "sync", "gap_blocks"),
 			"Block gap between latest observed network block and local synchronized block.",
 			[]string{"chain", "shard"},
 			nil,
 		),
 		syncRecentTPS: prometheus.NewDesc(
-			"flexserver_sync_recent_tps",
+			prometheus.BuildFQName(namespace, "sync", "recent_tps"),
 			"Recent local TPS over the service status window.",
 			nil,
 			nil,
 		),
 		syncRecentTx: prometheus.NewDesc(
-			"flexserver_sync_recent_transactions",
+			prometheus.BuildFQName(namespace, "sync", "recent_transactions"),
 			"Recent local transaction count over the service status window.",
 			nil,
 			nil,
 		),
 		syncRecentComplete: prometheus.NewDesc(
-			"flexserver_sync_recent_tps_complete",
+			prometheus.BuildFQName(namespace, "sync", "recent_tps_complete"),
 			"Whether the recent TPS status window was fully available.",
 			nil,
 			nil,
 		),
 		p2pOverlayPeers: prometheus.NewDesc(
-			"flexserver_p2p_overlay_peers",
+			prometheus.BuildFQName(namespace, "p2p", "overlay_peers"),
 			"Known overlay peers by overlay and liveness.",
 			[]string{"overlay", "state"},
 			nil,
 		),
 		p2pOverlayNeighbors: prometheus.NewDesc(
-			"flexserver_p2p_overlay_neighbours",
+			prometheus.BuildFQName(namespace, "p2p", "overlay_neighbours"),
 			"Active overlay neighbours by overlay and liveness.",
 			[]string{"overlay", "state"},
 			nil,
 		),
 		p2pQueueItems: prometheus.NewDesc(
-			"flexserver_p2p_queue_items",
+			prometheus.BuildFQName(namespace, "p2p", "queue_items"),
 			"Current P2P queue length.",
 			[]string{"queue"},
 			nil,
 		),
 		p2pQueueBytes: prometheus.NewDesc(
-			"flexserver_p2p_queue_bytes",
+			prometheus.BuildFQName(namespace, "p2p", "queue_bytes"),
 			"Current P2P queue estimated bytes.",
 			[]string{"queue"},
 			nil,
 		),
 		p2pQueueMaxItems: prometheus.NewDesc(
-			"flexserver_p2p_queue_max_items",
+			prometheus.BuildFQName(namespace, "p2p", "queue_max_items"),
 			"Configured P2P queue item limit.",
 			[]string{"queue"},
 			nil,
 		),
 		p2pQueueMaxBytes: prometheus.NewDesc(
-			"flexserver_p2p_queue_max_bytes",
+			prometheus.BuildFQName(namespace, "p2p", "queue_max_bytes"),
 			"Configured P2P queue byte limit.",
 			[]string{"queue"},
 			nil,
 		),
 		p2pQueuePushed: prometheus.NewDesc(
-			"flexserver_p2p_queue_pushed_total",
+			prometheus.BuildFQName(namespace, "p2p", "queue_pushed_total"),
 			"Total accepted P2P queue pushes.",
 			[]string{"queue"},
 			nil,
 		),
 		p2pQueueDropped: prometheus.NewDesc(
-			"flexserver_p2p_queue_dropped_total",
+			prometheus.BuildFQName(namespace, "p2p", "queue_dropped_total"),
 			"Total dropped P2P queue pushes.",
 			[]string{"queue"},
 			nil,
 		),
+		p2pRebroadcastSent: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "rebroadcast_sent_total"),
+			"Total successful P2P rebroadcast sends.",
+			[]string{"queue"},
+			nil,
+		),
+		p2pRebroadcastDrop: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "rebroadcast_dropped_total"),
+			"Total P2P rebroadcast messages dropped before a successful send.",
+			[]string{"queue"},
+			nil,
+		),
 		blocksyncQueueItems: prometheus.NewDesc(
-			"flexserver_blocksync_queue_items",
+			prometheus.BuildFQName(namespace, "blocksync", "queue_items"),
 			"Current block sync queue length.",
 			[]string{"queue"},
 			nil,
 		),
 		blocksyncQueueCapacity: prometheus.NewDesc(
-			"flexserver_blocksync_queue_capacity",
+			prometheus.BuildFQName(namespace, "blocksync", "queue_capacity"),
 			"Block sync queue capacity.",
 			[]string{"queue"},
 			nil,
 		),
 		blocksyncQueueDropped: prometheus.NewDesc(
-			"flexserver_blocksync_queue_dropped_total",
+			prometheus.BuildFQName(namespace, "blocksync", "queue_dropped_total"),
 			"Total dropped block sync queue items.",
 			[]string{"queue"},
 			nil,
 		),
 		blocksyncChains: prometheus.NewDesc(
-			"flexserver_blocksync_chains",
+			prometheus.BuildFQName(namespace, "blocksync", "chains"),
 			"Block sync chain count by state.",
 			[]string{"state"},
 			nil,
@@ -185,6 +199,8 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pQueueMaxBytes
 	ch <- c.p2pQueuePushed
 	ch <- c.p2pQueueDropped
+	ch <- c.p2pRebroadcastSent
+	ch <- c.p2pRebroadcastDrop
 	ch <- c.blocksyncQueueItems
 	ch <- c.blocksyncQueueCapacity
 	ch <- c.blocksyncQueueDropped
@@ -265,6 +281,11 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 		ch <- prometheus.MustNewConstMetric(c.p2pQueueMaxBytes, prometheus.GaugeValue, float64(queue.MaxBytes), queue.Name)
 		ch <- prometheus.MustNewConstMetric(c.p2pQueuePushed, prometheus.CounterValue, float64(queue.Pushed), queue.Name)
 		ch <- prometheus.MustNewConstMetric(c.p2pQueueDropped, prometheus.CounterValue, float64(queue.Dropped), queue.Name)
+	}
+
+	for _, rebroadcast := range snapshot.Rebroadcast {
+		ch <- prometheus.MustNewConstMetric(c.p2pRebroadcastSent, prometheus.CounterValue, float64(rebroadcast.Sent), rebroadcast.Queue)
+		ch <- prometheus.MustNewConstMetric(c.p2pRebroadcastDrop, prometheus.CounterValue, float64(rebroadcast.Dropped), rebroadcast.Queue)
 	}
 }
 

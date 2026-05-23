@@ -371,8 +371,9 @@ func (s *Store) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {
 func (s *Store) setNextBlockLink(batch *pebble.Batch, prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	key := hotKeyNextBlock(prev)
 	value := encodeBlockID(next)
-	current, err := pebbleReaderGetCopy(s.hot, key)
+	current, closer, err := pebbleReaderGet(s.hot, key)
 	if err == nil {
+		defer func() { _ = closer.Close() }()
 		if bytes.Equal(current, value) {
 			return nil
 		}
@@ -551,13 +552,14 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 
 func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.BlockIDExt) error {
 	key := hotKeyBlockMeta(block)
-	raw, err := pebbleReaderGetCopy(s.hot, key)
+	raw, closer, err := pebbleReaderGet(s.hot, key)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	defer func() { _ = closer.Close() }()
 
 	meta, err := decodeBlockMeta(block, raw)
 	if err != nil {

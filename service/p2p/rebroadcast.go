@@ -3,7 +3,7 @@ package p2p
 import (
 	"context"
 	"crypto/ed25519"
-	"encoding/hex"
+	"math/rand/v2"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -39,32 +39,6 @@ const (
 type rebroadcastPlan struct {
 	mode  rebroadcastMode
 	flags int32
-}
-
-type rebroadcastTarget struct {
-	peer overlay.BroadcastPeer
-	id   string
-	addr string
-}
-
-func (s *overlaySubscription) rebroadcastTargets() []rebroadcastTarget {
-	peers := s.rebroadcastCandidates()
-	fanout := rebroadcastFanout
-	if s.node.rebroadcastQuiet.Load() {
-		fanout = quietRebroadcastFanout
-	}
-	if len(peers) > fanout {
-		peers = peers[:fanout]
-	}
-	res := make([]rebroadcastTarget, 0, len(peers))
-	for _, peer := range peers {
-		res = append(res, rebroadcastTarget{
-			peer: peer.overlay,
-			id:   peer.id,
-			addr: peer.addr,
-		})
-	}
-	return res
 }
 
 func (n *Node) SetRebroadcastQuiet(quiet bool) {
@@ -140,145 +114,343 @@ func calcFECRebroadcastParts(payloadLen int, symbolSize uint32) uint32 {
 	return uint32(payloadLen/int(symbolSize)+1) * 2
 }
 
-func (n *Node) runRebroadcastLoop(ctx context.Context) {
-	for {
-		req, ok := popPriority(ctx, n.localRebroadcastQueue, n.rebroadcastQueue)
-		if !ok {
-			return
-		}
+func (p *overlayPeer) initRebroadcastQueues() bool {
+	if p == nil {
+		return false
+	}
 
-		req.subscription.rebroadcast(ctx, req)
+	p.rebroadcastMx.Lock()
+	defer p.rebroadcastMx.Unlock()
+
+	if p.rebroadcastClosed {
+		return false
+	}
+	if p.localRebroadcastQueue == nil {
+		p.localRebroadcastQueue = newBoundedQueue(peerRebroadcastQueueItems, peerRebroadcastQueueBytes, rebroadcastRequestBytes)
+	}
+	if p.rebroadcastQueue == nil {
+		p.rebroadcastQueue = newBoundedQueue(peerRebroadcastQueueItems, peerRebroadcastQueueBytes, rebroadcastRequestBytes)
+	}
+	return true
+}
+
+func (p *overlayPeer) closeRebroadcastQueues() {
+	if p == nil {
+		return
+	}
+
+	p.rebroadcastMx.Lock()
+	local := p.localRebroadcastQueue
+	regular := p.rebroadcastQueue
+	p.rebroadcastClosed = true
+	p.rebroadcastMx.Unlock()
+
+	if local != nil {
+		local.Close()
+	}
+	if regular != nil {
+		regular.Close()
 	}
 }
 
-func (s *overlaySubscription) rebroadcast(ctx context.Context, req rebroadcastRequest) {
-	if len(req.payload) == 0 {
+func (p *overlayPeer) pushRebroadcast(req rebroadcastRequest) bool {
+	if !p.initRebroadcastQueues() {
+		return false
+	}
+
+	p.rebroadcastMx.Lock()
+	local := p.localRebroadcastQueue
+	regular := p.rebroadcastQueue
+	p.rebroadcastMx.Unlock()
+
+	if req.local {
+		return local.Push(req)
+	}
+	return regular.Push(req)
+}
+
+func (p *overlayPeer) rebroadcastQueueSnapshots() (QueueStatusSnapshot, QueueStatusSnapshot, bool) {
+	if p == nil {
+		return QueueStatusSnapshot{}, QueueStatusSnapshot{}, false
+	}
+
+	p.rebroadcastMx.Lock()
+	local := p.localRebroadcastQueue
+	regular := p.rebroadcastQueue
+	p.rebroadcastMx.Unlock()
+
+	if local == nil && regular == nil {
+		return QueueStatusSnapshot{}, QueueStatusSnapshot{}, false
+	}
+
+	var localSnapshot QueueStatusSnapshot
+	if local != nil {
+		localSnapshot = local.StatusSnapshot("local_rebroadcast")
+	}
+
+	var regularSnapshot QueueStatusSnapshot
+	if regular != nil {
+		regularSnapshot = regular.StatusSnapshot("rebroadcast")
+	}
+
+	return localSnapshot, regularSnapshot, true
+}
+
+func (req rebroadcastRequest) queueName() string {
+	if req.local {
+		return "local_rebroadcast"
+	}
+	return "rebroadcast"
+}
+
+func (n *Node) closePeerRebroadcastQueues() {
+	for _, sub := range n.subscriptionsSnapshot() {
+		for _, peer := range sub.peersSnapshot() {
+			peer.closeRebroadcastQueues()
+		}
+	}
+}
+
+func (n *Node) noteRebroadcastSent(req rebroadcastRequest) {
+	if req.local {
+		n.localRebroadcastSent.Add(1)
 		return
 	}
-	if len(req.payload) > maxOverlayPayloadSize {
+	n.peerRebroadcastSent.Add(1)
+}
+
+func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
+	if req.local {
+		n.localRebroadcastDropped.Add(1)
+		return
+	}
+	n.peerRebroadcastDropped.Add(1)
+}
+
+func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
+	if s == nil || s.node == nil || s.node.runCtx == nil || peer == nil {
+		return
+	}
+	if !peer.initRebroadcastQueues() {
+		return
+	}
+
+	s.node.runAsync(func() {
+		s.runPeerRebroadcastLoop(s.node.runCtx, peer)
+	})
+}
+
+func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *overlayPeer) {
+	for {
+		peer.rebroadcastMx.Lock()
+		local := peer.localRebroadcastQueue
+		regular := peer.rebroadcastQueue
+		peer.rebroadcastMx.Unlock()
+		if local == nil || regular == nil {
+			return
+		}
+
+		req, ok := popPriority(ctx, local, regular)
+		if !ok {
+			return
+		}
+		if req.sourcePeerID != "" && req.sourcePeerID == peer.id {
+			continue
+		}
+
+		if s.rebroadcastToPeer(ctx, peer, req) {
+			s.node.noteRebroadcastSent(req)
+		} else {
+			s.node.noteRebroadcastDropped(req)
+		}
+	}
+}
+
+func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
+	if s == nil || s.node == nil {
+		return false
+	}
+	if len(req.payload) == 0 || len(req.payload) > maxOverlayPayloadSize {
+		s.node.noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
+			Str("queue", req.queueName()).
 			Int("size", len(req.payload)).
-			Msg("skipping rebroadcast because payload is too large")
-		return
+			Msg("dropping rebroadcast request because payload size is invalid")
+		return false
+	}
+
+	candidates := s.rebroadcastCandidatesForRequest(req)
+	fanout := s.rebroadcastFanoutForRequest(req)
+	attempts := 1
+	shuffle := req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast"
+	if req.local {
+		attempts = localRebroadcastAttempts
+		shuffle = true
+	}
+
+	queued := 0
+	tried := make(map[string]struct{}, fanout*attempts)
+	for attempt := 0; attempt < attempts && queued == 0; attempt++ {
+		targets := selectRebroadcastQueueTargets(candidates, tried, fanout, shuffle)
+		if len(targets) == 0 {
+			break
+		}
+
+		for _, peer := range targets {
+			tried[peer.id] = struct{}{}
+			if peer.pushRebroadcast(req) {
+				queued++
+				if req.local {
+					return true
+				}
+			}
+		}
+	}
+
+	if queued > 0 {
+		return true
+	}
+
+	s.node.noteRebroadcastDropped(req)
+	s.log.Debug().
+		Str("kind", req.kind).
+		Str("queue", req.queueName()).
+		Int("candidates", len(candidates)).
+		Int("attempts", attempts).
+		Msg("dropping rebroadcast request because peer queues are full")
+	return false
+}
+
+func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastRequest) []*overlayPeer {
+	candidates := s.rebroadcastCandidates()
+	if req.sourcePeerID == "" {
+		return candidates
+	}
+
+	filtered := candidates[:0]
+	for _, peer := range candidates {
+		if peer.id == req.sourcePeerID {
+			continue
+		}
+		filtered = append(filtered, peer)
+	}
+	return filtered
+}
+
+func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
+	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
+		return externalRebroadcastFanout
+	}
+	if s.node != nil && s.node.rebroadcastQuiet.Load() {
+		return quietRebroadcastFanout
+	}
+	return rebroadcastFanout
+}
+
+func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[string]struct{}, limit int, shuffle bool) []*overlayPeer {
+	if limit <= 0 || len(candidates) == 0 {
+		return nil
+	}
+
+	pool := make([]*overlayPeer, 0, len(candidates))
+	for _, peer := range candidates {
+		if peer == nil || peer.id == "" {
+			continue
+		}
+		if _, ok := tried[peer.id]; ok {
+			continue
+		}
+		pool = append(pool, peer)
+	}
+	if len(pool) == 0 {
+		return nil
+	}
+	if shuffle {
+		rand.Shuffle(len(pool), func(i, j int) {
+			pool[i], pool[j] = pool[j], pool[i]
+		})
+	}
+	if len(pool) > limit {
+		pool = pool[:limit]
+	}
+	return pool
+}
+
+func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) bool {
+	if peer == nil || peer.overlay == nil || len(req.payload) == 0 || len(req.payload) > maxOverlayPayloadSize {
+		return false
 	}
 
 	plan := planRebroadcast(req.kind, len(req.payload))
 	switch plan.mode {
 	case rebroadcastModeSimple:
-		s.rebroadcastSimple(ctx, req, plan)
+		return s.rebroadcastSimpleToPeer(ctx, peer, req, plan)
 	case rebroadcastModeFEC:
-		s.rebroadcastFEC(ctx, req, plan)
+		return s.rebroadcastFECToPeer(ctx, peer, req, plan)
 	default:
 		s.log.Debug().Str("kind", req.kind).Msg("skipping rebroadcast because the delivery mode is unknown")
+		return false
 	}
 }
 
-func (s *overlaySubscription) rebroadcastSimple(ctx context.Context, req rebroadcastRequest, plan rebroadcastPlan) {
-	targets := s.rebroadcastTargets()
-	if len(targets) == 0 {
-		s.log.Debug().
-			Str("kind", req.kind).
-			Str("delivery", string(DeliverySimple)).
-			Msg("skipping rebroadcast because there are no target peers")
-		return
-	}
-
-	targetList := formatRebroadcastTargets(targets)
-	s.log.Debug().
-		Str("kind", req.kind).
-		Str("delivery", string(DeliverySimple)).
-		Int("size", len(req.payload)).
-		Int32("flags", plan.flags).
-		Strs("targets", targetList).
-		Msg("rebroadcasting ordinary-node message")
-
-	sentTo, failedTo := rebroadcastSimpleToPeers(ctx, s.log, func(payload []byte, flags int32) (overlay.Broadcast, error) {
-		return s.node.buildSimpleBroadcast(payload, flags)
-	}, rebroadcastTargetPeers(targets), req, plan)
-
-	s.log.Debug().
-		Str("kind", req.kind).
-		Str("delivery", string(DeliverySimple)).
-		Int("size", len(req.payload)).
-		Strs("targets", targetList).
-		Int("sent_to", sentTo).
-		Int("failed_to", failedTo).
-		Msg("rebroadcasted ordinary-node message")
-}
-
-func (s *overlaySubscription) rebroadcastFEC(ctx context.Context, req rebroadcastRequest, plan rebroadcastPlan) {
-	// TODO: Match cppnode's legacy overlay FEC relay more closely by forwarding
-	// validated inbound FEC parts before full payload decode. Today we only start
-	// rebroadcast after the broadcast payload is decoded by tonutils-go, because
-	// the public Go overlay API does not yet expose an inbound-part relay hook.
-	targets := s.rebroadcastTargets()
-	if len(targets) == 0 {
-		s.log.Debug().
-			Str("kind", req.kind).
-			Str("delivery", string(DeliveryFEC)).
-			Msg("skipping rebroadcast because there are no target peers")
-		return
-	}
-
-	targetList := formatRebroadcastTargets(targets)
-	totalParts := calcFECRebroadcastParts(len(req.payload), rebroadcastFECSymbolSize)
-	s.log.Debug().
-		Str("kind", req.kind).
-		Str("delivery", string(DeliveryFEC)).
-		Int("size", len(req.payload)).
-		Int32("flags", plan.flags).
-		Uint32("parts", totalParts).
-		Strs("targets", targetList).
-		Msg("rebroadcasting ordinary-node message")
-
-	sentParts, batches, failedBatches := rebroadcastFECToPeers(ctx, s.log, s.node.privKey, rebroadcastTargetPeers(targets), req, plan)
-
-	s.log.Debug().
-		Str("kind", req.kind).
-		Str("delivery", string(DeliveryFEC)).
-		Int("size", len(req.payload)).
-		Uint32("parts", totalParts).
-		Uint32("parts_sent", sentParts).
-		Int("batches", batches).
-		Int("failed_batches", failedBatches).
-		Strs("targets", targetList).
-		Msg("rebroadcasted ordinary-node message")
-}
-
-func rebroadcastSimpleToPeers(ctx context.Context, log zerolog.Logger, buildSimple func([]byte, int32) (overlay.Broadcast, error), peers []overlay.BroadcastPeer, req rebroadcastRequest, plan rebroadcastPlan) (int, int) {
-	if len(peers) == 0 {
-		return 0, 0
-	}
-
-	msg, err := buildSimple(req.payload, plan.flags)
+func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
+	msg, err := s.node.buildSimpleBroadcast(req.payload, plan.flags)
 	if err != nil {
-		log.Debug().Err(err).Str("kind", req.kind).Msg("failed to build rebroadcast envelope")
-		return 0, len(peers)
+		s.log.Debug().Err(err).Str("kind", req.kind).Msg("failed to build rebroadcast envelope")
+		return false
 	}
 
-	sentTo := 0
-	failedTo := 0
-	for _, peer := range peers {
-		sendCtx, cancel := context.WithTimeout(ctx, peerQueryTimeout)
-		err := peer.SendCustomMessage(sendCtx, msg)
-		cancel()
-		if err != nil {
-			failedTo++
-			log.Debug().
-				Err(err).
-				Str("kind", req.kind).
-				Str("peer", peerIDHex(peer.ID())).
-				Str("delivery", string(DeliverySimple)).
-				Msg("failed to rebroadcast ordinary-node message")
-			continue
-		}
-		sentTo++
+	sendCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
+	err = peer.overlay.SendCustomMessage(sendCtx, msg)
+	cancel()
+	if err != nil {
+		s.handlePeerQueryFailure(peer, err)
+		s.log.Debug().
+			Err(err).
+			Str("kind", req.kind).
+			Str("peer", peer.addr).
+			Str("delivery", string(DeliverySimple)).
+			Msg("failed to rebroadcast ordinary-node message")
+		return false
 	}
-	return sentTo, failedTo
+
+	return true
+}
+
+func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
+	totalParts := calcFECRebroadcastParts(len(req.payload), rebroadcastFECSymbolSize)
+	sentParts, _, failedBatches := rebroadcastFECToPeersWithTimeout(
+		ctx,
+		s.log,
+		s.node.privKey,
+		[]overlay.BroadcastPeer{peer.overlay},
+		req,
+		plan,
+		peerRebroadcastTimeout,
+	)
+	if sentParts < totalParts || failedBatches > 0 {
+		if sentParts == 0 {
+			s.markPeerQueryFailed(peer)
+		}
+		s.log.Debug().
+			Str("kind", req.kind).
+			Str("peer", peer.addr).
+			Str("delivery", string(DeliveryFEC)).
+			Uint32("parts", totalParts).
+			Uint32("parts_sent", sentParts).
+			Int("failed_batches", failedBatches).
+			Msg("failed to rebroadcast ordinary-node message completely")
+		return false
+	}
+	return true
 }
 
 func rebroadcastFECToPeers(ctx context.Context, log zerolog.Logger, key ed25519.PrivateKey, peers []overlay.BroadcastPeer, req rebroadcastRequest, plan rebroadcastPlan) (uint32, int, int) {
+	return rebroadcastFECToPeersWithTimeout(ctx, log, key, peers, req, plan, peerQueryTimeout)
+}
+
+func rebroadcastFECToPeersWithTimeout(ctx context.Context, log zerolog.Logger, key ed25519.PrivateKey, peers []overlay.BroadcastPeer, req rebroadcastRequest, plan rebroadcastPlan, timeout time.Duration) (uint32, int, int) {
 	if len(peers) == 0 {
 		return 0, 0, 0
 	}
@@ -309,7 +481,7 @@ func rebroadcastFECToPeers(ctx context.Context, log zerolog.Logger, key ed25519.
 		}
 		batches++
 
-		sendCtx, cancel := context.WithTimeout(ctx, peerQueryTimeout)
+		sendCtx, cancel := context.WithTimeout(ctx, timeout)
 		sent, err := sender.SendNow(sendCtx, peerSet, batch)
 		cancel()
 
@@ -378,35 +550,4 @@ func (n *Node) buildSimpleBroadcast(payload []byte, flags int32) (overlay.Broadc
 
 	msg.Signature = ed25519.Sign(n.privKey, toSign)
 	return msg, nil
-}
-
-func peerIDHex(id []byte) string {
-	if len(id) == 0 {
-		return ""
-	}
-	return hex.EncodeToString(id)
-}
-
-func rebroadcastTargetPeers(targets []rebroadcastTarget) []overlay.BroadcastPeer {
-	peers := make([]overlay.BroadcastPeer, 0, len(targets))
-	for _, target := range targets {
-		peers = append(peers, target.peer)
-	}
-	return peers
-}
-
-func formatRebroadcastTargets(targets []rebroadcastTarget) []string {
-	res := make([]string, 0, len(targets))
-	for _, target := range targets {
-		id := target.id
-		if len(id) > 12 {
-			id = id[:12]
-		}
-		if target.addr != "" {
-			res = append(res, target.addr+"("+id+")")
-			continue
-		}
-		res = append(res, id)
-	}
-	return res
 }

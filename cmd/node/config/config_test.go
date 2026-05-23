@@ -84,6 +84,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Metrics.ListenAddr != "" {
 		t.Fatalf("unexpected metrics listen addr %q", cfg.Metrics.ListenAddr)
 	}
+	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
+		t.Fatalf("unexpected metrics namespace %q", cfg.Metrics.Namespace)
+	}
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
 		t.Fatalf("cell total cache size: %v", err)
@@ -302,6 +305,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.Metrics.Enabled {
 		t.Fatal("expected generated metrics to be disabled")
+	}
+	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
+		t.Fatalf("unexpected generated metrics namespace %q", cfg.Metrics.Namespace)
 	}
 
 	info, err := os.Stat(path)

@@ -549,8 +549,9 @@ func (s *Store) setArchivePackageMeta(batch *pebble.Batch, reg archivePackRegist
 	}
 
 	key := hotKeyArchivePackage(reg.archiveID)
-	old, err := pebbleReaderGetCopy(s.hot, key)
+	old, closer, err := pebbleReaderGet(s.hot, key)
 	if err == nil {
+		defer func() { _ = closer.Close() }()
 		current, err := decodeArchivePackageMeta(old)
 		if err != nil {
 			return err
@@ -584,8 +585,9 @@ func (s *Store) setArchivePackageMeta(batch *pebble.Batch, reg archivePackRegist
 
 func (s *Store) setArchiveFileRef(batch *pebble.Batch, archiveID int64, ref *storage.ArtifactRef) error {
 	key := hotKeyArchiveFile(archiveID)
-	old, err := pebbleReaderGetCopy(s.hot, key)
+	old, closer, err := pebbleReaderGet(s.hot, key)
 	if err == nil {
+		defer func() { _ = closer.Close() }()
 		current, err := decodeArtifactRef(old)
 		if err != nil {
 			return err
@@ -701,8 +703,9 @@ func (s *Store) commitSyncedPackSizes(items []pendingPackSync) error {
 
 func (s *Store) setPackCommittedSize(batch *pebble.Batch, path string, size int64) error {
 	key := hotKeyPackCommitted(path)
-	old, err := pebbleReaderGetCopy(s.hot, key)
+	old, closer, err := pebbleReaderGet(s.hot, key)
 	if err == nil {
+		defer func() { _ = closer.Close() }()
 		if len(old) != 8 {
 			return fmt.Errorf("invalid committed pack size record")
 		}
@@ -716,13 +719,14 @@ func (s *Store) setPackCommittedSize(batch *pebble.Batch, path string, size int6
 }
 
 func (s *Store) packCommittedSize(path string) (int64, error) {
-	raw, err := pebbleReaderGetCopy(s.hot, hotKeyPackCommitted(path))
+	raw, closer, err := pebbleReaderGet(s.hot, hotKeyPackCommitted(path))
 	if errors.Is(err, storage.ErrNotFound) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
+	defer func() { _ = closer.Close() }()
 	if len(raw) != 8 {
 		return 0, fmt.Errorf("invalid committed pack size record")
 	}

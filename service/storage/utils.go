@@ -78,7 +78,6 @@ func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wa
 		return nil, fmt.Errorf("state root is nil")
 	}
 	rootHash := root.HashKey(0)
-	rootCellHash := root.HashKey()
 
 	var fileHash []byte
 	if len(rawBOC) == 0 && len(wantFileHash) > 0 {
@@ -120,7 +119,6 @@ func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wa
 	return &BlockState{
 		Block:         *expected,
 		StateRootHash: rootHash[:],
-		StateCellHash: rootCellHash[:],
 		StateFileHash: fileHash,
 		Cell:          root,
 		Parsed:        parsed,

@@ -36,6 +36,7 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 		Metrics: nodeconfig.Metrics{
 			Enabled:    true,
 			ListenAddr: "127.0.0.1:9090",
+			Namespace:  "custom",
 		},
 	}
 
@@ -95,6 +96,26 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	if metricsOpts.ListenAddr != "127.0.0.1:9090" {
 		t.Fatalf("unexpected metrics listen addr %q", metricsOpts.ListenAddr)
 	}
+	if metricsOpts.Namespace != "custom" {
+		t.Fatalf("unexpected metrics namespace %q", metricsOpts.Namespace)
+	}
+}
+
+func TestMetricsOptionsDefaultNamespace(t *testing.T) {
+	cfg := nodeconfig.Config{
+		Metrics: nodeconfig.Metrics{
+			Enabled:    true,
+			ListenAddr: "127.0.0.1:9090",
+		},
+	}
+
+	metricsOpts, err := metricsOptionsFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("metrics options: %v", err)
+	}
+	if metricsOpts.Namespace != nodeconfig.DefaultMetricsNamespace {
+		t.Fatalf("unexpected default metrics namespace %q", metricsOpts.Namespace)
+	}
 }
 
 func TestMetricsOptionsRequireListenAddrWhenEnabled(t *testing.T) {
@@ -106,6 +127,20 @@ func TestMetricsOptionsRequireListenAddrWhenEnabled(t *testing.T) {
 
 	if _, err := metricsOptionsFromConfig(cfg); err == nil {
 		t.Fatal("expected enabled metrics without listen addr to fail")
+	}
+}
+
+func TestMetricsOptionsRejectInvalidNamespace(t *testing.T) {
+	cfg := nodeconfig.Config{
+		Metrics: nodeconfig.Metrics{
+			Enabled:    true,
+			ListenAddr: "127.0.0.1:9090",
+			Namespace:  "bad-name",
+		},
+	}
+
+	if _, err := metricsOptionsFromConfig(cfg); err == nil {
+		t.Fatal("expected invalid metrics namespace to fail")
 	}
 }
 

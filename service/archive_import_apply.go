@@ -12,7 +12,6 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type archiveShardBlockLoader struct {
@@ -31,6 +30,7 @@ type shardClientArchiveWindow struct {
 	masterProofs   map[uint32]*masterchainConsensusProof
 	archiveBlocks  map[string]p2p.DownloadedBlock
 	archiveImports []*archiveImportResult
+	stateCells     *archiveStateCellOverlay
 	appliedStates  appliedStateSet
 	shardArchives  int
 	splitDepth     uint32
@@ -65,9 +65,7 @@ func (l archiveShardBlockLoader) load(_ context.Context, block ton.BlockIDExt) (
 	if downloaded.Meta == nil {
 		return p2p.DownloadedBlock{}, fmt.Errorf("archive shard block %s is missing metadata", downloaded.BlockRef())
 	}
-	if downloaded.Meta.MasterchainRef != nil && downloaded.Meta.MasterchainRef.SeqNo > l.master.SeqNo {
-		return p2p.DownloadedBlock{}, fmt.Errorf("archive shard block %s references future masterchain block %s", downloaded.BlockRef(), storage.FormatBlockRef(*downloaded.Meta.MasterchainRef))
-	}
+	setDownloadedShardMasterchainRef(&downloaded, l.master)
 	return downloaded, nil
 }
 
@@ -162,9 +160,6 @@ func (r *archiveCatchUpRunner) importArchiveWindowShards(ctx context.Context, qu
 		for _, imported := range importedFiles {
 			mergeImportStats(window.totalStats, imported.stats, true)
 			window.archiveImports = append(window.archiveImports, imported)
-			if err = r.rememberImportedArchiveData(window, imported); err != nil {
-				return err
-			}
 			for key, block := range imported.blocks {
 				window.archiveBlocks[key] = block
 			}
@@ -196,10 +191,10 @@ func (r *archiveCatchUpRunner) importArchiveWindowShards(ctx context.Context, qu
 
 func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, start *storage.BlockState, window *shardClientArchiveWindow) (*storage.BlockState, error) {
 	master := start
-	var applier stateUpdateApplier = r.stateCells
-	if r.stateCells != nil {
-		applier = r.stateCells.metered(nil)
+	if window.stateCells == nil {
+		return nil, fmt.Errorf("archive window state cell overlay is nil")
 	}
+	applier := window.stateCells.metered(nil)
 	if window.masterSequence == nil {
 		sequence, err := archiveMasterBlockSequence(start, r.target.SeqNo, window.startSeqno, window.masterBlocks)
 		if err != nil {
@@ -267,10 +262,10 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 		return nil, nil
 	}
 
-	var applier stateUpdateApplier = r.stateCells
-	if r.stateCells != nil {
-		applier = r.stateCells.metered(nil)
+	if window.stateCells == nil {
+		return nil, fmt.Errorf("archive window state cell overlay is nil")
 	}
+	applier := window.stateCells.metered(nil)
 
 	var appliedMu sync.Mutex
 	var blockLoaderMu sync.Mutex
@@ -378,19 +373,18 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 	return shards, nil
 }
 
-func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.CurrentState, checkpointBlocks uint32, lockElapsed time.Duration, states []*storage.BlockState, cells *archiveStateCellCheckpoint, stateCells []storage.EncodedCellRecord) (*storage.CurrentState, error) {
+func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.CurrentState, checkpointBlocks uint32, lockElapsed time.Duration, entries []storage.StateCheckpointBlock, cells *archiveStateCellCheckpoint) (*storage.CurrentState, error) {
 	if current == nil {
 		return nil, fmt.Errorf("archive current state is nil")
 	}
 
-	if len(states) == 0 {
+	if len(entries) == 0 {
 		return nil, fmt.Errorf("archive current state has no block states")
 	}
 
 	storedCurrent := currentStateWithoutCells(current)
 	started := time.Now()
-	cellRecords := mergeEncodedCellRecords(cells.records(), stateCells)
-	persisted, err := r.service.saveStateCheckpoint(r.ctx, storedCurrent, states, 0, cellRecords)
+	persisted, err := r.service.saveStateCheckpoint(r.ctx, storedCurrent, entries, 0)
 	if err != nil {
 		return nil, fmt.Errorf("persist archive current state %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}
@@ -400,43 +394,10 @@ func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.Curre
 		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
 		Uint32("shard_client_seqno", current.ShardClientSeqno).
 		Uint32("checkpoint_blocks", checkpointBlocks).
-		Int("states", len(states)).
+		Int("states", len(entries)).
 		Int("shards", len(current.Shards)).
 		Dur("lock_wait", lockElapsed).
 		Dur("elapsed", time.Since(started)).
 		Msg("archive shard-client checkpoint persisted")
 	return persisted, nil
-}
-
-func mergeEncodedCellRecords(records []storage.EncodedCellRecord, extra []storage.EncodedCellRecord) []storage.EncodedCellRecord {
-	if len(records) == 0 {
-		return extra
-	}
-	if len(extra) == 0 {
-		return records
-	}
-
-	seen := make(map[cell.Hash]struct{}, len(records)+len(extra))
-	merged := make([]storage.EncodedCellRecord, 0, len(records)+len(extra))
-	for _, record := range records {
-		if len(record.Data) == 0 {
-			continue
-		}
-		if _, ok := seen[record.Hash]; ok {
-			continue
-		}
-		seen[record.Hash] = struct{}{}
-		merged = append(merged, record)
-	}
-	for _, record := range extra {
-		if len(record.Data) == 0 {
-			continue
-		}
-		if _, ok := seen[record.Hash]; ok {
-			continue
-		}
-		seen[record.Hash] = struct{}{}
-		merged = append(merged, record)
-	}
-	return merged
 }

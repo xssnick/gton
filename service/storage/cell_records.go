@@ -22,6 +22,19 @@ type EncodedCellRecord struct {
 	Data []byte
 }
 
+type StateCheckpointCells struct {
+	Records []EncodedCellRecord
+}
+
+// StateCheckpointBlock is the checkpoint boundary: cells produced while applying
+// the block travel with the metadata that will publish that state. Writers flush
+// all cells first, then commit state metadata/current; cells left orphaned by a
+// crash before metadata commit are harmless and expected.
+type StateCheckpointBlock struct {
+	State *BlockState
+	Cells []EncodedCellRecord
+}
+
 type CellRefRecord struct {
 	LevelMask byte
 	Hashes    []byte

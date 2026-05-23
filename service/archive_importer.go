@@ -151,6 +151,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		if err = r.storeArchiveWindow(window); err != nil {
 			return nil, r.returnWithProgress(err)
 		}
+		window.stateCells.copyRecordsTo(r.stateCells)
 		s.log.Debug().
 			Uint32("start_seqno", window.startSeqno).
 			Int("master_blocks", len(window.masterStates)).

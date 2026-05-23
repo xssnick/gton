@@ -101,41 +101,58 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 		return cached, nil
 	}
 
-	state, err := s.loadStateRoot(ctx, block)
-	if err != nil {
-		return nil, err
-	}
-	prevBlocks, err := blockProofPrevBlocks(state)
-	if err != nil {
-		return nil, err
-	}
-	isKey, err := s.blockIsKey(ctx, block, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	base := &blockProofBase{
-		block:      block,
-		prevBlocks: prevBlocks,
-		isKey:      isKey,
-	}
-
-	s.blockProofBasesMu.Lock()
-	if s.blockProofBases == nil {
-		s.blockProofBases = make(map[string]*blockProofBase)
-	}
-	if existing := s.blockProofBases[key]; existing != nil {
+	value, err := s.blockProofBaseLoad.do(ctx, key, func() (any, error) {
+		s.blockProofBasesMu.Lock()
+		cached := s.blockProofBases[key]
 		s.blockProofBasesMu.Unlock()
-		return existing, nil
-	}
-	s.blockProofBases[key] = base
-	s.blockProofBaseOrder = append(s.blockProofBaseOrder, key)
-	for len(s.blockProofBaseOrder) > maxBlockProofBaseCacheEntries {
-		delete(s.blockProofBases, s.blockProofBaseOrder[0])
-		s.blockProofBaseOrder = s.blockProofBaseOrder[1:]
-	}
-	s.blockProofBasesMu.Unlock()
+		if cached != nil {
+			return cached, nil
+		}
 
+		state, err := s.loadStateRoot(ctx, block)
+		if err != nil {
+			return nil, err
+		}
+		prevBlocks, err := blockProofPrevBlocks(state)
+		if err != nil {
+			return nil, err
+		}
+		isKey, err := s.blockIsKey(ctx, block)
+		if err != nil {
+			return nil, err
+		}
+
+		base := &blockProofBase{
+			block:      block,
+			prevBlocks: prevBlocks,
+			isKey:      isKey,
+		}
+
+		s.blockProofBasesMu.Lock()
+		if s.blockProofBases == nil {
+			s.blockProofBases = make(map[string]*blockProofBase)
+		}
+		if existing := s.blockProofBases[key]; existing != nil {
+			s.blockProofBasesMu.Unlock()
+			return existing, nil
+		}
+		s.blockProofBases[key] = base
+		s.blockProofBaseOrder = append(s.blockProofBaseOrder, key)
+		for len(s.blockProofBaseOrder) > maxBlockProofBaseCacheEntries {
+			delete(s.blockProofBases, s.blockProofBaseOrder[0])
+			s.blockProofBaseOrder = s.blockProofBaseOrder[1:]
+		}
+		s.blockProofBasesMu.Unlock()
+
+		return base, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	base, ok := value.(*blockProofBase)
+	if !ok {
+		return nil, fmt.Errorf("invalid block proof base cache value")
+	}
 	return base, nil
 }
 
@@ -345,7 +362,7 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 		if err != nil {
 			return ton.BlockLinkBackward{}, err
 		}
-		toKeyBlock, err = s.blockIsKey(ctx, to, toRoot)
+		toKeyBlock, err = s.blockIsKey(ctx, to)
 		if err != nil {
 			return ton.BlockLinkBackward{}, err
 		}
@@ -461,26 +478,12 @@ func storedMasterProofKinds(meta *storage.BlockMeta, link bool) []storage.Served
 	return []storage.ServedProofKind{kind}
 }
 
-func (s *Server) blockIsKey(ctx context.Context, id ton.BlockIDExt, root *cell.Cell) (bool, error) {
+func (s *Server) blockIsKey(ctx context.Context, id ton.BlockIDExt) (bool, error) {
 	meta, err := s.store.BlockMeta(ctx, id)
-	if err == nil && meta.Has(storage.BlockMetaIsKeyBlock) {
-		return true, nil
-	}
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return false, err
-	}
-
-	if root == nil {
-		root, err = s.loadBlockRoot(ctx, id)
-		if err != nil {
-			return false, err
-		}
-	}
-	block, err := storage.ParseVerifiedBlockCell(id, root)
 	if err != nil {
 		return false, err
 	}
-	return block.BlockInfo.KeyBlock, nil
+	return meta.Has(storage.BlockMetaIsKeyBlock), nil
 }
 
 func (s *Server) prevKeyBlockInState(req blockProofRequest, seqno uint32) (ton.BlockIDExt, error) {

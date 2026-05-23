@@ -28,7 +28,6 @@ func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 	}
 	root := mustTestShardStateCell(t, block)
 	rootHash := root.HashKey(0)
-	cellHash := root.HashKey()
 	raw := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	fileHash := sha256.Sum256(raw)
 
@@ -52,9 +51,6 @@ func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 
 	if !bytes.Equal(staged.state.StateRootHash, rootHash[:]) {
 		t.Fatalf("unexpected state root hash %x want %x", staged.state.StateRootHash, rootHash[:])
-	}
-	if !bytes.Equal(staged.state.StateCellHash, cellHash[:]) {
-		t.Fatalf("unexpected state cell hash %x want %x", staged.state.StateCellHash, cellHash[:])
 	}
 	if _, err := store.BlockState(context.Background(), block); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("staged metadata should not be persisted by p2p, got %v", err)
@@ -256,16 +252,13 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
 		Block:          splitStatePartStorageBlock(block, part),
 		StateRootHash:  partLevelHash[:],
-		StateCellHash:  partRootHash[:],
 		CellGeneration: 1,
 	}); err != nil {
 		t.Fatalf("save split part metadata: %v", err)
 	}
-	fullCellHash := fullRoot.HashKey()
 	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
 		Block:          block,
 		StateRootHash:  fullRootHash[:],
-		StateCellHash:  fullCellHash[:],
 		CellGeneration: 1,
 	}); err != nil {
 		t.Fatalf("save full state metadata: %v", err)
@@ -592,9 +585,6 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	}
 	if !bytes.Equal(state.StateRootHash, fullRootHash[:]) {
 		t.Fatalf("merged state root hash mismatch: got=%x want=%x", state.StateRootHash, fullRootHash)
-	}
-	if !bytes.Equal(state.StateCellHash, fullCellHash[:]) {
-		t.Fatalf("merged state cell hash mismatch: got=%x want=%x", state.StateCellHash, fullCellHash)
 	}
 	if err = store.SaveBlockState(ctx, state); err != nil {
 		t.Fatalf("commit merged state metadata: %v", err)

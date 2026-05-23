@@ -141,6 +141,74 @@ func TestRebroadcastFECToPeerSetUsesCppNodeBurstCount(t *testing.T) {
 	}
 }
 
+func TestEnqueueRebroadcastSkipsSourcePeer(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "basechain"},
+		log:  discardLogger(),
+		peers: map[string]*overlayPeer{
+			"source": testRebroadcastQueuePeer("source"),
+			"target": testRebroadcastQueuePeer("target"),
+		},
+	}
+
+	req := rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x01},
+		sourcePeerID: "source",
+	}
+	if !sub.enqueueRebroadcast(req) {
+		t.Fatal("expected rebroadcast enqueue")
+	}
+
+	if _, ok := sub.peers["source"].rebroadcastQueue.TryPop(); ok {
+		t.Fatal("source peer should not receive its own rebroadcast")
+	}
+
+	got, ok := sub.peers["target"].rebroadcastQueue.TryPop()
+	if !ok {
+		t.Fatal("expected target peer rebroadcast")
+	}
+	if got.sourcePeerID != "source" {
+		t.Fatalf("source peer id = %q, want source", got.sourcePeerID)
+	}
+}
+
+func TestEnqueueLocalRebroadcastRecordsDropWhenPeerQueuesAreFull(t *testing.T) {
+	node := newTestNode(t)
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{peer.id: peer},
+	}
+
+	for i := 0; i < peerRebroadcastQueueItems; i++ {
+		if !peer.localRebroadcastQueue.Push(rebroadcastRequest{
+			kind:    "tonNode.externalMessageBroadcast",
+			payload: []byte{byte(i)},
+			local:   true,
+		}) {
+			t.Fatalf("fill local rebroadcast queue at item %d", i)
+		}
+	}
+
+	if sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x02},
+		local:        true,
+	}) {
+		t.Fatal("expected full local rebroadcast queues to reject request")
+	}
+	if got := node.localRebroadcastDropped.Load(); got != 1 {
+		t.Fatalf("local dropped counter = %d, want 1", got)
+	}
+}
+
 func mustHashSimpleBroadcastID(t *testing.T, payload []byte, flags int32) []byte {
 	t.Helper()
 

@@ -67,11 +67,11 @@ const (
 	dhtFindTimeout             = 30 * time.Second
 	masterchainWaitLogEvery    = 5 * time.Second
 	peerQueryTimeout           = 10 * time.Second
-	rebroadcastWorkerCount     = 4
-	rebroadcastQueueMaxItems   = 1024
-	rebroadcastQueueMaxBytes   = int64(128 << 20)
-	localExternalQueueMaxItems = 1024
-	localExternalQueueMaxBytes = int64(128 << 20)
+	peerRebroadcastTimeout     = 5 * time.Second
+	peerRebroadcastQueueItems  = 4096
+	peerRebroadcastQueueBytes  = int64(64 << 20)
+	externalRebroadcastFanout  = 4
+	localRebroadcastAttempts   = 3
 	dhtServerStoreMaxKeys      = 300000
 
 	maxBlockDownloadAnswerSize  = 32 << 20

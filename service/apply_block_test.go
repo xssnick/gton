@@ -795,6 +795,26 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 	}
 }
 
+func TestArchiveStateCellOverlayCopiesWindowCellsOnEmission(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
+	windowCells := newArchiveStateCellOverlay(nil)
+	if err := windowCells.rememberPrepared(root, mustPreparedReachableStateCells(t, root), nil, 0); err != nil {
+		t.Fatalf("remember window cells: %v", err)
+	}
+
+	checkpointCells := newArchiveStateCellOverlay(nil)
+	if got := checkpointCells.byteSize(); got != 0 {
+		t.Fatalf("checkpoint overlay starts with %d bytes, want 0", got)
+	}
+
+	windowCells.copyRecordsTo(checkpointCells)
+	checkpoint := checkpointCells.beginCheckpoint()
+	records := checkpoint.records()
+	if !hasCellRecord(records, root.HashKey()) {
+		t.Fatal("emitted archive window cells were not copied into checkpoint overlay")
+	}
+}
+
 func mustProofBody(tb testing.TB, root *cell.Cell, recursiveRefs ...int) *cell.Cell {
 	tb.Helper()
 

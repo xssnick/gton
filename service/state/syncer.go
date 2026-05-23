@@ -188,7 +188,9 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterState *storage2.Blo
 			if err != nil {
 				return nil, fmt.Errorf("load pending shard state %s: %w", storage2.FormatBlockRef(shard.Block), err)
 			}
-			next.Shards[key] = storage2.BlockStateWithoutCells(stored)
+			storedShard := storage2.BlockStateWithoutCells(stored)
+			setShardMasterchainRef(&storedShard, master)
+			next.Shards[key] = storedShard
 		}
 	}
 
@@ -387,11 +389,10 @@ func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, m
 	s.log.Info().
 		Str("block", storage2.FormatBlockRef(block)).
 		Msg("importing downloaded state snapshot")
-	state, err = s.importer.ImportAndPersist(ctx, downloaded, s.storage)
+	state, err = s.importer.ImportAndPersist(ctx, downloaded, s.storage, master)
 	if err != nil {
 		return nil, fmt.Errorf("import block state %s: %w", storage2.FormatBlockRef(block), err)
 	}
-	setShardMasterchainRef(state, master)
 	s.log.Info().
 		Str("block", storage2.FormatBlockRef(block)).
 		Msg("block state persisted")
@@ -399,10 +400,11 @@ func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, m
 }
 
 func setShardMasterchainRef(state *storage2.BlockState, master ton.BlockIDExt) {
-	if state == nil || state.Block.Workchain == -1 || state.MasterchainRef != nil {
+	if state == nil || state.Block.Workchain == -1 {
 		return
 	}
 
+	// Match cppnode: this is the including master, not the shard header MasterRef.
 	ref := master
 	state.MasterchainRef = &ref
 }

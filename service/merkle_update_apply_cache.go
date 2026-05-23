@@ -187,6 +187,26 @@ func (c *stateCellEncodedCache) addRecords(records map[cell.Hash][]byte) {
 	c.mu.Unlock()
 }
 
+func (c *stateCellEncodedCache) addStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
+	if c == nil {
+		return nil
+	}
+	rootData := records[root]
+	if len(rootData) == 0 {
+		return fmt.Errorf("prepared state cells do not contain root %x", root[:])
+	}
+
+	c.mu.Lock()
+	for hash, encoded := range records {
+		if len(encoded) == 0 {
+			continue
+		}
+		c.setRecordLocked(hash, encoded)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *stateCellEncodedCache) setRecordLocked(hash cell.Hash, encoded []byte) {
 	if previous, ok := c.records[hash]; ok {
 		c.bytes -= uint64(len(previous))
@@ -214,7 +234,7 @@ func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoa
 	return loaded, nil
 }
 
-func (c *stateCellEncodedCache) appendRecords(records []storage.EncodedCellRecord, seen map[cell.Hash]struct{}) []storage.EncodedCellRecord {
+func (c *stateCellEncodedCache) appendRecords(records []storage.EncodedCellRecord) []storage.EncodedCellRecord {
 	if c == nil {
 		return records
 	}
@@ -223,10 +243,6 @@ func (c *stateCellEncodedCache) appendRecords(records []storage.EncodedCellRecor
 	defer c.mu.RUnlock()
 
 	for hash, encoded := range c.records {
-		if _, ok := seen[hash]; ok {
-			continue
-		}
-		seen[hash] = struct{}{}
 		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
 	}
 	return records
@@ -291,8 +307,7 @@ func (w *stateCellWindowCache) rememberApplied(root *cell.Cell, prepared map[cel
 	if len(prepared[hash]) == 0 {
 		return fmt.Errorf("prepared state update cells do not contain destination root %x", hash[:])
 	}
-	w.addPreparedRecords(prepared)
-	return nil
+	return w.addPreparedStateRecords(hash, prepared)
 }
 
 func (w *stateCellWindowCache) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, error) {
@@ -333,6 +348,29 @@ func (w *stateCellWindowCache) addPreparedRecords(records map[cell.Hash][]byte) 
 		w.active = newStateCellEncodedCache(4096)
 	}
 	w.active.addRecords(records)
+}
+
+func (w *stateCellWindowCache) addPreparedStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
+	if w == nil || len(records) == 0 {
+		return nil
+	}
+
+	w.mu.RLock()
+	active := w.active
+	if active != nil {
+		err := active.addStateRecords(root, records)
+		w.mu.RUnlock()
+		return err
+	}
+	w.mu.RUnlock()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.active == nil {
+		w.active = newStateCellEncodedCache(4096)
+	}
+	return w.active.addStateRecords(root, records)
 }
 
 func (w *stateCellWindowCache) loader() cell.LazyCellLoader {
@@ -420,21 +458,29 @@ func (w *stateCellWindowCache) byteSize() uint64 {
 }
 
 func (c *stateCellCheckpointCache) records() []storage.EncodedCellRecord {
+	return c.cells().Records
+}
+
+func (c *stateCellCheckpointCache) cells() storage.StateCheckpointCells {
 	if c == nil || len(c.caches) == 0 {
-		return nil
+		return storage.StateCheckpointCells{}
 	}
 
 	total := 0
 	for _, cache := range c.caches {
 		total += cache.len()
 	}
+	if total == 0 {
+		return storage.StateCheckpointCells{}
+	}
 
-	seen := make(map[cell.Hash]struct{}, total)
 	records := make([]storage.EncodedCellRecord, 0, total)
 	for _, cache := range c.caches {
-		records = cache.appendRecords(records, seen)
+		records = cache.appendRecords(records)
 	}
-	return records
+	return storage.StateCheckpointCells{
+		Records: records,
+	}
 }
 
 func (c *stateCellCheckpointCache) byteSize() uint64 {
@@ -488,6 +534,26 @@ func (c *archiveStateCellRecordCache) addRecords(records map[cell.Hash][]byte) {
 	c.mu.Unlock()
 }
 
+func (c *archiveStateCellRecordCache) addStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
+	if c == nil {
+		return nil
+	}
+	rootData := records[root]
+	if len(rootData) == 0 {
+		return fmt.Errorf("archive prepared state cells do not contain root %x", root[:])
+	}
+
+	c.mu.Lock()
+	for hash, encoded := range records {
+		if len(encoded) == 0 {
+			continue
+		}
+		c.setRecordLocked(hash, encoded)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *archiveStateCellRecordCache) setRecordLocked(hash cell.Hash, encoded []byte) {
 	if previous, ok := c.records[hash]; ok {
 		c.bytes -= uint64(len(previous))
@@ -515,7 +581,7 @@ func (c *archiveStateCellRecordCache) loadWith(hash cell.Hash, loader cell.LazyC
 	return loaded, nil
 }
 
-func (c *archiveStateCellRecordCache) appendRecords(records []storage.EncodedCellRecord, seen map[cell.Hash]struct{}) []storage.EncodedCellRecord {
+func (c *archiveStateCellRecordCache) appendRecords(records []storage.EncodedCellRecord) []storage.EncodedCellRecord {
 	if c == nil {
 		return records
 	}
@@ -524,13 +590,19 @@ func (c *archiveStateCellRecordCache) appendRecords(records []storage.EncodedCel
 	defer c.mu.RUnlock()
 
 	for hash, encoded := range c.records {
-		if _, ok := seen[hash]; ok {
-			continue
-		}
-		seen[hash] = struct{}{}
 		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
 	}
 	return records
+}
+
+func (c *archiveStateCellRecordCache) copyRecordsTo(dst *archiveStateCellOverlay) {
+	if c == nil || dst == nil {
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	dst.addPreparedRecords(c.records)
 }
 
 func (c *archiveStateCellRecordCache) len() int {
@@ -601,7 +673,9 @@ func (w *archiveStateCellOverlay) rememberPrepared(root *cell.Cell, prepared map
 	if len(prepared[hash]) == 0 {
 		return fmt.Errorf("archive state cell overlay does not contain destination root %x", hash[:])
 	}
-	w.addPreparedRecords(prepared)
+	if err := w.addPreparedStateRecords(hash, prepared); err != nil {
+		return err
+	}
 	stats.observe(len(prepared), prepareElapsed)
 	return nil
 }
@@ -611,6 +685,18 @@ func (w *archiveStateCellOverlay) rememberPreparedCells(prepared map[cell.Hash][
 		return
 	}
 	w.addPreparedRecords(prepared)
+}
+
+func (w *archiveStateCellOverlay) copyRecordsTo(dst *archiveStateCellOverlay) {
+	if w == nil || dst == nil || w == dst {
+		return
+	}
+
+	sources := w.loaderSources()
+	sources.active.copyRecordsTo(dst)
+	for _, cache := range sources.pending {
+		cache.copyRecordsTo(dst)
+	}
 }
 
 func (w *archiveStateCellOverlay) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, error) {
@@ -651,6 +737,29 @@ func (w *archiveStateCellOverlay) addPreparedRecords(records map[cell.Hash][]byt
 		w.active = newArchiveStateCellRecordCache(4096)
 	}
 	w.active.addRecords(records)
+}
+
+func (w *archiveStateCellOverlay) addPreparedStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
+	if w == nil || len(records) == 0 {
+		return nil
+	}
+
+	w.mu.RLock()
+	active := w.active
+	if active != nil {
+		err := active.addStateRecords(root, records)
+		w.mu.RUnlock()
+		return err
+	}
+	w.mu.RUnlock()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.active == nil {
+		w.active = newArchiveStateCellRecordCache(4096)
+	}
+	return w.active.addStateRecords(root, records)
 }
 
 func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
@@ -743,21 +852,29 @@ func (w *archiveStateCellOverlay) beginCheckpoint() *archiveStateCellCheckpoint 
 }
 
 func (c *archiveStateCellCheckpoint) records() []storage.EncodedCellRecord {
+	return c.cells().Records
+}
+
+func (c *archiveStateCellCheckpoint) cells() storage.StateCheckpointCells {
 	if c == nil || len(c.caches) == 0 {
-		return nil
+		return storage.StateCheckpointCells{}
 	}
 
 	total := 0
 	for _, cache := range c.caches {
 		total += cache.len()
 	}
+	if total == 0 {
+		return storage.StateCheckpointCells{}
+	}
 
-	seen := make(map[cell.Hash]struct{}, total)
 	records := make([]storage.EncodedCellRecord, 0, total)
 	for _, cache := range c.caches {
-		records = cache.appendRecords(records, seen)
+		records = cache.appendRecords(records)
 	}
-	return records
+	return storage.StateCheckpointCells{
+		Records: records,
+	}
 }
 
 func (c *archiveStateCellCheckpoint) byteSize() uint64 {

@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	appliedBlockArtifactRetryCount = 3
-	appliedBlockArtifactRetryDelay = 200 * time.Millisecond
+	appliedBlockArtifactRetryCount     = 3
+	appliedBlockArtifactRetryDelay     = 200 * time.Millisecond
+	appliedBlockArtifactQueueJobsLimit = 4096
+	appliedBlockArtifactQueueByteLimit = 512 << 20
 )
 
 var errAppliedBlockArtifactsClosed = errors.New("applied block artifact writer is closed")
@@ -41,6 +43,7 @@ type appliedBlockArtifactJob struct {
 	seq        uint64
 	block      p2p.DownloadedBlock
 	splitDepth uint32
+	bytes      uint64
 }
 
 type appliedBlockArtifactWriter struct {
@@ -53,6 +56,7 @@ type appliedBlockArtifactWriter struct {
 	done   chan struct{}
 	jobs   []appliedBlockArtifactJob
 	head   int
+	bytes  uint64
 	next   uint64
 	saved  uint64
 	err    error
@@ -104,25 +108,58 @@ func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block p2p.Down
 		return ctx.Err()
 	default:
 	}
+	jobBytes := downloadedBlockArtifactBytes(block)
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	for {
+		if w.err != nil {
+			err := w.err
+			w.mu.Unlock()
+			return err
+		}
+		if w.closed {
+			w.mu.Unlock()
+			return errAppliedBlockArtifactsClosed
+		}
+		if w.hasQueueRoomLocked(jobBytes) {
+			break
+		}
 
-	if w.err != nil {
-		return w.err
-	}
-	if w.closed {
-		return errAppliedBlockArtifactsClosed
+		done := w.done
+		w.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		w.mu.Lock()
 	}
 
 	w.next++
+	w.bytes += jobBytes
 	w.jobs = append(w.jobs, appliedBlockArtifactJob{
 		seq:        w.next,
 		block:      cloneDownloadedBlockForArtifact(block),
 		splitDepth: splitDepth,
+		bytes:      jobBytes,
 	})
 	w.signalWake()
+	w.mu.Unlock()
 	return nil
+}
+
+func (w *appliedBlockArtifactWriter) hasQueueRoomLocked(jobBytes uint64) bool {
+	queuedJobs := len(w.jobs) - w.head
+	if queuedJobs == 0 {
+		return true
+	}
+	if queuedJobs >= appliedBlockArtifactQueueJobsLimit {
+		return false
+	}
+	if jobBytes > 0 && w.bytes+jobBytes > appliedBlockArtifactQueueByteLimit {
+		return false
+	}
+	return true
 }
 
 func (w *appliedBlockArtifactWriter) target() uint64 {
@@ -178,6 +215,11 @@ func (w *appliedBlockArtifactWriter) popJob() (appliedBlockArtifactJob, bool) {
 	job := w.jobs[w.head]
 	w.jobs[w.head] = appliedBlockArtifactJob{}
 	w.head++
+	if job.bytes > w.bytes {
+		w.bytes = 0
+	} else {
+		w.bytes -= job.bytes
+	}
 	if w.head == len(w.jobs) {
 		w.jobs = nil
 		w.head = 0
@@ -186,6 +228,7 @@ func (w *appliedBlockArtifactWriter) popJob() (appliedBlockArtifactJob, bool) {
 		w.jobs = w.jobs[:len(w.jobs)-w.head]
 		w.head = 0
 	}
+	w.broadcastDone()
 	return job, true
 }
 
@@ -370,4 +413,8 @@ func cloneDownloadedBlockForArtifact(block p2p.DownloadedBlock) p2p.DownloadedBl
 		block.Meta = block.Meta.Clone()
 	}
 	return block
+}
+
+func downloadedBlockArtifactBytes(block p2p.DownloadedBlock) uint64 {
+	return uint64(len(block.ProofBOC) + len(block.BlockBOC))
 }

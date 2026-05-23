@@ -33,6 +33,7 @@ const (
 	DefaultLiteMasterBlockCache            = 128
 	DefaultLiteShardBlockCache             = 4096
 	DefaultLiteListen                      = "0.0.0.0:7445"
+	DefaultMetricsNamespace                = "gton"
 	defaultStorageDir                      = "data"
 	defaultADNLPort                        = 30303
 	defaultADNLListen                      = "0.0.0.0:30303"
@@ -95,6 +96,7 @@ type Storage struct {
 type Metrics struct {
 	Enabled    bool   `json:"enabled"`
 	ListenAddr string `json:"listen_addr"`
+	Namespace  string `json:"namespace"`
 }
 
 func defaultConfig() Config {
@@ -117,6 +119,9 @@ func defaultConfig() Config {
 			CellShardMemTableSize:           DefaultCellShardMemTable,
 			CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
 			ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
+		},
+		Metrics: Metrics{
+			Namespace: DefaultMetricsNamespace,
 		},
 	}
 }

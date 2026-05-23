@@ -59,10 +59,11 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 		subscription: sub,
 		kind:         "tonNode.externalMessageBroadcast",
 		payload:      payload,
+		local:        true,
 	}
 	if n.allowRebroadcast(&req) {
-		if !n.localRebroadcastQueue.Push(req) {
-			return errors.New("local external message rebroadcast queue is full")
+		if !sub.enqueueRebroadcast(req) {
+			return errors.New("local external message rebroadcast queues are full")
 		}
 	}
 	return nil

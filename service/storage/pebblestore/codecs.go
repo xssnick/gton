@@ -130,7 +130,6 @@ func encodeBlockStateMeta(state *storage.BlockState) []byte {
 	buf := make([]byte, 0, 169)
 	buf = append(buf, blockStateMetaVersion)
 	buf = appendLenBytes(buf, state.StateRootHash)
-	buf = appendLenBytes(buf, state.StateCellHash)
 	buf = appendLenBytes(buf, state.StateFileHash)
 	if state.MasterchainRef == nil {
 		buf = append(buf, 0)
@@ -141,30 +140,26 @@ func encodeBlockStateMeta(state *storage.BlockState) []byte {
 	return buf
 }
 
-func decodeBlockStateMeta(data []byte) ([]byte, []byte, []byte, *ton.BlockIDExt, error) {
+func decodeBlockStateMeta(data []byte) ([]byte, []byte, *ton.BlockIDExt, error) {
 	if len(data) < 1+1+1+1 {
-		return nil, nil, nil, nil, fmt.Errorf("block state meta payload too small")
+		return nil, nil, nil, fmt.Errorf("block state meta payload too small")
 	}
 	if data[0] != blockStateMetaVersion {
-		return nil, nil, nil, nil, fmt.Errorf("unsupported block state meta version %d", data[0])
+		return nil, nil, nil, fmt.Errorf("unsupported block state meta version %d", data[0])
 	}
 	pos := 1
 
 	root, pos, err := readLenBytes(data, pos)
 	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	cellHash, pos, err := readLenBytes(data, pos)
-	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 	file, pos, err := readLenBytes(data, pos)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if pos >= len(data) {
-		return nil, nil, nil, nil, fmt.Errorf("block state meta masterchain ref flag missing")
+		return nil, nil, nil, fmt.Errorf("block state meta masterchain ref flag missing")
 	}
 	var masterRef *ton.BlockIDExt
 	switch data[pos] {
@@ -173,21 +168,21 @@ func decodeBlockStateMeta(data []byte) ([]byte, []byte, []byte, *ton.BlockIDExt,
 	case 1:
 		pos++
 		if pos+80 > len(data) {
-			return nil, nil, nil, nil, fmt.Errorf("block state meta masterchain ref truncated")
+			return nil, nil, nil, fmt.Errorf("block state meta masterchain ref truncated")
 		}
 		ref, err := decodeBlockID(data[pos : pos+80])
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, err
 		}
 		masterRef = &ref
 		pos += 80
 	default:
-		return nil, nil, nil, nil, fmt.Errorf("invalid block state meta masterchain ref flag %d", data[pos])
+		return nil, nil, nil, fmt.Errorf("invalid block state meta masterchain ref flag %d", data[pos])
 	}
 	if pos != len(data) {
-		return nil, nil, nil, nil, fmt.Errorf("block state meta has %d trailing bytes", len(data)-pos)
+		return nil, nil, nil, fmt.Errorf("block state meta has %d trailing bytes", len(data)-pos)
 	}
-	return root, cellHash, file, masterRef, nil
+	return root, file, masterRef, nil
 }
 
 func encodeCurrentState(state *storage.CurrentState) []byte {
@@ -241,6 +236,123 @@ func decodeCurrentState(data []byte) (*storage.CurrentState, error) {
 		return nil, fmt.Errorf("current state has %d trailing bytes", len(data)-pos)
 	}
 	return state, nil
+}
+
+func encodeCellGenerationMigrationProgress(state *storage.CurrentState) []byte {
+	buf := make([]byte, 0, 1024)
+	buf = append(buf, cellGenerationMigrationVersion)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(state.SyncedAt.UnixNano()))
+	buf = binary.BigEndian.AppendUint32(buf, state.ShardClientSeqno)
+	buf = appendMigrationProgressBlockState(buf, &state.Masterchain)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(state.Shards)))
+	for _, key := range storage.SortedShardKeys(state.Shards) {
+		shard := state.Shards[key]
+		buf = appendMigrationProgressBlockState(buf, &shard)
+	}
+	return buf
+}
+
+func decodeCellGenerationMigrationProgress(data []byte) (*storage.CurrentState, error) {
+	if len(data) < 1+8+4+80+1+1+1+1+4 {
+		return nil, fmt.Errorf("cell generation migration progress payload too small")
+	}
+	if data[0] != cellGenerationMigrationVersion {
+		return nil, fmt.Errorf("unsupported cell generation migration progress version %d", data[0])
+	}
+
+	pos := 1
+	state := &storage.CurrentState{
+		SyncedAt: time.Unix(0, int64(binary.BigEndian.Uint64(data[pos:pos+8]))),
+		Shards:   map[storage.ShardKey]storage.BlockState{},
+	}
+	pos += 8
+	state.ShardClientSeqno = binary.BigEndian.Uint32(data[pos : pos+4])
+	pos += 4
+
+	master, next, err := readMigrationProgressBlockState(data, pos)
+	if err != nil {
+		return nil, fmt.Errorf("decode migration progress masterchain state: %w", err)
+	}
+	state.Masterchain = master
+	pos = next
+
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("migration progress shard count missing")
+	}
+	shardCount := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+	for i := 0; i < shardCount; i++ {
+		shard, next, err := readMigrationProgressBlockState(data, pos)
+		if err != nil {
+			return nil, fmt.Errorf("decode migration progress shard state %d: %w", i, err)
+		}
+		state.Shards[storage.ShardKeyFromBlock(shard.Block)] = shard
+		pos = next
+	}
+	if pos != len(data) {
+		return nil, fmt.Errorf("cell generation migration progress has %d trailing bytes", len(data)-pos)
+	}
+	return state, nil
+}
+
+func appendMigrationProgressBlockState(dst []byte, state *storage.BlockState) []byte {
+	dst = append(dst, encodeBlockID(state.Block)...)
+	dst = appendLenBytes(dst, state.StateRootHash)
+	dst = appendLenBytes(dst, state.StateFileHash)
+	if state.MasterchainRef == nil {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return append(dst, encodeBlockID(*state.MasterchainRef)...)
+}
+
+func readMigrationProgressBlockState(data []byte, pos int) (storage.BlockState, int, error) {
+	if pos+80 > len(data) {
+		return storage.BlockState{}, pos, fmt.Errorf("block id truncated")
+	}
+	block, err := decodeBlockID(data[pos : pos+80])
+	if err != nil {
+		return storage.BlockState{}, pos, err
+	}
+	pos += 80
+
+	root, pos, err := readLenBytes(data, pos)
+	if err != nil {
+		return storage.BlockState{}, pos, err
+	}
+	fileHash, pos, err := readLenBytes(data, pos)
+	if err != nil {
+		return storage.BlockState{}, pos, err
+	}
+
+	if pos >= len(data) {
+		return storage.BlockState{}, pos, fmt.Errorf("masterchain ref flag missing")
+	}
+	var masterRef *ton.BlockIDExt
+	switch data[pos] {
+	case 0:
+		pos++
+	case 1:
+		pos++
+		if pos+80 > len(data) {
+			return storage.BlockState{}, pos, fmt.Errorf("masterchain ref truncated")
+		}
+		ref, err := decodeBlockID(data[pos : pos+80])
+		if err != nil {
+			return storage.BlockState{}, pos, err
+		}
+		masterRef = &ref
+		pos += 80
+	default:
+		return storage.BlockState{}, pos, fmt.Errorf("invalid masterchain ref flag %d", data[pos])
+	}
+
+	return storage.BlockState{
+		Block:          block,
+		StateRootHash:  root,
+		StateFileHash:  fileHash,
+		MasterchainRef: masterRef,
+	}, pos, nil
 }
 
 func encodeCellRecord(record *storage.CellRecord) []byte {

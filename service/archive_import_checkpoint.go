@@ -121,20 +121,22 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) (uint32, error) {
 	if err := r.service.checkCurrentStatePersistAllowed(); err != nil {
 		return 0, err
 	}
-	current := storage.CloneCurrentState(r.current)
-	checkpointStates := r.checkpointStates.checkpoint()
-	checkpointCells := r.stateCells.beginCheckpoint()
-	releaseCheckpointCells := r.service.retainStateCellLoader(checkpointCells.loader())
-	checkpointBlocks := r.current.ShardClientSeqno - r.lastCheckpointSeqno
 	lockStarted := time.Now()
 	r.service.currentStatePersistMu.Lock()
 	lockElapsed := time.Since(lockStarted)
 	if err := r.service.checkCurrentStatePersistAllowed(); err != nil {
 		r.service.currentStatePersistMu.Unlock()
-		releaseCheckpointCells()
 		return 0, err
 	}
 
+	current := storage.CloneCurrentState(r.current)
+	checkpointStates := r.checkpointStates.checkpoint()
+	checkpointCells := r.stateCells.beginCheckpoint()
+	releaseCheckpointCells := func() {}
+	if checkpointCells != nil {
+		releaseCheckpointCells = r.service.retainStateCellLoader(checkpointCells.loader())
+	}
+	checkpointBlocks := r.current.ShardClientSeqno - r.lastCheckpointSeqno
 	done := make(chan archiveCheckpointResult, 1)
 	r.checkpointDone = done
 
@@ -153,7 +155,7 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) (uint32, error) {
 		defer release()
 
 		startedCheckpoint := time.Now()
-		persisted, err := r.persistArchiveCurrentState(current, checkpointBlocks, lockElapsed, checkpointStates.states, checkpointCells, checkpointStates.cells)
+		persisted, err := r.persistArchiveCurrentState(current, checkpointBlocks, lockElapsed, checkpointStates.entries, checkpointCells)
 		r.service.currentStatePersistMu.Unlock()
 		if err != nil {
 			r.service.setCurrentStatePersistError(err)

@@ -176,6 +176,57 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 
 }
 
+func TestPebbleStorageLookupBlockByAccountLTUsesShardPrefixPath(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+	account := bytes.Repeat([]byte{0x40}, 32)
+	shards := storage.AccountShardCandidates(0, account)
+	if len(shards) < 3 {
+		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
+	}
+
+	topBlock := testPebbleBlockID(0, topShard, 10)
+	pathBlock := testPebbleBlockID(0, shards[2], 20)
+	siblingBlock := testPebbleBlockID(0, int64(0x2000000000000000), 30)
+	for _, meta := range []*storage.BlockMeta{
+		{ID: topBlock, StartLT: 1, EndLT: 100},
+		{ID: pathBlock, StartLT: 101, EndLT: 200},
+		{ID: siblingBlock, StartLT: 101, EndLT: 200},
+	} {
+		if err := store.SaveBlockMeta(meta); err != nil {
+			t.Fatalf("save block meta %s: %v", storage.FormatBlockRef(meta.ID), err)
+		}
+	}
+
+	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 150)
+	if err != nil {
+		t.Fatalf("lookup account lt: %v", err)
+	}
+	if !got.Equals(&pathBlock) {
+		t.Fatalf("lookup account block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(pathBlock))
+	}
+}
+
+func TestPebbleStorageLookupBlockByAccountLTDoesNotReturnFloorBlock(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+	account := bytes.Repeat([]byte{0x40}, 32)
+	block := testPebbleBlockID(0, topShard, 10)
+
+	if err := store.SaveBlockMeta(&storage.BlockMeta{
+		ID:      block,
+		StartLT: 1,
+		EndLT:   100,
+	}); err != nil {
+		t.Fatalf("save block meta: %v", err)
+	}
+
+	_, err := store.LookupBlockByAccountLT(ctx, 0, account, 150)
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("lookup floor block error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestPebbleStoragePersistentStateSerializerMetadata(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()

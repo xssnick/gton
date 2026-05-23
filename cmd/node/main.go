@@ -133,7 +133,7 @@ func main() {
 	var syncObserver service2.SyncObserver
 	var queryObserver liteserver.QueryObserver
 	if metricsOpts.Enabled {
-		runtimeMetrics = metrics.New()
+		runtimeMetrics = metrics.New(metricsOpts.Namespace)
 		if err = startMetricsServer(ctx, logger, metricsOpts.ListenAddr, runtimeMetrics.Handler()); err != nil {
 			logger.Error().Err(err).Str("metrics_addr", metricsOpts.ListenAddr).Msg("failed to start metrics server")
 			os.Exit(1)

@@ -10,33 +10,33 @@ import (
 type stateCheckpointData struct {
 	live      *storage.CurrentState
 	persisted *storage.CurrentState
-	states    []*storage.BlockState
+	entries   []storage.StateCheckpointBlock
 }
 
-func prepareStateCheckpoint(current *storage.CurrentState, states []*storage.BlockState) (stateCheckpointData, error) {
+func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock) (stateCheckpointData, error) {
 	if current == nil {
 		return stateCheckpointData{}, fmt.Errorf("current state is nil")
 	}
 
-	appliedStates := cloneBlockStateSlice(states)
-	if len(appliedStates) == 0 {
+	appliedEntries := cloneStateCheckpointEntries(entries)
+	if len(appliedEntries) == 0 {
 		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
 	}
 	return stateCheckpointData{
 		live:      storage.CloneCurrentState(current),
 		persisted: currentStateWithoutCells(current),
-		states:    appliedStates,
+		entries:   appliedEntries,
 	}, nil
 }
 
-func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, states []*storage.BlockState, artifactTarget uint64, cells []storage.EncodedCellRecord) (*storage.CurrentState, error) {
+func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, artifactTarget uint64) (*storage.CurrentState, error) {
 	if err := s.waitAppliedBlockArtifacts(ctx, artifactTarget); err != nil {
 		return nil, err
 	}
-	if err := s.storage.SaveStateCheckpointWithCells(ctx, states, current, cells); err != nil {
+	if err := s.storage.SaveStateCheckpointEntries(ctx, entries, current); err != nil {
 		return nil, err
 	}
-	return currentStateWithSavedBlockStates(current, states), nil
+	return currentStateWithSavedBlockStates(current, checkpointEntryStates(entries)), nil
 }
 
 func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*storage.BlockState) *storage.CurrentState {
@@ -58,6 +58,37 @@ func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*s
 		}
 	}
 	return next
+}
+
+func cloneStateCheckpointEntries(entries []storage.StateCheckpointBlock) []storage.StateCheckpointBlock {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]storage.StateCheckpointBlock, 0, len(entries))
+	for _, entry := range entries {
+		if entry.State == nil {
+			continue
+		}
+		cloned = append(cloned, storage.StateCheckpointBlock{
+			State: storage.CloneBlockState(entry.State),
+			Cells: cloneEncodedCellRecords(entry.Cells),
+		})
+	}
+	return cloned
+}
+
+func checkpointEntryStates(entries []storage.StateCheckpointBlock) []*storage.BlockState {
+	if len(entries) == 0 {
+		return nil
+	}
+	states := make([]*storage.BlockState, 0, len(entries))
+	for _, entry := range entries {
+		if entry.State == nil {
+			continue
+		}
+		states = append(states, storage.CloneBlockState(entry.State))
+	}
+	return states
 }
 
 func currentStateWithoutCells(current *storage.CurrentState) *storage.CurrentState {

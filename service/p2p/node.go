@@ -65,24 +65,27 @@ type Node struct {
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx                context.Context
-	zeroStateFileHash     []byte
-	zeroStateBlock        ton.BlockIDExt
-	initBlock             ton.BlockIDExt
-	externalPort          uint16
-	dhtListenAddr         string
-	storage               storage2.Storage
-	peerStorage           storage2.PeerServingStorage
-	compressedState       CompressedBlockStateProvider
-	shardBroadcastCache   *shardBroadcastBlockCache
-	blockCacheObserver    BlockCacheObserver
-	blockCacheSlots       chan struct{}
-	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
-	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
-	rebroadcastQuiet      atomic.Bool
+	runCtx              context.Context
+	zeroStateFileHash   []byte
+	zeroStateBlock      ton.BlockIDExt
+	initBlock           ton.BlockIDExt
+	externalPort        uint16
+	dhtListenAddr       string
+	storage             storage2.Storage
+	peerStorage         storage2.PeerServingStorage
+	compressedState     CompressedBlockStateProvider
+	shardBroadcastCache *shardBroadcastBlockCache
+	blockCacheObserver  BlockCacheObserver
+	blockCacheSlots     chan struct{}
+	rebroadcastQuiet    atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
+
+	localRebroadcastSent    atomic.Uint64
+	localRebroadcastDropped atomic.Uint64
+	peerRebroadcastSent     atomic.Uint64
+	peerRebroadcastDropped  atomic.Uint64
 
 	subscriptionsMx sync.RWMutex
 	subscriptions   map[string]*overlaySubscription
@@ -199,8 +202,6 @@ func New(opts Options) (*Node, error) {
 		compressedState:           opts.CompressedState,
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		blockCacheSlots:           make(chan struct{}, 2),
-		rebroadcastQueue:          newBoundedQueue(rebroadcastQueueMaxItems, rebroadcastQueueMaxBytes, rebroadcastRequestBytes),
-		localRebroadcastQueue:     newBoundedQueue(localExternalQueueMaxItems, localExternalQueueMaxBytes, rebroadcastRequestBytes),
 		rebroadcastThrottleLast:   map[string]time.Time{},
 		stateFilesDir:             stateFilesDir,
 		downloadPeerLeases:        map[string]int{},
@@ -287,11 +288,6 @@ func (n *Node) Start(ctx context.Context) error {
 	n.runAsync(func() {
 		n.runEventLoop(ctx)
 	})
-	for i := 0; i < rebroadcastWorkerCount; i++ {
-		n.runAsync(func() {
-			n.runRebroadcastLoop(ctx)
-		})
-	}
 	n.runAsync(func() {
 		n.runShardBroadcastCacheJanitor(ctx)
 	})
@@ -360,8 +356,7 @@ func (n *Node) stop() {
 		_ = n.gateway.Close()
 
 		n.eventQueue.Close()
-		n.localRebroadcastQueue.Close()
-		n.rebroadcastQueue.Close()
+		n.closePeerRebroadcastQueues()
 
 		n.wg.Wait()
 		n.inboundWG.Wait()

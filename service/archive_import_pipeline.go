@@ -12,6 +12,7 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type archiveMasterImportTask struct {
@@ -88,7 +89,9 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 	progress.setQueue(importQueue)
 	planning := archivePipelineCurrent(current)
 	emitted := archivePipelineCurrent(current)
+	planningCellLoader := r.stateCells.loader()
 	pending := make([]archivePendingWindow, 0, r.archivePendingWindowLimit())
+	var planningErr error
 
 	var masterTask *archiveMasterImportTask
 	defer func() {
@@ -98,7 +101,7 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 	}()
 
 	for planning.ShardClientSeqno < targetSeqno || len(pending) > 0 {
-		for r.canScheduleArchiveWindow(planning, len(pending), targetSeqno) {
+		for planningErr == nil && r.canScheduleArchiveWindow(planning, len(pending), targetSeqno) {
 			planningProgress := progress
 			if len(pending) > 0 {
 				planningProgress = nil
@@ -107,8 +110,24 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 			if planningProgress != nil {
 				planningProgress.setPlanning(planning.ShardClientSeqno+1, "master_archive")
 			}
-			prepared, err := r.prepareArchiveMasterWindow(taskCtx, importQueue, planning, masterTask, targetSeqno, planningProgress)
+			prepared, err := r.prepareArchiveMasterWindow(taskCtx, importQueue, planning, masterTask, targetSeqno, planningCellLoader, planningProgress)
 			if err != nil {
+				if len(pending) > 0 {
+					if masterTask != nil {
+						masterTask.cancel()
+						masterTask = nil
+					}
+					planningErr = err
+					progress.setPending(pending, planning.ShardClientSeqno+1, "draining")
+					r.service.log.Info().
+						Err(err).
+						Uint32("current_seqno", emitted.ShardClientSeqno).
+						Uint32("planning_seqno", planning.ShardClientSeqno+1).
+						Int("pending_windows", len(pending)).
+						Msg("archive lookahead failed, draining prepared windows before retry")
+					break
+				}
+
 				cancelTasks()
 				select {
 				case out <- archiveWindowResult{err: err}:
@@ -149,6 +168,7 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 				shards: r.startArchiveWindowShardImport(taskCtx, importQueue, prepared, priority),
 			})
 			planning = nextPlanning
+			planningCellLoader = prepared.window.stateCells.loader()
 			progress.setPending(pending, planning.ShardClientSeqno+1, "planning")
 			if r.shouldEmitReadyArchiveWindow(pending) {
 				break
@@ -156,6 +176,15 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 		}
 
 		if len(pending) == 0 {
+			if planningErr != nil {
+				cancelTasks()
+				select {
+				case out <- archiveWindowResult{err: planningErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+
 			progress.setPlanning(planning.ShardClientSeqno+1, "idle")
 			return
 		}
@@ -190,7 +219,11 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 		}
 		emitted = nextEmitted
 		pending = pending[1:]
-		progress.setPending(pending, planning.ShardClientSeqno+1, "planning")
+		if planningErr != nil {
+			progress.setPending(pending, planning.ShardClientSeqno+1, "draining")
+		} else {
+			progress.setPending(pending, planning.ShardClientSeqno+1, "planning")
+		}
 	}
 }
 
@@ -653,7 +686,7 @@ func (t *archiveWindowShardImportTask) ready() bool {
 	}
 }
 
-func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, queue *archiveImportQueue, current *storage.CurrentState, masterTask *archiveMasterImportTask, targetSeqno uint32, progress *archiveWindowPipelineProgress) (archivePreparedMasterWindow, error) {
+func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, queue *archiveImportQueue, current *storage.CurrentState, masterTask *archiveMasterImportTask, targetSeqno uint32, baseCellLoader cell.LazyCellLoader, progress *archiveWindowPipelineProgress) (archivePreparedMasterWindow, error) {
 	startSeqno := current.ShardClientSeqno + 1
 	progress.setPlanning(startSeqno, "master_state")
 	startMaster, err := r.service.loadBlockStateForApply(ctx, current.Masterchain)
@@ -688,13 +721,10 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		masterProofs:          masterResult.consensusProofs,
 		archiveBlocks:         masterImport.blocks,
 		archiveImports:        []*archiveImportResult{masterImport},
+		stateCells:            newArchiveStateCellOverlay(baseCellLoader),
 		masterWait:            masterWait,
 		masterPrecheckElapsed: masterResult.precheckElapsed,
 	}
-	if err := r.rememberImportedArchiveData(window, masterImport); err != nil {
-		return archivePreparedMasterWindow{}, err
-	}
-
 	progress.setPlanning(startSeqno, "master_apply")
 	lastMaster, err := r.applyArchiveMasterBlocks(ctx, startMaster, window)
 	if err != nil {

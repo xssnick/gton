@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestAppliedStateSetCloneDoesNotClear(t *testing.T) {
@@ -34,8 +35,8 @@ func TestAppliedStateCheckpointCompletesOnlyAfterSuccess(t *testing.T) {
 	states.remember(first)
 
 	checkpoint := states.checkpoint()
-	if len(checkpoint.states) != 1 {
-		t.Fatalf("checkpoint states = %d, want 1", len(checkpoint.states))
+	if len(checkpoint.entries) != 1 {
+		t.Fatalf("checkpoint states = %d, want 1", len(checkpoint.entries))
 	}
 
 	states.remember(second)
@@ -50,6 +51,32 @@ func TestAppliedStateCheckpointCompletesOnlyAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestAppliedStateCheckpointCarriesCellsWithState(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
+	hash := root.HashKey()
+	state := &storage.BlockState{
+		Block:         testBlockID(0, topShard, 10),
+		StateRootHash: hash[:],
+	}
+
+	var states appliedStateSet
+	states.rememberWithCells(state, map[cell.Hash][]byte{hash: {0x01, 0x02}})
+
+	checkpoint := states.checkpoint()
+	if len(checkpoint.entries) != 1 {
+		t.Fatalf("checkpoint entries = %d, want 1", len(checkpoint.entries))
+	}
+	if !checkpoint.entries[0].State.Block.Equals(&state.Block) {
+		t.Fatalf("checkpoint state = %s, want %s", storage.FormatBlockRef(checkpoint.entries[0].State.Block), storage.FormatBlockRef(state.Block))
+	}
+	if got := len(checkpoint.entries[0].Cells); got != 1 {
+		t.Fatalf("checkpoint cells = %d, want 1", got)
+	}
+	if checkpoint.entries[0].Cells[0].Hash != hash {
+		t.Fatalf("checkpoint cell hash = %x, want %x", checkpoint.entries[0].Cells[0].Hash, hash)
+	}
+}
+
 func TestAppliedStateCheckpointFailureKeepsStates(t *testing.T) {
 	first := &storage.BlockState{Block: testBlockID(0, topShard, 10)}
 
@@ -57,15 +84,15 @@ func TestAppliedStateCheckpointFailureKeepsStates(t *testing.T) {
 	states.remember(first)
 
 	checkpoint := states.checkpoint()
-	if len(checkpoint.states) != 1 {
-		t.Fatalf("checkpoint states = %d, want 1", len(checkpoint.states))
+	if len(checkpoint.entries) != 1 {
+		t.Fatalf("checkpoint states = %d, want 1", len(checkpoint.entries))
 	}
 
 	nextCheckpoint := states.checkpoint()
-	if len(nextCheckpoint.states) != 1 {
-		t.Fatalf("next checkpoint states = %d, want 1", len(nextCheckpoint.states))
+	if len(nextCheckpoint.entries) != 1 {
+		t.Fatalf("next checkpoint states = %d, want 1", len(nextCheckpoint.entries))
 	}
-	if !nextCheckpoint.states[0].Block.Equals(&first.Block) {
-		t.Fatalf("next checkpoint block = %s, want %s", storage.FormatBlockRef(nextCheckpoint.states[0].Block), storage.FormatBlockRef(first.Block))
+	if !nextCheckpoint.entries[0].State.Block.Equals(&first.Block) {
+		t.Fatalf("next checkpoint block = %s, want %s", storage.FormatBlockRef(nextCheckpoint.entries[0].State.Block), storage.FormatBlockRef(first.Block))
 	}
 }

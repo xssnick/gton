@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -485,32 +484,14 @@ func accountTransactionFromCurrentBlock(hasBlock bool, block ton.BlockIDExt, roo
 }
 
 func (s *Server) lookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
-	for _, shard := range accountShardCandidates(workchain, account) {
-		block, err := s.store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
-		if errors.Is(err, storage.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		if !blockContainsAccount(block, workchain, account) {
-			return ton.BlockIDExt{}, errBlockCannotContainAccount
-		}
-
-		meta, err := s.store.BlockMeta(ctx, block)
-		switch {
-		case err == nil:
-			if !blockMetaContainsLT(meta, lt) {
-				continue
-			}
-		case errors.Is(err, storage.ErrNotFound):
-		default:
-			return ton.BlockIDExt{}, err
-		}
-
-		return block, nil
+	block, err := s.store.LookupBlockByAccountLT(ctx, workchain, account, lt)
+	if err != nil {
+		return ton.BlockIDExt{}, err
 	}
-	return ton.BlockIDExt{}, storage.ErrNotFound
+	if !blockContainsAccount(block, workchain, account) {
+		return ton.BlockIDExt{}, errBlockCannotContainAccount
+	}
+	return block, nil
 }
 
 func getTransactionsResponse(roots []*cell.Cell, ids []*ton.BlockIDExt) any {
@@ -542,22 +523,6 @@ func blockMetaContainsLT(meta *storage.BlockMeta, lt uint64) bool {
 		return false
 	}
 	return meta.StartLT < lt && (meta.EndLT == 0 || lt < meta.EndLT)
-}
-
-func accountShardCandidates(workchain int32, account []byte) []int64 {
-	if workchain == masterchainID || len(account) < 8 {
-		return []int64{masterchainShard}
-	}
-
-	prefix := binary.BigEndian.Uint64(account[:8])
-	shards := make([]int64, 0, 61)
-	shards = append(shards, masterchainShard)
-	for length := 1; length <= 60; length++ {
-		x := uint64(1) << (63 - uint(length))
-		shard := (prefix & ^(x - 1)) | x
-		shards = append(shards, int64(shard))
-	}
-	return shards
 }
 
 func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.ListBlockTransactions) any {

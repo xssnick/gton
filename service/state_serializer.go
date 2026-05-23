@@ -86,6 +86,10 @@ type stateSerializationCleanupStore interface {
 	DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error
 }
 
+type stateSerializationGenerationCellSaver interface {
+	SaveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error
+}
+
 func newStateSerializer(logger zerolog.Logger, store storage.Storage, dir string, disableAutomatic bool) *stateSerializer {
 	return &stateSerializer{
 		log:               logger.With().Str("component", "state_serializer").Logger(),
@@ -682,11 +686,11 @@ func throttleStateSerializationCompactions(store storage.Storage) func() {
 }
 
 func (s *stateSerializer) lazyStateRoot(ctx context.Context, target stateSerializationTarget, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	if len(target.state.StateCellHash) != 32 {
-		return nil, fmt.Errorf("state cell hash size mismatch: %d", len(target.state.StateCellHash))
+	if len(target.state.StateRootHash) != 32 {
+		return nil, fmt.Errorf("state root hash size mismatch: %d", len(target.state.StateRootHash))
 	}
 
-	record, err := s.cellRecordForTarget(ctx, target, target.state.StateCellHash)
+	record, err := s.cellRecordForTarget(ctx, target, target.state.StateRootHash)
 	if err != nil {
 		return nil, err
 	}
@@ -694,18 +698,14 @@ func (s *stateSerializer) lazyStateRoot(ctx context.Context, target stateSeriali
 }
 
 func (s *stateSerializer) saveCellsForTarget(ctx context.Context, target stateSerializationTarget, records []*storage.CellRecord) error {
-	if store, ok := s.store.(interface {
-		SaveCellsInGeneration(context.Context, uint64, []*storage.CellRecord) error
-	}); ok && target.state.CellGeneration != 0 {
+	if store, ok := s.store.(stateSerializationGenerationCellSaver); ok && target.state.CellGeneration != 0 {
 		return store.SaveCellsInGeneration(ctx, target.state.CellGeneration, records)
 	}
 	return s.store.SaveCells(records)
 }
 
 func (s *stateSerializer) cellRecordForTarget(ctx context.Context, target stateSerializationTarget, hash []byte) (*storage.CellRecord, error) {
-	if store, ok := s.store.(interface {
-		CellRecordInGeneration(context.Context, uint64, []byte) (*storage.CellRecord, error)
-	}); ok && target.state.CellGeneration != 0 {
+	if store, ok := s.store.(stateSerializationGenerationCellStore); ok && target.state.CellGeneration != 0 {
 		return store.CellRecordInGeneration(ctx, target.state.CellGeneration, hash)
 	}
 	return s.store.CellRecord(ctx, hash)

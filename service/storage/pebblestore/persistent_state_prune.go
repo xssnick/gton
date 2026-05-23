@@ -36,6 +36,7 @@ func (s *Store) PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix ui
 
 	sortPersistentStatePruneFiles(files)
 	retained := persistentStatePruneRetainedGroups(files, keepRecentGroups)
+	pendingMigrationSeqno, hasPendingMigration := s.pendingCellGenerationMigrationOriginSeqno()
 	stats.RetainedRecentGroups = len(retained)
 	stats.OldestRetainedMasterSeqno = oldestRetainedPersistentStateSeqno(retained)
 
@@ -48,6 +49,9 @@ func (s *Store) PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix ui
 		}
 
 		if _, ok := retained[file.master.SeqNo]; ok {
+			continue
+		}
+		if hasPendingMigration && file.master.SeqNo == pendingMigrationSeqno {
 			continue
 		}
 
@@ -74,6 +78,16 @@ func (s *Store) PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix ui
 	return stats, nil
 }
 
+func (s *Store) pendingCellGenerationMigrationOriginSeqno() (uint32, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.pendingCellMigration == nil {
+		return 0, false
+	}
+	return s.pendingCellMigration.origin.SeqNo, true
+}
+
 func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMasterSeqno uint32) (storage.PersistentStatePruneStats, error) {
 	stats := storage.PersistentStatePruneStats{}
 	if beforeMasterSeqno == 0 {
@@ -90,9 +104,13 @@ func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMas
 	}
 
 	sortPersistentStatePruneFiles(files)
+	pendingMigrationSeqno, hasPendingMigration := s.pendingCellGenerationMigrationOriginSeqno()
 	var previousSeqno uint32
 	for _, file := range files {
 		if file.master.SeqNo >= beforeMasterSeqno {
+			continue
+		}
+		if hasPendingMigration && file.master.SeqNo == pendingMigrationSeqno {
 			continue
 		}
 		if file.master.SeqNo > previousSeqno {

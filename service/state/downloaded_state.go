@@ -8,6 +8,7 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 type stateImportCoordinator struct {
@@ -26,6 +27,7 @@ func (c *stateImportCoordinator) ImportAndPersist(
 	ctx context.Context,
 	downloaded storage.DownloadedState,
 	store storage.StateStorage,
+	master ton.BlockIDExt,
 ) (*storage.BlockState, error) {
 	block := downloaded.Block()
 	blockRef := storage.FormatBlockRef(block)
@@ -56,6 +58,7 @@ func (c *stateImportCoordinator) ImportAndPersist(
 	if err != nil {
 		return nil, err
 	}
+	setShardMasterchainRef(state, master)
 
 	c.log.Info().
 		Str("block", blockRef).

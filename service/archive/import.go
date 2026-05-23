@@ -347,7 +347,6 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 	}
 	stateRoot := updateTo.Virtualize(0)
 	stateRootHash := stateRoot.HashKey(0)
-	stateCellHash := stateRoot.HashKey()
 
 	started := time.Now()
 	cells, err := storage.PrepareStateUpdateCells(block.StateUpdate)
@@ -361,7 +360,6 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 		State: &storage.BlockState{
 			Block:         id,
 			StateRootHash: append([]byte(nil), stateRootHash[:]...),
-			StateCellHash: append([]byte(nil), stateCellHash[:]...),
 		},
 		StateUpdateToCells:        cells,
 		StateUpdateToCellsElapsed: time.Since(started),

@@ -109,6 +109,87 @@ func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 	}
 }
 
+func TestProbeNextFullFromPeersStagesFanoutAfterDelay(t *testing.T) {
+	peers := []*overlayPeer{
+		{id: "peer-1", addr: "peer-1"},
+		{id: "peer-2", addr: "peer-2"},
+		{id: "peer-3", addr: "peer-3"},
+	}
+	want := &DownloadedBlock{ID: testBlockID(-1, topShard, 42)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	started := make(chan string, len(peers))
+	gotCh := make(chan *DownloadedBlock, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		got, err := probeNextFullFromPeersStaged(ctx, peers, 2, 3, 50*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+			started <- peer.id
+			if peer.id == "peer-3" {
+				return *want, nil
+			}
+			<-ctx.Done()
+			return DownloadedBlock{}, ctx.Err()
+		}, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		gotCh <- got
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case peer := <-started:
+			seen[peer] = true
+		case <-time.After(time.Second):
+			t.Fatalf("probe did not start initial peers, seen=%v", seen)
+		}
+	}
+	if seen["peer-3"] {
+		t.Fatal("staged peer started before delay")
+	}
+
+	select {
+	case peer := <-started:
+		t.Fatalf("unexpected staged peer before delay: %s", peer)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("probeNextFullFromPeersStaged: %v", err)
+	case got := <-gotCh:
+		if !got.ID.Equals(&want.ID) {
+			t.Fatalf("unexpected block: got=%s want=%s", got.BlockRef(), want.BlockRef())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe did not complete after staged fanout")
+	}
+}
+
+func TestPreferDownloadPeerMovesSourceFirst(t *testing.T) {
+	peers := []*overlayPeer{
+		{id: "peer-a", addr: "peer-a"},
+		{id: "peer-b", addr: "peer-b"},
+		{id: "peer-c", addr: "peer-c"},
+	}
+
+	got := preferDownloadPeer(peers, "peer-b")
+	if len(got) != len(peers) {
+		t.Fatalf("unexpected peers count: %d", len(got))
+	}
+	if got[0].id != "peer-b" || got[1].id != "peer-a" || got[2].id != "peer-c" {
+		t.Fatalf("unexpected preferred order: %q, %q, %q", got[0].id, got[1].id, got[2].id)
+	}
+	if peers[0].id != "peer-a" || peers[1].id != "peer-b" || peers[2].id != "peer-c" {
+		t.Fatal("preferDownloadPeer mutated original slice order")
+	}
+}
+
 func TestChainBlockDownloadSuccessPinsPeer(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
@@ -140,6 +221,185 @@ func TestChainBlockUnavailableDoesNotClearPinnedPeer(t *testing.T) {
 	got := sub.currentChainBlockPeer(chain, []*overlayPeer{fast})
 	if got != fast {
 		t.Fatalf("expected not-available response to keep sticky peer, got %v", got)
+	}
+}
+
+func TestLiveNextUnavailablePenalizesAndClearsPinnedMasterPeer(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(-1, topShard, 41)
+	stale := &overlayPeer{id: "stale", addr: "stale", alive: true}
+	fresh := &overlayPeer{id: "fresh", addr: "fresh", alive: true}
+
+	sub.noteChainBlockDownloadSuccess(chain, stale, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 1<<20),
+	}, time.Millisecond)
+	if got := sub.currentChainBlockPeer(chain, []*overlayPeer{fresh, stale}); got != stale {
+		t.Fatalf("expected stale peer to be sticky before live miss, got %v", got)
+	}
+
+	sub.noteLiveNextDownloadFailure(chain, stale, ErrBlockNotAvailable)
+	if got := sub.currentChainBlockPeer(chain, []*overlayPeer{stale}); got != nil {
+		t.Fatalf("expected live miss to clear sticky peer, got %v", got)
+	}
+
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{stale, fresh}, "", time.Now())
+	if prioritized[0] != fresh || prioritized[1] != stale {
+		t.Fatalf("unexpected live next priority after miss: %q, %q", prioritized[0].id, prioritized[1].id)
+	}
+}
+
+func TestLiveNextUnavailableDoesNotClearBasechainSticky(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(0, topShard, 77)
+	peer := &overlayPeer{id: "base-fast", addr: "base-fast", alive: true}
+
+	sub.noteChainBlockDownloadSuccess(chain, peer, &DownloadedBlock{
+		ID:       testBlockID(0, topShard, 78),
+		BlockBOC: make([]byte, 1<<20),
+	}, time.Millisecond)
+	sub.noteLiveNextDownloadFailure(chain, peer, ErrBlockNotAvailable)
+
+	if got := sub.currentChainBlockPeer(chain, []*overlayPeer{peer}); got != peer {
+		t.Fatalf("basechain not-available should keep sticky peer, got %v", got)
+	}
+}
+
+func TestLiveNextPeerScorePrefersLowerLatency(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(-1, topShard, 41)
+	slow := &overlayPeer{id: "slow", addr: "slow", alive: true}
+	fast := &overlayPeer{id: "fast", addr: "fast", alive: true}
+	block := &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 1<<20),
+	}
+
+	sub.noteLiveNextDownloadSuccess(chain, slow, block, 400*time.Millisecond, 0)
+	sub.noteLiveNextDownloadSuccess(chain, fast, block, 50*time.Millisecond, 0)
+
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{slow, fast}, "", time.Now())
+	if prioritized[0] != fast || prioritized[1] != slow {
+		t.Fatalf("unexpected live next latency order: %q, %q", prioritized[0].id, prioritized[1].id)
+	}
+}
+
+func TestLiveNextPeerScoreKeepsSlowPeerBehindHealthy(t *testing.T) {
+	now := time.Now()
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(-1, topShard, 41)
+	slow := &overlayPeer{id: "slow", addr: "slow", alive: true, downloadSlowUntil: now.Add(time.Minute)}
+	healthy := &overlayPeer{id: "healthy", addr: "healthy", alive: true}
+	block := &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 1<<20),
+	}
+
+	sub.noteLiveNextDownloadSuccess(chain, slow, block, 10*time.Millisecond, 0)
+	slow.downloadSlowUntil = now.Add(time.Minute)
+
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{slow, healthy}, "", now)
+	if prioritized[0] != healthy || prioritized[1] != slow {
+		t.Fatalf("unexpected live next health order: %q, %q", prioritized[0].id, prioritized[1].id)
+	}
+}
+
+func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
+	now := int32(time.Now().Unix())
+	sticky := &overlayPeer{id: "sticky", addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	fast := &overlayPeer{id: "fast", addr: "fast", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		peers: map[string]*overlayPeer{
+			sticky.id: sticky,
+			fast.id:   fast,
+		},
+	}
+	chain := testBlockID(-1, topShard, 41)
+	block := &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 1<<20),
+	}
+
+	sub.noteChainBlockDownloadSuccess(chain, sticky, block, time.Millisecond)
+	sub.noteLiveNextDownloadSuccess(chain, sticky, block, 300*time.Millisecond, 0)
+	sub.noteLiveNextDownloadSuccess(chain, fast, block, 20*time.Millisecond, 0)
+
+	candidates := sub.liveNextBlockDownloadCandidates(chain, "")
+	if len(candidates) != 2 {
+		t.Fatalf("unexpected candidate count: %d", len(candidates))
+	}
+	if candidates[0] != fast {
+		t.Fatalf("fast live next peer should beat generic sticky peer, got %q", candidates[0].id)
+	}
+}
+
+func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
+	now := int32(time.Now().Unix())
+	sticky := &overlayPeer{id: "sticky", addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	preferred := &overlayPeer{id: "preferred", addr: "preferred", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		peers: map[string]*overlayPeer{
+			sticky.id:    sticky,
+			preferred.id: preferred,
+		},
+	}
+	chain := testBlockID(-1, topShard, 41)
+
+	sub.noteChainBlockDownloadSuccess(chain, sticky, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 1<<20),
+	}, time.Millisecond)
+
+	candidates := sub.liveNextBlockDownloadCandidates(chain, preferred.id)
+	if len(candidates) != 2 {
+		t.Fatalf("unexpected candidate count: %d", len(candidates))
+	}
+	if candidates[0] != preferred {
+		t.Fatalf("preferred source should lead live next probe, got %q", candidates[0].id)
+	}
+}
+
+func TestLiveNextPeerScoreAccountsForBlockSize(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(-1, topShard, 41)
+	smallFast := &overlayPeer{id: "small-fast", addr: "small-fast", alive: true}
+	bigFast := &overlayPeer{id: "big-fast", addr: "big-fast", alive: true}
+
+	sub.noteLiveNextDownloadSuccess(chain, smallFast, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 64<<10),
+	}, 40*time.Millisecond, 0)
+	sub.noteLiveNextDownloadSuccess(chain, bigFast, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 43),
+		BlockBOC: make([]byte, 4<<20),
+	}, 800*time.Millisecond, 0)
+
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{smallFast, bigFast}, "", time.Now())
+	if prioritized[0] != bigFast || prioritized[1] != smallFast {
+		t.Fatalf("unexpected live next size-aware order: %q, %q", prioritized[0].id, prioritized[1].id)
+	}
+}
+
+func TestLiveNextPeerScoreRewardsAvailabilityAfterMisses(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(-1, topShard, 41)
+	alwaysFast := &overlayPeer{id: "always-fast", addr: "always-fast", alive: true}
+	earlyAvailable := &overlayPeer{id: "early-available", addr: "early-available", alive: true}
+
+	sub.noteLiveNextDownloadSuccess(chain, alwaysFast, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 4<<20),
+	}, 300*time.Millisecond, 0)
+	sub.noteLiveNextDownloadSuccess(chain, earlyAvailable, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 43),
+		BlockBOC: make([]byte, 1<<20),
+	}, time.Second, 4)
+
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{alwaysFast, earlyAvailable}, "", time.Now())
+	if prioritized[0] != earlyAvailable || prioritized[1] != alwaysFast {
+		t.Fatalf("unexpected live next availability order: %q, %q", prioritized[0].id, prioritized[1].id)
 	}
 }
 

@@ -1,7 +1,9 @@
 package liteserver
 
 import (
+	"context"
 	"errors"
+	"strconv"
 	"sync"
 
 	"github.com/xssnick/gton/service/storage"
@@ -33,6 +35,7 @@ type liveBlockFragments struct {
 	baseConfig        *runMethodBaseConfig
 	globalLibs        *cell.Dictionary
 	librariesLoaded   bool
+	lazyLoad          liveBlockLoadGroup
 }
 
 func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*liveBlockFragments, error) {
@@ -98,22 +101,40 @@ func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {
 	}
 	f.mu.Unlock()
 
-	extra, err := mcStateExtra(f.stateRoot)
-	if err != nil {
-		return nil, err
-	}
-	extra, err = prewarmMcStateExtra(extra)
-	if err != nil {
-		return nil, err
-	}
+	value, err := f.lazyLoad.do(context.Background(), "mc-extra", func() (any, error) {
+		f.mu.Lock()
+		if f.masterExtra != nil {
+			extra := f.masterExtra
+			f.mu.Unlock()
+			return extra, nil
+		}
+		f.mu.Unlock()
 
-	f.mu.Lock()
-	if f.masterExtra == nil {
-		f.masterExtra = extra
-	} else {
-		extra = f.masterExtra
+		extra, err := mcStateExtra(f.stateRoot)
+		if err != nil {
+			return nil, err
+		}
+		extra, err = prewarmMcStateExtra(extra)
+		if err != nil {
+			return nil, err
+		}
+
+		f.mu.Lock()
+		if f.masterExtra == nil {
+			f.masterExtra = extra
+		} else {
+			extra = f.masterExtra
+		}
+		f.mu.Unlock()
+		return extra, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	f.mu.Unlock()
+	extra, ok := value.(*tlb.McStateExtra)
+	if !ok {
+		return nil, errors.New("invalid masterchain state extra cache value")
+	}
 	return extra, nil
 }
 
@@ -125,21 +146,38 @@ func (f *liveBlockFragments) shardHashesProof(workchain int32) (*cell.Cell, erro
 	}
 	f.mu.Unlock()
 
-	proof, err := shardHashesProof(f.stateRoot, workchain)
+	value, err := f.lazyLoad.do(context.Background(), "shard-hashes:"+strconv.FormatInt(int64(workchain), 10), func() (any, error) {
+		f.mu.Lock()
+		if proof := f.shardHashesProofs[workchain]; proof != nil {
+			f.mu.Unlock()
+			return proof, nil
+		}
+		f.mu.Unlock()
+
+		proof, err := shardHashesProof(f.stateRoot, workchain)
+		if err != nil {
+			return nil, err
+		}
+
+		f.mu.Lock()
+		if f.shardHashesProofs == nil {
+			f.shardHashesProofs = map[int32]*cell.Cell{}
+		}
+		if cached := f.shardHashesProofs[workchain]; cached != nil {
+			proof = cached
+		} else {
+			f.shardHashesProofs[workchain] = proof
+		}
+		f.mu.Unlock()
+		return proof, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	f.mu.Lock()
-	if f.shardHashesProofs == nil {
-		f.shardHashesProofs = map[int32]*cell.Cell{}
+	proof, ok := value.(*cell.Cell)
+	if !ok {
+		return nil, errors.New("invalid shard hashes proof cache value")
 	}
-	if cached := f.shardHashesProofs[workchain]; cached != nil {
-		proof = cached
-	} else {
-		f.shardHashesProofs[workchain] = proof
-	}
-	f.mu.Unlock()
 	return proof, nil
 }
 
@@ -160,23 +198,41 @@ func (f *liveBlockFragments) runMethodBaseConfig() (*runMethodBaseConfig, error)
 	}
 	f.mu.Unlock()
 
-	extra, err := f.mcStateExtra()
+	value, err := f.lazyLoad.do(context.Background(), "base-config", func() (any, error) {
+		f.mu.Lock()
+		if f.baseConfig != nil {
+			config := f.baseConfig
+			f.mu.Unlock()
+			return config, nil
+		}
+		f.mu.Unlock()
+
+		extra, err := f.mcStateExtra()
+		if err != nil {
+			return nil, err
+		}
+
+		config, err := buildRunMethodBaseConfig(f.block, extra)
+		if err != nil {
+			return nil, err
+		}
+
+		f.mu.Lock()
+		if f.baseConfig == nil {
+			f.baseConfig = config
+		} else {
+			config = f.baseConfig
+		}
+		f.mu.Unlock()
+		return config, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	config, err := buildRunMethodBaseConfig(f.block, extra)
-	if err != nil {
-		return nil, err
+	config, ok := value.(*runMethodBaseConfig)
+	if !ok {
+		return nil, errors.New("invalid run method base config cache value")
 	}
-
-	f.mu.Lock()
-	if f.baseConfig == nil {
-		f.baseConfig = config
-	} else {
-		config = f.baseConfig
-	}
-	f.mu.Unlock()
 	return config, nil
 }
 
@@ -197,23 +253,41 @@ func (f *liveBlockFragments) globalLibraries() (*cell.Dictionary, error) {
 	}
 	f.mu.Unlock()
 
-	globalLibs, err := librariesDict(f.stateRoot)
-	if err != nil {
-		return nil, err
-	}
-	globalLibs, err = prewarmCachedDict(globalLibs, 256, liveGlobalLibrariesPrewarmDepth)
-	if err != nil {
-		return nil, err
-	}
+	value, err := f.lazyLoad.do(context.Background(), "global-libraries", func() (any, error) {
+		f.mu.Lock()
+		if f.librariesLoaded {
+			globalLibs := f.globalLibs
+			f.mu.Unlock()
+			return globalLibs, nil
+		}
+		f.mu.Unlock()
 
-	f.mu.Lock()
-	if !f.librariesLoaded {
-		f.globalLibs = globalLibs
-		f.librariesLoaded = true
-	} else {
-		globalLibs = f.globalLibs
+		globalLibs, err := librariesDict(f.stateRoot)
+		if err != nil {
+			return nil, err
+		}
+		globalLibs, err = prewarmCachedDict(globalLibs, 256, liveGlobalLibrariesPrewarmDepth)
+		if err != nil {
+			return nil, err
+		}
+
+		f.mu.Lock()
+		if !f.librariesLoaded {
+			f.globalLibs = globalLibs
+			f.librariesLoaded = true
+		} else {
+			globalLibs = f.globalLibs
+		}
+		f.mu.Unlock()
+		return globalLibs, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	f.mu.Unlock()
+	globalLibs, ok := value.(*cell.Dictionary)
+	if !ok {
+		return nil, errors.New("invalid global libraries cache value")
+	}
 	return globalLibs, nil
 }
 

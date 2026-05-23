@@ -5,12 +5,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
-	"github.com/xssnick/gton/service/archive"
-	tnstore "github.com/xssnick/gton/service/storage"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xssnick/gton/service/archive"
+	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
@@ -106,16 +107,16 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 	node.runCtx = runCtx
 	node.zeroStateFileHash = make([]byte, 32)
 
-	sub := &overlaySubscription{
-		node: node,
-		spec: overlaySpec{
-			Name:              "basechain",
-			ShortID:           make([]byte, 32),
-			ProtoVersionMajor: shardchainProtoVersionMajor,
-			ProtoVersionMinor: shardchainProtoVersionMinor,
-		},
-		log: discardLogger(),
+	spec, err := buildOverlaySpec(node.zeroStateFileHash, 0, topShard, overlayName(0, topShard))
+	if err != nil {
+		t.Fatalf("build overlay spec: %v", err)
 	}
+	sub, _ := node.getOrCreateSubscription(spec)
+	peer := testRebroadcastQueuePeer("peer")
+	sub.mx.Lock()
+	sub.peers[peer.id] = peer
+	sub.mx.Unlock()
+
 	data := testExternalMessageBOC(t)
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, SendExtMessage{
@@ -131,7 +132,7 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	req, ok := node.localRebroadcastQueue.Pop(ctx)
+	req, ok := peer.localRebroadcastQueue.Pop(ctx)
 	if !ok {
 		t.Fatal("expected external message rebroadcast request")
 	}
@@ -156,24 +157,18 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 }
 
 func TestLocalExternalRebroadcastQueueHasPriority(t *testing.T) {
-	node := newTestNode(t)
-	sub := &overlaySubscription{
-		node: node,
-		spec: overlaySpec{Name: "basechain"},
-		log:  discardLogger(),
-	}
+	peer := testRebroadcastQueuePeer("peer")
 
-	if !node.rebroadcastQueue.Push(rebroadcastRequest{
-		subscription: sub,
-		kind:         "tonNode.newShardBlockBroadcast",
-		payload:      []byte{0x01},
+	if !peer.rebroadcastQueue.Push(rebroadcastRequest{
+		kind:    "tonNode.newShardBlockBroadcast",
+		payload: []byte{0x01},
 	}) {
 		t.Fatal("enqueue ordinary rebroadcast")
 	}
-	if !node.localRebroadcastQueue.Push(rebroadcastRequest{
-		subscription: sub,
-		kind:         "tonNode.externalMessageBroadcast",
-		payload:      []byte{0x02},
+	if !peer.localRebroadcastQueue.Push(rebroadcastRequest{
+		kind:    "tonNode.externalMessageBroadcast",
+		payload: []byte{0x02},
+		local:   true,
 	}) {
 		t.Fatal("enqueue local external rebroadcast")
 	}
@@ -181,7 +176,7 @@ func TestLocalExternalRebroadcastQueueHasPriority(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	first, ok := popPriority(ctx, node.localRebroadcastQueue, node.rebroadcastQueue)
+	first, ok := popPriority(ctx, peer.localRebroadcastQueue, peer.rebroadcastQueue)
 	if !ok {
 		t.Fatal("expected priority rebroadcast")
 	}
@@ -189,7 +184,7 @@ func TestLocalExternalRebroadcastQueueHasPriority(t *testing.T) {
 		t.Fatalf("first rebroadcast kind = %q, want local external", first.kind)
 	}
 
-	second, ok := popPriority(ctx, node.localRebroadcastQueue, node.rebroadcastQueue)
+	second, ok := popPriority(ctx, peer.localRebroadcastQueue, peer.rebroadcastQueue)
 	if !ok {
 		t.Fatal("expected ordinary rebroadcast")
 	}
@@ -635,4 +630,19 @@ func countKnownPeers(peers map[string]*overlayPeer) int {
 		count++
 	}
 	return count
+}
+
+func testRebroadcastQueuePeer(id string) *overlayPeer {
+	peer := &overlayPeer{
+		id:      id,
+		addr:    id,
+		overlay: &overlay.ADNLOverlayWrapper{},
+		announced: &overlay.Node{
+			Version: int32(time.Now().Unix()),
+		},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	peer.initRebroadcastQueues()
+	return peer
 }

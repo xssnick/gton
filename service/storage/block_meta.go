@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sort"
 
@@ -13,6 +14,26 @@ import (
 type BlockHistoryKey struct {
 	Workchain int32
 	Shard     int64
+}
+
+// AccountShardCandidates returns the shard IDs along the account prefix path.
+func AccountShardCandidates(workchain int32, account []byte) []int64 {
+	if workchain == masterchainID {
+		return []int64{masterchainShard}
+	}
+	if len(account) < 8 {
+		return nil
+	}
+
+	prefix := binary.BigEndian.Uint64(account[:8])
+	shards := make([]int64, 0, 61)
+	shards = append(shards, masterchainShard)
+	for length := 1; length <= 60; length++ {
+		x := uint64(1) << (63 - uint(length))
+		shard := (prefix & ^(x - 1)) | x
+		shards = append(shards, int64(shard))
+	}
+	return shards
 }
 
 type BlockMetaFlags uint32
@@ -29,7 +50,10 @@ const (
 	BlockMetaIsKeyBlock
 )
 
-const masterchainShard = int64(-1 << 63)
+const (
+	masterchainID    int32 = -1
+	masterchainShard int64 = -1 << 63
+)
 
 type BlockMeta struct {
 	ID            ton.BlockIDExt
@@ -40,7 +64,7 @@ type BlockMeta struct {
 	StateRootHash []byte
 	StateFileHash []byte
 	// MasterchainRef matches C++ BlockHandle::masterchain_ref_block:
-	// the masterchain block that first included this shard block.
+	// the masterchain block that applied/included this shard block, not BlockInfo.MasterRef.
 	MasterchainRef *ton.BlockIDExt
 	PrevRefs       []ton.BlockIDExt
 }
@@ -147,7 +171,7 @@ func MergeBlockMeta(base *BlockMeta, next *BlockMeta) *BlockMeta {
 	if len(next.StateFileHash) > 0 {
 		merged.StateFileHash = bytes.Clone(next.StateFileHash)
 	}
-	if merged.MasterchainRef == nil && next.MasterchainRef != nil {
+	if next.MasterchainRef != nil {
 		ref := *next.MasterchainRef
 		merged.MasterchainRef = &ref
 	}
@@ -343,8 +367,6 @@ func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockM
 		if block.BlockInfo.MasterRef == nil {
 			return nil, fmt.Errorf("shard block %s has no masterchain ref", FormatBlockRef(id))
 		}
-		ref := blockRefToBlockIDExt(-1, masterchainShard, *block.BlockInfo.MasterRef)
-		meta.MasterchainRef = &ref
 	}
 
 	prev := make([]ton.BlockIDExt, 0, 2)

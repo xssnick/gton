@@ -179,9 +179,7 @@ func (s *Server) handleAccountState(ctx context.Context, id *ton.BlockIDExt, acc
 }
 
 func (s *Server) masterchainInfoWithUTime(ctx context.Context) (ton.MasterchainInfo, uint32, error) {
-	if cached, ok := s.store.(interface {
-		CurrentMasterchainInfo(context.Context) (ton.BlockIDExt, []byte, uint32, error)
-	}); ok {
+	if cached, ok := s.store.(currentMasterchainInfoStore); ok {
 		block, stateRoot, lastUTime, err := cached.CurrentMasterchainInfo(ctx)
 		if err == nil {
 			info, err := s.masterchainInfo(block, stateRoot)

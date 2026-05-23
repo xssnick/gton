@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -22,7 +23,10 @@ type liteserverOptions struct {
 type metricsOptions struct {
 	Enabled    bool
 	ListenAddr string
+	Namespace  string
 }
+
+var metricsNamespacePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func p2pOptionsFromConfig(cfg nodeconfig.Config) (p2p.Options, error) {
 	opts := p2p.Options{
@@ -84,9 +88,19 @@ func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, erro
 }
 
 func metricsOptionsFromConfig(cfg nodeconfig.Config) (metricsOptions, error) {
+	namespace := strings.TrimSpace(cfg.Metrics.Namespace)
+	if namespace == "" {
+		// Config loading applies this default too; keep direct Config callers consistent.
+		namespace = nodeconfig.DefaultMetricsNamespace
+	}
+	if !metricsNamespacePattern.MatchString(namespace) {
+		return metricsOptions{}, fmt.Errorf("metrics.namespace must match [A-Za-z_][A-Za-z0-9_]*")
+	}
+
 	opts := metricsOptions{
 		Enabled:    cfg.Metrics.Enabled,
 		ListenAddr: strings.TrimSpace(cfg.Metrics.ListenAddr),
+		Namespace:  namespace,
 	}
 	if opts.Enabled && opts.ListenAddr == "" {
 		return metricsOptions{}, fmt.Errorf("metrics.listen_addr is required when metrics.enabled is true")

@@ -50,10 +50,17 @@ func (s *testStateStore) SaveCurrentState(_ context.Context, state *storage.Curr
 }
 
 func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
-	return s.SaveStateCheckpointWithCells(context.Background(), blocks, current, nil)
+	entries := make([]storage.StateCheckpointBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		entries = append(entries, storage.StateCheckpointBlock{State: block})
+	}
+	return s.SaveStateCheckpointEntries(context.Background(), entries, current)
 }
 
-func (s *testStateStore) SaveStateCheckpointWithCells(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState, _ []storage.EncodedCellRecord) error {
+func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, current *storage.CurrentState) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}
@@ -61,11 +68,11 @@ func (s *testStateStore) SaveStateCheckpointWithCells(_ context.Context, blocks 
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
-	for _, block := range blocks {
-		if block == nil {
+	for _, entry := range blocks {
+		if entry.State == nil {
 			continue
 		}
-		clonedBlock := storage.CloneBlockState(block)
+		clonedBlock := storage.CloneBlockState(entry.State)
 		fillTestBlockStateHashes(clonedBlock)
 		s.blocks[storage.BlockKey(clonedBlock.Block)] = clonedBlock
 	}
@@ -207,9 +214,5 @@ func fillTestBlockStateHashes(state *storage.BlockState) {
 	if len(state.StateRootHash) == 0 && state.Cell != nil {
 		hash := state.Cell.HashKey(0)
 		state.StateRootHash = hash[:]
-	}
-	if len(state.StateCellHash) == 0 && state.Cell != nil {
-		hash := state.Cell.HashKey()
-		state.StateCellHash = hash[:]
 	}
 }

@@ -11,7 +11,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestBuildBlockMetaFromParsedShardBlockKeepsMasterRef(t *testing.T) {
+func TestBuildBlockMetaFromParsedShardBlockDoesNotUseHeaderMasterRef(t *testing.T) {
 	id := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 21}
 	masterRef := tlb.ExtBlkRef{
 		EndLt:    100,
@@ -35,14 +35,11 @@ func TestBuildBlockMetaFromParsedShardBlockKeepsMasterRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build meta: %v", err)
 	}
-	if meta.MasterchainRef == nil {
-		t.Fatal("masterchain ref is nil")
-	}
-	if meta.MasterchainRef.Workchain != -1 || meta.MasterchainRef.Shard != masterchainShard || meta.MasterchainRef.SeqNo != masterRef.SeqNo {
-		t.Fatalf("unexpected master ref: %s", FormatBlockRef(*meta.MasterchainRef))
-	}
-	if !bytes.Equal(meta.MasterchainRef.RootHash, masterRef.RootHash) || !bytes.Equal(meta.MasterchainRef.FileHash, masterRef.FileHash) {
-		t.Fatal("master ref hashes mismatch")
+	// Keep this aligned with cppnode: BlockInfo.MasterRef is validated as part
+	// of the shard header, but BlockHandle::masterchain_ref_block is filled later
+	// from the masterchain block that actually applies/includes the shard block.
+	if meta.MasterchainRef != nil {
+		t.Fatalf("header master ref leaked into block meta: %s", FormatBlockRef(*meta.MasterchainRef))
 	}
 }
 

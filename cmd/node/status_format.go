@@ -87,12 +87,12 @@ func formatDBCacheStatus(b *strings.Builder, cache pebblestore.CellDBCacheStatus
 }
 
 func formatDBMetricsHeader(b *strings.Builder, label string) {
-	fmt.Fprintf(b, "    %-5s %9s %9s %7s %5s %9s %9s %9s %10s %10s %8s\n",
-		label, "disk", "live", "tables", "amp", "l0 f/s", "l0 size", "debt", "comp", "mem", "fl/ing")
+	fmt.Fprintf(b, "    %-5s %9s %9s %7s %5s %9s %9s %9s %10s %10s %11s %8s\n",
+		label, "disk", "live", "tables", "amp", "l0 f/s", "l0 size", "debt", "comp", "mem", "rd/wr/s", "fl/ing")
 }
 
 func formatDBMetricsStatus(b *strings.Builder, label string, shard pebblestore.CellDBShardStatus) {
-	fmt.Fprintf(b, "    %-5s %9s %9s %7d %5d %9s %9s %9s %10s %10s %8s\n",
+	fmt.Fprintf(b, "    %-5s %9s %9s %7d %5d %9s %9s %9s %10s %10s %11s %8s\n",
 		label,
 		formatDBBytes(shard.DiskSize),
 		formatDBBytes(shard.LiveSize),
@@ -103,8 +103,36 @@ func formatDBMetricsStatus(b *strings.Builder, label string, shard pebblestore.C
 		formatDBBytes(shard.CompactionDebt),
 		fmt.Sprintf("%d/%s", shard.CompactionsInProgress, formatDBBytesInt(shard.CompactionInProgressSize)),
 		fmt.Sprintf("%s/%d", formatDBBytes(shard.MemTableSize), shard.MemTableCount),
+		formatDBCellRate(shard.ReadCellsPerSecond, shard.WrittenCellsPerSecond),
 		fmt.Sprintf("%d/%d", shard.Flushes, shard.Ingests),
 	)
+}
+
+func formatDBCellRate(read float64, write float64) string {
+	return fmt.Sprintf("%s/%s", formatDBCellsPerSecond(read), formatDBCellsPerSecond(write))
+}
+
+func formatDBCellsPerSecond(value float64) string {
+	if value <= 0 {
+		return "0"
+	}
+
+	units := []string{"", "K", "M", "G"}
+	unit := 0
+	for value >= 1000 && unit+1 < len(units) {
+		value /= 1000
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%.0f", value)
+	}
+	if value >= 100 {
+		return fmt.Sprintf("%.0f%s", value, units[unit])
+	}
+	if value >= 10 {
+		return fmt.Sprintf("%.1f%s", value, units[unit])
+	}
+	return fmt.Sprintf("%.2f%s", value, units[unit])
 }
 
 func formatDBCacheHitRate(hits int64, misses int64) string {

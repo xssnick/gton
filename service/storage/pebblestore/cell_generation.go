@@ -194,41 +194,16 @@ func (s *Store) PendingCellGenerationMigration(ctx context.Context) (storage.Cel
 	}, nil
 }
 
-func (s *Store) CellGenerationStateImported(ctx context.Context, generation uint64, block ton.BlockIDExt) error {
-	if generation == 0 {
-		return fmt.Errorf("cell generation is zero")
-	}
-	if isEmptyBlockID(block) {
-		return fmt.Errorf("cell generation imported state block is empty")
-	}
-
-	raw, err := s.getHotCopy(ctx, hotKeyCellGenerationStateImport(generation, block))
-	if err != nil {
-		return err
-	}
-	if len(raw) != 1 || raw[0] != cellGenerationStateImportVersion {
-		return fmt.Errorf("unsupported cell generation state import marker")
-	}
-	return nil
-}
-
-func (s *Store) MarkCellGenerationStateImported(ctx context.Context, generation uint64, block ton.BlockIDExt) error {
-	if generation == 0 {
-		return fmt.Errorf("cell generation is zero")
-	}
-	if isEmptyBlockID(block) {
-		return fmt.Errorf("cell generation imported state block is empty")
-	}
-
-	return s.setHotRecord(ctx, hotKeyCellGenerationStateImport(generation, block), []byte{cellGenerationStateImportVersion}, pebble.Sync)
-}
-
 func (s *Store) CellGenerationMigrationProgress(ctx context.Context, generation uint64) (*storage.CurrentState, error) {
 	if generation == 0 {
 		return nil, fmt.Errorf("cell generation is zero")
 	}
 
-	return s.currentStateRecord(ctx, hotKeyCellGenerationCurrent(generation), "cell generation migration progress")
+	raw, err := s.getHotCopy(ctx, hotKeyCellGenerationCurrent(generation))
+	if err != nil {
+		return nil, err
+	}
+	return decodeCellGenerationMigrationProgress(raw)
 }
 
 func (s *Store) SaveCellGenerationMigrationProgress(ctx context.Context, generation uint64, current *storage.CurrentState) error {
@@ -239,7 +214,7 @@ func (s *Store) SaveCellGenerationMigrationProgress(ctx context.Context, generat
 		return fmt.Errorf("cell generation migration progress is nil")
 	}
 
-	return s.setHotRecord(ctx, hotKeyCellGenerationCurrent(generation), encodeCurrentState(current), pebble.Sync)
+	return s.setHotRecord(ctx, hotKeyCellGenerationCurrent(generation), encodeCellGenerationMigrationProgress(current), pebble.Sync)
 }
 
 func (s *Store) BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) (uint64, error) {
@@ -355,13 +330,10 @@ func (s *Store) AbortCellGeneration(ctx context.Context, generation uint64) erro
 	if err := s.deleteCellGenerationMigrationProgress(ctx, generation); err != nil {
 		return err
 	}
-	if err := s.deleteCellGenerationStateImportMarkers(ctx, generation); err != nil {
+	if err := s.clearPendingCellGeneration(ctx, generation); err != nil {
 		return err
 	}
-	if err := s.closeAndRemoveCellGeneration(ctx, generation, false); err != nil {
-		return err
-	}
-	return s.clearPendingCellGeneration(ctx, generation)
+	return s.closeAndRemoveCellGeneration(ctx, generation, false)
 }
 
 func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64) error {
@@ -376,6 +348,15 @@ func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64
 	if generation == 0 {
 		return fmt.Errorf("cell generation is zero")
 	}
+
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.releaseHotDB()
+
+	s.hotWriteMu.Lock()
+	defer s.hotWriteMu.Unlock()
 
 	s.mu.Lock()
 	if s.closed {
@@ -392,42 +373,9 @@ func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64
 	}
 
 	cells := s.cellGenerations[generation]
-	delete(s.cellGenerations, generation)
-	s.pendingCellMigration = nil
 	manifest := s.manifestLocked()
+	manifest.pending = nil
 	s.mu.Unlock()
-
-	s.log.Info().
-		Uint64("cell_generation", generation).
-		Msg("detached pending cell generation migration")
-
-	go s.cleanupDroppedPendingCellGeneration(generation, manifest, cells)
-	return nil
-}
-
-func (s *Store) cleanupDroppedPendingCellGeneration(generation uint64, manifest cellGenerationManifest, cells *cellStore) {
-	s.removeDetachedCellGeneration(generation, cells)
-	if err := s.deleteDroppedPendingCellGenerationMetadata(generation, manifest); err != nil {
-		s.log.Warn().
-			Err(err).
-			Uint64("cell_generation", generation).
-			Msg("failed to delete dropped pending cell generation metadata")
-	}
-}
-
-func (s *Store) deleteDroppedPendingCellGenerationMetadata(generation uint64, manifest cellGenerationManifest) error {
-	if err := s.ensureWritable(); err != nil {
-		return err
-	}
-
-	db, err := s.acquireHotDB(context.Background())
-	if err != nil {
-		return err
-	}
-	defer s.releaseHotDB()
-
-	s.hotWriteMu.Lock()
-	defer s.hotWriteMu.Unlock()
 
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -437,21 +385,33 @@ func (s *Store) deleteDroppedPendingCellGenerationMetadata(generation uint64, ma
 	if err := batch.Delete(hotKeyCellGenerationCurrent(generation), pebble.NoSync); err != nil {
 		return err
 	}
-	importPrefix := hotKeyCellGenerationStateImportPrefix(generation)
-	if err := batch.DeleteRange(importPrefix, prefixUpperBound(importPrefix), pebble.NoSync); err != nil {
-		return err
-	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	detached := false
+	if s.pendingCellMigration != nil && s.pendingCellMigration.generation == generation {
+		delete(s.cellGenerations, generation)
+		s.pendingCellMigration = nil
+		detached = true
+	}
+	s.mu.Unlock()
+
+	if !detached {
+		return nil
+	}
+
+	s.log.Info().
+		Uint64("cell_generation", generation).
+		Msg("detached pending cell generation migration")
+
+	go s.removeDetachedCellGeneration(generation, cells)
 	return nil
 }
 
 func (s *Store) DeleteCellGeneration(ctx context.Context, generation uint64) error {
 	if err := s.deleteCellGenerationMigrationProgress(ctx, generation); err != nil {
-		return err
-	}
-	if err := s.deleteCellGenerationStateImportMarkers(ctx, generation); err != nil {
 		return err
 	}
 	if err := s.closeAndRemoveCellGeneration(ctx, generation, false); err != nil {
@@ -478,7 +438,10 @@ func (s *Store) CleanupRetiredCellGenerations(ctx context.Context) error {
 }
 
 func (s *Store) removeDetachedCellGeneration(generation uint64, cells *cellStore) {
-	closeErr := cells.closeAggressively()
+	var closeErr error
+	if cells != nil {
+		closeErr = cells.closeAggressively()
+	}
 	removeErr := s.removeCellGenerationDirs(generation)
 	if err := errors.Join(closeErr, removeErr); err != nil {
 		s.log.Warn().
@@ -548,56 +511,6 @@ func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uin
 		Uint64("cell_generation", generation).
 		Msg("removed cell generation")
 	return nil
-}
-
-func (s *Store) deleteCellGenerationStateImportMarkers(ctx context.Context, generation uint64) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	if err := s.ensureWritable(); err != nil {
-		return err
-	}
-	if generation == 0 {
-		return fmt.Errorf("cell generation is zero")
-	}
-
-	db, err := s.acquireHotDB(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.releaseHotDB()
-
-	prefix := hotKeyCellGenerationStateImportPrefix(generation)
-	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = iter.Close() }()
-
-	s.hotWriteMu.Lock()
-	defer s.hotWriteMu.Unlock()
-	batch := db.NewBatch()
-	defer func() { _ = batch.Close() }()
-
-	for valid := iter.First(); valid; valid = iter.Next() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if err := batch.Delete(iter.Key(), pebble.NoSync); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	return batch.Commit(pebble.Sync)
 }
 
 func (s *Store) deleteCellGenerationMigrationProgress(ctx context.Context, generation uint64) error {

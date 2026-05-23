@@ -23,10 +23,9 @@ func ShardKeyFromBlock(block ton.BlockIDExt) ShardKey {
 type BlockState struct {
 	Block         ton.BlockIDExt
 	StateRootHash []byte
-	StateCellHash []byte
 	StateFileHash []byte
 	// MasterchainRef matches C++ BlockHandle::masterchain_ref_block:
-	// the masterchain block that first included this shard block.
+	// the masterchain block that applied/included this shard block, not BlockInfo.MasterRef.
 	MasterchainRef *ton.BlockIDExt
 	CellGeneration uint64
 	Cell           *cell.Cell

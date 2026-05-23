@@ -51,6 +51,9 @@
 - Do not introduce internal conversion helpers like `fromX` and `toX` unless there is a real format boundary, protocol boundary, or external API boundary.
 - Inside the project, prefer using the actual types directly.
 
+- Do not declare anonymous non-empty `interface { ... }` or `struct { ... }` types directly in function parameters, local variables, or type assertions.
+- If a local contract is needed, define a named interface or struct type near the code that owns the contract.
+
 ## Code style
 
 - Add empty lines between logical blocks inside functions.

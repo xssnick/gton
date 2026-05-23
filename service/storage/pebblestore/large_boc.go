@@ -178,7 +178,7 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 				}
 			}()
 
-			if err := largeBOCLoadShardRecordIndexes(ctx, db, shardIdx, indexes, hashes, shardReadWorkers, visit); err != nil {
+			if err := largeBOCLoadShardRecordIndexes(ctx, cells, db, shardIdx, indexes, hashes, shardReadWorkers, visit); err != nil {
 				errs <- err
 			}
 		}(shardIdx, shard.db, indexes)
@@ -194,10 +194,10 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 	return stats, joinedErr
 }
 
-func largeBOCLoadShardRecordIndexes(ctx context.Context, db *pebble.DB, shardIdx int, indexes []int, hashes []cell.Hash, shardReadWorkers int, visit largeBOCRecordVisitor) error {
+func largeBOCLoadShardRecordIndexes(ctx context.Context, cells *cellStore, db *pebble.DB, shardIdx int, indexes []int, hashes []cell.Hash, shardReadWorkers int, visit largeBOCRecordVisitor) error {
 	shardReadWorkers = largeBOCShardReadWorkerCount(len(indexes), shardReadWorkers)
 	if shardReadWorkers <= 1 {
-		return largeBOCLoadRecordIndexes(ctx, db, shardIdx, 0, indexes, hashes, visit)
+		return largeBOCLoadRecordIndexes(ctx, cells, db, shardIdx, 0, indexes, hashes, visit)
 	}
 
 	var wg sync.WaitGroup
@@ -213,7 +213,7 @@ func largeBOCLoadShardRecordIndexes(ctx context.Context, db *pebble.DB, shardIdx
 		wg.Add(1)
 		go func(workerIdx int, chunk []int) {
 			defer wg.Done()
-			if err := largeBOCLoadRecordIndexes(ctx, db, shardIdx, workerIdx, chunk, hashes, visit); err != nil {
+			if err := largeBOCLoadRecordIndexes(ctx, cells, db, shardIdx, workerIdx, chunk, hashes, visit); err != nil {
 				errs <- err
 			}
 		}(worker, chunk)
@@ -228,7 +228,12 @@ func largeBOCLoadShardRecordIndexes(ctx context.Context, db *pebble.DB, shardIdx
 	return joinedErr
 }
 
-func largeBOCLoadRecordIndexes(ctx context.Context, db *pebble.DB, shardIdx int, workerIdx int, indexes []int, hashes []cell.Hash, visit largeBOCRecordVisitor) error {
+func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble.DB, shardIdx int, workerIdx int, indexes []int, hashes []cell.Hash, visit largeBOCRecordVisitor) error {
+	var loaded uint64
+	defer func() {
+		cells.addReadCells(shardIdx, loaded)
+	}()
+
 	for n, index := range indexes {
 		if n&0x3fff == 0 {
 			select {
@@ -253,6 +258,7 @@ func largeBOCLoadRecordIndexes(ctx context.Context, db *pebble.DB, shardIdx int,
 		if err = closer.Close(); err != nil {
 			return fmt.Errorf("close cell %x value: %w", hash[:], err)
 		}
+		loaded++
 	}
 	return nil
 }

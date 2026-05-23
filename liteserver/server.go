@@ -40,7 +40,20 @@ type Store interface {
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
 	LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error)
 	LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
+	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
+}
+
+type blockRootStore interface {
+	BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
+}
+
+type blockFragmentsStore interface {
+	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error)
+}
+
+type currentMasterchainInfoStore interface {
+	CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error)
 }
 
 type MessageSender interface {
@@ -92,6 +105,7 @@ type Server struct {
 	blockProofBasesMu   sync.Mutex
 	blockProofBases     map[string]*blockProofBase
 	blockProofBaseOrder []string
+	blockProofBaseLoad  liveBlockLoadGroup
 }
 
 func New(opts Options) (*Server, error) {

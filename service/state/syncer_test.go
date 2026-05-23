@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -172,6 +173,7 @@ func TestSyncerUsesStoredShardStateWithoutCurrentCheckpoint(t *testing.T) {
 	if _, ok := snapshot.Shards[storage.ShardKeyFromBlock(shard)]; !ok {
 		t.Fatalf("stored shard %s is missing from current snapshot", storage.FormatBlockRef(shard))
 	}
+	assertShardMasterchainRef(t, snapshot.Shards[storage.ShardKeyFromBlock(shard)], master)
 	if got := source.downloadCount[storage.BlockKey(shard)]; got != 0 {
 		t.Fatalf("expected stored shard not to be downloaded, got %d", got)
 	}
@@ -223,9 +225,11 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	if _, ok := snapshot.Shards[storage.ShardKeyFromBlock(doneShard)]; !ok {
 		t.Fatalf("completed shard %s is missing from current snapshot", storage.FormatBlockRef(doneShard))
 	}
+	assertShardMasterchainRef(t, snapshot.Shards[storage.ShardKeyFromBlock(doneShard)], pendingMaster)
 	if _, ok := snapshot.Shards[storage.ShardKeyFromBlock(missingShard)]; !ok {
 		t.Fatalf("downloaded shard %s is missing from current snapshot", storage.FormatBlockRef(missingShard))
 	}
+	assertShardMasterchainRef(t, snapshot.Shards[storage.ShardKeyFromBlock(missingShard)], pendingMaster)
 	if got := source.zeroStateCalls; got != 0 {
 		t.Fatalf("expected zero state lookup to be skipped, got %d", got)
 	}
@@ -238,6 +242,32 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	if _, err = store.StateSyncProgress(context.Background()); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected pending progress to be cleared, got %v", err)
 	}
+}
+
+func TestImportAndPersistStoresShardMasterchainRefBeforeMetadata(t *testing.T) {
+	master := testStateBlock(-1, topShard, 10)
+	shard := testStateBlock(0, topShard, 11)
+	store := newTestStateStore()
+	importer := newStateImportCoordinator(zerolog.Nop())
+
+	_, err := importer.ImportAndPersist(
+		context.Background(),
+		newImmediateDownloadedState(&storage.BlockState{
+			Block: shard,
+			Cell:  cell.BeginCell().EndCell(),
+		}),
+		store,
+		master,
+	)
+	if err != nil {
+		t.Fatalf("import and persist shard state: %v", err)
+	}
+
+	stored, err := store.BlockState(context.Background(), shard)
+	if err != nil {
+		t.Fatalf("load stored shard state: %v", err)
+	}
+	assertShardMasterchainRef(t, *stored, master)
 }
 
 func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
@@ -355,6 +385,17 @@ func savePendingMasterProgress(t *testing.T, store *testStateStore, master ton.B
 		Masterchain:      storage.BlockState{Block: master},
 	}); err != nil {
 		t.Fatalf("save pending progress: %v", err)
+	}
+}
+
+func assertShardMasterchainRef(t *testing.T, state storage.BlockState, master ton.BlockIDExt) {
+	t.Helper()
+
+	if state.MasterchainRef == nil {
+		t.Fatalf("shard %s masterchain ref is nil, want %s", storage.FormatBlockRef(state.Block), storage.FormatBlockRef(master))
+	}
+	if !state.MasterchainRef.Equals(&master) {
+		t.Fatalf("shard %s masterchain ref = %s, want %s", storage.FormatBlockRef(state.Block), storage.FormatBlockRef(*state.MasterchainRef), storage.FormatBlockRef(master))
 	}
 }
 

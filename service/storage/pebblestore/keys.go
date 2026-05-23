@@ -34,20 +34,11 @@ var (
 	hotPrefixArchivePackage        = []byte{0x1A}
 	hotPrefixStateSerializerActive = []byte{0x1B}
 	hotPrefixKeyBlockSeq           = []byte{0x1C}
-	hotPrefixCellGenerationImport  = []byte{0x1D}
 	hotPrefixCellGenerationCurrent = []byte{0x1E}
 )
 
 func hotKeyCellGenerationManifest() []byte {
 	return bytes.Clone(hotPrefixCellGeneration)
-}
-
-func hotKeyCellGenerationStateImport(generation uint64, block ton.BlockIDExt) []byte {
-	return append(hotKeyCellGenerationStateImportPrefix(generation), encodeBlockID(block)...)
-}
-
-func hotKeyCellGenerationStateImportPrefix(generation uint64) []byte {
-	return binary.BigEndian.AppendUint64(bytes.Clone(hotPrefixCellGenerationImport), generation)
 }
 
 func hotKeyCellGenerationCurrent(generation uint64) []byte {
@@ -73,6 +64,11 @@ func hotKeyKeyBlockSeqIndex(seqno uint32) []byte {
 
 func hotKeyBlockLTPrefix(key storage.BlockHistoryKey) []byte {
 	return appendHistoryPrefix(hotPrefixBlockLT, key)
+}
+
+func hotKeyBlockLTWorkchainPrefix(workchain int32) []byte {
+	buf := append([]byte(nil), hotPrefixBlockLT...)
+	return binary.BigEndian.AppendUint32(buf, uint32(workchain))
 }
 
 func hotKeyBlockLTIndex(meta *storage.BlockMeta) []byte {

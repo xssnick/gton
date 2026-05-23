@@ -32,6 +32,7 @@ type cellStore struct {
 	closeMu     sync.Mutex
 	closing     atomic.Bool
 	refs        atomic.Int64
+	io          cellStoreIOCounters
 	drained     chan struct{}
 	drainOnce   sync.Once
 	closed      bool
@@ -41,6 +42,28 @@ type cellStore struct {
 
 type cellDBShard struct {
 	db *pebble.DB
+}
+
+type cellStoreIOCounters struct {
+	readCells    [cellDBShardCount]atomic.Uint64
+	writtenCells [cellDBShardCount]atomic.Uint64
+	rates        cellStoreIORateSampler
+}
+
+type cellStoreIOStatus struct {
+	readCells             uint64
+	writtenCells          uint64
+	readCellsPerSecond    float64
+	writtenCellsPerSecond float64
+}
+
+type cellStoreIORateSampler struct {
+	mu                    sync.Mutex
+	lastAt                time.Time
+	lastReadCells         [cellDBShardCount]uint64
+	lastWrittenCells      [cellDBShardCount]uint64
+	readCellsPerSecond    [cellDBShardCount]float64
+	writtenCellsPerSecond [cellDBShardCount]float64
 }
 
 type cellStoreMetrics struct {
@@ -274,11 +297,16 @@ func (c *cellStore) shardForHash(hash []byte) (int, *cellDBShard, error) {
 }
 
 func (c *cellStore) getCopy(hash []byte) ([]byte, error) {
-	_, shard, err := c.shardForHash(hash)
+	idx, shard, err := c.shardForHash(hash)
 	if err != nil {
 		return nil, err
 	}
-	return pebbleReaderGetCopy(shard.db, hash)
+	value, err := pebbleReaderGetCopy(shard.db, hash, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addReadCells(idx, 1)
+	return value, nil
 }
 
 func (c *cellStore) has(hash []byte) (bool, error) {
@@ -365,6 +393,54 @@ func (c *cellStore) metrics() cellStoreMetrics {
 	return metrics
 }
 
+func (c *cellStore) addReadCells(shard int, count uint64) {
+	if c == nil || count == 0 || shard < 0 || shard >= cellDBShardCount {
+		return
+	}
+	c.io.readCells[shard].Add(count)
+}
+
+func (c *cellStore) addWrittenCells(shard int, count uint64) {
+	if c == nil || count == 0 || shard < 0 || shard >= cellDBShardCount {
+		return
+	}
+	c.io.writtenCells[shard].Add(count)
+}
+
+func (c *cellStore) ioStatus(now time.Time) [cellDBShardCount]cellStoreIOStatus {
+	var status [cellDBShardCount]cellStoreIOStatus
+	if c == nil {
+		return status
+	}
+
+	for i := range status {
+		status[i].readCells = c.io.readCells[i].Load()
+		status[i].writtenCells = c.io.writtenCells[i].Load()
+	}
+
+	c.io.rates.mu.Lock()
+	defer c.io.rates.mu.Unlock()
+
+	if !c.io.rates.lastAt.IsZero() {
+		elapsed := now.Sub(c.io.rates.lastAt).Seconds()
+		if elapsed > 0 {
+			for i := range status {
+				c.io.rates.readCellsPerSecond[i] = float64(status[i].readCells-c.io.rates.lastReadCells[i]) / elapsed
+				c.io.rates.writtenCellsPerSecond[i] = float64(status[i].writtenCells-c.io.rates.lastWrittenCells[i]) / elapsed
+			}
+		}
+	}
+
+	for i := range status {
+		c.io.rates.lastReadCells[i] = status[i].readCells
+		c.io.rates.lastWrittenCells[i] = status[i].writtenCells
+		status[i].readCellsPerSecond = c.io.rates.readCellsPerSecond[i]
+		status[i].writtenCellsPerSecond = c.io.rates.writtenCellsPerSecond[i]
+	}
+	c.io.rates.lastAt = now
+	return status
+}
+
 type cellBatchWriter struct {
 	store *cellStore
 
@@ -433,6 +509,7 @@ func (w *cellBatchWriter) flush() (stateCellWriteStats, error) {
 				firstErr = fmt.Errorf("commit celldb shard %d batch: %w", i, err)
 			}
 		} else {
+			w.store.addWrittenCells(i, uint64(w.cellsByShard[i]))
 			w.store.markDirty(i)
 		}
 		_ = batch.Close()

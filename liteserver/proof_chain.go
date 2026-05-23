@@ -68,7 +68,7 @@ func (s *Server) handleLookupBlockWithProof(ctx context.Context, query ton.Looku
 		return errorResponse(err, "cannot build block header proof")
 	}
 
-	prevHeader, err := s.lookupPrevHeaderProof(ctx, target, targetRoot, query)
+	prevHeader, err := s.lookupPrevHeaderProof(ctx, target, query)
 	if err != nil {
 		return errorResponse(err, "cannot build previous block header proof")
 	}
@@ -134,12 +134,12 @@ func (s *Server) lookupBlockForProof(ctx context.Context, query ton.LookupBlockW
 	}
 }
 
-func (s *Server) lookupPrevHeaderProof(ctx context.Context, target ton.BlockIDExt, targetRoot *cell.Cell, query ton.LookupBlockWithProof) ([]byte, error) {
+func (s *Server) lookupPrevHeaderProof(ctx context.Context, target ton.BlockIDExt, query ton.LookupBlockWithProof) ([]byte, error) {
 	if query.Mode&6 == 0 {
 		return nil, nil
 	}
 
-	prev, err := s.previousBlockForPrefix(ctx, target, targetRoot, storage.ShardKey{
+	prev, err := s.previousBlockForPrefix(ctx, target, storage.ShardKey{
 		Workchain: query.ID.Workchain,
 		Shard:     query.ID.Shard,
 	})
@@ -323,36 +323,15 @@ func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt) (ton.
 	return ton.BlockIDExt{}, fmt.Errorf("block doesn't have masterchain ref")
 }
 
-func (s *Server) previousBlockForPrefix(ctx context.Context, id ton.BlockIDExt, root *cell.Cell, prefix storage.ShardKey) (ton.BlockIDExt, error) {
+func (s *Server) previousBlockForPrefix(ctx context.Context, id ton.BlockIDExt, prefix storage.ShardKey) (ton.BlockIDExt, error) {
 	meta, err := s.store.BlockMeta(ctx, id)
-	if err == nil && len(meta.PrevRefs) > 0 {
-		for _, prev := range meta.PrevRefs {
-			if shardIntersects(storage.ShardKeyFromBlock(prev), prefix) {
-				return prev, nil
-			}
-		}
-		return ton.BlockIDExt{}, fmt.Errorf("failed to choose previous block")
-	}
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return ton.BlockIDExt{}, err
-	}
-
-	if root == nil {
-		root, err = s.loadBlockRoot(ctx, id)
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-	}
-
-	parsed, err := storage.ParseVerifiedBlockCell(id, root)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
-	parsedMeta, err := storage.BuildBlockMetaFromParsedBlock(id, parsed)
-	if err != nil {
-		return ton.BlockIDExt{}, err
+	if len(meta.PrevRefs) == 0 {
+		return ton.BlockIDExt{}, fmt.Errorf("previous block references are missing")
 	}
-	for _, prev := range parsedMeta.PrevRefs {
+	for _, prev := range meta.PrevRefs {
 		if shardIntersects(storage.ShardKeyFromBlock(prev), prefix) {
 			return prev, nil
 		}

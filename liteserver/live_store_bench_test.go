@@ -110,9 +110,9 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 			GenUTime: uint32(1000 + i),
 		}
 		live.blocks[storage.BlockKey(block)] = &liveBlock{
-			id:      block,
-			meta:    meta,
-			flushed: true,
+			id:               block,
+			meta:             meta,
+			blockDataFlushed: true,
 		}
 		live.refreshBlockIndexLocked(block)
 	}
@@ -128,7 +128,7 @@ func benchmarkLiveStoreWithCurrent(tb testing.TB, shards int) (*LiveStore, *stor
 		Masterchain: masterState,
 		Shards:      make(map[storage.ShardKey]storage.BlockState, shards),
 	}
-	if err := live.SetLiveBlock(current.Masterchain.Block, masterRoot, testBlockBOC(masterRoot), true); err != nil {
+	if err := live.publishLiveBlockData(current.Masterchain.Block, masterRoot, testBlockBOC(masterRoot), true); err != nil {
 		tb.Fatalf("set live master block: %v", err)
 	}
 
@@ -138,7 +138,7 @@ func benchmarkLiveStoreWithCurrent(tb testing.TB, shards int) (*LiveStore, *stor
 		state, root := benchmarkBlockState(tb, 0, shard, uint32(2000+i))
 		current.Shards[storage.ShardKey{Workchain: 0, Shard: shard}] = state
 		target = state.Block
-		if err := live.SetLiveBlock(state.Block, root, testBlockBOC(root), true); err != nil {
+		if err := live.publishLiveBlockData(state.Block, root, testBlockBOC(root), true); err != nil {
 			tb.Fatalf("set live shard block: %v", err)
 		}
 	}

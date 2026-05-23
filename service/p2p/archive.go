@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/archive/packfile"
-	"fmt"
 	"os"
 	"time"
 
@@ -319,7 +319,7 @@ func formatArchiveCandidateRate(candidate archiveCandidate) string {
 func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resolved resolvedArchive, candidate archiveCandidate, tmpDir string) (*archive.Downloaded, error) {
 	peer := candidate.peer
 	archiveID := candidate.archiveID
-	file, err := os.CreateTemp(tmpDir, "flexserver-archive-*.pack.part")
+	file, err := os.CreateTemp(tmpDir, "gton-archive-*.pack.part")
 	if err != nil {
 		return nil, fmt.Errorf("create archive temp file: %w", err)
 	}

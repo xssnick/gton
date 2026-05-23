@@ -24,7 +24,7 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 	event.Msg("loading block state lazy root from storage")
 
 	rootLoadStarted := time.Now()
-	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateCellHash)
+	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateRootHash)
 	if err != nil {
 		return nil, fmt.Errorf("load state root cell: %w", err)
 	}
@@ -52,7 +52,7 @@ func (s *Store) blockStateMeta(ctx context.Context, block ton.BlockIDExt) (stora
 	if err != nil {
 		return storage.BlockState{}, err
 	}
-	rootHash, cellHash, fileHash, masterRef, err := decodeBlockStateMeta(metaRaw)
+	rootHash, fileHash, masterRef, err := decodeBlockStateMeta(metaRaw)
 	if err != nil {
 		return storage.BlockState{}, err
 	}
@@ -63,7 +63,6 @@ func (s *Store) blockStateMeta(ctx context.Context, block ton.BlockIDExt) (stora
 	return storage.BlockState{
 		Block:          block,
 		StateRootHash:  bytes.Clone(rootHash),
-		StateCellHash:  bytes.Clone(cellHash),
 		StateFileHash:  bytes.Clone(fileHash),
 		MasterchainRef: masterRef,
 	}, nil
@@ -136,7 +135,7 @@ func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]t
 			continue
 		}
 
-		raw, err := pebbleReaderGetCopy(snap, hotKeyBlockMeta(block))
+		raw, closer, err := pebbleReaderGet(snap, hotKeyBlockMeta(block))
 		if errors.Is(err, storage.ErrNotFound) {
 			continue
 		}
@@ -144,6 +143,7 @@ func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]t
 			return nil, err
 		}
 		meta, err := decodeBlockMeta(block, raw)
+		_ = closer.Close()
 		if err != nil {
 			return nil, err
 		}
@@ -163,56 +163,131 @@ func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]t
 
 func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
 	prefix := hotKeyBlockLTPrefix(key)
+
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer s.releaseHotDB()
+
+	snap := db.NewSnapshot()
+	defer func() { _ = snap.Close() }()
+
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	block, err := lookupBlockByLTWithIterator(snap, iter, key, lt)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return block, iter.Error()
+}
+
+func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
+	shards := storage.AccountShardCandidates(workchain, account)
+	if len(shards) == 0 {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+
+	prefix := hotKeyBlockLTWorkchainPrefix(workchain)
+
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer s.releaseHotDB()
+
+	snap := db.NewSnapshot()
+	defer func() { _ = snap.Close() }()
+
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	for _, shard := range shards {
+		select {
+		case <-ctx.Done():
+			return ton.BlockIDExt{}, ctx.Err()
+		default:
+		}
+
+		block, err := lookupBlockCoveringLTWithIterator(snap, iter, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return ton.BlockIDExt{}, err
+		}
+
+		return block, iter.Error()
+	}
+	if err = iter.Error(); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func lookupBlockCoveringLTWithIterator(reader pebbleReader, iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	prefix := hotKeyBlockLTPrefix(key)
+	if !iter.SeekGE(hotKeyBlockLTSeekGE(key, lt)) || !bytes.HasPrefix(iter.Key(), prefix) {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+
+	block, err := decodeBlockID(iter.Value())
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+
+	meta, err := blockMetaFromReader(reader, block)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if !blockMetaContainsLT(meta, lt) {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return block, nil
+}
+
+func lookupBlockByLTWithIterator(reader pebbleReader, iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	prefix := hotKeyBlockLTPrefix(key)
 	var geBlock ton.BlockIDExt
 	var geFound bool
 	var ltBlock ton.BlockIDExt
 	var ltFound bool
 
-	if err := func() error {
-		db, err := s.acquireHotDB(ctx)
+	seekGE := hotKeyBlockLTSeekGE(key, lt)
+	if iter.SeekGE(seekGE) && bytes.HasPrefix(iter.Key(), prefix) {
+		block, err := decodeBlockID(iter.Value())
 		if err != nil {
-			return err
+			return ton.BlockIDExt{}, err
 		}
-		defer s.releaseHotDB()
+		geBlock = block
+		geFound = true
+	}
 
-		snap := db.NewSnapshot()
-		defer func() { _ = snap.Close() }()
-
-		iter, err := snap.NewIter(&pebble.IterOptions{
-			LowerBound: prefix,
-			UpperBound: prefixUpperBound(prefix),
-		})
+	seekLT := hotKeyBlockLTSeek(key, lt)
+	if iter.SeekLT(seekLT) && bytes.HasPrefix(iter.Key(), prefix) {
+		block, err := decodeBlockID(iter.Value())
 		if err != nil {
-			return err
+			return ton.BlockIDExt{}, err
 		}
-		defer func() { _ = iter.Close() }()
-
-		seekGE := hotKeyBlockLTSeekGE(key, lt)
-		if iter.SeekGE(seekGE) && bytes.HasPrefix(iter.Key(), prefix) {
-			block, err := decodeBlockID(iter.Value())
-			if err != nil {
-				return err
-			}
-			geBlock = block
-			geFound = true
-		}
-
-		seekLT := hotKeyBlockLTSeek(key, lt)
-		if iter.SeekLT(seekLT) && bytes.HasPrefix(iter.Key(), prefix) {
-			block, err := decodeBlockID(iter.Value())
-			if err != nil {
-				return err
-			}
-			ltBlock = block
-			ltFound = true
-		}
-		return nil
-	}(); err != nil {
-		return ton.BlockIDExt{}, err
+		ltBlock = block
+		ltFound = true
 	}
 
 	if geFound {
-		meta, err := s.BlockMeta(ctx, geBlock)
+		meta, err := blockMetaFromReader(reader, geBlock)
 		switch {
 		case err == nil && meta.StartLT <= lt && (meta.EndLT == 0 || lt <= meta.EndLT):
 			return geBlock, nil
@@ -227,6 +302,22 @@ func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 	return ltBlock, nil
+}
+
+func blockMetaFromReader(reader pebbleReader, block ton.BlockIDExt) (*storage.BlockMeta, error) {
+	raw, closer, err := pebbleReaderGet(reader, hotKeyBlockMeta(block))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = closer.Close() }()
+	return decodeBlockMeta(block, raw)
+}
+
+func blockMetaContainsLT(meta *storage.BlockMeta, lt uint64) bool {
+	if meta == nil {
+		return false
+	}
+	return meta.StartLT < lt && (meta.EndLT == 0 || lt < meta.EndLT)
 }
 
 func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
@@ -260,7 +351,7 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 	}
 
 	key := hotKeyBlockMeta(next.ID)
-	existingRaw, err := pebbleReaderGetCopy(s.hot, key)
+	existingRaw, closer, err := pebbleReaderGet(s.hot, key)
 	existed := false
 	if err != nil {
 		if !errors.Is(err, storage.ErrNotFound) {
@@ -268,6 +359,7 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 		}
 		existingRaw = nil
 	} else {
+		defer func() { _ = closer.Close() }()
 		existed = true
 	}
 

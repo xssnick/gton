@@ -9,6 +9,8 @@ import (
 
 type peerRequestOptions struct {
 	parallelism          int
+	stageParallelism     int
+	stageDelay           time.Duration
 	hedgeDelay           time.Duration
 	collectAfterSuccess  time.Duration
 	cancelOnFirstSuccess bool
@@ -25,6 +27,10 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 	parallelism := minInt(opts.parallelism, len(peers))
 	if parallelism <= 0 {
 		return nil, []error{errors.New("overlay has no connected peers")}
+	}
+	stageParallelism := minInt(opts.stageParallelism, len(peers))
+	if stageParallelism <= parallelism {
+		stageParallelism = 0
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -70,6 +76,11 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		hedgeTimer = time.NewTimer(opts.hedgeDelay)
 		defer hedgeTimer.Stop()
 	}
+	var stageTimer *time.Timer
+	if opts.stageDelay > 0 && stageParallelism > 0 && nextIdx < len(peers) {
+		stageTimer = time.NewTimer(opts.stageDelay)
+		defer stageTimer.Stop()
+	}
 
 	var collectTimer *time.Timer
 	var collectC <-chan time.Time
@@ -85,6 +96,10 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		var hedgeC <-chan time.Time
 		if hedgeTimer != nil {
 			hedgeC = hedgeTimer.C
+		}
+		var stageC <-chan time.Time
+		if stageTimer != nil {
+			stageC = stageTimer.C
 		}
 
 		select {
@@ -112,6 +127,12 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 			} else {
 				hedgeTimer = nil
 			}
+		case <-stageC:
+			for nextIdx < len(peers) && inFlight < stageParallelism {
+				launch(peers[nextIdx])
+				nextIdx++
+			}
+			stageTimer = nil
 		case res := <-results:
 			inFlight--
 			if res.err == nil {

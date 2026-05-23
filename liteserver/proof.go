@@ -124,16 +124,12 @@ func createUsageProof(root *cell.Cell, visit func(*cell.Cell) error) (*cell.Cell
 }
 
 func (s *Server) loadBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
-	if cached, ok := s.store.(interface {
-		BlockRoot(context.Context, ton.BlockIDExt) (*cell.Cell, error)
-	}); ok {
+	if cached, ok := s.store.(blockRootStore); ok {
 		root, err := cached.BlockRoot(ctx, id)
-		if err == nil {
-			return root, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
+		if err != nil {
 			return nil, err
 		}
+		return root, nil
 	}
 
 	data, err := s.store.BlockData(ctx, id)
@@ -145,19 +141,35 @@ func (s *Server) loadBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Ce
 }
 
 func (s *Server) loadStateRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
-	root, _, err := s.loadStateRootWithBlockRoot(ctx, id)
-	return root, err
+	stateRootHash, err := s.loadStateRootHash(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	root, err := s.store.LoadStateCellTree(ctx, id, stateRootHash)
+	if err != nil {
+		return nil, fmt.Errorf("load state root %x for %s: %w", stateRootHash, storage.FormatBlockRef(id), err)
+	}
+	return root, nil
 }
 
 func (s *Server) loadStateRootWithBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, *cell.Cell, error) {
+	stateRootHash, err := s.loadStateRootHash(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	blockRoot, err := s.loadBlockRoot(ctx, id)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load block root for state %s: %w", storage.FormatBlockRef(id), err)
 	}
 
-	stateRootHash, err := stateRootHashFromBlock(id, blockRoot)
+	blockStateRootHash, err := stateRootHashFromBlock(id, blockRoot)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !bytes.Equal(blockStateRootHash, stateRootHash) {
+		return nil, nil, fmt.Errorf("state root hash mismatch for %s: meta=%x block=%x", storage.FormatBlockRef(id), stateRootHash, blockStateRootHash)
 	}
 
 	root, err := s.store.LoadStateCellTree(ctx, id, stateRootHash)
@@ -167,26 +179,25 @@ func (s *Server) loadStateRootWithBlockRoot(ctx context.Context, id ton.BlockIDE
 	return root, blockRoot, nil
 }
 
+func (s *Server) loadStateRootHash(ctx context.Context, id ton.BlockIDExt) ([]byte, error) {
+	meta, err := s.store.BlockMeta(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("load block meta for state %s: %w", storage.FormatBlockRef(id), err)
+	}
+	if len(meta.StateRootHash) != 32 {
+		return nil, fmt.Errorf("state root hash is missing for %s", storage.FormatBlockRef(id))
+	}
+	return bytes.Clone(meta.StateRootHash), nil
+}
+
 func (s *Server) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error) {
-	if cached, ok := s.store.(interface {
-		BlockFragments(context.Context, ton.BlockIDExt) (*liveBlockFragments, error)
-	}); ok {
+	if cached, ok := s.store.(blockFragmentsStore); ok {
 		return cached.BlockFragments(ctx, block)
 	}
 
-	blockRoot, err := s.loadBlockRoot(ctx, block)
+	stateRoot, blockRoot, err := s.loadStateRootWithBlockRoot(ctx, block)
 	if err != nil {
 		return nil, err
-	}
-
-	stateRootHash, err := stateRootHashFromBlock(block, blockRoot)
-	if err != nil {
-		return nil, err
-	}
-
-	stateRoot, err := s.store.LoadStateCellTree(ctx, block, stateRootHash)
-	if err != nil {
-		return nil, fmt.Errorf("load state root %x for %s: %w", stateRootHash, storage.FormatBlockRef(block), err)
 	}
 
 	return buildLiveBlockFragments(block, blockRoot, stateRoot)

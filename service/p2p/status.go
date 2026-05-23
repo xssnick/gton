@@ -15,6 +15,7 @@ type StatusSnapshot struct {
 	LatestBasechainShards []ton.BlockIDExt
 	Overlays              []OverlayStatusSnapshot
 	Queues                []QueueStatusSnapshot
+	Rebroadcast           []RebroadcastStatusSnapshot
 }
 
 type OverlayStatusSnapshot struct {
@@ -43,6 +44,12 @@ type QueueStatusSnapshot struct {
 	MaxBytes int64
 	Pushed   uint64
 	Dropped  uint64
+}
+
+type RebroadcastStatusSnapshot struct {
+	Queue   string
+	Sent    uint64
+	Dropped uint64
 }
 
 func (n *Node) StatusSnapshot() StatusSnapshot {
@@ -82,6 +89,7 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 		return snapshot.Overlays[i].Name < snapshot.Overlays[j].Name
 	})
 	snapshot.Queues = n.queueStatusSnapshot()
+	snapshot.Rebroadcast = n.rebroadcastStatusSnapshot()
 
 	return snapshot
 }
@@ -91,13 +99,51 @@ func (n *Node) queueStatusSnapshot() []QueueStatusSnapshot {
 	if n.eventQueue != nil {
 		queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
 	}
-	if n.rebroadcastQueue != nil {
-		queues = append(queues, n.rebroadcastQueue.StatusSnapshot("rebroadcast"))
-	}
-	if n.localRebroadcastQueue != nil {
-		queues = append(queues, n.localRebroadcastQueue.StatusSnapshot("local_rebroadcast"))
-	}
+	local, regular := n.peerRebroadcastQueueStatusSnapshot()
+	queues = append(queues, regular, local)
 	return queues
+}
+
+func (n *Node) peerRebroadcastQueueStatusSnapshot() (QueueStatusSnapshot, QueueStatusSnapshot) {
+	regular := QueueStatusSnapshot{Name: "rebroadcast"}
+	local := QueueStatusSnapshot{Name: "local_rebroadcast"}
+
+	for _, sub := range n.subscriptionsSnapshot() {
+		for _, peer := range sub.peersSnapshot() {
+			localPeer, regularPeer, ok := peer.rebroadcastQueueSnapshots()
+			if !ok {
+				continue
+			}
+			addQueueStatus(&local, localPeer)
+			addQueueStatus(&regular, regularPeer)
+		}
+	}
+
+	return local, regular
+}
+
+func addQueueStatus(total *QueueStatusSnapshot, next QueueStatusSnapshot) {
+	total.Items += next.Items
+	total.Bytes += next.Bytes
+	total.MaxItems += next.MaxItems
+	total.MaxBytes += next.MaxBytes
+	total.Pushed += next.Pushed
+	total.Dropped += next.Dropped
+}
+
+func (n *Node) rebroadcastStatusSnapshot() []RebroadcastStatusSnapshot {
+	return []RebroadcastStatusSnapshot{
+		{
+			Queue:   "rebroadcast",
+			Sent:    n.peerRebroadcastSent.Load(),
+			Dropped: n.peerRebroadcastDropped.Load(),
+		},
+		{
+			Queue:   "local_rebroadcast",
+			Sent:    n.localRebroadcastSent.Load(),
+			Dropped: n.localRebroadcastDropped.Load(),
+		},
+	}
 }
 
 func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {

@@ -35,8 +35,9 @@ type cellGenerationPendingMigration struct {
 
 func loadOrInitCellGenerationManifest(db *pebble.DB) (cellGenerationManifest, error) {
 	key := hotKeyCellGenerationManifest()
-	raw, err := pebbleReaderGetCopy(db, key)
+	raw, closer, err := pebbleReaderGet(db, key)
 	if err == nil {
+		defer func() { _ = closer.Close() }()
 		return decodeCellGenerationManifest(raw)
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
@@ -61,13 +62,14 @@ func loadOrInitCellGenerationManifest(db *pebble.DB) (cellGenerationManifest, er
 }
 
 func loadCellGenerationManifest(db *pebble.DB) (cellGenerationManifest, error) {
-	raw, err := pebbleReaderGetCopy(db, hotKeyCellGenerationManifest())
+	raw, closer, err := pebbleReaderGet(db, hotKeyCellGenerationManifest())
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return cellGenerationManifest{}, fmt.Errorf("cell generation manifest is missing")
 		}
 		return cellGenerationManifest{}, err
 	}
+	defer func() { _ = closer.Close() }()
 	return decodeCellGenerationManifest(raw)
 }
 
