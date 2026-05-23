@@ -32,7 +32,7 @@ const (
 	nextBlockBootstrapBlocks           = 0
 	nextBlockBootstrapProbeTimeout     = 2 * time.Second
 	nextBlockBootstrapLiveProbeTimeout = 5 * time.Second
-	nextBlockBootstrapLiveStageDelay   = 1500 * time.Millisecond
+	nextBlockBootstrapLiveStageDelay   = 250 * time.Millisecond
 	nextBlockBootstrapProbePeers       = 3
 	nextBlockBootstrapUrgentPeers      = 8
 	nextBlockBootstrapWidePeers        = 16

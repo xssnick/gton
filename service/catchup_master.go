@@ -133,10 +133,10 @@ func (d nextBlockBootstrapProbeDecision) probeTimeout() time.Duration {
 }
 
 func (d nextBlockBootstrapProbeDecision) stagedPeerLimit() int {
-	if !d.liveTail || d.peerLimit != nextBlockBootstrapProbePeers {
+	if !d.liveTail || d.peerLimit >= nextBlockBootstrapWidePeers {
 		return d.peerLimit
 	}
-	return nextBlockBootstrapUrgentPeers
+	return nextBlockBootstrapWidePeers
 }
 
 func nextBlockBootstrapLiveTail(blockUTime int64, nowUnix int64) bool {

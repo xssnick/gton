@@ -32,6 +32,7 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 	if stageParallelism <= parallelism {
 		stageParallelism = 0
 	}
+	targetParallelism := parallelism
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -66,7 +67,7 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		}()
 	}
 
-	for nextIdx < len(peers) && inFlight < parallelism {
+	for nextIdx < len(peers) && inFlight < targetParallelism {
 		launch(peers[nextIdx])
 		nextIdx++
 	}
@@ -128,11 +129,18 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 				hedgeTimer = nil
 			}
 		case <-stageC:
-			for nextIdx < len(peers) && inFlight < stageParallelism {
+			if targetParallelism < stageParallelism {
+				targetParallelism++
+			}
+			for nextIdx < len(peers) && inFlight < targetParallelism {
 				launch(peers[nextIdx])
 				nextIdx++
 			}
-			stageTimer = nil
+			if targetParallelism < stageParallelism && nextIdx < len(peers) {
+				stageTimer.Reset(opts.stageDelay)
+			} else {
+				stageTimer = nil
+			}
 		case res := <-results:
 			inFlight--
 			if res.err == nil {

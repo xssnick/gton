@@ -109,11 +109,12 @@ func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 	}
 }
 
-func TestProbeNextFullFromPeersStagesFanoutAfterDelay(t *testing.T) {
+func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 	peers := []*overlayPeer{
 		{id: "peer-1", addr: "peer-1"},
 		{id: "peer-2", addr: "peer-2"},
 		{id: "peer-3", addr: "peer-3"},
+		{id: "peer-4", addr: "peer-4"},
 	}
 	want := &DownloadedBlock{ID: testBlockID(-1, topShard, 42)}
 
@@ -125,9 +126,9 @@ func TestProbeNextFullFromPeersStagesFanoutAfterDelay(t *testing.T) {
 	errCh := make(chan error, 1)
 
 	go func() {
-		got, err := probeNextFullFromPeersStaged(ctx, peers, 2, 3, 50*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+		got, err := probeNextFullFromPeersStaged(ctx, peers, 2, 4, 50*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 			started <- peer.id
-			if peer.id == "peer-3" {
+			if peer.id == "peer-4" {
 				return *want, nil
 			}
 			<-ctx.Done()
@@ -149,13 +150,28 @@ func TestProbeNextFullFromPeersStagesFanoutAfterDelay(t *testing.T) {
 			t.Fatalf("probe did not start initial peers, seen=%v", seen)
 		}
 	}
-	if seen["peer-3"] {
+	if seen["peer-3"] || seen["peer-4"] {
 		t.Fatal("staged peer started before delay")
 	}
 
 	select {
 	case peer := <-started:
 		t.Fatalf("unexpected staged peer before delay: %s", peer)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	select {
+	case peer := <-started:
+		if peer != "peer-3" {
+			t.Fatalf("unexpected first ramp peer: %s", peer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe did not start first ramp peer")
+	}
+
+	select {
+	case peer := <-started:
+		t.Fatalf("unexpected second ramp peer before next delay: %s", peer)
 	case <-time.After(20 * time.Millisecond):
 	}
 

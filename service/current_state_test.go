@@ -788,8 +788,8 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	if baseLive.probeTimeout() != nextBlockBootstrapLiveProbeTimeout {
 		t.Fatalf("live probe timeout = %s, want %s", baseLive.probeTimeout(), nextBlockBootstrapLiveProbeTimeout)
 	}
-	if baseLive.stagedPeerLimit() != nextBlockBootstrapUrgentPeers {
-		t.Fatalf("live staged probe peers = %d, want %d", baseLive.stagedPeerLimit(), nextBlockBootstrapUrgentPeers)
+	if baseLive.stagedPeerLimit() != nextBlockBootstrapWidePeers {
+		t.Fatalf("live staged probe peers = %d, want %d", baseLive.stagedPeerLimit(), nextBlockBootstrapWidePeers)
 	}
 
 	oldUTime := time.Now().Add(-time.Duration(nextBlockBootstrapWideLagSeconds+1) * time.Second).Unix()
