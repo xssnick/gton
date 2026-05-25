@@ -45,6 +45,8 @@ const (
 	chainBlockDownloadRetries          = 3
 	chainBlockDownloadRetryDelay       = 500 * time.Millisecond
 	nextMasterchainQueueLimit          = 64
+	nextMasterchainQueueTTL            = 3 * time.Minute
+	nextMasterchainQueueMaxBytes       = 128 << 20
 	masterStateCacheLimit              = 2048
 	syncedBlockProcessorWorkers        = 8
 	statusTPSMasterWindow              = 10
@@ -57,7 +59,7 @@ const (
 
 var (
 	errMasterchainPrevMismatch = errors.New("masterchain previous state is not current")
-	errSyncedBlockNotVerified  = errors.New("synced block was not verified")
+	errSyncedBlockDeferred     = errors.New("synced block was deferred")
 	errShardDescriptionTooOld  = errors.New("shard block description is older than current state")
 	errShardDescriptionTooNew  = errors.New("shard block description is too far ahead of current state")
 )
@@ -144,6 +146,7 @@ type Service struct {
 	nextMasterchainMx      sync.Mutex
 	nextMasterchainQueue   map[string]queuedMasterchainBlock
 	nextMasterchainBySeqno map[uint32]string
+	nextMasterchainBytes   int64
 	validatorCache         masterchainValidatorCache
 	masterStateCacheMu     sync.Mutex
 	masterStateCache       map[string]*storage.BlockState
@@ -205,21 +208,20 @@ type CurrentStateFlusher interface {
 	MarkLiveCurrentStateFlushed(*storage.CurrentState)
 }
 
-type SyncObserver interface {
-	ObserveSyncCurrentState(SyncCurrentStateObservation)
-	ObserveSyncBlock(SyncBlockObservation)
-	ObserveSyncPersist(SyncPersistObservation)
+type liveBlockStateFlusher interface {
+	MarkLiveBlockStatesFlushed([]ton.BlockIDExt)
 }
 
-type SyncCurrentStateObservation struct {
-	MasterchainSeqno uint32
-	ShardClientSeqno uint32
+type SyncObserver interface {
+	ObserveSyncBlock(SyncBlockObservation)
+	ObserveSyncPersist(SyncPersistObservation)
 }
 
 type SyncBlockObservation struct {
 	Pipeline         string
 	Chain            string
 	Source           string
+	Origin           string
 	Result           string
 	CatchUp          bool
 	DownloadDuration time.Duration
@@ -247,10 +249,61 @@ func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
 	if observation.Source == "" {
 		observation.Source = "unknown"
 	}
+	if observation.Origin == "" {
+		observation.Origin = syncBlockOriginForSource(observation.Source)
+	}
 	if observation.Result == "" {
 		observation.Result = "unknown"
 	}
 	s.sync.ObserveSyncBlock(observation)
+}
+
+func syncBlockOriginForSource(source string) string {
+	switch source {
+	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "queue":
+		return "broadcast"
+	case "peer_probe", "next_block", "indexed", "next_description", "peer_catch_up", "catch_up", "probe":
+		return "download"
+	case "stored":
+		return "stored"
+	case "":
+		return "unknown"
+	default:
+		return "other"
+	}
+}
+
+func syncBlockSourceForDownloadedBlock(defaultSource string, downloaded p2p.DownloadedBlock) string {
+	switch downloaded.Kind {
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+		return "broadcast_cache"
+	case "local full block cache", "local next block cache":
+		return "stored"
+	default:
+		return defaultSource
+	}
+}
+
+func syncBlockResultForError(err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if isTimeoutError(err) {
+		return "timeout"
+	}
+	if errors.Is(err, p2p.ErrBlockNotAvailable) || errors.Is(err, p2p.ErrStateNotAvailable) {
+		return "miss"
+	}
+	if isExpectedRetryError(err) {
+		return "retry"
+	}
+	return "error"
 }
 
 func (s *Service) observeSyncPersist(observation SyncPersistObservation) {
@@ -291,6 +344,7 @@ type StatusSnapshot struct {
 	LocalMasterchainHasTx bool
 	LocalBasechainHasTx   bool
 	RecentTPS             StatusTPSSnapshot
+	BackgroundTask        string
 }
 
 type ShardStatusSnapshot struct {
@@ -436,6 +490,7 @@ func (s *Service) Wait() {
 func (s *Service) StatusSnapshot() StatusSnapshot {
 	snapshot := StatusSnapshot{
 		StatusSnapshot: s.node.StatusSnapshot(),
+		BackgroundTask: s.backgroundTaskStatus(),
 	}
 	if s.blockSync != nil {
 		snapshot.BlockSync = s.blockSync.StatusSnapshot()
@@ -670,6 +725,9 @@ func (s *Service) runBlockProcessorWorker(ctx context.Context, jobs <-chan block
 	for synced := range jobs {
 		if err := s.processSyncedBlock(ctx, synced); err != nil {
 			synced.Reject()
+			if errors.Is(err, errSyncedBlockDeferred) {
+				continue
+			}
 			if !errors.Is(err, context.Canceled) {
 				s.logProcessError(err)
 			}
@@ -683,7 +741,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	started := time.Now()
 	source := "broadcast"
 	if synced.CatchUp {
-		source = "catch_up"
+		source = "peer_catch_up"
 	}
 	observation := SyncBlockObservation{
 		Pipeline:         "blocksync",
@@ -694,8 +752,11 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		DownloadDuration: synced.DownloadElapsed,
 	}
 	defer func() {
+		if errors.Is(err, errSyncedBlockDeferred) {
+			return
+		}
 		if err != nil {
-			observation.Result = "error"
+			observation.Result = syncBlockResultForError(err)
 		}
 		observation.ApplyDuration = time.Since(started)
 		s.observeSyncBlock(observation)
@@ -729,8 +790,9 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
 		if err := s.validateSyncedMasterchainBlock(ctx, downloaded); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
+				s.queueMasterchainBroadcastCandidateFromSource(downloaded, synced.Trigger.SourceKey)
 				s.wakeCurrentStateSync()
-				return fmt.Errorf("%w: %v", errSyncedBlockNotVerified, err)
+				return errSyncedBlockDeferred
 			}
 			return err
 		}
@@ -829,7 +891,6 @@ func (s *Service) logProcessError(err error) {
 func isExpectedRetryError(err error) bool {
 	if errors.Is(err, p2p.ErrStateNotAvailable) ||
 		errors.Is(err, p2p.ErrBlockNotAvailable) ||
-		errors.Is(err, errSyncedBlockNotVerified) ||
 		errors.Is(err, errCellGenerationMigrationRunning) ||
 		errors.Is(err, errCellGenerationMigrationStopping) ||
 		errors.Is(err, errCellGenerationMigrationStopped) ||
@@ -844,6 +905,10 @@ func isExpectedRetryError(err error) bool {
 		return true
 	}
 
+	return isTimeoutError(err)
+}
+
+func isTimeoutError(err error) bool {
 	var timeout timeoutError
 	return errors.As(err, &timeout) && timeout.Timeout()
 }

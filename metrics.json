@@ -57,28 +57,35 @@
         },
         "vizConfig": {
           "kind": "VizConfig",
-          "group": "stat",
+          "group": "timeseries",
           "version": "12.3.1",
           "spec": {
             "options": {
-              "colorMode": "value",
-              "graphMode": "area",
-              "justifyMode": "auto",
-              "orientation": "auto",
-              "reduceOptions": {
+              "legend": {
                 "calcs": [
-                  "lastNotNull"
+                  "lastNotNull",
+                  "max"
                 ],
-                "fields": "",
-                "values": false
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
               },
-              "textMode": "auto",
-              "wideLayout": true
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
             },
             "fieldConfig": {
               "defaults": {
                 "color": {
-                  "mode": "thresholds"
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
                 },
                 "mappings": [],
                 "thresholds": {
@@ -176,7 +183,7 @@
                     },
                     {
                       "color": "orange",
-                      "value": 1
+                      "value": 3
                     },
                     {
                       "color": "red",
@@ -229,28 +236,35 @@
         },
         "vizConfig": {
           "kind": "VizConfig",
-          "group": "stat",
+          "group": "timeseries",
           "version": "12.3.1",
           "spec": {
             "options": {
-              "colorMode": "value",
-              "graphMode": "area",
-              "justifyMode": "auto",
-              "orientation": "auto",
-              "reduceOptions": {
+              "legend": {
                 "calcs": [
-                  "lastNotNull"
+                  "lastNotNull",
+                  "max"
                 ],
-                "fields": "",
-                "values": false
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
               },
-              "textMode": "auto",
-              "wideLayout": true
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
             },
             "fieldConfig": {
               "defaults": {
                 "color": {
-                  "mode": "thresholds"
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
                 },
                 "mappings": [],
                 "thresholds": {
@@ -360,8 +374,8 @@
       "kind": "Panel",
       "spec": {
         "id": 6,
-        "title": "Storage status",
-        "description": "",
+        "title": "Cell DB generation id",
+        "description": "Numeric cell DB generation id for stable labels: active and pending.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -380,8 +394,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "min by (instance) (${metric_namespace}_storage_db_status_available{job=~\"$job\", instance=~\"$instance\"})",
-                      "legendFormat": "{{instance}}"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_generation{job=~\"$job\", instance=~\"$instance\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
                     }
                   }
                 }
@@ -438,6 +452,84 @@
         }
       }
     },
+    "panel-8": {
+      "kind": "Panel",
+      "spec": {
+        "id": 8,
+        "title": "Background worker",
+        "description": "Current exclusive background task: idle, serializing state, migrating cell DB, pruning persistent states, or pruning archives.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, task) (${metric_namespace}_service_background_task{job=~\"$job\", instance=~\"$instance\"})",
+                      "legendFormat": "{{instance}} {{task}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "stat",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "colorMode": "value",
+              "graphMode": "none",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "textMode": "name",
+              "wideLayout": true
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "thresholds"
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-7": {
       "kind": "Panel",
       "spec": {
@@ -475,28 +567,35 @@
         },
         "vizConfig": {
           "kind": "VizConfig",
-          "group": "stat",
+          "group": "timeseries",
           "version": "12.3.1",
           "spec": {
             "options": {
-              "colorMode": "value",
-              "graphMode": "area",
-              "justifyMode": "auto",
-              "orientation": "auto",
-              "reduceOptions": {
+              "legend": {
                 "calcs": [
-                  "lastNotNull"
+                  "lastNotNull",
+                  "max"
                 ],
-                "fields": "",
-                "values": false
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
               },
-              "textMode": "auto",
-              "wideLayout": true
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
             },
             "fieldConfig": {
               "defaults": {
                 "color": {
-                  "mode": "thresholds"
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
                 },
                 "mappings": [],
                 "thresholds": {
@@ -789,95 +888,11 @@
         }
       }
     },
-    "panel-12": {
-      "kind": "Panel",
-      "spec": {
-        "id": 12,
-        "title": "Current-state publish age",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "time() - max by (instance) (${metric_namespace}_sync_last_publish_timestamp_seconds{job=~\"$job\", instance=~\"$instance\"})",
-                      "legendFormat": "{{instance}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "s"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
     "panel-14": {
       "kind": "Panel",
       "spec": {
         "id": 14,
-        "title": "Blocks processed rate",
+        "title": "Block origin rate",
         "description": "",
         "links": [],
         "data": {
@@ -897,8 +912,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, pipeline, chain, result) (rate(${metric_namespace}_sync_blocks_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{pipeline}} {{chain}} {{result}}"
+                      "expr": "sum by (instance, pipeline, chain, origin) (rate(${metric_namespace}_sync_block_origins_total{job=~\"$job\", instance=~\"$instance\", result=\"success\", pipeline!=\"blocksync\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{pipeline}} {{chain}} {{origin}}"
                     }
                   }
                 }
@@ -965,7 +980,7 @@
       "kind": "Panel",
       "spec": {
         "id": 15,
-        "title": "Sync block errors",
+        "title": "Sync block non-success by type",
         "description": "",
         "links": [],
         "data": {
@@ -985,8 +1000,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, pipeline, chain, source) (rate(${metric_namespace}_sync_blocks_total{job=~\"$job\", instance=~\"$instance\", result=\"error\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{pipeline}} {{chain}} {{source}}"
+                      "expr": "sum by (instance, pipeline, chain, source, result) (rate(${metric_namespace}_sync_blocks_total{job=~\"$job\", instance=~\"$instance\", result!=\"success\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{pipeline}} {{chain}} {{source}} {{result}}"
                     }
                   }
                 }
@@ -1026,7 +1041,11 @@
                   "fillOpacity": 10,
                   "lineWidth": 1,
                   "showPoints": "never",
-                  "spanNulls": true
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
                 },
                 "mappings": [],
                 "thresholds": {
@@ -2515,8 +2534,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_disk_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}}"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_disk_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
                     }
                   }
                 }
@@ -2600,8 +2619,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_live_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}}"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_live_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
                     }
                   }
                 }
@@ -2685,8 +2704,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_l0_files{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} L0 files"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_l0_files{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} L0 files"
                     }
                   }
                 }
@@ -2704,8 +2723,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_l0_sublevels{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} L0 sublevels"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_l0_sublevels{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} L0 sublevels"
                     }
                   }
                 }
@@ -2789,8 +2808,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_compaction_debt_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} debt"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_compaction_debt_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} debt"
                     }
                   }
                 }
@@ -2808,8 +2827,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_compaction_in_progress_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} in progress"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_compaction_in_progress_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} in progress"
                     }
                   }
                 }
@@ -2893,8 +2912,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance, generation, role) (${metric_namespace}_storage_cell_db_memtable_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}}"
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_memtable_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
                     }
                   }
                 }
@@ -2978,8 +2997,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, generation, role) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) / clamp_min(sum by (instance, generation, role) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 0.000001)",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}}"
+                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) / clamp_min(sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 0.000001)",
+                      "legendFormat": "{{instance}} {{generation}}"
                     }
                   }
                 }
@@ -3063,8 +3082,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, generation, role) (rate(${metric_namespace}_storage_cell_db_read_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} read"
+                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_read_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{generation}} read"
                     }
                   }
                 }
@@ -3082,8 +3101,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, generation, role) (rate(${metric_namespace}_storage_cell_db_written_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} write"
+                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_written_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{generation}} write"
                     }
                   }
                 }
@@ -3147,8 +3166,8 @@
       "kind": "Panel",
       "spec": {
         "id": 42,
-        "title": "Flush and ingest rate",
-        "description": "",
+        "title": "Cell DB read amplification",
+        "description": "Read amplification by cell DB generation and shard.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -3167,27 +3186,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, generation, role) (rate(${metric_namespace}_storage_cell_db_flushes_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} flush"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, generation, role) (rate(${metric_namespace}_storage_cell_db_ingests_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} gen {{generation}} {{role}} ingest"
+                      "expr": "max by (instance, generation, shard) (${metric_namespace}_storage_cell_db_read_amp{job=~\"$job\", instance=~\"$instance\", shard!=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} shard={{shard}}"
                     }
                   }
                 }
@@ -3239,7 +3239,7 @@
                     }
                   ]
                 },
-                "unit": "ops"
+                "unit": "short"
               },
               "overrides": []
             }
@@ -3624,6 +3624,182 @@
           }
         }
       }
+    },
+    "panel-34": {
+      "kind": "Panel",
+      "spec": {
+        "id": 34,
+        "title": "Accepted broadcast rate",
+        "description": "Accepted inbound P2P broadcasts by overlay and TL type.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"accepted\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} {{kind}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-48": {
+      "kind": "Panel",
+      "spec": {
+        "id": 48,
+        "title": "Rebroadcast rate",
+        "description": "Successful P2P rebroadcast sends by overlay and TL type.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"rebroadcasted\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} {{kind}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
     }
   },
   "layout": {
@@ -3644,8 +3820,8 @@
                     "spec": {
                       "x": 0,
                       "y": 0,
-                      "width": 4,
-                      "height": 4,
+                      "width": 8,
+                      "height": 8,
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-2"
@@ -3655,9 +3831,9 @@
                   {
                     "kind": "GridLayoutItem",
                     "spec": {
-                      "x": 4,
-                      "y": 0,
-                      "width": 4,
+                      "x": 0,
+                      "y": 8,
+                      "width": 8,
                       "height": 4,
                       "element": {
                         "kind": "ElementReference",
@@ -3670,8 +3846,8 @@
                     "spec": {
                       "x": 8,
                       "y": 0,
-                      "width": 4,
-                      "height": 4,
+                      "width": 8,
+                      "height": 8,
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-4"
@@ -3681,9 +3857,9 @@
                   {
                     "kind": "GridLayoutItem",
                     "spec": {
-                      "x": 12,
-                      "y": 0,
-                      "width": 4,
+                      "x": 8,
+                      "y": 8,
+                      "width": 8,
                       "height": 4,
                       "element": {
                         "kind": "ElementReference",
@@ -3695,7 +3871,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 16,
-                      "y": 0,
+                      "y": 8,
                       "width": 4,
                       "height": 4,
                       "element": {
@@ -3708,9 +3884,22 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 20,
-                      "y": 0,
+                      "y": 8,
                       "width": 4,
                       "height": 4,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-8"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 16,
+                      "y": 0,
+                      "width": 8,
+                      "height": 8,
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-7"
@@ -3762,24 +3951,11 @@
                     "spec": {
                       "x": 0,
                       "y": 8,
-                      "width": 12,
+                      "width": 24,
                       "height": 8,
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-11"
-                      }
-                    }
-                  },
-                  {
-                    "kind": "GridLayoutItem",
-                    "spec": {
-                      "x": 12,
-                      "y": 8,
-                      "width": 12,
-                      "height": 8,
-                      "element": {
-                        "kind": "ElementReference",
-                        "name": "panel-12"
                       }
                     }
                   }
@@ -4056,6 +4232,32 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-33"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 24,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-34"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 24,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-48"
                       }
                     }
                   }

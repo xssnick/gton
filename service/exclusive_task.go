@@ -206,6 +206,34 @@ func (s *Service) exclusiveServiceTaskActive(task exclusiveServiceTask) bool {
 	return s.exclusiveTask == task
 }
 
+func (s *Service) backgroundTaskStatus() string {
+	if s == nil {
+		return "idle"
+	}
+
+	s.exclusiveTaskMu.Lock()
+	task := s.exclusiveTask
+	s.exclusiveTaskMu.Unlock()
+	return task.backgroundStatus()
+}
+
+func (t exclusiveServiceTask) backgroundStatus() string {
+	switch t {
+	case exclusiveServiceTaskNone:
+		return "idle"
+	case exclusiveServiceTaskStateSerialization:
+		return "serializing state"
+	case exclusiveServiceTaskCellGenerationMigration:
+		return "migrating cell DB"
+	case exclusiveServiceTaskPersistentStateGC:
+		return "pruning persistent states"
+	case exclusiveServiceTaskArchiveTTLGC:
+		return "pruning archives"
+	default:
+		return string(t)
+	}
+}
+
 func (l *exclusiveServiceTaskLease) release() {
 	if l == nil || l.service == nil {
 		return

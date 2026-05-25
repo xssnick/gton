@@ -27,7 +27,12 @@ import (
 var ErrBlockNotAvailable = errors.New("peer does not have the requested block")
 var ErrCompressedBlockV2Unsupported = errors.New("tonNode.dataFullCompressedV2 is not supported without state-aware BOC decompression")
 
-const liveNextUnavailablePenalty = 3 * time.Second
+const (
+	liveNextUnavailablePenalty    = 3 * time.Second
+	liveNextProbeSoftTimeout      = 2500 * time.Millisecond
+	liveNextProbeEarlyFailDelay   = 1200 * time.Millisecond
+	liveNextProbeEarlyFailReserve = 4
+)
 
 type ProbeNextBlockFullOptions struct {
 	PeerLimit        int
@@ -48,14 +53,6 @@ func (f CompressedBlockStateProviderFunc) StateRootForCompressedBlock(ctx contex
 }
 
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
-	if cached, err := n.cachedBlockFull(ctx, block); err == nil {
-		return cached, nil
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
-		n.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Msg("failed to load cached full block")
-	}
 	if cached, err := n.popShardBroadcastBlock(block); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
@@ -64,8 +61,16 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 			Str("block", formatBlockRef(block)).
 			Msg("failed to load cached shard broadcast block")
 	}
+	if cached, err := n.cachedBlockFull(ctx, block); err == nil {
+		return cached, nil
+	} else if !errors.Is(err, tnstore.ErrNotFound) {
+		n.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Msg("failed to load cached full block")
+	}
 
-	res, err := n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+	res, err := n.downloadBlockFullFromOverlayOrShardBroadcast(ctx, block)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +81,57 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 	return res, nil
 }
 
+func (n *Node) downloadBlockFullFromOverlayOrShardBroadcast(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+	wake, unwatch := n.watchShardBroadcastBlock(block)
+	if wake == nil {
+		return n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+	}
+	defer unwatch()
+
+	if cached, err := n.popShardBroadcastBlock(block); err == nil {
+		return cached, nil
+	} else if !errors.Is(err, tnstore.ErrNotFound) {
+		n.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Msg("failed to load cached shard broadcast block")
+	}
+
+	downloadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type downloadResult struct {
+		block *DownloadedBlock
+		err   error
+	}
+	result := make(chan downloadResult, 1)
+	go func() {
+		res, err := n.downloadFromOverlay(downloadCtx, block, tonnodeapi.DownloadBlockFull{Block: block})
+		result <- downloadResult{block: res, err: err}
+	}()
+
+	for {
+		select {
+		case res := <-result:
+			return res.block, res.err
+		case <-wake:
+			if cached, err := n.popShardBroadcastBlock(block); err == nil {
+				cancel()
+				return cached, nil
+			} else if !errors.Is(err, tnstore.ErrNotFound) {
+				n.log.Debug().
+					Err(err).
+					Str("block", formatBlockRef(block)).
+					Msg("failed to load cached shard broadcast block")
+			}
+			wake = nil
+		case <-ctx.Done():
+			cancel()
+			return nil, ctx.Err()
+		}
+	}
+}
+
 func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt) error {
 	if isMasterchainBlock(block) {
 		return fmt.Errorf("masterchain block %s is not a shard prefetch candidate", formatBlockRef(block))
@@ -84,9 +140,12 @@ func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt)
 		return nil
 	}
 
-	res, err := n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+	res, err := n.prefetchShardBlockFullFromOverlayOrBroadcast(ctx, block)
 	if err != nil {
 		return err
+	}
+	if res == nil {
+		return nil
 	}
 	if !res.ID.Equals(&block) {
 		return fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
@@ -94,6 +153,47 @@ func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt)
 
 	n.rememberShardBroadcastBlock(res)
 	return nil
+}
+
+func (n *Node) prefetchShardBlockFullFromOverlayOrBroadcast(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+	wake, unwatch := n.watchShardBroadcastBlock(block)
+	if wake == nil {
+		return n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+	}
+	defer unwatch()
+
+	if n.shardBroadcastCache.HasBlock(block) {
+		return nil, nil
+	}
+
+	downloadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type downloadResult struct {
+		block *DownloadedBlock
+		err   error
+	}
+	result := make(chan downloadResult, 1)
+	go func() {
+		res, err := n.downloadFromOverlay(downloadCtx, block, tonnodeapi.DownloadBlockFull{Block: block})
+		result <- downloadResult{block: res, err: err}
+	}()
+
+	for {
+		select {
+		case res := <-result:
+			return res.block, res.err
+		case <-wake:
+			if n.shardBroadcastCache.HasBlock(block) {
+				cancel()
+				return nil, nil
+			}
+			wake = nil
+		case <-ctx.Done():
+			cancel()
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
@@ -261,7 +361,17 @@ func (s *overlaySubscription) probeNextFull(ctx context.Context, prev ton.BlockI
 
 	req := DownloadNextBlockFull{PrevBlock: prev}
 	var liveNotAvailableMisses atomic.Int64
-	return probeNextFullFromPeersStaged(ctx, peers, peerLimit, stagedPeerLimit, opts.StageDelay, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+	probeOpts := probeNextFullPeerOptions{
+		peerLimit:       peerLimit,
+		stagedPeerLimit: stagedPeerLimit,
+		stageDelay:      opts.StageDelay,
+	}
+	if opts.LiveTail && isMasterchainBlock(prev) {
+		probeOpts.maxElapsed = liveNextProbeSoftTimeout
+		probeOpts.earlyFailureDelay = liveNextProbeEarlyFailDelay
+		probeOpts.earlyFailureCount = liveNextEarlyFailureCount(len(peers))
+	}
+	return probeNextFullFromPeersWithOptions(ctx, peers, probeOpts, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 		return s.downloadNextFullFromPeer(ctx, prev, peer, req, opts.LiveTail, liveNotAvailableMisses.Load())
 	}, func(peer *overlayPeer, err error) {
 		if opts.LiveTail {
@@ -366,16 +476,38 @@ func (s *overlaySubscription) downloadNextFullFromPeer(ctx context.Context, chai
 }
 
 func probeNextFullFromPeers(ctx context.Context, peers []*overlayPeer, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
-	return probeNextFullFromPeersStaged(ctx, peers, len(peers), len(peers), 0, query, onFailure)
+	return probeNextFullFromPeersWithOptions(ctx, peers, probeNextFullPeerOptions{
+		peerLimit:       len(peers),
+		stagedPeerLimit: len(peers),
+	}, query, onFailure)
 }
 
 func probeNextFullFromPeersStaged(ctx context.Context, peers []*overlayPeer, peerLimit int, stagedPeerLimit int, stageDelay time.Duration, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
+	return probeNextFullFromPeersWithOptions(ctx, peers, probeNextFullPeerOptions{
+		peerLimit:       peerLimit,
+		stagedPeerLimit: stagedPeerLimit,
+		stageDelay:      stageDelay,
+	}, query, onFailure)
+}
+
+type probeNextFullPeerOptions struct {
+	peerLimit         int
+	stagedPeerLimit   int
+	stageDelay        time.Duration
+	maxElapsed        time.Duration
+	earlyFailureCount int
+	earlyFailureDelay time.Duration
+}
+
+func probeNextFullFromPeersWithOptions(ctx context.Context, peers []*overlayPeer, opts probeNextFullPeerOptions, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
 	if len(peers) == 0 {
 		return nil, errors.New("overlay has no connected peers")
 	}
+	peerLimit := opts.peerLimit
 	if peerLimit <= 0 || peerLimit > len(peers) {
 		peerLimit = len(peers)
 	}
+	stagedPeerLimit := opts.stagedPeerLimit
 	if stagedPeerLimit < peerLimit {
 		stagedPeerLimit = peerLimit
 	}
@@ -383,7 +515,10 @@ func probeNextFullFromPeersStaged(ctx context.Context, peers []*overlayPeer, pee
 	results, errs := runPeerRequests(ctx, peers, peerRequestOptions{
 		parallelism:          peerLimit,
 		stageParallelism:     stagedPeerLimit,
-		stageDelay:           stageDelay,
+		stageDelay:           opts.stageDelay,
+		maxElapsed:           opts.maxElapsed,
+		earlyFailureCount:    opts.earlyFailureCount,
+		earlyFailureDelay:    opts.earlyFailureDelay,
 		cancelOnFirstSuccess: true,
 		onFailure:            onFailure,
 	}, query)
@@ -393,6 +528,14 @@ func probeNextFullFromPeersStaged(ctx context.Context, peers []*overlayPeer, pee
 	}
 
 	return nil, errors.Join(errs...)
+}
+
+func liveNextEarlyFailureCount(peerCount int) int {
+	count := peerCount - liveNextProbeEarlyFailReserve
+	if count < 4 {
+		return 0
+	}
+	return count
 }
 
 func (s *overlaySubscription) blockDownloadCandidates() []*overlayPeer {
@@ -977,7 +1120,7 @@ func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block t
 		return nil, err
 	}
 	if len(meta.StateRootHash) != 32 {
-		return nil, fmt.Errorf("previous state root hash is not known for %s", formatBlockRef(prev))
+		return nil, fmt.Errorf("%w: previous state root hash is not known for %s", tnstore.ErrNotFound, formatBlockRef(prev))
 	}
 
 	root, err := n.storage.LoadStateCellTree(ctx, prev, meta.StateRootHash)
@@ -1083,7 +1226,6 @@ func serializeCompressedBlockRoot(root *cell.Cell) []byte {
 		WithCRC32C:    true,
 		WithIndex:     true,
 		WithCacheBits: true,
-		WithTopHash:   true,
 		WithIntHashes: true,
 	})
 }

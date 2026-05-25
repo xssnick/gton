@@ -1039,6 +1039,52 @@ func TestLiveStoreDoesNotTrimUnflushedLiveState(t *testing.T) {
 	}
 }
 
+func TestLiveStoreTrimsCheckpointFlushedHistoricalState(t *testing.T) {
+	stateRoot := cell.BeginCell().MustStoreUInt(34, 32).EndCell()
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 34, stateRoot)
+	blockData := testBlockBOC(blockRoot)
+	id = testBlockIDForData(masterchainID, masterchainShard, 34, blockRoot, blockData)
+	state := storage.BlockState{
+		Block:         id,
+		StateRootHash: stateRoot.Hash(0),
+		Cell:          stateRoot,
+	}
+
+	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            id,
+		Root:             blockRoot,
+		BlockData:        blockData,
+		State:            &state,
+		BlockDataFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish live artifacts: %v", err)
+	}
+
+	if _, err := live.LoadStateCellTree(context.Background(), id, stateRoot.Hash(0)); err != nil {
+		t.Fatalf("unflushed historical live state should stay cached: %v", err)
+	}
+
+	live.MarkLiveBlockStatesFlushed([]ton.BlockIDExt{id})
+	if _, err := live.LoadStateCellTree(context.Background(), id, stateRoot.Hash(0)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("checkpoint-flushed historical state error = %v, want ErrNotFound", err)
+	}
+	if _, err := live.BlockData(context.Background(), id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("checkpoint-flushed historical block data error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLiveStoreCheckpointFlushDoesNotRememberMissingBlocks(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(35, 32).EndCell()
+	missing := testBlockID(t, 35, root)
+	live := NewLiveStore(&fakeStore{})
+
+	live.MarkLiveBlockStatesFlushed([]ton.BlockIDExt{missing})
+	if len(live.flushed) != 0 {
+		t.Fatalf("missing checkpoint-flushed blocks remembered = %d, want 0", len(live.flushed))
+	}
+}
+
 func TestLiveStoreBlockRootAcceptsTrustedStoredRootWithMode31BOC(t *testing.T) {
 	stateRoot := cell.BeginCell().MustStoreUInt(0xab, 8).EndCell()
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 18, stateRoot)

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"testing"
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
@@ -99,4 +100,69 @@ func TestClassifyBroadcastUsesPeerAsFECSourceKey(t *testing.T) {
 	if accepted.event.SourceKey != "peer-a" {
 		t.Fatalf("source key = %q, want peer-a", accepted.event.SourceKey)
 	}
+}
+
+func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
+	node := newTestNode(t)
+	source := testRebroadcastQueuePeer("source")
+	target := testRebroadcastQueuePeer("target")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+		peers: map[string]*overlayPeer{
+			source.id: source,
+			target.id: target,
+		},
+	}
+	block := testBlockID(0, topShard, 203)
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      block,
+			CCSeqno: 7,
+			Data:    []byte{0x01, 0x02},
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize shard broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(source, msg, payload, DeliveryFEC, false, "")
+	if accepted == nil {
+		t.Fatal("expected shard block broadcast to be accepted")
+	}
+	node.acceptBroadcast(*accepted)
+
+	if _, ok := source.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("source peer should not receive its own shard block rebroadcast")
+	}
+	got, ok := target.rebroadcastQueue.TryPop()
+	if !ok {
+		t.Fatal("expected target peer shard block rebroadcast")
+	}
+	if got.kind != "tonNode.newShardBlockBroadcast" {
+		t.Fatalf("rebroadcast kind = %q, want tonNode.newShardBlockBroadcast", got.kind)
+	}
+	if got.sourcePeerID != source.id {
+		t.Fatalf("source peer id = %q, want %q", got.sourcePeerID, source.id)
+	}
+	if !bytes.Equal(got.payload, payload) {
+		t.Fatal("rebroadcast payload changed")
+	}
+	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
+		t.Fatalf("accepted broadcast count = %d, want 1", got)
+	}
+}
+
+func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 {
+	for _, stat := range node.broadcastStatusSnapshot() {
+		if stat.Direction == direction && stat.Overlay == overlay && stat.Kind == kind {
+			return stat.Count
+		}
+	}
+	return 0
 }

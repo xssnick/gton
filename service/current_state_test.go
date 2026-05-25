@@ -136,6 +136,96 @@ func TestPublishCommittedCurrentStateDoesNotRegressStatus(t *testing.T) {
 	}
 }
 
+func TestMarkLiveCheckpointStatesFlushedPublishesAllEntries(t *testing.T) {
+	flusher := &testLiveCheckpointFlusher{}
+	svc := &Service{liveState: flusher}
+	master := testBlockID(-1, topShard, 102)
+	shard := testBlockID(0, topShard, 103)
+
+	svc.markLiveCheckpointStatesFlushed([]tnstore.StateCheckpointBlock{
+		{State: &tnstore.BlockState{Block: master}},
+		{},
+		{State: &tnstore.BlockState{Block: shard}},
+	})
+
+	if len(flusher.blocks) != 2 {
+		t.Fatalf("flushed blocks = %d, want 2", len(flusher.blocks))
+	}
+	if !flusher.blocks[0].Equals(&master) {
+		t.Fatalf("first flushed block = %s, want %s", tnstore.FormatBlockRef(flusher.blocks[0]), tnstore.FormatBlockRef(master))
+	}
+	if !flusher.blocks[1].Equals(&shard) {
+		t.Fatalf("second flushed block = %s, want %s", tnstore.FormatBlockRef(flusher.blocks[1]), tnstore.FormatBlockRef(shard))
+	}
+}
+
+type testLiveCheckpointFlusher struct {
+	current *tnstore.CurrentState
+	blocks  []ton.BlockIDExt
+}
+
+func (f *testLiveCheckpointFlusher) SetLiveCurrentState(current *tnstore.CurrentState) {
+	f.current = current
+}
+
+func (f *testLiveCheckpointFlusher) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
+	f.blocks = append(f.blocks, blocks...)
+}
+
+func TestSyncBlockResultForError(t *testing.T) {
+	timeout := &testTimeoutError{}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", want: "success"},
+		{name: "canceled", err: context.Canceled, want: "canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "timeout", err: timeout, want: "timeout"},
+		{name: "block miss", err: p2p.ErrBlockNotAvailable, want: "miss"},
+		{name: "state miss", err: p2p.ErrStateNotAvailable, want: "miss"},
+		{name: "retry", err: errPersistentStateGCActive, want: "retry"},
+		{name: "error", err: errors.New("boom"), want: "error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := syncBlockResultForError(tc.err); got != tc.want {
+				t.Fatalf("result = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		want string
+	}{
+		{name: "plain overlay download", kind: "tonNode.dataFull", want: "next_block"},
+		{name: "broadcast cache", kind: "tonNode.blockBroadcastCompressedV2", want: "broadcast_cache"},
+		{name: "stored full block", kind: "local full block cache", want: "stored"},
+		{name: "stored next block", kind: "local next block cache", want: "stored"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := syncBlockSourceForDownloadedBlock("next_block", p2p.DownloadedBlock{Kind: tc.kind})
+			if got != tc.want {
+				t.Fatalf("source = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+type testTimeoutError struct{}
+
+func (e *testTimeoutError) Error() string {
+	return "timeout"
+}
+
+func (e *testTimeoutError) Timeout() bool {
+	return true
+}
+
 func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
@@ -609,6 +699,41 @@ func TestVerifiedMasterchainQueueAcceptsBroadcastOutsideCatchUp(t *testing.T) {
 	}
 	if !got.ID.Equals(&next) {
 		t.Fatalf("queued block = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(next))
+	}
+}
+
+func TestMasterchainBroadcastCandidateWaitsForValidation(t *testing.T) {
+	prev := testMasterBlockID(10)
+	next := testMasterBlockID(11)
+	downloaded := p2p.DownloadedBlock{
+		ID: next,
+		Meta: &tnstore.BlockMeta{
+			ID:       next,
+			PrevRefs: []ton.BlockIDExt{prev},
+		},
+		BlockBOC:            []byte{1},
+		ProofBOC:            []byte{2},
+		BroadcastSignatures: cell.BeginCell().EndCell(),
+		VerifiedRootHash:    true,
+		VerifiedFileHash:    true,
+	}
+
+	svc := &Service{}
+	svc.queueMasterchainBroadcastCandidateFromSource(downloaded, "peer-a")
+
+	if _, ok := svc.takeQueuedMasterchainBlock(prev, next); ok {
+		t.Fatal("unverified broadcast candidate must not be returned by verified fast path")
+	}
+	candidate, ok := svc.peekQueuedMasterchainCandidate(prev, next)
+	if !ok {
+		t.Fatal("expected queued masterchain broadcast candidate")
+	}
+	if candidate.sourceKey != "peer-a" {
+		t.Fatalf("candidate source = %q, want peer-a", candidate.sourceKey)
+	}
+	future, ok := svc.queuedMasterchainFuture(testMasterBlockID(9))
+	if !ok || !future.block.Equals(&next) {
+		t.Fatalf("candidate future = %v %s, want %s", ok, tnstore.FormatBlockRef(future.block), tnstore.FormatBlockRef(next))
 	}
 }
 

@@ -1005,7 +1005,11 @@ func (s *testCellGenerationMigrationStore) SaveEncodedCellsInGeneration(context.
 	return nil
 }
 
-func (s *testCellGenerationMigrationStore) SwitchCellGeneration(context.Context, uint64, ton.BlockIDExt, ton.BlockIDExt, *storage.CurrentState, []ton.BlockIDExt) (uint64, error) {
+func (s *testCellGenerationMigrationStore) DeleteStateMetadataBeforeCellGenerationSwitch(context.Context, ton.BlockIDExt, *storage.CurrentState, []ton.BlockIDExt) (int, error) {
+	return 0, nil
+}
+
+func (s *testCellGenerationMigrationStore) SwitchCellGeneration(context.Context, uint64, ton.BlockIDExt, ton.BlockIDExt, *storage.CurrentState) (uint64, error) {
 	return 0, errCellGenerationMigrationTest
 }
 

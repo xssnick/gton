@@ -214,9 +214,10 @@ func (n *Node) closePeerRebroadcastQueues() {
 func (n *Node) noteRebroadcastSent(req rebroadcastRequest) {
 	if req.local {
 		n.localRebroadcastSent.Add(1)
-		return
+	} else {
+		n.peerRebroadcastSent.Add(1)
 	}
-	n.peerRebroadcastSent.Add(1)
+	n.noteBroadcast("rebroadcasted", req.overlayName(), req.kind)
 }
 
 func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {

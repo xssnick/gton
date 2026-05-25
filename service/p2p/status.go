@@ -16,6 +16,7 @@ type StatusSnapshot struct {
 	Overlays              []OverlayStatusSnapshot
 	Queues                []QueueStatusSnapshot
 	Rebroadcast           []RebroadcastStatusSnapshot
+	Broadcasts            []BroadcastStatusSnapshot
 }
 
 type OverlayStatusSnapshot struct {
@@ -50,6 +51,19 @@ type RebroadcastStatusSnapshot struct {
 	Queue   string
 	Sent    uint64
 	Dropped uint64
+}
+
+type BroadcastStatusSnapshot struct {
+	Direction string
+	Overlay   string
+	Kind      string
+	Count     uint64
+}
+
+type broadcastStatKey struct {
+	direction string
+	overlay   string
+	kind      string
 }
 
 func (n *Node) StatusSnapshot() StatusSnapshot {
@@ -90,8 +104,60 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	})
 	snapshot.Queues = n.queueStatusSnapshot()
 	snapshot.Rebroadcast = n.rebroadcastStatusSnapshot()
+	snapshot.Broadcasts = n.broadcastStatusSnapshot()
 
 	return snapshot
+}
+
+func (n *Node) noteBroadcast(direction, overlay, kind string) {
+	if direction == "" {
+		direction = "unknown"
+	}
+	if overlay == "" {
+		overlay = "unknown"
+	}
+	if kind == "" {
+		kind = "unknown"
+	}
+
+	key := broadcastStatKey{
+		direction: direction,
+		overlay:   overlay,
+		kind:      kind,
+	}
+
+	n.broadcastStatsMx.Lock()
+	if n.broadcastStats == nil {
+		n.broadcastStats = map[broadcastStatKey]uint64{}
+	}
+	n.broadcastStats[key]++
+	n.broadcastStatsMx.Unlock()
+}
+
+func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
+	n.broadcastStatsMx.Lock()
+	defer n.broadcastStatsMx.Unlock()
+
+	stats := make([]BroadcastStatusSnapshot, 0, len(n.broadcastStats))
+	for key, count := range n.broadcastStats {
+		stats = append(stats, BroadcastStatusSnapshot{
+			Direction: key.direction,
+			Overlay:   key.overlay,
+			Kind:      key.kind,
+			Count:     count,
+		})
+	}
+
+	sort.SliceStable(stats, func(i, j int) bool {
+		if stats[i].Direction != stats[j].Direction {
+			return stats[i].Direction < stats[j].Direction
+		}
+		if stats[i].Overlay != stats[j].Overlay {
+			return stats[i].Overlay < stats[j].Overlay
+		}
+		return stats[i].Kind < stats[j].Kind
+	})
+	return stats
 }
 
 func (n *Node) queueStatusSnapshot() []QueueStatusSnapshot {

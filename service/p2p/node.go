@@ -65,22 +65,30 @@ type Node struct {
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx              context.Context
-	zeroStateFileHash   []byte
-	zeroStateBlock      ton.BlockIDExt
-	initBlock           ton.BlockIDExt
-	externalPort        uint16
-	dhtListenAddr       string
-	storage             storage2.Storage
-	peerStorage         storage2.PeerServingStorage
-	compressedState     CompressedBlockStateProvider
-	shardBroadcastCache *shardBroadcastBlockCache
-	blockCacheObserver  BlockCacheObserver
-	blockCacheSlots     chan struct{}
-	rebroadcastQuiet    atomic.Bool
+	runCtx                context.Context
+	zeroStateFileHash     []byte
+	zeroStateBlock        ton.BlockIDExt
+	initBlock             ton.BlockIDExt
+	externalPort          uint16
+	dhtListenAddr         string
+	storage               storage2.Storage
+	peerStorage           storage2.PeerServingStorage
+	compressedState       CompressedBlockStateProvider
+	shardBroadcastCache   *shardBroadcastBlockCache
+	shardBroadcastWaitMx  sync.Mutex
+	shardBroadcastWaiters map[string][]chan struct{}
+	blockCacheObserver    BlockCacheObserver
+	blockCacheSlots       chan struct{}
+	rebroadcastQuiet      atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
+
+	pendingBroadcastMx sync.Mutex
+	pendingBroadcasts  map[string]struct{}
+
+	broadcastStatsMx sync.Mutex
+	broadcastStats   map[broadcastStatKey]uint64
 
 	localRebroadcastSent    atomic.Uint64
 	localRebroadcastDropped atomic.Uint64
@@ -201,8 +209,11 @@ func New(opts Options) (*Node, error) {
 		peerStorage:               peerStorage,
 		compressedState:           opts.CompressedState,
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
+		shardBroadcastWaiters:     map[string][]chan struct{}{},
 		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastThrottleLast:   map[string]time.Time{},
+		pendingBroadcasts:         map[string]struct{}{},
+		broadcastStats:            map[broadcastStatKey]uint64{},
 		stateFilesDir:             stateFilesDir,
 		downloadPeerLeases:        map[string]int{},
 		stateCellImportSlot:       make(chan struct{}, 1),

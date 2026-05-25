@@ -44,7 +44,8 @@ type cellGenerationRotationStore interface {
 	ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)
 	LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader
 	SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error
-	SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (uint64, error)
+	DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Context, origin ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (int, error)
+	SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState) (uint64, error)
 	PersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*storage.PersistentStateFile, error)
 }
 
@@ -654,6 +655,9 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store cellGene
 
 		s.requestCellGenerationSwitch(candidate.generation, candidate.current.Masterchain.Block)
 		switchRequested = true
+		if err = s.prepareCellGenerationSwitchCandidate(ctx, store, candidate, origin); err != nil {
+			return err
+		}
 
 		for {
 			didSwitch, latest, oldGeneration, err := s.trySwitchCellGenerationCandidate(ctx, store, candidate, origin)
@@ -684,6 +688,9 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store cellGene
 				Msg("durable current state advanced during cell generation switch, finishing catch-up with switch requested")
 
 			if err = s.catchUpAndFlushCellGenerationCandidate(ctx, store, candidate, latest); err != nil {
+				return err
+			}
+			if err = s.prepareCellGenerationSwitchCandidate(ctx, store, candidate, origin); err != nil {
 				return err
 			}
 		}
@@ -1237,12 +1244,43 @@ func (s *Service) cellGenerationSwitchPreserveStateMeta(ctx context.Context, sto
 	return shards, nil
 }
 
-func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (bool, *storage.CurrentState, uint64, error) {
+func (s *Service) prepareCellGenerationSwitchCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) error {
 	preserveStateMeta, err := s.cellGenerationSwitchPreserveStateMeta(ctx, store, candidate.generation, origin)
 	if err != nil {
-		return false, nil, 0, err
+		return err
 	}
 
+	latest, err := s.storage.CurrentState(ctx)
+	if err != nil {
+		return fmt.Errorf("load durable current state before cell generation switch metadata cleanup: %w", err)
+	}
+	if latest.Masterchain.Block.SeqNo > candidate.current.Masterchain.Block.SeqNo ||
+		!currentStateBlockRefsEqual(latest, candidate.current) ||
+		!currentStateRootsEqual(latest, candidate.current) {
+		s.log.Info().
+			Uint64("cell_generation", candidate.generation).
+			Str("candidate", storage.FormatBlockRef(candidate.current.Masterchain.Block)).
+			Str("latest", storage.FormatBlockRef(latest.Masterchain.Block)).
+			Msg("skipping state metadata cleanup because durable current advanced before cell generation switch")
+		return nil
+	}
+
+	started := time.Now()
+	deleted, err := store.DeleteStateMetadataBeforeCellGenerationSwitch(ctx, origin, latest, preserveStateMeta)
+	if err != nil {
+		return fmt.Errorf("delete state metadata before cell generation switch: %w", err)
+	}
+	s.log.Info().
+		Uint64("cell_generation", candidate.generation).
+		Str("origin_persistent_state", storage.FormatBlockRef(origin)).
+		Str("masterchain", storage.FormatBlockRef(candidate.current.Masterchain.Block)).
+		Int("deleted_state_metadata_records", deleted).
+		Dur("elapsed", time.Since(started)).
+		Msg("prepared state metadata for cell generation switch")
+	return nil
+}
+
+func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (bool, *storage.CurrentState, uint64, error) {
 	s.stateMu.Lock()
 	s.currentStatePersistMu.Lock()
 
@@ -1288,7 +1326,7 @@ func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store ce
 		Str("masterchain", storage.FormatBlockRef(candidate.current.Masterchain.Block)).
 		Uint32("shard_client_seqno", candidate.current.ShardClientSeqno).
 		Msg("switching cell generation")
-	oldGeneration, err := store.SwitchCellGeneration(ctx, candidate.generation, origin, latest.Masterchain.Block, currentStateWithoutCells(latest), preserveStateMeta)
+	oldGeneration, err := store.SwitchCellGeneration(ctx, candidate.generation, origin, latest.Masterchain.Block, currentStateWithoutCells(latest))
 	if err != nil {
 		if errors.Is(err, storage.ErrCurrentStateAdvanced) {
 			latest, loadErr := s.storage.CurrentState(ctx)

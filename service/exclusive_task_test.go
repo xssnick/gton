@@ -70,6 +70,25 @@ func TestExclusiveServiceTaskBlocksSerializationDuringArchiveGC(t *testing.T) {
 	}
 }
 
+func TestBackgroundTaskStatusReportsExclusiveTask(t *testing.T) {
+	svc := &Service{}
+	if got := svc.backgroundTaskStatus(); got != "idle" {
+		t.Fatalf("background task = %q, want idle", got)
+	}
+
+	lease, err := svc.beginExclusiveServiceTask(context.Background(), exclusiveServiceTaskStateSerialization)
+	if err != nil {
+		t.Fatalf("begin serialization task: %v", err)
+	}
+	if got := svc.backgroundTaskStatus(); got != "serializing state" {
+		t.Fatalf("background task = %q, want serializing state", got)
+	}
+	lease.release()
+	if got := svc.backgroundTaskStatus(); got != "idle" {
+		t.Fatalf("background task after release = %q, want idle", got)
+	}
+}
+
 func TestExclusiveServiceTaskBlocksHighReadAmp(t *testing.T) {
 	svc := &Service{
 		storage: exclusiveTaskTestStorage{maxReadAmp: exclusiveServiceTaskMaxReadAmp + 1},

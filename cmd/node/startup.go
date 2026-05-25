@@ -244,11 +244,7 @@ func startMetricsServer(ctx context.Context, logger zerolog.Logger, addr string,
 	return nil
 }
 
-func resolveConfigPath(longPath string, shortPath string) string {
-	shortPath = strings.TrimSpace(shortPath)
-	if shortPath != "" {
-		return shortPath
-	}
+func resolveConfigPath(longPath string) string {
 	longPath = strings.TrimSpace(longPath)
 	if longPath == "" {
 		return nodeconfig.DefaultPath

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +36,6 @@ const (
 
 func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
-	configPathShort := flag.String("C", "", "path to node config JSON (alias for --config)")
 	logLevelFlag := flag.String("log-level", "info", "log level: trace, debug, info, warn, error")
 	logLevelsFlag := flag.String("log-levels", "", "category log level overrides, comma-separated: liteserver=debug,p2p=warn")
 	logJSONFlag := flag.Bool("log-json", false, "write logs as JSON instead of pretty console")
@@ -69,7 +69,7 @@ func main() {
 	defer stop()
 	startPprof(ctx, logger, strings.TrimSpace(*pprofAddrFlag))
 
-	selectedConfigPath := resolveConfigPath(*configPath, *configPathShort)
+	selectedConfigPath := resolveConfigPath(*configPath)
 	configResult, err := nodeconfig.LoadOrCreate(ctx, selectedConfigPath, nodeconfig.DetectExternalIP)
 	if err != nil {
 		logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
@@ -223,6 +223,7 @@ func main() {
 	opts.PeerServingStorage = store
 	if runtimeMetrics != nil {
 		runtimeMetrics.SetDBStatusReader(store.DBStatus)
+		runtimeMetrics.SetStorageArtifactDirs(filepath.Join(storageDir, "archive", "packages"), stateFilesDir)
 	}
 	logger.Info().
 		Str("storage", "pebble").

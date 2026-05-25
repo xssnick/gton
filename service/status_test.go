@@ -197,34 +197,6 @@ func TestStatusSnapshotPrefersLocalShardClientBasechainLatest(t *testing.T) {
 	}
 }
 
-func TestObserveCurrentSyncStateReportsMasterchainAndShardClientSeqno(t *testing.T) {
-	observer := &fakeSyncObserver{}
-	svc := &Service{sync: observer}
-
-	svc.observeCurrentSyncState(&tnstore.CurrentState{
-		Masterchain: tnstore.BlockState{
-			Block:  testBlockID(-1, topShard, 100),
-			Parsed: &tlb.ShardStateUnsplit{GenUTime: 990},
-		},
-		ShardClientSeqno: 90,
-		Shards: map[tnstore.ShardKey]tnstore.BlockState{
-			{Workchain: 0, Shard: topShard}: {
-				Parsed: &tlb.ShardStateUnsplit{GenUTime: 980},
-			},
-			{Workchain: 0, Shard: topShard >> 1}: {
-				Parsed: &tlb.ShardStateUnsplit{GenUTime: 995},
-			},
-		},
-	})
-
-	if got := observer.current.MasterchainSeqno; got != 100 {
-		t.Fatalf("masterchain seqno = %v, want 100", got)
-	}
-	if got := observer.current.ShardClientSeqno; got != 90 {
-		t.Fatalf("shard client seqno = %v, want 90", got)
-	}
-}
-
 func TestCurrentBasechainLagSecondsUsesLocalShardUTime(t *testing.T) {
 	baseFresh := testBlockID(0, topShard, 10)
 	baseStale := testBlockID(0, topShard>>1, 11)
@@ -257,13 +229,7 @@ func TestCurrentBasechainLagSecondsUsesLocalShardUTime(t *testing.T) {
 	}
 }
 
-type fakeSyncObserver struct {
-	current SyncCurrentStateObservation
-}
-
-func (o *fakeSyncObserver) ObserveSyncCurrentState(observation SyncCurrentStateObservation) {
-	o.current = observation
-}
+type fakeSyncObserver struct{}
 
 func (o *fakeSyncObserver) ObserveSyncBlock(SyncBlockObservation) {}
 

@@ -353,15 +353,29 @@ func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 	s.mu.Unlock()
 }
 
+func (s *LiveStore) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
+	if len(blocks) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	for _, block := range blocks {
+		s.markLiveBlockStateFlushedLocked(block, false)
+	}
+	s.trimBlocksLocked(liveBlockMaster)
+	s.trimBlocksLocked(liveBlockShard)
+	s.mu.Unlock()
+}
+
 func (s *LiveStore) MarkLiveCurrentStateFlushed(current *storage.CurrentState) {
 	if current == nil {
 		return
 	}
 
 	s.mu.Lock()
-	s.markLiveBlockStateFlushedLocked(current.Masterchain.Block)
+	s.markLiveBlockStateFlushedLocked(current.Masterchain.Block, true)
 	for _, shard := range current.Shards {
-		s.markLiveBlockStateFlushedLocked(shard.Block)
+		s.markLiveBlockStateFlushedLocked(shard.Block, true)
 	}
 	s.trimBlocksLocked(liveBlockMaster)
 	s.trimBlocksLocked(liveBlockShard)
@@ -1031,12 +1045,15 @@ func (s *LiveStore) markLiveBlockDataFlushedLocked(cached *liveBlock) {
 	s.adjustLiveEvictableStateLocked(cached, evictableBefore)
 }
 
-func (s *LiveStore) markLiveBlockStateFlushedLocked(block ton.BlockIDExt) {
+func (s *LiveStore) markLiveBlockStateFlushedLocked(block ton.BlockIDExt, rememberMissing bool) {
 	key := storage.BlockKey(block)
 	if cached := s.blocks[key]; cached != nil {
 		evictableBefore := s.liveBlockEvictableLocked(cached)
 		cached.stateFlushed = true
 		s.adjustLiveEvictableStateLocked(cached, evictableBefore)
+		return
+	}
+	if !rememberMissing {
 		return
 	}
 

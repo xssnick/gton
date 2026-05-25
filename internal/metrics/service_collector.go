@@ -26,6 +26,7 @@ type serviceCollector struct {
 	syncRecentTPS         *prometheus.Desc
 	syncRecentTx          *prometheus.Desc
 	syncRecentComplete    *prometheus.Desc
+	serviceBackgroundTask *prometheus.Desc
 
 	p2pOverlayPeers     *prometheus.Desc
 	p2pOverlayNeighbors *prometheus.Desc
@@ -35,6 +36,7 @@ type serviceCollector struct {
 	p2pQueueMaxBytes    *prometheus.Desc
 	p2pQueuePushed      *prometheus.Desc
 	p2pQueueDropped     *prometheus.Desc
+	p2pBroadcasts       *prometheus.Desc
 	p2pRebroadcastSent  *prometheus.Desc
 	p2pRebroadcastDrop  *prometheus.Desc
 
@@ -95,6 +97,12 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			nil,
 			nil,
 		),
+		serviceBackgroundTask: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "service", "background_task"),
+			"Current background service task as a labeled gauge.",
+			[]string{"task"},
+			nil,
+		),
 		p2pOverlayPeers: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "overlay_peers"),
 			"Known overlay peers by overlay and liveness.",
@@ -141,6 +149,12 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			prometheus.BuildFQName(namespace, "p2p", "queue_dropped_total"),
 			"Total dropped P2P queue pushes.",
 			[]string{"queue"},
+			nil,
+		),
+		p2pBroadcasts: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "broadcasts_total"),
+			"Total P2P broadcasts accepted or successfully rebroadcasted by type.",
+			[]string{"direction", "overlay", "kind"},
 			nil,
 		),
 		p2pRebroadcastSent: prometheus.NewDesc(
@@ -191,6 +205,7 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.syncRecentTPS
 	ch <- c.syncRecentTx
 	ch <- c.syncRecentComplete
+	ch <- c.serviceBackgroundTask
 	ch <- c.p2pOverlayPeers
 	ch <- c.p2pOverlayNeighbors
 	ch <- c.p2pQueueItems
@@ -199,6 +214,7 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pQueueMaxBytes
 	ch <- c.p2pQueuePushed
 	ch <- c.p2pQueueDropped
+	ch <- c.p2pBroadcasts
 	ch <- c.p2pRebroadcastSent
 	ch <- c.p2pRebroadcastDrop
 	ch <- c.blocksyncQueueItems
@@ -243,6 +259,12 @@ func (c *serviceCollector) collectSync(ch chan<- prometheus.Metric, snapshot ser
 		}
 		ch <- prometheus.MustNewConstMetric(c.syncRecentComplete, prometheus.GaugeValue, complete)
 	}
+
+	task := snapshot.BackgroundTask
+	if task == "" {
+		task = "idle"
+	}
+	ch <- prometheus.MustNewConstMetric(c.serviceBackgroundTask, prometheus.GaugeValue, 1, task)
 }
 
 func (c *serviceCollector) collectChain(ch chan<- prometheus.Metric, chain string, shard string, local *ton.BlockIDExt, network *ton.BlockIDExt, utime int64, now time.Time) {
@@ -286,6 +308,10 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 	for _, rebroadcast := range snapshot.Rebroadcast {
 		ch <- prometheus.MustNewConstMetric(c.p2pRebroadcastSent, prometheus.CounterValue, float64(rebroadcast.Sent), rebroadcast.Queue)
 		ch <- prometheus.MustNewConstMetric(c.p2pRebroadcastDrop, prometheus.CounterValue, float64(rebroadcast.Dropped), rebroadcast.Queue)
+	}
+
+	for _, broadcast := range snapshot.Broadcasts {
+		ch <- prometheus.MustNewConstMetric(c.p2pBroadcasts, prometheus.CounterValue, float64(broadcast.Count), broadcast.Direction, broadcast.Overlay, broadcast.Kind)
 	}
 }
 

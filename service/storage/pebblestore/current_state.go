@@ -5,10 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/xssnick/gton/service/storage"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -226,7 +226,7 @@ func flattenStateCheckpointEntries(entries []storage.StateCheckpointBlock) ([]*s
 	return states, storage.StateCheckpointCells{Records: cells}
 }
 
-func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (uint64, error) {
+func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState) (uint64, error) {
 	if generation == 0 {
 		return 0, fmt.Errorf("cell generation is zero")
 	}
@@ -240,25 +240,61 @@ func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, ori
 		return 0, fmt.Errorf("expected current state block is empty")
 	}
 
-	flushStarted := time.Now()
-	if err := s.flushCellDBs(generation); err != nil {
-		return 0, fmt.Errorf("flush generation %d before switch: %w", generation, err)
-	}
-	flushElapsed := time.Since(flushStarted)
-
-	if err := s.syncPendingArtifactFiles(); err != nil {
-		return 0, err
-	}
-
 	if err := s.verifyCurrentStateRootsPresentInGeneration(ctx, generation, current); err != nil {
 		return 0, fmt.Errorf("verify candidate generation current state roots: %w", err)
 	}
 
-	oldGeneration, err := s.saveCellGenerationSwitch(ctx, generation, origin, expectedCurrent, current, preserveStateMeta, flushElapsed)
+	oldGeneration, err := s.saveCellGenerationSwitch(ctx, generation, origin, expectedCurrent, current)
 	if err != nil {
 		return 0, err
 	}
 	return oldGeneration, nil
+}
+
+func (s *Store) DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Context, origin ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (int, error) {
+	if current == nil {
+		return 0, fmt.Errorf("current state is nil")
+	}
+	if isEmptyBlockID(origin) {
+		return 0, fmt.Errorf("cell generation origin persistent state is empty")
+	}
+
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer s.releaseHotDB()
+
+	s.hotWriteMu.Lock()
+	defer s.hotWriteMu.Unlock()
+
+	batch := db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	started := time.Now()
+	deleted, err := deleteStateMetadataBeforeImportedState(ctx, db, batch, origin, currentStateBlockKeepSet(current, preserveStateMeta))
+	if err != nil {
+		return deleted, err
+	}
+	if deleted == 0 {
+		return 0, nil
+	}
+
+	syncStarted := time.Now()
+	if err = batch.Commit(pebble.Sync); err != nil {
+		return deleted, err
+	}
+
+	s.log.Info().
+		Str("origin_persistent_state", storage.FormatBlockRef(origin)).
+		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+		Uint32("shard_client_seqno", current.ShardClientSeqno).
+		Int("shards", len(current.Shards)).
+		Int("deleted_state_metadata_records", deleted).
+		Dur("elapsed", time.Since(started)).
+		Dur("hot_metadata_sync_elapsed", time.Since(syncStarted)).
+		Msg("deleted state metadata before cell generation switch")
+	return deleted, nil
 }
 
 func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState, cells storage.StateCheckpointCells) ([]preparedBlockStateSave, time.Duration, error) {
@@ -554,7 +590,7 @@ func validateCurrentStateBlockMetaMatch(label string, current storage.BlockState
 	return nil
 }
 
-func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt, flushElapsed time.Duration) (uint64, error) {
+func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState) (uint64, error) {
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {
 		return 0, err
@@ -570,8 +606,7 @@ func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64,
 	if err = verifyCellGenerationSwitchCurrent(db, expectedCurrent, current); err != nil {
 		return 0, err
 	}
-	deletedStateMetadata, err := deleteStateMetadataBeforeImportedState(ctx, db, batch, origin, currentStateBlockKeepSet(current, preserveStateMeta))
-	if err != nil {
+	if err = verifyCellGenerationSwitchProgress(db, generation, current); err != nil {
 		return 0, err
 	}
 
@@ -631,8 +666,6 @@ func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64,
 		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
 		Uint32("shard_client_seqno", current.ShardClientSeqno).
 		Int("shards", len(current.Shards)).
-		Int("deleted_state_metadata_records", deletedStateMetadata).
-		Dur("flush_cell_dbs_elapsed", flushElapsed).
 		Dur("hot_metadata_sync_elapsed", hotSyncElapsed).
 		Msg("cell generation switched")
 
@@ -681,6 +714,26 @@ func verifyCellGenerationSwitchCurrent(db *pebble.DB, expectedMaster ton.BlockID
 	}
 	if err := verifyCellGenerationSwitchStateMetadata(db, current); err != nil {
 		return err
+	}
+	return nil
+}
+
+func verifyCellGenerationSwitchProgress(db *pebble.DB, generation uint64, current *storage.CurrentState) error {
+	raw, closer, err := pebbleReaderGet(db, hotKeyCellGenerationCurrent(generation))
+	if err != nil {
+		return fmt.Errorf("load durable cell generation migration progress before switch: %w", err)
+	}
+	defer func() { _ = closer.Close() }()
+
+	progress, err := decodeCellGenerationMigrationProgress(raw)
+	if err != nil {
+		return fmt.Errorf("decode durable cell generation migration progress before switch: %w", err)
+	}
+	if !currentStateBlockRefsEqual(progress, current) {
+		return fmt.Errorf("durable cell generation migration progress no longer matches switch current")
+	}
+	if !currentStateRootsEqual(progress, current) {
+		return fmt.Errorf("durable cell generation migration progress roots no longer match switch current")
 	}
 	return nil
 }
@@ -738,6 +791,29 @@ func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.Curre
 			return false
 		}
 		if !leftShard.Block.Equals(&rightShard.Block) {
+			return false
+		}
+	}
+	return true
+}
+
+func currentStateRootsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if !bytes.Equal(left.Masterchain.StateRootHash, right.Masterchain.StateRootHash) {
+		return false
+	}
+	if len(left.Shards) != len(right.Shards) {
+		return false
+	}
+	for _, key := range storage.SortedShardKeys(left.Shards) {
+		leftShard := left.Shards[key]
+		rightShard, ok := right.Shards[key]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(leftShard.StateRootHash, rightShard.StateRootHash) {
 			return false
 		}
 	}
@@ -818,6 +894,10 @@ func (s *Store) verifyCurrentStateRootsPresentInGeneration(ctx context.Context, 
 		return err
 	}
 	defer cells.release()
+
+	if dirty := cells.dirtyShardsSnapshot(); len(dirty) > 0 {
+		return fmt.Errorf("cell generation %d has unflushed cell shards: %v", generation, dirty)
+	}
 
 	if err := s.verifyBlockStateRootPresentInCellStore(ctx, cells, current.Masterchain); err != nil {
 		return fmt.Errorf("masterchain %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)

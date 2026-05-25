@@ -7,7 +7,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/tonutils-go v1.17.0
+	github.com/xssnick/tonutils-go v1.17.1
 )
 
 require (
@@ -47,8 +47,4 @@ require (
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-)
-
-replace (
-	github.com/xssnick/tonutils-go => ../tonutils-go
 )

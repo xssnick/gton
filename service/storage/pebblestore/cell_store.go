@@ -360,6 +360,23 @@ func (c *cellStore) flush() error {
 	return errors.Join(errs...)
 }
 
+func (c *cellStore) dirtyShardsSnapshot() []int {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var dirty []int
+	for i, isDirty := range c.dirty {
+		if isDirty {
+			dirty = append(dirty, i)
+		}
+	}
+	return dirty
+}
+
 func (c *cellStore) markDirty(idx int) {
 	if c == nil || idx < 0 || idx >= len(c.dirty) {
 		return

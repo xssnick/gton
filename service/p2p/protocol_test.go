@@ -5,10 +5,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"github.com/xssnick/gton/service/archive"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/xssnick/gton/service/archive"
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/xssnick/tonutils-go/adnl/keys"
@@ -363,6 +365,79 @@ func TestDecodeCompressedBlockV2(t *testing.T) {
 	}
 	if res.Block == nil || res.Block.HashKey() != blockCell.HashKey() {
 		t.Fatalf("block hash mismatch")
+	}
+}
+
+func TestDecodeShardBlockBroadcastCompressedV2AllowsNonFinalSimplex(t *testing.T) {
+	blockCell := cell.BeginCell().MustStoreUInt(0xEE, 8).EndCell()
+	blockData := serializeCompressedBlockRoot(blockCell)
+	fileHash := sha256.Sum256(blockData)
+	blockHash := blockCell.HashKey()
+	id := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     3,
+		RootHash:  blockHash[:],
+		FileHash:  fileHash[:],
+	}
+	proofCell := testBlockProofCell(t, id, nil)
+
+	compressed, err := cell.CompressBOC([]*cell.Cell{blockCell}, cell.CompressionImprovedStructureLZ4, nil)
+	if err != nil {
+		t.Fatalf("compress shard block broadcast v2: %v", err)
+	}
+
+	res, err := decodeBlockBroadcastCompressedV2(tonnodeapi.BlockBroadcastCompressedV2{
+		ID: id,
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			Final: false,
+		},
+		Proof:          proofCell.ToBOC(),
+		DataCompressed: compressed,
+	}, nil)
+	if err != nil {
+		t.Fatalf("decode shard block broadcast v2: %v", err)
+	}
+	if res.Kind != "tonNode.blockBroadcastCompressedV2" {
+		t.Fatalf("unexpected kind %q", res.Kind)
+	}
+	if res.BroadcastSignatures != nil {
+		t.Fatal("non-final shard simplex signatures should not be used as final broadcast signatures")
+	}
+	if !res.VerifiedRootHash {
+		t.Fatalf("expected root hash verification")
+	}
+}
+
+func TestDecodeMasterchainBlockBroadcastCompressedV2RejectsNonFinalSimplex(t *testing.T) {
+	blockCell := cell.BeginCell().MustStoreUInt(0xEF, 8).EndCell()
+	blockData := serializeCompressedBlockRoot(blockCell)
+	fileHash := sha256.Sum256(blockData)
+	blockHash := blockCell.HashKey()
+	id := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     3,
+		RootHash:  blockHash[:],
+		FileHash:  fileHash[:],
+	}
+	proofCell := testBlockProofCell(t, id, nil)
+
+	compressed, err := cell.CompressBOC([]*cell.Cell{blockCell}, cell.CompressionImprovedStructureLZ4, nil)
+	if err != nil {
+		t.Fatalf("compress masterchain block broadcast v2: %v", err)
+	}
+
+	_, err = decodeBlockBroadcastCompressedV2(tonnodeapi.BlockBroadcastCompressedV2{
+		ID: id,
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			Final: false,
+		},
+		Proof:          proofCell.ToBOC(),
+		DataCompressed: compressed,
+	}, nil)
+	if !errors.Is(err, errBroadcastSignatureSetNonFinal) {
+		t.Fatalf("decode masterchain block broadcast v2 err = %v, want %v", err, errBroadcastSignatureSetNonFinal)
 	}
 }
 

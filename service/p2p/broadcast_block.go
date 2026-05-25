@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	tnstore "github.com/xssnick/gton/service/storage"
+
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -12,6 +14,8 @@ import (
 )
 
 var errBroadcastSignatureSetUnsupported = errors.New("broadcast signature set is not supported")
+var errBroadcastSignatureSetNonFinal = errors.New("broadcast signature set is not final")
+var errBroadcastDecompressionStateNotReady = errors.New("compressed broadcast previous state is not ready")
 
 func (n *Node) decodeBroadcastBlock(ctx context.Context, msg any) (*DownloadedBlock, error) {
 	block, err := decodeBroadcastBlock(msg)
@@ -29,9 +33,16 @@ func (n *Node) decodeBroadcastBlock(ctx context.Context, msg any) (*DownloadedBl
 
 	state, stateErr := n.stateForCompressedBlockDecompression(ctx, data.ID, data.Proof)
 	if stateErr != nil {
+		if errors.Is(stateErr, tnstore.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %v", errBroadcastDecompressionStateNotReady, stateErr)
+		}
 		return nil, fmt.Errorf("%w: %v", err, stateErr)
 	}
 	return decodeBlockBroadcastCompressedV2(data, state)
+}
+
+func isBroadcastDecompressionStateNotReady(err error) bool {
+	return errors.Is(err, errBroadcastDecompressionStateNotReady)
 }
 
 func decodeBroadcastBlock(msg any) (*DownloadedBlock, error) {
@@ -98,7 +109,9 @@ func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*
 
 func decodeBlockBroadcastCompressedV2(data tonnodeapi.BlockBroadcastCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
 	signatures, err := broadcastSignatureSetCell(data.SignatureSet)
-	if err != nil {
+	if errors.Is(err, errBroadcastSignatureSetNonFinal) && !isMasterchainBlock(data.ID) {
+		signatures = nil
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -160,7 +173,7 @@ func ordinaryBroadcastSignatureSetCell(catchainSeqno int32, validatorSetHash int
 
 func simplexBroadcastSignatureSetCell(sig tonnodeapi.SignatureSetSimplex) (*cell.Cell, error) {
 	if !sig.Final {
-		return nil, fmt.Errorf("%w: non-final simplex signature set", errBroadcastSignatureSetUnsupported)
+		return nil, errBroadcastSignatureSetNonFinal
 	}
 	if len(sig.SessionID) != 32 {
 		return nil, fmt.Errorf("invalid simplex session id len %d", len(sig.SessionID))

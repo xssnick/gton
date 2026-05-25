@@ -15,6 +15,7 @@ type dbCollector struct {
 	metrics *Metrics
 
 	available                 *prometheus.Desc
+	generation                *prometheus.Desc
 	cacheBytes                *prometheus.Desc
 	cacheRequests             *prometheus.Desc
 	fileCacheTables           *prometheus.Desc
@@ -38,8 +39,8 @@ type dbCollector struct {
 }
 
 func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
-	generationLabels := []string{"generation", "role"}
-	shardLabels := []string{"generation", "role", "shard"}
+	generationLabels := []string{"generation"}
+	shardLabels := []string{"generation", "shard"}
 	return &dbCollector{
 		metrics: metrics,
 		available: prometheus.NewDesc(
@@ -48,16 +49,22 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 			nil,
 			nil,
 		),
+		generation: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "cell_db_generation"),
+			"Open cell DB generation id by stable generation role.",
+			generationLabels,
+			nil,
+		),
 		cacheBytes: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "cell_db_cache_bytes"),
 			"Cell DB cache size by cache kind.",
-			[]string{"generation", "role", "cache"},
+			[]string{"generation", "cache"},
 			nil,
 		),
 		cacheRequests: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "cell_db_cache_requests_total"),
 			"Cell DB block cache requests by result.",
-			[]string{"generation", "role", "result"},
+			[]string{"generation", "result"},
 			nil,
 		),
 		fileCacheTables: prometheus.NewDesc(
@@ -173,6 +180,7 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 
 func (c *dbCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.available
+	ch <- c.generation
 	ch <- c.cacheBytes
 	ch <- c.cacheRequests
 	ch <- c.fileCacheTables
@@ -215,36 +223,49 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c *dbCollector) collectGeneration(ch chan<- prometheus.Metric, generation pebblestore.CellDBGenerationStatus) {
-	generationID := strconv.FormatUint(generation.ID, 10)
-	role := fallbackLabel(generation.Role)
-	ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, float64(generation.Cache.BlockCacheSize), generationID, role, "block")
-	ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, float64(generation.Cache.FileCacheSize), generationID, role, "file")
-	ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(generation.Cache.BlockCacheHits), generationID, role, "hit")
-	ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(generation.Cache.BlockCacheMisses), generationID, role, "miss")
-	ch <- prometheus.MustNewConstMetric(c.fileCacheTables, prometheus.GaugeValue, float64(generation.Cache.FileCacheTableCount), generationID, role)
+	generationLabel := cellDBGenerationLabel(generation.Role)
+	if generationLabel == "" {
+		return
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.generation, prometheus.GaugeValue, float64(generation.ID), generationLabel)
+	ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, float64(generation.Cache.BlockCacheSize), generationLabel, "block")
+	ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, float64(generation.Cache.FileCacheSize), generationLabel, "file")
+	ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(generation.Cache.BlockCacheHits), generationLabel, "hit")
+	ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(generation.Cache.BlockCacheMisses), generationLabel, "miss")
+	ch <- prometheus.MustNewConstMetric(c.fileCacheTables, prometheus.GaugeValue, float64(generation.Cache.FileCacheTableCount), generationLabel)
 
 	for _, shard := range generation.Shards {
-		c.collectShard(ch, generationID, role, strconv.Itoa(shard.Shard), shard)
+		c.collectShard(ch, generationLabel, strconv.Itoa(shard.Shard), shard)
 	}
-	c.collectShard(ch, generationID, role, "total", generation.Total)
+	c.collectShard(ch, generationLabel, "total", generation.Total)
 }
 
-func (c *dbCollector) collectShard(ch chan<- prometheus.Metric, generation string, role string, shardLabel string, shard pebblestore.CellDBShardStatus) {
-	ch <- prometheus.MustNewConstMetric(c.diskBytes, prometheus.GaugeValue, float64(shard.DiskSize), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.liveBytes, prometheus.GaugeValue, float64(shard.LiveSize), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.liveTables, prometheus.GaugeValue, float64(shard.LiveTables), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.readAmp, prometheus.GaugeValue, float64(shard.ReadAmp), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.l0Files, prometheus.GaugeValue, float64(shard.L0Files), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.l0Sublevels, prometheus.GaugeValue, float64(shard.L0Sublevels), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.l0Bytes, prometheus.GaugeValue, float64(shard.L0Size), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.compactionDebtBytes, prometheus.GaugeValue, float64(shard.CompactionDebt), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.compactionsInProgress, prometheus.GaugeValue, float64(shard.CompactionsInProgress), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.compactionInProgressBytes, prometheus.GaugeValue, float64(shard.CompactionInProgressSize), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.memtableBytes, prometheus.GaugeValue, float64(shard.MemTableSize), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.memtableCount, prometheus.GaugeValue, float64(shard.MemTableCount), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.tableIters, prometheus.GaugeValue, float64(shard.TableIters), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.flushes, prometheus.CounterValue, float64(shard.Flushes), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.ingests, prometheus.CounterValue, float64(shard.Ingests), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.readCells, prometheus.CounterValue, float64(shard.ReadCells), generation, role, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.writtenCells, prometheus.CounterValue, float64(shard.WrittenCells), generation, role, shardLabel)
+func cellDBGenerationLabel(role string) string {
+	switch role {
+	case "active", "pending":
+		return role
+	default:
+		return ""
+	}
+}
+
+func (c *dbCollector) collectShard(ch chan<- prometheus.Metric, generation string, shardLabel string, shard pebblestore.CellDBShardStatus) {
+	ch <- prometheus.MustNewConstMetric(c.diskBytes, prometheus.GaugeValue, float64(shard.DiskSize), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.liveBytes, prometheus.GaugeValue, float64(shard.LiveSize), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.liveTables, prometheus.GaugeValue, float64(shard.LiveTables), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.readAmp, prometheus.GaugeValue, float64(shard.ReadAmp), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.l0Files, prometheus.GaugeValue, float64(shard.L0Files), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.l0Sublevels, prometheus.GaugeValue, float64(shard.L0Sublevels), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.l0Bytes, prometheus.GaugeValue, float64(shard.L0Size), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.compactionDebtBytes, prometheus.GaugeValue, float64(shard.CompactionDebt), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.compactionsInProgress, prometheus.GaugeValue, float64(shard.CompactionsInProgress), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.compactionInProgressBytes, prometheus.GaugeValue, float64(shard.CompactionInProgressSize), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.memtableBytes, prometheus.GaugeValue, float64(shard.MemTableSize), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.memtableCount, prometheus.GaugeValue, float64(shard.MemTableCount), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.tableIters, prometheus.GaugeValue, float64(shard.TableIters), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.flushes, prometheus.CounterValue, float64(shard.Flushes), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.ingests, prometheus.CounterValue, float64(shard.Ingests), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.readCells, prometheus.CounterValue, float64(shard.ReadCells), generation, shardLabel)
+	ch <- prometheus.MustNewConstMetric(c.writtenCells, prometheus.CounterValue, float64(shard.WrittenCells), generation, shardLabel)
 }

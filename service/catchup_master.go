@@ -176,19 +176,7 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	s.currentStatus = next
 	s.currentStatusMu.Unlock()
 
-	s.observeCurrentSyncState(next)
 	return true
-}
-
-func (s *Service) observeCurrentSyncState(current *storage.CurrentState) {
-	if s.sync == nil || current == nil {
-		return
-	}
-
-	s.sync.ObserveSyncCurrentState(SyncCurrentStateObservation{
-		MasterchainSeqno: current.Masterchain.Block.SeqNo,
-		ShardClientSeqno: current.ShardClientSeqno,
-	})
 }
 
 func currentStateBehind(next *storage.CurrentState, current *storage.CurrentState) bool {
@@ -343,6 +331,7 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 			Msg("next-block shard-client checkpoint persisted")
 		cells.complete()
 		s.publishCommittedCurrentState(committed)
+		s.markLiveCheckpointStatesFlushed(checkpoint.entries)
 	})
 
 	return checkpoint.live, nil
@@ -397,7 +386,24 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 		Msg("next-block shard-client checkpoint persisted")
 	cells.complete()
 	s.publishCommittedCurrentState(committed)
+	s.markLiveCheckpointStatesFlushed(checkpoint.entries)
 	return checkpoint.live, nil
+}
+
+func (s *Service) markLiveCheckpointStatesFlushed(entries []storage.StateCheckpointBlock) {
+	flusher, ok := s.liveState.(liveBlockStateFlusher)
+	if !ok || len(entries) == 0 {
+		return
+	}
+
+	blocks := make([]ton.BlockIDExt, 0, len(entries))
+	for _, entry := range entries {
+		if entry.State == nil {
+			continue
+		}
+		blocks = append(blocks, entry.State.Block)
+	}
+	flusher.MarkLiveBlockStatesFlushed(blocks)
 }
 
 func (s *Service) currentStatePersistContext() context.Context {
@@ -451,8 +457,8 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 	}
 
 	for {
-		if downloaded, ok := s.takeQueuedMasterchainBlock(prev, masterchainSeqnoTarget(^uint32(0))); ok {
-			return downloaded, "queue", nil
+		if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, masterchainSeqnoTarget(^uint32(0))); ok || err != nil {
+			return downloaded, source, err
 		}
 
 		decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
@@ -507,16 +513,16 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 				if err != nil {
 					return p2p.DownloadedBlock{}, "", fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err)
 				}
-				return prepared, "probe", nil
+				return prepared, syncBlockSourceForDownloadedBlock("peer_probe", prepared), nil
 			case <-s.currentStateWake:
-				if downloaded, ok := s.takeQueuedMasterchainBlock(prev, masterchainSeqnoTarget(^uint32(0))); ok {
+				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, masterchainSeqnoTarget(^uint32(0))); ok || err != nil {
 					cancel()
-					return downloaded, "queue", nil
+					return downloaded, source, err
 				}
 			case <-broadcastWake:
-				if downloaded, ok := s.takeQueuedMasterchainBlock(prev, masterchainSeqnoTarget(^uint32(0))); ok {
+				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, masterchainSeqnoTarget(^uint32(0))); ok || err != nil {
 					cancel()
-					return downloaded, "queue", nil
+					return downloaded, source, err
 				}
 				broadcastWake = nil
 			case <-queryCtx.Done():

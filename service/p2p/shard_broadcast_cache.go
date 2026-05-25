@@ -10,6 +10,7 @@ import (
 	"github.com/xssnick/gton/service/blockproof"
 	tnstore "github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -44,6 +45,7 @@ type shardBroadcastBlockCacheEntry struct {
 	proofBOC  []byte
 	isLink    bool
 	meta      *tnstore.BlockMeta
+	parsed    *tlb.Block
 	expiresAt time.Time
 	bytes     int64
 }
@@ -59,10 +61,10 @@ func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int
 }
 
 func (c *shardBroadcastBlockCache) Store(downloaded DownloadedBlock, meta *tnstore.BlockMeta) error {
-	return c.storeAt(downloaded, meta, downloaded.Block, downloaded.Proof, time.Now())
+	return c.storeAt(downloaded, meta, downloaded.Parsed, downloaded.Block, downloaded.Proof, time.Now())
 }
 
-func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tnstore.BlockMeta, blockRoot *cell.Cell, proofRoot *cell.Cell, now time.Time) error {
+func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tnstore.BlockMeta, parsed *tlb.Block, blockRoot *cell.Cell, proofRoot *cell.Cell, now time.Time) error {
 	if c == nil {
 		return tnstore.ErrNotFound
 	}
@@ -112,6 +114,7 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		proofBOC:  append([]byte(nil), downloaded.ProofBOC...),
 		isLink:    downloaded.IsLink,
 		meta:      meta.Clone(),
+		parsed:    parsed,
 		expiresAt: now.Add(c.ttl),
 		bytes:     size,
 	}
@@ -190,6 +193,7 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		BlockBOC:         append([]byte(nil), entry.blockBOC...),
 		ProofBOC:         append([]byte(nil), entry.proofBOC...),
 		Meta:             entry.meta.Clone(),
+		Parsed:           entry.parsed,
 		IsLink:           entry.isLink,
 		VerifiedRootHash: true,
 		VerifiedFileHash: true,
@@ -262,7 +266,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
 		return
 	}
 
-	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.blockRoot, validated.proofRoot, time.Now()); err != nil {
+	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.parsed, validated.blockRoot, validated.proofRoot, time.Now()); err != nil {
 		n.log.Debug().
 			Err(err).
 			Str("block", formatBlockRef(downloaded.ID)).
@@ -273,6 +277,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
 	n.log.Debug().
 		Str("block", formatBlockRef(downloaded.ID)).
 		Msg("cached shard block broadcast")
+	n.notifyShardBroadcastBlock(downloaded.ID)
 }
 
 func (n *Node) popShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, error) {
@@ -289,6 +294,59 @@ func (n *Node) popShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, e
 		Str("block", formatBlockRef(block)).
 		Msg("using cached shard block broadcast")
 	return downloaded, nil
+}
+
+func (n *Node) watchShardBroadcastBlock(block ton.BlockIDExt) (<-chan struct{}, func()) {
+	if n == nil || n.shardBroadcastCache == nil || isMasterchainBlock(block) {
+		return nil, func() {}
+	}
+
+	key := tnstore.BlockKey(block)
+	ch := make(chan struct{})
+
+	n.shardBroadcastWaitMx.Lock()
+	if n.shardBroadcastWaiters == nil {
+		n.shardBroadcastWaiters = map[string][]chan struct{}{}
+	}
+	n.shardBroadcastWaiters[key] = append(n.shardBroadcastWaiters[key], ch)
+	n.shardBroadcastWaitMx.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			n.shardBroadcastWaitMx.Lock()
+			waiters := n.shardBroadcastWaiters[key]
+			for i, waiter := range waiters {
+				if waiter == ch {
+					waiters = append(waiters[:i], waiters[i+1:]...)
+					break
+				}
+			}
+			if len(waiters) == 0 {
+				delete(n.shardBroadcastWaiters, key)
+			} else {
+				n.shardBroadcastWaiters[key] = waiters
+			}
+			n.shardBroadcastWaitMx.Unlock()
+		})
+	}
+	return ch, cancel
+}
+
+func (n *Node) notifyShardBroadcastBlock(block ton.BlockIDExt) {
+	if n == nil {
+		return
+	}
+
+	key := tnstore.BlockKey(block)
+	n.shardBroadcastWaitMx.Lock()
+	waiters := n.shardBroadcastWaiters[key]
+	delete(n.shardBroadcastWaiters, key)
+	n.shardBroadcastWaitMx.Unlock()
+
+	for _, waiter := range waiters {
+		close(waiter)
+	}
 }
 
 func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {
@@ -315,6 +373,7 @@ func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {
 
 type validatedShardBroadcastBlock struct {
 	meta      *tnstore.BlockMeta
+	parsed    *tlb.Block
 	blockRoot *cell.Cell
 	proofRoot *cell.Cell
 }
@@ -350,9 +409,17 @@ func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBro
 			return validatedShardBroadcastBlock{}, fmt.Errorf("parse block data for %s: %w", formatBlockRef(downloaded.ID), err)
 		}
 	}
-	block, err := tnstore.ParseVerifiedBlockCell(downloaded.ID, root)
-	if err != nil {
-		return validatedShardBroadcastBlock{}, err
+	block := downloaded.Parsed
+	if block != nil {
+		if err := tnstore.VerifyBlockIdentity(downloaded.ID, block); err != nil {
+			return validatedShardBroadcastBlock{}, err
+		}
+	} else {
+		var err error
+		block, err = tnstore.ParseVerifiedBlockCell(downloaded.ID, root)
+		if err != nil {
+			return validatedShardBroadcastBlock{}, err
+		}
 	}
 
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(downloaded.ID, block)
@@ -361,6 +428,7 @@ func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBro
 	}
 	return validatedShardBroadcastBlock{
 		meta:      meta,
+		parsed:    block,
 		blockRoot: root,
 		proofRoot: proof,
 	}, nil

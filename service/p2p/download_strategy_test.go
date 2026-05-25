@@ -187,6 +187,67 @@ func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 	}
 }
 
+func TestProbeNextFullFromPeersStopsAfterEarlyFailures(t *testing.T) {
+	peers := []*overlayPeer{
+		{id: "peer-1", addr: "peer-1"},
+		{id: "peer-2", addr: "peer-2"},
+		{id: "peer-3", addr: "peer-3"},
+		{id: "peer-4", addr: "peer-4"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	startedAt := time.Now()
+	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeNextFullPeerOptions{
+		peerLimit:         2,
+		stagedPeerLimit:   4,
+		stageDelay:        10 * time.Millisecond,
+		earlyFailureCount: 3,
+		earlyFailureDelay: 40 * time.Millisecond,
+	}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+		if peer.id == "peer-4" {
+			<-ctx.Done()
+			return DownloadedBlock{}, ctx.Err()
+		}
+		return DownloadedBlock{}, ErrBlockNotAvailable
+	}, nil)
+	if err == nil {
+		t.Fatal("expected early failure error")
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 500*time.Millisecond {
+		t.Fatalf("early failure took too long: %s", elapsed)
+	}
+}
+
+func TestProbeNextFullFromPeersStopsAfterSoftTimeout(t *testing.T) {
+	peers := []*overlayPeer{
+		{id: "peer-1", addr: "peer-1"},
+		{id: "peer-2", addr: "peer-2"},
+		{id: "peer-3", addr: "peer-3"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	startedAt := time.Now()
+	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeNextFullPeerOptions{
+		peerLimit:       2,
+		stagedPeerLimit: 3,
+		stageDelay:      10 * time.Millisecond,
+		maxElapsed:      50 * time.Millisecond,
+	}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+		<-ctx.Done()
+		return DownloadedBlock{}, ctx.Err()
+	}, nil)
+	if err == nil {
+		t.Fatal("expected soft timeout error")
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 500*time.Millisecond {
+		t.Fatalf("soft timeout took too long: %s", elapsed)
+	}
+}
+
 func TestPreferDownloadPeerMovesSourceFirst(t *testing.T) {
 	peers := []*overlayPeer{
 		{id: "peer-a", addr: "peer-a"},

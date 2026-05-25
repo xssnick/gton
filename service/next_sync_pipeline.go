@@ -367,7 +367,7 @@ func (r *nextSyncRunner) runTargetMasterSource(out chan<- nextMasterDownload) {
 				Pipeline:         r.method,
 				Chain:            syncChainLabel(item.prev),
 				Source:           next.source,
-				Result:           "error",
+				Result:           syncBlockResultForError(next.err),
 				CatchUp:          true,
 				DownloadDuration: next.downloadElapsed,
 			})
@@ -402,8 +402,8 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 			r.service.observeSyncBlock(SyncBlockObservation{
 				Pipeline:         r.method,
 				Chain:            syncChainLabel(prev),
-				Source:           "probe",
-				Result:           "error",
+				Source:           "peer_probe",
+				Result:           syncBlockResultForError(err),
 				CatchUp:          false,
 				DownloadDuration: elapsed,
 			})
@@ -556,14 +556,14 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 	applied.applyTiming = applyTiming
 	if err != nil {
 		applied.err = err
-		observe("error", applyTiming.total)
+		observe(syncBlockResultForError(err), applyTiming.total)
 		return applied, err
 	}
 
 	r.service.publishLiveBlockArtifacts(item.block, nextMaster, false)
 	if err = r.service.stageAppliedBlockArtifact(r.ctx, item.block, 0); err != nil {
 		applied.err = err
-		observe("error", applyTiming.total)
+		observe(syncBlockResultForError(err), applyTiming.total)
 		return applied, err
 	}
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)

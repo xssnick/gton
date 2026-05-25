@@ -13,6 +13,9 @@ type peerRequestOptions struct {
 	stageDelay           time.Duration
 	hedgeDelay           time.Duration
 	collectAfterSuccess  time.Duration
+	maxElapsed           time.Duration
+	earlyFailureCount    int
+	earlyFailureDelay    time.Duration
 	cancelOnFirstSuccess bool
 	onFailure            func(*overlayPeer, error)
 	onCollectElapsed     func(ready int, pending int)
@@ -33,6 +36,7 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		stageParallelism = 0
 	}
 	targetParallelism := parallelism
+	startedAt := time.Now()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -82,6 +86,13 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		stageTimer = time.NewTimer(opts.stageDelay)
 		defer stageTimer.Stop()
 	}
+	var maxElapsedTimer *time.Timer
+	if opts.maxElapsed > 0 {
+		maxElapsedTimer = time.NewTimer(opts.maxElapsed)
+		defer maxElapsedTimer.Stop()
+	}
+	var earlyFailureTimer *time.Timer
+	var earlyFailureC <-chan time.Time
 
 	var collectTimer *time.Timer
 	var collectC <-chan time.Time
@@ -89,10 +100,31 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		if collectTimer != nil {
 			collectTimer.Stop()
 		}
+		if earlyFailureTimer != nil {
+			earlyFailureTimer.Stop()
+		}
 	}()
 
 	successes := make([]peerRequestResult[T], 0, 1)
 	var errs []error
+	startEarlyFailureTimer := func() bool {
+		if opts.earlyFailureCount <= 0 || len(successes) > 0 || len(errs) < opts.earlyFailureCount || nextIdx < len(peers) {
+			return false
+		}
+
+		if opts.earlyFailureDelay <= 0 {
+			return true
+		}
+		remaining := opts.earlyFailureDelay - time.Since(startedAt)
+		if remaining <= 0 {
+			return true
+		}
+		if earlyFailureTimer == nil {
+			earlyFailureTimer = time.NewTimer(remaining)
+			earlyFailureC = earlyFailureTimer.C
+		}
+		return false
+	}
 	for inFlight > 0 || nextIdx < len(peers) {
 		var hedgeC <-chan time.Time
 		if hedgeTimer != nil {
@@ -101,6 +133,10 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 		var stageC <-chan time.Time
 		if stageTimer != nil {
 			stageC = stageTimer.C
+		}
+		var maxElapsedC <-chan time.Time
+		if maxElapsedTimer != nil {
+			maxElapsedC = maxElapsedTimer.C
 		}
 
 		select {
@@ -112,6 +148,18 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 				return nil, errs
 			}
 			return nil, []error{ctx.Err()}
+		case <-maxElapsedC:
+			cancel()
+			if len(successes) > 0 {
+				return successes, errs
+			}
+			if len(errs) > 0 {
+				return nil, errs
+			}
+			return nil, []error{context.DeadlineExceeded}
+		case <-earlyFailureC:
+			cancel()
+			return nil, errs
 		case <-collectC:
 			if opts.onCollectElapsed != nil {
 				opts.onCollectElapsed(len(successes), inFlight+len(peers)-nextIdx)
@@ -163,6 +211,10 @@ func runPeerRequests[T any](ctx context.Context, peers []*overlayPeer, opts peer
 			if nextIdx < len(peers) {
 				launch(peers[nextIdx])
 				nextIdx++
+			}
+			if startEarlyFailureTimer() {
+				cancel()
+				return nil, errs
 			}
 		}
 	}

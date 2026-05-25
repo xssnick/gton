@@ -1349,6 +1349,14 @@ func blockStateWithRoot(block ton.BlockIDExt, root *cell.Cell) *storage.BlockSta
 	}
 }
 
+func saveCellGenerationSwitchProgress(tb testing.TB, store *Store, ctx context.Context, generation uint64, current *storage.CurrentState) {
+	tb.Helper()
+
+	if err := store.SaveCellGenerationMigrationProgress(ctx, generation, current); err != nil {
+		tb.Fatalf("save cell generation switch progress: %v", err)
+	}
+}
+
 func mustCellRecord(tb testing.TB, cl *cell.Cell) *storage.CellRecord {
 	tb.Helper()
 
@@ -2090,8 +2098,12 @@ func TestSwitchCellGenerationAtomicallySwitchesActiveGeneration(t *testing.T) {
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableHistoricalState, durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
 
-	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil)
+	if _, err = store.DeleteStateMetadataBeforeCellGenerationSwitch(ctx, newState.Block, newCurrent, nil); err != nil {
+		t.Fatalf("delete state metadata before switch: %v", err)
+	}
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent)
 	if err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
@@ -2147,7 +2159,7 @@ func TestSwitchCellGenerationAtomicallySwitchesActiveGeneration(t *testing.T) {
 	}
 }
 
-func TestSwitchCellGenerationDeletesStateMetadataBeforeImportedState(t *testing.T) {
+func TestDeleteStateMetadataBeforeCellGenerationSwitchDeletesStateMetadataBeforeImportedState(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2197,8 +2209,12 @@ func TestSwitchCellGenerationDeletesStateMetadataBeforeImportedState(t *testing.
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
 
-	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil); err != nil {
+	if _, err = store.DeleteStateMetadataBeforeCellGenerationSwitch(ctx, newState.Block, newCurrent, nil); err != nil {
+		t.Fatalf("delete state metadata before switch: %v", err)
+	}
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
 	if _, err = store.blockStateMeta(ctx, oldMaster.Block); !errors.Is(err, storage.ErrNotFound) {
@@ -2256,8 +2272,9 @@ func TestSwitchCellGenerationDoesNotRewriteCurrentStateMetadata(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(candidateState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, candidateCurrent)
 
-	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, block, block, candidateCurrent, nil)
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, block, block, candidateCurrent)
 	if err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
@@ -2327,8 +2344,9 @@ func TestSwitchCellGenerationRejectsDurableRootMismatch(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(candidateState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, candidateCurrent)
 
-	if _, err = store.SwitchCellGeneration(ctx, generation, block, block, candidateCurrent, nil); err == nil || !strings.Contains(err.Error(), "root hash mismatch") {
+	if _, err = store.SwitchCellGeneration(ctx, generation, block, block, candidateCurrent); err == nil || !strings.Contains(err.Error(), "root hash mismatch") {
 		t.Fatalf("switch root mismatch err=%v, want root hash mismatch", err)
 	}
 	active, err := store.ActiveCellGeneration(ctx)
@@ -2378,8 +2396,12 @@ func TestSwitchCellGenerationKeepsCurrentShardStateMetadataBeforeOrigin(t *testi
 	originShard.CellGeneration = generation
 	current.Masterchain = storage.BlockStateWithoutCells(origin)
 	current.Shards[storage.ShardKeyFromBlock(originShard.Block)] = storage.BlockStateWithoutCells(originShard)
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, current)
 
-	if _, err = store.SwitchCellGeneration(ctx, generation, origin.Block, origin.Block, current, nil); err != nil {
+	if _, err = store.DeleteStateMetadataBeforeCellGenerationSwitch(ctx, origin.Block, current, nil); err != nil {
+		t.Fatalf("delete state metadata before switch: %v", err)
+	}
+	if _, err = store.SwitchCellGeneration(ctx, generation, origin.Block, origin.Block, current); err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
 	if _, err = store.blockStateMeta(ctx, oldMaster.Block); !errors.Is(err, storage.ErrNotFound) {
@@ -2426,10 +2448,14 @@ func TestSwitchCellGenerationKeepsImportedOriginShardStateMetadataBeforeOrigin(t
 	}
 	origin.CellGeneration = generation
 	current.Masterchain = storage.BlockStateWithoutCells(origin)
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, current)
 
 	// The origin persistent state may contain a shard first included by an older masterchain block.
 	// Keep that imported metadata even if the shard is no longer current at switch time.
-	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, origin.Block, origin.Block, current, []ton.BlockIDExt{originShard.Block})
+	if _, err = store.DeleteStateMetadataBeforeCellGenerationSwitch(ctx, origin.Block, current, []ton.BlockIDExt{originShard.Block}); err != nil {
+		t.Fatalf("delete state metadata before switch: %v", err)
+	}
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, origin.Block, origin.Block, current)
 	if err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
@@ -2732,7 +2758,8 @@ func TestLazyCellLoaderInGenerationKeepsRequestedGenerationAfterSwitch(t *testin
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
-	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil); err != nil {
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
 
@@ -2796,6 +2823,7 @@ func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
 
 	advancedBlock := ton.BlockIDExt{
 		Workchain: -1,
@@ -2813,7 +2841,7 @@ func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 		t.Fatalf("save advanced checkpoint: %v", err)
 	}
 
-	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil); !errors.Is(err, storage.ErrCurrentStateAdvanced) {
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); !errors.Is(err, storage.ErrCurrentStateAdvanced) {
 		t.Fatalf("switch advanced current err=%v, want ErrCurrentStateAdvanced", err)
 	}
 	active, err := store.ActiveCellGeneration(ctx)
@@ -2868,8 +2896,9 @@ func TestSwitchCellGenerationRejectsMissingCandidateCurrentCellsBeforeCleanup(t 
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
 
-	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil); err == nil {
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); err == nil {
 		t.Fatal("switch succeeded without candidate current cells")
 	}
 	active, err := store.ActiveCellGeneration(ctx)
@@ -2884,6 +2913,67 @@ func TestSwitchCellGenerationRejectsMissingCandidateCurrentCellsBeforeCleanup(t 
 	}
 	if _, err = store.blockStateMeta(ctx, newState.Block); err != nil {
 		t.Fatalf("current state metadata was deleted before rejected switch: %v", err)
+	}
+}
+
+func TestSwitchCellGenerationRejectsUnflushedCandidateCells(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	oldBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	oldState := blockStateWithSingleCell(oldBlock, 0x10)
+	oldCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: oldBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(oldState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+		t.Fatalf("save old checkpoint: %v", err)
+	}
+
+	newBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	generation, err := store.BeginCellGeneration(ctx, newBlock)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	newRoot := cell.BeginCell().MustStoreUInt(0x20, 8).EndCell()
+	if err = store.SaveEncodedCellsInGeneration(ctx, generation, mustReachableEncodedRecords(t, newRoot), false); err != nil {
+		t.Fatalf("save unflushed candidate cells: %v", err)
+	}
+	newState := blockStateWithRoot(newBlock, newRoot)
+	newCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newState.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
+		t.Fatalf("save durable current before switch: %v", err)
+	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
+
+	if _, err = store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent); err == nil || !strings.Contains(err.Error(), "unflushed cell shards") {
+		t.Fatalf("switch unflushed cells err=%v, want unflushed cell shards", err)
+	}
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation: %v", err)
+	}
+	if active.ID != initialCellGenerationID {
+		t.Fatalf("active generation = %d, want %d", active.ID, initialCellGenerationID)
 	}
 }
 
@@ -2939,8 +3029,12 @@ func TestOpenReconcilesRetiredCellGenerationCleanup(t *testing.T) {
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
 
-	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil)
+	if _, err = store.DeleteStateMetadataBeforeCellGenerationSwitch(ctx, newState.Block, newCurrent, nil); err != nil {
+		t.Fatalf("delete state metadata before switch: %v", err)
+	}
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent)
 	if err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}
@@ -3043,8 +3137,9 @@ func TestActiveLazyRootSurvivesPreviousGenerationDeleteWhenCellExistsInNewGenera
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
+	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
 
-	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent, nil)
+	oldGeneration, err := store.SwitchCellGeneration(ctx, generation, newState.Block, newState.Block, newCurrent)
 	if err != nil {
 		t.Fatalf("switch generation: %v", err)
 	}

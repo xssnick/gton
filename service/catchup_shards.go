@@ -29,8 +29,11 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				return
 			}
 
-			if downloaded, ok := s.takeQueuedMasterchainBlock(prev, target); ok {
-				if !s.sendShardStateDownload(ctx, downloads, shardStateDownload{prev: prev, block: downloaded, source: "queue"}) {
+			if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); err != nil {
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
+				return
+			} else if ok {
+				if !s.sendShardStateDownload(ctx, downloads, shardStateDownload{prev: prev, block: downloaded, source: source}) {
 					return
 				}
 				prev = downloaded.ID
@@ -102,7 +105,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			item := shardStateDownload{
 				prev:            prev,
 				block:           downloaded,
-				source:          "next_block",
+				source:          syncBlockSourceForDownloadedBlock("next_block", downloaded),
 				downloadElapsed: downloadElapsed,
 			}
 			if !s.sendShardStateDownload(ctx, downloads, item) {
@@ -217,8 +220,12 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 					prev:            job.prev,
 					block:           downloaded,
 					err:             err,
-					source:          source,
 					downloadElapsed: downloadElapsed,
+				}
+				if err == nil {
+					item.source = syncBlockSourceForDownloadedBlock(source, downloaded)
+				} else {
+					item.source = source
 				}
 				select {
 				case results <- item:

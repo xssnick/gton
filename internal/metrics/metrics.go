@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service"
@@ -28,6 +27,7 @@ type Metrics struct {
 	registry            *prometheus.Registry
 	serviceStatusReader func() service.StatusSnapshot
 	dbStatusReader      func(context.Context) (pebblestore.DBStatus, error)
+	artifactStatus      *storageArtifactStatusReader
 
 	liteserverQueryDuration *prometheus.HistogramVec
 	liteserverQueryHandler  *prometheus.HistogramVec
@@ -36,12 +36,12 @@ type Metrics struct {
 	liteserverInflight      prometheus.Gauge
 
 	syncBlocks                *prometheus.CounterVec
+	syncBlockOrigins          *prometheus.CounterVec
 	syncBlockDownloadDuration *prometheus.HistogramVec
 	syncBlockApplyDuration    *prometheus.HistogramVec
 	syncPersistDuration       *prometheus.HistogramVec
 	syncPersistQueueDuration  *prometheus.HistogramVec
 	syncCheckpoints           *prometheus.CounterVec
-	syncLastPublishTimestamp  prometheus.Gauge
 }
 
 func New(namespace string) *Metrics {
@@ -87,6 +87,12 @@ func New(namespace string) *Metrics {
 			Name:      "blocks_total",
 			Help:      "Total synchronized blocks by pipeline, chain, source, result, and catch-up mode.",
 		}, []string{"pipeline", "chain", "source", "result", "catch_up"}),
+		syncBlockOrigins: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "sync",
+			Name:      "block_origins_total",
+			Help:      "Total synchronized blocks by origin: broadcast, download, stored, or other.",
+		}, []string{"pipeline", "chain", "origin", "result", "catch_up"}),
 		syncBlockDownloadDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "sync",
@@ -121,12 +127,6 @@ func New(namespace string) *Metrics {
 			Name:      "checkpoints_total",
 			Help:      "Total current state checkpoints by mode and result.",
 		}, []string{"mode", "result"}),
-		syncLastPublishTimestamp: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Subsystem: "sync",
-			Name:      "last_publish_timestamp_seconds",
-			Help:      "Unix timestamp of the last published current state.",
-		}),
 	}
 
 	registry.MustRegister(
@@ -138,14 +138,15 @@ func New(namespace string) *Metrics {
 		m.liteserverQueries,
 		m.liteserverInflight,
 		m.syncBlocks,
+		m.syncBlockOrigins,
 		m.syncBlockDownloadDuration,
 		m.syncBlockApplyDuration,
 		m.syncPersistDuration,
 		m.syncPersistQueueDuration,
 		m.syncCheckpoints,
-		m.syncLastPublishTimestamp,
 		newServiceCollector(m, namespace),
 		newDBCollector(m, namespace),
+		newStorageArtifactCollector(m, namespace),
 	)
 	return m
 }
@@ -198,6 +199,28 @@ func (m *Metrics) dbStatus(ctx context.Context) (pebblestore.DBStatus, error) {
 	return reader(ctx)
 }
 
+func (m *Metrics) SetStorageArtifactDirs(archivePackagesDir string, stateFilesDir string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.artifactStatus = newStorageArtifactStatusReader(archivePackagesDir, stateFilesDir)
+	m.mu.Unlock()
+}
+
+func (m *Metrics) storageArtifactStatus(ctx context.Context) (storageArtifactStatus, error) {
+	if m == nil {
+		return storageArtifactStatus{}, errMetricReaderNotConfigured
+	}
+	m.mu.RLock()
+	reader := m.artifactStatus
+	m.mu.RUnlock()
+	if reader == nil {
+		return storageArtifactStatus{}, errMetricReaderNotConfigured
+	}
+	return reader.Status(ctx)
+}
+
 func (m *Metrics) AddLiteserverInflight(delta int) {
 	if m == nil || m.liteserverInflight == nil || delta == 0 {
 		return
@@ -238,13 +261,6 @@ func (m *Metrics) ObserveLiteserverQuery(observation liteserver.QueryObservation
 	}
 }
 
-func (m *Metrics) ObserveSyncCurrentState(_ service.SyncCurrentStateObservation) {
-	if m == nil || m.syncLastPublishTimestamp == nil {
-		return
-	}
-	m.syncLastPublishTimestamp.Set(float64(time.Now().Unix()))
-}
-
 func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 	if m == nil || m.syncBlocks == nil {
 		return
@@ -252,15 +268,38 @@ func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 	pipeline := fallbackLabel(observation.Pipeline)
 	chain := fallbackLabel(observation.Chain)
 	source := fallbackLabel(observation.Source)
+	origin := observation.Origin
+	if origin == "" {
+		origin = syncBlockOriginForMetricSource(observation.Source)
+	}
+	origin = fallbackLabel(origin)
 	result := fallbackLabel(observation.Result)
 	catchUp := strconv.FormatBool(observation.CatchUp)
 
 	m.syncBlocks.WithLabelValues(pipeline, chain, source, result, catchUp).Inc()
+	if m.syncBlockOrigins != nil {
+		m.syncBlockOrigins.WithLabelValues(pipeline, chain, origin, result, catchUp).Inc()
+	}
 	if observation.DownloadDuration > 0 && m.syncBlockDownloadDuration != nil {
 		m.syncBlockDownloadDuration.WithLabelValues(pipeline, chain, source, result, catchUp).Observe(observation.DownloadDuration.Seconds())
 	}
 	if observation.ApplyDuration > 0 && m.syncBlockApplyDuration != nil {
 		m.syncBlockApplyDuration.WithLabelValues(pipeline, chain, result).Observe(observation.ApplyDuration.Seconds())
+	}
+}
+
+func syncBlockOriginForMetricSource(source string) string {
+	switch source {
+	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "queue":
+		return "broadcast"
+	case "peer_probe", "next_block", "indexed", "next_description", "peer_catch_up", "catch_up", "probe":
+		return "download"
+	case "stored":
+		return "stored"
+	case "":
+		return "unknown"
+	default:
+		return "other"
 	}
 }
 
