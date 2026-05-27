@@ -2,13 +2,21 @@ package p2p
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"hash/crc64"
 	"time"
 
+	tnstore "github.com/xssnick/gton/service/storage"
+
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
+
+var externalMessageCRC64Table = crc64.MakeTable(crc64.ECMA)
 
 type acceptedBroadcast struct {
 	fingerprint        string
@@ -23,8 +31,11 @@ type rebroadcastRequest struct {
 	subscription *overlaySubscription
 	kind         string
 	payload      []byte
+	payloadSize  int
+	fec          *overlay.BroadcastFECSender
 	sourcePeerID string
 	local        bool
+	queuedAt     time.Time
 }
 
 func (req rebroadcastRequest) overlayName() string {
@@ -46,7 +57,17 @@ func broadcastEventBytes(event BroadcastEvent) int64 {
 }
 
 func rebroadcastRequestBytes(req rebroadcastRequest) int64 {
-	return int64(len(req.payload)) + 256
+	return int64(req.payloadLen()) + 256
+}
+
+func (req rebroadcastRequest) payloadLen() int {
+	if len(req.payload) > 0 {
+		return len(req.payload)
+	}
+	if req.payloadSize > 0 {
+		return req.payloadSize
+	}
+	return 0
 }
 
 func (s *overlaySubscription) handleOverlayBroadcast(peer *overlayPeer, msg any, delivery Delivery, trusted bool, sourceKey string) error {
@@ -113,6 +134,26 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 		if len(data.Message.Data) == 0 {
 			return nil
 		}
+		if len(data.Message.Data) > maxOverlayPayloadSize {
+			return nil
+		}
+
+		hash := externalMessageFingerprint(s.spec.ShortID, data.Message.Data)
+		now := time.Now()
+		if !s.node.processedExternalMessages.Mark(hash, now) {
+			return nil
+		}
+		if s.node.myExternalMessages.Seen(hash, now) {
+			return nil
+		}
+		addrKey, err := externalMessageDestinationAddress(data.Message.Data)
+		if err != nil {
+			return nil
+		}
+		if err = s.node.addExternalMessageAddressLimit(addrKey, now); err != nil {
+			return nil
+		}
+
 		kind := "tonNode.externalMessageBroadcast"
 		return &acceptedBroadcast{
 			fingerprint: fingerprint,
@@ -182,6 +223,15 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	if err != nil {
 		stateNotReady := isBroadcastDecompressionStateNotReady(err)
 		if stateNotReady {
+			if validationErr := s.node.validateMasterchainBroadcastSignatures(s.node.runCtx, block, msg); validationErr != nil && !errors.Is(validationErr, tnstore.ErrNotFound) {
+				s.log.Debug().
+					Err(validationErr).
+					Str("block", formatBlockRef(block)).
+					Str("kind", kind).
+					Msg("dropping pending block broadcast because signature validation failed")
+				return nil
+			}
+
 			s.node.schedulePendingBlockBroadcastDecode(pendingBlockBroadcastDecode{
 				fingerprint: fingerprint,
 				overlay:     s.spec.Name,
@@ -225,6 +275,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourceKey)
 	accepted.deduped = true
+	downloaded.SourceKey = sourceKey
 	accepted.event.Downloaded = downloaded
 	accepted.rebroadcast = rebroadcast
 	return accepted
@@ -272,6 +323,15 @@ func broadcastFingerprint(overlayID []byte, payload []byte) string {
 	hasher.Write(overlayID)
 	hasher.Write(payload)
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func externalMessageFingerprint(overlayID []byte, data []byte) string {
+	crc := crc64.Update(0, externalMessageCRC64Table, overlayID)
+	crc = crc64.Update(crc, externalMessageCRC64Table, data)
+
+	var key [8]byte
+	binary.BigEndian.PutUint64(key[:], crc)
+	return string(key[:])
 }
 
 func validBlockBroadcast(block ton.BlockIDExt, proof []byte, data []byte) bool {

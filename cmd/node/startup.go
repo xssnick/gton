@@ -106,8 +106,8 @@ func ensureStoredZeroStateMatchesGlobalConfig(ctx context.Context, store storedZ
 	return nil
 }
 
-func startupZeroStateRequired(fromZero bool, initBlock ton.BlockIDExt) bool {
-	return fromZero || initBlock.SeqNo == 0
+func startupZeroStateRequired(fromZero bool, initBlock ton.BlockIDExt, liteserverEnabled bool) bool {
+	return fromZero || initBlock.SeqNo == 0 || liteserverEnabled
 }
 
 func ensureZeroStateBeforeInitialSync(ctx context.Context, logger zerolog.Logger, node *p2p.Node) error {

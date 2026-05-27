@@ -479,9 +479,15 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
 	var newActiveOrigin *ton.BlockIDExt
+	firstCurrentState := false
 
 	if current != nil {
 		if err := s.validateCurrentStateMetadata(db, current, prepared); err != nil {
+			return err
+		}
+		var err error
+		firstCurrentState, err = hotCurrentStateMissing(db)
+		if err != nil {
 			return err
 		}
 	}
@@ -510,7 +516,7 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 			s.mu.Unlock()
 			return err
 		}
-		if isEmptyBlockID(s.activeCellOrigin) {
+		if firstCurrentState && isEmptyBlockID(s.activeCellOrigin) && !isEmptyBlockID(current.Masterchain.Block) {
 			origin := current.Masterchain.Block
 			manifest := s.manifestLocked()
 			manifest.activeOrigin = origin
@@ -536,6 +542,18 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 
 	s.logBlockStateCheckpoint(prepared, current, flushCells, cellsElapsed, flushElapsed, hotSyncElapsed)
 	return nil
+}
+
+func hotCurrentStateMissing(db *pebble.DB) (bool, error) {
+	_, closer, err := pebbleReaderGet(db, hotKeyCurrentState())
+	if err == nil {
+		_ = closer.Close()
+		return false, nil
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (s *Store) validateCurrentStateMetadata(db *pebble.DB, current *storage.CurrentState, prepared []preparedBlockStateSave) error {
@@ -973,5 +991,18 @@ func (s *Store) logBlockStateCheckpoint(prepared []preparedBlockStateSave, curre
 }
 
 func isEmptyBlockID(block ton.BlockIDExt) bool {
-	return block.Workchain == 0 && block.Shard == 0 && block.SeqNo == 0 && block.RootHash == nil && block.FileHash == nil
+	return block.Workchain == 0 &&
+		block.Shard == 0 &&
+		block.SeqNo == 0 &&
+		isZeroHash(block.RootHash) &&
+		isZeroHash(block.FileHash)
+}
+
+func isZeroHash(hash []byte) bool {
+	for _, b := range hash {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }

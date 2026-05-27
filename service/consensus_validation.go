@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -115,6 +117,56 @@ func (s *Service) validateMasterchainBlockConsensusWithProof(current *tnstore.Bl
 	}
 	proof.signaturesChecked = true
 	return nil
+}
+
+func (s *Service) ValidateMasterchainBroadcastSignatures(ctx context.Context, block ton.BlockIDExt, proofBOC []byte, signatures *cell.Cell) error {
+	if block.Workchain != -1 || block.Shard != topShard {
+		return nil
+	}
+	if signatures == nil {
+		return fmt.Errorf("masterchain broadcast %s has no signatures", tnstore.FormatBlockRef(block))
+	}
+
+	proof, err := prepareMasterchainConsensusProof(block, proofBOC)
+	if err != nil {
+		return err
+	}
+	if proof.parsed == nil || proof.parsed.Block == nil || proof.parsed.Meta == nil {
+		return fmt.Errorf("masterchain broadcast proof %s is incomplete", tnstore.FormatBlockRef(block))
+	}
+
+	current, err := s.masterchainStateForBroadcastSignatureValidation(ctx, proof.parsed.Meta)
+	if err != nil {
+		return err
+	}
+	validators, err := s.masterchainValidatorsForConsensus(current, block, proof.parsed.Block)
+	if err != nil {
+		return fmt.Errorf("%w: validator set is not ready for broadcast %s: %v", tnstore.ErrNotFound, tnstore.FormatBlockRef(block), err)
+	}
+	if err = blockproof.CheckMasterchainSignaturesWithValidators(block, proof.parsed.Block, signatures, validators); err != nil {
+		return fmt.Errorf("check broadcast signatures for %s: %w", tnstore.FormatBlockRef(block), err)
+	}
+	return nil
+}
+
+func (s *Service) masterchainStateForBroadcastSignatureValidation(ctx context.Context, meta *tnstore.BlockMeta) (*tnstore.BlockState, error) {
+	if meta == nil || len(meta.PrevRefs) != 1 {
+		return nil, fmt.Errorf("masterchain broadcast proof has no single previous ref")
+	}
+
+	prev := meta.PrevRefs[0]
+	if prev.Workchain != -1 || prev.Shard != topShard {
+		return nil, fmt.Errorf("masterchain broadcast previous ref is not masterchain: %s", tnstore.FormatBlockRef(prev))
+	}
+
+	current, err := s.loadMasterStateForConsensus(ctx, prev)
+	if err == nil {
+		return current, nil
+	}
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return nil, fmt.Errorf("%w: previous masterchain state %s is not ready", tnstore.ErrNotFound, tnstore.FormatBlockRef(prev))
+	}
+	return nil, err
 }
 
 func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofBOC []byte) (*masterchainConsensusProof, error) {

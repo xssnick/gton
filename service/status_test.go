@@ -229,6 +229,39 @@ func TestCurrentBasechainLagSecondsUsesLocalShardUTime(t *testing.T) {
 	}
 }
 
+func TestSyncLagSecondsUsesMaxCurrentStateLag(t *testing.T) {
+	now := time.Now()
+	master := testBlockID(-1, topShard, 20)
+	baseFresh := testBlockID(0, topShard, 10)
+	baseStale := testBlockID(0, topShard>>1, 11)
+	svc := &Service{
+		currentStatus: &tnstore.CurrentState{
+			Masterchain: tnstore.BlockState{
+				Block:  master,
+				Parsed: &tlb.ShardStateUnsplit{GenUTime: uint32(now.Add(-4 * time.Second).Unix())},
+			},
+			Shards: map[tnstore.ShardKey]tnstore.BlockState{
+				{Workchain: 0, Shard: topShard}: {
+					Block:  baseFresh,
+					Parsed: &tlb.ShardStateUnsplit{GenUTime: uint32(now.Add(-2 * time.Second).Unix())},
+				},
+				{Workchain: 0, Shard: topShard >> 1}: {
+					Block:  baseStale,
+					Parsed: &tlb.ShardStateUnsplit{GenUTime: uint32(now.Add(-9 * time.Second).Unix())},
+				},
+			},
+		},
+	}
+
+	lag, ok := svc.SyncLagSeconds()
+	if !ok {
+		t.Fatal("expected sync lag")
+	}
+	if lag < 8 || lag > 10 {
+		t.Fatalf("sync lag = %d, want about 9", lag)
+	}
+}
+
 type fakeSyncObserver struct{}
 
 func (o *fakeSyncObserver) ObserveSyncBlock(SyncBlockObservation) {}

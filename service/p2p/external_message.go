@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/internal/extmsg"
+	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -30,14 +32,20 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 		return err
 	}
 
-	workchain, err := externalMessageDestinationWorkchain(data)
+	addrKey, err := externalMessageDestinationAddress(data)
 	if err != nil {
 		return err
 	}
 
-	sub, err := n.subscriptionForWorkchain(workchain)
+	sub, err := n.subscriptionForWorkchain(addrKey.Workchain)
 	if err != nil {
 		return err
+	}
+
+	hash := externalMessageFingerprint(sub.spec.ShortID, data)
+	now := time.Now()
+	if n.processedExternalMessages.Seen(hash, now) || n.myExternalMessages.Seen(hash, now) {
+		return nil
 	}
 
 	payload, err := tl.Serialize(tonnodeapi.NewExternalMessageBroadcast{
@@ -49,10 +57,8 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 	if len(payload) > maxOverlayPayloadSize {
 		return fmt.Errorf("external message broadcast payload is too large: %d", len(payload))
 	}
-
-	fingerprint := broadcastFingerprint(sub.spec.ShortID, payload)
-	if !n.deduper.Mark(fingerprint, time.Now()) {
-		return nil
+	if err = n.addExternalMessageAddressLimit(addrKey, now); err != nil {
+		return err
 	}
 
 	req := rebroadcastRequest{
@@ -61,11 +67,11 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 		payload:      payload,
 		local:        true,
 	}
-	if n.allowRebroadcast(&req) {
-		if !sub.enqueueRebroadcast(req) {
-			return errors.New("local external message rebroadcast queues are full")
-		}
+	if !sub.enqueueRebroadcast(req) {
+		n.dropExternalMessageAddressLimit(addrKey, now)
+		return errors.New("local external message rebroadcast queues are full")
 	}
+	n.myExternalMessages.Mark(hash, now)
 	return nil
 }
 
@@ -85,23 +91,54 @@ func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, 
 	return sub, nil
 }
 
-func externalMessageDestinationWorkchain(data []byte) (int32, error) {
+func externalMessageDestinationAddress(data []byte) (extmsg.AddressKey, error) {
 	root, err := cell.FromBOC(data)
 	if err != nil {
-		return 0, fmt.Errorf("parse external message BOC: %w", err)
+		return extmsg.AddressKey{}, fmt.Errorf("parse external message BOC: %w", err)
 	}
 
 	loader, err := root.BeginParse()
 	if err != nil {
-		return 0, fmt.Errorf("begin parse external message: %w", err)
+		return extmsg.AddressKey{}, fmt.Errorf("begin parse external message: %w", err)
 	}
 
+	magic, err := loader.PreloadUInt(2)
+	if err != nil || magic != 0b10 {
+		return extmsg.AddressKey{}, errors.New("external message must begin with ext_in_msg_info$10")
+	}
 	var msg tlb.ExternalMessage
 	if err = tlb.LoadFromCell(&msg, loader); err != nil {
-		return 0, fmt.Errorf("parse external message: %w", err)
+		return extmsg.AddressKey{}, fmt.Errorf("parse external message: %w", err)
 	}
 	if msg.DstAddr == nil {
-		return 0, errors.New("external message has no destination address")
+		return extmsg.AddressKey{}, errors.New("external message has no destination address")
 	}
-	return msg.DstAddr.Workchain(), nil
+	if msg.DstAddr.Type() != address.StdAddress || msg.DstAddr.BitsLen() != 256 {
+		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
+	}
+	return externalMessageAddressKey(msg.DstAddr), nil
+}
+
+func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
+	key := extmsg.AddressKey{Workchain: addr.Workchain()}
+	copy(key.Account[:], addr.Data())
+	return key
+}
+
+func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {
+	if n.externalMessageLimiter == nil {
+		n.externalMessageLimiter = extmsg.NewDefaultAddressLimiter()
+	}
+	err := n.externalMessageLimiter.Add(key, now)
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w %d:%x", err, key.Workchain, key.Account[:])
+}
+
+func (n *Node) dropExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) {
+	if n.externalMessageLimiter == nil {
+		return
+	}
+	n.externalMessageLimiter.Remove(key, now)
 }

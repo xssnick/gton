@@ -94,6 +94,15 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		if err != nil {
 			return err
 		}
+		if blockRef != nil {
+			registration, err := s.archivePackRegistrationFromRef(full.ID, meta, full.ArchiveShardSplitDepth, blockRef)
+			if err != nil {
+				return err
+			}
+			if registration.valid {
+				registrations = append(registrations, registration)
+			}
+		}
 		mergeArchiveImportMeta(metas, meta)
 		fullWrites = append(fullWrites, fullWrite{
 			block:         full,
@@ -360,6 +369,46 @@ func mergeArchiveImportMeta(metas map[string]*storage.BlockMeta, meta *storage.B
 	merged := storage.MergeBlockMeta(metas[key], meta)
 	merged.ID = meta.ID
 	metas[key] = merged
+}
+
+func (s *Store) archivePackRegistrationFromRef(block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, ref *storage.ArtifactRef) (archivePackRegistration, error) {
+	if ref == nil || ref.Path == "" {
+		return archivePackRegistration{}, nil
+	}
+	if block.Workchain != -1 || block.Shard != topShard {
+		return archivePackRegistration{}, nil
+	}
+
+	location, err := s.archiveEntryLocation(block, meta, splitDepth)
+	if err != nil {
+		return archivePackRegistration{}, err
+	}
+	firstMasterSeq, firstMasterUTime, firstMasterLT, err := archiveEntryFirstMaster(block, meta)
+	if err != nil {
+		return archivePackRegistration{}, err
+	}
+
+	path := ref.Path
+	if filepath.IsAbs(path) {
+		path = s.relativeArtifactPath(path)
+	}
+	stat, err := os.Stat(s.artifactPath(path))
+	if err != nil {
+		return archivePackRegistration{}, err
+	}
+	return archivePackRegistration{
+		valid:            true,
+		archiveID:        location.archiveID,
+		path:             path,
+		size:             stat.Size(),
+		baseSeq:          location.baseSeqno,
+		startSeq:         location.sliceSeqno,
+		workchain:        location.workchain,
+		shard:            location.shard,
+		firstMasterSeq:   firstMasterSeq,
+		firstMasterUTime: firstMasterUTime,
+		firstMasterLT:    firstMasterLT,
+	}, nil
 }
 
 func (s *Store) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {

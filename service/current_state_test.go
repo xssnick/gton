@@ -204,8 +204,10 @@ func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
 	}{
 		{name: "plain overlay download", kind: "tonNode.dataFull", want: "next_block"},
 		{name: "broadcast cache", kind: "tonNode.blockBroadcastCompressedV2", want: "broadcast_cache"},
+		{name: "shard description broadcast hint", kind: "tonNode.newShardBlockBroadcast", want: "broadcast_hint"},
 		{name: "stored full block", kind: "local full block cache", want: "stored"},
 		{name: "stored next block", kind: "local next block cache", want: "stored"},
+		{name: "stored block data", kind: "stored block", want: "stored"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := syncBlockSourceForDownloadedBlock("next_block", p2p.DownloadedBlock{Kind: tc.kind})
@@ -213,6 +215,35 @@ func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
 				t.Fatalf("source = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSyncBlockOriginTreatsBroadcastHintAsBroadcast(t *testing.T) {
+	if got := syncBlockOriginForSource("broadcast_hint"); got != "broadcast" {
+		t.Fatalf("origin = %q, want broadcast", got)
+	}
+}
+
+func TestStateRootForCompressedBlockUsesLiveShardState(t *testing.T) {
+	block := testBlockID(0, topShard, 123)
+	root := testShardStateCell(t, block)
+	svc := &Service{
+		currentStatus: &tnstore.CurrentState{
+			Shards: map[tnstore.ShardKey]tnstore.BlockState{
+				tnstore.ShardKeyFromBlock(block): {
+					Block: block,
+					Cell:  root,
+				},
+			},
+		},
+	}
+
+	got, err := svc.StateRootForCompressedBlock(context.Background(), block)
+	if err != nil {
+		t.Fatalf("state root error = %v", err)
+	}
+	if got != root {
+		t.Fatal("state root was not taken from live shard state")
 	}
 }
 
@@ -872,6 +903,13 @@ func TestNextBlockBootstrapProbeDecisionWidensFanout(t *testing.T) {
 	if wide.peerLimit != nextBlockBootstrapWidePeers {
 		t.Fatalf("wide probe peers = %d, want %d", wide.peerLimit, nextBlockBootstrapWidePeers)
 	}
+
+	catchUpWide, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{
+		consecutiveMisses: nextBlockBootstrapWideMisses,
+	})
+	if catchUpWide.peerLimit != nextBlockBootstrapWidePeers {
+		t.Fatalf("catch-up wide probe peers = %d, want %d", catchUpWide.peerLimit, nextBlockBootstrapWidePeers)
+	}
 }
 
 func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
@@ -916,11 +954,60 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	if baseLive.stagedPeerLimit() != nextBlockBootstrapWidePeers {
 		t.Fatalf("live staged probe peers = %d, want %d", baseLive.stagedPeerLimit(), nextBlockBootstrapWidePeers)
 	}
+	if !(nextBlockBootstrapProbeDecision{liveTail: true, rawBroadcastAhead: true}).shouldPreferBroadcastCandidate() {
+		t.Fatal("live raw masterchain broadcast should prefer broadcast candidate")
+	}
+	if (nextBlockBootstrapProbeDecision{rawBroadcastAhead: true}).shouldPreferBroadcastCandidate() {
+		t.Fatal("cold raw masterchain broadcast should not delay peer probe")
+	}
 
 	oldUTime := time.Now().Add(-time.Duration(nextBlockBootstrapWideLagSeconds+1) * time.Second).Unix()
 	lagged, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{liveTail: true})
 	if lagged.peerLimit != nextBlockBootstrapWidePeers {
 		t.Fatalf("lagged probe peers = %d, want %d", lagged.peerLimit, nextBlockBootstrapWidePeers)
+	}
+
+	lagged, _ = (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{})
+	if lagged.peerLimit != nextBlockBootstrapWidePeers {
+		t.Fatalf("lagged catch-up probe peers = %d, want %d", lagged.peerLimit, nextBlockBootstrapWidePeers)
+	}
+}
+
+func TestExactBlockDownloadProbeDecisionWidensFanout(t *testing.T) {
+	base := (&Service{}).exactBlockDownloadProbeDecision(exactBlockDownloadProbeState{
+		started: time.Now(),
+	})
+	if base.peerLimit != exactBlockDownloadProbePeers {
+		t.Fatalf("base exact probe peers = %d, want %d", base.peerLimit, exactBlockDownloadProbePeers)
+	}
+	if base.stagedPeerLimit != exactBlockDownloadProbePeers {
+		t.Fatalf("base exact staged probe peers = %d, want %d", base.stagedPeerLimit, exactBlockDownloadProbePeers)
+	}
+
+	urgent := (&Service{}).exactBlockDownloadProbeDecision(exactBlockDownloadProbeState{
+		started:           time.Now(),
+		consecutiveMisses: nextBlockBootstrapUrgentMisses,
+	})
+	if urgent.peerLimit != nextBlockBootstrapUrgentPeers {
+		t.Fatalf("urgent exact probe peers = %d, want %d", urgent.peerLimit, nextBlockBootstrapUrgentPeers)
+	}
+	if urgent.stagedPeerLimit != nextBlockBootstrapWidePeers {
+		t.Fatalf("urgent exact staged probe peers = %d, want %d", urgent.stagedPeerLimit, nextBlockBootstrapWidePeers)
+	}
+
+	wide := (&Service{}).exactBlockDownloadProbeDecision(exactBlockDownloadProbeState{
+		started:           time.Now(),
+		consecutiveMisses: nextBlockBootstrapWideMisses,
+	})
+	if wide.peerLimit != nextBlockBootstrapWidePeers {
+		t.Fatalf("wide exact probe peers = %d, want %d", wide.peerLimit, nextBlockBootstrapWidePeers)
+	}
+
+	waited := (&Service{}).exactBlockDownloadProbeDecision(exactBlockDownloadProbeState{
+		started: time.Now().Add(-time.Duration(nextBlockBootstrapWideLagSeconds+1) * time.Second),
+	})
+	if waited.peerLimit != nextBlockBootstrapWidePeers {
+		t.Fatalf("waited exact probe peers = %d, want %d", waited.peerLimit, nextBlockBootstrapWidePeers)
 	}
 }
 
@@ -955,6 +1042,41 @@ func TestCurrentStateWakeInterruptsLivePollDelay(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("wake took %s", elapsed)
+	}
+}
+
+func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
+	prev := testMasterBlockID(10)
+	next := testMasterBlockID(11)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
+			ID: next,
+			Meta: &tnstore.BlockMeta{
+				ID:       next,
+				PrevRefs: []ton.BlockIDExt{prev},
+			},
+		}, "broadcast-peer")
+		svc.wakeCurrentStateSync()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	downloaded, source, ok, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
+	if err != nil {
+		t.Fatalf("wait preferred masterchain broadcast: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected preferred masterchain broadcast")
+	}
+	if !downloaded.ID.Equals(&next) {
+		t.Fatalf("preferred block = %s, want %s", tnstore.FormatBlockRef(downloaded.ID), tnstore.FormatBlockRef(next))
+	}
+	if source != "broadcast_queue" {
+		t.Fatalf("preferred source = %q, want broadcast_queue", source)
 	}
 }
 

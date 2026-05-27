@@ -19,6 +19,7 @@ const (
 var (
 	errPersistentStateGCActive         = errors.New("persistent state gc is running")
 	errArchiveTTLGCActive              = errors.New("archive ttl gc is running")
+	errArchiveBackfillActive           = errors.New("archive backfill is running")
 	errExclusiveServiceTaskHighReadAmp = errors.New("db read amplification is too high")
 	errExclusiveServiceTaskHighLag     = errors.New("sync lag is too high")
 )
@@ -31,6 +32,7 @@ const (
 	exclusiveServiceTaskCellGenerationMigration exclusiveServiceTask = "cell_generation_migration"
 	exclusiveServiceTaskPersistentStateGC       exclusiveServiceTask = "persistent_state_gc"
 	exclusiveServiceTaskArchiveTTLGC            exclusiveServiceTask = "archive_ttl_gc"
+	exclusiveServiceTaskArchiveBackfill         exclusiveServiceTask = "archive_backfill"
 )
 
 type exclusiveServiceTaskLease struct {
@@ -229,6 +231,8 @@ func (t exclusiveServiceTask) backgroundStatus() string {
 		return "pruning persistent states"
 	case exclusiveServiceTaskArchiveTTLGC:
 		return "pruning archives"
+	case exclusiveServiceTaskArchiveBackfill:
+		return "backfilling archives"
 	default:
 		return string(t)
 	}
@@ -256,6 +260,8 @@ func exclusiveServiceTaskError(task exclusiveServiceTask) error {
 		return errPersistentStateGCActive
 	case exclusiveServiceTaskArchiveTTLGC:
 		return errArchiveTTLGCActive
+	case exclusiveServiceTaskArchiveBackfill:
+		return errArchiveBackfillActive
 	default:
 		return fmt.Errorf("exclusive service task %q is running", task)
 	}

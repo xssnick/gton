@@ -39,6 +39,13 @@ type serviceCollector struct {
 	p2pBroadcasts       *prometheus.Desc
 	p2pRebroadcastSent  *prometheus.Desc
 	p2pRebroadcastDrop  *prometheus.Desc
+	p2pFECActiveStreams *prometheus.Desc
+	p2pFECActiveBytes   *prometheus.Desc
+	p2pFECDelivered     *prometheus.Desc
+	p2pFECDropped       *prometheus.Desc
+	p2pFECEvicted       *prometheus.Desc
+	p2pFECCompleted     *prometheus.Desc
+	p2pFECDeliveredHits *prometheus.Desc
 
 	blocksyncQueueItems    *prometheus.Desc
 	blocksyncQueueCapacity *prometheus.Desc
@@ -169,6 +176,48 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			[]string{"queue"},
 			nil,
 		),
+		p2pFECActiveStreams: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_active_streams"),
+			"Current active inbound FEC broadcast decoder streams by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
+		p2pFECActiveBytes: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_active_bytes"),
+			"Current estimated bytes reserved by inbound FEC broadcast decoder streams by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
+		p2pFECDelivered: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_delivered_cache_items"),
+			"Current delivered inbound FEC broadcast cache items by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
+		p2pFECDropped: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_dropped_total"),
+			"Total inbound FEC broadcast streams dropped by receiver budget by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
+		p2pFECEvicted: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_evicted_total"),
+			"Total inbound FEC broadcast streams evicted by receiver cleanup by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
+		p2pFECCompleted: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_completed_total"),
+			"Total inbound FEC broadcasts decoded and delivered by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
+		p2pFECDeliveredHits: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "fec_receiver_delivered_cache_hits_total"),
+			"Total late inbound FEC parts skipped by delivered broadcast cache by overlay.",
+			[]string{"overlay"},
+			nil,
+		),
 		blocksyncQueueItems: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "blocksync", "queue_items"),
 			"Current block sync queue length.",
@@ -217,6 +266,13 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pBroadcasts
 	ch <- c.p2pRebroadcastSent
 	ch <- c.p2pRebroadcastDrop
+	ch <- c.p2pFECActiveStreams
+	ch <- c.p2pFECActiveBytes
+	ch <- c.p2pFECDelivered
+	ch <- c.p2pFECDropped
+	ch <- c.p2pFECEvicted
+	ch <- c.p2pFECCompleted
+	ch <- c.p2pFECDeliveredHits
 	ch <- c.blocksyncQueueItems
 	ch <- c.blocksyncQueueCapacity
 	ch <- c.blocksyncQueueDropped
@@ -308,6 +364,16 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 	for _, rebroadcast := range snapshot.Rebroadcast {
 		ch <- prometheus.MustNewConstMetric(c.p2pRebroadcastSent, prometheus.CounterValue, float64(rebroadcast.Sent), rebroadcast.Queue)
 		ch <- prometheus.MustNewConstMetric(c.p2pRebroadcastDrop, prometheus.CounterValue, float64(rebroadcast.Dropped), rebroadcast.Queue)
+	}
+
+	for _, fec := range snapshot.FECReceivers {
+		ch <- prometheus.MustNewConstMetric(c.p2pFECActiveStreams, prometheus.GaugeValue, float64(fec.ActiveStreams), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pFECActiveBytes, prometheus.GaugeValue, float64(fec.ActiveBytes), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pFECDelivered, prometheus.GaugeValue, float64(fec.DeliveredBroadcasts), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pFECDropped, prometheus.CounterValue, float64(fec.DroppedTotal), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pFECEvicted, prometheus.CounterValue, float64(fec.EvictedTotal), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pFECCompleted, prometheus.CounterValue, float64(fec.CompletedTotal), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pFECDeliveredHits, prometheus.CounterValue, float64(fec.DeliveredCacheHitsTotal), fec.Overlay)
 	}
 
 	for _, broadcast := range snapshot.Broadcasts {

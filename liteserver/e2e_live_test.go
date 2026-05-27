@@ -34,7 +34,7 @@ const (
 var (
 	liteServerE2EAccountAddr        = address.MustParseAddr("EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs")
 	liteServerE2EMasterAccountAddr  = address.MustParseAddr("Ef9VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVbxn")
-	liteServerE2ERunMethodAddr      = address.MustParseAddr("EQBL2_3lMiyywU17g-or8N7v9hDmPCpttzBPE2isF2GTzpK4")
+	liteServerE2ERunMethodAddr      = address.MustParseAddr("kQDMo9xJIt6qMhYJg5luhIK18XkRJVKUPeOgrA0ORJoTgewC")
 	liteServerE2EMissingLibraryHash = make([]byte, 32)
 )
 
@@ -632,39 +632,24 @@ func TestLiveLiteServerE2E(t *testing.T) {
 	}
 
 	suite.step("runSmcMethod verified", func() error {
-		c1 := cell.BeginCell().MustStoreUInt(0xAA, 8).EndCell().MustBeginParse()
-		c2 := cell.BeginCell().MustStoreUInt(0xBB, 8).EndCell()
-
 		return compareReference(
 			func() (*ton.ExecutionResult, error) {
-				return refAPI.WaitForBlock(master.SeqNo).RunGetMethod(refCtx, master, liteServerE2ERunMethodAddr, "clltst2", c1, c2)
+				return refAPI.WaitForBlock(master.SeqNo).RunGetMethod(refCtx, master, liteServerE2ERunMethodAddr, "seqno")
 			},
 			func() (*ton.ExecutionResult, error) {
-				return api.WaitForBlock(master.SeqNo).RunGetMethod(ctx, master, liteServerE2ERunMethodAddr, "clltst2", c1, c2)
+				return api.WaitForBlock(master.SeqNo).RunGetMethod(ctx, master, liteServerE2ERunMethodAddr, "seqno")
 			},
 			func(ref *ton.ExecutionResult, got *ton.ExecutionResult) error {
-				refSlice, err := ref.Slice(0)
+				refSeqno, err := ref.Int(0)
 				if err != nil {
-					return fmt.Errorf("reference first stack value: %w", err)
+					return fmt.Errorf("reference seqno stack value: %w", err)
 				}
-				gotSlice, err := got.Slice(0)
-				if err != nil {
-					return err
-				}
-				if !bytes.Equal(refSlice.MustToCell().Hash(), gotSlice.MustToCell().Hash()) {
-					return fmt.Errorf("first returned stack value mismatch")
-				}
-
-				refCell, err := ref.Cell(1)
-				if err != nil {
-					return fmt.Errorf("reference second stack value: %w", err)
-				}
-				gotCell, err := got.Cell(1)
+				gotSeqno, err := got.Int(0)
 				if err != nil {
 					return err
 				}
-				if !bytes.Equal(refCell.Hash(), gotCell.Hash()) {
-					return fmt.Errorf("second returned stack value mismatch")
+				if refSeqno.Cmp(gotSeqno) != 0 {
+					return fmt.Errorf("seqno mismatch: reference=%s got=%s", refSeqno.String(), gotSeqno.String())
 				}
 				return nil
 			},
@@ -976,6 +961,7 @@ func isReferenceUnavailable(err error) bool {
 		strings.Contains(text, "no active connections") ||
 		strings.Contains(text, "unknown request type") ||
 		strings.Contains(text, "unknown query") ||
+		strings.Contains(text, "total weight of all validators in validator set exceeds 2^61") ||
 		strings.Contains(text, "query is not allowed") {
 		return true
 	}

@@ -55,6 +55,7 @@ const (
 	persistentStateVersion         = 1
 	archivePackageVersion          = 1
 	cellGenerationMigrationVersion = 2
+	archiveBackfillProgressVersion = 1
 
 	cellRecordCompactRefsFlag = 0x10
 	cellRecordHashSize        = 32

@@ -98,6 +98,10 @@ func (s *Server) handleQuery(ctx context.Context, query any) tl.Serializable {
 		return s.handleBlockOutMsgQueueSize(ctx, q)
 	case ton.GetOutMsgQueueSizes:
 		return s.handleOutMsgQueueSizes(ctx, q)
+	case ton.GetDispatchQueueInfo:
+		return s.handleDispatchQueueInfo(ctx, q)
+	case ton.GetDispatchQueueMessages:
+		return s.handleDispatchQueueMessages(ctx, q)
 	case ton.NonfinalGetValidatorGroups, ton.NonfinalGetCandidate, ton.NonfinalGetPendingShardBlocks:
 		return ton.LSError{Code: errCodeUnspecified, Text: "query is not allowed"}
 	default:
@@ -117,7 +121,7 @@ func (s *Server) handleMasterchainInfoExt(ctx context.Context, mode uint32) tl.S
 	}
 
 	return ton.MasterchainInfoExt{
-		Mode:          effectiveMode,
+		Mode:          mode,
 		Version:       s.version,
 		Capabilities:  s.capabilities,
 		Last:          info.Last,

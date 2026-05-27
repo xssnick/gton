@@ -119,9 +119,6 @@ func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error
 		return nil
 	}
 	if isLink {
-		if proof.Signatures != nil {
-			return fmt.Errorf("invalid masterchain proof link %s with validator signatures present", tnstore.FormatBlockRef(id))
-		}
 		return nil
 	}
 	if proof.Signatures == nil {

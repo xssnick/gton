@@ -292,21 +292,48 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 }
 
 func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+	state := exactBlockDownloadProbeState{
+		started: time.Now(),
+	}
 	for {
-		downloaded, err := s.downloadExactChainBlock(ctx, block)
+		attemptStarted := time.Now()
+		downloaded, source, err := s.downloadExactChainBlockProbe(ctx, block, state)
+		attemptElapsed := time.Since(attemptStarted)
 		if err == nil {
+			s.observeSyncBlock(SyncBlockObservation{
+				Pipeline:         "exact_block_download",
+				Chain:            syncChainLabel(block),
+				Source:           source,
+				Result:           "success",
+				CatchUp:          true,
+				DownloadDuration: attemptElapsed,
+			})
 			return downloaded, nil
 		}
+		s.observeSyncBlock(SyncBlockObservation{
+			Pipeline:         "exact_block_download",
+			Chain:            syncChainLabel(block),
+			Source:           "peer_probe",
+			Result:           syncBlockResultForError(err),
+			CatchUp:          true,
+			DownloadDuration: attemptElapsed,
+		})
 		if errors.Is(err, context.Canceled) {
 			return p2p.DownloadedBlock{}, err
 		}
 		if !isExpectedRetryError(err) {
 			return p2p.DownloadedBlock{}, err
 		}
+		state.consecutiveMisses++
+		decision := s.exactBlockDownloadProbeDecision(state)
 
 		s.log.Debug().
 			Err(err).
 			Str("block", storage.FormatBlockRef(block)).
+			Int("consecutive_misses", state.consecutiveMisses).
+			Int("next_probe_peers", decision.peerLimit).
+			Int("next_staged_probe_peers", decision.stagedPeerLimit).
+			Dur("waited", time.Since(state.started)).
 			Dur("retry_in", shardStateCatchUpRetryDelay).
 			Msg("retry indexed block download")
 		if err = waitRetry(ctx, shardStateCatchUpRetryDelay); err != nil {

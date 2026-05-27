@@ -394,6 +394,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		if r.service.cellGenerationSwitchRequestActive() {
 			return
 		}
+		probeState.liveTail = nextBlockBootstrapLiveTail(prevUTime, time.Now().Unix())
 
 		started := time.Now()
 		downloaded, source, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, probeState)
@@ -437,9 +438,6 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		prevUTime = 0
 		if downloaded.Meta != nil {
 			prevUTime = int64(downloaded.Meta.GenUTime)
-		}
-		if nextBlockBootstrapLiveTail(prevUTime, time.Now().Unix()) {
-			probeState.liveTail = true
 		}
 		probeState.consecutiveMisses = 0
 		processed++
@@ -837,7 +835,7 @@ func (r *nextSyncRunner) prefetchShardDescriptionTarget(hint shardDescriptionHin
 	go func() {
 		defer r.releaseShardPrefetchSlot()
 
-		err := r.service.node.PrefetchShardBlockFull(r.ctx, desc.Block)
+		err := r.service.node.PrefetchShardBlockFullFromBroadcastHint(r.ctx, desc.Block)
 		if err != nil && r.ctx.Err() == nil {
 			r.service.log.Debug().
 				Err(err).
@@ -1091,7 +1089,22 @@ func (r *nextSyncRunner) takeShardResolverStats() shardStateResolverStats {
 	return delta
 }
 
-func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded p2p.DownloadedBlock, _ time.Duration) error {
+func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded p2p.DownloadedBlock, applyElapsed time.Duration) (err error) {
+	observation := SyncBlockObservation{
+		Pipeline:      r.method,
+		Chain:         syncChainLabel(downloaded.ID),
+		Source:        syncBlockSourceForDownloadedBlock("next_block", downloaded),
+		Result:        "success",
+		CatchUp:       r.mode == nextSyncToTarget,
+		ApplyDuration: applyElapsed,
+	}
+	defer func() {
+		if err != nil {
+			observation.Result = syncBlockResultForError(err)
+		}
+		r.service.observeSyncBlock(observation)
+	}()
+
 	setShardStateMasterchainRef(state, r.master.Block)
 	setDownloadedShardMasterchainRef(&downloaded, r.master.Block)
 

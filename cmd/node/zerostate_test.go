@@ -40,10 +40,11 @@ func TestStartupZeroStateRequired(t *testing.T) {
 	initBlock.SeqNo = 123
 
 	tests := []struct {
-		name      string
-		fromZero  bool
-		initBlock ton.BlockIDExt
-		want      bool
+		name              string
+		fromZero          bool
+		initBlock         ton.BlockIDExt
+		liteserverEnabled bool
+		want              bool
 	}{
 		{
 			name:      "from zero with normal init block",
@@ -61,11 +62,17 @@ func TestStartupZeroStateRequired(t *testing.T) {
 			initBlock: initBlock,
 			want:      false,
 		},
+		{
+			name:              "liteserver enabled with normal init block",
+			initBlock:         initBlock,
+			liteserverEnabled: true,
+			want:              true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := startupZeroStateRequired(tt.fromZero, tt.initBlock); got != tt.want {
+			if got := startupZeroStateRequired(tt.fromZero, tt.initBlock, tt.liteserverEnabled); got != tt.want {
 				t.Fatalf("startupZeroStateRequired() = %v, want %v", got, tt.want)
 			}
 		})

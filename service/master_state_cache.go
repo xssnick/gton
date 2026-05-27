@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
@@ -21,8 +22,6 @@ func (s *Service) rememberMasterState(state *storage.BlockState) {
 	cloned := storage.CloneBlockState(state)
 
 	s.masterStateCacheMu.Lock()
-	defer s.masterStateCacheMu.Unlock()
-
 	if s.masterStateCache == nil {
 		s.masterStateCache = make(map[string]*storage.BlockState, masterStateCacheLimit)
 	}
@@ -36,6 +35,11 @@ func (s *Service) rememberMasterState(state *storage.BlockState) {
 		copy(s.masterStateCacheKeys, s.masterStateCacheKeys[1:])
 		s.masterStateCacheKeys = s.masterStateCacheKeys[:len(s.masterStateCacheKeys)-1]
 		delete(s.masterStateCache, evict)
+	}
+	s.masterStateCacheMu.Unlock()
+
+	if s.node != nil {
+		s.node.NotifyCompressedBlockStateReady()
 	}
 }
 
@@ -87,11 +91,32 @@ func (s *Service) loadMasterStateForConsensus(ctx context.Context, block ton.Blo
 }
 
 func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
+	s.currentStatusMu.RLock()
+	state, err := currentStateBlockState(s.currentStatus, block)
+	s.currentStatusMu.RUnlock()
+
+	if err == nil {
+		if state.Cell != nil {
+			return state.Cell, nil
+		}
+		if len(state.StateRootHash) == 32 && s.storage != nil {
+			root, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
+			if err == nil {
+				return root, nil
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				return nil, err
+			}
+		}
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
+	}
+
 	if block.Workchain != -1 || block.Shard != topShard {
 		return nil, storage.ErrNotFound
 	}
 
-	state, err := s.loadMasterStateForConsensus(ctx, block)
+	state, err = s.loadMasterStateForConsensus(ctx, block)
 	if err != nil {
 		return nil, err
 	}
@@ -104,4 +129,19 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 
 	root, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
 	return root, err
+}
+
+func currentStateBlockState(current *storage.CurrentState, block ton.BlockIDExt) (*storage.BlockState, error) {
+	if current == nil {
+		return nil, storage.ErrNotFound
+	}
+	if current.Masterchain.Block.Equals(&block) {
+		return storage.CloneBlockState(&current.Masterchain), nil
+	}
+	for _, shard := range current.Shards {
+		if shard.Block.Equals(&block) {
+			return storage.CloneBlockState(&shard), nil
+		}
+	}
+	return nil, storage.ErrNotFound
 }

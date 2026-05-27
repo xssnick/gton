@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/internal/logutil"
 	tnstate "github.com/xssnick/gton/service/state"
 	storage2 "github.com/xssnick/gton/service/storage"
@@ -57,9 +58,14 @@ type Node struct {
 	events     chan BroadcastEvent
 	eventQueue *boundedQueue[BroadcastEvent]
 	deduper    *eventDeduper
-	onceStop   sync.Once
-	stopped    chan struct{}
-	wg         sync.WaitGroup
+
+	myExternalMessages        *eventDeduper
+	processedExternalMessages *eventDeduper
+	externalMessageLimiter    *extmsg.AddressLimiter
+
+	onceStop sync.Once
+	stopped  chan struct{}
+	wg       sync.WaitGroup
 
 	inboundMx       sync.Mutex
 	inboundStopping bool
@@ -74,6 +80,11 @@ type Node struct {
 	storage               storage2.Storage
 	peerStorage           storage2.PeerServingStorage
 	compressedState       CompressedBlockStateProvider
+	syncLag               SyncLagProvider
+	signatureVerifierMx   sync.RWMutex
+	signatureVerifier     MasterchainBroadcastSignatureVerifier
+	stateReadyMx          sync.Mutex
+	stateReadyNotify      chan struct{}
 	shardBroadcastCache   *shardBroadcastBlockCache
 	shardBroadcastWaitMx  sync.Mutex
 	shardBroadcastWaiters map[string][]chan struct{}
@@ -83,12 +94,19 @@ type Node struct {
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
+	rebroadcastFECSlots     map[rebroadcastFECLimiterClass]chan struct{}
+	rebroadcastFECMu        sync.Mutex
+	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[string]struct{}
 
 	pendingBroadcastMx sync.Mutex
 	pendingBroadcasts  map[string]struct{}
 
 	broadcastStatsMx sync.Mutex
 	broadcastStats   map[broadcastStatKey]uint64
+
+	fecReceiverStatsMx sync.Mutex
+	fecReceiverLast    map[fecReceiverPeerKey]fecReceiverCounterSnapshot
+	fecReceiverTotals  map[string]fecReceiverCounterSnapshot
 
 	localRebroadcastSent    atomic.Uint64
 	localRebroadcastDropped atomic.Uint64
@@ -197,6 +215,9 @@ func New(opts Options) (*Node, error) {
 		events:                    make(chan BroadcastEvent, broadcastEventBuffer),
 		eventQueue:                newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
 		deduper:                   newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		myExternalMessages:        newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		processedExternalMessages: newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		externalMessageLimiter:    extmsg.NewDefaultAddressLimiter(),
 		stopped:                   make(chan struct{}),
 		subscriptions:             map[string]*overlaySubscription{},
 		monitorMinSplitDepth:      map[int32]uint32{},
@@ -208,12 +229,18 @@ func New(opts Options) (*Node, error) {
 		storage:                   storage,
 		peerStorage:               peerStorage,
 		compressedState:           opts.CompressedState,
+		syncLag:                   opts.SyncLag,
+		stateReadyNotify:          make(chan struct{}),
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		shardBroadcastWaiters:     map[string][]chan struct{}{},
 		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastThrottleLast:   map[string]time.Time{},
+		rebroadcastFECSlots:       newRebroadcastFECSlotLimits(),
+		rebroadcastFECPeers:       newRebroadcastFECPeerLimits(),
 		pendingBroadcasts:         map[string]struct{}{},
 		broadcastStats:            map[broadcastStatKey]uint64{},
+		fecReceiverLast:           map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
+		fecReceiverTotals:         map[string]fecReceiverCounterSnapshot{},
 		stateFilesDir:             stateFilesDir,
 		downloadPeerLeases:        map[string]int{},
 		stateCellImportSlot:       make(chan struct{}, 1),
@@ -867,6 +894,21 @@ func (d *eventDeduper) Mark(key string, now time.Time) bool {
 
 	d.pruneExpiredLocked(now)
 	d.pruneOverflowLocked()
+	return true
+}
+
+func (d *eventDeduper) Seen(key string, now time.Time) bool {
+	d.mx.Lock()
+	defer d.mx.Unlock()
+
+	entry := d.seen[key]
+	if entry == nil {
+		return false
+	}
+	if now.Sub(entry.seenAt) >= d.ttl {
+		d.deleteEntryLocked(entry)
+		return false
+	}
 	return true
 }
 

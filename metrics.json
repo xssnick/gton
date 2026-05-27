@@ -24,7 +24,7 @@
       "kind": "Panel",
       "spec": {
         "id": 2,
-        "title": "Max sync lag",
+        "title": "Master lag",
         "description": "",
         "links": [],
         "data": {
@@ -44,7 +44,7 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "max by (instance) (${metric_namespace}_sync_lag_seconds{job=~\"$job\", instance=~\"$instance\"})",
+                      "expr": "max by (instance) (${metric_namespace}_sync_lag_seconds{job=~\"$job\", instance=~\"$instance\", chain=\"masterchain\", shard=\"masterchain\"})",
                       "legendFormat": "{{instance}}"
                     }
                   }
@@ -785,109 +785,6 @@
         }
       }
     },
-    "panel-11": {
-      "kind": "Panel",
-      "spec": {
-        "id": 11,
-        "title": "Local vs network seqno",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, chain, shard) (${metric_namespace}_sync_local_seqno{job=~\"$job\", instance=~\"$instance\"})",
-                      "legendFormat": "{{instance}} local {{chain}}/{{shard}}"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, chain, shard) (${metric_namespace}_sync_network_seqno{job=~\"$job\", instance=~\"$instance\"})",
-                      "legendFormat": "{{instance}} network {{chain}}/{{shard}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
     "panel-14": {
       "kind": "Panel",
       "spec": {
@@ -1089,7 +986,7 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, source) (rate(${metric_namespace}_sync_block_download_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, source) (rate(${metric_namespace}_sync_block_download_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
                       "legendFormat": "{{instance}} {{pipeline}} {{source}} p95"
                     }
                   }
@@ -3247,6 +3144,176 @@
         }
       }
     },
+    "panel-49": {
+      "kind": "Panel",
+      "spec": {
+        "id": 49,
+        "title": "Archive package bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "max by (instance) (${metric_namespace}_storage_archive_package_bytes{job=~\"$job\", instance=~\"$instance\"})",
+                      "legendFormat": "{{instance}} archive packages"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-50": {
+      "kind": "Panel",
+      "spec": {
+        "id": 50,
+        "title": "Persistent state bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "max by (instance) (${metric_namespace}_storage_persistent_state_bytes{job=~\"$job\", instance=~\"$instance\"})",
+                      "legendFormat": "{{instance}} persistent states"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-44": {
       "kind": "Panel",
       "spec": {
@@ -3800,6 +3867,411 @@
           }
         }
       }
+    },
+    "panel-51": {
+      "kind": "Panel",
+      "spec": {
+        "id": 51,
+        "title": "FEC receiver active/cache",
+        "description": "Inbound FEC decoder streams and delivered broadcast cache entries by overlay.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "${metric_namespace}_p2p_fec_receiver_active_streams{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}} {{overlay}} active"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "${metric_namespace}_p2p_fec_receiver_delivered_cache_items{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}} {{overlay}} delivered cache"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-52": {
+      "kind": "Panel",
+      "spec": {
+        "id": 52,
+        "title": "FEC receiver active bytes",
+        "description": "Estimated memory reserved by inbound FEC decoder streams.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "${metric_namespace}_p2p_fec_receiver_active_bytes{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}} {{overlay}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-53": {
+      "kind": "Panel",
+      "spec": {
+        "id": 53,
+        "title": "FEC receiver drop rate",
+        "description": "Inbound FEC streams dropped or evicted by receiver protection.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} dropped"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_evicted_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} evicted"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-54": {
+      "kind": "Panel",
+      "spec": {
+        "id": 54,
+        "title": "FEC receiver delivery rate",
+        "description": "Inbound FEC broadcasts delivered and late parts skipped by delivered cache.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_completed_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} completed"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_delivered_cache_hits_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} cache hits"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
     }
   },
   "layout": {
@@ -3943,19 +4415,6 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-10"
-                      }
-                    }
-                  },
-                  {
-                    "kind": "GridLayoutItem",
-                    "spec": {
-                      "x": 0,
-                      "y": 8,
-                      "width": 24,
-                      "height": 8,
-                      "element": {
-                        "kind": "ElementReference",
-                        "name": "panel-11"
                       }
                     }
                   }
@@ -4260,6 +4719,58 @@
                         "name": "panel-48"
                       }
                     }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 32,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-51"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 32,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-52"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 40,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-53"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 40,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-54"
+                      }
+                    }
                   }
                 ]
               }
@@ -4376,6 +4887,32 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-42"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 32,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-49"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 32,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-50"
                       }
                     }
                   }

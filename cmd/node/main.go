@@ -252,6 +252,12 @@ func main() {
 		}
 		return svc.StateRootForCompressedBlock(ctx, block)
 	})
+	opts.SyncLag = p2p.SyncLagProviderFunc(func() (int64, bool) {
+		if svc == nil {
+			return 0, false
+		}
+		return svc.SyncLagSeconds()
+	})
 
 	node, err := p2p.New(opts)
 	if err != nil {
@@ -295,6 +301,7 @@ func main() {
 		DisableStateSerialization:      cfg.DisableStateSerialization,
 		SyncObserver:                   syncObserver,
 	})
+	node.SetMasterchainBroadcastSignatureVerifier(svc)
 	if runtimeMetrics != nil {
 		runtimeMetrics.SetServiceStatusReader(svc.StatusSnapshot)
 	}
@@ -327,7 +334,7 @@ func main() {
 		node.Wait()
 		os.Exit(1)
 	}
-	if startupZeroStateRequired(*fromZeroFlag, initBlock) {
+	if startupZeroStateRequired(*fromZeroFlag, initBlock, liteOpts.Enabled) {
 		if err = ensureZeroStateBeforeInitialSync(ctx, logger, node); err != nil {
 			if errors.Is(err, context.Canceled) {
 				node.Wait()

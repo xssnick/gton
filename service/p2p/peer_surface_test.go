@@ -345,6 +345,61 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 	}
 }
 
+func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
+	node := newTestNode(t)
+
+	zeroHash := make([]byte, 32)
+	spec, err := buildOverlaySpec(zeroHash, -1, topShard, "masterchain")
+	if err != nil {
+		t.Fatalf("build overlay spec: %v", err)
+	}
+
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  spec,
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+
+	now := time.Now()
+	for i := 0; i < maxRandomPeerReply*3; i++ {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("generate peer key: %v", err)
+		}
+		announced, err := overlay.NewNode(spec.FullID, priv)
+		if err != nil {
+			t.Fatalf("build overlay node: %v", err)
+		}
+		sub.peers[fmt.Sprintf("peer-%d", i)] = &overlayPeer{
+			announced:     announced,
+			alive:         true,
+			lastReceiveAt: now,
+		}
+	}
+
+	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
+	if len(res.List) != maxRandomPeerReply {
+		t.Fatalf("getRandomPeers returned %d nodes, want %d", len(res.List), maxRandomPeerReply)
+	}
+
+	self, err := node.selfOverlayNode(spec)
+	if err != nil {
+		t.Fatalf("build self overlay node: %v", err)
+	}
+	selfID, err := tl.Hash(self.ID)
+	if err != nil {
+		t.Fatalf("hash self overlay node id: %v", err)
+	}
+	firstID, err := tl.Hash(res.List[0].ID)
+	if err != nil {
+		t.Fatalf("hash first reply node id: %v", err)
+	}
+	if fmt.Sprintf("%x", firstID) != fmt.Sprintf("%x", selfID) {
+		t.Fatal("first getRandomPeers advertisement should be self")
+	}
+}
+
 func TestConnectOverlayNodeSkipsSelf(t *testing.T) {
 	node := newTestNode(t)
 

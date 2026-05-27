@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/storage"
 )
 
 var errServiceMaintenanceRescan = errors.New("service maintenance priority rescan")
+
+const serviceMaintenanceStartDelay = 30 * time.Second
 
 type serviceMaintenanceTask uint8
 
@@ -19,11 +22,30 @@ const (
 	serviceMaintenanceTaskArchiveTTLGC
 	serviceMaintenanceTaskCellGenerationMigration
 	serviceMaintenanceTaskStateSerialization
+	serviceMaintenanceTaskArchiveBackfill
 )
+
+func (s *Service) runDelayedServiceMaintenance(ctx context.Context) {
+	s.log.Info().
+		Dur("delay", serviceMaintenanceStartDelay).
+		Msg("delaying service maintenance worker start")
+
+	timer := time.NewTimer(serviceMaintenanceStartDelay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+
+	s.runServiceMaintenance(ctx)
+}
 
 func (s *Service) runServiceMaintenance(ctx context.Context) {
 	nextPersistentStateGC := time.Now()
 	nextArchiveGC := time.Now()
+	nextArchiveBackfill := time.Now()
 	var nextCellGenerationMigrationRetry time.Time
 	var nextStateSerialization time.Time
 	if s.stateSerializer != nil {
@@ -34,6 +56,7 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 		now := time.Now()
 		persistentStateGCDue := !now.Before(nextPersistentStateGC)
 		archiveGCDue := !now.Before(nextArchiveGC)
+		archiveBackfillDue := !now.Before(nextArchiveBackfill)
 		stateSerializationDue := !nextStateSerialization.IsZero() && !now.Before(nextStateSerialization)
 
 		migrationPending, err := s.cellGenerationMigrationPending(ctx)
@@ -54,10 +77,11 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 			nextCellGenerationMigrationRetry = time.Time{}
 		} else {
 			persistentStateGCDue = false
+			archiveBackfillDue = false
 		}
 
 		cellGenerationMigrationDue := migrationPending && !now.Before(nextCellGenerationMigrationRetry)
-		switch nextServiceMaintenanceTask(persistentStateGCDue, archiveGCDue, cellGenerationMigrationDue, stateSerializationDue) {
+		switch nextServiceMaintenanceTask(persistentStateGCDue, archiveGCDue, cellGenerationMigrationDue, stateSerializationDue, archiveBackfillDue) {
 		case serviceMaintenanceTaskPersistentStateGC:
 			delay := persistentStateGCInterval
 			pruned, err := s.runPersistentStateGCOnce(ctx)
@@ -138,6 +162,11 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 				nextStateSerialization = time.Now()
 				continue
 			}
+			var delayErr stateSerializationDelayError
+			if errors.As(err, &delayErr) {
+				nextStateSerialization = time.Now().Add(delayErr.delay)
+				continue
+			}
 			if err != nil {
 				delay = stateSerializationRetryDelay
 				event := s.log.Warn()
@@ -148,19 +177,45 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 			}
 			nextStateSerialization = time.Now().Add(delay)
 			continue
+
+		case serviceMaintenanceTaskArchiveBackfill:
+			delay := archiveBackfillIdlePollDelay
+			worked, err := s.runArchiveBackfillOnce(ctx)
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if err != nil {
+				delay = archiveBackfillRetryDelay
+				event := s.log.Warn()
+				if errors.Is(err, errExclusiveServiceTaskHighReadAmp) || errors.Is(err, errExclusiveServiceTaskHighLag) || errors.Is(err, archive.ErrNotAvailable) {
+					event = s.log.Info()
+				} else if isExpectedRetryError(err) {
+					event = s.log.Debug()
+				}
+				event.Err(err).Dur("retry_in", delay).Msg("archive backfill iteration failed")
+			}
+			if worked {
+				delay = 0
+			}
+			nextArchiveBackfill = time.Now().Add(delay)
+			continue
 		}
 
 		nextPersistentStateGCWait := nextPersistentStateGC
 		if migrationPending {
 			nextPersistentStateGCWait = time.Time{}
 		}
-		if !s.waitServiceMaintenanceWake(ctx, serviceMaintenanceWaitDelay(nextPersistentStateGCWait, nextArchiveGC, nextCellGenerationMigrationRetry, nextStateSerialization)) {
+		nextArchiveBackfillWait := nextArchiveBackfill
+		if migrationPending {
+			nextArchiveBackfillWait = time.Time{}
+		}
+		if !s.waitServiceMaintenanceWake(ctx, serviceMaintenanceWaitDelay(nextPersistentStateGCWait, nextArchiveGC, nextCellGenerationMigrationRetry, nextStateSerialization, nextArchiveBackfillWait)) {
 			return
 		}
 	}
 }
 
-func nextServiceMaintenanceTask(persistentStateGCDue bool, archiveGCDue bool, cellGenerationMigrationPending bool, stateSerializationDue bool) serviceMaintenanceTask {
+func nextServiceMaintenanceTask(persistentStateGCDue bool, archiveGCDue bool, cellGenerationMigrationPending bool, stateSerializationDue bool, archiveBackfillDue bool) serviceMaintenanceTask {
 	if cellGenerationMigrationPending {
 		return serviceMaintenanceTaskCellGenerationMigration
 	}
@@ -169,6 +224,9 @@ func nextServiceMaintenanceTask(persistentStateGCDue bool, archiveGCDue bool, ce
 	}
 	if archiveGCDue {
 		return serviceMaintenanceTaskArchiveTTLGC
+	}
+	if archiveBackfillDue {
+		return serviceMaintenanceTaskArchiveBackfill
 	}
 	if stateSerializationDue {
 		return serviceMaintenanceTaskStateSerialization

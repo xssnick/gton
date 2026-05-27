@@ -45,6 +45,45 @@ func isBroadcastDecompressionStateNotReady(err error) bool {
 	return errors.Is(err, errBroadcastDecompressionStateNotReady)
 }
 
+func (n *Node) validateMasterchainBroadcastSignatures(ctx context.Context, block ton.BlockIDExt, msg any) error {
+	if block.Workchain != -1 || block.Shard != topShard {
+		return nil
+	}
+
+	verifier := n.masterchainBroadcastSignatureVerifier()
+	if verifier == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	proof, signatures, ok, err := broadcastProofAndSignatures(msg)
+	if err != nil || !ok {
+		return err
+	}
+	if len(proof) == 0 {
+		return fmt.Errorf("masterchain broadcast %s proof is empty", formatBlockRef(block))
+	}
+	if signatures == nil {
+		return fmt.Errorf("masterchain broadcast %s signatures are empty", formatBlockRef(block))
+	}
+	return verifier.ValidateMasterchainBroadcastSignatures(ctx, block, proof, signatures)
+}
+
+func broadcastProofAndSignatures(msg any) ([]byte, *cell.Cell, bool, error) {
+	switch data := msg.(type) {
+	case tonnodeapi.BlockBroadcast:
+		signatures, err := ordinaryBroadcastSignatureSetCell(data.CatchainSeqno, data.ValidatorSetHash, data.Signatures)
+		return data.Proof, signatures, true, err
+	case tonnodeapi.BlockBroadcastCompressedV2:
+		signatures, err := broadcastSignatureSetCell(data.SignatureSet)
+		return data.Proof, signatures, true, err
+	default:
+		return nil, nil, false, nil
+	}
+}
+
 func decodeBroadcastBlock(msg any) (*DownloadedBlock, error) {
 	switch data := msg.(type) {
 	case tonnodeapi.BlockBroadcast:

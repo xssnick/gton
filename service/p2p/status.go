@@ -14,6 +14,7 @@ type StatusSnapshot struct {
 	LatestBasechain       *ton.BlockIDExt
 	LatestBasechainShards []ton.BlockIDExt
 	Overlays              []OverlayStatusSnapshot
+	FECReceivers          []FECReceiverStatusSnapshot
 	Queues                []QueueStatusSnapshot
 	Rebroadcast           []RebroadcastStatusSnapshot
 	Broadcasts            []BroadcastStatusSnapshot
@@ -53,6 +54,17 @@ type RebroadcastStatusSnapshot struct {
 	Dropped uint64
 }
 
+type FECReceiverStatusSnapshot struct {
+	Overlay                 string
+	ActiveStreams           int
+	ActiveBytes             int64
+	DeliveredBroadcasts     int
+	DroppedTotal            uint64
+	EvictedTotal            uint64
+	CompletedTotal          uint64
+	DeliveredCacheHitsTotal uint64
+}
+
 type BroadcastStatusSnapshot struct {
 	Direction string
 	Overlay   string
@@ -64,6 +76,18 @@ type broadcastStatKey struct {
 	direction string
 	overlay   string
 	kind      string
+}
+
+type fecReceiverPeerKey struct {
+	overlay string
+	peer    string
+}
+
+type fecReceiverCounterSnapshot struct {
+	dropped            uint64
+	evicted            uint64
+	completed          uint64
+	deliveredCacheHits uint64
 }
 
 func (n *Node) StatusSnapshot() StatusSnapshot {
@@ -102,6 +126,7 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	sort.SliceStable(snapshot.Overlays, func(i, j int) bool {
 		return snapshot.Overlays[i].Name < snapshot.Overlays[j].Name
 	})
+	snapshot.FECReceivers = n.fecReceiverStatusSnapshot(subscriptions)
 	snapshot.Queues = n.queueStatusSnapshot()
 	snapshot.Rebroadcast = n.rebroadcastStatusSnapshot()
 	snapshot.Broadcasts = n.broadcastStatusSnapshot()
@@ -210,6 +235,105 @@ func (n *Node) rebroadcastStatusSnapshot() []RebroadcastStatusSnapshot {
 			Dropped: n.localRebroadcastDropped.Load(),
 		},
 	}
+}
+
+func (n *Node) fecReceiverStatusSnapshot(subscriptions []*overlaySubscription) []FECReceiverStatusSnapshot {
+	byOverlay := map[string]*FECReceiverStatusSnapshot{}
+	seen := map[fecReceiverPeerKey]struct{}{}
+
+	for _, sub := range subscriptions {
+		sub.mx.Lock()
+		overlayName := sub.spec.Name
+		peers := make([]*overlayPeer, 0, len(sub.peers))
+		for _, peer := range sub.peers {
+			peers = append(peers, peer)
+		}
+		sub.mx.Unlock()
+
+		snapshot := byOverlay[overlayName]
+		if snapshot == nil {
+			snapshot = &FECReceiverStatusSnapshot{Overlay: overlayName}
+			byOverlay[overlayName] = snapshot
+		}
+
+		for _, peer := range peers {
+			if peer.overlay == nil {
+				continue
+			}
+
+			stats := peer.overlay.FECBroadcastStats()
+			snapshot.ActiveStreams += stats.ActiveStreams
+			snapshot.ActiveBytes += stats.ActiveBytes
+			snapshot.DeliveredBroadcasts += stats.DeliveredBroadcasts
+
+			key := fecReceiverPeerKey{overlay: overlayName, peer: peer.id}
+			seen[key] = struct{}{}
+			n.addFECReceiverCounterDeltas(key, stats.DroppedTotal, stats.EvictedTotal, stats.CompletedTotal, stats.DeliveredCacheHitsTotal)
+		}
+	}
+
+	n.fecReceiverStatsMx.Lock()
+	for key := range n.fecReceiverLast {
+		if _, ok := seen[key]; !ok {
+			delete(n.fecReceiverLast, key)
+		}
+	}
+	for overlay, totals := range n.fecReceiverTotals {
+		snapshot := byOverlay[overlay]
+		if snapshot == nil {
+			snapshot = &FECReceiverStatusSnapshot{Overlay: overlay}
+			byOverlay[overlay] = snapshot
+		}
+		snapshot.DroppedTotal = totals.dropped
+		snapshot.EvictedTotal = totals.evicted
+		snapshot.CompletedTotal = totals.completed
+		snapshot.DeliveredCacheHitsTotal = totals.deliveredCacheHits
+	}
+	n.fecReceiverStatsMx.Unlock()
+
+	stats := make([]FECReceiverStatusSnapshot, 0, len(byOverlay))
+	for _, snapshot := range byOverlay {
+		stats = append(stats, *snapshot)
+	}
+	sort.SliceStable(stats, func(i, j int) bool {
+		return stats[i].Overlay < stats[j].Overlay
+	})
+	return stats
+}
+
+func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, dropped, evicted, completed, deliveredCacheHits uint64) {
+	n.fecReceiverStatsMx.Lock()
+	defer n.fecReceiverStatsMx.Unlock()
+
+	if n.fecReceiverLast == nil {
+		n.fecReceiverLast = map[fecReceiverPeerKey]fecReceiverCounterSnapshot{}
+	}
+	if n.fecReceiverTotals == nil {
+		n.fecReceiverTotals = map[string]fecReceiverCounterSnapshot{}
+	}
+
+	current := fecReceiverCounterSnapshot{
+		dropped:            dropped,
+		evicted:            evicted,
+		completed:          completed,
+		deliveredCacheHits: deliveredCacheHits,
+	}
+	last := n.fecReceiverLast[key]
+	totals := n.fecReceiverTotals[key.overlay]
+	totals.dropped += counterDelta(last.dropped, current.dropped)
+	totals.evicted += counterDelta(last.evicted, current.evicted)
+	totals.completed += counterDelta(last.completed, current.completed)
+	totals.deliveredCacheHits += counterDelta(last.deliveredCacheHits, current.deliveredCacheHits)
+
+	n.fecReceiverLast[key] = current
+	n.fecReceiverTotals[key.overlay] = totals
+}
+
+func counterDelta(previous, current uint64) uint64 {
+	if current >= previous {
+		return current - previous
+	}
+	return current
 }
 
 func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {

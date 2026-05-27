@@ -25,7 +25,7 @@ func TestCheckProofShapeMatchesCXXProofAndProofLinkRules(t *testing.T) {
 		{name: "master proof with signatures", id: master, signatures: signatures},
 		{name: "master proof without signatures", id: master, wantErr: true},
 		{name: "master proof link without signatures", id: master, isLink: true},
-		{name: "master proof link with signatures", id: master, isLink: true, signatures: signatures, wantErr: true},
+		{name: "master proof link with signatures", id: master, isLink: true, signatures: signatures},
 		{name: "shard proof link without signatures", id: shard, isLink: true},
 		{name: "shard proof link with signatures", id: shard, isLink: true, signatures: signatures, wantErr: true},
 		{name: "shard full proof", id: shard, wantErr: true},

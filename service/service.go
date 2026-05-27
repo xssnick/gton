@@ -19,37 +19,41 @@ import (
 )
 
 const (
-	topShard                           = int64(-1 << 63)
-	shardStateCatchUpParallelism       = 4
-	shardStateDownloadBuffer           = 32
-	shardStateDownloadWorkers          = 4
-	nextBlockDescriptionLookahead      = shardStateDownloadBuffer
-	shardStateCatchUpRetryDelay        = time.Second
-	currentStateLivePollDelay          = 300 * time.Millisecond
-	syncDiskSpaceRetryDelay            = 5 * time.Second
-	defaultMinSyncDiskFreeBytes        = 10 << 30
-	stateSerializationMinDiskFreeBytes = 30 << 30
-	nextBlockBootstrapBlocks           = 0
-	nextBlockBootstrapProbeTimeout     = 2 * time.Second
-	nextBlockBootstrapLiveProbeTimeout = 5 * time.Second
-	nextBlockBootstrapLiveStageDelay   = 250 * time.Millisecond
-	nextBlockBootstrapProbePeers       = 3
-	nextBlockBootstrapUrgentPeers      = 8
-	nextBlockBootstrapWidePeers        = 16
-	nextBlockBootstrapUrgentMisses     = 1
-	nextBlockBootstrapWideMisses       = 2
-	nextBlockBootstrapUrgentLagSeconds = 3
-	nextBlockBootstrapWideLagSeconds   = 10
-	nextBlockBootstrapWideGapBlocks    = 8
-	nextBlockBootstrapLiveLagSeconds   = 10
-	chainBlockDownloadRetries          = 3
-	chainBlockDownloadRetryDelay       = 500 * time.Millisecond
-	nextMasterchainQueueLimit          = 64
-	nextMasterchainQueueTTL            = 3 * time.Minute
-	nextMasterchainQueueMaxBytes       = 128 << 20
-	masterStateCacheLimit              = 2048
-	syncedBlockProcessorWorkers        = 8
-	statusTPSMasterWindow              = 10
+	topShard                               = int64(-1 << 63)
+	shardStateCatchUpParallelism           = 4
+	shardStateDownloadBuffer               = 32
+	shardStateDownloadWorkers              = 4
+	nextBlockDescriptionLookahead          = shardStateDownloadBuffer
+	shardStateCatchUpRetryDelay            = time.Second
+	currentStateLivePollDelay              = 300 * time.Millisecond
+	syncDiskSpaceRetryDelay                = 5 * time.Second
+	defaultMinSyncDiskFreeBytes            = 10 << 30
+	stateSerializationMinDiskFreeBytes     = 30 << 30
+	nextBlockBootstrapBlocks               = 0
+	nextBlockBootstrapProbeTimeout         = 2 * time.Second
+	nextBlockBootstrapLiveProbeTimeout     = 5 * time.Second
+	nextBlockBootstrapLiveStageDelay       = 250 * time.Millisecond
+	nextBlockBootstrapProbePeers           = 3
+	nextBlockBootstrapUrgentPeers          = 8
+	nextBlockBootstrapWidePeers            = 16
+	nextBlockBootstrapUrgentMisses         = 1
+	nextBlockBootstrapWideMisses           = 2
+	nextBlockBootstrapUrgentLagSeconds     = 3
+	nextBlockBootstrapWideLagSeconds       = 10
+	nextBlockBootstrapWideGapBlocks        = 8
+	nextBlockBootstrapLiveLagSeconds       = 10
+	nextBlockBootstrapBroadcastPreferDelay = 25 * time.Millisecond
+	exactBlockDownloadProbePeers           = 4
+	exactBlockDownloadWaitLogDelay         = time.Second
+	exactBlockDownloadWaitLogEvery         = 2 * time.Second
+	chainBlockDownloadRetries              = 3
+	chainBlockDownloadRetryDelay           = 500 * time.Millisecond
+	nextMasterchainQueueLimit              = 64
+	nextMasterchainQueueTTL                = 3 * time.Minute
+	nextMasterchainQueueMaxBytes           = 128 << 20
+	masterStateCacheLimit                  = 2048
+	syncedBlockProcessorWorkers            = 8
+	statusTPSMasterWindow                  = 10
 )
 
 const (
@@ -260,7 +264,7 @@ func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
 
 func syncBlockOriginForSource(source string) string {
 	switch source {
-	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "queue":
+	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "broadcast_hint", "queue":
 		return "broadcast"
 	case "peer_probe", "next_block", "indexed", "next_description", "peer_catch_up", "catch_up", "probe":
 		return "download"
@@ -277,7 +281,9 @@ func syncBlockSourceForDownloadedBlock(defaultSource string, downloaded p2p.Down
 	switch downloaded.Kind {
 	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
 		return "broadcast_cache"
-	case "local full block cache", "local next block cache":
+	case "tonNode.newShardBlockBroadcast":
+		return "broadcast_hint"
+	case "local full block cache", "local next block cache", "stored block":
 		return "stored"
 	default:
 		return defaultSource
@@ -469,7 +475,7 @@ func (s *Service) Start(ctx context.Context) error {
 			s.runShardDescriptionProcessor(ctx)
 		})
 		s.runAsync(func() {
-			s.runServiceMaintenance(ctx)
+			s.runDelayedServiceMaintenance(ctx)
 		})
 	})
 	return nil
@@ -541,6 +547,40 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 	}
 
 	return snapshot
+}
+
+func (s *Service) SyncLagSeconds() (int64, bool) {
+	if s == nil {
+		return 0, false
+	}
+
+	nowUnix := time.Now().Unix()
+	var maxLag int64
+	hasLag := false
+
+	s.currentStatusMu.RLock()
+	defer s.currentStatusMu.RUnlock()
+
+	current := s.currentStatus
+	if current == nil {
+		return 0, false
+	}
+	if current.Masterchain.Parsed != nil && current.Masterchain.Parsed.GenUTime != 0 {
+		maxLag = nowUnix - int64(current.Masterchain.Parsed.GenUTime)
+		hasLag = true
+	}
+	for _, shard := range current.Shards {
+		if shard.Block.Workchain != 0 || shard.Parsed == nil || shard.Parsed.GenUTime == 0 {
+			continue
+		}
+
+		lag := nowUnix - int64(shard.Parsed.GenUTime)
+		if !hasLag || lag > maxLag {
+			maxLag = lag
+			hasLag = true
+		}
+	}
+	return maxLag, hasLag
 }
 
 func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *StatusSnapshot, current *storage.CurrentState) {
@@ -897,8 +937,10 @@ func isExpectedRetryError(err error) bool {
 		errors.Is(err, errPendingCellGenerationCompaction) ||
 		errors.Is(err, errPersistentStateGCActive) ||
 		errors.Is(err, errArchiveTTLGCActive) ||
+		errors.Is(err, errArchiveBackfillActive) ||
 		errors.Is(err, errExclusiveServiceTaskHighReadAmp) ||
 		errors.Is(err, errExclusiveServiceTaskHighLag) ||
+		errors.Is(err, errStateSerializationDelayed) ||
 		errors.Is(err, errStateSerializationLowDiskSpace) ||
 		errors.Is(err, errStateSerializationCanceled) ||
 		errors.Is(err, context.DeadlineExceeded) {

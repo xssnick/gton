@@ -129,11 +129,23 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 	if got, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 11); err != nil || !got.Equals(&blockB) {
 		t.Fatalf("lookup by seqno failed: err=%v got=%v", err, got)
 	}
+	if got, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 500); err != nil || !got.Equals(&blockA) {
+		t.Fatalf("lookup by early lt failed: err=%v got=%v", err, got)
+	}
 	if got, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 2500); err != nil || !got.Equals(&blockB) {
 		t.Fatalf("lookup by lt failed: err=%v got=%v", err, got)
 	}
-	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 110); err != nil || !got.Equals(&blockA) {
+	if _, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 3000); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("lookup future lt error = %v, want ErrNotFound", err)
+	}
+	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 90); err != nil || !got.Equals(&blockA) {
+		t.Fatalf("lookup by early utime failed: err=%v got=%v", err, got)
+	}
+	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 110); err != nil || !got.Equals(&blockB) {
 		t.Fatalf("lookup by utime failed: err=%v got=%v", err, got)
+	}
+	if _, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 121); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("lookup future utime error = %v, want ErrNotFound", err)
 	}
 
 	leaf := cell.BeginCell().MustStoreUInt(0xAA, 8).EndCell()
@@ -224,6 +236,37 @@ func TestPebbleStorageLookupBlockByAccountLTDoesNotReturnFloorBlock(t *testing.T
 	_, err := store.LookupBlockByAccountLT(ctx, 0, account, 150)
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("lookup floor block error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPebbleStorageLookupBlockByAccountLTReturnsLowerBoundOnShardPath(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+	account := bytes.Repeat([]byte{0x40}, 32)
+	shards := storage.AccountShardCandidates(0, account)
+	if len(shards) < 3 {
+		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
+	}
+
+	topBlock := testPebbleBlockID(0, topShard, 50)
+	pathBlock := testPebbleBlockID(0, shards[2], 20)
+	siblingBlock := testPebbleBlockID(0, int64(0x2000000000000000), 10)
+	for _, meta := range []*storage.BlockMeta{
+		{ID: topBlock, StartLT: 1, EndLT: 500},
+		{ID: pathBlock, StartLT: 150, EndLT: 200},
+		{ID: siblingBlock, StartLT: 1, EndLT: 200},
+	} {
+		if err := store.SaveBlockMeta(meta); err != nil {
+			t.Fatalf("save block meta %s: %v", storage.FormatBlockRef(meta.ID), err)
+		}
+	}
+
+	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 125)
+	if err != nil {
+		t.Fatalf("lookup account lt lower-bound: %v", err)
+	}
+	if !got.Equals(&pathBlock) {
+		t.Fatalf("lookup account lower-bound block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(pathBlock))
 	}
 }
 

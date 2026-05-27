@@ -9,6 +9,7 @@ func TestNextServiceMaintenanceTaskPriority(t *testing.T) {
 		archiveGC        bool
 		migrationPending bool
 		serialization    bool
+		backfill         bool
 		want             serviceMaintenanceTask
 	}{
 		{
@@ -32,9 +33,20 @@ func TestNextServiceMaintenanceTaskPriority(t *testing.T) {
 			want:             serviceMaintenanceTaskCellGenerationMigration,
 		},
 		{
+			name:          "archive backfill before serialization",
+			serialization: true,
+			backfill:      true,
+			want:          serviceMaintenanceTaskArchiveBackfill,
+		},
+		{
 			name:          "serialization when no higher priority task is ready",
 			serialization: true,
 			want:          serviceMaintenanceTaskStateSerialization,
+		},
+		{
+			name:     "archive backfill when no higher priority task is ready",
+			backfill: true,
+			want:     serviceMaintenanceTaskArchiveBackfill,
 		},
 		{
 			name: "nothing ready",
@@ -44,7 +56,7 @@ func TestNextServiceMaintenanceTaskPriority(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := nextServiceMaintenanceTask(test.persistentGC, test.archiveGC, test.migrationPending, test.serialization)
+			got := nextServiceMaintenanceTask(test.persistentGC, test.archiveGC, test.migrationPending, test.serialization, test.backfill)
 			if got != test.want {
 				t.Fatalf("task = %d, want %d", got, test.want)
 			}

@@ -4,11 +4,11 @@
 
 The project focuses on:
 
-- fast block sync and live updates;
-- memory efficiency
-- a liteserver optimized for live queries with hot data cache;
+- Fast block sync and live updates;
+- Memory efficiency
+- Liteserver optimized for live data availability, with smart cache;
 - LSM Pebble-based storage with a sharded cell DB
-- runtime metrics for sync, storage, p2p, and liteserver observability.
+- Runtime metrics for sync, storage, p2p, and liteserver observability.
 
 The project is under active development. Storage format and configuration may change without backward compatibility.
 

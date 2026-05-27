@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/blockproof"
 	tnstate "github.com/xssnick/gton/service/state"
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl"
@@ -211,9 +212,9 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case DownloadKeyBlockProof:
 		return s.serveProofData(ctx, tnstore.ServedProofKeyBlock, query.Block)
 	case DownloadBlockProofLink:
-		return s.serveProofData(ctx, tnstore.ServedProofBlockLink, query.Block)
+		return s.serveBlockProofLink(ctx, query.Block)
 	case DownloadKeyBlockProofLink:
-		return s.serveProofData(ctx, tnstore.ServedProofKeyBlockLink, query.Block)
+		return s.serveKeyBlockProofLink(ctx, query.Block)
 	case PrepareZeroState:
 		return s.servePrepareZeroState(ctx, query.Block)
 	case DownloadZeroState:
@@ -323,11 +324,14 @@ func (s *overlaySubscription) servePrepareBlockProof(ctx context.Context, block 
 	if err != nil {
 		return nil, err
 	}
-	if isMasterchainBlock(block) && hasFull {
-		return PreparedProof{}, nil
+	if isMasterchainBlock(block) {
+		if hasFull {
+			return PreparedProof{}, nil
+		}
+		return PreparedProofEmpty{}, nil
 	}
 
-	if !allowPartial && !hasFull {
+	if !allowPartial {
 		return PreparedProofEmpty{}, nil
 	}
 
@@ -347,25 +351,57 @@ func (s *overlaySubscription) servePrepareKeyBlockProof(ctx context.Context, blo
 		return nil, errors.New("cannot download proof for zero state")
 	}
 
-	if allowPartial {
-		hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlockLink, block)
-		if err != nil {
-			return nil, err
-		}
-		if hasLink {
-			return PreparedProofLink{}, nil
-		}
-		return PreparedProofEmpty{}, nil
-	}
-
 	hasFull, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlock, block)
 	if err != nil {
 		return nil, err
 	}
-	if hasFull {
-		return PreparedProof{}, nil
+	if !hasFull {
+		return PreparedProofEmpty{}, nil
 	}
-	return PreparedProofEmpty{}, nil
+	if allowPartial {
+		return PreparedProofLink{}, nil
+	}
+	return PreparedProof{}, nil
+}
+
+func (s *overlaySubscription) serveKeyBlockProofLink(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
+	if block.SeqNo == 0 {
+		return nil, errors.New("cannot download proof for zero state")
+	}
+
+	proof, err := s.node.peerStorage.BlockProof(ctx, tnstore.ServedProofKeyBlock, block)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return nil, errors.New("unknown block proof")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	link, err := blockproof.LinkBOC(block, proof)
+	if err != nil {
+		return nil, err
+	}
+	return tl.Raw(link), nil
+}
+
+func (s *overlaySubscription) serveBlockProofLink(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
+	if isMasterchainBlock(block) {
+		proof, err := s.node.peerStorage.BlockProof(ctx, tnstore.ServedProofBlock, block)
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return nil, errors.New("unknown block proof")
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		link, err := blockproof.LinkBOC(block, proof)
+		if err != nil {
+			return nil, err
+		}
+		return tl.Raw(link), nil
+	}
+
+	return s.serveProofData(ctx, tnstore.ServedProofBlockLink, block)
 }
 
 func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (tl.Serializable, error) {
@@ -567,19 +603,12 @@ func (s *overlaySubscription) handleGetRandomPeers(_ context.Context, query over
 		go s.learnAdvertisedPeers(query.List.List)
 	}
 
-	reply := make([]overlay.Node, 0, maxRandomPeerReply)
-	if self, err := s.node.selfOverlayNode(s.spec); err == nil {
-		reply = append(reply, *self)
+	reply, err := s.randomPeerAdvertisement()
+	if err != nil {
+		s.log.Debug().Err(err).Msg("failed to create getRandomPeers response")
+		return overlay.NodesList{}
 	}
-
-	for _, node := range s.overlayNodesSnapshot() {
-		if len(reply) >= maxRandomPeerReply {
-			break
-		}
-		reply = append(reply, node)
-	}
-
-	return overlay.NodesList{List: reply}
+	return reply
 }
 
 func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
@@ -588,8 +617,8 @@ func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
 	}
 
 	for _, peer := range peers {
-		if s.aliveKnownPeerCount() >= maxPeersPerOverlay {
-			return
+		if !s.canLearnAdvertisedPeer(peer) {
+			continue
 		}
 
 		connectCtx, cancel := context.WithTimeout(s.node.runCtx, 10*time.Second)

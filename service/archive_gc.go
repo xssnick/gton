@@ -14,7 +14,7 @@ import (
 const (
 	archiveGCInterval          = 30 * time.Minute
 	archiveGCRetryDelay        = 5 * time.Minute
-	archiveGCStartGroupsPerRun = 256
+	archiveGCStartGroupsPerRun = 1024
 )
 
 type archivePruneStore interface {

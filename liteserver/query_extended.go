@@ -72,10 +72,34 @@ func (s *Server) handleSendMessage(ctx context.Context, query ton.SendMessage) a
 	if s.messageSender == nil {
 		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": not configured"}
 	}
-	if err := s.checkExternalMessage(ctx, query.Body); err != nil {
+	if len(query.Body) > maxExternalMessageBroadcastDataSize {
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + fmt.Sprintf(": external message is too large: %d", len(query.Body))}
+	}
+
+	cacheKey, ok := s.cacheSendMessage(query.Body)
+	if !ok {
+		return ton.LSError{Code: errCodeUnspecified, Text: "cannot send external message : duplicate message"}
+	}
+	msgCell, msg, err := parseExternalMessage(query.Body)
+	if err != nil {
+		s.dropCachedSendMessage(cacheKey)
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+	}
+	if err = s.checkExternalMessageAddressLimit(msg.DstAddr); err != nil {
+		s.dropCachedSendMessage(cacheKey)
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+	}
+	if err = s.checkExternalMessage(ctx, query.Body, msgCell, msg); err != nil {
+		s.dropCachedSendMessage(cacheKey)
+		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+	}
+	if err = s.addExternalMessageAddressLimit(msg.DstAddr); err != nil {
+		s.dropCachedSendMessage(cacheKey)
 		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
 	}
 	if err := s.messageSender.SendExternalMessage(ctx, query.Body); err != nil {
+		s.dropExternalMessageAddressLimit(msg.DstAddr)
+		s.dropCachedSendMessage(cacheKey)
 		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
 	}
 	return ton.SendMessageStatus{Status: 1}
@@ -143,7 +167,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return errorResponse(err, "cannot load shard info")
 	}
 
-	stateProof, err := shardHashesProof(stateRoot, query.Workchain)
+	stateProof, err := shardHashesProof(stateRoot, query.Workchain, query.Shard, query.Exact)
 	if err != nil {
 		return errorResponse(err, "cannot create shard info proof")
 	}
@@ -541,7 +565,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 	proofRoot := root
 	var proofBuilder *cell.MerkleProofBuilder
 	if query.Mode&32 != 0 {
-		proofBuilder = cell.NewMerkleProofBuilder(root)
+		proofBuilder = newLiteServerProofBuilder(root)
 		proofRoot = proofBuilder.Root()
 	}
 
@@ -600,7 +624,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 	proofRoot := root
 	var proofBuilder *cell.MerkleProofBuilder
 	if query.Mode&32 != 0 || query.Mode&256 != 0 {
-		proofBuilder = cell.NewMerkleProofBuilder(root)
+		proofBuilder = newLiteServerProofBuilder(root)
 		proofRoot = proofBuilder.Root()
 	}
 
@@ -1268,7 +1292,10 @@ func findShardLeaf(root *cell.Cell, shard uint64, exact bool) (int64, *cell.Cell
 			return 0, nil, storage.ErrNotFound
 		}
 
-		node = node.MustPeekRef(int(z >> 63))
+		node, err = loader.BaseCell().PeekRef(int(z >> 63))
+		if err != nil {
+			return 0, nil, err
+		}
 		z <<= 1
 		remaining--
 		m >>= 1
@@ -1583,8 +1610,8 @@ func outMsgQueueSize(stateRoot *cell.Cell) (uint64, error) {
 		return 0, err
 	}
 
-	var state tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&state, loader); err != nil {
+	state, err := visitShardStateHeader(loader)
+	if err != nil {
 		return 0, err
 	}
 	if state.OutMsgQueueInfo == nil {

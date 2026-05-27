@@ -46,6 +46,7 @@ type shardBroadcastBlockCacheEntry struct {
 	isLink    bool
 	meta      *tnstore.BlockMeta
 	parsed    *tlb.Block
+	sourceKey string
 	expiresAt time.Time
 	bytes     int64
 }
@@ -115,6 +116,7 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		isLink:    downloaded.IsLink,
 		meta:      meta.Clone(),
 		parsed:    parsed,
+		sourceKey: downloaded.SourceKey,
 		expiresAt: now.Add(c.ttl),
 		bytes:     size,
 	}
@@ -194,6 +196,7 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		ProofBOC:         append([]byte(nil), entry.proofBOC...),
 		Meta:             entry.meta.Clone(),
 		Parsed:           entry.parsed,
+		SourceKey:        entry.sourceKey,
 		IsLink:           entry.isLink,
 		VerifiedRootHash: true,
 		VerifiedFileHash: true,

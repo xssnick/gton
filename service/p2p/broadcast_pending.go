@@ -64,6 +64,7 @@ func (n *Node) retryPendingBlockBroadcastDecode(ctx context.Context, req pending
 	delay := time.NewTicker(pendingBroadcastDecodeDelay)
 	defer delay.Stop()
 
+	stateReady := n.compressedBlockStateReadyNotify()
 	for {
 		downloaded, err := n.decodeBroadcastBlock(ctx, req.msg)
 		if err == nil {
@@ -103,6 +104,8 @@ func (n *Node) retryPendingBlockBroadcastDecode(ctx context.Context, req pending
 				Str("kind", req.kind).
 				Msg("dropping pending block broadcast because previous state did not arrive")
 			return
+		case <-stateReady:
+			stateReady = n.compressedBlockStateReadyNotify()
 		case <-delay.C:
 		}
 	}

@@ -3,18 +3,22 @@ package p2p
 import (
 	"bytes"
 	"context"
-	"github.com/xssnick/gton/service/archive"
-	"github.com/xssnick/gton/service/archive/packfile"
-	tnstore "github.com/xssnick/gton/service/storage"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/archive/packfile"
+	"github.com/xssnick/gton/service/blockproof"
+	tnstore "github.com/xssnick/gton/service/storage"
+
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
@@ -55,17 +59,11 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	if err = storage.LinkNextBlock(block, next); err != nil {
 		t.Fatalf("link next block: %v", err)
 	}
-	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, block, []byte{0x01, 0x02, 0x03}, nil); err != nil {
-		t.Fatalf("save block proof: %v", err)
-	}
 	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, shardBlock, []byte{0x04, 0x05}, nil); err != nil {
 		t.Fatalf("save shard block proof link: %v", err)
 	}
 	if err = storage.SaveBlockProof(tnstore.ServedProofKeyBlock, keyBlock, []byte{0x06, 0x07}, nil); err != nil {
 		t.Fatalf("save key block proof: %v", err)
-	}
-	if err = storage.SaveBlockProof(tnstore.ServedProofKeyBlockLink, keyBlock, []byte{0x08, 0x09}, nil); err != nil {
-		t.Fatalf("save key block proof link: %v", err)
 	}
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: next})
@@ -164,12 +162,12 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected raw block data")
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadBlockProofLink{Block: block})
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadBlockProofLink{Block: shardBlock})
 	if err != nil {
 		t.Fatalf("downloadBlockProofLink: %v", err)
 	}
 	proofLink, ok := resp.(tl.Raw)
-	if !ok || !bytes.Equal(proofLink, []byte{0x01, 0x02, 0x03}) {
+	if !ok || !bytes.Equal(proofLink, []byte{0x04, 0x05}) {
 		t.Fatalf("unexpected block proof link response %T", resp)
 	}
 
@@ -428,14 +426,14 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	}
 
 	block := testStoredMasterBlockID(60)
-	keyBlock := testStoredMasterBlockID(61)
+	shardBlock := testStoredBlockID(63)
 	zeroBlock := testStoredMasterBlockID(0)
 	master := testStoredMasterBlockID(62)
 	blockData := []byte{0x10, 0x11, 0x12}
 	blockProof := []byte{0x20, 0x21}
-	keyProof := []byte{0x22, 0x23}
+	keyBlock, keyProof, keyProofLink := testPeerMasterBlockProof(t, 61)
+	masterLinkBlock, masterLinkProof, masterLinkProofLink := testPeerMasterBlockProof(t, 64)
 	blockProofLink := []byte{0x30, 0x31}
-	keyProofLink := []byte{0x32, 0x33}
 	zeroState := []byte{0x40, 0x41, 0x42}
 	stateData := []byte{0x50, 0x51, 0x52, 0x53}
 	archiveData := []byte{0x60, 0x61, 0x62}
@@ -449,11 +447,11 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	if err = storage.SaveBlockProof(tnstore.ServedProofKeyBlock, keyBlock, keyProof, nil); err != nil {
 		t.Fatalf("save key block proof: %v", err)
 	}
-	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, block, blockProofLink, nil); err != nil {
-		t.Fatalf("save block proof link: %v", err)
+	if err = storage.SaveBlockProof(tnstore.ServedProofBlock, masterLinkBlock, masterLinkProof, nil); err != nil {
+		t.Fatalf("save master block proof: %v", err)
 	}
-	if err = storage.SaveBlockProof(tnstore.ServedProofKeyBlockLink, keyBlock, keyProofLink, nil); err != nil {
-		t.Fatalf("save key block proof link: %v", err)
+	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, shardBlock, blockProofLink, nil); err != nil {
+		t.Fatalf("save block proof link: %v", err)
 	}
 	if err = storage.SaveZeroState(zeroBlock, zeroState, nil); err != nil {
 		t.Fatalf("save zero state: %v", err)
@@ -491,7 +489,8 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 		{name: "downloadBlock", req: tonnodeapi.DownloadBlock{Block: block}, want: blockData},
 		{name: "downloadBlockProof", req: DownloadBlockProof{Block: block}, want: blockProof},
 		{name: "downloadKeyBlockProof", req: DownloadKeyBlockProof{Block: keyBlock}, want: keyProof},
-		{name: "downloadBlockProofLink", req: DownloadBlockProofLink{Block: block}, want: blockProofLink},
+		{name: "downloadBlockProofLink", req: DownloadBlockProofLink{Block: shardBlock}, want: blockProofLink},
+		{name: "downloadMasterBlockProofLink", req: DownloadBlockProofLink{Block: masterLinkBlock}, want: masterLinkProofLink},
 		{name: "downloadKeyBlockProofLink", req: DownloadKeyBlockProofLink{Block: keyBlock}, want: keyProofLink},
 		{name: "downloadZeroState", req: DownloadZeroState{Block: zeroBlock}, want: zeroState},
 		{name: "downloadPersistentStateSliceV2", req: DownloadPersistentStateSliceV2{
@@ -842,4 +841,158 @@ func testStoredMasterBlockID(seqno uint32) ton.BlockIDExt {
 		RootHash:  bytes.Repeat([]byte{byte(seqno)}, 32),
 		FileHash:  bytes.Repeat([]byte{byte(seqno + 1)}, 32),
 	}
+}
+
+type testPeerBlockIDExtTLB struct {
+	ShardID  tlb.ShardIdent `tlb:"."`
+	SeqNo    uint32         `tlb:"## 32"`
+	RootHash []byte         `tlb:"bits 256"`
+	FileHash []byte         `tlb:"bits 256"`
+}
+
+type testPeerBlockProofEnvelope struct {
+	_          tlb.Magic             `tlb:"#c3"`
+	ProofFor   testPeerBlockIDExtTLB `tlb:"."`
+	Root       *cell.Cell            `tlb:"^"`
+	Signatures *cell.Cell            `tlb:"maybe ^"`
+}
+
+func testPeerMasterBlockProof(t *testing.T, seqno uint32) (ton.BlockIDExt, []byte, []byte) {
+	t.Helper()
+
+	root := testPeerBlockRoot(t, -1, topShard, seqno)
+	rootHash := root.HashKey(0)
+	id := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     seqno,
+		RootHash:  bytes.Clone(rootHash[:]),
+		FileHash:  bytes.Repeat([]byte{byte(seqno + 1)}, 32),
+	}
+	full := testPeerBlockProofEnvelopeBOC(t, id, root, testPeerBlockProofSignatures())
+	link, err := blockproof.LinkBOC(id, full)
+	if err != nil {
+		t.Fatalf("export proof link: %v", err)
+	}
+	return id, full, link
+}
+
+func testPeerBlockRoot(t *testing.T, workchain int32, shard int64, seqno uint32) *cell.Cell {
+	t.Helper()
+
+	stateRoot := cell.BeginCell().MustStoreUInt(uint64(seqno), 32).EndCell()
+	var header tlb.BlockHeader
+	header.Version = 1
+	header.Shard = tlb.ShardIdent{PrefixBits: 0, WorkchainID: workchain, ShardPrefix: uint64(shard)}
+	header.SeqNo = seqno
+	header.StartLt = 1
+	header.EndLt = 100
+	header.GenUtime = 1000
+	header.MinRefMcSeqno = seqno
+	header.PrevKeyBlockSeqno = seqno
+	header.KeyBlock = workchain == -1
+	header.PrevRef = tlb.BlkPrevInfo{Prev1: tlb.ExtBlkRef{
+		EndLt:    1,
+		SeqNo:    seqno - 1,
+		RootHash: bytes.Repeat([]byte{0x03}, 32),
+		FileHash: bytes.Repeat([]byte{0x04}, 32),
+	}}
+
+	root, err := tlb.ToCell(&tlb.Block{
+		GlobalID:    -239,
+		BlockInfo:   header,
+		ValueFlow:   cell.BeginCell().EndCell(),
+		StateUpdate: testPeerMerkleUpdateCell(t, cell.BeginCell().EndCell(), stateRoot),
+		Extra: &tlb.BlockExtra{
+			InMsgDesc:          cell.BeginCell().EndCell(),
+			OutMsgDesc:         cell.BeginCell().EndCell(),
+			ShardAccountBlocks: cell.BeginCell().EndCell(),
+			RandSeed:           bytes.Repeat([]byte{0x01}, 32),
+			CreatedBy:          bytes.Repeat([]byte{0x02}, 32),
+		},
+	})
+	if err != nil {
+		t.Fatalf("build block root: %v", err)
+	}
+	return root
+}
+
+func testPeerMerkleUpdateCell(t *testing.T, oldRoot *cell.Cell, newRoot *cell.Cell) *cell.Cell {
+	t.Helper()
+
+	update, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
+		MustStoreSlice(oldRoot.Hash(0), 256).
+		MustStoreSlice(newRoot.Hash(0), 256).
+		MustStoreUInt(uint64(oldRoot.Depth(0)), 16).
+		MustStoreUInt(uint64(newRoot.Depth(0)), 16).
+		MustStoreRef(oldRoot).
+		MustStoreRef(newRoot).
+		EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("build merkle update: %v", err)
+	}
+	return update
+}
+
+func testPeerBlockProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.Cell, signatures *cell.Cell) []byte {
+	t.Helper()
+
+	envelope, err := tlb.ToCell(&testPeerBlockProofEnvelope{
+		ProofFor: testPeerBlockIDExtTLB{
+			ShardID: tlb.ShardIdent{
+				PrefixBits:  0,
+				WorkchainID: id.Workchain,
+				ShardPrefix: uint64(id.Shard),
+			},
+			SeqNo:    id.SeqNo,
+			RootHash: bytes.Clone(id.RootHash),
+			FileHash: bytes.Clone(id.FileHash),
+		},
+		Root:       testPeerFullMerkleProof(t, root),
+		Signatures: signatures,
+	})
+	if err != nil {
+		t.Fatalf("serialize block proof envelope: %v", err)
+	}
+	return envelope.ToBOCWithFlags(false)
+}
+
+func testPeerFullMerkleProof(t *testing.T, root *cell.Cell) *cell.Cell {
+	t.Helper()
+
+	proofBuilder := cell.NewMerkleProofBuilder(root)
+	testPeerMarkFullProofSubtree(t, proofBuilder.Root())
+	proof, err := proofBuilder.CreateProof()
+	if err != nil {
+		t.Fatalf("create block proof: %v", err)
+	}
+	return proof
+}
+
+func testPeerMarkFullProofSubtree(t *testing.T, root *cell.Cell) {
+	t.Helper()
+
+	loader, err := root.BeginParse()
+	if err != nil {
+		t.Fatalf("begin proof subtree: %v", err)
+	}
+	for i := 0; i < loader.RefsNum(); i++ {
+		ref, err := loader.PeekRefCellAt(i)
+		if err != nil {
+			t.Fatalf("proof subtree ref %d: %v", i, err)
+		}
+		testPeerMarkFullProofSubtree(t, ref)
+	}
+}
+
+func testPeerBlockProofSignatures() *cell.Cell {
+	return cell.BeginCell().
+		MustStoreUInt(0x11, 8).
+		MustStoreUInt(0, 32).
+		MustStoreUInt(0, 32).
+		MustStoreUInt(0, 32).
+		MustStoreUInt(0, 64).
+		MustStoreDict(cell.NewDict(16)).
+		EndCell()
 }

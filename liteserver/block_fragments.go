@@ -31,11 +31,17 @@ type liveBlockFragments struct {
 	shardHeader         runMethodShardHeader
 
 	masterExtra       *tlb.McStateExtra
-	shardHashesProofs map[int32]*cell.Cell
+	shardHashesProofs map[shardHashesProofKey]*cell.Cell
 	baseConfig        *runMethodBaseConfig
 	globalLibs        *cell.Dictionary
 	librariesLoaded   bool
 	lazyLoad          liveBlockLoadGroup
+}
+
+type shardHashesProofKey struct {
+	workchain int32
+	shard     int64
+	exact     bool
 }
 
 func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*liveBlockFragments, error) {
@@ -138,35 +144,38 @@ func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {
 	return extra, nil
 }
 
-func (f *liveBlockFragments) shardHashesProof(workchain int32) (*cell.Cell, error) {
+func (f *liveBlockFragments) shardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
+	key := shardHashesProofKey{workchain: workchain, shard: shard, exact: exact}
+
 	f.mu.Lock()
-	if proof := f.shardHashesProofs[workchain]; proof != nil {
+	if proof := f.shardHashesProofs[key]; proof != nil {
 		f.mu.Unlock()
 		return proof, nil
 	}
 	f.mu.Unlock()
 
-	value, err := f.lazyLoad.do(context.Background(), "shard-hashes:"+strconv.FormatInt(int64(workchain), 10), func() (any, error) {
+	loadKey := "shard-hashes:" + strconv.FormatInt(int64(workchain), 10) + ":" + strconv.FormatInt(shard, 10) + ":" + strconv.FormatBool(exact)
+	value, err := f.lazyLoad.do(context.Background(), loadKey, func() (any, error) {
 		f.mu.Lock()
-		if proof := f.shardHashesProofs[workchain]; proof != nil {
+		if proof := f.shardHashesProofs[key]; proof != nil {
 			f.mu.Unlock()
 			return proof, nil
 		}
 		f.mu.Unlock()
 
-		proof, err := shardHashesProof(f.stateRoot, workchain)
+		proof, err := shardHashesProof(f.stateRoot, workchain, shard, exact)
 		if err != nil {
 			return nil, err
 		}
 
 		f.mu.Lock()
 		if f.shardHashesProofs == nil {
-			f.shardHashesProofs = map[int32]*cell.Cell{}
+			f.shardHashesProofs = map[shardHashesProofKey]*cell.Cell{}
 		}
-		if cached := f.shardHashesProofs[workchain]; cached != nil {
+		if cached := f.shardHashesProofs[key]; cached != nil {
 			proof = cached
 		} else {
-			f.shardHashesProofs[workchain] = proof
+			f.shardHashesProofs[key] = proof
 		}
 		f.mu.Unlock()
 		return proof, nil

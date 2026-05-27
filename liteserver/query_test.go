@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -69,7 +70,7 @@ func TestHandleMasterchainInfoExtModeZero(t *testing.T) {
 	}
 }
 
-func TestHandleMasterchainInfoExtMasksHighBitAndRejectsOtherModes(t *testing.T) {
+func TestHandleMasterchainInfoExtEchoesHighBitAndRejectsOtherModes(t *testing.T) {
 	block := testBlockID(t, 10, cell.BeginCell().MustStoreUInt(1, 8).EndCell())
 	stateRoot := bytes.Repeat([]byte{0x22}, 32)
 	store := &fakeStore{
@@ -84,8 +85,8 @@ func TestHandleMasterchainInfoExtMasksHighBitAndRejectsOtherModes(t *testing.T) 
 	if !ok {
 		t.Fatalf("high-bit response type = %T, want ton.MasterchainInfoExt", resp)
 	}
-	if info.Mode != 0 {
-		t.Fatalf("mode = %d, want masked mode 0", info.Mode)
+	if info.Mode != 0x80000000 {
+		t.Fatalf("mode = %d, want echoed high-bit mode", info.Mode)
 	}
 
 	errResp, ok := srv.handleQuery(context.Background(), ton.GetMasterchainInfoExt{Mode: 1}).(ton.LSError)
@@ -198,6 +199,21 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 	if !bytes.Equal(sender.body, body) {
 		t.Fatalf("forwarded body = %x, want %x", sender.body, body)
 	}
+	if sender.count != 1 {
+		t.Fatalf("send count = %d, want 1", sender.count)
+	}
+
+	dup := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
+	lsErr, ok := dup.(ton.LSError)
+	if !ok {
+		t.Fatalf("duplicate response type = %T, want ton.LSError: %+v", dup, dup)
+	}
+	if lsErr.Text != "cannot send external message : duplicate message" {
+		t.Fatalf("duplicate error text = %q", lsErr.Text)
+	}
+	if sender.count != 1 {
+		t.Fatalf("duplicate was forwarded, send count = %d", sender.count)
+	}
 }
 
 func TestHandleSendMessageRejectsUnacceptedExternalMessage(t *testing.T) {
@@ -280,6 +296,72 @@ func TestHandleSendMessageRejectsInvalidExternalMessageLikeCpp(t *testing.T) {
 	want := "cannot apply external message to current state : external message must begin with ext_in_msg_info$10"
 	if lsErr.Text != want {
 		t.Fatalf("error text = %q, want %q", lsErr.Text, want)
+	}
+}
+
+func TestHandleSendMessageRejectsAddressOverLimitBeforeTVM(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x31}, 32)
+	addr := address.NewAddress(0, 0xff, accountID)
+	srv := testServer(&fakeStore{})
+	srv.messageSender = &fakeMessageSender{}
+
+	key := externalMessageAddressKey(addr)
+	now := srv.now()
+	for i := 0; i < extmsg.DefaultAddressLimit; i++ {
+		if err := srv.externalMessageLimiter.Add(key, now); err != nil {
+			t.Fatalf("preload limiter %d: %v", i, err)
+		}
+	}
+
+	msg, err := tlb.ToCell(&tlb.ExternalMessage{
+		DstAddr:   addr,
+		ImportFee: tlb.ZeroCoins,
+		Body:      cell.BeginCell().EndCell(),
+	})
+	if err != nil {
+		t.Fatalf("build external message: %v", err)
+	}
+
+	resp := srv.handleQuery(context.Background(), ton.SendMessage{Body: msg.ToBOC()})
+	lsErr, ok := resp.(ton.LSError)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
+	}
+	if !strings.Contains(lsErr.Text, "too many external messages to address") {
+		t.Fatalf("error text = %q", lsErr.Text)
+	}
+	if sender := srv.messageSender.(*fakeMessageSender); sender.count != 0 {
+		t.Fatalf("rate-limited message was forwarded, send count = %d", sender.count)
+	}
+}
+
+func TestHandleSendMessageRejectsOversizeBeforeTVM(t *testing.T) {
+	srv := testServer(&fakeStore{})
+	sender := &fakeMessageSender{}
+	srv.messageSender = sender
+
+	body := make([]byte, maxExternalMessageBroadcastDataSize+1)
+	resp := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
+	lsErr, ok := resp.(ton.LSError)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
+	}
+
+	want := "cannot apply external message to current state : external message is too large: 16777217"
+	if lsErr.Text != want {
+		t.Fatalf("error text = %q, want %q", lsErr.Text, want)
+	}
+	if sender.count != 0 {
+		t.Fatalf("oversize message was forwarded, send count = %d", sender.count)
+	}
+
+	again := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
+	againErr, ok := again.(ton.LSError)
+	if !ok {
+		t.Fatalf("second response type = %T, want ton.LSError: %+v", again, again)
+	}
+	if againErr.Text != want {
+		t.Fatalf("second error text = %q, want %q", againErr.Text, want)
 	}
 }
 
@@ -697,7 +779,7 @@ func TestLiveStoreHistoryIndexesMatchLookupRules(t *testing.T) {
 	})
 	live.putBlockLocked(storage.BlockKey(second), &liveBlock{
 		id:               second,
-		meta:             &storage.BlockMeta{ID: second, StartLT: 50, EndLT: 100, GenUTime: 1000},
+		meta:             &storage.BlockMeta{ID: second, StartLT: 150, EndLT: 200, GenUTime: 1001},
 		blockDataFlushed: true,
 	})
 	live.mu.Unlock()
@@ -710,20 +792,75 @@ func TestLiveStoreHistoryIndexesMatchLookupRules(t *testing.T) {
 		t.Fatalf("lt lookup block = %+v, want %+v", got, first)
 	}
 
-	got, err = live.LookupBlockByLT(context.Background(), key, 101)
+	got, err = live.LookupBlockByLT(context.Background(), key, 125)
 	if err != nil {
-		t.Fatalf("lookup live lt floor: %v", err)
+		t.Fatalf("lookup live lt ceil: %v", err)
 	}
 	if !blockIDEqual(got, second) {
-		t.Fatalf("lt floor lookup block = %+v, want %+v", got, second)
+		t.Fatalf("lt ceil lookup block = %+v, want %+v", got, second)
+	}
+
+	if _, err = live.LookupBlockByLT(context.Background(), key, 201); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("future lt lookup error = %v, want ErrNotFound", err)
 	}
 
 	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1000)
 	if err != nil {
 		t.Fatalf("lookup live unix time: %v", err)
 	}
+	if !blockIDEqual(got, first) {
+		t.Fatalf("unix time lookup block = %+v, want %+v", got, first)
+	}
+
+	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1001)
+	if err != nil {
+		t.Fatalf("lookup live unix time ceil: %v", err)
+	}
 	if !blockIDEqual(got, second) {
-		t.Fatalf("unix time lookup block = %+v, want %+v", got, second)
+		t.Fatalf("unix time ceil lookup block = %+v, want %+v", got, second)
+	}
+
+	if _, err = live.LookupBlockByUnixTime(context.Background(), key, 1002); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("future unix time lookup error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLiveStoreLookupBlockByAccountLTUsesLowerBoundShardPath(t *testing.T) {
+	live := NewLiveStore(&fakeStore{})
+	account := bytes.Repeat([]byte{0x40}, 32)
+	shards := storage.AccountShardCandidates(0, account)
+	if len(shards) < 3 {
+		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
+	}
+
+	topKey := storage.BlockHistoryKey{Workchain: 0, Shard: shards[0]}
+	pathKey := storage.BlockHistoryKey{Workchain: 0, Shard: shards[2]}
+	topBlock := testLiveStoreIndexBlock(50, topKey)
+	pathBlock := testLiveStoreIndexBlock(20, pathKey)
+
+	live.mu.Lock()
+	live.putBlockLocked(storage.BlockKey(topBlock), &liveBlock{
+		id:               topBlock,
+		meta:             &storage.BlockMeta{ID: topBlock, StartLT: 1, EndLT: 500},
+		blockDataFlushed: true,
+	})
+	live.putBlockLocked(storage.BlockKey(pathBlock), &liveBlock{
+		id:               pathBlock,
+		meta:             &storage.BlockMeta{ID: pathBlock, StartLT: 150, EndLT: 200},
+		blockDataFlushed: true,
+	})
+	live.mu.Unlock()
+
+	got, err := live.LookupBlockByAccountLT(context.Background(), 0, account, 125)
+	if err != nil {
+		t.Fatalf("lookup account lt lower-bound: %v", err)
+	}
+	if !blockIDEqual(got, pathBlock) {
+		t.Fatalf("account lt lower-bound block = %+v, want %+v", got, pathBlock)
+	}
+
+	if _, err = live.LookupBlockByAccountLT(context.Background(), 0, account, 501); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("future account lt lookup error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -751,14 +888,18 @@ func TestLiveStoreTrimRemovesHistoryIndexEntries(t *testing.T) {
 	}
 	live.mu.Unlock()
 
-	if _, err := live.LookupBlockByLT(context.Background(), key, 150); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("trimmed lt lookup error = %v, want ErrNotFound", err)
+	got, err := live.LookupBlockByLT(context.Background(), key, 150)
+	if err != nil {
+		t.Fatalf("lookup lt before first retained live block: %v", err)
 	}
-	if store.ltLookupCalls != 1 {
-		t.Fatalf("storage lt lookup calls = %d, want 1", store.ltLookupCalls)
+	if !blockIDEqual(got, blocks[1]) {
+		t.Fatalf("lt lookup before first retained block = %+v, want %+v", got, blocks[1])
+	}
+	if store.ltLookupCalls != 0 {
+		t.Fatalf("storage lt lookup calls = %d, want 0", store.ltLookupCalls)
 	}
 
-	got, err := live.LookupBlockByLT(context.Background(), key, 350)
+	got, err = live.LookupBlockByLT(context.Background(), key, 350)
 	if err != nil {
 		t.Fatalf("lookup retained live lt: %v", err)
 	}
@@ -766,11 +907,15 @@ func TestLiveStoreTrimRemovesHistoryIndexEntries(t *testing.T) {
 		t.Fatalf("lt lookup block = %+v, want %+v", got, blocks[2])
 	}
 
-	if _, err = live.LookupBlockByUnixTime(context.Background(), key, 1001); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("trimmed unix time lookup error = %v, want ErrNotFound", err)
+	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1001)
+	if err != nil {
+		t.Fatalf("lookup unix time before first retained live block: %v", err)
 	}
-	if store.utimeLookupCalls != 1 {
-		t.Fatalf("storage unix time lookup calls = %d, want 1", store.utimeLookupCalls)
+	if !blockIDEqual(got, blocks[1]) {
+		t.Fatalf("unix time lookup before first retained block = %+v, want %+v", got, blocks[1])
+	}
+	if store.utimeLookupCalls != 0 {
+		t.Fatalf("storage unix time lookup calls = %d, want 0", store.utimeLookupCalls)
 	}
 
 	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1003)
@@ -1200,6 +1345,28 @@ func TestLookupBlockBySeqnoReturnsBlockHeader(t *testing.T) {
 	assertRefType(t, body, 3, cell.PrunedCellType)
 }
 
+func TestGetBlockHeaderMode16IncludesBlockExtraLikeCpp(t *testing.T) {
+	id, root := testMasterBlockWithShardHashes(t, 12, cell.NewDict(32))
+	store := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(id): testBlockBOC(root),
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetBlockHeader{
+		ID:   cloneBlockID(id),
+		Mode: 16,
+	})
+	header, ok := resp.(ton.BlockHeader)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.BlockHeader: %+v", resp, resp)
+	}
+
+	body := mustUnwrapProof(t, header.HeaderProof, id.RootHash)
+	assertRefType(t, body, 3, cell.OrdinaryCellType)
+}
+
 func TestAccountPrunedProofSkipsStateInitRefsLikeCpp(t *testing.T) {
 	code := cell.BeginCell().
 		MustStoreUInt(0xCA, 8).
@@ -1414,6 +1581,84 @@ func TestGetBlockProofForwardIncludesSignaturesFromFullProof(t *testing.T) {
 	assertRefType(t, configBody, 3, cell.OrdinaryCellType)
 }
 
+func TestGetBlockProofForwardDestProofUsesVirtualizedStoredProofRoot(t *testing.T) {
+	catchainConfig := cell.BeginCell().MustStoreUInt(0x28, 8).EndCell()
+	validatorConfig := cell.BeginCell().MustStoreUInt(0x34, 8).EndCell()
+	keyCustom := testMcBlockExtraWithConfig(t, map[int32]*cell.Cell{
+		int32(tlb.ConfigParamCatchainConfig):    catchainConfig,
+		int32(tlb.ConfigParamCurrentValidators): validatorConfig,
+	})
+	keyStateRoot := testMasterStateWithOldBlocks(t, ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 5}, nil)
+	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 5, 5, true, keyStateRoot, keyCustom)
+	baseID := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 6}
+	stateRoot := testMasterStateWithOldBlocks(t, baseID, []testOldMasterBlock{{id: keyID, isKey: true, endLT: 600}})
+	targetID, targetRoot := testMasterBlockForStateWithPrevKey(t, 6, 5, false, stateRoot, nil)
+	targetProof := testBlockStateRootProofEnvelopeBOC(t, targetID, targetRoot, testBlockProofSignatures(t))
+
+	store := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(keyID):    testBlockBOC(keyRoot),
+			storage.BlockKey(targetID): testBlockBOC(targetRoot),
+		},
+		proofs: map[string][]byte{
+			fakeProofKey(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
+			fakeProofKey(storage.ServedProofBlock, targetID): targetProof,
+		},
+		blockStates: map[string]*storage.BlockState{
+			storage.BlockKey(targetID): {Block: targetID, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+		metas: map[string]*storage.BlockMeta{
+			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock},
+			storage.BlockKey(targetID): {ID: targetID, StateRootHash: stateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetBlockProof{
+		Mode:        0x1001,
+		KnownBlock:  cloneBlockID(keyID),
+		TargetBlock: cloneBlockID(targetID),
+	})
+	proof, ok := resp.(ton.PartialBlockProof)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.PartialBlockProof: %+v", resp, resp)
+	}
+	if len(proof.Steps) != 1 {
+		t.Fatalf("steps = %d, want 1", len(proof.Steps))
+	}
+	step, ok := proof.Steps[0].(ton.BlockLinkForward)
+	if !ok {
+		t.Fatalf("step type = %T, want ton.BlockLinkForward", proof.Steps[0])
+	}
+
+	assertBOCRootLevelZero(t, step.DestProof)
+	_ = mustUnwrapProof(t, step.DestProof, targetID.RootHash)
+}
+
+func TestBlockHeaderProofBOCVirtualizesNonZeroLevelSourceRoot(t *testing.T) {
+	stateRoot := cell.BeginCell().MustStoreUInt(0xbb, 8).EndCell()
+	id, root := testBlockForState(t, masterchainID, masterchainShard, 7, stateRoot)
+	storedProof, err := blockStateRootProof(root)
+	if err != nil {
+		t.Fatalf("create block state root proof: %v", err)
+	}
+	sourceRoot, err := cell.UnwrapProof(storedProof, id.RootHash)
+	if err != nil {
+		t.Fatalf("unwrap stored proof: %v", err)
+	}
+	if sourceRoot.Level() == 0 {
+		t.Fatal("test source root should have non-zero level")
+	}
+
+	headerProof, err := blockHeaderProofBOC(sourceRoot, id, 0)
+	if err != nil {
+		t.Fatalf("create header proof: %v", err)
+	}
+
+	assertBOCRootLevelZero(t, headerProof)
+	_ = mustUnwrapProof(t, headerProof, id.RootHash)
+}
+
 func TestGetBlockProofBackToKeyThenForwardIncludesSignatures(t *testing.T) {
 	keyCustom := testMcBlockExtraWithConfig(t, map[int32]*cell.Cell{
 		int32(tlb.ConfigParamCatchainConfig):    cell.BeginCell().EndCell(),
@@ -1440,17 +1685,17 @@ func TestGetBlockProofBackToKeyThenForwardIncludesSignatures(t *testing.T) {
 			storage.BlockKey(targetID): testBlockBOC(targetRoot),
 		},
 		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, nil),
-			fakeProofKey(storage.ServedProofBlockLink, knownID):  testBlockProofEnvelopeBOC(t, knownID, knownRoot, nil),
-			fakeProofKey(storage.ServedProofBlock, targetID):     testBlockProofEnvelopeBOC(t, targetID, targetRoot, testBlockProofSignatures(t)),
+			fakeProofKey(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
+			fakeProofKey(storage.ServedProofBlock, knownID):  testBlockProofEnvelopeBOC(t, knownID, knownRoot, testBlockProofSignatures(t)),
+			fakeProofKey(storage.ServedProofBlock, targetID): testBlockProofEnvelopeBOC(t, targetID, targetRoot, testBlockProofSignatures(t)),
 		},
 		blockStates: map[string]*storage.BlockState{
 			storage.BlockKey(knownID):  {Block: knownID, StateRootHash: knownStateRoot.Hash(0), Cell: knownStateRoot},
 			storage.BlockKey(targetID): {Block: targetID, StateRootHash: targetStateRoot.Hash(0), Cell: targetStateRoot},
 		},
 		metas: map[string]*storage.BlockMeta{
-			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlockLink},
-			storage.BlockKey(knownID):  {ID: knownID, StateRootHash: knownStateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlockLink},
+			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock},
+			storage.BlockKey(knownID):  {ID: knownID, StateRootHash: knownStateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
 			storage.BlockKey(targetID): {ID: targetID, StateRootHash: targetStateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
 		},
 	}
@@ -1483,23 +1728,22 @@ func TestGetBlockProofBackToKeyThenForwardIncludesSignatures(t *testing.T) {
 	}
 }
 
-func TestStoredMasterProofPrefersKeyBlockArtifacts(t *testing.T) {
-	keyID := ton.BlockIDExt{
-		Workchain: masterchainID,
-		Shard:     masterchainShard,
-		SeqNo:     10,
-		RootHash:  bytes.Repeat([]byte{0x10}, 32),
-		FileHash:  bytes.Repeat([]byte{0x11}, 32),
-	}
+func TestStoredMasterProofExportsKeyBlockLinkFromFullProof(t *testing.T) {
+	stateRoot := testMasterStateWithOldBlocks(t, ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 10}, nil)
+	custom := testMcBlockExtraWithConfig(t, map[int32]*cell.Cell{
+		int32(tlb.ConfigParamCatchainConfig):    cell.BeginCell().EndCell(),
+		int32(tlb.ConfigParamCurrentValidators): cell.BeginCell().EndCell(),
+	})
+	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 10, 10, true, stateRoot, custom)
+	fullProof := testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t))
 	store := &fakeStore{
 		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofBlockLink, keyID):    {0x01},
-			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): {0x02},
+			fakeProofKey(storage.ServedProofKeyBlock, keyID): fullProof,
 		},
 		metas: map[string]*storage.BlockMeta{
 			storage.BlockKey(keyID): {
 				ID:    keyID,
-				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofBlockLink | storage.BlockMetaHasProofKeyBlockLink,
+				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock,
 			},
 		},
 	}
@@ -1508,11 +1752,97 @@ func TestStoredMasterProofPrefersKeyBlockArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stored master proof: %v", err)
 	}
-	if !bytes.Equal(data, []byte{0x02}) {
-		t.Fatalf("proof data = %x, want key-block proof", data)
+	proofRoot, err := cell.FromBOC(data)
+	if err != nil {
+		t.Fatalf("parse proof link: %v", err)
+	}
+	loader, err := proofRoot.BeginParse()
+	if err != nil {
+		t.Fatalf("begin proof link: %v", err)
+	}
+	var parsed testBlockProofEnvelope
+	if err = tlb.LoadFromCell(&parsed, loader); err != nil {
+		t.Fatalf("load proof link: %v", err)
+	}
+	gotRoot, err := cell.UnwrapProofVirtualized(parsed.Root, keyID.RootHash)
+	if err != nil {
+		t.Fatalf("unwrap proof link: %v", err)
+	}
+	if parsed.Signatures != nil {
+		t.Fatal("proof link kept validator signatures")
+	}
+	if !bytes.Equal(gotRoot.Hash(0), keyID.RootHash) {
+		t.Fatalf("root hash = %x, want %x", gotRoot.Hash(0), keyID.RootHash)
+	}
+	if len(store.proofCalls) != 1 || store.proofCalls[0] != storage.ServedProofKeyBlock {
+		t.Fatalf("proof calls = %+v, want key-block full proof read", store.proofCalls)
+	}
+}
+
+func TestStoredMasterProofUsesStoredLinkWhenFullProofIsAbsent(t *testing.T) {
+	stateRoot := testMasterStateWithOldBlocks(t, ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 10}, nil)
+	custom := testMcBlockExtraWithConfig(t, map[int32]*cell.Cell{
+		int32(tlb.ConfigParamCatchainConfig):    cell.BeginCell().EndCell(),
+		int32(tlb.ConfigParamCurrentValidators): cell.BeginCell().EndCell(),
+	})
+	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 10, 10, true, stateRoot, custom)
+	linkProof := testBlockProofEnvelopeBOC(t, keyID, keyRoot, nil)
+	store := &fakeStore{
+		proofs: map[string][]byte{
+			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): linkProof,
+		},
+		metas: map[string]*storage.BlockMeta{
+			storage.BlockKey(keyID): {
+				ID:    keyID,
+				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlockLink,
+			},
+		},
+	}
+
+	gotRoot, parsed, err := testServer(store).storedMasterProofRoot(context.Background(), keyID, true)
+	if err != nil {
+		t.Fatalf("stored master proof root: %v", err)
+	}
+	if parsed.Proof.Signatures != nil {
+		t.Fatal("stored proof link has validator signatures")
+	}
+	if !bytes.Equal(gotRoot.Hash(0), keyID.RootHash) {
+		t.Fatalf("root hash = %x, want %x", gotRoot.Hash(0), keyID.RootHash)
 	}
 	if len(store.proofCalls) != 1 || store.proofCalls[0] != storage.ServedProofKeyBlockLink {
-		t.Fatalf("proof calls = %+v, want key-block link first only", store.proofCalls)
+		t.Fatalf("proof calls = %+v, want key-block link proof read", store.proofCalls)
+	}
+}
+
+func TestStoredMasterProofAcceptsStoredMasterLinkWithSignatures(t *testing.T) {
+	stateRoot := testMasterStateWithOldBlocks(t, ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 10}, nil)
+	custom := testMcBlockExtraWithConfig(t, map[int32]*cell.Cell{
+		int32(tlb.ConfigParamCatchainConfig):    cell.BeginCell().EndCell(),
+		int32(tlb.ConfigParamCurrentValidators): cell.BeginCell().EndCell(),
+	})
+	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 10, 10, true, stateRoot, custom)
+	linkProof := testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t))
+	store := &fakeStore{
+		proofs: map[string][]byte{
+			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): linkProof,
+		},
+		metas: map[string]*storage.BlockMeta{
+			storage.BlockKey(keyID): {
+				ID:    keyID,
+				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlockLink,
+			},
+		},
+	}
+
+	gotRoot, parsed, err := testServer(store).storedMasterProofRoot(context.Background(), keyID, true)
+	if err != nil {
+		t.Fatalf("stored master proof root: %v", err)
+	}
+	if parsed.Proof.Signatures == nil {
+		t.Fatal("stored master proof link signatures were not parsed")
+	}
+	if !bytes.Equal(gotRoot.Hash(0), keyID.RootHash) {
+		t.Fatalf("root hash = %x, want %x", gotRoot.Hash(0), keyID.RootHash)
 	}
 }
 
@@ -1526,12 +1856,12 @@ func TestStoredMasterProofDoesNotFallbackFromKeyBlockToOrdinaryProof(t *testing.
 	}
 	store := &fakeStore{
 		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofBlockLink, keyID): {0x01},
+			fakeProofKey(storage.ServedProofBlock, keyID): {0x01},
 		},
 		metas: map[string]*storage.BlockMeta{
 			storage.BlockKey(keyID): {
 				ID:    keyID,
-				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofBlockLink,
+				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofBlock,
 			},
 		},
 	}
@@ -1743,7 +2073,7 @@ func TestAccountStateReturnsAccountCellAndProofRoots(t *testing.T) {
 		t.Fatalf("unwrap block proof: %v", err)
 	}
 	assertRefType(t, blockProofBody, 0, cell.OrdinaryCellType)
-	assertRefType(t, blockProofBody, 1, cell.PrunedCellType)
+	assertRefType(t, blockProofBody, 2, cell.MerkleUpdateCellType)
 	assertRefType(t, blockProofBody, 3, cell.PrunedCellType)
 
 	if accountState.State.HashKey() != wantAccount.HashKey() {
@@ -2547,6 +2877,66 @@ func TestHandleConfigParamsStateInfoFlagsNeedConfigInfoPath(t *testing.T) {
 	}
 }
 
+func TestHandleConfigParamsStateInfoFlagsIncludeRequestedStateRoots(t *testing.T) {
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 9}
+	lib := cell.BeginCell().MustStoreUInt(0x6c, 8).EndCell()
+	accountID := bytes.Repeat([]byte{0x31}, 32)
+	stateRoot, _ := testMasterStateWithActiveAccountAndLibraries(t, base, accountID, cell.BeginCell().EndCell(), cell.BeginCell().EndCell(), []*cell.Cell{lib})
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	store := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		blockStates: map[string]*storage.BlockState{
+			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetConfigParams{
+		Mode:    int32(configModeNeedLibraries | configModeNeedAccountsRoot),
+		BlockID: cloneBlockID(id),
+	})
+	cfg, ok := resp.(ton.ConfigAll)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.ConfigAll: %+v", resp, resp)
+	}
+
+	body := mustUnwrapProof(t, cfg.ConfigProof, stateRoot.Hash(0))
+	assertRefType(t, body, 1, cell.OrdinaryCellType)
+	assertRefType(t, body, 2, cell.OrdinaryCellType)
+
+	shardBlock := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     masterchainShard,
+		SeqNo:     5,
+		RootHash:  bytes.Repeat([]byte{0x51}, 32),
+		FileHash:  bytes.Repeat([]byte{0x52}, 32),
+	}
+	shardStateRoot := testMasterStateWithShardHashes(t, base, testShardHashes(t, shardBlock))
+	shardID, shardBlockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, shardStateRoot)
+	store.blocks[storage.BlockKey(shardID)] = testBlockBOC(shardBlockRoot)
+	store.blockStates[storage.BlockKey(shardID)] = &storage.BlockState{Block: shardID, StateRootHash: shardStateRoot.Hash(0), Cell: shardStateRoot}
+
+	resp = srv.handleQuery(context.Background(), ton.GetConfigParams{
+		Mode:    int32(configModeNeedShardHashes),
+		BlockID: cloneBlockID(shardID),
+	})
+	cfg, ok = resp.(ton.ConfigAll)
+	if !ok {
+		t.Fatalf("shard hashes response type = %T, want ton.ConfigAll: %+v", resp, resp)
+	}
+
+	body = mustUnwrapProof(t, cfg.ConfigProof, shardStateRoot.Hash(0))
+	extra, err := loadMcStateExtraPrefix(body)
+	if err != nil {
+		t.Fatalf("load master state extra from proof: %v", err)
+	}
+	if extra.ShardHashes == nil || extra.ShardHashes.AsCell().GetType() != cell.OrdinaryCellType {
+		t.Fatal("shard hashes root is not included in config proof")
+	}
+}
+
 func TestHandleConfigParamsNeedPrevBlocksAddsCapabilitiesAndProof(t *testing.T) {
 	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 207}
 	version, err := tlb.ToCell(&tlb.GlobalVersion{Version: 13})
@@ -2698,6 +3088,54 @@ func TestHandleGetShardInfoReturnsDescriptorFromMasterState(t *testing.T) {
 	}
 	if len(info.ShardProof) != 2 || info.ShardDescription == nil {
 		t.Fatalf("expected shard proof and descriptor, got proof=%d descr=%v", len(info.ShardProof), info.ShardDescription)
+	}
+}
+
+func TestShardHashesProofFollowsRequestedShardPath(t *testing.T) {
+	rootShard := tlb.ShardID(1 << 63)
+	leftShard := int64(rootShard.GetChild(true))
+	rightShard := int64(rootShard.GetChild(false))
+	left := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     leftShard,
+		SeqNo:     78,
+		RootHash:  bytes.Repeat([]byte{0x78}, 32),
+		FileHash:  bytes.Repeat([]byte{0x87}, 32),
+	}
+	right := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     rightShard,
+		SeqNo:     79,
+		RootHash:  bytes.Repeat([]byte{0x79}, 32),
+		FileHash:  bytes.Repeat([]byte{0x97}, 32),
+	}
+
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 14}
+	stateRoot := testMasterStateWithShardHashes(t, base, testForkedShardHashes(t, left, right))
+
+	proof, err := shardHashesProof(stateRoot, left.Workchain, 1, false)
+	if err != nil {
+		t.Fatalf("create shard hashes proof: %v", err)
+	}
+	body, err := cell.UnwrapProofVirtualized(proof, stateRoot.Hash(0))
+	if err != nil {
+		t.Fatalf("unwrap shard hashes proof: %v", err)
+	}
+	extra, err := mcStateExtra(body)
+	if err != nil {
+		t.Fatalf("load master state extra from proof: %v", err)
+	}
+
+	got, _, err := shardInfoFromHashes(extra.ShardHashes, left.Workchain, left.Shard, true)
+	if err != nil {
+		t.Fatalf("load selected shard from proof: %v", err)
+	}
+	if !blockIDEqual(got, left) {
+		t.Fatalf("selected shard = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
+	}
+
+	if _, _, err = shardInfoFromHashes(extra.ShardHashes, right.Workchain, right.Shard, true); err == nil {
+		t.Fatal("expected sibling shard branch to stay pruned")
 	}
 }
 
@@ -3351,8 +3789,78 @@ func TestHandleBlockOutMsgQueueSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unwrap queue block proof: %v", err)
 	}
-	assertRefType(t, blockProofBody, 1, cell.PrunedCellType)
+	assertRefType(t, blockProofBody, 2, cell.MerkleUpdateCellType)
 	assertRefType(t, blockProofBody, 3, cell.PrunedCellType)
+}
+
+func TestHandleDispatchQueueInfoEmptyQueue(t *testing.T) {
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 13}
+	stateRoot := testShardStateWithOutMsgQueueSize(t, base, 0)
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 13, stateRoot)
+	store := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		blockStates: map[string]*storage.BlockState{
+			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetDispatchQueueInfo{
+		Mode:        1,
+		ID:          cloneBlockID(id),
+		MaxAccounts: 1,
+	})
+	info, ok := resp.(ton.DispatchQueueInfo)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.DispatchQueueInfo: %+v", resp, resp)
+	}
+	if !info.Complete || len(info.AccountDispatchQueues) != 0 {
+		t.Fatalf("unexpected dispatch queue info: %+v", info)
+	}
+	roots, err := cell.FromBOCMultiRoot(info.Proof)
+	if err != nil {
+		t.Fatalf("load dispatch queue proof: %v", err)
+	}
+	if len(roots) != 2 {
+		t.Fatalf("dispatch queue proof roots = %d, want 2", len(roots))
+	}
+}
+
+func TestHandleDispatchQueueMessagesEmptyQueueWithBOC(t *testing.T) {
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 14}
+	stateRoot := testShardStateWithOutMsgQueueSize(t, base, 0)
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 14, stateRoot)
+	store := &fakeStore{
+		blocks: map[string][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		blockStates: map[string]*storage.BlockState{
+			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetDispatchQueueMessages{
+		Mode:        1 | 4,
+		ID:          cloneBlockID(id),
+		Addr:        bytes.Repeat([]byte{0x01}, 32),
+		MaxMessages: 1,
+	})
+	messages, ok := resp.(ton.DispatchQueueMessages)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.DispatchQueueMessages: %+v", resp, resp)
+	}
+	if !messages.Complete || len(messages.Messages) != 0 {
+		t.Fatalf("unexpected dispatch queue messages: %+v", messages)
+	}
+	if len(messages.MessagesBOC) != 0 {
+		_, err := cell.FromBOCMultiRoot(messages.MessagesBOC)
+		if err != nil {
+			t.Fatalf("load dispatch queue messages boc: %v", err)
+		}
+	}
 }
 
 func TestHandleOutMsgQueueSizesUsesCurrentMasterAndShardStates(t *testing.T) {
@@ -3432,11 +3940,13 @@ func TestValidatorStatsCountParsesBlockCreateStatsLayouts(t *testing.T) {
 
 func testServer(store Store) *Server {
 	return &Server{
-		store:        store,
-		zeroState:    ton.ZeroStateIDExt{Workchain: masterchainID, RootHash: bytes.Repeat([]byte{0x01}, 32), FileHash: bytes.Repeat([]byte{0x02}, 32)},
-		version:      DefaultVersion,
-		capabilities: DefaultCapabilities,
-		tvm:          tvm.NewTVM(),
+		store:                  store,
+		zeroState:              ton.ZeroStateIDExt{Workchain: masterchainID, RootHash: bytes.Repeat([]byte{0x01}, 32), FileHash: bytes.Repeat([]byte{0x02}, 32)},
+		version:                DefaultVersion,
+		capabilities:           DefaultCapabilities,
+		tvm:                    tvm.NewTVM(),
+		sendMessageCache:       newSendMessageCache(),
+		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
 		now: func() time.Time {
 			return time.Unix(1700000000, 0)
 		},
@@ -3744,7 +4254,7 @@ func testShardStateWithAccount(t *testing.T, block ton.BlockIDExt, accountID []b
 		},
 		Seqno:           block.SeqNo,
 		OutMsgQueueInfo: cell.BeginCell().EndCell(),
-		Stats:           cell.BeginCell().EndCell(),
+		Stats:           testShardStateStats(t),
 	}
 	state.Accounts.ShardAccounts = &tlb.ShardAccountsAugDict{AugmentedDictionary: accounts}
 
@@ -4015,6 +4525,19 @@ func testMasterStateWithOldBlocks(t *testing.T, block ton.BlockIDExt, oldBlocks 
 		t.Fatalf("build mc state extra: %v", err)
 	}
 
+	cc, err := testCurrencyCollectionCell()
+	if err != nil {
+		t.Fatalf("currency collection: %v", err)
+	}
+	stats := cell.BeginCell().
+		MustStoreUInt(0, 64).
+		MustStoreUInt(0, 64).
+		MustStoreBuilder(cc.ToBuilder()).
+		MustStoreBuilder(cc.ToBuilder()).
+		MustStoreDict(cell.NewDict(256)).
+		MustStoreBoolBit(false).
+		EndCell()
+
 	state := tlb.ShardStateUnsplit{
 		GlobalID: -239,
 		ShardIdent: tlb.ShardIdent{
@@ -4024,7 +4547,7 @@ func testMasterStateWithOldBlocks(t *testing.T, block ton.BlockIDExt, oldBlocks 
 		},
 		Seqno:           block.SeqNo,
 		OutMsgQueueInfo: cell.BeginCell().EndCell(),
-		Stats:           cell.BeginCell().EndCell(),
+		Stats:           stats,
 		McStateExtra:    extraCell,
 	}
 	state.Accounts.ShardAccounts = testEmptyShardAccounts(t)
@@ -4041,6 +4564,25 @@ func testMcStateInfoWithOldBlocks(t *testing.T, oldBlocks []testOldMasterBlock) 
 	prevBlocks, err := cell.NewAugDict(32, testOldMcBlocksAugmentation{})
 	if err != nil {
 		t.Fatalf("create old mc blocks dict: %v", err)
+	}
+	hasZero := false
+	for _, old := range oldBlocks {
+		if old.id.SeqNo == 0 {
+			hasZero = true
+			break
+		}
+	}
+	if !hasZero {
+		oldBlocks = append([]testOldMasterBlock{{
+			id: ton.BlockIDExt{
+				Workchain: masterchainID,
+				Shard:     masterchainShard,
+				SeqNo:     0,
+				RootHash:  bytes.Repeat([]byte{0x00}, 32),
+				FileHash:  bytes.Repeat([]byte{0x01}, 32),
+			},
+			isKey: true,
+		}}, oldBlocks...)
 	}
 	for _, old := range oldBlocks {
 		endLT := old.endLT
@@ -4126,6 +4668,24 @@ func (testCurrencyCollectionAugmentation) CombineExtra(*cell.Slice, *cell.Slice)
 
 func testCurrencyCollectionCell() (*cell.Cell, error) {
 	return tlb.ToCell(&tlb.CurrencyCollection{Coins: tlb.ZeroCoins})
+}
+
+func testShardStateStats(t *testing.T) *cell.Cell {
+	t.Helper()
+
+	cc, err := testCurrencyCollectionCell()
+	if err != nil {
+		t.Fatalf("build currency collection: %v", err)
+	}
+
+	return cell.BeginCell().
+		MustStoreUInt(0, 64).
+		MustStoreUInt(0, 64).
+		MustStoreBuilder(cc.ToBuilder()).
+		MustStoreBuilder(cc.ToBuilder()).
+		MustStoreDict(cell.NewDict(256)).
+		MustStoreBoolBit(false).
+		EndCell()
 }
 
 func testGlobalVersionCell(t *testing.T, version uint32) *cell.Cell {
@@ -4247,6 +4807,19 @@ func testMasterStateWithConfig(t *testing.T, block ton.BlockIDExt, params map[in
 		t.Fatalf("build mc state extra: %v", err)
 	}
 
+	cc, err := testCurrencyCollectionCell()
+	if err != nil {
+		t.Fatalf("currency collection: %v", err)
+	}
+	stats := cell.BeginCell().
+		MustStoreUInt(0, 64).
+		MustStoreUInt(0, 64).
+		MustStoreBuilder(cc.ToBuilder()).
+		MustStoreBuilder(cc.ToBuilder()).
+		MustStoreDict(cell.NewDict(256)).
+		MustStoreBoolBit(false).
+		EndCell()
+
 	state := tlb.ShardStateUnsplit{
 		GlobalID: -239,
 		ShardIdent: tlb.ShardIdent{
@@ -4256,7 +4829,7 @@ func testMasterStateWithConfig(t *testing.T, block ton.BlockIDExt, params map[in
 		},
 		Seqno:           block.SeqNo,
 		OutMsgQueueInfo: cell.BeginCell().EndCell(),
-		Stats:           cell.BeginCell().EndCell(),
+		Stats:           stats,
 		McStateExtra:    extraCell,
 	}
 	state.Accounts.ShardAccounts = testEmptyShardAccounts(t)
@@ -4325,12 +4898,13 @@ func testMasterStateWithShardHashes(t *testing.T, block ton.BlockIDExt, shardHas
 				Params *cell.Dictionary `tlb:"dict inline 32"`
 			}{Params: params},
 		},
-		Info:          cell.BeginCell().EndCell(),
+		Info:          testMcStateInfo(t, block.SeqNo),
 		GlobalBalance: tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
 	})
 	if err != nil {
 		t.Fatalf("build mc state extra: %v", err)
 	}
+	stats := testShardStateStats(t)
 
 	state := tlb.ShardStateUnsplit{
 		GlobalID: -239,
@@ -4341,7 +4915,7 @@ func testMasterStateWithShardHashes(t *testing.T, block ton.BlockIDExt, shardHas
 		},
 		Seqno:           block.SeqNo,
 		OutMsgQueueInfo: cell.BeginCell().EndCell(),
-		Stats:           cell.BeginCell().EndCell(),
+		Stats:           stats,
 		McStateExtra:    extraCell,
 	}
 	state.Accounts.ShardAccounts = testEmptyShardAccounts(t)
@@ -4404,7 +4978,7 @@ func testMasterStateWithBlockCreateStats(t *testing.T, block ton.BlockIDExt, mag
 		},
 		Seqno:           block.SeqNo,
 		OutMsgQueueInfo: cell.BeginCell().EndCell(),
-		Stats:           cell.BeginCell().EndCell(),
+		Stats:           testShardStateStats(t),
 		McStateExtra:    extraCell,
 	}
 	state.Accounts.ShardAccounts = testEmptyShardAccounts(t)
@@ -4424,6 +4998,37 @@ func testShardHashes(t *testing.T, block ton.BlockIDExt) *cell.Dictionary {
 func testShardHashesWithNextValidatorShard(t *testing.T, block ton.BlockIDExt, nextValidatorShard int64) *cell.Dictionary {
 	t.Helper()
 
+	leaf := testShardHashLeaf(t, block, nextValidatorShard)
+
+	dict := cell.NewDict(32)
+	if err := dict.Set(cell.BeginCell().MustStoreInt(int64(block.Workchain), 32).EndCell(), cell.BeginCell().MustStoreRef(leaf).EndCell()); err != nil {
+		t.Fatalf("set shard hash: %v", err)
+	}
+	return dict
+}
+
+func testForkedShardHashes(t *testing.T, left ton.BlockIDExt, right ton.BlockIDExt) *cell.Dictionary {
+	t.Helper()
+
+	if left.Workchain != right.Workchain {
+		t.Fatalf("forked shard hashes require one workchain, got %d and %d", left.Workchain, right.Workchain)
+	}
+	root := cell.BeginCell().
+		MustStoreUInt(1, 1).
+		MustStoreRef(testShardHashLeaf(t, left, left.Shard)).
+		MustStoreRef(testShardHashLeaf(t, right, right.Shard)).
+		EndCell()
+
+	dict := cell.NewDict(32)
+	if err := dict.Set(cell.BeginCell().MustStoreInt(int64(left.Workchain), 32).EndCell(), cell.BeginCell().MustStoreRef(root).EndCell()); err != nil {
+		t.Fatalf("set forked shard hash: %v", err)
+	}
+	return dict
+}
+
+func testShardHashLeaf(t *testing.T, block ton.BlockIDExt, nextValidatorShard int64) *cell.Cell {
+	t.Helper()
+
 	desc, err := tlb.ToCell(&tlb.ShardDesc{
 		SeqNo:              block.SeqNo,
 		RootHash:           block.RootHash,
@@ -4434,13 +5039,7 @@ func testShardHashesWithNextValidatorShard(t *testing.T, block ton.BlockIDExt, n
 	if err != nil {
 		t.Fatalf("build shard descriptor: %v", err)
 	}
-	leaf := cell.BeginCell().MustStoreUInt(0, 1).MustStoreBuilder(desc.ToBuilder()).EndCell()
-
-	dict := cell.NewDict(32)
-	if err = dict.Set(cell.BeginCell().MustStoreInt(int64(block.Workchain), 32).EndCell(), cell.BeginCell().MustStoreRef(leaf).EndCell()); err != nil {
-		t.Fatalf("set shard hash: %v", err)
-	}
-	return dict
+	return cell.BeginCell().MustStoreUInt(0, 1).MustStoreBuilder(desc.ToBuilder()).EndCell()
 }
 
 func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size uint64) *cell.Cell {
@@ -4451,7 +5050,7 @@ func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size 
 		MustStoreUInt(0, 64).
 		MustStoreDict(cell.NewDict(96)).
 		MustStoreBoolBit(true).
-		MustStoreUInt(0, 1).
+		MustStoreUInt(0, 4).
 		MustStoreDict(cell.NewDict(256)).
 		MustStoreUInt(0, 64).
 		MustStoreBoolBit(true).
@@ -4467,7 +5066,7 @@ func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size 
 		},
 		Seqno:           block.SeqNo,
 		OutMsgQueueInfo: outMsgQueueInfo,
-		Stats:           cell.BeginCell().EndCell(),
+		Stats:           testShardStateStats(t),
 	}
 	state.Accounts.ShardAccounts = testEmptyShardAccounts(t)
 	root, err := tlb.ToCell(&state)
@@ -4982,12 +5581,14 @@ func fakeLTKey(key storage.BlockHistoryKey, lt uint64) fakeLTLookupKey {
 }
 
 type fakeMessageSender struct {
-	body []byte
-	err  error
+	body  []byte
+	err   error
+	count int
 }
 
 func (s *fakeMessageSender) SendExternalMessage(_ context.Context, body []byte) error {
 	s.body = append([]byte(nil), body...)
+	s.count++
 	return s.err
 }
 
@@ -5070,14 +5671,14 @@ func testBlockProofStore(t *testing.T, keyID ton.BlockIDExt, keyRoot *cell.Cell,
 			storage.BlockKey(targetID): testBlockBOC(targetRoot),
 		},
 		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, nil),
-			fakeProofKey(storage.ServedProofBlock, targetID):     testBlockProofEnvelopeBOC(t, targetID, targetRoot, signatures),
+			fakeProofKey(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
+			fakeProofKey(storage.ServedProofBlock, targetID): testBlockProofEnvelopeBOC(t, targetID, targetRoot, signatures),
 		},
 		blockStates: map[string]*storage.BlockState{
 			storage.BlockKey(targetID): {Block: targetID, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 		metas: map[string]*storage.BlockMeta{
-			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlockLink},
+			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock},
 			storage.BlockKey(targetID): {ID: targetID, StateRootHash: stateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
 		},
 	}
@@ -5087,6 +5688,21 @@ func testBlockProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.Cell,
 	t.Helper()
 
 	proof := testFullMerkleProof(t, root)
+	return testBlockProofEnvelopeWithRootBOC(t, id, proof, signatures)
+}
+
+func testBlockStateRootProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.Cell, signatures *cell.Cell) []byte {
+	t.Helper()
+
+	proof, err := blockStateRootProof(root)
+	if err != nil {
+		t.Fatalf("create block state root proof: %v", err)
+	}
+	return testBlockProofEnvelopeWithRootBOC(t, id, proof, signatures)
+}
+
+func testBlockProofEnvelopeWithRootBOC(t *testing.T, id ton.BlockIDExt, proof *cell.Cell, signatures *cell.Cell) []byte {
+	t.Helper()
 
 	envelope, err := tlb.ToCell(&testBlockProofEnvelope{
 		ProofFor: testBlockIDExtTLB{
@@ -5106,6 +5722,18 @@ func testBlockProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.Cell,
 		t.Fatalf("serialize block proof envelope: %v", err)
 	}
 	return envelope.ToBOCWithFlags(false)
+}
+
+func assertBOCRootLevelZero(t *testing.T, data []byte) {
+	t.Helper()
+
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		t.Fatalf("parse boc: %v", err)
+	}
+	if root.Level() != 0 {
+		t.Fatalf("boc root level = %d, want 0", root.Level())
+	}
 }
 
 func testFullMerkleProof(t *testing.T, root *cell.Cell) *cell.Cell {

@@ -43,7 +43,7 @@ func (s *Store) PruneArchivePackages(ctx context.Context, cutoffUnix uint32, max
 	stats.DeletedBeforeSeqno = deleteBeforeSeqno
 	stats.RetainedBoundarySeqno = boundarySeqno
 
-	deletedMeta, deletedKeys, err := s.deleteArchivedBlockMetadata(ctx, deleteBeforeSeqno)
+	deletedMeta, deletedKeys, err := s.deleteArchivedBlockMetadata(ctx, deleteBeforeSeqno, cutoffUnix)
 	if err != nil {
 		return stats, err
 	}
@@ -143,7 +143,7 @@ func archivePackagePruneBoundary(packages []archivePackageMeta, cutoffUnix uint3
 	return last + archiveSliceMasterchainBlocks, boundary
 }
 
-func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uint32) (int, int, error) {
+func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uint32, cutoffUnix uint32) (int, int, error) {
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {
 		return 0, 0, err
@@ -211,7 +211,7 @@ func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uin
 		if err != nil {
 			return deletedMeta, deletedKeys, err
 		}
-		if !archivePruneDeleteBlockMeta(block, meta, beforeSeqno) {
+		if !archivePruneDeleteBlockMeta(block, meta, beforeSeqno, cutoffUnix) {
 			continue
 		}
 		pending = append(pending, archivePruneBlockDelete{block: block, meta: meta})
@@ -262,12 +262,15 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 	return deleted, nil
 }
 
-func archivePruneDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, beforeSeqno uint32) bool {
+func archivePruneDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, beforeSeqno uint32, cutoffUnix uint32) bool {
 	if block.Workchain == -1 && block.Shard == topShard {
 		return block.SeqNo < beforeSeqno
 	}
 	if meta != nil && meta.MasterchainRef != nil {
 		return meta.MasterchainRef.SeqNo < beforeSeqno
+	}
+	if meta != nil && meta.GenUTime != 0 && cutoffUnix != 0 {
+		return meta.GenUTime < cutoffUnix
 	}
 	return false
 }

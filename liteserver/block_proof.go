@@ -380,7 +380,28 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 
 func oldMasterBlockStateProof(stateRoot *cell.Cell, id ton.BlockIDExt) (*cell.Cell, error) {
 	return createUsageProof(stateRoot, func(root *cell.Cell) error {
-		old, err := oldMasterBlockIDFromState(root, id.SeqNo)
+		prefix, err := loadMcStateExtraPrefix(root)
+		if err != nil {
+			return err
+		}
+		if err = visitMcStateExtraInfo(prefix.Info); err != nil {
+			return err
+		}
+		if err = visitCell(prefix.Config.Config); err != nil {
+			return err
+		}
+
+		seqno, err := shardStateSeqno(root)
+		if err != nil {
+			return err
+		}
+		if seqno != 0 {
+			if _, err = oldMasterBlockIDFromInfo(prefix.Info, 0); err != nil {
+				return err
+			}
+		}
+
+		old, err := oldMasterBlockIDFromInfo(prefix.Info, id.SeqNo)
 		if err != nil {
 			return err
 		}
@@ -409,7 +430,7 @@ func (s *Server) storedMasterProofRoot(ctx context.Context, id ton.BlockIDExt, l
 		return nil, nil, err
 	}
 
-	root, err := cell.UnwrapProof(parsed.Proof.Root, id.RootHash)
+	root, err := cell.UnwrapProofVirtualized(parsed.Proof.Root, id.RootHash)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -427,55 +448,45 @@ func (s *Server) storedMasterProof(ctx context.Context, id ton.BlockIDExt, link 
 	}
 
 	if link {
-		data, err := s.storedMasterProofByKind(ctx, id, storedMasterProofKinds(meta, true))
-		if err == nil {
-			return data, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
+		return s.storedMasterProofLink(ctx, id, meta)
+	}
 
-		full, err := s.storedMasterProofByKind(ctx, id, storedMasterProofKinds(meta, false))
+	kind := storedMasterFullProofKind(meta)
+	if !meta.HasProof(kind) {
+		return nil, storage.ErrNotFound
+	}
+	return s.store.BlockProof(ctx, kind, id)
+}
+
+func (s *Server) storedMasterProofLink(ctx context.Context, id ton.BlockIDExt, meta *storage.BlockMeta) ([]byte, error) {
+	fullKind := storedMasterFullProofKind(meta)
+	if meta.HasProof(fullKind) {
+		full, err := s.store.BlockProof(ctx, fullKind, id)
 		if err != nil {
 			return nil, err
 		}
 		return blockproof.LinkBOC(id, full)
 	}
 
-	return s.storedMasterProofByKind(ctx, id, storedMasterProofKinds(meta, false))
-}
-
-func (s *Server) storedMasterProofByKind(ctx context.Context, id ton.BlockIDExt, kinds []storage.ServedProofKind) ([]byte, error) {
-	for _, kind := range kinds {
-		data, err := s.store.BlockProof(ctx, kind, id)
-		if err == nil {
-			return data, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
+	linkKind := storedMasterLinkProofKind(meta)
+	if !meta.HasProof(linkKind) {
+		return nil, storage.ErrNotFound
 	}
-	return nil, storage.ErrNotFound
+	return s.store.BlockProof(ctx, linkKind, id)
 }
 
-func storedMasterProofKinds(meta *storage.BlockMeta, link bool) []storage.ServedProofKind {
-	var kind storage.ServedProofKind
+func storedMasterFullProofKind(meta *storage.BlockMeta) storage.ServedProofKind {
 	if meta.Has(storage.BlockMetaIsKeyBlock) {
-		if link {
-			kind = storage.ServedProofKeyBlockLink
-		} else {
-			kind = storage.ServedProofKeyBlock
-		}
-	} else if link {
-		kind = storage.ServedProofBlockLink
-	} else {
-		kind = storage.ServedProofBlock
+		return storage.ServedProofKeyBlock
 	}
+	return storage.ServedProofBlock
+}
 
-	if !meta.HasProof(kind) {
-		return nil
+func storedMasterLinkProofKind(meta *storage.BlockMeta) storage.ServedProofKind {
+	if meta.Has(storage.BlockMetaIsKeyBlock) {
+		return storage.ServedProofKeyBlockLink
 	}
-	return []storage.ServedProofKind{kind}
+	return storage.ServedProofBlockLink
 }
 
 func (s *Server) blockIsKey(ctx context.Context, id ton.BlockIDExt) (bool, error) {

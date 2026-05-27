@@ -33,6 +33,45 @@ func decodeBlockID(data []byte) (ton.BlockIDExt, error) {
 	}, nil
 }
 
+func encodeArchiveBackfillProgress(progress storage.ArchiveBackfillProgress) []byte {
+	buf := make([]byte, 0, 1+80+4+4+4+4+4+8)
+	buf = append(buf, archiveBackfillProgressVersion)
+	buf = append(buf, encodeBlockID(progress.OriginPersistentState)...)
+	buf = binary.BigEndian.AppendUint32(buf, progress.OriginGenUTime)
+	buf = binary.BigEndian.AppendUint32(buf, progress.GCCutoffUnix)
+	buf = binary.BigEndian.AppendUint32(buf, progress.TargetUnix)
+	buf = binary.BigEndian.AppendUint32(buf, progress.VerifiedFloorSeqno)
+	buf = binary.BigEndian.AppendUint32(buf, progress.VerifiedFloorUTime)
+	buf = binary.BigEndian.AppendUint64(buf, progress.UpdatedAtUnix)
+	return buf
+}
+
+func decodeArchiveBackfillProgress(data []byte) (storage.ArchiveBackfillProgress, error) {
+	const size = 1 + 80 + 4 + 4 + 4 + 4 + 4 + 8
+	if len(data) != size {
+		return storage.ArchiveBackfillProgress{}, fmt.Errorf("archive backfill progress payload size mismatch: got=%d want=%d", len(data), size)
+	}
+	if data[0] != archiveBackfillProgressVersion {
+		return storage.ArchiveBackfillProgress{}, fmt.Errorf("archive backfill progress version mismatch")
+	}
+	pos := 1
+	origin, err := decodeBlockID(data[pos : pos+80])
+	if err != nil {
+		return storage.ArchiveBackfillProgress{}, err
+	}
+	pos += 80
+	progress := storage.ArchiveBackfillProgress{
+		OriginPersistentState: origin,
+		OriginGenUTime:        binary.BigEndian.Uint32(data[pos : pos+4]),
+		GCCutoffUnix:          binary.BigEndian.Uint32(data[pos+4 : pos+8]),
+		TargetUnix:            binary.BigEndian.Uint32(data[pos+8 : pos+12]),
+		VerifiedFloorSeqno:    binary.BigEndian.Uint32(data[pos+12 : pos+16]),
+		VerifiedFloorUTime:    binary.BigEndian.Uint32(data[pos+16 : pos+20]),
+		UpdatedAtUnix:         binary.BigEndian.Uint64(data[pos+20 : pos+28]),
+	}
+	return progress, nil
+}
+
 func encodeBlockMeta(meta *storage.BlockMeta) []byte {
 	if meta == nil {
 		return nil

@@ -3,10 +3,15 @@ package p2p
 import (
 	"bytes"
 	"testing"
+	"time"
 
+	"github.com/xssnick/gton/internal/extmsg"
+	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestClassifyDuplicateCompressedBlockBroadcastDedupesBeforeDecode(t *testing.T) {
@@ -158,6 +163,122 @@ func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
 	}
 }
 
+func TestClassifyExternalMessageBroadcastCachesByBodyHash(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	data := testExternalMessageBOC(t)
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	first := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+	if first == nil || first.rebroadcast == nil {
+		t.Fatal("expected first external broadcast to be accepted")
+	}
+
+	second := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+	if second != nil {
+		t.Fatalf("duplicate external broadcast was accepted: %+v", second)
+	}
+}
+
+func TestClassifyExternalMessageBroadcastLimitsPerAddress(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+
+	for i := 0; i < extmsg.DefaultAddressLimit; i++ {
+		data := testExternalMessageBOCWithBody(t, uint64(i))
+		msg := tonnodeapi.NewExternalMessageBroadcast{
+			Message: tonnodeapi.ExternalMessage{Data: data},
+		}
+		payload, err := tl.Serialize(msg, true)
+		if err != nil {
+			t.Fatalf("serialize external broadcast %d: %v", i, err)
+		}
+		accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+		if accepted == nil || accepted.rebroadcast == nil {
+			t.Fatalf("external broadcast %d was not accepted", i)
+		}
+	}
+
+	data := testExternalMessageBOCWithBody(t, uint64(extmsg.DefaultAddressLimit))
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast over limit: %v", err)
+	}
+	if accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer"); accepted != nil {
+		t.Fatalf("over-limit external broadcast was accepted: %+v", accepted)
+	}
+}
+
+func TestClassifyExternalMessageBroadcastSkipsOwnMessage(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	data := []byte{0xAA, 0xBB}
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	node.myExternalMessages.Mark(externalMessageFingerprint(sub.spec.ShortID, data), time.Now())
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+	if accepted != nil {
+		t.Fatalf("own external broadcast was accepted: %+v", accepted)
+	}
+}
+
+func TestClassifyExternalMessageBroadcastRejectsOversizeData(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: make([]byte, maxOverlayPayloadSize+1)},
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, "peer")
+	if accepted != nil {
+		t.Fatalf("oversize external broadcast was accepted: %+v", accepted)
+	}
+}
+
 func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 {
 	for _, stat := range node.broadcastStatusSnapshot() {
 		if stat.Direction == direction && stat.Overlay == overlay && stat.Kind == kind {
@@ -165,4 +286,18 @@ func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 
 		}
 	}
 	return 0
+}
+
+func testExternalMessageBOCWithBody(t *testing.T, value uint64) []byte {
+	t.Helper()
+
+	root, err := tlb.ToCell(&tlb.ExternalMessage{
+		DstAddr:   address.MustParseRawAddr("0:1111111111111111111111111111111111111111111111111111111111111111"),
+		ImportFee: tlb.ZeroCoins,
+		Body:      cell.BeginCell().MustStoreUInt(value, 64).EndCell(),
+	})
+	if err != nil {
+		t.Fatalf("build external message: %v", err)
+	}
+	return root.ToBOCWithFlags(false)
 }

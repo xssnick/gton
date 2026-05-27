@@ -100,10 +100,7 @@ func (d *nextBlockBootstrapProbeDecision) noteAheadSeqno(currentSeqno uint32, se
 }
 
 func (d nextBlockBootstrapProbeDecision) shouldUseUrgentFanout() bool {
-	if !d.liveTail {
-		return false
-	}
-	if d.rawBroadcastAhead || d.observedAhead || d.seenAhead || d.queuedFutureAhead {
+	if d.liveTail && (d.rawBroadcastAhead || d.observedAhead || d.seenAhead || d.queuedFutureAhead) {
 		return true
 	}
 	if d.consecutiveMisses >= nextBlockBootstrapUrgentMisses {
@@ -113,9 +110,6 @@ func (d nextBlockBootstrapProbeDecision) shouldUseUrgentFanout() bool {
 }
 
 func (d nextBlockBootstrapProbeDecision) shouldUseWideFanout() bool {
-	if !d.liveTail {
-		return false
-	}
 	if d.consecutiveMisses >= nextBlockBootstrapWideMisses {
 		return true
 	}
@@ -123,6 +117,10 @@ func (d nextBlockBootstrapProbeDecision) shouldUseWideFanout() bool {
 		return true
 	}
 	return d.hasLag && d.lagSeconds >= nextBlockBootstrapWideLagSeconds
+}
+
+func (d nextBlockBootstrapProbeDecision) shouldPreferBroadcastCandidate() bool {
+	return d.liveTail && d.rawBroadcastAhead
 }
 
 func (d nextBlockBootstrapProbeDecision) probeTimeout() time.Duration {
@@ -176,6 +174,9 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	s.currentStatus = next
 	s.currentStatusMu.Unlock()
 
+	if s.node != nil {
+		s.node.NotifyCompressedBlockStateReady()
+	}
 	return true
 }
 
@@ -456,8 +457,9 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		return p2p.DownloadedBlock{}, "", fmt.Errorf("p2p node is nil")
 	}
 
+	target := masterchainSeqnoTarget(^uint32(0))
 	for {
-		if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, masterchainSeqnoTarget(^uint32(0))); ok || err != nil {
+		if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
 			return downloaded, source, err
 		}
 
@@ -502,6 +504,17 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		for {
 			select {
 			case res := <-result:
+				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+					cancel()
+					return downloaded, source, err
+				}
+				if decision.shouldPreferBroadcastCandidate() {
+					downloaded, source, ok, err := s.waitPreferredMasterchainBroadcast(ctx, prev, target, broadcastWake, nextBlockBootstrapBroadcastPreferDelay)
+					if ok || err != nil {
+						cancel()
+						return downloaded, source, err
+					}
+				}
 				cancel()
 				if res.err != nil {
 					return p2p.DownloadedBlock{}, "", fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), res.err)
@@ -515,12 +528,12 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 				}
 				return prepared, syncBlockSourceForDownloadedBlock("peer_probe", prepared), nil
 			case <-s.currentStateWake:
-				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, masterchainSeqnoTarget(^uint32(0))); ok || err != nil {
+				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
 					cancel()
 					return downloaded, source, err
 				}
 			case <-broadcastWake:
-				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, masterchainSeqnoTarget(^uint32(0))); ok || err != nil {
+				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
 					cancel()
 					return downloaded, source, err
 				}
@@ -532,6 +545,33 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 				cancel()
 				return p2p.DownloadedBlock{}, "", ctx.Err()
 			}
+		}
+	}
+}
+
+func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, target ton.BlockIDExt, broadcastWake <-chan struct{}, delay time.Duration) (p2p.DownloadedBlock, string, bool, error) {
+	if delay <= 0 {
+		return p2p.DownloadedBlock{}, "", false, nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return p2p.DownloadedBlock{}, "", false, ctx.Err()
+		case <-s.currentStateWake:
+			if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				return downloaded, source, ok, err
+			}
+		case <-broadcastWake:
+			if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				return downloaded, source, ok, err
+			}
+			broadcastWake = nil
+		case <-timer.C:
+			return p2p.DownloadedBlock{}, "", false, nil
 		}
 	}
 }

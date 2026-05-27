@@ -67,6 +67,29 @@ func ShardBlocksFromMasterState(state *storage.BlockState) ([]ton.BlockIDExt, er
 	return res, nil
 }
 
+func ShardBlocksFromMasterBlock(block ton.BlockIDExt, parsed *tlb.Block) ([]ton.BlockIDExt, error) {
+	if block.Workchain != -1 {
+		return nil, fmt.Errorf("expected masterchain block, got %s", storage.FormatBlockRef(block))
+	}
+	if parsed == nil || parsed.Extra == nil || parsed.Extra.Custom == nil {
+		return nil, fmt.Errorf("masterchain block %s is missing mc block extra", storage.FormatBlockRef(block))
+	}
+	if parsed.Extra.Custom.ShardHashes == nil {
+		return nil, fmt.Errorf("masterchain block %s does not contain shard hashes", storage.FormatBlockRef(block))
+	}
+
+	shards, err := loadShardsFromHashes(parsed.Extra.Custom.ShardHashes)
+	if err != nil {
+		return nil, fmt.Errorf("load shard hashes for %s: %w", storage.FormatBlockRef(block), err)
+	}
+
+	res := make([]ton.BlockIDExt, 0, len(shards))
+	for _, shard := range shards {
+		res = append(res, *shard)
+	}
+	return res, nil
+}
+
 func loadShardsFromHashes(shardHashes *cell.Dictionary) ([]*ton.BlockIDExt, error) {
 	if shardHashes == nil {
 		return []*ton.BlockIDExt{}, nil

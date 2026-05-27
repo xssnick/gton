@@ -1,12 +1,13 @@
 package p2p
 
 import (
+	"context"
 	"crypto/ed25519"
-	"github.com/xssnick/gton/service/storage"
 	"net"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -20,7 +21,7 @@ const (
 	maxQueryNeighbours         = 16
 	maxOverlayPayloadSize      = 16 << 20
 	simpleBroadcastSkew        = 20 * time.Second
-	dhtRefreshInterval         = 45 * time.Second
+	dhtRefreshInterval         = 90 * time.Second
 	peerRefreshMinDelay        = time.Second
 	peerRefreshJitter          = 0
 	peerRefreshFanout          = 1
@@ -29,6 +30,9 @@ const (
 	peerPingMinDelay           = 500 * time.Millisecond
 	peerPingJitter             = 500 * time.Millisecond
 	peerPingFanout             = 6
+	adnlPingMinDelay           = 30 * time.Second
+	adnlPingJitter             = 20 * time.Second
+	adnlPingFanout             = 5
 	overlayPeerTTL             = 10 * time.Minute
 	overlayFutureSkew          = 60 * time.Second
 	downloadQueryTimeout       = 15 * time.Second
@@ -54,23 +58,26 @@ const (
 	dhtSeedPeerTimeout         = 5 * time.Second
 	dhtSeedCooldownMinDelay    = 6 * time.Second
 	dhtSeedCooldownJitter      = 4 * time.Second
+	dhtRefreshReplacementLimit = 2
 	inactiveShardOverlayTTL    = overlayPeerTTL + 60*time.Second
 	attachWarmupTimeout        = 3 * time.Second
 	broadcastEventBuffer       = 4096
 	broadcastQueueMaxItems     = 1024
 	broadcastQueueMaxBytes     = int64(128 << 20)
 	broadcastDeduperMaxEntries = 4096
-	publicAnnounceTTL          = 12 * time.Minute
-	publicAnnounceEvery        = 4 * time.Minute
+	externalMessageCacheTTL    = time.Minute
+	externalMessageCacheMax    = 1 << 17
+	publicAnnounceTTL          = time.Hour
+	publicAnnounceEvery        = 90 * time.Second
 	publicAnnounceRetryDelay   = 15 * time.Second
 	dhtStoreTimeout            = 45 * time.Second
 	dhtFindTimeout             = 30 * time.Second
 	masterchainWaitLogEvery    = 5 * time.Second
 	peerQueryTimeout           = 10 * time.Second
 	peerRebroadcastTimeout     = 5 * time.Second
-	peerRebroadcastQueueItems  = 4096
-	peerRebroadcastQueueBytes  = int64(64 << 20)
-	externalRebroadcastFanout  = 4
+	peerRebroadcastQueueItems  = 2048
+	peerRebroadcastQueueBytes  = int64(256 << 20)
+	externalRebroadcastFanout  = 5
 	localRebroadcastAttempts   = 3
 	dhtServerStoreMaxKeys      = 300000
 
@@ -87,10 +94,14 @@ const (
 
 	peerStopUnreliability = 5.0
 	peerFailUnreliability = 10.0
+	peerSlowEvictionScore = peerStopUnreliability + 1
 
-	blockUnknownPeerSpeed = float64(256 << 10)
-	blockSlowPeerSpeed    = float64(64 << 10)
-	blockSlowPeerPenalty  = 30 * time.Second
+	blockUnknownPeerSpeed         = float64(256 << 10)
+	blockSlowPeerSpeed            = float64(64 << 10)
+	blockSlowPeerPenalty          = 30 * time.Second
+	blockUnavailablePeerPenalty   = 10 * time.Second
+	blockUnavailableConfirmWindow = 3 * time.Second
+	blockSpeedSampleMin           = int64(64 << 10)
 )
 
 type Delivery string
@@ -134,10 +145,25 @@ type Options struct {
 	Storage            storage.Storage
 	PeerServingStorage storage.PeerServingStorage
 	CompressedState    CompressedBlockStateProvider
+	SyncLag            SyncLagProvider
 }
 
 type BlockCacheObserver interface {
 	MarkLiveBlockFlushed(block ton.BlockIDExt)
+}
+
+type SyncLagProvider interface {
+	SyncLagSeconds() (int64, bool)
+}
+
+type SyncLagProviderFunc func() (int64, bool)
+
+func (f SyncLagProviderFunc) SyncLagSeconds() (int64, bool) {
+	return f()
+}
+
+type MasterchainBroadcastSignatureVerifier interface {
+	ValidateMasterchainBroadcastSignatures(ctx context.Context, block ton.BlockIDExt, proof []byte, signatures *cell.Cell) error
 }
 
 type overlaySpec struct {
@@ -164,6 +190,7 @@ type DownloadedBlock struct {
 	BroadcastSignatures *cell.Cell
 	Parsed              *tlb.Block
 	Meta                *storage.BlockMeta
+	SourceKey           string
 	// StateUpdateToCells contains encoded non-pruned cells reachable from block.state_update.to,
 	// keyed by their logical state hash. Service apply code treats it as output of
 	// storage.PrepareStateUpdateCells and only checks that the update matches the current root.

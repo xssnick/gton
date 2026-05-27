@@ -22,6 +22,20 @@ const (
 	stateSerializationMaxJitter     = 6 * time.Hour
 )
 
+var errStateSerializationDelayed = errors.New("persistent state serialization is delayed")
+
+type stateSerializationDelayError struct {
+	delay time.Duration
+}
+
+func (e stateSerializationDelayError) Error() string {
+	return fmt.Sprintf("%v: %s", errStateSerializationDelayed, e.delay)
+}
+
+func (e stateSerializationDelayError) Unwrap() error {
+	return errStateSerializationDelayed
+}
+
 type persistentStateSchedulerStore interface {
 	PersistentStateSerializerState(ctx context.Context) (*storage.PersistentStateSerializerState, error)
 	SavePersistentStateSerializerState(ctx context.Context, state *storage.PersistentStateSerializerState) error
@@ -200,6 +214,9 @@ func (s *Service) processPersistentStateKeyBlock(
 		s.stateSerializer.resetAutomaticAttempts(block.SeqNo)
 		return err
 	}
+	if errors.Is(err, errStateSerializationDelayed) {
+		return err
+	}
 	if errors.Is(err, errStateSerializationRunning) || errors.Is(err, errCellGenerationMigrationRunning) || errors.Is(err, errPersistentStateGCActive) || errors.Is(err, errArchiveTTLGCActive) || errors.Is(err, errStateSerializationLowDiskSpace) {
 		return err
 	}
@@ -270,13 +287,14 @@ func (s *Service) tryPersistentStateKeyBlock(
 		delay = s.stateSerializer.randomDelay()
 	}
 	if delay > 0 {
+		if err := saveActivePersistentStateSerialization(ctx, scheduler, block); err != nil {
+			return err
+		}
 		s.stateSerializer.log.Warn().
 			Str("block", storage.FormatBlockRef(block)).
 			Dur("delay", delay).
 			Msg("delaying persistent state serialization")
-		if err := waitRetry(ctx, delay); err != nil {
-			return err
-		}
+		return stateSerializationDelayError{delay: delay}
 	}
 
 	lease, err := s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskStateSerialization)

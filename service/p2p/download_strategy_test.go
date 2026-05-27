@@ -199,7 +199,7 @@ func TestProbeNextFullFromPeersStopsAfterEarlyFailures(t *testing.T) {
 	defer cancel()
 
 	startedAt := time.Now()
-	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeNextFullPeerOptions{
+	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
 		peerLimit:         2,
 		stagedPeerLimit:   4,
 		stageDelay:        10 * time.Millisecond,
@@ -231,7 +231,7 @@ func TestProbeNextFullFromPeersStopsAfterSoftTimeout(t *testing.T) {
 	defer cancel()
 
 	startedAt := time.Now()
-	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeNextFullPeerOptions{
+	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
 		peerLimit:       2,
 		stagedPeerLimit: 3,
 		stageDelay:      10 * time.Millisecond,
@@ -284,7 +284,40 @@ func TestChainBlockDownloadSuccessPinsPeer(t *testing.T) {
 	}
 }
 
-func TestChainBlockUnavailableDoesNotClearPinnedPeer(t *testing.T) {
+func TestChainBlockDownloadSuccessPinsSmallBlock(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(0, topShard, 77)
+	peer := &overlayPeer{id: "fast-small", addr: "fast-small", alive: true}
+
+	sub.noteChainBlockDownloadSuccess(chain, peer, &DownloadedBlock{
+		ID:       testBlockID(0, topShard, 78),
+		BlockBOC: make([]byte, 6<<10),
+	}, time.Second)
+
+	if got := sub.currentChainBlockPeer(chain, []*overlayPeer{peer}); got != peer {
+		t.Fatalf("expected small successful block to pin peer, got %v", got)
+	}
+	if peer.statsSnapshot().downloadSlowUntil.After(time.Now()) {
+		t.Fatal("small successful block should not mark peer slow")
+	}
+}
+
+func TestLargeSlowBlockDownloadDoesNotStayPinned(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(0, topShard, 77)
+	peer := &overlayPeer{id: "slow-large", addr: "slow-large", alive: true}
+
+	sub.noteChainBlockDownloadSuccess(chain, peer, &DownloadedBlock{
+		ID:       testBlockID(0, topShard, 78),
+		BlockBOC: make([]byte, 1<<20),
+	}, 30*time.Second)
+
+	if got := sub.currentChainBlockPeer(chain, []*overlayPeer{peer}); got != nil {
+		t.Fatalf("expected large slow block to clear pinned peer, got %v", got)
+	}
+}
+
+func TestChainBlockUnavailableDoesNotSlowUntilConfirmed(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
 	fast := &overlayPeer{id: "fast", addr: "fast", alive: true}
@@ -297,7 +330,30 @@ func TestChainBlockUnavailableDoesNotClearPinnedPeer(t *testing.T) {
 
 	got := sub.currentChainBlockPeer(chain, []*overlayPeer{fast})
 	if got != fast {
-		t.Fatalf("expected not-available response to keep sticky peer, got %v", got)
+		t.Fatalf("expected unconfirmed not-available response to keep sticky peer, got %v", got)
+	}
+	if fast.statsSnapshot().downloadSlowUntil.After(time.Now()) {
+		t.Fatal("unconfirmed not-available response should not slow peer")
+	}
+}
+
+func TestChainBlockUnavailableSlowsAfterAnotherPeerSucceeds(t *testing.T) {
+	sub := &overlaySubscription{log: discardLogger()}
+	chain := testBlockID(-1, topShard, 41)
+	stale := &overlayPeer{id: "stale", addr: "stale", alive: true}
+	fresh := &overlayPeer{id: "fresh", addr: "fresh", alive: true}
+
+	sub.noteChainBlockDownloadFailure(chain, stale, ErrBlockNotAvailable)
+	sub.noteChainBlockDownloadSuccess(chain, fresh, &DownloadedBlock{
+		ID:       testBlockID(-1, topShard, 42),
+		BlockBOC: make([]byte, 1<<20),
+	}, time.Millisecond)
+
+	if !stale.statsSnapshot().downloadSlowUntil.After(time.Now()) {
+		t.Fatal("confirmed not-available response should temporarily slow peer")
+	}
+	if got := sub.currentChainBlockPeer(chain, []*overlayPeer{stale, fresh}); got != fresh {
+		t.Fatalf("expected successful peer to become sticky, got %v", got)
 	}
 }
 

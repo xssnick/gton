@@ -113,6 +113,122 @@ func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 	}
 }
 
+func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
+	sub := &overlaySubscription{
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxPeersPerOverlay; i++ {
+		id := string(rune('a' + i))
+		sub.peers[id] = &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+	}
+
+	sub.mx.Lock()
+	got := sub.attachPeerEvictionCandidateLocked("new")
+	sub.mx.Unlock()
+	if got != "" {
+		t.Fatalf("healthy full pool eviction candidate = %q, want none", got)
+	}
+}
+
+func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
+	sub := &overlaySubscription{
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxPeersPerOverlay; i++ {
+		id := string(rune('a' + i))
+		peer := &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+		if i == 3 {
+			peer.unreliability = peerStopUnreliability + 1
+		}
+		sub.peers[id] = peer
+	}
+
+	sub.mx.Lock()
+	got := sub.attachPeerEvictionCandidateLocked("new")
+	sub.mx.Unlock()
+	if got != "d" {
+		t.Fatalf("bad peer eviction candidate = %q, want d", got)
+	}
+}
+
+func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
+	sub := &overlaySubscription{
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxPeersPerOverlay; i++ {
+		id := string(rune('a' + i))
+		peer := &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+		if i == 3 {
+			peer.downloadSlowUntil = time.Now().Add(time.Minute)
+		}
+		sub.peers[id] = peer
+	}
+
+	sub.mx.Lock()
+	got := sub.attachPeerEvictionCandidateLocked("new")
+	sub.mx.Unlock()
+	if got != "d" {
+		t.Fatalf("slow peer eviction candidate = %q, want d", got)
+	}
+}
+
+func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
+	sub := &overlaySubscription{
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxPeersPerOverlay; i++ {
+		id := string(rune('a' + i))
+		peer := &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+		if i == 3 {
+			peer.downloadSlowUntil = time.Now().Add(time.Minute)
+		}
+		sub.peers[id] = peer
+	}
+
+	if !sub.hasPeerReplacementCandidate("new") {
+		t.Fatal("expected slow peer to allow DHT refresh replacement")
+	}
+	if sub.peers["d"] == nil {
+		t.Fatal("DHT refresh should not evict before candidate is attached")
+	}
+}
+
 func TestPingTargetsRotateNeighbours(t *testing.T) {
 	sub := &overlaySubscription{
 		log:        discardLogger(),
@@ -215,6 +331,35 @@ func TestStartSeedFromDHTSetsCooldownAfterSearch(t *testing.T) {
 
 	if fake.findOverlayNodesCalls != 1 {
 		t.Fatalf("cooldown should block immediate DHT search, got %d calls", fake.findOverlayNodesCalls)
+	}
+}
+
+func TestStartSeedFromDHTRefreshesWhenPeerPoolIsFull(t *testing.T) {
+	node := newTestNode(t)
+	fake := &fakeDHTClient{}
+	node.dht = fake
+
+	sub := &overlaySubscription{
+		node:  node,
+		log:   discardLogger(),
+		peers: map[string]*overlayPeer{},
+	}
+	for i := 0; i < maxPeersPerOverlay; i++ {
+		id := string(rune('a' + i))
+		sub.peers[id] = &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+	}
+
+	sub.startSeedFromDHT(context.Background())
+	node.wg.Wait()
+
+	if fake.findOverlayNodesCalls != 1 {
+		t.Fatalf("expected DHT refresh search with full peer pool, got %d", fake.findOverlayNodesCalls)
 	}
 }
 

@@ -456,10 +456,18 @@ func (s *LiveStore) LookupBlockByLT(ctx context.Context, key storage.BlockHistor
 }
 
 func (s *LiveStore) LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
+	var best ton.BlockIDExt
+	found := false
 	for _, shard := range storage.AccountShardCandidates(workchain, account) {
-		if block, ok := s.cachedBlockCoveringLT(storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt); ok {
-			return block, nil
+		if block, ok := s.cachedBlockByLT(storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt); ok {
+			if !found || best.SeqNo > block.SeqNo {
+				best = block
+				found = true
+			}
 		}
+	}
+	if found {
+		return best, nil
 	}
 	if s.Store == nil {
 		return ton.BlockIDExt{}, storage.ErrNotFound
@@ -851,28 +859,7 @@ func (s *LiveStore) cachedBlockByLT(key storage.BlockHistoryKey, lt uint64) (ton
 	geIdx := sort.Search(len(entries), func(i int) bool {
 		return entries[i].endLT >= lt
 	})
-	if geIdx < len(entries) && entries[geIdx].startLT <= lt && lt <= entries[geIdx].endLT {
-		return *cloneBlockID(entries[geIdx].block), true
-	}
-
-	floorIdx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].endLT > lt
-	}) - 1
-	if floorIdx >= 0 {
-		return *cloneBlockID(entries[floorIdx].block), true
-	}
-	return ton.BlockIDExt{}, false
-}
-
-func (s *LiveStore) cachedBlockCoveringLT(key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	entries := s.ltIndex[liveHistoryKey{workchain: key.Workchain, shard: key.Shard}]
-	geIdx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].endLT >= lt
-	})
-	if geIdx < len(entries) && entries[geIdx].startLT < lt && lt < entries[geIdx].endLT {
+	if geIdx < len(entries) {
 		return *cloneBlockID(entries[geIdx].block), true
 	}
 	return ton.BlockIDExt{}, false
@@ -884,9 +871,9 @@ func (s *LiveStore) cachedBlockByUnixTime(key storage.BlockHistoryKey, utime uin
 
 	entries := s.unixIndex[liveHistoryKey{workchain: key.Workchain, shard: key.Shard}]
 	idx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].genUTime > utime
-	}) - 1
-	if idx < 0 {
+		return entries[i].genUTime >= utime
+	})
+	if idx >= len(entries) {
 		return ton.BlockIDExt{}, false
 	}
 	return *cloneBlockID(entries[idx].block), true

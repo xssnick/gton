@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
+	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
@@ -53,23 +54,171 @@ func TestPlanRebroadcastMatchesCppNodeRouting(t *testing.T) {
 	}
 }
 
-func TestCalcFECRebroadcastPartsMatchesCppNodeFormula(t *testing.T) {
-	tests := []struct {
-		payload int
-		want    uint32
-	}{
-		{payload: 1, want: 2},
-		{payload: 768, want: 4},
-		{payload: 769, want: 4},
-		{payload: 1536, want: 6},
-		{payload: 2000, want: 6},
+func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
+	node := newTestNode(t)
+	node.SetRebroadcastQuiet(true)
+
+	req := &rebroadcastRequest{
+		kind:  "tonNode.externalMessageBroadcast",
+		local: true,
+	}
+	if !node.allowRebroadcast(req) {
+		t.Fatalf("local rebroadcast must bypass quiet throttle")
+	}
+	if !node.allowRebroadcast(req) {
+		t.Fatalf("duplicate local rebroadcast must bypass quiet throttle")
 	}
 
-	for _, tt := range tests {
-		if got := calcFECRebroadcastParts(tt.payload, rebroadcastFECSymbolSize); got != tt.want {
-			t.Fatalf("payload=%d: got %d parts want %d", tt.payload, got, tt.want)
-		}
+	peerReq := &rebroadcastRequest{
+		kind: "tonNode.externalMessageBroadcast",
 	}
+	if !node.allowRebroadcast(peerReq) {
+		t.Fatalf("first peer rebroadcast should pass quiet throttle")
+	}
+	if node.allowRebroadcast(peerReq) {
+		t.Fatalf("peer rebroadcast should be throttled in quiet mode")
+	}
+}
+
+type testSyncLagProvider struct {
+	lag int64
+	ok  bool
+}
+
+func (p *testSyncLagProvider) SyncLagSeconds() (int64, bool) {
+	return p.lag, p.ok
+}
+
+func TestRebroadcastFECBackpressureLimitsExternalSlots(t *testing.T) {
+	node := newTestNode(t)
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+
+	req := rebroadcastRequest{
+		kind:     "tonNode.externalMessageBroadcast",
+		queuedAt: time.Now(),
+	}
+	releases := make([]func(), 0, externalFECBackpressureSlots)
+	for i := 0; i < externalFECBackpressureSlots; i++ {
+		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: string(rune('a' + i))}, req)
+		if !ok {
+			t.Fatalf("acquire external FEC slot %d", i)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if release, ok := node.waitRebroadcastFECBackpressure(ctx, &overlayPeer{id: "extra"}, req); ok {
+		release()
+		t.Fatal("expected extra external FEC sender to wait while all slots are busy")
+	}
+
+	releases[0]()
+	releases = releases[1:]
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: "extra"}, req)
+	if !ok {
+		t.Fatal("expected external FEC sender to acquire a released slot")
+	}
+	releases = append(releases, release)
+}
+
+func TestRebroadcastFECBackpressureLimitsOneStreamPerPeer(t *testing.T) {
+	node := newTestNode(t)
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	peer := &overlayPeer{id: "peer"}
+	req := rebroadcastRequest{
+		kind:     "tonNode.externalMessageBroadcast",
+		queuedAt: time.Now(),
+	}
+
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), peer, req)
+	if !ok {
+		t.Fatal("expected first peer FEC sender to acquire slot")
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if secondRelease, ok := node.waitRebroadcastFECBackpressure(ctx, peer, req); ok {
+		secondRelease()
+		t.Fatal("expected second FEC sender for the same peer to wait")
+	}
+}
+
+func TestRebroadcastFECBackpressureUsesSeparateBlockAndExternalSlots(t *testing.T) {
+	node := newTestNode(t)
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	blockReq := rebroadcastRequest{
+		kind:     "tonNode.blockBroadcastCompressedV2",
+		queuedAt: time.Now(),
+	}
+	externalReq := rebroadcastRequest{
+		kind:     "tonNode.externalMessageBroadcast",
+		queuedAt: time.Now(),
+	}
+
+	var blockReleases []func()
+	for i := 0; i < blockFECBackpressureSlots; i++ {
+		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: string(rune('b' + i))}, blockReq)
+		if !ok {
+			t.Fatalf("acquire block FEC slot %d", i)
+		}
+		blockReleases = append(blockReleases, release)
+	}
+	defer func() {
+		for _, release := range blockReleases {
+			release()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if release, ok := node.waitRebroadcastFECBackpressure(ctx, &overlayPeer{id: "block-extra"}, blockReq); ok {
+		release()
+		t.Fatal("expected block FEC sender to wait while block slots are busy")
+	}
+
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: "external"}, externalReq)
+	if !ok {
+		t.Fatal("expected external FEC sender to use independent slots")
+	}
+	release()
+}
+
+func TestRebroadcastFECBackpressurePassesWhenLagClears(t *testing.T) {
+	node := newTestNode(t)
+	lag := &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	node.syncLag = lag
+	req := rebroadcastRequest{
+		kind:     "tonNode.blockBroadcastCompressedV2",
+		queuedAt: time.Now(),
+	}
+
+	var releases []func()
+	for i := 0; i < blockFECBackpressureSlots; i++ {
+		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: string(rune('c' + i))}, req)
+		if !ok {
+			t.Fatalf("acquire block FEC slot %d", i)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	lag.lag = rebroadcastFECLagThreshold
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: "after-lag"}, req)
+	if !ok {
+		t.Fatal("expected FEC sender to bypass slots after lag clears")
+	}
+	release()
 }
 
 func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
@@ -107,7 +256,7 @@ func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
 	}
 }
 
-func TestRebroadcastFECToPeerSetUsesCppNodeBurstCount(t *testing.T) {
+func TestRebroadcastFECToPeerUsesTonutilsBroadcaster(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -115,21 +264,22 @@ func TestRebroadcastFECToPeerSetUsesCppNodeBurstCount(t *testing.T) {
 
 	peer := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x11}, 32)}
 	payload := bytes.Repeat([]byte{0xAB}, 2000)
-	req := rebroadcastRequest{
-		kind:    "tonNode.blockBroadcast",
-		payload: payload,
+	sender, err := overlay.NewBroadcastFECSender(
+		priv,
+		overlay.CertificateEmpty{},
+		payload,
+		overlay.BroadcastFlagAnySender,
+		overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
+		overlay.WithBroadcastFECDate(100),
+	)
+	if err != nil {
+		t.Fatalf("create fec sender: %v", err)
+	}
+	if err = runFECBroadcasterToPeer(context.Background(), sender, peer, time.Second); err != nil {
+		t.Fatalf("run fec broadcaster: %v", err)
 	}
 
-	_, _, _ = rebroadcastFECToPeers(
-		context.Background(),
-		discardLogger(),
-		priv,
-		[]overlay.BroadcastPeer{peer},
-		req,
-		rebroadcastPlan{mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender},
-	)
-
-	want := int(calcFECRebroadcastParts(len(payload), rebroadcastFECSymbolSize))
+	want := int(sender.TotalParts())
 	if len(peer.sent) != want {
 		t.Fatalf("unexpected sent part count: got %d want %d", len(peer.sent), want)
 	}
@@ -138,6 +288,42 @@ func TestRebroadcastFECToPeerSetUsesCppNodeBurstCount(t *testing.T) {
 		if _, ok := msg.(*overlay.BroadcastFEC); !ok {
 			t.Fatalf("message %d has unexpected type %T", i, msg)
 		}
+	}
+}
+
+func TestTonutilsFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte{0xAB}, 2000)
+	sender, err := overlay.NewBroadcastFECSender(
+		priv,
+		overlay.CertificateEmpty{},
+		payload,
+		overlay.BroadcastFlagAnySender,
+		overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
+		overlay.WithBroadcastFECDate(100),
+	)
+	if err != nil {
+		t.Fatalf("create fec sender: %v", err)
+	}
+
+	peerA := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x11}, 32)}
+	peerB := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x22}, 32)}
+	if err = runFECBroadcasterToPeer(context.Background(), sender, peerA, time.Second); err != nil {
+		t.Fatalf("run peer A fec broadcaster: %v", err)
+	}
+	if err = runFECBroadcasterToPeer(context.Background(), sender, peerB, time.Second); err != nil {
+		t.Fatalf("run peer B fec broadcaster: %v", err)
+	}
+
+	if len(peerA.sent) != int(sender.TotalParts()) || len(peerB.sent) != int(sender.TotalParts()) {
+		t.Fatalf("expected both peers to receive all FEC parts, got peerA=%d peerB=%d", len(peerA.sent), len(peerB.sent))
+	}
+	if peerA.sent[0] != peerB.sent[0] {
+		t.Fatal("expected peers to reuse the same cached FEC part")
 	}
 }
 
@@ -176,6 +362,154 @@ func TestEnqueueRebroadcastSkipsSourcePeer(t *testing.T) {
 	}
 }
 
+func TestEnqueueInboundBlockRebroadcastUsesCppNodeFanout(t *testing.T) {
+	node := newTestNode(t)
+	peers := map[string]*overlayPeer{
+		"source": testRebroadcastQueuePeer("source"),
+	}
+	for i := 0; i < 8; i++ {
+		id := string(rune('a' + i))
+		peers[id] = testRebroadcastQueuePeer(id)
+	}
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: peers,
+	}
+
+	req := rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.blockBroadcastCompressedV2",
+		payload:      []byte{0x01},
+		sourcePeerID: "source",
+	}
+	if !sub.enqueueRebroadcast(req) {
+		t.Fatal("expected block rebroadcast enqueue")
+	}
+
+	if _, ok := peers["source"].rebroadcastQueue.TryPop(); ok {
+		t.Fatal("source peer should not receive its own block rebroadcast")
+	}
+	if got := countQueuedRebroadcasts(peers, false); got != rebroadcastFanout {
+		t.Fatalf("queued block rebroadcasts = %d, want %d", got, rebroadcastFanout)
+	}
+}
+
+func TestEnqueueInboundBlockRebroadcastSharesFECSource(t *testing.T) {
+	node := newTestNode(t)
+	peers := map[string]*overlayPeer{
+		"source": testRebroadcastQueuePeer("source"),
+	}
+	for i := 0; i < 8; i++ {
+		id := string(rune('a' + i))
+		peers[id] = testRebroadcastQueuePeer(id)
+	}
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: peers,
+	}
+
+	req := rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.blockBroadcastCompressedV2",
+		payload:      bytes.Repeat([]byte{0x01}, 2000),
+		sourcePeerID: "source",
+	}
+	if !sub.enqueueRebroadcast(req) {
+		t.Fatal("expected block rebroadcast enqueue")
+	}
+
+	var shared *overlay.BroadcastFECSender
+	queued := 0
+	for id, peer := range peers {
+		if id == "source" {
+			continue
+		}
+		got, ok := peer.rebroadcastQueue.TryPop()
+		if !ok {
+			continue
+		}
+		queued++
+		if len(got.payload) != 0 {
+			t.Fatal("expected queued FEC rebroadcast to drop payload slice")
+		}
+		if got.fec == nil {
+			t.Fatal("expected queued FEC rebroadcast to carry shared source")
+		}
+		if shared == nil {
+			shared = got.fec
+		} else if shared != got.fec {
+			t.Fatal("expected all queued peers to share one FEC source")
+		}
+	}
+	if queued != rebroadcastFanout {
+		t.Fatalf("queued block rebroadcasts = %d, want %d", queued, rebroadcastFanout)
+	}
+}
+
+func TestEnqueueRebroadcastPrefersNeighbours(t *testing.T) {
+	node := newTestNode(t)
+	peers := map[string]*overlayPeer{}
+	for i := 0; i < 8; i++ {
+		id := string(rune('a' + i))
+		peers[id] = testRebroadcastQueuePeer(id)
+	}
+	sub := &overlaySubscription{
+		node:       node,
+		spec:       overlaySpec{Name: "basechain"},
+		log:        discardLogger(),
+		peers:      peers,
+		neighbours: []string{"g", "h"},
+	}
+
+	req := rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x01},
+	}
+	if !sub.enqueueRebroadcast(req) {
+		t.Fatal("expected rebroadcast enqueue")
+	}
+
+	for _, id := range sub.neighbours {
+		if _, ok := peers[id].rebroadcastQueue.TryPop(); !ok {
+			t.Fatalf("expected neighbour %q to receive rebroadcast before non-neighbours", id)
+		}
+	}
+}
+
+func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
+	node := newTestNode(t)
+	peers := map[string]*overlayPeer{}
+	for i := 0; i < 8; i++ {
+		id := string(rune('a' + i))
+		peers[id] = testRebroadcastQueuePeer(id)
+	}
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: peers,
+	}
+
+	req := rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}
+	if !sub.enqueueRebroadcast(req) {
+		t.Fatal("expected local external rebroadcast enqueue")
+	}
+
+	if got := countQueuedRebroadcasts(peers, true); got != externalRebroadcastFanout {
+		t.Fatalf("queued local external rebroadcasts = %d, want %d", got, externalRebroadcastFanout)
+	}
+}
+
 func TestEnqueueLocalRebroadcastRecordsDropWhenPeerQueuesAreFull(t *testing.T) {
 	node := newTestNode(t)
 	peer := testRebroadcastQueuePeer("peer")
@@ -209,6 +543,67 @@ func TestEnqueueLocalRebroadcastRecordsDropWhenPeerQueuesAreFull(t *testing.T) {
 	}
 }
 
+func TestPeerRebroadcastWorkerDropsStaleQueuedRequest(t *testing.T) {
+	node := newTestNode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	node.runCtx = ctx
+
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node: node,
+		log:  discardLogger(),
+	}
+	workers := sub.peerRebroadcastWorkerCount()
+
+	for i := 0; i < workers; i++ {
+		if !peer.localRebroadcastQueue.Push(rebroadcastRequest{
+			kind:     "tonNode.externalMessageBroadcast",
+			payload:  []byte{byte(i + 1)},
+			local:    true,
+			queuedAt: time.Now().Add(-rebroadcastQueueMaxAge - time.Second),
+		}) {
+			t.Fatalf("enqueue stale local rebroadcast %d", i)
+		}
+	}
+
+	sub.startPeerRebroadcastWorker(peer)
+
+	deadline := time.After(time.Second)
+	for node.localRebroadcastDropped.Load() < uint64(workers) {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("stale rebroadcast dropped=%d want %d", node.localRebroadcastDropped.Load(), workers)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		node.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("rebroadcast worker did not stop")
+	}
+}
+
+func TestPeerRebroadcastWorkerCountByOverlay(t *testing.T) {
+	master := &overlaySubscription{spec: overlaySpec{Workchain: -1, Shard: topShard}}
+	if got := master.peerRebroadcastWorkerCount(); got != masterPeerRebroadcastWorkers {
+		t.Fatalf("masterchain workers = %d, want %d", got, masterPeerRebroadcastWorkers)
+	}
+
+	base := &overlaySubscription{spec: overlaySpec{Workchain: 0, Shard: topShard}}
+	if got := base.peerRebroadcastWorkerCount(); got != basePeerRebroadcastWorkers {
+		t.Fatalf("basechain workers = %d, want %d", got, basePeerRebroadcastWorkers)
+	}
+}
+
 func mustHashSimpleBroadcastID(t *testing.T, payload []byte, flags int32) []byte {
 	t.Helper()
 
@@ -221,4 +616,23 @@ func mustHashSimpleBroadcastID(t *testing.T, payload []byte, flags int32) []byte
 		t.Fatalf("hash broadcast id: %v", err)
 	}
 	return hash
+}
+
+func countQueuedRebroadcasts(peers map[string]*overlayPeer, local bool) int {
+	count := 0
+	for _, peer := range peers {
+		var queue *boundedQueue[rebroadcastRequest]
+		if local {
+			queue = peer.localRebroadcastQueue
+		} else {
+			queue = peer.rebroadcastQueue
+		}
+		for {
+			if _, ok := queue.TryPop(); !ok {
+				break
+			}
+			count++
+		}
+	}
+	return count
 }

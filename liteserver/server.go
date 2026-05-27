@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
@@ -98,6 +99,10 @@ type Server struct {
 	now           func() time.Time
 	tvm           *tvm.TVM
 
+	sendMessageCacheInitMu sync.Mutex
+	sendMessageCache       *sendMessageCache
+	externalMessageLimiter *extmsg.AddressLimiter
+
 	server *liteclient.Server
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -135,18 +140,20 @@ func New(opts Options) (*Server, error) {
 	}
 
 	return &Server{
-		log:             log,
-		store:           opts.Store,
-		messageSender:   opts.MessageSender,
-		queryObserver:   opts.QueryObserver,
-		privateKey:      opts.PrivateKey,
-		listenAddr:      opts.ListenAddr,
-		zeroState:       cloneZeroState(opts.ZeroState),
-		version:         version,
-		capabilities:    capabilities,
-		now:             time.Now,
-		tvm:             tvm.NewTVM(),
-		blockProofBases: make(map[string]*blockProofBase),
+		log:                    log,
+		store:                  opts.Store,
+		messageSender:          opts.MessageSender,
+		queryObserver:          opts.QueryObserver,
+		privateKey:             opts.PrivateKey,
+		listenAddr:             opts.ListenAddr,
+		zeroState:              cloneZeroState(opts.ZeroState),
+		version:                version,
+		capabilities:           capabilities,
+		now:                    time.Now,
+		tvm:                    tvm.NewTVM(),
+		sendMessageCache:       newSendMessageCache(),
+		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
+		blockProofBases:        make(map[string]*blockProofBase),
 	}, nil
 }
 

@@ -68,14 +68,15 @@ func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, ad
 		return nil, ton.BlockIDExt{}, err
 	}
 
-	stateProof, err := fragments.shardHashesProof(addr.Workchain())
+	leafShard := accountLeafShard(addr)
+	stateProof, err := fragments.shardHashesProof(addr.Workchain(), leafShard, false)
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
 	proof := []*cell.Cell{fragments.blockStateRootProof, stateProof}
 
-	shardBlock, _, err := shardInfoFromHashes(extra.ShardHashes, addr.Workchain(), accountLeafShard(addr), false)
+	shardBlock, _, err := shardInfoFromHashes(extra.ShardHashes, addr.Workchain(), leafShard, false)
 	if err != nil {
 		return proof, ton.BlockIDExt{}, err
 	}
@@ -114,13 +115,20 @@ func (s *Server) blockProof(ctx context.Context, block ton.BlockIDExt) (*cell.Ce
 }
 
 func createUsageProof(root *cell.Cell, visit func(*cell.Cell) error) (*cell.Cell, error) {
-	builder := cell.NewMerkleProofBuilder(root)
+	builder := newLiteServerProofBuilder(root)
 	if visit != nil {
 		if err := visit(builder.Root()); err != nil {
 			return nil, err
 		}
 	}
 	return builder.CreateProof()
+}
+
+func newLiteServerProofBuilder(root *cell.Cell) *cell.MerkleProofBuilder {
+	if root != nil {
+		root = root.Virtualize(0)
+	}
+	return cell.NewMerkleProofBuilder(root)
 }
 
 func (s *Server) loadBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
@@ -235,6 +243,14 @@ func accountStateProofAndCell(stateRoot *cell.Cell, accountID []byte) (*cell.Cel
 	var accountCell *cell.Cell
 
 	proof, err := createUsageProof(stateRoot, func(root *cell.Cell) error {
+		loader, err := root.BeginParse()
+		if err != nil {
+			return err
+		}
+		if _, err = visitShardStateHeader(loader); err != nil {
+			return err
+		}
+
 		dictRoot, err := accountsDictRoot(root)
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
@@ -281,7 +297,7 @@ func accountPrunedProof(account *cell.Cell) (*cell.Cell, error) {
 	}
 
 	root := source.BaseCell().WithTrace(nil)
-	builder := cell.NewMerkleProofBuilder(root)
+	builder := newLiteServerProofBuilder(root)
 	loader, err := builder.Root().BeginParse()
 	if err != nil {
 		return nil, err
@@ -451,9 +467,86 @@ func blockHeaderProof(root *cell.Cell, id ton.BlockIDExt, mode uint32) (*cell.Ce
 }
 
 func blockStateRootProof(root *cell.Cell) (*cell.Cell, error) {
-	return createUsageProof(root, func(root *cell.Cell) error {
-		return visitBlockStateRoot(root)
-	})
+	if root != nil {
+		root = root.Virtualize(0)
+	}
+
+	rootLoader, err := visitBlockRoot(root)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := rootLoader.PeekRefCellAt(0)
+	if err != nil {
+		return nil, err
+	}
+	info, err = info.Prewarm()
+	if err != nil {
+		return nil, err
+	}
+	valueFlow, err := rootLoader.PeekRefCellAt(1)
+	if err != nil {
+		return nil, err
+	}
+	update, err := rootLoader.PeekRefCellAt(2)
+	if err != nil {
+		return nil, fmt.Errorf("block has no state update: %w", err)
+	}
+	extra, err := rootLoader.PeekRefCellAt(3)
+	if err != nil {
+		return nil, err
+	}
+
+	proofUpdate, err := blockStateRootProofUpdate(update)
+	if err != nil {
+		return nil, err
+	}
+	valueFlowProof, err := cell.CreatePrunedBranch(valueFlow, 1, 0)
+	if err != nil {
+		return nil, err
+	}
+	extraProof, err := cell.CreatePrunedBranch(extra, 1, 0)
+	if err != nil {
+		return nil, err
+	}
+	body, err := root.RebuildWithRefs([]*cell.Cell{info, valueFlowProof, proofUpdate, extraProof})
+	if err != nil {
+		return nil, err
+	}
+	return cell.CreateMerkleProof(body)
+}
+
+func blockStateRootProofUpdate(update *cell.Cell) (*cell.Cell, error) {
+	loader, err := update.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+	if loader.BaseCell().GetType() != cell.MerkleUpdateCellType {
+		return nil, fmt.Errorf("invalid Merkle update in block")
+	}
+	if loader.RefsNum() < 2 {
+		return nil, fmt.Errorf("invalid Merkle update in block")
+	}
+
+	from, err := loader.PeekRefCellAt(0)
+	if err != nil {
+		return nil, err
+	}
+	to, err := loader.PeekRefCellAt(1)
+	if err != nil {
+		return nil, err
+	}
+
+	fromProof, err := cell.CreatePrunedBranch(from, 2, 1)
+	if err != nil {
+		return nil, err
+	}
+	toProof, err := cell.CreatePrunedBranch(to, 2, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	return cell.CreateMerkleUpdate(fromProof, toProof)
 }
 
 func allShardsInfoProof(root *cell.Cell) (*cell.Cell, error) {
@@ -469,38 +562,175 @@ func allShardsInfoProof(root *cell.Cell) (*cell.Cell, error) {
 	})
 }
 
-func shardHashesProof(stateRoot *cell.Cell, workchain int32) (*cell.Cell, error) {
+func shardHashesProof(stateRoot *cell.Cell, workchain int32, shard int64, exact bool) (*cell.Cell, error) {
 	return createUsageProof(stateRoot, func(root *cell.Cell) error {
-		rootLoader, err := root.BeginParse()
-		if err != nil {
-			return err
-		}
-		custom, err := rootLoader.PeekRefCellAt(3)
+		loader, err := root.BeginParse()
 		if err != nil {
 			return err
 		}
 
-		loader, err := custom.BeginParse()
+		state, err := visitShardStateHeader(loader)
 		if err != nil {
 			return err
 		}
-		if _, err = loader.LoadUInt(16); err != nil {
+		if state.McStateExtra == nil {
+			return fmt.Errorf("state is missing mc_state_extra")
+		}
+
+		extraLoader, err := state.McStateExtra.BeginParse()
+		if err != nil {
 			return err
 		}
 
-		shards, err := loader.LoadDict(32)
-		if err != nil {
+		var extra tlb.McStateExtra
+		if err = tlb.LoadFromCell(&extra, extraLoader); err != nil {
 			return err
 		}
-		value, err := shards.LoadValue(cell.BeginCell().MustStoreInt(int64(workchain), 32).EndCell())
+		if extra.Info != nil {
+			if err = visitMcStateExtraInfo(extra.Info); err != nil {
+				return err
+			}
+		}
+		if extra.ShardHashes == nil {
+			return fmt.Errorf("state is missing shard hashes")
+		}
+
+		value, err := extra.ShardHashes.LoadValue(cell.BeginCell().MustStoreInt(int64(workchain), 32).EndCell())
 		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		return visitSliceRefsRecursive(value)
+
+		root, err = value.LoadRefCell()
+		if err != nil {
+			return err
+		}
+
+		trueShard, leaf, err := findShardLeaf(root, uint64(shard), exact)
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		_, err = blockIDFromShardLeaf(workchain, trueShard, leaf)
+		return err
 	})
+}
+
+func visitShardStateHeader(loader *cell.Slice) (tlb.ShardStateUnsplit, error) {
+	var state tlb.ShardStateUnsplit
+	if err := tlb.LoadFromCell(&state, loader); err != nil {
+		return tlb.ShardStateUnsplit{}, err
+	}
+	if err := visitShardStateStats(state.Stats); err != nil {
+		return tlb.ShardStateUnsplit{}, err
+	}
+	return state, nil
+}
+
+func visitShardStateStats(stats *cell.Cell) error {
+	if stats == nil {
+		return fmt.Errorf("state is missing shard state stats")
+	}
+
+	loader, err := stats.BeginParse()
+	if err != nil {
+		return err
+	}
+	if _, err = loader.LoadUInt(64); err != nil {
+		return err
+	}
+	if _, err = loader.LoadUInt(64); err != nil {
+		return err
+	}
+	if err = skipCurrencyCollection(loader); err != nil {
+		return err
+	}
+	if err = skipCurrencyCollection(loader); err != nil {
+		return err
+	}
+	if _, err = loader.LoadDict(256); err != nil {
+		return err
+	}
+
+	hasMasterRef, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if hasMasterRef {
+		var masterRef tlb.ExtBlkRef
+		if err = tlb.LoadFromCell(&masterRef, loader); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func visitMcStateExtraInfo(info *cell.Cell) error {
+	loader, err := info.BeginParse()
+	if err != nil {
+		return err
+	}
+	flags, err := loader.LoadUInt(16)
+	if err != nil {
+		return err
+	}
+	if _, err = loader.LoadUInt(32); err != nil {
+		return err
+	}
+	if _, err = loader.LoadUInt(32); err != nil {
+		return err
+	}
+	if _, err = loader.LoadBoolBit(); err != nil {
+		return err
+	}
+
+	prevBlocks := &tlb.OldMcBlocksInfoAugDict{}
+	if err = prevBlocks.LoadFromCell(loader); err != nil {
+		return err
+	}
+	if _, err = loader.LoadBoolBit(); err != nil {
+		return err
+	}
+	hasLastKeyBlock, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if hasLastKeyBlock {
+		var lastKey tlb.ExtBlkRef
+		if err = tlb.LoadFromCell(&lastKey, loader); err != nil {
+			return err
+		}
+	}
+	if flags&1 != 0 {
+		return visitBlockCreateStats(loader)
+	}
+	return nil
+}
+
+func visitBlockCreateStats(loader *cell.Slice) error {
+	magic, err := loader.LoadUInt(8)
+	if err != nil {
+		return err
+	}
+	switch magic {
+	case 0x17:
+		_, err = loader.LoadDict(256)
+		return err
+	case 0x34:
+		_, err = loader.LoadAugDict(256, cell.ReadOnlyAugmentation{SkipExtraFn: skipUint32Boundary}, false)
+		return err
+	default:
+		return fmt.Errorf("invalid block_create_stats magic %x", magic)
+	}
+}
+
+func skipUint32Boundary(loader *cell.Slice) error {
+	_, err := loader.LoadUInt(32)
+	return err
 }
 
 func visitBlockHeader(root *cell.Cell, id ton.BlockIDExt, mode uint32) error {
@@ -535,22 +765,27 @@ func visitBlockHeader(root *cell.Cell, id ton.BlockIDExt, mode uint32) error {
 			return err
 		}
 	}
-	if mode&16 != 0 && id.Workchain == masterchainID && mode&(32|64) != 0 {
+	if mode&16 != 0 {
 		extra, err := loadBlockExtra(root)
 		if err != nil {
 			return err
 		}
-		if extra.Custom == nil {
-			return fmt.Errorf("masterchain block extra is missing custom data")
-		}
-		if mode&32 != 0 && extra.Custom.ShardHashes != nil {
-			if err = visitCellRecursive(extra.Custom.ShardHashes.AsCell()); err != nil {
-				return err
+		if id.Workchain == masterchainID {
+			if extra.Custom == nil {
+				return fmt.Errorf("masterchain block extra is missing custom data")
 			}
-		}
-		if mode&64 != 0 && extra.Custom.Details.PrevBlockSignatures != nil {
-			if err = visitCellRecursive(extra.Custom.Details.PrevBlockSignatures.AsCell()); err != nil {
-				return err
+			if mode&32 != 0 {
+				if extra.Custom.ShardHashes == nil {
+					return fmt.Errorf("masterchain block extra is missing shard hashes")
+				}
+				if err = visitCellRecursive(extra.Custom.ShardHashes.AsCell()); err != nil {
+					return err
+				}
+			}
+			if mode&64 != 0 && extra.Custom.Details.PrevBlockSignatures != nil {
+				if err = visitCellRecursive(extra.Custom.Details.PrevBlockSignatures.AsCell()); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -609,6 +844,13 @@ func visitMerkleUpdate(update *cell.Cell) error {
 	}
 	if loader.RefsNum() < 2 {
 		return fmt.Errorf("invalid Merkle update in block")
+	}
+	to, err := loader.PeekRefCellAt(1)
+	if err != nil {
+		return err
+	}
+	if err = visitCell(to); err != nil {
+		return err
 	}
 	return nil
 }
@@ -731,17 +973,19 @@ func configProof(stateRoot *cell.Cell, mode uint32, all bool, params []int32) (*
 		if err != nil {
 			return err
 		}
+		if err = visitMcStateExtraInfo(prefix.Info); err != nil {
+			return err
+		}
 		if err = visitConfigDict(prefix.Config.Config, mode, all, params); err != nil {
 			return err
 		}
 
-		useConfigInfo := mode&configModeNeedPrevBlocks != 0
-		if useConfigInfo && mode&configModeNeedShardHashes != 0 {
+		if mode&configModeNeedShardHashes != 0 {
 			if err = visitMcStateShardHashes(root); err != nil {
 				return err
 			}
 		}
-		if useConfigInfo {
+		if mode&configModeNeedPrevBlocks != 0 {
 			seqno, err := shardStateSeqno(root)
 			if err != nil {
 				return err
@@ -754,7 +998,7 @@ func configProof(stateRoot *cell.Cell, mode uint32, all bool, params []int32) (*
 				return err
 			}
 		}
-		if useConfigInfo && mode&configModeNeedAccountsRoot != 0 {
+		if mode&configModeNeedAccountsRoot != 0 {
 			rootLoader, err := root.BeginParse()
 			if err != nil {
 				return err
@@ -767,7 +1011,7 @@ func configProof(stateRoot *cell.Cell, mode uint32, all bool, params []int32) (*
 				return err
 			}
 		}
-		if useConfigInfo && mode&configModeNeedLibraries != 0 {
+		if mode&configModeNeedLibraries != 0 {
 			if err = visitStateLibraries(root); err != nil {
 				return err
 			}
@@ -872,7 +1116,11 @@ func loadKeyBlockConfigParams(root *cell.Cell) (*cell.Dictionary, error) {
 	if err = skipShardFeesAugDict(customLoader); err != nil {
 		return nil, err
 	}
-	if _, err = customLoader.LoadRefCell(); err != nil {
+	details, err := customLoader.LoadRefCell()
+	if err != nil {
+		return nil, err
+	}
+	if err = visitMcBlockExtraDetails(details); err != nil {
 		return nil, err
 	}
 	if !keyBlock {
@@ -887,6 +1135,21 @@ func loadKeyBlockConfigParams(root *cell.Cell) (*cell.Dictionary, error) {
 		return nil, fmt.Errorf("key block config params dictionary is missing")
 	}
 	return config.Config.Params, nil
+}
+
+func visitMcBlockExtraDetails(details *cell.Cell) error {
+	loader, err := details.BeginParse()
+	if err != nil {
+		return err
+	}
+	if _, err = loader.LoadDict(16); err != nil {
+		return err
+	}
+	if _, err = loadMaybeRefCell(loader); err != nil {
+		return err
+	}
+	_, err = loadMaybeRefCell(loader)
+	return err
 }
 
 func skipShardFeesAugDict(loader *cell.Slice) error {
@@ -1083,10 +1346,14 @@ func visitMcStateShardHashes(stateRoot *cell.Cell) error {
 	if _, err = loader.LoadUInt(16); err != nil {
 		return err
 	}
-	if _, err = loader.LoadDict(32); err != nil {
+	shards, err := loader.LoadDict(32)
+	if err != nil {
 		return err
 	}
-	return nil
+	if shards == nil {
+		return nil
+	}
+	return visitCellRecursive(shards.AsCell())
 }
 
 func visitMcStatePrevBlocks(info *cell.Cell, seqno uint32, globalVersion uint32) error {
@@ -1189,10 +1456,12 @@ func visitLibraries(stateRoot *cell.Cell, hashes [][]byte, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	stats, err := stateLoader.PeekRefCellAt(2)
+
+	state, err := visitShardStateHeader(stateLoader)
 	if err != nil {
 		return err
 	}
+	stats := state.Stats
 
 	loader, err := stats.BeginParse()
 	if err != nil {
@@ -1289,13 +1558,17 @@ func loadMcStateExtraPrefix(stateRoot *cell.Cell) (mcStateExtraPrefix, error) {
 	if err != nil {
 		return mcStateExtraPrefix{}, err
 	}
-	custom, err := stateLoader.PeekRefCellAt(3)
+
+	state, err := visitShardStateHeader(stateLoader)
 	if err != nil {
 		return mcStateExtraPrefix{}, err
 	}
+	if state.McStateExtra == nil {
+		return mcStateExtraPrefix{}, fmt.Errorf("state is missing mc_state_extra")
+	}
 
 	var prefix mcStateExtraPrefix
-	loader, err := custom.BeginParse()
+	loader, err := state.McStateExtra.BeginParse()
 	if err != nil {
 		return mcStateExtraPrefix{}, err
 	}
@@ -1318,11 +1591,12 @@ func outMsgQueueSizeProof(stateRoot *cell.Cell) (*cell.Cell, error) {
 }
 
 func loadOutMsgQueueSize(queue *cell.Cell) (uint64, error) {
-	var info outMsgQueueInfo
 	loader, err := queue.BeginParse()
 	if err != nil {
 		return 0, err
 	}
+
+	var info tlb.OutMsgQueueInfo
 	if err := tlb.LoadFromCell(&info, loader); err != nil {
 		return 0, err
 	}
@@ -1333,28 +1607,6 @@ func loadOutMsgQueueSize(queue *cell.Cell) (uint64, error) {
 		return 0, fmt.Errorf("no out_msg_queue_size in shard state")
 	}
 	return *info.Extra.OutQueueSize, nil
-}
-
-type outMsgQueueInfo struct {
-	OutQueue uint64AugDict     `tlb:"."`
-	ProcInfo *cell.Dictionary  `tlb:"dict 96"`
-	Extra    *outMsgQueueExtra `tlb:"maybe ."`
-}
-
-type outMsgQueueExtra struct {
-	_            tlb.Magic     `tlb:"$0"`
-	Dispatch     uint64AugDict `tlb:"."`
-	OutQueueSize *uint64       `tlb:"maybe ## 48"`
-}
-
-type uint64AugDict struct{}
-
-func (d *uint64AugDict) LoadFromCell(loader *cell.Slice) error {
-	if _, err := loadMaybeRefCell(loader); err != nil {
-		return err
-	}
-	_, err := loader.LoadUInt(64)
-	return err
 }
 
 func loadMaybeRefCell(loader *cell.Slice) (bool, error) {
@@ -1384,7 +1636,7 @@ func skipOldMcBlocksInfoAugDict(loader *cell.Slice) (bool, error) {
 }
 
 func blockTransactionProof(root *cell.Cell, account []byte, lt uint64) (*cell.Cell, *cell.Cell, error) {
-	builder := cell.NewMerkleProofBuilder(root)
+	builder := newLiteServerProofBuilder(root)
 	tx, err := findBlockTransaction(builder.Root(), account, lt)
 	if errors.Is(err, storage.ErrNotFound) {
 		tx = nil

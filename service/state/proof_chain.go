@@ -469,13 +469,6 @@ func (s *Syncer) saveKeyBlockProofDownload(block ton.BlockIDExt, proof ProofDown
 	if err := writer.SaveBlockProof(storage.ServedProofKeyBlock, block, proof.Data, nil); err != nil {
 		return fmt.Errorf("store key block proof %s: %w", storage.FormatBlockRef(block), err)
 	}
-	link, err := blockproof.LinkBOC(block, proof.Data)
-	if err != nil {
-		return fmt.Errorf("derive key block proof link %s: %w", storage.FormatBlockRef(block), err)
-	}
-	if err = writer.SaveBlockProof(storage.ServedProofKeyBlockLink, block, link, nil); err != nil {
-		return fmt.Errorf("store key block proof link %s: %w", storage.FormatBlockRef(block), err)
-	}
 	return nil
 }
 

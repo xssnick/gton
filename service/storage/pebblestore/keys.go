@@ -3,7 +3,6 @@ package pebblestore
 import (
 	"bytes"
 	"encoding/binary"
-	"math"
 
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
@@ -34,6 +33,7 @@ var (
 	hotPrefixArchivePackage        = []byte{0x1A}
 	hotPrefixStateSerializerActive = []byte{0x1B}
 	hotPrefixKeyBlockSeq           = []byte{0x1C}
+	hotPrefixArchiveBackfill       = []byte{0x1D}
 	hotPrefixCellGenerationCurrent = []byte{0x1E}
 )
 
@@ -77,12 +77,6 @@ func hotKeyBlockLTIndex(meta *storage.BlockMeta) []byte {
 	return binary.BigEndian.AppendUint32(buf, meta.ID.SeqNo)
 }
 
-func hotKeyBlockLTSeek(key storage.BlockHistoryKey, lt uint64) []byte {
-	buf := hotKeyBlockLTPrefix(key)
-	buf = binary.BigEndian.AppendUint64(buf, lt)
-	return binary.BigEndian.AppendUint32(buf, math.MaxUint32)
-}
-
 func hotKeyBlockLTSeekGE(key storage.BlockHistoryKey, lt uint64) []byte {
 	buf := hotKeyBlockLTPrefix(key)
 	buf = binary.BigEndian.AppendUint64(buf, lt)
@@ -99,10 +93,10 @@ func hotKeyBlockUTimeIndex(meta *storage.BlockMeta) []byte {
 	return binary.BigEndian.AppendUint32(buf, meta.ID.SeqNo)
 }
 
-func hotKeyBlockUTimeSeek(key storage.BlockHistoryKey, utime uint32) []byte {
+func hotKeyBlockUTimeSeekGE(key storage.BlockHistoryKey, utime uint32) []byte {
 	buf := hotKeyBlockUTimePrefix(key)
 	buf = binary.BigEndian.AppendUint32(buf, utime)
-	return binary.BigEndian.AppendUint32(buf, math.MaxUint32)
+	return binary.BigEndian.AppendUint32(buf, 0)
 }
 
 func hotKeyCurrentState() []byte {
@@ -208,6 +202,10 @@ func hotKeyArchivePackage(archiveID int64) []byte {
 
 func hotKeyArchivePackagePrefix() []byte {
 	return bytes.Clone(hotPrefixArchivePackage)
+}
+
+func hotKeyArchiveBackfillProgress() []byte {
+	return bytes.Clone(hotPrefixArchiveBackfill)
 }
 
 func appendHistoryPrefix(prefix []byte, key storage.BlockHistoryKey) []byte {

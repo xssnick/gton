@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -15,12 +16,9 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/tuple"
 )
 
-func (s *Server) checkExternalMessage(ctx context.Context, data []byte) error {
-	msgCell, msg, err := parseExternalMessage(data)
-	if err != nil {
-		return err
-	}
+const maxExternalMessageBroadcastDataSize = 16 << 20
 
+func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell *cell.Cell, msg *tlb.ExternalMessage) error {
 	current, err := s.store.CurrentState(ctx)
 	if err != nil {
 		return err
@@ -91,6 +89,40 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte) error {
 		return errors.New("External message was not accepted")
 	}
 	return nil
+}
+
+func (s *Server) checkExternalMessageAddressLimit(addr *address.Address) error {
+	if s.externalMessageLimiter == nil {
+		s.externalMessageLimiter = extmsg.NewDefaultAddressLimiter()
+	}
+	return externalMessageAddressLimitError(addr, s.externalMessageLimiter.Check(externalMessageAddressKey(addr), s.now()))
+}
+
+func (s *Server) addExternalMessageAddressLimit(addr *address.Address) error {
+	if s.externalMessageLimiter == nil {
+		s.externalMessageLimiter = extmsg.NewDefaultAddressLimiter()
+	}
+	return externalMessageAddressLimitError(addr, s.externalMessageLimiter.Add(externalMessageAddressKey(addr), s.now()))
+}
+
+func (s *Server) dropExternalMessageAddressLimit(addr *address.Address) {
+	if s.externalMessageLimiter == nil {
+		return
+	}
+	s.externalMessageLimiter.Remove(externalMessageAddressKey(addr), s.now())
+}
+
+func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
+	key := extmsg.AddressKey{Workchain: addr.Workchain()}
+	copy(key.Account[:], addr.Data())
+	return key
+}
+
+func externalMessageAddressLimitError(addr *address.Address, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w %d:%x", err, addr.Workchain(), addr.Data())
 }
 
 func parseExternalMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {

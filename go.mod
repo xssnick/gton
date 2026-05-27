@@ -7,7 +7,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/tonutils-go v1.17.1
+	github.com/xssnick/tonutils-go v1.17.2
 )
 
 require (

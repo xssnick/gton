@@ -2019,6 +2019,216 @@ func TestStateCheckpointAllowsOrphanCellsWithoutMetadata(t *testing.T) {
 	}
 }
 
+func TestSaveStateCheckpointInitializesActiveOriginOnFirstCurrentState(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	state := blockStateWithRoot(block, cell.BeginCell().MustStoreUInt(0x10, 8).EndCell())
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(state),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+		t.Fatalf("save first current checkpoint: %v", err)
+	}
+
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation: %v", err)
+	}
+	if !active.OriginPersistentState.Equals(&state.Block) {
+		t.Fatalf("active origin = %s, want %s", storage.FormatBlockRef(active.OriginPersistentState), storage.FormatBlockRef(state.Block))
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	active, err = store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation after reopen: %v", err)
+	}
+	if !active.OriginPersistentState.Equals(&state.Block) {
+		t.Fatalf("active origin after reopen = %s, want %s", storage.FormatBlockRef(active.OriginPersistentState), storage.FormatBlockRef(state.Block))
+	}
+}
+
+func TestSaveStateCheckpointDoesNotBackfillActiveOriginWhenCurrentAlreadyExists(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	firstBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	firstState := blockStateWithRoot(firstBlock, cell.BeginCell().MustStoreUInt(0x10, 8).EndCell())
+	firstCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: firstBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(firstState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{firstState}, firstCurrent); err != nil {
+		t.Fatalf("save first current checkpoint: %v", err)
+	}
+	clearActiveCellOriginForTest(t, store)
+
+	nextBlock := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     20,
+	}
+	nextState := blockStateWithRoot(nextBlock, cell.BeginCell().MustStoreUInt(0x20, 8).EndCell())
+	nextCurrent := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: nextBlock.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(nextState),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{nextState}, nextCurrent); err != nil {
+		t.Fatalf("save next current checkpoint: %v", err)
+	}
+
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation: %v", err)
+	}
+	if !isEmptyBlockID(active.OriginPersistentState) {
+		t.Fatalf("active origin = %s, want empty", storage.FormatBlockRef(active.OriginPersistentState))
+	}
+}
+
+func TestOpenMigratesActiveOriginFromExistingCurrentState(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	state := blockStateWithRoot(block, cell.BeginCell().MustStoreUInt(0x10, 8).EndCell())
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(state),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+		t.Fatalf("save current checkpoint: %v", err)
+	}
+	clearActiveCellOriginForTest(t, store)
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation after migration: %v", err)
+	}
+	if !active.OriginPersistentState.Equals(&state.Block) {
+		t.Fatalf("active origin after migration = %s, want %s", storage.FormatBlockRef(active.OriginPersistentState), storage.FormatBlockRef(state.Block))
+	}
+}
+
+func TestOpenReadOnlyDoesNotMigrateActiveOrigin(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+	}
+	state := blockStateWithRoot(block, cell.BeginCell().MustStoreUInt(0x10, 8).EndCell())
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(state),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+		t.Fatalf("save current checkpoint: %v", err)
+	}
+	clearActiveCellOriginForTest(t, store)
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("reopen read-only store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	active, err := store.ActiveCellGeneration(ctx)
+	if err != nil {
+		t.Fatalf("active generation in read-only store: %v", err)
+	}
+	if !isEmptyBlockID(active.OriginPersistentState) {
+		t.Fatalf("read-only active origin = %s, want empty", storage.FormatBlockRef(active.OriginPersistentState))
+	}
+}
+
+func clearActiveCellOriginForTest(t *testing.T, store *Store) {
+	t.Helper()
+
+	ctx := context.Background()
+	db, err := store.acquireHotDB(ctx)
+	if err != nil {
+		t.Fatalf("acquire hot db: %v", err)
+	}
+	defer store.releaseHotDB()
+
+	store.hotWriteMu.Lock()
+	defer store.hotWriteMu.Unlock()
+
+	store.mu.Lock()
+	manifest := store.manifestLocked()
+	manifest.activeOrigin = ton.BlockIDExt{}
+	store.activeCellOrigin = ton.BlockIDExt{}
+	store.mu.Unlock()
+
+	if err = db.Set(hotKeyCellGenerationManifest(), encodeCellGenerationManifest(manifest), pebble.Sync); err != nil {
+		t.Fatalf("clear active origin manifest: %v", err)
+	}
+}
+
 func TestSwitchCellGenerationAtomicallySwitchesActiveGeneration(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {

@@ -342,6 +342,67 @@ func TestArchivePackageMetadataTracksFirstMasterBlock(t *testing.T) {
 	}
 }
 
+func TestSaveArchiveImportUpdatesDownloadedMasterPackageMetadata(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     150,
+		RootHash:  bytes.Repeat([]byte{0x31}, 32),
+		FileHash:  bytes.Repeat([]byte{0x32}, 32),
+	}
+	path, blockPtr, proofPtr := writeRefOnlyTestPack(t, block, []byte{0x01}, []byte{0x02})
+	saved, err := store.SaveArchiveFile(int32(block.SeqNo), -1, int64(-1<<63), 0, path)
+	if err != nil {
+		t.Fatalf("save archive file: %v", err)
+	}
+
+	archiveID, err := store.ArchiveInfo(context.Background(), int32(block.SeqNo), -1, int64(-1<<63))
+	if err != nil {
+		t.Fatalf("archive info: %v", err)
+	}
+	raw, err := store.getHotCopy(context.Background(), hotKeyArchivePackage(archiveID))
+	if err != nil {
+		t.Fatalf("load archive package meta: %v", err)
+	}
+	before, err := decodeArchivePackageMeta(raw)
+	if err != nil {
+		t.Fatalf("decode archive package meta: %v", err)
+	}
+	if before.firstMasterUTime != 0 {
+		t.Fatalf("first master utime before import = %d, want 0", before.firstMasterUTime)
+	}
+
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:       block,
+			BlockRef: &storage.ArtifactRef{Path: saved.Path, Offset: blockPtr.Offset, Size: blockPtr.Size},
+			ProofRef: &storage.ArtifactRef{Path: saved.Path, Offset: proofPtr.Offset, Size: proofPtr.Size},
+			Meta:     &storage.BlockMeta{ID: block, GenUTime: 1500, StartLT: 15, EndLT: 16},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("save archive import: %v", err)
+	}
+
+	raw, err = store.getHotCopy(context.Background(), hotKeyArchivePackage(archiveID))
+	if err != nil {
+		t.Fatalf("reload archive package meta: %v", err)
+	}
+	after, err := decodeArchivePackageMeta(raw)
+	if err != nil {
+		t.Fatalf("decode updated archive package meta: %v", err)
+	}
+	if after.firstMasterSeq != block.SeqNo || after.firstMasterUTime != 1500 || after.firstMasterLT != 15 {
+		t.Fatalf("unexpected updated metadata seq=%d utime=%d lt=%d", after.firstMasterSeq, after.firstMasterUTime, after.firstMasterLT)
+	}
+}
+
 func TestSaveKeyBlockProofUsesKeyArchivePack(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(Options{Dir: dir})
@@ -681,6 +742,10 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	oldBPath := savePruneBlock(oldB, 1500)
 	boundaryPath := savePruneBlock(boundary, 2000)
 	newerPath := savePruneBlock(newer, 3000)
+	oldShard := testServedBlockID(0, int64(-1<<63), 20, 0x55)
+	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: oldShard, GenUTime: 1000, StartLT: 20, EndLT: 21}); err != nil {
+		t.Fatalf("save old shard meta: %v", err)
+	}
 	if err = store.syncPendingArtifactFiles(); err != nil {
 		t.Fatalf("sync pending artifacts: %v", err)
 	}
@@ -702,8 +767,8 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	if stats.DeletedPackageBytes != wantDeletedBytes {
 		t.Fatalf("deleted package bytes = %d, want %d", stats.DeletedPackageBytes, wantDeletedBytes)
 	}
-	if stats.DeletedBlockMeta != 2 {
-		t.Fatalf("deleted block meta = %d, want 2", stats.DeletedBlockMeta)
+	if stats.DeletedBlockMeta != 3 {
+		t.Fatalf("deleted block meta = %d, want 3", stats.DeletedBlockMeta)
 	}
 
 	for _, block := range []ton.BlockIDExt{oldA, oldB} {
@@ -716,6 +781,9 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 		if _, err = store.ArchiveInfo(context.Background(), int32(block.SeqNo), -1, int64(-1<<63)); !errors.Is(err, storage.ErrNotFound) {
 			t.Fatalf("old archive info %d error = %v, want ErrNotFound", block.SeqNo, err)
 		}
+	}
+	if _, err = store.BlockMeta(context.Background(), oldShard); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("old shard meta error = %v, want ErrNotFound", err)
 	}
 
 	for _, block := range []ton.BlockIDExt{boundary, newer} {

@@ -182,7 +182,7 @@ func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey
 	}
 	defer func() { _ = iter.Close() }()
 
-	block, err := lookupBlockByLTWithIterator(snap, iter, key, lt)
+	block, err := lookupBlockByLTWithIterator(iter, key, lt)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -215,6 +215,9 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 	}
 	defer func() { _ = iter.Close() }()
 
+	var best ton.BlockIDExt
+	found := false
+
 	for _, shard := range shards {
 		select {
 		case <-ctx.Done():
@@ -222,7 +225,7 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 		default:
 		}
 
-		block, err := lookupBlockCoveringLTWithIterator(snap, iter, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
+		block, err := lookupBlockByLTWithIterator(iter, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
 		if errors.Is(err, storage.ErrNotFound) {
 			continue
 		}
@@ -230,98 +233,30 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 			return ton.BlockIDExt{}, err
 		}
 
-		return block, iter.Error()
+		if !found || best.SeqNo > block.SeqNo {
+			best = block
+			found = true
+		}
 	}
 	if err = iter.Error(); err != nil {
 		return ton.BlockIDExt{}, err
 	}
+	if found {
+		return best, nil
+	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
-func lookupBlockCoveringLTWithIterator(reader pebbleReader, iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+func lookupBlockByLTWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
 	prefix := hotKeyBlockLTPrefix(key)
 	if !iter.SeekGE(hotKeyBlockLTSeekGE(key, lt)) || !bytes.HasPrefix(iter.Key(), prefix) {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
-
-	block, err := decodeBlockID(iter.Value())
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-
-	meta, err := blockMetaFromReader(reader, block)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if !blockMetaContainsLT(meta, lt) {
-		return ton.BlockIDExt{}, storage.ErrNotFound
-	}
-	return block, nil
-}
-
-func lookupBlockByLTWithIterator(reader pebbleReader, iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
-	prefix := hotKeyBlockLTPrefix(key)
-	var geBlock ton.BlockIDExt
-	var geFound bool
-	var ltBlock ton.BlockIDExt
-	var ltFound bool
-
-	seekGE := hotKeyBlockLTSeekGE(key, lt)
-	if iter.SeekGE(seekGE) && bytes.HasPrefix(iter.Key(), prefix) {
-		block, err := decodeBlockID(iter.Value())
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		geBlock = block
-		geFound = true
-	}
-
-	seekLT := hotKeyBlockLTSeek(key, lt)
-	if iter.SeekLT(seekLT) && bytes.HasPrefix(iter.Key(), prefix) {
-		block, err := decodeBlockID(iter.Value())
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		ltBlock = block
-		ltFound = true
-	}
-
-	if geFound {
-		meta, err := blockMetaFromReader(reader, geBlock)
-		switch {
-		case err == nil && meta.StartLT <= lt && (meta.EndLT == 0 || lt <= meta.EndLT):
-			return geBlock, nil
-		case err == nil:
-		case errors.Is(err, storage.ErrNotFound):
-		default:
-			return ton.BlockIDExt{}, err
-		}
-	}
-
-	if !ltFound {
-		return ton.BlockIDExt{}, storage.ErrNotFound
-	}
-	return ltBlock, nil
-}
-
-func blockMetaFromReader(reader pebbleReader, block ton.BlockIDExt) (*storage.BlockMeta, error) {
-	raw, closer, err := pebbleReaderGet(reader, hotKeyBlockMeta(block))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = closer.Close() }()
-	return decodeBlockMeta(block, raw)
-}
-
-func blockMetaContainsLT(meta *storage.BlockMeta, lt uint64) bool {
-	if meta == nil {
-		return false
-	}
-	return meta.StartLT < lt && (meta.EndLT == 0 || lt < meta.EndLT)
+	return decodeBlockID(iter.Value())
 }
 
 func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
-	return s.lookupBlockByBoundedIndex(ctx, hotKeyBlockUTimePrefix(key), hotKeyBlockUTimeSeek(key, utime))
+	return s.lookupBlockByLowerBoundIndex(ctx, hotKeyBlockUTimePrefix(key), hotKeyBlockUTimeSeekGE(key, utime))
 }
 
 func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {
@@ -397,7 +332,7 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 	return nil
 }
 
-func (s *Store) lookupBlockByBoundedIndex(ctx context.Context, prefix []byte, seek []byte) (ton.BlockIDExt, error) {
+func (s *Store) lookupBlockByLowerBoundIndex(ctx context.Context, prefix []byte, seek []byte) (ton.BlockIDExt, error) {
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {
 		return ton.BlockIDExt{}, err
@@ -422,7 +357,7 @@ func (s *Store) lookupBlockByBoundedIndex(ctx context.Context, prefix []byte, se
 	default:
 	}
 
-	if !iter.SeekLT(seek) {
+	if !iter.SeekGE(seek) {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 	if !bytes.HasPrefix(iter.Key(), prefix) {
