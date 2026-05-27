@@ -39,9 +39,15 @@ const (
 func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
 	lsPubkeyFlag := flag.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
+	skipConfigCheckFlag := flag.Bool("skip-cfg-check", false, "continue startup after creating a missing config file")
 	verbosityFlag := flag.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
 	logTypesFlag := flag.String("log-types", "", "category log verbosity overrides, comma-separated: liteserver=debug,p2p=warn")
 	logJSONFlag := flag.Bool("log-json", false, "write logs as JSON instead of pretty console")
+	logFileFlag := flag.String("log-file", "", "path to rotating log file, disabled by default")
+	logFileMaxSizeFlag := flag.Int("log-file-max-size", defaultLogFileMaxSizeMB, "maximum log file size in megabytes before rotation")
+	logFileMaxBackupsFlag := flag.Int("log-file-max-backups", defaultLogFileMaxBackups, "maximum rotated log files to keep, 0 keeps all")
+	logFileMaxAgeFlag := flag.Int("log-file-max-age", defaultLogFileMaxAgeDays, "maximum days to keep rotated log files, 0 keeps all")
+	logFileCompressFlag := flag.Bool("log-file-compress", false, "compress rotated log files")
 	globalConfigURLFlag := flag.String("global-config", "", "download TON global config from URL and replace the configured file before start")
 	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	fromZeroFlag := flag.Bool("from-zero", false, "verify initial key block chain from zerostate instead of global config init_block")
@@ -59,7 +65,25 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid log type overrides %q: %v\n", *logTypesFlag, err)
 		os.Exit(1)
 	}
-	logs := logutil.NewFactory(os.Stdout, logutil.Config{
+	logRotation := logRotationOptions{
+		MaxSizeMB:  *logFileMaxSizeFlag,
+		MaxBackups: *logFileMaxBackupsFlag,
+		MaxAgeDays: *logFileMaxAgeFlag,
+		Compress:   *logFileCompressFlag,
+	}
+	logOutput, logFile, err := newLogOutput(os.Stdout, *logFileFlag, logRotation)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid log file config: %v\n", err)
+		os.Exit(1)
+	}
+	if logFile != nil {
+		defer func() {
+			if err := logFile.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to close log file %q: %v\n", logFile.Filename, err)
+			}
+		}()
+	}
+	logs := logutil.NewFactory(logOutput, logutil.Config{
 		Level:     level,
 		Overrides: logTypeOverrides,
 		JSON:      *logJSONFlag,
@@ -82,10 +106,16 @@ func main() {
 		}
 		cfg = configResult.Config
 		if configResult.Created {
-			logger.Info().
-				Str("config", displayConfigPath(selectedConfigPath)).
-				Msg("created default config; review and approve config.json settings, then start the node again")
-			return
+			if *skipConfigCheckFlag {
+				logger.Info().
+					Str("config", displayConfigPath(selectedConfigPath)).
+					Msg("created default config and continuing startup due --skip-cfg-check")
+			} else {
+				logger.Info().
+					Str("config", displayConfigPath(selectedConfigPath)).
+					Msg("created default config; review and approve config.json settings, then start the node again")
+				return
+			}
 		}
 	}
 	if *lsPubkeyFlag {
@@ -409,6 +439,11 @@ func main() {
 		Str("log_level", level.String()).
 		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(logTypeOverrides), "<none>")).
 		Str("log_format", logFormat(*logJSONFlag)).
+		Str("log_file", fallbackString(strings.TrimSpace(*logFileFlag), "<disabled>")).
+		Int("log_file_max_size_mb", logRotation.MaxSizeMB).
+		Int("log_file_max_backups", logRotation.MaxBackups).
+		Int("log_file_max_age_days", logRotation.MaxAgeDays).
+		Bool("log_file_compress", logRotation.Compress).
 		Str("global_config", globalConfigPath).
 		Str("listen_addr", fallbackString(opts.ListenAddr, "<client-mode>")).
 		Bool("dht_server", opts.DHTListenAddr != "").

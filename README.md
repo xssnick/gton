@@ -1,6 +1,6 @@
 # gton
 
-`gton` is a Go implementation of a TON full node with a liteserver API. It does not implement validator functionality. The node is designed to be an efficient API access point for services, backend projects, indexers, wallets, and other infrastructure that needs fast synchronization and stable data serving under heavy load.
+`gton` is a Go implementation of a TON full node with a liteserver API. It does not implement validator functionality. The node is designed to be an efficient API access point for services, backends of projects, indexers, wallets, and other infrastructure that needs fast synchronization and stable data serving under heavy load.
 
 The project focuses on:
 
@@ -12,6 +12,13 @@ The project focuses on:
 
 The project is under active development. Storage format and configuration may change without backward compatibility.
 
+## Hardware Requirements
+
+- Minimum RAM: `32 GB`.
+- Recommended RAM: `64 GB`.
+- Minimum CPU: `8` cores.
+- Minimum disk: `512 GB SSD`.
+
 ## Running
 
 Build the node binary:
@@ -19,6 +26,8 @@ Build the node binary:
 ```bash
 go build -o gton-node ./cmd/node
 ```
+
+Or download from releases.
 
 The first run creates `config.json` and exits:
 
@@ -41,7 +50,9 @@ The generated config defaults to:
 - storage directory: `data`;
 - liteserver: disabled, listen address `0.0.0.0:7445`.
 
-Open the external ADNL/DHT ports on your firewall and make sure `adnl.external_addr` points to the node's public address. If you enable the liteserver for external clients, open its port too.
+Open the external ADNL/DHT (UDP) ports on your firewall and make sure `adnl.external_addr` points to the node's public address. If you enable the liteserver for external clients, open its port too (TCP).
+
+After startup node will sync with the latest blockchain state. First it will download `state` and then blocks to apply them. This could take around 1 - 3 hours depending on your hardware and chain.
 
 ## CLI Flags
 
@@ -60,8 +71,14 @@ Supported flags:
 | `--verbosity <level>` | Global log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
 | `--log-types <list>` | Per-category log verbosity overrides, for example `liteserver=debug,p2p=warn`. |
 | `--log-json` | Write logs as JSON instead of pretty console output. |
+| `--log-file <path>` | Also write logs to this rotating file. Disabled by default. |
+| `--log-file-max-size <mb>` | Rotate the log file after it reaches this size. Defaults to `100`. |
+| `--log-file-max-backups <n>` | Maximum rotated log files to keep. Defaults to `10`, `0` keeps all. |
+| `--log-file-max-age <days>` | Maximum days to keep rotated log files. Defaults to `30`, `0` keeps all. |
+| `--log-file-compress` | Compress rotated log files. |
 | `--global-config <url>` | Download global config from the URL and replace the file from `ton.global_config_path` before startup. |
 | `--pprof-addr <addr>` | Enable `net/http/pprof`, for example `127.0.0.1:6060`. |
+| `--skip-cfg-check` | Continue startup after creating missing config file without manually reviewing it first. |
 | `--from-zero` | Verify the initial key-block chain from zerostate instead of the `init_block` from global config. |
 | `--archive-checkpoint-period <duration>` | Maximum current-state checkpoint interval during archive catch-up. Defaults to `2m`. |
 | `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `2`. |
@@ -70,25 +87,52 @@ Supported flags:
 
 After startup, the process reads commands from stdin. This is useful for manual diagnostics and maintenance without a separate RPC control interface.
 
-| Command | Description |
-| --- | --- |
-| `status` | Prints a short sync, p2p, liteserver, and TPS status. |
-| `status full` | Prints extended status with peer and overlay details. |
-| `status db` | Prints Pebble/meta DB and cell DB generation status: cache, disk, L0, compaction, memtable, and read/write rates. |
-| `serialize <masterchain_seqno>` | Starts persistent state serialization for the given masterchain seqno. |
-| `serialize <masterchain_seqno> basechain` | Serializes only the basechain persistent state for the given masterchain seqno. |
-| `serialize cancel` | Cancels the current persistent state serialization. |
-| `migrate <masterchain_seqno>` | Starts cell DB generation migration from the persistent state of the given masterchain block. |
-| `migrate stop` | Stops the current cell DB generation migration. |
+| Command | Description                                                                                                                                   |
+| --- |-----------------------------------------------------------------------------------------------------------------------------------------------|
+| `status` | Prints a short sync, p2p, liteserver, and TPS status.                                                                                         |
+| `status full` | Prints extended status with peer and overlay details.                                                                                         |
+| `status db` | Prints Pebble/meta DB and cell DB generation status: cache, disk, L0, compaction, memtable, and read/write rates.                             |
+| `serialize <masterchain_seqno>` | Starts persistent state serialization for the given masterchain seqno.                                                                        |
+| `serialize cancel` | Cancels the current persistent state serialization.                                                                                           |
+| `migrate <masterchain_seqno>` | Starts cell DB generation migration from the persistent state of the given masterchain block. Migration is used for cell db size optimization |
+| `migrate stop` | Stops the current cell DB generation migration.                                                                                               |
 
 Example:
 
 ```text
 status
 status db
-serialize 48500000 basechain
+serialize 48500000
 migrate 48500000
 ```
+
+## Background Routine
+
+After startup, the node runs a background maintenance routine. It keeps stored data useful for serving requests while controlling disk usage. Only one heavy maintenance job runs at a time, so the node does not run several large cleanup or rebuild tasks at once.
+
+The routine can run these jobs:
+
+##### Persistent state serialization
+
+Creates snapshot files with the full chain state at selected masterchain key blocks. These files let the node serve state downloads to other nodes and provide a stable point for later storage maintenance.
+
+##### Cell database migration
+
+Builds a fresh cell database from a serialized state snapshot, catches it up to the current chain state, and then switches to it. This keeps the state database compact and lets the node remove old state data after it is no longer needed.
+
+##### Persistent state cleanup
+
+Deletes expired state snapshot files while keeping recent snapshots and any snapshot still needed by an unfinished migration. This saves disk space without breaking state serving or an in-progress database migration.
+
+##### Archive cleanup
+
+Removes old archive packages and related block metadata after the configured archive retention period. This keeps archive storage inside the configured history window instead of growing forever.
+
+##### Archive backfill
+
+Downloads and verifies older archive data near the retention boundary. This fills missing archive ranges before cleanup reaches them, so the node can keep a continuous archive history for the configured retention period.
+
+The current background job is visible in the node status and Prometheus metrics as the background task.
 
 ## Configuration
 
