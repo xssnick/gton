@@ -260,9 +260,6 @@ func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHist
 }
 
 func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {
-	if next == nil {
-		return fmt.Errorf("block meta is nil")
-	}
 	db, err := s.acquireHotDB(context.Background())
 	if err != nil {
 		return err
@@ -281,10 +278,6 @@ func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {
 }
 
 func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta) error {
-	if next == nil {
-		return fmt.Errorf("block meta is nil")
-	}
-
 	key := hotKeyBlockMeta(next.ID)
 	existingRaw, closer, err := pebbleReaderGet(s.hot, key)
 	existed := false

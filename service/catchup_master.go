@@ -206,15 +206,15 @@ type masterchainApplyTiming struct {
 	stateUpdate time.Duration
 }
 
-func (s *Service) applyMasterchainTransitionWithConsensusProof(current *storage.BlockState, downloaded p2p.DownloadedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
-	return s.applyMasterchainTransition(current, downloaded, proof, applier, true)
+func (s *Service) applyMasterchainTransitionWithCheckedConsensus(current *storage.BlockState, block PreparedBlock, checked *checkedMasterchainConsensus, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
+	return s.applyMasterchainTransition(current, block, checked, applier)
 }
 
-func (s *Service) applyStoredMasterchainTransition(current *storage.BlockState, downloaded p2p.DownloadedBlock, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
-	return s.applyMasterchainTransition(current, downloaded, nil, applier, false)
+func (s *Service) applyStoredMasterchainTransition(current *storage.BlockState, block PreparedBlock, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
+	return s.applyMasterchainTransition(current, block, nil, applier)
 }
 
-func (s *Service) applyMasterchainTransition(current *storage.BlockState, downloaded p2p.DownloadedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier, validateConsensus bool) (*storage.BlockState, masterchainApplyTiming, error) {
+func (s *Service) applyMasterchainTransition(current *storage.BlockState, block PreparedBlock, checked *checkedMasterchainConsensus, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
 	started := time.Now()
 	var timing masterchainApplyTiming
 	finish := func() masterchainApplyTiming {
@@ -222,41 +222,31 @@ func (s *Service) applyMasterchainTransition(current *storage.BlockState, downlo
 		return timing
 	}
 
-	if current == nil {
-		return nil, finish(), fmt.Errorf("current masterchain state is nil")
+	if block.ID.Workchain != -1 || block.ID.Shard != topShard {
+		return nil, finish(), fmt.Errorf("download next masterchain block after %s returned %s", storage.FormatBlockRef(current.Block), block.BlockRef())
 	}
-
-	stageStarted := time.Now()
-	downloaded, err := prepareDownloadedBlock(downloaded)
-	timing.prepare += time.Since(stageStarted)
-	if err != nil {
-		return nil, finish(), err
+	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
+		return nil, finish(), fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
 	}
-	if downloaded.ID.Workchain != -1 || downloaded.ID.Shard != topShard {
-		return nil, finish(), fmt.Errorf("download next masterchain block after %s returned %s", storage.FormatBlockRef(current.Block), downloaded.BlockRef())
-	}
-	if len(downloaded.Meta.PrevRefs) != 1 {
-		return nil, finish(), fmt.Errorf("masterchain block %s has %d previous refs", downloaded.BlockRef(), len(downloaded.Meta.PrevRefs))
-	}
-	prev := downloaded.Meta.PrevRefs[0]
+	prev := block.Meta.PrevRefs[0]
 	if !prev.Equals(&current.Block) {
-		return nil, finish(), fmt.Errorf("%w: block=%s prev=%s current=%s", errMasterchainPrevMismatch, downloaded.BlockRef(), storage.FormatBlockRef(prev), storage.FormatBlockRef(current.Block))
+		return nil, finish(), fmt.Errorf("%w: block=%s prev=%s current=%s", errMasterchainPrevMismatch, block.BlockRef(), storage.FormatBlockRef(prev), storage.FormatBlockRef(current.Block))
 	}
 
-	if validateConsensus {
-		stageStarted = time.Now()
-		if err = s.validateMasterchainBlockConsensusWithProof(current, tonBlockForConsensus{block: downloaded.ID, proofBOC: downloaded.ProofBOC, broadcastSignatures: downloaded.BroadcastSignatures}, proof); err != nil {
+	if checked != nil {
+		stageStarted := time.Now()
+		if err := checked.validateFor(current, block.ID); err != nil {
 			timing.consensus += time.Since(stageStarted)
-			return nil, finish(), fmt.Errorf("validate masterchain consensus for %s: %w", downloaded.BlockRef(), err)
+			return nil, finish(), fmt.Errorf("checked masterchain consensus for %s: %w", block.BlockRef(), err)
 		}
 		timing.consensus += time.Since(stageStarted)
 	}
 
-	stageStarted = time.Now()
-	next, err := applyBlockWithPreviousStates([]*storage.BlockState{current}, downloaded, applier)
+	stageStarted := time.Now()
+	next, err := applyBlockWithPreviousStates([]*storage.BlockState{current}, block, applier)
 	timing.stateUpdate += time.Since(stageStarted)
 	if err != nil {
-		return nil, finish(), fmt.Errorf("apply masterchain block %s: %w", downloaded.BlockRef(), err)
+		return nil, finish(), fmt.Errorf("apply masterchain block %s: %w", block.BlockRef(), err)
 	}
 
 	return next, finish(), nil
@@ -268,7 +258,7 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 		return nil, err
 	}
 
-	checkpoint, err := prepareStateCheckpoint(current, entries)
+	checkpoint, err := prepareStateCheckpoint(current, entries, cells.cells())
 	if err != nil {
 		s.currentStatePersistMu.Unlock()
 		return nil, err
@@ -289,10 +279,12 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 	persistCtx := s.currentStatePersistContext()
 	s.runAsync(func() {
 		started := time.Now()
-		committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, artifactTarget)
+		committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, artifactTarget)
 		elapsed := time.Since(started)
-		s.currentStatePersistMu.Unlock()
 		if err != nil {
+			wrapped := fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
+			s.setCurrentStatePersistError(wrapped)
+			s.currentStatePersistMu.Unlock()
 			s.observeSyncPersist(SyncPersistObservation{
 				Mode:          "next_block_async",
 				Result:        "error",
@@ -300,8 +292,6 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 				Duration:      elapsed,
 				States:        len(checkpoint.entries),
 			})
-			wrapped := fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
-			s.setCurrentStatePersistError(wrapped)
 			s.log.Error().
 				Err(wrapped).
 				Str("masterchain", storage.FormatBlockRef(master)).
@@ -315,6 +305,9 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 		if onCommitted != nil {
 			onCommitted()
 		}
+		cells.complete()
+		s.currentStatePersistMu.Unlock()
+
 		s.observeSyncPersist(SyncPersistObservation{
 			Mode:          "next_block_async",
 			Result:        "success",
@@ -330,7 +323,6 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 			Dur("queued_for", time.Since(queuedAt)).
 			Dur("elapsed", elapsed).
 			Msg("next-block shard-client checkpoint persisted")
-		cells.complete()
 		s.publishCommittedCurrentState(committed)
 		s.markLiveCheckpointStatesFlushed(checkpoint.entries)
 	})
@@ -338,12 +330,12 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 	return checkpoint.live, nil
 }
 
-func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, lockElapsed time.Duration) (*storage.CurrentState, error) {
+func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
 	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		s.currentStatePersistMu.Unlock()
 		return nil, err
 	}
-	checkpoint, err := prepareStateCheckpoint(current, entries)
+	checkpoint, err := prepareStateCheckpoint(current, entries, cells.cells())
 	if err != nil {
 		s.currentStatePersistMu.Unlock()
 		return nil, err
@@ -356,9 +348,8 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 
 	started := time.Now()
 	persistCtx := s.currentStatePersistContext()
-	committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, artifactTarget)
+	committed, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, artifactTarget)
 	elapsed := time.Since(started)
-	s.currentStatePersistMu.Unlock()
 	if err != nil {
 		s.observeSyncPersist(SyncPersistObservation{
 			Mode:          "next_block_sync",
@@ -367,8 +358,15 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 			Duration:      elapsed,
 			States:        len(checkpoint.entries),
 		})
+		s.currentStatePersistMu.Unlock()
 		return nil, fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 	}
+
+	if onCommitted != nil {
+		onCommitted()
+	}
+	cells.complete()
+	s.currentStatePersistMu.Unlock()
 
 	s.observeSyncPersist(SyncPersistObservation{
 		Mode:          "next_block_sync",
@@ -385,7 +383,6 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 		Dur("elapsed", elapsed).
 		Int("states", len(checkpoint.entries)).
 		Msg("next-block shard-client checkpoint persisted")
-	cells.complete()
 	s.publishCommittedCurrentState(committed)
 	s.markLiveCheckpointStatesFlushed(checkpoint.entries)
 	return checkpoint.live, nil
@@ -452,15 +449,14 @@ func (s *Service) waitCurrentStatePersist(ctx context.Context) error {
 	}
 }
 
-func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (p2p.DownloadedBlock, string, error) {
-	if s.node == nil {
-		return p2p.DownloadedBlock{}, "", fmt.Errorf("p2p node is nil")
-	}
-
+func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, string, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
 	for {
-		if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
-			return downloaded, source, err
+		if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+			if err != nil {
+				return PreparedBlock{}, "", 0, err
+			}
+			return downloaded, source, prepareElapsed, nil
 		}
 
 		decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
@@ -504,54 +500,74 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		for {
 			select {
 			case res := <-result:
-				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
 					cancel()
-					return downloaded, source, err
+					if err != nil {
+						return PreparedBlock{}, "", 0, err
+					}
+					return downloaded, source, prepareElapsed, nil
 				}
 				if decision.shouldPreferBroadcastCandidate() {
-					downloaded, source, ok, err := s.waitPreferredMasterchainBroadcast(ctx, prev, target, broadcastWake, nextBlockBootstrapBroadcastPreferDelay)
+					downloaded, source, prepareElapsed, ok, err := s.waitPreferredMasterchainBroadcast(ctx, prev, target, broadcastWake, nextBlockBootstrapBroadcastPreferDelay)
 					if ok || err != nil {
 						cancel()
-						return downloaded, source, err
+						if err != nil {
+							return PreparedBlock{}, "", 0, err
+						}
+						return downloaded, source, prepareElapsed, nil
 					}
 				}
 				cancel()
 				if res.err != nil {
-					return p2p.DownloadedBlock{}, "", fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), res.err)
+					return PreparedBlock{}, "", 0, fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), res.err)
 				}
 				if res.downloaded == nil {
-					return p2p.DownloadedBlock{}, "", fmt.Errorf("probe next block after %s: empty response", storage.FormatBlockRef(prev))
+					return PreparedBlock{}, "", 0, fmt.Errorf("probe next block after %s: empty response", storage.FormatBlockRef(prev))
 				}
-				prepared, err := prepareDownloadedBlockStateCells(*res.downloaded)
+				prepareStarted := time.Now()
+				verified, err := verifyDownloadedBlock(*res.downloaded)
+				prepareElapsed := time.Since(prepareStarted)
 				if err != nil {
-					return p2p.DownloadedBlock{}, "", fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err)
+					return PreparedBlock{}, syncBlockSourceForDownloadedBlock("peer_probe", *res.downloaded), prepareElapsed, fmt.Errorf("verify probed next block after %s: %w", storage.FormatBlockRef(prev), err)
 				}
-				return prepared, syncBlockSourceForDownloadedBlock("peer_probe", prepared), nil
+				prepared, err := prepareVerifiedMasterchainBlockForNextSync(prev, verified)
+				prepareElapsed = time.Since(prepareStarted)
+				if err != nil {
+					return PreparedBlock{}, syncBlockSourceForVerifiedBlock("peer_probe", verified), prepareElapsed, fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err)
+				}
+				prepared.PrepareElapsed = prepareElapsed
+				return prepared, syncBlockSourceForKind("peer_probe", verified.Kind), prepared.PrepareElapsed, nil
 			case <-s.currentStateWake:
-				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
 					cancel()
-					return downloaded, source, err
+					if err != nil {
+						return PreparedBlock{}, "", 0, err
+					}
+					return downloaded, source, prepareElapsed, nil
 				}
 			case <-broadcastWake:
-				if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
 					cancel()
-					return downloaded, source, err
+					if err != nil {
+						return PreparedBlock{}, "", 0, err
+					}
+					return downloaded, source, prepareElapsed, nil
 				}
 				broadcastWake = nil
 			case <-queryCtx.Done():
 				cancel()
-				return p2p.DownloadedBlock{}, "", fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), queryCtx.Err())
+				return PreparedBlock{}, "", 0, fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), queryCtx.Err())
 			case <-ctx.Done():
 				cancel()
-				return p2p.DownloadedBlock{}, "", ctx.Err()
+				return PreparedBlock{}, "", 0, ctx.Err()
 			}
 		}
 	}
 }
 
-func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, target ton.BlockIDExt, broadcastWake <-chan struct{}, delay time.Duration) (p2p.DownloadedBlock, string, bool, error) {
+func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, target ton.BlockIDExt, broadcastWake <-chan struct{}, delay time.Duration) (PreparedBlock, string, time.Duration, bool, error) {
 	if delay <= 0 {
-		return p2p.DownloadedBlock{}, "", false, nil
+		return PreparedBlock{}, "", 0, false, nil
 	}
 
 	timer := time.NewTimer(delay)
@@ -560,18 +576,18 @@ func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, t
 	for {
 		select {
 		case <-ctx.Done():
-			return p2p.DownloadedBlock{}, "", false, ctx.Err()
+			return PreparedBlock{}, "", 0, false, ctx.Err()
 		case <-s.currentStateWake:
-			if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
-				return downloaded, source, ok, err
+			if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				return downloaded, source, prepareElapsed, ok, err
 			}
 		case <-broadcastWake:
-			if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
-				return downloaded, source, ok, err
+			if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				return downloaded, source, prepareElapsed, ok, err
 			}
 			broadcastWake = nil
 		case <-timer.C:
-			return p2p.DownloadedBlock{}, "", false, nil
+			return PreparedBlock{}, "", 0, false, nil
 		}
 	}
 }
@@ -581,7 +597,7 @@ type nextBlockProbeResult struct {
 	err        error
 }
 
-func downloadedBlockTimeLag(downloaded p2p.DownloadedBlock, now time.Time) (uint32, int64, bool) {
+func downloadedBlockTimeLag(downloaded PreparedBlock, now time.Time) (uint32, int64, bool) {
 	if downloaded.Meta == nil || downloaded.Meta.GenUTime == 0 {
 		return 0, 0, false
 	}

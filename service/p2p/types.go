@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -74,6 +74,7 @@ const (
 	dhtFindTimeout             = 30 * time.Second
 	masterchainWaitLogEvery    = 5 * time.Second
 	peerQueryTimeout           = 10 * time.Second
+	broadcastSignatureTimeout  = 2 * time.Second
 	peerRebroadcastTimeout     = 5 * time.Second
 	peerRebroadcastQueueItems  = 2048
 	peerRebroadcastQueueBytes  = int64(256 << 20)
@@ -146,6 +147,25 @@ type Options struct {
 	PeerServingStorage storage.PeerServingStorage
 	CompressedState    CompressedBlockStateProvider
 	SyncLag            SyncLagProvider
+	SignatureVerifier  BroadcastSignatureVerifier
+}
+
+type BroadcastSignatureVerifier interface {
+	CheckBlockBroadcastSignatures(ctx context.Context, req BlockBroadcastSignatureCheck) error
+	CheckShardDescriptionSignatures(ctx context.Context, req ShardDescriptionSignatureCheck) error
+}
+
+type BlockBroadcastSignatureCheck struct {
+	Kind       string
+	Block      ton.BlockIDExt
+	Proof      *cell.Cell
+	Signatures *blockproof.ValidatorSignatureSet
+}
+
+type ShardDescriptionSignatureCheck struct {
+	Block         ton.BlockIDExt
+	CatchainSeqno int32
+	Data          []byte
 }
 
 type BlockCacheObserver interface {
@@ -160,10 +180,6 @@ type SyncLagProviderFunc func() (int64, bool)
 
 func (f SyncLagProviderFunc) SyncLagSeconds() (int64, bool) {
 	return f()
-}
-
-type MasterchainBroadcastSignatureVerifier interface {
-	ValidateMasterchainBroadcastSignatures(ctx context.Context, block ton.BlockIDExt, proof []byte, signatures *cell.Cell) error
 }
 
 type overlaySpec struct {
@@ -188,19 +204,13 @@ type DownloadedBlock struct {
 	// It is not proof of validity by itself; service consensus validation checks it
 	// against the validator set before the block is used as verified.
 	BroadcastSignatures *cell.Cell
-	Parsed              *tlb.Block
 	Meta                *storage.BlockMeta
+	StateUpdate         *cell.Cell
 	SourceKey           string
-	// StateUpdateToCells contains encoded non-pruned cells reachable from block.state_update.to,
-	// keyed by their logical state hash. Service apply code treats it as output of
-	// storage.PrepareStateUpdateCells and only checks that the update matches the current root.
-	StateUpdateToCells        map[cell.Hash][]byte
-	StateUpdateToCellsElapsed time.Duration
 
 	IsLink bool
 
 	VerifiedRootHash bool
-	VerifiedFileHash bool
 }
 
 func (b DownloadedBlock) BlockRef() string {

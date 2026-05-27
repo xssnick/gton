@@ -71,10 +71,6 @@ func (d exactBlockDownloadProbeDecision) probeTimeout() time.Duration {
 }
 
 func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.BlockIDExt, state exactBlockDownloadProbeState) (p2p.DownloadedBlock, string, error) {
-	if s.node == nil {
-		return p2p.DownloadedBlock{}, "", fmt.Errorf("p2p node is nil")
-	}
-
 	decision := s.exactBlockDownloadProbeDecision(state)
 	queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
 	defer cancel()

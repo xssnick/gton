@@ -27,9 +27,6 @@ type largeBOCEncodedCellRecord struct {
 // LargeBOCMetaRecordFromCellRecord converts the persisted compact cell record
 // into tonutils-go large-BOC metadata without materializing *cell.Cell.
 func LargeBOCMetaRecordFromCellRecord(record *CellRecord) (cell.LargeBOCMetaRecord, error) {
-	if record == nil {
-		return cell.LargeBOCMetaRecord{}, fmt.Errorf("cell record is nil")
-	}
 	if len(record.Hash) != cellHashSize {
 		return cell.LargeBOCMetaRecord{}, fmt.Errorf("cell hash size mismatch: %d", len(record.Hash))
 	}
@@ -233,10 +230,6 @@ func appendLargeBOCPayloadRecordFromParsedEncodedCellRecord(record largeBOCEncod
 }
 
 func largeBOCPayloadDataFromCellRecord(record *CellRecord) ([]byte, uint, error) {
-	if record == nil {
-		return nil, 0, fmt.Errorf("cell record is nil")
-	}
-
 	bits, err := cellRecordBits(record)
 	if err != nil {
 		return nil, 0, err

@@ -30,18 +30,12 @@ func (s *Store) ImportStateCellTreeInGeneration(ctx context.Context, generation 
 	if generation == 0 {
 		return nil, fmt.Errorf("cell generation is zero")
 	}
-	if root == nil {
-		return nil, fmt.Errorf("state cell tree root is nil")
-	}
 	return s.importStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
 }
 
 func (s *Store) ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
 	if generation == 0 {
 		return nil, fmt.Errorf("cell generation is zero")
-	}
-	if view == nil {
-		return nil, fmt.Errorf("state boc view is nil")
 	}
 	return s.importStateBOCViewInGeneration(ctx, generation, block, view)
 }
@@ -51,10 +45,6 @@ func (s *Store) TrustImportedStateCellHashes() bool {
 }
 
 func (s *Store) importStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	if root == nil {
-		return nil, fmt.Errorf("state cell tree root is nil")
-	}
-
 	rootCellHash := root.HashKey()
 	if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{
 		block:          block,
@@ -82,10 +72,6 @@ func (s *Store) importStateCellTreeInGeneration(ctx context.Context, generation 
 }
 
 func (s *Store) importStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
-	if view == nil {
-		return nil, fmt.Errorf("state boc view is nil")
-	}
-
 	roots := view.Roots()
 	if len(roots) != 1 {
 		return nil, fmt.Errorf("state boc should contain exactly one root, got %d", len(roots))
@@ -179,9 +165,6 @@ func (s *Store) SaveCells(records []*storage.CellRecord) error {
 func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error {
 	encoded := make([]storage.EncodedCellRecord, 0, len(records))
 	for _, record := range records {
-		if record == nil {
-			return fmt.Errorf("cell record is nil")
-		}
 		if len(record.Hash) != 32 {
 			return fmt.Errorf("cell record hash size mismatch: %d", len(record.Hash))
 		}
@@ -209,8 +192,8 @@ type cellRecordBatchStats struct {
 	bytes   int64
 }
 
-func (s *Store) savePreparedStateCellRecords(ctx context.Context, records []storage.EncodedCellRecord, generation uint64) (stateCellSaveStats, error) {
-	stats, err := s.saveCellRecordBatch(ctx, records, false, generation, false)
+func (s *Store) savePreparedStateCellRecords(ctx context.Context, records storage.StateCellRecords, generation uint64) (stateCellSaveStats, error) {
+	stats, err := s.saveCellRecordSet(ctx, records, false, generation, false)
 	if err != nil {
 		return stateCellSaveStats{}, err
 	}
@@ -218,8 +201,12 @@ func (s *Store) savePreparedStateCellRecords(ctx context.Context, records []stor
 }
 
 func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.EncodedCellRecord, sync bool, generation uint64, dedupe bool) (cellRecordBatchStats, error) {
+	return s.saveCellRecordSet(ctx, storage.NewStateCellRecords(records), sync, generation, dedupe)
+}
+
+func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCellRecords, sync bool, generation uint64, dedupe bool) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
-	if len(records) == 0 {
+	if records.Empty() {
 		return stats, nil
 	}
 	if err := s.ensureWritable(); err != nil {
@@ -237,40 +224,45 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 
 	var written map[cell.Hash]struct{}
 	if dedupe {
-		written = make(map[cell.Hash]struct{}, len(records))
+		written = make(map[cell.Hash]struct{}, records.Len())
 	}
-	for i, record := range records {
+	i := 0
+	if err := records.ForEach(func(record storage.EncodedCellRecord) error {
 		if i&0x3fff == 0 {
 			select {
 			case <-ctx.Done():
-				return stats, ctx.Err()
+				return ctx.Err()
 			default:
 			}
 		}
+		i++
 
 		if len(record.Data) == 0 {
-			return stats, fmt.Errorf("encoded cell record is empty")
+			return fmt.Errorf("encoded cell record is empty")
 		}
 
 		if dedupe {
 			if _, ok := written[record.Hash]; ok {
 				stats.skipped++
-				continue
+				return nil
 			}
 			written[record.Hash] = struct{}{}
 		}
 
 		if err := writer.set(record.Hash[:], record.Data); err != nil {
-			return stats, err
+			return err
 		}
 		stats.written++
 		stats.bytes += int64(len(record.Data))
 
 		if writer.bytesInBatch >= stateCellImportBatchTargetBytes {
 			if _, err := writer.flush(); err != nil {
-				return stats, err
+				return err
 			}
 		}
+		return nil
+	}); err != nil {
+		return stats, err
 	}
 
 	if _, err := writer.flush(); err != nil {

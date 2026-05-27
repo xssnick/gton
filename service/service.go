@@ -21,7 +21,7 @@ import (
 const (
 	topShard                               = int64(-1 << 63)
 	shardStateCatchUpParallelism           = 4
-	shardStateDownloadBuffer               = 32
+	shardStateDownloadBuffer               = 16
 	shardStateDownloadWorkers              = 4
 	nextBlockDescriptionLookahead          = shardStateDownloadBuffer
 	shardStateCatchUpRetryDelay            = time.Second
@@ -57,8 +57,8 @@ const (
 )
 
 const (
-	DefaultNextBlockCheckpointBlocks = 600
-	DefaultCheckpointBytes           = uint64(1 << 30)
+	DefaultNextBlockCheckpointBlocks = 300
+	DefaultCheckpointBytes           = uint64(512 << 20)
 )
 
 var (
@@ -69,7 +69,7 @@ var (
 )
 var errShardCatchUpNeedsSnapshot = errors.New("shard catch-up requires state snapshot")
 
-type shardBlockLoader func(context.Context, ton.BlockIDExt) (p2p.DownloadedBlock, error)
+type shardBlockLoader func(context.Context, ton.BlockIDExt) (PreparedBlock, error)
 
 type timeoutError interface {
 	Timeout() bool
@@ -77,10 +77,11 @@ type timeoutError interface {
 
 type shardStateDownload struct {
 	prev            ton.BlockIDExt
-	block           p2p.DownloadedBlock
+	block           PreparedBlock
 	err             error
 	source          string
 	downloadElapsed time.Duration
+	prepareElapsed  time.Duration
 }
 
 type shardStateDownloadJob struct {
@@ -147,14 +148,17 @@ type Service struct {
 	shardDescriptionHints map[string]shardDescriptionHint
 	shardDescriptionOrder []string
 
-	nextMasterchainMx      sync.Mutex
-	nextMasterchainQueue   map[string]queuedMasterchainBlock
-	nextMasterchainBySeqno map[uint32]string
-	nextMasterchainBytes   int64
-	validatorCache         masterchainValidatorCache
-	masterStateCacheMu     sync.Mutex
-	masterStateCache       map[string]*storage.BlockState
-	masterStateCacheKeys   []string
+	nextMasterchainMx               sync.Mutex
+	nextMasterchainQueue            map[string]queuedMasterchainBlock
+	nextMasterchainBySeqno          map[uint32]string
+	nextMasterchainBytes            int64
+	nextMasterchainCandidates       map[string]queuedMasterchainCandidate
+	nextMasterchainCandidateBySeqno map[uint32]string
+	nextMasterchainCandidateBytes   int64
+	validatorCache                  masterchainValidatorCache
+	masterStateCacheMu              sync.Mutex
+	masterStateCache                map[string]*storage.BlockState
+	masterStateCacheKeys            []string
 
 	currentStatePersistMu              sync.Mutex
 	currentStatePersistErrMu           sync.Mutex
@@ -224,11 +228,13 @@ type SyncObserver interface {
 type SyncBlockObservation struct {
 	Pipeline         string
 	Chain            string
+	Shard            string
 	Source           string
 	Origin           string
 	Result           string
 	CatchUp          bool
 	DownloadDuration time.Duration
+	PrepareDuration  time.Duration
 	ApplyDuration    time.Duration
 }
 
@@ -249,6 +255,9 @@ func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
 	}
 	if observation.Chain == "" {
 		observation.Chain = "unknown"
+	}
+	if observation.Shard == "" {
+		observation.Shard = "unknown"
 	}
 	if observation.Source == "" {
 		observation.Source = "unknown"
@@ -278,7 +287,19 @@ func syncBlockOriginForSource(source string) string {
 }
 
 func syncBlockSourceForDownloadedBlock(defaultSource string, downloaded p2p.DownloadedBlock) string {
-	switch downloaded.Kind {
+	return syncBlockSourceForKind(defaultSource, downloaded.Kind)
+}
+
+func syncBlockSourceForPreparedBlock(defaultSource string, block PreparedBlock) string {
+	return syncBlockSourceForKind(defaultSource, block.Kind)
+}
+
+func syncBlockSourceForVerifiedBlock(defaultSource string, block VerifiedBlock) string {
+	return syncBlockSourceForKind(defaultSource, block.Kind)
+}
+
+func syncBlockSourceForKind(defaultSource string, kind string) string {
+	switch kind {
 	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
 		return "broadcast_cache"
 	case "tonNode.newShardBlockBroadcast":
@@ -333,6 +354,16 @@ func syncChainLabel(block ton.BlockIDExt) string {
 		return "shardchain"
 	}
 	return fmt.Sprintf("workchain_%d", block.Workchain)
+}
+
+func syncShardLabel(block ton.BlockIDExt) string {
+	if block.Workchain == -1 && block.Shard == topShard {
+		return "masterchain"
+	}
+	if block.Workchain == 0 && block.Shard == topShard {
+		return "basechain"
+	}
+	return fmt.Sprintf("%016x", uint64(block.Shard))
 }
 
 type StatusSnapshot struct {
@@ -786,6 +817,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	observation := SyncBlockObservation{
 		Pipeline:         "blocksync",
 		Chain:            syncChainLabel(synced.Downloaded.ID),
+		Shard:            syncShardLabel(synced.Downloaded.ID),
 		Source:           source,
 		Result:           "success",
 		CatchUp:          synced.CatchUp,
@@ -802,8 +834,11 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		s.observeSyncBlock(observation)
 	}()
 
-	downloaded, err := prepareDownloadedBlock(synced.Downloaded)
+	prepareStarted := time.Now()
+	downloaded := synced.Downloaded
+	verified, err := verifyDownloadedBlock(downloaded)
 	if err != nil {
+		observation.PrepareDuration = time.Since(prepareStarted)
 		return err
 	}
 
@@ -828,51 +863,86 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	}
 
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
-		if err := s.validateSyncedMasterchainBlock(ctx, downloaded); err != nil {
+		checked, err := s.validateSyncedMasterchainBlock(ctx, verified)
+		if err != nil {
+			observation.PrepareDuration = time.Since(prepareStarted)
 			if errors.Is(err, storage.ErrNotFound) {
-				s.queueMasterchainBroadcastCandidateFromSource(downloaded, synced.Trigger.SourceKey)
+				s.queueMasterchainBroadcastCandidateFromSource(verified, synced.Trigger.SourceKey)
 				s.wakeCurrentStateSync()
 				return errSyncedBlockDeferred
 			}
 			return err
 		}
-		downloaded, err = prepareDownloadedBlockStateCells(downloaded)
+		verified.consensusChecked = checked
+		prepared, err := prepareVerifiedBlockForApply(verified)
 		if err != nil {
+			observation.PrepareDuration = time.Since(prepareStarted)
 			return err
 		}
-		s.rememberSeenMasterchainBlock(downloaded.ID)
-		s.queueMasterchainBlockCandidateFromSource(downloaded, synced.Trigger.SourceKey)
+		prepared.PrepareElapsed = time.Since(prepareStarted)
+		observation.PrepareDuration = prepared.PrepareElapsed
+		s.rememberSeenMasterchainBlock(prepared.ID)
+		s.queueMasterchainBlockCandidateFromSource(prepared, synced.Trigger.SourceKey)
 		s.wakeCurrentStateSync()
 		return nil
 	}
 
 	// Shard states are advanced only by the main sync pipeline. Broadcast blocks
 	// are kept as download/cache hints so they cannot compete with live tail apply.
+	observation.PrepareDuration = time.Since(prepareStarted)
 	return nil
 }
 
-func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, downloaded p2p.DownloadedBlock) error {
-	if downloaded.Meta == nil || len(downloaded.Meta.PrevRefs) != 1 {
-		return fmt.Errorf("masterchain block %s has no single previous ref", downloaded.BlockRef())
+func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, block VerifiedBlock) (*checkedMasterchainConsensus, error) {
+	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
+		return nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
 	}
 
-	prev := downloaded.Meta.PrevRefs[0]
+	prev := block.Meta.PrevRefs[0]
 	current, err := s.loadMasterStateForConsensus(ctx, prev)
 	if errors.Is(err, storage.ErrNotFound) {
 		s.log.Debug().
-			Str("block", downloaded.BlockRef()).
+			Str("block", block.BlockRef()).
 			Str("prev", storage.FormatBlockRef(prev)).
 			Msg("skipping synced masterchain block until previous state is available for signature validation")
-		return fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
+		return nil, fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
 	}
 	if err != nil {
-		return fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
+		return nil, fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
 	}
 
-	if err = s.validateMasterchainBlockConsensusWithProof(current, tonBlockForConsensus{block: downloaded.ID, proofBOC: downloaded.ProofBOC, broadcastSignatures: downloaded.BroadcastSignatures}, nil); err != nil {
-		return fmt.Errorf("validate synced masterchain block %s: %w", downloaded.BlockRef(), err)
+	if block.consensus == nil {
+		return nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
 	}
-	return nil
+	checked, err := s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
+	if err != nil {
+		return nil, fmt.Errorf("validate synced masterchain block %s: %w", block.BlockRef(), err)
+	}
+	return checked, nil
+}
+
+func (s *Service) validateVerifiedMasterchainBlock(ctx context.Context, block VerifiedBlock) (*checkedMasterchainConsensus, error) {
+	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
+		return nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
+	}
+
+	prev := block.Meta.PrevRefs[0]
+	current, err := s.loadMasterStateForConsensus(ctx, prev)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
+	}
+
+	if block.consensus == nil {
+		return nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
+	}
+	checked, err := s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
+	if err != nil {
+		return nil, fmt.Errorf("validate masterchain block %s: %w", block.BlockRef(), err)
+	}
+	return checked, nil
 }
 
 func waitRetry(ctx context.Context, delay time.Duration) error {

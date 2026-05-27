@@ -893,7 +893,7 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	blockCell := cell.BeginCell().MustStoreUInt(0xbb, 8).EndCell()
+	blockCell := testPeerBlockRoot(t, -1, topShard, 100)
 	blockData := blockCell.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	rootHash := blockCell.HashKey()
 	fileHash := sha256.Sum256(blockData)

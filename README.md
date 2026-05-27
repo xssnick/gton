@@ -56,14 +56,15 @@ Supported flags:
 | Flag | Description |
 | --- | --- |
 | `--config <path>` | Path to the JSON config. Defaults to `config.json`. |
-| `--log-level <level>` | Global log level: `trace`, `debug`, `info`, `warn`, `error`. |
-| `--log-levels <list>` | Per-category log overrides, for example `liteserver=debug,p2p=warn`. |
+| `--ls-pubkey` | Print the liteserver public key (base64) and exit. |
+| `--verbosity <level>` | Global log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
+| `--log-types <list>` | Per-category log verbosity overrides, for example `liteserver=debug,p2p=warn`. |
 | `--log-json` | Write logs as JSON instead of pretty console output. |
 | `--global-config <url>` | Download global config from the URL and replace the file from `ton.global_config_path` before startup. |
 | `--pprof-addr <addr>` | Enable `net/http/pprof`, for example `127.0.0.1:6060`. |
 | `--from-zero` | Verify the initial key-block chain from zerostate instead of the `init_block` from global config. |
 | `--archive-checkpoint-period <duration>` | Maximum current-state checkpoint interval during archive catch-up. Defaults to `2m`. |
-| `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `8`. |
+| `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `2`. |
 
 ## Console Commands
 
@@ -102,9 +103,9 @@ Simplified example:
     "sync_before": 3600,
     "state_ttl": 259200,
     "archive_ttl": 604800,
-    "next_checkpoint_blocks": 600,
+    "next_checkpoint_blocks": 300,
     "archive_checkpoint_blocks": 2000,
-    "checkpoint_bytes": 1073741824
+    "checkpoint_bytes": 536870912
   },
   "adnl": {
     "key": "<base64 ed25519 seed>",

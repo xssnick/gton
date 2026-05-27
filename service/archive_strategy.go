@@ -17,8 +17,8 @@ import (
 
 const (
 	shardNextBlockCatchUpMaxRemaining = 100_000
-	archiveToNextLagSeconds           = 600
-	nextToArchiveLagSeconds           = 1200
+	archiveToNextLagSeconds           = 200
+	nextToArchiveLagSeconds           = 600
 	maxArchiveMonitorSplitDepth       = 12
 )
 
@@ -78,20 +78,26 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 		done <-chan archiveImportQueueResult
 	}
 
-	jobs := make([]archivePreloadJob, 0, len(shards))
-	for idx, shard := range shards {
-		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, splitDepth, priority)
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shard.String(), err)
-		}
-		jobs = append(jobs, archivePreloadJob{idx: idx, done: done})
+	limit := archiveShardArchiveImportInFlight
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > len(shards) {
+		limit = len(shards)
 	}
 
-	results := make(chan archivePreloadResult, len(shards))
+	results := make(chan archivePreloadResult, limit)
 	var wg sync.WaitGroup
-	for _, job := range jobs {
-		job := job
+	submitted := 0
+	inFlight := 0
+	submit := func(idx int) error {
+		shard := shards[idx]
+		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, splitDepth, priority)
+		if err != nil {
+			return fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shard.String(), err)
+		}
+
+		job := archivePreloadJob{idx: idx, done: done}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -102,33 +108,47 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 			case <-preloadCtx.Done():
 				res = archivePreloadResult{idx: job.idx, err: preloadCtx.Err()}
 			}
-			select {
-			case results <- res:
-			case <-preloadCtx.Done():
-				return
-			}
+			results <- res
 		}()
+		submitted++
+		inFlight++
+		return nil
 	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
 
 	imports := make([]*archiveImportResult, len(shards))
 	var firstErr error
 	completed := 0
-	for res := range results {
+	for submitted < len(shards) && inFlight < limit {
+		if err := submit(submitted); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+
+	for completed < submitted {
+		res := <-results
+		completed++
+		inFlight--
+
 		if res.err != nil {
 			cancel()
 			if firstErr == nil || errors.Is(firstErr, context.Canceled) {
 				firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shards[res.idx].String(), res.err)
 			}
-			continue
+		} else {
+			imports[res.idx] = res.imported
 		}
-		imports[res.idx] = res.imported
-		completed++
+
+		for firstErr == nil && submitted < len(shards) && inFlight < limit {
+			if err := submit(submitted); err != nil {
+				cancel()
+				firstErr = err
+				break
+			}
+		}
 	}
+	wg.Wait()
+
 	if firstErr != nil {
 		return nil, firstErr
 	}
@@ -162,6 +182,7 @@ func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
 	total.ProcessingElapsed += next.ProcessingElapsed
 	total.BlockPrepareElapsed += next.BlockPrepareElapsed
 	total.StateUpdateCells += next.StateUpdateCells
+	total.StateUpdateCellBytes += next.StateUpdateCellBytes
 	total.StateUpdateCellPrepare += next.StateUpdateCellPrepare
 
 	if includeSeqRange {
@@ -175,13 +196,20 @@ func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
 }
 
 func archivePrefixHasChangedShard(prefix archive.ShardID, nextBlocks []ton.BlockIDExt, prevBlocks map[storage.ShardKey]ton.BlockIDExt) bool {
+	return archivePrefixHasChangedShardMatching(prefix, nextBlocks, prevBlocks, nil)
+}
+
+func archivePrefixHasChangedShardMatching(prefix archive.ShardID, nextBlocks []ton.BlockIDExt, prevBlocks map[storage.ShardKey]ton.BlockIDExt, needBlock func(ton.BlockIDExt) bool) bool {
 	for _, next := range nextBlocks {
 		if next.Workchain != prefix.Workchain || !archiveShardIntersects(prefix.Shard, next.Shard) {
 			continue
 		}
 
 		prev, ok := prevBlocks[storage.ShardKeyFromBlock(next)]
-		if !ok || !prev.Equals(&next) {
+		if ok && prev.Equals(&next) {
+			continue
+		}
+		if needBlock == nil || needBlock(next) {
 			return true
 		}
 	}

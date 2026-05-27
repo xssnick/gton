@@ -11,13 +11,10 @@ type stateCheckpointData struct {
 	live      *storage.CurrentState
 	persisted *storage.CurrentState
 	entries   []storage.StateCheckpointBlock
+	cells     storage.StateCellRecords
 }
 
-func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock) (stateCheckpointData, error) {
-	if current == nil {
-		return stateCheckpointData{}, fmt.Errorf("current state is nil")
-	}
-
+func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords) (stateCheckpointData, error) {
 	appliedEntries := cloneStateCheckpointEntries(entries)
 	if len(appliedEntries) == 0 {
 		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
@@ -26,14 +23,15 @@ func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.Sta
 		live:      storage.CloneCurrentState(current),
 		persisted: currentStateWithoutCells(current),
 		entries:   appliedEntries,
+		cells:     cells,
 	}, nil
 }
 
-func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, artifactTarget uint64) (*storage.CurrentState, error) {
+func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, artifactTarget uint64) (*storage.CurrentState, error) {
 	if err := s.waitAppliedBlockArtifacts(ctx, artifactTarget); err != nil {
 		return nil, err
 	}
-	if err := s.storage.SaveStateCheckpointEntries(ctx, entries, current); err != nil {
+	if err := s.storage.SaveStateCheckpointEntries(ctx, entries, cells, current); err != nil {
 		return nil, err
 	}
 	return currentStateWithSavedBlockStates(current, checkpointEntryStates(entries)), nil
@@ -71,7 +69,6 @@ func cloneStateCheckpointEntries(entries []storage.StateCheckpointBlock) []stora
 		}
 		cloned = append(cloned, storage.StateCheckpointBlock{
 			State: storage.CloneBlockState(entry.State),
-			Cells: cloneEncodedCellRecords(entry.Cells),
 		})
 	}
 	return cloned

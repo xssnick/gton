@@ -64,6 +64,7 @@ type archiveCatchUpProgressStats struct {
 	shardTargetParse   time.Duration
 	shardApply         time.Duration
 	stateCells         uint64
+	stateCellBytes     uint64
 	stateCellPrepare   time.Duration
 	checkpointPersist  time.Duration
 }
@@ -94,6 +95,7 @@ func (s archiveCatchUpProgressStats) since(previous archiveCatchUpProgressStats)
 		shardTargetParse:   s.shardTargetParse - previous.shardTargetParse,
 		shardApply:         s.shardApply - previous.shardApply,
 		stateCells:         s.stateCells - previous.stateCells,
+		stateCellBytes:     s.stateCellBytes - previous.stateCellBytes,
 		stateCellPrepare:   s.stateCellPrepare - previous.stateCellPrepare,
 		checkpointPersist:  s.checkpointPersist - previous.checkpointPersist,
 	}
@@ -275,6 +277,7 @@ func (r *archiveCatchUpRunner) recordArchiveWindowProgress(window *shardClientAr
 	stats.archiveDownload += window.totalStats.DownloadElapsed
 	stats.archiveImport += window.totalStats.ImportElapsed
 	stats.stateCells += window.totalStats.StateUpdateCells
+	stats.stateCellBytes += window.totalStats.StateUpdateCellBytes
 	stats.stateCellPrepare += window.totalStats.StateUpdateCellPrepare
 
 	shardArchives := window.totalStats.ShardArchives
@@ -467,6 +470,8 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		Dur("window_shard_apply", windowStats.shardApply).
 		Uint64("state_cells", stats.stateCells).
 		Uint64("window_state_cells", windowStats.stateCells).
+		Uint64("state_cell_bytes", stats.stateCellBytes).
+		Uint64("window_state_cell_bytes", windowStats.stateCellBytes).
 		Dur("window_state_cell_prepare", windowStats.stateCellPrepare).
 		Dur("window_checkpoint_persist", windowStats.checkpointPersist).
 		Str("progress", progress).
@@ -481,6 +486,8 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		Str("window_archive_import_block_speed", formatBlockRate64(windowStats.blocks, windowStats.archiveImport)).
 		Str("state_cell_prepare_speed", logutil.FormatCellRate(stats.stateCells, stats.stateCellPrepare)).
 		Str("window_state_cell_prepare_speed", logutil.FormatCellRate(windowStats.stateCells, windowStats.stateCellPrepare)).
+		Str("state_cell_prepare_byte_speed", logutil.FormatByteRate(int64(stats.stateCellBytes), stats.stateCellPrepare)).
+		Str("window_state_cell_prepare_byte_speed", logutil.FormatByteRate(int64(windowStats.stateCellBytes), windowStats.stateCellPrepare)).
 		Str("window_bottleneck", archiveCatchUpDominantStage(
 			archiveCatchUpStageTiming{name: "pipeline_wait", elapsed: windowStats.pipelineWait},
 			archiveCatchUpStageTiming{name: "apply_wall", elapsed: windowStats.applyWall},

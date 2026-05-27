@@ -96,9 +96,6 @@ type persistentStateFileReader interface {
 }
 
 func NewPersistentStateSnapshotArtifactFromFile(node *Node, file *storage.PersistentStateFile) (storage.DownloadedState, error) {
-	if node == nil {
-		return nil, fmt.Errorf("node is nil")
-	}
 	staged, err := stagedStateFileFromPersistentStateFile(file)
 	if err != nil {
 		return nil, err
@@ -125,12 +122,6 @@ func NewSplitPersistentStateSnapshotArtifactFromStoredFiles(
 	stateRootHash []byte,
 	loadFile PersistentStateFileLoader,
 ) (storage.DownloadedState, error) {
-	if node == nil {
-		return nil, fmt.Errorf("node is nil")
-	}
-	if loadFile == nil {
-		return nil, fmt.Errorf("persistent state file loader is nil")
-	}
 	if len(stateRootHash) == 0 {
 		return nil, fmt.Errorf("persistent state root hash is empty")
 	}
@@ -187,12 +178,6 @@ func NewSplitPersistentStateSnapshotArtifactFromStoredFiles(
 }
 
 func stagedStateFileFromPersistentStateFile(file *storage.PersistentStateFile) (*stagedStateFile, error) {
-	if file == nil {
-		return nil, fmt.Errorf("persistent state file is nil")
-	}
-	if file.Ref == nil {
-		return nil, fmt.Errorf("persistent state file ref is nil")
-	}
 	if file.Ref.Path == "" {
 		return nil, fmt.Errorf("persistent state file path is empty")
 	}
@@ -504,10 +489,6 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 }
 
 func (n *Node) importStagedStateBOCView(ctx context.Context, storageBlock ton.BlockIDExt, staged *stagedStateFile, view *cell.BOCView) (*cell.Cell, error) {
-	if n.storage == nil {
-		return nil, fmt.Errorf("state storage is nil")
-	}
-
 	lazyRoot, err := n.storage.ImportStateBOCView(ctx, storageBlock, view)
 	if err != nil {
 		return nil, err

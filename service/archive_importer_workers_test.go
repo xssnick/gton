@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"testing"
+	"time"
+
+	"github.com/xssnick/gton/service/archive"
 )
 
 func TestArchiveDownloadWorkersUsesNetworkWorkerBudget(t *testing.T) {
@@ -106,6 +110,71 @@ func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
 	}
 	if snapshot.downloadHotQueued != 1 || snapshot.downloadPrefetchQueued != 1 || snapshot.prepareHotQueued != 0 || snapshot.preparePrefetchQueued != 1 {
 		t.Fatalf("queued jobs = download:%d/%d prepare:%d/%d, want download:1/1 prepare:0/1", snapshot.downloadHotQueued, snapshot.downloadPrefetchQueued, snapshot.prepareHotQueued, snapshot.preparePrefetchQueued)
+	}
+}
+
+func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
+	shards := make([]archive.ShardID, archiveShardArchiveImportInFlight+3)
+	for i := range shards {
+		shards[i] = archive.ShardID{Workchain: 0, Shard: int64(i+1) << 48}
+	}
+
+	queue := &archiveImportQueue{
+		downloadHot:      make(chan archiveDownloadJob, len(shards)),
+		downloadPrefetch: make(chan archiveDownloadJob, len(shards)),
+	}
+	runner := &archiveCatchUpRunner{}
+	done := make(chan error, 1)
+	go func() {
+		imports, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, shards, 0, archiveImportPriorityPrefetch)
+		if err == nil && len(imports) != len(shards) {
+			err = errors.New("unexpected import count")
+		}
+		done <- err
+	}()
+
+	jobs := make([]archiveDownloadJob, 0, len(shards))
+	for i := 0; i < archiveShardArchiveImportInFlight; i++ {
+		jobs = append(jobs, receiveArchiveDownloadJob(t, queue.downloadPrefetch))
+	}
+
+	select {
+	case job := <-queue.downloadPrefetch:
+		t.Fatalf("submitted archive %d before an in-flight import completed", job.masterchainSeqno)
+	default:
+	}
+
+	jobs[0].done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+	jobs = append(jobs, receiveArchiveDownloadJob(t, queue.downloadPrefetch))
+
+	for _, job := range jobs[1:] {
+		job.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+	}
+	for len(jobs) < len(shards) {
+		job := receiveArchiveDownloadJob(t, queue.downloadPrefetch)
+		job.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+		jobs = append(jobs, job)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("downloadAndImportShardArchives did not finish")
+	}
+}
+
+func receiveArchiveDownloadJob(t *testing.T, jobs <-chan archiveDownloadJob) archiveDownloadJob {
+	t.Helper()
+
+	select {
+	case job := <-jobs:
+		return job
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for archive download job")
+		return archiveDownloadJob{}
 	}
 }
 

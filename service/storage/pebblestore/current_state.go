@@ -14,16 +14,10 @@ import (
 )
 
 func (s *Store) SaveCurrentState(ctx context.Context, state *storage.CurrentState) error {
-	if state == nil {
-		return fmt.Errorf("current state is nil")
-	}
 	return s.saveCurrentStateRecord(ctx, hotKeyCurrentState(), state, pebble.NoSync)
 }
 
 func (s *Store) SaveStateSyncProgress(ctx context.Context, state *storage.CurrentState) error {
-	if state == nil {
-		return fmt.Errorf("state sync progress is nil")
-	}
 	return s.saveCurrentStateRecord(ctx, hotKeyStateSyncProgress(), state, pebble.Sync)
 }
 
@@ -154,7 +148,7 @@ type preparedBlockStateSave struct {
 }
 
 func (s *Store) SaveBlockState(ctx context.Context, state *storage.BlockState) error {
-	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, []*storage.BlockState{state}, storage.StateCheckpointCells{})
+	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, []*storage.BlockState{state}, storage.StateCellRecords{})
 	if err != nil {
 		return err
 	}
@@ -165,15 +159,11 @@ func (s *Store) SaveBlockState(ctx context.Context, state *storage.BlockState) e
 }
 
 func (s *Store) SaveStateCheckpoint(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
-	return s.SaveStateCheckpointEntries(ctx, checkpointEntriesFromStates(blocks), current)
+	return s.SaveStateCheckpointEntries(ctx, checkpointEntriesFromStates(blocks), storage.StateCellRecords{}, current)
 }
 
-func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage.StateCheckpointBlock, current *storage.CurrentState) error {
-	if current == nil {
-		return fmt.Errorf("current state is nil")
-	}
-
-	states, cells := flattenStateCheckpointEntries(blocks)
+func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage.StateCheckpointBlock, cells storage.StateCellRecords, current *storage.CurrentState) error {
+	states := checkpointEntryStates(blocks)
 	prepared, cellsElapsed, err := s.prepareBlockStatesForSave(ctx, states, cells)
 	if err != nil {
 		return err
@@ -198,40 +188,24 @@ func checkpointEntriesFromStates(states []*storage.BlockState) []storage.StateCh
 	return entries
 }
 
-func flattenStateCheckpointEntries(entries []storage.StateCheckpointBlock) ([]*storage.BlockState, storage.StateCheckpointCells) {
+func checkpointEntryStates(entries []storage.StateCheckpointBlock) []*storage.BlockState {
 	if len(entries) == 0 {
-		return nil, storage.StateCheckpointCells{}
+		return nil
 	}
 
 	states := make([]*storage.BlockState, 0, len(entries))
-	totalCells := 0
 	for _, entry := range entries {
 		if entry.State == nil {
 			continue
 		}
 		states = append(states, entry.State)
-		totalCells += len(entry.Cells)
 	}
-
-	if totalCells == 0 {
-		return states, storage.StateCheckpointCells{}
-	}
-	cells := make([]storage.EncodedCellRecord, 0, totalCells)
-	for _, entry := range entries {
-		if entry.State == nil {
-			continue
-		}
-		cells = append(cells, entry.Cells...)
-	}
-	return states, storage.StateCheckpointCells{Records: cells}
+	return states
 }
 
 func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState) (uint64, error) {
 	if generation == 0 {
 		return 0, fmt.Errorf("cell generation is zero")
-	}
-	if current == nil {
-		return 0, fmt.Errorf("current state is nil")
 	}
 	if isEmptyBlockID(origin) {
 		return 0, fmt.Errorf("cell generation origin persistent state is empty")
@@ -252,9 +226,6 @@ func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, ori
 }
 
 func (s *Store) DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Context, origin ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (int, error) {
-	if current == nil {
-		return 0, fmt.Errorf("current state is nil")
-	}
 	if isEmptyBlockID(origin) {
 		return 0, fmt.Errorf("cell generation origin persistent state is empty")
 	}
@@ -297,7 +268,7 @@ func (s *Store) DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Contex
 	return deleted, nil
 }
 
-func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState, cells storage.StateCheckpointCells) ([]preparedBlockStateSave, time.Duration, error) {
+func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState, cells storage.StateCellRecords) ([]preparedBlockStateSave, time.Duration, error) {
 	cellGeneration, err := s.activeCellGenerationID()
 	if err != nil {
 		return nil, 0, err
@@ -305,7 +276,7 @@ func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage
 	return s.prepareBlockStatesForSaveInGeneration(ctx, cellGeneration, states, cells, false)
 }
 
-func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellGeneration uint64, states []*storage.BlockState, cells storage.StateCheckpointCells, strictGeneration bool) ([]preparedBlockStateSave, time.Duration, error) {
+func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellGeneration uint64, states []*storage.BlockState, cells storage.StateCellRecords, strictGeneration bool) ([]preparedBlockStateSave, time.Duration, error) {
 	if cellGeneration == 0 {
 		return nil, 0, fmt.Errorf("cell generation is zero")
 	}
@@ -314,7 +285,7 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 	seen := make(map[string]struct{}, len(states))
 	trees := make([]stateCellTreeSave, 0, len(states))
 	treePreparedIndexes := make([]int, 0, len(states))
-	usePreparedCells := len(cells.Records) > 0
+	usePreparedCells := !cells.Empty()
 	for _, state := range states {
 		if state == nil {
 			continue
@@ -361,7 +332,7 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 		prepared = append(prepared, next)
 	}
 
-	preparedStats, err := s.savePreparedStateCellRecords(ctx, cells.Records, cellGeneration)
+	preparedStats, err := s.savePreparedStateCellRecords(ctx, cells, cellGeneration)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -405,10 +376,6 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 func prepareBlockStateHeader(state *storage.BlockState) (storage.BlockState, cell.Hash, error) {
 	var zero cell.Hash
 	var stateRootHash cell.Hash
-	if state == nil {
-		return storage.BlockState{}, stateRootHash, fmt.Errorf("block state is nil")
-	}
-
 	saved := *state
 	if len(saved.StateRootHash) == 0 && saved.Cell != nil {
 		hash := saved.Cell.HashKey(0)
@@ -708,9 +675,6 @@ func currentStateBlockKeepSet(current *storage.CurrentState, additional []ton.Bl
 }
 
 func verifyCellGenerationSwitchCurrent(db *pebble.DB, expectedMaster ton.BlockIDExt, current *storage.CurrentState) error {
-	if current == nil {
-		return fmt.Errorf("current state is nil")
-	}
 	if !current.Masterchain.Block.Equals(&expectedMaster) {
 		return fmt.Errorf("candidate current state %s does not match expected switch current %s", storage.FormatBlockRef(current.Masterchain.Block), storage.FormatBlockRef(expectedMaster))
 	}

@@ -44,7 +44,12 @@ func TestApplyBlockFromFixture(t *testing.T) {
 		t.Fatalf("build current state from old update branch: %v", err)
 	}
 
-	next, err := ApplyBlock(current, *downloaded)
+	prepared, err := prepareDownloadedBlockForApply(*downloaded)
+	if err != nil {
+		t.Fatalf("prepare block: %v", err)
+	}
+
+	next, err := ApplyBlock(current, prepared)
 	if err != nil {
 		t.Fatalf("apply block: %v", err)
 	}
@@ -68,7 +73,7 @@ func TestApplyBlockFromFixture(t *testing.T) {
 
 func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
-	prepared, err := prepareDownloadedBlock(*downloaded)
+	prepared, err := prepareDownloadedBlockForApply(*downloaded)
 	if err != nil {
 		t.Fatalf("prepare fixture block: %v", err)
 	}
@@ -96,8 +101,8 @@ func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	}
 	current.Block = prepared.Meta.PrevRefs[0]
 
-	downloaded.ProofBOC = nil
-	next, _, err := (&Service{}).applyStoredMasterchainTransition(current, *downloaded, nil)
+	prepared.ProofBOC = nil
+	next, _, err := (&Service{}).applyStoredMasterchainTransition(current, prepared, nil)
 	if err != nil {
 		t.Fatalf("apply stored masterchain transition: %v", err)
 	}
@@ -118,7 +123,12 @@ func TestApplyBlockRejectsWrongCurrentState(t *testing.T) {
 		StateRootHash: bytes32(0x42),
 	}
 
-	if _, err := ApplyBlock(current, *downloaded); err == nil {
+	prepared, err := prepareDownloadedBlockForApply(*downloaded)
+	if err != nil {
+		t.Fatalf("prepare block: %v", err)
+	}
+
+	if _, err := ApplyBlock(current, prepared); err == nil {
 		t.Fatal("expected apply block to reject wrong current state")
 	}
 }
@@ -381,9 +391,9 @@ func TestMerkleUpdateWindowCacheUsesPreparedDestinationCells(t *testing.T) {
 
 	checkpoint := window.beginCheckpoint()
 	records := checkpoint.records()
-	for hash := range prepared {
-		if !hasCellRecord(records, hash) {
-			t.Fatalf("checkpoint cache does not contain prepared cell %x", hash[:])
+	for _, record := range prepared.Records {
+		if !hasCellRecord(records, record.Hash) {
+			t.Fatalf("checkpoint cache does not contain prepared cell %x", record.Hash[:])
 		}
 	}
 	if hasCellRecord(records, prunedOldLeaf.HashKey()) || hasCellRecord(records, prunedStable.HashKey()) {
@@ -399,7 +409,7 @@ func TestMerkleUpdateWindowCacheRejectsPreparedDestinationWithoutRoot(t *testing
 	if err != nil {
 		t.Fatalf("prepare destination cells: %v", err)
 	}
-	delete(prepared, to.Virtualize(0).HashKey())
+	prepared = removePreparedCellRecord(prepared, to.Virtualize(0).HashKey())
 
 	window := newStateCellWindowCache(func(hash cell.Hash) (*cell.Cell, error) {
 		return nil, fmt.Errorf("unexpected base load %x", hash[:])
@@ -685,13 +695,13 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 	second[0] = 2
 
 	window := newStateCellWindowCache(nil)
-	window.addPreparedRecords(map[cell.Hash][]byte{
+	window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: []byte{1, 2, 3},
-	})
+	}))
 	checkpoint := window.beginCheckpoint()
-	window.addPreparedRecords(map[cell.Hash][]byte{
+	window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{4, 5},
-	})
+	}))
 
 	if got := window.byteSize(); got != 5 {
 		t.Fatalf("window byte size = %d, want 5", got)
@@ -702,9 +712,9 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 		t.Fatalf("window byte size after checkpoint = %d, want 2", got)
 	}
 
-	window.addPreparedRecords(map[cell.Hash][]byte{
+	window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{6},
-	})
+	}))
 	if got := window.byteSize(); got != 1 {
 		t.Fatalf("window byte size after replacement = %d, want 1", got)
 	}
@@ -737,30 +747,27 @@ func TestStateCellWindowLoaderUsesSourceSnapshot(t *testing.T) {
 	}
 }
 
-func TestArchiveStateCellOverlayLoaderUsesSourceSnapshot(t *testing.T) {
+func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
-	cache := newArchiveStateCellRecordCache(1)
-	cache.addRecords(mustPreparedReachableStateCells(t, root))
 
+	base := newArchiveStateCellOverlay(nil)
 	overlay := newArchiveStateCellOverlay(nil)
-	overlay.mu.Lock()
-	overlay.active = nil
-	overlay.pending = []*archiveStateCellRecordCache{cache}
-	overlay.mu.Unlock()
+	overlay.rememberPreparedCells(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
+	overlay.copyRecordsTo(base)
+	overlay.releaseRecordsToBase(base.loader())
 
-	overlay.mu.Lock()
-	overlay.pending = nil
-	overlay.active = newArchiveStateCellRecordCache(1)
-	overlay.mu.Unlock()
+	if got := overlay.byteSize(); got != 0 {
+		t.Fatalf("released overlay byte size = %d, want 0", got)
+	}
 
 	loaded, err := loader(root.HashKey())
 	if err != nil {
-		t.Fatalf("load archive cell from snapshot: %v", err)
+		t.Fatalf("load archive cell through released loader base: %v", err)
 	}
 	if loaded.HashKey() != root.HashKey() {
-		t.Fatal("loaded archive snapshot cell hash mismatch")
+		t.Fatal("loaded archive cell hash mismatch")
 	}
 }
 
@@ -770,13 +777,13 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 	second[0] = 2
 
 	overlay := newArchiveStateCellOverlay(nil)
-	overlay.rememberPreparedCells(map[cell.Hash][]byte{
+	overlay.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
 		first: []byte{1, 2, 3, 4},
-	})
+	}))
 	checkpoint := overlay.beginCheckpoint()
-	overlay.rememberPreparedCells(map[cell.Hash][]byte{
+	overlay.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{5, 6},
-	})
+	}))
 
 	if got := overlay.byteSize(); got != 6 {
 		t.Fatalf("overlay byte size = %d, want 6", got)
@@ -787,9 +794,9 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 		t.Fatalf("overlay byte size after checkpoint = %d, want 2", got)
 	}
 
-	overlay.rememberPreparedCells(map[cell.Hash][]byte{
+	overlay.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{7},
-	})
+	}))
 	if got := overlay.byteSize(); got != 1 {
 		t.Fatalf("overlay byte size after replacement = %d, want 1", got)
 	}
@@ -858,7 +865,7 @@ func markFullProofSubtree(tb testing.TB, root *cell.Cell) {
 	}
 }
 
-func mustPreparedStateUpdateCells(tb testing.TB, update *cell.Cell) map[cell.Hash][]byte {
+func mustPreparedStateUpdateCells(tb testing.TB, update *cell.Cell) tnstore.StateCellRecords {
 	tb.Helper()
 
 	prepared, err := tnstore.PrepareStateUpdateCells(update)
@@ -868,7 +875,7 @@ func mustPreparedStateUpdateCells(tb testing.TB, update *cell.Cell) map[cell.Has
 	return prepared
 }
 
-func mustPreparedReachableStateCells(tb testing.TB, root *cell.Cell) map[cell.Hash][]byte {
+func mustPreparedReachableStateCells(tb testing.TB, root *cell.Cell) tnstore.StateCellRecords {
 	tb.Helper()
 
 	prepared, err := tnstore.PrepareReachableStateCells(root)
@@ -876,6 +883,25 @@ func mustPreparedReachableStateCells(tb testing.TB, root *cell.Cell) map[cell.Ha
 		tb.Fatalf("prepare reachable state cells: %v", err)
 	}
 	return prepared
+}
+
+func testStateCellRecords(records map[cell.Hash][]byte) tnstore.StateCellRecords {
+	encoded := make([]tnstore.EncodedCellRecord, 0, len(records))
+	for hash, data := range records {
+		encoded = append(encoded, tnstore.EncodedCellRecord{Hash: hash, Data: data})
+	}
+	return tnstore.NewStateCellRecords(encoded)
+}
+
+func removePreparedCellRecord(records tnstore.StateCellRecords, hash cell.Hash) tnstore.StateCellRecords {
+	encoded := make([]tnstore.EncodedCellRecord, 0, records.Len())
+	for _, record := range records.Records {
+		if record.Hash == hash {
+			continue
+		}
+		encoded = append(encoded, record)
+	}
+	return tnstore.NewStateCellRecords(encoded)
 }
 
 func hasCellRecord(records []tnstore.EncodedCellRecord, hash cell.Hash) bool {
@@ -1022,15 +1048,30 @@ func mustLoadFixtureDownloadedBlock(tb testing.TB) *p2p.DownloadedBlock {
 		tb.Fatalf("parse shard: %v", err)
 	}
 
+	id := ton.BlockIDExt{
+		Workchain: fixture.Block.Workchain,
+		Shard:     int64(shard),
+		SeqNo:     fixture.Block.SeqNo,
+		RootHash:  rootHash,
+		FileHash:  fileHash,
+	}
+	parsed, err := tnstore.ParseVerifiedBlockCell(id, blockCell)
+	if err != nil {
+		tb.Fatalf("parse fixture block: %v", err)
+	}
+	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
+	if err != nil {
+		tb.Fatalf("build fixture block meta: %v", err)
+	}
+
 	return &p2p.DownloadedBlock{
-		ID: ton.BlockIDExt{
-			Workchain: fixture.Block.Workchain,
-			Shard:     int64(shard),
-			SeqNo:     fixture.Block.SeqNo,
-			RootHash:  rootHash,
-			FileHash:  fileHash,
-		},
-		Block: blockCell,
+		ID:               id,
+		Kind:             "fixture",
+		Block:            blockCell,
+		BlockBOC:         blockData,
+		Meta:             meta,
+		StateUpdate:      parsed.StateUpdate,
+		VerifiedRootHash: true,
 	}
 }
 

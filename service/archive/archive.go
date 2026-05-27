@@ -55,6 +55,7 @@ type ImportStats struct {
 	ProcessingElapsed      time.Duration
 	BlockPrepareElapsed    time.Duration
 	StateUpdateCells       uint64
+	StateUpdateCellBytes   uint64
 	StateUpdateCellPrepare time.Duration
 	ContainsShardBlocks    bool
 }
@@ -64,7 +65,8 @@ type PreparedBlock struct {
 	Parsed                    *tlb.Block
 	Meta                      *storage.BlockMeta
 	State                     *storage.BlockState
-	StateUpdateToCells        map[cell.Hash][]byte
+	StateUpdate               *cell.Cell
+	StateUpdateToCells        storage.StateCellRecords
 	StateUpdateToCellsElapsed time.Duration
 }
 

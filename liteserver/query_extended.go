@@ -1133,7 +1133,7 @@ func msgEnvelopeMetadata(envelope *cell.Cell) (*ton.TransactionMetadata, error) 
 		return nil, err
 	}
 	if initiator == nil {
-		return nil, fmt.Errorf("message metadata initiator is nil")
+		return nil, fmt.Errorf("message metadata has no initiator")
 	}
 	initiatorLT, err := loader.LoadUInt(64)
 	if err != nil {

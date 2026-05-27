@@ -4,7 +4,6 @@ import (
 	"sort"
 
 	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type appliedStateSet struct {
@@ -13,7 +12,6 @@ type appliedStateSet struct {
 
 type appliedStateEntry struct {
 	state *storage.BlockState
-	cells []storage.EncodedCellRecord
 }
 
 type appliedStateCheckpoint struct {
@@ -22,10 +20,6 @@ type appliedStateCheckpoint struct {
 }
 
 func (s *appliedStateSet) remember(state *storage.BlockState) {
-	s.rememberWithCells(state, nil)
-}
-
-func (s *appliedStateSet) rememberWithCells(state *storage.BlockState, cells map[cell.Hash][]byte) {
 	if state == nil {
 		return
 	}
@@ -34,7 +28,6 @@ func (s *appliedStateSet) rememberWithCells(state *storage.BlockState, cells map
 	}
 	s.states[storage.BlockKey(state.Block)] = appliedStateEntry{
 		state: storage.CloneBlockState(state),
-		cells: encodedCellRecordsFromMap(cells),
 	}
 }
 
@@ -70,7 +63,6 @@ func (s *appliedStateSet) checkpoint() appliedStateCheckpoint {
 		entry := s.states[key]
 		entries = append(entries, storage.StateCheckpointBlock{
 			State: storage.CloneBlockState(entry.state),
-			Cells: cloneEncodedCellRecords(entry.cells),
 		})
 	}
 
@@ -149,27 +141,5 @@ func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
 func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
 	return appliedStateEntry{
 		state: storage.CloneBlockState(entry.state),
-		cells: cloneEncodedCellRecords(entry.cells),
 	}
-}
-
-func cloneEncodedCellRecords(records []storage.EncodedCellRecord) []storage.EncodedCellRecord {
-	if len(records) == 0 {
-		return nil
-	}
-	return append([]storage.EncodedCellRecord(nil), records...)
-}
-
-func encodedCellRecordsFromMap(records map[cell.Hash][]byte) []storage.EncodedCellRecord {
-	if len(records) == 0 {
-		return nil
-	}
-	encoded := make([]storage.EncodedCellRecord, 0, len(records))
-	for hash, data := range records {
-		if len(data) == 0 {
-			continue
-		}
-		encoded = append(encoded, storage.EncodedCellRecord{Hash: hash, Data: data})
-	}
-	return encoded
 }

@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
@@ -16,7 +15,7 @@ import (
 )
 
 const (
-	nextMasterchainPrefetchBlocks    = 32
+	nextMasterchainPrefetchBlocks    = 16
 	nextShardPrefetchScheduleLimit   = 2048
 	nextShardPrefetchWorkers         = 8
 	shardDescriptionPrefetchMaxAhead = 20
@@ -80,21 +79,23 @@ type nextSyncRunner struct {
 
 type nextMasterDownload struct {
 	prev            ton.BlockIDExt
-	block           p2p.DownloadedBlock
+	block           PreparedBlock
 	source          string
 	downloadElapsed time.Duration
+	prepareElapsed  time.Duration
 	err             error
 }
 
 type nextAppliedMaster struct {
 	prev                 ton.BlockIDExt
-	block                p2p.DownloadedBlock
+	block                PreparedBlock
 	master               *storage.BlockState
 	downloadSource       string
 	downloadElapsed      time.Duration
+	prepareElapsed       time.Duration
 	applyTiming          masterchainApplyTiming
 	stageElapsed         time.Duration
-	stateUpdateCells     map[cell.Hash][]byte
+	stateUpdateCells     storage.StateCellRecords
 	releaseApplyCells    func()
 	shardTargets         []ton.BlockIDExt
 	shardTargetParse     time.Duration
@@ -102,9 +103,19 @@ type nextAppliedMaster struct {
 	err                  error
 }
 
+func downloadElapsedExcludingInlinePrepare(elapsed, prepareElapsed time.Duration) time.Duration {
+	if prepareElapsed <= 0 {
+		return elapsed
+	}
+	if prepareElapsed >= elapsed {
+		return 0
+	}
+	return elapsed - prepareElapsed
+}
+
 type nextMasterApplyCellLayer struct {
 	block   ton.BlockIDExt
-	records map[cell.Hash][]byte
+	records storage.StateCellRecords
 }
 
 // nextMasterApplyCellWindow is private to master apply-ahead. Future cells are
@@ -120,27 +131,27 @@ func newNextMasterApplyCellWindow(base cell.LazyCellLoader) *nextMasterApplyCell
 	return &nextMasterApplyCellWindow{base: base}
 }
 
-func (w *nextMasterApplyCellWindow) applyBlockStateUpdate(previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
-	updateTo, err := merkleUpdateToRef(downloaded.Parsed.StateUpdate)
+func (w *nextMasterApplyCellWindow) applyBlockStateUpdate(previous []*storage.BlockState, block PreparedBlock) (*cell.Cell, error) {
+	updateTo, err := merkleUpdateToRef(block.StateUpdate)
 	if err != nil {
 		return nil, err
 	}
-	if downloaded.StateUpdateToCells == nil {
+	if block.StateUpdateToCells.Empty() {
 		return nil, fmt.Errorf("prepared state update cells are missing")
 	}
 
 	nextRoot := updateTo.Virtualize(0)
 	rootHash := nextRoot.GetMetadata().Hash
-	if len(downloaded.StateUpdateToCells[rootHash]) == 0 {
+	if !block.StateUpdateToCells.Has(rootHash) {
 		return nil, fmt.Errorf("prepared state update cells do not contain destination root %x", rootHash[:])
 	}
 
-	loader := w.loaderWith(downloaded.StateUpdateToCells)
+	loader := w.loaderWith(block.StateUpdateToCells)
 	currentRoot, err := previousStateRootWithLoader(previous, loader)
 	if err != nil {
 		return nil, err
 	}
-	if err = cell.MayApplyMerkleUpdate(currentRoot, downloaded.Parsed.StateUpdate); err != nil {
+	if err = cell.MayApplyMerkleUpdate(currentRoot, block.StateUpdate); err != nil {
 		return nil, err
 	}
 
@@ -151,8 +162,8 @@ func (w *nextMasterApplyCellWindow) applyBlockStateUpdate(previous []*storage.Bl
 	return loaded, nil
 }
 
-func (w *nextMasterApplyCellWindow) remember(block ton.BlockIDExt, records map[cell.Hash][]byte) {
-	if w == nil || len(records) == 0 {
+func (w *nextMasterApplyCellWindow) remember(block ton.BlockIDExt, records storage.StateCellRecords) {
+	if w == nil || records.Empty() {
 		return
 	}
 
@@ -185,10 +196,10 @@ func (w *nextMasterApplyCellWindow) forget(block ton.BlockIDExt) {
 	}
 }
 
-func (w *nextMasterApplyCellWindow) loaderWith(records map[cell.Hash][]byte) cell.LazyCellLoader {
+func (w *nextMasterApplyCellWindow) loaderWith(records storage.StateCellRecords) cell.LazyCellLoader {
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
-		if data := records[hash]; len(data) > 0 {
+		if data := records.Data(hash); len(data) > 0 {
 			return cachedLazyCell(hash, data, load)
 		}
 		return w.load(hash)
@@ -204,7 +215,7 @@ func (w *nextMasterApplyCellWindow) load(hash cell.Hash) (*cell.Cell, error) {
 	var data []byte
 	w.mu.RLock()
 	for i := len(w.layers) - 1; i >= 0; i-- {
-		if candidate := w.layers[i].records[hash]; len(candidate) > 0 {
+		if candidate := w.layers[i].records.Data(hash); len(candidate) > 0 {
 			data = candidate
 			break
 		}
@@ -240,9 +251,6 @@ func (s *Service) runNextSyncBootstrap(ctx context.Context, current *storage.Cur
 }
 
 func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState, mode nextSyncMode, target ton.BlockIDExt, maxBlocks uint32, method string) (*storage.CurrentState, uint32, error) {
-	if current == nil {
-		return nil, 0, fmt.Errorf("current state is nil")
-	}
 	if s.cellGenerationSwitchActive() {
 		return nil, 0, errCellGenerationMigrationRunning
 	}
@@ -357,6 +365,7 @@ func (r *nextSyncRunner) runTargetMasterSource(out chan<- nextMasterDownload) {
 			block:           item.block,
 			source:          item.source,
 			downloadElapsed: item.downloadElapsed,
+			prepareElapsed:  item.prepareElapsed,
 			err:             item.err,
 		}
 		if next.source == "" {
@@ -366,10 +375,12 @@ func (r *nextSyncRunner) runTargetMasterSource(out chan<- nextMasterDownload) {
 			r.service.observeSyncBlock(SyncBlockObservation{
 				Pipeline:         r.method,
 				Chain:            syncChainLabel(item.prev),
+				Shard:            syncShardLabel(item.prev),
 				Source:           next.source,
 				Result:           syncBlockResultForError(next.err),
 				CatchUp:          true,
 				DownloadDuration: next.downloadElapsed,
+				PrepareDuration:  next.prepareElapsed,
 			})
 		}
 		if !r.sendMasterDownload(out, next) {
@@ -397,16 +408,22 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		probeState.liveTail = nextBlockBootstrapLiveTail(prevUTime, time.Now().Unix())
 
 		started := time.Now()
-		downloaded, source, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, probeState)
+		downloaded, source, prepareElapsed, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, probeState)
 		elapsed := time.Since(started)
+		downloadElapsed := downloadElapsedExcludingInlinePrepare(elapsed, prepareElapsed)
 		if err != nil {
+			if source == "" {
+				source = "peer_probe"
+			}
 			r.service.observeSyncBlock(SyncBlockObservation{
 				Pipeline:         r.method,
 				Chain:            syncChainLabel(prev),
-				Source:           "peer_probe",
+				Shard:            syncShardLabel(prev),
+				Source:           source,
 				Result:           syncBlockResultForError(err),
 				CatchUp:          false,
-				DownloadDuration: elapsed,
+				DownloadDuration: downloadElapsed,
+				PrepareDuration:  prepareElapsed,
 			})
 			if isExpectedRetryError(err) {
 				probeState.consecutiveMisses++
@@ -429,7 +446,8 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 			prev:            prev,
 			block:           downloaded,
 			source:          source,
-			downloadElapsed: elapsed,
+			downloadElapsed: downloadElapsed,
+			prepareElapsed:  prepareElapsed,
 		}
 		if !r.sendMasterDownload(out, item) {
 			return
@@ -534,23 +552,47 @@ func (r *nextSyncRunner) startMasterApply(downloads <-chan nextMasterDownload) <
 func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMasterDownload, applyCells *nextMasterApplyCellWindow) (nextAppliedMaster, error) {
 	applied := nextAppliedMaster{
 		prev:            item.prev,
-		block:           item.block,
 		downloadSource:  item.source,
 		downloadElapsed: item.downloadElapsed,
+		prepareElapsed:  item.prepareElapsed,
 	}
 	observe := func(result string, applyDuration time.Duration) {
 		r.service.observeSyncBlock(SyncBlockObservation{
 			Pipeline:         r.method,
 			Chain:            syncChainLabel(item.block.ID),
+			Shard:            syncShardLabel(item.block.ID),
 			Source:           item.source,
 			Result:           result,
 			CatchUp:          r.mode == nextSyncToTarget,
 			DownloadDuration: item.downloadElapsed,
+			PrepareDuration:  item.prepareElapsed,
 			ApplyDuration:    applyDuration,
 		})
 	}
 
-	nextMaster, applyTiming, err := r.service.applyMasterchainTransitionWithConsensusProof(master, item.block, nil, applyCells)
+	consensusStarted := time.Now()
+	applyTiming := masterchainApplyTiming{
+		prepare: item.block.StateUpdateToCellsElapsed,
+	}
+	checked, err := r.service.checkedConsensusForPreparedBlock(master, item.block)
+	if err != nil {
+		applyTiming.consensus = time.Since(consensusStarted)
+		applyTiming.total = applyTiming.consensus
+		applied.err = fmt.Errorf("validate masterchain consensus for %s: %w", item.block.BlockRef(), err)
+		observe(syncBlockResultForError(applied.err), applyTiming.total)
+		return applied, applied.err
+	}
+	applyTiming.consensus = time.Since(consensusStarted)
+	applyTiming.total = applyTiming.consensus
+	item.block.consensusChecked = checked
+	prepared := item.block
+	applied.block = prepared
+
+	nextMaster, transitionTiming, err := r.service.applyMasterchainTransitionWithCheckedConsensus(master, prepared, checked, applyCells)
+	applyTiming.prepare += transitionTiming.prepare
+	applyTiming.consensus += transitionTiming.consensus
+	applyTiming.stateUpdate += transitionTiming.stateUpdate
+	applyTiming.total += transitionTiming.total
 	applied.applyTiming = applyTiming
 	if err != nil {
 		applied.err = err
@@ -558,19 +600,19 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 		return applied, err
 	}
 
-	r.service.publishLiveBlockArtifacts(item.block, nextMaster, false)
-	if err = r.service.stageAppliedBlockArtifact(r.ctx, item.block, 0); err != nil {
+	r.service.publishLiveBlockArtifacts(prepared, nextMaster, false)
+	if err = r.service.stageAppliedBlockArtifact(r.ctx, prepared, 0); err != nil {
 		applied.err = err
 		observe(syncBlockResultForError(err), applyTiming.total)
 		return applied, err
 	}
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
 	r.service.rememberMasterState(nextMaster)
-	applyCells.remember(item.block.ID, item.block.StateUpdateToCells)
+	applyCells.remember(prepared.ID, prepared.StateUpdateToCells)
 	applied.master = nextMaster
-	applied.stateUpdateCells = item.block.StateUpdateToCells
+	applied.stateUpdateCells = prepared.StateUpdateToCells
 	applied.releaseApplyCells = func() {
-		applyCells.forget(item.block.ID)
+		applyCells.forget(prepared.ID)
 	}
 	observe("success", applyTiming.total)
 	return applied, nil
@@ -938,11 +980,12 @@ func (r *nextSyncRunner) flushStagedCurrentSync(reason string) error {
 
 	checkpoint := r.checkpoint()
 	cells := r.stateCells.beginCheckpoint()
-	next, err := r.service.persistNextBlockCurrentStateSyncLocked(r.current, &r.timing, reason, checkpoint.entries, cells, lockElapsed)
+	next, err := r.service.persistNextBlockCurrentStateSyncLocked(r.current, &r.timing, reason, checkpoint.entries, cells, func() {
+		r.completeCheckpoint(checkpoint)
+	}, lockElapsed)
 	if err != nil {
 		return err
 	}
-	r.completeCheckpoint(checkpoint)
 	r.current = next
 	r.stagedBlocks = 0
 	return nil
@@ -1089,14 +1132,16 @@ func (r *nextSyncRunner) takeShardResolverStats() shardStateResolverStats {
 	return delta
 }
 
-func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded p2p.DownloadedBlock, applyElapsed time.Duration) (err error) {
+func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded PreparedBlock, applyElapsed time.Duration) (err error) {
 	observation := SyncBlockObservation{
-		Pipeline:      r.method,
-		Chain:         syncChainLabel(downloaded.ID),
-		Source:        syncBlockSourceForDownloadedBlock("next_block", downloaded),
-		Result:        "success",
-		CatchUp:       r.mode == nextSyncToTarget,
-		ApplyDuration: applyElapsed,
+		Pipeline:        r.method,
+		Chain:           syncChainLabel(downloaded.ID),
+		Shard:           syncShardLabel(downloaded.ID),
+		Source:          syncBlockSourceForPreparedBlock("next_block", downloaded),
+		Result:          "success",
+		CatchUp:         r.mode == nextSyncToTarget,
+		PrepareDuration: downloaded.PrepareElapsed,
+		ApplyDuration:   applyElapsed,
 	}
 	defer func() {
 		if err != nil {
@@ -1106,7 +1151,7 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 	}()
 
 	setShardStateMasterchainRef(state, r.master.Block)
-	setDownloadedShardMasterchainRef(&downloaded, r.master.Block)
+	setPreparedShardMasterchainRef(&downloaded, r.master.Block)
 
 	r.service.publishLiveBlockArtifacts(downloaded, state, false)
 
@@ -1117,7 +1162,7 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 	if err = r.service.stageAppliedBlockArtifact(ctx, downloaded, splitDepth); err != nil {
 		return err
 	}
-	r.rememberCheckpointStateWithCells(state, downloaded.StateUpdateToCells)
+	r.rememberCheckpointState(state)
 	return nil
 }
 
@@ -1129,13 +1174,13 @@ func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) e
 	if item.releaseApplyCells != nil {
 		item.releaseApplyCells()
 	}
-	r.rememberCheckpointStateWithCells(item.master, item.stateUpdateCells)
+	r.rememberCheckpointState(item.master)
 	return nil
 }
 
-func (r *nextSyncRunner) rememberCheckpointStateWithCells(state *storage.BlockState, cells map[cell.Hash][]byte) {
+func (r *nextSyncRunner) rememberCheckpointState(state *storage.BlockState) {
 	r.checkpointMu.Lock()
-	r.checkpointStates.rememberWithCells(state, cells)
+	r.checkpointStates.remember(state)
 	r.checkpointMu.Unlock()
 }
 
@@ -1219,7 +1264,7 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 	}
 
 	blockUTime, lagSeconds, hasBlockTime := downloadedBlockTimeLag(item.block, time.Now())
-	elapsed := item.downloadElapsed + item.applyTiming.total
+	elapsed := item.downloadElapsed + item.prepareElapsed + item.applyTiming.total
 
 	event := r.service.log.Debug().
 		Str("block", item.block.BlockRef()).
@@ -1227,6 +1272,7 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 		Str("catchup_method", r.method).
 		Str("download_source", item.downloadSource).
 		Dur("download_elapsed", item.downloadElapsed).
+		Dur("prepare_elapsed", item.prepareElapsed).
 		Dur("apply_elapsed", item.applyTiming.total).
 		Dur("master_prepare_elapsed", item.applyTiming.prepare).
 		Dur("master_consensus_elapsed", item.applyTiming.consensus).

@@ -1,7 +1,6 @@
 package service
 
 import (
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -29,7 +28,7 @@ func setShardBlockMasterchainRef(meta *storage.BlockMeta, master ton.BlockIDExt)
 	meta.MasterchainRef = &ref
 }
 
-func setDownloadedShardMasterchainRef(block *p2p.DownloadedBlock, master ton.BlockIDExt) {
+func setPreparedShardMasterchainRef(block *PreparedBlock, master ton.BlockIDExt) {
 	if block == nil {
 		return
 	}

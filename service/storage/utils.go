@@ -71,12 +71,6 @@ func ParseStateProof(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, w
 }
 
 func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wantRootHash []byte, wantFileHash []byte, proof bool) (*BlockState, error) {
-	if expected == nil {
-		return nil, fmt.Errorf("expected block id is nil")
-	}
-	if root == nil {
-		return nil, fmt.Errorf("state root is nil")
-	}
 	rootHash := root.HashKey(0)
 
 	var fileHash []byte

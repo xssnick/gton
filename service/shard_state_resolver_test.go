@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -154,7 +153,7 @@ func TestShardStateResolverCallsAfterApplyState(t *testing.T) {
 		loadState: env.loadState,
 		loadBlock: env.loadBlock,
 		apply:     env.apply,
-		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded p2p.DownloadedBlock, _ time.Duration) error {
+		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded PreparedBlock, _ time.Duration) error {
 			callbackState = state.Block
 			callbackBlock = downloaded.ID
 			return nil
@@ -186,13 +185,13 @@ func TestShardStateResolverWaitUsesCallContext(t *testing.T) {
 			storage.ShardKeyFromBlock(parent): {Block: parent},
 		},
 		loadState: env.loadState,
-		loadBlock: func(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+		loadBlock: func(ctx context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
 			close(started)
 			select {
 			case <-unblock:
-				return p2p.DownloadedBlock{}, storage.ErrNotFound
+				return PreparedBlock{}, storage.ErrNotFound
 			case <-ctx.Done():
-				return p2p.DownloadedBlock{}, ctx.Err()
+				return PreparedBlock{}, ctx.Err()
 			}
 		},
 		apply: env.apply,
@@ -456,7 +455,7 @@ func TestShardStateResolverUsesUpdatedCurrentState(t *testing.T) {
 
 type fakeShardStateResolverEnv struct {
 	states       map[string]*storage.BlockState
-	blocks       map[string]p2p.DownloadedBlock
+	blocks       map[string]PreparedBlock
 	stateLoads   map[string]int
 	blockLoads   map[string]int
 	stateLoadSeq []ton.BlockIDExt
@@ -468,7 +467,7 @@ type fakeShardStateResolverEnv struct {
 func newFakeShardStateResolverEnv() *fakeShardStateResolverEnv {
 	return &fakeShardStateResolverEnv{
 		states:     map[string]*storage.BlockState{},
-		blocks:     map[string]p2p.DownloadedBlock{},
+		blocks:     map[string]PreparedBlock{},
 		stateLoads: map[string]int{},
 		blockLoads: map[string]int{},
 	}
@@ -479,7 +478,7 @@ func (e *fakeShardStateResolverEnv) addState(block ton.BlockIDExt) {
 }
 
 func (e *fakeShardStateResolverEnv) addBlock(block ton.BlockIDExt, prevRefs ...ton.BlockIDExt) {
-	e.blocks[storage.BlockKey(block)] = p2p.DownloadedBlock{
+	e.blocks[storage.BlockKey(block)] = PreparedBlock{
 		ID: block,
 		Meta: &storage.BlockMeta{
 			ID:       block,
@@ -500,19 +499,19 @@ func (e *fakeShardStateResolverEnv) loadState(_ context.Context, state storage.B
 	return storage.CloneBlockState(stored), nil
 }
 
-func (e *fakeShardStateResolverEnv) loadBlock(_ context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+func (e *fakeShardStateResolverEnv) loadBlock(_ context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
 	key := storage.BlockKey(block)
 	e.blockLoads[key]++
 	e.blockLoadSeq = append(e.blockLoadSeq, block)
 
 	downloaded, ok := e.blocks[key]
 	if !ok {
-		return p2p.DownloadedBlock{}, storage.ErrNotFound
+		return PreparedBlock{}, storage.ErrNotFound
 	}
 	return downloaded, nil
 }
 
-func (e *fakeShardStateResolverEnv) apply(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, error) {
+func (e *fakeShardStateResolverEnv) apply(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
 	if !downloaded.ID.Equals(&target) {
 		return nil, fmt.Errorf("downloaded %s instead of target %s", storage.FormatBlockRef(downloaded.ID), storage.FormatBlockRef(target))
 	}

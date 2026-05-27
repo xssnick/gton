@@ -116,7 +116,7 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 		}
 
 		stats.Entries++
-		if archive.Shard.IsMasterchain() && !archive.Shard.ContainsBlock(ref.id) {
+		if archive.Shard.IsMasterchain() && ref.kind == blockEntryKind && !archive.Shard.ContainsBlock(ref.id) {
 			stats.ContainsShardBlocks = true
 		}
 		if archive.Shard.ContainsBlock(ref.id) {
@@ -225,12 +225,6 @@ func (i *Imported) SetArtifactPath(path string) {
 }
 
 func (i *Imported) Store(sink ImportSink) error {
-	if i == nil {
-		return fmt.Errorf("imported archive is nil")
-	}
-	if sink.Writer == nil {
-		return fmt.Errorf("archive import sink writer is nil")
-	}
 	if err := i.validateArtifactRefs(); err != nil {
 		return err
 	}
@@ -336,6 +330,9 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 	if err != nil {
 		return PreparedBlock{}, err
 	}
+	if block.StateUpdate == nil {
+		return PreparedBlock{}, fmt.Errorf("block state update is missing")
+	}
 	meta, err := storage.BuildBlockMetaFromParsedBlock(id, block)
 	if err != nil {
 		return PreparedBlock{}, err
@@ -354,9 +351,10 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 		return PreparedBlock{}, err
 	}
 	return PreparedBlock{
-		Block:  root,
-		Parsed: block,
-		Meta:   meta,
+		Block:       root,
+		Parsed:      block,
+		Meta:        meta,
+		StateUpdate: block.StateUpdate,
 		State: &storage.BlockState{
 			Block:         id,
 			StateRootHash: append([]byte(nil), stateRootHash[:]...),

@@ -1,7 +1,6 @@
 package service
 
 import (
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -20,16 +19,14 @@ func (s *Service) configureLiveBlockPublisher(publisher CurrentStatePublisher) {
 	s.node.SetBlockCacheObserver(cache)
 }
 
-func (s *Service) publishLiveBlockArtifacts(downloaded p2p.DownloadedBlock, state *storage.BlockState, flushed bool) {
+func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState, flushed bool) {
 	cache, ok := s.liveState.(liveBlockPublisher)
 	if !ok {
 		return
 	}
 
-	root, err := downloadedBlockRoot(downloaded)
-	if err != nil {
+	if downloaded.BlockRoot == nil {
 		s.log.Debug().
-			Err(err).
 			Str("block", downloaded.BlockRef()).
 			Msg("skip live block cache update")
 		return
@@ -37,7 +34,7 @@ func (s *Service) publishLiveBlockArtifacts(downloaded p2p.DownloadedBlock, stat
 
 	var blockData []byte
 	cacheFlushed := false
-	if downloaded.VerifiedFileHash {
+	if len(downloaded.BlockBOC) > 0 {
 		blockData = downloaded.BlockBOC
 		cacheFlushed = flushed
 	}
@@ -60,9 +57,9 @@ func (s *Service) publishLiveBlockArtifacts(downloaded p2p.DownloadedBlock, stat
 	if downloaded.Meta != nil {
 		meta = downloaded.Meta.Clone()
 	}
-	if err = cache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:            downloaded.ID,
-		Root:             root,
+		Root:             downloaded.BlockRoot,
 		BlockData:        blockData,
 		Meta:             meta,
 		State:            state,

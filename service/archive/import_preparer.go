@@ -76,9 +76,6 @@ func importedBlockPrepareParallelism() int {
 }
 
 func (p *importedBlockPreparer) submit(full *storage.ServedBlockFull) error {
-	if full == nil {
-		return fmt.Errorf("archive full block is nil")
-	}
 	if err := p.err(); err != nil {
 		return err
 	}
@@ -116,7 +113,8 @@ func (p *importedBlockPreparer) finish(imported *Imported, stats *ImportStats) e
 		imported.PreparedBlocks[storage.BlockKey(result.full.ID)] = result.prepared
 		imported.FullBlocks = append(imported.FullBlocks, result.full)
 		stats.BlockPrepareElapsed += result.elapsed
-		stats.StateUpdateCells += uint64(len(result.prepared.StateUpdateToCells))
+		stats.StateUpdateCells += uint64(result.prepared.StateUpdateToCells.Len())
+		stats.StateUpdateCellBytes += result.prepared.StateUpdateToCells.ByteSize()
 		stats.StateUpdateCellPrepare += result.prepared.StateUpdateToCellsElapsed
 	}
 	return nil

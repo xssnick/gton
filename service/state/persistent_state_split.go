@@ -41,10 +41,6 @@ type PersistentStatePart struct {
 }
 
 func SplitPersistentState(block ton.BlockIDExt, root *cell.Cell, splitDepth uint32) ([]PersistentStatePart, error) {
-	if root == nil {
-		return nil, fmt.Errorf("persistent state root is nil")
-	}
-
 	shardPrefixLen := ShardPrefixLength(block.Shard)
 	if block.Workchain == -1 || splitDepth <= uint32(shardPrefixLen) {
 		return []PersistentStatePart{{

@@ -15,13 +15,14 @@ const (
 
 	DefaultArchiveCatchUpCheckpointBlocks = 2000
 	DefaultArchiveCatchUpCheckpointPeriod = 2 * time.Minute
-	DefaultArchiveCatchUpPrefetchWindows  = 8
+	DefaultArchiveCatchUpPrefetchWindows  = 2
 
 	archiveShardApplyParallelism              = 8
 	archiveMasterConsensusPrecheckParallelism = 8
 	archiveMasterLookaheadWindows             = 16
 	archiveHotLookaheadWindows                = 2
-	archiveReadyWindowBacklog                 = 4
+	archiveReadyWindowBacklog                 = 1
+	archiveShardArchiveImportInFlight         = 4
 	archiveDownloadWorkerMin                  = 16
 	archiveDownloadWorkerMax                  = 64
 	archiveDownloadWorkerMultiplier           = 4
@@ -152,6 +153,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			return nil, r.returnWithProgress(err)
 		}
 		window.stateCells.copyRecordsTo(r.stateCells)
+		window.stateCells.releaseRecordsToBase(r.stateCells.loader())
 		s.log.Debug().
 			Uint32("start_seqno", window.startSeqno).
 			Int("master_blocks", len(window.masterStates)).

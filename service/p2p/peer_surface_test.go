@@ -597,10 +597,9 @@ func TestAcceptBroadcastDoesNotCacheShardBlockInPeerLayer(t *testing.T) {
 
 	block := testBlockID(0, topShard, 42)
 	downloaded := &DownloadedBlock{
-		ID:               block,
-		BlockBOC:         []byte{0xAA, 0xBB},
-		ProofBOC:         []byte{0xCC},
-		VerifiedFileHash: true,
+		ID:       block,
+		BlockBOC: []byte{0xAA, 0xBB},
+		ProofBOC: []byte{0xCC},
 	}
 	node.acceptBroadcast(acceptedBroadcast{
 		fingerprint: "shard-full-block",
@@ -638,10 +637,9 @@ func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
 			Kind:    "tonNode.blockBroadcast",
 			Block:   block,
 			Downloaded: &DownloadedBlock{
-				ID:               block,
-				BlockBOC:         []byte{0xAA, 0xBB},
-				ProofBOC:         []byte{0xCC},
-				VerifiedFileHash: true,
+				ID:       block,
+				BlockBOC: []byte{0xAA, 0xBB},
+				ProofBOC: []byte{0xCC},
 			},
 		},
 	})

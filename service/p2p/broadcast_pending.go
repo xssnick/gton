@@ -2,14 +2,19 @@ package p2p
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
-	pendingBroadcastDecodeTTL   = 10 * time.Second
-	pendingBroadcastDecodeDelay = 250 * time.Millisecond
+	pendingBroadcastDecodeTTL      = 10 * time.Second
+	pendingBroadcastDecodeMaxItems = 1024
+	pendingBroadcastDecodeMaxBytes = int64(64 << 20)
+	pendingBroadcastDecodeOverhead = 256
 )
 
 type pendingBlockBroadcastDecode struct {
@@ -19,9 +24,13 @@ type pendingBlockBroadcastDecode struct {
 	trusted     bool
 	kind        string
 	block       ton.BlockIDExt
+	prev        ton.BlockIDExt
 	sourceKey   string
 	receivedAt  time.Time
 	msg         any
+	proofRoot   *cell.Cell
+	expiresAt   time.Time
+	bytes       int64
 }
 
 func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDecode) {
@@ -29,84 +38,170 @@ func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDeco
 		return
 	}
 
+	now := time.Now()
+	req.expiresAt = now.Add(pendingBroadcastDecodeTTL)
+	req.bytes = pendingBlockBroadcastDecodeBytes(req)
+
 	n.pendingBroadcastMx.Lock()
 	if n.pendingBroadcasts == nil {
-		n.pendingBroadcasts = map[string]struct{}{}
+		n.pendingBroadcasts = map[string]pendingBlockBroadcastDecode{}
 	}
-	if _, ok := n.pendingBroadcasts[req.fingerprint]; ok {
+	n.prunePendingBlockBroadcastDecodesLocked(now)
+	if old, ok := n.pendingBroadcasts[req.fingerprint]; ok {
+		n.pendingBroadcastBytes -= old.bytes
+	}
+	n.pendingBroadcasts[req.fingerprint] = req
+	n.pendingBroadcastBytes += req.bytes
+	n.prunePendingBlockBroadcastOverflowLocked()
+	n.pendingBroadcastMx.Unlock()
+}
+
+func (n *Node) forgetPendingBlockBroadcastDecode(fingerprint string) {
+	n.pendingBroadcastMx.Lock()
+	n.deletePendingBlockBroadcastDecodeLocked(fingerprint)
+	n.pendingBroadcastMx.Unlock()
+}
+
+func (n *Node) processPendingBlockBroadcastDecodesAsync() {
+	if n == nil {
+		return
+	}
+
+	n.pendingBroadcastMx.Lock()
+	if len(n.pendingBroadcasts) == 0 || n.pendingBroadcastProcessing {
 		n.pendingBroadcastMx.Unlock()
 		return
 	}
-	n.pendingBroadcasts[req.fingerprint] = struct{}{}
+	n.pendingBroadcastProcessing = true
 	n.pendingBroadcastMx.Unlock()
 
 	n.runAsync(func() {
-		defer n.forgetPendingBlockBroadcastDecode(req.fingerprint)
+		defer func() {
+			n.pendingBroadcastMx.Lock()
+			n.pendingBroadcastProcessing = false
+			n.pendingBroadcastMx.Unlock()
+		}()
 
 		ctx := n.runCtx
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		n.retryPendingBlockBroadcastDecode(ctx, req)
+		n.processPendingBlockBroadcastDecodes(ctx, time.Now())
 	})
 }
 
-func (n *Node) forgetPendingBlockBroadcastDecode(fingerprint string) {
-	n.pendingBroadcastMx.Lock()
-	delete(n.pendingBroadcasts, fingerprint)
-	n.pendingBroadcastMx.Unlock()
-}
-
-func (n *Node) retryPendingBlockBroadcastDecode(ctx context.Context, req pendingBlockBroadcastDecode) {
-	deadline := time.NewTimer(pendingBroadcastDecodeTTL)
-	defer deadline.Stop()
-
-	delay := time.NewTicker(pendingBroadcastDecodeDelay)
-	defer delay.Stop()
-
-	stateReady := n.compressedBlockStateReadyNotify()
-	for {
-		downloaded, err := n.decodeBroadcastBlock(ctx, req.msg)
-		if err == nil {
-			accepted := acceptedBroadcast{
-				fingerprint:        req.fingerprint,
-				deduped:            true,
-				skipAcceptedMetric: true,
-				event: &BroadcastEvent{
-					Overlay:    req.overlay,
-					Delivery:   req.delivery,
-					Trusted:    req.trusted,
-					Kind:       req.kind,
-					Block:      cloneBlockID(req.block),
-					SourceKey:  req.sourceKey,
-					ReceivedAt: req.receivedAt,
-					Downloaded: downloaded,
-				},
-			}
-			n.acceptBroadcast(accepted)
+func (n *Node) processPendingBlockBroadcastDecodes(ctx context.Context, now time.Time) {
+	reqs := n.pendingBlockBroadcastDecodeSnapshot(now)
+	for _, req := range reqs {
+		if ctx.Err() != nil {
 			return
 		}
-		if !isBroadcastDecompressionStateNotReady(err) {
+
+		downloaded, err := n.decodePendingBlockBroadcast(ctx, req)
+		if err != nil {
+			if isBroadcastDecompressionStateNotReady(err) {
+				continue
+			}
+			n.forgetPendingBlockBroadcastDecode(req.fingerprint)
 			n.log.Debug().
 				Err(err).
 				Str("block", formatBlockRef(req.block)).
 				Str("kind", req.kind).
 				Msg("dropping pending block broadcast because payload decode failed")
-			return
+			continue
 		}
 
-		select {
-		case <-ctx.Done():
-			return
-		case <-deadline.C:
-			n.log.Debug().
-				Str("block", formatBlockRef(req.block)).
-				Str("kind", req.kind).
-				Msg("dropping pending block broadcast because previous state did not arrive")
-			return
-		case <-stateReady:
-			stateReady = n.compressedBlockStateReadyNotify()
-		case <-delay.C:
+		n.forgetPendingBlockBroadcastDecode(req.fingerprint)
+		downloaded.SourceKey = req.sourceKey
+		accepted := acceptedBroadcast{
+			fingerprint:        req.fingerprint,
+			deduped:            true,
+			skipAcceptedMetric: true,
+			event: &BroadcastEvent{
+				Overlay:    req.overlay,
+				Delivery:   req.delivery,
+				Trusted:    req.trusted,
+				Kind:       req.kind,
+				Block:      cloneBlockID(req.block),
+				SourceKey:  req.sourceKey,
+				ReceivedAt: req.receivedAt,
+				Downloaded: downloaded,
+			},
 		}
+		n.acceptBroadcast(accepted)
+	}
+}
+
+func (n *Node) decodePendingBlockBroadcast(ctx context.Context, req pendingBlockBroadcastDecode) (*DownloadedBlock, error) {
+	switch data := req.msg.(type) {
+	case tonnodeapi.BlockBroadcastCompressedV2:
+		if req.proofRoot == nil {
+			return nil, fmt.Errorf("pending compressed V2 broadcast %s has no parsed proof root", formatBlockRef(req.block))
+		}
+		return n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, req.proofRoot, req.prev)
+	default:
+		return nil, fmt.Errorf("unexpected pending block broadcast %T", req.msg)
+	}
+}
+
+func (n *Node) pendingBlockBroadcastDecodeSnapshot(now time.Time) []pendingBlockBroadcastDecode {
+	n.pendingBroadcastMx.Lock()
+	defer n.pendingBroadcastMx.Unlock()
+
+	n.prunePendingBlockBroadcastDecodesLocked(now)
+	if len(n.pendingBroadcasts) == 0 {
+		return nil
+	}
+
+	reqs := make([]pendingBlockBroadcastDecode, 0, len(n.pendingBroadcasts))
+	for _, req := range n.pendingBroadcasts {
+		reqs = append(reqs, req)
+	}
+	return reqs
+}
+
+func (n *Node) prunePendingBlockBroadcastDecodesLocked(now time.Time) {
+	for key, req := range n.pendingBroadcasts {
+		if !req.expiresAt.After(now) {
+			n.deletePendingBlockBroadcastDecodeLocked(key)
+		}
+	}
+}
+
+func (n *Node) prunePendingBlockBroadcastOverflowLocked() {
+	for len(n.pendingBroadcasts) > pendingBroadcastDecodeMaxItems || n.pendingBroadcastBytes > pendingBroadcastDecodeMaxBytes {
+		var oldestKey string
+		var oldestAt time.Time
+		for key, req := range n.pendingBroadcasts {
+			if oldestKey == "" || req.receivedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = req.receivedAt
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		n.deletePendingBlockBroadcastDecodeLocked(oldestKey)
+	}
+}
+
+func (n *Node) deletePendingBlockBroadcastDecodeLocked(fingerprint string) {
+	req, ok := n.pendingBroadcasts[fingerprint]
+	if !ok {
+		return
+	}
+	delete(n.pendingBroadcasts, fingerprint)
+	n.pendingBroadcastBytes -= req.bytes
+	if n.pendingBroadcastBytes < 0 {
+		n.pendingBroadcastBytes = 0
+	}
+}
+
+func pendingBlockBroadcastDecodeBytes(req pendingBlockBroadcastDecode) int64 {
+	switch msg := req.msg.(type) {
+	case tonnodeapi.BlockBroadcastCompressedV2:
+		return int64(len(msg.Proof)+len(msg.DataCompressed)) + pendingBroadcastDecodeOverhead
+	default:
+		return pendingBroadcastDecodeOverhead
 	}
 }

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"fmt"
@@ -10,14 +11,13 @@ import (
 	"github.com/xssnick/gton/service/blockproof"
 	tnstore "github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
 	shardBroadcastBlockCacheTTL      = 3 * time.Minute
-	shardBroadcastBlockCacheMaxBytes = 128 << 20
+	shardBroadcastBlockCacheMaxBytes = 256 << 20
 	shardBroadcastBlockCacheMaxItems = 4096
 	shardBroadcastBlockCacheOverhead = 256
 )
@@ -35,20 +35,20 @@ type shardBroadcastBlockCache struct {
 }
 
 type shardBroadcastBlockCacheEntry struct {
-	key       string
-	element   *list.Element
-	block     ton.BlockIDExt
-	kind      string
-	blockRoot *cell.Cell
-	proofRoot *cell.Cell
-	blockBOC  []byte
-	proofBOC  []byte
-	isLink    bool
-	meta      *tnstore.BlockMeta
-	parsed    *tlb.Block
-	sourceKey string
-	expiresAt time.Time
-	bytes     int64
+	key         string
+	element     *list.Element
+	block       ton.BlockIDExt
+	kind        string
+	blockRoot   *cell.Cell
+	proofRoot   *cell.Cell
+	stateUpdate *cell.Cell
+	blockBOC    []byte
+	proofBOC    []byte
+	isLink      bool
+	meta        *tnstore.BlockMeta
+	sourceKey   string
+	expiresAt   time.Time
+	bytes       int64
 }
 
 func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int) *shardBroadcastBlockCache {
@@ -62,17 +62,24 @@ func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int
 }
 
 func (c *shardBroadcastBlockCache) Store(downloaded DownloadedBlock, meta *tnstore.BlockMeta) error {
-	return c.storeAt(downloaded, meta, downloaded.Parsed, downloaded.Block, downloaded.Proof, time.Now())
+	validated, err := validateShardBroadcastBlock(&downloaded)
+	if err != nil {
+		return err
+	}
+	if meta == nil {
+		meta = validated.meta
+	}
+	return c.storeAt(downloaded, meta, validated.blockRoot, validated.proofRoot, validated.stateUpdate, time.Now())
 }
 
-func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tnstore.BlockMeta, parsed *tlb.Block, blockRoot *cell.Cell, proofRoot *cell.Cell, now time.Time) error {
+func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tnstore.BlockMeta, blockRoot *cell.Cell, proofRoot *cell.Cell, stateUpdate *cell.Cell, now time.Time) error {
 	if c == nil {
 		return tnstore.ErrNotFound
 	}
 	if isMasterchainBlock(downloaded.ID) {
 		return fmt.Errorf("masterchain block %s is not a shard broadcast cache candidate", formatBlockRef(downloaded.ID))
 	}
-	if !downloaded.VerifiedRootHash || !downloaded.VerifiedFileHash {
+	if !downloaded.VerifiedRootHash {
 		return fmt.Errorf("block %s is not hash verified", formatBlockRef(downloaded.ID))
 	}
 	if len(downloaded.BlockBOC) == 0 {
@@ -84,41 +91,39 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return fmt.Errorf("shard broadcast cache is disabled")
 	}
+	if meta == nil {
+		return fmt.Errorf("block %s has no metadata", formatBlockRef(downloaded.ID))
+	}
 	if blockRoot == nil {
-		var err error
-		blockRoot, err = cell.FromBOC(downloaded.BlockBOC)
-		if err != nil {
-			return fmt.Errorf("parse block data for %s: %w", formatBlockRef(downloaded.ID), err)
-		}
+		return fmt.Errorf("block %s has no parsed block root", formatBlockRef(downloaded.ID))
 	}
 	if proofRoot == nil {
-		var err error
-		proofRoot, err = cell.FromBOC(downloaded.ProofBOC)
-		if err != nil {
-			return fmt.Errorf("parse proof for %s: %w", formatBlockRef(downloaded.ID), err)
-		}
+		return fmt.Errorf("block %s has no parsed proof root", formatBlockRef(downloaded.ID))
+	}
+	if stateUpdate == nil {
+		return fmt.Errorf("block %s has no state update", formatBlockRef(downloaded.ID))
 	}
 
-	size := int64(len(downloaded.BlockBOC) + len(downloaded.ProofBOC) + shardBroadcastBlockCacheOverhead)
+	size := shardBroadcastBlockCacheSize(downloaded.BlockBOC, downloaded.ProofBOC)
 	if size > c.maxBytes {
 		return fmt.Errorf("block %s is too large for shard broadcast cache: %d > %d", formatBlockRef(downloaded.ID), size, c.maxBytes)
 	}
 
 	key := tnstore.BlockKey(downloaded.ID)
 	entry := &shardBroadcastBlockCacheEntry{
-		key:       key,
-		block:     cloneBlockID(downloaded.ID),
-		kind:      downloaded.Kind,
-		blockRoot: blockRoot,
-		proofRoot: proofRoot,
-		blockBOC:  append([]byte(nil), downloaded.BlockBOC...),
-		proofBOC:  append([]byte(nil), downloaded.ProofBOC...),
-		isLink:    downloaded.IsLink,
-		meta:      meta.Clone(),
-		parsed:    parsed,
-		sourceKey: downloaded.SourceKey,
-		expiresAt: now.Add(c.ttl),
-		bytes:     size,
+		key:         key,
+		block:       cloneBlockID(downloaded.ID),
+		kind:        downloaded.Kind,
+		blockRoot:   blockRoot,
+		proofRoot:   proofRoot,
+		stateUpdate: stateUpdate,
+		blockBOC:    append([]byte(nil), downloaded.BlockBOC...),
+		proofBOC:    append([]byte(nil), downloaded.ProofBOC...),
+		isLink:      downloaded.IsLink,
+		meta:        meta.Clone(),
+		sourceKey:   downloaded.SourceKey,
+		expiresAt:   now.Add(c.ttl),
+		bytes:       size,
 	}
 
 	c.mu.Lock()
@@ -192,14 +197,13 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		Kind:             kind,
 		Block:            entry.blockRoot,
 		Proof:            entry.proofRoot,
-		BlockBOC:         append([]byte(nil), entry.blockBOC...),
-		ProofBOC:         append([]byte(nil), entry.proofBOC...),
+		BlockBOC:         entry.blockBOC,
+		ProofBOC:         entry.proofBOC,
 		Meta:             entry.meta.Clone(),
-		Parsed:           entry.parsed,
+		StateUpdate:      entry.stateUpdate,
 		SourceKey:        entry.sourceKey,
 		IsLink:           entry.isLink,
 		VerifiedRootHash: true,
-		VerifiedFileHash: true,
 	}, nil
 }
 
@@ -252,6 +256,10 @@ func (c *shardBroadcastBlockCache) deleteEntryLocked(entry *shardBroadcastBlockC
 	}
 }
 
+func shardBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
+	return int64(len(blockBOC)*2 + len(proofBOC)*2 + shardBroadcastBlockCacheOverhead)
+}
+
 func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
 	if downloaded == nil || n.shardBroadcastCache == nil {
 		return
@@ -269,7 +277,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
 		return
 	}
 
-	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.parsed, validated.blockRoot, validated.proofRoot, time.Now()); err != nil {
+	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.blockRoot, validated.proofRoot, validated.stateUpdate, time.Now()); err != nil {
 		n.log.Debug().
 			Err(err).
 			Str("block", formatBlockRef(downloaded.ID)).
@@ -374,66 +382,76 @@ func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {
 	}
 }
 
-type validatedShardBroadcastBlock struct {
-	meta      *tnstore.BlockMeta
-	parsed    *tlb.Block
+type validatedShardBroadcastRoots struct {
 	blockRoot *cell.Cell
 	proofRoot *cell.Cell
 }
 
-func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBroadcastBlock, error) {
-	if downloaded == nil {
-		return validatedShardBroadcastBlock{}, fmt.Errorf("downloaded block is nil")
-	}
+type validatedShardBroadcastBlock struct {
+	meta        *tnstore.BlockMeta
+	blockRoot   *cell.Cell
+	proofRoot   *cell.Cell
+	stateUpdate *cell.Cell
+}
+
+func validateShardBroadcastRoots(downloaded *DownloadedBlock) (validatedShardBroadcastRoots, error) {
 	if isMasterchainBlock(downloaded.ID) {
-		return validatedShardBroadcastBlock{}, fmt.Errorf("masterchain block %s is not a shard block", formatBlockRef(downloaded.ID))
+		return validatedShardBroadcastRoots{}, fmt.Errorf("masterchain block %s is not a shard block", formatBlockRef(downloaded.ID))
 	}
-	if !downloaded.VerifiedRootHash || !downloaded.VerifiedFileHash {
-		return validatedShardBroadcastBlock{}, fmt.Errorf("block %s is not hash verified", formatBlockRef(downloaded.ID))
+	if !downloaded.VerifiedRootHash {
+		return validatedShardBroadcastRoots{}, fmt.Errorf("block %s is not hash verified", formatBlockRef(downloaded.ID))
+	}
+	if len(downloaded.BlockBOC) == 0 {
+		return validatedShardBroadcastRoots{}, fmt.Errorf("block %s has empty block data", formatBlockRef(downloaded.ID))
+	}
+	if len(downloaded.ProofBOC) == 0 {
+		return validatedShardBroadcastRoots{}, fmt.Errorf("block %s has empty proof", formatBlockRef(downloaded.ID))
 	}
 
 	proof := downloaded.Proof
 	if proof == nil {
-		var err error
-		proof, err = cell.FromBOC(downloaded.ProofBOC)
-		if err != nil {
-			return validatedShardBroadcastBlock{}, fmt.Errorf("parse proof for %s: %w", formatBlockRef(downloaded.ID), err)
-		}
+		return validatedShardBroadcastRoots{}, fmt.Errorf("block %s has no parsed proof root", formatBlockRef(downloaded.ID))
 	}
 	if err := blockproof.CheckProofShape(downloaded.ID, proof, downloaded.IsLink); err != nil {
-		return validatedShardBroadcastBlock{}, err
+		return validatedShardBroadcastRoots{}, err
 	}
 
 	root := downloaded.Block
 	if root == nil {
-		var err error
-		root, err = cell.FromBOC(downloaded.BlockBOC)
-		if err != nil {
-			return validatedShardBroadcastBlock{}, fmt.Errorf("parse block data for %s: %w", formatBlockRef(downloaded.ID), err)
-		}
+		return validatedShardBroadcastRoots{}, fmt.Errorf("block %s has no parsed block root", formatBlockRef(downloaded.ID))
 	}
-	block := downloaded.Parsed
-	if block != nil {
-		if err := tnstore.VerifyBlockIdentity(downloaded.ID, block); err != nil {
-			return validatedShardBroadcastBlock{}, err
-		}
-	} else {
-		var err error
-		block, err = tnstore.ParseVerifiedBlockCell(downloaded.ID, root)
-		if err != nil {
-			return validatedShardBroadcastBlock{}, err
-		}
+	root, err := effectiveDownloadedBlockRoot(downloaded.ID, downloaded.IsLink, root)
+	if err != nil {
+		return validatedShardBroadcastRoots{}, err
+	}
+	rootHash := root.HashKey()
+	if !bytes.Equal(rootHash[:], downloaded.ID.RootHash) {
+		return validatedShardBroadcastRoots{}, fmt.Errorf("block %s root hash mismatch", formatBlockRef(downloaded.ID))
 	}
 
-	meta, err := tnstore.BuildBlockMetaFromParsedBlock(downloaded.ID, block)
+	return validatedShardBroadcastRoots{
+		blockRoot: root,
+		proofRoot: proof,
+	}, nil
+}
+
+func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBroadcastBlock, error) {
+	roots, err := validateShardBroadcastRoots(downloaded)
 	if err != nil {
 		return validatedShardBroadcastBlock{}, err
 	}
+
+	if downloaded.Meta == nil {
+		return validatedShardBroadcastBlock{}, fmt.Errorf("block %s has no metadata", formatBlockRef(downloaded.ID))
+	}
+	if downloaded.StateUpdate == nil {
+		return validatedShardBroadcastBlock{}, fmt.Errorf("block %s has no state update", formatBlockRef(downloaded.ID))
+	}
 	return validatedShardBroadcastBlock{
-		meta:      meta,
-		parsed:    block,
-		blockRoot: root,
-		proofRoot: proof,
+		meta:        downloaded.Meta.Clone(),
+		blockRoot:   roots.blockRoot,
+		proofRoot:   roots.proofRoot,
+		stateUpdate: downloaded.StateUpdate,
 	}, nil
 }
 

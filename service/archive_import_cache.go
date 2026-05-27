@@ -6,13 +6,12 @@ import (
 	"sync"
 
 	"github.com/xssnick/gton/service/archive"
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 )
 
 type archiveImportResult struct {
 	stats      *archive.ImportStats
-	blocks     map[string]p2p.DownloadedBlock
+	blocks     map[string]PreparedBlock
 	stored     storage.ServedArchiveImport
 	splitDepth uint32
 }
@@ -134,6 +133,16 @@ func (c *archiveImportCache) dropBefore(masterchainSeqno uint32) {
 	}
 }
 
+func (c *archiveImportCache) drop(key archiveImportCacheKey) {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
+}
+
 func (c *archiveImportCache) stats() (int, uint64) {
 	if c == nil {
 		return 0, 0
@@ -159,7 +168,7 @@ func cloneArchiveImportResult(result *archiveImportResult) *archiveImportResult 
 
 	cloned := &archiveImportResult{
 		stats:      cloneImportStats(result.stats),
-		blocks:     make(map[string]p2p.DownloadedBlock, len(result.blocks)),
+		blocks:     make(map[string]PreparedBlock, len(result.blocks)),
 		stored:     cloneServedArchiveImport(result.stored),
 		splitDepth: result.splitDepth,
 	}

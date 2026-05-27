@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -82,7 +82,7 @@ func TestArchivePipelineSchedulingUsesPendingWindowLimit(t *testing.T) {
 		t.Fatal("pipeline should schedule the first window immediately")
 	}
 
-	if runner.canScheduleArchiveWindow(planning, archiveMasterLookaheadWindows, runner.target.SeqNo) {
+	if runner.canScheduleArchiveWindow(planning, 2, runner.target.SeqNo) {
 		t.Fatal("pipeline should stop scheduling at the pending window limit")
 	}
 
@@ -110,10 +110,17 @@ func TestArchivePipelineSchedulingStopsNearLiveTail(t *testing.T) {
 	}
 }
 
-func TestArchivePipelinePendingWindowLimitAllowsWideShardImportAhead(t *testing.T) {
+func TestArchivePipelinePendingWindowLimitUsesConfiguredPrefetch(t *testing.T) {
+	runner := &archiveCatchUpRunner{service: &Service{archiveCatchUpPrefetchWindows: 2}}
+	if got := runner.archivePendingWindowLimit(); got != 2 {
+		t.Fatalf("pending window limit = %d, want 2", got)
+	}
+}
+
+func TestArchivePipelinePendingWindowLimitUsesDefaultPrefetch(t *testing.T) {
 	runner := &archiveCatchUpRunner{service: &Service{}}
-	if got := runner.archivePendingWindowLimit(); got != archiveMasterLookaheadWindows {
-		t.Fatalf("pending window limit = %d, want %d", got, archiveMasterLookaheadWindows)
+	if got := runner.archivePendingWindowLimit(); got != DefaultArchiveCatchUpPrefetchWindows {
+		t.Fatalf("pending window limit = %d, want %d", got, DefaultArchiveCatchUpPrefetchWindows)
 	}
 }
 
@@ -124,8 +131,8 @@ func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
 		t.Fatalf("ready window backlog = %d, want %d", runner.archiveReadyWindowBacklog(), archiveReadyWindowBacklog)
 	}
 
-	if runner.shouldEmitReadyArchiveWindow([]archivePendingWindow{testReadyArchiveWindow(nil)}) {
-		t.Fatal("pipeline should keep building backlog after the first ready window")
+	if !runner.shouldEmitReadyArchiveWindow([]archivePendingWindow{testReadyArchiveWindow(nil)}) {
+		t.Fatal("pipeline should emit the first ready window")
 	}
 
 	pending := make([]archivePendingWindow, archiveReadyWindowBacklog)
@@ -165,6 +172,47 @@ func TestArchiveCheckpointBackpressureWaitsAtDoubleTarget(t *testing.T) {
 	}
 }
 
+func TestArchiveShardPrefixesIncludeIntermediateShardChanges(t *testing.T) {
+	shard := int64(-1 << 61)
+	startBlocks := []ton.BlockIDExt{
+		testBlockID(0, shard, 10),
+	}
+	stateBlocks := [][]ton.BlockIDExt{
+		{testBlockID(0, shard, 11)},
+		{testBlockID(0, shard, 10)},
+	}
+
+	got := archiveShardPrefixesForBlockStates(2, startBlocks, stateBlocks)
+	want := archive.ShardID{Workchain: 0, Shard: shard}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("changed shard prefixes = %#v, want [%#v]", got, want)
+	}
+}
+
+func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t *testing.T) {
+	shard := int64(-1 << 61)
+	next := testBlockID(0, shard, 11)
+	startBlocks := []ton.BlockIDExt{
+		testBlockID(0, shard, 10),
+	}
+	stateBlocks := [][]ton.BlockIDExt{
+		{next},
+	}
+
+	missing := archiveShardPrefixesMissingFromBlockStates(2, startBlocks, stateBlocks, nil)
+	want := archive.ShardID{Workchain: 0, Shard: shard}
+	if len(missing) != 1 || missing[0] != want {
+		t.Fatalf("missing shard prefixes = %#v, want [%#v]", missing, want)
+	}
+
+	covered := archiveShardPrefixesMissingFromBlockStates(2, startBlocks, stateBlocks, map[string]PreparedBlock{
+		storage.BlockKey(next): {ID: next},
+	})
+	if len(covered) != 0 {
+		t.Fatalf("covered shard prefixes = %#v, want none", covered)
+	}
+}
+
 func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 	var first, second cell.Hash
 	first[0] = 1
@@ -178,16 +226,16 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 		current:                &storage.CurrentState{ShardClientSeqno: 1001},
 		stateCells:             newArchiveStateCellOverlay(nil),
 	}
-	runner.stateCells.rememberPreparedCells(map[cell.Hash][]byte{
+	runner.stateCells.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 2047),
-	})
+	}))
 	if runner.shouldWaitArchiveCheckpointBackpressure() {
 		t.Fatal("checkpoint backpressure should not wait below byte limit")
 	}
 
-	runner.stateCells.rememberPreparedCells(map[cell.Hash][]byte{
+	runner.stateCells.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
 		second: make([]byte, 1),
-	})
+	}))
 	if !runner.shouldWaitArchiveCheckpointBackpressure() {
 		t.Fatal("checkpoint backpressure should wait at byte limit")
 	}
@@ -219,16 +267,16 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 		stagedBlocks: 9,
 		stateCells:   newStateCellWindowCache(nil),
 	}
-	runner.stateCells.addPreparedRecords(map[cell.Hash][]byte{
+	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 1023),
-	})
+	}))
 	if runner.shouldCheckpointStagedCurrent() {
 		t.Fatal("next checkpoint should not start below block and byte targets")
 	}
 
-	runner.stateCells.addPreparedRecords(map[cell.Hash][]byte{
+	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: make([]byte, 1),
-	})
+	}))
 	if !runner.shouldCheckpointStagedCurrent() {
 		t.Fatal("next checkpoint should start at byte target")
 	}
@@ -302,7 +350,7 @@ func testReadyArchiveWindow(err error) archivePendingWindow {
 
 func TestArchiveMasterBlockSequenceStopsBeforeNonStartKeyBlock(t *testing.T) {
 	start := &storage.BlockState{Block: testMasterBlockID(10)}
-	blocks := map[uint32]p2p.DownloadedBlock{
+	blocks := map[uint32]PreparedBlock{
 		11: testArchiveMasterBlock(11, false),
 		12: testArchiveMasterBlock(12, true),
 	}
@@ -318,7 +366,7 @@ func TestArchiveMasterBlockSequenceStopsBeforeNonStartKeyBlock(t *testing.T) {
 
 func TestArchiveMasterBlockSequenceAllowsStartKeyBlock(t *testing.T) {
 	start := &storage.BlockState{Block: testMasterBlockID(10)}
-	blocks := map[uint32]p2p.DownloadedBlock{
+	blocks := map[uint32]PreparedBlock{
 		11: testArchiveMasterBlock(11, true),
 		12: testArchiveMasterBlock(12, false),
 	}
@@ -332,13 +380,13 @@ func TestArchiveMasterBlockSequenceAllowsStartKeyBlock(t *testing.T) {
 	}
 }
 
-func testArchiveMasterBlock(seqno uint32, keyBlock bool) p2p.DownloadedBlock {
+func testArchiveMasterBlock(seqno uint32, keyBlock bool) PreparedBlock {
 	block := testMasterBlockID(seqno)
 	meta := &storage.BlockMeta{ID: block}
 	if keyBlock {
 		meta.Mark(storage.BlockMetaIsKeyBlock)
 	}
-	return p2p.DownloadedBlock{ID: block, Meta: meta}
+	return PreparedBlock{ID: block, Meta: meta}
 }
 
 func testMasterBlockID(seqno uint32) ton.BlockIDExt {

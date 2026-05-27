@@ -831,9 +831,6 @@ func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store c
 }
 
 func (s *Service) cellGenerationPersistentImportComplete(candidate *cellGenerationCandidate) (bool, error) {
-	if candidate == nil || candidate.current == nil {
-		return false, fmt.Errorf("cell generation migration progress is nil")
-	}
 	master, err := parsedCellGenerationProgressState(&candidate.current.Masterchain)
 	if err != nil {
 		return false, fmt.Errorf("parse imported masterchain state %s: %w", storage.FormatBlockRef(candidate.current.Masterchain.Block), err)
@@ -853,9 +850,6 @@ func (s *Service) cellGenerationPersistentImportComplete(candidate *cellGenerati
 }
 
 func parsedCellGenerationProgressState(state *storage.BlockState) (*storage.BlockState, error) {
-	if state == nil {
-		return nil, fmt.Errorf("state is nil")
-	}
 	if state.Parsed != nil {
 		return storage.CloneBlockState(state), nil
 	}
@@ -900,9 +894,6 @@ func (s *Service) loadCellGenerationMigrationProgress(ctx context.Context, store
 }
 
 func (s *Service) loadCellGenerationMigrationProgressCells(ctx context.Context, store cellGenerationRotationStore, generation uint64, current *storage.CurrentState) error {
-	if current == nil {
-		return fmt.Errorf("cell generation migration progress is nil")
-	}
 	masterRoot, err := s.loadCellGenerationMigrationProgressBlock(ctx, store, generation, current.Masterchain)
 	if err != nil {
 		return fmt.Errorf("load migration progress masterchain state %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
@@ -1007,9 +998,6 @@ func (s *Service) serializedPersistentStateArtifact(ctx context.Context, store c
 }
 
 func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, target *storage.CurrentState) error {
-	if target == nil {
-		return fmt.Errorf("target current state is nil")
-	}
 	if target.Masterchain.Block.SeqNo < candidate.current.Masterchain.Block.SeqNo {
 		return fmt.Errorf("durable current state %s is before candidate current state %s", storage.FormatBlockRef(target.Masterchain.Block), storage.FormatBlockRef(candidate.current.Masterchain.Block))
 	}
@@ -1173,7 +1161,7 @@ func (s *Service) newCellGenerationShardResolver(ctx context.Context, store cell
 			return nil, fmt.Errorf("candidate shard state %s root hash size is %d", storage.FormatBlockRef(state.Block), len(state.StateRootHash))
 		},
 		loadBlock: s.loadCandidateBlockForApply,
-		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, error) {
+		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
 			next, err := s.applyResolvedShardBlock(ctx, target, previous, downloaded, candidate.cells)
 			if err != nil {
 				return nil, err
@@ -1181,24 +1169,24 @@ func (s *Service) newCellGenerationShardResolver(ctx context.Context, store cell
 			next.CellGeneration = candidate.generation
 			return next, nil
 		},
-		afterApplyState: func(_ context.Context, state *storage.BlockState, _ p2p.DownloadedBlock, _ time.Duration) error {
+		afterApplyState: func(_ context.Context, state *storage.BlockState, _ PreparedBlock, _ time.Duration) error {
 			return nil
 		},
 	})
 }
 
-func (s *Service) loadCandidateNextMasterBlock(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+func (s *Service) loadCandidateNextMasterBlock(ctx context.Context, prev ton.BlockIDExt) (PreparedBlock, error) {
 	next, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, prev.SeqNo+1)
 	if err != nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("load stored next masterchain block after %s: %w", storage.FormatBlockRef(prev), err)
+		return PreparedBlock{}, fmt.Errorf("load stored next masterchain block after %s: %w", storage.FormatBlockRef(prev), err)
 	}
 	return s.loadCandidateBlockForApply(ctx, next)
 }
 
-func (s *Service) loadCandidateBlockForApply(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+func (s *Service) loadCandidateBlockForApply(ctx context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
 	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block, false)
 	if err != nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("load stored candidate block %s: %w", storage.FormatBlockRef(block), err)
+		return PreparedBlock{}, fmt.Errorf("load stored candidate block %s: %w", storage.FormatBlockRef(block), err)
 	}
 	return downloaded, nil
 }

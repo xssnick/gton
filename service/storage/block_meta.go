@@ -226,10 +226,6 @@ func BuildBlockMetaFromBlockCell(id ton.BlockIDExt, root *cell.Cell) (*BlockMeta
 }
 
 func ParseVerifiedBlockCell(id ton.BlockIDExt, root *cell.Cell) (*tlb.Block, error) {
-	if root == nil {
-		return nil, fmt.Errorf("block root is nil for %s", FormatBlockRef(id))
-	}
-
 	loader, err := root.BeginParse()
 	if err != nil {
 		return nil, fmt.Errorf("begin parse block %s: %w", FormatBlockRef(id), err)
@@ -322,10 +318,6 @@ func countBlockTransactions(root *cell.Cell) (uint32, error) {
 }
 
 func VerifyBlockIdentity(id ton.BlockIDExt, block *tlb.Block) error {
-	if block == nil {
-		return fmt.Errorf("block is nil for %s", FormatBlockRef(id))
-	}
-
 	workchain, shard := tlb.ConvertShardIdentToShard(block.BlockInfo.Shard)
 	if block.BlockInfo.SeqNo != id.SeqNo || workchain != id.Workchain || shard != uint64(id.Shard) {
 		return fmt.Errorf(

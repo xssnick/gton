@@ -49,7 +49,7 @@ lag keeps moving forward even if no new block has been published.
 | `gton_sync_block_utime_seconds` | gauge | `chain`, `shard` | Unix timestamp of the local block generation time. |
 | `gton_sync_local_seqno` | gauge | `chain`, `shard` | Local synchronized block seqno. |
 | `gton_sync_network_seqno` | gauge | `chain`, `shard` | Latest observed network block seqno. |
-| `gton_sync_gap_blocks` | gauge | `chain`, `shard` | Difference between latest observed network seqno and local seqno. |
+| `gton_sync_gap_blocks` | gauge | `chain`, `shard` | Difference between latest observed network seqno and local seqno, clamped to `0` when local is ahead. |
 | `gton_sync_recent_tps` | gauge | none | Recent local TPS over the status window. |
 | `gton_sync_recent_transactions` | gauge | none | Transaction count in the recent TPS window. |
 | `gton_sync_recent_tps_complete` | gauge | none | `1` when the recent TPS window had all required block data, `0` otherwise. |
@@ -81,7 +81,8 @@ checkpoint persistence.
 | `gton_sync_blocks_total` | counter | `pipeline`, `chain`, `source`, `result`, `catch_up` | Number of blocks processed by sync pipelines. |
 | `gton_sync_block_origins_total` | counter | `pipeline`, `chain`, `origin`, `result`, `catch_up` | Number of synchronized blocks grouped by origin: `broadcast`, `download`, `stored`, or `other`. |
 | `gton_sync_block_download_duration_seconds` | histogram | `pipeline`, `chain`, `source`, `result`, `catch_up` | Block download duration. |
-| `gton_sync_block_apply_duration_seconds` | histogram | `pipeline`, `chain`, `result` | Block apply or block processing duration. |
+| `gton_sync_block_prepare_duration_seconds` | histogram | `pipeline`, `chain`, `shard`, `source`, `result`, `catch_up` | Block preparation duration, including downloaded block validation and state-cell preparation, excluding apply. |
+| `gton_sync_block_apply_duration_seconds` | histogram | `pipeline`, `chain`, `result` | Block state transition duration for state-apply pipelines; for `blocksync`, broadcast processing duration. |
 | `gton_sync_checkpoints_total` | counter | `mode`, `result` | Number of current-state checkpoints. |
 | `gton_sync_persist_duration_seconds` | histogram | `mode`, `result` | Time spent writing a current-state checkpoint. |
 | `gton_sync_persist_queue_seconds` | histogram | `mode`, `result` | Time spent waiting before a current-state checkpoint write can run. |
@@ -90,7 +91,8 @@ Common label values:
 
 - `pipeline`: `blocksync`, `next_block`, `next_block_bootstrap`.
 - `chain`: `masterchain`, `shardchain`, or `workchain_<id>`.
-- `source`: `broadcast`, `broadcast_queue`, `broadcast_candidate`, `broadcast_cache`, `peer_catch_up`, `peer_probe`, `next_block`, `indexed`, `next_description`, `stored`, `unknown`.
+- `shard`: `masterchain`, `basechain`, or a 16-digit shard id.
+- `source`: `broadcast`, `broadcast_queue`, `broadcast_candidate`, `broadcast_cache`, `broadcast_hint`, `queue`, `peer_catch_up`, `peer_probe`, `next_block`, `indexed`, `next_description`, `stored`, `unknown`.
 - `origin`: `broadcast`, `download`, `stored`, `other`, or `unknown`.
 - `result`: `success`, `miss`, `timeout`, `canceled`, `retry`, or `error`.
 - `catch_up`: `true` or `false`.
@@ -102,7 +104,9 @@ Useful examples:
 sum(rate(gton_sync_blocks_total{result="error"}[5m])) by (pipeline, chain)
 sum(rate(gton_sync_blocks_total{result!="success"}[5m])) by (pipeline, chain, result)
 sum(rate(gton_sync_block_origins_total{pipeline=~"next_block.*",result="success"}[5m])) by (pipeline, chain, origin)
-histogram_quantile(0.95, sum(rate(gton_sync_block_download_duration_seconds_bucket[5m])) by (le, pipeline, source))
+histogram_quantile(0.95, sum(rate(gton_sync_block_download_duration_seconds_bucket{result="success"}[5m])) by (le, pipeline, chain, source))
+histogram_quantile(0.95, sum(rate(gton_sync_block_prepare_duration_seconds_bucket{result="success"}[5m])) by (le, pipeline, chain, shard))
+histogram_quantile(0.95, sum(rate(gton_sync_block_apply_duration_seconds_bucket{result="success",pipeline!="blocksync"}[5m])) by (le, pipeline, chain))
 histogram_quantile(0.95, sum(rate(gton_sync_persist_duration_seconds_bucket[5m])) by (le, mode))
 ```
 
@@ -122,6 +126,7 @@ sync queues.
 | `gton_p2p_queue_pushed_total` | counter | `queue` | Number of accepted pushes into a P2P queue. |
 | `gton_p2p_queue_dropped_total` | counter | `queue` | Number of rejected pushes into a P2P queue. |
 | `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind` | Number of P2P broadcasts accepted or successfully rebroadcasted by type. |
+| `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. |
 | `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful P2P rebroadcast sends. |
 | `gton_p2p_rebroadcast_dropped_total` | counter | `queue` | Number of P2P rebroadcast messages dropped before a successful send. |
 | `gton_blocksync_queue_items` | gauge | `queue` | Current block sync queue length. |
@@ -136,6 +141,10 @@ Common `queue` values:
 
 Common `direction` values for `gton_p2p_broadcasts_total` are `accepted` and
 `rebroadcasted`.
+
+Common `reason` values for `gton_p2p_broadcast_dropped_total` include `seen`,
+`invalid_payload`, `decode_failed`, `signature_parse_failed`, and
+`signature_check_failed`.
 
 Useful examples:
 
@@ -155,9 +164,9 @@ growth.
 | --- | --- | --- | --- |
 | `gton_storage_db_status_available` | gauge | none | `1` when DB status was collected successfully, `0` when collection failed. |
 | `gton_storage_archive_packages` | gauge | none | Number of archive `.pack` files under the archive package directory. |
-| `gton_storage_archive_package_bytes` | gauge | none | Total regular-file bytes under the archive package directory. |
+| `gton_storage_archive_package_bytes` | gauge | none | Total bytes used by archive `.pack` files under the archive package directory. |
 | `gton_storage_persistent_state_masters` | gauge | none | Number of distinct masterchain seqnos represented by persistent state files. |
-| `gton_storage_persistent_state_bytes` | gauge | none | Total regular-file bytes under the persistent state directory. |
+| `gton_storage_persistent_state_bytes` | gauge | none | Total bytes used by recognized persistent state files under the persistent state directory. |
 | `gton_storage_cell_db_generation` | gauge | `generation` | Numeric cell DB generation id for the stable generation label. |
 | `gton_storage_cell_db_cache_bytes` | gauge | `generation`, `cache` | Cell DB cache size. `cache` is `block` or `file`. |
 | `gton_storage_cell_db_cache_requests_total` | counter | `generation`, `result` | Block cache requests. `result` is `hit` or `miss`. |

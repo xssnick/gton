@@ -210,9 +210,6 @@ func (s *Store) SaveCellGenerationMigrationProgress(ctx context.Context, generat
 	if generation == 0 {
 		return fmt.Errorf("cell generation is zero")
 	}
-	if current == nil {
-		return fmt.Errorf("cell generation migration progress is nil")
-	}
 
 	return s.setHotRecord(ctx, hotKeyCellGenerationCurrent(generation), encodeCellGenerationMigrationProgress(current), pebble.Sync)
 }

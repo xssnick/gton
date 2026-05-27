@@ -32,9 +32,11 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	m.ObserveSyncBlock(service.SyncBlockObservation{
 		Pipeline:         "next_block",
 		Chain:            ChainMasterchain,
+		Shard:            "masterchain",
 		Source:           "queue",
 		Result:           "success",
 		DownloadDuration: time.Second,
+		PrepareDuration:  750 * time.Millisecond,
 		ApplyDuration:    500 * time.Millisecond,
 	})
 	m.ObserveSyncPersist(service.SyncPersistObservation{
@@ -54,6 +56,9 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(archivePackagesDir, "arch0000", "archive.00000.pack"), []byte("pack"), 0o644); err != nil {
 		t.Fatalf("write archive package: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(archivePackagesDir, "arch0000", "archive.tmp"), []byte("ignored"), 0o644); err != nil {
+		t.Fatalf("write ignored archive file: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(stateFilesDir, "state_42_-1_8000000000000000_hash"), []byte("state-a"), 0o644); err != nil {
 		t.Fatalf("write state file: %v", err)
 	}
@@ -63,6 +68,9 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateFilesDir, "stateaccount_43_0_8000000000000000_4000000000000000_hash"), []byte("state-c"), 0o644); err != nil {
 		t.Fatalf("write account state file: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(stateFilesDir, "partial.tmp"), []byte("ignored"), 0o644); err != nil {
+		t.Fatalf("write ignored state file: %v", err)
+	}
 	m.SetStorageArtifactDirs(archivePackagesDir, stateFilesDir)
 
 	localMaster := ton.BlockIDExt{
@@ -70,16 +78,26 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		Shard:     int64(-1 << 63),
 		SeqNo:     42,
 	}
+	networkMaster := localMaster
+	networkMaster.SeqNo = 41
 	m.SetServiceStatusReader(func() service.StatusSnapshot {
 		return service.StatusSnapshot{
 			StatusSnapshot: p2p.StatusSnapshot{
-				LatestMasterchain: &localMaster,
+				LatestMasterchain: &networkMaster,
 				Broadcasts: []p2p.BroadcastStatusSnapshot{
 					{
 						Direction: "accepted",
 						Overlay:   "masterchain",
 						Kind:      "tonNode.blockBroadcastCompressedV2",
 						Count:     3,
+					},
+				},
+				BroadcastDrops: []p2p.BroadcastDropStatusSnapshot{
+					{
+						Overlay: "masterchain",
+						Kind:    "tonNode.blockBroadcastCompressedV2",
+						Reason:  "signature_check_failed",
+						Count:   2,
 					},
 				},
 				FECReceivers: []p2p.FECReceiverStatusSnapshot{
@@ -138,10 +156,13 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_liteserver_queries_total{error_code="0",method="GetTime",response="CurrentTime"} 1`,
 		namespace + `_sync_blocks_total{catch_up="false",chain="masterchain",pipeline="next_block",result="success",source="queue"} 1`,
 		namespace + `_sync_block_origins_total{catch_up="false",chain="masterchain",origin="broadcast",pipeline="next_block",result="success"} 1`,
+		namespace + `_sync_block_prepare_duration_seconds_bucket{catch_up="false",chain="masterchain",pipeline="next_block",result="success",shard="masterchain",source="queue",le="1"} 1`,
 		namespace + `_sync_checkpoints_total{mode="next_block_async",result="success"} 1`,
+		namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 0`,
 		namespace + `_sync_lag_seconds{chain="masterchain",shard="masterchain"}`,
 		namespace + `_service_background_task{task="idle"} 1`,
 		namespace + `_p2p_broadcasts_total{direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
+		namespace + `_p2p_broadcast_dropped_total{kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain",reason="signature_check_failed"} 2`,
 		namespace + `_p2p_fec_receiver_active_streams{overlay="masterchain"} 2`,
 		namespace + `_p2p_fec_receiver_active_bytes{overlay="masterchain"} 4096`,
 		namespace + `_p2p_fec_receiver_delivered_cache_items{overlay="masterchain"} 7`,

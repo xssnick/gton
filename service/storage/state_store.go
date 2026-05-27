@@ -34,7 +34,7 @@ type StateStorage interface {
 	VerifiedKeyBlockProgress(ctx context.Context) (ton.BlockIDExt, error)
 	SaveBlockState(ctx context.Context, state *BlockState) error
 	SaveStateCheckpoint(ctx context.Context, blocks []*BlockState, current *CurrentState) error
-	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, current *CurrentState) error
+	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, cells StateCellRecords, current *CurrentState) error
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
 }
 

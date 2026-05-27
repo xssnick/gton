@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"github.com/xssnick/gton/service/storage"
 	"fmt"
+	"github.com/xssnick/gton/service/storage"
 	"sort"
 	"time"
 
@@ -28,9 +28,6 @@ func (s *Store) PersistentStateSerializerState(ctx context.Context) (*storage.Pe
 }
 
 func (s *Store) SavePersistentStateSerializerState(ctx context.Context, state *storage.PersistentStateSerializerState) error {
-	if state == nil {
-		return fmt.Errorf("persistent state serializer state is nil")
-	}
 	if !isMasterchainBlock(state.LastBlock) {
 		return fmt.Errorf("persistent state serializer last block is not masterchain: %s", storage.FormatBlockRef(state.LastBlock))
 	}
@@ -50,9 +47,6 @@ func (s *Store) ActivePersistentStateSerialization(ctx context.Context) (*storag
 }
 
 func (s *Store) SaveActivePersistentStateSerialization(ctx context.Context, active *storage.PersistentStateSerializerActive) error {
-	if active == nil {
-		return fmt.Errorf("active persistent state serialization is nil")
-	}
 	if !isMasterchainBlock(active.Block) {
 		return fmt.Errorf("active persistent state serialization block is not masterchain: %s", storage.FormatBlockRef(active.Block))
 	}
@@ -65,9 +59,6 @@ func (s *Store) DeleteActivePersistentStateSerialization(ctx context.Context) er
 }
 
 func (s *Store) SavePersistentStateDescription(ctx context.Context, desc *storage.PersistentStateDescription) error {
-	if desc == nil {
-		return fmt.Errorf("persistent state description is nil")
-	}
 	if !isMasterchainBlock(desc.MasterchainBlock) {
 		return fmt.Errorf("persistent state description masterchain block is invalid: %s", storage.FormatBlockRef(desc.MasterchainBlock))
 	}

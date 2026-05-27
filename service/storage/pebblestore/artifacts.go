@@ -18,10 +18,6 @@ import (
 )
 
 func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
-	if block == nil {
-		return fmt.Errorf("served block is nil")
-	}
-
 	meta, proofKinds := servedBlockFullMeta(block)
 	blockRef, proofRefs, registrations, err := s.servedBlockFullArtifactRefs(block, meta, proofKinds)
 	if err != nil {
@@ -65,10 +61,6 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 }
 
 func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
-	if imported == nil {
-		return fmt.Errorf("served archive import is nil")
-	}
-
 	type fullWrite struct {
 		block         *storage.ServedBlockFull
 		proofKinds    []storage.ServedProofKind
@@ -534,12 +526,6 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 }
 
 func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error {
-	if file == nil {
-		return fmt.Errorf("persistent state file is nil")
-	}
-	if file.Ref == nil {
-		return fmt.Errorf("persistent state file ref is nil")
-	}
 	if file.Ref.Size <= 0 {
 		return fmt.Errorf("persistent state file size is invalid")
 	}

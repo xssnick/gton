@@ -213,10 +213,6 @@ func loadShardDesc(workchain int32, shardID int64, loader *cell.Slice) (*ton.Blo
 }
 
 func shardFromBinTreeKey(key *cell.Cell) (int64, error) {
-	if key == nil {
-		return 0, fmt.Errorf("shard key is nil")
-	}
-
 	shard := tlb.ShardID(uint64(1) << 63)
 	loader, err := key.BeginParse()
 	if err != nil {

@@ -38,6 +38,7 @@ type Metrics struct {
 	syncBlocks                *prometheus.CounterVec
 	syncBlockOrigins          *prometheus.CounterVec
 	syncBlockDownloadDuration *prometheus.HistogramVec
+	syncBlockPrepareDuration  *prometheus.HistogramVec
 	syncBlockApplyDuration    *prometheus.HistogramVec
 	syncPersistDuration       *prometheus.HistogramVec
 	syncPersistQueueDuration  *prometheus.HistogramVec
@@ -100,6 +101,13 @@ func New(namespace string) *Metrics {
 			Help:      "Synchronized block download duration in seconds.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 		}, []string{"pipeline", "chain", "source", "result", "catch_up"}),
+		syncBlockPrepareDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: "sync",
+			Name:      "block_prepare_duration_seconds",
+			Help:      "Synchronized block preparation duration in seconds, including downloaded block validation and state cell preparation, excluding apply.",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"pipeline", "chain", "shard", "source", "result", "catch_up"}),
 		syncBlockApplyDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "sync",
@@ -140,6 +148,7 @@ func New(namespace string) *Metrics {
 		m.syncBlocks,
 		m.syncBlockOrigins,
 		m.syncBlockDownloadDuration,
+		m.syncBlockPrepareDuration,
 		m.syncBlockApplyDuration,
 		m.syncPersistDuration,
 		m.syncPersistQueueDuration,
@@ -267,6 +276,7 @@ func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 	}
 	pipeline := fallbackLabel(observation.Pipeline)
 	chain := fallbackLabel(observation.Chain)
+	shard := fallbackLabel(observation.Shard)
 	source := fallbackLabel(observation.Source)
 	origin := observation.Origin
 	if origin == "" {
@@ -283,6 +293,9 @@ func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 	if observation.DownloadDuration > 0 && m.syncBlockDownloadDuration != nil {
 		m.syncBlockDownloadDuration.WithLabelValues(pipeline, chain, source, result, catchUp).Observe(observation.DownloadDuration.Seconds())
 	}
+	if observation.PrepareDuration > 0 && m.syncBlockPrepareDuration != nil {
+		m.syncBlockPrepareDuration.WithLabelValues(pipeline, chain, shard, source, result, catchUp).Observe(observation.PrepareDuration.Seconds())
+	}
 	if observation.ApplyDuration > 0 && m.syncBlockApplyDuration != nil {
 		m.syncBlockApplyDuration.WithLabelValues(pipeline, chain, result).Observe(observation.ApplyDuration.Seconds())
 	}
@@ -290,7 +303,7 @@ func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 
 func syncBlockOriginForMetricSource(source string) string {
 	switch source {
-	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "queue":
+	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "broadcast_hint", "queue":
 		return "broadcast"
 	case "peer_probe", "next_block", "indexed", "next_description", "peer_catch_up", "catch_up", "probe":
 		return "download"

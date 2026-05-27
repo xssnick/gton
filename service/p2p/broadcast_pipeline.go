@@ -4,11 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"hash/crc64"
 	"time"
-
-	tnstore "github.com/xssnick/gton/service/storage"
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -105,65 +102,85 @@ func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payl
 
 	switch data := msg.(type) {
 	case tonnodeapi.BlockBroadcast:
+		kind := "tonNode.blockBroadcast"
 		if !validBlockBroadcast(data.ID, data.Proof, data.Data) {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
-		kind := "tonNode.blockBroadcast"
 		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, kind, data.ID, sourceKey, msg, s.inboundRebroadcast(kind, payload, peer))
 	case tonnodeapi.BlockBroadcastCompressed:
+		kind := "tonNode.blockBroadcastCompressed"
 		if !validCompressedBroadcast(data.ID, data.Compressed) {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
-		kind := "tonNode.blockBroadcastCompressed"
 		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, kind, data.ID, sourceKey, msg, s.inboundRebroadcast(kind, payload, peer))
 	case tonnodeapi.BlockBroadcastCompressedV2:
+		kind := "tonNode.blockBroadcastCompressedV2"
 		if !validCompressedBroadcast(data.ID, data.DataCompressed) || len(data.Proof) == 0 {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
-		kind := "tonNode.blockBroadcastCompressedV2"
 		return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, kind, data.ID, sourceKey, msg, s.inboundRebroadcast(kind, payload, peer))
 	case tonnodeapi.NewShardBlockBroadcast:
+		kind := "tonNode.newShardBlockBroadcast"
 		if !validCompressedBroadcast(data.Block.ID, data.Block.Data) {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
-		kind := "tonNode.newShardBlockBroadcast"
+		if err := s.node.checkShardDescriptionSignatures(data.Block.ID, data.Block.CCSeqno, data.Block.Data); err != nil {
+			s.log.Debug().
+				Err(err).
+				Str("block", formatBlockRef(data.Block.ID)).
+				Str("kind", kind).
+				Msg("dropping shard block broadcast because validator signatures are not verified")
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
+			return nil
+		}
 		accepted := s.acceptedShardBlockBroadcast(fingerprint, delivery, trusted, data.Block.ID, sourceKey, data.Block.CCSeqno, data.Block.Data)
 		accepted.rebroadcast = s.inboundRebroadcast(kind, payload, peer)
 		return accepted
 	case tonnodeapi.NewExternalMessageBroadcast:
+		kind := "tonNode.externalMessageBroadcast"
 		if len(data.Message.Data) == 0 {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
 		if len(data.Message.Data) > maxOverlayPayloadSize {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "oversize_payload")
 			return nil
 		}
 
 		hash := externalMessageFingerprint(s.spec.ShortID, data.Message.Data)
 		now := time.Now()
 		if !s.node.processedExternalMessages.Mark(hash, now) {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
 			return nil
 		}
 		if s.node.myExternalMessages.Seen(hash, now) {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
 			return nil
 		}
 		addrKey, err := externalMessageDestinationAddress(data.Message.Data)
 		if err != nil {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
 		if err = s.node.addExternalMessageAddressLimit(addrKey, now); err != nil {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "address_rate_limited")
 			return nil
 		}
 
-		kind := "tonNode.externalMessageBroadcast"
 		return &acceptedBroadcast{
 			fingerprint: fingerprint,
 			rebroadcast: s.inboundRebroadcast(kind, payload, peer),
 		}
 	case IhrMessageBroadcast:
+		kind := "tonNode.ihrMessageBroadcast"
 		if len(data.Message.Data) == 0 {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil
 		}
-		kind := "tonNode.ihrMessageBroadcast"
 		return &acceptedBroadcast{
 			fingerprint: fingerprint,
 			rebroadcast: s.inboundRebroadcast(kind, payload, peer),
@@ -213,22 +230,52 @@ func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, de
 
 func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourceKey string, msg any, rebroadcast *rebroadcastRequest) *acceptedBroadcast {
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
+		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
 		return nil
-	}
-	if block.Workchain == -1 && block.Shard == topShard {
-		s.node.trackRawMasterchainBroadcast(block)
 	}
 
 	downloaded, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
 	if err != nil {
 		stateNotReady := isBroadcastDecompressionStateNotReady(err)
 		if stateNotReady {
-			if validationErr := s.node.validateMasterchainBroadcastSignatures(s.node.runCtx, block, msg); validationErr != nil && !errors.Is(validationErr, tnstore.ErrNotFound) {
+			pendingState, ok := broadcastDecompressionStateNotReady(err)
+			if !ok {
 				s.log.Debug().
-					Err(validationErr).
+					Err(err).
 					Str("block", formatBlockRef(block)).
 					Str("kind", kind).
-					Msg("dropping pending block broadcast because signature validation failed")
+					Msg("dropping pending block broadcast because state-ready artifact is missing")
+				s.node.noteBroadcastDrop(s.spec.Name, kind, "state_artifact_missing")
+				return nil
+			}
+
+			v2, ok := msg.(tonnodeapi.BlockBroadcastCompressedV2)
+			if !ok {
+				s.log.Debug().
+					Err(err).
+					Str("block", formatBlockRef(block)).
+					Str("kind", kind).
+					Msg("dropping pending block broadcast because payload type is not compressed-v2")
+				s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
+				return nil
+			}
+			sigSet, sigErr := broadcastSignatureSetFromTL(v2.SignatureSet)
+			if sigErr != nil {
+				s.log.Debug().
+					Err(sigErr).
+					Str("block", formatBlockRef(block)).
+					Str("kind", kind).
+					Msg("dropping pending block broadcast because validator signatures cannot be parsed")
+				s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
+				return nil
+			}
+			if sigErr = s.node.checkBlockBroadcastSignatures(kind, block, pendingState.proofRoot, sigSet); sigErr != nil {
+				s.log.Debug().
+					Err(sigErr).
+					Str("block", formatBlockRef(block)).
+					Str("kind", kind).
+					Msg("dropping pending block broadcast because validator signatures are not verified")
+				s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
 				return nil
 			}
 
@@ -242,6 +289,8 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 				sourceKey:   sourceKey,
 				receivedAt:  time.Now(),
 				msg:         msg,
+				prev:        pendingState.prev,
+				proofRoot:   pendingState.proofRoot,
 			})
 			s.log.Debug().
 				Err(err).
@@ -254,22 +303,41 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 				Str("block", formatBlockRef(block)).
 				Str("kind", kind).
 				Msg("dropping block broadcast because payload decode failed")
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "decode_failed")
 		}
 
-		if stateNotReady || (block.Workchain == -1 && block.Shard == topShard) {
-			accepted := &acceptedBroadcast{
-				fingerprint: fingerprint,
-				deduped:     true,
-			}
-			if stateNotReady {
-				accepted.rebroadcast = rebroadcast
-			}
-			if block.Workchain == -1 && block.Shard == topShard {
-				wake := block
-				accepted.masterchainWake = &wake
-			}
-			return accepted
+		if !stateNotReady {
+			return nil
 		}
+		accepted := &acceptedBroadcast{
+			fingerprint: fingerprint,
+			deduped:     true,
+			rebroadcast: rebroadcast,
+		}
+		if block.Workchain == -1 && block.Shard == topShard {
+			wake := block
+			accepted.masterchainWake = &wake
+		}
+		return accepted
+	}
+
+	sigSet, err := broadcastSignatureSetFromDecoded(msg, downloaded)
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Str("kind", kind).
+			Msg("dropping block broadcast because validator signatures cannot be parsed")
+		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
+		return nil
+	}
+	if err = s.node.checkBlockBroadcastSignatures(kind, block, downloaded.Proof, sigSet); err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Str("kind", kind).
+			Msg("dropping block broadcast because validator signatures are not verified")
+		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
 		return nil
 	}
 
@@ -286,6 +354,7 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		return
 	}
 	if !accepted.deduped && !n.deduper.Mark(accepted.fingerprint, time.Now()) {
+		n.noteSeenAcceptedBroadcastDrop(accepted)
 		return
 	}
 
@@ -315,6 +384,16 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		if n.allowRebroadcast(accepted.rebroadcast) {
 			accepted.rebroadcast.subscription.enqueueRebroadcast(*accepted.rebroadcast)
 		}
+	}
+}
+
+func (n *Node) noteSeenAcceptedBroadcastDrop(accepted acceptedBroadcast) {
+	if accepted.event != nil {
+		n.noteBroadcastDrop(accepted.event.Overlay, accepted.event.Kind, "seen")
+		return
+	}
+	if accepted.rebroadcast != nil {
+		n.noteBroadcastDrop(accepted.rebroadcast.overlayName(), accepted.rebroadcast.kind, "seen")
 	}
 }
 

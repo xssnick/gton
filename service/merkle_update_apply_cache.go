@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -15,7 +14,8 @@ import (
 
 type stateCellEncodedCache struct {
 	mu      sync.RWMutex
-	records map[cell.Hash][]byte
+	records []storage.EncodedCellRecord
+	index   map[cell.Hash]int
 	bytes   uint64
 }
 
@@ -24,7 +24,8 @@ func newStateCellEncodedCache(capacity int) *stateCellEncodedCache {
 		capacity = 1
 	}
 	return &stateCellEncodedCache{
-		records: make(map[cell.Hash][]byte, capacity),
+		records: make([]storage.EncodedCellRecord, 0, capacity),
+		index:   make(map[cell.Hash]int, capacity),
 	}
 }
 
@@ -48,7 +49,8 @@ type stateCellWindowLoaderSources struct {
 
 type archiveStateCellRecordCache struct {
 	mu      sync.RWMutex
-	records map[cell.Hash][]byte
+	records []storage.EncodedCellRecord
+	index   map[cell.Hash]int
 	bytes   uint64
 }
 
@@ -100,7 +102,8 @@ func newArchiveStateCellRecordCache(capacity int) *archiveStateCellRecordCache {
 		capacity = 1
 	}
 	return &archiveStateCellRecordCache{
-		records: make(map[cell.Hash][]byte, capacity),
+		records: make([]storage.EncodedCellRecord, 0, capacity),
+		index:   make(map[cell.Hash]int, capacity),
 	}
 }
 
@@ -133,9 +136,6 @@ func (w *archiveStateCellOverlay) metered(stats *archiveStateCellApplyStats) arc
 }
 
 func merkleUpdateToRef(update *cell.Cell) (*cell.Cell, error) {
-	if update == nil {
-		return nil, fmt.Errorf("merkle update cell is nil")
-	}
 	loader, err := update.BeginParse()
 	if err != nil {
 		return nil, fmt.Errorf("load merkle update cell: %w", err)
@@ -168,51 +168,68 @@ func (c *stateCellEncodedCache) addRecord(hash cell.Hash, encoded []byte) {
 	c.mu.Unlock()
 }
 
-func (c *stateCellEncodedCache) addRecords(records map[cell.Hash][]byte) {
+func (c *stateCellEncodedCache) addRecords(records storage.StateCellRecords) {
 	if c == nil {
 		return
 	}
 
-	if len(records) == 0 {
+	if records.Empty() {
 		return
 	}
 
 	c.mu.Lock()
-	for hash, encoded := range records {
-		if len(encoded) == 0 {
-			continue
-		}
-		c.setRecordLocked(hash, encoded)
-	}
+	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
+		c.setRecordLocked(record.Hash, record.Data)
+		return nil
+	})
 	c.mu.Unlock()
 }
 
-func (c *stateCellEncodedCache) addStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
+func (c *stateCellEncodedCache) addStateRecords(root cell.Hash, records storage.StateCellRecords) error {
 	if c == nil {
 		return nil
 	}
-	rootData := records[root]
-	if len(rootData) == 0 {
+	if !records.Has(root) {
 		return fmt.Errorf("prepared state cells do not contain root %x", root[:])
 	}
 
 	c.mu.Lock()
-	for hash, encoded := range records {
-		if len(encoded) == 0 {
-			continue
-		}
-		c.setRecordLocked(hash, encoded)
-	}
+	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
+		c.setRecordLocked(record.Hash, record.Data)
+		return nil
+	})
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *stateCellEncodedCache) setRecordLocked(hash cell.Hash, encoded []byte) {
-	if previous, ok := c.records[hash]; ok {
-		c.bytes -= uint64(len(previous))
+	if len(encoded) == 0 {
+		return
 	}
-	c.records[hash] = encoded
+	if idx, ok := c.index[hash]; ok {
+		c.bytes -= uint64(len(c.records[idx].Data))
+		c.records[idx].Data = encoded
+		c.bytes += uint64(len(encoded))
+		return
+	}
+	c.index[hash] = len(c.records)
+	c.records = append(c.records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
 	c.bytes += uint64(len(encoded))
+}
+
+func (c *stateCellEncodedCache) data(hash cell.Hash) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	idx, ok := c.index[hash]
+	if !ok {
+		return nil, false
+	}
+	return c.records[idx].Data, len(c.records[idx].Data) > 0
 }
 
 func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, error) {
@@ -220,10 +237,8 @@ func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoa
 		return nil, storage.ErrNotFound
 	}
 
-	c.mu.RLock()
-	encoded := c.records[hash]
-	c.mu.RUnlock()
-	if len(encoded) == 0 {
+	encoded, ok := c.data(hash)
+	if !ok {
 		return nil, storage.ErrNotFound
 	}
 
@@ -242,10 +257,21 @@ func (c *stateCellEncodedCache) appendRecords(records []storage.EncodedCellRecor
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	for hash, encoded := range c.records {
-		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
+	return append(records, c.records...)
+}
+
+func (c *stateCellEncodedCache) appendRecordChunks(chunks [][]storage.EncodedCellRecord) ([][]storage.EncodedCellRecord, uint64) {
+	if c == nil {
+		return chunks, 0
 	}
-	return records
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.records) == 0 {
+		return chunks, 0
+	}
+	return append(chunks, c.records), c.bytes
 }
 
 func (c *stateCellEncodedCache) len() int {
@@ -268,7 +294,7 @@ func (c *stateCellEncodedCache) byteSize() uint64 {
 	return c.bytes
 }
 
-func (w *stateCellWindowCache) applyMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared map[cell.Hash][]byte) (*cell.Cell, error) {
+func (w *stateCellWindowCache) applyMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared storage.StateCellRecords) (*cell.Cell, error) {
 	updateTo, err := merkleUpdateToRef(update)
 	if err != nil {
 		return nil, err
@@ -291,30 +317,26 @@ func (w *stateCellWindowCache) applyMerkleUpdate(previous []*storage.BlockState,
 	return w.reloadAppliedRoot(nextRoot)
 }
 
-func (w *stateCellWindowCache) applyBlockStateUpdate(previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
-	return w.applyMerkleUpdate(previous, downloaded.Parsed.StateUpdate, downloaded.StateUpdateToCells)
+func (w *stateCellWindowCache) applyBlockStateUpdate(previous []*storage.BlockState, block PreparedBlock) (*cell.Cell, error) {
+	return w.applyMerkleUpdate(previous, block.StateUpdate, block.StateUpdateToCells)
 }
 
-func (w *stateCellWindowCache) rememberApplied(root *cell.Cell, prepared map[cell.Hash][]byte) error {
+func (w *stateCellWindowCache) rememberApplied(root *cell.Cell, prepared storage.StateCellRecords) error {
 	if w == nil {
 		return nil
 	}
-	if prepared == nil {
+	if prepared.Empty() {
 		return fmt.Errorf("prepared state update cells are missing")
 	}
 
 	hash := root.GetMetadata().Hash
-	if len(prepared[hash]) == 0 {
+	if !prepared.Has(hash) {
 		return fmt.Errorf("prepared state update cells do not contain destination root %x", hash[:])
 	}
 	return w.addPreparedStateRecords(hash, prepared)
 }
 
 func (w *stateCellWindowCache) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, error) {
-	if root == nil {
-		return nil, fmt.Errorf("applied state root is nil")
-	}
-
 	hash := root.GetMetadata().Hash
 	loaded, err := w.loader()(hash)
 	if err != nil {
@@ -327,8 +349,8 @@ func (w *stateCellWindowCache) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, e
 	return loaded, nil
 }
 
-func (w *stateCellWindowCache) addPreparedRecords(records map[cell.Hash][]byte) {
-	if w == nil || len(records) == 0 {
+func (w *stateCellWindowCache) addPreparedRecords(records storage.StateCellRecords) {
+	if w == nil || records.Empty() {
 		return
 	}
 
@@ -350,8 +372,8 @@ func (w *stateCellWindowCache) addPreparedRecords(records map[cell.Hash][]byte) 
 	w.active.addRecords(records)
 }
 
-func (w *stateCellWindowCache) addPreparedStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
-	if w == nil || len(records) == 0 {
+func (w *stateCellWindowCache) addPreparedStateRecords(root cell.Hash, records storage.StateCellRecords) error {
+	if w == nil || records.Empty() {
 		return nil
 	}
 
@@ -458,12 +480,12 @@ func (w *stateCellWindowCache) byteSize() uint64 {
 }
 
 func (c *stateCellCheckpointCache) records() []storage.EncodedCellRecord {
-	return c.cells().Records
+	return c.cells().AppendTo(nil)
 }
 
-func (c *stateCellCheckpointCache) cells() storage.StateCheckpointCells {
+func (c *stateCellCheckpointCache) cells() storage.StateCellRecords {
 	if c == nil || len(c.caches) == 0 {
-		return storage.StateCheckpointCells{}
+		return storage.StateCellRecords{}
 	}
 
 	total := 0
@@ -471,16 +493,17 @@ func (c *stateCellCheckpointCache) cells() storage.StateCheckpointCells {
 		total += cache.len()
 	}
 	if total == 0 {
-		return storage.StateCheckpointCells{}
+		return storage.StateCellRecords{}
 	}
 
-	records := make([]storage.EncodedCellRecord, 0, total)
+	chunks := make([][]storage.EncodedCellRecord, 0, len(c.caches))
+	var bytes uint64
 	for _, cache := range c.caches {
-		records = cache.appendRecords(records)
+		var chunkBytes uint64
+		chunks, chunkBytes = cache.appendRecordChunks(chunks)
+		bytes += chunkBytes
 	}
-	return storage.StateCheckpointCells{
-		Records: records,
-	}
+	return storage.NewStateCellRecordChunks(chunks, bytes)
 }
 
 func (c *stateCellCheckpointCache) byteSize() uint64 {
@@ -519,47 +542,64 @@ func (c *stateCellCheckpointCache) complete() {
 	w.pending = pending
 }
 
-func (c *archiveStateCellRecordCache) addRecords(records map[cell.Hash][]byte) {
-	if c == nil || len(records) == 0 {
+func (c *archiveStateCellRecordCache) addRecords(records storage.StateCellRecords) {
+	if c == nil || records.Empty() {
 		return
 	}
 
 	c.mu.Lock()
-	for hash, encoded := range records {
-		if len(encoded) == 0 {
-			continue
-		}
-		c.setRecordLocked(hash, encoded)
-	}
+	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
+		c.setRecordLocked(record.Hash, record.Data)
+		return nil
+	})
 	c.mu.Unlock()
 }
 
-func (c *archiveStateCellRecordCache) addStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
+func (c *archiveStateCellRecordCache) addStateRecords(root cell.Hash, records storage.StateCellRecords) error {
 	if c == nil {
 		return nil
 	}
-	rootData := records[root]
-	if len(rootData) == 0 {
+	if !records.Has(root) {
 		return fmt.Errorf("archive prepared state cells do not contain root %x", root[:])
 	}
 
 	c.mu.Lock()
-	for hash, encoded := range records {
-		if len(encoded) == 0 {
-			continue
-		}
-		c.setRecordLocked(hash, encoded)
-	}
+	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
+		c.setRecordLocked(record.Hash, record.Data)
+		return nil
+	})
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *archiveStateCellRecordCache) setRecordLocked(hash cell.Hash, encoded []byte) {
-	if previous, ok := c.records[hash]; ok {
-		c.bytes -= uint64(len(previous))
+	if len(encoded) == 0 {
+		return
 	}
-	c.records[hash] = encoded
+	if idx, ok := c.index[hash]; ok {
+		c.bytes -= uint64(len(c.records[idx].Data))
+		c.records[idx].Data = encoded
+		c.bytes += uint64(len(encoded))
+		return
+	}
+	c.index[hash] = len(c.records)
+	c.records = append(c.records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
 	c.bytes += uint64(len(encoded))
+}
+
+func (c *archiveStateCellRecordCache) data(hash cell.Hash) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	idx, ok := c.index[hash]
+	if !ok {
+		return nil, false
+	}
+	return c.records[idx].Data, len(c.records[idx].Data) > 0
 }
 
 func (c *archiveStateCellRecordCache) loadWith(hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, error) {
@@ -567,10 +607,8 @@ func (c *archiveStateCellRecordCache) loadWith(hash cell.Hash, loader cell.LazyC
 		return nil, storage.ErrNotFound
 	}
 
-	c.mu.RLock()
-	encoded := c.records[hash]
-	c.mu.RUnlock()
-	if len(encoded) == 0 {
+	encoded, ok := c.data(hash)
+	if !ok {
 		return nil, storage.ErrNotFound
 	}
 
@@ -589,10 +627,21 @@ func (c *archiveStateCellRecordCache) appendRecords(records []storage.EncodedCel
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	for hash, encoded := range c.records {
-		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
+	return append(records, c.records...)
+}
+
+func (c *archiveStateCellRecordCache) appendRecordChunks(chunks [][]storage.EncodedCellRecord) ([][]storage.EncodedCellRecord, uint64) {
+	if c == nil {
+		return chunks, 0
 	}
-	return records
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.records) == 0 {
+		return chunks, 0
+	}
+	return append(chunks, c.records), c.bytes
 }
 
 func (c *archiveStateCellRecordCache) copyRecordsTo(dst *archiveStateCellOverlay) {
@@ -602,7 +651,7 @@ func (c *archiveStateCellRecordCache) copyRecordsTo(dst *archiveStateCellOverlay
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	dst.addPreparedRecords(c.records)
+	dst.addPreparedRecords(storage.NewStateCellRecords(c.records))
 }
 
 func (c *archiveStateCellRecordCache) len() int {
@@ -625,15 +674,12 @@ func (c *archiveStateCellRecordCache) byteSize() uint64 {
 	return c.bytes
 }
 
-func (w archiveStateCellApplier) applyBlockStateUpdate(previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
-	if w.overlay == nil {
-		return nil, fmt.Errorf("archive state cell overlay is nil")
-	}
-	return w.overlay.applyPreparedMerkleUpdate(previous, downloaded.Parsed.StateUpdate, downloaded.StateUpdateToCells, w.stats, downloaded.StateUpdateToCellsElapsed)
+func (w archiveStateCellApplier) applyBlockStateUpdate(previous []*storage.BlockState, block PreparedBlock) (*cell.Cell, error) {
+	return w.overlay.applyPreparedMerkleUpdate(previous, block.StateUpdate, block.StateUpdateToCells, w.stats, block.StateUpdateToCellsElapsed)
 }
 
-func (w *archiveStateCellOverlay) applyPreparedMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared map[cell.Hash][]byte, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) (*cell.Cell, error) {
-	if len(prepared) == 0 {
+func (w *archiveStateCellOverlay) applyPreparedMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared storage.StateCellRecords, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) (*cell.Cell, error) {
+	if prepared.Empty() {
 		return nil, fmt.Errorf("archive block state update target cells are not prepared")
 	}
 	updateTo, err := merkleUpdateToRef(update)
@@ -643,7 +689,7 @@ func (w *archiveStateCellOverlay) applyPreparedMerkleUpdate(previous []*storage.
 	return w.applyPreparedMerkleUpdateToRoot(previous, update, updateTo.Virtualize(0), prepared, stats, prepareElapsed)
 }
 
-func (w *archiveStateCellOverlay) applyPreparedMerkleUpdateToRoot(previous []*storage.BlockState, update *cell.Cell, nextRoot *cell.Cell, prepared map[cell.Hash][]byte, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) (*cell.Cell, error) {
+func (w *archiveStateCellOverlay) applyPreparedMerkleUpdateToRoot(previous []*storage.BlockState, update *cell.Cell, nextRoot *cell.Cell, prepared storage.StateCellRecords, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) (*cell.Cell, error) {
 	loader := w.loader()
 	currentRoot, err := previousStateRootWithLoader(previous, loader)
 	if err != nil {
@@ -660,28 +706,28 @@ func (w *archiveStateCellOverlay) applyPreparedMerkleUpdateToRoot(previous []*st
 	return w.reloadAppliedRoot(nextRoot)
 }
 
-func (w *archiveStateCellOverlay) applyBlockStateUpdate(previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
-	return w.applyPreparedMerkleUpdate(previous, downloaded.Parsed.StateUpdate, downloaded.StateUpdateToCells, nil, downloaded.StateUpdateToCellsElapsed)
+func (w *archiveStateCellOverlay) applyBlockStateUpdate(previous []*storage.BlockState, block PreparedBlock) (*cell.Cell, error) {
+	return w.applyPreparedMerkleUpdate(previous, block.StateUpdate, block.StateUpdateToCells, nil, block.StateUpdateToCellsElapsed)
 }
 
-func (w *archiveStateCellOverlay) rememberPrepared(root *cell.Cell, prepared map[cell.Hash][]byte, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) error {
+func (w *archiveStateCellOverlay) rememberPrepared(root *cell.Cell, prepared storage.StateCellRecords, stats *archiveStateCellApplyStats, prepareElapsed time.Duration) error {
 	if w == nil {
 		return nil
 	}
 
 	hash := root.GetMetadata().Hash
-	if len(prepared[hash]) == 0 {
+	if !prepared.Has(hash) {
 		return fmt.Errorf("archive state cell overlay does not contain destination root %x", hash[:])
 	}
 	if err := w.addPreparedStateRecords(hash, prepared); err != nil {
 		return err
 	}
-	stats.observe(len(prepared), prepareElapsed)
+	stats.observe(prepared.Len(), prepareElapsed)
 	return nil
 }
 
-func (w *archiveStateCellOverlay) rememberPreparedCells(prepared map[cell.Hash][]byte) {
-	if w == nil || len(prepared) == 0 {
+func (w *archiveStateCellOverlay) rememberPreparedCells(prepared storage.StateCellRecords) {
+	if w == nil || prepared.Empty() {
 		return
 	}
 	w.addPreparedRecords(prepared)
@@ -700,10 +746,6 @@ func (w *archiveStateCellOverlay) copyRecordsTo(dst *archiveStateCellOverlay) {
 }
 
 func (w *archiveStateCellOverlay) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, error) {
-	if root == nil {
-		return nil, fmt.Errorf("applied archive state root is nil")
-	}
-
 	hash := root.GetMetadata().Hash
 	loaded, err := w.loader()(hash)
 	if err != nil {
@@ -716,8 +758,8 @@ func (w *archiveStateCellOverlay) reloadAppliedRoot(root *cell.Cell) (*cell.Cell
 	return loaded, nil
 }
 
-func (w *archiveStateCellOverlay) addPreparedRecords(records map[cell.Hash][]byte) {
-	if w == nil || len(records) == 0 {
+func (w *archiveStateCellOverlay) addPreparedRecords(records storage.StateCellRecords) {
+	if w == nil || records.Empty() {
 		return
 	}
 
@@ -739,8 +781,8 @@ func (w *archiveStateCellOverlay) addPreparedRecords(records map[cell.Hash][]byt
 	w.active.addRecords(records)
 }
 
-func (w *archiveStateCellOverlay) addPreparedStateRecords(root cell.Hash, records map[cell.Hash][]byte) error {
-	if w == nil || len(records) == 0 {
+func (w *archiveStateCellOverlay) addPreparedStateRecords(root cell.Hash, records storage.StateCellRecords) error {
+	if w == nil || records.Empty() {
 		return nil
 	}
 
@@ -767,9 +809,9 @@ func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
 		return nil
 	}
 
-	sources := w.loaderSources()
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
+		sources := w.loaderSources()
 		loaded, err := sources.active.loadWith(hash, load)
 		if err == nil {
 			return loaded, nil
@@ -793,6 +835,20 @@ func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
 		return sources.base(hash)
 	}
 	return load
+}
+
+func (w *archiveStateCellOverlay) releaseRecordsToBase(base cell.LazyCellLoader) {
+	if w == nil {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.active = newArchiveStateCellRecordCache(1)
+	clear(w.pending)
+	w.pending = nil
+	w.base = base
 }
 
 func cachedLazyCell(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
@@ -852,12 +908,12 @@ func (w *archiveStateCellOverlay) beginCheckpoint() *archiveStateCellCheckpoint 
 }
 
 func (c *archiveStateCellCheckpoint) records() []storage.EncodedCellRecord {
-	return c.cells().Records
+	return c.cells().AppendTo(nil)
 }
 
-func (c *archiveStateCellCheckpoint) cells() storage.StateCheckpointCells {
+func (c *archiveStateCellCheckpoint) cells() storage.StateCellRecords {
 	if c == nil || len(c.caches) == 0 {
-		return storage.StateCheckpointCells{}
+		return storage.StateCellRecords{}
 	}
 
 	total := 0
@@ -865,16 +921,17 @@ func (c *archiveStateCellCheckpoint) cells() storage.StateCheckpointCells {
 		total += cache.len()
 	}
 	if total == 0 {
-		return storage.StateCheckpointCells{}
+		return storage.StateCellRecords{}
 	}
 
-	records := make([]storage.EncodedCellRecord, 0, total)
+	chunks := make([][]storage.EncodedCellRecord, 0, len(c.caches))
+	var bytes uint64
 	for _, cache := range c.caches {
-		records = cache.appendRecords(records)
+		var chunkBytes uint64
+		chunks, chunkBytes = cache.appendRecordChunks(chunks)
+		bytes += chunkBytes
 	}
-	return storage.StateCheckpointCells{
-		Records: records,
-	}
+	return storage.NewStateCellRecordChunks(chunks, bytes)
 }
 
 func (c *archiveStateCellCheckpoint) byteSize() uint64 {
@@ -938,16 +995,10 @@ func previousStateRootWithLoader(previous []*storage.BlockState, loader cell.Laz
 	switch len(previous) {
 	case 1:
 		current := previous[0]
-		if current == nil {
-			return nil, fmt.Errorf("current state is nil")
-		}
 		return stateRootWithLoader(current, loader)
 	case 2:
 		left := previous[0]
 		right := previous[1]
-		if left == nil || right == nil {
-			return nil, fmt.Errorf("merge previous state is nil")
-		}
 
 		leftRoot, err := stateRootWithLoader(left, loader)
 		if err != nil {

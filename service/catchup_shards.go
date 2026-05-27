@@ -29,11 +29,11 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				return
 			}
 
-			if downloaded, source, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); err != nil {
+			if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
 				return
 			} else if ok {
-				if !s.sendShardStateDownload(ctx, downloads, shardStateDownload{prev: prev, block: downloaded, source: source}) {
+				if !s.sendShardStateDownload(ctx, downloads, shardStateDownload{prev: prev, block: downloaded, source: source, prepareElapsed: prepareElapsed}) {
 					return
 				}
 				prev = downloaded.ID
@@ -42,7 +42,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 
 			indexed, err := s.lookupIndexedChainBlocks(ctx, prev, target, shardStateDownloadBuffer)
 			if err != nil {
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err, source: "indexed"})
 				return
 			}
 			if len(indexed) > 0 {
@@ -55,7 +55,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 
 			described, err := s.lookupNextChainBlockDescriptions(ctx, prev, target, nextBlockDescriptionLookahead)
 			if err != nil {
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err, source: "next_description"})
 				return
 			}
 			if len(described) > 0 {
@@ -86,33 +86,57 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 					continue
 				}
 
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
+					err:             err,
+					source:          "next_block",
+					downloadElapsed: downloadElapsed,
+				})
 				return
 			}
 			if downloaded.ID.Workchain != target.Workchain || downloaded.ID.Shard != target.Shard || downloaded.ID.SeqNo > target.SeqNo || downloaded.ID.SeqNo <= prev.SeqNo {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
-					err: fmt.Errorf("%w: next chain block after %s returned %s for target %s", errShardCatchUpNeedsSnapshot, storage.FormatBlockRef(prev), downloaded.BlockRef(), storage.FormatBlockRef(target)),
+					err:             fmt.Errorf("%w: next chain block after %s returned %s for target %s", errShardCatchUpNeedsSnapshot, storage.FormatBlockRef(prev), downloaded.BlockRef(), storage.FormatBlockRef(target)),
+					source:          syncBlockSourceForDownloadedBlock("next_block", downloaded),
+					downloadElapsed: downloadElapsed,
 				})
 				return
 			}
 
-			downloaded, err = prepareDownloadedBlockStateCells(downloaded)
+			prepareStarted := time.Now()
+			verified, err := verifyDownloadedBlock(downloaded)
 			if err != nil {
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
+					err:             err,
+					source:          syncBlockSourceForDownloadedBlock("next_block", downloaded),
+					downloadElapsed: downloadElapsed,
+					prepareElapsed:  time.Since(prepareStarted),
+				})
 				return
 			}
+			prepared, err := prepareVerifiedMasterchainBlockForNextSync(prev, verified)
+			if err != nil {
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
+					err:             err,
+					source:          syncBlockSourceForVerifiedBlock("next_block", verified),
+					downloadElapsed: downloadElapsed,
+					prepareElapsed:  time.Since(prepareStarted),
+				})
+				return
+			}
+			prepared.PrepareElapsed = time.Since(prepareStarted)
 
 			item := shardStateDownload{
 				prev:            prev,
-				block:           downloaded,
-				source:          syncBlockSourceForDownloadedBlock("next_block", downloaded),
+				block:           prepared,
+				source:          syncBlockSourceForVerifiedBlock("next_block", verified),
 				downloadElapsed: downloadElapsed,
+				prepareElapsed:  prepared.PrepareElapsed,
 			}
 			if !s.sendShardStateDownload(ctx, downloads, item) {
 				return
 			}
 
-			prev = downloaded.ID
+			prev = prepared.ID
 		}
 	}()
 
@@ -213,17 +237,29 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 				downloadStarted := time.Now()
 				downloaded, err := s.downloadExactChainBlockWithRetry(downloadCtx, job.block)
 				downloadElapsed := time.Since(downloadStarted)
+				var verified VerifiedBlock
+				var prepared PreparedBlock
+				var prepareElapsed time.Duration
 				if err == nil {
-					downloaded, err = prepareDownloadedBlockStateCells(downloaded)
+					prepareStarted := time.Now()
+					verified, err = verifyDownloadedBlock(downloaded)
+					if err == nil {
+						prepared, err = prepareVerifiedMasterchainBlockForNextSync(job.prev, verified)
+					}
+					prepareElapsed = time.Since(prepareStarted)
+				}
+				if err == nil {
+					prepared.PrepareElapsed = prepareElapsed
 				}
 				item := shardStateDownload{
 					prev:            job.prev,
-					block:           downloaded,
+					block:           prepared,
 					err:             err,
 					downloadElapsed: downloadElapsed,
+					prepareElapsed:  prepareElapsed,
 				}
 				if err == nil {
-					item.source = syncBlockSourceForDownloadedBlock(source, downloaded)
+					item.source = syncBlockSourceForVerifiedBlock(source, verified)
 				} else {
 					item.source = source
 				}
@@ -303,6 +339,7 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 			s.observeSyncBlock(SyncBlockObservation{
 				Pipeline:         "exact_block_download",
 				Chain:            syncChainLabel(block),
+				Shard:            syncShardLabel(block),
 				Source:           source,
 				Result:           "success",
 				CatchUp:          true,
@@ -313,6 +350,7 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 		s.observeSyncBlock(SyncBlockObservation{
 			Pipeline:         "exact_block_download",
 			Chain:            syncChainLabel(block),
+			Shard:            syncShardLabel(block),
 			Source:           "peer_probe",
 			Result:           syncBlockResultForError(err),
 			CatchUp:          true,

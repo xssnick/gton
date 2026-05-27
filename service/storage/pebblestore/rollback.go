@@ -18,9 +18,6 @@ type RollbackStats struct {
 }
 
 func (s *Store) Rollback(ctx context.Context, current *storage.CurrentState) (RollbackStats, error) {
-	if current == nil {
-		return RollbackStats{}, fmt.Errorf("rollback current state is nil")
-	}
 	target := current.Masterchain.Block
 	if target.Workchain != -1 || target.Shard != rollbackMasterShard {
 		return RollbackStats{}, fmt.Errorf("rollback target is not a masterchain block: %s", storage.FormatBlockRef(target))

@@ -52,9 +52,6 @@ func OldMasterBlockIDFromState(stateRoot *cell.Cell, seqno uint32) (ton.BlockIDE
 }
 
 func loadMcStateExtraPrefix(stateRoot *cell.Cell) (mcStateExtraPrefix, error) {
-	if stateRoot == nil {
-		return mcStateExtraPrefix{}, fmt.Errorf("masterchain state root is nil")
-	}
 	stateLoader, err := stateRoot.BeginParse()
 	if err != nil {
 		return mcStateExtraPrefix{}, err

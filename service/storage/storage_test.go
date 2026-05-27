@@ -212,6 +212,32 @@ func TestLargeBOCEncodedRecordsMatchCellRecords(t *testing.T) {
 	}
 }
 
+func TestPrepareReachableStateCellsUsesExactRecordBacking(t *testing.T) {
+	leaf := cell.BeginCell().MustStoreUInt(0b10101, 5).EndCell()
+	shared := cell.BeginCell().MustStoreUInt(0xAA, 8).MustStoreRef(leaf).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0b111, 3).MustStoreRef(shared).MustStoreRef(shared).EndCell()
+
+	records, err := PrepareReachableStateCells(root)
+	if err != nil {
+		t.Fatalf("prepare reachable state cells: %v", err)
+	}
+
+	checked := 0
+	err = records.ForEach(func(record EncodedCellRecord) error {
+		checked++
+		if cap(record.Data) != len(record.Data) {
+			t.Fatalf("record %x backing capacity = %d, want exact %d", record.Hash[:], cap(record.Data), len(record.Data))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate records: %v", err)
+	}
+	if checked == 0 {
+		t.Fatal("prepared no records")
+	}
+}
+
 func TestLargeBOCPrunedMetadataUsesPrunedHashesDepths(t *testing.T) {
 	leaf := cell.BeginCell().MustStoreUInt(0xBEEF, 16).EndCell()
 	hidden := cell.BeginCell().MustStoreUInt(0xA7, 8).MustStoreRef(leaf).EndCell()
@@ -250,11 +276,12 @@ func TestPrepareReachableStateUpdateCellsUsesCppPrunedBoundaryRule(t *testing.T)
 		t.Fatalf("prepare non-boundary state update cells: %v", err)
 	}
 	nonBoundaryHash := nonBoundary.Virtualize(1).HashKey()
-	if _, ok := nonBoundaryRecords[nonBoundaryHash]; !ok {
+	nonBoundaryData := nonBoundaryRecords.Data(nonBoundaryHash)
+	if len(nonBoundaryData) == 0 {
 		t.Fatalf("non-boundary pruned branch %x was not prepared", nonBoundaryHash[:])
 	}
 
-	record := DecodeCellRecordTrusted(nonBoundaryHash[:], nonBoundaryRecords[nonBoundaryHash])
+	record := DecodeCellRecordTrusted(nonBoundaryHash[:], nonBoundaryData)
 	if got, want := record.D1>>5, nonBoundaryView.LevelMask().Mask; got != want {
 		t.Fatalf("non-boundary pruned descriptor level mask = %d, want %d", got, want)
 	}
@@ -268,7 +295,7 @@ func TestPrepareReachableStateUpdateCellsUsesCppPrunedBoundaryRule(t *testing.T)
 	if loaded.HashKey() != nonBoundaryHash {
 		t.Fatalf("loaded non-boundary branch hash mismatch: got=%x want=%x", loaded.HashKey(), nonBoundaryHash)
 	}
-	assertLargeBOCMetaMatchesCellMetadataFromEncoded(t, nonBoundaryHash[:], nonBoundaryRecords[nonBoundaryHash], nonBoundaryView.GetMetadata())
+	assertLargeBOCMetaMatchesCellMetadataFromEncoded(t, nonBoundaryHash[:], nonBoundaryData, nonBoundaryView.GetMetadata())
 
 	boundary := mustStoragePrunedBranchAtLevel(t, represented, 2)
 	boundaryParent := mustStorageMerkleProofBody(t, boundary)
@@ -277,7 +304,7 @@ func TestPrepareReachableStateUpdateCellsUsesCppPrunedBoundaryRule(t *testing.T)
 		t.Fatalf("prepare boundary state update cells: %v", err)
 	}
 	boundaryHash := boundary.Virtualize(1).HashKey()
-	if _, ok := boundaryRecords[boundaryHash]; ok {
+	if boundaryRecords.Has(boundaryHash) {
 		t.Fatalf("boundary pruned branch %x was prepared, want existing-state boundary", boundaryHash[:])
 	}
 }

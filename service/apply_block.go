@@ -16,58 +16,7 @@ import (
 )
 
 type stateUpdateApplier interface {
-	applyBlockStateUpdate(previous []*tnstore.BlockState, downloaded p2p.DownloadedBlock) (*cell.Cell, error)
-}
-
-func prepareDownloadedBlock(downloaded p2p.DownloadedBlock) (p2p.DownloadedBlock, error) {
-	if downloaded.Parsed == nil {
-		root, err := downloadedBlockRoot(downloaded)
-		if err != nil {
-			return p2p.DownloadedBlock{}, err
-		}
-
-		block, err := tnstore.ParseVerifiedBlockCell(downloaded.ID, root)
-		if err != nil {
-			return p2p.DownloadedBlock{}, err
-		}
-		downloaded.Parsed = block
-	}
-	if err := tnstore.VerifyBlockIdentity(downloaded.ID, downloaded.Parsed); err != nil {
-		return p2p.DownloadedBlock{}, err
-	}
-	if downloaded.Parsed.StateUpdate == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("block %s does not contain state update", tnstore.FormatBlockRef(downloaded.ID))
-	}
-	if downloaded.Meta != nil {
-		return downloaded, nil
-	}
-
-	meta, err := tnstore.BuildBlockMetaFromParsedBlock(downloaded.ID, downloaded.Parsed)
-	if err != nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("build block meta %s: %w", downloaded.BlockRef(), err)
-	}
-
-	downloaded.Meta = meta
-	return downloaded, nil
-}
-
-func prepareDownloadedBlockStateCells(downloaded p2p.DownloadedBlock) (p2p.DownloadedBlock, error) {
-	downloaded, err := prepareDownloadedBlock(downloaded)
-	if err != nil {
-		return p2p.DownloadedBlock{}, err
-	}
-	if downloaded.StateUpdateToCells != nil {
-		return downloaded, nil
-	}
-
-	started := time.Now()
-	cells, err := tnstore.PrepareStateUpdateCells(downloaded.Parsed.StateUpdate)
-	if err != nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("prepare state update target cells for %s: %w", downloaded.BlockRef(), err)
-	}
-	downloaded.StateUpdateToCells = cells
-	downloaded.StateUpdateToCellsElapsed = time.Since(started)
-	return downloaded, nil
+	applyBlockStateUpdate(previous []*tnstore.BlockState, block PreparedBlock) (*cell.Cell, error)
 }
 
 func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
@@ -87,53 +36,70 @@ func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
 	return unwrapped, nil
 }
 
-func prepareBlockData(kind string, id ton.BlockIDExt, data []byte) (p2p.DownloadedBlock, error) {
+func prepareBlockData(kind string, id ton.BlockIDExt, data []byte) (VerifiedBlock, error) {
 	root, err := cell.FromBOC(data)
 	if err != nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("parse %s boc %s: %w", kind, tnstore.FormatBlockRef(id), err)
+		return VerifiedBlock{}, fmt.Errorf("parse %s boc %s: %w", kind, tnstore.FormatBlockRef(id), err)
 	}
 	rootHash := root.HashKey()
 	if !bytes.Equal(rootHash[:], id.RootHash) {
-		return p2p.DownloadedBlock{}, fmt.Errorf("%s root hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
+		return VerifiedBlock{}, fmt.Errorf("%s root hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
 	}
 
 	sum := sha256.Sum256(data)
 	if !bytes.Equal(sum[:], id.FileHash) {
-		return p2p.DownloadedBlock{}, fmt.Errorf("%s file hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
+		return VerifiedBlock{}, fmt.Errorf("%s file hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
 	}
 
-	downloaded := p2p.DownloadedBlock{
-		ID:               id,
-		Kind:             kind,
-		Block:            root,
-		BlockBOC:         data,
-		VerifiedRootHash: true,
-		VerifiedFileHash: true,
-	}
-	return prepareDownloadedBlock(downloaded)
-}
-
-func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (p2p.DownloadedBlock, error) {
-	downloaded, err := prepareBlockData(kind, id, data)
+	block, err := tnstore.ParseVerifiedBlockCell(id, root)
 	if err != nil {
-		return p2p.DownloadedBlock{}, err
+		return VerifiedBlock{}, err
 	}
-	return prepareDownloadedBlockStateCells(downloaded)
+	if block.StateUpdate == nil {
+		return VerifiedBlock{}, fmt.Errorf("%s block %s has no state update", kind, tnstore.FormatBlockRef(id))
+	}
+	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, block)
+	if err != nil {
+		return VerifiedBlock{}, fmt.Errorf("build %s block meta %s: %w", kind, tnstore.FormatBlockRef(id), err)
+	}
+
+	return VerifiedBlock{
+		ID:          id,
+		Kind:        kind,
+		BlockRoot:   root,
+		BlockBOC:    data,
+		Meta:        meta,
+		StateUpdate: block.StateUpdate,
+	}, nil
 }
 
-func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt, persistMeta bool) (p2p.DownloadedBlock, error) {
+func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (PreparedBlock, error) {
+	started := time.Now()
+	verified, err := prepareBlockData(kind, id, data)
+	if err != nil {
+		return PreparedBlock{}, err
+	}
+	prepared, err := prepareVerifiedBlockForApply(verified)
+	if err != nil {
+		return PreparedBlock{}, err
+	}
+	prepared.PrepareElapsed = time.Since(started)
+	return prepared, nil
+}
+
+func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt, persistMeta bool) (PreparedBlock, error) {
 	data, err := store.BlockData(ctx, id)
 	if err != nil {
-		return p2p.DownloadedBlock{}, err
+		return PreparedBlock{}, err
 	}
 
 	downloaded, err := prepareBlockDataForApply("stored block", id, data)
 	if err != nil {
-		return p2p.DownloadedBlock{}, err
+		return PreparedBlock{}, err
 	}
 	if persistMeta {
 		if err = store.SaveBlockMeta(downloaded.Meta); err != nil {
-			return p2p.DownloadedBlock{}, fmt.Errorf("persist stored block meta %s: %w", tnstore.FormatBlockRef(id), err)
+			return PreparedBlock{}, fmt.Errorf("persist stored block meta %s: %w", tnstore.FormatBlockRef(id), err)
 		}
 	}
 	return downloaded, nil
@@ -144,24 +110,24 @@ func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.
 //
 // TON blocks carry MERKLE_UPDATE, so the next state is reconstructed by
 // applying block.state_update to the current state tree.
-func ApplyBlock(current *tnstore.BlockState, downloaded p2p.DownloadedBlock) (*tnstore.BlockState, error) {
-	return ApplyBlockWithPreviousStates([]*tnstore.BlockState{current}, downloaded)
+func ApplyBlock(current *tnstore.BlockState, block PreparedBlock) (*tnstore.BlockState, error) {
+	return ApplyBlockWithPreviousStates([]*tnstore.BlockState{current}, block)
 }
 
-func ApplyBlockWithPreviousStates(previous []*tnstore.BlockState, downloaded p2p.DownloadedBlock) (*tnstore.BlockState, error) {
-	return applyBlockWithPreviousStates(previous, downloaded, nil)
+func ApplyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock) (*tnstore.BlockState, error) {
+	return applyBlockWithPreviousStates(previous, block, nil)
 }
 
-func applyBlockWithPreviousStates(previous []*tnstore.BlockState, downloaded p2p.DownloadedBlock, applier stateUpdateApplier) (*tnstore.BlockState, error) {
-	downloaded, err := prepareDownloadedBlock(downloaded)
-	if err != nil {
-		return nil, err
+func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock, applier stateUpdateApplier) (*tnstore.BlockState, error) {
+	stateUpdate := block.StateUpdate
+	if stateUpdate == nil {
+		return nil, fmt.Errorf("prepared block %s has no state update", block.BlockRef())
 	}
 
-	stateUpdate := downloaded.Parsed.StateUpdate
 	var nextRoot *cell.Cell
+	var err error
 	if applier != nil {
-		nextRoot, err = applier.applyBlockStateUpdate(previous, downloaded)
+		nextRoot, err = applier.applyBlockStateUpdate(previous, block)
 	} else {
 		var currentRoot *cell.Cell
 		currentRoot, err = previousStateRoot(previous)
@@ -170,12 +136,12 @@ func applyBlockWithPreviousStates(previous []*tnstore.BlockState, downloaded p2p
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("apply state update for %s: %w", tnstore.FormatBlockRef(downloaded.ID), err)
+		return nil, fmt.Errorf("apply state update for %s: %w", tnstore.FormatBlockRef(block.ID), err)
 	}
 
-	next, err := tnstore.ParseStateProof(&downloaded.ID, nextRoot, nil, nil, nil)
+	next, err := tnstore.ParseStateProof(&block.ID, nextRoot, nil, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("parse next state from %s: %w", tnstore.FormatBlockRef(downloaded.ID), err)
+		return nil, fmt.Errorf("parse next state from %s: %w", tnstore.FormatBlockRef(block.ID), err)
 	}
 	return next, nil
 }
@@ -184,9 +150,6 @@ func previousStateRoot(previous []*tnstore.BlockState) (*cell.Cell, error) {
 	switch len(previous) {
 	case 1:
 		current := previous[0]
-		if current == nil {
-			return nil, errors.New("current state is nil")
-		}
 		if current.Cell == nil {
 			return nil, errors.New("current state cell is missing")
 		}
@@ -194,9 +157,6 @@ func previousStateRoot(previous []*tnstore.BlockState) (*cell.Cell, error) {
 	case 2:
 		left := previous[0]
 		right := previous[1]
-		if left == nil || right == nil {
-			return nil, errors.New("merge previous state is nil")
-		}
 		if left.Cell == nil || right.Cell == nil {
 			return nil, errors.New("merge previous state cell is missing")
 		}

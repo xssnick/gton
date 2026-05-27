@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/xssnick/gton/service/archive"
-	"github.com/xssnick/gton/service/p2p"
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
@@ -88,7 +88,7 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 		return nil, fmt.Errorf("import archive %s: empty stats", imported.ArtifactPath)
 	}
 
-	blocks := map[string]p2p.DownloadedBlock{}
+	blocks := map[string]PreparedBlock{}
 	stored := storage.ServedArchiveImport{
 		FullBlocks: make([]*storage.ServedBlockFull, 0, len(imported.FullBlocks)),
 		Links:      append([]storage.ServedBlockLink(nil), imported.Links...),
@@ -108,19 +108,21 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 		if prepared.State == nil {
 			return nil, fmt.Errorf("archive block %s state was not prepared by archive import", storage.FormatBlockRef(full.ID))
 		}
-		blocks[key] = p2p.DownloadedBlock{
+		if prepared.StateUpdate == nil {
+			return nil, fmt.Errorf("archive block %s state update was not prepared by archive import", storage.FormatBlockRef(full.ID))
+		}
+		blocks[key] = PreparedBlock{
 			ID:                        full.ID,
 			Kind:                      "archive block",
-			Block:                     prepared.Block,
 			BlockBOC:                  full.Block,
 			ProofBOC:                  full.Proof,
-			Parsed:                    prepared.Parsed,
+			BlockRoot:                 prepared.Block,
 			Meta:                      prepared.Meta.Clone(),
+			StateUpdate:               prepared.StateUpdate,
 			StateUpdateToCells:        prepared.StateUpdateToCells,
 			StateUpdateToCellsElapsed: prepared.StateUpdateToCellsElapsed,
+			PrepareElapsed:            prepared.StateUpdateToCellsElapsed,
 			IsLink:                    full.IsLink,
-			VerifiedRootHash:          true,
-			VerifiedFileHash:          true,
 		}
 		stored.FullBlocks = append(stored.FullBlocks, &storage.ServedBlockFull{
 			ID:                     full.ID,
@@ -135,24 +137,77 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 	return &archiveImportResult{stats: imported.Stats, blocks: blocks, stored: stored, splitDepth: splitDepth}, nil
 }
 
-func (s *Service) archiveShardPrefixesForWindow(start *storage.BlockState, end *storage.BlockState) ([]archive.ShardID, uint32, error) {
+type archiveShardPrefixInputs struct {
+	splitDepth  uint32
+	startBlocks []ton.BlockIDExt
+	stateBlocks [][]ton.BlockIDExt
+}
+
+func (s *Service) archiveShardPrefixesForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState) ([]archive.ShardID, uint32, error) {
+	inputs, err := s.archiveShardPrefixInputsForWindow(start, states)
+	if err != nil {
+		return nil, 0, err
+	}
+	return archiveShardPrefixesForBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks), inputs.splitDepth, nil
+}
+
+func (s *Service) missingArchiveShardPrefixesForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[string]PreparedBlock) ([]archive.ShardID, uint32, error) {
+	inputs, err := s.archiveShardPrefixInputsForWindow(start, states)
+	if err != nil {
+		return nil, 0, err
+	}
+	return archiveShardPrefixesMissingFromBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks, blocks), inputs.splitDepth, nil
+}
+
+func (s *Service) archiveShardPrefixInputsForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState) (archiveShardPrefixInputs, error) {
 	splitDepth, err := monitorMinSplitDepth(start, 0)
 	if err != nil {
-		return nil, 0, fmt.Errorf("load monitor split depth for %s: %w", storage.FormatBlockRef(start.Block), err)
+		return archiveShardPrefixInputs{}, fmt.Errorf("load monitor split depth for %s: %w", storage.FormatBlockRef(start.Block), err)
 	}
 	if splitDepth > maxArchiveMonitorSplitDepth {
-		return nil, 0, fmt.Errorf("monitor split depth %d exceeds supported archive prefix fanout %d", splitDepth, maxArchiveMonitorSplitDepth)
+		return archiveShardPrefixInputs{}, fmt.Errorf("monitor split depth %d exceeds supported archive prefix fanout %d", splitDepth, maxArchiveMonitorSplitDepth)
 	}
 
 	startBlocks, err := state2.ShardBlocksFromMasterState(start)
 	if err != nil {
-		return nil, 0, fmt.Errorf("load start shard blocks from %s: %w", storage.FormatBlockRef(start.Block), err)
-	}
-	endBlocks, err := state2.ShardBlocksFromMasterState(end)
-	if err != nil {
-		return nil, 0, fmt.Errorf("load end shard blocks from %s: %w", storage.FormatBlockRef(end.Block), err)
+		return archiveShardPrefixInputs{}, fmt.Errorf("load start shard blocks from %s: %w", storage.FormatBlockRef(start.Block), err)
 	}
 
+	seqnos := make([]int, 0, len(states))
+	for seqno := range states {
+		seqnos = append(seqnos, int(seqno))
+	}
+	sort.Ints(seqnos)
+
+	stateBlocks := make([][]ton.BlockIDExt, 0, len(seqnos))
+	for _, seqno := range seqnos {
+		state := states[uint32(seqno)]
+		blocks, err := state2.ShardBlocksFromMasterState(state)
+		if err != nil {
+			return archiveShardPrefixInputs{}, fmt.Errorf("load shard blocks from %s: %w", storage.FormatBlockRef(state.Block), err)
+		}
+		stateBlocks = append(stateBlocks, blocks)
+	}
+
+	return archiveShardPrefixInputs{
+		splitDepth:  splitDepth,
+		startBlocks: startBlocks,
+		stateBlocks: stateBlocks,
+	}, nil
+}
+
+func archiveShardPrefixesForBlockStates(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt) []archive.ShardID {
+	return archiveShardPrefixesForBlockStatesMatching(splitDepth, startBlocks, stateBlocks, nil)
+}
+
+func archiveShardPrefixesMissingFromBlockStates(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, blocks map[string]PreparedBlock) []archive.ShardID {
+	return archiveShardPrefixesForBlockStatesMatching(splitDepth, startBlocks, stateBlocks, func(block ton.BlockIDExt) bool {
+		_, ok := blocks[storage.BlockKey(block)]
+		return !ok
+	})
+}
+
+func archiveShardPrefixesForBlockStatesMatching(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, needBlock func(ton.BlockIDExt) bool) []archive.ShardID {
 	startByShard := make(map[storage.ShardKey]ton.BlockIDExt, len(startBlocks))
 	for _, block := range startBlocks {
 		startByShard[storage.ShardKeyFromBlock(block)] = block
@@ -166,9 +221,12 @@ func (s *Service) archiveShardPrefixesForWindow(start *storage.BlockState, end *
 			Workchain: 0,
 			Shard:     int64(shard),
 		}
-		if archivePrefixHasChangedShard(prefix, endBlocks, startByShard) {
-			shards = append(shards, prefix)
+		for _, blocks := range stateBlocks {
+			if archivePrefixHasChangedShardMatching(prefix, blocks, startByShard, needBlock) {
+				shards = append(shards, prefix)
+				break
+			}
 		}
 	}
-	return shards, splitDepth, nil
+	return shards
 }

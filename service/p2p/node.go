@@ -81,10 +81,7 @@ type Node struct {
 	peerStorage           storage2.PeerServingStorage
 	compressedState       CompressedBlockStateProvider
 	syncLag               SyncLagProvider
-	signatureVerifierMx   sync.RWMutex
-	signatureVerifier     MasterchainBroadcastSignatureVerifier
-	stateReadyMx          sync.Mutex
-	stateReadyNotify      chan struct{}
+	signatureVerifier     BroadcastSignatureVerifier
 	shardBroadcastCache   *shardBroadcastBlockCache
 	shardBroadcastWaitMx  sync.Mutex
 	shardBroadcastWaiters map[string][]chan struct{}
@@ -98,8 +95,10 @@ type Node struct {
 	rebroadcastFECMu        sync.Mutex
 	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[string]struct{}
 
-	pendingBroadcastMx sync.Mutex
-	pendingBroadcasts  map[string]struct{}
+	pendingBroadcastMx         sync.Mutex
+	pendingBroadcasts          map[string]pendingBlockBroadcastDecode
+	pendingBroadcastBytes      int64
+	pendingBroadcastProcessing bool
 
 	broadcastStatsMx sync.Mutex
 	broadcastStats   map[broadcastStatKey]uint64
@@ -230,14 +229,14 @@ func New(opts Options) (*Node, error) {
 		peerStorage:               peerStorage,
 		compressedState:           opts.CompressedState,
 		syncLag:                   opts.SyncLag,
-		stateReadyNotify:          make(chan struct{}),
+		signatureVerifier:         opts.SignatureVerifier,
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		shardBroadcastWaiters:     map[string][]chan struct{}{},
 		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastThrottleLast:   map[string]time.Time{},
 		rebroadcastFECSlots:       newRebroadcastFECSlotLimits(),
 		rebroadcastFECPeers:       newRebroadcastFECPeerLimits(),
-		pendingBroadcasts:         map[string]struct{}{},
+		pendingBroadcasts:         map[string]pendingBlockBroadcastDecode{},
 		broadcastStats:            map[broadcastStatKey]uint64{},
 		fecReceiverLast:           map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
 		fecReceiverTotals:         map[string]fecReceiverCounterSnapshot{},
@@ -246,6 +245,10 @@ func New(opts Options) (*Node, error) {
 		stateCellImportSlot:       make(chan struct{}, 1),
 		stateSplitPartDecodeSlot:  make(chan struct{}, 1),
 	}, nil
+}
+
+func (n *Node) SetBroadcastSignatureVerifier(verifier BroadcastSignatureVerifier) {
+	n.signatureVerifier = verifier
 }
 
 func prepareStateFilesDir(dir string) (string, error) {

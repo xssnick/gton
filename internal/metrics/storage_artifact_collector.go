@@ -172,11 +172,11 @@ func scanArchivePackages(ctx context.Context, dir string) (uint64, uint64, error
 			return nil
 		}
 
-		if info.Size() > 0 {
-			bytes += uint64(info.Size())
-		}
 		if strings.HasSuffix(path, ".pack") {
 			packages++
+			if info.Size() > 0 {
+				bytes += uint64(info.Size())
+			}
 		}
 		return nil
 	})
@@ -215,11 +215,11 @@ func scanPersistentStates(ctx context.Context, dir string) (uint64, uint64, erro
 			return nil
 		}
 
-		if info.Size() > 0 {
-			bytes += uint64(info.Size())
-		}
 		if master, ok := persistentStateMasterFromFileName(entry.Name()); ok {
 			masters[master] = struct{}{}
+			if info.Size() > 0 {
+				bytes += uint64(info.Size())
+			}
 		}
 		return nil
 	})

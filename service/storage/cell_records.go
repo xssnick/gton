@@ -22,17 +22,18 @@ type EncodedCellRecord struct {
 	Data []byte
 }
 
-type StateCheckpointCells struct {
+type StateCellRecords struct {
 	Records []EncodedCellRecord
+	chunks  [][]EncodedCellRecord
+	index   map[cell.Hash]int
+	bytes   uint64
 }
 
-// StateCheckpointBlock is the checkpoint boundary: cells produced while applying
-// the block travel with the metadata that will publish that state. Writers flush
-// all cells first, then commit state metadata/current; cells left orphaned by a
-// crash before metadata commit are harmless and expected.
+// StateCheckpointBlock is the metadata side of the checkpoint boundary. Writers
+// flush checkpoint cells first, then commit state metadata/current; cells left
+// orphaned by a crash before metadata commit are harmless and expected.
 type StateCheckpointBlock struct {
 	State *BlockState
-	Cells []EncodedCellRecord
 }
 
 type CellRefRecord struct {
@@ -46,6 +47,143 @@ const (
 	encodedCellRecordHashSize        = 32
 	encodedCellRecordDepthSize       = 2
 )
+
+type stateCellRecordBuilder struct {
+	records []EncodedCellRecord
+	index   map[cell.Hash]int
+	bytes   uint64
+}
+
+func NewStateCellRecords(records []EncodedCellRecord) StateCellRecords {
+	result := StateCellRecords{
+		Records: records,
+	}
+	for _, record := range records {
+		result.bytes += uint64(len(record.Data))
+	}
+	return result
+}
+
+func NewStateCellRecordChunks(chunks [][]EncodedCellRecord, bytes uint64) StateCellRecords {
+	return StateCellRecords{
+		chunks: chunks,
+		bytes:  bytes,
+	}
+}
+
+func (r StateCellRecords) Len() int {
+	total := len(r.Records)
+	for _, chunk := range r.chunks {
+		total += len(chunk)
+	}
+	return total
+}
+
+func (r StateCellRecords) Empty() bool {
+	return r.Len() == 0
+}
+
+func (r StateCellRecords) ByteSize() uint64 {
+	if r.bytes != 0 {
+		return r.bytes
+	}
+
+	var total uint64
+	for _, record := range r.Records {
+		total += uint64(len(record.Data))
+	}
+	for _, chunk := range r.chunks {
+		for _, record := range chunk {
+			total += uint64(len(record.Data))
+		}
+	}
+	return total
+}
+
+func (r StateCellRecords) Data(hash cell.Hash) []byte {
+	if r.index != nil {
+		idx, ok := r.index[hash]
+		if !ok {
+			return nil
+		}
+		return r.Records[idx].Data
+	}
+
+	for _, record := range r.Records {
+		if record.Hash == hash {
+			return record.Data
+		}
+	}
+	for _, chunk := range r.chunks {
+		for _, record := range chunk {
+			if record.Hash == hash {
+				return record.Data
+			}
+		}
+	}
+	return nil
+}
+
+func (r StateCellRecords) Has(hash cell.Hash) bool {
+	return len(r.Data(hash)) > 0
+}
+
+func (r StateCellRecords) AppendTo(records []EncodedCellRecord) []EncodedCellRecord {
+	records = append(records, r.Records...)
+	for _, chunk := range r.chunks {
+		records = append(records, chunk...)
+	}
+	return records
+}
+
+func (r StateCellRecords) ForEach(fn func(EncodedCellRecord) error) error {
+	for _, record := range r.Records {
+		if err := fn(record); err != nil {
+			return err
+		}
+	}
+	for _, chunk := range r.chunks {
+		for _, record := range chunk {
+			if err := fn(record); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (b *stateCellRecordBuilder) add(record EncodedCellRecord) {
+	if len(record.Data) == 0 {
+		return
+	}
+	if b.index == nil {
+		b.index = make(map[cell.Hash]int)
+	}
+	if idx, ok := b.index[record.Hash]; ok {
+		b.bytes -= uint64(len(b.records[idx].Data))
+		b.records[idx].Data = record.Data
+		b.bytes += uint64(len(record.Data))
+		return
+	}
+	b.index[record.Hash] = len(b.records)
+	b.records = append(b.records, record)
+	b.bytes += uint64(len(record.Data))
+}
+
+func (b *stateCellRecordBuilder) alloc(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+	return make([]byte, size)
+}
+
+func (b *stateCellRecordBuilder) build() StateCellRecords {
+	return StateCellRecords{
+		Records: b.records,
+		index:   b.index,
+		bytes:   b.bytes,
+	}
+}
 
 func (r *CellRecord) Clone() *CellRecord {
 	if r == nil {
@@ -69,9 +207,6 @@ func (r *CellRecord) Clone() *CellRecord {
 }
 
 func CellRecordFromCell(cl *cell.Cell) (*CellRecord, error) {
-	if cl == nil {
-		return nil, fmt.Errorf("cell is nil")
-	}
 	if cl.IsLazy() {
 		loader, err := cl.BeginParse()
 		if err != nil {
@@ -81,9 +216,6 @@ func CellRecordFromCell(cl *cell.Cell) (*CellRecord, error) {
 	}
 
 	cellBits := cl.BitsSize()
-	if cellBits > 1023 {
-		return nil, fmt.Errorf("cell bits length is too large: %d", cellBits)
-	}
 	refsCount := int(cl.RefsNum())
 	d1, d2 := cellRecordDescriptors(cl, refsCount, cellBits)
 	data := cellRecordBody(cl, cellBits, int((cellBits+7)/8))
@@ -108,9 +240,6 @@ func CellRecordFromCell(cl *cell.Cell) (*CellRecord, error) {
 }
 
 func CellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (*CellRecord, error) {
-	if cl == nil {
-		return nil, fmt.Errorf("cell is nil")
-	}
 	if cl.IsLazy() {
 		loader, err := cl.BeginParse()
 		if err != nil {
@@ -121,12 +250,6 @@ func CellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (*CellRecord,
 	}
 
 	cellBits := cl.BitsSize()
-	if cellBits > 1023 {
-		return nil, fmt.Errorf("cell bits length is too large: %d", cellBits)
-	}
-	if len(meta.Refs) > 4 {
-		return nil, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
-	}
 
 	d1, d2 := cellRecordDescriptorsForLevelMask(cl, meta.LevelMask, len(meta.Refs), cellBits)
 	data := cellRecordBody(cl, cellBits, int((cellBits+7)/8))
@@ -150,9 +273,12 @@ func CellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (*CellRecord,
 }
 
 func PrepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (EncodedCellRecord, error) {
-	if cl == nil {
-		return EncodedCellRecord{}, fmt.Errorf("cell is nil")
-	}
+	return prepareEncodedCellRecordFromCellMetadata(cl, meta, func(size int) []byte {
+		return make([]byte, size)
+	})
+}
+
+func prepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata, alloc func(int) []byte) (EncodedCellRecord, error) {
 	if cl.IsLazy() {
 		loader, err := cl.BeginParse()
 		if err != nil {
@@ -163,12 +289,6 @@ func PrepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata)
 	}
 
 	cellBits := cl.BitsSize()
-	if cellBits > 1023 {
-		return EncodedCellRecord{}, fmt.Errorf("cell bits length is too large: %d", cellBits)
-	}
-	if len(meta.Refs) > 4 {
-		return EncodedCellRecord{}, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
-	}
 
 	d1, d2 := cellRecordDescriptorsForLevelMask(cl, meta.LevelMask, len(meta.Refs), cellBits)
 	size, err := encodedCellRecordLenFromMetadata(d2, meta.Refs)
@@ -176,56 +296,53 @@ func PrepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata)
 		return EncodedCellRecord{}, err
 	}
 
-	encoded := make([]byte, size)
+	encoded := alloc(size)
 	encodeCellRecordMetadataTo(encoded, cl, meta.Refs, d1, d2)
 	return EncodedCellRecord{Hash: meta.Hash, Data: encoded}, nil
 }
 
-func PrepareStateUpdateCells(update *cell.Cell) (map[cell.Hash][]byte, error) {
+func PrepareStateUpdateCells(update *cell.Cell) (StateCellRecords, error) {
 	if err := cell.ValidateMerkleUpdate(update); err != nil {
-		return nil, err
+		return StateCellRecords{}, err
 	}
 
 	updateTo, err := merkleUpdateTarget(update)
 	if err != nil {
-		return nil, err
+		return StateCellRecords{}, err
 	}
 	return prepareReachableStateUpdateCells(updateTo)
 }
 
-func prepareReachableStateUpdateCells(root *cell.Cell) (map[cell.Hash][]byte, error) {
+func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error) {
 	if root == nil {
-		return nil, nil
+		return StateCellRecords{}, nil
 	}
 
-	records := map[cell.Hash][]byte{}
+	var builder stateCellRecordBuilder
 	err := walkReachableStateUpdateCells(root.Virtualize(0), func(current *cell.Cell, meta cell.Metadata) error {
-		record, err := prepareReachableStateUpdateCellRecord(current, meta)
+		record, err := prepareReachableStateUpdateCellRecord(current, meta, builder.alloc)
 		if err != nil {
 			return fmt.Errorf("build reachable state update cell record %x: %w", meta.Hash[:], err)
 		}
-		if record.Hash != meta.Hash {
-			return fmt.Errorf("reachable state update cell hash mismatch: got=%x want=%x", record.Hash[:], meta.Hash[:])
-		}
-		records[meta.Hash] = record.Data
+		builder.add(record)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return StateCellRecords{}, err
 	}
-	return records, nil
+	return builder.build(), nil
 }
 
-func prepareReachableStateUpdateCellRecord(cl *cell.Cell, meta cell.Metadata) (EncodedCellRecord, error) {
+func prepareReachableStateUpdateCellRecord(cl *cell.Cell, meta cell.Metadata, alloc func(int) []byte) (EncodedCellRecord, error) {
 	if cl.GetType() != cell.PrunedCellType {
-		return PrepareEncodedCellRecordFromCellMetadata(cl, meta)
+		return prepareEncodedCellRecordFromCellMetadata(cl, meta, alloc)
 	}
 
 	pruned, err := materializePrunedStateCell(cl)
 	if err != nil {
 		return EncodedCellRecord{}, err
 	}
-	return PrepareEncodedCellRecordFromCellMetadata(pruned, meta)
+	return prepareEncodedCellRecordFromCellMetadata(pruned, meta, alloc)
 }
 
 func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {
@@ -302,27 +419,27 @@ func walkReachableStateUpdateCells(root *cell.Cell, visit func(*cell.Cell, cell.
 	return nil
 }
 
-func PrepareReachableStateCells(root *cell.Cell) (map[cell.Hash][]byte, error) {
+func PrepareReachableStateCells(root *cell.Cell) (StateCellRecords, error) {
 	if root == nil {
-		return nil, nil
+		return StateCellRecords{}, nil
 	}
 
-	records := map[cell.Hash][]byte{}
+	var builder stateCellRecordBuilder
 	err := WalkReachableStateCells(root, func(current *cell.Cell, meta cell.Metadata) error {
-		record, err := PrepareEncodedCellRecordFromCellMetadata(current, meta)
+		record, err := prepareEncodedCellRecordFromCellMetadata(current, meta, builder.alloc)
 		if err != nil {
 			return fmt.Errorf("build reachable state cell record %x: %w", meta.Hash[:], err)
 		}
 		if record.Hash != meta.Hash {
 			return fmt.Errorf("reachable state cell hash mismatch: got=%x want=%x", record.Hash[:], meta.Hash[:])
 		}
-		records[meta.Hash] = record.Data
+		builder.add(record)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return StateCellRecords{}, err
 	}
-	return records, nil
+	return builder.build(), nil
 }
 
 func WalkReachableStateCells(root *cell.Cell, visit func(*cell.Cell, cell.Metadata) error) error {
@@ -399,9 +516,6 @@ func reachableStateCellMetadata(cl *cell.Cell) (cell.Metadata, [4]*cell.Cell, er
 }
 
 func merkleUpdateTarget(update *cell.Cell) (*cell.Cell, error) {
-	if update == nil {
-		return nil, fmt.Errorf("merkle update cell is nil")
-	}
 	loader, err := update.BeginParse()
 	if err != nil {
 		return nil, fmt.Errorf("load merkle update cell: %w", err)

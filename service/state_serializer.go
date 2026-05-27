@@ -592,10 +592,6 @@ func useOnePassLargeBOCForStateSerialization(target stateSerializationTarget, pa
 }
 
 func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.BlockIDExt, target stateSerializationTarget, part state2.PersistentStatePart, onePassLargeBOC bool) (serializedStateFile, error) {
-	if part.Root == nil {
-		return serializedStateFile{}, fmt.Errorf("persistent state part root is nil")
-	}
-
 	var err error
 	if part.Kind != state2.PersistentStatePartUnsplit {
 		records, err := splitStateCellRecords(ctx, part.Root)
@@ -721,9 +717,6 @@ func splitStateCellRecords(ctx context.Context, root *cell.Cell) ([]*storage.Cel
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-		}
-		if cl == nil {
-			return fmt.Errorf("cell is nil")
 		}
 
 		meta := cl.GetMetadata()

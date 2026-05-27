@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestClassifyDuplicateCompressedBlockBroadcastDedupesBeforeDecode(t *testing.T) {
+func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePrecheck(t *testing.T) {
 	node := newTestNode(t)
 	sub := &overlaySubscription{
 		node: node,
@@ -60,14 +61,11 @@ func TestClassifyDuplicateCompressedBlockBroadcastDedupesBeforeDecode(t *testing
 			}
 
 			first := sub.classifyBroadcast(nil, tt.msg, payload, DeliverySimple, false, "peer")
-			if first == nil || first.masterchainWake == nil {
-				t.Fatal("first invalid masterchain broadcast should still wake the masterchain tracker")
+			if first != nil {
+				t.Fatalf("invalid masterchain broadcast was accepted before signature precheck: %+v", first)
 			}
-			if !first.deduped {
-				t.Fatal("first full block broadcast should be fingerprint-deduped before decode")
-			}
-			if _, ready := node.MasterchainBroadcastAfter(tt.block.SeqNo - 1); !ready {
-				t.Fatal("raw masterchain broadcast should wake before payload decode succeeds")
+			if _, ready := node.MasterchainBroadcastAfter(tt.block.SeqNo - 1); ready {
+				t.Fatal("invalid masterchain broadcast should not wake before signature precheck")
 			}
 
 			second := sub.classifyBroadcast(nil, tt.msg, payload, DeliverySimple, false, "peer")
@@ -104,6 +102,36 @@ func TestClassifyBroadcastUsesPeerAsFECSourceKey(t *testing.T) {
 	}
 	if accepted.event.SourceKey != "peer-a" {
 		t.Fatalf("source key = %q, want peer-a", accepted.event.SourceKey)
+	}
+}
+
+func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T) {
+	node := newTestNode(t)
+	node.SetBroadcastSignatureVerifier(testRejectBroadcastSignatureVerifier{err: errors.New("bad signatures")})
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+
+	block := testBlockID(0, topShard, 202)
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      block,
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, "peer")
+	if accepted != nil {
+		t.Fatalf("shard block broadcast with failed signature precheck was accepted: %+v", accepted)
+	}
+	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "signature_check_failed"); got != 1 {
+		t.Fatalf("dropped broadcast count = %d, want 1", got)
 	}
 }
 
@@ -160,6 +188,14 @@ func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
 	}
 	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
 		t.Fatalf("accepted broadcast count = %d, want 1", got)
+	}
+
+	node.acceptBroadcast(*accepted)
+	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "seen"); got != 1 {
+		t.Fatalf("seen broadcast drop count = %d, want 1", got)
+	}
+	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
+		t.Fatalf("duplicate accepted broadcast count = %d, want 1", got)
 	}
 }
 
@@ -282,6 +318,15 @@ func TestClassifyExternalMessageBroadcastRejectsOversizeData(t *testing.T) {
 func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 {
 	for _, stat := range node.broadcastStatusSnapshot() {
 		if stat.Direction == direction && stat.Overlay == overlay && stat.Kind == kind {
+			return stat.Count
+		}
+	}
+	return 0
+}
+
+func testBroadcastDropStatCount(node *Node, overlay, kind, reason string) uint64 {
+	for _, stat := range node.broadcastDropStatusSnapshot() {
+		if stat.Overlay == overlay && stat.Kind == kind && stat.Reason == reason {
 			return stat.Count
 		}
 	}

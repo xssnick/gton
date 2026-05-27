@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
@@ -142,7 +141,7 @@ func TestAppliedBlockArtifactWriterAcceptsAlreadyDurableBlock(t *testing.T) {
 		t.Fatalf("pre-save full block: %v", err)
 	}
 
-	if err := writer.enqueue(ctx, p2p.DownloadedBlock{ID: block.ID}, 4); err != nil {
+	if err := writer.enqueue(ctx, PreparedBlock{ID: block.ID}, 4); err != nil {
 		t.Fatalf("enqueue durable block: %v", err)
 	}
 	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
@@ -334,7 +333,7 @@ func (f *appliedBlockArtifactTestFlusher) has(block ton.BlockIDExt) bool {
 	return ok
 }
 
-func testAppliedDownloadedBlock(block ton.BlockIDExt, prev ton.BlockIDExt, isKey bool) p2p.DownloadedBlock {
+func testAppliedDownloadedBlock(block ton.BlockIDExt, prev ton.BlockIDExt, isKey bool) PreparedBlock {
 	meta := &storage.BlockMeta{
 		ID:       block,
 		PrevRefs: []ton.BlockIDExt{prev},
@@ -342,11 +341,10 @@ func testAppliedDownloadedBlock(block ton.BlockIDExt, prev ton.BlockIDExt, isKey
 	if isKey {
 		meta.Mark(storage.BlockMetaIsKeyBlock)
 	}
-	return p2p.DownloadedBlock{
-		ID:               block,
-		BlockBOC:         []byte("block boc"),
-		ProofBOC:         []byte("proof boc"),
-		Meta:             meta,
-		VerifiedFileHash: true,
+	return PreparedBlock{
+		ID:       block,
+		BlockBOC: []byte("block boc"),
+		ProofBOC: []byte("proof boc"),
+		Meta:     meta,
 	}
 }

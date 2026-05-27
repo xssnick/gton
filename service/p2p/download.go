@@ -25,7 +25,7 @@ import (
 )
 
 var ErrBlockNotAvailable = errors.New("peer does not have the requested block")
-var ErrCompressedBlockV2Unsupported = errors.New("tonNode.dataFullCompressedV2 is not supported without state-aware BOC decompression")
+var ErrCompressedBlockStateNotReady = errors.New("compressed block previous state is not ready")
 
 const (
 	liveNextUnavailablePenalty    = 3 * time.Second
@@ -429,7 +429,7 @@ func downloadedBlockFromStored(kind string, full *tnstore.ServedBlockFull) (*Dow
 	if full == nil {
 		return nil, tnstore.ErrNotFound
 	}
-	return normalizeDownloadedBlock(kind, full.ID, full.Proof, full.Block, full.IsLink, true, nil)
+	return decodeRawDownloadedBlock(kind, full.ID, full.Proof, full.Block, full.IsLink)
 }
 
 func (n *Node) downloadFromOverlay(ctx context.Context, block ton.BlockIDExt, req tl.Serializable) (*DownloadedBlock, error) {
@@ -1270,32 +1270,24 @@ func runConcurrentOverlayQueries(ctx context.Context, peers []*overlayPeer, para
 }
 
 func (n *Node) decodeDownloadedBlock(ctx context.Context, resp tl.Serializable) (*DownloadedBlock, error) {
-	block, err := decodeDownloadedBlock(resp)
-	if !errors.Is(err, ErrCompressedBlockV2Unsupported) {
-		return block, err
+	switch data := resp.(type) {
+	case DataFullCompressedV2:
+		return n.decodeDataFullCompressedV2(ctx, data)
+	default:
+		return decodeDownloadedBlock(resp)
 	}
-
-	data, ok := resp.(DataFullCompressedV2)
-	if !ok {
-		return nil, err
-	}
-	state, stateErr := n.stateForCompressedBlockDecompression(ctx, data.ID, data.Proof)
-	if stateErr != nil {
-		return nil, fmt.Errorf("%w: %v", err, stateErr)
-	}
-	return decodeCompressedBlockV2(data, state)
 }
 
 func decodeDownloadedBlock(resp tl.Serializable) (*DownloadedBlock, error) {
 	switch data := resp.(type) {
 	case tonnodeapi.DataFull:
-		return normalizeDownloadedBlock("tonNode.dataFull", data.ID, data.Proof, data.Block, data.IsLink, true, nil)
+		return decodeRawDownloadedBlock("tonNode.dataFull", data.ID, data.Proof, data.Block, data.IsLink)
 	case tonnodeapi.DataFullEmpty:
 		return nil, ErrBlockNotAvailable
 	case DataFullCompressed:
 		return decodeCompressedBlock(data)
 	case DataFullCompressedV2:
-		return decodeCompressedBlockV2(data, nil)
+		return nil, fmt.Errorf("tonNode.dataFullCompressedV2 requires state-aware decode")
 	default:
 		return nil, fmt.Errorf("unexpected download response %T", resp)
 	}
@@ -1318,16 +1310,51 @@ func decodeCompressedBlock(data DataFullCompressed) (*DownloadedBlock, error) {
 	proof := cell.ToBOCWithOptions([]*cell.Cell{roots[0]}, cell.BOCSerializeOptions{WithCRC32C: false})
 	block := serializeCompressedBlockRoot(roots[1])
 
-	return normalizeDownloadedBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, true, roots[1])
+	return newVerifiedDownloadedBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, roots[0], roots[1])
 }
 
 func decodeCompressedBlockV2(data DataFullCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
+	proofRoot, err := parseDownloadedBlockProof("tonNode.dataFullCompressedV2", data.Proof)
+	if err != nil {
+		return nil, err
+	}
+	return decodeCompressedBlockV2WithProofRoot(data, state, proofRoot)
+}
+
+func (n *Node) decodeDataFullCompressedV2(ctx context.Context, data DataFullCompressedV2) (*DownloadedBlock, error) {
+	proofRoot, err := parseDownloadedBlockProof("tonNode.dataFullCompressedV2", data.Proof)
+	if err != nil {
+		return nil, err
+	}
+
+	needState, err := cell.NeedStateForDecompression(data.BlockCompressed)
+	if err != nil {
+		return nil, fmt.Errorf("check tonNode.dataFullCompressedV2 compression: %w", err)
+	}
+	if !needState {
+		return decodeCompressedBlockV2WithProofRoot(data, nil, proofRoot)
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state, err := n.stateForCompressedBlockDecompression(ctx, data.ID, proofRoot)
+	if err != nil {
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %v", ErrCompressedBlockStateNotReady, err)
+		}
+		return nil, err
+	}
+	return decodeCompressedBlockV2WithProofRoot(data, state, proofRoot)
+}
+
+func decodeCompressedBlockV2WithProofRoot(data DataFullCompressedV2, state *cell.Cell, proofRoot *cell.Cell) (*DownloadedBlock, error) {
 	needState, err := cell.NeedStateForDecompression(data.BlockCompressed)
 	if err != nil {
 		return nil, fmt.Errorf("check tonNode.dataFullCompressedV2 compression: %w", err)
 	}
 	if needState && state == nil {
-		return nil, ErrCompressedBlockV2Unsupported
+		return nil, ErrCompressedBlockStateNotReady
 	}
 
 	roots, err := cell.DecompressBOC(data.BlockCompressed, maxDecompressedBlockSize, state)
@@ -1339,23 +1366,37 @@ func decodeCompressedBlockV2(data DataFullCompressedV2, state *cell.Cell) (*Down
 	}
 
 	block := serializeCompressedBlockRoot(roots[0])
-	return normalizeDownloadedBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, true, roots[0])
+	return newVerifiedDownloadedBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, proofRoot, roots[0])
 }
 
-func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block ton.BlockIDExt, proof []byte) (*cell.Cell, error) {
+func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, error) {
 	if n.storage == nil {
 		return nil, fmt.Errorf("state storage is not configured")
 	}
 
-	prevBlocks, err := prevBlocksFromBlockProof(block, proof)
+	prev, err := compressedBlockPreviousState(block, proofRoot)
 	if err != nil {
 		return nil, err
 	}
+	return n.stateForCompressedBlockDecompressionPrev(ctx, prev)
+}
+
+func compressedBlockPreviousState(block ton.BlockIDExt, proofRoot *cell.Cell) (ton.BlockIDExt, error) {
+	prevBlocks, err := prevBlocksFromBlockProof(block, proofRoot)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
 	if len(prevBlocks) != 1 {
-		return nil, fmt.Errorf("state-aware decompression with %d previous blocks is not supported", len(prevBlocks))
+		return ton.BlockIDExt{}, fmt.Errorf("state-aware decompression with %d previous blocks is not supported", len(prevBlocks))
+	}
+	return prevBlocks[0], nil
+}
+
+func (n *Node) stateForCompressedBlockDecompressionPrev(ctx context.Context, prev ton.BlockIDExt) (*cell.Cell, error) {
+	if n.storage == nil {
+		return nil, fmt.Errorf("state storage is not configured")
 	}
 
-	prev := prevBlocks[0]
 	if n.compressedState != nil {
 		state, err := n.compressedState.StateRootForCompressedBlock(ctx, prev)
 		if err == nil {
@@ -1387,12 +1428,8 @@ func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block t
 	return root, nil
 }
 
-func prevBlocksFromBlockProof(block ton.BlockIDExt, proof []byte) ([]ton.BlockIDExt, error) {
-	root, err := cell.FromBOC(proof)
-	if err != nil {
-		return nil, fmt.Errorf("parse block proof boc: %w", err)
-	}
-	parsed, err := parseBlockProofForBlock(block, root)
+func prevBlocksFromBlockProof(block ton.BlockIDExt, proofRoot *cell.Cell) ([]ton.BlockIDExt, error) {
+	parsed, err := parseBlockProofForBlock(block, proofRoot)
 	if err != nil {
 		return nil, fmt.Errorf("parse previous blocks from proof: %w", err)
 	}
@@ -1403,7 +1440,43 @@ func prevBlocksFromBlockProof(block ton.BlockIDExt, proof []byte) ([]ton.BlockID
 	return meta.PrevRefs, nil
 }
 
-func normalizeDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, requireFileHash bool, parsedBlock *cell.Cell) (*DownloadedBlock, error) {
+func decodeRawDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool) (*DownloadedBlock, error) {
+	proofRoot, err := parseDownloadedBlockProof(kind, proof)
+	if err != nil {
+		return nil, err
+	}
+	blockRoot, err := parseDownloadedBlockData(kind, data)
+	if err != nil {
+		return nil, err
+	}
+	return newVerifiedDownloadedBlock(kind, id, proof, data, isLink, proofRoot, blockRoot)
+}
+
+func parseDownloadedBlockProof(kind string, proof []byte) (*cell.Cell, error) {
+	if len(proof) == 0 {
+		return nil, fmt.Errorf("%s proof is empty", kind)
+	}
+
+	proofRoot, err := cell.FromBOC(proof)
+	if err != nil {
+		return nil, fmt.Errorf("%s proof is not a valid BOC: %w", kind, err)
+	}
+	return proofRoot, nil
+}
+
+func parseDownloadedBlockData(kind string, data []byte) (*cell.Cell, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%s block is empty", kind)
+	}
+
+	blockRoot, err := cell.FromBOC(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s block is not a valid BOC: %w", kind, err)
+	}
+	return blockRoot, nil
+}
+
+func newVerifiedDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, blockRoot *cell.Cell) (*DownloadedBlock, error) {
 	if len(proof) == 0 {
 		return nil, fmt.Errorf("%s proof is empty", kind)
 	}
@@ -1411,42 +1484,63 @@ func normalizeDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data
 		return nil, fmt.Errorf("%s block is empty", kind)
 	}
 
-	proofRoot, err := cell.FromBOC(proof)
-	if err != nil {
-		return nil, fmt.Errorf("%s proof is not a valid BOC: %w", kind, err)
-	}
-	if err = blockproof.CheckProofShape(id, proofRoot, isLink); err != nil {
+	if err := blockproof.CheckProofShape(id, proofRoot, isLink); err != nil {
 		return nil, fmt.Errorf("%s proof shape: %w", kind, err)
 	}
 
-	if parsedBlock == nil {
-		parsedBlock, err = cell.FromBOC(data)
-		if err != nil {
-			return nil, fmt.Errorf("%s block is not a valid BOC: %w", kind, err)
-		}
+	effectiveRoot, err := effectiveDownloadedBlockRoot(id, isLink, blockRoot)
+	if err != nil {
+		return nil, fmt.Errorf("%s block root: %w", kind, err)
 	}
-	rootHash := parsedBlock.HashKey()
+
+	rootHash := effectiveRoot.HashKey()
 	if !bytes.Equal(rootHash[:], id.RootHash) {
 		return nil, fmt.Errorf("%s root hash mismatch for %s", kind, formatBlockRef(id))
 	}
 
 	sum := sha256.Sum256(data)
-	verifiedFileHash := bytes.Equal(sum[:], id.FileHash)
-	if requireFileHash && !verifiedFileHash {
+	if !bytes.Equal(sum[:], id.FileHash) {
 		return nil, fmt.Errorf("%s file hash mismatch for %s", kind, formatBlockRef(id))
+	}
+
+	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
+	if err != nil {
+		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, formatBlockRef(id), err)
+	}
+	if parsed.StateUpdate == nil {
+		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
+	}
+	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
+	if err != nil {
+		return nil, fmt.Errorf("%s build block meta %s: %w", kind, formatBlockRef(id), err)
 	}
 
 	return &DownloadedBlock{
 		ID:               id,
 		Kind:             kind,
-		Block:            parsedBlock,
+		Block:            effectiveRoot,
 		Proof:            proofRoot,
 		BlockBOC:         data,
 		ProofBOC:         proof,
+		Meta:             meta,
+		StateUpdate:      parsed.StateUpdate,
 		IsLink:           isLink,
 		VerifiedRootHash: true,
-		VerifiedFileHash: verifiedFileHash,
 	}, nil
+}
+
+func effectiveDownloadedBlockRoot(id ton.BlockIDExt, isLink bool, root *cell.Cell) (*cell.Cell, error) {
+	if root == nil {
+		return nil, fmt.Errorf("block %s has no parsed root", formatBlockRef(id))
+	}
+	if !isLink || root.GetType() != cell.MerkleProofCellType {
+		return root, nil
+	}
+	unwrapped, err := cell.UnwrapProof(root, id.RootHash)
+	if err != nil {
+		return nil, fmt.Errorf("unwrap merkle proof link for %s: %w", formatBlockRef(id), err)
+	}
+	return unwrapped, nil
 }
 
 func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {

@@ -986,8 +986,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, source) (rate(${metric_namespace}_sync_block_download_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
-                      "legendFormat": "{{instance}} {{pipeline}} {{source}} p95"
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain, source) (rate(${metric_namespace}_sync_block_download_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} {{chain}} {{source}} p95"
                     }
                   }
                 }
@@ -1051,7 +1051,7 @@
       "kind": "Panel",
       "spec": {
         "id": 17,
-        "title": "Block apply latency p95",
+        "title": "State transition latency p95",
         "description": "",
         "links": [],
         "data": {
@@ -1071,7 +1071,7 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain) (rate(${metric_namespace}_sync_block_apply_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain) (rate(${metric_namespace}_sync_block_apply_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", pipeline!=\"blocksync\"}[$__rate_interval])))",
                       "legendFormat": "{{instance}} {{pipeline}} {{chain}} p95"
                     }
                   }
@@ -3617,25 +3617,6 @@
                     }
                   }
                 }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "process_max_fds{job=~\"$job\", instance=~\"$instance\"}",
-                      "legendFormat": "{{instance}} max fds"
-                    }
-                  }
-                }
               }
             ],
             "transformations": [],
@@ -3806,6 +3787,94 @@
                     "spec": {
                       "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"rebroadcasted\"}[$__rate_interval]))",
                       "legendFormat": "{{instance}} {{overlay}} {{kind}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-56": {
+      "kind": "Panel",
+      "spec": {
+        "id": 56,
+        "title": "Dropped broadcast rate",
+        "description": "Inbound P2P broadcasts dropped before acceptance by overlay, TL type, and reason. Existing seen/dedupe guards report repeated payloads as reason=seen.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, kind, reason) (rate(${metric_namespace}_p2p_broadcast_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} {{kind}} {{reason}}"
                     }
                   }
                 }
@@ -4272,6 +4341,91 @@
           }
         }
       }
+    },
+    "panel-55": {
+      "kind": "Panel",
+      "spec": {
+        "id": 55,
+        "title": "Block prepare latency p95",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain, shard) (rate(${metric_namespace}_sync_block_prepare_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} {{chain}}/{{shard}} p95"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "s"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
     }
   },
   "layout": {
@@ -4480,7 +4634,7 @@
                       "height": 8,
                       "element": {
                         "kind": "ElementReference",
-                        "name": "panel-17"
+                        "name": "panel-55"
                       }
                     }
                   },
@@ -4493,7 +4647,7 @@
                       "height": 8,
                       "element": {
                         "kind": "ElementReference",
-                        "name": "panel-18"
+                        "name": "panel-17"
                       }
                     }
                   },
@@ -4502,6 +4656,19 @@
                     "spec": {
                       "x": 12,
                       "y": 16,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-18"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 24,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -4769,6 +4936,19 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-54"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 48,
+                      "width": 24,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-56"
                       }
                     }
                   }

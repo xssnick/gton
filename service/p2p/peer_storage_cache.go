@@ -79,15 +79,10 @@ func (n *Node) rememberBlockFull(prev *ton.BlockIDExt, downloaded *DownloadedBlo
 		return
 	}
 
-	blockData := downloaded.BlockBOC
-	if !downloaded.VerifiedFileHash {
-		blockData = nil
-	}
-
 	full := &storage.ServedBlockFull{
 		ID:     downloaded.ID,
 		Proof:  downloaded.ProofBOC,
-		Block:  blockData,
+		Block:  downloaded.BlockBOC,
 		Meta:   downloaded.Meta,
 		IsLink: downloaded.IsLink,
 	}
@@ -105,7 +100,7 @@ func (n *Node) rememberBlockFull(prev *ton.BlockIDExt, downloaded *DownloadedBlo
 			Msg("failed to store block full")
 		return
 	}
-	if n.blockCacheObserver != nil && len(blockData) > 0 {
+	if n.blockCacheObserver != nil && len(downloaded.BlockBOC) > 0 {
 		n.blockCacheObserver.MarkLiveBlockFlushed(downloaded.ID)
 	}
 	if prev != nil {

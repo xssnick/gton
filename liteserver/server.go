@@ -114,9 +114,6 @@ type Server struct {
 }
 
 func New(opts Options) (*Server, error) {
-	if opts.Store == nil {
-		return nil, fmt.Errorf("liteserver storage is nil")
-	}
 	if len(opts.PrivateKey) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("liteserver private key must be %d bytes", ed25519.PrivateKeySize)
 	}

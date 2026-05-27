@@ -57,10 +57,10 @@ func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storag
 		}
 		entries = append(entries, storage.StateCheckpointBlock{State: block})
 	}
-	return s.SaveStateCheckpointEntries(context.Background(), entries, current)
+	return s.SaveStateCheckpointEntries(context.Background(), entries, storage.StateCellRecords{}, current)
 }
 
-func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, current *storage.CurrentState) error {
+func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, _ storage.StateCellRecords, current *storage.CurrentState) error {
 	if current == nil {
 		return fmt.Errorf("current state is nil")
 	}

@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"runtime"
 	"sync/atomic"
 
@@ -135,9 +134,6 @@ func (q *archiveImportQueue) importArchive(ctx context.Context, masterchainSeqno
 }
 
 func (q *archiveImportQueue) submitArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, priority archiveImportPriority) (<-chan archiveImportQueueResult, error) {
-	if q == nil {
-		return nil, fmt.Errorf("archive import queue is nil")
-	}
 	done := make(chan archiveImportQueueResult, 1)
 	job := archiveDownloadJob{
 		ctx:              ctx,

@@ -37,6 +37,7 @@ type serviceCollector struct {
 	p2pQueuePushed      *prometheus.Desc
 	p2pQueueDropped     *prometheus.Desc
 	p2pBroadcasts       *prometheus.Desc
+	p2pBroadcastDrops   *prometheus.Desc
 	p2pRebroadcastSent  *prometheus.Desc
 	p2pRebroadcastDrop  *prometheus.Desc
 	p2pFECActiveStreams *prometheus.Desc
@@ -164,6 +165,12 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			[]string{"direction", "overlay", "kind"},
 			nil,
 		),
+		p2pBroadcastDrops: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "broadcast_dropped_total"),
+			"Total inbound P2P broadcasts dropped before acceptance by type and reason.",
+			[]string{"overlay", "kind", "reason"},
+			nil,
+		),
 		p2pRebroadcastSent: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "rebroadcast_sent_total"),
 			"Total successful P2P rebroadcast sends.",
@@ -264,6 +271,7 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pQueuePushed
 	ch <- c.p2pQueueDropped
 	ch <- c.p2pBroadcasts
+	ch <- c.p2pBroadcastDrops
 	ch <- c.p2pRebroadcastSent
 	ch <- c.p2pRebroadcastDrop
 	ch <- c.p2pFECActiveStreams
@@ -330,8 +338,12 @@ func (c *serviceCollector) collectChain(ch chan<- prometheus.Metric, chain strin
 	if network != nil {
 		ch <- prometheus.MustNewConstMetric(c.syncNetworkSeqno, prometheus.GaugeValue, float64(network.SeqNo), chain, shard)
 	}
-	if local != nil && network != nil && network.SeqNo >= local.SeqNo {
-		ch <- prometheus.MustNewConstMetric(c.syncGapBlocks, prometheus.GaugeValue, float64(network.SeqNo-local.SeqNo), chain, shard)
+	if local != nil && network != nil {
+		gap := uint32(0)
+		if network.SeqNo > local.SeqNo {
+			gap = network.SeqNo - local.SeqNo
+		}
+		ch <- prometheus.MustNewConstMetric(c.syncGapBlocks, prometheus.GaugeValue, float64(gap), chain, shard)
 	}
 	if utime <= 0 {
 		return
@@ -378,6 +390,9 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 
 	for _, broadcast := range snapshot.Broadcasts {
 		ch <- prometheus.MustNewConstMetric(c.p2pBroadcasts, prometheus.CounterValue, float64(broadcast.Count), broadcast.Direction, broadcast.Overlay, broadcast.Kind)
+	}
+	for _, drop := range snapshot.BroadcastDrops {
+		ch <- prometheus.MustNewConstMetric(c.p2pBroadcastDrops, prometheus.CounterValue, float64(drop.Count), drop.Overlay, drop.Kind, drop.Reason)
 	}
 }
 

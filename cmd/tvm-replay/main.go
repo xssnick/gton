@@ -830,10 +830,6 @@ func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32,
 		return blockValidationResult{}, ctx.Err()
 	default:
 	}
-	if expected == nil {
-		return blockValidationResult{}, fmt.Errorf("expected state is nil for %s", storage.FormatBlockRef(block.ID))
-	}
-
 	accounts, err := accountBlocks(block.Parsed)
 	if err != nil {
 		return blockValidationResult{}, fmt.Errorf("load account blocks %s: %w", storage.FormatBlockRef(block.ID), err)
@@ -1695,9 +1691,6 @@ func countTransactions(accounts []accountBlockWork) int {
 }
 
 func accountBlocks(block *tlb.Block) ([]accountBlockWork, error) {
-	if block == nil {
-		return nil, fmt.Errorf("block is nil")
-	}
 	if block.Extra == nil || block.Extra.ShardAccountBlocks == nil {
 		return nil, fmt.Errorf("block has no shard account blocks")
 	}
@@ -1892,10 +1885,6 @@ func (v *replayValidator) blockStateViews(previous []*storage.BlockState, expect
 }
 
 func validateBlockStateUpdateRoots(previous []*storage.BlockState, expected *storage.BlockState, update *cell.Cell, source stateViewSource) error {
-	if expected == nil {
-		return fmt.Errorf("expected state is nil")
-	}
-
 	updateFrom, updateTo, err := merkleUpdateRootRefs(update)
 	if err != nil {
 		return err
@@ -1945,9 +1934,6 @@ func validateStateUpdateSourceHashes(previous []*storage.BlockState, updateFrom 
 	switch len(previous) {
 	case 1:
 		state := previous[0]
-		if state == nil {
-			return fmt.Errorf("current state is nil")
-		}
 		if len(state.StateRootHash) != 32 {
 			return fmt.Errorf("current state %s has no root hash", storage.FormatBlockRef(state.Block))
 		}
@@ -1959,9 +1945,6 @@ func validateStateUpdateSourceHashes(previous []*storage.BlockState, updateFrom 
 	case 2:
 		left := previous[0]
 		right := previous[1]
-		if left == nil || right == nil {
-			return fmt.Errorf("merge previous state is nil")
-		}
 		if len(left.StateRootHash) != 32 || len(right.StateRootHash) != 32 {
 			return fmt.Errorf("merge previous states have missing root hashes")
 		}
@@ -2020,9 +2003,6 @@ func previousStateRootForReplay(previous []*storage.BlockState) (*cell.Cell, err
 	switch len(previous) {
 	case 1:
 		current := previous[0]
-		if current == nil {
-			return nil, fmt.Errorf("current state is nil")
-		}
 		if current.Cell == nil {
 			return nil, fmt.Errorf("current state cell is missing")
 		}
@@ -2030,9 +2010,6 @@ func previousStateRootForReplay(previous []*storage.BlockState) (*cell.Cell, err
 	case 2:
 		left := previous[0]
 		right := previous[1]
-		if left == nil || right == nil {
-			return nil, fmt.Errorf("merge previous state is nil")
-		}
 		if left.Cell == nil || right.Cell == nil {
 			return nil, fmt.Errorf("merge previous state cell is missing")
 		}
@@ -2240,9 +2217,6 @@ func previousShardStateViewsFromRoot(root *cell.Cell) ([]*shardStateView, error)
 }
 
 func newShardStateView(state *storage.BlockState) (*shardStateView, error) {
-	if state == nil {
-		return nil, fmt.Errorf("state is nil")
-	}
 	if state.Cell == nil {
 		return nil, fmt.Errorf("state %s has no root cell", storage.FormatBlockRef(state.Block))
 	}
@@ -2282,9 +2256,6 @@ func blockRefFromParsedShardState(state *tlb.ShardStateUnsplit) ton.BlockIDExt {
 }
 
 func merkleUpdateRootRefs(update *cell.Cell) (*cell.Cell, *cell.Cell, error) {
-	if update == nil {
-		return nil, nil, fmt.Errorf("merkle update cell is nil")
-	}
 	loader, err := update.BeginParse()
 	if err != nil {
 		return nil, nil, fmt.Errorf("load merkle update cell: %w", err)
@@ -2588,9 +2559,6 @@ func (c *executionConfigCache) blockContext(ctx context.Context, lookupMaster fu
 }
 
 func (c *executionConfigCache) masterContext(ctx context.Context, lookupMaster func(context.Context, uint32) (ton.BlockIDExt, error), master ton.BlockIDExt, masterState *cell.Cell) (*masterExecutionContext, error) {
-	if masterState == nil {
-		return nil, fmt.Errorf("master state root is nil")
-	}
 	stateHash := masterState.HashKey(0)
 	masterKey := fmt.Sprintf("%s:%x:%s", storage.BlockKey(master), stateHash[:], c.prevBlocksSource)
 
@@ -3168,10 +3136,6 @@ func runMethodPrevBlocksInfo(master ton.BlockIDExt, masterState *cell.Cell) (tup
 }
 
 func runMethodPrevBlocksInfoFromIndex(ctx context.Context, master ton.BlockIDExt, masterState *cell.Cell, lookupMaster func(context.Context, uint32) (ton.BlockIDExt, error)) (tuple.Tuple, error) {
-	if lookupMaster == nil {
-		return tuple.Tuple{}, fmt.Errorf("master block index lookup is nil")
-	}
-
 	info, err := runMethodMasterInfoFromState(masterState)
 	if err != nil {
 		return tuple.Tuple{}, err

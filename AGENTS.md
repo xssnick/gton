@@ -61,6 +61,8 @@
 - Do not make excessive nil checks.
 - Check only what can really be nil logically.
 - Do not check obvious value inputs for nil.
+- Do not return defensive errors like `x is nil` for required pointer arguments, receivers, or dependencies that the caller contract already guarantees.
+- Keep nil checks only when nil is a real domain state, an optional dependency, decoded external data, or a lower-layer absence signal.
 
 - Keep code simple and optimized.
 - Add abstractions only when they remove real duplication or represent a real boundary.

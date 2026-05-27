@@ -18,6 +18,7 @@ type StatusSnapshot struct {
 	Queues                []QueueStatusSnapshot
 	Rebroadcast           []RebroadcastStatusSnapshot
 	Broadcasts            []BroadcastStatusSnapshot
+	BroadcastDrops        []BroadcastDropStatusSnapshot
 }
 
 type OverlayStatusSnapshot struct {
@@ -69,13 +70,22 @@ type BroadcastStatusSnapshot struct {
 	Direction string
 	Overlay   string
 	Kind      string
+	Reason    string
 	Count     uint64
+}
+
+type BroadcastDropStatusSnapshot struct {
+	Overlay string
+	Kind    string
+	Reason  string
+	Count   uint64
 }
 
 type broadcastStatKey struct {
 	direction string
 	overlay   string
 	kind      string
+	reason    string
 }
 
 type fecReceiverPeerKey struct {
@@ -130,11 +140,20 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	snapshot.Queues = n.queueStatusSnapshot()
 	snapshot.Rebroadcast = n.rebroadcastStatusSnapshot()
 	snapshot.Broadcasts = n.broadcastStatusSnapshot()
+	snapshot.BroadcastDrops = n.broadcastDropStatusSnapshot()
 
 	return snapshot
 }
 
 func (n *Node) noteBroadcast(direction, overlay, kind string) {
+	n.noteBroadcastWithReason(direction, overlay, kind, "")
+}
+
+func (n *Node) noteBroadcastDrop(overlay, kind, reason string) {
+	n.noteBroadcastWithReason("dropped", overlay, kind, reason)
+}
+
+func (n *Node) noteBroadcastWithReason(direction, overlay, kind, reason string) {
 	if direction == "" {
 		direction = "unknown"
 	}
@@ -144,11 +163,15 @@ func (n *Node) noteBroadcast(direction, overlay, kind string) {
 	if kind == "" {
 		kind = "unknown"
 	}
+	if reason == "" && direction == "dropped" {
+		reason = "unknown"
+	}
 
 	key := broadcastStatKey{
 		direction: direction,
 		overlay:   overlay,
 		kind:      kind,
+		reason:    reason,
 	}
 
 	n.broadcastStatsMx.Lock()
@@ -165,6 +188,9 @@ func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
 
 	stats := make([]BroadcastStatusSnapshot, 0, len(n.broadcastStats))
 	for key, count := range n.broadcastStats {
+		if key.direction == "dropped" {
+			continue
+		}
 		stats = append(stats, BroadcastStatusSnapshot{
 			Direction: key.direction,
 			Overlay:   key.overlay,
@@ -181,6 +207,35 @@ func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
 			return stats[i].Overlay < stats[j].Overlay
 		}
 		return stats[i].Kind < stats[j].Kind
+	})
+	return stats
+}
+
+func (n *Node) broadcastDropStatusSnapshot() []BroadcastDropStatusSnapshot {
+	n.broadcastStatsMx.Lock()
+	defer n.broadcastStatsMx.Unlock()
+
+	stats := make([]BroadcastDropStatusSnapshot, 0, len(n.broadcastStats))
+	for key, count := range n.broadcastStats {
+		if key.direction != "dropped" {
+			continue
+		}
+		stats = append(stats, BroadcastDropStatusSnapshot{
+			Overlay: key.overlay,
+			Kind:    key.kind,
+			Reason:  key.reason,
+			Count:   count,
+		})
+	}
+
+	sort.SliceStable(stats, func(i, j int) bool {
+		if stats[i].Overlay != stats[j].Overlay {
+			return stats[i].Overlay < stats[j].Overlay
+		}
+		if stats[i].Kind != stats[j].Kind {
+			return stats[i].Kind < stats[j].Kind
+		}
+		return stats[i].Reason < stats[j].Reason
 	})
 	return stats
 }

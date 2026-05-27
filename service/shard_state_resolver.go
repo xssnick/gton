@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -17,8 +16,8 @@ import (
 
 const shardStateResolverCacheLimit = 2048
 
-type shardStateApplyFunc func(context.Context, ton.BlockIDExt, []*storage.BlockState, p2p.DownloadedBlock) (*storage.BlockState, error)
-type shardStateAfterApplyFunc func(context.Context, *storage.BlockState, p2p.DownloadedBlock, time.Duration) error
+type shardStateApplyFunc func(context.Context, ton.BlockIDExt, []*storage.BlockState, PreparedBlock) (*storage.BlockState, error)
+type shardStateAfterApplyFunc func(context.Context, *storage.BlockState, PreparedBlock, time.Duration) error
 
 type shardStateResolverConfig struct {
 	current         map[storage.ShardKey]storage.BlockState
@@ -149,13 +148,6 @@ func (r *shardStateResolver) resolveOwned(ctx context.Context, block ton.BlockID
 	if !downloaded.ID.Equals(&block) {
 		return nil, fmt.Errorf("loaded shard block %s instead of %s", downloaded.BlockRef(), storage.FormatBlockRef(block))
 	}
-	if downloaded.Meta == nil {
-		downloaded, err = prepareDownloadedBlock(downloaded)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	prevRefs := downloaded.Meta.PrevRefs
 	if len(prevRefs) == 0 || len(prevRefs) > 2 {
 		return nil, fmt.Errorf("%w: shard block %s has %d previous refs", errShardCatchUpNeedsSnapshot, downloaded.BlockRef(), len(prevRefs))
@@ -309,15 +301,11 @@ func (r *shardStateResolver) rememberState(state *storage.BlockState) {
 	r.mu.Unlock()
 }
 
-func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock) (*storage.BlockState, error) {
+func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
 	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells)
 }
 
-func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded p2p.DownloadedBlock, applier stateUpdateApplier) (*storage.BlockState, error) {
-	downloaded, err := prepareDownloadedBlock(downloaded)
-	if err != nil {
-		return nil, err
-	}
+func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock, applier stateUpdateApplier) (*storage.BlockState, error) {
 	if !downloaded.ID.Equals(&target) {
 		return nil, fmt.Errorf("shard resolver downloaded %s instead of target %s", downloaded.BlockRef(), storage.FormatBlockRef(target))
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -17,6 +18,7 @@ type shardTopBlockDescription struct {
 	Block            ton.BlockIDExt
 	CatchainSeqno    uint32
 	ValidatorSetHash uint32
+	Signatures       *blockproof.ValidatorSignatureSet
 	Chain            []shardTopBlockDescriptionLink
 }
 
@@ -84,6 +86,10 @@ func parseShardTopBlockDescription(block ton.BlockIDExt, catchainSeqno int32, da
 	if err != nil {
 		return nil, err
 	}
+	signatureSet, err := blockproof.ParseValidatorSignatureSetCell(signatures)
+	if err != nil {
+		return nil, fmt.Errorf("parse shard top block description signatures: %w", err)
+	}
 	if signatureMeta.Count == 0 {
 		return nil, fmt.Errorf("shard top block description has empty validator signatures")
 	}
@@ -113,6 +119,7 @@ func parseShardTopBlockDescription(block ton.BlockIDExt, catchainSeqno int32, da
 		Block:            proofFor,
 		CatchainSeqno:    signatureMeta.CatchainSeqno,
 		ValidatorSetHash: signatureMeta.ValidatorSetHash,
+		Signatures:       signatureSet,
 		Chain:            links,
 	}, nil
 }

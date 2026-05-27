@@ -10,7 +10,6 @@ import (
 
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/blockproof"
-	"github.com/xssnick/gton/service/p2p"
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
@@ -63,7 +62,7 @@ type archiveBackfillRunner struct {
 
 type archiveBackfillMasterWindow struct {
 	imported     *archiveImportResult
-	blocks       []p2p.DownloadedBlock
+	blocks       []PreparedBlock
 	shardTargets []ton.BlockIDExt
 	floorSeq     uint32
 	floorTime    uint32
@@ -330,12 +329,12 @@ func (r *archiveBackfillRunner) downloadMasterWindow(ctx context.Context, window
 	}, nil
 }
 
-func (r *archiveBackfillRunner) masterWindowBlocks(imported *archiveImportResult, windowEnd uint32) ([]p2p.DownloadedBlock, error) {
+func (r *archiveBackfillRunner) masterWindowBlocks(imported *archiveImportResult, windowEnd uint32) ([]PreparedBlock, error) {
 	if imported == nil {
 		return nil, fmt.Errorf("archive backfill master import is empty")
 	}
 
-	bySeq := make(map[uint32]p2p.DownloadedBlock)
+	bySeq := make(map[uint32]PreparedBlock)
 	var seqnos []uint32
 	for _, block := range imported.blocks {
 		if block.ID.Workchain != -1 || block.ID.Shard != topShard {
@@ -361,7 +360,7 @@ func (r *archiveBackfillRunner) masterWindowBlocks(imported *archiveImportResult
 		return nil, fmt.Errorf("archive backfill master window has gap at top: got=%d want=%d", seqnos[0], windowEnd)
 	}
 
-	blocks := make([]p2p.DownloadedBlock, 0, len(seqnos))
+	blocks := make([]PreparedBlock, 0, len(seqnos))
 	expected := windowEnd
 	for _, seqno := range seqnos {
 		if seqno != expected {
@@ -377,12 +376,12 @@ func (r *archiveBackfillRunner) masterWindowBlocks(imported *archiveImportResult
 	return blocks, nil
 }
 
-func (r *archiveBackfillRunner) validateMasterWindow(blocks []p2p.DownloadedBlock, windowEnd uint32) error {
+func (r *archiveBackfillRunner) validateMasterWindow(blocks []PreparedBlock, windowEnd uint32) error {
 	if len(blocks) == 0 {
 		return fmt.Errorf("archive backfill master window #%d is empty", windowEnd)
 	}
 
-	var child *p2p.DownloadedBlock
+	var child *PreparedBlock
 	for i := range blocks {
 		block := blocks[i]
 		if block.IsLink {
@@ -412,12 +411,16 @@ func (r *archiveBackfillRunner) validateMasterWindow(blocks []p2p.DownloadedBloc
 	return nil
 }
 
-func archiveBackfillChangedShardTargets(blocks []p2p.DownloadedBlock) ([]ton.BlockIDExt, error) {
+func archiveBackfillChangedShardTargets(blocks []PreparedBlock) ([]ton.BlockIDExt, error) {
 	changed := make(map[string]ton.BlockIDExt)
 	var previous map[storage.ShardKey]ton.BlockIDExt
 	for i := len(blocks) - 1; i >= 0; i-- {
 		block := blocks[i]
-		shards, err := state2.ShardBlocksFromMasterBlock(block.ID, block.Parsed)
+		parsed, err := parsePreparedBlock(block)
+		if err != nil {
+			return nil, err
+		}
+		shards, err := state2.ShardBlocksFromMasterBlock(block.ID, parsed)
 		if err != nil {
 			return nil, err
 		}

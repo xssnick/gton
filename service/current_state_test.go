@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/p2p"
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
@@ -377,7 +378,6 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 	checkpointCells := overlay.beginCheckpoint()
 	entries := append([]tnstore.StateCheckpointBlock{{
 		State: historical,
-		Cells: encodedCellRecordsFromMap(preparedCells),
 	}}, testStateCheckpointEntries(testCurrentBlockStates(current))...)
 	runner := &archiveCatchUpRunner{
 		service: &Service{log: zerolog.Nop(), storage: store},
@@ -427,7 +427,7 @@ func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 		lastCheckpointSeqno: master.SeqNo - 1,
 		stateCells:          overlay,
 	}
-	runner.checkpointStates.rememberWithCells(&current.Masterchain, mustPreparedReachableStateCells(t, root))
+	runner.checkpointStates.remember(&current.Masterchain)
 	if _, err := runner.startCheckpoint("test"); err != nil {
 		t.Fatalf("start checkpoint: %v", err)
 	}
@@ -473,13 +473,85 @@ func TestNextBlockCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) 
 		timing:       newCatchUpTiming(time.Now()),
 		stateCells:   stateCells,
 	}
-	runner.checkpointStates.rememberWithCells(&current.Masterchain, mustPreparedReachableStateCells(t, root))
+	runner.checkpointStates.remember(&current.Masterchain)
 	if err := runner.flushStagedCurrentSync("test"); err != nil {
 		t.Fatalf("flush staged next-block current: %v", err)
 	}
 
 	if _, err := store.LoadStateCellTree(ctx, master, rootHash[:]); err != nil {
 		t.Fatalf("load persisted next-block checkpoint state cells: %v", err)
+	}
+}
+
+func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	svc := &Service{log: zerolog.Nop(), storage: store, shutdownContext: ctx}
+
+	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+	rootHash := root.HashKey(0)
+	master := testBlockID(-1, topShard, 76)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block:         master,
+			StateRootHash: rootHash[:],
+			Cell:          root,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	stateCells := newStateCellWindowCache(nil)
+	if err := stateCells.addPreparedStateRecords(rootHash, mustPreparedReachableStateCells(t, root)); err != nil {
+		t.Fatalf("remember checkpoint cells: %v", err)
+	}
+	runner := &nextSyncRunner{
+		service:      svc,
+		ctx:          ctx,
+		current:      current,
+		stagedBlocks: 1,
+		timing:       newCatchUpTiming(time.Now()),
+		stateCells:   stateCells,
+	}
+	runner.checkpointStates.remember(&current.Masterchain)
+
+	svc.currentStatePersistMu.Lock()
+	checkpoint := runner.checkpoint()
+	cells := runner.stateCells.beginCheckpoint()
+	callbackDone := make(chan struct{})
+	callbackSawUnlocked := false
+	next, err := svc.persistNextBlockCurrentStateLocked(current, &runner.timing, checkpoint.entries, cells, func() {
+		if svc.currentStatePersistMu.TryLock() {
+			callbackSawUnlocked = true
+			svc.currentStatePersistMu.Unlock()
+		}
+		runner.completeCheckpoint(checkpoint)
+		close(callbackDone)
+	}, 0, time.Now())
+	if err != nil {
+		t.Fatalf("schedule async checkpoint: %v", err)
+	}
+	runner.current = next
+	svc.Wait()
+
+	select {
+	case <-callbackDone:
+	default:
+		t.Fatal("async checkpoint did not complete checkpoint metadata callback")
+	}
+	if err = svc.takeCurrentStatePersistError(); err != nil {
+		t.Fatalf("async checkpoint persist error: %v", err)
+	}
+	if callbackSawUnlocked {
+		t.Fatal("checkpoint metadata callback ran after persist mutex was unlocked")
+	}
+	if stale := runner.stateCells.beginCheckpoint(); stale != nil {
+		t.Fatal("async checkpoint left completed cell snapshot pending")
+	}
+	if remaining := runner.checkpointStates.clone(); len(remaining) != 0 {
+		t.Fatalf("async checkpoint left %d completed state entries pending", len(remaining))
 	}
 }
 
@@ -521,7 +593,7 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
 	preparedCells := mustPreparedReachableStateCells(t, root)
-	delete(preparedCells, root.HashKey())
+	preparedCells = removePreparedCellRecord(preparedCells, root.HashKey())
 
 	rootHash := root.HashKey(0)
 	master := testBlockID(-1, topShard, 74)
@@ -572,7 +644,7 @@ func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
 	preparedCells := mustPreparedReachableStateCells(t, root)
-	delete(preparedCells, root.HashKey())
+	preparedCells = removePreparedCellRecord(preparedCells, root.HashKey())
 
 	overlay := newArchiveStateCellOverlay(nil)
 	overlay.rememberPreparedCells(preparedCells)
@@ -713,13 +785,7 @@ func TestCurrentStateForNextMasterStatePreservesUnchangedShardMasterchainRef(t *
 func TestVerifiedMasterchainQueueAcceptsBroadcastOutsideCatchUp(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
-	downloaded := p2p.DownloadedBlock{
-		ID: next,
-		Meta: &tnstore.BlockMeta{
-			ID:       next,
-			PrevRefs: []ton.BlockIDExt{prev},
-		},
-	}
+	downloaded := testPreparedMasterchainBlock(prev, next)
 
 	svc := &Service{}
 	svc.queueMasterchainBlockCandidateFromSource(downloaded, "")
@@ -736,17 +802,13 @@ func TestVerifiedMasterchainQueueAcceptsBroadcastOutsideCatchUp(t *testing.T) {
 func TestMasterchainBroadcastCandidateWaitsForValidation(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
-	downloaded := p2p.DownloadedBlock{
-		ID: next,
-		Meta: &tnstore.BlockMeta{
-			ID:       next,
-			PrevRefs: []ton.BlockIDExt{prev},
-		},
-		BlockBOC:            []byte{1},
-		ProofBOC:            []byte{2},
-		BroadcastSignatures: cell.BeginCell().EndCell(),
-		VerifiedRootHash:    true,
-		VerifiedFileHash:    true,
+	downloaded := testVerifiedMasterchainBlock(prev, next)
+	downloaded.BlockBOC = []byte{1}
+	downloaded.ProofBOC = []byte{2}
+	downloaded.consensus = &masterchainConsensusProof{
+		block:               next,
+		prevRef:             prev,
+		broadcastSignatures: &blockproof.ValidatorSignatureSet{},
 	}
 
 	svc := &Service{}
@@ -773,25 +835,13 @@ func TestVerifiedMasterchainQueueDropsFarFutureWhenFull(t *testing.T) {
 	for seqno := uint32(10); seqno < 10+nextMasterchainQueueLimit; seqno++ {
 		prev := testMasterBlockID(seqno)
 		next := testMasterBlockID(seqno + 1)
-		svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-			ID: next,
-			Meta: &tnstore.BlockMeta{
-				ID:       next,
-				PrevRefs: []ton.BlockIDExt{prev},
-			},
-		}, "")
+		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), "")
 	}
 
 	oldestPrev := testMasterBlockID(10)
 	farPrev := testMasterBlockID(1000)
 	farNext := testMasterBlockID(1001)
-	svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-		ID: farNext,
-		Meta: &tnstore.BlockMeta{
-			ID:       farNext,
-			PrevRefs: []ton.BlockIDExt{farPrev},
-		},
-	}, "")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(farPrev, farNext), "")
 
 	oldestNext := testMasterBlockID(11)
 	if got, ok := svc.takeQueuedMasterchainBlock(oldestPrev, oldestNext); !ok || !got.ID.Equals(&oldestNext) {
@@ -808,20 +858,8 @@ func TestVerifiedMasterchainQueueSeqnoIndexDoesNotDeleteReplacement(t *testing.T
 	block := testMasterBlockID(21)
 	svc := &Service{}
 
-	svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-		ID: block,
-		Meta: &tnstore.BlockMeta{
-			ID:       block,
-			PrevRefs: []ton.BlockIDExt{oldPrev},
-		},
-	}, "old")
-	svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-		ID: block,
-		Meta: &tnstore.BlockMeta{
-			ID:       block,
-			PrevRefs: []ton.BlockIDExt{newPrev},
-		},
-	}, "new")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(oldPrev, block), "old")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(newPrev, block), "new")
 
 	if _, ok := svc.takeQueuedMasterchainBlock(oldPrev, block); ok {
 		t.Fatal("expected same-seqno replacement to remove old prev entry")
@@ -836,13 +874,7 @@ func TestQueuedMasterchainBlockAheadReportsFutureBlock(t *testing.T) {
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-		ID: future,
-		Meta: &tnstore.BlockMeta{
-			ID:       future,
-			PrevRefs: []ton.BlockIDExt{futurePrev},
-		},
-	}, "")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), "")
 
 	got, ok := svc.queuedMasterchainBlockAhead(current)
 	if !ok {
@@ -858,13 +890,7 @@ func TestQueuedMasterchainFutureReportsMissingSeqnoAndSource(t *testing.T) {
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-		ID: future,
-		Meta: &tnstore.BlockMeta{
-			ID:       future,
-			PrevRefs: []ton.BlockIDExt{futurePrev},
-		},
-	}, "peer-a")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), "peer-a")
 
 	got, ok := svc.queuedMasterchainFuture(current)
 	if !ok {
@@ -917,13 +943,7 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	futurePrev := testMasterBlockID(101)
 	future := testMasterBlockID(102)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-		ID: future,
-		Meta: &tnstore.BlockMeta{
-			ID:       future,
-			PrevRefs: []ton.BlockIDExt{futurePrev},
-		},
-	}, "peer-a")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), "peer-a")
 
 	queued, _ := svc.nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{})
 	if queued.peerLimit != nextBlockBootstrapProbePeers {
@@ -1052,20 +1072,14 @@ func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		svc.queueMasterchainBlockCandidateFromSource(p2p.DownloadedBlock{
-			ID: next,
-			Meta: &tnstore.BlockMeta{
-				ID:       next,
-				PrevRefs: []ton.BlockIDExt{prev},
-			},
-		}, "broadcast-peer")
+		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), "broadcast-peer")
 		svc.wakeCurrentStateSync()
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	downloaded, source, ok, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
+	downloaded, source, _, ok, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
 	if err != nil {
 		t.Fatalf("wait preferred masterchain broadcast: %v", err)
 	}
@@ -1077,6 +1091,26 @@ func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
 	}
 	if source != "broadcast_queue" {
 		t.Fatalf("preferred source = %q, want broadcast_queue", source)
+	}
+}
+
+func testPreparedMasterchainBlock(prev ton.BlockIDExt, block ton.BlockIDExt) PreparedBlock {
+	return PreparedBlock{
+		ID: block,
+		Meta: &tnstore.BlockMeta{
+			ID:       block,
+			PrevRefs: []ton.BlockIDExt{prev},
+		},
+	}
+}
+
+func testVerifiedMasterchainBlock(prev ton.BlockIDExt, block ton.BlockIDExt) VerifiedBlock {
+	return VerifiedBlock{
+		ID: block,
+		Meta: &tnstore.BlockMeta{
+			ID:       block,
+			PrevRefs: []ton.BlockIDExt{prev},
+		},
 	}
 }
 

@@ -9,7 +9,6 @@ import (
 
 	tnstore "github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -17,8 +16,6 @@ func TestShardBroadcastCachePopConsumesBlock(t *testing.T) {
 	cache := newShardBroadcastBlockCache(time.Minute, 1<<20, 16)
 	downloaded := testShardBroadcastDownloadedBlock(t, 10, 0x10)
 	meta := &tnstore.BlockMeta{ID: downloaded.ID, GenUTime: 123}
-	parsed := &tlb.Block{}
-	downloaded.Parsed = parsed
 
 	if err := cache.Store(downloaded, meta); err != nil {
 		t.Fatalf("store block: %v", err)
@@ -34,14 +31,17 @@ func TestShardBroadcastCachePopConsumesBlock(t *testing.T) {
 	if got.Kind != downloaded.Kind {
 		t.Fatalf("kind = %q, want %q", got.Kind, downloaded.Kind)
 	}
+	if got.Block == nil {
+		t.Fatal("cached block root was not decoded")
+	}
+	if got.Proof == nil {
+		t.Fatal("cached proof root was not decoded")
+	}
 	if got.Block != downloaded.Block {
-		t.Fatal("cached block root was decoded again instead of reusing the stored tree")
+		t.Fatal("cached block root was reparsed instead of reused")
 	}
 	if got.Proof != downloaded.Proof {
-		t.Fatal("cached proof root was decoded again instead of reusing the stored tree")
-	}
-	if got.Parsed != parsed {
-		t.Fatal("cached parsed block was not reused")
+		t.Fatal("cached proof root was reparsed instead of reused")
 	}
 	if got.Meta == nil || got.Meta.GenUTime != 123 {
 		t.Fatalf("meta = %+v, want cached meta", got.Meta)
@@ -57,7 +57,7 @@ func TestShardBroadcastCachePrunesExpiredBlocks(t *testing.T) {
 	now := time.Unix(100, 0)
 	downloaded := testShardBroadcastDownloadedBlock(t, 11, 0x11)
 
-	if err := cache.storeAt(downloaded, nil, nil, downloaded.Block, downloaded.Proof, now); err != nil {
+	if err := cache.storeAt(downloaded, testShardBroadcastMeta(downloaded), downloaded.Block, downloaded.Proof, downloaded.StateUpdate, now); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 	cache.Prune(now.Add(2 * time.Second))
@@ -78,7 +78,7 @@ func TestShardBroadcastCachePrunesOldestOverflow(t *testing.T) {
 	third := testShardBroadcastDownloadedBlock(t, 14, 0x14)
 
 	for i, downloaded := range []DownloadedBlock{first, second, third} {
-		if err := cache.storeAt(downloaded, nil, nil, downloaded.Block, downloaded.Proof, now.Add(time.Duration(i)*time.Second)); err != nil {
+		if err := cache.storeAt(downloaded, testShardBroadcastMeta(downloaded), downloaded.Block, downloaded.Proof, downloaded.StateUpdate, now.Add(time.Duration(i)*time.Second)); err != nil {
 			t.Fatalf("store block %d: %v", i, err)
 		}
 	}
@@ -105,17 +105,17 @@ func TestShardBroadcastCacheReplacementMovesEntryToBack(t *testing.T) {
 	second := testShardBroadcastDownloadedBlock(t, 17, 0x17)
 	third := testShardBroadcastDownloadedBlock(t, 18, 0x18)
 
-	if err := cache.storeAt(first, nil, nil, first.Block, first.Proof, now); err != nil {
+	if err := cache.storeAt(first, testShardBroadcastMeta(first), first.Block, first.Proof, first.StateUpdate, now); err != nil {
 		t.Fatalf("store first block: %v", err)
 	}
-	if err := cache.storeAt(second, nil, nil, second.Block, second.Proof, now.Add(time.Second)); err != nil {
+	if err := cache.storeAt(second, testShardBroadcastMeta(second), second.Block, second.Proof, second.StateUpdate, now.Add(time.Second)); err != nil {
 		t.Fatalf("store second block: %v", err)
 	}
 	first.Kind = "updated"
-	if err := cache.storeAt(first, nil, nil, first.Block, first.Proof, now.Add(2*time.Second)); err != nil {
+	if err := cache.storeAt(first, testShardBroadcastMeta(first), first.Block, first.Proof, first.StateUpdate, now.Add(2*time.Second)); err != nil {
 		t.Fatalf("replace first block: %v", err)
 	}
-	if err := cache.storeAt(third, nil, nil, third.Block, third.Proof, now.Add(3*time.Second)); err != nil {
+	if err := cache.storeAt(third, testShardBroadcastMeta(third), third.Block, third.Proof, third.StateUpdate, now.Add(3*time.Second)); err != nil {
 		t.Fatalf("store third block: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestDownloadBlockFullUsesShardBroadcastCacheBeforeOverlay(t *testing.T) {
 	node := newTestNode(t)
 	downloaded := testShardBroadcastDownloadedBlock(t, 15, 0x15)
 
-	if err := node.shardBroadcastCache.Store(downloaded, nil); err != nil {
+	if err := node.shardBroadcastCache.Store(downloaded, testShardBroadcastMeta(downloaded)); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 
@@ -168,7 +168,7 @@ func TestShardBroadcastCacheNotifiesWaiters(t *testing.T) {
 		t.Fatal("watch returned nil")
 	}
 
-	if err := node.shardBroadcastCache.Store(downloaded, nil); err != nil {
+	if err := node.shardBroadcastCache.Store(downloaded, testShardBroadcastMeta(downloaded)); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 	node.notifyShardBroadcastBlock(downloaded.ID)
@@ -184,6 +184,10 @@ func shardBroadcastCacheLen(cache *shardBroadcastBlockCache) int {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	return len(cache.entries)
+}
+
+func testShardBroadcastMeta(downloaded DownloadedBlock) *tnstore.BlockMeta {
+	return &tnstore.BlockMeta{ID: downloaded.ID}
 }
 
 func testShardBroadcastDownloadedBlock(t *testing.T, seqno uint32, payload uint64) DownloadedBlock {
@@ -208,8 +212,9 @@ func testShardBroadcastDownloadedBlock(t *testing.T, seqno uint32, payload uint6
 		Proof:            proof,
 		BlockBOC:         blockBOC,
 		ProofBOC:         proofBOC,
+		Meta:             testShardBroadcastMeta(DownloadedBlock{ID: block}),
+		StateUpdate:      cell.BeginCell().EndCell(),
 		IsLink:           true,
 		VerifiedRootHash: true,
-		VerifiedFileHash: true,
 	}
 }

@@ -1,8 +1,6 @@
 package service
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"sync"
 
@@ -23,9 +21,19 @@ type masterchainValidatorCacheKey struct {
 }
 
 type masterchainConsensusProof struct {
-	block             ton.BlockIDExt
-	parsed            *blockproof.Parsed
-	signaturesChecked bool
+	block               ton.BlockIDExt
+	prevRef             ton.BlockIDExt
+	stateUpdateFromHash cell.Hash
+	validatorCacheKey   masterchainValidatorCacheKey
+	keyBlock            bool
+	proofSignatures     *blockproof.ValidatorSignatureSet
+	broadcastSignatures *blockproof.ValidatorSignatureSet
+	signaturesChecked   bool
+}
+
+type checkedMasterchainConsensus struct {
+	block   ton.BlockIDExt
+	current ton.BlockIDExt
 }
 
 type masterchainValidatorCache struct {
@@ -62,123 +70,176 @@ func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, valida
 	return validators
 }
 
-func (s *Service) validateMasterchainBlockConsensusWithProof(current *tnstore.BlockState, downloaded tonBlockForConsensus, proof *masterchainConsensusProof) error {
-	if downloaded.block.Workchain != -1 || downloaded.block.Shard != topShard {
-		return nil
+func (s *Service) checkMasterchainBlockConsensusWithProof(current *tnstore.BlockState, proof *masterchainConsensusProof) (*checkedMasterchainConsensus, error) {
+	if proof == nil {
+		return nil, fmt.Errorf("masterchain block has no prepared consensus proof")
 	}
-	if current == nil {
-		return fmt.Errorf("current masterchain state is nil")
+	if proof.block.Workchain != -1 || proof.block.Shard != topShard {
+		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(proof.block))
 	}
 	if current.Cell == nil {
-		return fmt.Errorf("current masterchain state %s is missing cell tree", tnstore.FormatBlockRef(current.Block))
-	}
-	if len(downloaded.proofBOC) == 0 {
-		return fmt.Errorf("masterchain block %s has no proof", tnstore.FormatBlockRef(downloaded.block))
+		return nil, fmt.Errorf("current masterchain state %s is missing cell tree", tnstore.FormatBlockRef(current.Block))
 	}
 
-	if proof == nil || !proof.block.Equals(&downloaded.block) {
-		var err error
-		proof, err = prepareMasterchainConsensusProof(downloaded.block, downloaded.proofBOC)
-		if err != nil {
-			return err
-		}
+	if !proof.prevRef.Equals(&current.Block) {
+		return nil, fmt.Errorf("%w: block=%s prev=%s current=%s", errMasterchainPrevMismatch, tnstore.FormatBlockRef(proof.block), tnstore.FormatBlockRef(proof.prevRef), tnstore.FormatBlockRef(current.Block))
 	}
-
-	parsed := proof.parsed
-	if parsed == nil || parsed.Proof == nil || parsed.Block == nil || parsed.Meta == nil {
-		return fmt.Errorf("masterchain block proof %s is incomplete", tnstore.FormatBlockRef(downloaded.block))
-	}
-	if len(parsed.Meta.PrevRefs) != 1 || !parsed.Meta.PrevRefs[0].Equals(&current.Block) {
-		return fmt.Errorf("%w: block=%s prev_refs=%d current=%s", errMasterchainPrevMismatch, tnstore.FormatBlockRef(downloaded.block), len(parsed.Meta.PrevRefs), tnstore.FormatBlockRef(current.Block))
-	}
-	if err := blockproof.ValidateStateUpdateStartsFrom(current, downloaded.block, parsed.Block.StateUpdate); err != nil {
-		return err
+	currentHash := current.Cell.Virtualize(0).HashKey(0)
+	if proof.stateUpdateFromHash != currentHash {
+		return nil, fmt.Errorf("invalid previous state hash in proof %s: expected %x, got %x", tnstore.FormatBlockRef(proof.block), currentHash[:], proof.stateUpdateFromHash[:])
 	}
 
 	if proof.signaturesChecked {
-		return nil
+		return &checkedMasterchainConsensus{
+			block:   proof.block,
+			current: current.Block,
+		}, nil
 	}
 
-	if parsed.Proof.Signatures == nil {
-		return fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(downloaded.block))
-	}
-
-	validators, err := s.masterchainValidatorsForConsensus(current, downloaded.block, parsed.Block)
+	validators, err := s.masterchainValidatorsForConsensus(current, proof.block, proof.validatorCacheKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if downloaded.broadcastSignatures != nil {
-		if err = blockproof.CheckMasterchainSignaturesWithValidators(downloaded.block, parsed.Block, downloaded.broadcastSignatures, validators); err != nil {
-			return fmt.Errorf("check broadcast signatures for %s: %w", tnstore.FormatBlockRef(downloaded.block), err)
+	if proof.broadcastSignatures != nil {
+		if err = blockproof.CheckPreparedMasterchainSignaturesWithValidators(proof.block, proof.broadcastSignatures, validators); err != nil {
+			return nil, fmt.Errorf("check broadcast signatures for %s: %w", tnstore.FormatBlockRef(proof.block), err)
 		}
 	}
-	if err = blockproof.CheckMasterchainSignaturesWithValidators(downloaded.block, parsed.Block, parsed.Proof.Signatures, validators); err != nil {
-		return err
+	if err = blockproof.CheckPreparedMasterchainSignaturesWithValidators(proof.block, proof.proofSignatures, validators); err != nil {
+		return nil, err
 	}
 	proof.signaturesChecked = true
-	return nil
+	return &checkedMasterchainConsensus{
+		block:   proof.block,
+		current: current.Block,
+	}, nil
 }
 
-func (s *Service) ValidateMasterchainBroadcastSignatures(ctx context.Context, block ton.BlockIDExt, proofBOC []byte, signatures *cell.Cell) error {
-	if block.Workchain != -1 || block.Shard != topShard {
-		return nil
+func (c *checkedMasterchainConsensus) validateFor(current *tnstore.BlockState, block ton.BlockIDExt) error {
+	if c == nil {
+		return fmt.Errorf("masterchain block %s has no checked consensus", tnstore.FormatBlockRef(block))
 	}
-	if signatures == nil {
-		return fmt.Errorf("masterchain broadcast %s has no signatures", tnstore.FormatBlockRef(block))
+	if !c.block.Equals(&block) {
+		return fmt.Errorf("checked consensus block mismatch: checked=%s block=%s", tnstore.FormatBlockRef(c.block), tnstore.FormatBlockRef(block))
 	}
-
-	proof, err := prepareMasterchainConsensusProof(block, proofBOC)
-	if err != nil {
-		return err
-	}
-	if proof.parsed == nil || proof.parsed.Block == nil || proof.parsed.Meta == nil {
-		return fmt.Errorf("masterchain broadcast proof %s is incomplete", tnstore.FormatBlockRef(block))
-	}
-
-	current, err := s.masterchainStateForBroadcastSignatureValidation(ctx, proof.parsed.Meta)
-	if err != nil {
-		return err
-	}
-	validators, err := s.masterchainValidatorsForConsensus(current, block, proof.parsed.Block)
-	if err != nil {
-		return fmt.Errorf("%w: validator set is not ready for broadcast %s: %v", tnstore.ErrNotFound, tnstore.FormatBlockRef(block), err)
-	}
-	if err = blockproof.CheckMasterchainSignaturesWithValidators(block, proof.parsed.Block, signatures, validators); err != nil {
-		return fmt.Errorf("check broadcast signatures for %s: %w", tnstore.FormatBlockRef(block), err)
+	if !c.current.Equals(&current.Block) {
+		return fmt.Errorf("%w: block=%s checked_current=%s current=%s", errMasterchainPrevMismatch, tnstore.FormatBlockRef(block), tnstore.FormatBlockRef(c.current), tnstore.FormatBlockRef(current.Block))
 	}
 	return nil
 }
 
-func (s *Service) masterchainStateForBroadcastSignatureValidation(ctx context.Context, meta *tnstore.BlockMeta) (*tnstore.BlockState, error) {
-	if meta == nil || len(meta.PrevRefs) != 1 {
-		return nil, fmt.Errorf("masterchain broadcast proof has no single previous ref")
+func (s *Service) checkedConsensusForVerifiedBlock(current *tnstore.BlockState, block VerifiedBlock) (*checkedMasterchainConsensus, error) {
+	if block.consensusChecked != nil {
+		if err := block.consensusChecked.validateFor(current, block.ID); err != nil {
+			return nil, err
+		}
+		return block.consensusChecked, nil
 	}
-
-	prev := meta.PrevRefs[0]
-	if prev.Workchain != -1 || prev.Shard != topShard {
-		return nil, fmt.Errorf("masterchain broadcast previous ref is not masterchain: %s", tnstore.FormatBlockRef(prev))
+	if block.consensus == nil || !block.consensus.block.Equals(&block.ID) {
+		return nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
 	}
-
-	current, err := s.loadMasterStateForConsensus(ctx, prev)
-	if err == nil {
-		return current, nil
-	}
-	if errors.Is(err, tnstore.ErrNotFound) {
-		return nil, fmt.Errorf("%w: previous masterchain state %s is not ready", tnstore.ErrNotFound, tnstore.FormatBlockRef(prev))
-	}
-	return nil, err
+	return s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
 }
 
-func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofBOC []byte) (*masterchainConsensusProof, error) {
+func (s *Service) checkedConsensusForPreparedBlock(current *tnstore.BlockState, block PreparedBlock) (*checkedMasterchainConsensus, error) {
+	if block.consensusChecked != nil {
+		if err := block.consensusChecked.validateFor(current, block.ID); err != nil {
+			return nil, err
+		}
+		return block.consensusChecked, nil
+	}
+	if block.consensus == nil || !block.consensus.block.Equals(&block.ID) {
+		return nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
+	}
+	return s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
+}
+
+func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, broadcastSignatures *cell.Cell) (*masterchainConsensusProof, *blockproof.Parsed, error) {
+	if proofRoot == nil {
+		return nil, nil, fmt.Errorf("masterchain block %s has no parsed proof root", tnstore.FormatBlockRef(block))
+	}
+
+	parsed, err := blockproof.ParseCell(block, proofRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	proof, err := masterchainConsensusProofFromParsed(block, parsed, broadcastSignatures)
+	if err != nil {
+		return nil, nil, err
+	}
+	return proof, parsed, nil
+}
+
+func prepareMasterchainConsensusProofBOC(block ton.BlockIDExt, proofBOC []byte, broadcastSignatures *cell.Cell) (*masterchainConsensusProof, error) {
+	if len(proofBOC) == 0 {
+		return nil, fmt.Errorf("masterchain block %s has no proof BOC", tnstore.FormatBlockRef(block))
+	}
+
 	parsed, err := blockproof.ParseBOC(block, proofBOC)
 	if err != nil {
 		return nil, err
 	}
-	return &masterchainConsensusProof{block: block, parsed: parsed}, nil
+	return masterchainConsensusProofFromParsed(block, parsed, broadcastSignatures)
 }
 
-func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, block *tlb.Block) ([]*tlb.ValidatorAddr, error) {
-	key := masterchainValidatorCacheKeyFromBlock(block)
+func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproof.Parsed, broadcastSignatures *cell.Cell) (*masterchainConsensusProof, error) {
+	if block.Workchain != -1 || block.Shard != topShard {
+		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(block))
+	}
+	if parsed == nil || parsed.Proof == nil || parsed.Block == nil || parsed.Meta == nil {
+		return nil, fmt.Errorf("masterchain block proof %s is incomplete", tnstore.FormatBlockRef(block))
+	}
+	if len(parsed.Meta.PrevRefs) != 1 {
+		return nil, fmt.Errorf("masterchain block proof %s has %d previous refs", tnstore.FormatBlockRef(block), len(parsed.Meta.PrevRefs))
+	}
+	if parsed.Proof.Signatures == nil {
+		return nil, fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(block))
+	}
+
+	fromHash, err := stateUpdateFromHash(block, parsed.Block.StateUpdate)
+	if err != nil {
+		return nil, err
+	}
+	proofSignatures, err := blockproof.PrepareMasterchainSignatureSet(block, parsed.Block, parsed.Proof.Signatures)
+	if err != nil {
+		return nil, err
+	}
+
+	var broadcastSet *blockproof.ValidatorSignatureSet
+	if broadcastSignatures != nil {
+		broadcastSet, err = blockproof.PrepareMasterchainSignatureSet(block, parsed.Block, broadcastSignatures)
+		if err != nil {
+			return nil, fmt.Errorf("prepare broadcast signatures for %s: %w", tnstore.FormatBlockRef(block), err)
+		}
+	}
+
+	return &masterchainConsensusProof{
+		block:               block,
+		prevRef:             parsed.Meta.PrevRefs[0],
+		stateUpdateFromHash: fromHash,
+		validatorCacheKey:   masterchainValidatorCacheKeyFromBlock(parsed.Block),
+		keyBlock:            parsed.Block.BlockInfo.KeyBlock,
+		proofSignatures:     proofSignatures,
+		broadcastSignatures: broadcastSet,
+	}, nil
+}
+
+func stateUpdateFromHash(block ton.BlockIDExt, update *cell.Cell) (cell.Hash, error) {
+	if update == nil {
+		return cell.Hash{}, fmt.Errorf("block proof %s has no state update", tnstore.FormatBlockRef(block))
+	}
+	if update.GetType() != cell.MerkleUpdateCellType {
+		return cell.Hash{}, fmt.Errorf("block proof %s has non-merkle state update", tnstore.FormatBlockRef(block))
+	}
+
+	oldState, err := update.PeekRef(0)
+	if err != nil {
+		return cell.Hash{}, fmt.Errorf("read old state hash from %s: %w", tnstore.FormatBlockRef(block), err)
+	}
+	return oldState.HashKey(0), nil
+}
+
+func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, key masterchainValidatorCacheKey) ([]*tlb.ValidatorAddr, error) {
 	if validators, ok := s.validatorCache.get(key); ok {
 		return validators, nil
 	}
@@ -187,7 +248,7 @@ func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState,
 	if err != nil {
 		return nil, err
 	}
-	validators, err := blockproof.MasterchainValidatorsForBlock(cfg, &blockID, block.BlockInfo.GenCatchainSeqno)
+	validators, err := blockproof.MasterchainValidatorsForBlock(cfg, &blockID, key.catchainSeqno)
 	if err != nil {
 		return nil, err
 	}
@@ -200,10 +261,4 @@ func masterchainValidatorCacheKeyFromBlock(block *tlb.Block) masterchainValidato
 		catchainSeqno:     block.BlockInfo.GenCatchainSeqno,
 		validatorSetHash:  block.BlockInfo.GenValidatorListHashShort,
 	}
-}
-
-type tonBlockForConsensus struct {
-	block               ton.BlockIDExt
-	proofBOC            []byte
-	broadcastSignatures *cell.Cell
 }

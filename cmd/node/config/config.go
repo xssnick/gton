@@ -23,9 +23,9 @@ const (
 	DefaultSyncBefore                      = time.Hour
 	DefaultStateTTL                        = 3 * 24 * time.Hour
 	DefaultArchiveTTL                      = 7 * 24 * time.Hour
-	DefaultNextCheckpointBlocks            = int64(600)
+	DefaultNextCheckpointBlocks            = int64(300)
 	DefaultArchiveCheckpointBlocks         = int64(2000)
-	DefaultCheckpointBytes                 = int64(1 << 30)
+	DefaultCheckpointBytes                 = int64(512 << 20)
 	DefaultCellTotalCache                  = int64(8 << 30)
 	DefaultCellShardMemTable               = int64(256 << 20)
 	DefaultCellMemTableStopWritesThreshold = int64(4)

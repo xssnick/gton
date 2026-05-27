@@ -132,7 +132,7 @@ func TestPrepareImportedBlockBuildsStateMetaAndPreparedCells(t *testing.T) {
 	}
 	var stateRootHash cell.Hash
 	copy(stateRootHash[:], prepared.State.StateRootHash)
-	if len(prepared.StateUpdateToCells[stateRootHash]) == 0 {
+	if !prepared.StateUpdateToCells.Has(stateRootHash) {
 		t.Fatalf("prepared update_to cells do not contain state root %x", prepared.State.StateRootHash)
 	}
 }
@@ -176,6 +176,43 @@ func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
 	}
 	if stats.MasterchainFirstSeqno != master.SeqNo || stats.MasterchainLastSeqno != master.SeqNo {
 		t.Fatalf("unexpected masterchain stats range: first=%d last=%d", stats.MasterchainFirstSeqno, stats.MasterchainLastSeqno)
+	}
+}
+
+func TestMasterArchiveContainsShardBlocksTracksShardBlockDataOnly(t *testing.T) {
+	shard := testBlockID(0, topShard, 77)
+
+	tests := []struct {
+		name string
+		kind string
+		want bool
+	}{
+		{name: "shard proof", kind: "proof"},
+		{name: "shard proof link", kind: "prooflink"},
+		{name: "shard block", kind: "block", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestPackage(t, []testEntry{
+				{name: testEntryName(tt.kind, shard), data: []byte{0x42}},
+			})
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read archive package: %v", err)
+			}
+
+			imported, err := ImportStream(context.Background(), &Downloaded{
+				MasterchainSeqno: 100,
+				Shard:            ShardID{Workchain: -1, Shard: topShard},
+			}, bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("import archive stream: %v", err)
+			}
+			if imported.Stats.ContainsShardBlocks != tt.want {
+				t.Fatalf("contains shard blocks = %v, want %v", imported.Stats.ContainsShardBlocks, tt.want)
+			}
+		})
 	}
 }
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -36,8 +38,9 @@ const (
 
 func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
-	logLevelFlag := flag.String("log-level", "info", "log level: trace, debug, info, warn, error")
-	logLevelsFlag := flag.String("log-levels", "", "category log level overrides, comma-separated: liteserver=debug,p2p=warn")
+	lsPubkeyFlag := flag.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
+	verbosityFlag := flag.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
+	logTypesFlag := flag.String("log-types", "", "category log verbosity overrides, comma-separated: liteserver=debug,p2p=warn")
 	logJSONFlag := flag.Bool("log-json", false, "write logs as JSON instead of pretty console")
 	globalConfigURLFlag := flag.String("global-config", "", "download TON global config from URL and replace the configured file before start")
 	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
@@ -46,42 +49,70 @@ func main() {
 	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
 	flag.Parse()
 
-	level, err := logutil.ParseLevel(*logLevelFlag)
+	level, err := logutil.ParseLevel(*verbosityFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid log level %q: %v\n", *logLevelFlag, err)
+		fmt.Fprintf(os.Stderr, "invalid verbosity %q: %v\n", *verbosityFlag, err)
 		os.Exit(1)
 	}
-	logLevelOverrides, err := logutil.ParseLevelOverrides(*logLevelsFlag)
+	logTypeOverrides, err := logutil.ParseLevelOverrides(*logTypesFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid log level overrides %q: %v\n", *logLevelsFlag, err)
+		fmt.Fprintf(os.Stderr, "invalid log type overrides %q: %v\n", *logTypesFlag, err)
 		os.Exit(1)
 	}
 	logs := logutil.NewFactory(os.Stdout, logutil.Config{
 		Level:     level,
-		Overrides: logLevelOverrides,
+		Overrides: logTypeOverrides,
 		JSON:      *logJSONFlag,
 	})
 	logger := logs.Component("main")
 	cell.MaxBOCCells = maxNodeBOCCells
 	logger.Debug().Int("max_boc_cells", cell.MaxBOCCells).Msg("configured BOC parser limits")
 
+	selectedConfigPath := resolveConfigPath(*configPath)
+	cfg, err := nodeconfig.Load(selectedConfigPath)
+	if err != nil {
+		if *lsPubkeyFlag {
+			logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
+			os.Exit(1)
+		}
+		configResult, err := nodeconfig.LoadOrCreate(context.Background(), selectedConfigPath, nodeconfig.DetectExternalIP)
+		if err != nil {
+			logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
+			os.Exit(1)
+		}
+		cfg = configResult.Config
+		if configResult.Created {
+			logger.Info().
+				Str("config", displayConfigPath(selectedConfigPath)).
+				Msg("created default config; review and approve config.json settings, then start the node again")
+			return
+		}
+	}
+	if *lsPubkeyFlag {
+		liteSeed := cfg.Lite.Key
+		if len(liteSeed) == 0 {
+			logger.Error().Str("config", selectedConfigPath).Msg("liteserver key is missing")
+			os.Exit(1)
+		}
+		if len(liteSeed) != ed25519.SeedSize {
+			logger.Error().
+				Int("key_bytes", len(liteSeed)).
+				Int("expected_bytes", ed25519.SeedSize).
+				Str("config", selectedConfigPath).
+				Msg("invalid liteserver key size")
+			os.Exit(1)
+		}
+		litePriv := ed25519.NewKeyFromSeed(liteSeed)
+		if _, err = fmt.Fprintln(os.Stdout, base64.StdEncoding.EncodeToString(litePriv.Public().(ed25519.PublicKey))); err != nil {
+			logger.Error().Err(err).Msg("failed to write liteserver public key")
+			os.Exit(1)
+		}
+		return
+	}
+
 	ctx, shutdownCtx, stop := signalContexts()
 	defer stop()
 	startPprof(ctx, logger, strings.TrimSpace(*pprofAddrFlag))
-
-	selectedConfigPath := resolveConfigPath(*configPath)
-	configResult, err := nodeconfig.LoadOrCreate(ctx, selectedConfigPath, nodeconfig.DetectExternalIP)
-	if err != nil {
-		logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
-		os.Exit(1)
-	}
-	cfg := configResult.Config
-	if configResult.Created {
-		logger.Info().
-			Str("config", displayConfigPath(selectedConfigPath)).
-			Msg("created default config; review and approve config.json settings, then start the node again")
-		return
-	}
 
 	globalConfigURL := nodeconfig.DefaultGlobalConfigURL
 	replaceGlobalConfig := false
@@ -301,7 +332,7 @@ func main() {
 		DisableStateSerialization:      cfg.DisableStateSerialization,
 		SyncObserver:                   syncObserver,
 	})
-	node.SetMasterchainBroadcastSignatureVerifier(svc)
+	node.SetBroadcastSignatureVerifier(svc)
 	if runtimeMetrics != nil {
 		runtimeMetrics.SetServiceStatusReader(svc.StatusSnapshot)
 	}
@@ -376,7 +407,7 @@ func main() {
 	logger.Info().
 		Str("config", selectedConfigPath).
 		Str("log_level", level.String()).
-		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(logLevelOverrides), "<none>")).
+		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(logTypeOverrides), "<none>")).
 		Str("log_format", logFormat(*logJSONFlag)).
 		Str("global_config", globalConfigPath).
 		Str("listen_addr", fallbackString(opts.ListenAddr, "<client-mode>")).

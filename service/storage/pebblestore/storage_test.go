@@ -1382,24 +1382,16 @@ func mustEncodedCellRecord(tb testing.TB, cl *cell.Cell) storage.EncodedCellReco
 func mustReachableEncodedRecords(tb testing.TB, root *cell.Cell) []storage.EncodedCellRecord {
 	tb.Helper()
 
-	recordsByHash, err := storage.PrepareReachableStateCells(root)
+	records, err := storage.PrepareReachableStateCells(root)
 	if err != nil {
 		tb.Fatalf("prepare reachable state cells: %v", err)
 	}
-	records := make([]storage.EncodedCellRecord, 0, len(recordsByHash))
-	for hash, data := range recordsByHash {
-		records = append(records, storage.EncodedCellRecord{
-			Hash: hash,
-			Data: data,
-		})
-	}
-	return records
+	return records.Records
 }
 
-func checkpointEntries(state *storage.BlockState, records []storage.EncodedCellRecord) []storage.StateCheckpointBlock {
+func checkpointEntries(state *storage.BlockState) []storage.StateCheckpointBlock {
 	return []storage.StateCheckpointBlock{{
 		State: state,
-		Cells: records,
 	}}
 }
 
@@ -1684,16 +1676,9 @@ func TestPreparedMerkleUpdateCellsMatchApplyMerkleUpdate(t *testing.T) {
 		StateRootHash: stateRootHash[:],
 		Cell:          directRoot,
 	}
-	preparedCellsByHash, err := storage.PrepareStateUpdateCells(update)
+	preparedCells, err := storage.PrepareStateUpdateCells(update)
 	if err != nil {
 		t.Fatalf("prepare state update cells: %v", err)
-	}
-	preparedCells := make([]storage.EncodedCellRecord, 0, len(preparedCellsByHash))
-	for hash, data := range preparedCellsByHash {
-		preparedCells = append(preparedCells, storage.EncodedCellRecord{
-			Hash: hash,
-			Data: data,
-		})
 	}
 	nextCurrent := &storage.CurrentState{
 		SyncedAt:         time.Now(),
@@ -1701,7 +1686,7 @@ func TestPreparedMerkleUpdateCellsMatchApplyMerkleUpdate(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(nextState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(nextState, preparedCells), nextCurrent); err != nil {
+	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(nextState), preparedCells, nextCurrent); err != nil {
 		t.Fatalf("save prepared state update target: %v", err)
 	}
 
@@ -1910,7 +1895,7 @@ func TestSaveStateCheckpointWithPreparedCellsLoadsLazyRoot(t *testing.T) {
 		mustEncodedCellRecord(t, root),
 		mustEncodedCellRecord(t, child),
 	}
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state, records), current); err != nil {
+	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state), storage.NewStateCellRecords(records), current); err != nil {
 		t.Fatalf("save checkpoint with prepared cells: %v", err)
 	}
 
@@ -1953,7 +1938,7 @@ func TestSaveStateCheckpointWithPreparedCellsAllowsExternalBoundary(t *testing.T
 	}
 
 	records := []storage.EncodedCellRecord{mustEncodedCellRecord(t, root)}
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state, records), current); err != nil {
+	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state), storage.NewStateCellRecords(records), current); err != nil {
 		t.Fatalf("save checkpoint with external boundary: %v", err)
 	}
 
@@ -2000,7 +1985,7 @@ func TestStateCheckpointAllowsOrphanCellsWithoutMetadata(t *testing.T) {
 	child2 := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()
 	root2 := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(child2).EndCell()
 	firstCheckpointCells := append(mustReachableEncodedRecords(t, root1), mustReachableEncodedRecords(t, root2)...)
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state1, firstCheckpointCells), current1); err != nil {
+	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state1), storage.NewStateCellRecords(firstCheckpointCells), current1); err != nil {
 		t.Fatalf("save first checkpoint: %v", err)
 	}
 	root2Hash := root2.HashKey(0)

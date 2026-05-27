@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
@@ -41,9 +40,17 @@ func appliedBlockArtifactFlusher(publisher CurrentStatePublisher) blockArtifactF
 
 type appliedBlockArtifactJob struct {
 	seq        uint64
-	block      p2p.DownloadedBlock
+	artifact   appliedBlockArtifact
 	splitDepth uint32
 	bytes      uint64
+}
+
+type appliedBlockArtifact struct {
+	id               ton.BlockIDExt
+	blockBOC         []byte
+	proofBOC         []byte
+	meta             *storage.BlockMeta
+	verifiedFileHash bool
 }
 
 type appliedBlockArtifactWriter struct {
@@ -99,7 +106,7 @@ func (w *appliedBlockArtifactWriter) run(ctx context.Context) {
 	}
 }
 
-func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block p2p.DownloadedBlock, splitDepth uint32) error {
+func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block PreparedBlock, splitDepth uint32) error {
 	if w == nil {
 		return nil
 	}
@@ -139,7 +146,7 @@ func (w *appliedBlockArtifactWriter) enqueue(ctx context.Context, block p2p.Down
 	w.bytes += jobBytes
 	w.jobs = append(w.jobs, appliedBlockArtifactJob{
 		seq:        w.next,
-		block:      cloneDownloadedBlockForArtifact(block),
+		artifact:   newAppliedBlockArtifact(block),
 		splitDepth: splitDepth,
 		bytes:      jobBytes,
 	})
@@ -235,7 +242,7 @@ func (w *appliedBlockArtifactWriter) popJob() (appliedBlockArtifactJob, bool) {
 func (w *appliedBlockArtifactWriter) process(job appliedBlockArtifactJob) {
 	var err error
 	for attempt := 1; attempt <= appliedBlockArtifactRetryCount; attempt++ {
-		err = w.storeBlock(context.Background(), job.block, job.splitDepth)
+		err = w.storeBlock(context.Background(), job.artifact, job.splitDepth)
 		if err == nil {
 			w.markSaved(job.seq)
 			return
@@ -245,61 +252,57 @@ func (w *appliedBlockArtifactWriter) process(job appliedBlockArtifactJob) {
 		}
 	}
 
-	w.fail(fmt.Errorf("store applied block artifact %s: %w", storage.FormatBlockRef(job.block.ID), err))
+	w.fail(fmt.Errorf("store applied block artifact %s: %w", storage.FormatBlockRef(job.artifact.id), err))
 }
 
-func (w *appliedBlockArtifactWriter) storeBlock(ctx context.Context, block p2p.DownloadedBlock, splitDepth uint32) error {
-	if err := w.blockArtifactsReady(ctx, block.ID); err == nil {
-		return w.finishBlock(ctx, block)
+func (w *appliedBlockArtifactWriter) storeBlock(ctx context.Context, artifact appliedBlockArtifact, splitDepth uint32) error {
+	if err := w.blockArtifactsReady(ctx, artifact.id); err == nil {
+		return w.finishBlock(ctx, artifact)
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
 
-	if len(block.BlockBOC) == 0 {
+	if len(artifact.blockBOC) == 0 {
 		return fmt.Errorf("block data is missing")
 	}
-	if !block.VerifiedFileHash {
+	if !artifact.verifiedFileHash {
 		return fmt.Errorf("block file hash is not verified")
 	}
-	if len(block.ProofBOC) == 0 {
+	if len(artifact.proofBOC) == 0 {
 		return fmt.Errorf("block proof is missing")
 	}
-	if block.Meta == nil {
-		prepared, err := prepareDownloadedBlock(block)
-		if err != nil {
-			return err
-		}
-		block = prepared
+	if artifact.meta == nil {
+		return fmt.Errorf("block meta is missing")
 	}
 
 	full := &storage.ServedBlockFull{
-		ID:                     block.ID,
-		Proof:                  append([]byte(nil), block.ProofBOC...),
-		Block:                  append([]byte(nil), block.BlockBOC...),
-		Meta:                   block.Meta.Clone(),
-		IsLink:                 appliedBlockProofIsLink(block.ID),
+		ID:                     artifact.id,
+		Proof:                  append([]byte(nil), artifact.proofBOC...),
+		Block:                  append([]byte(nil), artifact.blockBOC...),
+		Meta:                   artifact.meta.Clone(),
+		IsLink:                 appliedBlockProofIsLink(artifact.id),
 		ArchiveShardSplitDepth: splitDepth,
 	}
 	if err := w.store.SaveBlockFull(full); err != nil {
 		return err
 	}
 
-	return w.finishBlock(ctx, block)
+	return w.finishBlock(ctx, artifact)
 }
 
-func (w *appliedBlockArtifactWriter) finishBlock(ctx context.Context, block p2p.DownloadedBlock) error {
-	if block.Meta != nil {
-		for _, prev := range block.Meta.PrevRefs {
-			if err := w.store.LinkNextBlock(prev, block.ID); err != nil {
+func (w *appliedBlockArtifactWriter) finishBlock(ctx context.Context, artifact appliedBlockArtifact) error {
+	if artifact.meta != nil {
+		for _, prev := range artifact.meta.PrevRefs {
+			if err := w.store.LinkNextBlock(prev, artifact.id); err != nil {
 				return err
 			}
 		}
 	}
-	if err := w.blockArtifactsReady(ctx, block.ID); err != nil {
+	if err := w.blockArtifactsReady(ctx, artifact.id); err != nil {
 		return err
 	}
 
-	w.markLiveBlockFlushed(block.ID)
+	w.markLiveBlockFlushed(artifact.id)
 	return nil
 }
 
@@ -368,7 +371,7 @@ func (w *appliedBlockArtifactWriter) broadcastDone() {
 	w.done = make(chan struct{})
 }
 
-func (s *Service) stageAppliedBlockArtifact(ctx context.Context, block p2p.DownloadedBlock, splitDepth uint32) error {
+func (s *Service) stageAppliedBlockArtifact(ctx context.Context, block PreparedBlock, splitDepth uint32) error {
 	if s.appliedArtifacts == nil {
 		return nil
 	}
@@ -406,15 +409,19 @@ func appliedBlockProofIsLink(block ton.BlockIDExt) bool {
 	return block.Workchain != -1 || block.Shard != topShard
 }
 
-func cloneDownloadedBlockForArtifact(block p2p.DownloadedBlock) p2p.DownloadedBlock {
-	block.ProofBOC = append([]byte(nil), block.ProofBOC...)
-	block.BlockBOC = append([]byte(nil), block.BlockBOC...)
-	if block.Meta != nil {
-		block.Meta = block.Meta.Clone()
+func newAppliedBlockArtifact(block PreparedBlock) appliedBlockArtifact {
+	artifact := appliedBlockArtifact{
+		id:               block.ID,
+		blockBOC:         append([]byte(nil), block.BlockBOC...),
+		proofBOC:         append([]byte(nil), block.ProofBOC...),
+		verifiedFileHash: true,
 	}
-	return block
+	if block.Meta != nil {
+		artifact.meta = block.Meta.Clone()
+	}
+	return artifact
 }
 
-func downloadedBlockArtifactBytes(block p2p.DownloadedBlock) uint64 {
+func downloadedBlockArtifactBytes(block PreparedBlock) uint64 {
 	return uint64(len(block.ProofBOC) + len(block.BlockBOC))
 }

@@ -30,10 +30,10 @@ type stateCellSaveStats struct {
 }
 
 func (s *Store) saveStateCellTree(ctx context.Context, req stateCellTreeSave) (stateCellSaveStats, error) {
-	if req.root != nil && req.root.GetType() == cell.PrunedCellType {
+	if req.root.GetType() == cell.PrunedCellType {
 		return stateCellSaveStats{}, fmt.Errorf("state cell tree root is pruned")
 	}
-	if req.root != nil && req.root.IsVirtualized() {
+	if req.root.IsVirtualized() {
 		return stateCellSaveStats{}, fmt.Errorf("state cell tree root is virtualized")
 	}
 	return s.saveStateCellTreesDFSBatch(ctx, []stateCellTreeSave{req})
@@ -113,9 +113,6 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 
 	totalCells := uint64(0)
 	for _, tree := range trees {
-		if tree.root == nil {
-			return stateCellSaveStats{}, fmt.Errorf("state cell tree root is nil")
-		}
 		if tree.root.GetType() == cell.PrunedCellType {
 			return stateCellSaveStats{}, fmt.Errorf("state cell tree root is pruned")
 		}
