@@ -29,7 +29,7 @@ Build the node binary:
 go build -o gton-node ./cmd/node
 ```
 
-Or download from releases.
+Or download from [releases](https://github.com/xssnick/gton/releases).
 
 The first run creates `config.json` and exits:
 
