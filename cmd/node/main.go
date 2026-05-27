@@ -36,6 +36,8 @@ const (
 	startupZeroStateAttemptTimeout = 45 * time.Second
 )
 
+var GitCommit = "unknown"
+
 func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
 	lsPubkeyFlag := flag.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
@@ -436,6 +438,7 @@ func main() {
 
 	logger.Info().
 		Str("config", selectedConfigPath).
+		Str("git_commit", GitCommit).
 		Str("log_level", level.String()).
 		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(logTypeOverrides), "<none>")).
 		Str("log_format", logFormat(*logJSONFlag)).
