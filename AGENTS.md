@@ -1,4 +1,4 @@
-# flexserver style guide
+# gton style guide
 
 ## Reference implementation
 

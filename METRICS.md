@@ -1,6 +1,6 @@
-# Flexserver Prometheus Metrics
+# GTON Prometheus Metrics
 
-Flexserver exposes metrics on `/metrics` when metrics are enabled in the node
+GTON exposes metrics on `/metrics` when metrics are enabled in the node
 configuration:
 
 ```json
@@ -207,7 +207,7 @@ sum(rate(gton_storage_cell_db_written_cells_total[1m])) by (generation, shard)
 
 ## Go And Process Metrics
 
-Flexserver also registers the standard Prometheus Go and process collectors in
+GTON also registers the standard Prometheus Go and process collectors in
 the same registry. Expect metrics such as:
 
 - `go_goroutines`
