@@ -13,8 +13,8 @@ func TestArchivePeerDenylistFiltersOnlyArchivePool(t *testing.T) {
 		log:          discardLogger(),
 		archivePeers: map[string]*archivePeerState{},
 	}
-	peerA := &overlayPeer{id: "peer-a", addr: "peer-a"}
-	peerB := &overlayPeer{id: "peer-b", addr: "peer-b"}
+	peerA := &overlayPeer{id: testPeerID("peer-a"), addr: "peer-a"}
+	peerB := &overlayPeer{id: testPeerID("peer-b"), addr: "peer-b"}
 	basechain := archive.ShardID{Workchain: 0, Shard: topShard}
 	masterchain := archive.ShardID{Workchain: -1, Shard: topShard}
 
@@ -31,7 +31,7 @@ func TestArchivePeerDenylistFiltersOnlyArchivePool(t *testing.T) {
 	}
 
 	state := sub.archivePeers[archivePeerPoolKey(basechain)]
-	state.deniedPeers[archivePeerKey(peerA)] = time.Now().Add(-time.Second)
+	state.deniedPeers[archivePeerID(peerA)] = time.Now().Add(-time.Second)
 
 	got = sub.availableArchivePeers(basechain, []*overlayPeer{peerA, peerB})
 	if len(got) != 2 {
@@ -48,26 +48,26 @@ func TestArchiveQueryCandidatesUseNeighboursBeforeKnownPeers(t *testing.T) {
 			ProtoVersionMajor: shardchainProtoVersionMajor,
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
-		peers: map[string]*overlayPeer{
-			"peer-1": {id: "peer-1", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-2": {id: "peer-2", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-3": {id: "peer-3", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
 		},
-		neighbours: []string{"peer-1", "peer-2"},
+		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
 	}
 
 	got := sub.archiveQueryCandidates()
 	if len(got) != 2 {
 		t.Fatalf("archive candidates should use only neighbours when present, got %d", len(got))
 	}
-	seen := map[string]struct{}{
+	seen := map[PeerID]struct{}{
 		got[0].id: {},
 		got[1].id: {},
 	}
-	if _, ok := seen["peer-1"]; !ok {
+	if _, ok := seen[testPeerID("peer-1")]; !ok {
 		t.Fatalf("expected peer-1 in archive neighbours, got %#v", got)
 	}
-	if _, ok := seen["peer-2"]; !ok {
+	if _, ok := seen[testPeerID("peer-2")]; !ok {
 		t.Fatalf("expected peer-2 in archive neighbours, got %#v", got)
 	}
 }
@@ -81,9 +81,9 @@ func TestArchiveQueryCandidatesDoNotUseKnownPeersWithoutNeighbours(t *testing.T)
 			ProtoVersionMajor: shardchainProtoVersionMajor,
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
-		peers: map[string]*overlayPeer{
-			"peer-1": {id: "peer-1", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-2": {id: "peer-2", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
 		},
 	}
 
@@ -102,25 +102,25 @@ func TestArchiveQueryCandidatesSkipDeadKnownPeers(t *testing.T) {
 			ProtoVersionMajor: shardchainProtoVersionMajor,
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
-		peers: map[string]*overlayPeer{
-			"alive": {id: "alive", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			"dead":  {id: "dead", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: false},
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("alive"): {id: testPeerID("alive"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("dead"):  {id: testPeerID("dead"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: false},
 		},
-		neighbours: []string{"dead", "alive"},
+		neighbours: []PeerID{testPeerID("dead"), testPeerID("alive")},
 	}
 
 	got := sub.archiveQueryCandidates()
 	if len(got) != 1 {
 		t.Fatalf("unexpected archive candidate count: got %d want 1", len(got))
 	}
-	if got[0].id != "alive" {
+	if got[0].id != testPeerID("alive") {
 		t.Fatalf("expected only alive peer, got %q", got[0].id)
 	}
 }
 
 func TestArchiveSmallSeedDoesNotUpdatePeerSpeed(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
-	peer := &overlayPeer{id: "peer", addr: "peer", alive: true}
+	peer := &overlayPeer{id: testPeerID("peer"), addr: "peer", alive: true}
 
 	noteArchivePeerSeedSuccess(shard, peer, archiveSpeedSampleMinBytes/4, time.Second)
 
@@ -138,7 +138,7 @@ func TestArchiveSmallSeedDoesNotUpdatePeerSpeed(t *testing.T) {
 
 func TestArchiveSmallDownloadCanMarkPeerSlow(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
-	peer := &overlayPeer{id: "peer", addr: "peer", alive: true}
+	peer := &overlayPeer{id: testPeerID("peer"), addr: "peer", alive: true}
 
 	if noteArchivePeerDownload(shard, peer, archiveSpeedSampleMinBytes/4, time.Second) {
 		t.Fatal("fast small archive download should not mark peer slow")
@@ -157,7 +157,7 @@ func TestArchiveSmallDownloadCanMarkPeerSlow(t *testing.T) {
 
 func TestArchiveLargeDownloadUpdatesLargePackSpeed(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
-	peer := &overlayPeer{id: "peer", addr: "peer", alive: true}
+	peer := &overlayPeer{id: testPeerID("peer"), addr: "peer", alive: true}
 
 	noteArchivePeerDownload(shard, peer, archiveSpeedSampleMinBytes, time.Second)
 	if stats := peer.statsSnapshot(); stats.archiveLargeDownloads != 0 || stats.archiveLargeBytesSec != 0 {
@@ -175,7 +175,7 @@ func TestArchiveLargePackSpeedHasPriorityOverSmallPackSpeed(t *testing.T) {
 	node := &Node{}
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	largePackFast := &overlayPeer{
-		id:                    "large-pack-fast",
+		id:                    testPeerID("large-pack-fast"),
 		addr:                  "large-pack-fast",
 		alive:                 true,
 		downloadCount:         2,
@@ -184,7 +184,7 @@ func TestArchiveLargePackSpeedHasPriorityOverSmallPackSpeed(t *testing.T) {
 		archiveLargeDownloads: 1,
 	}
 	probeFast := &overlayPeer{
-		id:               "small-pack-fast",
+		id:               testPeerID("small-pack-fast"),
 		addr:             "small-pack-fast",
 		alive:            true,
 		downloadCount:    2,
@@ -199,13 +199,13 @@ func TestArchiveLargePackSpeedHasPriorityOverSmallPackSpeed(t *testing.T) {
 
 func TestArchiveLargePackPeerCanUseParallelCapacity(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[string]int{
-			"large-pack-fast": 2,
+		downloadPeerLeases: map[PeerID]int{
+			testPeerID("large-pack-fast"): 2,
 		},
 	}
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	largePackFast := &overlayPeer{
-		id:                    "large-pack-fast",
+		id:                    testPeerID("large-pack-fast"),
 		addr:                  "large-pack-fast",
 		alive:                 true,
 		downloadCount:         3,
@@ -214,7 +214,7 @@ func TestArchiveLargePackPeerCanUseParallelCapacity(t *testing.T) {
 		archiveLargeDownloads: 2,
 	}
 	freeMedium := &overlayPeer{
-		id:               "free-medium",
+		id:               testPeerID("free-medium"),
 		addr:             "free-medium",
 		alive:            true,
 		downloadCount:    2,
@@ -229,13 +229,13 @@ func TestArchiveLargePackPeerCanUseParallelCapacity(t *testing.T) {
 
 func TestArchiveLargePackPriorityStopsAfterParallelCapacity(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[string]int{
-			"large-pack-fast": 3,
+		downloadPeerLeases: map[PeerID]int{
+			testPeerID("large-pack-fast"): 3,
 		},
 	}
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	largePackFast := &overlayPeer{
-		id:                    "large-pack-fast",
+		id:                    testPeerID("large-pack-fast"),
 		addr:                  "large-pack-fast",
 		alive:                 true,
 		downloadCount:         3,
@@ -244,7 +244,7 @@ func TestArchiveLargePackPriorityStopsAfterParallelCapacity(t *testing.T) {
 		archiveLargeDownloads: 2,
 	}
 	freeProbeFast := &overlayPeer{
-		id:               "free-probe-fast",
+		id:               testPeerID("free-probe-fast"),
 		addr:             "free-probe-fast",
 		alive:            true,
 		downloadCount:    2,

@@ -17,8 +17,8 @@ type testStateStore struct {
 	current  *storage.CurrentState
 	progress *storage.CurrentState
 	keyBlock *ton.BlockIDExt
-	blocks   map[string]*storage.BlockState
-	trees    map[string]testStateCellTree
+	blocks   map[storage.BlockRootHash]*storage.BlockState
+	trees    map[storage.BlockRootHash]testStateCellTree
 }
 
 type testStateCellTree struct {
@@ -27,8 +27,8 @@ type testStateCellTree struct {
 
 func newTestStateStore() *testStateStore {
 	return &testStateStore{
-		blocks: map[string]*storage.BlockState{},
-		trees:  map[string]testStateCellTree{},
+		blocks: map[storage.BlockRootHash]*storage.BlockState{},
+		trees:  map[storage.BlockRootHash]testStateCellTree{},
 	}
 }
 

@@ -130,7 +130,7 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 
 		s.blockProofBasesMu.Lock()
 		if s.blockProofBases == nil {
-			s.blockProofBases = make(map[string]*blockProofBase)
+			s.blockProofBases = make(map[storage.BlockRootHash]*blockProofBase)
 		}
 		if existing := s.blockProofBases[key]; existing != nil {
 			s.blockProofBasesMu.Unlock()

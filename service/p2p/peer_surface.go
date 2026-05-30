@@ -144,6 +144,9 @@ func (n *Node) announceSelf(ctx context.Context) error {
 		if !sub.isActive() {
 			continue
 		}
+		if !sub.spec.Announce {
+			continue
+		}
 
 		self, err := n.selfOverlayNode(sub.spec)
 		if err != nil {
@@ -207,6 +210,9 @@ func (n *Node) warmupDHT(ctx context.Context) error {
 
 	var errs []error
 	for _, sub := range n.subscriptionsSnapshot() {
+		if !sub.spec.DHTDiscovery {
+			continue
+		}
 		warmCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
 		_, _, err := n.dht.FindOverlayNodes(warmCtx, sub.spec.FullID)
 		cancel()

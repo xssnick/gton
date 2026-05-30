@@ -33,7 +33,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 	}
 	sub.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
 
-	tried := map[string]struct{}{}
+	tried := map[PeerID]struct{}{}
 	var errs []error
 	for wave := 0; wave < proofDownloadWaves; wave++ {
 		peers := sub.proofQueryCandidates(tried)
@@ -50,7 +50,10 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 			peers = peers[:proofDownloadPeerLimit]
 		}
 		for _, peer := range peers {
-			tried[proofPeerKey(peer)] = struct{}{}
+			peerID := proofPeerID(peer)
+			if !peerID.IsZero() {
+				tried[peerID] = struct{}{}
+			}
 		}
 
 		resp, err := runConcurrentOverlayQueries(ctx, peers, proofDownloadParallelism, proofDownloadHedgeDelay, func(ctx context.Context, peer *overlayPeer) (tl.Serializable, error) {
@@ -81,7 +84,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 	return ProofDownload{}, errors.New("overlay has no proof download peers")
 }
 
-func (s *overlaySubscription) proofQueryCandidates(tried map[string]struct{}) []*overlayPeer {
+func (s *overlaySubscription) proofQueryCandidates(tried map[PeerID]struct{}) []*overlayPeer {
 	peers := s.queryCandidates(0, 0)
 	if len(peers) == 0 {
 		s.reloadNeighbours()
@@ -93,7 +96,7 @@ func (s *overlaySubscription) proofQueryCandidates(tried map[string]struct{}) []
 
 	filtered := peers[:0]
 	for _, peer := range peers {
-		if _, ok := tried[proofPeerKey(peer)]; ok {
+		if _, ok := tried[proofPeerID(peer)]; ok {
 			continue
 		}
 		filtered = append(filtered, peer)
@@ -115,11 +118,11 @@ func (s *overlaySubscription) waitForProofPeerDiscovery(ctx context.Context) err
 	}
 }
 
-func proofPeerKey(peer *overlayPeer) string {
-	if peer.id != "" {
-		return peer.id
+func proofPeerID(peer *overlayPeer) PeerID {
+	if peer == nil {
+		return PeerID{}
 	}
-	return peer.addr
+	return peer.id
 }
 
 func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *overlayPeer, block ton.BlockIDExt, allowPartial bool, keyBlock bool) (ProofDownload, error) {

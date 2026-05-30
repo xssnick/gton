@@ -70,6 +70,40 @@ func TestSendExternalMessageIgnoresBroadcastDeduper(t *testing.T) {
 	}
 }
 
+func TestSendExternalMessageCustomOverlayCanSkipPublic(t *testing.T) {
+	node, publicSub := newSendExternalMessageTestNode(t)
+	publicPeer := testRebroadcastQueuePeer("public-peer")
+	publicSub.peers[publicPeer.id] = publicPeer
+
+	customSpec := overlaySpec{
+		Name:              "custom.private-a",
+		Kind:              overlayKindCustomFixed,
+		ShortID:           bytes.Repeat([]byte{0x22}, 32),
+		MsgSenders:        map[PeerID]int{node.localID: 3},
+		SkipPublicMsgSend: true,
+	}
+	customSub, _ := node.getOrCreateSubscription(customSpec)
+	customSub.setActive(true, time.Time{})
+	customPeer := testRebroadcastQueuePeer("custom-peer")
+	customSub.peers[customPeer.id] = customPeer
+
+	body := testExternalMessageBOC(t)
+	if err := node.SendExternalMessage(context.Background(), body); err != nil {
+		t.Fatalf("send external message failed: %v", err)
+	}
+	if got, ok := customSub.customTwoStepQueueStatusSnapshot(); !ok {
+		t.Fatalf("expected custom two-step rebroadcast queue")
+	} else if got.Items != 1 {
+		t.Fatalf("custom two-step queued items = %d, want 1", got.Items)
+	}
+	if got, ok := customPeer.localRebroadcastQueue.TryPop(); ok {
+		t.Fatalf("unexpected ordinary custom rebroadcast: %#v", got)
+	}
+	if got, ok := publicPeer.localRebroadcastQueue.TryPop(); ok {
+		t.Fatalf("unexpected public rebroadcast: %#v", got)
+	}
+}
+
 func newSendExternalMessageTestNode(t *testing.T) (*Node, *overlaySubscription) {
 	t.Helper()
 

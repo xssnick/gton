@@ -53,7 +53,7 @@ type holeChecker struct {
 	opts  options
 
 	report       holeReport
-	checkedShard map[string]struct{}
+	checkedShard map[storage.BlockRootHash]struct{}
 	stop         bool
 }
 
@@ -137,7 +137,7 @@ func main() {
 		store:        store,
 		log:          logger,
 		opts:         opts,
-		checkedShard: map[string]struct{}{},
+		checkedShard: map[storage.BlockRootHash]struct{}{},
 		report: holeReport{
 			DB:         opts.dbDir,
 			StartSeqno: opts.seqno,

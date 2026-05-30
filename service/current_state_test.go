@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,10 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func testPeerID(label string) p2p.PeerID {
+	return p2p.PeerID(sha256.Sum256([]byte(label)))
+}
 
 func testCurrentBlockStates(current *tnstore.CurrentState) []*tnstore.BlockState {
 	if current == nil {
@@ -788,7 +793,7 @@ func TestVerifiedMasterchainQueueAcceptsBroadcastOutsideCatchUp(t *testing.T) {
 	downloaded := testPreparedMasterchainBlock(prev, next)
 
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(downloaded, "")
+	svc.queueMasterchainBlockCandidateFromSource(downloaded, p2p.PeerID{})
 
 	got, ok := svc.takeQueuedMasterchainBlock(prev, next)
 	if !ok {
@@ -812,7 +817,7 @@ func TestMasterchainBroadcastCandidateWaitsForValidation(t *testing.T) {
 	}
 
 	svc := &Service{}
-	svc.queueMasterchainBroadcastCandidateFromSource(downloaded, "peer-a")
+	svc.queueMasterchainBroadcastCandidateFromSource(downloaded, testPeerID("peer-a"))
 
 	if _, ok := svc.takeQueuedMasterchainBlock(prev, next); ok {
 		t.Fatal("unverified broadcast candidate must not be returned by verified fast path")
@@ -821,8 +826,8 @@ func TestMasterchainBroadcastCandidateWaitsForValidation(t *testing.T) {
 	if !ok {
 		t.Fatal("expected queued masterchain broadcast candidate")
 	}
-	if candidate.sourceKey != "peer-a" {
-		t.Fatalf("candidate source = %q, want peer-a", candidate.sourceKey)
+	if candidate.sourcePeerID != testPeerID("peer-a") {
+		t.Fatalf("candidate source = %q, want peer-a", candidate.sourcePeerID)
 	}
 	future, ok := svc.queuedMasterchainFuture(testMasterBlockID(9))
 	if !ok || !future.block.Equals(&next) {
@@ -835,13 +840,13 @@ func TestVerifiedMasterchainQueueDropsFarFutureWhenFull(t *testing.T) {
 	for seqno := uint32(10); seqno < 10+nextMasterchainQueueLimit; seqno++ {
 		prev := testMasterBlockID(seqno)
 		next := testMasterBlockID(seqno + 1)
-		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), "")
+		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), p2p.PeerID{})
 	}
 
 	oldestPrev := testMasterBlockID(10)
 	farPrev := testMasterBlockID(1000)
 	farNext := testMasterBlockID(1001)
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(farPrev, farNext), "")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(farPrev, farNext), p2p.PeerID{})
 
 	oldestNext := testMasterBlockID(11)
 	if got, ok := svc.takeQueuedMasterchainBlock(oldestPrev, oldestNext); !ok || !got.ID.Equals(&oldestNext) {
@@ -858,8 +863,8 @@ func TestVerifiedMasterchainQueueSeqnoIndexDoesNotDeleteReplacement(t *testing.T
 	block := testMasterBlockID(21)
 	svc := &Service{}
 
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(oldPrev, block), "old")
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(newPrev, block), "new")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(oldPrev, block), testPeerID("old"))
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(newPrev, block), testPeerID("new"))
 
 	if _, ok := svc.takeQueuedMasterchainBlock(oldPrev, block); ok {
 		t.Fatal("expected same-seqno replacement to remove old prev entry")
@@ -874,7 +879,7 @@ func TestQueuedMasterchainBlockAheadReportsFutureBlock(t *testing.T) {
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), "")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), p2p.PeerID{})
 
 	got, ok := svc.queuedMasterchainBlockAhead(current)
 	if !ok {
@@ -890,7 +895,7 @@ func TestQueuedMasterchainFutureReportsMissingSeqnoAndSource(t *testing.T) {
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), "peer-a")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
 
 	got, ok := svc.queuedMasterchainFuture(current)
 	if !ok {
@@ -902,8 +907,8 @@ func TestQueuedMasterchainFutureReportsMissingSeqnoAndSource(t *testing.T) {
 	if got.lowestMissingSeqno != current.SeqNo+1 {
 		t.Fatalf("lowest missing seqno = %d, want %d", got.lowestMissingSeqno, current.SeqNo+1)
 	}
-	if got.sourceKey != "peer-a" {
-		t.Fatalf("source key = %q, want peer-a", got.sourceKey)
+	if got.sourcePeerID != testPeerID("peer-a") {
+		t.Fatalf("source key = %q, want peer-a", got.sourcePeerID)
 	}
 }
 
@@ -943,14 +948,14 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	futurePrev := testMasterBlockID(101)
 	future := testMasterBlockID(102)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), "peer-a")
+	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
 
 	queued, _ := svc.nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{})
 	if queued.peerLimit != nextBlockBootstrapProbePeers {
 		t.Fatalf("cold queued future probe peers = %d, want %d", queued.peerLimit, nextBlockBootstrapProbePeers)
 	}
-	if queued.preferredSourceKey != "" {
-		t.Fatalf("cold queued future preferred source = %q, want empty", queued.preferredSourceKey)
+	if !queued.preferredSourcePeerID.IsZero() {
+		t.Fatalf("cold queued future preferred source = %q, want empty", queued.preferredSourcePeerID)
 	}
 
 	queued, _ = svc.nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{liveTail: true})
@@ -960,8 +965,8 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	if !queued.queuedFutureAhead || queued.aheadBlocks != future.SeqNo-prev.SeqNo {
 		t.Fatalf("unexpected queued future decision %+v", queued)
 	}
-	if queued.preferredSourceKey != "peer-a" {
-		t.Fatalf("queued future preferred source = %q, want peer-a", queued.preferredSourceKey)
+	if queued.preferredSourcePeerID != testPeerID("peer-a") {
+		t.Fatalf("queued future preferred source = %q, want peer-a", queued.preferredSourcePeerID)
 	}
 	if queued.lowestMissingSeqno != prev.SeqNo+1 {
 		t.Fatalf("queued future lowest missing = %d, want %d", queued.lowestMissingSeqno, prev.SeqNo+1)
@@ -1072,7 +1077,7 @@ func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), "broadcast-peer")
+		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
 		svc.wakeCurrentStateSync()
 	}()
 

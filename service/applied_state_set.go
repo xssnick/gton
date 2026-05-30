@@ -1,13 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"sort"
 
 	"github.com/xssnick/gton/service/storage"
 )
 
 type appliedStateSet struct {
-	states map[string]appliedStateEntry
+	states map[storage.BlockRootHash]appliedStateEntry
 }
 
 type appliedStateEntry struct {
@@ -15,7 +16,7 @@ type appliedStateEntry struct {
 }
 
 type appliedStateCheckpoint struct {
-	keys    []string
+	keys    []storage.BlockRootHash
 	entries []storage.StateCheckpointBlock
 }
 
@@ -24,7 +25,7 @@ func (s *appliedStateSet) remember(state *storage.BlockState) {
 		return
 	}
 	if s.states == nil {
-		s.states = map[string]appliedStateEntry{}
+		s.states = map[storage.BlockRootHash]appliedStateEntry{}
 	}
 	s.states[storage.BlockKey(state.Block)] = appliedStateEntry{
 		state: storage.CloneBlockState(state),
@@ -99,14 +100,14 @@ func (s *appliedStateSet) cloneEntries() []appliedStateEntry {
 		return nil
 	}
 
-	cloned := make(map[string]appliedStateEntry, len(s.states))
+	cloned := make(map[storage.BlockRootHash]appliedStateEntry, len(s.states))
 	for key, entry := range s.states {
 		cloned[key] = cloneAppliedStateEntry(entry)
 	}
 	return sortedClonedStateEntries(cloned)
 }
 
-func sortedClonedStateEntries(entries map[string]appliedStateEntry) []appliedStateEntry {
+func sortedClonedStateEntries(entries map[storage.BlockRootHash]appliedStateEntry) []appliedStateEntry {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -119,12 +120,14 @@ func sortedClonedStateEntries(entries map[string]appliedStateEntry) []appliedSta
 	return cloned
 }
 
-func sortedStateEntryKeys(entries map[string]appliedStateEntry) []string {
-	keys := make([]string, 0, len(entries))
+func sortedStateEntryKeys(entries map[storage.BlockRootHash]appliedStateEntry) []storage.BlockRootHash {
+	keys := make([]storage.BlockRootHash, 0, len(entries))
 	for key := range entries {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		return bytes.Compare(keys[i][:], keys[j][:]) < 0
+	})
 	return keys
 }
 
@@ -133,7 +136,7 @@ func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
 		return
 	}
 	if s.states == nil {
-		s.states = map[string]appliedStateEntry{}
+		s.states = map[storage.BlockRootHash]appliedStateEntry{}
 	}
 	s.states[storage.BlockKey(entry.state.Block)] = cloneAppliedStateEntry(entry)
 }

@@ -12,9 +12,9 @@ type liveBlockLoadResult struct {
 	data []byte
 }
 
-type liveBlockLoadGroup struct {
+type liveLoadGroup[K comparable] struct {
 	mu    sync.Mutex
-	calls map[string]*liveBlockLoadCall
+	calls map[K]*liveBlockLoadCall
 }
 
 type liveBlockLoadCall struct {
@@ -23,10 +23,10 @@ type liveBlockLoadCall struct {
 	err   error
 }
 
-func (g *liveBlockLoadGroup) do(ctx context.Context, key string, fn func() (any, error)) (any, error) {
+func (g *liveLoadGroup[K]) do(ctx context.Context, key K, fn func() (any, error)) (any, error) {
 	g.mu.Lock()
 	if g.calls == nil {
-		g.calls = map[string]*liveBlockLoadCall{}
+		g.calls = map[K]*liveBlockLoadCall{}
 	}
 	if call := g.calls[key]; call != nil {
 		done := call.done

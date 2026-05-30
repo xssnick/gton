@@ -162,22 +162,17 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 		return nil, nil, nil
 	}
 
-	stateRoot, err := s.loadStateRoot(ctx, client)
+	fragments, err := s.blockFragments(ctx, client)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	mcBlock, err := oldMasterBlockStateProof(stateRoot, proved)
+	mcBlock, err := oldMasterBlockStateProof(fragments.stateRoot, proved)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	clientMCState, err := s.blockProof(ctx, client)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return clientMCState.ToBOCWithFlags(false), mcBlock.ToBOCWithFlags(false), nil
+	return fragments.blockStateRootProof.ToBOCWithFlags(false), mcBlock.ToBOCWithFlags(false), nil
 }
 
 func oldMasterBlockIDFromState(stateRoot *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {

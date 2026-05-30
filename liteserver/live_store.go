@@ -28,32 +28,40 @@ var (
 type LiveStoreOptions struct {
 	MasterBlockCache int
 	ShardBlockCache  int
+	NonFinalEnabled  bool
+	NonFinalCache    int
 }
 
 type LiveStore struct {
 	Store
 
-	mu               sync.RWMutex
-	current          *storage.CurrentState
-	pendingCurrent   *storage.CurrentState
-	masterchainInfo  liveMasterchainInfo
-	readyMasterSeqno uint32
-	notify           chan struct{}
-	blocks           map[string]*liveBlock
-	metas            map[string]*storage.BlockMeta
-	states           map[liveBlockLookupKey]storage.BlockState
-	seqIndex         map[liveSeqKey]ton.BlockIDExt
-	ltIndex          map[liveHistoryKey][]liveLTIndexEntry
-	unixIndex        map[liveHistoryKey][]liveUnixIndexEntry
-	flushed          map[string]liveBlockFlush
-	masterOrder      liveBlockOrder
-	shardOrder       liveBlockOrder
-	masterEvictable  int
-	shardEvictable   int
-	masterCacheSize  int
-	shardCacheSize   int
-	blockLoad        liveBlockLoadGroup
-	fragmentLoad     liveBlockLoadGroup
+	mu                 sync.RWMutex
+	current            *storage.CurrentState
+	pendingCurrent     *storage.CurrentState
+	masterchainInfo    liveMasterchainInfo
+	readyMasterSeqno   uint32
+	notify             chan struct{}
+	blocks             map[storage.BlockRootHash]*liveBlock
+	metas              map[storage.BlockRootHash]*storage.BlockMeta
+	states             map[liveBlockLookupKey]storage.BlockState
+	seqIndex           map[liveSeqKey]ton.BlockIDExt
+	ltIndex            map[liveHistoryKey][]liveLTIndexEntry
+	unixIndex          map[liveHistoryKey][]liveUnixIndexEntry
+	flushed            map[storage.BlockRootHash]liveBlockFlush
+	masterOrder        liveBlockOrder
+	shardOrder         liveBlockOrder
+	masterEvictable    int
+	shardEvictable     int
+	masterCacheSize    int
+	shardCacheSize     int
+	nonFinalEnabled    bool
+	nonFinalCache      int
+	nonFinalPending    map[storage.BlockRootHash]liveNonfinalPending
+	nonFinalOrder      []storage.BlockRootHash
+	nonFinalWaiting    map[storage.BlockRootHash]liveNonfinalWaiting
+	nonFinalCellLoader cell.LazyCellLoader
+	blockLoad          liveLoadGroup[storage.BlockRootHash]
+	fragmentLoad       liveLoadGroup[storage.BlockRootHash]
 }
 
 type liveBlock struct {
@@ -76,6 +84,18 @@ type liveBlockFlush struct {
 	proofs    bool
 }
 
+type livePreparedBlockArtifacts struct {
+	block            ton.BlockIDExt
+	root             *cell.Cell
+	data             []byte
+	meta             *storage.BlockMeta
+	state            *storage.BlockState
+	proofs           map[storage.ServedProofKind][]byte
+	blockDataFlushed bool
+	stateFlushed     bool
+	proofsFlushed    bool
+}
+
 type liveMasterchainInfo struct {
 	block         ton.BlockIDExt
 	stateRootHash []byte
@@ -85,13 +105,13 @@ type liveMasterchainInfo struct {
 
 type liveBlockOrder struct {
 	items *list.List
-	index map[string]*list.Element
+	index map[storage.BlockRootHash]*list.Element
 }
 
 func newLiveBlockOrder() liveBlockOrder {
 	return liveBlockOrder{
 		items: list.New(),
-		index: map[string]*list.Element{},
+		index: map[storage.BlockRootHash]*list.Element{},
 	}
 }
 
@@ -100,11 +120,11 @@ func (o *liveBlockOrder) ensure() {
 		o.items = list.New()
 	}
 	if o.index == nil {
-		o.index = map[string]*list.Element{}
+		o.index = map[storage.BlockRootHash]*list.Element{}
 	}
 }
 
-func (o *liveBlockOrder) pushBack(key string) {
+func (o *liveBlockOrder) pushBack(key storage.BlockRootHash) {
 	o.ensure()
 	if elem := o.index[key]; elem != nil {
 		o.items.MoveToBack(elem)
@@ -113,7 +133,7 @@ func (o *liveBlockOrder) pushBack(key string) {
 	o.index[key] = o.items.PushBack(key)
 }
 
-func (o *liveBlockOrder) remove(key string) bool {
+func (o *liveBlockOrder) remove(key storage.BlockRootHash) bool {
 	o.ensure()
 	elem := o.index[key]
 	if elem == nil {
@@ -137,21 +157,37 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 	if len(opts) > 0 {
 		cfg = opts[0]
 	}
+	if cfg.NonFinalCache == 0 {
+		cfg.NonFinalCache = cfg.ShardBlockCache
+	}
+	if cfg.NonFinalCache == 0 {
+		cfg.NonFinalCache = DefaultShardBlockCache
+	}
+
+	var nonFinalCellLoader cell.LazyCellLoader
+	if store, ok := store.(lazyCellLoaderStore); ok {
+		nonFinalCellLoader = store.LazyCellLoader()
+	}
 
 	return &LiveStore{
-		Store:           store,
-		notify:          make(chan struct{}),
-		blocks:          map[string]*liveBlock{},
-		metas:           map[string]*storage.BlockMeta{},
-		states:          map[liveBlockLookupKey]storage.BlockState{},
-		seqIndex:        map[liveSeqKey]ton.BlockIDExt{},
-		ltIndex:         map[liveHistoryKey][]liveLTIndexEntry{},
-		unixIndex:       map[liveHistoryKey][]liveUnixIndexEntry{},
-		flushed:         map[string]liveBlockFlush{},
-		masterOrder:     newLiveBlockOrder(),
-		shardOrder:      newLiveBlockOrder(),
-		masterCacheSize: cfg.MasterBlockCache,
-		shardCacheSize:  cfg.ShardBlockCache,
+		Store:              store,
+		notify:             make(chan struct{}),
+		blocks:             map[storage.BlockRootHash]*liveBlock{},
+		metas:              map[storage.BlockRootHash]*storage.BlockMeta{},
+		states:             map[liveBlockLookupKey]storage.BlockState{},
+		seqIndex:           map[liveSeqKey]ton.BlockIDExt{},
+		ltIndex:            map[liveHistoryKey][]liveLTIndexEntry{},
+		unixIndex:          map[liveHistoryKey][]liveUnixIndexEntry{},
+		flushed:            map[storage.BlockRootHash]liveBlockFlush{},
+		masterOrder:        newLiveBlockOrder(),
+		shardOrder:         newLiveBlockOrder(),
+		masterCacheSize:    cfg.MasterBlockCache,
+		shardCacheSize:     cfg.ShardBlockCache,
+		nonFinalEnabled:    cfg.NonFinalEnabled,
+		nonFinalCache:      cfg.NonFinalCache,
+		nonFinalPending:    map[storage.BlockRootHash]liveNonfinalPending{},
+		nonFinalWaiting:    map[storage.BlockRootHash]liveNonfinalWaiting{},
+		nonFinalCellLoader: nonFinalCellLoader,
 	}
 }
 
@@ -162,6 +198,9 @@ func (s *LiveStore) SetLiveCurrentState(current *storage.CurrentState) {
 	prevSeqno := currentMasterchainSeqno(s.current)
 	s.pendingCurrent = next
 	published := s.publishPendingCurrentLocked()
+	if s.nonFinalEnabled {
+		s.cleanupNonfinalPendingLocked()
+	}
 	nextSeqno := currentMasterchainSeqno(s.current)
 	ready := s.updateReadyMasterSeqnoLocked()
 	if published || ready || nextSeqno > prevSeqno || currentMasterchainSeqno(next) > prevSeqno {
@@ -169,6 +208,9 @@ func (s *LiveStore) SetLiveCurrentState(current *storage.CurrentState) {
 		s.notify = make(chan struct{})
 	}
 	s.mu.Unlock()
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
 }
 
 func (s *LiveStore) CurrentState(ctx context.Context) (*storage.CurrentState, error) {
@@ -247,23 +289,42 @@ func (s *LiveStore) publishLiveBlockData(block ton.BlockIDExt, root *cell.Cell, 
 }
 
 func (s *LiveStore) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
+	prepared, err := prepareLiveBlockArtifacts(artifacts)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	published, ready := s.publishLiveBlockArtifactsPreparedLocked(prepared)
+	if published || ready {
+		close(s.notify)
+		s.notify = make(chan struct{})
+	}
+	s.mu.Unlock()
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
+	return nil
+}
+
+func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePreparedBlockArtifacts, error) {
 	block := artifacts.Block
 	if !isFullBlockID(&block) {
-		return storage.ErrNotFound
+		return livePreparedBlockArtifacts{}, storage.ErrNotFound
 	}
 
 	root := artifacts.Root
 	if root == nil && len(artifacts.BlockData) > 0 {
 		parsed, err := parseTrustedBlockBOC(block, artifacts.BlockData)
 		if err != nil {
-			return err
+			return livePreparedBlockArtifacts{}, err
 		}
 		root = parsed
 	}
 	if root != nil {
 		normalized, err := normalizeLiveBlockRoot(block, root)
 		if err != nil {
-			return err
+			return livePreparedBlockArtifacts{}, err
 		}
 		root = normalized
 	}
@@ -274,8 +335,9 @@ func (s *LiveStore) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifac
 	}
 
 	meta := artifacts.Meta.Clone()
-	if artifacts.State != nil {
-		meta = storage.MergeBlockMeta(meta, storage.BuildBlockMetaFromState(*artifacts.State))
+	state := storage.CloneBlockState(artifacts.State)
+	if state != nil {
+		meta = storage.MergeBlockMeta(meta, storage.BuildBlockMetaFromState(*state))
 	}
 	if meta != nil {
 		meta.ID = block
@@ -300,35 +362,68 @@ func (s *LiveStore) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifac
 		proofs = nil
 	}
 
-	key := storage.BlockKey(block)
+	return livePreparedBlockArtifacts{
+		block:            block,
+		root:             root,
+		data:             data,
+		meta:             meta,
+		state:            state,
+		proofs:           proofs,
+		blockDataFlushed: artifacts.BlockDataFlushed,
+		stateFlushed:     artifacts.StateFlushed,
+		proofsFlushed:    artifacts.ProofsFlushed,
+	}, nil
+}
 
-	s.mu.Lock()
+func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveBlockArtifacts {
+	cloned := storage.LiveBlockArtifacts{
+		Block:            artifacts.Block,
+		Root:             artifacts.Root,
+		BlockData:        append([]byte(nil), artifacts.BlockData...),
+		Meta:             artifacts.Meta.Clone(),
+		State:            storage.CloneBlockState(artifacts.State),
+		BlockDataFlushed: artifacts.BlockDataFlushed,
+		StateFlushed:     artifacts.StateFlushed,
+		ProofsFlushed:    artifacts.ProofsFlushed,
+	}
+	if len(artifacts.Proofs) > 0 {
+		cloned.Proofs = make([]storage.LiveBlockProofArtifact, 0, len(artifacts.Proofs))
+		for _, proof := range artifacts.Proofs {
+			cloned.Proofs = append(cloned.Proofs, storage.LiveBlockProofArtifact{
+				Kind: proof.Kind,
+				Data: append([]byte(nil), proof.Data...),
+			})
+		}
+	}
+	return cloned
+}
+
+func (s *LiveStore) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlockArtifacts) (bool, bool) {
+	key := storage.BlockKey(prepared.block)
 	flushed := s.flushed[key]
 	if flushed.blockData || flushed.state || flushed.proofs {
 		delete(s.flushed, key)
 	}
 	s.putBlockLocked(key, &liveBlock{
-		id:               block,
-		root:             root,
-		data:             data,
-		meta:             meta,
-		proofs:           proofs,
-		blockDataFlushed: artifacts.BlockDataFlushed || flushed.blockData,
-		stateFlushed:     artifacts.StateFlushed || flushed.state,
-		proofsFlushed:    artifacts.ProofsFlushed || flushed.proofs,
+		id:               prepared.block,
+		root:             prepared.root,
+		data:             prepared.data,
+		meta:             prepared.meta,
+		proofs:           prepared.proofs,
+		blockDataFlushed: prepared.blockDataFlushed || flushed.blockData,
+		stateFlushed:     prepared.stateFlushed || flushed.state,
+		proofsFlushed:    prepared.proofsFlushed || flushed.proofs,
 	})
-	if artifacts.State != nil {
-		s.rememberBlockStateLocked(*artifacts.State)
+	if prepared.state != nil {
+		s.rememberBlockStateLocked(*prepared.state)
 	}
 	published := s.publishPendingCurrentLocked()
-	s.trimBlocksLocked(liveBlockKind(block))
-	ready := s.updateReadyMasterSeqnoLocked()
-	if published || ready {
-		close(s.notify)
-		s.notify = make(chan struct{})
+	if s.nonFinalEnabled {
+		s.cleanupNonfinalPendingLocked()
 	}
-	s.mu.Unlock()
-	return nil
+	s.trimBlocksLocked(liveBlockKind(prepared.block))
+	ready := s.updateReadyMasterSeqnoLocked()
+	return published, ready
 }
 
 func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
@@ -338,6 +433,9 @@ func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 	if cached := s.blocks[key]; cached != nil {
 		s.markLiveBlockDataFlushedLocked(cached)
 		published := s.publishPendingCurrentLocked()
+		if s.nonFinalEnabled {
+			s.cleanupNonfinalPendingLocked()
+		}
 		s.trimBlocksLocked(liveBlockKind(block))
 		ready := s.updateReadyMasterSeqnoLocked()
 		if published || ready {
@@ -351,6 +449,9 @@ func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 		s.flushed[key] = flushed
 	}
 	s.mu.Unlock()
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
 }
 
 func (s *LiveStore) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
@@ -952,7 +1053,7 @@ func (s *LiveStore) rememberBlockFragments(block ton.BlockIDExt, fragments *live
 	return fragments
 }
 
-func (s *LiveStore) putBlockLocked(key string, block *liveBlock) {
+func (s *LiveStore) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 	if existing := s.blocks[key]; existing != nil {
 		existingEvictable := s.liveBlockEvictableLocked(existing)
 		incomingProofs := block.proofs
@@ -1006,7 +1107,7 @@ func (s *LiveStore) trimBlocksLocked(kind liveBlockCacheKind) {
 	order := s.blockOrderLocked(kind)
 	for elem := order.front(); elem != nil && evictable > limit; {
 		next := elem.Next()
-		key := elem.Value.(string)
+		key := elem.Value.(storage.BlockRootHash)
 		cached := s.blocks[key]
 		if cached == nil {
 			order.remove(key)
@@ -1232,7 +1333,7 @@ func (s *LiveStore) removeMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 	}
 }
 
-func (s *LiveStore) removeBlockOrderLocked(key string, kind liveBlockCacheKind) {
+func (s *LiveStore) removeBlockOrderLocked(key storage.BlockRootHash, kind liveBlockCacheKind) {
 	s.blockOrderLocked(kind).remove(key)
 }
 
@@ -1266,7 +1367,7 @@ func (s *LiveStore) adjustLiveEvictableLocked(kind liveBlockCacheKind, delta int
 	}
 }
 
-func (s *LiveStore) deleteLiveBlockLocked(key string, cached *liveBlock, kind liveBlockCacheKind) {
+func (s *LiveStore) deleteLiveBlockLocked(key storage.BlockRootHash, cached *liveBlock, kind liveBlockCacheKind) {
 	delete(s.blocks, key)
 	s.removeBlockOrderLocked(key, kind)
 	if s.liveBlockEvictableLocked(cached) {
@@ -1275,14 +1376,19 @@ func (s *LiveStore) deleteLiveBlockLocked(key string, cached *liveBlock, kind li
 	s.removeBlockStateLocked(cached.id)
 }
 
-func (s *LiveStore) protectedLiveBlocksLocked() map[string]struct{} {
-	protected := make(map[string]struct{})
+func (s *LiveStore) protectedLiveBlocksLocked() map[storage.BlockRootHash]struct{} {
+	protected := make(map[storage.BlockRootHash]struct{})
 	addCurrentLiveBlocks(protected, s.current)
 	addCurrentLiveBlocks(protected, s.pendingCurrent)
+	if s.nonFinalEnabled {
+		for _, pending := range s.nonFinalPending {
+			protected[storage.BlockKey(pending.block)] = struct{}{}
+		}
+	}
 	return protected
 }
 
-func addCurrentLiveBlocks(protected map[string]struct{}, current *storage.CurrentState) {
+func addCurrentLiveBlocks(protected map[storage.BlockRootHash]struct{}, current *storage.CurrentState) {
 	if current == nil {
 		return
 	}

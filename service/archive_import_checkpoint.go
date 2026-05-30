@@ -83,11 +83,11 @@ func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBlocks() uint32 {
 		target = DefaultArchiveCatchUpCheckpointBlocks
 	}
 
-	return checkpointBackpressureBlocks(target)
+	return checkpointBackpressureBlocks(target, r.service.syncBackpressureWindowCount())
 }
 
 func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBytes() uint64 {
-	return checkpointBackpressureBytes(r.service.checkpointBytesTarget())
+	return checkpointBackpressureBytes(r.service.checkpointBytesTarget(), r.service.syncBackpressureWindowCount())
 }
 
 func (r *archiveCatchUpRunner) pendingArchiveCheckpointBytes() uint64 {

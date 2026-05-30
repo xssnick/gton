@@ -37,7 +37,7 @@ func TestHandleMasterchainInfoExtModeZero(t *testing.T) {
 				StateRootHash: stateRoot,
 			},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(block): {
 				ID:            block,
 				StateRootHash: stateRoot,
@@ -70,7 +70,7 @@ func TestHandleMasterchainInfoExtModeZero(t *testing.T) {
 	}
 }
 
-func TestHandleMasterchainInfoExtEchoesHighBitAndRejectsOtherModes(t *testing.T) {
+func TestHandleMasterchainInfoExtSupportsShardClientStateMode(t *testing.T) {
 	block := testBlockID(t, 10, cell.BeginCell().MustStoreUInt(1, 8).EndCell())
 	stateRoot := bytes.Repeat([]byte{0x22}, 32)
 	store := &fakeStore{
@@ -89,7 +89,20 @@ func TestHandleMasterchainInfoExtEchoesHighBitAndRejectsOtherModes(t *testing.T)
 		t.Fatalf("mode = %d, want echoed high-bit mode", info.Mode)
 	}
 
-	errResp, ok := srv.handleQuery(context.Background(), ton.GetMasterchainInfoExt{Mode: 1}).(ton.LSError)
+	resp = srv.handleQuery(context.Background(), ton.GetMasterchainInfoExt{Mode: getMasterchainInfoExtShardClientState})
+	info, ok = resp.(ton.MasterchainInfoExt)
+	if !ok {
+		t.Fatalf("shard-client mode response type = %T, want ton.MasterchainInfoExt", resp)
+	}
+	if info.Mode != getMasterchainInfoExtShardClientState {
+		t.Fatalf("mode = %d, want shard-client state mode", info.Mode)
+	}
+	if info.Last == nil || !blockIDEqual(*info.Last, block) {
+		t.Fatalf("unexpected shard-client last block: %+v", info.Last)
+	}
+
+	resp = srv.handleQuery(context.Background(), ton.GetMasterchainInfoExt{Mode: 2})
+	errResp, ok := resp.(ton.LSError)
 	if !ok {
 		t.Fatalf("unsupported mode response type = %T, want ton.LSError", resp)
 	}
@@ -130,7 +143,7 @@ func TestHandleGetBlockDataReturnsStoredPayload(t *testing.T) {
 	id := testBlockID(t, 3, cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell())
 	payload := []byte{0xde, 0xad, 0xbe, 0xef}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): payload,
 		},
 	}
@@ -168,10 +181,10 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 		current: &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(block): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(block): {Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -216,6 +229,72 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 	}
 }
 
+func TestHandleSendMessageWithLiveStoreCachesBlockFragments(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x41}, 32)
+	addr := address.NewAddress(0, 0xff, accountID)
+	code := testCodeFromBuilders(t,
+		stackop.DROP().Serialize(),
+		stackop.DROP().Serialize(),
+		stackop.DROP().Serialize(),
+		stackop.DROP().Serialize(),
+		stackop.DROP().Serialize(),
+		funcsop.ACCEPT().Serialize(),
+	)
+	data := cell.BeginCell().EndCell()
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 4}
+	stateRoot, _ := testMasterStateWithActiveAccount(t, base, accountID, code, data)
+	block, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	blockState := storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot}
+	backing := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(block): testBlockBOC(blockRoot),
+		},
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(block): &blockState,
+		},
+	}
+	live := NewLiveStore(backing)
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     block,
+		Root:      blockRoot,
+		BlockData: testBlockBOC(blockRoot),
+		State:     &blockState,
+	}); err != nil {
+		t.Fatalf("publish live block artifacts: %v", err)
+	}
+	live.SetLiveCurrentState(&storage.CurrentState{Masterchain: blockState})
+
+	sender := &fakeMessageSender{}
+	srv := testServer(live)
+	srv.messageSender = sender
+
+	for i := 0; i < 2; i++ {
+		msg, err := tlb.ToCell(&tlb.ExternalMessage{
+			DstAddr: addr,
+			Body:    cell.BeginCell().MustStoreUInt(uint64(i), 8).EndCell(),
+		})
+		if err != nil {
+			t.Fatalf("build external message %d: %v", i, err)
+		}
+
+		resp := srv.handleQuery(context.Background(), ton.SendMessage{Body: msg.ToBOC()})
+		status, ok := resp.(ton.SendMessageStatus)
+		if !ok {
+			t.Fatalf("response %d type = %T, want ton.SendMessageStatus: %+v", i, resp, resp)
+		}
+		if status.Status != 1 {
+			t.Fatalf("status %d = %d, want 1", i, status.Status)
+		}
+	}
+
+	if sender.count != 2 {
+		t.Fatalf("send count = %d, want 2", sender.count)
+	}
+	if backing.loadStateCalls != 0 {
+		t.Fatalf("backing state loads = %d, want 0", backing.loadStateCalls)
+	}
+}
+
 func TestHandleSendMessageRejectsUnacceptedExternalMessage(t *testing.T) {
 	accountID := bytes.Repeat([]byte{0x12}, 32)
 	addr := address.NewAddress(0, 0xff, accountID)
@@ -233,10 +312,10 @@ func TestHandleSendMessageRejectsUnacceptedExternalMessage(t *testing.T) {
 		current: &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(block): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(block): {Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -515,7 +594,7 @@ func TestLiveStoreZeroStateReadsStorage(t *testing.T) {
 	}
 	data := []byte{0xde, 0xad}
 	live := NewLiveStore(&fakeStore{
-		zeroStates: map[string][]byte{
+		zeroStates: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): data,
 		},
 	})
@@ -622,14 +701,14 @@ func TestLiveStoreStoredCurrentRequiresReadableBlocks(t *testing.T) {
 		t.Fatalf("current state before block data = %v, want ErrNotFound", err)
 	}
 
-	store.blocks = map[string][]byte{
+	store.blocks = map[storage.BlockRootHash][]byte{
 		storage.BlockKey(current.Masterchain.Block): data,
 	}
 	if _, err := live.CurrentState(context.Background()); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("current state before state cells = %v, want ErrNotFound", err)
 	}
 
-	store.blockStates = map[string]*storage.BlockState{
+	store.blockStates = map[storage.BlockRootHash]*storage.BlockState{
 		storage.BlockKey(current.Masterchain.Block): {
 			Block:         current.Masterchain.Block,
 			StateRootHash: stateRoot.Hash(0),
@@ -665,10 +744,10 @@ func TestLiveStoreWaitIgnoresStoredCurrentWithoutReadableBlocks(t *testing.T) {
 		t.Fatalf("wait before block data = %v, want timeout", err)
 	}
 
-	store.blocks = map[string][]byte{
+	store.blocks = map[storage.BlockRootHash][]byte{
 		storage.BlockKey(current.Masterchain.Block): data,
 	}
-	store.blockStates = map[string]*storage.BlockState{
+	store.blockStates = map[storage.BlockRootHash]*storage.BlockState{
 		storage.BlockKey(current.Masterchain.Block): {
 			Block:         current.Masterchain.Block,
 			StateRootHash: stateRoot.Hash(0),
@@ -986,15 +1065,15 @@ func TestLiveStorePublishedArtifactsAreAuthoritative(t *testing.T) {
 	id = testBlockIDForData(masterchainID, masterchainShard, id.SeqNo, blockRoot, blockData)
 	proofData := []byte("live proof")
 	store := &fakeStore{
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(id): {
 				ID:       id,
 				GenUTime: 99,
 				Flags:    storage.BlockMetaHasProofKeyBlock,
 			},
 		},
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlock, id): []byte("stored proof"),
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlock, id): []byte("stored proof"),
 		},
 	}
 	live := NewLiveStore(store)
@@ -1059,7 +1138,7 @@ func TestLiveStoreDoesNotReadFutureMasterBlockFromBacking(t *testing.T) {
 	futureID = testBlockIDForData(masterchainID, masterchainShard, futureID.SeqNo, futureBlockRoot, futureData)
 
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(futureID): futureData,
 		},
 	}
@@ -1235,7 +1314,7 @@ func TestLiveStoreBlockRootAcceptsTrustedStoredRootWithMode31BOC(t *testing.T) {
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 18, stateRoot)
 	data := testBlockBOC(blockRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): data,
 		},
 	}
@@ -1264,7 +1343,7 @@ func TestLiveStoreBlockDataDeduplicatesColdMiss(t *testing.T) {
 	data := testBlockBOC(blockRoot)
 	store := &blockingBlockDataStore{
 		fakeStore: fakeStore{
-			blocks: map[string][]byte{
+			blocks: map[storage.BlockRootHash][]byte{
 				storage.BlockKey(id): data,
 			},
 		},
@@ -1312,7 +1391,7 @@ func TestLookupBlockBySeqnoReturnsBlockHeader(t *testing.T) {
 	stateRoot := cell.BeginCell().MustStoreUInt(0xbb, 8).EndCell()
 	id, root := testBlockForState(t, masterchainID, masterchainShard, 7, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 		seqLookup: id,
@@ -1348,7 +1427,7 @@ func TestLookupBlockBySeqnoReturnsBlockHeader(t *testing.T) {
 func TestGetBlockHeaderMode16IncludesBlockExtraLikeCpp(t *testing.T) {
 	id, root := testMasterBlockWithShardHashes(t, 12, cell.NewDict(32))
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 	}
@@ -1458,10 +1537,10 @@ func TestGetShardBlockProofBuildsMasterToShardLink(t *testing.T) {
 	shard, _ := testBlockForState(t, 0, masterchainShard, 15, shardState)
 	master, masterRoot := testMasterBlockWithShardHashes(t, 16, testShardHashes(t, shard))
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(master): testBlockBOC(masterRoot),
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(shard): {ID: shard, MasterchainRef: cloneBlockID(master)},
 		},
 	}
@@ -1596,18 +1675,18 @@ func TestGetBlockProofForwardDestProofUsesVirtualizedStoredProofRoot(t *testing.
 	targetProof := testBlockStateRootProofEnvelopeBOC(t, targetID, targetRoot, testBlockProofSignatures(t))
 
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(keyID):    testBlockBOC(keyRoot),
 			storage.BlockKey(targetID): testBlockBOC(targetRoot),
 		},
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
-			fakeProofKey(storage.ServedProofBlock, targetID): targetProof,
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
+			fakeProofKeyForBlock(storage.ServedProofBlock, targetID): targetProof,
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(targetID): {Block: targetID, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock},
 			storage.BlockKey(targetID): {ID: targetID, StateRootHash: stateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
 		},
@@ -1679,21 +1758,21 @@ func TestGetBlockProofBackToKeyThenForwardIncludesSignatures(t *testing.T) {
 	targetID, targetRoot := testMasterBlockForStateWithPrevKey(t, 7, 5, false, targetStateRoot, nil)
 
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(keyID):    testBlockBOC(keyRoot),
 			storage.BlockKey(knownID):  testBlockBOC(knownRoot),
 			storage.BlockKey(targetID): testBlockBOC(targetRoot),
 		},
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
-			fakeProofKey(storage.ServedProofBlock, knownID):  testBlockProofEnvelopeBOC(t, knownID, knownRoot, testBlockProofSignatures(t)),
-			fakeProofKey(storage.ServedProofBlock, targetID): testBlockProofEnvelopeBOC(t, targetID, targetRoot, testBlockProofSignatures(t)),
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
+			fakeProofKeyForBlock(storage.ServedProofBlock, knownID):  testBlockProofEnvelopeBOC(t, knownID, knownRoot, testBlockProofSignatures(t)),
+			fakeProofKeyForBlock(storage.ServedProofBlock, targetID): testBlockProofEnvelopeBOC(t, targetID, targetRoot, testBlockProofSignatures(t)),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(knownID):  {Block: knownID, StateRootHash: knownStateRoot.Hash(0), Cell: knownStateRoot},
 			storage.BlockKey(targetID): {Block: targetID, StateRootHash: targetStateRoot.Hash(0), Cell: targetStateRoot},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock},
 			storage.BlockKey(knownID):  {ID: knownID, StateRootHash: knownStateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
 			storage.BlockKey(targetID): {ID: targetID, StateRootHash: targetStateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
@@ -1737,10 +1816,10 @@ func TestStoredMasterProofExportsKeyBlockLinkFromFullProof(t *testing.T) {
 	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 10, 10, true, stateRoot, custom)
 	fullProof := testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t))
 	store := &fakeStore{
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlock, keyID): fullProof,
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlock, keyID): fullProof,
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID): {
 				ID:    keyID,
 				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock,
@@ -1788,10 +1867,10 @@ func TestStoredMasterProofUsesStoredLinkWhenFullProofIsAbsent(t *testing.T) {
 	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 10, 10, true, stateRoot, custom)
 	linkProof := testBlockProofEnvelopeBOC(t, keyID, keyRoot, nil)
 	store := &fakeStore{
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): linkProof,
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlockLink, keyID): linkProof,
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID): {
 				ID:    keyID,
 				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlockLink,
@@ -1823,10 +1902,10 @@ func TestStoredMasterProofAcceptsStoredMasterLinkWithSignatures(t *testing.T) {
 	keyID, keyRoot := testMasterBlockForStateWithPrevKey(t, 10, 10, true, stateRoot, custom)
 	linkProof := testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t))
 	store := &fakeStore{
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlockLink, keyID): linkProof,
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlockLink, keyID): linkProof,
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID): {
 				ID:    keyID,
 				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlockLink,
@@ -1855,10 +1934,10 @@ func TestStoredMasterProofDoesNotFallbackFromKeyBlockToOrdinaryProof(t *testing.
 		FileHash:  bytes.Repeat([]byte{0x11}, 32),
 	}
 	store := &fakeStore{
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofBlock, keyID): {0x01},
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofBlock, keyID): {0x01},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID): {
 				ID:    keyID,
 				Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofBlock,
@@ -1911,13 +1990,13 @@ func TestGetBlockProofModeTargets(t *testing.T) {
 		current: &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(id): {ID: id, StateRootHash: stateRoot.Hash(0)},
 		},
 	}
@@ -1946,11 +2025,11 @@ func TestLookupBlockWithProofBuildsShardLinks(t *testing.T) {
 	shard, shardRoot := testBlockForState(t, 0, masterchainShard, 21, shardState)
 	master, masterRoot := testMasterBlockWithShardHashes(t, 22, testShardHashes(t, shard))
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(master): testBlockBOC(masterRoot),
 			storage.BlockKey(shard):  testBlockBOC(shardRoot),
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(shard): {ID: shard, MasterchainRef: cloneBlockID(master)},
 		},
 		seqLookup: shard,
@@ -1996,12 +2075,12 @@ func TestLookupBlockWithProofIncludesPrevHeaderForLTLookup(t *testing.T) {
 	master, masterRoot := testMasterBlockWithShardHashes(t, 22, testShardHashes(t, shard))
 	key := storage.BlockHistoryKey{Workchain: shard.Workchain, Shard: shard.Shard}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(master): testBlockBOC(masterRoot),
 			storage.BlockKey(prev):   testBlockBOC(prevRoot),
 			storage.BlockKey(shard):  testBlockBOC(shardRoot),
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(shard): {ID: shard, MasterchainRef: cloneBlockID(master), PrevRefs: []ton.BlockIDExt{prev}},
 		},
 		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
@@ -2037,10 +2116,10 @@ func TestAccountStateReturnsAccountCellAndProofRoots(t *testing.T) {
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 9, stateRoot)
 
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {
 				Block:         id,
 				StateRootHash: stateRoot.Hash(0),
@@ -2092,11 +2171,11 @@ func TestAccountStateWithMasterReferenceResolvesBasechainShard(t *testing.T) {
 	masterBlock, masterRoot := testBlockForState(t, masterchainID, masterchainShard, 16, masterStateRoot)
 
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(masterBlock): testBlockBOC(masterRoot),
 			storage.BlockKey(shardBlock):  testBlockBOC(shardRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(masterBlock): {Block: masterBlock, StateRootHash: masterStateRoot.Hash(0), Cell: masterStateRoot},
 			storage.BlockKey(shardBlock):  {Block: shardBlock, StateRootHash: shardStateRoot.Hash(0), Cell: shardStateRoot},
 		},
@@ -2135,11 +2214,11 @@ func TestAccountStateWithLiveStoreCachesBlockFragments(t *testing.T) {
 	masterBlock, masterRoot := testBlockForState(t, masterchainID, masterchainShard, 16, masterStateRoot)
 
 	backing := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(masterBlock): testBlockBOC(masterRoot),
 			storage.BlockKey(shardBlock):  testBlockBOC(shardRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(masterBlock): {Block: masterBlock, StateRootHash: masterStateRoot.Hash(0), Cell: masterStateRoot},
 			storage.BlockKey(shardBlock):  {Block: shardBlock, StateRootHash: shardStateRoot.Hash(0), Cell: shardStateRoot},
 		},
@@ -2187,11 +2266,11 @@ func TestAccountStateUsesLocalShardAliasWithSameHash(t *testing.T) {
 				storage.ShardKeyFromBlock(localShard): {Block: localShard, StateRootHash: shardStateRoot.Hash(0), Cell: shardStateRoot},
 			},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(masterBlock): testBlockBOC(masterRoot),
 			storage.BlockKey(shardBlock):  testBlockBOC(shardRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(masterBlock): {Block: masterBlock, StateRootHash: masterStateRoot.Hash(0), Cell: masterStateRoot},
 			storage.BlockKey(shardBlock):  {Block: shardBlock, StateRootHash: shardStateRoot.Hash(0), Cell: shardStateRoot},
 		},
@@ -2234,10 +2313,10 @@ func TestRunSmcMethodExecutesGetMethodAndReturnsProofs(t *testing.T) {
 		t.Fatalf("build params stack: %v", err)
 	}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2315,10 +2394,10 @@ func TestRunSmcMethodWithLiveStoreCachesBlockFragments(t *testing.T) {
 		t.Fatalf("build params stack: %v", err)
 	}
 	backing := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2344,6 +2423,42 @@ func TestRunSmcMethodWithLiveStoreCachesBlockFragments(t *testing.T) {
 
 	if backing.loadStateCalls != 1 {
 		t.Fatalf("state loads = %d, want 1", backing.loadStateCalls)
+	}
+}
+
+func TestLiveBlockFragmentsCachesAccountProof(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x39}, 32)
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 12}
+	code := testCodeFromBuilders(t,
+		stackop.POP(0).Serialize(),
+		stackop.PUSHINT(big.NewInt(9)).Serialize(),
+		execop.RET().Serialize(),
+	)
+	stateRoot, _ := testMasterStateWithActiveAccount(t, base, accountID, code, cell.BeginCell().EndCell())
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+
+	fragments, err := buildLiveBlockFragments(id, blockRoot, stateRoot)
+	if err != nil {
+		t.Fatalf("build fragments: %v", err)
+	}
+
+	proof, state, err := fragments.accountProof(accountID, false)
+	if err != nil {
+		t.Fatalf("first account proof: %v", err)
+	}
+	cachedProof, cachedState, err := fragments.accountProof(accountID, false)
+	if err != nil {
+		t.Fatalf("cached account proof: %v", err)
+	}
+
+	if len(proof) != 2 || len(cachedProof) != 2 {
+		t.Fatalf("proof lengths = %d/%d, want 2/2", len(proof), len(cachedProof))
+	}
+	if proof[1] != cachedProof[1] {
+		t.Fatal("account proof was rebuilt instead of reused")
+	}
+	if state != cachedState {
+		t.Fatal("account state cell was rebuilt instead of reused")
 	}
 }
 
@@ -2412,10 +2527,10 @@ func TestRunSmcMethodExecutesLibraryReferenceCode(t *testing.T) {
 		t.Fatalf("build params stack: %v", err)
 	}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2449,6 +2564,69 @@ func TestRunSmcMethodExecutesLibraryReferenceCode(t *testing.T) {
 	}
 }
 
+func TestRunSmcMethodExecutesAccountLibraryReferenceCodeWithoutProof(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x3a}, 32)
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 16}
+	code := testCodeFromBuilders(t,
+		stackop.POP(0).Serialize(),
+		stackop.PUSHINT(big.NewInt(13)).Serialize(),
+		execop.RET().Serialize(),
+	)
+	codeRef, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.LibraryCellType), 8).
+		MustStoreSlice(code.Hash(), 256).
+		EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("build library code ref: %v", err)
+	}
+
+	stateRoot, _ := testMasterStateWithActiveAccountStateLibraries(t, base, accountID, codeRef, cell.BeginCell().EndCell(), []*cell.Cell{code})
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	paramsCell, err := tlb.NewStack().ToCell()
+	if err != nil {
+		t.Fatalf("build params stack: %v", err)
+	}
+	store := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+	}
+
+	resp := testServer(store).handleQuery(context.Background(), ton.RunSmcMethod{
+		Mode:     4,
+		ID:       cloneBlockID(id),
+		Account:  ton.AccountID{Workchain: masterchainID, ID: accountID},
+		MethodID: tlb.MethodNameHash("answer"),
+		Params:   paramsCell,
+	})
+
+	result, ok := resp.(ton.RunMethodResult)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.RunMethodResult: %+v", resp, resp)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code = %d, want 0", result.ExitCode)
+	}
+	if result.StateProof != nil {
+		t.Fatal("state proof should not be built when mode.1 is not requested")
+	}
+	var stack tlb.Stack
+	if err = stack.LoadFromCell(result.Result.MustBeginParse()); err != nil {
+		t.Fatalf("load result stack: %v", err)
+	}
+	value, err := stack.Pop()
+	if err != nil {
+		t.Fatalf("pop result: %v", err)
+	}
+	intValue, ok := value.(*big.Int)
+	if !ok || intValue.Int64() != 13 {
+		t.Fatalf("result value = %#v, want 13", value)
+	}
+}
+
 func TestRunSmcMethodReturnsContractNotInitializedForMissingAccount(t *testing.T) {
 	accountID := bytes.Repeat([]byte{0x36}, 32)
 	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 11}
@@ -2460,10 +2638,10 @@ func TestRunSmcMethodReturnsContractNotInitializedForMissingAccount(t *testing.T
 		t.Fatalf("build params stack: %v", err)
 	}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2617,13 +2795,13 @@ func TestLoadStateRootUsesStateHashFromMeta(t *testing.T) {
 		current: &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: id, StateRootHash: wrongState.Hash(0), Cell: wrongState},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(id): {ID: id, StateRootHash: stateRoot.Hash(0)},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: wrongState.Hash(0), Cell: wrongState},
 		},
 		stateRoots: map[string]*cell.Cell{
@@ -2649,10 +2827,10 @@ func TestLoadStateRootWithBlockRootRejectsMetaMismatch(t *testing.T) {
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 20, stateRoot)
 	wrongState := cell.BeginCell().MustStoreUInt(0xff, 8).EndCell()
 	store := &fakeStore{
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(id): {ID: id, StateRootHash: wrongState.Hash(0)},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
 		stateRoots: map[string]*cell.Cell{
@@ -2671,10 +2849,10 @@ func TestHandleGetStateReturnsSerializedState(t *testing.T) {
 	stateRoot := cell.BeginCell().MustStoreUInt(0xee, 8).EndCell()
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 5, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {
 				Block:         id,
 				StateRootHash: stateRoot.Hash(0),
@@ -2724,7 +2902,7 @@ func TestHandleStateReturnsOriginalZeroStateBytes(t *testing.T) {
 	}
 	data := []byte{0xaa, 0xbb, 0xcc}
 	store := &fakeStore{
-		zeroStates: map[string][]byte{
+		zeroStates: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): data,
 		},
 	}
@@ -2749,10 +2927,10 @@ func TestHandleStateZeroStateDoesNotFallbackToBlockState(t *testing.T) {
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 0, stateRoot)
 	id.FileHash = bytes.Repeat([]byte{0x01}, 32)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {
 				Block:         id,
 				StateRootHash: stateRoot.Hash(0),
@@ -2782,10 +2960,10 @@ func TestHandleConfigParamsReturnsTwoProofRoots(t *testing.T) {
 	})
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2819,10 +2997,10 @@ func TestHandleConfigParamsModeIncludesCapabilitiesParam(t *testing.T) {
 	})
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2851,10 +3029,10 @@ func TestHandleConfigParamsStateInfoFlagsNeedConfigInfoPath(t *testing.T) {
 	stateRoot := testMasterStateWithConfig(t, base, map[int32]*cell.Cell{15: param})
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2884,10 +3062,10 @@ func TestHandleConfigParamsStateInfoFlagsIncludeRequestedStateRoots(t *testing.T
 	stateRoot, _ := testMasterStateWithActiveAccountAndLibraries(t, base, accountID, cell.BeginCell().EndCell(), cell.BeginCell().EndCell(), []*cell.Cell{lib})
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2948,10 +3126,10 @@ func TestHandleConfigParamsNeedPrevBlocksAddsCapabilitiesAndProof(t *testing.T) 
 	})
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -2988,7 +3166,7 @@ func TestHandleConfigParamsPreviousKeyBlockMode(t *testing.T) {
 	keyID, keyRoot := testKeyBlockWithConfig(t, 5, map[int32]*cell.Cell{42: keyParam})
 	blockID, blockRoot := testMasterBlockWithPrevKey(t, 9, 5)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(keyID):   testBlockBOC(keyRoot),
 			storage.BlockKey(blockID): testBlockBOC(blockRoot),
 		},
@@ -3025,7 +3203,7 @@ func TestHandleConfigParamsPreviousKeyBlockDoesNotAddCapabilities(t *testing.T) 
 	keyID, keyRoot := testKeyBlockWithConfig(t, 6, map[int32]*cell.Cell{51: keyParam})
 	blockID, blockRoot := testMasterBlockWithPrevKey(t, 10, 6)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(keyID):   testBlockBOC(keyRoot),
 			storage.BlockKey(blockID): testBlockBOC(blockRoot),
 		},
@@ -3064,10 +3242,10 @@ func TestHandleGetShardInfoReturnsDescriptorFromMasterState(t *testing.T) {
 	stateRoot := testMasterStateWithShardHashes(t, masterBase, shardHashes)
 	master, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 13, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(master): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(master): {Block: master, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -3153,10 +3331,10 @@ func TestHandleGetLibrariesSortsDedupsAndLimits(t *testing.T) {
 		current: &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(block): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(block): {Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -3183,10 +3361,10 @@ func TestHandleGetLibrariesWithProofModeTwoOmitsLibraryData(t *testing.T) {
 	stateRoot := testMasterStateWithLibraries(t, base, []*cell.Cell{lib})
 	block, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 8, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(block): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(block): {Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -3225,7 +3403,7 @@ func TestListBlockTransactionsAndGetOneTransaction(t *testing.T) {
 	})
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 	}
@@ -3328,7 +3506,7 @@ func TestGetTransactionsTraversesPreviousChain(t *testing.T) {
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
@@ -3365,6 +3543,77 @@ func TestGetTransactionsTraversesPreviousChain(t *testing.T) {
 	}
 }
 
+func TestGetTransactionsUsesShardHintForPreviousBlock(t *testing.T) {
+	account := bytes.Repeat([]byte{0x5d}, 32)
+	oldTx := testTransactionWithPrev(t, account, 10, 0, bytes.Repeat([]byte{0x00}, 32))
+	newTx := testTransactionWithPrev(t, account, 20, 10, oldTx.Hash())
+	oldRoot := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+		10: oldTx,
+	})
+	newRoot := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+		20: newTx,
+	})
+	oldID := testBlockIDForRoot(0, masterchainShard, 1, oldRoot)
+	newID := testBlockIDForRoot(0, masterchainShard, 2, newRoot)
+	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
+	store := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(oldID): testBlockBOC(oldRoot),
+			storage.BlockKey(newID): testBlockBOC(newRoot),
+		},
+		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
+			fakeLTKey(key, 10): oldID,
+			fakeLTKey(key, 20): newID,
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetTransactions{
+		Limit:  2,
+		AccID:  &ton.AccountID{Workchain: 0, ID: account},
+		LT:     20,
+		TxHash: newTx.Hash(),
+	})
+	list, ok := resp.(ton.TransactionList)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.TransactionList: %+v", resp, resp)
+	}
+	if len(list.IDs) != 2 || !list.IDs[0].Equals(&newID) || !list.IDs[1].Equals(&oldID) {
+		t.Fatalf("unexpected transaction block ids: %+v", list.IDs)
+	}
+	roots, err := cell.FromBOCMultiRoot(list.Transactions)
+	if err != nil {
+		t.Fatalf("parse transaction list boc: %v", err)
+	}
+	if len(roots) != 2 || roots[0].HashKey() != newTx.HashKey() || roots[1].HashKey() != oldTx.HashKey() {
+		t.Fatalf("unexpected transaction roots order")
+	}
+	if store.accountLTLookupCalls != 1 {
+		t.Fatalf("account lt lookup calls = %d, want 1", store.accountLTLookupCalls)
+	}
+	if store.ltLookupCalls != 1 {
+		t.Fatalf("plain lt lookup calls = %d, want 1", store.ltLookupCalls)
+	}
+}
+
+func TestGetTransactionsCurrentBlockSkipsOutOfHeaderRange(t *testing.T) {
+	account := bytes.Repeat([]byte{0x5e}, 32)
+	block := &transactionSearchBlock{
+		id:      ton.BlockIDExt{Workchain: 0, Shard: masterchainShard},
+		root:    cell.BeginCell().EndCell(),
+		startLT: 20,
+		endLT:   30,
+	}
+
+	tx, gotBlock, err := accountTransactionFromCurrentBlock(block, 0, account, 10)
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound", err)
+	}
+	if tx != nil || gotBlock != nil {
+		t.Fatalf("transaction/current block = %v/%v, want nil/nil", tx, gotBlock)
+	}
+}
+
 func TestGetTransactionsMissingFirstReturnsError(t *testing.T) {
 	account := bytes.Repeat([]byte{0x56}, 32)
 	tx := testTransactionWithPrev(t, account, 30, 0, bytes.Repeat([]byte{0x00}, 32))
@@ -3374,7 +3623,7 @@ func TestGetTransactionsMissingFirstReturnsError(t *testing.T) {
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
@@ -3427,7 +3676,7 @@ func TestGetTransactionsReturnsPartialAfterChainGap(t *testing.T) {
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
@@ -3465,7 +3714,7 @@ func TestGetTransactionsRejectsHashMismatch(t *testing.T) {
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
@@ -3498,7 +3747,7 @@ func TestGetTransactionsCapsLimitAtSixteen(t *testing.T) {
 	prevLT := uint64(0)
 	prevHash := zeroHash
 	for i := 1; i <= 17; i++ {
-		lt := uint64(i * 10)
+		lt := uint64(i * 5)
 		tx := testTransactionWithPrev(t, account, lt, prevLT, prevHash)
 		txs[lt] = tx
 		newestLT = lt
@@ -3510,7 +3759,7 @@ func TestGetTransactionsCapsLimitAtSixteen(t *testing.T) {
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
@@ -3536,7 +3785,7 @@ func TestGetTransactionsCapsLimitAtSixteen(t *testing.T) {
 	if len(roots) != maxGetTransactions || len(list.IDs) != maxGetTransactions {
 		t.Fatalf("returned %d roots and %d ids, want %d", len(roots), len(list.IDs), maxGetTransactions)
 	}
-	if roots[0].HashKey() != newestTx.HashKey() || roots[len(roots)-1].HashKey() != txs[20].HashKey() {
+	if roots[0].HashKey() != newestTx.HashKey() || roots[len(roots)-1].HashKey() != txs[10].HashKey() {
 		t.Fatalf("unexpected capped transaction roots")
 	}
 }
@@ -3571,7 +3820,7 @@ func TestListBlockTransactionsMode256ReturnsTransactionMetadata(t *testing.T) {
 	}, inMsgDesc)
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(root),
 		},
 	}
@@ -3749,10 +3998,10 @@ func TestHandleBlockOutMsgQueueSize(t *testing.T) {
 	stateRoot := testShardStateWithOutMsgQueueSize(t, base, 12345)
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 12, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -3798,10 +4047,10 @@ func TestHandleDispatchQueueInfoEmptyQueue(t *testing.T) {
 	stateRoot := testShardStateWithOutMsgQueueSize(t, base, 0)
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 13, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -3833,10 +4082,10 @@ func TestHandleDispatchQueueMessagesEmptyQueueWithBOC(t *testing.T) {
 	stateRoot := testShardStateWithOutMsgQueueSize(t, base, 0)
 	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, 14, stateRoot)
 	store := &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(id): testBlockBOC(blockRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
 	}
@@ -3877,11 +4126,11 @@ func TestHandleOutMsgQueueSizesUsesCurrentMasterAndShardStates(t *testing.T) {
 				storage.ShardKeyFromBlock(shard): {Block: shard, StateRootHash: shardState.Hash(0), Cell: shardState},
 			},
 		},
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(master): testBlockBOC(masterRoot),
 			storage.BlockKey(shard):  testBlockBOC(shardRoot),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(master): {Block: master, StateRootHash: masterState.Hash(0), Cell: masterState},
 			storage.BlockKey(shard):  {Block: shard, StateRootHash: shardState.Hash(0), Cell: shardState},
 		},
@@ -4270,6 +4519,14 @@ func testMasterStateWithActiveAccount(t *testing.T, block ton.BlockIDExt, accoun
 }
 
 func testMasterStateWithActiveAccountAndLibraries(t *testing.T, block ton.BlockIDExt, accountID []byte, code, data *cell.Cell, libs []*cell.Cell) (*cell.Cell, *cell.Cell) {
+	return testMasterStateWithActiveAccountLibrarySets(t, block, accountID, code, data, libs, nil)
+}
+
+func testMasterStateWithActiveAccountStateLibraries(t *testing.T, block ton.BlockIDExt, accountID []byte, code, data *cell.Cell, libs []*cell.Cell) (*cell.Cell, *cell.Cell) {
+	return testMasterStateWithActiveAccountLibrarySets(t, block, accountID, code, data, nil, libs)
+}
+
+func testMasterStateWithActiveAccountLibrarySets(t *testing.T, block ton.BlockIDExt, accountID []byte, code, data *cell.Cell, globalLibs []*cell.Cell, accountLibs []*cell.Cell) (*cell.Cell, *cell.Cell) {
 	t.Helper()
 
 	accounts, err := cell.NewAugDict(256, testShardAccountsAugmentation{})
@@ -4277,7 +4534,7 @@ func testMasterStateWithActiveAccountAndLibraries(t *testing.T, block ton.BlockI
 		t.Fatalf("create accounts dict: %v", err)
 	}
 
-	account := testActiveAccountCell(t, block.Workchain, accountID, code, data)
+	account := testActiveAccountCellWithStateLibraries(t, block.Workchain, accountID, code, data, accountLibs)
 	shardAccount, err := tlb.ToCell(&tlb.ShardAccount{
 		Account:       account,
 		LastTransHash: bytes.Repeat([]byte{0x44}, 32),
@@ -4318,7 +4575,7 @@ func testMasterStateWithActiveAccountAndLibraries(t *testing.T, block ton.BlockI
 		t.Fatalf("currency collection: %v", err)
 	}
 	libDict := cell.NewDict(256)
-	for _, lib := range libs {
+	for _, lib := range globalLibs {
 		descr := cell.BeginCell().MustStoreUInt(0, 2).MustStoreRef(lib).EndCell()
 		if err = libDict.Set(accountKey(lib.Hash()), descr); err != nil {
 			t.Fatalf("set library: %v", err)
@@ -4357,7 +4614,19 @@ func testMasterStateWithActiveAccountAndLibraries(t *testing.T, block ton.BlockI
 }
 
 func testActiveAccountCell(t *testing.T, workchain int32, accountID []byte, code, data *cell.Cell) *cell.Cell {
+	return testActiveAccountCellWithStateLibraries(t, workchain, accountID, code, data, nil)
+}
+
+func testActiveAccountCellWithStateLibraries(t *testing.T, workchain int32, accountID []byte, code, data *cell.Cell, libs []*cell.Cell) *cell.Cell {
 	t.Helper()
+
+	libDict := cell.NewDict(256)
+	for _, lib := range libs {
+		descr := cell.BeginCell().MustStoreUInt(0, 2).MustStoreRef(lib).EndCell()
+		if err := libDict.Set(accountKey(lib.Hash()), descr); err != nil {
+			t.Fatalf("set account library: %v", err)
+		}
+	}
 
 	account := tlb.AccountState{
 		IsValid: true,
@@ -4376,7 +4645,7 @@ func testActiveAccountCell(t *testing.T, workchain int32, accountID []byte, code
 			StateInit: &tlb.StateInit{
 				Code: code,
 				Data: data,
-				Lib:  cell.NewDict(256),
+				Lib:  libDict,
 			},
 		},
 	}
@@ -5517,12 +5786,12 @@ func testAugDictRootCell(t *testing.T, dict *cell.AugmentedDictionary) *cell.Cel
 
 type fakeStore struct {
 	current     *storage.CurrentState
-	metas       map[string]*storage.BlockMeta
-	blocks      map[string][]byte
-	proofs      map[string][]byte
-	blockStates map[string]*storage.BlockState
+	metas       map[storage.BlockRootHash]*storage.BlockMeta
+	blocks      map[storage.BlockRootHash][]byte
+	proofs      map[fakeProofKey][]byte
+	blockStates map[storage.BlockRootHash]*storage.BlockState
 	stateRoots  map[string]*cell.Cell
-	zeroStates  map[string][]byte
+	zeroStates  map[storage.BlockRootHash][]byte
 	ltLookup    map[fakeLTLookupKey]ton.BlockIDExt
 
 	seqLookup            ton.BlockIDExt
@@ -5637,15 +5906,20 @@ func (s *fakeStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, 
 
 func (s *fakeStore) BlockProof(_ context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
 	s.proofCalls = append(s.proofCalls, kind)
-	data, ok := s.proofs[fakeProofKey(kind, block)]
+	data, ok := s.proofs[fakeProofKeyForBlock(kind, block)]
 	if !ok {
 		return nil, storage.ErrNotFound
 	}
 	return append([]byte(nil), data...), nil
 }
 
-func fakeProofKey(kind storage.ServedProofKind, block ton.BlockIDExt) string {
-	return string(kind) + ":" + storage.BlockKey(block)
+type fakeProofKey struct {
+	kind  storage.ServedProofKind
+	block storage.BlockRootHash
+}
+
+func fakeProofKeyForBlock(kind storage.ServedProofKind, block ton.BlockIDExt) fakeProofKey {
+	return fakeProofKey{kind: kind, block: storage.BlockKey(block)}
 }
 
 type testBlockIDExtTLB struct {
@@ -5666,18 +5940,18 @@ func testBlockProofStore(t *testing.T, keyID ton.BlockIDExt, keyRoot *cell.Cell,
 	t.Helper()
 
 	return &fakeStore{
-		blocks: map[string][]byte{
+		blocks: map[storage.BlockRootHash][]byte{
 			storage.BlockKey(keyID):    testBlockBOC(keyRoot),
 			storage.BlockKey(targetID): testBlockBOC(targetRoot),
 		},
-		proofs: map[string][]byte{
-			fakeProofKey(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
-			fakeProofKey(storage.ServedProofBlock, targetID): testBlockProofEnvelopeBOC(t, targetID, targetRoot, signatures),
+		proofs: map[fakeProofKey][]byte{
+			fakeProofKeyForBlock(storage.ServedProofKeyBlock, keyID): testBlockProofEnvelopeBOC(t, keyID, keyRoot, testBlockProofSignatures(t)),
+			fakeProofKeyForBlock(storage.ServedProofBlock, targetID): testBlockProofEnvelopeBOC(t, targetID, targetRoot, signatures),
 		},
-		blockStates: map[string]*storage.BlockState{
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(targetID): {Block: targetID, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
 		},
-		metas: map[string]*storage.BlockMeta{
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(keyID):    {ID: keyID, Flags: storage.BlockMetaIsKeyBlock | storage.BlockMetaHasProofKeyBlock},
 			storage.BlockKey(targetID): {ID: targetID, StateRootHash: stateRoot.Hash(0), Flags: storage.BlockMetaHasProofBlock},
 		},

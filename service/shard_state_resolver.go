@@ -21,7 +21,7 @@ type shardStateAfterApplyFunc func(context.Context, *storage.BlockState, Prepare
 
 type shardStateResolverConfig struct {
 	current         map[storage.ShardKey]storage.BlockState
-	cache           map[string]*storage.BlockState
+	cache           map[storage.BlockRootHash]*storage.BlockState
 	loadState       func(context.Context, storage.BlockState) (*storage.BlockState, error)
 	loadBlock       shardBlockLoader
 	apply           shardStateApplyFunc
@@ -45,7 +45,7 @@ type shardStateResolver struct {
 	ctx context.Context
 
 	current         map[storage.ShardKey]storage.BlockState
-	cache           map[string]*storage.BlockState
+	cache           map[storage.BlockRootHash]*storage.BlockState
 	loadState       func(context.Context, storage.BlockState) (*storage.BlockState, error)
 	loadBlock       shardBlockLoader
 	apply           shardStateApplyFunc
@@ -53,14 +53,14 @@ type shardStateResolver struct {
 	save            func(context.Context, *storage.BlockState) error
 
 	mu    sync.Mutex
-	tasks map[string]*shardStateResolverTask
+	tasks map[storage.BlockRootHash]*shardStateResolverTask
 	stats shardStateResolverStats
 }
 
 func newShardStateResolver(ctx context.Context, cfg shardStateResolverConfig) *shardStateResolver {
 	cache := cfg.cache
 	if cache == nil {
-		cache = map[string]*storage.BlockState{}
+		cache = map[storage.BlockRootHash]*storage.BlockState{}
 	}
 
 	return &shardStateResolver{
@@ -72,7 +72,7 @@ func newShardStateResolver(ctx context.Context, cfg shardStateResolverConfig) *s
 		apply:           cfg.apply,
 		afterApplyState: cfg.afterApplyState,
 		save:            cfg.save,
-		tasks:           map[string]*shardStateResolverTask{},
+		tasks:           map[storage.BlockRootHash]*shardStateResolverTask{},
 	}
 }
 
@@ -244,7 +244,7 @@ func (r *shardStateResolver) evictCacheLocked() {
 		return
 	}
 
-	var evictKey string
+	var evictKey storage.BlockRootHash
 	var evictSeqno uint32
 	first := true
 	for key, state := range r.cache {

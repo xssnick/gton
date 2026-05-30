@@ -34,12 +34,13 @@ type serviceCollector struct {
 	p2pQueueBytes       *prometheus.Desc
 	p2pQueueMaxItems    *prometheus.Desc
 	p2pQueueMaxBytes    *prometheus.Desc
-	p2pQueuePushed      *prometheus.Desc
 	p2pQueueDropped     *prometheus.Desc
 	p2pBroadcasts       *prometheus.Desc
 	p2pBroadcastDrops   *prometheus.Desc
 	p2pRebroadcastSent  *prometheus.Desc
 	p2pRebroadcastDrop  *prometheus.Desc
+	p2pRelaySent        *prometheus.Desc
+	p2pRelayFailed      *prometheus.Desc
 	p2pFECActiveStreams *prometheus.Desc
 	p2pFECActiveBytes   *prometheus.Desc
 	p2pFECDelivered     *prometheus.Desc
@@ -147,12 +148,6 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			[]string{"queue"},
 			nil,
 		),
-		p2pQueuePushed: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "p2p", "queue_pushed_total"),
-			"Total accepted P2P queue pushes.",
-			[]string{"queue"},
-			nil,
-		),
 		p2pQueueDropped: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "queue_dropped_total"),
 			"Total dropped P2P queue pushes.",
@@ -161,7 +156,7 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		p2pBroadcasts: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "broadcasts_total"),
-			"Total P2P broadcasts accepted or successfully rebroadcasted by type.",
+			"Total P2P broadcasts accepted or successfully sent through the app-level rebroadcast queue by type.",
 			[]string{"direction", "overlay", "kind"},
 			nil,
 		),
@@ -173,14 +168,26 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		p2pRebroadcastSent: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "rebroadcast_sent_total"),
-			"Total successful P2P rebroadcast sends.",
+			"Total successful app-level P2P rebroadcast queue sends.",
 			[]string{"queue"},
 			nil,
 		),
 		p2pRebroadcastDrop: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "rebroadcast_dropped_total"),
-			"Total P2P rebroadcast messages dropped before a successful send.",
+			"Total app-level P2P rebroadcast queue messages dropped before a successful send.",
 			[]string{"queue"},
+			nil,
+		),
+		p2pRelaySent: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "broadcast_relay_sent_total"),
+			"Total successful overlay-level broadcast relay sends by overlay and delivery path.",
+			[]string{"overlay", "delivery"},
+			nil,
+		),
+		p2pRelayFailed: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "broadcast_relay_failed_total"),
+			"Total failed overlay-level broadcast relay sends by overlay and delivery path.",
+			[]string{"overlay", "delivery"},
 			nil,
 		),
 		p2pFECActiveStreams: prometheus.NewDesc(
@@ -268,12 +275,13 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pQueueBytes
 	ch <- c.p2pQueueMaxItems
 	ch <- c.p2pQueueMaxBytes
-	ch <- c.p2pQueuePushed
 	ch <- c.p2pQueueDropped
 	ch <- c.p2pBroadcasts
 	ch <- c.p2pBroadcastDrops
 	ch <- c.p2pRebroadcastSent
 	ch <- c.p2pRebroadcastDrop
+	ch <- c.p2pRelaySent
+	ch <- c.p2pRelayFailed
 	ch <- c.p2pFECActiveStreams
 	ch <- c.p2pFECActiveBytes
 	ch <- c.p2pFECDelivered
@@ -369,7 +377,6 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 		ch <- prometheus.MustNewConstMetric(c.p2pQueueBytes, prometheus.GaugeValue, float64(queue.Bytes), queue.Name)
 		ch <- prometheus.MustNewConstMetric(c.p2pQueueMaxItems, prometheus.GaugeValue, float64(queue.MaxItems), queue.Name)
 		ch <- prometheus.MustNewConstMetric(c.p2pQueueMaxBytes, prometheus.GaugeValue, float64(queue.MaxBytes), queue.Name)
-		ch <- prometheus.MustNewConstMetric(c.p2pQueuePushed, prometheus.CounterValue, float64(queue.Pushed), queue.Name)
 		ch <- prometheus.MustNewConstMetric(c.p2pQueueDropped, prometheus.CounterValue, float64(queue.Dropped), queue.Name)
 	}
 
@@ -386,6 +393,10 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 		ch <- prometheus.MustNewConstMetric(c.p2pFECEvicted, prometheus.CounterValue, float64(fec.EvictedTotal), fec.Overlay)
 		ch <- prometheus.MustNewConstMetric(c.p2pFECCompleted, prometheus.CounterValue, float64(fec.CompletedTotal), fec.Overlay)
 		ch <- prometheus.MustNewConstMetric(c.p2pFECDeliveredHits, prometheus.CounterValue, float64(fec.DeliveredCacheHitsTotal), fec.Overlay)
+		ch <- prometheus.MustNewConstMetric(c.p2pRelaySent, prometheus.CounterValue, float64(fec.SimpleRelaySentTotal), fec.Overlay, "simple")
+		ch <- prometheus.MustNewConstMetric(c.p2pRelayFailed, prometheus.CounterValue, float64(fec.SimpleRelayFailedTotal), fec.Overlay, "simple")
+		ch <- prometheus.MustNewConstMetric(c.p2pRelaySent, prometheus.CounterValue, float64(fec.FECRelaySentTotal), fec.Overlay, "fec")
+		ch <- prometheus.MustNewConstMetric(c.p2pRelayFailed, prometheus.CounterValue, float64(fec.FECRelayFailedTotal), fec.Overlay, "fec")
 	}
 
 	for _, broadcast := range snapshot.Broadcasts {

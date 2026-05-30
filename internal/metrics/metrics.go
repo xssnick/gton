@@ -40,6 +40,7 @@ type Metrics struct {
 	syncBlockDownloadDuration *prometheus.HistogramVec
 	syncBlockPrepareDuration  *prometheus.HistogramVec
 	syncBlockApplyDuration    *prometheus.HistogramVec
+	syncObtainDuration        *prometheus.HistogramVec
 	syncPersistDuration       *prometheus.HistogramVec
 	syncPersistQueueDuration  *prometheus.HistogramVec
 	syncCheckpoints           *prometheus.CounterVec
@@ -105,16 +106,23 @@ func New(namespace string) *Metrics {
 			Namespace: namespace,
 			Subsystem: "sync",
 			Name:      "block_prepare_duration_seconds",
-			Help:      "Synchronized block preparation duration in seconds, including downloaded block validation and state cell preparation, excluding apply.",
+			Help:      "Synchronized block post-download processing duration in seconds, including validation, consensus checks, and state cell preparation after the block is dequeued, excluding network download, queue wait, and state apply.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 		}, []string{"pipeline", "chain", "shard", "source", "result", "catch_up"}),
 		syncBlockApplyDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "sync",
 			Name:      "block_apply_duration_seconds",
-			Help:      "Synchronized block apply or processing duration in seconds.",
+			Help:      "Synchronized block state apply duration in seconds.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 		}, []string{"pipeline", "chain", "result"}),
+		syncObtainDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: "sync",
+			Name:      "master_shards_obtain_duration_seconds",
+			Help:      "Duration spent obtaining a master block or shard blocks needed for one master transition, excluding state apply and checkpoint persistence.",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+		}, []string{"pipeline", "stage", "result", "catch_up"}),
 		syncPersistDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "sync",
@@ -150,6 +158,7 @@ func New(namespace string) *Metrics {
 		m.syncBlockDownloadDuration,
 		m.syncBlockPrepareDuration,
 		m.syncBlockApplyDuration,
+		m.syncObtainDuration,
 		m.syncPersistDuration,
 		m.syncPersistQueueDuration,
 		m.syncCheckpoints,
@@ -299,6 +308,22 @@ func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 	if observation.ApplyDuration > 0 && m.syncBlockApplyDuration != nil {
 		m.syncBlockApplyDuration.WithLabelValues(pipeline, chain, result).Observe(observation.ApplyDuration.Seconds())
 	}
+}
+
+func (m *Metrics) ObserveSyncObtain(observation service.SyncObtainObservation) {
+	if m == nil || m.syncObtainDuration == nil {
+		return
+	}
+	pipeline := fallbackLabel(observation.Pipeline)
+	stage := fallbackLabel(observation.Stage)
+	result := fallbackLabel(observation.Result)
+	catchUp := strconv.FormatBool(observation.CatchUp)
+	duration := observation.Duration
+	if duration < 0 {
+		duration = 0
+	}
+
+	m.syncObtainDuration.WithLabelValues(pipeline, stage, result, catchUp).Observe(duration.Seconds())
 }
 
 func syncBlockOriginForMetricSource(source string) string {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/hex"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strconv"
@@ -55,7 +55,7 @@ func (n *Node) startDHTServer(ctx context.Context, cfg *liteclient.GlobalConfig)
 	n.log.Info().
 		Str("listen_addr", n.dhtListenAddr).
 		Str("published_addr", publishedDial).
-		Str("adnl_id", dhtADNLID(n.dhtPrivKey)).
+		Str("adnl_id", dhtADNLIDBase64(n.dhtPrivKey)).
 		Msg("started DHT server")
 
 	n.dhtGateway = dhtGateway
@@ -123,7 +123,7 @@ func (n *Node) publishDHTServerAddress(ctx context.Context, addrList address.Lis
 	return err
 }
 
-func dhtADNLID(key ed25519.PrivateKey) string {
+func dhtADNLIDBase64(key ed25519.PrivateKey) string {
 	if len(key) == 0 {
 		return ""
 	}
@@ -132,5 +132,5 @@ func dhtADNLID(key ed25519.PrivateKey) string {
 	if err != nil {
 		return ""
 	}
-	return hex.EncodeToString(id)
+	return base64.StdEncoding.EncodeToString(id)
 }

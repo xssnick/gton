@@ -27,6 +27,8 @@ const (
 	masterchainID    int32 = -1
 	masterchainShard int64 = -1 << 63
 	workchainInvalid int32 = -1 << 31
+
+	getMasterchainInfoExtShardClientState uint32 = 1
 )
 
 var errInvalidLookupBlock = errors.New("invalid lookupBlock request")
@@ -102,16 +104,58 @@ func (s *Server) handleQuery(ctx context.Context, query any) tl.Serializable {
 		return s.handleDispatchQueueInfo(ctx, q)
 	case ton.GetDispatchQueueMessages:
 		return s.handleDispatchQueueMessages(ctx, q)
-	case ton.NonfinalGetValidatorGroups, ton.NonfinalGetCandidate, ton.NonfinalGetPendingShardBlocks:
+	case ton.NonfinalGetPendingShardBlocks:
+		return s.handleNonfinalPendingShardBlocks(q)
+	case ton.NonfinalGetValidatorGroups, ton.NonfinalGetCandidate:
 		return ton.LSError{Code: errCodeUnspecified, Text: "query is not allowed"}
 	default:
 		return ton.LSError{Code: errCodeTonProtoError, Text: "unknown query"}
 	}
 }
 
+type nonfinalPendingStore interface {
+	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
+}
+
+func (s *Server) handleNonfinalPendingShardBlocks(query ton.NonfinalGetPendingShardBlocks) tl.Serializable {
+	if !s.nonFinal {
+		return ton.LSError{Code: errCodeUnspecified, Text: "query is not allowed"}
+	}
+	if query.Mode&^uint32(1) != 0 {
+		return ton.LSError{Code: errCodeProtoViolation, Text: "unsupported nonfinal.getPendingShardBlocks mode"}
+	}
+
+	var filter *storage.ShardKey
+	if query.Mode&1 != 0 {
+		if shardPrefixLen(uint64(query.Shard)) < 0 {
+			return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
+		}
+		filter = &storage.ShardKey{Workchain: query.WC, Shard: query.Shard}
+	}
+
+	store, ok := s.store.(nonfinalPendingStore)
+	if !ok {
+		return ton.NonfinalPendingShardBlocks{}
+	}
+
+	signed, candidates := store.NonfinalPendingShardBlocks(filter)
+	return ton.NonfinalPendingShardBlocks{
+		SignedBlocks: blockIDPtrSlice(signed),
+		Candidates:   blockIDPtrSlice(candidates),
+	}
+}
+
+func blockIDPtrSlice(blocks []ton.BlockIDExt) []*ton.BlockIDExt {
+	ptrs := make([]*ton.BlockIDExt, 0, len(blocks))
+	for i := range blocks {
+		ptrs = append(ptrs, &blocks[i])
+	}
+	return ptrs
+}
+
 func (s *Server) handleMasterchainInfoExt(ctx context.Context, mode uint32) tl.Serializable {
 	effectiveMode := mode & 0x7fffffff
-	if effectiveMode != 0 {
+	if effectiveMode&^getMasterchainInfoExtShardClientState != 0 {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "unsupported getMasterchainInfo mode"}
 	}
 

@@ -17,6 +17,7 @@ type testOverlayADNL struct {
 	customHandler     func(msg *adnl.MessageCustom) error
 	queryHandler      func(msg *adnl.MessageQuery) error
 	disconnectHandler func(addr string, key ed25519.PublicKey)
+	sent              []tl.Serializable
 }
 
 func newTestOverlayADNL() *testOverlayADNL {
@@ -43,7 +44,8 @@ func (m *testOverlayADNL) GetDisconnectHandler() func(addr string, key ed25519.P
 	return m.disconnectHandler
 }
 
-func (m *testOverlayADNL) SendCustomMessage(context.Context, tl.Serializable) error {
+func (m *testOverlayADNL) SendCustomMessage(_ context.Context, req tl.Serializable) error {
+	m.sent = append(m.sent, req)
 	return nil
 }
 
@@ -91,22 +93,22 @@ func TestQueryCandidatesSkipClosedPeers(t *testing.T) {
 			ProtoVersionMajor: shardchainProtoVersionMajor,
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
-		peers: map[string]*overlayPeer{
-			"peer-1": {id: "peer-1", overlay: openOverlay, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-2": {id: "peer-2", overlay: closedOverlay, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-3": {id: "peer-3", overlay: fallbackOverlay, announced: &overlay.Node{Version: now}, alive: true},
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: openOverlay, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: closedOverlay, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: fallbackOverlay, announced: &overlay.Node{Version: now}, alive: true},
 		},
-		neighbours: []string{"peer-1", "peer-2"},
+		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
 	}
 
 	got := sub.queryCandidates(0, 0)
 	if len(got) != 2 {
 		t.Fatalf("unexpected candidate count: got %d want 2", len(got))
 	}
-	if got[0].id != "peer-1" {
+	if got[0].id != testPeerID("peer-1") {
 		t.Fatalf("expected open neighbour first, got %q", got[0].id)
 	}
-	if got[1].id != "peer-3" {
+	if got[1].id != testPeerID("peer-3") {
 		t.Fatalf("expected open fallback peer second, got %q", got[1].id)
 	}
 }
@@ -116,7 +118,7 @@ func TestHandlePeerQueryFailureRemovesClosedPeer(t *testing.T) {
 
 	peerOverlay, _ := newTestOverlayWrapper()
 	peer := &overlayPeer{
-		id:        "peer-1",
+		id:        testPeerID("peer-1"),
 		overlay:   peerOverlay,
 		announced: &overlay.Node{Version: now},
 		alive:     true,
@@ -124,13 +126,13 @@ func TestHandlePeerQueryFailureRemovesClosedPeer(t *testing.T) {
 
 	sub := &overlaySubscription{
 		log:        discardLogger(),
-		peers:      map[string]*overlayPeer{"peer-1": peer},
-		neighbours: []string{"peer-1"},
+		peers:      map[PeerID]*overlayPeer{testPeerID("peer-1"): peer},
+		neighbours: []PeerID{testPeerID("peer-1")},
 	}
 
 	sub.handlePeerQueryFailure(peer, adnl.ErrPeerConnClosed)
 
-	if _, ok := sub.peers["peer-1"]; ok {
+	if _, ok := sub.peers[testPeerID("peer-1")]; ok {
 		t.Fatal("closed peer must be removed from subscription")
 	}
 	if len(sub.neighbours) != 0 {

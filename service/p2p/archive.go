@@ -210,7 +210,7 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 	}
 
 	ordered := make([]*overlayPeer, 0, len(peers)+1)
-	seen := make(map[string]struct{}, len(peers)+2)
+	seen := make(map[PeerID]struct{}, len(peers)+2)
 	addPeer := func(peer *overlayPeer) {
 		if peer == nil {
 			return
@@ -218,11 +218,14 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 		if s.archivePeerDenied(resolved.Shard, peer) {
 			return
 		}
-		key := archivePeerKey(peer)
-		if _, ok := seen[key]; ok {
+		peerID := archivePeerID(peer)
+		if peerID.IsZero() {
 			return
 		}
-		seen[key] = struct{}{}
+		if _, ok := seen[peerID]; ok {
+			return
+		}
+		seen[peerID] = struct{}{}
 		ordered = append(ordered, peer)
 	}
 	addPeer(resolved.peer)
@@ -230,9 +233,9 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 		addPeer(peer)
 	}
 
-	candidates := map[string]archiveCandidate{}
+	candidates := map[PeerID]archiveCandidate{}
 	if resolved.peer != nil {
-		candidates[archivePeerKey(resolved.peer)] = archiveCandidate{
+		candidates[archivePeerID(resolved.peer)] = archiveCandidate{
 			peer:        resolved.peer,
 			archiveID:   resolved.ArchiveID,
 			seedSlice:   append([]byte(nil), resolved.seedSlice...),
@@ -243,18 +246,21 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 	return s.downloadArchiveFromPeers(ctx, resolved, ordered, tmpDir, candidates)
 }
 
-func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, resolved resolvedArchive, peers []*overlayPeer, tmpDir string, candidates map[string]archiveCandidate) (*archive.Downloaded, error) {
+func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, resolved resolvedArchive, peers []*overlayPeer, tmpDir string, candidates map[PeerID]archiveCandidate) (*archive.Downloaded, error) {
 	var errs []error
-	usedPeers := make(map[string]struct{}, len(peers))
+	usedPeers := make(map[PeerID]struct{}, len(peers))
 
 	for _, peer := range peers {
-		key := archivePeerKey(peer)
-		if _, ok := usedPeers[key]; ok {
+		peerID := archivePeerID(peer)
+		if peerID.IsZero() {
 			continue
 		}
-		usedPeers[key] = struct{}{}
+		if _, ok := usedPeers[peerID]; ok {
+			continue
+		}
+		usedPeers[peerID] = struct{}{}
 
-		candidate, hasCandidate := candidates[key]
+		candidate, hasCandidate := candidates[peerID]
 		if !hasCandidate {
 			var err error
 			candidate, err = s.fetchArchiveCandidate(ctx, peer, resolved.MasterchainSeqno, resolved.Shard)
@@ -266,7 +272,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, reso
 				errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
 				continue
 			}
-			candidates[key] = candidate
+			candidates[peerID] = candidate
 		}
 
 		downloaded, err := s.downloadArchiveFromPeer(ctx, resolved, candidate, tmpDir)

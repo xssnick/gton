@@ -19,10 +19,8 @@ const (
 )
 
 type storageArtifactStatus struct {
-	ArchivePackages        uint64
-	ArchivePackageBytes    uint64
-	PersistentStateMasters uint64
-	PersistentStateBytes   uint64
+	ArchivePackageBytes  uint64
+	PersistentStateBytes uint64
 }
 
 type storageArtifactStatusReader struct {
@@ -37,10 +35,8 @@ type storageArtifactStatusReader struct {
 type storageArtifactCollector struct {
 	metrics *Metrics
 
-	archivePackages        *prometheus.Desc
-	archivePackageBytes    *prometheus.Desc
-	persistentStateMasters *prometheus.Desc
-	persistentStateBytes   *prometheus.Desc
+	archivePackageBytes  *prometheus.Desc
+	persistentStateBytes *prometheus.Desc
 }
 
 func newStorageArtifactStatusReader(archivePackagesDir string, stateFilesDir string) *storageArtifactStatusReader {
@@ -53,21 +49,9 @@ func newStorageArtifactStatusReader(archivePackagesDir string, stateFilesDir str
 func newStorageArtifactCollector(metrics *Metrics, namespace string) prometheus.Collector {
 	return &storageArtifactCollector{
 		metrics: metrics,
-		archivePackages: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "storage", "archive_packages"),
-			"Number of archive package files stored on disk.",
-			nil,
-			nil,
-		),
 		archivePackageBytes: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "archive_package_bytes"),
 			"Total bytes used by archive package files on disk.",
-			nil,
-			nil,
-		),
-		persistentStateMasters: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "storage", "persistent_state_masters"),
-			"Number of masterchain blocks with persistent state files stored on disk.",
 			nil,
 			nil,
 		),
@@ -81,9 +65,7 @@ func newStorageArtifactCollector(metrics *Metrics, namespace string) prometheus.
 }
 
 func (c *storageArtifactCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.archivePackages
 	ch <- c.archivePackageBytes
-	ch <- c.persistentStateMasters
 	ch <- c.persistentStateBytes
 }
 
@@ -99,9 +81,7 @@ func (c *storageArtifactCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.archivePackages, prometheus.GaugeValue, float64(status.ArchivePackages))
 	ch <- prometheus.MustNewConstMetric(c.archivePackageBytes, prometheus.GaugeValue, float64(status.ArchivePackageBytes))
-	ch <- prometheus.MustNewConstMetric(c.persistentStateMasters, prometheus.GaugeValue, float64(status.PersistentStateMasters))
 	ch <- prometheus.MustNewConstMetric(c.persistentStateBytes, prometheus.GaugeValue, float64(status.PersistentStateBytes))
 }
 
@@ -127,24 +107,21 @@ func (r *storageArtifactStatusReader) Status(ctx context.Context) (storageArtifa
 func scanStorageArtifacts(ctx context.Context, archivePackagesDir string, stateFilesDir string) (storageArtifactStatus, error) {
 	var status storageArtifactStatus
 
-	archivePackages, archivePackageBytes, err := scanArchivePackages(ctx, archivePackagesDir)
+	archivePackageBytes, err := scanArchivePackages(ctx, archivePackagesDir)
 	if err != nil {
 		return storageArtifactStatus{}, err
 	}
-	persistentStateMasters, persistentStateBytes, err := scanPersistentStates(ctx, stateFilesDir)
+	persistentStateBytes, err := scanPersistentStates(ctx, stateFilesDir)
 	if err != nil {
 		return storageArtifactStatus{}, err
 	}
 
-	status.ArchivePackages = archivePackages
 	status.ArchivePackageBytes = archivePackageBytes
-	status.PersistentStateMasters = persistentStateMasters
 	status.PersistentStateBytes = persistentStateBytes
 	return status, nil
 }
 
-func scanArchivePackages(ctx context.Context, dir string) (uint64, uint64, error) {
-	var packages uint64
+func scanArchivePackages(ctx context.Context, dir string) (uint64, error) {
 	var bytes uint64
 
 	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
@@ -173,7 +150,6 @@ func scanArchivePackages(ctx context.Context, dir string) (uint64, uint64, error
 		}
 
 		if strings.HasSuffix(path, ".pack") {
-			packages++
 			if info.Size() > 0 {
 				bytes += uint64(info.Size())
 			}
@@ -181,13 +157,12 @@ func scanArchivePackages(ctx context.Context, dir string) (uint64, uint64, error
 		return nil
 	})
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
+		return 0, nil
 	}
-	return packages, bytes, err
+	return bytes, err
 }
 
-func scanPersistentStates(ctx context.Context, dir string) (uint64, uint64, error) {
-	masters := map[uint64]struct{}{}
+func scanPersistentStates(ctx context.Context, dir string) (uint64, error) {
 	var bytes uint64
 
 	err := filepath.WalkDir(dir, func(_ string, entry os.DirEntry, err error) error {
@@ -215,8 +190,7 @@ func scanPersistentStates(ctx context.Context, dir string) (uint64, uint64, erro
 			return nil
 		}
 
-		if master, ok := persistentStateMasterFromFileName(entry.Name()); ok {
-			masters[master] = struct{}{}
+		if isPersistentStateFileName(entry.Name()) {
 			if info.Size() > 0 {
 				bytes += uint64(info.Size())
 			}
@@ -224,32 +198,29 @@ func scanPersistentStates(ctx context.Context, dir string) (uint64, uint64, erro
 		return nil
 	})
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
+		return 0, nil
 	}
-	return uint64(len(masters)), bytes, err
+	return bytes, err
 }
 
-func persistentStateMasterFromFileName(name string) (uint64, bool) {
+func isPersistentStateFileName(name string) bool {
 	switch {
 	case strings.HasPrefix(name, "state_"):
-		return parsePersistentStateMaster(name[len("state_"):])
+		return hasPersistentStateMaster(name[len("state_"):])
 	case strings.HasPrefix(name, "statesplit_"):
-		return parsePersistentStateMaster(name[len("statesplit_"):])
+		return hasPersistentStateMaster(name[len("statesplit_"):])
 	case strings.HasPrefix(name, "stateaccount_"):
-		return parsePersistentStateMaster(name[len("stateaccount_"):])
+		return hasPersistentStateMaster(name[len("stateaccount_"):])
 	default:
-		return 0, false
+		return false
 	}
 }
 
-func parsePersistentStateMaster(s string) (uint64, bool) {
+func hasPersistentStateMaster(s string) bool {
 	idx := strings.IndexByte(s, '_')
 	if idx <= 0 {
-		return 0, false
+		return false
 	}
-	seqno, err := strconv.ParseUint(s[:idx], 10, 32)
-	if err != nil {
-		return 0, false
-	}
-	return seqno, true
+	_, err := strconv.ParseUint(s[:idx], 10, 32)
+	return err == nil
 }

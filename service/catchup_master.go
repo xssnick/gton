@@ -18,18 +18,18 @@ type nextBlockBootstrapProbeState struct {
 }
 
 type nextBlockBootstrapProbeDecision struct {
-	peerLimit          int
-	consecutiveMisses  int
-	liveTail           bool
-	rawBroadcastAhead  bool
-	observedAhead      bool
-	seenAhead          bool
-	queuedFutureAhead  bool
-	preferredSourceKey string
-	aheadBlocks        uint32
-	lowestMissingSeqno uint32
-	lagSeconds         int64
-	hasLag             bool
+	peerLimit             int
+	consecutiveMisses     int
+	liveTail              bool
+	rawBroadcastAhead     bool
+	observedAhead         bool
+	seenAhead             bool
+	queuedFutureAhead     bool
+	preferredSourcePeerID p2p.PeerID
+	aheadBlocks           uint32
+	lowestMissingSeqno    uint32
+	lagSeconds            int64
+	hasLag                bool
 }
 
 func (s *Service) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (nextBlockBootstrapProbeDecision, <-chan struct{}) {
@@ -54,7 +54,7 @@ func (s *Service) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime
 
 	if queued, ok := s.queuedMasterchainFuture(prev); ok {
 		decision.queuedFutureAhead = true
-		decision.preferredSourceKey = queued.sourceKey
+		decision.preferredSourcePeerID = queued.sourcePeerID
 		decision.lowestMissingSeqno = queued.lowestMissingSeqno
 		decision.noteAheadSeqno(prev.SeqNo, queued.block.SeqNo)
 	}
@@ -70,7 +70,7 @@ func (s *Service) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime
 		decision.peerLimit = nextBlockBootstrapUrgentPeers
 	}
 	if !decision.liveTail {
-		decision.preferredSourceKey = ""
+		decision.preferredSourcePeerID = p2p.PeerID{}
 	}
 	return decision, broadcastWake
 }
@@ -477,8 +477,8 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 			if decision.lowestMissingSeqno != 0 {
 				event.Uint32("lowest_missing_seqno", decision.lowestMissingSeqno)
 			}
-			if decision.preferredSourceKey != "" {
-				event.Str("preferred_source", decision.preferredSourceKey)
+			if !decision.preferredSourcePeerID.IsZero() {
+				event.Str("preferred_source_peer_id", decision.preferredSourcePeerID.String())
 			}
 			if decision.hasLag {
 				event.Int64("lag_seconds", decision.lagSeconds)
@@ -488,11 +488,11 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		result := make(chan nextBlockProbeResult, 1)
 		go func() {
 			downloaded, err := s.node.ProbeNextBlockFull(queryCtx, prev, p2p.ProbeNextBlockFullOptions{
-				PeerLimit:        decision.peerLimit,
-				StagedPeerLimit:  stagedPeerLimit,
-				StageDelay:       nextBlockBootstrapLiveStageDelay,
-				PreferredPeerKey: decision.preferredSourceKey,
-				LiveTail:         decision.liveTail,
+				PeerLimit:       decision.peerLimit,
+				StagedPeerLimit: stagedPeerLimit,
+				StageDelay:      nextBlockBootstrapLiveStageDelay,
+				PreferredPeerID: decision.preferredSourcePeerID,
+				LiveTail:        decision.liveTail,
 			})
 			result <- nextBlockProbeResult{downloaded: downloaded, err: err}
 		}()

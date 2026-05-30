@@ -54,6 +54,70 @@ func TestPlanRebroadcastMatchesCppNodeRouting(t *testing.T) {
 	}
 }
 
+func TestPlanCustomRebroadcastMatchesCppNodeRouting(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       string
+		payloadLen int
+		mode       rebroadcastMode
+		flags      int32
+	}{
+		{name: "small shard info stays ordinary simple", kind: "tonNode.newShardBlockBroadcast", payloadLen: ordinarySimpleBroadcastMaxSize, mode: rebroadcastModeSimple},
+		{name: "large shard info uses two-step path with anysender", kind: "tonNode.newShardBlockBroadcast", payloadLen: ordinarySimpleBroadcastMaxSize + 1, mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender},
+		{name: "small external uses two-step path", kind: "tonNode.externalMessageBroadcast", payloadLen: 128, mode: rebroadcastModeFEC},
+		{name: "small ihr uses two-step path", kind: "tonNode.ihrMessageBroadcast", payloadLen: 128, mode: rebroadcastModeFEC},
+		{name: "block broadcast uses two-step path with anysender", kind: "tonNode.blockBroadcastCompressedV2", payloadLen: 256, mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := planCustomRebroadcast(tt.kind, tt.payloadLen)
+			if plan.mode != tt.mode || plan.flags != tt.flags {
+				t.Fatalf("unexpected custom plan: got mode=%d flags=%d want mode=%d flags=%d", plan.mode, plan.flags, tt.mode, tt.flags)
+			}
+		})
+	}
+}
+
+func TestSelectRebroadcastQueueTargetsSamplesFullPool(t *testing.T) {
+	const totalPeers = 20
+	const limit = 5
+
+	peers := make([]*overlayPeer, 0, totalPeers)
+	prefixIDs := make(map[PeerID]struct{}, limit)
+	for i := 0; i < totalPeers; i++ {
+		id := testPeerID(string(rune('a' + i)))
+		peers = append(peers, &overlayPeer{id: id})
+		if i < limit {
+			prefixIDs[id] = struct{}{}
+		}
+	}
+
+	sawOutsidePrefix := false
+	for attempt := 0; attempt < 200 && !sawOutsidePrefix; attempt++ {
+		targets := selectRebroadcastQueueTargets(peers, nil, limit)
+		if len(targets) != limit {
+			t.Fatalf("got %d targets, want %d", len(targets), limit)
+		}
+
+		seen := make(map[PeerID]struct{}, len(targets))
+		for _, peer := range targets {
+			if _, ok := seen[peer.id]; ok {
+				t.Fatalf("duplicate target %x", peer.id)
+			}
+			seen[peer.id] = struct{}{}
+
+			if _, ok := prefixIDs[peer.id]; !ok {
+				sawOutsidePrefix = true
+			}
+		}
+	}
+
+	if !sawOutsidePrefix {
+		t.Fatal("expected rebroadcast target selection to sample beyond the first limit peers")
+	}
+}
+
 func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 	node := newTestNode(t)
 	node.SetRebroadcastQuiet(true)
@@ -99,7 +163,7 @@ func TestRebroadcastFECBackpressureLimitsExternalSlots(t *testing.T) {
 	}
 	releases := make([]func(), 0, externalFECBackpressureSlots)
 	for i := 0; i < externalFECBackpressureSlots; i++ {
-		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: string(rune('a' + i))}, req)
+		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: testPeerID(string(rune('a' + i)))}, req)
 		if !ok {
 			t.Fatalf("acquire external FEC slot %d", i)
 		}
@@ -113,14 +177,14 @@ func TestRebroadcastFECBackpressureLimitsExternalSlots(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	if release, ok := node.waitRebroadcastFECBackpressure(ctx, &overlayPeer{id: "extra"}, req); ok {
+	if release, ok := node.waitRebroadcastFECBackpressure(ctx, &overlayPeer{id: testPeerID("extra")}, req); ok {
 		release()
 		t.Fatal("expected extra external FEC sender to wait while all slots are busy")
 	}
 
 	releases[0]()
 	releases = releases[1:]
-	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: "extra"}, req)
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: testPeerID("extra")}, req)
 	if !ok {
 		t.Fatal("expected external FEC sender to acquire a released slot")
 	}
@@ -130,7 +194,7 @@ func TestRebroadcastFECBackpressureLimitsExternalSlots(t *testing.T) {
 func TestRebroadcastFECBackpressureLimitsOneStreamPerPeer(t *testing.T) {
 	node := newTestNode(t)
 	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
-	peer := &overlayPeer{id: "peer"}
+	peer := &overlayPeer{id: testPeerID("peer")}
 	req := rebroadcastRequest{
 		kind:     "tonNode.externalMessageBroadcast",
 		queuedAt: time.Now(),
@@ -164,7 +228,7 @@ func TestRebroadcastFECBackpressureUsesSeparateBlockAndExternalSlots(t *testing.
 
 	var blockReleases []func()
 	for i := 0; i < blockFECBackpressureSlots; i++ {
-		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: string(rune('b' + i))}, blockReq)
+		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: testPeerID(string(rune('b' + i)))}, blockReq)
 		if !ok {
 			t.Fatalf("acquire block FEC slot %d", i)
 		}
@@ -178,12 +242,12 @@ func TestRebroadcastFECBackpressureUsesSeparateBlockAndExternalSlots(t *testing.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	if release, ok := node.waitRebroadcastFECBackpressure(ctx, &overlayPeer{id: "block-extra"}, blockReq); ok {
+	if release, ok := node.waitRebroadcastFECBackpressure(ctx, &overlayPeer{id: testPeerID("block-extra")}, blockReq); ok {
 		release()
 		t.Fatal("expected block FEC sender to wait while block slots are busy")
 	}
 
-	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: "external"}, externalReq)
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: testPeerID("external")}, externalReq)
 	if !ok {
 		t.Fatal("expected external FEC sender to use independent slots")
 	}
@@ -201,7 +265,7 @@ func TestRebroadcastFECBackpressurePassesWhenLagClears(t *testing.T) {
 
 	var releases []func()
 	for i := 0; i < blockFECBackpressureSlots; i++ {
-		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: string(rune('c' + i))}, req)
+		release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: testPeerID(string(rune('c' + i)))}, req)
 		if !ok {
 			t.Fatalf("acquire block FEC slot %d", i)
 		}
@@ -214,11 +278,101 @@ func TestRebroadcastFECBackpressurePassesWhenLagClears(t *testing.T) {
 	}()
 
 	lag.lag = rebroadcastFECLagThreshold
-	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: "after-lag"}, req)
+	release, ok := node.waitRebroadcastFECBackpressure(context.Background(), &overlayPeer{id: testPeerID("after-lag")}, req)
 	if !ok {
 		t.Fatal("expected FEC sender to bypass slots after lag clears")
 	}
 	release()
+}
+
+func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
+	node := newTestNode(t)
+	overlayA, connA := newTestOverlayWrapper()
+	overlayB, connB := newTestOverlayWrapper()
+	now := int32(time.Now().Unix())
+
+	peerA := &overlayPeer{
+		id:            testPeerID("peer-a"),
+		addr:          "peer-a",
+		overlay:       overlayA,
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	peerB := &overlayPeer{
+		id:            testPeerID("peer-b"),
+		addr:          "peer-b",
+		overlay:       overlayB,
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name: "custom.private-a",
+			Kind: overlayKindCustomFixed,
+		},
+		log: discardLogger(),
+		peers: map[PeerID]*overlayPeer{
+			peerA.id: peerA,
+			peerB.id: peerB,
+		},
+	}
+
+	ok := sub.sendCustomTwoStepRebroadcast(context.Background(), rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x01, 0x02, 0x03},
+		local:        true,
+	})
+	if !ok {
+		t.Fatal("expected custom two-step send to succeed")
+	}
+
+	for name, conn := range map[string]*testOverlayADNL{"peer-a": connA, "peer-b": connB} {
+		if len(conn.sent) != 1 {
+			t.Fatalf("%s sent messages = %d, want 1", name, len(conn.sent))
+		}
+		msg := sentOverlayPayload(conn.sent[0])
+		if _, ok := msg.(*overlay.BroadcastTwoStepSimple); !ok {
+			t.Fatalf("%s sent unexpected message type %T", name, msg)
+		}
+	}
+}
+
+func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
+	node := newTestNode(t)
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name: "custom.private-a",
+			Kind: overlayKindCustomFixed,
+		},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
+	}
+
+	if !sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.newShardBlockBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}) {
+		t.Fatal("expected ordinary custom shard rebroadcast enqueue")
+	}
+
+	got, ok := peer.localRebroadcastQueue.TryPop()
+	if !ok {
+		t.Fatal("expected small shard broadcast to use ordinary peer queue")
+	}
+	if got.kind != "tonNode.newShardBlockBroadcast" || !got.local {
+		t.Fatalf("unexpected queued rebroadcast: %#v", got)
+	}
+	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
+	}
 }
 
 func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
@@ -254,6 +408,14 @@ func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
 	if !ed25519.Verify(pub, toSign, msg.Signature) {
 		t.Fatalf("signature should verify with zero source hash when any-sender is enabled")
 	}
+}
+
+func sentOverlayPayload(msg tl.Serializable) tl.Serializable {
+	wrapped, ok := msg.([]tl.Serializable)
+	if ok && len(wrapped) == 2 {
+		return wrapped[1]
+	}
+	return msg
 }
 
 func TestRebroadcastFECToPeerUsesTonutilsBroadcaster(t *testing.T) {
@@ -329,13 +491,15 @@ func TestTonutilsFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
 
 func TestEnqueueRebroadcastSkipsSourcePeer(t *testing.T) {
 	node := newTestNode(t)
+	sourcePeer := testRebroadcastQueuePeer("source")
+	targetPeer := testRebroadcastQueuePeer("target")
 	sub := &overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
 		log:  discardLogger(),
-		peers: map[string]*overlayPeer{
-			"source": testRebroadcastQueuePeer("source"),
-			"target": testRebroadcastQueuePeer("target"),
+		peers: map[PeerID]*overlayPeer{
+			sourcePeer.id: sourcePeer,
+			targetPeer.id: targetPeer,
 		},
 	}
 
@@ -343,33 +507,34 @@ func TestEnqueueRebroadcastSkipsSourcePeer(t *testing.T) {
 		subscription: sub,
 		kind:         "tonNode.externalMessageBroadcast",
 		payload:      []byte{0x01},
-		sourcePeerID: "source",
+		sourcePeerID: sourcePeer.id,
 	}
 	if !sub.enqueueRebroadcast(req) {
 		t.Fatal("expected rebroadcast enqueue")
 	}
 
-	if _, ok := sub.peers["source"].rebroadcastQueue.TryPop(); ok {
+	if _, ok := sub.peers[sourcePeer.id].rebroadcastQueue.TryPop(); ok {
 		t.Fatal("source peer should not receive its own rebroadcast")
 	}
 
-	got, ok := sub.peers["target"].rebroadcastQueue.TryPop()
+	got, ok := sub.peers[targetPeer.id].rebroadcastQueue.TryPop()
 	if !ok {
 		t.Fatal("expected target peer rebroadcast")
 	}
-	if got.sourcePeerID != "source" {
+	if got.sourcePeerID != sourcePeer.id {
 		t.Fatalf("source peer id = %q, want source", got.sourcePeerID)
 	}
 }
 
 func TestEnqueueInboundBlockRebroadcastUsesCppNodeFanout(t *testing.T) {
 	node := newTestNode(t)
-	peers := map[string]*overlayPeer{
-		"source": testRebroadcastQueuePeer("source"),
+	sourcePeer := testRebroadcastQueuePeer("source")
+	peers := map[PeerID]*overlayPeer{
+		sourcePeer.id: sourcePeer,
 	}
 	for i := 0; i < 8; i++ {
-		id := string(rune('a' + i))
-		peers[id] = testRebroadcastQueuePeer(id)
+		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
+		peers[peer.id] = peer
 	}
 	sub := &overlaySubscription{
 		node:  node,
@@ -382,13 +547,13 @@ func TestEnqueueInboundBlockRebroadcastUsesCppNodeFanout(t *testing.T) {
 		subscription: sub,
 		kind:         "tonNode.blockBroadcastCompressedV2",
 		payload:      []byte{0x01},
-		sourcePeerID: "source",
+		sourcePeerID: sourcePeer.id,
 	}
 	if !sub.enqueueRebroadcast(req) {
 		t.Fatal("expected block rebroadcast enqueue")
 	}
 
-	if _, ok := peers["source"].rebroadcastQueue.TryPop(); ok {
+	if _, ok := peers[sourcePeer.id].rebroadcastQueue.TryPop(); ok {
 		t.Fatal("source peer should not receive its own block rebroadcast")
 	}
 	if got := countQueuedRebroadcasts(peers, false); got != rebroadcastFanout {
@@ -398,12 +563,13 @@ func TestEnqueueInboundBlockRebroadcastUsesCppNodeFanout(t *testing.T) {
 
 func TestEnqueueInboundBlockRebroadcastSharesFECSource(t *testing.T) {
 	node := newTestNode(t)
-	peers := map[string]*overlayPeer{
-		"source": testRebroadcastQueuePeer("source"),
+	sourcePeer := testRebroadcastQueuePeer("source")
+	peers := map[PeerID]*overlayPeer{
+		sourcePeer.id: sourcePeer,
 	}
 	for i := 0; i < 8; i++ {
-		id := string(rune('a' + i))
-		peers[id] = testRebroadcastQueuePeer(id)
+		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
+		peers[peer.id] = peer
 	}
 	sub := &overlaySubscription{
 		node:  node,
@@ -416,7 +582,7 @@ func TestEnqueueInboundBlockRebroadcastSharesFECSource(t *testing.T) {
 		subscription: sub,
 		kind:         "tonNode.blockBroadcastCompressedV2",
 		payload:      bytes.Repeat([]byte{0x01}, 2000),
-		sourcePeerID: "source",
+		sourcePeerID: sourcePeer.id,
 	}
 	if !sub.enqueueRebroadcast(req) {
 		t.Fatal("expected block rebroadcast enqueue")
@@ -425,7 +591,7 @@ func TestEnqueueInboundBlockRebroadcastSharesFECSource(t *testing.T) {
 	var shared *overlay.BroadcastFECSender
 	queued := 0
 	for id, peer := range peers {
-		if id == "source" {
+		if id == sourcePeer.id {
 			continue
 		}
 		got, ok := peer.rebroadcastQueue.TryPop()
@@ -452,17 +618,17 @@ func TestEnqueueInboundBlockRebroadcastSharesFECSource(t *testing.T) {
 
 func TestEnqueueRebroadcastPrefersNeighbours(t *testing.T) {
 	node := newTestNode(t)
-	peers := map[string]*overlayPeer{}
+	peers := map[PeerID]*overlayPeer{}
 	for i := 0; i < 8; i++ {
-		id := string(rune('a' + i))
-		peers[id] = testRebroadcastQueuePeer(id)
+		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
+		peers[peer.id] = peer
 	}
 	sub := &overlaySubscription{
 		node:       node,
 		spec:       overlaySpec{Name: "basechain"},
 		log:        discardLogger(),
 		peers:      peers,
-		neighbours: []string{"g", "h"},
+		neighbours: []PeerID{testPeerID("g"), testPeerID("h")},
 	}
 
 	req := rebroadcastRequest{
@@ -483,10 +649,10 @@ func TestEnqueueRebroadcastPrefersNeighbours(t *testing.T) {
 
 func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
 	node := newTestNode(t)
-	peers := map[string]*overlayPeer{}
+	peers := map[PeerID]*overlayPeer{}
 	for i := 0; i < 8; i++ {
-		id := string(rune('a' + i))
-		peers[id] = testRebroadcastQueuePeer(id)
+		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
+		peers[peer.id] = peer
 	}
 	sub := &overlaySubscription{
 		node:  node,
@@ -517,7 +683,7 @@ func TestEnqueueLocalRebroadcastRecordsDropWhenPeerQueuesAreFull(t *testing.T) {
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{peer.id: peer},
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
 	}
 
 	for i := 0; i < peerRebroadcastQueueItems; i++ {
@@ -618,7 +784,7 @@ func mustHashSimpleBroadcastID(t *testing.T, payload []byte, flags int32) []byte
 	return hash
 }
 
-func countQueuedRebroadcasts(peers map[string]*overlayPeer, local bool) int {
+func countQueuedRebroadcasts(peers map[PeerID]*overlayPeer, local bool) int {
 	count := 0
 	for _, peer := range peers {
 		var queue *boundedQueue[rebroadcastRequest]

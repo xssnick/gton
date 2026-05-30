@@ -39,7 +39,7 @@ func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.Curr
 
 func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*storage.BlockState) *storage.CurrentState {
 	next := storage.CloneCurrentState(current)
-	byBlock := make(map[string]*storage.BlockState, len(states))
+	byBlock := make(map[storage.BlockRootHash]*storage.BlockState, len(states))
 	for _, state := range states {
 		if state != nil {
 			byBlock[storage.BlockKey(state.Block)] = state

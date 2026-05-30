@@ -60,7 +60,7 @@ func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePreche
 				t.Fatalf("serialize broadcast: %v", err)
 			}
 
-			first := sub.classifyBroadcast(nil, tt.msg, payload, DeliverySimple, false, "peer")
+			first := sub.classifyBroadcast(nil, tt.msg, payload, DeliverySimple, false, testPeerID("peer"))
 			if first != nil {
 				t.Fatalf("invalid masterchain broadcast was accepted before signature precheck: %+v", first)
 			}
@@ -68,7 +68,7 @@ func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePreche
 				t.Fatal("invalid masterchain broadcast should not wake before signature precheck")
 			}
 
-			second := sub.classifyBroadcast(nil, tt.msg, payload, DeliverySimple, false, "peer")
+			second := sub.classifyBroadcast(nil, tt.msg, payload, DeliverySimple, false, testPeerID("peer"))
 			if second != nil {
 				t.Fatalf("duplicate broadcast was accepted after fingerprint dedupe: %+v", second)
 			}
@@ -76,7 +76,7 @@ func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePreche
 	}
 }
 
-func TestClassifyBroadcastUsesPeerAsFECSourceKey(t *testing.T) {
+func TestClassifyBroadcastUsesPeerAsFECSourcePeerID(t *testing.T) {
 	node := newTestNode(t)
 	sub := &overlaySubscription{
 		node: node,
@@ -86,7 +86,7 @@ func TestClassifyBroadcastUsesPeerAsFECSourceKey(t *testing.T) {
 		},
 		log: discardLogger(),
 	}
-	peer := &overlayPeer{id: "peer-a", addr: "peer-a"}
+	peer := &overlayPeer{id: testPeerID("peer-a"), addr: "peer-a"}
 	block := testBlockID(0, topShard, 202)
 	msg := tonnodeapi.NewShardBlockBroadcast{
 		Block: tonnodeapi.NewShardBlock{
@@ -96,12 +96,12 @@ func TestClassifyBroadcastUsesPeerAsFECSourceKey(t *testing.T) {
 		},
 	}
 
-	accepted := sub.classifyBroadcast(peer, msg, []byte{0x01}, DeliveryFEC, false, "")
+	accepted := sub.classifyBroadcast(peer, msg, []byte{0x01}, DeliveryFEC, false, PeerID{})
 	if accepted == nil || accepted.event == nil {
 		t.Fatal("expected shard block broadcast event")
 	}
-	if accepted.event.SourceKey != "peer-a" {
-		t.Fatalf("source key = %q, want peer-a", accepted.event.SourceKey)
+	if accepted.event.SourcePeerID != testPeerID("peer-a") {
+		t.Fatalf("source key = %q, want peer-a", accepted.event.SourcePeerID)
 	}
 }
 
@@ -126,7 +126,7 @@ func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T
 		},
 	}
 
-	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, "peer")
+	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, testPeerID("peer"))
 	if accepted != nil {
 		t.Fatalf("shard block broadcast with failed signature precheck was accepted: %+v", accepted)
 	}
@@ -135,7 +135,7 @@ func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T
 	}
 }
 
-func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
+func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T) {
 	node := newTestNode(t)
 	source := testRebroadcastQueuePeer("source")
 	target := testRebroadcastQueuePeer("target")
@@ -146,7 +146,7 @@ func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-		peers: map[string]*overlayPeer{
+		peers: map[PeerID]*overlayPeer{
 			source.id: source,
 			target.id: target,
 		},
@@ -164,27 +164,20 @@ func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
 		t.Fatalf("serialize shard broadcast: %v", err)
 	}
 
-	accepted := sub.classifyBroadcast(source, msg, payload, DeliveryFEC, false, "")
+	accepted := sub.classifyBroadcast(source, msg, payload, DeliveryFEC, false, PeerID{})
 	if accepted == nil {
 		t.Fatal("expected shard block broadcast to be accepted")
+	}
+	if accepted.rebroadcast == nil || !accepted.rebroadcast.skipOverlayRebroadcast {
+		t.Fatal("expected ordinary FEC broadcast to skip app-level same-overlay rebroadcast")
 	}
 	node.acceptBroadcast(*accepted)
 
 	if _, ok := source.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("source peer should not receive its own shard block rebroadcast")
 	}
-	got, ok := target.rebroadcastQueue.TryPop()
-	if !ok {
-		t.Fatal("expected target peer shard block rebroadcast")
-	}
-	if got.kind != "tonNode.newShardBlockBroadcast" {
-		t.Fatalf("rebroadcast kind = %q, want tonNode.newShardBlockBroadcast", got.kind)
-	}
-	if got.sourcePeerID != source.id {
-		t.Fatalf("source peer id = %q, want %q", got.sourcePeerID, source.id)
-	}
-	if !bytes.Equal(got.payload, payload) {
-		t.Fatal("rebroadcast payload changed")
+	if _, ok := target.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("target peer should not receive app-level shard block rebroadcast when FEC relay is enabled")
 	}
 	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
 		t.Fatalf("accepted broadcast count = %d, want 1", got)
@@ -196,6 +189,128 @@ func TestAcceptedShardBlockBroadcastEnqueuesRebroadcast(t *testing.T) {
 	}
 	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
 		t.Fatalf("duplicate accepted broadcast count = %d, want 1", got)
+	}
+}
+
+func TestCustomOverlayRejectsUnauthorizedBlockSender(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:         "custom.private-a",
+			Kind:         overlayKindCustomFixed,
+			ShortID:      []byte{0x02, 0x03, 0x04},
+			BlockSenders: map[PeerID]struct{}{testPeerID("allowed"): {}},
+		},
+		log: discardLogger(),
+	}
+	block := testBlockID(0, topShard, 204)
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      block,
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize shard broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("blocked"))
+	if accepted != nil {
+		t.Fatalf("unauthorized custom broadcast was accepted: %+v", accepted)
+	}
+	if got := testBroadcastDropStatCount(node, "custom.private-a", "tonNode.newShardBlockBroadcast", "unauthorized_sender"); got != 1 {
+		t.Fatalf("unauthorized drop count = %d, want 1", got)
+	}
+}
+
+func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(t *testing.T) {
+	node := newTestNode(t)
+	sourceID := testPeerID("source")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:         "custom.private-a",
+			Kind:         overlayKindCustomFixed,
+			ShortID:      []byte{0x02, 0x03, 0x04},
+			BlockSenders: map[PeerID]struct{}{sourceID: {}},
+		},
+		log: discardLogger(),
+	}
+
+	data := []byte{0x10, 0x20, 0x30}
+	block := testBlockID(0, topShard, 204)
+	block.FileHash = hashSimpleBroadcastPayload(data)
+	msg := tonnodeapi.NewBlockCandidateBroadcast{
+		ID:   block,
+		Data: data,
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize block candidate broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryTwoStep, true, sourceID)
+	if accepted == nil {
+		t.Fatal("expected custom two-step broadcast to be accepted")
+	}
+	if accepted.rebroadcast == nil {
+		t.Fatal("expected accepted two-step broadcast to keep fanout payload")
+	}
+	if !accepted.rebroadcast.skipOverlayRebroadcast {
+		t.Fatal("expected two-step broadcast to skip same-overlay app rebroadcast")
+	}
+	if !bytes.Equal(accepted.rebroadcast.payload, payload) {
+		t.Fatal("expected two-step rebroadcast payload to be preserved for custom fanout")
+	}
+}
+
+func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {
+	node := newTestNode(t)
+	publicSpec := overlaySpec{
+		Name:    "basechain",
+		Kind:    overlayKindPublicShard,
+		ShortID: []byte{0x01, 0x02, 0x03},
+	}
+	publicSub, _ := node.getOrCreateSubscription(publicSpec)
+
+	customSpec := overlaySpec{
+		Name:         "custom.private-a",
+		Kind:         overlayKindCustomFixed,
+		ShortID:      []byte{0x04, 0x05, 0x06},
+		BlockSenders: map[PeerID]struct{}{node.localID: {}},
+	}
+	customSub, _ := node.getOrCreateSubscription(customSpec)
+	customPeer := testRebroadcastQueuePeer("custom-peer")
+	customSub.peers[customPeer.id] = customPeer
+
+	block := testBlockID(0, topShard, 205)
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      block,
+			CCSeqno: 8,
+			Data:    []byte{0x02},
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize shard broadcast: %v", err)
+	}
+
+	accepted := publicSub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("remote"))
+	if accepted == nil {
+		t.Fatal("expected public shard block broadcast to be accepted")
+	}
+	node.acceptBroadcast(*accepted)
+
+	got, ok := customPeer.localRebroadcastQueue.TryPop()
+	if !ok {
+		t.Fatal("expected custom overlay fanout")
+	}
+	if got.kind != "tonNode.newShardBlockBroadcast" || !got.local {
+		t.Fatalf("unexpected custom fanout request: %#v", got)
 	}
 }
 
@@ -218,14 +333,31 @@ func TestClassifyExternalMessageBroadcastCachesByBodyHash(t *testing.T) {
 		t.Fatalf("serialize external broadcast: %v", err)
 	}
 
-	first := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+	first := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
 	if first == nil || first.rebroadcast == nil {
 		t.Fatal("expected first external broadcast to be accepted")
 	}
 
-	second := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+	second := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
 	if second != nil {
 		t.Fatalf("duplicate external broadcast was accepted: %+v", second)
+	}
+}
+
+func TestHandleOverlayBroadcastRejectsInvalidUntrustedFECForRelay(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+
+	err := sub.handleOverlayBroadcast(nil, tonnodeapi.NewExternalMessageBroadcast{}, DeliveryFEC, false, testPeerID("peer"))
+	if !errors.Is(err, errBroadcastRejected) {
+		t.Fatalf("expected rejected untrusted FEC broadcast, got %v", err)
 	}
 }
 
@@ -249,7 +381,7 @@ func TestClassifyExternalMessageBroadcastLimitsPerAddress(t *testing.T) {
 		if err != nil {
 			t.Fatalf("serialize external broadcast %d: %v", i, err)
 		}
-		accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+		accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
 		if accepted == nil || accepted.rebroadcast == nil {
 			t.Fatalf("external broadcast %d was not accepted", i)
 		}
@@ -263,7 +395,7 @@ func TestClassifyExternalMessageBroadcastLimitsPerAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize external broadcast over limit: %v", err)
 	}
-	if accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer"); accepted != nil {
+	if accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer")); accepted != nil {
 		t.Fatalf("over-limit external broadcast was accepted: %+v", accepted)
 	}
 }
@@ -289,7 +421,7 @@ func TestClassifyExternalMessageBroadcastSkipsOwnMessage(t *testing.T) {
 
 	node.myExternalMessages.Mark(externalMessageFingerprint(sub.spec.ShortID, data), time.Now())
 
-	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, "peer")
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
 	if accepted != nil {
 		t.Fatalf("own external broadcast was accepted: %+v", accepted)
 	}
@@ -309,7 +441,7 @@ func TestClassifyExternalMessageBroadcastRejectsOversizeData(t *testing.T) {
 		Message: tonnodeapi.ExternalMessage{Data: make([]byte, maxOverlayPayloadSize+1)},
 	}
 
-	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, "peer")
+	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, testPeerID("peer"))
 	if accepted != nil {
 		t.Fatalf("oversize external broadcast was accepted: %+v", accepted)
 	}

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -182,37 +183,37 @@ func (s *Service) rememberSeenMasterchainBlock(block ton.BlockIDExt) {
 }
 
 type queuedMasterchainBlock struct {
-	block     PreparedBlock
-	sourceKey string
-	queuedAt  time.Time
-	bytes     int64
+	block        PreparedBlock
+	sourcePeerID p2p.PeerID
+	queuedAt     time.Time
+	bytes        int64
 }
 
 type queuedMasterchainCandidate struct {
-	block     VerifiedBlock
-	sourceKey string
-	queuedAt  time.Time
-	bytes     int64
+	block        VerifiedBlock
+	sourcePeerID p2p.PeerID
+	queuedAt     time.Time
+	bytes        int64
 }
 
 type queuedMasterchainFuture struct {
 	block              ton.BlockIDExt
-	sourceKey          string
+	sourcePeerID       p2p.PeerID
 	lowestMissingSeqno uint32
 }
 
-func (s *Service) queueMasterchainBlockCandidateFromSource(block PreparedBlock, sourceKey string) {
-	s.queuePreparedMasterchainBlockFromSource(block, sourceKey)
+func (s *Service) queueMasterchainBlockCandidateFromSource(block PreparedBlock, sourcePeerID p2p.PeerID) {
+	s.queuePreparedMasterchainBlockFromSource(block, sourcePeerID)
 }
 
-func (s *Service) queueMasterchainBroadcastCandidateFromSource(block VerifiedBlock, sourceKey string) {
+func (s *Service) queueMasterchainBroadcastCandidateFromSource(block VerifiedBlock, sourcePeerID p2p.PeerID) {
 	if !masterchainBroadcastCandidateCacheable(block) {
 		return
 	}
-	s.queueMasterchainCandidateFromSource(block, sourceKey)
+	s.queueMasterchainCandidateFromSource(block, sourcePeerID)
 }
 
-func (s *Service) queuePreparedMasterchainBlockFromSource(block PreparedBlock, sourceKey string) {
+func (s *Service) queuePreparedMasterchainBlockFromSource(block PreparedBlock, sourcePeerID p2p.PeerID) {
 	if block.ID.Workchain != -1 || block.ID.Shard != topShard || block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
 		return
 	}
@@ -225,10 +226,10 @@ func (s *Service) queuePreparedMasterchainBlockFromSource(block PreparedBlock, s
 	defer s.nextMasterchainMx.Unlock()
 
 	if s.nextMasterchainQueue == nil {
-		s.nextMasterchainQueue = make(map[string]queuedMasterchainBlock)
+		s.nextMasterchainQueue = make(map[storage.BlockRootHash]queuedMasterchainBlock)
 	}
 	if s.nextMasterchainBySeqno == nil {
-		s.nextMasterchainBySeqno = make(map[uint32]string)
+		s.nextMasterchainBySeqno = make(map[uint32]storage.BlockRootHash)
 	}
 
 	now := time.Now()
@@ -265,17 +266,17 @@ func (s *Service) queuePreparedMasterchainBlockFromSource(block PreparedBlock, s
 	}
 
 	entry := queuedMasterchainBlock{
-		block:     block,
-		sourceKey: sourceKey,
-		queuedAt:  now,
-		bytes:     bytes,
+		block:        block,
+		sourcePeerID: sourcePeerID,
+		queuedAt:     now,
+		bytes:        bytes,
 	}
 	s.nextMasterchainQueue[key] = entry
 	s.nextMasterchainBySeqno[block.ID.SeqNo] = key
 	s.nextMasterchainBytes += bytes
 }
 
-func (s *Service) queueMasterchainCandidateFromSource(block VerifiedBlock, sourceKey string) {
+func (s *Service) queueMasterchainCandidateFromSource(block VerifiedBlock, sourcePeerID p2p.PeerID) {
 	if block.ID.Workchain != -1 || block.ID.Shard != topShard || block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
 		return
 	}
@@ -293,10 +294,10 @@ func (s *Service) queueMasterchainCandidateFromSource(block VerifiedBlock, sourc
 		}
 	}
 	if s.nextMasterchainCandidates == nil {
-		s.nextMasterchainCandidates = make(map[string]queuedMasterchainCandidate)
+		s.nextMasterchainCandidates = make(map[storage.BlockRootHash]queuedMasterchainCandidate)
 	}
 	if s.nextMasterchainCandidateBySeqno == nil {
-		s.nextMasterchainCandidateBySeqno = make(map[uint32]string)
+		s.nextMasterchainCandidateBySeqno = make(map[uint32]storage.BlockRootHash)
 	}
 
 	now := time.Now()
@@ -335,10 +336,10 @@ func (s *Service) queueMasterchainCandidateFromSource(block VerifiedBlock, sourc
 	}
 
 	entry := queuedMasterchainCandidate{
-		block:     block,
-		sourceKey: sourceKey,
-		queuedAt:  now,
-		bytes:     bytes,
+		block:        block,
+		sourcePeerID: sourcePeerID,
+		queuedAt:     now,
+		bytes:        bytes,
 	}
 	s.nextMasterchainCandidates[key] = entry
 	s.nextMasterchainCandidateBySeqno[block.ID.SeqNo] = key
@@ -384,7 +385,7 @@ func queuedMasterchainCandidateBytes(block VerifiedBlock) int64 {
 	return bytes
 }
 
-func deleteQueuedMasterchainSeqnoIndex(bySeqno map[uint32]string, seqno uint32, key string) {
+func deleteQueuedMasterchainSeqnoIndex(bySeqno map[uint32]storage.BlockRootHash, seqno uint32, key storage.BlockRootHash) {
 	if bySeqno == nil {
 		return
 	}
@@ -407,7 +408,7 @@ func queuedMasterchainCandidatePrevSeqno(entry queuedMasterchainCandidate) uint3
 	return entry.block.ID.SeqNo
 }
 
-func queuedMasterchainMinPrevSeqno(queue map[string]queuedMasterchainBlock, candidates map[string]queuedMasterchainCandidate) (uint32, bool) {
+func queuedMasterchainMinPrevSeqno(queue map[storage.BlockRootHash]queuedMasterchainBlock, candidates map[storage.BlockRootHash]queuedMasterchainCandidate) (uint32, bool) {
 	var minSeqno uint32
 	first := true
 
@@ -428,7 +429,7 @@ func queuedMasterchainMinPrevSeqno(queue map[string]queuedMasterchainBlock, cand
 	return minSeqno, !first
 }
 
-func queuedMasterchainBlockTooFar(queue map[string]queuedMasterchainBlock, candidates map[string]queuedMasterchainCandidate, prevSeqno uint32) bool {
+func queuedMasterchainBlockTooFar(queue map[storage.BlockRootHash]queuedMasterchainBlock, candidates map[storage.BlockRootHash]queuedMasterchainCandidate, prevSeqno uint32) bool {
 	minSeqno, ok := queuedMasterchainMinPrevSeqno(queue, candidates)
 	if !ok || prevSeqno <= minSeqno {
 		return false
@@ -449,7 +450,7 @@ func (s *Service) pruneQueuedMasterchainBlocksLocked(now time.Time) {
 	}
 }
 
-func (s *Service) deleteQueuedMasterchainBlockLocked(key string) {
+func (s *Service) deleteQueuedMasterchainBlockLocked(key storage.BlockRootHash) {
 	entry, ok := s.nextMasterchainQueue[key]
 	if !ok {
 		return
@@ -462,7 +463,7 @@ func (s *Service) deleteQueuedMasterchainBlockLocked(key string) {
 	}
 }
 
-func (s *Service) deleteQueuedMasterchainCandidateLocked(key string) {
+func (s *Service) deleteQueuedMasterchainCandidateLocked(key storage.BlockRootHash) {
 	entry, ok := s.nextMasterchainCandidates[key]
 	if !ok {
 		return
@@ -484,7 +485,7 @@ func (s *Service) queuedMasterchainBytesLocked() int64 {
 }
 
 func (s *Service) evictFarthestQueuedMasterchainBlockLocked() bool {
-	var evictKey string
+	var evictKey storage.BlockRootHash
 	var evictSeqno uint32
 	evictCandidate := false
 	first := true
@@ -592,12 +593,14 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 			return PreparedBlock{}, 0, false, nil
 		}
 		s.dropQueuedMasterchainCandidate(prev)
-		s.log.Debug().
+		event := s.log.Debug().
 			Err(err).
 			Str("block", block.BlockRef()).
-			Str("prev", storage.FormatBlockRef(prev)).
-			Str("source", entry.sourceKey).
-			Msg("dropping invalid queued masterchain broadcast candidate")
+			Str("prev", storage.FormatBlockRef(prev))
+		if !entry.sourcePeerID.IsZero() {
+			event.Str("source_peer_id", entry.sourcePeerID.String())
+		}
+		event.Msg("dropping invalid queued masterchain broadcast candidate")
 		return PreparedBlock{}, 0, false, nil
 	}
 	block.consensusChecked = checked
@@ -605,12 +608,14 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 	prepared, err := prepareVerifiedBlockForApply(block)
 	if err != nil {
 		s.dropQueuedMasterchainCandidate(prev)
-		s.log.Debug().
+		event := s.log.Debug().
 			Err(err).
 			Str("block", block.BlockRef()).
-			Str("prev", storage.FormatBlockRef(prev)).
-			Str("source", entry.sourceKey).
-			Msg("dropping unprepared queued masterchain broadcast candidate")
+			Str("prev", storage.FormatBlockRef(prev))
+		if !entry.sourcePeerID.IsZero() {
+			event.Str("source_peer_id", entry.sourcePeerID.String())
+		}
+		event.Msg("dropping unprepared queued masterchain broadcast candidate")
 		return PreparedBlock{}, 0, false, nil
 	}
 
@@ -715,7 +720,7 @@ func (s *Service) queuedMasterchainFuture(prev ton.BlockIDExt) (queuedMasterchai
 		}
 		if !hasAhead || block.SeqNo > future.block.SeqNo {
 			future.block = block
-			future.sourceKey = entry.sourceKey
+			future.sourcePeerID = entry.sourcePeerID
 			hasAhead = true
 		}
 	}
@@ -731,7 +736,7 @@ func (s *Service) queuedMasterchainFuture(prev ton.BlockIDExt) (queuedMasterchai
 		}
 		if !hasAhead || block.SeqNo > future.block.SeqNo {
 			future.block = block
-			future.sourceKey = entry.sourceKey
+			future.sourcePeerID = entry.sourcePeerID
 			hasAhead = true
 		}
 	}
@@ -748,8 +753,11 @@ func masterchainSeqnoTarget(seqno uint32) ton.BlockIDExt {
 
 func (s *Service) currentStateForNextMasterState(ctx context.Context, current *storage.CurrentState, masterState *storage.BlockState, targets []ton.BlockIDExt, resolver *shardStateResolver) (nextState *storage.CurrentState, stats nextShardClientApplyStats, err error) {
 	started := time.Now()
+	obtainRecorder := newShardObtainRecorder()
 	defer func() {
 		stats.wall = time.Since(started)
+		stats.obtain = obtainRecorder.duration()
+		stats.downloaded = obtainRecorder.count()
 	}()
 
 	next := &storage.CurrentState{
@@ -800,6 +808,7 @@ func (s *Service) currentStateForNextMasterState(ctx context.Context, current *s
 	jobs := make(chan nextShardJob)
 	results := make(chan shardResult, len(jobsList))
 	applyCtx, cancelApply := context.WithCancel(ctx)
+	applyCtx = contextWithShardObtainRecorder(applyCtx, obtainRecorder)
 	defer cancelApply()
 
 	var wg sync.WaitGroup
@@ -875,7 +884,9 @@ func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.Blo
 		return PreparedBlock{}, err
 	}
 
+	downloadStarted := time.Now()
 	raw, err := s.downloadExactChainBlockWithRetry(ctx, block)
+	observeShardBlockObtain(ctx, downloadStarted)
 	if err != nil {
 		return PreparedBlock{}, err
 	}

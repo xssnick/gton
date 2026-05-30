@@ -25,12 +25,15 @@ const (
 )
 
 var quietRebroadcastIntervals = map[string]time.Duration{
-	"tonNode.blockBroadcast":             250 * time.Millisecond,
-	"tonNode.blockBroadcastCompressed":   250 * time.Millisecond,
-	"tonNode.blockBroadcastCompressedV2": 250 * time.Millisecond,
-	"tonNode.newShardBlockBroadcast":     500 * time.Millisecond,
-	"tonNode.externalMessageBroadcast":   100 * time.Millisecond,
-	"tonNode.ihrMessageBroadcast":        100 * time.Millisecond,
+	"tonNode.blockBroadcast":                         250 * time.Millisecond,
+	"tonNode.blockBroadcastCompressed":               250 * time.Millisecond,
+	"tonNode.blockBroadcastCompressedV2":             250 * time.Millisecond,
+	"tonNode.newBlockCandidateBroadcast":             250 * time.Millisecond,
+	"tonNode.newBlockCandidateBroadcastCompressed":   250 * time.Millisecond,
+	"tonNode.newBlockCandidateBroadcastCompressedV2": 250 * time.Millisecond,
+	"tonNode.newShardBlockBroadcast":                 500 * time.Millisecond,
+	"tonNode.externalMessageBroadcast":               100 * time.Millisecond,
+	"tonNode.ihrMessageBroadcast":                    100 * time.Millisecond,
 }
 
 type rebroadcastMode uint8
@@ -59,8 +62,8 @@ func newRebroadcastFECSlotLimits() map[rebroadcastFECLimiterClass]chan struct{} 
 	}
 }
 
-func newRebroadcastFECPeerLimits() map[rebroadcastFECLimiterClass]map[string]struct{} {
-	return map[rebroadcastFECLimiterClass]map[string]struct{}{
+func newRebroadcastFECPeerLimits() map[rebroadcastFECLimiterClass]map[PeerID]struct{} {
+	return map[rebroadcastFECLimiterClass]map[PeerID]struct{}{
 		rebroadcastFECLimiterBlock:    {},
 		rebroadcastFECLimiterExternal: {},
 	}
@@ -115,7 +118,9 @@ func (n *Node) allowRebroadcast(req *rebroadcastRequest) bool {
 
 func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2",
+		"tonNode.newBlockCandidateBroadcast", "tonNode.newBlockCandidateBroadcastCompressed",
+		"tonNode.newBlockCandidateBroadcastCompressedV2":
 		return rebroadcastPlan{mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender}
 	case "tonNode.newShardBlockBroadcast":
 		if payloadLen <= ordinarySimpleBroadcastMaxSize {
@@ -133,6 +138,13 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 		}
 		return rebroadcastPlan{mode: rebroadcastModeFEC}
 	}
+}
+
+func (s *overlaySubscription) rebroadcastPlan(kind string, payloadLen int) rebroadcastPlan {
+	if s != nil && s.spec.Kind == overlayKindCustomFixed {
+		return planCustomRebroadcast(kind, payloadLen)
+	}
+	return planRebroadcast(kind, payloadLen)
 }
 
 func (p *overlayPeer) initRebroadcastQueues() bool {
@@ -218,6 +230,12 @@ func (p *overlayPeer) rebroadcastQueueSnapshots() (QueueStatusSnapshot, QueueSta
 }
 
 func (req rebroadcastRequest) queueName() string {
+	if req.subscription != nil && req.subscription.spec.Kind == overlayKindCustomFixed {
+		payloadLen := req.payloadLen()
+		if payloadLen > 0 && planCustomRebroadcast(req.kind, payloadLen).mode == rebroadcastModeFEC {
+			return customTwoStepRebroadcastQueueName
+		}
+	}
 	if req.local {
 		return "local_rebroadcast"
 	}
@@ -238,7 +256,7 @@ func (n *Node) noteRebroadcastSent(req rebroadcastRequest) {
 	} else {
 		n.peerRebroadcastSent.Add(1)
 	}
-	n.noteBroadcast("rebroadcasted", req.overlayName(), req.kind)
+	n.noteBroadcast("queue_rebroadcasted", req.overlayName(), req.kind)
 }
 
 func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
@@ -293,7 +311,7 @@ func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *
 				Msg("dropping stale rebroadcast request")
 			continue
 		}
-		if req.sourcePeerID != "" && req.sourcePeerID == peer.id {
+		if !req.sourcePeerID.IsZero() && req.sourcePeerID == peer.id {
 			continue
 		}
 
@@ -320,7 +338,10 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		return false
 	}
 
-	plan := planRebroadcast(req.kind, payloadLen)
+	plan := s.rebroadcastPlan(req.kind, payloadLen)
+	if s.spec.Kind == overlayKindCustomFixed && plan.mode == rebroadcastModeFEC {
+		return s.enqueueCustomTwoStepRebroadcast(req)
+	}
 	if plan.mode == rebroadcastModeFEC && req.fec == nil {
 		fec, err := overlay.NewBroadcastFECSender(
 			s.node.privKey,
@@ -348,15 +369,14 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	candidates := s.rebroadcastCandidatesForRequest(req)
 	fanout := s.rebroadcastFanoutForRequest(req)
 	attempts := 1
-	shuffle := true
 	if req.local {
 		attempts = localRebroadcastAttempts
 	}
 
 	queued := 0
-	tried := make(map[string]struct{}, fanout*attempts)
+	tried := make(map[PeerID]struct{}, fanout*attempts)
 	for attempt := 0; attempt < attempts && queued < fanout; attempt++ {
-		targets := selectRebroadcastQueueTargets(candidates, tried, fanout-queued, shuffle)
+		targets := selectRebroadcastQueueTargets(candidates, tried, fanout-queued)
 		if len(targets) == 0 {
 			break
 		}
@@ -385,7 +405,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 
 func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastRequest) []*overlayPeer {
 	candidates := s.rebroadcastCandidates()
-	if req.sourcePeerID == "" {
+	if req.sourcePeerID.IsZero() {
 		return candidates
 	}
 
@@ -400,6 +420,9 @@ func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastReq
 }
 
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
+	if s != nil && s.spec.Kind == overlayKindCustomFixed {
+		return s.peerLimit()
+	}
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
 		return externalRebroadcastFanout
 	}
@@ -409,14 +432,14 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 	return rebroadcastFanout
 }
 
-func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[string]struct{}, limit int, shuffle bool) []*overlayPeer {
+func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[PeerID]struct{}, limit int) []*overlayPeer {
 	if limit <= 0 || len(candidates) == 0 {
 		return nil
 	}
 
 	pool := make([]*overlayPeer, 0, len(candidates))
 	for _, peer := range candidates {
-		if peer == nil || peer.id == "" {
+		if peer == nil || peer.id.IsZero() {
 			continue
 		}
 		if _, ok := tried[peer.id]; ok {
@@ -427,15 +450,20 @@ func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[string]s
 	if len(pool) == 0 {
 		return nil
 	}
-	if len(pool) > limit {
-		pool = pool[:limit]
+
+	if len(pool) <= limit {
+		return pool
 	}
-	if shuffle {
-		rand.Shuffle(len(pool), func(i, j int) {
-			pool[i], pool[j] = pool[j], pool[i]
-		})
+
+	// Match cppnode get_neighbours: sample unique peers from the full pool.
+	targets := make([]*overlayPeer, 0, limit)
+	for remaining := len(pool); len(targets) < limit; remaining-- {
+		idx := rand.IntN(remaining)
+		targets = append(targets, pool[idx])
+		pool[idx] = pool[remaining-1]
 	}
-	return pool
+
+	return targets
 }
 
 func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) bool {
@@ -444,7 +472,7 @@ func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overl
 		return false
 	}
 
-	plan := planRebroadcast(req.kind, payloadLen)
+	plan := s.rebroadcastPlan(req.kind, payloadLen)
 	switch plan.mode {
 	case rebroadcastModeSimple:
 		return s.rebroadcastSimpleToPeer(ctx, peer, req, plan)
@@ -567,10 +595,10 @@ func (n *Node) tryAcquireRebroadcastFECBackpressure(class rebroadcastFECLimiterC
 		return func() {}, true
 	}
 
-	peerKey := rebroadcastBackpressurePeerKey(peer)
+	peerID := rebroadcastBackpressurePeerID(peer)
 	peerAcquired := false
-	if peerKey != "" {
-		if !n.tryAcquireRebroadcastFECPeer(class, peerKey) {
+	if !peerID.IsZero() {
+		if !n.tryAcquireRebroadcastFECPeer(class, peerID) {
 			return nil, false
 		}
 		peerAcquired = true
@@ -581,12 +609,12 @@ func (n *Node) tryAcquireRebroadcastFECBackpressure(class rebroadcastFECLimiterC
 		return func() {
 			<-slots
 			if peerAcquired {
-				n.releaseRebroadcastFECPeer(class, peerKey)
+				n.releaseRebroadcastFECPeer(class, peerID)
 			}
 		}, true
 	default:
 		if peerAcquired {
-			n.releaseRebroadcastFECPeer(class, peerKey)
+			n.releaseRebroadcastFECPeer(class, peerID)
 		}
 		return nil, false
 	}
@@ -602,7 +630,7 @@ func (n *Node) rebroadcastFECSlotLimit(class rebroadcastFECLimiterClass) chan st
 	return n.rebroadcastFECSlots[class]
 }
 
-func (n *Node) tryAcquireRebroadcastFECPeer(class rebroadcastFECLimiterClass, peerKey string) bool {
+func (n *Node) tryAcquireRebroadcastFECPeer(class rebroadcastFECLimiterClass, peerID PeerID) bool {
 	n.rebroadcastFECMu.Lock()
 	defer n.rebroadcastFECMu.Unlock()
 
@@ -611,34 +639,31 @@ func (n *Node) tryAcquireRebroadcastFECPeer(class rebroadcastFECLimiterClass, pe
 	}
 	peers := n.rebroadcastFECPeers[class]
 	if peers == nil {
-		peers = map[string]struct{}{}
+		peers = map[PeerID]struct{}{}
 		n.rebroadcastFECPeers[class] = peers
 	}
-	if _, ok := peers[peerKey]; ok {
+	if _, ok := peers[peerID]; ok {
 		return false
 	}
-	peers[peerKey] = struct{}{}
+	peers[peerID] = struct{}{}
 	return true
 }
 
-func (n *Node) releaseRebroadcastFECPeer(class rebroadcastFECLimiterClass, peerKey string) {
+func (n *Node) releaseRebroadcastFECPeer(class rebroadcastFECLimiterClass, peerID PeerID) {
 	n.rebroadcastFECMu.Lock()
 	defer n.rebroadcastFECMu.Unlock()
 
 	if n.rebroadcastFECPeers == nil {
 		return
 	}
-	delete(n.rebroadcastFECPeers[class], peerKey)
+	delete(n.rebroadcastFECPeers[class], peerID)
 }
 
-func rebroadcastBackpressurePeerKey(peer *overlayPeer) string {
+func rebroadcastBackpressurePeerID(peer *overlayPeer) PeerID {
 	if peer == nil {
-		return ""
+		return PeerID{}
 	}
-	if peer.id != "" {
-		return peer.id
-	}
-	return peer.addr
+	return peer.id
 }
 
 func runFECBroadcasterToPeer(ctx context.Context, sender *overlay.BroadcastFECSender, peer overlay.BroadcastPeer, timeout time.Duration) error {

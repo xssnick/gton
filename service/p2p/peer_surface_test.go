@@ -211,7 +211,7 @@ func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 		},
 	}
 
-	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliverySimple, true, "peer")
+	accepted := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliverySimple, true, testPeerID("peer"))
 	if accepted == nil || accepted.event == nil {
 		t.Fatal("expected shard block broadcast event")
 	}
@@ -295,7 +295,7 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	_, foreignPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -306,7 +306,13 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build foreign overlay node: %v", err)
 	}
-	sub.peers["foreign"] = &overlayPeer{announced: foreignNode, alive: true, lastReceiveAt: time.Now()}
+	foreignPeerID := testPeerID("foreign")
+	sub.peers[foreignPeerID] = &overlayPeer{
+		id:            foreignPeerID,
+		announced:     foreignNode,
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
 
 	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
 	if len(res.List) < 2 {
@@ -358,7 +364,7 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	now := time.Now()
@@ -371,7 +377,9 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build overlay node: %v", err)
 		}
-		sub.peers[fmt.Sprintf("peer-%d", i)] = &overlayPeer{
+		peerID := testPeerID(fmt.Sprintf("peer-%d", i))
+		sub.peers[peerID] = &overlayPeer{
+			id:            peerID,
 			announced:     announced,
 			alive:         true,
 			lastReceiveAt: now,
@@ -413,7 +421,7 @@ func TestConnectOverlayNodeSkipsSelf(t *testing.T) {
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	self, err := node.selfOverlayNode(spec)
@@ -454,7 +462,7 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	_, foreignPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -465,7 +473,13 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build foreign overlay node: %v", err)
 	}
-	sub.peers["foreign"] = &overlayPeer{announced: foreignNode, alive: true, lastReceiveAt: time.Now()}
+	foreignPeerID := testPeerID("foreign")
+	sub.peers[foreignPeerID] = &overlayPeer{
+		id:            foreignPeerID,
+		announced:     foreignNode,
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
 
 	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
 	if len(res.List) < 2 {
@@ -652,9 +666,9 @@ func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
 func TestKnownPeerCountIgnoresInboundOnlyPeers(t *testing.T) {
 	sub := &overlaySubscription{
 		log: discardLogger(),
-		peers: map[string]*overlayPeer{
-			"inbound-only": {},
-			"known-v1": {
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("inbound-only"): {},
+			testPeerID("known-v1"): {
 				announced:     &overlay.Node{Version: int32(time.Now().Unix())},
 				alive:         true,
 				lastReceiveAt: time.Now(),
@@ -673,7 +687,7 @@ func TestKnownPeerCountIgnoresInboundOnlyPeers(t *testing.T) {
 	}
 }
 
-func countKnownPeers(peers map[string]*overlayPeer) int {
+func countKnownPeers(peers map[PeerID]*overlayPeer) int {
 	count := 0
 	now := time.Now()
 	for _, peer := range peers {
@@ -687,7 +701,7 @@ func countKnownPeers(peers map[string]*overlayPeer) int {
 
 func testRebroadcastQueuePeer(id string) *overlayPeer {
 	peer := &overlayPeer{
-		id:      id,
+		id:      testPeerID(id),
 		addr:    id,
 		overlay: &overlay.ADNLOverlayWrapper{},
 		announced: &overlay.Node{

@@ -87,14 +87,24 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		return errorResponse(err, "cannot load masterchain config")
 	}
 
+	var accountLibs *cell.Dictionary
+	if query.Mode&2 == 0 {
+		accountLibs = account.StateInit.Lib
+	}
+
 	var libraries []*cell.Cell
 	if info.masterCache != nil {
-		libraries, err = info.masterCache.runMethodLibraries(nil)
+		libraries, err = info.masterCache.runMethodLibraries(accountLibs)
 	} else {
-		libraries, err = runMethodLibraries(info.masterState, nil)
+		libraries, err = runMethodLibraries(info.masterState, accountLibs)
 	}
 	if err != nil {
 		return errorResponse(err, "cannot load libraries")
+	}
+
+	machine, err := s.tvm.WithGlobalVersion(config.GlobalVersion)
+	if err != nil {
+		return errorResponse(err, "cannot configure tvm")
 	}
 
 	c7, err := runMethodC7(runMethodC7Config{
@@ -114,13 +124,25 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		return errorResponse(err, "cannot create c7")
 	}
 
-	execResult, err := s.tvm.ExecuteDetailedWithAccountProof(
-		info.accountCell,
-		c7,
-		vmcore.GasWithLimit(runMethodGasLimit),
-		stack,
-		libraries...,
-	)
+	var execResult *tvm.ExecutionResult
+	if query.Mode&2 != 0 {
+		execResult, err = machine.ExecuteDetailedWithAccountProof(
+			info.accountCell,
+			c7,
+			vmcore.GasWithLimit(runMethodGasLimit),
+			stack,
+			libraries...,
+		)
+	} else {
+		execResult, err = machine.ExecuteGetMethodDetailedWithLibraries(
+			account.StateInit.Code,
+			account.StateInit.Data,
+			c7,
+			vmcore.GasWithLimit(runMethodGasLimit),
+			stack,
+			libraries...,
+		)
+	}
 	if err != nil {
 		return errorResponse(err, "cannot run get method")
 	}

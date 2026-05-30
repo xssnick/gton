@@ -50,7 +50,7 @@ The generated config defaults to:
 - ADNL: `0.0.0.0:30303`;
 - DHT: `0.0.0.0:30304`;
 - storage directory: `data`;
-- liteserver: disabled, listen address `0.0.0.0:7445`.
+- liteserver: disabled, non-final mode disabled, listen address `0.0.0.0:7445`.
 
 Open the external ADNL/DHT (UDP) ports on your firewall and make sure `adnl.external_addr` points to the node's public address. If you enable the liteserver for external clients, open its port too (TCP).
 
@@ -84,6 +84,58 @@ Supported flags:
 | `--from-zero` | Verify the initial key-block chain from zerostate instead of the `init_block` from global config. |
 | `--archive-checkpoint-period <duration>` | Maximum current-state checkpoint interval during archive catch-up. Defaults to `2m`. |
 | `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `2`. |
+
+## Using Custom Overlays and Non-Final Blocks
+
+Use this when the node must receive broadcasts from a private/custom overlay and optionally expose pending non-final shard blocks through its liteserver.
+
+### 1. Configure `custom_overlays`
+
+Custom overlays are configured directly in `config.json`. The local node must be listed in `nodes`; otherwise it will ignore the overlay. Set `block_sender=true` if this node should send block broadcasts to the overlay, and `msg_sender=true` if it should send external messages.
+
+Minimal `custom_overlays` example:
+
+```json
+{
+  "custom_overlays": [{
+    "name": "private-a",
+    "nodes": [{
+      "adnl_id": "<base64 32-byte ADNL id>",
+      "msg_sender": true,
+      "msg_sender_priority": 0,
+      "block_sender": true
+    }],
+    "sender_shards": [],
+    "skip_public_msg_send": false
+  }]
+}
+```
+
+`sender_shards` may be empty to send all shards. To limit sending to a shard, add entries with `workchain` and `shard`:
+
+```json
+"sender_shards": [{
+  "workchain": 0,
+  "shard": -9223372036854775808
+}]
+```
+
+`skip_public_msg_send` skips public-overlay external message broadcasting only when the message is actually sent through a matching custom overlay.
+
+### 2. Enable non-final liteserver data
+
+Set `liteserver.non_final_enabled=true` in the node config and restart:
+
+```json
+{
+  "liteserver": {
+    "enabled": true,
+    "non_final_enabled": true
+  }
+}
+```
+
+Non-final data is kept in memory only. It is not applied to persistent state or written to storage, and it is dropped when the corresponding final shard blocks arrive or cache limits are reached. Supported liteserver methods use it transparently when the request references a pending non-final block; regular final-block requests do not touch the non-final cache. `getValidatorGroups` is not supported for non-final blocks.
 
 ## Console Commands
 
@@ -147,11 +199,13 @@ Simplified example:
   "ton": {
     "global_config_path": "global.config.json",
     "sync_before": 3600,
-    "state_ttl": 259200,
+    "state_ttl": 172800,
     "archive_ttl": 604800,
-    "next_checkpoint_blocks": 300,
+    "disable_archive_backfill": false,
+    "next_checkpoint_blocks": 200,
     "archive_checkpoint_blocks": 2000,
-    "checkpoint_bytes": 536870912
+    "checkpoint_bytes": 268435456,
+    "sync_backpressure_windows": 4
   },
   "adnl": {
     "key": "<base64 ed25519 seed>",
@@ -164,6 +218,7 @@ Simplified example:
   },
   "liteserver": {
     "enabled": true,
+    "non_final_enabled": false,
     "key": "<base64 ed25519 seed>",
     "listen_addr": "0.0.0.0:7445",
     "master_block_cache": 128,
@@ -172,6 +227,11 @@ Simplified example:
   "storage": {
     "dir": "data",
     "cell_total_cache_size": 8589934592,
+    "decoded_cell_cache_enabled": true,
+    "decoded_cell_cache_shards": 64,
+    "decoded_cell_cache_bytes_per_entry": 16384,
+    "decoded_cell_cache_min_entries": 65536,
+    "decoded_cell_cache_max_entries": 1048576,
     "cell_shard_memtable_size": 268435456,
     "cell_memtable_stop_writes_threshold": 4,
     "artifact_file_max_open": 512
@@ -181,6 +241,7 @@ Simplified example:
     "listen_addr": "127.0.0.1:9090",
     "namespace": "gton"
   },
+  "custom_overlays": [],
   "disable_state_serialization": false
 }
 ```
@@ -191,11 +252,13 @@ Simplified example:
 | --- | --- |
 | `global_config_path` | Path to the TON global config. If the file is missing, it is downloaded during startup. |
 | `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `3600`. |
-| `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `259200` (3 days). |
-| `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). |
-| `next_checkpoint_blocks` | Current-state checkpoint frequency during next-block sync, in masterchain blocks. |
+| `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `172800` (2 days). Set to `0` to disable automatic cell DB generation rotation. |
+| `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). Set to `0` to keep archives forever; archive backfill will then run toward zeroblock unless disabled. |
+| `disable_archive_backfill` | Disables automatic archive backfill when `true`. Defaults to `false`. |
+| `next_checkpoint_blocks` | Current-state checkpoint frequency during next-block sync, in masterchain blocks. Defaults to `200`. |
 | `archive_checkpoint_blocks` | Current-state checkpoint frequency during archive catch-up. |
-| `checkpoint_bytes` | Pending checkpoint data threshold in bytes. Once reached, sync applies more pressure to persist a checkpoint. |
+| `checkpoint_bytes` | Pending checkpoint data threshold in bytes. Once reached, sync schedules a checkpoint. Defaults to `268435456` (256 MiB). |
+| `sync_backpressure_windows` | Number of checkpoint windows allowed to accumulate while a checkpoint is still persisting before sync backpressure waits. Defaults to `4`. |
 
 ### `adnl`
 
@@ -217,6 +280,7 @@ Simplified example:
 | Field | Description |
 | --- | --- |
 | `enabled` | Enables the liteserver. |
+| `non_final_enabled` | Enables in-memory non-final shard block visibility for supported liteserver methods. Defaults to `false`. |
 | `key` | Base64-encoded Ed25519 seed for the liteserver key. Required when `enabled=true`. |
 | `listen_addr` | Liteserver listener address. Defaults to `0.0.0.0:7445`. |
 | `master_block_cache` | Live cache size for masterchain blocks. |
@@ -228,6 +292,11 @@ Simplified example:
 | --- | --- |
 | `dir` | Pebble storage directory. |
 | `cell_total_cache_size` | Total cache budget for the cell DB, in bytes. Defaults to `8589934592` (8 GiB). |
+| `decoded_cell_cache_enabled` | Enables the in-process decoded lazy-cell cache. Defaults to `true`. |
+| `decoded_cell_cache_shards` | Number of LRU shards in the decoded lazy-cell cache. Defaults to `64`. |
+| `decoded_cell_cache_bytes_per_entry` | Estimated bytes per decoded cell cache entry used to derive capacity from `cell_total_cache_size`. Defaults to `16384`. |
+| `decoded_cell_cache_min_entries` | Minimum decoded cell cache entries. Defaults to `65536`. |
+| `decoded_cell_cache_max_entries` | Maximum decoded cell cache entries. Defaults to `1048576`. |
 | `cell_shard_memtable_size` | Memtable size for one cell DB shard, in bytes. |
 | `cell_memtable_stop_writes_threshold` | Pebble stop-writes threshold for memtables. |
 | `artifact_file_max_open` | Open-file limit for block/state artifacts. |
@@ -239,6 +308,26 @@ Simplified example:
 | `enabled` | Enables the Prometheus endpoint. |
 | `listen_addr` | HTTP listener address for `/metrics`, for example `127.0.0.1:9090`. |
 | `namespace` | Prometheus metric prefix. Defaults to `gton`; must match `[A-Za-z_][A-Za-z0-9_]*`. |
+
+### `custom_overlays`
+
+List of private overlay definitions. Empty by default. Each overlay has:
+
+| Field | Description |
+| --- | --- |
+| `name` | Custom overlay name used to derive the overlay id. |
+| `nodes` | Fixed overlay members. The local ADNL id must be present here to join the overlay. |
+| `sender_shards` | Optional shard filter for block and external-message sending. Empty means all shards. |
+| `skip_public_msg_send` | When `true`, skips public-overlay external message broadcasting after the message is sent through this custom overlay. |
+
+Each `nodes` entry has:
+
+| Field | Description |
+| --- | --- |
+| `adnl_id` | Base64-encoded 32-byte ADNL id. |
+| `msg_sender` | Allows this node to send external-message broadcasts. |
+| `msg_sender_priority` | Message sender priority preserved from the overlay config. |
+| `block_sender` | Allows this node to send block broadcasts. |
 
 ### `disable_state_serialization`
 

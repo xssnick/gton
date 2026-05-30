@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -39,13 +38,17 @@ type overlaySubscription struct {
 	nextSeedAt          time.Time
 	archivePeerMx       sync.Mutex
 	chainDownloadMx     sync.Mutex
-	peers               map[string]*overlayPeer
-	neighbours          []string
-	lastPingedNeighbour string
+	peers               map[PeerID]*overlayPeer
+	neighbours          []PeerID
+	lastPingedNeighbour PeerID
 	archivePeers        map[string]*archivePeerState
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
-	liveNextPeers       map[string]*liveNextPeerState
+	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
+	fecRelayState       *overlay.BroadcastFECRelayState
+	twoStepState        *overlay.BroadcastTwoStepState
+	twoStepQueue        *boundedQueue[rebroadcastRequest]
+	twoStepQueueClosed  bool
 }
 
 func (s *overlaySubscription) isActive() bool {
@@ -140,11 +143,16 @@ func (s *overlaySubscription) close() {
 	for _, peer := range s.peers {
 		peers = append(peers, peer)
 	}
-	s.peers = map[string]*overlayPeer{}
+	s.peers = map[PeerID]*overlayPeer{}
 	s.neighbours = nil
 	s.notifyPeersChangedLocked()
+	twoStepQueue := s.twoStepQueue
+	s.twoStepQueueClosed = true
 	s.mx.Unlock()
 
+	if twoStepQueue != nil {
+		twoStepQueue.Close()
+	}
 	for _, peer := range peers {
 		peer.closeRebroadcastQueues()
 		if peer.overlay != nil {
@@ -157,13 +165,13 @@ func (s *overlaySubscription) close() {
 }
 
 type archivePeerState struct {
-	deniedPeers map[string]time.Time
+	deniedPeers map[PeerID]time.Time
 }
 
 type chainDownloadState struct {
 	peer        *overlayPeer
 	speed       float64
-	unavailable map[string]chainUnavailablePeer
+	unavailable map[PeerID]chainUnavailablePeer
 }
 
 type chainUnavailablePeer struct {
@@ -180,10 +188,11 @@ type liveNextPeerState struct {
 }
 
 type overlayPeer struct {
-	id          string
+	id          PeerID
 	addr        string
 	pub         ed25519.PublicKey
 	announced   *overlay.Node
+	fixedMember bool
 	overlay     *overlay.ADNLOverlayWrapper
 	rldp        *overlay.RLDPWrapper
 	rldpOverlay *overlay.RLDPOverlayWrapper
@@ -213,7 +222,7 @@ type overlayPeer struct {
 
 func (s *overlaySubscription) run(ctx context.Context) {
 	s.log.Info().Msg("starting overlay peer discovery")
-	s.startSeedFromDHT(ctx)
+	s.startPeerDiscovery(ctx)
 
 	dhtTicker := time.NewTicker(dhtRefreshInterval)
 	defer dhtTicker.Stop()
@@ -231,7 +240,7 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-dhtTicker.C:
-			s.startSeedFromDHT(ctx)
+			s.startPeerDiscovery(ctx)
 		case <-refreshTimer.C:
 			s.refreshPeers(ctx)
 			refreshTimer.Reset(nextPeerRefreshDelay())
@@ -246,6 +255,14 @@ func (s *overlaySubscription) run(ctx context.Context) {
 			adnlPingTimer.Reset(nextADNLPingDelay())
 		}
 	}
+}
+
+func (s *overlaySubscription) startPeerDiscovery(ctx context.Context) {
+	if s.spec.Kind == overlayKindCustomFixed {
+		s.startSeedFromFixedNodes(ctx)
+		return
+	}
+	s.startSeedFromDHT(ctx)
 }
 
 func (s *overlaySubscription) startSeedFromDHT(ctx context.Context) {
@@ -352,6 +369,32 @@ func (s *overlaySubscription) finishSeedFromDHT() {
 	s.seedMx.Unlock()
 }
 
+func (s *overlaySubscription) startSeedFromFixedNodes(ctx context.Context) {
+	if !s.isActive() || s.node == nil || s.node.dht == nil {
+		return
+	}
+
+	s.seedMx.Lock()
+	if s.seedRunning {
+		s.seedMx.Unlock()
+		return
+	}
+	s.seedRunning = true
+	s.seedMx.Unlock()
+
+	run := func() {
+		defer s.finishFixedNodeSeed()
+		s.seedFromFixedNodes(ctx)
+	}
+	s.node.runAsync(run)
+}
+
+func (s *overlaySubscription) finishFixedNodeSeed() {
+	s.seedMx.Lock()
+	s.seedRunning = false
+	s.seedMx.Unlock()
+}
+
 func (s *overlaySubscription) currentSeedTarget(defaultTarget int) int {
 	s.seedMx.Lock()
 	defer s.seedMx.Unlock()
@@ -373,8 +416,7 @@ type adnlPinger interface {
 
 type overlayNodeIdentity struct {
 	pub    ed25519.PublicKey
-	nodeID []byte
-	peerID string
+	peerID PeerID
 	self   bool
 }
 
@@ -565,14 +607,14 @@ func (s *overlaySubscription) prepareDHTRefreshNode(node overlay.Node, replaceme
 	return true, true
 }
 
-func (s *overlaySubscription) hasPeer(id string) bool {
+func (s *overlaySubscription) hasPeer(id PeerID) bool {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
 	return s.peers[id] != nil
 }
 
-func (s *overlaySubscription) hasPeerReplacementCandidate(candidateID string) bool {
+func (s *overlaySubscription) hasPeerReplacementCandidate(candidateID PeerID) bool {
 	s.mx.Lock()
 	if s.peers[candidateID] != nil {
 		s.mx.Unlock()
@@ -583,7 +625,7 @@ func (s *overlaySubscription) hasPeerReplacementCandidate(candidateID string) bo
 	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now)
 	s.mx.Unlock()
 
-	return evictID != ""
+	return !evictID.IsZero()
 }
 
 func (s *overlaySubscription) connectDHTOverlayNode(ctx context.Context, node overlay.Node) (bool, error) {
@@ -615,7 +657,7 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 	}
 	s.mx.Unlock()
 
-	addrList, _, err := findPeerAddresses(ctx, s.node.dht, identity.nodeID)
+	addrList, _, err := findPeerAddresses(ctx, s.node.dht, identity.peerID[:])
 	if err != nil {
 		return false, fmt.Errorf("find ADNL addresses: %w", err)
 	}
@@ -640,13 +682,91 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 			}
 			event.
 				Str("peer", pooled.addr).
-				Str("peer_id", pooled.id).
+				Str("peer_id", pooled.id.String()).
 				Msg("connected overlay peer")
 		}
 		return attached, nil
 	}
 
 	return false, fmt.Errorf("failed to dial any address for overlay peer")
+}
+
+func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
+	if s.node == nil || s.node.dht == nil || !s.isActive() {
+		return
+	}
+	if s.aliveKnownPeerCount() >= s.peerLimit()-1 {
+		return
+	}
+
+	connected := 0
+	for _, id := range s.spec.FixedNodes {
+		if ctx.Err() != nil {
+			return
+		}
+		if id == s.node.localID || s.hasPeer(id) {
+			continue
+		}
+
+		connectCtx, cancel := context.WithTimeout(ctx, dhtSeedPeerTimeout)
+		attached, err := s.connectFixedNode(connectCtx, id)
+		cancel()
+		if err != nil {
+			s.log.Debug().
+				Err(err).
+				Str("peer_id", id.String()).
+				Msg("failed to connect fixed custom overlay peer")
+			continue
+		}
+		if attached {
+			connected++
+		}
+	}
+	if connected > 0 {
+		s.log.Debug().
+			Int("connected_peers", connected).
+			Int("known_peers", len(s.knownPeersSnapshot())).
+			Msg("custom overlay fixed peer search finished")
+	}
+}
+
+func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerID) (bool, error) {
+	addrList, pub, err := findPeerAddresses(ctx, s.node.dht, nodeID[:])
+	if err != nil {
+		return false, fmt.Errorf("find ADNL addresses: %w", err)
+	}
+	if len(addrList.Addresses) == 0 {
+		return false, fmt.Errorf("fixed node has no addresses")
+	}
+
+	pubID, err := tl.Hash(keys.PublicKeyED25519{Key: pub})
+	if err != nil {
+		return false, fmt.Errorf("hash fixed node public key: %w", err)
+	}
+	if !bytes.Equal(pubID, nodeID[:]) {
+		return false, fmt.Errorf("fixed node public key does not match requested ADNL id")
+	}
+
+	for _, addr := range addrList.Addresses {
+		udpAddr, err := adnladdr.DialString(addr)
+		if err != nil {
+			continue
+		}
+		pooled, err := s.node.pool.Get(udpAddr, pub)
+		if err != nil {
+			continue
+		}
+		if s.attachPooledPeer(pooled, nil) {
+			s.log.Debug().
+				Str("peer", pooled.addr).
+				Str("peer_id", pooled.id.String()).
+				Msg("connected fixed custom overlay peer")
+			return true, nil
+		}
+		return false, nil
+	}
+
+	return false, fmt.Errorf("failed to dial any fixed node address")
 }
 
 func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNodeIdentity, error) {
@@ -674,15 +794,22 @@ func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNod
 	if err != nil {
 		return overlayNodeIdentity{}, fmt.Errorf("hash overlay node id: %w", err)
 	}
+	peerID, err := NewPeerID(nodeID)
+	if err != nil {
+		return overlayNodeIdentity{}, fmt.Errorf("parse overlay node id: %w", err)
+	}
 
 	return overlayNodeIdentity{
 		pub:    append(ed25519.PublicKey(nil), pub.Key...),
-		nodeID: append([]byte(nil), nodeID...),
-		peerID: hex.EncodeToString(nodeID),
+		peerID: peerID,
 	}, nil
 }
 
 func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *overlay.Node) bool {
+	if !s.acceptsPeerID(pooled.id) {
+		return false
+	}
+
 	s.mx.Lock()
 	if peer := s.peers[pooled.id]; peer != nil {
 		peer.mergeAnnouncement(announced)
@@ -691,9 +818,9 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	}
 
 	var evicted *overlayPeer
-	if len(s.peers) >= maxPeersPerOverlay {
+	if len(s.peers) >= s.peerLimit() {
 		evictID := s.attachPeerEvictionCandidateLocked(pooled.id)
-		if evictID == "" {
+		if evictID.IsZero() {
 			s.mx.Unlock()
 			return false
 		}
@@ -702,16 +829,21 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		s.removeNeighbourLocked(evictID)
 	}
 
+	allowBroadcastFEC := s.spec.Kind != overlayKindCustomFixed
 	state := &overlayPeer{
 		id:            pooled.id,
 		addr:          pooled.addr,
 		pub:           append(ed25519.PublicKey(nil), pooled.pub...),
 		announced:     cloneOverlayNode(announced),
-		overlay:       pooled.adnl.CreateOverlayWithSettings(s.spec.ShortID, maxOverlayPayloadSize, true, false),
+		fixedMember:   s.spec.Kind == overlayKindCustomFixed,
+		overlay:       pooled.adnl.CreateOverlayWithSettings(s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false),
 		rldp:          pooled.rldp,
 		rldpOverlay:   pooled.rldp.CreateOverlay(s.spec.ShortID),
 		alive:         true,
 		lastReceiveAt: time.Now(),
+	}
+	if len(s.spec.AuthorizedKeys) > 0 {
+		state.overlay.SetAuthorizedKeys(s.spec.AuthorizedKeys)
 	}
 	state.initRebroadcastQueues()
 	s.peers[pooled.id] = state
@@ -721,23 +853,40 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	if evicted != nil {
 		evicted.closeRebroadcastQueues()
 	}
+	s.configureBroadcastFECRelay(state)
+	s.configureCustomTwoStepBroadcast(state)
 	s.installHandlers(state)
 	s.startPeerRebroadcastWorker(state)
-	if announced != nil {
+	if announced != nil || s.spec.Kind == overlayKindCustomFixed {
 		s.reloadNeighbours()
 		s.startPeerWarmup(state)
 	}
 	return true
 }
 
-func (s *overlaySubscription) attachPeerEvictionCandidateLocked(candidateID string) string {
+func (s *overlaySubscription) acceptsPeerID(id PeerID) bool {
+	if s.spec.Kind != overlayKindCustomFixed {
+		return true
+	}
+	_, ok := s.spec.FixedNodeIDs[id]
+	return ok
+}
+
+func (s *overlaySubscription) peerLimit() int {
+	if s.spec.Kind == overlayKindCustomFixed && len(s.spec.FixedNodes) > maxPeersPerOverlay {
+		return len(s.spec.FixedNodes)
+	}
+	return maxPeersPerOverlay
+}
+
+func (s *overlaySubscription) attachPeerEvictionCandidateLocked(candidateID PeerID) PeerID {
 	now := time.Now()
 	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now)
 	return evictID
 }
 
-func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID string, now time.Time) (string, float64) {
-	evictID := ""
+func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID PeerID, now time.Time) (PeerID, float64) {
+	evictID := PeerID{}
 	evictScore := -1.0
 	for id, peer := range s.peers {
 		if id == candidateID {
@@ -748,13 +897,13 @@ func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID string,
 		}
 
 		score := peerReplacementScore(peer, now)
-		if evictID == "" || score > evictScore {
+		if evictID.IsZero() || score > evictScore {
 			evictID = id
 			evictScore = score
 		}
 	}
 	if evictScore < peerStopUnreliability {
-		return "", evictScore
+		return PeerID{}, evictScore
 	}
 	return evictID, evictScore
 }
@@ -811,8 +960,10 @@ func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
 		ctx, cancel := context.WithTimeout(s.node.runCtx, attachWarmupTimeout)
 		defer cancel()
 
-		s.pingPeer(ctx, peer)
-		if ctx.Err() == nil {
+		if s.spec.QueryCapabilities {
+			s.pingPeer(ctx, peer)
+		}
+		if ctx.Err() == nil && s.spec.RandomPeers {
 			s.exchangeRandomPeers(ctx, peer)
 		}
 	})
@@ -820,11 +971,18 @@ func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
 
 func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 	peer.overlay.SetBroadcastHandlerWithInfo(func(msg tl.Serializable, info overlay.BroadcastInfo) error {
-		sourceKey := ""
+		var sourcePeerID PeerID
 		if len(info.SourceID) > 0 {
-			sourceKey = hex.EncodeToString(info.SourceID)
+			id, err := NewPeerID(info.SourceID)
+			if err == nil {
+				sourcePeerID = id
+			}
 		}
-		return s.handleOverlayBroadcast(peer, msg, DeliveryFEC, info.Trusted, sourceKey)
+		delivery := DeliveryFEC
+		if info.TwoStep {
+			delivery = DeliveryTwoStep
+		}
+		return s.handleOverlayBroadcast(peer, msg, delivery, info.Trusted, sourcePeerID)
 	})
 	peer.overlay.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
 		switch data := msg.Data.(type) {
@@ -844,16 +1002,20 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 		return s.answerRLDPQuery(peer, transferID, query)
 	})
 	peer.overlay.SetDisconnectHandler(func(_ string, key ed25519.PublicKey) {
-		id, err := tl.Hash(keys.PublicKeyED25519{Key: key})
+		rawID, err := tl.Hash(keys.PublicKeyED25519{Key: key})
 		if err != nil {
 			return
 		}
-		s.removePeer(hex.EncodeToString(id))
+		id, err := NewPeerID(rawID)
+		if err != nil {
+			return
+		}
+		s.removePeer(id)
 	})
 }
 
 func (s *overlaySubscription) refreshPeers(ctx context.Context) {
-	if !s.isActive() {
+	if !s.isActive() || !s.spec.RandomPeers {
 		return
 	}
 	peers := s.refreshTargets()
@@ -913,7 +1075,7 @@ func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *ove
 }
 
 func (s *overlaySubscription) pingPeers(ctx context.Context) {
-	if !s.isActive() {
+	if !s.isActive() || !s.spec.QueryCapabilities {
 		return
 	}
 	for _, peer := range s.pingTargets() {
@@ -1005,13 +1167,14 @@ func (s *overlaySubscription) handleSimpleBroadcast(peer *overlayPeer, msg overl
 		return nil
 	}
 
+	actualSourceID, err := tl.Hash(msg.Source)
+	if err != nil {
+		return nil
+	}
+
 	sourceID := make([]byte, 32)
 	if msg.Flags&1 == 0 {
-		var err error
-		sourceID, err = tl.Hash(msg.Source)
-		if err != nil {
-			return nil
-		}
+		sourceID = actualSourceID
 	}
 
 	broadcastHash, err := tl.Hash(OverlayBroadcastID{
@@ -1040,10 +1203,15 @@ func (s *overlaySubscription) handleSimpleBroadcast(peer *overlayPeer, msg overl
 		return nil
 	}
 
-	return s.handleOverlayBroadcast(peer, parsed, DeliverySimple, false, hex.EncodeToString(sourceID))
+	sourcePeerID, err := NewPeerID(actualSourceID)
+	if err != nil {
+		return nil
+	}
+
+	return s.handleOverlayBroadcast(peer, parsed, DeliverySimple, false, sourcePeerID)
 }
 
-func (s *overlaySubscription) removePeer(id string) {
+func (s *overlaySubscription) removePeer(id PeerID) {
 	s.mx.Lock()
 	peer := s.peers[id]
 	delete(s.peers, id)
@@ -1076,7 +1244,7 @@ func (s *overlaySubscription) ensurePeers(ctx context.Context) error {
 		return errors.New("shard is inactive")
 	}
 
-	s.startSeedFromDHT(ctx)
+	s.startPeerDiscovery(ctx)
 
 	for {
 		if s.aliveKnownPeerCount() > 0 {
@@ -1090,7 +1258,7 @@ func (s *overlaySubscription) ensurePeers(ctx context.Context) error {
 			return ctx.Err()
 		case <-notify:
 		case <-time.After(downloadRetryDelay):
-			s.startSeedFromDHT(ctx)
+			s.startPeerDiscovery(ctx)
 		}
 	}
 }

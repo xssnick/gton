@@ -10,7 +10,7 @@ import (
 func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
 	now := time.Unix(1000, 0)
 	svc := &Service{
-		shardDescriptionHints: map[string]shardDescriptionHint{},
+		shardDescriptionHints: map[storage.BlockRootHash]shardDescriptionHint{},
 	}
 
 	total := shardDescriptionHintLimit + 3
@@ -41,6 +41,6 @@ func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
 	}
 	firstKept := storage.BlockKey(testBlockID(0, topShard, 4))
 	if svc.shardDescriptionOrder[0] != firstKept {
-		t.Fatalf("first retained key = %q, want %q", svc.shardDescriptionOrder[0], firstKept)
+		t.Fatalf("first retained key = %x, want %x", svc.shardDescriptionOrder[0], firstKept)
 	}
 }

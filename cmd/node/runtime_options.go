@@ -14,6 +14,7 @@ import (
 
 type liteserverOptions struct {
 	Enabled          bool
+	NonFinalEnabled  bool
 	ListenAddr       string
 	PrivateKey       ed25519.PrivateKey
 	MasterBlockCache int
@@ -55,12 +56,71 @@ func p2pOptionsFromConfig(cfg nodeconfig.Config) (p2p.Options, error) {
 		opts.ExternalPort = port
 	}
 
+	opts.CustomOverlays, err = customOverlaysFromConfig(cfg.CustomOverlays)
+	if err != nil {
+		return p2p.Options{}, err
+	}
+
 	return opts, nil
+}
+
+func customOverlaysFromConfig(raw []nodeconfig.CustomOverlay) ([]p2p.CustomOverlayConfig, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	seen := map[string]struct{}{}
+	overlays := make([]p2p.CustomOverlayConfig, 0, len(raw))
+	for idx, overlay := range raw {
+		name := strings.TrimSpace(overlay.Name)
+		if name == "" {
+			return nil, fmt.Errorf("custom_overlays[%d].name is empty", idx)
+		}
+		if _, ok := seen[name]; ok {
+			return nil, fmt.Errorf("duplicate custom overlay name %q", name)
+		}
+		seen[name] = struct{}{}
+
+		if len(overlay.Nodes) == 0 {
+			return nil, fmt.Errorf("custom_overlays[%d].nodes is empty", idx)
+		}
+
+		nodes := make([]p2p.CustomOverlayNodeConfig, 0, len(overlay.Nodes))
+		for nodeIdx, node := range overlay.Nodes {
+			adnlID, err := p2p.NewPeerID(node.ADNLID)
+			if err != nil {
+				return nil, fmt.Errorf("custom_overlays[%d].nodes[%d].adnl_id: %w", idx, nodeIdx, err)
+			}
+			nodes = append(nodes, p2p.CustomOverlayNodeConfig{
+				ADNLID:            adnlID,
+				MsgSender:         node.MsgSender,
+				MsgSenderPriority: node.MsgSenderPriority,
+				BlockSender:       node.BlockSender,
+			})
+		}
+
+		shards := make([]p2p.CustomOverlayShard, 0, len(overlay.SenderShards))
+		for _, shard := range overlay.SenderShards {
+			shards = append(shards, p2p.CustomOverlayShard{
+				Workchain: shard.Workchain,
+				Shard:     shard.Shard,
+			})
+		}
+
+		overlays = append(overlays, p2p.CustomOverlayConfig{
+			Name:              name,
+			Nodes:             nodes,
+			SenderShards:      shards,
+			SkipPublicMsgSend: overlay.SkipPublicMsgSend,
+		})
+	}
+	return overlays, nil
 }
 
 func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, error) {
 	opts := liteserverOptions{
 		Enabled:          cfg.Lite.Enabled,
+		NonFinalEnabled:  cfg.Lite.NonFinalEnabled,
 		ListenAddr:       strings.TrimSpace(cfg.Lite.ListenAddr),
 		MasterBlockCache: cfg.Lite.MasterBlockCache,
 		ShardBlockCache:  cfg.Lite.ShardBlockCache,

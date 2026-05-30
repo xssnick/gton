@@ -23,7 +23,7 @@ func (s *Service) rememberMasterState(state *storage.BlockState) {
 
 	s.masterStateCacheMu.Lock()
 	if s.masterStateCache == nil {
-		s.masterStateCache = make(map[string]*storage.BlockState, masterStateCacheLimit)
+		s.masterStateCache = make(map[storage.BlockRootHash]*storage.BlockState, masterStateCacheLimit)
 	}
 	if _, ok := s.masterStateCache[key]; !ok {
 		s.masterStateCacheKeys = append(s.masterStateCacheKeys, key)
@@ -112,6 +112,26 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 		return nil, err
 	}
 
+	if live, ok := s.liveState.(liveStateRootStore); ok {
+		state, err = live.BlockState(ctx, block)
+		if err == nil {
+			if state.Cell != nil {
+				return state.Cell, nil
+			}
+			if len(state.StateRootHash) == 32 {
+				root, err := live.LoadStateCellTree(ctx, block, state.StateRootHash)
+				if err == nil {
+					return root, nil
+				}
+				if !errors.Is(err, storage.ErrNotFound) {
+					return nil, err
+				}
+			}
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
+	}
+
 	if block.Workchain != -1 || block.Shard != topShard {
 		return nil, storage.ErrNotFound
 	}
@@ -129,6 +149,11 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 
 	root, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
 	return root, err
+}
+
+type liveStateRootStore interface {
+	BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error)
+	LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error)
 }
 
 func currentStateBlockState(current *storage.CurrentState, block ton.BlockIDExt) (*storage.BlockState, error) {

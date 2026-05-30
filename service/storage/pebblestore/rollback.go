@@ -87,8 +87,8 @@ func (s *Store) rollbackDeleteHotKey(db *pebble.DB, batch *pebble.Batch, key []b
 	return 1, nil
 }
 
-func rollbackKeepStates(current *storage.CurrentState) map[string]struct{} {
-	keep := map[string]struct{}{
+func rollbackKeepStates(current *storage.CurrentState) map[storage.BlockRootHash]struct{} {
+	keep := map[storage.BlockRootHash]struct{}{
 		storage.BlockKey(current.Masterchain.Block): {},
 	}
 	for _, shard := range current.Shards {
@@ -97,8 +97,8 @@ func rollbackKeepStates(current *storage.CurrentState) map[string]struct{} {
 	return keep
 }
 
-func (s *Store) rollbackDeleteBlockMeta(ctx context.Context, db *pebble.DB, batch *pebble.Batch, cutoff uint32, keepStates map[string]struct{}) (map[string]struct{}, RollbackStats, error) {
-	futureBlocks := map[string]struct{}{}
+func (s *Store) rollbackDeleteBlockMeta(ctx context.Context, db *pebble.DB, batch *pebble.Batch, cutoff uint32, keepStates map[storage.BlockRootHash]struct{}) (map[storage.BlockRootHash]struct{}, RollbackStats, error) {
+	futureBlocks := map[storage.BlockRootHash]struct{}{}
 	var stats RollbackStats
 	err := s.rollbackScanPrefix(ctx, db, hotPrefixBlockMeta, func(key []byte, value []byte) error {
 		block, err := decodeRollbackBlockKey(hotPrefixBlockMeta, key)
@@ -122,7 +122,7 @@ func (s *Store) rollbackDeleteBlockMeta(ctx context.Context, db *pebble.DB, batc
 	return futureBlocks, stats, err
 }
 
-func rollbackDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, cutoff uint32, keepStates map[string]struct{}) bool {
+func rollbackDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, cutoff uint32, keepStates map[storage.BlockRootHash]struct{}) bool {
 	if block.Workchain == -1 && block.Shard == rollbackMasterShard {
 		return block.SeqNo > cutoff
 	}
@@ -136,7 +136,7 @@ func rollbackDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, cuto
 	return false
 }
 
-func (s *Store) rollbackDeleteStateMeta(ctx context.Context, db *pebble.DB, batch *pebble.Batch, cutoff uint32, keepStates map[string]struct{}) (int, error) {
+func (s *Store) rollbackDeleteStateMeta(ctx context.Context, db *pebble.DB, batch *pebble.Batch, cutoff uint32, keepStates map[storage.BlockRootHash]struct{}) (int, error) {
 	deleted := 0
 	err := s.rollbackScanPrefix(ctx, db, hotPrefixStateMeta, func(key []byte, _ []byte) error {
 		block, err := decodeRollbackBlockKey(hotPrefixStateMeta, key)
@@ -158,7 +158,7 @@ func (s *Store) rollbackDeleteStateMeta(ctx context.Context, db *pebble.DB, batc
 	return deleted, nil
 }
 
-func rollbackDeleteState(block ton.BlockIDExt, cutoff uint32, keepStates map[string]struct{}) bool {
+func rollbackDeleteState(block ton.BlockIDExt, cutoff uint32, keepStates map[storage.BlockRootHash]struct{}) bool {
 	if _, keep := keepStates[storage.BlockKey(block)]; keep {
 		return false
 	}
@@ -168,7 +168,7 @@ func rollbackDeleteState(block ton.BlockIDExt, cutoff uint32, keepStates map[str
 	return true
 }
 
-func (s *Store) rollbackDeleteIndexedBlocks(ctx context.Context, db *pebble.DB, batch *pebble.Batch, futureBlocks map[string]struct{}, cutoff uint32) (int, error) {
+func (s *Store) rollbackDeleteIndexedBlocks(ctx context.Context, db *pebble.DB, batch *pebble.Batch, futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) (int, error) {
 	deleted := 0
 	scans := []rollbackScan{
 		{prefix: hotPrefixNextBlock, delete: rollbackDeleteNextBlock(futureBlocks, cutoff)},
@@ -206,7 +206,7 @@ type rollbackScan struct {
 	delete func(key []byte, value []byte) (bool, error)
 }
 
-func rollbackDeleteNextBlock(futureBlocks map[string]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
+func rollbackDeleteNextBlock(futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
 	return func(key []byte, value []byte) (bool, error) {
 		prev, err := decodeRollbackBlockKey(hotPrefixNextBlock, key)
 		if err != nil {
@@ -220,7 +220,7 @@ func rollbackDeleteNextBlock(futureBlocks map[string]struct{}, cutoff uint32) fu
 	}
 }
 
-func rollbackDeleteIndexValue(futureBlocks map[string]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
+func rollbackDeleteIndexValue(futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
 	return func(_ []byte, value []byte) (bool, error) {
 		block, err := decodeBlockID(value)
 		if err != nil {
@@ -230,7 +230,7 @@ func rollbackDeleteIndexValue(futureBlocks map[string]struct{}, cutoff uint32) f
 	}
 }
 
-func rollbackDeleteBlockIDKey(prefix []byte, futureBlocks map[string]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
+func rollbackDeleteBlockIDKey(prefix []byte, futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
 	return func(key []byte, _ []byte) (bool, error) {
 		block, err := decodeRollbackBlockKey(prefix, key)
 		if err != nil {
@@ -240,7 +240,7 @@ func rollbackDeleteBlockIDKey(prefix []byte, futureBlocks map[string]struct{}, c
 	}
 }
 
-func rollbackDeleteProofKey(prefix []byte, futureBlocks map[string]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
+func rollbackDeleteProofKey(prefix []byte, futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
 	return func(key []byte, _ []byte) (bool, error) {
 		if len(key) != len(prefix)+1+80 {
 			return false, fmt.Errorf("invalid proof key size %d", len(key))
@@ -253,7 +253,7 @@ func rollbackDeleteProofKey(prefix []byte, futureBlocks map[string]struct{}, cut
 	}
 }
 
-func rollbackDeleteStateFileKey(futureBlocks map[string]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
+func rollbackDeleteStateFileKey(futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) func([]byte, []byte) (bool, error) {
 	return func(key []byte, _ []byte) (bool, error) {
 		if len(key) != len(hotPrefixStateFileRef)+80+80+8 {
 			return false, fmt.Errorf("invalid state file key size %d", len(key))
@@ -282,7 +282,7 @@ func rollbackDeleteArchiveInfo(cutoff uint32) func([]byte, []byte) (bool, error)
 	}
 }
 
-func rollbackFutureBlock(block ton.BlockIDExt, futureBlocks map[string]struct{}, cutoff uint32) bool {
+func rollbackFutureBlock(block ton.BlockIDExt, futureBlocks map[storage.BlockRootHash]struct{}, cutoff uint32) bool {
 	if block.Workchain == -1 && block.Shard == rollbackMasterShard && block.SeqNo > cutoff {
 		return true
 	}

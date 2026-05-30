@@ -42,6 +42,10 @@ func Open(opts Options) (*Store, error) {
 	if opts.ArtifactFileMaxOpen == 0 {
 		opts.ArtifactFileMaxOpen = DefaultArtifactFileMaxOpen
 	}
+	decodedCellCache, err := decodedCellCacheConfigFromOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 
 	metaMemTableSize := opts.MetaMemTableSize
 	if metaMemTableSize <= 0 {
@@ -75,6 +79,11 @@ func Open(opts Options) (*Store, error) {
 		Str("dir", opts.Dir).
 		Int64("meta_cache_size", opts.MetaCacheSize).
 		Int64("cell_total_cache_size", opts.CellCacheSize).
+		Bool("decoded_cell_cache_enabled", decodedCellCache.enabled).
+		Int("decoded_cell_cache_shards", decodedCellCache.shards).
+		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCache.bytesPerEntry).
+		Int("decoded_cell_cache_min_entries", decodedCellCache.minEntries).
+		Int("decoded_cell_cache_max_entries", decodedCellCache.maxEntries).
 		Int("meta_memtable_size", metaMemTableSize).
 		Int("cell_total_memtable_size", cellMemTableSize).
 		Int("cell_shard_memtable_size", cellShardMemTable).
@@ -206,7 +215,7 @@ func Open(opts Options) (*Store, error) {
 		pendingCellMigration:            cloneCellGenerationPendingMigration(manifest.pending),
 		retiredGenerations:              cloneUint64Slice(manifest.retired),
 		nextCellGeneration:              manifest.next,
-		cellCache:                       newDecodedCellCache(opts.CellCacheSize),
+		cellCache:                       newDecodedCellCache(decodedCellCache),
 		dir:                             opts.Dir,
 		cellCacheSize:                   opts.CellCacheSize,
 		cellShardMemTable:               cellShardMemTable,
@@ -250,6 +259,11 @@ func Open(opts Options) (*Store, error) {
 	logger.Info().
 		Int64("meta_cache_size", opts.MetaCacheSize).
 		Int64("cell_total_cache_size", opts.CellCacheSize).
+		Bool("decoded_cell_cache_enabled", decodedCellCache.enabled).
+		Int("decoded_cell_cache_shards", decodedCellCache.shards).
+		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCache.bytesPerEntry).
+		Int("decoded_cell_cache_min_entries", decodedCellCache.minEntries).
+		Int("decoded_cell_cache_max_entries", decodedCellCache.maxEntries).
 		Int("meta_memtable_size", metaMemTableSize).
 		Int("cell_total_memtable_size", cellMemTableSize).
 		Int("cell_shard_memtable_size", cellShardMemTable).
@@ -283,4 +297,43 @@ func Open(opts Options) (*Store, error) {
 		Msg("configured pebble storage tuning")
 	// Do not scan the full cell DB on startup just to populate console stats.
 	return store, nil
+}
+
+func decodedCellCacheConfigFromOptions(opts Options) (decodedCellCacheConfig, error) {
+	cfg := decodedCellCacheConfig{
+		enabled:       !opts.DisableDecodedCellCache,
+		shards:        opts.DecodedCellCacheShards,
+		cacheBytes:    opts.CellCacheSize,
+		bytesPerEntry: opts.DecodedCellCacheBytesPerEntry,
+		minEntries:    opts.DecodedCellCacheMinEntries,
+		maxEntries:    opts.DecodedCellCacheMaxEntries,
+	}
+	if cfg.bytesPerEntry < 0 {
+		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache bytes per entry cannot be negative")
+	}
+	if cfg.shards < 0 {
+		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache shards cannot be negative")
+	}
+	if cfg.minEntries < 0 {
+		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache min entries cannot be negative")
+	}
+	if cfg.maxEntries < 0 {
+		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache max entries cannot be negative")
+	}
+	if cfg.bytesPerEntry == 0 {
+		cfg.bytesPerEntry = DefaultDecodedCellCacheBytesPerEntry
+	}
+	if cfg.shards == 0 {
+		cfg.shards = DefaultDecodedCellCacheShards
+	}
+	if cfg.minEntries == 0 {
+		cfg.minEntries = DefaultDecodedCellCacheMinEntries
+	}
+	if cfg.maxEntries == 0 {
+		cfg.maxEntries = DefaultDecodedCellCacheMaxEntries
+	}
+	if cfg.minEntries > cfg.maxEntries {
+		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache min entries cannot exceed max entries")
+	}
+	return cfg, nil
 }

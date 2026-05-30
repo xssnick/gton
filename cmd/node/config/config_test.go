@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -54,6 +55,9 @@ func TestLoadDefaults(t *testing.T) {
 	if archiveTTL != DefaultArchiveTTL {
 		t.Fatalf("unexpected archive ttl %s", archiveTTL)
 	}
+	if cfg.TON.DisableArchiveBackfill {
+		t.Fatal("archive backfill should be enabled by default")
+	}
 	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
 	if err != nil {
 		t.Fatalf("next checkpoint blocks: %v", err)
@@ -75,6 +79,13 @@ func TestLoadDefaults(t *testing.T) {
 	if int64(checkpointBytes) != DefaultCheckpointBytes {
 		t.Fatalf("unexpected checkpoint bytes %d", checkpointBytes)
 	}
+	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
+	if err != nil {
+		t.Fatalf("sync backpressure windows: %v", err)
+	}
+	if int64(syncBackpressureWindows) != DefaultSyncBackpressureWindows {
+		t.Fatalf("unexpected sync backpressure windows %d", syncBackpressureWindows)
+	}
 	if cfg.DisableStateSerialization {
 		t.Fatal("state serialization should be enabled by default")
 	}
@@ -87,12 +98,37 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
 		t.Fatalf("unexpected metrics namespace %q", cfg.Metrics.Namespace)
 	}
+	if cfg.CustomOverlays == nil {
+		t.Fatal("custom overlays should default to an empty list")
+	}
+	if len(cfg.CustomOverlays) != 0 {
+		t.Fatalf("unexpected custom overlays %d", len(cfg.CustomOverlays))
+	}
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
 		t.Fatalf("cell total cache size: %v", err)
 	}
 	if cellTotalCacheSize != DefaultCellTotalCache {
 		t.Fatalf("unexpected cell total cache size %d", cellTotalCacheSize)
+	}
+	decodedCellCache, err := cfg.DecodedCellCacheOptions()
+	if err != nil {
+		t.Fatalf("decoded cell cache options: %v", err)
+	}
+	if decodedCellCache.Enabled != DefaultDecodedCellCacheEnabled {
+		t.Fatalf("unexpected decoded cell cache enabled %v", decodedCellCache.Enabled)
+	}
+	if int64(decodedCellCache.Shards) != DefaultDecodedCellCacheShards {
+		t.Fatalf("unexpected decoded cell cache shards %d", decodedCellCache.Shards)
+	}
+	if decodedCellCache.BytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
+		t.Fatalf("unexpected decoded cell cache bytes per entry %d", decodedCellCache.BytesPerEntry)
+	}
+	if int64(decodedCellCache.MinEntries) != DefaultDecodedCellCacheMinEntries {
+		t.Fatalf("unexpected decoded cell cache min entries %d", decodedCellCache.MinEntries)
+	}
+	if int64(decodedCellCache.MaxEntries) != DefaultDecodedCellCacheMaxEntries {
+		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
 	}
 	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
 	if err != nil {
@@ -117,8 +153,51 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadCustomOverlays(t *testing.T) {
+	nodeID := bytes.Repeat([]byte{0x11}, 32)
+	path := writeTestConfig(t, `{"custom_overlays":[{
+		"name":"private-a",
+		"nodes":[{
+			"adnl_id":"`+base64.StdEncoding.EncodeToString(nodeID)+`",
+			"msg_sender":true,
+			"msg_sender_priority":7,
+			"block_sender":true
+		}],
+		"sender_shards":[{
+			"workchain":0,
+			"shard":-9223372036854775808
+		}],
+		"skip_public_msg_send":true
+	}]}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.CustomOverlays) != 1 {
+		t.Fatalf("unexpected custom overlay count %d", len(cfg.CustomOverlays))
+	}
+	overlay := cfg.CustomOverlays[0]
+	if overlay.Name != "private-a" || !overlay.SkipPublicMsgSend {
+		t.Fatalf("unexpected custom overlay metadata: %+v", overlay)
+	}
+	if len(overlay.Nodes) != 1 {
+		t.Fatalf("unexpected custom overlay node count %d", len(overlay.Nodes))
+	}
+	node := overlay.Nodes[0]
+	if !bytes.Equal(node.ADNLID, nodeID) || !node.MsgSender || node.MsgSenderPriority != 7 || !node.BlockSender {
+		t.Fatalf("unexpected custom overlay node: %+v", node)
+	}
+	if len(overlay.SenderShards) != 1 {
+		t.Fatalf("unexpected sender shard count %d", len(overlay.SenderShards))
+	}
+	if overlay.SenderShards[0].Workchain != 0 || overlay.SenderShards[0].Shard != int64(-1<<63) {
+		t.Fatalf("unexpected sender shard: %+v", overlay.SenderShards[0])
+	}
+}
+
 func TestLoadSyncOptions(t *testing.T) {
-	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789}}`)
+	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800,"disable_archive_backfill":true,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789,"sync_backpressure_windows":6}}`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -146,6 +225,9 @@ func TestLoadSyncOptions(t *testing.T) {
 	if archiveTTL != 48*time.Hour {
 		t.Fatalf("unexpected archive ttl %s", archiveTTL)
 	}
+	if !cfg.TON.DisableArchiveBackfill {
+		t.Fatal("archive backfill should be disabled")
+	}
 	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
 	if err != nil {
 		t.Fatalf("next checkpoint blocks: %v", err)
@@ -167,6 +249,55 @@ func TestLoadSyncOptions(t *testing.T) {
 	if checkpointBytes != 123456789 {
 		t.Fatalf("unexpected checkpoint bytes %d", checkpointBytes)
 	}
+	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
+	if err != nil {
+		t.Fatalf("sync backpressure windows: %v", err)
+	}
+	if syncBackpressureWindows != 6 {
+		t.Fatalf("unexpected sync backpressure windows %d", syncBackpressureWindows)
+	}
+}
+
+func TestLoadOldSyncOptionsUsesBackpressureDefault(t *testing.T) {
+	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"next_checkpoint_blocks":700,"checkpoint_bytes":123456789}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
+	if err != nil {
+		t.Fatalf("sync backpressure windows: %v", err)
+	}
+	if int64(syncBackpressureWindows) != DefaultSyncBackpressureWindows {
+		t.Fatalf("unexpected sync backpressure windows %d", syncBackpressureWindows)
+	}
+}
+
+func TestLoadZeroTTLs(t *testing.T) {
+	path := writeTestConfig(t, `{"ton":{"state_ttl":0,"archive_ttl":0}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	stateTTL, err := cfg.StateTTL()
+	if err != nil {
+		t.Fatalf("state ttl: %v", err)
+	}
+	if stateTTL != 0 {
+		t.Fatalf("unexpected state ttl %s", stateTTL)
+	}
+
+	archiveTTL, err := cfg.ArchiveTTL()
+	if err != nil {
+		t.Fatalf("archive ttl: %v", err)
+	}
+	if archiveTTL != 0 {
+		t.Fatalf("unexpected archive ttl %s", archiveTTL)
+	}
 }
 
 func TestStorageOptions(t *testing.T) {
@@ -174,6 +305,11 @@ func TestStorageOptions(t *testing.T) {
 		"storage": {
 			"dir": "data/node",
 			"cell_total_cache_size": 8589934592,
+			"decoded_cell_cache_enabled": false,
+			"decoded_cell_cache_shards": 16,
+			"decoded_cell_cache_bytes_per_entry": 8192,
+			"decoded_cell_cache_min_entries": 1000,
+			"decoded_cell_cache_max_entries": 2000,
 			"cell_shard_memtable_size": 1073741824,
 			"cell_memtable_stop_writes_threshold": 3,
 			"artifact_file_max_open": 123
@@ -193,6 +329,25 @@ func TestStorageOptions(t *testing.T) {
 	}
 	if cellTotalCacheSize != 8<<30 {
 		t.Fatalf("unexpected cell total cache size %d", cellTotalCacheSize)
+	}
+	decodedCellCache, err := cfg.DecodedCellCacheOptions()
+	if err != nil {
+		t.Fatalf("decoded cell cache options: %v", err)
+	}
+	if decodedCellCache.Enabled {
+		t.Fatal("decoded cell cache should be disabled")
+	}
+	if decodedCellCache.Shards != 16 {
+		t.Fatalf("unexpected decoded cell cache shards %d", decodedCellCache.Shards)
+	}
+	if decodedCellCache.BytesPerEntry != 8192 {
+		t.Fatalf("unexpected decoded cell cache bytes per entry %d", decodedCellCache.BytesPerEntry)
+	}
+	if decodedCellCache.MinEntries != 1000 {
+		t.Fatalf("unexpected decoded cell cache min entries %d", decodedCellCache.MinEntries)
+	}
+	if decodedCellCache.MaxEntries != 2000 {
+		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
 	}
 	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
 	if err != nil {
@@ -214,6 +369,42 @@ func TestStorageOptions(t *testing.T) {
 	}
 	if artifactFileMaxOpen != 123 {
 		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
+	}
+}
+
+func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "negative shards",
+			cfg:  Config{Storage: Storage{DecodedCellCacheShards: -1}},
+		},
+		{
+			name: "negative bytes per entry",
+			cfg:  Config{Storage: Storage{DecodedCellCacheBytesPerEntry: -1}},
+		},
+		{
+			name: "negative min entries",
+			cfg:  Config{Storage: Storage{DecodedCellCacheMinEntries: -1}},
+		},
+		{
+			name: "negative max entries",
+			cfg:  Config{Storage: Storage{DecodedCellCacheMaxEntries: -1}},
+		},
+		{
+			name: "min over max",
+			cfg:  Config{Storage: Storage{DecodedCellCacheMinEntries: 20, DecodedCellCacheMaxEntries: 10}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tt.cfg.DecodedCellCacheOptions(); err == nil {
+				t.Fatal("expected invalid decoded cell cache options to fail")
+			}
+		})
 	}
 }
 
@@ -259,6 +450,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Lite.Enabled {
 		t.Fatal("expected generated liteserver to be disabled")
 	}
+	if cfg.Lite.NonFinalEnabled {
+		t.Fatal("expected generated liteserver non-final mode to be disabled")
+	}
 	if cfg.Lite.ListenAddr != DefaultLiteListen {
 		t.Fatalf("unexpected liteserver listen addr %q", cfg.Lite.ListenAddr)
 	}
@@ -278,6 +472,21 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Storage.ArtifactFileMaxOpen != DefaultArtifactFileMaxOpen {
 		t.Fatalf("unexpected artifact file max open %d", cfg.Storage.ArtifactFileMaxOpen)
 	}
+	if cfg.Storage.DecodedCellCacheEnabled != DefaultDecodedCellCacheEnabled {
+		t.Fatalf("unexpected decoded cell cache enabled %v", cfg.Storage.DecodedCellCacheEnabled)
+	}
+	if cfg.Storage.DecodedCellCacheShards != DefaultDecodedCellCacheShards {
+		t.Fatalf("unexpected decoded cell cache shards %d", cfg.Storage.DecodedCellCacheShards)
+	}
+	if cfg.Storage.DecodedCellCacheBytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
+		t.Fatalf("unexpected decoded cell cache bytes per entry %d", cfg.Storage.DecodedCellCacheBytesPerEntry)
+	}
+	if cfg.Storage.DecodedCellCacheMinEntries != DefaultDecodedCellCacheMinEntries {
+		t.Fatalf("unexpected decoded cell cache min entries %d", cfg.Storage.DecodedCellCacheMinEntries)
+	}
+	if cfg.Storage.DecodedCellCacheMaxEntries != DefaultDecodedCellCacheMaxEntries {
+		t.Fatalf("unexpected decoded cell cache max entries %d", cfg.Storage.DecodedCellCacheMaxEntries)
+	}
 	wantGlobalConfigPath, err := filepath.Abs(DefaultGlobalConfigPath)
 	if err != nil {
 		t.Fatalf("resolve global config path: %v", err)
@@ -294,6 +503,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
 		t.Fatalf("unexpected archive_ttl %d", cfg.TON.ArchiveTTL)
 	}
+	if cfg.TON.DisableArchiveBackfill {
+		t.Fatal("unexpected disable_archive_backfill")
+	}
 	if cfg.TON.NextCheckpointBlocks != DefaultNextCheckpointBlocks {
 		t.Fatalf("unexpected next checkpoint blocks %d", cfg.TON.NextCheckpointBlocks)
 	}
@@ -302,6 +514,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.TON.CheckpointBytes != DefaultCheckpointBytes {
 		t.Fatalf("unexpected checkpoint bytes %d", cfg.TON.CheckpointBytes)
+	}
+	if cfg.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
+		t.Fatalf("unexpected sync backpressure windows %d", cfg.TON.SyncBackpressureWindows)
 	}
 	if cfg.Metrics.Enabled {
 		t.Fatal("expected generated metrics to be disabled")
@@ -330,6 +545,15 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"archive_ttl"`)) {
 		t.Fatal("generated config should use archive_ttl key")
 	}
+	if !bytes.Contains(data, []byte(`"disable_archive_backfill"`)) {
+		t.Fatal("generated config should use disable_archive_backfill key")
+	}
+	if !bytes.Contains(data, []byte(`"sync_backpressure_windows"`)) {
+		t.Fatal("generated config should use sync_backpressure_windows key")
+	}
+	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
+		t.Fatal("generated config should use an empty custom_overlays list")
+	}
 
 	loaded, err := Load(path)
 	if err != nil {
@@ -349,6 +573,12 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if loaded.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
 		t.Fatalf("unexpected persisted archive_ttl %d", loaded.TON.ArchiveTTL)
+	}
+	if loaded.TON.DisableArchiveBackfill {
+		t.Fatal("unexpected persisted disable_archive_backfill")
+	}
+	if loaded.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
+		t.Fatalf("unexpected persisted sync_backpressure_windows %d", loaded.TON.SyncBackpressureWindows)
 	}
 }
 
@@ -380,12 +610,39 @@ func TestSyncBeforeValidation(t *testing.T) {
 	}
 }
 
+func TestSyncBackpressureWindowsValidation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.TON.SyncBackpressureWindows = 0
+
+	windows, err := cfg.SyncBackpressureWindows()
+	if err != nil {
+		t.Fatalf("zero sync_backpressure_windows should use default: %v", err)
+	}
+	if int64(windows) != DefaultSyncBackpressureWindows {
+		t.Fatalf("unexpected sync backpressure windows %d", windows)
+	}
+
+	cfg.TON.SyncBackpressureWindows = -1
+	if _, err = cfg.SyncBackpressureWindows(); err == nil {
+		t.Fatal("expected negative sync_backpressure_windows to fail")
+	}
+}
+
 func TestStateTTLValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.StateTTL = 0
 
-	if _, err := cfg.StateTTL(); err == nil {
-		t.Fatal("expected zero state_ttl to fail")
+	stateTTL, err := cfg.StateTTL()
+	if err != nil {
+		t.Fatalf("zero state_ttl should be allowed: %v", err)
+	}
+	if stateTTL != 0 {
+		t.Fatalf("unexpected zero state ttl %s", stateTTL)
+	}
+
+	cfg.TON.StateTTL = -1
+	if _, err = cfg.StateTTL(); err == nil {
+		t.Fatal("expected negative state_ttl to fail")
 	}
 }
 
@@ -393,8 +650,17 @@ func TestArchiveTTLValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.ArchiveTTL = 0
 
-	if _, err := cfg.ArchiveTTL(); err == nil {
-		t.Fatal("expected zero archive_ttl to fail")
+	archiveTTL, err := cfg.ArchiveTTL()
+	if err != nil {
+		t.Fatalf("zero archive_ttl should be allowed: %v", err)
+	}
+	if archiveTTL != 0 {
+		t.Fatalf("unexpected zero archive ttl %s", archiveTTL)
+	}
+
+	cfg.TON.ArchiveTTL = -1
+	if _, err = cfg.ArchiveTTL(); err == nil {
+		t.Fatal("expected negative archive_ttl to fail")
 	}
 }
 

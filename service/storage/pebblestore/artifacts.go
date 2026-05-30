@@ -78,7 +78,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		ref   *storage.ArtifactRef
 	}
 
-	metas := make(map[string]*storage.BlockMeta, len(imported.FullBlocks)+len(imported.BlockData)+len(imported.Proofs))
+	metas := make(map[storage.BlockRootHash]*storage.BlockMeta, len(imported.FullBlocks)+len(imported.BlockData)+len(imported.Proofs))
 	fullWrites := make([]fullWrite, 0, len(imported.FullBlocks))
 	for _, full := range imported.FullBlocks {
 		meta, proofKinds := servedBlockFullMeta(full)
@@ -192,11 +192,13 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		}
 	}
 
-	metaKeys := make([]string, 0, len(metas))
+	metaKeys := make([]storage.BlockRootHash, 0, len(metas))
 	for key := range metas {
 		metaKeys = append(metaKeys, key)
 	}
-	sort.Strings(metaKeys)
+	sort.Slice(metaKeys, func(i, j int) bool {
+		return bytes.Compare(metaKeys[i][:], metaKeys[j][:]) < 0
+	})
 
 	return s.withHotBatch(func(batch *pebble.Batch) error {
 		for _, write := range fullWrites {
@@ -356,7 +358,7 @@ func (s *Store) checkArtifactRef(ref *storage.ArtifactRef) error {
 	return nil
 }
 
-func mergeArchiveImportMeta(metas map[string]*storage.BlockMeta, meta *storage.BlockMeta) {
+func mergeArchiveImportMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, meta *storage.BlockMeta) {
 	key := storage.BlockKey(meta.ID)
 	merged := storage.MergeBlockMeta(metas[key], meta)
 	merged.ID = meta.ID

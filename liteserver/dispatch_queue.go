@@ -24,9 +24,21 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid after_addr"}
 	}
 
-	stateRoot, err := s.loadStateRoot(ctx, *query.ID)
-	if err != nil {
-		return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+	var blockProof *cell.Cell
+	var stateRoot *cell.Cell
+	if query.Mode&1 != 0 {
+		fragments, err := s.blockFragments(ctx, *query.ID)
+		if err != nil {
+			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+		}
+		stateRoot = fragments.stateRoot
+		blockProof = fragments.blockStateRootProof
+	} else {
+		root, err := s.loadStateRoot(ctx, *query.ID)
+		if err != nil {
+			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+		}
+		stateRoot = root
 	}
 
 	proofRoot := stateRoot
@@ -62,7 +74,7 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 		Complete:              complete,
 	}
 	if proofBuilder != nil {
-		proof, err := dispatchQueueProof(ctx, s, *query.ID, proofBuilder)
+		proof, err := dispatchQueueProof(blockProof, proofBuilder)
 		if err != nil {
 			return errorResponse(err, "cannot create dispatch queue proof")
 		}
@@ -82,9 +94,21 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid max_messages"}
 	}
 
-	stateRoot, err := s.loadStateRoot(ctx, *query.ID)
-	if err != nil {
-		return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+	var blockProof *cell.Cell
+	var stateRoot *cell.Cell
+	if query.Mode&1 != 0 {
+		fragments, err := s.blockFragments(ctx, *query.ID)
+		if err != nil {
+			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+		}
+		stateRoot = fragments.stateRoot
+		blockProof = fragments.blockStateRootProof
+	} else {
+		root, err := s.loadStateRoot(ctx, *query.ID)
+		if err != nil {
+			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+		}
+		stateRoot = root
 	}
 
 	proofRoot := stateRoot
@@ -118,7 +142,7 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 		Complete: complete,
 	}
 	if proofBuilder != nil {
-		proof, err := dispatchQueueProof(ctx, s, *query.ID, proofBuilder)
+		proof, err := dispatchQueueProof(blockProof, proofBuilder)
 		if err != nil {
 			return errorResponse(err, "cannot create dispatch queue proof")
 		}
@@ -134,15 +158,12 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 	return resp
 }
 
-func dispatchQueueProof(ctx context.Context, s *Server, block ton.BlockIDExt, proofBuilder *cell.MerkleProofBuilder) ([]byte, error) {
+func dispatchQueueProof(blockProof *cell.Cell, proofBuilder *cell.MerkleProofBuilder) ([]byte, error) {
 	dataProof, err := proofBuilder.CreateProof()
 	if err != nil {
 		return nil, err
 	}
-	proof, err := s.blockStateProof(ctx, block, dataProof)
-	if err != nil {
-		return nil, err
-	}
+	proof := []*cell.Cell{blockProof, dataProof}
 	return cell.ToBOCWithFlags(proof, false), nil
 }
 

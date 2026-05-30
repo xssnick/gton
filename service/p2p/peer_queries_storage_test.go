@@ -782,9 +782,9 @@ func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
 		node: node,
 		spec: overlaySpec{Name: "masterchain"},
 		log:  discardLogger(),
-		peers: map[string]*overlayPeer{
-			"peer-1": {
-				id:            "peer-1",
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("peer-1"): {
+				id:            testPeerID("peer-1"),
 				addr:          "1.2.3.4:30303",
 				alive:         true,
 				lastSuccessAt: time.Now().Add(-2 * time.Second),
@@ -794,7 +794,7 @@ func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
 				announced:     &overlay.Node{Version: int32(time.Now().Unix())},
 			},
 		},
-		neighbours: []string{"peer-1"},
+		neighbours: []PeerID{testPeerID("peer-1")},
 	}
 	node.subscriptions = map[string]*overlaySubscription{"master": sub}
 

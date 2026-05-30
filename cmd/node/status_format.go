@@ -63,7 +63,7 @@ func formatCellGenerationSwitchWait(generation pebblestore.CellDBGenerationStatu
 	}
 
 	return fmt.Sprintf(
-		"pending read_amp=%d > %d, waiting for compaction debt=%s comp=%d/%s l0=%d/%d %s",
+		"pending read_amp=%d > %d, waiting for compaction debt=%s comp=%d/%s l0=%d/%d",
 		generation.Total.ReadAmp,
 		service2.CellGenerationSwitchMaxReadAmp,
 		formatDBBytes(generation.Total.CompactionDebt),
@@ -71,38 +71,34 @@ func formatCellGenerationSwitchWait(generation pebblestore.CellDBGenerationStatu
 		formatDBBytesInt(generation.Total.CompactionInProgressSize),
 		generation.Total.L0Files,
 		generation.Total.L0Sublevels,
-		formatDBBytesInt(generation.Total.L0Size),
 	)
 }
 
 func formatDBCacheStatus(b *strings.Builder, cache pebblestore.CellDBCacheStatus) {
 	fmt.Fprintf(
 		b,
-		"    cache block=%s file=%s file_tables=%d block_hit=%s\n",
+		"    cache block=%s file=%s block_hit=%s\n",
 		formatDBBytes(uint64(cache.BlockCacheSize)),
 		formatDBBytes(uint64(cache.FileCacheSize)),
-		cache.FileCacheTableCount,
 		formatDBCacheHitRate(cache.BlockCacheHits, cache.BlockCacheMisses),
 	)
 }
 
 func formatDBMetricsHeader(b *strings.Builder, label string) {
-	fmt.Fprintf(b, "    %-5s %9s %9s %7s %5s %9s %9s %9s %10s %10s %11s %8s\n",
-		label, "disk", "live", "tables", "amp", "l0 f/s", "l0 size", "debt", "comp", "mem", "rd/wr/s", "fl/ing")
+	fmt.Fprintf(b, "    %-5s %9s %9s %5s %9s %9s %10s %10s %11s %8s\n",
+		label, "disk", "live", "amp", "l0 f/s", "debt", "comp", "mem", "rd/wr/s", "fl/ing")
 }
 
 func formatDBMetricsStatus(b *strings.Builder, label string, shard pebblestore.CellDBShardStatus) {
-	fmt.Fprintf(b, "    %-5s %9s %9s %7d %5d %9s %9s %9s %10s %10s %11s %8s\n",
+	fmt.Fprintf(b, "    %-5s %9s %9s %5d %9s %9s %10s %10s %11s %8s\n",
 		label,
 		formatDBBytes(shard.DiskSize),
 		formatDBBytes(shard.LiveSize),
-		shard.LiveTables,
 		shard.ReadAmp,
 		fmt.Sprintf("%d/%d", shard.L0Files, shard.L0Sublevels),
-		formatDBBytesInt(shard.L0Size),
 		formatDBBytes(shard.CompactionDebt),
 		fmt.Sprintf("%d/%s", shard.CompactionsInProgress, formatDBBytesInt(shard.CompactionInProgressSize)),
-		fmt.Sprintf("%s/%d", formatDBBytes(shard.MemTableSize), shard.MemTableCount),
+		formatDBBytes(shard.MemTableSize),
 		formatDBCellRate(shard.ReadCellsPerSecond, shard.WrittenCellsPerSecond),
 		fmt.Sprintf("%d/%d", shard.Flushes, shard.Ingests),
 	)

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"math/rand/v2"
 	"sort"
 	"time"
@@ -21,7 +22,7 @@ func (s *overlaySubscription) neighbourPeerSnapshots() []*overlayPeer {
 	return peers
 }
 
-func (s *overlaySubscription) hasNeighbourLocked(id string) bool {
+func (s *overlaySubscription) hasNeighbourLocked(id PeerID) bool {
 	for _, current := range s.neighbours {
 		if current == id {
 			return true
@@ -30,30 +31,30 @@ func (s *overlaySubscription) hasNeighbourLocked(id string) bool {
 	return false
 }
 
-func (s *overlaySubscription) addNeighbourLocked(id string) bool {
-	if id == "" || s.hasNeighbourLocked(id) || len(s.neighbours) >= maxQueryNeighbours {
+func (s *overlaySubscription) addNeighbourLocked(id PeerID) bool {
+	if id.IsZero() || s.hasNeighbourLocked(id) || len(s.neighbours) >= maxQueryNeighbours {
 		return false
 	}
 	s.neighbours = append(s.neighbours, id)
 	return true
 }
 
-func (s *overlaySubscription) removeNeighbourLocked(id string) bool {
+func (s *overlaySubscription) removeNeighbourLocked(id PeerID) bool {
 	for idx, current := range s.neighbours {
 		if current != id {
 			continue
 		}
 		s.neighbours = append(s.neighbours[:idx], s.neighbours[idx+1:]...)
 		if s.lastPingedNeighbour == id {
-			s.lastPingedNeighbour = ""
+			s.lastPingedNeighbour = PeerID{}
 		}
 		return true
 	}
 	return false
 }
 
-func (s *overlaySubscription) replaceNeighbourLocked(prevID, nextID string) bool {
-	if prevID == "" || nextID == "" || prevID == nextID || s.hasNeighbourLocked(nextID) {
+func (s *overlaySubscription) replaceNeighbourLocked(prevID, nextID PeerID) bool {
+	if prevID.IsZero() || nextID.IsZero() || prevID == nextID || s.hasNeighbourLocked(nextID) {
 		return false
 	}
 	for idx, current := range s.neighbours {
@@ -76,7 +77,7 @@ func (s *overlaySubscription) pruneNeighboursLocked() {
 		peer := s.peers[id]
 		if peer == nil || !peer.isAliveKnownOverlayPeer(now) || !peer.hasOpenConnection() {
 			if s.lastPingedNeighbour == id {
-				s.lastPingedNeighbour = ""
+				s.lastPingedNeighbour = PeerID{}
 			}
 			continue
 		}
@@ -105,9 +106,9 @@ func (s *overlaySubscription) reloadNeighbours() {
 	s.pruneNeighboursLocked()
 
 	exchanged := false
-	excluded := map[string]struct{}{}
+	excluded := map[PeerID]struct{}{}
 	for _, peer := range candidates {
-		if peer.id == "" || peer.overlay == nil {
+		if peer.id.IsZero() || peer.overlay == nil {
 			continue
 		}
 		if _, skip := excluded[peer.id]; skip {
@@ -122,7 +123,7 @@ func (s *overlaySubscription) reloadNeighbours() {
 		}
 
 		worstID, worstUnreliability := s.worstNeighbourLocked()
-		if worstID == "" {
+		if worstID.IsZero() {
 			break
 		}
 		if worstUnreliability > peerStopUnreliability {
@@ -160,8 +161,8 @@ func (s *overlaySubscription) reloadNeighbours() {
 	}
 }
 
-func (s *overlaySubscription) worstNeighbourLocked() (string, float64) {
-	worstID := ""
+func (s *overlaySubscription) worstNeighbourLocked() (PeerID, float64) {
+	worstID := PeerID{}
 	worstUnreliability := -1.0
 	for _, id := range s.neighbours {
 		peer := s.peers[id]
@@ -210,16 +211,16 @@ func (s *overlaySubscription) pingTargets() []*overlayPeer {
 	}
 
 	sort.SliceStable(peers, func(i, j int) bool {
-		return peers[i].id < peers[j].id
+		return bytes.Compare(peers[i].id[:], peers[j].id[:]) < 0
 	})
 
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
 	start := 0
-	if s.lastPingedNeighbour != "" {
+	if !s.lastPingedNeighbour.IsZero() {
 		for idx, peer := range peers {
-			if peer.id <= s.lastPingedNeighbour {
+			if bytes.Compare(peer.id[:], s.lastPingedNeighbour[:]) <= 0 {
 				continue
 			}
 			start = idx
@@ -239,6 +240,10 @@ selected:
 }
 
 func (s *overlaySubscription) adnlPingTargets() []*overlayPeer {
+	if s.spec.Kind == overlayKindCustomFixed {
+		return nil
+	}
+
 	peers := s.neighbourPeerSnapshots()
 	if len(peers) == 0 {
 		return nil

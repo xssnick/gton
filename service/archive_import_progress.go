@@ -74,6 +74,11 @@ type archiveCatchUpStageTiming struct {
 	elapsed time.Duration
 }
 
+type archiveImportLinkKey struct {
+	prev storage.BlockRootHash
+	next storage.BlockRootHash
+}
+
 func (s archiveCatchUpProgressStats) since(previous archiveCatchUpProgressStats) archiveCatchUpProgressStats {
 	return archiveCatchUpProgressStats{
 		windows:            s.windows - previous.windows,
@@ -312,8 +317,8 @@ func (r *archiveCatchUpRunner) storeArchiveWindow(window *shardClientArchiveWind
 	}
 
 	stored := storage.ServedArchiveImport{}
-	seenFull := map[string]struct{}{}
-	seenLink := map[string]struct{}{}
+	seenFull := map[storage.BlockRootHash]struct{}{}
+	seenLink := map[archiveImportLinkKey]struct{}{}
 	for _, imported := range window.archiveImports {
 		if imported == nil {
 			continue
@@ -338,7 +343,7 @@ func (r *archiveCatchUpRunner) storeArchiveWindow(window *shardClientArchiveWind
 	return nil
 }
 
-func appendArchiveImport(dst *storage.ServedArchiveImport, src *storage.ServedArchiveImport, seenFull map[string]struct{}, seenLink map[string]struct{}) {
+func appendArchiveImport(dst *storage.ServedArchiveImport, src *storage.ServedArchiveImport, seenFull map[storage.BlockRootHash]struct{}, seenLink map[archiveImportLinkKey]struct{}) {
 	if dst == nil || src == nil {
 		return
 	}
@@ -370,7 +375,7 @@ func appendArchiveImport(dst *storage.ServedArchiveImport, src *storage.ServedAr
 	for _, link := range src.Links {
 		prevKey := storage.BlockKey(link.Prev)
 		nextKey := storage.BlockKey(link.Next)
-		linkKey := prevKey + ">" + nextKey
+		linkKey := archiveImportLinkKey{prev: prevKey, next: nextKey}
 		if _, exists := seenLink[linkKey]; exists {
 			continue
 		}

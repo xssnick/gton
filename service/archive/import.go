@@ -54,7 +54,7 @@ type Imported struct {
 	Stats *ImportStats
 	storage.ServedArchiveImport
 	ArtifactPath   string
-	PreparedBlocks map[string]PreparedBlock
+	PreparedBlocks map[storage.BlockRootHash]PreparedBlock
 }
 
 func ImportFile(ctx context.Context, archive *Downloaded, sink ImportSink) (*ImportStats, error) {
@@ -87,10 +87,10 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 	imported := &Imported{
 		Stats:          stats,
 		ArtifactPath:   archive.Path,
-		PreparedBlocks: map[string]PreparedBlock{},
+		PreparedBlocks: map[storage.BlockRootHash]PreparedBlock{},
 	}
-	parts := map[string]*blockParts{}
-	seenBlocks := map[string]struct{}{}
+	parts := map[storage.BlockRootHash]*blockParts{}
+	seenBlocks := map[storage.BlockRootHash]struct{}{}
 	var blockIDs []ton.BlockIDExt
 	preparer := newImportedBlockPreparer(ctx)
 	defer preparer.abort()

@@ -37,16 +37,59 @@ func TestOverlayPeerLivenessRecoversAfterInboundTraffic(t *testing.T) {
 	}
 }
 
+func TestFixedOverlayPeerIgnoresPingFailures(t *testing.T) {
+	peer := &overlayPeer{
+		fixedMember:   true,
+		alive:         true,
+		lastReceiveAt: time.Now().Add(-20 * time.Second),
+	}
+
+	for i := 0; i < 8; i++ {
+		peer.queryFailed()
+	}
+
+	stats := peer.statsSnapshot()
+	if !stats.alive {
+		t.Fatal("fixed overlay peer should stay alive after ping failures")
+	}
+	if stats.failedQueries != 0 || stats.unreliability != 0 {
+		t.Fatalf("fixed overlay ping failures should not affect peer score: failed=%d unreliability=%f", stats.failedQueries, stats.unreliability)
+	}
+}
+
+func TestCustomFixedOverlaySkipsADNLPingTargets(t *testing.T) {
+	peerID := testPeerID("fixed")
+	sub := &overlaySubscription{
+		spec: overlaySpec{
+			Kind: overlayKindCustomFixed,
+		},
+		peers: map[PeerID]*overlayPeer{
+			peerID: {
+				id:            peerID,
+				fixedMember:   true,
+				overlay:       &overlay.ADNLOverlayWrapper{},
+				alive:         true,
+				lastReceiveAt: time.Now(),
+			},
+		},
+		neighbours: []PeerID{peerID},
+	}
+
+	if targets := sub.adnlPingTargets(); len(targets) != 0 {
+		t.Fatalf("custom fixed overlay should not ADNL-ping peers, got %d targets", len(targets))
+	}
+}
+
 func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 	sub := &overlaySubscription{
 		log:        discardLogger(),
-		peers:      map[string]*overlayPeer{},
-		neighbours: make([]string, 0, maxQueryNeighbours),
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: make([]PeerID, 0, maxQueryNeighbours),
 	}
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxQueryNeighbours; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
@@ -62,7 +105,7 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 	}
 
 	fresh := &overlayPeer{
-		id:            "fresh",
+		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
 		announced:     &overlay.Node{Version: now},
 		alive:         true,
@@ -72,7 +115,7 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 
 	sub.reloadNeighbours()
 
-	if sub.hasNeighbourLocked("a") {
+	if sub.hasNeighbourLocked(testPeerID("a")) {
 		t.Fatalf("expected worst neighbour to be replaced")
 	}
 	if !sub.hasNeighbourLocked(fresh.id) {
@@ -83,20 +126,22 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 	sub := &overlaySubscription{
 		log:        discardLogger(),
-		peers:      map[string]*overlayPeer{},
-		neighbours: []string{"dead"},
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: []PeerID{testPeerID("dead")},
 	}
 
 	now := int32(time.Now().Unix())
-	sub.peers["dead"] = &overlayPeer{
-		id:            "dead",
+	deadID := testPeerID("dead")
+	aliveID := testPeerID("alive")
+	sub.peers[deadID] = &overlayPeer{
+		id:            testPeerID("dead"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
 		announced:     &overlay.Node{Version: now},
 		alive:         false,
 		lastReceiveAt: time.Now().Add(-time.Minute),
 	}
-	sub.peers["alive"] = &overlayPeer{
-		id:            "alive",
+	sub.peers[aliveID] = &overlayPeer{
+		id:            testPeerID("alive"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
 		announced:     &overlay.Node{Version: now},
 		alive:         true,
@@ -105,10 +150,10 @@ func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 
 	sub.reloadNeighbours()
 
-	if sub.hasNeighbourLocked("dead") {
+	if sub.hasNeighbourLocked(deadID) {
 		t.Fatalf("expected dead known peer to be dropped from neighbours")
 	}
-	if !sub.hasNeighbourLocked("alive") {
+	if !sub.hasNeighbourLocked(aliveID) {
 		t.Fatalf("expected alive known peer to occupy neighbour slot")
 	}
 }
@@ -116,12 +161,12 @@ func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
 	sub := &overlaySubscription{
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
@@ -132,9 +177,9 @@ func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
 	}
 
 	sub.mx.Lock()
-	got := sub.attachPeerEvictionCandidateLocked("new")
+	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"))
 	sub.mx.Unlock()
-	if got != "" {
+	if !got.IsZero() {
 		t.Fatalf("healthy full pool eviction candidate = %q, want none", got)
 	}
 }
@@ -142,12 +187,12 @@ func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
 func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
 	sub := &overlaySubscription{
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
@@ -162,9 +207,9 @@ func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
 	}
 
 	sub.mx.Lock()
-	got := sub.attachPeerEvictionCandidateLocked("new")
+	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"))
 	sub.mx.Unlock()
-	if got != "d" {
+	if got != testPeerID("d") {
 		t.Fatalf("bad peer eviction candidate = %q, want d", got)
 	}
 }
@@ -172,12 +217,12 @@ func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
 func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
 	sub := &overlaySubscription{
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
@@ -192,9 +237,9 @@ func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
 	}
 
 	sub.mx.Lock()
-	got := sub.attachPeerEvictionCandidateLocked("new")
+	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"))
 	sub.mx.Unlock()
-	if got != "d" {
+	if got != testPeerID("d") {
 		t.Fatalf("slow peer eviction candidate = %q, want d", got)
 	}
 }
@@ -202,12 +247,12 @@ func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
 func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
 	sub := &overlaySubscription{
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
@@ -221,10 +266,10 @@ func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
 		sub.peers[id] = peer
 	}
 
-	if !sub.hasPeerReplacementCandidate("new") {
+	if !sub.hasPeerReplacementCandidate(testPeerID("new")) {
 		t.Fatal("expected slow peer to allow DHT refresh replacement")
 	}
-	if sub.peers["d"] == nil {
+	if sub.peers[testPeerID("d")] == nil {
 		t.Fatal("DHT refresh should not evict before candidate is attached")
 	}
 }
@@ -232,13 +277,13 @@ func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
 func TestPingTargetsRotateNeighbours(t *testing.T) {
 	sub := &overlaySubscription{
 		log:        discardLogger(),
-		peers:      map[string]*overlayPeer{},
-		neighbours: []string{},
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: []PeerID{},
 	}
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < 8; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
@@ -263,7 +308,7 @@ func TestPingTargetsRotateNeighbours(t *testing.T) {
 func TestEnsurePeersReturnsWhenFirstPeerArrives(t *testing.T) {
 	sub := &overlaySubscription{
 		log:        discardLogger(),
-		peers:      map[string]*overlayPeer{},
+		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
 	}
 
@@ -277,8 +322,9 @@ func TestEnsurePeersReturnsWhenFirstPeerArrives(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 	sub.mx.Lock()
-	sub.peers["peer-1"] = &overlayPeer{
-		id:            "peer-1",
+	peerID := testPeerID("peer-1")
+	sub.peers[peerID] = &overlayPeer{
+		id:            peerID,
 		overlay:       &overlay.ADNLOverlayWrapper{},
 		announced:     &overlay.Node{Version: int32(time.Now().Unix())},
 		alive:         true,
@@ -305,7 +351,7 @@ func TestStartSeedFromDHTSetsCooldownAfterSearch(t *testing.T) {
 	sub := &overlaySubscription{
 		node:  node,
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 
 	before := time.Now()
@@ -342,10 +388,10 @@ func TestStartSeedFromDHTRefreshesWhenPeerPoolIsFull(t *testing.T) {
 	sub := &overlaySubscription{
 		node:  node,
 		log:   discardLogger(),
-		peers: map[string]*overlayPeer{},
+		peers: map[PeerID]*overlayPeer{},
 	}
 	for i := 0; i < maxPeersPerOverlay; i++ {
-		id := string(rune('a' + i))
+		id := testPeerID(string(rune('a' + i)))
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},

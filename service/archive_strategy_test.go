@@ -151,24 +151,24 @@ func TestArchivePipelineReadyWindowErrorEmitsImmediately(t *testing.T) {
 	}
 }
 
-func TestArchiveCheckpointBackpressureWaitsAtDoubleTarget(t *testing.T) {
+func TestArchiveCheckpointBackpressureWaitsAtConfiguredWindowTarget(t *testing.T) {
 	runner := &archiveCatchUpRunner{
 		service:                &Service{archiveCatchUpCheckpointBlocks: 2000},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
-		current:                &storage.CurrentState{ShardClientSeqno: 4999},
+		current:                &storage.CurrentState{ShardClientSeqno: 8999},
 	}
-	if runner.archiveCheckpointBackpressureBlocks() != 4000 {
-		t.Fatalf("checkpoint backpressure blocks = %d, want 4000", runner.archiveCheckpointBackpressureBlocks())
+	if runner.archiveCheckpointBackpressureBlocks() != 8000 {
+		t.Fatalf("checkpoint backpressure blocks = %d, want 8000", runner.archiveCheckpointBackpressureBlocks())
 	}
 	if runner.shouldWaitArchiveCheckpointBackpressure() {
-		t.Fatal("checkpoint backpressure should not wait below double target")
+		t.Fatal("checkpoint backpressure should not wait below configured window target")
 	}
 
-	runner.current.ShardClientSeqno = 5000
+	runner.current.ShardClientSeqno = 9000
 	if !runner.shouldWaitArchiveCheckpointBackpressure() {
-		t.Fatal("checkpoint backpressure should wait at double target")
+		t.Fatal("checkpoint backpressure should wait at configured window target")
 	}
 }
 
@@ -205,7 +205,7 @@ func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t
 		t.Fatalf("missing shard prefixes = %#v, want [%#v]", missing, want)
 	}
 
-	covered := archiveShardPrefixesMissingFromBlockStates(2, startBlocks, stateBlocks, map[string]PreparedBlock{
+	covered := archiveShardPrefixesMissingFromBlockStates(2, startBlocks, stateBlocks, map[storage.BlockRootHash]PreparedBlock{
 		storage.BlockKey(next): {ID: next},
 	})
 	if len(covered) != 0 {
@@ -227,7 +227,7 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 		stateCells:             newArchiveStateCellOverlay(nil),
 	}
 	runner.stateCells.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
-		first: make([]byte, 2047),
+		first: make([]byte, 4095),
 	}))
 	if runner.shouldWaitArchiveCheckpointBackpressure() {
 		t.Fatal("checkpoint backpressure should not wait below byte limit")
@@ -281,16 +281,16 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 		t.Fatal("next checkpoint should start at byte target")
 	}
 	if runner.shouldBackpressureStagedCurrent() {
-		t.Fatal("next checkpoint should not backpressure below double byte target")
+		t.Fatal("next checkpoint should not backpressure below configured byte target")
 	}
 
-	runner.stagedBlocks = 20
+	runner.stagedBlocks = 40
 	if !runner.shouldBackpressureStagedCurrent() {
-		t.Fatal("next checkpoint should backpressure at double block target")
+		t.Fatal("next checkpoint should backpressure at configured block target")
 	}
 }
 
-func TestArchiveCheckpointAdaptiveTargetCapsBackpressureAtEightThousand(t *testing.T) {
+func TestArchiveCheckpointAdaptiveTargetUsesConfiguredBackpressureWindows(t *testing.T) {
 	service := &Service{archiveCatchUpCheckpointBlocks: 2000}
 	target := service.adaptArchiveCheckpointBlocks(4000, 2*time.Second)
 	if target != 4000 {
@@ -301,8 +301,8 @@ func TestArchiveCheckpointAdaptiveTargetCapsBackpressureAtEightThousand(t *testi
 		service:                service,
 		checkpointBlocksTarget: target,
 	}
-	if runner.archiveCheckpointBackpressureBlocks() != 8000 {
-		t.Fatalf("checkpoint backpressure blocks = %d, want 8000", runner.archiveCheckpointBackpressureBlocks())
+	if runner.archiveCheckpointBackpressureBlocks() != 16000 {
+		t.Fatalf("checkpoint backpressure blocks = %d, want 16000", runner.archiveCheckpointBackpressureBlocks())
 	}
 }
 
@@ -310,7 +310,7 @@ func TestArchiveImportAppendKeepsAllImportedBlocks(t *testing.T) {
 	master1 := testMasterBlockID(11)
 	master2 := testMasterBlockID(12)
 	future := testMasterBlockID(13)
-	shard := ton.BlockIDExt{Workchain: 0, Shard: topShard, SeqNo: 101}
+	shard := testBlockID(0, topShard, 101)
 
 	src := &storage.ServedArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{
@@ -326,7 +326,7 @@ func TestArchiveImportAppendKeepsAllImportedBlocks(t *testing.T) {
 	}
 
 	dst := &storage.ServedArchiveImport{}
-	appendArchiveImport(dst, src, map[string]struct{}{}, map[string]struct{}{})
+	appendArchiveImport(dst, src, map[storage.BlockRootHash]struct{}{}, map[archiveImportLinkKey]struct{}{})
 
 	if len(dst.FullBlocks) != 4 {
 		t.Fatalf("stored full blocks = %d, want 4", len(dst.FullBlocks))
@@ -390,7 +390,7 @@ func testArchiveMasterBlock(seqno uint32, keyBlock bool) PreparedBlock {
 }
 
 func testMasterBlockID(seqno uint32) ton.BlockIDExt {
-	return ton.BlockIDExt{Workchain: -1, Shard: topShard, SeqNo: seqno}
+	return testBlockID(-1, topShard, seqno)
 }
 
 func testStoredArchiveFull(block ton.BlockIDExt) *storage.ServedBlockFull {

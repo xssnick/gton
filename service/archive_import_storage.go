@@ -88,13 +88,13 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 		return nil, fmt.Errorf("import archive %s: empty stats", imported.ArtifactPath)
 	}
 
-	blocks := map[string]PreparedBlock{}
+	blocks := map[storage.BlockRootHash]PreparedBlock{}
 	stored := storage.ServedArchiveImport{
 		FullBlocks: make([]*storage.ServedBlockFull, 0, len(imported.FullBlocks)),
 		Links:      append([]storage.ServedBlockLink(nil), imported.Links...),
 	}
 
-	seenBlocks := map[string]struct{}{}
+	seenBlocks := map[storage.BlockRootHash]struct{}{}
 	for _, full := range imported.FullBlocks {
 		key := storage.BlockKey(full.ID)
 		if _, exists := seenBlocks[key]; exists {
@@ -151,7 +151,7 @@ func (s *Service) archiveShardPrefixesForWindow(start *storage.BlockState, state
 	return archiveShardPrefixesForBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks), inputs.splitDepth, nil
 }
 
-func (s *Service) missingArchiveShardPrefixesForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[string]PreparedBlock) ([]archive.ShardID, uint32, error) {
+func (s *Service) missingArchiveShardPrefixesForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock) ([]archive.ShardID, uint32, error) {
 	inputs, err := s.archiveShardPrefixInputsForWindow(start, states)
 	if err != nil {
 		return nil, 0, err
@@ -200,7 +200,7 @@ func archiveShardPrefixesForBlockStates(splitDepth uint32, startBlocks []ton.Blo
 	return archiveShardPrefixesForBlockStatesMatching(splitDepth, startBlocks, stateBlocks, nil)
 }
 
-func archiveShardPrefixesMissingFromBlockStates(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, blocks map[string]PreparedBlock) []archive.ShardID {
+func archiveShardPrefixesMissingFromBlockStates(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, blocks map[storage.BlockRootHash]PreparedBlock) []archive.ShardID {
 	return archiveShardPrefixesForBlockStatesMatching(splitDepth, startBlocks, stateBlocks, func(block ton.BlockIDExt) bool {
 		_, ok := blocks[storage.BlockKey(block)]
 		return !ok

@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -37,17 +38,6 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 		return err
 	}
 
-	sub, err := n.subscriptionForWorkchain(addrKey.Workchain)
-	if err != nil {
-		return err
-	}
-
-	hash := externalMessageFingerprint(sub.spec.ShortID, data)
-	now := time.Now()
-	if n.processedExternalMessages.Seen(hash, now) || n.myExternalMessages.Seen(hash, now) {
-		return nil
-	}
-
 	payload, err := tl.Serialize(tonnodeapi.NewExternalMessageBroadcast{
 		Message: tonnodeapi.ExternalMessage{Data: append([]byte(nil), data...)},
 	}, true)
@@ -57,22 +47,98 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 	if len(payload) > maxOverlayPayloadSize {
 		return fmt.Errorf("external message broadcast payload is too large: %d", len(payload))
 	}
+
+	now := time.Now()
+	targets, err := n.externalMessageTargets(addrKey, data)
+	if err != nil {
+		return err
+	}
+
+	pending := make([]externalMessageTarget, 0, len(targets))
+	for _, target := range targets {
+		if n.processedExternalMessages.Seen(target.hash, now) || n.myExternalMessages.Seen(target.hash, now) {
+			continue
+		}
+		pending = append(pending, target)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
 	if err = n.addExternalMessageAddressLimit(addrKey, now); err != nil {
 		return err
 	}
 
-	req := rebroadcastRequest{
-		subscription: sub,
-		kind:         "tonNode.externalMessageBroadcast",
-		payload:      payload,
-		local:        true,
+	queued := 0
+	for _, target := range pending {
+		req := rebroadcastRequest{
+			subscription: target.sub,
+			kind:         "tonNode.externalMessageBroadcast",
+			payload:      append([]byte(nil), payload...),
+			local:        true,
+		}
+		if !target.sub.enqueueRebroadcast(req) {
+			continue
+		}
+		n.myExternalMessages.Mark(target.hash, now)
+		queued++
 	}
-	if !sub.enqueueRebroadcast(req) {
+	if queued == 0 {
 		n.dropExternalMessageAddressLimit(addrKey, now)
 		return errors.New("local external message rebroadcast queues are full")
 	}
-	n.myExternalMessages.Mark(hash, now)
 	return nil
+}
+
+type externalMessageTarget struct {
+	sub  *overlaySubscription
+	hash string
+}
+
+func (n *Node) externalMessageTargets(addrKey extmsg.AddressKey, data []byte) ([]externalMessageTarget, error) {
+	customTargets, skipPublic := n.customExternalMessageTargets(addrKey, data)
+	targets := make([]externalMessageTarget, 0, len(customTargets)+1)
+	targets = append(targets, customTargets...)
+
+	if !skipPublic {
+		sub, err := n.subscriptionForWorkchain(addrKey.Workchain)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, externalMessageTarget{
+			sub:  sub,
+			hash: externalMessageFingerprint(sub.spec.ShortID, data),
+		})
+	}
+	return targets, nil
+}
+
+func (n *Node) customExternalMessageTargets(addrKey extmsg.AddressKey, data []byte) ([]externalMessageTarget, bool) {
+	leafShard := externalMessageLeafShard(addrKey)
+	targets := make([]externalMessageTarget, 0)
+	skipPublic := false
+	for _, sub := range n.subscriptionsSnapshot() {
+		if sub == nil || sub.spec.Kind != overlayKindCustomFixed || !sub.isActive() {
+			continue
+		}
+		if _, ok := sub.spec.MsgSenders[n.localID]; !ok {
+			continue
+		}
+		if !sub.spec.sendsShard(addrKey.Workchain, leafShard) {
+			continue
+		}
+		targets = append(targets, externalMessageTarget{
+			sub:  sub,
+			hash: externalMessageFingerprint(sub.spec.ShortID, data),
+		})
+		if sub.spec.SkipPublicMsgSend {
+			skipPublic = true
+		}
+	}
+	return targets, skipPublic
+}
+
+func externalMessageLeafShard(key extmsg.AddressKey) int64 {
+	return int64(binary.BigEndian.Uint64(key.Account[:8]) | 1)
 }
 
 func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, error) {

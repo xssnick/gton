@@ -7,17 +7,17 @@ import (
 
 func TestPrioritizeStateSnapshotPeers(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[string]int{
-			"peer-a": 2,
-			"peer-b": 0,
-			"peer-c": 0,
+		downloadPeerLeases: map[PeerID]int{
+			testPeerID("peer-a"): 2,
+			testPeerID("peer-b"): 0,
+			testPeerID("peer-c"): 0,
 		},
 	}
 
 	peers := []*overlayPeer{
-		{addr: "peer-a"},
-		{addr: "peer-b"},
-		{addr: "peer-c"},
+		{id: testPeerID("peer-a"), addr: "peer-a"},
+		{id: testPeerID("peer-b"), addr: "peer-b"},
+		{id: testPeerID("peer-c"), addr: "peer-c"},
 	}
 
 	prioritized := node.prioritizeStateSnapshotPeers(peers)
@@ -35,16 +35,16 @@ func TestPrioritizeStateSnapshotPeers(t *testing.T) {
 
 func TestPrioritizeBlockDownloadPeersUsesDownloadScore(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[string]int{
-			"busy": 2,
+		downloadPeerLeases: map[PeerID]int{
+			testPeerID("busy"): 2,
 		},
 	}
 	now := time.Now()
 	peers := []*overlayPeer{
-		{id: "slow", addr: "slow", alive: true, downloadBytesSec: 20 << 20, downloadSlowUntil: now.Add(time.Minute)},
-		{id: "unknown", addr: "unknown", alive: true},
-		{id: "busy", addr: "busy", alive: true, downloadBytesSec: 10 << 20, roundtrip: 20 * time.Millisecond},
-		{id: "fast", addr: "fast", alive: true, downloadBytesSec: 8 << 20, roundtrip: 20 * time.Millisecond},
+		{id: testPeerID("slow"), addr: "slow", alive: true, downloadBytesSec: 20 << 20, downloadSlowUntil: now.Add(time.Minute)},
+		{id: testPeerID("unknown"), addr: "unknown", alive: true},
+		{id: testPeerID("busy"), addr: "busy", alive: true, downloadBytesSec: 10 << 20, roundtrip: 20 * time.Millisecond},
+		{id: testPeerID("fast"), addr: "fast", alive: true, downloadBytesSec: 8 << 20, roundtrip: 20 * time.Millisecond},
 	}
 
 	prioritized := node.prioritizeBlockDownloadPeers(peers)
@@ -61,12 +61,12 @@ func TestPrioritizeBlockDownloadPeersUsesDownloadScore(t *testing.T) {
 
 func TestAcquirePreferredStateSnapshotProbePrefersLessBusyPeer(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[string]int{},
+		downloadPeerLeases: map[PeerID]int{},
 	}
 
-	peerA := &overlayPeer{addr: "peer-a"}
-	peerB := &overlayPeer{addr: "peer-b"}
-	peerC := &overlayPeer{addr: "peer-c"}
+	peerA := &overlayPeer{id: testPeerID("peer-a"), addr: "peer-a"}
+	peerB := &overlayPeer{id: testPeerID("peer-b"), addr: "peer-b"}
+	peerC := &overlayPeer{id: testPeerID("peer-c"), addr: "peer-c"}
 
 	probes := []persistentStatePeerProbe{
 		{

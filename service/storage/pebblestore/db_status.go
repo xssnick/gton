@@ -30,27 +30,23 @@ type CellDBGenerationStatus struct {
 }
 
 type CellDBCacheStatus struct {
-	BlockCacheSize      int64
-	BlockCacheHits      int64
-	BlockCacheMisses    int64
-	FileCacheSize       int64
-	FileCacheTableCount int64
+	BlockCacheSize   int64
+	BlockCacheHits   int64
+	BlockCacheMisses int64
+	FileCacheSize    int64
 }
 
 type CellDBShardStatus struct {
 	Shard                    int
 	DiskSize                 uint64
 	LiveSize                 uint64
-	LiveTables               uint64
 	ReadAmp                  int64
 	L0Files                  int64
 	L0Sublevels              int64
-	L0Size                   int64
 	CompactionDebt           uint64
 	CompactionsInProgress    int64
 	CompactionInProgressSize int64
 	MemTableSize             uint64
-	MemTableCount            int64
 	TableIters               int64
 	Flushes                  int64
 	Ingests                  uint64
@@ -202,11 +198,10 @@ func metaDBStatus(db *pebble.DB) *MetaDBStatus {
 
 func pebbleDBCacheStatus(metrics *pebble.Metrics) CellDBCacheStatus {
 	return CellDBCacheStatus{
-		BlockCacheSize:      metrics.BlockCache.Size,
-		BlockCacheHits:      metrics.BlockCache.Hits,
-		BlockCacheMisses:    metrics.BlockCache.Misses,
-		FileCacheSize:       metrics.FileCache.Size,
-		FileCacheTableCount: metrics.FileCache.TableCount,
+		BlockCacheSize:   metrics.BlockCache.Size,
+		BlockCacheHits:   metrics.BlockCache.Hits,
+		BlockCacheMisses: metrics.BlockCache.Misses,
+		FileCacheSize:    metrics.FileCache.Size,
 	}
 }
 
@@ -215,16 +210,13 @@ func pebbleDBShardStatus(shard int, metrics *pebble.Metrics) CellDBShardStatus {
 		Shard:                    shard,
 		DiskSize:                 metrics.DiskSpaceUsage(),
 		LiveSize:                 metrics.Table.Local.LiveSize,
-		LiveTables:               metrics.Table.Local.LiveCount,
 		ReadAmp:                  cellDBReadAmp(metrics.Levels),
 		L0Files:                  metrics.Levels[0].TablesCount,
 		L0Sublevels:              int64(metrics.Levels[0].Sublevels),
-		L0Size:                   metrics.Levels[0].TablesSize,
 		CompactionDebt:           metrics.Compact.EstimatedDebt,
 		CompactionsInProgress:    metrics.Compact.NumInProgress,
 		CompactionInProgressSize: metrics.Compact.InProgressBytes,
 		MemTableSize:             metrics.MemTable.Size,
-		MemTableCount:            metrics.MemTable.Count,
 		TableIters:               metrics.TableIters,
 		Flushes:                  metrics.Flush.Count,
 		Ingests:                  metrics.Ingest.Count,
@@ -289,18 +281,15 @@ func cellStoreDBMetrics(cells *cellStore) storage.CellGenerationDBMetrics {
 func (s *CellDBShardStatus) add(shard CellDBShardStatus) {
 	s.DiskSize += shard.DiskSize
 	s.LiveSize += shard.LiveSize
-	s.LiveTables += shard.LiveTables
 	if shard.ReadAmp > s.ReadAmp {
 		s.ReadAmp = shard.ReadAmp
 	}
 	s.L0Files += shard.L0Files
 	s.L0Sublevels += shard.L0Sublevels
-	s.L0Size += shard.L0Size
 	s.CompactionDebt += shard.CompactionDebt
 	s.CompactionsInProgress += shard.CompactionsInProgress
 	s.CompactionInProgressSize += shard.CompactionInProgressSize
 	s.MemTableSize += shard.MemTableSize
-	s.MemTableCount += shard.MemTableCount
 	s.TableIters += shard.TableIters
 	s.Flushes += shard.Flushes
 	s.Ingests += shard.Ingests

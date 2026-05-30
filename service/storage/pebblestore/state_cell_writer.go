@@ -270,7 +270,7 @@ func (p *stateCellSaveProgress) logProgress(done bool, now time.Time) {
 		event.Msg("state cells imported into celldb")
 		return
 	}
-	event.Int("pending_batch_cells", p.writer.pendingCells()).Msg("state cell persistence progress")
+	event.Int("pending_batch_cells", p.writer.pendingCells()).Msg("state to cell db import progress")
 }
 
 func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*cell.Cell, error) {

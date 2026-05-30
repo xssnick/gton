@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"testing"
@@ -11,12 +13,8 @@ import (
 )
 
 func testBlockID(workchain int32, shard int64, seqno uint32) ton.BlockIDExt {
-	root := make([]byte, 32)
-	file := make([]byte, 32)
-	root[0] = byte(seqno)
-	root[31] = 0x01
-	file[0] = byte(seqno)
-	file[31] = 0x02
+	root := testBlockHash(0x01, workchain, shard, seqno)
+	file := testBlockHash(0x02, workchain, shard, seqno)
 	return ton.BlockIDExt{
 		Workchain: workchain,
 		Shard:     shard,
@@ -24,6 +22,16 @@ func testBlockID(workchain int32, shard int64, seqno uint32) ton.BlockIDExt {
 		RootHash:  root,
 		FileHash:  file,
 	}
+}
+
+func testBlockHash(kind byte, workchain int32, shard int64, seqno uint32) []byte {
+	var data [17]byte
+	data[0] = kind
+	binary.BigEndian.PutUint32(data[1:5], uint32(workchain))
+	binary.BigEndian.PutUint64(data[5:13], uint64(shard))
+	binary.BigEndian.PutUint32(data[13:17], seqno)
+	hash := sha256.Sum256(data[:])
+	return append([]byte(nil), hash[:]...)
 }
 
 func testShardStateCell(tb testing.TB, block ton.BlockIDExt) *cell.Cell {

@@ -1047,11 +1047,134 @@
         }
       }
     },
+    "panel-57": {
+      "kind": "Panel",
+      "spec": {
+        "id": 57,
+        "title": "Master+shards obtain p95",
+        "description": "Critical-path obtain time per master transition. The shards stage records the union of shard download intervals so parallel requests are not summed.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"master\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} master p95"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"shards\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} shards p95"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "C",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"master\"}[$__rate_interval]))) + on (instance, pipeline) histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"shards\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} master+shards p95"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "s"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-17": {
       "kind": "Panel",
       "spec": {
         "id": 17,
-        "title": "State transition latency p95",
+        "title": "Block apply latency p95",
         "description": "",
         "links": [],
         "data": {
@@ -3765,8 +3888,8 @@
       "kind": "Panel",
       "spec": {
         "id": 48,
-        "title": "Rebroadcast rate",
-        "description": "Successful P2P rebroadcast sends by overlay and TL type.",
+        "title": "Queue rebroadcast / overlay relay rate",
+        "description": "App-level rebroadcast queue sends by TL type and overlay-level relay sends by delivery path. FEC relay sends are FEC parts, not decoded TL broadcast kinds.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -3785,8 +3908,27 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"rebroadcasted\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{overlay}} {{kind}}"
+                      "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"queue_rebroadcasted\"}[$__rate_interval]))",
+                      "legendFormat": "queue {{instance}} {{overlay}} {{kind}}"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, delivery) (rate(${metric_namespace}_p2p_broadcast_relay_sent_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "relay {{instance}} {{overlay}} {{delivery}}"
                     }
                   }
                 }
@@ -4674,6 +4816,19 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-19"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 24,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-57"
                       }
                     }
                   }

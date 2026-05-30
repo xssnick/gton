@@ -21,3 +21,10 @@ type LiveBlockArtifacts struct {
 	StateFlushed     bool
 	ProofsFlushed    bool
 }
+
+type LiveBlockNonfinalKind uint8
+
+const (
+	LiveBlockNonfinalSigned LiveBlockNonfinalKind = 1 << iota
+	LiveBlockNonfinalCandidate
+)

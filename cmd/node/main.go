@@ -234,6 +234,11 @@ func main() {
 		logger.Error().Err(err).Msg("failed to load checkpoint bytes option")
 		os.Exit(1)
 	}
+	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load sync backpressure windows option")
+		os.Exit(1)
+	}
 
 	storageDir := cfg.StorageDir()
 	if storageDir == "" {
@@ -243,6 +248,11 @@ func main() {
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to load storage cell cache option")
+		os.Exit(1)
+	}
+	decodedCellCacheOpts, err := cfg.DecodedCellCacheOptions()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage decoded cell cache option")
 		os.Exit(1)
 	}
 	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
@@ -265,6 +275,11 @@ func main() {
 		Str("storage", "pebble").
 		Str("dir", storageDir).
 		Int64("cell_total_cache_size", cellTotalCacheSize).
+		Bool("decoded_cell_cache_enabled", decodedCellCacheOpts.Enabled).
+		Int("decoded_cell_cache_shards", decodedCellCacheOpts.Shards).
+		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCacheOpts.BytesPerEntry).
+		Int("decoded_cell_cache_min_entries", decodedCellCacheOpts.MinEntries).
+		Int("decoded_cell_cache_max_entries", decodedCellCacheOpts.MaxEntries).
 		Int("cell_shard_memtable_size", cellShardMemTableSize).
 		Int("cell_memtable_stop_writes_threshold", cellMemTableStopWritesThreshold).
 		Int("artifact_file_max_open", artifactFileMaxOpen).
@@ -273,6 +288,11 @@ func main() {
 		Dir:                             storageDir,
 		Logger:                          logs.CategoryPtr("pebblestore"),
 		CellCacheSize:                   cellTotalCacheSize,
+		DisableDecodedCellCache:         !decodedCellCacheOpts.Enabled,
+		DecodedCellCacheShards:          decodedCellCacheOpts.Shards,
+		DecodedCellCacheBytesPerEntry:   decodedCellCacheOpts.BytesPerEntry,
+		DecodedCellCacheMinEntries:      decodedCellCacheOpts.MinEntries,
+		DecodedCellCacheMaxEntries:      decodedCellCacheOpts.MaxEntries,
 		CellShardMemTableSize:           cellShardMemTableSize,
 		CellMemTableStopWritesThreshold: cellMemTableStopWritesThreshold,
 		ArtifactFileMaxOpen:             artifactFileMaxOpen,
@@ -344,6 +364,7 @@ func main() {
 		liveLiteStore = liteserver.NewLiveStore(opts.Storage, liteserver.LiveStoreOptions{
 			MasterBlockCache: liteOpts.MasterBlockCache,
 			ShardBlockCache:  liteOpts.ShardBlockCache,
+			NonFinalEnabled:  liteOpts.NonFinalEnabled,
 		})
 		currentStatePublisher = liveLiteStore
 	}
@@ -355,6 +376,7 @@ func main() {
 		ArchiveCatchUpPrefetchWindows:  *archivePrefetchWindowsFlag,
 		NextBlockCheckpointBlocks:      nextCheckpointBlocks,
 		CheckpointBytes:                checkpointBytes,
+		SyncBackpressureWindows:        syncBackpressureWindows,
 		CurrentStatePublisher:          currentStatePublisher,
 		ShutdownContext:                shutdownCtx,
 		StateFilesDir:                  stateFilesDir,
@@ -362,6 +384,7 @@ func main() {
 		ArchiveTTL:                     archiveTTL,
 		StorageDir:                     storageDir,
 		DisableStateSerialization:      cfg.DisableStateSerialization,
+		DisableArchiveBackfill:         cfg.TON.DisableArchiveBackfill,
 		SyncObserver:                   syncObserver,
 	})
 	node.SetBroadcastSignatureVerifier(svc)
@@ -378,6 +401,7 @@ func main() {
 			QueryObserver: queryObserver,
 			PrivateKey:    liteOpts.PrivateKey,
 			ListenAddr:    liteOpts.ListenAddr,
+			NonFinal:      liteOpts.NonFinalEnabled,
 			ZeroState:     zeroStateIDFromBlock(globalConfigZeroState),
 		})
 		if err != nil {
@@ -449,6 +473,7 @@ func main() {
 		Bool("log_file_compress", logRotation.Compress).
 		Str("global_config", globalConfigPath).
 		Str("listen_addr", fallbackString(opts.ListenAddr, "<client-mode>")).
+		Str("adnl_id", node.LocalID().Base64()).
 		Bool("dht_server", opts.DHTListenAddr != "").
 		Str("dht_listen_addr", fallbackString(opts.DHTListenAddr, "<client-mode>")).
 		Bool("liteserver", liteOpts.Enabled).
@@ -460,9 +485,11 @@ func main() {
 		Dur("sync_before", syncBefore).
 		Dur("state_ttl", stateTTL).
 		Dur("archive_ttl", archiveTTL).
+		Bool("disable_archive_backfill", cfg.TON.DisableArchiveBackfill).
 		Uint32("next_checkpoint_blocks", nextCheckpointBlocks).
 		Uint32("archive_checkpoint_blocks", archiveCheckpointBlocks).
 		Uint64("checkpoint_bytes", checkpointBytes).
+		Uint32("sync_backpressure_windows", syncBackpressureWindows).
 		Dur("archive_checkpoint_period", *archiveCheckpointPeriodFlag).
 		Int("archive_prefetch_windows", *archivePrefetchWindowsFlag).
 		Bool("disable_state_serialization", cfg.DisableStateSerialization).

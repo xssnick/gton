@@ -232,7 +232,7 @@ func TestRunCellGenerationMigrationDropsPendingWhenPersistentStateMissing(t *tes
 	store := &testCellGenerationMigrationStore{
 		pending:                &pending,
 		persistentStateFileErr: storage.ErrNotFound,
-		blockMetas: map[string]*storage.BlockMeta{
+		blockMetas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(origin): {
 				ID:            origin,
 				StateRootHash: bytes.Repeat([]byte{0x42}, 32),
@@ -714,7 +714,7 @@ func TestPersistentImportStateMetadataUsesBlockMeta(t *testing.T) {
 	rootHash := bytes.Repeat([]byte{0x42}, 32)
 	fileHash := bytes.Repeat([]byte{0x24}, 32)
 	store := &testCellGenerationMigrationStore{
-		blockMetas: map[string]*storage.BlockMeta{
+		blockMetas: map[storage.BlockRootHash]*storage.BlockMeta{
 			storage.BlockKey(block): {
 				ID:            block,
 				StateRootHash: rootHash,
@@ -898,8 +898,8 @@ type testCellGenerationMigrationStore struct {
 	migrationProgress            *storage.CurrentState
 	savedMigrationProgress       *storage.CurrentState
 	saveMigrationProgresses      int
-	blockStates                  map[string]*storage.BlockState
-	blockMetas                   map[string]*storage.BlockMeta
+	blockStates                  map[storage.BlockRootHash]*storage.BlockState
+	blockMetas                   map[storage.BlockRootHash]*storage.BlockMeta
 	lazyRoots                    map[string]*cell.Cell
 	persistentStateFileErr       error
 	persistentStateFileCalls     int

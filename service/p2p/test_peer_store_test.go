@@ -22,24 +22,24 @@ const (
 type testPeerStore struct {
 	mu sync.RWMutex
 
-	blocks       map[string]*storage.ServedBlockFull
-	nextBlocks   map[string]string
-	blockData    map[string][]byte
-	proofs       map[string][]byte
-	zeroStates   map[string][]byte
-	stateFiles   map[string][]byte
+	blocks       map[storage.BlockRootHash]*storage.ServedBlockFull
+	nextBlocks   map[storage.BlockRootHash]storage.BlockRootHash
+	blockData    map[storage.BlockRootHash][]byte
+	proofs       map[testPeerProofKey][]byte
+	zeroStates   map[storage.BlockRootHash][]byte
+	stateFiles   map[testPeerPersistentStateKey][]byte
 	archiveInfos map[string]int64
 	archiveFiles map[int64][]byte
 }
 
 func newTestPeerStore() *testPeerStore {
 	return &testPeerStore{
-		blocks:       map[string]*storage.ServedBlockFull{},
-		nextBlocks:   map[string]string{},
-		blockData:    map[string][]byte{},
-		proofs:       map[string][]byte{},
-		zeroStates:   map[string][]byte{},
-		stateFiles:   map[string][]byte{},
+		blocks:       map[storage.BlockRootHash]*storage.ServedBlockFull{},
+		nextBlocks:   map[storage.BlockRootHash]storage.BlockRootHash{},
+		blockData:    map[storage.BlockRootHash][]byte{},
+		proofs:       map[testPeerProofKey][]byte{},
+		zeroStates:   map[storage.BlockRootHash][]byte{},
+		stateFiles:   map[testPeerPersistentStateKey][]byte{},
 		archiveInfos: map[string]int64{},
 		archiveFiles: map[int64][]byte{},
 	}
@@ -294,12 +294,27 @@ func (s *testPeerStore) ArchiveSlice(_ context.Context, archiveID, offset int64,
 	return append([]byte(nil), value...), nil
 }
 
-func (s *testPeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) string {
-	return string(kind) + ":" + storage.BlockKey(block)
+type testPeerProofKey struct {
+	kind  storage.ServedProofKind
+	block storage.BlockRootHash
 }
 
-func (s *testPeerStore) persistentStateKey(block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) string {
-	return storage.BlockKey(block) + ":" + storage.BlockKey(masterchainBlock) + ":" + fmt.Sprintf("%016x", uint64(effectiveShard))
+func (s *testPeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) testPeerProofKey {
+	return testPeerProofKey{kind: kind, block: storage.BlockKey(block)}
+}
+
+type testPeerPersistentStateKey struct {
+	block            storage.BlockRootHash
+	masterchainBlock storage.BlockRootHash
+	effectiveShard   int64
+}
+
+func (s *testPeerStore) persistentStateKey(block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) testPeerPersistentStateKey {
+	return testPeerPersistentStateKey{
+		block:            storage.BlockKey(block),
+		masterchainBlock: storage.BlockKey(masterchainBlock),
+		effectiveShard:   effectiveShard,
+	}
 }
 
 func testArchiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) string {

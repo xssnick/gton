@@ -282,7 +282,7 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 	}
 	started := time.Now()
 	prepared := make([]preparedBlockStateSave, 0, len(states))
-	seen := make(map[string]struct{}, len(states))
+	seen := make(map[storage.BlockRootHash]struct{}, len(states))
 	trees := make([]stateCellTreeSave, 0, len(states))
 	treePreparedIndexes := make([]int, 0, len(states))
 	usePreparedCells := !cells.Empty()
@@ -524,7 +524,7 @@ func hotCurrentStateMissing(db *pebble.DB) (bool, error) {
 }
 
 func (s *Store) validateCurrentStateMetadata(db *pebble.DB, current *storage.CurrentState, prepared []preparedBlockStateSave) error {
-	preparedByBlock := make(map[string]storage.BlockState, len(prepared))
+	preparedByBlock := make(map[storage.BlockRootHash]storage.BlockState, len(prepared))
 	for _, state := range prepared {
 		preparedByBlock[storage.BlockKey(state.saved.Block)] = state.saved
 	}
@@ -541,7 +541,7 @@ func (s *Store) validateCurrentStateMetadata(db *pebble.DB, current *storage.Cur
 	return nil
 }
 
-func (s *Store) validateCurrentStateBlockMetadata(db *pebble.DB, label string, current storage.BlockState, prepared map[string]storage.BlockState) error {
+func (s *Store) validateCurrentStateBlockMetadata(db *pebble.DB, label string, current storage.BlockState, prepared map[storage.BlockRootHash]storage.BlockState) error {
 	if saved, ok := prepared[storage.BlockKey(current.Block)]; ok {
 		return validateCurrentStateBlockMetaMatch(label, current, saved)
 	}
@@ -657,12 +657,12 @@ func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64,
 	return oldGeneration, nil
 }
 
-func currentStateBlockKeepSet(current *storage.CurrentState, additional []ton.BlockIDExt) map[string]struct{} {
+func currentStateBlockKeepSet(current *storage.CurrentState, additional []ton.BlockIDExt) map[storage.BlockRootHash]struct{} {
 	if current == nil {
 		return nil
 	}
 
-	keep := make(map[string]struct{}, 1+len(current.Shards)+len(additional))
+	keep := make(map[storage.BlockRootHash]struct{}, 1+len(current.Shards)+len(additional))
 	keep[storage.BlockKey(current.Masterchain.Block)] = struct{}{}
 	for _, key := range storage.SortedShardKeys(current.Shards) {
 		shard := current.Shards[key]
@@ -802,7 +802,7 @@ func currentStateRootsEqual(left *storage.CurrentState, right *storage.CurrentSt
 	return true
 }
 
-func deleteStateMetadataBeforeImportedState(ctx context.Context, db *pebble.DB, batch *pebble.Batch, origin ton.BlockIDExt, keep map[string]struct{}) (int, error) {
+func deleteStateMetadataBeforeImportedState(ctx context.Context, db *pebble.DB, batch *pebble.Batch, origin ton.BlockIDExt, keep map[storage.BlockRootHash]struct{}) (int, error) {
 	if !isMasterchainBlock(origin) {
 		return 0, fmt.Errorf("cell generation origin is not masterchain: %s", storage.FormatBlockRef(origin))
 	}

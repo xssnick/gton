@@ -15,9 +15,9 @@ import (
 
 func TestRunConcurrentBlockDownloadsHedgesPastHungPeers(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-1", addr: "peer-1"},
-		{id: "peer-2", addr: "peer-2"},
-		{id: "peer-3", addr: "peer-3"},
+		{id: testPeerID("peer-1"), addr: "peer-1"},
+		{id: testPeerID("peer-2"), addr: "peer-2"},
+		{id: testPeerID("peer-3"), addr: "peer-3"},
 	}
 	want := &DownloadedBlock{ID: testBlockID(-1, topShard, 42)}
 
@@ -27,7 +27,7 @@ func TestRunConcurrentBlockDownloadsHedgesPastHungPeers(t *testing.T) {
 	startedAt := time.Now()
 	got, err := runConcurrentBlockDownloads(ctx, peers, 2, func(*overlayPeer, error) {}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 		switch peer.id {
-		case "peer-3":
+		case testPeerID("peer-3"):
 			return *want, nil
 		default:
 			<-ctx.Done()
@@ -49,16 +49,16 @@ func TestRunConcurrentBlockDownloadsHedgesPastHungPeers(t *testing.T) {
 
 func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-1", addr: "peer-1"},
-		{id: "peer-2", addr: "peer-2"},
-		{id: "peer-3", addr: "peer-3"},
+		{id: testPeerID("peer-1"), addr: "peer-1"},
+		{id: testPeerID("peer-2"), addr: "peer-2"},
+		{id: testPeerID("peer-3"), addr: "peer-3"},
 	}
 	want := &DownloadedBlock{ID: testBlockID(-1, topShard, 42)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	started := make(chan string, len(peers))
+	started := make(chan PeerID, len(peers))
 	release := make(chan struct{})
 	gotCh := make(chan *DownloadedBlock, 1)
 	errCh := make(chan error, 1)
@@ -67,12 +67,12 @@ func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 		got, err := probeNextFullFromPeers(ctx, peers, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 			started <- peer.id
 			switch peer.id {
-			case "peer-1":
+			case testPeerID("peer-1"):
 				return DownloadedBlock{}, ErrBlockNotAvailable
-			case "peer-2":
+			case testPeerID("peer-2"):
 				<-release
 				return DownloadedBlock{}, ErrBlockNotAvailable
-			case "peer-3":
+			case testPeerID("peer-3"):
 				<-release
 				return *want, nil
 			default:
@@ -86,7 +86,7 @@ func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 		gotCh <- got
 	}()
 
-	seen := map[string]bool{}
+	seen := map[PeerID]bool{}
 	for len(seen) < len(peers) {
 		select {
 		case peer := <-started:
@@ -111,24 +111,24 @@ func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 
 func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-1", addr: "peer-1"},
-		{id: "peer-2", addr: "peer-2"},
-		{id: "peer-3", addr: "peer-3"},
-		{id: "peer-4", addr: "peer-4"},
+		{id: testPeerID("peer-1"), addr: "peer-1"},
+		{id: testPeerID("peer-2"), addr: "peer-2"},
+		{id: testPeerID("peer-3"), addr: "peer-3"},
+		{id: testPeerID("peer-4"), addr: "peer-4"},
 	}
 	want := &DownloadedBlock{ID: testBlockID(-1, topShard, 42)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	started := make(chan string, len(peers))
+	started := make(chan PeerID, len(peers))
 	gotCh := make(chan *DownloadedBlock, 1)
 	errCh := make(chan error, 1)
 
 	go func() {
 		got, err := probeNextFullFromPeersStaged(ctx, peers, 2, 4, 50*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 			started <- peer.id
-			if peer.id == "peer-4" {
+			if peer.id == testPeerID("peer-4") {
 				return *want, nil
 			}
 			<-ctx.Done()
@@ -141,7 +141,7 @@ func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 		gotCh <- got
 	}()
 
-	seen := map[string]bool{}
+	seen := map[PeerID]bool{}
 	for len(seen) < 2 {
 		select {
 		case peer := <-started:
@@ -150,7 +150,7 @@ func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 			t.Fatalf("probe did not start initial peers, seen=%v", seen)
 		}
 	}
-	if seen["peer-3"] || seen["peer-4"] {
+	if seen[testPeerID("peer-3")] || seen[testPeerID("peer-4")] {
 		t.Fatal("staged peer started before delay")
 	}
 
@@ -162,7 +162,7 @@ func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 
 	select {
 	case peer := <-started:
-		if peer != "peer-3" {
+		if peer != testPeerID("peer-3") {
 			t.Fatalf("unexpected first ramp peer: %s", peer)
 		}
 	case <-time.After(time.Second):
@@ -189,10 +189,10 @@ func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 
 func TestProbeNextFullFromPeersStopsAfterEarlyFailures(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-1", addr: "peer-1"},
-		{id: "peer-2", addr: "peer-2"},
-		{id: "peer-3", addr: "peer-3"},
-		{id: "peer-4", addr: "peer-4"},
+		{id: testPeerID("peer-1"), addr: "peer-1"},
+		{id: testPeerID("peer-2"), addr: "peer-2"},
+		{id: testPeerID("peer-3"), addr: "peer-3"},
+		{id: testPeerID("peer-4"), addr: "peer-4"},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -206,7 +206,7 @@ func TestProbeNextFullFromPeersStopsAfterEarlyFailures(t *testing.T) {
 		earlyFailureCount: 3,
 		earlyFailureDelay: 40 * time.Millisecond,
 	}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
-		if peer.id == "peer-4" {
+		if peer.id == testPeerID("peer-4") {
 			<-ctx.Done()
 			return DownloadedBlock{}, ctx.Err()
 		}
@@ -222,9 +222,9 @@ func TestProbeNextFullFromPeersStopsAfterEarlyFailures(t *testing.T) {
 
 func TestProbeNextFullFromPeersStopsAfterSoftTimeout(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-1", addr: "peer-1"},
-		{id: "peer-2", addr: "peer-2"},
-		{id: "peer-3", addr: "peer-3"},
+		{id: testPeerID("peer-1"), addr: "peer-1"},
+		{id: testPeerID("peer-2"), addr: "peer-2"},
+		{id: testPeerID("peer-3"), addr: "peer-3"},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -250,19 +250,19 @@ func TestProbeNextFullFromPeersStopsAfterSoftTimeout(t *testing.T) {
 
 func TestPreferDownloadPeerMovesSourceFirst(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-a", addr: "peer-a"},
-		{id: "peer-b", addr: "peer-b"},
-		{id: "peer-c", addr: "peer-c"},
+		{id: testPeerID("peer-a"), addr: "peer-a"},
+		{id: testPeerID("peer-b"), addr: "peer-b"},
+		{id: testPeerID("peer-c"), addr: "peer-c"},
 	}
 
-	got := preferDownloadPeer(peers, "peer-b")
+	got := preferDownloadPeer(peers, testPeerID("peer-b"))
 	if len(got) != len(peers) {
 		t.Fatalf("unexpected peers count: %d", len(got))
 	}
-	if got[0].id != "peer-b" || got[1].id != "peer-a" || got[2].id != "peer-c" {
+	if got[0].id != testPeerID("peer-b") || got[1].id != testPeerID("peer-a") || got[2].id != testPeerID("peer-c") {
 		t.Fatalf("unexpected preferred order: %q, %q, %q", got[0].id, got[1].id, got[2].id)
 	}
-	if peers[0].id != "peer-a" || peers[1].id != "peer-b" || peers[2].id != "peer-c" {
+	if peers[0].id != testPeerID("peer-a") || peers[1].id != testPeerID("peer-b") || peers[2].id != testPeerID("peer-c") {
 		t.Fatal("preferDownloadPeer mutated original slice order")
 	}
 }
@@ -270,8 +270,8 @@ func TestPreferDownloadPeerMovesSourceFirst(t *testing.T) {
 func TestChainBlockDownloadSuccessPinsPeer(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	fast := &overlayPeer{id: "fast", addr: "fast", alive: true}
-	other := &overlayPeer{id: "other", addr: "other", alive: true}
+	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
+	other := &overlayPeer{id: testPeerID("other"), addr: "other", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, fast, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -287,7 +287,7 @@ func TestChainBlockDownloadSuccessPinsPeer(t *testing.T) {
 func TestChainBlockDownloadSuccessPinsSmallBlock(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(0, topShard, 77)
-	peer := &overlayPeer{id: "fast-small", addr: "fast-small", alive: true}
+	peer := &overlayPeer{id: testPeerID("fast-small"), addr: "fast-small", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, peer, &DownloadedBlock{
 		ID:       testBlockID(0, topShard, 78),
@@ -305,7 +305,7 @@ func TestChainBlockDownloadSuccessPinsSmallBlock(t *testing.T) {
 func TestLargeSlowBlockDownloadDoesNotStayPinned(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(0, topShard, 77)
-	peer := &overlayPeer{id: "slow-large", addr: "slow-large", alive: true}
+	peer := &overlayPeer{id: testPeerID("slow-large"), addr: "slow-large", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, peer, &DownloadedBlock{
 		ID:       testBlockID(0, topShard, 78),
@@ -320,7 +320,7 @@ func TestLargeSlowBlockDownloadDoesNotStayPinned(t *testing.T) {
 func TestChainBlockUnavailableDoesNotSlowUntilConfirmed(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	fast := &overlayPeer{id: "fast", addr: "fast", alive: true}
+	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, fast, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -340,8 +340,8 @@ func TestChainBlockUnavailableDoesNotSlowUntilConfirmed(t *testing.T) {
 func TestChainBlockUnavailableSlowsAfterAnotherPeerSucceeds(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	stale := &overlayPeer{id: "stale", addr: "stale", alive: true}
-	fresh := &overlayPeer{id: "fresh", addr: "fresh", alive: true}
+	stale := &overlayPeer{id: testPeerID("stale"), addr: "stale", alive: true}
+	fresh := &overlayPeer{id: testPeerID("fresh"), addr: "fresh", alive: true}
 
 	sub.noteChainBlockDownloadFailure(chain, stale, ErrBlockNotAvailable)
 	sub.noteChainBlockDownloadSuccess(chain, fresh, &DownloadedBlock{
@@ -360,8 +360,8 @@ func TestChainBlockUnavailableSlowsAfterAnotherPeerSucceeds(t *testing.T) {
 func TestLiveNextUnavailablePenalizesAndClearsPinnedMasterPeer(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	stale := &overlayPeer{id: "stale", addr: "stale", alive: true}
-	fresh := &overlayPeer{id: "fresh", addr: "fresh", alive: true}
+	stale := &overlayPeer{id: testPeerID("stale"), addr: "stale", alive: true}
+	fresh := &overlayPeer{id: testPeerID("fresh"), addr: "fresh", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, stale, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -376,7 +376,7 @@ func TestLiveNextUnavailablePenalizesAndClearsPinnedMasterPeer(t *testing.T) {
 		t.Fatalf("expected live miss to clear sticky peer, got %v", got)
 	}
 
-	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{stale, fresh}, "", time.Now())
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{stale, fresh}, PeerID{}, time.Now())
 	if prioritized[0] != fresh || prioritized[1] != stale {
 		t.Fatalf("unexpected live next priority after miss: %q, %q", prioritized[0].id, prioritized[1].id)
 	}
@@ -385,7 +385,7 @@ func TestLiveNextUnavailablePenalizesAndClearsPinnedMasterPeer(t *testing.T) {
 func TestLiveNextUnavailableDoesNotClearBasechainSticky(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(0, topShard, 77)
-	peer := &overlayPeer{id: "base-fast", addr: "base-fast", alive: true}
+	peer := &overlayPeer{id: testPeerID("base-fast"), addr: "base-fast", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, peer, &DownloadedBlock{
 		ID:       testBlockID(0, topShard, 78),
@@ -401,8 +401,8 @@ func TestLiveNextUnavailableDoesNotClearBasechainSticky(t *testing.T) {
 func TestLiveNextPeerScorePrefersLowerLatency(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	slow := &overlayPeer{id: "slow", addr: "slow", alive: true}
-	fast := &overlayPeer{id: "fast", addr: "fast", alive: true}
+	slow := &overlayPeer{id: testPeerID("slow"), addr: "slow", alive: true}
+	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
 	block := &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
 		BlockBOC: make([]byte, 1<<20),
@@ -411,7 +411,7 @@ func TestLiveNextPeerScorePrefersLowerLatency(t *testing.T) {
 	sub.noteLiveNextDownloadSuccess(chain, slow, block, 400*time.Millisecond, 0)
 	sub.noteLiveNextDownloadSuccess(chain, fast, block, 50*time.Millisecond, 0)
 
-	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{slow, fast}, "", time.Now())
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{slow, fast}, PeerID{}, time.Now())
 	if prioritized[0] != fast || prioritized[1] != slow {
 		t.Fatalf("unexpected live next latency order: %q, %q", prioritized[0].id, prioritized[1].id)
 	}
@@ -421,8 +421,8 @@ func TestLiveNextPeerScoreKeepsSlowPeerBehindHealthy(t *testing.T) {
 	now := time.Now()
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	slow := &overlayPeer{id: "slow", addr: "slow", alive: true, downloadSlowUntil: now.Add(time.Minute)}
-	healthy := &overlayPeer{id: "healthy", addr: "healthy", alive: true}
+	slow := &overlayPeer{id: testPeerID("slow"), addr: "slow", alive: true, downloadSlowUntil: now.Add(time.Minute)}
+	healthy := &overlayPeer{id: testPeerID("healthy"), addr: "healthy", alive: true}
 	block := &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
 		BlockBOC: make([]byte, 1<<20),
@@ -431,7 +431,7 @@ func TestLiveNextPeerScoreKeepsSlowPeerBehindHealthy(t *testing.T) {
 	sub.noteLiveNextDownloadSuccess(chain, slow, block, 10*time.Millisecond, 0)
 	slow.downloadSlowUntil = now.Add(time.Minute)
 
-	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{slow, healthy}, "", now)
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{slow, healthy}, PeerID{}, now)
 	if prioritized[0] != healthy || prioritized[1] != slow {
 		t.Fatalf("unexpected live next health order: %q, %q", prioritized[0].id, prioritized[1].id)
 	}
@@ -439,11 +439,11 @@ func TestLiveNextPeerScoreKeepsSlowPeerBehindHealthy(t *testing.T) {
 
 func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 	now := int32(time.Now().Unix())
-	sticky := &overlayPeer{id: "sticky", addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
-	fast := &overlayPeer{id: "fast", addr: "fast", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
 	sub := &overlaySubscription{
 		log: discardLogger(),
-		peers: map[string]*overlayPeer{
+		peers: map[PeerID]*overlayPeer{
 			sticky.id: sticky,
 			fast.id:   fast,
 		},
@@ -458,7 +458,7 @@ func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 	sub.noteLiveNextDownloadSuccess(chain, sticky, block, 300*time.Millisecond, 0)
 	sub.noteLiveNextDownloadSuccess(chain, fast, block, 20*time.Millisecond, 0)
 
-	candidates := sub.liveNextBlockDownloadCandidates(chain, "")
+	candidates := sub.liveNextBlockDownloadCandidates(chain, PeerID{})
 	if len(candidates) != 2 {
 		t.Fatalf("unexpected candidate count: %d", len(candidates))
 	}
@@ -469,11 +469,11 @@ func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 
 func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
 	now := int32(time.Now().Unix())
-	sticky := &overlayPeer{id: "sticky", addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
-	preferred := &overlayPeer{id: "preferred", addr: "preferred", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	preferred := &overlayPeer{id: testPeerID("preferred"), addr: "preferred", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
 	sub := &overlaySubscription{
 		log: discardLogger(),
-		peers: map[string]*overlayPeer{
+		peers: map[PeerID]*overlayPeer{
 			sticky.id:    sticky,
 			preferred.id: preferred,
 		},
@@ -497,8 +497,8 @@ func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
 func TestLiveNextPeerScoreAccountsForBlockSize(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	smallFast := &overlayPeer{id: "small-fast", addr: "small-fast", alive: true}
-	bigFast := &overlayPeer{id: "big-fast", addr: "big-fast", alive: true}
+	smallFast := &overlayPeer{id: testPeerID("small-fast"), addr: "small-fast", alive: true}
+	bigFast := &overlayPeer{id: testPeerID("big-fast"), addr: "big-fast", alive: true}
 
 	sub.noteLiveNextDownloadSuccess(chain, smallFast, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -509,7 +509,7 @@ func TestLiveNextPeerScoreAccountsForBlockSize(t *testing.T) {
 		BlockBOC: make([]byte, 4<<20),
 	}, 800*time.Millisecond, 0)
 
-	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{smallFast, bigFast}, "", time.Now())
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{smallFast, bigFast}, PeerID{}, time.Now())
 	if prioritized[0] != bigFast || prioritized[1] != smallFast {
 		t.Fatalf("unexpected live next size-aware order: %q, %q", prioritized[0].id, prioritized[1].id)
 	}
@@ -518,8 +518,8 @@ func TestLiveNextPeerScoreAccountsForBlockSize(t *testing.T) {
 func TestLiveNextPeerScoreRewardsAvailabilityAfterMisses(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	alwaysFast := &overlayPeer{id: "always-fast", addr: "always-fast", alive: true}
-	earlyAvailable := &overlayPeer{id: "early-available", addr: "early-available", alive: true}
+	alwaysFast := &overlayPeer{id: testPeerID("always-fast"), addr: "always-fast", alive: true}
+	earlyAvailable := &overlayPeer{id: testPeerID("early-available"), addr: "early-available", alive: true}
 
 	sub.noteLiveNextDownloadSuccess(chain, alwaysFast, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -530,7 +530,7 @@ func TestLiveNextPeerScoreRewardsAvailabilityAfterMisses(t *testing.T) {
 		BlockBOC: make([]byte, 1<<20),
 	}, time.Second, 4)
 
-	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{alwaysFast, earlyAvailable}, "", time.Now())
+	prioritized := sub.prioritizeLiveNextPeers([]*overlayPeer{alwaysFast, earlyAvailable}, PeerID{}, time.Now())
 	if prioritized[0] != earlyAvailable || prioritized[1] != alwaysFast {
 		t.Fatalf("unexpected live next availability order: %q, %q", prioritized[0].id, prioritized[1].id)
 	}
@@ -539,7 +539,7 @@ func TestLiveNextPeerScoreRewardsAvailabilityAfterMisses(t *testing.T) {
 func TestChainBlockFailureClearsPinnedPeer(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	chain := testBlockID(-1, topShard, 41)
-	fast := &overlayPeer{id: "fast", addr: "fast", alive: true}
+	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(chain, fast, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -556,8 +556,8 @@ func TestChainBlockPinnedPeerIsPerChain(t *testing.T) {
 	sub := &overlaySubscription{log: discardLogger()}
 	master := testBlockID(-1, topShard, 41)
 	base := testBlockID(0, topShard, 77)
-	masterPeer := &overlayPeer{id: "master-fast", addr: "master-fast", alive: true}
-	basePeer := &overlayPeer{id: "base-fast", addr: "base-fast", alive: true}
+	masterPeer := &overlayPeer{id: testPeerID("master-fast"), addr: "master-fast", alive: true}
+	basePeer := &overlayPeer{id: testPeerID("base-fast"), addr: "base-fast", alive: true}
 
 	sub.noteChainBlockDownloadSuccess(master, masterPeer, &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -578,13 +578,13 @@ func TestChainBlockPinnedPeerIsPerChain(t *testing.T) {
 
 func TestBlockDownloadParallelismGivesFastPeerExclusiveTry(t *testing.T) {
 	fast := &overlayPeer{
-		id:            "fast",
+		id:            testPeerID("fast"),
 		addr:          "fast",
 		alive:         true,
 		roundtrip:     downloadQueryHedgeDelay / 2,
 		unreliability: 0,
 	}
-	slow := &overlayPeer{id: "slow", addr: "slow", alive: true}
+	slow := &overlayPeer{id: testPeerID("slow"), addr: "slow", alive: true}
 
 	if got := blockDownloadParallelism([]*overlayPeer{fast, slow}); got != 1 {
 		t.Fatalf("fast peer should get exclusive first try, got parallelism %d", got)
@@ -592,13 +592,13 @@ func TestBlockDownloadParallelismGivesFastPeerExclusiveTry(t *testing.T) {
 }
 
 func TestBlockDownloadParallelismHedgesUnknownOrSlowPeerImmediately(t *testing.T) {
-	unknown := &overlayPeer{id: "unknown", addr: "unknown", alive: true}
+	unknown := &overlayPeer{id: testPeerID("unknown"), addr: "unknown", alive: true}
 	if got := blockDownloadParallelism([]*overlayPeer{unknown}); got != downloadQueryParallelism {
 		t.Fatalf("unknown peer should use default parallelism, got %d", got)
 	}
 
 	slow := &overlayPeer{
-		id:        "slow",
+		id:        testPeerID("slow"),
 		addr:      "slow",
 		alive:     true,
 		roundtrip: downloadQueryHedgeDelay + time.Millisecond,
@@ -610,9 +610,9 @@ func TestBlockDownloadParallelismHedgesUnknownOrSlowPeerImmediately(t *testing.T
 
 func TestRunConcurrentOverlayQueriesHedgesPastHungPeers(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "peer-1", addr: "peer-1"},
-		{id: "peer-2", addr: "peer-2"},
-		{id: "peer-3", addr: "peer-3"},
+		{id: testPeerID("peer-1"), addr: "peer-1"},
+		{id: testPeerID("peer-2"), addr: "peer-2"},
+		{id: testPeerID("peer-3"), addr: "peer-3"},
 	}
 	want := testBlockID(-1, topShard, 42)
 
@@ -622,7 +622,7 @@ func TestRunConcurrentOverlayQueriesHedgesPastHungPeers(t *testing.T) {
 	startedAt := time.Now()
 	got, err := runConcurrentOverlayQueries(ctx, peers, 2, 20*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (tl.Serializable, error) {
 		switch peer.id {
-		case "peer-3":
+		case testPeerID("peer-3"):
 			return KeyBlocks{Blocks: []ton.BlockIDExt{want}}, nil
 		default:
 			<-ctx.Done()
@@ -649,8 +649,8 @@ func TestRunConcurrentOverlayQueriesHedgesPastHungPeers(t *testing.T) {
 
 func TestRunConcurrentKeyBlockQueriesPrefersNonEmptyBatch(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "empty", addr: "empty"},
-		{id: "with-key", addr: "with-key"},
+		{id: testPeerID("empty"), addr: "empty"},
+		{id: testPeerID("with-key"), addr: "with-key"},
 	}
 	want := testBlockID(-1, topShard, 42)
 	semanticFailures := 0
@@ -660,9 +660,9 @@ func TestRunConcurrentKeyBlockQueriesPrefersNonEmptyBatch(t *testing.T) {
 
 	got, err := queryKeyBlocksFromPeers(ctx, peers, 2, 20*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (tl.Serializable, error) {
 		switch peer.id {
-		case "empty":
+		case testPeerID("empty"):
 			return KeyBlocks{}, nil
-		case "with-key":
+		case testPeerID("with-key"):
 			time.Sleep(10 * time.Millisecond)
 			return KeyBlocks{Blocks: []ton.BlockIDExt{want}}, nil
 		default:
@@ -697,29 +697,29 @@ func TestQueryCandidatesKeepNeighboursFirstButFallBackToOtherPeers(t *testing.T)
 			ProtoVersionMajor: shardchainProtoVersionMajor,
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
-		peers: map[string]*overlayPeer{
-			"peer-1": {id: "peer-1", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-2": {id: "peer-2", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			"peer-3": {id: "peer-3", overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
 		},
-		neighbours: []string{"peer-1", "peer-2"},
+		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
 	}
 
 	got := sub.queryCandidates(0, 0)
 	if len(got) != 3 {
 		t.Fatalf("unexpected candidate count: got %d want 3", len(got))
 	}
-	front := map[string]struct{}{
+	front := map[PeerID]struct{}{
 		got[0].id: {},
 		got[1].id: {},
 	}
-	if _, ok := front["peer-1"]; !ok {
+	if _, ok := front[testPeerID("peer-1")]; !ok {
 		t.Fatalf("expected peer-1 in neighbour prefix, got %q and %q", got[0].id, got[1].id)
 	}
-	if _, ok := front["peer-2"]; !ok {
+	if _, ok := front[testPeerID("peer-2")]; !ok {
 		t.Fatalf("expected peer-2 in neighbour prefix, got %q and %q", got[0].id, got[1].id)
 	}
-	if got[2].id != "peer-3" {
+	if got[2].id != testPeerID("peer-3") {
 		t.Fatalf("expected fallback peer at the end, got %q", got[2].id)
 	}
 }
@@ -728,10 +728,10 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 	now := int32(time.Now().Unix())
 	overlayWrapper := &overlay.ADNLOverlayWrapper{}
 
-	peers := map[string]*overlayPeer{}
-	neighbours := make([]string, 0, 16)
+	peers := map[PeerID]*overlayPeer{}
+	neighbours := make([]PeerID, 0, 16)
 	for i := 0; i < 16; i++ {
-		id := "neighbour-" + string(rune('a'+i))
+		id := testPeerID("neighbour-" + string(rune('a'+i)))
 		peers[id] = &overlayPeer{
 			id:           id,
 			overlay:      overlayWrapper,
@@ -743,8 +743,8 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 		}
 		neighbours = append(neighbours, id)
 	}
-	peers["fast"] = &overlayPeer{
-		id:           "fast",
+	peers[testPeerID("fast")] = &overlayPeer{
+		id:           testPeerID("fast"),
 		overlay:      overlayWrapper,
 		announced:    &overlay.Node{Version: now},
 		alive:        true,
@@ -764,11 +764,11 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("unexpected candidate count %d", len(got))
 	}
-	if !hasPeerID(got, "fast") {
+	if !hasPeerID(got, testPeerID("fast")) {
 		t.Fatalf("expected fast non-neighbour in bounded candidate window, got %#v", got)
 	}
 	for _, peer := range got[:2] {
-		if _, ok := peers[peer.id]; !ok || peer.id == "fast" {
+		if _, ok := peers[peer.id]; !ok || peer.id == testPeerID("fast") {
 			t.Fatalf("expected neighbour prefix, got %q", peer.id)
 		}
 	}
@@ -776,8 +776,8 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 
 func TestRunConcurrentKeyBlockQueriesSkipsErrorResponse(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "error", addr: "error"},
-		{id: "with-key", addr: "with-key"},
+		{id: testPeerID("error"), addr: "error"},
+		{id: testPeerID("with-key"), addr: "with-key"},
 	}
 	want := testBlockID(-1, topShard, 42)
 
@@ -786,9 +786,9 @@ func TestRunConcurrentKeyBlockQueriesSkipsErrorResponse(t *testing.T) {
 
 	got, err := queryKeyBlocksFromPeers(ctx, peers, 2, 20*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (tl.Serializable, error) {
 		switch peer.id {
-		case "error":
+		case testPeerID("error"):
 			return KeyBlocks{Error: true}, nil
-		case "with-key":
+		case testPeerID("with-key"):
 			return KeyBlocks{Blocks: []ton.BlockIDExt{want}}, nil
 		default:
 			return nil, context.Canceled
@@ -807,7 +807,7 @@ func TestRunConcurrentKeyBlockQueriesSkipsErrorResponse(t *testing.T) {
 	}
 }
 
-func hasPeerID(peers []*overlayPeer, id string) bool {
+func hasPeerID(peers []*overlayPeer, id PeerID) bool {
 	for _, peer := range peers {
 		if peer.id == id {
 			return true
@@ -826,9 +826,9 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 			ProtoVersionMajor: masterchainProtoVersionMajor,
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
-		peers: map[string]*overlayPeer{
-			"alive-neighbour": {
-				id:            "alive-neighbour",
+		peers: map[PeerID]*overlayPeer{
+			testPeerID("alive-neighbour"): {
+				id:            testPeerID("alive-neighbour"),
 				overlay:       overlayWrapper,
 				announced:     &overlay.Node{Version: now},
 				alive:         true,
@@ -836,8 +836,8 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 				versionMinor:  masterchainProtoVersionMinor,
 				lastReceiveAt: time.Now(),
 			},
-			"dead-neighbour": {
-				id:            "dead-neighbour",
+			testPeerID("dead-neighbour"): {
+				id:            testPeerID("dead-neighbour"),
 				overlay:       overlayWrapper,
 				announced:     &overlay.Node{Version: now},
 				alive:         false,
@@ -845,8 +845,8 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 				versionMinor:  masterchainProtoVersionMinor,
 				lastReceiveAt: time.Now(),
 			},
-			"alive-non-neighbour": {
-				id:            "alive-non-neighbour",
+			testPeerID("alive-non-neighbour"): {
+				id:            testPeerID("alive-non-neighbour"),
 				overlay:       overlayWrapper,
 				announced:     &overlay.Node{Version: now},
 				alive:         true,
@@ -855,28 +855,28 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 				lastReceiveAt: time.Now(),
 			},
 		},
-		neighbours: []string{"dead-neighbour", "alive-neighbour"},
+		neighbours: []PeerID{testPeerID("dead-neighbour"), testPeerID("alive-neighbour")},
 	}
 
 	got := sub.aliveNeighbourPeers(masterchainProtoVersionMajor, masterchainProtoVersionMinor)
 	if len(got) != 1 {
 		t.Fatalf("unexpected alive neighbour count: got %d want 1", len(got))
 	}
-	if got[0].id != "alive-neighbour" {
+	if got[0].id != testPeerID("alive-neighbour") {
 		t.Fatalf("unexpected alive neighbour %q", got[0].id)
 	}
 }
 
 func TestSortPeersByPreferenceUsesRoundtripAfterReliabilityAndVersion(t *testing.T) {
 	peers := []*overlayPeer{
-		{id: "unknown", versionMajor: shardchainProtoVersionMajor, versionMinor: shardchainProtoVersionMinor},
-		{id: "slow", versionMajor: shardchainProtoVersionMajor, versionMinor: shardchainProtoVersionMinor, roundtrip: 500 * time.Millisecond},
-		{id: "fast", versionMajor: shardchainProtoVersionMajor, versionMinor: shardchainProtoVersionMinor, roundtrip: 50 * time.Millisecond},
+		{id: testPeerID("unknown"), versionMajor: shardchainProtoVersionMajor, versionMinor: shardchainProtoVersionMinor},
+		{id: testPeerID("slow"), versionMajor: shardchainProtoVersionMajor, versionMinor: shardchainProtoVersionMinor, roundtrip: 500 * time.Millisecond},
+		{id: testPeerID("fast"), versionMajor: shardchainProtoVersionMajor, versionMinor: shardchainProtoVersionMinor, roundtrip: 50 * time.Millisecond},
 	}
 
 	sortPeersByPreference(peers)
 
-	if peers[0].id != "fast" || peers[1].id != "slow" || peers[2].id != "unknown" {
+	if peers[0].id != testPeerID("fast") || peers[1].id != testPeerID("slow") || peers[2].id != testPeerID("unknown") {
 		t.Fatalf("unexpected peer order: %q, %q, %q", peers[0].id, peers[1].id, peers[2].id)
 	}
 }

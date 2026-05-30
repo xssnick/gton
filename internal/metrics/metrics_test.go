@@ -39,6 +39,12 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		PrepareDuration:  750 * time.Millisecond,
 		ApplyDuration:    500 * time.Millisecond,
 	})
+	m.ObserveSyncObtain(service.SyncObtainObservation{
+		Pipeline: "next_block",
+		Stage:    "master",
+		Result:   "success",
+		Duration: 3500 * time.Millisecond,
+	})
 	m.ObserveSyncPersist(service.SyncPersistObservation{
 		Mode:          "next_block_async",
 		Result:        "success",
@@ -91,6 +97,12 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 						Kind:      "tonNode.blockBroadcastCompressedV2",
 						Count:     3,
 					},
+					{
+						Direction: "queue_rebroadcasted",
+						Overlay:   "masterchain",
+						Kind:      "tonNode.externalMessageBroadcast",
+						Count:     4,
+					},
 				},
 				BroadcastDrops: []p2p.BroadcastDropStatusSnapshot{
 					{
@@ -110,6 +122,10 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 						EvictedTotal:            1,
 						CompletedTotal:          11,
 						DeliveredCacheHitsTotal: 13,
+						SimpleRelaySentTotal:    17,
+						SimpleRelayFailedTotal:  19,
+						FECRelaySentTotal:       23,
+						FECRelayFailedTotal:     29,
 					},
 				},
 			},
@@ -157,11 +173,13 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_sync_blocks_total{catch_up="false",chain="masterchain",pipeline="next_block",result="success",source="queue"} 1`,
 		namespace + `_sync_block_origins_total{catch_up="false",chain="masterchain",origin="broadcast",pipeline="next_block",result="success"} 1`,
 		namespace + `_sync_block_prepare_duration_seconds_bucket{catch_up="false",chain="masterchain",pipeline="next_block",result="success",shard="masterchain",source="queue",le="1"} 1`,
+		namespace + `_sync_master_shards_obtain_duration_seconds_bucket{catch_up="false",pipeline="next_block",result="success",stage="master",le="5"} 1`,
 		namespace + `_sync_checkpoints_total{mode="next_block_async",result="success"} 1`,
 		namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 0`,
 		namespace + `_sync_lag_seconds{chain="masterchain",shard="masterchain"}`,
 		namespace + `_service_background_task{task="idle"} 1`,
 		namespace + `_p2p_broadcasts_total{direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
+		namespace + `_p2p_broadcasts_total{direction="queue_rebroadcasted",kind="tonNode.externalMessageBroadcast",overlay="masterchain"} 4`,
 		namespace + `_p2p_broadcast_dropped_total{kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain",reason="signature_check_failed"} 2`,
 		namespace + `_p2p_fec_receiver_active_streams{overlay="masterchain"} 2`,
 		namespace + `_p2p_fec_receiver_active_bytes{overlay="masterchain"} 4096`,
@@ -170,9 +188,11 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_p2p_fec_receiver_evicted_total{overlay="masterchain"} 1`,
 		namespace + `_p2p_fec_receiver_completed_total{overlay="masterchain"} 11`,
 		namespace + `_p2p_fec_receiver_delivered_cache_hits_total{overlay="masterchain"} 13`,
-		namespace + `_storage_archive_packages 1`,
+		namespace + `_p2p_broadcast_relay_sent_total{delivery="simple",overlay="masterchain"} 17`,
+		namespace + `_p2p_broadcast_relay_failed_total{delivery="simple",overlay="masterchain"} 19`,
+		namespace + `_p2p_broadcast_relay_sent_total{delivery="fec",overlay="masterchain"} 23`,
+		namespace + `_p2p_broadcast_relay_failed_total{delivery="fec",overlay="masterchain"} 29`,
 		namespace + `_storage_archive_package_bytes 4`,
-		namespace + `_storage_persistent_state_masters 2`,
 		namespace + `_storage_persistent_state_bytes 21`,
 		namespace + `_storage_cell_db_generation{generation="active"} 1`,
 		namespace + `_storage_cell_db_read_cells_total{generation="active",shard="0"} 7`,
@@ -180,6 +200,20 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics output does not contain %q\n%s", want, body)
+		}
+	}
+
+	for _, removed := range []string{
+		namespace + `_p2p_queue_pushed_total`,
+		namespace + `_storage_archive_packages`,
+		namespace + `_storage_persistent_state_masters`,
+		namespace + `_storage_cell_db_file_cache_tables`,
+		namespace + `_storage_cell_db_live_tables`,
+		namespace + `_storage_cell_db_l0_bytes`,
+		namespace + `_storage_cell_db_memtable_count`,
+	} {
+		if strings.Contains(body, removed) {
+			t.Fatalf("metrics output contains removed metric %q\n%s", removed, body)
 		}
 	}
 }
@@ -190,5 +224,6 @@ func TestNilMetricsObserverMethodsAreNoop(t *testing.T) {
 	m.AddLiteserverInflight(1)
 	m.ObserveLiteserverQuery(liteserver.QueryObservation{Method: "GetTime", Duration: time.Second})
 	m.ObserveSyncBlock(service.SyncBlockObservation{})
+	m.ObserveSyncObtain(service.SyncObtainObservation{})
 	m.ObserveSyncPersist(service.SyncPersistObservation{})
 }

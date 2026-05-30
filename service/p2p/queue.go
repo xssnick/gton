@@ -11,7 +11,6 @@ type boundedQueue[T any] struct {
 	bytes    int64
 	maxItems int
 	maxBytes int64
-	pushed   uint64
 	dropped  uint64
 	size     func(T) int64
 	notify   chan struct{}
@@ -55,7 +54,6 @@ func (q *boundedQueue[T]) Push(item T) bool {
 
 	q.items = append(q.items, queuedItem[T]{value: item, bytes: itemBytes})
 	q.bytes += itemBytes
-	q.pushed++
 	if len(q.items) == 1 {
 		select {
 		case q.notify <- struct{}{}:
@@ -137,7 +135,6 @@ func (q *boundedQueue[T]) StatusSnapshot(name string) QueueStatusSnapshot {
 		Bytes:    q.bytes,
 		MaxItems: q.maxItems,
 		MaxBytes: q.maxBytes,
-		Pushed:   q.pushed,
 		Dropped:  q.dropped,
 	}
 }

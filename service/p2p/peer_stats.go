@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -43,6 +44,10 @@ func (p *overlayPeer) hasOpenConnection() bool {
 }
 
 func (p *overlayPeer) isKnownOverlayPeer(now time.Time) bool {
+	if p.fixedMember {
+		return true
+	}
+
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
@@ -50,6 +55,10 @@ func (p *overlayPeer) isKnownOverlayPeer(now time.Time) bool {
 }
 
 func (p *overlayPeer) isAliveKnownOverlayPeer(now time.Time) bool {
+	if p.fixedMember {
+		return p.hasOpenConnection()
+	}
+
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
@@ -127,6 +136,10 @@ func (p *overlayPeer) querySuccess(rtt time.Duration) {
 }
 
 func (p *overlayPeer) queryFailed() {
+	if p.fixedMember {
+		return
+	}
+
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
@@ -381,7 +394,7 @@ func sortPeersByPreference(peers []*overlayPeer) {
 		if peerRoundtripLess(right, left) {
 			return false
 		}
-		return peers[i].id < peers[j].id
+		return bytes.Compare(peers[i].id[:], peers[j].id[:]) < 0
 	})
 }
 
@@ -455,7 +468,7 @@ func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVers
 		return neighbours
 	}
 
-	seen := make(map[string]struct{}, len(neighbours))
+	seen := make(map[PeerID]struct{}, len(neighbours))
 	res := make([]*overlayPeer, 0, len(neighbours)+len(others))
 	for _, peer := range neighbours {
 		seen[peer.id] = struct{}{}
@@ -487,7 +500,7 @@ func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requir
 	}
 
 	res := make([]*overlayPeer, 0, limit)
-	seen := make(map[string]struct{}, limit)
+	seen := make(map[PeerID]struct{}, limit)
 	for _, peer := range neighbours[:neighbourSlots] {
 		seen[peer.id] = struct{}{}
 		res = append(res, peer)
@@ -538,7 +551,7 @@ func (s *overlaySubscription) rebroadcastCandidatesMatching(allow func(*overlayP
 		return neighbours
 	}
 
-	seen := make(map[string]struct{}, len(neighbours))
+	seen := make(map[PeerID]struct{}, len(neighbours))
 	res := make([]*overlayPeer, 0, len(neighbours)+len(others))
 	for _, peer := range neighbours {
 		seen[peer.id] = struct{}{}

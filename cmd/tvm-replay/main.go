@@ -82,12 +82,32 @@ type transactionWork struct {
 	Cell      *cell.Cell
 	InMsgCell *cell.Cell
 	Parsed    *tlb.Transaction
-	Hash      []byte
+	Hash      cell.Hash
 }
+
+var (
+	tvmIntMinusOne = big.NewInt(-1)
+	tvmIntZero     = big.NewInt(0)
+
+	defaultInMsgParamsTuple = tuple.NewTupleValue(
+		tvmIntZero,
+		tvmIntZero,
+		cell.BeginCell().MustStoreUInt(0, 2).ToSlice(),
+		tvmIntZero,
+		tvmIntZero,
+		tvmIntZero,
+		tvmIntZero,
+		tvmIntZero,
+		nil,
+		nil,
+	)
+	zeroCurrencyTuple = tuple.NewTupleValue(tvmIntZero, nil)
+)
 
 type replayValidator struct {
 	store         *pebblestore.Store
 	cache         *executionConfigCache
+	tvm           *tvm.TVM
 	log           zerolog.Logger
 	stateViews    stateViewSource
 	mismatchLimit int
@@ -286,6 +306,7 @@ func main() {
 	validator := &replayValidator{
 		store:         store,
 		cache:         newExecutionConfigCache(logger.With().Str("component", "tvm-replay-cache").Logger(), opts.prevBlocksSource),
+		tvm:           tvm.NewTVM(),
 		log:           logger,
 		stateViews:    opts.stateViewSource,
 		benchmark:     newTVMBenchmarkFixtureCollector(logger, opts.benchmarkPath),
@@ -476,12 +497,16 @@ func (v *replayValidator) runWithDBStates(ctx context.Context, opts options, cur
 }
 
 func (v *replayValidator) runWithStateUpdates(ctx context.Context, opts options, current ton.BlockIDExt) error {
-	currentMaster, err := v.loadState(ctx, current)
+	currentMaster, err := v.loadStateRoot(ctx, current)
 	if err != nil {
-		return fmt.Errorf("load start master state %s: %w", storage.FormatBlockRef(current), err)
+		return fmt.Errorf("load start master state root %s: %w", storage.FormatBlockRef(current), err)
 	}
 
-	currentShardBlocks, err := serviceState.ShardBlocksFromMasterState(currentMaster)
+	currentMasterBlock, err := v.loadBlock(ctx, current)
+	if err != nil {
+		return fmt.Errorf("load start master block %s: %w", storage.FormatBlockRef(current), err)
+	}
+	currentShardBlocks, err := shardBlocksFromMasterBlock(currentMasterBlock.Parsed)
 	if err != nil {
 		return fmt.Errorf("load start master shard set %s: %w", storage.FormatBlockRef(currentMaster.Block), err)
 	}
@@ -551,7 +576,7 @@ func (v *replayValidator) validateMasterStep(ctx context.Context, previousMaster
 		return fmt.Errorf("load next master shard set %s: %w", storage.FormatBlockRef(nextMaster.Block), err)
 	}
 
-	currentShards := make(map[string]*storage.BlockState, len(prevShardBlocks))
+	currentShards := make(map[storage.BlockRootHash]*storage.BlockState, len(prevShardBlocks))
 	for _, shard := range prevShardBlocks {
 		shardState, err := v.loadState(ctx, shard)
 		if err != nil {
@@ -563,7 +588,7 @@ func (v *replayValidator) validateMasterStep(ctx context.Context, previousMaster
 	runnerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	resolver := newReplayShardResolver(v, previousMaster, nextMaster.Block.SeqNo, currentShards)
+	resolver := newReplayShardResolver(v, previousMaster, nextMaster.Block, currentShards)
 	sem := make(chan struct{}, parallel)
 	errCh := make(chan error, len(nextShardBlocks)+1)
 	var wg sync.WaitGroup
@@ -613,7 +638,7 @@ func (v *replayValidator) validateMasterStep(ctx context.Context, previousMaster
 	return nil
 }
 
-func (v *replayValidator) validateMasterStepFromUpdates(ctx context.Context, previousMaster *storage.BlockState, currentShards map[string]*storage.BlockState, nextMasterBlock loadedBlock, parallel int) (*storage.BlockState, map[string]*storage.BlockState, error) {
+func (v *replayValidator) validateMasterStepFromUpdates(ctx context.Context, previousMaster *storage.BlockState, currentShards map[storage.BlockRootHash]*storage.BlockState, nextMasterBlock loadedBlock, parallel int) (*storage.BlockState, map[storage.BlockRootHash]*storage.BlockState, error) {
 	if previousMaster == nil {
 		return nil, nil, fmt.Errorf("previous master state is required")
 	}
@@ -629,13 +654,13 @@ func (v *replayValidator) validateMasterStepFromUpdates(ctx context.Context, pre
 	runnerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	resolver := newReplayShardResolver(v, previousMaster, nextMasterBlock.ID.SeqNo, currentShards)
+	resolver := newReplayShardResolver(v, previousMaster, nextMasterBlock.ID, currentShards)
 	sem := make(chan struct{}, parallel)
 	errCh := make(chan error, len(nextShardBlocks)+1)
 	var wg sync.WaitGroup
 
 	var nextMaster *storage.BlockState
-	nextShards := make(map[string]*storage.BlockState, len(nextShardBlocks))
+	nextShards := make(map[storage.BlockRootHash]*storage.BlockState, len(nextShardBlocks))
 	var resultMu sync.Mutex
 
 	runJob := func(fn func(context.Context) error) {
@@ -705,8 +730,8 @@ func (v *replayValidator) validateMasterStepFromUpdates(ctx context.Context, pre
 	return nextMaster, nextShards, nil
 }
 
-func (v *replayValidator) stateShells(ctx context.Context, blocks []ton.BlockIDExt) (map[string]*storage.BlockState, error) {
-	states := make(map[string]*storage.BlockState, len(blocks))
+func (v *replayValidator) stateShells(ctx context.Context, blocks []ton.BlockIDExt) (map[storage.BlockRootHash]*storage.BlockState, error) {
+	states := make(map[storage.BlockRootHash]*storage.BlockState, len(blocks))
 	for _, block := range blocks {
 		state, err := v.stateShell(ctx, block)
 		if err != nil {
@@ -774,7 +799,7 @@ func (v *replayValidator) loadBlock(ctx context.Context, id ton.BlockIDExt) (loa
 	if err != nil {
 		return loadedBlock{}, err
 	}
-	root, err := cell.FromBOC(data)
+	root, err := parseBlockBOC(data)
 	if err != nil {
 		return loadedBlock{}, fmt.Errorf("parse block BOC: %w", err)
 	}
@@ -804,6 +829,19 @@ func (v *replayValidator) loadBlock(ctx context.Context, id ton.BlockIDExt) (loa
 	}, nil
 }
 
+func parseBlockBOC(data []byte) (*cell.Cell, error) {
+	roots, _, err := cell.FromBOCMultiRootReader(cell.NewBOCNoCopyReader(data), cell.BOCParseOptions{
+		NoCopyPayload: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(roots) != 1 {
+		return nil, fmt.Errorf("boc should contain exactly one root, got %d", len(roots))
+	}
+	return roots[0], nil
+}
+
 func (v *replayValidator) loadState(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
 	meta, err := v.store.BlockMeta(ctx, block)
 	if err != nil {
@@ -821,6 +859,32 @@ func (v *replayValidator) loadState(ctx context.Context, block ton.BlockIDExt) (
 		return nil, err
 	}
 	state.MasterchainRef = meta.MasterchainRef
+	return state, nil
+}
+
+func (v *replayValidator) loadStateRoot(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+	meta, err := v.store.BlockMeta(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+	if len(meta.StateRootHash) != 32 {
+		return nil, fmt.Errorf("block meta for %s has no state root hash", storage.FormatBlockRef(block))
+	}
+	root, err := v.store.LoadStateCellTree(ctx, block, meta.StateRootHash)
+	if err != nil {
+		return nil, fmt.Errorf("load lazy state root: %w", err)
+	}
+
+	state := &storage.BlockState{
+		Block:         block,
+		StateRootHash: bytes.Clone(meta.StateRootHash),
+		StateFileHash: bytes.Clone(meta.StateFileHash),
+		Cell:          root,
+	}
+	if meta.MasterchainRef != nil {
+		ref := *meta.MasterchainRef
+		state.MasterchainRef = &ref
+	}
 	return state, nil
 }
 
@@ -854,13 +918,13 @@ func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32,
 		Int("global_version", execCtx.master.bundle.globalVersion).
 		Msg("replaying block transactions")
 
-	machine := tvm.NewTVM()
-	if err = machine.SetGlobalVersion(execCtx.master.bundle.globalVersion); err != nil {
+	machine, err := v.tvm.WithGlobalVersion(execCtx.master.bundle.globalVersion)
+	if err != nil {
 		return result, err
 	}
 
 	for _, account := range accounts {
-		emulationElapsed, txs, err := v.validateAccountBlock(masterSeqno, previousViews, expectedView, block, execCtx, machine, account)
+		emulationElapsed, txs, err := v.validateAccountBlock(masterSeqno, previousViews, expectedView, block, execCtx, &machine, account)
 		result.EmulationElapsed += emulationElapsed
 		result.Transactions += txs
 		if err != nil {
@@ -875,7 +939,7 @@ func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32,
 		Msg("block transaction replay finished")
 
 	if v.benchmark != nil {
-		if err = v.benchmark.consider(masterSeqno, previousViews, expectedView, block, execCtx, accounts); err != nil {
+		if err = v.benchmark.consider(masterSeqno, previousViews, expectedView, block, execCtx, v.tvm, accounts); err != nil {
 			return result, err
 		}
 	}
@@ -1003,9 +1067,9 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 			break
 		}
 
-		gotTxHash := res.TransactionCell.Hash()
-		if !bytes.Equal(gotTxHash, tx.Hash) {
-			txDetails.GotTxHash = hex.EncodeToString(gotTxHash)
+		gotTxHash := res.TransactionCell.HashKey()
+		if gotTxHash != tx.Hash {
+			txDetails.GotTxHash = hex.EncodeToString(gotTxHash[:])
 			txDetails.GotTxBOCBase64 = cellBOCBase64(res.TransactionCell)
 			setFirstTx(current, txDetails)
 			addMismatch()
@@ -1016,8 +1080,8 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 				Uint64("lt", tx.Parsed.LT).
 				Int64("gas", gasUsed).
 				Dur("elapsed", elapsed).
-				Str("expected_tx_hash", hex.EncodeToString(tx.Hash)).
-				Str("got_tx_hash", hex.EncodeToString(gotTxHash)).
+				Str("expected_tx_hash", hex.EncodeToString(tx.Hash[:])).
+				Str("got_tx_hash", hex.EncodeToString(gotTxHash[:])).
 				Msg("transaction hash mismatch")
 		} else {
 			v.log.Debug().
@@ -1041,6 +1105,7 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.BlockIDExt, expectedView *shardStateView, account accountBlockWork, details accountMismatchDetails, got *tlb.ShardAccount) {
 	addr := accountAddress(block.Workchain, account.Account)
 	expectedAccountHash := account.Expected
+	var expectedAccountHashKey cell.Hash
 	if v.collectsMismatches() {
 		details.gotShardAccountBOCBase64 = shardAccountBOCBase64(got)
 	}
@@ -1051,7 +1116,8 @@ func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.Blo
 
 	expectedShard, err := expectedView.account(account.Account)
 	if err == nil {
-		expectedAccountHash = expectedShard.Account.Hash()
+		expectedAccountHashKey = expectedShard.Account.HashKey()
+		expectedAccountHash = expectedAccountHashKey[:]
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		addMismatch()
 		v.log.Warn().
@@ -1084,15 +1150,15 @@ func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.Blo
 		return
 	}
 
-	gotAccountHash := got.Account.Hash()
-	if !bytes.Equal(gotAccountHash, expectedAccountHash) {
+	gotAccountHash := got.Account.HashKey()
+	if !bytes.Equal(gotAccountHash[:], expectedAccountHash) {
 		addMismatch()
 		v.log.Warn().
 			Uint32("master_seqno", masterSeqno).
 			Str("block", storage.FormatBlockRef(block)).
 			Str("address", addr.StringRaw()).
 			Str("expected_account_hash", hex.EncodeToString(expectedAccountHash)).
-			Str("got_account_hash", hex.EncodeToString(gotAccountHash)).
+			Str("got_account_hash", hex.EncodeToString(gotAccountHash[:])).
 			Msg("account root hash mismatch")
 	}
 }
@@ -1407,7 +1473,7 @@ func (c *tvmBenchmarkFixtureCollector) fixture() (tvmBenchmarkFixture, bool) {
 	return *c.best, true
 }
 
-func (c *tvmBenchmarkFixtureCollector) consider(masterSeqno uint32, previous []*shardStateView, expected *shardStateView, block loadedBlock, execCtx *blockExecutionContext, accounts []accountBlockWork) error {
+func (c *tvmBenchmarkFixtureCollector) consider(masterSeqno uint32, previous []*shardStateView, expected *shardStateView, block loadedBlock, execCtx *blockExecutionContext, baseTVM *tvm.TVM, accounts []accountBlockWork) error {
 	txCount := countTransactions(accounts)
 	if txCount == 0 {
 		return nil
@@ -1423,7 +1489,7 @@ func (c *tvmBenchmarkFixtureCollector) consider(masterSeqno uint32, previous []*
 		return nil
 	}
 
-	fixture, err := buildTVMBenchmarkFixture(masterSeqno, previous, expected, block, execCtx, accounts)
+	fixture, err := buildTVMBenchmarkFixture(masterSeqno, previous, expected, block, execCtx, baseTVM, accounts)
 	if err != nil {
 		c.log.Warn().
 			Err(err).
@@ -1451,14 +1517,14 @@ func (c *tvmBenchmarkFixtureCollector) consider(masterSeqno uint32, previous []*
 	return nil
 }
 
-func buildTVMBenchmarkFixture(masterSeqno uint32, previous []*shardStateView, expected *shardStateView, block loadedBlock, execCtx *blockExecutionContext, accounts []accountBlockWork) (tvmBenchmarkFixture, error) {
+func buildTVMBenchmarkFixture(masterSeqno uint32, previous []*shardStateView, expected *shardStateView, block loadedBlock, execCtx *blockExecutionContext, baseTVM *tvm.TVM, accounts []accountBlockWork) (tvmBenchmarkFixture, error) {
 	proofViews, proofs, err := benchmarkStateProofViews(previous)
 	if err != nil {
 		return tvmBenchmarkFixture{}, err
 	}
 
-	machine := tvm.NewTVM()
-	if err = machine.SetGlobalVersion(execCtx.master.bundle.globalVersion); err != nil {
+	machine, err := baseTVM.WithGlobalVersion(execCtx.master.bundle.globalVersion)
+	if err != nil {
 		return tvmBenchmarkFixture{}, err
 	}
 
@@ -1466,7 +1532,7 @@ func buildTVMBenchmarkFixture(masterSeqno uint32, previous []*shardStateView, ex
 	txConfigs := make([]benchmarkTransactionConfig, 0, countTransactions(accounts))
 	accountStates := make([]benchmarkAccountState, 0, len(accounts))
 	for _, account := range accounts {
-		accountState, configs, txs, err := replayAccountBlockForBenchmarkProof(block, execCtx, machine, proofViews, expected, account)
+		accountState, configs, txs, err := replayAccountBlockForBenchmarkProof(block, execCtx, &machine, proofViews, expected, account)
 		if err != nil {
 			return tvmBenchmarkFixture{}, err
 		}
@@ -1503,7 +1569,7 @@ func buildTVMBenchmarkFixture(masterSeqno uint32, previous []*shardStateView, ex
 
 	blockBOC := block.Root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	return tvmBenchmarkFixture{
-		Name:                fmt.Sprintf("master_%d_%s", masterSeqno, storage.BlockKey(block.ID)),
+		Name:                fmt.Sprintf("master_%d_%x", masterSeqno, storage.BlockKey(block.ID)),
 		MasterSeqno:         masterSeqno,
 		Block:               benchmarkBlockRefFromID(block.ID),
 		Accounts:            len(accounts),
@@ -1617,9 +1683,9 @@ func replayAccountBlockForBenchmarkProof(block loadedBlock, execCtx *blockExecut
 			return accountState, txConfigs, txCount, fmt.Errorf("emulate transaction %s lt=%d returned incomplete result", accountAddressRaw(block.ID.Workchain, account.Account), tx.Parsed.LT)
 		}
 
-		gotTxHash := res.TransactionCell.Hash()
-		if !bytes.Equal(gotTxHash, tx.Hash) {
-			return accountState, txConfigs, txCount, fmt.Errorf("transaction hash mismatch %s lt=%d: got=%x want=%x", accountAddressRaw(block.ID.Workchain, account.Account), tx.Parsed.LT, gotTxHash, tx.Hash)
+		gotTxHash := res.TransactionCell.HashKey()
+		if gotTxHash != tx.Hash {
+			return accountState, txConfigs, txCount, fmt.Errorf("transaction hash mismatch %s lt=%d: got=%x want=%x", accountAddressRaw(block.ID.Workchain, account.Account), tx.Parsed.LT, gotTxHash[:], tx.Hash[:])
 		}
 		txConfigs = append(txConfigs, benchmarkTransactionConfig{
 			Account:                      accountAddressRaw(block.ID.Workchain, account.Account),
@@ -1640,17 +1706,19 @@ func replayAccountBlockForBenchmarkProof(block loadedBlock, execCtx *blockExecut
 	}
 
 	expectedHash := account.Expected
+	var expectedHashKey cell.Hash
 	expectedShard, err := expected.account(account.Account)
 	if err == nil {
-		expectedHash = expectedShard.Account.Hash()
+		expectedHashKey = expectedShard.Account.HashKey()
+		expectedHash = expectedHashKey[:]
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return accountState, txConfigs, txCount, fmt.Errorf("load expected account %s: %w", accountAddressRaw(block.ID.Workchain, account.Account), err)
 	}
 	if current == nil || current.Account == nil {
 		return accountState, txConfigs, txCount, fmt.Errorf("missing final account %s", accountAddressRaw(block.ID.Workchain, account.Account))
 	}
-	if gotHash := current.Account.Hash(); !bytes.Equal(gotHash, expectedHash) {
-		return accountState, txConfigs, txCount, fmt.Errorf("account hash mismatch %s: got=%x want=%x", accountAddressRaw(block.ID.Workchain, account.Account), gotHash, expectedHash)
+	if gotHash := current.Account.HashKey(); !bytes.Equal(gotHash[:], expectedHash) {
+		return accountState, txConfigs, txCount, fmt.Errorf("account hash mismatch %s: got=%x want=%x", accountAddressRaw(block.ID.Workchain, account.Account), gotHash[:], expectedHash)
 	}
 	return accountState, txConfigs, txCount, nil
 }
@@ -1664,11 +1732,13 @@ func benchmarkAccountStateFromShard(workchain int32, account []byte, shard *tlb.
 	if err != nil {
 		return benchmarkAccountState{}, fmt.Errorf("serialize previous account %s: %w", accountAddressRaw(workchain, account), err)
 	}
+	rootHash := root.HashKey()
+	accountHash := shard.Account.HashKey()
 	return benchmarkAccountState{
 		Account:               accountAddressRaw(workchain, account),
 		ShardAccountBOCBase64: cellBOCBase64(root),
-		ShardAccountRootHash:  hex.EncodeToString(root.Hash()),
-		AccountRootHash:       hex.EncodeToString(shard.Account.Hash()),
+		ShardAccountRootHash:  hex.EncodeToString(rootHash[:]),
+		AccountRootHash:       hex.EncodeToString(accountHash[:]),
 	}, nil
 }
 
@@ -1765,8 +1835,7 @@ func accountBlocks(block *tlb.Block) ([]accountBlockWork, error) {
 			if err = tlb.Parse(&tx, txCell); err != nil {
 				return nil, fmt.Errorf("load tx from cell: %w", err)
 			}
-			hash := txCell.Hash()
-			tx.Hash = append([]byte(nil), hash...)
+			hash := txCell.HashKey()
 			inMsgCell, err := transactionInputMessageCell(txCell)
 			if err != nil {
 				return nil, fmt.Errorf("load tx input message cell: %w", err)
@@ -1775,7 +1844,7 @@ func accountBlocks(block *tlb.Block) ([]accountBlockWork, error) {
 				Cell:      txCell,
 				InMsgCell: inMsgCell,
 				Parsed:    &tx,
-				Hash:      append([]byte(nil), hash...),
+				Hash:      hash,
 			})
 		}
 		sort.Slice(work.Txs, func(i, j int) bool {
@@ -2352,13 +2421,14 @@ func accountKey(accountID []byte) *cell.Cell {
 type replayShardResolver struct {
 	validator   *replayValidator
 	masterState *storage.BlockState
+	master      ton.BlockIDExt
 	masterSeqno uint32
 
 	mu           sync.Mutex
-	current      map[string]*storage.BlockState
-	cache        map[string]*storage.BlockState
-	masterStates map[string]*storage.BlockState
-	tasks        map[string]*shardResolveTask
+	current      map[storage.BlockRootHash]*storage.BlockState
+	cache        map[storage.BlockRootHash]*storage.BlockState
+	masterStates map[storage.BlockRootHash]*storage.BlockState
+	tasks        map[storage.BlockRootHash]*shardResolveTask
 }
 
 type shardResolveTask struct {
@@ -2367,17 +2437,18 @@ type shardResolveTask struct {
 	err   error
 }
 
-func newReplayShardResolver(validator *replayValidator, masterState *storage.BlockState, masterSeqno uint32, current map[string]*storage.BlockState) *replayShardResolver {
+func newReplayShardResolver(validator *replayValidator, masterState *storage.BlockState, master ton.BlockIDExt, current map[storage.BlockRootHash]*storage.BlockState) *replayShardResolver {
 	return &replayShardResolver{
 		validator:   validator,
 		masterState: masterState,
-		masterSeqno: masterSeqno,
+		master:      master,
+		masterSeqno: master.SeqNo,
 		current:     current,
-		cache:       map[string]*storage.BlockState{},
-		masterStates: map[string]*storage.BlockState{
+		cache:       map[storage.BlockRootHash]*storage.BlockState{},
+		masterStates: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(masterState.Block): masterState,
 		},
-		tasks: map[string]*shardResolveTask{},
+		tasks: map[storage.BlockRootHash]*shardResolveTask{},
 	}
 }
 
@@ -2456,10 +2527,13 @@ func (r *replayShardResolver) resolveOwned(ctx context.Context, block ton.BlockI
 		expected = loadedState
 	}
 
-	if loaded.Meta.MasterchainRef == nil {
-		return nil, fmt.Errorf("shard block %s has no masterchain ref", storage.FormatBlockRef(block))
+	// Shard blocks are scheduled from this master block shard set, so this
+	// master is the execution context when older imported metadata has no ref.
+	master := r.master
+	if loaded.Meta.MasterchainRef != nil {
+		master = *loaded.Meta.MasterchainRef
 	}
-	masterState, err := r.masterStateFor(ctx, *loaded.Meta.MasterchainRef)
+	masterState, err := r.masterStateFor(ctx, master)
 	if err != nil {
 		return nil, fmt.Errorf("load master state for shard block %s: %w", storage.FormatBlockRef(block), err)
 	}
@@ -2485,9 +2559,9 @@ func (r *replayShardResolver) masterStateFor(ctx context.Context, block ton.Bloc
 		return state, nil
 	}
 
-	state, err := r.validator.loadState(ctx, block)
+	state, err := r.validator.loadStateRoot(ctx, block)
 	if err != nil {
-		return nil, fmt.Errorf("load master state %s: %w", storage.FormatBlockRef(block), err)
+		return nil, fmt.Errorf("load master state root %s: %w", storage.FormatBlockRef(block), err)
 	}
 
 	r.mu.Lock()
@@ -2530,7 +2604,7 @@ type configBundle struct {
 
 	mu          sync.Mutex
 	unpacked    map[uint32]tuple.Tuple
-	precompiled map[string]*big.Int
+	precompiled map[cell.Hash]*big.Int
 }
 
 func newExecutionConfigCache(log zerolog.Logger, source prevBlocksSource) *executionConfigCache {
@@ -2560,7 +2634,7 @@ func (c *executionConfigCache) blockContext(ctx context.Context, lookupMaster fu
 
 func (c *executionConfigCache) masterContext(ctx context.Context, lookupMaster func(context.Context, uint32) (ton.BlockIDExt, error), master ton.BlockIDExt, masterState *cell.Cell) (*masterExecutionContext, error) {
 	stateHash := masterState.HashKey(0)
-	masterKey := fmt.Sprintf("%s:%x:%s", storage.BlockKey(master), stateHash[:], c.prevBlocksSource)
+	masterKey := fmt.Sprintf("%x:%x:%s", storage.BlockKey(master), stateHash[:], c.prevBlocksSource)
 
 	c.mu.Lock()
 	if cached := c.masters[masterKey]; cached != nil {
@@ -2604,7 +2678,7 @@ func (c *executionConfigCache) masterContext(ctx context.Context, lookupMaster f
 			globalVersion: globalVersion,
 			libraries:     libraries,
 			unpacked:      map[uint32]tuple.Tuple{},
-			precompiled:   map[string]*big.Int{},
+			precompiled:   map[cell.Hash]*big.Int{},
 		}
 		c.mu.Lock()
 		if existing := c.bundles[bundleKey]; existing != nil {
@@ -2670,7 +2744,8 @@ func (b *blockExecutionContext) transactionConfig(block loadedBlock, shard *tlb.
 	if err != nil {
 		return tvm.TransactionEmulationConfig{}, err
 	}
-	incomingCoins, incomingExtra, err := transactionIncomingValue(shard, tx.IO.In, tx)
+	storageFees := transactionStorageFeesBig(tx)
+	incomingCoins, incomingExtra, err := transactionIncomingValue(shard, tx.IO.In, storageFees)
 	if err != nil {
 		return tvm.TransactionEmulationConfig{}, err
 	}
@@ -2690,7 +2765,7 @@ func (b *blockExecutionContext) transactionConfig(block loadedBlock, shard *tlb.
 		PrecompiledGasUsage: precompiled,
 		Libraries:           b.master.bundle.libraries,
 		IncomingValue:       currencyTuple(incomingCoins, incomingExtra),
-		StorageFees:         transactionStorageFees(tx),
+		StorageFees:         storageFeesInt64(storageFees),
 		DuePayment:          transactionDuePayment(tx),
 		InMsgParams:         inMsgParams,
 	}, nil
@@ -2719,6 +2794,7 @@ func (b *blockExecutionContext) tickTockTransactionConfig(block loadedBlock, sha
 		return tvm.TransactionEmulationConfig{}, err
 	}
 
+	storageFees := transactionStorageFeesBig(tx)
 	return tvm.TransactionEmulationConfig{
 		Now:                 block.Parsed.BlockInfo.GenUtime,
 		BlockLT:             blockLT,
@@ -2729,8 +2805,8 @@ func (b *blockExecutionContext) tickTockTransactionConfig(block loadedBlock, sha
 		UnpackedConfig:      b.unpacked,
 		PrecompiledGasUsage: precompiled,
 		Libraries:           b.master.bundle.libraries,
-		IncomingValue:       currencyTuple(big.NewInt(0), nil),
-		StorageFees:         transactionStorageFees(tx),
+		IncomingValue:       currencyTuple(nil, nil),
+		StorageFees:         storageFeesInt64(storageFees),
 		DuePayment:          transactionDuePayment(tx),
 		InMsgParams:         defaultInMsgParams(),
 	}, nil
@@ -2739,7 +2815,7 @@ func (b *blockExecutionContext) tickTockTransactionConfig(block loadedBlock, sha
 func (b *blockExecutionContext) accountMismatchTxDetails(tx transactionWork, msgCell *cell.Cell, cfg tvm.TransactionEmulationConfig) accountMismatchTx {
 	return accountMismatchTx{
 		LT:                  tx.Parsed.LT,
-		ExpectedTxHash:      hex.EncodeToString(tx.Hash),
+		ExpectedTxHash:      hex.EncodeToString(tx.Hash[:]),
 		ExpectedTxBOCBase64: cellBOCBase64(tx.Cell),
 		InMsgBOCBase64:      cellBOCBase64(msgCell),
 		Config: accountMismatchTxConfig{
@@ -2785,11 +2861,10 @@ func (b *configBundle) precompiledGas(code *cell.Cell) (*big.Int, error) {
 		return nil, nil
 	}
 
-	hash := code.Hash()
-	key := hex.EncodeToString(hash)
+	hash := code.HashKey()
 
 	b.mu.Lock()
-	if cached, ok := b.precompiled[key]; ok {
+	if cached, ok := b.precompiled[hash]; ok {
 		b.mu.Unlock()
 		if cached == nil {
 			return nil, nil
@@ -2798,7 +2873,7 @@ func (b *configBundle) precompiledGas(code *cell.Cell) (*big.Int, error) {
 	}
 	b.mu.Unlock()
 
-	gas, err := runMethodPrecompiledGas(b.config, code)
+	gas, err := runMethodPrecompiledGasByHash(b.config, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -2808,7 +2883,7 @@ func (b *configBundle) precompiledGas(code *cell.Cell) (*big.Int, error) {
 	}
 
 	b.mu.Lock()
-	b.precompiled[key] = stored
+	b.precompiled[hash] = stored
 	b.mu.Unlock()
 	if gas == nil {
 		return nil, nil
@@ -2824,9 +2899,18 @@ func uint64ToInt64(value uint64, name string) (int64, error) {
 }
 
 func transactionRandSeed(blockRandSeed []byte, account []byte) []byte {
-	data := make([]byte, 0, 64)
-	data = append(data, blockRandSeed...)
-	data = append(data, account...)
+	var stack [64]byte
+	total := len(blockRandSeed) + len(account)
+	var data []byte
+	if total <= len(stack) {
+		n := copy(stack[:], blockRandSeed)
+		copy(stack[n:], account)
+		data = stack[:total]
+	} else {
+		data = make([]byte, 0, total)
+		data = append(data, blockRandSeed...)
+		data = append(data, account...)
+	}
 	sum := sha256.Sum256(data)
 	return sum[:]
 }
@@ -2857,9 +2941,9 @@ func transactionComputeCode(shard *tlb.ShardAccount, msg *tlb.Message) (*cell.Ce
 	return nil, nil
 }
 
-func transactionIncomingValue(shard *tlb.ShardAccount, msg *tlb.Message, tx *tlb.Transaction) (*big.Int, *cell.Dictionary, error) {
+func transactionIncomingValue(shard *tlb.ShardAccount, msg *tlb.Message, storageFees *big.Int) (*big.Int, *cell.Dictionary, error) {
 	if msg == nil || msg.MsgType != tlb.MsgTypeInternal {
-		return big.NewInt(0), nil, nil
+		return nil, nil, nil
 	}
 
 	internal := msg.AsInternal()
@@ -2871,7 +2955,9 @@ func transactionIncomingValue(shard *tlb.ShardAccount, msg *tlb.Message, tx *tlb
 		}
 
 		afterStorage := new(big.Int).Add(balance, internal.Amount.Nano())
-		afterStorage.Sub(afterStorage, transactionStorageFeesBig(tx))
+		if storageFees != nil {
+			afterStorage.Sub(afterStorage, storageFees)
+		}
 		if afterStorage.Sign() < 0 {
 			return nil, nil, fmt.Errorf("message value after storage fees is negative")
 		}
@@ -2916,14 +3002,14 @@ func transactionInMsgParams(msg *tlb.Message, remainingCoins *big.Int, remaining
 		}
 
 		return tuple.NewTupleValue(
-			big.NewInt(0),
-			big.NewInt(0),
+			tvmIntZero,
+			tvmIntZero,
 			cell.BeginCell().MustStoreAddr(external.SrcAddr).ToSlice(),
-			big.NewInt(0),
-			big.NewInt(0),
-			big.NewInt(0),
-			big.NewInt(0),
-			big.NewInt(0),
+			tvmIntZero,
+			tvmIntZero,
+			tvmIntZero,
+			tvmIntZero,
+			tvmIntZero,
 			nil,
 			stateInit,
 		), nil
@@ -2940,30 +3026,22 @@ func messageStateInitCell(stateInit *tlb.StateInit) (*cell.Cell, error) {
 }
 
 func defaultInMsgParams() tuple.Tuple {
-	return tuple.NewTupleValue(
-		big.NewInt(0),
-		big.NewInt(0),
-		cell.BeginCell().MustStoreUInt(0, 2).ToSlice(),
-		big.NewInt(0),
-		big.NewInt(0),
-		big.NewInt(0),
-		big.NewInt(0),
-		big.NewInt(0),
-		nil,
-		nil,
-	)
+	return defaultInMsgParamsTuple.Copy()
 }
 
 func boolToTVMInt(value bool) *big.Int {
 	if value {
-		return big.NewInt(-1)
+		return tvmIntMinusOne
 	}
-	return big.NewInt(0)
+	return tvmIntZero
 }
 
 func currencyTuple(coins *big.Int, extra *cell.Dictionary) tuple.Tuple {
+	if (coins == nil || coins.Sign() == 0) && (extra == nil || extra.IsEmpty()) {
+		return zeroCurrencyTuple.Copy()
+	}
 	if coins == nil {
-		coins = big.NewInt(0)
+		coins = tvmIntZero
 	}
 	return tuple.NewTupleValue(new(big.Int).Set(coins), extraCurrencyCell(extra))
 }
@@ -2997,8 +3075,7 @@ func shardAccountBalance(shard *tlb.ShardAccount) (*big.Int, error) {
 	return new(big.Int).Set(account.Balance.Nano()), nil
 }
 
-func transactionStorageFees(tx *tlb.Transaction) int64 {
-	fees := transactionStorageFeesBig(tx)
+func storageFeesInt64(fees *big.Int) int64 {
 	if !fees.IsInt64() {
 		return math.MaxInt64
 	}
@@ -3381,6 +3458,13 @@ func runMethodPrecompiledGas(config tlb.BlockchainConfig, code *cell.Cell) (*big
 	if config.Root == nil || code == nil {
 		return nil, nil
 	}
+	return runMethodPrecompiledGasByHash(config, code.HashKey())
+}
+
+func runMethodPrecompiledGasByHash(config tlb.BlockchainConfig, hash cell.Hash) (*big.Int, error) {
+	if config.Root == nil {
+		return nil, nil
+	}
 
 	precompiled, err := config.GetPrecompiledContractsConfig()
 	if err != nil {
@@ -3390,7 +3474,7 @@ func runMethodPrecompiledGas(config tlb.BlockchainConfig, code *cell.Cell) (*big
 		return nil, nil
 	}
 
-	value, err := precompiled.List.LoadValue(accountKey(code.Hash()))
+	value, err := precompiled.List.LoadValue(accountKey(hash[:]))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		return nil, nil
 	}

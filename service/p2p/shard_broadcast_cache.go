@@ -29,26 +29,26 @@ type shardBroadcastBlockCache struct {
 	maxBytes int64
 	maxItems int
 
-	entries map[string]*shardBroadcastBlockCacheEntry
+	entries map[tnstore.BlockRootHash]*shardBroadcastBlockCacheEntry
 	order   *list.List
 	bytes   int64
 }
 
 type shardBroadcastBlockCacheEntry struct {
-	key         string
-	element     *list.Element
-	block       ton.BlockIDExt
-	kind        string
-	blockRoot   *cell.Cell
-	proofRoot   *cell.Cell
-	stateUpdate *cell.Cell
-	blockBOC    []byte
-	proofBOC    []byte
-	isLink      bool
-	meta        *tnstore.BlockMeta
-	sourceKey   string
-	expiresAt   time.Time
-	bytes       int64
+	key          tnstore.BlockRootHash
+	element      *list.Element
+	block        ton.BlockIDExt
+	kind         string
+	blockRoot    *cell.Cell
+	proofRoot    *cell.Cell
+	stateUpdate  *cell.Cell
+	blockBOC     []byte
+	proofBOC     []byte
+	isLink       bool
+	meta         *tnstore.BlockMeta
+	sourcePeerID PeerID
+	expiresAt    time.Time
+	bytes        int64
 }
 
 func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int) *shardBroadcastBlockCache {
@@ -56,7 +56,7 @@ func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int
 		ttl:      ttl,
 		maxBytes: maxBytes,
 		maxItems: maxItems,
-		entries:  map[string]*shardBroadcastBlockCacheEntry{},
+		entries:  map[tnstore.BlockRootHash]*shardBroadcastBlockCacheEntry{},
 		order:    list.New(),
 	}
 }
@@ -111,19 +111,19 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 
 	key := tnstore.BlockKey(downloaded.ID)
 	entry := &shardBroadcastBlockCacheEntry{
-		key:         key,
-		block:       cloneBlockID(downloaded.ID),
-		kind:        downloaded.Kind,
-		blockRoot:   blockRoot,
-		proofRoot:   proofRoot,
-		stateUpdate: stateUpdate,
-		blockBOC:    append([]byte(nil), downloaded.BlockBOC...),
-		proofBOC:    append([]byte(nil), downloaded.ProofBOC...),
-		isLink:      downloaded.IsLink,
-		meta:        meta.Clone(),
-		sourceKey:   downloaded.SourceKey,
-		expiresAt:   now.Add(c.ttl),
-		bytes:       size,
+		key:          key,
+		block:        cloneBlockID(downloaded.ID),
+		kind:         downloaded.Kind,
+		blockRoot:    blockRoot,
+		proofRoot:    proofRoot,
+		stateUpdate:  stateUpdate,
+		blockBOC:     append([]byte(nil), downloaded.BlockBOC...),
+		proofBOC:     append([]byte(nil), downloaded.ProofBOC...),
+		isLink:       downloaded.IsLink,
+		meta:         meta.Clone(),
+		sourcePeerID: downloaded.SourcePeerID,
+		expiresAt:    now.Add(c.ttl),
+		bytes:        size,
 	}
 
 	c.mu.Lock()
@@ -201,7 +201,7 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		ProofBOC:         entry.proofBOC,
 		Meta:             entry.meta.Clone(),
 		StateUpdate:      entry.stateUpdate,
-		SourceKey:        entry.sourceKey,
+		SourcePeerID:     entry.sourcePeerID,
 		IsLink:           entry.isLink,
 		VerifiedRootHash: true,
 	}, nil
@@ -317,7 +317,7 @@ func (n *Node) watchShardBroadcastBlock(block ton.BlockIDExt) (<-chan struct{}, 
 
 	n.shardBroadcastWaitMx.Lock()
 	if n.shardBroadcastWaiters == nil {
-		n.shardBroadcastWaiters = map[string][]chan struct{}{}
+		n.shardBroadcastWaiters = map[tnstore.BlockRootHash][]chan struct{}{}
 	}
 	n.shardBroadcastWaiters[key] = append(n.shardBroadcastWaiters[key], ch)
 	n.shardBroadcastWaitMx.Unlock()

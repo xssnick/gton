@@ -65,7 +65,7 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 
 	s.shardDescriptionMu.Lock()
 	if s.shardDescriptionHints == nil {
-		s.shardDescriptionHints = map[string]shardDescriptionHint{}
+		s.shardDescriptionHints = map[storage.BlockRootHash]shardDescriptionHint{}
 	}
 	if _, ok := s.shardDescriptionHints[key]; !ok {
 		s.shardDescriptionOrder = append(s.shardDescriptionOrder, key)
@@ -139,7 +139,7 @@ func (s *Service) pruneShardDescriptionHintsLocked(now time.Time) {
 		}
 		copy(s.shardDescriptionOrder, s.shardDescriptionOrder[overflow:])
 		for i := len(s.shardDescriptionOrder) - overflow; i < len(s.shardDescriptionOrder); i++ {
-			s.shardDescriptionOrder[i] = ""
+			s.shardDescriptionOrder[i] = storage.BlockRootHash{}
 		}
 		s.shardDescriptionOrder = s.shardDescriptionOrder[:len(s.shardDescriptionOrder)-overflow]
 	}

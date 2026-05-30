@@ -16,10 +16,12 @@ import (
 const (
 	DefaultGlobalConfigPath = "global.config.json"
 
-	topShard                   = int64(-1 << 63)
-	maxPeersPerOverlay         = 20
-	maxQueryNeighbours         = 16
-	maxOverlayPayloadSize      = 16 << 20
+	topShard              = int64(-1 << 63)
+	maxPeersPerOverlay    = 20
+	maxQueryNeighbours    = 16
+	maxOverlayPayloadSize = 16 << 20
+	// C++ private overlays set the RLDP2 peer MTU to max broadcast size + 1024.
+	maxRLDPTwoStepTransferSize = maxOverlayPayloadSize + 1024
 	simpleBroadcastSkew        = 20 * time.Second
 	dhtRefreshInterval         = 90 * time.Second
 	peerRefreshMinDelay        = time.Second
@@ -108,8 +110,9 @@ const (
 type Delivery string
 
 const (
-	DeliverySimple Delivery = "simple"
-	DeliveryFEC    Delivery = "fec"
+	DeliverySimple  Delivery = "simple"
+	DeliveryFEC     Delivery = "fec"
+	DeliveryTwoStep Delivery = "two_step"
 )
 
 type BroadcastEvent struct {
@@ -120,7 +123,7 @@ type BroadcastEvent struct {
 	Block            ton.BlockIDExt
 	Downloaded       *DownloadedBlock
 	ShardDescription *ShardBlockDescription
-	SourceKey        string
+	SourcePeerID     PeerID
 	ReceivedAt       time.Time
 }
 
@@ -148,6 +151,7 @@ type Options struct {
 	CompressedState    CompressedBlockStateProvider
 	SyncLag            SyncLagProvider
 	SignatureVerifier  BroadcastSignatureVerifier
+	CustomOverlays     []CustomOverlayConfig
 }
 
 type BroadcastSignatureVerifier interface {
@@ -170,6 +174,8 @@ type ShardDescriptionSignatureCheck struct {
 
 type BlockCacheObserver interface {
 	MarkLiveBlockFlushed(block ton.BlockIDExt)
+	NonfinalBlockCacheEnabled() bool
+	PublishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) error
 }
 
 type SyncLagProvider interface {
@@ -182,14 +188,52 @@ func (f SyncLagProviderFunc) SyncLagSeconds() (int64, bool) {
 	return f()
 }
 
+type CustomOverlayConfig struct {
+	Name              string
+	Nodes             []CustomOverlayNodeConfig
+	SenderShards      []CustomOverlayShard
+	SkipPublicMsgSend bool
+}
+
+type CustomOverlayNodeConfig struct {
+	ADNLID            PeerID
+	MsgSender         bool
+	MsgSenderPriority int
+	BlockSender       bool
+}
+
+type CustomOverlayShard struct {
+	Workchain int32
+	Shard     int64
+}
+
+type overlayKind uint8
+
+const (
+	overlayKindPublicShard overlayKind = iota
+	overlayKindCustomFixed
+)
+
 type overlaySpec struct {
 	Name              string
+	Kind              overlayKind
 	Workchain         int32
 	Shard             int64
 	FullID            []byte
 	ShortID           []byte
 	ProtoVersionMajor int32
 	ProtoVersionMinor int32
+	FixedNodes        []PeerID
+	FixedNodeIDs      map[PeerID]struct{}
+	MsgSenders        map[PeerID]int
+	BlockSenders      map[PeerID]struct{}
+	AuthorizedKeys    map[string]uint32
+	SenderShards      []CustomOverlayShard
+	SkipPublicMsgSend bool
+	Announce          bool
+	DHTDiscovery      bool
+	RandomPeers       bool
+	QueryCapabilities bool
 }
 
 type DownloadedBlock struct {
@@ -206,7 +250,7 @@ type DownloadedBlock struct {
 	BroadcastSignatures *cell.Cell
 	Meta                *storage.BlockMeta
 	StateUpdate         *cell.Cell
-	SourceKey           string
+	SourcePeerID        PeerID
 
 	IsLink bool
 

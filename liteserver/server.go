@@ -3,7 +3,6 @@ package liteserver
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -16,7 +15,6 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
-	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -26,7 +24,7 @@ import (
 
 const (
 	DefaultVersion      int32 = 0x101
-	DefaultCapabilities int64 = 7
+	DefaultCapabilities int64 = 15
 )
 
 type Store interface {
@@ -81,6 +79,7 @@ type Options struct {
 	QueryObserver QueryObserver
 	PrivateKey    ed25519.PrivateKey
 	ListenAddr    string
+	NonFinal      bool
 	ZeroState     ton.ZeroStateIDExt
 	Version       int32
 	Capabilities  int64
@@ -93,6 +92,7 @@ type Server struct {
 	queryObserver QueryObserver
 	privateKey    ed25519.PrivateKey
 	listenAddr    string
+	nonFinal      bool
 	zeroState     ton.ZeroStateIDExt
 	version       int32
 	capabilities  int64
@@ -108,9 +108,9 @@ type Server struct {
 	wg     sync.WaitGroup
 
 	blockProofBasesMu   sync.Mutex
-	blockProofBases     map[string]*blockProofBase
-	blockProofBaseOrder []string
-	blockProofBaseLoad  liveBlockLoadGroup
+	blockProofBases     map[storage.BlockRootHash]*blockProofBase
+	blockProofBaseOrder []storage.BlockRootHash
+	blockProofBaseLoad  liveLoadGroup[storage.BlockRootHash]
 }
 
 func New(opts Options) (*Server, error) {
@@ -143,6 +143,7 @@ func New(opts Options) (*Server, error) {
 		queryObserver:          opts.QueryObserver,
 		privateKey:             opts.PrivateKey,
 		listenAddr:             opts.ListenAddr,
+		nonFinal:               opts.NonFinal,
 		zeroState:              cloneZeroState(opts.ZeroState),
 		version:                version,
 		capabilities:           capabilities,
@@ -150,7 +151,7 @@ func New(opts Options) (*Server, error) {
 		tvm:                    tvm.NewTVM(),
 		sendMessageCache:       newSendMessageCache(),
 		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
-		blockProofBases:        make(map[string]*blockProofBase),
+		blockProofBases:        make(map[storage.BlockRootHash]*blockProofBase),
 	}, nil
 }
 
@@ -162,7 +163,7 @@ func (s *Server) Start(ctx context.Context) error {
 	configureLiteclientLogger(s.log)
 
 	srv := liteclient.NewServer([]ed25519.PrivateKey{s.privateKey})
-	srv.SetMessageHandler(s.handleMessage)
+	srv.SetQueryHandler(s.handleQueryRequest)
 	srv.SetConnectionHook(func(client *liteclient.ServerClient) error {
 		s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port()).Msg("accepted liteserver connection")
 		return nil
@@ -279,29 +280,10 @@ func splitLiteclientLogRemote(args []any, fallback string) (string, string) {
 	return remoteAddr, msg
 }
 
-func (s *Server) handleMessage(ctx context.Context, client *liteclient.ServerClient, msg tl.Serializable) error {
-	switch m := msg.(type) {
-	case adnl.MessageQuery:
-		return s.handleMessageQuery(ctx, client, m.ID, m.Data)
-	case liteclient.TCPPing:
-		return client.Send(liteclient.TCPPong{RandomID: m.RandomID})
-	case liteclient.TCPAuthenticate:
-		nonce, err := randomNonce()
-		if err != nil {
-			return fmt.Errorf("generate liteserver authentication nonce: %w", err)
-		}
-		return client.Send(liteclient.TCPAuthenticationNonce{Nonce: nonce})
-	case liteclient.TCPAuthenticationComplete:
-		return nil
-	default:
-		return fmt.Errorf("unknown liteserver TCP message %T", msg)
-	}
-}
-
-func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.ServerClient, id []byte, data any) error {
+func (s *Server) handleQueryRequest(ctx context.Context, client *liteclient.ServerClient, data tl.Serializable) (tl.Serializable, error) {
 	event := s.log.Debug()
 	if !event.Enabled() && s.queryObserver == nil {
-		return client.Send(adnl.MessageAnswer{ID: id, Data: s.handleQueryData(ctx, data)})
+		return s.handleQueryData(ctx, data), nil
 	}
 
 	if s.queryObserver != nil {
@@ -322,9 +304,8 @@ func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.Serv
 		}
 		s.queryObserver.ObserveLiteserverQuery(observation)
 	}
-	err := client.Send(adnl.MessageAnswer{ID: id, Data: resp})
 	if !event.Enabled() {
-		return err
+		return resp, nil
 	}
 
 	event = event.
@@ -332,8 +313,7 @@ func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.Serv
 		Str("response", liteserverTypeName(resp)).
 		Dur("duration", timing.duration).
 		Str("remote_ip", client.IP()).
-		Uint16("remote_port", client.Port()).
-		Err(err)
+		Uint16("remote_port", client.Port())
 	if timing.sequence != "" && timing.sequence != timing.query {
 		event = event.Str("sequence", timing.sequence)
 	}
@@ -345,15 +325,7 @@ func (s *Server) handleMessageQuery(ctx context.Context, client *liteclient.Serv
 	}
 	event.Msg("handled liteserver query")
 
-	return err
-}
-
-func randomNonce() ([]byte, error) {
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	return nonce, nil
+	return resp, nil
 }
 
 func liteserverQueryLogName(data any) string {

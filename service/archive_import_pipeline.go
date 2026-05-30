@@ -424,11 +424,11 @@ func (t *archiveWindowShardImportTask) finishStage(stage string) {
 	t.mu.Unlock()
 }
 
-func (r *archiveCatchUpRunner) archiveMasterBlocksForWindow(start *storage.BlockState, imported map[string]PreparedBlock, startSeqno uint32, targetSeqno uint32) ([]PreparedBlock, error) {
+func (r *archiveCatchUpRunner) archiveMasterBlocksForWindow(start *storage.BlockState, imported map[storage.BlockRootHash]PreparedBlock, startSeqno uint32, targetSeqno uint32) ([]PreparedBlock, error) {
 	return archiveMasterBlockSequence(start, targetSeqno, startSeqno, archiveMasterBlockMap(imported))
 }
 
-func archiveMasterBlockMap(blocks map[string]PreparedBlock) map[uint32]PreparedBlock {
+func archiveMasterBlockMap(blocks map[storage.BlockRootHash]PreparedBlock) map[uint32]PreparedBlock {
 	masterBlocks := make(map[uint32]PreparedBlock)
 	for _, block := range blocks {
 		if block.ID.Workchain == -1 && block.ID.Shard == topShard {

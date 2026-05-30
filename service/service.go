@@ -57,8 +57,9 @@ const (
 )
 
 const (
-	DefaultNextBlockCheckpointBlocks = 300
-	DefaultCheckpointBytes           = uint64(512 << 20)
+	DefaultNextBlockCheckpointBlocks = 200
+	DefaultCheckpointBytes           = uint64(256 << 20)
+	DefaultSyncBackpressureWindows   = 4
 )
 
 var (
@@ -102,8 +103,10 @@ type nextShardClientApplyStats struct {
 	wall         time.Duration
 	targetParse  time.Duration
 	apply        time.Duration
+	obtain       time.Duration
 	resolverWait time.Duration
 	applied      int
+	downloaded   int
 	reused       int
 }
 
@@ -138,6 +141,7 @@ type Service struct {
 	archiveCatchUpPrefetchWindows  int
 	nextBlockCheckpointBlocks      uint32
 	checkpointBytes                uint64
+	syncBackpressureWindows        uint32
 	shutdownContext                context.Context
 
 	stateMu sync.Mutex
@@ -145,20 +149,20 @@ type Service struct {
 	currentStateWake      chan struct{}
 	shardDescriptionWake  chan struct{}
 	shardDescriptionMu    sync.Mutex
-	shardDescriptionHints map[string]shardDescriptionHint
-	shardDescriptionOrder []string
+	shardDescriptionHints map[storage.BlockRootHash]shardDescriptionHint
+	shardDescriptionOrder []storage.BlockRootHash
 
 	nextMasterchainMx               sync.Mutex
-	nextMasterchainQueue            map[string]queuedMasterchainBlock
-	nextMasterchainBySeqno          map[uint32]string
+	nextMasterchainQueue            map[storage.BlockRootHash]queuedMasterchainBlock
+	nextMasterchainBySeqno          map[uint32]storage.BlockRootHash
 	nextMasterchainBytes            int64
-	nextMasterchainCandidates       map[string]queuedMasterchainCandidate
-	nextMasterchainCandidateBySeqno map[uint32]string
+	nextMasterchainCandidates       map[storage.BlockRootHash]queuedMasterchainCandidate
+	nextMasterchainCandidateBySeqno map[uint32]storage.BlockRootHash
 	nextMasterchainCandidateBytes   int64
 	validatorCache                  masterchainValidatorCache
 	masterStateCacheMu              sync.Mutex
-	masterStateCache                map[string]*storage.BlockState
-	masterStateCacheKeys            []string
+	masterStateCache                map[storage.BlockRootHash]*storage.BlockState
+	masterStateCacheKeys            []storage.BlockRootHash
 
 	currentStatePersistMu              sync.Mutex
 	currentStatePersistErrMu           sync.Mutex
@@ -170,6 +174,7 @@ type Service struct {
 	maintenanceWake                    chan struct{}
 	stateTTL                           time.Duration
 	archiveTTL                         time.Duration
+	disableArchiveBackfill             bool
 	syncDiskSpacePath                  string
 	minSyncDiskFreeBytes               uint64
 	minStateSerializationDiskFreeBytes uint64
@@ -196,6 +201,7 @@ type Options struct {
 	ArchiveCatchUpPrefetchWindows      int
 	NextBlockCheckpointBlocks          uint32
 	CheckpointBytes                    uint64
+	SyncBackpressureWindows            uint32
 	CurrentStatePublisher              CurrentStatePublisher
 	ShutdownContext                    context.Context
 	StateFilesDir                      string
@@ -205,6 +211,7 @@ type Options struct {
 	MinSyncDiskFreeBytes               uint64
 	MinStateSerializationDiskFreeBytes uint64
 	DisableStateSerialization          bool
+	DisableArchiveBackfill             bool
 	SyncObserver                       SyncObserver
 }
 
@@ -222,6 +229,7 @@ type liveBlockStateFlusher interface {
 
 type SyncObserver interface {
 	ObserveSyncBlock(SyncBlockObservation)
+	ObserveSyncObtain(SyncObtainObservation)
 	ObserveSyncPersist(SyncPersistObservation)
 }
 
@@ -236,6 +244,14 @@ type SyncBlockObservation struct {
 	DownloadDuration time.Duration
 	PrepareDuration  time.Duration
 	ApplyDuration    time.Duration
+}
+
+type SyncObtainObservation struct {
+	Pipeline string
+	Stage    string
+	Result   string
+	CatchUp  bool
+	Duration time.Duration
 }
 
 type SyncPersistObservation struct {
@@ -269,6 +285,22 @@ func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
 		observation.Result = "unknown"
 	}
 	s.sync.ObserveSyncBlock(observation)
+}
+
+func (s *Service) observeSyncObtain(observation SyncObtainObservation) {
+	if s.sync == nil {
+		return
+	}
+	if observation.Pipeline == "" {
+		observation.Pipeline = "unknown"
+	}
+	if observation.Stage == "" {
+		observation.Stage = "unknown"
+	}
+	if observation.Result == "" {
+		observation.Result = "unknown"
+	}
+	s.sync.ObserveSyncObtain(observation)
 }
 
 func syncBlockOriginForSource(source string) string {
@@ -415,14 +447,11 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	if opts.CheckpointBytes == 0 {
 		opts.CheckpointBytes = DefaultCheckpointBytes
 	}
+	if opts.SyncBackpressureWindows == 0 {
+		opts.SyncBackpressureWindows = DefaultSyncBackpressureWindows
+	}
 	if opts.ShutdownContext == nil {
 		opts.ShutdownContext = context.Background()
-	}
-	if opts.StateTTL <= 0 {
-		opts.StateTTL = 3 * 24 * time.Hour
-	}
-	if opts.ArchiveTTL <= 0 {
-		opts.ArchiveTTL = 7 * 24 * time.Hour
 	}
 	if opts.MinSyncDiskFreeBytes == 0 {
 		opts.MinSyncDiskFreeBytes = defaultMinSyncDiskFreeBytes
@@ -445,13 +474,15 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		archiveCatchUpPrefetchWindows:      opts.ArchiveCatchUpPrefetchWindows,
 		nextBlockCheckpointBlocks:          opts.NextBlockCheckpointBlocks,
 		checkpointBytes:                    opts.CheckpointBytes,
+		syncBackpressureWindows:            opts.SyncBackpressureWindows,
 		shutdownContext:                    opts.ShutdownContext,
 		currentStateWake:                   make(chan struct{}, 1),
 		shardDescriptionWake:               make(chan struct{}, 1),
-		shardDescriptionHints:              map[string]shardDescriptionHint{},
+		shardDescriptionHints:              map[storage.BlockRootHash]shardDescriptionHint{},
 		maintenanceWake:                    make(chan struct{}, 1),
 		stateTTL:                           opts.StateTTL,
 		archiveTTL:                         opts.ArchiveTTL,
+		disableArchiveBackfill:             opts.DisableArchiveBackfill,
 		syncDiskSpacePath:                  opts.StorageDir,
 		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
@@ -475,18 +506,32 @@ func (s *Service) checkpointBytesTarget() uint64 {
 	return DefaultCheckpointBytes
 }
 
-func checkpointBackpressureBlocks(target uint32) uint32 {
-	if target > ^uint32(0)/2 {
-		return ^uint32(0)
+func (s *Service) syncBackpressureWindowCount() uint32 {
+	if s.syncBackpressureWindows != 0 {
+		return s.syncBackpressureWindows
 	}
-	return target * 2
+	return DefaultSyncBackpressureWindows
 }
 
-func checkpointBackpressureBytes(target uint64) uint64 {
-	if target > ^uint64(0)/2 {
+func checkpointBackpressureBlocks(target uint32, windows uint32) uint32 {
+	if windows == 0 {
+		windows = DefaultSyncBackpressureWindows
+	}
+	if target > ^uint32(0)/windows {
+		return ^uint32(0)
+	}
+	return target * windows
+}
+
+func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
+	if windows == 0 {
+		windows = DefaultSyncBackpressureWindows
+	}
+	windowCount := uint64(windows)
+	if target > ^uint64(0)/windowCount {
 		return ^uint64(0)
 	}
-	return target * 2
+	return target * windowCount
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -809,7 +854,6 @@ func (s *Service) runBlockProcessorWorker(ctx context.Context, jobs <-chan block
 }
 
 func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.SyncedBlock) (err error) {
-	started := time.Now()
 	source := "broadcast"
 	if synced.CatchUp {
 		source = "peer_catch_up"
@@ -830,7 +874,6 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		if err != nil {
 			observation.Result = syncBlockResultForError(err)
 		}
-		observation.ApplyDuration = time.Since(started)
 		s.observeSyncBlock(observation)
 	}()
 
@@ -867,7 +910,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		if err != nil {
 			observation.PrepareDuration = time.Since(prepareStarted)
 			if errors.Is(err, storage.ErrNotFound) {
-				s.queueMasterchainBroadcastCandidateFromSource(verified, synced.Trigger.SourceKey)
+				s.queueMasterchainBroadcastCandidateFromSource(verified, synced.Trigger.SourcePeerID)
 				s.wakeCurrentStateSync()
 				return errSyncedBlockDeferred
 			}
@@ -882,7 +925,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		prepared.PrepareElapsed = time.Since(prepareStarted)
 		observation.PrepareDuration = prepared.PrepareElapsed
 		s.rememberSeenMasterchainBlock(prepared.ID)
-		s.queueMasterchainBlockCandidateFromSource(prepared, synced.Trigger.SourceKey)
+		s.queueMasterchainBlockCandidateFromSource(prepared, synced.Trigger.SourcePeerID)
 		s.wakeCurrentStateSync()
 		return nil
 	}

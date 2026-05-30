@@ -8,6 +8,11 @@ type Options struct {
 	ReadOnly                        bool
 	MetaCacheSize                   int64
 	CellCacheSize                   int64
+	DisableDecodedCellCache         bool
+	DecodedCellCacheShards          int
+	DecodedCellCacheBytesPerEntry   int64
+	DecodedCellCacheMinEntries      int
+	DecodedCellCacheMaxEntries      int
 	MetaMemTableSize                int
 	CellMemTableSize                int
 	CellShardMemTableSize           int

@@ -2,14 +2,16 @@ package state
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
-	"github.com/xssnick/gton/service/storage"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -28,7 +30,7 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		states: map[string]*storage.BlockState{
+		states: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, base, aux),
 			storage.BlockKey(base):   {Block: base, Cell: cell.BeginCell().EndCell()},
 			storage.BlockKey(aux):    {Block: aux, Cell: cell.BeginCell().EndCell()},
@@ -86,10 +88,10 @@ func TestSyncerReturnsShardDownloadError(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		states: map[string]*storage.BlockState{
+		states: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, shard),
 		},
-		errByBlock: map[string]error{
+		errByBlock: map[storage.BlockRootHash]error{
 			storage.BlockKey(shard): context.DeadlineExceeded,
 		},
 	}
@@ -109,11 +111,11 @@ func TestSyncerRetriesShardStateWithoutRepeatingMasterStage(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		states: map[string]*storage.BlockState{
+		states: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, shard),
 			storage.BlockKey(shard):  {Block: shard},
 		},
-		errSequenceByBlock: map[string][]error{
+		errSequenceByBlock: map[storage.BlockRootHash][]error{
 			storage.BlockKey(shard): {ErrStateNotAvailable},
 		},
 	}
@@ -145,7 +147,7 @@ func TestSyncerUsesStoredShardStateWithoutCurrentCheckpoint(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		errByBlock: map[string]error{
+		errByBlock: map[storage.BlockRootHash]error{
 			storage.BlockKey(shard): errors.New("shard should not be downloaded"),
 		},
 	}
@@ -187,10 +189,10 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 
 	source := &fakeSource{
 		master: newerMaster,
-		states: map[string]*storage.BlockState{
+		states: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(missingShard): {Block: missingShard},
 		},
-		errByBlock: map[string]error{
+		errByBlock: map[storage.BlockRootHash]error{
 			storage.BlockKey(doneShard): errors.New("completed shard should not be downloaded"),
 		},
 	}
@@ -280,7 +282,7 @@ func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 
 	source := &fakeSource{
 		master: master,
-		states: map[string]*storage.BlockState{
+		states: map[storage.BlockRootHash]*storage.BlockState{
 			storage.BlockKey(master): testMasterState(t, master, shardA, shardB),
 			storage.BlockKey(shardA): {Block: shardA},
 			storage.BlockKey(shardB): {Block: shardB},
@@ -417,7 +419,7 @@ func testMasterState(t *testing.T, master ton.BlockIDExt, shards ...ton.BlockIDE
 		if len(got) != len(shards) {
 			t.Fatalf("test master state shard count = %d, want %d", len(got), len(shards))
 		}
-		want := make(map[string]ton.BlockIDExt, len(shards))
+		want := make(map[storage.BlockRootHash]ton.BlockIDExt, len(shards))
 		for _, shard := range shards {
 			want[storage.BlockKey(shard)] = shard
 		}
@@ -515,9 +517,19 @@ func testStateBlock(workchain int32, shard int64, seqno uint32) ton.BlockIDExt {
 		Workchain: workchain,
 		Shard:     shard,
 		SeqNo:     seqno,
-		RootHash:  make([]byte, 32),
-		FileHash:  make([]byte, 32),
+		RootHash:  testStateBlockHash(0x01, workchain, shard, seqno),
+		FileHash:  testStateBlockHash(0x02, workchain, shard, seqno),
 	}
+}
+
+func testStateBlockHash(kind byte, workchain int32, shard int64, seqno uint32) []byte {
+	var data [17]byte
+	data[0] = kind
+	binary.BigEndian.PutUint32(data[1:5], uint32(workchain))
+	binary.BigEndian.PutUint64(data[5:13], uint64(shard))
+	binary.BigEndian.PutUint32(data[13:17], seqno)
+	hash := sha256.Sum256(data[:])
+	return append([]byte(nil), hash[:]...)
 }
 
 type fakeSource struct {
@@ -526,12 +538,12 @@ type fakeSource struct {
 	initBlock          *ton.BlockIDExt
 	zeroBlock          *ton.BlockIDExt
 	zeroState          *storage.BlockState
-	states             map[string]*storage.BlockState
+	states             map[storage.BlockRootHash]*storage.BlockState
 	keyBlockBatches    map[uint32]KeyBlockBatch
 	downloadedFactory  func(block ton.BlockIDExt) storage.DownloadedState
-	errByBlock         map[string]error
-	errSequenceByBlock map[string][]error
-	downloadCount      map[string]int
+	errByBlock         map[storage.BlockRootHash]error
+	errSequenceByBlock map[storage.BlockRootHash][]error
+	downloadCount      map[storage.BlockRootHash]int
 	nextKeyBlockCalls  int
 	zeroStateCalls     int
 }
@@ -591,7 +603,7 @@ func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ to
 		return nil, err
 	}
 	if f.downloadCount == nil {
-		f.downloadCount = map[string]int{}
+		f.downloadCount = map[storage.BlockRootHash]int{}
 	}
 	f.downloadCount[key]++
 

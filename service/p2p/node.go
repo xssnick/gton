@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/ed25519"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,20 +46,22 @@ type dhtBackend interface {
 var _ dhtBackend = (*dht.Client)(nil)
 
 type Node struct {
-	log        zerolog.Logger
-	cfgPath    string
-	listenAddr string
-	externalIP net.IP
-	privKey    ed25519.PrivateKey
-	dhtPrivKey ed25519.PrivateKey
-	gateway    *adnl.Gateway
-	dhtGateway *adnl.Gateway
-	dhtServer  *dht.Server
-	dht        dhtBackend
-	pool       *peerPool
-	events     chan BroadcastEvent
-	eventQueue *boundedQueue[BroadcastEvent]
-	deduper    *eventDeduper
+	log                 zerolog.Logger
+	cfgPath             string
+	listenAddr          string
+	externalIP          net.IP
+	privKey             ed25519.PrivateKey
+	localID             PeerID
+	dhtPrivKey          ed25519.PrivateKey
+	gateway             *adnl.Gateway
+	dhtGateway          *adnl.Gateway
+	dhtServer           *dht.Server
+	dht                 dhtBackend
+	pool                *peerPool
+	events              chan BroadcastEvent
+	eventQueue          *boundedQueue[BroadcastEvent]
+	deduper             *eventDeduper
+	customFanoutDeduper *eventDeduper
 
 	myExternalMessages        *eventDeduper
 	processedExternalMessages *eventDeduper
@@ -84,7 +88,7 @@ type Node struct {
 	signatureVerifier     BroadcastSignatureVerifier
 	shardBroadcastCache   *shardBroadcastBlockCache
 	shardBroadcastWaitMx  sync.Mutex
-	shardBroadcastWaiters map[string][]chan struct{}
+	shardBroadcastWaiters map[storage2.BlockRootHash][]chan struct{}
 	blockCacheObserver    BlockCacheObserver
 	blockCacheSlots       chan struct{}
 	rebroadcastQuiet      atomic.Bool
@@ -93,7 +97,7 @@ type Node struct {
 	rebroadcastThrottleLast map[string]time.Time
 	rebroadcastFECSlots     map[rebroadcastFECLimiterClass]chan struct{}
 	rebroadcastFECMu        sync.Mutex
-	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[string]struct{}
+	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[PeerID]struct{}
 
 	pendingBroadcastMx         sync.Mutex
 	pendingBroadcasts          map[string]pendingBlockBroadcastDecode
@@ -130,10 +134,11 @@ type Node struct {
 	rawMasterchainNotify      chan struct{}
 	stateFilesDir             string
 	downloadPeerMx            sync.RWMutex
-	downloadPeerLeases        map[string]int
+	downloadPeerLeases        map[PeerID]int
 	stateCellImportSlot       chan struct{}
 	stateSplitPartDecodeSlot  chan struct{}
 	zeroStateBootstrapMu      sync.Mutex
+	customOverlays            []CustomOverlayConfig
 }
 
 func New(opts Options) (*Node, error) {
@@ -141,20 +146,29 @@ func New(opts Options) (*Node, error) {
 	if rldp.MaxFECDataSize < persistentStateChunkAnswerMax {
 		rldp.MaxFECDataSize = persistentStateChunkAnswerMax
 	}
-	rldp.Logger = func(args ...any) {
-		msg := strings.TrimSpace(fmt.Sprintln(args...))
-		if strings.Contains(msg, "received out of order part") ||
-			strings.Contains(msg, "unsupported peer query") {
-			return
-		}
-		if strings.Contains(msg, "error") ||
-			strings.Contains(msg, "failed") ||
-			strings.Contains(msg, "invalid") ||
-			strings.Contains(msg, "too big") {
+	if logger.GetLevel() == zerolog.DebugLevel {
+		adnl.Logger = func(args ...any) {
+			msg := strings.TrimSpace(fmt.Sprintln(args...))
+			if !protocolDiagnosticLoggable(msg) {
+				return
+			}
 			if len(msg) > 2000 {
 				msg = msg[:2000] + "...(truncated)"
 			}
-			logger.Debug().Str("rldp", msg).Msg("rldp diagnostic")
+			logger.Debug().Str("adnl", msg).Msg("adnl diagnostic")
+		}
+		rldp.Logger = func(args ...any) {
+			msg := strings.TrimSpace(fmt.Sprintln(args...))
+			if strings.Contains(msg, "received out of order part") ||
+				strings.Contains(msg, "unsupported peer query") {
+				return
+			}
+			if protocolDiagnosticLoggable(msg) {
+				if len(msg) > 2000 {
+					msg = msg[:2000] + "...(truncated)"
+				}
+				logger.Debug().Str("rldp", msg).Msg("rldp diagnostic")
+			}
 		}
 	}
 
@@ -185,6 +199,15 @@ func New(opts Options) (*Node, error) {
 	}
 
 	gateway := adnl.NewGateway(priv)
+	localPub := priv.Public().(ed25519.PublicKey)
+	localIDRaw, err := tl.Hash(keys.PublicKeyED25519{Key: localPub})
+	if err != nil {
+		return nil, fmt.Errorf("compute local ADNL id: %w", err)
+	}
+	localID, err := NewPeerID(localIDRaw)
+	if err != nil {
+		return nil, fmt.Errorf("parse local ADNL id: %w", err)
+	}
 
 	peerStorage := opts.PeerServingStorage
 	storage := opts.Storage
@@ -207,6 +230,7 @@ func New(opts Options) (*Node, error) {
 		externalIP:                append(net.IP(nil), opts.ExternalIP...),
 		externalPort:              opts.ExternalPort,
 		privKey:                   priv,
+		localID:                   localID,
 		dhtPrivKey:                dhtPriv,
 		gateway:                   gateway,
 		dhtListenAddr:             opts.DHTListenAddr,
@@ -214,6 +238,7 @@ func New(opts Options) (*Node, error) {
 		events:                    make(chan BroadcastEvent, broadcastEventBuffer),
 		eventQueue:                newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
 		deduper:                   newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		customFanoutDeduper:       newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
 		myExternalMessages:        newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		processedExternalMessages: newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		externalMessageLimiter:    extmsg.NewDefaultAddressLimiter(),
@@ -231,7 +256,7 @@ func New(opts Options) (*Node, error) {
 		syncLag:                   opts.SyncLag,
 		signatureVerifier:         opts.SignatureVerifier,
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
-		shardBroadcastWaiters:     map[string][]chan struct{}{},
+		shardBroadcastWaiters:     map[storage2.BlockRootHash][]chan struct{}{},
 		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastThrottleLast:   map[string]time.Time{},
 		rebroadcastFECSlots:       newRebroadcastFECSlotLimits(),
@@ -241,14 +266,26 @@ func New(opts Options) (*Node, error) {
 		fecReceiverLast:           map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
 		fecReceiverTotals:         map[string]fecReceiverCounterSnapshot{},
 		stateFilesDir:             stateFilesDir,
-		downloadPeerLeases:        map[string]int{},
+		downloadPeerLeases:        map[PeerID]int{},
 		stateCellImportSlot:       make(chan struct{}, 1),
 		stateSplitPartDecodeSlot:  make(chan struct{}, 1),
+		customOverlays:            append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
 	}, nil
+}
+
+func protocolDiagnosticLoggable(msg string) bool {
+	return strings.Contains(msg, "error") ||
+		strings.Contains(msg, "failed") ||
+		strings.Contains(msg, "invalid") ||
+		strings.Contains(msg, "too big")
 }
 
 func (n *Node) SetBroadcastSignatureVerifier(verifier BroadcastSignatureVerifier) {
 	n.signatureVerifier = verifier
+}
+
+func (n *Node) LocalID() PeerID {
+	return n.localID
 }
 
 func prepareStateFilesDir(dir string) (string, error) {
@@ -308,6 +345,17 @@ func (n *Node) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	customSpecs, err := buildCustomOverlaySpecs(n.zeroStateFileHash, n.customOverlays, n.localID)
+	if err != nil {
+		return err
+	}
+	if len(n.customOverlays) > 0 {
+		n.log.Info().
+			Int("configured", len(n.customOverlays)).
+			Int("local", len(customSpecs)).
+			Msg("loaded custom overlay config")
+	}
+	specs = append(specs, customSpecs...)
 	for _, spec := range specs {
 		n.getOrCreateSubscription(spec)
 	}
@@ -369,6 +417,7 @@ func (n *Node) startSubscription(sub *overlaySubscription) {
 		return
 	}
 
+	sub.startCustomTwoStepRebroadcastWorker(ctx)
 	n.runAsync(func() {
 		defer sub.clearRunCancel(token)
 		sub.run(ctx)
@@ -777,22 +826,21 @@ func (n *Node) startDHTClient(cfg *liteclient.GlobalConfig) error {
 type peerPool struct {
 	gateway *adnl.Gateway
 	mx      sync.RWMutex
-	peers   map[string]*pooledPeer
+	peers   map[PeerID]*pooledPeer
 }
 
 type pooledPeer struct {
-	id      string
-	shortID []byte
-	addr    string
-	pub     ed25519.PublicKey
-	adnl    *overlay.ADNLWrapper
-	rldp    *overlay.RLDPWrapper
+	id   PeerID
+	addr string
+	pub  ed25519.PublicKey
+	adnl *overlay.ADNLWrapper
+	rldp *overlay.RLDPWrapper
 }
 
 func newPeerPool(gateway *adnl.Gateway) *peerPool {
 	return &peerPool{
 		gateway: gateway,
-		peers:   map[string]*pooledPeer{},
+		peers:   map[PeerID]*pooledPeer{},
 	}
 }
 
@@ -809,8 +857,10 @@ func (p *peerPool) Get(addr string, key ed25519.PublicKey) (*pooledPeer, error) 
 }
 
 func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
-	peerID := peer.GetID()
-	id := hex.EncodeToString(peerID)
+	id, err := NewPeerID(peer.GetID())
+	if err != nil {
+		return nil, false, err
+	}
 
 	p.mx.Lock()
 	defer p.mx.Unlock()
@@ -820,15 +870,16 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	}
 
 	wrapper := overlay.CreateExtendedADNL(peer)
-	rldpClient := overlay.CreateExtendedRLDP(rldp.NewClientV2(wrapper))
+	baseRLDP := rldp.NewClientV2(wrapper)
+	baseRLDP.SetMaxUnexpectedTransferSize(maxRLDPTwoStepTransferSize)
+	rldpClient := overlay.CreateExtendedRLDP(baseRLDP)
 
 	pooled := &pooledPeer{
-		id:      id,
-		shortID: append([]byte(nil), peerID...),
-		addr:    peer.RemoteAddr(),
-		pub:     append(ed25519.PublicKey(nil), peer.GetPubKey()...),
-		adnl:    wrapper,
-		rldp:    rldpClient,
+		id:   id,
+		addr: peer.RemoteAddr(),
+		pub:  append(ed25519.PublicKey(nil), peer.GetPubKey()...),
+		adnl: wrapper,
+		rldp: rldpClient,
 	}
 	rldpClient.SetOnDisconnect(func() {
 		p.mx.Lock()
@@ -988,13 +1039,110 @@ func buildOverlaySpec(zeroStateFileHash []byte, workchain int32, shard int64, na
 
 	return overlaySpec{
 		Name:              name,
+		Kind:              overlayKindPublicShard,
 		Workchain:         workchain,
 		Shard:             shard,
 		FullID:            fullID,
 		ShortID:           shortID,
 		ProtoVersionMajor: protoMajor,
 		ProtoVersionMinor: protoMinor,
+		Announce:          true,
+		DHTDiscovery:      true,
+		RandomPeers:       true,
+		QueryCapabilities: true,
 	}, nil
+}
+
+func buildCustomOverlaySpecs(zeroStateFileHash []byte, overlays []CustomOverlayConfig, localID PeerID) ([]overlaySpec, error) {
+	if len(overlays) == 0 {
+		return nil, nil
+	}
+
+	specs := make([]overlaySpec, 0, len(overlays))
+	for _, cfg := range overlays {
+		spec, localMember, err := buildCustomOverlaySpec(zeroStateFileHash, cfg, localID)
+		if err != nil {
+			return nil, err
+		}
+		if !localMember {
+			continue
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
+func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, localID PeerID) (overlaySpec, bool, error) {
+	nodes := make([][]byte, 0, len(cfg.Nodes))
+	fixedNodes := make([]PeerID, 0, len(cfg.Nodes))
+	fixedIDs := make(map[PeerID]struct{}, len(cfg.Nodes))
+	msgSenders := map[PeerID]int{}
+	blockSenders := map[PeerID]struct{}{}
+	authorizedKeys := map[string]uint32{}
+
+	for _, node := range cfg.Nodes {
+		if node.ADNLID.IsZero() {
+			return overlaySpec{}, false, fmt.Errorf("custom overlay %q has empty adnl_id", cfg.Name)
+		}
+		id := node.ADNLID.Bytes()
+		if _, ok := fixedIDs[node.ADNLID]; !ok {
+			nodes = append(nodes, id)
+			fixedNodes = append(fixedNodes, node.ADNLID)
+			fixedIDs[node.ADNLID] = struct{}{}
+		}
+		if node.MsgSender {
+			msgSenders[node.ADNLID] = node.MsgSenderPriority
+			authorizedKeys[string(id)] = maxOverlayPayloadSize
+		}
+		if node.BlockSender {
+			blockSenders[node.ADNLID] = struct{}{}
+			authorizedKeys[string(id)] = maxOverlayPayloadSize
+		}
+	}
+	if len(nodes) == 0 {
+		return overlaySpec{}, false, fmt.Errorf("custom overlay %q has no nodes", cfg.Name)
+	}
+
+	sort.Slice(nodes, func(i, j int) bool {
+		return bytes.Compare(nodes[i], nodes[j]) < 0
+	})
+
+	fullID, err := tl.Hash(tonnodeapi.CustomOverlayID{
+		ZeroStateFileHash: zeroStateFileHash,
+		Name:              cfg.Name,
+		Nodes:             nodes,
+	})
+	if err != nil {
+		return overlaySpec{}, false, fmt.Errorf("build custom overlay %q id: %w", cfg.Name, err)
+	}
+
+	shortID, err := tl.Hash(keys.PublicKeyOverlay{Key: fullID})
+	if err != nil {
+		return overlaySpec{}, false, fmt.Errorf("build custom overlay %q short id: %w", cfg.Name, err)
+	}
+
+	_, localMember := fixedIDs[localID]
+	return overlaySpec{
+		Name:              "custom." + cfg.Name,
+		Kind:              overlayKindCustomFixed,
+		Workchain:         0,
+		Shard:             topShard,
+		FullID:            fullID,
+		ShortID:           shortID,
+		ProtoVersionMajor: shardchainProtoVersionMajor,
+		ProtoVersionMinor: shardchainProtoVersionMinor,
+		FixedNodes:        fixedNodes,
+		FixedNodeIDs:      fixedIDs,
+		MsgSenders:        msgSenders,
+		BlockSenders:      blockSenders,
+		AuthorizedKeys:    authorizedKeys,
+		SenderShards:      append([]CustomOverlayShard(nil), cfg.SenderShards...),
+		SkipPublicMsgSend: cfg.SkipPublicMsgSend,
+		Announce:          false,
+		DHTDiscovery:      false,
+		RandomPeers:       false,
+		QueryCapabilities: false,
+	}, localMember, nil
 }
 
 func overlaySpecKey(spec overlaySpec) string {
@@ -1014,7 +1162,7 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 		node:         n,
 		spec:         spec,
 		log:          n.log.With().Str("overlay", spec.Name).Logger(),
-		peers:        map[string]*overlayPeer{},
+		peers:        map[PeerID]*overlayPeer{},
 		archivePeers: map[string]*archivePeerState{},
 		peerNotify:   make(chan struct{}, 1),
 	}
@@ -1079,6 +1227,9 @@ func (n *Node) SetActiveShardOverlays(blocks []ton.BlockIDExt) error {
 	deleteAt := time.Now().Add(inactiveShardOverlayTTL)
 	for _, entry := range n.subscriptionEntriesSnapshot() {
 		if _, ok := active[entry.key]; ok {
+			continue
+		}
+		if entry.sub.spec.Kind != overlayKindPublicShard {
 			continue
 		}
 		if entry.sub.spec.Workchain == -1 && entry.sub.spec.Shard == topShard {

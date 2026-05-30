@@ -8,6 +8,8 @@ import (
 
 type liveBlockPublisher interface {
 	PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error
+	NonfinalBlockCacheEnabled() bool
+	PublishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) error
 	MarkLiveBlockFlushed(block ton.BlockIDExt)
 }
 
@@ -53,15 +55,11 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 		}
 	}
 
-	var meta *storage.BlockMeta
-	if downloaded.Meta != nil {
-		meta = downloaded.Meta.Clone()
-	}
 	if err := cache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:            downloaded.ID,
 		Root:             downloaded.BlockRoot,
 		BlockData:        blockData,
-		Meta:             meta,
+		Meta:             downloaded.Meta,
 		State:            state,
 		Proofs:           proofs,
 		BlockDataFlushed: cacheFlushed,

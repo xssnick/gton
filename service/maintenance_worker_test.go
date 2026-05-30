@@ -1,6 +1,32 @@
 package service
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/rs/zerolog"
+)
+
+func TestServiceNewKeepsZeroTTLs(t *testing.T) {
+	svc := New(zerolog.Nop(), nil, nil, nil, nil, Options{})
+
+	if svc.stateTTL != 0 {
+		t.Fatalf("state ttl = %s, want 0", svc.stateTTL)
+	}
+	if svc.archiveTTL != 0 {
+		t.Fatalf("archive ttl = %s, want 0", svc.archiveTTL)
+	}
+	if svc.disableArchiveBackfill {
+		t.Fatal("archive backfill should be enabled by default")
+	}
+}
+
+func TestServiceNewStoresArchiveBackfillDisable(t *testing.T) {
+	svc := New(zerolog.Nop(), nil, nil, nil, nil, Options{DisableArchiveBackfill: true})
+
+	if !svc.disableArchiveBackfill {
+		t.Fatal("archive backfill disable flag was not stored")
+	}
+}
 
 func TestNextServiceMaintenanceTaskPriority(t *testing.T) {
 	tests := []struct {

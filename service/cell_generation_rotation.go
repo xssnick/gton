@@ -1002,7 +1002,7 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store cell
 		return fmt.Errorf("durable current state %s is before candidate current state %s", storage.FormatBlockRef(target.Masterchain.Block), storage.FormatBlockRef(candidate.current.Masterchain.Block))
 	}
 
-	shardCache := map[string]*storage.BlockState{}
+	shardCache := map[storage.BlockRootHash]*storage.BlockState{}
 	resolver := s.newCellGenerationShardResolver(ctx, store, candidate, shardCache)
 	processed := uint32(0)
 	started := time.Now()
@@ -1133,7 +1133,7 @@ func (s *Service) logCellGenerationCandidateCatchUpProgress(
 	event.Msg("cell generation migration catch-up progress")
 }
 
-func (s *Service) newCellGenerationShardResolver(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, cache map[string]*storage.BlockState) *shardStateResolver {
+func (s *Service) newCellGenerationShardResolver(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, cache map[storage.BlockRootHash]*storage.BlockState) *shardStateResolver {
 	return newShardStateResolver(ctx, shardStateResolverConfig{
 		current: candidate.current.Shards,
 		cache:   cache,

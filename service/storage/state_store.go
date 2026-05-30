@@ -3,7 +3,6 @@ package storage
 import (
 	"bytes"
 	"context"
-	"fmt"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -37,6 +36,8 @@ type StateStorage interface {
 	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, cells StateCellRecords, current *CurrentState) error
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
 }
+
+type BlockRootHash [32]byte
 
 func CloneCurrentState(state *CurrentState) *CurrentState {
 	if state == nil {
@@ -93,13 +94,8 @@ func cloneBlockIDPtr(block *ton.BlockIDExt) *ton.BlockIDExt {
 	return &cloned
 }
 
-func BlockKey(block ton.BlockIDExt) string {
-	return fmt.Sprintf(
-		"%d:%016x:%d:%x:%x",
-		block.Workchain,
-		uint64(block.Shard),
-		block.SeqNo,
-		block.RootHash,
-		block.FileHash,
-	)
+func BlockKey(block ton.BlockIDExt) BlockRootHash {
+	var key BlockRootHash
+	copy(key[:], block.RootHash)
+	return key
 }

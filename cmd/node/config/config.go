@@ -21,12 +21,18 @@ const (
 	DefaultGlobalConfigPath                = "global.config.json"
 	DefaultGlobalConfigURL                 = "https://ton-blockchain.github.io/global.config.json"
 	DefaultSyncBefore                      = time.Hour
-	DefaultStateTTL                        = 3 * 24 * time.Hour
+	DefaultStateTTL                        = 2 * 24 * time.Hour
 	DefaultArchiveTTL                      = 7 * 24 * time.Hour
-	DefaultNextCheckpointBlocks            = int64(300)
+	DefaultNextCheckpointBlocks            = int64(200)
 	DefaultArchiveCheckpointBlocks         = int64(2000)
-	DefaultCheckpointBytes                 = int64(512 << 20)
+	DefaultCheckpointBytes                 = int64(256 << 20)
+	DefaultSyncBackpressureWindows         = int64(4)
 	DefaultCellTotalCache                  = int64(8 << 30)
+	DefaultDecodedCellCacheEnabled         = true
+	DefaultDecodedCellCacheShards          = int64(64)
+	DefaultDecodedCellCacheBytesPerEntry   = int64(16 << 10)
+	DefaultDecodedCellCacheMinEntries      = int64(64 << 10)
+	DefaultDecodedCellCacheMaxEntries      = int64(1 << 20)
 	DefaultCellShardMemTable               = int64(256 << 20)
 	DefaultCellMemTableStopWritesThreshold = int64(4)
 	DefaultArtifactFileMaxOpen             = int64(512)
@@ -47,23 +53,27 @@ const (
 var ErrConfigMissingWithExistingStorage = errors.New("config file is missing while storage metadata exists")
 
 type Config struct {
-	TON                       TON     `json:"ton"`
-	ADNL                      ADNL    `json:"adnl"`
-	DHT                       DHT     `json:"dht"`
-	Lite                      Lite    `json:"liteserver"`
-	Storage                   Storage `json:"storage"`
-	Metrics                   Metrics `json:"metrics"`
-	DisableStateSerialization bool    `json:"disable_state_serialization"`
+	TON                       TON             `json:"ton"`
+	ADNL                      ADNL            `json:"adnl"`
+	DHT                       DHT             `json:"dht"`
+	Lite                      Lite            `json:"liteserver"`
+	Storage                   Storage         `json:"storage"`
+	Metrics                   Metrics         `json:"metrics"`
+	CustomOverlays            []CustomOverlay `json:"custom_overlays"`
+	DisableStateSerialization bool            `json:"disable_state_serialization"`
 }
 
 type TON struct {
-	GlobalConfigPath        string `json:"global_config_path"`
-	SyncBefore              int64  `json:"sync_before"`
-	StateTTL                int64  `json:"state_ttl"`
-	ArchiveTTL              int64  `json:"archive_ttl"`
-	NextCheckpointBlocks    int64  `json:"next_checkpoint_blocks"`
-	ArchiveCheckpointBlocks int64  `json:"archive_checkpoint_blocks"`
-	CheckpointBytes         int64  `json:"checkpoint_bytes"`
+	GlobalConfigPath       string `json:"global_config_path"`
+	SyncBefore             int64  `json:"sync_before"`
+	StateTTL               int64  `json:"state_ttl"`
+	ArchiveTTL             int64  `json:"archive_ttl"`
+	DisableArchiveBackfill bool   `json:"disable_archive_backfill"`
+
+	NextCheckpointBlocks    int64 `json:"next_checkpoint_blocks"`
+	ArchiveCheckpointBlocks int64 `json:"archive_checkpoint_blocks"`
+	CheckpointBytes         int64 `json:"checkpoint_bytes"`
+	SyncBackpressureWindows int64 `json:"sync_backpressure_windows"`
 }
 
 type ADNL struct {
@@ -79,6 +89,7 @@ type DHT struct {
 
 type Lite struct {
 	Enabled          bool   `json:"enabled"`
+	NonFinalEnabled  bool   `json:"non_final_enabled"`
 	Key              []byte `json:"key"`
 	ListenAddr       string `json:"listen_addr"`
 	MasterBlockCache int    `json:"master_block_cache"`
@@ -88,15 +99,47 @@ type Lite struct {
 type Storage struct {
 	Dir                             string `json:"dir"`
 	CellTotalCacheSize              int64  `json:"cell_total_cache_size"`
+	DecodedCellCacheEnabled         bool   `json:"decoded_cell_cache_enabled"`
+	DecodedCellCacheShards          int64  `json:"decoded_cell_cache_shards"`
+	DecodedCellCacheBytesPerEntry   int64  `json:"decoded_cell_cache_bytes_per_entry"`
+	DecodedCellCacheMinEntries      int64  `json:"decoded_cell_cache_min_entries"`
+	DecodedCellCacheMaxEntries      int64  `json:"decoded_cell_cache_max_entries"`
 	CellShardMemTableSize           int64  `json:"cell_shard_memtable_size"`
 	CellMemTableStopWritesThreshold int64  `json:"cell_memtable_stop_writes_threshold"`
 	ArtifactFileMaxOpen             int64  `json:"artifact_file_max_open"`
+}
+
+type DecodedCellCacheOptions struct {
+	Enabled       bool
+	Shards        int
+	BytesPerEntry int64
+	MinEntries    int
+	MaxEntries    int
 }
 
 type Metrics struct {
 	Enabled    bool   `json:"enabled"`
 	ListenAddr string `json:"listen_addr"`
 	Namespace  string `json:"namespace"`
+}
+
+type CustomOverlay struct {
+	Name              string               `json:"name"`
+	Nodes             []CustomOverlayNode  `json:"nodes"`
+	SenderShards      []CustomOverlayShard `json:"sender_shards"`
+	SkipPublicMsgSend bool                 `json:"skip_public_msg_send"`
+}
+
+type CustomOverlayNode struct {
+	ADNLID            []byte `json:"adnl_id"`
+	MsgSender         bool   `json:"msg_sender"`
+	MsgSenderPriority int    `json:"msg_sender_priority"`
+	BlockSender       bool   `json:"block_sender"`
+}
+
+type CustomOverlayShard struct {
+	Workchain int32 `json:"workchain"`
+	Shard     int64 `json:"shard"`
 }
 
 func defaultConfig() Config {
@@ -109,6 +152,7 @@ func defaultConfig() Config {
 			NextCheckpointBlocks:    DefaultNextCheckpointBlocks,
 			ArchiveCheckpointBlocks: DefaultArchiveCheckpointBlocks,
 			CheckpointBytes:         DefaultCheckpointBytes,
+			SyncBackpressureWindows: DefaultSyncBackpressureWindows,
 		},
 		Lite: Lite{
 			MasterBlockCache: DefaultLiteMasterBlockCache,
@@ -116,6 +160,11 @@ func defaultConfig() Config {
 		},
 		Storage: Storage{
 			CellTotalCacheSize:              DefaultCellTotalCache,
+			DecodedCellCacheEnabled:         DefaultDecodedCellCacheEnabled,
+			DecodedCellCacheShards:          DefaultDecodedCellCacheShards,
+			DecodedCellCacheBytesPerEntry:   DefaultDecodedCellCacheBytesPerEntry,
+			DecodedCellCacheMinEntries:      DefaultDecodedCellCacheMinEntries,
+			DecodedCellCacheMaxEntries:      DefaultDecodedCellCacheMaxEntries,
 			CellShardMemTableSize:           DefaultCellShardMemTable,
 			CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
 			ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
@@ -123,6 +172,7 @@ func defaultConfig() Config {
 		Metrics: Metrics{
 			Namespace: DefaultMetricsNamespace,
 		},
+		CustomOverlays: []CustomOverlay{},
 	}
 }
 
@@ -162,6 +212,7 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	cfg.TON.NextCheckpointBlocks = DefaultNextCheckpointBlocks
 	cfg.TON.ArchiveCheckpointBlocks = DefaultArchiveCheckpointBlocks
 	cfg.TON.CheckpointBytes = DefaultCheckpointBytes
+	cfg.TON.SyncBackpressureWindows = DefaultSyncBackpressureWindows
 	cfg.ADNL = ADNL{
 		Key:          adnlSeed,
 		ListenAddr:   defaultADNLListen,
@@ -181,6 +232,11 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	cfg.Storage = Storage{
 		Dir:                             storageDir,
 		CellTotalCacheSize:              DefaultCellTotalCache,
+		DecodedCellCacheEnabled:         DefaultDecodedCellCacheEnabled,
+		DecodedCellCacheShards:          DefaultDecodedCellCacheShards,
+		DecodedCellCacheBytesPerEntry:   DefaultDecodedCellCacheBytesPerEntry,
+		DecodedCellCacheMinEntries:      DefaultDecodedCellCacheMinEntries,
+		DecodedCellCacheMaxEntries:      DefaultDecodedCellCacheMaxEntries,
 		CellShardMemTableSize:           DefaultCellShardMemTable,
 		CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
 		ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
@@ -271,6 +327,53 @@ func (cfg Config) CellTotalCacheSize() (int64, error) {
 	return cfg.Storage.CellTotalCacheSize, nil
 }
 
+func (cfg Config) DecodedCellCacheOptions() (DecodedCellCacheOptions, error) {
+	opts := DecodedCellCacheOptions{
+		Enabled:       cfg.Storage.DecodedCellCacheEnabled,
+		BytesPerEntry: cfg.Storage.DecodedCellCacheBytesPerEntry,
+	}
+	if cfg.Storage.DecodedCellCacheShards < 0 {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards cannot be negative")
+	}
+	if cfg.Storage.DecodedCellCacheBytesPerEntry < 0 {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_bytes_per_entry cannot be negative")
+	}
+	if cfg.Storage.DecodedCellCacheMinEntries < 0 {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot be negative")
+	}
+	if cfg.Storage.DecodedCellCacheMaxEntries < 0 {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries cannot be negative")
+	}
+	if cfg.Storage.DecodedCellCacheMinEntries > int64(int(^uint(0)>>1)) {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries is too large")
+	}
+	if cfg.Storage.DecodedCellCacheMaxEntries > int64(int(^uint(0)>>1)) {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries is too large")
+	}
+	if cfg.Storage.DecodedCellCacheShards > int64(int(^uint(0)>>1)) {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards is too large")
+	}
+	opts.Shards = int(cfg.Storage.DecodedCellCacheShards)
+	opts.MinEntries = int(cfg.Storage.DecodedCellCacheMinEntries)
+	opts.MaxEntries = int(cfg.Storage.DecodedCellCacheMaxEntries)
+	if opts.Shards == 0 {
+		opts.Shards = int(DefaultDecodedCellCacheShards)
+	}
+	if opts.BytesPerEntry == 0 {
+		opts.BytesPerEntry = DefaultDecodedCellCacheBytesPerEntry
+	}
+	if opts.MinEntries == 0 {
+		opts.MinEntries = int(DefaultDecodedCellCacheMinEntries)
+	}
+	if opts.MaxEntries == 0 {
+		opts.MaxEntries = int(DefaultDecodedCellCacheMaxEntries)
+	}
+	if opts.MinEntries > opts.MaxEntries {
+		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot exceed storage.decoded_cell_cache_max_entries")
+	}
+	return opts, nil
+}
+
 func (cfg Config) CellShardMemTableSize() (int, error) {
 	if cfg.Storage.CellShardMemTableSize < 0 {
 		return 0, fmt.Errorf("storage.cell_shard_memtable_size cannot be negative")
@@ -336,8 +439,8 @@ func (cfg Config) SyncBefore() (time.Duration, error) {
 }
 
 func (cfg Config) StateTTL() (time.Duration, error) {
-	if cfg.TON.StateTTL <= 0 {
-		return 0, fmt.Errorf("ton.state_ttl should be positive seconds")
+	if cfg.TON.StateTTL < 0 {
+		return 0, fmt.Errorf("ton.state_ttl cannot be negative")
 	}
 	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
 	if cfg.TON.StateTTL > maxDurationSeconds {
@@ -347,8 +450,8 @@ func (cfg Config) StateTTL() (time.Duration, error) {
 }
 
 func (cfg Config) ArchiveTTL() (time.Duration, error) {
-	if cfg.TON.ArchiveTTL <= 0 {
-		return 0, fmt.Errorf("ton.archive_ttl should be positive seconds")
+	if cfg.TON.ArchiveTTL < 0 {
+		return 0, fmt.Errorf("ton.archive_ttl cannot be negative")
 	}
 	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
 	if cfg.TON.ArchiveTTL > maxDurationSeconds {
@@ -373,6 +476,10 @@ func (cfg Config) CheckpointBytes() (uint64, error) {
 		return uint64(DefaultCheckpointBytes), nil
 	}
 	return uint64(cfg.TON.CheckpointBytes), nil
+}
+
+func (cfg Config) SyncBackpressureWindows() (uint32, error) {
+	return uint32ConfigValue("ton.sync_backpressure_windows", cfg.TON.SyncBackpressureWindows, uint32(DefaultSyncBackpressureWindows))
 }
 
 func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, error) {

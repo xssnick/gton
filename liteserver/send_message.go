@@ -29,22 +29,22 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 		return err
 	}
 
-	stateRoot, err := s.loadStateRoot(ctx, state.Block)
+	stateFragments, err := s.blockFragments(ctx, state.Block)
 	if err != nil {
 		return err
 	}
 
-	masterRoot, err := s.loadStateRoot(ctx, current.Masterchain.Block)
-	if err != nil {
-		return err
+	masterFragments := stateFragments
+	if !blockIDEqual(state.Block, current.Masterchain.Block) {
+		masterFragments, err = s.blockFragments(ctx, current.Masterchain.Block)
+		if err != nil {
+			return err
+		}
 	}
 
-	header, err := runMethodShardStateHeader(stateRoot)
-	if err != nil {
-		return fmt.Errorf("cannot unpack shard state header: %w", err)
-	}
+	header := stateFragments.shardHeader
 
-	shardAccount, err := shardAccountForExternalMessage(stateRoot, msg.DstAddr)
+	shardAccount, err := shardAccountFromAccountsRoot(stateFragments.accountsRoot, msg.DstAddr)
 	if err != nil {
 		return err
 	}
@@ -54,7 +54,7 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 		return err
 	}
 
-	config, err := runMethodConfig(current.Masterchain.Block, masterRoot, header.GenUTime, accountCode)
+	config, err := masterFragments.runMethodConfig(header.GenUTime, accountCode)
 	if err != nil {
 		return err
 	}
@@ -62,13 +62,18 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 		return err
 	}
 
-	libraries, err := runMethodLibraries(masterRoot, accountLibraries)
+	libraries, err := masterFragments.runMethodLibraries(accountLibraries)
 	if err != nil {
 		return err
 	}
 
 	unpacked, _ := config.Unpacked.(tuple.Tuple)
-	result, err := s.tvm.EmulateTransaction(shardAccount, msgCell, tvm.TransactionEmulationConfig{
+	machine, err := s.tvm.WithGlobalVersion(config.GlobalVersion)
+	if err != nil {
+		return err
+	}
+
+	result, err := machine.EmulateTransaction(shardAccount, msgCell, tvm.TransactionEmulationConfig{
 		Address:             msg.DstAddr,
 		Now:                 header.GenUTime,
 		BlockLT:             int64(header.GenLT),
@@ -217,7 +222,15 @@ func shardAccountForExternalMessage(stateRoot *cell.Cell, addr *address.Address)
 		return nil, err
 	}
 
-	value, err := dictRoot.AsDict(256).LoadValue(accountKey(addr.Data()))
+	return shardAccountFromAccountsRoot(dictRoot, addr)
+}
+
+func shardAccountFromAccountsRoot(accountsRoot *cell.Cell, addr *address.Address) (*tlb.ShardAccount, error) {
+	if accountsRoot == nil {
+		return emptyShardAccount(), nil
+	}
+
+	value, err := accountsRoot.AsDict(256).LoadValue(accountKey(addr.Data()))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		return emptyShardAccount(), nil
 	}

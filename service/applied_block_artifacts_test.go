@@ -200,9 +200,9 @@ func TestAppliedBlockArtifactWriterBackpressuresQueuedJobs(t *testing.T) {
 type appliedBlockArtifactTestStore struct {
 	mu sync.Mutex
 
-	blocks map[string][]byte
-	proofs map[string][]byte
-	next   map[string]ton.BlockIDExt
+	blocks map[storage.BlockRootHash][]byte
+	proofs map[appliedBlockArtifactProofKey][]byte
+	next   map[storage.BlockRootHash]ton.BlockIDExt
 
 	saveStartedOnce sync.Once
 	saveStarted     chan struct{}
@@ -214,10 +214,15 @@ type appliedBlockArtifactTestStore struct {
 
 func newAppliedBlockArtifactTestStore() *appliedBlockArtifactTestStore {
 	return &appliedBlockArtifactTestStore{
-		blocks: map[string][]byte{},
-		proofs: map[string][]byte{},
-		next:   map[string]ton.BlockIDExt{},
+		blocks: map[storage.BlockRootHash][]byte{},
+		proofs: map[appliedBlockArtifactProofKey][]byte{},
+		next:   map[storage.BlockRootHash]ton.BlockIDExt{},
 	}
+}
+
+type appliedBlockArtifactProofKey struct {
+	kind  storage.ServedProofKind
+	block storage.BlockRootHash
 }
 
 func (s *appliedBlockArtifactTestStore) SaveBlockFull(block *storage.ServedBlockFull) error {
@@ -308,20 +313,20 @@ func (s *appliedBlockArtifactTestStore) saveCount() int {
 	return s.saves
 }
 
-func (s *appliedBlockArtifactTestStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) string {
-	return string(kind) + ":" + storage.BlockKey(block)
+func (s *appliedBlockArtifactTestStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) appliedBlockArtifactProofKey {
+	return appliedBlockArtifactProofKey{kind: kind, block: storage.BlockKey(block)}
 }
 
 type appliedBlockArtifactTestFlusher struct {
 	mu      sync.Mutex
-	flushed map[string]struct{}
+	flushed map[storage.BlockRootHash]struct{}
 }
 
 func (f *appliedBlockArtifactTestFlusher) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.flushed == nil {
-		f.flushed = map[string]struct{}{}
+		f.flushed = map[storage.BlockRootHash]struct{}{}
 	}
 	f.flushed[storage.BlockKey(block)] = struct{}{}
 }

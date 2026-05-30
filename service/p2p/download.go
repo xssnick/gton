@@ -36,18 +36,18 @@ const (
 )
 
 type ProbeNextBlockFullOptions struct {
-	PeerLimit        int
-	StagedPeerLimit  int
-	StageDelay       time.Duration
-	PreferredPeerKey string
-	LiveTail         bool
+	PeerLimit       int
+	StagedPeerLimit int
+	StageDelay      time.Duration
+	PreferredPeerID PeerID
+	LiveTail        bool
 }
 
 type ProbeBlockFullOptions struct {
 	PeerLimit            int
 	StagedPeerLimit      int
 	StageDelay           time.Duration
-	PreferredPeerKey     string
+	PreferredPeerID      PeerID
 	BroadcastPreferDelay time.Duration
 }
 
@@ -469,7 +469,7 @@ func (s *overlaySubscription) downloadFull(ctx context.Context, block ton.BlockI
 
 func (s *overlaySubscription) probeBlockFull(ctx context.Context, block ton.BlockIDExt, opts ProbeBlockFullOptions) (*DownloadedBlock, error) {
 	peers := s.chainBlockDownloadCandidates(block)
-	peers = preferDownloadPeer(peers, opts.PreferredPeerKey)
+	peers = preferDownloadPeer(peers, opts.PreferredPeerID)
 	if len(peers) == 0 {
 		return nil, errors.New("overlay has no connected peers")
 	}
@@ -531,10 +531,10 @@ func (s *overlaySubscription) downloadNextFull(ctx context.Context, prev ton.Blo
 func (s *overlaySubscription) probeNextFull(ctx context.Context, prev ton.BlockIDExt, opts ProbeNextBlockFullOptions) (*DownloadedBlock, error) {
 	var peers []*overlayPeer
 	if opts.LiveTail && isMasterchainBlock(prev) {
-		peers = s.liveNextBlockDownloadCandidates(prev, opts.PreferredPeerKey)
+		peers = s.liveNextBlockDownloadCandidates(prev, opts.PreferredPeerID)
 	} else {
 		peers = s.chainBlockDownloadCandidates(prev)
-		peers = preferDownloadPeer(peers, opts.PreferredPeerKey)
+		peers = preferDownloadPeer(peers, opts.PreferredPeerID)
 	}
 	if len(peers) == 0 {
 		return nil, errors.New("overlay has no connected peers")
@@ -583,13 +583,13 @@ func (s *overlaySubscription) probeNextFull(ctx context.Context, prev ton.BlockI
 	})
 }
 
-func preferDownloadPeer(peers []*overlayPeer, preferredKey string) []*overlayPeer {
-	if preferredKey == "" || len(peers) < 2 {
+func preferDownloadPeer(peers []*overlayPeer, preferredPeerID PeerID) []*overlayPeer {
+	if preferredPeerID.IsZero() || len(peers) < 2 {
 		return peers
 	}
 
 	for idx, peer := range peers {
-		if downloadPeerKey(peer) != preferredKey {
+		if peer == nil || peer.id != preferredPeerID {
 			continue
 		}
 
@@ -758,14 +758,14 @@ func (s *overlaySubscription) chainBlockDownloadCandidates(block ton.BlockIDExt)
 	return moveDownloadPeerFirst(peers, sticky)
 }
 
-func (s *overlaySubscription) liveNextBlockDownloadCandidates(block ton.BlockIDExt, preferredPeerKey string) []*overlayPeer {
+func (s *overlaySubscription) liveNextBlockDownloadCandidates(block ton.BlockIDExt, preferredPeerID PeerID) []*overlayPeer {
 	peers := s.blockDownloadCandidates()
 	if len(peers) == 0 {
 		return peers
 	}
 
 	now := time.Now()
-	peers = s.prioritizeLiveNextPeers(peers, preferredPeerKey, now)
+	peers = s.prioritizeLiveNextPeers(peers, preferredPeerID, now)
 	if isMasterchainBlock(block) {
 		return peers
 	}
@@ -774,7 +774,7 @@ func (s *overlaySubscription) liveNextBlockDownloadCandidates(block ton.BlockIDE
 	if sticky == nil {
 		return peers
 	}
-	if preferredPeerKey != "" && downloadPeerKey(sticky) != preferredPeerKey && downloadPeerKey(peers[0]) == preferredPeerKey {
+	if !preferredPeerID.IsZero() && sticky.id != preferredPeerID && peers[0].id == preferredPeerID {
 		return peers
 	}
 	return moveDownloadPeerFirst(peers, sticky)
@@ -785,11 +785,11 @@ func moveDownloadPeerFirst(peers []*overlayPeer, first *overlayPeer) []*overlayP
 		return peers
 	}
 
-	firstKey := downloadPeerKey(first)
+	firstID := first.id
 	ordered := make([]*overlayPeer, 0, len(peers))
 	ordered = append(ordered, first)
 	for _, peer := range peers {
-		if downloadPeerKey(peer) != firstKey {
+		if peer.id != firstID {
 			ordered = append(ordered, peer)
 		}
 	}
@@ -820,13 +820,13 @@ func (s *overlaySubscription) currentLiveNextChainBlockPeer(block ton.BlockIDExt
 	if !isMasterchainBlock(block) {
 		return s.currentChainBlockPeer(block, peers)
 	}
-	return s.currentChainBlockPeerFiltered(block, peers, func(peerKey string) bool {
-		state := s.liveNextPeers[peerKey]
+	return s.currentChainBlockPeerFiltered(block, peers, func(peerID PeerID) bool {
+		state := s.liveNextPeers[peerID]
 		return state == nil || !state.unavailableUntil.After(now)
 	})
 }
 
-func (s *overlaySubscription) currentChainBlockPeerFiltered(block ton.BlockIDExt, peers []*overlayPeer, allow func(string) bool) *overlayPeer {
+func (s *overlaySubscription) currentChainBlockPeerFiltered(block ton.BlockIDExt, peers []*overlayPeer, allow func(PeerID) bool) *overlayPeer {
 	if len(peers) == 0 {
 		return nil
 	}
@@ -841,13 +841,13 @@ func (s *overlaySubscription) currentChainBlockPeerFiltered(block ton.BlockIDExt
 		return nil
 	}
 
-	stickyKey := downloadPeerKey(state.peer)
-	if allow != nil && !allow(stickyKey) {
+	stickyID := state.peer.id
+	if stickyID.IsZero() || allow != nil && !allow(stickyID) {
 		s.clearChainBlockPeerLocked(key)
 		return nil
 	}
 	for _, peer := range peers {
-		if downloadPeerKey(peer) != stickyKey {
+		if peer == nil || peer.id != stickyID {
 			continue
 		}
 
@@ -1026,7 +1026,10 @@ func (s *overlaySubscription) noteChainBlockDownloadSuccess(chain ton.BlockIDExt
 		return
 	}
 	speed := float64(bytes) / elapsed.Seconds()
-	winnerKey := downloadPeerKey(peer)
+	winnerID := peer.id
+	if winnerID.IsZero() {
+		return
+	}
 	confirmedAt := time.Now()
 
 	key := chainDownloadKeyFromBlock(chain)
@@ -1042,7 +1045,7 @@ func (s *overlaySubscription) noteChainBlockDownloadSuccess(chain ton.BlockIDExt
 		s.chainDownloads[key] = state
 	}
 
-	if state.peer == nil || downloadPeerKey(state.peer) != downloadPeerKey(peer) {
+	if state.peer == nil || state.peer.id != peer.id {
 		s.log.Debug().
 			Str("chain", key.String()).
 			Str("peer", peer.addr).
@@ -1056,7 +1059,7 @@ func (s *overlaySubscription) noteChainBlockDownloadSuccess(chain ton.BlockIDExt
 		state.speed = state.speed*0.7 + speed*0.3
 	}
 	for missedKey, missed := range state.unavailable {
-		if missedKey == winnerKey || missed.peer == nil || confirmedAt.Sub(missed.at) > blockUnavailableConfirmWindow {
+		if missedKey == winnerID || missed.peer == nil || confirmedAt.Sub(missed.at) > blockUnavailableConfirmWindow {
 			delete(state.unavailable, missedKey)
 			continue
 		}
@@ -1082,8 +1085,8 @@ func (s *overlaySubscription) noteLiveNextDownloadSuccess(chain ton.BlockIDExt, 
 		return
 	}
 
-	key := downloadPeerKey(peer)
-	if key == "" {
+	key := peer.id
+	if key.IsZero() {
 		return
 	}
 
@@ -1091,7 +1094,7 @@ func (s *overlaySubscription) noteLiveNextDownloadSuccess(chain ton.BlockIDExt, 
 	defer s.chainDownloadMx.Unlock()
 
 	if s.liveNextPeers == nil {
-		s.liveNextPeers = map[string]*liveNextPeerState{}
+		s.liveNextPeers = map[PeerID]*liveNextPeerState{}
 	}
 	state := s.liveNextPeers[key]
 	if state == nil {
@@ -1164,7 +1167,7 @@ func (s *overlaySubscription) noteChainBlockDownloadFailure(chain ton.BlockIDExt
 	defer s.chainDownloadMx.Unlock()
 
 	state := s.chainDownloads[key]
-	if state != nil && state.peer != nil && downloadPeerKey(state.peer) == downloadPeerKey(peer) {
+	if state != nil && state.peer != nil && state.peer.id == peer.id {
 		s.log.Debug().
 			Err(err).
 			Str("chain", key.String()).
@@ -1176,8 +1179,8 @@ func (s *overlaySubscription) noteChainBlockDownloadFailure(chain ton.BlockIDExt
 
 func (s *overlaySubscription) noteChainBlockUnavailable(chain ton.BlockIDExt, peer *overlayPeer) {
 	key := chainDownloadKeyFromBlock(chain)
-	peerKey := downloadPeerKey(peer)
-	if peerKey == "" {
+	peerID := peer.id
+	if peerID.IsZero() {
 		return
 	}
 
@@ -1193,9 +1196,9 @@ func (s *overlaySubscription) noteChainBlockUnavailable(chain ton.BlockIDExt, pe
 		s.chainDownloads[key] = state
 	}
 	if state.unavailable == nil {
-		state.unavailable = map[string]chainUnavailablePeer{}
+		state.unavailable = map[PeerID]chainUnavailablePeer{}
 	}
-	state.unavailable[peerKey] = chainUnavailablePeer{
+	state.unavailable[peerID] = chainUnavailablePeer{
 		peer: peer,
 		at:   time.Now(),
 	}
@@ -1211,8 +1214,8 @@ func (s *overlaySubscription) noteLiveNextDownloadFailure(chain ton.BlockIDExt, 
 		return
 	}
 
-	peerKey := downloadPeerKey(peer)
-	if peerKey == "" {
+	peerID := peer.id
+	if peerID.IsZero() {
 		return
 	}
 
@@ -1221,17 +1224,17 @@ func (s *overlaySubscription) noteLiveNextDownloadFailure(chain ton.BlockIDExt, 
 
 	s.chainDownloadMx.Lock()
 	if s.liveNextPeers == nil {
-		s.liveNextPeers = map[string]*liveNextPeerState{}
+		s.liveNextPeers = map[PeerID]*liveNextPeerState{}
 	}
-	state := s.liveNextPeers[peerKey]
+	state := s.liveNextPeers[peerID]
 	if state == nil {
 		state = &liveNextPeerState{}
-		s.liveNextPeers[peerKey] = state
+		s.liveNextPeers[peerID] = state
 	}
 	state.unavailableUntil = unavailableUntil
 
 	sticky := s.chainDownloads[chainKey]
-	wasSticky := sticky != nil && sticky.peer != nil && downloadPeerKey(sticky.peer) == peerKey
+	wasSticky := sticky != nil && sticky.peer != nil && sticky.peer.id == peerID
 	if wasSticky {
 		s.clearChainBlockPeerLocked(chainKey)
 	}
@@ -1509,6 +1512,9 @@ func newVerifiedDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, da
 	}
 	if parsed.StateUpdate == nil {
 		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
+	}
+	if err = cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
+		return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
 	}
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
 	if err != nil {

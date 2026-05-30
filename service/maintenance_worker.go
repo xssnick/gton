@@ -44,8 +44,14 @@ func (s *Service) runDelayedServiceMaintenance(ctx context.Context) {
 
 func (s *Service) runServiceMaintenance(ctx context.Context) {
 	nextPersistentStateGC := time.Now()
-	nextArchiveGC := time.Now()
-	nextArchiveBackfill := time.Now()
+	var nextArchiveGC time.Time
+	if s.archiveTTL > 0 {
+		nextArchiveGC = time.Now()
+	}
+	var nextArchiveBackfill time.Time
+	if !s.disableArchiveBackfill {
+		nextArchiveBackfill = time.Now()
+	}
 	var nextCellGenerationMigrationRetry time.Time
 	var nextStateSerialization time.Time
 	if s.stateSerializer != nil {
@@ -55,8 +61,8 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 	for {
 		now := time.Now()
 		persistentStateGCDue := !now.Before(nextPersistentStateGC)
-		archiveGCDue := !now.Before(nextArchiveGC)
-		archiveBackfillDue := !now.Before(nextArchiveBackfill)
+		archiveGCDue := !nextArchiveGC.IsZero() && !now.Before(nextArchiveGC)
+		archiveBackfillDue := !nextArchiveBackfill.IsZero() && !now.Before(nextArchiveBackfill)
 		stateSerializationDue := !nextStateSerialization.IsZero() && !now.Before(nextStateSerialization)
 
 		migrationPending, err := s.cellGenerationMigrationPending(ctx)

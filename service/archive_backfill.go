@@ -69,7 +69,7 @@ type archiveBackfillMasterWindow struct {
 }
 
 func (s *Service) runArchiveBackfillOnce(ctx context.Context) (bool, error) {
-	if s.archiveTTL <= archiveBackfillGuard {
+	if s.disableArchiveBackfill {
 		return false, nil
 	}
 	if s.node == nil {
@@ -137,6 +137,10 @@ func (s *Service) runArchiveBackfillOnce(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) archiveBackfillRetention(ctx context.Context, store archiveBackfillStore) (archiveBackfillRetention, error) {
+	if s.disableArchiveBackfill {
+		return archiveBackfillRetention{}, errArchiveBackfillDisabled
+	}
+
 	active, err := store.ActiveCellGeneration(ctx)
 	if err != nil {
 		return archiveBackfillRetention{}, fmt.Errorf("load active cell generation: %w", err)
@@ -155,57 +159,95 @@ func (s *Service) archiveBackfillRetention(ctx context.Context, store archiveBac
 
 	ttlSeconds := uint64(s.archiveTTL / time.Second)
 	guardSeconds := uint64(archiveBackfillGuard / time.Second)
-	if ttlSeconds <= guardSeconds || ttlSeconds > uint64(^uint32(0)) {
-		return archiveBackfillRetention{}, errArchiveBackfillDisabled
-	}
-	if uint64(originMeta.GenUTime) <= ttlSeconds {
-		return archiveBackfillRetention{}, errArchiveBackfillDisabled
+	if ttlSeconds == 0 || uint64(originMeta.GenUTime) <= ttlSeconds {
+		return archiveBackfillRetention{
+			origin:      active.OriginPersistentState,
+			originUTime: originMeta.GenUTime,
+		}, nil
 	}
 
 	gcCutoff := originMeta.GenUTime - uint32(ttlSeconds)
-	target := gcCutoff + uint32(guardSeconds)
-	if target >= originMeta.GenUTime {
-		return archiveBackfillRetention{}, errArchiveBackfillDisabled
+	target := uint64(gcCutoff) + guardSeconds
+	if target >= uint64(originMeta.GenUTime) {
+		target = uint64(originMeta.GenUTime)
 	}
+
 	return archiveBackfillRetention{
 		origin:      active.OriginPersistentState,
 		originUTime: originMeta.GenUTime,
 		gcCutoff:    gcCutoff,
-		target:      target,
+		target:      uint32(target),
 	}, nil
 }
 
 func (s *Service) archiveBackfillProgress(ctx context.Context, store archiveBackfillStore, retention archiveBackfillRetention) (storage.ArchiveBackfillProgress, error) {
 	progress, err := store.ArchiveBackfillProgress(ctx)
 	if errors.Is(err, storage.ErrNotFound) {
-		progress = storage.ArchiveBackfillProgress{
-			OriginPersistentState: retention.origin,
-			OriginGenUTime:        retention.originUTime,
-			GCCutoffUnix:          retention.gcCutoff,
-			TargetUnix:            retention.target,
-			VerifiedFloorSeqno:    retention.origin.SeqNo,
-			VerifiedFloorUTime:    retention.originUTime,
-		}
+		progress = newArchiveBackfillProgress(retention)
 	} else if err != nil {
 		return storage.ArchiveBackfillProgress{}, fmt.Errorf("load archive backfill progress: %w", err)
 	} else if !progress.OriginPersistentState.Equals(&retention.origin) {
-		progress = storage.ArchiveBackfillProgress{
-			OriginPersistentState: retention.origin,
-			OriginGenUTime:        retention.originUTime,
-			GCCutoffUnix:          retention.gcCutoff,
-			TargetUnix:            retention.target,
-			VerifiedFloorSeqno:    retention.origin.SeqNo,
-			VerifiedFloorUTime:    retention.originUTime,
+		if canCarryArchiveBackfillProgress(progress, retention) {
+			progress.OriginPersistentState = retention.origin
+		} else {
+			// Reinitialize only when the stored checkpoint is not monotonic relative to the active origin.
+			progress = newArchiveBackfillProgress(retention)
 		}
 	}
 
 	progress.OriginGenUTime = retention.originUTime
 	progress.GCCutoffUnix = retention.gcCutoff
 	progress.TargetUnix = retention.target
-	if progress.VerifiedFloorSeqno <= 1 || progress.VerifiedFloorUTime <= retention.target {
+	if progress.VerifiedFloorSeqno == 0 {
+		return storage.ArchiveBackfillProgress{}, errArchiveBackfillComplete
+	}
+	if retention.target > 0 && (progress.VerifiedFloorSeqno <= 1 || progress.VerifiedFloorUTime <= retention.target) {
 		return storage.ArchiveBackfillProgress{}, errArchiveBackfillComplete
 	}
 	return progress, nil
+}
+
+func newArchiveBackfillProgress(retention archiveBackfillRetention) storage.ArchiveBackfillProgress {
+	return storage.ArchiveBackfillProgress{
+		OriginPersistentState: retention.origin,
+		OriginGenUTime:        retention.originUTime,
+		GCCutoffUnix:          retention.gcCutoff,
+		TargetUnix:            retention.target,
+		VerifiedFloorSeqno:    retention.origin.SeqNo,
+		VerifiedFloorUTime:    retention.originUTime,
+	}
+}
+
+func canCarryArchiveBackfillProgress(progress storage.ArchiveBackfillProgress, retention archiveBackfillRetention) bool {
+	if emptyBlockID(progress.OriginPersistentState) {
+		return false
+	}
+	if progress.OriginPersistentState.Workchain != retention.origin.Workchain ||
+		progress.OriginPersistentState.Shard != retention.origin.Shard {
+		return false
+	}
+	if progress.OriginPersistentState.SeqNo == retention.origin.SeqNo {
+		return false
+	}
+	if progress.OriginPersistentState.SeqNo > retention.origin.SeqNo {
+		return false
+	}
+	if progress.OriginGenUTime != 0 && retention.originUTime != 0 && progress.OriginGenUTime > retention.originUTime {
+		return false
+	}
+	if progress.VerifiedFloorSeqno != 0 && progress.VerifiedFloorSeqno > progress.OriginPersistentState.SeqNo {
+		return false
+	}
+	if progress.VerifiedFloorSeqno > retention.origin.SeqNo {
+		return false
+	}
+	if progress.VerifiedFloorUTime != 0 && progress.OriginGenUTime != 0 && progress.VerifiedFloorUTime > progress.OriginGenUTime {
+		return false
+	}
+	if progress.VerifiedFloorUTime != 0 && retention.originUTime != 0 && progress.VerifiedFloorUTime > retention.originUTime {
+		return false
+	}
+	return true
 }
 
 func (s *Service) archiveBackfillStateRoot(ctx context.Context, store archiveBackfillStore, origin ton.BlockIDExt) (*cell.Cell, uint32, error) {
@@ -256,7 +298,7 @@ func (r *archiveBackfillRunner) runWindow(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if masterWindow.floorTime <= r.retention.gcCutoff {
+	if r.retention.gcCutoff != 0 && masterWindow.floorTime <= r.retention.gcCutoff {
 		r.service.log.Info().
 			Uint32("window_floor_utime", masterWindow.floorTime).
 			Uint32("gc_cutoff_unix", r.retention.gcCutoff).
@@ -412,7 +454,7 @@ func (r *archiveBackfillRunner) validateMasterWindow(blocks []PreparedBlock, win
 }
 
 func archiveBackfillChangedShardTargets(blocks []PreparedBlock) ([]ton.BlockIDExt, error) {
-	changed := make(map[string]ton.BlockIDExt)
+	changed := make(map[storage.BlockRootHash]ton.BlockIDExt)
 	var previous map[storage.ShardKey]ton.BlockIDExt
 	for i := len(blocks) - 1; i >= 0; i-- {
 		block := blocks[i]

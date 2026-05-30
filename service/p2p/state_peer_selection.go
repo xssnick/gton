@@ -11,59 +11,60 @@ const (
 	stateSlowPeerPenalty = archiveSlowPeerPenalty
 )
 
-func downloadPeerKey(peer *overlayPeer) string {
+func downloadPeerID(peer *overlayPeer) PeerID {
 	if peer == nil {
-		return ""
+		return PeerID{}
 	}
-	if peer.id != "" {
-		return peer.id
-	}
-	return peer.addr
+	return peer.id
 }
 
 func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
-	if peer == nil {
+	peerID := downloadPeerID(peer)
+	if peerID.IsZero() {
 		return func() {}
 	}
 
-	key := downloadPeerKey(peer)
-
 	n.downloadPeerMx.Lock()
 	if n.downloadPeerLeases == nil {
-		n.downloadPeerLeases = map[string]int{}
+		n.downloadPeerLeases = map[PeerID]int{}
 	}
-	n.downloadPeerLeases[key]++
+	n.downloadPeerLeases[peerID]++
 	n.downloadPeerMx.Unlock()
 
 	return func() {
 		n.downloadPeerMx.Lock()
 		defer n.downloadPeerMx.Unlock()
 
-		count := n.downloadPeerLeases[key]
+		count := n.downloadPeerLeases[peerID]
 		if count <= 1 {
-			delete(n.downloadPeerLeases, key)
+			delete(n.downloadPeerLeases, peerID)
 			return
 		}
-		n.downloadPeerLeases[key] = count - 1
+		n.downloadPeerLeases[peerID] = count - 1
 	}
 }
 
 func (n *Node) downloadPeerLeaseCount(peer *overlayPeer) int {
-	if peer == nil {
+	peerID := downloadPeerID(peer)
+	if peerID.IsZero() {
 		return 0
 	}
 
 	n.downloadPeerMx.RLock()
 	defer n.downloadPeerMx.RUnlock()
-	return n.downloadPeerLeases[downloadPeerKey(peer)]
+	return n.downloadPeerLeases[peerID]
 }
 
-func (n *Node) downloadPeerLeaseSnapshot(peers []*overlayPeer) map[string]int {
-	leases := make(map[string]int, len(peers))
+func (n *Node) downloadPeerLeaseSnapshot(peers []*overlayPeer) map[PeerID]int {
+	leases := make(map[PeerID]int, len(peers))
 	n.downloadPeerMx.RLock()
 	defer n.downloadPeerMx.RUnlock()
 	for _, peer := range peers {
-		leases[downloadPeerKey(peer)] = n.downloadPeerLeases[downloadPeerKey(peer)]
+		peerID := downloadPeerID(peer)
+		if peerID.IsZero() {
+			continue
+		}
+		leases[peerID] = n.downloadPeerLeases[peerID]
 	}
 	return leases
 }
@@ -81,8 +82,8 @@ func (n *Node) prioritizeStateSnapshotPeers(peers []*overlayPeer) []*overlayPeer
 		right := prioritized[j]
 		leftStats := left.statsSnapshot()
 		rightStats := right.statsSnapshot()
-		leftLeases := leases[downloadPeerKey(left)]
-		rightLeases := leases[downloadPeerKey(right)]
+		leftLeases := leases[left.id]
+		rightLeases := leases[right.id]
 
 		leftSlow := leftStats.downloadSlowUntil.After(now)
 		rightSlow := rightStats.downloadSlowUntil.After(now)
@@ -116,8 +117,8 @@ func (n *Node) prioritizeBlockDownloadPeers(peers []*overlayPeer) []*overlayPeer
 		right := prioritized[j]
 		leftStats := left.statsSnapshot()
 		rightStats := right.statsSnapshot()
-		leftLeases := leases[downloadPeerKey(left)]
-		rightLeases := leases[downloadPeerKey(right)]
+		leftLeases := leases[left.id]
+		rightLeases := leases[right.id]
 
 		leftSlow := leftStats.downloadSlowUntil.After(now)
 		rightSlow := rightStats.downloadSlowUntil.After(now)
@@ -141,23 +142,23 @@ func (n *Node) prioritizeBlockDownloadPeers(peers []*overlayPeer) []*overlayPeer
 	return prioritized
 }
 
-func (s *overlaySubscription) prioritizeLiveNextPeers(peers []*overlayPeer, preferredKey string, now time.Time) []*overlayPeer {
+func (s *overlaySubscription) prioritizeLiveNextPeers(peers []*overlayPeer, preferredPeerID PeerID, now time.Time) []*overlayPeer {
 	if len(peers) < 2 {
 		return peers
 	}
 
 	states := s.liveNextPeerSnapshot(peers)
-	leases := map[string]int{}
+	leases := map[PeerID]int{}
 	if s.node != nil {
 		leases = s.node.downloadPeerLeaseSnapshot(peers)
 	}
 
 	prioritized := append([]*overlayPeer(nil), peers...)
 	sort.SliceStable(prioritized, func(i, j int) bool {
-		leftKey := downloadPeerKey(prioritized[i])
-		rightKey := downloadPeerKey(prioritized[j])
-		left := liveNextPeerRankFor(prioritized[i], preferredKey, states[leftKey], leases[leftKey], now)
-		right := liveNextPeerRankFor(prioritized[j], preferredKey, states[rightKey], leases[rightKey], now)
+		leftPeer := prioritized[i]
+		rightPeer := prioritized[j]
+		left := liveNextPeerRankFor(leftPeer, preferredPeerID, states[leftPeer.id], leases[leftPeer.id], now)
+		right := liveNextPeerRankFor(rightPeer, preferredPeerID, states[rightPeer.id], leases[rightPeer.id], now)
 
 		if left.unavailable != right.unavailable {
 			return !left.unavailable
@@ -197,7 +198,7 @@ func (s *overlaySubscription) prioritizeLiveNextPeers(peers []*overlayPeer, pref
 	return prioritized
 }
 
-func (s *overlaySubscription) liveNextPeerSnapshot(peers []*overlayPeer) map[string]liveNextPeerState {
+func (s *overlaySubscription) liveNextPeerSnapshot(peers []*overlayPeer) map[PeerID]liveNextPeerState {
 	s.chainDownloadMx.Lock()
 	defer s.chainDownloadMx.Unlock()
 
@@ -205,11 +206,13 @@ func (s *overlaySubscription) liveNextPeerSnapshot(peers []*overlayPeer) map[str
 		return nil
 	}
 
-	snapshot := make(map[string]liveNextPeerState, len(peers))
+	snapshot := make(map[PeerID]liveNextPeerState, len(peers))
 	for _, peer := range peers {
-		key := downloadPeerKey(peer)
-		if state := s.liveNextPeers[key]; state != nil {
-			snapshot[key] = *state
+		if peer == nil || peer.id.IsZero() {
+			continue
+		}
+		if state := s.liveNextPeers[peer.id]; state != nil {
+			snapshot[peer.id] = *state
 		}
 	}
 	return snapshot
@@ -229,11 +232,10 @@ type liveNextPeerRank struct {
 	availability  float64
 }
 
-func liveNextPeerRankFor(peer *overlayPeer, preferredKey string, state liveNextPeerState, leases int, now time.Time) liveNextPeerRank {
-	key := downloadPeerKey(peer)
+func liveNextPeerRankFor(peer *overlayPeer, preferredPeerID PeerID, state liveNextPeerState, leases int, now time.Time) liveNextPeerRank {
 	stats := peer.statsSnapshot()
 	rank := liveNextPeerRank{
-		preferred:     preferredKey != "" && key == preferredKey,
+		preferred:     !preferredPeerID.IsZero() && peer.id == preferredPeerID,
 		alive:         stats.alive,
 		slow:          stats.downloadSlowUntil.After(now),
 		unreliability: stats.unreliability,
@@ -265,7 +267,7 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 	bestSpeed := 0.0
 
 	for i, probe := range probes {
-		leases := n.downloadPeerLeases[downloadPeerKey(probe.candidate.peer)]
+		leases := n.downloadPeerLeases[downloadPeerID(probe.candidate.peer)]
 		speed := probeBytesPerSecond(probe)
 		score := speed / float64(leases+1)
 
@@ -278,22 +280,25 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 	}
 
 	selected := probes[bestIdx]
-	selectedKey := downloadPeerKey(selected.candidate.peer)
-	if n.downloadPeerLeases == nil {
-		n.downloadPeerLeases = map[string]int{}
+	selectedPeerID := downloadPeerID(selected.candidate.peer)
+	if selectedPeerID.IsZero() {
+		return selected, func() {}
 	}
-	n.downloadPeerLeases[selectedKey]++
+	if n.downloadPeerLeases == nil {
+		n.downloadPeerLeases = map[PeerID]int{}
+	}
+	n.downloadPeerLeases[selectedPeerID]++
 
 	return selected, func() {
 		n.downloadPeerMx.Lock()
 		defer n.downloadPeerMx.Unlock()
 
-		count := n.downloadPeerLeases[selectedKey]
+		count := n.downloadPeerLeases[selectedPeerID]
 		if count <= 1 {
-			delete(n.downloadPeerLeases, selectedKey)
+			delete(n.downloadPeerLeases, selectedPeerID)
 			return
 		}
-		n.downloadPeerLeases[selectedKey] = count - 1
+		n.downloadPeerLeases[selectedPeerID] = count - 1
 	}
 }
 

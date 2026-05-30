@@ -2,20 +2,30 @@ package pebblestore
 
 import (
 	"container/list"
+	"encoding/binary"
 	"sync"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
-	decodedCellCacheShards     = 64
-	decodedCellCacheBytesPerEl = 16 << 10
-	decodedCellCacheMinEntries = 64 << 10
-	decodedCellCacheMaxEntries = 1 << 20
+	DefaultDecodedCellCacheShards        = 64
+	DefaultDecodedCellCacheBytesPerEntry = int64(16 << 10)
+	DefaultDecodedCellCacheMinEntries    = 64 << 10
+	DefaultDecodedCellCacheMaxEntries    = 1 << 20
 )
 
 type decodedCellCache struct {
-	shards [decodedCellCacheShards]decodedCellCacheShard
+	shards []decodedCellCacheShard
+}
+
+type decodedCellCacheConfig struct {
+	enabled       bool
+	shards        int
+	cacheBytes    int64
+	bytesPerEntry int64
+	minEntries    int
+	maxEntries    int
 }
 
 type decodedCellCacheShard struct {
@@ -35,17 +45,28 @@ type decodedCellCacheKey struct {
 	hash       [32]byte
 }
 
-func newDecodedCellCache(cellCacheBytes int64) *decodedCellCache {
-	entries := int(cellCacheBytes / decodedCellCacheBytesPerEl)
-	if entries < decodedCellCacheMinEntries {
-		entries = decodedCellCacheMinEntries
-	}
-	if entries > decodedCellCacheMaxEntries {
-		entries = decodedCellCacheMaxEntries
+func newDecodedCellCache(cfg decodedCellCacheConfig) *decodedCellCache {
+	if !cfg.enabled {
+		return nil
 	}
 
-	cache := &decodedCellCache{}
-	perShard := entries / decodedCellCacheShards
+	entries64 := cfg.cacheBytes / cfg.bytesPerEntry
+	if entries64 > int64(cfg.maxEntries) {
+		entries64 = int64(cfg.maxEntries)
+	}
+	entries := int(entries64)
+	if entries < cfg.minEntries {
+		entries = cfg.minEntries
+	}
+	shards := cfg.shards
+	if shards > entries {
+		shards = entries
+	}
+
+	cache := &decodedCellCache{
+		shards: make([]decodedCellCacheShard, shards),
+	}
+	perShard := entries / shards
 	if perShard < 1 {
 		perShard = 1
 	}
@@ -65,7 +86,7 @@ func (c *decodedCellCache) get(generation uint64, hash []byte) (*cell.Cell, bool
 	}
 
 	key := newDecodedCellCacheKey(generation, hash)
-	shard := &c.shards[key.hash[0]&byte(decodedCellCacheShards-1)]
+	shard := &c.shards[c.shardIndex(key.hash)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -84,7 +105,7 @@ func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell
 	}
 
 	key := newDecodedCellCacheKey(generation, hash)
-	shard := &c.shards[key.hash[0]&byte(decodedCellCacheShards-1)]
+	shard := &c.shards[c.shardIndex(key.hash)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -105,6 +126,10 @@ func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell
 		entry := evicted.Value.(decodedCellCacheEntry)
 		delete(shard.items, entry.key)
 	}
+}
+
+func (c *decodedCellCache) shardIndex(hash [32]byte) int {
+	return int(binary.BigEndian.Uint32(hash[:4]) % uint32(len(c.shards)))
 }
 
 func newDecodedCellCacheKey(generation uint64, hash []byte) decodedCellCacheKey {

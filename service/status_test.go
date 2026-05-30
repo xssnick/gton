@@ -266,4 +266,6 @@ type fakeSyncObserver struct{}
 
 func (o *fakeSyncObserver) ObserveSyncBlock(SyncBlockObservation) {}
 
+func (o *fakeSyncObserver) ObserveSyncObtain(SyncObtainObservation) {}
+
 func (o *fakeSyncObserver) ObserveSyncPersist(SyncPersistObservation) {}

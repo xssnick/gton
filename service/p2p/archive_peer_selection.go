@@ -22,8 +22,8 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 		leftStats := left.statsSnapshot()
 		rightStats := right.statsSnapshot()
 
-		leftLeases := leases[downloadPeerKey(left)]
-		rightLeases := leases[downloadPeerKey(right)]
+		leftLeases := leases[left.id]
+		rightLeases := leases[right.id]
 
 		leftTier := archivePeerTier(leftStats, basechain, now)
 		rightTier := archivePeerTier(rightStats, basechain, now)
@@ -194,7 +194,7 @@ func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers
 
 	available := make([]*overlayPeer, 0, len(peers))
 	for _, peer := range peers {
-		if !archivePeerDeniedLocked(state, archivePeerKey(peer), now) {
+		if !archivePeerDeniedLocked(state, archivePeerID(peer), now) {
 			available = append(available, peer)
 		}
 	}
@@ -211,14 +211,17 @@ func (s *overlaySubscription) denyArchivePeer(shard archive.ShardID, peer *overl
 
 	until := time.Now().Add(archiveSlowPeerPenalty)
 	stateKey := archivePeerPoolKey(shard)
-	peerKey := archivePeerKey(peer)
+	peerID := archivePeerID(peer)
+	if peerID.IsZero() {
+		return
+	}
 
 	s.archivePeerMx.Lock()
 	state := s.archivePeerState(stateKey)
 	if state.deniedPeers == nil {
-		state.deniedPeers = map[string]time.Time{}
+		state.deniedPeers = map[PeerID]time.Time{}
 	}
-	state.deniedPeers[peerKey] = until
+	state.deniedPeers[peerID] = until
 	s.archivePeerMx.Unlock()
 
 	s.log.Debug().
@@ -244,19 +247,22 @@ func (s *overlaySubscription) archivePeerDenied(shard archive.ShardID, peer *ove
 	if state == nil {
 		return false
 	}
-	denied := archivePeerDeniedLocked(state, archivePeerKey(peer), now)
+	denied := archivePeerDeniedLocked(state, archivePeerID(peer), now)
 	if len(state.deniedPeers) == 0 {
 		delete(s.archivePeers, stateKey)
 	}
 	return denied
 }
 
-func archivePeerDeniedLocked(state *archivePeerState, peerKey string, now time.Time) bool {
+func archivePeerDeniedLocked(state *archivePeerState, peerID PeerID, now time.Time) bool {
 	if state == nil || len(state.deniedPeers) == 0 {
 		return false
 	}
+	if peerID.IsZero() {
+		return false
+	}
 
-	until, ok := state.deniedPeers[peerKey]
+	until, ok := state.deniedPeers[peerID]
 	if !ok {
 		return false
 	}
@@ -264,7 +270,7 @@ func archivePeerDeniedLocked(state *archivePeerState, peerKey string, now time.T
 		return true
 	}
 
-	delete(state.deniedPeers, peerKey)
+	delete(state.deniedPeers, peerID)
 	return false
 }
 
@@ -303,6 +309,6 @@ func archiveDownloadTooSlow(shard archive.ShardID, bytes int64, elapsed time.Dur
 	return elapsed >= archiveSmallPackSlowElapsed
 }
 
-func archivePeerKey(peer *overlayPeer) string {
-	return downloadPeerKey(peer)
+func archivePeerID(peer *overlayPeer) PeerID {
+	return downloadPeerID(peer)
 }

@@ -149,12 +149,12 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	stateRoot, err := s.loadStateRoot(ctx, *query.ID)
+	fragments, err := s.blockFragments(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	extra, err := mcStateExtra(stateRoot)
+	extra, err := fragments.mcStateExtra()
 	if err != nil {
 		return errorResponse(err, "cannot unpack masterchain state")
 	}
@@ -167,11 +167,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return errorResponse(err, "cannot load shard info")
 	}
 
-	stateProof, err := shardHashesProof(stateRoot, query.Workchain, query.Shard, query.Exact)
-	if err != nil {
-		return errorResponse(err, "cannot create shard info proof")
-	}
-	proof, err := s.blockStateProof(ctx, *query.ID, stateProof)
+	stateProof, err := fragments.shardHashesProof(query.Workchain, query.Shard, query.Exact)
 	if err != nil {
 		return errorResponse(err, "cannot create shard info proof")
 	}
@@ -179,7 +175,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 	return ton.ShardInfo{
 		ID:               cloneBlockID(*query.ID),
 		ShardBlock:       cloneBlockID(shardBlock),
-		ShardProof:       proof,
+		ShardProof:       []*cell.Cell{fragments.blockStateRootProof, stateProof},
 		ShardDescription: leaf,
 	}
 }
@@ -197,19 +193,16 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		effectiveMode |= configModeNeedCapabilities
 	}
 
-	stateRoot, blockRoot, err := s.loadStateRootWithBlockRoot(ctx, *id)
+	fragments, err := s.blockFragments(ctx, *id)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*id))
 	}
 
-	stateProof, err := configProof(stateRoot, effectiveMode, all, params)
+	stateProof, err := configProof(fragments.stateRoot, effectiveMode, all, params)
 	if err != nil {
 		return errorResponse(err, "cannot create config proof")
 	}
-	proof, err := blockStateProofFromRoot(blockRoot, stateProof)
-	if err != nil {
-		return errorResponse(err, "cannot create config proof")
-	}
+	proof := []*cell.Cell{fragments.blockStateRootProof, stateProof}
 
 	return ton.ConfigAll{
 		Mode:        int(effectiveMode),
@@ -292,12 +285,17 @@ func (s *Server) handleLibraries(ctx context.Context, query ton.GetLibraries) an
 		return errorResponse(err, "cannot obtain current masterchain state")
 	}
 
-	root, err := s.loadStateRoot(ctx, current.Masterchain.Block)
+	fragments, err := s.blockFragments(ctx, current.Masterchain.Block)
 	if err != nil {
 		return errorResponse(err, "cannot load current masterchain state")
 	}
 
-	entries, err := libraryEntries(root, query.LibraryList, 0)
+	libraries, err := fragments.globalLibraries()
+	if err != nil {
+		return errorResponse(err, "cannot load libraries")
+	}
+
+	entries, err := libraryEntriesFromDict(libraries, query.LibraryList, 0)
 	if err != nil {
 		return errorResponse(err, "cannot load libraries")
 	}
@@ -309,24 +307,26 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	root, err := s.loadStateRoot(ctx, *query.ID)
+	fragments, err := s.blockFragments(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	entries, err := libraryEntries(root, query.LibraryList, query.Mode)
+	libraries, err := fragments.globalLibraries()
 	if err != nil {
 		return errorResponse(err, "cannot load libraries")
 	}
 
-	dataProof, err := librariesProof(root, query.LibraryList, query.Mode)
+	entries, err := libraryEntriesFromDict(libraries, query.LibraryList, query.Mode)
+	if err != nil {
+		return errorResponse(err, "cannot load libraries")
+	}
+
+	dataProof, err := librariesProof(fragments.stateRoot, query.LibraryList, query.Mode)
 	if err != nil {
 		return errorResponse(err, "cannot create library proof")
 	}
-	proof, err := s.blockStateProof(ctx, *query.ID, dataProof)
-	if err != nil {
-		return errorResponse(err, "cannot create library proof")
-	}
+	proof := []*cell.Cell{fragments.blockStateRootProof, dataProof}
 
 	return ton.LibraryResultWithProof{
 		ID:         cloneBlockID(*query.ID),
@@ -400,52 +400,67 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 	roots := make([]*cell.Cell, 0, limit)
 	ids := make([]*ton.BlockIDExt, 0, limit)
 
-	var currentBlock ton.BlockIDExt
-	var currentRoot *cell.Cell
-	hasCurrentBlock := false
+	var currentBlock *transactionSearchBlock
 
 	for cursorLT != 0 && len(roots) < limit {
-		tx, block, root, err := accountTransactionFromCurrentBlock(hasCurrentBlock, currentBlock, currentRoot, query.AccID.Workchain, account, cursorLT)
+		tx, block, err := accountTransactionFromCurrentBlock(currentBlock, query.AccID.Workchain, account, cursorLT)
 		if errors.Is(err, storage.ErrNotFound) {
-			block, err = s.lookupBlockByAccountLT(ctx, query.AccID.Workchain, account, cursorLT)
+			tx, block, err = s.accountTransactionFromShardHint(ctx, currentBlock, query.AccID.Workchain, account, cursorLT)
 			if errors.Is(err, storage.ErrNotFound) {
-				if len(roots) > 0 {
-					return getTransactionsResponse(roots, ids)
+				blockID, err := s.lookupBlockByAccountLT(ctx, query.AccID.Workchain, account, cursorLT)
+				if errors.Is(err, storage.ErrNotFound) {
+					if len(roots) > 0 {
+						return getTransactionsResponse(roots, ids)
+					}
+					return ton.LSError{Code: errCodeProtoViolation, Text: "cannot locate transaction in block with specified logical time"}
 				}
-				return ton.LSError{Code: errCodeProtoViolation, Text: "cannot locate transaction in block with specified logical time"}
-			}
-			if errors.Is(err, errBlockCannotContainAccount) {
-				return ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
-			}
-			if err != nil {
-				if len(roots) > 0 {
-					return getTransactionsResponse(roots, ids)
+				if errors.Is(err, errBlockCannotContainAccount) {
+					return ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
 				}
-				return ton.LSError{Code: errCodeProtoViolation, Text: "cannot compute block with specified transaction: " + err.Error()}
-			}
+				if err != nil {
+					if len(roots) > 0 {
+						return getTransactionsResponse(roots, ids)
+					}
+					return ton.LSError{Code: errCodeProtoViolation, Text: "cannot compute block with specified transaction: " + err.Error()}
+				}
 
-			root, err = s.loadBlockRoot(ctx, block)
-			if err != nil {
-				if len(roots) > 0 {
-					return getTransactionsResponse(roots, ids)
+				root, err := s.loadBlockRoot(ctx, blockID)
+				if err != nil {
+					if len(roots) > 0 {
+						return getTransactionsResponse(roots, ids)
+					}
+					return ton.LSError{Code: errCodeProtoViolation, Text: fmt.Sprintf("cannot load block %s with specified transaction: %s", cxxBlockIDExtString(blockID), err.Error())}
 				}
-				return ton.LSError{Code: errCodeProtoViolation, Text: fmt.Sprintf("cannot load block %s with specified transaction: %s", cxxBlockIDExtString(block), err.Error())}
+
+				block, err = transactionSearchBlockFromRoot(blockID, root)
+				if err != nil {
+					if len(roots) > 0 {
+						return getTransactionsResponse(roots, ids)
+					}
+					return ton.LSError{Code: errCodeProtoViolation, Text: fmt.Sprintf("cannot unpack block %s with specified transaction: %s", cxxBlockIDExtString(blockID), err.Error())}
+				}
+				if !block.containsLT(cursorLT) {
+					if len(roots) > 0 {
+						return getTransactionsResponse(roots, ids)
+					}
+					return ton.LSError{Code: errCodeProtoViolation, Text: "cannot locate transaction in block with specified logical time"}
+				}
+
+				tx, err = findBlockTransaction(block.root, account, cursorLT)
+				if errors.Is(err, storage.ErrNotFound) {
+					if len(roots) > 0 {
+						return getTransactionsResponse(roots, ids)
+					}
+					return ton.LSError{Code: errCodeProtoViolation, Text: "cannot locate transaction in block with specified logical time"}
+				}
+				if err != nil {
+					return errorResponse(err, "cannot get transaction")
+				}
+			} else if err != nil {
+				return errorResponse(err, "cannot get transaction")
 			}
 
 			currentBlock = block
-			currentRoot = root
-			hasCurrentBlock = true
-
-			tx, err = findBlockTransaction(root, account, cursorLT)
-			if errors.Is(err, storage.ErrNotFound) {
-				if len(roots) > 0 {
-					return getTransactionsResponse(roots, ids)
-				}
-				return ton.LSError{Code: errCodeProtoViolation, Text: "cannot locate transaction in block with specified logical time"}
-			}
-			if err != nil {
-				return errorResponse(err, "cannot get transaction")
-			}
 		} else if errors.Is(err, errBlockCannotContainAccount) {
 			return ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
 		} else if err != nil {
@@ -457,54 +472,113 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 			return ton.LSError{Code: errCodeProtoViolation, Text: "transaction hash mismatch"}
 		}
 
-		txLoader, err := tx.BeginParse()
+		header, err := loadTransactionChainHeader(tx)
 		if err != nil {
 			return errorResponse(err, "cannot unpack transaction")
 		}
-
-		var parsed tlb.Transaction
-		if err = tlb.LoadFromCell(&parsed, txLoader); err != nil {
-			return errorResponse(err, "cannot unpack transaction")
-		}
-		if parsed.LT != cursorLT {
+		if header.lt != cursorLT {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "transaction lt mismatch"}
 		}
-		if !bytes.Equal(parsed.AccountAddr, account) {
+		if !bytes.Equal(header.account, account) {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "transaction account mismatch"}
 		}
-		if parsed.PrevTxLT >= cursorLT {
+		if header.prevLT >= cursorLT {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "previous transaction time is not less than the current one"}
 		}
 
 		roots = append(roots, tx)
-		ids = append(ids, cloneBlockID(block))
+		ids = append(ids, cloneBlockID(block.id))
 
-		cursorLT = parsed.PrevTxLT
+		cursorLT = header.prevLT
 		if cursorLT == 0 {
 			break
 		}
-		if len(parsed.PrevTxHash) != 32 {
+		if len(header.prevHash) != 32 {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "transaction previous hash is invalid"}
 		}
-		cursorHash = bytes.Clone(parsed.PrevTxHash)
+		cursorHash = header.prevHash
 	}
 
 	return getTransactionsResponse(roots, ids)
 }
 
-func accountTransactionFromCurrentBlock(hasBlock bool, block ton.BlockIDExt, root *cell.Cell, workchain int32, account []byte, lt uint64) (*cell.Cell, ton.BlockIDExt, *cell.Cell, error) {
-	if !hasBlock || root == nil {
-		return nil, ton.BlockIDExt{}, nil, storage.ErrNotFound
+type transactionSearchBlock struct {
+	id      ton.BlockIDExt
+	root    *cell.Cell
+	startLT uint64
+	endLT   uint64
+}
+
+func transactionSearchBlockFromRoot(id ton.BlockIDExt, root *cell.Cell) (*transactionSearchBlock, error) {
+	header, err := loadBlockHeader(root)
+	if err != nil {
+		return nil, err
 	}
-	if !blockContainsAccount(block, workchain, account) {
-		return nil, ton.BlockIDExt{}, nil, errBlockCannotContainAccount
+
+	return &transactionSearchBlock{
+		id:      id,
+		root:    root,
+		startLT: header.StartLt,
+		endLT:   header.EndLt,
+	}, nil
+}
+
+func (b *transactionSearchBlock) containsLT(lt uint64) bool {
+	return b.startLT < lt && lt < b.endLT
+}
+
+func accountTransactionFromCurrentBlock(block *transactionSearchBlock, workchain int32, account []byte, lt uint64) (*cell.Cell, *transactionSearchBlock, error) {
+	if block == nil {
+		return nil, nil, storage.ErrNotFound
+	}
+	if !blockContainsAccount(block.id, workchain, account) {
+		return nil, nil, errBlockCannotContainAccount
+	}
+	if !block.containsLT(lt) {
+		return nil, nil, storage.ErrNotFound
+	}
+
+	tx, err := findBlockTransaction(block.root, account, lt)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tx, block, nil
+}
+
+func (s *Server) accountTransactionFromShardHint(ctx context.Context, current *transactionSearchBlock, workchain int32, account []byte, lt uint64) (*cell.Cell, *transactionSearchBlock, error) {
+	if current == nil || !blockContainsAccount(current.id, workchain, account) {
+		return nil, nil, storage.ErrNotFound
+	}
+
+	// The shard hint is only a fast path: chains can cross split/merge boundaries,
+	// so any hint failure falls back to the authoritative account-prefix lookup.
+	hintKey := storage.BlockHistoryKey{Workchain: workchain, Shard: current.id.Shard}
+	hintedBlock, err := s.store.LookupBlockByLT(ctx, hintKey, lt)
+	if err != nil {
+		return nil, nil, storage.ErrNotFound
+	}
+	if !blockContainsAccount(hintedBlock, workchain, account) {
+		return nil, nil, storage.ErrNotFound
+	}
+
+	root, err := s.loadBlockRoot(ctx, hintedBlock)
+	if err != nil {
+		return nil, nil, storage.ErrNotFound
+	}
+
+	block, err := transactionSearchBlockFromRoot(hintedBlock, root)
+	if err != nil {
+		return nil, nil, storage.ErrNotFound
+	}
+	if !block.containsLT(lt) {
+		return nil, nil, storage.ErrNotFound
 	}
 
 	tx, err := findBlockTransaction(root, account, lt)
 	if err != nil {
-		return nil, ton.BlockIDExt{}, nil, err
+		return nil, nil, storage.ErrNotFound
 	}
-	return tx, block, root, nil
+	return tx, block, nil
 }
 
 func (s *Server) lookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
@@ -527,6 +601,52 @@ func getTransactionsResponse(roots []*cell.Cell, ids []*ton.BlockIDExt) any {
 		IDs:          ids,
 		Transactions: data,
 	}
+}
+
+type transactionChainHeader struct {
+	account  []byte
+	lt       uint64
+	prevHash []byte
+	prevLT   uint64
+}
+
+func loadTransactionChainHeader(tx *cell.Cell) (transactionChainHeader, error) {
+	loader, err := tx.BeginParse()
+	if err != nil {
+		return transactionChainHeader{}, err
+	}
+
+	magic, err := loader.LoadUInt(4)
+	if err != nil {
+		return transactionChainHeader{}, err
+	}
+	if magic != 0x7 {
+		return transactionChainHeader{}, fmt.Errorf("invalid transaction magic %x", magic)
+	}
+
+	account, err := loader.LoadSlice(256)
+	if err != nil {
+		return transactionChainHeader{}, err
+	}
+	lt, err := loader.LoadUInt(64)
+	if err != nil {
+		return transactionChainHeader{}, err
+	}
+	prevHash, err := loader.LoadSlice(256)
+	if err != nil {
+		return transactionChainHeader{}, err
+	}
+	prevLT, err := loader.LoadUInt(64)
+	if err != nil {
+		return transactionChainHeader{}, err
+	}
+
+	return transactionChainHeader{
+		account:  account,
+		lt:       lt,
+		prevHash: prevHash,
+		prevLT:   prevLT,
+	}, nil
 }
 
 func cxxBlockIDExtString(block ton.BlockIDExt) string {
@@ -667,19 +787,16 @@ func (s *Server) handleValidatorStats(ctx context.Context, query ton.GetValidato
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	root, err := s.loadStateRoot(ctx, *query.ID)
+	fragments, err := s.blockFragments(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	dataProof, count, complete, err := validatorStatsProofAndCount(root, query.Mode, query.Limit, query.StartAfter)
+	dataProof, count, complete, err := validatorStatsProofAndCount(fragments.stateRoot, query.Mode, query.Limit, query.StartAfter)
 	if err != nil {
 		return errorResponse(err, "cannot load validator stats")
 	}
-	proof, err := s.blockStateProof(ctx, *query.ID, dataProof)
-	if err != nil {
-		return errorResponse(err, "cannot create validator stats proof")
-	}
+	proof := []*cell.Cell{fragments.blockStateRootProof, dataProof}
 
 	return ton.ValidatorStats{
 		Mode:       query.Mode & 0xff,
@@ -696,9 +813,21 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid BlockIdExt"}
 	}
 
-	root, err := s.loadStateRoot(ctx, *query.ID)
-	if err != nil {
-		return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+	var blockProof *cell.Cell
+	var root *cell.Cell
+	if query.Mode&1 != 0 {
+		fragments, err := s.blockFragments(ctx, *query.ID)
+		if err != nil {
+			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+		}
+		root = fragments.stateRoot
+		blockProof = fragments.blockStateRootProof
+	} else {
+		stateRoot, err := s.loadStateRoot(ctx, *query.ID)
+		if err != nil {
+			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
+		}
+		root = stateRoot
 	}
 
 	size, err := outMsgQueueSize(root)
@@ -716,10 +845,7 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 		if err != nil {
 			return errorResponse(err, "cannot create out msg queue proof")
 		}
-		proof, err := s.blockStateProof(ctx, *query.ID, dataProof)
-		if err != nil {
-			return errorResponse(err, "cannot create out msg queue proof")
-		}
+		proof := []*cell.Cell{blockProof, dataProof}
 		resp.Proof = cell.ToBOCWithFlags(proof, false)
 	}
 	return resp
@@ -1377,6 +1503,10 @@ func libraryEntries(stateRoot *cell.Cell, hashes [][]byte, mode uint32) ([]*ton.
 	if err != nil {
 		return nil, err
 	}
+	return libraryEntriesFromDict(libraries, hashes, mode)
+}
+
+func libraryEntriesFromDict(libraries *cell.Dictionary, hashes [][]byte, mode uint32) ([]*ton.LibraryEntry, error) {
 	if libraries == nil {
 		return nil, nil
 	}

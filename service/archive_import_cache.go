@@ -11,7 +11,7 @@ import (
 
 type archiveImportResult struct {
 	stats      *archive.ImportStats
-	blocks     map[string]PreparedBlock
+	blocks     map[storage.BlockRootHash]PreparedBlock
 	stored     storage.ServedArchiveImport
 	splitDepth uint32
 }
@@ -168,7 +168,7 @@ func cloneArchiveImportResult(result *archiveImportResult) *archiveImportResult 
 
 	cloned := &archiveImportResult{
 		stats:      cloneImportStats(result.stats),
-		blocks:     make(map[string]PreparedBlock, len(result.blocks)),
+		blocks:     make(map[storage.BlockRootHash]PreparedBlock, len(result.blocks)),
 		stored:     cloneServedArchiveImport(result.stored),
 		splitDepth: result.splitDepth,
 	}

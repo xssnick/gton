@@ -1,7 +1,9 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -74,6 +76,89 @@ func decodeBroadcastBlock(msg any) (*DownloadedBlock, error) {
 	default:
 		return nil, fmt.Errorf("unexpected broadcast block %T", msg)
 	}
+}
+
+func decodeBlockCandidateBroadcast(msg any) (*DownloadedBlock, error) {
+	switch data := msg.(type) {
+	case tonnodeapi.NewBlockCandidateBroadcast:
+		return decodeRawBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcast", data.ID, data.Data)
+	case tonnodeapi.NewBlockCandidateBroadcastCompressed:
+		decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
+		if err != nil {
+			return nil, fmt.Errorf("decompress tonNode.newBlockCandidateBroadcastCompressed: %w", err)
+		}
+
+		root, err := parseDownloadedBlockData("tonNode.newBlockCandidateBroadcastCompressed", decompressed)
+		if err != nil {
+			return nil, err
+		}
+		return newVerifiedBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcastCompressed", data.ID, serializeCompressedBlockRoot(root), root)
+	case tonnodeapi.NewBlockCandidateBroadcastCompressedV2:
+		roots, err := cell.DecompressBOC(data.Compressed, maxDecompressedBlockSize, nil)
+		if err != nil {
+			return nil, fmt.Errorf("decompress tonNode.newBlockCandidateBroadcastCompressedV2: %w", err)
+		}
+		if len(roots) != 1 {
+			return nil, fmt.Errorf("expected 1 root in tonNode.newBlockCandidateBroadcastCompressedV2, got %d", len(roots))
+		}
+		return newVerifiedBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcastCompressedV2", data.ID, serializeCompressedBlockRoot(roots[0]), roots[0])
+	default:
+		return nil, fmt.Errorf("unexpected block candidate broadcast %T", msg)
+	}
+}
+
+func decodeRawBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []byte) (*DownloadedBlock, error) {
+	root, err := parseDownloadedBlockData(kind, data)
+	if err != nil {
+		return nil, err
+	}
+	return newVerifiedBlockCandidateBroadcast(kind, id, data, root)
+}
+
+func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []byte, root *cell.Cell) (*DownloadedBlock, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%s block is empty", kind)
+	}
+
+	effectiveRoot, err := effectiveDownloadedBlockRoot(id, false, root)
+	if err != nil {
+		return nil, fmt.Errorf("%s block root: %w", kind, err)
+	}
+
+	rootHash := effectiveRoot.HashKey()
+	if !bytes.Equal(rootHash[:], id.RootHash) {
+		return nil, fmt.Errorf("%s root hash mismatch for %s", kind, formatBlockRef(id))
+	}
+
+	sum := sha256.Sum256(data)
+	if !bytes.Equal(sum[:], id.FileHash) {
+		return nil, fmt.Errorf("%s file hash mismatch for %s", kind, formatBlockRef(id))
+	}
+
+	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
+	if err != nil {
+		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, formatBlockRef(id), err)
+	}
+	if parsed.StateUpdate == nil {
+		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
+	}
+	if err = cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
+		return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
+	}
+	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
+	if err != nil {
+		return nil, fmt.Errorf("%s build block meta %s: %w", kind, formatBlockRef(id), err)
+	}
+
+	return &DownloadedBlock{
+		ID:               id,
+		Kind:             kind,
+		Block:            effectiveRoot,
+		BlockBOC:         data,
+		Meta:             meta,
+		StateUpdate:      parsed.StateUpdate,
+		VerifiedRootHash: true,
+	}, nil
 }
 
 func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*DownloadedBlock, error) {

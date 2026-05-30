@@ -30,8 +30,8 @@ type PreparedBlock struct {
 	consensus                 *masterchainConsensusProof
 	consensusChecked          *checkedMasterchainConsensus
 
-	IsLink    bool
-	SourceKey string
+	IsLink       bool
+	SourcePeerID p2p.PeerID
 }
 
 type VerifiedBlock struct {
@@ -47,8 +47,8 @@ type VerifiedBlock struct {
 	consensus        *masterchainConsensusProof
 	consensusChecked *checkedMasterchainConsensus
 
-	IsLink    bool
-	SourceKey string
+	IsLink       bool
+	SourcePeerID p2p.PeerID
 }
 
 func (b PreparedBlock) BlockRef() string {
@@ -110,16 +110,16 @@ func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error
 	}
 
 	return VerifiedBlock{
-		ID:          downloaded.ID,
-		Kind:        downloaded.Kind,
-		BlockBOC:    downloaded.BlockBOC,
-		ProofBOC:    downloaded.ProofBOC,
-		BlockRoot:   root,
-		Meta:        meta.Clone(),
-		StateUpdate: downloaded.StateUpdate,
-		consensus:   consensus,
-		IsLink:      downloaded.IsLink,
-		SourceKey:   downloaded.SourceKey,
+		ID:           downloaded.ID,
+		Kind:         downloaded.Kind,
+		BlockBOC:     downloaded.BlockBOC,
+		ProofBOC:     downloaded.ProofBOC,
+		BlockRoot:    root,
+		Meta:         meta.Clone(),
+		StateUpdate:  downloaded.StateUpdate,
+		consensus:    consensus,
+		IsLink:       downloaded.IsLink,
+		SourcePeerID: downloaded.SourcePeerID,
 	}, nil
 }
 
@@ -177,7 +177,7 @@ func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRec
 		consensus:                 block.consensus,
 		consensusChecked:          block.consensusChecked,
 		IsLink:                    block.IsLink,
-		SourceKey:                 block.SourceKey,
+		SourcePeerID:              block.SourcePeerID,
 	}
 }
 
@@ -200,7 +200,7 @@ func verifiedBlockFromPrepared(block PreparedBlock) (VerifiedBlock, error) {
 		consensus:        block.consensus,
 		consensusChecked: block.consensusChecked,
 		IsLink:           block.IsLink,
-		SourceKey:        block.SourceKey,
+		SourcePeerID:     block.SourcePeerID,
 	}, nil
 }
 

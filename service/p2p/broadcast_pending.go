@@ -18,19 +18,19 @@ const (
 )
 
 type pendingBlockBroadcastDecode struct {
-	fingerprint string
-	overlay     string
-	delivery    Delivery
-	trusted     bool
-	kind        string
-	block       ton.BlockIDExt
-	prev        ton.BlockIDExt
-	sourceKey   string
-	receivedAt  time.Time
-	msg         any
-	proofRoot   *cell.Cell
-	expiresAt   time.Time
-	bytes       int64
+	fingerprint  string
+	overlay      string
+	delivery     Delivery
+	trusted      bool
+	kind         string
+	block        ton.BlockIDExt
+	prev         ton.BlockIDExt
+	sourcePeerID PeerID
+	receivedAt   time.Time
+	msg          any
+	proofRoot    *cell.Cell
+	expiresAt    time.Time
+	bytes        int64
 }
 
 func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDecode) {
@@ -112,20 +112,20 @@ func (n *Node) processPendingBlockBroadcastDecodes(ctx context.Context, now time
 		}
 
 		n.forgetPendingBlockBroadcastDecode(req.fingerprint)
-		downloaded.SourceKey = req.sourceKey
+		downloaded.SourcePeerID = req.sourcePeerID
 		accepted := acceptedBroadcast{
 			fingerprint:        req.fingerprint,
 			deduped:            true,
 			skipAcceptedMetric: true,
 			event: &BroadcastEvent{
-				Overlay:    req.overlay,
-				Delivery:   req.delivery,
-				Trusted:    req.trusted,
-				Kind:       req.kind,
-				Block:      cloneBlockID(req.block),
-				SourceKey:  req.sourceKey,
-				ReceivedAt: req.receivedAt,
-				Downloaded: downloaded,
+				Overlay:      req.overlay,
+				Delivery:     req.delivery,
+				Trusted:      req.trusted,
+				Kind:         req.kind,
+				Block:        cloneBlockID(req.block),
+				SourcePeerID: req.sourcePeerID,
+				ReceivedAt:   req.receivedAt,
+				Downloaded:   downloaded,
 			},
 		}
 		n.acceptBroadcast(accepted)

@@ -7,9 +7,11 @@ import (
 	"testing"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
+	"github.com/xssnick/gton/service/p2p"
 )
 
 func TestRuntimeOptionsFromConfig(t *testing.T) {
+	customNodeID := bytes.Repeat([]byte{4}, p2p.PeerIDSize)
 	cfg := nodeconfig.Config{
 		TON: nodeconfig.TON{
 			GlobalConfigPath: "configs/global.config.json",
@@ -25,6 +27,7 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 		},
 		Lite: nodeconfig.Lite{
 			Enabled:          true,
+			NonFinalEnabled:  true,
 			Key:              testSeed(3),
 			ListenAddr:       "0.0.0.0:7445",
 			MasterBlockCache: 11,
@@ -38,6 +41,20 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 			ListenAddr: "127.0.0.1:9090",
 			Namespace:  "custom",
 		},
+		CustomOverlays: []nodeconfig.CustomOverlay{{
+			Name: "private-a",
+			Nodes: []nodeconfig.CustomOverlayNode{{
+				ADNLID:            customNodeID,
+				MsgSender:         true,
+				MsgSenderPriority: 7,
+				BlockSender:       true,
+			}},
+			SenderShards: []nodeconfig.CustomOverlayShard{{
+				Workchain: 0,
+				Shard:     topShard,
+			}},
+			SkipPublicMsgSend: true,
+		}},
 	}
 
 	opts, err := p2pOptionsFromConfig(cfg)
@@ -65,6 +82,26 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	if opts.DHTListenAddr != "0.0.0.0:30304" {
 		t.Fatalf("unexpected DHT listen addr %q", opts.DHTListenAddr)
 	}
+	if len(opts.CustomOverlays) != 1 {
+		t.Fatalf("unexpected custom overlay count %d", len(opts.CustomOverlays))
+	}
+	customOverlay := opts.CustomOverlays[0]
+	if customOverlay.Name != "private-a" || !customOverlay.SkipPublicMsgSend {
+		t.Fatalf("unexpected custom overlay metadata: %+v", customOverlay)
+	}
+	if len(customOverlay.Nodes) != 1 {
+		t.Fatalf("unexpected custom overlay node count %d", len(customOverlay.Nodes))
+	}
+	customNode := customOverlay.Nodes[0]
+	if !bytes.Equal(customNode.ADNLID.Bytes(), customNodeID) {
+		t.Fatal("unexpected custom overlay ADNL id")
+	}
+	if !customNode.MsgSender || customNode.MsgSenderPriority != 7 || !customNode.BlockSender {
+		t.Fatalf("unexpected custom overlay node roles: %+v", customNode)
+	}
+	if len(customOverlay.SenderShards) != 1 || customOverlay.SenderShards[0].Shard != topShard {
+		t.Fatalf("unexpected custom overlay sender shards: %+v", customOverlay.SenderShards)
+	}
 
 	liteOpts, err := liteserverOptionsFromConfig(cfg)
 	if err != nil {
@@ -72,6 +109,9 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	}
 	if !liteOpts.Enabled {
 		t.Fatal("expected liteserver to be enabled")
+	}
+	if !liteOpts.NonFinalEnabled {
+		t.Fatal("expected liteserver non-final mode to be enabled")
 	}
 	if liteOpts.ListenAddr != "0.0.0.0:7445" {
 		t.Fatalf("unexpected liteserver listen addr %q", liteOpts.ListenAddr)
@@ -98,6 +138,20 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	}
 	if metricsOpts.Namespace != "custom" {
 		t.Fatalf("unexpected metrics namespace %q", metricsOpts.Namespace)
+	}
+}
+
+func TestP2POptionsRejectsInvalidCustomOverlays(t *testing.T) {
+	_, err := p2pOptionsFromConfig(nodeconfig.Config{
+		CustomOverlays: []nodeconfig.CustomOverlay{{
+			Name: "private-a",
+			Nodes: []nodeconfig.CustomOverlayNode{{
+				ADNLID: []byte{1},
+			}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected invalid custom overlay config to fail")
 	}
 }
 

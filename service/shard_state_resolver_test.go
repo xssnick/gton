@@ -331,7 +331,7 @@ func TestShardStateResolverReusesSplitChildrenWhenTheyMerge(t *testing.T) {
 	env.addBlock(right, parent)
 	env.addBlock(merged, left, right)
 
-	cache := map[string]*storage.BlockState{}
+	cache := map[storage.BlockRootHash]*storage.BlockState{}
 	splitResolver := newShardStateResolver(ctx, shardStateResolverConfig{
 		current: map[storage.ShardKey]storage.BlockState{
 			storage.ShardKeyFromBlock(parent): {Block: parent},
@@ -439,7 +439,7 @@ func TestShardStateResolverUsesUpdatedCurrentState(t *testing.T) {
 
 	nextBlockLoads := env.blockLoads[storage.BlockKey(next)]
 	resolver.mu.Lock()
-	resolver.cache = map[string]*storage.BlockState{}
+	resolver.cache = map[storage.BlockRootHash]*storage.BlockState{}
 	resolver.mu.Unlock()
 	resolver.updateCurrent(map[storage.ShardKey]storage.BlockState{
 		storage.ShardKeyFromBlock(next): *nextState,
@@ -454,10 +454,10 @@ func TestShardStateResolverUsesUpdatedCurrentState(t *testing.T) {
 }
 
 type fakeShardStateResolverEnv struct {
-	states       map[string]*storage.BlockState
-	blocks       map[string]PreparedBlock
-	stateLoads   map[string]int
-	blockLoads   map[string]int
+	states       map[storage.BlockRootHash]*storage.BlockState
+	blocks       map[storage.BlockRootHash]PreparedBlock
+	stateLoads   map[storage.BlockRootHash]int
+	blockLoads   map[storage.BlockRootHash]int
 	stateLoadSeq []ton.BlockIDExt
 	blockLoadSeq []ton.BlockIDExt
 	applied      []ton.BlockIDExt
@@ -466,10 +466,10 @@ type fakeShardStateResolverEnv struct {
 
 func newFakeShardStateResolverEnv() *fakeShardStateResolverEnv {
 	return &fakeShardStateResolverEnv{
-		states:     map[string]*storage.BlockState{},
-		blocks:     map[string]PreparedBlock{},
-		stateLoads: map[string]int{},
-		blockLoads: map[string]int{},
+		states:     map[storage.BlockRootHash]*storage.BlockState{},
+		blocks:     map[storage.BlockRootHash]PreparedBlock{},
+		stateLoads: map[storage.BlockRootHash]int{},
+		blockLoads: map[storage.BlockRootHash]int{},
 	}
 }
 

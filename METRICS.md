@@ -81,8 +81,9 @@ checkpoint persistence.
 | `gton_sync_blocks_total` | counter | `pipeline`, `chain`, `source`, `result`, `catch_up` | Number of blocks processed by sync pipelines. |
 | `gton_sync_block_origins_total` | counter | `pipeline`, `chain`, `origin`, `result`, `catch_up` | Number of synchronized blocks grouped by origin: `broadcast`, `download`, `stored`, or `other`. |
 | `gton_sync_block_download_duration_seconds` | histogram | `pipeline`, `chain`, `source`, `result`, `catch_up` | Block download duration. |
-| `gton_sync_block_prepare_duration_seconds` | histogram | `pipeline`, `chain`, `shard`, `source`, `result`, `catch_up` | Block preparation duration, including downloaded block validation and state-cell preparation, excluding apply. |
-| `gton_sync_block_apply_duration_seconds` | histogram | `pipeline`, `chain`, `result` | Block state transition duration for state-apply pipelines; for `blocksync`, broadcast processing duration. |
+| `gton_sync_block_prepare_duration_seconds` | histogram | `pipeline`, `chain`, `shard`, `source`, `result`, `catch_up` | Post-download block processing duration, including validation, consensus checks, and state-cell preparation after the block is dequeued; excludes network download, queue wait, and state apply. |
+| `gton_sync_block_apply_duration_seconds` | histogram | `pipeline`, `chain`, `result` | Block state transition duration for state-apply pipelines. |
+| `gton_sync_master_shards_obtain_duration_seconds` | histogram | `pipeline`, `stage`, `result`, `catch_up` | Time spent obtaining a master block or the shard blocks needed for one master transition; excludes state apply and checkpoint persistence. |
 | `gton_sync_checkpoints_total` | counter | `mode`, `result` | Number of current-state checkpoints. |
 | `gton_sync_persist_duration_seconds` | histogram | `mode`, `result` | Time spent writing a current-state checkpoint. |
 | `gton_sync_persist_queue_seconds` | histogram | `mode`, `result` | Time spent waiting before a current-state checkpoint write can run. |
@@ -94,6 +95,7 @@ Common label values:
 - `shard`: `masterchain`, `basechain`, or a 16-digit shard id.
 - `source`: `broadcast`, `broadcast_queue`, `broadcast_candidate`, `broadcast_cache`, `broadcast_hint`, `queue`, `peer_catch_up`, `peer_probe`, `next_block`, `indexed`, `next_description`, `stored`, `unknown`.
 - `origin`: `broadcast`, `download`, `stored`, `other`, or `unknown`.
+- `stage`: `master` or `shards`.
 - `result`: `success`, `miss`, `timeout`, `canceled`, `retry`, or `error`.
 - `catch_up`: `true` or `false`.
 - `mode`: `next_block_async`, `next_block_sync`.
@@ -123,12 +125,13 @@ sync queues.
 | `gton_p2p_queue_bytes` | gauge | `queue` | Estimated bytes held by a P2P queue. |
 | `gton_p2p_queue_max_items` | gauge | `queue` | Configured item limit for a P2P queue. |
 | `gton_p2p_queue_max_bytes` | gauge | `queue` | Configured byte limit for a P2P queue. |
-| `gton_p2p_queue_pushed_total` | counter | `queue` | Number of accepted pushes into a P2P queue. |
 | `gton_p2p_queue_dropped_total` | counter | `queue` | Number of rejected pushes into a P2P queue. |
-| `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind` | Number of P2P broadcasts accepted or successfully rebroadcasted by type. |
+| `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind` | Number of P2P broadcasts accepted or successfully sent through the app-level rebroadcast queue by type. |
 | `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. |
-| `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful P2P rebroadcast sends. |
-| `gton_p2p_rebroadcast_dropped_total` | counter | `queue` | Number of P2P rebroadcast messages dropped before a successful send. |
+| `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful app-level P2P rebroadcast queue sends. |
+| `gton_p2p_rebroadcast_dropped_total` | counter | `queue` | Number of app-level P2P rebroadcast queue messages dropped before a successful send. |
+| `gton_p2p_broadcast_relay_sent_total` | counter | `overlay`, `delivery` | Number of successful overlay-level broadcast relay sends. `delivery="fec"` counts FEC part sends; `delivery="simple"` counts simple broadcast sends. |
+| `gton_p2p_broadcast_relay_failed_total` | counter | `overlay`, `delivery` | Number of failed overlay-level broadcast relay sends. `delivery="fec"` counts FEC part send failures; `delivery="simple"` counts simple broadcast send failures. |
 | `gton_blocksync_queue_items` | gauge | `queue` | Current block sync queue length. |
 | `gton_blocksync_queue_capacity` | gauge | `queue` | Block sync queue capacity. |
 | `gton_blocksync_queue_dropped_total` | counter | `queue` | Number of dropped block sync queue items. |
@@ -140,7 +143,8 @@ Common `queue` values:
 - Blocksync queues: `output`, `shard_description`.
 
 Common `direction` values for `gton_p2p_broadcasts_total` are `accepted` and
-`rebroadcasted`.
+`queue_rebroadcasted`. Overlay-level relay sends are exported separately via
+`gton_p2p_broadcast_relay_sent_total`.
 
 Common `reason` values for `gton_p2p_broadcast_dropped_total` include `seen`,
 `invalid_payload`, `decode_failed`, `signature_parse_failed`, and
@@ -163,26 +167,20 @@ growth.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `gton_storage_db_status_available` | gauge | none | `1` when DB status was collected successfully, `0` when collection failed. |
-| `gton_storage_archive_packages` | gauge | none | Number of archive `.pack` files under the archive package directory. |
 | `gton_storage_archive_package_bytes` | gauge | none | Total bytes used by archive `.pack` files under the archive package directory. |
-| `gton_storage_persistent_state_masters` | gauge | none | Number of distinct masterchain seqnos represented by persistent state files. |
 | `gton_storage_persistent_state_bytes` | gauge | none | Total bytes used by recognized persistent state files under the persistent state directory. |
 | `gton_storage_cell_db_generation` | gauge | `generation` | Numeric cell DB generation id for the stable generation label. |
 | `gton_storage_cell_db_cache_bytes` | gauge | `generation`, `cache` | Cell DB cache size. `cache` is `block` or `file`. |
 | `gton_storage_cell_db_cache_requests_total` | counter | `generation`, `result` | Block cache requests. `result` is `hit` or `miss`. |
-| `gton_storage_cell_db_file_cache_tables` | gauge | `generation` | Number of file cache tables. |
 | `gton_storage_cell_db_disk_bytes` | gauge | `generation`, `shard` | Disk space used by cell DB tables. |
 | `gton_storage_cell_db_live_bytes` | gauge | `generation`, `shard` | Live table bytes. |
-| `gton_storage_cell_db_live_tables` | gauge | `generation`, `shard` | Live table count. |
 | `gton_storage_cell_db_read_amp` | gauge | `generation`, `shard` | Read amplification estimate. |
 | `gton_storage_cell_db_l0_files` | gauge | `generation`, `shard` | Number of L0 files. |
 | `gton_storage_cell_db_l0_sublevels` | gauge | `generation`, `shard` | Number of L0 sublevels. |
-| `gton_storage_cell_db_l0_bytes` | gauge | `generation`, `shard` | Bytes in L0 tables. |
 | `gton_storage_cell_db_compaction_debt_bytes` | gauge | `generation`, `shard` | Estimated compaction debt. |
 | `gton_storage_cell_db_compactions_in_progress` | gauge | `generation`, `shard` | Number of compactions currently running. |
 | `gton_storage_cell_db_compaction_in_progress_bytes` | gauge | `generation`, `shard` | Bytes currently being compacted. |
 | `gton_storage_cell_db_memtable_bytes` | gauge | `generation`, `shard` | Memtable bytes. |
-| `gton_storage_cell_db_memtable_count` | gauge | `generation`, `shard` | Memtable count. |
 | `gton_storage_cell_db_table_iters` | gauge | `generation`, `shard` | Open table iterator count. |
 | `gton_storage_cell_db_flushes_total` | counter | `generation`, `shard` | Pebble flush count. |
 | `gton_storage_cell_db_ingests_total` | counter | `generation`, `shard` | Pebble ingest count. |

@@ -674,10 +674,13 @@ func probeBytesPerSecond(probe persistentStatePeerProbe) float64 {
 
 func (d persistentStateSnapshotDownloader) probePersistentStateCandidates(ctx context.Context, candidates []persistentStateCandidate, probeChunks int, chunkLimiter chan struct{}) ([]persistentStatePeerProbe, []error) {
 	peers := make([]*overlayPeer, 0, len(candidates))
-	candidateByPeer := make(map[string]persistentStateCandidate, len(candidates))
+	candidateByPeer := make(map[PeerID]persistentStateCandidate, len(candidates))
 	for _, candidate := range candidates {
 		peers = append(peers, candidate.peer)
-		candidateByPeer[downloadPeerKey(candidate.peer)] = candidate
+		peerID := downloadPeerID(candidate.peer)
+		if !peerID.IsZero() {
+			candidateByPeer[peerID] = candidate
+		}
 	}
 
 	results, errs := runPeerRequests(ctx, peers, peerRequestOptions{
@@ -693,7 +696,7 @@ func (d persistentStateSnapshotDownloader) probePersistentStateCandidates(ctx co
 				Msg("persistent state peer probe grace elapsed, selecting from ready peers")
 		},
 	}, func(queryCtx context.Context, peer *overlayPeer) (persistentStatePeerProbe, error) {
-		candidate := candidateByPeer[downloadPeerKey(peer)]
+		candidate := candidateByPeer[downloadPeerID(peer)]
 		return d.probePersistentStatePeer(queryCtx, candidate, probeChunks, chunkLimiter)
 	})
 

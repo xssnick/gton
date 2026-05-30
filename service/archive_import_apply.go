@@ -15,7 +15,7 @@ import (
 
 type archiveShardBlockLoader struct {
 	master ton.BlockIDExt
-	blocks map[string]PreparedBlock
+	blocks map[storage.BlockRootHash]PreparedBlock
 	mu     *sync.Mutex
 }
 
@@ -27,7 +27,7 @@ type shardClientArchiveWindow struct {
 	masterBlocks   map[uint32]PreparedBlock
 	masterSequence []PreparedBlock
 	masterProofs   map[uint32]*masterchainConsensusProof
-	archiveBlocks  map[string]PreparedBlock
+	archiveBlocks  map[storage.BlockRootHash]PreparedBlock
 	archiveImports []*archiveImportResult
 	stateCells     *archiveStateCellOverlay
 	appliedStates  appliedStateSet
@@ -60,7 +60,7 @@ func (l archiveShardBlockLoader) load(_ context.Context, block ton.BlockIDExt) (
 	return downloaded, nil
 }
 
-func (l archiveShardBlockLoader) block(key string) (PreparedBlock, bool) {
+func (l archiveShardBlockLoader) block(key storage.BlockRootHash) (PreparedBlock, bool) {
 	if l.mu == nil {
 		downloaded, ok := l.blocks[key]
 		return downloaded, ok
@@ -198,7 +198,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 }
 
 func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context, current *storage.CurrentState, window *shardClientArchiveWindow) (*storage.CurrentState, error) {
-	applied := map[string]*storage.BlockState{}
+	applied := map[storage.BlockRootHash]*storage.BlockState{}
 	next := storage.CloneCurrentState(current)
 
 	seqno := current.ShardClientSeqno + 1
@@ -234,7 +234,7 @@ func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context
 	return next, nil
 }
 
-func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, master ton.BlockIDExt, current map[storage.ShardKey]storage.BlockState, applied map[string]*storage.BlockState, blocks map[string]PreparedBlock, targets []ton.BlockIDExt, window *shardClientArchiveWindow) (map[storage.ShardKey]*storage.BlockState, error) {
+func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, master ton.BlockIDExt, current map[storage.ShardKey]storage.BlockState, applied map[storage.BlockRootHash]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock, targets []ton.BlockIDExt, window *shardClientArchiveWindow) (map[storage.ShardKey]*storage.BlockState, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}

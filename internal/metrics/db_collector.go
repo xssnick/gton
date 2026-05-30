@@ -18,19 +18,15 @@ type dbCollector struct {
 	generation                *prometheus.Desc
 	cacheBytes                *prometheus.Desc
 	cacheRequests             *prometheus.Desc
-	fileCacheTables           *prometheus.Desc
 	diskBytes                 *prometheus.Desc
 	liveBytes                 *prometheus.Desc
-	liveTables                *prometheus.Desc
 	readAmp                   *prometheus.Desc
 	l0Files                   *prometheus.Desc
 	l0Sublevels               *prometheus.Desc
-	l0Bytes                   *prometheus.Desc
 	compactionDebtBytes       *prometheus.Desc
 	compactionsInProgress     *prometheus.Desc
 	compactionInProgressBytes *prometheus.Desc
 	memtableBytes             *prometheus.Desc
-	memtableCount             *prometheus.Desc
 	tableIters                *prometheus.Desc
 	flushes                   *prometheus.Desc
 	ingests                   *prometheus.Desc
@@ -67,12 +63,6 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 			[]string{"generation", "result"},
 			nil,
 		),
-		fileCacheTables: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "storage", "cell_db_file_cache_tables"),
-			"Cell DB file cache table count.",
-			generationLabels,
-			nil,
-		),
 		diskBytes: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "cell_db_disk_bytes"),
 			"Cell DB disk space usage.",
@@ -82,12 +72,6 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 		liveBytes: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "cell_db_live_bytes"),
 			"Cell DB live table size.",
-			shardLabels,
-			nil,
-		),
-		liveTables: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "storage", "cell_db_live_tables"),
-			"Cell DB live table count.",
 			shardLabels,
 			nil,
 		),
@@ -106,12 +90,6 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 		l0Sublevels: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "cell_db_l0_sublevels"),
 			"Cell DB L0 sublevel count.",
-			shardLabels,
-			nil,
-		),
-		l0Bytes: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "storage", "cell_db_l0_bytes"),
-			"Cell DB L0 table size.",
 			shardLabels,
 			nil,
 		),
@@ -136,12 +114,6 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 		memtableBytes: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "storage", "cell_db_memtable_bytes"),
 			"Cell DB memtable size.",
-			shardLabels,
-			nil,
-		),
-		memtableCount: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "storage", "cell_db_memtable_count"),
-			"Cell DB memtable count.",
 			shardLabels,
 			nil,
 		),
@@ -183,19 +155,15 @@ func (c *dbCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.generation
 	ch <- c.cacheBytes
 	ch <- c.cacheRequests
-	ch <- c.fileCacheTables
 	ch <- c.diskBytes
 	ch <- c.liveBytes
-	ch <- c.liveTables
 	ch <- c.readAmp
 	ch <- c.l0Files
 	ch <- c.l0Sublevels
-	ch <- c.l0Bytes
 	ch <- c.compactionDebtBytes
 	ch <- c.compactionsInProgress
 	ch <- c.compactionInProgressBytes
 	ch <- c.memtableBytes
-	ch <- c.memtableCount
 	ch <- c.tableIters
 	ch <- c.flushes
 	ch <- c.ingests
@@ -233,7 +201,6 @@ func (c *dbCollector) collectGeneration(ch chan<- prometheus.Metric, generation 
 	ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, float64(generation.Cache.FileCacheSize), generationLabel, "file")
 	ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(generation.Cache.BlockCacheHits), generationLabel, "hit")
 	ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(generation.Cache.BlockCacheMisses), generationLabel, "miss")
-	ch <- prometheus.MustNewConstMetric(c.fileCacheTables, prometheus.GaugeValue, float64(generation.Cache.FileCacheTableCount), generationLabel)
 
 	for _, shard := range generation.Shards {
 		c.collectShard(ch, generationLabel, strconv.Itoa(shard.Shard), shard)
@@ -253,16 +220,13 @@ func cellDBGenerationLabel(role string) string {
 func (c *dbCollector) collectShard(ch chan<- prometheus.Metric, generation string, shardLabel string, shard pebblestore.CellDBShardStatus) {
 	ch <- prometheus.MustNewConstMetric(c.diskBytes, prometheus.GaugeValue, float64(shard.DiskSize), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.liveBytes, prometheus.GaugeValue, float64(shard.LiveSize), generation, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.liveTables, prometheus.GaugeValue, float64(shard.LiveTables), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.readAmp, prometheus.GaugeValue, float64(shard.ReadAmp), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.l0Files, prometheus.GaugeValue, float64(shard.L0Files), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.l0Sublevels, prometheus.GaugeValue, float64(shard.L0Sublevels), generation, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.l0Bytes, prometheus.GaugeValue, float64(shard.L0Size), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.compactionDebtBytes, prometheus.GaugeValue, float64(shard.CompactionDebt), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.compactionsInProgress, prometheus.GaugeValue, float64(shard.CompactionsInProgress), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.compactionInProgressBytes, prometheus.GaugeValue, float64(shard.CompactionInProgressSize), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.memtableBytes, prometheus.GaugeValue, float64(shard.MemTableSize), generation, shardLabel)
-	ch <- prometheus.MustNewConstMetric(c.memtableCount, prometheus.GaugeValue, float64(shard.MemTableCount), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.tableIters, prometheus.GaugeValue, float64(shard.TableIters), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.flushes, prometheus.CounterValue, float64(shard.Flushes), generation, shardLabel)
 	ch <- prometheus.MustNewConstMetric(c.ingests, prometheus.CounterValue, float64(shard.Ingests), generation, shardLabel)
