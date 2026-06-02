@@ -48,8 +48,11 @@ func (testAcceptBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(contex
 	return nil
 }
 
-func (testAcceptBroadcastSignatureVerifier) CheckShardDescriptionSignatures(context.Context, ShardDescriptionSignatureCheck) error {
-	return nil
+func (testAcceptBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(_ context.Context, req ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {
+	return &ShardBlockDescription{
+		Block:         req.Block,
+		CatchainSeqno: uint32(req.CatchainSeqno),
+	}, nil
 }
 
 type testRejectBroadcastSignatureVerifier struct {
@@ -60,8 +63,14 @@ func (v testRejectBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(cont
 	return v.err
 }
 
-func (v testRejectBroadcastSignatureVerifier) CheckShardDescriptionSignatures(context.Context, ShardDescriptionSignatureCheck) error {
-	return v.err
+func (v testRejectBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(context.Context, ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {
+	return nil, v.err
+}
+
+type testBroadcastAdmission bool
+
+func (a testBroadcastAdmission) CanAcceptBroadcast(BroadcastAdmissionRequest) bool {
+	return bool(a)
 }
 
 func newTestPebbleStore(tb testing.TB) *pebblestore.Store {

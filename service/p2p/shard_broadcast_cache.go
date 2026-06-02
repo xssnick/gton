@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -117,8 +118,8 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		blockRoot:    blockRoot,
 		proofRoot:    proofRoot,
 		stateUpdate:  stateUpdate,
-		blockBOC:     append([]byte(nil), downloaded.BlockBOC...),
-		proofBOC:     append([]byte(nil), downloaded.ProofBOC...),
+		blockBOC:     downloaded.BlockBOC,
+		proofBOC:     downloaded.ProofBOC,
 		isLink:       downloaded.IsLink,
 		meta:         meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
@@ -260,12 +261,12 @@ func shardBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
 	return int64(len(blockBOC)*2 + len(proofBOC)*2 + shardBroadcastBlockCacheOverhead)
 }
 
-func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
+func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 	if downloaded == nil || n.shardBroadcastCache == nil {
-		return
+		return false
 	}
 	if isMasterchainBlock(downloaded.ID) {
-		return
+		return false
 	}
 
 	validated, err := validateShardBroadcastBlock(downloaded)
@@ -274,7 +275,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
 			Err(err).
 			Str("block", formatBlockRef(downloaded.ID)).
 			Msg("dropping shard block broadcast from hot cache")
-		return
+		return false
 	}
 
 	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.blockRoot, validated.proofRoot, validated.stateUpdate, time.Now()); err != nil {
@@ -282,25 +283,40 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) {
 			Err(err).
 			Str("block", formatBlockRef(downloaded.ID)).
 			Msg("failed to cache shard block broadcast")
-		return
+		return false
 	}
 
 	n.log.Debug().
 		Str("block", formatBlockRef(downloaded.ID)).
 		Msg("cached shard block broadcast")
 	n.notifyShardBroadcastBlock(downloaded.ID)
+	return true
 }
 
 func (n *Node) popShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, error) {
+	popStarted := n.startBroadcastPipelineStage()
+	kind := shardDescriptionBroadcastKind
+	result := broadcastPipelineResultMiss
+	defer func() {
+		n.observeBroadcastPipelineStageSince(popStarted, broadcastPipelineStageExactPop, kind, "", result)
+	}()
+
 	if n.shardBroadcastCache == nil || isMasterchainBlock(block) {
 		return nil, tnstore.ErrNotFound
 	}
 
 	downloaded, err := n.shardBroadcastCache.PopBlock(block)
 	if err != nil {
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			result = broadcastPipelineResultError
+		}
 		return nil, err
 	}
 
+	if downloaded.Kind != "" {
+		kind = downloaded.Kind
+	}
+	result = broadcastPipelineResultSuccess
 	n.log.Debug().
 		Str("block", formatBlockRef(block)).
 		Msg("using cached shard block broadcast")
@@ -456,11 +472,5 @@ func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBro
 }
 
 func cloneBlockID(block ton.BlockIDExt) ton.BlockIDExt {
-	return ton.BlockIDExt{
-		Workchain: block.Workchain,
-		Shard:     block.Shard,
-		SeqNo:     block.SeqNo,
-		RootHash:  append([]byte(nil), block.RootHash...),
-		FileHash:  append([]byte(nil), block.FileHash...),
-	}
+	return block
 }

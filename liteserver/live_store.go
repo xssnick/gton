@@ -26,10 +26,12 @@ var (
 )
 
 type LiveStoreOptions struct {
-	MasterBlockCache int
-	ShardBlockCache  int
-	NonFinalEnabled  bool
-	NonFinalCache    int
+	MasterBlockCache   int
+	ShardBlockCache    int
+	NonFinalEnabled    bool
+	NonFinalCache      int
+	NonFinalCellLoader cell.LazyCellLoader
+	LiveBlockCache     *storage.LiveBlockCache
 }
 
 type LiveStore struct {
@@ -48,6 +50,7 @@ type LiveStore struct {
 	ltIndex            map[liveHistoryKey][]liveLTIndexEntry
 	unixIndex          map[liveHistoryKey][]liveUnixIndexEntry
 	flushed            map[storage.BlockRootHash]liveBlockFlush
+	liveBlockCache     *storage.LiveBlockCache
 	masterOrder        liveBlockOrder
 	shardOrder         liveBlockOrder
 	masterEvictable    int
@@ -65,35 +68,29 @@ type LiveStore struct {
 }
 
 type liveBlock struct {
-	id     ton.BlockIDExt
-	root   *cell.Cell
-	data   []byte
-	meta   *storage.BlockMeta
-	proofs map[storage.ServedProofKind][]byte
-
-	blockDataFlushed bool
-	stateFlushed     bool
-	proofsFlushed    bool
+	id              ton.BlockIDExt
+	root            *cell.Cell
+	meta            *storage.BlockMeta
+	artifactFlushed bool
+	stateFlushed    bool
 
 	fragments *liveBlockFragments
 }
 
 type liveBlockFlush struct {
-	blockData bool
-	state     bool
-	proofs    bool
+	artifact bool
+	state    bool
 }
 
 type livePreparedBlockArtifacts struct {
-	block            ton.BlockIDExt
-	root             *cell.Cell
-	data             []byte
-	meta             *storage.BlockMeta
-	state            *storage.BlockState
-	proofs           map[storage.ServedProofKind][]byte
-	blockDataFlushed bool
-	stateFlushed     bool
-	proofsFlushed    bool
+	block           ton.BlockIDExt
+	root            *cell.Cell
+	data            []byte
+	meta            *storage.BlockMeta
+	state           *storage.BlockState
+	proofs          map[storage.ServedProofKind][]byte
+	artifactFlushed bool
+	stateFlushed    bool
 }
 
 type liveMasterchainInfo struct {
@@ -168,6 +165,13 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 	if store, ok := store.(lazyCellLoaderStore); ok {
 		nonFinalCellLoader = store.LazyCellLoader()
 	}
+	if cfg.NonFinalCellLoader != nil {
+		nonFinalCellLoader = cfg.NonFinalCellLoader
+	}
+	liveBlockCache := cfg.LiveBlockCache
+	if liveBlockCache == nil {
+		liveBlockCache = storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
+	}
 
 	return &LiveStore{
 		Store:              store,
@@ -179,6 +183,7 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 		ltIndex:            map[liveHistoryKey][]liveLTIndexEntry{},
 		unixIndex:          map[liveHistoryKey][]liveUnixIndexEntry{},
 		flushed:            map[storage.BlockRootHash]liveBlockFlush{},
+		liveBlockCache:     liveBlockCache,
 		masterOrder:        newLiveBlockOrder(),
 		shardOrder:         newLiveBlockOrder(),
 		masterCacheSize:    cfg.MasterBlockCache,
@@ -189,6 +194,19 @@ func NewLiveStore(store Store, opts ...LiveStoreOptions) *LiveStore {
 		nonFinalWaiting:    map[storage.BlockRootHash]liveNonfinalWaiting{},
 		nonFinalCellLoader: nonFinalCellLoader,
 	}
+}
+
+func (s *LiveStore) SetNonfinalCellLoader(loader cell.LazyCellLoader) {
+	s.mu.Lock()
+	s.nonFinalCellLoader = loader
+	s.mu.Unlock()
+}
+
+func (s *LiveStore) LiveBlockCache() *storage.LiveBlockCache {
+	if s == nil {
+		return nil
+	}
+	return s.liveBlockCache
 }
 
 func (s *LiveStore) SetLiveCurrentState(current *storage.CurrentState) {
@@ -257,7 +275,7 @@ func (s *LiveStore) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt,
 	return block, stateRootHash, lastUTime, nil
 }
 
-func (s *LiveStore) publishLiveBlockData(block ton.BlockIDExt, root *cell.Cell, data []byte, flushed bool) error {
+func (s *LiveStore) publishLiveBlockData(block ton.BlockIDExt, root *cell.Cell, data []byte, artifactFlushed bool) error {
 	if root == nil {
 		if len(data) == 0 {
 			return errors.New("live block has no cell tree or BOC")
@@ -274,17 +292,14 @@ func (s *LiveStore) publishLiveBlockData(block ton.BlockIDExt, root *cell.Cell, 
 	if err != nil {
 		return err
 	}
-	if len(data) > 0 {
-		data = append([]byte(nil), data...)
-	}
 	meta, _ := storage.BuildBlockMetaFromBlockCell(block, root)
 
 	return s.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-		Block:            block,
-		Root:             root,
-		BlockData:        data,
-		Meta:             meta,
-		BlockDataFlushed: flushed,
+		Block:           block,
+		Root:            root,
+		BlockData:       data,
+		Meta:            meta,
+		ArtifactFlushed: artifactFlushed,
 	})
 }
 
@@ -292,6 +307,29 @@ func (s *LiveStore) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifac
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
 	if err != nil {
 		return err
+	}
+	if s.liveBlockCache != nil {
+		cacheArtifacts := storage.LiveBlockArtifacts{
+			Block:           prepared.block,
+			Root:            prepared.root,
+			BlockData:       prepared.data,
+			Meta:            prepared.meta,
+			State:           prepared.state,
+			ArtifactFlushed: prepared.artifactFlushed,
+			StateFlushed:    prepared.stateFlushed,
+		}
+		if len(prepared.proofs) > 0 {
+			cacheArtifacts.Proofs = make([]storage.LiveBlockProofArtifact, 0, len(prepared.proofs))
+			for kind, data := range prepared.proofs {
+				cacheArtifacts.Proofs = append(cacheArtifacts.Proofs, storage.LiveBlockProofArtifact{
+					Kind: kind,
+					Data: data,
+				})
+			}
+		}
+		if err = s.liveBlockCache.PublishLiveBlockArtifacts(cacheArtifacts); err != nil {
+			return err
+		}
 	}
 
 	s.mu.Lock()
@@ -331,7 +369,7 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 
 	var data []byte
 	if len(artifacts.BlockData) > 0 {
-		data = append([]byte(nil), artifacts.BlockData...)
+		data = artifacts.BlockData
 	}
 
 	meta := artifacts.Meta.Clone()
@@ -356,42 +394,40 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 		if len(proof.Data) == 0 {
 			continue
 		}
-		proofs[proof.Kind] = append([]byte(nil), proof.Data...)
+		proofs[proof.Kind] = proof.Data
 	}
 	if len(proofs) == 0 {
 		proofs = nil
 	}
 
 	return livePreparedBlockArtifacts{
-		block:            block,
-		root:             root,
-		data:             data,
-		meta:             meta,
-		state:            state,
-		proofs:           proofs,
-		blockDataFlushed: artifacts.BlockDataFlushed,
-		stateFlushed:     artifacts.StateFlushed,
-		proofsFlushed:    artifacts.ProofsFlushed,
+		block:           block,
+		root:            root,
+		data:            data,
+		meta:            meta,
+		state:           state,
+		proofs:          proofs,
+		artifactFlushed: artifacts.ArtifactFlushed,
+		stateFlushed:    artifacts.StateFlushed,
 	}, nil
 }
 
 func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveBlockArtifacts {
 	cloned := storage.LiveBlockArtifacts{
-		Block:            artifacts.Block,
-		Root:             artifacts.Root,
-		BlockData:        append([]byte(nil), artifacts.BlockData...),
-		Meta:             artifacts.Meta.Clone(),
-		State:            storage.CloneBlockState(artifacts.State),
-		BlockDataFlushed: artifacts.BlockDataFlushed,
-		StateFlushed:     artifacts.StateFlushed,
-		ProofsFlushed:    artifacts.ProofsFlushed,
+		Block:           artifacts.Block,
+		Root:            artifacts.Root,
+		BlockData:       artifacts.BlockData,
+		Meta:            artifacts.Meta.Clone(),
+		State:           storage.CloneBlockState(artifacts.State),
+		ArtifactFlushed: artifacts.ArtifactFlushed,
+		StateFlushed:    artifacts.StateFlushed,
 	}
 	if len(artifacts.Proofs) > 0 {
 		cloned.Proofs = make([]storage.LiveBlockProofArtifact, 0, len(artifacts.Proofs))
 		for _, proof := range artifacts.Proofs {
 			cloned.Proofs = append(cloned.Proofs, storage.LiveBlockProofArtifact{
 				Kind: proof.Kind,
-				Data: append([]byte(nil), proof.Data...),
+				Data: proof.Data,
 			})
 		}
 	}
@@ -401,18 +437,15 @@ func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveB
 func (s *LiveStore) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlockArtifacts) (bool, bool) {
 	key := storage.BlockKey(prepared.block)
 	flushed := s.flushed[key]
-	if flushed.blockData || flushed.state || flushed.proofs {
+	if flushed.artifact || flushed.state {
 		delete(s.flushed, key)
 	}
 	s.putBlockLocked(key, &liveBlock{
-		id:               prepared.block,
-		root:             prepared.root,
-		data:             prepared.data,
-		meta:             prepared.meta,
-		proofs:           prepared.proofs,
-		blockDataFlushed: prepared.blockDataFlushed || flushed.blockData,
-		stateFlushed:     prepared.stateFlushed || flushed.state,
-		proofsFlushed:    prepared.proofsFlushed || flushed.proofs,
+		id:              prepared.block,
+		root:            prepared.root,
+		meta:            prepared.meta,
+		artifactFlushed: prepared.artifactFlushed || flushed.artifact,
+		stateFlushed:    prepared.stateFlushed || flushed.state,
 	})
 	if prepared.state != nil {
 		s.rememberBlockStateLocked(*prepared.state)
@@ -427,11 +460,17 @@ func (s *LiveStore) publishLiveBlockArtifactsPreparedLocked(prepared livePrepare
 }
 
 func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
+	if s.liveBlockCache != nil {
+		s.liveBlockCache.MarkBlockFlushed(block)
+	}
+
 	key := storage.BlockKey(block)
 
 	s.mu.Lock()
 	if cached := s.blocks[key]; cached != nil {
-		s.markLiveBlockDataFlushedLocked(cached)
+		evictableBefore := s.liveBlockEvictableLocked(cached)
+		cached.artifactFlushed = true
+		s.adjustLiveEvictableStateLocked(cached, evictableBefore)
 		published := s.publishPendingCurrentLocked()
 		if s.nonFinalEnabled {
 			s.cleanupNonfinalPendingLocked()
@@ -444,8 +483,7 @@ func (s *LiveStore) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 		}
 	} else {
 		flushed := s.flushed[key]
-		flushed.blockData = true
-		flushed.proofs = true
+		flushed.artifact = true
 		s.flushed[key] = flushed
 	}
 	s.mu.Unlock()
@@ -616,8 +654,14 @@ func (s *LiveStore) BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.
 }
 
 func (s *LiveStore) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	if data, ok := s.cachedBlockData(block); ok {
-		return data, nil
+	if s.liveBlockCache != nil {
+		data, err := s.liveBlockCache.BlockData(ctx, block)
+		if err == nil {
+			return data, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
 	}
 	if s.Store == nil || !s.backingBlockAllowed(block) {
 		return nil, storage.ErrNotFound
@@ -631,8 +675,14 @@ func (s *LiveStore) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte
 }
 
 func (s *LiveStore) BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	if proof, ok := s.cachedBlockProof(kind, block); ok {
-		return proof, nil
+	if s.liveBlockCache != nil {
+		proof, err := s.liveBlockCache.BlockProof(ctx, kind, block)
+		if err == nil {
+			return proof, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
 	}
 	if s.Store == nil || !s.backingBlockAllowed(block) {
 		return nil, storage.ErrNotFound
@@ -708,10 +758,10 @@ func (s *LiveStore) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (
 			return nil, err
 		}
 		if err = s.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-			Block:            block,
-			Root:             root,
-			BlockData:        data,
-			BlockDataFlushed: true,
+			Block:           block,
+			Root:            root,
+			BlockData:       data,
+			ArtifactFlushed: true,
 		}); err != nil {
 			return nil, err
 		}
@@ -804,7 +854,7 @@ func (s *LiveStore) updateMasterchainInfoLocked(current *storage.CurrentState) {
 	}
 
 	block := current.Masterchain.Block
-	stateRootHash := bytes.Clone(current.Masterchain.StateRootHash)
+	stateRootHash := current.Masterchain.StateRootHash
 	lastUTime := uint32(0)
 	if current.Masterchain.Parsed != nil {
 		lastUTime = current.Masterchain.Parsed.GenUTime
@@ -812,7 +862,7 @@ func (s *LiveStore) updateMasterchainInfoLocked(current *storage.CurrentState) {
 
 	if meta := s.metas[storage.BlockKey(block)]; meta != nil {
 		if len(stateRootHash) == 0 {
-			stateRootHash = bytes.Clone(meta.StateRootHash)
+			stateRootHash = meta.StateRootHash
 		}
 		if lastUTime == 0 {
 			lastUTime = meta.GenUTime
@@ -849,9 +899,14 @@ func (s *LiveStore) blockDataReadyLocked(block ton.BlockIDExt) bool {
 	if blockStateFromCurrent(s.current, block) != nil {
 		return true
 	}
+	if s.liveBlockCache != nil {
+		if _, err := s.liveBlockCache.BlockData(context.Background(), block); err == nil {
+			return true
+		}
+	}
 
 	cached := s.blocks[storage.BlockKey(block)]
-	return cached != nil && liveBlockHasData(cached)
+	return cached != nil && cached.artifactFlushed
 }
 
 func (s *LiveStore) updateReadyMasterSeqnoLocked() bool {
@@ -864,37 +919,6 @@ func (s *LiveStore) updateReadyMasterSeqnoLocked() bool {
 		return false
 	}
 	s.readyMasterSeqno = next
-	return true
-}
-
-func liveBlockHasData(block *liveBlock) bool {
-	if block == nil {
-		return false
-	}
-	return len(block.data) > 0
-}
-
-func mergeLiveBlockProofs(base map[storage.ServedProofKind][]byte, next map[storage.ServedProofKind][]byte) map[storage.ServedProofKind][]byte {
-	if len(base) == 0 && len(next) == 0 {
-		return nil
-	}
-
-	merged := make(map[storage.ServedProofKind][]byte, len(base)+len(next))
-	for kind, data := range base {
-		merged[kind] = data
-	}
-	for kind, data := range next {
-		merged[kind] = data
-	}
-	return merged
-}
-
-func liveProofsCovered(base map[storage.ServedProofKind][]byte, next map[storage.ServedProofKind][]byte) bool {
-	for kind, data := range next {
-		if !bytes.Equal(base[kind], data) {
-			return false
-		}
-	}
 	return true
 }
 
@@ -993,34 +1017,14 @@ func (s *LiveStore) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
 }
 
 func (s *LiveStore) cachedBlockData(block ton.BlockIDExt) ([]byte, bool) {
-	key := storage.BlockKey(block)
+	if s.liveBlockCache != nil {
+		data, err := s.liveBlockCache.BlockData(context.Background(), block)
+		if err == nil {
+			return data, true
+		}
+	}
 
-	s.mu.RLock()
-	cached := s.blocks[key]
-	s.mu.RUnlock()
-	if cached == nil {
-		return nil, false
-	}
-	if len(cached.data) > 0 {
-		return cached.data, true
-	}
 	return nil, false
-}
-
-func (s *LiveStore) cachedBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, bool) {
-	key := storage.BlockKey(block)
-
-	s.mu.RLock()
-	cached := s.blocks[key]
-	s.mu.RUnlock()
-	if cached == nil {
-		return nil, false
-	}
-	proof := cached.proofs[kind]
-	if len(proof) == 0 {
-		return nil, false
-	}
-	return proof, true
 }
 
 func (s *LiveStore) cachedBlockFragments(block ton.BlockIDExt) *liveBlockFragments {
@@ -1056,20 +1060,14 @@ func (s *LiveStore) rememberBlockFragments(block ton.BlockIDExt, fragments *live
 func (s *LiveStore) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 	if existing := s.blocks[key]; existing != nil {
 		existingEvictable := s.liveBlockEvictableLocked(existing)
-		incomingProofs := block.proofs
 		if block.root == nil {
 			block.root = existing.root
-		}
-		if len(block.data) == 0 {
-			block.data = existing.data
 		}
 		if existing.meta != nil || block.meta != nil {
 			block.meta = storage.MergeBlockMeta(existing.meta, block.meta)
 		}
-		block.proofs = mergeLiveBlockProofs(existing.proofs, block.proofs)
-		block.blockDataFlushed = block.blockDataFlushed || existing.blockDataFlushed
+		block.artifactFlushed = block.artifactFlushed || existing.artifactFlushed
 		block.stateFlushed = block.stateFlushed || existing.stateFlushed
-		block.proofsFlushed = block.proofsFlushed || existing.proofsFlushed && liveProofsCovered(existing.proofs, incomingProofs)
 		if block.fragments == nil {
 			block.fragments = existing.fragments
 		}
@@ -1126,13 +1124,6 @@ func (s *LiveStore) trimBlocksLocked(kind liveBlockCacheKind) {
 	}
 }
 
-func (s *LiveStore) markLiveBlockDataFlushedLocked(cached *liveBlock) {
-	evictableBefore := s.liveBlockEvictableLocked(cached)
-	cached.blockDataFlushed = true
-	cached.proofsFlushed = true
-	s.adjustLiveEvictableStateLocked(cached, evictableBefore)
-}
-
 func (s *LiveStore) markLiveBlockStateFlushedLocked(block ton.BlockIDExt, rememberMissing bool) {
 	key := storage.BlockKey(block)
 	if cached := s.blocks[key]; cached != nil {
@@ -1166,10 +1157,7 @@ func (s *LiveStore) liveBlockEvictableLocked(cached *liveBlock) bool {
 	if cached == nil {
 		return false
 	}
-	if (cached.root != nil || len(cached.data) > 0) && !cached.blockDataFlushed {
-		return false
-	}
-	if len(cached.proofs) > 0 && !cached.proofsFlushed {
+	if (cached.root != nil || cached.meta != nil) && !cached.artifactFlushed {
 		return false
 	}
 	if s.liveBlockHasStateLocked(cached.id) && !cached.stateFlushed {
@@ -1241,7 +1229,7 @@ func (s *LiveStore) refreshBlockIndexLocked(block ton.BlockIDExt) {
 		if cached.meta != nil {
 			meta = storage.MergeBlockMeta(meta, cached.meta)
 			indexed = true
-		} else if cached.root != nil || len(cached.data) > 0 {
+		} else if cached.root != nil {
 			indexed = true
 		}
 	}
@@ -1520,7 +1508,7 @@ func maxKnownShardSeqno(key storage.BlockHistoryKey, states ...*storage.CurrentS
 		}
 		for _, shard := range current.Shards {
 			shardKey := storage.ShardKeyFromBlock(shard.Block)
-			if shardKey.Workchain != key.Workchain || !shardIntersects(shardKey, storage.ShardKey{Workchain: key.Workchain, Shard: key.Shard}) {
+			if shardKey.Workchain != key.Workchain || !shardIntersects(shardKey, storage.ShardKey(key)) {
 				continue
 			}
 			if !ok || shard.Block.SeqNo > max {

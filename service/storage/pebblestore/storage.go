@@ -47,9 +47,10 @@ type Store struct {
 
 	mu                  sync.RWMutex
 	artifactMu          sync.Mutex
+	artifactPublishMu   sync.Mutex
 	artifactSyncSeq     uint64
-	pendingArchiveSync  map[string]uint64
-	pendingKeyProofSync map[string]uint64
+	pendingArchiveSync  map[string]pendingPackWrite
+	pendingKeyProofSync map[string]pendingPackWrite
 	dirtyArchivePacks   map[string]struct{}
 	dirtyKeyProofPacks  map[string]struct{}
 	closed              bool
@@ -57,9 +58,9 @@ type Store struct {
 
 func (s *Store) Close() error {
 	var firstErr error
-	if err := s.syncPendingArtifactFiles(); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	s.artifactPublishMu.Lock()
+	s.abandonPendingArtifactPacks()
+	s.artifactPublishMu.Unlock()
 
 	s.mu.Lock()
 	if s.closed {

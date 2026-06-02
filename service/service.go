@@ -57,8 +57,8 @@ const (
 )
 
 const (
-	DefaultNextBlockCheckpointBlocks = 200
-	DefaultCheckpointBytes           = uint64(256 << 20)
+	DefaultNextBlockCheckpointBlocks = 400
+	DefaultCheckpointBytes           = uint64(512 << 20)
 	DefaultSyncBackpressureWindows   = 4
 )
 
@@ -134,7 +134,7 @@ type Service struct {
 	liveState CurrentStatePublisher
 	sync      SyncObserver
 
-	appliedArtifacts *appliedBlockArtifactWriter
+	stateCellPrewrite *stateCellPrewriter
 
 	archiveCatchUpCheckpointBlocks uint32
 	archiveCatchUpCheckpointPeriod time.Duration
@@ -143,6 +143,11 @@ type Service struct {
 	checkpointBytes                uint64
 	syncBackpressureWindows        uint32
 	shutdownContext                context.Context
+	broadcastAdmissionMu           sync.Mutex
+	broadcastAdmissionInitialized  bool
+	broadcastAdmissionClosed       bool
+	broadcastLiveMasterSeqno       uint32
+	broadcastFlushedMasterSeqno    uint32
 
 	stateMu sync.Mutex
 
@@ -163,6 +168,11 @@ type Service struct {
 	masterStateCacheMu              sync.Mutex
 	masterStateCache                map[storage.BlockRootHash]*storage.BlockState
 	masterStateCacheKeys            []storage.BlockRootHash
+	compressedStateMu               sync.Mutex
+	compressedStateCache            map[storage.BlockRootHash]compressedBlockStateEntry
+	compressedStateOrder            []storage.BlockRootHash
+	monitorSplitDepthMu             sync.Mutex
+	monitorSplitDepth               map[monitorSplitDepthKey]uint32
 
 	currentStatePersistMu              sync.Mutex
 	currentStatePersistErrMu           sync.Mutex
@@ -227,6 +237,10 @@ type liveBlockStateFlusher interface {
 	MarkLiveBlockStatesFlushed([]ton.BlockIDExt)
 }
 
+type liveBlockArtifactFlusher interface {
+	MarkLiveBlockFlushed(ton.BlockIDExt)
+}
+
 type SyncObserver interface {
 	ObserveSyncBlock(SyncBlockObservation)
 	ObserveSyncObtain(SyncObtainObservation)
@@ -260,6 +274,12 @@ type SyncPersistObservation struct {
 	QueueDuration time.Duration
 	Duration      time.Duration
 	States        int
+	Stages        []SyncPersistStageObservation
+}
+
+type SyncPersistStageObservation struct {
+	Stage    string
+	Duration time.Duration
 }
 
 func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
@@ -375,6 +395,14 @@ func (s *Service) observeSyncPersist(observation SyncPersistObservation) {
 	if observation.Result == "" {
 		observation.Result = "unknown"
 	}
+	for i := range observation.Stages {
+		if observation.Stages[i].Stage == "" {
+			observation.Stages[i].Stage = "unknown"
+		}
+		if observation.Stages[i].Duration < 0 {
+			observation.Stages[i].Duration = 0
+		}
+	}
 	s.sync.ObserveSyncPersist(observation)
 }
 
@@ -468,7 +496,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		stateSync:                          stateSync,
 		liveState:                          opts.CurrentStatePublisher,
 		sync:                               opts.SyncObserver,
-		appliedArtifacts:                   newAppliedBlockArtifactWriter(logger, store, appliedBlockArtifactFlusher(opts.CurrentStatePublisher)),
+		stateCellPrewrite:                  newStateCellPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
 		archiveCatchUpCheckpointPeriod:     opts.ArchiveCatchUpCheckpointPeriod,
 		archiveCatchUpPrefetchWindows:      opts.ArchiveCatchUpPrefetchWindows,
@@ -490,6 +518,14 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization)
 	svc.configureLiveBlockPublisher(opts.CurrentStatePublisher)
 	return svc
+}
+
+func (s *Service) nextStateCellPrewriter() *stateCellPrewriter {
+	if s.stateCellPrewrite == nil {
+		return nil
+	}
+	s.stateCellPrewrite.start(s.currentStatePersistContext(), s.runAsync)
+	return s.stateCellPrewrite
 }
 
 func (s *Service) nextCheckpointBlocks() uint32 {
@@ -536,11 +572,6 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 
 func (s *Service) Start(ctx context.Context) error {
 	s.startOnce.Do(func() {
-		if s.appliedArtifacts != nil {
-			s.runAsync(func() {
-				s.appliedArtifacts.run(ctx)
-			})
-		}
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
 		})

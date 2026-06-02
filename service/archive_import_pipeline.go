@@ -474,7 +474,7 @@ func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Contex
 	expectedPrev := start.Block
 
 	for i, downloaded := range blocks {
-		proof, err := prepareMasterchainConsensusProofBOC(downloaded.ID, downloaded.ProofBOC, nil)
+		proof, err := prepareMasterchainConsensusProofBOC(downloaded.ID, downloaded.ProofBOC)
 		if err != nil {
 			return nil, time.Since(started), err
 		}
@@ -603,7 +603,7 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 }
 
 func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID) (*archive.Downloaded, error) {
-	downloaded, err := r.service.node.DownloadArchive(ctx, masterchainSeqno, shard, "")
+	downloaded, err := r.service.node.DownloadArchive(ctx, masterchainSeqno, shard)
 	if err != nil {
 		return nil, fmt.Errorf("download archive #%d %s: %w", masterchainSeqno, shard.String(), err)
 	}

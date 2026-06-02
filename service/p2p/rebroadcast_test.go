@@ -144,6 +144,88 @@ func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 	}
 }
 
+func TestEnqueueRebroadcastAdmissionClosedDropsRemoteBlock(t *testing.T) {
+	node := newTestNode(t)
+	node.SetBroadcastAdmission(testBroadcastAdmission(false))
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
+	}
+
+	if sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.blockBroadcast",
+		payload:      []byte{0x01},
+	}) {
+		t.Fatal("closed admission accepted remote block rebroadcast")
+	}
+	if _, ok := peer.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("remote block rebroadcast reached peer queue")
+	}
+	if got := node.peerRebroadcastDropped.Load(); got != 1 {
+		t.Fatalf("peer rebroadcast dropped = %d, want 1", got)
+	}
+}
+
+func TestEnqueueRebroadcastAdmissionClosedKeepsLocalExternal(t *testing.T) {
+	node := newTestNode(t)
+	node.SetBroadcastAdmission(testBroadcastAdmission(false))
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
+	}
+
+	if !sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}) {
+		t.Fatal("closed admission rejected local external rebroadcast")
+	}
+	if got, ok := peer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatal("local external rebroadcast did not reach peer queue")
+	} else if got.kind != "tonNode.externalMessageBroadcast" || !got.local {
+		t.Fatalf("unexpected local rebroadcast request: %#v", got)
+	}
+}
+
+func TestEnqueueRebroadcastAdmissionClosedDropsLocalBlockFanout(t *testing.T) {
+	node := newTestNode(t)
+	node.SetBroadcastAdmission(testBroadcastAdmission(false))
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name: "custom.private-a",
+			Kind: overlayKindCustomFixed,
+		},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
+	}
+
+	if sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.blockBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}) {
+		t.Fatal("closed admission accepted local block fanout")
+	}
+	if _, ok := peer.localRebroadcastQueue.TryPop(); ok {
+		t.Fatal("local block fanout reached peer queue")
+	}
+	if got := node.localRebroadcastDropped.Load(); got != 1 {
+		t.Fatalf("local rebroadcast dropped = %d, want 1", got)
+	}
+}
+
 type testSyncLagProvider struct {
 	lag int64
 	ok  bool

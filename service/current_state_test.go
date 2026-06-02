@@ -5,10 +5,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/p2p"
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
@@ -250,6 +250,102 @@ func TestStateRootForCompressedBlockUsesLiveShardState(t *testing.T) {
 	}
 	if got != root {
 		t.Fatal("state root was not taken from live shard state")
+	}
+}
+
+func TestStateRootForCompressedBlockUsesRecentlyAppliedShardState(t *testing.T) {
+	block := testBlockID(0, topShard, 124)
+	root := testShardStateCell(t, block)
+	svc := &Service{}
+
+	if !svc.rememberCompressedBlockState(&tnstore.BlockState{
+		Block: block,
+		Cell:  root,
+	}) {
+		t.Fatal("state root was not remembered")
+	}
+
+	got, err := svc.StateRootForCompressedBlock(context.Background(), block)
+	if err != nil {
+		t.Fatalf("state root error = %v", err)
+	}
+	if got != root {
+		t.Fatal("state root was not taken from recently applied shard state")
+	}
+}
+
+func TestCurrentBroadcastValidatorConfigUsesLiveCurrentState(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	persistedMaster := testBlockID(-1, topShard, 120)
+	liveMaster := testBlockID(-1, topShard, 121)
+
+	if err := store.SaveCurrentState(ctx, &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{Block: persistedMaster},
+		Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
+	}); err != nil {
+		t.Fatalf("save persisted current state: %v", err)
+	}
+
+	svc := &Service{
+		storage: store,
+		currentStatus: &tnstore.CurrentState{
+			Masterchain: tnstore.BlockState{Block: liveMaster},
+			Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
+		},
+		masterStateCache: map[tnstore.BlockRootHash]*tnstore.BlockState{
+			tnstore.BlockKey(liveMaster): {Block: liveMaster},
+		},
+	}
+
+	_, err := svc.currentBroadcastValidatorConfig(ctx)
+	if err == nil {
+		t.Fatal("validator config unexpectedly loaded from incomplete test state")
+	}
+	if !strings.Contains(err.Error(), tnstore.FormatBlockRef(liveMaster)) {
+		t.Fatalf("validator config error = %q, want live master %s", err, tnstore.FormatBlockRef(liveMaster))
+	}
+	if strings.Contains(err.Error(), tnstore.FormatBlockRef(persistedMaster)) {
+		t.Fatalf("validator config used persisted current state: %v", err)
+	}
+}
+
+func TestShardPrefetchDoesNotMarkScheduledWhenSlotUnavailable(t *testing.T) {
+	runner := &nextSyncRunner{
+		service:            &Service{node: &p2p.Node{}},
+		ctx:                context.Background(),
+		shardPrefetchSlots: make(chan struct{}, 1),
+	}
+	runner.shardPrefetchSlots <- struct{}{}
+
+	scheduled := map[tnstore.BlockRootHash]struct{}{}
+	scheduledOrder := []tnstore.BlockRootHash{}
+	master := testBlockID(-1, topShard, 125)
+	target := testBlockID(0, topShard, 126)
+
+	got := runner.scheduleShardPrefetch(scheduled, &scheduledOrder, master, []ton.BlockIDExt{target})
+	if got != 0 {
+		t.Fatalf("scheduled prefetch count = %d, want 0", got)
+	}
+	if _, ok := scheduled[tnstore.BlockKey(target)]; ok {
+		t.Fatal("prefetch target was marked scheduled without an available worker slot")
+	}
+	if len(scheduledOrder) != 0 {
+		t.Fatalf("scheduled order length = %d, want 0", len(scheduledOrder))
+	}
+}
+
+func TestShardDescriptionPrefetchReportsUnavailableSlot(t *testing.T) {
+	runner := &nextSyncRunner{
+		service:            &Service{node: &p2p.Node{}},
+		ctx:                context.Background(),
+		shardPrefetchSlots: make(chan struct{}, 1),
+	}
+	runner.shardPrefetchSlots <- struct{}{}
+
+	desc := &p2p.ShardBlockDescription{Block: testBlockID(0, topShard, 127)}
+	if runner.prefetchShardDescriptionTarget(shardDescriptionHint{Overlay: "test"}, desc) {
+		t.Fatal("description prefetch started without an available worker slot")
 	}
 }
 
@@ -534,7 +630,7 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 		}
 		runner.completeCheckpoint(checkpoint)
 		close(callbackDone)
-	}, 0, time.Now())
+	}, nil, 0, time.Now())
 	if err != nil {
 		t.Fatalf("schedule async checkpoint: %v", err)
 	}
@@ -555,7 +651,7 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 	if stale := runner.stateCells.beginCheckpoint(); stale != nil {
 		t.Fatal("async checkpoint left completed cell snapshot pending")
 	}
-	if remaining := runner.checkpointStates.clone(); len(remaining) != 0 {
+	if remaining := runner.checkpointStates.cloneEntries(); len(remaining) != 0 {
 		t.Fatalf("async checkpoint left %d completed state entries pending", len(remaining))
 	}
 }
@@ -632,12 +728,12 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 	if err := svc.takeCurrentStatePersistError(); err == nil {
 		t.Fatal("expected async checkpoint persist error")
 	}
-	remaining := runner.checkpointStates.clone()
+	remaining := runner.checkpointStates.cloneEntries()
 	if len(remaining) != 1 {
 		t.Fatalf("remaining checkpoint states = %d, want 1", len(remaining))
 	}
-	if !remaining[0].Block.Equals(&master) {
-		t.Fatalf("remaining checkpoint block = %s, want %s", tnstore.FormatBlockRef(remaining[0].Block), tnstore.FormatBlockRef(master))
+	if !remaining[0].state.Block.Equals(&master) {
+		t.Fatalf("remaining checkpoint block = %s, want %s", tnstore.FormatBlockRef(remaining[0].state.Block), tnstore.FormatBlockRef(master))
 	}
 }
 
@@ -652,7 +748,7 @@ func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.
 	preparedCells = removePreparedCellRecord(preparedCells, root.HashKey())
 
 	overlay := newArchiveStateCellOverlay(nil)
-	overlay.rememberPreparedCells(preparedCells)
+	overlay.addPreparedRecords(preparedCells)
 
 	rootHash := root.HashKey(0)
 	master := testBlockID(-1, topShard, 72)
@@ -808,12 +904,12 @@ func TestMasterchainBroadcastCandidateWaitsForValidation(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
 	downloaded := testVerifiedMasterchainBlock(prev, next)
+	downloaded.Kind = "tonNode.blockBroadcast"
 	downloaded.BlockBOC = []byte{1}
 	downloaded.ProofBOC = []byte{2}
 	downloaded.consensus = &masterchainConsensusProof{
-		block:               next,
-		prevRef:             prev,
-		broadcastSignatures: &blockproof.ValidatorSignatureSet{},
+		block:   next,
+		prevRef: prev,
 	}
 
 	svc := &Service{}
@@ -881,12 +977,12 @@ func TestQueuedMasterchainBlockAheadReportsFutureBlock(t *testing.T) {
 	svc := &Service{}
 	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), p2p.PeerID{})
 
-	got, ok := svc.queuedMasterchainBlockAhead(current)
+	got, ok := svc.queuedMasterchainFuture(current)
 	if !ok {
 		t.Fatal("expected queued future masterchain block")
 	}
-	if !got.Equals(&future) {
-		t.Fatalf("queued future block = %s, want %s", tnstore.FormatBlockRef(got), tnstore.FormatBlockRef(future))
+	if !got.block.Equals(&future) {
+		t.Fatalf("queued future block = %s, want %s", tnstore.FormatBlockRef(got.block), tnstore.FormatBlockRef(future))
 	}
 }
 

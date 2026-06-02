@@ -11,8 +11,6 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-const topShard = int64(-1 << 63)
-
 func init() {
 	tl.Register(DbFileDBKeyZeroStateFile{}, "db.filedb.key.zeroStateFile block_id:tonNode.blockIdExt = db.filedb.Key")
 }
@@ -31,6 +29,14 @@ func ZeroStateFileName(block ton.BlockIDExt) (string, error) {
 
 func StoredProofKinds(blockData []byte, isLink bool) []ServedProofKind {
 	return StoredProofKindsForBlock(isLink, isKeyBlockData(blockData))
+}
+
+func StoredProofKindsForServedBlock(block ton.BlockIDExt, isLink bool, isKeyBlock bool) []ServedProofKind {
+	return StoredProofKindsForBlock(ServedBlockProofIsLink(block, isLink), isKeyBlock)
+}
+
+func ServedBlockProofIsLink(block ton.BlockIDExt, isLink bool) bool {
+	return isLink || block.Workchain != masterchainID || block.Shard != masterchainShard
 }
 
 func StoredProofKindsForBlock(isLink bool, isKeyBlock bool) []ServedProofKind {

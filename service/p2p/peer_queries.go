@@ -243,7 +243,7 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 }
 
 func (s *overlaySubscription) serveBlockFull(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
-	full, err := s.node.peerStorage.BlockFull(ctx, block)
+	full, err := s.loadServedBlockFull(ctx, block)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return tonnodeapi.DataFullEmpty{}, nil
 	}
@@ -253,8 +253,8 @@ func (s *overlaySubscription) serveBlockFull(ctx context.Context, block ton.Bloc
 
 	return tonnodeapi.DataFull{
 		ID:     full.ID,
-		Proof:  append([]byte(nil), full.Proof...),
-		Block:  append([]byte(nil), full.Block...),
+		Proof:  full.Proof,
+		Block:  full.Block,
 		IsLink: full.IsLink,
 	}, nil
 }
@@ -264,7 +264,7 @@ func (s *overlaySubscription) serveNextBlockDescription(ctx context.Context, pre
 		return nil, errors.New("next block allowed only for masterchain")
 	}
 
-	full, err := s.node.peerStorage.NextBlockFull(ctx, prev)
+	full, err := s.loadNextServedBlockFull(ctx, prev)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return BlockDescriptionEmpty{}, nil
 	}
@@ -275,7 +275,7 @@ func (s *overlaySubscription) serveNextBlockDescription(ctx context.Context, pre
 }
 
 func (s *overlaySubscription) serveNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (tl.Serializable, error) {
-	full, err := s.node.peerStorage.NextBlockFull(ctx, prev)
+	full, err := s.loadNextServedBlockFull(ctx, prev)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return tonnodeapi.DataFullEmpty{}, nil
 	}
@@ -285,8 +285,8 @@ func (s *overlaySubscription) serveNextBlockFull(ctx context.Context, prev ton.B
 
 	return tonnodeapi.DataFull{
 		ID:     full.ID,
-		Proof:  append([]byte(nil), full.Proof...),
-		Block:  append([]byte(nil), full.Block...),
+		Proof:  full.Proof,
+		Block:  full.Block,
 		IsLink: full.IsLink,
 	}, nil
 }
@@ -328,6 +328,15 @@ func (s *overlaySubscription) servePrepareBlockProof(ctx context.Context, block 
 		if hasFull {
 			return PreparedProof{}, nil
 		}
+		if allowPartial {
+			hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofBlockLink, block)
+			if err != nil {
+				return nil, err
+			}
+			if hasLink {
+				return PreparedProofLink{}, nil
+			}
+		}
 		return PreparedProofEmpty{}, nil
 	}
 
@@ -356,6 +365,15 @@ func (s *overlaySubscription) servePrepareKeyBlockProof(ctx context.Context, blo
 		return nil, err
 	}
 	if !hasFull {
+		if allowPartial {
+			hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlockLink, block)
+			if err != nil {
+				return nil, err
+			}
+			if hasLink {
+				return PreparedProofLink{}, nil
+			}
+		}
 		return PreparedProofEmpty{}, nil
 	}
 	if allowPartial {
@@ -369,7 +387,15 @@ func (s *overlaySubscription) serveKeyBlockProofLink(ctx context.Context, block 
 		return nil, errors.New("cannot download proof for zero state")
 	}
 
-	proof, err := s.node.peerStorage.BlockProof(ctx, tnstore.ServedProofKeyBlock, block)
+	link, err := s.loadStoredBlockProof(ctx, tnstore.ServedProofKeyBlockLink, block)
+	if err == nil {
+		return tl.Raw(link), nil
+	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+
+	proof, err := s.loadStoredBlockProof(ctx, tnstore.ServedProofKeyBlock, block)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return nil, errors.New("unknown block proof")
 	}
@@ -377,7 +403,7 @@ func (s *overlaySubscription) serveKeyBlockProofLink(ctx context.Context, block 
 		return nil, err
 	}
 
-	link, err := blockproof.LinkBOC(block, proof)
+	link, err = blockproof.LinkBOC(block, proof)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +412,15 @@ func (s *overlaySubscription) serveKeyBlockProofLink(ctx context.Context, block 
 
 func (s *overlaySubscription) serveBlockProofLink(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
 	if isMasterchainBlock(block) {
-		proof, err := s.node.peerStorage.BlockProof(ctx, tnstore.ServedProofBlock, block)
+		link, err := s.loadStoredBlockProof(ctx, tnstore.ServedProofBlockLink, block)
+		if err == nil {
+			return tl.Raw(link), nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
+
+		proof, err := s.loadStoredBlockProof(ctx, tnstore.ServedProofBlock, block)
 		if errors.Is(err, tnstore.ErrNotFound) {
 			return nil, errors.New("unknown block proof")
 		}
@@ -394,7 +428,7 @@ func (s *overlaySubscription) serveBlockProofLink(ctx context.Context, block ton
 			return nil, err
 		}
 
-		link, err := blockproof.LinkBOC(block, proof)
+		link, err = blockproof.LinkBOC(block, proof)
 		if err != nil {
 			return nil, err
 		}
@@ -409,7 +443,7 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 		return nil, errors.New("cannot download proof for zero state")
 	}
 
-	proof, err := s.node.peerStorage.BlockProof(ctx, kind, block)
+	proof, err := s.loadStoredBlockProof(ctx, kind, block)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return nil, errors.New("unknown block proof")
 	}
@@ -635,23 +669,23 @@ func queryTypeName(query any) string {
 }
 
 func (s *overlaySubscription) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	data, err := s.node.peerStorage.BlockData(ctx, block)
-	if err == nil {
-		return data, nil
-	}
-	if !errors.Is(err, tnstore.ErrNotFound) {
-		return nil, err
-	}
+	return s.node.localBlockData(ctx, block)
+}
 
-	full, err := s.node.peerStorage.BlockFull(ctx, block)
-	if err != nil {
-		return nil, err
-	}
-	return full.Block, nil
+func (s *overlaySubscription) loadServedBlockFull(ctx context.Context, block ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
+	return s.node.localServedBlockFull(ctx, block)
+}
+
+func (s *overlaySubscription) loadNextServedBlockFull(ctx context.Context, prev ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
+	return s.node.localNextServedBlockFull(ctx, prev)
+}
+
+func (s *overlaySubscription) loadStoredBlockProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
+	return s.node.localBlockProof(ctx, kind, block)
 }
 
 func (s *overlaySubscription) hasStoredProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (bool, error) {
-	_, err := s.node.peerStorage.BlockProof(ctx, kind, block)
+	_, err := s.loadStoredBlockProof(ctx, kind, block)
 	if err == nil {
 		return true, nil
 	}

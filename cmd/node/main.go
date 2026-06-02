@@ -53,6 +53,7 @@ func main() {
 	globalConfigURLFlag := flag.String("global-config", "", "download TON global config from URL and replace the configured file before start")
 	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	fromZeroFlag := flag.Bool("from-zero", false, "verify initial key block chain from zerostate instead of global config init_block")
+	liteSendMessageTVMTraceFlag := flag.Bool("liteserver-send-message-tvm-trace", false, "dump TVM opcode trace when liteserver sendMessage execution rejects a message")
 	archiveCheckpointPeriodFlag := flag.Duration("archive-checkpoint-period", service2.DefaultArchiveCatchUpCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
 	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
 	flag.Parse()
@@ -314,6 +315,8 @@ func main() {
 		Dur("elapsed", time.Since(storageOpenStarted)).
 		Msg("configured storage")
 	opts.StateFilesDir = stateFilesDir
+	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
+	opts.LiveBlockCache = liveBlockCache
 	defer func() {
 		if opts.Storage != nil {
 			closeStorage(logger, opts.Storage)
@@ -347,6 +350,9 @@ func main() {
 		logger.Error().Err(err).Msg("failed to initialize p2p node")
 		os.Exit(1)
 	}
+	if runtimeMetrics != nil {
+		node.SetBroadcastPipelineObserver(runtimeMetrics)
+	}
 
 	blockSync := blocksync.New(logs.CategoryPtr("blocksync"), node, blocksync.NewNodeFetcher(node))
 
@@ -365,6 +371,7 @@ func main() {
 			MasterBlockCache: liteOpts.MasterBlockCache,
 			ShardBlockCache:  liteOpts.ShardBlockCache,
 			NonFinalEnabled:  liteOpts.NonFinalEnabled,
+			LiveBlockCache:   liveBlockCache,
 		})
 		currentStatePublisher = liveLiteStore
 	}
@@ -388,6 +395,7 @@ func main() {
 		SyncObserver:                   syncObserver,
 	})
 	node.SetBroadcastSignatureVerifier(svc)
+	node.SetBroadcastAdmission(svc)
 	if runtimeMetrics != nil {
 		runtimeMetrics.SetServiceStatusReader(svc.StatusSnapshot)
 	}
@@ -395,14 +403,15 @@ func main() {
 	var liteSrv *liteserver.Server
 	if liteOpts.Enabled {
 		liteSrv, err = liteserver.New(liteserver.Options{
-			Logger:        logs.CategoryPtr("liteserver"),
-			Store:         liveLiteStore,
-			MessageSender: node,
-			QueryObserver: queryObserver,
-			PrivateKey:    liteOpts.PrivateKey,
-			ListenAddr:    liteOpts.ListenAddr,
-			NonFinal:      liteOpts.NonFinalEnabled,
-			ZeroState:     zeroStateIDFromBlock(globalConfigZeroState),
+			Logger:              logs.CategoryPtr("liteserver"),
+			Store:               liveLiteStore,
+			MessageSender:       node,
+			QueryObserver:       queryObserver,
+			PrivateKey:          liteOpts.PrivateKey,
+			ListenAddr:          liteOpts.ListenAddr,
+			NonFinal:            liteOpts.NonFinalEnabled,
+			SendMessageTVMTrace: *liteSendMessageTVMTraceFlag,
+			ZeroState:           zeroStateIDFromBlock(globalConfigZeroState),
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to initialize liteserver")
@@ -478,6 +487,7 @@ func main() {
 		Str("dht_listen_addr", fallbackString(opts.DHTListenAddr, "<client-mode>")).
 		Bool("liteserver", liteOpts.Enabled).
 		Str("liteserver_listen_addr", fallbackString(liteOpts.ListenAddr, "<disabled>")).
+		Bool("liteserver_send_message_tvm_trace", *liteSendMessageTVMTraceFlag).
 		Bool("metrics", metricsOpts.Enabled).
 		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
 		Str("pprof_addr", fallbackString(strings.TrimSpace(*pprofAddrFlag), "<disabled>")).

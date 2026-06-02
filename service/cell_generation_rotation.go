@@ -1035,7 +1035,7 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store cell
 		if err != nil {
 			return err
 		}
-		nextMaster, _, err := s.applyStoredMasterchainTransition(&candidate.current.Masterchain, downloaded, candidate.cells)
+		nextMaster, _, err := s.applyMasterchainTransition(&candidate.current.Masterchain, downloaded, nil, candidate.cells)
 		if err != nil {
 			return fmt.Errorf("apply candidate masterchain transition after %s: %w", storage.FormatBlockRef(candidate.current.Masterchain.Block), err)
 		}

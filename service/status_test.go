@@ -2,6 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -9,6 +15,8 @@ import (
 	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
@@ -262,10 +270,148 @@ func TestSyncLagSecondsUsesMaxCurrentStateLag(t *testing.T) {
 	}
 }
 
-type fakeSyncObserver struct{}
+func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
 
-func (o *fakeSyncObserver) ObserveSyncBlock(SyncBlockObservation) {}
+	block, root, data, meta := mustStatusFixtureBlock(t)
+	meta.GenUTime = 100
+	if err = node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+		Block:     block,
+		Root:      root,
+		BlockData: data,
+		Meta:      meta,
+		Proofs: []tnstore.LiveBlockProofArtifact{{
+			Kind: tnstore.ServedProofBlock,
+			Data: []byte{0x01},
+		}},
+	}); err != nil {
+		t.Fatalf("publish live block: %v", err)
+	}
 
-func (o *fakeSyncObserver) ObserveSyncObtain(SyncObtainObservation) {}
+	svc := &Service{
+		node:    node,
+		storage: store,
+	}
+	svc.publishLiveCurrentState(&tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{
+			Block:  block,
+			Parsed: &tlb.ShardStateUnsplit{GenUTime: 100},
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	})
 
-func (o *fakeSyncObserver) ObserveSyncPersist(SyncPersistObservation) {}
+	snapshot := svc.StatusSnapshot()
+	if !snapshot.LocalMasterchainHasTx {
+		t.Fatal("expected live masterchain transaction count")
+	}
+	if snapshot.LocalMasterchainTx == 0 {
+		t.Fatal("expected positive live masterchain transaction count")
+	}
+	if _, err = store.BlockData(context.Background(), block); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("pebble block data error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+
+	block, root, data, meta := mustStatusFixtureBlock(t)
+	meta.GenUTime = 100
+	if err = node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+		Block:     block,
+		Root:      root,
+		BlockData: data,
+		Meta:      meta,
+		Proofs: []tnstore.LiveBlockProofArtifact{{
+			Kind: tnstore.ServedProofBlock,
+			Data: []byte{0x01},
+		}},
+	}); err != nil {
+		t.Fatalf("publish live block: %v", err)
+	}
+
+	svc := &Service{
+		node:    node,
+		storage: store,
+	}
+	snapshot := svc.recentTPSSnapshot(context.Background(), &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{Block: block},
+		Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
+	}, statusTPSMasterWindow)
+
+	if !snapshot.Complete {
+		t.Fatalf("expected complete live TPS snapshot: %+v", snapshot)
+	}
+	if snapshot.WindowMasters != 1 {
+		t.Fatalf("window masters = %d, want 1", snapshot.WindowMasters)
+	}
+	if snapshot.Transactions == 0 {
+		t.Fatal("expected live transactions")
+	}
+	if snapshot.DurationSeconds != 1 {
+		t.Fatalf("duration = %d, want 1", snapshot.DurationSeconds)
+	}
+	if snapshot.TPS <= 0 {
+		t.Fatalf("tps = %f, want positive", snapshot.TPS)
+	}
+	if _, err = store.LookupBlockBySeqNo(context.Background(), tnstore.BlockHistoryKey{Workchain: -1, Shard: topShard}, block.SeqNo); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("pebble seqno lookup error = %v, want ErrNotFound", err)
+	}
+}
+
+func mustStatusFixtureBlock(t *testing.T) (ton.BlockIDExt, *cell.Cell, []byte, *tnstore.BlockMeta) {
+	t.Helper()
+
+	rawFixture, err := os.ReadFile("testdata/masterchain_block_fixture.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	var fixture blockFixture
+	if err = json.Unmarshal(rawFixture, &fixture); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(fixture.RawBOCBase64)
+	if err != nil {
+		t.Fatalf("decode block boc base64: %v", err)
+	}
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		t.Fatalf("parse block boc: %v", err)
+	}
+
+	rootHash, err := hex.DecodeString(fixture.Block.RootHashHex)
+	if err != nil {
+		t.Fatalf("decode root hash: %v", err)
+	}
+	fileHash, err := hex.DecodeString(fixture.Block.FileHashHex)
+	if err != nil {
+		t.Fatalf("decode file hash: %v", err)
+	}
+	shard, err := strconv.ParseUint(fixture.Block.Shard, 16, 64)
+	if err != nil {
+		t.Fatalf("parse shard: %v", err)
+	}
+
+	block := ton.BlockIDExt{
+		Workchain: fixture.Block.Workchain,
+		Shard:     int64(shard),
+		SeqNo:     fixture.Block.SeqNo,
+		RootHash:  rootHash,
+		FileHash:  fileHash,
+	}
+	meta, err := tnstore.BuildBlockMetaFromBlockData(block, data)
+	if err != nil {
+		t.Fatalf("build block meta: %v", err)
+	}
+	return block, root, data, meta
+}

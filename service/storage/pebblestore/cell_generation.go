@@ -25,10 +25,6 @@ func (s *Store) closeCellGenerations() error {
 	return err
 }
 
-func (s *Store) getCellCopy(ctx context.Context, hash []byte) ([]byte, error) {
-	return s.getCellCopyFromGeneration(ctx, 0, hash)
-}
-
 func (s *Store) getCellCopyFromGeneration(ctx context.Context, generation uint64, hash []byte) ([]byte, error) {
 	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
@@ -120,10 +116,6 @@ func (s *Store) flushCellDBs(generation uint64) error {
 	}
 	defer cells.release()
 	return cells.flush()
-}
-
-func (s *Store) activeCellStoreLocked() (*cellStore, error) {
-	return s.cellStoreForGenerationLocked(0)
 }
 
 func (s *Store) cellStoreForGenerationLocked(generation uint64) (*cellStore, error) {

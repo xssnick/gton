@@ -21,8 +21,8 @@ func TestArchiveDownloadWorkersUsesNetworkWorkerBudget(t *testing.T) {
 	}
 
 	runtime.GOMAXPROCS(12)
-	if got := archiveDownloadWorkers(); got != 48 {
-		t.Fatalf("download workers at GOMAXPROCS=12 = %d want 48", got)
+	if got := archiveDownloadWorkers(); got != archiveDownloadWorkerMax {
+		t.Fatalf("download workers at GOMAXPROCS=12 = %d want %d", got, archiveDownloadWorkerMax)
 	}
 
 	runtime.GOMAXPROCS(64)
@@ -40,8 +40,7 @@ func TestArchiveDownloadWorkerBudgetReservesHotWorkers(t *testing.T) {
 		{workers: 1, hotOnly: 0, shared: 1},
 		{workers: 2, hotOnly: 1, shared: 1},
 		{workers: archiveDownloadWorkerMin, hotOnly: 4, shared: archiveDownloadWorkerMin - 4},
-		{workers: 48, hotOnly: archiveDownloadHotWorkerMax, shared: 40},
-		{workers: archiveDownloadWorkerMax, hotOnly: archiveDownloadHotWorkerMax, shared: archiveDownloadWorkerMax - archiveDownloadHotWorkerMax},
+		{workers: archiveDownloadWorkerMax, hotOnly: archiveDownloadWorkerMax / 4, shared: archiveDownloadWorkerMax - archiveDownloadWorkerMax/4},
 	}
 
 	for _, tt := range tests {
@@ -97,12 +96,14 @@ func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
 		downloadPrefetch: make(chan archiveDownloadJob, 2),
 		prepareHot:       make(chan archivePrepareJob, 2),
 		preparePrefetch:  make(chan archivePrepareJob, 2),
+		downloadedBytes:  newArchiveDownloadByteGate(1024),
 	}
 	queue.downloadHot <- archiveDownloadJob{}
 	queue.downloadPrefetch <- archiveDownloadJob{}
 	queue.preparePrefetch <- archivePrepareJob{}
 	queue.activeDownload.Add(3)
 	queue.activePrepare.Add(5)
+	queue.downloadedBytes.add(256)
 
 	snapshot := queue.snapshot()
 	if snapshot.activeDownload != 3 || snapshot.activePrepare != 5 {
@@ -111,29 +112,93 @@ func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
 	if snapshot.downloadHotQueued != 1 || snapshot.downloadPrefetchQueued != 1 || snapshot.prepareHotQueued != 0 || snapshot.preparePrefetchQueued != 1 {
 		t.Fatalf("queued jobs = download:%d/%d prepare:%d/%d, want download:1/1 prepare:0/1", snapshot.downloadHotQueued, snapshot.downloadPrefetchQueued, snapshot.prepareHotQueued, snapshot.preparePrefetchQueued)
 	}
+	if snapshot.downloadedBytes != 256 || snapshot.downloadedBytesLimit != 1024 {
+		t.Fatalf("downloaded bytes = %d/%d, want 256/1024", snapshot.downloadedBytes, snapshot.downloadedBytesLimit)
+	}
+}
+
+func TestArchiveDownloadByteGateWaitsUntilDownloadedBytesDrop(t *testing.T) {
+	gate := newArchiveDownloadByteGate(100)
+	gate.add(100)
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- gate.wait(context.Background())
+	}()
+
+	select {
+	case err := <-waitDone:
+		t.Fatalf("gate wait finished before release: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	gate.release(100)
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("gate wait after release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gate wait did not finish after release")
+	}
+}
+
+func TestArchiveImportQueueReleasesDownloadedBytesWhenPrepareContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	queue := &archiveImportQueue{
+		downloadedBytes: newArchiveDownloadByteGate(100),
+	}
+	downloaded := &archive.Downloaded{Data: make([]byte, 80)}
+	queue.downloadedBytes.add(80)
+
+	done := make(chan archiveImportQueueResult, 1)
+	queue.runPrepareJob(&archiveCatchUpRunner{}, archivePrepareJob{
+		ctx:        ctx,
+		downloaded: downloaded,
+		bytes:      80,
+		done:       done,
+	})
+
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("prepare result err = %v, want context.Canceled", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prepare job did not finish")
+	}
+	if got := queue.downloadedBytes.size(); got != 0 {
+		t.Fatalf("downloaded bytes after canceled prepare = %d, want 0", got)
+	}
+	if downloaded.Data != nil {
+		t.Fatal("downloaded data was not released after canceled prepare")
+	}
 }
 
 func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
-	shards := make([]archive.ShardID, archiveShardArchiveImportInFlight+3)
-	for i := range shards {
-		shards[i] = archive.ShardID{Workchain: 0, Shard: int64(i+1) << 48}
+	plans := make([]archiveShardImportPlan, archiveShardArchiveImportInFlight+3)
+	for i := range plans {
+		plans[i] = archiveShardImportPlan{shard: archive.ShardID{Workchain: 0, Shard: int64(i+1) << 48}}
 	}
 
 	queue := &archiveImportQueue{
-		downloadHot:      make(chan archiveDownloadJob, len(shards)),
-		downloadPrefetch: make(chan archiveDownloadJob, len(shards)),
+		downloadHot:      make(chan archiveDownloadJob, len(plans)),
+		downloadPrefetch: make(chan archiveDownloadJob, len(plans)),
 	}
 	runner := &archiveCatchUpRunner{}
 	done := make(chan error, 1)
 	go func() {
-		imports, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, shards, 0, archiveImportPriorityPrefetch)
-		if err == nil && len(imports) != len(shards) {
+		imports, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, plans, 0, archiveImportPriorityPrefetch)
+		if err == nil && len(imports) != len(plans) {
 			err = errors.New("unexpected import count")
 		}
 		done <- err
 	}()
 
-	jobs := make([]archiveDownloadJob, 0, len(shards))
+	jobs := make([]archiveDownloadJob, 0, len(plans))
 	for i := 0; i < archiveShardArchiveImportInFlight; i++ {
 		jobs = append(jobs, receiveArchiveDownloadJob(t, queue.downloadPrefetch))
 	}
@@ -150,7 +215,7 @@ func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
 	for _, job := range jobs[1:] {
 		job.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
 	}
-	for len(jobs) < len(shards) {
+	for len(jobs) < len(plans) {
 		job := receiveArchiveDownloadJob(t, queue.downloadPrefetch)
 		job.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
 		jobs = append(jobs, job)

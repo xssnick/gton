@@ -43,6 +43,20 @@ func TestBuildBlockMetaFromParsedShardBlockDoesNotUseHeaderMasterRef(t *testing.
 	}
 }
 
+func TestStoredProofKindsForServedBlockTreatsNonMasterAsProofLink(t *testing.T) {
+	shard := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 21}
+	got := StoredProofKindsForServedBlock(shard, false, false)
+	if len(got) != 1 || got[0] != ServedProofBlockLink {
+		t.Fatalf("proof kinds = %#v, want shard proof link", got)
+	}
+
+	master := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 21}
+	got = StoredProofKindsForServedBlock(master, false, true)
+	if len(got) != 2 || got[0] != ServedProofBlock || got[1] != ServedProofKeyBlock {
+		t.Fatalf("proof kinds = %#v, want master full proof kinds", got)
+	}
+}
+
 func TestLoadCellGraphBuildsScheduledSharedRefs(t *testing.T) {
 	shared := cell.BeginCell().MustStoreUInt(0xAA, 8).EndCell()
 	left := cell.BeginCell().MustStoreUInt(0xBB, 8).MustStoreRef(shared).EndCell()

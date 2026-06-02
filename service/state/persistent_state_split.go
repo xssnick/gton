@@ -111,6 +111,9 @@ func SplitPersistentState(block ton.BlockIDExt, root *cell.Cell, splitDepth uint
 		return nil, err
 	}
 	proof, err := proofBuilder.CreateProof()
+	if err != nil {
+		return nil, err
+	}
 	parts = append(parts, PersistentStatePart{
 		Kind:           PersistentStatePartSplitHeader,
 		EffectiveShard: block.Shard,

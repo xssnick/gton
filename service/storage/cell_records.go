@@ -33,7 +33,9 @@ type StateCellRecords struct {
 // flush checkpoint cells first, then commit state metadata/current; cells left
 // orphaned by a crash before metadata commit are harmless and expected.
 type StateCheckpointBlock struct {
-	State *BlockState
+	State    *BlockState
+	Artifact *ServedBlockFull
+	Links    []ServedBlockLink
 }
 
 type CellRefRecord struct {
@@ -134,6 +136,16 @@ func (r StateCellRecords) AppendTo(records []EncodedCellRecord) []EncodedCellRec
 		records = append(records, chunk...)
 	}
 	return records
+}
+
+// AppendChunks exposes the existing record slices for batch writers that can
+// consume immutable records without flattening them into another large slice.
+func (r StateCellRecords) AppendChunks(chunks [][]EncodedCellRecord) ([][]EncodedCellRecord, uint64) {
+	if len(r.Records) > 0 {
+		chunks = append(chunks, r.Records)
+	}
+	chunks = append(chunks, r.chunks...)
+	return chunks, r.ByteSize()
 }
 
 func (r StateCellRecords) ForEach(fn func(EncodedCellRecord) error) error {
@@ -302,10 +314,6 @@ func prepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata,
 }
 
 func PrepareStateUpdateCells(update *cell.Cell) (StateCellRecords, error) {
-	if err := cell.ValidateMerkleUpdate(update); err != nil {
-		return StateCellRecords{}, err
-	}
-
 	updateTo, err := merkleUpdateTarget(update)
 	if err != nil {
 		return StateCellRecords{}, err

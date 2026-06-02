@@ -27,7 +27,7 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 	block10, block10Data := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
 		{name: testEntryName("block", block10), data: block10Data},
-		{name: testEntryName("prooflink", block10), data: []byte{0x10, 0x02}},
+		{name: testEntryName("proof", block10), data: []byte{0x10, 0x02}},
 		{name: "ignored_file", data: []byte{0x99}},
 	})
 
@@ -49,7 +49,7 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 		t.Fatalf("import archive: %v", err)
 	}
 
-	if stats.Entries != 2 || stats.IgnoredEntries != 1 || stats.Blocks != 1 || stats.Proofs != 0 || stats.ProofLinks != 1 || stats.FullBlocks != 1 || stats.Links != 0 {
+	if stats.Entries != 2 || stats.IgnoredEntries != 1 || stats.Blocks != 1 || stats.Proofs != 1 || stats.ProofLinks != 0 || stats.FullBlocks != 1 || stats.Links != 0 {
 		t.Fatalf("unexpected stats: %#v", stats)
 	}
 	if len(imported) != 1 || !imported[0].Equals(&block10) {
@@ -60,13 +60,13 @@ func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load block 10: %v", err)
 	}
-	if !full10.IsLink || string(full10.Proof) != string([]byte{0x10, 0x02}) {
+	if full10.IsLink || string(full10.Proof) != string([]byte{0x10, 0x02}) {
 		t.Fatalf("unexpected block 10 full: %#v", full10)
 	}
 
 }
 
-func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
+func TestImportBytesStoresInlineBlocks(t *testing.T) {
 	store := openTestPebbleStore(t)
 
 	block, blockData := readMasterchainBlockFixture(t)
@@ -79,11 +79,11 @@ func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 		t.Fatalf("read test package: %v", err)
 	}
 
-	imported, err := ImportStream(context.Background(), &Downloaded{
+	imported, err := ImportBytes(context.Background(), &Downloaded{
 		MasterchainSeqno: 100,
 		ArchiveID:        778,
 		Shard:            ShardID{Workchain: 0, Shard: topShard},
-	}, bytes.NewReader(data))
+	}, data)
 	if err != nil {
 		t.Fatalf("stream import archive: %v", err)
 	}
@@ -100,7 +100,6 @@ func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 		t.Fatal("expected block prepare timing")
 	}
 
-	imported.SetArtifactPath(path)
 	if err = imported.Store(ImportSink{Writer: store}); err != nil {
 		t.Fatalf("store streamed import: %v", err)
 	}
@@ -111,6 +110,180 @@ func TestImportStreamStoresAfterArtifactPathIsAssigned(t *testing.T) {
 	}
 	if string(full.Block) != string(blockData) || string(full.Proof) != string([]byte{0x12, 0x02}) {
 		t.Fatalf("unexpected streamed full block: %#v", full)
+	}
+}
+
+func TestCanonicalArchiveProofKeepsCanonicalKind(t *testing.T) {
+	master := testBlockID(-1, topShard, 71)
+	shard := testBlockID(0, topShard, 72)
+
+	tests := []struct {
+		name     string
+		part     *blockParts
+		wantLink bool
+		wantData []byte
+		wantNone bool
+	}{
+		{
+			name: "master uses proof",
+			part: &blockParts{
+				id:        master,
+				proof:     []byte{0x02},
+				proofLink: []byte{0x01},
+			},
+			wantData: []byte{0x02},
+		},
+		{
+			name: "shard uses prooflink",
+			part: &blockParts{
+				id:        shard,
+				proof:     []byte{0x03},
+				proofLink: []byte{0x04},
+			},
+			wantLink: true,
+			wantData: []byte{0x04},
+		},
+		{
+			name: "shard ignores proof without link",
+			part: &blockParts{
+				id:    shard,
+				proof: []byte{0x05},
+			},
+			wantNone: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proof, isLink, ok := canonicalArchiveProof(tt.part)
+			if tt.wantNone {
+				if ok {
+					t.Fatalf("canonical proof = %x is_link=%v, want none", proof, isLink)
+				}
+				return
+			}
+			if !ok || isLink != tt.wantLink || !bytes.Equal(proof, tt.wantData) {
+				t.Fatalf("canonical proof = %x is_link=%v ok=%v, want data=%x is_link=%v", proof, isLink, ok, tt.wantData, tt.wantLink)
+			}
+		})
+	}
+}
+
+func TestImportStreamDoesNotExposePartialArtifacts(t *testing.T) {
+	block, blockData := readMasterchainBlockFixture(t)
+	path := writeTestPackage(t, []testEntry{
+		{name: testEntryName("block", block), data: blockData},
+		{name: testEntryName("proof", testBlockID(-1, topShard, block.SeqNo+1)), data: []byte{0x02}},
+	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read test package: %v", err)
+	}
+
+	imported, err := ImportStream(context.Background(), &Downloaded{
+		MasterchainSeqno: 100,
+		Shard:            ShardID{Workchain: -1, Shard: topShard},
+	}, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("import archive stream: %v", err)
+	}
+	if len(imported.FullBlocks) != 0 {
+		t.Fatalf("full block count = %d, want none", len(imported.FullBlocks))
+	}
+}
+
+func TestImportStreamDoesNotLinkPartialBlockEntries(t *testing.T) {
+	block, blockData := readMasterchainBlockFixture(t)
+	partial := testBlockID(block.Workchain, block.Shard, block.SeqNo+1)
+	path := writeTestPackage(t, []testEntry{
+		{name: testEntryName("block", block), data: blockData},
+		{name: testEntryName("proof", block), data: []byte{0x02}},
+		{name: testEntryName("block", partial), data: []byte{0x42}},
+	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read test package: %v", err)
+	}
+
+	imported, err := ImportStream(context.Background(), &Downloaded{
+		MasterchainSeqno: 100,
+		Shard:            ShardID{Workchain: -1, Shard: topShard},
+	}, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("import archive stream: %v", err)
+	}
+	if len(imported.FullBlocks) != 1 {
+		t.Fatalf("full block count = %d, want 1", len(imported.FullBlocks))
+	}
+	if len(imported.Links) != 0 {
+		t.Fatalf("links = %#v, want none", imported.Links)
+	}
+	if imported.Stats.Blocks != 2 || imported.Stats.FullBlocks != 1 || imported.Stats.Links != 0 {
+		t.Fatalf("unexpected stats: %#v", imported.Stats)
+	}
+}
+
+func TestImportStreamMasterFullBlockIgnoresProofLinkOrder(t *testing.T) {
+	block, blockData := readMasterchainBlockFixture(t)
+
+	tests := []struct {
+		name    string
+		entries []testEntry
+	}{
+		{
+			name: "prooflink before proof",
+			entries: []testEntry{
+				{name: testEntryName("prooflink", block), data: []byte{0x01}},
+				{name: testEntryName("block", block), data: blockData},
+				{name: testEntryName("proof", block), data: []byte{0x02}},
+			},
+		},
+		{
+			name: "proof before prooflink",
+			entries: []testEntry{
+				{name: testEntryName("proof", block), data: []byte{0x02}},
+				{name: testEntryName("block", block), data: blockData},
+				{name: testEntryName("prooflink", block), data: []byte{0x01}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestPackage(t, tt.entries)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read test package: %v", err)
+			}
+
+			imported, err := ImportBytes(context.Background(), &Downloaded{
+				MasterchainSeqno: 100,
+				ArchiveID:        779,
+				Shard:            ShardID{Workchain: -1, Shard: topShard},
+			}, data)
+			if err != nil {
+				t.Fatalf("import archive bytes: %v", err)
+			}
+			if len(imported.FullBlocks) != 1 {
+				t.Fatalf("full block count = %d, want 1", len(imported.FullBlocks))
+			}
+			full := imported.FullBlocks[0]
+			if full.IsLink || !bytes.Equal(full.Proof, []byte{0x02}) {
+				t.Fatalf("full proof = %x is_link=%v, want canonical proof", full.Proof, full.IsLink)
+			}
+		})
+	}
+}
+
+func TestCanonicalArchiveProofPrefersShardProofLink(t *testing.T) {
+	shard := testBlockID(0, topShard, 73)
+	proof, isLink, ok := canonicalArchiveProof(&blockParts{
+		id:        shard,
+		proof:     []byte{0x01},
+		proofLink: []byte{0x02},
+	})
+	if !ok || !isLink || !bytes.Equal(proof, []byte{0x02}) {
+		t.Fatalf("canonical proof = %x is_link=%v ok=%v, want shard proof link", proof, isLink, ok)
 	}
 }
 
@@ -176,43 +349,6 @@ func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
 	}
 	if stats.MasterchainFirstSeqno != master.SeqNo || stats.MasterchainLastSeqno != master.SeqNo {
 		t.Fatalf("unexpected masterchain stats range: first=%d last=%d", stats.MasterchainFirstSeqno, stats.MasterchainLastSeqno)
-	}
-}
-
-func TestMasterArchiveContainsShardBlocksTracksShardBlockDataOnly(t *testing.T) {
-	shard := testBlockID(0, topShard, 77)
-
-	tests := []struct {
-		name string
-		kind string
-		want bool
-	}{
-		{name: "shard proof", kind: "proof"},
-		{name: "shard proof link", kind: "prooflink"},
-		{name: "shard block", kind: "block", want: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := writeTestPackage(t, []testEntry{
-				{name: testEntryName(tt.kind, shard), data: []byte{0x42}},
-			})
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read archive package: %v", err)
-			}
-
-			imported, err := ImportStream(context.Background(), &Downloaded{
-				MasterchainSeqno: 100,
-				Shard:            ShardID{Workchain: -1, Shard: topShard},
-			}, bytes.NewReader(data))
-			if err != nil {
-				t.Fatalf("import archive stream: %v", err)
-			}
-			if imported.Stats.ContainsShardBlocks != tt.want {
-				t.Fatalf("contains shard blocks = %v, want %v", imported.Stats.ContainsShardBlocks, tt.want)
-			}
-		})
 	}
 }
 

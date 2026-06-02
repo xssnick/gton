@@ -39,10 +39,27 @@ type blockParts struct {
 	block     []byte
 	proof     []byte
 	proofLink []byte
-	blockRef  *storage.ArtifactRef
-	proofRef  *storage.ArtifactRef
-	linkRef   *storage.ArtifactRef
 	savedFull bool
+}
+
+func canonicalArchiveProof(part *blockParts) ([]byte, bool, bool) {
+	if part == nil {
+		return nil, false, false
+	}
+	if isMasterchainBlock(part.id) {
+		if len(part.proof) == 0 {
+			return nil, false, false
+		}
+		return part.proof, false, true
+	}
+	if len(part.proofLink) == 0 {
+		return nil, false, false
+	}
+	return part.proofLink, true, true
+}
+
+func isMasterchainBlock(block ton.BlockIDExt) bool {
+	return block.Workchain == -1 && block.Shard == topShard
 }
 
 type ImportSink struct {
@@ -76,6 +93,15 @@ func ImportFile(ctx context.Context, archive *Downloaded, sink ImportSink) (*Imp
 	return imported.Stats, nil
 }
 
+func ImportBytes(ctx context.Context, archive *Downloaded, data []byte) (*Imported, error) {
+	archiveRef := *archive
+	archiveRef.Path = ""
+	archiveRef.Data = nil
+	archiveRef.Imported = nil
+	archiveRef.Bytes = int64(len(data))
+	return ImportStream(ctx, &archiveRef, bytes.NewReader(data))
+}
+
 func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Imported, error) {
 	stats := &ImportStats{
 		MasterchainSeqno: archive.MasterchainSeqno,
@@ -90,8 +116,6 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 		PreparedBlocks: map[storage.BlockRootHash]PreparedBlock{},
 	}
 	parts := map[storage.BlockRootHash]*blockParts{}
-	seenBlocks := map[storage.BlockRootHash]struct{}{}
-	var blockIDs []ton.BlockIDExt
 	preparer := newImportedBlockPreparer(ctx)
 	defer preparer.abort()
 
@@ -116,9 +140,6 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 		}
 
 		stats.Entries++
-		if archive.Shard.IsMasterchain() && ref.kind == blockEntryKind && !archive.Shard.ContainsBlock(ref.id) {
-			stats.ContainsShardBlocks = true
-		}
 		if archive.Shard.ContainsBlock(ref.id) {
 			stats.observe(ref.id)
 		}
@@ -134,19 +155,12 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 		case blockEntryKind:
 			stats.Blocks++
 			part.block = entry.Data
-			part.blockRef = artifactRefFromEntry(archive.Path, entry)
-			if _, seen := seenBlocks[key]; !seen {
-				seenBlocks[key] = struct{}{}
-				blockIDs = append(blockIDs, ref.id)
-			}
 		case proofEntryKind:
 			stats.Proofs++
 			part.proof = entry.Data
-			part.proofRef = artifactRefFromEntry(archive.Path, entry)
 		case proofLinkKind:
 			stats.ProofLinks++
 			part.proofLink = entry.Data
-			part.linkRef = artifactRefFromEntry(archive.Path, entry)
 		default:
 			stats.IgnoredEntries++
 			return nil
@@ -164,40 +178,11 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 		return nil, err
 	}
 
-	for _, part := range parts {
-		if part.savedFull {
-			continue
-		}
-		if len(part.block) > 0 {
-			imported.BlockData = append(imported.BlockData, storage.ServedBlockData{
-				ID:   part.id,
-				Data: part.block,
-				Ref:  part.blockRef,
-			})
-		}
-		if len(part.proof) > 0 {
-			imported.Proofs = append(imported.Proofs, storage.ServedBlockProof{
-				Kind: storage.ServedProofBlock,
-				ID:   part.id,
-				Data: part.proof,
-				Ref:  part.proofRef,
-			})
-		}
-		if len(part.proofLink) > 0 {
-			imported.Proofs = append(imported.Proofs, storage.ServedBlockProof{
-				Kind: storage.ServedProofBlockLink,
-				ID:   part.id,
-				Data: part.proofLink,
-				Ref:  part.linkRef,
-			})
-		}
-	}
-
 	if err = preparer.finish(imported, stats); err != nil {
 		return nil, err
 	}
 
-	imported.Links = buildBlockLinks(blockIDs)
+	imported.Links = buildFullBlockLinks(imported.FullBlocks)
 	stats.Links = len(imported.Links)
 	if archive.Shard.IsMasterchain() {
 		stats.MasterchainFirstSeqno = stats.FirstSeqno
@@ -207,28 +192,7 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 	return imported, nil
 }
 
-func (i *Imported) SetArtifactPath(path string) {
-	if i == nil {
-		return
-	}
-	i.ArtifactPath = path
-	for _, full := range i.FullBlocks {
-		setArtifactPath(full.BlockRef, path)
-		setArtifactPath(full.ProofRef, path)
-	}
-	for idx := range i.BlockData {
-		setArtifactPath(i.BlockData[idx].Ref, path)
-	}
-	for idx := range i.Proofs {
-		setArtifactPath(i.Proofs[idx].Ref, path)
-	}
-}
-
 func (i *Imported) Store(sink ImportSink) error {
-	if err := i.validateArtifactRefs(); err != nil {
-		return err
-	}
-
 	for _, full := range i.FullBlocks {
 		if sink.FullBlock != nil {
 			if err := sink.FullBlock(full); err != nil {
@@ -242,67 +206,23 @@ func (i *Imported) Store(sink ImportSink) error {
 	return nil
 }
 
-func (i *Imported) validateArtifactRefs() error {
-	for _, full := range i.FullBlocks {
-		if err := validateArtifactRef(full.BlockRef); err != nil {
-			return fmt.Errorf("block artifact ref %s: %w", storage.FormatBlockRef(full.ID), err)
-		}
-		if err := validateArtifactRef(full.ProofRef); err != nil {
-			return fmt.Errorf("proof artifact ref %s: %w", storage.FormatBlockRef(full.ID), err)
-		}
-	}
-	for _, block := range i.BlockData {
-		if err := validateArtifactRef(block.Ref); err != nil {
-			return fmt.Errorf("block artifact ref %s: %w", storage.FormatBlockRef(block.ID), err)
-		}
-	}
-	for _, proof := range i.Proofs {
-		if err := validateArtifactRef(proof.Ref); err != nil {
-			return fmt.Errorf("proof artifact ref %s: %w", storage.FormatBlockRef(proof.ID), err)
-		}
-	}
-	return nil
-}
-
-func validateArtifactRef(ref *storage.ArtifactRef) error {
-	if ref == nil {
-		return nil
-	}
-	if ref.Path == "" {
-		return fmt.Errorf("empty path")
-	}
-	return nil
-}
-
-func setArtifactPath(ref *storage.ArtifactRef, path string) {
-	if ref != nil {
-		ref.Path = path
-	}
-}
-
 func flushBlockPart(preparer *importedBlockPreparer, part *blockParts, stats *ImportStats) error {
 	if part.savedFull || len(part.block) == 0 {
 		return nil
 	}
 
 	full := &storage.ServedBlockFull{
-		ID:       part.id,
-		Block:    part.block,
-		BlockRef: part.blockRef,
-		Meta:     &storage.BlockMeta{ID: part.id},
+		ID:    part.id,
+		Block: part.block,
+		Meta:  &storage.BlockMeta{ID: part.id},
 	}
 
-	switch {
-	case len(part.proof) > 0:
-		full.Proof = part.proof
-		full.ProofRef = part.proofRef
-	case len(part.proofLink) > 0:
-		full.Proof = part.proofLink
-		full.ProofRef = part.linkRef
-		full.IsLink = true
-	default:
+	proof, isLink, ok := canonicalArchiveProof(part)
+	if !ok {
 		return nil
 	}
+	full.Proof = proof
+	full.IsLink = isLink
 
 	if err := preparer.submit(full); err != nil {
 		return err
@@ -332,6 +252,9 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 	}
 	if block.StateUpdate == nil {
 		return PreparedBlock{}, fmt.Errorf("block state update is missing")
+	}
+	if err = cell.ValidateMerkleUpdate(block.StateUpdate); err != nil {
+		return PreparedBlock{}, fmt.Errorf("validate block state update: %w", err)
 	}
 	meta, err := storage.BuildBlockMetaFromParsedBlock(id, block)
 	if err != nil {
@@ -364,6 +287,27 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 	}, nil
 }
 
+func buildFullBlockLinks(blocks []*storage.ServedBlockFull) []storage.ServedBlockLink {
+	if len(blocks) < 2 {
+		return nil
+	}
+
+	seen := make(map[storage.BlockRootHash]struct{}, len(blocks))
+	ids := make([]ton.BlockIDExt, 0, len(blocks))
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		key := storage.BlockKey(block.ID)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		ids = append(ids, block.ID)
+	}
+	return buildBlockLinks(ids)
+}
+
 func buildBlockLinks(blocks []ton.BlockIDExt) []storage.ServedBlockLink {
 	if len(blocks) < 2 {
 		return nil
@@ -388,17 +332,6 @@ func buildBlockLinks(blocks []ton.BlockIDExt) []storage.ServedBlockLink {
 		prev = next
 	}
 	return links
-}
-
-func artifactRefFromEntry(path string, entry packfile.Entry) *storage.ArtifactRef {
-	if entry.DataSize <= 0 {
-		return nil
-	}
-	return &storage.ArtifactRef{
-		Path:   path,
-		Offset: entry.DataOffset,
-		Size:   entry.DataSize,
-	}
 }
 
 func parseEntryName(name string) (entryRef, error) {

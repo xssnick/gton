@@ -3,6 +3,7 @@ package liteserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 
@@ -20,6 +21,7 @@ const (
 	liveMasterInfoPrewarmDepth        = 2
 	liveMasterShardHashesPrewarmDepth = 2
 	liveAccountProofCacheLimit        = 64
+	liveShardHashesProofCacheLimit    = 64
 )
 
 type liveBlockFragments struct {
@@ -42,10 +44,13 @@ type liveBlockFragments struct {
 
 type accountProofKey struct {
 	accountID [32]byte
-	pruned    bool
 }
 
 type accountProofValue struct {
+	proof []*cell.Cell
+}
+
+type accountProofResult struct {
 	proof []*cell.Cell
 	state *cell.Cell
 }
@@ -59,25 +64,25 @@ type shardHashesProofKey struct {
 func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*liveBlockFragments, error) {
 	blockProof, err := blockStateRootProof(blockRoot)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("build block state root proof: %w", err)
 	}
 
 	accountsRoot, err := accountsDictRoot(stateRoot)
 	if errors.Is(err, storage.ErrNotFound) {
 		accountsRoot = nil
 	} else if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load accounts dict root: %w", err)
 	}
 	if accountsRoot != nil && block.Workchain != masterchainID {
 		accountsRoot, err = prewarmCachedCell(accountsRoot, liveAccountsRootPrewarmDepth)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("prewarm accounts dict root: %w", err)
 		}
 	}
 
 	header, err := runMethodShardStateHeader(stateRoot)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load shard state header: %w", err)
 	}
 
 	return &liveBlockFragments{
@@ -97,12 +102,15 @@ func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cel
 	var key accountProofKey
 	if len(accountID) == len(key.accountID) {
 		copy(key.accountID[:], accountID)
-		key.pruned = pruned
 
 		f.mu.Lock()
 		if cached, ok := f.accountProofs[key]; ok {
 			f.mu.Unlock()
-			return cached.proof, cached.state, nil
+			state, err := f.accountProofState(accountID, pruned)
+			if err != nil {
+				return nil, nil, err
+			}
+			return cached.proof, state, nil
 		}
 		f.mu.Unlock()
 
@@ -111,16 +119,20 @@ func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cel
 			f.mu.Lock()
 			if cached, ok := f.accountProofs[key]; ok {
 				f.mu.Unlock()
-				return cached, nil
+				state, err := f.accountProofState(accountID, pruned)
+				if err != nil {
+					return accountProofResult{}, err
+				}
+				return accountProofResult{proof: cached.proof, state: state}, nil
 			}
 			f.mu.Unlock()
 
 			proof, state, err := f.buildAccountProof(accountID, pruned)
 			if err != nil {
-				return accountProofValue{}, err
+				return accountProofResult{}, err
 			}
 
-			cached := accountProofValue{proof: proof, state: state}
+			cached := accountProofValue{proof: proof}
 
 			f.mu.Lock()
 			if f.accountProofs == nil {
@@ -139,16 +151,16 @@ func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cel
 			}
 			f.mu.Unlock()
 
-			return cached, nil
+			return accountProofResult{proof: cached.proof, state: state}, nil
 		})
 		if err != nil {
 			return nil, nil, err
 		}
-		cached, ok := value.(accountProofValue)
+		result, ok := value.(accountProofResult)
 		if !ok {
 			return nil, nil, errors.New("invalid account proof cache value")
 		}
-		return cached.proof, cached.state, nil
+		return result.proof, result.state, nil
 	}
 
 	return f.buildAccountProof(accountID, pruned)
@@ -169,6 +181,20 @@ func (f *liveBlockFragments) buildAccountProof(accountID []byte, pruned bool) ([
 	}
 
 	return []*cell.Cell{f.blockStateRootProof, stateProof}, state, nil
+}
+
+func (f *liveBlockFragments) accountProofState(accountID []byte, pruned bool) (*cell.Cell, error) {
+	state, err := f.accountCell(accountID)
+	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if state != nil && pruned {
+		return accountPrunedProof(state)
+	}
+	return state, nil
 }
 
 func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {
@@ -248,6 +274,12 @@ func (f *liveBlockFragments) shardHashesProof(workchain int32, shard int64, exac
 		if cached := f.shardHashesProofs[key]; cached != nil {
 			proof = cached
 		} else {
+			if len(f.shardHashesProofs) >= liveShardHashesProofCacheLimit {
+				for evict := range f.shardHashesProofs {
+					delete(f.shardHashesProofs, evict)
+					break
+				}
+			}
 			f.shardHashesProofs[key] = proof
 		}
 		f.mu.Unlock()

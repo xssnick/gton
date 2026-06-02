@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/xssnick/gton/service/blockproof"
@@ -9,6 +10,9 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+// ErrBroadcastSignatureRetryable marks local verifier state gaps that should not poison broadcast dedupe.
+var ErrBroadcastSignatureRetryable = errors.New("broadcast signature check is retryable")
 
 func (n *Node) checkBlockBroadcastSignatures(kind string, block ton.BlockIDExt, proof *cell.Cell, signatures *blockproof.ValidatorSignatureSet) error {
 	if n.signatureVerifier == nil {
@@ -36,9 +40,9 @@ func (n *Node) checkBlockBroadcastSignatures(kind string, block ton.BlockIDExt, 
 	})
 }
 
-func (n *Node) checkShardDescriptionSignatures(block ton.BlockIDExt, catchainSeqno int32, data []byte) error {
+func (n *Node) validateShardDescriptionBroadcast(block ton.BlockIDExt, catchainSeqno int32, data []byte) (*ShardBlockDescription, error) {
 	if n.signatureVerifier == nil {
-		return fmt.Errorf("broadcast signature verifier is not configured")
+		return nil, fmt.Errorf("broadcast signature verifier is not configured")
 	}
 
 	ctx := n.runCtx
@@ -48,9 +52,9 @@ func (n *Node) checkShardDescriptionSignatures(block ton.BlockIDExt, catchainSeq
 	ctx, cancel := context.WithTimeout(ctx, broadcastSignatureTimeout)
 	defer cancel()
 
-	return n.signatureVerifier.CheckShardDescriptionSignatures(ctx, ShardDescriptionSignatureCheck{
+	return n.signatureVerifier.ValidateShardDescriptionBroadcast(ctx, ShardDescriptionSignatureCheck{
 		Block:         block,
 		CatchainSeqno: catchainSeqno,
-		Data:          append([]byte(nil), data...),
+		Data:          data,
 	})
 }

@@ -221,13 +221,8 @@ func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 	if accepted.event.ShardDescription.CatchainSeqno != 7 {
 		t.Fatalf("catchain seqno = %d, want 7", accepted.event.ShardDescription.CatchainSeqno)
 	}
-	if string(accepted.event.ShardDescription.Data) != string(data) {
-		t.Fatalf("description data = %x, want %x", accepted.event.ShardDescription.Data, data)
-	}
-
-	data[0] = 0x11
-	if accepted.event.ShardDescription.Data[0] != 0xAA {
-		t.Fatal("description data was not cloned")
+	if !accepted.event.ShardDescription.Block.Equals(&block) {
+		t.Fatalf("description block = %s, want %s", formatBlockRef(accepted.event.ShardDescription.Block), formatBlockRef(block))
 	}
 }
 
@@ -270,7 +265,7 @@ func testExternalMessageBOC(t *testing.T) []byte {
 	if err != nil {
 		t.Fatalf("build external message: %v", err)
 	}
-	return root.ToBOCWithFlags(false)
+	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 }
 
 func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
@@ -607,7 +602,6 @@ func TestAcceptBroadcastDoesNotCacheShardBlockInPeerLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
-	node.blockCacheSlots = nil
 
 	block := testBlockID(0, topShard, 42)
 	downloaded := &DownloadedBlock{
@@ -641,7 +635,6 @@ func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
-	node.blockCacheSlots = nil
 
 	block := testBlockID(-1, topShard, 42)
 	node.acceptBroadcast(acceptedBroadcast{

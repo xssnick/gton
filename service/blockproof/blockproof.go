@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/bits"
 	"sort"
 
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -95,14 +96,26 @@ func LinkBOC(id ton.BlockIDExt, proofBOC []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	_, boc, err := LinkFromRoot(id, parsed.Proof.Root)
+	if err != nil {
+		return nil, err
+	}
+	return boc, nil
+}
+
+func LinkFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, []byte, error) {
+	if proofRoot == nil {
+		return nil, nil, fmt.Errorf("block proof link %s has no root", tnstore.FormatBlockRef(id))
+	}
+
 	root, err := tlb.ToCell(&BlockProof{
-		ProofFor: parsed.Proof.ProofFor,
-		Root:     parsed.Proof.Root,
+		ProofFor: blockIDExtTLBFromBlock(id),
+		Root:     proofRoot,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("serialize block proof link %s: %w", tnstore.FormatBlockRef(id), err)
+		return nil, nil, fmt.Errorf("serialize block proof link %s: %w", tnstore.FormatBlockRef(id), err)
 	}
-	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
+	return root, root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
 func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error {
@@ -356,6 +369,10 @@ func (s *ValidatorSignatureSet) CatchainSeqno() uint32 {
 	return s.catchainSeqno
 }
 
+func (s *ValidatorSignatureSet) Final() bool {
+	return s != nil && s.final
+}
+
 func (s *ValidatorSignatureSet) ValidatorSetHash() uint32 {
 	if s == nil {
 		return 0
@@ -391,6 +408,33 @@ func (id blockIDExtTLB) blockID() ton.BlockIDExt {
 		RootHash:  bytes.Clone(id.RootHash),
 		FileHash:  bytes.Clone(id.FileHash),
 	}
+}
+
+func blockIDExtTLBFromBlock(id ton.BlockIDExt) blockIDExtTLB {
+	prefixBits := shardPrefixLength(id.Shard)
+	shardPrefix := uint64(id.Shard)
+	if prefixBits < 64 {
+		shardPrefix &^= uint64(1) << (63 - prefixBits)
+	}
+	return blockIDExtTLB{
+		ShardID: tlb.ShardIdent{
+			PrefixBits:  int8(prefixBits),
+			WorkchainID: id.Workchain,
+			ShardPrefix: shardPrefix,
+		},
+		SeqNo:    id.SeqNo,
+		RootHash: bytes.Clone(id.RootHash),
+		FileHash: bytes.Clone(id.FileHash),
+	}
+}
+
+func shardPrefixLength(shard int64) int {
+	x := uint64(shard)
+	lowBit := x & -x
+	if lowBit == 0 {
+		return 64
+	}
+	return 63 - bits.TrailingZeros64(lowBit)
 }
 
 func parseSignatureSet(root *cell.Cell) (ValidatorSignatureSet, error) {

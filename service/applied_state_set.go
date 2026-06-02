@@ -12,7 +12,9 @@ type appliedStateSet struct {
 }
 
 type appliedStateEntry struct {
-	state *storage.BlockState
+	state    *storage.BlockState
+	artifact *storage.ServedBlockFull
+	links    []storage.ServedBlockLink
 }
 
 type appliedStateCheckpoint struct {
@@ -21,6 +23,10 @@ type appliedStateCheckpoint struct {
 }
 
 func (s *appliedStateSet) remember(state *storage.BlockState) {
+	s.rememberWithArtifacts(state, nil, nil)
+}
+
+func (s *appliedStateSet) rememberWithArtifacts(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
 	if state == nil {
 		return
 	}
@@ -28,7 +34,9 @@ func (s *appliedStateSet) remember(state *storage.BlockState) {
 		s.states = map[storage.BlockRootHash]appliedStateEntry{}
 	}
 	s.states[storage.BlockKey(state.Block)] = appliedStateEntry{
-		state: storage.CloneBlockState(state),
+		state:    storage.CloneBlockState(state),
+		artifact: cloneServedBlockFullSharedPayload(artifact),
+		links:    cloneServedBlockLinks(links),
 	}
 }
 
@@ -36,15 +44,6 @@ func (s *appliedStateSet) rememberAllEntries(entries []appliedStateEntry) {
 	for _, entry := range entries {
 		s.rememberEntry(entry)
 	}
-}
-
-func (s *appliedStateSet) take() []*storage.BlockState {
-	entries := s.takeEntries()
-	states := make([]*storage.BlockState, 0, len(entries))
-	for _, entry := range entries {
-		states = append(states, storage.CloneBlockState(entry.state))
-	}
-	return states
 }
 
 func (s *appliedStateSet) takeEntries() []appliedStateEntry {
@@ -63,7 +62,9 @@ func (s *appliedStateSet) checkpoint() appliedStateCheckpoint {
 	for _, key := range keys {
 		entry := s.states[key]
 		entries = append(entries, storage.StateCheckpointBlock{
-			State: storage.CloneBlockState(entry.state),
+			State:    storage.CloneBlockState(entry.state),
+			Artifact: cloneServedBlockFullSharedPayload(entry.artifact),
+			Links:    cloneServedBlockLinks(entry.links),
 		})
 	}
 
@@ -84,15 +85,6 @@ func (s *appliedStateSet) completeCheckpoint(checkpoint appliedStateCheckpoint) 
 	if len(s.states) == 0 {
 		s.states = nil
 	}
-}
-
-func (s *appliedStateSet) clone() []*storage.BlockState {
-	entries := s.cloneEntries()
-	states := make([]*storage.BlockState, 0, len(entries))
-	for _, entry := range entries {
-		states = append(states, storage.CloneBlockState(entry.state))
-	}
-	return states
 }
 
 func (s *appliedStateSet) cloneEntries() []appliedStateEntry {
@@ -143,6 +135,29 @@ func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
 
 func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
 	return appliedStateEntry{
-		state: storage.CloneBlockState(entry.state),
+		state:    storage.CloneBlockState(entry.state),
+		artifact: cloneServedBlockFullSharedPayload(entry.artifact),
+		links:    cloneServedBlockLinks(entry.links),
 	}
+}
+
+func cloneServedBlockFullSharedPayload(block *storage.ServedBlockFull) *storage.ServedBlockFull {
+	if block == nil {
+		return nil
+	}
+	return &storage.ServedBlockFull{
+		ID:                     block.ID,
+		Proof:                  block.Proof,
+		Block:                  block.Block,
+		Meta:                   block.Meta.Clone(),
+		IsLink:                 block.IsLink,
+		ArchiveShardSplitDepth: block.ArchiveShardSplitDepth,
+	}
+}
+
+func cloneServedBlockLinks(links []storage.ServedBlockLink) []storage.ServedBlockLink {
+	if len(links) == 0 {
+		return nil
+	}
+	return append([]storage.ServedBlockLink(nil), links...)
 }

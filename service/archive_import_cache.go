@@ -12,7 +12,6 @@ import (
 type archiveImportResult struct {
 	stats      *archive.ImportStats
 	blocks     map[storage.BlockRootHash]PreparedBlock
-	stored     storage.ServedArchiveImport
 	splitDepth uint32
 }
 
@@ -169,55 +168,10 @@ func cloneArchiveImportResult(result *archiveImportResult) *archiveImportResult 
 	cloned := &archiveImportResult{
 		stats:      cloneImportStats(result.stats),
 		blocks:     make(map[storage.BlockRootHash]PreparedBlock, len(result.blocks)),
-		stored:     cloneServedArchiveImport(result.stored),
 		splitDepth: result.splitDepth,
 	}
 	for key, block := range result.blocks {
 		cloned.blocks[key] = block
 	}
 	return cloned
-}
-
-func cloneServedArchiveImport(imported storage.ServedArchiveImport) storage.ServedArchiveImport {
-	cloned := storage.ServedArchiveImport{
-		FullBlocks: make([]*storage.ServedBlockFull, 0, len(imported.FullBlocks)),
-		BlockData:  make([]storage.ServedBlockData, 0, len(imported.BlockData)),
-		Proofs:     make([]storage.ServedBlockProof, 0, len(imported.Proofs)),
-		Links:      append([]storage.ServedBlockLink(nil), imported.Links...),
-	}
-	for _, full := range imported.FullBlocks {
-		if full == nil {
-			cloned.FullBlocks = append(cloned.FullBlocks, nil)
-			continue
-		}
-		next := *full
-		next.ProofRef = full.ProofRef.Clone()
-		next.BlockRef = full.BlockRef.Clone()
-		next.Meta = full.Meta.Clone()
-		cloned.FullBlocks = append(cloned.FullBlocks, &next)
-	}
-	for _, block := range imported.BlockData {
-		cloned.BlockData = append(cloned.BlockData, cloneServedBlockData(block))
-	}
-	for _, proof := range imported.Proofs {
-		cloned.Proofs = append(cloned.Proofs, cloneServedBlockProof(proof))
-	}
-	return cloned
-}
-
-func cloneServedBlockData(block storage.ServedBlockData) storage.ServedBlockData {
-	return storage.ServedBlockData{
-		ID:   block.ID,
-		Data: block.Data,
-		Ref:  block.Ref.Clone(),
-	}
-}
-
-func cloneServedBlockProof(proof storage.ServedBlockProof) storage.ServedBlockProof {
-	return storage.ServedBlockProof{
-		Kind: proof.Kind,
-		ID:   proof.ID,
-		Data: proof.Data,
-		Ref:  proof.Ref.Clone(),
-	}
 }

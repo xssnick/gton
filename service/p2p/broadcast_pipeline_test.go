@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
@@ -14,6 +15,40 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+type testBroadcastPipelineObserver struct {
+	observations []BroadcastPipelineStageObservation
+}
+
+func (o *testBroadcastPipelineObserver) ObserveBroadcastPipelineStage(observation BroadcastPipelineStageObservation) {
+	o.observations = append(o.observations, observation)
+}
+
+func (o *testBroadcastPipelineObserver) requireStage(t *testing.T, stage string, kind string, delivery Delivery, result string) {
+	t.Helper()
+
+	for _, observation := range o.observations {
+		if observation.Stage == stage &&
+			observation.Kind == kind &&
+			observation.Delivery == delivery &&
+			observation.Result == result {
+			return
+		}
+	}
+	t.Fatalf("missing broadcast pipeline observation stage=%s kind=%s delivery=%s result=%s in %#v", stage, kind, delivery, result, o.observations)
+}
+
+func (o *testBroadcastPipelineObserver) requireNoStage(t *testing.T, stage string, kind string, delivery Delivery) {
+	t.Helper()
+
+	for _, observation := range o.observations {
+		if observation.Stage == stage &&
+			observation.Kind == kind &&
+			observation.Delivery == delivery {
+			t.Fatalf("unexpected broadcast pipeline observation stage=%s kind=%s delivery=%s in %#v", stage, kind, delivery, o.observations)
+		}
+	}
+}
 
 func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePrecheck(t *testing.T) {
 	node := newTestNode(t)
@@ -105,6 +140,66 @@ func TestClassifyBroadcastUsesPeerAsFECSourcePeerID(t *testing.T) {
 	}
 }
 
+func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
+	node := newTestNode(t)
+	node.SetBlockCacheObserver(&testBlockCacheObserver{nonfinalEnabled: true})
+	observer := &testBroadcastPipelineObserver{}
+	node.SetBroadcastPipelineObserver(observer)
+
+	sourceID := testPeerID("source")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:         "custom.private-a",
+			Kind:         overlayKindCustomFixed,
+			ShortID:      []byte{0x01, 0x02, 0x03},
+			BlockSenders: map[PeerID]struct{}{sourceID: {}},
+		},
+		log: discardLogger(),
+	}
+
+	downloaded := testShardBroadcastDownloadedBlock(t, 206, 0x206)
+	candidate := tonnodeapi.NewBlockCandidateBroadcast{
+		ID:   downloaded.ID,
+		Data: downloaded.BlockBOC,
+	}
+	if err := sub.handleOverlayBroadcast(nil, candidate, DeliveryTwoStep, true, sourceID); err != nil {
+		t.Fatalf("handle candidate broadcast: %v", err)
+	}
+	observer.requireStage(t, broadcastPipelineStageClassify, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultSuccess)
+	observer.requireStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultError)
+
+	desc := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      downloaded.ID,
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
+	}
+	if err := sub.handleOverlayBroadcast(nil, desc, DeliveryFEC, true, sourceID); err != nil {
+		t.Fatalf("handle shard description broadcast: %v", err)
+	}
+	observer.requireStage(t, broadcastPipelineStageShardDescValidate, "tonNode.newShardBlockBroadcast", DeliveryFEC, broadcastPipelineResultSuccess)
+
+	node.acceptBroadcast(acceptedBroadcast{
+		fingerprint: "hot-cache",
+		deduped:     true,
+		event: &BroadcastEvent{
+			Overlay:    "basechain",
+			Kind:       downloaded.Kind,
+			Delivery:   DeliverySimple,
+			Block:      downloaded.ID,
+			Downloaded: &downloaded,
+		},
+	})
+	observer.requireStage(t, broadcastPipelineStageHotCacheNotify, "tonNode.blockBroadcast", DeliverySimple, broadcastPipelineResultSuccess)
+
+	if _, err := node.popShardBroadcastBlock(downloaded.ID); err != nil {
+		t.Fatalf("pop hot shard block: %v", err)
+	}
+	observer.requireStage(t, broadcastPipelineStageExactPop, "tonNode.blockBroadcast", "", broadcastPipelineResultSuccess)
+}
+
 func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T) {
 	node := newTestNode(t)
 	node.SetBroadcastSignatureVerifier(testRejectBroadcastSignatureVerifier{err: errors.New("bad signatures")})
@@ -132,6 +227,31 @@ func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T
 	}
 	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "signature_check_failed"); got != 1 {
 		t.Fatalf("dropped broadcast count = %d, want 1", got)
+	}
+}
+
+func TestBroadcastTransientSignatureFailureReleasesDeduper(t *testing.T) {
+	node := newTestNode(t)
+	now := time.Now()
+	fingerprint := "transient-signature-failure"
+	if !node.deduper.Mark(fingerprint, now) {
+		t.Fatal("fingerprint was not marked")
+	}
+
+	node.forgetBroadcastFingerprintIfRetryable(fingerprint, ErrBroadcastSignatureRetryable)
+	if node.deduper.Seen(fingerprint, time.Now()) {
+		t.Fatal("transient signature failure poisoned the broadcast deduper")
+	}
+
+	if !node.deduper.Mark(fingerprint, now.Add(time.Second)) {
+		t.Fatal("fingerprint was not accepted after transient failure")
+	}
+
+	for _, err := range []error{errors.New("bad signatures"), tnstore.ErrNotFound} {
+		node.forgetBroadcastFingerprintIfRetryable(fingerprint, err)
+		if !node.deduper.Seen(fingerprint, now.Add(2*time.Second)) {
+			t.Fatalf("permanent signature failure %v should stay deduped", err)
+		}
 	}
 }
 
@@ -228,6 +348,8 @@ func TestCustomOverlayRejectsUnauthorizedBlockSender(t *testing.T) {
 
 func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(t *testing.T) {
 	node := newTestNode(t)
+	observer := &testBroadcastPipelineObserver{}
+	node.SetBroadcastPipelineObserver(observer)
 	sourceID := testPeerID("source")
 	sub := &overlaySubscription{
 		node: node,
@@ -240,9 +362,9 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 		log: discardLogger(),
 	}
 
-	data := []byte{0x10, 0x20, 0x30}
-	block := testBlockID(0, topShard, 204)
-	block.FileHash = hashSimpleBroadcastPayload(data)
+	downloaded := testShardBroadcastDownloadedBlock(t, 204, 0x204)
+	block := downloaded.ID
+	data := downloaded.BlockBOC
 	msg := tonnodeapi.NewBlockCandidateBroadcast{
 		ID:   block,
 		Data: data,
@@ -265,6 +387,7 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 	if !bytes.Equal(accepted.rebroadcast.payload, payload) {
 		t.Fatal("expected two-step rebroadcast payload to be preserved for custom fanout")
 	}
+	observer.requireNoStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep)
 }
 
 func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {
@@ -447,6 +570,47 @@ func TestClassifyExternalMessageBroadcastRejectsOversizeData(t *testing.T) {
 	}
 }
 
+func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProcessing(t *testing.T) {
+	for _, delivery := range []Delivery{DeliveryFEC, DeliveryTwoStep} {
+		t.Run(string(delivery), func(t *testing.T) {
+			node := newTestNode(t)
+			node.SetBroadcastAdmission(testBroadcastAdmission(false))
+			sub := &overlaySubscription{
+				node: node,
+				spec: overlaySpec{
+					Name:    "basechain",
+					ShortID: []byte{0x01, 0x02, 0x03},
+				},
+				log: discardLogger(),
+			}
+			peer := testRebroadcastQueuePeer("peer")
+			block := testBlockID(0, topShard, 77)
+			msg := tonnodeapi.NewBlockCandidateBroadcast{
+				ID:   block,
+				Data: []byte{0x01},
+			}
+			payload, err := tl.Serialize(msg, true)
+			if err != nil {
+				t.Fatalf("serialize candidate broadcast: %v", err)
+			}
+
+			err = sub.handleOverlayBroadcast(peer, msg, delivery, false, peer.id)
+			if !errors.Is(err, errBroadcastRejected) {
+				t.Fatalf("closed admission error = %v, want %v", err, errBroadcastRejected)
+			}
+			if _, ok := node.eventQueue.TryPop(); ok {
+				t.Fatal("closed admission broadcast reached event queue")
+			}
+			if node.deduper.Seen(broadcastFingerprint(sub.spec.ShortID, payload), time.Now()) {
+				t.Fatal("closed admission broadcast was deduped")
+			}
+			if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newBlockCandidateBroadcast", "broadcast_admission_closed"); got != 1 {
+				t.Fatalf("admission drop count = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 {
 	for _, stat := range node.broadcastStatusSnapshot() {
 		if stat.Direction == direction && stat.Overlay == overlay && stat.Kind == kind {
@@ -476,5 +640,5 @@ func testExternalMessageBOCWithBody(t *testing.T, value uint64) []byte {
 	if err != nil {
 		t.Fatalf("build external message: %v", err)
 	}
-	return root.ToBOCWithFlags(false)
+	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 }

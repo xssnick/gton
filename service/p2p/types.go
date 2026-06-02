@@ -107,6 +107,13 @@ const (
 	blockSpeedSampleMin           = int64(64 << 10)
 )
 
+const (
+	prefetchShardBlockTimeout    = 2500 * time.Millisecond
+	prefetchShardBlockPeers      = 3
+	prefetchShardBlockWidePeers  = 8
+	prefetchShardBlockStageDelay = 250 * time.Millisecond
+)
+
 type Delivery string
 
 const (
@@ -127,13 +134,29 @@ type BroadcastEvent struct {
 	ReceivedAt       time.Time
 }
 
-func (e BroadcastEvent) BlockRef() string {
-	return formatBlockRef(e.Block)
+type BroadcastPipelineObserver interface {
+	ObserveBroadcastPipelineStage(BroadcastPipelineStageObservation)
 }
 
-type ShardBlockDescription struct {
-	CatchainSeqno int32
-	Data          []byte
+type BroadcastPipelineStageObservation struct {
+	Stage    string
+	Kind     string
+	Delivery Delivery
+	Result   string
+	Duration time.Duration
+}
+
+type BroadcastAdmissionRequest struct {
+	Kind  string
+	Local bool
+}
+
+type BroadcastAdmission interface {
+	CanAcceptBroadcast(req BroadcastAdmissionRequest) bool
+}
+
+func (e BroadcastEvent) BlockRef() string {
+	return formatBlockRef(e.Block)
 }
 
 type Options struct {
@@ -148,15 +171,17 @@ type Options struct {
 	StateFilesDir      string
 	Storage            storage.Storage
 	PeerServingStorage storage.PeerServingStorage
+	LiveBlockCache     *storage.LiveBlockCache
 	CompressedState    CompressedBlockStateProvider
 	SyncLag            SyncLagProvider
 	SignatureVerifier  BroadcastSignatureVerifier
+	BroadcastAdmission BroadcastAdmission
 	CustomOverlays     []CustomOverlayConfig
 }
 
 type BroadcastSignatureVerifier interface {
 	CheckBlockBroadcastSignatures(ctx context.Context, req BlockBroadcastSignatureCheck) error
-	CheckShardDescriptionSignatures(ctx context.Context, req ShardDescriptionSignatureCheck) error
+	ValidateShardDescriptionBroadcast(ctx context.Context, req ShardDescriptionSignatureCheck) (*ShardBlockDescription, error)
 }
 
 type BlockBroadcastSignatureCheck struct {
@@ -172,8 +197,23 @@ type ShardDescriptionSignatureCheck struct {
 	Data          []byte
 }
 
+type ShardBlockDescription struct {
+	Block            ton.BlockIDExt
+	CatchainSeqno    uint32
+	ValidatorSetHash uint32
+	Data             []byte
+	Chain            []ShardDescriptionLink
+}
+
+type ShardDescriptionLink struct {
+	Block          ton.BlockIDExt
+	PrevRefs       []ton.BlockIDExt
+	MasterchainRef *ton.BlockIDExt
+	ProofRoot      *cell.Cell
+	ProofBOC       []byte
+}
+
 type BlockCacheObserver interface {
-	MarkLiveBlockFlushed(block ton.BlockIDExt)
 	NonfinalBlockCacheEnabled() bool
 	PublishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) error
 }
@@ -244,13 +284,10 @@ type DownloadedBlock struct {
 	Proof    *cell.Cell
 	BlockBOC []byte
 	ProofBOC []byte
-	// BroadcastSignatures is the validator signature set received with block broadcasts.
-	// It is not proof of validity by itself; service consensus validation checks it
-	// against the validator set before the block is used as verified.
-	BroadcastSignatures *cell.Cell
-	Meta                *storage.BlockMeta
-	StateUpdate         *cell.Cell
-	SourcePeerID        PeerID
+	Meta     *storage.BlockMeta
+
+	StateUpdate  *cell.Cell
+	SourcePeerID PeerID
 
 	IsLink bool
 

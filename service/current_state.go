@@ -357,13 +357,22 @@ func masterchainBroadcastCandidateCacheable(block VerifiedBlock) bool {
 	if prev.Workchain != -1 || prev.Shard != topShard {
 		return false
 	}
-	if block.consensus == nil || block.consensus.broadcastSignatures == nil {
+	if block.consensus == nil || !masterchainBroadcastBlockKind(block.Kind) {
 		return false
 	}
 	if block.IsLink || len(block.BlockBOC) == 0 || len(block.ProofBOC) == 0 {
 		return false
 	}
 	return true
+}
+
+func masterchainBroadcastBlockKind(kind string) bool {
+	switch kind {
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+		return true
+	default:
+		return false
+	}
 }
 
 func queuedMasterchainBlockBytes(block PreparedBlock) int64 {
@@ -662,11 +671,6 @@ func (s *Service) takeQueuedMasterchainEntry(prev, target ton.BlockIDExt) (queue
 		return queuedMasterchainBlock{}, false
 	}
 	return entry, true
-}
-
-func (s *Service) queuedMasterchainBlockAhead(prev ton.BlockIDExt) (ton.BlockIDExt, bool) {
-	future, ok := s.queuedMasterchainFuture(prev)
-	return future.block, ok
 }
 
 func (s *Service) queuedMasterchainFuture(prev ton.BlockIDExt) (queuedMasterchainFuture, bool) {

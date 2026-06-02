@@ -183,7 +183,7 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 }
 
 func runMethodStack(methodID uint64, params *cell.Cell) (*vmcore.Stack, error) {
-	if params != nil && len(params.ToBOCWithFlags(false)) >= runMethodMaxParamBytes {
+	if params != nil && len(params.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})) >= runMethodMaxParamBytes {
 		return nil, fmt.Errorf("more than 64k parameter bytes passed")
 	}
 
@@ -248,7 +248,7 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 	if masterState == nil {
 		masterBlock, root, fragments, err := s.runMethodMasterState(ctx, ref.shard)
 		if err != nil {
-			return runMethodAccount{}, err
+			return runMethodAccount{}, fmt.Errorf("load run method master state: %w", err)
 		}
 		master = masterBlock
 		masterState = root
@@ -257,7 +257,7 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 
 	shardFragments, err := s.blockFragments(ctx, ref.shard)
 	if err != nil {
-		return runMethodAccount{}, err
+		return runMethodAccount{}, fmt.Errorf("load run method shard fragments: %w", err)
 	}
 
 	header := shardFragments.shardHeader
@@ -273,7 +273,7 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 		}
 	}
 	if err != nil {
-		return runMethodAccount{}, err
+		return runMethodAccount{}, fmt.Errorf("load run method account cell: %w", err)
 	}
 
 	return runMethodAccount{
@@ -293,7 +293,7 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 func (s *Server) runMethodMasterState(ctx context.Context, shard ton.BlockIDExt) (ton.BlockIDExt, *cell.Cell, *liveBlockFragments, error) {
 	shardFragments, err := s.blockFragments(ctx, shard)
 	if err != nil {
-		return ton.BlockIDExt{}, nil, nil, err
+		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("load shard state fragments: %w", err)
 	}
 
 	master, err := shardStateMasterRef(shardFragments.stateRoot)
@@ -301,27 +301,23 @@ func (s *Server) runMethodMasterState(ctx context.Context, shard ton.BlockIDExt)
 		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("masterchain ref block is not available")
 	}
 	if err != nil {
-		return ton.BlockIDExt{}, nil, nil, err
+		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("load shard state master ref: %w", err)
 	}
 	fragments, err := s.blockFragments(ctx, master)
 	if err != nil {
-		return ton.BlockIDExt{}, nil, nil, err
+		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("load master state fragments %s: %w", storage.FormatBlockRef(master), err)
 	}
 	return master, fragments.stateRoot, fragments, nil
-}
-
-type shardStateStatsMasterRef struct {
-	Master tlb.ExtBlkRef `tlb:"."`
 }
 
 func shardStateMasterRef(stateRoot *cell.Cell) (ton.BlockIDExt, error) {
 	var state tlb.ShardStateUnsplit
 	loader, err := stateRoot.BeginParse()
 	if err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("parse shard state root: %w", err)
 	}
 	if err = tlb.LoadFromCell(&state, loader); err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard state header: %w", err)
 	}
 	if state.Stats == nil {
 		return ton.BlockIDExt{}, storage.ErrNotFound
@@ -329,40 +325,40 @@ func shardStateMasterRef(stateRoot *cell.Cell) (ton.BlockIDExt, error) {
 
 	stats, err := state.Stats.BeginParse()
 	if err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("parse shard state stats: %w", err)
 	}
 	if _, err = stats.LoadUInt(64); err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats overload history: %w", err)
 	}
 	if _, err = stats.LoadUInt(64); err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats underload history: %w", err)
 	}
 
 	var totalBalance tlb.CurrencyCollection
 	if err = tlb.LoadFromCell(&totalBalance, stats); err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats total balance: %w", err)
 	}
 	var totalValidatorFees tlb.CurrencyCollection
 	if err = tlb.LoadFromCell(&totalValidatorFees, stats); err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats total validator fees: %w", err)
 	}
 	if _, err = stats.LoadDict(256); err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats libraries dict: %w", err)
 	}
 
-	masterRef, err := stats.LoadMaybeRef()
+	hasMasterRef, err := stats.LoadBoolBit()
 	if err != nil {
-		return ton.BlockIDExt{}, err
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats master ref flag: %w", err)
 	}
-	if masterRef == nil {
+	if !hasMasterRef {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 
-	var info shardStateStatsMasterRef
-	if err = tlb.LoadFromCell(&info, masterRef); err != nil {
-		return ton.BlockIDExt{}, err
+	var masterRef tlb.ExtBlkRef
+	if err = tlb.LoadFromCell(&masterRef, stats); err != nil {
+		return ton.BlockIDExt{}, fmt.Errorf("load shard stats master ref info: %w", err)
 	}
-	return blockIDFromExtRef(masterchainID, masterchainShard, info.Master), nil
+	return blockIDFromExtRef(masterchainID, masterchainShard, masterRef), nil
 }
 
 type runMethodConfigInfo struct {

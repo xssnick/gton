@@ -3,20 +3,12 @@ package p2p
 import (
 	"context"
 	"fmt"
-	"math/bits"
 	"os"
 	"sync"
 
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
-)
-
-const (
-	testArchiveSliceMasterchainBlocks   = 100
-	testArchivePackIndexSliceStride     = 1 << 20
-	testArchivePackIndexMaxShardDepth   = 12
-	testArchivePackIndexWorkchainStride = 1 << (testArchivePackIndexMaxShardDepth + 1)
 )
 
 type testPeerStore struct {
@@ -63,10 +55,11 @@ func (s *testPeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
 		s.blockData[storage.BlockKey(cloned.ID)] = append([]byte(nil), cloned.Block...)
 	}
 	if len(cloned.Proof) > 0 {
-		kinds := storage.StoredProofKinds(cloned.Block, cloned.IsLink)
+		isKeyBlock := false
 		if cloned.Meta != nil {
-			kinds = storage.StoredProofKindsForBlock(cloned.IsLink, cloned.Meta.Has(storage.BlockMetaIsKeyBlock))
+			isKeyBlock = cloned.Meta.Has(storage.BlockMetaIsKeyBlock)
 		}
+		kinds := storage.StoredProofKindsForServedBlock(cloned.ID, cloned.IsLink, isKeyBlock)
 		for _, kind := range kinds {
 			s.proofs[s.proofKey(kind, cloned.ID)] = append([]byte(nil), cloned.Proof...)
 		}
@@ -84,12 +77,6 @@ func (s *testPeerStore) SaveArchiveImport(imported *storage.ServedArchiveImport)
 	for _, full := range imported.FullBlocks {
 		s.saveBlockFullLocked(full)
 	}
-	for _, block := range imported.BlockData {
-		s.blockData[storage.BlockKey(block.ID)] = append([]byte(nil), block.Data...)
-	}
-	for _, proof := range imported.Proofs {
-		s.proofs[s.proofKey(proof.Kind, proof.ID)] = append([]byte(nil), proof.Data...)
-	}
 	for _, link := range imported.Links {
 		s.nextBlocks[storage.BlockKey(link.Prev)] = storage.BlockKey(link.Next)
 	}
@@ -100,13 +87,6 @@ func (s *testPeerStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextBlocks[storage.BlockKey(prev)] = storage.BlockKey(next)
-	return nil
-}
-
-func (s *testPeerStore) SaveBlockData(block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.blockData[storage.BlockKey(block)] = append([]byte(nil), data...)
 	return nil
 }
 
@@ -141,28 +121,6 @@ func (s *testPeerStore) SavePersistentStateFile(file *storage.PersistentStateFil
 	defer s.mu.Unlock()
 	s.stateFiles[s.persistentStateKey(file.Block, file.MasterchainBlock, file.EffectiveShard)] = append([]byte(nil), data...)
 	return nil
-}
-
-func (s *testPeerStore) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (storage.SavedArchiveFile, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return storage.SavedArchiveFile{}, err
-	}
-	baseSeqno := uint32(archiveID)
-	masterSeqno := uint32(masterchainSeqno)
-	if masterSeqno < baseSeqno {
-		return storage.SavedArchiveFile{}, fmt.Errorf("archive masterchain seqno %d is before package base %d", masterchainSeqno, baseSeqno)
-	}
-	sliceSeqno := baseSeqno + ((masterSeqno-baseSeqno)/testArchiveSliceMasterchainBlocks)*testArchiveSliceMasterchainBlocks
-	localArchiveID := testArchivePackID(baseSeqno, sliceSeqno, workchain, shard)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := uint32(0); i < testArchiveSliceMasterchainBlocks; i++ {
-		s.archiveInfos[testArchiveInfoKey(int32(sliceSeqno+i), workchain, shard)] = localArchiveID
-	}
-	s.archiveFiles[localArchiveID] = data
-	return storage.SavedArchiveFile{Path: path}, nil
 }
 
 func (s *testPeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
@@ -319,39 +277,4 @@ func (s *testPeerStore) persistentStateKey(block ton.BlockIDExt, masterchainBloc
 
 func testArchiveInfoKey(masterchainSeqno int32, workchain int32, shard int64) string {
 	return fmt.Sprintf("%d:%d:%016x", masterchainSeqno, workchain, uint64(shard))
-}
-
-func testArchivePackID(baseSeqno uint32, sliceSeqno uint32, workchain int32, shard int64) int64 {
-	sliceIndex := uint32(0)
-	if sliceSeqno > baseSeqno {
-		sliceIndex = (sliceSeqno - baseSeqno) / testArchiveSliceMasterchainBlocks
-	}
-	idx := sliceIndex * testArchivePackIndexSliceStride
-	if workchain != -1 || shard != topShard {
-		idx += 1 + testArchiveShardIndex(workchain, shard)
-	}
-	return int64(uint64(idx)<<32 | uint64(baseSeqno))
-}
-
-func testArchiveShardIndex(workchain int32, shard int64) uint32 {
-	workchainOffset := uint32(workchain+1) * testArchivePackIndexWorkchainStride
-	depth := testShardPrefixLength(shard)
-	if depth <= 0 {
-		return workchainOffset
-	}
-	if depth > testArchivePackIndexMaxShardDepth {
-		depth = testArchivePackIndexMaxShardDepth
-	}
-
-	prefix := uint64(shard) >> (64 - depth)
-	shardOffset := (uint32(1) << uint(depth)) - 1 + uint32(prefix)
-	return workchainOffset + shardOffset
-}
-
-func testShardPrefixLength(shard int64) int {
-	value := uint64(shard)
-	if value == 0 {
-		return 0
-	}
-	return 63 - bits.TrailingZeros64(value)
 }

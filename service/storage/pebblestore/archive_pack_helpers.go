@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -20,7 +21,17 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-const topShard = int64(-1 << 63)
+const (
+	topShard                = int64(-1 << 63)
+	artifactPackSyncWorkers = 4
+)
+
+type pathSyncFunc func(string) error
+
+type artifactSyncTask struct {
+	index int
+	path  string
+}
 
 type archivePackRegistration struct {
 	valid            bool
@@ -49,9 +60,22 @@ type archivePackageMeta struct {
 	firstMasterLT    uint64
 }
 
-type artifactAppendResult struct {
-	ref          *storage.ArtifactRef
-	registration archivePackRegistration
+type archiveAppendRequest struct {
+	kind       string
+	block      ton.BlockIDExt
+	meta       *storage.BlockMeta
+	splitDepth uint32
+	data       []byte
+}
+
+type archiveAppendRecord struct {
+	request          archiveAppendRequest
+	requestIndex     int
+	location         archiveEntryLocation
+	firstMasterSeq   uint32
+	firstMasterUTime uint32
+	firstMasterLT    uint64
+	path             string
 }
 
 type pendingPackSync struct {
@@ -60,39 +84,48 @@ type pendingPackSync struct {
 	size int64
 }
 
-func (s *Store) syncPendingArtifactFiles() error {
-	if err := s.syncPendingArchiveFiles(); err != nil {
-		return err
+type pendingPackWrite struct {
+	seq  uint64
+	size int64
+}
+
+type syncedArtifactPacks struct {
+	archive  []pendingPackSync
+	keyProof []pendingPackSync
+}
+
+func (p syncedArtifactPacks) empty() bool {
+	return len(p.archive) == 0 && len(p.keyProof) == 0
+}
+
+func (s *Store) syncPendingArtifactPacks() (syncedArtifactPacks, error) {
+	archive, err := s.syncPendingPackFiles(s.pendingArchiveSync, "archive")
+	if err != nil {
+		return syncedArtifactPacks{}, err
 	}
-	return s.syncPendingKeyProofFiles()
+	keyProof, err := s.syncPendingPackFiles(s.pendingKeyProofSync, "key proof")
+	if err != nil {
+		return syncedArtifactPacks{}, err
+	}
+	return syncedArtifactPacks{
+		archive:  archive,
+		keyProof: keyProof,
+	}, nil
 }
 
-func (s *Store) syncPendingArchiveFiles() error {
-	return s.syncPendingPackFiles(s.pendingArchiveSync, "archive")
-}
-
-func (s *Store) syncPendingKeyProofFiles() error {
-	return s.syncPendingPackFiles(s.pendingKeyProofSync, "key proof")
-}
-
-func (s *Store) syncPendingPackFiles(pending map[string]uint64, label string) error {
+func (s *Store) syncPendingPackFiles(pending map[string]pendingPackWrite, label string) ([]pendingPackSync, error) {
 	s.artifactMu.Lock()
 	if len(pending) == 0 {
 		s.artifactMu.Unlock()
-		return nil
+		return nil, nil
 	}
 
 	items := make([]pendingPackSync, 0, len(pending))
-	for path, seq := range pending {
-		stat, err := os.Stat(path)
-		if err != nil {
-			s.artifactMu.Unlock()
-			return fmt.Errorf("stat %s pending pack %s: %w", label, path, err)
-		}
+	for path, write := range pending {
 		items = append(items, pendingPackSync{
 			path: path,
-			seq:  seq,
-			size: stat.Size(),
+			seq:  write.seq,
+			size: write.size,
 		})
 	}
 	s.artifactMu.Unlock()
@@ -102,11 +135,20 @@ func (s *Store) syncPendingPackFiles(pending map[string]uint64, label string) er
 	})
 
 	dirs := make(map[string]struct{}, len(items))
+	paths := make([]string, 0, len(items))
 	for _, item := range items {
-		if err := syncFile(item.path); err != nil {
-			return fmt.Errorf("sync %s pack %s: %w", label, item.path, err)
-		}
+		paths = append(paths, item.path)
 		dirs[filepath.Dir(item.path)] = struct{}{}
+	}
+
+	err := syncPathsParallel(paths, artifactPackSyncWorkers, func(path string) error {
+		if err := syncFile(path); err != nil {
+			return fmt.Errorf("sync %s pack %s: %w", label, path, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	dirPaths := make([]string, 0, len(dirs))
@@ -114,23 +156,93 @@ func (s *Store) syncPendingPackFiles(pending map[string]uint64, label string) er
 		dirPaths = append(dirPaths, dir)
 	}
 	sort.Strings(dirPaths)
-	for _, dir := range dirPaths {
-		if err := syncDir(dir); err != nil {
-			return fmt.Errorf("sync %s pack dir %s: %w", label, dir, err)
+	err = syncPathsParallel(dirPaths, artifactPackSyncWorkers, func(path string) error {
+		if err := syncDir(path); err != nil {
+			return fmt.Errorf("sync %s pack dir %s: %w", label, path, err)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := s.commitSyncedPackSizes(items); err != nil {
-		return err
+	return items, nil
+}
+
+func syncPathsParallel(paths []string, workerLimit int, syncPath pathSyncFunc) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	if workerLimit <= 1 || len(paths) == 1 {
+		for _, path := range paths {
+			if err := syncPath(path); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
+	workers := workerLimit
+	if len(paths) < workers {
+		workers = len(paths)
+	}
+
+	tasks := make(chan artifactSyncTask)
+	errs := make([]error, len(paths))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				errs[task.index] = syncPath(task.path)
+			}
+		}()
+	}
+
+	for index, path := range paths {
+		tasks <- artifactSyncTask{index: index, path: path}
+	}
+	close(tasks)
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) clearSyncedArtifactPacks(packs syncedArtifactPacks) {
+	if packs.empty() {
+		return
+	}
 	s.artifactMu.Lock()
+	s.clearSyncedPackFilesLocked(s.pendingArchiveSync, packs.archive)
+	s.clearSyncedPackFilesLocked(s.pendingKeyProofSync, packs.keyProof)
+	s.artifactMu.Unlock()
+}
+
+func (s *Store) clearSyncedPackFilesLocked(pending map[string]pendingPackWrite, items []pendingPackSync) {
 	for _, item := range items {
-		if pending[item.path] == item.seq {
+		if current, ok := pending[item.path]; ok && current.seq == item.seq {
 			delete(pending, item.path)
 		}
 	}
+}
+
+func (s *Store) abandonPendingArtifactPacks() {
+	s.artifactMu.Lock()
+	s.abandonPendingPackFilesLocked(s.pendingArchiveSync, s.dirtyArchivePacks)
+	s.abandonPendingPackFilesLocked(s.pendingKeyProofSync, s.dirtyKeyProofPacks)
 	s.artifactMu.Unlock()
-	return nil
+}
+
+func (s *Store) abandonPendingPackFilesLocked(pending map[string]pendingPackWrite, dirty map[string]struct{}) {
+	for path := range pending {
+		s.markDirtyPackTail(dirty, path)
+		delete(pending, path)
+	}
 }
 
 func syncFile(path string) error {
@@ -154,75 +266,176 @@ func syncDir(path string) error {
 	return nil
 }
 
-func (s *Store) appendArchiveEntry(kind string, block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, data []byte) (artifactAppendResult, error) {
-	location, err := s.archiveEntryLocation(block, meta, splitDepth)
-	if err != nil {
-		return artifactAppendResult{}, err
+func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storage.ArtifactRef, []archivePackRegistration, error) {
+	if len(requests) == 0 {
+		return nil, nil, nil
 	}
-	firstMasterSeq, firstMasterUTime, firstMasterLT, err := archiveEntryFirstMaster(block, meta)
-	if err != nil {
-		return artifactAppendResult{}, err
+
+	pendingStarts := archiveAppendPackageStarts(requests)
+	baseCache := make(map[uint32]uint32)
+	baseSeqnoFor := func(masterSeqno uint32, isKey bool) (uint32, error) {
+		if isKey {
+			return masterSeqno, nil
+		}
+		if cached, ok := baseCache[masterSeqno]; ok {
+			return cached, nil
+		}
+
+		baseSeqno, err := s.archivePackageBaseSeqno(masterSeqno, false)
+		if err != nil {
+			return 0, err
+		}
+		if pending, ok := latestPendingArchivePackageStart(pendingStarts, masterSeqno); ok && pending > baseSeqno {
+			baseSeqno = pending
+		}
+		baseCache[masterSeqno] = baseSeqno
+		return baseSeqno, nil
 	}
+
+	records := make([]archiveAppendRecord, 0, len(requests))
+	for idx, request := range requests {
+		masterSeqno, err := archiveEntryMasterSeqno(request.block, request.meta)
+		if err != nil {
+			return nil, nil, err
+		}
+		isKey := archiveEntryIsKey(request.block, request.meta)
+		baseSeqno, err := baseSeqnoFor(masterSeqno, isKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		location := archiveEntryLocationForBase(request.block, request.splitDepth, masterSeqno, baseSeqno)
+
+		firstMasterSeq, firstMasterUTime, firstMasterLT, err := archiveEntryFirstMaster(request.block, request.meta)
+		if err != nil {
+			return nil, nil, err
+		}
+		records = append(records, archiveAppendRecord{
+			request:          request,
+			requestIndex:     idx,
+			location:         location,
+			firstMasterSeq:   firstMasterSeq,
+			firstMasterUTime: firstMasterUTime,
+			firstMasterLT:    firstMasterLT,
+			path:             s.archivePackPath(location.sliceSeqno, location.workchain, location.shard),
+		})
+	}
+
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].path != records[j].path {
+			return records[i].path < records[j].path
+		}
+		return records[i].requestIndex < records[j].requestIndex
+	})
+
+	refs := make([]*storage.ArtifactRef, len(requests))
+	registrations := make([]archivePackRegistration, 0, len(records))
 
 	s.artifactMu.Lock()
 	defer s.artifactMu.Unlock()
 
-	path := s.archivePackPath(location.sliceSeqno, location.workchain, location.shard)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return artifactAppendResult{}, err
-	}
-	if err := s.ensureCleanPackTail(path, s.pendingArchiveSync, s.dirtyArchivePacks); err != nil {
-		return artifactAppendResult{}, err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return artifactAppendResult{}, err
-	}
-	defer func() { _ = file.Close() }()
+	for idx := 0; idx < len(records); {
+		path := records[idx].path
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, nil, err
+		}
+		if err := s.ensureCleanPackTail(path, s.pendingArchiveSync, s.dirtyArchivePacks); err != nil {
+			return nil, nil, err
+		}
 
-	ptr, err := packfile.Append(file, packfile.EntryName(kind, block), data, false)
-	if err != nil {
-		s.markDirtyPackTail(s.dirtyArchivePacks, path)
-		return artifactAppendResult{}, err
-	}
-	stat, err := file.Stat()
-	if err != nil {
-		return artifactAppendResult{}, err
-	}
-	s.markPendingPackSync(s.pendingArchiveSync, path)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			return nil, nil, err
+		}
 
-	ref := &storage.ArtifactRef{
-		Path:   s.relativeArtifactPath(path),
-		Offset: ptr.Offset,
-		Size:   ptr.Size,
+		appender, err := packfile.NewAppender(file)
+		if err != nil {
+			_ = file.Close()
+			s.markDirtyPackTail(s.dirtyArchivePacks, path)
+			return nil, nil, err
+		}
+
+		groupReg := archivePackRegistration{}
+		for idx < len(records) && records[idx].path == path {
+			record := records[idx]
+			ptr, appendErr := appender.Append(packfile.EntryName(record.request.kind, record.request.block), record.request.data)
+			if appendErr != nil {
+				_ = file.Close()
+				s.markDirtyPackTail(s.dirtyArchivePacks, path)
+				return nil, nil, appendErr
+			}
+
+			ref := &storage.ArtifactRef{
+				Path:   s.relativeArtifactPath(path),
+				Offset: ptr.Offset,
+				Size:   ptr.Size,
+			}
+			refs[record.requestIndex] = ref
+
+			reg := archivePackRegistration{
+				valid:            true,
+				archiveID:        record.location.archiveID,
+				path:             ref.Path,
+				baseSeq:          record.location.baseSeqno,
+				startSeq:         record.location.sliceSeqno,
+				workchain:        record.location.workchain,
+				shard:            record.location.shard,
+				firstMasterSeq:   record.firstMasterSeq,
+				firstMasterUTime: record.firstMasterUTime,
+				firstMasterLT:    record.firstMasterLT,
+			}
+			if !groupReg.valid {
+				groupReg = reg
+			} else if mergeErr := mergeArchivePackRegistration(&groupReg, reg); mergeErr != nil {
+				_ = file.Close()
+				s.markDirtyPackTail(s.dirtyArchivePacks, path)
+				return nil, nil, mergeErr
+			}
+			idx++
+		}
+
+		size := appender.Size()
+		closeErr := file.Close()
+		if closeErr != nil {
+			s.markDirtyPackTail(s.dirtyArchivePacks, path)
+			return nil, nil, closeErr
+		}
+
+		groupReg.size = size
+		registrations = append(registrations, groupReg)
+		s.markPendingPackSync(s.pendingArchiveSync, path, size)
 	}
-	return artifactAppendResult{
-		ref: ref,
-		registration: archivePackRegistration{
-			valid:            true,
-			archiveID:        location.archiveID,
-			path:             ref.Path,
-			size:             stat.Size(),
-			baseSeq:          location.baseSeqno,
-			startSeq:         location.sliceSeqno,
-			workchain:        location.workchain,
-			shard:            location.shard,
-			firstMasterSeq:   firstMasterSeq,
-			firstMasterUTime: firstMasterUTime,
-			firstMasterLT:    firstMasterLT,
-		},
-	}, nil
+
+	return refs, registrations, nil
 }
 
-func (s *Store) appendProofEntry(kind storage.ServedProofKind, block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, data []byte) (artifactAppendResult, error) {
-	if isKeyProofKind(kind) {
-		ref, err := s.appendKeyBlockProofEntry(kind, block, data)
-		if err != nil {
-			return artifactAppendResult{}, err
+func archiveAppendPackageStarts(requests []archiveAppendRequest) []uint32 {
+	starts := make([]uint32, 0, len(requests))
+	seen := make(map[uint32]struct{})
+	for _, request := range requests {
+		if !archiveEntryIsKey(request.block, request.meta) {
+			continue
 		}
-		return artifactAppendResult{ref: ref}, nil
+		seqno := request.block.SeqNo
+		if _, ok := seen[seqno]; ok {
+			continue
+		}
+		seen[seqno] = struct{}{}
+		starts = append(starts, seqno)
 	}
-	return s.appendArchiveEntry(packEntryKindForProofKind(kind), block, meta, splitDepth, data)
+	sort.Slice(starts, func(i, j int) bool {
+		return starts[i] < starts[j]
+	})
+	return starts
+}
+
+func latestPendingArchivePackageStart(starts []uint32, masterSeqno uint32) (uint32, bool) {
+	idx := sort.Search(len(starts), func(i int) bool {
+		return starts[i] > masterSeqno
+	})
+	if idx == 0 {
+		return 0, false
+	}
+	return starts[idx-1], true
 }
 
 func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) (*storage.ArtifactRef, error) {
@@ -240,27 +453,30 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = file.Close() }()
 
-	ptr, err := packfile.Append(file, packfile.EntryName(packEntryKindForProofKind(kind), block), data, false)
+	appender, err := packfile.NewAppender(file)
 	if err != nil {
+		_ = file.Close()
 		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
 		return nil, err
 	}
-	s.markPendingPackSync(s.pendingKeyProofSync, path)
+	ptr, err := appender.Append(packfile.EntryName(packEntryKindForProofKind(kind), block), data)
+	if err != nil {
+		_ = file.Close()
+		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
+		return nil, err
+	}
+	size := appender.Size()
+	if err = file.Close(); err != nil {
+		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
+		return nil, err
+	}
+	s.markPendingPackSync(s.pendingKeyProofSync, path, size)
 	return &storage.ArtifactRef{
 		Path:   s.relativeArtifactPath(path),
 		Offset: ptr.Offset,
 		Size:   ptr.Size,
 	}, nil
-}
-
-func (s *Store) copyProofRefToKeyPack(kind storage.ServedProofKind, block ton.BlockIDExt, ref *storage.ArtifactRef) (*storage.ArtifactRef, error) {
-	data, err := s.readArtifactRef(context.Background(), ref)
-	if err != nil {
-		return nil, err
-	}
-	return s.appendKeyBlockProofEntry(kind, block, data)
 }
 
 func (s *Store) archivePackPath(seqno uint32, workchain int32, shard int64) string {
@@ -304,11 +520,14 @@ func (s *Store) archiveEntryLocation(block ton.BlockIDExt, meta *storage.BlockMe
 		return archiveEntryLocation{}, err
 	}
 
-	isKey := block.Workchain == -1 && block.Shard == topShard && meta != nil && meta.Has(storage.BlockMetaIsKeyBlock)
-	baseSeqno, err := s.archivePackageBaseSeqno(masterSeqno, isKey)
+	baseSeqno, err := s.archivePackageBaseSeqno(masterSeqno, archiveEntryIsKey(block, meta))
 	if err != nil {
 		return archiveEntryLocation{}, err
 	}
+	return archiveEntryLocationForBase(block, splitDepth, masterSeqno, baseSeqno), nil
+}
+
+func archiveEntryLocationForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32) archiveEntryLocation {
 	sliceSeqno := archiveSliceSeqno(baseSeqno, masterSeqno)
 	workchain, shard := archiveEntryShardPrefix(block, splitDepth)
 
@@ -318,7 +537,11 @@ func (s *Store) archiveEntryLocation(block ton.BlockIDExt, meta *storage.BlockMe
 		sliceSeqno: sliceSeqno,
 		workchain:  workchain,
 		shard:      shard,
-	}, nil
+	}
+}
+
+func archiveEntryIsKey(block ton.BlockIDExt, meta *storage.BlockMeta) bool {
+	return block.Workchain == -1 && block.Shard == topShard && meta != nil && meta.Has(storage.BlockMetaIsKeyBlock)
 }
 
 func archiveEntryMasterSeqno(block ton.BlockIDExt, meta *storage.BlockMeta) (uint32, error) {
@@ -424,17 +647,28 @@ func archiveShardPrefixLength(shard int64) int {
 	return 63 - bits.TrailingZeros64(value)
 }
 
-func isShardSplitNextLinkConflict(prev ton.BlockIDExt, existing ton.BlockIDExt, next ton.BlockIDExt) bool {
+func selectShardSplitNextLink(prev ton.BlockIDExt, existing ton.BlockIDExt, next ton.BlockIDExt) (ton.BlockIDExt, bool) {
 	if prev.Workchain == -1 || existing.Workchain != prev.Workchain || next.Workchain != prev.Workchain {
-		return false
+		return ton.BlockIDExt{}, false
 	}
 	if prev.SeqNo == ^uint32(0) || existing.SeqNo != prev.SeqNo+1 || next.SeqNo != prev.SeqNo+1 {
-		return false
+		return ton.BlockIDExt{}, false
 	}
 	if existing.Shard == next.Shard {
-		return false
+		return ton.BlockIDExt{}, false
 	}
-	return archiveShardIsDirectChild(prev.Shard, existing.Shard) && archiveShardIsDirectChild(prev.Shard, next.Shard)
+	if !archiveShardIsDirectChild(prev.Shard, existing.Shard) || !archiveShardIsDirectChild(prev.Shard, next.Shard) {
+		return ton.BlockIDExt{}, false
+	}
+
+	leftShard := archiveShardChild(prev.Shard, true)
+	if existing.Shard == leftShard {
+		return existing, true
+	}
+	if next.Shard == leftShard {
+		return next, true
+	}
+	return ton.BlockIDExt{}, false
 }
 
 func archiveShardIsDirectChild(parent int64, child int64) bool {
@@ -444,6 +678,16 @@ func archiveShardIsDirectChild(parent int64, child int64) bool {
 		return false
 	}
 	return archiveShardIntersects(parent, child)
+}
+
+func archiveShardChild(shard int64, left bool) int64 {
+	value := uint64(shard)
+	bit := value & -value
+	step := bit >> 1
+	if left {
+		return int64(value - step)
+	}
+	return int64(value + step)
 }
 
 func archiveShardIntersects(left int64, right int64) bool {
@@ -511,18 +755,24 @@ func (s *Store) latestArchivePackageStart(masterSeqno uint32) (uint32, error) {
 }
 
 func (s *Store) registerArchivePacks(batch *pebble.Batch, registrations []archivePackRegistration) error {
+	registrations, err := mergeArchivePackRegistrations(registrations)
+	if err != nil {
+		return err
+	}
+
+	packageStarts := make(map[uint32]struct{}, len(registrations))
 	for _, reg := range registrations {
-		if !reg.valid {
-			continue
-		}
 		if err := s.setArchiveFileRef(batch, reg.archiveID, &storage.ArtifactRef{
 			Path: reg.path,
 			Size: reg.size,
 		}); err != nil {
 			return err
 		}
-		if err := batch.Set(hotKeyArchivePackageStart(reg.baseSeq), []byte{1}, pebble.NoSync); err != nil {
-			return err
+		if _, ok := packageStarts[reg.baseSeq]; !ok {
+			if err := s.setArchivePackageStart(batch, reg.baseSeq); err != nil {
+				return err
+			}
+			packageStarts[reg.baseSeq] = struct{}{}
 		}
 		if err := s.setArchivePackageMeta(batch, reg); err != nil {
 			return err
@@ -532,6 +782,81 @@ func (s *Store) registerArchivePacks(batch *pebble.Batch, registrations []archiv
 		}
 	}
 	return nil
+}
+
+func mergeArchivePackRegistrations(registrations []archivePackRegistration) ([]archivePackRegistration, error) {
+	merged := make([]archivePackRegistration, 0, len(registrations))
+	byArchiveID := make(map[int64]int, len(registrations))
+	for _, reg := range registrations {
+		if !reg.valid {
+			continue
+		}
+
+		idx, ok := byArchiveID[reg.archiveID]
+		if !ok {
+			byArchiveID[reg.archiveID] = len(merged)
+			merged = append(merged, reg)
+			continue
+		}
+		if err := mergeArchivePackRegistration(&merged[idx], reg); err != nil {
+			return nil, err
+		}
+	}
+	return merged, nil
+}
+
+func mergeArchivePackRegistration(dst *archivePackRegistration, next archivePackRegistration) error {
+	if dst.path != next.path ||
+		dst.baseSeq != next.baseSeq ||
+		dst.startSeq != next.startSeq ||
+		dst.workchain != next.workchain ||
+		dst.shard != next.shard {
+		return fmt.Errorf("archive package descriptor mismatch archive_id=%d old={%s} new={%s}", next.archiveID, archivePackRegistrationDescriptor(*dst), archivePackRegistrationDescriptor(next))
+	}
+
+	if next.size > dst.size {
+		dst.size = next.size
+	}
+	mergeArchivePackFirstMaster(dst, next)
+	return nil
+}
+
+func mergeArchivePackFirstMaster(dst *archivePackRegistration, next archivePackRegistration) {
+	if next.firstMasterSeq != 0 && (dst.firstMasterSeq == 0 || next.firstMasterSeq < dst.firstMasterSeq) {
+		dst.firstMasterSeq = next.firstMasterSeq
+		dst.firstMasterUTime = next.firstMasterUTime
+		dst.firstMasterLT = next.firstMasterLT
+		return
+	}
+	if next.firstMasterSeq == dst.firstMasterSeq {
+		if dst.firstMasterUTime == 0 {
+			dst.firstMasterUTime = next.firstMasterUTime
+		}
+		if dst.firstMasterLT == 0 {
+			dst.firstMasterLT = next.firstMasterLT
+		}
+	}
+}
+
+func archivePackRegistrationDescriptor(reg archivePackRegistration) string {
+	return fmt.Sprintf("path=%s base=%d start=%d wc=%d shard=%016x", reg.path, reg.baseSeq, reg.startSeq, reg.workchain, uint64(reg.shard))
+}
+
+func archivePackageMetaDescriptor(meta archivePackageMeta) string {
+	return fmt.Sprintf("path=%s base=%d start=%d wc=%d shard=%016x", meta.path, meta.baseSeq, meta.startSeq, meta.workchain, uint64(meta.shard))
+}
+
+func (s *Store) setArchivePackageStart(batch *pebble.Batch, seqno uint32) error {
+	key := hotKeyArchivePackageStart(seqno)
+	_, closer, err := pebbleReaderGet(s.hot, key)
+	if err == nil {
+		defer func() { _ = closer.Close() }()
+		return nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return err
+	}
+	return batch.Set(key, []byte{1}, pebble.NoSync)
 }
 
 func (s *Store) setArchivePackageMeta(batch *pebble.Batch, reg archivePackRegistration) error {
@@ -560,7 +885,7 @@ func (s *Store) setArchivePackageMeta(batch *pebble.Batch, reg archivePackRegist
 			return fmt.Errorf("archive package path mismatch archive_id=%d old=%s new=%s", reg.archiveID, current.path, meta.path)
 		}
 		if current.baseSeq != meta.baseSeq || current.startSeq != meta.startSeq || current.workchain != meta.workchain || current.shard != meta.shard {
-			return fmt.Errorf("archive package descriptor mismatch archive_id=%d", reg.archiveID)
+			return fmt.Errorf("archive package descriptor mismatch archive_id=%d old={%s} new={%s}", reg.archiveID, archivePackageMetaDescriptor(current), archivePackageMetaDescriptor(meta))
 		}
 		if current.size > meta.size {
 			meta.size = current.size
@@ -577,6 +902,11 @@ func (s *Store) setArchivePackageMeta(batch *pebble.Batch, reg archivePackRegist
 				meta.firstMasterLT = current.firstMasterLT
 			}
 		}
+		encoded := encodeArchivePackageMeta(meta)
+		if bytes.Equal(old, encoded) {
+			return nil
+		}
+		return batch.Set(key, encoded, pebble.NoSync)
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
@@ -605,6 +935,14 @@ func (s *Store) setArchiveFileRef(batch *pebble.Batch, archiveID int64, ref *sto
 }
 
 func (s *Store) registerArchiveInfoRange(batch *pebble.Batch, startSeq uint32, workchain int32, shard int64, archiveID int64) error {
+	registered, err := s.archiveInfoRangeRegistered(startSeq, workchain, shard, archiveID)
+	if err != nil {
+		return err
+	}
+	if registered {
+		return nil
+	}
+
 	for i := uint32(0); i < archiveSliceMasterchainBlocks; i++ {
 		seqno := startSeq + i
 		if err := batch.Set(hotKeyArchiveInfo(int32(seqno), workchain, shard), encodeInt64(archiveID), pebble.NoSync); err != nil {
@@ -612,6 +950,28 @@ func (s *Store) registerArchiveInfoRange(batch *pebble.Batch, startSeq uint32, w
 		}
 	}
 	return nil
+}
+
+func (s *Store) archiveInfoRangeRegistered(startSeq uint32, workchain int32, shard int64, archiveID int64) (bool, error) {
+	for _, seqno := range []uint32{startSeq, startSeq + archiveSliceMasterchainBlocks - 1} {
+		raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchiveInfo(int32(seqno), workchain, shard))
+		if errors.Is(err, storage.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if len(raw) != 8 {
+			_ = closer.Close()
+			return false, fmt.Errorf("invalid archive info payload")
+		}
+		storedArchiveID := int64(binary.BigEndian.Uint64(raw))
+		_ = closer.Close()
+		if storedArchiveID != archiveID {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func isKeyProofKind(kind storage.ServedProofKind) bool {
@@ -680,60 +1040,129 @@ func (s *Store) writeStateArtifactFile(block ton.BlockIDExt, data []byte) (*stor
 	}, nil
 }
 
-func (s *Store) markPendingPackSync(pending map[string]uint64, path string) {
+func (s *Store) markPendingPackSync(pending map[string]pendingPackWrite, path string, size int64) {
 	s.artifactSyncSeq++
-	pending[path] = s.artifactSyncSeq
+	pending[path] = pendingPackWrite{
+		seq:  s.artifactSyncSeq,
+		size: size,
+	}
 }
 
-func (s *Store) commitSyncedPackSizes(items []pendingPackSync) error {
-	if len(items) == 0 {
-		return nil
+func (s *Store) publishedArtifactFileSize(path string) (int64, error) {
+	relPath, ok := s.archivePackArtifactPath(path)
+	if !ok {
+		return 0, fmt.Errorf("artifact path is not an archive pack: %s", path)
 	}
 
-	return s.withHotBatch(func(batch *pebble.Batch) error {
-		for _, item := range items {
-			path := s.relativeArtifactPath(item.path)
-			if err := s.setPackCommittedSize(batch, path, item.size); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (s *Store) setPackCommittedSize(batch *pebble.Batch, path string, size int64) error {
-	key := hotKeyPackCommitted(path)
-	old, closer, err := pebbleReaderGet(s.hot, key)
-	if err == nil {
-		defer func() { _ = closer.Close() }()
-		if len(old) != 8 {
-			return fmt.Errorf("invalid committed pack size record")
-		}
-		if int64(binary.BigEndian.Uint64(old)) >= size {
-			return nil
-		}
-	} else if !errors.Is(err, storage.ErrNotFound) {
-		return err
-	}
-	return batch.Set(key, encodeInt64(size), pebble.NoSync)
-}
-
-func (s *Store) packCommittedSize(path string) (int64, error) {
-	raw, closer, err := pebbleReaderGet(s.hot, hotKeyPackCommitted(path))
-	if errors.Is(err, storage.ErrNotFound) {
-		return 0, nil
-	}
+	published, err := s.publishedArtifactFileSizes()
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = closer.Close() }()
-	if len(raw) != 8 {
-		return 0, fmt.Errorf("invalid committed pack size record")
-	}
-	return int64(binary.BigEndian.Uint64(raw)), nil
+	return published[relPath], nil
 }
 
-func (s *Store) ensureCleanPackTail(path string, pending map[string]uint64, dirty map[string]struct{}) error {
+func (s *Store) publishedArtifactFileSizes() (map[string]int64, error) {
+	published := map[string]int64{}
+	for _, prefix := range [][]byte{
+		hotPrefixArchiveFile,
+		hotPrefixBlockDataRef,
+		hotPrefixProofRef,
+		hotPrefixKeyProofRef,
+	} {
+		if err := s.collectPublishedArtifactRefs(published, prefix); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.collectPublishedArchivePackageMetas(published); err != nil {
+		return nil, err
+	}
+	return published, nil
+}
+
+func (s *Store) collectPublishedArtifactRefs(published map[string]int64, prefix []byte) error {
+	iter, err := s.hot.NewIter(&pebble.IterOptions{
+		LowerBound: bytes.Clone(prefix),
+		UpperBound: appendPrefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = iter.Close() }()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		ref, err := decodeArtifactRef(iter.Value())
+		if err != nil {
+			return err
+		}
+		if err = s.recordPublishedArtifactRange(published, ref.Path, ref.Offset, ref.Size); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func (s *Store) collectPublishedArchivePackageMetas(published map[string]int64) error {
+	iter, err := s.hot.NewIter(&pebble.IterOptions{
+		LowerBound: hotKeyArchivePackagePrefix(),
+		UpperBound: appendPrefixUpperBound(hotPrefixArchivePackage),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = iter.Close() }()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		meta, err := decodeArchivePackageMeta(iter.Value())
+		if err != nil {
+			return err
+		}
+		if err = s.recordPublishedArtifactRange(published, meta.path, 0, meta.size); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func (s *Store) recordPublishedArtifactRange(published map[string]int64, path string, offset int64, size int64) error {
+	relPath, ok := s.archivePackArtifactPath(path)
+	if !ok {
+		return fmt.Errorf("artifact path is not an archive pack: %s", path)
+	}
+	if offset < 0 || size < 0 {
+		return fmt.Errorf("invalid artifact range path=%s offset=%d size=%d", path, offset, size)
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if offset > maxInt64-size {
+		return fmt.Errorf("artifact range overflows path=%s offset=%d size=%d", path, offset, size)
+	}
+
+	end := offset + size
+	if end > published[relPath] {
+		published[relPath] = end
+	}
+	return nil
+}
+
+func (s *Store) archivePackArtifactPath(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	if filepath.IsAbs(path) {
+		path = s.relativeArtifactPath(path)
+	}
+
+	clean := filepath.Clean(path)
+	slashPath := filepath.ToSlash(clean)
+	if strings.HasPrefix(slashPath, "../") || strings.HasPrefix(slashPath, "/") {
+		return "", false
+	}
+	if !strings.HasPrefix(slashPath, "archive/packages/") || !strings.HasSuffix(slashPath, ".pack") {
+		return "", false
+	}
+	return filepath.FromSlash(slashPath), true
+}
+
+func (s *Store) ensureCleanPackTail(path string, pending map[string]pendingPackWrite, dirty map[string]struct{}) error {
 	if _, ok := pending[path]; ok {
 		return nil
 	}
@@ -761,16 +1190,16 @@ func (s *Store) truncateUncommittedPackTail(path string) error {
 		return err
 	}
 
-	committedSize, err := s.packCommittedSize(s.relativeArtifactPath(path))
+	publishedSize, err := s.publishedArtifactFileSize(path)
 	if err != nil {
 		return err
 	}
-	if stat.Size() <= committedSize {
+	if stat.Size() <= publishedSize {
 		return nil
 	}
 
-	if err := os.Truncate(path, committedSize); err != nil {
-		return fmt.Errorf("truncate uncommitted pack %s from %d to %d: %w", path, stat.Size(), committedSize, err)
+	if err := os.Truncate(path, publishedSize); err != nil {
+		return fmt.Errorf("truncate uncommitted pack %s from %d to %d: %w", path, stat.Size(), publishedSize, err)
 	}
 	return nil
 }
@@ -786,26 +1215,13 @@ func isMissingArtifactError(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
-func (s *Store) reconcileCommittedArtifactFiles() error {
-	committed := map[string]int64{}
-	iter, err := s.hot.NewIter(&pebble.IterOptions{
-		LowerBound: hotKeyPackCommittedPrefix(),
-		UpperBound: appendPrefixUpperBound(hotPrefixPackCommitted),
-	})
+func (s *Store) reconcileArtifactPackFiles() error {
+	published, err := s.publishedArtifactFileSizes()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = iter.Close() }()
 
-	for iter.First(); iter.Valid(); iter.Next() {
-		key := iter.Key()
-		value := iter.Value()
-		if len(value) != 8 {
-			return fmt.Errorf("invalid committed pack size record")
-		}
-		relPath := string(key[len(hotPrefixPackCommitted):])
-		size := int64(binary.BigEndian.Uint64(value))
-		committed[relPath] = size
+	for relPath, size := range published {
 		path := s.artifactPath(relPath)
 		stat, err := os.Stat(path)
 		if err != nil {
@@ -816,17 +1232,14 @@ func (s *Store) reconcileCommittedArtifactFiles() error {
 		}
 		if stat.Size() > size {
 			if err = os.Truncate(path, size); err != nil {
-				return fmt.Errorf("truncate committed pack %s to %d: %w", path, size, err)
+				return fmt.Errorf("truncate artifact pack %s to published size %d: %w", path, size, err)
 			}
 		}
 	}
-	if err = iter.Error(); err != nil {
-		return err
-	}
-	return s.removeUncommittedPackFiles(committed)
+	return s.removeUncommittedPackFiles(published)
 }
 
-func (s *Store) removeUncommittedPackFiles(committed map[string]int64) error {
+func (s *Store) removeUncommittedPackFiles(published map[string]int64) error {
 	root := filepath.Join(s.dir, "archive", "packages")
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -836,7 +1249,7 @@ func (s *Store) removeUncommittedPackFiles(committed map[string]int64) error {
 			return nil
 		}
 		rel := s.relativeArtifactPath(path)
-		if _, ok := committed[rel]; ok {
+		if _, ok := published[rel]; ok {
 			return nil
 		}
 		return os.Remove(path)
@@ -852,153 +1265,4 @@ func appendPrefixUpperBound(prefix []byte) []byte {
 		}
 	}
 	return nil
-}
-
-type archivePackStoreResult struct {
-	stored         bool
-	reusedExisting bool
-}
-
-func storeArchivePack(src string, dst string) (archivePackStoreResult, error) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return archivePackStoreResult{}, err
-	}
-	if filepath.Clean(src) == filepath.Clean(dst) {
-		return archivePackStoreResult{}, validateArchivePack(dst)
-	}
-
-	if err := validateArchivePack(src); err != nil {
-		return archivePackStoreResult{}, err
-	}
-	if _, err := os.Stat(dst); err == nil {
-		merged, err := mergeArchivePack(src, dst)
-		if err != nil {
-			return archivePackStoreResult{}, err
-		}
-		return archivePackStoreResult{stored: merged, reusedExisting: true}, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return archivePackStoreResult{}, err
-	}
-	if err := os.Rename(src, dst); err == nil {
-		return archivePackStoreResult{stored: true}, validateArchivePack(dst)
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
-	if err != nil {
-		return archivePackStoreResult{}, err
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-	if err = tmp.Close(); err != nil {
-		return archivePackStoreResult{}, err
-	}
-
-	if err = copyFileSync(src, tmpPath); err != nil {
-		return archivePackStoreResult{}, err
-	}
-	if err = validateArchivePack(tmpPath); err != nil {
-		return archivePackStoreResult{}, err
-	}
-	if err = os.Rename(tmpPath, dst); err != nil {
-		return archivePackStoreResult{}, err
-	}
-	if err = os.Remove(src); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return archivePackStoreResult{}, err
-	}
-	return archivePackStoreResult{stored: true}, nil
-}
-
-func mergeArchivePack(src string, dst string) (bool, error) {
-	if err := validateArchivePack(dst); err != nil {
-		return false, err
-	}
-
-	existing, err := archivePackEntryNames(dst)
-	if err != nil {
-		return false, err
-	}
-
-	out, err := os.OpenFile(dst, os.O_RDWR, 0o644)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = out.Close() }()
-	stat, err := out.Stat()
-	if err != nil {
-		return false, err
-	}
-	originalSize := stat.Size()
-
-	in, err := os.Open(src)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = in.Close() }()
-
-	merged := false
-	if err = packfile.Read(context.Background(), in, func(entry packfile.Entry) error {
-		if _, ok := existing[entry.Name]; ok {
-			return nil
-		}
-		if _, err := packfile.Append(out, entry.Name, entry.Data, false); err != nil {
-			return err
-		}
-		existing[entry.Name] = struct{}{}
-		merged = true
-		return nil
-	}); err != nil {
-		return false, err
-	}
-	if merged {
-		if err = out.Sync(); err != nil {
-			if truncateErr := out.Truncate(originalSize); truncateErr != nil {
-				return false, errors.Join(err, fmt.Errorf("rollback archive pack merge %s to %d: %w", dst, originalSize, truncateErr))
-			}
-			return false, err
-		}
-	}
-	if err = os.Remove(src); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return false, err
-	}
-	return merged, nil
-}
-
-func archivePackEntryNames(path string) (map[string]struct{}, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = file.Close() }()
-
-	names := map[string]struct{}{}
-	if err = packfile.Read(context.Background(), file, func(entry packfile.Entry) error {
-		names[entry.Name] = struct{}{}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return names, nil
-}
-
-func validateArchivePack(path string) error {
-	return packfile.Validate(path)
-}
-
-func copyFileSync(src string, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-
-	if _, err = io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Sync()
 }

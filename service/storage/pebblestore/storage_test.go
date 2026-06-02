@@ -277,7 +277,7 @@ func TestOpenRejectsMetaDBWithoutCellGenerationManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw metadb: %v", err)
 	}
-	if err = db.Set(hotKeyVerifiedKeyBlockProgress(), []byte{0x01}, pebble.Sync); err != nil {
+	if err = db.Set(hotKeyStateSyncProgress(), []byte{0x01}, pebble.Sync); err != nil {
 		t.Fatalf("write raw metadb record: %v", err)
 	}
 	if err = db.Close(); err != nil {
@@ -896,6 +896,123 @@ func TestDecodeBlockStateMetaRejectsPayloadWithoutMasterchainRefFlag(t *testing.
 	}
 }
 
+func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	prev := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     10,
+		RootHash:  bytes.Repeat([]byte{0x10}, 32),
+		FileHash:  bytes.Repeat([]byte{0x11}, 32),
+	}
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     11,
+		RootHash:  bytes.Repeat([]byte{0x12}, 32),
+		FileHash:  bytes.Repeat([]byte{0x13}, 32),
+	}
+	root := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()
+	rootHash := root.HashKey(0)
+	state := &storage.BlockState{
+		Block:         block,
+		StateRootHash: rootHash[:],
+		Cell:          root,
+	}
+	current := &storage.CurrentState{
+		SyncedAt:    time.Now(),
+		Masterchain: *state,
+		Shards:      map[storage.ShardKey]storage.BlockState{},
+	}
+	blockData := []byte{0x30, 0x31, 0x32}
+	proofData := []byte{0x40, 0x41, 0x42}
+
+	_, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		State: state,
+		Artifact: &storage.ServedBlockFull{
+			ID:    block,
+			Block: blockData,
+			Proof: proofData,
+			Meta: &storage.BlockMeta{
+				ID:       block,
+				GenUTime: 123,
+				StartLT:  10,
+				EndLT:    20,
+				PrevRefs: []ton.BlockIDExt{prev},
+			},
+		},
+		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
+	}}, storage.StateCellRecords{}, current)
+	if err != nil {
+		t.Fatalf("save checkpoint with artifacts: %v", err)
+	}
+
+	gotBlock, err := store.BlockData(ctx, block)
+	if err != nil {
+		t.Fatalf("load checkpoint block data: %v", err)
+	}
+	if !bytes.Equal(gotBlock, blockData) {
+		t.Fatalf("checkpoint block data = %x, want %x", gotBlock, blockData)
+	}
+	gotProof, err := store.BlockProof(ctx, storage.ServedProofBlock, block)
+	if err != nil {
+		t.Fatalf("load checkpoint block proof: %v", err)
+	}
+	if !bytes.Equal(gotProof, proofData) {
+		t.Fatalf("checkpoint block proof = %x, want %x", gotProof, proofData)
+	}
+
+	raw, err := store.getHotCopy(ctx, hotKeyBlockDataRef(block))
+	if err != nil {
+		t.Fatalf("load block data ref: %v", err)
+	}
+	ref, err := decodeArtifactRef(raw)
+	if err != nil {
+		t.Fatalf("decode block data ref: %v", err)
+	}
+	publishedSizes, err := store.publishedArtifactFileSizes()
+	if err != nil {
+		t.Fatalf("published artifact sizes: %v", err)
+	}
+	published := publishedSizes[ref.Path]
+	if published < ref.Offset+ref.Size {
+		t.Fatalf("published artifact size = %d, want at least ref end %d", published, ref.Offset+ref.Size)
+	}
+	meta, err := store.BlockMeta(ctx, block)
+	if err != nil {
+		t.Fatalf("load checkpoint block meta: %v", err)
+	}
+	if !meta.Has(storage.BlockMetaHasServedFull) {
+		t.Fatalf("checkpoint block meta flags = %v, want served full", meta.Flags)
+	}
+
+	rawNext, err := store.getHotCopy(ctx, hotKeyNextBlock(prev))
+	if err != nil {
+		t.Fatalf("load checkpoint next link: %v", err)
+	}
+	decodedNext, err := decodeBlockID(rawNext)
+	if err != nil {
+		t.Fatalf("decode checkpoint next link: %v", err)
+	}
+	if !decodedNext.Equals(&block) {
+		t.Fatalf("checkpoint next link = %s, want %s", storage.FormatBlockRef(decodedNext), storage.FormatBlockRef(block))
+	}
+
+	next, err := store.NextBlockFull(ctx, prev)
+	if err != nil {
+		t.Fatalf("load checkpoint next block: %v", err)
+	}
+	if !next.ID.Equals(&block) {
+		t.Fatalf("checkpoint next block = %s, want %s", storage.FormatBlockRef(next.ID), storage.FormatBlockRef(block))
+	}
+}
+
 func TestSaveStateCheckpointStoresShardInclusionMasterRef(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -1049,10 +1166,9 @@ func TestOpenReadOnlyRejectsWrites(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	block10 := testMasterBlockID(10, 10)
 	block11 := testMasterBlockID(11, 11)
-	if err = store.SaveVerifiedKeyBlockProgress(ctx, block10); err != nil {
-		t.Fatalf("save verified key progress: %v", err)
+	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: block11, GenUTime: 11, StartLT: 11, EndLT: 12}); err != nil {
+		t.Fatalf("save block meta: %v", err)
 	}
 	if err = store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
@@ -1064,62 +1180,12 @@ func TestOpenReadOnlyRejectsWrites(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	loaded, err := store.VerifiedKeyBlockProgress(ctx)
-	if err != nil {
-		t.Fatalf("load verified key progress: %v", err)
+	if _, err = store.BlockMeta(ctx, block11); err != nil {
+		t.Fatalf("load block meta in read-only store: %v", err)
 	}
-	if !loaded.Equals(&block10) {
-		t.Fatalf("verified key progress = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block10))
-	}
-	if err = store.SaveVerifiedKeyBlockProgress(ctx, block11); !errors.Is(err, pebble.ErrReadOnly) {
+	block12 := testMasterBlockID(12, 12)
+	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: block12, GenUTime: 12, StartLT: 12, EndLT: 13}); !errors.Is(err, pebble.ErrReadOnly) {
 		t.Fatalf("save in read-only store = %v, want pebble.ErrReadOnly", err)
-	}
-}
-
-func TestVerifiedKeyBlockProgressPersistsOnlyNewestHint(t *testing.T) {
-	dir := t.TempDir()
-	store, err := Open(Options{Dir: dir})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-
-	ctx := context.Background()
-	block20 := testMasterBlockID(20, 20)
-	block19 := testMasterBlockID(19, 19)
-
-	if _, err = store.VerifiedKeyBlockProgress(ctx); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("verified key progress before save = %v, want ErrNotFound", err)
-	}
-	if err = store.SaveVerifiedKeyBlockProgress(ctx, block20); err != nil {
-		t.Fatalf("save verified key progress: %v", err)
-	}
-	if err = store.SaveVerifiedKeyBlockProgress(ctx, block19); err != nil {
-		t.Fatalf("save older verified key progress: %v", err)
-	}
-
-	loaded, err := store.VerifiedKeyBlockProgress(ctx)
-	if err != nil {
-		t.Fatalf("load verified key progress: %v", err)
-	}
-	if !loaded.Equals(&block20) {
-		t.Fatalf("verified key progress = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block20))
-	}
-
-	if err = store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-	store, err = Open(Options{Dir: dir})
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	defer func() { _ = store.Close() }()
-
-	loaded, err = store.VerifiedKeyBlockProgress(ctx)
-	if err != nil {
-		t.Fatalf("load verified key progress after reopen: %v", err)
-	}
-	if !loaded.Equals(&block20) {
-		t.Fatalf("verified key progress after reopen = %s, want %s", storage.FormatBlockRef(loaded), storage.FormatBlockRef(block20))
 	}
 }
 
@@ -1158,11 +1224,10 @@ func TestRollbackRestoresCurrentAndDeletesFutureMetadata(t *testing.T) {
 	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master11, shard11}, current11); err != nil {
 		t.Fatalf("save future current: %v", err)
 	}
-	if err = store.LinkNextBlock(master10.Block, master11.Block); err != nil {
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		Links: []storage.ServedBlockLink{{Prev: master10.Block, Next: master11.Block}},
+	}); err != nil {
 		t.Fatalf("link future master: %v", err)
-	}
-	if err = store.SaveVerifiedKeyBlockProgress(ctx, master11.Block); err != nil {
-		t.Fatalf("save verified key progress: %v", err)
 	}
 
 	stats, err := store.Rollback(ctx, current10)
@@ -1204,9 +1269,6 @@ func TestRollbackRestoresCurrentAndDeletesFutureMetadata(t *testing.T) {
 	}
 	if _, err = store.NextBlockFull(ctx, master10.Block); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("future next block link still exists: %v", err)
-	}
-	if _, err = store.VerifiedKeyBlockProgress(ctx); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("verified key progress after rollback = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1686,7 +1748,7 @@ func TestPreparedMerkleUpdateCellsMatchApplyMerkleUpdate(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(nextState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(nextState), preparedCells, nextCurrent); err != nil {
+	if _, err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(nextState), preparedCells, nextCurrent); err != nil {
 		t.Fatalf("save prepared state update target: %v", err)
 	}
 
@@ -1895,8 +1957,71 @@ func TestSaveStateCheckpointWithPreparedCellsLoadsLazyRoot(t *testing.T) {
 		mustEncodedCellRecord(t, root),
 		mustEncodedCellRecord(t, child),
 	}
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state), storage.NewStateCellRecords(records), current); err != nil {
+	if _, err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state), storage.NewStateCellRecords(records), current); err != nil {
 		t.Fatalf("save checkpoint with prepared cells: %v", err)
+	}
+
+	loaded, err := store.LoadStateCellTree(ctx, state.Block, state.StateRootHash)
+	if err != nil {
+		t.Fatalf("load saved state: %v", err)
+	}
+	loadedChild, err := loaded.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load saved child ref: %v", err)
+	}
+	if loadedChild.HashKey() != child.HashKey() {
+		t.Fatalf("loaded child hash mismatch: got=%x want=%x", loadedChild.HashKey(), child.HashKey())
+	}
+}
+
+func TestStateCellPrewriteAllowsCheckpointWithoutCellBatch(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     1,
+	}
+	child := cell.BeginCell().MustStoreUInt(0x31, 8).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0x32, 8).MustStoreRef(child).EndCell()
+	state := blockStateWithRoot(block, root)
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(state),
+		Shards:           map[storage.ShardKey]storage.BlockState{},
+	}
+
+	records := storage.NewStateCellRecords([]storage.EncodedCellRecord{
+		mustEncodedCellRecord(t, root),
+		mustEncodedCellRecord(t, child),
+	})
+	if err = store.SaveStateCellRecords(ctx, records); err != nil {
+		t.Fatalf("prewrite state cells: %v", err)
+	}
+	if err = store.FlushStateCells(ctx); err != nil {
+		t.Fatalf("flush prewritten cells: %v", err)
+	}
+
+	rootHash := root.HashKey()
+	_, err = store.loadLazyCell(ctx, rootHash[:])
+	if err != nil {
+		t.Fatalf("load prewritten lazy root: %v", err)
+	}
+	checkpointState := storage.CloneBlockState(state)
+	checkpointState.Cell = nil
+
+	timing, err := store.SaveStateCheckpointEntries(ctx, checkpointEntries(checkpointState), storage.StateCellRecords{}, current)
+	if err != nil {
+		t.Fatalf("save checkpoint metadata for prewritten cells: %v", err)
+	}
+	if timing.CellsWrite != 0 {
+		t.Fatalf("checkpoint cells write duration = %s, want 0 after prewrite", timing.CellsWrite)
 	}
 
 	loaded, err := store.LoadStateCellTree(ctx, state.Block, state.StateRootHash)
@@ -1938,7 +2063,7 @@ func TestSaveStateCheckpointWithPreparedCellsAllowsExternalBoundary(t *testing.T
 	}
 
 	records := []storage.EncodedCellRecord{mustEncodedCellRecord(t, root)}
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state), storage.NewStateCellRecords(records), current); err != nil {
+	if _, err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state), storage.NewStateCellRecords(records), current); err != nil {
 		t.Fatalf("save checkpoint with external boundary: %v", err)
 	}
 
@@ -1985,7 +2110,7 @@ func TestStateCheckpointAllowsOrphanCellsWithoutMetadata(t *testing.T) {
 	child2 := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()
 	root2 := cell.BeginCell().MustStoreUInt(0x33, 8).MustStoreRef(child2).EndCell()
 	firstCheckpointCells := append(mustReachableEncodedRecords(t, root1), mustReachableEncodedRecords(t, root2)...)
-	if err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state1), storage.NewStateCellRecords(firstCheckpointCells), current1); err != nil {
+	if _, err = store.SaveStateCheckpointEntries(ctx, checkpointEntries(state1), storage.NewStateCellRecords(firstCheckpointCells), current1); err != nil {
 		t.Fatalf("save first checkpoint: %v", err)
 	}
 	root2Hash := root2.HashKey(0)

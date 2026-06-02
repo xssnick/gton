@@ -50,6 +50,16 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		Result:        "success",
 		QueueDuration: 10 * time.Millisecond,
 		Duration:      20 * time.Millisecond,
+		Stages: []service.SyncPersistStageObservation{
+			{Stage: "metadata_sync", Duration: 15 * time.Millisecond},
+		},
+	})
+	m.ObserveBroadcastPipelineStage(p2p.BroadcastPipelineStageObservation{
+		Stage:    "candidate_decode",
+		Kind:     "tonNode.newBlockCandidateBroadcast",
+		Delivery: p2p.DeliveryFEC,
+		Result:   "success",
+		Duration: 3 * time.Millisecond,
 	})
 	archivePackagesDir := filepath.Join(t.TempDir(), "archive", "packages")
 	stateFilesDir := filepath.Join(t.TempDir(), "archive", "states")
@@ -132,6 +142,13 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 			LocalMasterchain:      &localMaster,
 			LocalMasterchainUtime: time.Now().Unix() - 12,
 			LocalStateLoaded:      true,
+			RecentTPS: service.StatusTPSSnapshot{
+				WindowMasters:   1,
+				Transactions:    42,
+				DurationSeconds: 1,
+				TPS:             42,
+				Complete:        true,
+			},
 		}
 	})
 	m.SetDBStatusReader(func(context.Context) (pebblestore.DBStatus, error) {
@@ -175,8 +192,13 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_sync_block_prepare_duration_seconds_bucket{catch_up="false",chain="masterchain",pipeline="next_block",result="success",shard="masterchain",source="queue",le="1"} 1`,
 		namespace + `_sync_master_shards_obtain_duration_seconds_bucket{catch_up="false",pipeline="next_block",result="success",stage="master",le="5"} 1`,
 		namespace + `_sync_checkpoints_total{mode="next_block_async",result="success"} 1`,
+		namespace + `_sync_checkpoint_stage_duration_seconds_bucket{mode="next_block_async",result="success",stage="metadata_sync",le="0.025"} 1`,
+		namespace + `_p2p_broadcast_pipeline_stage_duration_seconds_count{delivery="fec",kind="tonNode.newBlockCandidateBroadcast",result="success",stage="candidate_decode"} 1`,
 		namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 0`,
 		namespace + `_sync_lag_seconds{chain="masterchain",shard="masterchain"}`,
+		namespace + `_sync_recent_tps 42`,
+		namespace + `_sync_recent_transactions 42`,
+		namespace + `_sync_recent_tps_complete 1`,
 		namespace + `_service_background_task{task="idle"} 1`,
 		namespace + `_p2p_broadcasts_total{direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
 		namespace + `_p2p_broadcasts_total{direction="queue_rebroadcasted",kind="tonNode.externalMessageBroadcast",overlay="masterchain"} 4`,
@@ -218,6 +240,37 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	}
 }
 
+func TestLiteserverMetricsTreatUnspecifiedLSErrorAsError(t *testing.T) {
+	namespace := "testgton"
+	m := New(namespace)
+	m.ObserveLiteserverQuery(liteserver.QueryObservation{
+		Method:    "SendMessage",
+		Response:  "LSError",
+		Error:     true,
+		ErrorCode: 0,
+		Duration:  time.Millisecond,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	want := namespace + `_liteserver_queries_total{error_code="unspecified",method="SendMessage",response="LSError"} 1`
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics output does not contain %q\n%s", want, body)
+	}
+
+	removed := namespace + `_liteserver_queries_total{error_code="0",method="SendMessage",response="LSError"}`
+	if strings.Contains(body, removed) {
+		t.Fatalf("metrics output contains successful error label %q\n%s", removed, body)
+	}
+}
+
 func TestNilMetricsObserverMethodsAreNoop(t *testing.T) {
 	var m *Metrics
 
@@ -226,4 +279,5 @@ func TestNilMetricsObserverMethodsAreNoop(t *testing.T) {
 	m.ObserveSyncBlock(service.SyncBlockObservation{})
 	m.ObserveSyncObtain(service.SyncObtainObservation{})
 	m.ObserveSyncPersist(service.SyncPersistObservation{})
+	m.ObserveBroadcastPipelineStage(p2p.BroadcastPipelineStageObservation{})
 }

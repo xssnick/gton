@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/xssnick/gton/service/blockproof"
@@ -32,17 +33,57 @@ func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.Blo
 	return blockproof.CheckPreparedSignaturesWithValidators(req.Block, signatures, validators)
 }
 
-func (s *Service) CheckShardDescriptionSignatures(ctx context.Context, req p2p.ShardDescriptionSignatureCheck) error {
+func (s *Service) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p.ShardDescriptionSignatureCheck) (*p2p.ShardBlockDescription, error) {
 	desc, err := parseShardTopBlockDescription(req.Block, req.CatchainSeqno, req.Data)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	validators, err := s.broadcastValidatorsForSignatures(ctx, desc.Block, desc.CatchainSeqno, desc.ValidatorSetHash)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return blockproof.CheckPreparedSignaturesWithValidators(desc.Block, desc.Signatures, validators)
+	if err = blockproof.CheckPreparedSignaturesWithValidators(desc.Block, desc.Signatures, validators); err != nil {
+		return nil, err
+	}
+	out, err := newP2PShardBlockDescription(desc)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func newP2PShardBlockDescription(desc *shardTopBlockDescription) (*p2p.ShardBlockDescription, error) {
+	if desc == nil {
+		return nil, fmt.Errorf("shard top block description is empty")
+	}
+
+	out := &p2p.ShardBlockDescription{
+		Block:            desc.Block,
+		CatchainSeqno:    desc.CatchainSeqno,
+		ValidatorSetHash: desc.ValidatorSetHash,
+		Chain:            make([]p2p.ShardDescriptionLink, 0, len(desc.Chain)),
+	}
+	for _, link := range desc.Chain {
+		proofRoot, proofBOC, err := blockproof.LinkFromRoot(link.Block, link.ProofRoot)
+		if err != nil {
+			return nil, fmt.Errorf("build shard description proof link for %s: %w", storage.FormatBlockRef(link.Block), err)
+		}
+
+		var masterchainRef *ton.BlockIDExt
+		if link.MasterchainRef != nil {
+			ref := *link.MasterchainRef
+			masterchainRef = &ref
+		}
+		out.Chain = append(out.Chain, p2p.ShardDescriptionLink{
+			Block:          link.Block,
+			PrevRefs:       append([]ton.BlockIDExt(nil), link.PrevRefs...),
+			MasterchainRef: masterchainRef,
+			ProofRoot:      proofRoot,
+			ProofBOC:       proofBOC,
+		})
+	}
+	return out, nil
 }
 
 func (s *Service) broadcastValidatorsForSignatures(ctx context.Context, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) ([]*tlb.ValidatorAddr, error) {
@@ -100,13 +141,19 @@ func (s *Service) broadcastValidatorsForSignatures(ctx context.Context, block to
 }
 
 func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (*tlb.BlockchainConfig, error) {
-	current, err := s.storage.CurrentState(ctx)
+	current, err := s.currentStatusSnapshot(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("load current state for broadcast signature check: %w", err)
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("%w: load live current state for broadcast signature check: %w", p2p.ErrBroadcastSignatureRetryable, err)
+		}
+		return nil, fmt.Errorf("load live current state for broadcast signature check: %w", err)
 	}
 
 	masterState, err := s.loadMasterStateForConsensus(ctx, current.Masterchain.Block)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("%w: load masterchain state %s for broadcast signature check: %w", p2p.ErrBroadcastSignatureRetryable, storage.FormatBlockRef(current.Masterchain.Block), err)
+		}
 		return nil, fmt.Errorf("load masterchain state %s for broadcast signature check: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}
 	return blockproof.ConfigFromMasterchainState(masterState)

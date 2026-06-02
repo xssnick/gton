@@ -16,12 +16,10 @@ const (
 )
 
 type shardDescriptionHint struct {
-	Block         ton.BlockIDExt
-	CatchainSeqno int32
-	Data          []byte
-	Overlay       string
-	Kind          string
-	ReceivedAt    time.Time
+	Description p2p.ShardBlockDescription
+	Overlay     string
+	Kind        string
+	ReceivedAt  time.Time
 }
 
 func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
@@ -43,7 +41,7 @@ func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
 }
 
 func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
-	if ev.ShardDescription == nil || ev.Block.Workchain == -1 || ev.ShardDescription.CatchainSeqno < 0 || len(ev.ShardDescription.Data) == 0 {
+	if ev.ShardDescription == nil || ev.Block.Workchain == -1 || !ev.ShardDescription.Block.Equals(&ev.Block) {
 		return
 	}
 
@@ -53,12 +51,10 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 	}
 
 	hint := shardDescriptionHint{
-		Block:         ev.Block,
-		CatchainSeqno: ev.ShardDescription.CatchainSeqno,
-		Data:          append([]byte(nil), ev.ShardDescription.Data...),
-		Overlay:       ev.Overlay,
-		Kind:          ev.Kind,
-		ReceivedAt:    receivedAt,
+		Description: cloneShardBlockDescription(ev.ShardDescription),
+		Overlay:     ev.Overlay,
+		Kind:        ev.Kind,
+		ReceivedAt:  receivedAt,
 	}
 
 	key := storage.BlockKey(ev.Block)
@@ -77,12 +73,59 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(ev.Block)).
 		Str("overlay", ev.Overlay).
-		Int32("catchain_seqno", ev.ShardDescription.CatchainSeqno).
-		Int("bytes", len(ev.ShardDescription.Data)).
+		Uint32("catchain_seqno", ev.ShardDescription.CatchainSeqno).
+		Int("chain_links", len(ev.ShardDescription.Chain)).
 		Msg("remembered shard block description broadcast")
 
+	s.rememberShardDescriptionProofs(hint)
 	s.signalShardDescriptionWake()
 	s.wakeCurrentStateSync()
+}
+
+func (s *Service) rememberShardDescriptionProofs(hint shardDescriptionHint) {
+	if s.node == nil {
+		return
+	}
+
+	desc := hint.Description
+	proofs := make([]p2p.ShardDescriptionProof, 0, len(desc.Chain))
+	for _, link := range desc.Chain {
+		proofs = append(proofs, p2p.ShardDescriptionProof{
+			Block:    link.Block,
+			Proof:    link.ProofRoot,
+			ProofBOC: link.ProofBOC,
+		})
+	}
+	s.node.RememberShardDescriptionProofs(proofs)
+}
+
+func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) p2p.ShardBlockDescription {
+	if desc == nil {
+		return p2p.ShardBlockDescription{}
+	}
+
+	cloned := p2p.ShardBlockDescription{
+		Block:            desc.Block,
+		CatchainSeqno:    desc.CatchainSeqno,
+		ValidatorSetHash: desc.ValidatorSetHash,
+		Data:             desc.Data,
+		Chain:            make([]p2p.ShardDescriptionLink, 0, len(desc.Chain)),
+	}
+	for _, link := range desc.Chain {
+		var masterchainRef *ton.BlockIDExt
+		if link.MasterchainRef != nil {
+			ref := *link.MasterchainRef
+			masterchainRef = &ref
+		}
+		cloned.Chain = append(cloned.Chain, p2p.ShardDescriptionLink{
+			Block:          link.Block,
+			PrevRefs:       link.PrevRefs,
+			MasterchainRef: masterchainRef,
+			ProofRoot:      link.ProofRoot,
+			ProofBOC:       link.ProofBOC,
+		})
+	}
+	return cloned
 }
 
 func (s *Service) shardDescriptionHintSnapshot(now time.Time) []shardDescriptionHint {
@@ -97,7 +140,7 @@ func (s *Service) shardDescriptionHintSnapshot(now time.Time) []shardDescription
 		if !ok {
 			continue
 		}
-		hint.Data = append([]byte(nil), hint.Data...)
+		hint.Description = cloneShardBlockDescription(&hint.Description)
 		hints = append(hints, hint)
 	}
 	return hints

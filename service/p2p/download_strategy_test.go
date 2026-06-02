@@ -1,11 +1,14 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
-	"github.com/xssnick/gton/service/storage"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
@@ -917,5 +920,132 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 	}
 	if !got.ID.Equals(&block) || got.Kind != "local full block cache" {
 		t.Fatalf("unexpected cached block: %#v", got)
+	}
+}
+
+func TestDownloadNextBlockFullUsesLiveCacheBeforeOverlay(t *testing.T) {
+	store := newTestPeerStore()
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: store,
+		StateFilesDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	prev := testStoredMasterBlockID(100)
+	nextCell := testPeerBlockRoot(t, -1, topShard, 101)
+	blockData := nextCell.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+	rootHash := nextCell.HashKey()
+	fileHash := sha256.Sum256(blockData)
+	next := testBlockID(-1, topShard, 101)
+	next.RootHash = append([]byte(nil), rootHash[:]...)
+	next.FileHash = append([]byte(nil), fileHash[:]...)
+
+	proofData := testBlockProofCell(t, next, testProofSignatureSet()).ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+	err = node.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     next,
+		BlockData: blockData,
+		Meta: &storage.BlockMeta{
+			ID:       next,
+			PrevRefs: []ton.BlockIDExt{prev},
+		},
+		Proofs: []storage.LiveBlockProofArtifact{
+			{Kind: storage.ServedProofBlock, Data: proofData},
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish live block: %v", err)
+	}
+
+	if _, err = store.NextBlockFull(context.Background(), prev); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("peer storage next block err = %v, want not found", err)
+	}
+
+	desc, err := node.NextBlockDescription(context.Background(), prev)
+	if err != nil {
+		t.Fatalf("next block description from live cache: %v", err)
+	}
+	if !desc.Equals(&next) {
+		t.Fatalf("unexpected next description: got=%s want=%s", formatBlockRef(desc), formatBlockRef(next))
+	}
+
+	got, err := node.DownloadNextBlockFull(context.Background(), prev)
+	if err != nil {
+		t.Fatalf("download next from live cache: %v", err)
+	}
+	if !got.ID.Equals(&next) || got.Kind != "local next block cache" {
+		t.Fatalf("unexpected live cached next block: %#v", got)
+	}
+
+	got, err = node.DownloadBlockFull(context.Background(), next)
+	if err != nil {
+		t.Fatalf("download block from live cache: %v", err)
+	}
+	if !got.ID.Equals(&next) || got.Kind != "local full block cache" {
+		t.Fatalf("unexpected live cached block: %#v", got)
+	}
+}
+
+func TestDownloadBlockProofUsesLiveCacheBeforeOverlay(t *testing.T) {
+	store := newTestPeerStore()
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: store,
+		StateFilesDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	keyBlock, fullProof, linkProof := testPeerMasterBlockProof(t, 151)
+	err = node.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block: keyBlock,
+		Proofs: []storage.LiveBlockProofArtifact{
+			{Kind: storage.ServedProofBlock, Data: fullProof},
+			{Kind: storage.ServedProofKeyBlock, Data: fullProof},
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish live full proof: %v", err)
+	}
+
+	got, err := node.DownloadBlockProof(context.Background(), keyBlock, false)
+	if err != nil {
+		t.Fatalf("download block proof from live cache: %v", err)
+	}
+	if got.Link || !bytes.Equal(got.Data, fullProof) {
+		t.Fatalf("unexpected cached block proof")
+	}
+
+	got, err = node.DownloadKeyBlockProof(context.Background(), keyBlock, true)
+	if err != nil {
+		t.Fatalf("download key block proof link from live full proof: %v", err)
+	}
+	if !got.Link || !bytes.Equal(got.Data, linkProof) {
+		t.Fatalf("unexpected cached key proof link")
+	}
+
+	linkOnlyBlock := testStoredMasterBlockID(152)
+	linkOnlyProof := []byte{0x15, 0x02}
+	err = node.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block: linkOnlyBlock,
+		Proofs: []storage.LiveBlockProofArtifact{
+			{Kind: storage.ServedProofKeyBlockLink, Data: linkOnlyProof},
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish live key proof link: %v", err)
+	}
+
+	got, err = node.DownloadKeyBlockProof(context.Background(), linkOnlyBlock, true)
+	if err != nil {
+		t.Fatalf("download key proof link from live cache: %v", err)
+	}
+	if !got.Link || !bytes.Equal(got.Data, linkOnlyProof) {
+		t.Fatalf("unexpected cached key proof link data")
 	}
 }

@@ -33,10 +33,6 @@ func (t queryLogTiming) queryName() string {
 	return t.query
 }
 
-func (t queryLogTiming) totalDuration() time.Duration {
-	return t.duration + t.waitDuration
-}
-
 func (s *Server) handleQueryData(ctx context.Context, data any) tl.Serializable {
 	switch q := data.(type) {
 	case liteclient.LiteServerQuery:

@@ -982,6 +982,9 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 		if info.TwoStep {
 			delivery = DeliveryTwoStep
 		}
+		if info.DecodeTime > 0 {
+			s.node.observeBroadcastPipelineStageDuration(broadcastPipelineStageFECDecode, broadcastKindLabel(msg), delivery, broadcastPipelineResultSuccess, info.DecodeTime)
+		}
 		return s.handleOverlayBroadcast(peer, msg, delivery, info.Trusted, sourcePeerID)
 	})
 	peer.overlay.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {

@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/service/blockproof"
+	tnstore "github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type ProofDownload struct {
@@ -24,6 +28,19 @@ func (n *Node) DownloadKeyBlockProof(ctx context.Context, block ton.BlockIDExt, 
 }
 
 func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool, keyBlock bool) (ProofDownload, error) {
+	cached, err := n.cachedProofDownload(ctx, block, allowPartial, keyBlock)
+	if err == nil {
+		return cached, nil
+	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		n.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Bool("allow_partial", allowPartial).
+			Bool("key_block", keyBlock).
+			Msg("failed to load cached block proof")
+	}
+
 	sub, err := n.subscriptionForBlock(block)
 	if err != nil {
 		return ProofDownload{}, err
@@ -82,6 +99,61 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 		return ProofDownload{}, errors.Join(errs...)
 	}
 	return ProofDownload{}, errors.New("overlay has no proof download peers")
+}
+
+func (n *Node) cachedProofDownload(ctx context.Context, block ton.BlockIDExt, allowPartial bool, keyBlock bool) (ProofDownload, error) {
+	if keyBlock {
+		return n.cachedKeyBlockProofDownload(ctx, block, allowPartial)
+	}
+	return n.cachedBlockProofDownload(ctx, block, allowPartial)
+}
+
+func (n *Node) cachedBlockProofDownload(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (ProofDownload, error) {
+	if isMasterchainBlock(block) {
+		data, err := n.localBlockProof(ctx, tnstore.ServedProofBlock, block)
+		if err == nil {
+			return ProofDownload{Data: data}, nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return ProofDownload{}, err
+		}
+	}
+
+	if !allowPartial {
+		return ProofDownload{}, tnstore.ErrNotFound
+	}
+
+	data, err := n.localBlockProof(ctx, tnstore.ServedProofBlockLink, block)
+	if err != nil {
+		return ProofDownload{}, err
+	}
+	return ProofDownload{Data: data, Link: true}, nil
+}
+
+func (n *Node) cachedKeyBlockProofDownload(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (ProofDownload, error) {
+	if allowPartial {
+		data, err := n.localBlockProof(ctx, tnstore.ServedProofKeyBlockLink, block)
+		if err == nil {
+			return ProofDownload{Data: data, Link: true}, nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return ProofDownload{}, err
+		}
+	}
+
+	data, err := n.localBlockProof(ctx, tnstore.ServedProofKeyBlock, block)
+	if err != nil {
+		return ProofDownload{}, err
+	}
+	if !allowPartial {
+		return ProofDownload{Data: data}, nil
+	}
+
+	link, err := blockproof.LinkBOC(block, data)
+	if err != nil {
+		return ProofDownload{}, err
+	}
+	return ProofDownload{Data: link, Link: true}, nil
 }
 
 func (s *overlaySubscription) proofQueryCandidates(tried map[PeerID]struct{}) []*overlayPeer {
@@ -168,8 +240,30 @@ func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *o
 	if len(data) == 0 {
 		return ProofDownload{}, ErrBlockNotAvailable
 	}
+	if err = validateDownloadedProof(block, data, isLink, keyBlock); err != nil {
+		return ProofDownload{}, err
+	}
 	return ProofDownload{
 		Data: data,
 		Link: isLink,
 	}, nil
+}
+
+func validateDownloadedProof(block ton.BlockIDExt, data []byte, isLink bool, keyBlock bool) error {
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		return fmt.Errorf("proof is not a valid BOC for %s: %w", formatBlockRef(block), err)
+	}
+	if err = blockproof.CheckProofShape(block, root, isLink); err != nil {
+		return err
+	}
+
+	parsed, err := blockproof.ParseCell(block, root)
+	if err != nil {
+		return err
+	}
+	if keyBlock && !parsed.Block.BlockInfo.KeyBlock {
+		return fmt.Errorf("proof for %s is not a key block", formatBlockRef(block))
+	}
+	return nil
 }

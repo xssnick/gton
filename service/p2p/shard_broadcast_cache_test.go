@@ -180,10 +180,141 @@ func TestShardBroadcastCacheNotifiesWaiters(t *testing.T) {
 	}
 }
 
+func TestShardCandidateAndDescriptionProofAssemblesHotBlock(t *testing.T) {
+	node := newTestNode(t)
+	downloaded := testShardBroadcastDownloadedBlock(t, 20, 0x20)
+	candidate := downloaded
+	candidate.Kind = "tonNode.newBlockCandidateBroadcast"
+	candidate.Proof = nil
+	candidate.ProofBOC = nil
+	candidate.IsLink = false
+
+	node.rememberShardBlockCandidate(&candidate)
+	node.RememberShardDescriptionProofs([]ShardDescriptionProof{{
+		Block:    downloaded.ID,
+		Proof:    downloaded.Proof,
+		ProofBOC: downloaded.ProofBOC,
+	}})
+
+	got, err := node.DownloadBlockFull(context.Background(), downloaded.ID)
+	if err != nil {
+		t.Fatalf("download block: %v", err)
+	}
+	if !got.ID.Equals(&downloaded.ID) {
+		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(downloaded.ID))
+	}
+	if got.Kind != shardDescriptionBroadcastKind {
+		t.Fatalf("kind = %q, want %q", got.Kind, shardDescriptionBroadcastKind)
+	}
+	if len(got.BlockBOC) == 0 || len(got.ProofBOC) == 0 || got.StateUpdate == nil {
+		t.Fatalf("assembled block is incomplete: block=%d proof=%d state_update=%v", len(got.BlockBOC), len(got.ProofBOC), got.StateUpdate != nil)
+	}
+}
+
+func TestShardDescriptionProofAndCandidateAssemblesHotBlock(t *testing.T) {
+	node := newTestNode(t)
+	downloaded := testShardBroadcastDownloadedBlock(t, 21, 0x21)
+	candidate := downloaded
+	candidate.Kind = "tonNode.newBlockCandidateBroadcast"
+	candidate.Proof = nil
+	candidate.ProofBOC = nil
+	candidate.IsLink = false
+
+	node.RememberShardDescriptionProofs([]ShardDescriptionProof{{
+		Block:    downloaded.ID,
+		Proof:    downloaded.Proof,
+		ProofBOC: downloaded.ProofBOC,
+	}})
+	node.rememberShardBlockCandidate(&candidate)
+
+	got, err := node.DownloadBlockFull(context.Background(), downloaded.ID)
+	if err != nil {
+		t.Fatalf("download block: %v", err)
+	}
+	if !got.ID.Equals(&downloaded.ID) || got.Kind != shardDescriptionBroadcastKind {
+		t.Fatalf("unexpected assembled block: %#v", got)
+	}
+}
+
+func TestShardCandidateCacheAssemblesProofAfterCandidateBeforeOverflowPrune(t *testing.T) {
+	cache := newShardBlockCandidateCache(time.Minute, 1<<20, 1)
+	now := time.Unix(300, 0)
+	downloaded := testShardBroadcastDownloadedBlock(t, 22, 0x22)
+
+	assembled, err := cache.StoreCandidate(testShardBlockCandidate(downloaded), now)
+	if err != nil {
+		t.Fatalf("store candidate: %v", err)
+	}
+	if len(assembled) != 0 {
+		t.Fatalf("assembled from candidate without proof: %d", len(assembled))
+	}
+
+	assembled, err = cache.StoreProofs([]ShardDescriptionProof{{
+		Block:    downloaded.ID,
+		Proof:    downloaded.Proof,
+		ProofBOC: downloaded.ProofBOC,
+	}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("store proof: %v", err)
+	}
+	requireAssembledShardCandidate(t, assembled, downloaded)
+}
+
+func TestShardCandidateCacheAssemblesCandidateAfterProofBeforeOverflowPrune(t *testing.T) {
+	cache := newShardBlockCandidateCache(time.Minute, 1<<20, 1)
+	now := time.Unix(400, 0)
+	downloaded := testShardBroadcastDownloadedBlock(t, 23, 0x23)
+
+	assembled, err := cache.StoreProofs([]ShardDescriptionProof{{
+		Block:    downloaded.ID,
+		Proof:    downloaded.Proof,
+		ProofBOC: downloaded.ProofBOC,
+	}}, now)
+	if err != nil {
+		t.Fatalf("store proof: %v", err)
+	}
+	if len(assembled) != 0 {
+		t.Fatalf("assembled from proof without candidate: %d", len(assembled))
+	}
+
+	assembled, err = cache.StoreCandidate(testShardBlockCandidate(downloaded), now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("store candidate: %v", err)
+	}
+	requireAssembledShardCandidate(t, assembled, downloaded)
+}
+
 func shardBroadcastCacheLen(cache *shardBroadcastBlockCache) int {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	return len(cache.entries)
+}
+
+func requireAssembledShardCandidate(t *testing.T, assembled []DownloadedBlock, want DownloadedBlock) {
+	t.Helper()
+
+	if len(assembled) != 1 {
+		t.Fatalf("assembled blocks = %d, want 1", len(assembled))
+	}
+	got := assembled[0]
+	if !got.ID.Equals(&want.ID) {
+		t.Fatalf("assembled block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(want.ID))
+	}
+	if got.Kind != shardDescriptionBroadcastKind {
+		t.Fatalf("assembled kind = %q, want %q", got.Kind, shardDescriptionBroadcastKind)
+	}
+	if got.Proof == nil || len(got.ProofBOC) == 0 || !got.IsLink || !got.VerifiedRootHash {
+		t.Fatalf("assembled block is incomplete: proof=%v proof_boc=%d is_link=%v verified=%v", got.Proof != nil, len(got.ProofBOC), got.IsLink, got.VerifiedRootHash)
+	}
+}
+
+func testShardBlockCandidate(downloaded DownloadedBlock) DownloadedBlock {
+	candidate := downloaded
+	candidate.Kind = "tonNode.newBlockCandidateBroadcast"
+	candidate.Proof = nil
+	candidate.ProofBOC = nil
+	candidate.IsLink = false
+	return candidate
 }
 
 func testShardBroadcastMeta(downloaded DownloadedBlock) *tnstore.BlockMeta {

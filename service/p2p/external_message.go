@@ -39,7 +39,7 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 	}
 
 	payload, err := tl.Serialize(tonnodeapi.NewExternalMessageBroadcast{
-		Message: tonnodeapi.ExternalMessage{Data: append([]byte(nil), data...)},
+		Message: tonnodeapi.ExternalMessage{Data: data},
 	}, true)
 	if err != nil {
 		return fmt.Errorf("serialize external message broadcast: %w", err)
@@ -73,7 +73,7 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 		req := rebroadcastRequest{
 			subscription: target.sub,
 			kind:         "tonNode.externalMessageBroadcast",
-			payload:      append([]byte(nil), payload...),
+			payload:      payload,
 			local:        true,
 		}
 		if !target.sub.enqueueRebroadcast(req) {

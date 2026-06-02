@@ -45,7 +45,7 @@ func (s *Server) blockHeader(ctx context.Context, id ton.BlockIDExt, mode uint32
 	return ton.BlockHeader{
 		ID:          cloneBlockID(id),
 		Mode:        mode,
-		HeaderProof: proof.ToBOCWithFlags(false),
+		HeaderProof: proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}, nil
 }
 
@@ -86,32 +86,6 @@ func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, ad
 
 func accountLeafShard(addr *address.Address) int64 {
 	return int64(binary.BigEndian.Uint64(addr.Data()[:8]) | 1)
-}
-
-func (s *Server) blockStateProof(ctx context.Context, block ton.BlockIDExt, stateProof *cell.Cell) ([]*cell.Cell, error) {
-	blockProof, err := s.blockProof(ctx, block)
-	if err != nil {
-		return nil, err
-	}
-
-	return []*cell.Cell{blockProof, stateProof}, nil
-}
-
-func blockStateProofFromRoot(blockRoot *cell.Cell, stateProof *cell.Cell) ([]*cell.Cell, error) {
-	blockProof, err := blockStateRootProof(blockRoot)
-	if err != nil {
-		return nil, err
-	}
-	return []*cell.Cell{blockProof, stateProof}, nil
-}
-
-func (s *Server) blockProof(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
-	root, err := s.loadBlockRoot(ctx, block)
-	if err != nil {
-		return nil, err
-	}
-
-	return blockStateRootProof(root)
 }
 
 func createUsageProof(root *cell.Cell, visit func(*cell.Cell) error) (*cell.Cell, error) {
@@ -394,34 +368,23 @@ func skipPrunedStateInit(loader *cell.Slice) error {
 	return nil
 }
 
-func accountCell(stateRoot *cell.Cell, accountID []byte) (*cell.Cell, error) {
-	dictRoot, err := accountsDictRoot(stateRoot)
-	if errors.Is(err, storage.ErrNotFound) {
-		return nil, cell.ErrNoSuchKeyInDict
-	}
-	if err != nil {
-		return nil, err
-	}
-	return accountCellFromAccountsRoot(dictRoot, accountID)
-}
-
 func accountCellFromAccountsRoot(dictRoot *cell.Cell, accountID []byte) (*cell.Cell, error) {
 	if dictRoot == nil {
 		return nil, cell.ErrNoSuchKeyInDict
 	}
 	value, err := dictRoot.AsDict(256).LoadValue(accountKey(accountID))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load account value from accounts dict: %w", err)
 	}
 
 	var balance tlb.DepthBalanceInfo
 	if err = tlb.LoadFromCell(&balance, value); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load account depth balance: %w", err)
 	}
 
 	var account tlb.ShardAccount
 	if err = tlb.LoadFromCell(&account, value); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load shard account: %w", err)
 	}
 
 	return account.Account, nil
@@ -430,20 +393,20 @@ func accountCellFromAccountsRoot(dictRoot *cell.Cell, accountID []byte) (*cell.C
 func accountsDictRoot(stateRoot *cell.Cell) (*cell.Cell, error) {
 	stateLoader, err := stateRoot.BeginParse()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse shard state root: %w", err)
 	}
 	accounts, err := stateLoader.PeekRefCellAt(1)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load shard state accounts ref: %w", err)
 	}
 
 	loader, err := accounts.BeginParse()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse shard accounts cell: %w", err)
 	}
 	hasRoot, err := loader.LoadBoolBit()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load shard accounts dict flag: %w", err)
 	}
 	if !hasRoot {
 		return nil, storage.ErrNotFound
@@ -451,7 +414,7 @@ func accountsDictRoot(stateRoot *cell.Cell) (*cell.Cell, error) {
 
 	root, err := loader.LoadRefCell()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load shard accounts dict root ref: %w", err)
 	}
 	return root, nil
 }
@@ -793,26 +756,6 @@ func visitBlockHeader(root *cell.Cell, id ton.BlockIDExt, mode uint32) error {
 	return nil
 }
 
-func visitBlockStateRoot(root *cell.Cell) error {
-	rootLoader, err := visitBlockRoot(root)
-	if err != nil {
-		return err
-	}
-
-	info, err := rootLoader.PeekRefCellAt(0)
-	if err != nil {
-		return err
-	}
-	if err = visitCellRecursive(info); err != nil {
-		return err
-	}
-	update, err := rootLoader.PeekRefCellAt(2)
-	if err != nil {
-		return fmt.Errorf("block has no state update: %w", err)
-	}
-	return visitMerkleUpdate(update)
-}
-
 func visitBlockRoot(root *cell.Cell) (*cell.Slice, error) {
 	loader, err := root.BeginParse()
 	if err != nil {
@@ -853,19 +796,6 @@ func visitMerkleUpdate(update *cell.Cell) error {
 		return err
 	}
 	return nil
-}
-
-func loadBlock(root *cell.Cell) (tlb.Block, error) {
-	loader, err := root.BeginParse()
-	if err != nil {
-		return tlb.Block{}, err
-	}
-
-	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, loader); err != nil {
-		return tlb.Block{}, err
-	}
-	return block, nil
 }
 
 func loadBlockHeader(root *cell.Cell) (tlb.BlockHeader, error) {

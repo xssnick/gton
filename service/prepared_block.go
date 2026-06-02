@@ -95,7 +95,7 @@ func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error
 
 	var consensus *masterchainConsensusProof
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard && downloaded.Proof != nil {
-		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof, downloaded.BroadcastSignatures)
+		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof)
 		if err != nil {
 			return VerifiedBlock{}, fmt.Errorf("prepare masterchain consensus proof %s: %w", downloaded.BlockRef(), err)
 		}
@@ -179,29 +179,6 @@ func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRec
 		IsLink:                    block.IsLink,
 		SourcePeerID:              block.SourcePeerID,
 	}
-}
-
-func verifiedBlockFromPrepared(block PreparedBlock) (VerifiedBlock, error) {
-	if block.StateUpdate == nil {
-		return VerifiedBlock{}, fmt.Errorf("prepared block %s has no state update", block.BlockRef())
-	}
-	if block.BlockRoot == nil {
-		return VerifiedBlock{}, fmt.Errorf("prepared block %s has no block root", block.BlockRef())
-	}
-
-	return VerifiedBlock{
-		ID:               block.ID,
-		Kind:             block.Kind,
-		BlockBOC:         block.BlockBOC,
-		ProofBOC:         block.ProofBOC,
-		BlockRoot:        block.BlockRoot,
-		Meta:             block.Meta.Clone(),
-		StateUpdate:      block.StateUpdate,
-		consensus:        block.consensus,
-		consensusChecked: block.consensusChecked,
-		IsLink:           block.IsLink,
-		SourcePeerID:     block.SourcePeerID,
-	}, nil
 }
 
 func prepareDownloadedBlockForApply(downloaded p2p.DownloadedBlock) (PreparedBlock, error) {

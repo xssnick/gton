@@ -28,6 +28,7 @@ type Downloaded struct {
 	ArchiveID        int64
 	Peer             string
 	Path             string
+	Data             []byte
 	Bytes            int64
 	DownloadElapsed  time.Duration
 	Imported         *Imported
@@ -57,7 +58,6 @@ type ImportStats struct {
 	StateUpdateCells       uint64
 	StateUpdateCellBytes   uint64
 	StateUpdateCellPrepare time.Duration
-	ContainsShardBlocks    bool
 }
 
 type PreparedBlock struct {

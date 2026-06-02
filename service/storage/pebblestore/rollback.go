@@ -57,11 +57,6 @@ func (s *Store) Rollback(ctx context.Context, current *storage.CurrentState) (Ro
 		return RollbackStats{}, err
 	}
 	stats.DeletedKeys += deleted
-	deleted, err = s.rollbackDeleteHotKey(db, batch, hotKeyVerifiedKeyBlockProgress())
-	if err != nil {
-		return RollbackStats{}, err
-	}
-	stats.DeletedKeys += deleted
 
 	if err = batch.Set(hotKeyCurrentState(), encodeCurrentState(current), pebble.NoSync); err != nil {
 		return RollbackStats{}, err

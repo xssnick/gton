@@ -1009,7 +1009,10 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 				txDetails = execCtx.accountMismatchTxDetails(tx, nil, cfg)
 			}
 
-			finishTrace = v.startVMTrace(addr.StringRaw(), tx.Parsed.LT)
+			if traceHook, finish := v.startVMTrace(addr.StringRaw(), tx.Parsed.LT); traceHook != nil {
+				cfg.TraceHook = traceHook
+				finishTrace = finish
+			}
 			started := time.Now()
 			res, err = machine.EmulateTickTockTransaction(current, desc.IsTock, cfg)
 			elapsed = time.Since(started)
@@ -1024,7 +1027,10 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 				txDetails = execCtx.accountMismatchTxDetails(tx, tx.InMsgCell, cfg)
 			}
 
-			finishTrace = v.startVMTrace(addr.StringRaw(), tx.Parsed.LT)
+			if traceHook, finish := v.startVMTrace(addr.StringRaw(), tx.Parsed.LT); traceHook != nil {
+				cfg.TraceHook = traceHook
+				finishTrace = finish
+			}
 			started := time.Now()
 			res, err = machine.EmulateTransaction(current, tx.InMsgCell, cfg)
 			elapsed = time.Since(started)
@@ -1163,37 +1169,33 @@ func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.Blo
 	}
 }
 
-func (v *replayValidator) addMismatch(masterSeqno uint32, workchain int32, account []byte) {
-	v.addMismatchWithDetails(masterSeqno, workchain, account, accountMismatchDetails{})
-}
-
 func (v *replayValidator) collectsMismatches() bool {
 	return v.mismatchLimit != 0
 }
 
-func (v *replayValidator) startVMTrace(addr string, lt uint64) func() {
+func (v *replayValidator) startVMTrace(addr string, lt uint64) (vmcore.TraceHook, func()) {
 	if v.vmTraceAddr == "" || v.vmTraceAddr != addr {
-		return nil
+		return nil, nil
 	}
 	if v.vmTraceLT != 0 && v.vmTraceLT != lt {
-		return nil
+		return nil, nil
 	}
 
 	lines := make([]string, 0, 256)
-	vmcore.TraceHook = func(format string, args ...any) {
+	traceHook := func(step vmcore.TraceStep) {
 		if len(lines) >= 512 {
 			return
 		}
-		lines = append(lines, fmt.Sprintf(format, args...))
+		lines = append(lines, step.String())
 	}
-	return func() {
-		vmcore.TraceHook = nil
+	finish := func() {
 		v.log.Warn().
 			Str("address", addr).
 			Uint64("lt", lt).
 			Str("vm_trace", strings.Join(lines, "\n")).
 			Msg("vm trace")
 	}
+	return traceHook, finish
 }
 
 func (v *replayValidator) addMismatchWithDetails(masterSeqno uint32, workchain int32, account []byte, details accountMismatchDetails) {
@@ -2527,11 +2529,9 @@ func (r *replayShardResolver) resolveOwned(ctx context.Context, block ton.BlockI
 		expected = loadedState
 	}
 
-	// Shard blocks are scheduled from this master block shard set, so this
-	// master is the execution context when older imported metadata has no ref.
-	master := r.master
-	if loaded.Meta.MasterchainRef != nil {
-		master = *loaded.Meta.MasterchainRef
+	master, err := replayExecutionMaster(loaded, r.master)
+	if err != nil {
+		return nil, err
 	}
 	masterState, err := r.masterStateFor(ctx, master)
 	if err != nil {
@@ -2547,6 +2547,16 @@ func (r *replayShardResolver) resolveOwned(ctx context.Context, block ton.BlockI
 		return nil, err
 	}
 	return result.State, nil
+}
+
+func replayExecutionMaster(block loadedBlock, fallback ton.BlockIDExt) (ton.BlockIDExt, error) {
+	if !block.Parsed.BlockInfo.NotMaster {
+		return fallback, nil
+	}
+	if block.Parsed.BlockInfo.MasterRef == nil {
+		return ton.BlockIDExt{}, fmt.Errorf("shard block %s has no header master ref", storage.FormatBlockRef(block.ID))
+	}
+	return runMethodExtBlkRef(*block.Parsed.BlockInfo.MasterRef), nil
 }
 
 func (r *replayShardResolver) masterStateFor(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
@@ -3452,13 +3462,6 @@ func runMethodMaybeSlice(value *cell.Slice) any {
 		return nil
 	}
 	return value
-}
-
-func runMethodPrecompiledGas(config tlb.BlockchainConfig, code *cell.Cell) (*big.Int, error) {
-	if config.Root == nil || code == nil {
-		return nil, nil
-	}
-	return runMethodPrecompiledGasByHash(config, code.HashKey())
 }
 
 func runMethodPrecompiledGasByHash(config tlb.BlockchainConfig, hash cell.Hash) (*big.Int, error) {

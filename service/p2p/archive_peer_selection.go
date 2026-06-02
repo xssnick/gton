@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/tonutils-go/ton"
 	"sort"
 	"time"
 )
@@ -52,8 +53,38 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 	return prioritized
 }
 
+func (n *Node) DenyArchivePeer(shard archive.ShardID, peerAddr string, reason string) bool {
+	if n == nil || peerAddr == "" {
+		return false
+	}
+
+	sub, err := n.subscriptionForBlock(ton.BlockIDExt{Workchain: shard.Workchain, Shard: shard.Shard})
+	if err != nil {
+		return false
+	}
+	peer := sub.peerByAddr(peerAddr)
+	if peer == nil {
+		return false
+	}
+
+	sub.denyArchivePeer(shard, peer, reason)
+	return true
+}
+
 func (s *overlaySubscription) archiveQueryCandidates() []*overlayPeer {
 	return s.aliveNeighbourPeers(0, 0)
+}
+
+func (s *overlaySubscription) peerByAddr(addr string) *overlayPeer {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	for _, peer := range s.peers {
+		if peer.addr == addr {
+			return peer
+		}
+	}
+	return nil
 }
 
 func archivePeerTier(stats peerStats, basechain bool, now time.Time) int {
@@ -151,10 +182,7 @@ func noteArchivePeerDownload(shard archive.ShardID, peer *overlayPeer, bytes int
 	if archiveSpeedSampleReliable(bytes) {
 		peer.downloadSuccess(bytes, elapsed, archiveSlowThreshold(shard.Workchain == 0), archiveSlowPeerPenalty)
 		peer.archiveLargeDownloadSuccess(bytes, elapsed)
-		if archiveDownloadTooSlow(shard, bytes, elapsed) {
-			return true
-		}
-		return false
+		return archiveDownloadTooSlow(shard, bytes, elapsed)
 	}
 
 	if archiveDownloadTooSlow(shard, bytes, elapsed) {

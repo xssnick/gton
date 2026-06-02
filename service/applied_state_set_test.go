@@ -12,17 +12,17 @@ func TestAppliedStateSetCloneDoesNotClear(t *testing.T) {
 	var states appliedStateSet
 	states.remember(historical)
 
-	cloned := states.clone()
+	cloned := states.cloneEntries()
 	if len(cloned) != 1 {
 		t.Fatalf("cloned states = %d, want 1", len(cloned))
 	}
 
-	taken := states.take()
+	taken := states.takeEntries()
 	if len(taken) != 1 {
 		t.Fatalf("taken states after clone = %d, want 1", len(taken))
 	}
-	if !taken[0].Block.Equals(&historical.Block) {
-		t.Fatalf("taken block = %s, want %s", storage.FormatBlockRef(taken[0].Block), storage.FormatBlockRef(historical.Block))
+	if !taken[0].state.Block.Equals(&historical.Block) {
+		t.Fatalf("taken block = %s, want %s", storage.FormatBlockRef(taken[0].state.Block), storage.FormatBlockRef(historical.Block))
 	}
 }
 
@@ -41,12 +41,12 @@ func TestAppliedStateCheckpointCompletesOnlyAfterSuccess(t *testing.T) {
 	states.remember(second)
 	states.completeCheckpoint(checkpoint)
 
-	remaining := states.clone()
+	remaining := states.cloneEntries()
 	if len(remaining) != 1 {
 		t.Fatalf("remaining states = %d, want 1", len(remaining))
 	}
-	if !remaining[0].Block.Equals(&second.Block) {
-		t.Fatalf("remaining block = %s, want %s", storage.FormatBlockRef(remaining[0].Block), storage.FormatBlockRef(second.Block))
+	if !remaining[0].state.Block.Equals(&second.Block) {
+		t.Fatalf("remaining block = %s, want %s", storage.FormatBlockRef(remaining[0].state.Block), storage.FormatBlockRef(second.Block))
 	}
 }
 

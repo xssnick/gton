@@ -172,15 +172,7 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 		return nil, nil, err
 	}
 
-	return fragments.blockStateRootProof.ToBOCWithFlags(false), mcBlock.ToBOCWithFlags(false), nil
-}
-
-func oldMasterBlockIDFromState(stateRoot *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
-	prefix, err := loadMcStateExtraPrefix(stateRoot)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	return oldMasterBlockIDFromInfo(prefix.Info, seqno)
+	return fragments.blockStateRootProof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), mcBlock.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
 func oldMasterBlockIDFromInfo(info *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
@@ -300,7 +292,7 @@ func blockHeaderProofBOC(root *cell.Cell, id ton.BlockIDExt, mode uint32) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	return proof.ToBOCWithFlags(false), nil
+	return proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
 func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt) (ton.BlockIDExt, error) {

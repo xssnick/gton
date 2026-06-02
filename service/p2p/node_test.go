@@ -40,6 +40,30 @@ func TestEventDeduperEvictsOldestWithCap(t *testing.T) {
 	}
 }
 
+func TestPendingBroadcastExpiryReleasesDeduper(t *testing.T) {
+	node := newTestNode(t)
+	now := time.Unix(100, 0)
+	fingerprint := "pending-broadcast"
+
+	if !node.deduper.Mark(fingerprint, now) {
+		t.Fatal("pending broadcast was not marked")
+	}
+
+	node.pendingBroadcastMx.Lock()
+	node.pendingBroadcasts[fingerprint] = pendingBlockBroadcastDecode{
+		fingerprint: fingerprint,
+		expiresAt:   now.Add(-time.Second),
+		bytes:       1,
+	}
+	node.pendingBroadcastBytes = 1
+	node.prunePendingBlockBroadcastDecodesLocked(now)
+	node.pendingBroadcastMx.Unlock()
+
+	if !node.deduper.Mark(fingerprint, now.Add(time.Second)) {
+		t.Fatal("expired pending broadcast still blocked rebroadcast")
+	}
+}
+
 func TestOverlayBlockForDownloadUsesMonitorMinSplitDepth(t *testing.T) {
 	node := newTestNode(t)
 	block := testBlockID(0, int64(-0x2000000000000000), 10)
@@ -327,32 +351,6 @@ func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
 	}
 	if !observed.Equals(&block10) {
 		t.Fatalf("runtime observed = %+v, want %+v", observed, block10)
-	}
-}
-
-func TestMasterchainDownloadCacheRequiresVerifiedPath(t *testing.T) {
-	logger := discardLogger()
-	store := newTestPeerStore()
-	node, err := New(Options{Logger: &logger, PeerServingStorage: store, StateFilesDir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("new node: %v", err)
-	}
-
-	block := testBlockID(-1, topShard, 10)
-	downloaded := &DownloadedBlock{
-		ID:       block,
-		BlockBOC: []byte{1, 2, 3},
-		ProofBOC: []byte{4, 5, 6},
-	}
-
-	node.rememberDownloadedBlock(nil, downloaded)
-	if _, err = store.BlockFull(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("unverified masterchain block cache = %v, want ErrNotFound", err)
-	}
-
-	node.RememberVerifiedBlockFull(nil, *downloaded)
-	if _, err = store.BlockFull(context.Background(), block); err != nil {
-		t.Fatalf("verified masterchain block was not cached: %v", err)
 	}
 }
 

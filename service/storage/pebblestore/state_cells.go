@@ -44,6 +44,29 @@ func (s *Store) TrustImportedStateCellHashes() bool {
 	return false
 }
 
+func (s *Store) SaveStateCellRecords(ctx context.Context, records storage.StateCellRecords) error {
+	generation, err := s.activeCellGenerationID()
+	if err != nil {
+		return err
+	}
+	_, err = s.saveCellRecordSet(ctx, records, false, generation, false)
+	return err
+}
+
+func (s *Store) FlushStateCells(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	generation, err := s.activeCellGenerationID()
+	if err != nil {
+		return err
+	}
+	return s.flushCellDBs(generation)
+}
+
 func (s *Store) importStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
 	rootCellHash := root.HashKey()
 	if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{

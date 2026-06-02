@@ -743,7 +743,7 @@ func TestLiveLiteServerE2E(t *testing.T) {
 	})
 
 	suite.step("sendMessage invalid external message is rejected", func() error {
-		req := ton.SendMessage{Body: cell.BeginCell().EndCell().ToBOCWithFlags(false)}
+		req := ton.SendMessage{Body: cell.BeginCell().EndCell().ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})}
 		_, refErr := queryAs[ton.SendMessageStatus](refCtx, refAPI.Client(), req)
 		_, gotErr := queryAs[ton.SendMessageStatus](ctx, api.Client(), req)
 		return compareCallOutcome(refErr, gotErr)
@@ -1284,19 +1284,6 @@ func blockKey(block *ton.BlockIDExt) string {
 		return "<nil>"
 	}
 	return fmt.Sprintf("%d:%d:%d:%x:%x", block.Workchain, block.Shard, block.SeqNo, block.RootHash, block.FileHash)
-}
-
-func expectLSError(fn func() error) error {
-	err := fn()
-	if err == nil {
-		return fmt.Errorf("query succeeded")
-	}
-
-	var lsErr ton.LSError
-	if !errors.As(err, &lsErr) {
-		return err
-	}
-	return nil
 }
 
 func loadGlobalConfig(ctx context.Context) (*liteclient.GlobalConfig, error) {

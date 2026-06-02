@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -35,7 +36,7 @@ func TestShardStateResolverResolvesSplitDescendantFromParent(t *testing.T) {
 		save:      env.save,
 	})
 
-	state, err := resolver.resolve(target)
+	state, err := resolver.resolveWithContext(ctx, target)
 	if err != nil {
 		t.Fatalf("resolve split descendant: %v", err)
 	}
@@ -76,7 +77,7 @@ func TestShardStateResolverResolvesMergeFromTwoChildren(t *testing.T) {
 		save:      env.save,
 	})
 
-	state, err := resolver.resolve(target)
+	state, err := resolver.resolveWithContext(ctx, target)
 	if err != nil {
 		t.Fatalf("resolve merge target: %v", err)
 	}
@@ -104,9 +105,9 @@ func TestValidateShardDescriptionPrefetchUsesRelatedCurrentShard(t *testing.T) {
 	})
 	runner := &nextSyncRunner{shardResolver: resolver}
 
-	desc := &shardTopBlockDescription{
+	desc := &p2p.ShardBlockDescription{
 		Block: target,
-		Chain: []shardTopBlockDescriptionLink{
+		Chain: []p2p.ShardDescriptionLink{
 			{Block: target, PrevRefs: []ton.BlockIDExt{parent}},
 		},
 	}
@@ -114,9 +115,9 @@ func TestValidateShardDescriptionPrefetchUsesRelatedCurrentShard(t *testing.T) {
 		t.Fatalf("validate related shard target: %v", err)
 	}
 
-	unanchored := &shardTopBlockDescription{
+	unanchored := &p2p.ShardBlockDescription{
 		Block: target,
-		Chain: []shardTopBlockDescriptionLink{
+		Chain: []p2p.ShardDescriptionLink{
 			{Block: target, PrevRefs: []ton.BlockIDExt{testBlockID(0, leftShard, parent.SeqNo)}},
 		},
 	}
@@ -125,12 +126,12 @@ func TestValidateShardDescriptionPrefetchUsesRelatedCurrentShard(t *testing.T) {
 	}
 
 	old := testBlockID(0, leftShard, 10)
-	if err := runner.validateShardDescriptionPrefetch(&shardTopBlockDescription{Block: old}); err != errShardDescriptionTooOld {
+	if err := runner.validateShardDescriptionPrefetch(&p2p.ShardBlockDescription{Block: old}); err != errShardDescriptionTooOld {
 		t.Fatalf("old shard target error = %v, want errShardDescriptionTooOld", err)
 	}
 
 	far := testBlockID(0, leftShard, parent.SeqNo+shardDescriptionPrefetchMaxAhead+1)
-	if err := runner.validateShardDescriptionPrefetch(&shardTopBlockDescription{Block: far}); err != errShardDescriptionTooNew {
+	if err := runner.validateShardDescriptionPrefetch(&p2p.ShardBlockDescription{Block: far}); err != errShardDescriptionTooNew {
 		t.Fatalf("far shard target error = %v, want errShardDescriptionTooNew", err)
 	}
 }
@@ -160,7 +161,7 @@ func TestShardStateResolverCallsAfterApplyState(t *testing.T) {
 		},
 	})
 
-	if _, err := resolver.resolve(target); err != nil {
+	if _, err := resolver.resolveWithContext(ctx, target); err != nil {
 		t.Fatalf("resolve target: %v", err)
 	}
 	if !callbackState.Equals(&target) {
@@ -199,7 +200,7 @@ func TestShardStateResolverWaitUsesCallContext(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := resolver.resolve(target)
+		_, err := resolver.resolveWithContext(ctx, target)
 		done <- err
 	}()
 	<-started
@@ -231,7 +232,7 @@ func TestShardStateResolverRejectsNonPreviousRef(t *testing.T) {
 		apply:     env.apply,
 	})
 
-	if _, err := resolver.resolve(target); err == nil {
+	if _, err := resolver.resolveWithContext(ctx, target); err == nil {
 		t.Fatal("expected non-previous ref to be rejected")
 	}
 }
@@ -259,10 +260,10 @@ func TestShardStateResolverReusesIntermediateStateForSiblingTargets(t *testing.T
 		apply:     env.apply,
 	})
 
-	if _, err := resolver.resolve(targetA); err != nil {
+	if _, err := resolver.resolveWithContext(ctx, targetA); err != nil {
 		t.Fatalf("resolve target A: %v", err)
 	}
-	if _, err := resolver.resolve(targetB); err != nil {
+	if _, err := resolver.resolveWithContext(ctx, targetB); err != nil {
 		t.Fatalf("resolve target B: %v", err)
 	}
 	assertBlockSeq(t, "applied", env.applied, []ton.BlockIDExt{firstChild, targetA, targetB})
@@ -295,10 +296,10 @@ func TestShardStateResolverResolvesSplitSiblingsFromSameParent(t *testing.T) {
 		apply:     env.apply,
 	})
 
-	if _, err := resolver.resolve(left); err != nil {
+	if _, err := resolver.resolveWithContext(ctx, left); err != nil {
 		t.Fatalf("resolve left split child: %v", err)
 	}
-	if _, err := resolver.resolve(right); err != nil {
+	if _, err := resolver.resolveWithContext(ctx, right); err != nil {
 		t.Fatalf("resolve right split child: %v", err)
 	}
 	assertBlockSeq(t, "applied", env.applied, []ton.BlockIDExt{left, right})
@@ -341,10 +342,10 @@ func TestShardStateResolverReusesSplitChildrenWhenTheyMerge(t *testing.T) {
 		loadBlock: env.loadBlock,
 		apply:     env.apply,
 	})
-	if _, err := splitResolver.resolve(left); err != nil {
+	if _, err := splitResolver.resolveWithContext(ctx, left); err != nil {
 		t.Fatalf("resolve left split child: %v", err)
 	}
-	if _, err := splitResolver.resolve(right); err != nil {
+	if _, err := splitResolver.resolveWithContext(ctx, right); err != nil {
 		t.Fatalf("resolve right split child: %v", err)
 	}
 
@@ -362,7 +363,7 @@ func TestShardStateResolverReusesSplitChildrenWhenTheyMerge(t *testing.T) {
 		loadBlock: env.loadBlock,
 		apply:     env.apply,
 	})
-	if _, err := mergeResolver.resolve(merged); err != nil {
+	if _, err := mergeResolver.resolveWithContext(ctx, merged); err != nil {
 		t.Fatalf("resolve merged shard: %v", err)
 	}
 	assertBlockSeq(t, "applied", env.applied, []ton.BlockIDExt{left, right, merged})
@@ -399,7 +400,7 @@ func TestShardStateResolverDropsCompletedTasks(t *testing.T) {
 		apply:     env.apply,
 	})
 
-	if _, err := resolver.resolve(target); err != nil {
+	if _, err := resolver.resolveWithContext(ctx, target); err != nil {
 		t.Fatalf("resolve target: %v", err)
 	}
 
@@ -431,7 +432,7 @@ func TestShardStateResolverUsesUpdatedCurrentState(t *testing.T) {
 		apply:     env.apply,
 	})
 
-	nextState, err := resolver.resolve(next)
+	nextState, err := resolver.resolveWithContext(ctx, next)
 	if err != nil {
 		t.Fatalf("resolve next: %v", err)
 	}
@@ -445,7 +446,7 @@ func TestShardStateResolverUsesUpdatedCurrentState(t *testing.T) {
 		storage.ShardKeyFromBlock(next): *nextState,
 	})
 
-	if _, err = resolver.resolve(target); err != nil {
+	if _, err = resolver.resolveWithContext(ctx, target); err != nil {
 		t.Fatalf("resolve target: %v", err)
 	}
 	if got := env.blockLoads[storage.BlockKey(next)]; got != nextBlockLoads {

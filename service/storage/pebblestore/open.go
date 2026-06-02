@@ -227,22 +227,22 @@ func Open(opts Options) (*Store, error) {
 		hotCache:                        hotCache,
 		readOnly:                        opts.ReadOnly,
 		hotDrained:                      make(chan struct{}),
-		pendingArchiveSync:              map[string]uint64{},
-		pendingKeyProofSync:             map[string]uint64{},
+		pendingArchiveSync:              map[string]pendingPackWrite{},
+		pendingKeyProofSync:             map[string]pendingPackWrite{},
 		dirtyArchivePacks:               map[string]struct{}{},
 		dirtyKeyProofPacks:              map[string]struct{}{},
 	}
 	if !opts.ReadOnly {
 		stageStarted = time.Now()
-		logger.Info().Msg("reconciling committed artifact files")
-		if err = store.reconcileCommittedArtifactFiles(); err != nil {
+		logger.Info().Msg("reconciling artifact pack files")
+		if err = store.reconcileArtifactPackFiles(); err != nil {
 			_ = store.closeCellGenerations()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()
 			hotCache.Unref()
 			return nil, err
 		}
-		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("reconciled committed artifact files")
+		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("reconciled artifact pack files")
 		stageStarted = time.Now()
 		logger.Info().Msg("cleaning retired cell generations")
 		if err = store.CleanupRetiredCellGenerations(context.Background()); err != nil {

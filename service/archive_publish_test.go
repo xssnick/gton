@@ -7,17 +7,16 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/archive/packfile"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -28,11 +27,12 @@ func TestImportArchiveBlocksRejectsInvalidNewArchive(t *testing.T) {
 	ctx := context.Background()
 
 	badPath := writeServiceTestCorruptArchivePack(t)
+	badData := readServiceTestFile(t, badPath)
 	_, err := svc.importArchiveBlocks(ctx, &archive.Downloaded{
 		MasterchainSeqno: 21,
 		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
 		ArchiveID:        0,
-		Path:             badPath,
+		Data:             badData,
 	}, 0)
 	if err == nil || !strings.Contains(err.Error(), "archive entry magic mismatch") {
 		t.Fatalf("import corrupt archive error = %v, want entry magic mismatch", err)
@@ -44,64 +44,78 @@ func TestImportArchiveBlocksDoesNotTouchStoredArchiveOnInvalidDuplicateDownload(
 	svc := &Service{storage: store}
 	ctx := context.Background()
 
-	archiveID := int64(0)
-	oldPath, oldPtr := writeServiceTestArchivePack(t, "old", []byte{0x55})
-	if _, err := store.SaveArchiveFile(21, -1, topShard, archiveID, oldPath); err != nil {
-		t.Fatalf("save old archive: %v", err)
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     21,
+		RootHash:  bytes.Repeat([]byte{0x21}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+	oldData := []byte{0x55}
+	if err := store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    block,
+			Block: oldData,
+			Meta:  &storage.BlockMeta{ID: block, GenUTime: 2100, StartLT: 21, EndLT: 22},
+		}},
+	}); err != nil {
+		t.Fatalf("save old archive block: %v", err)
 	}
 
+	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo), -1, topShard)
+	if err != nil {
+		t.Fatalf("old archive info: %v", err)
+	}
+	oldOffset := int64(packfile.HeaderSize + packfile.EntryHeaderSize + len(packfile.EntryName(packfile.KindBlock, block)))
+
 	badPath := writeServiceTestCorruptArchivePack(t)
-	_, err := svc.importArchiveBlocks(ctx, &archive.Downloaded{
+	badData := readServiceTestFile(t, badPath)
+	_, err = svc.importArchiveBlocks(ctx, &archive.Downloaded{
 		MasterchainSeqno: 21,
 		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
 		ArchiveID:        archiveID,
-		Path:             badPath,
+		Data:             badData,
 	}, 0)
 	if err == nil || !strings.Contains(err.Error(), "archive entry magic mismatch") {
 		t.Fatalf("import corrupt archive error = %v, want entry magic mismatch", err)
 	}
-	if _, err = os.Stat(badPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("duplicate corrupt archive stat error = %v, want removed", err)
-	}
 
-	got, err := store.ArchiveSlice(ctx, archiveID, oldPtr.Offset, int32(oldPtr.Size))
+	got, err := store.ArchiveSlice(ctx, archiveID, oldOffset, int32(len(oldData)))
 	if err != nil {
 		t.Fatalf("read old archive slice: %v", err)
 	}
-	if string(got) != string([]byte{0x55}) {
+	if !bytes.Equal(got, oldData) {
 		t.Fatalf("archive file was replaced before full validation: %x", got)
 	}
 }
 
-func TestImportArchiveBlocksStoresDownloadedPackRefs(t *testing.T) {
+func TestImportArchiveBlocksStoresInlineArchiveData(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	svc := &Service{storage: store}
 	ctx := context.Background()
 
 	block, blockData := readServiceMasterchainBlockFixture(t)
 	path := writeServiceTestBlockArchivePack(t, block, blockData)
-	imported, err := svc.importArchiveBlocks(ctx, &archive.Downloaded{
+	data := readServiceTestFile(t, path)
+	_, imported, err := svc.importArchiveBlocksForStorage(ctx, &archive.Downloaded{
 		MasterchainSeqno: block.SeqNo,
 		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
 		ArchiveID:        0,
-		Path:             path,
-	}, 0)
+		Data:             data,
+	}, 0, nil)
 	if err != nil {
 		t.Fatalf("import archive blocks: %v", err)
 	}
-	if len(imported.stored.FullBlocks) != 1 {
-		t.Fatalf("stored full blocks = %d, want 1", len(imported.stored.FullBlocks))
+	if len(imported.FullBlocks) != 1 {
+		t.Fatalf("stored full blocks = %d, want 1", len(imported.FullBlocks))
 	}
-	full := imported.stored.FullBlocks[0]
-	if full.BlockRef == nil || full.ProofRef == nil {
-		t.Fatalf("stored full block refs are missing: block=%+v proof=%+v", full.BlockRef, full.ProofRef)
-	}
-	if len(full.Block) != 0 || len(full.Proof) != 0 {
-		t.Fatalf("stored full block keeps inline data: block=%d proof=%d", len(full.Block), len(full.Proof))
+	full := imported.FullBlocks[0]
+	if !bytes.Equal(full.Block, blockData) || len(full.Proof) == 0 {
+		t.Fatalf("stored full block misses inline data: block=%d proof=%d", len(full.Block), len(full.Proof))
 	}
 
-	if err = store.SaveArchiveImport(&imported.stored); err != nil {
-		t.Fatalf("save archive import refs: %v", err)
+	if err = store.SaveArchiveImport(&imported); err != nil {
+		t.Fatalf("save archive import data: %v", err)
 	}
 	got, err := store.BlockData(ctx, block)
 	if err != nil {
@@ -112,153 +126,14 @@ func TestImportArchiveBlocksStoresDownloadedPackRefs(t *testing.T) {
 	}
 }
 
-func TestImportArchiveBlocksReusesExistingStoredPack(t *testing.T) {
-	store := openTestPebbleStorage(t)
-	svc := &Service{storage: store}
-	ctx := context.Background()
-
-	block, blockData := readServiceMasterchainBlockFixture(t)
-	firstPath := writeServiceTestBlockArchivePack(t, block, blockData)
-	first, err := svc.importArchiveBlocks(ctx, &archive.Downloaded{
-		MasterchainSeqno: block.SeqNo,
-		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
-		ArchiveID:        0,
-		Path:             firstPath,
-	}, 0)
-	if err != nil {
-		t.Fatalf("import first archive blocks: %v", err)
-	}
-	if len(first.stored.FullBlocks) != 1 {
-		t.Fatalf("first stored full blocks = %d, want 1", len(first.stored.FullBlocks))
-	}
-
-	secondPath := writeServiceTestBlockArchivePackProofFirst(t, block, blockData)
-	second, err := svc.importArchiveBlocks(ctx, &archive.Downloaded{
-		MasterchainSeqno: block.SeqNo,
-		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
-		ArchiveID:        0,
-		Path:             secondPath,
-	}, 0)
-	if err != nil {
-		t.Fatalf("import duplicate archive blocks: %v", err)
-	}
-	if len(second.stored.FullBlocks) != 1 {
-		t.Fatalf("second stored full blocks = %d, want 1", len(second.stored.FullBlocks))
-	}
-	if _, err = os.Stat(secondPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("duplicate downloaded pack stat error = %v, want removed", err)
-	}
-
-	firstBlock := first.stored.FullBlocks[0]
-	secondBlock := second.stored.FullBlocks[0]
-	if firstBlock.BlockRef == nil || firstBlock.ProofRef == nil || secondBlock.BlockRef == nil || secondBlock.ProofRef == nil {
-		t.Fatalf("stored refs are missing: first=%+v second=%+v", firstBlock, secondBlock)
-	}
-	if *secondBlock.BlockRef != *firstBlock.BlockRef {
-		t.Fatalf("duplicate block ref = %+v, want existing %+v", secondBlock.BlockRef, firstBlock.BlockRef)
-	}
-	if *secondBlock.ProofRef != *firstBlock.ProofRef {
-		t.Fatalf("duplicate proof ref = %+v, want existing %+v", secondBlock.ProofRef, firstBlock.ProofRef)
-	}
-}
-
-func TestSaveArchiveFileMergesDownloadedPackIntoExistingPartialPack(t *testing.T) {
-	store := openTestPebbleStorage(t)
-
-	oldPath := writeServiceTestArchivePackEntries(t, map[string][]byte{
-		"old": {0x01},
-	})
-	saved, err := store.SaveArchiveFile(21, -1, topShard, 0, oldPath)
-	if err != nil {
-		t.Fatalf("save partial archive: %v", err)
-	}
-
-	fullPath := writeServiceTestArchivePackEntries(t, map[string][]byte{
-		"old": {0x02},
-		"new": {0x03},
-	})
-	merged, err := store.SaveArchiveFile(21, -1, topShard, 0, fullPath)
-	if err != nil {
-		t.Fatalf("merge full archive: %v", err)
-	}
-	if !merged.ReusedExisting {
-		t.Fatalf("merged archive did not report existing pack reuse: %+v", merged)
-	}
-	if merged.Path != saved.Path {
-		t.Fatalf("merged path = %q, want %q", merged.Path, saved.Path)
-	}
-	if _, err = os.Stat(fullPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("full downloaded pack stat error = %v, want removed", err)
-	}
-
-	entries := readServiceTestArchiveEntries(t, saved.Path)
-	if !bytes.Equal(entries["old"], []byte{0x01}) {
-		t.Fatalf("old entry = %x, want original partial data", entries["old"])
-	}
-	if !bytes.Equal(entries["new"], []byte{0x03}) {
-		t.Fatalf("new entry = %x, want appended full-pack data", entries["new"])
-	}
-}
-
-func writeServiceTestArchivePack(t *testing.T, name string, data []byte) (string, packfile.Pointer) {
+func readServiceTestFile(t *testing.T, path string) []byte {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "archive.pack")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("create archive pack: %v", err)
+		t.Fatalf("read test file %s: %v", path, err)
 	}
-	ptr, err := packfile.Append(file, name, data, true)
-	if closeErr := file.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatalf("write archive pack: %v", err)
-	}
-	return path, ptr
-}
-
-func writeServiceTestArchivePackEntries(t *testing.T, entries map[string][]byte) string {
-	t.Helper()
-
-	path := filepath.Join(t.TempDir(), "archive.pack")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatalf("create archive pack: %v", err)
-	}
-	names := make([]string, 0, len(entries))
-	for name := range entries {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if _, err = packfile.Append(file, name, entries[name], true); err != nil {
-			t.Fatalf("write archive entry %s: %v", name, err)
-		}
-	}
-	if err = file.Close(); err != nil {
-		t.Fatalf("close archive pack: %v", err)
-	}
-	return path
-}
-
-func readServiceTestArchiveEntries(t *testing.T, path string) map[string][]byte {
-	t.Helper()
-
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatalf("open archive pack: %v", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	entries := map[string][]byte{}
-	if err = packfile.Read(context.Background(), file, func(entry packfile.Entry) error {
-		entries[entry.Name] = append([]byte(nil), entry.Data...)
-		return nil
-	}); err != nil {
-		t.Fatalf("read archive pack: %v", err)
-	}
-	return entries
+	return data
 }
 
 func writeServiceTestBlockArchivePack(t *testing.T, block ton.BlockIDExt, blockData []byte) string {
@@ -269,31 +144,18 @@ func writeServiceTestBlockArchivePack(t *testing.T, block ton.BlockIDExt, blockD
 	if err != nil {
 		t.Fatalf("create archive pack: %v", err)
 	}
-	if _, err = packfile.Append(file, serviceTestEntryName("block", block), blockData, true); err != nil {
-		t.Fatalf("write block entry: %v", err)
-	}
-	if _, err = packfile.Append(file, serviceTestEntryName("proof", block), []byte{0x01}, true); err != nil {
-		t.Fatalf("write proof entry: %v", err)
-	}
-	if err = file.Close(); err != nil {
-		t.Fatalf("close archive pack: %v", err)
-	}
-	return path
-}
-
-func writeServiceTestBlockArchivePackProofFirst(t *testing.T, block ton.BlockIDExt, blockData []byte) string {
-	t.Helper()
-
-	path := filepath.Join(t.TempDir(), "archive.pack")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	appender, err := packfile.NewAppender(file)
 	if err != nil {
-		t.Fatalf("create archive pack: %v", err)
+		t.Fatalf("create archive appender: %v", err)
 	}
-	if _, err = packfile.Append(file, serviceTestEntryName("proof", block), []byte{0x01}, true); err != nil {
+	if _, err = appender.Append(serviceTestEntryName("block", block), blockData); err != nil {
+		t.Fatalf("write block entry: %v", err)
+	}
+	if _, err = appender.Append(serviceTestEntryName("proof", block), []byte{0x01}); err != nil {
 		t.Fatalf("write proof entry: %v", err)
 	}
-	if _, err = packfile.Append(file, serviceTestEntryName("block", block), blockData, true); err != nil {
-		t.Fatalf("write block entry: %v", err)
+	if err = file.Sync(); err != nil {
+		t.Fatalf("sync archive pack: %v", err)
 	}
 	if err = file.Close(); err != nil {
 		t.Fatalf("close archive pack: %v", err)

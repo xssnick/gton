@@ -256,12 +256,6 @@ func (s *stateSerializer) acquire(ctx context.Context, master ton.BlockIDExt, sc
 	return runCtx, run, nil
 }
 
-func (s *stateSerializer) active() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.activeRun != nil
-}
-
 func (s *stateSerializer) cancel(ctx context.Context) error {
 	s.mu.Lock()
 	run := s.activeRun

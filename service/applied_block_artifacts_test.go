@@ -1,355 +1,91 @@
 package service
 
 import (
-	"bytes"
-	"context"
-	"errors"
-	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/xssnick/gton/service/storage"
-
-	"github.com/rs/zerolog"
-	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestAppliedBlockArtifactWriterWaitsUntilBlockAndProofStored(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	store := newAppliedBlockArtifactTestStore()
-	store.saveStarted = make(chan struct{})
-	store.releaseSave = make(chan struct{})
-	flusher := &appliedBlockArtifactTestFlusher{}
-	writer := newAppliedBlockArtifactWriter(zerolog.Nop(), store, flusher)
-	go writer.run(ctx)
-
-	prev := testBlockID(0, topShard, 10)
-	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 11), prev, false)
-	if err := writer.enqueue(ctx, block, 4); err != nil {
-		t.Fatalf("enqueue block: %v", err)
-	}
-	target := writer.target()
-
-	select {
-	case <-store.saveStarted:
-	case <-time.After(time.Second):
-		t.Fatal("SaveBlockFull was not called")
-	}
-
-	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelWait()
-	waitErr := make(chan error, 1)
-	go func() {
-		waitErr <- writer.wait(waitCtx, target)
-	}()
-
-	select {
-	case err := <-waitErr:
-		t.Fatalf("wait finished before artifact save was released: %v", err)
-	case <-time.After(50 * time.Millisecond):
+func TestPreparedBlockCheckpointArtifactsCanonicalProofLinkFlag(t *testing.T) {
+	tests := []struct {
+		name       string
+		block      PreparedBlock
+		wantIsLink bool
+	}{
+		{
+			name: "master full proof stays full proof",
+			block: PreparedBlock{
+				ID:       testBlockID(-1, topShard, 10),
+				BlockBOC: []byte{0x01},
+				ProofBOC: []byte{0x02},
+				Meta:     &storage.BlockMeta{},
+			},
+		},
+		{
+			name: "shard full proof is served as proof link",
+			block: PreparedBlock{
+				ID:       testBlockID(0, topShard, 11),
+				BlockBOC: []byte{0x03},
+				ProofBOC: []byte{0x04},
+				Meta:     &storage.BlockMeta{},
+			},
+			wantIsLink: true,
+		},
 	}
 
-	close(store.releaseSave)
-
-	if err := <-waitErr; err != nil {
-		t.Fatalf("wait saved artifacts: %v", err)
-	}
-	if got := store.blockData(block.ID); !bytes.Equal(got, block.BlockBOC) {
-		t.Fatalf("stored block data = %x, want %x", got, block.BlockBOC)
-	}
-	if got := store.proofData(storage.ServedProofBlockLink, block.ID); !bytes.Equal(got, block.ProofBOC) {
-		t.Fatalf("stored block proof = %x, want %x", got, block.ProofBOC)
-	}
-	if got, ok := store.nextBlock(prev); !ok || !got.Equals(&block.ID) {
-		t.Fatalf("next block link = %s ok=%v, want %s", storage.FormatBlockRef(got), ok, storage.FormatBlockRef(block.ID))
-	}
-	if !flusher.has(block.ID) {
-		t.Fatalf("live block was not marked flushed")
-	}
-}
-
-func TestAppliedBlockArtifactWriterFailsWhenProofIsMissing(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	store := newAppliedBlockArtifactTestStore()
-	writer := newAppliedBlockArtifactWriter(zerolog.Nop(), store, nil)
-	go writer.run(ctx)
-
-	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 21), testBlockID(0, topShard, 20), false)
-	block.ProofBOC = nil
-	if err := writer.enqueue(ctx, block, 4); err != nil {
-		t.Fatalf("enqueue block: %v", err)
-	}
-
-	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelWait()
-	err := writer.wait(waitCtx, writer.target())
-	if err == nil || !strings.Contains(err.Error(), "block proof is missing") {
-		t.Fatalf("wait error = %v, want missing proof", err)
-	}
-}
-
-func TestAppliedBlockArtifactWriterRetriesLinkAfterPartialSave(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	store := newAppliedBlockArtifactTestStore()
-	store.linkFailures = 1
-	writer := newAppliedBlockArtifactWriter(zerolog.Nop(), store, nil)
-	go writer.run(ctx)
-
-	prev := testBlockID(0, topShard, 24)
-	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 25), prev, false)
-	if err := writer.enqueue(ctx, block, 4); err != nil {
-		t.Fatalf("enqueue block: %v", err)
-	}
-
-	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelWait()
-	if err := writer.wait(waitCtx, writer.target()); err != nil {
-		t.Fatalf("wait after partial save: %v", err)
-	}
-	if saves := store.saveCount(); saves != 1 {
-		t.Fatalf("SaveBlockFull calls = %d, want 1", saves)
-	}
-	if got, ok := store.nextBlock(prev); !ok || !got.Equals(&block.ID) {
-		t.Fatalf("next block link = %s ok=%v, want %s", storage.FormatBlockRef(got), ok, storage.FormatBlockRef(block.ID))
-	}
-}
-
-func TestAppliedBlockArtifactWriterAcceptsAlreadyDurableBlock(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	store := newAppliedBlockArtifactTestStore()
-	flusher := &appliedBlockArtifactTestFlusher{}
-	writer := newAppliedBlockArtifactWriter(zerolog.Nop(), store, flusher)
-	go writer.run(ctx)
-
-	block := testAppliedDownloadedBlock(testBlockID(0, topShard, 31), testBlockID(0, topShard, 30), false)
-	if err := store.SaveBlockFull(&storage.ServedBlockFull{
-		ID:     block.ID,
-		Block:  block.BlockBOC,
-		Proof:  block.ProofBOC,
-		Meta:   block.Meta,
-		IsLink: true,
-	}); err != nil {
-		t.Fatalf("pre-save full block: %v", err)
-	}
-
-	if err := writer.enqueue(ctx, PreparedBlock{ID: block.ID}, 4); err != nil {
-		t.Fatalf("enqueue durable block: %v", err)
-	}
-	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelWait()
-	if err := writer.wait(waitCtx, writer.target()); err != nil {
-		t.Fatalf("wait durable block: %v", err)
-	}
-	if saves := store.saveCount(); saves != 1 {
-		t.Fatalf("SaveBlockFull calls = %d, want only pre-save", saves)
-	}
-	if !flusher.has(block.ID) {
-		t.Fatalf("live block was not marked flushed")
-	}
-}
-
-func TestAppliedBlockArtifactWriterBackpressuresQueuedJobs(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	store := newAppliedBlockArtifactTestStore()
-	writer := newAppliedBlockArtifactWriter(zerolog.Nop(), store, nil)
-	prev := testBlockID(0, topShard, 40)
-	for i := 0; i < appliedBlockArtifactQueueJobsLimit; i++ {
-		block := testAppliedDownloadedBlock(testBlockID(0, topShard, uint32(41+i)), prev, false)
-		if err := writer.enqueue(ctx, block, 4); err != nil {
-			t.Fatalf("enqueue block %d: %v", i, err)
-		}
-		prev = block.ID
-	}
-
-	enqueued := make(chan error, 1)
-	go func() {
-		block := testAppliedDownloadedBlock(testBlockID(0, topShard, 41+appliedBlockArtifactQueueJobsLimit), prev, false)
-		enqueued <- writer.enqueue(ctx, block, 4)
-	}()
-
-	select {
-	case err := <-enqueued:
-		t.Fatalf("enqueue passed through full artifact queue: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	if _, ok := writer.popJob(); !ok {
-		t.Fatal("pop queued artifact job")
-	}
-	select {
-	case err := <-enqueued:
-		if err != nil {
-			t.Fatalf("enqueue after queue space: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("enqueue did not resume after artifact queue space was freed")
-	}
-}
-
-type appliedBlockArtifactTestStore struct {
-	mu sync.Mutex
-
-	blocks map[storage.BlockRootHash][]byte
-	proofs map[appliedBlockArtifactProofKey][]byte
-	next   map[storage.BlockRootHash]ton.BlockIDExt
-
-	saveStartedOnce sync.Once
-	saveStarted     chan struct{}
-	releaseSave     chan struct{}
-	saveErr         error
-	linkFailures    int
-	saves           int
-}
-
-func newAppliedBlockArtifactTestStore() *appliedBlockArtifactTestStore {
-	return &appliedBlockArtifactTestStore{
-		blocks: map[storage.BlockRootHash][]byte{},
-		proofs: map[appliedBlockArtifactProofKey][]byte{},
-		next:   map[storage.BlockRootHash]ton.BlockIDExt{},
-	}
-}
-
-type appliedBlockArtifactProofKey struct {
-	kind  storage.ServedProofKind
-	block storage.BlockRootHash
-}
-
-func (s *appliedBlockArtifactTestStore) SaveBlockFull(block *storage.ServedBlockFull) error {
-	if s.saveStarted != nil {
-		s.saveStartedOnce.Do(func() {
-			close(s.saveStarted)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			full, _, err := preparedBlockCheckpointArtifacts(tt.block, 0)
+			if err != nil {
+				t.Fatalf("prepare checkpoint artifacts: %v", err)
+			}
+			if full.IsLink != tt.wantIsLink {
+				t.Fatalf("is link = %v, want %v", full.IsLink, tt.wantIsLink)
+			}
 		})
 	}
-	if s.releaseSave != nil {
-		<-s.releaseSave
-	}
-	if s.saveErr != nil {
-		return s.saveErr
-	}
-	if block == nil {
-		return errors.New("served block is nil")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.saves++
-	if len(block.Block) > 0 {
-		s.blocks[storage.BlockKey(block.ID)] = bytes.Clone(block.Block)
-	}
-	if len(block.Proof) > 0 {
-		isKey := block.Meta != nil && block.Meta.Has(storage.BlockMetaIsKeyBlock)
-		for _, kind := range storage.StoredProofKindsForBlock(block.IsLink, isKey) {
-			s.proofs[s.proofKey(kind, block.ID)] = bytes.Clone(block.Proof)
-		}
-	}
-	return nil
 }
 
-func (s *appliedBlockArtifactTestStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.linkFailures > 0 {
-		s.linkFailures--
-		return errors.New("link failed")
-	}
-	s.next[storage.BlockKey(prev)] = next
-	return nil
-}
+func TestCheckpointArtifactsShareImmutablePayload(t *testing.T) {
+	blockData := []byte{0x01, 0x02, 0x03}
+	proofData := []byte{0x04, 0x05}
+	block := testBlockID(0, topShard, 20)
+	state := &storage.BlockState{Block: block}
 
-func (s *appliedBlockArtifactTestStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data, ok := s.blocks[storage.BlockKey(block)]
-	if !ok {
-		return nil, storage.ErrNotFound
-	}
-	return bytes.Clone(data), nil
-}
-
-func (s *appliedBlockArtifactTestStore) BlockProof(_ context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data, ok := s.proofs[s.proofKey(kind, block)]
-	if !ok {
-		return nil, storage.ErrNotFound
-	}
-	return bytes.Clone(data), nil
-}
-
-func (s *appliedBlockArtifactTestStore) blockData(block ton.BlockIDExt) []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return bytes.Clone(s.blocks[storage.BlockKey(block)])
-}
-
-func (s *appliedBlockArtifactTestStore) proofData(kind storage.ServedProofKind, block ton.BlockIDExt) []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return bytes.Clone(s.proofs[s.proofKey(kind, block)])
-}
-
-func (s *appliedBlockArtifactTestStore) nextBlock(prev ton.BlockIDExt) (ton.BlockIDExt, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next, ok := s.next[storage.BlockKey(prev)]
-	return next, ok
-}
-
-func (s *appliedBlockArtifactTestStore) saveCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saves
-}
-
-func (s *appliedBlockArtifactTestStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) appliedBlockArtifactProofKey {
-	return appliedBlockArtifactProofKey{kind: kind, block: storage.BlockKey(block)}
-}
-
-type appliedBlockArtifactTestFlusher struct {
-	mu      sync.Mutex
-	flushed map[storage.BlockRootHash]struct{}
-}
-
-func (f *appliedBlockArtifactTestFlusher) MarkLiveBlockFlushed(block ton.BlockIDExt) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.flushed == nil {
-		f.flushed = map[storage.BlockRootHash]struct{}{}
-	}
-	f.flushed[storage.BlockKey(block)] = struct{}{}
-}
-
-func (f *appliedBlockArtifactTestFlusher) has(block ton.BlockIDExt) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.flushed[storage.BlockKey(block)]
-	return ok
-}
-
-func testAppliedDownloadedBlock(block ton.BlockIDExt, prev ton.BlockIDExt, isKey bool) PreparedBlock {
-	meta := &storage.BlockMeta{
+	artifact, _, err := preparedBlockCheckpointArtifacts(PreparedBlock{
 		ID:       block,
-		PrevRefs: []ton.BlockIDExt{prev},
+		BlockBOC: blockData,
+		ProofBOC: proofData,
+		Meta:     &storage.BlockMeta{},
+		IsLink:   true,
+	}, 2)
+	if err != nil {
+		t.Fatalf("prepare checkpoint artifacts: %v", err)
 	}
-	if isKey {
-		meta.Mark(storage.BlockMetaIsKeyBlock)
+	if !sameByteBacking(artifact.Block, blockData) {
+		t.Fatal("checkpoint artifact copied block payload")
 	}
-	return PreparedBlock{
-		ID:       block,
-		BlockBOC: []byte("block boc"),
-		ProofBOC: []byte("proof boc"),
-		Meta:     meta,
+	if !sameByteBacking(artifact.Proof, proofData) {
+		t.Fatal("checkpoint artifact copied proof payload")
 	}
+
+	var states appliedStateSet
+	states.rememberWithArtifacts(state, artifact, nil)
+	checkpoint := states.checkpoint()
+	if len(checkpoint.entries) != 1 || checkpoint.entries[0].Artifact == nil {
+		t.Fatalf("checkpoint entries = %+v, want one artifact", checkpoint.entries)
+	}
+	if !sameByteBacking(checkpoint.entries[0].Artifact.Block, blockData) {
+		t.Fatal("applied state checkpoint copied block payload")
+	}
+	if !sameByteBacking(checkpoint.entries[0].Artifact.Proof, proofData) {
+		t.Fatal("applied state checkpoint copied proof payload")
+	}
+}
+
+func sameByteBacking(left []byte, right []byte) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) == len(right)
+	}
+	return &left[0] == &right[0]
 }

@@ -11,15 +11,14 @@ type LiveBlockProofArtifact struct {
 }
 
 type LiveBlockArtifacts struct {
-	Block            ton.BlockIDExt
-	Root             *cell.Cell
-	BlockData        []byte
-	Meta             *BlockMeta
-	State            *BlockState
-	Proofs           []LiveBlockProofArtifact
-	BlockDataFlushed bool
-	StateFlushed     bool
-	ProofsFlushed    bool
+	Block           ton.BlockIDExt
+	Root            *cell.Cell
+	BlockData       []byte
+	Meta            *BlockMeta
+	State           *BlockState
+	Proofs          []LiveBlockProofArtifact
+	ArtifactFlushed bool
+	StateFlushed    bool
 }
 
 type LiveBlockNonfinalKind uint8

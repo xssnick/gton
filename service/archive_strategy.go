@@ -59,8 +59,8 @@ func archiveCatchUpTargetByLag(current *storage.CurrentState, lagSeconds int64) 
 	return target, true
 }
 
-func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, shards []archive.ShardID, splitDepth uint32, priority archiveImportPriority) ([]*archiveImportResult, error) {
-	if len(shards) == 0 {
+func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, plans []archiveShardImportPlan, splitDepth uint32, priority archiveImportPriority) ([]*archiveImportResult, error) {
+	if len(plans) == 0 {
 		return nil, nil
 	}
 
@@ -68,9 +68,11 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 	defer cancel()
 
 	type archivePreloadResult struct {
-		idx      int
-		imported *archiveImportResult
-		err      error
+		idx       int
+		imported  *archiveImportResult
+		peer      string
+		archiveID int64
+		err       error
 	}
 
 	type archivePreloadJob struct {
@@ -82,16 +84,15 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 	if limit < 1 {
 		limit = 1
 	}
-	if limit > len(shards) {
-		limit = len(shards)
+	if limit > len(plans) {
+		limit = len(plans)
 	}
 
 	results := make(chan archivePreloadResult, limit)
 	var wg sync.WaitGroup
-	submitted := 0
 	inFlight := 0
 	submit := func(idx int) error {
-		shard := shards[idx]
+		shard := plans[idx].shard
 		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, splitDepth, priority)
 		if err != nil {
 			return fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shard.String(), err)
@@ -104,61 +105,113 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 			var res archivePreloadResult
 			select {
 			case result := <-job.done:
-				res = archivePreloadResult{idx: job.idx, imported: result.imported, err: result.err}
+				res = archivePreloadResult{idx: job.idx, imported: result.imported, peer: result.peer, archiveID: result.archiveID, err: result.err}
 			case <-preloadCtx.Done():
 				res = archivePreloadResult{idx: job.idx, err: preloadCtx.Err()}
 			}
 			results <- res
 		}()
-		submitted++
 		inFlight++
 		return nil
 	}
 
-	imports := make([]*archiveImportResult, len(shards))
+	imports := make([]*archiveImportResult, len(plans))
 	var firstErr error
+	next := 0
 	completed := 0
-	for submitted < len(shards) && inFlight < limit {
-		if err := submit(submitted); err != nil {
-			cancel()
-			return nil, err
-		}
-	}
-
-	for completed < submitted {
-		res := <-results
-		completed++
-		inFlight--
-
-		if res.err != nil {
-			cancel()
-			if firstErr == nil || errors.Is(firstErr, context.Canceled) {
-				firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shards[res.idx].String(), res.err)
-			}
-		} else {
-			imports[res.idx] = res.imported
-		}
-
-		for firstErr == nil && submitted < len(shards) && inFlight < limit {
-			if err := submit(submitted); err != nil {
+	submitMore := func() {
+		for firstErr == nil && next < len(plans) && inFlight < limit {
+			if err := submit(next); err != nil {
 				cancel()
 				firstErr = err
-				break
+				return
 			}
+			next++
 		}
+	}
+	submitMore()
+
+	for completed < len(plans) && firstErr == nil {
+		res := <-results
+		inFlight--
+		plan := plans[res.idx]
+
+		if res.err != nil {
+			if r.denyShardArchivePeer(plan.shard, res.peer, res.archiveID, "archive_import_failed", res.err) {
+				if err := submit(res.idx); err != nil {
+					cancel()
+					firstErr = err
+				}
+				continue
+			}
+			cancel()
+			if firstErr == nil || errors.Is(firstErr, context.Canceled) {
+				firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, plan.shard.String(), res.err)
+			}
+			break
+		}
+
+		if err := validateArchiveImportCoversPlan(res.imported, plan); err != nil {
+			if r.denyShardArchivePeer(plan.shard, res.peer, res.archiveID, "archive_import_missing_block", err) {
+				if err := submit(res.idx); err != nil {
+					cancel()
+					firstErr = err
+				}
+				continue
+			}
+			cancel()
+			firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, plan.shard.String(), err)
+			break
+		}
+
+		imports[res.idx] = res.imported
+		completed++
+		submitMore()
 	}
 	wg.Wait()
 
 	if firstErr != nil {
 		return nil, firstErr
 	}
-	if completed != len(shards) {
+	if completed != len(plans) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("preload shard archive #%d: incomplete import results got=%d want=%d", masterchainSeqno, completed, len(shards))
+		return nil, fmt.Errorf("preload shard archive #%d: incomplete import results got=%d want=%d", masterchainSeqno, completed, len(plans))
 	}
 	return imports, nil
+}
+
+func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archiveShardImportPlan) error {
+	if imported == nil {
+		return fmt.Errorf("archive shard %s import returned empty result", plan.shard.String())
+	}
+
+	for _, block := range plan.needed {
+		if _, ok := imported.blocks[storage.BlockKey(block)]; !ok {
+			return fmt.Errorf("archive shard %s does not contain planned shard block %s", plan.shard.String(), storage.FormatBlockRef(block))
+		}
+	}
+	return nil
+}
+
+func (r *archiveCatchUpRunner) denyShardArchivePeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
+	if r == nil || r.service == nil || r.service.node == nil || peer == "" {
+		return false
+	}
+
+	denied := r.service.node.DenyArchivePeer(shard, peer, reason)
+	if denied {
+		r.service.log.Debug().
+			Err(err).
+			Str("peer", peer).
+			Int64("archive_id", archiveID).
+			Int32("workchain", shard.Workchain).
+			Str("shard", fmt.Sprintf("%016x", uint64(shard.Shard))).
+			Str("reason", reason).
+			Msg("rejected archive import peer")
+	}
+	return denied
 }
 
 func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
@@ -193,27 +246,6 @@ func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
 			total.LastSeqno = next.LastSeqno
 		}
 	}
-}
-
-func archivePrefixHasChangedShard(prefix archive.ShardID, nextBlocks []ton.BlockIDExt, prevBlocks map[storage.ShardKey]ton.BlockIDExt) bool {
-	return archivePrefixHasChangedShardMatching(prefix, nextBlocks, prevBlocks, nil)
-}
-
-func archivePrefixHasChangedShardMatching(prefix archive.ShardID, nextBlocks []ton.BlockIDExt, prevBlocks map[storage.ShardKey]ton.BlockIDExt, needBlock func(ton.BlockIDExt) bool) bool {
-	for _, next := range nextBlocks {
-		if next.Workchain != prefix.Workchain || !archiveShardIntersects(prefix.Shard, next.Shard) {
-			continue
-		}
-
-		prev, ok := prevBlocks[storage.ShardKeyFromBlock(next)]
-		if ok && prev.Equals(&next) {
-			continue
-		}
-		if needBlock == nil || needBlock(next) {
-			return true
-		}
-	}
-	return false
 }
 
 func archiveShardIntersects(left int64, right int64) bool {

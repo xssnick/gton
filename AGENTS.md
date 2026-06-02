@@ -67,6 +67,10 @@
 - Keep code simple and optimized.
 - Add abstractions only when they remove real duplication or represent a real boundary.
 
+- Avoid copying slices, byte payloads, structs, or metadata when the receiving code does not mutate them.
+- Prefer sharing immutable data by reference through internal flows.
+- Copy only at real ownership or mutation boundaries, such as external input that may be reused, mutable cache state that must be protected, or data that is modified before storing or returning.
+
 - Prefer straightforward Go-style code.
 - Keep the control flow linear and easy to read.
 - Avoid unnecessary indirection.

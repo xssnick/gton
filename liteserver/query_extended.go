@@ -44,9 +44,9 @@ func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 
 		return ton.BlockState{
 			ID:       cloneBlockID(*id),
-			RootHash: append([]byte(nil), id.RootHash...),
-			FileHash: append([]byte(nil), id.FileHash...),
-			Data:     append([]byte(nil), data...),
+			RootHash: id.RootHash,
+			FileHash: id.FileHash,
+			Data:     data,
 		}
 	}
 
@@ -55,7 +55,7 @@ func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 		return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*id))
 	}
 
-	data := root.ToBOCWithFlags(false)
+	data := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	fileHash := sha256.Sum256(data)
 
 	return ton.BlockState{
@@ -207,8 +207,8 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 	return ton.ConfigAll{
 		Mode:        int(effectiveMode),
 		ID:          cloneBlockID(*id),
-		StateProof:  proof[0].ToBOCWithFlags(false),
-		ConfigProof: proof[1].ToBOCWithFlags(false),
+		StateProof:  proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+		ConfigProof: proof[1].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
 }
 
@@ -227,7 +227,7 @@ func (s *Server) handlePreviousKeyBlockConfig(ctx context.Context, id ton.BlockI
 		Mode:        int(mode),
 		ID:          cloneBlockID(keyBlock),
 		StateProof:  nil,
-		ConfigProof: proof.ToBOCWithFlags(false),
+		ConfigProof: proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
 }
 
@@ -332,8 +332,8 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 		ID:         cloneBlockID(*query.ID),
 		Mode:       query.Mode,
 		Result:     entries,
-		StateProof: proof[0].ToBOCWithFlags(false),
-		DataProof:  proof[1].ToBOCWithFlags(false),
+		StateProof: proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+		DataProof:  proof[1].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
 }
 
@@ -348,7 +348,7 @@ func (s *Server) handleOneTransaction(ctx context.Context, query ton.GetOneTrans
 		return ton.LSError{Code: errCodeProtoViolation, Text: "requested account id is not contained in the shard of the specified block"}
 	}
 
-	addr := address.NewAddress(0, byte(query.AccID.Workchain), append([]byte(nil), query.AccID.ID...))
+	addr := address.NewAddress(0, byte(query.AccID.Workchain), query.AccID.ID)
 	if !tlb.ShardID(uint64(query.ID.Shard)).ContainsAddress(addr) {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "requested account id is not contained in the shard of the specified block"}
 	}
@@ -365,12 +365,12 @@ func (s *Server) handleOneTransaction(ctx context.Context, query ton.GetOneTrans
 
 	var data []byte
 	if tx != nil {
-		data = tx.ToBOCWithFlags(false)
+		data = tx.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	}
 
 	return ton.TransactionInfo{
 		ID:          cloneBlockID(*query.ID),
-		Proof:       proof.ToBOCWithFlags(false),
+		Proof:       proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 		Transaction: data,
 	}
 }
@@ -394,9 +394,9 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 		return ton.TransactionList{IDs: []*ton.BlockIDExt{}}
 	}
 
-	account := bytes.Clone(query.AccID.ID)
+	account := query.AccID.ID
 	cursorLT := uint64(query.LT)
-	cursorHash := bytes.Clone(query.TxHash)
+	cursorHash := query.TxHash
 	roots := make([]*cell.Cell, 0, limit)
 	ids := make([]*ton.BlockIDExt, 0, limit)
 
@@ -658,15 +658,8 @@ func blockContainsAccount(block ton.BlockIDExt, workchain int32, account []byte)
 		return false
 	}
 
-	addr := address.NewAddress(0, byte(workchain), bytes.Clone(account))
+	addr := address.NewAddress(0, byte(workchain), account)
 	return tlb.ShardID(uint64(block.Shard)).ContainsAddress(addr)
-}
-
-func blockMetaContainsLT(meta *storage.BlockMeta, lt uint64) bool {
-	if meta == nil {
-		return false
-	}
-	return meta.StartLT < lt && (meta.EndLT == 0 || lt < meta.EndLT)
 }
 
 func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.ListBlockTransactions) any {
@@ -764,7 +757,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 		if err != nil {
 			return errorResponse(err, "cannot create block transaction proof")
 		}
-		proof = blockProof.ToBOCWithFlags(false)
+		proof = blockProof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	}
 
 	return ton.BlockTransactionsExt{
@@ -803,8 +796,8 @@ func (s *Server) handleValidatorStats(ctx context.Context, query ton.GetValidato
 		ID:         cloneBlockID(*query.ID),
 		Count:      count,
 		Complete:   complete,
-		StateProof: proof[0].ToBOCWithFlags(false),
-		DataProof:  proof[1].ToBOCWithFlags(false),
+		StateProof: proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+		DataProof:  proof[1].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
 }
 
@@ -846,7 +839,7 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 			return errorResponse(err, "cannot create out msg queue proof")
 		}
 		proof := []*cell.Cell{blockProof, dataProof}
-		resp.Proof = cell.ToBOCWithFlags(proof, false)
+		resp.Proof = cell.ToBOCWithOptions(proof, cell.BOCSerializeOptions{WithCRC32C: false})
 	}
 	return resp
 }
@@ -943,12 +936,12 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 		startLT = math.MaxUint64
 	}
 	if mode&128 != 0 && after != nil {
-		startAccount = append([]byte(nil), after.Account...)
+		startAccount = after.Account
 		startLT = after.LT
 	}
 
 	out := make([]blockTxItem, 0, limit)
-	currentAccount := append([]byte(nil), startAccount...)
+	currentAccount := startAccount
 	allowSameAccount := true
 	fetchNext := !reverse
 	eof := false
@@ -1014,7 +1007,7 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 				}
 
 				item := blockTxItem{
-					account: append([]byte(nil), account...),
+					account: account,
 					lt:      lt,
 					hash:    txCell.Hash(),
 					cell:    txCell,
@@ -1271,7 +1264,7 @@ func msgEnvelopeMetadata(envelope *cell.Cell) (*ton.TransactionMetadata, error) 
 		Depth: int32(depth),
 		Initiator: ton.AccountID{
 			Workchain: initiator.Workchain(),
-			ID:        append([]byte(nil), initiator.Data()...),
+			ID:        initiator.Data(),
 		},
 		InitiatorLT: initiatorLT,
 	}, nil
@@ -1498,14 +1491,6 @@ func shardPrefix(shard uint64, length int) uint64 {
 	return shard >> (64 - length)
 }
 
-func libraryEntries(stateRoot *cell.Cell, hashes [][]byte, mode uint32) ([]*ton.LibraryEntry, error) {
-	libraries, err := librariesDict(stateRoot)
-	if err != nil {
-		return nil, err
-	}
-	return libraryEntriesFromDict(libraries, hashes, mode)
-}
-
 func libraryEntriesFromDict(libraries *cell.Dictionary, hashes [][]byte, mode uint32) ([]*ton.LibraryEntry, error) {
 	if libraries == nil {
 		return nil, nil
@@ -1540,9 +1525,9 @@ func libraryEntriesFromDict(libraries *cell.Dictionary, hashes [][]byte, mode ui
 
 		var data []byte
 		if mode&2 == 0 {
-			data = lib.ToBOCWithFlags(false)
+			data = lib.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 		}
-		result = append(result, &ton.LibraryEntry{Hash: append([]byte(nil), hash...), Data: data})
+		result = append(result, &ton.LibraryEntry{Hash: hash, Data: data})
 	}
 	return result, nil
 }
@@ -1757,7 +1742,7 @@ func uniqueHashes(src [][]byte, limit int) [][]byte {
 		if len(hash) != 32 {
 			continue
 		}
-		hashes = append(hashes, append([]byte(nil), hash...))
+		hashes = append(hashes, hash)
 		if len(hashes) >= limit {
 			break
 		}

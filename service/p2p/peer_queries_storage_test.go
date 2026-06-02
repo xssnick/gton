@@ -181,6 +181,182 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	}
 }
 
+func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
+	storage := newTestPeerStore()
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: storage,
+		StateFilesDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "masterchain",
+			ProtoVersionMajor: masterchainProtoVersionMajor,
+			ProtoVersionMinor: masterchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+
+	prev := testStoredMasterBlockID(70)
+	next := testStoredMasterBlockID(71)
+	blockData := []byte{0x71, 0x01}
+	proofData := []byte{0x71, 0x02}
+	if err := node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+		Block:     next,
+		BlockData: blockData,
+		Meta: &tnstore.BlockMeta{
+			ID:       next,
+			PrevRefs: []ton.BlockIDExt{prev},
+		},
+		Proofs: []tnstore.LiveBlockProofArtifact{
+			{Kind: tnstore.ServedProofBlock, Data: proofData},
+		},
+	}); err != nil {
+		t.Fatalf("publish live block: %v", err)
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: next})
+	if err != nil {
+		t.Fatalf("downloadBlockFull: %v", err)
+	}
+	full, ok := resp.(tonnodeapi.DataFull)
+	if !ok {
+		t.Fatalf("unexpected downloadBlockFull response %T", resp)
+	}
+	if !bytes.Equal(full.Block, blockData) || !bytes.Equal(full.Proof, proofData) {
+		t.Fatalf("unexpected live full block payload")
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadNextBlockFull{PrevBlock: prev})
+	if err != nil {
+		t.Fatalf("downloadNextBlockFull: %v", err)
+	}
+	nextFull, ok := resp.(tonnodeapi.DataFull)
+	if !ok || !nextFull.ID.Equals(&next) {
+		t.Fatalf("unexpected live next response %T", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextBlockDescription{PrevBlock: prev})
+	if err != nil {
+		t.Fatalf("getNextBlockDescription: %v", err)
+	}
+	desc, ok := resp.(BlockDescription)
+	if !ok || !desc.ID.Equals(&next) {
+		t.Fatalf("unexpected live next description %T", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlock{Block: next})
+	if err != nil {
+		t.Fatalf("prepareBlock: %v", err)
+	}
+	if _, ok = resp.(Prepared); !ok {
+		t.Fatalf("unexpected live prepareBlock response %T", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlockProof{Block: next, AllowPartial: false})
+	if err != nil {
+		t.Fatalf("prepareBlockProof: %v", err)
+	}
+	if _, ok = resp.(PreparedProof); !ok {
+		t.Fatalf("unexpected live prepareBlockProof response %T", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlock{Block: next})
+	if err != nil {
+		t.Fatalf("downloadBlock: %v", err)
+	}
+	rawBlock, ok := resp.(tl.Raw)
+	if !ok || !bytes.Equal(rawBlock, blockData) {
+		t.Fatalf("unexpected live block data response %T", resp)
+	}
+}
+
+func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
+	storage := newTestPeerStore()
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		PeerServingStorage: storage,
+		StateFilesDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:              "masterchain",
+			ProtoVersionMajor: masterchainProtoVersionMajor,
+			ProtoVersionMinor: masterchainProtoVersionMinor,
+		},
+		log: discardLogger(),
+	}
+
+	keyBlock := testStoredMasterBlockID(72)
+	proofData := []byte{0x72, 0x01}
+	if err := node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+		Block: keyBlock,
+		Proofs: []tnstore.LiveBlockProofArtifact{
+			{Kind: tnstore.ServedProofBlock, Data: proofData},
+			{Kind: tnstore.ServedProofKeyBlock, Data: proofData},
+		},
+	}); err != nil {
+		t.Fatalf("publish live key proof: %v", err)
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareKeyBlockProof{Block: keyBlock, AllowPartial: false})
+	if err != nil {
+		t.Fatalf("prepareKeyBlockProof full: %v", err)
+	}
+	if _, ok := resp.(PreparedProof); !ok {
+		t.Fatalf("unexpected live key proof prepare response %T", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadKeyBlockProof{Block: keyBlock})
+	if err != nil {
+		t.Fatalf("downloadKeyBlockProof: %v", err)
+	}
+	rawProof, ok := resp.(tl.Raw)
+	if !ok || !bytes.Equal(rawProof, proofData) {
+		t.Fatalf("unexpected live key proof response %T", resp)
+	}
+
+	linkOnlyBlock := testStoredMasterBlockID(73)
+	linkOnlyProof := []byte{0x73, 0x01}
+	if err := node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+		Block: linkOnlyBlock,
+		Proofs: []tnstore.LiveBlockProofArtifact{
+			{Kind: tnstore.ServedProofKeyBlockLink, Data: linkOnlyProof},
+		},
+	}); err != nil {
+		t.Fatalf("publish live key proof link: %v", err)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareKeyBlockProof{Block: linkOnlyBlock, AllowPartial: true})
+	if err != nil {
+		t.Fatalf("prepareKeyBlockProof link-only: %v", err)
+	}
+	if _, ok = resp.(PreparedProofLink); !ok {
+		t.Fatalf("unexpected live key proof link prepare response %T", resp)
+	}
+
+	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadKeyBlockProofLink{Block: linkOnlyBlock})
+	if err != nil {
+		t.Fatalf("downloadKeyBlockProofLink: %v", err)
+	}
+	rawProof, ok = resp.(tl.Raw)
+	if !ok || !bytes.Equal(rawProof, linkOnlyProof) {
+		t.Fatalf("unexpected live key proof link response %T", resp)
+	}
+}
+
 func TestDispatchPeerQueryDirectDownloadsErrorWhenMissing(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
@@ -309,13 +485,9 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("save persistent state file: %v", err)
 	}
 	archivePath, archivePtr := writePeerQueryArchivePack(t, []byte{9, 8, 7, 6})
-	if _, err = storage.SaveArchiveFile(21, -1, topShard, 0, archivePath); err != nil {
-		t.Fatalf("save archive file: %v", err)
-	}
+	registerPeerQueryArchivePack(t, storage, 21, -1, topShard, 0, archivePath)
 	shardArchivePath, _ := writePeerQueryArchivePack(t, []byte{6, 5, 4})
-	if _, err = storage.SaveArchiveFile(21, 0, topShard, 0, shardArchivePath); err != nil {
-		t.Fatalf("save shard archive file: %v", err)
-	}
+	registerPeerQueryArchivePack(t, storage, 21, 0, topShard, 1, shardArchivePath)
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareZeroState{Block: zeroBlock})
 	if err != nil {
@@ -473,9 +645,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	}
 
 	archivePath, archivePtr := writePeerQueryArchivePack(t, archiveData)
-	if _, err = storage.SaveArchiveFile(62, -1, topShard, 0, archivePath); err != nil {
-		t.Fatalf("save archive file: %v", err)
-	}
+	registerPeerQueryArchivePack(t, storage, 62, -1, topShard, 0, archivePath)
 	archiveID, err := storage.ArchiveInfo(context.Background(), 62, -1, topShard)
 	if err != nil {
 		t.Fatalf("get archive info: %v", err)
@@ -541,7 +711,15 @@ func writePeerQueryArchivePack(t *testing.T, data []byte) (string, packfile.Poin
 	if err != nil {
 		t.Fatalf("create archive pack: %v", err)
 	}
-	ptr, err := packfile.Append(file, "test", data, true)
+	appender, err := packfile.NewAppender(file)
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("create archive appender: %v", err)
+	}
+	ptr, err := appender.Append("test", data)
+	if err == nil {
+		err = file.Sync()
+	}
 	if closeErr := file.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
@@ -549,6 +727,20 @@ func writePeerQueryArchivePack(t *testing.T, data []byte) (string, packfile.Poin
 		t.Fatalf("write archive pack: %v", err)
 	}
 	return path, ptr
+}
+
+func registerPeerQueryArchivePack(t *testing.T, store *testPeerStore, masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read archive pack: %v", err)
+	}
+
+	store.mu.Lock()
+	store.archiveInfos[testArchiveInfoKey(masterchainSeqno, workchain, shard)] = archiveID
+	store.archiveFiles[archiveID] = data
+	store.mu.Unlock()
 }
 
 func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
@@ -955,7 +1147,7 @@ func testPeerBlockProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.C
 	if err != nil {
 		t.Fatalf("serialize block proof envelope: %v", err)
 	}
-	return envelope.ToBOCWithFlags(false)
+	return envelope.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 }
 
 func testPeerFullMerkleProof(t *testing.T, root *cell.Cell) *cell.Cell {

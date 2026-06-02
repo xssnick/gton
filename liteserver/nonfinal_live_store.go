@@ -18,7 +18,7 @@ var errInvalidNonfinalKind = errors.New("invalid non-final block kind")
 type liveNonfinalPending struct {
 	block ton.BlockIDExt
 	kind  storage.LiveBlockNonfinalKind
-	cells map[cell.Hash]*cell.Cell
+	cells storage.StateCellRecords
 }
 
 type liveNonfinalWaiting struct {
@@ -75,7 +75,33 @@ func (s *LiveStore) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArt
 		return false, nil
 	}
 
-	state, meta, cells, err := nonfinalStateFromUpdate(artifacts, s.nonfinalBlockCellLoader(block))
+	loader := s.nonfinalBlockCellLoader(block)
+	var state *storage.BlockState
+	var meta *storage.BlockMeta
+	var cells storage.StateCellRecords
+	var update *cell.Cell
+	var err error
+	if artifacts.State != nil {
+		state, meta, cells, err = nonfinalStateFromSnapshot(artifacts, loader)
+	} else {
+		parsed, parseErr := nonfinalParseStateUpdate(artifacts)
+		if parseErr != nil {
+			if keepWaiting {
+				s.deleteNonfinalWaiting(block)
+			}
+			return false, parseErr
+		}
+		artifacts.Root = parsed.root
+		meta = parsed.meta
+		update = parsed.update
+		artifacts.Meta = storage.MergeBlockMeta(meta, artifacts.Meta)
+		if s.nonfinalTooFarAheadOfCurrentMaster(artifacts.Meta) {
+			s.deleteNonfinalWaiting(block)
+			return false, nil
+		}
+
+		state, cells, err = nonfinalStateFromParsedUpdate(artifacts, parsed, loader)
+	}
 	if err != nil {
 		if keepWaiting {
 			s.deleteNonfinalWaiting(block)
@@ -94,6 +120,9 @@ func (s *LiveStore) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArt
 		s.deleteNonfinalWaiting(block)
 		return false, nil
 	}
+	artifacts.BlockData = nil
+	artifacts.Proofs = nil
+	artifacts.Meta = nonfinalStateOnlyMeta(artifacts.Meta)
 
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
 	if err != nil {
@@ -118,6 +147,24 @@ func (s *LiveStore) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArt
 		s.mu.Unlock()
 		return false, nil
 	}
+	if update != nil {
+		previous, ok := s.nonfinalPreviousStatesLocked(prepared.meta)
+		if !ok {
+			if keepWaiting {
+				s.rememberNonfinalWaitingLocked(original, kind)
+				s.trimNonfinalWaitingLocked()
+			}
+			s.mu.Unlock()
+			return false, nil
+		}
+		if err = nonfinalStateUpdateApplies(previous, update); err != nil {
+			if keepWaiting {
+				s.deleteNonfinalWaitingLocked(key)
+			}
+			s.mu.Unlock()
+			return false, err
+		}
+	}
 
 	s.deleteNonfinalWaitingLocked(key)
 	pending := s.nonFinalPending[key]
@@ -127,6 +174,7 @@ func (s *LiveStore) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArt
 	s.putNonfinalPendingLocked(key, pending)
 
 	published, ready := s.publishLiveBlockArtifactsPreparedLocked(prepared)
+	s.removeNonfinalLookupIndexesLocked(block)
 	s.trimNonfinalPendingLocked()
 	if published || ready {
 		close(s.notify)
@@ -163,6 +211,24 @@ func validNonfinalKind(kind storage.LiveBlockNonfinalKind) bool {
 	return kind != 0 && kind&^allowed == 0
 }
 
+func nonfinalStateOnlyMeta(meta *storage.BlockMeta) *storage.BlockMeta {
+	cloned := meta.Clone()
+	if cloned == nil {
+		return nil
+	}
+
+	const servedArtifactFlags = storage.BlockMetaHasServedFull |
+		storage.BlockMetaServedFullIsLink |
+		storage.BlockMetaHasBlockData |
+		storage.BlockMetaHasProofBlock |
+		storage.BlockMetaHasProofBlockLink |
+		storage.BlockMetaHasProofKeyBlock |
+		storage.BlockMetaHasProofKeyBlockLink
+
+	cloned.Flags &^= servedArtifactFlags
+	return cloned
+}
+
 func (s *LiveStore) nonfinalTooFarAheadOfCurrentMaster(meta *storage.BlockMeta) bool {
 	if meta == nil || meta.GenUTime == 0 {
 		return false
@@ -192,28 +258,28 @@ func (s *LiveStore) currentMasterUTimeLocked() uint32 {
 }
 
 func (s *LiveStore) nonfinalBlockCellLoader(block ton.BlockIDExt) cell.LazyCellLoader {
-	return func(hash cell.Hash) (*cell.Cell, error) {
-		return s.loadNonfinalCell(block, hash)
+	var loader cell.LazyCellLoader
+	loader = func(hash cell.Hash) (*cell.Cell, error) {
+		return s.loadNonfinalCell(block, hash, loader)
 	}
+	return loader
 }
 
-func (s *LiveStore) loadNonfinalCell(block ton.BlockIDExt, hash cell.Hash) (*cell.Cell, error) {
+func (s *LiveStore) loadNonfinalCell(block ton.BlockIDExt, hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, error) {
 	s.mu.RLock()
-	cached := s.nonfinalCellLocked(block, hash)
+	cached := s.nonfinalCellDataLocked(block, hash)
+	base := s.nonFinalCellLoader
 	s.mu.RUnlock()
-	if cached != nil {
-		if cached.RefsNum() == 0 {
-			return cached, nil
-		}
-		return nonfinalLazyCell(cached, s.nonfinalBlockCellLoader(block))
+	if len(cached) > 0 {
+		return nonfinalLazyCellRecord(hash, cached, loader)
 	}
-	if s.nonFinalCellLoader == nil {
+	if base == nil {
 		return nil, cell.ErrLazyRefNotFound
 	}
-	return s.nonFinalCellLoader(hash)
+	return base(hash)
 }
 
-func (s *LiveStore) nonfinalCellLocked(block ton.BlockIDExt, hash cell.Hash) *cell.Cell {
+func (s *LiveStore) nonfinalCellDataLocked(block ton.BlockIDExt, hash cell.Hash) []byte {
 	idx := s.nonfinalOrderIndexLocked(storage.BlockKey(block))
 	if idx < 0 {
 		return nil
@@ -221,8 +287,8 @@ func (s *LiveStore) nonfinalCellLocked(block ton.BlockIDExt, hash cell.Hash) *ce
 
 	for i := idx; i >= 0; i-- {
 		pending := s.nonFinalPending[s.nonFinalOrder[i]]
-		if root := pending.cells[hash]; root != nil {
-			return root
+		if data := pending.cells.Data(hash); len(data) > 0 {
+			return data
 		}
 	}
 	return nil
@@ -245,28 +311,47 @@ func (s *LiveStore) nonfinalOrderIndexLocked(key storage.BlockRootHash) int {
 }
 
 func (s *LiveStore) nonfinalPrevRefsReadyLocked(meta *storage.BlockMeta) bool {
-	if meta == nil || len(meta.PrevRefs) == 0 {
-		return false
-	}
-
-	for _, prev := range meta.PrevRefs {
-		if !s.nonfinalBlockStateReadyLocked(prev) {
-			return false
-		}
-	}
-	return true
+	_, ok := s.nonfinalPreviousStatesLocked(meta)
+	return ok
 }
 
-func (s *LiveStore) nonfinalBlockStateReadyLocked(block ton.BlockIDExt) bool {
-	if currentRefersToBlock(s.current, block) || currentRefersToBlock(s.pendingCurrent, block) {
-		return true
+func (s *LiveStore) nonfinalPreviousStatesLocked(meta *storage.BlockMeta) ([]*storage.BlockState, bool) {
+	if meta == nil || len(meta.PrevRefs) == 0 {
+		return nil, false
 	}
+
+	previous := make([]*storage.BlockState, 0, len(meta.PrevRefs))
+	for _, prev := range meta.PrevRefs {
+		state := s.nonfinalBlockStateLocked(prev)
+		if state == nil || state.Cell == nil {
+			return nil, false
+		}
+		previous = append(previous, state)
+	}
+	return previous, true
+}
+
+func (s *LiveStore) nonfinalBlockStateLocked(block ton.BlockIDExt) *storage.BlockState {
 	key, ok := liveBlockLookupKeyFromBlock(block)
-	if !ok {
-		return false
+	if ok {
+		if state, exists := s.states[key]; exists && blockIDEqual(state.Block, block) {
+			return storage.CloneBlockState(&state)
+		}
 	}
-	state, ok := s.states[key]
-	return ok && blockIDEqual(state.Block, block)
+	if state := blockStateFromCurrent(s.pendingCurrent, block); state != nil {
+		return state
+	}
+	return blockStateFromCurrent(s.current, block)
+}
+
+func (s *LiveStore) removeNonfinalLookupIndexesLocked(block ton.BlockIDExt) {
+	seqKey := liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}
+	if indexed, ok := s.seqIndex[seqKey]; ok && blockIDEqual(indexed, block) {
+		delete(s.seqIndex, seqKey)
+	}
+	if meta := s.metas[storage.BlockKey(block)]; meta != nil {
+		s.removeMetaHistoryIndexLocked(meta)
+	}
 }
 
 func (s *LiveStore) rememberNonfinalWaitingLocked(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) {
@@ -317,10 +402,7 @@ func (s *LiveStore) nonfinalWaitingSnapshot() []liveNonfinalWaitingSnapshot {
 	s.mu.RLock()
 	out := make([]liveNonfinalWaitingSnapshot, 0, len(s.nonFinalWaiting))
 	for _, waiting := range s.nonFinalWaiting {
-		out = append(out, liveNonfinalWaitingSnapshot{
-			artifacts: waiting.artifacts,
-			kind:      waiting.kind,
-		})
+		out = append(out, liveNonfinalWaitingSnapshot(waiting))
 	}
 	s.mu.RUnlock()
 

@@ -33,6 +33,8 @@ type archiveWindowPipelineSnapshot struct {
 	downloadPrefetchQueued int
 	prepareHotQueued       int
 	preparePrefetchQueued  int
+	downloadedBytes        uint64
+	downloadedBytesLimit   uint64
 }
 
 type archiveImportQueueSnapshot struct {
@@ -42,6 +44,8 @@ type archiveImportQueueSnapshot struct {
 	downloadPrefetchQueued int
 	prepareHotQueued       int
 	preparePrefetchQueued  int
+	downloadedBytes        uint64
+	downloadedBytesLimit   uint64
 }
 
 type archiveCatchUpProgressStats struct {
@@ -72,11 +76,6 @@ type archiveCatchUpProgressStats struct {
 type archiveCatchUpStageTiming struct {
 	name    string
 	elapsed time.Duration
-}
-
-type archiveImportLinkKey struct {
-	prev storage.BlockRootHash
-	next storage.BlockRootHash
 }
 
 func (s archiveCatchUpProgressStats) since(previous archiveCatchUpProgressStats) archiveCatchUpProgressStats {
@@ -212,6 +211,8 @@ func (p *archiveWindowPipelineProgress) snapshot() archiveWindowPipelineSnapshot
 		snapshot.downloadPrefetchQueued = queueSnapshot.downloadPrefetchQueued
 		snapshot.prepareHotQueued = queueSnapshot.prepareHotQueued
 		snapshot.preparePrefetchQueued = queueSnapshot.preparePrefetchQueued
+		snapshot.downloadedBytes = queueSnapshot.downloadedBytes
+		snapshot.downloadedBytesLimit = queueSnapshot.downloadedBytesLimit
 	}
 	return snapshot
 }
@@ -221,6 +222,9 @@ func (s archiveWindowPipelineSnapshot) activeString() string {
 }
 
 func (s archiveWindowPipelineSnapshot) queueString() string {
+	if s.downloadedBytesLimit > 0 {
+		return fmt.Sprintf("download(h/p)=%d/%d prepare(h/p)=%d/%d downloaded_bytes=%d/%d", s.downloadHotQueued, s.downloadPrefetchQueued, s.prepareHotQueued, s.preparePrefetchQueued, s.downloadedBytes, s.downloadedBytesLimit)
+	}
 	return fmt.Sprintf("download(h/p)=%d/%d prepare(h/p)=%d/%d", s.downloadHotQueued, s.downloadPrefetchQueued, s.prepareHotQueued, s.preparePrefetchQueued)
 }
 
@@ -309,79 +313,6 @@ func (w *shardClientArchiveWindow) releaseImportedData() {
 	w.archiveImports = nil
 	w.stateCells = nil
 	w.appliedStates = appliedStateSet{}
-}
-
-func (r *archiveCatchUpRunner) storeArchiveWindow(window *shardClientArchiveWindow) error {
-	if window == nil || len(window.archiveImports) == 0 {
-		return nil
-	}
-
-	stored := storage.ServedArchiveImport{}
-	seenFull := map[storage.BlockRootHash]struct{}{}
-	seenLink := map[archiveImportLinkKey]struct{}{}
-	for _, imported := range window.archiveImports {
-		if imported == nil {
-			continue
-		}
-		appendArchiveImport(&stored, &imported.stored, seenFull, seenLink)
-	}
-	if len(stored.FullBlocks) == 0 && len(stored.BlockData) == 0 && len(stored.Proofs) == 0 && len(stored.Links) == 0 {
-		return nil
-	}
-
-	started := time.Now()
-	if err := r.service.storage.SaveArchiveImport(&stored); err != nil {
-		return fmt.Errorf("store archive blocks: %w", err)
-	}
-	r.service.log.Debug().
-		Int("full_blocks", len(stored.FullBlocks)).
-		Int("block_data", len(stored.BlockData)).
-		Int("proofs", len(stored.Proofs)).
-		Int("links", len(stored.Links)).
-		Dur("elapsed", time.Since(started)).
-		Msg("stored archive block refs")
-	return nil
-}
-
-func appendArchiveImport(dst *storage.ServedArchiveImport, src *storage.ServedArchiveImport, seenFull map[storage.BlockRootHash]struct{}, seenLink map[archiveImportLinkKey]struct{}) {
-	if dst == nil || src == nil {
-		return
-	}
-
-	for _, full := range src.FullBlocks {
-		if full == nil {
-			continue
-		}
-		key := storage.BlockKey(full.ID)
-		if _, exists := seenFull[key]; exists {
-			continue
-		}
-		seenFull[key] = struct{}{}
-		cloned := *full
-		cloned.ProofRef = full.ProofRef.Clone()
-		cloned.BlockRef = full.BlockRef.Clone()
-		cloned.Meta = full.Meta.Clone()
-		dst.FullBlocks = append(dst.FullBlocks, &cloned)
-	}
-
-	for _, block := range src.BlockData {
-		dst.BlockData = append(dst.BlockData, cloneServedBlockData(block))
-	}
-
-	for _, proof := range src.Proofs {
-		dst.Proofs = append(dst.Proofs, cloneServedBlockProof(proof))
-	}
-
-	for _, link := range src.Links {
-		prevKey := storage.BlockKey(link.Prev)
-		nextKey := storage.BlockKey(link.Next)
-		linkKey := archiveImportLinkKey{prev: prevKey, next: nextKey}
-		if _, exists := seenLink[linkKey]; exists {
-			continue
-		}
-		seenLink[linkKey] = struct{}{}
-		dst.Links = append(dst.Links, link)
-	}
 }
 
 func (r *archiveCatchUpRunner) recordArchiveCheckpointProgress(checkpointBlocks uint32, elapsed time.Duration) {

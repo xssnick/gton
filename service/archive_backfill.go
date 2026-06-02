@@ -32,6 +32,8 @@ var (
 type archiveBackfillStore interface {
 	ActiveCellGeneration(ctx context.Context) (storage.CellGenerationInfo, error)
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
+	LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error)
+	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	ArchiveBackfillProgress(ctx context.Context) (storage.ArchiveBackfillProgress, error)
 	SaveArchiveBackfillProgress(ctx context.Context, progress storage.ArchiveBackfillProgress) error
 	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error)
@@ -61,11 +63,31 @@ type archiveBackfillRunner struct {
 }
 
 type archiveBackfillMasterWindow struct {
-	imported     *archiveImportResult
-	blocks       []PreparedBlock
-	shardTargets []ton.BlockIDExt
-	floorSeq     uint32
-	floorTime    uint32
+	imported  *archiveImportResult
+	loaded    *archive.Imported
+	stored    storage.ServedArchiveImport
+	floorSeq  uint32
+	floorTime uint32
+}
+
+type archiveBackfillStoredMasterWindow struct {
+	shardTargets    []ton.BlockIDExt
+	shardMasterRefs map[storage.BlockRootHash]ton.BlockIDExt
+	shardPlans      []archiveShardImportPlan
+	splitDepth      uint32
+	floorSeq        uint32
+	floorTime       uint32
+}
+
+type archiveBackfillStoredMasterBlock struct {
+	ID     ton.BlockIDExt
+	Meta   *storage.BlockMeta
+	Shards []ton.BlockIDExt
+}
+
+type archiveBackfillShardTargetRef struct {
+	target ton.BlockIDExt
+	master ton.BlockIDExt
 }
 
 func (s *Service) runArchiveBackfillOnce(ctx context.Context) (bool, error) {
@@ -308,16 +330,35 @@ func (r *archiveBackfillRunner) runWindow(ctx context.Context) (bool, error) {
 	}
 
 	r.setStage("saving master archive metadata", 0, 0)
-	if err = r.service.storage.SaveArchiveImport(&masterWindow.imported.stored); err != nil {
+	if err = r.service.storage.SaveArchiveImport(&masterWindow.stored); err != nil {
 		return false, fmt.Errorf("save archive backfill master window: %w", err)
 	}
+	masterWindow.stored = storage.ServedArchiveImport{}
 
-	if err = r.downloadShardWindows(ctx, windowEnd, masterWindow); err != nil {
+	storedWindow, err := r.loadStoredMasterWindow(ctx, windowEnd, masterWindow.floorSeq)
+	if err != nil {
+		return false, err
+	}
+	if storedWindow.floorSeq != masterWindow.floorSeq || storedWindow.floorTime != masterWindow.floorTime {
+		return false, fmt.Errorf("archive backfill stored master window floor mismatch: stored=(%d,%d) imported=(%d,%d)",
+			storedWindow.floorSeq, storedWindow.floorTime, masterWindow.floorSeq, masterWindow.floorTime)
+	}
+
+	if archiveBackfillImportHasShardBlocks(masterWindow.imported) {
+		if err = r.saveMasterArchiveShardBlocks(masterWindow, storedWindow); err != nil {
+			return false, err
+		}
+		storedWindow.shardPlans = nil
+	}
+	masterWindow.imported = nil
+	masterWindow.loaded = nil
+
+	if err = r.downloadShardWindows(ctx, windowEnd, storedWindow); err != nil {
 		return false, err
 	}
 
-	r.progress.VerifiedFloorSeqno = masterWindow.floorSeq
-	r.progress.VerifiedFloorUTime = masterWindow.floorTime
+	r.progress.VerifiedFloorSeqno = storedWindow.floorSeq
+	r.progress.VerifiedFloorUTime = storedWindow.floorTime
 	r.progress.GCCutoffUnix = r.retention.gcCutoff
 	r.progress.TargetUnix = r.retention.target
 	r.progress.UpdatedAtUnix = uint64(time.Now().Unix())
@@ -339,11 +380,15 @@ func (r *archiveBackfillRunner) runWindow(ctx context.Context) (bool, error) {
 }
 
 func (r *archiveBackfillRunner) downloadMasterWindow(ctx context.Context, windowEnd uint32) (archiveBackfillMasterWindow, error) {
-	downloaded, err := r.service.node.DownloadArchive(ctx, windowEnd, archive.ShardID{Workchain: -1, Shard: topShard}, "")
+	downloaded, err := r.service.node.DownloadArchive(ctx, windowEnd, archive.ShardID{Workchain: -1, Shard: topShard})
 	if err != nil {
 		return archiveBackfillMasterWindow{}, fmt.Errorf("download archive backfill master window #%d: %w", windowEnd, err)
 	}
-	imported, err := r.service.importArchiveBlocks(ctx, downloaded, r.splitDepth)
+	loaded, err := loadDownloadedArchive(ctx, downloaded)
+	if err != nil {
+		return archiveBackfillMasterWindow{}, fmt.Errorf("import archive backfill master window #%d: %w", windowEnd, err)
+	}
+	imported, err := r.service.prepareImportedArchiveBlocks(loaded, r.splitDepth)
 	if err != nil {
 		return archiveBackfillMasterWindow{}, fmt.Errorf("import archive backfill master window #%d: %w", windowEnd, err)
 	}
@@ -355,19 +400,18 @@ func (r *archiveBackfillRunner) downloadMasterWindow(ctx context.Context, window
 	if err = r.validateMasterWindow(blocks, windowEnd); err != nil {
 		return archiveBackfillMasterWindow{}, err
 	}
-
-	shardTargets, err := archiveBackfillChangedShardTargets(blocks)
+	stored, err := servedArchiveImportFromImported(loaded, r.splitDepth, nil, archiveBackfillIncludeBlocks(blocks))
 	if err != nil {
-		return archiveBackfillMasterWindow{}, err
+		return archiveBackfillMasterWindow{}, fmt.Errorf("prepare archive backfill master window storage #%d: %w", windowEnd, err)
 	}
 
 	floor := blocks[len(blocks)-1]
 	return archiveBackfillMasterWindow{
-		imported:     imported,
-		blocks:       blocks,
-		shardTargets: shardTargets,
-		floorSeq:     floor.ID.SeqNo,
-		floorTime:    floor.Meta.GenUTime,
+		imported:  imported,
+		loaded:    loaded,
+		stored:    stored,
+		floorSeq:  floor.ID.SeqNo,
+		floorTime: floor.Meta.GenUTime,
 	}, nil
 }
 
@@ -453,29 +497,266 @@ func (r *archiveBackfillRunner) validateMasterWindow(blocks []PreparedBlock, win
 	return nil
 }
 
-func archiveBackfillChangedShardTargets(blocks []PreparedBlock) ([]ton.BlockIDExt, error) {
-	changed := make(map[storage.BlockRootHash]ton.BlockIDExt)
-	var previous map[storage.ShardKey]ton.BlockIDExt
-	for i := len(blocks) - 1; i >= 0; i-- {
-		block := blocks[i]
-		parsed, err := parsePreparedBlock(block)
-		if err != nil {
-			return nil, err
+func archiveBackfillIncludeBlocks(blocks []PreparedBlock) map[storage.BlockRootHash]bool {
+	include := make(map[storage.BlockRootHash]bool, len(blocks))
+	for _, block := range blocks {
+		include[storage.BlockKey(block.ID)] = true
+	}
+	return include
+}
+
+func archiveBackfillImportHasShardBlocks(imported *archiveImportResult) bool {
+	if imported == nil {
+		return false
+	}
+	for _, block := range imported.blocks {
+		if block.ID.Workchain != -1 || block.ID.Shard != topShard {
+			return true
 		}
-		shards, err := state2.ShardBlocksFromMasterBlock(block.ID, parsed)
+	}
+	return false
+}
+
+func (r *archiveBackfillRunner) downloadShardWindows(ctx context.Context, windowEnd uint32, masterWindow archiveBackfillStoredMasterWindow) error {
+	if len(masterWindow.shardPlans) == 0 {
+		r.setStage("validating shard archive coverage", 0, 0)
+		return r.validateShardCoverage(ctx, masterWindow.shardTargets)
+	}
+
+	r.setStage("downloading shard archives", 0, len(masterWindow.shardPlans))
+	for idx, plan := range masterWindow.shardPlans {
+		r.setStage("downloading shard archives", idx, len(masterWindow.shardPlans))
+		shard := plan.shard
+		downloaded, err := r.service.node.DownloadArchive(ctx, windowEnd, shard)
+		if errors.Is(err, archive.ErrNotAvailable) {
+			r.service.log.Debug().
+				Uint32("masterchain_seqno", windowEnd).
+				Int32("workchain", shard.Workchain).
+				Str("shard", fmt.Sprintf("%016x", uint64(shard.Shard))).
+				Msg("archive backfill shard archive is not available")
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("download archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
+		}
+
+		loaded, err := loadDownloadedArchive(ctx, downloaded)
+		if err != nil {
+			return fmt.Errorf("import archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
+		}
+		imported, err := r.service.prepareImportedArchiveBlocks(loaded, plan.splitDepth)
+		if err != nil {
+			return fmt.Errorf("import archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
+		}
+		if err = validateArchiveImportCoversPlan(imported, plan); err != nil {
+			return err
+		}
+		shardRefs, includeBlocks, err := archiveBackfillShardImportMasterRefs(imported.blocks, plan.needed, masterWindow.shardMasterRefs)
+		if err != nil {
+			return err
+		}
+		if err = validateArchiveBackfillShardImport(imported, includeBlocks); err != nil {
+			return err
+		}
+		stored, err := servedArchiveImportFromImported(loaded, plan.splitDepth, shardRefs, includeBlocks)
+		if err != nil {
+			return err
+		}
+		if err = r.service.storage.SaveArchiveImport(&stored); err != nil {
+			return fmt.Errorf("save archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
+		}
+		r.setStage("downloading shard archives", idx+1, len(masterWindow.shardPlans))
+	}
+
+	r.setStage("validating shard archive coverage", len(masterWindow.shardPlans), len(masterWindow.shardPlans))
+	return r.validateShardCoverage(ctx, masterWindow.shardTargets)
+}
+
+func (r *archiveBackfillRunner) saveMasterArchiveShardBlocks(masterWindow archiveBackfillMasterWindow, storedWindow archiveBackfillStoredMasterWindow) error {
+	if len(storedWindow.shardPlans) == 0 {
+		return nil
+	}
+
+	r.setStage("saving shard blocks from master archive", 0, 1)
+	stored, err := archiveBackfillShardImportFromCommonMasterArchive(masterWindow.loaded, masterWindow.imported, storedWindow.splitDepth, storedWindow.shardPlans, storedWindow.shardMasterRefs)
+	if err != nil {
+		return err
+	}
+	if err = r.service.storage.SaveArchiveImport(&stored); err != nil {
+		return fmt.Errorf("save archive backfill shard blocks from master archive: %w", err)
+	}
+	r.setStage("saving shard blocks from master archive", 1, 1)
+	return nil
+}
+
+func archiveBackfillShardImportFromCommonMasterArchive(loaded *archive.Imported, imported *archiveImportResult, splitDepth uint32, plans []archiveShardImportPlan, masterRefs map[storage.BlockRootHash]ton.BlockIDExt) (storage.ServedArchiveImport, error) {
+	targets := archiveBackfillShardPlanTargets(plans)
+	if len(targets) == 0 {
+		return storage.ServedArchiveImport{}, nil
+	}
+	for _, plan := range plans {
+		if err := validateArchiveImportCoversPlan(imported, plan); err != nil {
+			return storage.ServedArchiveImport{}, fmt.Errorf("archive backfill common master archive: %w", err)
+		}
+	}
+
+	shardRefs, includeBlocks, err := archiveBackfillShardImportMasterRefs(imported.blocks, targets, masterRefs)
+	if err != nil {
+		return storage.ServedArchiveImport{}, err
+	}
+	if err = validateArchiveBackfillShardImport(imported, includeBlocks); err != nil {
+		return storage.ServedArchiveImport{}, err
+	}
+	return servedArchiveImportFromImported(loaded, splitDepth, shardRefs, includeBlocks)
+}
+
+func archiveBackfillShardPlanTargets(plans []archiveShardImportPlan) []ton.BlockIDExt {
+	var total int
+	for _, plan := range plans {
+		total += len(plan.needed)
+	}
+	targets := make([]ton.BlockIDExt, 0, total)
+	for _, plan := range plans {
+		targets = append(targets, plan.needed...)
+	}
+	return targets
+}
+
+func (r *archiveBackfillRunner) loadStoredMasterWindow(ctx context.Context, windowEnd uint32, floorSeq uint32) (archiveBackfillStoredMasterWindow, error) {
+	blocks, err := r.loadStoredMasterWindowBlocks(ctx, windowEnd, floorSeq)
+	if err != nil {
+		return archiveBackfillStoredMasterWindow{}, err
+	}
+	if err = r.validateStoredMasterWindow(blocks, windowEnd); err != nil {
+		return archiveBackfillStoredMasterWindow{}, err
+	}
+
+	shardTargets, shardMasterRefs, err := archiveBackfillStoredShardTargets(blocks)
+	if err != nil {
+		return archiveBackfillStoredMasterWindow{}, err
+	}
+	splitDepth, err := archiveBackfillStoredWindowSplitDepth(r.splitDepth, blocks)
+	if err != nil {
+		return archiveBackfillStoredMasterWindow{}, err
+	}
+	shardPlans, err := r.missingArchiveBackfillShardPlans(ctx, splitDepth, shardTargets)
+	if err != nil {
+		return archiveBackfillStoredMasterWindow{}, err
+	}
+
+	floor := blocks[len(blocks)-1]
+	return archiveBackfillStoredMasterWindow{
+		shardTargets:    shardTargets,
+		shardMasterRefs: shardMasterRefs,
+		shardPlans:      shardPlans,
+		splitDepth:      splitDepth,
+		floorSeq:        floor.ID.SeqNo,
+		floorTime:       floor.Meta.GenUTime,
+	}, nil
+}
+
+func (r *archiveBackfillRunner) loadStoredMasterWindowBlocks(ctx context.Context, windowEnd uint32, floorSeq uint32) ([]archiveBackfillStoredMasterBlock, error) {
+	if floorSeq > windowEnd {
+		return nil, fmt.Errorf("archive backfill stored master window floor %d is above top %d", floorSeq, windowEnd)
+	}
+
+	key := storage.BlockHistoryKey{Workchain: -1, Shard: topShard}
+	blocks := make([]archiveBackfillStoredMasterBlock, 0, 128)
+	for seqno := windowEnd; ; seqno-- {
+		id, err := r.store.LookupBlockBySeqNo(ctx, key, seqno)
+		if err != nil {
+			return nil, fmt.Errorf("load archive backfill stored master block #%d: %w", seqno, err)
+		}
+		if id.Workchain != -1 || id.Shard != topShard {
+			return nil, fmt.Errorf("archive backfill master seqno index #%d points to %s", seqno, storage.FormatBlockRef(id))
+		}
+
+		meta, err := r.store.BlockMeta(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("load archive backfill stored master meta %s: %w", storage.FormatBlockRef(id), err)
+		}
+		if meta.GenUTime == 0 {
+			return nil, fmt.Errorf("archive backfill stored master block %s has no gen utime", storage.FormatBlockRef(id))
+		}
+
+		data, err := r.store.BlockData(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("load archive backfill stored master block data %s: %w", storage.FormatBlockRef(id), err)
+		}
+		root, err := cell.FromBOC(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse archive backfill stored master block data %s: %w", storage.FormatBlockRef(id), err)
+		}
+		parsed, err := storage.ParseVerifiedBlockCell(id, root)
+		if err != nil {
+			return nil, fmt.Errorf("parse archive backfill stored master block %s: %w", storage.FormatBlockRef(id), err)
+		}
+		shards, err := state2.ShardBlocksFromMasterBlock(id, parsed)
 		if err != nil {
 			return nil, err
 		}
 
-		current := make(map[storage.ShardKey]ton.BlockIDExt, len(shards))
-		for _, shard := range shards {
-			current[storage.ShardKeyFromBlock(shard)] = shard
+		blocks = append(blocks, archiveBackfillStoredMasterBlock{
+			ID:     id,
+			Meta:   meta,
+			Shards: shards,
+		})
+		if seqno == floorSeq {
+			break
+		}
+	}
+	return blocks, nil
+}
+
+func (r *archiveBackfillRunner) validateStoredMasterWindow(blocks []archiveBackfillStoredMasterBlock, windowEnd uint32) error {
+	if len(blocks) == 0 {
+		return fmt.Errorf("archive backfill stored master window #%d is empty", windowEnd)
+	}
+	if blocks[0].ID.SeqNo != windowEnd {
+		return fmt.Errorf("archive backfill stored master window has gap at top: got=%d want=%d", blocks[0].ID.SeqNo, windowEnd)
+	}
+
+	var child *archiveBackfillStoredMasterBlock
+	for i := range blocks {
+		block := &blocks[i]
+		old, err := blockproof.OldMasterBlockIDFromState(r.stateRoot, block.ID.SeqNo)
+		if err != nil {
+			return fmt.Errorf("validate archive backfill stored old master reference %s: %w", storage.FormatBlockRef(block.ID), err)
+		}
+		if !old.Equals(&block.ID) {
+			return fmt.Errorf("archive backfill stored old master reference mismatch: state=%s archive=%s", storage.FormatBlockRef(old), storage.FormatBlockRef(block.ID))
+		}
+		if child != nil {
+			if len(child.Meta.PrevRefs) != 1 || !child.Meta.PrevRefs[0].Equals(&block.ID) {
+				return fmt.Errorf("archive backfill stored master chain gap: child=%s expected_prev=%s", storage.FormatBlockRef(child.ID), storage.FormatBlockRef(block.ID))
+			}
+		}
+		child = block
+	}
+	return nil
+}
+
+func archiveBackfillStoredShardTargets(blocks []archiveBackfillStoredMasterBlock) ([]ton.BlockIDExt, map[storage.BlockRootHash]ton.BlockIDExt, error) {
+	changed := make(map[storage.BlockRootHash]ton.BlockIDExt)
+	masterRefs := make(map[storage.BlockRootHash]ton.BlockIDExt)
+	var previous map[storage.ShardKey]ton.BlockIDExt
+	for i := len(blocks) - 1; i >= 0; i-- {
+		block := blocks[i]
+		current := make(map[storage.ShardKey]ton.BlockIDExt, len(block.Shards))
+		for _, shard := range block.Shards {
+			key := storage.BlockKey(shard)
+			if _, ok := masterRefs[key]; !ok {
+				masterRefs[key] = block.ID
+			}
+
+			shardKey := storage.ShardKeyFromBlock(shard)
+			current[shardKey] = shard
 			if previous == nil || shard.SeqNo == 0 {
 				continue
 			}
-			old, ok := previous[storage.ShardKeyFromBlock(shard)]
+			old, ok := previous[shardKey]
 			if !ok || !old.Equals(&shard) {
-				changed[storage.BlockKey(shard)] = shard
+				changed[key] = shard
 			}
 		}
 		previous = current
@@ -494,59 +775,194 @@ func archiveBackfillChangedShardTargets(blocks []PreparedBlock) ([]ton.BlockIDEx
 		}
 		return targets[i].SeqNo < targets[j].SeqNo
 	})
-	return targets, nil
+	return targets, masterRefs, nil
 }
 
-func (r *archiveBackfillRunner) downloadShardWindows(ctx context.Context, windowEnd uint32, masterWindow archiveBackfillMasterWindow) error {
-	if masterWindow.imported.stats.ContainsShardBlocks {
-		r.setStage("validating shard archive coverage", 0, 0)
-		return r.validateShardCoverage(ctx, masterWindow.shardTargets)
+func archiveBackfillStoredWindowSplitDepth(base uint32, blocks []archiveBackfillStoredMasterBlock) (uint32, error) {
+	if base > maxArchiveMonitorSplitDepth {
+		return 0, fmt.Errorf("archive backfill split depth %d exceeds supported archive prefix fanout %d", base, maxArchiveMonitorSplitDepth)
 	}
 
-	shards := archiveBackfillShardPrefixes(r.splitDepth)
-	r.setStage("downloading shard archives", 0, len(shards))
-	for idx, shard := range shards {
-		r.setStage("downloading shard archives", idx, len(shards))
-		downloaded, err := r.service.node.DownloadArchive(ctx, windowEnd, shard, "")
-		if errors.Is(err, archive.ErrNotAvailable) {
-			r.service.log.Debug().
-				Uint32("masterchain_seqno", windowEnd).
-				Int32("workchain", shard.Workchain).
-				Str("shard", fmt.Sprintf("%016x", uint64(shard.Shard))).
-				Msg("archive backfill shard archive is not available")
+	splitDepth := base
+	for _, block := range blocks {
+		for _, shard := range block.Shards {
+			if shard.Workchain != 0 {
+				continue
+			}
+
+			depth := uint32(archiveShardPrefixLength(shard.Shard))
+			if depth > splitDepth {
+				splitDepth = depth
+			}
+		}
+	}
+	if splitDepth > maxArchiveMonitorSplitDepth {
+		return 0, fmt.Errorf("archive backfill stored shard split depth %d exceeds supported archive prefix fanout %d", splitDepth, maxArchiveMonitorSplitDepth)
+	}
+	return splitDepth, nil
+}
+
+func (r *archiveBackfillRunner) missingArchiveBackfillShardPlans(ctx context.Context, splitDepth uint32, targets []ton.BlockIDExt) ([]archiveShardImportPlan, error) {
+	plansByShard := make(map[archive.ShardID]*archiveShardImportPlan)
+	for _, target := range targets {
+		stored, err := r.archiveBackfillShardTargetStored(ctx, target)
+		if err != nil {
+			return nil, err
+		}
+		if stored {
 			continue
 		}
-		if err != nil {
-			return fmt.Errorf("download archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
-		}
 
-		imported, err := r.service.importArchiveBlocks(ctx, downloaded, r.splitDepth)
+		shard, err := archiveBackfillShardPrefixForBlock(splitDepth, target)
 		if err != nil {
-			return fmt.Errorf("import archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
+			return nil, err
 		}
-		if err = validateArchiveBackfillShardImport(imported, shard); err != nil {
-			return err
+		plan := plansByShard[shard]
+		if plan == nil {
+			plan = &archiveShardImportPlan{shard: shard, splitDepth: splitDepth}
+			plansByShard[shard] = plan
 		}
-		if err = r.service.storage.SaveArchiveImport(&imported.stored); err != nil {
-			return fmt.Errorf("save archive backfill shard window #%d %s: %w", windowEnd, shard.String(), err)
-		}
-		r.setStage("downloading shard archives", idx+1, len(shards))
+		plan.needed = append(plan.needed, target)
 	}
 
-	r.setStage("validating shard archive coverage", len(shards), len(shards))
-	return r.validateShardCoverage(ctx, masterWindow.shardTargets)
+	plans := make([]archiveShardImportPlan, 0, len(plansByShard))
+	for _, plan := range plansByShard {
+		plans = append(plans, *plan)
+	}
+	sort.Slice(plans, func(i, j int) bool {
+		if plans[i].shard.Workchain != plans[j].shard.Workchain {
+			return plans[i].shard.Workchain < plans[j].shard.Workchain
+		}
+		return plans[i].shard.Shard < plans[j].shard.Shard
+	})
+	return plans, nil
 }
 
-func validateArchiveBackfillShardImport(imported *archiveImportResult, shard archive.ShardID) error {
+func (r *archiveBackfillRunner) archiveBackfillShardTargetStored(ctx context.Context, target ton.BlockIDExt) (bool, error) {
+	meta, err := r.store.BlockMeta(ctx, target)
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load archive backfill shard target meta %s: %w", storage.FormatBlockRef(target), err)
+	}
+	if !meta.Has(storage.BlockMetaHasServedFull) || !meta.Has(storage.BlockMetaHasBlockData) {
+		return false, nil
+	}
+	return target.Workchain == -1 || meta.MasterchainRef != nil, nil
+}
+
+func archiveBackfillShardPrefixForBlock(splitDepth uint32, block ton.BlockIDExt) (archive.ShardID, error) {
+	if block.Workchain != 0 {
+		return archive.ShardID{}, fmt.Errorf("archive backfill shard target %s is not a basechain block", storage.FormatBlockRef(block))
+	}
+	if splitDepth > 62 {
+		return archive.ShardID{}, fmt.Errorf("archive backfill split depth %d is too large", splitDepth)
+	}
+	if splitDepth == 0 {
+		return archive.ShardID{Workchain: 0, Shard: topShard}, nil
+	}
+
+	idx := uint64(block.Shard) >> (64 - splitDepth)
+	shard := (idx*2 + 1) << (64 - splitDepth - 1)
+	return archive.ShardID{Workchain: 0, Shard: int64(shard)}, nil
+}
+
+func archiveBackfillShardImportMasterRefs(blocks map[storage.BlockRootHash]PreparedBlock, targets []ton.BlockIDExt, targetMasterRefs map[storage.BlockRootHash]ton.BlockIDExt) (map[storage.BlockRootHash]ton.BlockIDExt, map[storage.BlockRootHash]bool, error) {
+	ordered, err := archiveBackfillOrderedShardTargets(blocks, targets, targetMasterRefs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	refs := make(map[storage.BlockRootHash]ton.BlockIDExt)
+	include := make(map[storage.BlockRootHash]bool)
+	for _, item := range ordered {
+		if err := assignArchiveBackfillShardImportMasterRef(blocks, item.target, item.master, refs, include); err != nil {
+			return nil, nil, err
+		}
+	}
+	return refs, include, nil
+}
+
+func archiveBackfillOrderedShardTargets(blocks map[storage.BlockRootHash]PreparedBlock, targets []ton.BlockIDExt, targetMasterRefs map[storage.BlockRootHash]ton.BlockIDExt) ([]archiveBackfillShardTargetRef, error) {
+	ordered := make([]archiveBackfillShardTargetRef, 0, len(targets))
+	for _, target := range targets {
+		key := storage.BlockKey(target)
+		master, ok := targetMasterRefs[key]
+		if !ok {
+			return nil, fmt.Errorf("archive backfill shard target %s has no masterchain reference in stored master window", storage.FormatBlockRef(target))
+		}
+		if _, ok = blocks[key]; !ok {
+			return nil, fmt.Errorf("archive backfill shard import is missing planned block %s", storage.FormatBlockRef(target))
+		}
+		ordered = append(ordered, archiveBackfillShardTargetRef{
+			target: target,
+			master: master,
+		})
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left := ordered[i]
+		right := ordered[j]
+		if left.master.SeqNo != right.master.SeqNo {
+			return left.master.SeqNo < right.master.SeqNo
+		}
+		if left.target.Workchain != right.target.Workchain {
+			return left.target.Workchain < right.target.Workchain
+		}
+		if left.target.Shard != right.target.Shard {
+			return left.target.Shard < right.target.Shard
+		}
+		return left.target.SeqNo < right.target.SeqNo
+	})
+	return ordered, nil
+}
+
+func assignArchiveBackfillShardImportMasterRef(blocks map[storage.BlockRootHash]PreparedBlock, start ton.BlockIDExt, master ton.BlockIDExt, refs map[storage.BlockRootHash]ton.BlockIDExt, include map[storage.BlockRootHash]bool) error {
+	stack := []ton.BlockIDExt{start}
+	for len(stack) > 0 {
+		block := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		key := storage.BlockKey(block)
+		if existing, ok := refs[key]; ok {
+			if !existing.Equals(&master) && existing.SeqNo >= master.SeqNo {
+				return fmt.Errorf("archive backfill shard block %s was visited with later masterchain reference %s before %s",
+					storage.FormatBlockRef(block), storage.FormatBlockRef(existing), storage.FormatBlockRef(master))
+			}
+			continue
+		}
+
+		prepared, ok := blocks[key]
+		if !ok {
+			continue
+		}
+		if !prepared.ID.Equals(&block) {
+			return fmt.Errorf("archive backfill shard block key collision: got=%s want=%s", storage.FormatBlockRef(prepared.ID), storage.FormatBlockRef(block))
+		}
+		if prepared.Meta == nil {
+			return fmt.Errorf("archive backfill shard block %s has no meta", storage.FormatBlockRef(block))
+		}
+
+		refs[key] = master
+		include[key] = true
+		for _, prev := range prepared.Meta.PrevRefs {
+			if prev.Workchain == block.Workchain && prev.Shard == block.Shard {
+				stack = append(stack, prev)
+			}
+		}
+	}
+	return nil
+}
+
+func validateArchiveBackfillShardImport(imported *archiveImportResult, includeBlocks map[storage.BlockRootHash]bool) error {
 	if imported == nil {
 		return fmt.Errorf("archive backfill shard import is empty")
 	}
 	for _, block := range imported.blocks {
-		if block.ID.Workchain == -1 && block.ID.Shard == topShard {
+		if !includeBlocks[storage.BlockKey(block.ID)] {
 			continue
 		}
-		if !shard.ContainsBlock(block.ID) {
-			return fmt.Errorf("archive backfill shard archive %s contains block %s", shard.String(), storage.FormatBlockRef(block.ID))
+		if block.ID.Workchain == -1 && block.ID.Shard == topShard {
+			continue
 		}
 		if !block.IsLink {
 			return fmt.Errorf("archive backfill shard block %s has full proof instead of proof link", storage.FormatBlockRef(block.ID))
@@ -566,6 +982,9 @@ func (r *archiveBackfillRunner) validateShardCoverage(ctx context.Context, targe
 		}
 		if meta == nil || !meta.Has(storage.BlockMetaHasServedFull) || !meta.Has(storage.BlockMetaHasBlockData) {
 			return fmt.Errorf("archive backfill changed shard block %s is not stored as full block", storage.FormatBlockRef(target))
+		}
+		if target.Workchain != -1 && meta.MasterchainRef == nil {
+			return fmt.Errorf("archive backfill changed shard block %s has no masterchain reference", storage.FormatBlockRef(target))
 		}
 	}
 	return nil

@@ -1,10 +1,12 @@
 package service
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -18,6 +20,38 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	proofBOC := []byte{0x70, 0x71, 0x72}
+
+	if err := store.SaveArchiveImport(&tnstore.ServedArchiveImport{
+		FullBlocks: []*tnstore.ServedBlockFull{{
+			ID:     downloaded.ID,
+			Block:  downloaded.BlockBOC,
+			Proof:  proofBOC,
+			Meta:   downloaded.Meta,
+			IsLink: downloaded.IsLink,
+		}},
+	}); err != nil {
+		t.Fatalf("save fixture block: %v", err)
+	}
+
+	prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID, false)
+	if err != nil {
+		t.Fatalf("load stored block: %v", err)
+	}
+	if string(prepared.BlockBOC) != string(downloaded.BlockBOC) {
+		t.Fatal("stored block data was not loaded")
+	}
+	if string(prepared.ProofBOC) != string(proofBOC) {
+		t.Fatal("stored proof was not loaded")
+	}
+	if prepared.IsLink != downloaded.IsLink {
+		t.Fatalf("stored proof link flag = %v, want %v", prepared.IsLink, downloaded.IsLink)
+	}
+}
 
 func TestApplyBlockFromFixture(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
@@ -102,7 +136,7 @@ func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	current.Block = prepared.Meta.PrevRefs[0]
 
 	prepared.ProofBOC = nil
-	next, _, err := (&Service{}).applyStoredMasterchainTransition(current, prepared, nil)
+	next, _, err := (&Service{}).applyMasterchainTransition(current, prepared, nil, nil)
 	if err != nil {
 		t.Fatalf("apply stored masterchain transition: %v", err)
 	}
@@ -637,7 +671,7 @@ func TestServiceStateCellLoaderKeepsArchiveCheckpointCellsVisible(t *testing.T) 
 	root := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 
 	overlay := newArchiveStateCellOverlay(nil)
-	overlay.rememberPreparedCells(mustPreparedReachableStateCells(t, root))
+	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 	checkpoint := overlay.beginCheckpoint()
 	if checkpoint == nil {
 		t.Fatal("archive checkpoint is nil")
@@ -658,6 +692,52 @@ func TestServiceStateCellLoaderKeepsArchiveCheckpointCellsVisible(t *testing.T) 
 	release()
 	if _, err = loader(root.HashKey()); err == nil {
 		t.Fatal("released archive checkpoint cell loader still resolves cells")
+	}
+}
+
+func TestStateCellWindowRetainedLoaderFallsThroughToBaseRefs(t *testing.T) {
+	child := cell.BeginCell().MustStoreUInt(0x43, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+	records := removePreparedCellRecord(mustPreparedReachableStateCells(t, root), child.HashKey())
+
+	window := newStateCellWindowCache(nil)
+	if err := window.addPreparedRecords(records); err != nil {
+		t.Fatalf("remember window records: %v", err)
+	}
+
+	baseLoads := 0
+	loader := window.retainedLoader(func(hash cell.Hash) (*cell.Cell, error) {
+		baseLoads++
+		if hash == child.HashKey() {
+			return child, nil
+		}
+		return nil, tnstore.ErrNotFound
+	})
+
+	if _, err := loader(child.HashKey()); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("top-level retained loader err=%v, want ErrNotFound", err)
+	}
+	if baseLoads != 0 {
+		t.Fatalf("top-level retained loader used base %d times", baseLoads)
+	}
+
+	loadedRoot, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load retained root: %v", err)
+	}
+	loadedChild, err := loadedRoot.PeekRef(0)
+	if err != nil {
+		t.Fatalf("load retained root ref through base: %v", err)
+	}
+	loadedChild, err = loadedChild.Prewarm()
+	if err != nil {
+		t.Fatalf("prewarm retained root ref through base: %v", err)
+	}
+	if loadedChild.HashKey() != child.HashKey() {
+		t.Fatalf("loaded child hash mismatch")
+	}
+	if baseLoads == 0 {
+		t.Fatal("retained root ref did not use base loader")
 	}
 }
 
@@ -723,7 +803,7 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 func TestStateCellWindowLoaderUsesSourceSnapshot(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	cache := newStateCellEncodedCache(1)
-	cache.addRecords(mustPreparedReachableStateCells(t, root))
+	cache.addRecords(mustPreparedReachableStateCells(t, root), nil)
 
 	window := newStateCellWindowCache(nil)
 	window.mu.Lock()
@@ -752,7 +832,7 @@ func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 
 	base := newArchiveStateCellOverlay(nil)
 	overlay := newArchiveStateCellOverlay(nil)
-	overlay.rememberPreparedCells(mustPreparedReachableStateCells(t, root))
+	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
 	overlay.copyRecordsTo(base)
@@ -777,11 +857,11 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 	second[0] = 2
 
 	overlay := newArchiveStateCellOverlay(nil)
-	overlay.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
+	overlay.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: []byte{1, 2, 3, 4},
 	}))
 	checkpoint := overlay.beginCheckpoint()
-	overlay.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
+	overlay.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{5, 6},
 	}))
 
@@ -794,7 +874,7 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 		t.Fatalf("overlay byte size after checkpoint = %d, want 2", got)
 	}
 
-	overlay.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
+	overlay.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{7},
 	}))
 	if got := overlay.byteSize(); got != 1 {

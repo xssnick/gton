@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -136,7 +135,7 @@ func (n *Node) downloadZeroStateSnapshot(ctx context.Context, block ton.BlockIDE
 	if data, err := n.peerStorage.ZeroState(ctx, block); err == nil && len(data) > 0 {
 		return &zeroStateSnapshotArtifact{
 			block: block,
-			data:  bytes.Clone(data),
+			data:  data,
 		}, nil
 	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		n.log.Debug().
@@ -212,7 +211,7 @@ func (n *Node) downloadZeroStateSnapshotFromPeer(ctx context.Context, sub *overl
 
 	return &zeroStateSnapshotArtifact{
 		block: block,
-		data:  bytes.Clone(data),
+		data:  data,
 	}, nil
 }
 
@@ -227,7 +226,7 @@ func (n *Node) downloadPersistentStateSnapshot(ctx context.Context, block ton.Bl
 		sub:           sub,
 		block:         block,
 		master:        master,
-		stateRootHash: bytes.Clone(stateRootHash),
+		stateRootHash: stateRootHash,
 	}.download(ctx, splitDepth)
 }
 

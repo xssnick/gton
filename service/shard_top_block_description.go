@@ -26,6 +26,7 @@ type shardTopBlockDescriptionLink struct {
 	Block          ton.BlockIDExt
 	PrevRefs       []ton.BlockIDExt
 	MasterchainRef *ton.BlockIDExt
+	ProofRoot      *cell.Cell
 }
 
 type shardDescriptionBlockIDExtTLB struct {
@@ -247,6 +248,7 @@ func validateShardDescriptionProofChain(block ton.BlockIDExt, signatures shardDe
 			Block:          current,
 			PrevRefs:       append([]ton.BlockIDExt(nil), meta.PrevRefs...),
 			MasterchainRef: meta.MasterchainRef,
+			ProofRoot:      proof,
 		})
 
 		maxPrevSeqno := meta.PrevRefs[0].SeqNo

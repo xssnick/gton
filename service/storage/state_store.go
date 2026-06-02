@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -29,12 +30,19 @@ type StateStorage interface {
 	SaveStateSyncProgress(ctx context.Context, state *CurrentState) error
 	StateSyncProgress(ctx context.Context) (*CurrentState, error)
 	ClearStateSyncProgress(ctx context.Context) error
-	SaveVerifiedKeyBlockProgress(ctx context.Context, block ton.BlockIDExt) error
-	VerifiedKeyBlockProgress(ctx context.Context) (ton.BlockIDExt, error)
+	SaveStateCellRecords(ctx context.Context, cells StateCellRecords) error
+	FlushStateCells(ctx context.Context) error
 	SaveBlockState(ctx context.Context, state *BlockState) error
 	SaveStateCheckpoint(ctx context.Context, blocks []*BlockState, current *CurrentState) error
-	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, cells StateCellRecords, current *CurrentState) error
+	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, cells StateCellRecords, current *CurrentState) (StateCheckpointTiming, error)
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
+}
+
+type StateCheckpointTiming struct {
+	CellsWrite   time.Duration
+	CellsFlush   time.Duration
+	ArtifactSync time.Duration
+	MetadataSync time.Duration
 }
 
 type BlockRootHash [32]byte

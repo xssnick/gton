@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	pendingBroadcastDecodeTTL      = 10 * time.Second
+	pendingBroadcastDecodeTTL      = 3 * time.Minute
 	pendingBroadcastDecodeMaxItems = 1024
 	pendingBroadcastDecodeMaxBytes = int64(64 << 20)
 	pendingBroadcastDecodeOverhead = 256
@@ -68,7 +68,12 @@ func (n *Node) processPendingBlockBroadcastDecodesAsync() {
 	}
 
 	n.pendingBroadcastMx.Lock()
-	if len(n.pendingBroadcasts) == 0 || n.pendingBroadcastProcessing {
+	if len(n.pendingBroadcasts) == 0 {
+		n.pendingBroadcastMx.Unlock()
+		return
+	}
+	if n.pendingBroadcastProcessing {
+		n.pendingBroadcastProcessAgain = true
 		n.pendingBroadcastMx.Unlock()
 		return
 	}
@@ -76,17 +81,24 @@ func (n *Node) processPendingBlockBroadcastDecodesAsync() {
 	n.pendingBroadcastMx.Unlock()
 
 	n.runAsync(func() {
-		defer func() {
-			n.pendingBroadcastMx.Lock()
-			n.pendingBroadcastProcessing = false
-			n.pendingBroadcastMx.Unlock()
-		}()
-
 		ctx := n.runCtx
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		n.processPendingBlockBroadcastDecodes(ctx, time.Now())
+
+		for {
+			n.processPendingBlockBroadcastDecodes(ctx, time.Now())
+
+			n.pendingBroadcastMx.Lock()
+			processAgain := n.pendingBroadcastProcessAgain && len(n.pendingBroadcasts) > 0 && ctx.Err() == nil
+			n.pendingBroadcastProcessAgain = false
+			if !processAgain {
+				n.pendingBroadcastProcessing = false
+				n.pendingBroadcastMx.Unlock()
+				return
+			}
+			n.pendingBroadcastMx.Unlock()
+		}
 	})
 }
 
@@ -95,6 +107,9 @@ func (n *Node) processPendingBlockBroadcastDecodes(ctx context.Context, now time
 	for _, req := range reqs {
 		if ctx.Err() != nil {
 			return
+		}
+		if !n.canAcceptBroadcast(req.kind, false) {
+			continue
 		}
 
 		downloaded, err := n.decodePendingBlockBroadcast(ctx, req)
@@ -138,7 +153,8 @@ func (n *Node) decodePendingBlockBroadcast(ctx context.Context, req pendingBlock
 		if req.proofRoot == nil {
 			return nil, fmt.Errorf("pending compressed V2 broadcast %s has no parsed proof root", formatBlockRef(req.block))
 		}
-		return n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, req.proofRoot, req.prev)
+		downloaded, _, err := n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, req.proofRoot, req.prev)
+		return downloaded, err
 	default:
 		return nil, fmt.Errorf("unexpected pending block broadcast %T", req.msg)
 	}
@@ -164,6 +180,7 @@ func (n *Node) prunePendingBlockBroadcastDecodesLocked(now time.Time) {
 	for key, req := range n.pendingBroadcasts {
 		if !req.expiresAt.After(now) {
 			n.deletePendingBlockBroadcastDecodeLocked(key)
+			n.deduper.Forget(key)
 		}
 	}
 }
@@ -182,6 +199,7 @@ func (n *Node) prunePendingBlockBroadcastOverflowLocked() {
 			return
 		}
 		n.deletePendingBlockBroadcastDecodeLocked(oldestKey)
+		n.deduper.Forget(oldestKey)
 	}
 }
 

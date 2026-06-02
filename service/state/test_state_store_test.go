@@ -16,7 +16,6 @@ type testStateStore struct {
 	mx       sync.RWMutex
 	current  *storage.CurrentState
 	progress *storage.CurrentState
-	keyBlock *ton.BlockIDExt
 	blocks   map[storage.BlockRootHash]*storage.BlockState
 	trees    map[storage.BlockRootHash]testStateCellTree
 }
@@ -49,6 +48,14 @@ func (s *testStateStore) SaveCurrentState(_ context.Context, state *storage.Curr
 	return nil
 }
 
+func (s *testStateStore) SaveStateCellRecords(_ context.Context, _ storage.StateCellRecords) error {
+	return nil
+}
+
+func (s *testStateStore) FlushStateCells(_ context.Context) error {
+	return nil
+}
+
 func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
 	entries := make([]storage.StateCheckpointBlock, 0, len(blocks))
 	for _, block := range blocks {
@@ -57,12 +64,13 @@ func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storag
 		}
 		entries = append(entries, storage.StateCheckpointBlock{State: block})
 	}
-	return s.SaveStateCheckpointEntries(context.Background(), entries, storage.StateCellRecords{}, current)
+	_, err := s.SaveStateCheckpointEntries(context.Background(), entries, storage.StateCellRecords{}, current)
+	return err
 }
 
-func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, _ storage.StateCellRecords, current *storage.CurrentState) error {
+func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, _ storage.StateCellRecords, current *storage.CurrentState) (storage.StateCheckpointTiming, error) {
 	if current == nil {
-		return fmt.Errorf("current state is nil")
+		return storage.StateCheckpointTiming{}, fmt.Errorf("current state is nil")
 	}
 
 	s.mx.Lock()
@@ -83,7 +91,7 @@ func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []
 	for _, shard := range cloned.Shards {
 		s.blocks[storage.BlockKey(shard.Block)] = storage.CloneBlockState(&shard)
 	}
-	return nil
+	return storage.StateCheckpointTiming{}, nil
 }
 
 func (s *testStateStore) CurrentState(_ context.Context) (*storage.CurrentState, error) {
@@ -124,29 +132,6 @@ func (s *testStateStore) ClearStateSyncProgress(_ context.Context) error {
 
 	s.progress = nil
 	return nil
-}
-
-func (s *testStateStore) SaveVerifiedKeyBlockProgress(_ context.Context, block ton.BlockIDExt) error {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	if s.keyBlock != nil && s.keyBlock.SeqNo >= block.SeqNo {
-		return nil
-	}
-
-	next := block
-	s.keyBlock = &next
-	return nil
-}
-
-func (s *testStateStore) VerifiedKeyBlockProgress(_ context.Context) (ton.BlockIDExt, error) {
-	s.mx.RLock()
-	defer s.mx.RUnlock()
-
-	if s.keyBlock == nil {
-		return ton.BlockIDExt{}, storage.ErrNotFound
-	}
-	return *s.keyBlock, nil
 }
 
 func (s *testStateStore) ImportStateCellTree(_ context.Context, block ton.BlockIDExt, root *cell.Cell, _ uint64) (*cell.Cell, error) {

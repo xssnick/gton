@@ -24,7 +24,7 @@ These metrics describe inbound liteserver query load, latency, and result mix.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `gton_liteserver_queries_total` | counter | `method`, `response`, `error_code` | Number of handled liteserver queries. `error_code="0"` means the response was not a `ton.LSError`. |
+| `gton_liteserver_queries_total` | counter | `method`, `response`, `error_code` | Number of handled liteserver queries. `error_code="0"` means the response was not a `ton.LSError`; `ton.LSError` with protocol code `0` is exported as `error_code="unspecified"`. |
 | `gton_liteserver_inflight_queries` | gauge | none | Number of liteserver queries currently being handled. |
 | `gton_liteserver_query_duration_seconds` | histogram | `method`, `response`, `error_code` | Total query duration, including `waitMasterchainSeqno` wait time. |
 | `gton_liteserver_query_handler_duration_seconds` | histogram | `method`, `response`, `error_code` | Query handler duration without `waitMasterchainSeqno` wait time. Use this for normal handler latency SLOs. |
@@ -87,6 +87,7 @@ checkpoint persistence.
 | `gton_sync_checkpoints_total` | counter | `mode`, `result` | Number of current-state checkpoints. |
 | `gton_sync_persist_duration_seconds` | histogram | `mode`, `result` | Time spent writing a current-state checkpoint. |
 | `gton_sync_persist_queue_seconds` | histogram | `mode`, `result` | Time spent waiting before a current-state checkpoint write can run. |
+| `gton_sync_checkpoint_stage_duration_seconds` | histogram | `mode`, `stage`, `result` | Current-state checkpoint duration split by artifact wait, cell prewrite wait, cell flush, artifact fsync, and metadata sync stages. |
 
 Common label values:
 
@@ -99,6 +100,7 @@ Common label values:
 - `result`: `success`, `miss`, `timeout`, `canceled`, `retry`, or `error`.
 - `catch_up`: `true` or `false`.
 - `mode`: `next_block_async`, `next_block_sync`.
+- checkpoint `stage`: `wait_artifacts`, `wait_cell_prewrite`, `flush_prewrite_cells`, `write_cells`, `flush_cells`, `sync_artifacts`, or `metadata_sync`.
 
 Useful examples:
 
@@ -110,6 +112,7 @@ histogram_quantile(0.95, sum(rate(gton_sync_block_download_duration_seconds_buck
 histogram_quantile(0.95, sum(rate(gton_sync_block_prepare_duration_seconds_bucket{result="success"}[5m])) by (le, pipeline, chain, shard))
 histogram_quantile(0.95, sum(rate(gton_sync_block_apply_duration_seconds_bucket{result="success",pipeline!="blocksync"}[5m])) by (le, pipeline, chain))
 histogram_quantile(0.95, sum(rate(gton_sync_persist_duration_seconds_bucket[5m])) by (le, mode))
+histogram_quantile(0.95, sum(rate(gton_sync_checkpoint_stage_duration_seconds_bucket[5m])) by (le, mode, stage))
 ```
 
 ## P2P And Blocksync Load
@@ -128,6 +131,7 @@ sync queues.
 | `gton_p2p_queue_dropped_total` | counter | `queue` | Number of rejected pushes into a P2P queue. |
 | `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind` | Number of P2P broadcasts accepted or successfully sent through the app-level rebroadcast queue by type. |
 | `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. |
+| `gton_p2p_broadcast_pipeline_stage_duration_seconds` | histogram | `stage`, `kind`, `delivery`, `result` | Inbound broadcast hot-path stage latency. Stages include `fec_decode`, `classify`, `candidate_decode`, `shard_desc_validate`, `hot_cache_notify`, and `exact_pop`. |
 | `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful app-level P2P rebroadcast queue sends. |
 | `gton_p2p_rebroadcast_dropped_total` | counter | `queue` | Number of app-level P2P rebroadcast queue messages dropped before a successful send. |
 | `gton_p2p_broadcast_relay_sent_total` | counter | `overlay`, `delivery` | Number of successful overlay-level broadcast relay sends. `delivery="fec"` counts FEC part sends; `delivery="simple"` counts simple broadcast sends. |
@@ -150,12 +154,17 @@ Common `reason` values for `gton_p2p_broadcast_dropped_total` include `seen`,
 `invalid_payload`, `decode_failed`, `signature_parse_failed`, and
 `signature_check_failed`.
 
+`gton_p2p_broadcast_pipeline_stage_duration_seconds` intentionally has no block
+id, root hash, file hash, or peer label. `stage="fec_decode"` is measured inside
+the overlay FEC/two-step decoder before the gton broadcast classifier runs.
+
 Useful examples:
 
 ```promql
 sum(rate(gton_p2p_queue_dropped_total[5m])) by (queue)
 gton_p2p_queue_items / gton_p2p_queue_max_items
 sum(gton_p2p_overlay_neighbours{state="alive"}) by (overlay)
+histogram_quantile(0.95, sum(rate(gton_p2p_broadcast_pipeline_stage_duration_seconds_bucket[5m])) by (le, stage, delivery, kind))
 ```
 
 ## Storage

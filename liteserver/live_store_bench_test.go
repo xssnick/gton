@@ -110,9 +110,9 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 			GenUTime: uint32(1000 + i),
 		}
 		live.blocks[storage.BlockKey(block)] = &liveBlock{
-			id:               block,
-			meta:             meta,
-			blockDataFlushed: true,
+			id:              block,
+			meta:            meta,
+			artifactFlushed: true,
 		}
 		live.refreshBlockIndexLocked(block)
 	}

@@ -258,7 +258,7 @@ func currentMasterchainInfo(ctx context.Context, store Store, current *storage.C
 	}
 
 	block := current.Masterchain.Block
-	stateRoot := append([]byte(nil), current.Masterchain.StateRootHash...)
+	stateRoot := current.Masterchain.StateRootHash
 	lastUTime := uint32(0)
 	if current.Masterchain.Parsed != nil {
 		lastUTime = current.Masterchain.Parsed.GenUTime
@@ -268,7 +268,7 @@ func currentMasterchainInfo(ctx context.Context, store Store, current *storage.C
 		meta, metaErr := store.BlockMeta(ctx, block)
 		if metaErr == nil {
 			if len(stateRoot) == 0 {
-				stateRoot = append([]byte(nil), meta.StateRootHash...)
+				stateRoot = meta.StateRootHash
 			}
 			if lastUTime == 0 {
 				lastUTime = meta.GenUTime
@@ -290,7 +290,7 @@ func (s *Server) masterchainInfo(block ton.BlockIDExt, stateRoot []byte) (ton.Ma
 	}
 	return ton.MasterchainInfo{
 		Last:          cloneBlockID(block),
-		StateRootHash: append([]byte(nil), stateRoot...),
+		StateRootHash: stateRoot,
 		Init:          cloneZeroStatePtr(s.zeroState),
 	}, nil
 }
@@ -355,7 +355,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 		return accountReference{}, fmt.Errorf("reference block for a %s must belong to the masterchain", request)
 	}
 
-	addr := address.NewAddress(0, byte(account.Workchain), append([]byte(nil), account.ID...))
+	addr := address.NewAddress(0, byte(account.Workchain), account.ID)
 	if base.Workchain == account.Workchain && !tlb.ShardID(uint64(base.Shard)).ContainsAddress(addr) {
 		return accountReference{}, fmt.Errorf("requested account id is not contained in the shard of the reference block")
 	}

@@ -3,38 +3,81 @@ package service
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/xssnick/gton/service/storage"
 )
 
 type stateCheckpointData struct {
-	live      *storage.CurrentState
-	persisted *storage.CurrentState
-	entries   []storage.StateCheckpointBlock
-	cells     storage.StateCellRecords
+	live               *storage.CurrentState
+	persisted          *storage.CurrentState
+	entries            []storage.StateCheckpointBlock
+	cells              storage.StateCellRecords
+	cellPrewriteTarget uint64
 }
 
-func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords) (stateCheckpointData, error) {
+func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
 	appliedEntries := cloneStateCheckpointEntries(entries)
 	if len(appliedEntries) == 0 {
 		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
 	}
+	checkpointCells := storage.StateCellRecords{}
+	cellPrewriteTarget, prewritten := cells.prewriteTarget()
+	if !prewritten {
+		checkpointCells = cells.cells()
+	}
 	return stateCheckpointData{
-		live:      storage.CloneCurrentState(current),
-		persisted: currentStateWithoutCells(current),
-		entries:   appliedEntries,
-		cells:     cells,
+		live:               storage.CloneCurrentState(current),
+		persisted:          currentStateWithoutCells(current),
+		entries:            appliedEntries,
+		cells:              checkpointCells,
+		cellPrewriteTarget: cellPrewriteTarget,
 	}, nil
 }
 
-func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, artifactTarget uint64) (*storage.CurrentState, error) {
-	if err := s.waitAppliedBlockArtifacts(ctx, artifactTarget); err != nil {
-		return nil, err
+func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
+	var stages []SyncPersistStageObservation
+
+	if cellPrewriteTarget > 0 {
+		stageStarted := time.Now()
+		if err := s.stateCellPrewrite.wait(ctx, cellPrewriteTarget); err != nil {
+			stages = appendSyncPersistStage(stages, "wait_cell_prewrite", time.Since(stageStarted))
+			return nil, stages, err
+		}
+		stages = appendSyncPersistStage(stages, "wait_cell_prewrite", time.Since(stageStarted))
+
+		stageStarted = time.Now()
+		if err := s.storage.FlushStateCells(ctx); err != nil {
+			stages = appendSyncPersistStage(stages, "flush_prewrite_cells", time.Since(stageStarted))
+			return nil, stages, err
+		}
+		stages = appendSyncPersistStage(stages, "flush_prewrite_cells", time.Since(stageStarted))
 	}
-	if err := s.storage.SaveStateCheckpointEntries(ctx, entries, cells, current); err != nil {
-		return nil, err
+
+	timing, err := s.storage.SaveStateCheckpointEntries(ctx, entries, cells, current)
+	stages = appendStateCheckpointTimingStages(stages, timing)
+	if err != nil {
+		return nil, stages, err
 	}
-	return currentStateWithSavedBlockStates(current, checkpointEntryStates(entries)), nil
+	return currentStateWithSavedBlockStates(current, checkpointEntryStates(entries)), stages, nil
+}
+
+func appendStateCheckpointTimingStages(stages []SyncPersistStageObservation, timing storage.StateCheckpointTiming) []SyncPersistStageObservation {
+	stages = appendSyncPersistStage(stages, "write_cells", timing.CellsWrite)
+	stages = appendSyncPersistStage(stages, "flush_cells", timing.CellsFlush)
+	stages = appendSyncPersistStage(stages, "sync_artifacts", timing.ArtifactSync)
+	stages = appendSyncPersistStage(stages, "metadata_sync", timing.MetadataSync)
+	return stages
+}
+
+func appendSyncPersistStage(stages []SyncPersistStageObservation, stage string, duration time.Duration) []SyncPersistStageObservation {
+	if duration <= 0 {
+		return stages
+	}
+	return append(stages, SyncPersistStageObservation{
+		Stage:    stage,
+		Duration: duration,
+	})
 }
 
 func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*storage.BlockState) *storage.CurrentState {
@@ -68,7 +111,9 @@ func cloneStateCheckpointEntries(entries []storage.StateCheckpointBlock) []stora
 			continue
 		}
 		cloned = append(cloned, storage.StateCheckpointBlock{
-			State: storage.CloneBlockState(entry.State),
+			State:    storage.CloneBlockState(entry.State),
+			Artifact: cloneServedBlockFullSharedPayload(entry.Artifact),
+			Links:    cloneServedBlockLinks(entry.Links),
 		})
 	}
 	return cloned

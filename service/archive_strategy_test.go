@@ -182,10 +182,13 @@ func TestArchiveShardPrefixesIncludeIntermediateShardChanges(t *testing.T) {
 		{testBlockID(0, shard, 10)},
 	}
 
-	got := archiveShardPrefixesForBlockStates(2, startBlocks, stateBlocks)
+	got := archiveShardImportPlansForBlockStatesMatching(2, startBlocks, stateBlocks, nil)
 	want := archive.ShardID{Workchain: 0, Shard: shard}
-	if len(got) != 1 || got[0] != want {
+	if len(got) != 1 || got[0].shard != want {
 		t.Fatalf("changed shard prefixes = %#v, want [%#v]", got, want)
+	}
+	if len(got[0].needed) != 1 || !got[0].needed[0].Equals(&stateBlocks[0][0]) {
+		t.Fatalf("changed shard needed blocks = %#v, want [%s]", got[0].needed, storage.FormatBlockRef(stateBlocks[0][0]))
 	}
 }
 
@@ -199,17 +202,42 @@ func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t
 		{next},
 	}
 
-	missing := archiveShardPrefixesMissingFromBlockStates(2, startBlocks, stateBlocks, nil)
+	missing := archiveShardImportPlansMissingFromBlockStates(2, startBlocks, stateBlocks, nil)
 	want := archive.ShardID{Workchain: 0, Shard: shard}
-	if len(missing) != 1 || missing[0] != want {
+	if len(missing) != 1 || missing[0].shard != want {
 		t.Fatalf("missing shard prefixes = %#v, want [%#v]", missing, want)
 	}
+	if len(missing[0].needed) != 1 || !missing[0].needed[0].Equals(&next) {
+		t.Fatalf("missing shard needed blocks = %#v, want [%s]", missing[0].needed, storage.FormatBlockRef(next))
+	}
 
-	covered := archiveShardPrefixesMissingFromBlockStates(2, startBlocks, stateBlocks, map[storage.BlockRootHash]PreparedBlock{
+	covered := archiveShardImportPlansMissingFromBlockStates(2, startBlocks, stateBlocks, map[storage.BlockRootHash]PreparedBlock{
 		storage.BlockKey(next): {ID: next},
 	})
 	if len(covered) != 0 {
 		t.Fatalf("covered shard prefixes = %#v, want none", covered)
+	}
+}
+
+func TestValidateArchiveImportCoversPlanRequiresPlannedBlocks(t *testing.T) {
+	shard := archive.ShardID{Workchain: 0, Shard: int64(-1 << 61)}
+	block := testBlockID(0, shard.Shard, 11)
+	plan := archiveShardImportPlan{shard: shard, needed: []ton.BlockIDExt{block}}
+
+	err := validateArchiveImportCoversPlan(&archiveImportResult{
+		blocks: map[storage.BlockRootHash]PreparedBlock{},
+	}, plan)
+	if err == nil {
+		t.Fatal("coverage validation accepted an archive without the planned shard block")
+	}
+
+	err = validateArchiveImportCoversPlan(&archiveImportResult{
+		blocks: map[storage.BlockRootHash]PreparedBlock{
+			storage.BlockKey(block): {ID: block},
+		},
+	}, plan)
+	if err != nil {
+		t.Fatalf("coverage validation rejected covered archive: %v", err)
 	}
 }
 
@@ -226,14 +254,14 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 		current:                &storage.CurrentState{ShardClientSeqno: 1001},
 		stateCells:             newArchiveStateCellOverlay(nil),
 	}
-	runner.stateCells.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
+	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 4095),
 	}))
 	if runner.shouldWaitArchiveCheckpointBackpressure() {
 		t.Fatal("checkpoint backpressure should not wait below byte limit")
 	}
 
-	runner.stateCells.rememberPreparedCells(testStateCellRecords(map[cell.Hash][]byte{
+	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: make([]byte, 1),
 	}))
 	if !runner.shouldWaitArchiveCheckpointBackpressure() {
@@ -306,39 +334,48 @@ func TestArchiveCheckpointAdaptiveTargetUsesConfiguredBackpressureWindows(t *tes
 	}
 }
 
-func TestArchiveImportAppendKeepsAllImportedBlocks(t *testing.T) {
-	master1 := testMasterBlockID(11)
-	master2 := testMasterBlockID(12)
-	future := testMasterBlockID(13)
-	shard := testBlockID(0, topShard, 101)
+func TestArchiveAppliedStateUsesCheckpointArtifactPath(t *testing.T) {
+	prev := testBlockID(0, topShard, 100)
+	block := testBlockID(0, topShard, 101)
+	state := &storage.BlockState{Block: block}
+	meta := &storage.BlockMeta{
+		ID:       block,
+		PrevRefs: []ton.BlockIDExt{prev},
+	}
+	master := testMasterBlockID(50)
+	setShardBlockMasterchainRef(meta, master)
 
-	src := &storage.ServedArchiveImport{
-		FullBlocks: []*storage.ServedBlockFull{
-			testStoredArchiveFull(master1),
-			testStoredArchiveFull(master2),
-			testStoredArchiveFull(future),
-			testStoredArchiveFull(shard),
-		},
-		Links: []storage.ServedBlockLink{
-			{Prev: master1, Next: master2},
-			{Prev: master2, Next: future},
-		},
+	window := &shardClientArchiveWindow{}
+	err := window.rememberAppliedArchiveState(state, PreparedBlock{
+		ID:       block,
+		BlockBOC: []byte{1, 2, 3},
+		ProofBOC: []byte{4, 5, 6},
+		Meta:     meta,
+		IsLink:   true,
+	}, 3)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	dst := &storage.ServedArchiveImport{}
-	appendArchiveImport(dst, src, map[storage.BlockRootHash]struct{}{}, map[archiveImportLinkKey]struct{}{})
-
-	if len(dst.FullBlocks) != 4 {
-		t.Fatalf("stored full blocks = %d, want 4", len(dst.FullBlocks))
+	checkpoint := window.appliedStates.checkpoint()
+	if len(checkpoint.entries) != 1 {
+		t.Fatalf("checkpoint entries = %d, want 1", len(checkpoint.entries))
 	}
-	if storage.BlockKey(dst.FullBlocks[0].ID) != storage.BlockKey(master1) ||
-		storage.BlockKey(dst.FullBlocks[1].ID) != storage.BlockKey(master2) ||
-		storage.BlockKey(dst.FullBlocks[2].ID) != storage.BlockKey(future) ||
-		storage.BlockKey(dst.FullBlocks[3].ID) != storage.BlockKey(shard) {
-		t.Fatalf("unexpected stored full block order: %v", dst.FullBlocks)
+	entry := checkpoint.entries[0]
+	if entry.Artifact == nil {
+		t.Fatal("archive applied state did not store checkpoint artifact")
 	}
-	if len(dst.Links) != 2 {
-		t.Fatalf("stored links = %+v, want all links", dst.Links)
+	if !entry.Artifact.ID.Equals(&block) {
+		t.Fatalf("artifact block = %s, want %s", storage.FormatBlockRef(entry.Artifact.ID), storage.FormatBlockRef(block))
+	}
+	if entry.Artifact.ArchiveShardSplitDepth != 3 {
+		t.Fatalf("artifact split depth = %d, want 3", entry.Artifact.ArchiveShardSplitDepth)
+	}
+	if entry.Artifact.Meta == nil || entry.Artifact.Meta.MasterchainRef == nil || !entry.Artifact.Meta.MasterchainRef.Equals(&master) {
+		t.Fatalf("artifact master ref = %+v, want %s", entry.Artifact.Meta, storage.FormatBlockRef(master))
+	}
+	if len(entry.Links) != 1 || !entry.Links[0].Prev.Equals(&prev) || !entry.Links[0].Next.Equals(&block) {
+		t.Fatalf("artifact links = %+v, want %s -> %s", entry.Links, storage.FormatBlockRef(prev), storage.FormatBlockRef(block))
 	}
 }
 
@@ -391,13 +428,4 @@ func testArchiveMasterBlock(seqno uint32, keyBlock bool) PreparedBlock {
 
 func testMasterBlockID(seqno uint32) ton.BlockIDExt {
 	return testBlockID(-1, topShard, seqno)
-}
-
-func testStoredArchiveFull(block ton.BlockIDExt) *storage.ServedBlockFull {
-	return &storage.ServedBlockFull{
-		ID:       block,
-		BlockRef: &storage.ArtifactRef{Path: "archive.pack", Offset: int64(block.SeqNo), Size: 10},
-		ProofRef: &storage.ArtifactRef{Path: "archive.pack", Offset: int64(block.SeqNo) + 10, Size: 5},
-		Meta:     &storage.BlockMeta{ID: block},
-	}
 }

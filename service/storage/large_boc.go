@@ -166,7 +166,7 @@ func AppendLargeBOCPayloadRecordFromCellRecord(record *CellRecord, arena []byte)
 
 	start := len(arena)
 	arena = append(arena, data...)
-	payload := arena[start:len(arena)]
+	payload := arena[start:]
 	if tailBits := bits % 8; tailBits != 0 {
 		payload[len(payload)-1] &= byte(0xff << (8 - tailBits))
 	}
@@ -183,7 +183,7 @@ func AppendLargeBOCPayloadRecordFromEncodedCellRecord(encoded []byte, arena []by
 
 	start := len(arena)
 	arena = append(arena, data...)
-	payload := arena[start:len(arena)]
+	payload := arena[start:]
 	if tailBits := bits % 8; tailBits != 0 {
 		payload[len(payload)-1] &= byte(0xff << (8 - tailBits))
 	}
@@ -222,7 +222,7 @@ func appendLargeBOCPayloadRecordFromParsedEncodedCellRecord(record largeBOCEncod
 
 	start := len(arena)
 	arena = append(arena, record.data...)
-	payload := arena[start:len(arena)]
+	payload := arena[start:]
 	if tailBits := bits % 8; tailBits != 0 {
 		payload[len(payload)-1] &= byte(0xff << (8 - tailBits))
 	}

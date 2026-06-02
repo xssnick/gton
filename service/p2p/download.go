@@ -86,7 +86,6 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 	if !res.ID.Equals(&block) {
 		return nil, fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
 	}
-	n.rememberDownloadedBlockAsync(nil, res)
 	return res, nil
 }
 
@@ -115,7 +114,6 @@ func (n *Node) ProbeBlockFull(ctx context.Context, block ton.BlockIDExt, opts Pr
 	if !res.ID.Equals(&block) {
 		return nil, fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
 	}
-	n.rememberDownloadedBlockAsync(nil, res)
 	return res, nil
 }
 
@@ -300,7 +298,7 @@ func (n *Node) prefetchShardBlockFullFromOverlayOrBroadcast(ctx context.Context,
 		return nil, nil
 	}
 
-	downloadCtx, cancel := context.WithCancel(ctx)
+	downloadCtx, cancel := context.WithTimeout(ctx, prefetchShardBlockTimeout)
 	defer cancel()
 
 	type downloadResult struct {
@@ -309,7 +307,11 @@ func (n *Node) prefetchShardBlockFullFromOverlayOrBroadcast(ctx context.Context,
 	}
 	result := make(chan downloadResult, 1)
 	go func() {
-		res, err := n.downloadFromOverlay(downloadCtx, block, tonnodeapi.DownloadBlockFull{Block: block})
+		res, err := n.probeBlockFromOverlay(downloadCtx, block, ProbeBlockFullOptions{
+			PeerLimit:       prefetchShardBlockPeers,
+			StagedPeerLimit: prefetchShardBlockWidePeers,
+			StageDelay:      prefetchShardBlockStageDelay,
+		})
 		result <- downloadResult{block: res, err: err}
 	}()
 
@@ -323,6 +325,8 @@ func (n *Node) prefetchShardBlockFullFromOverlayOrBroadcast(ctx context.Context,
 				return nil, nil
 			}
 			wake = nil
+		case <-downloadCtx.Done():
+			return nil, downloadCtx.Err()
 		case <-ctx.Done():
 			cancel()
 			return nil, ctx.Err()
@@ -344,7 +348,6 @@ func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (
 	if err != nil {
 		return nil, err
 	}
-	n.rememberDownloadedBlockAsync(&prev, res)
 	return res, nil
 }
 
@@ -370,12 +373,11 @@ func (n *Node) ProbeNextBlockFull(ctx context.Context, prev ton.BlockIDExt, opts
 	if err != nil {
 		return nil, err
 	}
-	n.rememberDownloadedBlockAsync(&prev, res)
 	return res, nil
 }
 
 func (n *Node) NextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (ton.BlockIDExt, error) {
-	full, err := n.peerStorage.NextBlockFull(ctx, prev)
+	full, err := n.localNextServedBlockFull(ctx, prev)
 	if err == nil && full != nil {
 		return full.ID, nil
 	}
@@ -410,7 +412,7 @@ func (n *Node) downloadNextFromOverlay(ctx context.Context, prev ton.BlockIDExt)
 }
 
 func (n *Node) cachedBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
-	full, err := n.peerStorage.BlockFull(ctx, block)
+	full, err := n.localServedBlockFull(ctx, block)
 	if err != nil {
 		return nil, err
 	}
@@ -418,11 +420,76 @@ func (n *Node) cachedBlockFull(ctx context.Context, block ton.BlockIDExt) (*Down
 }
 
 func (n *Node) cachedNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
-	full, err := n.peerStorage.NextBlockFull(ctx, prev)
+	full, err := n.localNextServedBlockFull(ctx, prev)
 	if err != nil {
 		return nil, err
 	}
 	return downloadedBlockFromStored("local next block cache", full)
+}
+
+func (n *Node) localServedBlockFull(ctx context.Context, block ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
+	if n.liveBlockCache != nil {
+		full, err := n.liveBlockCache.BlockFull(ctx, block)
+		if err == nil {
+			return full, nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
+	}
+	return n.peerStorage.BlockFull(ctx, block)
+}
+
+func (n *Node) localNextServedBlockFull(ctx context.Context, prev ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
+	if n.liveBlockCache != nil {
+		full, err := n.liveBlockCache.NextBlockFull(ctx, prev)
+		if err == nil {
+			return full, nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
+	}
+	return n.peerStorage.NextBlockFull(ctx, prev)
+}
+
+func (n *Node) localBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+	if n.liveBlockCache != nil {
+		data, err := n.liveBlockCache.BlockData(ctx, block)
+		if err == nil {
+			return data, nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
+	}
+
+	data, err := n.peerStorage.BlockData(ctx, block)
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+
+	full, err := n.localServedBlockFull(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+	return full.Block, nil
+}
+
+func (n *Node) localBlockProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
+	if n.liveBlockCache != nil {
+		proof, err := n.liveBlockCache.BlockProof(ctx, kind, block)
+		if err == nil {
+			return proof, nil
+		}
+		if !errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
+	}
+	return n.peerStorage.BlockProof(ctx, kind, block)
 }
 
 func downloadedBlockFromStored(kind string, full *tnstore.ServedBlockFull) (*DownloadedBlock, error) {
@@ -863,24 +930,6 @@ func (s *overlaySubscription) currentChainBlockPeerFiltered(block ton.BlockIDExt
 
 	s.clearChainBlockPeerLocked(key)
 	return nil
-}
-
-func (s *overlaySubscription) query(ctx context.Context, req tl.Serializable) (tl.Serializable, error) {
-	peers := s.queryCandidates(0, 0)
-	if len(peers) == 0 {
-		return nil, errors.New("overlay has no connected peers")
-	}
-
-	var errs []error
-	for _, peer := range peers {
-		resp, err := s.queryFromPeer(ctx, peer, req)
-		if err == nil {
-			return resp, nil
-		}
-		errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
-	}
-
-	return nil, errors.Join(errs...)
 }
 
 func (s *overlaySubscription) queryFromPeer(ctx context.Context, peer *overlayPeer, req tl.Serializable) (tl.Serializable, error) {

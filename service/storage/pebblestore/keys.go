@@ -24,8 +24,6 @@ var (
 	hotPrefixZeroStateRef          = []byte{0x11}
 	hotPrefixKeyProofRef           = []byte{0x12}
 	hotPrefixStateFileRef          = []byte{0x13}
-	hotPrefixVerifiedKey           = []byte{0x14}
-	hotPrefixPackCommitted         = []byte{0x15}
 	hotPrefixPackStart             = []byte{0x16}
 	hotPrefixStateSerializer       = []byte{0x17}
 	hotPrefixStateDescription      = []byte{0x18}
@@ -107,10 +105,6 @@ func hotKeyStateSyncProgress() []byte {
 	return bytes.Clone(hotPrefixStateSync)
 }
 
-func hotKeyVerifiedKeyBlockProgress() []byte {
-	return bytes.Clone(hotPrefixVerifiedKey)
-}
-
 func hotKeyPersistentStateSerializer() []byte {
 	return bytes.Clone(hotPrefixStateSerializer)
 }
@@ -175,15 +169,6 @@ func hotKeyPersistentStateFile(block ton.BlockIDExt, masterchainBlock ton.BlockI
 func hotKeyArchiveFile(archiveID int64) []byte {
 	buf := append([]byte(nil), hotPrefixArchiveFile...)
 	return binary.BigEndian.AppendUint64(buf, uint64(archiveID))
-}
-
-func hotKeyPackCommitted(path string) []byte {
-	buf := append([]byte(nil), hotPrefixPackCommitted...)
-	return append(buf, path...)
-}
-
-func hotKeyPackCommittedPrefix() []byte {
-	return bytes.Clone(hotPrefixPackCommitted)
 }
 
 func hotKeyArchivePackageStart(seqno uint32) []byte {

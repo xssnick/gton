@@ -19,19 +19,9 @@ type PeerServingStorage interface {
 }
 
 type PeerServingStorageWriter interface {
-	SaveBlockFull(block *ServedBlockFull) error
 	SaveArchiveImport(imported *ServedArchiveImport) error
-	LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error
-	SaveBlockData(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
-	SaveBlockProof(kind ServedProofKind, block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SaveZeroState(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SavePersistentStateFile(file *PersistentStateFile) error
-	SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (SavedArchiveFile, error)
-}
-
-type SavedArchiveFile struct {
-	Path           string
-	ReusedExisting bool
 }
 
 type ServedProofKind string
@@ -47,24 +37,9 @@ type ServedBlockFull struct {
 	ID                     ton.BlockIDExt
 	Proof                  []byte
 	Block                  []byte
-	ProofRef               *ArtifactRef
-	BlockRef               *ArtifactRef
 	Meta                   *BlockMeta
 	IsLink                 bool
 	ArchiveShardSplitDepth uint32
-}
-
-type ServedBlockData struct {
-	ID   ton.BlockIDExt
-	Data []byte
-	Ref  *ArtifactRef
-}
-
-type ServedBlockProof struct {
-	Kind ServedProofKind
-	ID   ton.BlockIDExt
-	Data []byte
-	Ref  *ArtifactRef
 }
 
 type ServedBlockLink struct {
@@ -74,8 +49,6 @@ type ServedBlockLink struct {
 
 type ServedArchiveImport struct {
 	FullBlocks []*ServedBlockFull
-	BlockData  []ServedBlockData
-	Proofs     []ServedBlockProof
 	Links      []ServedBlockLink
 }
 
@@ -136,8 +109,6 @@ func (b *ServedBlockFull) Clone() *ServedBlockFull {
 		ID:                     b.ID,
 		Proof:                  append([]byte(nil), b.Proof...),
 		Block:                  append([]byte(nil), b.Block...),
-		ProofRef:               b.ProofRef.Clone(),
-		BlockRef:               b.BlockRef.Clone(),
 		Meta:                   b.Meta.Clone(),
 		IsLink:                 b.IsLink,
 		ArchiveShardSplitDepth: b.ArchiveShardSplitDepth,

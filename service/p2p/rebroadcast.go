@@ -327,6 +327,18 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if s == nil || s.node == nil {
 		return false
 	}
+	if s.node.rebroadcastBlockedByAdmission(&req) {
+		s.node.noteRebroadcastDropped(req)
+		s.log.Debug().
+			Str("kind", req.kind).
+			Str("queue", req.queueName()).
+			Msg("dropping rebroadcast request because broadcast admission is closed")
+		return false
+	}
+	if !s.node.allowRebroadcast(&req) {
+		return false
+	}
+
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
 		s.node.noteRebroadcastDropped(req)
@@ -367,6 +379,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	req.queuedAt = time.Now()
 
 	candidates := s.rebroadcastCandidatesForRequest(req)
+	preferred := s.rebroadcastPreferredCandidateIDs(req)
 	fanout := s.rebroadcastFanoutForRequest(req)
 	attempts := 1
 	if req.local {
@@ -376,7 +389,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	queued := 0
 	tried := make(map[PeerID]struct{}, fanout*attempts)
 	for attempt := 0; attempt < attempts && queued < fanout; attempt++ {
-		targets := selectRebroadcastQueueTargets(candidates, tried, fanout-queued)
+		targets := selectRebroadcastQueueTargetsWithPreferred(candidates, tried, preferred, fanout-queued)
 		if len(targets) == 0 {
 			break
 		}
@@ -419,6 +432,28 @@ func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastReq
 	return filtered
 }
 
+func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRequest) map[PeerID]struct{} {
+	s.mx.Lock()
+	neighbours := append([]PeerID(nil), s.neighbours...)
+	s.mx.Unlock()
+
+	if len(neighbours) == 0 {
+		return nil
+	}
+
+	ids := make(map[PeerID]struct{}, len(neighbours))
+	for _, id := range neighbours {
+		if id.IsZero() || id == req.sourcePeerID {
+			continue
+		}
+		ids[id] = struct{}{}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return ids
+}
+
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if s != nil && s.spec.Kind == overlayKindCustomFixed {
 		return s.peerLimit()
@@ -430,6 +465,35 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 		return quietRebroadcastFanout
 	}
 	return rebroadcastFanout
+}
+
+func selectRebroadcastQueueTargetsWithPreferred(candidates []*overlayPeer, tried map[PeerID]struct{}, preferred map[PeerID]struct{}, limit int) []*overlayPeer {
+	if len(preferred) == 0 {
+		return selectRebroadcastQueueTargets(candidates, tried, limit)
+	}
+
+	preferredCandidates := make([]*overlayPeer, 0, len(preferred))
+	others := make([]*overlayPeer, 0, len(candidates))
+	for _, peer := range candidates {
+		if peer == nil || peer.id.IsZero() {
+			continue
+		}
+		if _, ok := tried[peer.id]; ok {
+			continue
+		}
+		if _, ok := preferred[peer.id]; ok {
+			preferredCandidates = append(preferredCandidates, peer)
+			continue
+		}
+		others = append(others, peer)
+	}
+
+	targets := selectRebroadcastQueueTargets(preferredCandidates, nil, limit)
+	if len(targets) >= limit {
+		return targets
+	}
+	targets = append(targets, selectRebroadcastQueueTargets(others, nil, limit-len(targets))...)
+	return targets
 }
 
 func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[PeerID]struct{}, limit int) []*overlayPeer {
@@ -690,7 +754,7 @@ func (n *Node) buildSimpleBroadcast(payload []byte, flags int32) (overlay.Broadc
 		Source:      keys.PublicKeyED25519{Key: pub},
 		Certificate: overlay.CertificateEmpty{},
 		Flags:       flags,
-		Data:        append([]byte(nil), payload...),
+		Data:        payload,
 		Date:        int32(time.Now().Unix()),
 	}
 

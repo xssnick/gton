@@ -3,12 +3,12 @@ module github.com/xssnick/gton
 go 1.25.6
 
 require (
-	github.com/cockroachdb/pebble/v2 v2.1.5
+	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/tonutils-go v1.17.1-0.20260530085416-f6cc287b59a9
+	github.com/xssnick/tonutils-go v1.17.1-0.20260602082556-d6fbaafcd9a9
 	golang.org/x/sys v0.45.0
 )
 
@@ -52,5 +52,3 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-replace github.com/xssnick/tonutils-go => ../tonutils-go

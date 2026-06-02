@@ -134,7 +134,7 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) (uint32, error) {
 	checkpointCells := r.stateCells.beginCheckpoint()
 	releaseCheckpointCells := func() {}
 	if checkpointCells != nil {
-		releaseCheckpointCells = r.service.retainStateCellLoader(checkpointCells.loader())
+		releaseCheckpointCells = r.service.retainStateCellLoader(checkpointCells.retainedLoader(r.service.stateCellLoader()))
 	}
 	checkpointBlocks := r.current.ShardClientSeqno - r.lastCheckpointSeqno
 	done := make(chan archiveCheckpointResult, 1)

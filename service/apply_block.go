@@ -88,14 +88,20 @@ func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (Prep
 }
 
 func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt, persistMeta bool) (PreparedBlock, error) {
-	data, err := store.BlockData(ctx, id)
+	full, err := store.BlockFull(ctx, id)
 	if err != nil {
 		return PreparedBlock{}, err
 	}
 
-	downloaded, err := prepareBlockDataForApply("stored block", id, data)
+	downloaded, err := prepareBlockDataForApply("stored block", id, full.Block)
 	if err != nil {
 		return PreparedBlock{}, err
+	}
+	downloaded.ProofBOC = full.Proof
+	downloaded.IsLink = full.IsLink
+	if full.Meta != nil {
+		downloaded.Meta = tnstore.MergeBlockMeta(downloaded.Meta, full.Meta)
+		downloaded.Meta.ID = id
 	}
 	if persistMeta {
 		if err = store.SaveBlockMeta(downloaded.Meta); err != nil {

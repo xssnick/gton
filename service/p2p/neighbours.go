@@ -31,14 +31,6 @@ func (s *overlaySubscription) hasNeighbourLocked(id PeerID) bool {
 	return false
 }
 
-func (s *overlaySubscription) addNeighbourLocked(id PeerID) bool {
-	if id.IsZero() || s.hasNeighbourLocked(id) || len(s.neighbours) >= maxQueryNeighbours {
-		return false
-	}
-	s.neighbours = append(s.neighbours, id)
-	return true
-}
-
 func (s *overlaySubscription) removeNeighbourLocked(id PeerID) bool {
 	for idx, current := range s.neighbours {
 		if current != id {

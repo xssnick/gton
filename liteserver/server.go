@@ -67,37 +67,40 @@ type QueryObserver interface {
 type QueryObservation struct {
 	Method       string
 	Response     string
+	Error        bool
 	ErrorCode    int32
 	Duration     time.Duration
 	WaitDuration time.Duration
 }
 
 type Options struct {
-	Logger        *zerolog.Logger
-	Store         Store
-	MessageSender MessageSender
-	QueryObserver QueryObserver
-	PrivateKey    ed25519.PrivateKey
-	ListenAddr    string
-	NonFinal      bool
-	ZeroState     ton.ZeroStateIDExt
-	Version       int32
-	Capabilities  int64
+	Logger              *zerolog.Logger
+	Store               Store
+	MessageSender       MessageSender
+	QueryObserver       QueryObserver
+	PrivateKey          ed25519.PrivateKey
+	ListenAddr          string
+	NonFinal            bool
+	SendMessageTVMTrace bool
+	ZeroState           ton.ZeroStateIDExt
+	Version             int32
+	Capabilities        int64
 }
 
 type Server struct {
-	log           zerolog.Logger
-	store         Store
-	messageSender MessageSender
-	queryObserver QueryObserver
-	privateKey    ed25519.PrivateKey
-	listenAddr    string
-	nonFinal      bool
-	zeroState     ton.ZeroStateIDExt
-	version       int32
-	capabilities  int64
-	now           func() time.Time
-	tvm           *tvm.TVM
+	log                 zerolog.Logger
+	store               Store
+	messageSender       MessageSender
+	queryObserver       QueryObserver
+	privateKey          ed25519.PrivateKey
+	listenAddr          string
+	nonFinal            bool
+	sendMessageTVMTrace bool
+	zeroState           ton.ZeroStateIDExt
+	version             int32
+	capabilities        int64
+	now                 func() time.Time
+	tvm                 *tvm.TVM
 
 	sendMessageCacheInitMu sync.Mutex
 	sendMessageCache       *sendMessageCache
@@ -144,6 +147,7 @@ func New(opts Options) (*Server, error) {
 		privateKey:             opts.PrivateKey,
 		listenAddr:             opts.ListenAddr,
 		nonFinal:               opts.NonFinal,
+		sendMessageTVMTrace:    opts.SendMessageTVMTrace,
 		zeroState:              cloneZeroState(opts.ZeroState),
 		version:                version,
 		capabilities:           capabilities,
@@ -293,16 +297,7 @@ func (s *Server) handleQueryRequest(ctx context.Context, client *liteclient.Serv
 
 	resp, timing := s.handleQueryDataWithTiming(ctx, data)
 	if s.queryObserver != nil {
-		observation := QueryObservation{
-			Method:       timing.queryName(),
-			Response:     liteserverTypeName(resp),
-			Duration:     timing.duration,
-			WaitDuration: timing.waitDuration,
-		}
-		if lsErr, ok := resp.(ton.LSError); ok {
-			observation.ErrorCode = lsErr.Code
-		}
-		s.queryObserver.ObserveLiteserverQuery(observation)
+		s.queryObserver.ObserveLiteserverQuery(queryObservationFromResponse(resp, timing))
 	}
 	if !event.Enabled() {
 		return resp, nil
@@ -326,6 +321,20 @@ func (s *Server) handleQueryRequest(ctx context.Context, client *liteclient.Serv
 	event.Msg("handled liteserver query")
 
 	return resp, nil
+}
+
+func queryObservationFromResponse(resp tl.Serializable, timing queryLogTiming) QueryObservation {
+	observation := QueryObservation{
+		Method:       timing.queryName(),
+		Response:     liteserverTypeName(resp),
+		Duration:     timing.duration,
+		WaitDuration: timing.waitDuration,
+	}
+	if lsErr, ok := resp.(ton.LSError); ok {
+		observation.Error = true
+		observation.ErrorCode = lsErr.Code
+	}
+	return observation
 }
 
 func liteserverQueryLogName(data any) string {

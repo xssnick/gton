@@ -1,6 +1,7 @@
 package liteserver
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/xssnick/gton/service/storage"
@@ -12,179 +13,240 @@ type lazyCellLoaderStore interface {
 	LazyCellLoader() cell.LazyCellLoader
 }
 
-func nonfinalStateFromUpdate(block storage.LiveBlockArtifacts, loader cell.LazyCellLoader) (*storage.BlockState, *storage.BlockMeta, map[cell.Hash]*cell.Cell, error) {
-	if block.State != nil {
-		state := storage.CloneBlockState(block.State)
-		cells, err := nonfinalStateCells(state.Cell)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		lazy, err := nonfinalLazyCellRoot(state.Cell, loader)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		state.Cell = lazy
-		return state, block.Meta.Clone(), cells, nil
+type nonfinalParsedStateUpdate struct {
+	root   *cell.Cell
+	meta   *storage.BlockMeta
+	update *cell.Cell
+}
+
+func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.LazyCellLoader) (*storage.BlockState, *storage.BlockMeta, storage.StateCellRecords, error) {
+	state := storage.CloneBlockState(block.State)
+	if state.Cell == nil {
+		return nil, nil, storage.StateCellRecords{}, storage.ErrNotFound
+	}
+	records, err := nonfinalSnapshotStateRecords(state.Cell)
+	if err != nil {
+		return nil, nil, storage.StateCellRecords{}, err
 	}
 
+	rootHash := state.Cell.GetMetadata().Hash
+	lazy, err := nonfinalLoadStateRoot(rootHash, records, loader)
+	if err != nil {
+		return nil, nil, storage.StateCellRecords{}, err
+	}
+	state.Cell = lazy
+	return state, block.Meta.Clone(), records, nil
+}
+
+func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedStateUpdate, error) {
 	root := block.Root
 	if root == nil && len(block.BlockData) > 0 {
 		parsed, err := parseTrustedBlockBOC(block.Block, block.BlockData)
 		if err != nil {
-			return nil, nil, nil, err
+			return nonfinalParsedStateUpdate{}, err
 		}
 		root = parsed
 	}
 	if root == nil {
-		return nil, block.Meta.Clone(), nil, nil
+		return nonfinalParsedStateUpdate{meta: block.Meta.Clone()}, nil
 	}
 	normalized, err := normalizeLiveBlockRoot(block.Block, root)
 	if err != nil {
-		return nil, nil, nil, err
+		return nonfinalParsedStateUpdate{}, err
 	}
 	root = normalized
 
 	meta := block.Meta
+	var stateUpdate *cell.Cell
 	if meta == nil {
-		var err error
-		meta, err = storage.BuildBlockMetaFromBlockCell(block.Block, root)
+		parsed, err := storage.ParseVerifiedBlockCell(block.Block, root)
 		if err != nil {
-			return nil, nil, nil, err
+			return nonfinalParsedStateUpdate{}, err
 		}
+		meta, err = storage.BuildBlockMetaFromParsedBlock(block.Block, parsed)
+		if err != nil {
+			return nonfinalParsedStateUpdate{}, err
+		}
+		stateUpdate = parsed.StateUpdate
 	}
 	if meta == nil || len(meta.StateRootHash) != 32 {
-		return nil, meta.Clone(), nil, nil
+		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
 	}
 
-	parsed, err := storage.ParseVerifiedBlockCell(block.Block, root)
-	if err != nil {
-		return nil, nil, nil, err
+	if stateUpdate == nil {
+		parsed, err := storage.ParseVerifiedBlockCell(block.Block, root)
+		if err != nil {
+			return nonfinalParsedStateUpdate{}, err
+		}
+		stateUpdate = parsed.StateUpdate
 	}
-	if parsed.StateUpdate == nil {
-		return nil, meta.Clone(), nil, nil
+	if stateUpdate == nil {
+		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
 	}
-	if err = cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
-		return nil, nil, nil, fmt.Errorf("validate non-final state update: %w", err)
+	if err = cell.ValidateMerkleUpdate(stateUpdate); err != nil {
+		return nonfinalParsedStateUpdate{}, fmt.Errorf("validate non-final state update: %w", err)
 	}
 
-	stateRoot, err := parsed.StateUpdate.PeekRef(1)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("load non-final state update target: %w", err)
+	return nonfinalParsedStateUpdate{
+		root:   root,
+		meta:   meta.Clone(),
+		update: stateUpdate,
+	}, nil
+}
+
+func nonfinalStateFromParsedUpdate(block storage.LiveBlockArtifacts, parsed nonfinalParsedStateUpdate, loader cell.LazyCellLoader) (*storage.BlockState, storage.StateCellRecords, error) {
+	if parsed.update == nil {
+		return nil, storage.StateCellRecords{}, nil
 	}
-	cells, err := nonfinalStateCells(stateRoot)
+
+	updateTo, err := parsed.update.PeekRef(1)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, storage.StateCellRecords{}, fmt.Errorf("load non-final state update target: %w", err)
 	}
-	stateRoot, err = nonfinalLazyCellRoot(stateRoot, loader)
+	stateRoot := updateTo.Virtualize(0)
+	stateRootHash := stateRoot.GetMetadata().Hash
+	if parsed.meta != nil && len(parsed.meta.StateRootHash) == 32 && !bytes.Equal(parsed.meta.StateRootHash, stateRootHash[:]) {
+		return nil, storage.StateCellRecords{}, fmt.Errorf("non-final state root hash mismatch: meta=%x root=%x", parsed.meta.StateRootHash, stateRootHash[:])
+	}
+
+	records, err := storage.PrepareStateUpdateCells(parsed.update)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, storage.StateCellRecords{}, err
+	}
+	if !records.Has(stateRootHash) {
+		return nil, storage.StateCellRecords{}, fmt.Errorf("prepared non-final state update cells do not contain destination root %x", stateRootHash[:])
+	}
+
+	stateRoot, err = nonfinalLoadStateRoot(stateRootHash, records, loader)
+	if err != nil {
+		return nil, storage.StateCellRecords{}, err
 	}
 
 	return &storage.BlockState{
 		Block:         block.Block,
-		StateRootHash: meta.StateRootHash,
+		StateRootHash: append([]byte(nil), stateRootHash[:]...),
 		Cell:          stateRoot,
-	}, meta.Clone(), cells, nil
+	}, records, nil
 }
 
-func nonfinalLazyCellRoot(root *cell.Cell, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	if root == nil {
-		return nil, nil
+func nonfinalStateUpdateApplies(previous []*storage.BlockState, update *cell.Cell) error {
+	currentRoot, err := nonfinalPreviousStateRoot(previous)
+	if err != nil {
+		return err
 	}
-	if root.RefsNum() == 0 {
-		return root, nil
-	}
-	return nonfinalLazyCell(root, loader)
-}
-
-func nonfinalStateCells(root *cell.Cell) (map[cell.Hash]*cell.Cell, error) {
-	if root == nil {
-		return nil, nil
-	}
-
-	cells := map[cell.Hash]*cell.Cell{}
-	if err := rememberNonfinalCells(cells, root); err != nil {
-		return nil, err
-	}
-	return cells, nil
-}
-
-func rememberNonfinalCells(cells map[cell.Hash]*cell.Cell, root *cell.Cell) error {
-	if root.GetType() == cell.PrunedCellType {
-		return nil
-	}
-
-	hash := root.HashKey()
-	if _, ok := cells[hash]; ok {
-		return nil
-	}
-	cells[hash] = root
-
-	for i := 0; i < int(root.RefsNum()); i++ {
-		ref, err := root.PeekRef(i)
-		if err != nil {
-			return fmt.Errorf("load non-final state cell ref %d: %w", i, err)
-		}
-		if err := rememberNonfinalCells(cells, ref); err != nil {
-			return err
-		}
+	if err = cell.MayApplyMerkleUpdate(currentRoot, update); err != nil {
+		return fmt.Errorf("non-final state update does not match previous state: %w", err)
 	}
 	return nil
 }
 
-func nonfinalLazyCell(root *cell.Cell, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	meta := root.GetMetadata()
-	refs := make([]cell.LazyRef, len(meta.Refs))
-	for i, ref := range meta.Refs {
-		refs[i] = cell.LazyRef{
-			LevelMask: ref.LevelMask,
-			Hashes:    flattenCellHashes(ref.Hashes),
-			Depths:    append([]uint16(nil), ref.Depths...),
+func nonfinalPreviousStateRoot(previous []*storage.BlockState) (*cell.Cell, error) {
+	switch len(previous) {
+	case 1:
+		return nonfinalStateRoot(previous[0])
+	case 2:
+		left, err := nonfinalStateRoot(previous[0])
+		if err != nil {
+			return nil, fmt.Errorf("load left merge state root: %w", err)
+		}
+		right, err := nonfinalStateRoot(previous[1])
+		if err != nil {
+			return nil, fmt.Errorf("load right merge state root: %w", err)
+		}
+
+		return cell.BeginCell().
+			MustStoreUInt(0x5f327da5, 32).
+			MustStoreRef(left).
+			MustStoreRef(right).
+			EndCell(), nil
+	default:
+		return nil, fmt.Errorf("unsupported previous state count %d", len(previous))
+	}
+}
+
+func nonfinalStateRoot(state *storage.BlockState) (*cell.Cell, error) {
+	if state == nil || state.Cell == nil {
+		return nil, fmt.Errorf("previous state cell is missing")
+	}
+
+	root := state.Cell.Virtualize(0)
+	if len(state.StateRootHash) > 0 {
+		hash := root.HashKey(0)
+		if !bytes.Equal(hash[:], state.StateRootHash) {
+			return nil, fmt.Errorf("previous state root hash mismatch for %s: got=%x want=%x", storage.FormatBlockRef(state.Block), hash[:], state.StateRootHash)
 		}
 	}
-
-	lazy, err := cell.CreateWithLazyRefsUnsafe(
-		nonfinalCellDescriptors(root),
-		nonfinalSerializedCellData(root),
-		flattenCellHashes(meta.Hashes),
-		append([]uint16(nil), meta.Depths...),
-		refs,
-		loader,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return lazy, nil
+	return root, nil
 }
 
-func nonfinalCellDescriptors(root *cell.Cell) uint16 {
-	d1 := byte(root.RefsNum())
-	if root.IsSpecial() {
-		d1 |= 8
+func nonfinalRecordOverlayLoader(records storage.StateCellRecords, base cell.LazyCellLoader) cell.LazyCellLoader {
+	var loader cell.LazyCellLoader
+	loader = func(hash cell.Hash) (*cell.Cell, error) {
+		if data := records.Data(hash); len(data) > 0 {
+			return nonfinalLazyCellRecord(hash, data, loader)
+		}
+		if base == nil {
+			return nil, cell.ErrLazyRefNotFound
+		}
+		return base(hash)
 	}
-	d1 |= root.LevelMask().Mask * 32
-
-	ln := (root.BitsSize() / 8) * 2
-	if root.BitsSize()%8 != 0 {
-		ln++
-	}
-	return uint16(d1)<<8 | uint16(byte(ln))
+	return loader
 }
 
-func nonfinalSerializedCellData(root *cell.Cell) []byte {
-	data := make([]byte, root.SerializedBOCBodySize())
-	root.SerializeBOCBodyTo(data)
-	return data
+func nonfinalLoadStateRoot(hash cell.Hash, records storage.StateCellRecords, base cell.LazyCellLoader) (*cell.Cell, error) {
+	return nonfinalRecordOverlayLoader(records, base)(hash)
 }
 
-func flattenCellHashes(hashes []cell.Hash) []byte {
-	if len(hashes) == 0 {
-		return nil
+func nonfinalLazyCellRecord(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
+	return storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash[:], encoded), loader)
+}
+
+func nonfinalSnapshotStateRecords(root *cell.Cell) (storage.StateCellRecords, error) {
+	if root == nil {
+		return storage.StateCellRecords{}, nil
 	}
 
-	out := make([]byte, 0, len(hashes)*32)
-	for _, hash := range hashes {
-		out = append(out, hash[:]...)
+	records := make([]storage.EncodedCellRecord, 0)
+	seen := map[cell.Hash]struct{}{}
+	stack := []*cell.Cell{root}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if current == nil {
+			continue
+		}
+		if current.IsLazy() {
+			loader, err := current.BeginParse()
+			if err != nil {
+				return storage.StateCellRecords{}, fmt.Errorf("load non-final snapshot cell %x: %w", current.Hash(), err)
+			}
+			current = loader.BaseCell()
+		}
+		if current.GetType() == cell.PrunedCellType {
+			continue
+		}
+
+		meta := current.GetMetadata()
+		if _, ok := seen[meta.Hash]; ok {
+			continue
+		}
+		record, err := storage.PrepareEncodedCellRecordFromCellMetadata(current, meta)
+		if err != nil {
+			return storage.StateCellRecords{}, fmt.Errorf("build non-final snapshot cell record %x: %w", meta.Hash[:], err)
+		}
+		seen[meta.Hash] = struct{}{}
+		records = append(records, record)
+
+		for i, ref := range meta.Refs {
+			if ref.Lazy {
+				continue
+			}
+			refCell, err := current.PeekRef(i)
+			if err != nil {
+				return storage.StateCellRecords{}, fmt.Errorf("load non-final snapshot ref %d from %x: %w", i, meta.Hash[:], err)
+			}
+			stack = append(stack, refCell)
+		}
 	}
-	return out
+	return storage.NewStateCellRecords(records), nil
 }

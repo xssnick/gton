@@ -17,33 +17,124 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func (s *Store) SaveBlockFull(block *storage.ServedBlockFull) error {
-	meta, proofKinds := servedBlockFullMeta(block)
-	blockRef, proofRefs, registrations, err := s.servedBlockFullArtifactRefs(block, meta, proofKinds)
+type checkpointArtifactWrite struct {
+	block           *storage.ServedBlockFull
+	proofKinds      []storage.ServedProofKind
+	blockRef        *storage.ArtifactRef
+	blockRefIndex   int
+	proofRefs       map[storage.ServedProofKind]*storage.ArtifactRef
+	proofRefIndexes map[storage.ServedProofKind]int
+	meta            *storage.BlockMeta
+}
+
+func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpointBlock) ([]checkpointArtifactWrite, []archivePackRegistration, []storage.ServedBlockLink, error) {
+	const noQueuedRef = -1
+
+	writes := make([]checkpointArtifactWrite, 0, len(entries))
+	registrations := make([]archivePackRegistration, 0, len(entries))
+	appendRequests := make([]archiveAppendRequest, 0, len(entries)*2)
+	var links []storage.ServedBlockLink
+	queueArchiveAppend := func(kind string, block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, data []byte) int {
+		idx := len(appendRequests)
+		appendRequests = append(appendRequests, archiveAppendRequest{
+			kind:       kind,
+			block:      block,
+			meta:       meta,
+			splitDepth: splitDepth,
+			data:       data,
+		})
+		return idx
+	}
+
+	for _, entry := range entries {
+		if entry.Artifact == nil {
+			continue
+		}
+
+		meta, proofKinds := servedBlockFullMeta(entry.Artifact)
+		var blockRef *storage.ArtifactRef
+		blockRefIndex := noQueuedRef
+		if len(entry.Artifact.Block) > 0 {
+			blockRefIndex = queueArchiveAppend(packfile.KindBlock, entry.Artifact.ID, meta, entry.Artifact.ArchiveShardSplitDepth, entry.Artifact.Block)
+		}
+
+		proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
+		proofRefIndexes := make(map[storage.ServedProofKind]int, len(proofKinds))
+		for _, kind := range proofKinds {
+			if len(entry.Artifact.Proof) == 0 {
+				continue
+			}
+			if isKeyProofKind(kind) {
+				ref, err := s.appendKeyBlockProofEntry(kind, entry.Artifact.ID, entry.Artifact.Proof)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				proofRefs[kind] = ref
+				continue
+			}
+			proofRefIndexes[kind] = queueArchiveAppend(packEntryKindForProofKind(kind), entry.Artifact.ID, meta, entry.Artifact.ArchiveShardSplitDepth, entry.Artifact.Proof)
+		}
+
+		links = append(links, entry.Links...)
+		writes = append(writes, checkpointArtifactWrite{
+			block:           entry.Artifact,
+			proofKinds:      proofKinds,
+			blockRef:        blockRef,
+			blockRefIndex:   blockRefIndex,
+			proofRefs:       proofRefs,
+			proofRefIndexes: proofRefIndexes,
+			meta:            meta,
+		})
+	}
+
+	appendedRefs, appendRegistrations, err := s.appendArchiveEntries(appendRequests)
 	if err != nil {
+		return nil, nil, nil, err
+	}
+	registrations = append(registrations, appendRegistrations...)
+	for idx := range writes {
+		write := &writes[idx]
+		if write.blockRefIndex != noQueuedRef {
+			write.blockRef = appendedRefs[write.blockRefIndex]
+		}
+		for kind, refIndex := range write.proofRefIndexes {
+			write.proofRefs[kind] = appendedRefs[refIndex]
+		}
+	}
+
+	return writes, registrations, links, nil
+}
+
+func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkpointArtifactWrite, registrations []archivePackRegistration, links []storage.ServedBlockLink) error {
+	if err := s.registerArchivePacks(batch, registrations); err != nil {
 		return err
 	}
-	return s.withHotBatch(func(batch *pebble.Batch) error {
-		if err := s.registerArchivePacks(batch, registrations); err != nil {
+	for _, write := range writes {
+		if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRefs); err != nil {
 			return err
 		}
-		if err := s.setServedBlockFullArtifactRefs(batch, block, proofKinds, blockRef, proofRefs); err != nil {
+	}
+
+	pendingLinks := make(map[storage.BlockRootHash]ton.BlockIDExt, len(links))
+	for _, link := range links {
+		if err := s.setNextBlockLinkWithPending(batch, pendingLinks, link.Prev, link.Next); err != nil {
 			return err
 		}
-		return s.setMergedBlockMeta(batch, meta)
-	})
+	}
+	return nil
 }
 
 func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []storage.ServedProofKind) {
+	isLink := storage.ServedBlockProofIsLink(block.ID, block.IsLink)
 	meta := &storage.BlockMeta{
 		ID:    block.ID,
-		Flags: blockMetaServedFlags(block.IsLink),
+		Flags: blockMetaServedFlags(isLink),
 	}
 	if block.Meta != nil {
 		meta = storage.MergeBlockMeta(meta, block.Meta)
 		meta.ID = block.ID
 	}
-	if len(block.Block) > 0 || block.BlockRef != nil {
+	if len(block.Block) > 0 {
 		meta.Mark(storage.BlockMetaHasBlockData)
 		if block.Meta == nil && len(block.Block) > 0 {
 			meta = storage.MergeBlockMetaFromBlockData(meta, block.ID, block.Block)
@@ -51,8 +142,8 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 	}
 
 	var proofKinds []storage.ServedProofKind
-	if len(block.Proof) > 0 || block.ProofRef != nil {
-		proofKinds = storage.StoredProofKindsForBlock(block.IsLink, meta.Has(storage.BlockMetaIsKeyBlock))
+	if len(block.Proof) > 0 {
+		proofKinds = storage.StoredProofKindsForServedBlock(block.ID, block.IsLink, meta.Has(storage.BlockMetaIsKeyBlock))
 		for _, kind := range proofKinds {
 			meta.Mark(storage.BlockMetaFlagForProof(kind))
 		}
@@ -62,134 +153,91 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 
 func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 	type fullWrite struct {
-		block         *storage.ServedBlockFull
-		proofKinds    []storage.ServedProofKind
-		blockRef      *storage.ArtifactRef
-		proofRefs     map[storage.ServedProofKind]*storage.ArtifactRef
-		registrations []archivePackRegistration
+		block           *storage.ServedBlockFull
+		proofKinds      []storage.ServedProofKind
+		blockRef        *storage.ArtifactRef
+		blockRefIndex   int
+		proofRefs       map[storage.ServedProofKind]*storage.ArtifactRef
+		proofRefIndexes map[storage.ServedProofKind]int
 	}
-	type blockDataWrite struct {
-		block ton.BlockIDExt
-		ref   *storage.ArtifactRef
-	}
-	type proofWrite struct {
-		kind  storage.ServedProofKind
-		block ton.BlockIDExt
-		ref   *storage.ArtifactRef
+	const noQueuedRef = -1
+
+	s.artifactPublishMu.Lock()
+	artifactCommitted := false
+	defer func() {
+		if !artifactCommitted {
+			s.abandonPendingArtifactPacks()
+		}
+		s.artifactPublishMu.Unlock()
+	}()
+
+	metas := make(map[storage.BlockRootHash]*storage.BlockMeta, len(imported.FullBlocks))
+	registrations := make([]archivePackRegistration, 0, len(imported.FullBlocks))
+	appendRequests := make([]archiveAppendRequest, 0, len(imported.FullBlocks)*2)
+	queueArchiveAppend := func(kind string, block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, data []byte) int {
+		idx := len(appendRequests)
+		appendRequests = append(appendRequests, archiveAppendRequest{
+			kind:       kind,
+			block:      block,
+			meta:       meta,
+			splitDepth: splitDepth,
+			data:       data,
+		})
+		return idx
 	}
 
-	metas := make(map[storage.BlockRootHash]*storage.BlockMeta, len(imported.FullBlocks)+len(imported.BlockData)+len(imported.Proofs))
 	fullWrites := make([]fullWrite, 0, len(imported.FullBlocks))
 	for _, full := range imported.FullBlocks {
 		meta, proofKinds := servedBlockFullMeta(full)
-		blockRef, proofRefs, registrations, err := s.servedBlockFullArtifactRefs(full, meta, proofKinds)
-		if err != nil {
-			return err
+		var blockRef *storage.ArtifactRef
+		blockRefIndex := noQueuedRef
+		if len(full.Block) > 0 {
+			reusable, err := s.reusableArtifactRef(hotKeyBlockDataRef(full.ID))
+			if err == nil {
+				blockRef = reusable
+			} else {
+				if !errors.Is(err, storage.ErrNotFound) {
+					return err
+				}
+				blockRefIndex = queueArchiveAppend(packfile.KindBlock, full.ID, meta, full.ArchiveShardSplitDepth, full.Block)
+			}
 		}
-		if blockRef != nil {
-			registration, err := s.archivePackRegistrationFromRef(full.ID, meta, full.ArchiveShardSplitDepth, blockRef)
-			if err != nil {
+
+		proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
+		proofRefIndexes := make(map[storage.ServedProofKind]int, len(proofKinds))
+		for _, kind := range proofKinds {
+			reusable, err := s.reusableArtifactRef(hotKeyStoredProofRef(kind, full.ID))
+			if err == nil {
+				proofRefs[kind] = reusable
+				continue
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
 				return err
 			}
-			if registration.valid {
-				registrations = append(registrations, registration)
+
+			if len(full.Proof) == 0 {
+				continue
 			}
+			if isKeyProofKind(kind) {
+				ref, err := s.appendKeyBlockProofEntry(kind, full.ID, full.Proof)
+				if err != nil {
+					return err
+				}
+				proofRefs[kind] = ref
+				continue
+			}
+			proofRefIndexes[kind] = queueArchiveAppend(packEntryKindForProofKind(kind), full.ID, meta, full.ArchiveShardSplitDepth, full.Proof)
 		}
+
 		mergeArchiveImportMeta(metas, meta)
 		fullWrites = append(fullWrites, fullWrite{
-			block:         full,
-			proofKinds:    proofKinds,
-			blockRef:      blockRef,
-			proofRefs:     proofRefs,
-			registrations: registrations,
+			block:           full,
+			proofKinds:      proofKinds,
+			blockRef:        blockRef,
+			blockRefIndex:   blockRefIndex,
+			proofRefs:       proofRefs,
+			proofRefIndexes: proofRefIndexes,
 		})
-	}
-
-	blockDataWrites := make([]blockDataWrite, 0, len(imported.BlockData))
-	for _, block := range imported.BlockData {
-		if len(block.Data) == 0 && block.Ref == nil {
-			continue
-		}
-		ref := block.Ref
-		var registrations []archivePackRegistration
-		if ref == nil {
-			meta := &storage.BlockMeta{
-				ID:    block.ID,
-				Flags: storage.BlockMetaHasBlockData,
-			}
-			meta = storage.MergeBlockMetaFromBlockData(meta, block.ID, block.Data)
-			reusable, err := s.reusableArtifactRef(hotKeyBlockDataRef(block.ID))
-			if err == nil {
-				ref = reusable
-			} else {
-				if !errors.Is(err, storage.ErrNotFound) {
-					return err
-				}
-				appended, err := s.appendArchiveEntry(packfile.KindBlock, block.ID, meta, 0, block.Data)
-				if err != nil {
-					return err
-				}
-				ref = appended.ref
-				registrations = append(registrations, appended.registration)
-			}
-		}
-		meta := &storage.BlockMeta{
-			ID:    block.ID,
-			Flags: storage.BlockMetaHasBlockData,
-		}
-		if len(block.Data) > 0 {
-			meta = storage.MergeBlockMetaFromBlockData(meta, block.ID, block.Data)
-		}
-		mergeArchiveImportMeta(metas, meta)
-		blockDataWrites = append(blockDataWrites, blockDataWrite{block: block.ID, ref: ref})
-		if len(registrations) > 0 {
-			fullWrites = append(fullWrites, fullWrite{registrations: registrations})
-		}
-	}
-
-	proofWrites := make([]proofWrite, 0, len(imported.Proofs))
-	for _, proof := range imported.Proofs {
-		if len(proof.Data) == 0 && proof.Ref == nil {
-			continue
-		}
-		ref := proof.Ref
-		var registrations []archivePackRegistration
-		if ref == nil {
-			meta := &storage.BlockMeta{
-				ID:    proof.ID,
-				Flags: blockMetaFlagsForProofKind(proof.Kind),
-			}
-			reusable, err := s.reusableArtifactRef(hotKeyStoredProofRef(proof.Kind, proof.ID))
-			if err == nil {
-				ref = reusable
-			} else {
-				if !errors.Is(err, storage.ErrNotFound) {
-					return err
-				}
-				appended, err := s.appendProofEntry(proof.Kind, proof.ID, meta, 0, proof.Data)
-				if err != nil {
-					return err
-				}
-				ref = appended.ref
-				if appended.registration.valid {
-					registrations = append(registrations, appended.registration)
-				}
-			}
-		} else if isKeyProofKind(proof.Kind) {
-			var err error
-			ref, err = s.copyProofRefToKeyPack(proof.Kind, proof.ID, ref)
-			if err != nil {
-				return err
-			}
-		}
-		mergeArchiveImportMeta(metas, &storage.BlockMeta{
-			ID:    proof.ID,
-			Flags: blockMetaFlagsForProofKind(proof.Kind),
-		})
-		proofWrites = append(proofWrites, proofWrite{kind: proof.Kind, block: proof.ID, ref: ref})
-		if len(registrations) > 0 {
-			fullWrites = append(fullWrites, fullWrite{registrations: registrations})
-		}
 	}
 
 	metaKeys := make([]storage.BlockRootHash, 0, len(metas))
@@ -200,30 +248,38 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		return bytes.Compare(metaKeys[i][:], metaKeys[j][:]) < 0
 	})
 
-	return s.withHotBatch(func(batch *pebble.Batch) error {
+	appendedRefs, appendRegistrations, err := s.appendArchiveEntries(appendRequests)
+	if err != nil {
+		return err
+	}
+	registrations = append(registrations, appendRegistrations...)
+	for idx := range fullWrites {
+		write := &fullWrites[idx]
+		if write.blockRefIndex != noQueuedRef {
+			write.blockRef = appendedRefs[write.blockRefIndex]
+		}
+		for kind, refIndex := range write.proofRefIndexes {
+			write.proofRefs[kind] = appendedRefs[refIndex]
+		}
+	}
+
+	syncedPacks, err := s.syncPendingArtifactPacks()
+	if err != nil {
+		return err
+	}
+
+	if err := s.withHotBatchOptions(pebble.Sync, func(batch *pebble.Batch) error {
+		if err := s.registerArchivePacks(batch, registrations); err != nil {
+			return err
+		}
 		for _, write := range fullWrites {
-			if err := s.registerArchivePacks(batch, write.registrations); err != nil {
-				return err
-			}
-			if write.block == nil {
-				continue
-			}
 			if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRefs); err != nil {
 				return err
 			}
 		}
-		for _, write := range blockDataWrites {
-			if err := batch.Set(hotKeyBlockDataRef(write.block), encodeArtifactRef(write.ref), pebble.NoSync); err != nil {
-				return err
-			}
-		}
-		for _, write := range proofWrites {
-			if err := batch.Set(hotKeyStoredProofRef(write.kind, write.block), encodeArtifactRef(write.ref), pebble.NoSync); err != nil {
-				return err
-			}
-		}
+		pendingLinks := make(map[storage.BlockRootHash]ton.BlockIDExt, len(imported.Links))
 		for _, link := range imported.Links {
-			if err := s.setNextBlockLink(batch, link.Prev, link.Next); err != nil {
+			if err := s.setNextBlockLinkWithPending(batch, pendingLinks, link.Prev, link.Next); err != nil {
 				return err
 			}
 		}
@@ -233,71 +289,12 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 			}
 		}
 		return nil
-	})
-}
-
-func (s *Store) servedBlockFullArtifactRefs(block *storage.ServedBlockFull, meta *storage.BlockMeta, proofKinds []storage.ServedProofKind) (*storage.ArtifactRef, map[storage.ServedProofKind]*storage.ArtifactRef, []archivePackRegistration, error) {
-	if len(block.Block) == 0 && len(block.Proof) == 0 && block.BlockRef == nil && block.ProofRef == nil {
-		return nil, nil, nil, nil
+	}); err != nil {
+		return err
 	}
-
-	var registrations []archivePackRegistration
-	blockRef := block.BlockRef
-	if len(block.Block) > 0 && blockRef == nil {
-		ref, err := s.reusableArtifactRef(hotKeyBlockDataRef(block.ID))
-		if err == nil {
-			blockRef = ref
-		} else {
-			if !errors.Is(err, storage.ErrNotFound) {
-				return nil, nil, nil, err
-			}
-			appended, err := s.appendArchiveEntry(packfile.KindBlock, block.ID, meta, block.ArchiveShardSplitDepth, block.Block)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			blockRef = appended.ref
-			registrations = append(registrations, appended.registration)
-		}
-	}
-
-	proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
-	if len(proofKinds) > 0 {
-		if len(block.Proof) > 0 {
-			for _, kind := range proofKinds {
-				ref, err := s.reusableArtifactRef(hotKeyStoredProofRef(kind, block.ID))
-				if err == nil {
-					proofRefs[kind] = ref
-					continue
-				}
-				if !errors.Is(err, storage.ErrNotFound) {
-					return nil, nil, nil, err
-				}
-
-				appended, err := s.appendProofEntry(kind, block.ID, meta, block.ArchiveShardSplitDepth, block.Proof)
-				if err != nil {
-					return nil, nil, nil, err
-				}
-				proofRefs[kind] = appended.ref
-				if appended.registration.valid {
-					registrations = append(registrations, appended.registration)
-				}
-			}
-		} else if block.ProofRef != nil {
-			for _, kind := range proofKinds {
-				ref := block.ProofRef
-				if isKeyProofKind(kind) {
-					var err error
-					ref, err = s.copyProofRefToKeyPack(kind, block.ID, block.ProofRef)
-					if err != nil {
-						return nil, nil, nil, err
-					}
-				}
-				proofRefs[kind] = ref
-			}
-		}
-	}
-
-	return blockRef, proofRefs, registrations, nil
+	s.clearSyncedArtifactPacks(syncedPacks)
+	artifactCommitted = true
+	return nil
 }
 
 func (s *Store) setServedBlockFullArtifactRefs(batch *pebble.Batch, block *storage.ServedBlockFull, proofKinds []storage.ServedProofKind, blockRef *storage.ArtifactRef, proofRefs map[storage.ServedProofKind]*storage.ArtifactRef) error {
@@ -365,55 +362,34 @@ func mergeArchiveImportMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, 
 	metas[key] = merged
 }
 
-func (s *Store) archivePackRegistrationFromRef(block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, ref *storage.ArtifactRef) (archivePackRegistration, error) {
-	if ref == nil || ref.Path == "" {
-		return archivePackRegistration{}, nil
-	}
-	if block.Workchain != -1 || block.Shard != topShard {
-		return archivePackRegistration{}, nil
-	}
-
-	location, err := s.archiveEntryLocation(block, meta, splitDepth)
-	if err != nil {
-		return archivePackRegistration{}, err
-	}
-	firstMasterSeq, firstMasterUTime, firstMasterLT, err := archiveEntryFirstMaster(block, meta)
-	if err != nil {
-		return archivePackRegistration{}, err
-	}
-
-	path := ref.Path
-	if filepath.IsAbs(path) {
-		path = s.relativeArtifactPath(path)
-	}
-	stat, err := os.Stat(s.artifactPath(path))
-	if err != nil {
-		return archivePackRegistration{}, err
-	}
-	return archivePackRegistration{
-		valid:            true,
-		archiveID:        location.archiveID,
-		path:             path,
-		size:             stat.Size(),
-		baseSeq:          location.baseSeqno,
-		startSeq:         location.sliceSeqno,
-		workchain:        location.workchain,
-		shard:            location.shard,
-		firstMasterSeq:   firstMasterSeq,
-		firstMasterUTime: firstMasterUTime,
-		firstMasterLT:    firstMasterLT,
-	}, nil
-}
-
-func (s *Store) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {
-	return s.withHotBatch(func(batch *pebble.Batch) error {
-		return s.setNextBlockLink(batch, prev, next)
-	})
-}
-
-func (s *Store) setNextBlockLink(batch *pebble.Batch, prev ton.BlockIDExt, next ton.BlockIDExt) error {
+func (s *Store) setNextBlockLinkWithPending(batch *pebble.Batch, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	key := hotKeyNextBlock(prev)
 	value := encodeBlockID(next)
+	pendingKey := storage.BlockKey(prev)
+	if existing, ok := pending[pendingKey]; ok {
+		if existing.Equals(&next) {
+			return nil
+		}
+		if selected, ok := selectShardSplitNextLink(prev, existing, next); ok {
+			if existing.Equals(&selected) {
+				s.log.Debug().
+					Str("prev", storage.FormatBlockRef(prev)).
+					Str("existing_next", storage.FormatBlockRef(existing)).
+					Str("ignored_next", storage.FormatBlockRef(next)).
+					Msg("keeping selected shard split next block link")
+				return nil
+			}
+			s.log.Debug().
+				Str("prev", storage.FormatBlockRef(prev)).
+				Str("existing_next", storage.FormatBlockRef(existing)).
+				Str("selected_next", storage.FormatBlockRef(selected)).
+				Msg("updating shard split next block link to selected child")
+			pending[pendingKey] = selected
+			return batch.Set(key, encodeBlockID(selected), pebble.NoSync)
+		}
+		return fmt.Errorf("next block link for %s already points to %s, cannot set %s", storage.FormatBlockRef(prev), storage.FormatBlockRef(existing), storage.FormatBlockRef(next))
+	}
+
 	current, closer, err := pebbleReaderGet(s.hot, key)
 	if err == nil {
 		defer func() { _ = closer.Close() }()
@@ -425,13 +401,24 @@ func (s *Store) setNextBlockLink(batch *pebble.Batch, prev ton.BlockIDExt, next 
 		if err != nil {
 			return err
 		}
-		if isShardSplitNextLinkConflict(prev, existing, next) {
+		if selected, ok := selectShardSplitNextLink(prev, existing, next); ok {
+			if existing.Equals(&selected) {
+				s.log.Debug().
+					Str("prev", storage.FormatBlockRef(prev)).
+					Str("existing_next", storage.FormatBlockRef(existing)).
+					Str("ignored_next", storage.FormatBlockRef(next)).
+					Msg("keeping selected shard split next block link")
+				return nil
+			}
 			s.log.Debug().
 				Str("prev", storage.FormatBlockRef(prev)).
 				Str("existing_next", storage.FormatBlockRef(existing)).
-				Str("next", storage.FormatBlockRef(next)).
-				Msg("keeping existing shard split next block link")
-			return nil
+				Str("selected_next", storage.FormatBlockRef(selected)).
+				Msg("updating shard split next block link to selected child")
+			if pending != nil {
+				pending[pendingKey] = selected
+			}
+			return batch.Set(key, encodeBlockID(selected), pebble.NoSync)
 		}
 
 		return fmt.Errorf("next block link for %s already points to %s, cannot set %s", storage.FormatBlockRef(prev), storage.FormatBlockRef(existing), storage.FormatBlockRef(next))
@@ -439,76 +426,10 @@ func (s *Store) setNextBlockLink(batch *pebble.Batch, prev ton.BlockIDExt, next 
 	if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
+	if pending != nil {
+		pending[pendingKey] = next
+	}
 	return batch.Set(key, value, pebble.NoSync)
-}
-
-func (s *Store) SaveBlockData(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
-	if len(data) == 0 {
-		return nil
-	}
-	meta := &storage.BlockMeta{
-		ID:    block,
-		Flags: storage.BlockMetaHasBlockData,
-	}
-	meta = storage.MergeBlockMetaFromBlockData(meta, block, data)
-	var registrations []archivePackRegistration
-	if ref == nil {
-		appended, err := s.appendArchiveEntry(packfile.KindBlock, block, meta, 0, data)
-		if err != nil {
-			return err
-		}
-		ref = appended.ref
-		registrations = append(registrations, appended.registration)
-	}
-	if err := s.withHotBatch(func(batch *pebble.Batch) error {
-		if err := s.registerArchivePacks(batch, registrations); err != nil {
-			return err
-		}
-		return batch.Set(hotKeyBlockDataRef(block), encodeArtifactRef(ref), pebble.NoSync)
-	}); err != nil {
-		return err
-	}
-
-	return s.mergeAndStoreBlockMeta(meta)
-}
-
-func (s *Store) SaveBlockProof(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
-	if len(data) == 0 && ref == nil {
-		return nil
-	}
-	meta := &storage.BlockMeta{
-		ID:    block,
-		Flags: blockMetaFlagsForProofKind(kind),
-	}
-	var registrations []archivePackRegistration
-	if ref == nil {
-		appended, err := s.appendProofEntry(kind, block, meta, 0, data)
-		if err != nil {
-			return err
-		}
-		ref = appended.ref
-		if appended.registration.valid {
-			registrations = append(registrations, appended.registration)
-		}
-	} else if isKeyProofKind(kind) {
-		var err error
-		ref, err = s.copyProofRefToKeyPack(kind, block, ref)
-		if err != nil {
-			return err
-		}
-	}
-	if err := s.withHotBatch(func(batch *pebble.Batch) error {
-		if err := s.registerArchivePacks(batch, registrations); err != nil {
-			return err
-		}
-		return batch.Set(hotKeyStoredProofRef(kind, block), encodeArtifactRef(ref), pebble.NoSync)
-	}); err != nil {
-		return err
-	}
-	return s.mergeAndStoreBlockMeta(&storage.BlockMeta{
-		ID:    block,
-		Flags: blockMetaFlagsForProofKind(kind),
-	})
 }
 
 func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
@@ -607,86 +528,6 @@ func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.
 	return batch.Set(key, encodeBlockMeta(meta), pebble.NoSync)
 }
 
-func (s *Store) SaveArchiveFile(masterchainSeqno int32, workchain int32, shard int64, archiveID int64, path string) (storage.SavedArchiveFile, error) {
-	baseSeqno := uint32(archiveID)
-	masterSeqno := uint32(masterchainSeqno)
-	if masterSeqno < baseSeqno {
-		return storage.SavedArchiveFile{}, fmt.Errorf("archive masterchain seqno %d is before package base %d", masterchainSeqno, baseSeqno)
-	}
-	sliceSeqno := archiveSliceSeqno(baseSeqno, masterSeqno)
-	shardPrefix := archivePackShardPrefix(workchain, shard, 0)
-	storedPath := s.archivePackPath(sliceSeqno, workchain, shardPrefix)
-	localArchiveID := archivePackID(baseSeqno, sliceSeqno, workchain, shardPrefix)
-
-	s.artifactMu.Lock()
-	if filepath.Clean(path) != filepath.Clean(storedPath) {
-		if err := s.ensureCleanPackTail(storedPath, s.pendingArchiveSync, s.dirtyArchivePacks); err != nil {
-			s.artifactMu.Unlock()
-			return storage.SavedArchiveFile{}, err
-		}
-	}
-	storeResult, err := storeArchivePack(path, storedPath)
-	if err != nil {
-		s.markDirtyPackTail(s.dirtyArchivePacks, storedPath)
-		s.artifactMu.Unlock()
-		return storage.SavedArchiveFile{}, err
-	}
-	stat, err := os.Stat(storedPath)
-	if err == nil && storeResult.stored {
-		s.markPendingPackSync(s.pendingArchiveSync, storedPath)
-	}
-	s.artifactMu.Unlock()
-	if err != nil {
-		return storage.SavedArchiveFile{}, err
-	}
-	ref := &storage.ArtifactRef{
-		Path: s.relativeArtifactPath(storedPath),
-		Size: stat.Size(),
-	}
-	firstMasterUTime, firstMasterLT := s.archivePackageFirstMasterFromStoredMeta(uint32(masterchainSeqno))
-	if err := s.withHotBatch(func(batch *pebble.Batch) error {
-		reg := archivePackRegistration{
-			valid:            true,
-			archiveID:        localArchiveID,
-			path:             ref.Path,
-			size:             ref.Size,
-			baseSeq:          baseSeqno,
-			startSeq:         sliceSeqno,
-			workchain:        workchain,
-			shard:            shardPrefix,
-			firstMasterSeq:   uint32(masterchainSeqno),
-			firstMasterUTime: firstMasterUTime,
-			firstMasterLT:    firstMasterLT,
-		}
-		if err := batch.Set(hotKeyArchivePackageStart(baseSeqno), []byte{1}, pebble.NoSync); err != nil {
-			return err
-		}
-		return s.registerArchivePacks(batch, []archivePackRegistration{reg})
-	}); err != nil {
-		return storage.SavedArchiveFile{}, err
-	}
-	return storage.SavedArchiveFile{
-		Path:           storedPath,
-		ReusedExisting: storeResult.reusedExisting,
-	}, nil
-}
-
-func (s *Store) archivePackageFirstMasterFromStoredMeta(masterchainSeqno uint32) (uint32, uint64) {
-	block, err := s.LookupBlockBySeqNo(context.Background(), storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, masterchainSeqno)
-	if err != nil {
-		return 0, 0
-	}
-	meta, err := s.BlockMeta(context.Background(), block)
-	if err != nil || meta == nil {
-		return 0, 0
-	}
-	lt := meta.StartLT
-	if lt == 0 {
-		lt = meta.EndLT
-	}
-	return meta.GenUTime, lt
-}
-
 func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
 	meta, err := s.BlockMeta(ctx, block)
 	if err != nil {
@@ -719,6 +560,7 @@ func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.S
 		ID:     block,
 		Proof:  proof,
 		Block:  data,
+		Meta:   meta.Clone(),
 		IsLink: meta.Has(storage.BlockMetaServedFullIsLink),
 	}, nil
 }

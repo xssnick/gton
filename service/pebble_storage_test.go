@@ -8,7 +8,6 @@ import (
 	"github.com/xssnick/gton/service/archive/packfile"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -28,36 +27,32 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	proofData := []byte{0x10, 0x20, 0x30}
 	zeroStateData := []byte{0x01, 0x00, 0x02}
 
-	if err := store.SaveBlockFull(&storage.ServedBlockFull{
-		ID:     block,
-		Block:  blockData,
-		Proof:  proofData,
-		IsLink: false,
+	if err := store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:     block,
+			Block:  blockData,
+			Proof:  proofData,
+			IsLink: false,
+		}},
+		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
 	}); err != nil {
 		t.Fatalf("save block full: %v", err)
-	}
-	if err := store.LinkNextBlock(prev, block); err != nil {
-		t.Fatalf("link next block: %v", err)
 	}
 	if err := store.SaveZeroState(prev, zeroStateData, nil); err != nil {
 		t.Fatalf("save zero state: %v", err)
 	}
 
-	archivePath := filepath.Join(t.TempDir(), "archive.pack")
-	archiveFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatalf("create archive pack: %v", err)
-	}
-	archivePtr, err := packfile.Append(archiveFile, "test", []byte{0x55, 0x44}, true)
-	if closeErr := archiveFile.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatalf("write archive pack: %v", err)
-	}
 	archiveSeqno := int32(101)
-	if _, err = store.SaveArchiveFile(archiveSeqno, -1, topShard, 0, archivePath); err != nil {
-		t.Fatalf("save archive file: %v", err)
+	archiveBlock := testPebbleBlockID(-1, topShard, uint32(archiveSeqno))
+	archiveData := []byte{0x55, 0x44}
+	if err := store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    archiveBlock,
+			Block: archiveData,
+			Meta:  &storage.BlockMeta{ID: archiveBlock, GenUTime: 1010, StartLT: 101, EndLT: 102},
+		}},
+	}); err != nil {
+		t.Fatalf("save archive import: %v", err)
 	}
 
 	got, err := store.BlockFull(ctx, block)
@@ -96,8 +91,9 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 		t.Fatalf("archive header mismatch: err=%v data=%x", err, archiveHeader)
 	}
 
-	archive, err := store.ArchiveSlice(ctx, archiveID, archivePtr.Offset, 16)
-	if err != nil || !bytes.Equal(archive, []byte{0x55, 0x44}) {
+	archiveOffset := int64(packfile.HeaderSize + packfile.EntryHeaderSize + len(packfile.EntryName(packfile.KindBlock, archiveBlock)))
+	archive, err := store.ArchiveSlice(ctx, archiveID, archiveOffset, int32(len(archiveData)))
+	if err != nil || !bytes.Equal(archive, archiveData) {
 		t.Fatalf("archive slice mismatch: err=%v data=%x", err, archive)
 	}
 }

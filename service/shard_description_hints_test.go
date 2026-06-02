@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 )
 
@@ -19,8 +20,8 @@ func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
 		key := storage.BlockKey(block)
 		svc.shardDescriptionOrder = append(svc.shardDescriptionOrder, key)
 		svc.shardDescriptionHints[key] = shardDescriptionHint{
-			Block:      block,
-			ReceivedAt: now,
+			Description: p2p.ShardBlockDescription{Block: block},
+			ReceivedAt:  now,
 		}
 	}
 

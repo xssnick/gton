@@ -84,7 +84,7 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 
 	b.Run("active-root-hit", func(b *testing.B) {
 		overlay := newArchiveStateCellOverlay(rejectingBenchmarkCellLoader)
-		overlay.rememberPreparedCells(records)
+		overlay.addPreparedRecords(records)
 		load := overlay.loader()
 
 		b.ReportAllocs()
@@ -102,7 +102,7 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 
 	b.Run("pending-root-hit", func(b *testing.B) {
 		overlay := newArchiveStateCellOverlay(rejectingBenchmarkCellLoader)
-		overlay.rememberPreparedCells(records)
+		overlay.addPreparedRecords(records)
 		checkpoint := overlay.beginCheckpoint()
 		if checkpoint == nil {
 			b.Fatal("checkpoint is nil")

@@ -390,7 +390,13 @@ func TestDecodeShardBlockBroadcastCompressedV2AllowsNonFinalSimplex(t *testing.T
 	res, err := decodeBlockBroadcastCompressedV2(tonnodeapi.BlockBroadcastCompressedV2{
 		ID: id,
 		SignatureSet: tonnodeapi.SignatureSetSimplex{
-			Final: false,
+			Final:     false,
+			SessionID: bytes.Repeat([]byte{0x44}, 32),
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            id,
+				CollatedFileHash: bytes.Repeat([]byte{0x46}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
 		},
 		Proof:          proofCell.ToBOC(),
 		DataCompressed: compressed,
@@ -400,9 +406,6 @@ func TestDecodeShardBlockBroadcastCompressedV2AllowsNonFinalSimplex(t *testing.T
 	}
 	if res.Kind != "tonNode.blockBroadcastCompressedV2" {
 		t.Fatalf("unexpected kind %q", res.Kind)
-	}
-	if res.BroadcastSignatures != nil {
-		t.Fatal("non-final shard simplex signatures should not be used as final broadcast signatures")
 	}
 	if !res.VerifiedRootHash {
 		t.Fatalf("expected root hash verification")
@@ -431,7 +434,13 @@ func TestDecodeMasterchainBlockBroadcastCompressedV2RejectsNonFinalSimplex(t *te
 	_, err = decodeBlockBroadcastCompressedV2(tonnodeapi.BlockBroadcastCompressedV2{
 		ID: id,
 		SignatureSet: tonnodeapi.SignatureSetSimplex{
-			Final: false,
+			Final:     false,
+			SessionID: bytes.Repeat([]byte{0x45}, 32),
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            id,
+				CollatedFileHash: bytes.Repeat([]byte{0x47}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
 		},
 		Proof:          proofCell.ToBOC(),
 		DataCompressed: compressed,

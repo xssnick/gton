@@ -834,8 +834,8 @@ func TestCatchUpCurrentStateYieldsForActiveCellGenerationSwitch(t *testing.T) {
 	locked := make(chan struct{})
 	go func() {
 		svc.stateMu.Lock()
-		svc.stateMu.Unlock()
 		close(locked)
+		svc.stateMu.Unlock()
 	}()
 
 	select {
@@ -864,8 +864,8 @@ func TestCatchUpCurrentStateYieldsForCellGenerationSwitchRequest(t *testing.T) {
 	locked := make(chan struct{})
 	go func() {
 		svc.stateMu.Lock()
-		svc.stateMu.Unlock()
 		close(locked)
+		svc.stateMu.Unlock()
 	}()
 
 	select {

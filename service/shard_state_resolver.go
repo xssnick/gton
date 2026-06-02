@@ -76,10 +76,6 @@ func newShardStateResolver(ctx context.Context, cfg shardStateResolverConfig) *s
 	}
 }
 
-func (r *shardStateResolver) resolve(block ton.BlockIDExt) (*storage.BlockState, error) {
-	return r.resolveWithContext(r.ctx, block)
-}
-
 func (r *shardStateResolver) resolveWithContext(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
 	key := storage.BlockKey(block)
 
@@ -278,27 +274,6 @@ func (r *shardStateResolver) statsSnapshot() shardStateResolverStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.stats
-}
-
-func (r *shardStateResolver) cachedState(block ton.BlockIDExt) (*storage.BlockState, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	state := r.cache[storage.BlockKey(block)]
-	if state == nil {
-		return nil, false
-	}
-	return state, true
-}
-
-func (r *shardStateResolver) rememberState(state *storage.BlockState) {
-	if state == nil {
-		return
-	}
-
-	r.mu.Lock()
-	r.cache[storage.BlockKey(state.Block)] = state
-	r.mu.Unlock()
 }
 
 func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {

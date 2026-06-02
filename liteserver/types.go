@@ -7,21 +7,12 @@ import (
 )
 
 func cloneBlockID(id ton.BlockIDExt) *ton.BlockIDExt {
-	return &ton.BlockIDExt{
-		Workchain: id.Workchain,
-		Shard:     id.Shard,
-		SeqNo:     id.SeqNo,
-		RootHash:  append([]byte(nil), id.RootHash...),
-		FileHash:  append([]byte(nil), id.FileHash...),
-	}
+	cloned := id
+	return &cloned
 }
 
 func cloneZeroState(id ton.ZeroStateIDExt) ton.ZeroStateIDExt {
-	return ton.ZeroStateIDExt{
-		Workchain: id.Workchain,
-		RootHash:  append([]byte(nil), id.RootHash...),
-		FileHash:  append([]byte(nil), id.FileHash...),
-	}
+	return id
 }
 
 func cloneZeroStatePtr(id ton.ZeroStateIDExt) *ton.ZeroStateIDExt {

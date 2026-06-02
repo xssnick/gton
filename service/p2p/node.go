@@ -75,23 +75,26 @@ type Node struct {
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx                context.Context
-	zeroStateFileHash     []byte
-	zeroStateBlock        ton.BlockIDExt
-	initBlock             ton.BlockIDExt
-	externalPort          uint16
-	dhtListenAddr         string
-	storage               storage2.Storage
-	peerStorage           storage2.PeerServingStorage
-	compressedState       CompressedBlockStateProvider
-	syncLag               SyncLagProvider
-	signatureVerifier     BroadcastSignatureVerifier
-	shardBroadcastCache   *shardBroadcastBlockCache
-	shardBroadcastWaitMx  sync.Mutex
-	shardBroadcastWaiters map[storage2.BlockRootHash][]chan struct{}
-	blockCacheObserver    BlockCacheObserver
-	blockCacheSlots       chan struct{}
-	rebroadcastQuiet      atomic.Bool
+	runCtx                    context.Context
+	zeroStateFileHash         []byte
+	zeroStateBlock            ton.BlockIDExt
+	initBlock                 ton.BlockIDExt
+	externalPort              uint16
+	dhtListenAddr             string
+	storage                   storage2.Storage
+	peerStorage               storage2.PeerServingStorage
+	liveBlockCache            *storage2.LiveBlockCache
+	compressedState           CompressedBlockStateProvider
+	syncLag                   SyncLagProvider
+	signatureVerifier         BroadcastSignatureVerifier
+	broadcastAdmission        BroadcastAdmission
+	broadcastPipelineObserver BroadcastPipelineObserver
+	shardBroadcastCache       *shardBroadcastBlockCache
+	shardCandidateCache       *shardBlockCandidateCache
+	shardBroadcastWaitMx      sync.Mutex
+	shardBroadcastWaiters     map[storage2.BlockRootHash][]chan struct{}
+	blockCacheObserver        BlockCacheObserver
+	rebroadcastQuiet          atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
@@ -99,10 +102,11 @@ type Node struct {
 	rebroadcastFECMu        sync.Mutex
 	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[PeerID]struct{}
 
-	pendingBroadcastMx         sync.Mutex
-	pendingBroadcasts          map[string]pendingBlockBroadcastDecode
-	pendingBroadcastBytes      int64
-	pendingBroadcastProcessing bool
+	pendingBroadcastMx           sync.Mutex
+	pendingBroadcasts            map[string]pendingBlockBroadcastDecode
+	pendingBroadcastBytes        int64
+	pendingBroadcastProcessing   bool
+	pendingBroadcastProcessAgain bool
 
 	broadcastStatsMx sync.Mutex
 	broadcastStats   map[broadcastStatKey]uint64
@@ -217,6 +221,10 @@ func New(opts Options) (*Node, error) {
 	if peerStorage == nil {
 		return nil, fmt.Errorf("peer serving storage is required")
 	}
+	liveBlockCache := opts.LiveBlockCache
+	if liveBlockCache == nil {
+		liveBlockCache = storage2.NewLiveBlockCache(storage2.DefaultLiveBlockCacheMaxBlocks)
+	}
 
 	stateFilesDir, err := prepareStateFilesDir(opts.StateFilesDir)
 	if err != nil {
@@ -252,12 +260,14 @@ func New(opts Options) (*Node, error) {
 		rawMasterchainNotify:      make(chan struct{}),
 		storage:                   storage,
 		peerStorage:               peerStorage,
+		liveBlockCache:            liveBlockCache,
 		compressedState:           opts.CompressedState,
 		syncLag:                   opts.SyncLag,
 		signatureVerifier:         opts.SignatureVerifier,
+		broadcastAdmission:        opts.BroadcastAdmission,
 		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
+		shardCandidateCache:       newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
 		shardBroadcastWaiters:     map[storage2.BlockRootHash][]chan struct{}{},
-		blockCacheSlots:           make(chan struct{}, 2),
 		rebroadcastThrottleLast:   map[string]time.Time{},
 		rebroadcastFECSlots:       newRebroadcastFECSlotLimits(),
 		rebroadcastFECPeers:       newRebroadcastFECPeerLimits(),
@@ -282,6 +292,10 @@ func protocolDiagnosticLoggable(msg string) bool {
 
 func (n *Node) SetBroadcastSignatureVerifier(verifier BroadcastSignatureVerifier) {
 	n.signatureVerifier = verifier
+}
+
+func (n *Node) SetBroadcastAdmission(admission BroadcastAdmission) {
+	n.broadcastAdmission = admission
 }
 
 func (n *Node) LocalID() PeerID {
@@ -964,6 +978,17 @@ func (d *eventDeduper) Seen(key string, now time.Time) bool {
 		return false
 	}
 	return true
+}
+
+func (d *eventDeduper) Forget(key string) {
+	if d == nil {
+		return
+	}
+
+	d.mx.Lock()
+	defer d.mx.Unlock()
+
+	d.deleteEntryLocked(d.seen[key])
 }
 
 func (d *eventDeduper) pruneExpiredLocked(now time.Time) {

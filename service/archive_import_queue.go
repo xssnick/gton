@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"github.com/xssnick/gton/service/archive"
@@ -20,6 +21,7 @@ type archiveImportQueue struct {
 	downloadPrefetch chan archiveDownloadJob
 	prepareHot       chan archivePrepareJob
 	preparePrefetch  chan archivePrepareJob
+	downloadedBytes  *archiveDownloadByteGate
 	activeDownload   atomic.Int64
 	activePrepare    atomic.Int64
 }
@@ -36,14 +38,17 @@ type archiveDownloadJob struct {
 type archivePrepareJob struct {
 	ctx        context.Context
 	downloaded *archive.Downloaded
+	bytes      uint64
 	splitDepth uint32
 	priority   archiveImportPriority
 	done       chan archiveImportQueueResult
 }
 
 type archiveImportQueueResult struct {
-	imported *archiveImportResult
-	err      error
+	imported  *archiveImportResult
+	peer      string
+	archiveID int64
+	err       error
 }
 
 func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *archiveImportQueue {
@@ -56,6 +61,7 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 		downloadPrefetch: make(chan archiveDownloadJob, downloadWorkers),
 		prepareHot:       make(chan archivePrepareJob, prepareWorkers),
 		preparePrefetch:  make(chan archivePrepareJob, prepareWorkers),
+		downloadedBytes:  newArchiveDownloadByteGate(r.archiveCheckpointBackpressureBytes()),
 	}
 	for worker := 0; worker < downloadBudget.hotOnly; worker++ {
 		go func() {
@@ -109,7 +115,7 @@ func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
 		return archiveImportQueueSnapshot{}
 	}
 
-	return archiveImportQueueSnapshot{
+	snapshot := archiveImportQueueSnapshot{
 		activeDownload:         q.activeDownload.Load(),
 		activePrepare:          q.activePrepare.Load(),
 		downloadHotQueued:      len(q.downloadHot),
@@ -117,6 +123,11 @@ func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
 		prepareHotQueued:       len(q.prepareHot),
 		preparePrefetchQueued:  len(q.preparePrefetch),
 	}
+	if q.downloadedBytes != nil {
+		snapshot.downloadedBytes = q.downloadedBytes.size()
+		snapshot.downloadedBytesLimit = q.downloadedBytes.limit()
+	}
+	return snapshot
 }
 
 func (q *archiveImportQueue) importArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, priority archiveImportPriority) (*archiveImportResult, error) {
@@ -161,15 +172,27 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	q.activeDownload.Add(1)
 	defer q.activeDownload.Add(-1)
 
+	if q.downloadedBytes != nil {
+		if err := q.downloadedBytes.wait(job.ctx); err != nil {
+			job.done <- archiveImportQueueResult{err: err}
+			return
+		}
+	}
+
 	downloaded, err := r.downloadArchiveFile(job.ctx, job.masterchainSeqno, job.shard)
 	if err != nil {
 		job.done <- archiveImportQueueResult{err: err}
 		return
 	}
+	downloadedBytes := uint64(len(downloaded.Data))
+	if q.downloadedBytes != nil {
+		q.downloadedBytes.add(downloadedBytes)
+	}
 
 	prepare := archivePrepareJob{
 		ctx:        job.ctx,
 		downloaded: downloaded,
+		bytes:      downloadedBytes,
 		splitDepth: job.splitDepth,
 		priority:   job.priority,
 		done:       job.done,
@@ -177,12 +200,25 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	select {
 	case q.prepareJobs(job.priority) <- prepare:
 	case <-job.ctx.Done():
+		if q.downloadedBytes != nil {
+			q.downloadedBytes.release(downloadedBytes)
+		}
 		job.done <- archiveImportQueueResult{err: job.ctx.Err()}
 	}
 }
 
 func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archivePrepareJob) {
+	releaseDownloadedData := func() {
+		if job.downloaded != nil {
+			job.downloaded.Data = nil
+		}
+		if q.downloadedBytes != nil {
+			q.downloadedBytes.release(job.bytes)
+		}
+	}
+
 	if err := job.ctx.Err(); err != nil {
+		releaseDownloadedData()
 		job.done <- archiveImportQueueResult{err: err}
 		return
 	}
@@ -191,7 +227,10 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 	defer q.activePrepare.Add(-1)
 
 	imported, err := r.prepareArchiveDownload(job.ctx, job.downloaded.MasterchainSeqno, job.downloaded.Shard, job.splitDepth, job.downloaded)
-	job.done <- archiveImportQueueResult{imported: imported, err: err}
+	peer := job.downloaded.Peer
+	archiveID := job.downloaded.ArchiveID
+	releaseDownloadedData()
+	job.done <- archiveImportQueueResult{imported: imported, peer: peer, archiveID: archiveID, err: err}
 }
 
 func (q *archiveImportQueue) nextDownload(ctx context.Context) (archiveDownloadJob, bool) {
@@ -248,6 +287,97 @@ func (q *archiveImportQueue) prepareJobs(priority archiveImportPriority) chan ar
 		return q.prepareHot
 	}
 	return q.preparePrefetch
+}
+
+type archiveDownloadByteGate struct {
+	max   uint64
+	mu    sync.Mutex
+	done  chan struct{}
+	bytes uint64
+}
+
+func newArchiveDownloadByteGate(max uint64) *archiveDownloadByteGate {
+	if max == 0 {
+		return nil
+	}
+	return &archiveDownloadByteGate{
+		max:  max,
+		done: make(chan struct{}),
+	}
+}
+
+func (g *archiveDownloadByteGate) wait(ctx context.Context) error {
+	if g == nil || g.max == 0 {
+		return nil
+	}
+
+	for {
+		g.mu.Lock()
+		if g.bytes < g.max {
+			g.mu.Unlock()
+			return nil
+		}
+		done := g.done
+		g.mu.Unlock()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (g *archiveDownloadByteGate) add(bytes uint64) {
+	if g == nil || bytes == 0 {
+		return
+	}
+
+	g.mu.Lock()
+	if g.bytes > ^uint64(0)-bytes {
+		g.bytes = ^uint64(0)
+	} else {
+		g.bytes += bytes
+	}
+	g.mu.Unlock()
+}
+
+func (g *archiveDownloadByteGate) release(bytes uint64) {
+	if g == nil || bytes == 0 {
+		return
+	}
+
+	g.mu.Lock()
+	if bytes > g.bytes {
+		g.bytes = 0
+	} else {
+		g.bytes -= bytes
+	}
+	g.broadcast()
+	g.mu.Unlock()
+}
+
+func (g *archiveDownloadByteGate) size() uint64 {
+	if g == nil {
+		return 0
+	}
+
+	g.mu.Lock()
+	bytes := g.bytes
+	g.mu.Unlock()
+	return bytes
+}
+
+func (g *archiveDownloadByteGate) limit() uint64 {
+	if g == nil {
+		return 0
+	}
+	return g.max
+}
+
+func (g *archiveDownloadByteGate) broadcast() {
+	close(g.done)
+	g.done = make(chan struct{})
 }
 
 func archiveCPUWorkers() int {

@@ -8,7 +8,6 @@ import (
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/archive/packfile"
-	"os"
 	"time"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -66,7 +65,7 @@ type resolvedArchive struct {
 	peers []*overlayPeer
 }
 
-func (n *Node) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, tmpDir string) (*archive.Downloaded, error) {
+func (n *Node) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID) (*archive.Downloaded, error) {
 	sub, err := n.subscriptionForBlock(ton.BlockIDExt{Workchain: shard.Workchain, Shard: shard.Shard})
 	if err != nil {
 		return nil, err
@@ -113,7 +112,7 @@ func (n *Node) DownloadArchive(ctx context.Context, masterchainSeqno uint32, sha
 	}
 	logBootstrapTiming(resolved.Peer, nil)
 
-	return sub.downloadArchiveFromResolved(ctx, resolved, tmpDir)
+	return sub.downloadArchiveFromResolved(ctx, resolved)
 }
 
 func (s *overlaySubscription) ensureArchivePeers(ctx context.Context, shard archive.ShardID) error {
@@ -187,7 +186,7 @@ func (s *overlaySubscription) resolveArchive(ctx context.Context, masterchainSeq
 		Shard:            shard,
 		ArchiveID:        info.candidate.archiveID,
 		Peer:             info.peer.addr,
-		seedSlice:        append([]byte(nil), info.candidate.seedSlice...),
+		seedSlice:        info.candidate.seedSlice,
 		seedElapsed:      info.candidate.seedElapsed,
 		hasSeed:          info.candidate.hasSeed,
 		peer:             info.peer,
@@ -195,7 +194,7 @@ func (s *overlaySubscription) resolveArchive(ctx context.Context, masterchainSeq
 	}, nil
 }
 
-func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, resolved resolvedArchive, tmpDir string) (*archive.Downloaded, error) {
+func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, resolved resolvedArchive) (*archive.Downloaded, error) {
 	peers := s.node.prioritizeArchivePeers(resolved.Shard, resolved.peers)
 	peers = s.availableArchivePeers(resolved.Shard, peers)
 	if len(peers) == 0 {
@@ -238,15 +237,15 @@ func (s *overlaySubscription) downloadArchiveFromResolved(ctx context.Context, r
 		candidates[archivePeerID(resolved.peer)] = archiveCandidate{
 			peer:        resolved.peer,
 			archiveID:   resolved.ArchiveID,
-			seedSlice:   append([]byte(nil), resolved.seedSlice...),
+			seedSlice:   resolved.seedSlice,
 			seedElapsed: resolved.seedElapsed,
 			hasSeed:     resolved.hasSeed,
 		}
 	}
-	return s.downloadArchiveFromPeers(ctx, resolved, ordered, tmpDir, candidates)
+	return s.downloadArchiveFromPeers(ctx, resolved, ordered, candidates)
 }
 
-func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, resolved resolvedArchive, peers []*overlayPeer, tmpDir string, candidates map[PeerID]archiveCandidate) (*archive.Downloaded, error) {
+func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, resolved resolvedArchive, peers []*overlayPeer, candidates map[PeerID]archiveCandidate) (*archive.Downloaded, error) {
 	var errs []error
 	usedPeers := make(map[PeerID]struct{}, len(peers))
 
@@ -275,7 +274,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, reso
 			candidates[peerID] = candidate
 		}
 
-		downloaded, err := s.downloadArchiveFromPeer(ctx, resolved, candidate, tmpDir)
+		downloaded, err := s.downloadArchiveFromPeer(ctx, resolved, candidate)
 		if err == nil {
 			return downloaded, nil
 		}
@@ -322,19 +321,9 @@ func formatArchiveCandidateRate(candidate archiveCandidate) string {
 	return logutil.FormatByteRate(0, time.Second)
 }
 
-func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resolved resolvedArchive, candidate archiveCandidate, tmpDir string) (*archive.Downloaded, error) {
+func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resolved resolvedArchive, candidate archiveCandidate) (*archive.Downloaded, error) {
 	peer := candidate.peer
 	archiveID := candidate.archiveID
-	file, err := os.CreateTemp(tmpDir, "gton-archive-*.pack.part")
-	if err != nil {
-		return nil, fmt.Errorf("create archive temp file: %w", err)
-	}
-
-	path := file.Name()
-	cleanup := func() {
-		_ = file.Close()
-		_ = os.Remove(path)
-	}
 
 	release := s.node.acquireDownloadPeer(peer)
 	defer release()
@@ -345,11 +334,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 	var lastLogBytes int64
 	var downloadElapsed time.Duration
 	var lastLogDownloadElapsed time.Duration
-
-	fail := func(err error) (*archive.Downloaded, error) {
-		cleanup()
-		return nil, err
-	}
+	var buf []byte
 
 	s.log.Debug().
 		Uint32("masterchain_seqno", resolved.MasterchainSeqno).
@@ -371,13 +356,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		if sizeErr := checkArchivePackDownloadSize(offset, len(data)); sizeErr != nil {
 			return sizeErr
 		}
-		n, err := file.Write(data)
-		if err != nil {
-			return fmt.Errorf("write archive temp file: %w", err)
-		}
-		if n != len(data) {
-			return fmt.Errorf("short archive temp file write: %d of %d", n, len(data))
-		}
+		buf = append(buf, data...)
 		offset += int64(len(data))
 		return nil
 	}
@@ -385,12 +364,17 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 	seedComplete := false
 	if candidate.hasSeed {
 		if len(candidate.seedSlice) > archiveSliceSize {
-			return fail(fmt.Errorf("archive seed response too large: %d", len(candidate.seedSlice)))
+			return nil, fmt.Errorf("archive seed response too large: %d", len(candidate.seedSlice))
+		}
+		if err := checkArchivePackMagic(candidate.seedSlice); err != nil {
+			return nil, err
+		}
+		if err := checkArchivePackDownloadSize(0, len(candidate.seedSlice)); err != nil {
+			return nil, err
 		}
 		downloadElapsed += candidate.seedElapsed
-		if err = writeSlice(candidate.seedSlice); err != nil {
-			return fail(err)
-		}
+		buf = candidate.seedSlice
+		offset = int64(len(candidate.seedSlice))
 		seedComplete = len(candidate.seedSlice) < archiveSliceSize
 	}
 
@@ -402,13 +386,13 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		data, err := s.queryArchiveSlice(ctx, peer, archiveID, offset)
 		downloadElapsed += time.Since(queryStarted)
 		if err != nil {
-			return fail(fmt.Errorf("download archive offset=%d: %w", offset, err))
+			return nil, fmt.Errorf("download archive offset=%d: %w", offset, err)
 		}
 		if len(data) > archiveSliceSize {
-			return fail(fmt.Errorf("archive slice response too large: %d", len(data)))
+			return nil, fmt.Errorf("archive slice response too large: %d", len(data))
 		}
 		if err = writeSlice(data); err != nil {
-			return fail(err)
+			return nil, err
 		}
 
 		if elapsed := time.Since(lastLog); elapsed >= 10*time.Second {
@@ -434,11 +418,6 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		if len(data) < archiveSliceSize {
 			break
 		}
-	}
-
-	if err = file.Close(); err != nil {
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("close archive temp file: %w", err)
 	}
 
 	wallElapsed := time.Since(startedAt)
@@ -478,7 +457,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, resol
 		Shard:            resolved.Shard,
 		ArchiveID:        archiveID,
 		Peer:             peer.addr,
-		Path:             path,
+		Data:             buf,
 		Bytes:            offset,
 		DownloadElapsed:  downloadElapsed,
 	}, nil
@@ -552,7 +531,7 @@ func (s *overlaySubscription) fetchArchiveCandidate(ctx context.Context, peer *o
 		speed:       speed,
 	}
 	if bytes > 0 {
-		candidate.seedSlice = append([]byte(nil), data...)
+		candidate.seedSlice = data
 		candidate.hasSeed = true
 	}
 	return candidate, nil

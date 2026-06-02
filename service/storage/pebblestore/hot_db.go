@@ -51,6 +51,10 @@ func (s *Store) ensureWritable() error {
 }
 
 func (s *Store) withHotBatch(fn func(batch *pebble.Batch) error) error {
+	return s.withHotBatchOptions(pebble.NoSync, fn)
+}
+
+func (s *Store) withHotBatchOptions(writeOptions *pebble.WriteOptions, fn func(batch *pebble.Batch) error) error {
 	if err := s.ensureWritable(); err != nil {
 		return err
 	}
@@ -68,7 +72,7 @@ func (s *Store) withHotBatch(fn func(batch *pebble.Batch) error) error {
 	if err := fn(batch); err != nil {
 		return err
 	}
-	return batch.Commit(pebble.NoSync)
+	return batch.Commit(writeOptions)
 }
 
 func (s *Store) setHotRecord(ctx context.Context, key, value []byte, writeOptions *pebble.WriteOptions) error {

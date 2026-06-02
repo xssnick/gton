@@ -24,7 +24,7 @@ const (
 	archiveReadyWindowBacklog                 = 1
 	archiveShardArchiveImportInFlight         = 4
 	archiveDownloadWorkerMin                  = 16
-	archiveDownloadWorkerMax                  = 64
+	archiveDownloadWorkerMax                  = 20
 	archiveDownloadWorkerMultiplier           = 4
 	archiveDownloadHotWorkerMin               = 2
 	archiveDownloadHotWorkerMax               = 8
@@ -149,9 +149,6 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			return nil, r.returnWithProgress(err)
 		}
 		applyElapsed := time.Since(applyStarted)
-		if err = r.storeArchiveWindow(window); err != nil {
-			return nil, r.returnWithProgress(err)
-		}
 		window.stateCells.copyRecordsTo(r.stateCells)
 		window.stateCells.releaseRecordsToBase(r.stateCells.loader())
 		s.log.Debug().

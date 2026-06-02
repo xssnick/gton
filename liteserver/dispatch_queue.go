@@ -164,7 +164,7 @@ func dispatchQueueProof(blockProof *cell.Cell, proofBuilder *cell.MerkleProofBui
 		return nil, err
 	}
 	proof := []*cell.Cell{blockProof, dataProof}
-	return cell.ToBOCWithFlags(proof, false), nil
+	return cell.ToBOCWithOptions(proof, cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
 func dispatchQueueFromStateRoot(stateRoot *cell.Cell) (*cell.AugmentedDictionary, error) {

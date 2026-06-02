@@ -313,12 +313,6 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 			return nil, 0, deletedKeys, err
 		}
 		deletedKeys++
-		if pkg.path != "" {
-			if err := batch.Delete(hotKeyPackCommitted(pkg.path), pebble.NoSync); err != nil {
-				return nil, 0, deletedKeys, err
-			}
-			deletedKeys++
-		}
 	}
 
 	iter, err := db.NewIter(&pebble.IterOptions{

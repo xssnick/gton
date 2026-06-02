@@ -34,7 +34,7 @@ func (e *broadcastDecompressionStateNotReadyError) Unwrap() error {
 	return errBroadcastDecompressionStateNotReady
 }
 
-func (n *Node) decodeBroadcastBlock(ctx context.Context, msg any) (*DownloadedBlock, error) {
+func (n *Node) decodeBroadcastBlock(ctx context.Context, msg any) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	switch data := msg.(type) {
 	case tonnodeapi.BlockBroadcastCompressedV2:
 		return n.decodeBlockBroadcastCompressedV2(ctx, data)
@@ -55,26 +55,25 @@ func broadcastDecompressionStateNotReady(err error) (*broadcastDecompressionStat
 	return nil, false
 }
 
-func decodeBroadcastBlock(msg any) (*DownloadedBlock, error) {
+func decodeBroadcastBlock(msg any) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	switch data := msg.(type) {
 	case tonnodeapi.BlockBroadcast:
-		signatures, err := ordinaryBroadcastSignatureSetCell(data.CatchainSeqno, data.ValidatorSetHash, data.Signatures)
+		signatures, err := ordinaryBroadcastValidatorSignatureSet(data.CatchainSeqno, data.ValidatorSetHash, data.Signatures)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		block, err := decodeRawDownloadedBlock("tonNode.blockBroadcast", data.ID, data.Proof, data.Data, broadcastProofIsLink(data.ID))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		block.BroadcastSignatures = signatures
-		return block, nil
+		return block, signatures, nil
 	case tonnodeapi.BlockBroadcastCompressed:
 		return decodeBlockBroadcastCompressed(data)
 	case tonnodeapi.BlockBroadcastCompressedV2:
-		return nil, fmt.Errorf("tonNode.blockBroadcastCompressedV2 requires state-aware decode")
+		return nil, nil, fmt.Errorf("tonNode.blockBroadcastCompressedV2 requires state-aware decode")
 	default:
-		return nil, fmt.Errorf("unexpected broadcast block %T", msg)
+		return nil, nil, fmt.Errorf("unexpected broadcast block %T", msg)
 	}
 }
 
@@ -161,32 +160,32 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 	}, nil
 }
 
-func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*DownloadedBlock, error) {
+func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
 	if err != nil {
-		return nil, fmt.Errorf("decompress tonNode.blockBroadcastCompressed: %w", err)
+		return nil, nil, fmt.Errorf("decompress tonNode.blockBroadcastCompressed: %w", err)
 	}
 
 	var payload tonnodeapi.BlockBroadcastCompressedData
 	left, err := tl.Parse(&payload, decompressed, true)
 	if err != nil {
-		return nil, fmt.Errorf("parse tonNode.blockBroadcastCompressed.data: %w", err)
+		return nil, nil, fmt.Errorf("parse tonNode.blockBroadcastCompressed.data: %w", err)
 	}
 	if len(left) > 0 {
-		return nil, fmt.Errorf("tonNode.blockBroadcastCompressed.data has %d trailing bytes", len(left))
+		return nil, nil, fmt.Errorf("tonNode.blockBroadcastCompressed.data has %d trailing bytes", len(left))
 	}
 
 	roots, err := cell.FromBOCMultiRoot(payload.ProofData)
 	if err != nil {
-		return nil, fmt.Errorf("parse tonNode.blockBroadcastCompressed proof_data: %w", err)
+		return nil, nil, fmt.Errorf("parse tonNode.blockBroadcastCompressed proof_data: %w", err)
 	}
 	if len(roots) != 2 {
-		return nil, fmt.Errorf("expected 2 roots in tonNode.blockBroadcastCompressed proof_data, got %d", len(roots))
+		return nil, nil, fmt.Errorf("expected 2 roots in tonNode.blockBroadcastCompressed proof_data, got %d", len(roots))
 	}
 
-	signatures, err := ordinaryBroadcastSignatureSetCell(data.CatchainSeqno, data.ValidatorSetHash, payload.Signatures)
+	signatures, err := ordinaryBroadcastValidatorSignatureSet(data.CatchainSeqno, data.ValidatorSetHash, payload.Signatures)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	proof := cell.ToBOCWithOptions([]*cell.Cell{roots[0]}, cell.BOCSerializeOptions{WithCRC32C: false})
@@ -194,10 +193,9 @@ func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*
 
 	block, err := newVerifiedDownloadedBlock("tonNode.blockBroadcastCompressed", data.ID, proof, blockBOC, broadcastProofIsLink(data.ID), roots[0], roots[1])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	block.BroadcastSignatures = signatures
-	return block, nil
+	return block, signatures, nil
 }
 
 func decodeBlockBroadcastCompressedV2(data tonnodeapi.BlockBroadcastCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
@@ -205,21 +203,22 @@ func decodeBlockBroadcastCompressedV2(data tonnodeapi.BlockBroadcastCompressedV2
 	if err != nil {
 		return nil, err
 	}
-	return decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot)
+	block, _, err := decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot)
+	return block, err
 }
 
-func (n *Node) decodeBlockBroadcastCompressedV2(ctx context.Context, data tonnodeapi.BlockBroadcastCompressedV2) (*DownloadedBlock, error) {
+func (n *Node) decodeBlockBroadcastCompressedV2(ctx context.Context, data tonnodeapi.BlockBroadcastCompressedV2) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	proofRoot, err := parseDownloadedBlockProof("tonNode.blockBroadcastCompressedV2", data.Proof)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, proofRoot, ton.BlockIDExt{})
 }
 
-func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context, data tonnodeapi.BlockBroadcastCompressedV2, proofRoot *cell.Cell, prev ton.BlockIDExt) (*DownloadedBlock, error) {
+func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context, data tonnodeapi.BlockBroadcastCompressedV2, proofRoot *cell.Cell, prev ton.BlockIDExt) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	needState, err := cell.NeedStateForDecompression(data.DataCompressed)
 	if err != nil {
-		return nil, fmt.Errorf("check tonNode.blockBroadcastCompressedV2 compression: %w", err)
+		return nil, nil, fmt.Errorf("check tonNode.blockBroadcastCompressedV2 compression: %w", err)
 	}
 	if !needState {
 		return decodeBlockBroadcastCompressedV2WithProofRoot(data, nil, proofRoot)
@@ -227,7 +226,7 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 	if len(prev.RootHash) == 0 {
 		prev, err = compressedBlockPreviousState(data.ID, proofRoot)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -237,69 +236,48 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 	state, err := n.stateForCompressedBlockDecompressionPrev(ctx, prev)
 	if err != nil {
 		if errors.Is(err, tnstore.ErrNotFound) {
-			return nil, &broadcastDecompressionStateNotReadyError{
+			return nil, nil, &broadcastDecompressionStateNotReadyError{
 				err:       fmt.Errorf("%w: %v", errBroadcastDecompressionStateNotReady, err),
 				prev:      prev,
 				proofRoot: proofRoot,
 			}
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	return decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot)
 }
 
-func decodeBlockBroadcastCompressedV2WithProofRoot(data tonnodeapi.BlockBroadcastCompressedV2, state *cell.Cell, proofRoot *cell.Cell) (*DownloadedBlock, error) {
-	signatures, err := blockBroadcastCompressedV2Signatures(data)
+func decodeBlockBroadcastCompressedV2WithProofRoot(data tonnodeapi.BlockBroadcastCompressedV2, state *cell.Cell, proofRoot *cell.Cell) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
+	signatures, err := broadcastSignatureSetFromTL(data.SignatureSet)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if isMasterchainBlock(data.ID) && !signatures.Final() {
+		return nil, nil, errBroadcastSignatureSetNonFinal
 	}
 
 	needState, err := cell.NeedStateForDecompression(data.DataCompressed)
 	if err != nil {
-		return nil, fmt.Errorf("check tonNode.blockBroadcastCompressedV2 compression: %w", err)
+		return nil, nil, fmt.Errorf("check tonNode.blockBroadcastCompressedV2 compression: %w", err)
 	}
 	if needState && state == nil {
-		return nil, errBroadcastDecompressionStateNotReady
+		return nil, nil, errBroadcastDecompressionStateNotReady
 	}
 
 	roots, err := cell.DecompressBOC(data.DataCompressed, maxDecompressedBlockSize, state)
 	if err != nil {
-		return nil, fmt.Errorf("decompress tonNode.blockBroadcastCompressedV2: %w", err)
+		return nil, nil, fmt.Errorf("decompress tonNode.blockBroadcastCompressedV2: %w", err)
 	}
 	if len(roots) != 1 {
-		return nil, fmt.Errorf("expected 1 root in tonNode.blockBroadcastCompressedV2, got %d", len(roots))
+		return nil, nil, fmt.Errorf("expected 1 root in tonNode.blockBroadcastCompressedV2, got %d", len(roots))
 	}
 
 	blockBOC := serializeCompressedBlockRoot(roots[0])
 	block, err := newVerifiedDownloadedBlock("tonNode.blockBroadcastCompressedV2", data.ID, data.Proof, blockBOC, broadcastProofIsLink(data.ID), proofRoot, roots[0])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	block.BroadcastSignatures = signatures
-	return block, nil
-}
-
-func blockBroadcastCompressedV2Signatures(data tonnodeapi.BlockBroadcastCompressedV2) (*cell.Cell, error) {
-	signatures, err := broadcastSignatureSetCell(data.SignatureSet)
-	if errors.Is(err, errBroadcastSignatureSetNonFinal) && !isMasterchainBlock(data.ID) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return signatures, nil
-}
-
-func broadcastSignatureSetFromDecoded(msg any, downloaded *DownloadedBlock) (*blockproof.ValidatorSignatureSet, error) {
-	switch data := msg.(type) {
-	case tonnodeapi.BlockBroadcastCompressedV2:
-		return broadcastSignatureSetFromTL(data.SignatureSet)
-	default:
-		if downloaded == nil || downloaded.BroadcastSignatures == nil {
-			return nil, fmt.Errorf("broadcast block has no validator signatures")
-		}
-		return blockproof.ParseValidatorSignatureSetCell(downloaded.BroadcastSignatures)
-	}
+	return block, signatures, nil
 }
 
 func broadcastSignatureSetFromTL(sigSet any) (*blockproof.ValidatorSignatureSet, error) {

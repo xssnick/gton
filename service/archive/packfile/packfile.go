@@ -40,6 +40,11 @@ type Pointer struct {
 	Size   int64
 }
 
+type Appender struct {
+	file   *os.File
+	offset int64
+}
+
 func EntryName(kind string, id ton.BlockIDExt) string {
 	return fmt.Sprintf(
 		"%s_(%d,%016x,%d):%x:%x",
@@ -118,123 +123,78 @@ func Read(ctx context.Context, r io.Reader, handle func(Entry) error) error {
 	}
 }
 
-func Validate(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-
-	var magic [HeaderSize]byte
-	if _, err = io.ReadFull(file, magic[:]); err != nil {
-		return fmt.Errorf("read archive magic: %w", err)
-	}
-	got := binary.LittleEndian.Uint32(magic[:])
-	if got != PackageMagic {
-		return fmt.Errorf("archive package magic mismatch: got=%08x want=%08x", got, PackageMagic)
-	}
-
-	for {
-		var header [EntryHeaderSize]byte
-		n, err := io.ReadFull(file, header[:])
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			if errors.Is(err, io.ErrUnexpectedEOF) && n == 0 {
-				return nil
-			}
-			return fmt.Errorf("read archive entry header: %w", err)
-		}
-
-		header0 := binary.LittleEndian.Uint32(header[:4])
-		if header0&0xffff != EntryMagic {
-			return fmt.Errorf("archive entry magic mismatch")
-		}
-
-		nameLen := int64(header0 >> 16)
-		dataLen := int64(binary.LittleEndian.Uint32(header[4:]))
-		if dataLen > MaxDataSize {
-			return fmt.Errorf("archive entry %d bytes exceeds limit %d", dataLen, MaxDataSize)
-		}
-
-		if _, err = io.CopyN(io.Discard, file, nameLen); err != nil {
-			return fmt.Errorf("read archive entry name: %w", err)
-		}
-		if _, err = io.CopyN(io.Discard, file, dataLen); err != nil {
-			return fmt.Errorf("read archive entry data: %w", err)
-		}
-	}
-}
-
-func Ensure(file *os.File) error {
+func ensureWithSize(file *os.File) (int64, error) {
 	stat, err := file.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if stat.Size() == 0 {
 		var magic [HeaderSize]byte
 		binary.LittleEndian.PutUint32(magic[:], PackageMagic)
 		if _, err = file.WriteAt(magic[:], 0); err != nil {
-			return err
+			return 0, err
 		}
-		return nil
+		return HeaderSize, nil
 	}
 	if stat.Size() < HeaderSize {
-		return fmt.Errorf("archive package is too short")
+		return 0, fmt.Errorf("archive package is too short")
 	}
 
 	var magic [HeaderSize]byte
 	if _, err = file.ReadAt(magic[:], 0); err != nil {
-		return err
+		return 0, err
 	}
 	if binary.LittleEndian.Uint32(magic[:]) != PackageMagic {
-		return fmt.Errorf("archive package magic mismatch")
+		return 0, fmt.Errorf("archive package magic mismatch")
 	}
-	return nil
+	return stat.Size(), nil
 }
 
-func Append(file *os.File, name string, data []byte, sync bool) (Pointer, error) {
+func NewAppender(file *os.File) (*Appender, error) {
+	offset, err := ensureWithSize(file)
+	if err != nil {
+		return nil, err
+	}
+	return &Appender{
+		file:   file,
+		offset: offset,
+	}, nil
+}
+
+func (a *Appender) Append(name string, data []byte) (Pointer, error) {
 	if len(name) > MaxNameSize {
 		return Pointer{}, fmt.Errorf("archive entry name too large: %d", len(name))
 	}
 	if len(data) > MaxDataSize {
 		return Pointer{}, fmt.Errorf("archive entry data too large: %d", len(data))
 	}
-	if err := Ensure(file); err != nil {
-		return Pointer{}, err
-	}
 
-	stat, err := file.Stat()
-	if err != nil {
-		return Pointer{}, err
-	}
-	entryOffset := stat.Size()
+	entryOffset := a.offset
 	dataOffset := entryOffset + EntryHeaderSize + int64(len(name))
 
 	var header [EntryHeaderSize]byte
 	binary.LittleEndian.PutUint32(header[:4], uint32(EntryMagic)|uint32(len(name))<<16)
 	binary.LittleEndian.PutUint32(header[4:], uint32(len(data)))
 
-	if _, err = file.WriteAt(header[:], entryOffset); err != nil {
-		return Pointer{}, rollbackAppend(file, entryOffset, err)
+	if _, err := a.file.WriteAt(header[:], entryOffset); err != nil {
+		return Pointer{}, rollbackAppend(a.file, entryOffset, err)
 	}
-	if _, err = file.WriteAt([]byte(name), entryOffset+EntryHeaderSize); err != nil {
-		return Pointer{}, rollbackAppend(file, entryOffset, err)
+	if _, err := a.file.WriteAt([]byte(name), entryOffset+EntryHeaderSize); err != nil {
+		return Pointer{}, rollbackAppend(a.file, entryOffset, err)
 	}
-	if _, err = file.WriteAt(data, dataOffset); err != nil {
-		return Pointer{}, rollbackAppend(file, entryOffset, err)
-	}
-	if sync {
-		if err = file.Sync(); err != nil {
-			return Pointer{}, err
-		}
+	if _, err := a.file.WriteAt(data, dataOffset); err != nil {
+		return Pointer{}, rollbackAppend(a.file, entryOffset, err)
 	}
 
+	a.offset = dataOffset + int64(len(data))
 	return Pointer{
 		Offset: dataOffset,
 		Size:   int64(len(data)),
 	}, nil
+}
+
+func (a *Appender) Size() int64 {
+	return a.offset
 }
 
 func rollbackAppend(file *os.File, offset int64, err error) error {

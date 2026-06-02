@@ -9,15 +9,20 @@ import (
 
 	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
 	ChainMasterchain = "masterchain"
 	ChainShardchain  = "shardchain"
+
+	liteserverNoErrorCodeLabel          = "0"
+	liteserverUnspecifiedErrorCodeLabel = "unspecified"
 )
 
 var errMetricReaderNotConfigured = errors.New("metric reader is not configured")
@@ -43,7 +48,18 @@ type Metrics struct {
 	syncObtainDuration        *prometheus.HistogramVec
 	syncPersistDuration       *prometheus.HistogramVec
 	syncPersistQueueDuration  *prometheus.HistogramVec
+	syncPersistStageDuration  *prometheus.HistogramVec
 	syncCheckpoints           *prometheus.CounterVec
+
+	p2pBroadcastPipelineStageDuration  *prometheus.HistogramVec
+	p2pBroadcastPipelineStageObservers sync.Map
+}
+
+type p2pBroadcastPipelineStageMetricKey struct {
+	stage    string
+	kind     string
+	delivery string
+	result   string
 }
 
 func New(namespace string) *Metrics {
@@ -137,17 +153,35 @@ func New(namespace string) *Metrics {
 			Help:      "Current state checkpoint queue and lock wait duration in seconds.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 		}, []string{"mode", "result"}),
+		syncPersistStageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: "sync",
+			Name:      "checkpoint_stage_duration_seconds",
+			Help:      "Current state checkpoint duration split by storage and prewrite wait stage.",
+			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		}, []string{"mode", "stage", "result"}),
 		syncCheckpoints: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "sync",
 			Name:      "checkpoints_total",
 			Help:      "Total current state checkpoints by mode and result.",
 		}, []string{"mode", "result"}),
+		p2pBroadcastPipelineStageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: "p2p",
+			Name:      "broadcast_pipeline_stage_duration_seconds",
+			Help:      "Inbound P2P broadcast pipeline stage duration in seconds after the overlay has delivered a TL broadcast to gton.",
+			Buckets: []float64{
+				0.00005, 0.0001, 0.00025, 0.0005,
+				0.001, 0.0025, 0.005, 0.01, 0.025,
+				0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+			},
+		}, []string{"stage", "kind", "delivery", "result"}),
 	}
 
 	registry.MustRegister(
-		prometheus.NewGoCollector(),
-		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		m.liteserverQueryDuration,
 		m.liteserverQueryHandler,
 		m.liteserverQueryWait,
@@ -161,7 +195,9 @@ func New(namespace string) *Metrics {
 		m.syncObtainDuration,
 		m.syncPersistDuration,
 		m.syncPersistQueueDuration,
+		m.syncPersistStageDuration,
 		m.syncCheckpoints,
+		m.p2pBroadcastPipelineStageDuration,
 		newServiceCollector(m, namespace),
 		newDBCollector(m, namespace),
 		newStorageArtifactCollector(m, namespace),
@@ -258,7 +294,7 @@ func (m *Metrics) ObserveLiteserverQuery(observation liteserver.QueryObservation
 	if response == "" {
 		response = "unknown"
 	}
-	errorCode := strconv.FormatInt(int64(observation.ErrorCode), 10)
+	errorCode := liteserverErrorCodeLabel(observation)
 	duration := observation.Duration
 	if duration < 0 {
 		duration = 0
@@ -277,6 +313,16 @@ func (m *Metrics) ObserveLiteserverQuery(observation liteserver.QueryObservation
 	if waitDuration > 0 && m.liteserverQueryWait != nil {
 		m.liteserverQueryWait.WithLabelValues(method, response, errorCode).Observe(waitDuration.Seconds())
 	}
+}
+
+func liteserverErrorCodeLabel(observation liteserver.QueryObservation) string {
+	if observation.ErrorCode != 0 {
+		return strconv.FormatInt(int64(observation.ErrorCode), 10)
+	}
+	if observation.Error {
+		return liteserverUnspecifiedErrorCodeLabel
+	}
+	return liteserverNoErrorCodeLabel
 }
 
 func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
@@ -354,6 +400,42 @@ func (m *Metrics) ObserveSyncPersist(observation service.SyncPersistObservation)
 	if observation.QueueDuration > 0 && m.syncPersistQueueDuration != nil {
 		m.syncPersistQueueDuration.WithLabelValues(mode, result).Observe(observation.QueueDuration.Seconds())
 	}
+	if m.syncPersistStageDuration != nil {
+		for _, stage := range observation.Stages {
+			if stage.Duration <= 0 {
+				continue
+			}
+			m.syncPersistStageDuration.WithLabelValues(mode, fallbackLabel(stage.Stage), result).Observe(stage.Duration.Seconds())
+		}
+	}
+}
+
+func (m *Metrics) ObserveBroadcastPipelineStage(observation p2p.BroadcastPipelineStageObservation) {
+	if m == nil || m.p2pBroadcastPipelineStageDuration == nil {
+		return
+	}
+	duration := observation.Duration
+	if duration < 0 {
+		duration = 0
+	}
+	key := p2pBroadcastPipelineStageMetricKey{
+		stage:    fallbackLabel(observation.Stage),
+		kind:     fallbackLabel(observation.Kind),
+		delivery: fallbackLabel(string(observation.Delivery)),
+		result:   fallbackLabel(observation.Result),
+	}
+
+	m.p2pBroadcastPipelineStageObserver(key).Observe(duration.Seconds())
+}
+
+func (m *Metrics) p2pBroadcastPipelineStageObserver(key p2pBroadcastPipelineStageMetricKey) prometheus.Observer {
+	if observer, ok := m.p2pBroadcastPipelineStageObservers.Load(key); ok {
+		return observer.(prometheus.Observer)
+	}
+
+	observer := m.p2pBroadcastPipelineStageDuration.WithLabelValues(key.stage, key.kind, key.delivery, key.result)
+	actual, _ := m.p2pBroadcastPipelineStageObservers.LoadOrStore(key, observer)
+	return actual.(prometheus.Observer)
 }
 
 func fallbackLabel(value string) string {

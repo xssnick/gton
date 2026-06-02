@@ -328,7 +328,7 @@ func (s *Server) forwardConfigProofBOC(from ton.BlockIDExt, fromRoot *cell.Cell)
 	if err != nil {
 		return nil, err
 	}
-	return proof.ToBOCWithFlags(false), nil
+	return proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
 func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkBackward, error) {
@@ -373,8 +373,8 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 		From:       cloneBlockID(from),
 		To:         cloneBlockID(to),
 		DestProof:  destProof,
-		Proof:      proof.ToBOCWithFlags(false),
-		StateProof: stateProof.ToBOCWithFlags(false),
+		Proof:      proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+		StateProof: stateProof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}, nil
 }
 
