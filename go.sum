@@ -28,8 +28,6 @@ github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b h1:r6VH0faHjZe
 github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b/go.mod h1:Vz9DsVWQQhf3vs21MhPMZpMGSht7O/2vFW2xusFUVOs=
 github.com/cockroachdb/metamorphic v0.0.0-20231108215700-4ba948b56895 h1:XANOgPYtvELQ/h4IrmPAohXqe2pWA8Bwhejr3VQoZsA=
 github.com/cockroachdb/metamorphic v0.0.0-20231108215700-4ba948b56895/go.mod h1:aPd7gM9ov9M8v32Yy5NJrDyOcD8z642dqs+F0CeNXfA=
-github.com/cockroachdb/pebble/v2 v2.1.5 h1:1ziHpaSau6qCXnFpQX3EBOH14yPHA8W66vKxsyrgXgs=
-github.com/cockroachdb/pebble/v2 v2.1.5/go.mod h1:Reo1RTniv1UjVTAu/Fv74y5i3kJ5gmVrPhO9UtFiKn8=
 github.com/cockroachdb/pebble/v2 v2.1.6 h1:GDo7Z2+LgFZ7LJLdLmBXhDeTVIwgSPGxIT15hE7vGqM=
 github.com/cockroachdb/pebble/v2 v2.1.6/go.mod h1:Reo1RTniv1UjVTAu/Fv74y5i3kJ5gmVrPhO9UtFiKn8=
 github.com/cockroachdb/redact v1.1.8 h1:8eVLLj6juKxiKrAEw2b8cJvNqWq++U8WOfQFuL7KTaA=
@@ -99,8 +97,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/xssnick/raptorq v1.4.0 h1:Bms8lgT7aEPRP8YBRuS+8w7Cic8GP9BbvFT1NrWvi24=
 github.com/xssnick/raptorq v1.4.0/go.mod h1:mo5n6T4yaqZkNVMWonRuMS0tcyD4XQ6PwwTjaY3ZwQY=
-github.com/xssnick/tonutils-go v1.17.1-0.20260602082556-d6fbaafcd9a9 h1:BLtcLat2B02kVQWNvFj/Pr5vO6W1u/CKMJ9ASuk8D6k=
-github.com/xssnick/tonutils-go v1.17.1-0.20260602082556-d6fbaafcd9a9/go.mod h1:Ind3q0JM2N/63zfWR7rSGmUpUZaiGxregm9nZc/xGx4=
+github.com/xssnick/tonutils-go v1.17.1-0.20260603063011-fbaf81cc9c5b h1:Z3qyEmurM8Ry8ISArNZ1hZrUWuWwzwTTBK+dB2krWu4=
+github.com/xssnick/tonutils-go v1.17.1-0.20260603063011-fbaf81cc9c5b/go.mod h1:Ind3q0JM2N/63zfWR7rSGmUpUZaiGxregm9nZc/xGx4=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
