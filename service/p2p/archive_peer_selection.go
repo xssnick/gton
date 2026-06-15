@@ -1,10 +1,11 @@
 package p2p
 
 import (
-	"github.com/xssnick/gton/service/archive"
-	"github.com/xssnick/tonutils-go/ton"
+	"context"
 	"sort"
 	"time"
+
+	"github.com/xssnick/gton/service/archive"
 )
 
 func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
@@ -51,24 +52,6 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 		return leftSpeed > rightSpeed
 	})
 	return prioritized
-}
-
-func (n *Node) DenyArchivePeer(shard archive.ShardID, peerAddr string, reason string) bool {
-	if n == nil || peerAddr == "" {
-		return false
-	}
-
-	sub, err := n.subscriptionForBlock(ton.BlockIDExt{Workchain: shard.Workchain, Shard: shard.Shard})
-	if err != nil {
-		return false
-	}
-	peer := sub.peerByAddr(peerAddr)
-	if peer == nil {
-		return false
-	}
-
-	sub.denyArchivePeer(shard, peer, reason)
-	return true
 }
 
 func (s *overlaySubscription) archiveQueryCandidates() []*overlayPeer {
@@ -192,16 +175,20 @@ func noteArchivePeerDownload(shard archive.ShardID, peer *overlayPeer, bytes int
 	return false
 }
 
-func (s *overlaySubscription) archivePeerState(key string) *archivePeerState {
+func (s *overlaySubscription) archivePeerPoolState(key string) *archivePeerPoolState {
 	if s.archivePeers == nil {
-		s.archivePeers = map[string]*archivePeerState{}
+		s.archivePeers = map[string]*archivePeerPoolState{}
 	}
 	state := s.archivePeers[key]
 	if state == nil {
-		state = &archivePeerState{}
+		state = &archivePeerPoolState{}
 		s.archivePeers[key] = state
 	}
 	return state
+}
+
+func archivePeerPoolStateEmpty(state *archivePeerPoolState) bool {
+	return state == nil || len(state.cooldownUntil) == 0
 }
 
 func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
@@ -216,23 +203,74 @@ func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers
 	defer s.archivePeerMx.Unlock()
 
 	state := s.archivePeers[stateKey]
-	if state == nil || len(state.deniedPeers) == 0 {
+	if state == nil || len(state.cooldownUntil) == 0 {
 		return peers
 	}
 
 	available := make([]*overlayPeer, 0, len(peers))
 	for _, peer := range peers {
-		if !archivePeerDeniedLocked(state, archivePeerID(peer), now) {
+		if !archivePeerCoolingDownLocked(state, archivePeerID(peer), now) {
 			available = append(available, peer)
 		}
 	}
-	if len(state.deniedPeers) == 0 {
+	if archivePeerPoolStateEmpty(state) {
 		delete(s.archivePeers, stateKey)
 	}
 	return available
 }
 
-func (s *overlaySubscription) denyArchivePeer(shard archive.ShardID, peer *overlayPeer, reason string) {
+func (s *overlaySubscription) refreshEmptyArchivePeerPool(ctx context.Context, shard archive.ShardID) {
+	rotated := s.rotateUnavailableArchivePeers(shard)
+	if rotated == 0 {
+		return
+	}
+
+	if s.node != nil && s.node.dht != nil {
+		s.forceSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
+	}
+	s.reloadNeighbours()
+}
+
+func (s *overlaySubscription) rotateUnavailableArchivePeers(shard archive.ShardID) int {
+	if s.node == nil {
+		return 0
+	}
+
+	candidates := s.archiveQueryCandidates()
+	if len(candidates) == 0 {
+		return 0
+	}
+	if available := s.availableArchivePeers(shard, s.node.prioritizeArchivePeers(shard, candidates)); len(available) > 0 {
+		return 0
+	}
+
+	protected := s.protectedNeighbourPeerIDs()
+	rotated := 0
+	for _, peer := range candidates {
+		if peer == nil || peer.id.IsZero() {
+			continue
+		}
+		if _, ok := protected[peer.id]; ok {
+			continue
+		}
+		if !s.archivePeerCoolingDown(shard, peer) {
+			continue
+		}
+		s.removePeer(peer.id)
+		rotated++
+	}
+	if rotated == 0 {
+		return 0
+	}
+
+	s.log.Info().
+		Int("rotated_peers", rotated).
+		Str("archive_pool", archivePeerPoolKey(shard)).
+		Msg("rotated unavailable archive peers")
+	return rotated
+}
+
+func (s *overlaySubscription) cooldownArchivePeer(shard archive.ShardID, peer *overlayPeer, reason string) {
 	if peer == nil {
 		return
 	}
@@ -245,11 +283,11 @@ func (s *overlaySubscription) denyArchivePeer(shard archive.ShardID, peer *overl
 	}
 
 	s.archivePeerMx.Lock()
-	state := s.archivePeerState(stateKey)
-	if state.deniedPeers == nil {
-		state.deniedPeers = map[PeerID]time.Time{}
+	state := s.archivePeerPoolState(stateKey)
+	if state.cooldownUntil == nil {
+		state.cooldownUntil = map[PeerID]time.Time{}
 	}
-	state.deniedPeers[peerID] = until
+	state.cooldownUntil[peerID] = until
 	s.archivePeerMx.Unlock()
 
 	s.log.Debug().
@@ -257,10 +295,10 @@ func (s *overlaySubscription) denyArchivePeer(shard archive.ShardID, peer *overl
 		Str("archive_pool", stateKey).
 		Str("reason", reason).
 		Dur("duration", archiveSlowPeerPenalty).
-		Msg("temporarily denied archive peer")
+		Msg("temporarily cooled down archive peer")
 }
 
-func (s *overlaySubscription) archivePeerDenied(shard archive.ShardID, peer *overlayPeer) bool {
+func (s *overlaySubscription) archivePeerCoolingDown(shard archive.ShardID, peer *overlayPeer) bool {
 	if peer == nil {
 		return false
 	}
@@ -275,22 +313,22 @@ func (s *overlaySubscription) archivePeerDenied(shard archive.ShardID, peer *ove
 	if state == nil {
 		return false
 	}
-	denied := archivePeerDeniedLocked(state, archivePeerID(peer), now)
-	if len(state.deniedPeers) == 0 {
+	coolingDown := archivePeerCoolingDownLocked(state, archivePeerID(peer), now)
+	if archivePeerPoolStateEmpty(state) {
 		delete(s.archivePeers, stateKey)
 	}
-	return denied
+	return coolingDown
 }
 
-func archivePeerDeniedLocked(state *archivePeerState, peerID PeerID, now time.Time) bool {
-	if state == nil || len(state.deniedPeers) == 0 {
+func archivePeerCoolingDownLocked(state *archivePeerPoolState, peerID PeerID, now time.Time) bool {
+	if state == nil || len(state.cooldownUntil) == 0 {
 		return false
 	}
 	if peerID.IsZero() {
 		return false
 	}
 
-	until, ok := state.deniedPeers[peerID]
+	until, ok := state.cooldownUntil[peerID]
 	if !ok {
 		return false
 	}
@@ -298,7 +336,7 @@ func archivePeerDeniedLocked(state *archivePeerState, peerID PeerID, now time.Ti
 		return true
 	}
 
-	delete(state.deniedPeers, peerID)
+	delete(state.cooldownUntil, peerID)
 	return false
 }
 
@@ -335,6 +373,10 @@ func archiveDownloadTooSlow(shard archive.ShardID, bytes int64, elapsed time.Dur
 		return float64(bytes)/elapsed.Seconds() < archiveSlowThreshold(shard.Workchain == 0)
 	}
 	return elapsed >= archiveSmallPackSlowElapsed
+}
+
+func archivePeerCanStayPinned(shard archive.ShardID, bytes int64, elapsed time.Duration) bool {
+	return bytes > 0 && elapsed > 0 && !archiveDownloadTooSlow(shard, bytes, elapsed)
 }
 
 func archivePeerID(peer *overlayPeer) PeerID {

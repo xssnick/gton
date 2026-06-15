@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/xssnick/gton/liteserver"
@@ -19,17 +20,16 @@ import (
 
 const (
 	ChainMasterchain = "masterchain"
-	ChainShardchain  = "shardchain"
 
 	liteserverNoErrorCodeLabel          = "0"
 	liteserverUnspecifiedErrorCodeLabel = "unspecified"
+	liteserverNoErrorReasonLabel        = "none"
+	liteserverUnspecifiedReasonLabel    = "unspecified"
 )
 
-var errMetricReaderNotConfigured = errors.New("metric reader is not configured")
-
 type Metrics struct {
-	mu                  sync.RWMutex
 	registry            *prometheus.Registry
+	namespace           string
 	serviceStatusReader func() service.StatusSnapshot
 	dbStatusReader      func(context.Context) (pebblestore.DBStatus, error)
 	artifactStatus      *storageArtifactStatusReader
@@ -55,6 +55,13 @@ type Metrics struct {
 	p2pBroadcastPipelineStageObservers sync.Map
 }
 
+type RuntimeReaders struct {
+	ServiceStatusReader func() service.StatusSnapshot
+	DBStatusReader      func(context.Context) (pebblestore.DBStatus, error)
+	ArchivePackagesDir  string
+	StateFilesDir       string
+}
+
 type p2pBroadcastPipelineStageMetricKey struct {
 	stage    string
 	kind     string
@@ -65,34 +72,35 @@ type p2pBroadcastPipelineStageMetricKey struct {
 func New(namespace string) *Metrics {
 	registry := prometheus.NewRegistry()
 	m := &Metrics{
-		registry: registry,
+		registry:  registry,
+		namespace: namespace,
 		liteserverQueryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "liteserver",
 			Name:      "query_duration_seconds",
 			Help:      "Total liteserver query duration in seconds, including waitMasterchainSeqno wait time.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"method", "response", "error_code"}),
+		}, []string{"method", "response", "error_code", "reason"}),
 		liteserverQueryHandler: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "liteserver",
 			Name:      "query_handler_duration_seconds",
 			Help:      "Liteserver query handler duration in seconds, without waitMasterchainSeqno wait time.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"method", "response", "error_code"}),
+		}, []string{"method", "response", "error_code", "reason"}),
 		liteserverQueryWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "liteserver",
 			Name:      "query_wait_seconds",
 			Help:      "Liteserver waitMasterchainSeqno wait duration in seconds.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"method", "response", "error_code"}),
+		}, []string{"method", "response", "error_code", "reason"}),
 		liteserverQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "liteserver",
 			Name:      "queries_total",
 			Help:      "Total liteserver queries by method and response.",
-		}, []string{"method", "response", "error_code"}),
+		}, []string{"method", "response", "error_code", "reason"}),
 		liteserverInflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: "liteserver",
@@ -198,9 +206,6 @@ func New(namespace string) *Metrics {
 		m.syncPersistStageDuration,
 		m.syncCheckpoints,
 		m.p2pBroadcastPipelineStageDuration,
-		newServiceCollector(m, namespace),
-		newDBCollector(m, namespace),
-		newStorageArtifactCollector(m, namespace),
 	)
 	return m
 }
@@ -209,70 +214,41 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
 
-func (m *Metrics) SetServiceStatusReader(reader func() service.StatusSnapshot) {
+func (m *Metrics) RegisterRuntimeCollectors(readers RuntimeReaders) error {
 	if m == nil {
-		return
+		return nil
 	}
-	m.mu.Lock()
-	m.serviceStatusReader = reader
-	m.mu.Unlock()
+	if readers.ServiceStatusReader == nil {
+		return errors.New("service status metric reader is required")
+	}
+	if readers.DBStatusReader == nil {
+		return errors.New("db status metric reader is required")
+	}
+	m.serviceStatusReader = readers.ServiceStatusReader
+	m.dbStatusReader = readers.DBStatusReader
+	m.artifactStatus = newStorageArtifactStatusReader(readers.ArchivePackagesDir, readers.StateFilesDir)
+	for _, collector := range []prometheus.Collector{
+		newServiceCollector(m, m.namespace),
+		newDBCollector(m, m.namespace),
+		newStorageArtifactCollector(m, m.namespace),
+	} {
+		if err := m.registry.Register(collector); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (m *Metrics) serviceStatus() (service.StatusSnapshot, error) {
-	if m == nil {
-		return service.StatusSnapshot{}, errMetricReaderNotConfigured
-	}
-	m.mu.RLock()
-	reader := m.serviceStatusReader
-	m.mu.RUnlock()
-	if reader == nil {
-		return service.StatusSnapshot{}, errMetricReaderNotConfigured
-	}
-	return reader(), nil
-}
-
-func (m *Metrics) SetDBStatusReader(reader func(context.Context) (pebblestore.DBStatus, error)) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	m.dbStatusReader = reader
-	m.mu.Unlock()
+func (m *Metrics) serviceStatus() service.StatusSnapshot {
+	return m.serviceStatusReader()
 }
 
 func (m *Metrics) dbStatus(ctx context.Context) (pebblestore.DBStatus, error) {
-	if m == nil {
-		return pebblestore.DBStatus{}, errMetricReaderNotConfigured
-	}
-	m.mu.RLock()
-	reader := m.dbStatusReader
-	m.mu.RUnlock()
-	if reader == nil {
-		return pebblestore.DBStatus{}, errMetricReaderNotConfigured
-	}
-	return reader(ctx)
-}
-
-func (m *Metrics) SetStorageArtifactDirs(archivePackagesDir string, stateFilesDir string) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	m.artifactStatus = newStorageArtifactStatusReader(archivePackagesDir, stateFilesDir)
-	m.mu.Unlock()
+	return m.dbStatusReader(ctx)
 }
 
 func (m *Metrics) storageArtifactStatus(ctx context.Context) (storageArtifactStatus, error) {
-	if m == nil {
-		return storageArtifactStatus{}, errMetricReaderNotConfigured
-	}
-	m.mu.RLock()
-	reader := m.artifactStatus
-	m.mu.RUnlock()
-	if reader == nil {
-		return storageArtifactStatus{}, errMetricReaderNotConfigured
-	}
-	return reader.Status(ctx)
+	return m.artifactStatus.Status(ctx)
 }
 
 func (m *Metrics) AddLiteserverInflight(delta int) {
@@ -295,6 +271,7 @@ func (m *Metrics) ObserveLiteserverQuery(observation liteserver.QueryObservation
 		response = "unknown"
 	}
 	errorCode := liteserverErrorCodeLabel(observation)
+	errorReason := liteserverErrorReasonLabel(observation)
 	duration := observation.Duration
 	if duration < 0 {
 		duration = 0
@@ -305,13 +282,13 @@ func (m *Metrics) ObserveLiteserverQuery(observation liteserver.QueryObservation
 	}
 
 	totalDuration := duration + waitDuration
-	m.liteserverQueryDuration.WithLabelValues(method, response, errorCode).Observe(totalDuration.Seconds())
+	m.liteserverQueryDuration.WithLabelValues(method, response, errorCode, errorReason).Observe(totalDuration.Seconds())
 	if m.liteserverQueryHandler != nil {
-		m.liteserverQueryHandler.WithLabelValues(method, response, errorCode).Observe(duration.Seconds())
+		m.liteserverQueryHandler.WithLabelValues(method, response, errorCode, errorReason).Observe(duration.Seconds())
 	}
-	m.liteserverQueries.WithLabelValues(method, response, errorCode).Inc()
+	m.liteserverQueries.WithLabelValues(method, response, errorCode, errorReason).Inc()
 	if waitDuration > 0 && m.liteserverQueryWait != nil {
-		m.liteserverQueryWait.WithLabelValues(method, response, errorCode).Observe(waitDuration.Seconds())
+		m.liteserverQueryWait.WithLabelValues(method, response, errorCode, errorReason).Observe(waitDuration.Seconds())
 	}
 }
 
@@ -323,6 +300,18 @@ func liteserverErrorCodeLabel(observation liteserver.QueryObservation) string {
 		return liteserverUnspecifiedErrorCodeLabel
 	}
 	return liteserverNoErrorCodeLabel
+}
+
+func liteserverErrorReasonLabel(observation liteserver.QueryObservation) string {
+	if !observation.Error {
+		return liteserverNoErrorReasonLabel
+	}
+
+	reason := strings.TrimSpace(observation.ErrorReason)
+	if reason == "" {
+		return liteserverUnspecifiedReasonLabel
+	}
+	return reason
 }
 
 func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {

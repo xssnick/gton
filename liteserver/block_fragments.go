@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 
 	"github.com/xssnick/gton/service/storage"
@@ -39,7 +38,7 @@ type liveBlockFragments struct {
 	baseConfig        *runMethodBaseConfig
 	globalLibs        *cell.Dictionary
 	librariesLoaded   bool
-	lazyLoad          liveLoadGroup[string]
+	lazyLoad          liveLoadGroup[liveBlockFragmentLoadKey]
 }
 
 type accountProofKey struct {
@@ -59,6 +58,23 @@ type shardHashesProofKey struct {
 	workchain int32
 	shard     int64
 	exact     bool
+}
+
+type liveBlockFragmentLoadKind uint8
+
+const (
+	liveBlockFragmentLoadMcExtra liveBlockFragmentLoadKind = iota
+	liveBlockFragmentLoadAccountProof
+	liveBlockFragmentLoadShardHashes
+	liveBlockFragmentLoadBaseConfig
+	liveBlockFragmentLoadGlobalLibraries
+)
+
+type liveBlockFragmentLoadKey struct {
+	kind    liveBlockFragmentLoadKind
+	account accountProofKey
+	shard   shardHashesProofKey
+	pruned  bool
 }
 
 func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*liveBlockFragments, error) {
@@ -94,6 +110,17 @@ func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRo
 	}, nil
 }
 
+func (f *liveBlockFragments) prewarmForLiteServer() {
+	if f.block.Workchain != masterchainID {
+		return
+	}
+
+	// Master config and global libraries are runMethod hot-path data. Prewarm is
+	// opportunistic because publish accepts hash-valid partial artifacts as well.
+	_, _ = f.runMethodBaseConfig()
+	_, _ = f.globalLibraries()
+}
+
 func (f *liveBlockFragments) accountCell(accountID []byte) (*cell.Cell, error) {
 	return accountCellFromAccountsRoot(f.accountsRoot, accountID)
 }
@@ -114,7 +141,7 @@ func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cel
 		}
 		f.mu.Unlock()
 
-		loadKey := "account-proof:" + strconv.FormatBool(pruned) + ":" + string(key.accountID[:])
+		loadKey := liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadAccountProof, account: key, pruned: pruned}
 		value, err := f.lazyLoad.do(context.Background(), loadKey, func() (any, error) {
 			f.mu.Lock()
 			if cached, ok := f.accountProofs[key]; ok {
@@ -206,7 +233,7 @@ func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {
 	}
 	f.mu.Unlock()
 
-	value, err := f.lazyLoad.do(context.Background(), "mc-extra", func() (any, error) {
+	value, err := f.lazyLoad.do(context.Background(), liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadMcExtra}, func() (any, error) {
 		f.mu.Lock()
 		if f.masterExtra != nil {
 			extra := f.masterExtra
@@ -253,7 +280,7 @@ func (f *liveBlockFragments) shardHashesProof(workchain int32, shard int64, exac
 	}
 	f.mu.Unlock()
 
-	loadKey := "shard-hashes:" + strconv.FormatInt(int64(workchain), 10) + ":" + strconv.FormatInt(shard, 10) + ":" + strconv.FormatBool(exact)
+	loadKey := liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadShardHashes, shard: key}
 	value, err := f.lazyLoad.do(context.Background(), loadKey, func() (any, error) {
 		f.mu.Lock()
 		if proof := f.shardHashesProofs[key]; proof != nil {
@@ -312,7 +339,7 @@ func (f *liveBlockFragments) runMethodBaseConfig() (*runMethodBaseConfig, error)
 	}
 	f.mu.Unlock()
 
-	value, err := f.lazyLoad.do(context.Background(), "base-config", func() (any, error) {
+	value, err := f.lazyLoad.do(context.Background(), liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadBaseConfig}, func() (any, error) {
 		f.mu.Lock()
 		if f.baseConfig != nil {
 			config := f.baseConfig
@@ -367,7 +394,7 @@ func (f *liveBlockFragments) globalLibraries() (*cell.Dictionary, error) {
 	}
 	f.mu.Unlock()
 
-	value, err := f.lazyLoad.do(context.Background(), "global-libraries", func() (any, error) {
+	value, err := f.lazyLoad.do(context.Background(), liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadGlobalLibraries}, func() (any, error) {
 		f.mu.Lock()
 		if f.librariesLoaded {
 			globalLibs := f.globalLibs

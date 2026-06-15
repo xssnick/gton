@@ -22,16 +22,12 @@ func (s *Service) blockStatusMetrics(ctx context.Context, state *storage.BlockSt
 		return statusBlockMetrics{}
 	}
 
-	metrics, _, err := s.liveBlockStatusMetrics(ctx, state.Block)
+	metrics, _, _ := s.liveBlockStatusMetrics(ctx, state.Block)
 	if state.Parsed != nil && state.Parsed.GenUTime != 0 {
 		metrics.Utime = int64(state.Parsed.GenUTime)
 	} else if metrics.Utime == 0 {
 		metrics.Utime = blockUtimeFromMeta(ctx, s.storage, &state.Block)
 	}
-	if err == nil {
-		return metrics
-	}
-
 	return metrics
 }
 
@@ -93,7 +89,7 @@ func (s *Service) liveBlockStatusMetrics(ctx context.Context, block ton.BlockIDE
 }
 
 func (s *Service) liveBlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error) {
-	cache := s.liveBlockCache()
+	cache := s.liveBlockCache
 	if cache == nil {
 		return nil, storage.ErrNotFound
 	}
@@ -120,20 +116,12 @@ func (s *Service) liveBlockMeta(ctx context.Context, block ton.BlockIDExt) (*sto
 }
 
 func (s *Service) liveBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	cache := s.liveBlockCache()
+	cache := s.liveBlockCache
 	if cache == nil {
 		return nil, storage.ErrNotFound
 	}
 
 	return cache.BlockData(ctx, block)
-}
-
-func (s *Service) liveBlockCache() *storage.LiveBlockCache {
-	if s == nil || s.node == nil {
-		return nil
-	}
-
-	return s.node.LiveBlockCache()
 }
 
 func (s *Service) masterShardBlocks(ctx context.Context, master ton.BlockIDExt) ([]ton.BlockIDExt, error) {

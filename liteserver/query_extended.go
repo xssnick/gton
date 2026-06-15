@@ -10,9 +10,11 @@ import (
 	"math/bits"
 	"sort"
 
+	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -22,6 +24,18 @@ const (
 	maxGetTransactions       = 16
 	maxListBlockTransactions = 256
 	outMsgQueueSizeLimit     = 8000
+
+	sendMessageErrorReasonNotConfigured      = "not_configured"
+	sendMessageErrorReasonOversized          = "oversized"
+	sendMessageErrorReasonDuplicate          = "duplicate"
+	sendMessageErrorReasonParseFailed        = "parse_failed"
+	sendMessageErrorReasonRateLimited        = "rate_limited"
+	sendMessageErrorReasonAddressLimiterFull = "address_limiter_full"
+	sendMessageErrorReasonNotReady           = "not_ready"
+	sendMessageErrorReasonTVMRejected        = "tvm_rejected"
+	sendMessageErrorReasonCheckFailed        = "check_failed"
+	sendMessageErrorReasonBroadcastCapacity  = "broadcast_capacity"
+	sendMessageErrorReasonBroadcastFailed    = "broadcast_failed"
 )
 
 var (
@@ -67,42 +81,82 @@ func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 }
 
 func (s *Server) handleSendMessage(ctx context.Context, query ton.SendMessage) any {
+	resp, _ := s.handleSendMessageWithReason(ctx, query)
+	return resp
+}
+
+func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.SendMessage) (tl.Serializable, string) {
 	const errorPrefix = "cannot apply external message to current state "
 
 	if s.messageSender == nil {
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": not configured"}
+		return sendMessageLSError(sendMessageErrorReasonNotConfigured, errorPrefix+": not configured")
 	}
 	if len(query.Body) > maxExternalMessageBroadcastDataSize {
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + fmt.Sprintf(": external message is too large: %d", len(query.Body))}
+		return sendMessageLSError(sendMessageErrorReasonOversized, errorPrefix+fmt.Sprintf(": external message is too large: %d", len(query.Body)))
 	}
 
 	cacheKey, ok := s.cacheSendMessage(query.Body)
 	if !ok {
-		return ton.LSError{Code: errCodeUnspecified, Text: "cannot send external message : duplicate message"}
+		return sendMessageLSError(sendMessageErrorReasonDuplicate, "cannot send external message : duplicate message")
 	}
 	msgCell, msg, err := parseExternalMessage(query.Body)
 	if err != nil {
 		s.dropCachedSendMessage(cacheKey)
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+		return sendMessageLSError(sendMessageErrorReasonParseFailed, errorPrefix+": "+err.Error())
 	}
-	if err = s.checkExternalMessageAddressLimit(msg.DstAddr); err != nil {
+
+	addrKey := externalMessageAddressKey(msg.DstAddr)
+	if err = s.checkExternalMessageAddressLimit(addrKey); err != nil {
 		s.dropCachedSendMessage(cacheKey)
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
 	if err = s.checkExternalMessage(ctx, query.Body, msgCell, msg); err != nil {
 		s.dropCachedSendMessage(cacheKey)
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+		return sendMessageLSError(sendMessageCheckErrorReason(err), errorPrefix+": "+err.Error())
 	}
-	if err = s.addExternalMessageAddressLimit(msg.DstAddr); err != nil {
+	if err = s.addExternalMessageAddressLimit(addrKey); err != nil {
 		s.dropCachedSendMessage(cacheKey)
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
-	if err := s.messageSender.SendExternalMessage(ctx, query.Body); err != nil {
-		s.dropExternalMessageAddressLimit(msg.DstAddr)
+	if err := s.messageSender.SendExternalMessage(ctx, query.Body, addrKey); err != nil {
+		s.dropExternalMessageAddressLimit(addrKey)
 		s.dropCachedSendMessage(cacheKey)
-		return ton.LSError{Code: errCodeUnspecified, Text: errorPrefix + ": " + err.Error()}
+		return sendMessageLSError(sendMessageBroadcastErrorReason(err), errorPrefix+": "+err.Error())
 	}
-	return ton.SendMessageStatus{Status: 1}
+	return ton.SendMessageStatus{Status: 1}, ""
+}
+
+func sendMessageLSError(reason string, text string) (tl.Serializable, string) {
+	return ton.LSError{Code: errCodeUnspecified, Text: text}, reason
+}
+
+func sendMessageAddressLimitErrorReason(err error) string {
+	switch {
+	case errors.Is(err, extmsg.ErrAddressRateLimited):
+		return sendMessageErrorReasonRateLimited
+	case errors.Is(err, extmsg.ErrAddressLimiterFull):
+		return sendMessageErrorReasonAddressLimiterFull
+	default:
+		return sendMessageErrorReasonCheckFailed
+	}
+}
+
+func sendMessageCheckErrorReason(err error) string {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return sendMessageErrorReasonNotReady
+	case errors.Is(err, errExternalMessageRejected):
+		return sendMessageErrorReasonTVMRejected
+	default:
+		return sendMessageErrorReasonCheckFailed
+	}
+}
+
+func sendMessageBroadcastErrorReason(err error) string {
+	if errors.Is(err, extmsg.ErrExternalBroadcastCapacityExceeded) {
+		return sendMessageErrorReasonBroadcastCapacity
+	}
+	return sendMessageErrorReasonBroadcastFailed
 }
 
 func (s *Server) handleAllShardsInfo(ctx context.Context, id *ton.BlockIDExt) any {

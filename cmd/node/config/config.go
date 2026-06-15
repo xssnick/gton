@@ -17,37 +17,39 @@ import (
 )
 
 const (
-	DefaultPath                            = "config.json"
-	DefaultGlobalConfigPath                = "global.config.json"
-	DefaultGlobalConfigURL                 = "https://ton-blockchain.github.io/global.config.json"
-	DefaultSyncBefore                      = time.Hour
-	DefaultStateTTL                        = 2 * 24 * time.Hour
-	DefaultArchiveTTL                      = 7 * 24 * time.Hour
-	DefaultNextCheckpointBlocks            = int64(400)
-	DefaultArchiveCheckpointBlocks         = int64(2000)
-	DefaultCheckpointBytes                 = int64(512 << 20)
-	DefaultSyncBackpressureWindows         = int64(4)
-	DefaultCellTotalCache                  = int64(8 << 30)
-	DefaultDecodedCellCacheEnabled         = true
-	DefaultDecodedCellCacheShards          = int64(64)
-	DefaultDecodedCellCacheBytesPerEntry   = int64(16 << 10)
-	DefaultDecodedCellCacheMinEntries      = int64(64 << 10)
-	DefaultDecodedCellCacheMaxEntries      = int64(1 << 20)
-	DefaultCellShardMemTable               = int64(256 << 20)
-	DefaultCellMemTableStopWritesThreshold = int64(4)
-	DefaultArtifactFileMaxOpen             = int64(512)
-	DefaultLiteMasterBlockCache            = 128
-	DefaultLiteShardBlockCache             = 4096
-	DefaultLiteListen                      = "0.0.0.0:7445"
-	DefaultMetricsNamespace                = "gton"
-	defaultStorageDir                      = "data"
-	defaultADNLPort                        = 30303
-	defaultADNLListen                      = "0.0.0.0:30303"
-	defaultDHTListen                       = "0.0.0.0:30304"
-	privateKeySeedSize                     = 32
-	externalIPHTTPClient                   = 5 * time.Second
-	globalConfigHTTPClient                 = 30 * time.Second
-	ipAPILookupURL                         = "http://ip-api.com/json/?fields=status,message,query"
+	DefaultPath                             = "config.json"
+	DefaultGlobalConfigPath                 = "global.config.json"
+	DefaultGlobalConfigURL                  = "https://ton-blockchain.github.io/global.config.json"
+	DefaultSyncBefore                       = time.Hour
+	ArchiveFromZeroSyncBefore               = int64(-1)
+	DefaultStateTTL                         = 2 * 24 * time.Hour
+	DefaultArchiveTTL                       = 7 * 24 * time.Hour
+	DefaultNextCheckpointBlocks             = int64(400)
+	DefaultArchiveCheckpointBlocks          = int64(2000)
+	DefaultCheckpointBytes                  = int64(512 << 20)
+	DefaultSyncBackpressureWindows          = int64(4)
+	DefaultCellTotalCache                   = int64(8 << 30)
+	DefaultDecodedCellCacheEnabled          = true
+	DefaultDecodedCellCacheShards           = int64(64)
+	DefaultDecodedCellCacheBytesPerEntry    = int64(16 << 10)
+	DefaultDecodedCellCacheMinEntries       = int64(64 << 10)
+	DefaultDecodedCellCacheMaxEntries       = int64(1 << 20)
+	DefaultCellShardMemTable                = int64(256 << 20)
+	DefaultCellMemTableStopWritesThreshold  = int64(4)
+	DefaultArtifactFileMaxOpen              = int64(512)
+	DefaultLiteMasterBlockCache             = 128
+	DefaultLiteShardBlockCache              = 4096
+	DefaultLiteListen                       = "0.0.0.0:7445"
+	DefaultLiteSendMessageBroadcastMaxDelay = 100 * time.Millisecond
+	DefaultMetricsNamespace                 = "gton"
+	defaultStorageDir                       = "data"
+	defaultADNLPort                         = 30303
+	defaultADNLListen                       = "0.0.0.0:30303"
+	defaultDHTListen                        = "0.0.0.0:30304"
+	privateKeySeedSize                      = 32
+	externalIPHTTPClient                    = 5 * time.Second
+	globalConfigHTTPClient                  = 30 * time.Second
+	ipAPILookupURL                          = "http://ip-api.com/json/?fields=status,message,query"
 )
 
 var ErrConfigMissingWithExistingStorage = errors.New("config file is missing while storage metadata exists")
@@ -64,11 +66,10 @@ type Config struct {
 }
 
 type TON struct {
-	GlobalConfigPath       string `json:"global_config_path"`
-	SyncBefore             int64  `json:"sync_before"`
-	StateTTL               int64  `json:"state_ttl"`
-	ArchiveTTL             int64  `json:"archive_ttl"`
-	DisableArchiveBackfill bool   `json:"disable_archive_backfill"`
+	GlobalConfigPath string `json:"global_config_path"`
+	SyncBefore       int64  `json:"sync_before"`
+	StateTTL         int64  `json:"state_ttl"`
+	ArchiveTTL       int64  `json:"archive_ttl"`
 
 	NextCheckpointBlocks    int64 `json:"next_checkpoint_blocks"`
 	ArchiveCheckpointBlocks int64 `json:"archive_checkpoint_blocks"`
@@ -88,12 +89,14 @@ type DHT struct {
 }
 
 type Lite struct {
-	Enabled          bool   `json:"enabled"`
-	NonFinalEnabled  bool   `json:"non_final_enabled"`
-	Key              []byte `json:"key"`
-	ListenAddr       string `json:"listen_addr"`
-	MasterBlockCache int    `json:"master_block_cache"`
-	ShardBlockCache  int    `json:"shard_block_cache"`
+	Enabled                            bool   `json:"enabled"`
+	NonFinalEnabled                    bool   `json:"non_final_enabled"`
+	Key                                []byte `json:"key"`
+	ListenAddr                         string `json:"listen_addr"`
+	MasterBlockCache                   int    `json:"master_block_cache"`
+	ShardBlockCache                    int    `json:"shard_block_cache"`
+	SendMessageBroadcastBytesPerSecond int64  `json:"send_message_broadcast_bytes_per_second"`
+	SendMessageBroadcastMaxDelayMS     int64  `json:"send_message_broadcast_max_delay_ms"`
 }
 
 type Storage struct {
@@ -115,6 +118,11 @@ type DecodedCellCacheOptions struct {
 	BytesPerEntry int64
 	MinEntries    int
 	MaxEntries    int
+}
+
+type LiteSendMessageBroadcastCapacity struct {
+	BytesPerSecond int64
+	MaxDelay       time.Duration
 }
 
 type Metrics struct {
@@ -155,8 +163,9 @@ func defaultConfig() Config {
 			SyncBackpressureWindows: DefaultSyncBackpressureWindows,
 		},
 		Lite: Lite{
-			MasterBlockCache: DefaultLiteMasterBlockCache,
-			ShardBlockCache:  DefaultLiteShardBlockCache,
+			MasterBlockCache:               DefaultLiteMasterBlockCache,
+			ShardBlockCache:                DefaultLiteShardBlockCache,
+			SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
 		},
 		Storage: Storage{
 			CellTotalCacheSize:              DefaultCellTotalCache,
@@ -223,11 +232,12 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		ListenAddr: defaultDHTListen,
 	}
 	cfg.Lite = Lite{
-		Enabled:          false,
-		Key:              liteSeed,
-		ListenAddr:       DefaultLiteListen,
-		MasterBlockCache: DefaultLiteMasterBlockCache,
-		ShardBlockCache:  DefaultLiteShardBlockCache,
+		Enabled:                        false,
+		Key:                            liteSeed,
+		ListenAddr:                     DefaultLiteListen,
+		MasterBlockCache:               DefaultLiteMasterBlockCache,
+		ShardBlockCache:                DefaultLiteShardBlockCache,
+		SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
 	}
 	cfg.Storage = Storage{
 		Dir:                             storageDir,
@@ -297,7 +307,9 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	cfg := defaultConfig()
 	dec := json.NewDecoder(file)
@@ -428,6 +440,9 @@ func (cfg Config) GlobalConfigPath() string {
 }
 
 func (cfg Config) SyncBefore() (time.Duration, error) {
+	if cfg.ArchiveFromZero() {
+		return 0, nil
+	}
 	if cfg.TON.SyncBefore <= 0 {
 		return 0, fmt.Errorf("ton.sync_before should be positive seconds")
 	}
@@ -436,6 +451,10 @@ func (cfg Config) SyncBefore() (time.Duration, error) {
 		return 0, fmt.Errorf("ton.sync_before is too large")
 	}
 	return time.Duration(cfg.TON.SyncBefore) * time.Second, nil
+}
+
+func (cfg Config) ArchiveFromZero() bool {
+	return cfg.TON.SyncBefore == ArchiveFromZeroSyncBefore
 }
 
 func (cfg Config) StateTTL() (time.Duration, error) {
@@ -480,6 +499,26 @@ func (cfg Config) CheckpointBytes() (uint64, error) {
 
 func (cfg Config) SyncBackpressureWindows() (uint32, error) {
 	return uint32ConfigValue("ton.sync_backpressure_windows", cfg.TON.SyncBackpressureWindows, uint32(DefaultSyncBackpressureWindows))
+}
+
+func (cfg Config) LiteSendMessageBroadcastCapacity() (LiteSendMessageBroadcastCapacity, error) {
+	if cfg.Lite.SendMessageBroadcastBytesPerSecond < 0 {
+		return LiteSendMessageBroadcastCapacity{}, fmt.Errorf("liteserver.send_message_broadcast_bytes_per_second cannot be negative")
+	}
+	if cfg.Lite.SendMessageBroadcastMaxDelayMS < 0 {
+		return LiteSendMessageBroadcastCapacity{}, fmt.Errorf("liteserver.send_message_broadcast_max_delay_ms cannot be negative")
+	}
+
+	delayMS := cfg.Lite.SendMessageBroadcastMaxDelayMS
+	const maxDurationMilliseconds = int64(time.Duration(1<<63-1) / time.Millisecond)
+	if delayMS > maxDurationMilliseconds {
+		return LiteSendMessageBroadcastCapacity{}, fmt.Errorf("liteserver.send_message_broadcast_max_delay_ms is too large")
+	}
+
+	return LiteSendMessageBroadcastCapacity{
+		BytesPerSecond: cfg.Lite.SendMessageBroadcastBytesPerSecond,
+		MaxDelay:       time.Duration(delayMS) * time.Millisecond,
+	}, nil
 }
 
 func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, error) {
@@ -595,7 +634,9 @@ func downloadFileWithClient(ctx context.Context, client *http.Client, path strin
 	if err != nil {
 		return fmt.Errorf("download %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s returned %s", url, resp.Status)
@@ -642,7 +683,9 @@ func lookupExternalIP(ctx context.Context, client *http.Client, url string) (str
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("%s returned %s", url, resp.Status)

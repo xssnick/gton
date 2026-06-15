@@ -74,7 +74,7 @@ func SplitPersistentState(block ton.BlockIDExt, root *cell.Cell, splitDepth uint
 		return nil, fmt.Errorf("shard state has no accounts dict")
 	}
 
-	observedAccounts := accounts.AugmentedDictionary.Copy()
+	observedAccounts := accounts.Copy()
 
 	partsCount := uint64(1) << (splitDepth - uint32(shardPrefixLen))
 	effectiveShard := uint64(block.Shard) ^ (uint64(1) << (63 - shardPrefixLen)) ^ (uint64(1) << (63 - splitDepth))

@@ -70,8 +70,12 @@ func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
 	}
 
 	svc.resetMonitorSplitDepthCache()
-	if _, err = svc.cachedMonitorMinSplitDepth(cached, 0); err == nil {
-		t.Fatal("expected cache reset to require mc_state_extra again")
+	got, err = svc.cachedMonitorMinSplitDepth(cached, 0)
+	if err != nil {
+		t.Fatalf("cachedMonitorMinSplitDepth after cache reset: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("cachedMonitorMinSplitDepth after cache reset = %d, want 0", got)
 	}
 }
 
@@ -110,6 +114,37 @@ func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	}
 	if got != 9 {
 		t.Fatalf("cachedMonitorMinSplitDepth after key master = %d, want 9", got)
+	}
+}
+
+func TestResetMasterDependentCachesForKeyBlockResetsBroadcastValidatorConfig(t *testing.T) {
+	svc := &Service{}
+	first := testBlockID(-1, topShard, 10)
+	config := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
+	svc.broadcastValidatorCache.putConfig(first, config)
+
+	if _, ok := svc.broadcastValidatorCache.getConfig(testBlockID(-1, topShard, 11)); !ok {
+		t.Fatal("expected broadcast validator config cache hit before reset")
+	}
+
+	nonKey := testBlockID(-1, topShard, 12)
+	svc.resetMasterDependentCachesForKeyBlock(&PreparedBlock{
+		ID:   nonKey,
+		Meta: &storage.BlockMeta{ID: nonKey},
+	})
+	if _, ok := svc.broadcastValidatorCache.getConfig(testBlockID(-1, topShard, 13)); !ok {
+		t.Fatal("non-key master block reset broadcast validator config cache")
+	}
+
+	key := testBlockID(-1, topShard, 14)
+	meta := &storage.BlockMeta{ID: key}
+	meta.Mark(storage.BlockMetaIsKeyBlock)
+	svc.resetMasterDependentCachesForKeyBlock(&PreparedBlock{
+		ID:   key,
+		Meta: meta,
+	})
+	if _, ok := svc.broadcastValidatorCache.getConfig(testBlockID(-1, topShard, 15)); ok {
+		t.Fatal("expected broadcast validator config cache miss after key block reset")
 	}
 }
 

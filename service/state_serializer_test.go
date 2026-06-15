@@ -29,16 +29,52 @@ func TestStateSerializerFailsOnMissingPrunedBoundary(t *testing.T) {
 		t.Fatalf("save root record: %v", err)
 	}
 
-	loader, err := newLargeBOCStateLoader(ctx, store, 0)
-	if err != nil {
-		t.Fatalf("create large boc loader: %v", err)
-	}
-
+	loader := newLargeBOCStateLoader(ctx, store, 0)
 	var rootHash cell.Hash
 	copy(rootHash[:], root.Hash())
 	var buf bytes.Buffer
 	if err = cell.ToLargeBOC(&buf, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 1, persistentStateLargeBOCBatchSize); err == nil {
 		t.Fatal("serialized state with missing pruned boundary")
+	}
+}
+
+func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+
+	zero := testBlockID(-1, topShard, 0)
+	zeroState := &tnstore.BlockState{
+		Block: zero,
+		Cell:  cell.BeginCell().EndCell(),
+	}
+	if err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{zeroState}, &tnstore.CurrentState{
+		ShardClientSeqno: 0,
+		Masterchain:      *zeroState,
+		Shards:           map[tnstore.ShardKey]tnstore.BlockState{},
+	}); err != nil {
+		t.Fatalf("save current zero state: %v", err)
+	}
+
+	svc := &Service{
+		storage:         store,
+		stateSerializer: newStateSerializer(zerolog.Nop(), store, t.TempDir(), false),
+	}
+	if err := svc.processPersistentStateSerialization(ctx); err != nil {
+		t.Fatalf("process persistent state serialization: %v", err)
+	}
+
+	cursor, err := store.PersistentStateSerializerState(ctx)
+	if err != nil {
+		t.Fatalf("load serializer cursor: %v", err)
+	}
+	if !cursor.LastBlock.Equals(&zero) {
+		t.Fatalf("last block = %s, want %s", tnstore.FormatBlockRef(cursor.LastBlock), tnstore.FormatBlockRef(zero))
+	}
+	if !cursor.LastWrittenBlock.Equals(&zero) {
+		t.Fatalf("last written block = %s, want %s", tnstore.FormatBlockRef(cursor.LastWrittenBlock), tnstore.FormatBlockRef(zero))
+	}
+	if cursor.LastWrittenBlockUTime != 0 {
+		t.Fatalf("last written utime = %d, want 0", cursor.LastWrittenBlockUTime)
 	}
 }
 
@@ -82,11 +118,7 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 		t.Fatalf("save split cell records: %v", err)
 	}
 
-	loader, err := newLargeBOCStateLoader(ctx, store, 0)
-	if err != nil {
-		t.Fatalf("create large boc loader: %v", err)
-	}
-
+	loader := newLargeBOCStateLoader(ctx, store, 0)
 	rootHash := root.HashKey()
 	var got bytes.Buffer
 	if err = cell.ToLargeBOC(&got, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, persistentStateLargeBOCBatchSize); err != nil {
@@ -99,10 +131,7 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 		t.Fatal("synthetic root boc mismatch")
 	}
 
-	onePassLoader, err := newLargeBOCStateLoader(ctx, store, 0)
-	if err != nil {
-		t.Fatalf("create one-pass large boc loader: %v", err)
-	}
+	onePassLoader := newLargeBOCStateLoader(ctx, store, 0)
 	var onePass bytes.Buffer
 	if err = cell.ToLargeBOCOnePass(&onePass, []cell.Hash{rootHash}, persistentStateBOCOptions(), onePassLoader, 0, persistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("one-pass serialize synthetic root: %v", err)
@@ -160,11 +189,7 @@ func TestStateSerializerPersistsRawSplitRefs(t *testing.T) {
 		t.Fatalf("save split cell records: %v", err)
 	}
 
-	loader, err := newLargeBOCStateLoader(ctx, store, 0)
-	if err != nil {
-		t.Fatalf("create large boc loader: %v", err)
-	}
-
+	loader := newLargeBOCStateLoader(ctx, store, 0)
 	var got bytes.Buffer
 	if err = cell.ToLargeBOC(&got, []cell.Hash{root.HashKey()}, persistentStateBOCOptions(), loader, 0, persistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("serialize split root with effective refs: %v", err)
@@ -262,11 +287,11 @@ func TestStateSerializationKeepsTwoPhaseForNonBasechainSplits(t *testing.T) {
 
 func TestStateSerializerTreatsExistingFinalFileAsReady(t *testing.T) {
 	store := openTestPebbleStorage(t)
-	serializer := newStateSerializer(zerolog.Nop(), store, t.TempDir(), false)
+	serializer := newStateSerializer(zerolog.Nop(), store, store.StateFilesDir(), false)
 
 	master := testPebbleBlockID(-1, topShard, 100)
 	block := testPebbleBlockID(0, topShard, 101)
-	if err := os.MkdirAll(serializer.targetDir(), 0o755); err != nil {
+	if err := os.MkdirAll(serializer.dir, 0o755); err != nil {
 		t.Fatalf("create serializer target dir: %v", err)
 	}
 

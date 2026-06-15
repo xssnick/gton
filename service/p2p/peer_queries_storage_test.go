@@ -207,7 +207,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 	next := testStoredMasterBlockID(71)
 	blockData := []byte{0x71, 0x01}
 	proofData := []byte{0x71, 0x02}
-	if err := node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
 		Block:     next,
 		BlockData: blockData,
 		Meta: &tnstore.BlockMeta{
@@ -301,7 +301,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 
 	keyBlock := testStoredMasterBlockID(72)
 	proofData := []byte{0x72, 0x01}
-	if err := node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
 		Block: keyBlock,
 		Proofs: []tnstore.LiveBlockProofArtifact{
 			{Kind: tnstore.ServedProofBlock, Data: proofData},
@@ -330,7 +330,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 
 	linkOnlyBlock := testStoredMasterBlockID(73)
 	linkOnlyProof := []byte{0x73, 0x01}
-	if err := node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
 		Block: linkOnlyBlock,
 		Proofs: []tnstore.LiveBlockProofArtifact{
 			{Kind: tnstore.ServedProofKeyBlockLink, Data: linkOnlyProof},
@@ -470,7 +470,11 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		EffectiveShard:   0,
 	}
 	stateData := []byte{7, 8, 9, 10, 11}
-	statePath := filepath.Join(t.TempDir(), "state.boc")
+	stateName, err := tnstore.PersistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), stateName)
 	if err = os.WriteFile(statePath, stateData, 0o644); err != nil {
 		t.Fatalf("write persistent state file: %v", err)
 	}
@@ -629,7 +633,11 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 		t.Fatalf("save zero state: %v", err)
 	}
 
-	statePath := filepath.Join(t.TempDir(), "state.boc")
+	stateName, err := tnstore.PersistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), stateName)
 	if err = os.WriteFile(statePath, stateData, 0o644); err != nil {
 		t.Fatalf("write persistent state file: %v", err)
 	}

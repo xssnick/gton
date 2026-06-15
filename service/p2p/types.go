@@ -81,6 +81,7 @@ const (
 	peerRebroadcastQueueItems  = 2048
 	peerRebroadcastQueueBytes  = int64(256 << 20)
 	externalRebroadcastFanout  = 5
+	laggedExternalFanout       = 3
 	localRebroadcastAttempts   = 3
 	dhtServerStoreMaxKeys      = 300000
 
@@ -160,23 +161,29 @@ func (e BroadcastEvent) BlockRef() string {
 }
 
 type Options struct {
-	Logger             *zerolog.Logger
-	GlobalConfigPath   string
-	PrivateKey         ed25519.PrivateKey
-	ListenAddr         string
-	ExternalIP         net.IP
-	ExternalPort       uint16
-	DHTPrivateKey      ed25519.PrivateKey
-	DHTListenAddr      string
-	StateFilesDir      string
-	Storage            storage.Storage
-	PeerServingStorage storage.PeerServingStorage
-	LiveBlockCache     *storage.LiveBlockCache
-	CompressedState    CompressedBlockStateProvider
-	SyncLag            SyncLagProvider
-	SignatureVerifier  BroadcastSignatureVerifier
-	BroadcastAdmission BroadcastAdmission
-	CustomOverlays     []CustomOverlayConfig
+	Logger                    *zerolog.Logger
+	GlobalConfigPath          string
+	PrivateKey                ed25519.PrivateKey
+	ListenAddr                string
+	ExternalIP                net.IP
+	ExternalPort              uint16
+	DHTPrivateKey             ed25519.PrivateKey
+	DHTListenAddr             string
+	StateFilesDir             string
+	Storage                   storage.Storage
+	PeerServingStorage        storage.PeerServingStorage
+	LiveBlockCache            *storage.LiveBlockCache
+	CompressedState           CompressedBlockStateProvider
+	SyncLag                   SyncLagProvider
+	SignatureVerifier         BroadcastSignatureVerifier
+	BroadcastAdmission        BroadcastAdmission
+	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
+	CustomOverlays            []CustomOverlayConfig
+}
+
+type ExternalBroadcastCapacityOptions struct {
+	BytesPerSecond int64
+	MaxDelay       time.Duration
 }
 
 type BroadcastSignatureVerifier interface {
@@ -220,12 +227,6 @@ type BlockCacheObserver interface {
 
 type SyncLagProvider interface {
 	SyncLagSeconds() (int64, bool)
-}
-
-type SyncLagProviderFunc func() (int64, bool)
-
-func (f SyncLagProviderFunc) SyncLagSeconds() (int64, bool) {
-	return f()
 }
 
 type CustomOverlayConfig struct {

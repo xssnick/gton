@@ -140,6 +140,62 @@ func TestClassifyBroadcastUsesPeerAsFECSourcePeerID(t *testing.T) {
 	}
 }
 
+func TestClassifyBroadcastDoesNotSerializeInvalidPayload(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	payload := newSerializedBroadcastPayload(make(chan struct{}))
+
+	accepted, err := sub.classifyBroadcastPayload(nil, tonnodeapi.NewExternalMessageBroadcast{}, payload, DeliveryFEC, false, testPeerID("peer"))
+	if err != nil {
+		t.Fatalf("classify invalid broadcast: %v", err)
+	}
+	if accepted != nil {
+		t.Fatalf("invalid external broadcast was accepted: %+v", accepted)
+	}
+	if payload.serialized {
+		t.Fatal("invalid broadcast serialized payload before cheap drop")
+	}
+}
+
+func TestClassifyDuplicateIdentifiedBroadcastDoesNotSerializePayload(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+
+	downloaded := testShardBroadcastDownloadedBlock(t, 207, 0x207)
+	msg := tonnodeapi.NewBlockCandidateBroadcast{
+		ID:   downloaded.ID,
+		Data: downloaded.BlockBOC,
+	}
+	broadcastID := bytes.Repeat([]byte{0xAB}, 32)
+	node.deduper.Mark(broadcastFingerprint(sub.spec.ShortID, broadcastID), time.Now())
+	payload := newIdentifiedBroadcastPayload(make(chan struct{}), broadcastID)
+
+	accepted, err := sub.classifyBroadcastPayload(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
+	if err != nil {
+		t.Fatalf("classify duplicate identified broadcast: %v", err)
+	}
+	if accepted != nil {
+		t.Fatalf("duplicate identified broadcast was accepted: %+v", accepted)
+	}
+	if payload.serialized {
+		t.Fatal("duplicate identified broadcast serialized payload before dedupe")
+	}
+}
+
 func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	node := newTestNode(t)
 	node.SetBlockCacheObserver(&testBlockCacheObserver{nonfinalEnabled: true})

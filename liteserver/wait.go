@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/xssnick/gton/service/storage"
-
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -15,13 +13,10 @@ import (
 
 const errCodeTimeout int32 = 652
 
-type masterchainSeqnoWaiter interface {
-	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error
-}
-
 type queryLogTiming struct {
 	query        string
 	sequence     string
+	errorReason  string
 	duration     time.Duration
 	waitDuration time.Duration
 }
@@ -77,6 +72,15 @@ func (s *Server) handleQueryDataWithTiming(ctx context.Context, data any) (tl.Se
 
 func (s *Server) handleStandaloneQueryWithTiming(ctx context.Context, query any) (tl.Serializable, queryLogTiming) {
 	started := time.Now()
+	if sendMessage, ok := query.(ton.SendMessage); ok {
+		resp, reason := s.handleSendMessageWithReason(ctx, sendMessage)
+		return resp, queryLogTiming{
+			query:       liteserverQueryLogName(query),
+			errorReason: reason,
+			duration:    time.Since(started),
+		}
+	}
+
 	resp := s.handleQuery(ctx, query)
 	return resp, queryLogTiming{
 		query:    liteserverQueryLogName(query),
@@ -188,50 +192,7 @@ func (s *Server) waitMasterchainSeqno(ctx context.Context, query ton.WaitMasterc
 
 	seqno := uint32(query.Seqno)
 	timeout := time.Duration(query.Timeout) * time.Millisecond
-	if waiter, ok := s.store.(masterchainSeqnoWaiter); ok {
-		return waitMasterchainError(waiter.WaitMasterchainSeqno(ctx, seqno, timeout))
-	}
-
-	return waitMasterchainError(s.pollMasterchainSeqno(ctx, seqno, timeout))
-}
-
-func (s *Server) pollMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error {
-	if timeout > 10*time.Second {
-		timeout = 10 * time.Second
-	}
-	if timeout < 0 {
-		timeout = 0
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		current, err := s.store.CurrentState(waitCtx)
-		if err == nil {
-			currentSeqno := currentMasterchainSeqno(current)
-			if currentSeqno >= seqno {
-				return nil
-			}
-			if currentSeqno > 0 && seqno > currentSeqno+100 {
-				return errWaitMasterchainTooFar
-			}
-		} else if !errors.Is(err, storage.ErrNotFound) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			return err
-		}
-
-		select {
-		case <-ticker.C:
-		case <-waitCtx.Done():
-			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-				return errWaitMasterchainTimeout
-			}
-			return waitCtx.Err()
-		}
-	}
+	return waitMasterchainError(s.store.WaitMasterchainSeqno(ctx, seqno, timeout))
 }
 
 func waitMasterchainError(err error) *ton.LSError {

@@ -109,20 +109,9 @@ func (c *sendMessageCache) deleteEntryLocked(entry *sendMessageCacheEntry) {
 
 func (s *Server) cacheSendMessage(body []byte) (uint64, bool) {
 	key := crc64.Checksum(body, sendMessageCRC64Table)
-	cache := s.ensureSendMessageCache()
-	return key, cache.Mark(key, s.now())
+	return key, s.sendMessageCache.Mark(key, s.now())
 }
 
 func (s *Server) dropCachedSendMessage(key uint64) {
-	s.ensureSendMessageCache().Drop(key)
-}
-
-func (s *Server) ensureSendMessageCache() *sendMessageCache {
-	s.sendMessageCacheInitMu.Lock()
-	defer s.sendMessageCacheInitMu.Unlock()
-
-	if s.sendMessageCache == nil {
-		s.sendMessageCache = newSendMessageCache()
-	}
-	return s.sendMessageCache
+	s.sendMessageCache.Drop(key)
 }

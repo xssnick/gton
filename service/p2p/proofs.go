@@ -241,7 +241,12 @@ func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *o
 		return ProofDownload{}, ErrBlockNotAvailable
 	}
 	if err = validateDownloadedProof(block, data, isLink, keyBlock); err != nil {
-		return ProofDownload{}, err
+		if s.node == nil || !s.node.IsHardfork(block) {
+			return ProofDownload{}, err
+		}
+		if hardforkErr := validateDownloadedHardforkProof(block, data, isLink, keyBlock); hardforkErr != nil {
+			return ProofDownload{}, fmt.Errorf("%v; hardfork proof: %w", err, hardforkErr)
+		}
 	}
 	return ProofDownload{
 		Data: data,
@@ -264,6 +269,28 @@ func validateDownloadedProof(block ton.BlockIDExt, data []byte, isLink bool, key
 	}
 	if keyBlock && !parsed.Block.BlockInfo.KeyBlock {
 		return fmt.Errorf("proof for %s is not a key block", formatBlockRef(block))
+	}
+	return nil
+}
+
+func validateDownloadedHardforkProof(block ton.BlockIDExt, data []byte, isLink bool, keyBlock bool) error {
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		return fmt.Errorf("proof is not a valid BOC for %s: %w", formatBlockRef(block), err)
+	}
+	if err = blockproof.CheckHardforkProofShape(block, root, isLink); err != nil {
+		return err
+	}
+
+	parsed, err := blockproof.ParseCell(block, root)
+	if err != nil {
+		return err
+	}
+	if keyBlock && !parsed.Block.BlockInfo.KeyBlock {
+		return fmt.Errorf("proof for %s is not a key block", formatBlockRef(block))
+	}
+	if err = blockproof.ValidateHardforkBlock(block, parsed.Block); err != nil {
+		return err
 	}
 	return nil
 }

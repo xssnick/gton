@@ -28,6 +28,16 @@ const (
 )
 
 type Store interface {
+	LiveStoreBacking
+	CurrentAccountBlocks(ctx context.Context, workchain int32, account []byte) (CurrentAccountBlockIDs, error)
+	BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
+	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error)
+	CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error)
+	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error
+	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
+}
+
+type LiveStoreBacking interface {
 	// BlockData returns bytes that remain valid for the duration of the call
 	// chain. The liteserver treats the returned slice as read-only.
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
@@ -41,22 +51,11 @@ type Store interface {
 	LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
-}
-
-type blockRootStore interface {
-	BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
-}
-
-type blockFragmentsStore interface {
-	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error)
-}
-
-type currentMasterchainInfoStore interface {
-	CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error)
+	LazyCellLoader() cell.LazyCellLoader
 }
 
 type MessageSender interface {
-	SendExternalMessage(ctx context.Context, body []byte) error
+	SendExternalMessage(ctx context.Context, body []byte, address extmsg.AddressKey) error
 }
 
 type QueryObserver interface {
@@ -69,6 +68,7 @@ type QueryObservation struct {
 	Response     string
 	Error        bool
 	ErrorCode    int32
+	ErrorReason  string
 	Duration     time.Duration
 	WaitDuration time.Duration
 }
@@ -102,7 +102,6 @@ type Server struct {
 	now                 func() time.Time
 	tvm                 *tvm.TVM
 
-	sendMessageCacheInitMu sync.Mutex
 	sendMessageCache       *sendMessageCache
 	externalMessageLimiter *extmsg.AddressLimiter
 
@@ -122,6 +121,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.ListenAddr == "" {
 		return nil, fmt.Errorf("liteserver listen address is empty")
+	}
+	if opts.Store == nil {
+		return nil, fmt.Errorf("liteserver store is required")
 	}
 
 	log := zerolog.Nop()
@@ -318,6 +320,9 @@ func (s *Server) handleQueryRequest(ctx context.Context, client *liteclient.Serv
 	if lsErr, ok := resp.(ton.LSError); ok {
 		event = event.Int32("error_code", lsErr.Code)
 	}
+	if timing.errorReason != "" {
+		event = event.Str("error_reason", timing.errorReason)
+	}
 	event.Msg("handled liteserver query")
 
 	return resp, nil
@@ -327,6 +332,7 @@ func queryObservationFromResponse(resp tl.Serializable, timing queryLogTiming) Q
 	observation := QueryObservation{
 		Method:       timing.queryName(),
 		Response:     liteserverTypeName(resp),
+		ErrorReason:  timing.errorReason,
 		Duration:     timing.duration,
 		WaitDuration: timing.waitDuration,
 	}

@@ -12,33 +12,39 @@ import (
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	"github.com/xssnick/tonutils-go/tvm/tuple"
 	vmcore "github.com/xssnick/tonutils-go/tvm/vm"
 )
 
-const maxExternalMessageBroadcastDataSize = 16 << 20
+const (
+	maxExternalMessageBroadcastDataSize = 16 << 20
+	maxExternalMessageBOCCells          = 1 << 17
+)
+
+var errExternalMessageRejected = errors.New("external message was not accepted")
+
+type CurrentAccountBlockIDs struct {
+	Master  ton.BlockIDExt
+	Account ton.BlockIDExt
+}
 
 func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell *cell.Cell, msg *tlb.ExternalMessage) error {
-	current, err := s.store.CurrentState(ctx)
+	blocks, err := s.currentExternalMessageBlocks(ctx, msg.DstAddr)
 	if err != nil {
 		return err
 	}
 
-	state, err := currentStateForAddress(current, msg.DstAddr)
-	if err != nil {
-		return err
-	}
-
-	stateFragments, err := s.blockFragments(ctx, state.Block)
+	stateFragments, err := s.blockFragments(ctx, blocks.Account)
 	if err != nil {
 		return err
 	}
 
 	masterFragments := stateFragments
-	if !blockIDEqual(state.Block, current.Masterchain.Block) {
-		masterFragments, err = s.blockFragments(ctx, current.Masterchain.Block)
+	if !blockIDEqual(blocks.Account, blocks.Master) {
+		masterFragments, err = s.blockFragments(ctx, blocks.Master)
 		if err != nil {
 			return err
 		}
@@ -46,14 +52,16 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 
 	header := stateFragments.shardHeader
 
-	shardAccount, err := shardAccountFromAccountsRoot(stateFragments.accountsRoot, msg.DstAddr)
+	shardAccount, accountState, err := externalMessageAccountFromAccountsRoot(stateFragments.accountsRoot, msg.DstAddr)
 	if err != nil {
 		return err
 	}
 
-	accountCode, accountLibraries, duePayment, err := externalMessageAccountConfig(shardAccount)
-	if err != nil {
-		return err
+	var accountCode *cell.Cell
+	var accountLibraries *cell.Dictionary
+	if accountState.IsValid && accountState.StateInit != nil {
+		accountCode = accountState.StateInit.Code
+		accountLibraries = accountState.StateInit.Lib
 	}
 
 	config, err := masterFragments.runMethodConfig(header.GenUTime, accountCode)
@@ -75,8 +83,7 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 		return err
 	}
 
-	execConfig := tvm.TransactionEmulationConfig{
-		Address:             msg.DstAddr,
+	checkConfig := tvm.CheckExternalMessageAcceptedConfig{
 		Now:                 header.GenUTime,
 		BlockLT:             int64(header.GenLT),
 		LogicalTime:         int64(header.GenLT + 2),
@@ -84,52 +91,50 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 		ConfigRoot:          config.Root,
 		PrevBlocks:          config.PrevBlocks,
 		UnpackedConfig:      unpacked,
-		DuePayment:          duePayment,
+		DuePayment:          accountDuePayment(*accountState),
 		PrecompiledGasUsage: config.Precompiled,
 		Libraries:           libraries,
-		StopOnAccept:        true,
 	}
 
 	var trace []vmcore.TraceStep
 	if s.sendMessageTVMTrace {
-		execConfig.TraceHook = func(step vmcore.TraceStep) {
+		checkConfig.TraceHook = func(step vmcore.TraceStep) {
 			trace = append(trace, step)
 		}
 	}
-	result, err := machine.EmulateTransaction(shardAccount, msgCell, execConfig)
-	if s.sendMessageTVMTrace && (err != nil || result == nil || !result.Accepted) {
-		s.logSendMessageTVMTrace(err, result, trace, msg.DstAddr, current, state, masterFragments.shardHeader, header, execConfig, config.GlobalVersion)
+	accepted, err := machine.CheckExternalMessageAccepted(shardAccount, accountState, msgCell, msg, checkConfig)
+	if s.sendMessageTVMTrace && (err != nil || !accepted) {
+		s.logSendMessageTVMTrace(err, accepted, trace, msg.DstAddr, blocks.Master, blocks.Account, masterFragments.shardHeader, header, checkConfig, config.GlobalVersion)
 	}
 	if err != nil {
-		return fmt.Errorf("external message was not accepted: cannot run message on account: %w", err)
+		return fmt.Errorf("%w: cannot run message on account: %w", errExternalMessageRejected, err)
 	}
-	if !result.Accepted {
-		return errors.New("external message was not accepted")
+	if !accepted {
+		return errExternalMessageRejected
 	}
 	return nil
 }
 
-func (s *Server) logSendMessageTVMTrace(err error, result *tvm.TransactionExecutionResult, trace []vmcore.TraceStep, addr *address.Address, current *storage.CurrentState, state storage.BlockState, masterHeader runMethodShardHeader, executionHeader runMethodShardHeader, cfg tvm.TransactionEmulationConfig, globalVersion int) {
-	accepted := false
-	if result != nil {
-		accepted = result.Accepted
-	}
+func (s *Server) currentExternalMessageBlocks(ctx context.Context, addr *address.Address) (CurrentAccountBlockIDs, error) {
+	return s.store.CurrentAccountBlocks(ctx, addr.Workchain(), addr.Data())
+}
 
+func (s *Server) logSendMessageTVMTrace(err error, accepted bool, trace []vmcore.TraceStep, addr *address.Address, master ton.BlockIDExt, execution ton.BlockIDExt, masterHeader runMethodShardHeader, executionHeader runMethodShardHeader, cfg tvm.CheckExternalMessageAcceptedConfig, globalVersion int) {
 	event := s.log.Warn().
 		Bool("accepted", accepted).
 		Int("vm_trace_steps", len(trace)).
 		Str("address", addr.StringRaw()).
 		Int32("address_workchain", addr.Workchain()).
-		Str("master_block", storage.FormatBlockRef(current.Masterchain.Block)).
-		Int32("master_workchain", current.Masterchain.Block.Workchain).
-		Int64("master_shard", current.Masterchain.Block.Shard).
-		Uint32("master_seqno", current.Masterchain.Block.SeqNo).
+		Str("master_block", storage.FormatBlockRef(master)).
+		Int32("master_workchain", master.Workchain).
+		Int64("master_shard", master.Shard).
+		Uint32("master_seqno", master.SeqNo).
 		Uint32("master_gen_utime", masterHeader.GenUTime).
 		Uint64("master_gen_lt", masterHeader.GenLT).
-		Str("execution_block", storage.FormatBlockRef(state.Block)).
-		Int32("execution_workchain", state.Block.Workchain).
-		Int64("execution_shard", state.Block.Shard).
-		Uint32("execution_seqno", state.Block.SeqNo).
+		Str("execution_block", storage.FormatBlockRef(execution)).
+		Int32("execution_workchain", execution.Workchain).
+		Int64("execution_shard", execution.Shard).
+		Uint32("execution_seqno", execution.SeqNo).
 		Uint32("execution_gen_utime", executionHeader.GenUTime).
 		Uint64("execution_gen_lt", executionHeader.GenLT).
 		Int("global_version", globalVersion).
@@ -155,25 +160,16 @@ func formatSendMessageTVMTrace(trace []vmcore.TraceStep) string {
 	return strings.Join(lines, "\n")
 }
 
-func (s *Server) checkExternalMessageAddressLimit(addr *address.Address) error {
-	if s.externalMessageLimiter == nil {
-		s.externalMessageLimiter = extmsg.NewDefaultAddressLimiter()
-	}
-	return externalMessageAddressLimitError(addr, s.externalMessageLimiter.Check(externalMessageAddressKey(addr), s.now()))
+func (s *Server) checkExternalMessageAddressLimit(key extmsg.AddressKey) error {
+	return externalMessageAddressLimitError(key, s.externalMessageLimiter.Check(key, s.now()))
 }
 
-func (s *Server) addExternalMessageAddressLimit(addr *address.Address) error {
-	if s.externalMessageLimiter == nil {
-		s.externalMessageLimiter = extmsg.NewDefaultAddressLimiter()
-	}
-	return externalMessageAddressLimitError(addr, s.externalMessageLimiter.Add(externalMessageAddressKey(addr), s.now()))
+func (s *Server) addExternalMessageAddressLimit(key extmsg.AddressKey) error {
+	return externalMessageAddressLimitError(key, s.externalMessageLimiter.Add(key, s.now()))
 }
 
-func (s *Server) dropExternalMessageAddressLimit(addr *address.Address) {
-	if s.externalMessageLimiter == nil {
-		return
-	}
-	s.externalMessageLimiter.Remove(externalMessageAddressKey(addr), s.now())
+func (s *Server) dropExternalMessageAddressLimit(key extmsg.AddressKey) {
+	s.externalMessageLimiter.Remove(key, s.now())
 }
 
 func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
@@ -182,11 +178,11 @@ func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
 	return key
 }
 
-func externalMessageAddressLimitError(addr *address.Address, err error) error {
+func externalMessageAddressLimitError(key extmsg.AddressKey, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w %d:%x", err, addr.Workchain(), addr.Data())
+	return fmt.Errorf("%w %d:%x", err, key.Workchain, key.Account[:])
 }
 
 func parseExternalMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {
@@ -194,7 +190,9 @@ func parseExternalMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error)
 		return nil, nil, errors.New("external message is empty")
 	}
 
-	root, err := cell.FromBOC(data)
+	root, err := cell.FromBOCWithOptions(data, cell.BOCParseOptions{
+		MaxCells: maxExternalMessageBOCCells,
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot parse external message BOC: %w", err)
 	}
@@ -252,49 +250,38 @@ func checkExternalMessageLimits(config tlb.BlockchainConfig, data []byte, root *
 	return nil
 }
 
-func currentStateForAddress(current *storage.CurrentState, addr *address.Address) (storage.BlockState, error) {
-	if current == nil {
-		return storage.BlockState{}, storage.ErrNotFound
-	}
-	if addr.Workchain() == masterchainID {
-		return current.Masterchain, nil
-	}
-
-	for _, shard := range current.Shards {
-		if shard.Block.Workchain != addr.Workchain() {
-			continue
-		}
-		if tlb.ShardID(uint64(shard.Block.Shard)).ContainsAddress(addr) {
-			return shard, nil
-		}
-	}
-
-	return storage.BlockState{}, storage.ErrNotFound
-}
-
-func shardAccountFromAccountsRoot(accountsRoot *cell.Cell, addr *address.Address) (*tlb.ShardAccount, error) {
+func externalMessageAccountFromAccountsRoot(accountsRoot *cell.Cell, addr *address.Address) (*tlb.ShardAccount, *tlb.AccountState, error) {
 	if accountsRoot == nil {
-		return emptyShardAccount(), nil
+		shard := emptyShardAccount()
+		account, err := accountStateFromShardAccount(shard)
+		return shard, account, err
 	}
 
 	value, err := accountsRoot.AsDict(256).LoadValue(accountKey(addr.Data()))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return emptyShardAccount(), nil
+		shard := emptyShardAccount()
+		account, parseErr := accountStateFromShardAccount(shard)
+		return shard, account, parseErr
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var extra tlb.DepthBalanceInfo
 	if err = tlb.LoadFromCell(&extra, value); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var account tlb.ShardAccount
 	if err = tlb.LoadFromCell(&account, value); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &account, nil
+
+	state, err := accountStateFromShardAccount(&account)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &account, state, nil
 }
 
 func emptyShardAccount() *tlb.ShardAccount {
@@ -304,19 +291,12 @@ func emptyShardAccount() *tlb.ShardAccount {
 	}
 }
 
-func externalMessageAccountConfig(shard *tlb.ShardAccount) (*cell.Cell, *cell.Dictionary, any, error) {
+func accountStateFromShardAccount(shard *tlb.ShardAccount) (*tlb.AccountState, error) {
 	var account tlb.AccountState
-	loader, err := shard.Account.BeginParse()
-	if err != nil {
-		return nil, nil, nil, err
+	if err := tlb.Parse(&account, shard.Account); err != nil {
+		return nil, err
 	}
-	if err := tlb.LoadFromCell(&account, loader); err != nil {
-		return nil, nil, nil, err
-	}
-	if !account.IsValid || account.StateInit == nil {
-		return nil, nil, nil, nil
-	}
-	return account.StateInit.Code, account.StateInit.Lib, accountDuePayment(account), nil
+	return &account, nil
 }
 
 func externalMessageRandSeed() []byte {

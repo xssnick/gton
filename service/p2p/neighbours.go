@@ -93,6 +93,8 @@ func (s *overlaySubscription) reloadNeighbours() {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
 
+	protected := s.protectedNeighbourPeerIDs()
+
 	s.mx.Lock()
 
 	s.pruneNeighboursLocked()
@@ -114,7 +116,7 @@ func (s *overlaySubscription) reloadNeighbours() {
 			continue
 		}
 
-		worstID, worstUnreliability := s.worstNeighbourLocked()
+		worstID, worstUnreliability := s.worstRotatableNeighbourLocked(protected)
 		if worstID.IsZero() {
 			break
 		}
@@ -128,7 +130,10 @@ func (s *overlaySubscription) reloadNeighbours() {
 			continue
 		}
 
-		idx := rand.IntN(len(s.neighbours))
+		idx, ok := s.randomRotatableNeighbourIndexLocked(protected)
+		if !ok {
+			break
+		}
 		replaced := s.neighbours[idx]
 		s.neighbours[idx] = peer.id
 		if s.lastPingedNeighbour == replaced {
@@ -153,10 +158,20 @@ func (s *overlaySubscription) reloadNeighbours() {
 	}
 }
 
-func (s *overlaySubscription) worstNeighbourLocked() (PeerID, float64) {
+func (s *overlaySubscription) protectedNeighbourPeerIDs() map[PeerID]struct{} {
+	if s.node != nil {
+		return s.node.protectedPeerIDs()
+	}
+	return nil
+}
+
+func (s *overlaySubscription) worstRotatableNeighbourLocked(protected map[PeerID]struct{}) (PeerID, float64) {
 	worstID := PeerID{}
 	worstUnreliability := -1.0
 	for _, id := range s.neighbours {
+		if _, ok := protected[id]; ok {
+			continue
+		}
 		peer := s.peers[id]
 		if peer == nil {
 			continue
@@ -168,6 +183,20 @@ func (s *overlaySubscription) worstNeighbourLocked() (PeerID, float64) {
 		}
 	}
 	return worstID, worstUnreliability
+}
+
+func (s *overlaySubscription) randomRotatableNeighbourIndexLocked(protected map[PeerID]struct{}) (int, bool) {
+	rotatable := make([]int, 0, len(s.neighbours))
+	for idx, id := range s.neighbours {
+		if _, ok := protected[id]; ok {
+			continue
+		}
+		rotatable = append(rotatable, idx)
+	}
+	if len(rotatable) == 0 {
+		return 0, false
+	}
+	return rotatable[rand.IntN(len(rotatable))], true
 }
 
 func (s *overlaySubscription) preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {

@@ -24,17 +24,17 @@ These metrics describe inbound liteserver query load, latency, and result mix.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `gton_liteserver_queries_total` | counter | `method`, `response`, `error_code` | Number of handled liteserver queries. `error_code="0"` means the response was not a `ton.LSError`; `ton.LSError` with protocol code `0` is exported as `error_code="unspecified"`. |
+| `gton_liteserver_queries_total` | counter | `method`, `response`, `error_code`, `reason` | Number of handled liteserver queries. `error_code="0"` means the response was not a `ton.LSError`; `ton.LSError` with protocol code `0` is exported as `error_code="unspecified"`. Successful queries use `reason="none"`; unclassified errors use `reason="unspecified"`. |
 | `gton_liteserver_inflight_queries` | gauge | none | Number of liteserver queries currently being handled. |
-| `gton_liteserver_query_duration_seconds` | histogram | `method`, `response`, `error_code` | Total query duration, including `waitMasterchainSeqno` wait time. |
-| `gton_liteserver_query_handler_duration_seconds` | histogram | `method`, `response`, `error_code` | Query handler duration without `waitMasterchainSeqno` wait time. Use this for normal handler latency SLOs. |
-| `gton_liteserver_query_wait_seconds` | histogram | `method`, `response`, `error_code` | Time spent waiting for `waitMasterchainSeqno`. This series is emitted only for queries that actually waited. |
+| `gton_liteserver_query_duration_seconds` | histogram | `method`, `response`, `error_code`, `reason` | Total query duration, including `waitMasterchainSeqno` wait time. |
+| `gton_liteserver_query_handler_duration_seconds` | histogram | `method`, `response`, `error_code`, `reason` | Query handler duration without `waitMasterchainSeqno` wait time. Use this for normal handler latency SLOs. |
+| `gton_liteserver_query_wait_seconds` | histogram | `method`, `response`, `error_code`, `reason` | Time spent waiting for `waitMasterchainSeqno`. This series is emitted only for queries that actually waited. |
 
 Useful examples:
 
 ```promql
 sum(rate(gton_liteserver_queries_total[5m])) by (method)
-sum(rate(gton_liteserver_queries_total{error_code!="0"}[5m])) by (method, error_code)
+sum(rate(gton_liteserver_queries_total{error_code!="0"}[5m])) by (method, error_code, reason)
 histogram_quantile(0.95, sum(rate(gton_liteserver_query_handler_duration_seconds_bucket[5m])) by (le, method))
 ```
 

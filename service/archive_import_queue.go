@@ -66,7 +66,7 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 	for worker := 0; worker < downloadBudget.hotOnly; worker++ {
 		go func() {
 			for {
-				job, ok := queue.nextHotDownload(ctx)
+				job, ok := nextArchiveHotJob(ctx, queue.downloadHot, archiveDownloadJob{})
 				if !ok {
 					return
 				}
@@ -77,7 +77,7 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 	for worker := 0; worker < downloadBudget.shared; worker++ {
 		go func() {
 			for {
-				job, ok := queue.nextDownload(ctx)
+				job, ok := nextArchivePriorityJob(ctx, queue.downloadHot, queue.downloadPrefetch, archiveDownloadJob{})
 				if !ok {
 					return
 				}
@@ -88,7 +88,7 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 	for worker := 0; worker < prepareBudget.hotOnly; worker++ {
 		go func() {
 			for {
-				job, ok := queue.nextHotPrepare(ctx)
+				job, ok := nextArchiveHotJob(ctx, queue.prepareHot, archivePrepareJob{})
 				if !ok {
 					return
 				}
@@ -99,7 +99,7 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 	for worker := 0; worker < prepareBudget.shared; worker++ {
 		go func() {
 			for {
-				job, ok := queue.nextPrepare(ctx)
+				job, ok := nextArchivePriorityJob(ctx, queue.prepareHot, queue.preparePrefetch, archivePrepareJob{})
 				if !ok {
 					return
 				}
@@ -231,22 +231,6 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 	archiveID := job.downloaded.ArchiveID
 	releaseDownloadedData()
 	job.done <- archiveImportQueueResult{imported: imported, peer: peer, archiveID: archiveID, err: err}
-}
-
-func (q *archiveImportQueue) nextDownload(ctx context.Context) (archiveDownloadJob, bool) {
-	return nextArchivePriorityJob(ctx, q.downloadHot, q.downloadPrefetch, archiveDownloadJob{})
-}
-
-func (q *archiveImportQueue) nextHotDownload(ctx context.Context) (archiveDownloadJob, bool) {
-	return nextArchiveHotJob(ctx, q.downloadHot, archiveDownloadJob{})
-}
-
-func (q *archiveImportQueue) nextPrepare(ctx context.Context) (archivePrepareJob, bool) {
-	return nextArchivePriorityJob(ctx, q.prepareHot, q.preparePrefetch, archivePrepareJob{})
-}
-
-func (q *archiveImportQueue) nextHotPrepare(ctx context.Context) (archivePrepareJob, bool) {
-	return nextArchiveHotJob(ctx, q.prepareHot, archivePrepareJob{})
 }
 
 func nextArchivePriorityJob[T any](ctx context.Context, hot <-chan T, prefetch <-chan T, zero T) (T, bool) {

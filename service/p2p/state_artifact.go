@@ -16,7 +16,6 @@ import (
 	tnstate "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -90,10 +89,6 @@ type stagedStateFile struct {
 }
 
 type PersistentStateFileLoader func(effectiveShard int64) (*storage.PersistentStateFile, error)
-
-type persistentStateFileReader interface {
-	PersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*storage.PersistentStateFile, error)
-}
 
 func NewPersistentStateSnapshotArtifactFromFile(node *Node, file *storage.PersistentStateFile) (storage.DownloadedState, error) {
 	staged, err := stagedStateFileFromPersistentStateFile(file)
@@ -716,10 +711,6 @@ type splitPersistentStateSnapshotArtifact struct {
 	parts         []splitPersistentStatePartArtifact
 }
 
-type splitPersistentStatePartReusePolicy interface {
-	ReuseImportedSplitStatePartCells() bool
-}
-
 func (a *splitPersistentStateSnapshotArtifact) Block() ton.BlockIDExt {
 	return a.block
 }
@@ -834,7 +825,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 }
 
 func (a *splitPersistentStateSnapshotArtifact) splitStatePartRoot(ctx context.Context, cells storage.StateCellTreeImporter, part splitPersistentStatePartArtifact, index int) (*cell.Cell, error) {
-	if cells != nil && !reuseImportedSplitStatePartCells(cells) {
+	if cells != nil && !cells.ReuseImportedSplitStatePartCells() {
 		return a.importSplitStatePartBOCView(ctx, cells, part, index)
 	}
 
@@ -879,13 +870,6 @@ func (a *splitPersistentStateSnapshotArtifact) splitStatePartRoot(ctx context.Co
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
 	return root, nil
-}
-
-func reuseImportedSplitStatePartCells(cells storage.StateCellTreeImporter) bool {
-	if policy, ok := cells.(splitPersistentStatePartReusePolicy); ok {
-		return policy.ReuseImportedSplitStatePartCells()
-	}
-	return true
 }
 
 func (a *splitPersistentStateSnapshotArtifact) importSplitStatePartBOCView(ctx context.Context, cells storage.StateCellTreeImporter, part splitPersistentStatePartArtifact, index int) (*cell.Cell, error) {
@@ -1027,46 +1011,8 @@ func (a *splitPersistentStateSnapshotArtifact) Cleanup() error {
 	return errors.Join(errs...)
 }
 
-func PersistentStateFileName(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
-	hash, err := PersistentStateFileKeyHash(block, master, effectiveShard)
-	if err != nil {
-		return "", err
-	}
-	hashHex := hex.EncodeToString(hash)
-
-	switch {
-	case effectiveShard == 0:
-		return fmt.Sprintf("state_%d_%d_%x_%s", master.SeqNo, block.Workchain, uint64(block.Shard), hashHex), nil
-	case effectiveShard == block.Shard:
-		return fmt.Sprintf("statesplit_%d_%d_%016x_%s", master.SeqNo, block.Workchain, uint64(block.Shard), hashHex), nil
-	default:
-		return fmt.Sprintf("stateaccount_%d_%d_%016x_%016x_%s", master.SeqNo, block.Workchain, uint64(block.Shard), uint64(effectiveShard), hashHex), nil
-	}
-}
-
-func PersistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]byte, error) {
-	switch {
-	case effectiveShard == 0:
-		return tl.Hash(DbFileDBKeyPersistentStateFile{
-			BlockID:            block,
-			MasterchainBlockID: master,
-		})
-	case effectiveShard == block.Shard:
-		return tl.Hash(DbFileDBKeySplitPersistentStateFile{
-			BlockID:            block,
-			MasterchainBlockID: master,
-		})
-	default:
-		return tl.Hash(DbFileDBKeySplitAccountStateFile{
-			BlockID:            block,
-			MasterchainBlockID: master,
-			EffectiveShard:     effectiveShard,
-		})
-	}
-}
-
 func (n *Node) persistentStateFilePath(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
-	name, err := PersistentStateFileName(block, master, effectiveShard)
+	name, err := storage.PersistentStateFileName(block, master, effectiveShard)
 	if err != nil {
 		return "", err
 	}
@@ -1074,11 +1020,8 @@ func (n *Node) persistentStateFilePath(block ton.BlockIDExt, master ton.BlockIDE
 }
 
 func (n *Node) loadReusablePersistentStateFile(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*stagedStateFile, error) {
-	reader, ok := n.peerStorage.(persistentStateFileReader)
-	if !ok && n.storage != nil {
-		reader, ok = n.storage.(persistentStateFileReader)
-	}
-	if !ok {
+	reader := n.reusablePersistentStateFileReader()
+	if reader == nil {
 		return nil, storage.ErrNotFound
 	}
 
@@ -1106,6 +1049,15 @@ func (n *Node) loadReusablePersistentStateFile(ctx context.Context, block ton.Bl
 		return nil, fmt.Errorf("%w: staged state file size mismatch: got=%d want=%d", errStateSnapshotInvalid, stat.Size(), staged.size)
 	}
 	return staged, nil
+}
+
+func (n *Node) reusablePersistentStateFileReader() storage.PersistentStateFileStorage {
+	var source any = n.storage
+	if n.peerStorage != nil {
+		source = n.peerStorage
+	}
+	reader, _ := source.(storage.PersistentStateFileStorage)
+	return reader
 }
 
 func (n *Node) createStateFile(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*os.File, string, string, error) {

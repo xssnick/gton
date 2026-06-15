@@ -4,34 +4,16 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-type liveBlockPublisher interface {
-	PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error
-	NonfinalBlockCacheEnabled() bool
-	PublishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) error
-	MarkLiveBlockFlushed(block ton.BlockIDExt)
-}
-
-type liveNonfinalCellLoaderSetter interface {
-	SetNonfinalCellLoader(cell.LazyCellLoader)
-}
-
-type liveBlockCacheProvider interface {
-	LiveBlockCache() *storage.LiveBlockCache
-}
-
 func (s *Service) configureLiveBlockPublisher(publisher CurrentStatePublisher) {
-	if cache, ok := publisher.(liveNonfinalCellLoaderSetter); ok {
-		cache.SetNonfinalCellLoader(s.stateCellLoader())
-	}
-
-	cache, ok := publisher.(liveBlockPublisher)
-	if !ok || s.node == nil {
+	if publisher == nil {
 		return
 	}
-	s.node.SetBlockCacheObserver(cache)
+	publisher.SetNonfinalCellLoader(s.stateCellLoader())
+	if s.node != nil {
+		s.node.SetBlockCacheObserver(publisher)
+	}
 }
 
 func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState) {
@@ -71,28 +53,54 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 	}
 
 	liveArtifacts := artifacts
-	if s.node != nil {
-		if err := s.node.PublishLiveBlockArtifacts(artifacts); err != nil {
+	if s.liveBlockCache != nil {
+		if err := s.liveBlockCache.PublishLiveBlockArtifacts(artifacts); err != nil {
 			s.log.Debug().
 				Err(err).
 				Str("block", storage.FormatBlockRef(downloaded.ID)).
-				Msg("skip p2p live block cache update")
+				Msg("skip live block cache update")
 		}
-		if provider, ok := s.liveState.(liveBlockCacheProvider); ok && provider.LiveBlockCache() == s.node.LiveBlockCache() {
-			liveArtifacts.BlockData = nil
-			liveArtifacts.Proofs = nil
-		}
+	}
+	if s.liveStateUsesBlockCache {
+		liveArtifacts.BlockData = nil
+		liveArtifacts.Proofs = nil
 	}
 
-	cache, ok := s.liveState.(liveBlockPublisher)
-	if !ok {
+	if s.liveState == nil {
 		return
 	}
-	if err := cache.PublishLiveBlockArtifacts(liveArtifacts); err != nil {
+	if err := s.liveState.PublishLiveBlockArtifacts(liveArtifacts); err != nil {
 		s.log.Debug().
 			Err(err).
 			Str("block", storage.FormatBlockRef(downloaded.ID)).
 			Msg("skip live block cache update")
+	}
+}
+
+func (s *Service) publishLiveCurrentBlockMarkers(current *storage.CurrentState) {
+	if s.liveState == nil || current == nil {
+		return
+	}
+
+	publish := func(state storage.BlockState) {
+		err := s.liveState.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+			Block:           state.Block,
+			Meta:            storage.BuildBlockMetaFromState(state),
+			State:           &state,
+			ArtifactFlushed: true,
+			StateFlushed:    true,
+		})
+		if err != nil {
+			s.log.Debug().
+				Err(err).
+				Str("block", storage.FormatBlockRef(state.Block)).
+				Msg("skip live current block marker")
+		}
+	}
+
+	publish(current.Masterchain)
+	for _, key := range storage.SortedShardKeys(current.Shards) {
+		publish(current.Shards[key])
 	}
 }
 

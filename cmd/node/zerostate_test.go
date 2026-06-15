@@ -23,6 +23,12 @@ func TestEnsureStoredZeroStateMatchesGlobalConfig(t *testing.T) {
 		t.Fatalf("matching stored zerostate: %v", err)
 	}
 
+	basechain := testZeroStateBlock(0x21, 0x22)
+	basechain.Workchain = 0
+	if err := ensureStoredZeroStateMatchesGlobalConfig(ctx, fakeZeroStateStore{blocks: []ton.BlockIDExt{basechain, configured}}, configured); err != nil {
+		t.Fatalf("stored basechain zerostate should not be compared with global config zerostate: %v", err)
+	}
+
 	err := ensureStoredZeroStateMatchesGlobalConfig(ctx, fakeZeroStateStore{
 		blocks: []ton.BlockIDExt{testZeroStateBlock(0x21, 0x22)},
 	}, configured)

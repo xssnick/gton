@@ -66,6 +66,7 @@ type Node struct {
 	myExternalMessages        *eventDeduper
 	processedExternalMessages *eventDeduper
 	externalMessageLimiter    *extmsg.AddressLimiter
+	externalBroadcastPacer    *externalBroadcastPacer
 
 	onceStop sync.Once
 	stopped  chan struct{}
@@ -79,6 +80,8 @@ type Node struct {
 	zeroStateFileHash         []byte
 	zeroStateBlock            ton.BlockIDExt
 	initBlock                 ton.BlockIDExt
+	hardforks                 []ton.BlockIDExt
+	hardforkSet               map[blockIDFullKey]struct{}
 	externalPort              uint16
 	dhtListenAddr             string
 	storage                   storage2.Storage
@@ -137,8 +140,8 @@ type Node struct {
 	latestBasechainNotify     chan struct{}
 	rawMasterchainNotify      chan struct{}
 	stateFilesDir             string
-	downloadPeerMx            sync.RWMutex
-	downloadPeerLeases        map[PeerID]int
+	peerUseMx                 sync.RWMutex
+	peerUse                   map[PeerID]peerUse
 	stateCellImportSlot       chan struct{}
 	stateSplitPartDecodeSlot  chan struct{}
 	zeroStateBootstrapMu      sync.Mutex
@@ -226,6 +229,11 @@ func New(opts Options) (*Node, error) {
 		liveBlockCache = storage2.NewLiveBlockCache(storage2.DefaultLiveBlockCacheMaxBlocks)
 	}
 
+	externalBroadcastPacer, err := newExternalBroadcastPacer(opts.ExternalBroadcastCapacity)
+	if err != nil {
+		return nil, err
+	}
+
 	stateFilesDir, err := prepareStateFilesDir(opts.StateFilesDir)
 	if err != nil {
 		return nil, fmt.Errorf("prepare state files dir: %w", err)
@@ -250,6 +258,7 @@ func New(opts Options) (*Node, error) {
 		myExternalMessages:        newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		processedExternalMessages: newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		externalMessageLimiter:    extmsg.NewDefaultAddressLimiter(),
+		externalBroadcastPacer:    externalBroadcastPacer,
 		stopped:                   make(chan struct{}),
 		subscriptions:             map[string]*overlaySubscription{},
 		monitorMinSplitDepth:      map[int32]uint32{},
@@ -276,7 +285,7 @@ func New(opts Options) (*Node, error) {
 		fecReceiverLast:           map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
 		fecReceiverTotals:         map[string]fecReceiverCounterSnapshot{},
 		stateFilesDir:             stateFilesDir,
-		downloadPeerLeases:        map[PeerID]int{},
+		peerUse:                   map[PeerID]peerUse{},
 		stateCellImportSlot:       make(chan struct{}, 1),
 		stateSplitPartDecodeSlot:  make(chan struct{}, 1),
 		customOverlays:            append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
@@ -296,6 +305,14 @@ func (n *Node) SetBroadcastSignatureVerifier(verifier BroadcastSignatureVerifier
 
 func (n *Node) SetBroadcastAdmission(admission BroadcastAdmission) {
 	n.broadcastAdmission = admission
+}
+
+func (n *Node) SetCompressedBlockStateProvider(provider CompressedBlockStateProvider) {
+	n.compressedState = provider
+}
+
+func (n *Node) SetSyncLagProvider(provider SyncLagProvider) {
+	n.syncLag = provider
 }
 
 func (n *Node) LocalID() PeerID {
@@ -346,7 +363,12 @@ func (n *Node) Start(ctx context.Context) error {
 		return fmt.Errorf("global config contains invalid zero_state")
 	}
 
-	initBlock, err := initBlockFromConfig(cfg.Validator.InitBlock, zeroBlock)
+	hardforks, hardforkSet, err := hardforksFromConfig(cfg.Validator.Hardforks)
+	if err != nil {
+		return err
+	}
+
+	initBlock, err := initBlockFromConfig(cfg.Validator.InitBlock, zeroBlock, hardforks)
 	if err != nil {
 		return err
 	}
@@ -355,6 +377,14 @@ func (n *Node) Start(ctx context.Context) error {
 	n.zeroStateFileHash = append([]byte(nil), zeroBlock.FileHash...)
 	n.zeroStateBlock = zeroBlock
 	n.initBlock = initBlock
+	n.hardforks = hardforks
+	n.hardforkSet = hardforkSet
+	if len(hardforks) > 0 {
+		n.log.Info().
+			Int("hardforks", len(hardforks)).
+			Str("init_block", formatBlockRef(initBlock)).
+			Msg("loaded hardforks from global config")
+	}
 	specs, err := buildOverlaySpecs(n.zeroStateFileHash)
 	if err != nil {
 		return err
@@ -709,6 +739,15 @@ func (n *Node) InitBlock() (ton.BlockIDExt, error) {
 	return block, nil
 }
 
+func (n *Node) IsHardfork(block ton.BlockIDExt) bool {
+	key, ok := blockIDFullKeyFromBlock(block)
+	if !ok {
+		return false
+	}
+	_, ok = n.hardforkSet[key]
+	return ok
+}
+
 func (n *Node) configuredZeroStateBlock() (ton.BlockIDExt, bool) {
 	if n.zeroStateBlock.Workchain != -1 || n.zeroStateBlock.Shard != topShard || n.zeroStateBlock.SeqNo != 0 || !validBlockID(n.zeroStateBlock) {
 		return ton.BlockIDExt{}, false
@@ -733,16 +772,92 @@ func blockIDFromConfig(block liteclient.ConfigBlock) ton.BlockIDExt {
 	}
 }
 
-func initBlockFromConfig(block liteclient.ConfigBlock, zeroBlock ton.BlockIDExt) (ton.BlockIDExt, error) {
-	if emptyConfigBlock(block) {
-		return zeroBlock, nil
+type blockIDFullKey struct {
+	workchain int32
+	shard     int64
+	seqno     uint32
+	rootHash  [32]byte
+	fileHash  [32]byte
+}
+
+func blockIDFullKeyFromBlock(block ton.BlockIDExt) (blockIDFullKey, bool) {
+	if !validBlockID(block) {
+		return blockIDFullKey{}, false
 	}
 
-	initBlock := blockIDFromConfig(block)
+	var key blockIDFullKey
+	key.workchain = block.Workchain
+	key.shard = block.Shard
+	key.seqno = block.SeqNo
+	copy(key.rootHash[:], block.RootHash)
+	copy(key.fileHash[:], block.FileHash)
+	return key, true
+}
+
+func hardforksFromConfig(blocks []liteclient.ConfigBlock) ([]ton.BlockIDExt, map[blockIDFullKey]struct{}, error) {
+	if len(blocks) == 0 {
+		return nil, nil, nil
+	}
+
+	hardforks := make([]ton.BlockIDExt, 0, len(blocks))
+	active := make([]bool, 0, len(blocks))
+	for _, block := range blocks {
+		hardfork := blockIDFromConfig(block)
+		if hardfork.Workchain != -1 || hardfork.Shard != topShard {
+			return nil, nil, fmt.Errorf("global config contains non-masterchain hardfork")
+		}
+		if !validBlockID(hardfork) {
+			return nil, nil, fmt.Errorf("global config contains invalid hardfork")
+		}
+
+		for i := range hardforks {
+			if active[i] && hardforks[i].SeqNo >= hardfork.SeqNo {
+				active[i] = false
+			}
+		}
+		hardforks = append(hardforks, hardfork)
+		active = append(active, true)
+	}
+
+	filtered := hardforks[:0]
+	for i := range hardforks {
+		if active[i] {
+			filtered = append(filtered, hardforks[i])
+		}
+	}
+	hardforks = filtered
+	if len(hardforks) == 0 {
+		return nil, nil, nil
+	}
+
+	set := make(map[blockIDFullKey]struct{}, len(hardforks))
+	for _, hardfork := range hardforks {
+		key, _ := blockIDFullKeyFromBlock(hardfork)
+		set[key] = struct{}{}
+	}
+	return hardforks, set, nil
+}
+
+func initBlockFromConfig(block liteclient.ConfigBlock, zeroBlock ton.BlockIDExt, hardforks []ton.BlockIDExt) (ton.BlockIDExt, error) {
+	initBlock := zeroBlock
+	if emptyConfigBlock(block) {
+		return latestInitBlockForHardforks(initBlock, hardforks), nil
+	}
+
+	initBlock = blockIDFromConfig(block)
 	if initBlock.Workchain != -1 || initBlock.Shard != topShard || !validBlockID(initBlock) {
 		return ton.BlockIDExt{}, fmt.Errorf("global config contains invalid init_block")
 	}
-	return initBlock, nil
+	return latestInitBlockForHardforks(initBlock, hardforks), nil
+}
+
+func latestInitBlockForHardforks(initBlock ton.BlockIDExt, hardforks []ton.BlockIDExt) ton.BlockIDExt {
+	for _, hardfork := range hardforks {
+		if hardfork.SeqNo > initBlock.SeqNo {
+			initBlock = hardfork
+		}
+	}
+	return initBlock
 }
 
 func emptyConfigBlock(block liteclient.ConfigBlock) bool {
@@ -1188,7 +1303,7 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 		spec:         spec,
 		log:          n.log.With().Str("overlay", spec.Name).Logger(),
 		peers:        map[PeerID]*overlayPeer{},
-		archivePeers: map[string]*archivePeerState{},
+		archivePeers: map[string]*archivePeerPoolState{},
 		peerNotify:   make(chan struct{}, 1),
 	}
 	n.subscriptions[key] = sub

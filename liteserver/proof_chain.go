@@ -301,13 +301,24 @@ func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt) (ton.
 	}
 
 	meta, err := s.store.BlockMeta(ctx, id)
-	if err == nil && meta.MasterchainRef != nil {
-		return *cloneBlockID(*meta.MasterchainRef), nil
+	if err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
+			return ton.BlockIDExt{}, err
+		}
+		return ton.BlockIDExt{}, fmt.Errorf("%w: block doesn't have masterchain ref", storage.ErrNotFound)
 	}
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return ton.BlockIDExt{}, err
+	if !meta.MasterchainRefKnown() {
+		return ton.BlockIDExt{}, fmt.Errorf("%w: block doesn't have masterchain ref", storage.ErrNotFound)
 	}
-	return ton.BlockIDExt{}, fmt.Errorf("block doesn't have masterchain ref")
+
+	resolved, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+	if err != nil {
+		return ton.BlockIDExt{}, fmt.Errorf("lookup masterchain ref #%d: %w", meta.MasterchainRefSeqno, err)
+	}
+	if !isFullBlockID(&resolved) {
+		return ton.BlockIDExt{}, fmt.Errorf("resolved masterchain ref is not full: %s", storage.FormatBlockRef(resolved))
+	}
+	return resolved, nil
 }
 
 func (s *Server) previousBlockForPrefix(ctx context.Context, id ton.BlockIDExt, prefix storage.ShardKey) (ton.BlockIDExt, error) {

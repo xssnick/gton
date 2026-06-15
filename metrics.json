@@ -1645,8 +1645,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, method, error_code) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\", error_code!=\"0\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{method}} error {{error_code}}"
+                      "expr": "sum by (instance, method, error_code, reason) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\", error_code!=\"0\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{method}} error {{error_code}} {{reason}}"
                     }
                   }
                 }

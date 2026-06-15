@@ -24,13 +24,10 @@ const (
 	masterchainShard              = int64(-1 << 63)
 )
 
-type Source interface {
+type Node interface {
 	Events() <-chan p2p.BroadcastEvent
-}
-
-type Fetcher interface {
-	DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error)
-	DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error)
+	DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*p2p.DownloadedBlock, error)
+	DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*p2p.DownloadedBlock, error)
 }
 
 type SyncedBlock struct {
@@ -62,8 +59,7 @@ func (b SyncedBlock) ackResult(accepted bool) {
 
 type Service struct {
 	log                   zerolog.Logger
-	source                Source
-	fetcher               Fetcher
+	node                  Node
 	out                   chan SyncedBlock
 	shardDescriptions     chan p2p.BroadcastEvent
 	shardDescriptionDrops atomic.Uint64
@@ -98,49 +94,16 @@ type chain struct {
 	last    *ton.BlockIDExt
 }
 
-func New(logger *zerolog.Logger, source Source, fetcher Fetcher) *Service {
+func New(logger *zerolog.Logger, node Node) *Service {
 	return &Service{
 		log:               logutil.WithComponent(logger, "blocksync"),
-		source:            source,
-		fetcher:           fetcher,
+		node:              node,
 		out:               make(chan SyncedBlock, defaultOutputBuffer),
 		shardDescriptions: make(chan p2p.BroadcastEvent, defaultShardDescriptionBuffer),
 		retryCount:        defaultRetryCount,
 		retryDelay:        defaultRetryDelay,
 		chains:            map[string]*chain{},
 	}
-}
-
-type NodeFetcher struct {
-	node *p2p.Node
-}
-
-func NewNodeFetcher(node *p2p.Node) NodeFetcher {
-	return NodeFetcher{node: node}
-}
-
-func (f NodeFetcher) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	downloaded, err := f.node.DownloadBlockFull(ctx, block)
-	if err != nil {
-		return p2p.DownloadedBlock{}, err
-	}
-	if downloaded == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("download block %s: empty response", storage.FormatBlockRef(block))
-	}
-
-	return *downloaded, nil
-}
-
-func (f NodeFetcher) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	downloaded, err := f.node.DownloadNextBlockFull(ctx, prev)
-	if err != nil {
-		return p2p.DownloadedBlock{}, err
-	}
-	if downloaded == nil {
-		return p2p.DownloadedBlock{}, fmt.Errorf("download next block after %s: empty response", storage.FormatBlockRef(prev))
-	}
-
-	return *downloaded, nil
 }
 
 func (s *Service) Blocks() <-chan SyncedBlock {
@@ -196,7 +159,7 @@ func (s *Service) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, ok := <-s.source.Events():
+		case ev, ok := <-s.node.Events():
 			if !ok {
 				return
 			}
@@ -599,13 +562,27 @@ func (s *Service) emitAsync(ctx context.Context, block *SyncedBlock) bool {
 
 func (s *Service) downloadBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
 	return s.downloadWithRetry(ctx, fmt.Sprintf("download block %s", storage.FormatBlockRef(block)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
-		return s.fetcher.DownloadBlockFull(ctx, block)
+		downloaded, err := s.node.DownloadBlockFull(ctx, block)
+		if err != nil {
+			return p2p.DownloadedBlock{}, err
+		}
+		if downloaded == nil {
+			return p2p.DownloadedBlock{}, fmt.Errorf("download block %s: empty response", storage.FormatBlockRef(block))
+		}
+		return *downloaded, nil
 	})
 }
 
 func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
 	return s.downloadWithRetry(ctx, fmt.Sprintf("download next block after %s", storage.FormatBlockRef(prev)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
-		return s.fetcher.DownloadNextBlockFull(ctx, prev)
+		downloaded, err := s.node.DownloadNextBlockFull(ctx, prev)
+		if err != nil {
+			return p2p.DownloadedBlock{}, err
+		}
+		if downloaded == nil {
+			return p2p.DownloadedBlock{}, fmt.Errorf("download next block after %s: empty response", storage.FormatBlockRef(prev))
+		}
+		return *downloaded, nil
 	})
 }
 

@@ -33,43 +33,23 @@ func decodeBlockID(data []byte) (ton.BlockIDExt, error) {
 	}, nil
 }
 
-func encodeArchiveBackfillProgress(progress storage.ArchiveBackfillProgress) []byte {
-	buf := make([]byte, 0, 1+80+4+4+4+4+4+8)
-	buf = append(buf, archiveBackfillProgressVersion)
-	buf = append(buf, encodeBlockID(progress.OriginPersistentState)...)
-	buf = binary.BigEndian.AppendUint32(buf, progress.OriginGenUTime)
-	buf = binary.BigEndian.AppendUint32(buf, progress.GCCutoffUnix)
-	buf = binary.BigEndian.AppendUint32(buf, progress.TargetUnix)
-	buf = binary.BigEndian.AppendUint32(buf, progress.VerifiedFloorSeqno)
-	buf = binary.BigEndian.AppendUint32(buf, progress.VerifiedFloorUTime)
-	buf = binary.BigEndian.AppendUint64(buf, progress.UpdatedAtUnix)
-	return buf
+func encodeBlockIDHashes(id ton.BlockIDExt) []byte {
+	buf := make([]byte, 0, 64)
+	buf = append(buf, id.RootHash...)
+	return append(buf, id.FileHash...)
 }
 
-func decodeArchiveBackfillProgress(data []byte) (storage.ArchiveBackfillProgress, error) {
-	const size = 1 + 80 + 4 + 4 + 4 + 4 + 4 + 8
-	if len(data) != size {
-		return storage.ArchiveBackfillProgress{}, fmt.Errorf("archive backfill progress payload size mismatch: got=%d want=%d", len(data), size)
+func decodeBlockIDFromHashes(workchain int32, shard int64, seqno uint32, data []byte) (ton.BlockIDExt, error) {
+	if len(data) != 64 {
+		return ton.BlockIDExt{}, fmt.Errorf("invalid block id hash payload size %d", len(data))
 	}
-	if data[0] != archiveBackfillProgressVersion {
-		return storage.ArchiveBackfillProgress{}, fmt.Errorf("archive backfill progress version mismatch")
-	}
-	pos := 1
-	origin, err := decodeBlockID(data[pos : pos+80])
-	if err != nil {
-		return storage.ArchiveBackfillProgress{}, err
-	}
-	pos += 80
-	progress := storage.ArchiveBackfillProgress{
-		OriginPersistentState: origin,
-		OriginGenUTime:        binary.BigEndian.Uint32(data[pos : pos+4]),
-		GCCutoffUnix:          binary.BigEndian.Uint32(data[pos+4 : pos+8]),
-		TargetUnix:            binary.BigEndian.Uint32(data[pos+8 : pos+12]),
-		VerifiedFloorSeqno:    binary.BigEndian.Uint32(data[pos+12 : pos+16]),
-		VerifiedFloorUTime:    binary.BigEndian.Uint32(data[pos+16 : pos+20]),
-		UpdatedAtUnix:         binary.BigEndian.Uint64(data[pos+20 : pos+28]),
-	}
-	return progress, nil
+	return ton.BlockIDExt{
+		Workchain: workchain,
+		Shard:     shard,
+		SeqNo:     seqno,
+		RootHash:  bytes.Clone(data[:32]),
+		FileHash:  bytes.Clone(data[32:64]),
+	}, nil
 }
 
 func encodeBlockMeta(meta *storage.BlockMeta) []byte {
@@ -84,21 +64,25 @@ func encodeBlockMeta(meta *storage.BlockMeta) []byte {
 	buf = binary.BigEndian.AppendUint64(buf, meta.EndLT)
 	buf = appendLenBytes(buf, meta.StateRootHash)
 	buf = appendLenBytes(buf, meta.StateFileHash)
-	if meta.MasterchainRef == nil {
+	if !meta.MasterchainRefKnown() {
 		buf = append(buf, 0)
 	} else {
 		buf = append(buf, 1)
-		buf = append(buf, encodeBlockID(*meta.MasterchainRef)...)
+		buf = binary.BigEndian.AppendUint32(buf, meta.MasterchainRefSeqno)
 	}
 	buf = append(buf, byte(len(meta.PrevRefs)))
 	for _, ref := range meta.PrevRefs {
+		buf = append(buf, encodeBlockID(ref)...)
+	}
+	buf = append(buf, byte(len(meta.NextRefs)))
+	for _, ref := range meta.NextRefs {
 		buf = append(buf, encodeBlockID(ref)...)
 	}
 	return buf
 }
 
 func decodeBlockMeta(id ton.BlockIDExt, data []byte) (*storage.BlockMeta, error) {
-	if len(data) < 1+4+4+8+8+1+1+1+1 {
+	if len(data) < 1+4+4+8+8+1+1+1+1+1 {
 		return nil, fmt.Errorf("block meta payload too small")
 	}
 	if data[0] != blockMetaVersion {
@@ -130,15 +114,11 @@ func decodeBlockMeta(id ton.BlockIDExt, data []byte) (*storage.BlockMeta, error)
 		pos++
 	case 1:
 		pos++
-		if pos+80 > len(data) {
+		if pos+4 > len(data) {
 			return nil, fmt.Errorf("block meta masterchain ref truncated")
 		}
-		ref, err := decodeBlockID(data[pos : pos+80])
-		if err != nil {
-			return nil, err
-		}
-		meta.MasterchainRef = &ref
-		pos += 80
+		meta.MasterchainRefSeqno = binary.BigEndian.Uint32(data[pos : pos+4])
+		pos += 4
 	default:
 		return nil, fmt.Errorf("invalid block meta masterchain ref flag %d", data[pos])
 	}
@@ -159,69 +139,27 @@ func decodeBlockMeta(id ton.BlockIDExt, data []byte) (*storage.BlockMeta, error)
 		meta.PrevRefs = append(meta.PrevRefs, ref)
 		pos += 80
 	}
+	if pos >= len(data) {
+		return nil, fmt.Errorf("block meta next refs count missing")
+	}
+	nextCount := int(data[pos])
+	pos++
+	meta.NextRefs = make([]ton.BlockIDExt, 0, nextCount)
+	for i := 0; i < nextCount; i++ {
+		if pos+80 > len(data) {
+			return nil, fmt.Errorf("block meta next refs truncated")
+		}
+		ref, err := decodeBlockID(data[pos : pos+80])
+		if err != nil {
+			return nil, err
+		}
+		meta.NextRefs = append(meta.NextRefs, ref)
+		pos += 80
+	}
 	if pos != len(data) {
 		return nil, fmt.Errorf("block meta has %d trailing bytes", len(data)-pos)
 	}
 	return meta, nil
-}
-
-func encodeBlockStateMeta(state *storage.BlockState) []byte {
-	buf := make([]byte, 0, 169)
-	buf = append(buf, blockStateMetaVersion)
-	buf = appendLenBytes(buf, state.StateRootHash)
-	buf = appendLenBytes(buf, state.StateFileHash)
-	if state.MasterchainRef == nil {
-		buf = append(buf, 0)
-	} else {
-		buf = append(buf, 1)
-		buf = append(buf, encodeBlockID(*state.MasterchainRef)...)
-	}
-	return buf
-}
-
-func decodeBlockStateMeta(data []byte) ([]byte, []byte, *ton.BlockIDExt, error) {
-	if len(data) < 1+1+1+1 {
-		return nil, nil, nil, fmt.Errorf("block state meta payload too small")
-	}
-	if data[0] != blockStateMetaVersion {
-		return nil, nil, nil, fmt.Errorf("unsupported block state meta version %d", data[0])
-	}
-	pos := 1
-
-	root, pos, err := readLenBytes(data, pos)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	file, pos, err := readLenBytes(data, pos)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	if pos >= len(data) {
-		return nil, nil, nil, fmt.Errorf("block state meta masterchain ref flag missing")
-	}
-	var masterRef *ton.BlockIDExt
-	switch data[pos] {
-	case 0:
-		pos++
-	case 1:
-		pos++
-		if pos+80 > len(data) {
-			return nil, nil, nil, fmt.Errorf("block state meta masterchain ref truncated")
-		}
-		ref, err := decodeBlockID(data[pos : pos+80])
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		masterRef = &ref
-		pos += 80
-	default:
-		return nil, nil, nil, fmt.Errorf("invalid block state meta masterchain ref flag %d", data[pos])
-	}
-	if pos != len(data) {
-		return nil, nil, nil, fmt.Errorf("block state meta has %d trailing bytes", len(data)-pos)
-	}
-	return root, file, masterRef, nil
 }
 
 func encodeCurrentState(state *storage.CurrentState) []byte {
@@ -591,38 +529,72 @@ func encodeInt64(v int64) []byte {
 	return buf[:]
 }
 
+const (
+	artifactRefArchivePackageKind  = 1
+	artifactRefKeyProofPackageKind = 2
+)
+
 func encodeArtifactRef(ref *storage.ArtifactRef) []byte {
-	path := []byte(ref.Path)
-	buf := make([]byte, 0, 1+8+8+4+len(path))
-	buf = append(buf, artifactRefVersion)
+	kind := byte(artifactRefArchivePackageKind)
+	packageID := ref.ArchivePackageID
+	if packageID < 0 {
+		kind = artifactRefKeyProofPackageKind
+		packageID = keyProofPackageIDFromRef(packageID)
+	}
+	buf := make([]byte, 0, 1+1+8+8+8)
+	buf = append(buf, artifactRefVersion, kind)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(packageID))
 	buf = binary.BigEndian.AppendUint64(buf, uint64(ref.Offset))
-	buf = binary.BigEndian.AppendUint64(buf, uint64(ref.Size))
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(path)))
-	return append(buf, path...)
+	return binary.BigEndian.AppendUint64(buf, uint64(ref.Size))
 }
 
 func decodeArtifactRef(data []byte) (*storage.ArtifactRef, error) {
-	const fixed = 1 + 8 + 8 + 4
-	if len(data) < fixed {
-		return nil, fmt.Errorf("artifact ref payload truncated")
+	const fixed = 1 + 1 + 8 + 8 + 8
+	if len(data) != fixed {
+		return nil, fmt.Errorf("artifact ref payload size mismatch")
 	}
 	if data[0] != artifactRefVersion {
 		return nil, fmt.Errorf("artifact ref version mismatch")
 	}
-	offset := int64(binary.BigEndian.Uint64(data[1:9]))
-	size := int64(binary.BigEndian.Uint64(data[9:17]))
-	pathLen := int(binary.BigEndian.Uint32(data[17:21]))
-	if len(data) != fixed+pathLen {
-		return nil, fmt.Errorf("artifact ref payload size mismatch")
+	packageID := int64(binary.BigEndian.Uint64(data[2:10]))
+	switch data[1] {
+	case artifactRefArchivePackageKind:
+	case artifactRefKeyProofPackageKind:
+		packageID = keyProofPackageRefID(uint32(packageID))
+	default:
+		return nil, fmt.Errorf("unsupported artifact ref kind %d", data[1])
 	}
+	offset := int64(binary.BigEndian.Uint64(data[10:18]))
+	size := int64(binary.BigEndian.Uint64(data[18:26]))
 	if offset < 0 || size < 0 {
 		return nil, fmt.Errorf("artifact ref has invalid range")
 	}
 	return &storage.ArtifactRef{
-		Path:   string(data[fixed:]),
-		Offset: offset,
-		Size:   size,
+		ArchivePackage:   true,
+		ArchivePackageID: packageID,
+		Offset:           offset,
+		Size:             size,
 	}, nil
+}
+
+func encodeStateFileRef(size int64) []byte {
+	buf := make([]byte, 0, 1+8)
+	buf = append(buf, artifactRefVersion)
+	return binary.BigEndian.AppendUint64(buf, uint64(size))
+}
+
+func decodeStateFileRef(data []byte) (int64, error) {
+	if len(data) != 1+8 {
+		return 0, fmt.Errorf("state file ref payload size mismatch")
+	}
+	if data[0] != artifactRefVersion {
+		return 0, fmt.Errorf("state file ref version mismatch")
+	}
+	size := int64(binary.BigEndian.Uint64(data[1:9]))
+	if size < 0 {
+		return 0, fmt.Errorf("state file ref size is invalid")
+	}
+	return size, nil
 }
 
 func encodeArchivePackageMeta(meta archivePackageMeta) []byte {
@@ -684,23 +656,21 @@ func decodeArchivePackageMeta(data []byte) (archivePackageMeta, error) {
 }
 
 type persistentStateFileRecord struct {
-	ref           *storage.ArtifactRef
+	size          int64
 	fileHash      []byte
 	stateRootHash []byte
 }
 
 func encodePersistentStateFileRecord(file *storage.PersistentStateFile) []byte {
-	ref := encodeArtifactRef(file.Ref)
-	buf := make([]byte, 0, 1+1+len(file.FileHash)+1+len(file.StateRootHash)+4+len(ref))
+	buf := make([]byte, 0, 1+1+len(file.FileHash)+1+len(file.StateRootHash)+8)
 	buf = append(buf, persistentStateVersion)
 	buf = appendLenBytes(buf, file.FileHash)
 	buf = appendLenBytes(buf, file.StateRootHash)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(ref)))
-	return append(buf, ref...)
+	return binary.BigEndian.AppendUint64(buf, uint64(file.Ref.Size))
 }
 
 func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, error) {
-	if len(data) < 1+1+1+4 {
+	if len(data) < 1+1+1+8 {
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
 	if data[0] != persistentStateVersion {
@@ -720,20 +690,15 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 	}
 	pos = next
 
-	if len(data)-pos < 4 {
+	if len(data)-pos != 8 {
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
-	refLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
-	pos += 4
-	if refLen <= 0 || len(data)-pos != refLen {
-		return nil, fmt.Errorf("persistent state file payload size mismatch")
-	}
-	ref, err := decodeArtifactRef(data[pos:])
-	if err != nil {
-		return nil, err
+	size := int64(binary.BigEndian.Uint64(data[pos : pos+8]))
+	if size < 0 {
+		return nil, fmt.Errorf("persistent state file size is invalid")
 	}
 	return &persistentStateFileRecord{
-		ref:           ref,
+		size:          size,
 		fileHash:      fileHash,
 		stateRootHash: stateRootHash,
 	}, nil

@@ -27,6 +27,7 @@ type ProofDownload struct {
 type Source interface {
 	InitBlock(ctx context.Context) (ton.BlockIDExt, error)
 	ZeroStateBlock(ctx context.Context) (ton.BlockIDExt, error)
+	IsHardfork(ctx context.Context, block ton.BlockIDExt) bool
 	ZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error)
 	NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (KeyBlockBatch, error)
 	InitBlockProof(ctx context.Context, block ton.BlockIDExt) (ProofDownload, error)
@@ -51,10 +52,6 @@ func ShardBlocksFromMasterState(state *storage.BlockState) ([]ton.BlockIDExt, er
 	if err := tlb.LoadFromCell(&extra, loader); err != nil {
 		return nil, fmt.Errorf("parse mc_state_extra for %s: %w", storage.FormatBlockRef(state.Block), err)
 	}
-	if extra.ShardHashes == nil {
-		return nil, fmt.Errorf("masterchain state %s does not contain shard hashes", storage.FormatBlockRef(state.Block))
-	}
-
 	shards, err := loadShardsFromHashes(extra.ShardHashes)
 	if err != nil {
 		return nil, fmt.Errorf("load shard hashes for %s: %w", storage.FormatBlockRef(state.Block), err)
@@ -74,10 +71,6 @@ func ShardBlocksFromMasterBlock(block ton.BlockIDExt, parsed *tlb.Block) ([]ton.
 	if parsed == nil || parsed.Extra == nil || parsed.Extra.Custom == nil {
 		return nil, fmt.Errorf("masterchain block %s is missing mc block extra", storage.FormatBlockRef(block))
 	}
-	if parsed.Extra.Custom.ShardHashes == nil {
-		return nil, fmt.Errorf("masterchain block %s does not contain shard hashes", storage.FormatBlockRef(block))
-	}
-
 	shards, err := loadShardsFromHashes(parsed.Extra.Custom.ShardHashes)
 	if err != nil {
 		return nil, fmt.Errorf("load shard hashes for %s: %w", storage.FormatBlockRef(block), err)

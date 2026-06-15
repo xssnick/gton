@@ -195,18 +195,29 @@ func printBlock(ctx context.Context, store *pebblestore.Store, label string, mas
 		stateErr = err.Error()
 	}
 
-	masterRef := ""
-	if meta.MasterchainRef != nil {
-		masterRef = storage.FormatBlockRef(*meta.MasterchainRef)
+	masterRef := uint32(0)
+	masterRefBlock := ""
+	masterRefError := ""
+	if meta.MasterchainRefKnown() {
+		masterRef = meta.MasterchainRefSeqno
+		ref, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+		if err != nil {
+			masterRefError = err.Error()
+		} else {
+			masterRefBlock = storage.FormatBlockRef(ref)
+		}
 	}
-	fmt.Printf("  %s block=%s flags=%s state_root_hash=%d state_snapshot=%t state_root=%s master_ref=%q prev_refs=%d\n",
+	fmt.Printf("  %s block=%s flags=%s state_root_hash=%d state_snapshot=%t state_cells=%t state_root=%s master_ref_seqno=%d master_ref=%s master_ref_error=%s prev_refs=%d\n",
 		label,
 		storage.FormatBlockRef(block),
 		formatFlags(meta.Flags),
 		len(meta.StateRootHash),
 		meta.Has(storage.BlockMetaHasStateSnapshot),
+		meta.Has(storage.BlockMetaHasStateCells),
 		stateErr,
 		masterRef,
+		masterRefBlock,
+		masterRefError,
 		len(meta.PrevRefs),
 	)
 }
@@ -226,6 +237,7 @@ func formatFlags(flags storage.BlockMetaFlags) string {
 	add(storage.BlockMetaHasProofKeyBlock, "proof_key")
 	add(storage.BlockMetaHasProofKeyBlockLink, "proof_key_link")
 	add(storage.BlockMetaHasStateSnapshot, "state_snapshot")
+	add(storage.BlockMetaHasStateCells, "state_cells")
 	add(storage.BlockMetaIsKeyBlock, "key_block")
 	if len(names) == 0 {
 		return "none"

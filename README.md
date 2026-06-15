@@ -70,6 +70,7 @@ Supported flags:
 | --- | --- |
 | `--config <path>` | Path to the JSON config. Defaults to `config.json`. |
 | `--ls-pubkey` | Print the liteserver public key (base64) and exit. |
+| `--adnl-id` | Print the ADNL id derived from `adnl.key` (base64) and exit. |
 | `--verbosity <level>` | Global log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
 | `--log-types <list>` | Per-category log verbosity overrides, for example `liteserver=debug,p2p=warn`. |
 | `--log-json` | Write logs as JSON instead of pretty console output. |
@@ -182,11 +183,26 @@ Deletes expired state snapshot files while keeping recent snapshots and any snap
 
 Removes old archive packages and related block metadata after the configured archive retention period. This keeps archive storage inside the configured history window instead of growing forever.
 
-##### Archive backfill
+## Archival liteserver
 
-Downloads and verifies older archive data near the retention boundary. This fills missing archive ranges before cleanup reaches them, so the node can keep a continuous archive history for the configured retention period.
+Use archival liteserver mode when the node should start from the zero state, import archive data forward, keep archive packages forever, and serve liteserver requests over the full stored history.
 
-The current background job is visible in the node status and Prometheus metrics as the background task.
+Enable it by setting `ton.sync_before=-1` and keeping both storage retention knobs disabled:
+
+```json
+{
+  "ton": {
+    "sync_before": -1,
+    "state_ttl": 0,
+    "archive_ttl": 0
+  },
+  "liteserver": {
+    "enabled": true
+  }
+}
+```
+
+In this mode startup rejects non-zero `state_ttl` or `archive_ttl`. `state_ttl=0` keeps the current-state cell database generation, and `archive_ttl=0` disables archive package pruning. Disk usage grows with the archived history, so size the storage volume for long-term retention before enabling this mode.
 
 ## Configuration
 
@@ -201,7 +217,6 @@ Simplified example:
     "sync_before": 3600,
     "state_ttl": 172800,
     "archive_ttl": 604800,
-    "disable_archive_backfill": false,
     "next_checkpoint_blocks": 200,
     "archive_checkpoint_blocks": 2000,
     "checkpoint_bytes": 268435456,
@@ -222,7 +237,9 @@ Simplified example:
     "key": "<base64 ed25519 seed>",
     "listen_addr": "0.0.0.0:7445",
     "master_block_cache": 128,
-    "shard_block_cache": 4096
+    "shard_block_cache": 4096,
+    "send_message_broadcast_bytes_per_second": 0,
+    "send_message_broadcast_max_delay_ms": 100
   },
   "storage": {
     "dir": "data",
@@ -251,10 +268,9 @@ Simplified example:
 | Field | Description |
 | --- | --- |
 | `global_config_path` | Path to the TON global config. If the file is missing, it is downloaded during startup. |
-| `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `3600`. |
-| `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `172800` (2 days). Set to `0` to disable automatic cell DB generation rotation. |
-| `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). Set to `0` to keep archives forever; archive backfill will then run toward zeroblock unless disabled. |
-| `disable_archive_backfill` | Disables automatic archive backfill when `true`. Defaults to `false`. |
+| `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `3600`. Set to `-1` only for Archival liteserver mode. |
+| `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `172800` (2 days). Set to `0` to disable automatic cell DB generation rotation and keep the current-state DB generation forever. Required to be `0` when `sync_before=-1`. |
+| `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). Set to `0` to keep archives forever. Required to be `0` when `sync_before=-1`. |
 | `next_checkpoint_blocks` | Current-state checkpoint frequency during next-block sync, in masterchain blocks. Defaults to `200`. |
 | `archive_checkpoint_blocks` | Current-state checkpoint frequency during archive catch-up. |
 | `checkpoint_bytes` | Pending checkpoint data threshold in bytes. Once reached, sync schedules a checkpoint. Defaults to `268435456` (256 MiB). |
@@ -285,6 +301,8 @@ Simplified example:
 | `listen_addr` | Liteserver listener address. Defaults to `0.0.0.0:7445`. |
 | `master_block_cache` | Live cache size for masterchain blocks. |
 | `shard_block_cache` | Live cache size for shard blocks. |
+| `send_message_broadcast_bytes_per_second` | Leaky-bucket capacity for external message broadcast traffic. `0` disables the limit. |
+| `send_message_broadcast_max_delay_ms` | Maximum pacing delay before `sendMessage` is rejected with `reason="broadcast_capacity"`. Defaults to `100`; set to `0` for no backlog. |
 
 ### `storage`
 

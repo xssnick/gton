@@ -63,11 +63,36 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 				}
 			}
 		})
+
+		b.Run(fmt.Sprintf("current-account-blocks/shards-%d", shards), func(b *testing.B) {
+			live, current, _ := benchmarkLiveStoreWithCurrent(b, shards)
+			account := bytes.Repeat([]byte{0x44}, 32)
+			candidates := storage.AccountShardCandidates(0, account)
+			targetShard := candidates[len(candidates)-1]
+			targetState, targetRoot := benchmarkBlockState(b, 0, targetShard, 3000)
+			current.Shards[storage.ShardKey{Workchain: 0, Shard: targetShard}] = targetState
+			if err := live.publishLiveBlockData(targetState.Block, targetRoot, testBlockBOC(targetRoot), true); err != nil {
+				b.Fatalf("set live account shard block: %v", err)
+			}
+			live.SetLiveCurrentState(current)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				blocks, err := live.CurrentAccountBlocks(context.Background(), 0, account)
+				if err != nil {
+					b.Fatalf("load current account blocks: %v", err)
+				}
+				if !blocks.Account.Equals(&targetState.Block) {
+					b.Fatalf("account block mismatch")
+				}
+			}
+		})
 	}
 
 	b.Run("lookup-lt/live-blocks-4096", func(b *testing.B) {
 		live := benchmarkLiveStoreWithIndexes(4096)
-		key := storage.BlockHistoryKey{Workchain: 0, Shard: 1}
+		key := storage.BlockHistoryKey{Workchain: 0, Shard: 1 << 3}
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -79,7 +104,7 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 
 	b.Run("lookup-seqno/live-blocks-4096", func(b *testing.B) {
 		live := benchmarkLiveStoreWithIndexes(4096)
-		key := storage.BlockHistoryKey{Workchain: 0, Shard: 1}
+		key := storage.BlockHistoryKey{Workchain: 0, Shard: 1 << 3}
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
@@ -98,7 +123,7 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 	for i := 0; i < blocks; i++ {
 		block := ton.BlockIDExt{
 			Workchain: 0,
-			Shard:     int64(i + 1),
+			Shard:     int64(i+1) << 3,
 			SeqNo:     uint32(i + 1),
 			RootHash:  bytes.Repeat([]byte{byte(i)}, 32),
 			FileHash:  bytes.Repeat([]byte{byte(i + 1)}, 32),
@@ -134,7 +159,7 @@ func benchmarkLiveStoreWithCurrent(tb testing.TB, shards int) (*LiveStore, *stor
 
 	var target ton.BlockIDExt
 	for i := 0; i < shards; i++ {
-		shard := int64(i + 1)
+		shard := int64(i+1) << 3
 		state, root := benchmarkBlockState(tb, 0, shard, uint32(2000+i))
 		current.Shards[storage.ShardKey{Workchain: 0, Shard: shard}] = state
 		target = state.Block
@@ -202,7 +227,7 @@ func benchmarkBlockWithState(tb testing.TB, workchain int32, shard int64, seqno 
 	if err != nil {
 		tb.Fatalf("build benchmark block: %v", err)
 	}
-	return testBlockIDForRoot(workchain, shard, seqno, root), root
+	return testBlockIDForData(workchain, shard, seqno, root, testBlockBOC(root)), root
 }
 
 func benchmarkMerkleUpdateCell(tb testing.TB, oldRoot *cell.Cell, newRoot *cell.Cell) *cell.Cell {

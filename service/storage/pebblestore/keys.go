@@ -3,24 +3,23 @@ package pebblestore
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 var (
+	hotPrefixMetaDBVersion         = []byte{0x00}
 	hotPrefixBlockMeta             = []byte{0x01}
-	hotPrefixNextBlock             = []byte{0x02}
 	hotPrefixBlockSeq              = []byte{0x03}
 	hotPrefixBlockLT               = []byte{0x04}
 	hotPrefixBlockUTime            = []byte{0x05}
 	hotPrefixCurrentState          = []byte{0x06}
-	hotPrefixStateMeta             = []byte{0x07}
 	hotPrefixArchiveInfo           = []byte{0x0B}
 	hotPrefixStateSync             = []byte{0x0C}
 	hotPrefixBlockDataRef          = []byte{0x0D}
 	hotPrefixProofRef              = []byte{0x0E}
-	hotPrefixArchiveFile           = []byte{0x0F}
 	hotPrefixZeroStateRef          = []byte{0x11}
 	hotPrefixKeyProofRef           = []byte{0x12}
 	hotPrefixStateFileRef          = []byte{0x13}
@@ -31,9 +30,15 @@ var (
 	hotPrefixArchivePackage        = []byte{0x1A}
 	hotPrefixStateSerializerActive = []byte{0x1B}
 	hotPrefixKeyBlockSeq           = []byte{0x1C}
-	hotPrefixArchiveBackfill       = []byte{0x1D}
 	hotPrefixCellGenerationCurrent = []byte{0x1E}
+	hotPrefixArchivePackageIndex   = []byte{0x1F}
+	hotPrefixPackAppendDirty       = []byte{0x20}
+	hotPrefixPackDeletePending     = []byte{0x21}
 )
+
+func hotKeyMetaDBVersion() []byte {
+	return bytes.Clone(hotPrefixMetaDBVersion)
+}
 
 func hotKeyCellGenerationManifest() []byte {
 	return bytes.Clone(hotPrefixCellGeneration)
@@ -45,10 +50,6 @@ func hotKeyCellGenerationCurrent(generation uint64) []byte {
 
 func hotKeyBlockMeta(id ton.BlockIDExt) []byte {
 	return appendPrefixAndBlockID(hotPrefixBlockMeta, id)
-}
-
-func hotKeyNextBlock(id ton.BlockIDExt) []byte {
-	return appendPrefixAndBlockID(hotPrefixNextBlock, id)
 }
 
 func hotKeyBlockSeqIndex(key storage.BlockHistoryKey, seqno uint32) []byte {
@@ -122,15 +123,17 @@ func hotKeyPersistentStateDescriptionPrefix() []byte {
 	return bytes.Clone(hotPrefixStateDescription)
 }
 
-func hotKeyStateMeta(id ton.BlockIDExt) []byte {
-	return appendPrefixAndBlockID(hotPrefixStateMeta, id)
-}
-
-func hotKeyArchiveInfo(masterchainSeqno int32, workchain int32, shard int64) []byte {
+func hotKeyArchiveInfo(baseSeqno uint32, startSeqno uint32, workchain int32, shard int64) []byte {
 	buf := append([]byte(nil), hotPrefixArchiveInfo...)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(masterchainSeqno))
+	buf = binary.BigEndian.AppendUint32(buf, baseSeqno)
+	buf = binary.BigEndian.AppendUint32(buf, startSeqno)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(workchain))
 	return binary.BigEndian.AppendUint64(buf, uint64(shard))
+}
+
+func hotKeyArchiveInfoBasePrefix(baseSeqno uint32) []byte {
+	buf := append([]byte(nil), hotPrefixArchiveInfo...)
+	return binary.BigEndian.AppendUint32(buf, baseSeqno)
 }
 
 func hotKeyBlockDataRef(id ton.BlockIDExt) []byte {
@@ -166,11 +169,6 @@ func hotKeyPersistentStateFile(block ton.BlockIDExt, masterchainBlock ton.BlockI
 	return binary.BigEndian.AppendUint64(buf, uint64(effectiveShard))
 }
 
-func hotKeyArchiveFile(archiveID int64) []byte {
-	buf := append([]byte(nil), hotPrefixArchiveFile...)
-	return binary.BigEndian.AppendUint64(buf, uint64(archiveID))
-}
-
 func hotKeyArchivePackageStart(seqno uint32) []byte {
 	buf := append([]byte(nil), hotPrefixPackStart...)
 	return binary.BigEndian.AppendUint32(buf, seqno)
@@ -189,8 +187,25 @@ func hotKeyArchivePackagePrefix() []byte {
 	return bytes.Clone(hotPrefixArchivePackage)
 }
 
-func hotKeyArchiveBackfillProgress() []byte {
-	return bytes.Clone(hotPrefixArchiveBackfill)
+func hotKeyArchivePackageIndex(baseSeqno uint32) []byte {
+	buf := append([]byte(nil), hotPrefixArchivePackageIndex...)
+	return binary.BigEndian.AppendUint32(buf, baseSeqno)
+}
+
+func hotKeyPackAppendDirty(path string) []byte {
+	return append(bytes.Clone(hotPrefixPackAppendDirty), path...)
+}
+
+func hotKeyPackAppendDirtyPrefix() []byte {
+	return bytes.Clone(hotPrefixPackAppendDirty)
+}
+
+func hotKeyPackDeletePending(path string) []byte {
+	return append(bytes.Clone(hotPrefixPackDeletePending), path...)
+}
+
+func hotKeyPackDeletePendingPrefix() []byte {
+	return bytes.Clone(hotPrefixPackDeletePending)
 }
 
 func appendHistoryPrefix(prefix []byte, key storage.BlockHistoryKey) []byte {
@@ -202,6 +217,13 @@ func appendHistoryPrefix(prefix []byte, key storage.BlockHistoryKey) []byte {
 func appendPrefixAndBlockID(prefix []byte, id ton.BlockIDExt) []byte {
 	buf := append([]byte(nil), prefix...)
 	return append(buf, encodeBlockID(id)...)
+}
+
+func decodePrefixedBlockID(prefix []byte, key []byte) (ton.BlockIDExt, error) {
+	if len(key) != len(prefix)+80 {
+		return ton.BlockIDExt{}, fmt.Errorf("invalid block key size %d for prefix %x", len(key), prefix)
+	}
+	return decodeBlockID(key[len(prefix):])
 }
 
 func prefixUpperBound(prefix []byte) []byte {

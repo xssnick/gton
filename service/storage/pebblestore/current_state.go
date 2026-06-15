@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -460,36 +459,31 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 		return timing, errPebbleClosed
 	}
 
-	// Durability order is deliberate: write and flush celldb/artifact packs first,
-	// then publish hot metadata. If the process dies between the two, orphan
-	// files are fine; metadata still points at the previous durable state.
-	if err := s.setCheckpointArtifactWrites(batch, artifactWrites, artifactRegistrations, artifactLinks); err != nil {
-		s.mu.Unlock()
-		return timing, err
-	}
 	blockMetas := make(map[storage.BlockRootHash]*storage.BlockMeta, len(prepared)+len(artifactWrites))
 	for _, write := range artifactWrites {
 		mergeCheckpointBlockMeta(blockMetas, write.meta)
 	}
 	for _, state := range prepared {
-		if err := batch.Set(hotKeyStateMeta(state.saved.Block), encodeBlockStateMeta(&state.saved), pebble.NoSync); err != nil {
-			s.mu.Unlock()
-			return timing, err
-		}
 		mergeCheckpointBlockMeta(blockMetas, storage.BuildBlockMetaFromState(state.saved))
 	}
-	metaKeys := make([]storage.BlockRootHash, 0, len(blockMetas))
-	for key := range blockMetas {
-		metaKeys = append(metaKeys, key)
-	}
-	sort.Slice(metaKeys, func(i, j int) bool {
-		return bytes.Compare(metaKeys[i][:], metaKeys[j][:]) < 0
-	})
-	for _, key := range metaKeys {
-		if err := s.setMergedBlockMeta(batch, blockMetas[key]); err != nil {
-			s.mu.Unlock()
-			return timing, err
+	if current != nil {
+		mergeCheckpointBlockMeta(blockMetas, storage.BuildBlockMetaFromState(current.Masterchain))
+		for _, key := range storage.SortedShardKeys(current.Shards) {
+			shard := current.Shards[key]
+			mergeCheckpointBlockMeta(blockMetas, storage.BuildBlockMetaFromState(shard))
 		}
+	}
+
+	// Durability order is deliberate: write and flush celldb/artifact packs first,
+	// then publish hot metadata and clear pack dirty markers atomically. If the
+	// process dies between the two, startup recovery truncates dirty pack tails.
+	if err := s.setCheckpointArtifactWrites(batch, artifactWrites, artifactRegistrations, artifactLinks, blockMetas); err != nil {
+		s.mu.Unlock()
+		return timing, err
+	}
+	if err := s.setMergedBlockMetas(batch, blockMetas); err != nil {
+		s.mu.Unlock()
+		return timing, err
 	}
 	if current != nil {
 		if err := batch.Set(hotKeyCurrentState(), encodeCurrentState(current), pebble.NoSync); err != nil {
@@ -507,6 +501,10 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 			newActiveOrigin = &origin
 		}
 	}
+	if err := s.deleteSyncedPackAppendMarkers(batch, syncedPacks); err != nil {
+		s.mu.Unlock()
+		return timing, err
+	}
 	s.mu.Unlock()
 
 	hotSyncStarted := time.Now()
@@ -515,6 +513,7 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 		return timing, err
 	}
 	timing.MetadataSync = time.Since(hotSyncStarted)
+	s.deleteArchivePackageRegistrationCache(artifactRegistrations)
 	if syncArtifacts {
 		s.clearSyncedArtifactPacks(syncedPacks)
 	}
@@ -562,26 +561,15 @@ func (s *Store) validateCurrentStateBlockMetadata(db *pebble.DB, label string, c
 		return validateCurrentStateBlockMetaMatch(label, current, saved)
 	}
 
-	raw, closer, err := pebbleReaderGet(db, hotKeyStateMeta(current.Block))
+	saved, err := blockStateMetaFromReader(db, current.Block)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fmt.Errorf("current %s state %s metadata is missing", label, storage.FormatBlockRef(current.Block))
 		}
 		return fmt.Errorf("load current %s state %s metadata: %w", label, storage.FormatBlockRef(current.Block), err)
 	}
-	defer func() { _ = closer.Close() }()
-	rootHash, _, _, err := decodeBlockStateMeta(raw)
-	if err != nil {
-		return fmt.Errorf("decode current %s state %s metadata: %w", label, storage.FormatBlockRef(current.Block), err)
-	}
-	if len(rootHash) == 0 {
-		return fmt.Errorf("current %s state %s metadata is empty", label, storage.FormatBlockRef(current.Block))
-	}
 
-	return validateCurrentStateBlockMetaMatch(label, current, storage.BlockState{
-		Block:         current.Block,
-		StateRootHash: rootHash,
-	})
+	return validateCurrentStateBlockMetaMatch(label, current, saved)
 }
 
 func validateCurrentStateBlockMetaMatch(label string, current storage.BlockState, saved storage.BlockState) error {
@@ -750,23 +738,14 @@ func verifyCellGenerationSwitchStateMetadata(db *pebble.DB, current *storage.Cur
 }
 
 func verifyCellGenerationSwitchBlockStateMetadata(db *pebble.DB, label string, current storage.BlockState) error {
-	raw, closer, err := pebbleReaderGet(db, hotKeyStateMeta(current.Block))
+	saved, err := blockStateMetaFromReader(db, current.Block)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fmt.Errorf("durable current %s state %s metadata is missing", label, storage.FormatBlockRef(current.Block))
 		}
 		return fmt.Errorf("load durable current %s state %s metadata: %w", label, storage.FormatBlockRef(current.Block), err)
 	}
-	defer func() { _ = closer.Close() }()
-
-	rootHash, _, _, err := decodeBlockStateMeta(raw)
-	if err != nil {
-		return fmt.Errorf("decode durable current %s state %s metadata: %w", label, storage.FormatBlockRef(current.Block), err)
-	}
-	return validateCurrentStateBlockMetaMatch(label, current, storage.BlockState{
-		Block:         current.Block,
-		StateRootHash: rootHash,
-	})
+	return validateCurrentStateBlockMetaMatch(label, current, saved)
 }
 
 func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
@@ -824,8 +803,8 @@ func deleteStateMetadataBeforeImportedState(ctx context.Context, db *pebble.DB, 
 	}
 
 	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: hotPrefixStateMeta,
-		UpperBound: prefixUpperBound(hotPrefixStateMeta),
+		LowerBound: hotPrefixBlockMeta,
+		UpperBound: prefixUpperBound(hotPrefixBlockMeta),
 	})
 	if err != nil {
 		return 0, err
@@ -840,22 +819,23 @@ func deleteStateMetadataBeforeImportedState(ctx context.Context, db *pebble.DB, 
 		default:
 		}
 
-		block, err := decodeStateMetaBlockKey(iter.Key())
+		block, err := decodePrefixedBlockID(hotPrefixBlockMeta, iter.Key())
 		if err != nil {
 			return deleted, err
 		}
 		if _, ok := keep[storage.BlockKey(block)]; ok {
 			continue
 		}
-		_, _, masterRef, err := decodeBlockStateMeta(iter.Value())
+		meta, err := decodeBlockMeta(block, iter.Value())
 		if err != nil {
 			return deleted, fmt.Errorf("decode state metadata %s: %w", storage.FormatBlockRef(block), err)
 		}
-		if !stateMetadataBeforeImportedState(block, masterRef, origin) {
+		if !meta.Has(storage.BlockMetaHasStateCells) || !stateMetadataBeforeImportedState(block, meta, origin) {
 			continue
 		}
 
-		if err = batch.Delete(bytes.Clone(iter.Key()), pebble.NoSync); err != nil {
+		meta.Flags &^= storage.BlockMetaHasStateCells
+		if err = batch.Set(bytes.Clone(iter.Key()), encodeBlockMeta(meta), pebble.NoSync); err != nil {
 			return deleted, err
 		}
 		deleted++
@@ -866,24 +846,14 @@ func deleteStateMetadataBeforeImportedState(ctx context.Context, db *pebble.DB, 
 	return deleted, nil
 }
 
-func stateMetadataBeforeImportedState(block ton.BlockIDExt, masterRef *ton.BlockIDExt, origin ton.BlockIDExt) bool {
+func stateMetadataBeforeImportedState(block ton.BlockIDExt, meta *storage.BlockMeta, origin ton.BlockIDExt) bool {
 	if isMasterchainBlock(block) {
 		return block.SeqNo < origin.SeqNo
 	}
-	if masterRef == nil {
+	if meta == nil || !meta.MasterchainRefKnown() {
 		return false
 	}
-	if !isMasterchainBlock(*masterRef) {
-		return false
-	}
-	return masterRef.SeqNo < origin.SeqNo
-}
-
-func decodeStateMetaBlockKey(key []byte) (ton.BlockIDExt, error) {
-	if len(key) != len(hotPrefixStateMeta)+80 {
-		return ton.BlockIDExt{}, fmt.Errorf("invalid state metadata key size %d", len(key))
-	}
-	return decodeBlockID(key[len(hotPrefixStateMeta):])
+	return meta.MasterchainRefSeqno < origin.SeqNo
 }
 
 func (s *Store) verifyCurrentStateRootsPresentInGeneration(ctx context.Context, generation uint64, current *storage.CurrentState) error {

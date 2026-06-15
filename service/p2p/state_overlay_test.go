@@ -15,10 +15,71 @@ import (
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
+	peerA := testZeroStatePeer("a")
+	peerB := testZeroStatePeer("b")
+	sub := &overlaySubscription{
+		peers: map[PeerID]*overlayPeer{
+			peerA.id: peerA,
+			peerB.id: peerB,
+		},
+	}
+
+	got := sub.zeroStateQueryCandidates(map[PeerID]struct{}{
+		peerA.id: {},
+	})
+	if len(got) != 1 {
+		t.Fatalf("unexpected candidate count %d", len(got))
+	}
+	if got[0].id != peerB.id {
+		t.Fatalf("unexpected candidate %s, want %s", got[0].addr, peerB.addr)
+	}
+}
+
+func TestRotateZeroStateUnavailablePeersRemovesCurrentPeers(t *testing.T) {
+	peerA := testZeroStatePeer("a")
+	peerB := testZeroStatePeer("b")
+	sub := &overlaySubscription{
+		peers: map[PeerID]*overlayPeer{
+			peerA.id: peerA,
+			peerB.id: peerB,
+		},
+		neighbours: []PeerID{peerA.id, peerB.id},
+		peerNotify: make(chan struct{}, 1),
+	}
+
+	if got := sub.rotateZeroStateUnavailablePeers([]*overlayPeer{peerA, peerB}); got != 2 {
+		t.Fatalf("rotated peers = %d, want 2", got)
+	}
+	if len(sub.peers) != 0 {
+		t.Fatalf("peers were not removed: %d", len(sub.peers))
+	}
+	if len(sub.neighbours) != 0 {
+		t.Fatalf("neighbours were not removed: %d", len(sub.neighbours))
+	}
+	select {
+	case <-sub.peerNotify:
+	default:
+		t.Fatal("expected peer notification")
+	}
+}
+
+func testZeroStatePeer(label string) *overlayPeer {
+	id := testPeerID(label)
+	return &overlayPeer{
+		id:          id,
+		addr:        label,
+		fixedMember: true,
+		overlay:     &overlay.ADNLOverlayWrapper{},
+		alive:       true,
+	}
+}
 
 func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 	block := ton.BlockIDExt{
@@ -86,7 +147,8 @@ func TestPrepareStateFilesDirPreservesCompletedFiles(t *testing.T) {
 
 func TestTryImportReusableStagedStateFile(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	store := newTestPebbleStore(t)
+	dir := store.StateFilesDir()
 	block := ton.BlockIDExt{
 		Workchain: 0,
 		Shard:     int64(0x0800000000000000),
@@ -95,7 +157,7 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
 	root := mustTestShardStateCell(t, block)
 	rootHash := root.HashKey(0)
-	name, err := PersistentStateFileName(block, master, 0)
+	name, err := tnstore.PersistentStateFileName(block, master, 0)
 	if err != nil {
 		t.Fatalf("persistent state file name: %v", err)
 	}
@@ -109,7 +171,6 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		t.Fatalf("write reusable state file: %v", err)
 	}
 
-	store := newTestPebbleStore(t)
 	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
 		Block:            block,
 		MasterchainBlock: master,
@@ -157,9 +218,76 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	}
 }
 
+func TestTryImportReusableStagedStateFileUsesPeerStorage(t *testing.T) {
+	ctx := context.Background()
+	store := newTestPebbleStore(t)
+	dir := store.StateFilesDir()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(0x0800000000000000),
+		SeqNo:     63272133,
+	}
+	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	root := mustTestShardStateCell(t, block)
+	rootHash := root.HashKey(0)
+	data := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithIndex:     true,
+		WithCRC32C:    true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	name, err := tnstore.PersistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	path := filepath.Join(dir, name)
+	if err = os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write reusable state file: %v", err)
+	}
+	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
+		Block:            block,
+		MasterchainBlock: master,
+		EffectiveShard:   0,
+		Ref: &tnstore.ArtifactRef{
+			Path: path,
+			Size: int64(len(data)),
+		},
+		FileHash:      bytes.Repeat([]byte{0x56}, 32),
+		StateRootHash: rootHash[:],
+	}); err != nil {
+		t.Fatalf("save reusable state file metadata: %v", err)
+	}
+
+	node := &Node{
+		log:           zerolog.Nop(),
+		storage:       persistentStateFileMissingStore{Storage: store},
+		peerStorage:   store,
+		stateFilesDir: dir,
+	}
+	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
+	if err != nil {
+		t.Fatalf("import reusable staged state file from peer storage: %v", err)
+	}
+	if staged == nil || staged.peerAddr != "local" {
+		t.Fatalf("unexpected staged file %+v", staged)
+	}
+	if lazyRoot == nil || lazyRoot.HashKey(0) != rootHash {
+		t.Fatal("unexpected imported root")
+	}
+}
+
+type persistentStateFileMissingStore struct {
+	tnstore.Storage
+}
+
+func (s persistentStateFileMissingStore) PersistentStateFile(context.Context, ton.BlockIDExt, ton.BlockIDExt, int64) (*tnstore.PersistentStateFile, error) {
+	return nil, tnstore.ErrNotFound
+}
+
 func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	store := newTestPebbleStore(t)
+	dir := store.StateFilesDir()
 	block := ton.BlockIDExt{
 		Workchain: 0,
 		Shard:     int64(-1 << 63),
@@ -170,7 +298,7 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	proof := testFullMerkleProof(t, root)
 
 	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
-	name, err := PersistentStateFileName(block, master, block.Shard)
+	name, err := tnstore.PersistentStateFileName(block, master, block.Shard)
 	if err != nil {
 		t.Fatalf("split header file name: %v", err)
 	}
@@ -179,7 +307,6 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 		t.Fatalf("write reusable split header file: %v", err)
 	}
 
-	store := newTestPebbleStore(t)
 	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
 		Block:            block,
 		MasterchainBlock: master,
@@ -310,8 +437,9 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 		WithTopHash:   true,
 		WithIntHashes: true,
 	})
-	dir := t.TempDir()
-	name, err := PersistentStateFileName(block, master, int64(part.effectiveShard))
+	store := newTestPebbleStore(t)
+	dir := store.StateFilesDir()
+	name, err := tnstore.PersistentStateFileName(block, master, int64(part.effectiveShard))
 	if err != nil {
 		t.Fatalf("persistent state file name: %v", err)
 	}
@@ -320,7 +448,6 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 		t.Fatalf("write reusable split part file: %v", err)
 	}
 
-	store := newTestPebbleStore(t)
 	if err = store.SavePersistentStateFile(&tnstore.PersistentStateFile{
 		Block:            block,
 		MasterchainBlock: master,
@@ -391,17 +518,21 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 		WithTopHash:   true,
 		WithIntHashes: true,
 	})
-	path := filepath.Join(t.TempDir(), "part.boc")
+	store := newTestPebbleStore(t)
+	name, err := tnstore.PersistentStateFileName(block, master, int64(part.effectiveShard))
+	if err != nil {
+		t.Fatalf("split part file name: %v", err)
+	}
+	path := filepath.Join(store.StateFilesDir(), name)
 	if err := os.WriteFile(path, boc, 0o644); err != nil {
 		t.Fatalf("write split part boc: %v", err)
 	}
 
-	store := newTestPebbleStore(t)
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
 		peerStorage:   store,
-		stateFilesDir: t.TempDir(),
+		stateFilesDir: store.StateFilesDir(),
 	}
 	downloader := persistentStateSnapshotDownloader{
 		node:   node,

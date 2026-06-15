@@ -231,6 +231,45 @@ func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
 	}
 }
 
+func TestDownloadAndImportShardArchivesRetriesFailedShardWithoutCancelingWindow(t *testing.T) {
+	plans := []archiveShardImportPlan{
+		{shard: archive.ShardID{Workchain: 0, Shard: 1 << 60}},
+		{shard: archive.ShardID{Workchain: 0, Shard: 2 << 60}},
+	}
+	queue := &archiveImportQueue{
+		downloadHot:      make(chan archiveDownloadJob, len(plans)+1),
+		downloadPrefetch: make(chan archiveDownloadJob, len(plans)+1),
+	}
+
+	runner := &archiveCatchUpRunner{}
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, plans, 0, archiveImportPriorityPrefetch)
+		done <- err
+	}()
+
+	first := receiveArchiveDownloadJob(t, queue.downloadPrefetch)
+	second := receiveArchiveDownloadJob(t, queue.downloadPrefetch)
+
+	first.done <- archiveImportQueueResult{err: errors.New("seed timeout")}
+	retry := receiveArchiveDownloadJob(t, queue.downloadPrefetch)
+	if retry.shard != first.shard {
+		t.Fatalf("retried shard = %s, want %s", retry.shard.String(), first.shard.String())
+	}
+
+	second.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+	retry.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("downloadAndImportShardArchives did not finish")
+	}
+}
+
 func receiveArchiveDownloadJob(t *testing.T, jobs <-chan archiveDownloadJob) archiveDownloadJob {
 	t.Helper()
 

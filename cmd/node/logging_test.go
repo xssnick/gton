@@ -42,7 +42,9 @@ func TestNewLogOutputWritesConsoleAndFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new log output: %v", err)
 	}
-	defer logFile.Close()
+	defer func() {
+		_ = logFile.Close()
+	}()
 
 	if logFile.Filename != path {
 		t.Fatalf("log filename = %q, want %q", logFile.Filename, path)

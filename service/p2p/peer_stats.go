@@ -31,7 +31,7 @@ func (p *overlayPeer) hasOpenConnection() bool {
 	if p == nil || p.overlay == nil {
 		return false
 	}
-	if p.overlay.ADNLWrapper == nil || p.overlay.ADNLWrapper.ADNL == nil {
+	if p.overlay.ADNLWrapper == nil || p.overlay.ADNL == nil {
 		return true
 	}
 

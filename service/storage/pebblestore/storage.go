@@ -34,6 +34,8 @@ type Store struct {
 	cellShardMemTable               int
 	cellMemTableStopWritesThreshold int
 	artifactFiles                   *artifactFileCache
+	archivePackagesMu               sync.RWMutex
+	archivePackages                 map[int64]archivePackageMeta
 	bytesPerSync                    int
 	fs                              vfs.FS
 	hotOpts                         *pebble.Options
@@ -51,8 +53,6 @@ type Store struct {
 	artifactSyncSeq     uint64
 	pendingArchiveSync  map[string]pendingPackWrite
 	pendingKeyProofSync map[string]pendingPackWrite
-	dirtyArchivePacks   map[string]struct{}
-	dirtyKeyProofPacks  map[string]struct{}
 	closed              bool
 }
 

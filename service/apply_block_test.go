@@ -746,14 +746,18 @@ func TestStateCellWindowCacheRetriesPendingCheckpointCells(t *testing.T) {
 	second := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()
 
 	window := newStateCellWindowCache(nil)
-	window.addPreparedRecords(mustPreparedReachableStateCells(t, first))
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, first)); err != nil {
+		t.Fatalf("add first prepared records: %v", err)
+	}
 	failedCheckpoint := window.beginCheckpoint()
 	failedRecords := failedCheckpoint.records()
 	if !hasCellRecord(failedRecords, first.HashKey()) {
 		t.Fatal("first checkpoint does not contain first cell")
 	}
 
-	window.addPreparedRecords(mustPreparedReachableStateCells(t, second))
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, second)); err != nil {
+		t.Fatalf("add second prepared records: %v", err)
+	}
 	nextCheckpoint := window.beginCheckpoint()
 	records := nextCheckpoint.records()
 	if !hasCellRecord(records, first.HashKey()) {
@@ -775,13 +779,17 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 	second[0] = 2
 
 	window := newStateCellWindowCache(nil)
-	window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
+	if err := window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: []byte{1, 2, 3},
-	}))
+	})); err != nil {
+		t.Fatalf("add first prepared records: %v", err)
+	}
 	checkpoint := window.beginCheckpoint()
-	window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
+	if err := window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{4, 5},
-	}))
+	})); err != nil {
+		t.Fatalf("add second prepared records: %v", err)
+	}
 
 	if got := window.byteSize(); got != 5 {
 		t.Fatalf("window byte size = %d, want 5", got)
@@ -792,9 +800,11 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 		t.Fatalf("window byte size after checkpoint = %d, want 2", got)
 	}
 
-	window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
+	if err := window.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: []byte{6},
-	}))
+	})); err != nil {
+		t.Fatalf("replace prepared records: %v", err)
+	}
 	if got := window.byteSize(); got != 1 {
 		t.Fatalf("window byte size after replacement = %d, want 1", got)
 	}
@@ -803,7 +813,9 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 func TestStateCellWindowLoaderUsesSourceSnapshot(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	cache := newStateCellEncodedCache(1)
-	cache.addRecords(mustPreparedReachableStateCells(t, root), nil)
+	if err := cache.addRecords(mustPreparedReachableStateCells(t, root), nil); err != nil {
+		t.Fatalf("add source records: %v", err)
+	}
 
 	window := newStateCellWindowCache(nil)
 	window.mu.Lock()

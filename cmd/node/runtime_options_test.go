@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"net"
 	"testing"
+	"time"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/service/p2p"
@@ -26,12 +27,14 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 			ListenAddr: "0.0.0.0:30304",
 		},
 		Lite: nodeconfig.Lite{
-			Enabled:          true,
-			NonFinalEnabled:  true,
-			Key:              testSeed(3),
-			ListenAddr:       "0.0.0.0:7445",
-			MasterBlockCache: 11,
-			ShardBlockCache:  22,
+			Enabled:                            true,
+			NonFinalEnabled:                    true,
+			Key:                                testSeed(3),
+			ListenAddr:                         "0.0.0.0:7445",
+			MasterBlockCache:                   11,
+			ShardBlockCache:                    22,
+			SendMessageBroadcastBytesPerSecond: 123456,
+			SendMessageBroadcastMaxDelayMS:     75,
 		},
 		Storage: nodeconfig.Storage{
 			Dir: "data/node",
@@ -101,6 +104,12 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	}
 	if len(customOverlay.SenderShards) != 1 || customOverlay.SenderShards[0].Shard != topShard {
 		t.Fatalf("unexpected custom overlay sender shards: %+v", customOverlay.SenderShards)
+	}
+	if opts.ExternalBroadcastCapacity.BytesPerSecond != 123456 {
+		t.Fatalf("unexpected external broadcast capacity %d", opts.ExternalBroadcastCapacity.BytesPerSecond)
+	}
+	if opts.ExternalBroadcastCapacity.MaxDelay != 75*time.Millisecond {
+		t.Fatalf("unexpected external broadcast max delay %s", opts.ExternalBroadcastCapacity.MaxDelay)
 	}
 
 	liteOpts, err := liteserverOptionsFromConfig(cfg)

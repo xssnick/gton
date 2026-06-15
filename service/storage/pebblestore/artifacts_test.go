@@ -5,12 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/xssnick/gton/service/archive/packfile"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -40,13 +40,9 @@ func TestSaveArchiveImportAllowsShardSplitNextChildrenAcrossBatches(t *testing.T
 		t.Fatalf("link left split child: %v", err)
 	}
 
-	raw, err := store.getHotCopy(context.Background(), hotKeyNextBlock(prev))
+	got, err := readNextBlockLink(context.Background(), store, prev)
 	if err != nil {
 		t.Fatalf("load next block link: %v", err)
-	}
-	got, err := decodeBlockID(raw)
-	if err != nil {
-		t.Fatalf("decode next block link: %v", err)
 	}
 	if !got.Equals(&left) {
 		t.Fatalf("next block link = %s, want left split child %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
@@ -95,17 +91,61 @@ func TestSaveArchiveImportSelectsLeftShardSplitNextLinkInBatch(t *testing.T) {
 		t.Fatalf("save archive import split links: %v", err)
 	}
 
-	raw, err := store.getHotCopy(context.Background(), hotKeyNextBlock(prev))
+	got, err := readNextBlockLink(context.Background(), store, prev)
 	if err != nil {
 		t.Fatalf("load next block link: %v", err)
-	}
-	got, err := decodeBlockID(raw)
-	if err != nil {
-		t.Fatalf("decode next block link: %v", err)
 	}
 	if !got.Equals(&left) {
 		t.Fatalf("archive import next block link = %s, want left split child %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
 	}
+}
+
+func TestSaveArchiveImportKeepsSameBatchMetaAndNextLink(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(-1, int64(-1<<63), 100, 1)
+	next := testServedBlockID(-1, int64(-1<<63), 101, 2)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    prev,
+			Block: []byte{0x01},
+			Meta: &storage.BlockMeta{
+				ID:       prev,
+				GenUTime: 123,
+				StartLT:  10,
+				EndLT:    20,
+			},
+		}},
+		Links: []storage.ServedBlockLink{{Prev: prev, Next: next}},
+	}); err != nil {
+		t.Fatalf("save archive import: %v", err)
+	}
+
+	meta, err := store.BlockMeta(context.Background(), prev)
+	if err != nil {
+		t.Fatalf("load prev meta: %v", err)
+	}
+	if !meta.Has(storage.BlockMetaHasServedFull) || meta.GenUTime != 123 || meta.EndLT != 20 {
+		t.Fatalf("prev meta = flags=%v utime=%d end_lt=%d, want served meta", meta.Flags, meta.GenUTime, meta.EndLT)
+	}
+	if len(meta.NextRefs) != 1 || !meta.NextRefs[0].Equals(&next) {
+		t.Fatalf("prev next refs = %+v, want %s", meta.NextRefs, storage.FormatBlockRef(next))
+	}
+}
+
+func readNextBlockLink(ctx context.Context, store *Store, prev ton.BlockIDExt) (ton.BlockIDExt, error) {
+	meta, err := store.BlockMeta(ctx, prev)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if len(meta.NextRefs) == 0 {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return meta.NextRefs[0], nil
 }
 
 func TestStoredZeroStateBlocks(t *testing.T) {
@@ -221,9 +261,13 @@ func TestSaveArchiveImportStoresOriginalBlockBOC(t *testing.T) {
 	if !bytes.Equal(packed, blockData) {
 		t.Fatalf("packed block data mismatch: got %x want %x", packed, blockData)
 	}
+	refPath, err := store.artifactRefPath(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("resolve block artifact ref path: %v", err)
+	}
 
 	store.artifactMu.Lock()
-	_, pending := store.pendingArchiveSync[store.artifactPath(ref.Path)]
+	_, pending := store.pendingArchiveSync[store.artifactPath(refPath)]
 	pendingCount := len(store.pendingArchiveSync)
 	store.artifactMu.Unlock()
 	if pending {
@@ -232,13 +276,15 @@ func TestSaveArchiveImportStoresOriginalBlockBOC(t *testing.T) {
 	if pendingCount != 0 {
 		t.Fatalf("pending archive sync files = %d, want 0", pendingCount)
 	}
-	publishedSizes, err := store.publishedArtifactFileSizes()
+	stat, err := os.Stat(store.artifactPath(refPath))
 	if err != nil {
-		t.Fatalf("load published artifact sizes: %v", err)
+		t.Fatalf("stat archive block pack: %v", err)
 	}
-	publishedSize := publishedSizes[ref.Path]
-	if publishedSize < ref.Offset+ref.Size {
-		t.Fatalf("published artifact size = %d, want at least ref end %d", publishedSize, ref.Offset+ref.Size)
+	if stat.Size() < ref.Offset+ref.Size {
+		t.Fatalf("archive block pack size = %d, want at least ref end %d", stat.Size(), ref.Offset+ref.Size)
+	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyPackAppendDirty(refPath)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("dirty append marker error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -347,6 +393,84 @@ func TestSaveArchiveImportRegistersInlineMasterPackageMetadata(t *testing.T) {
 	}
 }
 
+func TestArchiveSliceSeesArchiveImportAppendAfterMetaCacheWarm(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	first := testServedBlockID(-1, topShard, 150, 0x31)
+	second := testServedBlockID(-1, topShard, 151, 0x33)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{testArchivePackageCacheBlock(first, []byte{0x01}, []byte{0x02})},
+	}); err != nil {
+		t.Fatalf("save first archive import: %v", err)
+	}
+
+	archiveID, oldSize := warmArchivePackageMetaCache(t, store, ctx, first)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{testArchivePackageCacheBlock(second, []byte{0x03}, []byte{0x04})},
+	}); err != nil {
+		t.Fatalf("save second archive import: %v", err)
+	}
+	secondArchiveID, err := store.ArchiveInfo(ctx, int32(second.SeqNo), second.Workchain, second.Shard)
+	if err != nil {
+		t.Fatalf("second archive info: %v", err)
+	}
+	if secondArchiveID != archiveID {
+		t.Fatalf("second archive id = %d, want %d", secondArchiveID, archiveID)
+	}
+
+	tail, err := store.ArchiveSlice(ctx, archiveID, oldSize, 4096)
+	if err != nil {
+		t.Fatalf("archive slice after append: %v", err)
+	}
+	if len(tail) == 0 {
+		t.Fatal("archive slice returned EOF at old cached package size after append")
+	}
+}
+
+func TestArchiveSliceSeesCheckpointAppendAfterMetaCacheWarm(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	first := testServedBlockID(-1, topShard, 250, 0x41)
+	second := testServedBlockID(-1, topShard, 251, 0x43)
+	if _, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		Artifact: testArchivePackageCacheBlock(first, []byte{0x11}, []byte{0x12}),
+	}}, storage.StateCellRecords{}, nil); err != nil {
+		t.Fatalf("save first checkpoint artifact: %v", err)
+	}
+
+	archiveID, oldSize := warmArchivePackageMetaCache(t, store, ctx, first)
+	if _, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		Artifact: testArchivePackageCacheBlock(second, []byte{0x13}, []byte{0x14}),
+	}}, storage.StateCellRecords{}, nil); err != nil {
+		t.Fatalf("save second checkpoint artifact: %v", err)
+	}
+	secondArchiveID, err := store.ArchiveInfo(ctx, int32(second.SeqNo), second.Workchain, second.Shard)
+	if err != nil {
+		t.Fatalf("second checkpoint archive info: %v", err)
+	}
+	if secondArchiveID != archiveID {
+		t.Fatalf("second checkpoint archive id = %d, want %d", secondArchiveID, archiveID)
+	}
+
+	tail, err := store.ArchiveSlice(ctx, archiveID, oldSize, 4096)
+	if err != nil {
+		t.Fatalf("checkpoint archive slice after append: %v", err)
+	}
+	if len(tail) == 0 {
+		t.Fatal("checkpoint archive slice returned EOF at old cached package size after append")
+	}
+}
+
 func TestSaveArchiveImportRegistersInlineShardPackage(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -364,18 +488,26 @@ func TestSaveArchiveImportRegistersInlineShardPackage(t *testing.T) {
 	}
 
 	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
-		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    shard,
-			Block: blockData,
-			Proof: proofData,
-			Meta: &storage.BlockMeta{
-				ID:             shard,
-				MasterchainRef: &master,
-				GenUTime:       1800,
-				StartLT:        18,
-				EndLT:          19,
+		FullBlocks: []*storage.ServedBlockFull{
+			{
+				ID:    master,
+				Block: []byte{0x01},
+				Proof: []byte{0x02},
+				Meta:  &storage.BlockMeta{ID: master, GenUTime: 1800, StartLT: 17, EndLT: 18},
 			},
-		}},
+			{
+				ID:    shard,
+				Block: blockData,
+				Proof: proofData,
+				Meta: &storage.BlockMeta{
+					ID:                  shard,
+					MasterchainRefSeqno: master.SeqNo,
+					GenUTime:            1800,
+					StartLT:             18,
+					EndLT:               19,
+				},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("save archive import: %v", err)
@@ -405,6 +537,341 @@ func TestSaveArchiveImportRegistersInlineShardPackage(t *testing.T) {
 	}
 }
 
+func TestArchivePackIDsFollowCppPackageIndexOrder(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	baseMaster := testServedBlockID(-1, topShard, 20000, 0x60)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    baseMaster,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  &storage.BlockMeta{ID: baseMaster, GenUTime: 20000, StartLT: 20, EndLT: 21},
+		}},
+	}); err != nil {
+		t.Fatalf("save base master package: %v", err)
+	}
+
+	baseID, err := store.ArchiveInfo(ctx, int32(baseMaster.SeqNo), -1, topShard)
+	if err != nil {
+		t.Fatalf("base master archive info: %v", err)
+	}
+	if archivePackageIndex(baseID) != 0 || uint32(uint64(baseID)) != baseMaster.SeqNo {
+		t.Fatalf("base master archive id index/base = %d/%d, want 0/%d", archivePackageIndex(baseID), uint32(uint64(baseID)), baseMaster.SeqNo)
+	}
+
+	nextMaster := testServedBlockID(-1, topShard, 20150, 0x61)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    nextMaster,
+			Block: []byte{0x03},
+			Proof: []byte{0x04},
+			Meta:  &storage.BlockMeta{ID: nextMaster, GenUTime: 20150, StartLT: 22, EndLT: 23},
+		}},
+	}); err != nil {
+		t.Fatalf("save next master package: %v", err)
+	}
+
+	nextID, err := store.ArchiveInfo(ctx, int32(nextMaster.SeqNo), -1, topShard)
+	if err != nil {
+		t.Fatalf("next master archive info: %v", err)
+	}
+	if archivePackageIndex(nextID) != 1 || uint32(uint64(nextID)) != baseMaster.SeqNo {
+		t.Fatalf("next master archive id index/base = %d/%d, want 1/%d", archivePackageIndex(nextID), uint32(uint64(nextID)), baseMaster.SeqNo)
+	}
+
+	shard := testServedBlockID(0, topShard, 1000, 0x62)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    shard,
+			Block: []byte{0x05},
+			Proof: []byte{0x06},
+			Meta: &storage.BlockMeta{
+				ID:                  shard,
+				MasterchainRefSeqno: nextMaster.SeqNo,
+				GenUTime:            20150,
+				StartLT:             24,
+				EndLT:               25,
+			},
+		}},
+	}); err != nil {
+		t.Fatalf("save shard package: %v", err)
+	}
+
+	shardID, err := store.ArchiveInfo(ctx, int32(nextMaster.SeqNo), shard.Workchain, shard.Shard)
+	if err != nil {
+		t.Fatalf("shard archive info: %v", err)
+	}
+	if archivePackageIndex(shardID) != 2 || uint32(uint64(shardID)) != baseMaster.SeqNo {
+		t.Fatalf("shard archive id index/base = %d/%d, want 2/%d", archivePackageIndex(shardID), uint32(uint64(shardID)), baseMaster.SeqNo)
+	}
+
+	next, err := store.nextArchivePackageIndex(baseMaster.SeqNo)
+	if err != nil {
+		t.Fatalf("next archive package index: %v", err)
+	}
+	if next != 3 {
+		t.Fatalf("next archive package index = %d, want 3", next)
+	}
+}
+
+func TestAppendArchiveEntriesAllocatesDynamicPackageIDsWithinCheckpoint(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	master := testServedBlockID(-1, topShard, 20150, 0x70)
+	shardA := testServedBlockID(0, int64(0x4000000000000000), 1000, 0x71)
+	shardB := testServedBlockID(0, int64(-0x4000000000000000), 1001, 0x72)
+	masterMeta := &storage.BlockMeta{
+		ID:       master,
+		GenUTime: 20150,
+		StartLT:  201,
+		EndLT:    202,
+	}
+	shardMeta := func(block ton.BlockIDExt) *storage.BlockMeta {
+		return &storage.BlockMeta{
+			ID:                  block,
+			MasterchainRefSeqno: master.SeqNo,
+			GenUTime:            20150,
+			StartLT:             uint64(block.SeqNo),
+			EndLT:               uint64(block.SeqNo + 1),
+		}
+	}
+
+	refs, registrations, err := store.appendArchiveEntries([]archiveAppendRequest{
+		{kind: packfile.KindBlock, block: master, meta: masterMeta, data: []byte{0x01}},
+		{kind: packfile.KindBlock, block: shardA, meta: shardMeta(shardA), data: []byte{0x02}},
+		{kind: packfile.KindProof, block: shardA, meta: shardMeta(shardA), data: []byte{0x03}},
+		{kind: packfile.KindBlock, block: shardB, meta: shardMeta(shardB), data: []byte{0x04}},
+	})
+	if err != nil {
+		t.Fatalf("append archive entries: %v", err)
+	}
+	if len(refs) != 4 {
+		t.Fatalf("refs = %d, want 4", len(refs))
+	}
+
+	wantIndexes := []uint32{1, 2, 2, 3}
+	for idx, ref := range refs {
+		if ref == nil {
+			t.Fatalf("ref %d is nil", idx)
+		}
+		if got := archivePackageIndex(ref.ArchivePackageID); got != wantIndexes[idx] {
+			t.Fatalf("ref %d archive package index = %d, want %d", idx, got, wantIndexes[idx])
+		}
+		if got := uint32(uint64(ref.ArchivePackageID)); got != 20000 {
+			t.Fatalf("ref %d archive package base = %d, want 20000", idx, got)
+		}
+	}
+	if len(registrations) != 3 {
+		t.Fatalf("archive package registrations = %d, want 3", len(registrations))
+	}
+}
+
+func TestAppendArchiveEntriesReusesLoadedPackageIDs(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	master := testServedBlockID(-1, topShard, 20150, 0x73)
+	shardA := testServedBlockID(0, int64(0x4000000000000000), 1000, 0x74)
+	shardB := testServedBlockID(0, int64(-0x4000000000000000), 1001, 0x75)
+	masterMeta := &storage.BlockMeta{
+		ID:       master,
+		GenUTime: 20150,
+		StartLT:  201,
+		EndLT:    202,
+	}
+	shardMeta := func(block ton.BlockIDExt) *storage.BlockMeta {
+		return &storage.BlockMeta{
+			ID:                  block,
+			MasterchainRefSeqno: master.SeqNo,
+			GenUTime:            20150,
+			StartLT:             uint64(block.SeqNo),
+			EndLT:               uint64(block.SeqNo + 1),
+		}
+	}
+
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    master,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  masterMeta,
+		}},
+	}); err != nil {
+		t.Fatalf("save master archive: %v", err)
+	}
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    shardA,
+			Block: []byte{0x03},
+			Proof: []byte{0x04},
+			Meta:  shardMeta(shardA),
+		}},
+	}); err != nil {
+		t.Fatalf("save shard archive: %v", err)
+	}
+
+	masterID, err := store.ArchiveInfo(ctx, int32(master.SeqNo), master.Workchain, master.Shard)
+	if err != nil {
+		t.Fatalf("master archive info: %v", err)
+	}
+	shardAID, err := store.ArchiveInfo(ctx, int32(master.SeqNo), shardA.Workchain, shardA.Shard)
+	if err != nil {
+		t.Fatalf("shard archive info: %v", err)
+	}
+
+	refs, registrations, err := store.appendArchiveEntries([]archiveAppendRequest{
+		{kind: packfile.KindBlock, block: master, meta: masterMeta, data: []byte{0x05}},
+		{kind: packfile.KindBlock, block: shardA, meta: shardMeta(shardA), data: []byte{0x06}},
+		{kind: packfile.KindProof, block: shardA, meta: shardMeta(shardA), data: []byte{0x07}},
+		{kind: packfile.KindBlock, block: shardB, meta: shardMeta(shardB), data: []byte{0x08}},
+	})
+	if err != nil {
+		t.Fatalf("append archive entries: %v", err)
+	}
+	if len(refs) != 4 {
+		t.Fatalf("refs = %d, want 4", len(refs))
+	}
+	if refs[0].ArchivePackageID != masterID {
+		t.Fatalf("master archive id = %d, want existing %d", refs[0].ArchivePackageID, masterID)
+	}
+	if refs[1].ArchivePackageID != shardAID || refs[2].ArchivePackageID != shardAID {
+		t.Fatalf("shard archive ids = %d/%d, want existing %d", refs[1].ArchivePackageID, refs[2].ArchivePackageID, shardAID)
+	}
+	if got := archivePackageIndex(refs[3].ArchivePackageID); got != 3 {
+		t.Fatalf("new shard archive package index = %d, want 3", got)
+	}
+	if got := uint32(uint64(refs[3].ArchivePackageID)); got != 20000 {
+		t.Fatalf("new shard archive package base = %d, want 20000", got)
+	}
+	if len(registrations) != 3 {
+		t.Fatalf("archive package registrations = %d, want 3", len(registrations))
+	}
+}
+
+func TestArchiveInfoUsesKeyBlockPackageBaseInsidePreviousSliceRange(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	oldMaster := testServedBlockID(-1, topShard, 521000, 0x10)
+	oldShard := testServedBlockID(0, topShard, 1000, 0x11)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			{
+				ID:    oldMaster,
+				Block: []byte{0x00},
+				Proof: []byte{0x09},
+				Meta: &storage.BlockMeta{
+					ID:       oldMaster,
+					GenUTime: oldMaster.SeqNo,
+					StartLT:  0,
+					EndLT:    1,
+				},
+			},
+			{
+				ID:    oldShard,
+				Block: []byte{0x01},
+				Proof: []byte{0x02},
+				Meta: &storage.BlockMeta{
+					ID:                  oldShard,
+					MasterchainRefSeqno: oldMaster.SeqNo,
+					GenUTime:            oldMaster.SeqNo,
+					StartLT:             1,
+					EndLT:               2,
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save old shard archive: %v", err)
+	}
+
+	oldID, err := store.ArchiveInfo(context.Background(), int32(oldMaster.SeqNo), oldShard.Workchain, oldShard.Shard)
+	if err != nil {
+		t.Fatalf("old archive info: %v", err)
+	}
+
+	keyMaster := testServedBlockID(-1, topShard, 521044, 0x20)
+	newShard := testServedBlockID(0, topShard, 1001, 0x21)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			{
+				ID:    keyMaster,
+				Block: []byte{0x03},
+				Proof: []byte{0x04},
+				Meta: &storage.BlockMeta{
+					ID:       keyMaster,
+					Flags:    storage.BlockMetaIsKeyBlock,
+					GenUTime: keyMaster.SeqNo,
+					StartLT:  3,
+					EndLT:    4,
+				},
+			},
+			{
+				ID:    newShard,
+				Block: []byte{0x05},
+				Proof: []byte{0x06},
+				Meta: &storage.BlockMeta{
+					ID:                  newShard,
+					MasterchainRefSeqno: keyMaster.SeqNo,
+					GenUTime:            keyMaster.SeqNo,
+					StartLT:             5,
+					EndLT:               6,
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save key-base archive: %v", err)
+	}
+
+	stillOldID, err := store.ArchiveInfo(context.Background(), int32(keyMaster.SeqNo-1), oldShard.Workchain, oldShard.Shard)
+	if err != nil {
+		t.Fatalf("old range archive info: %v", err)
+	}
+	if stillOldID != oldID {
+		t.Fatalf("pre-key archive id = %d, want old id %d", stillOldID, oldID)
+	}
+
+	newID, err := store.ArchiveInfo(context.Background(), int32(keyMaster.SeqNo), newShard.Workchain, newShard.Shard)
+	if err != nil {
+		t.Fatalf("new archive info: %v", err)
+	}
+	if newID == oldID {
+		t.Fatalf("key-base archive reused previous range id %d", newID)
+	}
+	if uint32(uint64(newID)) != keyMaster.SeqNo {
+		t.Fatalf("new archive id low bits = %d, want key base %d", uint32(uint64(newID)), keyMaster.SeqNo)
+	}
+
+	raw, err := store.getHotCopy(context.Background(), hotKeyArchivePackage(newID))
+	if err != nil {
+		t.Fatalf("load new archive package meta: %v", err)
+	}
+	meta, err := decodeArchivePackageMeta(raw)
+	if err != nil {
+		t.Fatalf("decode new archive package meta: %v", err)
+	}
+	wantPath := "archive/packages/arch0005/archive.521044.0_8000000000000000.pack"
+	if meta.path != wantPath {
+		t.Fatalf("new archive package path = %s, want %s", meta.path, wantPath)
+	}
+}
+
 func TestSaveArchiveImportRejectsInlineShardPackageWithoutMasterRef(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -429,6 +896,38 @@ func TestSaveArchiveImportRejectsInlineShardPackageWithoutMasterRef(t *testing.T
 	})
 	if err == nil || !strings.Contains(err.Error(), "masterchain reference is required") {
 		t.Fatalf("save archive import error = %v, want missing masterchain ref", err)
+	}
+}
+
+func TestSaveArchiveImportRejectsShardPackageBeforeMasterBlock(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	master := testServedBlockID(-1, topShard, 521044, 0x53)
+	shard := testServedBlockID(0, topShard, 921, 0x54)
+
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    shard,
+			Block: []byte{0x31},
+			Proof: []byte{0x41},
+			Meta: &storage.BlockMeta{
+				ID:                  shard,
+				MasterchainRefSeqno: master.SeqNo,
+				GenUTime:            521044,
+				StartLT:             181,
+				EndLT:               182,
+			},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires stored masterchain block") {
+		t.Fatalf("save archive import error = %v, want missing masterchain block", err)
+	}
+	if _, err = store.ArchiveInfo(context.Background(), int32(master.SeqNo), shard.Workchain, shard.Shard); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("archive info after rejected import error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -491,6 +990,84 @@ func TestSaveArchiveImportKeyBlockProofUsesKeyArchivePack(t *testing.T) {
 	}
 	if !meta.Has(storage.BlockMetaIsKeyBlock) {
 		t.Fatal("key proof did not mark block meta as key block")
+	}
+}
+
+func TestPendingKeyProofPackKeepsFirstCleanSize(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	committed := testServedBlockID(-1, topShard, 345678, 0x34)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    committed,
+			Block: []byte{0x11},
+			Proof: []byte{0x21},
+			Meta: &storage.BlockMeta{
+				ID:       committed,
+				Flags:    storage.BlockMetaIsKeyBlock,
+				GenUTime: 3456780,
+				StartLT:  345678,
+				EndLT:    345679,
+			},
+		}},
+	}); err != nil {
+		t.Fatalf("save committed key proof: %v", err)
+	}
+
+	path := store.keyBlockProofPackPath(committed.SeqNo)
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat committed key proof pack: %v", err)
+	}
+	publishedSize := stat.Size()
+
+	pendingA := testServedBlockID(-1, topShard, 345679, 0x35)
+	if _, err = store.appendKeyBlockProofEntry(storage.ServedProofKeyBlock, pendingA, []byte{0x31}); err != nil {
+		t.Fatalf("append first pending key proof: %v", err)
+	}
+	pendingB := testServedBlockID(-1, topShard, 345680, 0x36)
+	if _, err = store.appendKeyBlockProofEntry(storage.ServedProofKeyBlock, pendingB, []byte{0x41}); err != nil {
+		t.Fatalf("append second pending key proof: %v", err)
+	}
+
+	pending, ok := store.pendingKeyProofSync[path]
+	if !ok {
+		t.Fatalf("missing pending key proof sync for %s", path)
+	}
+	if pending.cleanSize != publishedSize {
+		t.Fatalf("pending clean size = %d, want published size %d", pending.cleanSize, publishedSize)
+	}
+	relPath, err := store.packJournalPath(path)
+	if err != nil {
+		t.Fatalf("pack journal path: %v", err)
+	}
+	raw, err := store.getHotCopy(context.Background(), hotKeyPackAppendDirty(relPath))
+	if err != nil {
+		t.Fatalf("load dirty append marker: %v", err)
+	}
+	markerCleanSize, err := decodePackAppendDirty(raw)
+	if err != nil {
+		t.Fatalf("decode dirty append marker: %v", err)
+	}
+	if markerCleanSize != publishedSize {
+		t.Fatalf("dirty marker clean size = %d, want published size %d", markerCleanSize, publishedSize)
+	}
+
+	store.abandonPendingArtifactPacks()
+
+	stat, err = os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat abandoned key proof pack: %v", err)
+	}
+	if stat.Size() != publishedSize {
+		t.Fatalf("key proof pack size after abandon = %d, want %d", stat.Size(), publishedSize)
+	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyPackAppendDirty(relPath)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("dirty append marker after abandon = %v, want ErrNotFound", err)
 	}
 }
 
@@ -568,9 +1145,10 @@ func TestSaveArchiveImportReplacesMissingArtifactRefs(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x02}, 32),
 	}
 	missing := encodeArtifactRef(&storage.ArtifactRef{
-		Path:   "archive/packages/arch0000/missing.pack",
-		Offset: 10,
-		Size:   4,
+		ArchivePackage:   true,
+		ArchivePackageID: 1234,
+		Offset:           10,
+		Size:             4,
 	})
 	if err = store.withHotBatch(func(batch *pebble.Batch) error {
 		if err := batch.Set(hotKeyBlockDataRef(block), missing, pebble.NoSync); err != nil {
@@ -753,12 +1331,20 @@ func TestArchiveInfoNormalizesSplitShardPrefix(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x02}, 32),
 	}
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
-		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: []byte{1},
-			Proof: []byte{2},
-			Meta:  &storage.BlockMeta{ID: block, MasterchainRef: &master, GenUTime: 420, StartLT: 42, EndLT: 43},
-		}},
+		FullBlocks: []*storage.ServedBlockFull{
+			{
+				ID:    master,
+				Block: []byte{0},
+				Proof: []byte{3},
+				Meta:  &storage.BlockMeta{ID: master, GenUTime: 420, StartLT: 41, EndLT: 42},
+			},
+			{
+				ID:    block,
+				Block: []byte{1},
+				Proof: []byte{2},
+				Meta:  &storage.BlockMeta{ID: block, MasterchainRefSeqno: master.SeqNo, GenUTime: 420, StartLT: 42, EndLT: 43},
+			},
+		},
 	}); err != nil {
 		t.Fatalf("save archive import: %v", err)
 	}
@@ -793,10 +1379,20 @@ func TestArchivePackIDSeparatesBasechainFullAndSplitShard(t *testing.T) {
 	}
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    master,
+			Block: []byte{0},
+			Proof: []byte{5},
+			Meta:  &storage.BlockMeta{ID: master, GenUTime: 1560, StartLT: 155, EndLT: 156},
+		}},
+	}); err != nil {
+		t.Fatalf("save master archive: %v", err)
+	}
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
 			ID:    full,
 			Block: []byte{1},
 			Proof: []byte{2},
-			Meta:  &storage.BlockMeta{ID: full, MasterchainRef: &master, GenUTime: 1560, StartLT: 156, EndLT: 157},
+			Meta:  &storage.BlockMeta{ID: full, MasterchainRefSeqno: master.SeqNo, GenUTime: 1560, StartLT: 156, EndLT: 157},
 		}},
 	}); err != nil {
 		t.Fatalf("save full basechain archive: %v", err)
@@ -815,7 +1411,7 @@ func TestArchivePackIDSeparatesBasechainFullAndSplitShard(t *testing.T) {
 			ID:    split,
 			Block: []byte{3},
 			Proof: []byte{4},
-			Meta:  &storage.BlockMeta{ID: split, MasterchainRef: &master, GenUTime: 1560, StartLT: 158, EndLT: 159},
+			Meta:  &storage.BlockMeta{ID: split, MasterchainRefSeqno: master.SeqNo, GenUTime: 1560, StartLT: 158, EndLT: 159},
 		}},
 	}); err != nil {
 		t.Fatalf("save split basechain archive: %v", err)
@@ -831,6 +1427,66 @@ func TestArchivePackIDSeparatesBasechainFullAndSplitShard(t *testing.T) {
 	}
 	if fullID == splitID {
 		t.Fatalf("archive ids collided: full=%d split=%d", fullID, splitID)
+	}
+}
+
+func TestArchivePackIDSeparatesDeepShardPrefixes(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	master := testServedBlockID(-1, topShard, 3085024, 0x30)
+	shardA := testShardID(0xb684000000000000)
+	shardB := testShardID(0xb68c000000000000)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    master,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  &storage.BlockMeta{ID: master, GenUTime: 3085024, StartLT: 99, EndLT: 100},
+		}},
+	}); err != nil {
+		t.Fatalf("save master archive: %v", err)
+	}
+
+	for idx, shard := range []int64{shardA, shardB} {
+		block := ton.BlockIDExt{
+			Workchain: 0,
+			Shard:     shard,
+			SeqNo:     uint32(100 + idx),
+			RootHash:  bytes.Repeat([]byte{byte(0x40 + idx)}, 32),
+			FileHash:  bytes.Repeat([]byte{byte(0x50 + idx)}, 32),
+		}
+		if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+			FullBlocks: []*storage.ServedBlockFull{{
+				ID:    block,
+				Block: []byte{byte(0x60 + idx)},
+				Proof: []byte{byte(0x70 + idx)},
+				Meta: &storage.BlockMeta{
+					ID:                  block,
+					MasterchainRefSeqno: master.SeqNo,
+					GenUTime:            3085024,
+					StartLT:             uint64(100 + idx),
+					EndLT:               uint64(101 + idx),
+				},
+			}},
+		}); err != nil {
+			t.Fatalf("save shard %016x archive: %v", uint64(shard), err)
+		}
+	}
+
+	idA, err := store.ArchiveInfo(context.Background(), int32(master.SeqNo), 0, shardA)
+	if err != nil {
+		t.Fatalf("shard A archive info: %v", err)
+	}
+	idB, err := store.ArchiveInfo(context.Background(), int32(master.SeqNo), 0, shardB)
+	if err != nil {
+		t.Fatalf("shard B archive info: %v", err)
+	}
+	if idA == idB {
+		t.Fatalf("deep shard archive ids collided: shard_a=%016x shard_b=%016x id=%d", uint64(shardA), uint64(shardB), idA)
 	}
 }
 
@@ -866,13 +1522,29 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode block ref %d: %v", block.SeqNo, err)
 		}
-		return store.artifactPath(ref.Path)
+		path, err := store.artifactRefPath(context.Background(), ref)
+		if err != nil {
+			t.Fatalf("resolve block ref path %d: %v", block.SeqNo, err)
+		}
+		return store.artifactPath(path)
 	}
 
 	oldAPath := savePruneBlock(oldA, 1000)
 	oldBPath := savePruneBlock(oldB, 1500)
 	boundaryPath := savePruneBlock(boundary, 2000)
 	newerPath := savePruneBlock(newer, 3000)
+	if err = store.withHotBatch(func(batch *pebble.Batch) error {
+		return batch.Set(hotKeyKeyProofRef(storage.ServedProofKeyBlock, oldA), encodeArtifactRef(&storage.ArtifactRef{
+			ArchivePackage:   true,
+			ArchivePackageID: keyProofPackageRefID(keyProofPackageID(oldA.SeqNo)),
+			Size:             1,
+		}), pebble.NoSync)
+	}); err != nil {
+		t.Fatalf("save old key proof ref: %v", err)
+	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyKeyProofRef(storage.ServedProofKeyBlock, oldA)); err != nil {
+		t.Fatalf("old key proof ref missing before prune: %v", err)
+	}
 	oldShard := testServedBlockID(0, int64(-1<<63), 20, 0x55)
 	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: oldShard, GenUTime: 1000, StartLT: 20, EndLT: 21}); err != nil {
 		t.Fatalf("save old shard meta: %v", err)
@@ -913,6 +1585,9 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	if _, err = store.BlockMeta(context.Background(), oldShard); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("old shard meta error = %v, want ErrNotFound", err)
 	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyKeyProofRef(storage.ServedProofKeyBlock, oldA)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("old key proof ref error = %v, want ErrNotFound", err)
+	}
 
 	for _, block := range []ton.BlockIDExt{boundary, newer} {
 		if _, err = store.BlockMeta(context.Background(), block); err != nil {
@@ -938,8 +1613,13 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	}
 }
 
-func TestOpenRemovesUnreferencedArchivePack(t *testing.T) {
+func TestOpenRemovesDeletePendingArchivePack(t *testing.T) {
 	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
 	strayPath := filepath.Join(dir, "archive", "packages", "arch0000", "stray.pack")
 	if err := os.MkdirAll(filepath.Dir(strayPath), 0o755); err != nil {
 		t.Fatalf("create stray pack dir: %v", err)
@@ -947,15 +1627,30 @@ func TestOpenRemovesUnreferencedArchivePack(t *testing.T) {
 	if err := os.WriteFile(strayPath, []byte{0x01, 0x02, 0x03}, 0o644); err != nil {
 		t.Fatalf("write stray pack: %v", err)
 	}
-
-	store, err := Open(Options{Dir: dir})
+	relPath, err := store.packJournalPath(strayPath)
 	if err != nil {
-		t.Fatalf("open store: %v", err)
+		t.Fatalf("pack journal path: %v", err)
+	}
+	if err = store.withHotBatchOptions(pebble.Sync, func(batch *pebble.Batch) error {
+		return store.setPackDeletePending(batch, strayPath)
+	}); err != nil {
+		t.Fatalf("set delete pending: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
 
 	if _, err = os.Stat(strayPath); !os.IsNotExist(err) {
 		t.Fatalf("stray archive pack stat error = %v, want missing", err)
+	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyPackDeletePending(relPath)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("delete pending marker after recovery = %v, want ErrNotFound", err)
 	}
 }
 
@@ -985,12 +1680,19 @@ func TestOpenTruncatesArchivePackToPublishedRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode block ref: %v", err)
 	}
-	publishedSizes, err := store.publishedArtifactFileSizes()
+	refPath, err := store.artifactRefPath(context.Background(), ref)
 	if err != nil {
-		t.Fatalf("load published artifact sizes: %v", err)
+		t.Fatalf("resolve block ref path: %v", err)
 	}
-	publishedSize := publishedSizes[ref.Path]
-	path := store.artifactPath(ref.Path)
+	path := store.artifactPath(refPath)
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat archive pack before tail append: %v", err)
+	}
+	publishedSize := stat.Size()
+	if _, err = store.markPackAppendDirty(path, publishedSize); err != nil {
+		t.Fatalf("mark dirty append: %v", err)
+	}
 	tail, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		t.Fatalf("open archive pack for tail append: %v", err)
@@ -1012,15 +1714,76 @@ func TestOpenTruncatesArchivePackToPublishedRefs(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	stat, err := os.Stat(path)
+	stat, err = os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat archive pack: %v", err)
 	}
 	if stat.Size() != publishedSize {
 		t.Fatalf("archive pack size = %d, want %d", stat.Size(), publishedSize)
 	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyPackAppendDirty(refPath)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("dirty append marker after recovery = %v, want ErrNotFound", err)
+	}
 	if _, err = store.BlockData(context.Background(), block); err != nil {
 		t.Fatalf("block data after tail truncation: %v", err)
+	}
+}
+
+func TestAbandonPendingArchivePackTruncatesTail(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testArchivePruneBlock(42, 0x42)
+	refs, _, err := store.appendArchiveEntries([]archiveAppendRequest{{
+		kind:  packfile.KindBlock,
+		block: block,
+		meta: &storage.BlockMeta{
+			ID:       block,
+			GenUTime: 4200,
+			StartLT:  42,
+			EndLT:    43,
+		},
+		data: []byte{0x42},
+	}})
+	if err != nil {
+		t.Fatalf("append archive entry: %v", err)
+	}
+	if len(refs) != 1 || refs[0] == nil {
+		t.Fatalf("archive refs = %#v, want one ref", refs)
+	}
+
+	path := store.artifactPath(refs[0].Path)
+	pending, ok := store.pendingArchiveSync[path]
+	if !ok {
+		t.Fatalf("missing pending archive sync for %s", path)
+	}
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat appended archive pack: %v", err)
+	}
+	if stat.Size() <= pending.cleanSize {
+		t.Fatalf("appended archive pack size = %d, clean size = %d", stat.Size(), pending.cleanSize)
+	}
+
+	store.abandonPendingArtifactPacks()
+
+	stat, err = os.Stat(path)
+	if pending.cleanSize == 0 && errors.Is(err, os.ErrNotExist) {
+		stat = nil
+	} else if err != nil {
+		t.Fatalf("stat truncated archive pack: %v", err)
+	}
+	if stat != nil && stat.Size() != pending.cleanSize {
+		t.Fatalf("archive pack size = %d, want %d", stat.Size(), pending.cleanSize)
+	}
+	if len(store.pendingArchiveSync) != 0 {
+		t.Fatalf("pending archive sync entries = %d, want 0", len(store.pendingArchiveSync))
+	}
+	if _, err = store.getHotCopy(context.Background(), hotKeyPackAppendDirty(refs[0].Path)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("dirty append marker after abandon = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1034,6 +1797,10 @@ func testArchivePruneBlock(seqno uint32, seed byte) ton.BlockIDExt {
 	}
 }
 
+func testShardID(value uint64) int64 {
+	return int64(value)
+}
+
 func testServedBlockID(workchain int32, shard int64, seqno uint32, seed byte) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: workchain,
@@ -1042,6 +1809,51 @@ func testServedBlockID(workchain int32, shard int64, seqno uint32, seed byte) to
 		RootHash:  bytes.Repeat([]byte{seed}, 32),
 		FileHash:  bytes.Repeat([]byte{seed + 1}, 32),
 	}
+}
+
+func testArchivePackageCacheBlock(block ton.BlockIDExt, blockData []byte, proofData []byte) *storage.ServedBlockFull {
+	return &storage.ServedBlockFull{
+		ID:    block,
+		Block: blockData,
+		Proof: proofData,
+		Meta: &storage.BlockMeta{
+			ID:       block,
+			GenUTime: block.SeqNo * 10,
+			StartLT:  uint64(block.SeqNo),
+			EndLT:    uint64(block.SeqNo + 1),
+		},
+	}
+}
+
+func warmArchivePackageMetaCache(t *testing.T, store *Store, ctx context.Context, block ton.BlockIDExt) (int64, int64) {
+	t.Helper()
+
+	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo), block.Workchain, block.Shard)
+	if err != nil {
+		t.Fatalf("archive info: %v", err)
+	}
+	raw, err := store.getHotCopy(ctx, hotKeyArchivePackage(archiveID))
+	if err != nil {
+		t.Fatalf("load archive package meta: %v", err)
+	}
+	meta, err := decodeArchivePackageMeta(raw)
+	if err != nil {
+		t.Fatalf("decode archive package meta: %v", err)
+	}
+	if meta.size <= 0 {
+		t.Fatalf("archive package size = %d, want positive", meta.size)
+	}
+	if meta.size > int64(^uint32(0)>>1) {
+		t.Fatalf("archive package size = %d, too large for test", meta.size)
+	}
+	data, err := store.ArchiveSlice(ctx, archiveID, 0, int32(meta.size))
+	if err != nil {
+		t.Fatalf("warm archive package meta cache: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("archive package warm read returned empty data")
+	}
+	return archiveID, meta.size
 }
 
 func TestArtifactSlicesReturnNotFoundOnTruncatedFiles(t *testing.T) {
@@ -1066,7 +1878,11 @@ func TestArtifactSlicesReturnNotFoundOnTruncatedFiles(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x04}, 32),
 	}
 
-	statePath := filepath.Join(store.StateFilesDir(), "state-truncated")
+	stateName, err := storage.PersistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("state file name: %v", err)
+	}
+	statePath := filepath.Join(store.StateFilesDir(), stateName)
 	if err = os.WriteFile(statePath, []byte{1, 2, 3, 4, 5}, 0o644); err != nil {
 		t.Fatalf("write state file: %v", err)
 	}
@@ -1101,15 +1917,15 @@ func TestArtifactSlicesReturnNotFoundOnTruncatedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("archive info: %v", err)
 	}
-	rawArchiveRef, err := store.getHotCopy(context.Background(), hotKeyArchiveFile(archiveID))
+	rawArchiveRef, err := store.getHotCopy(context.Background(), hotKeyArchivePackage(archiveID))
 	if err != nil {
-		t.Fatalf("load archive file ref: %v", err)
+		t.Fatalf("load archive package meta: %v", err)
 	}
-	archiveRef, err := decodeArtifactRef(rawArchiveRef)
+	archiveRef, err := decodeArchivePackageMeta(rawArchiveRef)
 	if err != nil {
-		t.Fatalf("decode archive file ref: %v", err)
+		t.Fatalf("decode archive package meta: %v", err)
 	}
-	archivePath := store.artifactPath(archiveRef.Path)
+	archivePath := store.artifactPath(archiveRef.path)
 	stat, err := os.Stat(archivePath)
 	if err != nil {
 		t.Fatalf("stat archive file: %v", err)
@@ -1144,7 +1960,11 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x04}, 32),
 	}
 	data := []byte{1, 2, 3, 4, 5, 6}
-	path := filepath.Join(store.StateFilesDir(), "state-test")
+	name, err := storage.PersistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	path := filepath.Join(store.StateFilesDir(), name)
 	if err = os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write state file: %v", err)
 	}
@@ -1399,7 +2219,11 @@ func saveTestPersistentStatePruneFile(t *testing.T, store *Store, master ton.Blo
 	t.Helper()
 
 	data := []byte{byte(master.SeqNo)}
-	path := filepath.Join(store.StateFilesDir(), fmt.Sprintf("state-prune-%d", master.SeqNo))
+	name, err := storage.PersistentStateFileName(master, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	path := filepath.Join(store.StateFilesDir(), name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir state dir: %v", err)
 	}

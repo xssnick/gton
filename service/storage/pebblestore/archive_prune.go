@@ -241,7 +241,8 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 			hotKeyBlockDataRef(block),
 			hotKeyProofRef(storage.ServedProofBlock, block),
 			hotKeyProofRef(storage.ServedProofBlockLink, block),
-			hotKeyNextBlock(block),
+			hotKeyKeyProofRef(storage.ServedProofKeyBlock, block),
+			hotKeyKeyProofRef(storage.ServedProofKeyBlockLink, block),
 		}
 		if meta.EndLT != 0 {
 			keys = append(keys, hotKeyBlockLTIndex(meta))
@@ -266,8 +267,8 @@ func archivePruneDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, 
 	if block.Workchain == -1 && block.Shard == topShard {
 		return block.SeqNo < beforeSeqno
 	}
-	if meta != nil && meta.MasterchainRef != nil {
-		return meta.MasterchainRef.SeqNo < beforeSeqno
+	if meta != nil && meta.MasterchainRefKnown() {
+		return meta.MasterchainRefSeqno < beforeSeqno
 	}
 	if meta != nil && meta.GenUTime != 0 && cutoffUnix != 0 {
 		return meta.GenUTime < cutoffUnix
@@ -309,10 +310,11 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 			return nil, 0, deletedKeys, err
 		}
 		deletedKeys++
-		if err := batch.Delete(hotKeyArchiveFile(pkg.archiveID), pebble.NoSync); err != nil {
+	}
+	for path := range pathSet {
+		if err := s.setPackDeletePending(batch, path); err != nil {
 			return nil, 0, deletedKeys, err
 		}
-		deletedKeys++
 	}
 
 	iter, err := db.NewIter(&pebble.IterOptions{
@@ -331,11 +333,11 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 		default:
 		}
 		key := iter.Key()
-		if len(key) != len(hotPrefixArchiveInfo)+4+4+8 {
+		if len(key) != len(hotPrefixArchiveInfo)+4+4+4+8 {
 			return nil, 0, deletedKeys, fmt.Errorf("invalid archive info key size %d", len(key))
 		}
-		seqno := binary.BigEndian.Uint32(key[len(hotPrefixArchiveInfo) : len(hotPrefixArchiveInfo)+4])
-		if seqno >= beforeSeqno {
+		startSeqno := binary.BigEndian.Uint32(key[len(hotPrefixArchiveInfo)+4 : len(hotPrefixArchiveInfo)+8])
+		if startSeqno >= beforeSeqno {
 			continue
 		}
 		if err := batch.Delete(bytes.Clone(key), pebble.NoSync); err != nil {
@@ -350,6 +352,7 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 	if err = batch.Commit(pebble.Sync); err != nil {
 		return nil, 0, deletedKeys, err
 	}
+	s.deleteArchivePackageCache(deletePackage)
 
 	paths := make([]string, 0, len(pathSet))
 	for path := range pathSet {
@@ -404,6 +407,9 @@ func (s *Store) removeArchivePackageFiles(paths []string) (int, uint64, error) {
 		if err := syncDir(dir); err != nil {
 			return deleted, deletedBytes, fmt.Errorf("sync archive package dir %s: %w", dir, err)
 		}
+	}
+	if err := s.clearPackDeletePending(paths); err != nil {
+		return deleted, deletedBytes, err
 	}
 	return deleted, deletedBytes, nil
 }

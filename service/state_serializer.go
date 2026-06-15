@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/logutil"
-	"github.com/xssnick/gton/service/p2p"
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
@@ -76,18 +75,6 @@ type serializedStateFile struct {
 	path     string
 	size     int64
 	fileHash []byte
-}
-
-type stateSerializationCompactionThrottler interface {
-	ThrottleCellCompactions() func()
-}
-
-type stateSerializationCleanupStore interface {
-	DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error
-}
-
-type stateSerializationGenerationCellSaver interface {
-	SaveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error
 }
 
 func newStateSerializer(logger zerolog.Logger, store storage.Storage, dir string, disableAutomatic bool) *stateSerializer {
@@ -303,11 +290,6 @@ func (s *stateSerializer) release(run *stateSerializationRun) {
 }
 
 func (s *stateSerializer) cleanupSerializedState(ctx context.Context, master ton.BlockIDExt, scope PersistentStateSerializationScope) error {
-	store, ok := s.store.(stateSerializationCleanupStore)
-	if !ok {
-		return fmt.Errorf("storage %T does not support persistent state cleanup", s.store)
-	}
-
 	targets, err := s.loadTargets(ctx, master, scope)
 	if err != nil {
 		return err
@@ -315,12 +297,7 @@ func (s *stateSerializer) cleanupSerializedState(ctx context.Context, master ton
 
 	var cleanupErr error
 	for _, target := range targets {
-		loader, err := newLargeBOCStateLoader(ctx, s.store, target.state.CellGeneration)
-		if err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("create cleanup loader for %s: %w", storage.FormatBlockRef(target.block), err))
-			continue
-		}
-
+		loader := newLargeBOCStateLoader(ctx, s.store, target.state.CellGeneration)
 		root, err := s.lazyStateRoot(ctx, target, loader.Load)
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("load cleanup state root %s: %w", storage.FormatBlockRef(target.block), err))
@@ -334,7 +311,7 @@ func (s *stateSerializer) cleanupSerializedState(ctx context.Context, master ton
 		}
 
 		for _, part := range parts {
-			err = store.DeletePersistentStateFile(ctx, target.block, master, part.EffectiveShard)
+			err = s.store.DeletePersistentStateFile(ctx, target.block, master, part.EffectiveShard)
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
 			}
@@ -356,12 +333,7 @@ func (s *stateSerializer) cleanupSerializedState(ctx context.Context, master ton
 }
 
 func (s *stateSerializer) clearActiveSerializationMarker(ctx context.Context, master ton.BlockIDExt) error {
-	scheduler, ok := s.store.(persistentStateSchedulerStore)
-	if !ok {
-		return nil
-	}
-
-	active, err := scheduler.ActivePersistentStateSerialization(ctx)
+	active, err := s.store.ActivePersistentStateSerialization(ctx)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil
 	}
@@ -371,7 +343,7 @@ func (s *stateSerializer) clearActiveSerializationMarker(ctx context.Context, ma
 	if !active.Block.Equals(&master) {
 		return nil
 	}
-	return clearActivePersistentStateSerialization(ctx, scheduler, master)
+	return clearActivePersistentStateSerialization(ctx, s.store, master)
 }
 
 func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope PersistentStateSerializationScope) error {
@@ -402,11 +374,7 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 			Uint32("split_depth", target.splitDepth).
 			Msg("preparing persistent state serialization")
 
-		loader, err := newLargeBOCStateLoader(ctx, s.store, target.state.CellGeneration)
-		if err != nil {
-			return err
-		}
-
+		loader := newLargeBOCStateLoader(ctx, s.store, target.state.CellGeneration)
 		root, err := s.lazyStateRoot(ctx, target, loader.Load)
 		if err != nil {
 			return fmt.Errorf("load lazy %s state root %s: %w", target.kind, storage.FormatBlockRef(target.block), err)
@@ -597,12 +565,9 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 		}
 	}
 
-	loader, err := newLargeBOCStateLoader(ctx, s.store, target.state.CellGeneration)
-	if err != nil {
-		return serializedStateFile{}, err
-	}
+	loader := newLargeBOCStateLoader(ctx, s.store, target.state.CellGeneration)
 
-	if err = os.MkdirAll(s.targetDir(), 0o755); err != nil {
+	if err = os.MkdirAll(s.dir, 0o755); err != nil {
 		return serializedStateFile{}, err
 	}
 
@@ -610,7 +575,7 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 	if err != nil {
 		return serializedStateFile{}, err
 	}
-	tmp, err := os.CreateTemp(s.targetDir(), "."+filepath.Base(finalPath)+".*.tmp")
+	tmp, err := os.CreateTemp(s.dir, "."+filepath.Base(finalPath)+".*.tmp")
 	if err != nil {
 		return serializedStateFile{}, err
 	}
@@ -668,11 +633,7 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 }
 
 func throttleStateSerializationCompactions(store storage.Storage) func() {
-	throttler, ok := store.(stateSerializationCompactionThrottler)
-	if !ok {
-		return func() {}
-	}
-	return throttler.ThrottleCellCompactions()
+	return store.ThrottleCellCompactions()
 }
 
 func (s *stateSerializer) lazyStateRoot(ctx context.Context, target stateSerializationTarget, loader cell.LazyCellLoader) (*cell.Cell, error) {
@@ -688,15 +649,15 @@ func (s *stateSerializer) lazyStateRoot(ctx context.Context, target stateSeriali
 }
 
 func (s *stateSerializer) saveCellsForTarget(ctx context.Context, target stateSerializationTarget, records []*storage.CellRecord) error {
-	if store, ok := s.store.(stateSerializationGenerationCellSaver); ok && target.state.CellGeneration != 0 {
-		return store.SaveCellsInGeneration(ctx, target.state.CellGeneration, records)
+	if target.state.CellGeneration != 0 {
+		return s.store.SaveCellsInGeneration(ctx, target.state.CellGeneration, records)
 	}
 	return s.store.SaveCells(records)
 }
 
 func (s *stateSerializer) cellRecordForTarget(ctx context.Context, target stateSerializationTarget, hash []byte) (*storage.CellRecord, error) {
-	if store, ok := s.store.(stateSerializationGenerationCellStore); ok && target.state.CellGeneration != 0 {
-		return store.CellRecordInGeneration(ctx, target.state.CellGeneration, hash)
+	if target.state.CellGeneration != 0 {
+		return s.store.CellRecordInGeneration(ctx, target.state.CellGeneration, hash)
 	}
 	return s.store.CellRecord(ctx, hash)
 }
@@ -746,16 +707,12 @@ func splitStateCellRecords(ctx context.Context, root *cell.Cell) ([]*storage.Cel
 	return records, nil
 }
 
-func (s *stateSerializer) targetDir() string {
-	return s.dir
-}
-
 func (s *stateSerializer) serializedStatePath(master ton.BlockIDExt, block ton.BlockIDExt, effectiveShard int64) (string, error) {
-	name, err := p2p.PersistentStateFileName(block, master, effectiveShard)
+	name, err := storage.PersistentStateFileName(block, master, effectiveShard)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(s.targetDir(), name), nil
+	return filepath.Join(s.dir, name), nil
 }
 
 func persistentStateBOCOptions() cell.BOCSerializeOptions {
@@ -812,32 +769,6 @@ func stateSerializationLogBlock(target stateSerializationTarget, part state2.Per
 	return block
 }
 
-type largeBOCStateStore interface {
-	LargeBOCLoadMeta(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error)
-	LargeBOCLoadPayload(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error)
-}
-
-type largeBOCOnePassStateStore interface {
-	LargeBOCLoadCells(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error)
-}
-
-type largeBOCGenerationStateStore interface {
-	LargeBOCLoadMetaInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error)
-	LargeBOCLoadPayloadInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error)
-}
-
-type largeBOCOnePassGenerationStateStore interface {
-	LargeBOCLoadCellsInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error)
-}
-
-type stateSerializationCellStore interface {
-	CellRecord(ctx context.Context, hash []byte) (*storage.CellRecord, error)
-}
-
-type stateSerializationGenerationCellStore interface {
-	CellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*storage.CellRecord, error)
-}
-
 const (
 	largeBOCStatePhaseMeta uint32 = iota
 	largeBOCStatePhasePayload
@@ -846,12 +777,7 @@ const (
 
 type largeBOCStateLoader struct {
 	ctx        context.Context
-	store      largeBOCStateStore
-	onePass    largeBOCOnePassStateStore
-	genStore   largeBOCGenerationStateStore
-	genOnePass largeBOCOnePassGenerationStateStore
-	cellStore  stateSerializationCellStore
-	genCells   stateSerializationGenerationCellStore
+	store      storage.Storage
 	generation uint64
 
 	phase              atomic.Uint32
@@ -866,31 +792,12 @@ type largeBOCStateLoader struct {
 	lastDataBatchNanos atomic.Int64
 }
 
-func newLargeBOCStateLoader(ctx context.Context, store storage.Storage, generation uint64) (*largeBOCStateLoader, error) {
-	largeStore, ok := store.(largeBOCStateStore)
-	if !ok {
-		return nil, fmt.Errorf("storage %T does not support large boc state loading", store)
-	}
-	onePass, ok := store.(largeBOCOnePassStateStore)
-	if !ok {
-		return nil, fmt.Errorf("storage %T does not support one-pass large boc state loading", store)
-	}
-	genStore, _ := store.(largeBOCGenerationStateStore)
-	genOnePass, _ := store.(largeBOCOnePassGenerationStateStore)
-	genCells, _ := store.(stateSerializationGenerationCellStore)
-	if generation != 0 && (genStore == nil || genOnePass == nil || genCells == nil) {
-		return nil, fmt.Errorf("storage %T does not support generation-scoped large boc state loading", store)
-	}
+func newLargeBOCStateLoader(ctx context.Context, store storage.Storage, generation uint64) *largeBOCStateLoader {
 	return &largeBOCStateLoader{
 		ctx:        ctx,
-		store:      largeStore,
-		onePass:    onePass,
-		genStore:   genStore,
-		genOnePass: genOnePass,
-		cellStore:  store,
-		genCells:   genCells,
+		store:      store,
 		generation: generation,
-	}, nil
+	}
 }
 
 func (l *largeBOCStateLoader) Load(hash cell.Hash) (*cell.Cell, error) {
@@ -903,9 +810,9 @@ func (l *largeBOCStateLoader) Load(hash cell.Hash) (*cell.Cell, error) {
 	var record *storage.CellRecord
 	var err error
 	if l.generation != 0 {
-		record, err = l.genCells.CellRecordInGeneration(l.ctx, l.generation, hash[:])
+		record, err = l.store.CellRecordInGeneration(l.ctx, l.generation, hash[:])
 	} else {
-		record, err = l.cellStore.CellRecord(l.ctx, hash[:])
+		record, err = l.store.CellRecord(l.ctx, hash[:])
 	}
 	if err != nil {
 		return nil, err
@@ -925,7 +832,7 @@ func (l *largeBOCStateLoader) LoadMeta(hashes []cell.Hash, dst []cell.LargeBOCMe
 	var err error
 	started := time.Now()
 	if l.generation != 0 {
-		records, err = l.genStore.LargeBOCLoadMetaInGeneration(l.ctx, l.generation, hashes, dst)
+		records, err = l.store.LargeBOCLoadMetaInGeneration(l.ctx, l.generation, hashes, dst)
 	} else {
 		records, err = l.store.LargeBOCLoadMeta(l.ctx, hashes, dst)
 	}
@@ -957,7 +864,7 @@ func (l *largeBOCStateLoader) LoadPayload(hashes []cell.Hash, dst []cell.LargeBO
 	var err error
 	started := time.Now()
 	if l.generation != 0 {
-		records, err = l.genStore.LargeBOCLoadPayloadInGeneration(l.ctx, l.generation, hashes, dst)
+		records, err = l.store.LargeBOCLoadPayloadInGeneration(l.ctx, l.generation, hashes, dst)
 	} else {
 		records, err = l.store.LargeBOCLoadPayload(l.ctx, hashes, dst)
 	}
@@ -989,9 +896,9 @@ func (l *largeBOCStateLoader) LoadCells(hashes []cell.Hash, dst []cell.LargeBOCR
 	var err error
 	started := time.Now()
 	if l.generation != 0 {
-		records, err = l.genOnePass.LargeBOCLoadCellsInGeneration(l.ctx, l.generation, hashes, dst)
+		records, err = l.store.LargeBOCLoadCellsInGeneration(l.ctx, l.generation, hashes, dst)
 	} else {
-		records, err = l.onePass.LargeBOCLoadCells(l.ctx, hashes, dst)
+		records, err = l.store.LargeBOCLoadCells(l.ctx, hashes, dst)
 	}
 	if err != nil {
 		return dst, err
@@ -1041,13 +948,14 @@ func startStateSerializationProgress(ctx context.Context, log zerolog.Logger, bl
 				loadBatches := loader.metaBatches.Load()
 				lastLoadBatchCells := loader.lastMetaBatchCells.Load()
 				lastLoadBatchElapsed := time.Duration(loader.lastMetaBatchNanos.Load())
-				if phase == largeBOCStatePhasePayload {
+				switch phase {
+				case largeBOCStatePhasePayload:
 					current = cellLoaded
 					phaseName = "load_payload"
 					loadBatches = loader.dataBatches.Load()
 					lastLoadBatchCells = loader.lastDataBatchCells.Load()
 					lastLoadBatchElapsed = time.Duration(loader.lastDataBatchNanos.Load())
-				} else if phase == largeBOCStatePhaseCells {
+				case largeBOCStatePhaseCells:
 					current = cellLoaded
 					phaseName = "load_cells"
 					loadBatches = loader.dataBatches.Load()

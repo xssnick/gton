@@ -55,12 +55,6 @@ type CompressedBlockStateProvider interface {
 	StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
 }
 
-type CompressedBlockStateProviderFunc func(context.Context, ton.BlockIDExt) (*cell.Cell, error)
-
-func (f CompressedBlockStateProviderFunc) StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
-	return f(ctx, block)
-}
-
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
 	if cached, err := n.popShardBroadcastBlock(block); err == nil {
 		return cached, nil
@@ -740,21 +734,6 @@ func (s *overlaySubscription) downloadNextFullFromPeer(ctx context.Context, chai
 	return *block, nil
 }
 
-func probeNextFullFromPeers(ctx context.Context, peers []*overlayPeer, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
-	return probeFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
-		peerLimit:       len(peers),
-		stagedPeerLimit: len(peers),
-	}, query, onFailure)
-}
-
-func probeNextFullFromPeersStaged(ctx context.Context, peers []*overlayPeer, peerLimit int, stagedPeerLimit int, stageDelay time.Duration, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
-	return probeFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
-		peerLimit:       peerLimit,
-		stagedPeerLimit: stagedPeerLimit,
-		stageDelay:      stageDelay,
-	}, query, onFailure)
-}
-
 type probeFullPeerOptions struct {
 	peerLimit         int
 	stagedPeerLimit   int
@@ -762,10 +741,6 @@ type probeFullPeerOptions struct {
 	maxElapsed        time.Duration
 	earlyFailureCount int
 	earlyFailureDelay time.Duration
-}
-
-func probeNextFullFromPeersWithOptions(ctx context.Context, peers []*overlayPeer, opts probeFullPeerOptions, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
-	return probeFullFromPeersWithOptions(ctx, peers, opts, query, onFailure)
 }
 
 func probeFullFromPeersWithOptions(ctx context.Context, peers []*overlayPeer, opts probeFullPeerOptions, query func(context.Context, *overlayPeer) (DownloadedBlock, error), onFailure func(*overlayPeer, error)) (*DownloadedBlock, error) {
@@ -1323,6 +1298,18 @@ func runConcurrentOverlayQueries(ctx context.Context, peers []*overlayPeer, para
 
 func (n *Node) decodeDownloadedBlock(ctx context.Context, resp tl.Serializable) (*DownloadedBlock, error) {
 	switch data := resp.(type) {
+	case tonnodeapi.DataFull:
+		downloaded, err := decodeRawDownloadedBlock("tonNode.dataFull", data.ID, data.Proof, data.Block, data.IsLink)
+		if err == nil || !n.IsHardfork(data.ID) {
+			return downloaded, err
+		}
+		return decodeRawDownloadedHardforkBlock("tonNode.dataFull", data.ID, data.Proof, data.Block, data.IsLink, err)
+	case DataFullCompressed:
+		downloaded, err := decodeCompressedBlock(data)
+		if err == nil || !n.IsHardfork(data.ID) {
+			return downloaded, err
+		}
+		return decodeCompressedHardforkBlock(data, err)
 	case DataFullCompressedV2:
 		return n.decodeDataFullCompressedV2(ctx, data)
 	default:
@@ -1365,6 +1352,22 @@ func decodeCompressedBlock(data DataFullCompressed) (*DownloadedBlock, error) {
 	return newVerifiedDownloadedBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, roots[0], roots[1])
 }
 
+func decodeCompressedHardforkBlock(data DataFullCompressed, cause error) (*DownloadedBlock, error) {
+	decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
+	if err != nil {
+		return nil, cause
+	}
+
+	roots, err := cell.FromBOCMultiRoot(decompressed)
+	if err != nil || len(roots) != 2 {
+		return nil, cause
+	}
+
+	proof := cell.ToBOCWithOptions([]*cell.Cell{roots[0]}, cell.BOCSerializeOptions{WithCRC32C: false})
+	block := serializeCompressedBlockRoot(roots[1])
+	return newVerifiedDownloadedHardforkBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, roots[0], roots[1], cause)
+}
+
 func decodeCompressedBlockV2(data DataFullCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
 	proofRoot, err := parseDownloadedBlockProof("tonNode.dataFullCompressedV2", data.Proof)
 	if err != nil {
@@ -1384,7 +1387,11 @@ func (n *Node) decodeDataFullCompressedV2(ctx context.Context, data DataFullComp
 		return nil, fmt.Errorf("check tonNode.dataFullCompressedV2 compression: %w", err)
 	}
 	if !needState {
-		return decodeCompressedBlockV2WithProofRoot(data, nil, proofRoot)
+		downloaded, err := decodeCompressedBlockV2WithProofRoot(data, nil, proofRoot)
+		if err == nil || !n.IsHardfork(data.ID) {
+			return downloaded, err
+		}
+		return decodeCompressedBlockV2WithProofRootForHardfork(data, nil, proofRoot, err)
 	}
 
 	if ctx == nil {
@@ -1397,7 +1404,11 @@ func (n *Node) decodeDataFullCompressedV2(ctx context.Context, data DataFullComp
 		}
 		return nil, err
 	}
-	return decodeCompressedBlockV2WithProofRoot(data, state, proofRoot)
+	downloaded, err := decodeCompressedBlockV2WithProofRoot(data, state, proofRoot)
+	if err == nil || !n.IsHardfork(data.ID) {
+		return downloaded, err
+	}
+	return decodeCompressedBlockV2WithProofRootForHardfork(data, state, proofRoot, err)
 }
 
 func decodeCompressedBlockV2WithProofRoot(data DataFullCompressedV2, state *cell.Cell, proofRoot *cell.Cell) (*DownloadedBlock, error) {
@@ -1419,6 +1430,24 @@ func decodeCompressedBlockV2WithProofRoot(data DataFullCompressedV2, state *cell
 
 	block := serializeCompressedBlockRoot(roots[0])
 	return newVerifiedDownloadedBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, proofRoot, roots[0])
+}
+
+func decodeCompressedBlockV2WithProofRootForHardfork(data DataFullCompressedV2, state *cell.Cell, proofRoot *cell.Cell, cause error) (*DownloadedBlock, error) {
+	needState, err := cell.NeedStateForDecompression(data.BlockCompressed)
+	if err != nil {
+		return nil, cause
+	}
+	if needState && state == nil {
+		return nil, cause
+	}
+
+	roots, err := cell.DecompressBOC(data.BlockCompressed, maxDecompressedBlockSize, state)
+	if err != nil || len(roots) != 1 {
+		return nil, cause
+	}
+
+	block := serializeCompressedBlockRoot(roots[0])
+	return newVerifiedDownloadedHardforkBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, proofRoot, roots[0], cause)
 }
 
 func (n *Node) stateForCompressedBlockDecompression(ctx context.Context, block ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, error) {
@@ -1504,6 +1533,18 @@ func decodeRawDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data
 	return newVerifiedDownloadedBlock(kind, id, proof, data, isLink, proofRoot, blockRoot)
 }
 
+func decodeRawDownloadedHardforkBlock(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, cause error) (*DownloadedBlock, error) {
+	proofRoot, err := parseDownloadedBlockProof(kind, proof)
+	if err != nil {
+		return nil, cause
+	}
+	blockRoot, err := parseDownloadedBlockData(kind, data)
+	if err != nil {
+		return nil, cause
+	}
+	return newVerifiedDownloadedHardforkBlock(kind, id, proof, data, isLink, proofRoot, blockRoot, cause)
+}
+
 func parseDownloadedBlockProof(kind string, proof []byte) (*cell.Cell, error) {
 	if len(proof) == 0 {
 		return nil, fmt.Errorf("%s proof is empty", kind)
@@ -1529,6 +1570,18 @@ func parseDownloadedBlockData(kind string, data []byte) (*cell.Cell, error) {
 }
 
 func newVerifiedDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, blockRoot *cell.Cell) (*DownloadedBlock, error) {
+	return newVerifiedDownloadedBlockWithProofShape(kind, id, proof, data, isLink, proofRoot, blockRoot, false)
+}
+
+func newVerifiedDownloadedHardforkBlock(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, blockRoot *cell.Cell, cause error) (*DownloadedBlock, error) {
+	downloaded, err := newVerifiedDownloadedBlockWithProofShape(kind, id, proof, data, isLink, proofRoot, blockRoot, true)
+	if err != nil {
+		return nil, fmt.Errorf("%v; hardfork decode: %w", cause, err)
+	}
+	return downloaded, nil
+}
+
+func newVerifiedDownloadedBlockWithProofShape(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, blockRoot *cell.Cell, hardfork bool) (*DownloadedBlock, error) {
 	if len(proof) == 0 {
 		return nil, fmt.Errorf("%s proof is empty", kind)
 	}
@@ -1536,7 +1589,13 @@ func newVerifiedDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, da
 		return nil, fmt.Errorf("%s block is empty", kind)
 	}
 
-	if err := blockproof.CheckProofShape(id, proofRoot, isLink); err != nil {
+	var err error
+	if hardfork {
+		err = blockproof.CheckHardforkProofShape(id, proofRoot, isLink)
+	} else {
+		err = blockproof.CheckProofShape(id, proofRoot, isLink)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("%s proof shape: %w", kind, err)
 	}
 
@@ -1558,6 +1617,11 @@ func newVerifiedDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, da
 	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
 	if err != nil {
 		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, formatBlockRef(id), err)
+	}
+	if hardfork {
+		if err = blockproof.ValidateHardforkBlock(id, parsed); err != nil {
+			return nil, fmt.Errorf("%s validate hardfork block %s: %w", kind, formatBlockRef(id), err)
+		}
 	}
 	if parsed.StateUpdate == nil {
 		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))

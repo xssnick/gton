@@ -29,15 +29,17 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				return
 			}
 
-			if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); err != nil {
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
-				return
-			} else if ok {
-				if !s.sendShardStateDownload(ctx, downloads, shardStateDownload{prev: prev, block: downloaded, source: source, prepareElapsed: prepareElapsed}) {
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil {
+				if !s.sendShardStateDownload(ctx, downloads, shardStateDownload{prev: prev, block: cached.block, source: cached.source, prepareElapsed: cached.prepareElapsed}) {
 					return
 				}
-				prev = downloaded.ID
+				prev = cached.block.ID
 				continue
+			}
+			if !errors.Is(err, storage.ErrNotFound) {
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err})
+				return
 			}
 
 			indexed, err := s.lookupIndexedChainBlocks(ctx, prev, target, shardStateDownloadBuffer)

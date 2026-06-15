@@ -2,7 +2,6 @@ package metrics
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"time"
 
@@ -176,9 +175,6 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 
 	status, err := c.metrics.dbStatus(ctx)
-	if errors.Is(err, errMetricReaderNotConfigured) {
-		return
-	}
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(c.available, prometheus.GaugeValue, 0)
 		return

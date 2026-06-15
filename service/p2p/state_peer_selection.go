@@ -18,29 +18,39 @@ func downloadPeerID(peer *overlayPeer) PeerID {
 	return peer.id
 }
 
+type peerUse struct {
+	downloads   int
+	archivePins int
+}
+
 func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
 	peerID := downloadPeerID(peer)
 	if peerID.IsZero() {
 		return func() {}
 	}
 
-	n.downloadPeerMx.Lock()
-	if n.downloadPeerLeases == nil {
-		n.downloadPeerLeases = map[PeerID]int{}
+	n.peerUseMx.Lock()
+	if n.peerUse == nil {
+		n.peerUse = map[PeerID]peerUse{}
 	}
-	n.downloadPeerLeases[peerID]++
-	n.downloadPeerMx.Unlock()
+	use := n.peerUse[peerID]
+	use.downloads++
+	n.peerUse[peerID] = use
+	n.peerUseMx.Unlock()
 
 	return func() {
-		n.downloadPeerMx.Lock()
-		defer n.downloadPeerMx.Unlock()
+		n.peerUseMx.Lock()
+		defer n.peerUseMx.Unlock()
 
-		count := n.downloadPeerLeases[peerID]
-		if count <= 1 {
-			delete(n.downloadPeerLeases, peerID)
+		use := n.peerUse[peerID]
+		if use.downloads > 0 {
+			use.downloads--
+		}
+		if use.downloads == 0 && use.archivePins == 0 {
+			delete(n.peerUse, peerID)
 			return
 		}
-		n.downloadPeerLeases[peerID] = count - 1
+		n.peerUse[peerID] = use
 	}
 }
 
@@ -50,23 +60,95 @@ func (n *Node) downloadPeerLeaseCount(peer *overlayPeer) int {
 		return 0
 	}
 
-	n.downloadPeerMx.RLock()
-	defer n.downloadPeerMx.RUnlock()
-	return n.downloadPeerLeases[peerID]
+	n.peerUseMx.RLock()
+	defer n.peerUseMx.RUnlock()
+	return n.peerUse[peerID].downloads
 }
 
 func (n *Node) downloadPeerLeaseSnapshot(peers []*overlayPeer) map[PeerID]int {
 	leases := make(map[PeerID]int, len(peers))
-	n.downloadPeerMx.RLock()
-	defer n.downloadPeerMx.RUnlock()
+	n.peerUseMx.RLock()
+	defer n.peerUseMx.RUnlock()
 	for _, peer := range peers {
 		peerID := downloadPeerID(peer)
 		if peerID.IsZero() {
 			continue
 		}
-		leases[peerID] = n.downloadPeerLeases[peerID]
+		leases[peerID] = n.peerUse[peerID].downloads
 	}
 	return leases
+}
+
+func (n *Node) protectedPeerIDs() map[PeerID]struct{} {
+	if n == nil {
+		return nil
+	}
+
+	n.peerUseMx.RLock()
+	defer n.peerUseMx.RUnlock()
+
+	if len(n.peerUse) == 0 {
+		return nil
+	}
+
+	protected := make(map[PeerID]struct{}, len(n.peerUse))
+	for peerID, use := range n.peerUse {
+		if use.downloads > 0 || use.archivePins > 0 {
+			protected[peerID] = struct{}{}
+		}
+	}
+	return protected
+}
+
+func (n *Node) acquireArchiveSessionPeer(peerID PeerID) func() {
+	if n == nil || peerID.IsZero() {
+		return func() {}
+	}
+
+	n.peerUseMx.Lock()
+	if n.peerUse == nil {
+		n.peerUse = map[PeerID]peerUse{}
+	}
+	use := n.peerUse[peerID]
+	use.archivePins++
+	n.peerUse[peerID] = use
+	n.peerUseMx.Unlock()
+
+	return func() {
+		n.peerUseMx.Lock()
+		defer n.peerUseMx.Unlock()
+
+		use := n.peerUse[peerID]
+		if use.archivePins > 0 {
+			use.archivePins--
+		}
+		if use.downloads == 0 && use.archivePins == 0 {
+			delete(n.peerUse, peerID)
+			return
+		}
+		n.peerUse[peerID] = use
+	}
+}
+
+func (n *Node) archiveSessionPinnedPeerIDs() map[PeerID]struct{} {
+	if n == nil {
+		return nil
+	}
+
+	n.peerUseMx.RLock()
+	defer n.peerUseMx.RUnlock()
+
+	if len(n.peerUse) == 0 {
+		return nil
+	}
+
+	pinned := make(map[PeerID]struct{}, len(n.peerUse))
+	for peerID, use := range n.peerUse {
+		if use.archivePins > 0 {
+			pinned[peerID] = struct{}{}
+		}
+	}
+	return pinned
 }
 
 func (n *Node) prioritizeStateSnapshotPeers(peers []*overlayPeer) []*overlayPeer {
@@ -258,8 +340,8 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 		return persistentStatePeerProbe{}, func() {}
 	}
 
-	n.downloadPeerMx.Lock()
-	defer n.downloadPeerMx.Unlock()
+	n.peerUseMx.Lock()
+	defer n.peerUseMx.Unlock()
 
 	bestIdx := 0
 	bestScore := math.Inf(-1)
@@ -267,7 +349,7 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 	bestSpeed := 0.0
 
 	for i, probe := range probes {
-		leases := n.downloadPeerLeases[downloadPeerID(probe.candidate.peer)]
+		leases := n.peerUse[downloadPeerID(probe.candidate.peer)].downloads
 		speed := probeBytesPerSecond(probe)
 		score := speed / float64(leases+1)
 
@@ -284,21 +366,26 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 	if selectedPeerID.IsZero() {
 		return selected, func() {}
 	}
-	if n.downloadPeerLeases == nil {
-		n.downloadPeerLeases = map[PeerID]int{}
+	if n.peerUse == nil {
+		n.peerUse = map[PeerID]peerUse{}
 	}
-	n.downloadPeerLeases[selectedPeerID]++
+	use := n.peerUse[selectedPeerID]
+	use.downloads++
+	n.peerUse[selectedPeerID] = use
 
 	return selected, func() {
-		n.downloadPeerMx.Lock()
-		defer n.downloadPeerMx.Unlock()
+		n.peerUseMx.Lock()
+		defer n.peerUseMx.Unlock()
 
-		count := n.downloadPeerLeases[selectedPeerID]
-		if count <= 1 {
-			delete(n.downloadPeerLeases, selectedPeerID)
+		use := n.peerUse[selectedPeerID]
+		if use.downloads > 0 {
+			use.downloads--
+		}
+		if use.downloads == 0 && use.archivePins == 0 {
+			delete(n.peerUse, selectedPeerID)
 			return
 		}
-		n.downloadPeerLeases[selectedPeerID] = count - 1
+		n.peerUse[selectedPeerID] = use
 	}
 }
 

@@ -60,6 +60,20 @@ type archivePackageMeta struct {
 	firstMasterLT    uint64
 }
 
+type archivePackDescriptor struct {
+	baseSeqno  uint32
+	startSeqno uint32
+	workchain  int32
+	shard      int64
+}
+
+type archivePackClaims struct {
+	byID         map[int64]archivePackDescriptor
+	byDescriptor map[archivePackDescriptor]int64
+	nextIndex    map[uint32]uint32
+	loadedBase   map[uint32]struct{}
+}
+
 type archiveAppendRequest struct {
 	kind       string
 	block      ton.BlockIDExt
@@ -85,8 +99,9 @@ type pendingPackSync struct {
 }
 
 type pendingPackWrite struct {
-	seq  uint64
-	size int64
+	seq       uint64
+	cleanSize int64
+	size      int64
 }
 
 type syncedArtifactPacks struct {
@@ -231,16 +246,30 @@ func (s *Store) clearSyncedPackFilesLocked(pending map[string]pendingPackWrite, 
 	}
 }
 
+func (s *Store) deleteSyncedPackAppendMarkers(batch *pebble.Batch, packs syncedArtifactPacks) error {
+	for _, item := range packs.archive {
+		if err := s.deletePackAppendDirty(batch, item.path); err != nil {
+			return err
+		}
+	}
+	for _, item := range packs.keyProof {
+		if err := s.deletePackAppendDirty(batch, item.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) abandonPendingArtifactPacks() {
 	s.artifactMu.Lock()
-	s.abandonPendingPackFilesLocked(s.pendingArchiveSync, s.dirtyArchivePacks)
-	s.abandonPendingPackFilesLocked(s.pendingKeyProofSync, s.dirtyKeyProofPacks)
+	s.abandonPendingPackFilesLocked(s.pendingArchiveSync)
+	s.abandonPendingPackFilesLocked(s.pendingKeyProofSync)
 	s.artifactMu.Unlock()
 }
 
-func (s *Store) abandonPendingPackFilesLocked(pending map[string]pendingPackWrite, dirty map[string]struct{}) {
-	for path := range pending {
-		s.markDirtyPackTail(dirty, path)
+func (s *Store) abandonPendingPackFilesLocked(pending map[string]pendingPackWrite) {
+	for path, write := range pending {
+		s.discardPackTail(path, write.cleanSize, "abandoned")
 		delete(pending, path)
 	}
 }
@@ -293,6 +322,7 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 	}
 
 	records := make([]archiveAppendRecord, 0, len(requests))
+	claimedArchiveIDs := newArchivePackClaims()
 	for idx, request := range requests {
 		masterSeqno, err := archiveEntryMasterSeqno(request.block, request.meta)
 		if err != nil {
@@ -303,7 +333,10 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 		if err != nil {
 			return nil, nil, err
 		}
-		location := archiveEntryLocationForBase(request.block, request.splitDepth, masterSeqno, baseSeqno)
+		location, err := s.archiveEntryLocationForBase(request.block, request.splitDepth, masterSeqno, baseSeqno, claimedArchiveIDs)
+		if err != nil {
+			return nil, nil, err
+		}
 
 		firstMasterSeq, firstMasterUTime, firstMasterLT, err := archiveEntryFirstMaster(request.block, request.meta)
 		if err != nil {
@@ -338,7 +371,7 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return nil, nil, err
 		}
-		if err := s.ensureCleanPackTail(path, s.pendingArchiveSync, s.dirtyArchivePacks); err != nil {
+		if err := s.ensureCleanPackTail(path, s.pendingArchiveSync); err != nil {
 			return nil, nil, err
 		}
 
@@ -350,7 +383,12 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 		appender, err := packfile.NewAppender(file)
 		if err != nil {
 			_ = file.Close()
-			s.markDirtyPackTail(s.dirtyArchivePacks, path)
+			return nil, nil, err
+		}
+		cleanSize := appender.Size()
+		relPath, cleanSize, err := s.beginPackAppend(s.pendingArchiveSync, path, cleanSize)
+		if err != nil {
+			_ = file.Close()
 			return nil, nil, err
 		}
 
@@ -360,14 +398,16 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 			ptr, appendErr := appender.Append(packfile.EntryName(record.request.kind, record.request.block), record.request.data)
 			if appendErr != nil {
 				_ = file.Close()
-				s.markDirtyPackTail(s.dirtyArchivePacks, path)
+				s.discardPackTail(path, cleanSize, "failed append")
 				return nil, nil, appendErr
 			}
 
 			ref := &storage.ArtifactRef{
-				Path:   s.relativeArtifactPath(path),
-				Offset: ptr.Offset,
-				Size:   ptr.Size,
+				Path:             relPath,
+				ArchivePackage:   true,
+				ArchivePackageID: record.location.archiveID,
+				Offset:           ptr.Offset,
+				Size:             ptr.Size,
 			}
 			refs[record.requestIndex] = ref
 
@@ -387,7 +427,7 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 				groupReg = reg
 			} else if mergeErr := mergeArchivePackRegistration(&groupReg, reg); mergeErr != nil {
 				_ = file.Close()
-				s.markDirtyPackTail(s.dirtyArchivePacks, path)
+				s.discardPackTail(path, cleanSize, "failed append registration")
 				return nil, nil, mergeErr
 			}
 			idx++
@@ -396,13 +436,13 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 		size := appender.Size()
 		closeErr := file.Close()
 		if closeErr != nil {
-			s.markDirtyPackTail(s.dirtyArchivePacks, path)
+			s.discardPackTail(path, cleanSize, "failed close")
 			return nil, nil, closeErr
 		}
 
 		groupReg.size = size
 		registrations = append(registrations, groupReg)
-		s.markPendingPackSync(s.pendingArchiveSync, path, size)
+		s.markPendingPackSync(s.pendingArchiveSync, path, cleanSize, size)
 	}
 
 	return refs, registrations, nil
@@ -446,7 +486,7 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	if err := s.ensureCleanPackTail(path, s.pendingKeyProofSync, s.dirtyKeyProofPacks); err != nil {
+	if err := s.ensureCleanPackTail(path, s.pendingKeyProofSync); err != nil {
 		return nil, err
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
@@ -457,25 +497,31 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 	appender, err := packfile.NewAppender(file)
 	if err != nil {
 		_ = file.Close()
-		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
+		return nil, err
+	}
+	cleanSize := appender.Size()
+	_, cleanSize, err = s.beginPackAppend(s.pendingKeyProofSync, path, cleanSize)
+	if err != nil {
+		_ = file.Close()
 		return nil, err
 	}
 	ptr, err := appender.Append(packfile.EntryName(packEntryKindForProofKind(kind), block), data)
 	if err != nil {
 		_ = file.Close()
-		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
+		s.discardPackTail(path, cleanSize, "failed append")
 		return nil, err
 	}
 	size := appender.Size()
 	if err = file.Close(); err != nil {
-		s.markDirtyPackTail(s.dirtyKeyProofPacks, path)
+		s.discardPackTail(path, cleanSize, "failed close")
 		return nil, err
 	}
-	s.markPendingPackSync(s.pendingKeyProofSync, path, size)
+	s.markPendingPackSync(s.pendingKeyProofSync, path, cleanSize, size)
 	return &storage.ArtifactRef{
-		Path:   s.relativeArtifactPath(path),
-		Offset: ptr.Offset,
-		Size:   ptr.Size,
+		ArchivePackage:   true,
+		ArchivePackageID: keyProofPackageRefID(keyProofPackageID(block.SeqNo)),
+		Offset:           ptr.Offset,
+		Size:             ptr.Size,
 	}, nil
 }
 
@@ -495,7 +541,7 @@ func (s *Store) archivePackPath(seqno uint32, workchain int32, shard int64) stri
 }
 
 func (s *Store) keyBlockProofPackPath(seqno uint32) string {
-	packageID := seqno - seqno%keyArchiveMasterchainBlocks
+	packageID := keyProofPackageID(seqno)
 	group := packageID / 1000000
 	return filepath.Join(
 		s.dir,
@@ -506,6 +552,18 @@ func (s *Store) keyBlockProofPackPath(seqno uint32) string {
 	)
 }
 
+func keyProofPackageID(seqno uint32) uint32 {
+	return seqno - seqno%keyArchiveMasterchainBlocks
+}
+
+func keyProofPackageRefID(packageID uint32) int64 {
+	return -1 - int64(packageID)
+}
+
+func keyProofPackageIDFromRef(refID int64) int64 {
+	return -1 - refID
+}
+
 type archiveEntryLocation struct {
 	archiveID  int64
 	baseSeqno  uint32
@@ -514,27 +572,28 @@ type archiveEntryLocation struct {
 	shard      int64
 }
 
-func (s *Store) archiveEntryLocation(block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32) (archiveEntryLocation, error) {
-	masterSeqno, err := archiveEntryMasterSeqno(block, meta)
+func (s *Store) archiveEntryLocationForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32, claimed *archivePackClaims) (archiveEntryLocation, error) {
+	desc := archiveEntryDescriptorForBase(block, splitDepth, masterSeqno, baseSeqno)
+	archiveID, err := s.archivePackIDForDescriptor(desc, claimed)
 	if err != nil {
 		return archiveEntryLocation{}, err
 	}
-
-	baseSeqno, err := s.archivePackageBaseSeqno(masterSeqno, archiveEntryIsKey(block, meta))
-	if err != nil {
-		return archiveEntryLocation{}, err
-	}
-	return archiveEntryLocationForBase(block, splitDepth, masterSeqno, baseSeqno), nil
+	return archiveEntryLocation{
+		archiveID:  archiveID,
+		baseSeqno:  desc.baseSeqno,
+		sliceSeqno: desc.startSeqno,
+		workchain:  desc.workchain,
+		shard:      desc.shard,
+	}, nil
 }
 
-func archiveEntryLocationForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32) archiveEntryLocation {
+func archiveEntryDescriptorForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32) archivePackDescriptor {
 	sliceSeqno := archiveSliceSeqno(baseSeqno, masterSeqno)
 	workchain, shard := archiveEntryShardPrefix(block, splitDepth)
 
-	return archiveEntryLocation{
-		archiveID:  archivePackID(baseSeqno, sliceSeqno, workchain, shard),
+	return archivePackDescriptor{
 		baseSeqno:  baseSeqno,
-		sliceSeqno: sliceSeqno,
+		startSeqno: sliceSeqno,
 		workchain:  workchain,
 		shard:      shard,
 	}
@@ -548,10 +607,10 @@ func archiveEntryMasterSeqno(block ton.BlockIDExt, meta *storage.BlockMeta) (uin
 	if block.Workchain == -1 && block.Shard == topShard {
 		return block.SeqNo, nil
 	}
-	if meta == nil || meta.MasterchainRef == nil {
+	if meta == nil || !meta.MasterchainRefKnown() {
 		return 0, fmt.Errorf("masterchain reference is required for archive shard block %s", storage.FormatBlockRef(block))
 	}
-	return meta.MasterchainRef.SeqNo, nil
+	return meta.MasterchainRefSeqno, nil
 }
 
 func archiveEntryFirstMaster(block ton.BlockIDExt, meta *storage.BlockMeta) (uint32, uint32, uint64, error) {
@@ -601,42 +660,260 @@ func archiveSliceSeqno(baseSeqno uint32, masterSeqno uint32) uint32 {
 	return baseSeqno + ((masterSeqno-baseSeqno)/archiveSliceMasterchainBlocks)*archiveSliceMasterchainBlocks
 }
 
-func archivePackID(baseSeqno uint32, sliceSeqno uint32, workchain int32, shard int64) int64 {
-	idx := archivePackIndex(baseSeqno, sliceSeqno, workchain, shard)
-	return int64(uint64(idx)<<32 | uint64(baseSeqno))
+const archiveFirstDynamicPackageIndex uint32 = 1
+
+func (s *Store) archivePackIDForDescriptor(desc archivePackDescriptor, claimed *archivePackClaims) (int64, error) {
+	if claimed == nil {
+		existing, err := s.lookupArchivePackID(desc)
+		if err == nil {
+			return existing, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return 0, err
+		}
+
+		if archivePackDescriptorIsBaseMaster(desc) {
+			return archivePackageID(desc.baseSeqno, 0), nil
+		}
+
+		next, err := s.nextArchivePackageIndex(desc.baseSeqno)
+		if err != nil {
+			return 0, err
+		}
+		return archivePackageID(desc.baseSeqno, next), nil
+	}
+
+	if err := s.loadArchivePackClaimsBase(claimed, desc.baseSeqno); err != nil {
+		return 0, err
+	}
+	return archivePackIDFromClaims(desc, claimed)
 }
 
-func archivePackIndex(baseSeqno uint32, sliceSeqno uint32, workchain int32, shard int64) uint32 {
-	sliceIndex := uint32(0)
-	if sliceSeqno > baseSeqno {
-		sliceIndex = (sliceSeqno - baseSeqno) / archiveSliceMasterchainBlocks
+func archivePackIDFromClaims(desc archivePackDescriptor, claimed *archivePackClaims) (int64, error) {
+	if archiveID, ok := claimed.archiveID(desc); ok {
+		return archiveID, nil
 	}
-	idx := sliceIndex * archivePackIndexSliceStride
-	if workchain == -1 && shard == topShard {
-		return idx
+
+	if archivePackDescriptorIsBaseMaster(desc) {
+		id := archivePackageID(desc.baseSeqno, 0)
+		if !claimed.claim(id, desc) {
+			return 0, archivePackClaimError(claimed, id, desc)
+		}
+		return id, nil
 	}
-	return idx + 1 + archiveShardIndex(workchain, shard)
+
+	next := claimed.nextPackageIndex(desc.baseSeqno)
+	for index := next; index >= archiveFirstDynamicPackageIndex; index++ {
+		id := archivePackageID(desc.baseSeqno, index)
+		if claimed.claim(id, desc) {
+			claimed.advancePackageIndex(desc.baseSeqno, index)
+			return id, nil
+		}
+		if index == ^uint32(0) {
+			break
+		}
+	}
+	return 0, fmt.Errorf("archive package index exhausted for base=%d start=%d wc=%d shard=%016x", desc.baseSeqno, desc.startSeqno, desc.workchain, uint64(desc.shard))
 }
 
-const (
-	archivePackIndexSliceStride     = 1 << 20
-	archivePackIndexMaxShardDepth   = 12
-	archivePackIndexWorkchainStride = 1 << (archivePackIndexMaxShardDepth + 1)
-)
-
-func archiveShardIndex(workchain int32, shard int64) uint32 {
-	workchainOffset := uint32(workchain+1) * archivePackIndexWorkchainStride
-	depth := archiveShardPrefixLength(shard)
-	if depth <= 0 {
-		return workchainOffset
-	}
-	if depth > archivePackIndexMaxShardDepth {
-		depth = archivePackIndexMaxShardDepth
+func (s *Store) loadArchivePackClaimsBase(claimed *archivePackClaims, baseSeqno uint32) error {
+	if claimed.baseLoaded(baseSeqno) {
+		return nil
 	}
 
-	prefix := uint64(shard) >> (64 - depth)
-	shardOffset := (uint32(1) << uint(depth)) - 1 + uint32(prefix)
-	return workchainOffset + shardOffset
+	db, err := s.acquireHotDB(context.Background())
+	if err != nil {
+		return err
+	}
+	defer s.releaseHotDB()
+
+	prefix := hotKeyArchiveInfoBasePrefix(baseSeqno)
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: appendPrefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = iter.Close() }()
+
+	nextIndex := archiveFirstDynamicPackageIndex
+	for valid := iter.First(); valid; valid = iter.Next() {
+		desc, err := decodeArchiveInfoKey(iter.Key())
+		if err != nil {
+			return err
+		}
+		raw := iter.Value()
+		if len(raw) != 8 {
+			return fmt.Errorf("invalid archive info payload")
+		}
+
+		archiveID := int64(binary.BigEndian.Uint64(raw))
+		if !claimed.claim(archiveID, desc) {
+			return archivePackClaimError(claimed, archiveID, desc)
+		}
+		if index := archivePackageIndex(archiveID); index >= archiveFirstDynamicPackageIndex && index != ^uint32(0) {
+			next := index + 1
+			if next > nextIndex {
+				nextIndex = next
+			}
+		}
+	}
+	if err = iter.Error(); err != nil {
+		return err
+	}
+
+	storedNext, err := s.nextArchivePackageIndex(baseSeqno)
+	if err != nil {
+		return err
+	}
+	if storedNext > nextIndex {
+		nextIndex = storedNext
+	}
+	claimed.markBaseLoaded(baseSeqno, nextIndex)
+	return nil
+}
+
+func newArchivePackClaims() *archivePackClaims {
+	return &archivePackClaims{
+		byID:         make(map[int64]archivePackDescriptor),
+		byDescriptor: make(map[archivePackDescriptor]int64),
+		nextIndex:    make(map[uint32]uint32),
+		loadedBase:   make(map[uint32]struct{}),
+	}
+}
+
+func (c *archivePackClaims) archiveID(desc archivePackDescriptor) (int64, bool) {
+	archiveID, ok := c.byDescriptor[desc]
+	return archiveID, ok
+}
+
+func (c *archivePackClaims) claim(id int64, desc archivePackDescriptor) bool {
+	if archiveID, ok := c.byDescriptor[desc]; ok {
+		return archiveID == id
+	}
+	if used, ok := c.byID[id]; ok && used != desc {
+		return false
+	}
+	c.byID[id] = desc
+	c.byDescriptor[desc] = id
+	return true
+}
+
+func (c *archivePackClaims) baseLoaded(baseSeqno uint32) bool {
+	_, ok := c.loadedBase[baseSeqno]
+	return ok
+}
+
+func (c *archivePackClaims) markBaseLoaded(baseSeqno uint32, nextIndex uint32) {
+	c.loadedBase[baseSeqno] = struct{}{}
+	c.nextIndex[baseSeqno] = nextIndex
+}
+
+func (c *archivePackClaims) nextPackageIndex(baseSeqno uint32) uint32 {
+	next, ok := c.nextIndex[baseSeqno]
+	if !ok || next < archiveFirstDynamicPackageIndex {
+		return archiveFirstDynamicPackageIndex
+	}
+	return next
+}
+
+func (c *archivePackClaims) advancePackageIndex(baseSeqno uint32, index uint32) {
+	if index == ^uint32(0) {
+		return
+	}
+	next := index + 1
+	if next > c.nextIndex[baseSeqno] {
+		c.nextIndex[baseSeqno] = next
+	}
+}
+
+func archivePackClaimError(claimed *archivePackClaims, id int64, desc archivePackDescriptor) error {
+	if used, ok := claimed.byID[id]; ok && used != desc {
+		return fmt.Errorf("archive package id collision archive_id=%d old={%s} new={%s}", id, archivePackDescriptorString(used), archivePackDescriptorString(desc))
+	}
+	if existing, ok := claimed.byDescriptor[desc]; ok && existing != id {
+		return fmt.Errorf("archive package descriptor already assigned archive_id=%d new_archive_id=%d desc={%s}", existing, id, archivePackDescriptorString(desc))
+	}
+	return fmt.Errorf("archive package id claim failed archive_id=%d desc={%s}", id, archivePackDescriptorString(desc))
+}
+
+func archivePackDescriptorString(desc archivePackDescriptor) string {
+	return fmt.Sprintf("base=%d start=%d wc=%d shard=%016x", desc.baseSeqno, desc.startSeqno, desc.workchain, uint64(desc.shard))
+}
+
+func decodeArchiveInfoKey(key []byte) (archivePackDescriptor, error) {
+	size := len(hotPrefixArchiveInfo) + 4 + 4 + 4 + 8
+	if len(key) != size || !bytes.HasPrefix(key, hotPrefixArchiveInfo) {
+		return archivePackDescriptor{}, fmt.Errorf("invalid archive info key")
+	}
+
+	pos := len(hotPrefixArchiveInfo)
+	desc := archivePackDescriptor{
+		baseSeqno:  binary.BigEndian.Uint32(key[pos : pos+4]),
+		startSeqno: binary.BigEndian.Uint32(key[pos+4 : pos+8]),
+		workchain:  int32(binary.BigEndian.Uint32(key[pos+8 : pos+12])),
+		shard:      int64(binary.BigEndian.Uint64(key[pos+12 : pos+20])),
+	}
+	return desc, nil
+}
+
+func (s *Store) lookupArchivePackID(desc archivePackDescriptor) (int64, error) {
+	raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchiveInfo(desc.baseSeqno, desc.startSeqno, desc.workchain, desc.shard))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = closer.Close() }()
+
+	if len(raw) != 8 {
+		return 0, fmt.Errorf("invalid archive info payload")
+	}
+	return int64(binary.BigEndian.Uint64(raw)), nil
+}
+
+func (s *Store) nextArchivePackageIndex(baseSeqno uint32) (uint32, error) {
+	raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchivePackageIndex(baseSeqno))
+	if errors.Is(err, storage.ErrNotFound) {
+		return archiveFirstDynamicPackageIndex, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = closer.Close() }()
+	if len(raw) != 4 {
+		return 0, fmt.Errorf("invalid archive package index payload")
+	}
+	next := binary.BigEndian.Uint32(raw)
+	if next < archiveFirstDynamicPackageIndex {
+		return 0, fmt.Errorf("invalid archive package next index %d for base=%d", next, baseSeqno)
+	}
+	return next, nil
+}
+
+func (s *Store) setArchivePackageNextIndex(batch *pebble.Batch, baseSeqno uint32, next uint32) error {
+	current, err := s.nextArchivePackageIndex(baseSeqno)
+	if err != nil {
+		return err
+	}
+	if next < archiveFirstDynamicPackageIndex {
+		return fmt.Errorf("invalid archive package next index %d for base=%d", next, baseSeqno)
+	}
+	if current >= next {
+		return nil
+	}
+	return batch.Set(hotKeyArchivePackageIndex(baseSeqno), binary.BigEndian.AppendUint32(nil, next), pebble.NoSync)
+}
+
+func archivePackageID(baseSeqno uint32, index uint32) int64 {
+	return int64(uint64(index)<<32 | uint64(baseSeqno))
+}
+
+func archivePackageIndex(archiveID int64) uint32 {
+	return uint32(uint64(archiveID) >> 32)
+}
+
+func archivePackDescriptorIsBaseMaster(desc archivePackDescriptor) bool {
+	return desc.startSeqno == desc.baseSeqno && desc.workchain == -1 && desc.shard == topShard
 }
 
 func archiveShardPrefixLength(shard int64) int {
@@ -761,13 +1038,8 @@ func (s *Store) registerArchivePacks(batch *pebble.Batch, registrations []archiv
 	}
 
 	packageStarts := make(map[uint32]struct{}, len(registrations))
+	nextPackageIndex := make(map[uint32]uint32)
 	for _, reg := range registrations {
-		if err := s.setArchiveFileRef(batch, reg.archiveID, &storage.ArtifactRef{
-			Path: reg.path,
-			Size: reg.size,
-		}); err != nil {
-			return err
-		}
 		if _, ok := packageStarts[reg.baseSeq]; !ok {
 			if err := s.setArchivePackageStart(batch, reg.baseSeq); err != nil {
 				return err
@@ -777,7 +1049,18 @@ func (s *Store) registerArchivePacks(batch *pebble.Batch, registrations []archiv
 		if err := s.setArchivePackageMeta(batch, reg); err != nil {
 			return err
 		}
-		if err := s.registerArchiveInfoRange(batch, reg.startSeq, reg.workchain, reg.shard, reg.archiveID); err != nil {
+		if err := s.registerArchiveInfo(batch, reg.baseSeq, reg.startSeq, reg.workchain, reg.shard, reg.archiveID); err != nil {
+			return err
+		}
+		if index := archivePackageIndex(reg.archiveID); index >= archiveFirstDynamicPackageIndex {
+			next := index + 1
+			if next > nextPackageIndex[reg.baseSeq] {
+				nextPackageIndex[reg.baseSeq] = next
+			}
+		}
+	}
+	for baseSeqno, next := range nextPackageIndex {
+		if err := s.setArchivePackageNextIndex(batch, baseSeqno, next); err != nil {
 			return err
 		}
 	}
@@ -913,29 +1196,57 @@ func (s *Store) setArchivePackageMeta(batch *pebble.Batch, reg archivePackRegist
 	return batch.Set(key, encodeArchivePackageMeta(meta), pebble.NoSync)
 }
 
-func (s *Store) setArchiveFileRef(batch *pebble.Batch, archiveID int64, ref *storage.ArtifactRef) error {
-	key := hotKeyArchiveFile(archiveID)
-	old, closer, err := pebbleReaderGet(s.hot, key)
-	if err == nil {
-		defer func() { _ = closer.Close() }()
-		current, err := decodeArtifactRef(old)
-		if err != nil {
-			return err
-		}
-		if current.Path != ref.Path {
-			return fmt.Errorf("archive file ref path mismatch archive_id=%d old=%s new=%s", archiveID, current.Path, ref.Path)
-		}
-		if current.Size >= ref.Size {
-			return nil
-		}
-	} else if !errors.Is(err, storage.ErrNotFound) {
-		return err
+func (s *Store) archivePackageMetaByID(ctx context.Context, archiveID int64) (archivePackageMeta, error) {
+	s.archivePackagesMu.RLock()
+	if meta, ok := s.archivePackages[archiveID]; ok {
+		s.archivePackagesMu.RUnlock()
+		return meta, nil
 	}
-	return batch.Set(key, encodeArtifactRef(ref), pebble.NoSync)
+	s.archivePackagesMu.RUnlock()
+
+	raw, err := s.getHotCopy(ctx, hotKeyArchivePackage(archiveID))
+	if err != nil {
+		return archivePackageMeta{}, err
+	}
+	meta, err := decodeArchivePackageMeta(raw)
+	if err != nil {
+		return archivePackageMeta{}, err
+	}
+
+	s.archivePackagesMu.Lock()
+	s.archivePackages[archiveID] = meta
+	s.archivePackagesMu.Unlock()
+	return meta, nil
 }
 
-func (s *Store) registerArchiveInfoRange(batch *pebble.Batch, startSeq uint32, workchain int32, shard int64, archiveID int64) error {
-	registered, err := s.archiveInfoRangeRegistered(startSeq, workchain, shard, archiveID)
+func (s *Store) deleteArchivePackageCache(ids map[int64]archivePackageMeta) {
+	if len(ids) == 0 {
+		return
+	}
+	s.archivePackagesMu.Lock()
+	defer s.archivePackagesMu.Unlock()
+	for id := range ids {
+		delete(s.archivePackages, id)
+	}
+}
+
+func (s *Store) deleteArchivePackageRegistrationCache(registrations []archivePackRegistration) {
+	if len(registrations) == 0 {
+		return
+	}
+
+	s.archivePackagesMu.Lock()
+	defer s.archivePackagesMu.Unlock()
+	for _, reg := range registrations {
+		if !reg.valid {
+			continue
+		}
+		delete(s.archivePackages, reg.archiveID)
+	}
+}
+
+func (s *Store) registerArchiveInfo(batch *pebble.Batch, baseSeq uint32, startSeq uint32, workchain int32, shard int64, archiveID int64) error {
+	registered, err := s.archiveInfoRegistered(baseSeq, startSeq, workchain, shard, archiveID)
 	if err != nil {
 		return err
 	}
@@ -943,47 +1254,27 @@ func (s *Store) registerArchiveInfoRange(batch *pebble.Batch, startSeq uint32, w
 		return nil
 	}
 
-	for i := uint32(0); i < archiveSliceMasterchainBlocks; i++ {
-		seqno := startSeq + i
-		if err := batch.Set(hotKeyArchiveInfo(int32(seqno), workchain, shard), encodeInt64(archiveID), pebble.NoSync); err != nil {
-			return err
-		}
-	}
-	return nil
+	return batch.Set(hotKeyArchiveInfo(baseSeq, startSeq, workchain, shard), encodeInt64(archiveID), pebble.NoSync)
 }
 
-func (s *Store) archiveInfoRangeRegistered(startSeq uint32, workchain int32, shard int64, archiveID int64) (bool, error) {
-	for _, seqno := range []uint32{startSeq, startSeq + archiveSliceMasterchainBlocks - 1} {
-		raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchiveInfo(int32(seqno), workchain, shard))
-		if errors.Is(err, storage.ErrNotFound) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		if len(raw) != 8 {
-			_ = closer.Close()
-			return false, fmt.Errorf("invalid archive info payload")
-		}
-		storedArchiveID := int64(binary.BigEndian.Uint64(raw))
-		_ = closer.Close()
-		if storedArchiveID != archiveID {
-			return false, nil
-		}
+func (s *Store) archiveInfoRegistered(baseSeq uint32, startSeq uint32, workchain int32, shard int64, archiveID int64) (bool, error) {
+	raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchiveInfo(baseSeq, startSeq, workchain, shard))
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
 	}
-	return true, nil
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = closer.Close() }()
+
+	if len(raw) != 8 {
+		return false, fmt.Errorf("invalid archive info payload")
+	}
+	return int64(binary.BigEndian.Uint64(raw)) == archiveID, nil
 }
 
 func isKeyProofKind(kind storage.ServedProofKind) bool {
 	return kind == storage.ServedProofKeyBlock || kind == storage.ServedProofKeyBlockLink
-}
-
-func blockMetaFlagsForProofKind(kind storage.ServedProofKind) storage.BlockMetaFlags {
-	flags := storage.BlockMetaFlagForProof(kind)
-	if isKeyProofKind(kind) {
-		flags |= storage.BlockMetaIsKeyBlock
-	}
-	return flags
 }
 
 func packEntryKindForProofKind(kind storage.ServedProofKind) string {
@@ -1034,113 +1325,42 @@ func (s *Store) writeStateArtifactFile(block ton.BlockIDExt, data []byte) (*stor
 	if err = syncDir(dir); err != nil {
 		return nil, err
 	}
+	relPath, err := s.relativeArtifactPath(finalPath)
+	if err != nil {
+		return nil, err
+	}
 	return &storage.ArtifactRef{
-		Path: s.relativeArtifactPath(finalPath),
+		Path: relPath,
 		Size: int64(len(data)),
 	}, nil
 }
 
-func (s *Store) markPendingPackSync(pending map[string]pendingPackWrite, path string, size int64) {
+func (s *Store) markPendingPackSync(pending map[string]pendingPackWrite, path string, cleanSize int64, size int64) {
 	s.artifactSyncSeq++
+	if current, ok := pending[path]; ok {
+		cleanSize = current.cleanSize
+	}
 	pending[path] = pendingPackWrite{
-		seq:  s.artifactSyncSeq,
-		size: size,
+		seq:       s.artifactSyncSeq,
+		cleanSize: cleanSize,
+		size:      size,
 	}
 }
 
-func (s *Store) publishedArtifactFileSize(path string) (int64, error) {
-	relPath, ok := s.archivePackArtifactPath(path)
-	if !ok {
-		return 0, fmt.Errorf("artifact path is not an archive pack: %s", path)
-	}
-
-	published, err := s.publishedArtifactFileSizes()
-	if err != nil {
-		return 0, err
-	}
-	return published[relPath], nil
-}
-
-func (s *Store) publishedArtifactFileSizes() (map[string]int64, error) {
-	published := map[string]int64{}
-	for _, prefix := range [][]byte{
-		hotPrefixArchiveFile,
-		hotPrefixBlockDataRef,
-		hotPrefixProofRef,
-		hotPrefixKeyProofRef,
-	} {
-		if err := s.collectPublishedArtifactRefs(published, prefix); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.collectPublishedArchivePackageMetas(published); err != nil {
-		return nil, err
-	}
-	return published, nil
-}
-
-func (s *Store) collectPublishedArtifactRefs(published map[string]int64, prefix []byte) error {
-	iter, err := s.hot.NewIter(&pebble.IterOptions{
-		LowerBound: bytes.Clone(prefix),
-		UpperBound: appendPrefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = iter.Close() }()
-
-	for iter.First(); iter.Valid(); iter.Next() {
-		ref, err := decodeArtifactRef(iter.Value())
+func (s *Store) beginPackAppend(pending map[string]pendingPackWrite, path string, cleanSize int64) (string, int64, error) {
+	if current, ok := pending[path]; ok {
+		relPath, err := s.packJournalPath(path)
 		if err != nil {
-			return err
+			return "", 0, err
 		}
-		if err = s.recordPublishedArtifactRange(published, ref.Path, ref.Offset, ref.Size); err != nil {
-			return err
-		}
+		return relPath, current.cleanSize, nil
 	}
-	return iter.Error()
-}
 
-func (s *Store) collectPublishedArchivePackageMetas(published map[string]int64) error {
-	iter, err := s.hot.NewIter(&pebble.IterOptions{
-		LowerBound: hotKeyArchivePackagePrefix(),
-		UpperBound: appendPrefixUpperBound(hotPrefixArchivePackage),
-	})
+	relPath, err := s.markPackAppendDirty(path, cleanSize)
 	if err != nil {
-		return err
+		return "", 0, err
 	}
-	defer func() { _ = iter.Close() }()
-
-	for iter.First(); iter.Valid(); iter.Next() {
-		meta, err := decodeArchivePackageMeta(iter.Value())
-		if err != nil {
-			return err
-		}
-		if err = s.recordPublishedArtifactRange(published, meta.path, 0, meta.size); err != nil {
-			return err
-		}
-	}
-	return iter.Error()
-}
-
-func (s *Store) recordPublishedArtifactRange(published map[string]int64, path string, offset int64, size int64) error {
-	relPath, ok := s.archivePackArtifactPath(path)
-	if !ok {
-		return fmt.Errorf("artifact path is not an archive pack: %s", path)
-	}
-	if offset < 0 || size < 0 {
-		return fmt.Errorf("invalid artifact range path=%s offset=%d size=%d", path, offset, size)
-	}
-	const maxInt64 = int64(^uint64(0) >> 1)
-	if offset > maxInt64-size {
-		return fmt.Errorf("artifact range overflows path=%s offset=%d size=%d", path, offset, size)
-	}
-
-	end := offset + size
-	if end > published[relPath] {
-		published[relPath] = end
-	}
-	return nil
+	return relPath, cleanSize, nil
 }
 
 func (s *Store) archivePackArtifactPath(path string) (string, bool) {
@@ -1148,7 +1368,11 @@ func (s *Store) archivePackArtifactPath(path string) (string, bool) {
 		return "", false
 	}
 	if filepath.IsAbs(path) {
-		path = s.relativeArtifactPath(path)
+		relPath, err := s.relativeArtifactPath(path)
+		if err != nil {
+			return "", false
+		}
+		path = relPath
 	}
 
 	clean := filepath.Clean(path)
@@ -1162,98 +1386,72 @@ func (s *Store) archivePackArtifactPath(path string) (string, bool) {
 	return filepath.FromSlash(slashPath), true
 }
 
-func (s *Store) ensureCleanPackTail(path string, pending map[string]pendingPackWrite, dirty map[string]struct{}) error {
+func (s *Store) ensureCleanPackTail(path string, pending map[string]pendingPackWrite) error {
 	if _, ok := pending[path]; ok {
 		return nil
 	}
-	if _, ok := dirty[path]; !ok {
-		return nil
-	}
-
-	if err := s.truncateUncommittedPackTail(path); err != nil {
-		return err
-	}
-	delete(dirty, path)
-	return nil
+	return s.recoverDirtyPackPath(path)
 }
 
-func (s *Store) truncateUncommittedPackTail(path string) error {
+func (s *Store) discardPackTail(path string, cleanSize int64, reason string) {
+	if err := s.truncateUncommittedPackTail(path, cleanSize); err != nil {
+		s.log.Warn().
+			Err(err).
+			Str("path", path).
+			Str("reason", reason).
+			Int64("clean_size", cleanSize).
+			Msg("failed to truncate uncommitted pack tail")
+		return
+	}
+	if err := s.clearPackAppendDirty(path); err != nil {
+		s.log.Warn().
+			Err(err).
+			Str("path", path).
+			Str("reason", reason).
+			Int64("clean_size", cleanSize).
+			Msg("failed to clear dirty pack marker")
+		return
+	}
+}
+
+func (s *Store) truncateUncommittedPackTail(path string, cleanSize int64) error {
 	if path == "" {
 		return nil
+	}
+	if cleanSize < 0 {
+		return fmt.Errorf("invalid clean pack size path=%s size=%d", path, cleanSize)
+	}
+
+	if cleanSize == 0 {
+		return removePackFile(path)
 	}
 
 	stat, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return fmt.Errorf("dirty pack %s is missing", path)
 	}
 	if err != nil {
 		return err
 	}
 
-	publishedSize, err := s.publishedArtifactFileSize(path)
-	if err != nil {
-		return err
+	if stat.Size() < cleanSize {
+		return fmt.Errorf("dirty pack %s size %d is below clean size %d", path, stat.Size(), cleanSize)
 	}
-	if stat.Size() <= publishedSize {
+	if stat.Size() == cleanSize {
 		return nil
 	}
 
-	if err := os.Truncate(path, publishedSize); err != nil {
-		return fmt.Errorf("truncate uncommitted pack %s from %d to %d: %w", path, stat.Size(), publishedSize, err)
+	if err := os.Truncate(path, cleanSize); err != nil {
+		return fmt.Errorf("truncate uncommitted pack %s from %d to %d: %w", path, stat.Size(), cleanSize, err)
+	}
+	if err := syncFile(path); err != nil {
+		return fmt.Errorf("sync truncated pack %s: %w", path, err)
 	}
 	return nil
 }
 
-func (s *Store) markDirtyPackTail(dirty map[string]struct{}, path string) {
-	if path == "" {
-		return
-	}
-	dirty[path] = struct{}{}
-}
-
 func isMissingArtifactError(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-func (s *Store) reconcileArtifactPackFiles() error {
-	published, err := s.publishedArtifactFileSizes()
-	if err != nil {
-		return err
-	}
-
-	for relPath, size := range published {
-		path := s.artifactPath(relPath)
-		stat, err := os.Stat(path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return err
-		}
-		if stat.Size() > size {
-			if err = os.Truncate(path, size); err != nil {
-				return fmt.Errorf("truncate artifact pack %s to published size %d: %w", path, size, err)
-			}
-		}
-	}
-	return s.removeUncommittedPackFiles(published)
-}
-
-func (s *Store) removeUncommittedPackFiles(published map[string]int64) error {
-	root := filepath.Join(s.dir, "archive", "packages")
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pack") {
-			return nil
-		}
-		rel := s.relativeArtifactPath(path)
-		if _, ok := published[rel]; ok {
-			return nil
-		}
-		return os.Remove(path)
-	})
 }
 
 func appendPrefixUpperBound(prefix []byte) []byte {

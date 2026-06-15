@@ -309,10 +309,6 @@ func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDE
 	if err != nil {
 		return nil, fmt.Errorf("apply shard block %s: %w", downloaded.BlockRef(), err)
 	}
-	if downloaded.Meta.MasterchainRef != nil {
-		ref := cloneServiceBlockID(*downloaded.Meta.MasterchainRef)
-		next.MasterchainRef = &ref
-	}
 	return next, nil
 }
 
@@ -355,6 +351,7 @@ func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
 		s.stateCellLoaders = map[uint64]cell.LazyCellLoader{}
 	}
 	s.stateCellLoaders[id] = loader
+	s.storeStateCellLoadersSnapshotLocked()
 	s.stateCellLoaderMu.Unlock()
 
 	var once sync.Once
@@ -362,24 +359,27 @@ func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
 		once.Do(func() {
 			s.stateCellLoaderMu.Lock()
 			delete(s.stateCellLoaders, id)
+			s.storeStateCellLoadersSnapshotLocked()
 			s.stateCellLoaderMu.Unlock()
 		})
 	}
 }
 
 func (s *Service) stateCellLoadersSnapshot() []cell.LazyCellLoader {
-	s.stateCellLoaderMu.RLock()
-	defer s.stateCellLoaderMu.RUnlock()
-
-	if len(s.stateCellLoaders) == 0 {
+	if s == nil {
 		return nil
 	}
 
+	loaders, _ := s.stateCellLoaderSnapshot.Load().([]cell.LazyCellLoader)
+	return loaders
+}
+
+func (s *Service) storeStateCellLoadersSnapshotLocked() {
 	loaders := make([]cell.LazyCellLoader, 0, len(s.stateCellLoaders))
 	for _, loader := range s.stateCellLoaders {
 		loaders = append(loaders, loader)
 	}
-	return loaders
+	s.stateCellLoaderSnapshot.Store(loaders)
 }
 
 func shardTransitionKind(target ton.BlockIDExt, prevRefs []ton.BlockIDExt) string {

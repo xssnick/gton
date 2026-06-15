@@ -500,7 +500,7 @@ func sentOverlayPayload(msg tl.Serializable) tl.Serializable {
 	return msg
 }
 
-func TestRebroadcastFECToPeerUsesTonutilsBroadcaster(t *testing.T) {
+func TestSendFastFECToPeerSendsReserveParts(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -519,8 +519,8 @@ func TestRebroadcastFECToPeerUsesTonutilsBroadcaster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fec sender: %v", err)
 	}
-	if err = runFECBroadcasterToPeer(context.Background(), sender, peer, time.Second); err != nil {
-		t.Fatalf("run fec broadcaster: %v", err)
+	if err = sendFastFECToPeer(context.Background(), sender, peer, time.Second); err != nil {
+		t.Fatalf("send fast fec: %v", err)
 	}
 
 	want := int(sender.TotalParts())
@@ -535,7 +535,7 @@ func TestRebroadcastFECToPeerUsesTonutilsBroadcaster(t *testing.T) {
 	}
 }
 
-func TestTonutilsFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
+func TestFastFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -556,11 +556,11 @@ func TestTonutilsFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
 
 	peerA := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x11}, 32)}
 	peerB := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x22}, 32)}
-	if err = runFECBroadcasterToPeer(context.Background(), sender, peerA, time.Second); err != nil {
-		t.Fatalf("run peer A fec broadcaster: %v", err)
+	if err = sendFastFECToPeer(context.Background(), sender, peerA, time.Second); err != nil {
+		t.Fatalf("send peer A fast fec: %v", err)
 	}
-	if err = runFECBroadcasterToPeer(context.Background(), sender, peerB, time.Second); err != nil {
-		t.Fatalf("run peer B fec broadcaster: %v", err)
+	if err = sendFastFECToPeer(context.Background(), sender, peerB, time.Second); err != nil {
+		t.Fatalf("send peer B fast fec: %v", err)
 	}
 
 	if len(peerA.sent) != int(sender.TotalParts()) || len(peerB.sent) != int(sender.TotalParts()) {
@@ -758,6 +758,120 @@ func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
 	}
 }
 
+func TestEnqueueLocalExternalRebroadcastReducesFanoutWhenLagged(t *testing.T) {
+	node := newTestNode(t)
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	peers := map[PeerID]*overlayPeer{}
+	for i := 0; i < 8; i++ {
+		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
+		peers[peer.id] = peer
+	}
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: peers,
+	}
+
+	req := rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}
+	if !sub.enqueueRebroadcast(req) {
+		t.Fatal("expected local external rebroadcast enqueue")
+	}
+
+	if got := countQueuedRebroadcasts(peers, true); got != laggedExternalFanout {
+		t.Fatalf("queued local external rebroadcasts = %d, want %d", got, laggedExternalFanout)
+	}
+}
+
+func TestExternalRebroadcastFanoutThreshold(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "basechain"},
+	}
+	req := rebroadcastRequest{kind: "tonNode.externalMessageBroadcast"}
+
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold, ok: true}
+	if got := sub.rebroadcastFanoutForRequest(req); got != externalRebroadcastFanout {
+		t.Fatalf("fanout at threshold = %d, want %d", got, externalRebroadcastFanout)
+	}
+
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	if got := sub.rebroadcastFanoutForRequest(req); got != laggedExternalFanout {
+		t.Fatalf("fanout above threshold = %d, want %d", got, laggedExternalFanout)
+	}
+
+	blockReq := rebroadcastRequest{kind: "tonNode.blockBroadcastCompressedV2"}
+	if got := sub.rebroadcastFanoutForRequest(blockReq); got != rebroadcastFanout {
+		t.Fatalf("block fanout while lagged = %d, want %d", got, rebroadcastFanout)
+	}
+
+	custom := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "custom.private-a", Kind: overlayKindCustomFixed},
+	}
+	if got := custom.rebroadcastFanoutForRequest(req); got != laggedExternalFanout {
+		t.Fatalf("custom external fanout while lagged = %d, want %d", got, laggedExternalFanout)
+	}
+	if got := custom.rebroadcastFanoutForRequest(blockReq); got != custom.peerLimit() {
+		t.Fatalf("custom block fanout while lagged = %d, want %d", got, custom.peerLimit())
+	}
+}
+
+func TestEnqueueSimpleRebroadcastSharesEnvelope(t *testing.T) {
+	node := newTestNode(t)
+	peers := map[PeerID]*overlayPeer{}
+	for i := 0; i < 3; i++ {
+		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
+		peers[peer.id] = peer
+	}
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  overlaySpec{Name: "basechain"},
+		log:   discardLogger(),
+		peers: peers,
+	}
+
+	payload := []byte{0x01, 0x02, 0x03}
+	if !sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		payload:      payload,
+		local:        true,
+	}) {
+		t.Fatal("expected simple rebroadcast enqueue")
+	}
+
+	var shared *overlay.Broadcast
+	queued := 0
+	for _, peer := range peers {
+		got, ok := peer.localRebroadcastQueue.TryPop()
+		if !ok {
+			continue
+		}
+		queued++
+		if got.simple == nil {
+			t.Fatal("queued simple rebroadcast does not carry a prebuilt envelope")
+		}
+		if !bytes.Equal(got.payload, payload) {
+			t.Fatal("queued simple rebroadcast lost payload")
+		}
+		if shared == nil {
+			shared = got.simple
+		} else if shared != got.simple {
+			t.Fatal("expected all queued peers to share one simple envelope")
+		}
+	}
+	if queued != len(peers) {
+		t.Fatalf("queued simple rebroadcasts = %d, want %d", queued, len(peers))
+	}
+}
+
 func TestEnqueueLocalRebroadcastRecordsDropWhenPeerQueuesAreFull(t *testing.T) {
 	node := newTestNode(t)
 	peer := testRebroadcastQueuePeer("peer")
@@ -849,6 +963,36 @@ func TestPeerRebroadcastWorkerCountByOverlay(t *testing.T) {
 	base := &overlaySubscription{spec: overlaySpec{Workchain: 0, Shard: topShard}}
 	if got := base.peerRebroadcastWorkerCount(); got != basePeerRebroadcastWorkers {
 		t.Fatalf("basechain workers = %d, want %d", got, basePeerRebroadcastWorkers)
+	}
+}
+
+func TestRemovePeerStopsRebroadcastWorkers(t *testing.T) {
+	node := newTestNode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	node.runCtx = ctx
+
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node:       node,
+		log:        discardLogger(),
+		spec:       overlaySpec{Workchain: 0, Shard: topShard},
+		peers:      map[PeerID]*overlayPeer{peer.id: peer},
+		neighbours: []PeerID{peer.id},
+	}
+
+	sub.startPeerRebroadcastWorker(peer)
+	sub.removePeer(peer.id)
+
+	done := make(chan struct{})
+	go func() {
+		node.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("rebroadcast workers did not stop after peer removal")
 	}
 }
 

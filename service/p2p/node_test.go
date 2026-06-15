@@ -315,12 +315,69 @@ func TestInitBlockFromConfigFallsBackToZeroStateWhenMissing(t *testing.T) {
 	}
 	zero := blockIDFromConfig(zeroConfig)
 
-	init, err := initBlockFromConfig(liteclient.ConfigBlock{}, zero)
+	init, err := initBlockFromConfig(liteclient.ConfigBlock{}, zero, nil)
 	if err != nil {
 		t.Fatalf("init block from empty config: %v", err)
 	}
 	if !init.Equals(&zero) {
 		t.Fatalf("init block = %+v, want zero %+v", init, zero)
+	}
+}
+
+func TestInitBlockFromConfigUsesLatestHardfork(t *testing.T) {
+	zero := testBlockID(-1, topShard, 0)
+	init := testBlockID(-1, topShard, 100)
+	hardfork90 := testBlockID(-1, topShard, 90)
+	hardfork120 := testBlockID(-1, topShard, 120)
+
+	got, err := initBlockFromConfig(configBlockFromID(init), zero, []ton.BlockIDExt{hardfork90, hardfork120})
+	if err != nil {
+		t.Fatalf("init block from config: %v", err)
+	}
+	if !got.Equals(&hardfork120) {
+		t.Fatalf("init block = %+v, want latest hardfork %+v", got, hardfork120)
+	}
+}
+
+func TestHardforksFromConfigInvalidatesOlderForkAtSameOrHigherSeqno(t *testing.T) {
+	old := testBlockID(-1, topShard, 120)
+	replacement := testBlockID(-1, topShard, 110)
+
+	hardforks, set, err := hardforksFromConfig([]liteclient.ConfigBlock{
+		configBlockFromID(old),
+		configBlockFromID(replacement),
+	})
+	if err != nil {
+		t.Fatalf("hardforks from config: %v", err)
+	}
+	if len(hardforks) != 1 || !hardforks[0].Equals(&replacement) {
+		t.Fatalf("hardforks = %+v, want only replacement %+v", hardforks, replacement)
+	}
+
+	oldKey, _ := blockIDFullKeyFromBlock(old)
+	if _, ok := set[oldKey]; ok {
+		t.Fatal("old hardfork stayed active")
+	}
+	replacementKey, _ := blockIDFullKeyFromBlock(replacement)
+	if _, ok := set[replacementKey]; !ok {
+		t.Fatal("replacement hardfork is not active")
+	}
+}
+
+func TestNodeIsHardforkRequiresExactFullBlockID(t *testing.T) {
+	node := newTestNode(t)
+	hardfork := testBlockID(-1, topShard, 120)
+	key, _ := blockIDFullKeyFromBlock(hardfork)
+	node.hardforkSet = map[blockIDFullKey]struct{}{key: struct{}{}}
+
+	if !node.IsHardfork(hardfork) {
+		t.Fatal("expected exact configured hardfork match")
+	}
+
+	other := hardfork
+	other.FileHash = bytes.Repeat([]byte{0xff}, 32)
+	if node.IsHardfork(other) {
+		t.Fatal("hardfork lookup ignored file hash")
 	}
 }
 
@@ -351,6 +408,16 @@ func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
 	}
 	if !observed.Equals(&block10) {
 		t.Fatalf("runtime observed = %+v, want %+v", observed, block10)
+	}
+}
+
+func configBlockFromID(block ton.BlockIDExt) liteclient.ConfigBlock {
+	return liteclient.ConfigBlock{
+		Workchain: block.Workchain,
+		Shard:     block.Shard,
+		SeqNo:     block.SeqNo,
+		RootHash:  append([]byte(nil), block.RootHash...),
+		FileHash:  append([]byte(nil), block.FileHash...),
 	}
 }
 

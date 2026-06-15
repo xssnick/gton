@@ -97,4 +97,4 @@ func (s *testPreviousPersistentStatePruneStore) PrunePreviousPersistentStateFile
 	return s.stats, nil
 }
 
-var _ previousPersistentStatePruneStore = (*testPreviousPersistentStatePruneStore)(nil)
+var _ storage.Storage = (*testPreviousPersistentStatePruneStore)(nil)

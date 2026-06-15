@@ -30,25 +30,6 @@ const (
 	cellGenerationNextBlockYieldInterval    = 2 * time.Minute
 )
 
-type cellGenerationRotationStore interface {
-	ActiveCellGeneration(ctx context.Context) (storage.CellGenerationInfo, error)
-	PendingCellGenerationMigration(ctx context.Context) (storage.CellGenerationInfo, error)
-	CellGenerationDBMetrics(ctx context.Context, generation uint64) (storage.CellGenerationDBMetrics, error)
-	CellGenerationMigrationProgress(ctx context.Context, generation uint64) (*storage.CurrentState, error)
-	SaveCellGenerationMigrationProgress(ctx context.Context, generation uint64, current *storage.CurrentState) error
-	BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) (uint64, error)
-	DropPendingCellGeneration(ctx context.Context, generation uint64) error
-	CleanupCellGeneration(ctx context.Context, generation uint64) error
-	ThrottleCellGenerationCompactions(ctx context.Context, generation uint64) (func(), error)
-	ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error)
-	ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)
-	LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader
-	SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error
-	DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Context, origin ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (int, error)
-	SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *storage.CurrentState) (uint64, error)
-	PersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*storage.PersistentStateFile, error)
-}
-
 type cellGenerationCandidate struct {
 	generation uint64
 	current    *storage.CurrentState
@@ -61,7 +42,7 @@ type cellGenerationMigrationRun struct {
 }
 
 type generationStateCellImporter struct {
-	store      cellGenerationRotationStore
+	store      storage.Storage
 	generation uint64
 }
 
@@ -94,13 +75,7 @@ func (s *Service) afterPersistentStateSerialized(ctx context.Context, persistent
 		return
 	}
 
-	store, ok := s.storage.(cellGenerationRotationStore)
-	if !ok {
-		s.log.Debug().
-			Str("storage", fmt.Sprintf("%T", s.storage)).
-			Msg("storage does not support cell generation migration")
-		return
-	}
+	store := s.storage
 
 	needed, err := s.shouldStartCellGenerationMigration(ctx, store, persistent)
 	if err != nil {
@@ -123,10 +98,7 @@ func (s *Service) afterPersistentStateSerialized(ctx context.Context, persistent
 }
 
 func (s *Service) StartCellGenerationMigration(ctx context.Context, masterSeqno uint32) error {
-	store, ok := s.storage.(cellGenerationRotationStore)
-	if !ok {
-		return fmt.Errorf("storage does not support cell generation migration")
-	}
+	store := s.storage
 
 	migrationLease, err := s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskCellGenerationMigration)
 	if err != nil {
@@ -160,7 +132,7 @@ func (s *Service) durableMasterchainBlockForMigration(ctx context.Context, maste
 	return s.durableMasterchainBlock(ctx, masterSeqno, "cell generation migration")
 }
 
-func (s *Service) queueCellGenerationMigration(ctx context.Context, store cellGenerationRotationStore, persistent ton.BlockIDExt, source string) error {
+func (s *Service) queueCellGenerationMigration(ctx context.Context, store storage.Storage, persistent ton.BlockIDExt, source string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -187,7 +159,7 @@ func (s *Service) queueCellGenerationMigration(ctx context.Context, store cellGe
 	return nil
 }
 
-func (s *Service) startCellGenerationMigrationWithLease(store cellGenerationRotationStore, persistent ton.BlockIDExt, source string, migrationLease *exclusiveServiceTaskLease) error {
+func (s *Service) startCellGenerationMigrationWithLease(store storage.Storage, persistent ton.BlockIDExt, source string, migrationLease *exclusiveServiceTaskLease) error {
 	runCtx, run, err := s.beginCellGenerationMigrationRun(s.currentStatePersistContext())
 	if err != nil {
 		migrationLease.release()
@@ -240,7 +212,7 @@ func (s *Service) startCellGenerationMigrationWithLease(store cellGenerationRota
 	return nil
 }
 
-func (s *Service) ensureCellGenerationPersistentStateAvailable(ctx context.Context, store cellGenerationRotationStore, persistent ton.BlockIDExt) error {
+func (s *Service) ensureCellGenerationPersistentStateAvailable(ctx context.Context, store storage.Storage, persistent ton.BlockIDExt) error {
 	if _, err := store.PersistentStateFile(ctx, persistent, persistent, 0); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fmt.Errorf("%w: masterchain %s", errCellGenerationPersistentMissing, storage.FormatBlockRef(persistent))
@@ -250,7 +222,7 @@ func (s *Service) ensureCellGenerationPersistentStateAvailable(ctx context.Conte
 	return nil
 }
 
-func (s *Service) shouldStartCellGenerationMigration(ctx context.Context, store cellGenerationRotationStore, persistent ton.BlockIDExt) (bool, error) {
+func (s *Service) shouldStartCellGenerationMigration(ctx context.Context, store storage.Storage, persistent ton.BlockIDExt) (bool, error) {
 	if s.stateTTL <= 0 {
 		return false, nil
 	}
@@ -309,10 +281,6 @@ func (s *Service) shouldStartCellGenerationMigration(ctx context.Context, store 
 	return true, nil
 }
 
-func (s *Service) beginCellGenerationMigration(ctx context.Context) (*exclusiveServiceTaskLease, error) {
-	return s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskCellGenerationMigration)
-}
-
 func (s *Service) beginPendingCellGenerationMigration(ctx context.Context) (*exclusiveServiceTaskLease, error) {
 	s.exclusiveTaskMu.Lock()
 	if err := s.canStartExclusiveServiceTaskLocked(exclusiveServiceTaskCellGenerationMigration); err != nil {
@@ -339,10 +307,7 @@ func (s *Service) cellGenerationMigrationActive() bool {
 }
 
 func (s *Service) StopCellGenerationMigration(ctx context.Context) error {
-	store, ok := s.storage.(cellGenerationRotationStore)
-	if !ok {
-		return fmt.Errorf("storage does not support cell generation migration")
-	}
+	store := s.storage
 
 	run, err := s.beginCellGenerationMigrationStop()
 	if err != nil {
@@ -374,11 +339,7 @@ func (s *Service) StopCellGenerationMigration(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) pendingCellGenerationCompactionWait(ctx context.Context, store cellGenerationRotationStore, pending storage.CellGenerationInfo) (storage.CellGenerationDBMetrics, bool, error) {
-	return s.cellGenerationCompactionWait(ctx, store, pending.ID)
-}
-
-func (s *Service) cellGenerationCompactionWait(ctx context.Context, store cellGenerationRotationStore, generation uint64) (storage.CellGenerationDBMetrics, bool, error) {
+func (s *Service) cellGenerationCompactionWait(ctx context.Context, store storage.Storage, generation uint64) (storage.CellGenerationDBMetrics, bool, error) {
 	metrics, err := store.CellGenerationDBMetrics(ctx, generation)
 	if err != nil {
 		return storage.CellGenerationDBMetrics{}, false, fmt.Errorf("load cell generation db metrics: %w", err)
@@ -530,7 +491,7 @@ func (s *Service) checkCurrentStatePersistAllowed() error {
 	return nil
 }
 
-func (s *Service) runCellGenerationMigration(ctx context.Context, store cellGenerationRotationStore, origin ton.BlockIDExt) (err error) {
+func (s *Service) runCellGenerationMigration(ctx context.Context, store storage.Storage, origin ton.BlockIDExt) (err error) {
 	if err := s.waitCurrentStatePersist(ctx); err != nil {
 		return err
 	}
@@ -697,7 +658,7 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store cellGene
 	}
 }
 
-func (s *Service) catchUpAndFlushCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, target *storage.CurrentState) error {
+func (s *Service) catchUpAndFlushCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, target *storage.CurrentState) error {
 	release, err := s.throttleActiveCellGenerationCompactions(ctx, store, candidate, target)
 	if err != nil {
 		return err
@@ -716,7 +677,7 @@ func (s *Service) catchUpAndFlushCellGenerationCandidate(ctx context.Context, st
 	return nil
 }
 
-func (s *Service) throttleActiveCellGenerationCompactions(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, target *storage.CurrentState) (func(), error) {
+func (s *Service) throttleActiveCellGenerationCompactions(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, target *storage.CurrentState) (func(), error) {
 	if candidate == nil || candidate.current == nil || target == nil || target.Masterchain.Block.SeqNo <= candidate.current.Masterchain.Block.SeqNo {
 		return func() {}, nil
 	}
@@ -743,7 +704,7 @@ func (s *Service) throttleActiveCellGenerationCompactions(ctx context.Context, s
 	return release, nil
 }
 
-func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store cellGenerationRotationStore, generation uint64, master ton.BlockIDExt, resume *cellGenerationCandidate) (*cellGenerationCandidate, error) {
+func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store storage.Storage, generation uint64, master ton.BlockIDExt, resume *cellGenerationCandidate) (*cellGenerationCandidate, error) {
 	importer := generationStateCellImporter{store: store, generation: generation}
 	var current *storage.CurrentState
 	var importedMaster *storage.BlockState
@@ -870,7 +831,7 @@ func parsedCellGenerationProgressState(state *storage.BlockState) (*storage.Bloc
 	return parsed, nil
 }
 
-func (s *Service) loadCellGenerationMigrationProgress(ctx context.Context, store cellGenerationRotationStore, generation uint64) (*cellGenerationCandidate, error) {
+func (s *Service) loadCellGenerationMigrationProgress(ctx context.Context, store storage.Storage, generation uint64) (*cellGenerationCandidate, error) {
 	current, err := store.CellGenerationMigrationProgress(ctx, generation)
 	if err != nil {
 		return nil, err
@@ -893,7 +854,7 @@ func (s *Service) loadCellGenerationMigrationProgress(ctx context.Context, store
 	}, nil
 }
 
-func (s *Service) loadCellGenerationMigrationProgressCells(ctx context.Context, store cellGenerationRotationStore, generation uint64, current *storage.CurrentState) error {
+func (s *Service) loadCellGenerationMigrationProgressCells(ctx context.Context, store storage.Storage, generation uint64, current *storage.CurrentState) error {
 	masterRoot, err := s.loadCellGenerationMigrationProgressBlock(ctx, store, generation, current.Masterchain)
 	if err != nil {
 		return fmt.Errorf("load migration progress masterchain state %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
@@ -914,7 +875,7 @@ func (s *Service) loadCellGenerationMigrationProgressCells(ctx context.Context, 
 	return nil
 }
 
-func (s *Service) loadCellGenerationMigrationProgressBlock(ctx context.Context, store cellGenerationRotationStore, generation uint64, state storage.BlockState) (*cell.Cell, error) {
+func (s *Service) loadCellGenerationMigrationProgressBlock(ctx context.Context, store storage.Storage, generation uint64, state storage.BlockState) (*cell.Cell, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -939,7 +900,7 @@ func (s *Service) loadCellGenerationMigrationProgressBlock(ctx context.Context, 
 
 func (s *Service) importSerializedPersistentBlockState(
 	ctx context.Context,
-	store cellGenerationRotationStore,
+	store storage.Storage,
 	importer generationStateCellImporter,
 	generation uint64,
 	block ton.BlockIDExt,
@@ -976,7 +937,7 @@ func (s *Service) persistentImportStateMetadata(ctx context.Context, block ton.B
 	return state, nil
 }
 
-func (s *Service) serializedPersistentStateArtifact(ctx context.Context, store cellGenerationRotationStore, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
+func (s *Service) serializedPersistentStateArtifact(ctx context.Context, store storage.Storage, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
 	if block.Workchain == -1 || splitDepth <= uint32(state2.ShardPrefixLength(block.Shard)) {
 		file, err := store.PersistentStateFile(ctx, block, master, 0)
 		if err != nil {
@@ -997,7 +958,7 @@ func (s *Service) serializedPersistentStateArtifact(ctx context.Context, store c
 	})
 }
 
-func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, target *storage.CurrentState) error {
+func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, target *storage.CurrentState) error {
 	if target.Masterchain.Block.SeqNo < candidate.current.Masterchain.Block.SeqNo {
 		return fmt.Errorf("durable current state %s is before candidate current state %s", storage.FormatBlockRef(target.Masterchain.Block), storage.FormatBlockRef(candidate.current.Masterchain.Block))
 	}
@@ -1133,7 +1094,7 @@ func (s *Service) logCellGenerationCandidateCatchUpProgress(
 	event.Msg("cell generation migration catch-up progress")
 }
 
-func (s *Service) newCellGenerationShardResolver(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, cache map[storage.BlockRootHash]*storage.BlockState) *shardStateResolver {
+func (s *Service) newCellGenerationShardResolver(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, cache map[storage.BlockRootHash]*storage.BlockState) *shardStateResolver {
 	return newShardStateResolver(ctx, shardStateResolverConfig{
 		current: candidate.current.Shards,
 		cache:   cache,
@@ -1191,7 +1152,7 @@ func (s *Service) loadCandidateBlockForApply(ctx context.Context, block ton.Bloc
 	return downloaded, nil
 }
 
-func (s *Service) flushCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate) error {
+func (s *Service) flushCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate) error {
 	checkpoint := candidate.cells.beginCheckpoint()
 	if checkpoint == nil {
 		return nil
@@ -1207,7 +1168,7 @@ func (s *Service) flushCellGenerationCandidate(ctx context.Context, store cellGe
 	return nil
 }
 
-func (s *Service) cellGenerationSwitchPreserveStateMeta(ctx context.Context, store cellGenerationRotationStore, generation uint64, origin ton.BlockIDExt) ([]ton.BlockIDExt, error) {
+func (s *Service) cellGenerationSwitchPreserveStateMeta(ctx context.Context, store storage.Storage, generation uint64, origin ton.BlockIDExt) ([]ton.BlockIDExt, error) {
 	originState, err := s.persistentImportStateMetadata(ctx, origin)
 	if err != nil {
 		return nil, fmt.Errorf("load origin persistent state metadata %s before switch: %w", storage.FormatBlockRef(origin), err)
@@ -1232,7 +1193,7 @@ func (s *Service) cellGenerationSwitchPreserveStateMeta(ctx context.Context, sto
 	return shards, nil
 }
 
-func (s *Service) prepareCellGenerationSwitchCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) error {
+func (s *Service) prepareCellGenerationSwitchCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, origin ton.BlockIDExt) error {
 	preserveStateMeta, err := s.cellGenerationSwitchPreserveStateMeta(ctx, store, candidate.generation, origin)
 	if err != nil {
 		return err
@@ -1268,7 +1229,7 @@ func (s *Service) prepareCellGenerationSwitchCandidate(ctx context.Context, stor
 	return nil
 }
 
-func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store cellGenerationRotationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (bool, *storage.CurrentState, uint64, error) {
+func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (bool, *storage.CurrentState, uint64, error) {
 	s.stateMu.Lock()
 	s.currentStatePersistMu.Lock()
 

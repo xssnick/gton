@@ -12,10 +12,6 @@ import (
 
 var errStateSerializationLowDiskSpace = errors.New("free disk space is below persistent state serialization minimum")
 
-type previousPersistentStatePruneStore interface {
-	PrunePreviousPersistentStateFiles(ctx context.Context, beforeMasterSeqno uint32) (storage.PersistentStatePruneStats, error)
-}
-
 func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Context, target ton.BlockIDExt) error {
 	path := strings.TrimSpace(s.syncDiskSpacePath)
 	if path == "" || s.minStateSerializationDiskFreeBytes == 0 {
@@ -92,12 +88,7 @@ func (s *Service) checkPersistentStateSerializationDiskSpace(path string) (syncD
 }
 
 func (s *Service) prunePreviousPersistentStateBeforeSerialization(ctx context.Context, target ton.BlockIDExt) (storage.PersistentStatePruneStats, error) {
-	store, ok := s.storage.(previousPersistentStatePruneStore)
-	if !ok {
-		return storage.PersistentStatePruneStats{}, nil
-	}
-
-	stats, err := store.PrunePreviousPersistentStateFiles(ctx, target.SeqNo)
+	stats, err := s.storage.PrunePreviousPersistentStateFiles(ctx, target.SeqNo)
 	if err != nil {
 		return stats, fmt.Errorf("delete previous persistent state before serialization %s: %w", storage.FormatBlockRef(target), err)
 	}

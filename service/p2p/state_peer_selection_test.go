@@ -7,10 +7,10 @@ import (
 
 func TestPrioritizeStateSnapshotPeers(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[PeerID]int{
-			testPeerID("peer-a"): 2,
-			testPeerID("peer-b"): 0,
-			testPeerID("peer-c"): 0,
+		peerUse: map[PeerID]peerUse{
+			testPeerID("peer-a"): {downloads: 2},
+			testPeerID("peer-b"): {},
+			testPeerID("peer-c"): {},
 		},
 	}
 
@@ -35,9 +35,7 @@ func TestPrioritizeStateSnapshotPeers(t *testing.T) {
 
 func TestPrioritizeBlockDownloadPeersUsesDownloadScore(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[PeerID]int{
-			testPeerID("busy"): 2,
-		},
+		peerUse: map[PeerID]peerUse{testPeerID("busy"): {downloads: 2}},
 	}
 	now := time.Now()
 	peers := []*overlayPeer{
@@ -61,7 +59,7 @@ func TestPrioritizeBlockDownloadPeersUsesDownloadScore(t *testing.T) {
 
 func TestAcquirePreferredStateSnapshotProbePrefersLessBusyPeer(t *testing.T) {
 	node := &Node{
-		downloadPeerLeases: map[PeerID]int{},
+		peerUse: map[PeerID]peerUse{},
 	}
 
 	peerA := &overlayPeer{id: testPeerID("peer-a"), addr: "peer-a"}

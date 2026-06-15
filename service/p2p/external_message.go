@@ -15,14 +15,21 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+const maxExternalMessageBOCCells = 1 << 17
+
 func (s *overlaySubscription) serveSendExtMessage(ctx context.Context, msg tonnodeapi.ExternalMessage) (tl.Serializable, error) {
-	if err := s.node.SendExternalMessage(ctx, msg.Data); err != nil {
+	addrKey, err := externalMessageDestinationAddress(msg.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.node.SendExternalMessage(ctx, msg.Data, addrKey); err != nil {
 		return nil, err
 	}
 	return Success{}, nil
 }
 
-func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
+func (n *Node) SendExternalMessage(ctx context.Context, data []byte, addrKey extmsg.AddressKey) error {
 	if len(data) == 0 {
 		return errors.New("external message is empty")
 	}
@@ -30,11 +37,6 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 		return fmt.Errorf("external message is too large: %d", len(data))
 	}
 	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	addrKey, err := externalMessageDestinationAddress(data)
-	if err != nil {
 		return err
 	}
 
@@ -64,12 +66,29 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 	if len(pending) == 0 {
 		return nil
 	}
-	if err = n.addExternalMessageAddressLimit(addrKey, now); err != nil {
+	if n.externalBroadcastPacer == nil {
+		return n.enqueueExternalMessageTargets(addrKey, pending, payload, now)
+	}
+
+	costBytes := externalBroadcastCostBytes(pending, len(payload))
+	if err = n.externalBroadcastPacer.Wait(ctx, costBytes); err != nil {
+		return err
+	}
+	return n.enqueueExternalMessageTargets(addrKey, pending, payload, time.Now())
+}
+
+type externalMessageTarget struct {
+	sub  *overlaySubscription
+	hash string
+}
+
+func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets []externalMessageTarget, payload []byte, now time.Time) error {
+	if err := n.addExternalMessageAddressLimit(addrKey, now); err != nil {
 		return err
 	}
 
 	queued := 0
-	for _, target := range pending {
+	for _, target := range targets {
 		req := rebroadcastRequest{
 			subscription: target.sub,
 			kind:         "tonNode.externalMessageBroadcast",
@@ -89,9 +108,21 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte) error {
 	return nil
 }
 
-type externalMessageTarget struct {
-	sub  *overlaySubscription
-	hash string
+func externalBroadcastCostBytes(targets []externalMessageTarget, payloadLen int) int64 {
+	var cost int64
+	for _, target := range targets {
+		if target.sub == nil {
+			continue
+		}
+		req := rebroadcastRequest{
+			subscription: target.sub,
+			kind:         "tonNode.externalMessageBroadcast",
+			payloadSize:  payloadLen,
+			local:        true,
+		}
+		cost += int64(payloadLen) * int64(target.sub.rebroadcastFanoutForRequest(req))
+	}
+	return cost
 }
 
 func (n *Node) externalMessageTargets(addrKey extmsg.AddressKey, data []byte) ([]externalMessageTarget, error) {
@@ -158,7 +189,9 @@ func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, 
 }
 
 func externalMessageDestinationAddress(data []byte) (extmsg.AddressKey, error) {
-	root, err := cell.FromBOC(data)
+	root, err := cell.FromBOCWithOptions(data, cell.BOCParseOptions{
+		MaxCells: maxExternalMessageBOCCells,
+	})
 	if err != nil {
 		return extmsg.AddressKey{}, fmt.Errorf("parse external message BOC: %w", err)
 	}
@@ -192,9 +225,6 @@ func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
 }
 
 func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {
-	if n.externalMessageLimiter == nil {
-		n.externalMessageLimiter = extmsg.NewDefaultAddressLimiter()
-	}
 	err := n.externalMessageLimiter.Add(key, now)
 	if err == nil {
 		return nil
@@ -203,8 +233,5 @@ func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Ti
 }
 
 func (n *Node) dropExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) {
-	if n.externalMessageLimiter == nil {
-		return
-	}
 	n.externalMessageLimiter.Remove(key, now)
 }

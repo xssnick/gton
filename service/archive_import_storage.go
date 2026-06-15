@@ -29,7 +29,7 @@ func (s *Service) importArchiveBlocksForStorage(ctx context.Context, downloaded 
 	if err != nil {
 		return nil, storage.ServedArchiveImport{}, err
 	}
-	stored, err := servedArchiveImportFromImported(imported, splitDepth, shardMasterRefs, nil)
+	stored, err := servedArchiveImportFromImported(imported, splitDepth, shardMasterRefs)
 	if err != nil {
 		return nil, storage.ServedArchiveImport{}, err
 	}
@@ -101,31 +101,19 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 	return &archiveImportResult{stats: imported.Stats, blocks: blocks, splitDepth: splitDepth}, nil
 }
 
-func servedArchiveImportFromImported(imported *archive.Imported, splitDepth uint32, shardMasterRefs map[storage.BlockRootHash]ton.BlockIDExt, includeBlocks map[storage.BlockRootHash]bool) (storage.ServedArchiveImport, error) {
+func servedArchiveImportFromImported(imported *archive.Imported, splitDepth uint32, shardMasterRefs map[storage.BlockRootHash]ton.BlockIDExt) (storage.ServedArchiveImport, error) {
 	if imported == nil {
 		return storage.ServedArchiveImport{}, fmt.Errorf("import archive: empty imported data")
 	}
 
 	stored := storage.ServedArchiveImport{
 		FullBlocks: make([]*storage.ServedBlockFull, 0, len(imported.FullBlocks)),
-	}
-	if includeBlocks == nil {
-		stored.Links = imported.Links
-	} else {
-		stored.Links = make([]storage.ServedBlockLink, 0, len(imported.Links))
-		for _, link := range imported.Links {
-			if includeBlocks[storage.BlockKey(link.Next)] {
-				stored.Links = append(stored.Links, link)
-			}
-		}
+		Links:      imported.Links,
 	}
 
 	seenBlocks := map[storage.BlockRootHash]struct{}{}
 	for _, full := range imported.FullBlocks {
 		key := storage.BlockKey(full.ID)
-		if includeBlocks != nil && !includeBlocks[key] {
-			continue
-		}
 		if _, exists := seenBlocks[key]; exists {
 			continue
 		}
@@ -241,6 +229,10 @@ func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlock
 		seen := map[storage.BlockRootHash]struct{}{}
 		for _, blocks := range stateBlocks {
 			for _, next := range blocks {
+				// Zerostates are downloaded through state overlay, not shard archive packages.
+				if next.SeqNo == 0 {
+					continue
+				}
 				if next.Workchain != prefix.Workchain || !archiveShardIntersects(prefix.Shard, next.Shard) {
 					continue
 				}

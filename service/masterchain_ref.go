@@ -24,8 +24,7 @@ func setShardBlockMasterchainRef(meta *storage.BlockMeta, master ton.BlockIDExt)
 
 	// cppnode sets BlockHandle::masterchain_ref_block from the including master,
 	// so overwrite any stale value parsed from the shard header.
-	ref := cloneServiceBlockID(master)
-	meta.MasterchainRef = &ref
+	meta.MasterchainRefSeqno = master.SeqNo
 }
 
 func setPreparedShardMasterchainRef(block *PreparedBlock, master ton.BlockIDExt) {

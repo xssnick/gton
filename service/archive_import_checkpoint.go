@@ -168,6 +168,7 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) (uint32, error) {
 				Msg("archive shard-client checkpoint failed")
 		}
 		if persisted != nil {
+			r.service.publishLiveCurrentBlockMarkers(persisted)
 			r.service.publishCommittedCurrentState(persisted)
 		}
 		release()

@@ -113,10 +113,6 @@ func (s *Server) handleQuery(ctx context.Context, query any) tl.Serializable {
 	}
 }
 
-type nonfinalPendingStore interface {
-	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
-}
-
 func (s *Server) handleNonfinalPendingShardBlocks(query ton.NonfinalGetPendingShardBlocks) tl.Serializable {
 	if !s.nonFinal {
 		return ton.LSError{Code: errCodeUnspecified, Text: "query is not allowed"}
@@ -133,12 +129,7 @@ func (s *Server) handleNonfinalPendingShardBlocks(query ton.NonfinalGetPendingSh
 		filter = &storage.ShardKey{Workchain: query.WC, Shard: query.Shard}
 	}
 
-	store, ok := s.store.(nonfinalPendingStore)
-	if !ok {
-		return ton.NonfinalPendingShardBlocks{}
-	}
-
-	signed, candidates := store.NonfinalPendingShardBlocks(filter)
+	signed, candidates := s.store.NonfinalPendingShardBlocks(filter)
 	return ton.NonfinalPendingShardBlocks{
 		SignedBlocks: blockIDPtrSlice(signed),
 		Candidates:   blockIDPtrSlice(candidates),
@@ -227,23 +218,7 @@ func (s *Server) handleAccountState(ctx context.Context, id *ton.BlockIDExt, acc
 }
 
 func (s *Server) masterchainInfoWithUTime(ctx context.Context) (ton.MasterchainInfo, uint32, error) {
-	if cached, ok := s.store.(currentMasterchainInfoStore); ok {
-		block, stateRoot, lastUTime, err := cached.CurrentMasterchainInfo(ctx)
-		if err == nil {
-			info, err := s.masterchainInfo(block, stateRoot)
-			return info, lastUTime, err
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return ton.MasterchainInfo{}, 0, err
-		}
-	}
-
-	current, err := s.store.CurrentState(ctx)
-	if err != nil {
-		return ton.MasterchainInfo{}, 0, err
-	}
-
-	block, stateRoot, lastUTime, err := currentMasterchainInfo(ctx, s.store, current)
+	block, stateRoot, lastUTime, err := s.store.CurrentMasterchainInfo(ctx)
 	if err != nil {
 		return ton.MasterchainInfo{}, 0, err
 	}
@@ -252,7 +227,7 @@ func (s *Server) masterchainInfoWithUTime(ctx context.Context) (ton.MasterchainI
 	return info, lastUTime, err
 }
 
-func currentMasterchainInfo(ctx context.Context, store Store, current *storage.CurrentState) (ton.BlockIDExt, []byte, uint32, error) {
+func currentMasterchainInfo(current *storage.CurrentState) (ton.BlockIDExt, []byte, uint32, error) {
 	if current == nil {
 		return ton.BlockIDExt{}, nil, 0, storage.ErrNotFound
 	}
@@ -262,20 +237,6 @@ func currentMasterchainInfo(ctx context.Context, store Store, current *storage.C
 	lastUTime := uint32(0)
 	if current.Masterchain.Parsed != nil {
 		lastUTime = current.Masterchain.Parsed.GenUTime
-	}
-
-	if store != nil {
-		meta, metaErr := store.BlockMeta(ctx, block)
-		if metaErr == nil {
-			if len(stateRoot) == 0 {
-				stateRoot = meta.StateRootHash
-			}
-			if lastUTime == 0 {
-				lastUTime = meta.GenUTime
-			}
-		} else if !errors.Is(metaErr, storage.ErrNotFound) {
-			return ton.BlockIDExt{}, nil, 0, metaErr
-		}
 	}
 
 	if len(stateRoot) != 32 {

@@ -74,9 +74,6 @@ func (c *storageArtifactCollector) Collect(ch chan<- prometheus.Metric) {
 	defer cancel()
 
 	status, err := c.metrics.storageArtifactStatus(ctx)
-	if errors.Is(err, errMetricReaderNotConfigured) {
-		return
-	}
 	if err != nil {
 		return
 	}

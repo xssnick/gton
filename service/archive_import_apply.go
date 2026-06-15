@@ -181,6 +181,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		if err != nil {
 			return nil, fmt.Errorf("apply archive master block %s: %w", downloaded.BlockRef(), err)
 		}
+		r.service.resetMasterDependentCachesForKeyBlock(&downloaded)
 		master = next
 		window.masterSequence[idx].releaseStateUpdatePayload()
 		downloaded.releaseStateUpdatePayload()
@@ -249,9 +250,14 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 	var appliedMu sync.Mutex
 	var blockLoaderMu sync.Mutex
 	resolver := newShardStateResolver(ctx, shardStateResolverConfig{
-		current:   current,
-		cache:     applied,
-		loadState: r.service.loadBlockStateForApply,
+		current: current,
+		cache:   applied,
+		loadState: func(ctx context.Context, state storage.BlockState) (*storage.BlockState, error) {
+			if state.Block.SeqNo == 0 && r.service.stateSync != nil {
+				return r.service.stateSync.ImportZeroState(ctx, state.Block, master)
+			}
+			return r.service.loadBlockStateForApply(ctx, state)
+		},
 		loadBlock: archiveShardBlockLoader{
 			master: master,
 			blocks: blocks,

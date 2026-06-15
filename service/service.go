@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/blocksync"
@@ -126,13 +127,15 @@ func avgDuration(total time.Duration, count uint32) time.Duration {
 }
 
 type Service struct {
-	log       zerolog.Logger
-	node      *p2p.Node
-	blockSync *blocksync.Service
-	storage   storage.Storage
-	stateSync *state.Syncer
-	liveState CurrentStatePublisher
-	sync      SyncObserver
+	log                     zerolog.Logger
+	node                    *p2p.Node
+	blockSync               *blocksync.Service
+	storage                 storage.Storage
+	stateSync               *state.Syncer
+	liveState               CurrentStatePublisher
+	liveBlockCache          *storage.LiveBlockCache
+	liveStateUsesBlockCache bool
+	sync                    SyncObserver
 
 	stateCellPrewrite *stateCellPrewriter
 
@@ -146,6 +149,7 @@ type Service struct {
 	broadcastAdmissionMu           sync.Mutex
 	broadcastAdmissionInitialized  bool
 	broadcastAdmissionClosed       bool
+	broadcastAdmissionClosedAtomic atomic.Bool
 	broadcastLiveMasterSeqno       uint32
 	broadcastFlushedMasterSeqno    uint32
 
@@ -165,6 +169,7 @@ type Service struct {
 	nextMasterchainCandidateBySeqno map[uint32]storage.BlockRootHash
 	nextMasterchainCandidateBytes   int64
 	validatorCache                  masterchainValidatorCache
+	broadcastValidatorCache         broadcastValidatorCache
 	masterStateCacheMu              sync.Mutex
 	masterStateCache                map[storage.BlockRootHash]*storage.BlockState
 	masterStateCacheKeys            []storage.BlockRootHash
@@ -179,12 +184,13 @@ type Service struct {
 	currentStatePersistErr             error
 	stateCellLoaderMu                  sync.RWMutex
 	stateCellLoaders                   map[uint64]cell.LazyCellLoader
+	stateCellLoaderSnapshot            atomic.Value
 	nextStateCellLoaderID              uint64
 	stateSerializer                    *stateSerializer
 	maintenanceWake                    chan struct{}
 	stateTTL                           time.Duration
 	archiveTTL                         time.Duration
-	disableArchiveBackfill             bool
+	archiveFromZero                    bool
 	syncDiskSpacePath                  string
 	minSyncDiskFreeBytes               uint64
 	minStateSerializationDiskFreeBytes uint64
@@ -206,39 +212,38 @@ type Service struct {
 }
 
 type Options struct {
-	ArchiveCatchUpCheckpointBlocks     uint32
-	ArchiveCatchUpCheckpointPeriod     time.Duration
-	ArchiveCatchUpPrefetchWindows      int
-	NextBlockCheckpointBlocks          uint32
-	CheckpointBytes                    uint64
-	SyncBackpressureWindows            uint32
-	CurrentStatePublisher              CurrentStatePublisher
-	ShutdownContext                    context.Context
-	StateFilesDir                      string
-	StateTTL                           time.Duration
-	ArchiveTTL                         time.Duration
-	StorageDir                         string
-	MinSyncDiskFreeBytes               uint64
-	MinStateSerializationDiskFreeBytes uint64
-	DisableStateSerialization          bool
-	DisableArchiveBackfill             bool
-	SyncObserver                       SyncObserver
+	ArchiveCatchUpCheckpointBlocks          uint32
+	ArchiveCatchUpCheckpointPeriod          time.Duration
+	ArchiveCatchUpPrefetchWindows           int
+	NextBlockCheckpointBlocks               uint32
+	CheckpointBytes                         uint64
+	SyncBackpressureWindows                 uint32
+	CurrentStatePublisher                   CurrentStatePublisher
+	LiveBlockCache                          *storage.LiveBlockCache
+	CurrentStatePublisherUsesLiveBlockCache bool
+	ShutdownContext                         context.Context
+	StateFilesDir                           string
+	StateTTL                                time.Duration
+	ArchiveTTL                              time.Duration
+	ArchiveFromZero                         bool
+	StorageDir                              string
+	MinSyncDiskFreeBytes                    uint64
+	MinStateSerializationDiskFreeBytes      uint64
+	DisableStateSerialization               bool
+	SyncObserver                            SyncObserver
 }
 
 type CurrentStatePublisher interface {
 	SetLiveCurrentState(*storage.CurrentState)
-}
-
-type CurrentStateFlusher interface {
 	MarkLiveCurrentStateFlushed(*storage.CurrentState)
-}
-
-type liveBlockStateFlusher interface {
 	MarkLiveBlockStatesFlushed([]ton.BlockIDExt)
-}
-
-type liveBlockArtifactFlusher interface {
 	MarkLiveBlockFlushed(ton.BlockIDExt)
+	PublishLiveBlockArtifacts(storage.LiveBlockArtifacts) error
+	NonfinalBlockCacheEnabled() bool
+	PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts, storage.LiveBlockNonfinalKind) error
+	SetNonfinalCellLoader(cell.LazyCellLoader)
+	BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error)
+	LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error)
 }
 
 type SyncObserver interface {
@@ -495,6 +500,8 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		storage:                            store,
 		stateSync:                          stateSync,
 		liveState:                          opts.CurrentStatePublisher,
+		liveBlockCache:                     opts.LiveBlockCache,
+		liveStateUsesBlockCache:            opts.CurrentStatePublisherUsesLiveBlockCache,
 		sync:                               opts.SyncObserver,
 		stateCellPrewrite:                  newStateCellPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
@@ -510,7 +517,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		maintenanceWake:                    make(chan struct{}, 1),
 		stateTTL:                           opts.StateTTL,
 		archiveTTL:                         opts.ArchiveTTL,
-		disableArchiveBackfill:             opts.DisableArchiveBackfill,
+		archiveFromZero:                    opts.ArchiveFromZero,
 		syncDiskSpacePath:                  opts.StorageDir,
 		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
@@ -704,6 +711,14 @@ func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *S
 		shards, err := s.masterShardBlocks(ctx, latestMaster)
 		if err == nil {
 			setStatusLatestBasechain(snapshot, shards)
+			return
+		}
+		if !latestMaster.Equals(&current.Masterchain.Block) {
+			s.log.Debug().
+				Err(err).
+				Str("latest_masterchain", storage.FormatBlockRef(latestMaster)).
+				Str("current_masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+				Msg("skip latest basechain status because latest shard blocks are unavailable")
 			return
 		}
 	}
@@ -956,7 +971,7 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		prepared.PrepareElapsed = time.Since(prepareStarted)
 		observation.PrepareDuration = prepared.PrepareElapsed
 		s.rememberSeenMasterchainBlock(prepared.ID)
-		s.queueMasterchainBlockCandidateFromSource(prepared, synced.Trigger.SourcePeerID)
+		s.queuePreparedMasterchainBlockFromSource(prepared, synced.Trigger.SourcePeerID)
 		s.wakeCurrentStateSync()
 		return nil
 	}
@@ -968,55 +983,43 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 }
 
 func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, block VerifiedBlock) (*checkedMasterchainConsensus, error) {
-	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
-		return nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
-	}
-
-	prev := block.Meta.PrevRefs[0]
-	current, err := s.loadMasterStateForConsensus(ctx, prev)
+	prev, checked, err := s.validateMasterchainBlockConsensus(ctx, block, "validate synced masterchain block")
 	if errors.Is(err, storage.ErrNotFound) {
 		s.log.Debug().
 			Str("block", block.BlockRef()).
 			Str("prev", storage.FormatBlockRef(prev)).
 			Msg("skipping synced masterchain block until previous state is available for signature validation")
-		return nil, fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
-	}
-
-	if block.consensus == nil {
-		return nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
-	}
-	checked, err := s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
-	if err != nil {
-		return nil, fmt.Errorf("validate synced masterchain block %s: %w", block.BlockRef(), err)
-	}
-	return checked, nil
+	return checked, err
 }
 
 func (s *Service) validateVerifiedMasterchainBlock(ctx context.Context, block VerifiedBlock) (*checkedMasterchainConsensus, error) {
+	_, checked, err := s.validateMasterchainBlockConsensus(ctx, block, "validate masterchain block")
+	return checked, err
+}
+
+func (s *Service) validateMasterchainBlockConsensus(ctx context.Context, block VerifiedBlock, validationLabel string) (ton.BlockIDExt, *checkedMasterchainConsensus, error) {
 	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
-		return nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
+		return ton.BlockIDExt{}, nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
 	}
 
 	prev := block.Meta.PrevRefs[0]
 	current, err := s.loadMasterStateForConsensus(ctx, prev)
 	if errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
+		return prev, nil, fmt.Errorf("previous masterchain state %s: %w", storage.FormatBlockRef(prev), storage.ErrNotFound)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
+		return prev, nil, fmt.Errorf("load previous masterchain state %s: %w", storage.FormatBlockRef(prev), err)
 	}
 
 	if block.consensus == nil {
-		return nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
+		return prev, nil, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
 	}
 	checked, err := s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
 	if err != nil {
-		return nil, fmt.Errorf("validate masterchain block %s: %w", block.BlockRef(), err)
+		return prev, nil, fmt.Errorf("%s %s: %w", validationLabel, block.BlockRef(), err)
 	}
-	return checked, nil
+	return prev, checked, nil
 }
 
 func waitRetry(ctx context.Context, delay time.Duration) error {
@@ -1050,10 +1053,6 @@ func (s *Service) wakeCurrentStateSync() {
 	case s.currentStateWake <- struct{}{}:
 	default:
 	}
-	s.wakePersistentStateSerializer()
-}
-
-func (s *Service) wakePersistentStateSerializer() {
 	s.wakeServiceMaintenance()
 }
 
@@ -1081,7 +1080,6 @@ func isExpectedRetryError(err error) bool {
 		errors.Is(err, errPendingCellGenerationCompaction) ||
 		errors.Is(err, errPersistentStateGCActive) ||
 		errors.Is(err, errArchiveTTLGCActive) ||
-		errors.Is(err, errArchiveBackfillActive) ||
 		errors.Is(err, errExclusiveServiceTaskHighReadAmp) ||
 		errors.Is(err, errExclusiveServiceTaskHighLag) ||
 		errors.Is(err, errStateSerializationDelayed) ||

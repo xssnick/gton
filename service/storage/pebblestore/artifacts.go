@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -105,7 +104,7 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 	return writes, registrations, links, nil
 }
 
-func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkpointArtifactWrite, registrations []archivePackRegistration, links []storage.ServedBlockLink) error {
+func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkpointArtifactWrite, registrations []archivePackRegistration, links []storage.ServedBlockLink, metas map[storage.BlockRootHash]*storage.BlockMeta) error {
 	if err := s.registerArchivePacks(batch, registrations); err != nil {
 		return err
 	}
@@ -117,7 +116,7 @@ func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkp
 
 	pendingLinks := make(map[storage.BlockRootHash]ton.BlockIDExt, len(links))
 	for _, link := range links {
-		if err := s.setNextBlockLinkWithPending(batch, pendingLinks, link.Prev, link.Next); err != nil {
+		if err := s.mergeNextBlockLinkWithPendingMeta(metas, pendingLinks, link.Prev, link.Next); err != nil {
 			return err
 		}
 	}
@@ -149,6 +148,43 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 		}
 	}
 	return meta, proofKinds
+}
+
+func (s *Store) validateArchiveImportMasterRefs(requests []archiveAppendRequest) error {
+	if len(requests) == 0 {
+		return nil
+	}
+
+	batchMasters := make(map[uint32]struct{})
+	requiredMasters := make(map[uint32]ton.BlockIDExt)
+	for _, request := range requests {
+		masterSeqno, err := archiveEntryMasterSeqno(request.block, request.meta)
+		if err != nil {
+			return err
+		}
+		if isMasterchainBlock(request.block) {
+			batchMasters[masterSeqno] = struct{}{}
+			continue
+		}
+		if _, ok := requiredMasters[masterSeqno]; !ok {
+			requiredMasters[masterSeqno] = request.block
+		}
+	}
+
+	for masterSeqno, block := range requiredMasters {
+		if _, ok := batchMasters[masterSeqno]; ok {
+			continue
+		}
+
+		_, err := s.lookupBlockBySeqNo(context.Background(), storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, masterSeqno)
+		if errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("archive shard block %s requires stored masterchain block #%d", storage.FormatBlockRef(block), masterSeqno)
+		}
+		if err != nil {
+			return fmt.Errorf("lookup archive masterchain block #%d: %w", masterSeqno, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
@@ -229,7 +265,7 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 			proofRefIndexes[kind] = queueArchiveAppend(packEntryKindForProofKind(kind), full.ID, meta, full.ArchiveShardSplitDepth, full.Proof)
 		}
 
-		mergeArchiveImportMeta(metas, meta)
+		mergePendingBlockMeta(metas, meta)
 		fullWrites = append(fullWrites, fullWrite{
 			block:           full,
 			proofKinds:      proofKinds,
@@ -240,13 +276,9 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		})
 	}
 
-	metaKeys := make([]storage.BlockRootHash, 0, len(metas))
-	for key := range metas {
-		metaKeys = append(metaKeys, key)
+	if err := s.validateArchiveImportMasterRefs(appendRequests); err != nil {
+		return err
 	}
-	sort.Slice(metaKeys, func(i, j int) bool {
-		return bytes.Compare(metaKeys[i][:], metaKeys[j][:]) < 0
-	})
 
 	appendedRefs, appendRegistrations, err := s.appendArchiveEntries(appendRequests)
 	if err != nil {
@@ -279,19 +311,18 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 		}
 		pendingLinks := make(map[storage.BlockRootHash]ton.BlockIDExt, len(imported.Links))
 		for _, link := range imported.Links {
-			if err := s.setNextBlockLinkWithPending(batch, pendingLinks, link.Prev, link.Next); err != nil {
+			if err := s.mergeNextBlockLinkWithPendingMeta(metas, pendingLinks, link.Prev, link.Next); err != nil {
 				return err
 			}
 		}
-		for _, key := range metaKeys {
-			if err := s.setMergedBlockMeta(batch, metas[key]); err != nil {
-				return err
-			}
+		if err := s.setMergedBlockMetas(batch, metas); err != nil {
+			return err
 		}
-		return nil
+		return s.deleteSyncedPackAppendMarkers(batch, syncedPacks)
 	}); err != nil {
 		return err
 	}
+	s.deleteArchivePackageRegistrationCache(registrations)
 	s.clearSyncedArtifactPacks(syncedPacks)
 	artifactCommitted = true
 	return nil
@@ -342,7 +373,11 @@ func (s *Store) checkArtifactRef(ref *storage.ArtifactRef) error {
 		return storage.ErrNotFound
 	}
 
-	stat, err := os.Stat(s.artifactPath(ref.Path))
+	path, err := s.artifactRefPath(context.Background(), ref)
+	if err != nil {
+		return err
+	}
+	stat, err := os.Stat(s.artifactPath(path))
 	if err != nil {
 		if isMissingArtifactError(err) {
 			return storage.ErrNotFound
@@ -355,81 +390,79 @@ func (s *Store) checkArtifactRef(ref *storage.ArtifactRef) error {
 	return nil
 }
 
-func mergeArchiveImportMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, meta *storage.BlockMeta) {
+func mergePendingBlockMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, meta *storage.BlockMeta) {
 	key := storage.BlockKey(meta.ID)
 	merged := storage.MergeBlockMeta(metas[key], meta)
 	merged.ID = meta.ID
 	metas[key] = merged
 }
 
-func (s *Store) setNextBlockLinkWithPending(batch *pebble.Batch, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
-	key := hotKeyNextBlock(prev)
-	value := encodeBlockID(next)
+func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	pendingKey := storage.BlockKey(prev)
 	if existing, ok := pending[pendingKey]; ok {
-		if existing.Equals(&next) {
-			return nil
-		}
-		if selected, ok := selectShardSplitNextLink(prev, existing, next); ok {
-			if existing.Equals(&selected) {
-				s.log.Debug().
-					Str("prev", storage.FormatBlockRef(prev)).
-					Str("existing_next", storage.FormatBlockRef(existing)).
-					Str("ignored_next", storage.FormatBlockRef(next)).
-					Msg("keeping selected shard split next block link")
-				return nil
-			}
-			s.log.Debug().
-				Str("prev", storage.FormatBlockRef(prev)).
-				Str("existing_next", storage.FormatBlockRef(existing)).
-				Str("selected_next", storage.FormatBlockRef(selected)).
-				Msg("updating shard split next block link to selected child")
-			pending[pendingKey] = selected
-			return batch.Set(key, encodeBlockID(selected), pebble.NoSync)
-		}
-		return fmt.Errorf("next block link for %s already points to %s, cannot set %s", storage.FormatBlockRef(prev), storage.FormatBlockRef(existing), storage.FormatBlockRef(next))
+		return s.mergeSelectedNextBlockLink(metas, pending, prev, existing, next)
+	}
+	if meta := metas[pendingKey]; meta != nil && len(meta.NextRefs) > 0 {
+		return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
 	}
 
-	current, closer, err := pebbleReaderGet(s.hot, key)
+	current, closer, err := pebbleReaderGet(s.hot, hotKeyBlockMeta(prev))
 	if err == nil {
 		defer func() { _ = closer.Close() }()
-		if bytes.Equal(current, value) {
-			return nil
-		}
-
-		existing, err := decodeBlockID(current)
+		meta, err := decodeBlockMeta(prev, current)
 		if err != nil {
 			return err
 		}
-		if selected, ok := selectShardSplitNextLink(prev, existing, next); ok {
-			if existing.Equals(&selected) {
-				s.log.Debug().
-					Str("prev", storage.FormatBlockRef(prev)).
-					Str("existing_next", storage.FormatBlockRef(existing)).
-					Str("ignored_next", storage.FormatBlockRef(next)).
-					Msg("keeping selected shard split next block link")
-				return nil
-			}
-			s.log.Debug().
-				Str("prev", storage.FormatBlockRef(prev)).
-				Str("existing_next", storage.FormatBlockRef(existing)).
-				Str("selected_next", storage.FormatBlockRef(selected)).
-				Msg("updating shard split next block link to selected child")
-			if pending != nil {
-				pending[pendingKey] = selected
-			}
-			return batch.Set(key, encodeBlockID(selected), pebble.NoSync)
+		if len(meta.NextRefs) > 0 {
+			return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
 		}
-
-		return fmt.Errorf("next block link for %s already points to %s, cannot set %s", storage.FormatBlockRef(prev), storage.FormatBlockRef(existing), storage.FormatBlockRef(next))
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
-	if pending != nil {
-		pending[pendingKey] = next
+	recordPendingNextBlockLink(metas, pending, prev, next)
+	return nil
+}
+
+func (s *Store) mergeSelectedNextBlockLink(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, existing ton.BlockIDExt, next ton.BlockIDExt) error {
+	if existing.Equals(&next) {
+		if pending != nil {
+			pending[storage.BlockKey(prev)] = next
+		}
+		return nil
 	}
-	return batch.Set(key, value, pebble.NoSync)
+
+	if selected, ok := selectShardSplitNextLink(prev, existing, next); ok {
+		if existing.Equals(&selected) {
+			s.log.Debug().
+				Str("prev", storage.FormatBlockRef(prev)).
+				Str("existing_next", storage.FormatBlockRef(existing)).
+				Str("ignored_next", storage.FormatBlockRef(next)).
+				Msg("keeping selected shard split next block link")
+			return nil
+		}
+		s.log.Debug().
+			Str("prev", storage.FormatBlockRef(prev)).
+			Str("existing_next", storage.FormatBlockRef(existing)).
+			Str("selected_next", storage.FormatBlockRef(selected)).
+			Msg("updating shard split next block link to selected child")
+		recordPendingNextBlockLink(metas, pending, prev, selected)
+		return nil
+	}
+
+	return fmt.Errorf("next block link for %s already points to %s, cannot set %s", storage.FormatBlockRef(prev), storage.FormatBlockRef(existing), storage.FormatBlockRef(next))
+}
+
+func recordPendingNextBlockLink(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) {
+	key := storage.BlockKey(prev)
+	if pending != nil {
+		pending[key] = next
+	}
+	// Pebble batch reads do not see earlier batch.Set calls. Keep every same-batch
+	// block-handle update in this pending meta map first, then write each meta once
+	// at commit time, otherwise a later metadata update can overwrite a staged
+	// NextRefs update for the same previous block.
+	mergePendingBlockMeta(metas, &storage.BlockMeta{ID: prev, NextRefs: []ton.BlockIDExt{next}})
 }
 
 func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
@@ -442,9 +475,17 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 		if err != nil {
 			return err
 		}
+	} else if err := s.validateZeroStateArtifactPath(block, ref.Path); err != nil {
+		return err
+	}
+	if ref.Size <= 0 {
+		return fmt.Errorf("zerostate file size is invalid")
+	}
+	if ref.Offset != 0 {
+		return fmt.Errorf("zerostate file offset must be zero")
 	}
 	return s.withHotBatch(func(batch *pebble.Batch) error {
-		return s.setHotUnique(batch, hotKeyZeroStateRef(block), encodeArtifactRef(ref))
+		return s.setHotUnique(batch, hotKeyZeroStateRef(block), encodeStateFileRef(ref.Size))
 	})
 }
 
@@ -455,10 +496,16 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 	if file.Ref.Offset < 0 {
 		return fmt.Errorf("persistent state file offset is invalid")
 	}
+	if file.Ref.Offset != 0 {
+		return fmt.Errorf("persistent state file offset must be zero")
+	}
+	if err := s.validatePersistentStateArtifactPath(file.Block, file.MasterchainBlock, file.EffectiveShard, file.Ref.Path); err != nil {
+		return err
+	}
 
 	stored := *file
 	stored.Ref = file.Ref.Clone()
-	stored.Ref.Path = s.relativeArtifactPath(stored.Ref.Path)
+	stored.Ref.Path = ""
 
 	meta := &storage.BlockMeta{
 		ID:            stored.Block,
@@ -481,7 +528,7 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 }
 
 func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error {
-	record, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+	_, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
 	if err != nil {
 		return err
 	}
@@ -499,10 +546,11 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 		return err
 	}
 
-	if record.ref.Offset != 0 {
-		return nil
+	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return err
 	}
-	if err = os.Remove(s.artifactPath(record.ref.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -566,15 +614,14 @@ func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.S
 }
 
 func (s *Store) NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*storage.ServedBlockFull, error) {
-	nextRaw, err := s.getHotCopy(ctx, hotKeyNextBlock(prev))
+	meta, err := s.BlockMeta(ctx, prev)
 	if err != nil {
 		return nil, err
 	}
-	next, err := decodeBlockID(nextRaw)
-	if err != nil {
-		return nil, err
+	if len(meta.NextRefs) == 0 {
+		return nil, storage.ErrNotFound
 	}
-	return s.BlockFull(ctx, next)
+	return s.BlockFull(ctx, meta.NextRefs[0])
 }
 
 func (s *Store) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
@@ -586,7 +633,19 @@ func (s *Store) BlockProof(ctx context.Context, kind storage.ServedProofKind, bl
 }
 
 func (s *Store) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	return s.readArtifact(ctx, hotKeyZeroStateRef(block))
+	raw, err := s.getHotCopy(ctx, hotKeyZeroStateRef(block))
+	if err != nil {
+		return nil, err
+	}
+	size, err := decodeStateFileRef(raw)
+	if err != nil {
+		return nil, err
+	}
+	path, err := s.zeroStateArtifactPath(block)
+	if err != nil {
+		return nil, err
+	}
+	return s.readArtifactFileRange(ctx, path, 0, size, size)
 }
 
 func (s *Store) StoredZeroStateBlocks(ctx context.Context) ([]ton.BlockIDExt, error) {
@@ -637,17 +696,21 @@ func (s *Store) PersistentStateSize(ctx context.Context, block ton.BlockIDExt, m
 	if err != nil {
 		return 0, err
 	}
-	stat, err := os.Stat(s.artifactPath(record.ref.Path))
+	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return 0, err
+	}
+	stat, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, storage.ErrNotFound
 		}
 		return 0, err
 	}
-	if stat.Size() < record.ref.Offset+record.ref.Size {
+	if stat.Size() < record.size {
 		return 0, storage.ErrNotFound
 	}
-	return record.ref.Size, nil
+	return record.size, nil
 }
 
 func (s *Store) PersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*storage.PersistentStateFile, error) {
@@ -655,15 +718,20 @@ func (s *Store) PersistentStateFile(ctx context.Context, block ton.BlockIDExt, m
 	if err != nil {
 		return nil, err
 	}
-	ref := record.ref.Clone()
-	ref.Path = s.artifactPath(ref.Path)
+	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return nil, err
+	}
 	return &storage.PersistentStateFile{
 		Block:            block,
 		MasterchainBlock: masterchainBlock,
 		EffectiveShard:   effectiveShard,
-		Ref:              ref,
-		FileHash:         bytes.Clone(record.fileHash),
-		StateRootHash:    bytes.Clone(record.stateRootHash),
+		Ref: &storage.ArtifactRef{
+			Path: path,
+			Size: record.size,
+		},
+		FileHash:      bytes.Clone(record.fileHash),
+		StateRootHash: bytes.Clone(record.stateRootHash),
 	}, nil
 }
 
@@ -678,14 +746,18 @@ func (s *Store) PersistentStateSlice(ctx context.Context, block ton.BlockIDExt, 
 	if maxSize == 0 {
 		return []byte{}, nil
 	}
-	if offset >= record.ref.Size {
+	if offset >= record.size {
 		return nil, nil
 	}
-	size := record.ref.Size - offset
+	size := record.size - offset
 	if size > maxSize {
 		size = maxSize
 	}
-	return s.readArtifactRange(ctx, record.ref.Path, record.ref.Offset+offset, size, record.ref.Offset+record.ref.Size)
+	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return nil, err
+	}
+	return s.readArtifactFileRange(ctx, path, offset, size, record.size)
 }
 
 func (s *Store) persistentStateFileRecord(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*persistentStateFileRecord, error) {
@@ -697,9 +769,19 @@ func (s *Store) persistentStateFileRecord(ctx context.Context, block ton.BlockID
 }
 
 func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {
-	raw, err := s.getHotCopy(ctx, hotKeyArchiveInfo(masterchainSeqno, workchain, shard))
+	if masterchainSeqno < 0 {
+		return 0, storage.ErrNotFound
+	}
+
+	baseSeqno, err := s.archivePackageBaseSeqno(uint32(masterchainSeqno), false)
+	if err != nil {
+		return 0, err
+	}
+	startSeqno := archiveSliceSeqno(baseSeqno, uint32(masterchainSeqno))
+
+	raw, err := s.getHotCopy(ctx, hotKeyArchiveInfo(baseSeqno, startSeqno, workchain, shard))
 	if errors.Is(err, storage.ErrNotFound) && workchain != -1 {
-		raw, err = s.archiveInfoForSplitShardPrefix(ctx, masterchainSeqno, workchain, shard)
+		raw, err = s.archiveInfoForSplitShardPrefix(ctx, baseSeqno, startSeqno, workchain, shard)
 	}
 	if err != nil {
 		return 0, err
@@ -710,13 +792,13 @@ func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32, workcha
 	return int64(binary.BigEndian.Uint64(raw)), nil
 }
 
-func (s *Store) archiveInfoForSplitShardPrefix(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) ([]byte, error) {
+func (s *Store) archiveInfoForSplitShardPrefix(ctx context.Context, baseSeqno uint32, startSeqno uint32, workchain int32, shard int64) ([]byte, error) {
 	for depth := uint32(1); depth <= 60; depth++ {
 		prefix := archivePackShardPrefix(workchain, shard, depth)
 		if prefix == shard {
 			continue
 		}
-		raw, err := s.getHotCopy(ctx, hotKeyArchiveInfo(masterchainSeqno, workchain, prefix))
+		raw, err := s.getHotCopy(ctx, hotKeyArchiveInfo(baseSeqno, startSeqno, workchain, prefix))
 		if err == nil {
 			return raw, nil
 		}
@@ -728,11 +810,7 @@ func (s *Store) archiveInfoForSplitShardPrefix(ctx context.Context, masterchainS
 }
 
 func (s *Store) ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error) {
-	raw, err := s.getHotCopy(ctx, hotKeyArchiveFile(archiveID))
-	if err != nil {
-		return nil, err
-	}
-	ref, err := decodeArtifactRef(raw)
+	meta, err := s.archivePackageMetaByID(ctx, archiveID)
 	if err != nil {
 		return nil, err
 	}
@@ -742,21 +820,25 @@ func (s *Store) ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSi
 	if maxSize == 0 {
 		return []byte{}, nil
 	}
-	if offset >= ref.Size {
+	if offset >= meta.size {
 		return nil, nil
 	}
-	size := ref.Size - offset
+	size := meta.size - offset
 	if size > int64(maxSize) {
 		size = int64(maxSize)
 	}
-	return s.readArtifactRange(ctx, ref.Path, offset, size, ref.Size)
+	return s.readArtifactRange(ctx, meta.path, offset, size, meta.size)
 }
 
 func (s *Store) readArtifactRef(ctx context.Context, ref *storage.ArtifactRef) ([]byte, error) {
 	if ref == nil {
 		return nil, storage.ErrNotFound
 	}
-	return s.readArtifactRange(ctx, ref.Path, ref.Offset, ref.Size, ref.Offset+ref.Size)
+	path, err := s.artifactRefPath(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	return s.readArtifactRange(ctx, path, ref.Offset, ref.Size, ref.Offset+ref.Size)
 }
 
 func (s *Store) readArtifactRange(ctx context.Context, path string, offset int64, size int64, minFileSize int64) ([]byte, error) {
@@ -779,6 +861,70 @@ func (s *Store) readArtifact(ctx context.Context, key []byte) ([]byte, error) {
 	return s.readArtifactRef(ctx, ref)
 }
 
+func (s *Store) artifactRefPath(ctx context.Context, ref *storage.ArtifactRef) (string, error) {
+	if ref.ArchivePackage {
+		if ref.ArchivePackageID < 0 {
+			return s.keyBlockProofPackPath(uint32(keyProofPackageIDFromRef(ref.ArchivePackageID))), nil
+		}
+		meta, err := s.archivePackageMetaByID(ctx, ref.ArchivePackageID)
+		if err != nil {
+			return "", err
+		}
+		if meta.path == "" {
+			return "", storage.ErrNotFound
+		}
+		return meta.path, nil
+	}
+	return "", storage.ErrNotFound
+}
+
+func (s *Store) zeroStateArtifactPath(block ton.BlockIDExt) (string, error) {
+	name, err := storage.ZeroStateFileName(block)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(s.StateFilesDir(), name), nil
+}
+
+func (s *Store) persistentStateArtifactPath(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
+	name, err := storage.PersistentStateFileName(block, master, effectiveShard)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(s.StateFilesDir(), name), nil
+}
+
+func (s *Store) validateZeroStateArtifactPath(block ton.BlockIDExt, path string) error {
+	expected, err := s.zeroStateArtifactPath(block)
+	if err != nil {
+		return err
+	}
+	return validateArtifactCanonicalPath(s.artifactPath(path), expected)
+}
+
+func (s *Store) validatePersistentStateArtifactPath(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64, path string) error {
+	expected, err := s.persistentStateArtifactPath(block, master, effectiveShard)
+	if err != nil {
+		return err
+	}
+	return validateArtifactCanonicalPath(s.artifactPath(path), expected)
+}
+
+func validateArtifactCanonicalPath(path string, expected string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	absExpected, err := filepath.Abs(expected)
+	if err != nil {
+		return err
+	}
+	if absPath != absExpected {
+		return fmt.Errorf("artifact path %s does not match canonical path %s", absPath, absExpected)
+	}
+	return nil
+}
+
 func (s *Store) artifactPath(path string) string {
 	if filepath.IsAbs(path) {
 		return path
@@ -786,13 +932,21 @@ func (s *Store) artifactPath(path string) string {
 	return filepath.Join(s.dir, path)
 }
 
-func (s *Store) relativeArtifactPath(path string) string {
-	rel, err := filepath.Rel(s.dir, path)
+func (s *Store) relativeArtifactPath(path string) (string, error) {
+	root, err := filepath.Abs(s.dir)
 	if err != nil {
-		return path
+		return "", err
 	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
 	}
-	return rel
+	rel, err := filepath.Rel(root, absPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("artifact path %s is outside store dir %s", absPath, root)
+	}
+	return rel, nil
 }

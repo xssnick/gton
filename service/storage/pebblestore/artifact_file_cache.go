@@ -14,6 +14,7 @@ import (
 type artifactFileCache struct {
 	mu        sync.Mutex
 	notify    chan struct{}
+	waiters   int
 	maxOpen   int
 	openCount int
 	entries   map[string]*artifactFileEntry
@@ -125,11 +126,13 @@ func (c *artifactFileCache) acquire(ctx context.Context, path string) (*artifact
 			return c.openReserved(ctx, path, opening)
 		}
 		notify := c.notify
+		c.waiters++
 		c.mu.Unlock()
 
 		select {
 		case <-notify:
 		case <-ctx.Done():
+			c.cancelWaiter()
 			return nil, ctx.Err()
 		}
 	}
@@ -302,8 +305,20 @@ func (c *artifactFileCache) removeEntryLocked(entry *artifactFileEntry) {
 }
 
 func (c *artifactFileCache) broadcastLocked() {
+	if c.waiters == 0 {
+		return
+	}
+	c.waiters = 0
 	close(c.notify)
 	c.notify = make(chan struct{})
+}
+
+func (c *artifactFileCache) cancelWaiter() {
+	c.mu.Lock()
+	if c.waiters > 0 {
+		c.waiters--
+	}
+	c.mu.Unlock()
 }
 
 func (s *Store) readArtifactFileRange(ctx context.Context, path string, offset int64, size int64, minFileSize int64) ([]byte, error) {

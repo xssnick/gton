@@ -19,10 +19,20 @@ import (
 )
 
 const (
-	runMethodSupportedMode uint32 = 0x3f
-	runMethodMaxParamBytes        = 65536
-	runMethodGasLimit      int64  = 300000
+	runMethodSupportedMode    uint32 = 0x3f
+	runMethodMaxParamBytes           = 65536
+	runMethodGasLimit         int64  = 300000
+	runMethodConfigParamCount        = 6
 )
+
+var runMethodConfigParamIDs = [runMethodConfigParamCount]uint32{
+	tlb.ConfigParamGlobalID,
+	tlb.ConfigParamGasPricesMasterchain,
+	tlb.ConfigParamGasPricesBasechain,
+	tlb.ConfigParamMsgForwardPricesMasterchain,
+	tlb.ConfigParamMsgForwardPricesBasechain,
+	tlb.ConfigParamSizeLimits,
+}
 
 type runMethodAccount struct {
 	base        ton.BlockIDExt
@@ -182,14 +192,19 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 	return result
 }
 
-func runMethodStack(methodID uint64, params *cell.Cell) (*vmcore.Stack, error) {
-	if params != nil && len(params.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})) >= runMethodMaxParamBytes {
+func runMethodStack(methodID uint64, params []byte) (*vmcore.Stack, error) {
+	if len(params) >= runMethodMaxParamBytes {
 		return nil, fmt.Errorf("more than 64k parameter bytes passed")
 	}
 
 	var stack tlb.Stack
-	if params != nil {
-		loader, err := params.BeginParse()
+	if len(params) > 0 {
+		paramsCell, err := cell.FromBOC(params)
+		if err != nil {
+			return nil, fmt.Errorf("parameter list boc cannot be deserialized as a VmStack: %w", err)
+		}
+
+		loader, err := paramsCell.BeginParse()
 		if err != nil {
 			return nil, fmt.Errorf("parameter list boc cannot be deserialized as a VmStack: %w", err)
 		}
@@ -201,8 +216,9 @@ func runMethodStack(methodID uint64, params *cell.Cell) (*vmcore.Stack, error) {
 		}
 	}
 
-	values := make([]any, 0, stack.Depth())
-	for stack.Depth() > 0 {
+	depth := stack.Depth()
+	values := make([]any, 0, depth)
+	for i := uint(0); i < depth; i++ {
 		value, err := stack.Pop()
 		if err != nil {
 			return nil, err
@@ -376,6 +392,12 @@ type runMethodBaseConfig struct {
 	GlobalVersion int
 	PrevBlocks    any
 	Config        tlb.BlockchainConfig
+	Unpacked      runMethodUnpackedConfigCells
+}
+
+type runMethodUnpackedConfigCells struct {
+	StoragePrices *cell.Cell
+	Params        [runMethodConfigParamCount]*cell.Cell
 }
 
 func runMethodConfig(master ton.BlockIDExt, masterState *cell.Cell, now uint32, code *cell.Cell) (runMethodConfigInfo, error) {
@@ -416,17 +438,23 @@ func buildRunMethodBaseConfig(master ton.BlockIDExt, extra *tlb.McStateExtra) (*
 		return nil, err
 	}
 
+	unpacked, err := loadRunMethodUnpackedConfigCells(config)
+	if err != nil {
+		return nil, err
+	}
+
 	return &runMethodBaseConfig{
 		Root:          config.Root,
 		Present:       true,
 		GlobalVersion: globalVersion,
 		PrevBlocks:    prevBlocks,
 		Config:        config,
+		Unpacked:      unpacked,
 	}, nil
 }
 
 func runMethodConfigFromBase(base *runMethodBaseConfig, now uint32, code *cell.Cell) (runMethodConfigInfo, error) {
-	unpacked, err := runMethodUnpackedConfig(base.Config, now)
+	unpacked, err := runMethodUnpackedConfig(base.Unpacked, now)
 	if err != nil {
 		return runMethodConfigInfo{}, err
 	}
@@ -603,22 +631,36 @@ func runMethodBlockIDTuple(id ton.BlockIDExt) tuple.Tuple {
 	)
 }
 
-func runMethodUnpackedConfig(config tlb.BlockchainConfig, now uint32) (tuple.Tuple, error) {
-	storagePrices, err := runMethodCurrentStoragePrices(config, now)
+func loadRunMethodUnpackedConfigCells(config tlb.BlockchainConfig) (runMethodUnpackedConfigCells, error) {
+	storagePrices, err := runMethodConfigParamCell(config, tlb.ConfigParamStoragePrices)
+	if err != nil {
+		return runMethodUnpackedConfigCells{}, err
+	}
+
+	var params [runMethodConfigParamCount]*cell.Cell
+	for i, id := range runMethodConfigParamIDs {
+		param, err := runMethodConfigParamCell(config, id)
+		if err != nil {
+			return runMethodUnpackedConfigCells{}, err
+		}
+		params[i] = param
+	}
+
+	return runMethodUnpackedConfigCells{
+		StoragePrices: storagePrices,
+		Params:        params,
+	}, nil
+}
+
+func runMethodUnpackedConfig(config runMethodUnpackedConfigCells, now uint32) (tuple.Tuple, error) {
+	storagePrices, err := runMethodCurrentStoragePrices(config.StoragePrices, now)
 	if err != nil {
 		return tuple.Tuple{}, err
 	}
 
 	values := []any{runMethodMaybeSlice(storagePrices)}
-	for _, id := range []uint32{
-		tlb.ConfigParamGlobalID,
-		tlb.ConfigParamGasPricesMasterchain,
-		tlb.ConfigParamGasPricesBasechain,
-		tlb.ConfigParamMsgForwardPricesMasterchain,
-		tlb.ConfigParamMsgForwardPricesBasechain,
-		tlb.ConfigParamSizeLimits,
-	} {
-		param, err := runMethodConfigParamSlice(config, id)
+	for _, paramCell := range config.Params {
+		param, err := runMethodConfigParamSlice(paramCell)
 		if err != nil {
 			return tuple.Tuple{}, err
 		}
@@ -628,10 +670,9 @@ func runMethodUnpackedConfig(config tlb.BlockchainConfig, now uint32) (tuple.Tup
 	return tuple.NewTupleValue(values...), nil
 }
 
-func runMethodCurrentStoragePrices(config tlb.BlockchainConfig, now uint32) (*cell.Slice, error) {
-	root, err := runMethodConfigParamCell(config, tlb.ConfigParamStoragePrices)
-	if err != nil || root == nil {
-		return nil, err
+func runMethodCurrentStoragePrices(root *cell.Cell, now uint32) (*cell.Slice, error) {
+	if root == nil {
+		return nil, nil
 	}
 
 	entries, err := root.AsDict(32).LoadAll()
@@ -656,10 +697,9 @@ func runMethodCurrentStoragePrices(config tlb.BlockchainConfig, now uint32) (*ce
 	return best, nil
 }
 
-func runMethodConfigParamSlice(config tlb.BlockchainConfig, id uint32) (*cell.Slice, error) {
-	param, err := runMethodConfigParamCell(config, id)
-	if err != nil || param == nil {
-		return nil, err
+func runMethodConfigParamSlice(param *cell.Cell) (*cell.Slice, error) {
+	if param == nil {
+		return nil, nil
 	}
 	return param.BeginParse()
 }

@@ -106,20 +106,11 @@ func newLiteServerProofBuilder(root *cell.Cell) *cell.MerkleProofBuilder {
 }
 
 func (s *Server) loadBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
-	if cached, ok := s.store.(blockRootStore); ok {
-		root, err := cached.BlockRoot(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		return root, nil
-	}
-
-	data, err := s.store.BlockData(ctx, id)
+	root, err := s.store.BlockRoot(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-
-	return parseTrustedBlockBOC(id, data)
+	return root, nil
 }
 
 func (s *Server) loadStateRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
@@ -173,16 +164,7 @@ func (s *Server) loadStateRootHash(ctx context.Context, id ton.BlockIDExt) ([]by
 }
 
 func (s *Server) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error) {
-	if cached, ok := s.store.(blockFragmentsStore); ok {
-		return cached.BlockFragments(ctx, block)
-	}
-
-	stateRoot, blockRoot, err := s.loadStateRootWithBlockRoot(ctx, block)
-	if err != nil {
-		return nil, err
-	}
-
-	return buildLiveBlockFragments(block, blockRoot, stateRoot)
+	return s.store.BlockFragments(ctx, block)
 }
 
 func stateRootHashFromBlock(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) {

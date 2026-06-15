@@ -12,11 +12,7 @@ func (s *Service) CanAcceptBroadcast(_ p2p.BroadcastAdmissionRequest) bool {
 		return true
 	}
 
-	s.broadcastAdmissionMu.Lock()
-	closed := s.broadcastAdmissionClosed
-	s.broadcastAdmissionMu.Unlock()
-
-	return !closed
+	return !s.broadcastAdmissionClosedAtomic.Load()
 }
 
 func (s *Service) observeBroadcastLiveCurrentState(current *storage.CurrentState) {
@@ -69,6 +65,7 @@ func (s *Service) updateBroadcastAdmissionLocked() {
 	if wasClosed == s.broadcastAdmissionClosed {
 		return
 	}
+	s.broadcastAdmissionClosedAtomic.Store(s.broadcastAdmissionClosed)
 
 	event := s.log.Info()
 	if s.broadcastAdmissionClosed {

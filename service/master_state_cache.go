@@ -35,9 +35,7 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 		return
 	}
 
-	if block != nil && block.Meta != nil && block.Meta.Has(storage.BlockMetaIsKeyBlock) {
-		s.resetMonitorSplitDepthCache()
-	}
+	s.resetMasterDependentCachesForKeyBlock(block)
 
 	s.rememberCompressedBlockState(state)
 	s.updateP2PShardOverlays(ctx, state, block)
@@ -65,6 +63,15 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 	if s.node != nil {
 		s.node.NotifyCompressedBlockStateReady()
 	}
+}
+
+func (s *Service) resetMasterDependentCachesForKeyBlock(block *PreparedBlock) {
+	if block == nil || block.Meta == nil || !block.Meta.Has(storage.BlockMetaIsKeyBlock) {
+		return
+	}
+
+	s.resetMonitorSplitDepthCache()
+	s.broadcastValidatorCache.reset()
 }
 
 func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
@@ -359,14 +366,14 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 		return nil, err
 	}
 
-	if live, ok := s.liveState.(liveStateRootStore); ok {
-		state, err = live.BlockState(ctx, block)
+	if s.liveState != nil {
+		state, err = s.liveState.BlockState(ctx, block)
 		if err == nil {
 			if state.Cell != nil {
 				return state.Cell, nil
 			}
 			if len(state.StateRootHash) == 32 {
-				root, err := live.LoadStateCellTree(ctx, block, state.StateRootHash)
+				root, err := s.liveState.LoadStateCellTree(ctx, block, state.StateRootHash)
 				if err == nil {
 					return root, nil
 				}
@@ -400,11 +407,6 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 
 	root, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
 	return root, err
-}
-
-type liveStateRootStore interface {
-	BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error)
-	LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error)
 }
 
 func currentStateBlockState(current *storage.CurrentState, block ton.BlockIDExt) (*storage.BlockState, error) {

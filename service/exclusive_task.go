@@ -19,7 +19,6 @@ const (
 var (
 	errPersistentStateGCActive         = errors.New("persistent state gc is running")
 	errArchiveTTLGCActive              = errors.New("archive ttl gc is running")
-	errArchiveBackfillActive           = errors.New("archive backfill is running")
 	errExclusiveServiceTaskHighReadAmp = errors.New("db read amplification is too high")
 	errExclusiveServiceTaskHighLag     = errors.New("sync lag is too high")
 )
@@ -32,26 +31,11 @@ const (
 	exclusiveServiceTaskCellGenerationMigration exclusiveServiceTask = "cell_generation_migration"
 	exclusiveServiceTaskPersistentStateGC       exclusiveServiceTask = "persistent_state_gc"
 	exclusiveServiceTaskArchiveTTLGC            exclusiveServiceTask = "archive_ttl_gc"
-	exclusiveServiceTaskArchiveBackfill         exclusiveServiceTask = "archive_backfill"
 )
 
 type exclusiveServiceTaskLease struct {
 	service *Service
 	task    exclusiveServiceTask
-}
-
-type exclusiveServiceTaskReadAmpStore interface {
-	MaxReadAmp(ctx context.Context) (int64, error)
-}
-
-func (s *Service) canStartExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask) error {
-	s.exclusiveTaskMu.Lock()
-	err := s.canStartExclusiveServiceTaskLocked(task)
-	s.exclusiveTaskMu.Unlock()
-	if err != nil {
-		return err
-	}
-	return s.canStartExclusiveServiceTaskLimits(ctx, task)
 }
 
 func (s *Service) beginExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask) (*exclusiveServiceTaskLease, error) {
@@ -90,12 +74,7 @@ func exclusiveServiceTaskIsCleanup(task exclusiveServiceTask) bool {
 }
 
 func (s *Service) canStartExclusiveServiceTaskReadAmp(ctx context.Context) error {
-	store, ok := s.storage.(exclusiveServiceTaskReadAmpStore)
-	if !ok {
-		return nil
-	}
-
-	readAmp, err := store.MaxReadAmp(ctx)
+	readAmp, err := s.storage.MaxReadAmp(ctx)
 	if err != nil {
 		return fmt.Errorf("check db read amplification: %w", err)
 	}
@@ -231,8 +210,6 @@ func (t exclusiveServiceTask) backgroundStatus() string {
 		return "pruning persistent states"
 	case exclusiveServiceTaskArchiveTTLGC:
 		return "pruning archives"
-	case exclusiveServiceTaskArchiveBackfill:
-		return "backfilling archives"
 	default:
 		return string(t)
 	}
@@ -260,8 +237,6 @@ func exclusiveServiceTaskError(task exclusiveServiceTask) error {
 		return errPersistentStateGCActive
 	case exclusiveServiceTaskArchiveTTLGC:
 		return errArchiveTTLGCActive
-	case exclusiveServiceTaskArchiveBackfill:
-		return errArchiveBackfillActive
 	default:
 		return fmt.Errorf("exclusive service task %q is running", task)
 	}

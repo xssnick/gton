@@ -31,6 +31,32 @@ type Parsed struct {
 	Meta  *tnstore.BlockMeta
 }
 
+const masterchainShard = int64(-1 << 63)
+
+func ValidateHardforkBlockHeader(block ton.BlockIDExt, keyBlock bool, vertSeqnoIncr bool) error {
+	if block.Workchain != -1 || block.Shard != masterchainShard {
+		return fmt.Errorf("hardfork block is not masterchain: %s", tnstore.FormatBlockRef(block))
+	}
+	if len(block.RootHash) != 32 || len(block.FileHash) != 32 {
+		return fmt.Errorf("hardfork block has invalid hashes: %s", tnstore.FormatBlockRef(block))
+	}
+	if !keyBlock {
+		return fmt.Errorf("hardfork block %s is not a key block", tnstore.FormatBlockRef(block))
+	}
+	if !vertSeqnoIncr {
+		return fmt.Errorf("hardfork block %s has no vert_seqno_incr", tnstore.FormatBlockRef(block))
+	}
+	return nil
+}
+
+func ValidateHardforkBlock(block ton.BlockIDExt, parsed *tlb.Block) error {
+	return ValidateHardforkBlockHeader(
+		block,
+		parsed != nil && parsed.BlockInfo.KeyBlock,
+		parsed != nil && parsed.BlockInfo.VertSeqnoIncr,
+	)
+}
+
 type blockIDExtTLB struct {
 	ShardID  tlb.ShardIdent `tlb:"."`
 	SeqNo    uint32         `tlb:"## 32"`
@@ -119,6 +145,14 @@ func LinkFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, []byte, 
 }
 
 func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error {
+	return checkProofShape(id, proofRoot, isLink, false)
+}
+
+func CheckHardforkProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error {
+	return checkProofShape(id, proofRoot, isLink, true)
+}
+
+func checkProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool, allowUnsignedMasterchain bool) error {
 	loader, err := proofRoot.BeginParse()
 	if err != nil {
 		return fmt.Errorf("begin parse block proof %s: %w", tnstore.FormatBlockRef(id), err)
@@ -145,7 +179,7 @@ func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error
 	if isLink {
 		return nil
 	}
-	if proof.Signatures == nil {
+	if proof.Signatures == nil && !allowUnsignedMasterchain {
 		return fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(id))
 	}
 	return nil

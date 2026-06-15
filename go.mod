@@ -5,11 +5,11 @@ go 1.25.6
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/natefinch/lumberjack v2.0.0+incompatible
-	github.com/pierrec/lz4/v4 v4.1.26
+	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/tonutils-go v1.17.1-0.20260603063011-fbaf81cc9c5b
-	golang.org/x/sys v0.45.0
+	github.com/xssnick/tonutils-go v1.17.1-0.20260615111455-9bf0b863dafb
+	golang.org/x/sys v0.46.0
 )
 
 require (

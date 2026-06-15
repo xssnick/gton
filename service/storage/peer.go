@@ -24,6 +24,10 @@ type PeerServingStorageWriter interface {
 	SavePersistentStateFile(file *PersistentStateFile) error
 }
 
+type PersistentStateFileStorage interface {
+	PersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (*PersistentStateFile, error)
+}
+
 type ServedProofKind string
 
 const (
@@ -85,9 +89,11 @@ type PersistentStateFile struct {
 }
 
 type ArtifactRef struct {
-	Path   string
-	Offset int64
-	Size   int64
+	Path             string
+	ArchivePackage   bool
+	ArchivePackageID int64
+	Offset           int64
+	Size             int64
 }
 
 func (r *ArtifactRef) Clone() *ArtifactRef {
@@ -95,9 +101,11 @@ func (r *ArtifactRef) Clone() *ArtifactRef {
 		return nil
 	}
 	return &ArtifactRef{
-		Path:   r.Path,
-		Offset: r.Offset,
-		Size:   r.Size,
+		Path:             r.Path,
+		ArchivePackage:   r.ArchivePackage,
+		ArchivePackageID: r.ArchivePackageID,
+		Offset:           r.Offset,
+		Size:             r.Size,
 	}
 }
 

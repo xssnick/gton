@@ -903,9 +903,9 @@ func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
 		return nil
 	}
 
+	sources := w.loaderSources()
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
-		sources := w.loaderSources()
 		loaded, err := loadArchiveStateCellRecordCaches(sources.active, sources.pending, hash, load)
 		if err == nil {
 			return loaded, nil

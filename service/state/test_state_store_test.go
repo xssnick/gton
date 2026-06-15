@@ -154,6 +154,10 @@ func (s *testStateStore) TrustImportedStateCellHashes() bool {
 	return false
 }
 
+func (s *testStateStore) ReuseImportedSplitStatePartCells() bool {
+	return true
+}
+
 func (s *testStateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
 	s.mx.RLock()
 	tree, ok := s.trees[storage.BlockKey(block)]

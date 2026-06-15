@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/storage"
-
-	"github.com/xssnick/tonutils-go/ton"
 )
 
 const (
@@ -17,24 +15,12 @@ const (
 	archiveGCStartGroupsPerRun = 1024
 )
 
-type archivePruneStore interface {
-	ActiveCellGeneration(ctx context.Context) (storage.CellGenerationInfo, error)
-	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
-	PruneArchivePackages(ctx context.Context, cutoffUnix uint32, maxStartGroups int) (storage.ArchivePruneStats, error)
-}
-
 func (s *Service) runArchiveGCOnce(ctx context.Context) (bool, error) {
 	if s.archiveTTL <= 0 {
 		return false, nil
 	}
 
-	store, ok := s.storage.(archivePruneStore)
-	if !ok {
-		s.log.Debug().
-			Str("storage", fmt.Sprintf("%T", s.storage)).
-			Msg("storage does not support archive ttl gc")
-		return false, nil
-	}
+	store := s.storage
 
 	active, err := store.ActiveCellGeneration(ctx)
 	if err != nil {

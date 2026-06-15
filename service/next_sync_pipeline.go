@@ -935,11 +935,6 @@ func (r *nextSyncRunner) commitCurrent(applied <-chan nextAppliedMaster) (*stora
 			return r.current, r.ctx.Err()
 		}
 	}
-
-	if err := r.flushStagedCurrent(); err != nil {
-		return r.current, err
-	}
-	return r.current, nil
 }
 
 func (r *nextSyncRunner) flushStagedCurrent() error {
@@ -1032,7 +1027,7 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	r.current = nextCurrent
 	r.shardResolver.updateCurrent(r.current.Shards)
 	r.prefetchShardDescriptionHints()
-	r.service.publishLiveCurrentState(r.current)
+	r.service.publishLiveCurrentStateChanged(r.current)
 	if r.service.liveState != nil {
 		r.service.liveState.SetLiveCurrentState(r.current)
 	}

@@ -257,7 +257,10 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 	lt := afterLT
 	first := true
 	messages := make([]ton.DispatchQueueMessage, 0, remaining)
-	roots := make([]*cell.Cell, 0, remaining)
+	var roots []*cell.Cell
+	if withMessagesBOC {
+		roots = make([]*cell.Cell, 0, remaining)
+	}
 
 	for remaining > 0 {
 		key, value, err := lookupNextDispatchQueueAccount(dispatchQueue, currentAddr, first)
@@ -284,7 +287,7 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 			return nil, nil, false, fmt.Errorf("invalid empty account dispatch queue")
 		}
 
-		for {
+		for remaining > 0 {
 			key, value, err := lookupNextAccountDispatchMessage(accountQueue.Messages, lt)
 			if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 				break
@@ -297,9 +300,6 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 			if err != nil {
 				return nil, nil, false, fmt.Errorf("load account dispatch message lt: %w", err)
 			}
-			if remaining == 0 {
-				break
-			}
 			remaining--
 
 			message, root, err := loadDispatchQueueMessage(currentAddr, lt, value)
@@ -307,7 +307,9 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 				return nil, nil, false, err
 			}
 			messages = append(messages, message)
-			roots = append(roots, root)
+			if withMessagesBOC {
+				roots = append(roots, root)
+			}
 		}
 
 		first = false

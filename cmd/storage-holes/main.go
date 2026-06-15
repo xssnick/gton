@@ -345,8 +345,15 @@ func (c *holeChecker) checkShardChain(ctx context.Context, masterSeqno uint32, b
 	if meta == nil {
 		return
 	}
-	if meta.MasterchainRef == nil {
+	if !meta.MasterchainRefKnown() {
 		c.addHole(masterSeqno, "shard_master_ref", block, fmt.Errorf("shard block has no masterchain ref"))
+	} else {
+		ref, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+		if err != nil {
+			c.addHole(masterSeqno, "shard_master_ref_index", block, err)
+		} else if ref.Workchain != masterchainID || ref.Shard != masterchainShard || ref.SeqNo != meta.MasterchainRefSeqno || len(ref.RootHash) != 32 || len(ref.FileHash) != 32 {
+			c.addHole(masterSeqno, "shard_master_ref_index", block, fmt.Errorf("indexed master ref is %s", storage.FormatBlockRef(ref)))
+		}
 	}
 	if len(meta.PrevRefs) == 0 {
 		c.addHole(masterSeqno, "shard_prev_refs", block, fmt.Errorf("shard block has no previous refs"))

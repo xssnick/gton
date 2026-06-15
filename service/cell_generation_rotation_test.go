@@ -444,7 +444,7 @@ func TestPendingCellGenerationMigrationLeaseIgnoresStartLimits(t *testing.T) {
 		storage: exclusiveTaskTestStorage{maxReadAmp: exclusiveServiceTaskMaxReadAmp + 1},
 	}
 
-	if _, err := svc.beginCellGenerationMigration(context.Background()); !errors.Is(err, errExclusiveServiceTaskHighReadAmp) {
+	if _, err := svc.beginExclusiveServiceTask(context.Background(), exclusiveServiceTaskCellGenerationMigration); !errors.Is(err, errExclusiveServiceTaskHighReadAmp) {
 		t.Fatalf("begin fresh migration error = %v, want high read amp", err)
 	}
 
@@ -548,7 +548,7 @@ func TestPendingCellGenerationCompactionWait(t *testing.T) {
 	}
 	svc := &Service{storage: store}
 
-	metrics, waiting, err := svc.pendingCellGenerationCompactionWait(context.Background(), store, pending)
+	metrics, waiting, err := svc.cellGenerationCompactionWait(context.Background(), store, pending.ID)
 	if err != nil {
 		t.Fatalf("pending compaction wait: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestPendingCellGenerationCompactionWait(t *testing.T) {
 	}
 
 	store.cellGenerationDBMetrics.MaxReadAmp = CellGenerationSwitchMaxReadAmp
-	_, waiting, err = svc.pendingCellGenerationCompactionWait(context.Background(), store, pending)
+	_, waiting, err = svc.cellGenerationCompactionWait(context.Background(), store, pending.ID)
 	if err != nil {
 		t.Fatalf("pending compaction wait at limit: %v", err)
 	}
@@ -908,6 +908,10 @@ type testCellGenerationMigrationStore struct {
 
 func (s *testCellGenerationMigrationStore) ActiveCellGeneration(context.Context) (storage.CellGenerationInfo, error) {
 	return storage.CellGenerationInfo{ID: 1}, nil
+}
+
+func (s *testCellGenerationMigrationStore) MaxReadAmp(context.Context) (int64, error) {
+	return 0, nil
 }
 
 func (s *testCellGenerationMigrationStore) PendingCellGenerationMigration(context.Context) (storage.CellGenerationInfo, error) {

@@ -2,10 +2,7 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"time"
-
-	"github.com/xssnick/gton/service/storage"
 )
 
 const (
@@ -15,18 +12,8 @@ const (
 	persistentStateGCMaxFilesPerRun   = 256
 )
 
-type persistentStatePruneStore interface {
-	PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix uint64, keepRecentGroups int, maxFiles int) (storage.PersistentStatePruneStats, error)
-}
-
 func (s *Service) runPersistentStateGCOnce(ctx context.Context) (bool, error) {
-	store, ok := s.storage.(persistentStatePruneStore)
-	if !ok {
-		s.log.Debug().
-			Str("storage", fmt.Sprintf("%T", s.storage)).
-			Msg("storage does not support persistent state gc")
-		return false, nil
-	}
+	store := s.storage
 
 	lease, err := s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskPersistentStateGC)
 	if err != nil {

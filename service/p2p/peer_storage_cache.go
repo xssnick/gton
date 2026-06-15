@@ -2,33 +2,10 @@ package p2p
 
 import (
 	"github.com/xssnick/gton/service/storage"
-
-	"github.com/xssnick/tonutils-go/ton"
 )
 
 func (n *Node) SetBlockCacheObserver(observer BlockCacheObserver) {
 	n.blockCacheObserver = observer
-}
-
-func (n *Node) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
-	if n == nil || n.liveBlockCache == nil {
-		return nil
-	}
-	return n.liveBlockCache.PublishLiveBlockArtifacts(artifacts)
-}
-
-func (n *Node) MarkLiveBlockFlushed(block ton.BlockIDExt) {
-	if n == nil || n.liveBlockCache == nil {
-		return
-	}
-	n.liveBlockCache.MarkBlockFlushed(block)
-}
-
-func (n *Node) LiveBlockCache() *storage.LiveBlockCache {
-	if n == nil {
-		return nil
-	}
-	return n.liveBlockCache
 }
 
 func (n *Node) nonfinalBlockCacheEnabled() bool {

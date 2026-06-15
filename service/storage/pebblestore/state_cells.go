@@ -44,6 +44,10 @@ func (s *Store) TrustImportedStateCellHashes() bool {
 	return false
 }
 
+func (s *Store) ReuseImportedSplitStatePartCells() bool {
+	return true
+}
+
 func (s *Store) SaveStateCellRecords(ctx context.Context, records storage.StateCellRecords) error {
 	generation, err := s.activeCellGenerationID()
 	if err != nil {

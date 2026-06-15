@@ -48,6 +48,12 @@ func (s *p2pStateSource) InitBlock(ctx context.Context) (ton.BlockIDExt, error) 
 	return block, err
 }
 
+func (s *p2pStateSource) IsHardfork(ctx context.Context, block ton.BlockIDExt) bool {
+	_ = ctx
+
+	return s.node.IsHardfork(block)
+}
+
 func (s *p2pStateSource) ZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
 	s.log.Info().
 		Str("block", storage.FormatBlockRef(block)).

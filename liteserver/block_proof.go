@@ -109,7 +109,15 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 			return cached, nil
 		}
 
-		state, err := s.loadStateRoot(ctx, block)
+		meta, err := s.store.BlockMeta(ctx, block)
+		if err != nil {
+			return nil, err
+		}
+		if len(meta.StateRootHash) != 32 {
+			return nil, fmt.Errorf("state root hash is missing for %s", storage.FormatBlockRef(block))
+		}
+
+		state, err := s.store.LoadStateCellTree(ctx, block, meta.StateRootHash)
 		if err != nil {
 			return nil, err
 		}
@@ -117,15 +125,11 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 		if err != nil {
 			return nil, err
 		}
-		isKey, err := s.blockIsKey(ctx, block)
-		if err != nil {
-			return nil, err
-		}
 
 		base := &blockProofBase{
 			block:      block,
 			prevBlocks: prevBlocks,
-			isKey:      isKey,
+			isKey:      meta.Has(storage.BlockMetaIsKeyBlock),
 		}
 
 		s.blockProofBasesMu.Lock()

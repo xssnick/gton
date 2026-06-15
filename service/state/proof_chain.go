@@ -329,8 +329,19 @@ func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trust
 		Bool("key_block", parsed.Block.BlockInfo.KeyBlock).
 		Msg("checking masterchain proof signatures")
 
+	signaturesChecked := true
 	if err = blockproof.CheckMasterchainSignatures(block, parsed.Block, parsed.Proof.Signatures, trusted.config); err != nil {
-		return trustedKeyBlock{}, err
+		if !s.source.IsHardfork(ctx, block) {
+			return trustedKeyBlock{}, err
+		}
+		if hardforkErr := blockproof.ValidateHardforkBlock(block, parsed.Block); hardforkErr != nil {
+			return trustedKeyBlock{}, hardforkErr
+		}
+		s.log.Debug().
+			Str("block", storage.FormatBlockRef(block)).
+			Str("trusted_key", storage.FormatBlockRef(trusted.block)).
+			Msg("accepted configured hardfork key block proof without validator signatures")
+		signaturesChecked = false
 	}
 
 	next := trustedKeyBlock{
@@ -350,7 +361,8 @@ func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trust
 		Str("block", storage.FormatBlockRef(block)).
 		Str("trusted_key", storage.FormatBlockRef(trusted.block)).
 		Bool("key_block", parsed.Block.BlockInfo.KeyBlock).
-		Msg("masterchain proof signatures verified")
+		Bool("signatures_checked", signaturesChecked).
+		Msg("masterchain proof accepted")
 	return next, nil
 }
 

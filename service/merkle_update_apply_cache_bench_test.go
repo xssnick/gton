@@ -19,7 +19,9 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 
 	b.Run("active-root-hit", func(b *testing.B) {
 		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
-		cache.addPreparedRecords(records)
+		if err := cache.addPreparedRecords(records); err != nil {
+			b.Fatalf("add prepared records: %v", err)
+		}
 		load := cache.loader()
 
 		b.ReportAllocs()
@@ -37,7 +39,9 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 
 	b.Run("active-first-ref-chain", func(b *testing.B) {
 		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
-		cache.addPreparedRecords(records)
+		if err := cache.addPreparedRecords(records); err != nil {
+			b.Fatalf("add prepared records: %v", err)
+		}
 		load := cache.loader()
 
 		b.ReportAllocs()
@@ -53,7 +57,9 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 
 	b.Run("pending-root-hit", func(b *testing.B) {
 		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
-		cache.addPreparedRecords(records)
+		if err := cache.addPreparedRecords(records); err != nil {
+			b.Fatalf("add prepared records: %v", err)
+		}
 		checkpoint := cache.beginCheckpoint()
 		if checkpoint == nil {
 			b.Fatal("checkpoint is nil")

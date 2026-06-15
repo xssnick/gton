@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
@@ -296,13 +295,7 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *serviceCollector) Collect(ch chan<- prometheus.Metric) {
-	snapshot, err := c.metrics.serviceStatus()
-	if errors.Is(err, errMetricReaderNotConfigured) {
-		return
-	}
-	if err != nil {
-		return
-	}
+	snapshot := c.metrics.serviceStatus()
 
 	now := time.Now()
 	c.collectSync(ch, snapshot, now)

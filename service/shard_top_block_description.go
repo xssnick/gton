@@ -245,10 +245,9 @@ func validateShardDescriptionProofChain(block ton.BlockIDExt, signatures shardDe
 		}
 
 		links = append(links, shardTopBlockDescriptionLink{
-			Block:          current,
-			PrevRefs:       append([]ton.BlockIDExt(nil), meta.PrevRefs...),
-			MasterchainRef: meta.MasterchainRef,
-			ProofRoot:      proof,
+			Block:     current,
+			PrevRefs:  append([]ton.BlockIDExt(nil), meta.PrevRefs...),
+			ProofRoot: proof,
 		})
 
 		maxPrevSeqno := meta.PrevRefs[0].SeqNo

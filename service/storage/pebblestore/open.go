@@ -136,6 +136,15 @@ func Open(opts Options) (*Store, error) {
 	logger.Info().Str("dir", hotDir).Dur("elapsed", time.Since(stageStarted)).Msg("opened pebble metadb")
 
 	stageStarted = time.Now()
+	logger.Info().Uint32("version", metaDBVersion).Msg("checking metadb version")
+	if err = ensureMetaDBVersion(hot, opts.ReadOnly); err != nil {
+		_ = hot.Close()
+		hotCache.Unref()
+		return nil, fmt.Errorf("check metadb version: %w", err)
+	}
+	logger.Info().Uint32("version", metaDBVersion).Dur("elapsed", time.Since(stageStarted)).Msg("checked metadb version")
+
+	stageStarted = time.Now()
 	logger.Info().Msg("loading cell generation manifest")
 	var manifest cellGenerationManifest
 	if opts.ReadOnly {
@@ -221,6 +230,7 @@ func Open(opts Options) (*Store, error) {
 		cellShardMemTable:               cellShardMemTable,
 		cellMemTableStopWritesThreshold: opts.CellMemTableStopWritesThreshold,
 		artifactFiles:                   newArtifactFileCache(opts.ArtifactFileMaxOpen),
+		archivePackages:                 map[int64]archivePackageMeta{},
 		bytesPerSync:                    opts.BytesPerSync,
 		fs:                              fs,
 		hotOpts:                         hotOpts,
@@ -229,20 +239,18 @@ func Open(opts Options) (*Store, error) {
 		hotDrained:                      make(chan struct{}),
 		pendingArchiveSync:              map[string]pendingPackWrite{},
 		pendingKeyProofSync:             map[string]pendingPackWrite{},
-		dirtyArchivePacks:               map[string]struct{}{},
-		dirtyKeyProofPacks:              map[string]struct{}{},
 	}
 	if !opts.ReadOnly {
 		stageStarted = time.Now()
-		logger.Info().Msg("reconciling artifact pack files")
-		if err = store.reconcileArtifactPackFiles(); err != nil {
+		logger.Info().Msg("recovering artifact pack journals")
+		if err = store.recoverPackJournals(context.Background()); err != nil {
 			_ = store.closeCellGenerations()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()
 			hotCache.Unref()
 			return nil, err
 		}
-		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("reconciled artifact pack files")
+		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("recovered artifact pack journals")
 		stageStarted = time.Now()
 		logger.Info().Msg("cleaning retired cell generations")
 		if err = store.CleanupRetiredCellGenerations(context.Background()); err != nil {

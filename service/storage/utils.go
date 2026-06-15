@@ -13,10 +13,29 @@ import (
 
 func init() {
 	tl.Register(DbFileDBKeyZeroStateFile{}, "db.filedb.key.zeroStateFile block_id:tonNode.blockIdExt = db.filedb.Key")
+	tl.Register(DbFileDBKeyPersistentStateFile{}, "db.filedb.key.persistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key")
+	tl.Register(DbFileDBKeySplitAccountStateFile{}, "db.filedb.key.splitAccountStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt effective_shard:long = db.filedb.Key")
+	tl.Register(DbFileDBKeySplitPersistentStateFile{}, "db.filedb.key.splitPersistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key")
 }
 
 type DbFileDBKeyZeroStateFile struct {
 	BlockID ton.BlockIDExt `tl:"struct"`
+}
+
+type DbFileDBKeyPersistentStateFile struct {
+	BlockID            ton.BlockIDExt `tl:"struct"`
+	MasterchainBlockID ton.BlockIDExt `tl:"struct"`
+}
+
+type DbFileDBKeySplitAccountStateFile struct {
+	BlockID            ton.BlockIDExt `tl:"struct"`
+	MasterchainBlockID ton.BlockIDExt `tl:"struct"`
+	EffectiveShard     int64          `tl:"long"`
+}
+
+type DbFileDBKeySplitPersistentStateFile struct {
+	BlockID            ton.BlockIDExt `tl:"struct"`
+	MasterchainBlockID ton.BlockIDExt `tl:"struct"`
 }
 
 func ZeroStateFileName(block ton.BlockIDExt) (string, error) {
@@ -25,6 +44,43 @@ func ZeroStateFileName(block ton.BlockIDExt) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("zerostate_%d_%x", block.Workchain, hash), nil
+}
+
+func PersistentStateFileName(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (string, error) {
+	hash, err := PersistentStateFileKeyHash(block, master, effectiveShard)
+	if err != nil {
+		return "", err
+	}
+
+	switch effectiveShard {
+	case 0:
+		return fmt.Sprintf("state_%d_%d_%x_%x", master.SeqNo, block.Workchain, uint64(block.Shard), hash), nil
+	case block.Shard:
+		return fmt.Sprintf("statesplit_%d_%d_%016x_%x", master.SeqNo, block.Workchain, uint64(block.Shard), hash), nil
+	default:
+		return fmt.Sprintf("stateaccount_%d_%d_%016x_%016x_%x", master.SeqNo, block.Workchain, uint64(block.Shard), uint64(effectiveShard), hash), nil
+	}
+}
+
+func PersistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) ([]byte, error) {
+	switch effectiveShard {
+	case 0:
+		return tl.Hash(DbFileDBKeyPersistentStateFile{
+			BlockID:            block,
+			MasterchainBlockID: master,
+		})
+	case block.Shard:
+		return tl.Hash(DbFileDBKeySplitPersistentStateFile{
+			BlockID:            block,
+			MasterchainBlockID: master,
+		})
+	default:
+		return tl.Hash(DbFileDBKeySplitAccountStateFile{
+			BlockID:            block,
+			MasterchainBlockID: master,
+			EffectiveShard:     effectiveShard,
+		})
+	}
 }
 
 func StoredProofKinds(blockData []byte, isLink bool) []ServedProofKind {

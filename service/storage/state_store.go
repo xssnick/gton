@@ -14,6 +14,7 @@ type StateCellTreeImporter interface {
 	ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)
 	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error)
 	TrustImportedStateCellHashes() bool
+	ReuseImportedSplitStatePartCells() bool
 }
 
 type DownloadedState interface {

@@ -362,6 +362,68 @@ func TestSyncerUsesConfiguredZeroStateWhenInitBlockIsEmpty(t *testing.T) {
 	}
 }
 
+func TestSyncerSyncZeroStateCurrentStoresMasterAndShardZeroStates(t *testing.T) {
+	zero := testStateBlock(-1, topShard, 0)
+	shard := testStateBlock(0, topShard, 0)
+	masterState := testMasterState(t, zero, shard)
+	shardState := &storage.BlockState{
+		Block: shard,
+		Cell:  cell.BeginCell().EndCell(),
+	}
+	source := &fakeSource{
+		zeroBlock: &zero,
+		zeroStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(zero):  masterState,
+			storage.BlockKey(shard): shardState,
+		},
+	}
+	store := newTestStateStore()
+	if err := store.SaveStateSyncProgress(context.Background(), &storage.CurrentState{
+		ShardClientSeqno: 100,
+		Masterchain:      storage.BlockState{Block: testStateBlock(-1, topShard, 100)},
+	}); err != nil {
+		t.Fatalf("save stale progress: %v", err)
+	}
+
+	syncer := NewSyncer(source, store, SyncerOptions{})
+	current, err := syncer.SyncZeroStateCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("sync zero state current: %v", err)
+	}
+	if !current.Masterchain.Block.Equals(&zero) {
+		t.Fatalf("current master = %s, want %s", storage.FormatBlockRef(current.Masterchain.Block), storage.FormatBlockRef(zero))
+	}
+	if current.ShardClientSeqno != 0 {
+		t.Fatalf("shard client seqno = %d, want 0", current.ShardClientSeqno)
+	}
+
+	currentShard, ok := current.Shards[storage.ShardKeyFromBlock(shard)]
+	if !ok {
+		t.Fatalf("current shard %s is missing", storage.FormatBlockRef(shard))
+	}
+	if !currentShard.Block.Equals(&shard) {
+		t.Fatalf("current shard = %s, want %s", storage.FormatBlockRef(currentShard.Block), storage.FormatBlockRef(shard))
+	}
+	assertShardMasterchainRef(t, currentShard, zero)
+
+	storedShard, err := store.BlockState(context.Background(), shard)
+	if err != nil {
+		t.Fatalf("load stored shard zero state: %v", err)
+	}
+	assertShardMasterchainRef(t, *storedShard, zero)
+
+	persisted, err := store.CurrentState(context.Background())
+	if err != nil {
+		t.Fatalf("load persisted current: %v", err)
+	}
+	if !persisted.Masterchain.Block.Equals(&zero) || persisted.ShardClientSeqno != 0 {
+		t.Fatalf("unexpected persisted current master=%s shard_client_seqno=%d", storage.FormatBlockRef(persisted.Masterchain.Block), persisted.ShardClientSeqno)
+	}
+	if _, err = store.StateSyncProgress(context.Background()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("state sync progress err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSyncerRejectsNonMasterchainKeyBlockAnchor(t *testing.T) {
 	source := &fakeSource{}
 	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
@@ -538,6 +600,7 @@ type fakeSource struct {
 	initBlock          *ton.BlockIDExt
 	zeroBlock          *ton.BlockIDExt
 	zeroState          *storage.BlockState
+	zeroStates         map[storage.BlockRootHash]*storage.BlockState
 	states             map[storage.BlockRootHash]*storage.BlockState
 	keyBlockBatches    map[uint32]KeyBlockBatch
 	downloadedFactory  func(block ton.BlockIDExt) storage.DownloadedState
@@ -563,7 +626,16 @@ func (f *fakeSource) ZeroStateBlock(context.Context) (ton.BlockIDExt, error) {
 	return f.master, nil
 }
 
+func (f *fakeSource) IsHardfork(context.Context, ton.BlockIDExt) bool {
+	return false
+}
+
 func (f *fakeSource) ZeroState(_ context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
+	if f.zeroStates != nil {
+		if state := f.zeroStates[storage.BlockKey(block)]; state != nil {
+			return newImmediateDownloadedState(state), nil
+		}
+	}
 	if f.zeroState != nil && f.zeroState.Block.Equals(&block) {
 		return newImmediateDownloadedState(f.zeroState), nil
 	}

@@ -13,7 +13,11 @@ func TestDBStatusIncludesMetaDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
 
 	status, err := store.DBStatus(context.Background())
 	if err != nil {
@@ -33,7 +37,11 @@ func TestDBStatusIncludesCellIOCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
 
 	root := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	rootHash := root.HashKey()

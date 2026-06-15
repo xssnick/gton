@@ -55,9 +55,6 @@ func TestLoadDefaults(t *testing.T) {
 	if archiveTTL != DefaultArchiveTTL {
 		t.Fatalf("unexpected archive ttl %s", archiveTTL)
 	}
-	if cfg.TON.DisableArchiveBackfill {
-		t.Fatal("archive backfill should be enabled by default")
-	}
 	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
 	if err != nil {
 		t.Fatalf("next checkpoint blocks: %v", err)
@@ -103,6 +100,16 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if len(cfg.CustomOverlays) != 0 {
 		t.Fatalf("unexpected custom overlays %d", len(cfg.CustomOverlays))
+	}
+	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
+	if err != nil {
+		t.Fatalf("liteserver send message broadcast capacity: %v", err)
+	}
+	if capacity.BytesPerSecond != 0 {
+		t.Fatalf("unexpected default liteserver send message broadcast capacity %d", capacity.BytesPerSecond)
+	}
+	if capacity.MaxDelay != DefaultLiteSendMessageBroadcastMaxDelay {
+		t.Fatalf("unexpected default liteserver send message broadcast max delay %s", capacity.MaxDelay)
 	}
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
@@ -196,8 +203,57 @@ func TestLoadCustomOverlays(t *testing.T) {
 	}
 }
 
+func TestLoadLiteSendMessageBroadcastCapacity(t *testing.T) {
+	path := writeTestConfig(t, `{"liteserver":{"send_message_broadcast_bytes_per_second":123456,"send_message_broadcast_max_delay_ms":75}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
+	if err != nil {
+		t.Fatalf("liteserver send message broadcast capacity: %v", err)
+	}
+	if capacity.BytesPerSecond != 123456 {
+		t.Fatalf("unexpected capacity %d", capacity.BytesPerSecond)
+	}
+	if capacity.MaxDelay != 75*time.Millisecond {
+		t.Fatalf("unexpected max delay %s", capacity.MaxDelay)
+	}
+}
+
+func TestLoadLiteSendMessageBroadcastCapacityRejectsNegative(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "bytes per second",
+			body: `{"liteserver":{"send_message_broadcast_bytes_per_second":-1}}`,
+		},
+		{
+			name: "max delay",
+			body: `{"liteserver":{"send_message_broadcast_max_delay_ms":-1}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestConfig(t, tt.body)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			if _, err = cfg.LiteSendMessageBroadcastCapacity(); err == nil {
+				t.Fatal("expected negative capacity config to fail")
+			}
+		})
+	}
+}
+
 func TestLoadSyncOptions(t *testing.T) {
-	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800,"disable_archive_backfill":true,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789,"sync_backpressure_windows":6}}`)
+	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789,"sync_backpressure_windows":6}}`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -224,9 +280,6 @@ func TestLoadSyncOptions(t *testing.T) {
 	}
 	if archiveTTL != 48*time.Hour {
 		t.Fatalf("unexpected archive ttl %s", archiveTTL)
-	}
-	if !cfg.TON.DisableArchiveBackfill {
-		t.Fatal("archive backfill should be disabled")
 	}
 	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
 	if err != nil {
@@ -462,6 +515,12 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Lite.ShardBlockCache != DefaultLiteShardBlockCache {
 		t.Fatalf("unexpected liteserver shard cache %d", cfg.Lite.ShardBlockCache)
 	}
+	if cfg.Lite.SendMessageBroadcastBytesPerSecond != 0 {
+		t.Fatalf("unexpected liteserver send message broadcast capacity %d", cfg.Lite.SendMessageBroadcastBytesPerSecond)
+	}
+	if cfg.Lite.SendMessageBroadcastMaxDelayMS != int64(DefaultLiteSendMessageBroadcastMaxDelay/time.Millisecond) {
+		t.Fatalf("unexpected liteserver send message broadcast max delay %d", cfg.Lite.SendMessageBroadcastMaxDelayMS)
+	}
 	wantStorageDir, err := filepath.Abs(defaultStorageDir)
 	if err != nil {
 		t.Fatalf("resolve storage dir: %v", err)
@@ -503,9 +562,6 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
 		t.Fatalf("unexpected archive_ttl %d", cfg.TON.ArchiveTTL)
 	}
-	if cfg.TON.DisableArchiveBackfill {
-		t.Fatal("unexpected disable_archive_backfill")
-	}
 	if cfg.TON.NextCheckpointBlocks != DefaultNextCheckpointBlocks {
 		t.Fatalf("unexpected next checkpoint blocks %d", cfg.TON.NextCheckpointBlocks)
 	}
@@ -545,11 +601,14 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"archive_ttl"`)) {
 		t.Fatal("generated config should use archive_ttl key")
 	}
-	if !bytes.Contains(data, []byte(`"disable_archive_backfill"`)) {
-		t.Fatal("generated config should use disable_archive_backfill key")
-	}
 	if !bytes.Contains(data, []byte(`"sync_backpressure_windows"`)) {
 		t.Fatal("generated config should use sync_backpressure_windows key")
+	}
+	if !bytes.Contains(data, []byte(`"send_message_broadcast_bytes_per_second"`)) {
+		t.Fatal("generated config should use send_message_broadcast_bytes_per_second key")
+	}
+	if !bytes.Contains(data, []byte(`"send_message_broadcast_max_delay_ms"`)) {
+		t.Fatal("generated config should use send_message_broadcast_max_delay_ms key")
 	}
 	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
 		t.Fatal("generated config should use an empty custom_overlays list")
@@ -573,9 +632,6 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if loaded.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
 		t.Fatalf("unexpected persisted archive_ttl %d", loaded.TON.ArchiveTTL)
-	}
-	if loaded.TON.DisableArchiveBackfill {
-		t.Fatal("unexpected persisted disable_archive_backfill")
 	}
 	if loaded.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
 		t.Fatalf("unexpected persisted sync_backpressure_windows %d", loaded.TON.SyncBackpressureWindows)
@@ -603,10 +659,28 @@ func TestLoadOrCreateRefusesExistingDefaultMetadata(t *testing.T) {
 
 func TestSyncBeforeValidation(t *testing.T) {
 	cfg := defaultConfig()
+	cfg.TON.SyncBefore = ArchiveFromZeroSyncBefore
+
+	syncBefore, err := cfg.SyncBefore()
+	if err != nil {
+		t.Fatalf("archive-from-zero sync_before should be allowed: %v", err)
+	}
+	if syncBefore != 0 {
+		t.Fatalf("unexpected archive-from-zero sync before %s", syncBefore)
+	}
+	if !cfg.ArchiveFromZero() {
+		t.Fatal("archive-from-zero mode should be enabled")
+	}
+
 	cfg.TON.SyncBefore = 0
 
 	if _, err := cfg.SyncBefore(); err == nil {
 		t.Fatal("expected zero sync_before to fail")
+	}
+
+	cfg.TON.SyncBefore = -2
+	if _, err := cfg.SyncBefore(); err == nil {
+		t.Fatal("expected negative sync_before other than -1 to fail")
 	}
 }
 

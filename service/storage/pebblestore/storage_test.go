@@ -61,7 +61,11 @@ func TestLargeBOCLoadRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
 
 	partial := cell.BeginCell().MustStoreUInt(0b10101, 5).EndCell()
 	shared := cell.BeginCell().MustStoreUInt(0xAA, 8).MustStoreRef(partial).EndCell()
@@ -131,7 +135,11 @@ func TestLargeBOCLoadPayloadAndCellsWithWorkerLocalArenas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
 
 	records := make([]*storage.CellRecord, 0, largeBOCShardReadWorkerMinCell)
 	hashes := make([]cell.Hash, 0, largeBOCShardReadWorkerMinCell)
@@ -266,6 +274,95 @@ func TestHotMetaCodecsAvoidDuplicatedKeys(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsMetaDBWithoutVersionRecord(t *testing.T) {
+	dir := t.TempDir()
+	hotDir := filepath.Join(dir, "metadb")
+	if err := os.MkdirAll(hotDir, 0o755); err != nil {
+		t.Fatalf("create metadb dir: %v", err)
+	}
+
+	db, err := pebble.Open(hotDir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open raw metadb: %v", err)
+	}
+	if err = db.Set(hotKeyStateSyncProgress(), []byte{0x01}, pebble.Sync); err != nil {
+		t.Fatalf("write raw metadb record: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("close raw metadb: %v", err)
+	}
+
+	store, err := Open(Options{Dir: dir})
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("opened non-empty metadb without version record")
+	}
+	if !strings.Contains(err.Error(), "version record is missing") {
+		t.Fatalf("open error = %v, want missing version record", err)
+	}
+}
+
+func TestOpenRejectsOlderMetaDBVersion(t *testing.T) {
+	dir := t.TempDir()
+	hotDir := filepath.Join(dir, "metadb")
+	if err := os.MkdirAll(hotDir, 0o755); err != nil {
+		t.Fatalf("create metadb dir: %v", err)
+	}
+
+	db, err := pebble.Open(hotDir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open raw metadb: %v", err)
+	}
+	if err = db.Set(hotKeyMetaDBVersion(), encodeMetaDBVersion(metaDBVersion-1), pebble.Sync); err != nil {
+		t.Fatalf("write raw metadb version: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("close raw metadb: %v", err)
+	}
+
+	store, err := Open(Options{Dir: dir})
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("opened metadb with older version")
+	}
+	if !strings.Contains(err.Error(), "unsupported metadb version") {
+		t.Fatalf("open error = %v, want unsupported metadb version", err)
+	}
+}
+
+func TestOpenInitializesMetaDBVersion(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	db, err := pebble.Open(filepath.Join(dir, "metadb"), &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open raw metadb: %v", err)
+	}
+	raw, closer, err := pebbleReaderGet(db, hotKeyMetaDBVersion())
+	if err != nil {
+		t.Fatalf("load metadb version: %v", err)
+	}
+	version, err := decodeMetaDBVersion(raw)
+	if closeErr := closer.Close(); closeErr != nil {
+		t.Fatalf("close version record: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("decode metadb version: %v", err)
+	}
+	if version != metaDBVersion {
+		t.Fatalf("metadb version = %d, want %d", version, metaDBVersion)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("close raw metadb: %v", err)
+	}
+}
+
 func TestOpenRejectsMetaDBWithoutCellGenerationManifest(t *testing.T) {
 	dir := t.TempDir()
 	hotDir := filepath.Join(dir, "metadb")
@@ -276,6 +373,9 @@ func TestOpenRejectsMetaDBWithoutCellGenerationManifest(t *testing.T) {
 	db, err := pebble.Open(hotDir, &pebble.Options{})
 	if err != nil {
 		t.Fatalf("open raw metadb: %v", err)
+	}
+	if err = db.Set(hotKeyMetaDBVersion(), encodeMetaDBVersion(metaDBVersion), pebble.Sync); err != nil {
+		t.Fatalf("write raw metadb version: %v", err)
 	}
 	if err = db.Set(hotKeyStateSyncProgress(), []byte{0x01}, pebble.Sync); err != nil {
 		t.Fatalf("write raw metadb record: %v", err)
@@ -884,18 +984,6 @@ func TestSaveBlockStateRejectsNonLevelZeroStateRoot(t *testing.T) {
 	}
 }
 
-func TestDecodeBlockStateMetaRejectsPayloadWithoutMasterchainRefFlag(t *testing.T) {
-	buf := make([]byte, 0, 1+33+33+33)
-	buf = append(buf, blockStateMetaVersion)
-	buf = appendLenBytes(buf, bytes.Repeat([]byte{0x11}, 32))
-	buf = appendLenBytes(buf, bytes.Repeat([]byte{0x22}, 32))
-
-	_, _, _, err := decodeBlockStateMeta(buf)
-	if err == nil || !strings.Contains(err.Error(), "masterchain ref flag missing") {
-		t.Fatalf("decode block state meta error = %v, want missing masterchain ref flag", err)
-	}
-}
-
 func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -976,13 +1064,16 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode block data ref: %v", err)
 	}
-	publishedSizes, err := store.publishedArtifactFileSizes()
+	refPath, err := store.artifactRefPath(ctx, ref)
 	if err != nil {
-		t.Fatalf("published artifact sizes: %v", err)
+		t.Fatalf("resolve block data ref path: %v", err)
 	}
-	published := publishedSizes[ref.Path]
-	if published < ref.Offset+ref.Size {
-		t.Fatalf("published artifact size = %d, want at least ref end %d", published, ref.Offset+ref.Size)
+	stat, err := os.Stat(store.artifactPath(refPath))
+	if err != nil {
+		t.Fatalf("stat checkpoint artifact pack: %v", err)
+	}
+	if stat.Size() < ref.Offset+ref.Size {
+		t.Fatalf("checkpoint artifact pack size = %d, want at least ref end %d", stat.Size(), ref.Offset+ref.Size)
 	}
 	meta, err := store.BlockMeta(ctx, block)
 	if err != nil {
@@ -992,13 +1083,9 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 		t.Fatalf("checkpoint block meta flags = %v, want served full", meta.Flags)
 	}
 
-	rawNext, err := store.getHotCopy(ctx, hotKeyNextBlock(prev))
+	decodedNext, err := readNextBlockLink(ctx, store, prev)
 	if err != nil {
 		t.Fatalf("load checkpoint next link: %v", err)
-	}
-	decodedNext, err := decodeBlockID(rawNext)
-	if err != nil {
-		t.Fatalf("decode checkpoint next link: %v", err)
 	}
 	if !decodedNext.Equals(&block) {
 		t.Fatalf("checkpoint next link = %s, want %s", storage.FormatBlockRef(decodedNext), storage.FormatBlockRef(block))
@@ -1041,8 +1128,8 @@ func TestSaveStateCheckpointStoresShardInclusionMasterRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load shard meta: %v", err)
 	}
-	if meta.MasterchainRef == nil || !meta.MasterchainRef.Equals(&master.Block) {
-		t.Fatalf("masterchain ref = %+v, want %s", meta.MasterchainRef, storage.FormatBlockRef(master.Block))
+	if meta.MasterchainRefSeqno != master.Block.SeqNo {
+		t.Fatalf("masterchain ref seqno = %d, want %d", meta.MasterchainRefSeqno, master.Block.SeqNo)
 	}
 }
 
@@ -1064,7 +1151,7 @@ func TestSaveStateCheckpointOverwritesHeaderMasterRefWithInclusionMaster(t *test
 		FileHash:  bytes.Repeat([]byte{0x19}, 32),
 	}
 	shard.MasterchainRef = &master.Block
-	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: shard.Block, MasterchainRef: &oldMaster}); err != nil {
+	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: shard.Block, MasterchainRefSeqno: oldMaster.SeqNo}); err != nil {
 		t.Fatalf("save old shard meta: %v", err)
 	}
 
@@ -1087,8 +1174,8 @@ func TestSaveStateCheckpointOverwritesHeaderMasterRefWithInclusionMaster(t *test
 	// This mirrors cppnode's BlockHandle::masterchain_ref_block behavior. The
 	// authoritative value is the masterchain block that includes/applies the
 	// shard block, so a stale header-derived ref must not survive the checkpoint.
-	if meta.MasterchainRef == nil || !meta.MasterchainRef.Equals(&master.Block) {
-		t.Fatalf("masterchain ref = %+v, want %s", meta.MasterchainRef, storage.FormatBlockRef(master.Block))
+	if meta.MasterchainRefSeqno != master.Block.SeqNo {
+		t.Fatalf("masterchain ref seqno = %d, want %d", meta.MasterchainRefSeqno, master.Block.SeqNo)
 	}
 }
 
@@ -1186,89 +1273,6 @@ func TestOpenReadOnlyRejectsWrites(t *testing.T) {
 	block12 := testMasterBlockID(12, 12)
 	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: block12, GenUTime: 12, StartLT: 12, EndLT: 13}); !errors.Is(err, pebble.ErrReadOnly) {
 		t.Fatalf("save in read-only store = %v, want pebble.ErrReadOnly", err)
-	}
-}
-
-func TestRollbackRestoresCurrentAndDeletesFutureMetadata(t *testing.T) {
-	store, err := Open(Options{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer func() { _ = store.Close() }()
-
-	ctx := context.Background()
-	master10 := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
-	shard10 := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 100}, 0x11)
-	current10 := &storage.CurrentState{
-		SyncedAt:         time.Now(),
-		ShardClientSeqno: master10.Block.SeqNo,
-		Masterchain:      storage.BlockStateWithoutCells(master10),
-		Shards: map[storage.ShardKey]storage.BlockState{
-			storage.ShardKeyFromBlock(shard10.Block): storage.BlockStateWithoutCells(shard10),
-		},
-	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master10, shard10}, current10); err != nil {
-		t.Fatalf("save target current: %v", err)
-	}
-
-	master11 := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 11}, 0x20)
-	shard11 := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 101}, 0x21)
-	current11 := &storage.CurrentState{
-		SyncedAt:         time.Now(),
-		ShardClientSeqno: master11.Block.SeqNo,
-		Masterchain:      storage.BlockStateWithoutCells(master11),
-		Shards: map[storage.ShardKey]storage.BlockState{
-			storage.ShardKeyFromBlock(shard11.Block): storage.BlockStateWithoutCells(shard11),
-		},
-	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master11, shard11}, current11); err != nil {
-		t.Fatalf("save future current: %v", err)
-	}
-	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
-		Links: []storage.ServedBlockLink{{Prev: master10.Block, Next: master11.Block}},
-	}); err != nil {
-		t.Fatalf("link future master: %v", err)
-	}
-
-	stats, err := store.Rollback(ctx, current10)
-	if err != nil {
-		t.Fatalf("rollback: %v", err)
-	}
-	if stats.DeletedKeys == 0 {
-		t.Fatal("rollback did not delete any metadata")
-	}
-
-	loadedCurrent, err := store.CurrentState(ctx)
-	if err != nil {
-		t.Fatalf("load current after rollback: %v", err)
-	}
-	if !loadedCurrent.Masterchain.Block.Equals(&master10.Block) {
-		t.Fatalf("current master = %s, want %s", storage.FormatBlockRef(loadedCurrent.Masterchain.Block), storage.FormatBlockRef(master10.Block))
-	}
-	if loadedShard := loadedCurrent.Shards[storage.ShardKeyFromBlock(shard10.Block)]; !loadedShard.Block.Equals(&shard10.Block) {
-		t.Fatalf("current shard = %s, want %s", storage.FormatBlockRef(loadedShard.Block), storage.FormatBlockRef(shard10.Block))
-	}
-
-	if _, err = store.blockStateMeta(ctx, master10.Block); err != nil {
-		t.Fatalf("target master state missing after rollback: %v", err)
-	}
-	if _, err = store.blockStateMeta(ctx, shard10.Block); err != nil {
-		t.Fatalf("target shard state missing after rollback: %v", err)
-	}
-	if _, err = store.BlockState(ctx, master11.Block); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("future master state still exists: %v", err)
-	}
-	if _, err = store.BlockState(ctx, shard11.Block); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("future shard state still exists: %v", err)
-	}
-	if _, err = store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: int64(-1 << 63)}, master11.Block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("future master seq index still exists: %v", err)
-	}
-	if _, err = store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: int64(-1 << 63)}, shard11.Block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("future shard seq index still exists: %v", err)
-	}
-	if _, err = store.NextBlockFull(ctx, master10.Block); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("future next block link still exists: %v", err)
 	}
 }
 
@@ -1387,6 +1391,56 @@ func TestSaveStateCheckpointAllowsExistingCurrentShardStateMeta(t *testing.T) {
 	loadedShard := loaded.Shards[storage.ShardKeyFromBlock(shard.Block)]
 	if !loadedShard.Block.Equals(&shard.Block) {
 		t.Fatalf("current shard was not loaded from existing metadata")
+	}
+}
+
+func TestSaveStateCheckpointUpdatesReusedCurrentShardMasterRef(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	oldMaster := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
+	newMaster := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 11}, 0x11)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 100}, 0x20)
+	shard.MasterchainRef = &oldMaster.Block
+	if err = store.SaveBlockState(ctx, oldMaster); err != nil {
+		t.Fatalf("save old master state: %v", err)
+	}
+	if err = store.SaveBlockState(ctx, shard); err != nil {
+		t.Fatalf("save existing shard state: %v", err)
+	}
+
+	currentShard := storage.BlockStateWithoutCells(shard)
+	currentShard.MasterchainRef = &newMaster.Block
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: newMaster.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(newMaster),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): currentShard,
+		},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newMaster}, current); err != nil {
+		t.Fatalf("save checkpoint with reused shard state: %v", err)
+	}
+
+	meta, err := store.BlockMeta(ctx, shard.Block)
+	if err != nil {
+		t.Fatalf("load shard meta: %v", err)
+	}
+	if meta.MasterchainRefSeqno != newMaster.Block.SeqNo {
+		t.Fatalf("shard master ref seqno = %d, want %d", meta.MasterchainRefSeqno, newMaster.Block.SeqNo)
+	}
+	loaded, err := store.CurrentState(ctx)
+	if err != nil {
+		t.Fatalf("load current: %v", err)
+	}
+	loadedShard := loaded.Shards[storage.ShardKeyFromBlock(shard.Block)]
+	if loadedShard.MasterchainRef == nil || !loadedShard.MasterchainRef.Equals(&newMaster.Block) {
+		t.Fatalf("loaded shard master ref = %+v, want %s", loadedShard.MasterchainRef, storage.FormatBlockRef(newMaster.Block))
 	}
 }
 
@@ -2179,7 +2233,7 @@ func TestSaveStateCheckpointInitializesActiveOriginOnFirstCurrentState(t *testin
 	}
 }
 
-func TestSaveStateCheckpointDoesNotBackfillActiveOriginWhenCurrentAlreadyExists(t *testing.T) {
+func TestSaveStateCheckpointDoesNotOverwriteActiveOriginWhenCurrentAlreadyExists(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2930,6 +2984,107 @@ func TestCellGenerationMigrationProgressSurvivesRestart(t *testing.T) {
 	}
 	if _, err = store.CellGenerationMigrationProgress(ctx, generation); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("aborted generation progress error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCellGenerationMigrationProgressFromStoredCurrentStateResolvesMasterRef(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 30}, 0x30)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 40}, 0x40)
+	shard.MasterchainRef = &master.Block
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
+		},
+	}
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master, shard}, current); err != nil {
+		t.Fatalf("save state checkpoint: %v", err)
+	}
+
+	loadedCurrent, err := store.CurrentState(ctx)
+	if err != nil {
+		t.Fatalf("load current state: %v", err)
+	}
+	loadedShard := loadedCurrent.Shards[storage.ShardKeyFromBlock(shard.Block)]
+	if loadedShard.MasterchainRef == nil || !loadedShard.MasterchainRef.Equals(&master.Block) {
+		t.Fatalf("loaded shard master ref = %+v, want %s", loadedShard.MasterchainRef, storage.FormatBlockRef(master.Block))
+	}
+
+	generation, err := store.BeginCellGeneration(ctx, master.Block)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	if err = store.SaveCellGenerationMigrationProgress(ctx, generation, loadedCurrent); err != nil {
+		t.Fatalf("save migration progress: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	progress, err := store.CellGenerationMigrationProgress(ctx, generation)
+	if err != nil {
+		t.Fatalf("load migration progress: %v", err)
+	}
+	progressShard := progress.Shards[storage.ShardKeyFromBlock(shard.Block)]
+	if progressShard.MasterchainRef == nil || !progressShard.MasterchainRef.Equals(&master.Block) {
+		t.Fatalf("progress shard master ref = %+v, want %s", progressShard.MasterchainRef, storage.FormatBlockRef(master.Block))
+	}
+}
+
+func TestCellGenerationMigrationProgressResolvesSeqOnlyMasterRefBeforeEncode(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 31}, 0x31)
+	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 41}, 0x41)
+	if err = store.SaveBlockMeta(storage.BuildBlockMetaFromState(*master)); err != nil {
+		t.Fatalf("save master meta: %v", err)
+	}
+
+	seqOnlyMasterRef := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: master.Block.SeqNo}
+	shard.MasterchainRef = &seqOnlyMasterRef
+	current := &storage.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.Block.SeqNo,
+		Masterchain:      storage.BlockStateWithoutCells(master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
+		},
+	}
+	generation, err := store.BeginCellGeneration(ctx, master.Block)
+	if err != nil {
+		t.Fatalf("begin generation: %v", err)
+	}
+	if err = store.SaveCellGenerationMigrationProgress(ctx, generation, current); err != nil {
+		t.Fatalf("save migration progress: %v", err)
+	}
+
+	progress, err := store.CellGenerationMigrationProgress(ctx, generation)
+	if err != nil {
+		t.Fatalf("load migration progress: %v", err)
+	}
+	progressShard := progress.Shards[storage.ShardKeyFromBlock(shard.Block)]
+	if progressShard.MasterchainRef == nil || !progressShard.MasterchainRef.Equals(&master.Block) {
+		t.Fatalf("progress shard master ref = %+v, want %s", progressShard.MasterchainRef, storage.FormatBlockRef(master.Block))
 	}
 }
 

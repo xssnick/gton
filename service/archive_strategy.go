@@ -9,17 +9,19 @@ import (
 	"sync"
 
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
-	shardNextBlockCatchUpMaxRemaining = 100_000
-	archiveToNextLagSeconds           = 200
-	nextToArchiveLagSeconds           = 600
-	maxArchiveMonitorSplitDepth       = 12
+	archiveToNextLagSeconds          = 200
+	nextToArchiveLagSeconds          = 600
+	maxArchiveMonitorSplitDepth      = 12
+	archiveShardArchiveImportRetries = 2
 )
 
 func masterchainBlockLagSeconds(blockUTime int64, nowUnix int64) (int64, bool) {
@@ -116,6 +118,7 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 	}
 
 	imports := make([]*archiveImportResult, len(plans))
+	retries := make([]int, len(plans))
 	var firstErr error
 	next := 0
 	completed := 0
@@ -137,7 +140,22 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 		plan := plans[res.idx]
 
 		if res.err != nil {
-			if r.denyShardArchivePeer(plan.shard, res.peer, res.archiveID, "archive_import_failed", res.err) {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				cancel()
+				firstErr = ctxErr
+				break
+			}
+			if r.rejectArchiveImportPeer(plan.shard, res.peer, res.archiveID, p2p.ArchivePeerRejectImportFailed, res.err) {
+				retries[res.idx]++
+				if retries[res.idx] <= archiveShardArchiveImportRetries {
+					if err := submit(res.idx); err != nil {
+						cancel()
+						firstErr = err
+					}
+					continue
+				}
+			} else if ctx.Err() == nil && retries[res.idx] < archiveShardArchiveImportRetries {
+				retries[res.idx]++
 				if err := submit(res.idx); err != nil {
 					cancel()
 					firstErr = err
@@ -145,14 +163,24 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 				continue
 			}
 			cancel()
-			if firstErr == nil || errors.Is(firstErr, context.Canceled) {
+			if firstErr == nil {
 				firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, plan.shard.String(), res.err)
 			}
 			break
 		}
 
 		if err := validateArchiveImportCoversPlan(res.imported, plan); err != nil {
-			if r.denyShardArchivePeer(plan.shard, res.peer, res.archiveID, "archive_import_missing_block", err) {
+			if r.rejectArchiveImportPeer(plan.shard, res.peer, res.archiveID, p2p.ArchivePeerRejectImportIncomplete, err) {
+				retries[res.idx]++
+				if retries[res.idx] <= archiveShardArchiveImportRetries {
+					if err := submit(res.idx); err != nil {
+						cancel()
+						firstErr = err
+					}
+					continue
+				}
+			} else if ctx.Err() == nil && retries[res.idx] < archiveShardArchiveImportRetries {
+				retries[res.idx]++
 				if err := submit(res.idx); err != nil {
 					cancel()
 					firstErr = err
@@ -195,13 +223,13 @@ func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archive
 	return nil
 }
 
-func (r *archiveCatchUpRunner) denyShardArchivePeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
-	if r == nil || r.service == nil || r.service.node == nil || peer == "" {
+func (r *archiveCatchUpRunner) rejectArchiveImportPeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
+	if r == nil || r.archiveSession == nil || peer == "" {
 		return false
 	}
 
-	denied := r.service.node.DenyArchivePeer(shard, peer, reason)
-	if denied {
+	rejected := r.archiveSession.RejectArchivePeer(shard, peer, reason)
+	if rejected && r.service != nil {
 		r.service.log.Debug().
 			Err(err).
 			Str("peer", peer).
@@ -211,7 +239,7 @@ func (r *archiveCatchUpRunner) denyShardArchivePeer(shard archive.ShardID, peer 
 			Str("reason", reason).
 			Msg("rejected archive import peer")
 	}
-	return denied
+	return rejected
 }
 
 func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
@@ -291,14 +319,20 @@ func monitorMinSplitDepth(state *storage.BlockState, workchain int32) (uint32, e
 	cfg := tlb.BlockchainConfig{Root: extra.ConfigParams.Config.Params.AsCell()}
 	workchains, err := cfg.GetWorkchains()
 	if err != nil {
+		if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	if workchains.Workchains == nil {
-		return 0, fmt.Errorf("workchains config is empty")
+		return 0, nil
 	}
 
 	value, err := workchains.Workchains.LoadValueByIntKey(big.NewInt(int64(workchain)))
 	if err != nil {
+		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	if value.BitsLeft() < 48 && value.RefsNum() > 0 {

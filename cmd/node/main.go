@@ -24,7 +24,9 @@ import (
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
-	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/adnl/keys"
+	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -41,6 +43,7 @@ var GitCommit = "unknown"
 func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
 	lsPubkeyFlag := flag.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
+	adnlIDFlag := flag.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
 	skipConfigCheckFlag := flag.Bool("skip-cfg-check", false, "continue startup after creating a missing config file")
 	verbosityFlag := flag.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
 	logTypesFlag := flag.String("log-types", "", "category log verbosity overrides, comma-separated: liteserver=debug,p2p=warn")
@@ -54,6 +57,7 @@ func main() {
 	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	fromZeroFlag := flag.Bool("from-zero", false, "verify initial key block chain from zerostate instead of global config init_block")
 	liteSendMessageTVMTraceFlag := flag.Bool("liteserver-send-message-tvm-trace", false, "dump TVM opcode trace when liteserver sendMessage execution rejects a message")
+	liteQueryWorkersFlag := flag.Int("liteserver-query-workers", 0, "liteserver query worker goroutines, 0 uses tonutils default")
 	archiveCheckpointPeriodFlag := flag.Duration("archive-checkpoint-period", service2.DefaultArchiveCatchUpCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
 	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
 	flag.Parse()
@@ -94,11 +98,18 @@ func main() {
 	logger := logs.Component("main")
 	cell.MaxBOCCells = maxNodeBOCCells
 	logger.Debug().Int("max_boc_cells", cell.MaxBOCCells).Msg("configured BOC parser limits")
+	if *liteQueryWorkersFlag < 0 {
+		logger.Error().Int("liteserver_query_workers", *liteQueryWorkersFlag).Msg("liteserver query workers cannot be negative")
+		os.Exit(1)
+	}
+	if *liteQueryWorkersFlag > 0 {
+		liteclient.ServerQueryWorkers = *liteQueryWorkersFlag
+	}
 
 	selectedConfigPath := resolveConfigPath(*configPath)
 	cfg, err := nodeconfig.Load(selectedConfigPath)
 	if err != nil {
-		if *lsPubkeyFlag {
+		if *lsPubkeyFlag || *adnlIDFlag {
 			logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
 			os.Exit(1)
 		}
@@ -138,6 +149,32 @@ func main() {
 		litePriv := ed25519.NewKeyFromSeed(liteSeed)
 		if _, err = fmt.Fprintln(os.Stdout, base64.StdEncoding.EncodeToString(litePriv.Public().(ed25519.PublicKey))); err != nil {
 			logger.Error().Err(err).Msg("failed to write liteserver public key")
+			os.Exit(1)
+		}
+		return
+	}
+	if *adnlIDFlag {
+		adnlSeed := cfg.ADNL.Key
+		if len(adnlSeed) == 0 {
+			logger.Error().Str("config", selectedConfigPath).Msg("ADNL key is missing")
+			os.Exit(1)
+		}
+		if len(adnlSeed) != ed25519.SeedSize {
+			logger.Error().
+				Int("key_bytes", len(adnlSeed)).
+				Int("expected_bytes", ed25519.SeedSize).
+				Str("config", selectedConfigPath).
+				Msg("invalid ADNL key size")
+			os.Exit(1)
+		}
+		adnlPriv := ed25519.NewKeyFromSeed(adnlSeed)
+		adnlID, err := tl.Hash(keys.PublicKeyED25519{Key: adnlPriv.Public().(ed25519.PublicKey)})
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to compute ADNL id")
+			os.Exit(1)
+		}
+		if _, err = fmt.Fprintln(os.Stdout, base64.StdEncoding.EncodeToString(adnlID)); err != nil {
+			logger.Error().Err(err).Msg("failed to write ADNL id")
 			os.Exit(1)
 		}
 		return
@@ -210,6 +247,7 @@ func main() {
 		logger.Error().Err(err).Msg("failed to load sync options")
 		os.Exit(1)
 	}
+	archiveFromZero := cfg.ArchiveFromZero()
 	stateTTL, err := cfg.StateTTL()
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to load state ttl option")
@@ -218,6 +256,18 @@ func main() {
 	archiveTTL, err := cfg.ArchiveTTL()
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to load archive ttl option")
+		os.Exit(1)
+	}
+	if archiveFromZero && stateTTL != 0 {
+		logger.Error().
+			Dur("state_ttl", stateTTL).
+			Msg("ton.sync_before=-1 requires ton.state_ttl=0")
+		os.Exit(1)
+	}
+	if archiveFromZero && archiveTTL != 0 {
+		logger.Error().
+			Dur("archive_ttl", archiveTTL).
+			Msg("ton.sync_before=-1 requires ton.archive_ttl=0")
 		os.Exit(1)
 	}
 	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
@@ -304,11 +354,6 @@ func main() {
 	}
 	stateFilesDir := store.StateFilesDir()
 	opts.Storage = store
-	opts.PeerServingStorage = store
-	if runtimeMetrics != nil {
-		runtimeMetrics.SetDBStatusReader(store.DBStatus)
-		runtimeMetrics.SetStorageArtifactDirs(filepath.Join(storageDir, "archive", "packages"), stateFilesDir)
-	}
 	logger.Info().
 		Str("storage", "pebble").
 		Str("dir", storageDir).
@@ -331,20 +376,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	var svc *service2.Service
-	opts.CompressedState = p2p.CompressedBlockStateProviderFunc(func(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
-		if svc == nil {
-			return nil, storage.ErrNotFound
-		}
-		return svc.StateRootForCompressedBlock(ctx, block)
-	})
-	opts.SyncLag = p2p.SyncLagProviderFunc(func() (int64, bool) {
-		if svc == nil {
-			return 0, false
-		}
-		return svc.SyncLagSeconds()
-	})
-
 	node, err := p2p.New(opts)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to initialize p2p node")
@@ -354,7 +385,7 @@ func main() {
 		node.SetBroadcastPipelineObserver(runtimeMetrics)
 	}
 
-	blockSync := blocksync.New(logs.CategoryPtr("blocksync"), node, blocksync.NewNodeFetcher(node))
+	blockSync := blocksync.New(logs.CategoryPtr("blocksync"), node)
 
 	stateLogger := logs.CategoryPtr("state")
 	stateSource := service2.NewP2PStateSource(node, stateLogger)
@@ -377,27 +408,39 @@ func main() {
 	}
 
 	serviceLogger := logs.Component("service")
-	svc = service2.New(serviceLogger, node, blockSync, opts.Storage, stateSync, service2.Options{
-		ArchiveCatchUpCheckpointBlocks: archiveCheckpointBlocks,
-		ArchiveCatchUpCheckpointPeriod: *archiveCheckpointPeriodFlag,
-		ArchiveCatchUpPrefetchWindows:  *archivePrefetchWindowsFlag,
-		NextBlockCheckpointBlocks:      nextCheckpointBlocks,
-		CheckpointBytes:                checkpointBytes,
-		SyncBackpressureWindows:        syncBackpressureWindows,
-		CurrentStatePublisher:          currentStatePublisher,
-		ShutdownContext:                shutdownCtx,
-		StateFilesDir:                  stateFilesDir,
-		StateTTL:                       stateTTL,
-		ArchiveTTL:                     archiveTTL,
-		StorageDir:                     storageDir,
-		DisableStateSerialization:      cfg.DisableStateSerialization,
-		DisableArchiveBackfill:         cfg.TON.DisableArchiveBackfill,
-		SyncObserver:                   syncObserver,
+	svc := service2.New(serviceLogger, node, blockSync, opts.Storage, stateSync, service2.Options{
+		ArchiveCatchUpCheckpointBlocks:          archiveCheckpointBlocks,
+		ArchiveCatchUpCheckpointPeriod:          *archiveCheckpointPeriodFlag,
+		ArchiveCatchUpPrefetchWindows:           *archivePrefetchWindowsFlag,
+		NextBlockCheckpointBlocks:               nextCheckpointBlocks,
+		CheckpointBytes:                         checkpointBytes,
+		SyncBackpressureWindows:                 syncBackpressureWindows,
+		CurrentStatePublisher:                   currentStatePublisher,
+		LiveBlockCache:                          liveBlockCache,
+		CurrentStatePublisherUsesLiveBlockCache: liveLiteStore != nil,
+		ShutdownContext:                         shutdownCtx,
+		StateFilesDir:                           stateFilesDir,
+		StateTTL:                                stateTTL,
+		ArchiveTTL:                              archiveTTL,
+		ArchiveFromZero:                         archiveFromZero,
+		StorageDir:                              storageDir,
+		DisableStateSerialization:               cfg.DisableStateSerialization,
+		SyncObserver:                            syncObserver,
 	})
+	node.SetCompressedBlockStateProvider(svc)
+	node.SetSyncLagProvider(svc)
 	node.SetBroadcastSignatureVerifier(svc)
 	node.SetBroadcastAdmission(svc)
 	if runtimeMetrics != nil {
-		runtimeMetrics.SetServiceStatusReader(svc.StatusSnapshot)
+		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
+			ServiceStatusReader: svc.StatusSnapshot,
+			DBStatusReader:      store.DBStatus,
+			ArchivePackagesDir:  filepath.Join(storageDir, "archive", "packages"),
+			StateFilesDir:       stateFilesDir,
+		}); err != nil {
+			logger.Error().Err(err).Msg("failed to initialize runtime metrics collectors")
+			os.Exit(1)
+		}
 	}
 
 	var liteSrv *liteserver.Server
@@ -430,7 +473,7 @@ func main() {
 		node.Wait()
 		os.Exit(1)
 	}
-	if startupZeroStateRequired(*fromZeroFlag, initBlock, liteOpts.Enabled) {
+	if startupZeroStateRequired(*fromZeroFlag, initBlock, liteOpts.Enabled) || archiveFromZero {
 		if err = ensureZeroStateBeforeInitialSync(ctx, logger, node); err != nil {
 			if errors.Is(err, context.Canceled) {
 				node.Wait()
@@ -487,15 +530,18 @@ func main() {
 		Str("dht_listen_addr", fallbackString(opts.DHTListenAddr, "<client-mode>")).
 		Bool("liteserver", liteOpts.Enabled).
 		Str("liteserver_listen_addr", fallbackString(liteOpts.ListenAddr, "<disabled>")).
+		Int("liteserver_query_workers", liteclient.ServerQueryWorkers).
 		Bool("liteserver_send_message_tvm_trace", *liteSendMessageTVMTraceFlag).
+		Int64("liteserver_send_message_broadcast_bytes_per_second", opts.ExternalBroadcastCapacity.BytesPerSecond).
+		Dur("liteserver_send_message_broadcast_max_delay", opts.ExternalBroadcastCapacity.MaxDelay).
 		Bool("metrics", metricsOpts.Enabled).
 		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
 		Str("pprof_addr", fallbackString(strings.TrimSpace(*pprofAddrFlag), "<disabled>")).
 		Bool("from_zero", *fromZeroFlag).
+		Bool("archive_from_zero", archiveFromZero).
 		Dur("sync_before", syncBefore).
 		Dur("state_ttl", stateTTL).
 		Dur("archive_ttl", archiveTTL).
-		Bool("disable_archive_backfill", cfg.TON.DisableArchiveBackfill).
 		Uint32("next_checkpoint_blocks", nextCheckpointBlocks).
 		Uint32("archive_checkpoint_blocks", archiveCheckpointBlocks).
 		Uint64("checkpoint_bytes", checkpointBytes).
@@ -505,7 +551,7 @@ func main() {
 		Bool("disable_state_serialization", cfg.DisableStateSerialization).
 		Msg("service started")
 
-	go runConsole(ctx, logger, svc, store)
+	go runConsole(ctx, logger, svc, store.DBStatus)
 
 	<-ctx.Done()
 	logger.Info().Msg("shutting down")

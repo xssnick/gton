@@ -19,7 +19,7 @@ type persistentStatePruneFile struct {
 	block          ton.BlockIDExt
 	master         ton.BlockIDExt
 	effectiveShard int64
-	ref            *storage.ArtifactRef
+	size           int64
 }
 
 func (s *Store) PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix uint64, keepRecentGroups int, maxFiles int) (storage.PersistentStatePruneStats, error) {
@@ -136,7 +136,7 @@ func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMas
 
 func (s *Store) deletePersistentStatePruneFiles(ctx context.Context, stats *storage.PersistentStatePruneStats, files []persistentStatePruneFile) error {
 	for _, file := range files {
-		diskFileSize, err := s.persistentStateDiskFileSize(file.ref)
+		diskFileSize, err := s.persistentStateDiskFileSize(file)
 		diskFileExists := !errors.Is(err, storage.ErrNotFound)
 		if errors.Is(err, storage.ErrNotFound) {
 			err = nil
@@ -205,7 +205,7 @@ func (s *Store) persistentStateFileSnapshot(ctx context.Context) ([]persistentSt
 			block:          block,
 			master:         master,
 			effectiveShard: effectiveShard,
-			ref:            record.ref.Clone(),
+			size:           record.size,
 		})
 	}
 	if err = iter.Error(); err != nil {
@@ -321,12 +321,12 @@ func persistentStateFileTTL(ts uint32) uint64 {
 	return uint64(ts) + ((uint64(1) << 18) << bits.TrailingZeros64(x))
 }
 
-func (s *Store) persistentStateDiskFileSize(ref *storage.ArtifactRef) (uint64, error) {
-	if ref == nil || ref.Offset != 0 {
-		return 0, storage.ErrNotFound
+func (s *Store) persistentStateDiskFileSize(file persistentStatePruneFile) (uint64, error) {
+	path, err := s.persistentStateArtifactPath(file.block, file.master, file.effectiveShard)
+	if err != nil {
+		return 0, err
 	}
-
-	stat, err := os.Stat(s.artifactPath(ref.Path))
+	stat, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, storage.ErrNotFound
 	}

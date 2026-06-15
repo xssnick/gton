@@ -67,7 +67,10 @@ func TestProbeNextFullFromPeersFansOutAfterFirstNotAvailable(t *testing.T) {
 	errCh := make(chan error, 1)
 
 	go func() {
-		got, err := probeNextFullFromPeers(ctx, peers, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+		got, err := probeFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
+			peerLimit:       len(peers),
+			stagedPeerLimit: len(peers),
+		}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 			started <- peer.id
 			switch peer.id {
 			case testPeerID("peer-1"):
@@ -129,7 +132,11 @@ func TestProbeNextFullFromPeersRampsFanoutAfterDelay(t *testing.T) {
 	errCh := make(chan error, 1)
 
 	go func() {
-		got, err := probeNextFullFromPeersStaged(ctx, peers, 2, 4, 50*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
+		got, err := probeFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
+			peerLimit:       2,
+			stagedPeerLimit: 4,
+			stageDelay:      50 * time.Millisecond,
+		}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
 			started <- peer.id
 			if peer.id == testPeerID("peer-4") {
 				return *want, nil
@@ -202,7 +209,7 @@ func TestProbeNextFullFromPeersStopsAfterEarlyFailures(t *testing.T) {
 	defer cancel()
 
 	startedAt := time.Now()
-	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
+	_, err := probeFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
 		peerLimit:         2,
 		stagedPeerLimit:   4,
 		stageDelay:        10 * time.Millisecond,
@@ -234,7 +241,7 @@ func TestProbeNextFullFromPeersStopsAfterSoftTimeout(t *testing.T) {
 	defer cancel()
 
 	startedAt := time.Now()
-	_, err := probeNextFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
+	_, err := probeFullFromPeersWithOptions(ctx, peers, probeFullPeerOptions{
 		peerLimit:       2,
 		stagedPeerLimit: 3,
 		stageDelay:      10 * time.Millisecond,
@@ -945,7 +952,7 @@ func TestDownloadNextBlockFullUsesLiveCacheBeforeOverlay(t *testing.T) {
 	next.FileHash = append([]byte(nil), fileHash[:]...)
 
 	proofData := testBlockProofCell(t, next, testProofSignatureSet()).ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-	err = node.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:     next,
 		BlockData: blockData,
 		Meta: &storage.BlockMeta{
@@ -1002,7 +1009,7 @@ func TestDownloadBlockProofUsesLiveCacheBeforeOverlay(t *testing.T) {
 	}
 
 	keyBlock, fullProof, linkProof := testPeerMasterBlockProof(t, 151)
-	err = node.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 		Block: keyBlock,
 		Proofs: []storage.LiveBlockProofArtifact{
 			{Kind: storage.ServedProofBlock, Data: fullProof},
@@ -1031,7 +1038,7 @@ func TestDownloadBlockProofUsesLiveCacheBeforeOverlay(t *testing.T) {
 
 	linkOnlyBlock := testStoredMasterBlockID(152)
 	linkOnlyProof := []byte{0x15, 0x02}
-	err = node.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 		Block: linkOnlyBlock,
 		Proofs: []storage.LiveBlockProofArtifact{
 			{Kind: storage.ServedProofKeyBlockLink, Data: linkOnlyProof},

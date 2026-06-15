@@ -9,10 +9,6 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-type lazyCellLoaderStore interface {
-	LazyCellLoader() cell.LazyCellLoader
-}
-
 type nonfinalParsedStateUpdate struct {
 	root   *cell.Cell
 	meta   *storage.BlockMeta

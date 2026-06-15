@@ -756,11 +756,29 @@ func (v *replayValidator) stateShell(ctx context.Context, block ton.BlockIDExt) 
 		StateRootHash: bytes.Clone(meta.StateRootHash),
 		StateFileHash: bytes.Clone(meta.StateFileHash),
 	}
-	if meta.MasterchainRef != nil {
-		ref := *meta.MasterchainRef
-		state.MasterchainRef = &ref
+	if err = v.setStateMasterchainRefFromMeta(ctx, state, meta); err != nil {
+		return nil, err
 	}
 	return state, nil
+}
+
+func (v *replayValidator) setStateMasterchainRefFromMeta(ctx context.Context, state *storage.BlockState, meta *storage.BlockMeta) error {
+	if state == nil || meta == nil || (state.Block.Workchain == masterchainID && state.Block.Shard == masterchainShard) {
+		return nil
+	}
+	if !meta.MasterchainRefKnown() {
+		return fmt.Errorf("%w: state %s has no masterchain ref", storage.ErrNotFound, storage.FormatBlockRef(state.Block))
+	}
+
+	ref, err := v.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+	if err != nil {
+		return fmt.Errorf("lookup masterchain ref #%d: %w", meta.MasterchainRefSeqno, err)
+	}
+	if ref.Workchain != masterchainID || ref.Shard != masterchainShard || ref.SeqNo != meta.MasterchainRefSeqno || len(ref.RootHash) != 32 || len(ref.FileHash) != 32 {
+		return fmt.Errorf("lookup masterchain ref #%d returned invalid block %s", meta.MasterchainRefSeqno, storage.FormatBlockRef(ref))
+	}
+	state.MasterchainRef = &ref
+	return nil
 }
 
 func shardBlocksFromMasterBlock(block *tlb.Block) ([]ton.BlockIDExt, error) {
@@ -858,7 +876,9 @@ func (v *replayValidator) loadState(ctx context.Context, block ton.BlockIDExt) (
 	if err != nil {
 		return nil, err
 	}
-	state.MasterchainRef = meta.MasterchainRef
+	if err = v.setStateMasterchainRefFromMeta(ctx, state, meta); err != nil {
+		return nil, err
+	}
 	return state, nil
 }
 
@@ -881,9 +901,8 @@ func (v *replayValidator) loadStateRoot(ctx context.Context, block ton.BlockIDEx
 		StateFileHash: bytes.Clone(meta.StateFileHash),
 		Cell:          root,
 	}
-	if meta.MasterchainRef != nil {
-		ref := *meta.MasterchainRef
-		state.MasterchainRef = &ref
+	if err = v.setStateMasterchainRefFromMeta(ctx, state, meta); err != nil {
+		return nil, err
 	}
 	return state, nil
 }
@@ -1916,10 +1935,6 @@ func blockStateShellFromLoadedBlock(block loadedBlock) *storage.BlockState {
 		Block:         block.ID,
 		StateRootHash: bytes.Clone(block.Meta.StateRootHash),
 		StateFileHash: bytes.Clone(block.Meta.StateFileHash),
-	}
-	if block.Meta.MasterchainRef != nil {
-		ref := *block.Meta.MasterchainRef
-		state.MasterchainRef = &ref
 	}
 	return state
 }

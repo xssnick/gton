@@ -41,7 +41,7 @@ type overlaySubscription struct {
 	peers               map[PeerID]*overlayPeer
 	neighbours          []PeerID
 	lastPingedNeighbour PeerID
-	archivePeers        map[string]*archivePeerState
+	archivePeers        map[string]*archivePeerPoolState
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
@@ -164,8 +164,8 @@ func (s *overlaySubscription) close() {
 	}
 }
 
-type archivePeerState struct {
-	deniedPeers map[PeerID]time.Time
+type archivePeerPoolState struct {
+	cooldownUntil map[PeerID]time.Time
 }
 
 type chainDownloadState struct {
@@ -296,6 +296,29 @@ func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, target
 		s.seedScheduled = true
 		s.seedMx.Unlock()
 		s.scheduleSeedFromDHT(ctx, delay)
+		return
+	}
+	s.seedRunning = true
+	targetPeers = s.seedTarget
+	s.seedMx.Unlock()
+
+	s.runSeedFromDHT(ctx, targetPeers)
+}
+
+func (s *overlaySubscription) forceSeedFromDHTTarget(ctx context.Context, targetPeers int) {
+	if !s.isActive() {
+		return
+	}
+	if targetPeers < maxPeersPerOverlay {
+		targetPeers = maxPeersPerOverlay
+	}
+
+	s.seedMx.Lock()
+	if targetPeers > s.seedTarget {
+		s.seedTarget = targetPeers
+	}
+	if s.seedRunning {
+		s.seedMx.Unlock()
 		return
 	}
 	s.seedRunning = true
@@ -985,7 +1008,7 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 		if info.DecodeTime > 0 {
 			s.node.observeBroadcastPipelineStageDuration(broadcastPipelineStageFECDecode, broadcastKindLabel(msg), delivery, broadcastPipelineResultSuccess, info.DecodeTime)
 		}
-		return s.handleOverlayBroadcast(peer, msg, delivery, info.Trusted, sourcePeerID)
+		return s.handleOverlayBroadcastPayload(peer, msg, newIdentifiedBroadcastPayload(msg, info.BroadcastID), delivery, info.Trusted, sourcePeerID)
 	})
 	peer.overlay.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
 		switch data := msg.Data.(type) {
@@ -1134,7 +1157,7 @@ func (s *overlaySubscription) pingADNLPeer(ctx context.Context, peer *overlayPee
 	if peer == nil || peer.overlay == nil || peer.overlay.ADNLWrapper == nil {
 		return
 	}
-	pinger, ok := peer.overlay.ADNLWrapper.ADNL.(adnlPinger)
+	pinger, ok := peer.overlay.ADNL.(adnlPinger)
 	if !ok {
 		return
 	}
@@ -1211,7 +1234,7 @@ func (s *overlaySubscription) handleSimpleBroadcast(peer *overlayPeer, msg overl
 		return nil
 	}
 
-	return s.handleOverlayBroadcast(peer, parsed, DeliverySimple, false, sourcePeerID)
+	return s.handleOverlayBroadcastPayload(peer, parsed, newKnownBroadcastPayload(msg.Data), DeliverySimple, false, sourcePeerID)
 }
 
 func (s *overlaySubscription) removePeer(id PeerID) {

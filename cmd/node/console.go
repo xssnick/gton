@@ -13,11 +13,7 @@ import (
 	"github.com/xssnick/gton/service/storage/pebblestore"
 )
 
-type pebbleDBStatusReader interface {
-	DBStatus(ctx context.Context) (pebblestore.DBStatus, error)
-}
-
-func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Service, dbStatus pebbleDBStatusReader) {
+func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Service, dbStatus func(context.Context) (pebblestore.DBStatus, error)) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		if !scanner.Scan() {
@@ -39,15 +35,15 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 		case "status":
 			if len(cmd) == 2 && cmd[1] == "db" {
 				if dbStatus == nil {
-					fmt.Fprintln(os.Stdout, formatDBStatus(pebblestore.DBStatus{}))
+					_, _ = fmt.Fprintln(os.Stdout, formatDBStatus(pebblestore.DBStatus{}))
 					continue
 				}
-				status, err := dbStatus.DBStatus(ctx)
+				status, err := dbStatus(ctx)
 				if err != nil {
 					logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("failed to load db status")
 					continue
 				}
-				fmt.Fprintln(os.Stdout, formatDBStatus(status))
+				_, _ = fmt.Fprintln(os.Stdout, formatDBStatus(status))
 				continue
 			}
 
@@ -60,7 +56,7 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 				logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
 				continue
 			}
-			fmt.Fprintln(os.Stdout, formatStatus(svc.StatusSnapshot(), showPeers))
+			_, _ = fmt.Fprintln(os.Stdout, formatStatus(svc.StatusSnapshot(), showPeers))
 		case "serialize":
 			if len(cmd) != 2 && len(cmd) != 3 {
 				logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
@@ -71,7 +67,7 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 					logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("failed to cancel persistent state serialization")
 					continue
 				}
-				fmt.Fprintln(os.Stdout, "persistent state serialization canceled")
+				_, _ = fmt.Fprintln(os.Stdout, "persistent state serialization canceled")
 				continue
 			}
 
@@ -95,9 +91,9 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 				continue
 			}
 			if scope == service2.PersistentStateSerializationBasechain {
-				fmt.Fprintf(os.Stdout, "persistent basechain state serialization started for masterchain seqno %d\n", seqno)
+				_, _ = fmt.Fprintf(os.Stdout, "persistent basechain state serialization started for masterchain seqno %d\n", seqno)
 			} else {
-				fmt.Fprintf(os.Stdout, "persistent state serialization started for masterchain seqno %d\n", seqno)
+				_, _ = fmt.Fprintf(os.Stdout, "persistent state serialization started for masterchain seqno %d\n", seqno)
 			}
 		case "migrate":
 			if len(cmd) != 2 {
@@ -109,7 +105,7 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 					logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("failed to stop cell generation migration")
 					continue
 				}
-				fmt.Fprintln(os.Stdout, "cell generation migration stopped")
+				_, _ = fmt.Fprintln(os.Stdout, "cell generation migration stopped")
 				continue
 			}
 
@@ -123,7 +119,7 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 				logger.Warn().Err(err).Uint32("masterchain_seqno", seqno).Msg("failed to start cell generation migration")
 				continue
 			}
-			fmt.Fprintf(os.Stdout, "cell generation migration started for masterchain seqno %d\n", seqno)
+			_, _ = fmt.Fprintf(os.Stdout, "cell generation migration started for masterchain seqno %d\n", seqno)
 		default:
 			logger.Warn().Str("command", strings.Join(cmd, " ")).Msg("unknown console command")
 		}

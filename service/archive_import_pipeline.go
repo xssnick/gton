@@ -481,6 +481,9 @@ func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Contex
 		if proof.keyBlock {
 			return nil, time.Since(started), nil
 		}
+		if proof.signaturePrepareErr != nil {
+			return nil, time.Since(started), proof.signaturePrepareErr
+		}
 		if !proof.prevRef.Equals(&expectedPrev) {
 			return nil, time.Since(started), fmt.Errorf("%w: block=%s prev=%s expected=%s", errMasterchainPrevMismatch, storage.FormatBlockRef(downloaded.ID), storage.FormatBlockRef(proof.prevRef), storage.FormatBlockRef(expectedPrev))
 		}
@@ -598,12 +601,20 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 			Int("blocks", len(downloaded.imported.blocks)).
 			Msg("using preloaded archive import")
 	}
-	r.importCache.drop(key)
 	return downloaded, nil
 }
 
 func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID) (*archive.Downloaded, error) {
-	downloaded, err := r.service.node.DownloadArchive(ctx, masterchainSeqno, shard)
+	session := r.archiveSession
+	if session == nil {
+		if r.service == nil || r.service.node == nil {
+			return nil, fmt.Errorf("archive session is not initialized")
+		}
+		session = r.service.node.BeginArchiveSession()
+		defer session.Close()
+	}
+
+	downloaded, err := session.DownloadArchive(ctx, masterchainSeqno, shard)
 	if err != nil {
 		return nil, fmt.Errorf("download archive #%d %s: %w", masterchainSeqno, shard.String(), err)
 	}

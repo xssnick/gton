@@ -142,10 +142,6 @@ func nextBlockBootstrapLiveTail(blockUTime int64, nowUnix int64) bool {
 	return ok && lagSeconds <= nextBlockBootstrapLiveLagSeconds
 }
 
-func (s *Service) publishLiveCurrentState(current *storage.CurrentState) {
-	s.publishLiveCurrentStateChanged(current)
-}
-
 func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 	s.observeBroadcastFlushedCurrentState(current)
 	if !s.publishLiveCurrentStateChanged(current) {
@@ -153,11 +149,9 @@ func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 	}
 	if s.liveState != nil {
 		s.liveState.SetLiveCurrentState(current)
-		if flusher, ok := s.liveState.(CurrentStateFlusher); ok {
-			flusher.MarkLiveCurrentStateFlushed(current)
-		}
+		s.liveState.MarkLiveCurrentStateFlushed(current)
 	}
-	s.wakePersistentStateSerializer()
+	s.wakeServiceMaintenance()
 }
 
 func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) bool {
@@ -407,17 +401,17 @@ func (s *Service) markLiveCheckpointStatesFlushed(entries []storage.StateCheckpo
 			artifactBlocks = append(artifactBlocks, entry.Artifact.ID)
 		}
 	}
-	if flusher, ok := s.liveState.(liveBlockStateFlusher); ok && len(stateBlocks) > 0 {
-		flusher.MarkLiveBlockStatesFlushed(stateBlocks)
+	if s.liveState != nil && len(stateBlocks) > 0 {
+		s.liveState.MarkLiveBlockStatesFlushed(stateBlocks)
 	}
-	if flusher, ok := s.liveState.(liveBlockArtifactFlusher); ok {
+	if s.liveState != nil {
 		for _, block := range artifactBlocks {
-			flusher.MarkLiveBlockFlushed(block)
+			s.liveState.MarkLiveBlockFlushed(block)
 		}
 	}
-	if s.node != nil {
+	if s.liveBlockCache != nil {
 		for _, block := range artifactBlocks {
-			s.node.MarkLiveBlockFlushed(block)
+			s.liveBlockCache.MarkBlockFlushed(block)
 		}
 	}
 }
@@ -470,11 +464,12 @@ func (s *Service) waitCurrentStatePersist(ctx context.Context) error {
 func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, string, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
 	for {
-		if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
-			if err != nil {
-				return PreparedBlock{}, "", 0, err
-			}
-			return downloaded, source, prepareElapsed, nil
+		cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+		if err == nil {
+			return cached.block, cached.source, cached.prepareElapsed, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return PreparedBlock{}, "", 0, err
 		}
 
 		decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
@@ -518,21 +513,24 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		for {
 			select {
 			case res := <-result:
-				if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+				if err == nil {
 					cancel()
-					if err != nil {
-						return PreparedBlock{}, "", 0, err
-					}
-					return downloaded, source, prepareElapsed, nil
+					return cached.block, cached.source, cached.prepareElapsed, nil
+				}
+				if !errors.Is(err, storage.ErrNotFound) {
+					cancel()
+					return PreparedBlock{}, "", 0, err
 				}
 				if decision.shouldPreferBroadcastCandidate() {
-					downloaded, source, prepareElapsed, ok, err := s.waitPreferredMasterchainBroadcast(ctx, prev, target, broadcastWake, nextBlockBootstrapBroadcastPreferDelay)
-					if ok || err != nil {
+					cached, err := s.waitPreferredMasterchainBroadcast(ctx, prev, target, broadcastWake, nextBlockBootstrapBroadcastPreferDelay)
+					if err == nil {
 						cancel()
-						if err != nil {
-							return PreparedBlock{}, "", 0, err
-						}
-						return downloaded, source, prepareElapsed, nil
+						return cached.block, cached.source, cached.prepareElapsed, nil
+					}
+					if !errors.Is(err, storage.ErrNotFound) {
+						cancel()
+						return PreparedBlock{}, "", 0, err
 					}
 				}
 				cancel()
@@ -556,20 +554,24 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 				prepared.PrepareElapsed = prepareElapsed
 				return prepared, syncBlockSourceForKind("peer_probe", verified.Kind), prepared.PrepareElapsed, nil
 			case <-s.currentStateWake:
-				if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+				if err == nil {
 					cancel()
-					if err != nil {
-						return PreparedBlock{}, "", 0, err
-					}
-					return downloaded, source, prepareElapsed, nil
+					return cached.block, cached.source, cached.prepareElapsed, nil
+				}
+				if !errors.Is(err, storage.ErrNotFound) {
+					cancel()
+					return PreparedBlock{}, "", 0, err
 				}
 			case <-broadcastWake:
-				if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
+				cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+				if err == nil {
 					cancel()
-					if err != nil {
-						return PreparedBlock{}, "", 0, err
-					}
-					return downloaded, source, prepareElapsed, nil
+					return cached.block, cached.source, cached.prepareElapsed, nil
+				}
+				if !errors.Is(err, storage.ErrNotFound) {
+					cancel()
+					return PreparedBlock{}, "", 0, err
 				}
 				broadcastWake = nil
 			case <-queryCtx.Done():
@@ -583,9 +585,9 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 	}
 }
 
-func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, target ton.BlockIDExt, broadcastWake <-chan struct{}, delay time.Duration) (PreparedBlock, string, time.Duration, bool, error) {
+func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, target ton.BlockIDExt, broadcastWake <-chan struct{}, delay time.Duration) (cachedMasterchainBlockForApply, error) {
 	if delay <= 0 {
-		return PreparedBlock{}, "", 0, false, nil
+		return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 	}
 
 	timer := time.NewTimer(delay)
@@ -594,18 +596,20 @@ func (s *Service) waitPreferredMasterchainBroadcast(ctx context.Context, prev, t
 	for {
 		select {
 		case <-ctx.Done():
-			return PreparedBlock{}, "", 0, false, ctx.Err()
+			return cachedMasterchainBlockForApply{}, ctx.Err()
 		case <-s.currentStateWake:
-			if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
-				return downloaded, source, prepareElapsed, ok, err
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil || !errors.Is(err, storage.ErrNotFound) {
+				return cached, err
 			}
 		case <-broadcastWake:
-			if downloaded, source, prepareElapsed, ok, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); ok || err != nil {
-				return downloaded, source, prepareElapsed, ok, err
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil || !errors.Is(err, storage.ErrNotFound) {
+				return cached, err
 			}
 			broadcastWake = nil
 		case <-timer.C:
-			return PreparedBlock{}, "", 0, false, nil
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 		}
 	}
 }

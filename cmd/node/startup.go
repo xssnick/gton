@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -98,6 +99,9 @@ func ensureStoredZeroStateMatchesGlobalConfig(ctx context.Context, store storedZ
 	}
 
 	for _, block := range stored {
+		if block.Workchain != configured.Workchain {
+			continue
+		}
 		if !block.Equals(&configured) {
 			return fmt.Errorf("stored zerostate %s does not match global config zerostate %s",
 				formatBlockID(block), formatBlockID(configured))
@@ -159,11 +163,7 @@ func formatBlockID(block ton.BlockIDExt) string {
 	)
 }
 
-type closeableStorage interface {
-	Close() error
-}
-
-func closeStorage(logger zerolog.Logger, store closeableStorage) {
+func closeStorage(logger zerolog.Logger, store io.Closer) {
 	started := time.Now()
 	logger.Info().Msg("closing storage")
 	if err := store.Close(); err != nil {

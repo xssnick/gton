@@ -61,6 +61,15 @@ func p2pOptionsFromConfig(cfg nodeconfig.Config) (p2p.Options, error) {
 		return p2p.Options{}, err
 	}
 
+	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
+	if err != nil {
+		return p2p.Options{}, err
+	}
+	opts.ExternalBroadcastCapacity = p2p.ExternalBroadcastCapacityOptions{
+		BytesPerSecond: capacity.BytesPerSecond,
+		MaxDelay:       capacity.MaxDelay,
+	}
+
 	return opts, nil
 }
 

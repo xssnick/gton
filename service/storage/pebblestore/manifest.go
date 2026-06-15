@@ -199,7 +199,14 @@ func pebbleHasAnyUserRecord(db *pebble.DB) (bool, error) {
 	}
 	defer func() { _ = iter.Close() }()
 
-	hasRecords := iter.First()
+	hasRecords := false
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if isMetaDBVersionKey(iter.Key()) {
+			continue
+		}
+		hasRecords = true
+		break
+	}
 	if err = iter.Error(); err != nil {
 		return false, err
 	}

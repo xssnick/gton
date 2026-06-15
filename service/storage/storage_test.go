@@ -38,8 +38,22 @@ func TestBuildBlockMetaFromParsedShardBlockDoesNotUseHeaderMasterRef(t *testing.
 	// Keep this aligned with cppnode: BlockInfo.MasterRef is validated as part
 	// of the shard header, but BlockHandle::masterchain_ref_block is filled later
 	// from the masterchain block that actually applies/includes the shard block.
-	if meta.MasterchainRef != nil {
-		t.Fatalf("header master ref leaked into block meta: %s", FormatBlockRef(*meta.MasterchainRef))
+	if meta.MasterchainRefKnown() {
+		t.Fatalf("header master ref leaked into block meta: %d", meta.MasterchainRefSeqno)
+	}
+}
+
+func TestMergeBlockMetaOverwritesKnownZeroMasterchainRef(t *testing.T) {
+	shardZero := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 0}
+	base := &BlockMeta{ID: shardZero, MasterchainRefSeqno: 10}
+	next := &BlockMeta{ID: shardZero}
+
+	merged := MergeBlockMeta(base, next)
+	if !merged.MasterchainRefKnown() {
+		t.Fatal("zero-state shard master ref is not known")
+	}
+	if merged.MasterchainRefSeqno != 0 {
+		t.Fatalf("masterchain ref seqno = %d, want 0", merged.MasterchainRefSeqno)
 	}
 }
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"math/big"
 	"testing"
 	"time"
 
@@ -124,6 +125,42 @@ func TestArchivePipelinePendingWindowLimitUsesDefaultPrefetch(t *testing.T) {
 	}
 }
 
+func TestMonitorMinSplitDepthAllowsMissingWorkchainConfig(t *testing.T) {
+	state := testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(10), testMasterBlockID(1), true)
+
+	depth, err := monitorMinSplitDepth(state, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if depth != 0 {
+		t.Fatalf("split depth = %d, want 0", depth)
+	}
+}
+
+func TestMonitorMinSplitDepthAllowsMissingWorkchain(t *testing.T) {
+	state := testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32))
+
+	depth, err := monitorMinSplitDepth(state, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if depth != 0 {
+		t.Fatalf("split depth = %d, want 0", depth)
+	}
+}
+
+func TestMonitorMinSplitDepthReadsWorkchainDescriptor(t *testing.T) {
+	state := testMonitorMasterStateWithKeyBlock(t, testMasterBlockID(10), 7, testMasterBlockID(1), true)
+
+	depth, err := monitorMinSplitDepth(state, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if depth != 7 {
+		t.Fatalf("split depth = %d, want 7", depth)
+	}
+}
+
 func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
 	runner := &archiveCatchUpRunner{service: &Service{}}
 
@@ -219,6 +256,16 @@ func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t
 	}
 }
 
+func TestArchiveShardPrefixesSkipZeroStateTargets(t *testing.T) {
+	shard := int64(-1 << 61)
+	zero := testBlockID(0, shard, 0)
+
+	missing := archiveShardImportPlansMissingFromBlockStates(2, nil, [][]ton.BlockIDExt{{zero}}, nil)
+	if len(missing) != 0 {
+		t.Fatalf("zerostate shard prefixes = %#v, want none", missing)
+	}
+}
+
 func TestValidateArchiveImportCoversPlanRequiresPlannedBlocks(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: int64(-1 << 61)}
 	block := testBlockID(0, shard.Shard, 11)
@@ -295,16 +342,20 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 		stagedBlocks: 9,
 		stateCells:   newStateCellWindowCache(nil),
 	}
-	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
+	if err := runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 1023),
-	}))
+	})); err != nil {
+		t.Fatalf("add first prepared records: %v", err)
+	}
 	if runner.shouldCheckpointStagedCurrent() {
 		t.Fatal("next checkpoint should not start below block and byte targets")
 	}
 
-	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
+	if err := runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		second: make([]byte, 1),
-	}))
+	})); err != nil {
+		t.Fatalf("add second prepared records: %v", err)
+	}
 	if !runner.shouldCheckpointStagedCurrent() {
 		t.Fatal("next checkpoint should start at byte target")
 	}
@@ -371,7 +422,7 @@ func TestArchiveAppliedStateUsesCheckpointArtifactPath(t *testing.T) {
 	if entry.Artifact.ArchiveShardSplitDepth != 3 {
 		t.Fatalf("artifact split depth = %d, want 3", entry.Artifact.ArchiveShardSplitDepth)
 	}
-	if entry.Artifact.Meta == nil || entry.Artifact.Meta.MasterchainRef == nil || !entry.Artifact.Meta.MasterchainRef.Equals(&master) {
+	if entry.Artifact.Meta == nil || entry.Artifact.Meta.MasterchainRefSeqno != master.SeqNo {
 		t.Fatalf("artifact master ref = %+v, want %s", entry.Artifact.Meta, storage.FormatBlockRef(master))
 	}
 	if len(entry.Links) != 1 || !entry.Links[0].Prev.Equals(&prev) || !entry.Links[0].Next.Equals(&block) {
@@ -383,6 +434,39 @@ func testReadyArchiveWindow(err error) archivePendingWindow {
 	done := make(chan error, 1)
 	done <- err
 	return archivePendingWindow{shards: &archiveWindowShardImportTask{done: done}}
+}
+
+func testArchiveStrategyMasterStateWithWorkchains(t *testing.T, workchains *cell.Dictionary) *storage.BlockState {
+	t.Helper()
+
+	workchainsCell, err := tlb.ToCell(&tlb.WorkchainsConfig{Workchains: workchains})
+	if err != nil {
+		t.Fatalf("build workchains config: %v", err)
+	}
+
+	configParams := cell.NewDict(32)
+	param := cell.BeginCell().MustStoreRef(workchainsCell).EndCell()
+	if err = configParams.SetIntKey(big.NewInt(int64(tlb.ConfigParamWorkchains)), param); err != nil {
+		t.Fatalf("store workchains config param: %v", err)
+	}
+
+	extra := cell.BeginCell().
+		MustStoreUInt(0xcc26, 16).
+		MustStoreDict(nil).
+		MustStoreSlice(make([]byte, 32), 256).
+		MustStoreRef(configParams.AsCell()).
+		MustStoreRef(testMonitorMasterInfo(t, testMasterBlockID(1), true)).
+		MustStoreCoins(0).
+		MustStoreDict(nil).
+		EndCell()
+
+	return &storage.BlockState{
+		Block: testMasterBlockID(10),
+		Cell:  cell.BeginCell().EndCell(),
+		Parsed: &tlb.ShardStateUnsplit{
+			McStateExtra: extra,
+		},
+	}
 }
 
 func TestArchiveMasterBlockSequenceStopsBeforeNonStartKeyBlock(t *testing.T) {

@@ -203,7 +203,56 @@ func (s *Store) SaveCellGenerationMigrationProgress(ctx context.Context, generat
 		return fmt.Errorf("cell generation is zero")
 	}
 
+	current, err := s.cellGenerationMigrationProgressForEncode(ctx, current)
+	if err != nil {
+		return err
+	}
 	return s.setHotRecord(ctx, hotKeyCellGenerationCurrent(generation), encodeCellGenerationMigrationProgress(current), pebble.Sync)
+}
+
+func (s *Store) cellGenerationMigrationProgressForEncode(ctx context.Context, current *storage.CurrentState) (*storage.CurrentState, error) {
+	encoded := storage.CloneCurrentState(current)
+	if err := s.resolveMigrationProgressBlockMasterRef(ctx, &encoded.Masterchain); err != nil {
+		return nil, fmt.Errorf("resolve migration progress masterchain state ref: %w", err)
+	}
+	for key, shard := range encoded.Shards {
+		if err := s.resolveMigrationProgressBlockMasterRef(ctx, &shard); err != nil {
+			return nil, fmt.Errorf("resolve migration progress shard state %s ref: %w", storage.FormatBlockRef(shard.Block), err)
+		}
+		encoded.Shards[key] = shard
+	}
+	return encoded, nil
+}
+
+func (s *Store) resolveMigrationProgressBlockMasterRef(ctx context.Context, state *storage.BlockState) error {
+	if state == nil || isMasterchainBlock(state.Block) {
+		return nil
+	}
+	if state.MasterchainRef == nil {
+		return fmt.Errorf("shard state %s has no masterchain ref", storage.FormatBlockRef(state.Block))
+	}
+
+	ref := *state.MasterchainRef
+	if !isMasterchainBlock(ref) {
+		return fmt.Errorf("shard state %s masterchain ref is not masterchain: %s", storage.FormatBlockRef(state.Block), storage.FormatBlockRef(ref))
+	}
+	if fullBlockIDHashesKnown(ref) {
+		return nil
+	}
+
+	resolved, err := s.lookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, ref.SeqNo)
+	if err != nil {
+		return fmt.Errorf("lookup masterchain ref #%d: %w", ref.SeqNo, err)
+	}
+	if !fullBlockIDHashesKnown(resolved) {
+		return fmt.Errorf("resolved masterchain ref is not full: %s", storage.FormatBlockRef(resolved))
+	}
+	state.MasterchainRef = &resolved
+	return nil
+}
+
+func fullBlockIDHashesKnown(id ton.BlockIDExt) bool {
+	return len(id.RootHash) == 32 && len(id.FileHash) == 32
 }
 
 func (s *Store) BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) (uint64, error) {
@@ -484,8 +533,10 @@ func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uin
 	s.mu.Unlock()
 
 	var errs []error
-	if err := cells.close(); err != nil {
-		errs = append(errs, err)
+	if cells != nil {
+		if err := cells.close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	for shard := 0; shard < cellDBShardCount; shard++ {
 		if err := os.RemoveAll(cellGenerationShardDir(s.dir, generation, shard)); err != nil {

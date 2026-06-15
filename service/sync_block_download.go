@@ -103,7 +103,6 @@ func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.Bl
 
 	logTimer := time.NewTimer(exactBlockDownloadWaitLogDelay)
 	defer logTimer.Stop()
-	logDelay := exactBlockDownloadWaitLogDelay
 	for {
 		select {
 		case res := <-result:
@@ -126,8 +125,7 @@ func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.Bl
 				Int("consecutive_misses", decision.consecutiveMisses).
 				Dur("waited", waited).
 				Msg("waiting for exact chain block download")
-			logDelay = exactBlockDownloadWaitLogEvery
-			logTimer.Reset(logDelay)
+			logTimer.Reset(exactBlockDownloadWaitLogEvery)
 		case <-queryCtx.Done():
 			return p2p.DownloadedBlock{}, "", fmt.Errorf("probe block %s: %w", storage.FormatBlockRef(block), queryCtx.Err())
 		case <-ctx.Done():

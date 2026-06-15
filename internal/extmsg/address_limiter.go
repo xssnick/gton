@@ -14,8 +14,9 @@ const (
 )
 
 var (
-	ErrAddressRateLimited = errors.New("too many external messages to address")
-	ErrAddressLimiterFull = errors.New("external message address limiter is full")
+	ErrAddressRateLimited                = errors.New("too many external messages to address")
+	ErrAddressLimiterFull                = errors.New("external message address limiter is full")
+	ErrExternalBroadcastCapacityExceeded = errors.New("external message broadcast capacity exceeded")
 )
 
 type AddressKey struct {

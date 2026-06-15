@@ -105,7 +105,7 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 		node:    node,
 		storage: store,
 	}
-	svc.publishLiveCurrentState(&tnstore.CurrentState{
+	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
 			Block:  liveMaster,
 			Parsed: &tlb.ShardStateUnsplit{GenUTime: 200},
@@ -148,7 +148,7 @@ func TestStatusSnapshotIncludesSplitBasechainShards(t *testing.T) {
 		node:    node,
 		storage: store,
 	}
-	svc.publishLiveCurrentState(&tnstore.CurrentState{
+	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
 			Block:  master,
 			Parsed: &tlb.ShardStateUnsplit{GenUTime: 300},
@@ -274,12 +274,13 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
 	if err != nil {
-		t.Fatalf("new node: %v", err)
+		t.Fatalf("create p2p node: %v", err)
 	}
+	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks)
 
 	block, root, data, meta := mustStatusFixtureBlock(t)
 	meta.GenUTime = 100
-	if err = node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err = cache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
 		Block:     block,
 		Root:      root,
 		BlockData: data,
@@ -293,10 +294,11 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 	}
 
 	svc := &Service{
-		node:    node,
-		storage: store,
+		node:           node,
+		storage:        store,
+		liveBlockCache: cache,
 	}
-	svc.publishLiveCurrentState(&tnstore.CurrentState{
+	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
 			Block:  block,
 			Parsed: &tlb.ShardStateUnsplit{GenUTime: 100},
@@ -311,21 +313,18 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 	if snapshot.LocalMasterchainTx == 0 {
 		t.Fatal("expected positive live masterchain transaction count")
 	}
-	if _, err = store.BlockData(context.Background(), block); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err := store.BlockData(context.Background(), block); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("pebble block data error = %v, want ErrNotFound", err)
 	}
 }
 
 func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
 	store := openTestPebbleStorage(t)
-	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
-	if err != nil {
-		t.Fatalf("new node: %v", err)
-	}
+	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks)
 
 	block, root, data, meta := mustStatusFixtureBlock(t)
 	meta.GenUTime = 100
-	if err = node.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
 		Block:     block,
 		Root:      root,
 		BlockData: data,
@@ -339,8 +338,8 @@ func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
 	}
 
 	svc := &Service{
-		node:    node,
-		storage: store,
+		storage:        store,
+		liveBlockCache: cache,
 	}
 	snapshot := svc.recentTPSSnapshot(context.Background(), &tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{Block: block},
@@ -362,7 +361,7 @@ func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
 	if snapshot.TPS <= 0 {
 		t.Fatalf("tps = %f, want positive", snapshot.TPS)
 	}
-	if _, err = store.LookupBlockBySeqNo(context.Background(), tnstore.BlockHistoryKey{Workchain: -1, Shard: topShard}, block.SeqNo); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err := store.LookupBlockBySeqNo(context.Background(), tnstore.BlockHistoryKey{Workchain: -1, Shard: topShard}, block.SeqNo); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("pebble seqno lookup error = %v, want ErrNotFound", err)
 	}
 }

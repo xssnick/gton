@@ -3,8 +3,10 @@ package pebblestore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -48,24 +50,52 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 }
 
 func (s *Store) blockStateMeta(ctx context.Context, block ton.BlockIDExt) (storage.BlockState, error) {
-	metaRaw, err := s.getHotCopy(ctx, hotKeyStateMeta(block))
+	db, err := s.acquireHotDB(ctx)
 	if err != nil {
 		return storage.BlockState{}, err
 	}
-	rootHash, fileHash, masterRef, err := decodeBlockStateMeta(metaRaw)
+	defer s.releaseHotDB()
+
+	return blockStateMetaFromReader(db, block)
+}
+
+func blockStateMetaFromReader(reader pebbleReader, block ton.BlockIDExt) (storage.BlockState, error) {
+	metaRaw, closer, err := pebbleReaderGet(reader, hotKeyBlockMeta(block))
 	if err != nil {
 		return storage.BlockState{}, err
 	}
-	if len(rootHash) == 0 {
+	defer func() { _ = closer.Close() }()
+
+	meta, err := decodeBlockMeta(block, metaRaw)
+	if err != nil {
+		return storage.BlockState{}, err
+	}
+	if !meta.Has(storage.BlockMetaHasStateCells) || len(meta.StateRootHash) == 0 {
 		return storage.BlockState{}, storage.ErrNotFound
+	}
+	masterRef, err := blockStateMasterchainRefFromMeta(reader, meta)
+	if err != nil {
+		return storage.BlockState{}, err
 	}
 
 	return storage.BlockState{
 		Block:          block,
-		StateRootHash:  bytes.Clone(rootHash),
-		StateFileHash:  bytes.Clone(fileHash),
+		StateRootHash:  bytes.Clone(meta.StateRootHash),
+		StateFileHash:  bytes.Clone(meta.StateFileHash),
 		MasterchainRef: masterRef,
 	}, nil
+}
+
+func blockStateMasterchainRefFromMeta(reader pebbleReader, meta *storage.BlockMeta) (*ton.BlockIDExt, error) {
+	if meta == nil || isMasterchainBlock(meta.ID) || !meta.MasterchainRefKnown() {
+		return nil, nil
+	}
+
+	ref, err := lookupBlockBySeqNoWithReader(reader, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, meta.MasterchainRefSeqno)
+	if err != nil {
+		return nil, fmt.Errorf("lookup masterchain ref #%d: %w", meta.MasterchainRefSeqno, err)
+	}
+	return &ref, nil
 }
 
 func (s *Store) SaveBlockMeta(meta *storage.BlockMeta) error {
@@ -85,15 +115,7 @@ func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.B
 }
 
 func (s *Store) LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
-	raw, err := s.getHotCopy(ctx, hotKeyBlockSeqIndex(key, seqno))
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	block, err := decodeBlockID(raw)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	return block, nil
+	return s.lookupBlockBySeqNo(ctx, key, seqno)
 }
 
 func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]ton.BlockIDExt, error) {
@@ -127,7 +149,11 @@ func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]t
 		default:
 		}
 
-		block, err := decodeBlockID(iter.Value())
+		seqno, err := decodeKeyBlockSeqIndexKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		block, err := decodeBlockIDFromHashes(-1, topShard, seqno, iter.Value())
 		if err != nil {
 			return nil, err
 		}
@@ -182,11 +208,11 @@ func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey
 	}
 	defer func() { _ = iter.Close() }()
 
-	block, err := lookupBlockByLTWithIterator(iter, key, lt)
+	ref, err := lookupBlockByLTWithIterator(iter, key, lt)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
-	return block, iter.Error()
+	return ref.block, iter.Error()
 }
 
 func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
@@ -215,7 +241,7 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 	}
 	defer func() { _ = iter.Close() }()
 
-	var best ton.BlockIDExt
+	var best blockLTIndexRef
 	found := false
 
 	for _, shard := range shards {
@@ -225,7 +251,7 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 		default:
 		}
 
-		block, err := lookupBlockByLTWithIterator(iter, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
+		ref, err := lookupBlockByLTWithIterator(iter, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
 		if errors.Is(err, storage.ErrNotFound) {
 			continue
 		}
@@ -233,8 +259,8 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 			return ton.BlockIDExt{}, err
 		}
 
-		if !found || best.SeqNo > block.SeqNo {
-			best = block
+		if !found || best.seqno > ref.seqno {
+			best = ref
 			found = true
 		}
 	}
@@ -242,21 +268,39 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 		return ton.BlockIDExt{}, err
 	}
 	if found {
-		return best, nil
+		return best.block, nil
 	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
-func lookupBlockByLTWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+type blockSeqIndexRef struct {
+	key   storage.BlockHistoryKey
+	seqno uint32
+}
+
+type blockLTIndexRef struct {
+	block ton.BlockIDExt
+	seqno uint32
+}
+
+func lookupBlockByLTWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (blockLTIndexRef, error) {
 	prefix := hotKeyBlockLTPrefix(key)
 	if !iter.SeekGE(hotKeyBlockLTSeekGE(key, lt)) || !bytes.HasPrefix(iter.Key(), prefix) {
-		return ton.BlockIDExt{}, storage.ErrNotFound
+		return blockLTIndexRef{}, storage.ErrNotFound
 	}
-	return decodeBlockID(iter.Value())
+	ref, err := decodeBlockLTIndexKey(iter.Key())
+	if err != nil {
+		return blockLTIndexRef{}, err
+	}
+	block, err := decodeBlockIDFromHashes(ref.key.Workchain, ref.key.Shard, ref.seqno, iter.Value())
+	if err != nil {
+		return blockLTIndexRef{}, err
+	}
+	return blockLTIndexRef{block: block, seqno: ref.seqno}, nil
 }
 
 func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
-	return s.lookupBlockByLowerBoundIndex(ctx, hotKeyBlockUTimePrefix(key), hotKeyBlockUTimeSeekGE(key, utime))
+	return s.lookupBlockByLowerBoundIndex(ctx, hotKeyBlockUTimePrefix(key), hotKeyBlockUTimeSeekGE(key, utime), decodeBlockUTimeIndexKey)
 }
 
 func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {
@@ -304,28 +348,67 @@ func (s *Store) setMergedBlockMeta(batch *pebble.Batch, next *storage.BlockMeta)
 	if err = batch.Set(key, encoded, pebble.NoSync); err != nil {
 		return err
 	}
-	if err = batch.Set(hotKeyBlockSeqIndex(storage.BlockHistoryKey{Workchain: merged.ID.Workchain, Shard: merged.ID.Shard}, merged.ID.SeqNo), encodeBlockID(merged.ID), pebble.NoSync); err != nil {
+	if err = batch.Set(hotKeyBlockSeqIndex(storage.BlockHistoryKey{Workchain: merged.ID.Workchain, Shard: merged.ID.Shard}, merged.ID.SeqNo), encodeBlockIDHashes(merged.ID), pebble.NoSync); err != nil {
 		return err
 	}
 	if isMasterchainBlock(merged.ID) && merged.Has(storage.BlockMetaIsKeyBlock) {
-		if err = batch.Set(hotKeyKeyBlockSeqIndex(merged.ID.SeqNo), encodeBlockID(merged.ID), pebble.NoSync); err != nil {
+		if err = batch.Set(hotKeyKeyBlockSeqIndex(merged.ID.SeqNo), encodeBlockIDHashes(merged.ID), pebble.NoSync); err != nil {
 			return err
 		}
 	}
 	if merged.EndLT != 0 {
-		if err = batch.Set(hotKeyBlockLTIndex(merged), encodeBlockID(merged.ID), pebble.NoSync); err != nil {
+		if err = batch.Set(hotKeyBlockLTIndex(merged), encodeBlockIDHashes(merged.ID), pebble.NoSync); err != nil {
 			return err
 		}
 	}
 	if merged.GenUTime != 0 {
-		if err = batch.Set(hotKeyBlockUTimeIndex(merged), encodeBlockID(merged.ID), pebble.NoSync); err != nil {
+		if err = batch.Set(hotKeyBlockUTimeIndex(merged), encodeBlockIDHashes(merged.ID), pebble.NoSync); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) lookupBlockByLowerBoundIndex(ctx context.Context, prefix []byte, seek []byte) (ton.BlockIDExt, error) {
+func (s *Store) setMergedBlockMetas(batch *pebble.Batch, metas map[storage.BlockRootHash]*storage.BlockMeta) error {
+	for _, key := range sortedBlockMetaKeys(metas) {
+		if err := s.setMergedBlockMeta(batch, metas[key]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sortedBlockMetaKeys(metas map[storage.BlockRootHash]*storage.BlockMeta) []storage.BlockRootHash {
+	keys := make([]storage.BlockRootHash, 0, len(metas))
+	for key := range metas {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return bytes.Compare(keys[i][:], keys[j][:]) < 0
+	})
+	return keys
+}
+
+func (s *Store) lookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer s.releaseHotDB()
+
+	return lookupBlockBySeqNoWithReader(db, key, seqno)
+}
+
+func lookupBlockBySeqNoWithReader(reader pebbleReader, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
+	raw, closer, err := pebbleReaderGet(reader, hotKeyBlockSeqIndex(key, seqno))
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer func() { _ = closer.Close() }()
+	return decodeBlockIDFromHashes(key.Workchain, key.Shard, seqno, raw)
+}
+
+func (s *Store) lookupBlockByLowerBoundIndex(ctx context.Context, prefix []byte, seek []byte, decodeKey func([]byte) (blockSeqIndexRef, error)) (ton.BlockIDExt, error) {
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {
 		return ton.BlockIDExt{}, err
@@ -356,9 +439,54 @@ func (s *Store) lookupBlockByLowerBoundIndex(ctx context.Context, prefix []byte,
 	if !bytes.HasPrefix(iter.Key(), prefix) {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
-	block, err := decodeBlockID(iter.Value())
+	ref, err := decodeKey(iter.Key())
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
-	return block, nil
+	return decodeBlockIDFromHashes(ref.key.Workchain, ref.key.Shard, ref.seqno, iter.Value())
+}
+
+func decodeKeyBlockSeqIndexKey(key []byte) (uint32, error) {
+	if len(key) != len(hotPrefixKeyBlockSeq)+4 || !bytes.HasPrefix(key, hotPrefixKeyBlockSeq) {
+		return 0, fmt.Errorf("invalid key block seq index key size %d", len(key))
+	}
+	return binary.BigEndian.Uint32(key[len(hotPrefixKeyBlockSeq):]), nil
+}
+
+func decodeBlockLTIndexKey(key []byte) (blockSeqIndexRef, error) {
+	const suffix = 8 + 4
+	prefixLen := len(hotPrefixBlockLT)
+	if len(key) != prefixLen+4+8+suffix || !bytes.HasPrefix(key, hotPrefixBlockLT) {
+		return blockSeqIndexRef{}, fmt.Errorf("invalid block lt index key size %d", len(key))
+	}
+	pos := prefixLen
+	historyKey := storage.BlockHistoryKey{
+		Workchain: int32(binary.BigEndian.Uint32(key[pos : pos+4])),
+		Shard:     int64(binary.BigEndian.Uint64(key[pos+4 : pos+12])),
+	}
+	pos += 4 + 8 + 8
+	return blockSeqIndexRef{key: historyKey, seqno: binary.BigEndian.Uint32(key[pos : pos+4])}, nil
+}
+
+func decodeBlockUTimeIndexKey(key []byte) (blockSeqIndexRef, error) {
+	const suffix = 4 + 4
+	prefixLen := len(hotPrefixBlockUTime)
+	if len(key) != prefixLen+4+8+suffix || !bytes.HasPrefix(key, hotPrefixBlockUTime) {
+		return blockSeqIndexRef{}, fmt.Errorf("invalid block utime index key size %d", len(key))
+	}
+	pos := prefixLen
+	historyKey := storage.BlockHistoryKey{
+		Workchain: int32(binary.BigEndian.Uint32(key[pos : pos+4])),
+		Shard:     int64(binary.BigEndian.Uint64(key[pos+4 : pos+12])),
+	}
+	pos += 4 + 8 + 4
+	return blockSeqIndexRef{key: historyKey, seqno: binary.BigEndian.Uint32(key[pos : pos+4])}, nil
+}
+
+func cloneBlockIDPtr(ref *ton.BlockIDExt) *ton.BlockIDExt {
+	if ref == nil {
+		return nil
+	}
+	cloned := *ref
+	return &cloned
 }

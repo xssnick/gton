@@ -48,6 +48,7 @@ const (
 	BlockMetaHasProofKeyBlockLink
 	BlockMetaHasStateSnapshot
 	BlockMetaIsKeyBlock
+	BlockMetaHasStateCells
 )
 
 const (
@@ -63,10 +64,11 @@ type BlockMeta struct {
 	EndLT         uint64
 	StateRootHash []byte
 	StateFileHash []byte
-	// MasterchainRef matches C++ BlockHandle::masterchain_ref_block:
+	// MasterchainRefSeqno matches C++ BlockHandle::masterchain_ref_block seqno:
 	// the masterchain block that applied/included this shard block, not BlockInfo.MasterRef.
-	MasterchainRef *ton.BlockIDExt
-	PrevRefs       []ton.BlockIDExt
+	MasterchainRefSeqno uint32
+	PrevRefs            []ton.BlockIDExt
+	NextRefs            []ton.BlockIDExt
 }
 
 func (m *BlockMeta) Clone() *BlockMeta {
@@ -75,21 +77,22 @@ func (m *BlockMeta) Clone() *BlockMeta {
 	}
 
 	cloned := &BlockMeta{
-		ID:            m.ID,
-		Flags:         m.Flags,
-		GenUTime:      m.GenUTime,
-		StartLT:       m.StartLT,
-		EndLT:         m.EndLT,
-		StateRootHash: bytes.Clone(m.StateRootHash),
-		StateFileHash: bytes.Clone(m.StateFileHash),
-	}
-	if m.MasterchainRef != nil {
-		ref := *m.MasterchainRef
-		cloned.MasterchainRef = &ref
+		ID:                  m.ID,
+		Flags:               m.Flags,
+		GenUTime:            m.GenUTime,
+		StartLT:             m.StartLT,
+		EndLT:               m.EndLT,
+		StateRootHash:       bytes.Clone(m.StateRootHash),
+		StateFileHash:       bytes.Clone(m.StateFileHash),
+		MasterchainRefSeqno: m.MasterchainRefSeqno,
 	}
 	if len(m.PrevRefs) > 0 {
 		cloned.PrevRefs = make([]ton.BlockIDExt, len(m.PrevRefs))
 		copy(cloned.PrevRefs, m.PrevRefs)
+	}
+	if len(m.NextRefs) > 0 {
+		cloned.NextRefs = make([]ton.BlockIDExt, len(m.NextRefs))
+		copy(cloned.NextRefs, m.NextRefs)
 	}
 	return cloned
 }
@@ -100,6 +103,13 @@ func (m *BlockMeta) Has(flag BlockMetaFlags) bool {
 
 func (m *BlockMeta) Mark(flag BlockMetaFlags) {
 	m.Flags |= flag
+}
+
+func (m *BlockMeta) MasterchainRefKnown() bool {
+	if m == nil || (m.ID.Workchain == masterchainID && m.ID.Shard == masterchainShard) {
+		return false
+	}
+	return m.MasterchainRefSeqno != 0 || m.ID.SeqNo == 0
 }
 
 func (m *BlockMeta) HasProof(kind ServedProofKind) bool {
@@ -171,13 +181,16 @@ func MergeBlockMeta(base *BlockMeta, next *BlockMeta) *BlockMeta {
 	if len(next.StateFileHash) > 0 {
 		merged.StateFileHash = bytes.Clone(next.StateFileHash)
 	}
-	if next.MasterchainRef != nil {
-		ref := *next.MasterchainRef
-		merged.MasterchainRef = &ref
+	if next.MasterchainRefKnown() {
+		merged.MasterchainRefSeqno = next.MasterchainRefSeqno
 	}
 	if len(next.PrevRefs) > 0 {
 		merged.PrevRefs = make([]ton.BlockIDExt, len(next.PrevRefs))
 		copy(merged.PrevRefs, next.PrevRefs)
+	}
+	if len(next.NextRefs) > 0 {
+		merged.NextRefs = make([]ton.BlockIDExt, len(next.NextRefs))
+		copy(merged.NextRefs, next.NextRefs)
 	}
 	return merged
 }
@@ -384,7 +397,7 @@ func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockM
 func BuildBlockMetaFromState(state BlockState) *BlockMeta {
 	meta := &BlockMeta{
 		ID:            state.Block,
-		Flags:         BlockMetaHasStateSnapshot,
+		Flags:         BlockMetaHasStateSnapshot | BlockMetaHasStateCells,
 		StateRootHash: bytes.Clone(state.StateRootHash),
 		StateFileHash: bytes.Clone(state.StateFileHash),
 	}
@@ -392,8 +405,7 @@ func BuildBlockMetaFromState(state BlockState) *BlockMeta {
 		meta.GenUTime = state.Parsed.GenUTime
 	}
 	if state.MasterchainRef != nil {
-		ref := *state.MasterchainRef
-		meta.MasterchainRef = &ref
+		meta.MasterchainRefSeqno = state.MasterchainRef.SeqNo
 	}
 	return meta
 }

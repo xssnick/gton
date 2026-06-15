@@ -165,9 +165,62 @@ func TestMarkLiveCheckpointStatesFlushedPublishesAllEntries(t *testing.T) {
 	}
 }
 
+func TestPublishLiveCurrentBlockMarkersPublishesOnlyCurrentTips(t *testing.T) {
+	flusher := &testLiveCheckpointFlusher{}
+	logger := zerolog.Nop()
+	svc := &Service{log: logger, liveState: flusher}
+	master := testBlockID(-1, topShard, 202)
+	shardA := testBlockID(0, topShard, 203)
+	shardB := testBlockID(0, topShard/2, 204)
+	current := &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{
+			Block:         master,
+			StateRootHash: []byte{0x01},
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{
+			tnstore.ShardKeyFromBlock(shardA): {
+				Block:         shardA,
+				StateRootHash: []byte{0x02},
+			},
+			tnstore.ShardKeyFromBlock(shardB): {
+				Block:         shardB,
+				StateRootHash: []byte{0x03},
+			},
+		},
+	}
+
+	svc.publishLiveCurrentBlockMarkers(current)
+
+	if len(flusher.artifacts) != 3 {
+		t.Fatalf("published markers = %d, want 3", len(flusher.artifacts))
+	}
+	wantBlocks := []ton.BlockIDExt{master}
+	for _, key := range tnstore.SortedShardKeys(current.Shards) {
+		wantBlocks = append(wantBlocks, current.Shards[key].Block)
+	}
+	for i, artifact := range flusher.artifacts {
+		if !artifact.Block.Equals(&wantBlocks[i]) {
+			t.Fatalf("marker[%d] block = %s, want %s", i, tnstore.FormatBlockRef(artifact.Block), tnstore.FormatBlockRef(wantBlocks[i]))
+		}
+		if len(artifact.BlockData) != 0 || len(artifact.Proofs) != 0 {
+			t.Fatalf("marker[%d] published payload data=%d proofs=%d", i, len(artifact.BlockData), len(artifact.Proofs))
+		}
+		if artifact.State == nil || !artifact.State.Block.Equals(&wantBlocks[i]) {
+			t.Fatalf("marker[%d] state is missing", i)
+		}
+		if artifact.Meta == nil || !artifact.Meta.ID.Equals(&wantBlocks[i]) {
+			t.Fatalf("marker[%d] meta is missing", i)
+		}
+		if !artifact.ArtifactFlushed || !artifact.StateFlushed {
+			t.Fatalf("marker[%d] flushed flags artifact=%v state=%v", i, artifact.ArtifactFlushed, artifact.StateFlushed)
+		}
+	}
+}
+
 type testLiveCheckpointFlusher struct {
-	current *tnstore.CurrentState
-	blocks  []ton.BlockIDExt
+	current   *tnstore.CurrentState
+	blocks    []ton.BlockIDExt
+	artifacts []tnstore.LiveBlockArtifacts
 }
 
 func (f *testLiveCheckpointFlusher) SetLiveCurrentState(current *tnstore.CurrentState) {
@@ -176,6 +229,35 @@ func (f *testLiveCheckpointFlusher) SetLiveCurrentState(current *tnstore.Current
 
 func (f *testLiveCheckpointFlusher) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
 	f.blocks = append(f.blocks, blocks...)
+}
+
+func (f *testLiveCheckpointFlusher) MarkLiveCurrentStateFlushed(current *tnstore.CurrentState) {
+	f.current = current
+}
+
+func (f *testLiveCheckpointFlusher) MarkLiveBlockFlushed(ton.BlockIDExt) {}
+
+func (f *testLiveCheckpointFlusher) PublishLiveBlockArtifacts(artifact tnstore.LiveBlockArtifacts) error {
+	f.artifacts = append(f.artifacts, artifact)
+	return nil
+}
+
+func (f *testLiveCheckpointFlusher) NonfinalBlockCacheEnabled() bool {
+	return false
+}
+
+func (f *testLiveCheckpointFlusher) PublishNonfinalBlockArtifacts(tnstore.LiveBlockArtifacts, tnstore.LiveBlockNonfinalKind) error {
+	return nil
+}
+
+func (f *testLiveCheckpointFlusher) SetNonfinalCellLoader(cell.LazyCellLoader) {}
+
+func (f *testLiveCheckpointFlusher) BlockState(context.Context, ton.BlockIDExt) (*tnstore.BlockState, error) {
+	return nil, tnstore.ErrNotFound
+}
+
+func (f *testLiveCheckpointFlusher) LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error) {
+	return nil, tnstore.ErrNotFound
 }
 
 func TestSyncBlockResultForError(t *testing.T) {
@@ -717,7 +799,9 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 		timing:       newCatchUpTiming(time.Now()),
 		stateCells:   newStateCellWindowCache(nil),
 	}
-	runner.stateCells.addPreparedRecords(preparedCells)
+	if err := runner.stateCells.addPreparedRecords(preparedCells); err != nil {
+		t.Fatalf("add prepared records: %v", err)
+	}
 	runner.checkpointStates.remember(&current.Masterchain)
 	cancelShutdown()
 	if err := runner.flushStagedCurrent(); err != nil {
@@ -889,7 +973,7 @@ func TestVerifiedMasterchainQueueAcceptsBroadcastOutsideCatchUp(t *testing.T) {
 	downloaded := testPreparedMasterchainBlock(prev, next)
 
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(downloaded, p2p.PeerID{})
+	svc.queuePreparedMasterchainBlockFromSource(downloaded, p2p.PeerID{})
 
 	got, ok := svc.takeQueuedMasterchainBlock(prev, next)
 	if !ok {
@@ -936,13 +1020,13 @@ func TestVerifiedMasterchainQueueDropsFarFutureWhenFull(t *testing.T) {
 	for seqno := uint32(10); seqno < 10+nextMasterchainQueueLimit; seqno++ {
 		prev := testMasterBlockID(seqno)
 		next := testMasterBlockID(seqno + 1)
-		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), p2p.PeerID{})
+		svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), p2p.PeerID{})
 	}
 
 	oldestPrev := testMasterBlockID(10)
 	farPrev := testMasterBlockID(1000)
 	farNext := testMasterBlockID(1001)
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(farPrev, farNext), p2p.PeerID{})
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(farPrev, farNext), p2p.PeerID{})
 
 	oldestNext := testMasterBlockID(11)
 	if got, ok := svc.takeQueuedMasterchainBlock(oldestPrev, oldestNext); !ok || !got.ID.Equals(&oldestNext) {
@@ -959,8 +1043,8 @@ func TestVerifiedMasterchainQueueSeqnoIndexDoesNotDeleteReplacement(t *testing.T
 	block := testMasterBlockID(21)
 	svc := &Service{}
 
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(oldPrev, block), testPeerID("old"))
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(newPrev, block), testPeerID("new"))
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(oldPrev, block), testPeerID("old"))
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(newPrev, block), testPeerID("new"))
 
 	if _, ok := svc.takeQueuedMasterchainBlock(oldPrev, block); ok {
 		t.Fatal("expected same-seqno replacement to remove old prev entry")
@@ -975,7 +1059,7 @@ func TestQueuedMasterchainBlockAheadReportsFutureBlock(t *testing.T) {
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), p2p.PeerID{})
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(futurePrev, future), p2p.PeerID{})
 
 	got, ok := svc.queuedMasterchainFuture(current)
 	if !ok {
@@ -991,7 +1075,7 @@ func TestQueuedMasterchainFutureReportsMissingSeqnoAndSource(t *testing.T) {
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
 
 	got, ok := svc.queuedMasterchainFuture(current)
 	if !ok {
@@ -1044,7 +1128,7 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	futurePrev := testMasterBlockID(101)
 	future := testMasterBlockID(102)
 	svc := &Service{}
-	svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
 
 	queued, _ := svc.nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{})
 	if queued.peerLimit != nextBlockBootstrapProbePeers {
@@ -1173,25 +1257,22 @@ func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		svc.queueMasterchainBlockCandidateFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
+		svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
 		svc.wakeCurrentStateSync()
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	downloaded, source, _, ok, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
+	cached, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
 	if err != nil {
 		t.Fatalf("wait preferred masterchain broadcast: %v", err)
 	}
-	if !ok {
-		t.Fatal("expected preferred masterchain broadcast")
+	if !cached.block.ID.Equals(&next) {
+		t.Fatalf("preferred block = %s, want %s", tnstore.FormatBlockRef(cached.block.ID), tnstore.FormatBlockRef(next))
 	}
-	if !downloaded.ID.Equals(&next) {
-		t.Fatalf("preferred block = %s, want %s", tnstore.FormatBlockRef(downloaded.ID), tnstore.FormatBlockRef(next))
-	}
-	if source != "broadcast_queue" {
-		t.Fatalf("preferred source = %q, want broadcast_queue", source)
+	if cached.source != "broadcast_queue" {
+		t.Fatalf("preferred source = %q, want broadcast_queue", cached.source)
 	}
 }
 

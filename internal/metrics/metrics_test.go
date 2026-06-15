@@ -87,8 +87,6 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateFilesDir, "partial.tmp"), []byte("ignored"), 0o644); err != nil {
 		t.Fatalf("write ignored state file: %v", err)
 	}
-	m.SetStorageArtifactDirs(archivePackagesDir, stateFilesDir)
-
 	localMaster := ton.BlockIDExt{
 		Workchain: -1,
 		Shard:     int64(-1 << 63),
@@ -96,7 +94,7 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 	}
 	networkMaster := localMaster
 	networkMaster.SeqNo = 41
-	m.SetServiceStatusReader(func() service.StatusSnapshot {
+	serviceStatusReader := func() service.StatusSnapshot {
 		return service.StatusSnapshot{
 			StatusSnapshot: p2p.StatusSnapshot{
 				LatestMasterchain: &networkMaster,
@@ -150,8 +148,8 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 				Complete:        true,
 			},
 		}
-	})
-	m.SetDBStatusReader(func(context.Context) (pebblestore.DBStatus, error) {
+	}
+	dbStatusReader := func(context.Context) (pebblestore.DBStatus, error) {
 		return pebblestore.DBStatus{
 			CellGenerations: []pebblestore.CellDBGenerationStatus{
 				{
@@ -172,7 +170,15 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 				},
 			},
 		}, nil
-	})
+	}
+	if err := m.RegisterRuntimeCollectors(RuntimeReaders{
+		ServiceStatusReader: serviceStatusReader,
+		DBStatusReader:      dbStatusReader,
+		ArchivePackagesDir:  archivePackagesDir,
+		StateFilesDir:       stateFilesDir,
+	}); err != nil {
+		t.Fatalf("register runtime collectors: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -184,9 +190,9 @@ func TestMetricsHandlerExposesLiteserverSyncAndStatusMetrics(t *testing.T) {
 
 	body := rec.Body.String()
 	for _, want := range []string{
-		namespace + `_liteserver_query_duration_seconds_bucket{error_code="0",method="GetTime",response="CurrentTime",le="2.5"} 1`,
-		namespace + `_liteserver_query_wait_seconds_bucket{error_code="0",method="GetTime",response="CurrentTime",le="0.25"} 1`,
-		namespace + `_liteserver_queries_total{error_code="0",method="GetTime",response="CurrentTime"} 1`,
+		namespace + `_liteserver_query_duration_seconds_bucket{error_code="0",method="GetTime",reason="none",response="CurrentTime",le="2.5"} 1`,
+		namespace + `_liteserver_query_wait_seconds_bucket{error_code="0",method="GetTime",reason="none",response="CurrentTime",le="0.25"} 1`,
+		namespace + `_liteserver_queries_total{error_code="0",method="GetTime",reason="none",response="CurrentTime"} 1`,
 		namespace + `_sync_blocks_total{catch_up="false",chain="masterchain",pipeline="next_block",result="success",source="queue"} 1`,
 		namespace + `_sync_block_origins_total{catch_up="false",chain="masterchain",origin="broadcast",pipeline="next_block",result="success"} 1`,
 		namespace + `_sync_block_prepare_duration_seconds_bucket{catch_up="false",chain="masterchain",pipeline="next_block",result="success",shard="masterchain",source="queue",le="1"} 1`,
@@ -244,11 +250,12 @@ func TestLiteserverMetricsTreatUnspecifiedLSErrorAsError(t *testing.T) {
 	namespace := "testgton"
 	m := New(namespace)
 	m.ObserveLiteserverQuery(liteserver.QueryObservation{
-		Method:    "SendMessage",
-		Response:  "LSError",
-		Error:     true,
-		ErrorCode: 0,
-		Duration:  time.Millisecond,
+		Method:      "SendMessage",
+		Response:    "LSError",
+		Error:       true,
+		ErrorCode:   0,
+		ErrorReason: "tvm_rejected",
+		Duration:    time.Millisecond,
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -260,14 +267,39 @@ func TestLiteserverMetricsTreatUnspecifiedLSErrorAsError(t *testing.T) {
 	}
 
 	body := rec.Body.String()
-	want := namespace + `_liteserver_queries_total{error_code="unspecified",method="SendMessage",response="LSError"} 1`
+	want := namespace + `_liteserver_queries_total{error_code="unspecified",method="SendMessage",reason="tvm_rejected",response="LSError"} 1`
 	if !strings.Contains(body, want) {
 		t.Fatalf("metrics output does not contain %q\n%s", want, body)
 	}
 
-	removed := namespace + `_liteserver_queries_total{error_code="0",method="SendMessage",response="LSError"}`
+	removed := namespace + `_liteserver_queries_total{error_code="0",method="SendMessage",reason="tvm_rejected",response="LSError"}`
 	if strings.Contains(body, removed) {
 		t.Fatalf("metrics output contains successful error label %q\n%s", removed, body)
+	}
+}
+
+func TestLiteserverMetricsUseUnspecifiedReasonForUnclassifiedErrors(t *testing.T) {
+	namespace := "testgton"
+	m := New(namespace)
+	m.ObserveLiteserverQuery(liteserver.QueryObservation{
+		Method:   "SendMessage",
+		Response: "LSError",
+		Error:    true,
+		Duration: time.Millisecond,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	want := namespace + `_liteserver_queries_total{error_code="unspecified",method="SendMessage",reason="unspecified",response="LSError"} 1`
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics output does not contain %q\n%s", want, body)
 	}
 }
 

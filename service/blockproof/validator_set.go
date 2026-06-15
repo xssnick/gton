@@ -2,6 +2,7 @@ package blockproof
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"sort"
@@ -34,25 +35,48 @@ type validatorWeightHole struct {
 var crc32CastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 func CurrentValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {
-	validatorsCfg, err := cfg.GetCurrentValidators()
+	validatorsCfg, err := cfg.GetCurrentTempValidators()
 	if err != nil {
-		return nil, fmt.Errorf("load current validators: %w", err)
+		if !errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
+			return nil, fmt.Errorf("load current temporary validators: %w", err)
+		}
+
+		// C++ uses cur_temp_validators as active when present, then falls back to cur_validators.
+		validatorsCfg, err = cfg.GetCurrentValidators()
+		if err != nil {
+			return nil, fmt.Errorf("load current validators: %w", err)
+		}
 	}
+
 	return ValidatorsForBlock(cfg, block, *validatorsCfg, ccSeqno)
 }
 
 func PrevValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {
-	validatorsCfg, err := cfg.GetPrevValidators()
+	validatorsCfg, err := cfg.GetPrevTempValidators()
 	if err != nil {
-		return nil, fmt.Errorf("load previous validators: %w", err)
+		if !errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
+			return nil, fmt.Errorf("load previous temporary validators: %w", err)
+		}
+
+		validatorsCfg, err = cfg.GetPrevValidators()
+		if err != nil {
+			return nil, fmt.Errorf("load previous validators: %w", err)
+		}
 	}
 	return ValidatorsForBlock(cfg, block, *validatorsCfg, ccSeqno)
 }
 
 func NextValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {
-	validatorsCfg, err := cfg.GetNextValidators()
+	validatorsCfg, err := cfg.GetNextTempValidators()
 	if err != nil {
-		return nil, fmt.Errorf("load next validators: %w", err)
+		if !errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
+			return nil, fmt.Errorf("load next temporary validators: %w", err)
+		}
+
+		validatorsCfg, err = cfg.GetNextValidators()
+		if err != nil {
+			return nil, fmt.Errorf("load next validators: %w", err)
+		}
 	}
 	return ValidatorsForBlock(cfg, block, *validatorsCfg, ccSeqno)
 }

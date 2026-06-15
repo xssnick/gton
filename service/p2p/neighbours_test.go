@@ -123,6 +123,220 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 	}
 }
 
+func TestReloadNeighboursKeepsLeasedWorstPeer(t *testing.T) {
+	leasedID := testPeerID("a")
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		node: &Node{
+			peerUse: map[PeerID]peerUse{leasedID: {downloads: 1}},
+		},
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: make([]PeerID, 0, maxQueryNeighbours),
+	}
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxQueryNeighbours; i++ {
+		id := testPeerID(string(rune('a' + i)))
+		peer := &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+		if id == leasedID {
+			peer.unreliability = peerStopUnreliability + 1
+		}
+		sub.peers[id] = peer
+		sub.neighbours = append(sub.neighbours, id)
+	}
+
+	fresh := &overlayPeer{
+		id:            testPeerID("fresh"),
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub.peers[fresh.id] = fresh
+
+	sub.reloadNeighbours()
+
+	if !sub.hasNeighbourLocked(leasedID) {
+		t.Fatalf("leased neighbour was rotated")
+	}
+}
+
+func TestReloadNeighboursKeepsSessionPinnedArchivePeer(t *testing.T) {
+	pinnedID := testPeerID("a")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:        discardLogger(),
+		node:       node,
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: make([]PeerID, 0, maxQueryNeighbours),
+	}
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxQueryNeighbours; i++ {
+		id := testPeerID(string(rune('a' + i)))
+		peer := &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+		if id == pinnedID {
+			peer.unreliability = peerStopUnreliability + 1
+		}
+		sub.peers[id] = peer
+		sub.neighbours = append(sub.neighbours, id)
+	}
+	session.noteArchivePeerSuccess(sub.peers[pinnedID])
+
+	fresh := &overlayPeer{
+		id:            testPeerID("fresh"),
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub.peers[fresh.id] = fresh
+
+	sub.reloadNeighbours()
+
+	if !sub.hasNeighbourLocked(pinnedID) {
+		t.Fatalf("session-pinned archive neighbour was rotated")
+	}
+}
+
+func TestReloadNeighboursDoesNotRandomRotateLeasedNeighbours(t *testing.T) {
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:        discardLogger(),
+		node:       node,
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: make([]PeerID, 0, maxQueryNeighbours),
+	}
+
+	now := int32(time.Now().Unix())
+	for i := 0; i < maxQueryNeighbours; i++ {
+		id := testPeerID(string(rune('a' + i)))
+		sub.peers[id] = &overlayPeer{
+			id:            id,
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: now},
+			alive:         true,
+			lastReceiveAt: time.Now(),
+		}
+		sub.neighbours = append(sub.neighbours, id)
+		node.peerUse[id] = peerUse{downloads: 1}
+	}
+
+	fresh := &overlayPeer{
+		id:            testPeerID("fresh"),
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub.peers[fresh.id] = fresh
+
+	sub.reloadNeighbours()
+
+	if sub.hasNeighbourLocked(fresh.id) {
+		t.Fatalf("fresh peer replaced a leased neighbour")
+	}
+	for id := range node.peerUse {
+		if !sub.hasNeighbourLocked(id) {
+			t.Fatalf("leased neighbour %q was rotated", id)
+		}
+	}
+}
+
+func TestReloadNeighboursPrunesDeadLeasedPeer(t *testing.T) {
+	deadID := testPeerID("dead")
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		node: &Node{
+			peerUse: map[PeerID]peerUse{deadID: {downloads: 1}},
+		},
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: []PeerID{deadID},
+	}
+
+	now := int32(time.Now().Unix())
+	sub.peers[deadID] = &overlayPeer{
+		id:            deadID,
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         false,
+		lastReceiveAt: time.Now().Add(-time.Minute),
+	}
+
+	fresh := &overlayPeer{
+		id:            testPeerID("fresh"),
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub.peers[fresh.id] = fresh
+
+	sub.reloadNeighbours()
+
+	if sub.hasNeighbourLocked(deadID) {
+		t.Fatalf("dead leased neighbour was not pruned")
+	}
+	if !sub.hasNeighbourLocked(fresh.id) {
+		t.Fatalf("fresh peer did not replace dead leased neighbour")
+	}
+}
+
+func TestReloadNeighboursPrunesDeadSessionPinnedArchivePeer(t *testing.T) {
+	deadID := testPeerID("dead")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:        discardLogger(),
+		node:       node,
+		peers:      map[PeerID]*overlayPeer{},
+		neighbours: []PeerID{deadID},
+	}
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	now := int32(time.Now().Unix())
+	sub.peers[deadID] = &overlayPeer{
+		id:            deadID,
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         false,
+		lastReceiveAt: time.Now().Add(-time.Minute),
+	}
+	session.noteArchivePeerSuccess(sub.peers[deadID])
+
+	fresh := &overlayPeer{
+		id:            testPeerID("fresh"),
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		announced:     &overlay.Node{Version: now},
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
+	sub.peers[fresh.id] = fresh
+
+	sub.reloadNeighbours()
+
+	if sub.hasNeighbourLocked(deadID) {
+		t.Fatalf("dead session-pinned archive neighbour was not pruned")
+	}
+	if !sub.hasNeighbourLocked(fresh.id) {
+		t.Fatalf("fresh peer did not replace dead session-pinned archive neighbour")
+	}
+}
+
 func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 	sub := &overlaySubscription{
 		log:        discardLogger(),

@@ -408,6 +408,54 @@ func TestLiveStoreNonfinalRejectsStateUpdateFromDifferentPreviousRoot(t *testing
 	}
 }
 
+func TestLiveStoreNonfinalWaitsBeforePreparingStateUpdate(t *testing.T) {
+	live, base := testNonfinalLiveStoreWithCurrent(t)
+
+	parentState := cell.BeginCell().MustStoreUInt(0x93, 8).EndCell()
+	parent := testNonfinalArtifact(t, 0, masterchainShard, 11, parentState, base.Block)
+
+	usageTree := cell.NewCellUsageTree()
+	usageParentState := parentState.WithTrace(usageTree.RootTrace())
+	if _, err := usageParentState.BeginParse(); err != nil {
+		t.Fatalf("trace parent state: %v", err)
+	}
+	childState := cell.BeginCell().MustStoreUInt(0x94, 8).EndCell()
+	update, err := usageTree.CreateMerkleUpdate(usageParentState, childState)
+	if err != nil {
+		t.Fatalf("create merkle update: %v", err)
+	}
+
+	childBlock, childRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 12, parent.Block, update)
+	child := storage.LiveBlockArtifacts{
+		Block:     childBlock,
+		Root:      childRoot,
+		BlockData: testBlockBOC(childRoot),
+		Meta: &storage.BlockMeta{
+			ID:            childBlock,
+			PrevRefs:      []ton.BlockIDExt{parent.Block},
+			StateRootHash: bytes.Repeat([]byte{0xff}, 32),
+		},
+	}
+	if err = live.PublishNonfinalBlockArtifacts(child, storage.LiveBlockNonfinalCandidate); err != nil {
+		t.Fatalf("publish not-ready child: %v", err)
+	}
+
+	signed, candidates := live.NonfinalPendingShardBlocks(nil)
+	if len(signed) != 0 || len(candidates) != 0 {
+		t.Fatalf("not-ready child became visible: signed=%d candidates=%d", len(signed), len(candidates))
+	}
+	if _, err = live.BlockState(context.Background(), childBlock); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("not-ready child state err = %v, want ErrNotFound", err)
+	}
+
+	live.mu.RLock()
+	_, waiting := live.nonFinalWaiting[storage.BlockKey(childBlock)]
+	live.mu.RUnlock()
+	if !waiting {
+		t.Fatal("not-ready child was not kept in waiting queue")
+	}
+}
+
 func TestLiveStoreNonfinalDoesNotEnterLookupIndexes(t *testing.T) {
 	live, base := testNonfinalLiveStoreWithCurrent(t)
 
@@ -546,6 +594,63 @@ func TestLiveStoreNonfinalDropsBlocksTooFarAheadOfCurrentMaster(t *testing.T) {
 	}
 }
 
+func TestLiveStoreNonfinalDropsTooFarAheadWithMetaOnlyCurrent(t *testing.T) {
+	live, base := testNonfinalLiveStoreWithCurrent(t)
+
+	current, err := live.CurrentState(context.Background())
+	if err != nil {
+		t.Fatalf("current state: %v", err)
+	}
+	current.Masterchain.Parsed = nil
+	live.SetLiveCurrentState(current)
+
+	tooFar := testNonfinalArtifact(t, 0, masterchainShard, 11, cell.BeginCell().MustStoreUInt(0x72, 8).EndCell(), base.Block)
+	tooFar.Meta.GenUTime = 1030
+	if err = live.PublishNonfinalBlockArtifacts(tooFar, storage.LiveBlockNonfinalCandidate); err != nil {
+		t.Fatalf("publish too far: %v", err)
+	}
+
+	_, candidates := live.NonfinalPendingShardBlocks(nil)
+	if len(candidates) != 0 {
+		t.Fatalf("candidates = %d, want 0", len(candidates))
+	}
+	if _, err = live.BlockState(context.Background(), tooFar.Block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("too-far state err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLiveStoreNonfinalOrderIndexTracksDeletes(t *testing.T) {
+	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{NonFinalEnabled: true, NonFinalCache: 8})
+	blocks := []ton.BlockIDExt{
+		{Workchain: 0, Shard: 1, SeqNo: 1, RootHash: bytes.Repeat([]byte{0x01}, 32), FileHash: bytes.Repeat([]byte{0x11}, 32)},
+		{Workchain: 0, Shard: 2, SeqNo: 2, RootHash: bytes.Repeat([]byte{0x02}, 32), FileHash: bytes.Repeat([]byte{0x12}, 32)},
+		{Workchain: 0, Shard: 3, SeqNo: 3, RootHash: bytes.Repeat([]byte{0x03}, 32), FileHash: bytes.Repeat([]byte{0x13}, 32)},
+	}
+
+	live.mu.Lock()
+	for i, block := range blocks {
+		key := storage.BlockKey(block)
+		live.putNonfinalPendingLocked(key, liveNonfinalPending{block: block})
+		if idx := live.nonfinalOrderIndexLocked(key); idx != i {
+			t.Fatalf("pending index for %d = %d, want %d", i, idx, i)
+		}
+	}
+
+	live.deleteNonfinalPendingLocked(storage.BlockKey(blocks[1]))
+	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); idx != 1 {
+		t.Fatalf("tail pending index after middle delete = %d, want 1", idx)
+	}
+	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[1])); idx != -1 {
+		t.Fatalf("deleted pending index = %d, want -1", idx)
+	}
+
+	live.deleteNonfinalPendingLocked(storage.BlockKey(blocks[0]))
+	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); idx != 0 {
+		t.Fatalf("tail pending index after head delete = %d, want 0", idx)
+	}
+	live.mu.Unlock()
+}
+
 func TestHandleNonfinalPendingShardBlocksEnabled(t *testing.T) {
 	live, base := testNonfinalLiveStoreWithCurrent(t)
 	pendingState := cell.BeginCell().MustStoreUInt(0x77, 8).EndCell()
@@ -602,6 +707,7 @@ func testNonfinalLiveStoreWithCurrentStore(t *testing.T, store Store) (*LiveStor
 
 	master := testNonfinalArtifact(t, masterchainID, masterchainShard, 100, cell.BeginCell().MustStoreUInt(0x01, 8).EndCell())
 	master.Meta.GenUTime = 1000
+	master.State.Parsed = &tlb.ShardStateUnsplit{GenUTime: 1000}
 	base := testNonfinalArtifact(t, 0, masterchainShard, 10, cell.BeginCell().MustStoreUInt(0x02, 8).EndCell())
 	for _, artifact := range []storage.LiveBlockArtifacts{master, base} {
 		if err := live.PublishLiveBlockArtifacts(artifact); err != nil {

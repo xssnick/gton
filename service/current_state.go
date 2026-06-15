@@ -30,10 +30,19 @@ func (s *Service) ensureCurrentState(ctx context.Context) error {
 		return fmt.Errorf("load current state: %w", err)
 	}
 
-	s.log.Info().Msg("current state is missing, starting state snapshot sync")
-	snapshot, err := s.stateSync.SyncCurrent(ctx)
-	if err != nil {
-		return fmt.Errorf("sync current state: %w", err)
+	var snapshot *storage.CurrentState
+	if s.archiveFromZero {
+		s.log.Info().Msg("current state is missing, starting archive sync from zero state")
+		snapshot, err = s.stateSync.SyncZeroStateCurrent(ctx)
+		if err != nil {
+			return fmt.Errorf("sync current state from zero state: %w", err)
+		}
+	} else {
+		s.log.Info().Msg("current state is missing, starting state snapshot sync")
+		snapshot, err = s.stateSync.SyncCurrent(ctx)
+		if err != nil {
+			return fmt.Errorf("sync current state: %w", err)
+		}
 	}
 
 	s.log.Info().
@@ -56,6 +65,21 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 	for {
 		if current.ShardClientSeqno == 0 {
 			current.ShardClientSeqno = current.Masterchain.Block.SeqNo
+		}
+		if s.archiveFromZero && current.Masterchain.Block.SeqNo == 0 && current.ShardClientSeqno == 0 {
+			archiveTarget := current.Masterchain.Block
+			archiveTarget.SeqNo = ^uint32(0)
+			s.log.Info().
+				Str("current", storage.FormatBlockRef(current.Masterchain.Block)).
+				Str("archive_target", storage.FormatBlockRef(archiveTarget)).
+				Msg("starting archive catch-up from zero state")
+
+			var err error
+			current, err = s.catchUpShardClientFromArchives(ctx, current, archiveTarget)
+			if err != nil {
+				return err
+			}
+			continue
 		}
 		if s.cellGenerationSwitchRequestActive() || s.cellGenerationSwitchActive() {
 			s.log.Debug().
@@ -202,8 +226,10 @@ type queuedMasterchainFuture struct {
 	lowestMissingSeqno uint32
 }
 
-func (s *Service) queueMasterchainBlockCandidateFromSource(block PreparedBlock, sourcePeerID p2p.PeerID) {
-	s.queuePreparedMasterchainBlockFromSource(block, sourcePeerID)
+type cachedMasterchainBlockForApply struct {
+	block          PreparedBlock
+	source         string
+	prepareElapsed time.Duration
 }
 
 func (s *Service) queueMasterchainBroadcastCandidateFromSource(block VerifiedBlock, sourcePeerID p2p.PeerID) {
@@ -585,10 +611,10 @@ func (s *Service) dropQueuedMasterchainCandidate(prev ton.BlockIDExt) {
 	s.nextMasterchainMx.Unlock()
 }
 
-func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context, prev, target ton.BlockIDExt) (PreparedBlock, time.Duration, bool, error) {
+func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context, prev, target ton.BlockIDExt) (cachedMasterchainBlockForApply, error) {
 	entry, ok := s.peekQueuedMasterchainCandidate(prev, target)
 	if !ok {
-		return PreparedBlock{}, 0, false, nil
+		return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 	}
 
 	started := time.Now()
@@ -596,10 +622,10 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 	checked, err := s.validateVerifiedMasterchainBlock(ctx, block)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return PreparedBlock{}, 0, false, err
+			return cachedMasterchainBlockForApply{}, err
 		}
 		if errors.Is(err, storage.ErrNotFound) {
-			return PreparedBlock{}, 0, false, nil
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 		}
 		s.dropQueuedMasterchainCandidate(prev)
 		event := s.log.Debug().
@@ -610,7 +636,7 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 			event.Str("source_peer_id", entry.sourcePeerID.String())
 		}
 		event.Msg("dropping invalid queued masterchain broadcast candidate")
-		return PreparedBlock{}, 0, false, nil
+		return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 	}
 	block.consensusChecked = checked
 
@@ -625,24 +651,24 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 			event.Str("source_peer_id", entry.sourcePeerID.String())
 		}
 		event.Msg("dropping unprepared queued masterchain broadcast candidate")
-		return PreparedBlock{}, 0, false, nil
+		return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 	}
 
 	s.dropQueuedMasterchainCandidate(prev)
 	prepared.PrepareElapsed = time.Since(started)
-	return prepared, prepared.PrepareElapsed, true, nil
+	return cachedMasterchainBlockForApply{
+		block:          prepared,
+		source:         "broadcast_candidate",
+		prepareElapsed: prepared.PrepareElapsed,
+	}, nil
 }
 
-func (s *Service) takeCachedMasterchainBlockForApply(ctx context.Context, prev, target ton.BlockIDExt) (PreparedBlock, string, time.Duration, bool, error) {
+func (s *Service) takeCachedMasterchainBlockForApply(ctx context.Context, prev, target ton.BlockIDExt) (cachedMasterchainBlockForApply, error) {
 	if downloaded, ok := s.takeQueuedMasterchainBlock(prev, target); ok {
-		return downloaded, "broadcast_queue", 0, true, nil
+		return cachedMasterchainBlockForApply{block: downloaded, source: "broadcast_queue"}, nil
 	}
 
-	downloaded, prepareElapsed, ok, err := s.promoteQueuedMasterchainBroadcastCandidate(ctx, prev, target)
-	if err != nil || !ok {
-		return PreparedBlock{}, "", 0, false, err
-	}
-	return downloaded, "broadcast_candidate", prepareElapsed, true, nil
+	return s.promoteQueuedMasterchainBroadcastCandidate(ctx, prev, target)
 }
 
 func (s *Service) takeQueuedMasterchainEntry(prev, target ton.BlockIDExt) (queuedMasterchainBlock, bool) {
@@ -864,6 +890,7 @@ func (s *Service) currentStateForNextMasterState(ctx context.Context, current *s
 		}
 		stats.resolverWait += res.wait
 		shard := *storage.CloneBlockState(res.state)
+		setShardStateMasterchainRef(&shard, masterState.Block)
 		next.Shards[storage.ShardKeyFromBlock(res.target)] = shard
 	}
 
