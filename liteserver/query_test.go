@@ -3806,6 +3806,45 @@ func TestHandleConfigParamsNeedPrevBlocksAddsCapabilitiesAndProof(t *testing.T) 
 	}
 }
 
+func TestHandleConfigParamsNeedPrevBlocksSkipsCurrentHundredBlock(t *testing.T) {
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 200}
+	version, err := tlb.ToCell(&tlb.GlobalVersion{Version: 13})
+	if err != nil {
+		t.Fatalf("build global version: %v", err)
+	}
+	stateRoot := testMasterStateWithConfig(t, base, map[int32]*cell.Cell{
+		int32(tlb.ConfigParamGlobalVersion): version,
+	})
+	id, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	store := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(id): testBlockBOC(blockRoot),
+		},
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(id): {Block: id, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetConfigParams{
+		Mode:    int32(configModeNeedPrevBlocks),
+		BlockID: cloneBlockID(id),
+	})
+	cfg, ok := resp.(ton.ConfigAll)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.ConfigAll: %+v", resp, resp)
+	}
+	if seqno := configProofPrevBlockSeqno(t, stateRoot, cfg.ConfigProof, 199); seqno != 199 {
+		t.Fatalf("prev block seqno = %d, want 199", seqno)
+	}
+	if seqno := configProofPrevBlockSeqno(t, stateRoot, cfg.ConfigProof, 100); seqno != 100 {
+		t.Fatalf("prev block 100-step seqno = %d, want 100", seqno)
+	}
+	if seqno := configProofPrevBlockSeqno(t, stateRoot, cfg.ConfigProof, 0); seqno != 0 {
+		t.Fatalf("zerostate seqno = %d, want 0", seqno)
+	}
+}
+
 func TestHandleConfigParamsPreviousKeyBlockMode(t *testing.T) {
 	keyParam := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	keyID, keyRoot := testKeyBlockWithConfig(t, 5, map[int32]*cell.Cell{42: keyParam})
@@ -4497,6 +4536,39 @@ func TestListBlockTransactionsMode256ReturnsTransactionMetadata(t *testing.T) {
 	}
 	if txID.Metadata.Initiator.Workchain != 0 || !bytes.Equal(txID.Metadata.Initiator.ID, initiator) {
 		t.Fatalf("metadata initiator = %+v, want 0:%x", txID.Metadata.Initiator, initiator)
+	}
+}
+
+func TestListBlockTransactionsMode256ErrorsWhenInMsgDescrEntryMissing(t *testing.T) {
+	account := bytes.Repeat([]byte{0x67}, 32)
+	tx, _ := testTransactionWithInMsg(t, account, 42)
+	otherAccount := bytes.Repeat([]byte{0x68}, 32)
+	otherTx, otherMsg := testTransactionWithInMsg(t, otherAccount, 43)
+	otherEnvelope := testMsgEnvelopeWithMetadata(t, otherMsg, otherAccount, 1, 43)
+	inMsgDesc := testInMsgDescr(t, otherMsg, otherEnvelope, otherTx)
+	root := testBlockWithTransactionsAndInMsgDesc(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+		42: tx,
+	}, inMsgDesc)
+	id := testBlockIDForRoot(0, masterchainShard, 1, root)
+	store := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(id): testBlockBOC(root),
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.ListBlockTransactions{
+		ID:    cloneBlockID(id),
+		Mode:  7 | 256,
+		Count: 1,
+	})
+
+	lsErr, ok := resp.(ton.LSError)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
+	}
+	if !strings.Contains(lsErr.Text, "no InMsg in InMsgDescr for message with hash") {
+		t.Fatalf("error = %q, want missing InMsgDescr entry", lsErr.Text)
 	}
 }
 

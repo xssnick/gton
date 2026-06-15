@@ -1066,7 +1066,7 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 					hash:    txCell.Hash(),
 					cell:    txCell,
 				}
-				if mode&256 != 0 && data.inMsgDescr != nil {
+				if mode&256 != 0 {
 					metadata, err := transactionMetadata(data.inMsgDescr, txCell)
 					if err != nil {
 						return blockTransactionList{}, err
@@ -1199,9 +1199,14 @@ func transactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell
 		return nil, fmt.Errorf("load transaction inbound message: %w", err)
 	}
 
-	value, err := inMsgDescr.LoadValueWithExtra(accountKey(msg.Hash()))
+	msgHash := msg.Hash()
+	if inMsgDescr == nil {
+		return nil, fmt.Errorf("no InMsg in InMsgDescr for message with hash %x", msgHash)
+	}
+
+	value, err := inMsgDescr.LoadValueWithExtra(accountKey(msgHash))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return nil, nil
+		return nil, fmt.Errorf("no InMsg in InMsgDescr for message with hash %x", msgHash)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup inbound message descriptor: %w", err)

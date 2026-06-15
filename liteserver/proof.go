@@ -1312,7 +1312,7 @@ func visitMcStatePrevBlocks(info *cell.Cell, seqno uint32, globalVersion uint32)
 	for _, prevSeqno := range configPrevBlockProofSeqnos(seqno, globalVersion) {
 		value, err := prevBlocks.LoadValueByIntKey(new(big.Int).SetUint64(uint64(prevSeqno)))
 		if err != nil {
-			return fmt.Errorf("cannot fetch old mc block")
+			return fmt.Errorf("cannot fetch old mc block seqno=%d: %w", prevSeqno, err)
 		}
 		var ref tlb.KeyExtBlkRef
 		if err = tlb.LoadFromCell(&ref, value); err != nil {
@@ -1329,12 +1329,15 @@ func visitMcStatePrevBlocks(info *cell.Cell, seqno uint32, globalVersion uint32)
 func configPrevBlockProofSeqnos(seqno uint32, globalVersion uint32) []uint32 {
 	seen := map[uint32]struct{}{}
 	seqnos := make([]uint32, 0, 33)
-	add := func(seqno uint32) {
-		if _, ok := seen[seqno]; ok {
+	add := func(prevSeqno uint32) {
+		if prevSeqno == seqno {
 			return
 		}
-		seen[seqno] = struct{}{}
-		seqnos = append(seqnos, seqno)
+		if _, ok := seen[prevSeqno]; ok {
+			return
+		}
+		seen[prevSeqno] = struct{}{}
+		seqnos = append(seqnos, prevSeqno)
 	}
 
 	if seqno > 0 {
