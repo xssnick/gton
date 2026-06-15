@@ -16,7 +16,7 @@ The project is under active development. Storage format and configuration may ch
 
 ## Hardware Requirements
 
-- Minimum RAM: `32 GB`.
+- Minimum RAM: `48 GB` (for mainnet).
 - Recommended RAM: `64 GB`.
 - Minimum CPU: `8` cores.
 - Minimum disk: `512 GB SSD`.
