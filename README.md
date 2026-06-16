@@ -71,6 +71,7 @@ Supported flags:
 | `--config <path>` | Path to the JSON config. Defaults to `config.json`. |
 | `--ls-pubkey` | Print the liteserver public key (base64) and exit. |
 | `--adnl-id` | Print the ADNL id derived from `adnl.key` (base64) and exit. |
+| `--version` | Print the build version and exit. |
 | `--verbosity <level>` | Global log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
 | `--log-types <list>` | Per-category log verbosity overrides, for example `liteserver=debug,p2p=warn`. |
 | `--log-json` | Write logs as JSON instead of pretty console output. |

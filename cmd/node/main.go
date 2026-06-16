@@ -44,6 +44,7 @@ func main() {
 	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
 	lsPubkeyFlag := flag.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
 	adnlIDFlag := flag.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
+	versionFlag := flag.Bool("version", false, "print build version and exit")
 	skipConfigCheckFlag := flag.Bool("skip-cfg-check", false, "continue startup after creating a missing config file")
 	verbosityFlag := flag.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
 	logTypesFlag := flag.String("log-types", "", "category log verbosity overrides, comma-separated: liteserver=debug,p2p=warn")
@@ -61,6 +62,14 @@ func main() {
 	archiveCheckpointPeriodFlag := flag.Duration("archive-checkpoint-period", service2.DefaultArchiveCatchUpCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
 	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
 	flag.Parse()
+
+	if *versionFlag {
+		if _, err := fmt.Fprintln(os.Stdout, GitCommit); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write version: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	level, err := logutil.ParseLevel(*verbosityFlag)
 	if err != nil {
