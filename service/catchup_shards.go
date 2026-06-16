@@ -82,7 +82,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 						Str("target", storage.FormatBlockRef(target)).
 						Dur("retry_in", shardStateCatchUpRetryDelay).
 						Msg("retry chain block download")
-					if err = waitRetry(ctx, shardStateCatchUpRetryDelay); err != nil {
+					if err = s.waitShardStateCatchUpRetry(ctx, shardStateCatchUpRetryDelay); err != nil {
 						return
 					}
 					continue
@@ -376,9 +376,23 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 			Dur("waited", time.Since(state.started)).
 			Dur("retry_in", shardStateCatchUpRetryDelay).
 			Msg("retry indexed block download")
-		if err = waitRetry(ctx, shardStateCatchUpRetryDelay); err != nil {
+		if err = s.waitShardStateCatchUpRetry(ctx, shardStateCatchUpRetryDelay); err != nil {
 			return p2p.DownloadedBlock{}, err
 		}
+	}
+}
+
+func (s *Service) waitShardStateCatchUpRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.currentStateWake:
+		return nil
+	case <-timer.C:
+		return nil
 	}
 }
 

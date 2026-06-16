@@ -154,8 +154,12 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 			return err
 		}
 		if !next.changed {
-			if err = s.waitCurrentStatePersist(ctx); err != nil {
+			woken, err := s.waitCurrentStatePersistOrWake(ctx)
+			if err != nil {
 				return err
+			}
+			if woken {
+				continue
 			}
 			s.log.Debug().
 				Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).

@@ -440,21 +440,26 @@ func (w *stateCellWindowCache) loader() cell.LazyCellLoader {
 		return nil
 	}
 
-	sources := w.loaderSources()
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := loadStateCellEncodedCaches(sources.active, sources.pending, hash, load)
+		w.mu.RLock()
+		loaded, err := loadStateCellEncodedCaches(w.active, w.pending, hash, load)
 		if err == nil {
+			w.mu.RUnlock()
 			return loaded, nil
 		}
 		if !errors.Is(err, storage.ErrNotFound) {
+			w.mu.RUnlock()
 			return nil, err
 		}
 
-		if sources.base == nil {
+		base := w.base
+		w.mu.RUnlock()
+
+		if base == nil {
 			return nil, fmt.Errorf("state cell %x is not in state cell window cache and base loader is not set", hash[:])
 		}
-		return sources.base(hash)
+		return base(hash)
 	}
 	return load
 }
@@ -745,16 +750,6 @@ func (c *archiveStateCellRecordCache) appendRecordChunks(chunks [][]storage.Enco
 	return append(chunks, c.records), c.bytes
 }
 
-func (c *archiveStateCellRecordCache) copyRecordsTo(dst *archiveStateCellOverlay) {
-	if c == nil || dst == nil {
-		return
-	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	dst.addPreparedRecords(storage.NewStateCellRecords(c.records))
-}
-
 func (c *archiveStateCellRecordCache) len() int {
 	if c == nil {
 		return 0
@@ -827,16 +822,28 @@ func (w *archiveStateCellOverlay) rememberPrepared(root *cell.Cell, prepared sto
 	return nil
 }
 
-func (w *archiveStateCellOverlay) copyRecordsTo(dst *archiveStateCellOverlay) {
-	if w == nil || dst == nil || w == dst {
+func (w *archiveStateCellOverlay) adoptRecordsFrom(src *archiveStateCellOverlay) {
+	if w == nil || src == nil || w == src {
 		return
 	}
 
-	sources := w.loaderSources()
-	sources.active.copyRecordsTo(dst)
-	for _, cache := range sources.pending {
-		cache.copyRecordsTo(dst)
+	sources := src.loaderSources()
+	caches := make([]*archiveStateCellRecordCache, 0, 1+len(sources.pending))
+	if sources.active.len() > 0 {
+		caches = append(caches, sources.active)
 	}
+	for _, cache := range sources.pending {
+		if cache.len() > 0 {
+			caches = append(caches, cache)
+		}
+	}
+	if len(caches) == 0 {
+		return
+	}
+
+	w.mu.Lock()
+	w.pending = append(w.pending, caches...)
+	w.mu.Unlock()
 }
 
 func (w *archiveStateCellOverlay) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, error) {
@@ -903,21 +910,26 @@ func (w *archiveStateCellOverlay) loader() cell.LazyCellLoader {
 		return nil
 	}
 
-	sources := w.loaderSources()
 	var load cell.LazyCellLoader
 	load = func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := loadArchiveStateCellRecordCaches(sources.active, sources.pending, hash, load)
+		w.mu.RLock()
+		loaded, err := loadArchiveStateCellRecordCaches(w.active, w.pending, hash, load)
 		if err == nil {
+			w.mu.RUnlock()
 			return loaded, nil
 		}
 		if !errors.Is(err, storage.ErrNotFound) {
+			w.mu.RUnlock()
 			return nil, err
 		}
 
-		if sources.base == nil {
+		base := w.base
+		w.mu.RUnlock()
+
+		if base == nil {
 			return nil, fmt.Errorf("archive state cell %x is not in overlay and base loader is not set", hash[:])
 		}
-		return sources.base(hash)
+		return base(hash)
 	}
 	return load
 }

@@ -25,7 +25,7 @@ const (
 	shardStateDownloadBuffer               = 16
 	shardStateDownloadWorkers              = 4
 	nextBlockDescriptionLookahead          = shardStateDownloadBuffer
-	shardStateCatchUpRetryDelay            = time.Second
+	shardStateCatchUpRetryDelay            = 500 * time.Millisecond
 	currentStateLivePollDelay              = 300 * time.Millisecond
 	syncDiskSpaceRetryDelay                = 5 * time.Second
 	defaultMinSyncDiskFreeBytes            = 10 << 30

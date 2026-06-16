@@ -91,10 +91,17 @@ func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBytes() uint64 {
 }
 
 func (r *archiveCatchUpRunner) pendingArchiveCheckpointBytes() uint64 {
+	var total uint64
 	if r.stateCells == nil {
-		return 0
+		total = 0
+	} else {
+		total = r.stateCells.byteSize()
 	}
-	return r.stateCells.byteSize()
+	artifactBytes := r.checkpointStates.byteSize()
+	if total > ^uint64(0)-artifactBytes {
+		return ^uint64(0)
+	}
+	return total + artifactBytes
 }
 
 func (r *archiveCatchUpRunner) persistCheckpoint(reason string) (uint32, error) {

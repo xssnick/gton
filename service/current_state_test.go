@@ -610,7 +610,7 @@ func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 		lastCheckpointSeqno: master.SeqNo - 1,
 		stateCells:          overlay,
 	}
-	runner.checkpointStates.remember(&current.Masterchain)
+	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
 	if _, err := runner.startCheckpoint("test"); err != nil {
 		t.Fatalf("start checkpoint: %v", err)
 	}
@@ -656,7 +656,7 @@ func TestNextBlockCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) 
 		timing:       newCatchUpTiming(time.Now()),
 		stateCells:   stateCells,
 	}
-	runner.checkpointStates.remember(&current.Masterchain)
+	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
 	if err := runner.flushStagedCurrentSync("test"); err != nil {
 		t.Fatalf("flush staged next-block current: %v", err)
 	}
@@ -698,7 +698,7 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 		timing:       newCatchUpTiming(time.Now()),
 		stateCells:   stateCells,
 	}
-	runner.checkpointStates.remember(&current.Masterchain)
+	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
 
 	svc.currentStatePersistMu.Lock()
 	checkpoint := runner.checkpoint()
@@ -802,7 +802,7 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 	if err := runner.stateCells.addPreparedRecords(preparedCells); err != nil {
 		t.Fatalf("add prepared records: %v", err)
 	}
-	runner.checkpointStates.remember(&current.Masterchain)
+	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
 	cancelShutdown()
 	if err := runner.flushStagedCurrent(); err != nil {
 		t.Fatalf("schedule staged current flush: %v", err)
@@ -854,7 +854,7 @@ func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.
 		lastCheckpointSeqno: master.SeqNo - 1,
 		stateCells:          overlay,
 	}
-	runner.checkpointStates.remember(&current.Masterchain)
+	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store before checkpoint: %v", err)
 	}
@@ -1250,6 +1250,58 @@ func TestCurrentStateWakeInterruptsLivePollDelay(t *testing.T) {
 	}
 }
 
+func TestCurrentStateWakeInterruptsPersistWait(t *testing.T) {
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc.currentStatePersistMu.Lock()
+	defer svc.currentStatePersistMu.Unlock()
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		svc.wakeCurrentStateSync()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	started := time.Now()
+	woken, err := svc.waitCurrentStatePersistOrWake(ctx)
+	if err != nil {
+		t.Fatalf("wait current state persist or wake: %v", err)
+	}
+	if !woken {
+		t.Fatal("expected current state wake")
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("wake took %s", elapsed)
+	}
+}
+
+func TestShardStateCatchUpRetryDelayIsShort(t *testing.T) {
+	if shardStateCatchUpRetryDelay != 500*time.Millisecond {
+		t.Fatalf("shard state catch-up retry delay = %s, want 500ms", shardStateCatchUpRetryDelay)
+	}
+}
+
+func TestCurrentStateWakeInterruptsShardStateCatchUpRetry(t *testing.T) {
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		svc.wakeCurrentStateSync()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	started := time.Now()
+	if err := svc.waitShardStateCatchUpRetry(ctx, time.Hour); err != nil {
+		t.Fatalf("wait shard state catch-up retry: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("wake took %s", elapsed)
+	}
+}
+
 func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
@@ -1317,7 +1369,7 @@ func TestFlushStagedCurrentSyncPersistsAfterContextCancel(t *testing.T) {
 		timing:       newCatchUpTiming(time.Now()),
 	}
 	for _, state := range testCurrentBlockStates(current) {
-		runner.checkpointStates.remember(state)
+		rememberFullCheckpointStateForTest(t, &runner.checkpointStates, state)
 	}
 
 	if err := runner.flushStagedCurrentSync("test_shutdown"); err != nil {
@@ -1363,7 +1415,7 @@ func TestFlushStagedCurrentSyncStopsWhenShutdownContextCanceled(t *testing.T) {
 		timing:       newCatchUpTiming(time.Now()),
 	}
 	for _, state := range testCurrentBlockStates(current) {
-		runner.checkpointStates.remember(state)
+		rememberFullCheckpointStateForTest(t, &runner.checkpointStates, state)
 	}
 
 	err := runner.flushStagedCurrentSync("test_shutdown")

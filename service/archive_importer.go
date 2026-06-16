@@ -156,7 +156,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			return nil, r.returnWithProgress(err)
 		}
 		applyElapsed := time.Since(applyStarted)
-		window.stateCells.copyRecordsTo(r.stateCells)
+		r.stateCells.adoptRecordsFrom(window.stateCells)
 		window.stateCells.releaseRecordsToBase(r.stateCells.loader())
 		s.log.Debug().
 			Uint32("start_seqno", window.startSeqno).

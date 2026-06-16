@@ -810,10 +810,10 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 	}
 }
 
-func TestStateCellWindowLoaderUsesSourceSnapshot(t *testing.T) {
-	root := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
+func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
+	releasedRoot := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	cache := newStateCellEncodedCache(1)
-	if err := cache.addRecords(mustPreparedReachableStateCells(t, root), nil); err != nil {
+	if err := cache.addRecords(mustPreparedReachableStateCells(t, releasedRoot), nil); err != nil {
 		t.Fatalf("add source records: %v", err)
 	}
 
@@ -825,17 +825,30 @@ func TestStateCellWindowLoaderUsesSourceSnapshot(t *testing.T) {
 
 	loader := window.loader()
 
+	baseRoot := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
+	baseCache := newStateCellEncodedCache(1)
+	if err := baseCache.addRecords(mustPreparedReachableStateCells(t, baseRoot), nil); err != nil {
+		t.Fatalf("add base records: %v", err)
+	}
+
 	window.mu.Lock()
 	window.pending = nil
 	window.active = newStateCellEncodedCache(1)
+	window.base = func(hash cell.Hash) (*cell.Cell, error) {
+		return baseCache.loadWith(hash, nil)
+	}
 	window.mu.Unlock()
 
-	loaded, err := loader(root.HashKey())
-	if err != nil {
-		t.Fatalf("load cell from snapshot: %v", err)
+	if _, err := loader(releasedRoot.HashKey()); err == nil {
+		t.Fatal("loaded released pending cell through old loader")
 	}
-	if loaded.HashKey() != root.HashKey() {
-		t.Fatal("loaded snapshot cell hash mismatch")
+
+	loaded, err := loader(baseRoot.HashKey())
+	if err != nil {
+		t.Fatalf("load cell from live base: %v", err)
+	}
+	if loaded.HashKey() != baseRoot.HashKey() {
+		t.Fatal("loaded live base cell hash mismatch")
 	}
 }
 
@@ -847,7 +860,7 @@ func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
-	overlay.copyRecordsTo(base)
+	base.adoptRecordsFrom(overlay)
 	overlay.releaseRecordsToBase(base.loader())
 
 	if got := overlay.byteSize(); got != 0 {
@@ -860,6 +873,23 @@ func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 	}
 	if loaded.HashKey() != root.HashKey() {
 		t.Fatal("loaded archive cell hash mismatch")
+	}
+}
+
+func TestArchiveStateCellOverlayLoaderDropsReleasedRecordsWithoutBase(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
+
+	overlay := newArchiveStateCellOverlay(nil)
+	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
+
+	loader := overlay.loader()
+	overlay.releaseRecordsToBase(nil)
+
+	if got := overlay.byteSize(); got != 0 {
+		t.Fatalf("released overlay byte size = %d, want 0", got)
+	}
+	if _, err := loader(root.HashKey()); err == nil {
+		t.Fatal("loaded released archive cell through old loader")
 	}
 }
 
@@ -894,7 +924,7 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 	}
 }
 
-func TestArchiveStateCellOverlayCopiesWindowCellsOnEmission(t *testing.T) {
+func TestArchiveStateCellOverlayAdoptsWindowCellsOnEmission(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
 	windowCells := newArchiveStateCellOverlay(nil)
 	if err := windowCells.rememberPrepared(root, mustPreparedReachableStateCells(t, root), nil, 0); err != nil {
@@ -906,11 +936,30 @@ func TestArchiveStateCellOverlayCopiesWindowCellsOnEmission(t *testing.T) {
 		t.Fatalf("checkpoint overlay starts with %d bytes, want 0", got)
 	}
 
-	windowCells.copyRecordsTo(checkpointCells)
+	checkpointCells.adoptRecordsFrom(windowCells)
 	checkpoint := checkpointCells.beginCheckpoint()
 	records := checkpoint.records()
 	if !hasCellRecord(records, root.HashKey()) {
-		t.Fatal("emitted archive window cells were not copied into checkpoint overlay")
+		t.Fatal("emitted archive window cells were not adopted into checkpoint overlay")
+	}
+}
+
+func TestArchiveStateCellOverlayAdoptDoesNotDedupeRecords(t *testing.T) {
+	var hash cell.Hash
+	hash[0] = 0x54
+	records := testStateCellRecords(map[cell.Hash][]byte{
+		hash: []byte{1, 2, 3},
+	})
+
+	windowCells := newArchiveStateCellOverlay(nil)
+	windowCells.addPreparedRecords(records)
+	checkpointCells := newArchiveStateCellOverlay(nil)
+	checkpointCells.addPreparedRecords(records)
+
+	checkpointCells.adoptRecordsFrom(windowCells)
+	checkpoint := checkpointCells.beginCheckpoint()
+	if got := countCellRecords(checkpoint.records(), hash); got != 2 {
+		t.Fatalf("adopted record count = %d, want 2", got)
 	}
 }
 
@@ -1003,6 +1052,16 @@ func hasCellRecord(records []tnstore.EncodedCellRecord, hash cell.Hash) bool {
 		}
 	}
 	return false
+}
+
+func countCellRecords(records []tnstore.EncodedCellRecord, hash cell.Hash) int {
+	count := 0
+	for _, record := range records {
+		if record.Hash == hash {
+			count++
+		}
+	}
+	return count
 }
 
 func assertResolvedCellTreeEqual(tb testing.TB, got, want *cell.Cell) {

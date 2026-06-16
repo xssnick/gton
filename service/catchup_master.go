@@ -461,6 +461,32 @@ func (s *Service) waitCurrentStatePersist(ctx context.Context) error {
 	}
 }
 
+func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if s.currentStatePersistMu.TryLock() {
+			s.currentStatePersistMu.Unlock()
+			return false, s.takeCurrentStatePersistError()
+		}
+
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-s.currentStateWake:
+			if s.currentStatePersistMu.TryLock() {
+				s.currentStatePersistMu.Unlock()
+				if err := s.takeCurrentStatePersistError(); err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, string, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
 	for {

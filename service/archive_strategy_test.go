@@ -316,6 +316,42 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 	}
 }
 
+func TestArchiveCheckpointBackpressureCountsArtifactBytes(t *testing.T) {
+	first := &storage.BlockState{Block: testBlockID(0, topShard, 100)}
+	second := &storage.BlockState{Block: testBlockID(0, topShard, 101)}
+
+	runner := &archiveCatchUpRunner{
+		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024},
+		checkpointDone:         make(chan archiveCheckpointResult),
+		checkpointBlocksTarget: 2000,
+		lastCheckpointSeqno:    1000,
+		current:                &storage.CurrentState{ShardClientSeqno: 1001},
+	}
+	runner.checkpointStates.rememberWithArtifacts(first, &storage.ServedBlockFull{
+		ID:    first.Block,
+		Block: make([]byte, 4095),
+		Meta:  &storage.BlockMeta{},
+	}, nil)
+	if got := runner.pendingArchiveCheckpointBytes(); got != 4095 {
+		t.Fatalf("pending checkpoint bytes = %d, want 4095", got)
+	}
+	if runner.shouldWaitArchiveCheckpointBackpressure() {
+		t.Fatal("checkpoint backpressure should not wait below artifact byte limit")
+	}
+
+	runner.checkpointStates.rememberWithArtifacts(second, &storage.ServedBlockFull{
+		ID:    second.Block,
+		Proof: []byte{1},
+		Meta:  &storage.BlockMeta{},
+	}, nil)
+	if got := runner.pendingArchiveCheckpointBytes(); got != 4096 {
+		t.Fatalf("pending checkpoint bytes = %d, want 4096", got)
+	}
+	if !runner.shouldWaitArchiveCheckpointBackpressure() {
+		t.Fatal("checkpoint backpressure should wait at artifact byte limit")
+	}
+}
+
 func TestArchiveCheckpointPersistsAtByteTarget(t *testing.T) {
 	service := &Service{
 		archiveCatchUpCheckpointBlocks: 2000,
