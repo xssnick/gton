@@ -258,7 +258,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 
 func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T) {
 	node := newTestNode(t)
-	node.SetBroadcastSignatureVerifier(testRejectBroadcastSignatureVerifier{err: errors.New("bad signatures")})
+	node.signatureVerifier = testRejectBroadcastSignatureVerifier{err: errors.New("bad signatures")}
 	sub := &overlaySubscription{
 		node: node,
 		spec: overlaySpec{
@@ -630,7 +630,7 @@ func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProc
 	for _, delivery := range []Delivery{DeliveryFEC, DeliveryTwoStep} {
 		t.Run(string(delivery), func(t *testing.T) {
 			node := newTestNode(t)
-			node.SetBroadcastAdmission(testBroadcastAdmission(false))
+			node.broadcastAdmission = testBroadcastAdmission(false)
 			sub := &overlaySubscription{
 				node: node,
 				spec: overlaySpec{

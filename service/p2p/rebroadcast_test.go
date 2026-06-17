@@ -146,7 +146,7 @@ func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 
 func TestEnqueueRebroadcastAdmissionClosedDropsRemoteBlock(t *testing.T) {
 	node := newTestNode(t)
-	node.SetBroadcastAdmission(testBroadcastAdmission(false))
+	node.broadcastAdmission = testBroadcastAdmission(false)
 	peer := testRebroadcastQueuePeer("peer")
 	sub := &overlaySubscription{
 		node:  node,
@@ -172,7 +172,7 @@ func TestEnqueueRebroadcastAdmissionClosedDropsRemoteBlock(t *testing.T) {
 
 func TestEnqueueRebroadcastAdmissionClosedKeepsLocalExternal(t *testing.T) {
 	node := newTestNode(t)
-	node.SetBroadcastAdmission(testBroadcastAdmission(false))
+	node.broadcastAdmission = testBroadcastAdmission(false)
 	peer := testRebroadcastQueuePeer("peer")
 	sub := &overlaySubscription{
 		node:  node,
@@ -198,7 +198,7 @@ func TestEnqueueRebroadcastAdmissionClosedKeepsLocalExternal(t *testing.T) {
 
 func TestEnqueueRebroadcastAdmissionClosedDropsLocalBlockFanout(t *testing.T) {
 	node := newTestNode(t)
-	node.SetBroadcastAdmission(testBroadcastAdmission(false))
+	node.broadcastAdmission = testBroadcastAdmission(false)
 	peer := testRebroadcastQueuePeer("peer")
 	sub := &overlaySubscription{
 		node: node,
@@ -228,16 +228,16 @@ func TestEnqueueRebroadcastAdmissionClosedDropsLocalBlockFanout(t *testing.T) {
 
 type testSyncLagProvider struct {
 	lag int64
-	ok  bool
+	err error
 }
 
-func (p *testSyncLagProvider) SyncLagSeconds() (int64, bool) {
-	return p.lag, p.ok
+func (p *testSyncLagProvider) SyncLagSeconds() (int64, error) {
+	return p.lag, p.err
 }
 
 func TestRebroadcastFECBackpressureLimitsExternalSlots(t *testing.T) {
 	node := newTestNode(t)
-	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 
 	req := rebroadcastRequest{
 		kind:     "tonNode.externalMessageBroadcast",
@@ -275,7 +275,7 @@ func TestRebroadcastFECBackpressureLimitsExternalSlots(t *testing.T) {
 
 func TestRebroadcastFECBackpressureLimitsOneStreamPerPeer(t *testing.T) {
 	node := newTestNode(t)
-	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	peer := &overlayPeer{id: testPeerID("peer")}
 	req := rebroadcastRequest{
 		kind:     "tonNode.externalMessageBroadcast",
@@ -298,7 +298,7 @@ func TestRebroadcastFECBackpressureLimitsOneStreamPerPeer(t *testing.T) {
 
 func TestRebroadcastFECBackpressureUsesSeparateBlockAndExternalSlots(t *testing.T) {
 	node := newTestNode(t)
-	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	blockReq := rebroadcastRequest{
 		kind:     "tonNode.blockBroadcastCompressedV2",
 		queuedAt: time.Now(),
@@ -338,7 +338,7 @@ func TestRebroadcastFECBackpressureUsesSeparateBlockAndExternalSlots(t *testing.
 
 func TestRebroadcastFECBackpressurePassesWhenLagClears(t *testing.T) {
 	node := newTestNode(t)
-	lag := &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	lag := &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	node.syncLag = lag
 	req := rebroadcastRequest{
 		kind:     "tonNode.blockBroadcastCompressedV2",
@@ -760,7 +760,7 @@ func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
 
 func TestEnqueueLocalExternalRebroadcastReducesFanoutWhenLagged(t *testing.T) {
 	node := newTestNode(t)
-	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	peers := map[PeerID]*overlayPeer{}
 	for i := 0; i < 8; i++ {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
@@ -796,12 +796,12 @@ func TestExternalRebroadcastFanoutThreshold(t *testing.T) {
 	}
 	req := rebroadcastRequest{kind: "tonNode.externalMessageBroadcast"}
 
-	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold, ok: true}
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold}
 	if got := sub.rebroadcastFanoutForRequest(req); got != externalRebroadcastFanout {
 		t.Fatalf("fanout at threshold = %d, want %d", got, externalRebroadcastFanout)
 	}
 
-	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1, ok: true}
+	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	if got := sub.rebroadcastFanoutForRequest(req); got != laggedExternalFanout {
 		t.Fatalf("fanout above threshold = %d, want %d", got, laggedExternalFanout)
 	}

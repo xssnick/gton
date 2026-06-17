@@ -126,8 +126,7 @@ func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkp
 func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []storage.ServedProofKind) {
 	isLink := storage.ServedBlockProofIsLink(block.ID, block.IsLink)
 	meta := &storage.BlockMeta{
-		ID:    block.ID,
-		Flags: blockMetaServedFlags(isLink),
+		ID: block.ID,
 	}
 	if block.Meta != nil {
 		meta = storage.MergeBlockMeta(meta, block.Meta)
@@ -146,6 +145,9 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 		for _, kind := range proofKinds {
 			meta.Mark(storage.BlockMetaFlagForProof(kind))
 		}
+	}
+	if len(block.Block) > 0 && len(proofKinds) > 0 {
+		meta.Mark(blockMetaServedFlags(isLink))
 	}
 	return meta, proofKinds
 }

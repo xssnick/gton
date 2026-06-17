@@ -23,6 +23,16 @@ func TestValidateDownloadedProofRejectsMalformedProof(t *testing.T) {
 	}
 }
 
+func TestValidateDownloadedProofRejectsProofForMismatch(t *testing.T) {
+	block, proof, _ := testPeerMasterBlockProof(t, 173)
+	requested := block
+	requested.SeqNo++
+
+	if err := validateDownloadedProof(requested, proof, false, false); err == nil {
+		t.Fatal("proof for another block was accepted")
+	}
+}
+
 func TestValidateDownloadedProofRejectsShardFullProof(t *testing.T) {
 	root := testPeerBlockRoot(t, 0, topShard, 172)
 	rootHash := root.HashKey()

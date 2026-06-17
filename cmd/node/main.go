@@ -371,10 +371,21 @@ func main() {
 	opts.StateFilesDir = stateFilesDir
 	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
 	opts.LiveBlockCache = liveBlockCache
-	defer func() {
-		if opts.Storage != nil {
-			closeStorage(logger, opts.Storage)
+	serviceCallbacks := &serviceP2PCallbacks{}
+	opts.CompressedState = serviceCallbacks
+	opts.SyncLag = serviceCallbacks
+	opts.SignatureVerifier = serviceCallbacks
+	opts.BroadcastAdmission = serviceCallbacks
+	storageClosed := false
+	closeStore := func() {
+		if storageClosed {
+			return
 		}
+		closeStorage(logger, store)
+		storageClosed = true
+	}
+	defer func() {
+		closeStore()
 	}()
 	if err = ensureStoredZeroStateMatchesGlobalConfig(ctx, store, globalConfigZeroState); err != nil {
 		logger.Error().
@@ -399,7 +410,7 @@ func main() {
 	stateLogger := logs.CategoryPtr("state")
 	stateSource := service2.NewP2PStateSource(node, stateLogger)
 
-	stateSync := state.NewSyncer(stateSource, opts.Storage, state.SyncerOptions{
+	stateSync := state.NewSyncer(stateSource, store, state.SyncerOptions{
 		FromZero:   *fromZeroFlag,
 		SyncBefore: syncBefore,
 	}, stateLogger)
@@ -407,7 +418,7 @@ func main() {
 	var liveLiteStore *liteserver.LiveStore
 	var currentStatePublisher service2.CurrentStatePublisher
 	if liteOpts.Enabled {
-		liveLiteStore = liteserver.NewLiveStore(opts.Storage, liteserver.LiveStoreOptions{
+		liveLiteStore = liteserver.NewLiveStore(store, liteserver.LiveStoreOptions{
 			MasterBlockCache: liteOpts.MasterBlockCache,
 			ShardBlockCache:  liteOpts.ShardBlockCache,
 			NonFinalEnabled:  liteOpts.NonFinalEnabled,
@@ -417,7 +428,7 @@ func main() {
 	}
 
 	serviceLogger := logs.Component("service")
-	svc := service2.New(serviceLogger, node, blockSync, opts.Storage, stateSync, service2.Options{
+	svc := service2.New(serviceLogger, node, blockSync, store, stateSync, service2.Options{
 		ArchiveCatchUpCheckpointBlocks:          archiveCheckpointBlocks,
 		ArchiveCatchUpCheckpointPeriod:          *archiveCheckpointPeriodFlag,
 		ArchiveCatchUpPrefetchWindows:           *archivePrefetchWindowsFlag,
@@ -436,10 +447,7 @@ func main() {
 		DisableStateSerialization:               cfg.DisableStateSerialization,
 		SyncObserver:                            syncObserver,
 	})
-	node.SetCompressedBlockStateProvider(svc)
-	node.SetSyncLagProvider(svc)
-	node.SetBroadcastSignatureVerifier(svc)
-	node.SetBroadcastAdmission(svc)
+	serviceCallbacks.set(svc)
 	if runtimeMetrics != nil {
 		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
 			ServiceStatusReader: svc.StatusSnapshot,
@@ -502,13 +510,7 @@ func main() {
 		blockSync.Run(ctx)
 	}()
 
-	if err = svc.Start(ctx); err != nil {
-		logger.Error().Err(err).Msg("failed to start service")
-		stop()
-		blockSyncWG.Wait()
-		node.Wait()
-		os.Exit(1)
-	}
+	svc.Start(ctx)
 
 	if liteSrv != nil {
 		if err = liteSrv.Start(ctx); err != nil {
@@ -575,7 +577,6 @@ func main() {
 	if liteSrv != nil {
 		liteSrv.Wait()
 	}
-	closeStorage(logger, opts.Storage)
-	opts.Storage = nil
+	closeStore()
 	logger.Info().Msg("shutdown complete")
 }

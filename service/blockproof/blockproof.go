@@ -11,7 +11,6 @@ import (
 
 	tnstore "github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -378,10 +377,18 @@ func CheckPreparedMasterchainSignaturesWithValidators(blockID ton.BlockIDExt, si
 	if sigSet != nil && !sigSet.final {
 		return fmt.Errorf("masterchain block %s has non-final validator signatures", tnstore.FormatBlockRef(blockID))
 	}
-	return CheckPreparedSignaturesWithValidators(blockID, sigSet, validators)
+	if sigSet == nil {
+		return CheckPreparedSignatures(blockID, sigSet, nil)
+	}
+
+	prepared, err := PrepareValidatorSet(sigSet.catchainSeqno, validators)
+	if err != nil {
+		return fmt.Errorf("prepare validator set for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	}
+	return CheckPreparedSignatures(blockID, sigSet, prepared)
 }
 
-func CheckPreparedSignaturesWithValidators(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators []*tlb.ValidatorAddr) error {
+func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) error {
 	if sigSet == nil {
 		return fmt.Errorf("block %s has no prepared validator signatures", tnstore.FormatBlockRef(blockID))
 	}
@@ -390,7 +397,7 @@ func CheckPreparedSignaturesWithValidators(blockID ton.BlockIDExt, sigSet *Valid
 	if err != nil {
 		return fmt.Errorf("build validator signature payload for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
-	if err = checkSignaturesPayload(payload, sigSet.catchainSeqno, sigSet.validatorSetHash, cloneSignatures(sigSet.signatures), validators); err != nil {
+	if err = checkSignaturesPayload(payload, sigSet, cloneSignatures(sigSet.signatures), validators); err != nil {
 		return fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
 	return nil
@@ -591,56 +598,53 @@ func parseSimplexCandidateBlock(candidate []byte) (*ton.BlockIDExt, error) {
 	return nil, fmt.Errorf("unsupported candidate type: ordinary parse failed: %v; empty parse failed: %v", ordinaryErr, emptyErr)
 }
 
-func checkSignaturesPayload(toSign []byte, chainSeqno, setHash uint32, sigs []ton.Signature, validators []*tlb.ValidatorAddr) error {
-	if len(sigs) == 0 || len(validators) == 0 {
+func checkSignaturesPayload(toSign []byte, sigSet *ValidatorSignatureSet, sigs []ton.Signature, validators *PreparedValidatorSet) error {
+	if len(sigs) == 0 || validators == nil || len(validators.validators) == 0 {
 		return fmt.Errorf("zero signatures or validators")
 	}
-
-	calcedSetHash, err := ValidatorSetHash(chainSeqno, validators)
-	if err != nil {
-		return fmt.Errorf("calc validator set hash: %w", err)
+	if sigSet.catchainSeqno != validators.catchainSeqno {
+		return fmt.Errorf("incorrect validator catchain seqno")
 	}
-	if setHash != calcedSetHash {
+	if sigSet.validatorSetHash != validators.setHash {
 		return fmt.Errorf("incorrect validator set hash")
 	}
 
-	var totalWeight, signedWeight uint64
-	validatorsMap := map[string]*tlb.ValidatorAddr{}
-	for _, v := range validators {
-		kid, err := tl.Hash(keys.PublicKeyED25519{Key: v.PublicKey.Key})
-		if err != nil {
-			return fmt.Errorf("calc validator key id: %w", err)
-		}
-
-		totalWeight += v.Weight
-		validatorsMap[string(kid)] = v
-	}
-
 	sort.Slice(sigs, func(i, j int) bool {
-		return string(sigs[i].NodeIDShort) < string(sigs[j].NodeIDShort)
+		return bytes.Compare(sigs[i].NodeIDShort, sigs[j].NodeIDShort) < 0
 	})
 
-	for i, sig := range sigs {
-		if i > 0 && string(sigs[i-1].NodeIDShort) == string(sig.NodeIDShort) {
+	var signedWeight uint64
+	var prevNodeID [32]byte
+	hasPrevNodeID := false
+	for _, sig := range sigs {
+		var nodeID [32]byte
+		if len(sig.NodeIDShort) != len(nodeID) {
+			return fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
+		}
+		copy(nodeID[:], sig.NodeIDShort)
+
+		if hasPrevNodeID && prevNodeID == nodeID {
 			return fmt.Errorf("duplicated node signature")
 		}
+		prevNodeID = nodeID
+		hasPrevNodeID = true
 
-		v, ok := validatorsMap[string(sig.NodeIDShort)]
+		v, ok := validators.validators[nodeID]
 		if !ok {
 			return fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
 		}
-		if !ed25519.Verify(v.PublicKey.Key, toSign, sig.Signature) {
+		if !ed25519.Verify(v.publicKey, toSign, sig.Signature) {
 			return fmt.Errorf("incorrect signature of validator %s", hex.EncodeToString(sig.NodeIDShort))
 		}
 
-		signedWeight += v.Weight
-		if signedWeight > totalWeight {
+		signedWeight += v.weight
+		if signedWeight > validators.totalWeight {
 			break
 		}
 	}
 
-	if 3*signedWeight <= 2*totalWeight {
-		return fmt.Errorf("insufficient signed weight (%d/%d)", 3*signedWeight, 2*totalWeight)
+	if 3*signedWeight <= 2*validators.totalWeight {
+		return fmt.Errorf("insufficient signed weight (%d/%d)", 3*signedWeight, 2*validators.totalWeight)
 	}
 	return nil
 }

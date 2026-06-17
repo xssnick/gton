@@ -42,8 +42,11 @@ func persistentStateSplitDepths(master *storage.BlockState, workchains []int32) 
 		return depths, nil
 	}
 
-	if master == nil || master.Parsed == nil || master.Parsed.McStateExtra == nil {
-		return depths, nil
+	if master == nil {
+		return nil, fmt.Errorf("masterchain state is missing for persistent state split depth: %w", storage.ErrNotFound)
+	}
+	if master.Parsed == nil || master.Parsed.McStateExtra == nil {
+		return nil, fmt.Errorf("masterchain state %s is missing parsed config for persistent state split depth: %w", storage.FormatBlockRef(master.Block), storage.ErrNotFound)
 	}
 
 	loader, err := master.Parsed.McStateExtra.BeginParse()
@@ -56,27 +59,26 @@ func persistentStateSplitDepths(master *storage.BlockState, workchains []int32) 
 		return nil, fmt.Errorf("parse masterchain extra: %w", err)
 	}
 	if extra.ConfigParams.Config.Params == nil {
-		return depths, nil
+		return nil, fmt.Errorf("masterchain state %s has no config params for persistent state split depth: %w", storage.FormatBlockRef(master.Block), storage.ErrNotFound)
 	}
 
 	config := tlb.BlockchainConfig{Root: extra.ConfigParams.Config.Params.AsCell()}
 	workchainConfig, err := config.GetWorkchains()
 	if err != nil {
 		if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
-			return depths, nil
+			return nil, fmt.Errorf("masterchain state %s has no workchains config for persistent state split depth: %w", storage.FormatBlockRef(master.Block), storage.ErrNotFound)
 		}
 		return nil, err
 	}
 	if workchainConfig.Workchains == nil {
-		return depths, nil
+		return nil, fmt.Errorf("masterchain state %s has empty workchains config for persistent state split depth: %w", storage.FormatBlockRef(master.Block), storage.ErrNotFound)
 	}
 
 	for workchain := range needed {
 		value, err := workchainConfig.Workchains.LoadValueByIntKey(big.NewInt(int64(workchain)))
 		if err != nil {
 			if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-				depths[workchain] = 0
-				continue
+				return nil, fmt.Errorf("workchain %d config is missing in masterchain state %s for persistent state split depth: %w", workchain, storage.FormatBlockRef(master.Block), storage.ErrNotFound)
 			}
 			return nil, err
 		}

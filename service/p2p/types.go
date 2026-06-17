@@ -226,7 +226,7 @@ type BlockCacheObserver interface {
 }
 
 type SyncLagProvider interface {
-	SyncLagSeconds() (int64, bool)
+	SyncLagSeconds() (int64, error)
 }
 
 type CustomOverlayConfig struct {

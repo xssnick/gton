@@ -38,7 +38,7 @@ type broadcastValidatorCache struct {
 	configLoaded   bool
 	configRootHash cell.Hash
 	initialized    bool
-	entries        map[broadcastValidatorCacheKey][]*tlb.ValidatorAddr
+	entries        map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet
 }
 
 func (c *broadcastValidatorCache) getConfig(block ton.BlockIDExt) (broadcastValidatorConfig, bool) {
@@ -86,31 +86,31 @@ func (c *broadcastValidatorCache) reset() {
 	c.entries = nil
 }
 
-func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) ([]*tlb.ValidatorAddr, bool) {
+func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) (*blockproof.PreparedValidatorSet, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.initialized || c.configRootHash != key.configRootHash {
 		return nil, false
 	}
-	validators, ok := c.entries[key]
-	return validators, ok
+	set, ok := c.entries[key]
+	return set, ok
 }
 
-func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, validators []*tlb.ValidatorAddr) []*tlb.ValidatorAddr {
+func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *blockproof.PreparedValidatorSet) *blockproof.PreparedValidatorSet {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.initialized || c.configRootHash != key.configRootHash {
 		c.configRootHash = key.configRootHash
 		c.initialized = true
-		c.entries = make(map[broadcastValidatorCacheKey][]*tlb.ValidatorAddr)
+		c.entries = make(map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet)
 	}
 	if cached, ok := c.entries[key]; ok {
 		return cached
 	}
-	c.entries[key] = validators
-	return validators
+	c.entries[key] = set
+	return set
 }
 
 func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.BlockBroadcastSignatureCheck) error {
@@ -124,11 +124,11 @@ func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.Blo
 		return err
 	}
 
-	validators, err := s.broadcastValidatorsForSignatures(ctx, req.Block, signatures.CatchainSeqno(), signatures.ValidatorSetHash())
+	validators, err := s.broadcastValidatorSetForSignatures(ctx, req.Block, signatures.CatchainSeqno(), signatures.ValidatorSetHash())
 	if err != nil {
 		return err
 	}
-	return blockproof.CheckPreparedSignaturesWithValidators(req.Block, signatures, validators)
+	return blockproof.CheckPreparedSignatures(req.Block, signatures, validators)
 }
 
 func (s *Service) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p.ShardDescriptionSignatureCheck) (*p2p.ShardBlockDescription, error) {
@@ -137,11 +137,11 @@ func (s *Service) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p
 		return nil, err
 	}
 
-	validators, err := s.broadcastValidatorsForSignatures(ctx, desc.Block, desc.CatchainSeqno, desc.ValidatorSetHash)
+	validators, err := s.broadcastValidatorSetForSignatures(ctx, desc.Block, desc.CatchainSeqno, desc.ValidatorSetHash)
 	if err != nil {
 		return nil, err
 	}
-	if err = blockproof.CheckPreparedSignaturesWithValidators(desc.Block, desc.Signatures, validators); err != nil {
+	if err = blockproof.CheckPreparedSignatures(desc.Block, desc.Signatures, validators); err != nil {
 		return nil, err
 	}
 	out, err := newP2PShardBlockDescription(desc)
@@ -184,22 +184,22 @@ func newP2PShardBlockDescription(desc *shardTopBlockDescription) (*p2p.ShardBloc
 	return out, nil
 }
 
-func (s *Service) broadcastValidatorsForSignatures(ctx context.Context, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) ([]*tlb.ValidatorAddr, error) {
+func (s *Service) broadcastValidatorSetForSignatures(ctx context.Context, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) (*blockproof.PreparedValidatorSet, error) {
 	config, err := s.currentBroadcastValidatorConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	key := broadcastValidatorCacheKeyFromBlock(config.rootHash, block, catchainSeqno, validatorSetHash)
-	if validators, ok := s.broadcastValidatorCache.get(key); ok {
-		return validators, nil
+	if set, ok := s.broadcastValidatorCache.get(key); ok {
+		return set, nil
 	}
 
-	validators, err := broadcastValidatorsFromConfig(config.cfg, block, catchainSeqno, validatorSetHash)
+	set, err := broadcastValidatorSetFromConfig(config.cfg, block, catchainSeqno, validatorSetHash)
 	if err != nil {
 		return nil, err
 	}
-	return s.broadcastValidatorCache.put(key, validators), nil
+	return s.broadcastValidatorCache.put(key, set), nil
 }
 
 func broadcastValidatorCacheKeyFromBlock(configRootHash cell.Hash, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) broadcastValidatorCacheKey {
@@ -212,7 +212,7 @@ func broadcastValidatorCacheKeyFromBlock(configRootHash cell.Hash, block ton.Blo
 	}
 }
 
-func broadcastValidatorsFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) ([]*tlb.ValidatorAddr, error) {
+func broadcastValidatorSetFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) (*blockproof.PreparedValidatorSet, error) {
 	// Key-block boundaries can leave valid broadcasts signed by a known previous,
 	// current, or next validator set; the hash is checked before any set is used.
 	candidates := []struct {
@@ -247,15 +247,15 @@ func broadcastValidatorsFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockIDE
 			continue
 		}
 
-		hash, err := blockproof.ValidatorSetHash(catchainSeqno, validators)
+		set, err := blockproof.PrepareValidatorSet(catchainSeqno, validators)
 		if err != nil {
-			lastErr = fmt.Errorf("%s validators hash: %w", candidate.name, err)
+			lastErr = fmt.Errorf("%s validators prepare: %w", candidate.name, err)
 			continue
 		}
-		if hash == validatorSetHash {
-			return validators, nil
+		if set.Hash() == validatorSetHash {
+			return set, nil
 		}
-		lastErr = fmt.Errorf("%s validators hash %08x does not match %08x", candidate.name, hash, validatorSetHash)
+		lastErr = fmt.Errorf("%s validators hash %08x does not match %08x", candidate.name, set.Hash(), validatorSetHash)
 	}
 
 	return nil, fmt.Errorf("validator set %08x for %s is not available: %w: %v", validatorSetHash, storage.FormatBlockRef(block), storage.ErrNotFound, lastErr)

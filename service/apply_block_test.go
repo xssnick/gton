@@ -105,6 +105,43 @@ func TestApplyBlockFromFixture(t *testing.T) {
 	}
 }
 
+func TestPrepareBlockDataRejectsBlockIDHashMismatches(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+
+	tests := []struct {
+		name   string
+		mutate func(*ton.BlockIDExt)
+	}{
+		{
+			name: "root hash mismatch",
+			mutate: func(id *ton.BlockIDExt) {
+				id.RootHash = append([]byte(nil), id.RootHash...)
+				id.RootHash[0] ^= 0x01
+			},
+		},
+		{
+			name: "file hash mismatch",
+			mutate: func(id *ton.BlockIDExt) {
+				id.FileHash = append([]byte(nil), id.FileHash...)
+				id.FileHash[0] ^= 0x01
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := downloaded.ID
+			id.RootHash = append([]byte(nil), id.RootHash...)
+			id.FileHash = append([]byte(nil), id.FileHash...)
+			tt.mutate(&id)
+
+			if _, err := prepareBlockData("fixture block", id, downloaded.BlockBOC); err == nil {
+				t.Fatal("block data with mismatched BlockID hash was accepted")
+			}
+		})
+	}
+}
+
 func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
 	prepared, err := prepareDownloadedBlockForApply(*downloaded)

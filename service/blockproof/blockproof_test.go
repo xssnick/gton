@@ -46,6 +46,40 @@ func TestCheckProofShapeMatchesCXXProofAndProofLinkRules(t *testing.T) {
 	}
 }
 
+func TestCheckProofShapeRejectsProofForMismatch(t *testing.T) {
+	signatures := testSignatureSet(0x12345678, 33, 100)
+
+	tests := []struct {
+		name   string
+		proof  ton.BlockIDExt
+		expect ton.BlockIDExt
+		isLink bool
+		sig    *cell.Cell
+	}{
+		{
+			name:   "master proof",
+			proof:  testBlockID(-1, 20),
+			expect: testBlockID(-1, 21),
+			sig:    signatures,
+		},
+		{
+			name:   "shard proof link",
+			proof:  testBlockID(0, 20),
+			expect: testBlockID(0, 21),
+			isLink: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := testBlockProof(t, tt.proof, tt.sig)
+			if err := CheckProofShape(tt.expect, root, tt.isLink); err == nil {
+				t.Fatal("proof with mismatched ProofFor was accepted")
+			}
+		})
+	}
+}
+
 func TestCheckPreparedSignaturesAcceptsOrdinaryAndSimplexVotes(t *testing.T) {
 	block := testBlockID(0, 77)
 	validators, privateKeys := testValidators(t, 4)
@@ -53,6 +87,13 @@ func TestCheckPreparedSignaturesAcceptsOrdinaryAndSimplexVotes(t *testing.T) {
 	setHash, err := ValidatorSetHash(catchainSeqno, validators)
 	if err != nil {
 		t.Fatalf("validator set hash: %v", err)
+	}
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+	if prepared.Hash() != setHash || prepared.CatchainSeqno() != catchainSeqno {
+		t.Fatalf("prepared validator set mismatch")
 	}
 
 	candidate := testSimplexCandidate(t, block)
@@ -92,10 +133,175 @@ func TestCheckPreparedSignaturesAcceptsOrdinaryAndSimplexVotes(t *testing.T) {
 				signed = NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, signatures)
 			}
 
-			if err = CheckPreparedSignaturesWithValidators(block, signed, validators); err != nil {
+			if err = CheckPreparedSignatures(block, signed, prepared); err != nil {
 				t.Fatalf("check signatures: %v", err)
 			}
 		})
+	}
+}
+
+func TestCheckPreparedSignaturesRejectsValidatorSetMutations(t *testing.T) {
+	block := testBlockID(-1, 79)
+	validators, privateKeys := testValidators(t, 4)
+	catchainSeqno := uint32(9)
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("validator set hash: %v", err)
+	}
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	payload, err := signaturePayload(block, NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, nil))
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	validSignatures := testSignatures(t, validators[:3], privateKeys[:3], payload)
+
+	unknownPub, unknownPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate unknown validator key: %v", err)
+	}
+	unknownID, err := tl.Hash(keys.PublicKeyED25519{Key: unknownPub})
+	if err != nil {
+		t.Fatalf("hash unknown validator key: %v", err)
+	}
+	unknownSignature := ton.Signature{
+		NodeIDShort: unknownID,
+		Signature:   ed25519.Sign(unknownPriv, payload),
+	}
+
+	badSignature := append([]ton.Signature(nil), validSignatures...)
+	badSignature[0].Signature = append([]byte(nil), badSignature[0].Signature...)
+	badSignature[0].Signature[0] ^= 0x01
+
+	tests := []struct {
+		name    string
+		sigs    []ton.Signature
+		setHash uint32
+	}{
+		{
+			name:    "duplicate validator signature",
+			sigs:    []ton.Signature{validSignatures[0], validSignatures[1], validSignatures[0]},
+			setHash: setHash,
+		},
+		{
+			name:    "unknown validator signature",
+			sigs:    []ton.Signature{validSignatures[0], validSignatures[1], unknownSignature},
+			setHash: setHash,
+		},
+		{
+			name:    "insufficient signed weight",
+			sigs:    validSignatures[:2],
+			setHash: setHash,
+		},
+		{
+			name:    "incorrect validator signature",
+			sigs:    badSignature,
+			setHash: setHash,
+		},
+		{
+			name:    "incorrect validator set hash",
+			sigs:    validSignatures,
+			setHash: setHash + 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := NewOrdinaryValidatorSignatureSet(catchainSeqno, tt.setHash, tt.sigs)
+			if err := CheckPreparedSignatures(block, set, prepared); err == nil {
+				t.Fatal("mutated validator signature set was accepted")
+			}
+		})
+	}
+}
+
+func TestPreparedValidatorSetCopiesValidatorKeys(t *testing.T) {
+	block := testBlockID(-1, 82)
+	validators, privateKeys := testValidators(t, 4)
+	catchainSeqno := uint32(9)
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("validator set hash: %v", err)
+	}
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	sigSet := NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, nil)
+	payload, err := signaturePayload(block, sigSet)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	signatures := testSignatures(t, validators[:3], privateKeys[:3], payload)
+	signed := NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, signatures)
+
+	validators[0].PublicKey.Key[0] ^= 0x01
+
+	if err := CheckPreparedSignatures(block, signed, prepared); err != nil {
+		t.Fatalf("prepared validator set should not share validator keys: %v", err)
+	}
+}
+
+func TestPrepareValidatorSignatureSetRejectsHeaderMismatches(t *testing.T) {
+	blockID := testBlockID(-1, 80)
+	validators, _ := testValidators(t, 4)
+	catchainSeqno := uint32(9)
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("validator set hash: %v", err)
+	}
+
+	block := &tlb.Block{}
+	block.BlockInfo.GenValidatorListHashShort = setHash
+	block.BlockInfo.GenCatchainSeqno = catchainSeqno
+
+	tests := []struct {
+		name string
+		set  *ValidatorSignatureSet
+	}{
+		{
+			name: "validator set hash mismatch",
+			set:  NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash+1, nil),
+		},
+		{
+			name: "catchain seqno mismatch",
+			set:  NewOrdinaryValidatorSignatureSet(catchainSeqno+1, setHash, nil),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := PrepareValidatorSignatureSet(blockID, block, tt.set); err == nil {
+				t.Fatal("signature set with header mismatch was accepted")
+			}
+		})
+	}
+}
+
+func TestCheckPreparedSignaturesRejectsSimplexCandidateBlockMismatch(t *testing.T) {
+	block := testBlockID(0, 81)
+	otherBlock := testBlockID(0, 82)
+	validators, _ := testValidators(t, 4)
+	catchainSeqno := uint32(9)
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("validator set hash: %v", err)
+	}
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	sessionID := make([]byte, 32)
+	sessionID[0] = 0x99
+	set := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, nil, true, sessionID, 11, testSimplexCandidate(t, otherBlock))
+
+	if err := CheckPreparedSignatures(block, set, prepared); err == nil {
+		t.Fatal("simplex candidate for another block was accepted")
 	}
 }
 

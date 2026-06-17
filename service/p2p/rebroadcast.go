@@ -668,8 +668,8 @@ func (n *Node) rebroadcastLagged() bool {
 		return false
 	}
 
-	lagSeconds, ok := n.syncLag.SyncLagSeconds()
-	return ok && lagSeconds > rebroadcastFECLagThreshold
+	lagSeconds, err := n.syncLag.SyncLagSeconds()
+	return err == nil && lagSeconds > rebroadcastFECLagThreshold
 }
 
 func rebroadcastFECBackpressureClass(kind string) rebroadcastFECLimiterClass {

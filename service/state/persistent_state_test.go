@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
@@ -71,7 +72,6 @@ func TestPersistentStateSplitDepthsReusesMasterConfig(t *testing.T) {
 		{Workchain: 0},
 		{Workchain: 0},
 		{Workchain: 1},
-		{Workchain: 2},
 		{Workchain: -1},
 	}
 
@@ -84,7 +84,6 @@ func TestPersistentStateSplitDepthsReusesMasterConfig(t *testing.T) {
 		-1: 0,
 		0:  7,
 		1:  11,
-		2:  0,
 	} {
 		if got := depths[workchain]; got != want {
 			t.Fatalf("workchain %d depth = %d, want %d", workchain, got, want)
@@ -97,6 +96,43 @@ func TestPersistentStateSplitDepthsReusesMasterConfig(t *testing.T) {
 	}
 	if depth != 11 {
 		t.Fatalf("single workchain depth = %d, want 11", depth)
+	}
+}
+
+func TestPersistentStateSplitDepthsMasterchainOnlyDoesNotNeedConfig(t *testing.T) {
+	depths, err := PersistentStateSplitDepths(nil, []ton.BlockIDExt{{Workchain: -1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := depths[-1]; got != 0 {
+		t.Fatalf("masterchain depth = %d, want 0", got)
+	}
+}
+
+func TestPersistentStateSplitDepthsReturnsNotFoundForMissingConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		master *storage.BlockState
+	}{
+		{
+			name: "missing master state",
+		},
+		{
+			name:   "missing parsed config",
+			master: &storage.BlockState{},
+		},
+		{
+			name:   "missing workchain descriptor",
+			master: masterStateWithPersistentSplitDepths(t, map[int32]uint64{}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := PersistentStateSplitDepth(tt.master, 0); !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("split depth error = %v, want ErrNotFound", err)
+			}
+		})
 	}
 }
 

@@ -261,9 +261,9 @@ func TestSyncLagSecondsUsesMaxCurrentStateLag(t *testing.T) {
 		},
 	}
 
-	lag, ok := svc.SyncLagSeconds()
-	if !ok {
-		t.Fatal("expected sync lag")
+	lag, err := svc.SyncLagSeconds()
+	if err != nil {
+		t.Fatalf("sync lag: %v", err)
 	}
 	if lag < 8 || lag > 10 {
 		t.Fatalf("sync lag = %d, want about 9", lag)

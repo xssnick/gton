@@ -113,6 +113,7 @@ func TestSaveArchiveImportKeepsSameBatchMetaAndNextLink(t *testing.T) {
 		FullBlocks: []*storage.ServedBlockFull{{
 			ID:    prev,
 			Block: []byte{0x01},
+			Proof: []byte{0x02},
 			Meta: &storage.BlockMeta{
 				ID:       prev,
 				GenUTime: 123,
@@ -134,6 +135,39 @@ func TestSaveArchiveImportKeepsSameBatchMetaAndNextLink(t *testing.T) {
 	}
 	if len(meta.NextRefs) != 1 || !meta.NextRefs[0].Equals(&next) {
 		t.Fatalf("prev next refs = %+v, want %s", meta.NextRefs, storage.FormatBlockRef(next))
+	}
+}
+
+func TestSaveArchiveImportDoesNotMarkPartialBlockAsServedFull(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
+	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    block,
+			Block: []byte{0x01},
+			Meta:  &storage.BlockMeta{ID: block, GenUTime: 123},
+		}},
+	}); err != nil {
+		t.Fatalf("save partial archive import: %v", err)
+	}
+
+	meta, err := store.BlockMeta(context.Background(), block)
+	if err != nil {
+		t.Fatalf("load block meta: %v", err)
+	}
+	if meta.Has(storage.BlockMetaHasServedFull) {
+		t.Fatalf("partial block was marked served full: flags=%v", meta.Flags)
+	}
+	if !meta.Has(storage.BlockMetaHasBlockData) {
+		t.Fatalf("partial block data flag is missing: flags=%v", meta.Flags)
+	}
+	if _, err = store.BlockFull(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("partial block full error = %v, want ErrNotFound", err)
 	}
 }
 

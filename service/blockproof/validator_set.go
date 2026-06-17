@@ -2,6 +2,7 @@ package blockproof
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -9,6 +10,7 @@ import (
 
 	tnstore "github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -33,6 +35,68 @@ type validatorWeightHole struct {
 }
 
 var crc32CastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
+type PreparedValidatorSet struct {
+	catchainSeqno uint32
+	setHash       uint32
+	totalWeight   uint64
+	validators    map[[32]byte]preparedValidator
+}
+
+type preparedValidator struct {
+	publicKey ed25519.PublicKey
+	weight    uint64
+}
+
+func PrepareValidatorSet(catchainSeqno uint32, validators []*tlb.ValidatorAddr) (*PreparedValidatorSet, error) {
+	if len(validators) == 0 {
+		return nil, fmt.Errorf("zero validators")
+	}
+
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		return nil, fmt.Errorf("calc validator set hash: %w", err)
+	}
+
+	prepared := &PreparedValidatorSet{
+		catchainSeqno: catchainSeqno,
+		setHash:       setHash,
+		validators:    make(map[[32]byte]preparedValidator, len(validators)),
+	}
+	for _, validator := range validators {
+		nodeID, err := tl.Hash(keys.PublicKeyED25519{Key: validator.PublicKey.Key})
+		if err != nil {
+			return nil, fmt.Errorf("calc validator key id: %w", err)
+		}
+		if len(nodeID) != 32 {
+			return nil, fmt.Errorf("invalid validator key id len %d", len(nodeID))
+		}
+
+		var nodeIDShort [32]byte
+		copy(nodeIDShort[:], nodeID)
+
+		prepared.totalWeight += validator.Weight
+		prepared.validators[nodeIDShort] = preparedValidator{
+			publicKey: ed25519.PublicKey(bytes.Clone(validator.PublicKey.Key)),
+			weight:    validator.Weight,
+		}
+	}
+	return prepared, nil
+}
+
+func (s *PreparedValidatorSet) CatchainSeqno() uint32 {
+	if s == nil {
+		return 0
+	}
+	return s.catchainSeqno
+}
+
+func (s *PreparedValidatorSet) Hash() uint32 {
+	if s == nil {
+		return 0
+	}
+	return s.setHash
+}
 
 func CurrentValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {
 	validatorsCfg, err := cfg.GetCurrentTempValidators()

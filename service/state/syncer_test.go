@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"math/big"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -516,6 +517,29 @@ func testMcStateExtra(t *testing.T, shards ...ton.BlockIDExt) *cell.Cell {
 	configParams := cell.NewDict(32)
 	if err := configParams.Set(cell.BeginCell().MustStoreUInt(0, 32).EndCell(), cell.BeginCell().EndCell()); err != nil {
 		t.Fatalf("store dummy config param: %v", err)
+	}
+	workchains := cell.NewDict(32)
+	workchainSeen := map[int32]struct{}{}
+	for _, shard := range shards {
+		if shard.Workchain == -1 {
+			continue
+		}
+		if _, ok := workchainSeen[shard.Workchain]; ok {
+			continue
+		}
+		workchainSeen[shard.Workchain] = struct{}{}
+		if err := workchains.SetIntKey(big.NewInt(int64(shard.Workchain)), workchainDescriptorCell(0xa6, true, 0)); err != nil {
+			t.Fatalf("store workchain descriptor %d: %v", shard.Workchain, err)
+		}
+	}
+	if len(workchainSeen) > 0 {
+		workchainsCell, err := tlb.ToCell(&tlb.WorkchainsConfig{Workchains: workchains})
+		if err != nil {
+			t.Fatalf("build workchains config: %v", err)
+		}
+		if err := configParams.SetIntKey(big.NewInt(int64(tlb.ConfigParamWorkchains)), cell.BeginCell().MustStoreRef(workchainsCell).EndCell()); err != nil {
+			t.Fatalf("store workchains config param: %v", err)
+		}
 	}
 
 	return cell.BeginCell().

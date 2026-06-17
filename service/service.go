@@ -577,7 +577,7 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 	return target * windowCount
 }
 
-func (s *Service) Start(ctx context.Context) error {
+func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
@@ -592,7 +592,6 @@ func (s *Service) Start(ctx context.Context) error {
 			s.runDelayedServiceMaintenance(ctx)
 		})
 	})
-	return nil
 }
 
 func (s *Service) runAsync(fn func()) {
@@ -663,9 +662,9 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 	return snapshot
 }
 
-func (s *Service) SyncLagSeconds() (int64, bool) {
+func (s *Service) SyncLagSeconds() (int64, error) {
 	if s == nil {
-		return 0, false
+		return 0, fmt.Errorf("service is missing for sync lag: %w", storage.ErrNotFound)
 	}
 
 	nowUnix := time.Now().Unix()
@@ -677,7 +676,7 @@ func (s *Service) SyncLagSeconds() (int64, bool) {
 
 	current := s.currentStatus
 	if current == nil {
-		return 0, false
+		return 0, fmt.Errorf("current state is missing for sync lag: %w", storage.ErrNotFound)
 	}
 	if current.Masterchain.Parsed != nil && current.Masterchain.Parsed.GenUTime != 0 {
 		maxLag = nowUnix - int64(current.Masterchain.Parsed.GenUTime)
@@ -694,7 +693,10 @@ func (s *Service) SyncLagSeconds() (int64, bool) {
 			hasLag = true
 		}
 	}
-	return maxLag, hasLag
+	if !hasLag {
+		return 0, fmt.Errorf("current state has no block utime for sync lag: %w", storage.ErrNotFound)
+	}
+	return maxLag, nil
 }
 
 func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *StatusSnapshot, current *storage.CurrentState) {

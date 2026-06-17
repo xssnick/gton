@@ -3,7 +3,8 @@ package service
 import (
 	"testing"
 
-	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/gton/service/blockproof"
+
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -17,10 +18,10 @@ func TestBroadcastValidatorCacheResetsByConfigRoot(t *testing.T) {
 		catchainSeqno:    7,
 		validatorSetHash: 11,
 	}
-	firstValidators := []*tlb.ValidatorAddr{nil}
-	cache.put(firstKey, firstValidators)
+	firstSet := &blockproof.PreparedValidatorSet{}
+	cache.put(firstKey, firstSet)
 
-	if validators, ok := cache.get(firstKey); !ok || len(validators) != len(firstValidators) {
+	if set, ok := cache.get(firstKey); !ok || set != firstSet {
 		t.Fatal("expected broadcast validator cache hit before config root reset")
 	}
 
@@ -28,13 +29,13 @@ func TestBroadcastValidatorCacheResetsByConfigRoot(t *testing.T) {
 	secondKey.configRootHash = testBroadcastConfigHash(2)
 	secondKey.catchainSeqno = 8
 	secondKey.validatorSetHash = 22
-	secondValidators := []*tlb.ValidatorAddr{nil, nil}
-	cache.put(secondKey, secondValidators)
+	secondSet := &blockproof.PreparedValidatorSet{}
+	cache.put(secondKey, secondSet)
 
 	if _, ok := cache.get(firstKey); ok {
 		t.Fatal("expected broadcast validator cache miss after config root changed")
 	}
-	if validators, ok := cache.get(secondKey); !ok || len(validators) != len(secondValidators) {
+	if set, ok := cache.get(secondKey); !ok || set != secondSet {
 		t.Fatal("expected broadcast validator cache hit for the new config root")
 	}
 }
@@ -54,13 +55,15 @@ func TestBroadcastValidatorCacheKeepsShardVariants(t *testing.T) {
 	shardKey.shard = 1 << 62
 	shardKey.validatorSetHash = 22
 
-	cache.put(baseKey, []*tlb.ValidatorAddr{nil})
-	cache.put(shardKey, []*tlb.ValidatorAddr{nil, nil})
+	baseSet := &blockproof.PreparedValidatorSet{}
+	shardSet := &blockproof.PreparedValidatorSet{}
+	cache.put(baseKey, baseSet)
+	cache.put(shardKey, shardSet)
 
-	if validators, ok := cache.get(baseKey); !ok || len(validators) != 1 {
+	if set, ok := cache.get(baseKey); !ok || set != baseSet {
 		t.Fatal("expected first shard validator set to stay cached")
 	}
-	if validators, ok := cache.get(shardKey); !ok || len(validators) != 2 {
+	if set, ok := cache.get(shardKey); !ok || set != shardSet {
 		t.Fatal("expected second shard validator set to stay cached")
 	}
 }
@@ -93,7 +96,7 @@ func TestBroadcastValidatorCacheKeepsConfigUntilReset(t *testing.T) {
 		catchainSeqno:    7,
 		validatorSetHash: 11,
 	}
-	cache.put(key, []*tlb.ValidatorAddr{nil})
+	cache.put(key, &blockproof.PreparedValidatorSet{})
 
 	cache.reset()
 	if _, ok = cache.getConfig(secondBlock); ok {

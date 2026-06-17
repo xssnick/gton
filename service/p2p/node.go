@@ -299,22 +299,6 @@ func protocolDiagnosticLoggable(msg string) bool {
 		strings.Contains(msg, "too big")
 }
 
-func (n *Node) SetBroadcastSignatureVerifier(verifier BroadcastSignatureVerifier) {
-	n.signatureVerifier = verifier
-}
-
-func (n *Node) SetBroadcastAdmission(admission BroadcastAdmission) {
-	n.broadcastAdmission = admission
-}
-
-func (n *Node) SetCompressedBlockStateProvider(provider CompressedBlockStateProvider) {
-	n.compressedState = provider
-}
-
-func (n *Node) SetSyncLagProvider(provider SyncLagProvider) {
-	n.syncLag = provider
-}
-
 func (n *Node) LocalID() PeerID {
 	return n.localID
 }
