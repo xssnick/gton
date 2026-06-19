@@ -12,15 +12,16 @@ import (
 )
 
 const (
-	archiveSessionDownloadRounds      = 2
+	archiveSessionDownloadRounds      = 6
 	archiveSessionPinnedDeadlineGrace = 5
 
-	archivePeerRejectNotAvailable     = "archive_not_available"
-	archivePeerRejectCandidateFailed  = "archive_candidate_failed"
-	archivePeerRejectDownloadFailed   = "archive_download_failed"
-	archivePeerRejectDownloadTooSlow  = "archive_download_too_slow"
-	ArchivePeerRejectImportFailed     = "archive_import_failed"
-	ArchivePeerRejectImportIncomplete = "archive_import_missing_block"
+	archivePeerRejectNotAvailable        = "archive_not_available"
+	archivePeerRejectCandidateFailed     = "archive_candidate_failed"
+	archivePeerRejectDownloadFailed      = "archive_download_failed"
+	archivePeerRejectStateNotAvailable   = "state_not_available"
+	archivePeerRejectStateDownloadFailed = "state_download_failed"
+	ArchivePeerRejectImportFailed        = "archive_import_failed"
+	ArchivePeerRejectImportIncomplete    = "archive_import_missing_block"
 )
 
 type ArchiveSession struct {
@@ -30,6 +31,8 @@ type ArchiveSession struct {
 	closed   bool
 	pins     map[PeerID]func()
 	failures map[PeerID]int
+	selected map[string]PeerID
+	pools    map[*overlaySubscription]*archivePeerPool
 }
 
 type ArchiveDownloadOptions struct {
@@ -41,6 +44,8 @@ func (n *Node) BeginArchiveSession() *ArchiveSession {
 		node:     n,
 		pins:     map[PeerID]func(){},
 		failures: map[PeerID]int{},
+		selected: map[string]PeerID{},
+		pools:    map[*overlaySubscription]*archivePeerPool{},
 	}
 }
 
@@ -60,10 +65,19 @@ func (a *ArchiveSession) Close() {
 		releases = append(releases, release)
 		delete(a.pins, peerID)
 	}
+	pools := make([]*archivePeerPool, 0, len(a.pools))
+	for sub, pool := range a.pools {
+		pools = append(pools, pool)
+		delete(a.pools, sub)
+	}
+	a.selected = map[string]PeerID{}
 	a.mx.Unlock()
 
 	for _, release := range releases {
 		release()
+	}
+	for _, pool := range pools {
+		pool.Close()
 	}
 }
 
@@ -88,7 +102,7 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 		}
 
 		lastErr = err
-		sub.refreshEmptyArchivePeerPool(ctx, shard)
+		a.archivePeerPool(sub).refreshUseless(ctx, shard)
 	}
 
 	if lastErr == nil {
@@ -107,20 +121,25 @@ func (a *ArchiveSession) RejectArchivePeer(shard archive.ShardID, peerAddr strin
 		return false
 	}
 	peer := sub.peerByAddr(peerAddr)
+	pool := a.archivePeerPool(sub)
+	if poolPeer := pool.peerByAddr(peerAddr); poolPeer != nil {
+		peer = poolPeer
+	}
 	if peer == nil {
 		return false
 	}
 
-	a.rejectArchivePeer(sub, shard, peer, reason)
+	a.rejectArchivePeer(pool, shard, peer, reason)
 	return true
 }
 
 func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlaySubscription, masterchainSeqno uint32, shard archive.ShardID, options ArchiveDownloadOptions) (*archive.Downloaded, error) {
+	pool := a.archivePeerPool(sub)
 	var ensureElapsed time.Duration
 	var resolveElapsed time.Duration
 	logBootstrapTiming := func(peer string, err error) {
-		candidates := sub.archiveQueryCandidates()
-		available := sub.availableArchivePeers(shard, sub.node.prioritizeArchivePeers(shard, candidates))
+		candidates := pool.candidates(shard)
+		available := pool.downloadCandidates(a, shard, candidates)
 
 		event := sub.log.Debug()
 		if err != nil || ensureElapsed >= archiveBootstrapSlowLog || resolveElapsed >= archiveBootstrapSlowLog {
@@ -143,13 +162,13 @@ func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlayS
 	}
 
 	ensureStarted := time.Now()
-	if err := sub.ensureArchivePeers(ctx, shard); err != nil {
+	if err := sub.ensureArchivePeers(ctx, pool, shard); err != nil {
 		return nil, fmt.Errorf("bootstrap overlay peers: %w", err)
 	}
 	ensureElapsed = time.Since(ensureStarted)
 
 	resolveStarted := time.Now()
-	resolved, err := sub.resolveArchive(ctx, a, masterchainSeqno, shard)
+	resolved, err := sub.resolveArchive(ctx, a, pool, masterchainSeqno, shard)
 	resolveElapsed = time.Since(resolveStarted)
 	if err != nil {
 		logBootstrapTiming("", err)
@@ -157,7 +176,19 @@ func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlayS
 	}
 	logBootstrapTiming(resolved.Peer, nil)
 
-	return sub.downloadArchiveFromResolved(ctx, a, resolved, options)
+	return sub.downloadArchiveFromResolved(ctx, a, pool, resolved, options)
+}
+
+func (a *ArchiveSession) archivePeerPool(sub *overlaySubscription) *archivePeerPool {
+	a.mx.Lock()
+	defer a.mx.Unlock()
+
+	pool := a.pools[sub]
+	if pool == nil {
+		pool = newArchivePeerPool(sub)
+		a.pools[sub] = pool
+	}
+	return pool
 }
 
 func (a *ArchiveSession) pinArchivePeer(peer *overlayPeer) {
@@ -178,8 +209,50 @@ func (a *ArchiveSession) pinArchivePeer(peer *overlayPeer) {
 		a.mx.Unlock()
 		return
 	}
-	release := a.node.acquireArchiveSessionPeer(peerID)
+	release := a.node.pinPeer(peerID)
 	a.pins[peerID] = release
+	a.mx.Unlock()
+}
+
+func (a *ArchiveSession) selectedArchivePeerID(shard archive.ShardID) PeerID {
+	if a == nil {
+		return PeerID{}
+	}
+
+	a.mx.Lock()
+	defer a.mx.Unlock()
+
+	return a.selected[archivePeerPoolKey(shard)]
+}
+
+func (a *ArchiveSession) selectArchivePeer(shard archive.ShardID, peer *overlayPeer) {
+	if a == nil {
+		return
+	}
+	peerID := archivePeerID(peer)
+	if peerID.IsZero() {
+		return
+	}
+
+	a.pinArchivePeer(peer)
+
+	a.mx.Lock()
+	if !a.closed {
+		a.selected[archivePeerPoolKey(shard)] = peerID
+	}
+	a.mx.Unlock()
+}
+
+func (a *ArchiveSession) clearSelectedArchivePeerID(shard archive.ShardID, peerID PeerID) {
+	if a == nil || peerID.IsZero() {
+		return
+	}
+
+	a.mx.Lock()
+	key := archivePeerPoolKey(shard)
+	if a.selected[key] == peerID {
+		delete(a.selected, key)
+	}
 	a.mx.Unlock()
 }
 
@@ -189,6 +262,14 @@ func (a *ArchiveSession) unpinArchivePeer(peer *overlayPeer) {
 	}
 	peerID := archivePeerID(peer)
 	if peerID.IsZero() {
+		return
+	}
+
+	a.unpinArchivePeerID(peerID)
+}
+
+func (a *ArchiveSession) unpinArchivePeerID(peerID PeerID) {
+	if a == nil || peerID.IsZero() {
 		return
 	}
 
@@ -297,13 +378,25 @@ func archivePinnedPeerTimeout(base time.Duration, max time.Duration, failures in
 	return base + time.Duration(int64(max-base)*int64(failures)/int64(archiveSessionPinnedDeadlineGrace))
 }
 
-func (a *ArchiveSession) rejectArchivePeer(sub *overlaySubscription, shard archive.ShardID, peer *overlayPeer, reason string) {
-	if a != nil {
-		a.unpinArchivePeer(peer)
+func (a *ArchiveSession) rejectArchivePeer(pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, reason string) {
+	peerID := archivePeerID(peer)
+	selected := a != nil && !peerID.IsZero() && a.selectedArchivePeerID(shard) == peerID
+	useless := pool == nil
+	if pool != nil {
+		useless = pool.noteFailure(shard, peer, reason)
 	}
-	if sub != nil {
-		sub.noteRememberedArchivePeerFailure(shard, peer)
-		sub.cooldownArchivePeer(shard, peer, reason)
+
+	if a != nil {
+		if useless {
+			a.clearSelectedArchivePeerID(shard, peerID)
+			a.unpinArchivePeer(peer)
+		} else if !selected {
+			a.unpinArchivePeer(peer)
+		}
+	}
+	if pool != nil && useless {
+		pool.cooldown(shard, peer, reason)
+		pool.refreshUseless(nil, shard)
 	}
 }
 

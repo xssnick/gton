@@ -592,7 +592,7 @@ func (s *overlaySubscription) downloadNextFull(ctx context.Context, prev ton.Blo
 func (s *overlaySubscription) probeNextFull(ctx context.Context, prev ton.BlockIDExt, opts ProbeNextBlockFullOptions) (*DownloadedBlock, error) {
 	var peers []*overlayPeer
 	if opts.LiveTail && isMasterchainBlock(prev) {
-		peers = s.liveNextBlockDownloadCandidates(prev, opts.PreferredPeerID)
+		peers = s.liveNextBlockDownloadCandidates(opts.PreferredPeerID)
 	} else {
 		peers = s.chainBlockDownloadCandidates(prev)
 		peers = preferDownloadPeer(peers, opts.PreferredPeerID)
@@ -800,26 +800,13 @@ func (s *overlaySubscription) chainBlockDownloadCandidates(block ton.BlockIDExt)
 	return moveDownloadPeerFirst(peers, sticky)
 }
 
-func (s *overlaySubscription) liveNextBlockDownloadCandidates(block ton.BlockIDExt, preferredPeerID PeerID) []*overlayPeer {
+func (s *overlaySubscription) liveNextBlockDownloadCandidates(preferredPeerID PeerID) []*overlayPeer {
 	peers := s.blockDownloadCandidates()
 	if len(peers) == 0 {
 		return peers
 	}
 
-	now := time.Now()
-	peers = s.prioritizeLiveNextPeers(peers, preferredPeerID, now)
-	if isMasterchainBlock(block) {
-		return peers
-	}
-
-	sticky := s.currentLiveNextChainBlockPeer(block, peers, now)
-	if sticky == nil {
-		return peers
-	}
-	if !preferredPeerID.IsZero() && sticky.id != preferredPeerID && peers[0].id == preferredPeerID {
-		return peers
-	}
-	return moveDownloadPeerFirst(peers, sticky)
+	return s.prioritizeLiveNextPeers(peers, preferredPeerID, time.Now())
 }
 
 func moveDownloadPeerFirst(peers []*overlayPeer, first *overlayPeer) []*overlayPeer {
@@ -855,20 +842,6 @@ func (k chainDownloadKey) String() string {
 }
 
 func (s *overlaySubscription) currentChainBlockPeer(block ton.BlockIDExt, peers []*overlayPeer) *overlayPeer {
-	return s.currentChainBlockPeerFiltered(block, peers, nil)
-}
-
-func (s *overlaySubscription) currentLiveNextChainBlockPeer(block ton.BlockIDExt, peers []*overlayPeer, now time.Time) *overlayPeer {
-	if !isMasterchainBlock(block) {
-		return s.currentChainBlockPeer(block, peers)
-	}
-	return s.currentChainBlockPeerFiltered(block, peers, func(peerID PeerID) bool {
-		state := s.liveNextPeers[peerID]
-		return state == nil || !state.unavailableUntil.After(now)
-	})
-}
-
-func (s *overlaySubscription) currentChainBlockPeerFiltered(block ton.BlockIDExt, peers []*overlayPeer, allow func(PeerID) bool) *overlayPeer {
 	if len(peers) == 0 {
 		return nil
 	}
@@ -884,7 +857,7 @@ func (s *overlaySubscription) currentChainBlockPeerFiltered(block ton.BlockIDExt
 	}
 
 	stickyID := state.peer.id
-	if stickyID.IsZero() || allow != nil && !allow(stickyID) {
+	if stickyID.IsZero() {
 		s.clearChainBlockPeerLocked(key)
 		return nil
 	}

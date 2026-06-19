@@ -56,17 +56,17 @@ func TestSlowCompletedArchiveDownloadKeepsPeerPinned(t *testing.T) {
 	peer := &overlayPeer{id: testPeerID("slow-archive"), addr: "slow-archive", alive: true}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := &overlaySubscription{
-		log:          discardLogger(),
-		node:         node,
-		archivePeers: map[string]*archivePeerPoolState{},
+		log:  discardLogger(),
+		node: node,
 	}
+	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
 
 	seed := make([]byte, packfile.HeaderSize)
 	binary.LittleEndian.PutUint32(seed, packfile.PackageMagic)
 
-	downloaded, err := sub.downloadArchiveFromPeer(context.Background(), session, resolvedArchive{
+	downloaded, err := sub.downloadArchiveFromPeer(context.Background(), session, pool, resolvedArchive{
 		MasterchainSeqno: 10,
 		Shard:            shard,
 	}, archiveCandidate{
@@ -82,10 +82,10 @@ func TestSlowCompletedArchiveDownloadKeepsPeerPinned(t *testing.T) {
 	if downloaded.Bytes != int64(len(seed)) {
 		t.Fatalf("downloaded bytes = %d, want %d", downloaded.Bytes, len(seed))
 	}
-	if _, ok := node.archiveSessionPinnedPeerIDs()[peer.id]; !ok {
+	if _, ok := node.pinnedPeerIDs()[peer.id]; !ok {
 		t.Fatal("slow completed archive download should keep peer pinned")
 	}
-	if sub.archivePeerCoolingDown(shard, peer) {
+	if pool.coolingDown(shard, peer) {
 		t.Fatal("slow completed archive download should not cool down peer")
 	}
 	if !peer.statsSnapshot().downloadSlowUntil.After(time.Now()) {
@@ -98,12 +98,12 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	peerID := testPeerID("archive-info")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := &overlaySubscription{
-		log:          discardLogger(),
-		node:         node,
-		spec:         overlaySpec{ShortID: []byte{1}},
-		archivePeers: map[string]*archivePeerPoolState{},
-		peers:        map[PeerID]*overlayPeer{},
+		log:   discardLogger(),
+		node:  node,
+		spec:  overlaySpec{ShortID: []byte{1}},
+		peers: map[PeerID]*overlayPeer{},
 	}
+	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
 
@@ -121,8 +121,9 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 		alive:       true,
 	}
 	sub.peers[peerID] = peer
+	pool.addBorrowedPeer(peer)
 
-	candidate, err := sub.fetchArchiveCandidate(context.Background(), session, peer, 10, shard)
+	candidate, err := sub.fetchArchiveCandidate(context.Background(), session, pool, peer, 10, shard)
 	if err != nil {
 		t.Fatalf("fetch archive candidate: %v", err)
 	}
@@ -132,14 +133,14 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	if candidate.hasSeed {
 		t.Fatal("seed probe failure should return candidate without seed")
 	}
-	if _, ok := node.archiveSessionPinnedPeerIDs()[peer.id]; !ok {
+	if _, ok := node.pinnedPeerIDs()[peer.id]; !ok {
 		t.Fatal("archive info should pin peer")
 	}
 	failures, pinned := session.archivePeerDeadlineFailures(peer)
 	if !pinned || failures != 1 {
 		t.Fatalf("deadline failures = %d pinned=%v, want 1 and pinned", failures, pinned)
 	}
-	if sub.archivePeerCoolingDown(shard, peer) {
+	if pool.coolingDown(shard, peer) {
 		t.Fatal("seed probe deadline should not cool down peer")
 	}
 }
@@ -148,11 +149,11 @@ func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := &overlaySubscription{
-		log:          discardLogger(),
-		node:         node,
-		spec:         overlaySpec{ShortID: []byte{1}},
-		archivePeers: map[string]*archivePeerPoolState{},
+		log:  discardLogger(),
+		node: node,
+		spec: overlaySpec{ShortID: []byte{1}},
 	}
+	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
 
@@ -162,8 +163,11 @@ func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 	primary := testArchiveDownloadPeer(t, "primary", 100, primaryPack, 120*time.Millisecond)
 	fast := testArchiveDownloadPeer(t, "fast", 200, fastPack, 10*time.Millisecond)
 	slow := testArchiveDownloadPeer(t, "slow", 300, slowPack, 120*time.Millisecond)
+	pool.addArchiveOnlyPeer(primary)
+	pool.addArchiveOnlyPeer(fast)
+	pool.addArchiveOnlyPeer(slow)
 
-	downloaded, err := sub.downloadArchiveFromPeers(context.Background(), session, resolvedArchive{
+	downloaded, err := sub.downloadArchiveFromPeers(context.Background(), session, pool, resolvedArchive{
 		MasterchainSeqno: 10,
 		Shard:            shard,
 		peer:             primary,
@@ -182,7 +186,7 @@ func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 	if string(downloaded.Data) != string(fastPack) {
 		t.Fatal("hedged archive returned data from the wrong peer")
 	}
-	if sub.archivePeerCoolingDown(shard, primary) {
+	if pool.coolingDown(shard, primary) {
 		t.Fatal("hedge-lost primary should not be cooled down")
 	}
 }

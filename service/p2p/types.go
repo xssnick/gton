@@ -100,6 +100,7 @@ const (
 	peerFailUnreliability = 10.0
 	peerSlowEvictionScore = peerStopUnreliability + 1
 
+	largeDownloadSlowPeerPenalty  = 3 * time.Minute
 	blockUnknownPeerSpeed         = float64(256 << 10)
 	blockSlowPeerSpeed            = float64(64 << 10)
 	blockSlowPeerPenalty          = 30 * time.Second

@@ -21,7 +21,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
+func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	peerA := testZeroStatePeer("a")
 	peerB := testZeroStatePeer("b")
 	sub := &overlaySubscription{
@@ -30,8 +30,10 @@ func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
 			peerB.id: peerB,
 		},
 	}
+	pool := testArchivePool(sub)
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
-	got := sub.zeroStateQueryCandidates(map[PeerID]struct{}{
+	got := zeroStateArchiveCandidates(pool, nil, shard, map[PeerID]struct{}{
 		peerA.id: {},
 	})
 	if len(got) != 1 {
@@ -42,31 +44,48 @@ func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
 	}
 }
 
-func TestRotateZeroStateUnavailablePeersRemovesCurrentPeers(t *testing.T) {
-	peerA := testZeroStatePeer("a")
-	peerB := testZeroStatePeer("b")
+func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
+	peer := testZeroStatePeer("live")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
 		peers: map[PeerID]*overlayPeer{
-			peerA.id: peerA,
-			peerB.id: peerB,
+			peer.id: peer,
 		},
-		neighbours: []PeerID{peerA.id, peerB.id},
-		peerNotify: make(chan struct{}, 1),
 	}
+	pool := testArchivePool(sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
-	if got := sub.rotateZeroStateUnavailablePeers([]*overlayPeer{peerA, peerB}); got != 2 {
-		t.Fatalf("rotated peers = %d, want 2", got)
+	session.rejectArchivePeer(pool, shard, peer, archivePeerRejectStateNotAvailable)
+
+	if _, ok := sub.peers[peer.id]; !ok {
+		t.Fatal("borrowed live peer was removed from live pool")
 	}
-	if len(sub.peers) != 0 {
-		t.Fatalf("peers were not removed: %d", len(sub.peers))
+	if !pool.hasPeer(peer.id) {
+		t.Fatal("borrowed live peer was removed from archive pool")
 	}
-	if len(sub.neighbours) != 0 {
-		t.Fatalf("neighbours were not removed: %d", len(sub.neighbours))
+}
+
+func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
+	peer := testZeroStatePeer("archive-only")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
 	}
-	select {
-	case <-sub.peerNotify:
-	default:
-		t.Fatal("expected peer notification")
+	pool := testArchivePool(sub)
+	pool.addArchiveOnlyPeer(peer)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+
+	session.rejectArchivePeer(pool, shard, peer, archivePeerRejectStateNotAvailable)
+
+	if pool.hasPeer(peer.id) {
+		t.Fatal("archive-only peer survived zero-state not-available rotation")
 	}
 }
 

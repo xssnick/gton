@@ -1224,12 +1224,11 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 	}
 
 	sub := &overlaySubscription{
-		node:         n,
-		spec:         spec,
-		log:          n.log.With().Str("overlay", spec.Name).Logger(),
-		peers:        map[PeerID]*overlayPeer{},
-		archivePeers: map[string]*archivePeerPoolState{},
-		peerNotify:   make(chan struct{}, 1),
+		node:       n,
+		spec:       spec,
+		log:        n.log.With().Str("overlay", spec.Name).Logger(),
+		peers:      map[PeerID]*overlayPeer{},
+		peerNotify: make(chan struct{}, 1),
 	}
 	n.subscriptions[key] = sub
 	n.subscriptionsMx.Unlock()

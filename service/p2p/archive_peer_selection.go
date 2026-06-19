@@ -1,24 +1,24 @@
 package p2p
 
 import (
-	"context"
 	"sort"
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
 )
 
-const (
-	archiveRememberedPeerLimit       = 16
-	archiveRememberedPeerMaxFailures = 6
-)
-
 func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
+	if n == nil {
+		return prioritizeArchivePeersWithLeases(shard, peers, nil)
+	}
+	return prioritizeArchivePeersWithLeases(shard, peers, n.downloadPeerLeaseSnapshot(peers))
+}
+
+func prioritizeArchivePeersWithLeases(shard archive.ShardID, peers []*overlayPeer, leases map[PeerID]int) []*overlayPeer {
 	if len(peers) < 2 {
 		return peers
 	}
 
-	leases := n.downloadPeerLeaseSnapshot(peers)
 	now := time.Now()
 	basechain := shard.Workchain == 0
 	prioritized := append([]*overlayPeer(nil), peers...)
@@ -57,29 +57,6 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 		return leftSpeed > rightSpeed
 	})
 	return prioritized
-}
-
-func (s *overlaySubscription) archiveQueryCandidates() []*overlayPeer {
-	return s.aliveNeighbourPeers(0, 0)
-}
-
-func (s *overlaySubscription) availableArchivePeersWithFallback(shard archive.ShardID) ([]*overlayPeer, bool) {
-	if s.node == nil {
-		return nil, false
-	}
-
-	peers := s.node.prioritizeArchivePeers(shard, s.archiveQueryCandidates())
-	available := s.availableArchivePeers(shard, peers)
-	if len(available) > 0 {
-		return available, false
-	}
-
-	remembered := s.rememberedArchivePeers(shard)
-	remembered = s.availableArchivePeers(shard, remembered)
-	if len(remembered) > 0 {
-		return remembered, true
-	}
-	return available, false
 }
 
 func (s *overlaySubscription) peerByAddr(addr string) *overlayPeer {
@@ -148,33 +125,13 @@ func archiveDownloadPeerScore(stats peerStats, speed float64, leases int, basech
 	return downloadPeerScoreWithCapacity(stats, speed, leases, archivePeerParallelCapacity(stats, basechain), now)
 }
 
-func downloadPeerScore(stats peerStats, speed float64, leases int, now time.Time) float64 {
-	return downloadPeerScoreWithCapacity(stats, speed, leases, 1, now)
-}
-
-func downloadPeerScoreWithCapacity(stats peerStats, speed float64, leases int, capacity int, now time.Time) float64 {
-	if capacity < 1 {
-		capacity = 1
-	}
-
-	score := speed / (1 + float64(leases)/float64(capacity))
-	if stats.unreliability > 0 {
-		score /= 1 + stats.unreliability
-	}
-	if stats.roundtrip > 0 {
-		score /= 1 + stats.roundtrip.Seconds()
-	}
-	if !stats.lastSuccessAt.IsZero() && now.Sub(stats.lastSuccessAt) > 30*time.Second {
-		score *= 0.5
-	}
-	if !stats.alive {
-		score *= 0.25
-	}
-	return score
-}
-
 func noteArchivePeerSeedSuccess(shard archive.ShardID, peer *overlayPeer, bytes int64, elapsed time.Duration) {
+	if peer == nil || bytes <= 0 || elapsed <= 0 {
+		return
+	}
+
 	if !archiveSpeedSampleReliable(bytes) {
+		peer.querySuccess(0)
 		return
 	}
 
@@ -192,371 +149,12 @@ func noteArchivePeerDownload(shard archive.ShardID, peer *overlayPeer, bytes int
 		return archiveDownloadTooSlow(shard, bytes, elapsed)
 	}
 
+	peer.querySuccess(0)
 	if archiveDownloadTooSlow(shard, bytes, elapsed) {
 		peer.downloadFailed(archiveSlowPeerPenalty)
 		return true
 	}
 	return false
-}
-
-func (s *overlaySubscription) archivePeerPoolState(key string) *archivePeerPoolState {
-	if s.archivePeers == nil {
-		s.archivePeers = map[string]*archivePeerPoolState{}
-	}
-	state := s.archivePeers[key]
-	if state == nil {
-		state = &archivePeerPoolState{}
-		s.archivePeers[key] = state
-	}
-	return state
-}
-
-func archivePeerPoolStateEmpty(state *archivePeerPoolState) bool {
-	return state == nil || len(state.cooldownUntil) == 0 && len(state.remembered) == 0
-}
-
-func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
-	if len(peers) == 0 {
-		return nil
-	}
-
-	now := time.Now()
-	stateKey := archivePeerPoolKey(shard)
-
-	s.archivePeerMx.Lock()
-	defer s.archivePeerMx.Unlock()
-
-	state := s.archivePeers[stateKey]
-	if state == nil || len(state.cooldownUntil) == 0 {
-		return peers
-	}
-
-	available := make([]*overlayPeer, 0, len(peers))
-	for _, peer := range peers {
-		if !archivePeerCoolingDownLocked(state, archivePeerID(peer), now) {
-			available = append(available, peer)
-		}
-	}
-	if archivePeerPoolStateEmpty(state) {
-		delete(s.archivePeers, stateKey)
-	}
-	return available
-}
-
-func (s *overlaySubscription) rememberArchivePeer(shard archive.ShardID, peer *overlayPeer, bytes int64, elapsed time.Duration) {
-	peerID := archivePeerID(peer)
-	if peerID.IsZero() {
-		return
-	}
-
-	now := time.Now()
-	speed := rememberedArchivePeerSpeed(bytes, elapsed)
-	stateKey := archivePeerPoolKey(shard)
-
-	s.archivePeerMx.Lock()
-	state := s.archivePeerPoolState(stateKey)
-	if state.remembered == nil {
-		state.remembered = map[PeerID]archiveRememberedPeer{}
-	}
-	remembered := state.remembered[peerID]
-	remembered.lastSuccessAt = now
-	remembered.bytesSec = speed
-	remembered.failures = 0
-	state.remembered[peerID] = remembered
-	trimRememberedArchivePeersLocked(state)
-	s.archivePeerMx.Unlock()
-}
-
-func (s *overlaySubscription) noteRememberedArchivePeerAttempt(shard archive.ShardID, peer *overlayPeer) {
-	peerID := archivePeerID(peer)
-	if peerID.IsZero() {
-		return
-	}
-
-	stateKey := archivePeerPoolKey(shard)
-
-	s.archivePeerMx.Lock()
-	state := s.archivePeers[stateKey]
-	if state == nil || len(state.remembered) == 0 {
-		s.archivePeerMx.Unlock()
-		return
-	}
-	remembered, ok := state.remembered[peerID]
-	if !ok {
-		s.archivePeerMx.Unlock()
-		return
-	}
-	remembered.attempts++
-	state.remembered[peerID] = remembered
-	s.archivePeerMx.Unlock()
-}
-
-func (s *overlaySubscription) noteRememberedArchivePeerFailure(shard archive.ShardID, peer *overlayPeer) {
-	peerID := archivePeerID(peer)
-	if peerID.IsZero() {
-		return
-	}
-
-	stateKey := archivePeerPoolKey(shard)
-
-	s.archivePeerMx.Lock()
-	state := s.archivePeers[stateKey]
-	if state == nil || len(state.remembered) == 0 {
-		s.archivePeerMx.Unlock()
-		return
-	}
-	remembered, ok := state.remembered[peerID]
-	if !ok {
-		s.archivePeerMx.Unlock()
-		return
-	}
-	remembered.failures++
-	if remembered.failures >= archiveRememberedPeerMaxFailures {
-		delete(state.remembered, peerID)
-	} else {
-		state.remembered[peerID] = remembered
-	}
-	if archivePeerPoolStateEmpty(state) {
-		delete(s.archivePeers, stateKey)
-	}
-	s.archivePeerMx.Unlock()
-}
-
-func (s *overlaySubscription) rememberedArchivePeers(shard archive.ShardID) []*overlayPeer {
-	now := time.Now()
-	stateKey := archivePeerPoolKey(shard)
-
-	s.archivePeerMx.Lock()
-	state := s.archivePeers[stateKey]
-	if state == nil || len(state.remembered) == 0 {
-		s.archivePeerMx.Unlock()
-		return nil
-	}
-	trimRememberedArchivePeersLocked(state)
-	ranks := make([]archiveRememberedPeerRank, 0, len(state.remembered))
-	for peerID, remembered := range state.remembered {
-		if archivePeerCoolingDownLocked(state, peerID, now) {
-			continue
-		}
-		ranks = append(ranks, archiveRememberedPeerRank{
-			peerID:        peerID,
-			score:         rememberedArchivePeerScore(remembered),
-			bytesSec:      remembered.bytesSec,
-			attempts:      remembered.attempts,
-			lastSuccessAt: remembered.lastSuccessAt,
-		})
-	}
-	if archivePeerPoolStateEmpty(state) {
-		delete(s.archivePeers, stateKey)
-	}
-	s.archivePeerMx.Unlock()
-
-	if len(ranks) == 0 {
-		return nil
-	}
-	sort.SliceStable(ranks, func(i, j int) bool {
-		left := ranks[i]
-		right := ranks[j]
-		if left.score != right.score {
-			return left.score > right.score
-		}
-		if left.attempts != right.attempts {
-			return left.attempts < right.attempts
-		}
-		if left.bytesSec != right.bytesSec {
-			return left.bytesSec > right.bytesSec
-		}
-		return left.lastSuccessAt.After(right.lastSuccessAt)
-	})
-
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	peers := make([]*overlayPeer, 0, len(ranks))
-	for _, rank := range ranks {
-		peer := s.peers[rank.peerID]
-		if peer == nil || !peer.hasOpenConnection() || !peer.isAliveKnownOverlayPeer(now) {
-			continue
-		}
-		peers = append(peers, peer)
-	}
-	return peers
-}
-
-type archiveRememberedPeerRank struct {
-	peerID        PeerID
-	score         float64
-	bytesSec      float64
-	attempts      int
-	lastSuccessAt time.Time
-}
-
-func trimRememberedArchivePeersLocked(state *archivePeerPoolState) {
-	if state == nil || len(state.remembered) == 0 {
-		return
-	}
-
-	for len(state.remembered) > archiveRememberedPeerLimit {
-		oldestPeerID := PeerID{}
-		oldestAt := time.Time{}
-		for peerID, remembered := range state.remembered {
-			if oldestPeerID.IsZero() || remembered.lastSuccessAt.Before(oldestAt) {
-				oldestPeerID = peerID
-				oldestAt = remembered.lastSuccessAt
-			}
-		}
-		if oldestPeerID.IsZero() {
-			break
-		}
-		delete(state.remembered, oldestPeerID)
-	}
-
-	if len(state.remembered) == 0 {
-		state.remembered = nil
-	}
-}
-
-func rememberedArchivePeerSpeed(bytes int64, elapsed time.Duration) float64 {
-	if bytes <= 0 || elapsed <= 0 {
-		return defaultArchivePeerSpeed
-	}
-	return float64(bytes) / elapsed.Seconds()
-}
-
-func rememberedArchivePeerScore(remembered archiveRememberedPeer) float64 {
-	speed := remembered.bytesSec
-	if speed <= 0 {
-		speed = defaultArchivePeerSpeed
-	}
-	return speed / float64(remembered.attempts+1)
-}
-
-func (s *overlaySubscription) refreshEmptyArchivePeerPool(ctx context.Context, shard archive.ShardID) {
-	rotated := s.rotateUnavailableArchivePeers(shard)
-	if rotated == 0 {
-		return
-	}
-
-	if s.node != nil && s.node.dht != nil {
-		s.forceSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
-	}
-	s.reloadNeighbours()
-}
-
-func (s *overlaySubscription) rotateUnavailableArchivePeers(shard archive.ShardID) int {
-	if s.node == nil {
-		return 0
-	}
-
-	candidates := s.archiveQueryCandidates()
-	if len(candidates) == 0 {
-		return 0
-	}
-	if available := s.availableArchivePeers(shard, s.node.prioritizeArchivePeers(shard, candidates)); len(available) > 0 {
-		return 0
-	}
-
-	protected := s.protectedNeighbourPeerIDs()
-	rotated := 0
-	for _, peer := range candidates {
-		if peer == nil || peer.id.IsZero() {
-			continue
-		}
-		if _, ok := protected[peer.id]; ok {
-			continue
-		}
-		if !s.archivePeerCoolingDown(shard, peer) {
-			continue
-		}
-		s.removePeer(peer.id)
-		rotated++
-	}
-	if rotated == 0 {
-		return 0
-	}
-
-	s.log.Info().
-		Int("rotated_peers", rotated).
-		Str("archive_pool", archivePeerPoolKey(shard)).
-		Msg("rotated unavailable archive peers")
-	return rotated
-}
-
-func (s *overlaySubscription) cooldownArchivePeer(shard archive.ShardID, peer *overlayPeer, reason string) {
-	if peer == nil {
-		return
-	}
-
-	until := time.Now().Add(archiveSlowPeerPenalty)
-	stateKey := archivePeerPoolKey(shard)
-	peerID := archivePeerID(peer)
-	if peerID.IsZero() {
-		return
-	}
-
-	s.archivePeerMx.Lock()
-	state := s.archivePeerPoolState(stateKey)
-	if state.cooldownUntil == nil {
-		state.cooldownUntil = map[PeerID]time.Time{}
-	}
-	state.cooldownUntil[peerID] = until
-	s.archivePeerMx.Unlock()
-
-	s.log.Debug().
-		Str("peer", peer.addr).
-		Str("archive_pool", stateKey).
-		Str("reason", reason).
-		Dur("duration", archiveSlowPeerPenalty).
-		Msg("temporarily cooled down archive peer")
-}
-
-func (s *overlaySubscription) archivePeerCoolingDown(shard archive.ShardID, peer *overlayPeer) bool {
-	if peer == nil {
-		return false
-	}
-
-	now := time.Now()
-	stateKey := archivePeerPoolKey(shard)
-
-	s.archivePeerMx.Lock()
-	defer s.archivePeerMx.Unlock()
-
-	state := s.archivePeers[stateKey]
-	if state == nil {
-		return false
-	}
-	coolingDown := archivePeerCoolingDownLocked(state, archivePeerID(peer), now)
-	if archivePeerPoolStateEmpty(state) {
-		delete(s.archivePeers, stateKey)
-	}
-	return coolingDown
-}
-
-func archivePeerCoolingDownLocked(state *archivePeerPoolState, peerID PeerID, now time.Time) bool {
-	if state == nil || len(state.cooldownUntil) == 0 {
-		return false
-	}
-	if peerID.IsZero() {
-		return false
-	}
-
-	until, ok := state.cooldownUntil[peerID]
-	if !ok {
-		return false
-	}
-	if now.Before(until) {
-		return true
-	}
-
-	delete(state.cooldownUntil, peerID)
-	return false
-}
-
-func archivePeerPoolKey(shard archive.ShardID) string {
-	if shard.Workchain == -1 {
-		return "master"
-	}
-	return shard.String()
 }
 
 func archiveSlowThreshold(basechain bool) float64 {
@@ -589,8 +187,4 @@ func archiveDownloadTooSlow(shard archive.ShardID, bytes int64, elapsed time.Dur
 
 func archivePeerCanStayPinned(shard archive.ShardID, bytes int64, elapsed time.Duration) bool {
 	return bytes > 0 && elapsed > 0 && !archiveDownloadTooSlow(shard, bytes, elapsed)
-}
-
-func archivePeerID(peer *overlayPeer) PeerID {
-	return downloadPeerID(peer)
 }

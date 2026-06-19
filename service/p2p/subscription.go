@@ -36,12 +36,10 @@ type overlaySubscription struct {
 	seedScheduled       bool
 	seedTarget          int
 	nextSeedAt          time.Time
-	archivePeerMx       sync.Mutex
 	chainDownloadMx     sync.Mutex
 	peers               map[PeerID]*overlayPeer
 	neighbours          []PeerID
 	lastPingedNeighbour PeerID
-	archivePeers        map[string]*archivePeerPoolState
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
@@ -162,18 +160,6 @@ func (s *overlaySubscription) close() {
 			peer.rldpOverlay.Close()
 		}
 	}
-}
-
-type archivePeerPoolState struct {
-	cooldownUntil map[PeerID]time.Time
-	remembered    map[PeerID]archiveRememberedPeer
-}
-
-type archiveRememberedPeer struct {
-	lastSuccessAt time.Time
-	bytesSec      float64
-	attempts      int
-	failures      int
 }
 
 type chainDownloadState struct {
@@ -860,19 +846,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		s.removeNeighbourLocked(evictID)
 	}
 
-	allowBroadcastFEC := s.spec.Kind != overlayKindCustomFixed
-	state := &overlayPeer{
-		id:            pooled.id,
-		addr:          pooled.addr,
-		pub:           append(ed25519.PublicKey(nil), pooled.pub...),
-		announced:     cloneOverlayNode(announced),
-		fixedMember:   s.spec.Kind == overlayKindCustomFixed,
-		overlay:       pooled.adnl.CreateOverlayWithSettings(s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false),
-		rldp:          pooled.rldp,
-		rldpOverlay:   pooled.rldp.CreateOverlay(s.spec.ShortID),
-		alive:         true,
-		lastReceiveAt: time.Now(),
-	}
+	state := s.newOverlayPeer(pooled, announced, s.spec.Kind == overlayKindCustomFixed, s.spec.Kind != overlayKindCustomFixed)
 	if len(s.spec.AuthorizedKeys) > 0 {
 		state.overlay.SetAuthorizedKeys(s.spec.AuthorizedKeys)
 	}
@@ -893,6 +867,21 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		s.startPeerWarmup(state)
 	}
 	return true
+}
+
+func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *overlay.Node, fixedMember bool, allowBroadcastFEC bool) *overlayPeer {
+	return &overlayPeer{
+		id:            pooled.id,
+		addr:          pooled.addr,
+		pub:           append(ed25519.PublicKey(nil), pooled.pub...),
+		announced:     cloneOverlayNode(announced),
+		fixedMember:   fixedMember,
+		overlay:       pooled.adnl.CreateOverlayWithSettings(s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false),
+		rldp:          pooled.rldp,
+		rldpOverlay:   pooled.rldp.CreateOverlay(s.spec.ShortID),
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
 }
 
 func (s *overlaySubscription) acceptsPeerID(id PeerID) bool {
