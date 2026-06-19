@@ -363,6 +363,18 @@ func (s *Store) reusableArtifactRef(key []byte) (*storage.ArtifactRef, error) {
 	return ref, nil
 }
 
+func (s *Store) artifactAvailable(ctx context.Context, key []byte) error {
+	raw, err := s.getHotCopy(ctx, key)
+	if err != nil {
+		return err
+	}
+	ref, err := decodeArtifactRef(raw)
+	if err != nil {
+		return err
+	}
+	return s.checkArtifactRef(ref)
+}
+
 func (s *Store) checkArtifactRef(ref *storage.ArtifactRef) error {
 	if ref == nil {
 		return storage.ErrNotFound
@@ -613,6 +625,33 @@ func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.S
 		Meta:   meta.Clone(),
 		IsLink: meta.Has(storage.BlockMetaServedFullIsLink),
 	}, nil
+}
+
+func (s *Store) BlockFullAvailable(ctx context.Context, block ton.BlockIDExt) error {
+	meta, err := s.BlockMeta(ctx, block)
+	if err != nil {
+		return err
+	}
+	if !meta.Has(storage.BlockMetaHasServedFull) {
+		return storage.ErrNotFound
+	}
+	if err = s.artifactAvailable(ctx, hotKeyBlockDataRef(block)); err != nil {
+		return err
+	}
+
+	for _, kind := range storage.ProofCandidates(meta) {
+		if !meta.HasProof(kind) {
+			continue
+		}
+		err = s.artifactAvailable(ctx, hotKeyStoredProofRef(kind, block))
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+	}
+	return storage.ErrNotFound
 }
 
 func (s *Store) NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*storage.ServedBlockFull, error) {

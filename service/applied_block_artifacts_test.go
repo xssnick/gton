@@ -46,6 +46,47 @@ func TestPreparedBlockCheckpointArtifactsCanonicalProofLinkFlag(t *testing.T) {
 	}
 }
 
+func TestPreparedBlockCheckpointArtifactsRequiresFullPayload(t *testing.T) {
+	block := testBlockID(0, topShard, 12)
+	tests := []struct {
+		name  string
+		block PreparedBlock
+	}{
+		{
+			name: "missing block data",
+			block: PreparedBlock{
+				ID:       block,
+				ProofBOC: []byte{0x02},
+				Meta:     &storage.BlockMeta{},
+			},
+		},
+		{
+			name: "missing proof data",
+			block: PreparedBlock{
+				ID:       block,
+				BlockBOC: []byte{0x01},
+				Meta:     &storage.BlockMeta{},
+			},
+		},
+		{
+			name: "missing meta",
+			block: PreparedBlock{
+				ID:       block,
+				BlockBOC: []byte{0x01},
+				ProofBOC: []byte{0x02},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := preparedBlockCheckpointArtifacts(tt.block, 0); err == nil {
+				t.Fatal("checkpoint artifact accepted incomplete prepared block")
+			}
+		})
+	}
+}
+
 func TestCheckpointArtifactsShareImmutablePayload(t *testing.T) {
 	blockData := []byte{0x01, 0x02, 0x03}
 	proofData := []byte{0x04, 0x05}

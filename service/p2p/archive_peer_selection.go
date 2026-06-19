@@ -8,6 +8,11 @@ import (
 	"github.com/xssnick/gton/service/archive"
 )
 
+const (
+	archiveRememberedPeerLimit       = 16
+	archiveRememberedPeerMaxFailures = 6
+)
+
 func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
 	if len(peers) < 2 {
 		return peers
@@ -56,6 +61,25 @@ func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPee
 
 func (s *overlaySubscription) archiveQueryCandidates() []*overlayPeer {
 	return s.aliveNeighbourPeers(0, 0)
+}
+
+func (s *overlaySubscription) availableArchivePeersWithFallback(shard archive.ShardID) ([]*overlayPeer, bool) {
+	if s.node == nil {
+		return nil, false
+	}
+
+	peers := s.node.prioritizeArchivePeers(shard, s.archiveQueryCandidates())
+	available := s.availableArchivePeers(shard, peers)
+	if len(available) > 0 {
+		return available, false
+	}
+
+	remembered := s.rememberedArchivePeers(shard)
+	remembered = s.availableArchivePeers(shard, remembered)
+	if len(remembered) > 0 {
+		return remembered, true
+	}
+	return available, false
 }
 
 func (s *overlaySubscription) peerByAddr(addr string) *overlayPeer {
@@ -188,7 +212,7 @@ func (s *overlaySubscription) archivePeerPoolState(key string) *archivePeerPoolS
 }
 
 func archivePeerPoolStateEmpty(state *archivePeerPoolState) bool {
-	return state == nil || len(state.cooldownUntil) == 0
+	return state == nil || len(state.cooldownUntil) == 0 && len(state.remembered) == 0
 }
 
 func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
@@ -217,6 +241,194 @@ func (s *overlaySubscription) availableArchivePeers(shard archive.ShardID, peers
 		delete(s.archivePeers, stateKey)
 	}
 	return available
+}
+
+func (s *overlaySubscription) rememberArchivePeer(shard archive.ShardID, peer *overlayPeer, bytes int64, elapsed time.Duration) {
+	peerID := archivePeerID(peer)
+	if peerID.IsZero() {
+		return
+	}
+
+	now := time.Now()
+	speed := rememberedArchivePeerSpeed(bytes, elapsed)
+	stateKey := archivePeerPoolKey(shard)
+
+	s.archivePeerMx.Lock()
+	state := s.archivePeerPoolState(stateKey)
+	if state.remembered == nil {
+		state.remembered = map[PeerID]archiveRememberedPeer{}
+	}
+	remembered := state.remembered[peerID]
+	remembered.lastSuccessAt = now
+	remembered.bytesSec = speed
+	remembered.failures = 0
+	state.remembered[peerID] = remembered
+	trimRememberedArchivePeersLocked(state)
+	s.archivePeerMx.Unlock()
+}
+
+func (s *overlaySubscription) noteRememberedArchivePeerAttempt(shard archive.ShardID, peer *overlayPeer) {
+	peerID := archivePeerID(peer)
+	if peerID.IsZero() {
+		return
+	}
+
+	stateKey := archivePeerPoolKey(shard)
+
+	s.archivePeerMx.Lock()
+	state := s.archivePeers[stateKey]
+	if state == nil || len(state.remembered) == 0 {
+		s.archivePeerMx.Unlock()
+		return
+	}
+	remembered, ok := state.remembered[peerID]
+	if !ok {
+		s.archivePeerMx.Unlock()
+		return
+	}
+	remembered.attempts++
+	state.remembered[peerID] = remembered
+	s.archivePeerMx.Unlock()
+}
+
+func (s *overlaySubscription) noteRememberedArchivePeerFailure(shard archive.ShardID, peer *overlayPeer) {
+	peerID := archivePeerID(peer)
+	if peerID.IsZero() {
+		return
+	}
+
+	stateKey := archivePeerPoolKey(shard)
+
+	s.archivePeerMx.Lock()
+	state := s.archivePeers[stateKey]
+	if state == nil || len(state.remembered) == 0 {
+		s.archivePeerMx.Unlock()
+		return
+	}
+	remembered, ok := state.remembered[peerID]
+	if !ok {
+		s.archivePeerMx.Unlock()
+		return
+	}
+	remembered.failures++
+	if remembered.failures >= archiveRememberedPeerMaxFailures {
+		delete(state.remembered, peerID)
+	} else {
+		state.remembered[peerID] = remembered
+	}
+	if archivePeerPoolStateEmpty(state) {
+		delete(s.archivePeers, stateKey)
+	}
+	s.archivePeerMx.Unlock()
+}
+
+func (s *overlaySubscription) rememberedArchivePeers(shard archive.ShardID) []*overlayPeer {
+	now := time.Now()
+	stateKey := archivePeerPoolKey(shard)
+
+	s.archivePeerMx.Lock()
+	state := s.archivePeers[stateKey]
+	if state == nil || len(state.remembered) == 0 {
+		s.archivePeerMx.Unlock()
+		return nil
+	}
+	trimRememberedArchivePeersLocked(state)
+	ranks := make([]archiveRememberedPeerRank, 0, len(state.remembered))
+	for peerID, remembered := range state.remembered {
+		if archivePeerCoolingDownLocked(state, peerID, now) {
+			continue
+		}
+		ranks = append(ranks, archiveRememberedPeerRank{
+			peerID:        peerID,
+			score:         rememberedArchivePeerScore(remembered),
+			bytesSec:      remembered.bytesSec,
+			attempts:      remembered.attempts,
+			lastSuccessAt: remembered.lastSuccessAt,
+		})
+	}
+	if archivePeerPoolStateEmpty(state) {
+		delete(s.archivePeers, stateKey)
+	}
+	s.archivePeerMx.Unlock()
+
+	if len(ranks) == 0 {
+		return nil
+	}
+	sort.SliceStable(ranks, func(i, j int) bool {
+		left := ranks[i]
+		right := ranks[j]
+		if left.score != right.score {
+			return left.score > right.score
+		}
+		if left.attempts != right.attempts {
+			return left.attempts < right.attempts
+		}
+		if left.bytesSec != right.bytesSec {
+			return left.bytesSec > right.bytesSec
+		}
+		return left.lastSuccessAt.After(right.lastSuccessAt)
+	})
+
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	peers := make([]*overlayPeer, 0, len(ranks))
+	for _, rank := range ranks {
+		peer := s.peers[rank.peerID]
+		if peer == nil || !peer.hasOpenConnection() || !peer.isAliveKnownOverlayPeer(now) {
+			continue
+		}
+		peers = append(peers, peer)
+	}
+	return peers
+}
+
+type archiveRememberedPeerRank struct {
+	peerID        PeerID
+	score         float64
+	bytesSec      float64
+	attempts      int
+	lastSuccessAt time.Time
+}
+
+func trimRememberedArchivePeersLocked(state *archivePeerPoolState) {
+	if state == nil || len(state.remembered) == 0 {
+		return
+	}
+
+	for len(state.remembered) > archiveRememberedPeerLimit {
+		oldestPeerID := PeerID{}
+		oldestAt := time.Time{}
+		for peerID, remembered := range state.remembered {
+			if oldestPeerID.IsZero() || remembered.lastSuccessAt.Before(oldestAt) {
+				oldestPeerID = peerID
+				oldestAt = remembered.lastSuccessAt
+			}
+		}
+		if oldestPeerID.IsZero() {
+			break
+		}
+		delete(state.remembered, oldestPeerID)
+	}
+
+	if len(state.remembered) == 0 {
+		state.remembered = nil
+	}
+}
+
+func rememberedArchivePeerSpeed(bytes int64, elapsed time.Duration) float64 {
+	if bytes <= 0 || elapsed <= 0 {
+		return defaultArchivePeerSpeed
+	}
+	return float64(bytes) / elapsed.Seconds()
+}
+
+func rememberedArchivePeerScore(remembered archiveRememberedPeer) float64 {
+	speed := remembered.bytesSec
+	if speed <= 0 {
+		speed = defaultArchivePeerSpeed
+	}
+	return speed / float64(remembered.attempts+1)
 }
 
 func (s *overlaySubscription) refreshEmptyArchivePeerPool(ctx context.Context, shard archive.ShardID) {

@@ -19,6 +19,69 @@ type archiveCheckpointResult struct {
 	err              error
 }
 
+type archiveDownloadBackpressureGate struct {
+	mu     sync.Mutex
+	done   chan struct{}
+	paused bool
+}
+
+func (g *archiveDownloadBackpressureGate) pause() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.paused {
+		return
+	}
+	g.paused = true
+	g.done = make(chan struct{})
+}
+
+func (g *archiveDownloadBackpressureGate) resume() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if !g.paused {
+		return
+	}
+	g.paused = false
+	close(g.done)
+	g.done = nil
+}
+
+func (g *archiveDownloadBackpressureGate) wait(ctx context.Context) error {
+	for {
+		g.mu.Lock()
+		if !g.paused {
+			g.mu.Unlock()
+			return nil
+		}
+		done := g.done
+		g.mu.Unlock()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (r *archiveCatchUpRunner) pauseArchiveDownloadsForCheckpointBackpressure() func() {
+	if r == nil {
+		return func() {}
+	}
+
+	r.downloadGate.pause()
+	return r.downloadGate.resume
+}
+
+func (r *archiveCatchUpRunner) waitArchiveDownloadBackpressure(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	return r.downloadGate.wait(ctx)
+}
+
 func (s *Service) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Duration) uint32 {
 	if current == 0 {
 		current = s.archiveCatchUpCheckpointBlocks

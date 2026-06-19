@@ -946,7 +946,7 @@ func (s *Service) loadBlockStateForApply(ctx context.Context, state storage.Bloc
 		// Block-only resolver probes may become historical replay dependencies.
 		// Reusing state metadata without its full block would leave future
 		// cell-generation migrations unable to replay the same transition.
-		if _, err = s.storage.BlockFull(ctx, state.Block); err != nil {
+		if err = s.storage.BlockFullAvailable(ctx, state.Block); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, storage.ErrNotFound
 			}

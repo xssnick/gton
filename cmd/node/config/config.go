@@ -89,14 +89,22 @@ type DHT struct {
 }
 
 type Lite struct {
-	Enabled                            bool   `json:"enabled"`
-	NonFinalEnabled                    bool   `json:"non_final_enabled"`
-	Key                                []byte `json:"key"`
-	ListenAddr                         string `json:"listen_addr"`
-	MasterBlockCache                   int    `json:"master_block_cache"`
-	ShardBlockCache                    int    `json:"shard_block_cache"`
-	SendMessageBroadcastBytesPerSecond int64  `json:"send_message_broadcast_bytes_per_second"`
-	SendMessageBroadcastMaxDelayMS     int64  `json:"send_message_broadcast_max_delay_ms"`
+	Enabled                            bool       `json:"enabled"`
+	NonFinalEnabled                    bool       `json:"non_final_enabled"`
+	Key                                []byte     `json:"key"`
+	ListenAddr                         string     `json:"listen_addr"`
+	MasterBlockCache                   int        `json:"master_block_cache"`
+	ShardBlockCache                    int        `json:"shard_block_cache"`
+	SendMessageBroadcastBytesPerSecond int64      `json:"send_message_broadcast_bytes_per_second"`
+	SendMessageBroadcastMaxDelayMS     int64      `json:"send_message_broadcast_max_delay_ms"`
+	Limits                             LiteLimits `json:"limits"`
+}
+
+type LiteLimits struct {
+	CapacityPerIP       int64   `json:"capacity_per_ip"`
+	CoolingPerSec       float64 `json:"cooling_per_sec"`
+	MaxConnectionsPerIP int64   `json:"max_connections_per_ip"`
+	MaxKeepAliveSeconds int64   `json:"max_keep_alive_seconds"`
 }
 
 type Storage struct {

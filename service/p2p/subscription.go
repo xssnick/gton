@@ -166,6 +166,14 @@ func (s *overlaySubscription) close() {
 
 type archivePeerPoolState struct {
 	cooldownUntil map[PeerID]time.Time
+	remembered    map[PeerID]archiveRememberedPeer
+}
+
+type archiveRememberedPeer struct {
+	lastSuccessAt time.Time
+	bytesSec      float64
+	attempts      int
+	failures      int
 }
 
 type chainDownloadState struct {

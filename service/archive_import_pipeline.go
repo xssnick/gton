@@ -8,6 +8,7 @@ import (
 
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -577,7 +578,7 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 		if queue != nil {
 			return queue.importArchive(loadCtx, masterchainSeqno, shard, splitDepth, priority)
 		}
-		downloaded, err := r.downloadArchiveFile(loadCtx, masterchainSeqno, shard)
+		downloaded, err := r.downloadArchiveFile(loadCtx, masterchainSeqno, shard, false)
 		if err != nil {
 			return nil, err
 		}
@@ -604,7 +605,11 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 	return downloaded, nil
 }
 
-func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID) (*archive.Downloaded, error) {
+func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, hedge bool) (*archive.Downloaded, error) {
+	if err := r.waitArchiveDownloadBackpressure(ctx); err != nil {
+		return nil, err
+	}
+
 	session := r.archiveSession
 	if session == nil {
 		if r.service == nil || r.service.node == nil {
@@ -614,7 +619,7 @@ func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterch
 		defer session.Close()
 	}
 
-	downloaded, err := session.DownloadArchive(ctx, masterchainSeqno, shard)
+	downloaded, err := session.DownloadArchive(ctx, masterchainSeqno, shard, p2p.ArchiveDownloadOptions{Hedge: hedge})
 	if err != nil {
 		return nil, fmt.Errorf("download archive #%d %s: %w", masterchainSeqno, shard.String(), err)
 	}

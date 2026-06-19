@@ -32,6 +32,10 @@ type ArchiveSession struct {
 	failures map[PeerID]int
 }
 
+type ArchiveDownloadOptions struct {
+	Hedge bool
+}
+
 func (n *Node) BeginArchiveSession() *ArchiveSession {
 	return &ArchiveSession{
 		node:     n,
@@ -63,7 +67,7 @@ func (a *ArchiveSession) Close() {
 	}
 }
 
-func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID) (*archive.Downloaded, error) {
+func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, options ArchiveDownloadOptions) (*archive.Downloaded, error) {
 	if a == nil || a.node == nil {
 		return nil, errors.New("archive session is not initialized")
 	}
@@ -75,7 +79,7 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 
 	var lastErr error
 	for round := 0; round < archiveSessionDownloadRounds; round++ {
-		downloaded, err := a.downloadArchiveRound(ctx, sub, masterchainSeqno, shard)
+		downloaded, err := a.downloadArchiveRound(ctx, sub, masterchainSeqno, shard, options)
 		if err == nil {
 			return downloaded, nil
 		}
@@ -111,7 +115,7 @@ func (a *ArchiveSession) RejectArchivePeer(shard archive.ShardID, peerAddr strin
 	return true
 }
 
-func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlaySubscription, masterchainSeqno uint32, shard archive.ShardID) (*archive.Downloaded, error) {
+func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlaySubscription, masterchainSeqno uint32, shard archive.ShardID, options ArchiveDownloadOptions) (*archive.Downloaded, error) {
 	var ensureElapsed time.Duration
 	var resolveElapsed time.Duration
 	logBootstrapTiming := func(peer string, err error) {
@@ -153,7 +157,7 @@ func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlayS
 	}
 	logBootstrapTiming(resolved.Peer, nil)
 
-	return sub.downloadArchiveFromResolved(ctx, a, resolved)
+	return sub.downloadArchiveFromResolved(ctx, a, resolved, options)
 }
 
 func (a *ArchiveSession) pinArchivePeer(peer *overlayPeer) {
@@ -294,10 +298,11 @@ func archivePinnedPeerTimeout(base time.Duration, max time.Duration, failures in
 }
 
 func (a *ArchiveSession) rejectArchivePeer(sub *overlaySubscription, shard archive.ShardID, peer *overlayPeer, reason string) {
-	if a != nil && reason != archivePeerRejectNotAvailable {
+	if a != nil {
 		a.unpinArchivePeer(peer)
 	}
 	if sub != nil {
+		sub.noteRememberedArchivePeerFailure(shard, peer)
 		sub.cooldownArchivePeer(shard, peer, reason)
 	}
 }

@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	runMethodSupportedMode    uint32 = 0x3f
-	runMethodMaxParamBytes           = 65536
-	runMethodGasLimit         int64  = 300000
-	runMethodConfigParamCount        = 6
+	runMethodSupportedMode              uint32 = 0x3f
+	runMethodMaxParamBytes                     = 65536
+	runMethodGasLimit                   int64  = 300000
+	runMethodConfigParamCount                  = 6
+	runMethodConfigParamSizeLimitsIndex        = 5
 )
 
 var runMethodConfigParamIDs = [runMethodConfigParamCount]uint32{
@@ -159,11 +160,11 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 
 	result.ExitCode = int32(execResult.ExitCode)
 
-	resultStack, err := vmStackToCell(execResult.Stack)
-	if err != nil {
-		return errorResponse(err, "cannot serialize resulting stack")
-	}
 	if query.Mode&4 != 0 {
+		resultStack, err := vmStackToCell(execResult.Stack)
+		if err != nil {
+			return errorResponse(err, "cannot serialize resulting stack")
+		}
 		result.Result = resultStack
 	}
 	if query.Mode&8 != 0 {

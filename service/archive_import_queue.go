@@ -179,7 +179,7 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 		}
 	}
 
-	downloaded, err := r.downloadArchiveFile(job.ctx, job.masterchainSeqno, job.shard)
+	downloaded, err := r.downloadArchiveFile(job.ctx, job.masterchainSeqno, job.shard, q.archiveDownloadsStarved())
 	if err != nil {
 		job.done <- archiveImportQueueResult{err: err}
 		return
@@ -231,6 +231,16 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 	archiveID := job.downloaded.ArchiveID
 	releaseDownloadedData()
 	job.done <- archiveImportQueueResult{imported: imported, peer: peer, archiveID: archiveID, err: err}
+}
+
+func (q *archiveImportQueue) archiveDownloadsStarved() bool {
+	if q == nil {
+		return false
+	}
+	if q.activePrepare.Load() > 0 || len(q.prepareHot) > 0 || len(q.preparePrefetch) > 0 {
+		return false
+	}
+	return q.downloadedBytes == nil || q.downloadedBytes.size() == 0
 }
 
 func nextArchivePriorityJob[T any](ctx context.Context, hot <-chan T, prefetch <-chan T, zero T) (T, bool) {

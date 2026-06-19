@@ -40,51 +40,6 @@ func TestEnsureStoredZeroStateMatchesGlobalConfig(t *testing.T) {
 	}
 }
 
-func TestStartupZeroStateRequired(t *testing.T) {
-	zero := testZeroStateBlock(0x11, 0x12)
-	initBlock := testZeroStateBlock(0x21, 0x22)
-	initBlock.SeqNo = 123
-
-	tests := []struct {
-		name              string
-		fromZero          bool
-		initBlock         ton.BlockIDExt
-		liteserverEnabled bool
-		want              bool
-	}{
-		{
-			name:      "from zero with normal init block",
-			fromZero:  true,
-			initBlock: initBlock,
-			want:      true,
-		},
-		{
-			name:      "zero init block",
-			initBlock: zero,
-			want:      true,
-		},
-		{
-			name:      "normal init block",
-			initBlock: initBlock,
-			want:      false,
-		},
-		{
-			name:              "liteserver enabled with normal init block",
-			initBlock:         initBlock,
-			liteserverEnabled: true,
-			want:              true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := startupZeroStateRequired(tt.fromZero, tt.initBlock, tt.liteserverEnabled); got != tt.want {
-				t.Fatalf("startupZeroStateRequired() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 type fakeZeroStateStore struct {
 	blocks []ton.BlockIDExt
 	err    error

@@ -24,8 +24,11 @@ func TestLoadBlockStateForApplyTreatsBlockOnlyStateWithoutFullBlockAsMiss(t *tes
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("load state error = %v, want ErrNotFound", err)
 	}
-	if store.blockFullCalls != 1 {
-		t.Fatalf("BlockFull calls = %d, want 1", store.blockFullCalls)
+	if store.blockFullAvailableCalls != 1 {
+		t.Fatalf("BlockFullAvailable calls = %d, want 1", store.blockFullAvailableCalls)
+	}
+	if store.blockFullCalls != 0 {
+		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
 }
 
@@ -46,8 +49,11 @@ func TestLoadBlockStateForApplyReusesBlockOnlyStateWithFullBlock(t *testing.T) {
 	if !got.Block.Equals(&block) {
 		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
 	}
-	if store.blockFullCalls != 1 {
-		t.Fatalf("BlockFull calls = %d, want 1", store.blockFullCalls)
+	if store.blockFullAvailableCalls != 1 {
+		t.Fatalf("BlockFullAvailable calls = %d, want 1", store.blockFullAvailableCalls)
+	}
+	if store.blockFullCalls != 0 {
+		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
 }
 
@@ -71,6 +77,9 @@ func TestLoadBlockStateForApplyAllowsCurrentBoundaryWithoutFullBlock(t *testing.
 	if !got.Block.Equals(&block) {
 		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
 	}
+	if store.blockFullAvailableCalls != 0 {
+		t.Fatalf("BlockFullAvailable calls = %d, want 0", store.blockFullAvailableCalls)
+	}
 	if store.blockFullCalls != 0 {
 		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
@@ -91,11 +100,12 @@ func testReplayBlockState(tb testing.TB, block ton.BlockIDExt) *storage.BlockSta
 type testReplayStateStore struct {
 	storage.Storage
 
-	state          *storage.BlockState
-	stateErr       error
-	blockFull      *storage.ServedBlockFull
-	blockFullErr   error
-	blockFullCalls int
+	state                   *storage.BlockState
+	stateErr                error
+	blockFull               *storage.ServedBlockFull
+	blockFullErr            error
+	blockFullCalls          int
+	blockFullAvailableCalls int
 }
 
 func (s *testReplayStateStore) BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error) {
@@ -117,4 +127,15 @@ func (s *testReplayStateStore) BlockFull(context.Context, ton.BlockIDExt) (*stor
 		return nil, storage.ErrNotFound
 	}
 	return s.blockFull.Clone(), nil
+}
+
+func (s *testReplayStateStore) BlockFullAvailable(context.Context, ton.BlockIDExt) error {
+	s.blockFullAvailableCalls++
+	if s.blockFullErr != nil {
+		return s.blockFullErr
+	}
+	if s.blockFull == nil {
+		return storage.ErrNotFound
+	}
+	return nil
 }

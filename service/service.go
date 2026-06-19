@@ -54,6 +54,7 @@ const (
 	nextMasterchainQueueMaxBytes           = 128 << 20
 	masterStateCacheLimit                  = 2048
 	syncedBlockProcessorWorkers            = 8
+	syncedBlockPriorityQueueLimit          = 64
 	statusTPSMasterWindow                  = 10
 )
 
@@ -853,16 +854,18 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 }
 
 func (s *Service) runBlockProcessor(ctx context.Context) {
+	priorityJobs := make(chan blocksync.SyncedBlock, syncedBlockPriorityQueueLimit)
 	jobs := make(chan blocksync.SyncedBlock, syncedBlockProcessorWorkers*2)
 	var wg sync.WaitGroup
 	for worker := 0; worker < syncedBlockProcessorWorkers; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.runBlockProcessorWorker(ctx, jobs)
+			s.runBlockProcessorWorker(ctx, priorityJobs, jobs)
 		}()
 	}
 	defer func() {
+		close(priorityJobs)
 		close(jobs)
 		wg.Wait()
 	}()
@@ -875,8 +878,13 @@ func (s *Service) runBlockProcessor(ctx context.Context) {
 			if !ok {
 				return
 			}
+			targetJobs := jobs
+			if synced.Priority {
+				targetJobs = priorityJobs
+			}
+
 			select {
-			case jobs <- synced:
+			case targetJobs <- synced:
 			case <-ctx.Done():
 				synced.Reject()
 				return
@@ -885,8 +893,13 @@ func (s *Service) runBlockProcessor(ctx context.Context) {
 	}
 }
 
-func (s *Service) runBlockProcessorWorker(ctx context.Context, jobs <-chan blocksync.SyncedBlock) {
-	for synced := range jobs {
+func (s *Service) runBlockProcessorWorker(ctx context.Context, priorityJobs, jobs <-chan blocksync.SyncedBlock) {
+	for {
+		synced, ok := nextSyncedBlockProcessorJob(ctx, priorityJobs, jobs)
+		if !ok {
+			return
+		}
+
 		if err := s.processSyncedBlock(ctx, synced); err != nil {
 			synced.Reject()
 			if errors.Is(err, errSyncedBlockDeferred) {
@@ -899,6 +912,38 @@ func (s *Service) runBlockProcessorWorker(ctx context.Context, jobs <-chan block
 		}
 		synced.Accept()
 	}
+}
+
+func nextSyncedBlockProcessorJob(ctx context.Context, priorityJobs, jobs <-chan blocksync.SyncedBlock) (blocksync.SyncedBlock, bool) {
+	select {
+	case synced, ok := <-priorityJobs:
+		if ok {
+			return synced, true
+		}
+		priorityJobs = nil
+	default:
+	}
+
+	for priorityJobs != nil || jobs != nil {
+		select {
+		case synced, ok := <-priorityJobs:
+			if !ok {
+				priorityJobs = nil
+				continue
+			}
+			return synced, true
+		case synced, ok := <-jobs:
+			if !ok {
+				jobs = nil
+				continue
+			}
+			return synced, true
+		case <-ctx.Done():
+			return blocksync.SyncedBlock{}, false
+		}
+	}
+
+	return blocksync.SyncedBlock{}, false
 }
 
 func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.SyncedBlock) (err error) {

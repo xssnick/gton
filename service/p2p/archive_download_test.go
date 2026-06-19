@@ -144,10 +144,82 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	}
 }
 
+func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         node,
+		spec:         overlaySpec{ShortID: []byte{1}},
+		archivePeers: map[string]*archivePeerPoolState{},
+	}
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	primaryPack := testArchivePackBytes("primary")
+	fastPack := testArchivePackBytes("fast")
+	slowPack := testArchivePackBytes("slow")
+	primary := testArchiveDownloadPeer(t, "primary", 100, primaryPack, 120*time.Millisecond)
+	fast := testArchiveDownloadPeer(t, "fast", 200, fastPack, 10*time.Millisecond)
+	slow := testArchiveDownloadPeer(t, "slow", 300, slowPack, 120*time.Millisecond)
+
+	downloaded, err := sub.downloadArchiveFromPeers(context.Background(), session, resolvedArchive{
+		MasterchainSeqno: 10,
+		Shard:            shard,
+		peer:             primary,
+	}, []*overlayPeer{primary, fast, slow}, map[PeerID]archiveCandidate{
+		primary.id: {
+			peer:      primary,
+			archiveID: 100,
+		},
+	}, ArchiveDownloadOptions{Hedge: true})
+	if err != nil {
+		t.Fatalf("hedged download archive: %v", err)
+	}
+	if downloaded.Peer != fast.addr {
+		t.Fatalf("hedged archive winner = %q, want %q", downloaded.Peer, fast.addr)
+	}
+	if string(downloaded.Data) != string(fastPack) {
+		t.Fatal("hedged archive returned data from the wrong peer")
+	}
+	if sub.archivePeerCoolingDown(shard, primary) {
+		t.Fatal("hedge-lost primary should not be cooled down")
+	}
+}
+
+func testArchiveDownloadPeer(t *testing.T, label string, archiveID int64, data []byte, delay time.Duration) *overlayPeer {
+	t.Helper()
+
+	peerOverlay, _ := newTestOverlayWrapper()
+	archiveRLDP := &testArchiveRLDP{
+		adnl:        newTestOverlayADNL(),
+		queryResult: ArchiveInfo{ID: archiveID},
+		asyncResult: data,
+		asyncDelay:  delay,
+	}
+	return &overlayPeer{
+		id:          testPeerID(label),
+		addr:        label,
+		overlay:     peerOverlay,
+		rldpOverlay: overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1}),
+		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:       true,
+	}
+}
+
+func testArchivePackBytes(label string) []byte {
+	data := make([]byte, packfile.HeaderSize+len(label))
+	binary.LittleEndian.PutUint32(data, packfile.PackageMagic)
+	copy(data[packfile.HeaderSize:], label)
+	return data
+}
+
 type testArchiveRLDP struct {
 	adnl        *testOverlayADNL
 	queryResult tl.Serializable
 	asyncErr    error
+	asyncResult []byte
+	asyncDelay  time.Duration
 }
 
 func (r *testArchiveRLDP) GetADNL() rldp.ADNL {
@@ -167,7 +239,26 @@ func (r *testArchiveRLDP) DoQuery(_ context.Context, _ uint64, _ tl.Serializable
 	return nil
 }
 
-func (r *testArchiveRLDP) DoQueryAsync(_ context.Context, _ uint64, _ []byte, _ tl.Serializable, _ chan<- rldp.AsyncQueryResult) error {
+func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, _ uint64, _ []byte, _ tl.Serializable, result chan<- rldp.AsyncQueryResult) error {
+	if r.asyncErr == nil {
+		data := append([]byte(nil), r.asyncResult...)
+		go func() {
+			if r.asyncDelay > 0 {
+				timer := time.NewTimer(r.asyncDelay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return
+				}
+			}
+			select {
+			case result <- rldp.AsyncQueryResult{ResultBytes: data}:
+			case <-ctx.Done():
+			}
+		}()
+		return nil
+	}
 	return r.asyncErr
 }
 

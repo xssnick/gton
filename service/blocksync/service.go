@@ -34,6 +34,7 @@ type SyncedBlock struct {
 	Trigger         p2p.BroadcastEvent
 	Downloaded      p2p.DownloadedBlock
 	CatchUp         bool
+	Priority        bool
 	DownloadElapsed time.Duration
 	ack             chan bool
 }
@@ -203,6 +204,7 @@ func (s *Service) emitDirectMasterchainBroadcast(ctx context.Context, ev p2p.Bro
 		Trigger:    ev,
 		Downloaded: downloaded,
 		CatchUp:    false,
+		Priority:   true,
 	})
 	return true
 }

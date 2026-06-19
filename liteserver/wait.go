@@ -192,6 +192,9 @@ func (s *Server) waitMasterchainSeqno(ctx context.Context, query ton.WaitMasterc
 
 	seqno := uint32(query.Seqno)
 	timeout := time.Duration(query.Timeout) * time.Millisecond
+	if s.requestLimits.MaxKeepAlive > 0 && timeout > s.requestLimits.MaxKeepAlive {
+		timeout = s.requestLimits.MaxKeepAlive
+	}
 	return waitMasterchainError(s.store.WaitMasterchainSeqno(ctx, seqno, timeout))
 }
 

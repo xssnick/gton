@@ -77,6 +77,32 @@ func TestRejectArchivePeerUnpinsSessionPeer(t *testing.T) {
 	}
 }
 
+func TestRejectArchiveNotAvailableUnpinsSessionPeer(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	peer := &overlayPeer{id: testPeerID("peer"), addr: "peer"}
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         node,
+		archivePeers: map[string]*archivePeerPoolState{},
+	}
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	session.noteArchivePeerSuccess(peer)
+	if _, ok := node.archiveSessionPinnedPeerIDs()[peer.id]; !ok {
+		t.Fatal("expected pinned archive peer")
+	}
+
+	session.rejectArchivePeer(sub, shard, peer, archivePeerRejectNotAvailable)
+	if _, ok := node.archiveSessionPinnedPeerIDs()[peer.id]; ok {
+		t.Fatal("archive not available reject should unpin archive peer")
+	}
+	if !sub.archivePeerCoolingDown(shard, peer) {
+		t.Fatal("archive not available peer was not cooled down")
+	}
+}
+
 func TestArchiveSessionCloseReleasesPinnedPeers(t *testing.T) {
 	peer := &overlayPeer{id: testPeerID("peer"), addr: "peer"}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
@@ -242,6 +268,148 @@ func TestArchiveQueryCandidatesDoNotUseKnownPeersWithoutNeighbours(t *testing.T)
 	got := sub.archiveQueryCandidates()
 	if len(got) != 0 {
 		t.Fatalf("archive candidates should use only neighbours, got %d known peers", len(got))
+	}
+}
+
+func TestRememberedArchivePeersFallbackUsesKnownPeerWithoutNeighbours(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	peer := testArchiveCandidate("remembered")
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         &Node{},
+		archivePeers: map[string]*archivePeerPoolState{},
+		peers: map[PeerID]*overlayPeer{
+			peer.id: peer,
+		},
+	}
+
+	sub.rememberArchivePeer(shard, peer, int64(4<<20), time.Second)
+	got, fallback := sub.availableArchivePeersWithFallback(shard)
+	if !fallback {
+		t.Fatal("expected remembered archive fallback")
+	}
+	if len(got) != 1 || got[0] != peer {
+		t.Fatalf("unexpected remembered archive peers: %#v", got)
+	}
+}
+
+func TestRememberedArchivePeersFallbackPrioritizesSpeedWithAttemptFairness(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	fast := testArchiveCandidate("fast")
+	slow := testArchiveCandidate("slow")
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         &Node{},
+		archivePeers: map[string]*archivePeerPoolState{},
+		peers: map[PeerID]*overlayPeer{
+			fast.id: fast,
+			slow.id: slow,
+		},
+	}
+
+	sub.rememberArchivePeer(shard, slow, int64(1<<20), time.Second)
+	sub.rememberArchivePeer(shard, fast, int64(4<<20), time.Second)
+
+	got, fallback := sub.availableArchivePeersWithFallback(shard)
+	if !fallback {
+		t.Fatal("expected remembered archive fallback")
+	}
+	if len(got) != 2 || got[0] != fast {
+		t.Fatalf("fast remembered peer should be first initially: %#v", got)
+	}
+
+	for i := 0; i < 4; i++ {
+		sub.noteRememberedArchivePeerAttempt(shard, fast)
+	}
+
+	got, fallback = sub.availableArchivePeersWithFallback(shard)
+	if !fallback {
+		t.Fatal("expected remembered archive fallback after attempts")
+	}
+	if len(got) != 2 || got[0] != slow {
+		t.Fatalf("attempt fairness should give slower peer a retry slot: %#v", got)
+	}
+}
+
+func TestRememberedArchivePeersFallbackRespectsArchiveCooldown(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	peer := testArchiveCandidate("remembered")
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         &Node{},
+		archivePeers: map[string]*archivePeerPoolState{},
+		peers: map[PeerID]*overlayPeer{
+			peer.id: peer,
+		},
+	}
+
+	sub.rememberArchivePeer(shard, peer, int64(4<<20), time.Second)
+	sub.cooldownArchivePeer(shard, peer, "test")
+
+	got, fallback := sub.availableArchivePeersWithFallback(shard)
+	if fallback {
+		t.Fatal("cooling down peer should not be used as remembered fallback")
+	}
+	if len(got) != 0 {
+		t.Fatalf("cooling down remembered peer should not be available: %#v", got)
+	}
+
+	state := sub.archivePeers[archivePeerPoolKey(shard)]
+	state.cooldownUntil[archivePeerID(peer)] = time.Now().Add(-time.Second)
+
+	got, fallback = sub.availableArchivePeersWithFallback(shard)
+	if !fallback {
+		t.Fatal("expected remembered archive fallback after cooldown")
+	}
+	if len(got) != 1 || got[0] != peer {
+		t.Fatalf("unexpected remembered archive peers after cooldown: %#v", got)
+	}
+}
+
+func TestRememberedArchivePeersFallbackDropsAfterConsecutiveFailures(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	peer := testArchiveCandidate("remembered")
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         &Node{},
+		archivePeers: map[string]*archivePeerPoolState{},
+		peers: map[PeerID]*overlayPeer{
+			peer.id: peer,
+		},
+	}
+
+	sub.rememberArchivePeer(shard, peer, int64(4<<20), time.Second)
+	for i := 0; i < archiveRememberedPeerMaxFailures; i++ {
+		sub.noteRememberedArchivePeerFailure(shard, peer)
+	}
+
+	if state := sub.archivePeers[archivePeerPoolKey(shard)]; state != nil && len(state.remembered) != 0 {
+		t.Fatalf("remembered peer survived consecutive failures: %#v", state.remembered)
+	}
+}
+
+func TestRememberArchivePeerResetsConsecutiveFailures(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	peer := testArchiveCandidate("remembered")
+	sub := &overlaySubscription{
+		log:          discardLogger(),
+		node:         &Node{},
+		archivePeers: map[string]*archivePeerPoolState{},
+		peers: map[PeerID]*overlayPeer{
+			peer.id: peer,
+		},
+	}
+
+	sub.rememberArchivePeer(shard, peer, int64(4<<20), time.Second)
+	sub.noteRememberedArchivePeerFailure(shard, peer)
+	sub.rememberArchivePeer(shard, peer, int64(4<<20), time.Second)
+
+	got, fallback := sub.availableArchivePeersWithFallback(shard)
+	if !fallback {
+		t.Fatal("expected remembered archive fallback after success reset")
+	}
+	if len(got) != 1 || got[0] != peer {
+		t.Fatalf("unexpected remembered archive peers after success reset: %#v", got)
 	}
 }
 

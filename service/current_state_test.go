@@ -1159,12 +1159,6 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	if baseLive.stagedPeerLimit() != nextBlockBootstrapWidePeers {
 		t.Fatalf("live staged probe peers = %d, want %d", baseLive.stagedPeerLimit(), nextBlockBootstrapWidePeers)
 	}
-	if !(nextBlockBootstrapProbeDecision{liveTail: true, rawBroadcastAhead: true}).shouldPreferBroadcastCandidate() {
-		t.Fatal("live raw masterchain broadcast should prefer broadcast candidate")
-	}
-	if (nextBlockBootstrapProbeDecision{rawBroadcastAhead: true}).shouldPreferBroadcastCandidate() {
-		t.Fatal("cold raw masterchain broadcast should not delay peer probe")
-	}
 
 	oldUTime := time.Now().Add(-time.Duration(nextBlockBootstrapWideLagSeconds+1) * time.Second).Unix()
 	lagged, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{liveTail: true})
@@ -1302,30 +1296,162 @@ func TestCurrentStateWakeInterruptsShardStateCatchUpRetry(t *testing.T) {
 	}
 }
 
-func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
+func TestNextMasterchainApplyCandidateUsesBroadcastWhilePeerProbePrepares(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
 	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	result := make(chan nextBlockProbeResult, 1)
 
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
-		svc.wakeCurrentStateSync()
-	}()
-
+	queryCtx, cancelQuery := context.WithCancel(context.Background())
+	defer cancelQuery()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	cached, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
+	got := make(chan nextMasterchainApplyCandidateTestResult, 1)
+	go func() {
+		block, source, prepareElapsed, err := svc.waitNextMasterchainApplyCandidate(
+			ctx,
+			queryCtx,
+			prev,
+			masterchainSeqnoTarget(^uint32(0)),
+			nil,
+			nil,
+			result,
+			cancelQuery,
+		)
+		got <- nextMasterchainApplyCandidateTestResult{
+			block:          block,
+			source:         source,
+			prepareElapsed: prepareElapsed,
+			err:            err,
+		}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
+	svc.wakeCurrentStateSync()
+
+	select {
+	case res := <-got:
+		if res.err != nil {
+			t.Fatalf("wait next masterchain apply candidate: %v", res.err)
+		}
+		if !res.block.ID.Equals(&next) {
+			t.Fatalf("candidate block = %s, want %s", tnstore.FormatBlockRef(res.block.ID), tnstore.FormatBlockRef(next))
+		}
+		if res.source != "broadcast_queue" {
+			t.Fatalf("candidate source = %q, want broadcast_queue", res.source)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for broadcast candidate")
+	}
+}
+
+func TestNextMasterchainApplyCandidateReturnsPreparedPeerResult(t *testing.T) {
+	prev := testMasterBlockID(10)
+	next := testMasterBlockID(11)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	result := make(chan nextBlockProbeResult, 1)
+	prepared := testPreparedMasterchainBlock(prev, next)
+	prepared.PrepareElapsed = 7 * time.Millisecond
+	result <- nextBlockProbeResult{
+		block:          prepared,
+		source:         "peer_probe",
+		prepareElapsed: prepared.PrepareElapsed,
+	}
+
+	queryCtx, cancelQuery := context.WithCancel(context.Background())
+	defer cancelQuery()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	block, source, prepareElapsed, err := svc.waitNextMasterchainApplyCandidate(
+		ctx,
+		queryCtx,
+		prev,
+		masterchainSeqnoTarget(^uint32(0)),
+		nil,
+		nil,
+		result,
+		cancelQuery,
+	)
 	if err != nil {
-		t.Fatalf("wait preferred masterchain broadcast: %v", err)
+		t.Fatalf("wait next masterchain apply candidate: %v", err)
 	}
-	if !cached.block.ID.Equals(&next) {
-		t.Fatalf("preferred block = %s, want %s", tnstore.FormatBlockRef(cached.block.ID), tnstore.FormatBlockRef(next))
+	if !block.ID.Equals(&next) {
+		t.Fatalf("candidate block = %s, want %s", tnstore.FormatBlockRef(block.ID), tnstore.FormatBlockRef(next))
 	}
-	if cached.source != "broadcast_queue" {
-		t.Fatalf("preferred source = %q, want broadcast_queue", cached.source)
+	if source != "peer_probe" {
+		t.Fatalf("candidate source = %q, want peer_probe", source)
 	}
+	if prepareElapsed != prepared.PrepareElapsed {
+		t.Fatalf("prepare elapsed = %s, want %s", prepareElapsed, prepared.PrepareElapsed)
+	}
+}
+
+func TestNextMasterchainApplyCandidateDoesNotTimeoutAfterProbeReturned(t *testing.T) {
+	prev := testMasterBlockID(10)
+	next := testMasterBlockID(11)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	result := make(chan nextBlockProbeResult, 1)
+	probeReturned := make(chan struct{})
+	close(probeReturned)
+
+	queryCtx, cancelQuery := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelQuery()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	got := make(chan nextMasterchainApplyCandidateTestResult, 1)
+	go func() {
+		block, source, prepareElapsed, err := svc.waitNextMasterchainApplyCandidate(
+			ctx,
+			queryCtx,
+			prev,
+			masterchainSeqnoTarget(^uint32(0)),
+			nil,
+			probeReturned,
+			result,
+			cancelQuery,
+		)
+		got <- nextMasterchainApplyCandidateTestResult{
+			block:          block,
+			source:         source,
+			prepareElapsed: prepareElapsed,
+			err:            err,
+		}
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	prepared := testPreparedMasterchainBlock(prev, next)
+	prepared.PrepareElapsed = 5 * time.Millisecond
+	result <- nextBlockProbeResult{
+		block:          prepared,
+		source:         "peer_probe",
+		prepareElapsed: prepared.PrepareElapsed,
+	}
+
+	select {
+	case res := <-got:
+		if res.err != nil {
+			t.Fatalf("wait next masterchain apply candidate: %v", res.err)
+		}
+		if !res.block.ID.Equals(&next) {
+			t.Fatalf("candidate block = %s, want %s", tnstore.FormatBlockRef(res.block.ID), tnstore.FormatBlockRef(next))
+		}
+		if res.source != "peer_probe" {
+			t.Fatalf("candidate source = %q, want peer_probe", res.source)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for prepared peer candidate")
+	}
+}
+
+type nextMasterchainApplyCandidateTestResult struct {
+	block          PreparedBlock
+	source         string
+	prepareElapsed time.Duration
+	err            error
 }
 
 func testPreparedMasterchainBlock(prev ton.BlockIDExt, block ton.BlockIDExt) PreparedBlock {

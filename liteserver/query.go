@@ -18,17 +18,20 @@ import (
 )
 
 const (
-	errCodeUnspecified    int32 = 0
-	errCodeProtoViolation int32 = -400
-	errCodeTonProtoError  int32 = 621
-	errCodeNotReady       int32 = 651
-	errCodeInternal       int32 = -400
+	errCodeUnspecified     int32 = 0
+	errCodeProtoViolation  int32 = -400
+	errCodeTonProtoError   int32 = 621
+	errCodeNotReady        int32 = 651
+	errCodeInternal        int32 = -400
+	errCodeTooManyRequests int32 = 429
 
 	masterchainID    int32 = -1
 	masterchainShard int64 = -1 << 63
 	workchainInvalid int32 = -1 << 31
 
 	getMasterchainInfoExtShardClientState uint32 = 1
+
+	queryErrorReasonRateLimited = "rate_limited"
 )
 
 var errInvalidLookupBlock = errors.New("invalid lookupBlock request")

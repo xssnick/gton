@@ -32,13 +32,15 @@ type liveBlockFragments struct {
 	accountsRoot        *cell.Cell
 	shardHeader         runMethodShardHeader
 
-	masterExtra       *tlb.McStateExtra
-	accountProofs     map[accountProofKey]accountProofValue
-	shardHashesProofs map[shardHashesProofKey]*cell.Cell
-	baseConfig        *runMethodBaseConfig
-	globalLibs        *cell.Dictionary
-	librariesLoaded   bool
-	lazyLoad          liveLoadGroup[liveBlockFragmentLoadKey]
+	masterExtra        *tlb.McStateExtra
+	accountProofs      map[accountProofKey]accountProofValue
+	shardHashesProofs  map[shardHashesProofKey]*cell.Cell
+	baseConfig         *runMethodBaseConfig
+	globalLibs         *cell.Dictionary
+	librariesLoaded    bool
+	extMsgLimits       externalMessageSizeLimits
+	extMsgLimitsLoaded bool
+	lazyLoad           liveLoadGroup[liveBlockFragmentLoadKey]
 }
 
 type accountProofKey struct {
@@ -46,7 +48,11 @@ type accountProofKey struct {
 }
 
 type accountProofValue struct {
-	proof []*cell.Cell
+	proof             []*cell.Cell
+	fullState         *cell.Cell
+	fullStateLoaded   bool
+	prunedState       *cell.Cell
+	prunedStateLoaded bool
 }
 
 type accountProofResult struct {
@@ -68,6 +74,7 @@ const (
 	liveBlockFragmentLoadShardHashes
 	liveBlockFragmentLoadBaseConfig
 	liveBlockFragmentLoadGlobalLibraries
+	liveBlockFragmentLoadExternalMessageLimits
 )
 
 type liveBlockFragmentLoadKey struct {
@@ -130,67 +137,147 @@ func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cel
 	if len(accountID) == len(key.accountID) {
 		copy(key.accountID[:], accountID)
 
-		f.mu.Lock()
-		if cached, ok := f.accountProofs[key]; ok {
-			f.mu.Unlock()
-			state, err := f.accountProofState(accountID, pruned)
-			if err != nil {
-				return nil, nil, err
-			}
-			return cached.proof, state, nil
-		}
-		f.mu.Unlock()
-
-		loadKey := liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadAccountProof, account: key, pruned: pruned}
-		value, err := f.lazyLoad.do(context.Background(), loadKey, func() (any, error) {
-			f.mu.Lock()
-			if cached, ok := f.accountProofs[key]; ok {
-				f.mu.Unlock()
-				state, err := f.accountProofState(accountID, pruned)
-				if err != nil {
-					return accountProofResult{}, err
-				}
-				return accountProofResult{proof: cached.proof, state: state}, nil
-			}
-			f.mu.Unlock()
-
-			proof, state, err := f.buildAccountProof(accountID, pruned)
-			if err != nil {
-				return accountProofResult{}, err
-			}
-
-			cached := accountProofValue{proof: proof}
-
-			f.mu.Lock()
-			if f.accountProofs == nil {
-				f.accountProofs = map[accountProofKey]accountProofValue{}
-			}
-			if existing, ok := f.accountProofs[key]; ok {
-				cached = existing
-			} else {
-				if len(f.accountProofs) >= liveAccountProofCacheLimit {
-					for evict := range f.accountProofs {
-						delete(f.accountProofs, evict)
-						break
-					}
-				}
-				f.accountProofs[key] = cached
-			}
-			f.mu.Unlock()
-
-			return accountProofResult{proof: cached.proof, state: state}, nil
-		})
+		proof, state, err := f.accountFullProof(accountID, key)
 		if err != nil {
 			return nil, nil, err
 		}
-		result, ok := value.(accountProofResult)
-		if !ok {
-			return nil, nil, errors.New("invalid account proof cache value")
+		if pruned {
+			state, err = f.accountPrunedState(key, proof, state)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
-		return result.proof, result.state, nil
+		return proof, state, nil
 	}
 
 	return f.buildAccountProof(accountID, pruned)
+}
+
+func (f *liveBlockFragments) accountFullProof(accountID []byte, key accountProofKey) ([]*cell.Cell, *cell.Cell, error) {
+	f.mu.Lock()
+	if result, ok := f.cachedAccountProofResultLocked(key, false); ok {
+		f.mu.Unlock()
+		return result.proof, result.state, nil
+	}
+	f.mu.Unlock()
+
+	loadKey := liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadAccountProof, account: key}
+	value, err := f.lazyLoad.do(context.Background(), loadKey, func() (any, error) {
+		f.mu.Lock()
+		if result, ok := f.cachedAccountProofResultLocked(key, false); ok {
+			f.mu.Unlock()
+			return result, nil
+		}
+		f.mu.Unlock()
+
+		proof, state, err := f.buildAccountProof(accountID, false)
+		if err != nil {
+			return accountProofResult{}, err
+		}
+
+		result := f.rememberAccountProofState(key, proof, state, false)
+		return result, nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	result, ok := value.(accountProofResult)
+	if !ok {
+		return nil, nil, errors.New("invalid account proof cache value")
+	}
+	return result.proof, result.state, nil
+}
+
+func (f *liveBlockFragments) accountPrunedState(key accountProofKey, proof []*cell.Cell, fullState *cell.Cell) (*cell.Cell, error) {
+	f.mu.Lock()
+	if result, ok := f.cachedAccountProofResultLocked(key, true); ok {
+		f.mu.Unlock()
+		return result.state, nil
+	}
+	f.mu.Unlock()
+
+	loadKey := liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadAccountProof, account: key, pruned: true}
+	value, err := f.lazyLoad.do(context.Background(), loadKey, func() (any, error) {
+		f.mu.Lock()
+		if result, ok := f.cachedAccountProofResultLocked(key, true); ok {
+			f.mu.Unlock()
+			return result, nil
+		}
+		f.mu.Unlock()
+
+		var prunedState *cell.Cell
+		if fullState != nil {
+			var err error
+			prunedState, err = accountPrunedProof(fullState)
+			if err != nil {
+				return accountProofResult{}, err
+			}
+		}
+
+		return f.rememberAccountProofState(key, proof, prunedState, true), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result, ok := value.(accountProofResult)
+	if !ok {
+		return nil, errors.New("invalid pruned account proof cache value")
+	}
+	return result.state, nil
+}
+
+func (f *liveBlockFragments) cachedAccountProofResultLocked(key accountProofKey, pruned bool) (accountProofResult, bool) {
+	cached, ok := f.accountProofs[key]
+	if !ok || cached.proof == nil {
+		return accountProofResult{}, false
+	}
+	if pruned {
+		if !cached.prunedStateLoaded {
+			return accountProofResult{}, false
+		}
+		return accountProofResult{proof: cached.proof, state: cached.prunedState}, true
+	}
+	if !cached.fullStateLoaded {
+		return accountProofResult{}, false
+	}
+	return accountProofResult{proof: cached.proof, state: cached.fullState}, true
+}
+
+func (f *liveBlockFragments) rememberAccountProofState(key accountProofKey, proof []*cell.Cell, state *cell.Cell, pruned bool) accountProofResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.accountProofs == nil {
+		f.accountProofs = map[accountProofKey]accountProofValue{}
+	}
+	cached, ok := f.accountProofs[key]
+	if !ok {
+		if len(f.accountProofs) >= liveAccountProofCacheLimit {
+			for evict := range f.accountProofs {
+				delete(f.accountProofs, evict)
+				break
+			}
+		}
+	}
+	if cached.proof == nil {
+		cached.proof = proof
+	}
+	if pruned {
+		if !cached.prunedStateLoaded {
+			cached.prunedState = state
+			cached.prunedStateLoaded = true
+		}
+		state = cached.prunedState
+	} else {
+		if !cached.fullStateLoaded {
+			cached.fullState = state
+			cached.fullStateLoaded = true
+		}
+		state = cached.fullState
+	}
+	f.accountProofs[key] = cached
+
+	return accountProofResult{proof: cached.proof, state: state}
 }
 
 func (f *liveBlockFragments) buildAccountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
@@ -208,20 +295,6 @@ func (f *liveBlockFragments) buildAccountProof(accountID []byte, pruned bool) ([
 	}
 
 	return []*cell.Cell{f.blockStateRootProof, stateProof}, state, nil
-}
-
-func (f *liveBlockFragments) accountProofState(accountID []byte, pruned bool) (*cell.Cell, error) {
-	state, err := f.accountCell(accountID)
-	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if state != nil && pruned {
-		return accountPrunedProof(state)
-	}
-	return state, nil
 }
 
 func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {

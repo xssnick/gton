@@ -1082,6 +1082,9 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	if !meta.Has(storage.BlockMetaHasServedFull) {
 		t.Fatalf("checkpoint block meta flags = %v, want served full", meta.Flags)
 	}
+	if err = store.BlockFullAvailable(ctx, block); err != nil {
+		t.Fatalf("checkpoint block full availability: %v", err)
+	}
 
 	decodedNext, err := readNextBlockLink(ctx, store, prev)
 	if err != nil {
@@ -1097,6 +1100,56 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	}
 	if !next.ID.Equals(&block) {
 		t.Fatalf("checkpoint next block = %s, want %s", storage.FormatBlockRef(next.ID), storage.FormatBlockRef(block))
+	}
+}
+
+func TestSaveStateCheckpointDoesNotMarkPartialArtifactAsServedFull(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     12,
+	}
+	state := blockStateWithSingleCell(block, 0x23)
+	current := &storage.CurrentState{
+		SyncedAt:    time.Now(),
+		Masterchain: storage.BlockStateWithoutCells(state),
+		Shards:      map[storage.ShardKey]storage.BlockState{},
+	}
+
+	_, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		State: state,
+		Artifact: &storage.ServedBlockFull{
+			ID:    state.Block,
+			Block: []byte{0x30, 0x31},
+			Meta:  &storage.BlockMeta{ID: state.Block, GenUTime: 123},
+		},
+	}}, storage.StateCellRecords{}, current)
+	if err != nil {
+		t.Fatalf("save checkpoint with partial artifact: %v", err)
+	}
+
+	meta, err := store.BlockMeta(ctx, state.Block)
+	if err != nil {
+		t.Fatalf("load checkpoint block meta: %v", err)
+	}
+	if meta.Has(storage.BlockMetaHasServedFull) {
+		t.Fatalf("partial checkpoint artifact was marked served full: flags=%v", meta.Flags)
+	}
+	if !meta.Has(storage.BlockMetaHasBlockData) {
+		t.Fatalf("partial checkpoint artifact did not mark block data: flags=%v", meta.Flags)
+	}
+	if _, err = store.BlockFull(ctx, state.Block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("partial checkpoint block full error = %v, want ErrNotFound", err)
+	}
+	if err = store.BlockFullAvailable(ctx, state.Block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("partial checkpoint block full availability error = %v, want ErrNotFound", err)
 	}
 }
 

@@ -194,6 +194,9 @@ func TestServiceEmitsDecodedMasterchainBroadcastsWithoutCoalescing(t *testing.T)
 	if !got[0].Downloaded.ID.Equals(&block12) || !got[1].Downloaded.ID.Equals(&block10) {
 		t.Fatalf("unexpected direct broadcast order: %+v", got)
 	}
+	if !got[0].Priority || !got[1].Priority {
+		t.Fatalf("expected direct masterchain broadcasts to be priority: %+v", got)
+	}
 	if len(node.exactCalls) != 0 || len(node.nextCalls) != 0 {
 		t.Fatalf("expected direct broadcasts to avoid downloads, exact=%d next=%d", len(node.exactCalls), len(node.nextCalls))
 	}

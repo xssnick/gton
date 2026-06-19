@@ -111,6 +111,10 @@ func TestLoadDefaults(t *testing.T) {
 	if capacity.MaxDelay != DefaultLiteSendMessageBroadcastMaxDelay {
 		t.Fatalf("unexpected default liteserver send message broadcast max delay %s", capacity.MaxDelay)
 	}
+	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
+		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
+		t.Fatalf("unexpected default liteserver limits: %+v", cfg.Lite.Limits)
+	}
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
 		t.Fatalf("cell total cache size: %v", err)
@@ -249,6 +253,28 @@ func TestLoadLiteSendMessageBroadcastCapacityRejectsNegative(t *testing.T) {
 				t.Fatal("expected negative capacity config to fail")
 			}
 		})
+	}
+}
+
+func TestLoadLiteLimits(t *testing.T) {
+	path := writeTestConfig(t, `{"liteserver":{"limits":{"capacity_per_ip":100,"cooling_per_sec":20,"max_connections_per_ip":50,"max_keep_alive_seconds":60}}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.Lite.Limits.CapacityPerIP != 100 {
+		t.Fatalf("unexpected capacity per IP %d", cfg.Lite.Limits.CapacityPerIP)
+	}
+	if cfg.Lite.Limits.CoolingPerSec != 20 {
+		t.Fatalf("unexpected cooling per second %f", cfg.Lite.Limits.CoolingPerSec)
+	}
+	if cfg.Lite.Limits.MaxConnectionsPerIP != 50 {
+		t.Fatalf("unexpected max connections per IP %d", cfg.Lite.Limits.MaxConnectionsPerIP)
+	}
+	if cfg.Lite.Limits.MaxKeepAliveSeconds != 60 {
+		t.Fatalf("unexpected max keep alive seconds %d", cfg.Lite.Limits.MaxKeepAliveSeconds)
 	}
 }
 
@@ -521,6 +547,10 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Lite.SendMessageBroadcastMaxDelayMS != int64(DefaultLiteSendMessageBroadcastMaxDelay/time.Millisecond) {
 		t.Fatalf("unexpected liteserver send message broadcast max delay %d", cfg.Lite.SendMessageBroadcastMaxDelayMS)
 	}
+	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
+		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
+		t.Fatalf("unexpected generated liteserver limits: %+v", cfg.Lite.Limits)
+	}
 	wantStorageDir, err := filepath.Abs(defaultStorageDir)
 	if err != nil {
 		t.Fatalf("resolve storage dir: %v", err)
@@ -609,6 +639,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"send_message_broadcast_max_delay_ms"`)) {
 		t.Fatal("generated config should use send_message_broadcast_max_delay_ms key")
+	}
+	if !bytes.Contains(data, []byte(`"limits"`)) {
+		t.Fatal("generated config should use liteserver limits key")
 	}
 	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
 		t.Fatal("generated config should use an empty custom_overlays list")

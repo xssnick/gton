@@ -17,6 +17,7 @@ type Storage interface {
 	MaintenanceStorage
 	PersistentStateSerializationStorage
 	CellGenerationStorage
+	BlockFullAvailable(ctx context.Context, block ton.BlockIDExt) error
 	Close() error
 }
 

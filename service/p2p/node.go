@@ -144,7 +144,6 @@ type Node struct {
 	peerUse                   map[PeerID]peerUse
 	stateCellImportSlot       chan struct{}
 	stateSplitPartDecodeSlot  chan struct{}
-	zeroStateBootstrapMu      sync.Mutex
 	customOverlays            []CustomOverlayConfig
 }
 
@@ -850,64 +849,6 @@ func emptyConfigBlock(block liteclient.ConfigBlock) bool {
 		block.SeqNo == 0 &&
 		len(block.RootHash) == 0 &&
 		len(block.FileHash) == 0
-}
-
-func (n *Node) EnsureZeroState(ctx context.Context) error {
-	block, ok := n.configuredZeroStateBlock()
-	if !ok {
-		return storage2.ErrNotFound
-	}
-
-	writer, _ := n.peerStorage.(storage2.PeerServingStorageWriter)
-	if writer == nil {
-		return storage2.ErrNotFound
-	}
-
-	n.zeroStateBootstrapMu.Lock()
-	defer n.zeroStateBootstrapMu.Unlock()
-
-	return n.ensureZeroState(ctx, block, writer)
-}
-
-func (n *Node) ensureZeroState(ctx context.Context, block ton.BlockIDExt, writer storage2.PeerServingStorageWriter) error {
-	if data, err := n.peerStorage.ZeroState(ctx, block); err == nil && len(data) > 0 {
-		return nil
-	} else if err != nil && !errors.Is(err, storage2.ErrNotFound) {
-		return err
-	}
-
-	n.log.Info().
-		Str("block", formatBlockRef(block)).
-		Msg("zero state is missing, downloading zero state")
-
-	artifact, err := n.DownloadState(ctx, block, block, 0, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cleanupErr := artifact.Cleanup(); cleanupErr != nil {
-			n.log.Debug().
-				Err(cleanupErr).
-				Str("block", formatBlockRef(block)).
-				Msg("failed to cleanup zero state artifact")
-		}
-	}()
-
-	zero, ok := artifact.(*zeroStateSnapshotArtifact)
-	if !ok {
-		return fmt.Errorf("unexpected zero state artifact %T", artifact)
-	}
-	zero.writer = writer
-
-	if _, err = artifact.Decode(ctx); err != nil {
-		return fmt.Errorf("verify zero state: %w", err)
-	}
-
-	logEvent := n.log.Info().
-		Str("block", formatBlockRef(block)).
-		Int("bytes", len(zero.data))
-	logEvent.Msg("zero state downloaded and stored")
-	return nil
 }
 
 func (n *Node) startDHT(ctx context.Context, cfg *liteclient.GlobalConfig) error {

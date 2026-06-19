@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -33,9 +32,6 @@ import (
 const (
 	maxNodeBOCCells = 4_000_000_000
 	topShard        = int64(-1 << 63)
-
-	startupZeroStateRetry          = 5 * time.Second
-	startupZeroStateAttemptTimeout = 45 * time.Second
 )
 
 var GitCommit = "unknown"
@@ -472,6 +468,7 @@ func main() {
 			NonFinal:            liteOpts.NonFinalEnabled,
 			SendMessageTVMTrace: *liteSendMessageTVMTraceFlag,
 			ZeroState:           zeroStateIDFromBlock(globalConfigZeroState),
+			RequestLimits:       liteOpts.Limits,
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to initialize liteserver")
@@ -482,25 +479,6 @@ func main() {
 	if err = node.Start(ctx); err != nil {
 		logger.Error().Err(err).Msg("failed to start p2p node")
 		os.Exit(1)
-	}
-	initBlock, err := node.InitBlock()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load configured init block")
-		stop()
-		node.Wait()
-		os.Exit(1)
-	}
-	if startupZeroStateRequired(*fromZeroFlag, initBlock, liteOpts.Enabled) || archiveFromZero {
-		if err = ensureZeroStateBeforeInitialSync(ctx, logger, node); err != nil {
-			if errors.Is(err, context.Canceled) {
-				node.Wait()
-				return
-			}
-			logger.Error().Err(err).Msg("failed to prepare zero state before initial sync")
-			stop()
-			node.Wait()
-			os.Exit(1)
-		}
 	}
 
 	var blockSyncWG sync.WaitGroup
@@ -545,6 +523,10 @@ func main() {
 		Bool("liteserver_send_message_tvm_trace", *liteSendMessageTVMTraceFlag).
 		Int64("liteserver_send_message_broadcast_bytes_per_second", opts.ExternalBroadcastCapacity.BytesPerSecond).
 		Dur("liteserver_send_message_broadcast_max_delay", opts.ExternalBroadcastCapacity.MaxDelay).
+		Int("liteserver_capacity_per_ip", liteOpts.Limits.CapacityPerIP).
+		Float64("liteserver_cooling_per_sec", liteOpts.Limits.CoolingPerSec).
+		Int("liteserver_max_connections_per_ip", liteOpts.Limits.MaxConnectionsPerIP).
+		Dur("liteserver_max_keep_alive", liteOpts.Limits.MaxKeepAlive).
 		Bool("metrics", metricsOpts.Enabled).
 		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
 		Str("pprof_addr", fallbackString(strings.TrimSpace(*pprofAddrFlag), "<disabled>")).
