@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -456,12 +458,161 @@ func TestServiceCoalescesFutureBroadcastsWithoutSkippingBlocks(t *testing.T) {
 	if !got[0].Downloaded.ID.Equals(&block10) || !got[1].Downloaded.ID.Equals(&block11) || !got[2].Downloaded.ID.Equals(&block12) || !got[3].Downloaded.ID.Equals(&block13) || !got[4].Downloaded.ID.Equals(&block14) {
 		t.Fatalf("unexpected synced order: %+v", got)
 	}
-	if got[1].Trigger.Block.SeqNo != 14 || got[2].Trigger.Block.SeqNo != 14 || got[3].Trigger.Block.SeqNo != 14 || got[4].Trigger.Block.SeqNo != 14 {
-		t.Fatalf("expected catch-up blocks to be coalesced to latest target, got triggers: %d %d %d %d", got[1].Trigger.Block.SeqNo, got[2].Trigger.Block.SeqNo, got[3].Trigger.Block.SeqNo, got[4].Trigger.Block.SeqNo)
+	if got[1].Trigger.Block.SeqNo != 12 || got[2].Trigger.Block.SeqNo != 12 || got[3].Trigger.Block.SeqNo != 13 || got[4].Trigger.Block.SeqNo != 14 {
+		t.Fatalf("expected catch-up blocks to use nearest queued targets, got triggers: %d %d %d %d", got[1].Trigger.Block.SeqNo, got[2].Trigger.Block.SeqNo, got[3].Trigger.Block.SeqNo, got[4].Trigger.Block.SeqNo)
 	}
 	if len(node.nextCalls) != 4 {
 		t.Fatalf("expected 4 next-block downloads, got %d", len(node.nextCalls))
 	}
+}
+
+func TestChainPromotesPendingBroadcastsByNearestSeqno(t *testing.T) {
+	chain := &chain{notify: make(chan struct{}, 1)}
+	block10 := testBlockID(-1, topShard, 10)
+	block11 := testBlockID(-1, topShard, 11)
+	block12 := testBlockID(-1, topShard, 12)
+	block13 := testBlockID(-1, topShard, 13)
+
+	if !chain.enqueue(p2p.BroadcastEvent{Block: block10}) {
+		t.Fatal("enqueue block10 failed")
+	}
+	got := nextChainEvent(t, chain)
+	if !got.Block.Equals(&block10) {
+		t.Fatalf("first event = %s, want %s", got.BlockRef(), storage.FormatBlockRef(block10))
+	}
+
+	chain.enqueue(p2p.BroadcastEvent{Block: block13})
+	chain.enqueue(p2p.BroadcastEvent{Block: block11})
+	chain.enqueue(p2p.BroadcastEvent{Block: block12})
+
+	chain.last = &block10
+	chain.done()
+	got = nextChainEvent(t, chain)
+	if !got.Block.Equals(&block11) {
+		t.Fatalf("second event = %s, want %s", got.BlockRef(), storage.FormatBlockRef(block11))
+	}
+
+	chain.last = &block11
+	chain.done()
+	got = nextChainEvent(t, chain)
+	if !got.Block.Equals(&block12) {
+		t.Fatalf("third event = %s, want %s", got.BlockRef(), storage.FormatBlockRef(block12))
+	}
+
+	chain.last = &block12
+	chain.done()
+	got = nextChainEvent(t, chain)
+	if !got.Block.Equals(&block13) {
+		t.Fatalf("fourth event = %s, want %s", got.BlockRef(), storage.FormatBlockRef(block13))
+	}
+}
+
+func TestChainPendingBroadcastOverflowKeepsNearestSeqnos(t *testing.T) {
+	chain := &chain{notify: make(chan struct{}, defaultPendingBroadcasts+2)}
+	block10 := testBlockID(-1, topShard, 10)
+
+	if !chain.enqueue(p2p.BroadcastEvent{Block: block10}) {
+		t.Fatal("enqueue block10 failed")
+	}
+	_ = nextChainEvent(t, chain)
+
+	for seqno := uint32(12); seqno < 12+defaultPendingBroadcasts; seqno++ {
+		chain.enqueue(p2p.BroadcastEvent{Block: testBlockID(-1, topShard, seqno)})
+	}
+	near := testBlockID(-1, topShard, 11)
+	far := testBlockID(-1, topShard, 12+defaultPendingBroadcasts)
+	chain.enqueue(p2p.BroadcastEvent{Block: far})
+	chain.enqueue(p2p.BroadcastEvent{Block: near})
+
+	chain.last = &block10
+	chain.done()
+	got := nextChainEvent(t, chain)
+	if !got.Block.Equals(&near) {
+		t.Fatalf("overflow promoted %s, want nearest %s", got.BlockRef(), storage.FormatBlockRef(near))
+	}
+
+	if _, ok := chain.pending[far.SeqNo]; ok {
+		t.Fatalf("far future block %s stayed queued after overflow", storage.FormatBlockRef(far))
+	}
+}
+
+func TestChainWaitForNextBlockUsesPendingBroadcastDuringDownload(t *testing.T) {
+	node := newBlockingNextNode()
+	service := New(discardLogger(), node)
+	service.retryCount = 1
+
+	prev := testBlockID(-1, topShard, 10)
+	next := testBlockID(-1, topShard, 11)
+	target := testBlockID(-1, topShard, 13)
+	downloaded := p2p.DownloadedBlock{
+		ID:   next,
+		Kind: "tonNode.blockBroadcast",
+	}
+	chain := &chain{
+		service: service,
+		key:     chainKey(prev),
+		notify:  make(chan struct{}, 1),
+		busy:    true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	done := make(chan nextBlockWaitTestResult, 1)
+	go func() {
+		block, trigger, ok := chain.waitForNextBlock(ctx, p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: target}, prev)
+		done <- nextBlockWaitTestResult{block: block, trigger: trigger, ok: ok}
+	}()
+
+	select {
+	case got := <-node.nextStarted:
+		if !got.Equals(&prev) {
+			t.Fatalf("download started from %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(prev))
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for next-block download to start")
+	}
+
+	chain.enqueue(p2p.BroadcastEvent{
+		Overlay:    "masterchain",
+		Kind:       "tonNode.blockBroadcast",
+		Block:      next,
+		Downloaded: &downloaded,
+	})
+
+	select {
+	case res := <-done:
+		if !res.ok {
+			t.Fatal("wait for next block returned false")
+		}
+		if !res.block.ID.Equals(&next) {
+			t.Fatalf("next block = %s, want %s", storage.FormatBlockRef(res.block.ID), storage.FormatBlockRef(next))
+		}
+		if !res.trigger.Block.Equals(&next) {
+			t.Fatalf("trigger block = %s, want %s", res.trigger.BlockRef(), storage.FormatBlockRef(next))
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for pending broadcast")
+	}
+}
+
+type nextBlockWaitTestResult struct {
+	block   p2p.DownloadedBlock
+	trigger p2p.BroadcastEvent
+	ok      bool
+}
+
+func nextChainEvent(t *testing.T, chain *chain) p2p.BroadcastEvent {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ev, ok := chain.next(ctx)
+	if !ok {
+		t.Fatal("chain did not return next event")
+	}
+	return ev
 }
 
 func collectSyncedBlocks(ch <-chan SyncedBlock) []SyncedBlock {
@@ -483,6 +634,39 @@ type stubNode struct {
 
 	exactCalls []ton.BlockIDExt
 	nextCalls  []ton.BlockIDExt
+}
+
+type blockingNextNode struct {
+	events       chan p2p.BroadcastEvent
+	nextStarted  chan ton.BlockIDExt
+	nextFinished chan ton.BlockIDExt
+}
+
+func newBlockingNextNode() *blockingNextNode {
+	return &blockingNextNode{
+		events:       make(chan p2p.BroadcastEvent),
+		nextStarted:  make(chan ton.BlockIDExt, 1),
+		nextFinished: make(chan ton.BlockIDExt, 1),
+	}
+}
+
+func (n *blockingNextNode) Events() <-chan p2p.BroadcastEvent {
+	return n.events
+}
+
+func (n *blockingNextNode) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*p2p.DownloadedBlock, error) {
+	return nil, errors.New("unexpected exact block request")
+}
+
+func (n *blockingNextNode) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*p2p.DownloadedBlock, error) {
+	select {
+	case n.nextStarted <- prev:
+	default:
+	}
+
+	<-ctx.Done()
+	n.nextFinished <- prev
+	return nil, ctx.Err()
 }
 
 func newStubNode(events int) *stubNode {

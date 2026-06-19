@@ -400,20 +400,18 @@ func TestShardPrefetchDoesNotMarkScheduledWhenSlotUnavailable(t *testing.T) {
 	}
 	runner.shardPrefetchSlots <- struct{}{}
 
-	scheduled := map[tnstore.BlockRootHash]struct{}{}
-	scheduledOrder := []tnstore.BlockRootHash{}
 	master := testBlockID(-1, topShard, 125)
 	target := testBlockID(0, topShard, 126)
 
-	got := runner.scheduleShardPrefetch(scheduled, &scheduledOrder, master, []ton.BlockIDExt{target})
+	got := runner.scheduleShardPrefetch(master, []ton.BlockIDExt{target})
 	if got != 0 {
 		t.Fatalf("scheduled prefetch count = %d, want 0", got)
 	}
-	if _, ok := scheduled[tnstore.BlockKey(target)]; ok {
+	if _, ok := runner.shardPrefetchScheduled[tnstore.BlockKey(target)]; ok {
 		t.Fatal("prefetch target was marked scheduled without an available worker slot")
 	}
-	if len(scheduledOrder) != 0 {
-		t.Fatalf("scheduled order length = %d, want 0", len(scheduledOrder))
+	if len(runner.shardPrefetchOrder) != 0 {
+		t.Fatalf("scheduled order length = %d, want 0", len(runner.shardPrefetchOrder))
 	}
 }
 

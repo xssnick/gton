@@ -56,7 +56,7 @@ type CompressedBlockStateProvider interface {
 }
 
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
-	if cached, err := n.popShardBroadcastBlock(block); err == nil {
+	if cached, err := n.shardBroadcastBlock(block); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
@@ -84,7 +84,7 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 }
 
 func (n *Node) ProbeBlockFull(ctx context.Context, block ton.BlockIDExt, opts ProbeBlockFullOptions) (*DownloadedBlock, error) {
-	if cached, err := n.popShardBroadcastBlock(block); err == nil {
+	if cached, err := n.shardBroadcastBlock(block); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
@@ -118,7 +118,7 @@ func (n *Node) downloadBlockFullFromOverlayOrShardBroadcast(ctx context.Context,
 	}
 	defer unwatch()
 
-	if cached, err := n.popShardBroadcastBlock(block); err == nil {
+	if cached, err := n.shardBroadcastBlock(block); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
@@ -145,7 +145,7 @@ func (n *Node) downloadBlockFullFromOverlayOrShardBroadcast(ctx context.Context,
 		case res := <-result:
 			return res.block, res.err
 		case <-wake:
-			if cached, err := n.popShardBroadcastBlock(block); err == nil {
+			if cached, err := n.shardBroadcastBlock(block); err == nil {
 				cancel()
 				return cached, nil
 			} else if !errors.Is(err, tnstore.ErrNotFound) {
@@ -169,7 +169,7 @@ func (n *Node) probeBlockFullFromOverlayOrShardBroadcast(ctx context.Context, bl
 	}
 	defer unwatch()
 
-	if cached, err := n.popShardBroadcastBlock(block); err == nil {
+	if cached, err := n.shardBroadcastBlock(block); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
@@ -202,7 +202,7 @@ func (n *Node) probeBlockFullFromOverlayOrShardBroadcast(ctx context.Context, bl
 			}
 			return res.block, res.err
 		case <-wake:
-			if cached, err := n.popShardBroadcastBlock(block); err == nil {
+			if cached, err := n.shardBroadcastBlock(block); err == nil {
 				cancel()
 				return cached, nil
 			} else if !errors.Is(err, tnstore.ErrNotFound) {
@@ -231,7 +231,7 @@ func (n *Node) waitPreferredShardBroadcastBlock(ctx context.Context, block ton.B
 	case <-ctx.Done():
 		return nil, false, ctx.Err()
 	case <-wake:
-		cached, err := n.popShardBroadcastBlock(block)
+		cached, err := n.shardBroadcastBlock(block)
 		if err == nil {
 			return cached, true, nil
 		}

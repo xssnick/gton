@@ -21,6 +21,7 @@ const (
 	defaultShardDescriptionBuffer = 1024
 	defaultRetryCount             = 3
 	defaultRetryDelay             = 500 * time.Millisecond
+	defaultPendingBroadcasts      = 64
 	masterchainShard              = int64(-1 << 63)
 )
 
@@ -89,7 +90,7 @@ type chain struct {
 
 	mx      sync.Mutex
 	current *p2p.BroadcastEvent
-	future  *p2p.BroadcastEvent
+	pending map[uint32]p2p.BroadcastEvent
 	busy    bool
 	closed  bool
 	last    *ton.BlockIDExt
@@ -134,7 +135,7 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 		if chain.busy {
 			snapshot.BusyChains++
 		}
-		if chain.current != nil || chain.future != nil {
+		if chain.current != nil || len(chain.pending) > 0 {
 			snapshot.PendingChains++
 		}
 		chain.mx.Unlock()
@@ -274,11 +275,15 @@ func (c *chain) enqueue(ev p2p.BroadcastEvent) bool {
 	}
 
 	if !c.busy && c.current == nil {
-		copyEv := ev
-		c.current = &copyEv
-	} else if c.future == nil || shouldReplacePending(*c.future, ev) {
-		copyEv := ev
-		c.future = &copyEv
+		if len(c.pending) == 0 {
+			copyEv := ev
+			c.current = &copyEv
+		} else {
+			c.storePendingLocked(ev)
+			c.promotePendingLocked()
+		}
+	} else {
+		c.storePendingLocked(ev)
 	}
 
 	select {
@@ -329,16 +334,77 @@ func (c *chain) done() {
 	defer c.mx.Unlock()
 
 	c.busy = false
-	if c.current == nil && c.future != nil {
-		c.current = c.future
-		c.future = nil
+	if c.last != nil {
+		c.prunePendingAtOrBeforeLocked(c.last.SeqNo)
+	}
+	c.promotePendingLocked()
+}
+
+func (c *chain) storePendingLocked(ev p2p.BroadcastEvent) {
+	if c.pending == nil {
+		c.pending = make(map[uint32]p2p.BroadcastEvent)
+	}
+
+	if current, ok := c.pending[ev.Block.SeqNo]; ok {
+		if shouldReplacePendingAtSeqno(current, ev) {
+			c.pending[ev.Block.SeqNo] = ev
+		}
+		return
+	}
+
+	if len(c.pending) >= defaultPendingBroadcasts {
+		highest := c.highestPendingSeqnoLocked()
+		if ev.Block.SeqNo >= highest {
+			return
+		}
+		delete(c.pending, highest)
+	}
+
+	c.pending[ev.Block.SeqNo] = ev
+}
+
+func (c *chain) promotePendingLocked() {
+	if c.busy || c.current != nil || len(c.pending) == 0 {
+		return
+	}
+
+	seqno := c.lowestPendingSeqnoLocked()
+	ev := c.pending[seqno]
+	delete(c.pending, seqno)
+	c.current = &ev
+}
+
+func (c *chain) prunePendingAtOrBeforeLocked(seqno uint32) {
+	for pendingSeqno := range c.pending {
+		if pendingSeqno <= seqno {
+			delete(c.pending, pendingSeqno)
+		}
 	}
 }
 
-func shouldReplacePending(current, next p2p.BroadcastEvent) bool {
-	if next.Block.SeqNo != current.Block.SeqNo {
-		return next.Block.SeqNo > current.Block.SeqNo
+func (c *chain) lowestPendingSeqnoLocked() uint32 {
+	var lowest uint32
+	first := true
+	for seqno := range c.pending {
+		if first || seqno < lowest {
+			lowest = seqno
+			first = false
+		}
 	}
+	return lowest
+}
+
+func (c *chain) highestPendingSeqnoLocked() uint32 {
+	var highest uint32
+	for seqno := range c.pending {
+		if seqno > highest {
+			highest = seqno
+		}
+	}
+	return highest
+}
+
+func shouldReplacePendingAtSeqno(current, next p2p.BroadcastEvent) bool {
 	if next.ReceivedAt.After(current.ReceivedAt) {
 		return true
 	}
@@ -395,7 +461,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 		prev := *c.last
 
 		downloadStarted := time.Now()
-		downloaded, ok := c.waitForNextBlock(ctx, ev, prev)
+		downloaded, trigger, ok := c.waitForNextBlock(ctx, ev, prev)
 		downloadElapsed := time.Since(downloadStarted)
 		if !ok {
 			return
@@ -423,7 +489,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 		}
 
 		if !c.service.emit(ctx, &SyncedBlock{
-			Trigger:         ev,
+			Trigger:         trigger,
 			Downloaded:      downloaded,
 			CatchUp:         true,
 			DownloadElapsed: downloadElapsed,
@@ -491,9 +557,9 @@ func (c *chain) waitForBlock(ctx context.Context, ev p2p.BroadcastEvent) (p2p.Do
 	}
 }
 
-func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, prev ton.BlockIDExt) (p2p.DownloadedBlock, bool) {
+func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, prev ton.BlockIDExt) (p2p.DownloadedBlock, p2p.BroadcastEvent, bool) {
 	if ev.Downloaded != nil && ev.Downloaded.ID.Equals(&ev.Block) && ev.Downloaded.ID.SeqNo == prev.SeqNo+1 {
-		return *ev.Downloaded, true
+		return *ev.Downloaded, ev, true
 	}
 	if fullBlockBroadcastKind(ev.Kind) && ev.Block.SeqNo == prev.SeqNo+1 {
 		c.service.log.Debug().
@@ -502,27 +568,73 @@ func (c *chain) waitForNextBlock(ctx context.Context, ev p2p.BroadcastEvent, pre
 			Str("overlay", ev.Overlay).
 			Str("kind", ev.Kind).
 			Msg("dropping full block broadcast without decoded next payload")
-		return p2p.DownloadedBlock{}, false
+		return p2p.DownloadedBlock{}, ev, false
 	}
 
+retry:
 	for attempt := 1; ; attempt++ {
-		downloaded, err := c.service.downloadNextBlockWithRetry(ctx, prev)
-		if err == nil {
-			return downloaded, true
-		}
-		if ctx.Err() != nil {
-			return p2p.DownloadedBlock{}, false
+		if downloaded, trigger, ok := c.takePendingDownloadedNext(prev); ok {
+			return downloaded, trigger, true
 		}
 
-		c.service.log.Debug().
-			Err(err).
-			Str("from", storage.FormatBlockRef(prev)).
-			Str("target", ev.BlockRef()).
-			Str("overlay", ev.Overlay).
-			Str("kind", ev.Kind).
-			Int("attempt", attempt).
-			Msg("failed to catch up shard chain after broadcast gap, will retry in order")
+		downloadCtx, cancel := context.WithCancel(ctx)
+		result := make(chan nextBlockDownloadResult, 1)
+		go func() {
+			downloaded, err := c.service.downloadNextBlockWithRetry(downloadCtx, prev)
+			result <- nextBlockDownloadResult{downloaded: downloaded, err: err}
+		}()
+
+		for {
+			select {
+			case res := <-result:
+				cancel()
+				if res.err == nil {
+					return res.downloaded, ev, true
+				}
+				if ctx.Err() != nil {
+					return p2p.DownloadedBlock{}, ev, false
+				}
+
+				c.service.log.Debug().
+					Err(res.err).
+					Str("from", storage.FormatBlockRef(prev)).
+					Str("target", ev.BlockRef()).
+					Str("overlay", ev.Overlay).
+					Str("kind", ev.Kind).
+					Int("attempt", attempt).
+					Msg("failed to catch up shard chain after broadcast gap, will retry in order")
+				continue retry
+			case <-c.notify:
+				if downloaded, trigger, ok := c.takePendingDownloadedNext(prev); ok {
+					cancel()
+					return downloaded, trigger, true
+				}
+			case <-ctx.Done():
+				cancel()
+				return p2p.DownloadedBlock{}, ev, false
+			}
+		}
 	}
+}
+
+type nextBlockDownloadResult struct {
+	downloaded p2p.DownloadedBlock
+	err        error
+}
+
+func (c *chain) takePendingDownloadedNext(prev ton.BlockIDExt) (p2p.DownloadedBlock, p2p.BroadcastEvent, bool) {
+	nextSeqno := prev.SeqNo + 1
+
+	c.mx.Lock()
+	defer c.mx.Unlock()
+
+	ev, ok := c.pending[nextSeqno]
+	if !ok || ev.Downloaded == nil || !ev.Downloaded.ID.Equals(&ev.Block) || ev.Downloaded.ID.SeqNo != nextSeqno {
+		return p2p.DownloadedBlock{}, p2p.BroadcastEvent{}, false
+	}
+
+	delete(c.pending, nextSeqno)
+	return *ev.Downloaded, ev, true
 }
 
 func fullBlockBroadcastKind(kind string) bool {

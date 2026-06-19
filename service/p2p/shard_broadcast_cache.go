@@ -143,8 +143,8 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 	return nil
 }
 
-func (c *shardBroadcastBlockCache) PopBlock(block ton.BlockIDExt) (*DownloadedBlock, error) {
-	return c.popBlockAt(block, time.Now())
+func (c *shardBroadcastBlockCache) Block(block ton.BlockIDExt) (*DownloadedBlock, error) {
+	return c.blockAt(block, time.Now())
 }
 
 func (c *shardBroadcastBlockCache) HasBlock(block ton.BlockIDExt) bool {
@@ -170,7 +170,7 @@ func (c *shardBroadcastBlockCache) hasBlockAt(block ton.BlockIDExt, now time.Tim
 	return true
 }
 
-func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Time) (*DownloadedBlock, error) {
+func (c *shardBroadcastBlockCache) blockAt(block ton.BlockIDExt, now time.Time) (*DownloadedBlock, error) {
 	if c == nil {
 		return nil, tnstore.ErrNotFound
 	}
@@ -182,10 +182,9 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		c.mu.Unlock()
 		return nil, tnstore.ErrNotFound
 	}
-	c.deleteEntryLocked(entry)
-	c.mu.Unlock()
-
 	if !entry.expiresAt.After(now) {
+		c.deleteEntryLocked(entry)
+		c.mu.Unlock()
 		return nil, tnstore.ErrNotFound
 	}
 
@@ -193,7 +192,7 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 	if kind == "" {
 		kind = "shard broadcast block cache"
 	}
-	return &DownloadedBlock{
+	downloaded := &DownloadedBlock{
 		ID:               cloneBlockID(entry.block),
 		Kind:             kind,
 		Block:            entry.blockRoot,
@@ -205,7 +204,9 @@ func (c *shardBroadcastBlockCache) popBlockAt(block ton.BlockIDExt, now time.Tim
 		SourcePeerID:     entry.sourcePeerID,
 		IsLink:           entry.isLink,
 		VerifiedRootHash: true,
-	}, nil
+	}
+	c.mu.Unlock()
+	return downloaded, nil
 }
 
 func (c *shardBroadcastBlockCache) Prune(now time.Time) {
@@ -293,7 +294,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 	return true
 }
 
-func (n *Node) popShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, error) {
+func (n *Node) shardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, error) {
 	popStarted := n.startBroadcastPipelineStage()
 	kind := shardDescriptionBroadcastKind
 	result := broadcastPipelineResultMiss
@@ -305,7 +306,7 @@ func (n *Node) popShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, e
 		return nil, tnstore.ErrNotFound
 	}
 
-	downloaded, err := n.shardBroadcastCache.PopBlock(block)
+	downloaded, err := n.shardBroadcastCache.Block(block)
 	if err != nil {
 		if !errors.Is(err, tnstore.ErrNotFound) {
 			result = broadcastPipelineResultError

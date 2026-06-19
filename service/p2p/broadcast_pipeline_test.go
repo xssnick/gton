@@ -250,7 +250,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	})
 	observer.requireStage(t, broadcastPipelineStageHotCacheNotify, "tonNode.blockBroadcast", DeliverySimple, broadcastPipelineResultSuccess)
 
-	if _, err := node.popShardBroadcastBlock(downloaded.ID); err != nil {
+	if _, err := node.shardBroadcastBlock(downloaded.ID); err != nil {
 		t.Fatalf("pop hot shard block: %v", err)
 	}
 	observer.requireStage(t, broadcastPipelineStageExactPop, "tonNode.blockBroadcast", "", broadcastPipelineResultSuccess)

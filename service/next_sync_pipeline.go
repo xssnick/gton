@@ -57,6 +57,8 @@ type nextSyncRunner struct {
 	shardResolver                     *shardStateResolver
 	shardResolverSeen                 shardStateResolverStats
 	shardPrefetchSlots                chan struct{}
+	shardPrefetchScheduled            map[storage.BlockRootHash]struct{}
+	shardPrefetchOrder                []storage.BlockRootHash
 	shardDescriptionPrefetchMu        sync.Mutex
 	shardDescriptionPrefetchScheduled map[storage.BlockRootHash]struct{}
 	shardDescriptionPrefetchOrder     []storage.BlockRootHash
@@ -99,6 +101,7 @@ type nextAppliedMaster struct {
 	stateUpdateCells     storage.StateCellRecords
 	releaseApplyCells    func()
 	shardTargets         []ton.BlockIDExt
+	shardTargetsParsed   bool
 	shardTargetParse     time.Duration
 	shardPrefetchTargets int
 	err                  error
@@ -299,6 +302,7 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 		stateCells:                        stateCells,
 		shardCache:                        map[storage.BlockRootHash]*storage.BlockState{},
 		shardPrefetchSlots:                make(chan struct{}, nextShardPrefetchWorkers),
+		shardPrefetchScheduled:            map[storage.BlockRootHash]struct{}{},
 		shardDescriptionPrefetchScheduled: map[storage.BlockRootHash]struct{}{},
 		lastProgressMasterSeqno:           master.Block.SeqNo,
 		lastProgressShardClientSeqno:      current.Masterchain.Block.SeqNo,
@@ -594,6 +598,17 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 	prepared := item.block
 	applied.block = prepared
 
+	targets, elapsed, err := r.shardTargetsForMasterBlock(prepared)
+	applied.shardTargets = targets
+	applied.shardTargetsParsed = true
+	applied.shardTargetParse = elapsed
+	if err != nil {
+		applied.err = err
+		observe(syncBlockResultForError(err), applyTiming.total)
+		return applied, err
+	}
+	applied.shardPrefetchTargets = r.scheduleShardPrefetch(prepared.ID, targets)
+
 	nextMaster, transitionTiming, err := r.service.applyMasterchainTransition(master, prepared, checked, applyCells)
 	applyTiming.prepare += transitionTiming.prepare
 	applyTiming.consensus += transitionTiming.consensus
@@ -633,18 +648,16 @@ func (r *nextSyncRunner) startShardPrefetch(applied <-chan nextAppliedMaster) <-
 	go func() {
 		defer close(out)
 
-		scheduled := make(map[storage.BlockRootHash]struct{}, nextMasterchainPrefetchBlocks)
-		scheduledOrder := make([]storage.BlockRootHash, 0, nextMasterchainPrefetchBlocks)
-
 		for item := range applied {
-			if item.err == nil && item.master != nil {
+			if item.err == nil && item.master != nil && !item.shardTargetsParsed {
 				targets, elapsed, err := r.shardTargetsForMasterBlock(item.block)
 				item.shardTargets = targets
+				item.shardTargetsParsed = true
 				item.shardTargetParse = elapsed
 				if err != nil {
 					item.err = err
 				} else {
-					item.shardPrefetchTargets = r.scheduleShardPrefetch(scheduled, &scheduledOrder, item.master.Block, targets)
+					item.shardPrefetchTargets = r.scheduleShardPrefetch(item.master.Block, targets)
 				}
 			}
 			if !r.sendAppliedMaster(out, item) {
@@ -673,17 +686,21 @@ func (r *nextSyncRunner) shardTargetsForMasterBlock(block PreparedBlock) ([]ton.
 	return targets, elapsed, nil
 }
 
-func (r *nextSyncRunner) scheduleShardPrefetch(scheduled map[storage.BlockRootHash]struct{}, scheduledOrder *[]storage.BlockRootHash, master ton.BlockIDExt, targets []ton.BlockIDExt) int {
+func (r *nextSyncRunner) scheduleShardPrefetch(master ton.BlockIDExt, targets []ton.BlockIDExt) int {
+	if r.shardPrefetchScheduled == nil {
+		r.shardPrefetchScheduled = map[storage.BlockRootHash]struct{}{}
+	}
+
 	count := 0
 	for _, target := range targets {
 		key := storage.BlockKey(target)
-		if _, ok := scheduled[key]; ok {
+		if _, ok := r.shardPrefetchScheduled[key]; ok {
 			continue
 		}
 		if !r.prefetchShardTarget(master, target) {
 			continue
 		}
-		rememberScheduledShardPrefetch(scheduled, scheduledOrder, key)
+		rememberScheduledShardPrefetch(r.shardPrefetchScheduled, &r.shardPrefetchOrder, key)
 		count++
 	}
 	return count
