@@ -3676,8 +3676,54 @@ func TestHandleStateZeroStateDoesNotFallbackToBlockState(t *testing.T) {
 	if lsErr.Code != errCodeNotReady {
 		t.Fatalf("error code = %d, want %d", lsErr.Code, errCodeNotReady)
 	}
-	if !strings.Contains(lsErr.Text, "cannot load zero state") {
-		t.Fatalf("error text = %q", lsErr.Text)
+	if lsErr.Text != cxxZeroStateNotInDB {
+		t.Fatalf("error text = %q, want %q", lsErr.Text, cxxZeroStateNotInDB)
+	}
+}
+
+func TestGetBlockProofForwardFromMissingZeroStateUsesCppError(t *testing.T) {
+	zeroID := ton.BlockIDExt{
+		Workchain: masterchainID,
+		Shard:     masterchainShard,
+		SeqNo:     0,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+	targetBase := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 1}
+	stateRoot := testMasterStateWithOldBlocks(t, targetBase, []testOldMasterBlock{{
+		id:    zeroID,
+		isKey: true,
+		endLT: 1,
+	}})
+	targetID, targetRoot := testMasterBlockForStateWithPrevKey(t, 1, 1, true, stateRoot, nil)
+	store := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(targetID): testBlockBOC(targetRoot),
+		},
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(targetID): {Block: targetID, StateRootHash: stateRoot.Hash(0), Cell: stateRoot},
+		},
+		metas: map[storage.BlockRootHash]*storage.BlockMeta{
+			storage.BlockKey(targetID): {ID: targetID, StateRootHash: stateRoot.Hash(0), Flags: storage.BlockMetaIsKeyBlock},
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.GetBlockProof{
+		Mode:        0x1001,
+		KnownBlock:  cloneBlockID(zeroID),
+		TargetBlock: cloneBlockID(targetID),
+	})
+	lsErr, ok := resp.(ton.LSError)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
+	}
+	if lsErr.Code != errCodeNotReady {
+		t.Fatalf("error code = %d, want %d", lsErr.Code, errCodeNotReady)
+	}
+	want := "cannot load zerostate of " + cxxBlockIDExtString(zeroID) + " : " + cxxZeroStateNotInDB
+	if lsErr.Text != want {
+		t.Fatalf("error text = %q, want %q", lsErr.Text, want)
 	}
 }
 

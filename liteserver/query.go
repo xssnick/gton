@@ -417,7 +417,40 @@ func unixNow(now func() time.Time) uint32 {
 	return uint32(now().Unix())
 }
 
+const cxxZeroStateNotInDB = "zerostate not in db"
+
+type queryError struct {
+	code int32
+	text string
+}
+
+func (e *queryError) Error() string {
+	return e.text
+}
+
+func newQueryError(code int32, text string) error {
+	return &queryError{code: code, text: text}
+}
+
+func zeroStateErrorResponse(err error, block ton.BlockIDExt) ton.LSError {
+	if errors.Is(err, storage.ErrNotFound) {
+		return ton.LSError{Code: errCodeNotReady, Text: cxxZeroStateNotInDB}
+	}
+	return errorResponse(err, "cannot load zerostate of "+cxxBlockIDExtString(block))
+}
+
+func zeroStateProofError(err error, block ton.BlockIDExt) error {
+	if errors.Is(err, storage.ErrNotFound) {
+		return newQueryError(errCodeNotReady, "cannot load zerostate of "+cxxBlockIDExtString(block)+" : "+cxxZeroStateNotInDB)
+	}
+	return err
+}
+
 func errorResponse(err error, fallback string) ton.LSError {
+	var queryErr *queryError
+	if errors.As(err, &queryErr) {
+		return ton.LSError{Code: queryErr.code, Text: queryErr.text}
+	}
 	if errors.Is(err, storage.ErrNotFound) {
 		text := fallback + ": not found"
 		if err != nil && err.Error() != storage.ErrNotFound.Error() {

@@ -53,7 +53,7 @@ func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 	if id.SeqNo == 0 {
 		data, err := s.store.ZeroState(ctx, *id)
 		if err != nil {
-			return errorResponse(err, "cannot load zero state "+storage.FormatBlockRef(*id))
+			return zeroStateErrorResponse(err, *id)
 		}
 
 		return ton.BlockState{

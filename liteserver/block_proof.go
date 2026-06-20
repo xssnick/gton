@@ -309,7 +309,7 @@ func (s *Server) forwardSourceRoot(ctx context.Context, from ton.BlockIDExt) (*c
 
 	data, err := s.store.ZeroState(ctx, from)
 	if err != nil {
-		return nil, err
+		return nil, zeroStateProofError(err, from)
 	}
 	root, err := cell.FromBOC(data)
 	if err != nil {
