@@ -20,42 +20,43 @@ import (
 )
 
 const (
-	topShard                               = int64(-1 << 63)
-	shardStateCatchUpParallelism           = 4
-	shardStateDownloadBuffer               = 16
-	shardStateDownloadWorkers              = 4
-	nextBlockDescriptionLookahead          = shardStateDownloadBuffer
-	shardStateCatchUpRetryDelay            = 500 * time.Millisecond
-	currentStateLivePollDelay              = 300 * time.Millisecond
-	syncDiskSpaceRetryDelay                = 5 * time.Second
-	defaultMinSyncDiskFreeBytes            = 10 << 30
-	stateSerializationMinDiskFreeBytes     = 30 << 30
-	nextBlockBootstrapBlocks               = 0
-	nextBlockBootstrapProbeTimeout         = 2 * time.Second
-	nextBlockBootstrapLiveProbeTimeout     = 5 * time.Second
-	nextBlockBootstrapLiveStageDelay       = 250 * time.Millisecond
-	nextBlockBootstrapProbePeers           = 3
-	nextBlockBootstrapUrgentPeers          = 8
-	nextBlockBootstrapWidePeers            = 16
-	nextBlockBootstrapUrgentMisses         = 1
-	nextBlockBootstrapWideMisses           = 2
-	nextBlockBootstrapUrgentLagSeconds     = 3
-	nextBlockBootstrapWideLagSeconds       = 10
-	nextBlockBootstrapWideGapBlocks        = 8
-	nextBlockBootstrapLiveLagSeconds       = 10
-	nextBlockBootstrapBroadcastPreferDelay = 25 * time.Millisecond
-	exactBlockDownloadProbePeers           = 4
-	exactBlockDownloadWaitLogDelay         = time.Second
-	exactBlockDownloadWaitLogEvery         = 2 * time.Second
-	chainBlockDownloadRetries              = 3
-	chainBlockDownloadRetryDelay           = 500 * time.Millisecond
-	nextMasterchainQueueLimit              = 64
-	nextMasterchainQueueTTL                = 3 * time.Minute
-	nextMasterchainQueueMaxBytes           = 128 << 20
-	masterStateCacheLimit                  = 2048
-	syncedBlockProcessorWorkers            = 8
-	syncedBlockPriorityQueueLimit          = 64
-	statusTPSMasterWindow                  = 10
+	topShard                           = int64(-1 << 63)
+	shardStateCatchUpParallelism       = 4
+	shardStateDownloadBuffer           = 16
+	shardStateDownloadWorkers          = 4
+	nextBlockDescriptionLookahead      = shardStateDownloadBuffer
+	shardStateCatchUpRetryDelay        = 500 * time.Millisecond
+	currentStateLivePollDelay          = 300 * time.Millisecond
+	syncDiskSpaceRetryDelay            = 5 * time.Second
+	defaultMinSyncDiskFreeBytes        = 10 << 30
+	stateSerializationMinDiskFreeBytes = 30 << 30
+	nextBlockBootstrapBlocks           = 0
+	nextBlockBootstrapProbeTimeout     = 2 * time.Second
+	nextBlockBootstrapLiveProbeTimeout = 5 * time.Second
+	nextBlockBootstrapLiveStageDelay   = 250 * time.Millisecond
+	nextBlockBootstrapProbePeers       = 3
+	nextBlockBootstrapUrgentPeers      = 8
+	nextBlockBootstrapWidePeers        = 16
+	nextBlockBootstrapUrgentMisses     = 1
+	nextBlockBootstrapWideMisses       = 2
+	nextBlockBootstrapUrgentLagSeconds = 3
+	nextBlockBootstrapWideLagSeconds   = 10
+	nextBlockBootstrapWideGapBlocks    = 8
+	nextBlockBootstrapLiveLagSeconds   = 10
+	exactBlockDownloadProbePeers       = 4
+	exactBlockDownloadWaitLogDelay     = time.Second
+	exactBlockDownloadWaitLogEvery     = 2 * time.Second
+	chainBlockDownloadRetries          = 3
+	chainBlockDownloadRetryDelay       = 500 * time.Millisecond
+	nextMasterchainQueueLimit          = 64
+	nextMasterchainQueueTTL            = 3 * time.Minute
+	nextMasterchainQueueMaxBytes       = 512 << 20
+	masterStateCacheLimit              = 2048
+	syncedBlockProcessorWorkers        = 8
+	syncedBlockPriorityQueueLimit      = 64
+	syncedBlockMasterHotWorkers        = 2
+	syncedBlockMasterHotQueueLimit     = 64
+	statusTPSMasterWindow              = 10
 )
 
 const (
@@ -207,6 +208,7 @@ type Service struct {
 	cellGenerationSwitching            bool
 	currentStatusMu                    sync.RWMutex
 	currentStatus                      *storage.CurrentState
+	appliedMasterchainStatus           *storage.BlockState
 
 	startOnce sync.Once
 	wg        sync.WaitGroup
@@ -434,20 +436,22 @@ func syncShardLabel(block ton.BlockIDExt) string {
 
 type StatusSnapshot struct {
 	p2p.StatusSnapshot
-	BlockSync             blocksync.StatusSnapshot
-	LocalMasterchain      *ton.BlockIDExt
-	LocalBasechain        *ton.BlockIDExt
-	LocalBasechainShards  []ShardStatusSnapshot
-	LocalStateLoaded      bool
-	LocalStateError       string
-	LocalMasterchainUtime int64
-	LocalBasechainUtime   int64
-	LocalMasterchainTx    uint32
-	LocalBasechainTx      uint32
-	LocalMasterchainHasTx bool
-	LocalBasechainHasTx   bool
-	RecentTPS             StatusTPSSnapshot
-	BackgroundTask        string
+	BlockSync               blocksync.StatusSnapshot
+	AppliedMasterchain      *ton.BlockIDExt
+	LocalMasterchain        *ton.BlockIDExt
+	LocalBasechain          *ton.BlockIDExt
+	LocalBasechainShards    []ShardStatusSnapshot
+	LocalStateLoaded        bool
+	LocalStateError         string
+	AppliedMasterchainUtime int64
+	LocalMasterchainUtime   int64
+	LocalBasechainUtime     int64
+	LocalMasterchainTx      uint32
+	LocalBasechainTx        uint32
+	LocalMasterchainHasTx   bool
+	LocalBasechainHasTx     bool
+	RecentTPS               StatusTPSSnapshot
+	BackgroundTask          string
 }
 
 type ShardStatusSnapshot struct {
@@ -660,6 +664,17 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 		snapshot.LocalStateError = err.Error()
 	}
 
+	appliedMaster := s.appliedMasterchainStatusSnapshot()
+	if current != nil && (appliedMaster == nil || appliedMaster.Block.SeqNo < current.Masterchain.Block.SeqNo) {
+		appliedMaster = storage.CloneBlockState(&current.Masterchain)
+	}
+	if appliedMaster != nil {
+		master := appliedMaster.Block
+		metrics := s.blockStatusMetrics(ctx, appliedMaster)
+		snapshot.AppliedMasterchain = &master
+		snapshot.AppliedMasterchainUtime = metrics.Utime
+	}
+
 	return snapshot
 }
 
@@ -854,9 +869,17 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 }
 
 func (s *Service) runBlockProcessor(ctx context.Context) {
+	masterHotJobs := make(chan blocksync.SyncedBlock, syncedBlockMasterHotQueueLimit)
 	priorityJobs := make(chan blocksync.SyncedBlock, syncedBlockPriorityQueueLimit)
 	jobs := make(chan blocksync.SyncedBlock, syncedBlockProcessorWorkers*2)
 	var wg sync.WaitGroup
+	for worker := 0; worker < syncedBlockMasterHotWorkers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.runBlockProcessorWorker(ctx, masterHotJobs, nil)
+		}()
+	}
 	for worker := 0; worker < syncedBlockProcessorWorkers; worker++ {
 		wg.Add(1)
 		go func() {
@@ -865,6 +888,7 @@ func (s *Service) runBlockProcessor(ctx context.Context) {
 		}()
 	}
 	defer func() {
+		close(masterHotJobs)
 		close(priorityJobs)
 		close(jobs)
 		wg.Wait()
@@ -879,7 +903,9 @@ func (s *Service) runBlockProcessor(ctx context.Context) {
 				return
 			}
 			targetJobs := jobs
-			if synced.Priority {
+			if isHotMasterchainSyncedBlock(synced) {
+				targetJobs = masterHotJobs
+			} else if synced.Priority {
 				targetJobs = priorityJobs
 			}
 
@@ -891,6 +917,14 @@ func (s *Service) runBlockProcessor(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func isHotMasterchainSyncedBlock(synced blocksync.SyncedBlock) bool {
+	if !synced.Priority || synced.CatchUp {
+		return false
+	}
+	block := synced.Downloaded.ID
+	return block.Workchain == -1 && block.Shard == topShard
 }
 
 func (s *Service) runBlockProcessorWorker(ctx context.Context, priorityJobs, jobs <-chan blocksync.SyncedBlock) {

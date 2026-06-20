@@ -625,9 +625,6 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 		block:       block.Copy(),
 		rebroadcast: rebroadcast,
 	}
-	if !s.node.nonfinalBlockCacheEnabled() {
-		return accepted, nil
-	}
 
 	decodeStarted := s.node.startBroadcastPipelineStage()
 	downloaded, err := decodeBlockCandidateBroadcast(msg)
@@ -672,7 +669,11 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		if accepted.event.Downloaded != nil && accepted.event.Downloaded.ID.Equals(&accepted.event.Block) {
 			cacheStarted := n.startBroadcastPipelineStage()
 			cacheResult := broadcastPipelineResultMiss
-			if n.rememberShardBroadcastBlock(accepted.event.Downloaded) {
+			if isMasterchainBlock(accepted.event.Downloaded.ID) {
+				if n.rememberMasterchainNextBroadcastBlock(accepted.event.Downloaded) {
+					cacheResult = broadcastPipelineResultSuccess
+				}
+			} else if n.rememberShardBroadcastBlock(accepted.event.Downloaded) {
 				cacheResult = broadcastPipelineResultSuccess
 			}
 			n.observeBroadcastPipelineStageSince(cacheStarted, broadcastPipelineStageHotCacheNotify, accepted.event.Kind, accepted.event.Delivery, cacheResult)

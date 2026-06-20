@@ -443,7 +443,7 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 	if !bytes.Equal(accepted.rebroadcast.payload, payload) {
 		t.Fatal("expected two-step rebroadcast payload to be preserved for custom fanout")
 	}
-	observer.requireNoStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep)
+	observer.requireStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultError)
 }
 
 func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {

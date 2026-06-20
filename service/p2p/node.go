@@ -76,28 +76,31 @@ type Node struct {
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx                    context.Context
-	zeroStateFileHash         []byte
-	zeroStateBlock            ton.BlockIDExt
-	initBlock                 ton.BlockIDExt
-	hardforks                 []ton.BlockIDExt
-	hardforkSet               map[blockIDFullKey]struct{}
-	externalPort              uint16
-	dhtListenAddr             string
-	storage                   storage2.Storage
-	peerStorage               storage2.PeerServingStorage
-	liveBlockCache            *storage2.LiveBlockCache
-	compressedState           CompressedBlockStateProvider
-	syncLag                   SyncLagProvider
-	signatureVerifier         BroadcastSignatureVerifier
-	broadcastAdmission        BroadcastAdmission
-	broadcastPipelineObserver BroadcastPipelineObserver
-	shardBroadcastCache       *shardBroadcastBlockCache
-	shardCandidateCache       *shardBlockCandidateCache
-	shardBroadcastWaitMx      sync.Mutex
-	shardBroadcastWaiters     map[storage2.BlockRootHash][]chan struct{}
-	blockCacheObserver        BlockCacheObserver
-	rebroadcastQuiet          atomic.Bool
+	runCtx                          context.Context
+	zeroStateFileHash               []byte
+	zeroStateBlock                  ton.BlockIDExt
+	initBlock                       ton.BlockIDExt
+	hardforks                       []ton.BlockIDExt
+	hardforkSet                     map[blockIDFullKey]struct{}
+	externalPort                    uint16
+	dhtListenAddr                   string
+	storage                         storage2.Storage
+	peerStorage                     storage2.PeerServingStorage
+	liveBlockCache                  *storage2.LiveBlockCache
+	compressedState                 CompressedBlockStateProvider
+	syncLag                         SyncLagProvider
+	signatureVerifier               BroadcastSignatureVerifier
+	broadcastAdmission              BroadcastAdmission
+	broadcastPipelineObserver       BroadcastPipelineObserver
+	shardBroadcastCache             *shardBroadcastBlockCache
+	shardCandidateCache             *shardBlockCandidateCache
+	shardBroadcastWaitMx            sync.Mutex
+	shardBroadcastWaiters           map[storage2.BlockRootHash][]chan struct{}
+	masterchainNextBroadcastCache   *masterchainNextBroadcastCache
+	masterchainNextBroadcastWaitMx  sync.Mutex
+	masterchainNextBroadcastWaiters map[storage2.BlockRootHash][]chan struct{}
+	blockCacheObserver              BlockCacheObserver
+	rebroadcastQuiet                atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
@@ -105,11 +108,12 @@ type Node struct {
 	rebroadcastFECMu        sync.Mutex
 	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[PeerID]struct{}
 
-	pendingBroadcastMx           sync.Mutex
-	pendingBroadcasts            map[string]pendingBlockBroadcastDecode
-	pendingBroadcastBytes        int64
-	pendingBroadcastProcessing   bool
-	pendingBroadcastProcessAgain bool
+	pendingBroadcastMx         sync.Mutex
+	pendingBroadcasts          map[string]pendingBlockBroadcastDecode
+	pendingBroadcastByPrev     map[storage2.BlockRootHash]map[string]struct{}
+	pendingBroadcastReadyPrev  map[storage2.BlockRootHash]ton.BlockIDExt
+	pendingBroadcastBytes      int64
+	pendingBroadcastProcessing bool
 
 	broadcastStatsMx sync.Mutex
 	broadcastStats   map[broadcastStatKey]uint64
@@ -239,55 +243,58 @@ func New(opts Options) (*Node, error) {
 	}
 
 	return &Node{
-		log:                       logger,
-		cfgPath:                   cfgPath,
-		listenAddr:                opts.ListenAddr,
-		externalIP:                append(net.IP(nil), opts.ExternalIP...),
-		externalPort:              opts.ExternalPort,
-		privKey:                   priv,
-		localID:                   localID,
-		dhtPrivKey:                dhtPriv,
-		gateway:                   gateway,
-		dhtListenAddr:             opts.DHTListenAddr,
-		pool:                      newPeerPool(gateway),
-		events:                    make(chan BroadcastEvent, broadcastEventBuffer),
-		eventQueue:                newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
-		deduper:                   newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		customFanoutDeduper:       newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		myExternalMessages:        newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
-		processedExternalMessages: newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
-		externalMessageLimiter:    extmsg.NewDefaultAddressLimiter(),
-		externalBroadcastPacer:    externalBroadcastPacer,
-		stopped:                   make(chan struct{}),
-		subscriptions:             map[string]*overlaySubscription{},
-		monitorMinSplitDepth:      map[int32]uint32{},
-		latestBasechainShards:     map[storage2.ShardKey]ton.BlockIDExt{},
-		observedMasterchainNotify: make(chan struct{}),
-		seenMasterchainNotify:     make(chan struct{}),
-		latestBasechainNotify:     make(chan struct{}),
-		rawMasterchainNotify:      make(chan struct{}),
-		storage:                   storage,
-		peerStorage:               peerStorage,
-		liveBlockCache:            liveBlockCache,
-		compressedState:           opts.CompressedState,
-		syncLag:                   opts.SyncLag,
-		signatureVerifier:         opts.SignatureVerifier,
-		broadcastAdmission:        opts.BroadcastAdmission,
-		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
-		shardCandidateCache:       newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
-		shardBroadcastWaiters:     map[storage2.BlockRootHash][]chan struct{}{},
-		rebroadcastThrottleLast:   map[string]time.Time{},
-		rebroadcastFECSlots:       newRebroadcastFECSlotLimits(),
-		rebroadcastFECPeers:       newRebroadcastFECPeerLimits(),
-		pendingBroadcasts:         map[string]pendingBlockBroadcastDecode{},
-		broadcastStats:            map[broadcastStatKey]uint64{},
-		fecReceiverLast:           map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
-		fecReceiverTotals:         map[string]fecReceiverCounterSnapshot{},
-		stateFilesDir:             stateFilesDir,
-		peerUse:                   map[PeerID]peerUse{},
-		stateCellImportSlot:       make(chan struct{}, 1),
-		stateSplitPartDecodeSlot:  make(chan struct{}, 1),
-		customOverlays:            append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
+		log:                             logger,
+		cfgPath:                         cfgPath,
+		listenAddr:                      opts.ListenAddr,
+		externalIP:                      append(net.IP(nil), opts.ExternalIP...),
+		externalPort:                    opts.ExternalPort,
+		privKey:                         priv,
+		localID:                         localID,
+		dhtPrivKey:                      dhtPriv,
+		gateway:                         gateway,
+		dhtListenAddr:                   opts.DHTListenAddr,
+		pool:                            newPeerPool(gateway),
+		events:                          make(chan BroadcastEvent, broadcastEventBuffer),
+		eventQueue:                      newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
+		deduper:                         newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		customFanoutDeduper:             newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		myExternalMessages:              newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		processedExternalMessages:       newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		externalMessageLimiter:          extmsg.NewDefaultAddressLimiter(),
+		externalBroadcastPacer:          externalBroadcastPacer,
+		stopped:                         make(chan struct{}),
+		subscriptions:                   map[string]*overlaySubscription{},
+		monitorMinSplitDepth:            map[int32]uint32{},
+		latestBasechainShards:           map[storage2.ShardKey]ton.BlockIDExt{},
+		observedMasterchainNotify:       make(chan struct{}),
+		seenMasterchainNotify:           make(chan struct{}),
+		latestBasechainNotify:           make(chan struct{}),
+		rawMasterchainNotify:            make(chan struct{}),
+		storage:                         storage,
+		peerStorage:                     peerStorage,
+		liveBlockCache:                  liveBlockCache,
+		compressedState:                 opts.CompressedState,
+		syncLag:                         opts.SyncLag,
+		signatureVerifier:               opts.SignatureVerifier,
+		broadcastAdmission:              opts.BroadcastAdmission,
+		shardBroadcastCache:             newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
+		shardCandidateCache:             newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
+		shardBroadcastWaiters:           map[storage2.BlockRootHash][]chan struct{}{},
+		masterchainNextBroadcastCache:   newMasterchainNextBroadcastCache(masterchainNextBroadcastCacheTTL, masterchainNextBroadcastCacheMaxBytes, masterchainNextBroadcastCacheMaxItems),
+		masterchainNextBroadcastWaiters: map[storage2.BlockRootHash][]chan struct{}{},
+		rebroadcastThrottleLast:         map[string]time.Time{},
+		rebroadcastFECSlots:             newRebroadcastFECSlotLimits(),
+		rebroadcastFECPeers:             newRebroadcastFECPeerLimits(),
+		pendingBroadcasts:               map[string]pendingBlockBroadcastDecode{},
+		pendingBroadcastByPrev:          map[storage2.BlockRootHash]map[string]struct{}{},
+		broadcastStats:                  map[broadcastStatKey]uint64{},
+		fecReceiverLast:                 map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
+		fecReceiverTotals:               map[string]fecReceiverCounterSnapshot{},
+		stateFilesDir:                   stateFilesDir,
+		peerUse:                         map[PeerID]peerUse{},
+		stateCellImportSlot:             make(chan struct{}, 1),
+		stateSplitPartDecodeSlot:        make(chan struct{}, 1),
+		customOverlays:                  append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
 	}, nil
 }
 

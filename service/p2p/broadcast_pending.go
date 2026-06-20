@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	tnstore "github.com/xssnick/gton/service/storage"
+
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -13,7 +15,7 @@ import (
 const (
 	pendingBroadcastDecodeTTL      = 3 * time.Minute
 	pendingBroadcastDecodeMaxItems = 1024
-	pendingBroadcastDecodeMaxBytes = int64(64 << 20)
+	pendingBroadcastDecodeMaxBytes = int64(256 << 20)
 	pendingBroadcastDecodeOverhead = 256
 )
 
@@ -46,11 +48,15 @@ func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDeco
 	if n.pendingBroadcasts == nil {
 		n.pendingBroadcasts = map[string]pendingBlockBroadcastDecode{}
 	}
+	if n.pendingBroadcastByPrev == nil {
+		n.pendingBroadcastByPrev = map[tnstore.BlockRootHash]map[string]struct{}{}
+	}
 	n.prunePendingBlockBroadcastDecodesLocked(now)
 	if old, ok := n.pendingBroadcasts[req.fingerprint]; ok {
-		n.pendingBroadcastBytes -= old.bytes
+		n.deletePendingBlockBroadcastDecodeLocked(old.fingerprint)
 	}
 	n.pendingBroadcasts[req.fingerprint] = req
+	n.addPendingBlockBroadcastPrevIndexLocked(req)
 	n.pendingBroadcastBytes += req.bytes
 	n.prunePendingBlockBroadcastOverflowLocked()
 	n.pendingBroadcastMx.Unlock()
@@ -62,24 +68,33 @@ func (n *Node) forgetPendingBlockBroadcastDecode(fingerprint string) {
 	n.pendingBroadcastMx.Unlock()
 }
 
-func (n *Node) processPendingBlockBroadcastDecodesAsync() {
-	if n == nil {
+func (n *Node) processPendingBlockBroadcastDecodesForPrevAsync(prev ton.BlockIDExt) {
+	if n == nil || len(prev.RootHash) != 32 {
 		return
 	}
 
+	key := tnstore.BlockKey(prev)
+
 	n.pendingBroadcastMx.Lock()
-	if len(n.pendingBroadcasts) == 0 {
+	if len(n.pendingBroadcastByPrev[key]) == 0 {
 		n.pendingBroadcastMx.Unlock()
 		return
 	}
+	if n.pendingBroadcastReadyPrev == nil {
+		n.pendingBroadcastReadyPrev = map[tnstore.BlockRootHash]ton.BlockIDExt{}
+	}
+	n.pendingBroadcastReadyPrev[key] = prev
 	if n.pendingBroadcastProcessing {
-		n.pendingBroadcastProcessAgain = true
 		n.pendingBroadcastMx.Unlock()
 		return
 	}
 	n.pendingBroadcastProcessing = true
 	n.pendingBroadcastMx.Unlock()
 
+	n.runPendingBlockBroadcastDecodeProcessorAsync()
+}
+
+func (n *Node) runPendingBlockBroadcastDecodeProcessorAsync() {
 	n.runAsync(func() {
 		ctx := n.runCtx
 		if ctx == nil {
@@ -87,23 +102,37 @@ func (n *Node) processPendingBlockBroadcastDecodesAsync() {
 		}
 
 		for {
-			n.processPendingBlockBroadcastDecodes(ctx, time.Now())
-
 			n.pendingBroadcastMx.Lock()
-			processAgain := n.pendingBroadcastProcessAgain && len(n.pendingBroadcasts) > 0 && ctx.Err() == nil
-			n.pendingBroadcastProcessAgain = false
-			if !processAgain {
+			prevs := make([]ton.BlockIDExt, 0, len(n.pendingBroadcastReadyPrev))
+			for key, prev := range n.pendingBroadcastReadyPrev {
+				prevs = append(prevs, prev)
+				delete(n.pendingBroadcastReadyPrev, key)
+			}
+			done := len(prevs) == 0 || len(n.pendingBroadcasts) == 0 || ctx.Err() != nil
+			if done {
 				n.pendingBroadcastProcessing = false
 				n.pendingBroadcastMx.Unlock()
 				return
 			}
 			n.pendingBroadcastMx.Unlock()
+
+			now := time.Now()
+			for _, prev := range prevs {
+				if ctx.Err() != nil {
+					break
+				}
+				n.processPendingBlockBroadcastDecodesForPrev(ctx, prev, now)
+			}
 		}
 	})
 }
 
-func (n *Node) processPendingBlockBroadcastDecodes(ctx context.Context, now time.Time) {
-	reqs := n.pendingBlockBroadcastDecodeSnapshot(now)
+func (n *Node) processPendingBlockBroadcastDecodesForPrev(ctx context.Context, prev ton.BlockIDExt, now time.Time) {
+	reqs := n.pendingBlockBroadcastDecodeSnapshotForPrev(prev, now)
+	n.processPendingBlockBroadcastDecodeRequests(ctx, reqs)
+}
+
+func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, reqs []pendingBlockBroadcastDecode) {
 	for _, req := range reqs {
 		if ctx.Err() != nil {
 			return
@@ -160,7 +189,7 @@ func (n *Node) decodePendingBlockBroadcast(ctx context.Context, req pendingBlock
 	}
 }
 
-func (n *Node) pendingBlockBroadcastDecodeSnapshot(now time.Time) []pendingBlockBroadcastDecode {
+func (n *Node) pendingBlockBroadcastDecodeSnapshotForPrev(prev ton.BlockIDExt, now time.Time) []pendingBlockBroadcastDecode {
 	n.pendingBroadcastMx.Lock()
 	defer n.pendingBroadcastMx.Unlock()
 
@@ -169,9 +198,17 @@ func (n *Node) pendingBlockBroadcastDecodeSnapshot(now time.Time) []pendingBlock
 		return nil
 	}
 
-	reqs := make([]pendingBlockBroadcastDecode, 0, len(n.pendingBroadcasts))
-	for _, req := range n.pendingBroadcasts {
-		reqs = append(reqs, req)
+	fingerprints := n.pendingBroadcastByPrev[tnstore.BlockKey(prev)]
+	if len(fingerprints) == 0 {
+		return nil
+	}
+
+	reqs := make([]pendingBlockBroadcastDecode, 0, len(fingerprints))
+	for fingerprint := range fingerprints {
+		req, ok := n.pendingBroadcasts[fingerprint]
+		if ok {
+			reqs = append(reqs, req)
+		}
 	}
 	return reqs
 }
@@ -209,9 +246,35 @@ func (n *Node) deletePendingBlockBroadcastDecodeLocked(fingerprint string) {
 		return
 	}
 	delete(n.pendingBroadcasts, fingerprint)
+	n.deletePendingBlockBroadcastPrevIndexLocked(req)
 	n.pendingBroadcastBytes -= req.bytes
 	if n.pendingBroadcastBytes < 0 {
 		n.pendingBroadcastBytes = 0
+	}
+}
+
+func (n *Node) addPendingBlockBroadcastPrevIndexLocked(req pendingBlockBroadcastDecode) {
+	key := tnstore.BlockKey(req.prev)
+	if n.pendingBroadcastByPrev == nil {
+		n.pendingBroadcastByPrev = map[tnstore.BlockRootHash]map[string]struct{}{}
+	}
+	fingerprints := n.pendingBroadcastByPrev[key]
+	if fingerprints == nil {
+		fingerprints = map[string]struct{}{}
+		n.pendingBroadcastByPrev[key] = fingerprints
+	}
+	fingerprints[req.fingerprint] = struct{}{}
+}
+
+func (n *Node) deletePendingBlockBroadcastPrevIndexLocked(req pendingBlockBroadcastDecode) {
+	key := tnstore.BlockKey(req.prev)
+	fingerprints := n.pendingBroadcastByPrev[key]
+	if len(fingerprints) == 0 {
+		return
+	}
+	delete(fingerprints, req.fingerprint)
+	if len(fingerprints) == 0 {
+		delete(n.pendingBroadcastByPrev, key)
 	}
 }
 

@@ -65,7 +65,7 @@ const (
 	attachWarmupTimeout        = 3 * time.Second
 	broadcastEventBuffer       = 4096
 	broadcastQueueMaxItems     = 1024
-	broadcastQueueMaxBytes     = int64(128 << 20)
+	broadcastQueueMaxBytes     = int64(512 << 20)
 	broadcastDeduperMaxEntries = 4096
 	externalMessageCacheTTL    = time.Minute
 	externalMessageCacheMax    = 1 << 17
@@ -79,7 +79,7 @@ const (
 	broadcastSignatureTimeout  = 2 * time.Second
 	peerRebroadcastTimeout     = 5 * time.Second
 	peerRebroadcastQueueItems  = 2048
-	peerRebroadcastQueueBytes  = int64(256 << 20)
+	peerRebroadcastQueueBytes  = int64(1024 << 20)
 	externalRebroadcastFanout  = 5
 	laggedExternalFanout       = 3
 	localRebroadcastAttempts   = 3

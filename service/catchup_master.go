@@ -140,6 +140,9 @@ func nextBlockBootstrapLiveTail(blockUTime int64, nowUnix int64) bool {
 
 func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 	s.observeBroadcastFlushedCurrentState(current)
+	if current != nil {
+		s.rememberAppliedMasterchainState(&current.Masterchain)
+	}
 	if !s.publishLiveCurrentStateChanged(current) {
 		return
 	}
@@ -168,9 +171,46 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	s.observeBroadcastLiveCurrentState(next)
 
 	if s.node != nil {
-		s.node.NotifyCompressedBlockStateReady()
+		s.node.NotifyCompressedBlockStateReady(currentStateCompressedBlockStateRefs(next)...)
 	}
 	return true
+}
+
+func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.BlockIDExt {
+	if current == nil {
+		return nil
+	}
+
+	refs := make([]ton.BlockIDExt, 0, len(current.Shards)+1)
+	refs = append(refs, current.Masterchain.Block)
+	for _, key := range storage.SortedShardKeys(current.Shards) {
+		shard := current.Shards[key]
+		refs = append(refs, shard.Block)
+	}
+	return refs
+}
+
+func (s *Service) rememberAppliedMasterchainState(state *storage.BlockState) {
+	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard {
+		return
+	}
+
+	next := storage.CloneBlockState(state)
+
+	s.currentStatusMu.Lock()
+	if s.appliedMasterchainStatus != nil && s.appliedMasterchainStatus.Block.SeqNo >= next.Block.SeqNo {
+		s.currentStatusMu.Unlock()
+		return
+	}
+	s.appliedMasterchainStatus = next
+	s.currentStatusMu.Unlock()
+}
+
+func (s *Service) appliedMasterchainStatusSnapshot() *storage.BlockState {
+	s.currentStatusMu.RLock()
+	state := storage.CloneBlockState(s.appliedMasterchainStatus)
+	s.currentStatusMu.RUnlock()
+	return state
 }
 
 func currentStateBehind(next *storage.CurrentState, current *storage.CurrentState) bool {

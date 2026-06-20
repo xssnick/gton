@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/gton/service/blocksync"
+	"github.com/xssnick/gton/service/p2p"
 )
 
 func TestNextSyncedBlockProcessorJobDrainsPriorityFirst(t *testing.T) {
@@ -34,5 +35,32 @@ func TestNextSyncedBlockProcessorJobUsesRegularAfterPriorityClosed(t *testing.T)
 	}
 	if !got.CatchUp {
 		t.Fatalf("got unexpected job after priority close: %+v", got)
+	}
+}
+
+func TestIsHotMasterchainSyncedBlockRequiresPriorityLiveMaster(t *testing.T) {
+	master := testMasterBlockID(10)
+	if !isHotMasterchainSyncedBlock(blocksync.SyncedBlock{
+		Priority:   true,
+		Downloaded: p2p.DownloadedBlock{ID: master},
+	}) {
+		t.Fatal("priority live master block should use hot queue")
+	}
+
+	if isHotMasterchainSyncedBlock(blocksync.SyncedBlock{
+		Priority:   true,
+		CatchUp:    true,
+		Downloaded: p2p.DownloadedBlock{ID: master},
+	}) {
+		t.Fatal("catch-up master block should not use hot queue")
+	}
+
+	base := master
+	base.Workchain = 0
+	if isHotMasterchainSyncedBlock(blocksync.SyncedBlock{
+		Priority:   true,
+		Downloaded: p2p.DownloadedBlock{ID: base},
+	}) {
+		t.Fatal("basechain block should not use master hot queue")
 	}
 }

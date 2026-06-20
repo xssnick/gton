@@ -304,7 +304,13 @@ func (c *serviceCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c *serviceCollector) collectSync(ch chan<- prometheus.Metric, snapshot service.StatusSnapshot, now time.Time) {
-	c.collectChain(ch, "masterchain", "masterchain", snapshot.LocalMasterchain, snapshot.LatestMasterchain, snapshot.LocalMasterchainUtime, now)
+	masterLocal := snapshot.AppliedMasterchain
+	masterUTime := snapshot.AppliedMasterchainUtime
+	if masterLocal == nil {
+		masterLocal = snapshot.LocalMasterchain
+		masterUTime = snapshot.LocalMasterchainUtime
+	}
+	c.collectChain(ch, "masterchain", "masterchain", masterLocal, snapshot.LatestMasterchain, masterUTime, now)
 	if len(snapshot.LocalBasechainShards) == 0 {
 		c.collectChain(ch, "shardchain", "basechain", snapshot.LocalBasechain, snapshot.LatestBasechain, snapshot.LocalBasechainUtime, now)
 	} else {

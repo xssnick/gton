@@ -64,6 +64,44 @@ func TestPendingBroadcastExpiryReleasesDeduper(t *testing.T) {
 	}
 }
 
+func TestPendingBroadcastDecodeSnapshotForPrevUsesIndex(t *testing.T) {
+	node := newTestNode(t)
+	now := time.Unix(100, 0)
+	prevA := testBlockID(-1, topShard, 10)
+	prevB := testBlockID(-1, topShard, 11)
+
+	node.schedulePendingBlockBroadcastDecode(pendingBlockBroadcastDecode{
+		fingerprint: "pending-a",
+		block:       testBlockID(-1, topShard, 12),
+		prev:        prevA,
+		receivedAt:  now,
+		msg:         struct{}{},
+	})
+	node.schedulePendingBlockBroadcastDecode(pendingBlockBroadcastDecode{
+		fingerprint: "pending-b",
+		block:       testBlockID(-1, topShard, 13),
+		prev:        prevB,
+		receivedAt:  now,
+		msg:         struct{}{},
+	})
+
+	reqs := node.pendingBlockBroadcastDecodeSnapshotForPrev(prevA, now)
+	if len(reqs) != 1 || reqs[0].fingerprint != "pending-a" {
+		t.Fatalf("snapshot for prev A = %+v, want pending-a", reqs)
+	}
+
+	node.forgetPendingBlockBroadcastDecode("pending-a")
+	reqs = node.pendingBlockBroadcastDecodeSnapshotForPrev(prevA, now)
+	if len(reqs) != 0 {
+		t.Fatalf("snapshot for prev A after delete = %+v, want empty", reqs)
+	}
+
+	reqs = node.pendingBlockBroadcastDecodeSnapshotForPrev(prevB, now)
+	if len(reqs) != 1 || reqs[0].fingerprint != "pending-b" {
+		t.Fatalf("snapshot for prev B = %+v, want pending-b", reqs)
+	}
+}
+
 func TestOverlayBlockForDownloadUsesMonitorMinSplitDepth(t *testing.T) {
 	node := newTestNode(t)
 	block := testBlockID(0, int64(-0x2000000000000000), 10)

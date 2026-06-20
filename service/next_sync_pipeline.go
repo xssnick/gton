@@ -622,6 +622,7 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 	}
 
 	r.service.publishLiveBlockArtifacts(prepared, nextMaster)
+	r.service.rememberAppliedMasterchainState(nextMaster)
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
 	r.service.rememberMasterState(r.ctx, nextMaster, &prepared)
 	applyCells.remember(prepared.ID, prepared.StateUpdateToCells)
@@ -1198,7 +1199,7 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 
 	r.service.publishLiveBlockArtifacts(downloaded, state)
 	if r.service.rememberCompressedBlockState(state) && r.service.node != nil {
-		r.service.node.NotifyCompressedBlockStateReady()
+		r.service.node.NotifyCompressedBlockStateReady(state.Block)
 	}
 
 	splitDepth, err := r.service.cachedMonitorMinSplitDepth(r.master, downloaded.ID.Workchain)
