@@ -7,6 +7,7 @@ import (
 
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
+	"github.com/xssnick/tonutils-go/adnl/rldp"
 )
 
 func testArchiveCandidate(label string) *overlayPeer {
@@ -25,6 +26,23 @@ func testArchivePool(sub *overlaySubscription) *archivePeerPool {
 		sub.peers = map[PeerID]*overlayPeer{}
 	}
 	return newArchivePeerPool(sub)
+}
+
+func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlayADNL) {
+	base := newTestOverlayADNL()
+	adnlWrapper := overlay.CreateExtendedADNL(base)
+	baseRLDP := rldp.NewClientV2(adnlWrapper)
+	rldpWrapper := overlay.CreateExtendedRLDP(baseRLDP)
+	id := testPeerID(label)
+	pooled := &pooledPeer{
+		id:          id,
+		addr:        label,
+		adnl:        adnlWrapper,
+		rldp:        rldpWrapper,
+		overlayRefs: map[string]int{},
+	}
+	pool := &peerPool{peers: map[PeerID]*pooledPeer{id: pooled}}
+	return pool, pooled, base
 }
 
 func TestArchivePeerCooldownFiltersOnlyArchivePool(t *testing.T) {
@@ -143,19 +161,22 @@ func TestArchiveSessionCloseReleasesPinnedPeers(t *testing.T) {
 
 func TestArchiveSessionCloseClosesOnlyArchiveOnlyPeers(t *testing.T) {
 	liveOverlay, liveConn := newTestOverlayWrapper()
-	archiveOverlay, archiveConn := newTestOverlayWrapper()
 	livePeer := testArchiveCandidate("live")
 	livePeer.overlay = liveOverlay
-	archivePeer := testArchiveCandidate("archive-only")
-	archivePeer.overlay = archiveOverlay
-	node := &Node{peerUse: map[PeerID]peerUse{}}
+	archivePool, pooledArchive, archiveConn := newTestLeasedPooledPeer("archive-only")
+	node := &Node{peerUse: map[PeerID]peerUse{}, pool: archivePool}
 	sub := &overlaySubscription{
 		log:  discardLogger(),
 		node: node,
+		spec: overlaySpec{
+			ShortID: []byte{0x01},
+			Kind:    overlayKindPublicShard,
+		},
 		peers: map[PeerID]*overlayPeer{
 			livePeer.id: livePeer,
 		},
 	}
+	archivePeer := sub.newOverlayPeer(pooledArchive, nil, false, true)
 	session := node.BeginArchiveSession()
 
 	pool := session.archivePeerPool(sub)
@@ -181,19 +202,16 @@ func TestArchiveSessionCloseClosesOnlyArchiveOnlyPeers(t *testing.T) {
 }
 
 func TestArchivePoolBorrowedPeerReplacesAndClosesArchiveOnlyPeer(t *testing.T) {
-	archiveOverlay, archiveConn := newTestOverlayWrapper()
-	liveOverlay, liveConn := newTestOverlayWrapper()
-	peerID := testPeerID("same-peer")
-	archivePeer := testArchiveCandidate("archive-only")
-	archivePeer.id = peerID
-	archivePeer.overlay = archiveOverlay
-	livePeer := testArchiveCandidate("live")
-	livePeer.id = peerID
-	livePeer.overlay = liveOverlay
+	basePool, pooledPeer, sharedConn := newTestLeasedPooledPeer("same-peer")
 	sub := &overlaySubscription{
+		node:  &Node{pool: basePool},
 		log:   discardLogger(),
+		spec:  overlaySpec{ShortID: []byte{0x01}, Kind: overlayKindPublicShard},
 		peers: map[PeerID]*overlayPeer{},
 	}
+	announced := &overlay.Node{Version: int32(time.Now().Unix())}
+	archivePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
+	livePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
 	pool := testArchivePool(sub)
 
 	if !pool.addArchiveOnlyPeer(archivePeer) {
@@ -202,18 +220,76 @@ func TestArchivePoolBorrowedPeerReplacesAndClosesArchiveOnlyPeer(t *testing.T) {
 	pool.addBorrowedPeer(livePeer)
 
 	select {
-	case <-archiveConn.GetCloserCtx().Done():
-	default:
-		t.Fatal("archive-only peer connection survived live replacement")
-	}
-	select {
-	case <-liveConn.GetCloserCtx().Done():
-		t.Fatal("borrowed live peer connection was closed during replacement")
+	case <-sharedConn.GetCloserCtx().Done():
+		t.Fatal("archive-only replacement closed shared pooled ADNL")
 	default:
 	}
 	got := pool.candidates(archive.ShardID{Workchain: -1, Shard: topShard})
 	if len(got) != 1 || got[0] != livePeer {
 		t.Fatalf("expected borrowed live peer after replacement, got %#v", got)
+	}
+}
+
+func TestArchiveOnlyPeerCloseDoesNotCloseSharedPooledADNL(t *testing.T) {
+	pool, pooled, base := newTestLeasedPooledPeer("shared")
+	overlayID := []byte{0x01}
+	sub := &overlaySubscription{
+		node: &Node{pool: pool},
+		spec: overlaySpec{
+			ShortID: overlayID,
+			Kind:    overlayKindPublicShard,
+		},
+	}
+	archivePeer := sub.newOverlayPeer(pooled, nil, false, true)
+	archivePeer.initRebroadcastQueues()
+	livePeer := sub.newOverlayPeer(pooled, nil, false, true)
+	liveOverlay := livePeer.overlay
+
+	closeArchiveOnlyPeer(archivePeer)
+
+	archivePeer.rebroadcastMx.Lock()
+	rebroadcastClosed := archivePeer.rebroadcastClosed
+	archivePeer.rebroadcastMx.Unlock()
+	if !rebroadcastClosed {
+		t.Fatal("archive-only close left rebroadcast queues open")
+	}
+	select {
+	case <-base.GetCloserCtx().Done():
+		t.Fatal("archive-only close closed shared pooled ADNL")
+	default:
+	}
+	if got := pooled.adnl.CreateOverlayWithSettings(overlayID, maxOverlayPayloadSize, true, false); got != liveOverlay {
+		t.Fatal("archive-only close unregistered shared live overlay")
+	}
+
+	livePeer.close()
+	select {
+	case <-base.GetCloserCtx().Done():
+	default:
+		t.Fatal("pooled ADNL survived last overlay release")
+	}
+}
+
+func TestArchiveOnlyPeerCloseClosesUnusedPooledADNL(t *testing.T) {
+	pool, pooled, base := newTestLeasedPooledPeer("archive-only")
+	sub := &overlaySubscription{
+		node: &Node{pool: pool},
+		spec: overlaySpec{
+			ShortID: []byte{0x01},
+			Kind:    overlayKindPublicShard,
+		},
+	}
+	archivePeer := sub.newOverlayPeer(pooled, nil, false, true)
+
+	closeArchiveOnlyPeer(archivePeer)
+
+	select {
+	case <-base.GetCloserCtx().Done():
+	default:
+		t.Fatal("unused archive-only pooled ADNL survived close")
+	}
+	if len(pool.snapshot()) != 0 {
+		t.Fatal("unused archive-only pooled peer survived in pool")
 	}
 }
 

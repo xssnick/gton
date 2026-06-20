@@ -19,6 +19,15 @@ type p2pStateSource struct {
 	log  zerolog.Logger
 }
 
+type downloadedStateWithBlockArtifact struct {
+	storage.DownloadedState
+	artifact *storage.ServedBlockFull
+}
+
+func (d *downloadedStateWithBlockArtifact) BlockArtifact() *storage.ServedBlockFull {
+	return d.artifact.Clone()
+}
+
 func NewP2PStateSource(node *p2p.Node, logger ...*zerolog.Logger) state.Source {
 	log := zerolog.Nop()
 	if len(logger) > 0 && logger[0] != nil {
@@ -135,48 +144,71 @@ func (s *p2pStateSource) DownloadState(ctx context.Context, block ton.BlockIDExt
 		Uint32("split_depth", splitDepth).
 		Msg("requesting state snapshot")
 
-	stateRootHash, err := s.blockStateRootHash(ctx, block)
+	artifact, stateRootHash, err := s.blockStateRootArtifact(ctx, block)
 	if err != nil {
 		return nil, fmt.Errorf("load expected state root for %s: %w", storage.FormatBlockRef(block), err)
 	}
 
 	downloaded, err := s.node.DownloadState(ctx, block, master, splitDepth, stateRootHash)
-	return downloaded, normalizeStateSourceError(err)
+	if err != nil {
+		return nil, normalizeStateSourceError(err)
+	}
+	return &downloadedStateWithBlockArtifact{
+		DownloadedState: downloaded,
+		artifact:        artifact,
+	}, nil
 }
 
-func (s *p2pStateSource) blockStateRootHash(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+func (s *p2pStateSource) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
+	artifact, _, err := s.blockStateRootArtifact(ctx, block)
+	return artifact, err
+}
+
+func (s *p2pStateSource) blockStateRootArtifact(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, []byte, error) {
 	downloaded, err := s.node.DownloadBlockFull(ctx, block)
 	if err != nil {
-		return nil, fmt.Errorf("download block: %w", err)
+		return nil, nil, fmt.Errorf("download block: %w", err)
 	}
 	if downloaded == nil {
-		return nil, fmt.Errorf("download block: empty response")
+		return nil, nil, fmt.Errorf("download block: empty response")
+	}
+	if len(downloaded.BlockBOC) == 0 {
+		return nil, nil, fmt.Errorf("downloaded block %s has no block data", storage.FormatBlockRef(block))
+	}
+	if len(downloaded.ProofBOC) == 0 {
+		return nil, nil, fmt.Errorf("downloaded block %s has no proof", storage.FormatBlockRef(block))
 	}
 
 	root := downloaded.Block
 	if root == nil {
-		return nil, fmt.Errorf("downloaded block %s is missing parsed cell", storage.FormatBlockRef(block))
+		return nil, nil, fmt.Errorf("downloaded block %s is missing parsed cell", storage.FormatBlockRef(block))
 	}
 	if downloaded.IsLink && root.GetType() == cell.MerkleProofCellType {
 		root, err = cell.UnwrapProof(root, downloaded.ID.RootHash)
 		if err != nil {
-			return nil, fmt.Errorf("unwrap block proof link: %w", err)
+			return nil, nil, fmt.Errorf("unwrap block proof link: %w", err)
 		}
 	}
 
 	meta, err := storage.BuildBlockMetaFromBlockCell(downloaded.ID, root)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(meta.StateRootHash) == 0 {
-		return nil, fmt.Errorf("block has no state update target")
+		return nil, nil, fmt.Errorf("block has no state update target")
 	}
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
 		Str("state_root_hash", fmt.Sprintf("%x", meta.StateRootHash)).
 		Msg("resolved block state root for snapshot validation")
-	return meta.StateRootHash, nil
+	return &storage.ServedBlockFull{
+		ID:     downloaded.ID,
+		Proof:  downloaded.ProofBOC,
+		Block:  downloaded.BlockBOC,
+		Meta:   meta,
+		IsLink: storage.ServedBlockProofIsLink(downloaded.ID, downloaded.IsLink),
+	}, meta.StateRootHash, nil
 }
 
 func normalizeStateSourceError(err error) error {

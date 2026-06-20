@@ -50,7 +50,20 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 			continue
 		}
 
-		meta, proofKinds := servedBlockFullMeta(entry.Artifact)
+		meta, proofKinds, err := servedBlockFullMeta(entry.Artifact)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if entry.State != nil {
+			if !entry.State.Block.Equals(&entry.Artifact.ID) {
+				return nil, nil, nil, fmt.Errorf(
+					"checkpoint artifact %s state block mismatch %s",
+					storage.FormatBlockRef(entry.Artifact.ID),
+					storage.FormatBlockRef(entry.State.Block),
+				)
+			}
+			meta = storage.MergeBlockMeta(meta, storage.BuildBlockMetaFromState(*entry.State))
+		}
 		var blockRef *storage.ArtifactRef
 		blockRefIndex := noQueuedRef
 		if len(entry.Artifact.Block) > 0 {
@@ -123,19 +136,35 @@ func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkp
 	return nil
 }
 
-func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []storage.ServedProofKind) {
+func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []storage.ServedProofKind, error) {
+	if block == nil {
+		return nil, nil, fmt.Errorf("served block is missing")
+	}
+	if len(block.Block) == 0 && len(block.Proof) == 0 {
+		return nil, nil, fmt.Errorf("served block %s has no block data or proof", storage.FormatBlockRef(block.ID))
+	}
+
 	isLink := storage.ServedBlockProofIsLink(block.ID, block.IsLink)
 	meta := &storage.BlockMeta{
 		ID: block.ID,
 	}
 	if block.Meta != nil {
-		meta = storage.MergeBlockMeta(meta, block.Meta)
+		if len(block.Meta.NextRefs) > 0 {
+			return nil, nil, fmt.Errorf("served block meta %s cannot set next refs directly", storage.FormatBlockRef(block.ID))
+		}
+		provided := block.Meta.Clone()
+		provided.Flags &^= servedBlockPayloadMetaFlags()
+		meta = storage.MergeBlockMeta(meta, provided)
 		meta.ID = block.ID
 	}
 	if len(block.Block) > 0 {
 		meta.Mark(storage.BlockMetaHasBlockData)
 		if block.Meta == nil && len(block.Block) > 0 {
-			meta = storage.MergeBlockMetaFromBlockData(meta, block.ID, block.Block)
+			merged, err := storage.MergeBlockMetaFromBlockData(meta, block.ID, block.Block)
+			if err != nil {
+				return nil, nil, fmt.Errorf("build block meta from %s: %w", storage.FormatBlockRef(block.ID), err)
+			}
+			meta = merged
 		}
 	}
 
@@ -149,7 +178,20 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 	if len(block.Block) > 0 && len(proofKinds) > 0 {
 		meta.Mark(blockMetaServedFlags(isLink))
 	}
-	return meta, proofKinds
+	if !blockMetaHasStoredMetadata(meta) {
+		return nil, nil, fmt.Errorf("served block %s has no stored metadata", storage.FormatBlockRef(block.ID))
+	}
+	return meta, proofKinds, nil
+}
+
+func servedBlockPayloadMetaFlags() storage.BlockMetaFlags {
+	return storage.BlockMetaHasServedFull |
+		storage.BlockMetaServedFullIsLink |
+		storage.BlockMetaHasBlockData |
+		storage.BlockMetaHasProofBlock |
+		storage.BlockMetaHasProofBlockLink |
+		storage.BlockMetaHasProofKeyBlock |
+		storage.BlockMetaHasProofKeyBlockLink
 }
 
 func (s *Store) validateArchiveImportMasterRefs(requests []archiveAppendRequest) error {
@@ -226,7 +268,10 @@ func (s *Store) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
 
 	fullWrites := make([]fullWrite, 0, len(imported.FullBlocks))
 	for _, full := range imported.FullBlocks {
-		meta, proofKinds := servedBlockFullMeta(full)
+		meta, proofKinds, err := servedBlockFullMeta(full)
+		if err != nil {
+			return err
+		}
 		var blockRef *storage.ArtifactRef
 		blockRefIndex := noQueuedRef
 		if len(full.Block) > 0 {
@@ -413,11 +458,21 @@ func mergePendingBlockMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, m
 
 func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	pendingKey := storage.BlockKey(prev)
-	if existing, ok := pending[pendingKey]; ok {
-		return s.mergeSelectedNextBlockLink(metas, pending, prev, existing, next)
-	}
-	if meta := metas[pendingKey]; meta != nil && len(meta.NextRefs) > 0 {
-		return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
+	if meta := metas[pendingKey]; meta != nil {
+		if !blockMetaHasServedFull(meta) {
+			return nextBlockLinkMissingPreviousError(prev, next)
+		}
+		if err := s.requireNextBlockLinkTargetMaterialized(metas, prev, next); err != nil {
+			return err
+		}
+		if existing, ok := pending[pendingKey]; ok {
+			return s.mergeSelectedNextBlockLink(metas, pending, prev, existing, next)
+		}
+		if len(meta.NextRefs) > 0 {
+			return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
+		}
+		recordPendingNextBlockLink(metas, pending, prev, next)
+		return nil
 	}
 
 	current, closer, err := pebbleReaderGet(s.hot, hotKeyBlockMeta(prev))
@@ -427,15 +482,61 @@ func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHas
 		if err != nil {
 			return err
 		}
+		if !blockMetaHasServedFull(meta) {
+			return nextBlockLinkMissingPreviousError(prev, next)
+		}
+		if err := s.requireNextBlockLinkTargetMaterialized(metas, prev, next); err != nil {
+			return err
+		}
 		if len(meta.NextRefs) > 0 {
 			return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
 		}
+		recordPendingNextBlockLink(metas, pending, prev, next)
+		return nil
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
-	recordPendingNextBlockLink(metas, pending, prev, next)
-	return nil
+	return nextBlockLinkMissingPreviousError(prev, next)
+}
+
+func blockMetaHasServedFull(meta *storage.BlockMeta) bool {
+	return meta != nil && meta.Has(storage.BlockMetaHasServedFull)
+}
+
+func nextBlockLinkMissingPreviousError(prev ton.BlockIDExt, next ton.BlockIDExt) error {
+	return fmt.Errorf("next block link %s -> %s requires materialized previous block: %w", storage.FormatBlockRef(prev), storage.FormatBlockRef(next), storage.ErrNotFound)
+}
+
+func (s *Store) requireNextBlockLinkTargetMaterialized(metas map[storage.BlockRootHash]*storage.BlockMeta, prev ton.BlockIDExt, next ton.BlockIDExt) error {
+	key := storage.BlockKey(next)
+	if meta := metas[key]; meta != nil {
+		if blockMetaHasServedFull(meta) {
+			return nil
+		}
+		return nextBlockLinkMissingTargetError(prev, next)
+	}
+
+	current, closer, err := pebbleReaderGet(s.hot, hotKeyBlockMeta(next))
+	if err == nil {
+		defer func() { _ = closer.Close() }()
+		meta, err := decodeBlockMeta(next, current)
+		if err != nil {
+			return err
+		}
+		if blockMetaHasServedFull(meta) {
+			return nil
+		}
+		return nextBlockLinkMissingTargetError(prev, next)
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return err
+	}
+	return nextBlockLinkMissingTargetError(prev, next)
+}
+
+func nextBlockLinkMissingTargetError(prev ton.BlockIDExt, next ton.BlockIDExt) error {
+	return fmt.Errorf("next block link %s -> %s requires materialized next block: %w", storage.FormatBlockRef(prev), storage.FormatBlockRef(next), storage.ErrNotFound)
 }
 
 func (s *Store) mergeSelectedNextBlockLink(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, existing ton.BlockIDExt, next ton.BlockIDExt) error {
@@ -585,9 +686,21 @@ func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.
 	if err != nil {
 		return err
 	}
+	existing := meta.Clone()
 	meta.Flags &^= storage.BlockMetaHasStateSnapshot
 	meta.StateFileHash = nil
-	return batch.Set(key, encodeBlockMeta(meta), pebble.NoSync)
+	if !blockMetaIndexedInHistory(meta) {
+		if err := deleteBlockMetaHistoryIndexes(batch, existing); err != nil {
+			return err
+		}
+	}
+	if !blockMetaHasStoredMetadata(meta) {
+		return batch.Delete(key, pebble.NoSync)
+	}
+	if err = batch.Set(key, encodeBlockMeta(meta), pebble.NoSync); err != nil {
+		return err
+	}
+	return setBlockMetaHistoryIndexes(batch, existing, meta)
 }
 
 func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
@@ -698,7 +811,7 @@ func (s *Store) StoredZeroStateBlocks(ctx context.Context) ([]ton.BlockIDExt, er
 
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: bytes.Clone(hotPrefixZeroStateRef),
-		UpperBound: appendPrefixUpperBound(hotPrefixZeroStateRef),
+		UpperBound: prefixUpperBound(hotPrefixZeroStateRef),
 	})
 	if err != nil {
 		return nil, err

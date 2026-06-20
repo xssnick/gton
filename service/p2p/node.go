@@ -298,6 +298,13 @@ func New(opts Options) (*Node, error) {
 	}, nil
 }
 
+func (n *Node) SetRuntimeCallbacks(callbacks RuntimeCallbacks) {
+	n.compressedState = callbacks
+	n.syncLag = callbacks
+	n.signatureVerifier = callbacks
+	n.broadcastAdmission = callbacks
+}
+
 func protocolDiagnosticLoggable(msg string) bool {
 	return strings.Contains(msg, "error") ||
 		strings.Contains(msg, "failed") ||
@@ -891,11 +898,13 @@ type peerPool struct {
 }
 
 type pooledPeer struct {
-	id   PeerID
-	addr string
-	pub  ed25519.PublicKey
-	adnl *overlay.ADNLWrapper
-	rldp *overlay.RLDPWrapper
+	id          PeerID
+	addr        string
+	pub         ed25519.PublicKey
+	adnl        *overlay.ADNLWrapper
+	rldp        *overlay.RLDPWrapper
+	refs        int
+	overlayRefs map[string]int
 }
 
 func newPeerPool(gateway *adnl.Gateway) *peerPool {
@@ -912,6 +921,7 @@ func (p *peerPool) Get(addr string, key ed25519.PublicKey) (*pooledPeer, error) 
 	}
 	pooled, _, err := p.wrap(peer)
 	if err != nil {
+		peer.Close()
 		return nil, err
 	}
 	return pooled, nil
@@ -936,11 +946,12 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	rldpClient := overlay.CreateExtendedRLDP(baseRLDP)
 
 	pooled := &pooledPeer{
-		id:   id,
-		addr: peer.RemoteAddr(),
-		pub:  append(ed25519.PublicKey(nil), peer.GetPubKey()...),
-		adnl: wrapper,
-		rldp: rldpClient,
+		id:          id,
+		addr:        peer.RemoteAddr(),
+		pub:         append(ed25519.PublicKey(nil), peer.GetPubKey()...),
+		adnl:        wrapper,
+		rldp:        rldpClient,
+		overlayRefs: map[string]int{},
 	}
 	rldpClient.SetOnDisconnect(func() {
 		p.mx.Lock()
@@ -949,6 +960,87 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	})
 	p.peers[id] = pooled
 	return pooled, true, nil
+}
+
+func (p *peerPool) acquireOverlay(pooled *pooledPeer, overlayID []byte, maxUnauthBroadcastSize uint32, allowBroadcastFEC bool, trustUnauthorizedBroadcast bool) (*overlay.ADNLOverlayWrapper, *overlay.RLDPOverlayWrapper, func()) {
+	key := string(overlayID)
+
+	p.mx.Lock()
+	pooled.refs++
+	if pooled.overlayRefs == nil {
+		pooled.overlayRefs = map[string]int{}
+	}
+	pooled.overlayRefs[key]++
+	p.mx.Unlock()
+
+	adnlOverlay := pooled.adnl.CreateOverlayWithSettings(overlayID, maxUnauthBroadcastSize, allowBroadcastFEC, trustUnauthorizedBroadcast)
+	rldpOverlay := pooled.rldp.CreateOverlay(overlayID)
+
+	var once sync.Once
+	return adnlOverlay, rldpOverlay, func() {
+		once.Do(func() {
+			p.releaseOverlay(pooled, key, adnlOverlay, rldpOverlay)
+		})
+	}
+}
+
+func (p *peerPool) releaseOverlay(pooled *pooledPeer, overlayKey string, adnlOverlay *overlay.ADNLOverlayWrapper, rldpOverlay *overlay.RLDPOverlayWrapper) {
+	var closeBase *pooledPeer
+
+	p.mx.Lock()
+	if refs := pooled.overlayRefs[overlayKey]; refs <= 1 {
+		delete(pooled.overlayRefs, overlayKey)
+		if adnlOverlay != nil {
+			adnlOverlay.Close()
+		}
+		if rldpOverlay != nil {
+			rldpOverlay.Close()
+		}
+	} else {
+		pooled.overlayRefs[overlayKey] = refs - 1
+	}
+
+	if pooled.refs > 0 {
+		pooled.refs--
+	}
+	if pooled.refs == 0 && p.peers[pooled.id] == pooled {
+		delete(p.peers, pooled.id)
+		closeBase = pooled
+	}
+	p.mx.Unlock()
+
+	if closeBase != nil {
+		closeBase.close()
+	}
+}
+
+func (p *peerPool) closeIfUnused(pooled *pooledPeer) {
+	if pooled == nil {
+		return
+	}
+
+	var closeBase *pooledPeer
+
+	p.mx.Lock()
+	if pooled.refs == 0 && len(pooled.overlayRefs) == 0 && p.peers[pooled.id] == pooled {
+		delete(p.peers, pooled.id)
+		closeBase = pooled
+	}
+	p.mx.Unlock()
+
+	if closeBase != nil {
+		closeBase.close()
+	}
+}
+
+func (p *pooledPeer) close() {
+	if p.rldp != nil {
+		p.rldp.Close()
+		return
+	}
+	if p.adnl != nil {
+		p.adnl.Close()
+	}
 }
 
 func (p *peerPool) snapshot() []*pooledPeer {

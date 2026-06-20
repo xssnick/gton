@@ -281,6 +281,56 @@ func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 	}
 }
 
+func TestLiveStoreNonfinalCellIndexUsesNearestPendingBlock(t *testing.T) {
+	live := &LiveStore{
+		nonFinalPending:    map[storage.BlockRootHash]liveNonfinalPending{},
+		nonFinalOrderIndex: map[storage.BlockRootHash]int{},
+		nonFinalCellIndex:  map[cell.Hash][]liveNonfinalCellIndexEntry{},
+	}
+
+	var hash cell.Hash
+	hash[0] = 0x91
+	firstData := []byte{0x01}
+	secondData := []byte{0x02}
+
+	first := testNonfinalArtifact(t, 0, masterchainShard, 11, cell.BeginCell().MustStoreUInt(0x41, 8).EndCell()).Block
+	second := testNonfinalArtifact(t, 0, masterchainShard, 12, cell.BeginCell().MustStoreUInt(0x42, 8).EndCell(), first).Block
+	firstKey := storage.BlockKey(first)
+	secondKey := storage.BlockKey(second)
+
+	live.putNonfinalPendingLocked(firstKey, liveNonfinalPending{
+		block: first,
+		cells: storage.NewStateCellRecords([]storage.EncodedCellRecord{{Hash: hash, Data: firstData}}),
+	})
+	live.putNonfinalPendingLocked(secondKey, liveNonfinalPending{
+		block: second,
+		cells: storage.NewStateCellRecords([]storage.EncodedCellRecord{{Hash: hash, Data: secondData}}),
+	})
+
+	if got := live.nonfinalCellDataLocked(second, hash); !bytes.Equal(got, secondData) {
+		t.Fatalf("second block cell data = %x, want %x", got, secondData)
+	}
+	if got := live.nonfinalCellDataLocked(first, hash); !bytes.Equal(got, firstData) {
+		t.Fatalf("first block cell data = %x, want %x", got, firstData)
+	}
+
+	live.deleteNonfinalPendingLocked(secondKey)
+	if got := live.nonfinalCellDataLocked(second, hash); got != nil {
+		t.Fatalf("deleted second block cell data = %x, want nil", got)
+	}
+	if got := live.nonfinalCellDataLocked(first, hash); !bytes.Equal(got, firstData) {
+		t.Fatalf("first block cell data after cleanup = %x, want %x", got, firstData)
+	}
+	if entries := live.nonFinalCellIndex[hash]; len(entries) != 1 || entries[0].block != firstKey {
+		t.Fatalf("cell index after second cleanup = %#v, want only first block", entries)
+	}
+
+	live.deleteNonfinalPendingLocked(firstKey)
+	if entries := live.nonFinalCellIndex[hash]; len(entries) != 0 {
+		t.Fatalf("cell index after full cleanup = %#v, want empty", entries)
+	}
+}
+
 func TestLiveStoreNonfinalUsesStateUpdateLazyOverlay(t *testing.T) {
 	store := &fakeLazyCellStore{cells: map[cell.Hash]*cell.Cell{}}
 	live := NewLiveStore(store, LiveStoreOptions{

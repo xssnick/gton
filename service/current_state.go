@@ -918,6 +918,9 @@ func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.Blo
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return PreparedBlock{}, err
 	}
+	if s.node == nil {
+		return PreparedBlock{}, fmt.Errorf("download block %s: p2p node is not initialized", storage.FormatBlockRef(block))
+	}
 
 	downloadStarted := time.Now()
 	raw, err := s.downloadExactChainBlockWithRetry(ctx, block)

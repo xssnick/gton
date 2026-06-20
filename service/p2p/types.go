@@ -230,6 +230,13 @@ type SyncLagProvider interface {
 	SyncLagSeconds() (int64, error)
 }
 
+type RuntimeCallbacks interface {
+	CompressedBlockStateProvider
+	SyncLagProvider
+	BroadcastSignatureVerifier
+	BroadcastAdmission
+}
+
 type CustomOverlayConfig struct {
 	Name              string
 	Nodes             []CustomOverlayNodeConfig

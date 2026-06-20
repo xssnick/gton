@@ -929,7 +929,7 @@ func (p *archivePeerPool) connectArchiveNode(ctx context.Context, node overlay.N
 		if err != nil {
 			continue
 		}
-		peer := p.sub.newOverlayPeer(pooled, &node, false, false)
+		peer := p.sub.newOverlayPeer(pooled, &node, false, p.sub.spec.Kind != overlayKindCustomFixed)
 		if !p.addArchiveOnlyPeer(peer) {
 			closeArchiveOnlyPeer(peer)
 			return false, nil
@@ -1012,12 +1012,5 @@ func closeArchiveOnlyPeer(peer *overlayPeer) {
 		return
 	}
 
-	peer.closeRebroadcastQueues()
-	if peer.overlay != nil && peer.overlay.ADNLWrapper != nil {
-		peer.overlay.Close()
-		peer.overlay.ADNLWrapper.Close()
-	}
-	if peer.rldpOverlay != nil {
-		peer.rldpOverlay.Close()
-	}
+	peer.close()
 }

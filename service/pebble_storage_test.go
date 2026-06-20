@@ -29,9 +29,16 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 
 	if err := store.SaveArchiveImport(&storage.ServedArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
+			ID:     prev,
+			Block:  []byte{0x70},
+			Proof:  []byte{0x71},
+			Meta:   &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
+			IsLink: false,
+		}, {
 			ID:     block,
 			Block:  blockData,
 			Proof:  proofData,
+			Meta:   &storage.BlockMeta{ID: block, GenUTime: block.SeqNo},
 			IsLink: false,
 		}},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
@@ -98,7 +105,7 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
+func TestPebbleStorageKeepsMetadataOnlyBlocksOutOfHistoryIndexes(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 
@@ -122,23 +129,30 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 		t.Fatalf("save block meta B: %v", err)
 	}
 
-	if got, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 11); err != nil || !got.Equals(&blockB) {
-		t.Fatalf("lookup by seqno failed: err=%v got=%v", err, got)
+	meta, err := store.BlockMeta(ctx, blockB)
+	if err != nil {
+		t.Fatalf("load metadata-only block meta: %v", err)
 	}
-	if got, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 500); err != nil || !got.Equals(&blockA) {
-		t.Fatalf("lookup by early lt failed: err=%v got=%v", err, got)
+	if meta.GenUTime != 120 || meta.EndLT != 2999 {
+		t.Fatalf("metadata-only block meta = %+v", meta)
 	}
-	if got, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 2500); err != nil || !got.Equals(&blockB) {
-		t.Fatalf("lookup by lt failed: err=%v got=%v", err, got)
+	if _, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 11); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("metadata-only lookup by seqno error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 500); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("metadata-only lookup by early lt error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 2500); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("metadata-only lookup by lt error = %v, want ErrNotFound", err)
 	}
 	if _, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 3000); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("lookup future lt error = %v, want ErrNotFound", err)
 	}
-	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 90); err != nil || !got.Equals(&blockA) {
-		t.Fatalf("lookup by early utime failed: err=%v got=%v", err, got)
+	if _, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 90); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("metadata-only lookup by early utime error = %v, want ErrNotFound", err)
 	}
-	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 110); err != nil || !got.Equals(&blockB) {
-		t.Fatalf("lookup by utime failed: err=%v got=%v", err, got)
+	if _, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 110); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("metadata-only lookup by utime error = %v, want ErrNotFound", err)
 	}
 	if _, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 121); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("lookup future utime error = %v, want ErrNotFound", err)
@@ -184,6 +198,76 @@ func TestPebbleStorageIndexesCellsAndCurrentState(t *testing.T) {
 
 }
 
+func TestPebbleStorageLookupBlockByLTDoesNotSkipMetadataOnlyLowerBound(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+	key := storage.BlockHistoryKey{Workchain: 0, Shard: topShard}
+
+	metadataOnly := testPebbleBlockID(0, topShard, 12)
+	served := testPebbleBlockID(0, topShard, 13)
+
+	if err := store.SaveBlockMeta(&storage.BlockMeta{
+		ID:       metadataOnly,
+		GenUTime: 130,
+		StartLT:  3000,
+		EndLT:    3999,
+	}); err != nil {
+		t.Fatalf("save metadata-only block meta: %v", err)
+	}
+	saveTestPebbleFullBlockMeta(t, store, &storage.BlockMeta{
+		ID:       served,
+		GenUTime: 140,
+		StartLT:  4000,
+		EndLT:    4999,
+	})
+
+	if _, err := store.LookupBlockByLT(ctx, key, 3500); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("lookup metadata-only lower-bound lt error = %v, want ErrNotFound", err)
+	}
+	got, err := store.LookupBlockByLT(ctx, key, 4500)
+	if err != nil {
+		t.Fatalf("lookup served lt: %v", err)
+	}
+	if !got.Equals(&served) {
+		t.Fatalf("lookup served lt block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(served))
+	}
+}
+
+func TestPebbleStorageLookupBlockByUnixTimeDoesNotSkipMetadataOnlyLowerBound(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+	key := storage.BlockHistoryKey{Workchain: 0, Shard: topShard}
+
+	metadataOnly := testPebbleBlockID(0, topShard, 14)
+	served := testPebbleBlockID(0, topShard, 15)
+
+	if err := store.SaveBlockMeta(&storage.BlockMeta{
+		ID:       metadataOnly,
+		GenUTime: 130,
+		StartLT:  5000,
+		EndLT:    5999,
+	}); err != nil {
+		t.Fatalf("save metadata-only block meta: %v", err)
+	}
+	saveTestPebbleFullBlockMeta(t, store, &storage.BlockMeta{
+		ID:       served,
+		GenUTime: 140,
+		StartLT:  6000,
+		EndLT:    6999,
+	})
+
+	if _, err := store.LookupBlockByUnixTime(ctx, key, 130); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("lookup metadata-only lower-bound utime error = %v, want ErrNotFound", err)
+	}
+	got, err := store.LookupBlockByUnixTime(ctx, key, 140)
+	if err != nil {
+		t.Fatalf("lookup served utime: %v", err)
+	}
+	if !got.Equals(&served) {
+		t.Fatalf("lookup served utime block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(served))
+	}
+}
+
 func TestPebbleStorageLookupBlockByAccountLTUsesShardPrefixPath(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
@@ -201,9 +285,7 @@ func TestPebbleStorageLookupBlockByAccountLTUsesShardPrefixPath(t *testing.T) {
 		{ID: pathBlock, StartLT: 101, EndLT: 200},
 		{ID: siblingBlock, StartLT: 101, EndLT: 200},
 	} {
-		if err := store.SaveBlockMeta(meta); err != nil {
-			t.Fatalf("save block meta %s: %v", storage.FormatBlockRef(meta.ID), err)
-		}
+		saveTestPebbleFullBlockMeta(t, store, meta)
 	}
 
 	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 150)
@@ -215,19 +297,54 @@ func TestPebbleStorageLookupBlockByAccountLTUsesShardPrefixPath(t *testing.T) {
 	}
 }
 
+func TestPebbleStorageLookupBlockByAccountLTDoesNotSkipMetadataOnlyBestCandidate(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+	account := bytes.Repeat([]byte{0x40}, 32)
+	shards := storage.AccountShardCandidates(0, account)
+	if len(shards) < 3 {
+		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
+	}
+
+	metadataOnly := testPebbleBlockID(0, shards[2], 20)
+	served := testPebbleBlockID(0, shards[2], 21)
+
+	if err := store.SaveBlockMeta(&storage.BlockMeta{
+		ID:      metadataOnly,
+		StartLT: 101,
+		EndLT:   200,
+	}); err != nil {
+		t.Fatalf("save metadata-only account block meta: %v", err)
+	}
+	saveTestPebbleFullBlockMeta(t, store, &storage.BlockMeta{
+		ID:      served,
+		StartLT: 201,
+		EndLT:   300,
+	})
+
+	if _, err := store.LookupBlockByAccountLT(ctx, 0, account, 150); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("lookup metadata-only account lower-bound error = %v, want ErrNotFound", err)
+	}
+	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 250)
+	if err != nil {
+		t.Fatalf("lookup served account lt: %v", err)
+	}
+	if !got.Equals(&served) {
+		t.Fatalf("lookup served account block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(served))
+	}
+}
+
 func TestPebbleStorageLookupBlockByAccountLTDoesNotReturnFloorBlock(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 	account := bytes.Repeat([]byte{0x40}, 32)
 	block := testPebbleBlockID(0, topShard, 10)
 
-	if err := store.SaveBlockMeta(&storage.BlockMeta{
+	saveTestPebbleFullBlockMeta(t, store, &storage.BlockMeta{
 		ID:      block,
 		StartLT: 1,
 		EndLT:   100,
-	}); err != nil {
-		t.Fatalf("save block meta: %v", err)
-	}
+	})
 
 	_, err := store.LookupBlockByAccountLT(ctx, 0, account, 150)
 	if !errors.Is(err, storage.ErrNotFound) {
@@ -252,9 +369,7 @@ func TestPebbleStorageLookupBlockByAccountLTReturnsLowerBoundOnShardPath(t *test
 		{ID: pathBlock, StartLT: 150, EndLT: 200},
 		{ID: siblingBlock, StartLT: 1, EndLT: 200},
 	} {
-		if err := store.SaveBlockMeta(meta); err != nil {
-			t.Fatalf("save block meta %s: %v", storage.FormatBlockRef(meta.ID), err)
-		}
+		saveTestPebbleFullBlockMeta(t, store, meta)
 	}
 
 	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 125)
@@ -527,6 +642,44 @@ func openTestPebbleStorage(t *testing.T) *pebblestore.Store {
 		}
 	})
 	return store
+}
+
+func saveTestPebbleFullBlockMeta(t *testing.T, store *pebblestore.Store, meta *storage.BlockMeta) {
+	t.Helper()
+
+	fullMeta := meta.Clone()
+	entries := []storage.StateCheckpointBlock{}
+	if fullMeta.ID.Workchain != -1 && !fullMeta.MasterchainRefKnown() {
+		master := testPebbleBlockID(-1, topShard, 1)
+		fullMeta.MasterchainRefSeqno = master.SeqNo
+		entries = append(entries, storage.StateCheckpointBlock{
+			State: &storage.BlockState{
+				Block:         master,
+				StateRootHash: bytes.Repeat([]byte{0x03}, 32),
+			},
+			Artifact: &storage.ServedBlockFull{
+				ID:    master,
+				Block: []byte{0x03},
+				Proof: []byte{0x04},
+				Meta:  &storage.BlockMeta{ID: master, GenUTime: 1},
+			},
+		})
+	}
+	entries = append(entries, storage.StateCheckpointBlock{
+		State: &storage.BlockState{
+			Block:         fullMeta.ID,
+			StateRootHash: bytes.Repeat([]byte{0x01}, 32),
+		},
+		Artifact: &storage.ServedBlockFull{
+			ID:    fullMeta.ID,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  fullMeta,
+		},
+	})
+	if _, err := store.SaveStateCheckpointEntries(context.Background(), entries, storage.StateCellRecords{}, nil); err != nil {
+		t.Fatalf("save full block meta %s: %v", storage.FormatBlockRef(meta.ID), err)
+	}
 }
 
 func requireLazyCellBOC(t testing.TB, loaded *cell.Cell, want *cell.Cell) {

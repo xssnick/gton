@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestPreparedBlockCheckpointArtifactsCanonicalProofLinkFlag(t *testing.T) {
@@ -84,6 +85,30 @@ func TestPreparedBlockCheckpointArtifactsRequiresFullPayload(t *testing.T) {
 				t.Fatal("checkpoint artifact accepted incomplete prepared block")
 			}
 		})
+	}
+}
+
+func TestPreparedBlockCheckpointArtifactsSkipsZeroStatePrevLink(t *testing.T) {
+	zero := testBlockID(0, topShard, 0)
+	prev := testBlockID(0, topShard, 12)
+	block := testBlockID(0, topShard, 13)
+
+	_, links, err := preparedBlockCheckpointArtifacts(PreparedBlock{
+		ID:       block,
+		BlockBOC: []byte{0x01},
+		ProofBOC: []byte{0x02},
+		Meta: &storage.BlockMeta{
+			PrevRefs: []ton.BlockIDExt{zero, prev},
+		},
+	}, 0)
+	if err != nil {
+		t.Fatalf("prepare checkpoint artifacts: %v", err)
+	}
+	if len(links) != 1 {
+		t.Fatalf("links = %+v, want one non-zero prev link", links)
+	}
+	if !links[0].Prev.Equals(&prev) || !links[0].Next.Equals(&block) {
+		t.Fatalf("link = %s -> %s, want %s -> %s", storage.FormatBlockRef(links[0].Prev), storage.FormatBlockRef(links[0].Next), storage.FormatBlockRef(prev), storage.FormatBlockRef(block))
 	}
 }
 

@@ -28,13 +28,22 @@ func TestSaveArchiveImportAllowsShardSplitNextChildrenAcrossBatches(t *testing.T
 	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
 	left := testServedBlockID(0, int64(0x4000000000000000), 101, 2)
 	right := testServedBlockID(0, int64(-0x4000000000000000), 101, 3)
+	master := testServedBlockID(-1, int64(-1<<63), 90, 4)
 
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(master, 0),
+			testLinkPreviousBlock(prev, master.SeqNo),
+			testLinkPreviousBlock(right, master.SeqNo),
+		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: right}},
 	}); err != nil {
 		t.Fatalf("link right split child: %v", err)
 	}
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(left, master.SeqNo),
+		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: left}},
 	}); err != nil {
 		t.Fatalf("link left split child: %v", err)
@@ -59,13 +68,22 @@ func TestSaveArchiveImportRejectsSameShardNextForkAcrossBatches(t *testing.T) {
 	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
 	next := testServedBlockID(0, int64(-1<<63), 101, 2)
 	fork := testServedBlockID(0, int64(-1<<63), 101, 3)
+	master := testServedBlockID(-1, int64(-1<<63), 90, 4)
 
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(master, 0),
+			testLinkPreviousBlock(prev, master.SeqNo),
+			testLinkPreviousBlock(next, master.SeqNo),
+		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: next}},
 	}); err != nil {
 		t.Fatalf("link next block: %v", err)
 	}
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(fork, master.SeqNo),
+		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: fork}},
 	}); err == nil {
 		t.Fatal("same-shard next block fork was accepted")
@@ -82,7 +100,14 @@ func TestSaveArchiveImportSelectsLeftShardSplitNextLinkInBatch(t *testing.T) {
 	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
 	left := testServedBlockID(0, int64(0x4000000000000000), 101, 2)
 	right := testServedBlockID(0, int64(-0x4000000000000000), 101, 3)
+	master := testServedBlockID(-1, int64(-1<<63), 90, 4)
 	if err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(master, 0),
+			testLinkPreviousBlock(prev, master.SeqNo),
+			testLinkPreviousBlock(right, master.SeqNo),
+			testLinkPreviousBlock(left, master.SeqNo),
+		},
 		Links: []storage.ServedBlockLink{
 			{Prev: prev, Next: right},
 			{Prev: prev, Next: left},
@@ -97,6 +122,52 @@ func TestSaveArchiveImportSelectsLeftShardSplitNextLinkInBatch(t *testing.T) {
 	}
 	if !got.Equals(&left) {
 		t.Fatalf("archive import next block link = %s, want left split child %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
+	}
+}
+
+func TestSaveArchiveImportRejectsNextLinkWithoutPreviousBlock(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
+	next := testServedBlockID(0, int64(-1<<63), 101, 2)
+
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		Links: []storage.ServedBlockLink{{Prev: prev, Next: next}},
+	})
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("orphan next block link error = %v, want ErrNotFound", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), prev); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("orphan previous block meta error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveArchiveImportRejectsNextLinkWithoutNextBlock(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(-1, int64(-1<<63), 100, 1)
+	next := testServedBlockID(-1, int64(-1<<63), 101, 2)
+
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{testLinkPreviousBlock(prev, 0)},
+		Links:      []storage.ServedBlockLink{{Prev: prev, Next: next}},
+	})
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("missing next block link error = %v, want ErrNotFound", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), prev); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("partial import previous block meta error = %v, want ErrNotFound", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), next); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("partial import next block meta error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -120,6 +191,16 @@ func TestSaveArchiveImportKeepsSameBatchMetaAndNextLink(t *testing.T) {
 				StartLT:  10,
 				EndLT:    20,
 			},
+		}, {
+			ID:    next,
+			Block: []byte{0x03},
+			Proof: []byte{0x04},
+			Meta: &storage.BlockMeta{
+				ID:       next,
+				GenUTime: 124,
+				StartLT:  20,
+				EndLT:    30,
+			},
 		}},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: next}},
 	}); err != nil {
@@ -138,6 +219,115 @@ func TestSaveArchiveImportKeepsSameBatchMetaAndNextLink(t *testing.T) {
 	}
 	if err = store.BlockFullAvailable(context.Background(), prev); err != nil {
 		t.Fatalf("prev block full availability: %v", err)
+	}
+}
+
+func testLinkPreviousBlock(block ton.BlockIDExt, masterSeqno uint32) *storage.ServedBlockFull {
+	meta := &storage.BlockMeta{
+		ID:       block,
+		GenUTime: block.SeqNo,
+	}
+	if block.Workchain != -1 || block.Shard != int64(-1<<63) {
+		meta.MasterchainRefSeqno = masterSeqno
+	}
+	return &storage.ServedBlockFull{
+		ID:    block,
+		Block: []byte{0x01},
+		Proof: []byte{0x02},
+		Meta:  meta,
+	}
+}
+
+func TestSaveArchiveImportRejectsEmptyFullBlock(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{ID: block}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "has no block data or proof") {
+		t.Fatalf("save empty full block err = %v, want empty block error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty full block meta err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveArchiveImportRejectsMetadataOnlyFullBlock(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:   block,
+			Meta: &storage.BlockMeta{ID: block},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "has no block data or proof") {
+		t.Fatalf("save metadata-only full block err = %v, want missing payload error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("metadata-only full block meta err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveArchiveImportRejectsForgedServedFullFlag(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
+	meta := &storage.BlockMeta{ID: block}
+	meta.Mark(storage.BlockMetaHasServedFull)
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:   block,
+			Meta: meta,
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "has no block data or proof") {
+		t.Fatalf("save forged served-full flag err = %v, want missing payload error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("forged served-full block meta err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveArchiveImportRejectsFullBlockMetaNextRefs(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
+	next := testServedBlockID(-1, int64(-1<<63), 103, 5)
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    block,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta: &storage.BlockMeta{
+				ID:       block,
+				NextRefs: []ton.BlockIDExt{next},
+			},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot set next refs directly") {
+		t.Fatalf("save full block meta next refs err = %v, want direct next refs error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("direct next refs full block meta err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -174,6 +364,28 @@ func TestSaveArchiveImportDoesNotMarkPartialBlockAsServedFull(t *testing.T) {
 	}
 	if err = store.BlockFullAvailable(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("partial block full availability error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveArchiveImportRejectsInvalidBlockDataWithoutMeta(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testServedBlockID(-1, int64(-1<<63), 103, 5)
+	err = store.SaveArchiveImport(&storage.ServedArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{{
+			ID:    block,
+			Block: []byte{0x01},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "parse block boc") {
+		t.Fatalf("save invalid block data err = %v, want parse block boc", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("invalid block meta err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1170,6 +1382,50 @@ func TestCheckpointArchiveRegistrationsUsePendingKeyBlockPackageStart(t *testing
 	}
 }
 
+func TestCheckpointArchiveAppendUsesStateMasterchainRefForShardArtifact(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	master := testServedBlockID(-1, topShard, 20150, 0x4a)
+	shard := testServedBlockID(0, int64(0x4000000000000000), 1000, 0x4b)
+	entries := []storage.StateCheckpointBlock{{
+		State: &storage.BlockState{
+			Block:          shard,
+			MasterchainRef: &master,
+			StateRootHash:  bytes.Repeat([]byte{0x4c}, 32),
+		},
+		Artifact: &storage.ServedBlockFull{
+			ID:    shard,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta: &storage.BlockMeta{
+				ID:       shard,
+				GenUTime: 20150,
+				StartLT:  uint64(shard.SeqNo),
+				EndLT:    uint64(shard.SeqNo + 1),
+			},
+		},
+	}}
+
+	_, registrations, _, err := store.prepareCheckpointArtifactWrites(entries)
+	if err != nil {
+		t.Fatalf("prepare checkpoint artifacts: %v", err)
+	}
+	if len(registrations) != 1 {
+		t.Fatalf("archive registrations = %d, want 1", len(registrations))
+	}
+	reg := registrations[0]
+	if reg.workchain != shard.Workchain || reg.shard != shard.Shard {
+		t.Fatalf("archive registration shard = %d/%016x, want %d/%016x", reg.workchain, uint64(reg.shard), shard.Workchain, uint64(shard.Shard))
+	}
+	if reg.baseSeq != 20000 || reg.startSeq != 20100 {
+		t.Fatalf("archive registration base/start = %d/%d, want 20000/20100", reg.baseSeq, reg.startSeq)
+	}
+}
+
 func TestSaveArchiveImportReplacesMissingArtifactRefs(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -2051,6 +2307,9 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 	if !bytes.Equal(meta.StateRootHash, stateRootHash) {
 		t.Fatalf("state root hash = %x, want %x", meta.StateRootHash, stateRootHash)
 	}
+	if _, err = store.LookupBlockBySeqNo(context.Background(), storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("persistent state metadata lookup by seqno error = %v, want ErrNotFound", err)
+	}
 
 	if err = store.DeletePersistentStateFile(context.Background(), block, master, 0); err != nil {
 		t.Fatalf("delete persistent state file: %v", err)
@@ -2070,6 +2329,57 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 	}
 	if len(meta.StateFileHash) != 0 {
 		t.Fatalf("state file hash after delete = %x, want empty", meta.StateFileHash)
+	}
+	if _, err = store.LookupBlockBySeqNo(context.Background(), storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("persistent state metadata lookup by seqno after delete error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeletePersistentStateFileDeletesEmptyBlockMeta(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     int64(0x4000000000000000),
+		SeqNo:     79,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x12}, 32),
+	}
+	master := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     80,
+		RootHash:  bytes.Repeat([]byte{0x13}, 32),
+		FileHash:  bytes.Repeat([]byte{0x14}, 32),
+	}
+	data := []byte{1, 2, 3}
+	name, err := storage.PersistentStateFileName(block, master, 0)
+	if err != nil {
+		t.Fatalf("persistent state file name: %v", err)
+	}
+	path := filepath.Join(store.StateFilesDir(), name)
+	if err = os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write state file: %v", err)
+	}
+
+	if err = store.SavePersistentStateFile(&storage.PersistentStateFile{
+		Block:            block,
+		MasterchainBlock: master,
+		EffectiveShard:   0,
+		Ref:              &storage.ArtifactRef{Path: path, Size: int64(len(data))},
+		FileHash:         bytes.Repeat([]byte{0x15}, 32),
+	}); err != nil {
+		t.Fatalf("save persistent state file: %v", err)
+	}
+	if err = store.DeletePersistentStateFile(context.Background(), block, master, 0); err != nil {
+		t.Fatalf("delete persistent state file: %v", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty persistent state block meta after delete error = %v, want ErrNotFound", err)
 	}
 }
 

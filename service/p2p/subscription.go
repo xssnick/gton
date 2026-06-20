@@ -152,13 +152,7 @@ func (s *overlaySubscription) close() {
 		twoStepQueue.Close()
 	}
 	for _, peer := range peers {
-		peer.closeRebroadcastQueues()
-		if peer.overlay != nil {
-			peer.overlay.Close()
-		}
-		if peer.rldpOverlay != nil {
-			peer.rldpOverlay.Close()
-		}
+		peer.close()
 	}
 }
 
@@ -190,6 +184,7 @@ type overlayPeer struct {
 	overlay     *overlay.ADNLOverlayWrapper
 	rldp        *overlay.RLDPWrapper
 	rldpOverlay *overlay.RLDPOverlayWrapper
+	release     func()
 
 	statsMx               sync.Mutex
 	versionMajor          int32
@@ -212,6 +207,17 @@ type overlayPeer struct {
 	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
 	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
 	rebroadcastClosed     bool
+}
+
+func (p *overlayPeer) close() {
+	if p == nil {
+		return
+	}
+
+	p.closeRebroadcastQueues()
+	if p.release != nil {
+		p.release()
+	}
 }
 
 func (s *overlaySubscription) run(ctx context.Context) {
@@ -290,29 +296,6 @@ func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, target
 		s.seedScheduled = true
 		s.seedMx.Unlock()
 		s.scheduleSeedFromDHT(ctx, delay)
-		return
-	}
-	s.seedRunning = true
-	targetPeers = s.seedTarget
-	s.seedMx.Unlock()
-
-	s.runSeedFromDHT(ctx, targetPeers)
-}
-
-func (s *overlaySubscription) forceSeedFromDHTTarget(ctx context.Context, targetPeers int) {
-	if !s.isActive() {
-		return
-	}
-	if targetPeers < maxPeersPerOverlay {
-		targetPeers = maxPeersPerOverlay
-	}
-
-	s.seedMx.Lock()
-	if targetPeers > s.seedTarget {
-		s.seedTarget = targetPeers
-	}
-	if s.seedRunning {
-		s.seedMx.Unlock()
 		return
 	}
 	s.seedRunning = true
@@ -701,6 +684,8 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 				Str("peer", pooled.addr).
 				Str("peer_id", pooled.id.String()).
 				Msg("connected overlay peer")
+		} else {
+			s.node.pool.closeIfUnused(pooled)
 		}
 		return attached, nil
 	}
@@ -780,6 +765,7 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 				Msg("connected fixed custom overlay peer")
 			return true, nil
 		}
+		s.node.pool.closeIfUnused(pooled)
 		return false, nil
 	}
 
@@ -856,7 +842,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	s.mx.Unlock()
 
 	if evicted != nil {
-		evicted.closeRebroadcastQueues()
+		evicted.close()
 	}
 	s.configureBroadcastFECRelay(state)
 	s.configureCustomTwoStepBroadcast(state)
@@ -870,15 +856,18 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 }
 
 func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *overlay.Node, fixedMember bool, allowBroadcastFEC bool) *overlayPeer {
+	adnlOverlay, rldpOverlay, release := s.node.pool.acquireOverlay(pooled, s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false)
+
 	return &overlayPeer{
 		id:            pooled.id,
 		addr:          pooled.addr,
 		pub:           append(ed25519.PublicKey(nil), pooled.pub...),
 		announced:     cloneOverlayNode(announced),
 		fixedMember:   fixedMember,
-		overlay:       pooled.adnl.CreateOverlayWithSettings(s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false),
+		overlay:       adnlOverlay,
 		rldp:          pooled.rldp,
-		rldpOverlay:   pooled.rldp.CreateOverlay(s.spec.ShortID),
+		rldpOverlay:   rldpOverlay,
+		release:       release,
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -1243,7 +1232,7 @@ func (s *overlaySubscription) removePeer(id PeerID) {
 	s.mx.Unlock()
 
 	if peer != nil {
-		peer.closeRebroadcastQueues()
+		peer.close()
 	}
 }
 

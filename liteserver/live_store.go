@@ -65,6 +65,7 @@ type LiveStore struct {
 	nonFinalOrder      []storage.BlockRootHash
 	nonFinalOrderIndex map[storage.BlockRootHash]int
 	nonFinalWaiting    map[storage.BlockRootHash]liveNonfinalWaiting
+	nonFinalCellIndex  map[cell.Hash][]liveNonfinalCellIndexEntry
 	nonFinalCellLoader cell.LazyCellLoader
 	blockDataLoad      liveLoadGroup[storage.BlockRootHash]
 	blockLoad          liveLoadGroup[storage.BlockRootHash]
@@ -204,6 +205,7 @@ func NewLiveStore(store LiveStoreBacking, opts ...LiveStoreOptions) *LiveStore {
 		nonFinalPending:    map[storage.BlockRootHash]liveNonfinalPending{},
 		nonFinalOrderIndex: map[storage.BlockRootHash]int{},
 		nonFinalWaiting:    map[storage.BlockRootHash]liveNonfinalWaiting{},
+		nonFinalCellIndex:  map[cell.Hash][]liveNonfinalCellIndexEntry{},
 		nonFinalCellLoader: nonFinalCellLoader,
 	}
 	live.loadInitialStoredCurrentState(context.Background())
@@ -415,34 +417,6 @@ func (s *LiveStore) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt,
 		}
 	}
 	return block, stateRootHash, lastUTime, nil
-}
-
-func (s *LiveStore) publishLiveBlockData(block ton.BlockIDExt, root *cell.Cell, data []byte, artifactFlushed bool) error {
-	if root == nil {
-		if len(data) == 0 {
-			return errors.New("live block has no cell tree or BOC")
-		}
-
-		parsed, err := parseTrustedBlockBOC(block, data)
-		if err != nil {
-			return err
-		}
-		root = parsed
-	}
-
-	root, err := normalizeLiveBlockRoot(block, root)
-	if err != nil {
-		return err
-	}
-	meta, _ := storage.BuildBlockMetaFromBlockCell(block, root)
-
-	return s.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-		Block:           block,
-		Root:            root,
-		BlockData:       data,
-		Meta:            meta,
-		ArtifactFlushed: artifactFlushed,
-	})
 }
 
 func (s *LiveStore) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {

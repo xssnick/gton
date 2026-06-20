@@ -327,6 +327,22 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if s == nil || s.node == nil {
 		return false
 	}
+	if s.customRebroadcastUnsupported(req.kind) {
+		s.node.noteRebroadcastDropped(req)
+		s.log.Debug().
+			Str("kind", req.kind).
+			Str("queue", req.queueName()).
+			Msg("dropping unsupported custom rebroadcast")
+		return false
+	}
+	if s.customBlockRebroadcastBlocked(req.kind) {
+		s.node.noteRebroadcastDropped(req)
+		s.log.Debug().
+			Str("kind", req.kind).
+			Str("queue", req.queueName()).
+			Msg("dropping custom block rebroadcast because local node is not a block sender")
+		return false
+	}
 	if s.node.rebroadcastBlockedByAdmission(&req) {
 		s.node.noteRebroadcastDropped(req)
 		s.log.Debug().
@@ -428,6 +444,22 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		Int("attempts", attempts).
 		Msg("dropping rebroadcast request because peer queues are full")
 	return false
+}
+
+func (s *overlaySubscription) customRebroadcastUnsupported(kind string) bool {
+	return s.spec.Kind == overlayKindCustomFixed && kind == "tonNode.ihrMessageBroadcast"
+}
+
+func (s *overlaySubscription) customBlockRebroadcastBlocked(kind string) bool {
+	if s.spec.Kind != overlayKindCustomFixed {
+		return false
+	}
+	if _, ok := customFanoutClass(kind); !ok {
+		return false
+	}
+
+	_, ok := s.spec.BlockSenders[s.node.localID]
+	return !ok
 }
 
 func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastRequest) []*overlayPeer {

@@ -7,13 +7,6 @@ import (
 	"github.com/xssnick/gton/service/archive"
 )
 
-func (n *Node) prioritizeArchivePeers(shard archive.ShardID, peers []*overlayPeer) []*overlayPeer {
-	if n == nil {
-		return prioritizeArchivePeersWithLeases(shard, peers, nil)
-	}
-	return prioritizeArchivePeersWithLeases(shard, peers, n.downloadPeerLeaseSnapshot(peers))
-}
-
 func prioritizeArchivePeersWithLeases(shard archive.ShardID, peers []*overlayPeer, leases map[PeerID]int) []*overlayPeer {
 	if len(peers) < 2 {
 		return peers
@@ -183,8 +176,4 @@ func archiveDownloadTooSlow(shard archive.ShardID, bytes int64, elapsed time.Dur
 		return float64(bytes)/elapsed.Seconds() < archiveSlowThreshold(shard.Workchain == 0)
 	}
 	return elapsed >= archiveSmallPackSlowElapsed
-}
-
-func archivePeerCanStayPinned(shard archive.ShardID, bytes int64, elapsed time.Duration) bool {
-	return bytes > 0 && elapsed > 0 && !archiveDownloadTooSlow(shard, bytes, elapsed)
 }

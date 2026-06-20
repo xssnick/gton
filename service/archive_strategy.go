@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"math/bits"
 	"sync"
 
 	"github.com/xssnick/gton/service/archive"
@@ -274,29 +273,6 @@ func mergeImportStats(total, next *archive.ImportStats, includeSeqRange bool) {
 			total.LastSeqno = next.LastSeqno
 		}
 	}
-}
-
-func archiveShardIntersects(left int64, right int64) bool {
-	leftDepth := archiveShardPrefixLength(left)
-	rightDepth := archiveShardPrefixLength(right)
-	depth := leftDepth
-	if rightDepth < depth {
-		depth = rightDepth
-	}
-	if depth <= 0 {
-		return true
-	}
-
-	mask := ^uint64(0) << (64 - depth)
-	return uint64(left)&mask == uint64(right)&mask
-}
-
-func archiveShardPrefixLength(shard int64) int {
-	value := uint64(shard)
-	if value == 0 {
-		return 0
-	}
-	return 63 - bits.TrailingZeros64(value)
 }
 
 func monitorMinSplitDepth(state *storage.BlockState, workchain int32) (uint32, error) {

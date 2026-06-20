@@ -4,16 +4,11 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func (s *Service) configureLiveBlockPublisher(publisher CurrentStatePublisher) {
-	if publisher == nil {
-		return
-	}
-	publisher.SetNonfinalCellLoader(s.stateCellLoader())
-	if s.node != nil {
-		s.node.SetBlockCacheObserver(publisher)
-	}
+func (s *Service) NonfinalCellLoader() cell.LazyCellLoader {
+	return s.stateCellLoader()
 }
 
 func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState) {

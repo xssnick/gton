@@ -528,7 +528,6 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
 	}
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization)
-	svc.configureLiveBlockPublisher(opts.CurrentStatePublisher)
 	return svc
 }
 

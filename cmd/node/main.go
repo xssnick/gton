@@ -367,11 +367,6 @@ func main() {
 	opts.StateFilesDir = stateFilesDir
 	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
 	opts.LiveBlockCache = liveBlockCache
-	serviceCallbacks := &serviceP2PCallbacks{}
-	opts.CompressedState = serviceCallbacks
-	opts.SyncLag = serviceCallbacks
-	opts.SignatureVerifier = serviceCallbacks
-	opts.BroadcastAdmission = serviceCallbacks
 	storageClosed := false
 	closeStore := func() {
 		if storageClosed {
@@ -443,7 +438,11 @@ func main() {
 		DisableStateSerialization:               cfg.DisableStateSerialization,
 		SyncObserver:                            syncObserver,
 	})
-	serviceCallbacks.set(svc)
+	node.SetRuntimeCallbacks(svc)
+	if currentStatePublisher != nil {
+		currentStatePublisher.SetNonfinalCellLoader(svc.NonfinalCellLoader())
+		node.SetBlockCacheObserver(currentStatePublisher)
+	}
 	if runtimeMetrics != nil {
 		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
 			ServiceStatusReader: svc.StatusSnapshot,

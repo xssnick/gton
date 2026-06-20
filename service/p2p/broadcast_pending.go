@@ -31,6 +31,7 @@ type pendingBlockBroadcastDecode struct {
 	receivedAt   time.Time
 	msg          any
 	proofRoot    *cell.Cell
+	rebroadcast  *rebroadcastRequest
 	expiresAt    time.Time
 	bytes        int64
 }
@@ -60,6 +61,8 @@ func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDeco
 	n.pendingBroadcastBytes += req.bytes
 	n.prunePendingBlockBroadcastOverflowLocked()
 	n.pendingBroadcastMx.Unlock()
+
+	n.processPendingBlockBroadcastDecodesForPrevAsync(req.prev)
 }
 
 func (n *Node) forgetPendingBlockBroadcastDecode(fingerprint string) {
@@ -157,16 +160,20 @@ func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, r
 
 		n.forgetPendingBlockBroadcastDecode(req.fingerprint)
 		downloaded.SourcePeerID = req.sourcePeerID
+		rebroadcast := pendingBlockBroadcastRebroadcast(req.rebroadcast)
+		block := cloneBlockID(req.block)
 		accepted := acceptedBroadcast{
 			fingerprint:        req.fingerprint,
 			deduped:            true,
 			skipAcceptedMetric: true,
+			block:              &block,
+			rebroadcast:        rebroadcast,
 			event: &BroadcastEvent{
 				Overlay:      req.overlay,
 				Delivery:     req.delivery,
 				Trusted:      req.trusted,
 				Kind:         req.kind,
-				Block:        cloneBlockID(req.block),
+				Block:        block,
 				SourcePeerID: req.sourcePeerID,
 				ReceivedAt:   req.receivedAt,
 				Downloaded:   downloaded,
@@ -174,6 +181,16 @@ func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, r
 		}
 		n.acceptBroadcast(accepted)
 	}
+}
+
+func pendingBlockBroadcastRebroadcast(req *rebroadcastRequest) *rebroadcastRequest {
+	if req == nil {
+		return nil
+	}
+
+	rebroadcast := *req
+	rebroadcast.skipOverlayRebroadcast = true
+	return &rebroadcast
 }
 
 func (n *Node) decodePendingBlockBroadcast(ctx context.Context, req pendingBlockBroadcastDecode) (*DownloadedBlock, error) {
@@ -279,10 +296,13 @@ func (n *Node) deletePendingBlockBroadcastPrevIndexLocked(req pendingBlockBroadc
 }
 
 func pendingBlockBroadcastDecodeBytes(req pendingBlockBroadcastDecode) int64 {
+	bytes := int64(pendingBroadcastDecodeOverhead)
 	switch msg := req.msg.(type) {
 	case tonnodeapi.BlockBroadcastCompressedV2:
-		return int64(len(msg.Proof)+len(msg.DataCompressed)) + pendingBroadcastDecodeOverhead
-	default:
-		return pendingBroadcastDecodeOverhead
+		bytes += int64(len(msg.Proof) + len(msg.DataCompressed))
 	}
+	if req.rebroadcast != nil {
+		bytes += int64(req.rebroadcast.payloadLen())
+	}
+	return bytes
 }

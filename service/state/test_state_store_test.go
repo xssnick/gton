@@ -13,11 +13,12 @@ import (
 )
 
 type testStateStore struct {
-	mx       sync.RWMutex
-	current  *storage.CurrentState
-	progress *storage.CurrentState
-	blocks   map[storage.BlockRootHash]*storage.BlockState
-	trees    map[storage.BlockRootHash]testStateCellTree
+	mx        sync.RWMutex
+	current   *storage.CurrentState
+	progress  *storage.CurrentState
+	blocks    map[storage.BlockRootHash]*storage.BlockState
+	trees     map[storage.BlockRootHash]testStateCellTree
+	artifacts map[storage.BlockRootHash]*storage.ServedBlockFull
 }
 
 type testStateCellTree struct {
@@ -26,8 +27,9 @@ type testStateCellTree struct {
 
 func newTestStateStore() *testStateStore {
 	return &testStateStore{
-		blocks: map[storage.BlockRootHash]*storage.BlockState{},
-		trees:  map[storage.BlockRootHash]testStateCellTree{},
+		blocks:    map[storage.BlockRootHash]*storage.BlockState{},
+		trees:     map[storage.BlockRootHash]testStateCellTree{},
+		artifacts: map[storage.BlockRootHash]*storage.ServedBlockFull{},
 	}
 }
 
@@ -83,6 +85,9 @@ func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []
 		clonedBlock := storage.CloneBlockState(entry.State)
 		fillTestBlockStateHashes(clonedBlock)
 		s.blocks[storage.BlockKey(clonedBlock.Block)] = clonedBlock
+		if entry.Artifact != nil {
+			s.artifacts[storage.BlockKey(entry.Artifact.ID)] = entry.Artifact.Clone()
+		}
 	}
 
 	cloned := storage.CloneCurrentState(current)

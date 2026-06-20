@@ -1036,6 +1036,13 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 			},
 		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
+	}, {
+		Artifact: &storage.ServedBlockFull{
+			ID:    prev,
+			Block: []byte{0x20},
+			Proof: []byte{0x21},
+			Meta:  &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
+		},
 	}}, storage.StateCellRecords{}, current)
 	if err != nil {
 		t.Fatalf("save checkpoint with artifacts: %v", err)
@@ -1084,6 +1091,15 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	}
 	if err = store.BlockFullAvailable(ctx, block); err != nil {
 		t.Fatalf("checkpoint block full availability: %v", err)
+	}
+	if got, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo); err != nil || !got.Equals(&block) {
+		t.Fatalf("checkpoint lookup by seqno failed: err=%v got=%s", err, storage.FormatBlockRef(got))
+	}
+	if got, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, 19); err != nil || !got.Equals(&block) {
+		t.Fatalf("checkpoint lookup by lt failed: err=%v got=%s", err, storage.FormatBlockRef(got))
+	}
+	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, 123); err != nil || !got.Equals(&block) {
+		t.Fatalf("checkpoint lookup by utime failed: err=%v got=%s", err, storage.FormatBlockRef(got))
 	}
 
 	decodedNext, err := readNextBlockLink(ctx, store, prev)
@@ -1150,6 +1166,9 @@ func TestSaveStateCheckpointDoesNotMarkPartialArtifactAsServedFull(t *testing.T)
 	}
 	if err = store.BlockFullAvailable(ctx, state.Block); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("partial checkpoint block full availability error = %v, want ErrNotFound", err)
+	}
+	if _, err = store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: state.Block.Workchain, Shard: state.Block.Shard}, state.Block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("partial checkpoint lookup by seqno error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1326,6 +1345,66 @@ func TestOpenReadOnlyRejectsWrites(t *testing.T) {
 	block12 := testMasterBlockID(12, 12)
 	if err = store.SaveBlockMeta(&storage.BlockMeta{ID: block12, GenUTime: 12, StartLT: 12, EndLT: 13}); !errors.Is(err, pebble.ErrReadOnly) {
 		t.Fatalf("save in read-only store = %v, want pebble.ErrReadOnly", err)
+	}
+}
+
+func TestSaveBlockMetaRejectsEmptyMeta(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testMasterBlockID(20, 20)
+	err = store.SaveBlockMeta(&storage.BlockMeta{ID: block})
+	if err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("save empty block meta err = %v, want empty meta error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty block meta lookup err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveBlockMetaRejectsDirectNextRefs(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testMasterBlockID(20, 20)
+	next := testMasterBlockID(21, 21)
+	err = store.SaveBlockMeta(&storage.BlockMeta{
+		ID:       prev,
+		GenUTime: 20,
+		NextRefs: []ton.BlockIDExt{next},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot set next refs directly") {
+		t.Fatalf("save direct next refs err = %v, want direct next refs error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), prev); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("direct next refs meta lookup err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveBlockMetaRejectsDirectArtifactFlags(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testMasterBlockID(20, 20)
+	err = store.SaveBlockMeta(&storage.BlockMeta{
+		ID:       block,
+		Flags:    storage.BlockMetaHasServedFull,
+		GenUTime: 20,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot set artifact flags directly") {
+		t.Fatalf("save direct artifact flags err = %v, want direct artifact flags error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("direct artifact flags meta lookup err = %v, want ErrNotFound", err)
 	}
 }
 

@@ -396,7 +396,7 @@ func (a *ArchiveSession) rejectArchivePeer(pool *archivePeerPool, shard archive.
 	}
 	if pool != nil && useless {
 		pool.cooldown(shard, peer, reason)
-		pool.refreshUseless(nil, shard)
+		pool.refreshUseless(context.Background(), shard)
 	}
 }
 

@@ -10,11 +10,13 @@ import (
 type appliedStateSet struct {
 	states        map[storage.BlockRootHash]appliedStateEntry
 	artifactBytes uint64
+	nextVersion   uint64
 }
 
 type appliedStateEntry struct {
 	state    *storage.BlockState
 	artifact appliedBlockArtifact
+	version  uint64
 }
 
 type appliedBlockArtifact struct {
@@ -24,27 +26,20 @@ type appliedBlockArtifact struct {
 }
 
 type appliedStateCheckpoint struct {
-	keys    []storage.BlockRootHash
-	entries []storage.StateCheckpointBlock
+	keys     []storage.BlockRootHash
+	versions []uint64
+	entries  []storage.StateCheckpointBlock
 }
 
 func (s *appliedStateSet) rememberWithArtifacts(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
 	if state == nil {
 		return
 	}
-	if s.states == nil {
-		s.states = map[storage.BlockRootHash]appliedStateEntry{}
-	}
-	key := storage.BlockKey(state.Block)
-	if existing, ok := s.states[key]; ok {
-		s.artifactBytes -= existing.artifact.bytes
-	}
-	entry := appliedStateEntry{
+
+	s.rememberEntry(appliedStateEntry{
 		state:    checkpointBlockStateMetadata(state),
 		artifact: appliedBlockArtifactFrom(artifact, links).clone(),
-	}
-	s.states[key] = entry
-	s.artifactBytes += entry.artifact.bytes
+	})
 }
 
 func (s *appliedStateSet) rememberAllEntries(entries []appliedStateEntry) {
@@ -66,9 +61,11 @@ func (s *appliedStateSet) checkpoint() appliedStateCheckpoint {
 	}
 
 	keys := sortedStateEntryKeys(s.states)
+	versions := make([]uint64, 0, len(keys))
 	entries := make([]storage.StateCheckpointBlock, 0, len(keys))
 	for _, key := range keys {
 		entry := s.states[key]
+		versions = append(versions, entry.version)
 		entries = append(entries, storage.StateCheckpointBlock{
 			State:    storage.CloneBlockState(entry.state),
 			Artifact: cloneServedBlockFullSharedPayload(entry.artifact.block),
@@ -77,8 +74,9 @@ func (s *appliedStateSet) checkpoint() appliedStateCheckpoint {
 	}
 
 	return appliedStateCheckpoint{
-		keys:    keys,
-		entries: entries,
+		keys:     keys,
+		versions: versions,
+		entries:  entries,
 	}
 }
 
@@ -87,11 +85,14 @@ func (s *appliedStateSet) completeCheckpoint(checkpoint appliedStateCheckpoint) 
 		return
 	}
 
-	for _, key := range checkpoint.keys {
+	for idx, key := range checkpoint.keys {
 		if entry, ok := s.states[key]; ok {
+			if len(checkpoint.versions) == len(checkpoint.keys) && entry.version != checkpoint.versions[idx] {
+				continue
+			}
 			s.artifactBytes -= entry.artifact.bytes
+			delete(s.states, key)
 		}
-		delete(s.states, key)
 	}
 	if len(s.states) == 0 {
 		s.states = nil
@@ -143,10 +144,15 @@ func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
 		s.states = map[storage.BlockRootHash]appliedStateEntry{}
 	}
 	key := storage.BlockKey(entry.state.Block)
+	cloned := cloneAppliedStateEntry(entry)
 	if existing, ok := s.states[key]; ok {
 		s.artifactBytes -= existing.artifact.bytes
+		if !cloned.artifact.complete() && existing.artifact.complete() {
+			cloned.artifact = existing.artifact.clone()
+		}
 	}
-	cloned := cloneAppliedStateEntry(entry)
+	s.nextVersion++
+	cloned.version = s.nextVersion
 	s.states[key] = cloned
 	s.artifactBytes += cloned.artifact.bytes
 }
@@ -159,6 +165,7 @@ func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
 	return appliedStateEntry{
 		state:    storage.CloneBlockState(entry.state),
 		artifact: entry.artifact.clone(),
+		version:  entry.version,
 	}
 }
 
@@ -193,7 +200,14 @@ func (a appliedBlockArtifact) clone() appliedBlockArtifact {
 	}
 }
 
+func (a appliedBlockArtifact) complete() bool {
+	return a.block != nil && len(a.block.Block) > 0 && len(a.block.Proof) > 0
+}
+
 func servedBlockFullPayloadBytes(block *storage.ServedBlockFull) uint64 {
+	if block == nil {
+		return 0
+	}
 	return uint64(len(block.Block)) + uint64(len(block.Proof))
 }
 

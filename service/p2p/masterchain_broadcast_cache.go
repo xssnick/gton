@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"container/list"
 	"fmt"
 	"sync"
 	"time"
@@ -9,7 +8,6 @@ import (
 	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
@@ -20,42 +18,12 @@ const (
 )
 
 type masterchainNextBroadcastCache struct {
-	mu sync.Mutex
-
-	ttl      time.Duration
-	maxBytes int64
-	maxItems int
-
-	entries map[tnstore.BlockRootHash]*masterchainNextBroadcastCacheEntry
-	order   *list.List
-	bytes   int64
-}
-
-type masterchainNextBroadcastCacheEntry struct {
-	key          tnstore.BlockRootHash
-	element      *list.Element
-	prev         ton.BlockIDExt
-	block        ton.BlockIDExt
-	kind         string
-	blockRoot    *cell.Cell
-	proofRoot    *cell.Cell
-	stateUpdate  *cell.Cell
-	blockBOC     []byte
-	proofBOC     []byte
-	isLink       bool
-	meta         *tnstore.BlockMeta
-	sourcePeerID PeerID
-	expiresAt    time.Time
-	bytes        int64
+	broadcastBlockCache
 }
 
 func newMasterchainNextBroadcastCache(ttl time.Duration, maxBytes int64, maxItems int) *masterchainNextBroadcastCache {
 	return &masterchainNextBroadcastCache{
-		ttl:      ttl,
-		maxBytes: maxBytes,
-		maxItems: maxItems,
-		entries:  map[tnstore.BlockRootHash]*masterchainNextBroadcastCacheEntry{},
-		order:    list.New(),
+		broadcastBlockCache: newBroadcastBlockCache(ttl, maxBytes, maxItems, "masterchain next broadcast cache"),
 	}
 }
 
@@ -108,9 +76,8 @@ func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now 
 	}
 
 	key := tnstore.BlockKey(prev)
-	entry := &masterchainNextBroadcastCacheEntry{
+	entry := &broadcastBlockCacheEntry{
 		key:          key,
-		prev:         cloneBlockID(prev),
 		block:        cloneBlockID(downloaded.ID),
 		kind:         downloaded.Kind,
 		blockRoot:    downloaded.Block,
@@ -121,23 +88,10 @@ func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now 
 		isLink:       downloaded.IsLink,
 		meta:         downloaded.Meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
-		expiresAt:    now.Add(c.ttl),
 		bytes:        size,
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if old := c.entries[key]; old != nil {
-		c.deleteEntryLocked(old)
-	}
-
-	entry.element = c.order.PushBack(entry)
-	c.entries[key] = entry
-	c.bytes += size
-
-	c.pruneExpiredLocked(now)
-	c.pruneOverflowLocked()
+	c.storeEntry(entry, now)
 	return nil
 }
 
@@ -149,77 +103,7 @@ func (c *masterchainNextBroadcastCache) blockAfterAt(prev ton.BlockIDExt, now ti
 	if c == nil || !isMasterchainBlock(prev) {
 		return nil, tnstore.ErrNotFound
 	}
-
-	c.mu.Lock()
-	key := tnstore.BlockKey(prev)
-	entry := c.entries[key]
-	if entry == nil {
-		c.mu.Unlock()
-		return nil, tnstore.ErrNotFound
-	}
-	if !entry.expiresAt.After(now) {
-		c.deleteEntryLocked(entry)
-		c.mu.Unlock()
-		return nil, tnstore.ErrNotFound
-	}
-
-	kind := entry.kind
-	if kind == "" {
-		kind = "masterchain next broadcast cache"
-	}
-	downloaded := &DownloadedBlock{
-		ID:               cloneBlockID(entry.block),
-		Kind:             kind,
-		Block:            entry.blockRoot,
-		Proof:            entry.proofRoot,
-		BlockBOC:         entry.blockBOC,
-		ProofBOC:         entry.proofBOC,
-		Meta:             entry.meta.Clone(),
-		StateUpdate:      entry.stateUpdate,
-		SourcePeerID:     entry.sourcePeerID,
-		IsLink:           entry.isLink,
-		VerifiedRootHash: true,
-	}
-	c.mu.Unlock()
-	return downloaded, nil
-}
-
-func (c *masterchainNextBroadcastCache) pruneExpiredLocked(now time.Time) {
-	for elem := c.order.Front(); elem != nil; {
-		entry := elem.Value.(*masterchainNextBroadcastCacheEntry)
-		if !entry.expiresAt.After(now) {
-			next := elem.Next()
-			c.deleteEntryLocked(entry)
-			elem = next
-			continue
-		}
-		return
-	}
-}
-
-func (c *masterchainNextBroadcastCache) pruneOverflowLocked() {
-	for len(c.entries) > c.maxItems || c.bytes > c.maxBytes {
-		elem := c.order.Front()
-		if elem == nil {
-			return
-		}
-		c.deleteEntryLocked(elem.Value.(*masterchainNextBroadcastCacheEntry))
-	}
-}
-
-func (c *masterchainNextBroadcastCache) deleteEntryLocked(entry *masterchainNextBroadcastCacheEntry) {
-	if entry == nil {
-		return
-	}
-	delete(c.entries, entry.key)
-	if entry.element != nil {
-		c.order.Remove(entry.element)
-		entry.element = nil
-	}
-	c.bytes -= entry.bytes
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
+	return c.broadcastBlockCache.blockAt(tnstore.BlockKey(prev), now)
 }
 
 func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {

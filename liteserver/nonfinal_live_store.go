@@ -21,6 +21,11 @@ type liveNonfinalPending struct {
 	cells storage.StateCellRecords
 }
 
+type liveNonfinalCellIndexEntry struct {
+	block storage.BlockRootHash
+	data  []byte
+}
+
 type liveNonfinalWaiting struct {
 	artifacts storage.LiveBlockArtifacts
 	kind      storage.LiveBlockNonfinalKind
@@ -320,21 +325,88 @@ func (s *LiveStore) nonfinalCellDataLocked(block ton.BlockIDExt, hash cell.Hash)
 		return nil
 	}
 
-	for i := idx; i >= 0; i-- {
-		pending := s.nonFinalPending[s.nonFinalOrder[i]]
-		if data := pending.cells.Data(hash); len(data) > 0 {
-			return data
+	bestIdx := -1
+	var data []byte
+	for _, entry := range s.nonFinalCellIndex[hash] {
+		entryIdx := s.nonfinalOrderIndexLocked(entry.block)
+		if entryIdx < 0 || entryIdx > idx || entryIdx <= bestIdx {
+			continue
 		}
+		bestIdx = entryIdx
+		data = entry.data
 	}
-	return nil
+	return data
 }
 
 func (s *LiveStore) putNonfinalPendingLocked(key storage.BlockRootHash, pending liveNonfinalPending) {
-	if _, ok := s.nonFinalPending[key]; !ok {
+	current, ok := s.nonFinalPending[key]
+	if ok {
+		s.removeNonfinalCellIndexLocked(key, current.cells)
+	} else {
 		s.nonFinalOrderIndex[key] = len(s.nonFinalOrder)
 		s.nonFinalOrder = append(s.nonFinalOrder, key)
 	}
 	s.nonFinalPending[key] = pending
+	s.addNonfinalCellIndexLocked(key, pending.cells)
+}
+
+func (s *LiveStore) addNonfinalCellIndexLocked(key storage.BlockRootHash, records storage.StateCellRecords) {
+	if records.Empty() {
+		return
+	}
+	if s.nonFinalCellIndex == nil {
+		s.nonFinalCellIndex = map[cell.Hash][]liveNonfinalCellIndexEntry{}
+	}
+
+	seen := map[cell.Hash]struct{}{}
+	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
+		if len(record.Data) == 0 {
+			return nil
+		}
+		if _, ok := seen[record.Hash]; ok {
+			return nil
+		}
+		seen[record.Hash] = struct{}{}
+		s.nonFinalCellIndex[record.Hash] = append(s.nonFinalCellIndex[record.Hash], liveNonfinalCellIndexEntry{
+			block: key,
+			data:  record.Data,
+		})
+		return nil
+	})
+}
+
+func (s *LiveStore) removeNonfinalCellIndexLocked(key storage.BlockRootHash, records storage.StateCellRecords) {
+	if records.Empty() || len(s.nonFinalCellIndex) == 0 {
+		return
+	}
+
+	seen := map[cell.Hash]struct{}{}
+	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
+		if len(record.Data) == 0 {
+			return nil
+		}
+		if _, ok := seen[record.Hash]; ok {
+			return nil
+		}
+		seen[record.Hash] = struct{}{}
+
+		entries := s.nonFinalCellIndex[record.Hash]
+		for i := 0; i < len(entries); i++ {
+			if entries[i].block != key {
+				continue
+			}
+			copy(entries[i:], entries[i+1:])
+			entries[len(entries)-1] = liveNonfinalCellIndexEntry{}
+			entries = entries[:len(entries)-1]
+			i--
+		}
+		if len(entries) == 0 {
+			delete(s.nonFinalCellIndex, record.Hash)
+		} else {
+			s.nonFinalCellIndex[record.Hash] = entries
+		}
+		return nil
+	})
 }
 
 func (s *LiveStore) nonfinalOrderIndexLocked(key storage.BlockRootHash) int {
@@ -552,9 +624,11 @@ func (s *LiveStore) deleteNonfinalBlockLocked(key storage.BlockRootHash, block t
 }
 
 func (s *LiveStore) deleteNonfinalPendingLocked(key storage.BlockRootHash) {
-	if _, ok := s.nonFinalPending[key]; !ok {
+	pending, ok := s.nonFinalPending[key]
+	if !ok {
 		return
 	}
+	s.removeNonfinalCellIndexLocked(key, pending.cells)
 	delete(s.nonFinalPending, key)
 
 	idx := s.nonFinalOrderIndex[key]

@@ -198,15 +198,6 @@ func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*
 	return block, signatures, nil
 }
 
-func decodeBlockBroadcastCompressedV2(data tonnodeapi.BlockBroadcastCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
-	proofRoot, err := parseDownloadedBlockProof("tonNode.blockBroadcastCompressedV2", data.Proof)
-	if err != nil {
-		return nil, err
-	}
-	block, _, err := decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot)
-	return block, err
-}
-
 func (n *Node) decodeBlockBroadcastCompressedV2(ctx context.Context, data tonnodeapi.BlockBroadcastCompressedV2) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	proofRoot, err := parseDownloadedBlockProof("tonNode.blockBroadcastCompressedV2", data.Proof)
 	if err != nil {

@@ -525,70 +525,69 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 
 func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, string, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
-	for {
-		cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
-		if err == nil {
-			return cached.block, cached.source, cached.prepareElapsed, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return PreparedBlock{}, "", 0, err
-		}
 
-		decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
-		stagedPeerLimit := decision.stagedPeerLimit()
-		queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
-		if decision.peerLimit > nextBlockBootstrapProbePeers || stagedPeerLimit > decision.peerLimit {
-			event := s.log.Debug().
-				Str("current", storage.FormatBlockRef(prev)).
-				Int("probe_peers", decision.peerLimit).
-				Int("staged_probe_peers", stagedPeerLimit).
-				Int("consecutive_misses", decision.consecutiveMisses).
-				Bool("live_tail", decision.liveTail).
-				Bool("raw_broadcast_ahead", decision.rawBroadcastAhead).
-				Bool("observed_masterchain_ahead", decision.observedAhead).
-				Bool("seen_masterchain_ahead", decision.seenAhead).
-				Bool("queued_future_ahead", decision.queuedFutureAhead).
-				Uint32("ahead_blocks", decision.aheadBlocks)
-			if decision.lowestMissingSeqno != 0 {
-				event.Uint32("lowest_missing_seqno", decision.lowestMissingSeqno)
-			}
-			if !decision.preferredSourcePeerID.IsZero() {
-				event.Str("preferred_source_peer_id", decision.preferredSourcePeerID.String())
-			}
-			if decision.hasLag {
-				event.Int64("lag_seconds", decision.lagSeconds)
-			}
-			event.Msg("probing next masterchain block with urgent fanout")
-		}
-		result := make(chan nextBlockProbeResult, 1)
-		probeReturned := make(chan struct{})
-		go func() {
-			downloaded, err := s.node.ProbeNextBlockFull(queryCtx, prev, p2p.ProbeNextBlockFullOptions{
-				PeerLimit:       decision.peerLimit,
-				StagedPeerLimit: stagedPeerLimit,
-				StageDelay:      nextBlockBootstrapLiveStageDelay,
-				PreferredPeerID: decision.preferredSourcePeerID,
-				LiveTail:        decision.liveTail,
-			})
-			close(probeReturned)
-			result <- prepareNextBlockProbeResult(prev, downloaded, err)
-		}()
-
-		prepared, source, prepareElapsed, err := s.waitNextMasterchainApplyCandidate(
-			ctx,
-			queryCtx,
-			prev,
-			target,
-			broadcastWake,
-			probeReturned,
-			result,
-			cancel,
-		)
-		if err != nil {
-			return PreparedBlock{}, source, prepareElapsed, err
-		}
-		return prepared, source, prepareElapsed, nil
+	cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+	if err == nil {
+		return cached.block, cached.source, cached.prepareElapsed, nil
 	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return PreparedBlock{}, "", 0, err
+	}
+
+	decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
+	stagedPeerLimit := decision.stagedPeerLimit()
+	queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
+	if decision.peerLimit > nextBlockBootstrapProbePeers || stagedPeerLimit > decision.peerLimit {
+		event := s.log.Debug().
+			Str("current", storage.FormatBlockRef(prev)).
+			Int("probe_peers", decision.peerLimit).
+			Int("staged_probe_peers", stagedPeerLimit).
+			Int("consecutive_misses", decision.consecutiveMisses).
+			Bool("live_tail", decision.liveTail).
+			Bool("raw_broadcast_ahead", decision.rawBroadcastAhead).
+			Bool("observed_masterchain_ahead", decision.observedAhead).
+			Bool("seen_masterchain_ahead", decision.seenAhead).
+			Bool("queued_future_ahead", decision.queuedFutureAhead).
+			Uint32("ahead_blocks", decision.aheadBlocks)
+		if decision.lowestMissingSeqno != 0 {
+			event.Uint32("lowest_missing_seqno", decision.lowestMissingSeqno)
+		}
+		if !decision.preferredSourcePeerID.IsZero() {
+			event.Str("preferred_source_peer_id", decision.preferredSourcePeerID.String())
+		}
+		if decision.hasLag {
+			event.Int64("lag_seconds", decision.lagSeconds)
+		}
+		event.Msg("probing next masterchain block with urgent fanout")
+	}
+	result := make(chan nextBlockProbeResult, 1)
+	probeReturned := make(chan struct{})
+	go func() {
+		downloaded, err := s.node.ProbeNextBlockFull(queryCtx, prev, p2p.ProbeNextBlockFullOptions{
+			PeerLimit:       decision.peerLimit,
+			StagedPeerLimit: stagedPeerLimit,
+			StageDelay:      nextBlockBootstrapLiveStageDelay,
+			PreferredPeerID: decision.preferredSourcePeerID,
+			LiveTail:        decision.liveTail,
+		})
+		close(probeReturned)
+		result <- prepareNextBlockProbeResult(prev, downloaded, err)
+	}()
+
+	prepared, source, prepareElapsed, err := s.waitNextMasterchainApplyCandidate(
+		ctx,
+		queryCtx,
+		prev,
+		target,
+		broadcastWake,
+		probeReturned,
+		result,
+		cancel,
+	)
+	if err != nil {
+		return PreparedBlock{}, source, prepareElapsed, err
+	}
+	return prepared, source, prepareElapsed, nil
 }
 
 func (s *Service) waitNextMasterchainApplyCandidate(

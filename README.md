@@ -14,9 +14,11 @@ The project focuses on:
 
 The project is under active development. Storage format and configuration may change without backward compatibility.
 
+Telegram group: [@gtonnode](https://t.me/gtonnode)
+
 ## Hardware Requirements
 
-- Minimum RAM: `48 GB` (for mainnet).
+- Minimum RAM: `48 GB`.
 - Recommended RAM: `64 GB`.
 - Minimum CPU: `8` cores.
 - Minimum disk: `512 GB SSD`.

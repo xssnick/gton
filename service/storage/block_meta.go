@@ -195,15 +195,15 @@ func MergeBlockMeta(base *BlockMeta, next *BlockMeta) *BlockMeta {
 	return merged
 }
 
-func MergeBlockMetaFromBlockData(meta *BlockMeta, block ton.BlockIDExt, data []byte) *BlockMeta {
+func MergeBlockMetaFromBlockData(meta *BlockMeta, block ton.BlockIDExt, data []byte) (*BlockMeta, error) {
 	if len(data) == 0 {
-		return meta
+		return meta, nil
 	}
 	parsed, err := BuildBlockMetaFromBlockData(block, data)
 	if err != nil {
-		return meta
+		return nil, err
 	}
-	return MergeBlockMeta(meta, parsed)
+	return MergeBlockMeta(meta, parsed), nil
 }
 
 func SortedShardKeys(shards map[ShardKey]BlockState) []ShardKey {

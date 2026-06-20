@@ -81,6 +81,11 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 	if got := source.downloadCount[storage.BlockKey(master)]; got != 0 {
 		t.Fatalf("expected pending master state not to be downloaded, got %d", got)
 	}
+	for _, block := range []ton.BlockIDExt{master, base, aux} {
+		if store.artifacts[storage.BlockKey(block)] == nil {
+			t.Fatalf("checkpoint artifact for %s was not stored", storage.FormatBlockRef(block))
+		}
+	}
 }
 
 func TestSyncerReturnsShardDownloadError(t *testing.T) {
@@ -680,6 +685,15 @@ func (f *fakeSource) InitBlockProof(context.Context, ton.BlockIDExt) (ProofDownl
 
 func (f *fakeSource) MasterchainProof(context.Context, ton.BlockIDExt, bool) ([]byte, error) {
 	return nil, errors.New("unexpected masterchain proof download")
+}
+
+func (f *fakeSource) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
+	return &storage.ServedBlockFull{
+		ID:    block,
+		Proof: []byte{0x01},
+		Block: []byte{0x02},
+		Meta:  &storage.BlockMeta{ID: block, GenUTime: 1},
+	}, nil
 }
 
 func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (storage.DownloadedState, error) {

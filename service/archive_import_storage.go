@@ -217,45 +217,77 @@ func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlock
 	}
 
 	count := 1 << splitDepth
-	plans := make([]archiveShardImportPlan, 0, count)
-	for i := 0; i < count; i++ {
-		shard := uint64(i*2+1) << (64 - splitDepth - 1)
-		prefix := archive.ShardID{
-			Workchain: 0,
-			Shard:     int64(shard),
-		}
+	plansByPrefix := make([]archiveShardImportPlan, count)
+	seenByPrefix := make([]map[storage.BlockRootHash]struct{}, count)
+	for _, blocks := range stateBlocks {
+		for _, next := range blocks {
+			// Zerostates are downloaded through state overlay, not shard archive packages.
+			if next.SeqNo == 0 {
+				continue
+			}
+			if next.Workchain != 0 {
+				continue
+			}
 
-		plan := archiveShardImportPlan{shard: prefix, splitDepth: splitDepth}
-		seen := map[storage.BlockRootHash]struct{}{}
-		for _, blocks := range stateBlocks {
-			for _, next := range blocks {
-				// Zerostates are downloaded through state overlay, not shard archive packages.
-				if next.SeqNo == 0 {
-					continue
-				}
-				if next.Workchain != prefix.Workchain || !archiveShardIntersects(prefix.Shard, next.Shard) {
-					continue
-				}
+			prev, ok := startByShard[storage.ShardKeyFromBlock(next)]
+			if ok && prev.Equals(&next) {
+				continue
+			}
+			if needBlock != nil && !needBlock(next) {
+				continue
+			}
 
-				prev, ok := startByShard[storage.ShardKeyFromBlock(next)]
-				if ok && prev.Equals(&next) {
-					continue
+			key := storage.BlockKey(next)
+			start, end := archiveShardPrefixIndexRange(splitDepth, next.Shard)
+			for idx := start; idx < end; idx++ {
+				seen := seenByPrefix[idx]
+				if seen == nil {
+					seen = map[storage.BlockRootHash]struct{}{}
+					seenByPrefix[idx] = seen
+					plansByPrefix[idx] = archiveShardImportPlan{
+						shard:      archiveShardIDForPrefixIndex(splitDepth, idx),
+						splitDepth: splitDepth,
+					}
 				}
-				if needBlock != nil && !needBlock(next) {
-					continue
-				}
-
-				key := storage.BlockKey(next)
 				if _, ok = seen[key]; ok {
 					continue
 				}
 				seen[key] = struct{}{}
-				plan.needed = append(plan.needed, next)
+				plansByPrefix[idx].needed = append(plansByPrefix[idx].needed, next)
 			}
 		}
+	}
+
+	plans := make([]archiveShardImportPlan, 0, count)
+	for _, plan := range plansByPrefix {
 		if len(plan.needed) > 0 {
 			plans = append(plans, plan)
 		}
 	}
 	return plans
+}
+
+func archiveShardIDForPrefixIndex(splitDepth uint32, idx int) archive.ShardID {
+	shard := uint64(idx*2+1) << (64 - splitDepth - 1)
+	return archive.ShardID{
+		Workchain: 0,
+		Shard:     int64(shard),
+	}
+}
+
+func archiveShardPrefixIndexRange(splitDepth uint32, shard int64) (int, int) {
+	count := 1 << splitDepth
+	depth := storage.ShardPrefixLength(shard)
+	if depth <= 0 {
+		return 0, count
+	}
+	if uint32(depth) >= splitDepth {
+		idx := int(uint64(shard) >> (64 - splitDepth))
+		return idx, idx + 1
+	}
+
+	prefix := uint64(shard) >> (64 - uint(depth))
+	span := 1 << (splitDepth - uint32(depth))
+	start := int(prefix) * span
+	return start, start + span
 }

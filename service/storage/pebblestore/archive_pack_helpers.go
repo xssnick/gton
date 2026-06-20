@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -641,16 +640,7 @@ func archivePackShardPrefix(workchain int32, shard int64, splitDepth uint32) int
 	if workchain == -1 && shard == topShard {
 		return topShard
 	}
-	if splitDepth == 0 {
-		return shard
-	}
-	if splitDepth >= 63 {
-		return int64(uint64(shard) | 1)
-	}
-
-	value := uint64(shard) | 1
-	mask := ^uint64(0) << (64 - splitDepth)
-	return int64((value & mask) | (uint64(1) << (63 - splitDepth)))
+	return storage.ShardPrefix(shard, splitDepth)
 }
 
 func archiveSliceSeqno(baseSeqno uint32, masterSeqno uint32) uint32 {
@@ -730,7 +720,7 @@ func (s *Store) loadArchivePackClaimsBase(claimed *archivePackClaims, baseSeqno 
 	prefix := hotKeyArchiveInfoBasePrefix(baseSeqno)
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
-		UpperBound: appendPrefixUpperBound(prefix),
+		UpperBound: prefixUpperBound(prefix),
 	})
 	if err != nil {
 		return err
@@ -916,14 +906,6 @@ func archivePackDescriptorIsBaseMaster(desc archivePackDescriptor) bool {
 	return desc.startSeqno == desc.baseSeqno && desc.workchain == -1 && desc.shard == topShard
 }
 
-func archiveShardPrefixLength(shard int64) int {
-	value := uint64(shard)
-	if value == 0 {
-		return 0
-	}
-	return 63 - bits.TrailingZeros64(value)
-}
-
 func selectShardSplitNextLink(prev ton.BlockIDExt, existing ton.BlockIDExt, next ton.BlockIDExt) (ton.BlockIDExt, bool) {
 	if prev.Workchain == -1 || existing.Workchain != prev.Workchain || next.Workchain != prev.Workchain {
 		return ton.BlockIDExt{}, false
@@ -934,11 +916,11 @@ func selectShardSplitNextLink(prev ton.BlockIDExt, existing ton.BlockIDExt, next
 	if existing.Shard == next.Shard {
 		return ton.BlockIDExt{}, false
 	}
-	if !archiveShardIsDirectChild(prev.Shard, existing.Shard) || !archiveShardIsDirectChild(prev.Shard, next.Shard) {
+	if !storage.ShardIsDirectChild(prev.Shard, existing.Shard) || !storage.ShardIsDirectChild(prev.Shard, next.Shard) {
 		return ton.BlockIDExt{}, false
 	}
 
-	leftShard := archiveShardChild(prev.Shard, true)
+	leftShard := storage.ShardChild(prev.Shard, true)
 	if existing.Shard == leftShard {
 		return existing, true
 	}
@@ -946,40 +928,6 @@ func selectShardSplitNextLink(prev ton.BlockIDExt, existing ton.BlockIDExt, next
 		return next, true
 	}
 	return ton.BlockIDExt{}, false
-}
-
-func archiveShardIsDirectChild(parent int64, child int64) bool {
-	parentDepth := archiveShardPrefixLength(parent)
-	childDepth := archiveShardPrefixLength(child)
-	if childDepth != parentDepth+1 {
-		return false
-	}
-	return archiveShardIntersects(parent, child)
-}
-
-func archiveShardChild(shard int64, left bool) int64 {
-	value := uint64(shard)
-	bit := value & -value
-	step := bit >> 1
-	if left {
-		return int64(value - step)
-	}
-	return int64(value + step)
-}
-
-func archiveShardIntersects(left int64, right int64) bool {
-	leftDepth := archiveShardPrefixLength(left)
-	rightDepth := archiveShardPrefixLength(right)
-	depth := leftDepth
-	if rightDepth < depth {
-		depth = rightDepth
-	}
-	if depth <= 0 {
-		return true
-	}
-
-	mask := ^uint64(0) << (64 - depth)
-	return uint64(left)&mask == uint64(right)&mask
 }
 
 func (s *Store) archivePackageBaseSeqno(masterSeqno uint32, isKey bool) (uint32, error) {
@@ -1452,15 +1400,4 @@ func (s *Store) truncateUncommittedPackTail(path string, cleanSize int64) error 
 
 func isMissingArtifactError(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-func appendPrefixUpperBound(prefix []byte) []byte {
-	upper := bytes.Clone(prefix)
-	for i := len(upper) - 1; i >= 0; i-- {
-		if upper[i] != 0xff {
-			upper[i]++
-			return upper[:i+1]
-		}
-	}
-	return nil
 }

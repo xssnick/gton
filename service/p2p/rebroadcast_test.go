@@ -65,7 +65,6 @@ func TestPlanCustomRebroadcastMatchesCppNodeRouting(t *testing.T) {
 		{name: "small shard info stays ordinary simple", kind: "tonNode.newShardBlockBroadcast", payloadLen: ordinarySimpleBroadcastMaxSize, mode: rebroadcastModeSimple},
 		{name: "large shard info uses two-step path with anysender", kind: "tonNode.newShardBlockBroadcast", payloadLen: ordinarySimpleBroadcastMaxSize + 1, mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender},
 		{name: "small external uses two-step path", kind: "tonNode.externalMessageBroadcast", payloadLen: 128, mode: rebroadcastModeFEC},
-		{name: "small ihr uses two-step path", kind: "tonNode.ihrMessageBroadcast", payloadLen: 128, mode: rebroadcastModeFEC},
 		{name: "block broadcast uses two-step path with anysender", kind: "tonNode.blockBroadcastCompressedV2", payloadLen: 256, mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender},
 	}
 
@@ -203,8 +202,9 @@ func TestEnqueueRebroadcastAdmissionClosedDropsLocalBlockFanout(t *testing.T) {
 	sub := &overlaySubscription{
 		node: node,
 		spec: overlaySpec{
-			Name: "custom.private-a",
-			Kind: overlayKindCustomFixed,
+			Name:         "custom.private-a",
+			Kind:         overlayKindCustomFixed,
+			BlockSenders: map[PeerID]struct{}{node.localID: {}},
 		},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
@@ -429,8 +429,9 @@ func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
 	sub := &overlaySubscription{
 		node: node,
 		spec: overlaySpec{
-			Name: "custom.private-a",
-			Kind: overlayKindCustomFixed,
+			Name:         "custom.private-a",
+			Kind:         overlayKindCustomFixed,
+			BlockSenders: map[PeerID]struct{}{node.localID: {}},
 		},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
@@ -451,6 +452,68 @@ func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
 	}
 	if got.kind != "tonNode.newShardBlockBroadcast" || !got.local {
 		t.Fatalf("unexpected queued rebroadcast: %#v", got)
+	}
+	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
+	}
+}
+
+func TestCustomBlockRebroadcastRequiresLocalBlockSender(t *testing.T) {
+	node := newTestNode(t)
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name: "custom.private-a",
+			Kind: overlayKindCustomFixed,
+		},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
+	}
+
+	if sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.newShardBlockBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}) {
+		t.Fatal("custom block rebroadcast was accepted without local block sender role")
+	}
+	if peer.localRebroadcastQueue != nil {
+		if _, ok := peer.localRebroadcastQueue.TryPop(); ok {
+			t.Fatal("custom block rebroadcast reached peer queue without local block sender role")
+		}
+	}
+	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
+	}
+}
+
+func TestCustomIHRRebroadcastUnsupported(t *testing.T) {
+	node := newTestNode(t)
+	peer := testRebroadcastQueuePeer("peer")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name: "custom.private-a",
+			Kind: overlayKindCustomFixed,
+		},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{peer.id: peer},
+	}
+
+	if sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         "tonNode.ihrMessageBroadcast",
+		payload:      []byte{0x01},
+		local:        true,
+	}) {
+		t.Fatal("custom IHR rebroadcast was accepted")
+	}
+	if peer.localRebroadcastQueue != nil {
+		if _, ok := peer.localRebroadcastQueue.TryPop(); ok {
+			t.Fatal("custom IHR rebroadcast reached peer queue")
+		}
 	}
 	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
 		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)

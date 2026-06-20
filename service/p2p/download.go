@@ -55,52 +55,30 @@ type CompressedBlockStateProvider interface {
 }
 
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
-	if cached, err := n.shardBroadcastBlock(block); err == nil {
-		return cached, nil
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
-		n.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Msg("failed to load cached shard broadcast block")
-	}
-	if cached, err := n.cachedBlockFull(ctx, block); err == nil {
-		return cached, nil
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
-		n.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Msg("failed to load cached full block")
-	}
-
-	res, err := n.downloadBlockFullFromOverlayOrShardBroadcast(ctx, block)
-	if err != nil {
-		return nil, err
-	}
-	if !res.ID.Equals(&block) {
-		return nil, fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
-	}
-	return res, nil
+	return n.blockFullFromLocalOrOverlay(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+		return n.blockFullFromOverlayOrShardBroadcast(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+			return n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+		})
+	})
 }
 
 func (n *Node) ProbeBlockFull(ctx context.Context, block ton.BlockIDExt, opts ProbeBlockFullOptions) (*DownloadedBlock, error) {
-	if cached, err := n.shardBroadcastBlock(block); err == nil {
+	return n.blockFullFromLocalOrOverlay(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+		return n.blockFullFromOverlayOrShardBroadcast(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+			return n.probeBlockFromOverlay(ctx, block, opts)
+		})
+	})
+}
+
+func (n *Node) blockFullFromLocalOrOverlay(ctx context.Context, block ton.BlockIDExt, load func(context.Context, ton.BlockIDExt) (*DownloadedBlock, error)) (*DownloadedBlock, error) {
+	if cached, ok := n.cachedShardBroadcastBlock(block); ok {
 		return cached, nil
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
-		n.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Msg("failed to load cached shard broadcast block")
 	}
-	if cached, err := n.cachedBlockFull(ctx, block); err == nil {
+	if cached, ok := n.cachedLocalBlockFull(ctx, block); ok {
 		return cached, nil
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
-		n.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Msg("failed to load cached full block")
 	}
 
-	res, err := n.probeBlockFullFromOverlayOrShardBroadcast(ctx, block, opts)
+	res, err := load(ctx, block)
 	if err != nil {
 		return nil, err
 	}
@@ -110,20 +88,15 @@ func (n *Node) ProbeBlockFull(ctx context.Context, block ton.BlockIDExt, opts Pr
 	return res, nil
 }
 
-func (n *Node) downloadBlockFullFromOverlayOrShardBroadcast(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+func (n *Node) blockFullFromOverlayOrShardBroadcast(ctx context.Context, block ton.BlockIDExt, load func(context.Context, ton.BlockIDExt) (*DownloadedBlock, error)) (*DownloadedBlock, error) {
 	wake, unwatch := n.watchShardBroadcastBlock(block)
 	if wake == nil {
-		return n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
+		return load(ctx, block)
 	}
 	defer unwatch()
 
-	if cached, err := n.shardBroadcastBlock(block); err == nil {
+	if cached, ok := n.cachedShardBroadcastBlock(block); ok {
 		return cached, nil
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
-		n.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Msg("failed to load cached shard broadcast block")
 	}
 
 	downloadCtx, cancel := context.WithCancel(ctx)
@@ -135,32 +108,22 @@ func (n *Node) downloadBlockFullFromOverlayOrShardBroadcast(ctx context.Context,
 	}
 	result := make(chan downloadResult, 1)
 	go func() {
-		res, err := n.downloadFromOverlay(downloadCtx, block, tonnodeapi.DownloadBlockFull{Block: block})
+		res, err := load(downloadCtx, block)
 		result <- downloadResult{block: res, err: err}
 	}()
 
 	for {
 		select {
 		case res := <-result:
-			if cached, err := n.shardBroadcastBlock(block); err == nil {
+			if cached, ok := n.cachedShardBroadcastBlock(block); ok {
 				cancel()
 				return cached, nil
-			} else if !errors.Is(err, tnstore.ErrNotFound) {
-				n.log.Debug().
-					Err(err).
-					Str("block", formatBlockRef(block)).
-					Msg("failed to load cached shard broadcast block")
 			}
 			return res.block, res.err
 		case <-wake:
-			if cached, err := n.shardBroadcastBlock(block); err == nil {
+			if cached, ok := n.cachedShardBroadcastBlock(block); ok {
 				cancel()
 				return cached, nil
-			} else if !errors.Is(err, tnstore.ErrNotFound) {
-				n.log.Debug().
-					Err(err).
-					Str("block", formatBlockRef(block)).
-					Msg("failed to load cached shard broadcast block")
 			}
 			wake = nil
 		case <-ctx.Done():
@@ -170,64 +133,28 @@ func (n *Node) downloadBlockFullFromOverlayOrShardBroadcast(ctx context.Context,
 	}
 }
 
-func (n *Node) probeBlockFullFromOverlayOrShardBroadcast(ctx context.Context, block ton.BlockIDExt, opts ProbeBlockFullOptions) (*DownloadedBlock, error) {
-	wake, unwatch := n.watchShardBroadcastBlock(block)
-	if wake == nil {
-		return n.probeBlockFromOverlay(ctx, block, opts)
-	}
-	defer unwatch()
-
+func (n *Node) cachedShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, bool) {
 	if cached, err := n.shardBroadcastBlock(block); err == nil {
-		return cached, nil
+		return cached, true
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
 			Err(err).
 			Str("block", formatBlockRef(block)).
 			Msg("failed to load cached shard broadcast block")
 	}
+	return nil, false
+}
 
-	downloadCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	type downloadResult struct {
-		block *DownloadedBlock
-		err   error
+func (n *Node) cachedLocalBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, bool) {
+	if cached, err := n.cachedBlockFull(ctx, block); err == nil {
+		return cached, true
+	} else if !errors.Is(err, tnstore.ErrNotFound) {
+		n.log.Debug().
+			Err(err).
+			Str("block", formatBlockRef(block)).
+			Msg("failed to load cached full block")
 	}
-	result := make(chan downloadResult, 1)
-	go func() {
-		res, err := n.probeBlockFromOverlay(downloadCtx, block, opts)
-		result <- downloadResult{block: res, err: err}
-	}()
-
-	for {
-		select {
-		case res := <-result:
-			if cached, err := n.shardBroadcastBlock(block); err == nil {
-				cancel()
-				return cached, nil
-			} else if !errors.Is(err, tnstore.ErrNotFound) {
-				n.log.Debug().
-					Err(err).
-					Str("block", formatBlockRef(block)).
-					Msg("failed to load cached shard broadcast block")
-			}
-			return res.block, res.err
-		case <-wake:
-			if cached, err := n.shardBroadcastBlock(block); err == nil {
-				cancel()
-				return cached, nil
-			} else if !errors.Is(err, tnstore.ErrNotFound) {
-				n.log.Debug().
-					Err(err).
-					Str("block", formatBlockRef(block)).
-					Msg("failed to load cached shard broadcast block")
-			}
-			wake = nil
-		case <-ctx.Done():
-			cancel()
-			return nil, ctx.Err()
-		}
-	}
+	return nil, false
 }
 
 func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt) error {
@@ -1418,14 +1345,6 @@ func decodeCompressedHardforkBlock(data DataFullCompressed, cause error) (*Downl
 	proof := cell.ToBOCWithOptions([]*cell.Cell{roots[0]}, cell.BOCSerializeOptions{WithCRC32C: false})
 	block := serializeCompressedBlockRoot(roots[1])
 	return newVerifiedDownloadedHardforkBlock("tonNode.dataFullCompressed", data.ID, proof, block, data.IsLink, roots[0], roots[1], cause)
-}
-
-func decodeCompressedBlockV2(data DataFullCompressedV2, state *cell.Cell) (*DownloadedBlock, error) {
-	proofRoot, err := parseDownloadedBlockProof("tonNode.dataFullCompressedV2", data.Proof)
-	if err != nil {
-		return nil, err
-	}
-	return decodeCompressedBlockV2WithProofRoot(data, state, proofRoot)
 }
 
 func (n *Node) decodeDataFullCompressedV2(ctx context.Context, data DataFullCompressedV2) (*DownloadedBlock, error) {
