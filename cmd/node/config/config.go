@@ -20,7 +20,7 @@ const (
 	DefaultPath                             = "config.json"
 	DefaultGlobalConfigPath                 = "global.config.json"
 	DefaultGlobalConfigURL                  = "https://ton-blockchain.github.io/global.config.json"
-	DefaultSyncBefore                       = time.Hour
+	DefaultSyncBefore                       = 4 * time.Hour
 	ArchiveFromZeroSyncBefore               = int64(-1)
 	DefaultStateTTL                         = 2 * 24 * time.Hour
 	DefaultArchiveTTL                       = 7 * 24 * time.Hour

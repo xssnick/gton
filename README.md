@@ -217,7 +217,7 @@ Simplified example:
 {
   "ton": {
     "global_config_path": "global.config.json",
-    "sync_before": 3600,
+    "sync_before": 14400,
     "state_ttl": 172800,
     "archive_ttl": 604800,
     "next_checkpoint_blocks": 200,
@@ -271,7 +271,7 @@ Simplified example:
 | Field | Description |
 | --- | --- |
 | `global_config_path` | Path to the TON global config. If the file is missing, it is downloaded during startup. |
-| `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `3600`. Set to `-1` only for Archival liteserver mode. |
+| `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `14400` (4 hours). Set to `-1` only for Archival liteserver mode. |
 | `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `172800` (2 days). Set to `0` to disable automatic cell DB generation rotation and keep the current-state DB generation forever. Required to be `0` when `sync_before=-1`. |
 | `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). Set to `0` to keep archives forever. Required to be `0` when `sync_before=-1`. |
 | `next_checkpoint_blocks` | Current-state checkpoint frequency during next-block sync, in masterchain blocks. Defaults to `200`. |

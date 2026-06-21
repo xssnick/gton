@@ -21,7 +21,7 @@ const (
 	keyBlockProgressInfoEvery  = 64
 	keyBlockLookupRetryDelay   = time.Second
 	keyBlockLookupRetryLogEach = 5
-	DefaultSyncBefore          = time.Hour
+	DefaultSyncBefore          = 4 * time.Hour
 	initialStateDownloadWindow = 8 * time.Hour
 )
 
