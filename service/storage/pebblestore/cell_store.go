@@ -525,12 +525,13 @@ func (w *cellBatchWriter) flush() (stateCellWriteStats, error) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("commit celldb shard %d batch: %w", i, err)
 			}
+			_ = batch.Close()
+			w.batches[i] = nil
 		} else {
 			w.store.addWrittenCells(i, uint64(w.cellsByShard[i]))
 			w.store.markDirty(i)
+			batch.Reset()
 		}
-		_ = batch.Close()
-		w.batches[i] = nil
 		w.cellsByShard[i] = 0
 		w.bytesByShard[i] = 0
 	}
@@ -560,9 +561,14 @@ func (w *cellBatchWriter) ensureBatch(hash []byte) (int, error) {
 		return 0, err
 	}
 	if w.batches[idx] == nil {
-		w.batches[idx] = shard.db.NewBatchWithSize(cellShardBatchInitialSize())
+		w.batches[idx] = newCellShardBatch(shard.db)
 	}
 	return idx, nil
+}
+
+func newCellShardBatch(db *pebble.DB) *pebble.Batch {
+	size := cellShardBatchInitialSize()
+	return db.NewBatchWithSize(size, pebble.WithMaxRetainedSizeBytes(size))
 }
 
 func cellShardMemTableSize(total int) int {
