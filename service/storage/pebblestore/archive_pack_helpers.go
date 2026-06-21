@@ -653,26 +653,6 @@ func archiveSliceSeqno(baseSeqno uint32, masterSeqno uint32) uint32 {
 const archiveFirstDynamicPackageIndex uint32 = 1
 
 func (s *Store) archivePackIDForDescriptor(desc archivePackDescriptor, claimed *archivePackClaims) (int64, error) {
-	if claimed == nil {
-		existing, err := s.lookupArchivePackID(desc)
-		if err == nil {
-			return existing, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return 0, err
-		}
-
-		if archivePackDescriptorIsBaseMaster(desc) {
-			return archivePackageID(desc.baseSeqno, 0), nil
-		}
-
-		next, err := s.nextArchivePackageIndex(desc.baseSeqno)
-		if err != nil {
-			return 0, err
-		}
-		return archivePackageID(desc.baseSeqno, next), nil
-	}
-
 	if err := s.loadArchivePackClaimsBase(claimed, desc.baseSeqno); err != nil {
 		return 0, err
 	}
@@ -846,19 +826,6 @@ func decodeArchiveInfoKey(key []byte) (archivePackDescriptor, error) {
 		shard:      int64(binary.BigEndian.Uint64(key[pos+12 : pos+20])),
 	}
 	return desc, nil
-}
-
-func (s *Store) lookupArchivePackID(desc archivePackDescriptor) (int64, error) {
-	raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchiveInfo(desc.baseSeqno, desc.startSeqno, desc.workchain, desc.shard))
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = closer.Close() }()
-
-	if len(raw) != 8 {
-		return 0, fmt.Errorf("invalid archive info payload")
-	}
-	return int64(binary.BigEndian.Uint64(raw)), nil
 }
 
 func (s *Store) nextArchivePackageIndex(baseSeqno uint32) (uint32, error) {

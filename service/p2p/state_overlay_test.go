@@ -44,6 +44,41 @@ func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	}
 }
 
+func TestZeroStateDeadlineGraceKeepsPeerCandidate(t *testing.T) {
+	peer := testZeroStatePeer("slow")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+		peers: map[PeerID]*overlayPeer{
+			peer.id: peer,
+		},
+	}
+	pool := testArchivePool(sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+
+	pool.markAvailable(shard, peer)
+	session.noteArchivePeerAvailable(peer)
+	tried := map[PeerID]struct{}{}
+	if !session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded) {
+		t.Fatal("deadline grace should keep zero-state peer retryable")
+	}
+
+	got := zeroStateArchiveCandidates(pool, session, shard, tried)
+	if len(got) == 0 || got[0].id != peer.id {
+		t.Fatalf("deadline-graced peer was not retried: %#v", got)
+	}
+	failures, pinned := session.archivePeerDeadlineFailures(peer)
+	if !pinned || failures != 1 {
+		t.Fatalf("deadline failures = %d pinned=%v, want 1 and pinned", failures, pinned)
+	}
+	if pool.coolingDown(shard, peer) {
+		t.Fatal("deadline grace should not cool down zero-state peer")
+	}
+}
+
 func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
 	peer := testZeroStatePeer("live")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
@@ -59,7 +94,7 @@ func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
 	defer session.Close()
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
-	session.rejectArchivePeer(pool, shard, peer, archivePeerRejectStateNotAvailable)
+	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
 
 	if _, ok := sub.peers[peer.id]; !ok {
 		t.Fatal("borrowed live peer was removed from live pool")
@@ -82,7 +117,7 @@ func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
 	defer session.Close()
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
-	session.rejectArchivePeer(pool, shard, peer, archivePeerRejectStateNotAvailable)
+	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
 
 	if pool.hasPeer(peer.id) {
 		t.Fatal("archive-only peer survived zero-state not-available rotation")

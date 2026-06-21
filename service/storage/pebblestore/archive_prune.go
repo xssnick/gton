@@ -241,8 +241,6 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 			hotKeyBlockDataRef(block),
 			hotKeyProofRef(storage.ServedProofBlock, block),
 			hotKeyProofRef(storage.ServedProofBlockLink, block),
-			hotKeyKeyProofRef(storage.ServedProofKeyBlock, block),
-			hotKeyKeyProofRef(storage.ServedProofKeyBlockLink, block),
 		}
 		if meta.EndLT != 0 {
 			keys = append(keys, hotKeyBlockLTIndex(meta))

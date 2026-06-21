@@ -13,10 +13,6 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func (s *Store) SaveCurrentState(ctx context.Context, state *storage.CurrentState) error {
-	return s.saveCurrentStateRecord(ctx, hotKeyCurrentState(), state, pebble.NoSync)
-}
-
 func (s *Store) SaveStateSyncProgress(ctx context.Context, state *storage.CurrentState) error {
 	return s.saveCurrentStateRecord(ctx, hotKeyStateSyncProgress(), state, pebble.Sync)
 }

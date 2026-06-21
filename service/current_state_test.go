@@ -362,11 +362,15 @@ func TestCurrentBroadcastValidatorConfigUsesLiveCurrentState(t *testing.T) {
 	persistedMaster := testBlockID(-1, topShard, 120)
 	liveMaster := testBlockID(-1, topShard, 121)
 
-	if err := store.SaveCurrentState(ctx, &tnstore.CurrentState{
-		Masterchain: tnstore.BlockState{Block: persistedMaster},
+	persistedMasterState := tnstore.BlockState{
+		Block: persistedMaster,
+		Cell:  testShardStateCell(t, persistedMaster),
+	}
+	if err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{&persistedMasterState}, &tnstore.CurrentState{
+		Masterchain: persistedMasterState,
 		Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
 	}); err != nil {
-		t.Fatalf("save persisted current state: %v", err)
+		t.Fatalf("save persisted state checkpoint: %v", err)
 	}
 
 	svc := &Service{

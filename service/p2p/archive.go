@@ -247,7 +247,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, sess
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return nil, ctxErr
 				}
-				s.noteArchiveDownloadError(session, pool, resolved.Shard, peer, err)
+				s.noteArchiveDownloadError(ctx, session, pool, resolved.Shard, peer, err)
 				errs = append(errs, archiveDownloadError(peer, err))
 				continue
 			}
@@ -261,7 +261,7 @@ func (s *overlaySubscription) downloadArchiveFromPeers(ctx context.Context, sess
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		s.noteArchiveDownloadError(session, pool, resolved.Shard, peer, err)
+		s.noteArchiveDownloadError(ctx, session, pool, resolved.Shard, peer, err)
 		s.log.Debug().
 			Err(err).
 			Uint32("masterchain_seqno", resolved.MasterchainSeqno).
@@ -310,7 +310,7 @@ func (s *overlaySubscription) downloadArchiveFromPeersHedged(ctx context.Context
 		if errors.Is(res.err, context.Canceled) {
 			continue
 		}
-		s.noteArchiveDownloadError(session, pool, resolved.Shard, res.candidate.peer, res.err)
+		s.noteArchiveDownloadError(ctx, session, pool, resolved.Shard, res.candidate.peer, res.err)
 		s.log.Debug().
 			Err(res.err).
 			Uint32("masterchain_seqno", resolved.MasterchainSeqno).
@@ -400,9 +400,9 @@ func (s *overlaySubscription) logArchiveHedgeResult(resolved resolvedArchive, ca
 		Msg("archive hedge download won")
 }
 
-func (s *overlaySubscription) noteArchiveDownloadError(session *ArchiveSession, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) {
+func (s *overlaySubscription) noteArchiveDownloadError(ctx context.Context, session *ArchiveSession, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) {
 	if errors.Is(err, archive.ErrNotAvailable) {
-		session.rejectArchivePeer(pool, shard, peer, archivePeerRejectNotAvailable)
+		session.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectNotAvailable)
 		return
 	}
 	if session.archivePeerDeadlineGrace(peer, err) {
@@ -410,7 +410,7 @@ func (s *overlaySubscription) noteArchiveDownloadError(session *ArchiveSession, 
 	}
 
 	peer.downloadFailed(archiveSlowPeerPenalty)
-	session.rejectArchivePeer(pool, shard, peer, archivePeerRejectDownloadFailed)
+	session.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectDownloadFailed)
 }
 
 func formatArchiveCandidateRate(candidate archiveCandidate) string {
@@ -691,11 +691,11 @@ func (s *overlaySubscription) findArchiveInfo(ctx context.Context, session *Arch
 			return nil, ctxErr
 		}
 		if errors.Is(err, archive.ErrNotAvailable) {
-			session.rejectArchivePeer(pool, shard, peer, archivePeerRejectNotAvailable)
+			session.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectNotAvailable)
 		} else {
 			if !session.archivePeerDeadlineGrace(peer, err) {
 				peer.downloadFailed(archiveSlowPeerPenalty)
-				session.rejectArchivePeer(pool, shard, peer, archivePeerRejectCandidateFailed)
+				session.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectCandidateFailed)
 			}
 		}
 		errs = append(errs, archiveDownloadError(peer, err))

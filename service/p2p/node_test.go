@@ -189,38 +189,6 @@ func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 	}
 }
 
-func TestNodeWaitObservedMasterchainBlockAfterVerifiedSeen(t *testing.T) {
-	node := newTestNode(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	done := make(chan ton.BlockIDExt, 1)
-	go func() {
-		block, err := node.WaitObservedMasterchainBlock(ctx)
-		if err != nil {
-			t.Errorf("wait observed masterchain block: %v", err)
-			return
-		}
-		done <- block
-	}()
-
-	node.RememberSeenMasterchainBlock(ton.BlockIDExt{
-		Workchain: -1,
-		Shard:     topShard,
-		SeqNo:     123,
-	})
-
-	select {
-	case block := <-done:
-		if block.SeqNo != 123 {
-			t.Fatalf("unexpected block %+v", block)
-		}
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for masterchain block")
-	}
-}
-
 func TestStatusSnapshotTracksLatestBasechainBlock(t *testing.T) {
 	node := newTestNode(t)
 
@@ -456,41 +424,6 @@ func configBlockFromID(block ton.BlockIDExt) liteclient.ConfigBlock {
 		SeqNo:     block.SeqNo,
 		RootHash:  append([]byte(nil), block.RootHash...),
 		FileHash:  append([]byte(nil), block.FileHash...),
-	}
-}
-
-func TestNodeWaitBasechainBlock(t *testing.T) {
-	node := newTestNode(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	done := make(chan ton.BlockIDExt, 1)
-	go func() {
-		block, err := node.WaitBasechainBlock(ctx)
-		if err != nil {
-			t.Errorf("wait basechain block: %v", err)
-			return
-		}
-		done <- block
-	}()
-
-	node.trackUnverifiedBroadcastBlock(BroadcastEvent{
-		Overlay: "basechain",
-		Block: ton.BlockIDExt{
-			Workchain: 0,
-			Shard:     topShard,
-			SeqNo:     77,
-		},
-	})
-
-	select {
-	case block := <-done:
-		if block.SeqNo != 77 {
-			t.Fatalf("unexpected block %+v", block)
-		}
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for basechain block")
 	}
 }
 

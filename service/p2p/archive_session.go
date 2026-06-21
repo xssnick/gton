@@ -129,7 +129,7 @@ func (a *ArchiveSession) RejectArchivePeer(shard archive.ShardID, peerAddr strin
 		return false
 	}
 
-	a.rejectArchivePeer(pool, shard, peer, reason)
+	a.rejectArchivePeer(nil, pool, shard, peer, reason)
 	return true
 }
 
@@ -378,7 +378,7 @@ func archivePinnedPeerTimeout(base time.Duration, max time.Duration, failures in
 	return base + time.Duration(int64(max-base)*int64(failures)/int64(archiveSessionPinnedDeadlineGrace))
 }
 
-func (a *ArchiveSession) rejectArchivePeer(pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, reason string) {
+func (a *ArchiveSession) rejectArchivePeer(ctx context.Context, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, reason string) {
 	peerID := archivePeerID(peer)
 	selected := a != nil && !peerID.IsZero() && a.selectedArchivePeerID(shard) == peerID
 	useless := pool == nil
@@ -396,7 +396,7 @@ func (a *ArchiveSession) rejectArchivePeer(pool *archivePeerPool, shard archive.
 	}
 	if pool != nil && useless {
 		pool.cooldown(shard, peer, reason)
-		pool.refreshUseless(context.Background(), shard)
+		pool.refreshUseless(ctx, shard)
 	}
 }
 

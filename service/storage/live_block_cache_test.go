@@ -83,6 +83,43 @@ func TestLiveBlockCacheEvictsFlushedArtifacts(t *testing.T) {
 	}
 }
 
+func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
+	cache := NewLiveBlockCache(1)
+	block := testLiveBlockCacheBlockID(1)
+	data := []byte{0x11}
+
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+		Block:     block,
+		BlockData: data,
+	}); err != nil {
+		t.Fatalf("publish unflushed block: %v", err)
+	}
+	cached, err := cache.CachedBlockData(context.Background(), block)
+	if err != nil {
+		t.Fatalf("cached unflushed block data: %v", err)
+	}
+	if cached.ArtifactFlushed {
+		t.Fatal("unflushed block data reported as flushed")
+	}
+	if !bytes.Equal(cached.Data, data) {
+		t.Fatalf("cached block data = %x, want %x", cached.Data, data)
+	}
+
+	if err = cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+		Block:           block,
+		ArtifactFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish flushed marker: %v", err)
+	}
+	cached, err = cache.CachedBlockData(context.Background(), block)
+	if err != nil {
+		t.Fatalf("cached flushed block data: %v", err)
+	}
+	if !cached.ArtifactFlushed {
+		t.Fatal("flushed block data reported as unflushed")
+	}
+}
+
 func testLiveBlockCacheBlockID(seqno uint32) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: 0,

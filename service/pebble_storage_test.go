@@ -27,22 +27,22 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	proofData := []byte{0x10, 0x20, 0x30}
 	zeroStateData := []byte{0x01, 0x00, 0x02}
 
-	if err := store.SaveArchiveImport(&storage.ServedArchiveImport{
-		FullBlocks: []*storage.ServedBlockFull{{
-			ID:     prev,
-			Block:  []byte{0x70},
-			Proof:  []byte{0x71},
-			Meta:   &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
-			IsLink: false,
-		}, {
-			ID:     block,
-			Block:  blockData,
-			Proof:  proofData,
-			Meta:   &storage.BlockMeta{ID: block, GenUTime: block.SeqNo},
-			IsLink: false,
-		}},
+	if _, err := store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		Artifact: &storage.ServedBlockFull{
+			ID:    prev,
+			Block: []byte{0x70},
+			Proof: []byte{0x71},
+			Meta:  &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
+		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
-	}); err != nil {
+	}, {
+		Artifact: &storage.ServedBlockFull{
+			ID:    block,
+			Block: blockData,
+			Proof: proofData,
+			Meta:  &storage.BlockMeta{ID: block, GenUTime: block.SeqNo},
+		},
+	}}, storage.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
 	if err := store.SaveZeroState(prev, zeroStateData, nil); err != nil {
@@ -52,13 +52,13 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	archiveSeqno := int32(101)
 	archiveBlock := testPebbleBlockID(-1, topShard, uint32(archiveSeqno))
 	archiveData := []byte{0x55, 0x44}
-	if err := store.SaveArchiveImport(&storage.ServedArchiveImport{
-		FullBlocks: []*storage.ServedBlockFull{{
+	if _, err := store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		Artifact: &storage.ServedBlockFull{
 			ID:    archiveBlock,
 			Block: archiveData,
 			Meta:  &storage.BlockMeta{ID: archiveBlock, GenUTime: 1010, StartLT: 101, EndLT: 102},
-		}},
-	}); err != nil {
+		},
+	}}, storage.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save archive import: %v", err)
 	}
 
@@ -174,15 +174,17 @@ func TestPebbleStorageKeepsMetadataOnlyBlocksOutOfHistoryIndexes(t *testing.T) {
 	}
 	requireLazyCellBOC(t, loaded, root)
 
+	masterState := storage.BlockState{Block: testPebbleBlockID(-1, topShard, 100), Cell: cell.BeginCell().EndCell()}
+	shardState := storage.BlockState{Block: blockB, Cell: cell.BeginCell().EndCell()}
 	current := &storage.CurrentState{
 		SyncedAt:    time.Now().Round(0),
-		Masterchain: storage.BlockState{Block: testPebbleBlockID(-1, topShard, 100), Cell: cell.BeginCell().EndCell()},
+		Masterchain: masterState,
 		Shards: map[storage.ShardKey]storage.BlockState{
-			{Workchain: 0, Shard: topShard}: {Block: blockB, Cell: cell.BeginCell().EndCell()},
+			{Workchain: 0, Shard: topShard}: shardState,
 		},
 	}
-	if err = store.SaveCurrentState(ctx, current); err != nil {
-		t.Fatalf("save current state: %v", err)
+	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{&masterState, &shardState}, current); err != nil {
+		t.Fatalf("save state checkpoint: %v", err)
 	}
 	gotCurrent, err := store.CurrentState(ctx)
 	if err != nil {

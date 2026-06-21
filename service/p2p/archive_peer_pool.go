@@ -159,6 +159,8 @@ func (p *archivePeerPool) addArchiveOnlyPeer(peer *overlayPeer) bool {
 		return false
 	}
 
+	p.pruneClosedPeers()
+
 	p.mx.Lock()
 	defer p.mx.Unlock()
 
@@ -197,6 +199,7 @@ func (p *archivePeerPool) candidates(shard archive.ShardID) []*overlayPeer {
 	}
 
 	p.bootstrapLivePeers()
+	p.pruneClosedPeers()
 
 	now := time.Now()
 	stateKey := archivePeerPoolKey(shard)
@@ -671,9 +674,84 @@ func (p *archivePeerPool) refill(ctx context.Context, forceDHT bool) {
 }
 
 func (p *archivePeerPool) size() int {
+	p.pruneClosedPeers()
+
 	p.mx.Lock()
 	defer p.mx.Unlock()
 	return len(p.peers)
+}
+
+func (p *archivePeerPool) pruneClosedPeers() int {
+	if p == nil {
+		return 0
+	}
+
+	p.mx.Lock()
+	if p.closed {
+		p.mx.Unlock()
+		return 0
+	}
+
+	var archiveOnly []*overlayPeer
+	removed := 0
+	for peerID, entry := range p.peers {
+		if entry == nil {
+			delete(p.peers, peerID)
+			removed++
+			continue
+		}
+		if entry.leases > 0 {
+			continue
+		}
+		if entry.peer != nil && entry.peer.hasOpenConnection() {
+			continue
+		}
+
+		if peer := p.removeClosedPeerLocked(peerID); peer != nil {
+			archiveOnly = append(archiveOnly, peer)
+		}
+		removed++
+	}
+	p.mx.Unlock()
+
+	for _, peer := range archiveOnly {
+		closeArchiveOnlyPeer(peer)
+	}
+	return removed
+}
+
+func (p *archivePeerPool) removeClosedPeerLocked(peerID PeerID) *overlayPeer {
+	entry := p.peers[peerID]
+	if entry == nil {
+		return nil
+	}
+
+	delete(p.peers, peerID)
+	for workchain, peers := range p.workchains {
+		delete(peers, peerID)
+		if len(peers) == 0 {
+			delete(p.workchains, workchain)
+		}
+	}
+	for stateKey, state := range p.shards {
+		if state == nil {
+			delete(p.shards, stateKey)
+			continue
+		}
+		if len(state.failures) > 0 {
+			delete(state.failures, peerID)
+		}
+		if len(state.cooldownUntil) > 0 {
+			delete(state.cooldownUntil, peerID)
+		}
+		if archiveShardPeerStateEmpty(state) {
+			delete(p.shards, stateKey)
+		}
+	}
+	if entry.owner != archivePeerArchiveOnly {
+		return nil
+	}
+	return entry.peer
 }
 
 func (p *archivePeerPool) startDHTDiscovery(ctx context.Context, targetPeers int) {

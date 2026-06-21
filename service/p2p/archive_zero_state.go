@@ -58,10 +58,6 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 
 		notAvailable := 0
 		for _, peer := range peers {
-			if !peer.id.IsZero() {
-				tried[peer.id] = struct{}{}
-			}
-
 			a.node.log.Info().
 				Str("peer", peer.addr).
 				Str("block", formatBlockRef(block)).
@@ -77,11 +73,15 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 			if errors.Is(err, context.Canceled) {
 				return nil, err
 			}
+			retryable := false
 			if errors.Is(err, ErrStateNotAvailable) {
 				notAvailable++
-				a.rejectArchivePeer(pool, shard, peer, archivePeerRejectStateNotAvailable)
+				a.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectStateNotAvailable)
 			} else {
-				a.noteZeroStatePeerError(pool, shard, peer, err)
+				retryable = a.noteZeroStatePeerError(ctx, pool, shard, peer, err)
+			}
+			if !retryable && !peer.id.IsZero() {
+				tried[peer.id] = struct{}{}
 			}
 			errs = append(errs, archiveDownloadError(peer, err))
 		}
@@ -202,13 +202,15 @@ func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *ove
 	}, nil
 }
 
-func (a *ArchiveSession) noteZeroStatePeerError(pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) {
+// noteZeroStatePeerError returns true when deadline grace keeps the peer eligible for another attempt.
+func (a *ArchiveSession) noteZeroStatePeerError(ctx context.Context, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) bool {
 	if a.archivePeerDeadlineGrace(peer, err) {
-		return
+		return true
 	}
 
 	peer.downloadFailed(archiveSlowPeerPenalty)
-	a.rejectArchivePeer(pool, shard, peer, archivePeerRejectStateDownloadFailed)
+	a.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectStateDownloadFailed)
+	return false
 }
 
 func archiveShardFromBlock(block ton.BlockIDExt) archive.ShardID {

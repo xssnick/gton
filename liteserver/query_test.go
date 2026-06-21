@@ -874,6 +874,51 @@ func TestLiveStoreKeepsUnflushedArtifactsUnderSharedCachePressure(t *testing.T) 
 	}
 }
 
+func TestLiveStoreCachedBlockRootKeepsSharedUnflushedBlockPinned(t *testing.T) {
+	shared := storage.NewLiveBlockCache(1)
+	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{
+		MasterBlockCache: 0,
+		ShardBlockCache:  0,
+		LiveBlockCache:   shared,
+	})
+
+	firstRoot := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
+	firstData := testBlockBOC(firstRoot)
+	first := testBlockIDForData(masterchainID, masterchainShard, 51, firstRoot, firstData)
+	if err := shared.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     first,
+		BlockData: firstData,
+	}); err != nil {
+		t.Fatalf("publish first shared block data: %v", err)
+	}
+
+	gotRoot, err := live.BlockRoot(context.Background(), first)
+	if err != nil {
+		t.Fatalf("load first block root from shared cache: %v", err)
+	}
+	if !bytes.Equal(gotRoot.Hash(), firstRoot.Hash()) {
+		t.Fatalf("first root hash = %x, want %x", gotRoot.Hash(), firstRoot.Hash())
+	}
+
+	secondRoot := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
+	secondData := testBlockBOC(secondRoot)
+	second := testBlockIDForData(masterchainID, masterchainShard, 52, secondRoot, secondData)
+	if err = shared.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     second,
+		BlockData: secondData,
+	}); err != nil {
+		t.Fatalf("publish second shared block data: %v", err)
+	}
+
+	gotData, err := live.BlockData(context.Background(), first)
+	if err != nil {
+		t.Fatalf("first shared block data was evicted before flush: %v", err)
+	}
+	if !bytes.Equal(gotData, firstData) {
+		t.Fatalf("first shared block data = %x, want %x", gotData, firstData)
+	}
+}
+
 func TestLiveStoreReplacingFlushedBlockKeepsTrimCountStable(t *testing.T) {
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 2})
 
@@ -4710,14 +4755,10 @@ func TestWaitMasterchainSeqnoPrefixRunsWrappedQueryAfterLiveState(t *testing.T) 
 	live.SetLiveCurrentState(current10)
 	srv := testServer(live)
 
-	req := serializeWaitPrefixedQuery(t,
+	parsed := parseWaitPrefixedQuery(t,
 		ton.WaitMasterchainSeqno{Seqno: 11, Timeout: 500},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
-	var parsed tl.Serializable
-	if _, err := tl.Parse(&parsed, req, true); err != nil {
-		t.Fatal(err)
-	}
 
 	done := make(chan tl.Serializable, 1)
 	go func() {
@@ -4766,7 +4807,7 @@ func TestWaitMasterchainSeqnoPrefixWaitsForReadableLiveCurrent(t *testing.T) {
 	live.SetLiveCurrentState(current)
 	srv := testServer(live)
 
-	req := serializeRawWaitPrefixedQuery(t,
+	req := parseWaitPrefixedQuery(t,
 		ton.WaitMasterchainSeqno{Seqno: int32(block.SeqNo), Timeout: 500},
 		ton.LookupBlock{
 			Mode: 1,
@@ -4816,7 +4857,7 @@ func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 	live.SetLiveCurrentState(current)
 	srv := testServer(live)
 
-	timeoutReq := serializeRawWaitPrefixedQuery(t,
+	timeoutReq := parseWaitPrefixedQuery(t,
 		ton.WaitMasterchainSeqno{Seqno: 21, Timeout: 1},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
@@ -4829,7 +4870,7 @@ func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 		t.Fatalf("timeout code = %d, want %d", errResp.Code, errCodeTimeout)
 	}
 
-	tooFarReq := serializeRawWaitPrefixedQuery(t,
+	tooFarReq := parseWaitPrefixedQuery(t,
 		ton.WaitMasterchainSeqno{Seqno: 121, Timeout: 500},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
@@ -5079,15 +5120,26 @@ func testLiveStoreIndexBlock(seqno uint32, key storage.BlockHistoryKey) ton.Bloc
 func serializeWaitPrefixedQuery(t *testing.T, wait ton.WaitMasterchainSeqno, query tl.Serializable) []byte {
 	t.Helper()
 
-	raw := serializeRawWaitPrefixedQuery(t, wait, query)
-	data, err := tl.Serialize(liteclient.LiteServerQuery{Data: tl.Raw(raw)}, true)
+	payload := serializeWaitPrefixedPayload(t, wait, query)
+	data, err := tl.Serialize(liteclient.LiteServerQuery{Data: tl.Raw(payload)}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return data
 }
 
-func serializeRawWaitPrefixedQuery(t *testing.T, wait ton.WaitMasterchainSeqno, query tl.Serializable) tl.Raw {
+func parseWaitPrefixedQuery(t *testing.T, wait ton.WaitMasterchainSeqno, query tl.Serializable) tl.Serializable {
+	t.Helper()
+
+	data := serializeWaitPrefixedQuery(t, wait, query)
+	var parsed tl.Serializable
+	if _, err := tl.Parse(&parsed, data, true); err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+func serializeWaitPrefixedPayload(t *testing.T, wait ton.WaitMasterchainSeqno, query tl.Serializable) []byte {
 	t.Helper()
 
 	prefix, err := tl.Serialize(wait, true)
@@ -5098,7 +5150,7 @@ func serializeRawWaitPrefixedQuery(t *testing.T, wait ton.WaitMasterchainSeqno, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tl.Raw(append(prefix, suffix...))
+	return append(prefix, suffix...)
 }
 
 func testBlockIDForRoot(workchain int32, shard int64, seqno uint32, root *cell.Cell) ton.BlockIDExt {

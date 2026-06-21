@@ -222,13 +222,6 @@ func (s *LiveStore) LazyCellLoader() cell.LazyCellLoader {
 	return s.backing.LazyCellLoader()
 }
 
-func (s *LiveStore) LiveBlockCache() *storage.LiveBlockCache {
-	if s == nil {
-		return nil
-	}
-	return s.liveBlockCache
-}
-
 func (s *LiveStore) loadInitialStoredCurrentState(ctx context.Context) {
 	// Fresh and from-zero nodes do not have a stored current state yet. Missing
 	// current is allowed; real storage errors should fail during initialization.
@@ -845,8 +838,12 @@ func (s *LiveStore) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*
 
 func (s *LiveStore) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	value, err := s.blockDataLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
-		if data, ok := s.cachedBlockData(block); ok {
-			return data, nil
+		cached, err := s.cachedBlockData(ctx, block)
+		if err == nil {
+			return cached.Data, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
 		}
 
 		data, err := s.backing.BlockData(ctx, block)
@@ -878,7 +875,9 @@ func (s *LiveStore) loadStoredBlockData(ctx context.Context, block ton.BlockIDEx
 
 func (s *LiveStore) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liveBlockLoadResult, error) {
 	value, err := s.blockLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
-		if data, ok := s.cachedBlockData(block); ok {
+		cached, err := s.cachedBlockData(ctx, block)
+		if err == nil {
+			data := cached.Data
 			root := s.cachedBlockRoot(block)
 			if root == nil {
 				parsed, err := parseTrustedBlockBOC(block, data)
@@ -890,12 +889,15 @@ func (s *LiveStore) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (
 					Block:           block,
 					Root:            root,
 					BlockData:       data,
-					ArtifactFlushed: true,
+					ArtifactFlushed: cached.ArtifactFlushed,
 				}); err != nil {
 					return nil, err
 				}
 			}
 			return &liveBlockLoadResult{root: root, data: data}, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
 		}
 
 		data, err := s.backing.BlockData(ctx, block)
@@ -1183,15 +1185,12 @@ func (s *LiveStore) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
 	return cached.root
 }
 
-func (s *LiveStore) cachedBlockData(block ton.BlockIDExt) ([]byte, bool) {
+func (s *LiveStore) cachedBlockData(ctx context.Context, block ton.BlockIDExt) (storage.CachedBlockData, error) {
 	if s.liveBlockCache != nil {
-		data, err := s.liveBlockCache.BlockData(context.Background(), block)
-		if err == nil {
-			return data, true
-		}
+		return s.liveBlockCache.CachedBlockData(ctx, block)
 	}
 
-	return nil, false
+	return storage.CachedBlockData{}, storage.ErrNotFound
 }
 
 func (s *LiveStore) cachedBlockFragments(block ton.BlockIDExt) *liveBlockFragments {

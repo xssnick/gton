@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	requestLimitIdleTTL                 = 10 * time.Minute
-	requestLimitPruneInterval           = time.Minute
+	requestLimitPruneInterval           = time.Second
 	liteserverConnectionCleanupInterval = 5 * time.Second
+	maxRequestLimitNanos                = int64(1<<63 - 1)
 )
 
 type RequestLimitOptions struct {
@@ -40,77 +41,158 @@ func validateRequestLimitOptions(opts RequestLimitOptions) error {
 }
 
 type requestLimiter struct {
-	mx               sync.Mutex
-	capacity         float64
-	coolingPerSecond float64
-	buckets          map[string]*requestLimitBucket
-	lastPrune        time.Time
+	requestNanos int64
+	burstNanos   int64
+	buckets      sync.Map
 }
 
 type requestLimitBucket struct {
-	tokens  float64
-	updated time.Time
-	seenAt  time.Time
+	until   atomic.Int64
+	deleted atomic.Bool
 }
 
 func newRequestLimiter(opts RequestLimitOptions) *requestLimiter {
 	if opts.CapacityPerIP == 0 {
 		return nil
 	}
+	requestNanos := requestLimitCostNanos(opts.CoolingPerSec)
 	return &requestLimiter{
-		capacity:         float64(opts.CapacityPerIP),
-		coolingPerSecond: opts.CoolingPerSec,
-		buckets:          map[string]*requestLimitBucket{},
+		requestNanos: requestNanos,
+		burstNanos:   requestLimitBurstNanos(requestNanos, opts.CapacityPerIP),
 	}
 }
 
 func (l *requestLimiter) allow(ip string, now time.Time) bool {
-	l.mx.Lock()
-	defer l.mx.Unlock()
+	if l == nil {
+		return true
+	}
 
-	l.pruneLocked(now)
-
-	bucket := l.buckets[ip]
-	if bucket == nil {
-		bucket = &requestLimitBucket{
-			tokens:  l.capacity,
-			updated: now,
-			seenAt:  now,
+	nowNanos := now.UnixNano()
+	for {
+		bucket := l.bucket(ip)
+		if bucket.deleted.Load() {
+			l.buckets.CompareAndDelete(ip, bucket)
+			continue
 		}
-		l.buckets[ip] = bucket
-	}
 
-	l.refillLocked(bucket, now)
-	bucket.seenAt = now
-	if bucket.tokens < 1 {
-		return false
-	}
+		allowed, until := l.reserve(bucket, nowNanos)
+		if !allowed {
+			return false
+		}
+		if !bucket.deleted.Load() {
+			return true
+		}
 
-	bucket.tokens--
-	return true
+		l.buckets.CompareAndDelete(ip, bucket)
+		replacement := &requestLimitBucket{}
+		replacement.until.Store(until)
+		loaded, stored := l.buckets.LoadOrStore(ip, replacement)
+		if !stored {
+			return true
+		}
+		active := loaded.(*requestLimitBucket)
+		if !active.deleted.Load() {
+			raiseRequestLimitBucketUntil(active, until)
+			return true
+		}
+	}
 }
 
-func (l *requestLimiter) refillLocked(bucket *requestLimitBucket, now time.Time) {
-	elapsed := now.Sub(bucket.updated).Seconds()
-	if elapsed > 0 {
-		bucket.tokens += elapsed * l.coolingPerSecond
-		if bucket.tokens > l.capacity {
-			bucket.tokens = l.capacity
+func (l *requestLimiter) bucket(ip string) *requestLimitBucket {
+	loaded, ok := l.buckets.Load(ip)
+	if ok {
+		return loaded.(*requestLimitBucket)
+	}
+
+	bucket := &requestLimitBucket{}
+	loaded, ok = l.buckets.LoadOrStore(ip, bucket)
+	if ok {
+		return loaded.(*requestLimitBucket)
+	}
+	return bucket
+}
+
+func (l *requestLimiter) reserve(bucket *requestLimitBucket, nowNanos int64) (bool, int64) {
+	for {
+		until := bucket.until.Load()
+		base := until
+		if base < nowNanos {
+			base = nowNanos
 		}
-		bucket.updated = now
+		if base > maxRequestLimitNanos-l.requestNanos {
+			return false, until
+		}
+
+		next := base + l.requestNanos
+		if next-nowNanos > l.burstNanos {
+			return false, until
+		}
+		if bucket.until.CompareAndSwap(until, next) {
+			return true, next
+		}
 	}
 }
 
-func (l *requestLimiter) pruneLocked(now time.Time) {
-	if !l.lastPrune.IsZero() && now.Sub(l.lastPrune) < requestLimitPruneInterval {
-		return
+func (l *requestLimiter) prune(now time.Time) int {
+	if l == nil {
+		return 0
 	}
-	l.lastPrune = now
 
-	for ip, bucket := range l.buckets {
-		l.refillLocked(bucket, now)
-		if bucket.tokens >= l.capacity && now.Sub(bucket.seenAt) >= requestLimitIdleTTL {
-			delete(l.buckets, ip)
+	nowNanos := now.UnixNano()
+	deleted := 0
+	l.buckets.Range(func(key, value any) bool {
+		bucket := value.(*requestLimitBucket)
+		if bucket.until.Load() > nowNanos {
+			return true
+		}
+		if !bucket.deleted.CompareAndSwap(false, true) {
+			return true
+		}
+		if l.buckets.CompareAndDelete(key, bucket) {
+			deleted++
+		}
+		return true
+	})
+	return deleted
+}
+
+func requestLimitCostNanos(coolingPerSecond float64) int64 {
+	if coolingPerSecond <= 0 || math.IsNaN(coolingPerSecond) {
+		return maxRequestLimitNanos
+	}
+	if math.IsInf(coolingPerSecond, 1) {
+		return 1
+	}
+
+	nanos := math.Ceil(float64(time.Second) / coolingPerSecond)
+	if nanos < 1 {
+		return 1
+	}
+	if nanos >= float64(maxRequestLimitNanos) {
+		return maxRequestLimitNanos
+	}
+	return int64(nanos)
+}
+
+func requestLimitBurstNanos(requestNanos int64, capacity int) int64 {
+	if requestNanos <= 0 || capacity <= 0 {
+		return 0
+	}
+	capacityNanos := int64(capacity)
+	if requestNanos > maxRequestLimitNanos/capacityNanos {
+		return maxRequestLimitNanos
+	}
+	return requestNanos * capacityNanos
+}
+
+func raiseRequestLimitBucketUntil(bucket *requestLimitBucket, until int64) {
+	for {
+		current := bucket.until.Load()
+		if current >= until || bucket.deleted.Load() {
+			return
+		}
+		if bucket.until.CompareAndSwap(current, until) {
+			return
 		}
 	}
 }
@@ -126,16 +208,23 @@ type clientConnectionTracker struct {
 	maxConnectionsPerIP int
 	maxKeepAlive        time.Duration
 	ips                 map[string]*clientIPConnections
+	connections         sync.Map
 }
 
 type clientIPConnections struct {
 	active map[uint16]*trackedClientConnection
 }
 
+type clientConnectionKey struct {
+	ip   string
+	port uint16
+}
+
 type trackedClientConnection struct {
-	client      trackedLiteClient
-	lastRequest time.Time
-	closing     bool
+	client           trackedLiteClient
+	lastRequestNanos atomic.Int64
+	inflight         atomic.Int32
+	closing          atomic.Bool
 }
 
 func newClientConnectionTracker(opts RequestLimitOptions) *clientConnectionTracker {
@@ -167,9 +256,12 @@ func (t *clientConnectionTracker) accept(client trackedLiteClient, now time.Time
 		return len(info.active), fmt.Errorf("too many connections")
 	}
 
-	info.active[client.Port()] = &trackedClientConnection{
-		client:      client,
-		lastRequest: now,
+	key := clientConnectionKey{ip: ip, port: client.Port()}
+	conn := &trackedClientConnection{client: client}
+	conn.lastRequestNanos.Store(now.UnixNano())
+	info.active[key.port] = conn
+	if t.keepAliveEnabled() {
+		t.connections.Store(key, conn)
 	}
 	return len(info.active), nil
 }
@@ -178,13 +270,18 @@ func (t *clientConnectionTracker) disconnect(client trackedLiteClient) int {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
-	ip := client.IP()
+	key := clientConnectionKey{ip: client.IP(), port: client.Port()}
+	ip := key.ip
 	info := t.ips[ip]
 	if info == nil {
 		return 0
 	}
 
-	delete(info.active, client.Port())
+	conn := info.active[key.port]
+	delete(info.active, key.port)
+	if conn != nil && t.keepAliveEnabled() {
+		t.connections.Delete(key)
+	}
 	remaining := len(info.active)
 	if remaining == 0 {
 		delete(t.ips, ip)
@@ -192,35 +289,56 @@ func (t *clientConnectionTracker) disconnect(client trackedLiteClient) int {
 	return remaining
 }
 
-func (t *clientConnectionTracker) markRequest(client trackedLiteClient, now time.Time) {
-	t.mx.Lock()
-	defer t.mx.Unlock()
-
-	info := t.ips[client.IP()]
-	if info == nil {
+func (t *clientConnectionTracker) beginRequest(client trackedLiteClient, now time.Time) {
+	conn := t.connection(client)
+	if conn == nil || conn.closing.Load() {
 		return
 	}
-	conn := info.active[client.Port()]
+	conn.lastRequestNanos.Store(now.UnixNano())
+	conn.inflight.Add(1)
+	if conn.closing.Load() {
+		conn.inflight.Add(-1)
+	}
+}
+
+func (t *clientConnectionTracker) endRequest(client trackedLiteClient, now time.Time) {
+	conn := t.connection(client)
 	if conn == nil {
 		return
 	}
-	conn.lastRequest = now
+	conn.lastRequestNanos.Store(now.UnixNano())
+	for {
+		inflight := conn.inflight.Load()
+		if inflight <= 0 {
+			return
+		}
+		if conn.inflight.CompareAndSwap(inflight, inflight-1) {
+			return
+		}
+	}
+}
+
+func (t *clientConnectionTracker) connection(client trackedLiteClient) *trackedClientConnection {
+	loaded, ok := t.connections.Load(clientConnectionKey{ip: client.IP(), port: client.Port()})
+	if !ok {
+		return nil
+	}
+	return loaded.(*trackedClientConnection)
 }
 
 func (t *clientConnectionTracker) closeIdle(now time.Time) int {
-	t.mx.Lock()
 	var stale []trackedLiteClient
-	cutoff := now.Add(-t.maxKeepAlive)
-	for _, info := range t.ips {
-		for _, conn := range info.active {
-			if conn.closing || !conn.lastRequest.Before(cutoff) {
-				continue
-			}
-			conn.closing = true
+	cutoffNanos := now.Add(-t.maxKeepAlive).UnixNano()
+	t.connections.Range(func(_, value any) bool {
+		conn := value.(*trackedClientConnection)
+		if conn.inflight.Load() > 0 || conn.lastRequestNanos.Load() >= cutoffNanos {
+			return true
+		}
+		if conn.closing.CompareAndSwap(false, true) {
 			stale = append(stale, conn.client)
 		}
-	}
-	t.mx.Unlock()
+		return true
+	})
 
 	for _, client := range stale {
 		client.Close()

@@ -66,23 +66,6 @@ func (s *testPeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
 	}
 }
 
-func (s *testPeerStore) SaveArchiveImport(imported *storage.ServedArchiveImport) error {
-	if imported == nil {
-		return fmt.Errorf("served archive import is nil")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, full := range imported.FullBlocks {
-		s.saveBlockFullLocked(full)
-	}
-	for _, link := range imported.Links {
-		s.nextBlocks[storage.BlockKey(link.Prev)] = storage.BlockKey(link.Next)
-	}
-	return nil
-}
-
 func (s *testPeerStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

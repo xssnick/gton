@@ -33,23 +33,6 @@ func newTestStateStore() *testStateStore {
 	}
 }
 
-func (s *testStateStore) SaveCurrentState(_ context.Context, state *storage.CurrentState) error {
-	if state == nil {
-		return fmt.Errorf("current state is nil")
-	}
-
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	cloned := storage.CloneCurrentState(state)
-	s.current = cloned
-	s.blocks[storage.BlockKey(cloned.Masterchain.Block)] = storage.CloneBlockState(&cloned.Masterchain)
-	for _, shard := range cloned.Shards {
-		s.blocks[storage.BlockKey(shard.Block)] = storage.CloneBlockState(&shard)
-	}
-	return nil
-}
-
 func (s *testStateStore) SaveStateCellRecords(_ context.Context, _ storage.StateCellRecords) error {
 	return nil
 }

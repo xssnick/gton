@@ -166,10 +166,6 @@ func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 }
 
 func startMetricsServer(ctx context.Context, logger zerolog.Logger, addr string, handler http.Handler) error {
-	if addr == "" || handler == nil {
-		return nil
-	}
-
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", handler)
 

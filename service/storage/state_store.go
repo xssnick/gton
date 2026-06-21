@@ -26,7 +26,6 @@ type DownloadedState interface {
 
 type StateStorage interface {
 	StateCellTreeImporter
-	SaveCurrentState(ctx context.Context, state *CurrentState) error
 	CurrentState(ctx context.Context) (*CurrentState, error)
 	SaveStateSyncProgress(ctx context.Context, state *CurrentState) error
 	StateSyncProgress(ctx context.Context) (*CurrentState, error)

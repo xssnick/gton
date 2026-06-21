@@ -34,10 +34,6 @@ func runConsole(ctx context.Context, logger zerolog.Logger, svc *service2.Servic
 		switch cmd[0] {
 		case "status":
 			if len(cmd) == 2 && cmd[1] == "db" {
-				if dbStatus == nil {
-					_, _ = fmt.Fprintln(os.Stdout, formatDBStatus(pebblestore.DBStatus{}))
-					continue
-				}
 				status, err := dbStatus(ctx)
 				if err != nil {
 					logger.Warn().Err(err).Str("command", strings.Join(cmd, " ")).Msg("failed to load db status")

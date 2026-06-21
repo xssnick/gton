@@ -74,7 +74,6 @@ const (
 	publicAnnounceRetryDelay   = 15 * time.Second
 	dhtStoreTimeout            = 45 * time.Second
 	dhtFindTimeout             = 30 * time.Second
-	masterchainWaitLogEvery    = 5 * time.Second
 	peerQueryTimeout           = 10 * time.Second
 	broadcastSignatureTimeout  = 2 * time.Second
 	peerRebroadcastTimeout     = 5 * time.Second

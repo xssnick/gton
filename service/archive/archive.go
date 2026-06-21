@@ -27,11 +27,9 @@ type Downloaded struct {
 	Shard            ShardID
 	ArchiveID        int64
 	Peer             string
-	Path             string
 	Data             []byte
 	Bytes            int64
 	DownloadElapsed  time.Duration
-	Imported         *Imported
 }
 
 type ImportStats struct {
