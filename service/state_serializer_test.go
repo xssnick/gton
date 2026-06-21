@@ -47,7 +47,7 @@ func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
 		Block: zero,
 		Cell:  cell.BeginCell().EndCell(),
 	}
-	if err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{zeroState}, &tnstore.CurrentState{
+	if err := saveTestStateCheckpoint(ctx, store, []*tnstore.BlockState{zeroState}, &tnstore.CurrentState{
 		ShardClientSeqno: 0,
 		Masterchain:      *zeroState,
 		Shards:           map[tnstore.ShardKey]tnstore.BlockState{},

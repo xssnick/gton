@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -10,7 +9,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestLoadBlockStateForApplyTreatsBlockOnlyStateWithoutFullBlockAsMiss(t *testing.T) {
+func TestLoadBlockStateForApplyTrustsPublishedBlockOnlyState(t *testing.T) {
 	ctx := context.Background()
 	block := testBlockID(0, topShard, 100)
 	state := testReplayBlockState(t, block)
@@ -20,19 +19,19 @@ func TestLoadBlockStateForApplyTreatsBlockOnlyStateWithoutFullBlockAsMiss(t *tes
 	}
 	svc := &Service{storage: store}
 
-	_, err := svc.loadBlockStateForApply(ctx, storage.BlockState{Block: block})
-	if !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("load state error = %v, want ErrNotFound", err)
+	got, err := svc.loadBlockStateForApply(ctx, storage.BlockState{Block: block})
+	if err != nil {
+		t.Fatalf("load state: %v", err)
 	}
-	if store.blockFullAvailableCalls != 1 {
-		t.Fatalf("BlockFullAvailable calls = %d, want 1", store.blockFullAvailableCalls)
+	if !got.Block.Equals(&block) {
+		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
 	}
 	if store.blockFullCalls != 0 {
 		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
 }
 
-func TestLoadBlockStateForApplyReusesBlockOnlyStateWithFullBlock(t *testing.T) {
+func TestLoadBlockStateForApplyDoesNotProbeFullBlockForPublishedState(t *testing.T) {
 	ctx := context.Background()
 	block := testBlockID(0, topShard, 101)
 	state := testReplayBlockState(t, block)
@@ -48,9 +47,6 @@ func TestLoadBlockStateForApplyReusesBlockOnlyStateWithFullBlock(t *testing.T) {
 	}
 	if !got.Block.Equals(&block) {
 		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
-	}
-	if store.blockFullAvailableCalls != 1 {
-		t.Fatalf("BlockFullAvailable calls = %d, want 1", store.blockFullAvailableCalls)
 	}
 	if store.blockFullCalls != 0 {
 		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
@@ -77,9 +73,6 @@ func TestLoadBlockStateForApplyAllowsCurrentBoundaryWithoutFullBlock(t *testing.
 	if !got.Block.Equals(&block) {
 		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
 	}
-	if store.blockFullAvailableCalls != 0 {
-		t.Fatalf("BlockFullAvailable calls = %d, want 0", store.blockFullAvailableCalls)
-	}
 	if store.blockFullCalls != 0 {
 		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
@@ -100,12 +93,11 @@ func testReplayBlockState(tb testing.TB, block ton.BlockIDExt) *storage.BlockSta
 type testReplayStateStore struct {
 	storage.Storage
 
-	state                   *storage.BlockState
-	stateErr                error
-	blockFull               *storage.ServedBlockFull
-	blockFullErr            error
-	blockFullCalls          int
-	blockFullAvailableCalls int
+	state          *storage.BlockState
+	stateErr       error
+	blockFull      *storage.ServedBlockFull
+	blockFullErr   error
+	blockFullCalls int
 }
 
 func (s *testReplayStateStore) BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error) {
@@ -127,15 +119,4 @@ func (s *testReplayStateStore) BlockFull(context.Context, ton.BlockIDExt) (*stor
 		return nil, storage.ErrNotFound
 	}
 	return s.blockFull.Clone(), nil
-}
-
-func (s *testReplayStateStore) BlockFullAvailable(context.Context, ton.BlockIDExt) error {
-	s.blockFullAvailableCalls++
-	if s.blockFullErr != nil {
-		return s.blockFullErr
-	}
-	if s.blockFull == nil {
-		return storage.ErrNotFound
-	}
-	return nil
 }

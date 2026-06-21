@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -32,20 +34,97 @@ func testCurrentBlockStates(current *tnstore.CurrentState) []*tnstore.BlockState
 	states = append(states, tnstore.CloneBlockState(&current.Masterchain))
 	for _, key := range tnstore.SortedShardKeys(current.Shards) {
 		shard := current.Shards[key]
+		if shard.Block.Workchain != -1 && shard.MasterchainRef == nil {
+			master := current.Masterchain.Block
+			shard.MasterchainRef = &master
+		}
 		states = append(states, tnstore.CloneBlockState(&shard))
 	}
 	return states
 }
 
 func testStateCheckpointEntries(states []*tnstore.BlockState) []tnstore.StateCheckpointBlock {
+	return testStateCheckpointEntriesForCurrent(states, nil)
+}
+
+func testStateCheckpointEntriesForCurrent(states []*tnstore.BlockState, current *tnstore.CurrentState) []tnstore.StateCheckpointBlock {
 	entries := make([]tnstore.StateCheckpointBlock, 0, len(states))
 	for _, state := range states {
 		if state == nil {
 			continue
 		}
-		entries = append(entries, tnstore.StateCheckpointBlock{State: state})
+		entries = append(entries, testStateCheckpointEntryForCurrent(state, current))
 	}
 	return entries
+}
+
+func testStateCheckpointEntry(state *tnstore.BlockState) tnstore.StateCheckpointBlock {
+	return testStateCheckpointEntryForCurrent(state, nil)
+}
+
+func testStateCheckpointEntryForCurrent(state *tnstore.BlockState, current *tnstore.CurrentState) tnstore.StateCheckpointBlock {
+	entry := tnstore.StateCheckpointBlock{State: state}
+	if state != nil && state.Block.SeqNo != 0 {
+		entry.Artifact = testStateCheckpointArtifactForCurrent(state, current)
+	}
+	return entry
+}
+
+func testStateCheckpointArtifact(state *tnstore.BlockState) *tnstore.ServedBlockFull {
+	return testStateCheckpointArtifactForCurrent(state, nil)
+}
+
+func testStateCheckpointArtifactForCurrent(state *tnstore.BlockState, current *tnstore.CurrentState) *tnstore.ServedBlockFull {
+	block := state.Block
+	meta := &tnstore.BlockMeta{ID: block, GenUTime: block.SeqNo}
+	if block.Workchain != -1 {
+		if state.MasterchainRef != nil {
+			meta.MasterchainRefSeqno = state.MasterchainRef.SeqNo
+		} else if current != nil {
+			meta.MasterchainRefSeqno = current.Masterchain.Block.SeqNo
+		} else {
+			meta.MasterchainRefSeqno = block.SeqNo
+		}
+	}
+	return &tnstore.ServedBlockFull{
+		ID:    block,
+		Block: []byte{0x01},
+		Proof: []byte{0x02},
+		Meta:  meta,
+	}
+}
+
+func saveTestStateCheckpoint(ctx context.Context, store *pebblestore.Store, states []*tnstore.BlockState, current *tnstore.CurrentState) error {
+	_, err := store.SaveStateCheckpointEntries(ctx, testStateCheckpointEntriesForCurrent(states, current), tnstore.StateCellRecords{}, current)
+	return err
+}
+
+func saveTestBlockState(ctx context.Context, store *pebblestore.Store, state *tnstore.BlockState) error {
+	entries := testStateCheckpointEntries([]*tnstore.BlockState{state})
+	if state != nil && state.Block.Workchain != -1 && state.Block.SeqNo != 0 && state.MasterchainRef == nil {
+		entries = append(testStateCheckpointEntries([]*tnstore.BlockState{testDummyMasterState(state.Block.SeqNo)}), entries...)
+	}
+	_, err := store.SaveStateCheckpointEntries(ctx, entries, tnstore.StateCellRecords{}, nil)
+	return err
+}
+
+func testDummyMasterState(seqno uint32) *tnstore.BlockState {
+	return &tnstore.BlockState{
+		Block: ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+			SeqNo:     seqno,
+			RootHash:  testDummyHash(0xf1, seqno),
+			FileHash:  testDummyHash(0xf2, seqno),
+		},
+		StateRootHash: testDummyHash(0xf3, seqno),
+	}
+}
+
+func testDummyHash(prefix byte, seqno uint32) []byte {
+	hash := bytes.Repeat([]byte{prefix}, 32)
+	binary.BigEndian.PutUint32(hash[len(hash)-4:], seqno)
+	return hash
 }
 
 func openManualTestPebbleStorage(t *testing.T) *pebblestore.Store {
@@ -60,7 +139,7 @@ func openManualTestPebbleStorage(t *testing.T) *pebblestore.Store {
 	return store
 }
 
-func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
+func TestStateMetadataPublishDoesNotMoveCurrentState(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
 	master := testBlockID(-1, topShard, 50)
@@ -74,7 +153,7 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 		Block: base,
 		Cell:  testShardStateCell(t, base),
 	}
-	err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{
+	err := saveTestStateCheckpoint(ctx, store, []*tnstore.BlockState{
 		masterState,
 		baseState,
 	}, &tnstore.CurrentState{
@@ -92,7 +171,7 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 		Block: testBlockID(0, topShard, 101),
 	}
 	next.Cell = testShardStateCell(t, next.Block)
-	if err = store.SaveBlockState(ctx, next); err != nil {
+	if err = saveTestBlockState(ctx, store, next); err != nil {
 		t.Fatalf("persist next shard: %v", err)
 	}
 
@@ -366,7 +445,7 @@ func TestCurrentBroadcastValidatorConfigUsesLiveCurrentState(t *testing.T) {
 		Block: persistedMaster,
 		Cell:  testShardStateCell(t, persistedMaster),
 	}
-	if err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{&persistedMasterState}, &tnstore.CurrentState{
+	if err := saveTestStateCheckpoint(ctx, store, []*tnstore.BlockState{&persistedMasterState}, &tnstore.CurrentState{
 		Masterchain: persistedMasterState,
 		Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
 	}); err != nil {
@@ -470,7 +549,7 @@ func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntries(testCurrentBlockStates(current)), nil)
+	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current), nil)
 	if err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
@@ -514,7 +593,7 @@ func TestPersistArchiveCurrentStateStoresHistoricalAppliedStates(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	if _, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntries(states), nil); err != nil {
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(states, current), nil); err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
 	if _, err := store.BlockState(ctx, historical.Block); err != nil {
@@ -561,9 +640,9 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 		t.Fatalf("remember historical cells: %v", err)
 	}
 	checkpointCells := overlay.beginCheckpoint()
-	entries := append([]tnstore.StateCheckpointBlock{{
-		State: historical,
-	}}, testStateCheckpointEntries(testCurrentBlockStates(current))...)
+	entries := append([]tnstore.StateCheckpointBlock{
+		testStateCheckpointEntryForCurrent(historical, current),
+	}, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current)...)
 	runner := &archiveCatchUpRunner{
 		service: &Service{log: zerolog.Nop(), storage: store},
 		ctx:     ctx,

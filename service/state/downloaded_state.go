@@ -23,10 +23,10 @@ func newStateImportCoordinator(logger zerolog.Logger) *stateImportCoordinator {
 	}
 }
 
-func (c *stateImportCoordinator) ImportAndPersist(
+func (c *stateImportCoordinator) ImportCells(
 	ctx context.Context,
 	downloaded storage.DownloadedState,
-	store storage.StateStorage,
+	store storage.StateCellTreeImporter,
 	master ton.BlockIDExt,
 ) (*storage.BlockState, error) {
 	block := downloaded.Block()
@@ -65,9 +65,6 @@ func (c *stateImportCoordinator) ImportAndPersist(
 		Dur("elapsed", time.Since(startedAt)).
 		Msg("decoded staged state snapshot")
 
-	if err = store.SaveBlockState(ctx, state); err != nil {
-		return nil, err
-	}
 	runtime.GC()
 	return state, nil
 }

@@ -446,17 +446,34 @@ func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, m
 	s.log.Info().
 		Str("block", storage2.FormatBlockRef(block)).
 		Msg("importing downloaded state snapshot")
-	state, err = s.importer.ImportAndPersist(ctx, downloaded, s.storage, master)
+	state, err = s.importer.ImportCells(ctx, downloaded, s.storage, master)
 	if err != nil {
 		return blockStateSnapshot{}, fmt.Errorf("import block state %s: %w", storage2.FormatBlockRef(block), err)
 	}
+	if err = s.publishDownloadedBlockState(ctx, state, artifact); err != nil {
+		return blockStateSnapshot{}, fmt.Errorf("publish block state %s: %w", storage2.FormatBlockRef(block), err)
+	}
 	s.log.Info().
 		Str("block", storage2.FormatBlockRef(block)).
-		Msg("block state persisted")
+		Msg("block state published")
 	return blockStateSnapshot{
 		state:    state,
 		artifact: artifact,
 	}, nil
+}
+
+func (s *Syncer) publishDownloadedBlockState(ctx context.Context, state *storage2.BlockState, artifact *storage2.ServedBlockFull) error {
+	if state.Block.SeqNo == 0 {
+		return s.storage.SaveZeroStateCheckpoint(ctx, []*storage2.BlockState{state}, nil)
+	}
+	if artifact == nil {
+		return fmt.Errorf("downloaded state source did not include full block artifact")
+	}
+	_, err := s.storage.SaveStateCheckpointEntries(ctx, []storage2.StateCheckpointBlock{{
+		State:    state,
+		Artifact: artifact.Clone(),
+	}}, storage2.StateCellRecords{}, nil)
+	return err
 }
 
 func setShardMasterchainRef(state *storage2.BlockState, master ton.BlockIDExt) {

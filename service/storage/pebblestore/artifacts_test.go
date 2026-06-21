@@ -219,9 +219,6 @@ func TestCheckpointArchiveArtifactsKeepsSameBatchMetaAndNextLink(t *testing.T) {
 	if len(meta.NextRefs) != 1 || !meta.NextRefs[0].Equals(&next) {
 		t.Fatalf("prev next refs = %+v, want %s", meta.NextRefs, storage.FormatBlockRef(next))
 	}
-	if err = store.BlockFullAvailable(context.Background(), prev); err != nil {
-		t.Fatalf("prev block full availability: %v", err)
-	}
 }
 
 func testLinkPreviousBlock(block ton.BlockIDExt, masterSeqno uint32) *storage.ServedBlockFull {
@@ -363,9 +360,6 @@ func TestCheckpointArchiveArtifactsDoesNotMarkPartialBlockAsServedFull(t *testin
 	}
 	if _, err = store.BlockFull(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("partial block full error = %v, want ErrNotFound", err)
-	}
-	if err = store.BlockFullAvailable(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("partial block full availability error = %v, want ErrNotFound", err)
 	}
 }
 

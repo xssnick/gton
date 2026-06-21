@@ -944,17 +944,5 @@ func (s *Service) loadBlockStateForApply(ctx context.Context, state storage.Bloc
 	if err != nil {
 		return nil, err
 	}
-
-	if len(state.StateRootHash) == 0 {
-		// Block-only resolver probes may become historical replay dependencies.
-		// Reusing state metadata without its full block would leave future
-		// cell-generation migrations unable to replay the same transition.
-		if err = s.storage.BlockFullAvailable(ctx, state.Block); err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				return nil, storage.ErrNotFound
-			}
-			return nil, fmt.Errorf("load reusable block artifact %s: %w", storage.FormatBlockRef(state.Block), err)
-		}
-	}
 	return loaded, nil
 }

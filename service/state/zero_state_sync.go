@@ -62,7 +62,7 @@ func (s *Syncer) SyncZeroStateCurrent(ctx context.Context) (*storage.CurrentStat
 		states = append(states, shardState)
 	}
 
-	if err = s.storage.SaveStateCheckpoint(ctx, states, current); err != nil {
+	if err = s.storage.SaveZeroStateCheckpoint(ctx, states, current); err != nil {
 		return nil, fmt.Errorf("persist zero state current: %w", err)
 	}
 	if err = s.storage.ClearStateSyncProgress(ctx); err != nil {
@@ -118,8 +118,11 @@ func (s *Syncer) importZeroState(ctx context.Context, block ton.BlockIDExt, mast
 		return nil, fmt.Errorf("zero state artifact is for %s, expected %s", storage.FormatBlockRef(downloadedBlock), storage.FormatBlockRef(block))
 	}
 
-	state, err = s.importer.ImportAndPersist(ctx, downloaded, s.storage, master)
+	state, err = s.importer.ImportCells(ctx, downloaded, s.storage, master)
 	if err != nil {
+		return nil, err
+	}
+	if err = s.storage.SaveZeroStateCheckpoint(ctx, []*storage.BlockState{state}, nil); err != nil {
 		return nil, err
 	}
 	return state, nil

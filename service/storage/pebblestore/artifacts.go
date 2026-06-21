@@ -544,33 +544,6 @@ func (s *Store) BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.S
 	}, nil
 }
 
-func (s *Store) BlockFullAvailable(ctx context.Context, block ton.BlockIDExt) error {
-	meta, err := s.BlockMeta(ctx, block)
-	if err != nil {
-		return err
-	}
-	if !meta.Has(storage.BlockMetaHasServedFull) {
-		return storage.ErrNotFound
-	}
-	if err = s.artifactAvailable(ctx, hotKeyBlockDataRef(block)); err != nil {
-		return err
-	}
-
-	for _, kind := range storage.ProofCandidates(meta) {
-		if !meta.HasProof(kind) {
-			continue
-		}
-		err = s.artifactAvailable(ctx, hotKeyStoredProofRef(kind, block))
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return err
-		}
-	}
-	return storage.ErrNotFound
-}
-
 func (s *Store) NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*storage.ServedBlockFull, error) {
 	meta, err := s.BlockMeta(ctx, prev)
 	if err != nil {

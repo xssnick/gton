@@ -41,7 +41,7 @@ func (s *testStateStore) FlushStateCells(_ context.Context) error {
 	return nil
 }
 
-func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+func (s *testStateStore) saveStateCheckpoint(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
 	entries := make([]storage.StateCheckpointBlock, 0, len(blocks))
 	for _, block := range blocks {
 		if block == nil {
@@ -49,15 +49,43 @@ func (s *testStateStore) SaveStateCheckpoint(_ context.Context, blocks []*storag
 		}
 		entries = append(entries, storage.StateCheckpointBlock{State: block})
 	}
-	_, err := s.SaveStateCheckpointEntries(context.Background(), entries, storage.StateCellRecords{}, current)
+	_, err := s.SaveStateCheckpointEntries(ctx, entries, storage.StateCellRecords{}, current)
 	return err
 }
 
-func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, _ storage.StateCellRecords, current *storage.CurrentState) (storage.StateCheckpointTiming, error) {
-	if current == nil {
-		return storage.StateCheckpointTiming{}, fmt.Errorf("current state is nil")
+func (s *testStateStore) SaveZeroStateCheckpoint(ctx context.Context, blocks []*storage.BlockState, current *storage.CurrentState) error {
+	if err := validateTestZeroStateCheckpoint(blocks, current); err != nil {
+		return err
 	}
 
+	return s.saveStateCheckpoint(ctx, blocks, current)
+}
+
+func validateTestZeroStateCheckpoint(blocks []*storage.BlockState, current *storage.CurrentState) error {
+	for _, state := range blocks {
+		if state == nil {
+			continue
+		}
+		if state.Block.SeqNo != 0 {
+			return fmt.Errorf("zero state checkpoint contains non-zero state %s", storage.FormatBlockRef(state.Block))
+		}
+	}
+	if current == nil {
+		return nil
+	}
+	if current.Masterchain.Block.SeqNo != 0 {
+		return fmt.Errorf("zero state checkpoint current masterchain is non-zero: %s", storage.FormatBlockRef(current.Masterchain.Block))
+	}
+	for _, key := range storage.SortedShardKeys(current.Shards) {
+		shard := current.Shards[key]
+		if shard.Block.SeqNo != 0 {
+			return fmt.Errorf("zero state checkpoint current shard is non-zero: %s", storage.FormatBlockRef(shard.Block))
+		}
+	}
+	return nil
+}
+
+func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []storage.StateCheckpointBlock, _ storage.StateCellRecords, current *storage.CurrentState) (storage.StateCheckpointTiming, error) {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
@@ -71,6 +99,9 @@ func (s *testStateStore) SaveStateCheckpointEntries(_ context.Context, blocks []
 		if entry.Artifact != nil {
 			s.artifacts[storage.BlockKey(entry.Artifact.ID)] = entry.Artifact.Clone()
 		}
+	}
+	if current == nil {
+		return storage.StateCheckpointTiming{}, nil
 	}
 
 	cloned := storage.CloneCurrentState(current)
@@ -99,6 +130,16 @@ func (s *testStateStore) SaveStateSyncProgress(_ context.Context, state *storage
 
 	s.mx.Lock()
 	defer s.mx.Unlock()
+
+	if s.blocks[storage.BlockKey(state.Masterchain.Block)] == nil {
+		return fmt.Errorf("state sync progress masterchain state %s metadata is missing", storage.FormatBlockRef(state.Masterchain.Block))
+	}
+	for _, key := range storage.SortedShardKeys(state.Shards) {
+		shard := state.Shards[key]
+		if s.blocks[storage.BlockKey(shard.Block)] == nil {
+			return fmt.Errorf("state sync progress shard state %s metadata is missing", storage.FormatBlockRef(shard.Block))
+		}
+	}
 
 	s.progress = storage.CloneCurrentState(state)
 	return nil
@@ -162,7 +203,7 @@ func (s *testStateStore) LoadStateCellTree(_ context.Context, block ton.BlockIDE
 	return tree.root, nil
 }
 
-func (s *testStateStore) SaveBlockState(_ context.Context, state *storage.BlockState) error {
+func (s *testStateStore) saveBlockState(_ context.Context, state *storage.BlockState) error {
 	if state == nil {
 		return fmt.Errorf("block state is nil")
 	}

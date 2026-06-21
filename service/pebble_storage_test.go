@@ -183,7 +183,7 @@ func TestPebbleStorageKeepsMetadataOnlyBlocksOutOfHistoryIndexes(t *testing.T) {
 			{Workchain: 0, Shard: topShard}: shardState,
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{&masterState, &shardState}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{&masterState, &shardState}, current); err != nil {
 		t.Fatalf("save state checkpoint: %v", err)
 	}
 	gotCurrent, err := store.CurrentState(ctx)

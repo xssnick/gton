@@ -36,7 +36,7 @@ func TestAppliedStateSetCloneDoesNotClear(t *testing.T) {
 
 func rememberFullCheckpointStateForTest(t *testing.T, states *appliedStateSet, state *storage.BlockState) {
 	t.Helper()
-	states.rememberEntry(appliedStateEntry{state: storage.CloneBlockState(state)})
+	states.rememberWithArtifacts(state, testStateCheckpointArtifact(state), nil)
 }
 
 func TestAppliedStateSetStoresArtifactStateMetadataOnly(t *testing.T) {

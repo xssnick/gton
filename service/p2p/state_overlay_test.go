@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"math/big"
 	"os"
@@ -20,6 +21,60 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func saveTestBlockState(ctx context.Context, store *pebblestore.Store, state *tnstore.BlockState) error {
+	entries := []tnstore.StateCheckpointBlock{testStateCheckpointEntry(state)}
+	if state != nil && state.Block.Workchain != -1 && state.Block.SeqNo != 0 && state.MasterchainRef == nil {
+		entries = append([]tnstore.StateCheckpointBlock{testStateCheckpointEntry(testDummyMasterState(state.Block.SeqNo))}, entries...)
+	}
+	_, err := store.SaveStateCheckpointEntries(ctx, entries, tnstore.StateCellRecords{}, nil)
+	return err
+}
+
+func testStateCheckpointEntry(state *tnstore.BlockState) tnstore.StateCheckpointBlock {
+	entry := tnstore.StateCheckpointBlock{State: state}
+	if state != nil && state.Block.SeqNo != 0 {
+		entry.Artifact = testStateCheckpointArtifact(state)
+	}
+	return entry
+}
+
+func testStateCheckpointArtifact(state *tnstore.BlockState) *tnstore.ServedBlockFull {
+	block := state.Block
+	meta := &tnstore.BlockMeta{ID: block, GenUTime: block.SeqNo}
+	if block.Workchain != -1 {
+		if state.MasterchainRef != nil {
+			meta.MasterchainRefSeqno = state.MasterchainRef.SeqNo
+		} else {
+			meta.MasterchainRefSeqno = block.SeqNo
+		}
+	}
+	return &tnstore.ServedBlockFull{
+		ID:    block,
+		Block: []byte{0x01},
+		Proof: []byte{0x02},
+		Meta:  meta,
+	}
+}
+
+func testDummyMasterState(seqno uint32) *tnstore.BlockState {
+	return &tnstore.BlockState{
+		Block: ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+			SeqNo:     seqno,
+			RootHash:  testDummyHash(0xf1, seqno),
+			FileHash:  testDummyHash(0xf2, seqno),
+		},
+		StateRootHash: testDummyHash(0xf3, seqno),
+	}
+}
+
+func testDummyHash(prefix byte, seqno uint32) []byte {
+	hash := bytes.Repeat([]byte{prefix}, 32)
+	binary.BigEndian.PutUint32(hash[len(hash)-4:], seqno)
+	return hash
+}
 
 func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	peerA := testZeroStatePeer("a")
@@ -430,14 +485,14 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 		t.Fatalf("import full state cell tree: %v", err)
 	}
 	partLevelHash := partRoot.HashKey(0)
-	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
+	if err := saveTestBlockState(ctx, store, &tnstore.BlockState{
 		Block:          splitStatePartStorageBlock(block, part),
 		StateRootHash:  partLevelHash[:],
 		CellGeneration: 1,
 	}); err != nil {
 		t.Fatalf("save split part metadata: %v", err)
 	}
-	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
+	if err := saveTestBlockState(ctx, store, &tnstore.BlockState{
 		Block:          block,
 		StateRootHash:  fullRootHash[:],
 		CellGeneration: 1,
@@ -771,7 +826,7 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	if !bytes.Equal(state.StateRootHash, fullRootHash[:]) {
 		t.Fatalf("merged state root hash mismatch: got=%x want=%x", state.StateRootHash, fullRootHash)
 	}
-	if err = store.SaveBlockState(ctx, state); err != nil {
+	if err = saveTestBlockState(ctx, store, state); err != nil {
 		t.Fatalf("commit merged state metadata: %v", err)
 	}
 

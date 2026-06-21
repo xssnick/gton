@@ -38,7 +38,7 @@ func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 		Cell:   testShardStateCell(t, base),
 		Parsed: &tlb.ShardStateUnsplit{GenUTime: 120},
 	}
-	err = store.SaveStateCheckpoint(context.Background(), []*tnstore.BlockState{
+	err = saveTestStateCheckpoint(context.Background(), store, []*tnstore.BlockState{
 		masterState,
 		baseState,
 	}, &tnstore.CurrentState{
@@ -85,7 +85,7 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	liveMaster := testBlockID(-1, topShard, 41)
 	liveBase := testBlockID(0, topShard, 78)
 
-	err = store.SaveStateCheckpoint(context.Background(), []*tnstore.BlockState{{
+	err = saveTestStateCheckpoint(context.Background(), store, []*tnstore.BlockState{{
 		Block:         storedMaster,
 		StateRootHash: storedMaster.RootHash,
 		Parsed:        &tlb.ShardStateUnsplit{GenUTime: 100},
