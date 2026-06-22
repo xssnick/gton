@@ -38,7 +38,7 @@ func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 		Cell:   testShardStateCell(t, base),
 		Parsed: &tlb.ShardStateUnsplit{GenUTime: 120},
 	}
-	err = store.SaveStateCheckpoint(context.Background(), []*tnstore.BlockState{
+	err = saveTestStateCheckpoint(context.Background(), store, []*tnstore.BlockState{
 		masterState,
 		baseState,
 	}, &tnstore.CurrentState{
@@ -85,7 +85,7 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	liveMaster := testBlockID(-1, topShard, 41)
 	liveBase := testBlockID(0, topShard, 78)
 
-	err = store.SaveStateCheckpoint(context.Background(), []*tnstore.BlockState{{
+	err = saveTestStateCheckpoint(context.Background(), store, []*tnstore.BlockState{{
 		Block:         storedMaster,
 		StateRootHash: storedMaster.RootHash,
 		Parsed:        &tlb.ShardStateUnsplit{GenUTime: 100},
@@ -130,6 +130,47 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	}
 	if snapshot.LocalBasechainUtime != 220 {
 		t.Fatalf("unexpected local basechain utime %d", snapshot.LocalBasechainUtime)
+	}
+}
+
+func TestStatusSnapshotIncludesAppliedMasterchainProgress(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	node, err := p2p.New(p2p.Options{Storage: store, StateFilesDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+
+	currentMaster := testBlockID(-1, topShard, 100)
+	appliedMaster := testBlockID(-1, topShard, 105)
+
+	svc := &Service{
+		node:    node,
+		storage: store,
+		currentStatus: &tnstore.CurrentState{
+			Masterchain: tnstore.BlockState{
+				Block:  currentMaster,
+				Parsed: &tlb.ShardStateUnsplit{GenUTime: 1000},
+			},
+			Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+		},
+	}
+	svc.rememberAppliedMasterchainState(&tnstore.BlockState{
+		Block:  appliedMaster,
+		Parsed: &tlb.ShardStateUnsplit{GenUTime: 1005},
+	})
+
+	snapshot := svc.StatusSnapshot()
+	if snapshot.LocalMasterchain == nil || snapshot.LocalMasterchain.SeqNo != currentMaster.SeqNo {
+		t.Fatalf("local masterchain = %+v, want %s", snapshot.LocalMasterchain, tnstore.FormatBlockRef(currentMaster))
+	}
+	if snapshot.AppliedMasterchain == nil || snapshot.AppliedMasterchain.SeqNo != appliedMaster.SeqNo {
+		t.Fatalf("applied masterchain = %+v, want %s", snapshot.AppliedMasterchain, tnstore.FormatBlockRef(appliedMaster))
+	}
+	if snapshot.LocalMasterchainUtime != 1000 {
+		t.Fatalf("local masterchain utime = %d, want 1000", snapshot.LocalMasterchainUtime)
+	}
+	if snapshot.AppliedMasterchainUtime != 1005 {
+		t.Fatalf("applied masterchain utime = %d, want 1005", snapshot.AppliedMasterchainUtime)
 	}
 }
 

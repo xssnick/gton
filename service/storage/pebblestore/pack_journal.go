@@ -129,7 +129,7 @@ func (s *Store) recoverPackAppendDirty(ctx context.Context) error {
 
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: hotKeyPackAppendDirtyPrefix(),
-		UpperBound: appendPrefixUpperBound(hotPrefixPackAppendDirty),
+		UpperBound: prefixUpperBound(hotPrefixPackAppendDirty),
 	})
 	if err != nil {
 		return err
@@ -181,7 +181,7 @@ func (s *Store) recoverPackDeletePending(ctx context.Context) error {
 
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: hotKeyPackDeletePendingPrefix(),
-		UpperBound: appendPrefixUpperBound(hotPrefixPackDeletePending),
+		UpperBound: prefixUpperBound(hotPrefixPackDeletePending),
 	})
 	if err != nil {
 		return err

@@ -1,9 +1,13 @@
 package p2p
 
-func (n *Node) NotifyCompressedBlockStateReady() {
+import "github.com/xssnick/tonutils-go/ton"
+
+func (n *Node) NotifyCompressedBlockStateReady(blocks ...ton.BlockIDExt) {
 	if n == nil {
 		return
 	}
 
-	n.processPendingBlockBroadcastDecodesAsync()
+	for _, block := range blocks {
+		n.processPendingBlockBroadcastDecodesForPrevAsync(block)
+	}
 }

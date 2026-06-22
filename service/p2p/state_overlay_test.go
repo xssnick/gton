@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	tnstate "github.com/xssnick/gton/service/state"
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -21,7 +23,61 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
+func saveTestBlockState(ctx context.Context, store *pebblestore.Store, state *tnstore.BlockState) error {
+	entries := []tnstore.StateCheckpointBlock{testStateCheckpointEntry(state)}
+	if state != nil && state.Block.Workchain != -1 && state.Block.SeqNo != 0 && state.MasterchainRef == nil {
+		entries = append([]tnstore.StateCheckpointBlock{testStateCheckpointEntry(testDummyMasterState(state.Block.SeqNo))}, entries...)
+	}
+	_, err := store.SaveStateCheckpointEntries(ctx, entries, tnstore.StateCellRecords{}, nil)
+	return err
+}
+
+func testStateCheckpointEntry(state *tnstore.BlockState) tnstore.StateCheckpointBlock {
+	entry := tnstore.StateCheckpointBlock{State: state}
+	if state != nil && state.Block.SeqNo != 0 {
+		entry.Artifact = testStateCheckpointArtifact(state)
+	}
+	return entry
+}
+
+func testStateCheckpointArtifact(state *tnstore.BlockState) *tnstore.ServedBlockFull {
+	block := state.Block
+	meta := &tnstore.BlockMeta{ID: block, GenUTime: block.SeqNo}
+	if block.Workchain != -1 {
+		if state.MasterchainRef != nil {
+			meta.MasterchainRefSeqno = state.MasterchainRef.SeqNo
+		} else {
+			meta.MasterchainRefSeqno = block.SeqNo
+		}
+	}
+	return &tnstore.ServedBlockFull{
+		ID:    block,
+		Block: []byte{0x01},
+		Proof: []byte{0x02},
+		Meta:  meta,
+	}
+}
+
+func testDummyMasterState(seqno uint32) *tnstore.BlockState {
+	return &tnstore.BlockState{
+		Block: ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+			SeqNo:     seqno,
+			RootHash:  testDummyHash(0xf1, seqno),
+			FileHash:  testDummyHash(0xf2, seqno),
+		},
+		StateRootHash: testDummyHash(0xf3, seqno),
+	}
+}
+
+func testDummyHash(prefix byte, seqno uint32) []byte {
+	hash := bytes.Repeat([]byte{prefix}, 32)
+	binary.BigEndian.PutUint32(hash[len(hash)-4:], seqno)
+	return hash
+}
+
+func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	peerA := testZeroStatePeer("a")
 	peerB := testZeroStatePeer("b")
 	sub := &overlaySubscription{
@@ -30,8 +86,10 @@ func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
 			peerB.id: peerB,
 		},
 	}
+	pool := testArchivePool(sub)
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
-	got := sub.zeroStateQueryCandidates(map[PeerID]struct{}{
+	got := zeroStateArchiveCandidates(pool, nil, shard, map[PeerID]struct{}{
 		peerA.id: {},
 	})
 	if len(got) != 1 {
@@ -42,31 +100,159 @@ func TestZeroStateQueryCandidatesSkipsTriedPeers(t *testing.T) {
 	}
 }
 
-func TestRotateZeroStateUnavailablePeersRemovesCurrentPeers(t *testing.T) {
-	peerA := testZeroStatePeer("a")
-	peerB := testZeroStatePeer("b")
+func TestZeroStateDeadlineGraceKeepsPeerCandidate(t *testing.T) {
+	peer := testZeroStatePeer("slow")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
 		peers: map[PeerID]*overlayPeer{
-			peerA.id: peerA,
-			peerB.id: peerB,
+			peer.id: peer,
 		},
-		neighbours: []PeerID{peerA.id, peerB.id},
-		peerNotify: make(chan struct{}, 1),
+	}
+	pool := testArchivePool(sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+
+	pool.markAvailable(shard, peer)
+	session.noteArchivePeerAvailable(peer)
+	tried := map[PeerID]struct{}{}
+	if !session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded) {
+		t.Fatal("deadline grace should keep zero-state peer retryable")
 	}
 
-	if got := sub.rotateZeroStateUnavailablePeers([]*overlayPeer{peerA, peerB}); got != 2 {
-		t.Fatalf("rotated peers = %d, want 2", got)
+	got := zeroStateArchiveCandidates(pool, session, shard, tried)
+	if len(got) == 0 || got[0].id != peer.id {
+		t.Fatalf("deadline-graced peer was not retried: %#v", got)
 	}
-	if len(sub.peers) != 0 {
-		t.Fatalf("peers were not removed: %d", len(sub.peers))
+	failures, pinned := session.archivePeerDeadlineFailures(peer)
+	if !pinned || failures != 1 {
+		t.Fatalf("deadline failures = %d pinned=%v, want 1 and pinned", failures, pinned)
 	}
-	if len(sub.neighbours) != 0 {
-		t.Fatalf("neighbours were not removed: %d", len(sub.neighbours))
+	if pool.coolingDown(shard, peer) {
+		t.Fatal("deadline grace should not cool down zero-state peer")
 	}
+}
+
+func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
+	peer := testZeroStatePeer("live")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+		peers: map[PeerID]*overlayPeer{
+			peer.id: peer,
+		},
+	}
+	pool := testArchivePool(sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+
+	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
+
+	if _, ok := sub.peers[peer.id]; !ok {
+		t.Fatal("borrowed live peer was removed from live pool")
+	}
+	if !pool.hasPeer(peer.id) {
+		t.Fatal("borrowed live peer was removed from archive pool")
+	}
+}
+
+func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
+	peer := testZeroStatePeer("archive-only")
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+	}
+	pool := testArchivePool(sub)
+	pool.addArchiveOnlyPeer(peer)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+
+	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
+
+	if pool.hasPeer(peer.id) {
+		t.Fatal("archive-only peer survived zero-state not-available rotation")
+	}
+}
+
+func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
+	data := bytes.Repeat([]byte{0x42}, 64)
+	rldpClient := &testArchiveRLDP{
+		adnl:        newTestOverlayADNL(),
+		asyncResult: data,
+		asyncDelay:  150 * time.Millisecond,
+	}
+	peer := &overlayPeer{
+		id:          testPeerID("probe-peer"),
+		addr:        "probe-peer",
+		rldpOverlay: overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01}),
+		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:       true,
+	}
+	node := &Node{
+		log:     discardLogger(),
+		peerUse: map[PeerID]peerUse{},
+	}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+		spec: overlaySpec{ShortID: []byte{0x01}},
+	}
+	block := testBlockID(-1, topShard, 42)
+	downloader := persistentStateSnapshotDownloader{
+		node:   node,
+		sub:    sub,
+		block:  block,
+		master: block,
+	}
+	candidate := persistentStateCandidate{
+		peer: peer,
+		id: PersistentStateIDV2{
+			Block:            block,
+			MasterchainBlock: block,
+			EffectiveShard:   topShard,
+		},
+		size:       int64(len(data)),
+		workers:    1,
+		chunkCount: 1,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		probes, errs := downloader.probePersistentStateCandidates(context.Background(), []persistentStateCandidate{candidate}, 1, nil)
+		if len(probes) != 1 {
+			done <- errors.Join(errs...)
+			return
+		}
+		done <- nil
+	}()
+
+	deadline := time.After(time.Second)
+	for node.downloadPeerLeaseCount(peer) == 0 {
+		select {
+		case err := <-done:
+			t.Fatalf("probe finished before download lease was observed: %v", err)
+		case <-deadline:
+			t.Fatal("probe did not acquire download lease")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
 	select {
-	case <-sub.peerNotify:
-	default:
-		t.Fatal("expected peer notification")
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("probe failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe did not finish")
+	}
+	if leases := node.downloadPeerLeaseCount(peer); leases != 0 {
+		t.Fatalf("probe leaked download lease: %d", leases)
 	}
 }
 
@@ -376,14 +562,14 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 		t.Fatalf("import full state cell tree: %v", err)
 	}
 	partLevelHash := partRoot.HashKey(0)
-	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
+	if err := saveTestBlockState(ctx, store, &tnstore.BlockState{
 		Block:          splitStatePartStorageBlock(block, part),
 		StateRootHash:  partLevelHash[:],
 		CellGeneration: 1,
 	}); err != nil {
 		t.Fatalf("save split part metadata: %v", err)
 	}
-	if err := store.SaveBlockState(ctx, &tnstore.BlockState{
+	if err := saveTestBlockState(ctx, store, &tnstore.BlockState{
 		Block:          block,
 		StateRootHash:  fullRootHash[:],
 		CellGeneration: 1,
@@ -717,7 +903,7 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	if !bytes.Equal(state.StateRootHash, fullRootHash[:]) {
 		t.Fatalf("merged state root hash mismatch: got=%x want=%x", state.StateRootHash, fullRootHash)
 	}
-	if err = store.SaveBlockState(ctx, state); err != nil {
+	if err = saveTestBlockState(ctx, store, state); err != nil {
 		t.Fatalf("commit merged state metadata: %v", err)
 	}
 

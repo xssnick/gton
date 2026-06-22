@@ -229,6 +229,24 @@ func TestArchiveShardPrefixesIncludeIntermediateShardChanges(t *testing.T) {
 	}
 }
 
+func TestArchiveShardPrefixesIncludeWideShardInEveryCoveredPrefix(t *testing.T) {
+	block := testBlockID(0, topShard, 11)
+
+	got := archiveShardImportPlansForBlockStatesMatching(2, nil, [][]ton.BlockIDExt{{block}}, nil)
+	if len(got) != 4 {
+		t.Fatalf("wide shard prefixes = %#v, want 4 plans", got)
+	}
+	for i, plan := range got {
+		wantShard := archiveShardIDForPrefixIndex(2, i)
+		if plan.shard != wantShard {
+			t.Fatalf("plan[%d] shard = %#v, want %#v", i, plan.shard, wantShard)
+		}
+		if len(plan.needed) != 1 || !plan.needed[0].Equals(&block) {
+			t.Fatalf("plan[%d] needed = %#v, want [%s]", i, plan.needed, storage.FormatBlockRef(block))
+		}
+	}
+}
+
 func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t *testing.T) {
 	shard := int64(-1 << 61)
 	next := testBlockID(0, shard, 11)

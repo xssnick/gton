@@ -10,6 +10,7 @@ import (
 const (
 	sendMessageCacheTTL        = time.Minute
 	sendMessageCacheMaxEntries = 1 << 17
+	sendMessageCacheShards     = 64
 )
 
 var sendMessageCRC64Table = crc64.MakeTable(crc64.ECMA)
@@ -17,9 +18,13 @@ var sendMessageCRC64Table = crc64.MakeTable(crc64.ECMA)
 type sendMessageCache struct {
 	ttl        time.Duration
 	maxEntries int
-	mx         sync.Mutex
-	seen       map[uint64]*sendMessageCacheEntry
-	order      *list.List
+	shards     [sendMessageCacheShards]sendMessageCacheShard
+}
+
+type sendMessageCacheShard struct {
+	mx    sync.Mutex
+	seen  map[uint64]*sendMessageCacheEntry
+	order *list.List
 }
 
 type sendMessageCacheEntry struct {
@@ -29,26 +34,32 @@ type sendMessageCacheEntry struct {
 }
 
 func newSendMessageCache() *sendMessageCache {
-	return &sendMessageCache{
+	cache := &sendMessageCache{
 		ttl:        sendMessageCacheTTL,
 		maxEntries: sendMessageCacheMaxEntries,
-		seen:       map[uint64]*sendMessageCacheEntry{},
-		order:      list.New(),
 	}
+	for i := range cache.shards {
+		cache.shards[i] = sendMessageCacheShard{
+			seen:  map[uint64]*sendMessageCacheEntry{},
+			order: list.New(),
+		}
+	}
+	return cache
 }
 
 func (c *sendMessageCache) Mark(key uint64, now time.Time) bool {
-	c.mx.Lock()
-	defer c.mx.Unlock()
+	shard := c.shard(key)
+	shard.mx.Lock()
+	defer shard.mx.Unlock()
 
-	if entry := c.seen[key]; entry != nil {
+	if entry := shard.seen[key]; entry != nil {
 		if now.Sub(entry.seenAt) < c.ttl {
 			return false
 		}
 		entry.seenAt = now
-		c.order.MoveToBack(entry.element)
-		c.pruneExpiredLocked(now)
-		c.pruneOverflowLocked()
+		shard.order.MoveToBack(entry.element)
+		shard.pruneExpiredLocked(now, c.ttl)
+		shard.pruneOverflowLocked(c.maxEntriesPerShard())
 		return true
 	}
 
@@ -56,53 +67,65 @@ func (c *sendMessageCache) Mark(key uint64, now time.Time) bool {
 		key:    key,
 		seenAt: now,
 	}
-	entry.element = c.order.PushBack(entry)
-	c.seen[key] = entry
+	entry.element = shard.order.PushBack(entry)
+	shard.seen[key] = entry
 
-	c.pruneExpiredLocked(now)
-	c.pruneOverflowLocked()
+	shard.pruneExpiredLocked(now, c.ttl)
+	shard.pruneOverflowLocked(c.maxEntriesPerShard())
 	return true
 }
 
 func (c *sendMessageCache) Drop(key uint64) {
-	c.mx.Lock()
-	defer c.mx.Unlock()
+	shard := c.shard(key)
+	shard.mx.Lock()
+	defer shard.mx.Unlock()
 
-	c.deleteEntryLocked(c.seen[key])
+	shard.deleteEntryLocked(shard.seen[key])
 }
 
-func (c *sendMessageCache) pruneExpiredLocked(now time.Time) {
-	for elem := c.order.Front(); elem != nil; {
+func (c *sendMessageCache) shard(key uint64) *sendMessageCacheShard {
+	return &c.shards[key&(sendMessageCacheShards-1)]
+}
+
+func (c *sendMessageCache) maxEntriesPerShard() int {
+	if c.maxEntries <= 0 {
+		return 0
+	}
+	return (c.maxEntries + sendMessageCacheShards - 1) / sendMessageCacheShards
+}
+
+func (s *sendMessageCacheShard) pruneExpiredLocked(now time.Time, ttl time.Duration) {
+	for elem := s.order.Front(); elem != nil; {
 		entry := elem.Value.(*sendMessageCacheEntry)
-		if now.Sub(entry.seenAt) < c.ttl {
+		if now.Sub(entry.seenAt) < ttl {
 			return
 		}
 		next := elem.Next()
-		c.deleteEntryLocked(entry)
+		s.deleteEntryLocked(entry)
 		elem = next
 	}
 }
 
-func (c *sendMessageCache) pruneOverflowLocked() {
-	if c.maxEntries <= 0 {
+func (s *sendMessageCacheShard) pruneOverflowLocked(maxEntries int) {
+	if maxEntries <= 0 {
 		return
 	}
-	for len(c.seen) > c.maxEntries {
-		elem := c.order.Front()
+	for len(s.seen) > maxEntries {
+		elem := s.order.Front()
 		if elem == nil {
 			return
 		}
-		c.deleteEntryLocked(elem.Value.(*sendMessageCacheEntry))
+		s.deleteEntryLocked(elem.Value.(*sendMessageCacheEntry))
 	}
 }
 
-func (c *sendMessageCache) deleteEntryLocked(entry *sendMessageCacheEntry) {
+func (s *sendMessageCacheShard) deleteEntryLocked(entry *sendMessageCacheEntry) {
 	if entry == nil {
 		return
 	}
-	delete(c.seen, entry.key)
+	delete(s.seen, entry.key)
 	if elem := entry.element; elem != nil {
-		c.order.Remove(elem)
+		s.order.Remove(elem)
 		entry.element = nil
 	}
 }

@@ -36,7 +36,7 @@ func TestAppliedStateSetCloneDoesNotClear(t *testing.T) {
 
 func rememberFullCheckpointStateForTest(t *testing.T, states *appliedStateSet, state *storage.BlockState) {
 	t.Helper()
-	states.rememberEntry(appliedStateEntry{state: storage.CloneBlockState(state)})
+	states.rememberWithArtifacts(state, testStateCheckpointArtifact(state), nil)
 }
 
 func TestAppliedStateSetStoresArtifactStateMetadataOnly(t *testing.T) {
@@ -123,6 +123,78 @@ func TestAppliedStateCheckpointFailureKeepsStates(t *testing.T) {
 	}
 	if !nextCheckpoint.entries[0].State.Block.Equals(&first.Block) {
 		t.Fatalf("next checkpoint block = %s, want %s", storage.FormatBlockRef(nextCheckpoint.entries[0].State.Block), storage.FormatBlockRef(first.Block))
+	}
+}
+
+func TestAppliedStateSetStateOnlyUpdateKeepsFullArtifact(t *testing.T) {
+	block := testBlockID(0, topShard, 12)
+	state := &storage.BlockState{Block: block}
+
+	var states appliedStateSet
+	states.rememberWithArtifacts(state, &storage.ServedBlockFull{
+		ID:    block,
+		Block: []byte{1, 2, 3},
+		Proof: []byte{4, 5},
+		Meta:  &storage.BlockMeta{ID: block},
+	}, nil)
+	states.rememberEntry(appliedStateEntry{state: storage.CloneBlockState(state)})
+
+	checkpoint := states.checkpoint()
+	if len(checkpoint.entries) != 1 {
+		t.Fatalf("checkpoint states = %d, want 1", len(checkpoint.entries))
+	}
+	artifact := checkpoint.entries[0].Artifact
+	if artifact == nil {
+		t.Fatal("state-only update dropped full artifact")
+	}
+	if !bytes.Equal(artifact.Block, []byte{1, 2, 3}) {
+		t.Fatalf("artifact block = %x, want 010203", artifact.Block)
+	}
+	if !bytes.Equal(artifact.Proof, []byte{4, 5}) {
+		t.Fatalf("artifact proof = %x, want 0405", artifact.Proof)
+	}
+	if got, want := states.byteSize(), uint64(5); got != want {
+		t.Fatalf("artifact bytes = %d, want %d", got, want)
+	}
+}
+
+func TestAppliedStateCheckpointCompleteKeepsUpdatedEntry(t *testing.T) {
+	block := testBlockID(0, topShard, 13)
+	state := &storage.BlockState{Block: block}
+
+	var states appliedStateSet
+	states.rememberWithArtifacts(state, &storage.ServedBlockFull{
+		ID:    block,
+		Block: []byte{1},
+		Proof: []byte{2},
+		Meta:  &storage.BlockMeta{ID: block},
+	}, nil)
+	checkpoint := states.checkpoint()
+
+	states.rememberWithArtifacts(state, &storage.ServedBlockFull{
+		ID:    block,
+		Block: []byte{3},
+		Proof: []byte{4},
+		Meta:  &storage.BlockMeta{ID: block},
+	}, nil)
+	states.completeCheckpoint(checkpoint)
+
+	remaining := states.cloneEntries()
+	if len(remaining) != 1 {
+		t.Fatalf("remaining states = %d, want 1", len(remaining))
+	}
+	artifact := remaining[0].artifact.block
+	if artifact == nil {
+		t.Fatal("newer pending entry lost full artifact")
+	}
+	if !bytes.Equal(artifact.Block, []byte{3}) {
+		t.Fatalf("remaining artifact block = %x, want 03", artifact.Block)
+	}
+	if !bytes.Equal(artifact.Proof, []byte{4}) {
+		t.Fatalf("remaining artifact proof = %x, want 04", artifact.Proof)
+	}
+	if got, want := states.byteSize(), uint64(2); got != want {
+		t.Fatalf("artifact bytes = %d, want %d", got, want)
 	}
 }
 

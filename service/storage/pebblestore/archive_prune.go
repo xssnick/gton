@@ -77,7 +77,7 @@ func (s *Store) archivePackageSnapshot(ctx context.Context) ([]archivePackageMet
 
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: hotKeyArchivePackagePrefix(),
-		UpperBound: appendPrefixUpperBound(hotPrefixArchivePackage),
+		UpperBound: prefixUpperBound(hotPrefixArchivePackage),
 	})
 	if err != nil {
 		return nil, err
@@ -158,7 +158,7 @@ func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uin
 
 	iter, err := snap.NewIter(&pebble.IterOptions{
 		LowerBound: bytes.Clone(hotPrefixBlockMeta),
-		UpperBound: appendPrefixUpperBound(hotPrefixBlockMeta),
+		UpperBound: prefixUpperBound(hotPrefixBlockMeta),
 	})
 	if err != nil {
 		return 0, 0, err
@@ -241,8 +241,6 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 			hotKeyBlockDataRef(block),
 			hotKeyProofRef(storage.ServedProofBlock, block),
 			hotKeyProofRef(storage.ServedProofBlockLink, block),
-			hotKeyKeyProofRef(storage.ServedProofKeyBlock, block),
-			hotKeyKeyProofRef(storage.ServedProofKeyBlockLink, block),
 		}
 		if meta.EndLT != 0 {
 			keys = append(keys, hotKeyBlockLTIndex(meta))
@@ -319,7 +317,7 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: bytes.Clone(hotPrefixArchiveInfo),
-		UpperBound: appendPrefixUpperBound(hotPrefixArchiveInfo),
+		UpperBound: prefixUpperBound(hotPrefixArchiveInfo),
 	})
 	if err != nil {
 		return nil, 0, deletedKeys, err

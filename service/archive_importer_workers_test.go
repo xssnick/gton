@@ -144,6 +144,107 @@ func TestArchiveDownloadByteGateWaitsUntilDownloadedBytesDrop(t *testing.T) {
 	}
 }
 
+func TestArchiveDownloadBackpressureGateWaitsUntilResumed(t *testing.T) {
+	runner := &archiveCatchUpRunner{}
+	resume := runner.pauseArchiveDownloadsForCheckpointBackpressure()
+	t.Cleanup(resume)
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- runner.waitArchiveDownloadBackpressure(context.Background())
+	}()
+
+	select {
+	case err := <-waitDone:
+		t.Fatalf("download backpressure wait finished before resume: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	resume()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("download backpressure wait after resume: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download backpressure wait did not finish after resume")
+	}
+}
+
+func TestArchiveImportQueueDownloadJobWaitsForCheckpointBackpressure(t *testing.T) {
+	runner := &archiveCatchUpRunner{}
+	resume := runner.pauseArchiveDownloadsForCheckpointBackpressure()
+	t.Cleanup(resume)
+
+	queue := &archiveImportQueue{}
+	done := make(chan archiveImportQueueResult, 1)
+	go queue.runDownloadJob(runner, archiveDownloadJob{
+		ctx:              context.Background(),
+		masterchainSeqno: 100,
+		shard:            archive.ShardID{Workchain: -1, Shard: topShard},
+		splitDepth:       0,
+		priority:         archiveImportPriorityHot,
+		done:             done,
+	})
+
+	started := time.After(time.Second)
+	for queue.activeDownload.Load() == 0 {
+		select {
+		case result := <-done:
+			t.Fatalf("download job finished before reaching checkpoint backpressure gate: %v", result.err)
+		case <-started:
+			t.Fatal("download job did not reach checkpoint backpressure gate")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	select {
+	case result := <-done:
+		t.Fatalf("download job finished while checkpoint backpressure was active: %v", result.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	resume()
+
+	select {
+	case result := <-done:
+		if result.err == nil {
+			t.Fatal("download job unexpectedly succeeded without an archive session")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download job did not finish after checkpoint backpressure resumed")
+	}
+}
+
+func TestArchiveImportQueueDownloadStarvedRequiresEmptyPrepareBacklog(t *testing.T) {
+	queue := &archiveImportQueue{
+		prepareHot:      make(chan archivePrepareJob, 1),
+		preparePrefetch: make(chan archivePrepareJob, 1),
+		downloadedBytes: newArchiveDownloadByteGate(100),
+	}
+	if !queue.archiveDownloadsStarved() {
+		t.Fatal("empty archive queue should be download-starved")
+	}
+
+	queue.activePrepare.Add(1)
+	if queue.archiveDownloadsStarved() {
+		t.Fatal("active prepare should disable archive download hedge")
+	}
+	queue.activePrepare.Add(-1)
+
+	queue.prepareHot <- archivePrepareJob{}
+	if queue.archiveDownloadsStarved() {
+		t.Fatal("queued prepare should disable archive download hedge")
+	}
+	<-queue.prepareHot
+
+	queue.downloadedBytes.add(1)
+	if queue.archiveDownloadsStarved() {
+		t.Fatal("downloaded bytes waiting for prepare should disable archive download hedge")
+	}
+}
+
 func TestArchiveImportQueueReleasesDownloadedBytesWhenPrepareContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

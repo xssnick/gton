@@ -26,15 +26,13 @@ type DownloadedState interface {
 
 type StateStorage interface {
 	StateCellTreeImporter
-	SaveCurrentState(ctx context.Context, state *CurrentState) error
 	CurrentState(ctx context.Context) (*CurrentState, error)
 	SaveStateSyncProgress(ctx context.Context, state *CurrentState) error
 	StateSyncProgress(ctx context.Context) (*CurrentState, error)
 	ClearStateSyncProgress(ctx context.Context) error
 	SaveStateCellRecords(ctx context.Context, cells StateCellRecords) error
 	FlushStateCells(ctx context.Context) error
-	SaveBlockState(ctx context.Context, state *BlockState) error
-	SaveStateCheckpoint(ctx context.Context, blocks []*BlockState, current *CurrentState) error
+	SaveZeroStateCheckpoint(ctx context.Context, blocks []*BlockState, current *CurrentState) error
 	SaveStateCheckpointEntries(ctx context.Context, blocks []StateCheckpointBlock, cells StateCellRecords, current *CurrentState) (StateCheckpointTiming, error)
 	BlockState(ctx context.Context, block ton.BlockIDExt) (*BlockState, error)
 }

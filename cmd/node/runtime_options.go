@@ -3,12 +3,15 @@ package main
 import (
 	"crypto/ed25519"
 	"fmt"
+	"math"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
+	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service/p2p"
 )
 
@@ -19,6 +22,7 @@ type liteserverOptions struct {
 	PrivateKey       ed25519.PrivateKey
 	MasterBlockCache int
 	ShardBlockCache  int
+	Limits           liteserver.RequestLimitOptions
 }
 
 type metricsOptions struct {
@@ -153,7 +157,49 @@ func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, erro
 		return liteserverOptions{}, fmt.Errorf("liteserver.shard_block_cache cannot be negative")
 	}
 
+	limits, err := liteserverLimitOptionsFromConfig(cfg.Lite.Limits)
+	if err != nil {
+		return liteserverOptions{}, err
+	}
+	opts.Limits = limits
+
 	return opts, nil
+}
+
+func liteserverLimitOptionsFromConfig(cfg nodeconfig.LiteLimits) (liteserver.RequestLimitOptions, error) {
+	if cfg.CapacityPerIP < 0 {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.capacity_per_ip cannot be negative")
+	}
+	if cfg.CoolingPerSec < 0 || math.IsNaN(cfg.CoolingPerSec) || math.IsInf(cfg.CoolingPerSec, 0) {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.cooling_per_sec must be finite and non-negative")
+	}
+	if cfg.MaxConnectionsPerIP < 0 {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_connections_per_ip cannot be negative")
+	}
+	if cfg.MaxKeepAliveSeconds < 0 {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_keep_alive_seconds cannot be negative")
+	}
+	if (cfg.CapacityPerIP == 0) != (cfg.CoolingPerSec == 0) {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.capacity_per_ip and liteserver.limits.cooling_per_sec must be configured together")
+	}
+	if cfg.CapacityPerIP > int64(int(^uint(0)>>1)) {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.capacity_per_ip is too large")
+	}
+	if cfg.MaxConnectionsPerIP > int64(int(^uint(0)>>1)) {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_connections_per_ip is too large")
+	}
+
+	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
+	if cfg.MaxKeepAliveSeconds > maxDurationSeconds {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_keep_alive_seconds is too large")
+	}
+
+	return liteserver.RequestLimitOptions{
+		CapacityPerIP:       int(cfg.CapacityPerIP),
+		CoolingPerSec:       cfg.CoolingPerSec,
+		MaxConnectionsPerIP: int(cfg.MaxConnectionsPerIP),
+		MaxKeepAlive:        time.Duration(cfg.MaxKeepAliveSeconds) * time.Second,
+	}, nil
 }
 
 func metricsOptionsFromConfig(cfg nodeconfig.Config) (metricsOptions, error) {

@@ -35,11 +35,13 @@ var (
 )
 
 type stateSerializer struct {
-	log              zerolog.Logger
-	store            storage.Storage
-	dir              string
-	disableAutomatic bool
-	randomDelay      func() time.Duration
+	log                   zerolog.Logger
+	store                 storage.Storage
+	dir                   string
+	disableAutomatic      bool
+	largeBOCBatchSize     int
+	stateSerializeOnePass bool
+	randomDelay           func() time.Duration
 
 	mu        sync.Mutex
 	activeRun *stateSerializationRun
@@ -77,14 +79,19 @@ type serializedStateFile struct {
 	fileHash []byte
 }
 
-func newStateSerializer(logger zerolog.Logger, store storage.Storage, dir string, disableAutomatic bool) *stateSerializer {
+func newStateSerializer(logger zerolog.Logger, store storage.Storage, dir string, disableAutomatic bool, largeBOCBatchSize int, stateSerializeOnePass bool) *stateSerializer {
+	if largeBOCBatchSize <= 0 {
+		largeBOCBatchSize = defaultPersistentStateLargeBOCBatchSize
+	}
 	return &stateSerializer{
-		log:               logger.With().Str("component", "state_serializer").Logger(),
-		store:             store,
-		dir:               dir,
-		disableAutomatic:  disableAutomatic,
-		randomDelay:       randomStateSerializationDelay,
-		automaticAttempts: make(map[uint32]int),
+		log:                   logger.With().Str("component", "state_serializer").Logger(),
+		store:                 store,
+		dir:                   dir,
+		disableAutomatic:      disableAutomatic,
+		largeBOCBatchSize:     largeBOCBatchSize,
+		stateSerializeOnePass: stateSerializeOnePass,
+		randomDelay:           randomStateSerializationDelay,
+		automaticAttempts:     make(map[uint32]int),
 	}
 }
 
@@ -384,7 +391,7 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 		if err != nil {
 			return fmt.Errorf("split %s state %s: %w", target.kind, storage.FormatBlockRef(target.block), err)
 		}
-		onePassLargeBOC := useOnePassLargeBOCForStateSerialization(target, parts)
+		onePassLargeBOC := s.useOnePassLargeBOCForStateSerialization(target, parts)
 
 		for partIndex, part := range parts {
 			file, err := s.existingSerializedState(ctx, master, target, part)
@@ -553,6 +560,10 @@ func useOnePassLargeBOCForStateSerialization(target stateSerializationTarget, pa
 	return splitAccounts >= persistentStateOnePassSplitAccountThreshold
 }
 
+func (s *stateSerializer) useOnePassLargeBOCForStateSerialization(target stateSerializationTarget, parts []state2.PersistentStatePart) bool {
+	return s.stateSerializeOnePass || useOnePassLargeBOCForStateSerialization(target, parts)
+}
+
 func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.BlockIDExt, target stateSerializationTarget, part state2.PersistentStatePart, onePassLargeBOC bool) (serializedStateFile, error) {
 	var err error
 	if part.Kind != state2.PersistentStatePartUnsplit {
@@ -595,9 +606,9 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 
 	releaseCompactions := throttleStateSerializationCompactions(s.store)
 	if onePassLargeBOC {
-		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, persistentStateLargeBOCBatchSize)
+		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
 	} else {
-		err = cell.ToLargeBOC(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, persistentStateLargeBOCBatchSize)
+		err = cell.ToLargeBOC(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
 	}
 	releaseCompactions()
 	progressStop()
@@ -726,7 +737,7 @@ func persistentStateBOCOptions() cell.BOCSerializeOptions {
 }
 
 const (
-	persistentStateLargeBOCBatchSize            = 512 << 10
+	defaultPersistentStateLargeBOCBatchSize     = 512 << 10
 	persistentStateOnePassSplitAccountThreshold = 4
 )
 

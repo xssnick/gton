@@ -65,7 +65,7 @@ const (
 	attachWarmupTimeout        = 3 * time.Second
 	broadcastEventBuffer       = 4096
 	broadcastQueueMaxItems     = 1024
-	broadcastQueueMaxBytes     = int64(128 << 20)
+	broadcastQueueMaxBytes     = int64(512 << 20)
 	broadcastDeduperMaxEntries = 4096
 	externalMessageCacheTTL    = time.Minute
 	externalMessageCacheMax    = 1 << 17
@@ -74,12 +74,11 @@ const (
 	publicAnnounceRetryDelay   = 15 * time.Second
 	dhtStoreTimeout            = 45 * time.Second
 	dhtFindTimeout             = 30 * time.Second
-	masterchainWaitLogEvery    = 5 * time.Second
 	peerQueryTimeout           = 10 * time.Second
 	broadcastSignatureTimeout  = 2 * time.Second
 	peerRebroadcastTimeout     = 5 * time.Second
 	peerRebroadcastQueueItems  = 2048
-	peerRebroadcastQueueBytes  = int64(256 << 20)
+	peerRebroadcastQueueBytes  = int64(1024 << 20)
 	externalRebroadcastFanout  = 5
 	laggedExternalFanout       = 3
 	localRebroadcastAttempts   = 3
@@ -100,6 +99,7 @@ const (
 	peerFailUnreliability = 10.0
 	peerSlowEvictionScore = peerStopUnreliability + 1
 
+	largeDownloadSlowPeerPenalty  = 3 * time.Minute
 	blockUnknownPeerSpeed         = float64(256 << 10)
 	blockSlowPeerSpeed            = float64(64 << 10)
 	blockSlowPeerPenalty          = 30 * time.Second
@@ -227,6 +227,13 @@ type BlockCacheObserver interface {
 
 type SyncLagProvider interface {
 	SyncLagSeconds() (int64, error)
+}
+
+type RuntimeCallbacks interface {
+	CompressedBlockStateProvider
+	SyncLagProvider
+	BroadcastSignatureVerifier
+	BroadcastAdmission
 }
 
 type CustomOverlayConfig struct {

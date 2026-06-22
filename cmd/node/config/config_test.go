@@ -111,6 +111,10 @@ func TestLoadDefaults(t *testing.T) {
 	if capacity.MaxDelay != DefaultLiteSendMessageBroadcastMaxDelay {
 		t.Fatalf("unexpected default liteserver send message broadcast max delay %s", capacity.MaxDelay)
 	}
+	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
+		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
+		t.Fatalf("unexpected default liteserver limits: %+v", cfg.Lite.Limits)
+	}
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
 		t.Fatalf("cell total cache size: %v", err)
@@ -150,6 +154,23 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if int64(cellMemTableStopWritesThreshold) != DefaultCellMemTableStopWritesThreshold {
 		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
+	}
+	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		t.Fatalf("large boc shard read workers: %v", err)
+	}
+	if int64(largeBOCShardReadWorkers) != DefaultLargeBOCShardReadWorkers {
+		t.Fatalf("unexpected large boc shard read workers %d", largeBOCShardReadWorkers)
+	}
+	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		t.Fatalf("persistent state large boc batch size: %v", err)
+	}
+	if int64(persistentStateLargeBOCBatchSize) != DefaultPersistentStateLargeBOCBatchSize {
+		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
+	}
+	if cfg.Storage.StateSerializeOnePass {
+		t.Fatal("state serialize one-pass should be disabled by default")
 	}
 	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
 	if err != nil {
@@ -249,6 +270,28 @@ func TestLoadLiteSendMessageBroadcastCapacityRejectsNegative(t *testing.T) {
 				t.Fatal("expected negative capacity config to fail")
 			}
 		})
+	}
+}
+
+func TestLoadLiteLimits(t *testing.T) {
+	path := writeTestConfig(t, `{"liteserver":{"limits":{"capacity_per_ip":100,"cooling_per_sec":20,"max_connections_per_ip":50,"max_keep_alive_seconds":60}}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.Lite.Limits.CapacityPerIP != 100 {
+		t.Fatalf("unexpected capacity per IP %d", cfg.Lite.Limits.CapacityPerIP)
+	}
+	if cfg.Lite.Limits.CoolingPerSec != 20 {
+		t.Fatalf("unexpected cooling per second %f", cfg.Lite.Limits.CoolingPerSec)
+	}
+	if cfg.Lite.Limits.MaxConnectionsPerIP != 50 {
+		t.Fatalf("unexpected max connections per IP %d", cfg.Lite.Limits.MaxConnectionsPerIP)
+	}
+	if cfg.Lite.Limits.MaxKeepAliveSeconds != 60 {
+		t.Fatalf("unexpected max keep alive seconds %d", cfg.Lite.Limits.MaxKeepAliveSeconds)
 	}
 }
 
@@ -365,6 +408,9 @@ func TestStorageOptions(t *testing.T) {
 			"decoded_cell_cache_max_entries": 2000,
 			"cell_shard_memtable_size": 1073741824,
 			"cell_memtable_stop_writes_threshold": 3,
+			"large_boc_shard_read_workers": 8,
+			"persistent_state_large_boc_batch_size": 2097152,
+			"state_serialize_one_pass": true,
 			"artifact_file_max_open": 123
 		}
 	}`)
@@ -416,6 +462,23 @@ func TestStorageOptions(t *testing.T) {
 	if cellMemTableStopWritesThreshold != 3 {
 		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
 	}
+	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		t.Fatalf("large boc shard read workers: %v", err)
+	}
+	if largeBOCShardReadWorkers != 8 {
+		t.Fatalf("unexpected large boc shard read workers %d", largeBOCShardReadWorkers)
+	}
+	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		t.Fatalf("persistent state large boc batch size: %v", err)
+	}
+	if persistentStateLargeBOCBatchSize != 2<<20 {
+		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
+	}
+	if !cfg.Storage.StateSerializeOnePass {
+		t.Fatal("state serialize one-pass should be enabled")
+	}
 	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
 	if err != nil {
 		t.Fatalf("artifact file max open: %v", err)
@@ -458,6 +521,62 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 				t.Fatal("expected invalid decoded cell cache options to fail")
 			}
 		})
+	}
+}
+
+func TestStorageLargeBOCOptionsRejectInvalidValues(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(Config) error
+		cfg  Config
+	}{
+		{
+			name: "negative large boc shard read workers",
+			run: func(cfg Config) error {
+				_, err := cfg.LargeBOCShardReadWorkers()
+				return err
+			},
+			cfg: Config{Storage: Storage{LargeBOCShardReadWorkers: -1}},
+		},
+		{
+			name: "negative persistent state large boc batch size",
+			run: func(cfg Config) error {
+				_, err := cfg.PersistentStateLargeBOCBatchSize()
+				return err
+			},
+			cfg: Config{Storage: Storage{PersistentStateLargeBOCBatchSize: -1}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(tt.cfg); err == nil {
+				t.Fatal("expected invalid storage large boc option to fail")
+			}
+		})
+	}
+}
+
+func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
+	cfg := Config{Storage: Storage{
+		LargeBOCShardReadWorkers:         0,
+		PersistentStateLargeBOCBatchSize: 0,
+	}}
+
+	workers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		t.Fatalf("large boc shard read workers: %v", err)
+	}
+	if int64(workers) != DefaultLargeBOCShardReadWorkers {
+		t.Fatalf("large boc shard read workers = %d, want %d", workers, DefaultLargeBOCShardReadWorkers)
+	}
+
+	batchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		t.Fatalf("persistent state large boc batch size: %v", err)
+	}
+	if int64(batchSize) != DefaultPersistentStateLargeBOCBatchSize {
+		t.Fatalf("persistent state large boc batch size = %d, want %d", batchSize, DefaultPersistentStateLargeBOCBatchSize)
 	}
 }
 
@@ -521,6 +640,10 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Lite.SendMessageBroadcastMaxDelayMS != int64(DefaultLiteSendMessageBroadcastMaxDelay/time.Millisecond) {
 		t.Fatalf("unexpected liteserver send message broadcast max delay %d", cfg.Lite.SendMessageBroadcastMaxDelayMS)
 	}
+	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
+		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
+		t.Fatalf("unexpected generated liteserver limits: %+v", cfg.Lite.Limits)
+	}
 	wantStorageDir, err := filepath.Abs(defaultStorageDir)
 	if err != nil {
 		t.Fatalf("resolve storage dir: %v", err)
@@ -545,6 +668,15 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.Storage.DecodedCellCacheMaxEntries != DefaultDecodedCellCacheMaxEntries {
 		t.Fatalf("unexpected decoded cell cache max entries %d", cfg.Storage.DecodedCellCacheMaxEntries)
+	}
+	if cfg.Storage.LargeBOCShardReadWorkers != DefaultLargeBOCShardReadWorkers {
+		t.Fatalf("unexpected large boc shard read workers %d", cfg.Storage.LargeBOCShardReadWorkers)
+	}
+	if cfg.Storage.PersistentStateLargeBOCBatchSize != DefaultPersistentStateLargeBOCBatchSize {
+		t.Fatalf("unexpected persistent state large boc batch size %d", cfg.Storage.PersistentStateLargeBOCBatchSize)
+	}
+	if cfg.Storage.StateSerializeOnePass {
+		t.Fatal("state serialize one-pass should be disabled by default")
 	}
 	wantGlobalConfigPath, err := filepath.Abs(DefaultGlobalConfigPath)
 	if err != nil {
@@ -609,6 +741,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"send_message_broadcast_max_delay_ms"`)) {
 		t.Fatal("generated config should use send_message_broadcast_max_delay_ms key")
+	}
+	if !bytes.Contains(data, []byte(`"limits"`)) {
+		t.Fatal("generated config should use liteserver limits key")
 	}
 	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
 		t.Fatal("generated config should use an empty custom_overlays list")

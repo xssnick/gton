@@ -117,14 +117,7 @@ func (p *overlayPeer) querySuccess(rtt time.Duration) {
 	defer p.statsMx.Unlock()
 
 	now := time.Now()
-	p.missedPings = 0
-	p.alive = true
-	p.lastReceiveAt = now
-	p.lastSuccessAt = now
-	p.unreliability--
-	if p.unreliability < 0 {
-		p.unreliability = 0
-	}
+	p.noteSuccessLocked(now)
 	if rtt <= 0 {
 		return
 	}
@@ -162,6 +155,7 @@ func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowTh
 	defer p.statsMx.Unlock()
 
 	now := time.Now()
+	p.noteSuccessLocked(now)
 	p.downloadCount++
 	if p.downloadBytesSec == 0 {
 		p.downloadBytesSec = speed
@@ -191,6 +185,17 @@ func (p *overlayPeer) archiveLargeDownloadSuccess(bytes int64, elapsed time.Dura
 		return
 	}
 	p.archiveLargeBytesSec = p.archiveLargeBytesSec*0.7 + speed*0.3
+}
+
+func (p *overlayPeer) noteSuccessLocked(now time.Time) {
+	p.missedPings = 0
+	p.alive = true
+	p.lastReceiveAt = now
+	p.lastSuccessAt = now
+	p.unreliability--
+	if p.unreliability < 0 {
+		p.unreliability = 0
+	}
 }
 
 func (p *overlayPeer) downloadFailed(slowPenalty time.Duration) {
@@ -461,27 +466,7 @@ func (s *overlaySubscription) refreshTargets() []*overlayPeer {
 func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
 	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
 	others := s.preferredPeers(requiredVersionMajor, requiredVersionMinor, nil)
-	if len(neighbours) == 0 {
-		return others
-	}
-	if len(others) == 0 {
-		return neighbours
-	}
-
-	seen := make(map[PeerID]struct{}, len(neighbours))
-	res := make([]*overlayPeer, 0, len(neighbours)+len(others))
-	for _, peer := range neighbours {
-		seen[peer.id] = struct{}{}
-		res = append(res, peer)
-	}
-
-	for _, peer := range others {
-		if _, ok := seen[peer.id]; ok {
-			continue
-		}
-		res = append(res, peer)
-	}
-	return res
+	return mergePeerCandidates(neighbours, others)
 }
 
 func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requiredVersionMinor int32, limit int) []*overlayPeer {
@@ -501,25 +486,11 @@ func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requir
 
 	res := make([]*overlayPeer, 0, limit)
 	seen := make(map[PeerID]struct{}, limit)
-	for _, peer := range neighbours[:neighbourSlots] {
-		seen[peer.id] = struct{}{}
-		res = append(res, peer)
-	}
+	res = appendUniquePeerCandidates(res, seen, neighbours[:neighbourSlots], limit)
 
 	preferred := s.preferredPeers(requiredVersionMajor, requiredVersionMinor, nil)
 	sortPeersByPreference(preferred)
-	for _, peer := range preferred {
-		if len(res) >= limit {
-			break
-		}
-		if _, ok := seen[peer.id]; ok {
-			continue
-		}
-		seen[peer.id] = struct{}{}
-		res = append(res, peer)
-	}
-
-	return res
+	return appendUniquePeerCandidates(res, seen, preferred, limit)
 }
 
 func (s *overlaySubscription) rebroadcastCandidates() []*overlayPeer {
@@ -536,33 +507,45 @@ func (s *overlaySubscription) rebroadcastCandidatesMatching(allow func(*overlayP
 	neighbours := s.preferredNeighbourPeers(0, 0)
 	others := s.preferredPeers(0, 0, allow)
 	if allow != nil {
-		filtered := neighbours[:0]
-		for _, peer := range neighbours {
-			if allow(peer, peer.statsSnapshot()) {
-				filtered = append(filtered, peer)
-			}
+		neighbours = filterPeerCandidates(neighbours, allow)
+	}
+	return mergePeerCandidates(neighbours, others)
+}
+
+func mergePeerCandidates(first, second []*overlayPeer) []*overlayPeer {
+	if len(first) == 0 {
+		return second
+	}
+	if len(second) == 0 {
+		return first
+	}
+
+	seen := make(map[PeerID]struct{}, len(first))
+	res := make([]*overlayPeer, 0, len(first)+len(second))
+	res = appendUniquePeerCandidates(res, seen, first, 0)
+	return appendUniquePeerCandidates(res, seen, second, 0)
+}
+
+func appendUniquePeerCandidates(res []*overlayPeer, seen map[PeerID]struct{}, peers []*overlayPeer, limit int) []*overlayPeer {
+	for _, peer := range peers {
+		if limit > 0 && len(res) >= limit {
+			break
 		}
-		neighbours = filtered
-	}
-	if len(neighbours) == 0 {
-		return others
-	}
-	if len(others) == 0 {
-		return neighbours
-	}
-
-	seen := make(map[PeerID]struct{}, len(neighbours))
-	res := make([]*overlayPeer, 0, len(neighbours)+len(others))
-	for _, peer := range neighbours {
-		seen[peer.id] = struct{}{}
-		res = append(res, peer)
-	}
-
-	for _, peer := range others {
 		if _, ok := seen[peer.id]; ok {
 			continue
 		}
+		seen[peer.id] = struct{}{}
 		res = append(res, peer)
 	}
 	return res
+}
+
+func filterPeerCandidates(peers []*overlayPeer, allow func(*overlayPeer, peerStats) bool) []*overlayPeer {
+	filtered := peers[:0]
+	for _, peer := range peers {
+		if allow(peer, peer.statsSnapshot()) {
+			filtered = append(filtered, peer)
+		}
+	}
+	return filtered
 }

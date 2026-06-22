@@ -19,7 +19,6 @@ type PeerServingStorage interface {
 }
 
 type PeerServingStorageWriter interface {
-	SaveArchiveImport(imported *ServedArchiveImport) error
 	SaveZeroState(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SavePersistentStateFile(file *PersistentStateFile) error
 }
@@ -49,11 +48,6 @@ type ServedBlockFull struct {
 type ServedBlockLink struct {
 	Prev ton.BlockIDExt
 	Next ton.BlockIDExt
-}
-
-type ServedArchiveImport struct {
-	FullBlocks []*ServedBlockFull
-	Links      []ServedBlockLink
 }
 
 type ArchivePruneStats struct {

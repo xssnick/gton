@@ -21,7 +21,7 @@ const (
 	keyBlockProgressInfoEvery  = 64
 	keyBlockLookupRetryDelay   = time.Second
 	keyBlockLookupRetryLogEach = 5
-	DefaultSyncBefore          = time.Hour
+	DefaultSyncBefore          = 4 * time.Hour
 	initialStateDownloadWindow = 8 * time.Hour
 )
 
@@ -48,21 +48,11 @@ func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt
 }
 
 func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trusted trustedKeyBlock) (ton.BlockIDExt, error) {
-	blocks, err := s.keyBlockIDs(ctx, trusted.block)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	latestKey := trusted.block
-	if len(blocks) > 0 {
-		latestKey = blocks[len(blocks)-1]
-	}
-
 	s.log.Info().
 		Str("from", storage.FormatBlockRef(trusted.block)).
-		Str("latest_key", storage.FormatBlockRef(latestKey)).
 		Msg("verifying key block chain for persistent state selection")
 
-	candidates, trusted, err := s.verifiedKeyBlockCandidates(ctx, trusted, blocks)
+	candidates, trusted, err := s.verifiedKeyBlockCandidates(ctx, trusted)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -133,68 +123,161 @@ func validateTrustedKeyBlockAnchor(block ton.BlockIDExt) error {
 	return nil
 }
 
-func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trustedKeyBlock, blocks []ton.BlockIDExt) ([]keyBlockCandidate, trustedKeyBlock, error) {
-	candidates := make([]keyBlockCandidate, 0, len(blocks)+1)
+func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trustedKeyBlock) ([]keyBlockCandidate, trustedKeyBlock, error) {
+	candidates := make([]keyBlockCandidate, 0, keyBlockLookupLimit+1)
 	candidates = append(candidates, keyBlockCandidate{
 		block:                    trusted.block,
 		utime:                    trusted.utime,
 		allowBoundaryWithoutPrev: trusted.block.SeqNo > 0,
 	})
 
-	latest := trusted.block
-	if len(blocks) > 0 {
-		latest = blocks[len(blocks)-1]
-	}
-	s.log.Info().
-		Str("from", storage.FormatBlockRef(trusted.block)).
-		Str("latest_key", storage.FormatBlockRef(latest)).
-		Int("key_blocks", len(blocks)).
-		Msg("downloaded key block ids for persistent state selection")
-
 	verified := 0
+	retries := 0
+	for {
+		logEvent := s.log.Debug()
+		if verified == 0 || verified%keyBlockProgressInfoEvery == 0 {
+			logEvent = s.log.Info()
+		}
+		logEvent.
+			Str("from", storage.FormatBlockRef(trusted.block)).
+			Uint32("from_seqno", trusted.block.SeqNo).
+			Int("limit", keyBlockLookupLimit).
+			Msg("requesting next key block ids")
+
+		batch, err := s.source.NextKeyBlocks(ctx, trusted.block, keyBlockLookupLimit)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, trustedKeyBlock{}, ctxErr
+			}
+			retries++
+			s.logRetryNextKeyBlocks(err, trusted.block, retries)
+			if err = waitNextKeyBlockRetry(ctx); err != nil {
+				return nil, trustedKeyBlock{}, err
+			}
+			continue
+		}
+
+		if len(batch.Blocks) == 0 {
+			s.log.Info().
+				Str("from", storage.FormatBlockRef(trusted.block)).
+				Int("verified", verified).
+				Bool("incomplete", batch.Incomplete).
+				Msg("next key block lookup reached tail")
+			break
+		}
+
+		advanced, err := s.verifyKeyBlockBatch(ctx, &trusted, &candidates, batch.Blocks, &verified)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, trustedKeyBlock{}, ctxErr
+			}
+			retries++
+			s.logRetryNextKeyBlocks(err, trusted.block, retries)
+			if err = waitNextKeyBlockRetry(ctx); err != nil {
+				return nil, trustedKeyBlock{}, err
+			}
+			continue
+		}
+
+		if !advanced {
+			s.log.Info().
+				Str("from", storage.FormatBlockRef(trusted.block)).
+				Int("verified", verified).
+				Msg("next key block lookup did not advance")
+			break
+		}
+		retries = 0
+	}
+
+	s.log.Info().
+		Str("trusted_key", storage.FormatBlockRef(trusted.block)).
+		Int("candidates", len(candidates)).
+		Msg("key block proof chain verified")
+	return candidates, trusted, nil
+}
+
+func (s *Syncer) verifyKeyBlockBatch(ctx context.Context, trusted *trustedKeyBlock, candidates *[]keyBlockCandidate, blocks []ton.BlockIDExt, verified *int) (bool, error) {
+	advanced := false
+	firstAccepted := ton.BlockIDExt{}
+	lastAccepted := ton.BlockIDExt{}
+	accepted := 0
+
 	for idx, block := range blocks {
 		if block.Equals(&trusted.block) || block.SeqNo <= trusted.block.SeqNo {
 			continue
-		}
-		if block.SeqNo > latest.SeqNo {
-			break
 		}
 
 		s.log.Debug().
 			Str("block", storage.FormatBlockRef(block)).
 			Str("trusted_key", storage.FormatBlockRef(trusted.block)).
-			Str("latest_key", storage.FormatBlockRef(latest)).
 			Int("index", idx+1).
-			Int("key_blocks", len(blocks)).
+			Int("batch", len(blocks)).
 			Msg("verifying key block proof in chain")
 
-		next, err := s.verifyMasterchainBlockFromTrustedKey(ctx, trusted, block, true)
+		next, err := s.verifyMasterchainBlockFromTrustedKey(ctx, *trusted, block, true)
 		if err != nil {
-			return nil, trustedKeyBlock{}, fmt.Errorf("verify key block %s after %s: %w", storage.FormatBlockRef(block), storage.FormatBlockRef(trusted.block), err)
+			return advanced, fmt.Errorf("verify key block %s after %s: %w", storage.FormatBlockRef(block), storage.FormatBlockRef(trusted.block), err)
 		}
-		trusted = next
-		candidates = append(candidates, keyBlockCandidate{
+
+		*trusted = next
+		*candidates = append(*candidates, keyBlockCandidate{
 			block: trusted.block,
 			utime: trusted.utime,
 		})
-		verified++
+		*verified = *verified + 1
+		if accepted == 0 {
+			firstAccepted = trusted.block
+		}
+		lastAccepted = trusted.block
+		accepted++
+		advanced = true
 
-		if shouldLogKeyBlockProgress(verified, len(blocks)) {
+		if shouldLogKeyBlockProgress(*verified, 0) {
 			s.log.Info().
 				Str("block", storage.FormatBlockRef(trusted.block)).
-				Str("latest", storage.FormatBlockRef(latest)).
-				Int("verified", verified).
-				Int("key_blocks", len(blocks)).
+				Int("verified", *verified).
 				Msg("key block proof download and verification progress")
 		}
 	}
 
-	s.log.Info().
-		Str("trusted_key", storage.FormatBlockRef(trusted.block)).
-		Str("latest_key", storage.FormatBlockRef(latest)).
-		Int("candidates", len(candidates)).
-		Msg("key block proof chain verified")
-	return candidates, trusted, nil
+	evt := s.log.Debug().
+		Str("current", storage.FormatBlockRef(trusted.block)).
+		Int("batch", len(blocks)).
+		Int("accepted", accepted).
+		Int("verified", *verified)
+	if accepted > 0 {
+		evt = evt.
+			Str("first", storage.FormatBlockRef(firstAccepted)).
+			Str("last", storage.FormatBlockRef(lastAccepted)).
+			Uint32("first_seqno", firstAccepted.SeqNo).
+			Uint32("last_seqno", lastAccepted.SeqNo)
+	}
+	evt.Msg("verified next key block id batch")
+
+	return advanced, nil
+}
+
+func (s *Syncer) logRetryNextKeyBlocks(err error, from ton.BlockIDExt, retries int) {
+	evt := s.log.Debug()
+	if retries == 1 || retries%keyBlockLookupRetryLogEach == 0 {
+		evt = s.log.Warn()
+	}
+	evt.
+		Err(err).
+		Str("from", storage.FormatBlockRef(from)).
+		Uint32("from_seqno", from.SeqNo).
+		Int("attempt", retries).
+		Dur("retry_in", keyBlockLookupRetryDelay).
+		Msg("next key block lookup failed, retrying same verified key block")
+}
+
+func waitNextKeyBlockRetry(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(keyBlockLookupRetryDelay):
+		return nil
+	}
 }
 
 func (s *Syncer) trustedZeroState(ctx context.Context, zeroBlock ton.BlockIDExt) (trustedKeyBlock, error) {

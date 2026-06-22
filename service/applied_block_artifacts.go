@@ -32,6 +32,9 @@ func preparedBlockCheckpointArtifacts(block PreparedBlock, splitDepth uint32) (*
 	if len(block.Meta.PrevRefs) > 0 {
 		links = make([]storage.ServedBlockLink, 0, len(block.Meta.PrevRefs))
 		for _, prev := range block.Meta.PrevRefs {
+			if prev.SeqNo == 0 {
+				continue
+			}
 			links = append(links, storage.ServedBlockLink{Prev: prev, Next: block.ID})
 		}
 	}

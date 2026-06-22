@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -33,9 +32,6 @@ import (
 const (
 	maxNodeBOCCells = 4_000_000_000
 	topShard        = int64(-1 << 63)
-
-	startupZeroStateRetry          = 5 * time.Second
-	startupZeroStateAttemptTimeout = 45 * time.Second
 )
 
 var GitCommit = "unknown"
@@ -325,6 +321,16 @@ func main() {
 		logger.Error().Err(err).Msg("failed to load storage cell memtable stop writes threshold option")
 		os.Exit(1)
 	}
+	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage large boc shard read workers option")
+		os.Exit(1)
+	}
+	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage persistent state large boc batch size option")
+		os.Exit(1)
+	}
 	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to load storage artifact file max open option")
@@ -342,6 +348,8 @@ func main() {
 		Int("decoded_cell_cache_max_entries", decodedCellCacheOpts.MaxEntries).
 		Int("cell_shard_memtable_size", cellShardMemTableSize).
 		Int("cell_memtable_stop_writes_threshold", cellMemTableStopWritesThreshold).
+		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
+		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
 		Int("artifact_file_max_open", artifactFileMaxOpen).
 		Msg("opening storage")
 	store, err := pebblestore.Open(pebblestore.Options{
@@ -355,6 +363,7 @@ func main() {
 		DecodedCellCacheMaxEntries:      decodedCellCacheOpts.MaxEntries,
 		CellShardMemTableSize:           cellShardMemTableSize,
 		CellMemTableStopWritesThreshold: cellMemTableStopWritesThreshold,
+		LargeBOCShardReadWorkers:        largeBOCShardReadWorkers,
 		ArtifactFileMaxOpen:             artifactFileMaxOpen,
 	})
 	if err != nil {
@@ -371,11 +380,6 @@ func main() {
 	opts.StateFilesDir = stateFilesDir
 	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
 	opts.LiveBlockCache = liveBlockCache
-	serviceCallbacks := &serviceP2PCallbacks{}
-	opts.CompressedState = serviceCallbacks
-	opts.SyncLag = serviceCallbacks
-	opts.SignatureVerifier = serviceCallbacks
-	opts.BroadcastAdmission = serviceCallbacks
 	storageClosed := false
 	closeStore := func() {
 		if storageClosed {
@@ -445,9 +449,15 @@ func main() {
 		ArchiveFromZero:                         archiveFromZero,
 		StorageDir:                              storageDir,
 		DisableStateSerialization:               cfg.DisableStateSerialization,
+		PersistentStateLargeBOCBatchSize:        persistentStateLargeBOCBatchSize,
+		StateSerializeOnePass:                   cfg.Storage.StateSerializeOnePass,
 		SyncObserver:                            syncObserver,
 	})
-	serviceCallbacks.set(svc)
+	node.SetRuntimeCallbacks(svc)
+	if currentStatePublisher != nil {
+		currentStatePublisher.SetNonfinalCellLoader(svc.NonfinalCellLoader())
+		node.SetBlockCacheObserver(currentStatePublisher)
+	}
 	if runtimeMetrics != nil {
 		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
 			ServiceStatusReader: svc.StatusSnapshot,
@@ -472,6 +482,7 @@ func main() {
 			NonFinal:            liteOpts.NonFinalEnabled,
 			SendMessageTVMTrace: *liteSendMessageTVMTraceFlag,
 			ZeroState:           zeroStateIDFromBlock(globalConfigZeroState),
+			RequestLimits:       liteOpts.Limits,
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to initialize liteserver")
@@ -482,25 +493,6 @@ func main() {
 	if err = node.Start(ctx); err != nil {
 		logger.Error().Err(err).Msg("failed to start p2p node")
 		os.Exit(1)
-	}
-	initBlock, err := node.InitBlock()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load configured init block")
-		stop()
-		node.Wait()
-		os.Exit(1)
-	}
-	if startupZeroStateRequired(*fromZeroFlag, initBlock, liteOpts.Enabled) || archiveFromZero {
-		if err = ensureZeroStateBeforeInitialSync(ctx, logger, node); err != nil {
-			if errors.Is(err, context.Canceled) {
-				node.Wait()
-				return
-			}
-			logger.Error().Err(err).Msg("failed to prepare zero state before initial sync")
-			stop()
-			node.Wait()
-			os.Exit(1)
-		}
 	}
 
 	var blockSyncWG sync.WaitGroup
@@ -545,6 +537,10 @@ func main() {
 		Bool("liteserver_send_message_tvm_trace", *liteSendMessageTVMTraceFlag).
 		Int64("liteserver_send_message_broadcast_bytes_per_second", opts.ExternalBroadcastCapacity.BytesPerSecond).
 		Dur("liteserver_send_message_broadcast_max_delay", opts.ExternalBroadcastCapacity.MaxDelay).
+		Int("liteserver_capacity_per_ip", liteOpts.Limits.CapacityPerIP).
+		Float64("liteserver_cooling_per_sec", liteOpts.Limits.CoolingPerSec).
+		Int("liteserver_max_connections_per_ip", liteOpts.Limits.MaxConnectionsPerIP).
+		Dur("liteserver_max_keep_alive", liteOpts.Limits.MaxKeepAlive).
 		Bool("metrics", metricsOpts.Enabled).
 		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
 		Str("pprof_addr", fallbackString(strings.TrimSpace(*pprofAddrFlag), "<disabled>")).
@@ -559,6 +555,9 @@ func main() {
 		Uint32("sync_backpressure_windows", syncBackpressureWindows).
 		Dur("archive_checkpoint_period", *archiveCheckpointPeriodFlag).
 		Int("archive_prefetch_windows", *archivePrefetchWindowsFlag).
+		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
+		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
+		Bool("state_serialize_one_pass", cfg.Storage.StateSerializeOnePass).
 		Bool("disable_state_serialization", cfg.DisableStateSerialization).
 		Msg("service started")
 

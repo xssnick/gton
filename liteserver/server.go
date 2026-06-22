@@ -85,6 +85,7 @@ type Options struct {
 	ZeroState           ton.ZeroStateIDExt
 	Version             int32
 	Capabilities        int64
+	RequestLimits       RequestLimitOptions
 }
 
 type Server struct {
@@ -101,9 +102,12 @@ type Server struct {
 	capabilities        int64
 	now                 func() time.Time
 	tvm                 *tvm.TVM
+	requestLimits       RequestLimitOptions
 
 	sendMessageCache       *sendMessageCache
 	externalMessageLimiter *extmsg.AddressLimiter
+	requestLimiter         *requestLimiter
+	connectionTracker      *clientConnectionTracker
 
 	server *liteclient.Server
 	cancel context.CancelFunc
@@ -140,6 +144,9 @@ func New(opts Options) (*Server, error) {
 	if capabilities == 0 {
 		capabilities = DefaultCapabilities
 	}
+	if err := validateRequestLimitOptions(opts.RequestLimits); err != nil {
+		return nil, err
+	}
 
 	return &Server{
 		log:                    log,
@@ -155,8 +162,11 @@ func New(opts Options) (*Server, error) {
 		capabilities:           capabilities,
 		now:                    time.Now,
 		tvm:                    tvm.NewTVM(),
+		requestLimits:          opts.RequestLimits,
 		sendMessageCache:       newSendMessageCache(),
 		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
+		requestLimiter:         newRequestLimiter(opts.RequestLimits),
+		connectionTracker:      newClientConnectionTracker(opts.RequestLimits),
 		blockProofBases:        make(map[storage.BlockRootHash]*blockProofBase),
 	}, nil
 }
@@ -169,17 +179,75 @@ func (s *Server) Start(ctx context.Context) error {
 	configureLiteclientLogger(s.log)
 
 	srv := liteclient.NewServer([]ed25519.PrivateKey{s.privateKey})
+	if s.requestLimiter != nil {
+		srv.SetQueryPrecheck(s.precheckQueryRequest)
+	}
 	srv.SetQueryHandler(s.handleQueryRequest)
 	srv.SetConnectionHook(func(client *liteclient.ServerClient) error {
-		s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port()).Msg("accepted liteserver connection")
+		event := s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port())
+		if s.connectionTracker != nil {
+			connections, err := s.connectionTracker.accept(client, s.now())
+			if err != nil {
+				event.Msg("rejected liteserver connection")
+				return err
+			}
+			event = event.Int("connections", connections)
+		}
+		event.Msg("accepted liteserver connection")
 		return nil
 	})
 	srv.SetDisconnectHook(func(client *liteclient.ServerClient) {
-		s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port()).Msg("closed liteserver connection")
+		event := s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port())
+		if s.connectionTracker != nil {
+			connections := s.connectionTracker.disconnect(client)
+			event = event.Int("connections", connections)
+		}
+		event.Msg("closed liteserver connection")
 	})
 	s.server = srv
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
+
+	if s.connectionTracker != nil && s.connectionTracker.keepAliveEnabled() {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			ticker := time.NewTicker(liteserverConnectionCleanupInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
+					closed := s.connectionTracker.closeIdle(s.now())
+					if closed > 0 {
+						s.log.Debug().Int("closed", closed).Msg("closed idle liteserver connections")
+					}
+				}
+			}
+		}()
+	}
+	if s.requestLimiter != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			ticker := time.NewTicker(requestLimitPruneInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
+					deleted := s.requestLimiter.prune(s.now())
+					if deleted > 0 {
+						s.log.Debug().Int("deleted", deleted).Msg("pruned idle liteserver request limit buckets")
+					}
+				}
+			}
+		}()
+	}
 
 	errCh := make(chan error, 1)
 	s.wg.Add(1)
@@ -286,7 +354,43 @@ func splitLiteclientLogRemote(args []any, fallback string) (string, string) {
 	return remoteAddr, msg
 }
 
+func (s *Server) precheckQueryRequest(ctx context.Context, client *liteclient.ServerClient) (tl.Serializable, bool) {
+	now := s.now()
+	if s.requestLimiter != nil && !s.requestLimiter.allow(client.IP(), now) {
+		resp := ton.LSError{Code: errCodeTooManyRequests, Text: "too many requests"}
+		timing := queryLogTiming{
+			errorReason: queryErrorReasonRateLimited,
+		}
+		if s.queryObserver != nil {
+			s.queryObserver.ObserveLiteserverQuery(queryObservationFromResponse(resp, timing))
+		}
+		if event := s.log.Debug(); event.Enabled() {
+			event.
+				Str("query", timing.queryName()).
+				Str("response", liteserverTypeName(resp)).
+				Str("remote_ip", client.IP()).
+				Uint16("remote_port", client.Port()).
+				Int32("error_code", resp.Code).
+				Str("error_reason", timing.errorReason).
+				Msg("rate limited liteserver query")
+		}
+		return resp, true
+	}
+	if s.connectionTracker != nil && s.connectionTracker.keepAliveEnabled() {
+		s.connectionTracker.beginRequest(client, now)
+	}
+
+	return nil, false
+}
+
 func (s *Server) handleQueryRequest(ctx context.Context, client *liteclient.ServerClient, data tl.Serializable) (tl.Serializable, error) {
+	if s.connectionTracker != nil && s.connectionTracker.keepAliveEnabled() {
+		if s.requestLimiter == nil {
+			s.connectionTracker.beginRequest(client, s.now())
+		}
+		defer s.connectionTracker.endRequest(client, s.now())
+	}
+
 	event := s.log.Debug()
 	if !event.Enabled() && s.queryObserver == nil {
 		return s.handleQueryData(ctx, data), nil
@@ -347,12 +451,6 @@ func liteserverQueryLogName(data any) string {
 	switch q := data.(type) {
 	case liteclient.LiteServerQuery:
 		return liteserverQueryLogName(q.Data)
-	case tl.Raw:
-		items, err := parseQuerySequence(q)
-		if err != nil {
-			return "raw"
-		}
-		return liteserverQuerySequenceLogName(items)
 	case []tl.Serializable:
 		return liteserverQuerySequenceLogName(q)
 	default:

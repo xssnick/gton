@@ -26,15 +26,15 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
 	proofBOC := []byte{0x70, 0x71, 0x72}
 
-	if err := store.SaveArchiveImport(&tnstore.ServedArchiveImport{
-		FullBlocks: []*tnstore.ServedBlockFull{{
+	if _, err := store.SaveStateCheckpointEntries(context.Background(), []tnstore.StateCheckpointBlock{{
+		Artifact: &tnstore.ServedBlockFull{
 			ID:     downloaded.ID,
 			Block:  downloaded.BlockBOC,
 			Proof:  proofBOC,
 			Meta:   downloaded.Meta,
 			IsLink: downloaded.IsLink,
-		}},
-	}); err != nil {
+		},
+	}}, tnstore.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save fixture block: %v", err)
 	}
 

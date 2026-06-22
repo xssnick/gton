@@ -177,7 +177,7 @@ func (s *Store) persistentStateFileSnapshot(ctx context.Context) ([]persistentSt
 
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: bytes.Clone(hotPrefixStateFileRef),
-		UpperBound: appendPrefixUpperBound(hotPrefixStateFileRef),
+		UpperBound: prefixUpperBound(hotPrefixStateFileRef),
 	})
 	if err != nil {
 		return nil, err

@@ -126,32 +126,6 @@ func (s *Server) loadStateRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Ce
 	return root, nil
 }
 
-func (s *Server) loadStateRootWithBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, *cell.Cell, error) {
-	stateRootHash, err := s.loadStateRootHash(ctx, id)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	blockRoot, err := s.loadBlockRoot(ctx, id)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load block root for state %s: %w", storage.FormatBlockRef(id), err)
-	}
-
-	blockStateRootHash, err := stateRootHashFromBlock(id, blockRoot)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !bytes.Equal(blockStateRootHash, stateRootHash) {
-		return nil, nil, fmt.Errorf("state root hash mismatch for %s: meta=%x block=%x", storage.FormatBlockRef(id), stateRootHash, blockStateRootHash)
-	}
-
-	root, err := s.store.LoadStateCellTree(ctx, id, stateRootHash)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load state root %x for %s: %w", stateRootHash, storage.FormatBlockRef(id), err)
-	}
-	return root, blockRoot, nil
-}
-
 func (s *Server) loadStateRootHash(ctx context.Context, id ton.BlockIDExt) ([]byte, error) {
 	meta, err := s.store.BlockMeta(ctx, id)
 	if err != nil {

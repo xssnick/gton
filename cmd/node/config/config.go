@@ -20,7 +20,7 @@ const (
 	DefaultPath                             = "config.json"
 	DefaultGlobalConfigPath                 = "global.config.json"
 	DefaultGlobalConfigURL                  = "https://ton-blockchain.github.io/global.config.json"
-	DefaultSyncBefore                       = time.Hour
+	DefaultSyncBefore                       = 4 * time.Hour
 	ArchiveFromZeroSyncBefore               = int64(-1)
 	DefaultStateTTL                         = 2 * 24 * time.Hour
 	DefaultArchiveTTL                       = 7 * 24 * time.Hour
@@ -36,9 +36,11 @@ const (
 	DefaultDecodedCellCacheMaxEntries       = int64(1 << 20)
 	DefaultCellShardMemTable                = int64(256 << 20)
 	DefaultCellMemTableStopWritesThreshold  = int64(4)
+	DefaultLargeBOCShardReadWorkers         = int64(2)
+	DefaultPersistentStateLargeBOCBatchSize = int64(512 << 10)
 	DefaultArtifactFileMaxOpen              = int64(512)
 	DefaultLiteMasterBlockCache             = 128
-	DefaultLiteShardBlockCache              = 4096
+	DefaultLiteShardBlockCache              = 1024
 	DefaultLiteListen                       = "0.0.0.0:7445"
 	DefaultLiteSendMessageBroadcastMaxDelay = 100 * time.Millisecond
 	DefaultMetricsNamespace                 = "gton"
@@ -89,27 +91,38 @@ type DHT struct {
 }
 
 type Lite struct {
-	Enabled                            bool   `json:"enabled"`
-	NonFinalEnabled                    bool   `json:"non_final_enabled"`
-	Key                                []byte `json:"key"`
-	ListenAddr                         string `json:"listen_addr"`
-	MasterBlockCache                   int    `json:"master_block_cache"`
-	ShardBlockCache                    int    `json:"shard_block_cache"`
-	SendMessageBroadcastBytesPerSecond int64  `json:"send_message_broadcast_bytes_per_second"`
-	SendMessageBroadcastMaxDelayMS     int64  `json:"send_message_broadcast_max_delay_ms"`
+	Enabled                            bool       `json:"enabled"`
+	NonFinalEnabled                    bool       `json:"non_final_enabled"`
+	Key                                []byte     `json:"key"`
+	ListenAddr                         string     `json:"listen_addr"`
+	MasterBlockCache                   int        `json:"master_block_cache"`
+	ShardBlockCache                    int        `json:"shard_block_cache"`
+	SendMessageBroadcastBytesPerSecond int64      `json:"send_message_broadcast_bytes_per_second"`
+	SendMessageBroadcastMaxDelayMS     int64      `json:"send_message_broadcast_max_delay_ms"`
+	Limits                             LiteLimits `json:"limits"`
+}
+
+type LiteLimits struct {
+	CapacityPerIP       int64   `json:"capacity_per_ip"`
+	CoolingPerSec       float64 `json:"cooling_per_sec"`
+	MaxConnectionsPerIP int64   `json:"max_connections_per_ip"`
+	MaxKeepAliveSeconds int64   `json:"max_keep_alive_seconds"`
 }
 
 type Storage struct {
-	Dir                             string `json:"dir"`
-	CellTotalCacheSize              int64  `json:"cell_total_cache_size"`
-	DecodedCellCacheEnabled         bool   `json:"decoded_cell_cache_enabled"`
-	DecodedCellCacheShards          int64  `json:"decoded_cell_cache_shards"`
-	DecodedCellCacheBytesPerEntry   int64  `json:"decoded_cell_cache_bytes_per_entry"`
-	DecodedCellCacheMinEntries      int64  `json:"decoded_cell_cache_min_entries"`
-	DecodedCellCacheMaxEntries      int64  `json:"decoded_cell_cache_max_entries"`
-	CellShardMemTableSize           int64  `json:"cell_shard_memtable_size"`
-	CellMemTableStopWritesThreshold int64  `json:"cell_memtable_stop_writes_threshold"`
-	ArtifactFileMaxOpen             int64  `json:"artifact_file_max_open"`
+	Dir                              string `json:"dir"`
+	CellTotalCacheSize               int64  `json:"cell_total_cache_size"`
+	DecodedCellCacheEnabled          bool   `json:"decoded_cell_cache_enabled"`
+	DecodedCellCacheShards           int64  `json:"decoded_cell_cache_shards"`
+	DecodedCellCacheBytesPerEntry    int64  `json:"decoded_cell_cache_bytes_per_entry"`
+	DecodedCellCacheMinEntries       int64  `json:"decoded_cell_cache_min_entries"`
+	DecodedCellCacheMaxEntries       int64  `json:"decoded_cell_cache_max_entries"`
+	CellShardMemTableSize            int64  `json:"cell_shard_memtable_size"`
+	CellMemTableStopWritesThreshold  int64  `json:"cell_memtable_stop_writes_threshold"`
+	LargeBOCShardReadWorkers         int64  `json:"large_boc_shard_read_workers"`
+	PersistentStateLargeBOCBatchSize int64  `json:"persistent_state_large_boc_batch_size"`
+	StateSerializeOnePass            bool   `json:"state_serialize_one_pass"`
+	ArtifactFileMaxOpen              int64  `json:"artifact_file_max_open"`
 }
 
 type DecodedCellCacheOptions struct {
@@ -168,15 +181,18 @@ func defaultConfig() Config {
 			SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
 		},
 		Storage: Storage{
-			CellTotalCacheSize:              DefaultCellTotalCache,
-			DecodedCellCacheEnabled:         DefaultDecodedCellCacheEnabled,
-			DecodedCellCacheShards:          DefaultDecodedCellCacheShards,
-			DecodedCellCacheBytesPerEntry:   DefaultDecodedCellCacheBytesPerEntry,
-			DecodedCellCacheMinEntries:      DefaultDecodedCellCacheMinEntries,
-			DecodedCellCacheMaxEntries:      DefaultDecodedCellCacheMaxEntries,
-			CellShardMemTableSize:           DefaultCellShardMemTable,
-			CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
-			ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
+			CellTotalCacheSize:               DefaultCellTotalCache,
+			DecodedCellCacheEnabled:          DefaultDecodedCellCacheEnabled,
+			DecodedCellCacheShards:           DefaultDecodedCellCacheShards,
+			DecodedCellCacheBytesPerEntry:    DefaultDecodedCellCacheBytesPerEntry,
+			DecodedCellCacheMinEntries:       DefaultDecodedCellCacheMinEntries,
+			DecodedCellCacheMaxEntries:       DefaultDecodedCellCacheMaxEntries,
+			CellShardMemTableSize:            DefaultCellShardMemTable,
+			CellMemTableStopWritesThreshold:  DefaultCellMemTableStopWritesThreshold,
+			LargeBOCShardReadWorkers:         DefaultLargeBOCShardReadWorkers,
+			PersistentStateLargeBOCBatchSize: DefaultPersistentStateLargeBOCBatchSize,
+			StateSerializeOnePass:            false,
+			ArtifactFileMaxOpen:              DefaultArtifactFileMaxOpen,
 		},
 		Metrics: Metrics{
 			Namespace: DefaultMetricsNamespace,
@@ -240,16 +256,19 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
 	}
 	cfg.Storage = Storage{
-		Dir:                             storageDir,
-		CellTotalCacheSize:              DefaultCellTotalCache,
-		DecodedCellCacheEnabled:         DefaultDecodedCellCacheEnabled,
-		DecodedCellCacheShards:          DefaultDecodedCellCacheShards,
-		DecodedCellCacheBytesPerEntry:   DefaultDecodedCellCacheBytesPerEntry,
-		DecodedCellCacheMinEntries:      DefaultDecodedCellCacheMinEntries,
-		DecodedCellCacheMaxEntries:      DefaultDecodedCellCacheMaxEntries,
-		CellShardMemTableSize:           DefaultCellShardMemTable,
-		CellMemTableStopWritesThreshold: DefaultCellMemTableStopWritesThreshold,
-		ArtifactFileMaxOpen:             DefaultArtifactFileMaxOpen,
+		Dir:                              storageDir,
+		CellTotalCacheSize:               DefaultCellTotalCache,
+		DecodedCellCacheEnabled:          DefaultDecodedCellCacheEnabled,
+		DecodedCellCacheShards:           DefaultDecodedCellCacheShards,
+		DecodedCellCacheBytesPerEntry:    DefaultDecodedCellCacheBytesPerEntry,
+		DecodedCellCacheMinEntries:       DefaultDecodedCellCacheMinEntries,
+		DecodedCellCacheMaxEntries:       DefaultDecodedCellCacheMaxEntries,
+		CellShardMemTableSize:            DefaultCellShardMemTable,
+		CellMemTableStopWritesThreshold:  DefaultCellMemTableStopWritesThreshold,
+		LargeBOCShardReadWorkers:         DefaultLargeBOCShardReadWorkers,
+		PersistentStateLargeBOCBatchSize: DefaultPersistentStateLargeBOCBatchSize,
+		StateSerializeOnePass:            false,
+		ArtifactFileMaxOpen:              DefaultArtifactFileMaxOpen,
 	}
 
 	return cfg, nil
@@ -412,6 +431,36 @@ func (cfg Config) CellMemTableStopWritesThreshold() (int, error) {
 	maxInt := int64(int(^uint(0) >> 1))
 	if value > maxInt {
 		return 0, fmt.Errorf("storage.cell_memtable_stop_writes_threshold is too large")
+	}
+	return int(value), nil
+}
+
+func (cfg Config) LargeBOCShardReadWorkers() (int, error) {
+	if cfg.Storage.LargeBOCShardReadWorkers < 0 {
+		return 0, fmt.Errorf("storage.large_boc_shard_read_workers cannot be negative")
+	}
+	value := cfg.Storage.LargeBOCShardReadWorkers
+	if value == 0 {
+		value = DefaultLargeBOCShardReadWorkers
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if value > maxInt {
+		return 0, fmt.Errorf("storage.large_boc_shard_read_workers is too large")
+	}
+	return int(value), nil
+}
+
+func (cfg Config) PersistentStateLargeBOCBatchSize() (int, error) {
+	if cfg.Storage.PersistentStateLargeBOCBatchSize < 0 {
+		return 0, fmt.Errorf("storage.persistent_state_large_boc_batch_size cannot be negative")
+	}
+	value := cfg.Storage.PersistentStateLargeBOCBatchSize
+	if value == 0 {
+		value = DefaultPersistentStateLargeBOCBatchSize
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if value > maxInt {
+		return 0, fmt.Errorf("storage.persistent_state_large_boc_batch_size is too large")
 	}
 	return int(value), nil
 }

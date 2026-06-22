@@ -3,7 +3,6 @@ package liteserver
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -34,12 +33,6 @@ func (s *Server) handleQueryData(ctx context.Context, data any) tl.Serializable 
 		return s.handleQueryData(ctx, q.Data)
 	case liteclient.LiteServerQueryPrefix:
 		return ton.LSError{Code: errCodeProtoViolation, Text: "missing liteserver function after queryPrefix"}
-	case tl.Raw:
-		items, err := parseQuerySequence(q)
-		if err != nil {
-			return ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
-		}
-		return s.handleQuerySequence(ctx, items)
 	case []tl.Serializable:
 		return s.handleQuerySequence(ctx, q)
 	default:
@@ -55,14 +48,6 @@ func (s *Server) handleQueryDataWithTiming(ctx context.Context, data any) (tl.Se
 		started := time.Now()
 		resp := ton.LSError{Code: errCodeProtoViolation, Text: "missing liteserver function after queryPrefix"}
 		return resp, queryLogTiming{query: liteserverTypeName(q), duration: time.Since(started)}
-	case tl.Raw:
-		started := time.Now()
-		items, err := parseQuerySequence(q)
-		if err != nil {
-			resp := ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
-			return resp, queryLogTiming{query: "raw", duration: time.Since(started)}
-		}
-		return s.handleQuerySequenceWithTiming(ctx, items)
 	case []tl.Serializable:
 		return s.handleQuerySequenceWithTiming(ctx, q)
 	default:
@@ -86,24 +71,6 @@ func (s *Server) handleStandaloneQueryWithTiming(ctx context.Context, query any)
 		query:    liteserverQueryLogName(query),
 		duration: time.Since(started),
 	}
-}
-
-func parseQuerySequence(raw tl.Raw) ([]tl.Serializable, error) {
-	data := []byte(raw)
-	items := make([]tl.Serializable, 0, 2)
-	for len(data) > 0 {
-		var item tl.Serializable
-		rest, err := tl.Parse(&item, data, true)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse liteserver query: %w", err)
-		}
-		items = append(items, item)
-		data = rest
-	}
-	if len(items) == 0 {
-		return nil, fmt.Errorf("empty liteserver query")
-	}
-	return items, nil
 }
 
 func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.Serializable) (tl.Serializable, queryLogTiming) {
@@ -192,6 +159,9 @@ func (s *Server) waitMasterchainSeqno(ctx context.Context, query ton.WaitMasterc
 
 	seqno := uint32(query.Seqno)
 	timeout := time.Duration(query.Timeout) * time.Millisecond
+	if s.requestLimits.MaxKeepAlive > 0 && timeout > s.requestLimits.MaxKeepAlive {
+		timeout = s.requestLimits.MaxKeepAlive
+	}
 	return waitMasterchainError(s.store.WaitMasterchainSeqno(ctx, seqno, timeout))
 }
 

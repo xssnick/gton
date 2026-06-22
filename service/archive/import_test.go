@@ -15,60 +15,47 @@ import (
 
 	"github.com/xssnick/gton/service/archive/packfile"
 	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestImportFileStoresFullBlocksAndNextLinks(t *testing.T) {
-	store := openTestPebbleStore(t)
-
+func TestImportBytesBuildsFullBlocksAndNextLinks(t *testing.T) {
 	block10, block10Data := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
 		{name: testEntryName("block", block10), data: block10Data},
 		{name: testEntryName("proof", block10), data: []byte{0x10, 0x02}},
 		{name: "ignored_file", data: []byte{0x99}},
 	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read test package: %v", err)
+	}
 
-	var imported []ton.BlockIDExt
-	stats, err := ImportFile(context.Background(), &Downloaded{
+	imported, err := ImportBytes(context.Background(), &Downloaded{
 		MasterchainSeqno: 100,
 		ArchiveID:        777,
 		Peer:             "peer",
-		Path:             path,
 		Bytes:            1234,
-	}, ImportSink{
-		Writer: store,
-		FullBlock: func(block *storage.ServedBlockFull) error {
-			imported = append(imported, block.ID)
-			return nil
-		},
-	})
+	}, data)
 	if err != nil {
 		t.Fatalf("import archive: %v", err)
 	}
+	stats := imported.Stats
 
 	if stats.Entries != 2 || stats.IgnoredEntries != 1 || stats.Blocks != 1 || stats.Proofs != 1 || stats.ProofLinks != 0 || stats.FullBlocks != 1 || stats.Links != 0 {
 		t.Fatalf("unexpected stats: %#v", stats)
 	}
-	if len(imported) != 1 || !imported[0].Equals(&block10) {
-		t.Fatalf("unexpected direct imports: %#v", imported)
+	if len(imported.FullBlocks) != 1 || !imported.FullBlocks[0].ID.Equals(&block10) {
+		t.Fatalf("unexpected imported blocks: %#v", imported.FullBlocks)
 	}
-
-	full10, err := store.BlockFull(context.Background(), block10)
-	if err != nil {
-		t.Fatalf("load block 10: %v", err)
-	}
-	if full10.IsLink || string(full10.Proof) != string([]byte{0x10, 0x02}) {
+	full10 := imported.FullBlocks[0]
+	if full10.IsLink || string(full10.Proof) != string([]byte{0x10, 0x02}) || !bytes.Equal(full10.Block, block10Data) {
 		t.Fatalf("unexpected block 10 full: %#v", full10)
 	}
-
 }
 
 func TestImportBytesStoresInlineBlocks(t *testing.T) {
-	store := openTestPebbleStore(t)
-
 	block, blockData := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
 		{name: testEntryName("block", block), data: blockData},
@@ -99,15 +86,7 @@ func TestImportBytesStoresInlineBlocks(t *testing.T) {
 	if imported.Stats.BlockPrepareElapsed <= 0 {
 		t.Fatal("expected block prepare timing")
 	}
-
-	if err = imported.Store(ImportSink{Writer: store}); err != nil {
-		t.Fatalf("store streamed import: %v", err)
-	}
-
-	full, err := store.BlockFull(context.Background(), block)
-	if err != nil {
-		t.Fatalf("load streamed block: %v", err)
-	}
+	full := imported.FullBlocks[0]
 	if string(full.Block) != string(blockData) || string(full.Proof) != string([]byte{0x12, 0x02}) {
 		t.Fatalf("unexpected streamed full block: %#v", full)
 	}
@@ -325,25 +304,25 @@ func TestParseEntryName(t *testing.T) {
 	}
 }
 
-func TestImportFileSeqRangeTracksRequestedShard(t *testing.T) {
-	store := openTestPebbleStore(t)
-
+func TestImportBytesSeqRangeTracksRequestedShard(t *testing.T) {
 	master, masterData := readMasterchainBlockFixture(t)
 	path := writeTestPackage(t, []testEntry{
 		{name: testEntryName("block", master), data: masterData},
 		{name: testEntryName("proof", master), data: []byte{0x21}},
 	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read test package: %v", err)
+	}
 
-	stats, err := ImportFile(context.Background(), &Downloaded{
+	imported, err := ImportBytes(context.Background(), &Downloaded{
 		MasterchainSeqno: master.SeqNo,
 		Shard:            ShardID{Workchain: -1, Shard: topShard},
-		Path:             path,
-	}, ImportSink{
-		Writer: store,
-	})
+	}, data)
 	if err != nil {
 		t.Fatalf("import archive: %v", err)
 	}
+	stats := imported.Stats
 	if stats.FirstSeqno != master.SeqNo || stats.LastSeqno != master.SeqNo {
 		t.Fatalf("unexpected masterchain seq range: first=%d last=%d", stats.FirstSeqno, stats.LastSeqno)
 	}
@@ -398,17 +377,6 @@ func readMasterchainBlockFixture(t *testing.T) (ton.BlockIDExt, []byte) {
 		RootHash:  rootHash,
 		FileHash:  fileHash,
 	}, blockData
-}
-
-func openTestPebbleStore(tb testing.TB) *pebblestore.Store {
-	tb.Helper()
-
-	store, err := pebblestore.Open(pebblestore.Options{Dir: tb.TempDir()})
-	if err != nil {
-		tb.Fatalf("open pebble store: %v", err)
-	}
-	tb.Cleanup(func() { _ = store.Close() })
-	return store
 }
 
 func TestShardIDContainsBlock(t *testing.T) {

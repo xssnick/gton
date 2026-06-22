@@ -59,10 +59,6 @@ type broadcastPayload struct {
 	err        error
 }
 
-func newSerializedBroadcastPayload(msg any) *broadcastPayload {
-	return &broadcastPayload{msg: msg}
-}
-
 func newKnownBroadcastPayload(payload []byte) *broadcastPayload {
 	return &broadcastPayload{
 		payload:    payload,
@@ -145,10 +141,6 @@ func (req rebroadcastRequest) payloadLen() int {
 	return 0
 }
 
-func (s *overlaySubscription) handleOverlayBroadcast(peer *overlayPeer, msg any, delivery Delivery, trusted bool, sourcePeerID PeerID) error {
-	return s.handleOverlayBroadcastPayload(peer, msg, newSerializedBroadcastPayload(msg), delivery, trusted, sourcePeerID)
-}
-
 func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) error {
 	if !s.isActive() {
 		return nil
@@ -189,17 +181,13 @@ func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, m
 	return nil
 }
 
-func (s *overlaySubscription) classifyBroadcast(peer *overlayPeer, msg any, payload []byte, delivery Delivery, trusted bool, sourcePeerID PeerID) *acceptedBroadcast {
-	if len(payload) == 0 {
-		return nil
-	}
-	accepted, _ := s.classifyBroadcastPayload(peer, msg, newKnownBroadcastPayload(payload), delivery, trusted, sourcePeerID)
-	return accepted
-}
-
 func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) (*acceptedBroadcast, error) {
 	if sourcePeerID.IsZero() && peer != nil {
 		sourcePeerID = peer.id
+	}
+	if s.spec.Kind == overlayKindCustomFixed && sourcePeerID == s.node.localID {
+		s.node.noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "self")
+		return nil, nil
 	}
 
 	switch data := msg.(type) {
@@ -335,6 +323,10 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		)
 	case IhrMessageBroadcast:
 		kind := "tonNode.ihrMessageBroadcast"
+		if s.spec.Kind == overlayKindCustomFixed {
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "unsupported_custom_broadcast")
+			return nil, nil
+		}
 		if len(data.Message.Data) == 0 {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil, nil
@@ -484,6 +476,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	downloaded, sigSet, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
 	if err != nil {
 		stateNotReady := isBroadcastDecompressionStateNotReady(err)
+		var rebroadcast *rebroadcastRequest
 		if stateNotReady {
 			pendingState, ok := broadcastDecompressionStateNotReady(err)
 			if !ok {
@@ -527,6 +520,13 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 				return nil, nil
 			}
 
+			var payloadErr error
+			rebroadcast, payloadErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+			if payloadErr != nil {
+				s.node.deduper.Forget(fingerprint)
+				return nil, payloadErr
+			}
+
 			s.node.schedulePendingBlockBroadcastDecode(pendingBlockBroadcastDecode{
 				fingerprint:  fingerprint,
 				overlay:      s.spec.Name,
@@ -539,6 +539,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 				msg:          msg,
 				prev:         pendingState.prev,
 				proofRoot:    pendingState.proofRoot,
+				rebroadcast:  rebroadcast,
 			})
 			s.log.Debug().
 				Err(err).
@@ -556,11 +557,6 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 
 		if !stateNotReady {
 			return nil, nil
-		}
-		rebroadcast, payloadErr := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
-		if payloadErr != nil {
-			s.node.deduper.Forget(fingerprint)
-			return nil, payloadErr
 		}
 		accepted := &acceptedBroadcast{
 			fingerprint: fingerprint,
@@ -613,22 +609,6 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 		return nil, nil
 	}
 
-	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
-	if err != nil {
-		s.node.deduper.Forget(fingerprint)
-		return nil, err
-	}
-
-	accepted := &acceptedBroadcast{
-		fingerprint: fingerprint,
-		deduped:     true,
-		block:       block.Copy(),
-		rebroadcast: rebroadcast,
-	}
-	if !s.node.nonfinalBlockCacheEnabled() {
-		return accepted, nil
-	}
-
 	decodeStarted := s.node.startBroadcastPipelineStage()
 	downloaded, err := decodeBlockCandidateBroadcast(msg)
 	decodeResult := broadcastPipelineResultSuccess
@@ -641,13 +621,26 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 			Err(err).
 			Str("block", formatBlockRef(block)).
 			Str("kind", kind).
-			Msg("skip shard block candidate cache update because payload decode failed")
-	} else {
-		downloaded.SourcePeerID = sourcePeerID
-		s.node.rememberShardBlockCandidate(downloaded)
+			Msg("dropping block candidate broadcast because payload decode failed")
+		s.node.noteBroadcastDrop(s.spec.Name, kind, "decode_failed")
+		return nil, nil
 	}
-	if downloaded != nil {
-		s.node.publishNonfinalDownloadedBlock(downloaded, storage.LiveBlockNonfinalCandidate)
+
+	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+	if err != nil {
+		s.node.deduper.Forget(fingerprint)
+		return nil, err
+	}
+
+	downloaded.SourcePeerID = sourcePeerID
+	s.node.rememberShardBlockCandidate(downloaded)
+	s.node.publishNonfinalDownloadedBlock(downloaded, storage.LiveBlockNonfinalCandidate)
+
+	accepted := &acceptedBroadcast{
+		fingerprint: fingerprint,
+		deduped:     true,
+		block:       block.Copy(),
+		rebroadcast: rebroadcast,
 	}
 
 	return accepted, nil
@@ -672,7 +665,11 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		if accepted.event.Downloaded != nil && accepted.event.Downloaded.ID.Equals(&accepted.event.Block) {
 			cacheStarted := n.startBroadcastPipelineStage()
 			cacheResult := broadcastPipelineResultMiss
-			if n.rememberShardBroadcastBlock(accepted.event.Downloaded) {
+			if isMasterchainBlock(accepted.event.Downloaded.ID) {
+				if n.rememberMasterchainNextBroadcastBlock(accepted.event.Downloaded) {
+					cacheResult = broadcastPipelineResultSuccess
+				}
+			} else if n.rememberShardBroadcastBlock(accepted.event.Downloaded) {
 				cacheResult = broadcastPipelineResultSuccess
 			}
 			n.observeBroadcastPipelineStageSince(cacheStarted, broadcastPipelineStageHotCacheNotify, accepted.event.Kind, accepted.event.Delivery, cacheResult)

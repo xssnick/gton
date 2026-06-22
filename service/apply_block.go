@@ -104,11 +104,23 @@ func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.
 		downloaded.Meta.ID = id
 	}
 	if persistMeta {
-		if err = store.SaveBlockMeta(downloaded.Meta); err != nil {
+		if err = store.SaveBlockMeta(blockMetaWithoutArtifactFlags(downloaded.Meta)); err != nil {
 			return PreparedBlock{}, fmt.Errorf("persist stored block meta %s: %w", tnstore.FormatBlockRef(id), err)
 		}
 	}
 	return downloaded, nil
+}
+
+func blockMetaWithoutArtifactFlags(meta *tnstore.BlockMeta) *tnstore.BlockMeta {
+	cloned := meta.Clone()
+	cloned.Flags &^= tnstore.BlockMetaHasServedFull |
+		tnstore.BlockMetaServedFullIsLink |
+		tnstore.BlockMetaHasBlockData |
+		tnstore.BlockMetaHasProofBlock |
+		tnstore.BlockMetaHasProofBlockLink |
+		tnstore.BlockMetaHasProofKeyBlock |
+		tnstore.BlockMetaHasProofKeyBlockLink
+	return cloned
 }
 
 // ApplyBlock validates that downloaded contains a state transition from current

@@ -36,8 +36,6 @@ const (
 	persistentStateSplitPartImportWorkers = 2
 	persistentStateSplitChunkParallelism  = 32
 	persistentStateSplitRetryDelay        = time.Second
-	zeroStateDownloadWaves                = 3
-	zeroStatePeerDiscoveryDelay           = dhtSeedCooldownMinDelay + dhtSeedCooldownJitter + time.Second
 )
 
 var (
@@ -127,159 +125,9 @@ func (n *Node) downloadZeroStateSnapshot(ctx context.Context, block ton.BlockIDE
 			Msg("failed to load cached zero state")
 	}
 
-	sub, err := n.subscriptionForBlock(block)
-	if err != nil {
-		return nil, err
-	}
-	if err = sub.ensurePeers(ctx); err != nil {
-		return nil, fmt.Errorf("bootstrap overlay peers: %w", err)
-	}
-
-	sub.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
-	tried := map[PeerID]struct{}{}
-	var errs []error
-	for wave := 0; wave < zeroStateDownloadWaves; wave++ {
-		peers := sub.zeroStateQueryCandidates(tried)
-		if len(peers) == 0 {
-			if err = sub.waitForZeroStatePeerDiscovery(ctx); err != nil {
-				if len(errs) > 0 {
-					return nil, errors.Join(errs...)
-				}
-				return nil, err
-			}
-			continue
-		}
-
-		n.log.Info().
-			Str("block", formatBlockRef(block)).
-			Int("peers", len(peers)).
-			Int("wave", wave+1).
-			Msg("requesting zero state from overlay peers")
-
-		notFound := make([]*overlayPeer, 0, len(peers))
-		for _, peer := range peers {
-			if !peer.id.IsZero() {
-				tried[peer.id] = struct{}{}
-			}
-
-			n.log.Info().
-				Str("peer", peer.addr).
-				Str("block", formatBlockRef(block)).
-				Msg("requesting zero state from peer")
-
-			artifact, err := n.downloadZeroStateSnapshotFromPeer(ctx, sub, peer, block)
-			if err == nil {
-				if zero, ok := artifact.(*zeroStateSnapshotArtifact); ok {
-					zero.writer, _ = n.peerStorage.(storage.PeerServingStorageWriter)
-				}
-				return artifact, nil
-			}
-			if errors.Is(err, context.Canceled) {
-				return nil, err
-			}
-			if errors.Is(err, ErrStateNotAvailable) {
-				notFound = append(notFound, peer)
-			}
-			errs = append(errs, fmt.Errorf("%s: %w", peer.addr, err))
-		}
-
-		if len(notFound) == len(peers) && wave+1 < zeroStateDownloadWaves {
-			rotated := sub.rotateZeroStateUnavailablePeers(notFound)
-			n.log.Info().
-				Str("block", formatBlockRef(block)).
-				Int("rotated_peers", rotated).
-				Int("wave", wave+1).
-				Msg("zero state unavailable from current peers, rotating peer set")
-			if waitErr := sub.waitForZeroStatePeerDiscovery(ctx); waitErr != nil {
-				return nil, errors.Join(append(errs, waitErr)...)
-			}
-		}
-	}
-
-	if len(errs) == 0 {
-		return nil, ErrStateNotAvailable
-	}
-	return nil, errors.Join(errs...)
-}
-
-func (s *overlaySubscription) zeroStateQueryCandidates(tried map[PeerID]struct{}) []*overlayPeer {
-	peers := s.queryCandidates(0, 0)
-	if len(peers) == 0 {
-		s.reloadNeighbours()
-		peers = s.queryCandidates(0, 0)
-	}
-	if len(peers) == 0 || len(tried) == 0 {
-		return peers
-	}
-
-	filtered := peers[:0]
-	for _, peer := range peers {
-		if _, ok := tried[peer.id]; ok {
-			continue
-		}
-		filtered = append(filtered, peer)
-	}
-	return filtered
-}
-
-func (s *overlaySubscription) rotateZeroStateUnavailablePeers(peers []*overlayPeer) int {
-	rotated := 0
-	for _, peer := range peers {
-		if peer == nil || peer.id.IsZero() {
-			continue
-		}
-		s.removePeer(peer.id)
-		rotated++
-	}
-	return rotated
-}
-
-func (s *overlaySubscription) waitForZeroStatePeerDiscovery(ctx context.Context) error {
-	notify := s.peerNotifySnapshot()
-	for drained := false; !drained; {
-		select {
-		case <-notify:
-		default:
-			drained = true
-		}
-	}
-	s.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-notify:
-		return nil
-	case <-time.After(zeroStatePeerDiscoveryDelay):
-		return nil
-	}
-}
-
-func (n *Node) downloadZeroStateSnapshotFromPeer(ctx context.Context, sub *overlaySubscription, peer *overlayPeer, block ton.BlockIDExt) (storage.DownloadedState, error) {
-	resp, err := sub.queryFromPeer(ctx, peer, PrepareZeroState{Block: block})
-	if err != nil {
-		return nil, err
-	}
-	switch resp.(type) {
-	case PreparedState:
-	case NotFoundState:
-		return nil, ErrStateNotAvailable
-	default:
-		return nil, fmt.Errorf("unexpected prepareZeroState response %T", resp)
-	}
-
-	data, err := sub.queryRawFromPeerWithLimits(ctx, peer, DownloadZeroState{Block: block}, downloadQueryTimeout, maxBlockDownloadAnswerSize)
-	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("state boc is empty")
-	}
-
-	return &zeroStateSnapshotArtifact{
-		block: block,
-		data:  data,
-	}, nil
+	session := n.BeginArchiveSession()
+	defer session.Close()
+	return session.DownloadZeroState(ctx, block)
 }
 
 func (n *Node) downloadPersistentStateSnapshot(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
@@ -754,6 +602,9 @@ func (d persistentStateSnapshotDownloader) probePersistentStateCandidates(ctx co
 		},
 	}, func(queryCtx context.Context, peer *overlayPeer) (persistentStatePeerProbe, error) {
 		candidate := candidateByPeer[downloadPeerID(peer)]
+		release := d.node.acquireDownloadPeer(peer)
+		defer release()
+
 		return d.probePersistentStatePeer(queryCtx, candidate, probeChunks, chunkLimiter)
 	})
 

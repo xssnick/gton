@@ -37,7 +37,7 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 
 	s.resetMasterDependentCachesForKeyBlock(block)
 
-	s.rememberCompressedBlockState(state)
+	rememberedCompressedState := s.rememberCompressedBlockState(state)
 	s.updateP2PShardOverlays(ctx, state, block)
 
 	key := storage.BlockKey(state.Block)
@@ -60,8 +60,8 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 	}
 	s.masterStateCacheMu.Unlock()
 
-	if s.node != nil {
-		s.node.NotifyCompressedBlockStateReady()
+	if rememberedCompressedState && s.node != nil {
+		s.node.NotifyCompressedBlockStateReady(state.Block)
 	}
 }
 

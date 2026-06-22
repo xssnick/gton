@@ -18,17 +18,20 @@ import (
 )
 
 const (
-	errCodeUnspecified    int32 = 0
-	errCodeProtoViolation int32 = -400
-	errCodeTonProtoError  int32 = 621
-	errCodeNotReady       int32 = 651
-	errCodeInternal       int32 = -400
+	errCodeUnspecified     int32 = 0
+	errCodeProtoViolation  int32 = -400
+	errCodeTonProtoError   int32 = 621
+	errCodeNotReady        int32 = 651
+	errCodeInternal        int32 = -400
+	errCodeTooManyRequests int32 = 429
 
 	masterchainID    int32 = -1
 	masterchainShard int64 = -1 << 63
 	workchainInvalid int32 = -1 << 31
 
 	getMasterchainInfoExtShardClientState uint32 = 1
+
+	queryErrorReasonRateLimited = "rate_limited"
 )
 
 var errInvalidLookupBlock = errors.New("invalid lookupBlock request")
@@ -414,7 +417,40 @@ func unixNow(now func() time.Time) uint32 {
 	return uint32(now().Unix())
 }
 
+const cxxZeroStateNotInDB = "zerostate not in db"
+
+type queryError struct {
+	code int32
+	text string
+}
+
+func (e *queryError) Error() string {
+	return e.text
+}
+
+func newQueryError(code int32, text string) error {
+	return &queryError{code: code, text: text}
+}
+
+func zeroStateErrorResponse(err error, block ton.BlockIDExt) ton.LSError {
+	if errors.Is(err, storage.ErrNotFound) {
+		return ton.LSError{Code: errCodeNotReady, Text: cxxZeroStateNotInDB}
+	}
+	return errorResponse(err, "cannot load zerostate of "+cxxBlockIDExtString(block))
+}
+
+func zeroStateProofError(err error, block ton.BlockIDExt) error {
+	if errors.Is(err, storage.ErrNotFound) {
+		return newQueryError(errCodeNotReady, "cannot load zerostate of "+cxxBlockIDExtString(block)+" : "+cxxZeroStateNotInDB)
+	}
+	return err
+}
+
 func errorResponse(err error, fallback string) ton.LSError {
+	var queryErr *queryError
+	if errors.As(err, &queryErr) {
+		return ton.LSError{Code: queryErr.code, Text: queryErr.text}
+	}
 	if errors.Is(err, storage.ErrNotFound) {
 		text := fallback + ": not found"
 		if err != nil && err.Error() != storage.ErrNotFound.Error() {

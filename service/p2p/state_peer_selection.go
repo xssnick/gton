@@ -8,7 +8,7 @@ import (
 
 const (
 	stateSlowPeerSpeed   = float64(1 << 20)
-	stateSlowPeerPenalty = archiveSlowPeerPenalty
+	stateSlowPeerPenalty = largeDownloadSlowPeerPenalty
 )
 
 func downloadPeerID(peer *overlayPeer) PeerID {
@@ -19,8 +19,8 @@ func downloadPeerID(peer *overlayPeer) PeerID {
 }
 
 type peerUse struct {
-	downloads   int
-	archivePins int
+	downloads int
+	pins      int
 }
 
 func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
@@ -46,7 +46,7 @@ func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
 		if use.downloads > 0 {
 			use.downloads--
 		}
-		if use.downloads == 0 && use.archivePins == 0 {
+		if use.downloads == 0 && use.pins == 0 {
 			delete(n.peerUse, peerID)
 			return
 		}
@@ -93,14 +93,14 @@ func (n *Node) protectedPeerIDs() map[PeerID]struct{} {
 
 	protected := make(map[PeerID]struct{}, len(n.peerUse))
 	for peerID, use := range n.peerUse {
-		if use.downloads > 0 || use.archivePins > 0 {
+		if use.downloads > 0 || use.pins > 0 {
 			protected[peerID] = struct{}{}
 		}
 	}
 	return protected
 }
 
-func (n *Node) acquireArchiveSessionPeer(peerID PeerID) func() {
+func (n *Node) pinPeer(peerID PeerID) func() {
 	if n == nil || peerID.IsZero() {
 		return func() {}
 	}
@@ -110,7 +110,7 @@ func (n *Node) acquireArchiveSessionPeer(peerID PeerID) func() {
 		n.peerUse = map[PeerID]peerUse{}
 	}
 	use := n.peerUse[peerID]
-	use.archivePins++
+	use.pins++
 	n.peerUse[peerID] = use
 	n.peerUseMx.Unlock()
 
@@ -119,36 +119,15 @@ func (n *Node) acquireArchiveSessionPeer(peerID PeerID) func() {
 		defer n.peerUseMx.Unlock()
 
 		use := n.peerUse[peerID]
-		if use.archivePins > 0 {
-			use.archivePins--
+		if use.pins > 0 {
+			use.pins--
 		}
-		if use.downloads == 0 && use.archivePins == 0 {
+		if use.downloads == 0 && use.pins == 0 {
 			delete(n.peerUse, peerID)
 			return
 		}
 		n.peerUse[peerID] = use
 	}
-}
-
-func (n *Node) archiveSessionPinnedPeerIDs() map[PeerID]struct{} {
-	if n == nil {
-		return nil
-	}
-
-	n.peerUseMx.RLock()
-	defer n.peerUseMx.RUnlock()
-
-	if len(n.peerUse) == 0 {
-		return nil
-	}
-
-	pinned := make(map[PeerID]struct{}, len(n.peerUse))
-	for peerID, use := range n.peerUse {
-		if use.archivePins > 0 {
-			pinned[peerID] = struct{}{}
-		}
-	}
-	return pinned
 }
 
 func (n *Node) prioritizeStateSnapshotPeers(peers []*overlayPeer) []*overlayPeer {
@@ -381,7 +360,7 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 		if use.downloads > 0 {
 			use.downloads--
 		}
-		if use.downloads == 0 && use.archivePins == 0 {
+		if use.downloads == 0 && use.pins == 0 {
 			delete(n.peerUse, selectedPeerID)
 			return
 		}

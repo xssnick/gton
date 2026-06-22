@@ -68,7 +68,11 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 	if err != nil {
 		return err
 	}
-	if err = checkExternalMessageLimits(tlb.BlockchainConfig{Root: config.Root}, data, msgCell); err != nil {
+	limits, err := masterFragments.externalMessageLimits()
+	if err != nil {
+		return err
+	}
+	if err = checkExternalMessageLimits(limits, data, msgCell); err != nil {
 		return err
 	}
 
@@ -219,32 +223,91 @@ func parseExternalMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error)
 	return root, &msg, nil
 }
 
-func checkExternalMessageLimits(config tlb.BlockchainConfig, data []byte, root *cell.Cell) error {
-	limits, err := config.GetSizeLimitsConfig()
+type externalMessageSizeLimits struct {
+	maxSize  uint32
+	maxDepth uint16
+}
+
+func (f *liveBlockFragments) externalMessageLimits() (externalMessageSizeLimits, error) {
+	f.mu.Lock()
+	if f.extMsgLimitsLoaded {
+		limits := f.extMsgLimits
+		f.mu.Unlock()
+		return limits, nil
+	}
+	f.mu.Unlock()
+
+	value, err := f.lazyLoad.do(context.Background(), liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadExternalMessageLimits}, func() (any, error) {
+		f.mu.Lock()
+		if f.extMsgLimitsLoaded {
+			limits := f.extMsgLimits
+			f.mu.Unlock()
+			return limits, nil
+		}
+		f.mu.Unlock()
+
+		base, err := f.runMethodBaseConfig()
+		if err != nil {
+			return externalMessageSizeLimits{}, err
+		}
+		limits, err := externalMessageLimitsFromBaseConfig(base)
+		if err != nil {
+			return externalMessageSizeLimits{}, err
+		}
+
+		f.mu.Lock()
+		if !f.extMsgLimitsLoaded {
+			f.extMsgLimits = limits
+			f.extMsgLimitsLoaded = true
+		} else {
+			limits = f.extMsgLimits
+		}
+		f.mu.Unlock()
+		return limits, nil
+	})
 	if err != nil {
-		return err
+		return externalMessageSizeLimits{}, err
+	}
+	limits, ok := value.(externalMessageSizeLimits)
+	if !ok {
+		return externalMessageSizeLimits{}, errors.New("invalid external message limits cache value")
+	}
+	return limits, nil
+}
+
+func externalMessageLimitsFromBaseConfig(base *runMethodBaseConfig) (externalMessageSizeLimits, error) {
+	param := base.Unpacked.Params[runMethodConfigParamSizeLimitsIndex]
+
+	var limits tlb.SizeLimitsConfig
+	if param == nil {
+		var err error
+		// Preserve tonutils-go's default size limits when config param 43 is absent.
+		limits, err = base.Config.GetSizeLimitsConfig()
+		if err != nil {
+			return externalMessageSizeLimits{}, err
+		}
+	} else if err := tlb.Parse(&limits, param); err != nil {
+		return externalMessageSizeLimits{}, err
 	}
 
-	var maxSize uint32
-	var maxDepth uint16
 	switch cfg := limits.Config.(type) {
 	case tlb.SizeLimitsConfigV1:
-		maxSize = cfg.MaxExtMsgSize
-		maxDepth = cfg.MaxExtMsgDepth
+		return externalMessageSizeLimits{maxSize: cfg.MaxExtMsgSize, maxDepth: cfg.MaxExtMsgDepth}, nil
 	case tlb.SizeLimitsConfigV2:
-		maxSize = cfg.MaxExtMsgSize
-		maxDepth = cfg.MaxExtMsgDepth
+		return externalMessageSizeLimits{maxSize: cfg.MaxExtMsgSize, maxDepth: cfg.MaxExtMsgDepth}, nil
 	default:
-		return fmt.Errorf("unsupported size limits config %T", limits.Config)
+		return externalMessageSizeLimits{}, fmt.Errorf("unsupported size limits config %T", limits.Config)
 	}
+}
 
-	if uint64(len(data)) > uint64(maxSize) {
+func checkExternalMessageLimits(limits externalMessageSizeLimits, data []byte, root *cell.Cell) error {
+	if uint64(len(data)) > uint64(limits.maxSize) {
 		return errors.New("external message too large, rejecting")
 	}
 	if root.Level() != 0 {
 		return errors.New("external message must have zero level")
 	}
-	if root.Depth() >= maxDepth {
+	if root.Depth() >= limits.maxDepth {
 		return errors.New("external message is too deep")
 	}
 	return nil

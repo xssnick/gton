@@ -93,11 +93,10 @@ func (s *overlaySubscription) reloadNeighbours() {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
 
-	protected := s.protectedNeighbourPeerIDs()
-
 	s.mx.Lock()
 
 	s.pruneNeighboursLocked()
+	protected := s.protectedPeerIDs()
 
 	exchanged := false
 	excluded := map[PeerID]struct{}{}
@@ -156,13 +155,6 @@ func (s *overlaySubscription) reloadNeighbours() {
 			Int("alive_peers", len(candidates)).
 			Msg("selected overlay neighbours")
 	}
-}
-
-func (s *overlaySubscription) protectedNeighbourPeerIDs() map[PeerID]struct{} {
-	if s.node != nil {
-		return s.node.protectedPeerIDs()
-	}
-	return nil
 }
 
 func (s *overlaySubscription) worstRotatableNeighbourLocked(protected map[PeerID]struct{}) (PeerID, float64) {

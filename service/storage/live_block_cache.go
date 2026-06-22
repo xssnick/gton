@@ -27,6 +27,11 @@ type LiveBlockCacheBlock struct {
 	artifactFlushed bool
 }
 
+type CachedBlockData struct {
+	Data            []byte
+	ArtifactFlushed bool
+}
+
 func NewLiveBlockCache(max int) *LiveBlockCache {
 	if max <= 0 {
 		max = DefaultLiveBlockCacheMaxBlocks
@@ -135,9 +140,17 @@ func (c *LiveBlockCache) NextBlockFull(ctx context.Context, prev ton.BlockIDExt)
 	return c.BlockFull(ctx, next)
 }
 
-func (c *LiveBlockCache) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
+func (c *LiveBlockCache) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+	cached, err := c.CachedBlockData(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+	return cached.Data, nil
+}
+
+func (c *LiveBlockCache) CachedBlockData(_ context.Context, block ton.BlockIDExt) (CachedBlockData, error) {
 	if c == nil {
-		return nil, ErrNotFound
+		return CachedBlockData{}, ErrNotFound
 	}
 
 	key := BlockKey(block)
@@ -145,9 +158,12 @@ func (c *LiveBlockCache) BlockData(_ context.Context, block ton.BlockIDExt) ([]b
 	cached := c.blocks[key]
 	if cached == nil || len(cached.data) == 0 {
 		c.mu.Unlock()
-		return nil, ErrNotFound
+		return CachedBlockData{}, ErrNotFound
 	}
-	data := cached.data
+	data := CachedBlockData{
+		Data:            cached.data,
+		ArtifactFlushed: cached.artifactFlushed,
+	}
 	c.touchLocked(key)
 	c.mu.Unlock()
 	return data, nil

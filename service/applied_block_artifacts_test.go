@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestPreparedBlockCheckpointArtifactsCanonicalProofLinkFlag(t *testing.T) {
@@ -43,6 +44,71 @@ func TestPreparedBlockCheckpointArtifactsCanonicalProofLinkFlag(t *testing.T) {
 				t.Fatalf("is link = %v, want %v", full.IsLink, tt.wantIsLink)
 			}
 		})
+	}
+}
+
+func TestPreparedBlockCheckpointArtifactsRequiresFullPayload(t *testing.T) {
+	block := testBlockID(0, topShard, 12)
+	tests := []struct {
+		name  string
+		block PreparedBlock
+	}{
+		{
+			name: "missing block data",
+			block: PreparedBlock{
+				ID:       block,
+				ProofBOC: []byte{0x02},
+				Meta:     &storage.BlockMeta{},
+			},
+		},
+		{
+			name: "missing proof data",
+			block: PreparedBlock{
+				ID:       block,
+				BlockBOC: []byte{0x01},
+				Meta:     &storage.BlockMeta{},
+			},
+		},
+		{
+			name: "missing meta",
+			block: PreparedBlock{
+				ID:       block,
+				BlockBOC: []byte{0x01},
+				ProofBOC: []byte{0x02},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := preparedBlockCheckpointArtifacts(tt.block, 0); err == nil {
+				t.Fatal("checkpoint artifact accepted incomplete prepared block")
+			}
+		})
+	}
+}
+
+func TestPreparedBlockCheckpointArtifactsSkipsZeroStatePrevLink(t *testing.T) {
+	zero := testBlockID(0, topShard, 0)
+	prev := testBlockID(0, topShard, 12)
+	block := testBlockID(0, topShard, 13)
+
+	_, links, err := preparedBlockCheckpointArtifacts(PreparedBlock{
+		ID:       block,
+		BlockBOC: []byte{0x01},
+		ProofBOC: []byte{0x02},
+		Meta: &storage.BlockMeta{
+			PrevRefs: []ton.BlockIDExt{zero, prev},
+		},
+	}, 0)
+	if err != nil {
+		t.Fatalf("prepare checkpoint artifacts: %v", err)
+	}
+	if len(links) != 1 {
+		t.Fatalf("links = %+v, want one non-zero prev link", links)
+	}
+	if !links[0].Prev.Equals(&prev) || !links[0].Next.Equals(&block) {
+		t.Fatalf("link = %s -> %s, want %s -> %s", storage.FormatBlockRef(links[0].Prev), storage.FormatBlockRef(links[0].Next), storage.FormatBlockRef(prev), storage.FormatBlockRef(block))
 	}
 }
 

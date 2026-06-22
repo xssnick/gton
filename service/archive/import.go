@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -62,42 +61,17 @@ func isMasterchainBlock(block ton.BlockIDExt) bool {
 	return block.Workchain == -1 && block.Shard == topShard
 }
 
-type ImportSink struct {
-	Writer    storage.PeerServingStorageWriter
-	FullBlock func(*storage.ServedBlockFull) error
-}
-
 type Imported struct {
-	Stats *ImportStats
-	storage.ServedArchiveImport
-	ArtifactPath   string
+	Stats      *ImportStats
+	FullBlocks []*storage.ServedBlockFull
+	Links      []storage.ServedBlockLink
+
 	PreparedBlocks map[storage.BlockRootHash]PreparedBlock
-}
-
-func ImportFile(ctx context.Context, archive *Downloaded, sink ImportSink) (*ImportStats, error) {
-	file, err := os.Open(archive.Path)
-	if err != nil {
-		return nil, fmt.Errorf("open downloaded archive: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	started := time.Now()
-	imported, err := ImportStream(ctx, archive, file)
-	if err != nil {
-		return nil, err
-	}
-	if err = imported.Store(sink); err != nil {
-		return nil, err
-	}
-	imported.Stats.ImportElapsed = time.Since(started)
-	return imported.Stats, nil
 }
 
 func ImportBytes(ctx context.Context, archive *Downloaded, data []byte) (*Imported, error) {
 	archiveRef := *archive
-	archiveRef.Path = ""
 	archiveRef.Data = nil
-	archiveRef.Imported = nil
 	archiveRef.Bytes = int64(len(data))
 	return ImportStream(ctx, &archiveRef, bytes.NewReader(data))
 }
@@ -112,7 +86,6 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 	}
 	imported := &Imported{
 		Stats:          stats,
-		ArtifactPath:   archive.Path,
 		PreparedBlocks: map[storage.BlockRootHash]PreparedBlock{},
 	}
 	parts := map[storage.BlockRootHash]*blockParts{}
@@ -190,20 +163,6 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 	}
 	stats.ImportElapsed = time.Since(started)
 	return imported, nil
-}
-
-func (i *Imported) Store(sink ImportSink) error {
-	for _, full := range i.FullBlocks {
-		if sink.FullBlock != nil {
-			if err := sink.FullBlock(full); err != nil {
-				return fmt.Errorf("prepare archived full block %s: %w", storage.FormatBlockRef(full.ID), err)
-			}
-		}
-	}
-	if err := sink.Writer.SaveArchiveImport(&i.ServedArchiveImport); err != nil {
-		return fmt.Errorf("save archived blocks: %w", err)
-	}
-	return nil
 }
 
 func flushBlockPart(preparer *importedBlockPreparer, part *blockParts, stats *ImportStats) error {

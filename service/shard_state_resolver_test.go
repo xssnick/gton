@@ -52,6 +52,53 @@ func TestShardStateResolverResolvesSplitDescendantFromParent(t *testing.T) {
 	}
 }
 
+func TestShardStateResolverReplaysStoredStateRejectedAsMissingFullBlock(t *testing.T) {
+	ctx := context.Background()
+	parent := testBlockID(0, topShard, 13)
+	target := testBlockID(0, topShard, 14)
+
+	env := newFakeShardStateResolverEnv()
+	env.addState(parent)
+	env.addState(target)
+	env.addBlock(target, parent)
+
+	loadState := func(ctx context.Context, state storage.BlockState) (*storage.BlockState, error) {
+		if state.Block.Equals(&target) {
+			if _, err := env.loadState(ctx, state); err != nil {
+				return nil, err
+			}
+			return nil, storage.ErrNotFound
+		}
+		return env.loadState(ctx, state)
+	}
+
+	resolver := newShardStateResolver(ctx, shardStateResolverConfig{
+		current: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(parent): {Block: parent},
+		},
+		loadState: loadState,
+		loadBlock: env.loadBlock,
+		apply:     env.apply,
+		save:      env.save,
+	})
+
+	state, err := resolver.resolveWithContext(ctx, target)
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	if !state.Block.Equals(&target) {
+		t.Fatalf("resolved state = %s, want %s", storage.FormatBlockRef(state.Block), storage.FormatBlockRef(target))
+	}
+	if got := env.stateLoads[storage.BlockKey(target)]; got != 1 {
+		t.Fatalf("target state loads = %d, want 1", got)
+	}
+	if got := env.blockLoads[storage.BlockKey(target)]; got != 1 {
+		t.Fatalf("target block loads = %d, want 1", got)
+	}
+	assertBlockSeq(t, "applied", env.applied, []ton.BlockIDExt{target})
+	assertBlockSeq(t, "saved", env.saved, []ton.BlockIDExt{target})
+}
+
 func TestShardStateResolverResolvesMergeFromTwoChildren(t *testing.T) {
 	ctx := context.Background()
 	parentShard := int64(topShard)

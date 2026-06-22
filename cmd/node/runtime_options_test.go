@@ -35,6 +35,12 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 			ShardBlockCache:                    22,
 			SendMessageBroadcastBytesPerSecond: 123456,
 			SendMessageBroadcastMaxDelayMS:     75,
+			Limits: nodeconfig.LiteLimits{
+				CapacityPerIP:       100,
+				CoolingPerSec:       20,
+				MaxConnectionsPerIP: 50,
+				MaxKeepAliveSeconds: 60,
+			},
 		},
 		Storage: nodeconfig.Storage{
 			Dir: "data/node",
@@ -134,6 +140,18 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	if liteOpts.ShardBlockCache != 22 {
 		t.Fatalf("unexpected liteserver shard cache %d", liteOpts.ShardBlockCache)
 	}
+	if liteOpts.Limits.CapacityPerIP != 100 {
+		t.Fatalf("unexpected liteserver capacity per IP %d", liteOpts.Limits.CapacityPerIP)
+	}
+	if liteOpts.Limits.CoolingPerSec != 20 {
+		t.Fatalf("unexpected liteserver cooling per second %f", liteOpts.Limits.CoolingPerSec)
+	}
+	if liteOpts.Limits.MaxConnectionsPerIP != 50 {
+		t.Fatalf("unexpected liteserver max connections per IP %d", liteOpts.Limits.MaxConnectionsPerIP)
+	}
+	if liteOpts.Limits.MaxKeepAlive != time.Minute {
+		t.Fatalf("unexpected liteserver max keep alive %s", liteOpts.Limits.MaxKeepAlive)
+	}
 
 	metricsOpts, err := metricsOptionsFromConfig(cfg)
 	if err != nil {
@@ -216,6 +234,67 @@ func TestLiteserverOptionsRequireKeyWhenEnabled(t *testing.T) {
 
 	if _, err := liteserverOptionsFromConfig(cfg); err == nil {
 		t.Fatal("expected enabled liteserver without key to fail")
+	}
+}
+
+func TestLiteserverOptionsDefaultLimitsDisabled(t *testing.T) {
+	opts, err := liteserverOptionsFromConfig(nodeconfig.Config{
+		Lite: nodeconfig.Lite{
+			Key: testSeed(3),
+		},
+	})
+	if err != nil {
+		t.Fatalf("liteserver options: %v", err)
+	}
+	if opts.Limits.CapacityPerIP != 0 || opts.Limits.CoolingPerSec != 0 ||
+		opts.Limits.MaxConnectionsPerIP != 0 || opts.Limits.MaxKeepAlive != 0 {
+		t.Fatalf("expected default limits to be disabled: %+v", opts.Limits)
+	}
+}
+
+func TestLiteserverOptionsRejectInvalidLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		limits nodeconfig.LiteLimits
+	}{
+		{
+			name:   "negative capacity",
+			limits: nodeconfig.LiteLimits{CapacityPerIP: -1},
+		},
+		{
+			name:   "negative cooling",
+			limits: nodeconfig.LiteLimits{CoolingPerSec: -1},
+		},
+		{
+			name:   "capacity without cooling",
+			limits: nodeconfig.LiteLimits{CapacityPerIP: 100},
+		},
+		{
+			name:   "cooling without capacity",
+			limits: nodeconfig.LiteLimits{CoolingPerSec: 20},
+		},
+		{
+			name:   "negative connections",
+			limits: nodeconfig.LiteLimits{MaxConnectionsPerIP: -1},
+		},
+		{
+			name:   "negative keep alive",
+			limits: nodeconfig.LiteLimits{MaxKeepAliveSeconds: -1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := liteserverOptionsFromConfig(nodeconfig.Config{
+				Lite: nodeconfig.Lite{
+					Key:    testSeed(3),
+					Limits: tt.limits,
+				},
+			})
+			if err == nil {
+				t.Fatal("expected invalid liteserver limits to fail")
+			}
+		})
 	}
 }
 

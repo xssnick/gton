@@ -391,7 +391,7 @@ func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
 	}
 
 	sub.mx.Lock()
-	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"))
+	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"), nil)
 	sub.mx.Unlock()
 	if !got.IsZero() {
 		t.Fatalf("healthy full pool eviction candidate = %q, want none", got)
@@ -421,7 +421,7 @@ func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
 	}
 
 	sub.mx.Lock()
-	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"))
+	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"), nil)
 	sub.mx.Unlock()
 	if got != testPeerID("d") {
 		t.Fatalf("bad peer eviction candidate = %q, want d", got)
@@ -451,10 +451,69 @@ func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
 	}
 
 	sub.mx.Lock()
-	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"))
+	got := sub.attachPeerEvictionCandidateLocked(testPeerID("new"), nil)
 	sub.mx.Unlock()
 	if got != testPeerID("d") {
 		t.Fatalf("slow peer eviction candidate = %q, want d", got)
+	}
+}
+
+func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
+	tests := []struct {
+		name string
+		use  peerUse
+	}{
+		{name: "download", use: peerUse{downloads: 1}},
+		{name: "pin", use: peerUse{pins: 1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peerPool, pooled, _ := newTestLeasedPooledPeer("candidate-" + tt.name)
+			protectedID := testPeerID("protected-" + tt.name)
+			sub := &overlaySubscription{
+				log: discardLogger(),
+				node: &Node{
+					pool: peerPool,
+					peerUse: map[PeerID]peerUse{
+						protectedID: tt.use,
+					},
+				},
+				spec:  overlaySpec{ShortID: []byte{0x01}, Kind: overlayKindPublicShard},
+				peers: map[PeerID]*overlayPeer{},
+			}
+
+			now := int32(time.Now().Unix())
+			protected := &overlayPeer{
+				id:            protectedID,
+				overlay:       &overlay.ADNLOverlayWrapper{},
+				announced:     &overlay.Node{Version: now},
+				alive:         true,
+				lastReceiveAt: time.Now(),
+				unreliability: peerStopUnreliability + 1,
+			}
+			sub.peers[protectedID] = protected
+			for i := 1; i < maxPeersPerOverlay; i++ {
+				id := testPeerID(tt.name + string(rune('a'+i)))
+				sub.peers[id] = &overlayPeer{
+					id:            id,
+					overlay:       &overlay.ADNLOverlayWrapper{},
+					announced:     &overlay.Node{Version: now},
+					alive:         true,
+					lastReceiveAt: time.Now(),
+				}
+			}
+
+			if sub.attachPooledPeer(pooled, nil) {
+				t.Fatal("protected full pool accepted replacement peer")
+			}
+			if sub.peers[protectedID] != protected {
+				t.Fatal("protected peer was evicted")
+			}
+			if sub.peers[pooled.id] != nil {
+				t.Fatal("replacement peer was attached despite protected eviction candidate")
+			}
+		})
 	}
 }
 
@@ -693,9 +752,12 @@ type fakeDHTClient struct {
 	findOverlayNodesCalls    int
 	storeAddressErrs         []error
 	storeOverlayErrs         []error
+	findAddressesErr         error
+	findOverlayNodesWait     <-chan struct{}
 	storeAddressDeadline     time.Time
 	storeOverlayDeadline     time.Time
 	findOverlayNodesDeadline time.Time
+	findAddressesDeadline    time.Time
 }
 
 func (f *fakeDHTClient) Close() {}
@@ -703,11 +765,22 @@ func (f *fakeDHTClient) Close() {}
 func (f *fakeDHTClient) FindOverlayNodes(ctx context.Context, _ []byte, _ ...*dht.Continuation) (*overlay.NodesList, *dht.Continuation, error) {
 	f.findOverlayNodesCalls++
 	f.findOverlayNodesDeadline, _ = ctx.Deadline()
+	if f.findOverlayNodesWait != nil {
+		select {
+		case <-f.findOverlayNodesWait:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
 	return &overlay.NodesList{}, nil, nil
 }
 
-func (f *fakeDHTClient) FindAddresses(context.Context, []byte) (*adnladdr.List, ed25519.PublicKey, error) {
-	return nil, nil, nil
+func (f *fakeDHTClient) FindAddresses(ctx context.Context, _ []byte) (*adnladdr.List, ed25519.PublicKey, error) {
+	f.findAddressesDeadline, _ = ctx.Deadline()
+	if f.findAddressesErr != nil {
+		return nil, nil, f.findAddressesErr
+	}
+	return &adnladdr.List{}, nil, nil
 }
 
 func (f *fakeDHTClient) FindValue(context.Context, *dht.Key, ...*dht.Continuation) (*dht.Value, *dht.Continuation, error) {

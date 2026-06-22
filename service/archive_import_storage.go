@@ -20,38 +20,17 @@ func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.D
 	return s.prepareImportedArchiveBlocks(imported, splitDepth)
 }
 
-func (s *Service) importArchiveBlocksForStorage(ctx context.Context, downloaded *archive.Downloaded, splitDepth uint32, shardMasterRefs map[storage.BlockRootHash]ton.BlockIDExt) (*archiveImportResult, storage.ServedArchiveImport, error) {
-	imported, err := loadDownloadedArchive(ctx, downloaded)
-	if err != nil {
-		return nil, storage.ServedArchiveImport{}, err
-	}
-	result, err := s.prepareImportedArchiveBlocks(imported, splitDepth)
-	if err != nil {
-		return nil, storage.ServedArchiveImport{}, err
-	}
-	stored, err := servedArchiveImportFromImported(imported, splitDepth, shardMasterRefs)
-	if err != nil {
-		return nil, storage.ServedArchiveImport{}, err
-	}
-	return result, stored, nil
-}
-
 func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) (*archive.Imported, error) {
 	if downloaded == nil {
 		return nil, archive.ErrNotAvailable
 	}
+	if len(downloaded.Data) == 0 {
+		return nil, fmt.Errorf("import archive: empty downloaded archive data")
+	}
 
-	imported := downloaded.Imported
-	if imported == nil {
-		if len(downloaded.Data) == 0 {
-			return nil, fmt.Errorf("import archive: empty downloaded archive data")
-		}
-
-		var err error
-		imported, err = archive.ImportBytes(ctx, downloaded, downloaded.Data)
-		if err != nil {
-			return nil, err
-		}
+	imported, err := archive.ImportBytes(ctx, downloaded, downloaded.Data)
+	if err != nil {
+		return nil, err
 	}
 	return imported, nil
 }
@@ -61,7 +40,7 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 		return nil, fmt.Errorf("import archive: empty imported data")
 	}
 	if imported.Stats == nil {
-		return nil, fmt.Errorf("import archive %s: empty stats", imported.ArtifactPath)
+		return nil, fmt.Errorf("import archive: empty stats")
 	}
 
 	blocks := map[storage.BlockRootHash]PreparedBlock{}
@@ -99,51 +78,6 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 	}
 
 	return &archiveImportResult{stats: imported.Stats, blocks: blocks, splitDepth: splitDepth}, nil
-}
-
-func servedArchiveImportFromImported(imported *archive.Imported, splitDepth uint32, shardMasterRefs map[storage.BlockRootHash]ton.BlockIDExt) (storage.ServedArchiveImport, error) {
-	if imported == nil {
-		return storage.ServedArchiveImport{}, fmt.Errorf("import archive: empty imported data")
-	}
-
-	stored := storage.ServedArchiveImport{
-		FullBlocks: make([]*storage.ServedBlockFull, 0, len(imported.FullBlocks)),
-		Links:      imported.Links,
-	}
-
-	seenBlocks := map[storage.BlockRootHash]struct{}{}
-	for _, full := range imported.FullBlocks {
-		key := storage.BlockKey(full.ID)
-		if _, exists := seenBlocks[key]; exists {
-			continue
-		}
-		seenBlocks[key] = struct{}{}
-
-		prepared := imported.PreparedBlocks[key]
-		if prepared.Meta == nil {
-			return storage.ServedArchiveImport{}, fmt.Errorf("archive block %s was not prepared by archive import", storage.FormatBlockRef(full.ID))
-		}
-
-		meta := prepared.Meta
-		if full.ID.Workchain != -1 {
-			master, ok := shardMasterRefs[key]
-			if !ok {
-				return storage.ServedArchiveImport{}, fmt.Errorf("archive shard block %s has no masterchain reference", storage.FormatBlockRef(full.ID))
-			}
-			meta = prepared.Meta.Clone()
-			setShardBlockMasterchainRef(meta, master)
-		}
-
-		stored.FullBlocks = append(stored.FullBlocks, &storage.ServedBlockFull{
-			ID:                     full.ID,
-			Block:                  full.Block,
-			Proof:                  full.Proof,
-			Meta:                   meta,
-			IsLink:                 storage.ServedBlockProofIsLink(full.ID, full.IsLink),
-			ArchiveShardSplitDepth: splitDepth,
-		})
-	}
-	return stored, nil
 }
 
 type archiveShardPrefixInputs struct {
@@ -217,45 +151,77 @@ func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlock
 	}
 
 	count := 1 << splitDepth
-	plans := make([]archiveShardImportPlan, 0, count)
-	for i := 0; i < count; i++ {
-		shard := uint64(i*2+1) << (64 - splitDepth - 1)
-		prefix := archive.ShardID{
-			Workchain: 0,
-			Shard:     int64(shard),
-		}
+	plansByPrefix := make([]archiveShardImportPlan, count)
+	seenByPrefix := make([]map[storage.BlockRootHash]struct{}, count)
+	for _, blocks := range stateBlocks {
+		for _, next := range blocks {
+			// Zerostates are downloaded through state overlay, not shard archive packages.
+			if next.SeqNo == 0 {
+				continue
+			}
+			if next.Workchain != 0 {
+				continue
+			}
 
-		plan := archiveShardImportPlan{shard: prefix, splitDepth: splitDepth}
-		seen := map[storage.BlockRootHash]struct{}{}
-		for _, blocks := range stateBlocks {
-			for _, next := range blocks {
-				// Zerostates are downloaded through state overlay, not shard archive packages.
-				if next.SeqNo == 0 {
-					continue
-				}
-				if next.Workchain != prefix.Workchain || !archiveShardIntersects(prefix.Shard, next.Shard) {
-					continue
-				}
+			prev, ok := startByShard[storage.ShardKeyFromBlock(next)]
+			if ok && prev.Equals(&next) {
+				continue
+			}
+			if needBlock != nil && !needBlock(next) {
+				continue
+			}
 
-				prev, ok := startByShard[storage.ShardKeyFromBlock(next)]
-				if ok && prev.Equals(&next) {
-					continue
+			key := storage.BlockKey(next)
+			start, end := archiveShardPrefixIndexRange(splitDepth, next.Shard)
+			for idx := start; idx < end; idx++ {
+				seen := seenByPrefix[idx]
+				if seen == nil {
+					seen = map[storage.BlockRootHash]struct{}{}
+					seenByPrefix[idx] = seen
+					plansByPrefix[idx] = archiveShardImportPlan{
+						shard:      archiveShardIDForPrefixIndex(splitDepth, idx),
+						splitDepth: splitDepth,
+					}
 				}
-				if needBlock != nil && !needBlock(next) {
-					continue
-				}
-
-				key := storage.BlockKey(next)
 				if _, ok = seen[key]; ok {
 					continue
 				}
 				seen[key] = struct{}{}
-				plan.needed = append(plan.needed, next)
+				plansByPrefix[idx].needed = append(plansByPrefix[idx].needed, next)
 			}
 		}
+	}
+
+	plans := make([]archiveShardImportPlan, 0, count)
+	for _, plan := range plansByPrefix {
 		if len(plan.needed) > 0 {
 			plans = append(plans, plan)
 		}
 	}
 	return plans
+}
+
+func archiveShardIDForPrefixIndex(splitDepth uint32, idx int) archive.ShardID {
+	shard := uint64(idx*2+1) << (64 - splitDepth - 1)
+	return archive.ShardID{
+		Workchain: 0,
+		Shard:     int64(shard),
+	}
+}
+
+func archiveShardPrefixIndexRange(splitDepth uint32, shard int64) (int, int) {
+	count := 1 << splitDepth
+	depth := storage.ShardPrefixLength(shard)
+	if depth <= 0 {
+		return 0, count
+	}
+	if uint32(depth) >= splitDepth {
+		idx := int(uint64(shard) >> (64 - splitDepth))
+		return idx, idx + 1
+	}
+
+	prefix := uint64(shard) >> (64 - uint(depth))
+	span := 1 << (splitDepth - uint32(depth))
+	start := int(prefix) * span
+	return start, start + span
 }

@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -10,7 +9,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestLoadBlockStateForApplyTreatsBlockOnlyStateWithoutFullBlockAsMiss(t *testing.T) {
+func TestLoadBlockStateForApplyTrustsPublishedBlockOnlyState(t *testing.T) {
 	ctx := context.Background()
 	block := testBlockID(0, topShard, 100)
 	state := testReplayBlockState(t, block)
@@ -20,16 +19,19 @@ func TestLoadBlockStateForApplyTreatsBlockOnlyStateWithoutFullBlockAsMiss(t *tes
 	}
 	svc := &Service{storage: store}
 
-	_, err := svc.loadBlockStateForApply(ctx, storage.BlockState{Block: block})
-	if !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("load state error = %v, want ErrNotFound", err)
+	got, err := svc.loadBlockStateForApply(ctx, storage.BlockState{Block: block})
+	if err != nil {
+		t.Fatalf("load state: %v", err)
 	}
-	if store.blockFullCalls != 1 {
-		t.Fatalf("BlockFull calls = %d, want 1", store.blockFullCalls)
+	if !got.Block.Equals(&block) {
+		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
+	}
+	if store.blockFullCalls != 0 {
+		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
 }
 
-func TestLoadBlockStateForApplyReusesBlockOnlyStateWithFullBlock(t *testing.T) {
+func TestLoadBlockStateForApplyDoesNotProbeFullBlockForPublishedState(t *testing.T) {
 	ctx := context.Background()
 	block := testBlockID(0, topShard, 101)
 	state := testReplayBlockState(t, block)
@@ -46,8 +48,8 @@ func TestLoadBlockStateForApplyReusesBlockOnlyStateWithFullBlock(t *testing.T) {
 	if !got.Block.Equals(&block) {
 		t.Fatalf("loaded block = %s, want %s", storage.FormatBlockRef(got.Block), storage.FormatBlockRef(block))
 	}
-	if store.blockFullCalls != 1 {
-		t.Fatalf("BlockFull calls = %d, want 1", store.blockFullCalls)
+	if store.blockFullCalls != 0 {
+		t.Fatalf("BlockFull calls = %d, want 0", store.blockFullCalls)
 	}
 }
 

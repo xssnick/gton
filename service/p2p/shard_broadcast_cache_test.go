@@ -12,7 +12,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestShardBroadcastCachePopConsumesBlock(t *testing.T) {
+func TestShardBroadcastCacheBlockCanBeReadRepeatedly(t *testing.T) {
 	cache := newShardBroadcastBlockCache(time.Minute, 1<<20, 16)
 	downloaded := testShardBroadcastDownloadedBlock(t, 10, 0x10)
 	meta := &tnstore.BlockMeta{ID: downloaded.ID, GenUTime: 123}
@@ -21,9 +21,9 @@ func TestShardBroadcastCachePopConsumesBlock(t *testing.T) {
 		t.Fatalf("store block: %v", err)
 	}
 
-	got, err := cache.PopBlock(downloaded.ID)
+	got, err := cache.Block(downloaded.ID)
 	if err != nil {
-		t.Fatalf("pop block: %v", err)
+		t.Fatalf("read block: %v", err)
 	}
 	if !got.ID.Equals(&downloaded.ID) {
 		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(downloaded.ID))
@@ -47,8 +47,12 @@ func TestShardBroadcastCachePopConsumesBlock(t *testing.T) {
 		t.Fatalf("meta = %+v, want cached meta", got.Meta)
 	}
 
-	if _, err = cache.PopBlock(downloaded.ID); !errors.Is(err, tnstore.ErrNotFound) {
-		t.Fatalf("second pop err = %v, want ErrNotFound", err)
+	got, err = cache.Block(downloaded.ID)
+	if err != nil {
+		t.Fatalf("second read block: %v", err)
+	}
+	if !got.ID.Equals(&downloaded.ID) {
+		t.Fatalf("second block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(downloaded.ID))
 	}
 }
 
@@ -65,8 +69,8 @@ func TestShardBroadcastCachePrunesExpiredBlocks(t *testing.T) {
 	if entries := shardBroadcastCacheLen(cache); entries != 0 {
 		t.Fatalf("cache entries = %d, want 0", entries)
 	}
-	if _, err := cache.popBlockAt(downloaded.ID, now.Add(2*time.Second)); !errors.Is(err, tnstore.ErrNotFound) {
-		t.Fatalf("pop expired err = %v, want ErrNotFound", err)
+	if _, err := cache.blockAt(downloaded.ID, now.Add(2*time.Second)); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("read expired err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -87,13 +91,13 @@ func TestShardBroadcastCachePrunesOldestOverflow(t *testing.T) {
 		t.Fatalf("cache entries = %d, want 2", entries)
 	}
 	popAt := now.Add(10 * time.Second)
-	if _, err := cache.popBlockAt(first.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
-		t.Fatalf("oldest pop err = %v, want ErrNotFound", err)
+	if _, err := cache.blockAt(first.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("oldest read err = %v, want ErrNotFound", err)
 	}
-	if _, err := cache.popBlockAt(second.ID, popAt); err != nil {
+	if _, err := cache.blockAt(second.ID, popAt); err != nil {
 		t.Fatalf("second block was evicted: %v", err)
 	}
-	if _, err := cache.popBlockAt(third.ID, popAt); err != nil {
+	if _, err := cache.blockAt(third.ID, popAt); err != nil {
 		t.Fatalf("third block was evicted: %v", err)
 	}
 }
@@ -120,17 +124,17 @@ func TestShardBroadcastCacheReplacementMovesEntryToBack(t *testing.T) {
 	}
 
 	popAt := now.Add(10 * time.Second)
-	got, err := cache.popBlockAt(first.ID, popAt)
+	got, err := cache.blockAt(first.ID, popAt)
 	if err != nil {
 		t.Fatalf("replaced first block was evicted: %v", err)
 	}
 	if got.Kind != "updated" {
 		t.Fatalf("replaced kind = %q, want updated", got.Kind)
 	}
-	if _, err = cache.popBlockAt(second.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err = cache.blockAt(second.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("second block error = %v, want ErrNotFound", err)
 	}
-	if _, err = cache.popBlockAt(third.ID, popAt); err != nil {
+	if _, err = cache.blockAt(third.ID, popAt); err != nil {
 		t.Fatalf("third block was evicted: %v", err)
 	}
 }
@@ -150,8 +154,8 @@ func TestDownloadBlockFullUsesShardBroadcastCacheBeforeOverlay(t *testing.T) {
 	if !got.ID.Equals(&downloaded.ID) || got.Kind != downloaded.Kind {
 		t.Fatalf("unexpected downloaded block: %#v", got)
 	}
-	if _, err = node.shardBroadcastCache.PopBlock(downloaded.ID); !errors.Is(err, tnstore.ErrNotFound) {
-		t.Fatalf("cache was not consumed, err=%v", err)
+	if _, err = node.shardBroadcastCache.Block(downloaded.ID); err != nil {
+		t.Fatalf("cache was consumed: %v", err)
 	}
 	if _, err = node.peerStorage.BlockFull(context.Background(), downloaded.ID); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("block was stored in peer cache, err=%v", err)

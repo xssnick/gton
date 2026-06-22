@@ -278,6 +278,63 @@ func TestLiteserverMetricsTreatUnspecifiedLSErrorAsError(t *testing.T) {
 	}
 }
 
+func TestSyncMetricsUseAppliedMasterchainForMasterGap(t *testing.T) {
+	namespace := "testgton"
+	m := New(namespace)
+
+	currentMaster := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     100,
+	}
+	appliedMaster := currentMaster
+	appliedMaster.SeqNo = 105
+	networkMaster := currentMaster
+	networkMaster.SeqNo = 106
+
+	err := m.RegisterRuntimeCollectors(RuntimeReaders{
+		ServiceStatusReader: func() service.StatusSnapshot {
+			return service.StatusSnapshot{
+				StatusSnapshot: p2p.StatusSnapshot{
+					LatestMasterchain: &networkMaster,
+				},
+				LocalMasterchain:        &currentMaster,
+				LocalMasterchainUtime:   time.Now().Unix() - 60,
+				AppliedMasterchain:      &appliedMaster,
+				AppliedMasterchainUtime: time.Now().Unix() - 5,
+			}
+		},
+		DBStatusReader: func(context.Context) (pebblestore.DBStatus, error) {
+			return pebblestore.DBStatus{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("register runtime collectors: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		namespace + `_sync_local_seqno{chain="masterchain",shard="masterchain"} 105`,
+		namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics output does not contain %q\n%s", want, body)
+		}
+	}
+	removed := namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 6`
+	if strings.Contains(body, removed) {
+		t.Fatalf("metrics output contains coupled master gap %q\n%s", removed, body)
+	}
+}
+
 func TestLiteserverMetricsUseUnspecifiedReasonForUnclassifiedErrors(t *testing.T) {
 	namespace := "testgton"
 	m := New(namespace)

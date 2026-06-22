@@ -883,7 +883,7 @@ func TestLoadStateCellTreeRequiresCommittedStateMeta(t *testing.T) {
 		t.Fatalf("load state before metadata = %v, want ErrNotFound", err)
 	}
 
-	if err = store.SaveBlockState(ctx, &storage.BlockState{
+	if err = saveTestBlockState(ctx, store, &storage.BlockState{
 		Block:         block,
 		StateRootHash: rootHash[:],
 	}); err != nil {
@@ -895,7 +895,7 @@ func TestLoadStateCellTreeRequiresCommittedStateMeta(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointPersistsOneDurableState(t *testing.T) {
+func TestStateCheckpointEntriesPersistsOneDurableState(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -924,7 +924,7 @@ func TestSaveStateCheckpointPersistsOneDurableState(t *testing.T) {
 		Shards:      map[storage.ShardKey]storage.BlockState{},
 	}
 
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{state}, current); err != nil {
 		t.Fatalf("save state checkpoint: %v", err)
 	}
 
@@ -952,7 +952,7 @@ func TestSaveStateCheckpointPersistsOneDurableState(t *testing.T) {
 	}
 }
 
-func TestSaveBlockStateRejectsNonLevelZeroStateRoot(t *testing.T) {
+func TestStateMetadataPublishRejectsNonLevelZeroStateRoot(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -974,7 +974,7 @@ func TestSaveBlockStateRejectsNonLevelZeroStateRoot(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
 	rootHash := root.HashKey(0)
-	err = store.SaveBlockState(context.Background(), &storage.BlockState{
+	err = saveTestBlockState(context.Background(), store, &storage.BlockState{
 		Block:         block,
 		StateRootHash: rootHash[:],
 		Cell:          root,
@@ -984,7 +984,7 @@ func TestSaveBlockStateRejectsNonLevelZeroStateRoot(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
+func TestStateCheckpointEntriesPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1036,6 +1036,13 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 			},
 		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
+	}, {
+		Artifact: &storage.ServedBlockFull{
+			ID:    prev,
+			Block: []byte{0x20},
+			Proof: []byte{0x21},
+			Meta:  &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
+		},
 	}}, storage.StateCellRecords{}, current)
 	if err != nil {
 		t.Fatalf("save checkpoint with artifacts: %v", err)
@@ -1082,6 +1089,15 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	if !meta.Has(storage.BlockMetaHasServedFull) {
 		t.Fatalf("checkpoint block meta flags = %v, want served full", meta.Flags)
 	}
+	if got, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo); err != nil || !got.Equals(&block) {
+		t.Fatalf("checkpoint lookup by seqno failed: err=%v got=%s", err, storage.FormatBlockRef(got))
+	}
+	if got, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, 19); err != nil || !got.Equals(&block) {
+		t.Fatalf("checkpoint lookup by lt failed: err=%v got=%s", err, storage.FormatBlockRef(got))
+	}
+	if got, err := store.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, 123); err != nil || !got.Equals(&block) {
+		t.Fatalf("checkpoint lookup by utime failed: err=%v got=%s", err, storage.FormatBlockRef(got))
+	}
 
 	decodedNext, err := readNextBlockLink(ctx, store, prev)
 	if err != nil {
@@ -1100,7 +1116,62 @@ func TestSaveStateCheckpointPublishesBlockArtifactsAfterPackSync(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointStoresShardInclusionMasterRef(t *testing.T) {
+func TestStateCheckpointEntriesRejectsNonZeroStateWithPartialArtifact(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     12,
+	}
+	state := blockStateWithSingleCell(block, 0x23)
+	current := &storage.CurrentState{
+		SyncedAt:    time.Now(),
+		Masterchain: storage.BlockStateWithoutCells(state),
+		Shards:      map[storage.ShardKey]storage.BlockState{},
+	}
+
+	_, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		State: state,
+		Artifact: &storage.ServedBlockFull{
+			ID:    state.Block,
+			Block: []byte{0x30, 0x31},
+			Meta:  &storage.BlockMeta{ID: state.Block, GenUTime: 123},
+		},
+	}}, storage.StateCellRecords{}, current)
+	if err == nil || !strings.Contains(err.Error(), "artifact has no proof") {
+		t.Fatalf("partial checkpoint error = %v, want missing proof", err)
+	}
+}
+
+func TestStateCheckpointEntriesRejectsNonZeroStateWithoutArtifact(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	state := blockStateWithSingleCell(ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		SeqNo:     12,
+	}, 0x24)
+
+	_, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
+		State: state,
+	}}, storage.StateCellRecords{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "has no full block artifact") {
+		t.Fatalf("state-only checkpoint error = %v, want missing artifact", err)
+	}
+}
+
+func TestStateCheckpointEntriesStoresShardInclusionMasterRef(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1120,7 +1191,7 @@ func TestSaveStateCheckpointStoresShardInclusionMasterRef(t *testing.T) {
 			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master, shard}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{master, shard}, current); err != nil {
 		t.Fatalf("save state checkpoint: %v", err)
 	}
 
@@ -1133,7 +1204,7 @@ func TestSaveStateCheckpointStoresShardInclusionMasterRef(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointOverwritesHeaderMasterRefWithInclusionMaster(t *testing.T) {
+func TestStateCheckpointEntriesOverwritesHeaderMasterRefWithInclusionMaster(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1163,7 +1234,7 @@ func TestSaveStateCheckpointOverwritesHeaderMasterRefWithInclusionMaster(t *test
 			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master, shard}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{master, shard}, current); err != nil {
 		t.Fatalf("save state checkpoint: %v", err)
 	}
 
@@ -1204,10 +1275,10 @@ func TestStateSyncProgressPersistsAndClears(t *testing.T) {
 
 	masterState := blockStateWithSingleCell(master, 0x11)
 	shardState := blockStateWithSingleCell(shard, 0x22)
-	if err = store.SaveBlockState(ctx, masterState); err != nil {
+	if err = saveTestBlockState(ctx, store, masterState); err != nil {
 		t.Fatalf("save master state: %v", err)
 	}
-	if err = store.SaveBlockState(ctx, shardState); err != nil {
+	if err = saveTestBlockState(ctx, store, shardState); err != nil {
 		t.Fatalf("save shard state: %v", err)
 	}
 
@@ -1276,6 +1347,66 @@ func TestOpenReadOnlyRejectsWrites(t *testing.T) {
 	}
 }
 
+func TestSaveBlockMetaRejectsEmptyMeta(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testMasterBlockID(20, 20)
+	err = store.SaveBlockMeta(&storage.BlockMeta{ID: block})
+	if err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("save empty block meta err = %v, want empty meta error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("empty block meta lookup err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveBlockMetaRejectsDirectNextRefs(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testMasterBlockID(20, 20)
+	next := testMasterBlockID(21, 21)
+	err = store.SaveBlockMeta(&storage.BlockMeta{
+		ID:       prev,
+		GenUTime: 20,
+		NextRefs: []ton.BlockIDExt{next},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot set next refs directly") {
+		t.Fatalf("save direct next refs err = %v, want direct next refs error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), prev); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("direct next refs meta lookup err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSaveBlockMetaRejectsDirectArtifactFlags(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := testMasterBlockID(20, 20)
+	err = store.SaveBlockMeta(&storage.BlockMeta{
+		ID:       block,
+		Flags:    storage.BlockMetaHasServedFull,
+		GenUTime: 20,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot set artifact flags directly") {
+		t.Fatalf("save direct artifact flags err = %v, want direct artifact flags error", err)
+	}
+	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("direct artifact flags meta lookup err = %v, want ErrNotFound", err)
+	}
+}
+
 func testMasterBlockID(seqno uint32, seed byte) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: -1,
@@ -1286,7 +1417,7 @@ func testMasterBlockID(seqno uint32, seed byte) ton.BlockIDExt {
 	}
 }
 
-func TestSaveStateCheckpointPersistsAllAppliedStates(t *testing.T) {
+func TestStateCheckpointEntriesPersistsAllAppliedStates(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1308,7 +1439,7 @@ func TestSaveStateCheckpointPersistsAllAppliedStates(t *testing.T) {
 	}
 
 	states := []*storage.BlockState{master10, shard100, master11, shard101}
-	if err = store.SaveStateCheckpoint(ctx, states, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, states, current); err != nil {
 		t.Fatalf("save checkpoint states: %v", err)
 	}
 
@@ -1330,7 +1461,7 @@ func TestSaveStateCheckpointPersistsAllAppliedStates(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointRejectsCurrentShardWithoutStateMeta(t *testing.T) {
+func TestStateCheckpointEntriesRejectsCurrentShardWithoutStateMeta(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1349,7 +1480,7 @@ func TestSaveStateCheckpointRejectsCurrentShardWithoutStateMeta(t *testing.T) {
 		},
 	}
 
-	err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master}, current)
+	err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{master}, current)
 	if err == nil || !strings.Contains(err.Error(), "current shard state") || !strings.Contains(err.Error(), "metadata is missing") {
 		t.Fatalf("save checkpoint error = %v, want missing current shard metadata", err)
 	}
@@ -1358,7 +1489,7 @@ func TestSaveStateCheckpointRejectsCurrentShardWithoutStateMeta(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointAllowsExistingCurrentShardStateMeta(t *testing.T) {
+func TestStateCheckpointEntriesAllowsExistingCurrentShardStateMeta(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1368,7 +1499,7 @@ func TestSaveStateCheckpointAllowsExistingCurrentShardStateMeta(t *testing.T) {
 	ctx := context.Background()
 	master := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 10}, 0x10)
 	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 100}, 0x20)
-	if err = store.SaveBlockState(ctx, shard); err != nil {
+	if err = saveTestBlockState(ctx, store, shard); err != nil {
 		t.Fatalf("save existing shard state: %v", err)
 	}
 
@@ -1381,7 +1512,7 @@ func TestSaveStateCheckpointAllowsExistingCurrentShardStateMeta(t *testing.T) {
 		},
 	}
 
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{master}, current); err != nil {
 		t.Fatalf("save checkpoint with existing shard state: %v", err)
 	}
 	loaded, err := store.CurrentState(ctx)
@@ -1394,7 +1525,7 @@ func TestSaveStateCheckpointAllowsExistingCurrentShardStateMeta(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointUpdatesReusedCurrentShardMasterRef(t *testing.T) {
+func TestStateCheckpointEntriesUpdatesReusedCurrentShardMasterRef(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1406,10 +1537,10 @@ func TestSaveStateCheckpointUpdatesReusedCurrentShardMasterRef(t *testing.T) {
 	newMaster := blockStateWithSingleCell(ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: 11}, 0x11)
 	shard := blockStateWithSingleCell(ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 100}, 0x20)
 	shard.MasterchainRef = &oldMaster.Block
-	if err = store.SaveBlockState(ctx, oldMaster); err != nil {
+	if err = saveTestBlockState(ctx, store, oldMaster); err != nil {
 		t.Fatalf("save old master state: %v", err)
 	}
-	if err = store.SaveBlockState(ctx, shard); err != nil {
+	if err = saveTestBlockState(ctx, store, shard); err != nil {
 		t.Fatalf("save existing shard state: %v", err)
 	}
 
@@ -1423,7 +1554,7 @@ func TestSaveStateCheckpointUpdatesReusedCurrentShardMasterRef(t *testing.T) {
 			storage.ShardKeyFromBlock(shard.Block): currentShard,
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newMaster}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{newMaster}, current); err != nil {
 		t.Fatalf("save checkpoint with reused shard state: %v", err)
 	}
 
@@ -1506,9 +1637,7 @@ func mustReachableEncodedRecords(tb testing.TB, root *cell.Cell) []storage.Encod
 }
 
 func checkpointEntries(state *storage.BlockState) []storage.StateCheckpointBlock {
-	return []storage.StateCheckpointBlock{{
-		State: state,
-	}}
+	return []storage.StateCheckpointBlock{testStateCheckpointEntry(state)}
 }
 
 func testPrunedBranch(tb testing.TB, hidden *cell.Cell) *cell.Cell {
@@ -1656,7 +1785,7 @@ func TestSaveStateCellTreeStoresPrunedRefAsRawCell(t *testing.T) {
 	}
 }
 
-func TestSaveBlockStateSwitchesStateToLazyRoot(t *testing.T) {
+func TestStateMetadataPublishSwitchesStateToLazyRoot(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1677,7 +1806,7 @@ func TestSaveBlockStateSwitchesStateToLazyRoot(t *testing.T) {
 		Block: block,
 		Cell:  root,
 	}
-	if err = store.SaveBlockState(ctx, state); err != nil {
+	if err = saveTestBlockState(ctx, store, state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
 
@@ -1909,14 +2038,14 @@ func TestApplyMerkleUpdateCheckpointKeepsIntermediateCells(t *testing.T) {
 	directBlock := block
 	directBlock.SeqNo = 2
 	directState := blockStateWithRoot(directBlock, update2To.Virtualize(0))
-	if err = store.SaveBlockState(ctx, directState); err == nil {
+	if err = saveTestBlockState(ctx, store, directState); err == nil {
 		t.Fatal("direct proof-shaped state with unsaved pruned boundary was accepted")
 	}
 
 	nextBlock := block
 	nextBlock.SeqNo = 3
 	nextState := blockStateWithRoot(nextBlock, state2)
-	if err = store.SaveBlockState(ctx, nextState); err != nil {
+	if err = saveTestBlockState(ctx, store, nextState); err != nil {
 		t.Fatalf("save merged state: %v", err)
 	}
 
@@ -1929,7 +2058,7 @@ func TestApplyMerkleUpdateCheckpointKeepsIntermediateCells(t *testing.T) {
 	assertStateCellExists(t, store, newBranch.HashKey(), true)
 }
 
-func TestSaveStateCheckpointDoesNotCommitProofShapedRoot(t *testing.T) {
+func TestStateCheckpointEntriesDoesNotCommitProofShapedRoot(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -1949,7 +2078,7 @@ func TestSaveStateCheckpointDoesNotCommitProofShapedRoot(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(initial),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{initial}, initialCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{initial}, initialCurrent); err != nil {
 		t.Fatalf("save initial current: %v", err)
 	}
 
@@ -1968,7 +2097,7 @@ func TestSaveStateCheckpointDoesNotCommitProofShapedRoot(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(badState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{badState}, badCurrent); err == nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{badState}, badCurrent); err == nil {
 		t.Fatal("checkpoint with proof-shaped root was accepted")
 	}
 
@@ -1984,7 +2113,7 @@ func TestSaveStateCheckpointDoesNotCommitProofShapedRoot(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointWithPreparedCellsLoadsLazyRoot(t *testing.T) {
+func TestStateCheckpointEntriesWithPreparedCellsLoadsLazyRoot(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2091,7 +2220,7 @@ func TestStateCellPrewriteAllowsCheckpointWithoutCellBatch(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointWithPreparedCellsAllowsExternalBoundary(t *testing.T) {
+func TestStateCheckpointEntriesWithPreparedCellsAllowsExternalBoundary(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2183,7 +2312,7 @@ func TestStateCheckpointAllowsOrphanCellsWithoutMetadata(t *testing.T) {
 	}
 }
 
-func TestSaveStateCheckpointInitializesActiveOriginOnFirstCurrentState(t *testing.T) {
+func TestStateCheckpointEntriesInitializesActiveOriginOnFirstCurrentState(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(Options{Dir: dir})
 	if err != nil {
@@ -2203,7 +2332,7 @@ func TestSaveStateCheckpointInitializesActiveOriginOnFirstCurrentState(t *testin
 		Masterchain:      storage.BlockStateWithoutCells(state),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{state}, current); err != nil {
 		t.Fatalf("save first current checkpoint: %v", err)
 	}
 
@@ -2233,7 +2362,7 @@ func TestSaveStateCheckpointInitializesActiveOriginOnFirstCurrentState(t *testin
 	}
 }
 
-func TestSaveStateCheckpointDoesNotOverwriteActiveOriginWhenCurrentAlreadyExists(t *testing.T) {
+func TestStateCheckpointEntriesDoesNotOverwriteActiveOriginWhenCurrentAlreadyExists(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2253,7 +2382,7 @@ func TestSaveStateCheckpointDoesNotOverwriteActiveOriginWhenCurrentAlreadyExists
 		Masterchain:      storage.BlockStateWithoutCells(firstState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{firstState}, firstCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{firstState}, firstCurrent); err != nil {
 		t.Fatalf("save first current checkpoint: %v", err)
 	}
 	clearActiveCellOriginForTest(t, store)
@@ -2270,7 +2399,7 @@ func TestSaveStateCheckpointDoesNotOverwriteActiveOriginWhenCurrentAlreadyExists
 		Masterchain:      storage.BlockStateWithoutCells(nextState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{nextState}, nextCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{nextState}, nextCurrent); err != nil {
 		t.Fatalf("save next current checkpoint: %v", err)
 	}
 
@@ -2303,7 +2432,7 @@ func TestOpenMigratesActiveOriginFromExistingCurrentState(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(state),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{state}, current); err != nil {
 		t.Fatalf("save current checkpoint: %v", err)
 	}
 	clearActiveCellOriginForTest(t, store)
@@ -2346,7 +2475,7 @@ func TestOpenReadOnlyDoesNotMigrateActiveOrigin(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(state),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{state}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{state}, current); err != nil {
 		t.Fatalf("save current checkpoint: %v", err)
 	}
 	clearActiveCellOriginForTest(t, store)
@@ -2414,7 +2543,7 @@ func TestSwitchCellGenerationAtomicallySwitchesActiveGeneration(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -2469,7 +2598,7 @@ func TestSwitchCellGenerationAtomicallySwitchesActiveGeneration(t *testing.T) {
 
 	durableNewState := blockStateWithRoot(newBlock, newRoot)
 	durableHistoricalState := blockStateWithRoot(historicalBlock, historicalRoot)
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableHistoricalState, durableNewState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableHistoricalState, durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -2552,7 +2681,7 @@ func TestDeleteStateMetadataBeforeCellGenerationSwitchDeletesStateMetadataBefore
 			storage.ShardKeyFromBlock(oldShard.Block): storage.BlockStateWithoutCells(oldShard),
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldMaster, oldShard}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldMaster, oldShard}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -2580,7 +2709,7 @@ func TestDeleteStateMetadataBeforeCellGenerationSwitchDeletesStateMetadataBefore
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
 	durableNewState := blockStateWithRoot(newBlock, newRoot)
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -2626,7 +2755,7 @@ func TestSwitchCellGenerationDoesNotRewriteCurrentStateMetadata(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(durableState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableState}, durableCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableState}, durableCurrent); err != nil {
 		t.Fatalf("save durable checkpoint: %v", err)
 	}
 
@@ -2698,7 +2827,7 @@ func TestSwitchCellGenerationRejectsDurableRootMismatch(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(durableState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableState}, durableCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableState}, durableCurrent); err != nil {
 		t.Fatalf("save durable checkpoint: %v", err)
 	}
 
@@ -2752,7 +2881,7 @@ func TestSwitchCellGenerationKeepsCurrentShardStateMetadataBeforeOrigin(t *testi
 			storage.ShardKeyFromBlock(originShard.Block): storage.BlockStateWithoutCells(originShard),
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldMaster, origin, originShard}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldMaster, origin, originShard}, current); err != nil {
 		t.Fatalf("save durable checkpoint: %v", err)
 	}
 
@@ -2806,7 +2935,7 @@ func TestSwitchCellGenerationKeepsImportedOriginShardStateMetadataBeforeOrigin(t
 		Masterchain:      storage.BlockStateWithoutCells(origin),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldMaster, staleShard, origin, originShard}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldMaster, staleShard, origin, originShard}, current); err != nil {
 		t.Fatalf("save durable checkpoint: %v", err)
 	}
 
@@ -2871,7 +3000,7 @@ func TestPendingCellGenerationMigrationSurvivesRestart(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -2950,7 +3079,7 @@ func TestCellGenerationMigrationProgressSurvivesRestart(t *testing.T) {
 		t.Fatalf("begin generation: %v", err)
 	}
 	state := blockStateWithSingleCell(origin, 0x33)
-	if err = store.SaveBlockState(ctx, state); err != nil {
+	if err = saveTestBlockState(ctx, store, state); err != nil {
 		t.Fatalf("save block state: %v", err)
 	}
 	current := &storage.CurrentState{
@@ -3006,7 +3135,7 @@ func TestCellGenerationMigrationProgressFromStoredCurrentStateResolvesMasterRef(
 			storage.ShardKeyFromBlock(shard.Block): storage.BlockStateWithoutCells(shard),
 		},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{master, shard}, current); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{master, shard}, current); err != nil {
 		t.Fatalf("save state checkpoint: %v", err)
 	}
 
@@ -3230,7 +3359,7 @@ func TestLazyCellLoaderInGenerationKeepsRequestedGenerationAfterSwitch(t *testin
 		Masterchain:      storage.BlockStateWithoutCells(newState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{newState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -3267,7 +3396,7 @@ func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -3295,7 +3424,7 @@ func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
 	durableNewState := blockStateWithRoot(newBlock, newRoot)
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -3312,7 +3441,7 @@ func TestSwitchCellGenerationRejectsAdvancedCurrent(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(advancedState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{advancedState}, advancedCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{advancedState}, advancedCurrent); err != nil {
 		t.Fatalf("save advanced checkpoint: %v", err)
 	}
 
@@ -3348,7 +3477,7 @@ func TestSwitchCellGenerationRejectsMissingCandidateCurrentCellsBeforeCleanup(t 
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -3368,7 +3497,7 @@ func TestSwitchCellGenerationRejectsMissingCandidateCurrentCellsBeforeCleanup(t 
 		Masterchain:      storage.BlockStateWithoutCells(newState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{newState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -3411,7 +3540,7 @@ func TestSwitchCellGenerationRejectsUnflushedCandidateCells(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -3435,7 +3564,7 @@ func TestSwitchCellGenerationRejectsUnflushedCandidateCells(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(newState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{newState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{newState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -3473,7 +3602,7 @@ func TestOpenReconcilesRetiredCellGenerationCleanup(t *testing.T) {
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -3501,7 +3630,7 @@ func TestOpenReconcilesRetiredCellGenerationCleanup(t *testing.T) {
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
 	durableNewState := blockStateWithRoot(newBlock, newRoot)
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)
@@ -3577,7 +3706,7 @@ func TestActiveLazyRootSurvivesPreviousGenerationDeleteWhenCellExistsInNewGenera
 		Masterchain:      storage.BlockStateWithoutCells(oldState),
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{oldState}, oldCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{oldState}, oldCurrent); err != nil {
 		t.Fatalf("save old checkpoint: %v", err)
 	}
 
@@ -3609,7 +3738,7 @@ func TestActiveLazyRootSurvivesPreviousGenerationDeleteWhenCellExistsInNewGenera
 		Shards:           map[storage.ShardKey]storage.BlockState{},
 	}
 	durableNewState := blockStateWithRoot(newBlock, root)
-	if err = store.SaveStateCheckpoint(ctx, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
+	if err = saveTestStateCheckpoint(ctx, store, []*storage.BlockState{durableNewState}, newCurrent); err != nil {
 		t.Fatalf("save durable current before switch: %v", err)
 	}
 	saveCellGenerationSwitchProgress(t, store, ctx, generation, newCurrent)

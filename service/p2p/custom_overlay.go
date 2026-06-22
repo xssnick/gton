@@ -44,7 +44,7 @@ func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 			return rebroadcastPlan{mode: rebroadcastModeSimple}
 		}
 		return rebroadcastPlan{mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender}
-	case "tonNode.externalMessageBroadcast", "tonNode.ihrMessageBroadcast":
+	case "tonNode.externalMessageBroadcast":
 		return rebroadcastPlan{mode: rebroadcastModeFEC}
 	default:
 		return planRebroadcast(kind, payloadLen)

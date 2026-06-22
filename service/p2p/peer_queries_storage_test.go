@@ -12,6 +12,7 @@ import (
 	"github.com/xssnick/gton/service/archive/packfile"
 	"github.com/xssnick/gton/service/blockproof"
 	tnstore "github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -774,16 +775,14 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 	}
 
 	anchor := testStoredMasterBlockID(10)
-	anchorMeta := &tnstore.BlockMeta{ID: anchor}
-	anchorMeta.Mark(tnstore.BlockMetaIsKeyBlock)
-	if err = store.SaveBlockMeta(anchorMeta); err != nil {
-		t.Fatalf("save anchor meta: %v", err)
-	}
+	saveTestServedMasterBlockMeta(t, store, anchor, true)
 	for seqno := uint32(11); seqno <= 14; seqno++ {
 		block := testStoredMasterBlockID(seqno)
-		meta := &tnstore.BlockMeta{ID: block}
+		meta := &tnstore.BlockMeta{ID: block, GenUTime: seqno}
 		if seqno == 12 || seqno == 14 {
 			meta.Mark(tnstore.BlockMetaIsKeyBlock)
+			saveTestServedMasterBlockMeta(t, store, block, true)
+			continue
 		}
 		if err = store.SaveBlockMeta(meta); err != nil {
 			t.Fatalf("save block meta %d: %v", seqno, err)
@@ -813,7 +812,7 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 	store := newTestPebbleStore(t)
 	anchor := testStoredMasterBlockID(10)
-	if err := store.SaveBlockMeta(&tnstore.BlockMeta{ID: anchor}); err != nil {
+	if err := store.SaveBlockMeta(&tnstore.BlockMeta{ID: anchor, GenUTime: 10}); err != nil {
 		t.Fatalf("save anchor meta: %v", err)
 	}
 	keyBlock := testStoredMasterBlockID(12)
@@ -863,17 +862,9 @@ func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 	store := newTestPebbleStore(t)
 	anchor := testStoredMasterBlockID(10)
-	anchorMeta := &tnstore.BlockMeta{ID: anchor}
-	anchorMeta.Mark(tnstore.BlockMetaIsKeyBlock)
-	if err := store.SaveBlockMeta(anchorMeta); err != nil {
-		t.Fatalf("save anchor meta: %v", err)
-	}
+	saveTestServedMasterBlockMeta(t, store, anchor, true)
 	keyBlock := testStoredMasterBlockID(500_000)
-	meta := &tnstore.BlockMeta{ID: keyBlock}
-	meta.Mark(tnstore.BlockMetaIsKeyBlock)
-	if err := store.SaveBlockMeta(meta); err != nil {
-		t.Fatalf("save key block meta: %v", err)
-	}
+	saveTestServedMasterBlockMeta(t, store, keyBlock, true)
 
 	countingStore := &countingSeqNoLookupStore{Storage: store}
 	logger := discardLogger()
@@ -920,6 +911,32 @@ type countingSeqNoLookupStore struct {
 	tnstore.Storage
 
 	lookupBlockBySeqNoCalls int
+}
+
+func saveTestServedMasterBlockMeta(t *testing.T, store *pebblestore.Store, block ton.BlockIDExt, keyBlock bool) {
+	t.Helper()
+
+	meta := &tnstore.BlockMeta{
+		ID:       block,
+		GenUTime: block.SeqNo,
+	}
+	if keyBlock {
+		meta.Mark(tnstore.BlockMetaIsKeyBlock)
+	}
+	if _, err := store.SaveStateCheckpointEntries(context.Background(), []tnstore.StateCheckpointBlock{{
+		State: &tnstore.BlockState{
+			Block:         block,
+			StateRootHash: bytes.Repeat([]byte{0x01}, 32),
+		},
+		Artifact: &tnstore.ServedBlockFull{
+			ID:    block,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  meta,
+		},
+	}}, tnstore.StateCellRecords{}, nil); err != nil {
+		t.Fatalf("save served master block meta %s: %v", tnstore.FormatBlockRef(block), err)
+	}
 }
 
 func (s *countingSeqNoLookupStore) LookupBlockBySeqNo(ctx context.Context, key tnstore.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {

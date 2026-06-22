@@ -81,6 +81,11 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 	if got := source.downloadCount[storage.BlockKey(master)]; got != 0 {
 		t.Fatalf("expected pending master state not to be downloaded, got %d", got)
 	}
+	for _, block := range []ton.BlockIDExt{master, base, aux} {
+		if store.artifacts[storage.BlockKey(block)] == nil {
+			t.Fatalf("checkpoint artifact for %s was not stored", storage.FormatBlockRef(block))
+		}
+	}
 }
 
 func TestSyncerReturnsShardDownloadError(t *testing.T) {
@@ -154,10 +159,10 @@ func TestSyncerUsesStoredShardStateWithoutCurrentCheckpoint(t *testing.T) {
 	}
 
 	store := newTestStateStore()
-	if err := store.SaveBlockState(context.Background(), testMasterState(t, master, shard)); err != nil {
+	if err := store.saveBlockState(context.Background(), testMasterState(t, master, shard)); err != nil {
 		t.Fatalf("save stored master: %v", err)
 	}
-	if err := store.SaveBlockState(context.Background(), &storage.BlockState{Block: shard}); err != nil {
+	if err := store.saveBlockState(context.Background(), &storage.BlockState{Block: shard}); err != nil {
 		t.Fatalf("save stored shard: %v", err)
 	}
 	if err := store.SaveStateSyncProgress(context.Background(), &storage.CurrentState{
@@ -199,10 +204,10 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	}
 
 	store := newTestStateStore()
-	if err := store.SaveBlockState(context.Background(), testMasterState(t, pendingMaster, doneShard, missingShard)); err != nil {
+	if err := store.saveBlockState(context.Background(), testMasterState(t, pendingMaster, doneShard, missingShard)); err != nil {
 		t.Fatalf("save pending master: %v", err)
 	}
-	if err := store.SaveBlockState(context.Background(), &storage.BlockState{Block: doneShard}); err != nil {
+	if err := store.saveBlockState(context.Background(), &storage.BlockState{Block: doneShard}); err != nil {
 		t.Fatalf("save completed shard: %v", err)
 	}
 	progress := &storage.CurrentState{
@@ -247,13 +252,13 @@ func TestSyncerResumesPendingStateSyncWithoutSelectingNewMaster(t *testing.T) {
 	}
 }
 
-func TestImportAndPersistStoresShardMasterchainRefBeforeMetadata(t *testing.T) {
+func TestImportCellsSetsShardMasterchainRefWithoutPublishingMetadata(t *testing.T) {
 	master := testStateBlock(-1, topShard, 10)
 	shard := testStateBlock(0, topShard, 11)
 	store := newTestStateStore()
 	importer := newStateImportCoordinator(zerolog.Nop())
 
-	_, err := importer.ImportAndPersist(
+	state, err := importer.ImportCells(
 		context.Background(),
 		newImmediateDownloadedState(&storage.BlockState{
 			Block: shard,
@@ -263,14 +268,14 @@ func TestImportAndPersistStoresShardMasterchainRefBeforeMetadata(t *testing.T) {
 		master,
 	)
 	if err != nil {
-		t.Fatalf("import and persist shard state: %v", err)
+		t.Fatalf("import shard state cells: %v", err)
 	}
+	assertShardMasterchainRef(t, *state, master)
 
-	stored, err := store.BlockState(context.Background(), shard)
-	if err != nil {
-		t.Fatalf("load stored shard state: %v", err)
+	_, err = store.BlockState(context.Background(), shard)
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("published shard state err = %v, want ErrNotFound", err)
 	}
-	assertShardMasterchainRef(t, *stored, master)
 }
 
 func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
@@ -379,9 +384,13 @@ func TestSyncerSyncZeroStateCurrentStoresMasterAndShardZeroStates(t *testing.T) 
 		},
 	}
 	store := newTestStateStore()
+	staleProgressMaster := testStateBlock(-1, topShard, 100)
+	if err := store.saveBlockState(context.Background(), &storage.BlockState{Block: staleProgressMaster}); err != nil {
+		t.Fatalf("save stale progress master metadata: %v", err)
+	}
 	if err := store.SaveStateSyncProgress(context.Background(), &storage.CurrentState{
 		ShardClientSeqno: 100,
-		Masterchain:      storage.BlockState{Block: testStateBlock(-1, topShard, 100)},
+		Masterchain:      storage.BlockState{Block: staleProgressMaster},
 	}); err != nil {
 		t.Fatalf("save stale progress: %v", err)
 	}
@@ -441,7 +450,7 @@ func TestSyncerRejectsNonMasterchainKeyBlockAnchor(t *testing.T) {
 func savePendingMasterProgress(t *testing.T, store *testStateStore, master ton.BlockIDExt, shards ...ton.BlockIDExt) {
 	t.Helper()
 
-	if err := store.SaveBlockState(context.Background(), testMasterState(t, master, shards...)); err != nil {
+	if err := store.saveBlockState(context.Background(), testMasterState(t, master, shards...)); err != nil {
 		t.Fatalf("save pending master: %v", err)
 	}
 	if err := store.SaveStateSyncProgress(context.Background(), &storage.CurrentState{
@@ -682,6 +691,10 @@ func (f *fakeSource) MasterchainProof(context.Context, ton.BlockIDExt, bool) ([]
 	return nil, errors.New("unexpected masterchain proof download")
 }
 
+func (f *fakeSource) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
+	return testServedBlockFull(block), nil
+}
+
 func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (storage.DownloadedState, error) {
 	key := storage.BlockKey(block)
 
@@ -710,7 +723,16 @@ func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ to
 	if f.downloadedFactory != nil {
 		return f.downloadedFactory(block), nil
 	}
-	return newImmediateDownloadedState(storage.CloneBlockState(state)), nil
+	return newImmediateDownloadedStateWithArtifact(storage.CloneBlockState(state)), nil
+}
+
+func testServedBlockFull(block ton.BlockIDExt) *storage.ServedBlockFull {
+	return &storage.ServedBlockFull{
+		ID:    block,
+		Proof: []byte{0x01},
+		Block: []byte{0x02},
+		Meta:  &storage.BlockMeta{ID: block, GenUTime: 1},
+	}
 }
 
 type trackingDownloadedState struct {
@@ -751,16 +773,32 @@ func (d *trackingDownloadedState) ImportCells(ctx context.Context, _ storage.Sta
 	return d.Decode(ctx)
 }
 
+func (d *trackingDownloadedState) BlockArtifact() *storage.ServedBlockFull {
+	return testServedBlockFull(d.block)
+}
+
 func (d *trackingDownloadedState) Cleanup() error {
 	return nil
 }
 
 type immediateDownloadedState struct {
-	state *storage.BlockState
+	state    *storage.BlockState
+	artifact *storage.ServedBlockFull
 }
 
 func newImmediateDownloadedState(state *storage.BlockState) storage.DownloadedState {
 	return &immediateDownloadedState{state: storage.CloneBlockState(state)}
+}
+
+func newImmediateDownloadedStateWithArtifact(state *storage.BlockState) storage.DownloadedState {
+	if state == nil {
+		return &immediateDownloadedState{}
+	}
+
+	return &immediateDownloadedState{
+		state:    storage.CloneBlockState(state),
+		artifact: testServedBlockFull(state.Block),
+	}
 }
 
 func (d *immediateDownloadedState) Block() ton.BlockIDExt {
@@ -778,7 +816,15 @@ func (d *immediateDownloadedState) ImportCells(ctx context.Context, _ storage.St
 	return d.Decode(ctx)
 }
 
+func (d *immediateDownloadedState) BlockArtifact() *storage.ServedBlockFull {
+	if d.artifact == nil {
+		return nil
+	}
+	return d.artifact.Clone()
+}
+
 func (d *immediateDownloadedState) Cleanup() error {
 	d.state = nil
+	d.artifact = nil
 	return nil
 }

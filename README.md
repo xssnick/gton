@@ -14,9 +14,11 @@ The project focuses on:
 
 The project is under active development. Storage format and configuration may change without backward compatibility.
 
+Telegram group: [@gtonnode](https://t.me/gtonnode)
+
 ## Hardware Requirements
 
-- Minimum RAM: `48 GB` (for mainnet).
+- Minimum RAM: `48 GB`.
 - Recommended RAM: `64 GB`.
 - Minimum CPU: `8` cores.
 - Minimum disk: `512 GB SSD`.
@@ -215,7 +217,7 @@ Simplified example:
 {
   "ton": {
     "global_config_path": "global.config.json",
-    "sync_before": 3600,
+    "sync_before": 14400,
     "state_ttl": 172800,
     "archive_ttl": 604800,
     "next_checkpoint_blocks": 200,
@@ -238,7 +240,7 @@ Simplified example:
     "key": "<base64 ed25519 seed>",
     "listen_addr": "0.0.0.0:7445",
     "master_block_cache": 128,
-    "shard_block_cache": 4096,
+    "shard_block_cache": 1024,
     "send_message_broadcast_bytes_per_second": 0,
     "send_message_broadcast_max_delay_ms": 100
   },
@@ -252,6 +254,9 @@ Simplified example:
     "decoded_cell_cache_max_entries": 1048576,
     "cell_shard_memtable_size": 268435456,
     "cell_memtable_stop_writes_threshold": 4,
+    "large_boc_shard_read_workers": 2,
+    "persistent_state_large_boc_batch_size": 524288,
+    "state_serialize_one_pass": false,
     "artifact_file_max_open": 512
   },
   "metrics": {
@@ -269,7 +274,7 @@ Simplified example:
 | Field | Description |
 | --- | --- |
 | `global_config_path` | Path to the TON global config. If the file is missing, it is downloaded during startup. |
-| `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `3600`. Set to `-1` only for Archival liteserver mode. |
+| `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `14400` (4 hours). Set to `-1` only for Archival liteserver mode. |
 | `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `172800` (2 days). Set to `0` to disable automatic cell DB generation rotation and keep the current-state DB generation forever. Required to be `0` when `sync_before=-1`. |
 | `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). Set to `0` to keep archives forever. Required to be `0` when `sync_before=-1`. |
 | `next_checkpoint_blocks` | Current-state checkpoint frequency during next-block sync, in masterchain blocks. Defaults to `200`. |
@@ -318,6 +323,9 @@ Simplified example:
 | `decoded_cell_cache_max_entries` | Maximum decoded cell cache entries. Defaults to `1048576`. |
 | `cell_shard_memtable_size` | Memtable size for one cell DB shard, in bytes. |
 | `cell_memtable_stop_writes_threshold` | Pebble stop-writes threshold for memtables. |
+| `large_boc_shard_read_workers` | Per-cell-DB-shard parallel readers for large-BOC state serialization loads. Defaults to `2`; `0` uses the default. |
+| `persistent_state_large_boc_batch_size` | Large-BOC serialization batch size for persistent state files, in cells. Defaults to `524288`; `0` uses the default. |
+| `state_serialize_one_pass` | Forces persistent state serialization to use one-pass large-BOC serialization for every state part. Defaults to `false`. |
 | `artifact_file_max_open` | Open-file limit for block/state artifacts. |
 
 ### `metrics`

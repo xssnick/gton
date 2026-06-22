@@ -36,12 +36,10 @@ type overlaySubscription struct {
 	seedScheduled       bool
 	seedTarget          int
 	nextSeedAt          time.Time
-	archivePeerMx       sync.Mutex
 	chainDownloadMx     sync.Mutex
 	peers               map[PeerID]*overlayPeer
 	neighbours          []PeerID
 	lastPingedNeighbour PeerID
-	archivePeers        map[string]*archivePeerPoolState
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
@@ -154,18 +152,8 @@ func (s *overlaySubscription) close() {
 		twoStepQueue.Close()
 	}
 	for _, peer := range peers {
-		peer.closeRebroadcastQueues()
-		if peer.overlay != nil {
-			peer.overlay.Close()
-		}
-		if peer.rldpOverlay != nil {
-			peer.rldpOverlay.Close()
-		}
+		peer.close()
 	}
-}
-
-type archivePeerPoolState struct {
-	cooldownUntil map[PeerID]time.Time
 }
 
 type chainDownloadState struct {
@@ -196,6 +184,7 @@ type overlayPeer struct {
 	overlay     *overlay.ADNLOverlayWrapper
 	rldp        *overlay.RLDPWrapper
 	rldpOverlay *overlay.RLDPOverlayWrapper
+	release     func()
 
 	statsMx               sync.Mutex
 	versionMajor          int32
@@ -218,6 +207,17 @@ type overlayPeer struct {
 	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
 	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
 	rebroadcastClosed     bool
+}
+
+func (p *overlayPeer) close() {
+	if p == nil {
+		return
+	}
+
+	p.closeRebroadcastQueues()
+	if p.release != nil {
+		p.release()
+	}
 }
 
 func (s *overlaySubscription) run(ctx context.Context) {
@@ -296,29 +296,6 @@ func (s *overlaySubscription) startSeedFromDHTTarget(ctx context.Context, target
 		s.seedScheduled = true
 		s.seedMx.Unlock()
 		s.scheduleSeedFromDHT(ctx, delay)
-		return
-	}
-	s.seedRunning = true
-	targetPeers = s.seedTarget
-	s.seedMx.Unlock()
-
-	s.runSeedFromDHT(ctx, targetPeers)
-}
-
-func (s *overlaySubscription) forceSeedFromDHTTarget(ctx context.Context, targetPeers int) {
-	if !s.isActive() {
-		return
-	}
-	if targetPeers < maxPeersPerOverlay {
-		targetPeers = maxPeersPerOverlay
-	}
-
-	s.seedMx.Lock()
-	if targetPeers > s.seedTarget {
-		s.seedTarget = targetPeers
-	}
-	if s.seedRunning {
-		s.seedMx.Unlock()
 		return
 	}
 	s.seedRunning = true
@@ -644,8 +621,9 @@ func (s *overlaySubscription) hasPeerReplacementCandidate(candidateID PeerID) bo
 		return true
 	}
 
+	protected := s.protectedPeerIDs()
 	now := time.Now()
-	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now)
+	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now, protected)
 	s.mx.Unlock()
 
 	return !evictID.IsZero()
@@ -707,6 +685,8 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 				Str("peer", pooled.addr).
 				Str("peer_id", pooled.id.String()).
 				Msg("connected overlay peer")
+		} else {
+			s.node.pool.closeIfUnused(pooled)
 		}
 		return attached, nil
 	}
@@ -786,6 +766,7 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 				Msg("connected fixed custom overlay peer")
 			return true, nil
 		}
+		s.node.pool.closeIfUnused(pooled)
 		return false, nil
 	}
 
@@ -842,7 +823,8 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 
 	var evicted *overlayPeer
 	if len(s.peers) >= s.peerLimit() {
-		evictID := s.attachPeerEvictionCandidateLocked(pooled.id)
+		protected := s.protectedPeerIDs()
+		evictID := s.attachPeerEvictionCandidateLocked(pooled.id, protected)
 		if evictID.IsZero() {
 			s.mx.Unlock()
 			return false
@@ -852,19 +834,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		s.removeNeighbourLocked(evictID)
 	}
 
-	allowBroadcastFEC := s.spec.Kind != overlayKindCustomFixed
-	state := &overlayPeer{
-		id:            pooled.id,
-		addr:          pooled.addr,
-		pub:           append(ed25519.PublicKey(nil), pooled.pub...),
-		announced:     cloneOverlayNode(announced),
-		fixedMember:   s.spec.Kind == overlayKindCustomFixed,
-		overlay:       pooled.adnl.CreateOverlayWithSettings(s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false),
-		rldp:          pooled.rldp,
-		rldpOverlay:   pooled.rldp.CreateOverlay(s.spec.ShortID),
-		alive:         true,
-		lastReceiveAt: time.Now(),
-	}
+	state := s.newOverlayPeer(pooled, announced, s.spec.Kind == overlayKindCustomFixed, s.spec.Kind != overlayKindCustomFixed)
 	if len(s.spec.AuthorizedKeys) > 0 {
 		state.overlay.SetAuthorizedKeys(s.spec.AuthorizedKeys)
 	}
@@ -874,7 +844,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	s.mx.Unlock()
 
 	if evicted != nil {
-		evicted.closeRebroadcastQueues()
+		evicted.close()
 	}
 	s.configureBroadcastFECRelay(state)
 	s.configureCustomTwoStepBroadcast(state)
@@ -885,6 +855,24 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		s.startPeerWarmup(state)
 	}
 	return true
+}
+
+func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *overlay.Node, fixedMember bool, allowBroadcastFEC bool) *overlayPeer {
+	adnlOverlay, rldpOverlay, release := s.node.pool.acquireOverlay(pooled, s.spec.ShortID, maxOverlayPayloadSize, allowBroadcastFEC, false)
+
+	return &overlayPeer{
+		id:            pooled.id,
+		addr:          pooled.addr,
+		pub:           append(ed25519.PublicKey(nil), pooled.pub...),
+		announced:     cloneOverlayNode(announced),
+		fixedMember:   fixedMember,
+		overlay:       adnlOverlay,
+		rldp:          pooled.rldp,
+		rldpOverlay:   rldpOverlay,
+		release:       release,
+		alive:         true,
+		lastReceiveAt: time.Now(),
+	}
 }
 
 func (s *overlaySubscription) acceptsPeerID(id PeerID) bool {
@@ -902,17 +890,27 @@ func (s *overlaySubscription) peerLimit() int {
 	return maxPeersPerOverlay
 }
 
-func (s *overlaySubscription) attachPeerEvictionCandidateLocked(candidateID PeerID) PeerID {
+func (s *overlaySubscription) protectedPeerIDs() map[PeerID]struct{} {
+	if s.node == nil {
+		return nil
+	}
+	return s.node.protectedPeerIDs()
+}
+
+func (s *overlaySubscription) attachPeerEvictionCandidateLocked(candidateID PeerID, protected map[PeerID]struct{}) PeerID {
 	now := time.Now()
-	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now)
+	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now, protected)
 	return evictID
 }
 
-func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID PeerID, now time.Time) (PeerID, float64) {
+func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID PeerID, now time.Time, protected map[PeerID]struct{}) (PeerID, float64) {
 	evictID := PeerID{}
 	evictScore := -1.0
 	for id, peer := range s.peers {
 		if id == candidateID {
+			continue
+		}
+		if _, ok := protected[id]; ok {
 			continue
 		}
 		if peer == nil {
@@ -1246,7 +1244,7 @@ func (s *overlaySubscription) removePeer(id PeerID) {
 	s.mx.Unlock()
 
 	if peer != nil {
-		peer.closeRebroadcastQueues()
+		peer.close()
 	}
 }
 

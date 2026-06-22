@@ -918,6 +918,9 @@ func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.Blo
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return PreparedBlock{}, err
 	}
+	if s.node == nil {
+		return PreparedBlock{}, fmt.Errorf("download block %s: p2p node is not initialized", storage.FormatBlockRef(block))
+	}
 
 	downloadStarted := time.Now()
 	raw, err := s.downloadExactChainBlockWithRetry(ctx, block)
@@ -940,18 +943,6 @@ func (s *Service) loadBlockStateForApply(ctx context.Context, state storage.Bloc
 	loaded, err := s.storage.BlockState(ctx, state.Block)
 	if err != nil {
 		return nil, err
-	}
-
-	if len(state.StateRootHash) == 0 {
-		// Block-only resolver probes may become historical replay dependencies.
-		// Reusing state metadata without its full block would leave future
-		// cell-generation migrations unable to replay the same transition.
-		if _, err = s.storage.BlockFull(ctx, state.Block); err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				return nil, storage.ErrNotFound
-			}
-			return nil, fmt.Errorf("load reusable block artifact %s: %w", storage.FormatBlockRef(state.Block), err)
-		}
 	}
 	return loaded, nil
 }

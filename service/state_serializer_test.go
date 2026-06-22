@@ -33,7 +33,7 @@ func TestStateSerializerFailsOnMissingPrunedBoundary(t *testing.T) {
 	var rootHash cell.Hash
 	copy(rootHash[:], root.Hash())
 	var buf bytes.Buffer
-	if err = cell.ToLargeBOC(&buf, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 1, persistentStateLargeBOCBatchSize); err == nil {
+	if err = cell.ToLargeBOC(&buf, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 1, defaultPersistentStateLargeBOCBatchSize); err == nil {
 		t.Fatal("serialized state with missing pruned boundary")
 	}
 }
@@ -47,7 +47,7 @@ func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
 		Block: zero,
 		Cell:  cell.BeginCell().EndCell(),
 	}
-	if err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{zeroState}, &tnstore.CurrentState{
+	if err := saveTestStateCheckpoint(ctx, store, []*tnstore.BlockState{zeroState}, &tnstore.CurrentState{
 		ShardClientSeqno: 0,
 		Masterchain:      *zeroState,
 		Shards:           map[tnstore.ShardKey]tnstore.BlockState{},
@@ -57,7 +57,7 @@ func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
 
 	svc := &Service{
 		storage:         store,
-		stateSerializer: newStateSerializer(zerolog.Nop(), store, t.TempDir(), false),
+		stateSerializer: newStateSerializer(zerolog.Nop(), store, t.TempDir(), false, 0, false),
 	}
 	if err := svc.processPersistentStateSerialization(ctx); err != nil {
 		t.Fatalf("process persistent state serialization: %v", err)
@@ -121,7 +121,7 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 	loader := newLargeBOCStateLoader(ctx, store, 0)
 	rootHash := root.HashKey()
 	var got bytes.Buffer
-	if err = cell.ToLargeBOC(&got, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, persistentStateLargeBOCBatchSize); err != nil {
+	if err = cell.ToLargeBOC(&got, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, defaultPersistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("serialize synthetic root: %v", err)
 	}
 
@@ -133,7 +133,7 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 
 	onePassLoader := newLargeBOCStateLoader(ctx, store, 0)
 	var onePass bytes.Buffer
-	if err = cell.ToLargeBOCOnePass(&onePass, []cell.Hash{rootHash}, persistentStateBOCOptions(), onePassLoader, 0, persistentStateLargeBOCBatchSize); err != nil {
+	if err = cell.ToLargeBOCOnePass(&onePass, []cell.Hash{rootHash}, persistentStateBOCOptions(), onePassLoader, 0, defaultPersistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("one-pass serialize synthetic root: %v", err)
 	}
 	if !bytes.Equal(onePass.Bytes(), want) {
@@ -191,7 +191,7 @@ func TestStateSerializerPersistsRawSplitRefs(t *testing.T) {
 
 	loader := newLargeBOCStateLoader(ctx, store, 0)
 	var got bytes.Buffer
-	if err = cell.ToLargeBOC(&got, []cell.Hash{root.HashKey()}, persistentStateBOCOptions(), loader, 0, persistentStateLargeBOCBatchSize); err != nil {
+	if err = cell.ToLargeBOC(&got, []cell.Hash{root.HashKey()}, persistentStateBOCOptions(), loader, 0, defaultPersistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("serialize split root with effective refs: %v", err)
 	}
 
@@ -285,9 +285,22 @@ func TestStateSerializationKeepsTwoPhaseForNonBasechainSplits(t *testing.T) {
 	}
 }
 
+func TestStateSerializationForcedOnePassOverridesConditions(t *testing.T) {
+	serializer := newStateSerializer(zerolog.Nop(), nil, "", false, 0, true)
+	target := stateSerializationTarget{
+		block: testPebbleBlockID(1, topShard, 101),
+		kind:  "shardchain",
+	}
+	parts := []state2.PersistentStatePart{{Kind: state2.PersistentStatePartUnsplit}}
+
+	if !serializer.useOnePassLargeBOCForStateSerialization(target, parts) {
+		t.Fatal("forced one-pass setting does not use one-pass large boc")
+	}
+}
+
 func TestStateSerializerTreatsExistingFinalFileAsReady(t *testing.T) {
 	store := openTestPebbleStorage(t)
-	serializer := newStateSerializer(zerolog.Nop(), store, store.StateFilesDir(), false)
+	serializer := newStateSerializer(zerolog.Nop(), store, store.StateFilesDir(), false, 0, false)
 
 	master := testPebbleBlockID(-1, topShard, 100)
 	block := testPebbleBlockID(0, topShard, 101)

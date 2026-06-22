@@ -76,28 +76,31 @@ type Node struct {
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
-	runCtx                    context.Context
-	zeroStateFileHash         []byte
-	zeroStateBlock            ton.BlockIDExt
-	initBlock                 ton.BlockIDExt
-	hardforks                 []ton.BlockIDExt
-	hardforkSet               map[blockIDFullKey]struct{}
-	externalPort              uint16
-	dhtListenAddr             string
-	storage                   storage2.Storage
-	peerStorage               storage2.PeerServingStorage
-	liveBlockCache            *storage2.LiveBlockCache
-	compressedState           CompressedBlockStateProvider
-	syncLag                   SyncLagProvider
-	signatureVerifier         BroadcastSignatureVerifier
-	broadcastAdmission        BroadcastAdmission
-	broadcastPipelineObserver BroadcastPipelineObserver
-	shardBroadcastCache       *shardBroadcastBlockCache
-	shardCandidateCache       *shardBlockCandidateCache
-	shardBroadcastWaitMx      sync.Mutex
-	shardBroadcastWaiters     map[storage2.BlockRootHash][]chan struct{}
-	blockCacheObserver        BlockCacheObserver
-	rebroadcastQuiet          atomic.Bool
+	runCtx                          context.Context
+	zeroStateFileHash               []byte
+	zeroStateBlock                  ton.BlockIDExt
+	initBlock                       ton.BlockIDExt
+	hardforks                       []ton.BlockIDExt
+	hardforkSet                     map[blockIDFullKey]struct{}
+	externalPort                    uint16
+	dhtListenAddr                   string
+	storage                         storage2.Storage
+	peerStorage                     storage2.PeerServingStorage
+	liveBlockCache                  *storage2.LiveBlockCache
+	compressedState                 CompressedBlockStateProvider
+	syncLag                         SyncLagProvider
+	signatureVerifier               BroadcastSignatureVerifier
+	broadcastAdmission              BroadcastAdmission
+	broadcastPipelineObserver       BroadcastPipelineObserver
+	shardBroadcastCache             *shardBroadcastBlockCache
+	shardCandidateCache             *shardBlockCandidateCache
+	shardBroadcastWaitMx            sync.Mutex
+	shardBroadcastWaiters           map[storage2.BlockRootHash][]chan struct{}
+	masterchainNextBroadcastCache   *masterchainNextBroadcastCache
+	masterchainNextBroadcastWaitMx  sync.Mutex
+	masterchainNextBroadcastWaiters map[storage2.BlockRootHash][]chan struct{}
+	blockCacheObserver              BlockCacheObserver
+	rebroadcastQuiet                atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time
@@ -105,11 +108,12 @@ type Node struct {
 	rebroadcastFECMu        sync.Mutex
 	rebroadcastFECPeers     map[rebroadcastFECLimiterClass]map[PeerID]struct{}
 
-	pendingBroadcastMx           sync.Mutex
-	pendingBroadcasts            map[string]pendingBlockBroadcastDecode
-	pendingBroadcastBytes        int64
-	pendingBroadcastProcessing   bool
-	pendingBroadcastProcessAgain bool
+	pendingBroadcastMx         sync.Mutex
+	pendingBroadcasts          map[string]pendingBlockBroadcastDecode
+	pendingBroadcastByPrev     map[storage2.BlockRootHash]map[string]struct{}
+	pendingBroadcastReadyPrev  map[storage2.BlockRootHash]ton.BlockIDExt
+	pendingBroadcastBytes      int64
+	pendingBroadcastProcessing bool
 
 	broadcastStatsMx sync.Mutex
 	broadcastStats   map[broadcastStatKey]uint64
@@ -144,7 +148,6 @@ type Node struct {
 	peerUse                   map[PeerID]peerUse
 	stateCellImportSlot       chan struct{}
 	stateSplitPartDecodeSlot  chan struct{}
-	zeroStateBootstrapMu      sync.Mutex
 	customOverlays            []CustomOverlayConfig
 }
 
@@ -240,56 +243,66 @@ func New(opts Options) (*Node, error) {
 	}
 
 	return &Node{
-		log:                       logger,
-		cfgPath:                   cfgPath,
-		listenAddr:                opts.ListenAddr,
-		externalIP:                append(net.IP(nil), opts.ExternalIP...),
-		externalPort:              opts.ExternalPort,
-		privKey:                   priv,
-		localID:                   localID,
-		dhtPrivKey:                dhtPriv,
-		gateway:                   gateway,
-		dhtListenAddr:             opts.DHTListenAddr,
-		pool:                      newPeerPool(gateway),
-		events:                    make(chan BroadcastEvent, broadcastEventBuffer),
-		eventQueue:                newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
-		deduper:                   newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		customFanoutDeduper:       newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		myExternalMessages:        newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
-		processedExternalMessages: newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
-		externalMessageLimiter:    extmsg.NewDefaultAddressLimiter(),
-		externalBroadcastPacer:    externalBroadcastPacer,
-		stopped:                   make(chan struct{}),
-		subscriptions:             map[string]*overlaySubscription{},
-		monitorMinSplitDepth:      map[int32]uint32{},
-		latestBasechainShards:     map[storage2.ShardKey]ton.BlockIDExt{},
-		observedMasterchainNotify: make(chan struct{}),
-		seenMasterchainNotify:     make(chan struct{}),
-		latestBasechainNotify:     make(chan struct{}),
-		rawMasterchainNotify:      make(chan struct{}),
-		storage:                   storage,
-		peerStorage:               peerStorage,
-		liveBlockCache:            liveBlockCache,
-		compressedState:           opts.CompressedState,
-		syncLag:                   opts.SyncLag,
-		signatureVerifier:         opts.SignatureVerifier,
-		broadcastAdmission:        opts.BroadcastAdmission,
-		shardBroadcastCache:       newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
-		shardCandidateCache:       newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
-		shardBroadcastWaiters:     map[storage2.BlockRootHash][]chan struct{}{},
-		rebroadcastThrottleLast:   map[string]time.Time{},
-		rebroadcastFECSlots:       newRebroadcastFECSlotLimits(),
-		rebroadcastFECPeers:       newRebroadcastFECPeerLimits(),
-		pendingBroadcasts:         map[string]pendingBlockBroadcastDecode{},
-		broadcastStats:            map[broadcastStatKey]uint64{},
-		fecReceiverLast:           map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
-		fecReceiverTotals:         map[string]fecReceiverCounterSnapshot{},
-		stateFilesDir:             stateFilesDir,
-		peerUse:                   map[PeerID]peerUse{},
-		stateCellImportSlot:       make(chan struct{}, 1),
-		stateSplitPartDecodeSlot:  make(chan struct{}, 1),
-		customOverlays:            append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
+		log:                             logger,
+		cfgPath:                         cfgPath,
+		listenAddr:                      opts.ListenAddr,
+		externalIP:                      append(net.IP(nil), opts.ExternalIP...),
+		externalPort:                    opts.ExternalPort,
+		privKey:                         priv,
+		localID:                         localID,
+		dhtPrivKey:                      dhtPriv,
+		gateway:                         gateway,
+		dhtListenAddr:                   opts.DHTListenAddr,
+		pool:                            newPeerPool(gateway),
+		events:                          make(chan BroadcastEvent, broadcastEventBuffer),
+		eventQueue:                      newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
+		deduper:                         newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		customFanoutDeduper:             newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		myExternalMessages:              newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		processedExternalMessages:       newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		externalMessageLimiter:          extmsg.NewDefaultAddressLimiter(),
+		externalBroadcastPacer:          externalBroadcastPacer,
+		stopped:                         make(chan struct{}),
+		subscriptions:                   map[string]*overlaySubscription{},
+		monitorMinSplitDepth:            map[int32]uint32{},
+		latestBasechainShards:           map[storage2.ShardKey]ton.BlockIDExt{},
+		observedMasterchainNotify:       make(chan struct{}),
+		seenMasterchainNotify:           make(chan struct{}),
+		latestBasechainNotify:           make(chan struct{}),
+		rawMasterchainNotify:            make(chan struct{}),
+		storage:                         storage,
+		peerStorage:                     peerStorage,
+		liveBlockCache:                  liveBlockCache,
+		compressedState:                 opts.CompressedState,
+		syncLag:                         opts.SyncLag,
+		signatureVerifier:               opts.SignatureVerifier,
+		broadcastAdmission:              opts.BroadcastAdmission,
+		shardBroadcastCache:             newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
+		shardCandidateCache:             newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
+		shardBroadcastWaiters:           map[storage2.BlockRootHash][]chan struct{}{},
+		masterchainNextBroadcastCache:   newMasterchainNextBroadcastCache(masterchainNextBroadcastCacheTTL, masterchainNextBroadcastCacheMaxBytes, masterchainNextBroadcastCacheMaxItems),
+		masterchainNextBroadcastWaiters: map[storage2.BlockRootHash][]chan struct{}{},
+		rebroadcastThrottleLast:         map[string]time.Time{},
+		rebroadcastFECSlots:             newRebroadcastFECSlotLimits(),
+		rebroadcastFECPeers:             newRebroadcastFECPeerLimits(),
+		pendingBroadcasts:               map[string]pendingBlockBroadcastDecode{},
+		pendingBroadcastByPrev:          map[storage2.BlockRootHash]map[string]struct{}{},
+		broadcastStats:                  map[broadcastStatKey]uint64{},
+		fecReceiverLast:                 map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
+		fecReceiverTotals:               map[string]fecReceiverCounterSnapshot{},
+		stateFilesDir:                   stateFilesDir,
+		peerUse:                         map[PeerID]peerUse{},
+		stateCellImportSlot:             make(chan struct{}, 1),
+		stateSplitPartDecodeSlot:        make(chan struct{}, 1),
+		customOverlays:                  append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
 	}, nil
+}
+
+func (n *Node) SetRuntimeCallbacks(callbacks RuntimeCallbacks) {
+	n.compressedState = callbacks
+	n.syncLag = callbacks
+	n.signatureVerifier = callbacks
+	n.broadcastAdmission = callbacks
 }
 
 func protocolDiagnosticLoggable(msg string) bool {
@@ -627,86 +640,6 @@ func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
 	n.latestBasechainNotify = make(chan struct{})
 }
 
-func (n *Node) WaitObservedMasterchainBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	startedAt := time.Now()
-	progressTicker := time.NewTicker(masterchainWaitLogEvery)
-	defer progressTicker.Stop()
-
-	for {
-		n.latestBlocksMx.RLock()
-		current := n.observedMasterchain
-		wait := n.observedMasterchainNotify
-		n.latestBlocksMx.RUnlock()
-
-		if current != nil {
-			return *current, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ton.BlockIDExt{}, ctx.Err()
-		case <-wait:
-		case <-progressTicker.C:
-			n.logMasterchainWaitProgress(startedAt)
-		}
-	}
-}
-
-func (n *Node) WaitBasechainBlock(ctx context.Context) (ton.BlockIDExt, error) {
-	startedAt := time.Now()
-	progressTicker := time.NewTicker(masterchainWaitLogEvery)
-	defer progressTicker.Stop()
-
-	for {
-		n.latestBlocksMx.RLock()
-		current := n.latestBasechain
-		wait := n.latestBasechainNotify
-		n.latestBlocksMx.RUnlock()
-
-		if current != nil {
-			return *current, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ton.BlockIDExt{}, ctx.Err()
-		case <-wait:
-		case <-progressTicker.C:
-			n.logBasechainWaitProgress(startedAt)
-		}
-	}
-}
-
-func (n *Node) logMasterchainWaitProgress(startedAt time.Time) {
-	n.logLatestBlockWaitProgress(startedAt, "masterchain")
-}
-
-func (n *Node) logBasechainWaitProgress(startedAt time.Time) {
-	n.logLatestBlockWaitProgress(startedAt, "basechain")
-}
-
-func (n *Node) logLatestBlockWaitProgress(startedAt time.Time, chain string) {
-	subscriptions := n.subscriptionsSnapshot()
-
-	var knownPeers, alivePeers, activeNeighbours, aliveNeighbours int
-	for _, sub := range subscriptions {
-		status := sub.statusSnapshot()
-		knownPeers += status.KnownPeers
-		alivePeers += status.AliveKnownPeers
-		activeNeighbours += status.ActiveNeighbours
-		aliveNeighbours += status.AliveNeighbours
-	}
-
-	n.log.Info().
-		Dur("elapsed", time.Since(startedAt)).
-		Int("overlays", len(subscriptions)).
-		Int("known_peers", knownPeers).
-		Int("alive_peers", alivePeers).
-		Int("active_neighbours", activeNeighbours).
-		Int("alive_neighbours", aliveNeighbours).
-		Msgf("waiting for latest %s block broadcast", chain)
-}
-
 func (n *Node) ZeroStateBlock() (ton.BlockIDExt, error) {
 	block, ok := n.configuredZeroStateBlock()
 	if !ok {
@@ -852,64 +785,6 @@ func emptyConfigBlock(block liteclient.ConfigBlock) bool {
 		len(block.FileHash) == 0
 }
 
-func (n *Node) EnsureZeroState(ctx context.Context) error {
-	block, ok := n.configuredZeroStateBlock()
-	if !ok {
-		return storage2.ErrNotFound
-	}
-
-	writer, _ := n.peerStorage.(storage2.PeerServingStorageWriter)
-	if writer == nil {
-		return storage2.ErrNotFound
-	}
-
-	n.zeroStateBootstrapMu.Lock()
-	defer n.zeroStateBootstrapMu.Unlock()
-
-	return n.ensureZeroState(ctx, block, writer)
-}
-
-func (n *Node) ensureZeroState(ctx context.Context, block ton.BlockIDExt, writer storage2.PeerServingStorageWriter) error {
-	if data, err := n.peerStorage.ZeroState(ctx, block); err == nil && len(data) > 0 {
-		return nil
-	} else if err != nil && !errors.Is(err, storage2.ErrNotFound) {
-		return err
-	}
-
-	n.log.Info().
-		Str("block", formatBlockRef(block)).
-		Msg("zero state is missing, downloading zero state")
-
-	artifact, err := n.DownloadState(ctx, block, block, 0, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cleanupErr := artifact.Cleanup(); cleanupErr != nil {
-			n.log.Debug().
-				Err(cleanupErr).
-				Str("block", formatBlockRef(block)).
-				Msg("failed to cleanup zero state artifact")
-		}
-	}()
-
-	zero, ok := artifact.(*zeroStateSnapshotArtifact)
-	if !ok {
-		return fmt.Errorf("unexpected zero state artifact %T", artifact)
-	}
-	zero.writer = writer
-
-	if _, err = artifact.Decode(ctx); err != nil {
-		return fmt.Errorf("verify zero state: %w", err)
-	}
-
-	logEvent := n.log.Info().
-		Str("block", formatBlockRef(block)).
-		Int("bytes", len(zero.data))
-	logEvent.Msg("zero state downloaded and stored")
-	return nil
-}
-
 func (n *Node) startDHT(ctx context.Context, cfg *liteclient.GlobalConfig) error {
 	if n.dhtListenAddr != "" {
 		return n.startDHTServer(ctx, cfg)
@@ -943,11 +818,13 @@ type peerPool struct {
 }
 
 type pooledPeer struct {
-	id   PeerID
-	addr string
-	pub  ed25519.PublicKey
-	adnl *overlay.ADNLWrapper
-	rldp *overlay.RLDPWrapper
+	id          PeerID
+	addr        string
+	pub         ed25519.PublicKey
+	adnl        *overlay.ADNLWrapper
+	rldp        *overlay.RLDPWrapper
+	refs        int
+	overlayRefs map[string]int
 }
 
 func newPeerPool(gateway *adnl.Gateway) *peerPool {
@@ -964,6 +841,7 @@ func (p *peerPool) Get(addr string, key ed25519.PublicKey) (*pooledPeer, error) 
 	}
 	pooled, _, err := p.wrap(peer)
 	if err != nil {
+		peer.Close()
 		return nil, err
 	}
 	return pooled, nil
@@ -988,11 +866,12 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	rldpClient := overlay.CreateExtendedRLDP(baseRLDP)
 
 	pooled := &pooledPeer{
-		id:   id,
-		addr: peer.RemoteAddr(),
-		pub:  append(ed25519.PublicKey(nil), peer.GetPubKey()...),
-		adnl: wrapper,
-		rldp: rldpClient,
+		id:          id,
+		addr:        peer.RemoteAddr(),
+		pub:         append(ed25519.PublicKey(nil), peer.GetPubKey()...),
+		adnl:        wrapper,
+		rldp:        rldpClient,
+		overlayRefs: map[string]int{},
 	}
 	rldpClient.SetOnDisconnect(func() {
 		p.mx.Lock()
@@ -1001,6 +880,87 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	})
 	p.peers[id] = pooled
 	return pooled, true, nil
+}
+
+func (p *peerPool) acquireOverlay(pooled *pooledPeer, overlayID []byte, maxUnauthBroadcastSize uint32, allowBroadcastFEC bool, trustUnauthorizedBroadcast bool) (*overlay.ADNLOverlayWrapper, *overlay.RLDPOverlayWrapper, func()) {
+	key := string(overlayID)
+
+	p.mx.Lock()
+	pooled.refs++
+	if pooled.overlayRefs == nil {
+		pooled.overlayRefs = map[string]int{}
+	}
+	pooled.overlayRefs[key]++
+	p.mx.Unlock()
+
+	adnlOverlay := pooled.adnl.CreateOverlayWithSettings(overlayID, maxUnauthBroadcastSize, allowBroadcastFEC, trustUnauthorizedBroadcast)
+	rldpOverlay := pooled.rldp.CreateOverlay(overlayID)
+
+	var once sync.Once
+	return adnlOverlay, rldpOverlay, func() {
+		once.Do(func() {
+			p.releaseOverlay(pooled, key, adnlOverlay, rldpOverlay)
+		})
+	}
+}
+
+func (p *peerPool) releaseOverlay(pooled *pooledPeer, overlayKey string, adnlOverlay *overlay.ADNLOverlayWrapper, rldpOverlay *overlay.RLDPOverlayWrapper) {
+	var closeBase *pooledPeer
+
+	p.mx.Lock()
+	if refs := pooled.overlayRefs[overlayKey]; refs <= 1 {
+		delete(pooled.overlayRefs, overlayKey)
+		if adnlOverlay != nil {
+			adnlOverlay.Close()
+		}
+		if rldpOverlay != nil {
+			rldpOverlay.Close()
+		}
+	} else {
+		pooled.overlayRefs[overlayKey] = refs - 1
+	}
+
+	if pooled.refs > 0 {
+		pooled.refs--
+	}
+	if pooled.refs == 0 && p.peers[pooled.id] == pooled {
+		delete(p.peers, pooled.id)
+		closeBase = pooled
+	}
+	p.mx.Unlock()
+
+	if closeBase != nil {
+		closeBase.close()
+	}
+}
+
+func (p *peerPool) closeIfUnused(pooled *pooledPeer) {
+	if pooled == nil {
+		return
+	}
+
+	var closeBase *pooledPeer
+
+	p.mx.Lock()
+	if pooled.refs == 0 && len(pooled.overlayRefs) == 0 && p.peers[pooled.id] == pooled {
+		delete(p.peers, pooled.id)
+		closeBase = pooled
+	}
+	p.mx.Unlock()
+
+	if closeBase != nil {
+		closeBase.close()
+	}
+}
+
+func (p *pooledPeer) close() {
+	if p.rldp != nil {
+		p.rldp.Close()
+		return
+	}
+	if p.adnl != nil {
+		p.adnl.Close()
+	}
 }
 
 func (p *peerPool) snapshot() []*pooledPeer {
@@ -1283,12 +1243,11 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 	}
 
 	sub := &overlaySubscription{
-		node:         n,
-		spec:         spec,
-		log:          n.log.With().Str("overlay", spec.Name).Logger(),
-		peers:        map[PeerID]*overlayPeer{},
-		archivePeers: map[string]*archivePeerPoolState{},
-		peerNotify:   make(chan struct{}, 1),
+		node:       n,
+		spec:       spec,
+		log:        n.log.With().Str("overlay", spec.Name).Logger(),
+		peers:      map[PeerID]*overlayPeer{},
+		peerNotify: make(chan struct{}, 1),
 	}
 	n.subscriptions[key] = sub
 	n.subscriptionsMx.Unlock()

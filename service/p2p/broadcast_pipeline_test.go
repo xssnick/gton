@@ -2,7 +2,9 @@ package p2p
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,18 @@ import (
 
 type testBroadcastPipelineObserver struct {
 	observations []BroadcastPipelineStageObservation
+}
+
+type testFailOnceCompressedStateProvider struct {
+	failOnce atomic.Bool
+	state    *cell.Cell
+}
+
+func (p *testFailOnceCompressedStateProvider) StateRootForCompressedBlock(context.Context, ton.BlockIDExt) (*cell.Cell, error) {
+	if p.failOnce.Swap(false) {
+		return nil, tnstore.ErrNotFound
+	}
+	return p.state, nil
 }
 
 func (o *testBroadcastPipelineObserver) ObserveBroadcastPipelineStage(observation BroadcastPipelineStageObservation) {
@@ -222,7 +236,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	if err := sub.handleOverlayBroadcast(nil, candidate, DeliveryTwoStep, true, sourceID); err != nil {
 		t.Fatalf("handle candidate broadcast: %v", err)
 	}
-	observer.requireStage(t, broadcastPipelineStageClassify, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultSuccess)
+	observer.requireStage(t, broadcastPipelineStageClassify, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultDrop)
 	observer.requireStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultError)
 
 	desc := tonnodeapi.NewShardBlockBroadcast{
@@ -250,7 +264,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	})
 	observer.requireStage(t, broadcastPipelineStageHotCacheNotify, "tonNode.blockBroadcast", DeliverySimple, broadcastPipelineResultSuccess)
 
-	if _, err := node.popShardBroadcastBlock(downloaded.ID); err != nil {
+	if _, err := node.shardBroadcastBlock(downloaded.ID); err != nil {
 		t.Fatalf("pop hot shard block: %v", err)
 	}
 	observer.requireStage(t, broadcastPipelineStageExactPop, "tonNode.blockBroadcast", "", broadcastPipelineResultSuccess)
@@ -418,16 +432,17 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 		log: discardLogger(),
 	}
 
-	downloaded := testShardBroadcastDownloadedBlock(t, 204, 0x204)
-	block := downloaded.ID
-	data := downloaded.BlockBOC
-	msg := tonnodeapi.NewBlockCandidateBroadcast{
-		ID:   block,
-		Data: data,
+	block := testBlockID(0, topShard, 204)
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      block,
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
 	}
 	payload, err := tl.Serialize(msg, true)
 	if err != nil {
-		t.Fatalf("serialize block candidate broadcast: %v", err)
+		t.Fatalf("serialize shard block broadcast: %v", err)
 	}
 
 	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryTwoStep, true, sourceID)
@@ -443,7 +458,173 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 	if !bytes.Equal(accepted.rebroadcast.payload, payload) {
 		t.Fatal("expected two-step rebroadcast payload to be preserved for custom fanout")
 	}
-	observer.requireNoStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep)
+	observer.requireStage(t, broadcastPipelineStageShardDescValidate, "tonNode.newShardBlockBroadcast", DeliveryTwoStep, broadcastPipelineResultSuccess)
+}
+
+func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
+	raw := testShardBroadcastDownloadedBlock(t, 208, 0x208)
+	tests := []struct {
+		name string
+		kind string
+		msg  any
+	}{
+		{
+			name: "raw_parse_failure",
+			kind: "tonNode.newBlockCandidateBroadcast",
+			msg: tonnodeapi.NewBlockCandidateBroadcast{
+				ID:   raw.ID,
+				Data: raw.BlockBOC,
+			},
+		},
+		{
+			name: "compressed_decode_failure",
+			kind: "tonNode.newBlockCandidateBroadcastCompressed",
+			msg: tonnodeapi.NewBlockCandidateBroadcastCompressed{
+				ID:         testBlockID(0, topShard, 209),
+				Compressed: []byte{0x01},
+			},
+		},
+		{
+			name: "compressed_v2_decode_failure",
+			kind: "tonNode.newBlockCandidateBroadcastCompressedV2",
+			msg: tonnodeapi.NewBlockCandidateBroadcastCompressedV2{
+				ID:         testBlockID(0, topShard, 210),
+				Compressed: []byte{0x01},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := newTestNode(t)
+			observer := &testBroadcastPipelineObserver{}
+			node.SetBroadcastPipelineObserver(observer)
+
+			source := testRebroadcastQueuePeer("source")
+			target := testRebroadcastQueuePeer("target")
+			sub := &overlaySubscription{
+				node: node,
+				spec: overlaySpec{
+					Name:    "basechain",
+					ShortID: []byte{0x01, 0x02, 0x03},
+				},
+				log: discardLogger(),
+				peers: map[PeerID]*overlayPeer{
+					source.id: source,
+					target.id: target,
+				},
+			}
+			payload, err := tl.Serialize(tt.msg, true)
+			if err != nil {
+				t.Fatalf("serialize candidate broadcast: %v", err)
+			}
+
+			err = sub.handleOverlayBroadcastPayload(source, tt.msg, newKnownBroadcastPayload(payload), DeliverySimple, false, source.id)
+			if err != nil {
+				t.Fatalf("handle candidate broadcast: %v", err)
+			}
+
+			observer.requireStage(t, broadcastPipelineStageClassify, tt.kind, DeliverySimple, broadcastPipelineResultDrop)
+			observer.requireStage(t, broadcastPipelineStageCandidateDecode, tt.kind, DeliverySimple, broadcastPipelineResultError)
+			if got := testBroadcastDropStatCount(node, "basechain", tt.kind, "decode_failed"); got != 1 {
+				t.Fatalf("decode failure drop count = %d, want 1", got)
+			}
+			if !node.deduper.Seen(broadcastFingerprint(sub.spec.ShortID, payload), time.Now()) {
+				t.Fatal("decode-failed candidate should stay deduped")
+			}
+			if _, ok := target.rebroadcastQueue.TryPop(); ok {
+				t.Fatal("decode-failed candidate reached same-overlay rebroadcast queue")
+			}
+		})
+	}
+}
+
+func TestCustomOverlayDropsIHRBroadcast(t *testing.T) {
+	node := newTestNode(t)
+	sourceID := testPeerID("source")
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:       "custom.private-a",
+			Kind:       overlayKindCustomFixed,
+			ShortID:    []byte{0x01, 0x02, 0x03},
+			MsgSenders: map[PeerID]int{sourceID: 1},
+		},
+		log: discardLogger(),
+	}
+	msg := IhrMessageBroadcast{
+		Message: IhrMessage{Data: []byte{0x01}},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize ihr broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliverySimple, false, sourceID)
+	if accepted != nil {
+		t.Fatalf("custom IHR broadcast was accepted: %+v", accepted)
+	}
+	if got := testBroadcastDropStatCount(node, "custom.private-a", "tonNode.ihrMessageBroadcast", "unsupported_custom_broadcast"); got != 1 {
+		t.Fatalf("unsupported custom IHR drop count = %d, want 1", got)
+	}
+}
+
+func TestCustomOverlayDropsSelfBroadcast(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:         "custom.private-a",
+			Kind:         overlayKindCustomFixed,
+			ShortID:      []byte{0x01, 0x02, 0x03},
+			BlockSenders: map[PeerID]struct{}{node.localID: {}},
+		},
+		log: discardLogger(),
+	}
+	block := testBlockID(0, topShard, 211)
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      block,
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize shard broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliverySimple, false, node.localID)
+	if accepted != nil {
+		t.Fatalf("custom self broadcast was accepted: %+v", accepted)
+	}
+	if got := testBroadcastDropStatCount(node, "custom.private-a", "tonNode.newShardBlockBroadcast", "self"); got != 1 {
+		t.Fatalf("custom self drop count = %d, want 1", got)
+	}
+}
+
+func TestPublicOverlayAcceptsIHRBroadcast(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	msg := IhrMessageBroadcast{
+		Message: IhrMessage{Data: []byte{0x01}},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize ihr broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliverySimple, false, testPeerID("source"))
+	if accepted == nil || accepted.rebroadcast == nil {
+		t.Fatal("expected public IHR broadcast to be accepted")
+	}
 }
 
 func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {
@@ -490,6 +671,187 @@ func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {
 	}
 	if got.kind != "tonNode.newShardBlockBroadcast" || !got.local {
 		t.Fatalf("unexpected custom fanout request: %#v", got)
+	}
+}
+
+func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
+	node := newTestNode(t)
+	publicSpec := overlaySpec{
+		Name:    "basechain",
+		Kind:    overlayKindPublicShard,
+		ShortID: []byte{0x01, 0x02, 0x03},
+	}
+	publicSub, _ := node.getOrCreateSubscription(publicSpec)
+	source := testRebroadcastQueuePeer("source")
+	target := testRebroadcastQueuePeer("target")
+	publicSub.peers[source.id] = source
+	publicSub.peers[target.id] = target
+
+	customSpec := overlaySpec{
+		Name:         "custom.private-a",
+		Kind:         overlayKindCustomFixed,
+		ShortID:      []byte{0x04, 0x05, 0x06},
+		BlockSenders: map[PeerID]struct{}{node.localID: {}},
+	}
+	customSub, _ := node.getOrCreateSubscription(customSpec)
+	customPeer := testRebroadcastQueuePeer("custom-peer")
+	customSub.peers[customPeer.id] = customPeer
+
+	blockCell := testPeerBlockRoot(t, 0, topShard, 212)
+	blockBOC := serializeCompressedBlockRoot(blockCell)
+	fileHash := hashSimpleBroadcastPayload(blockBOC)
+	blockHash := blockCell.HashKey()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     212,
+		RootHash:  blockHash[:],
+		FileHash:  fileHash,
+	}
+	proofCell := testBlockProofCell(t, block, nil)
+	compressed, err := cell.CompressBOC([]*cell.Cell{blockCell}, cell.CompressionImprovedStructureLZ4, nil)
+	if err != nil {
+		t.Fatalf("compress block broadcast v2: %v", err)
+	}
+	msg := tonnodeapi.BlockBroadcastCompressedV2{
+		ID: block,
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			Final:     false,
+			SessionID: bytes.Repeat([]byte{0x44}, 32),
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            block,
+				CollatedFileHash: bytes.Repeat([]byte{0x46}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
+		},
+		Proof:          proofCell.ToBOC(),
+		DataCompressed: compressed,
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize pending broadcast: %v", err)
+	}
+
+	req := rebroadcastRequest{
+		subscription: publicSub,
+		kind:         "tonNode.blockBroadcastCompressedV2",
+		payload:      payload,
+		sourcePeerID: source.id,
+	}
+	node.processPendingBlockBroadcastDecodeRequests(context.Background(), []pendingBlockBroadcastDecode{{
+		fingerprint:  "pending-v2",
+		overlay:      publicSpec.Name,
+		delivery:     DeliverySimple,
+		kind:         "tonNode.blockBroadcastCompressedV2",
+		block:        block,
+		sourcePeerID: source.id,
+		receivedAt:   time.Now(),
+		msg:          msg,
+		proofRoot:    proofCell,
+		rebroadcast:  &req,
+	}})
+
+	if _, ok := target.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("pending completion repeated same-overlay rebroadcast")
+	}
+	snapshot, ok := customSub.customTwoStepQueueStatusSnapshot()
+	if !ok {
+		t.Fatal("custom two-step queue was not initialized")
+	}
+	if snapshot.Items != 1 {
+		t.Fatalf("custom fanout queue items = %d, want 1", snapshot.Items)
+	}
+}
+
+func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
+	node := newTestNode(t)
+	node.storage = newTestPebbleStore(t)
+
+	state := cell.BeginCell().MustStoreUInt(0x1234, 16).EndCell()
+	provider := &testFailOnceCompressedStateProvider{state: state}
+	provider.failOnce.Store(true)
+	node.compressedState = provider
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			Kind:    overlayKindPublicShard,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+
+	blockCell := testPeerBlockRoot(t, 0, topShard, 213)
+	blockBOC := serializeCompressedBlockRoot(blockCell)
+	fileHash := hashSimpleBroadcastPayload(blockBOC)
+	blockHash := blockCell.HashKey()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     213,
+		RootHash:  blockHash[:],
+		FileHash:  fileHash,
+	}
+	proofBOC := testPeerBlockProofEnvelopeBOC(t, block, blockCell, nil)
+	proofCell, err := parseDownloadedBlockProof("test pending broadcast proof", proofBOC)
+	if err != nil {
+		t.Fatalf("parse pending broadcast proof: %v", err)
+	}
+	prev, err := compressedBlockPreviousState(block, proofCell)
+	if err != nil {
+		t.Fatalf("previous block from proof: %v", err)
+	}
+
+	node.processPendingBlockBroadcastDecodesForPrevAsync(prev)
+
+	compressed, err := cell.CompressBOC([]*cell.Cell{blockCell}, cell.CompressionImprovedStructureLZ4WithState, state)
+	if err != nil {
+		t.Fatalf("compress state-aware block broadcast: %v", err)
+	}
+	msg := tonnodeapi.BlockBroadcastCompressedV2{
+		ID: block,
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			Final:     false,
+			SessionID: bytes.Repeat([]byte{0x44}, 32),
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            block,
+				CollatedFileHash: bytes.Repeat([]byte{0x46}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
+		},
+		Proof:          proofBOC,
+		DataCompressed: compressed,
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize pending broadcast: %v", err)
+	}
+
+	accepted, err := sub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("source"))
+	if err != nil {
+		t.Fatalf("classify pending broadcast: %v", err)
+	}
+	if accepted == nil {
+		t.Fatal("expected pending broadcast placeholder")
+	}
+	node.acceptBroadcast(*accepted)
+
+	eventCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, ok := node.eventQueue.Pop(eventCtx)
+	if !ok {
+		t.Fatal("pending broadcast was not retried after enqueue")
+	}
+	if event.Downloaded == nil || !event.Downloaded.ID.Equals(&block) {
+		t.Fatalf("unexpected pending broadcast event: %#v", event)
+	}
+
+	node.pendingBroadcastMx.Lock()
+	pending := len(node.pendingBroadcasts)
+	node.pendingBroadcastMx.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending broadcasts = %d, want 0", pending)
 	}
 }
 

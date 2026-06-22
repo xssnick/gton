@@ -468,7 +468,7 @@ func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 	sub.noteLiveNextDownloadSuccess(chain, sticky, block, 300*time.Millisecond, 0)
 	sub.noteLiveNextDownloadSuccess(chain, fast, block, 20*time.Millisecond, 0)
 
-	candidates := sub.liveNextBlockDownloadCandidates(chain, PeerID{})
+	candidates := sub.liveNextBlockDownloadCandidates(PeerID{})
 	if len(candidates) != 2 {
 		t.Fatalf("unexpected candidate count: %d", len(candidates))
 	}
@@ -495,7 +495,7 @@ func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
 		BlockBOC: make([]byte, 1<<20),
 	}, time.Millisecond)
 
-	candidates := sub.liveNextBlockDownloadCandidates(chain, preferred.id)
+	candidates := sub.liveNextBlockDownloadCandidates(preferred.id)
 	if len(candidates) != 2 {
 		t.Fatalf("unexpected candidate count: %d", len(candidates))
 	}

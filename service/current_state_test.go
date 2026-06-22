@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -32,20 +34,97 @@ func testCurrentBlockStates(current *tnstore.CurrentState) []*tnstore.BlockState
 	states = append(states, tnstore.CloneBlockState(&current.Masterchain))
 	for _, key := range tnstore.SortedShardKeys(current.Shards) {
 		shard := current.Shards[key]
+		if shard.Block.Workchain != -1 && shard.MasterchainRef == nil {
+			master := current.Masterchain.Block
+			shard.MasterchainRef = &master
+		}
 		states = append(states, tnstore.CloneBlockState(&shard))
 	}
 	return states
 }
 
 func testStateCheckpointEntries(states []*tnstore.BlockState) []tnstore.StateCheckpointBlock {
+	return testStateCheckpointEntriesForCurrent(states, nil)
+}
+
+func testStateCheckpointEntriesForCurrent(states []*tnstore.BlockState, current *tnstore.CurrentState) []tnstore.StateCheckpointBlock {
 	entries := make([]tnstore.StateCheckpointBlock, 0, len(states))
 	for _, state := range states {
 		if state == nil {
 			continue
 		}
-		entries = append(entries, tnstore.StateCheckpointBlock{State: state})
+		entries = append(entries, testStateCheckpointEntryForCurrent(state, current))
 	}
 	return entries
+}
+
+func testStateCheckpointEntry(state *tnstore.BlockState) tnstore.StateCheckpointBlock {
+	return testStateCheckpointEntryForCurrent(state, nil)
+}
+
+func testStateCheckpointEntryForCurrent(state *tnstore.BlockState, current *tnstore.CurrentState) tnstore.StateCheckpointBlock {
+	entry := tnstore.StateCheckpointBlock{State: state}
+	if state != nil && state.Block.SeqNo != 0 {
+		entry.Artifact = testStateCheckpointArtifactForCurrent(state, current)
+	}
+	return entry
+}
+
+func testStateCheckpointArtifact(state *tnstore.BlockState) *tnstore.ServedBlockFull {
+	return testStateCheckpointArtifactForCurrent(state, nil)
+}
+
+func testStateCheckpointArtifactForCurrent(state *tnstore.BlockState, current *tnstore.CurrentState) *tnstore.ServedBlockFull {
+	block := state.Block
+	meta := &tnstore.BlockMeta{ID: block, GenUTime: block.SeqNo}
+	if block.Workchain != -1 {
+		if state.MasterchainRef != nil {
+			meta.MasterchainRefSeqno = state.MasterchainRef.SeqNo
+		} else if current != nil {
+			meta.MasterchainRefSeqno = current.Masterchain.Block.SeqNo
+		} else {
+			meta.MasterchainRefSeqno = block.SeqNo
+		}
+	}
+	return &tnstore.ServedBlockFull{
+		ID:    block,
+		Block: []byte{0x01},
+		Proof: []byte{0x02},
+		Meta:  meta,
+	}
+}
+
+func saveTestStateCheckpoint(ctx context.Context, store *pebblestore.Store, states []*tnstore.BlockState, current *tnstore.CurrentState) error {
+	_, err := store.SaveStateCheckpointEntries(ctx, testStateCheckpointEntriesForCurrent(states, current), tnstore.StateCellRecords{}, current)
+	return err
+}
+
+func saveTestBlockState(ctx context.Context, store *pebblestore.Store, state *tnstore.BlockState) error {
+	entries := testStateCheckpointEntries([]*tnstore.BlockState{state})
+	if state != nil && state.Block.Workchain != -1 && state.Block.SeqNo != 0 && state.MasterchainRef == nil {
+		entries = append(testStateCheckpointEntries([]*tnstore.BlockState{testDummyMasterState(state.Block.SeqNo)}), entries...)
+	}
+	_, err := store.SaveStateCheckpointEntries(ctx, entries, tnstore.StateCellRecords{}, nil)
+	return err
+}
+
+func testDummyMasterState(seqno uint32) *tnstore.BlockState {
+	return &tnstore.BlockState{
+		Block: ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+			SeqNo:     seqno,
+			RootHash:  testDummyHash(0xf1, seqno),
+			FileHash:  testDummyHash(0xf2, seqno),
+		},
+		StateRootHash: testDummyHash(0xf3, seqno),
+	}
+}
+
+func testDummyHash(prefix byte, seqno uint32) []byte {
+	hash := bytes.Repeat([]byte{prefix}, 32)
+	binary.BigEndian.PutUint32(hash[len(hash)-4:], seqno)
+	return hash
 }
 
 func openManualTestPebbleStorage(t *testing.T) *pebblestore.Store {
@@ -60,7 +139,7 @@ func openManualTestPebbleStorage(t *testing.T) *pebblestore.Store {
 	return store
 }
 
-func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
+func TestStateMetadataPublishDoesNotMoveCurrentState(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
 	master := testBlockID(-1, topShard, 50)
@@ -74,7 +153,7 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 		Block: base,
 		Cell:  testShardStateCell(t, base),
 	}
-	err := store.SaveStateCheckpoint(ctx, []*tnstore.BlockState{
+	err := saveTestStateCheckpoint(ctx, store, []*tnstore.BlockState{
 		masterState,
 		baseState,
 	}, &tnstore.CurrentState{
@@ -92,7 +171,7 @@ func TestSaveBlockStateDoesNotMoveCurrentState(t *testing.T) {
 		Block: testBlockID(0, topShard, 101),
 	}
 	next.Cell = testShardStateCell(t, next.Block)
-	if err = store.SaveBlockState(ctx, next); err != nil {
+	if err = saveTestBlockState(ctx, store, next); err != nil {
 		t.Fatalf("persist next shard: %v", err)
 	}
 
@@ -362,11 +441,15 @@ func TestCurrentBroadcastValidatorConfigUsesLiveCurrentState(t *testing.T) {
 	persistedMaster := testBlockID(-1, topShard, 120)
 	liveMaster := testBlockID(-1, topShard, 121)
 
-	if err := store.SaveCurrentState(ctx, &tnstore.CurrentState{
-		Masterchain: tnstore.BlockState{Block: persistedMaster},
+	persistedMasterState := tnstore.BlockState{
+		Block: persistedMaster,
+		Cell:  testShardStateCell(t, persistedMaster),
+	}
+	if err := saveTestStateCheckpoint(ctx, store, []*tnstore.BlockState{&persistedMasterState}, &tnstore.CurrentState{
+		Masterchain: persistedMasterState,
 		Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
 	}); err != nil {
-		t.Fatalf("save persisted current state: %v", err)
+		t.Fatalf("save persisted state checkpoint: %v", err)
 	}
 
 	svc := &Service{
@@ -400,20 +483,18 @@ func TestShardPrefetchDoesNotMarkScheduledWhenSlotUnavailable(t *testing.T) {
 	}
 	runner.shardPrefetchSlots <- struct{}{}
 
-	scheduled := map[tnstore.BlockRootHash]struct{}{}
-	scheduledOrder := []tnstore.BlockRootHash{}
 	master := testBlockID(-1, topShard, 125)
 	target := testBlockID(0, topShard, 126)
 
-	got := runner.scheduleShardPrefetch(scheduled, &scheduledOrder, master, []ton.BlockIDExt{target})
+	got := runner.scheduleShardPrefetch(master, []ton.BlockIDExt{target})
 	if got != 0 {
 		t.Fatalf("scheduled prefetch count = %d, want 0", got)
 	}
-	if _, ok := scheduled[tnstore.BlockKey(target)]; ok {
+	if _, ok := runner.shardPrefetchScheduled[tnstore.BlockKey(target)]; ok {
 		t.Fatal("prefetch target was marked scheduled without an available worker slot")
 	}
-	if len(scheduledOrder) != 0 {
-		t.Fatalf("scheduled order length = %d, want 0", len(scheduledOrder))
+	if len(runner.shardPrefetchOrder) != 0 {
+		t.Fatalf("scheduled order length = %d, want 0", len(runner.shardPrefetchOrder))
 	}
 }
 
@@ -468,7 +549,7 @@ func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntries(testCurrentBlockStates(current)), nil)
+	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current), nil)
 	if err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
@@ -512,7 +593,7 @@ func TestPersistArchiveCurrentStateStoresHistoricalAppliedStates(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	if _, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntries(states), nil); err != nil {
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(states, current), nil); err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
 	if _, err := store.BlockState(ctx, historical.Block); err != nil {
@@ -559,9 +640,9 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 		t.Fatalf("remember historical cells: %v", err)
 	}
 	checkpointCells := overlay.beginCheckpoint()
-	entries := append([]tnstore.StateCheckpointBlock{{
-		State: historical,
-	}}, testStateCheckpointEntries(testCurrentBlockStates(current))...)
+	entries := append([]tnstore.StateCheckpointBlock{
+		testStateCheckpointEntryForCurrent(historical, current),
+	}, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current)...)
 	runner := &archiveCatchUpRunner{
 		service: &Service{log: zerolog.Nop(), storage: store},
 		ctx:     ctx,
@@ -1159,12 +1240,6 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	if baseLive.stagedPeerLimit() != nextBlockBootstrapWidePeers {
 		t.Fatalf("live staged probe peers = %d, want %d", baseLive.stagedPeerLimit(), nextBlockBootstrapWidePeers)
 	}
-	if !(nextBlockBootstrapProbeDecision{liveTail: true, rawBroadcastAhead: true}).shouldPreferBroadcastCandidate() {
-		t.Fatal("live raw masterchain broadcast should prefer broadcast candidate")
-	}
-	if (nextBlockBootstrapProbeDecision{rawBroadcastAhead: true}).shouldPreferBroadcastCandidate() {
-		t.Fatal("cold raw masterchain broadcast should not delay peer probe")
-	}
 
 	oldUTime := time.Now().Add(-time.Duration(nextBlockBootstrapWideLagSeconds+1) * time.Second).Unix()
 	lagged, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{liveTail: true})
@@ -1302,30 +1377,162 @@ func TestCurrentStateWakeInterruptsShardStateCatchUpRetry(t *testing.T) {
 	}
 }
 
-func TestPreferredMasterchainBroadcastWaitReturnsQueuedBlock(t *testing.T) {
+func TestNextMasterchainApplyCandidateUsesBroadcastWhilePeerProbePrepares(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
 	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	result := make(chan nextBlockProbeResult, 1)
 
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
-		svc.wakeCurrentStateSync()
-	}()
-
+	queryCtx, cancelQuery := context.WithCancel(context.Background())
+	defer cancelQuery()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	cached, err := svc.waitPreferredMasterchainBroadcast(ctx, prev, masterchainSeqnoTarget(^uint32(0)), nil, time.Hour)
+	got := make(chan nextMasterchainApplyCandidateTestResult, 1)
+	go func() {
+		block, source, prepareElapsed, err := svc.waitNextMasterchainApplyCandidate(
+			ctx,
+			queryCtx,
+			prev,
+			masterchainSeqnoTarget(^uint32(0)),
+			nil,
+			nil,
+			result,
+			cancelQuery,
+		)
+		got <- nextMasterchainApplyCandidateTestResult{
+			block:          block,
+			source:         source,
+			prepareElapsed: prepareElapsed,
+			err:            err,
+		}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("broadcast-peer"))
+	svc.wakeCurrentStateSync()
+
+	select {
+	case res := <-got:
+		if res.err != nil {
+			t.Fatalf("wait next masterchain apply candidate: %v", res.err)
+		}
+		if !res.block.ID.Equals(&next) {
+			t.Fatalf("candidate block = %s, want %s", tnstore.FormatBlockRef(res.block.ID), tnstore.FormatBlockRef(next))
+		}
+		if res.source != "broadcast_queue" {
+			t.Fatalf("candidate source = %q, want broadcast_queue", res.source)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for broadcast candidate")
+	}
+}
+
+func TestNextMasterchainApplyCandidateReturnsPreparedPeerResult(t *testing.T) {
+	prev := testMasterBlockID(10)
+	next := testMasterBlockID(11)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	result := make(chan nextBlockProbeResult, 1)
+	prepared := testPreparedMasterchainBlock(prev, next)
+	prepared.PrepareElapsed = 7 * time.Millisecond
+	result <- nextBlockProbeResult{
+		block:          prepared,
+		source:         "peer_probe",
+		prepareElapsed: prepared.PrepareElapsed,
+	}
+
+	queryCtx, cancelQuery := context.WithCancel(context.Background())
+	defer cancelQuery()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	block, source, prepareElapsed, err := svc.waitNextMasterchainApplyCandidate(
+		ctx,
+		queryCtx,
+		prev,
+		masterchainSeqnoTarget(^uint32(0)),
+		nil,
+		nil,
+		result,
+		cancelQuery,
+	)
 	if err != nil {
-		t.Fatalf("wait preferred masterchain broadcast: %v", err)
+		t.Fatalf("wait next masterchain apply candidate: %v", err)
 	}
-	if !cached.block.ID.Equals(&next) {
-		t.Fatalf("preferred block = %s, want %s", tnstore.FormatBlockRef(cached.block.ID), tnstore.FormatBlockRef(next))
+	if !block.ID.Equals(&next) {
+		t.Fatalf("candidate block = %s, want %s", tnstore.FormatBlockRef(block.ID), tnstore.FormatBlockRef(next))
 	}
-	if cached.source != "broadcast_queue" {
-		t.Fatalf("preferred source = %q, want broadcast_queue", cached.source)
+	if source != "peer_probe" {
+		t.Fatalf("candidate source = %q, want peer_probe", source)
 	}
+	if prepareElapsed != prepared.PrepareElapsed {
+		t.Fatalf("prepare elapsed = %s, want %s", prepareElapsed, prepared.PrepareElapsed)
+	}
+}
+
+func TestNextMasterchainApplyCandidateDoesNotTimeoutAfterProbeReturned(t *testing.T) {
+	prev := testMasterBlockID(10)
+	next := testMasterBlockID(11)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	result := make(chan nextBlockProbeResult, 1)
+	probeReturned := make(chan struct{})
+	close(probeReturned)
+
+	queryCtx, cancelQuery := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelQuery()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	got := make(chan nextMasterchainApplyCandidateTestResult, 1)
+	go func() {
+		block, source, prepareElapsed, err := svc.waitNextMasterchainApplyCandidate(
+			ctx,
+			queryCtx,
+			prev,
+			masterchainSeqnoTarget(^uint32(0)),
+			nil,
+			probeReturned,
+			result,
+			cancelQuery,
+		)
+		got <- nextMasterchainApplyCandidateTestResult{
+			block:          block,
+			source:         source,
+			prepareElapsed: prepareElapsed,
+			err:            err,
+		}
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	prepared := testPreparedMasterchainBlock(prev, next)
+	prepared.PrepareElapsed = 5 * time.Millisecond
+	result <- nextBlockProbeResult{
+		block:          prepared,
+		source:         "peer_probe",
+		prepareElapsed: prepared.PrepareElapsed,
+	}
+
+	select {
+	case res := <-got:
+		if res.err != nil {
+			t.Fatalf("wait next masterchain apply candidate: %v", res.err)
+		}
+		if !res.block.ID.Equals(&next) {
+			t.Fatalf("candidate block = %s, want %s", tnstore.FormatBlockRef(res.block.ID), tnstore.FormatBlockRef(next))
+		}
+		if res.source != "peer_probe" {
+			t.Fatalf("candidate source = %q, want peer_probe", res.source)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for prepared peer candidate")
+	}
+}
+
+type nextMasterchainApplyCandidateTestResult struct {
+	block          PreparedBlock
+	source         string
+	prepareElapsed time.Duration
+	err            error
 }
 
 func testPreparedMasterchainBlock(prev ton.BlockIDExt, block ton.BlockIDExt) PreparedBlock {

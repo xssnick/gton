@@ -93,10 +93,9 @@ func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.Bl
 	result := make(chan probeResult, 1)
 	go func() {
 		downloaded, err := s.node.ProbeBlockFull(queryCtx, block, p2p.ProbeBlockFullOptions{
-			PeerLimit:            decision.peerLimit,
-			StagedPeerLimit:      decision.stagedPeerLimit,
-			StageDelay:           nextBlockBootstrapLiveStageDelay,
-			BroadcastPreferDelay: nextBlockBootstrapBroadcastPreferDelay,
+			PeerLimit:       decision.peerLimit,
+			StagedPeerLimit: decision.stagedPeerLimit,
+			StageDelay:      nextBlockBootstrapLiveStageDelay,
 		})
 		result <- probeResult{downloaded: downloaded, err: err}
 	}()

@@ -46,6 +46,7 @@ type archiveCatchUpRunner struct {
 	archiveSession *p2p.ArchiveSession
 	importCache    *archiveImportCache
 	pipeline       *archiveWindowPipeline
+	downloadGate   archiveDownloadBackpressureGate
 
 	started                        time.Time
 	startSeqno                     uint32
@@ -261,9 +262,12 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 				Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 				Bool("checkpoint_in_flight", r.checkpointDone != nil).
 				Msg("waiting for archive shard-client checkpoint backpressure")
+			resumeDownloads := r.pauseArchiveDownloadsForCheckpointBackpressure()
 			if _, err = r.finishCheckpoint(true); err != nil {
+				resumeDownloads()
 				return nil, err
 			}
+			resumeDownloads()
 		}
 
 		if err = r.logProgress(); err != nil {

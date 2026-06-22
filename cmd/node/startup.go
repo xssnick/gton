@@ -18,7 +18,6 @@ import (
 
 	"github.com/rs/zerolog"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
-	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/ton"
@@ -110,44 +109,6 @@ func ensureStoredZeroStateMatchesGlobalConfig(ctx context.Context, store storedZ
 	return nil
 }
 
-func startupZeroStateRequired(fromZero bool, initBlock ton.BlockIDExt, liteserverEnabled bool) bool {
-	return fromZero || initBlock.SeqNo == 0 || liteserverEnabled
-}
-
-func ensureZeroStateBeforeInitialSync(ctx context.Context, logger zerolog.Logger, node *p2p.Node) error {
-	logger.Info().Msg("preparing zero state before initial sync")
-
-	for attempt := 1; ; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, startupZeroStateAttemptTimeout)
-		err := node.EnsureZeroState(attemptCtx)
-		cancel()
-		if err == nil {
-			logger.Info().Msg("zero state is ready")
-			return nil
-		}
-		if errors.Is(err, storage.ErrNotFound) {
-			return err
-		}
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-
-		event := logger.Warn()
-		event.
-			Err(err).
-			Int("attempt", attempt).
-			Dur("attempt_timeout", startupZeroStateAttemptTimeout).
-			Dur("retry_in", startupZeroStateRetry).
-			Msg("zero state is not ready, will retry before initial sync")
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(startupZeroStateRetry):
-		}
-	}
-}
-
 func validBlockID(block ton.BlockIDExt) bool {
 	return len(block.RootHash) == 32 && len(block.FileHash) == 32
 }
@@ -205,10 +166,6 @@ func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 }
 
 func startMetricsServer(ctx context.Context, logger zerolog.Logger, addr string, handler http.Handler) error {
-	if addr == "" || handler == nil {
-		return nil
-	}
-
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", handler)
 

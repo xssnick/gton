@@ -32,6 +32,7 @@ type Source interface {
 	NextKeyBlocks(ctx context.Context, from ton.BlockIDExt, limit int32) (KeyBlockBatch, error)
 	InitBlockProof(ctx context.Context, block ton.BlockIDExt) (ProofDownload, error)
 	MasterchainProof(ctx context.Context, block ton.BlockIDExt, requireKey bool) ([]byte, error)
+	BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error)
 	DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (storage.DownloadedState, error)
 }
 
