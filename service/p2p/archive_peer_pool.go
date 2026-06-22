@@ -38,6 +38,7 @@ type archivePeerPool struct {
 
 	discoveryMx      sync.Mutex
 	discoveryRunning bool
+	discoveryDone    chan struct{}
 }
 
 type archivePeer struct {
@@ -140,7 +141,7 @@ func (p *archivePeerPool) addBorrowedPeer(peer *overlayPeer) bool {
 	}
 	if entry := p.peers[peer.id]; entry != nil {
 		var closePeer *overlayPeer
-		if entry.owner == archivePeerArchiveOnly {
+		if entry.owner == archivePeerArchiveOnly && entry.leases == 0 {
 			closePeer = entry.peer
 			entry.owner = archivePeerBorrowedLive
 			entry.peer = peer
@@ -160,6 +161,7 @@ func (p *archivePeerPool) addArchiveOnlyPeer(peer *overlayPeer) bool {
 	}
 
 	p.pruneClosedPeers()
+	p.pruneUnprovenDeadArchiveOnlyPeers(time.Now())
 
 	p.mx.Lock()
 	defer p.mx.Unlock()
@@ -217,13 +219,10 @@ func (p *archivePeerPool) candidates(shard archive.ShardID) []*overlayPeer {
 	proven := make([]*overlayPeer, 0, len(provenIDs))
 	other := make([]*overlayPeer, 0, len(p.peers))
 	for peerID, entry := range p.peers {
+		if !archivePeerUsable(entry, now) {
+			continue
+		}
 		peer := entry.peer
-		if peer == nil || !peer.hasOpenConnection() {
-			continue
-		}
-		if !peer.isAliveKnownOverlayPeer(now) && entry.archiveSuccess == 0 {
-			continue
-		}
 		if archivePeerCoolingDownLocked(state, peerID, now) {
 			continue
 		}
@@ -645,19 +644,19 @@ func (p *archivePeerPool) ready(shard archive.ShardID) bool {
 	return len(p.candidates(shard)) > 0
 }
 
-func (p *archivePeerPool) refreshUseless(ctx context.Context, shard archive.ShardID) {
+func (p *archivePeerPool) refreshUseless(ctx context.Context, shard archive.ShardID) <-chan struct{} {
 	if p.rotateUseless(shard) == 0 {
-		return
+		return nil
 	}
-	p.refill(ctx, true)
+	return p.refill(ctx, true)
 }
 
-func (p *archivePeerPool) refill(ctx context.Context, forceDHT bool) {
+func (p *archivePeerPool) refill(ctx context.Context, forceDHT bool) <-chan struct{} {
 	if p == nil || p.sub == nil {
-		return
+		return nil
 	}
 	if p.isClosed() {
-		return
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -667,10 +666,14 @@ func (p *archivePeerPool) refill(ctx context.Context, forceDHT bool) {
 	}
 
 	p.bootstrapLivePeers()
+	now := time.Now()
+	p.pruneClosedPeers()
+	p.pruneUnprovenDeadArchiveOnlyPeers(now)
 	p.startRandomPeerRefresh(ctx)
-	if forceDHT || p.size() < archivePeerSoftLimit {
-		p.startDHTDiscovery(ctx, bootstrapDiscoveryTarget)
+	if forceDHT || p.usableSize(now) < archivePeerSoftLimit {
+		return p.startDHTDiscovery(ctx, bootstrapDiscoveryTarget)
 	}
+	return nil
 }
 
 func (p *archivePeerPool) size() int {
@@ -679,6 +682,27 @@ func (p *archivePeerPool) size() int {
 	p.mx.Lock()
 	defer p.mx.Unlock()
 	return len(p.peers)
+}
+
+func (p *archivePeerPool) usableSize(now time.Time) int {
+	if p == nil {
+		return 0
+	}
+
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if p.closed {
+		return 0
+	}
+
+	count := 0
+	for _, entry := range p.peers {
+		if archivePeerUsable(entry, now) {
+			count++
+		}
+	}
+	return count
 }
 
 func (p *archivePeerPool) pruneClosedPeers() int {
@@ -707,7 +731,7 @@ func (p *archivePeerPool) pruneClosedPeers() int {
 			continue
 		}
 
-		if peer := p.removeClosedPeerLocked(peerID); peer != nil {
+		if peer := p.removePeerLocked(peerID); peer != nil {
 			archiveOnly = append(archiveOnly, peer)
 		}
 		removed++
@@ -720,7 +744,37 @@ func (p *archivePeerPool) pruneClosedPeers() int {
 	return removed
 }
 
-func (p *archivePeerPool) removeClosedPeerLocked(peerID PeerID) *overlayPeer {
+func (p *archivePeerPool) pruneUnprovenDeadArchiveOnlyPeers(now time.Time) int {
+	if p == nil {
+		return 0
+	}
+
+	p.mx.Lock()
+	if p.closed {
+		p.mx.Unlock()
+		return 0
+	}
+
+	var archiveOnly []*overlayPeer
+	removed := 0
+	for peerID, entry := range p.peers {
+		if !archivePeerUnprovenDeadArchiveOnly(entry, now) {
+			continue
+		}
+		if peer := p.removePeerLocked(peerID); peer != nil {
+			archiveOnly = append(archiveOnly, peer)
+		}
+		removed++
+	}
+	p.mx.Unlock()
+
+	for _, peer := range archiveOnly {
+		closeArchiveOnlyPeer(peer)
+	}
+	return removed
+}
+
+func (p *archivePeerPool) removePeerLocked(peerID PeerID) *overlayPeer {
 	entry := p.peers[peerID]
 	if entry == nil {
 		return nil
@@ -754,9 +808,9 @@ func (p *archivePeerPool) removeClosedPeerLocked(peerID PeerID) *overlayPeer {
 	return entry.peer
 }
 
-func (p *archivePeerPool) startDHTDiscovery(ctx context.Context, targetPeers int) {
+func (p *archivePeerPool) startDHTDiscovery(ctx context.Context, targetPeers int) <-chan struct{} {
 	if p.sub.node == nil || p.sub.node.dht == nil || !p.sub.isActive() {
-		return
+		return nil
 	}
 	if targetPeers < maxPeersPerOverlay {
 		targetPeers = maxPeersPerOverlay
@@ -764,25 +818,33 @@ func (p *archivePeerPool) startDHTDiscovery(ctx context.Context, targetPeers int
 
 	p.discoveryMx.Lock()
 	if p.discoveryRunning {
+		done := p.discoveryDone
 		p.discoveryMx.Unlock()
-		return
+		return done
 	}
 	p.discoveryRunning = true
+	done := make(chan struct{})
+	p.discoveryDone = done
 	p.discoveryMx.Unlock()
 
 	run := func() {
 		defer func() {
 			p.discoveryMx.Lock()
-			p.discoveryRunning = false
+			if p.discoveryDone == done {
+				p.discoveryRunning = false
+				p.discoveryDone = nil
+			}
+			close(done)
 			p.discoveryMx.Unlock()
 		}()
 		p.discoverFromDHT(ctx, targetPeers)
 	}
 	if p.sub.node != nil {
 		p.sub.node.runAsync(run)
-		return
+		return done
 	}
 	go run()
+	return done
 }
 
 func (p *archivePeerPool) discoverFromDHT(ctx context.Context, targetPeers int) {
@@ -803,7 +865,7 @@ func (p *archivePeerPool) discoverFromDHT(ctx context.Context, targetPeers int) 
 		go func() {
 			defer workers.Done()
 			for node := range jobs {
-				attached, err := p.connectArchiveNode(ctx, node)
+				attached, err := p.connectArchiveSeedNode(ctx, node)
 				results <- seedConnectResult{attached: attached, err: err}
 			}
 		}()
@@ -859,7 +921,10 @@ func (p *archivePeerPool) discoverFromDHT(ctx context.Context, targetPeers int) 
 		}
 	}
 
-	for i := 0; i < 8 && p.size() < targetPeers; i++ {
+	now := time.Now()
+	p.pruneClosedPeers()
+	p.pruneUnprovenDeadArchiveOnlyPeers(now)
+	for i := 0; i < 8 && p.usableSize(time.Now()) < targetPeers; i++ {
 		lookupCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
 		var nodes *overlay.NodesList
 		if cont == nil {
@@ -881,7 +946,7 @@ func (p *archivePeerPool) discoverFromDHT(ctx context.Context, targetPeers int) 
 		requests++
 		nodesSeen += len(nodes.List)
 		for _, node := range nodes.List {
-			if p.size() >= targetPeers {
+			if p.usableSize(time.Now()) >= targetPeers {
 				break
 			}
 			if !sendNode(node) {
@@ -958,10 +1023,17 @@ func (p *archivePeerPool) exchangeRandomPeers(ctx context.Context, peer *overlay
 		if ctx.Err() != nil {
 			return
 		}
-		if _, err = p.connectArchiveNode(ctx, node); err != nil {
+		if _, err = p.connectArchiveSeedNode(ctx, node); err != nil {
 			p.sub.log.Debug().Err(err).Msg("failed to connect archive peer learned from overlay")
 		}
 	}
+}
+
+func (p *archivePeerPool) connectArchiveSeedNode(ctx context.Context, node overlay.Node) (bool, error) {
+	connectCtx, cancel := context.WithTimeout(ctx, dhtSeedPeerTimeout)
+	defer cancel()
+
+	return p.connectArchiveNode(connectCtx, node)
 }
 
 func (p *archivePeerPool) connectArchiveNode(ctx context.Context, node overlay.Node) (bool, error) {
@@ -979,6 +1051,8 @@ func (p *archivePeerPool) connectArchiveNode(ctx context.Context, node overlay.N
 		return false, nil
 	}
 
+	p.pruneClosedPeers()
+	p.pruneUnprovenDeadArchiveOnlyPeers(time.Now())
 	if live := p.sub.peerByID(identity.peerID); live != nil {
 		live.mergeAnnouncement(&node)
 		return p.addBorrowedPeer(live), nil
@@ -1052,6 +1126,21 @@ func archivePeerFailureUseless(failure archivePeerFailure) bool {
 
 func archiveShardPeerStateEmpty(state *archiveShardPeerState) bool {
 	return state == nil || len(state.cooldownUntil) == 0 && len(state.failures) == 0
+}
+
+func archivePeerUsable(entry *archivePeer, now time.Time) bool {
+	if entry == nil || entry.peer == nil || !entry.peer.hasOpenConnection() {
+		return false
+	}
+	return entry.archiveSuccess > 0 || entry.peer.isAliveKnownOverlayPeer(now)
+}
+
+func archivePeerUnprovenDeadArchiveOnly(entry *archivePeer, now time.Time) bool {
+	if entry == nil || entry.owner != archivePeerArchiveOnly || entry.leases > 0 || entry.archiveSuccess > 0 {
+		return false
+	}
+	peer := entry.peer
+	return peer != nil && peer.hasOpenConnection() && !peer.isAliveKnownOverlayPeer(now)
 }
 
 func archivePeerCoolingDownLocked(state *archiveShardPeerState, peerID PeerID, now time.Time) bool {

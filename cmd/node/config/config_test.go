@@ -155,6 +155,23 @@ func TestLoadDefaults(t *testing.T) {
 	if int64(cellMemTableStopWritesThreshold) != DefaultCellMemTableStopWritesThreshold {
 		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
 	}
+	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		t.Fatalf("large boc shard read workers: %v", err)
+	}
+	if int64(largeBOCShardReadWorkers) != DefaultLargeBOCShardReadWorkers {
+		t.Fatalf("unexpected large boc shard read workers %d", largeBOCShardReadWorkers)
+	}
+	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		t.Fatalf("persistent state large boc batch size: %v", err)
+	}
+	if int64(persistentStateLargeBOCBatchSize) != DefaultPersistentStateLargeBOCBatchSize {
+		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
+	}
+	if cfg.Storage.StateSerializeOnePass {
+		t.Fatal("state serialize one-pass should be disabled by default")
+	}
 	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
 	if err != nil {
 		t.Fatalf("artifact file max open: %v", err)
@@ -391,6 +408,9 @@ func TestStorageOptions(t *testing.T) {
 			"decoded_cell_cache_max_entries": 2000,
 			"cell_shard_memtable_size": 1073741824,
 			"cell_memtable_stop_writes_threshold": 3,
+			"large_boc_shard_read_workers": 8,
+			"persistent_state_large_boc_batch_size": 2097152,
+			"state_serialize_one_pass": true,
 			"artifact_file_max_open": 123
 		}
 	}`)
@@ -442,6 +462,23 @@ func TestStorageOptions(t *testing.T) {
 	if cellMemTableStopWritesThreshold != 3 {
 		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
 	}
+	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		t.Fatalf("large boc shard read workers: %v", err)
+	}
+	if largeBOCShardReadWorkers != 8 {
+		t.Fatalf("unexpected large boc shard read workers %d", largeBOCShardReadWorkers)
+	}
+	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		t.Fatalf("persistent state large boc batch size: %v", err)
+	}
+	if persistentStateLargeBOCBatchSize != 2<<20 {
+		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
+	}
+	if !cfg.Storage.StateSerializeOnePass {
+		t.Fatal("state serialize one-pass should be enabled")
+	}
 	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
 	if err != nil {
 		t.Fatalf("artifact file max open: %v", err)
@@ -484,6 +521,62 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 				t.Fatal("expected invalid decoded cell cache options to fail")
 			}
 		})
+	}
+}
+
+func TestStorageLargeBOCOptionsRejectInvalidValues(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(Config) error
+		cfg  Config
+	}{
+		{
+			name: "negative large boc shard read workers",
+			run: func(cfg Config) error {
+				_, err := cfg.LargeBOCShardReadWorkers()
+				return err
+			},
+			cfg: Config{Storage: Storage{LargeBOCShardReadWorkers: -1}},
+		},
+		{
+			name: "negative persistent state large boc batch size",
+			run: func(cfg Config) error {
+				_, err := cfg.PersistentStateLargeBOCBatchSize()
+				return err
+			},
+			cfg: Config{Storage: Storage{PersistentStateLargeBOCBatchSize: -1}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(tt.cfg); err == nil {
+				t.Fatal("expected invalid storage large boc option to fail")
+			}
+		})
+	}
+}
+
+func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
+	cfg := Config{Storage: Storage{
+		LargeBOCShardReadWorkers:         0,
+		PersistentStateLargeBOCBatchSize: 0,
+	}}
+
+	workers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		t.Fatalf("large boc shard read workers: %v", err)
+	}
+	if int64(workers) != DefaultLargeBOCShardReadWorkers {
+		t.Fatalf("large boc shard read workers = %d, want %d", workers, DefaultLargeBOCShardReadWorkers)
+	}
+
+	batchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		t.Fatalf("persistent state large boc batch size: %v", err)
+	}
+	if int64(batchSize) != DefaultPersistentStateLargeBOCBatchSize {
+		t.Fatalf("persistent state large boc batch size = %d, want %d", batchSize, DefaultPersistentStateLargeBOCBatchSize)
 	}
 }
 
@@ -575,6 +668,15 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.Storage.DecodedCellCacheMaxEntries != DefaultDecodedCellCacheMaxEntries {
 		t.Fatalf("unexpected decoded cell cache max entries %d", cfg.Storage.DecodedCellCacheMaxEntries)
+	}
+	if cfg.Storage.LargeBOCShardReadWorkers != DefaultLargeBOCShardReadWorkers {
+		t.Fatalf("unexpected large boc shard read workers %d", cfg.Storage.LargeBOCShardReadWorkers)
+	}
+	if cfg.Storage.PersistentStateLargeBOCBatchSize != DefaultPersistentStateLargeBOCBatchSize {
+		t.Fatalf("unexpected persistent state large boc batch size %d", cfg.Storage.PersistentStateLargeBOCBatchSize)
+	}
+	if cfg.Storage.StateSerializeOnePass {
+		t.Fatal("state serialize one-pass should be disabled by default")
 	}
 	wantGlobalConfigPath, err := filepath.Abs(DefaultGlobalConfigPath)
 	if err != nil {

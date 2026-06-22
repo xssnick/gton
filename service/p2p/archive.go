@@ -90,17 +90,20 @@ func (s *overlaySubscription) ensureArchivePeers(ctx context.Context, pool *arch
 		return nil
 	}
 
-	pool.refill(ctx, false)
+	discoveryDone := pool.refill(ctx, false)
 	if pool.ready(shard) {
 		return nil
 	}
-	pool.refreshUseless(ctx, shard)
+	if done := pool.refreshUseless(ctx, shard); done != nil {
+		discoveryDone = done
+	}
 	if pool.ready(shard) {
 		return nil
 	}
 
 	timer := time.NewTimer(archiveDiscoveryWait)
 	defer timer.Stop()
+	timerC := timer.C
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -114,8 +117,12 @@ func (s *overlaySubscription) ensureArchivePeers(ctx context.Context, pool *arch
 			if pool.ready(shard) {
 				return nil
 			}
-			pool.refill(ctx, false)
-			pool.refreshUseless(ctx, shard)
+			if done := pool.refill(ctx, false); done != nil {
+				discoveryDone = done
+			}
+			if done := pool.refreshUseless(ctx, shard); done != nil {
+				discoveryDone = done
+			}
 			if pool.ready(shard) {
 				return nil
 			}
@@ -123,12 +130,25 @@ func (s *overlaySubscription) ensureArchivePeers(ctx context.Context, pool *arch
 			if pool.ready(shard) {
 				return nil
 			}
-			pool.refreshUseless(ctx, shard)
+			if done := pool.refreshUseless(ctx, shard); done != nil {
+				discoveryDone = done
+			}
 			if pool.ready(shard) {
 				return nil
 			}
-		case <-timer.C:
-			return nil
+		case <-discoveryDone:
+			discoveryDone = nil
+			if pool.ready(shard) {
+				return nil
+			}
+			if timerC == nil {
+				return nil
+			}
+		case <-timerC:
+			if discoveryDone == nil {
+				return nil
+			}
+			timerC = nil
 		}
 	}
 }

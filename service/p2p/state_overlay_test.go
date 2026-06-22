@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	tnstate "github.com/xssnick/gton/service/state"
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -176,6 +177,82 @@ func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
 
 	if pool.hasPeer(peer.id) {
 		t.Fatal("archive-only peer survived zero-state not-available rotation")
+	}
+}
+
+func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
+	data := bytes.Repeat([]byte{0x42}, 64)
+	rldpClient := &testArchiveRLDP{
+		adnl:        newTestOverlayADNL(),
+		asyncResult: data,
+		asyncDelay:  150 * time.Millisecond,
+	}
+	peer := &overlayPeer{
+		id:          testPeerID("probe-peer"),
+		addr:        "probe-peer",
+		rldpOverlay: overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01}),
+		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:       true,
+	}
+	node := &Node{
+		log:     discardLogger(),
+		peerUse: map[PeerID]peerUse{},
+	}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+		spec: overlaySpec{ShortID: []byte{0x01}},
+	}
+	block := testBlockID(-1, topShard, 42)
+	downloader := persistentStateSnapshotDownloader{
+		node:   node,
+		sub:    sub,
+		block:  block,
+		master: block,
+	}
+	candidate := persistentStateCandidate{
+		peer: peer,
+		id: PersistentStateIDV2{
+			Block:            block,
+			MasterchainBlock: block,
+			EffectiveShard:   topShard,
+		},
+		size:       int64(len(data)),
+		workers:    1,
+		chunkCount: 1,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		probes, errs := downloader.probePersistentStateCandidates(context.Background(), []persistentStateCandidate{candidate}, 1, nil)
+		if len(probes) != 1 {
+			done <- errors.Join(errs...)
+			return
+		}
+		done <- nil
+	}()
+
+	deadline := time.After(time.Second)
+	for node.downloadPeerLeaseCount(peer) == 0 {
+		select {
+		case err := <-done:
+			t.Fatalf("probe finished before download lease was observed: %v", err)
+		case <-deadline:
+			t.Fatal("probe did not acquire download lease")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("probe failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe did not finish")
+	}
+	if leases := node.downloadPeerLeaseCount(peer); leases != 0 {
+		t.Fatalf("probe leaked download lease: %d", leases)
 	}
 }
 

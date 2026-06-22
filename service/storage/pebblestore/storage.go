@@ -33,6 +33,7 @@ type Store struct {
 	cellCacheSize                   int64
 	cellShardMemTable               int
 	cellMemTableStopWritesThreshold int
+	largeBOCShardReadWorkers        int
 	artifactFiles                   *artifactFileCache
 	archivePackagesMu               sync.RWMutex
 	archivePackages                 map[int64]archivePackageMeta

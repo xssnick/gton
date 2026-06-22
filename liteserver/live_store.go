@@ -19,7 +19,7 @@ import (
 
 const (
 	DefaultMasterBlockCache = 128
-	DefaultShardBlockCache  = 4096
+	DefaultShardBlockCache  = 1024
 )
 
 var (

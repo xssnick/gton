@@ -33,11 +33,17 @@ func Open(opts Options) (*Store, error) {
 	if opts.CellMemTableStopWritesThreshold < 0 {
 		return nil, fmt.Errorf("cell memtable stop writes threshold cannot be negative")
 	}
+	if opts.LargeBOCShardReadWorkers < 0 {
+		return nil, fmt.Errorf("large boc shard read workers cannot be negative")
+	}
 	if opts.ArtifactFileMaxOpen < 0 {
 		return nil, fmt.Errorf("artifact file max open cannot be negative")
 	}
 	if opts.CellMemTableStopWritesThreshold == 0 {
 		opts.CellMemTableStopWritesThreshold = defaultPebbleCellMemTableStopThreshold
+	}
+	if opts.LargeBOCShardReadWorkers == 0 {
+		opts.LargeBOCShardReadWorkers = defaultLargeBOCShardReadWorkers
 	}
 	if opts.ArtifactFileMaxOpen == 0 {
 		opts.ArtifactFileMaxOpen = DefaultArtifactFileMaxOpen
@@ -88,6 +94,7 @@ func Open(opts Options) (*Store, error) {
 		Int("cell_total_memtable_size", cellMemTableSize).
 		Int("cell_shard_memtable_size", cellShardMemTable).
 		Int("cell_memtable_stop_writes_threshold", opts.CellMemTableStopWritesThreshold).
+		Int("large_boc_shard_read_workers", opts.LargeBOCShardReadWorkers).
 		Int("artifact_file_max_open", opts.ArtifactFileMaxOpen).
 		Int("bytes_per_sync", opts.BytesPerSync).
 		Int("wal_bytes_per_sync", opts.WALBytesPerSync).
@@ -229,6 +236,7 @@ func Open(opts Options) (*Store, error) {
 		cellCacheSize:                   opts.CellCacheSize,
 		cellShardMemTable:               cellShardMemTable,
 		cellMemTableStopWritesThreshold: opts.CellMemTableStopWritesThreshold,
+		largeBOCShardReadWorkers:        opts.LargeBOCShardReadWorkers,
 		artifactFiles:                   newArtifactFileCache(opts.ArtifactFileMaxOpen),
 		archivePackages:                 map[int64]archivePackageMeta{},
 		bytesPerSync:                    opts.BytesPerSync,
@@ -276,6 +284,7 @@ func Open(opts Options) (*Store, error) {
 		Int("cell_total_memtable_size", cellMemTableSize).
 		Int("cell_shard_memtable_size", cellShardMemTable).
 		Int("cell_shards", cellDBShardCount).
+		Int("large_boc_shard_read_workers", opts.LargeBOCShardReadWorkers).
 		Uint64("cell_generation", manifest.active).
 		Uint64("next_cell_generation", manifest.next).
 		Str("cell_generation_origin", storage.FormatBlockRef(manifest.activeOrigin)).

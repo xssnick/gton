@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"testing"
 	"time"
@@ -29,6 +30,18 @@ func testArchivePool(sub *overlaySubscription) *archivePeerPool {
 	return newArchivePeerPool(sub)
 }
 
+func testArchiveOnlyPoolPeer(tb testing.TB, pool *archivePeerPool, label string) *overlayPeer {
+	tb.Helper()
+
+	overlayWrapper, _ := newTestOverlayWrapper()
+	peer := testArchiveCandidate(label)
+	peer.overlay = overlayWrapper
+	if !pool.addArchiveOnlyPeer(peer) {
+		tb.Fatalf("failed to add archive-only peer %s", label)
+	}
+	return peer
+}
+
 func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlayADNL) {
 	base := newTestOverlayADNL()
 	adnlWrapper := overlay.CreateExtendedADNL(base)
@@ -44,6 +57,38 @@ func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlay
 	}
 	pool := &peerPool{peers: map[PeerID]*pooledPeer{id: pooled}}
 	return pool, pooled, base
+}
+
+func TestArchivePeerPoolConnectSeedNodeUsesPeerTimeout(t *testing.T) {
+	_, selfKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate self key: %v", err)
+	}
+	_, peerKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate peer key: %v", err)
+	}
+	peerNode, err := overlay.NewNode([]byte{0x01}, peerKey)
+	if err != nil {
+		t.Fatalf("create peer overlay node: %v", err)
+	}
+
+	fake := &fakeDHTClient{findAddressesErr: context.DeadlineExceeded}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		node: &Node{
+			dht:     fake,
+			privKey: selfKey,
+		},
+		spec: overlaySpec{ShortID: peerNode.Overlay},
+	}
+	pool := testArchivePool(sub)
+
+	_, _ = pool.connectArchiveSeedNode(context.Background(), *peerNode)
+
+	if got := timeoutDuration(t, fake.findAddressesDeadline); got < dhtSeedPeerTimeout-time.Second {
+		t.Fatalf("archive seed address lookup timeout too short: %s", got)
+	}
 }
 
 func TestArchivePeerCooldownFiltersOnlyArchivePool(t *testing.T) {
@@ -228,6 +273,91 @@ func TestArchivePoolBorrowedPeerReplacesAndClosesArchiveOnlyPeer(t *testing.T) {
 	got := pool.candidates(archive.ShardID{Workchain: -1, Shard: topShard})
 	if len(got) != 1 || got[0] != livePeer {
 		t.Fatalf("expected borrowed live peer after replacement, got %#v", got)
+	}
+}
+
+func TestArchivePoolBorrowedPeerDoesNotReplaceLeasedArchiveOnlyPeer(t *testing.T) {
+	basePool, pooledPeer, sharedConn := newTestLeasedPooledPeer("leased-same-peer")
+	sub := &overlaySubscription{
+		node:  &Node{pool: basePool},
+		log:   discardLogger(),
+		spec:  overlaySpec{ShortID: []byte{0x01}, Kind: overlayKindPublicShard},
+		peers: map[PeerID]*overlayPeer{},
+	}
+	announced := &overlay.Node{Version: int32(time.Now().Unix())}
+	archivePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
+	livePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
+	pool := testArchivePool(sub)
+
+	if !pool.addArchiveOnlyPeer(archivePeer) {
+		t.Fatal("expected archive-only peer to be added")
+	}
+	release := pool.acquire(archivePeer)
+	pool.addBorrowedPeer(livePeer)
+
+	got := pool.candidates(archive.ShardID{Workchain: -1, Shard: topShard})
+	if len(got) != 1 || got[0] != archivePeer {
+		t.Fatalf("leased archive-only peer was replaced: %#v", got)
+	}
+	select {
+	case <-sharedConn.GetCloserCtx().Done():
+		t.Fatal("leased archive-only replacement closed pooled ADNL")
+	default:
+	}
+
+	release()
+	pool.addBorrowedPeer(livePeer)
+	got = pool.candidates(archive.ShardID{Workchain: -1, Shard: topShard})
+	if len(got) != 1 || got[0] != livePeer {
+		t.Fatalf("released archive-only peer was not replaced by live peer: %#v", got)
+	}
+}
+
+func TestEnsureArchivePeersWaitsForDHTDiscoveryCompletion(t *testing.T) {
+	waitDHT := make(chan struct{})
+	fake := &fakeDHTClient{findOverlayNodesWait: waitDHT}
+	livePeer := &overlayPeer{
+		id:        testPeerID("overlay-peer"),
+		addr:      "overlay-peer",
+		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:     true,
+	}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		node: &Node{
+			dht: fake,
+		},
+		spec: overlaySpec{
+			FullID:  []byte{0x01},
+			ShortID: []byte{0x01},
+			Kind:    overlayKindPublicShard,
+		},
+		peers: map[PeerID]*overlayPeer{
+			livePeer.id: livePeer,
+		},
+	}
+	pool := testArchivePool(sub)
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sub.ensureArchivePeers(context.Background(), pool, shard)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("ensureArchivePeers returned before DHT discovery completed: %v", err)
+	case <-time.After(archiveDiscoveryWait + 250*time.Millisecond):
+	}
+
+	close(waitDHT)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureArchivePeers returned error after DHT discovery: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ensureArchivePeers did not finish after DHT discovery completed")
 	}
 }
 
@@ -503,6 +633,114 @@ func TestArchivePoolKeepsLeasedClosedPeerUntilRelease(t *testing.T) {
 	}
 	if pool.hasPeer(peer.id) {
 		t.Fatal("closed peer survived release and cleanup")
+	}
+}
+
+func TestArchivePoolPrunesDeadUnprovenArchiveOnlyPeers(t *testing.T) {
+	sub := &overlaySubscription{
+		log: discardLogger(),
+	}
+	pool := testArchivePool(sub)
+	peers := make([]*overlayPeer, 0, 3)
+
+	for i := 0; i < cap(peers); i++ {
+		peers = append(peers, testArchiveOnlyPoolPeer(t, pool, fmt.Sprintf("dead-unproven-%d", i)))
+	}
+	for _, peer := range peers {
+		peer.alive = false
+	}
+
+	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != len(peers) {
+		t.Fatalf("unexpected dead unproven archive-only prune count: got %d want %d", pruned, len(peers))
+	}
+	if usable := pool.usableSize(time.Now()); usable != 0 {
+		t.Fatalf("dead unproven archive-only peers should not be usable, got %d", usable)
+	}
+	if size := pool.size(); size != 0 {
+		t.Fatalf("dead unproven archive-only peers should be pruned, got size %d", size)
+	}
+	for _, peer := range peers {
+		if pool.hasPeer(peer.id) {
+			t.Fatalf("dead unproven archive-only peer %s survived prune", peer.addr)
+		}
+	}
+}
+
+func TestArchivePoolKeepsLeasedAndProvenDeadArchiveOnlyPeers(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+	}
+	pool := testArchivePool(sub)
+	leased := testArchiveOnlyPoolPeer(t, pool, "leased-dead-unproven")
+	proven := testArchiveOnlyPoolPeer(t, pool, "proven-dead")
+	release := pool.acquire(leased)
+	pool.markSuccess(shard, proven)
+	leased.alive = false
+	proven.alive = false
+
+	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != 0 {
+		t.Fatalf("leased/proven dead archive-only peers were pruned: %d", pruned)
+	}
+	if !pool.hasPeer(leased.id) {
+		t.Fatal("leased dead archive-only peer was removed")
+	}
+	if !pool.hasPeer(proven.id) {
+		t.Fatal("proven dead archive-only peer was removed")
+	}
+	if usable := pool.usableSize(time.Now()); usable != 1 {
+		t.Fatalf("only proven dead archive-only peer should remain usable, got %d", usable)
+	}
+
+	release()
+	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != 1 {
+		t.Fatalf("released dead unproven archive-only peer was not pruned: %d", pruned)
+	}
+	if pool.hasPeer(leased.id) {
+		t.Fatal("released dead unproven archive-only peer survived prune")
+	}
+	if !pool.hasPeer(proven.id) {
+		t.Fatal("proven dead archive-only peer was pruned after leased peer release")
+	}
+}
+
+func TestArchivePoolRefillStartsDHTWhenSoftLimitHasOnlyDeadArchiveOnlyPeers(t *testing.T) {
+	fake := &fakeDHTClient{}
+	sub := &overlaySubscription{
+		log: discardLogger(),
+		node: &Node{
+			dht: fake,
+		},
+		spec: overlaySpec{
+			FullID:  []byte{0x01},
+			ShortID: []byte{0x01},
+			Kind:    overlayKindPublicShard,
+		},
+	}
+	pool := testArchivePool(sub)
+	peers := make([]*overlayPeer, 0, archivePeerSoftLimit)
+
+	for i := 0; i < archivePeerSoftLimit; i++ {
+		peers = append(peers, testArchiveOnlyPoolPeer(t, pool, fmt.Sprintf("soft-limit-dead-%d", i)))
+	}
+	for _, peer := range peers {
+		peer.alive = false
+	}
+
+	done := pool.refill(context.Background(), false)
+	if done == nil {
+		t.Fatal("dead unproven archive-only peers blocked archive DHT refill")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("archive DHT refill did not finish")
+	}
+	if fake.findOverlayNodesCalls == 0 {
+		t.Fatal("archive DHT refill did not query DHT")
+	}
+	if size := pool.size(); size != 0 {
+		t.Fatalf("dead unproven archive-only peers should be pruned before refill, got size %d", size)
 	}
 }
 

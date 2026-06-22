@@ -240,7 +240,7 @@ Simplified example:
     "key": "<base64 ed25519 seed>",
     "listen_addr": "0.0.0.0:7445",
     "master_block_cache": 128,
-    "shard_block_cache": 4096,
+    "shard_block_cache": 1024,
     "send_message_broadcast_bytes_per_second": 0,
     "send_message_broadcast_max_delay_ms": 100
   },
@@ -254,6 +254,9 @@ Simplified example:
     "decoded_cell_cache_max_entries": 1048576,
     "cell_shard_memtable_size": 268435456,
     "cell_memtable_stop_writes_threshold": 4,
+    "large_boc_shard_read_workers": 2,
+    "persistent_state_large_boc_batch_size": 524288,
+    "state_serialize_one_pass": false,
     "artifact_file_max_open": 512
   },
   "metrics": {
@@ -320,6 +323,9 @@ Simplified example:
 | `decoded_cell_cache_max_entries` | Maximum decoded cell cache entries. Defaults to `1048576`. |
 | `cell_shard_memtable_size` | Memtable size for one cell DB shard, in bytes. |
 | `cell_memtable_stop_writes_threshold` | Pebble stop-writes threshold for memtables. |
+| `large_boc_shard_read_workers` | Per-cell-DB-shard parallel readers for large-BOC state serialization loads. Defaults to `2`; `0` uses the default. |
+| `persistent_state_large_boc_batch_size` | Large-BOC serialization batch size for persistent state files, in cells. Defaults to `524288`; `0` uses the default. |
+| `state_serialize_one_pass` | Forces persistent state serialization to use one-pass large-BOC serialization for every state part. Defaults to `false`. |
 | `artifact_file_max_open` | Open-file limit for block/state artifacts. |
 
 ### `metrics`

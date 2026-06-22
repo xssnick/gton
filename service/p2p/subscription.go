@@ -621,8 +621,9 @@ func (s *overlaySubscription) hasPeerReplacementCandidate(candidateID PeerID) bo
 		return true
 	}
 
+	protected := s.protectedPeerIDs()
 	now := time.Now()
-	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now)
+	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now, protected)
 	s.mx.Unlock()
 
 	return !evictID.IsZero()
@@ -822,7 +823,8 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 
 	var evicted *overlayPeer
 	if len(s.peers) >= s.peerLimit() {
-		evictID := s.attachPeerEvictionCandidateLocked(pooled.id)
+		protected := s.protectedPeerIDs()
+		evictID := s.attachPeerEvictionCandidateLocked(pooled.id, protected)
 		if evictID.IsZero() {
 			s.mx.Unlock()
 			return false
@@ -888,17 +890,27 @@ func (s *overlaySubscription) peerLimit() int {
 	return maxPeersPerOverlay
 }
 
-func (s *overlaySubscription) attachPeerEvictionCandidateLocked(candidateID PeerID) PeerID {
+func (s *overlaySubscription) protectedPeerIDs() map[PeerID]struct{} {
+	if s.node == nil {
+		return nil
+	}
+	return s.node.protectedPeerIDs()
+}
+
+func (s *overlaySubscription) attachPeerEvictionCandidateLocked(candidateID PeerID, protected map[PeerID]struct{}) PeerID {
 	now := time.Now()
-	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now)
+	evictID, _ := s.peerReplacementCandidateLocked(candidateID, now, protected)
 	return evictID
 }
 
-func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID PeerID, now time.Time) (PeerID, float64) {
+func (s *overlaySubscription) peerReplacementCandidateLocked(candidateID PeerID, now time.Time, protected map[PeerID]struct{}) (PeerID, float64) {
 	evictID := PeerID{}
 	evictScore := -1.0
 	for id, peer := range s.peers {
 		if id == candidateID {
+			continue
+		}
+		if _, ok := protected[id]; ok {
 			continue
 		}
 		if peer == nil {

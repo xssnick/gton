@@ -17,6 +17,7 @@ type Options struct {
 	CellMemTableSize                int
 	CellShardMemTableSize           int
 	CellMemTableStopWritesThreshold int
+	LargeBOCShardReadWorkers        int
 	ArtifactFileMaxOpen             int
 	BytesPerSync                    int
 	WALBytesPerSync                 int

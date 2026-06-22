@@ -107,16 +107,18 @@ func (s *overlaySubscription) ensureZeroStateArchivePeers(ctx context.Context, p
 		return nil
 	}
 
-	pool.refill(ctx, true)
 	return s.waitForZeroStateArchivePeer(ctx, pool, nil, shard, nil)
 }
 
 func (s *overlaySubscription) waitForZeroStateArchivePeer(ctx context.Context, pool *archivePeerPool, session *ArchiveSession, shard archive.ShardID, tried map[PeerID]struct{}) error {
+	discoveryDone := pool.refill(ctx, true)
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	timer := time.NewTimer(zeroStatePeerDiscoveryDelay)
 	defer timer.Stop()
+	timerC := timer.C
 
 	for {
 		if len(zeroStateArchiveCandidates(pool, session, shard, tried)) > 0 {
@@ -127,12 +129,25 @@ func (s *overlaySubscription) waitForZeroStateArchivePeer(ctx context.Context, p
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			pool.refill(ctx, true)
-		case <-timer.C:
+			if done := pool.refill(ctx, true); done != nil {
+				discoveryDone = done
+			}
+		case <-discoveryDone:
+			discoveryDone = nil
 			if len(zeroStateArchiveCandidates(pool, session, shard, tried)) > 0 {
 				return nil
 			}
-			return ErrStateNotAvailable
+			if timerC == nil {
+				return ErrStateNotAvailable
+			}
+		case <-timerC:
+			if len(zeroStateArchiveCandidates(pool, session, shard, tried)) > 0 {
+				return nil
+			}
+			if discoveryDone == nil {
+				return ErrStateNotAvailable
+			}
+			timerC = nil
 		}
 	}
 }

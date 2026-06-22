@@ -233,6 +233,8 @@ type Options struct {
 	MinSyncDiskFreeBytes                    uint64
 	MinStateSerializationDiskFreeBytes      uint64
 	DisableStateSerialization               bool
+	PersistentStateLargeBOCBatchSize        int
+	StateSerializeOnePass                   bool
 	SyncObserver                            SyncObserver
 }
 
@@ -527,7 +529,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
 	}
-	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization)
+	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization, opts.PersistentStateLargeBOCBatchSize, opts.StateSerializeOnePass)
 	return svc
 }
 

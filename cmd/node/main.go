@@ -321,6 +321,16 @@ func main() {
 		logger.Error().Err(err).Msg("failed to load storage cell memtable stop writes threshold option")
 		os.Exit(1)
 	}
+	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage large boc shard read workers option")
+		os.Exit(1)
+	}
+	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to load storage persistent state large boc batch size option")
+		os.Exit(1)
+	}
 	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to load storage artifact file max open option")
@@ -338,6 +348,8 @@ func main() {
 		Int("decoded_cell_cache_max_entries", decodedCellCacheOpts.MaxEntries).
 		Int("cell_shard_memtable_size", cellShardMemTableSize).
 		Int("cell_memtable_stop_writes_threshold", cellMemTableStopWritesThreshold).
+		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
+		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
 		Int("artifact_file_max_open", artifactFileMaxOpen).
 		Msg("opening storage")
 	store, err := pebblestore.Open(pebblestore.Options{
@@ -351,6 +363,7 @@ func main() {
 		DecodedCellCacheMaxEntries:      decodedCellCacheOpts.MaxEntries,
 		CellShardMemTableSize:           cellShardMemTableSize,
 		CellMemTableStopWritesThreshold: cellMemTableStopWritesThreshold,
+		LargeBOCShardReadWorkers:        largeBOCShardReadWorkers,
 		ArtifactFileMaxOpen:             artifactFileMaxOpen,
 	})
 	if err != nil {
@@ -436,6 +449,8 @@ func main() {
 		ArchiveFromZero:                         archiveFromZero,
 		StorageDir:                              storageDir,
 		DisableStateSerialization:               cfg.DisableStateSerialization,
+		PersistentStateLargeBOCBatchSize:        persistentStateLargeBOCBatchSize,
+		StateSerializeOnePass:                   cfg.Storage.StateSerializeOnePass,
 		SyncObserver:                            syncObserver,
 	})
 	node.SetRuntimeCallbacks(svc)
@@ -540,6 +555,9 @@ func main() {
 		Uint32("sync_backpressure_windows", syncBackpressureWindows).
 		Dur("archive_checkpoint_period", *archiveCheckpointPeriodFlag).
 		Int("archive_prefetch_windows", *archivePrefetchWindowsFlag).
+		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
+		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
+		Bool("state_serialize_one_pass", cfg.Storage.StateSerializeOnePass).
 		Bool("disable_state_serialization", cfg.DisableStateSerialization).
 		Msg("service started")
 

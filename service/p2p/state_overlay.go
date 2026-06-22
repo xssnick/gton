@@ -602,6 +602,9 @@ func (d persistentStateSnapshotDownloader) probePersistentStateCandidates(ctx co
 		},
 	}, func(queryCtx context.Context, peer *overlayPeer) (persistentStatePeerProbe, error) {
 		candidate := candidateByPeer[downloadPeerID(peer)]
+		release := d.node.acquireDownloadPeer(peer)
+		defer release()
+
 		return d.probePersistentStatePeer(queryCtx, candidate, probeChunks, chunkLimiter)
 	})
 
