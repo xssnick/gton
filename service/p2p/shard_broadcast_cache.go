@@ -344,5 +344,7 @@ func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBro
 }
 
 func cloneBlockID(block ton.BlockIDExt) ton.BlockIDExt {
+	block.RootHash = bytes.Clone(block.RootHash)
+	block.FileHash = bytes.Clone(block.FileHash)
 	return block
 }

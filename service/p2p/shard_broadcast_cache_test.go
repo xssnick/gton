@@ -56,6 +56,44 @@ func TestShardBroadcastCacheBlockCanBeReadRepeatedly(t *testing.T) {
 	}
 }
 
+func TestShardBroadcastCacheOwnsStoredBlockID(t *testing.T) {
+	cache := newShardBroadcastBlockCache(time.Minute, 1<<20, 16)
+	downloaded := testShardBroadcastDownloadedBlock(t, 101, 0x101)
+	target := downloaded.ID
+	target.RootHash = append([]byte(nil), target.RootHash...)
+	target.FileHash = append([]byte(nil), target.FileHash...)
+
+	if err := cache.Store(downloaded, testShardBroadcastMeta(downloaded)); err != nil {
+		t.Fatalf("store block: %v", err)
+	}
+
+	for i := range downloaded.ID.RootHash {
+		downloaded.ID.RootHash[i] = 0xaa
+	}
+	for i := range downloaded.ID.FileHash {
+		downloaded.ID.FileHash[i] = 0xbb
+	}
+
+	got, err := cache.Block(target)
+	if err != nil {
+		t.Fatalf("read block: %v", err)
+	}
+	if !got.ID.Equals(&target) {
+		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(target))
+	}
+
+	got.ID.RootHash[0] ^= 0xff
+	got.ID.FileHash[0] ^= 0xff
+
+	again, err := cache.Block(target)
+	if err != nil {
+		t.Fatalf("read block again: %v", err)
+	}
+	if !again.ID.Equals(&target) {
+		t.Fatalf("second block = %s, want %s", formatBlockRef(again.ID), formatBlockRef(target))
+	}
+}
+
 func TestShardBroadcastCachePrunesExpiredBlocks(t *testing.T) {
 	cache := newShardBroadcastBlockCache(time.Second, 1<<20, 16)
 	now := time.Unix(100, 0)
