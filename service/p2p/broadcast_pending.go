@@ -37,7 +37,7 @@ type pendingBlockBroadcastDecode struct {
 }
 
 func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDecode) {
-	if n == nil || req.fingerprint == "" || req.msg == nil {
+	if req.fingerprint == "" || req.msg == nil {
 		return
 	}
 
@@ -72,7 +72,7 @@ func (n *Node) forgetPendingBlockBroadcastDecode(fingerprint string) {
 }
 
 func (n *Node) processPendingBlockBroadcastDecodesForPrevAsync(prev ton.BlockIDExt) {
-	if n == nil || len(prev.RootHash) != 32 {
+	if len(prev.RootHash) != 32 {
 		return
 	}
 
@@ -99,10 +99,7 @@ func (n *Node) processPendingBlockBroadcastDecodesForPrevAsync(prev ton.BlockIDE
 
 func (n *Node) runPendingBlockBroadcastDecodeProcessorAsync() {
 	n.runAsync(func() {
-		ctx := n.runCtx
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		ctx := n.runtimeContext()
 
 		for {
 			n.pendingBroadcastMx.Lock()

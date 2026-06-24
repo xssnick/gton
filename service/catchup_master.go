@@ -239,7 +239,7 @@ type masterchainApplyTiming struct {
 	stateUpdate time.Duration
 }
 
-func (s *Service) applyMasterchainTransition(current *storage.BlockState, block PreparedBlock, checked *checkedMasterchainConsensus, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, error) {
+func (s *Service) applyMasterchainTransition(ctx context.Context, current *storage.BlockState, block PreparedBlock, checked *checkedMasterchainConsensus, applier stateUpdateApplier, hook *blockApplyHookMeta) (*storage.BlockState, masterchainApplyTiming, error) {
 	started := time.Now()
 	var timing masterchainApplyTiming
 	finish := func() masterchainApplyTiming {
@@ -268,7 +268,7 @@ func (s *Service) applyMasterchainTransition(current *storage.BlockState, block 
 	}
 
 	stageStarted := time.Now()
-	next, err := applyBlockWithPreviousStates([]*storage.BlockState{current}, block, applier)
+	next, err := s.applyBlockWithHooks(ctx, []*storage.BlockState{current}, block, applier, hook)
 	timing.stateUpdate += time.Since(stageStarted)
 	if err != nil {
 		return nil, finish(), fmt.Errorf("apply masterchain block %s: %w", block.BlockRef(), err)

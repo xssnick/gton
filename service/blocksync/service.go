@@ -117,10 +117,6 @@ func (s *Service) ShardDescriptions() <-chan p2p.BroadcastEvent {
 }
 
 func (s *Service) StatusSnapshot() StatusSnapshot {
-	if s == nil {
-		return StatusSnapshot{}
-	}
-
 	snapshot := StatusSnapshot{
 		OutputQueueItems:              len(s.out),
 		OutputQueueCapacity:           cap(s.out),

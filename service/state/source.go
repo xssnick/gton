@@ -33,7 +33,12 @@ type Source interface {
 	InitBlockProof(ctx context.Context, block ton.BlockIDExt) (ProofDownload, error)
 	MasterchainProof(ctx context.Context, block ton.BlockIDExt, requireKey bool) ([]byte, error)
 	BlockFull(ctx context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error)
-	DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (storage.DownloadedState, error)
+	DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (DownloadedState, error)
+}
+
+type DownloadedState interface {
+	storage.DownloadedState
+	BlockArtifact() *storage.ServedBlockFull
 }
 
 func ShardBlocksFromMasterState(state *storage.BlockState) ([]ton.BlockIDExt, error) {

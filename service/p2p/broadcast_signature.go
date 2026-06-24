@@ -25,11 +25,7 @@ func (n *Node) checkBlockBroadcastSignatures(kind string, block ton.BlockIDExt, 
 		return fmt.Errorf("block broadcast %s has no validator signatures", formatBlockRef(block))
 	}
 
-	ctx := n.runCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(ctx, broadcastSignatureTimeout)
+	ctx, cancel := context.WithTimeout(n.runtimeContext(), broadcastSignatureTimeout)
 	defer cancel()
 
 	return n.signatureVerifier.CheckBlockBroadcastSignatures(ctx, BlockBroadcastSignatureCheck{
@@ -45,11 +41,7 @@ func (n *Node) validateShardDescriptionBroadcast(block ton.BlockIDExt, catchainS
 		return nil, fmt.Errorf("broadcast signature verifier is not configured")
 	}
 
-	ctx := n.runCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(ctx, broadcastSignatureTimeout)
+	ctx, cancel := context.WithTimeout(n.runtimeContext(), broadcastSignatureTimeout)
 	defer cancel()
 
 	return n.signatureVerifier.ValidateShardDescriptionBroadcast(ctx, ShardDescriptionSignatureCheck{

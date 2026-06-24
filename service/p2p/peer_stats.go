@@ -145,7 +145,7 @@ func (p *overlayPeer) queryFailed() {
 }
 
 func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowThreshold float64, slowPenalty time.Duration) {
-	if p == nil || bytes <= 0 || elapsed <= 0 {
+	if bytes <= 0 || elapsed <= 0 {
 		return
 	}
 
@@ -170,7 +170,7 @@ func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowTh
 }
 
 func (p *overlayPeer) archiveLargeDownloadSuccess(bytes int64, elapsed time.Duration) {
-	if p == nil || bytes < archiveLargeSpeedSampleMinBytes || elapsed <= 0 {
+	if bytes < archiveLargeSpeedSampleMinBytes || elapsed <= 0 {
 		return
 	}
 
@@ -199,10 +199,6 @@ func (p *overlayPeer) noteSuccessLocked(now time.Time) {
 }
 
 func (p *overlayPeer) downloadFailed(slowPenalty time.Duration) {
-	if p == nil {
-		return
-	}
-
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 

@@ -1,8 +1,9 @@
-package main
+package gton
 
 import (
 	"crypto/ed25519"
 	"fmt"
+	"github.com/xssnick/gton/api/liteserver"
 	"math"
 	"net"
 	"regexp"
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
-	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service/p2p"
 )
 
@@ -35,9 +35,8 @@ var metricsNamespacePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func p2pOptionsFromConfig(cfg nodeconfig.Config) (p2p.Options, error) {
 	opts := p2p.Options{
-		GlobalConfigPath: strings.TrimSpace(cfg.TON.GlobalConfigPath),
-		ListenAddr:       strings.TrimSpace(cfg.ADNL.ListenAddr),
-		DHTListenAddr:    strings.TrimSpace(cfg.DHT.ListenAddr),
+		ListenAddr:    strings.TrimSpace(cfg.ADNL.ListenAddr),
+		DHTListenAddr: strings.TrimSpace(cfg.DHT.ListenAddr),
 	}
 
 	var err error

@@ -115,9 +115,10 @@ func main() {
 		Bool("check_seq_index", opts.checkSeqIndex).
 		Msg("opening node storage")
 
+	storageLogger := logs.Category("pebblestore")
 	store, err := pebblestore.Open(pebblestore.Options{
 		Dir:      opts.dbDir,
-		Logger:   logs.CategoryPtr("pebblestore"),
+		Logger:   &storageLogger,
 		ReadOnly: true,
 	})
 	if err != nil {

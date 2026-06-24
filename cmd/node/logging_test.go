@@ -11,7 +11,7 @@ import (
 func TestNewLogOutputReturnsConsoleOnlyWhenFileDisabled(t *testing.T) {
 	var out bytes.Buffer
 
-	writer, logFile, err := newLogOutput(&out, "", logRotationOptions{
+	writer, logFile, err := newLogOutput(&out, "", logFileOptions{
 		MaxSizeMB: defaultLogFileMaxSizeMB,
 	})
 	if err != nil {
@@ -33,7 +33,7 @@ func TestNewLogOutputWritesConsoleAndFile(t *testing.T) {
 	var out bytes.Buffer
 	path := filepath.Join(t.TempDir(), "logs", "node.log")
 
-	writer, logFile, err := newLogOutput(&out, path, logRotationOptions{
+	writer, logFile, err := newLogOutput(&out, path, logFileOptions{
 		MaxSizeMB:  defaultLogFileMaxSizeMB,
 		MaxBackups: 3,
 		MaxAgeDays: 7,
@@ -81,14 +81,14 @@ func TestNewLogOutputWritesConsoleAndFile(t *testing.T) {
 func TestNewLogOutputRejectsInvalidRotation(t *testing.T) {
 	type invalidLogRotationCase struct {
 		name string
-		opts logRotationOptions
+		opts logFileOptions
 		want string
 	}
 
 	tests := []invalidLogRotationCase{
-		{name: "max size", opts: logRotationOptions{MaxSizeMB: 0}, want: "max size"},
-		{name: "max backups", opts: logRotationOptions{MaxSizeMB: 1, MaxBackups: -1}, want: "max backups"},
-		{name: "max age", opts: logRotationOptions{MaxSizeMB: 1, MaxAgeDays: -1}, want: "max age"},
+		{name: "max size", opts: logFileOptions{MaxSizeMB: 0}, want: "max size"},
+		{name: "max backups", opts: logFileOptions{MaxSizeMB: 1, MaxBackups: -1}, want: "max backups"},
+		{name: "max age", opts: logFileOptions{MaxSizeMB: 1, MaxAgeDays: -1}, want: "max age"},
 	}
 
 	for _, tt := range tests {
@@ -107,7 +107,7 @@ func TestNewLogOutputRejectsInvalidRotation(t *testing.T) {
 
 func TestNewLogOutputRejectsDirectoryPath(t *testing.T) {
 	var out bytes.Buffer
-	_, _, err := newLogOutput(&out, t.TempDir(), logRotationOptions{MaxSizeMB: defaultLogFileMaxSizeMB})
+	_, _, err := newLogOutput(&out, t.TempDir(), logFileOptions{MaxSizeMB: defaultLogFileMaxSizeMB})
 	if err == nil {
 		t.Fatal("expected directory path error")
 	}

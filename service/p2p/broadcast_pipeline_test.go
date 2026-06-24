@@ -885,6 +885,73 @@ func TestClassifyExternalMessageBroadcastCachesByBodyHash(t *testing.T) {
 	}
 }
 
+func TestClassifyExternalMessageBroadcastRunsAdmission(t *testing.T) {
+	node := newTestNode(t)
+	admission := &testExternalMessageAdmission{}
+	node.externalMessageAdmission = admission
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	data := testExternalMessageBOC(t)
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
+	if accepted == nil || accepted.rebroadcast == nil {
+		t.Fatal("expected external broadcast to be accepted")
+	}
+
+	if len(admission.events) != 1 {
+		t.Fatalf("admission events = %d, want 1", len(admission.events))
+	}
+	event := admission.events[0]
+	if !bytes.Equal(event.Body, data) {
+		t.Fatalf("admission body mismatch")
+	}
+	if event.Root == nil || event.Message == nil {
+		t.Fatalf("admission parsed data is missing")
+	}
+	if event.IsLocal {
+		t.Fatalf("broadcast external message IsLocal = true, want false")
+	}
+}
+
+func TestClassifyExternalMessageBroadcastDropsWhenAdmissionFails(t *testing.T) {
+	node := newTestNode(t)
+	wantErr := errors.New("reject external")
+	node.externalMessageAdmission = &testExternalMessageAdmission{err: wantErr}
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	}
+	data := testExternalMessageBOC(t)
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	if accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("peer")); accepted != nil {
+		t.Fatalf("external broadcast was accepted after admission failure: %+v", accepted)
+	}
+}
+
 func TestHandleOverlayBroadcastRejectsInvalidUntrustedFECForRelay(t *testing.T) {
 	node := newTestNode(t)
 	sub := &overlaySubscription{

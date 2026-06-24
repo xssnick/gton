@@ -282,9 +282,10 @@ func main() {
 		Bool("read_only", true).
 		Msg("opening node storage")
 
+	storageLogger := logs.Category("pebblestore")
 	store, err := pebblestore.Open(pebblestore.Options{
 		Dir:                   opts.dbDir,
-		Logger:                logs.CategoryPtr("pebblestore"),
+		Logger:                &storageLogger,
 		ReadOnly:              true,
 		CellCacheSize:         opts.cellCacheSize,
 		CellMemTableSize:      opts.cellMemTableSize,

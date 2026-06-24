@@ -404,29 +404,23 @@ func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureS
 }
 
 func (s *ValidatorSignatureSet) CatchainSeqno() uint32 {
-	if s == nil {
-		return 0
-	}
 	return s.catchainSeqno
 }
 
 func (s *ValidatorSignatureSet) Final() bool {
-	return s != nil && s.final
+	return s.final
 }
 
 func (s *ValidatorSignatureSet) ValidatorSetHash() uint32 {
-	if s == nil {
-		return 0
-	}
 	return s.validatorSetHash
 }
 
 func (s *ValidatorSignatureSet) IsFinal() bool {
-	return s != nil && s.final
+	return s.final
 }
 
 func (s *ValidatorSignatureSet) IsSimplex() bool {
-	return s != nil && s.simplex
+	return s.simplex
 }
 
 func MasterchainValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {

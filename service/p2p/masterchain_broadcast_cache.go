@@ -32,9 +32,6 @@ func (c *masterchainNextBroadcastCache) Store(downloaded DownloadedBlock) error 
 }
 
 func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now time.Time) error {
-	if c == nil {
-		return tnstore.ErrNotFound
-	}
 	if !isMasterchainBlock(downloaded.ID) {
 		return fmt.Errorf("block %s is not a masterchain next broadcast cache candidate", formatBlockRef(downloaded.ID))
 	}
@@ -100,7 +97,7 @@ func (c *masterchainNextBroadcastCache) BlockAfter(prev ton.BlockIDExt) (*Downlo
 }
 
 func (c *masterchainNextBroadcastCache) blockAfterAt(prev ton.BlockIDExt, now time.Time) (*DownloadedBlock, error) {
-	if c == nil || !isMasterchainBlock(prev) {
+	if !isMasterchainBlock(prev) {
 		return nil, tnstore.ErrNotFound
 	}
 	return c.broadcastBlockCache.blockAt(tnstore.BlockKey(prev), now)
@@ -111,7 +108,7 @@ func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) in
 }
 
 func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock) bool {
-	if downloaded == nil || n.masterchainNextBroadcastCache == nil {
+	if downloaded == nil {
 		return false
 	}
 	if !isMasterchainBlock(downloaded.ID) {
@@ -135,14 +132,11 @@ func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock
 }
 
 func (n *Node) masterchainNextBroadcastBlock(prev ton.BlockIDExt) (*DownloadedBlock, error) {
-	if n == nil || n.masterchainNextBroadcastCache == nil {
-		return nil, tnstore.ErrNotFound
-	}
 	return n.masterchainNextBroadcastCache.BlockAfter(prev)
 }
 
 func (n *Node) watchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan struct{}, func()) {
-	if n == nil || n.masterchainNextBroadcastCache == nil || !isMasterchainBlock(prev) {
+	if !isMasterchainBlock(prev) {
 		return nil, func() {}
 	}
 
@@ -179,7 +173,7 @@ func (n *Node) watchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan s
 }
 
 func (n *Node) notifyMasterchainNextBroadcastBlock(prev ton.BlockIDExt) {
-	if n == nil || !isMasterchainBlock(prev) {
+	if !isMasterchainBlock(prev) {
 		return
 	}
 

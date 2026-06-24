@@ -13,8 +13,7 @@ import (
 )
 
 type PreparedBlock struct {
-	ID   ton.BlockIDExt
-	Kind string
+	ID ton.BlockIDExt
 
 	BlockBOC []byte
 	ProofBOC []byte
@@ -165,7 +164,6 @@ func prepareVerifiedMasterchainBlockForNextSync(prev ton.BlockIDExt, block Verif
 func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRecords, elapsed time.Duration) PreparedBlock {
 	return PreparedBlock{
 		ID:                        block.ID,
-		Kind:                      block.Kind,
 		BlockBOC:                  block.BlockBOC,
 		ProofBOC:                  block.ProofBOC,
 		BlockRoot:                 block.BlockRoot,

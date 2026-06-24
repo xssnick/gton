@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/liteclient"
 )
 
 func TestIntegrationReceivesBroadcasts(t *testing.T) {
@@ -18,7 +19,9 @@ func TestIntegrationReceivesBroadcasts(t *testing.T) {
 	defer cancel()
 
 	logger := stdoutLogger(zerolog.InfoLevel)
+	globalConfig := loadIntegrationGlobalConfig(t, ctx)
 	node, err := New(Options{
+		GlobalConfig:       globalConfig,
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
 		StateFilesDir:      t.TempDir(),
@@ -60,7 +63,9 @@ func TestIntegrationDownloadsBlockFull(t *testing.T) {
 	defer cancel()
 
 	logger := stdoutLogger(zerolog.InfoLevel)
+	globalConfig := loadIntegrationGlobalConfig(t, ctx)
 	node, err := New(Options{
+		GlobalConfig:       globalConfig,
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
 		StateFilesDir:      t.TempDir(),
@@ -108,7 +113,9 @@ func TestIntegrationDownloadsNextBlockFull(t *testing.T) {
 	defer cancel()
 
 	logger := stdoutLogger(zerolog.InfoLevel)
+	globalConfig := loadIntegrationGlobalConfig(t, ctx)
 	node, err := New(Options{
+		GlobalConfig:       globalConfig,
 		Logger:             &logger,
 		PeerServingStorage: newTestPeerStore(),
 		StateFilesDir:      t.TempDir(),
@@ -151,4 +158,14 @@ func TestIntegrationDownloadsNextBlockFull(t *testing.T) {
 			return
 		}
 	}
+}
+
+func loadIntegrationGlobalConfig(t *testing.T, ctx context.Context) *liteclient.GlobalConfig {
+	t.Helper()
+
+	cfg, err := liteclient.GetConfigFromUrl(ctx, "https://tonutils.com/global.config.json")
+	if err != nil {
+		t.Fatalf("load global config: %v", err)
+	}
+	return cfg
 }

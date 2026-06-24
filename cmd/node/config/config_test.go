@@ -581,10 +581,24 @@ func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
-	path := writeTestConfig(t, `{"logging":{"level":"debug"}}`)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "logging",
+			body: `{"logging":{"level":"debug"}}`,
+		},
+	}
 
-	if _, err := Load(path); err == nil {
-		t.Fatal("expected unknown config field to fail")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestConfig(t, tt.body)
+
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected unknown config field to fail")
+			}
+		})
 	}
 }
 

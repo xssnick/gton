@@ -22,7 +22,6 @@ type Syncer struct {
 	storage    storage2.StateStorage
 	importer   *stateImportCoordinator
 	log        zerolog.Logger
-	fromZero   bool
 	syncBefore time.Duration
 }
 
@@ -31,12 +30,7 @@ type blockStateSnapshot struct {
 	artifact *storage2.ServedBlockFull
 }
 
-type downloadedStateBlockArtifact interface {
-	BlockArtifact() *storage2.ServedBlockFull
-}
-
 type SyncerOptions struct {
-	FromZero   bool
 	SyncBefore time.Duration
 }
 
@@ -55,7 +49,6 @@ func NewSyncer(source Source, storage storage2.StateStorage, opts SyncerOptions,
 		storage:    storage,
 		importer:   newStateImportCoordinator(log),
 		log:        log,
-		fromZero:   opts.FromZero,
 		syncBefore: syncBefore,
 	}
 }
@@ -430,10 +423,7 @@ func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, m
 	if err != nil {
 		return blockStateSnapshot{}, err
 	}
-	var artifact *storage2.ServedBlockFull
-	if withArtifact, ok := downloaded.(downloadedStateBlockArtifact); ok {
-		artifact = withArtifact.BlockArtifact()
-	}
+	artifact := downloaded.BlockArtifact()
 	defer func() {
 		if cleanupErr := downloaded.Cleanup(); cleanupErr != nil {
 			s.log.Warn().

@@ -73,31 +73,20 @@ func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trus
 }
 
 func (s *Syncer) configuredTrustedKeyBlockAnchor(ctx context.Context) (trustedKeyBlock, error) {
+	initBlock, err := s.source.InitBlock(ctx)
+	if err != nil {
+		return trustedKeyBlock{}, err
+	}
+
 	var trusted trustedKeyBlock
-	var err error
-	if s.fromZero {
-		var zeroBlock ton.BlockIDExt
-		zeroBlock, err = s.source.ZeroStateBlock(ctx)
+	if initBlock.SeqNo == 0 {
+		zeroBlock, err := s.source.ZeroStateBlock(ctx)
 		if err != nil {
 			return trustedKeyBlock{}, err
 		}
 		trusted, err = s.trustedZeroState(ctx, zeroBlock)
 	} else {
-		var initBlock ton.BlockIDExt
-		initBlock, err = s.source.InitBlock(ctx)
-		if err != nil {
-			return trustedKeyBlock{}, err
-		}
-		if initBlock.SeqNo == 0 {
-			var zeroBlock ton.BlockIDExt
-			zeroBlock, err = s.source.ZeroStateBlock(ctx)
-			if err != nil {
-				return trustedKeyBlock{}, err
-			}
-			trusted, err = s.trustedZeroState(ctx, zeroBlock)
-		} else {
-			trusted, err = s.trustedInitBlock(ctx, initBlock)
-		}
+		trusted, err = s.trustedInitBlock(ctx, initBlock)
 	}
 	if err != nil {
 		return trustedKeyBlock{}, err

@@ -85,16 +85,10 @@ func PrepareValidatorSet(catchainSeqno uint32, validators []*tlb.ValidatorAddr) 
 }
 
 func (s *PreparedValidatorSet) CatchainSeqno() uint32 {
-	if s == nil {
-		return 0
-	}
 	return s.catchainSeqno
 }
 
 func (s *PreparedValidatorSet) Hash() uint32 {
-	if s == nil {
-		return 0
-	}
 	return s.setHash
 }
 

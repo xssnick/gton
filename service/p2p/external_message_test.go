@@ -75,6 +75,116 @@ func TestSendExternalMessageIgnoresBroadcastDeduper(t *testing.T) {
 	}
 }
 
+func TestSendExternalMessageRunsAdmissionBeforeQueue(t *testing.T) {
+	node, sub := newSendExternalMessageTestNode(t)
+	peer := testRebroadcastQueuePeer("peer-a")
+	sub.peers[peer.id] = peer
+
+	admission := &testExternalMessageAdmission{}
+	node.externalMessageAdmission = admission
+
+	body := testExternalMessageBOC(t)
+	if err := sendTestExternalMessage(t, node, body); err != nil {
+		t.Fatalf("send external message failed: %v", err)
+	}
+
+	if len(admission.events) != 1 {
+		t.Fatalf("admission events = %d, want 1", len(admission.events))
+	}
+	event := admission.events[0]
+	if !bytes.Equal(event.Body, body) {
+		t.Fatalf("admission body mismatch")
+	}
+	if event.Root != nil || event.Message != nil {
+		t.Fatalf("send external message parsed data = (%v, %v), want nil", event.Root, event.Message)
+	}
+	if !event.IsLocal {
+		t.Fatalf("send external message IsLocal = false, want true")
+	}
+	if _, ok := peer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatalf("expected queued local rebroadcast after admission")
+	}
+}
+
+func TestSendExternalMessageDropsWhenAdmissionFails(t *testing.T) {
+	node, sub := newSendExternalMessageTestNode(t)
+	peer := testRebroadcastQueuePeer("peer-a")
+	sub.peers[peer.id] = peer
+
+	wantErr := errors.New("reject external")
+	node.externalMessageAdmission = &testExternalMessageAdmission{err: wantErr}
+
+	if err := sendTestExternalMessage(t, node, testExternalMessageBOC(t)); !errors.Is(err, wantErr) {
+		t.Fatalf("send external message error = %v, want %v", err, wantErr)
+	}
+	if _, ok := peer.localRebroadcastQueue.TryPop(); ok {
+		t.Fatalf("external message was queued after admission failure")
+	}
+}
+
+func TestSendCheckedExternalMessageRunsCheckedAdmission(t *testing.T) {
+	node, sub := newSendExternalMessageTestNode(t)
+	peer := testRebroadcastQueuePeer("peer-a")
+	sub.peers[peer.id] = peer
+
+	admission := &testExternalMessageAdmission{}
+	node.externalMessageAdmission = admission
+
+	body := testExternalMessageBOC(t)
+	key, err := externalMessageDestinationAddress(body)
+	if err != nil {
+		t.Fatalf("parse test external message address: %v", err)
+	}
+	if err = node.SendCheckedExternalMessage(context.Background(), body, key, nil, nil); err != nil {
+		t.Fatalf("send checked external message failed: %v", err)
+	}
+	if len(admission.events) != 1 {
+		t.Fatalf("admission events = %d, want 1", len(admission.events))
+	}
+	event := admission.events[0]
+	if !event.IsLocal {
+		t.Fatalf("checked external message IsLocal = false, want true")
+	}
+	if event.Root != nil || event.Message != nil {
+		t.Fatalf("checked external message parsed data = (%v, %v), want nil", event.Root, event.Message)
+	}
+	if _, ok := peer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatalf("expected checked external message to be queued")
+	}
+}
+
+func TestSendCheckedExternalMessageMarksAdmissionLocal(t *testing.T) {
+	node, sub := newSendExternalMessageTestNode(t)
+	peer := testRebroadcastQueuePeer("peer-a")
+	sub.peers[peer.id] = peer
+
+	admission := &testExternalMessageAdmission{}
+	node.externalMessageAdmission = admission
+
+	body := testExternalMessageBOC(t)
+	parsed, err := parseExternalMessageData(body)
+	if err != nil {
+		t.Fatalf("parse test external message: %v", err)
+	}
+	if err = node.SendCheckedExternalMessage(context.Background(), body, parsed.address, parsed.root, parsed.message); err != nil {
+		t.Fatalf("send checked external message failed: %v", err)
+	}
+
+	if len(admission.events) != 1 {
+		t.Fatalf("admission events = %d, want 1", len(admission.events))
+	}
+	event := admission.events[0]
+	if !event.IsLocal {
+		t.Fatalf("checked external message IsLocal = false, want true")
+	}
+	if event.Root != parsed.root || event.Message != parsed.message {
+		t.Fatalf("checked external message parsed data mismatch")
+	}
+	if _, ok := peer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatalf("expected checked external message to be queued")
+	}
+}
+
 func TestSendExternalMessageCustomOverlayCanSkipPublic(t *testing.T) {
 	node, publicSub := newSendExternalMessageTestNode(t)
 	publicPeer := testRebroadcastQueuePeer("public-peer")

@@ -44,9 +44,6 @@ func (c *shardBroadcastBlockCache) Store(downloaded DownloadedBlock, meta *tnsto
 }
 
 func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tnstore.BlockMeta, blockRoot *cell.Cell, proofRoot *cell.Cell, stateUpdate *cell.Cell, now time.Time) error {
-	if c == nil {
-		return tnstore.ErrNotFound
-	}
 	if isMasterchainBlock(downloaded.ID) {
 		return fmt.Errorf("masterchain block %s is not a shard broadcast cache candidate", formatBlockRef(downloaded.ID))
 	}
@@ -109,23 +106,14 @@ func (c *shardBroadcastBlockCache) HasBlock(block ton.BlockIDExt) bool {
 }
 
 func (c *shardBroadcastBlockCache) hasBlockAt(block ton.BlockIDExt, now time.Time) bool {
-	if c == nil {
-		return false
-	}
 	return c.has(tnstore.BlockKey(block), now)
 }
 
 func (c *shardBroadcastBlockCache) blockAt(block ton.BlockIDExt, now time.Time) (*DownloadedBlock, error) {
-	if c == nil {
-		return nil, tnstore.ErrNotFound
-	}
 	return c.broadcastBlockCache.blockAt(tnstore.BlockKey(block), now)
 }
 
 func (c *shardBroadcastBlockCache) Prune(now time.Time) {
-	if c == nil {
-		return
-	}
 	c.prune(now)
 }
 
@@ -134,7 +122,7 @@ func shardBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
 }
 
 func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
-	if downloaded == nil || n.shardBroadcastCache == nil {
+	if downloaded == nil {
 		return false
 	}
 	if isMasterchainBlock(downloaded.ID) {
@@ -173,7 +161,7 @@ func (n *Node) shardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, erro
 		n.observeBroadcastPipelineStageSince(popStarted, broadcastPipelineStageExactPop, kind, "", result)
 	}()
 
-	if n.shardBroadcastCache == nil || isMasterchainBlock(block) {
+	if isMasterchainBlock(block) {
 		return nil, tnstore.ErrNotFound
 	}
 
@@ -196,7 +184,7 @@ func (n *Node) shardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, erro
 }
 
 func (n *Node) watchShardBroadcastBlock(block ton.BlockIDExt) (<-chan struct{}, func()) {
-	if n == nil || n.shardBroadcastCache == nil || isMasterchainBlock(block) {
+	if isMasterchainBlock(block) {
 		return nil, func() {}
 	}
 
@@ -233,10 +221,6 @@ func (n *Node) watchShardBroadcastBlock(block ton.BlockIDExt) (<-chan struct{}, 
 }
 
 func (n *Node) notifyShardBroadcastBlock(block ton.BlockIDExt) {
-	if n == nil {
-		return
-	}
-
 	key := tnstore.BlockKey(block)
 	n.shardBroadcastWaitMx.Lock()
 	waiters := n.shardBroadcastWaiters[key]
@@ -249,10 +233,6 @@ func (n *Node) notifyShardBroadcastBlock(block ton.BlockIDExt) {
 }
 
 func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {
-	if n.shardBroadcastCache == nil {
-		return
-	}
-
 	interval := shardBroadcastBlockCacheTTL / 2
 	if interval <= 0 {
 		interval = time.Second

@@ -3,12 +3,12 @@ package metrics
 import (
 	"context"
 	"errors"
+	"github.com/xssnick/gton/api/liteserver"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage/pebblestore"
@@ -215,9 +215,6 @@ func (m *Metrics) Handler() http.Handler {
 }
 
 func (m *Metrics) RegisterRuntimeCollectors(readers RuntimeReaders) error {
-	if m == nil {
-		return nil
-	}
 	if readers.ServiceStatusReader == nil {
 		return errors.New("service status metric reader is required")
 	}

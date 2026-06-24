@@ -188,10 +188,6 @@ func (s *Service) exclusiveServiceTaskActive(task exclusiveServiceTask) bool {
 }
 
 func (s *Service) backgroundTaskStatus() string {
-	if s == nil {
-		return "idle"
-	}
-
 	s.exclusiveTaskMu.Lock()
 	task := s.exclusiveTask
 	s.exclusiveTaskMu.Unlock()

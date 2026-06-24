@@ -142,17 +142,13 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 }
 
 func (s *overlaySubscription) rebroadcastPlan(kind string, payloadLen int) rebroadcastPlan {
-	if s != nil && s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.Kind == overlayKindCustomFixed {
 		return planCustomRebroadcast(kind, payloadLen)
 	}
 	return planRebroadcast(kind, payloadLen)
 }
 
 func (p *overlayPeer) initRebroadcastQueues() bool {
-	if p == nil {
-		return false
-	}
-
 	p.rebroadcastMx.Lock()
 	defer p.rebroadcastMx.Unlock()
 
@@ -169,10 +165,6 @@ func (p *overlayPeer) initRebroadcastQueues() bool {
 }
 
 func (p *overlayPeer) closeRebroadcastQueues() {
-	if p == nil {
-		return
-	}
-
 	p.rebroadcastMx.Lock()
 	local := p.localRebroadcastQueue
 	regular := p.rebroadcastQueue
@@ -204,10 +196,6 @@ func (p *overlayPeer) pushRebroadcast(req rebroadcastRequest) bool {
 }
 
 func (p *overlayPeer) rebroadcastQueueSnapshots() (QueueStatusSnapshot, QueueStatusSnapshot, bool) {
-	if p == nil {
-		return QueueStatusSnapshot{}, QueueStatusSnapshot{}, false
-	}
-
 	p.rebroadcastMx.Lock()
 	local := p.localRebroadcastQueue
 	regular := p.rebroadcastQueue
@@ -269,7 +257,7 @@ func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
 }
 
 func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
-	if s == nil || s.node == nil || s.node.runCtx == nil || s.node.runCtx.Err() != nil || peer == nil {
+	if s.node.runCtx == nil || s.node.runCtx.Err() != nil || peer == nil {
 		return
 	}
 	if !peer.initRebroadcastQueues() {
@@ -283,7 +271,7 @@ func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
 }
 
 func (s *overlaySubscription) peerRebroadcastWorkerCount() int {
-	if s != nil && s.spec.Workchain == -1 && s.spec.Shard == topShard {
+	if s.spec.Workchain == -1 && s.spec.Shard == topShard {
 		return masterPeerRebroadcastWorkers
 	}
 	return basePeerRebroadcastWorkers
@@ -324,9 +312,6 @@ func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *
 }
 
 func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
-	if s == nil || s.node == nil {
-		return false
-	}
 	if s.customRebroadcastUnsupported(req.kind) {
 		s.node.noteRebroadcastDropped(req)
 		s.log.Debug().
@@ -696,7 +681,7 @@ func (n *Node) rebroadcastFECBackpressureActive() bool {
 }
 
 func (n *Node) rebroadcastLagged() bool {
-	if n == nil || n.syncLag == nil {
+	if n.syncLag == nil {
 		return false
 	}
 
@@ -745,9 +730,6 @@ func (n *Node) tryAcquireRebroadcastFECBackpressure(class rebroadcastFECLimiterC
 }
 
 func (n *Node) rebroadcastFECSlotLimit(class rebroadcastFECLimiterClass) chan struct{} {
-	if n == nil {
-		return nil
-	}
 	if n.rebroadcastFECSlots == nil {
 		n.rebroadcastFECSlots = newRebroadcastFECSlotLimits()
 	}

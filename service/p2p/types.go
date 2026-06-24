@@ -9,13 +9,13 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
-	DefaultGlobalConfigPath = "global.config.json"
-
 	topShard              = int64(-1 << 63)
 	maxPeersPerOverlay    = 20
 	maxQueryNeighbours    = 16
@@ -162,7 +162,7 @@ func (e BroadcastEvent) BlockRef() string {
 
 type Options struct {
 	Logger                    *zerolog.Logger
-	GlobalConfigPath          string
+	GlobalConfig              *liteclient.GlobalConfig
 	PrivateKey                ed25519.PrivateKey
 	ListenAddr                string
 	ExternalIP                net.IP
@@ -177,6 +177,8 @@ type Options struct {
 	SyncLag                   SyncLagProvider
 	SignatureVerifier         BroadcastSignatureVerifier
 	BroadcastAdmission        BroadcastAdmission
+	ExternalMessageAdmission  ExternalMessageAdmission
+	BlockReceivedObserver     BlockReceivedObserver
 	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
 	CustomOverlays            []CustomOverlayConfig
 }
@@ -229,11 +231,41 @@ type SyncLagProvider interface {
 	SyncLagSeconds() (int64, error)
 }
 
+type ExternalMessageEvent struct {
+	// IsLocal is true when the message originated from the local liteserver API.
+	IsLocal bool
+	// Body is the raw external message BOC.
+	Body []byte
+	// Root is the parsed external message root when already available.
+	Root *cell.Cell
+	// Message is the decoded external message when already available.
+	Message *tlb.ExternalMessage
+}
+
+type ExternalMessageAdmission interface {
+	AcceptExternalMessage(ctx context.Context, event ExternalMessageEvent) error
+	AcceptCheckedExternalMessage(ctx context.Context, event ExternalMessageEvent) error
+}
+
+type BlockReceivedEvent struct {
+	// IsSigned is true for signed block broadcasts and downloaded full blocks.
+	IsSigned bool
+	// Downloaded contains the received block artifacts.
+	Downloaded *DownloadedBlock
+}
+
+type BlockReceivedObserver interface {
+	ObserveBlockReceived(ctx context.Context, event BlockReceivedEvent)
+	BlockReceivedHooksEnabled() bool
+}
+
 type RuntimeCallbacks interface {
 	CompressedBlockStateProvider
 	SyncLagProvider
 	BroadcastSignatureVerifier
 	BroadcastAdmission
+	ExternalMessageAdmission
+	BlockReceivedObserver
 }
 
 type CustomOverlayConfig struct {

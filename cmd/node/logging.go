@@ -16,14 +16,22 @@ const (
 	defaultLogFileMaxAgeDays = 30
 )
 
-type logRotationOptions struct {
+type logFileOptions struct {
 	MaxSizeMB  int
 	MaxBackups int
 	MaxAgeDays int
 	Compress   bool
 }
 
-func newLogOutput(out io.Writer, filePath string, rotation logRotationOptions) (io.Writer, *lumberjack.Logger, error) {
+func defaultLogFileOptions() logFileOptions {
+	return logFileOptions{
+		MaxSizeMB:  defaultLogFileMaxSizeMB,
+		MaxBackups: defaultLogFileMaxBackups,
+		MaxAgeDays: defaultLogFileMaxAgeDays,
+	}
+}
+
+func newLogOutput(out io.Writer, filePath string, rotation logFileOptions) (io.Writer, *lumberjack.Logger, error) {
 	filePath = strings.TrimSpace(filePath)
 	if filePath == "" {
 		return out, nil, nil

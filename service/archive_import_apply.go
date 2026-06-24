@@ -173,7 +173,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		}
 		downloaded.consensusChecked = checked
 
-		next, timing, err := r.service.applyMasterchainTransition(master, downloaded, checked, applier)
+		next, timing, err := r.service.applyMasterchainTransition(ctx, master, downloaded, checked, applier, &blockApplyHookMeta{})
 		window.masterApplyElapsed += timing.total
 		window.masterPrepareElapsed += timing.prepare
 		window.masterConsensusElapsed += timing.consensus
@@ -264,7 +264,9 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 			mu:     &blockLoaderMu,
 		}.load,
 		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
-			return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, applier)
+			return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, applier, &blockApplyHookMeta{
+				MasterchainRef: &master,
+			})
 		},
 		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded PreparedBlock, _ time.Duration) error {
 			setShardStateMasterchainRef(state, master)

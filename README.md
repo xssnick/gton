@@ -85,7 +85,6 @@ Supported flags:
 | `--global-config <url>` | Download global config from the URL and replace the file from `ton.global_config_path` before startup. |
 | `--pprof-addr <addr>` | Enable `net/http/pprof`, for example `127.0.0.1:6060`. |
 | `--skip-cfg-check` | Continue startup after creating missing config file without manually reviewing it first. |
-| `--from-zero` | Verify the initial key-block chain from zerostate instead of the `init_block` from global config. |
 | `--archive-checkpoint-period <duration>` | Maximum current-state checkpoint interval during archive catch-up. Defaults to `2m`. |
 | `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `2`. |
 
@@ -381,3 +380,152 @@ http://127.0.0.1:9090/metrics
 ```
 
 The exported metrics cover liteserver latency, sync lag, block download/apply, checkpoint persistence, p2p queues, rebroadcasting, blocksync, and Pebble/cell DB status. The full metric list and PromQL examples are documented in [METRICS.md](METRICS.md). A Grafana dashboard is available in `metrics.json`.
+
+## Extensions
+
+The node can call a statically linked extension from a custom node binary.
+
+The extension is compiled into the custom binary, so node builds do not need cgo. A custom binary imports `github.com/xssnick/gton`, parses its own CLI/config files, and passes typed startup values to `gton.RunNode`:
+
+```go
+package main
+
+import (
+    "context"
+    "flag"
+    "os"
+
+    "github.com/xssnick/gton"
+    nodeconfig "github.com/xssnick/gton/cmd/node/config"
+    "github.com/rs/zerolog"
+    "github.com/xssnick/tonutils-go/liteclient"
+    "my/project/extension"
+)
+
+func main() {
+    flags := flag.NewFlagSet("my-node", flag.ExitOnError)
+    configPath := flags.String("config", nodeconfig.DefaultPath, "path to node config JSON")
+    flags.Parse(os.Args[1:])
+
+    cfg, err := nodeconfig.Load(*configPath)
+    if err != nil {
+        panic(err)
+    }
+
+    ctx := context.Background()
+    globalConfigPath := cfg.GlobalConfigPath()
+    if _, err = nodeconfig.EnsureGlobalConfig(ctx, globalConfigPath, nodeconfig.DefaultGlobalConfigURL, false); err != nil {
+        panic(err)
+    }
+    globalConfig, err := liteclient.GetConfigFromFile(globalConfigPath)
+    if err != nil {
+        panic(err)
+    }
+
+    opts := gton.DefaultNodeOptions()
+    opts.Config = cfg
+    opts.GlobalConfig = globalConfig
+    opts.Logger = zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
+    opts.Extension = extension.New
+
+    err = gton.RunNode(ctx, opts)
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+Custom binaries can load the node config themselves and keep extension config in
+a separate file:
+
+```go
+nodeCfg, err := nodeconfig.Load("node.json")
+if err != nil {
+    panic(err)
+}
+globalConfig, err := liteclient.GetConfigFromFile(nodeCfg.GlobalConfigPath())
+if err != nil {
+    panic(err)
+}
+extensionCfg, err := extension.LoadConfig("extension.json")
+if err != nil {
+    panic(err)
+}
+
+opts := gton.DefaultNodeOptions()
+opts.Config = nodeCfg
+opts.GlobalConfig = globalConfig
+opts.Logger = zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
+opts.Extension = extension.NewFactory(extensionCfg)
+
+err = gton.RunNode(context.Background(), opts)
+```
+
+See `example_extension/` for a complete static apply logger example.
+
+The extension factory must have this signature:
+
+```go
+func New(node hooks.Node) (hooks.Extension, error)
+```
+
+`hooks.Node` gives the extension a small capability surface:
+`Network` can send external messages, `Store` is a read-only live view backed by the same store/cache layer used by the liteserver, and `Logger` is a zerolog logger with `source=extension`. It does not expose block download methods or storage modifiers.
+
+The returned value receives hook events through:
+
+```go
+type Extension interface {
+    OnBlockApplied(context.Context, BlockAppliedEvent) error
+    OnExternalMessage(context.Context, ExternalMessageEvent) error
+    OnBlockReceived(context.Context, BlockReceivedEvent) error
+}
+```
+
+`OnBlockApplied` is called after a block state update is applied and before that block flow can continue to checkpoint or persist. Block apply hook delivery is at least once: the same block apply call may be repeated if the node crashes or is hard-stopped before the block flow is fully persisted/checkpointed. If the method returns an error, the node retries the same event after a short delay and does not advance that block flow until the extension returns `nil`. This retry only blocks the affected block dependency branch; shard block apply is parallel, so other independent branches may continue and may call the same extension concurrently.
+
+`OnExternalMessage` is called after an external message is accepted by TVM emulation and before it is rebroadcast further. `event.IsLocal` is `true` when the message came from this node's liteserver API and `false` for overlay broadcasts. If the method returns an error, that external message is dropped without retry.
+
+`OnBlockReceived` is called when a block is received from broadcasts, downloads, or archive imports. `event.IsSigned` is `true` for signed block artifacts and downloaded/imported full blocks, and `false` for shard block candidates. If the method returns an error, the node logs it and continues the block flow.
+
+Extension implementations must be thread-safe. They must also treat every object received in hook events as borrowed for the duration of the call only. Do not retain event fields, cells, metadata, state pointers, or payload slices after the hook returns. If an extension needs data later, it must copy or serialize the exact data it owns before returning.
+
+`BlockAppliedEvent` includes block/proof BOC payloads, block root cell, block metadata, parsed applied state, and masterchain reference for shard blocks. The block id is available as `event.Meta.ID`. `MasterchainRef` is `nil` for masterchain blocks. The node does not parse `tlb.Block` for extensions automatically; extensions that need parsed block data should parse it from `BlockRoot` themselves.
+
+`BlockReceivedEvent` includes the received block/proof BOC payloads, block root cell, block metadata, and `IsSigned`. The block id is available as `event.Meta.ID`.
+
+A minimal extension looks like:
+
+```go
+package extension
+
+import (
+    "context"
+
+    "github.com/xssnick/gton/service/hooks"
+)
+
+type extension struct{}
+
+func New(node hooks.Node) (hooks.Extension, error) {
+    return extension{}, nil
+}
+
+func (extension) OnBlockApplied(ctx context.Context, event hooks.BlockAppliedEvent) error {
+    return nil
+}
+
+func (extension) OnExternalMessage(ctx context.Context, event hooks.ExternalMessageEvent) error {
+    return nil
+}
+
+func (extension) OnBlockReceived(ctx context.Context, event hooks.BlockReceivedEvent) error {
+    return nil
+}
+```
+
+Build a custom node binary from the wrapper package:
+
+```bash
+CGO_ENABLED=0 go build -o gton-node-with-extension ./cmd/my-node
+```

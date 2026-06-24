@@ -16,10 +16,6 @@ const (
 )
 
 func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
-	if a == nil || a.node == nil {
-		return nil, errors.New("archive session is not initialized")
-	}
-
 	sub, err := a.node.subscriptionForBlock(block)
 	if err != nil {
 		return nil, err

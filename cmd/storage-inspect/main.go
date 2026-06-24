@@ -46,9 +46,10 @@ func main() {
 	logs := logutil.NewFactory(os.Stdout, logutil.Config{Level: level})
 	cell.MaxBOCCells = maxNodeBOCCells
 
+	storageLogger := logs.Category("pebblestore")
 	store, err := pebblestore.Open(pebblestore.Options{
 		Dir:      *dbDir,
-		Logger:   logs.CategoryPtr("pebblestore"),
+		Logger:   &storageLogger,
 		ReadOnly: true,
 	})
 	if err != nil {

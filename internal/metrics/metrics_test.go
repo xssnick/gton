@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"github.com/xssnick/gton/api/liteserver"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage/pebblestore"

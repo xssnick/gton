@@ -996,7 +996,7 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 		if err != nil {
 			return err
 		}
-		nextMaster, _, err := s.applyMasterchainTransition(&candidate.current.Masterchain, downloaded, nil, candidate.cells)
+		nextMaster, _, err := s.applyMasterchainTransition(ctx, &candidate.current.Masterchain, downloaded, nil, candidate.cells, nil)
 		if err != nil {
 			return fmt.Errorf("apply candidate masterchain transition after %s: %w", storage.FormatBlockRef(candidate.current.Masterchain.Block), err)
 		}
@@ -1123,7 +1123,7 @@ func (s *Service) newCellGenerationShardResolver(ctx context.Context, store stor
 		},
 		loadBlock: s.loadCandidateBlockForApply,
 		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
-			next, err := s.applyResolvedShardBlock(ctx, target, previous, downloaded, candidate.cells)
+			next, err := s.applyResolvedShardBlock(ctx, target, previous, downloaded, candidate.cells, nil)
 			if err != nil {
 				return nil, err
 			}

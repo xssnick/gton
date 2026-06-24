@@ -80,10 +80,6 @@ func (n *Node) downloadPeerLeaseSnapshot(peers []*overlayPeer) map[PeerID]int {
 }
 
 func (n *Node) protectedPeerIDs() map[PeerID]struct{} {
-	if n == nil {
-		return nil
-	}
-
 	n.peerUseMx.RLock()
 	defer n.peerUseMx.RUnlock()
 
@@ -101,7 +97,7 @@ func (n *Node) protectedPeerIDs() map[PeerID]struct{} {
 }
 
 func (n *Node) pinPeer(peerID PeerID) func() {
-	if n == nil || peerID.IsZero() {
+	if peerID.IsZero() {
 		return func() {}
 	}
 

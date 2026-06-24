@@ -71,10 +71,6 @@ func (c *broadcastBlockCache) storeEntry(entry *broadcastBlockCacheEntry, now ti
 }
 
 func (c *broadcastBlockCache) blockAt(key tnstore.BlockRootHash, now time.Time) (*DownloadedBlock, error) {
-	if c == nil {
-		return nil, tnstore.ErrNotFound
-	}
-
 	c.mu.Lock()
 	entry := c.entries[key]
 	if entry == nil {
@@ -93,10 +89,6 @@ func (c *broadcastBlockCache) blockAt(key tnstore.BlockRootHash, now time.Time) 
 }
 
 func (c *broadcastBlockCache) has(key tnstore.BlockRootHash, now time.Time) bool {
-	if c == nil {
-		return false
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -112,9 +104,6 @@ func (c *broadcastBlockCache) has(key tnstore.BlockRootHash, now time.Time) bool
 }
 
 func (c *broadcastBlockCache) prune(now time.Time) {
-	if c == nil {
-		return
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

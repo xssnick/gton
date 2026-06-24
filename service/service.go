@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/xssnick/gton/api/liteserver"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/blocksync"
+	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
@@ -138,6 +140,10 @@ type Service struct {
 	liveBlockCache          *storage.LiveBlockCache
 	liveStateUsesBlockCache bool
 	sync                    SyncObserver
+	applyHooks              *blockApplyHookRunner
+	externalMessageChecker  *liteserver.ExternalMessageChecker
+	externalMessageHooks    *externalMessageHookRunner
+	blockReceivedHooks      *blockReceivedHookRunner
 
 	stateCellPrewrite *stateCellPrewriter
 
@@ -236,6 +242,8 @@ type Options struct {
 	PersistentStateLargeBOCBatchSize        int
 	StateSerializeOnePass                   bool
 	SyncObserver                            SyncObserver
+	Extension                               hooks.Extension
+	ExternalMessageChecker                  *liteserver.ExternalMessageChecker
 }
 
 type CurrentStatePublisher interface {
@@ -350,10 +358,6 @@ func syncBlockOriginForSource(source string) string {
 
 func syncBlockSourceForDownloadedBlock(defaultSource string, downloaded p2p.DownloadedBlock) string {
 	return syncBlockSourceForKind(defaultSource, downloaded.Kind)
-}
-
-func syncBlockSourceForPreparedBlock(defaultSource string, block PreparedBlock) string {
-	return syncBlockSourceForKind(defaultSource, block.Kind)
 }
 
 func syncBlockSourceForVerifiedBlock(defaultSource string, block VerifiedBlock) string {
@@ -510,6 +514,10 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		liveBlockCache:                     opts.LiveBlockCache,
 		liveStateUsesBlockCache:            opts.CurrentStatePublisherUsesLiveBlockCache,
 		sync:                               opts.SyncObserver,
+		applyHooks:                         newBlockApplyHookRunner(logger, opts.Extension),
+		externalMessageChecker:             opts.ExternalMessageChecker,
+		externalMessageHooks:               newExternalMessageHookRunner(logger, opts.Extension),
+		blockReceivedHooks:                 newBlockReceivedHookRunner(logger, opts.Extension),
 		stateCellPrewrite:                  newStateCellPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
 		archiveCatchUpCheckpointPeriod:     opts.ArchiveCatchUpCheckpointPeriod,
@@ -680,10 +688,6 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 }
 
 func (s *Service) SyncLagSeconds() (int64, error) {
-	if s == nil {
-		return 0, fmt.Errorf("service is missing for sync lag: %w", storage.ErrNotFound)
-	}
-
 	nowUnix := time.Now().Unix()
 	var maxLag int64
 	hasLag := false

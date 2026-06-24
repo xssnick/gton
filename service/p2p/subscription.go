@@ -210,10 +210,6 @@ type overlayPeer struct {
 }
 
 func (p *overlayPeer) close() {
-	if p == nil {
-		return
-	}
-
 	p.closeRebroadcastQueues()
 	if p.release != nil {
 		p.release()

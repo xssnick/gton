@@ -223,8 +223,8 @@ func (s *LiveStore) LazyCellLoader() cell.LazyCellLoader {
 }
 
 func (s *LiveStore) loadInitialStoredCurrentState(ctx context.Context) {
-	// Fresh and from-zero nodes do not have a stored current state yet. Missing
-	// current is allowed; real storage errors should fail during initialization.
+	// Fresh nodes may not have a stored current state yet. Missing current is
+	// allowed; real storage errors should fail during initialization.
 	if _, err := s.loadStoredCurrentState(ctx); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		panic(fmt.Sprintf("load stored current state: %v", err))
 	}

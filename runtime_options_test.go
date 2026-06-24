@@ -1,4 +1,4 @@
-package main
+package gton
 
 import (
 	"bytes"
@@ -69,9 +69,6 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	opts, err := p2pOptionsFromConfig(cfg)
 	if err != nil {
 		t.Fatalf("p2p options: %v", err)
-	}
-	if opts.GlobalConfigPath != "configs/global.config.json" {
-		t.Fatalf("unexpected TON config path %q", opts.GlobalConfigPath)
 	}
 	if !bytes.Equal(opts.PrivateKey, testPrivateKey(1)) {
 		t.Fatal("unexpected ADNL private key")

@@ -47,7 +47,7 @@ var _ dhtBackend = (*dht.Client)(nil)
 
 type Node struct {
 	log                 zerolog.Logger
-	cfgPath             string
+	globalConfig        *liteclient.GlobalConfig
 	listenAddr          string
 	externalIP          net.IP
 	privKey             ed25519.PrivateKey
@@ -91,6 +91,9 @@ type Node struct {
 	syncLag                         SyncLagProvider
 	signatureVerifier               BroadcastSignatureVerifier
 	broadcastAdmission              BroadcastAdmission
+	externalMessageAdmission        ExternalMessageAdmission
+	blockReceivedObserver           BlockReceivedObserver
+	blockReceivedHooks              bool
 	broadcastPipelineObserver       BroadcastPipelineObserver
 	shardBroadcastCache             *shardBroadcastBlockCache
 	shardCandidateCache             *shardBlockCandidateCache
@@ -182,11 +185,6 @@ func New(opts Options) (*Node, error) {
 		}
 	}
 
-	cfgPath := opts.GlobalConfigPath
-	if cfgPath == "" {
-		cfgPath = DefaultGlobalConfigPath
-	}
-
 	priv, err := privateKeyOrGenerate(opts.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("load ADNL key: %w", err)
@@ -244,7 +242,7 @@ func New(opts Options) (*Node, error) {
 
 	return &Node{
 		log:                             logger,
-		cfgPath:                         cfgPath,
+		globalConfig:                    opts.GlobalConfig,
 		listenAddr:                      opts.ListenAddr,
 		externalIP:                      append(net.IP(nil), opts.ExternalIP...),
 		externalPort:                    opts.ExternalPort,
@@ -277,6 +275,9 @@ func New(opts Options) (*Node, error) {
 		syncLag:                         opts.SyncLag,
 		signatureVerifier:               opts.SignatureVerifier,
 		broadcastAdmission:              opts.BroadcastAdmission,
+		externalMessageAdmission:        opts.ExternalMessageAdmission,
+		blockReceivedObserver:           opts.BlockReceivedObserver,
+		blockReceivedHooks:              blockReceivedHooksEnabled(opts.BlockReceivedObserver),
 		shardBroadcastCache:             newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		shardCandidateCache:             newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
 		shardBroadcastWaiters:           map[storage2.BlockRootHash][]chan struct{}{},
@@ -303,6 +304,9 @@ func (n *Node) SetRuntimeCallbacks(callbacks RuntimeCallbacks) {
 	n.syncLag = callbacks
 	n.signatureVerifier = callbacks
 	n.broadcastAdmission = callbacks
+	n.externalMessageAdmission = callbacks
+	n.blockReceivedObserver = callbacks
+	n.blockReceivedHooks = blockReceivedHooksEnabled(callbacks)
 }
 
 func protocolDiagnosticLoggable(msg string) bool {
@@ -350,9 +354,9 @@ func (n *Node) Events() <-chan BroadcastEvent {
 }
 
 func (n *Node) Start(ctx context.Context) error {
-	cfg, err := liteclient.GetConfigFromFile(n.cfgPath)
-	if err != nil {
-		return fmt.Errorf("load TON config: %w", err)
+	cfg := n.globalConfig
+	if cfg == nil {
+		return fmt.Errorf("global config is required")
 	}
 
 	zeroBlock := blockIDFromConfig(cfg.Validator.ZeroState)
@@ -1040,10 +1044,6 @@ func (d *eventDeduper) Seen(key string, now time.Time) bool {
 }
 
 func (d *eventDeduper) Forget(key string) {
-	if d == nil {
-		return
-	}
-
 	d.mx.Lock()
 	defer d.mx.Unlock()
 

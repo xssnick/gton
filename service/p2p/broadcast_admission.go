@@ -1,7 +1,7 @@
 package p2p
 
 func (n *Node) canAcceptBroadcast(kind string, local bool) bool {
-	if n == nil || n.broadcastAdmission == nil {
+	if n.broadcastAdmission == nil {
 		return true
 	}
 	if local && broadcastAdmissionExternalKind(kind) {

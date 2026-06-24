@@ -14,7 +14,6 @@ import (
 	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/service/storage"
 
-	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
@@ -26,7 +25,6 @@ import (
 	funcsop "github.com/xssnick/tonutils-go/tvm/op/funcs"
 	stackop "github.com/xssnick/tonutils-go/tvm/op/stack"
 	"github.com/xssnick/tonutils-go/tvm/tuple"
-	vmcore "github.com/xssnick/tonutils-go/tvm/vm"
 )
 
 func TestHandleMasterchainInfoExtModeZero(t *testing.T) {
@@ -213,6 +211,9 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 	}
 	if sender.count != 1 {
 		t.Fatalf("send count = %d, want 1", sender.count)
+	}
+	if sender.root == nil || sender.message == nil {
+		t.Fatalf("checked sender did not receive parsed external message")
 	}
 
 	dup := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
@@ -464,76 +465,6 @@ func TestSendMessageBroadcastCapacityErrorReason(t *testing.T) {
 	got := sendMessageBroadcastErrorReason(extmsg.ErrExternalBroadcastCapacityExceeded)
 	if got != sendMessageErrorReasonBroadcastCapacity {
 		t.Fatalf("broadcast error reason = %q, want %q", got, sendMessageErrorReasonBroadcastCapacity)
-	}
-}
-
-func TestSendMessageTVMTraceLogIncludesBlockAndC7(t *testing.T) {
-	var out bytes.Buffer
-	logger := zerolog.New(&out).Level(zerolog.WarnLevel)
-	srv := testServer(&fakeStore{})
-	srv.log = logger
-
-	addr := address.NewAddress(0, 0xff, bytes.Repeat([]byte{0x33}, 32))
-	master := ton.BlockIDExt{
-		Workchain: masterchainID,
-		Shard:     masterchainShard,
-		SeqNo:     11,
-		RootHash:  bytes.Repeat([]byte{0x11}, 32),
-		FileHash:  bytes.Repeat([]byte{0x12}, 32),
-	}
-	shard := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     0x4000000000000000,
-		SeqNo:     22,
-		RootHash:  bytes.Repeat([]byte{0x21}, 32),
-		FileHash:  bytes.Repeat([]byte{0x22}, 32),
-	}
-
-	stackBefore := vmcore.NewStack()
-	if err := stackBefore.PushInt(big.NewInt(1)); err != nil {
-		t.Fatalf("push trace stack before: %v", err)
-	}
-	stackAfter := vmcore.NewStack()
-	if err := stackAfter.PushInt(big.NewInt(2)); err != nil {
-		t.Fatalf("push trace stack after: %v", err)
-	}
-
-	srv.logSendMessageTVMTrace(
-		errors.New("rejected"),
-		false,
-		[]vmcore.TraceStep{
-			{Step: 1, Opcode: "PUSHINT 1", GasRemaining: 999, Stack: stackBefore},
-			{Step: 2, Opcode: "THROWIF", GasRemaining: 990, Stack: stackAfter},
-		},
-		addr,
-		master,
-		shard,
-		runMethodShardHeader{GenUTime: 100, GenLT: 200},
-		runMethodShardHeader{GenUTime: 300, GenLT: 400},
-		tvm.CheckExternalMessageAcceptedConfig{Now: 300, BlockLT: 400, LogicalTime: 402},
-		13,
-	)
-
-	log := out.String()
-	for _, want := range []string{
-		`"accepted":false`,
-		`"vm_trace_steps":2`,
-		`"master_seqno":11`,
-		`"master_gen_utime":100`,
-		`"master_gen_lt":200`,
-		`"execution_seqno":22`,
-		`"execution_gen_utime":300`,
-		`"execution_gen_lt":400`,
-		`"global_version":13`,
-		`"c7_now":300`,
-		`"c7_block_lt":400`,
-		`"c7_logical_time":402`,
-		`#1 PUSHINT 1 gas=999\ns0 = 1 [int]`,
-		`#2 THROWIF gas=990\ns0 = 2 [int]`,
-	} {
-		if !strings.Contains(log, want) {
-			t.Fatalf("trace log missing %s in %s", want, log)
-		}
 	}
 }
 
@@ -6747,13 +6678,17 @@ func fakeLTKey(key storage.BlockHistoryKey, lt uint64) fakeLTLookupKey {
 type fakeMessageSender struct {
 	body    []byte
 	address extmsg.AddressKey
+	root    *cell.Cell
+	message *tlb.ExternalMessage
 	err     error
 	count   int
 }
 
-func (s *fakeMessageSender) SendExternalMessage(_ context.Context, body []byte, address extmsg.AddressKey) error {
+func (s *fakeMessageSender) SendCheckedExternalMessage(_ context.Context, body []byte, address extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage) error {
 	s.body = append([]byte(nil), body...)
 	s.address = address
+	s.root = root
+	s.message = msg
 	s.count++
 	return s.err
 }

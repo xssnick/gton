@@ -5,10 +5,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"strings"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/internal/extmsg"
-	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -16,7 +15,6 @@ import (
 	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	"github.com/xssnick/tonutils-go/tvm/tuple"
-	vmcore "github.com/xssnick/tonutils-go/tvm/vm"
 )
 
 const (
@@ -24,29 +22,71 @@ const (
 	maxExternalMessageBOCCells          = 1 << 17
 )
 
-var errExternalMessageRejected = errors.New("external message was not accepted")
+var ErrExternalMessageRejected = errors.New("external message was not accepted")
 
 type CurrentAccountBlockIDs struct {
 	Master  ton.BlockIDExt
 	Account ton.BlockIDExt
 }
 
-func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell *cell.Cell, msg *tlb.ExternalMessage) error {
-	blocks, err := s.currentExternalMessageBlocks(ctx, msg.DstAddr)
-	if err != nil {
-		return err
+type ExternalMessageCheckOptions struct {
+	Logger *zerolog.Logger
+	Store  Store
+}
+
+type ExternalMessageChecker struct {
+	log   zerolog.Logger
+	store Store
+	tvm   *tvm.TVM
+}
+
+type ExternalMessageCheckResult struct {
+	Root    *cell.Cell
+	Message *tlb.ExternalMessage
+	Blocks  CurrentAccountBlockIDs
+}
+
+func NewExternalMessageChecker(opts ExternalMessageCheckOptions) (*ExternalMessageChecker, error) {
+	if opts.Store == nil {
+		return nil, fmt.Errorf("external message checker store is required")
 	}
 
-	stateFragments, err := s.blockFragments(ctx, blocks.Account)
+	log := zerolog.Nop()
+	if opts.Logger != nil {
+		log = *opts.Logger
+	}
+
+	return &ExternalMessageChecker{
+		log:   log,
+		store: opts.Store,
+		tvm:   tvm.NewTVM(),
+	}, nil
+}
+
+func (c *ExternalMessageChecker) CheckBOC(ctx context.Context, data []byte) (ExternalMessageCheckResult, error) {
+	root, msg, err := parseExternalMessage(data)
 	if err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
+	}
+	return c.Check(ctx, data, root, msg)
+}
+
+func (c *ExternalMessageChecker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, msg *tlb.ExternalMessage) (ExternalMessageCheckResult, error) {
+	blocks, err := c.currentExternalMessageBlocks(ctx, msg.DstAddr)
+	if err != nil {
+		return ExternalMessageCheckResult{}, err
+	}
+
+	stateFragments, err := c.blockFragments(ctx, blocks.Account)
+	if err != nil {
+		return ExternalMessageCheckResult{}, err
 	}
 
 	masterFragments := stateFragments
 	if !blockIDEqual(blocks.Account, blocks.Master) {
-		masterFragments, err = s.blockFragments(ctx, blocks.Master)
+		masterFragments, err = c.blockFragments(ctx, blocks.Master)
 		if err != nil {
-			return err
+			return ExternalMessageCheckResult{}, err
 		}
 	}
 
@@ -54,7 +94,7 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 
 	shardAccount, accountState, err := externalMessageAccountFromAccountsRoot(stateFragments.accountsRoot, msg.DstAddr)
 	if err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
 	}
 
 	var accountCode *cell.Cell
@@ -66,25 +106,25 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 
 	config, err := masterFragments.runMethodConfig(header.GenUTime, accountCode)
 	if err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
 	}
 	limits, err := masterFragments.externalMessageLimits()
 	if err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
 	}
 	if err = checkExternalMessageLimits(limits, data, msgCell); err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
 	}
 
 	libraries, err := masterFragments.runMethodLibraries(accountLibraries)
 	if err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
 	}
 
 	unpacked, _ := config.Unpacked.(tuple.Tuple)
-	machine, err := s.tvm.WithGlobalVersion(config.GlobalVersion)
+	machine, err := c.tvm.WithGlobalVersion(config.GlobalVersion)
 	if err != nil {
-		return err
+		return ExternalMessageCheckResult{}, err
 	}
 
 	checkConfig := tvm.CheckExternalMessageAcceptedConfig{
@@ -100,68 +140,35 @@ func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell 
 		Libraries:           libraries,
 	}
 
-	var trace []vmcore.TraceStep
-	if s.sendMessageTVMTrace {
-		checkConfig.TraceHook = func(step vmcore.TraceStep) {
-			trace = append(trace, step)
-		}
-	}
 	accepted, err := machine.CheckExternalMessageAccepted(shardAccount, accountState, msgCell, msg, checkConfig)
-	if s.sendMessageTVMTrace && (err != nil || !accepted) {
-		s.logSendMessageTVMTrace(err, accepted, trace, msg.DstAddr, blocks.Master, blocks.Account, masterFragments.shardHeader, header, checkConfig, config.GlobalVersion)
-	}
 	if err != nil {
-		return fmt.Errorf("%w: cannot run message on account: %w", errExternalMessageRejected, err)
+		return ExternalMessageCheckResult{}, fmt.Errorf("%w: cannot run message on account: %w", ErrExternalMessageRejected, err)
 	}
 	if !accepted {
-		return errExternalMessageRejected
+		return ExternalMessageCheckResult{}, ErrExternalMessageRejected
 	}
-	return nil
+	return ExternalMessageCheckResult{
+		Root:    msgCell,
+		Message: msg,
+		Blocks:  blocks,
+	}, nil
 }
 
-func (s *Server) currentExternalMessageBlocks(ctx context.Context, addr *address.Address) (CurrentAccountBlockIDs, error) {
-	return s.store.CurrentAccountBlocks(ctx, addr.Workchain(), addr.Data())
+func (s *Server) checkExternalMessage(ctx context.Context, data []byte, msgCell *cell.Cell, msg *tlb.ExternalMessage) (ExternalMessageCheckResult, error) {
+	checker := ExternalMessageChecker{
+		log:   s.log,
+		store: s.store,
+		tvm:   s.tvm,
+	}
+	return checker.Check(ctx, data, msgCell, msg)
 }
 
-func (s *Server) logSendMessageTVMTrace(err error, accepted bool, trace []vmcore.TraceStep, addr *address.Address, master ton.BlockIDExt, execution ton.BlockIDExt, masterHeader runMethodShardHeader, executionHeader runMethodShardHeader, cfg tvm.CheckExternalMessageAcceptedConfig, globalVersion int) {
-	event := s.log.Warn().
-		Bool("accepted", accepted).
-		Int("vm_trace_steps", len(trace)).
-		Str("address", addr.StringRaw()).
-		Int32("address_workchain", addr.Workchain()).
-		Str("master_block", storage.FormatBlockRef(master)).
-		Int32("master_workchain", master.Workchain).
-		Int64("master_shard", master.Shard).
-		Uint32("master_seqno", master.SeqNo).
-		Uint32("master_gen_utime", masterHeader.GenUTime).
-		Uint64("master_gen_lt", masterHeader.GenLT).
-		Str("execution_block", storage.FormatBlockRef(execution)).
-		Int32("execution_workchain", execution.Workchain).
-		Int64("execution_shard", execution.Shard).
-		Uint32("execution_seqno", execution.SeqNo).
-		Uint32("execution_gen_utime", executionHeader.GenUTime).
-		Uint64("execution_gen_lt", executionHeader.GenLT).
-		Int("global_version", globalVersion).
-		Uint32("c7_now", cfg.Now).
-		Int64("c7_block_lt", cfg.BlockLT).
-		Int64("c7_logical_time", cfg.LogicalTime).
-		Str("vm_trace", formatSendMessageTVMTrace(trace))
-	if err != nil {
-		event = event.Err(err)
-	}
-	event.Msg("sendMessage TVM trace")
+func (c *ExternalMessageChecker) currentExternalMessageBlocks(ctx context.Context, addr *address.Address) (CurrentAccountBlockIDs, error) {
+	return c.store.CurrentAccountBlocks(ctx, addr.Workchain(), addr.Data())
 }
 
-func formatSendMessageTVMTrace(trace []vmcore.TraceStep) string {
-	if len(trace) == 0 {
-		return ""
-	}
-
-	lines := make([]string, 0, len(trace))
-	for _, step := range trace {
-		lines = append(lines, step.String())
-	}
-	return strings.Join(lines, "\n")
+func (c *ExternalMessageChecker) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error) {
+	return c.store.BlockFragments(ctx, block)
 }
 
 func (s *Server) checkExternalMessageAddressLimit(key extmsg.AddressKey) error {

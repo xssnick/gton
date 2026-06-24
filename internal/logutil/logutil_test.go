@@ -2,6 +2,7 @@ package logutil
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,6 +76,51 @@ func TestFactoryComponentUsesCategoryLevel(t *testing.T) {
 	logger := factory.Component("service")
 	if !logger.Debug().Enabled() {
 		t.Fatal("service component debug should be enabled")
+	}
+}
+
+func TestFactoryCategoryWritesOverrideWithoutComponentField(t *testing.T) {
+	var out bytes.Buffer
+	factory := NewFactory(&out, Config{
+		Level: zerolog.InfoLevel,
+		Overrides: map[string]zerolog.Level{
+			"p2p": zerolog.DebugLevel,
+		},
+		JSON: true,
+	})
+
+	logger := factory.Category("p2p")
+	logger.Debug().Msg("category debug")
+
+	if got := out.String(); !strings.Contains(got, `"message":"category debug"`) {
+		t.Fatalf("category logger should write debug override, got %s", got)
+	}
+}
+
+func TestFactoryBaseLoggerFiltersOverridesByComponent(t *testing.T) {
+	var out bytes.Buffer
+	factory := NewFactory(&out, Config{
+		Level: zerolog.InfoLevel,
+		Overrides: map[string]zerolog.Level{
+			"p2p": zerolog.DebugLevel,
+		},
+		JSON: true,
+	})
+
+	logger := factory.Base()
+	logger.Debug().Str("component", "p2p").Msg("p2p debug")
+	logger.Debug().Str("component", "service").Msg("service debug")
+	logger.Info().Str("component", "service").Msg("service info")
+
+	got := out.String()
+	if !strings.Contains(got, `"message":"p2p debug"`) {
+		t.Fatalf("base logger should include p2p debug override, got %s", got)
+	}
+	if strings.Contains(got, `"message":"service debug"`) {
+		t.Fatalf("base logger should filter service debug at global info level, got %s", got)
+	}
+	if !strings.Contains(got, `"message":"service info"`) {
+		t.Fatalf("base logger should include service info, got %s", got)
 	}
 }
 

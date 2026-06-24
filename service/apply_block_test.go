@@ -173,7 +173,7 @@ func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	current.Block = prepared.Meta.PrevRefs[0]
 
 	prepared.ProofBOC = nil
-	next, _, err := (&Service{}).applyMasterchainTransition(current, prepared, nil, nil)
+	next, _, err := (&Service{}).applyMasterchainTransition(context.Background(), current, prepared, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("apply stored masterchain transition: %v", err)
 	}

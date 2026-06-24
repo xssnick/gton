@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -55,7 +56,7 @@ type LiveStoreBacking interface {
 }
 
 type MessageSender interface {
-	SendExternalMessage(ctx context.Context, body []byte, address extmsg.AddressKey) error
+	SendCheckedExternalMessage(ctx context.Context, body []byte, address extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage) error
 }
 
 type QueryObserver interface {
@@ -74,35 +75,33 @@ type QueryObservation struct {
 }
 
 type Options struct {
-	Logger              *zerolog.Logger
-	Store               Store
-	MessageSender       MessageSender
-	QueryObserver       QueryObserver
-	PrivateKey          ed25519.PrivateKey
-	ListenAddr          string
-	NonFinal            bool
-	SendMessageTVMTrace bool
-	ZeroState           ton.ZeroStateIDExt
-	Version             int32
-	Capabilities        int64
-	RequestLimits       RequestLimitOptions
+	Logger        *zerolog.Logger
+	Store         Store
+	MessageSender MessageSender
+	QueryObserver QueryObserver
+	PrivateKey    ed25519.PrivateKey
+	ListenAddr    string
+	NonFinal      bool
+	ZeroState     ton.ZeroStateIDExt
+	Version       int32
+	Capabilities  int64
+	RequestLimits RequestLimitOptions
 }
 
 type Server struct {
-	log                 zerolog.Logger
-	store               Store
-	messageSender       MessageSender
-	queryObserver       QueryObserver
-	privateKey          ed25519.PrivateKey
-	listenAddr          string
-	nonFinal            bool
-	sendMessageTVMTrace bool
-	zeroState           ton.ZeroStateIDExt
-	version             int32
-	capabilities        int64
-	now                 func() time.Time
-	tvm                 *tvm.TVM
-	requestLimits       RequestLimitOptions
+	log           zerolog.Logger
+	store         Store
+	messageSender MessageSender
+	queryObserver QueryObserver
+	privateKey    ed25519.PrivateKey
+	listenAddr    string
+	nonFinal      bool
+	zeroState     ton.ZeroStateIDExt
+	version       int32
+	capabilities  int64
+	now           func() time.Time
+	tvm           *tvm.TVM
+	requestLimits RequestLimitOptions
 
 	sendMessageCache       *sendMessageCache
 	externalMessageLimiter *extmsg.AddressLimiter
@@ -156,7 +155,6 @@ func New(opts Options) (*Server, error) {
 		privateKey:             opts.PrivateKey,
 		listenAddr:             opts.ListenAddr,
 		nonFinal:               opts.NonFinal,
-		sendMessageTVMTrace:    opts.SendMessageTVMTrace,
 		zeroState:              cloneZeroState(opts.ZeroState),
 		version:                version,
 		capabilities:           capabilities,

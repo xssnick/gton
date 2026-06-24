@@ -110,7 +110,8 @@ func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.Send
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
-	if err = s.checkExternalMessage(ctx, query.Body, msgCell, msg); err != nil {
+	checkResult, err := s.checkExternalMessage(ctx, query.Body, msgCell, msg)
+	if err != nil {
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageCheckErrorReason(err), errorPrefix+": "+err.Error())
 	}
@@ -118,7 +119,7 @@ func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.Send
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
-	if err := s.messageSender.SendExternalMessage(ctx, query.Body, addrKey); err != nil {
+	if err := s.messageSender.SendCheckedExternalMessage(ctx, query.Body, addrKey, checkResult.Root, checkResult.Message); err != nil {
 		s.dropExternalMessageAddressLimit(addrKey)
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageBroadcastErrorReason(err), errorPrefix+": "+err.Error())
@@ -145,7 +146,7 @@ func sendMessageCheckErrorReason(err error) string {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
 		return sendMessageErrorReasonNotReady
-	case errors.Is(err, errExternalMessageRejected):
+	case errors.Is(err, ErrExternalMessageRejected):
 		return sendMessageErrorReasonTVMRejected
 	default:
 		return sendMessageErrorReasonCheckFailed

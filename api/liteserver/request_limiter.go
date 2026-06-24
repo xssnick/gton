@@ -63,10 +63,6 @@ func newRequestLimiter(opts RequestLimitOptions) *requestLimiter {
 }
 
 func (l *requestLimiter) allow(ip string, now time.Time) bool {
-	if l == nil {
-		return true
-	}
-
 	nowNanos := now.UnixNano()
 	for {
 		bucket := l.bucket(ip)
@@ -134,10 +130,6 @@ func (l *requestLimiter) reserve(bucket *requestLimitBucket, nowNanos int64) (bo
 }
 
 func (l *requestLimiter) prune(now time.Time) int {
-	if l == nil {
-		return 0
-	}
-
 	nowNanos := now.UnixNano()
 	deleted := 0
 	l.buckets.Range(func(key, value any) bool {

@@ -167,7 +167,7 @@ func (w *nextMasterApplyCellWindow) applyBlockStateUpdate(previous []*storage.Bl
 }
 
 func (w *nextMasterApplyCellWindow) remember(block ton.BlockIDExt, records storage.StateCellRecords) {
-	if w == nil || records.Empty() {
+	if records.Empty() {
 		return
 	}
 
@@ -180,10 +180,6 @@ func (w *nextMasterApplyCellWindow) remember(block ton.BlockIDExt, records stora
 }
 
 func (w *nextMasterApplyCellWindow) forget(block ton.BlockIDExt) {
-	if w == nil {
-		return
-	}
-
 	key := storage.BlockKey(block)
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -212,10 +208,6 @@ func (w *nextMasterApplyCellWindow) loaderWith(records storage.StateCellRecords)
 }
 
 func (w *nextMasterApplyCellWindow) load(hash cell.Hash) (*cell.Cell, error) {
-	if w == nil {
-		return nil, storage.ErrNotFound
-	}
-
 	var data []byte
 	w.mu.RLock()
 	for i := len(w.layers) - 1; i >= 0; i-- {
@@ -609,7 +601,7 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 	}
 	applied.shardPrefetchTargets = r.scheduleShardPrefetch(prepared.ID, targets)
 
-	nextMaster, transitionTiming, err := r.service.applyMasterchainTransition(master, prepared, checked, applyCells)
+	nextMaster, transitionTiming, err := r.service.applyMasterchainTransition(r.ctx, master, prepared, checked, applyCells, &blockApplyHookMeta{})
 	applyTiming.prepare += transitionTiming.prepare
 	applyTiming.consensus += transitionTiming.consensus
 	applyTiming.stateUpdate += transitionTiming.stateUpdate
@@ -1181,7 +1173,7 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 		Pipeline:        r.method,
 		Chain:           syncChainLabel(downloaded.ID),
 		Shard:           syncShardLabel(downloaded.ID),
-		Source:          syncBlockSourceForPreparedBlock("next_block", downloaded),
+		Source:          "next_block",
 		Result:          "success",
 		CatchUp:         r.mode == nextSyncToTarget,
 		PrepareDuration: downloaded.PrepareElapsed,

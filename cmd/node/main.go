@@ -4,86 +4,95 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/xssnick/gton"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/internal/logutil"
-	"github.com/xssnick/gton/internal/metrics"
-	"github.com/xssnick/gton/liteserver"
-	service2 "github.com/xssnick/gton/service"
-	"github.com/xssnick/gton/service/blocksync"
-	"github.com/xssnick/gton/service/p2p"
-	"github.com/xssnick/gton/service/state"
-	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/gton/service/storage/pebblestore"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
-	"github.com/xssnick/tonutils-go/tvm/cell"
-)
-
-const (
-	maxNodeBOCCells = 4_000_000_000
-	topShard        = int64(-1 << 63)
 )
 
 var GitCommit = "unknown"
 
-func main() {
-	configPath := flag.String("config", nodeconfig.DefaultPath, "path to node config JSON")
-	lsPubkeyFlag := flag.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
-	adnlIDFlag := flag.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
-	versionFlag := flag.Bool("version", false, "print build version and exit")
-	skipConfigCheckFlag := flag.Bool("skip-cfg-check", false, "continue startup after creating a missing config file")
-	verbosityFlag := flag.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
-	logTypesFlag := flag.String("log-types", "", "category log verbosity overrides, comma-separated: liteserver=debug,p2p=warn")
-	logJSONFlag := flag.Bool("log-json", false, "write logs as JSON instead of pretty console")
-	logFileFlag := flag.String("log-file", "", "path to rotating log file, disabled by default")
-	logFileMaxSizeFlag := flag.Int("log-file-max-size", defaultLogFileMaxSizeMB, "maximum log file size in megabytes before rotation")
-	logFileMaxBackupsFlag := flag.Int("log-file-max-backups", defaultLogFileMaxBackups, "maximum rotated log files to keep, 0 keeps all")
-	logFileMaxAgeFlag := flag.Int("log-file-max-age", defaultLogFileMaxAgeDays, "maximum days to keep rotated log files, 0 keeps all")
-	logFileCompressFlag := flag.Bool("log-file-compress", false, "compress rotated log files")
-	globalConfigURLFlag := flag.String("global-config", "", "download TON global config from URL and replace the configured file before start")
-	pprofAddrFlag := flag.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
-	fromZeroFlag := flag.Bool("from-zero", false, "verify initial key block chain from zerostate instead of global config init_block")
-	liteSendMessageTVMTraceFlag := flag.Bool("liteserver-send-message-tvm-trace", false, "dump TVM opcode trace when liteserver sendMessage execution rejects a message")
-	liteQueryWorkersFlag := flag.Int("liteserver-query-workers", 0, "liteserver query worker goroutines, 0 uses tonutils default")
-	archiveCheckpointPeriodFlag := flag.Duration("archive-checkpoint-period", service2.DefaultArchiveCatchUpCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
-	archivePrefetchWindowsFlag := flag.Int("archive-prefetch-windows", service2.DefaultArchiveCatchUpPrefetchWindows, "archive catch-up imported window prefetch depth")
-	flag.Parse()
+type cliCommands struct {
+	version         bool
+	lsPubkey        bool
+	adnlID          bool
+	skipConfigCheck bool
+}
 
-	if *versionFlag {
-		if _, err := fmt.Fprintln(os.Stdout, GitCommit); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write version: %v\n", err)
+type startupOptions struct {
+	Node       gton.NodeOptions
+	ConfigFile string
+
+	LogConfig   logutil.Config
+	LogFilePath string
+	LogFile     logFileOptions
+
+	GlobalConfigURL     string
+	ReplaceGlobalConfig bool
+	PprofAddr           string
+	LiteQueryWorkers    int
+}
+
+func main() {
+	startOpts, commands, err := parseNodeFlags(os.Args[1:], os.Stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	if commands.version {
+		fmt.Fprintln(os.Stdout, GitCommit)
+		return
+	}
+
+	cfg, created, err := loadNodeConfig(context.Background(), startOpts.ConfigFile, commands.lsPubkey || commands.adnlID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if created {
+		if commands.skipConfigCheck {
+			fmt.Fprintf(os.Stdout, "created default config %s and continuing startup due --skip-cfg-check\n", displayConfigPath(startOpts.ConfigFile))
+		} else {
+			fmt.Fprintf(os.Stdout, "created default config %s; review and approve config.json settings, then start the node again\n", displayConfigPath(startOpts.ConfigFile))
+			return
+		}
+	}
+
+	if commands.lsPubkey {
+		if err = writeLiteServerPublicKey(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if commands.adnlID {
+		if err = writeADNLID(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	level, err := logutil.ParseLevel(*verbosityFlag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid verbosity %q: %v\n", *verbosityFlag, err)
-		os.Exit(1)
-	}
-	logTypeOverrides, err := logutil.ParseLevelOverrides(*logTypesFlag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid log type overrides %q: %v\n", *logTypesFlag, err)
-		os.Exit(1)
-	}
-	logRotation := logRotationOptions{
-		MaxSizeMB:  *logFileMaxSizeFlag,
-		MaxBackups: *logFileMaxBackupsFlag,
-		MaxAgeDays: *logFileMaxAgeFlag,
-		Compress:   *logFileCompressFlag,
-	}
-	logOutput, logFile, err := newLogOutput(os.Stdout, *logFileFlag, logRotation)
+	logOutput, logFile, err := newLogOutput(os.Stdout, startOpts.LogFilePath, startOpts.LogFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid log file config: %v\n", err)
 		os.Exit(1)
@@ -95,487 +104,280 @@ func main() {
 			}
 		}()
 	}
-	logs := logutil.NewFactory(logOutput, logutil.Config{
+
+	logs := logutil.NewFactory(logOutput, startOpts.LogConfig)
+	logger := logs.Component("main")
+	logger.Info().
+		Str("git_commit", GitCommit).
+		Str("log_level", startOpts.LogConfig.Level.String()).
+		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(startOpts.LogConfig.Overrides), "<none>")).
+		Str("log_format", logFormat(startOpts.LogConfig.JSON)).
+		Str("log_file", fallbackString(strings.TrimSpace(startOpts.LogFilePath), "<disabled>")).
+		Int("log_file_max_size_mb", startOpts.LogFile.MaxSizeMB).
+		Int("log_file_max_backups", startOpts.LogFile.MaxBackups).
+		Int("log_file_max_age_days", startOpts.LogFile.MaxAgeDays).
+		Bool("log_file_compress", startOpts.LogFile.Compress).
+		Msg("configured logging")
+
+	if startOpts.LiteQueryWorkers < 0 {
+		logger.Error().Int("workers", startOpts.LiteQueryWorkers).Msg("invalid liteserver query workers")
+		fmt.Fprintf(os.Stderr, "liteserver query workers cannot be negative: %d\n", startOpts.LiteQueryWorkers)
+		os.Exit(1)
+	}
+	if startOpts.LiteQueryWorkers > 0 {
+		liteclient.ServerQueryWorkers = startOpts.LiteQueryWorkers
+	}
+
+	pprofCtx, stopPprof := context.WithCancel(context.Background())
+	defer stopPprof()
+	startPprof(pprofCtx, logger, strings.TrimSpace(startOpts.PprofAddr))
+
+	globalConfig, err := prepareGlobalConfig(context.Background(), logger, cfg, startOpts.GlobalConfigURL, startOpts.ReplaceGlobalConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	runOpts := startOpts.Node
+	runOpts.Config = cfg
+	runOpts.GlobalConfig = globalConfig
+	runOpts.Logger = logs.Base()
+	runOpts.ConsoleInput = os.Stdin
+	runOpts.ConsoleOutput = os.Stdout
+	err = gton.RunNode(context.Background(), runOpts)
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%v\n", err)
+	os.Exit(1)
+}
+
+func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommands, error) {
+	runOpts := gton.DefaultNodeOptions()
+	startOpts := startupOptions{
+		Node:      runOpts,
+		LogConfig: logutil.Config{Level: zerolog.InfoLevel},
+		LogFile:   defaultLogFileOptions(),
+	}
+
+	flags := flag.NewFlagSet("gton-node", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", nodeconfig.DefaultPath, "path to node config JSON")
+	lsPubkeyFlag := flags.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
+	adnlIDFlag := flags.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
+	versionFlag := flags.Bool("version", false, "print build version and exit")
+	skipConfigCheckFlag := flags.Bool("skip-cfg-check", false, "continue startup after creating a missing config file")
+	verbosityFlag := flags.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
+	logTypesFlag := flags.String("log-types", "", "category log verbosity overrides, comma-separated: liteserver=debug,p2p=warn")
+	logJSONFlag := flags.Bool("log-json", false, "write logs as JSON instead of pretty console")
+	logFileFlag := flags.String("log-file", "", "path to rotating log file, disabled by default")
+	logFileDefaults := defaultLogFileOptions()
+	logFileMaxSizeFlag := flags.Int("log-file-max-size", logFileDefaults.MaxSizeMB, "maximum log file size in megabytes before rotation")
+	logFileMaxBackupsFlag := flags.Int("log-file-max-backups", logFileDefaults.MaxBackups, "maximum rotated log files to keep, 0 keeps all")
+	logFileMaxAgeFlag := flags.Int("log-file-max-age", logFileDefaults.MaxAgeDays, "maximum days to keep rotated log files, 0 keeps all")
+	logFileCompressFlag := flags.Bool("log-file-compress", false, "compress rotated log files")
+	globalConfigURLFlag := flags.String("global-config", "", "download TON global config from URL and replace the configured file before start")
+	pprofAddrFlag := flags.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
+	liteQueryWorkersFlag := flags.Int("liteserver-query-workers", 0, "liteserver query worker goroutines, 0 uses tonutils default")
+	archiveCheckpointPeriodFlag := flags.Duration("archive-checkpoint-period", runOpts.ArchiveCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
+	archivePrefetchWindowsFlag := flags.Int("archive-prefetch-windows", runOpts.ArchivePrefetchWindows, "archive catch-up imported window prefetch depth")
+	if err := flags.Parse(args); err != nil {
+		return startupOptions{}, cliCommands{}, err
+	}
+
+	startOpts.ConfigFile = resolveConfigPath(*configPath)
+	startOpts.Node = runOpts
+	commands := cliCommands{
+		version:         *versionFlag,
+		lsPubkey:        *lsPubkeyFlag,
+		adnlID:          *adnlIDFlag,
+		skipConfigCheck: *skipConfigCheckFlag,
+	}
+	if commands.version || commands.lsPubkey || commands.adnlID {
+		return startOpts, commands, nil
+	}
+
+	level, err := logutil.ParseLevel(*verbosityFlag)
+	if err != nil {
+		return startupOptions{}, cliCommands{}, fmt.Errorf("invalid verbosity %q: %w", *verbosityFlag, err)
+	}
+	logTypeOverrides, err := logutil.ParseLevelOverrides(*logTypesFlag)
+	if err != nil {
+		return startupOptions{}, cliCommands{}, fmt.Errorf("invalid log type overrides %q: %w", *logTypesFlag, err)
+	}
+
+	startOpts.LogConfig = logutil.Config{
 		Level:     level,
 		Overrides: logTypeOverrides,
 		JSON:      *logJSONFlag,
-	})
-	logger := logs.Component("main")
-	cell.MaxBOCCells = maxNodeBOCCells
-	logger.Debug().Int("max_boc_cells", cell.MaxBOCCells).Msg("configured BOC parser limits")
-	if *liteQueryWorkersFlag < 0 {
-		logger.Error().Int("liteserver_query_workers", *liteQueryWorkersFlag).Msg("liteserver query workers cannot be negative")
-		os.Exit(1)
 	}
-	if *liteQueryWorkersFlag > 0 {
-		liteclient.ServerQueryWorkers = *liteQueryWorkersFlag
+	startOpts.LogFilePath = *logFileFlag
+	startOpts.LogFile = logFileOptions{
+		MaxSizeMB:  *logFileMaxSizeFlag,
+		MaxBackups: *logFileMaxBackupsFlag,
+		MaxAgeDays: *logFileMaxAgeFlag,
+		Compress:   *logFileCompressFlag,
+	}
+	if raw := strings.TrimSpace(*globalConfigURLFlag); raw != "" {
+		startOpts.GlobalConfigURL = raw
+		startOpts.ReplaceGlobalConfig = true
+	}
+	startOpts.PprofAddr = strings.TrimSpace(*pprofAddrFlag)
+	startOpts.LiteQueryWorkers = *liteQueryWorkersFlag
+	runOpts.ArchiveCheckpointPeriod = *archiveCheckpointPeriodFlag
+	runOpts.ArchivePrefetchWindows = *archivePrefetchWindowsFlag
+	startOpts.Node = runOpts
+
+	return startOpts, commands, nil
+}
+
+func loadNodeConfig(ctx context.Context, path string, keyOnly bool) (nodeconfig.Config, bool, error) {
+	path = resolveConfigPath(path)
+	if keyOnly {
+		cfg, err := nodeconfig.Load(path)
+		if err != nil {
+			return nodeconfig.Config{}, false, fmt.Errorf("load config %s: %w", path, err)
+		}
+		return cfg, false, nil
 	}
 
-	selectedConfigPath := resolveConfigPath(*configPath)
-	cfg, err := nodeconfig.Load(selectedConfigPath)
+	result, err := nodeconfig.LoadOrCreate(ctx, path, nodeconfig.DetectExternalIP)
 	if err != nil {
-		if *lsPubkeyFlag || *adnlIDFlag {
-			logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
-			os.Exit(1)
-		}
-		configResult, err := nodeconfig.LoadOrCreate(context.Background(), selectedConfigPath, nodeconfig.DetectExternalIP)
-		if err != nil {
-			logger.Error().Err(err).Str("config", selectedConfigPath).Msg("failed to load config")
-			os.Exit(1)
-		}
-		cfg = configResult.Config
-		if configResult.Created {
-			if *skipConfigCheckFlag {
-				logger.Info().
-					Str("config", displayConfigPath(selectedConfigPath)).
-					Msg("created default config and continuing startup due --skip-cfg-check")
-			} else {
-				logger.Info().
-					Str("config", displayConfigPath(selectedConfigPath)).
-					Msg("created default config; review and approve config.json settings, then start the node again")
-				return
-			}
-		}
+		return nodeconfig.Config{}, false, fmt.Errorf("load config %s: %w", path, err)
 	}
-	if *lsPubkeyFlag {
-		liteSeed := cfg.Lite.Key
-		if len(liteSeed) == 0 {
-			logger.Error().Str("config", selectedConfigPath).Msg("liteserver key is missing")
-			os.Exit(1)
-		}
-		if len(liteSeed) != ed25519.SeedSize {
-			logger.Error().
-				Int("key_bytes", len(liteSeed)).
-				Int("expected_bytes", ed25519.SeedSize).
-				Str("config", selectedConfigPath).
-				Msg("invalid liteserver key size")
-			os.Exit(1)
-		}
-		litePriv := ed25519.NewKeyFromSeed(liteSeed)
-		if _, err = fmt.Fprintln(os.Stdout, base64.StdEncoding.EncodeToString(litePriv.Public().(ed25519.PublicKey))); err != nil {
-			logger.Error().Err(err).Msg("failed to write liteserver public key")
-			os.Exit(1)
-		}
-		return
-	}
-	if *adnlIDFlag {
-		adnlSeed := cfg.ADNL.Key
-		if len(adnlSeed) == 0 {
-			logger.Error().Str("config", selectedConfigPath).Msg("ADNL key is missing")
-			os.Exit(1)
-		}
-		if len(adnlSeed) != ed25519.SeedSize {
-			logger.Error().
-				Int("key_bytes", len(adnlSeed)).
-				Int("expected_bytes", ed25519.SeedSize).
-				Str("config", selectedConfigPath).
-				Msg("invalid ADNL key size")
-			os.Exit(1)
-		}
-		adnlPriv := ed25519.NewKeyFromSeed(adnlSeed)
-		adnlID, err := tl.Hash(keys.PublicKeyED25519{Key: adnlPriv.Public().(ed25519.PublicKey)})
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to compute ADNL id")
-			os.Exit(1)
-		}
-		if _, err = fmt.Fprintln(os.Stdout, base64.StdEncoding.EncodeToString(adnlID)); err != nil {
-			logger.Error().Err(err).Msg("failed to write ADNL id")
-			os.Exit(1)
-		}
-		return
-	}
+	return result.Config, result.Created, nil
+}
 
-	ctx, shutdownCtx, stop := signalContexts()
-	defer stop()
-	startPprof(ctx, logger, strings.TrimSpace(*pprofAddrFlag))
-
-	globalConfigURL := nodeconfig.DefaultGlobalConfigURL
-	replaceGlobalConfig := false
-	if strings.TrimSpace(*globalConfigURLFlag) != "" {
-		globalConfigURL = strings.TrimSpace(*globalConfigURLFlag)
-		replaceGlobalConfig = true
-	}
-	globalConfigPath := cfg.GlobalConfigPath()
-	globalConfigResult, err := nodeconfig.EnsureGlobalConfig(ctx, globalConfigPath, globalConfigURL, replaceGlobalConfig)
+func prepareGlobalConfig(ctx context.Context, logger zerolog.Logger, cfg nodeconfig.Config, url string, replace bool) (*liteclient.GlobalConfig, error) {
+	path := cfg.GlobalConfigPath()
+	result, err := nodeconfig.EnsureGlobalConfig(ctx, path, url, replace)
 	if err != nil {
 		logger.Error().
 			Err(err).
-			Str("path", globalConfigPath).
-			Str("url", globalConfigURL).
+			Str("path", path).
+			Str("url", globalConfigURLLabel(url)).
 			Msg("failed to prepare global config")
-		os.Exit(1)
+		return nil, fmt.Errorf("prepare global config %s: %w", path, err)
 	}
-	if globalConfigResult.Downloaded {
+	if result.Downloaded {
 		logger.Info().
-			Str("path", globalConfigPath).
-			Str("url", globalConfigURL).
-			Bool("replace", replaceGlobalConfig).
+			Str("path", path).
+			Str("url", globalConfigURLLabel(url)).
+			Bool("replace", replace).
 			Msg("downloaded global config")
 	}
-	globalConfigZeroState, err := zeroStateBlockFromGlobalConfig(globalConfigPath)
+
+	globalConfig, err := liteclient.GetConfigFromFile(path)
 	if err != nil {
-		logger.Error().Err(err).Str("global_config", globalConfigPath).Msg("failed to load global config zerostate")
-		os.Exit(1)
+		logger.Error().Err(err).Str("global_config", path).Msg("failed to load global config")
+		return nil, fmt.Errorf("load global config %s: %w", path, err)
+	}
+	return globalConfig, nil
+}
+
+func globalConfigURLLabel(url string) string {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return nodeconfig.DefaultGlobalConfigURL
+	}
+	return url
+}
+
+func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
+	if addr == "" {
+		return
 	}
 
-	opts, err := p2pOptionsFromConfig(cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load p2p options")
-		os.Exit(1)
-	}
-	opts.Logger = logs.CategoryPtr("p2p")
-
-	liteOpts, err := liteserverOptionsFromConfig(cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load liteserver options")
-		os.Exit(1)
-	}
-	metricsOpts, err := metricsOptionsFromConfig(cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load metrics options")
-		os.Exit(1)
-	}
-	var runtimeMetrics *metrics.Metrics
-	var syncObserver service2.SyncObserver
-	var queryObserver liteserver.QueryObserver
-	if metricsOpts.Enabled {
-		runtimeMetrics = metrics.New(metricsOpts.Namespace)
-		if err = startMetricsServer(ctx, logger, metricsOpts.ListenAddr, runtimeMetrics.Handler()); err != nil {
-			logger.Error().Err(err).Str("metrics_addr", metricsOpts.ListenAddr).Msg("failed to start metrics server")
-			os.Exit(1)
-		}
-		syncObserver = runtimeMetrics
-		queryObserver = runtimeMetrics
-	}
-	syncBefore, err := cfg.SyncBefore()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load sync options")
-		os.Exit(1)
-	}
-	archiveFromZero := cfg.ArchiveFromZero()
-	stateTTL, err := cfg.StateTTL()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load state ttl option")
-		os.Exit(1)
-	}
-	archiveTTL, err := cfg.ArchiveTTL()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load archive ttl option")
-		os.Exit(1)
-	}
-	if archiveFromZero && stateTTL != 0 {
-		logger.Error().
-			Dur("state_ttl", stateTTL).
-			Msg("ton.sync_before=-1 requires ton.state_ttl=0")
-		os.Exit(1)
-	}
-	if archiveFromZero && archiveTTL != 0 {
-		logger.Error().
-			Dur("archive_ttl", archiveTTL).
-			Msg("ton.sync_before=-1 requires ton.archive_ttl=0")
-		os.Exit(1)
-	}
-	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load next checkpoint blocks option")
-		os.Exit(1)
-	}
-	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load archive checkpoint blocks option")
-		os.Exit(1)
-	}
-	checkpointBytes, err := cfg.CheckpointBytes()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load checkpoint bytes option")
-		os.Exit(1)
-	}
-	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load sync backpressure windows option")
-		os.Exit(1)
+	server := &http.Server{
+		Addr:              addr,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	storageDir := cfg.StorageDir()
-	if storageDir == "" {
-		logger.Error().Msg("storage.dir is required")
-		os.Exit(1)
-	}
-	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage cell cache option")
-		os.Exit(1)
-	}
-	decodedCellCacheOpts, err := cfg.DecodedCellCacheOptions()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage decoded cell cache option")
-		os.Exit(1)
-	}
-	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage cell memtable option")
-		os.Exit(1)
-	}
-	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage cell memtable stop writes threshold option")
-		os.Exit(1)
-	}
-	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage large boc shard read workers option")
-		os.Exit(1)
-	}
-	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage persistent state large boc batch size option")
-		os.Exit(1)
-	}
-	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage artifact file max open option")
-		os.Exit(1)
-	}
-	storageOpenStarted := time.Now()
-	logger.Info().
-		Str("storage", "pebble").
-		Str("dir", storageDir).
-		Int64("cell_total_cache_size", cellTotalCacheSize).
-		Bool("decoded_cell_cache_enabled", decodedCellCacheOpts.Enabled).
-		Int("decoded_cell_cache_shards", decodedCellCacheOpts.Shards).
-		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCacheOpts.BytesPerEntry).
-		Int("decoded_cell_cache_min_entries", decodedCellCacheOpts.MinEntries).
-		Int("decoded_cell_cache_max_entries", decodedCellCacheOpts.MaxEntries).
-		Int("cell_shard_memtable_size", cellShardMemTableSize).
-		Int("cell_memtable_stop_writes_threshold", cellMemTableStopWritesThreshold).
-		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
-		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
-		Int("artifact_file_max_open", artifactFileMaxOpen).
-		Msg("opening storage")
-	store, err := pebblestore.Open(pebblestore.Options{
-		Dir:                             storageDir,
-		Logger:                          logs.CategoryPtr("pebblestore"),
-		CellCacheSize:                   cellTotalCacheSize,
-		DisableDecodedCellCache:         !decodedCellCacheOpts.Enabled,
-		DecodedCellCacheShards:          decodedCellCacheOpts.Shards,
-		DecodedCellCacheBytesPerEntry:   decodedCellCacheOpts.BytesPerEntry,
-		DecodedCellCacheMinEntries:      decodedCellCacheOpts.MinEntries,
-		DecodedCellCacheMaxEntries:      decodedCellCacheOpts.MaxEntries,
-		CellShardMemTableSize:           cellShardMemTableSize,
-		CellMemTableStopWritesThreshold: cellMemTableStopWritesThreshold,
-		LargeBOCShardReadWorkers:        largeBOCShardReadWorkers,
-		ArtifactFileMaxOpen:             artifactFileMaxOpen,
-	})
-	if err != nil {
-		logger.Error().Err(err).Str("dir", storageDir).Msg("failed to open pebble storage")
-		os.Exit(1)
-	}
-	stateFilesDir := store.StateFilesDir()
-	opts.Storage = store
-	logger.Info().
-		Str("storage", "pebble").
-		Str("dir", storageDir).
-		Dur("elapsed", time.Since(storageOpenStarted)).
-		Msg("configured storage")
-	opts.StateFilesDir = stateFilesDir
-	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
-	opts.LiveBlockCache = liveBlockCache
-	storageClosed := false
-	closeStore := func() {
-		if storageClosed {
-			return
-		}
-		closeStorage(logger, store)
-		storageClosed = true
-	}
-	defer func() {
-		closeStore()
-	}()
-	if err = ensureStoredZeroStateMatchesGlobalConfig(ctx, store, globalConfigZeroState); err != nil {
-		logger.Error().
-			Err(err).
-			Str("global_config", globalConfigPath).
-			Str("configured_zerostate", formatBlockID(globalConfigZeroState)).
-			Msg("stored zerostate does not match global config")
-		os.Exit(1)
-	}
-
-	node, err := p2p.New(opts)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to initialize p2p node")
-		os.Exit(1)
-	}
-	if runtimeMetrics != nil {
-		node.SetBroadcastPipelineObserver(runtimeMetrics)
-	}
-
-	blockSync := blocksync.New(logs.CategoryPtr("blocksync"), node)
-
-	stateLogger := logs.CategoryPtr("state")
-	stateSource := service2.NewP2PStateSource(node, stateLogger)
-
-	stateSync := state.NewSyncer(stateSource, store, state.SyncerOptions{
-		FromZero:   *fromZeroFlag,
-		SyncBefore: syncBefore,
-	}, stateLogger)
-
-	var liveLiteStore *liteserver.LiveStore
-	var currentStatePublisher service2.CurrentStatePublisher
-	if liteOpts.Enabled {
-		liveLiteStore = liteserver.NewLiveStore(store, liteserver.LiveStoreOptions{
-			MasterBlockCache: liteOpts.MasterBlockCache,
-			ShardBlockCache:  liteOpts.ShardBlockCache,
-			NonFinalEnabled:  liteOpts.NonFinalEnabled,
-			LiveBlockCache:   liveBlockCache,
-		})
-		currentStatePublisher = liveLiteStore
-	}
-
-	serviceLogger := logs.Component("service")
-	svc := service2.New(serviceLogger, node, blockSync, store, stateSync, service2.Options{
-		ArchiveCatchUpCheckpointBlocks:          archiveCheckpointBlocks,
-		ArchiveCatchUpCheckpointPeriod:          *archiveCheckpointPeriodFlag,
-		ArchiveCatchUpPrefetchWindows:           *archivePrefetchWindowsFlag,
-		NextBlockCheckpointBlocks:               nextCheckpointBlocks,
-		CheckpointBytes:                         checkpointBytes,
-		SyncBackpressureWindows:                 syncBackpressureWindows,
-		CurrentStatePublisher:                   currentStatePublisher,
-		LiveBlockCache:                          liveBlockCache,
-		CurrentStatePublisherUsesLiveBlockCache: liveLiteStore != nil,
-		ShutdownContext:                         shutdownCtx,
-		StateFilesDir:                           stateFilesDir,
-		StateTTL:                                stateTTL,
-		ArchiveTTL:                              archiveTTL,
-		ArchiveFromZero:                         archiveFromZero,
-		StorageDir:                              storageDir,
-		DisableStateSerialization:               cfg.DisableStateSerialization,
-		PersistentStateLargeBOCBatchSize:        persistentStateLargeBOCBatchSize,
-		StateSerializeOnePass:                   cfg.Storage.StateSerializeOnePass,
-		SyncObserver:                            syncObserver,
-	})
-	node.SetRuntimeCallbacks(svc)
-	if currentStatePublisher != nil {
-		currentStatePublisher.SetNonfinalCellLoader(svc.NonfinalCellLoader())
-		node.SetBlockCacheObserver(currentStatePublisher)
-	}
-	if runtimeMetrics != nil {
-		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
-			ServiceStatusReader: svc.StatusSnapshot,
-			DBStatusReader:      store.DBStatus,
-			ArchivePackagesDir:  filepath.Join(storageDir, "archive", "packages"),
-			StateFilesDir:       stateFilesDir,
-		}); err != nil {
-			logger.Error().Err(err).Msg("failed to initialize runtime metrics collectors")
-			os.Exit(1)
-		}
-	}
-
-	var liteSrv *liteserver.Server
-	if liteOpts.Enabled {
-		liteSrv, err = liteserver.New(liteserver.Options{
-			Logger:              logs.CategoryPtr("liteserver"),
-			Store:               liveLiteStore,
-			MessageSender:       node,
-			QueryObserver:       queryObserver,
-			PrivateKey:          liteOpts.PrivateKey,
-			ListenAddr:          liteOpts.ListenAddr,
-			NonFinal:            liteOpts.NonFinalEnabled,
-			SendMessageTVMTrace: *liteSendMessageTVMTraceFlag,
-			ZeroState:           zeroStateIDFromBlock(globalConfigZeroState),
-			RequestLimits:       liteOpts.Limits,
-		})
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to initialize liteserver")
-			os.Exit(1)
-		}
-	}
-
-	if err = node.Start(ctx); err != nil {
-		logger.Error().Err(err).Msg("failed to start p2p node")
-		os.Exit(1)
-	}
-
-	var blockSyncWG sync.WaitGroup
-	blockSyncWG.Add(1)
 	go func() {
-		defer blockSyncWG.Done()
-		blockSync.Run(ctx)
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Warn().Err(err).Str("pprof_addr", addr).Msg("failed to stop pprof server")
+		}
 	}()
 
-	svc.Start(ctx)
-
-	if liteSrv != nil {
-		if err = liteSrv.Start(ctx); err != nil {
-			logger.Error().Err(err).Str("listen_addr", liteOpts.ListenAddr).Msg("failed to start liteserver")
-			stop()
-			svc.Wait()
-			blockSyncWG.Wait()
-			node.Wait()
-			os.Exit(1)
+	go func() {
+		logger.Info().
+			Str("pprof_addr", addr).
+			Str("heap_url", "http://"+addr+"/debug/pprof/heap").
+			Str("profile_url", "http://"+addr+"/debug/pprof/profile").
+			Msg("started pprof server")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error().Err(err).Str("pprof_addr", addr).Msg("pprof server stopped")
 		}
+	}()
+}
+
+func writeLiteServerPublicKey(out io.Writer, cfg nodeconfig.Config, path string) error {
+	liteSeed := cfg.Lite.Key
+	if len(liteSeed) == 0 {
+		return fmt.Errorf("liteserver key is missing in %s", path)
+	}
+	if len(liteSeed) != ed25519.SeedSize {
+		return fmt.Errorf("invalid liteserver key size: expected %d bytes, got %d", ed25519.SeedSize, len(liteSeed))
 	}
 
-	logger.Info().
-		Str("config", selectedConfigPath).
-		Str("git_commit", GitCommit).
-		Str("log_level", level.String()).
-		Str("log_levels", fallbackString(logutil.FormatLevelOverrides(logTypeOverrides), "<none>")).
-		Str("log_format", logFormat(*logJSONFlag)).
-		Str("log_file", fallbackString(strings.TrimSpace(*logFileFlag), "<disabled>")).
-		Int("log_file_max_size_mb", logRotation.MaxSizeMB).
-		Int("log_file_max_backups", logRotation.MaxBackups).
-		Int("log_file_max_age_days", logRotation.MaxAgeDays).
-		Bool("log_file_compress", logRotation.Compress).
-		Str("global_config", globalConfigPath).
-		Str("listen_addr", fallbackString(opts.ListenAddr, "<client-mode>")).
-		Str("adnl_id", node.LocalID().Base64()).
-		Bool("dht_server", opts.DHTListenAddr != "").
-		Str("dht_listen_addr", fallbackString(opts.DHTListenAddr, "<client-mode>")).
-		Bool("liteserver", liteOpts.Enabled).
-		Str("liteserver_listen_addr", fallbackString(liteOpts.ListenAddr, "<disabled>")).
-		Int("liteserver_query_workers", liteclient.ServerQueryWorkers).
-		Bool("liteserver_send_message_tvm_trace", *liteSendMessageTVMTraceFlag).
-		Int64("liteserver_send_message_broadcast_bytes_per_second", opts.ExternalBroadcastCapacity.BytesPerSecond).
-		Dur("liteserver_send_message_broadcast_max_delay", opts.ExternalBroadcastCapacity.MaxDelay).
-		Int("liteserver_capacity_per_ip", liteOpts.Limits.CapacityPerIP).
-		Float64("liteserver_cooling_per_sec", liteOpts.Limits.CoolingPerSec).
-		Int("liteserver_max_connections_per_ip", liteOpts.Limits.MaxConnectionsPerIP).
-		Dur("liteserver_max_keep_alive", liteOpts.Limits.MaxKeepAlive).
-		Bool("metrics", metricsOpts.Enabled).
-		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
-		Str("pprof_addr", fallbackString(strings.TrimSpace(*pprofAddrFlag), "<disabled>")).
-		Bool("from_zero", *fromZeroFlag).
-		Bool("archive_from_zero", archiveFromZero).
-		Dur("sync_before", syncBefore).
-		Dur("state_ttl", stateTTL).
-		Dur("archive_ttl", archiveTTL).
-		Uint32("next_checkpoint_blocks", nextCheckpointBlocks).
-		Uint32("archive_checkpoint_blocks", archiveCheckpointBlocks).
-		Uint64("checkpoint_bytes", checkpointBytes).
-		Uint32("sync_backpressure_windows", syncBackpressureWindows).
-		Dur("archive_checkpoint_period", *archiveCheckpointPeriodFlag).
-		Int("archive_prefetch_windows", *archivePrefetchWindowsFlag).
-		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
-		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
-		Bool("state_serialize_one_pass", cfg.Storage.StateSerializeOnePass).
-		Bool("disable_state_serialization", cfg.DisableStateSerialization).
-		Msg("service started")
-
-	go runConsole(ctx, logger, svc, store.DBStatus)
-
-	<-ctx.Done()
-	logger.Info().Msg("shutting down")
-	if liteSrv != nil {
-		if err := liteSrv.Close(); err != nil {
-			logger.Warn().Err(err).Msg("failed to stop liteserver")
-		}
+	litePriv := ed25519.NewKeyFromSeed(liteSeed)
+	if _, err := fmt.Fprintln(out, base64.StdEncoding.EncodeToString(litePriv.Public().(ed25519.PublicKey))); err != nil {
+		return fmt.Errorf("write liteserver public key: %w", err)
 	}
-	svc.Wait()
-	blockSyncWG.Wait()
-	node.Wait()
-	if liteSrv != nil {
-		liteSrv.Wait()
+	return nil
+}
+
+func writeADNLID(out io.Writer, cfg nodeconfig.Config, path string) error {
+	adnlSeed := cfg.ADNL.Key
+	if len(adnlSeed) == 0 {
+		return fmt.Errorf("ADNL key is missing in %s", path)
 	}
-	closeStore()
-	logger.Info().Msg("shutdown complete")
+	if len(adnlSeed) != ed25519.SeedSize {
+		return fmt.Errorf("invalid ADNL key size: expected %d bytes, got %d", ed25519.SeedSize, len(adnlSeed))
+	}
+
+	adnlPriv := ed25519.NewKeyFromSeed(adnlSeed)
+	adnlID, err := tl.Hash(keys.PublicKeyED25519{Key: adnlPriv.Public().(ed25519.PublicKey)})
+	if err != nil {
+		return fmt.Errorf("compute ADNL id: %w", err)
+	}
+	if _, err = fmt.Fprintln(out, base64.StdEncoding.EncodeToString(adnlID)); err != nil {
+		return fmt.Errorf("write ADNL id: %w", err)
+	}
+	return nil
+}
+
+func resolveConfigPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nodeconfig.DefaultPath
+	}
+	return path
+}
+
+func displayConfigPath(path string) string {
+	path = resolveConfigPath(path)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
+}
+
+func fallbackString(value string, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func logFormat(useJSON bool) string {
+	if useJSON {
+		return "json"
+	}
+	return "console"
 }
