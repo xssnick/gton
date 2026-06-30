@@ -1,4 +1,4 @@
-package liteserver
+package liveview
 
 import (
 	"fmt"
@@ -9,7 +9,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func parseTrustedBlockBOC(block ton.BlockIDExt, data []byte) (*cell.Cell, error) {
+func ParseTrustedBlockBOC(block ton.BlockIDExt, data []byte) (*cell.Cell, error) {
 	roots, _, err := cell.FromBOCMultiRootReader(cell.NewBOCNoCopyReader(data), cell.BOCParseOptions{
 		TrustedHashes: true,
 		Lazy:          true,

@@ -140,8 +140,8 @@ func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, m
 	}
 
 	kind := broadcastKindLabel(msg)
-	if peer != nil {
-		peer.noteReceive()
+	if peer != nil && peer.noteReceive() {
+		s.peerPromoted(peer)
 	}
 	if !s.node.canAcceptBroadcast(kind, false) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "broadcast_admission_closed")

@@ -29,15 +29,32 @@ func (s *overlaySubscription) serveSendExtMessage(ctx context.Context, msg tonno
 	return Success{}, nil
 }
 
-func (n *Node) SendExternalMessage(ctx context.Context, data []byte, addrKey extmsg.AddressKey) error {
+func (n *Node) SendExternalMessage(ctx context.Context, data []byte, dst *address.Address) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
+	addrKey, err := checkedExternalMessageAddressKey(dst)
+	if err != nil {
+		return err
+	}
 	return n.sendExternalMessage(ctx, data, addrKey, nil, nil, false, true)
 }
 
-func (n *Node) SendCheckedExternalMessage(ctx context.Context, data []byte, addrKey extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage) error {
+func (n *Node) SendCheckedExternalMessage(ctx context.Context, data []byte, dst *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
+	addrKey, err := checkedExternalMessageAddressKey(dst)
+	if err != nil {
+		return err
+	}
 	return n.sendExternalMessage(ctx, data, addrKey, root, msg, true, true)
 }
 
 func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage, checked bool, isLocal bool) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	if len(data) == 0 {
 		return errors.New("external message is empty")
 	}
@@ -293,6 +310,16 @@ func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
 	key := extmsg.AddressKey{Workchain: addr.Workchain()}
 	copy(key.Account[:], addr.Data())
 	return key
+}
+
+func checkedExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey, error) {
+	if addr == nil {
+		return extmsg.AddressKey{}, errors.New("external message destination address is nil")
+	}
+	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
+		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
+	}
+	return externalMessageAddressKey(addr), nil
 }
 
 func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {

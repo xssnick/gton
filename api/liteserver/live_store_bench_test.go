@@ -108,7 +108,7 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			if _, err := live.LookupBlockBySeqNo(context.Background(), key, 1); err != nil {
+			if _, err := live.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: 1}); err != nil {
 				b.Fatalf("lookup block by seqno: %v", err)
 			}
 		}
@@ -117,16 +117,16 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 
 func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: blocks, ShardBlockCache: blocks})
-	live.mu.Lock()
-	defer live.mu.Unlock()
 
 	for i := 0; i < blocks; i++ {
+		rootByte := byte(i%250 + 1)
+		fileByte := byte((i+1)%250 + 1)
 		block := ton.BlockIDExt{
 			Workchain: 0,
 			Shard:     int64(i+1) << 3,
 			SeqNo:     uint32(i + 1),
-			RootHash:  bytes.Repeat([]byte{byte(i)}, 32),
-			FileHash:  bytes.Repeat([]byte{byte(i + 1)}, 32),
+			RootHash:  bytes.Repeat([]byte{rootByte}, 32),
+			FileHash:  bytes.Repeat([]byte{fileByte}, 32),
 		}
 		meta := &storage.BlockMeta{
 			ID:       block,
@@ -134,12 +134,13 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 			EndLT:    uint64(i*100 + 100),
 			GenUTime: uint32(1000 + i),
 		}
-		live.blocks[storage.BlockKey(block)] = &liveBlock{
-			id:              block,
-			meta:            meta,
-			artifactFlushed: true,
+		if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+			Block:           block,
+			Meta:            meta,
+			ArtifactFlushed: true,
+		}); err != nil {
+			panic(err)
 		}
-		live.refreshBlockIndexLocked(block)
 	}
 	return live
 }

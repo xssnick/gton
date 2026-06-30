@@ -30,6 +30,7 @@ type PreparedBlock struct {
 	consensusChecked          *checkedMasterchainConsensus
 
 	IsLink       bool
+	Origin       SyncBlockOrigin
 	SourcePeerID p2p.PeerID
 }
 
@@ -175,6 +176,7 @@ func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRec
 		consensus:                 block.consensus,
 		consensusChecked:          block.consensusChecked,
 		IsLink:                    block.IsLink,
+		Origin:                    syncBlockOriginForKind(block.Kind),
 		SourcePeerID:              block.SourcePeerID,
 	}
 }

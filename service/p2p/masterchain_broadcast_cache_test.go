@@ -111,7 +111,6 @@ func TestDownloadNextBlockFullUsesMasterchainBroadcastCacheBeforeOverlay(t *test
 	if !got.ID.Equals(&broadcast.ID) {
 		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(broadcast.ID))
 	}
-
 	desc, err := node.NextBlockDescription(context.Background(), prev)
 	if err != nil {
 		t.Fatalf("next block description: %v", err)
@@ -184,7 +183,6 @@ func testMasterchainBroadcastDownloadedBlock(t *testing.T, prev ton.BlockIDExt, 
 
 	proof := testBlockProofCell(t, block, nil)
 	proofBOC := proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-
 	return DownloadedBlock{
 		ID:       block,
 		Kind:     "tonNode.blockBroadcast",

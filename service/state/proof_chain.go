@@ -57,17 +57,18 @@ func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trus
 		return ton.BlockIDExt{}, err
 	}
 
-	block, ok := choosePersistentKeyBlock(candidates, time.Now(), s.syncBefore)
+	block, ok := choosePersistentKeyBlock(candidates, time.Now(), s.syncBefore, s.syncUntil)
 	if ok {
 		return block, nil
 	}
 
 	return ton.BlockIDExt{}, fmt.Errorf(
-		"%w: latest_verified=%s key_blocks=%d sync_before=%s download_window=%s",
+		"%w: latest_verified=%s key_blocks=%d sync_before=%s sync_until=%d download_window=%s",
 		errNoPersistentKeyBlockCandidate,
 		storage.FormatBlockRef(trusted.block),
 		len(candidates),
 		s.syncBefore,
+		s.syncUntil,
 		initialStateDownloadWindow,
 	)
 }
@@ -549,7 +550,7 @@ func (s *Syncer) keyBlockIDs(ctx context.Context, fromBlock ton.BlockIDExt) ([]t
 	return all, nil
 }
 
-func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syncBefore time.Duration) (ton.BlockIDExt, bool) {
+func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syncBefore time.Duration, syncUntil uint32) (ton.BlockIDExt, bool) {
 	if syncBefore <= 0 {
 		syncBefore = DefaultSyncBefore
 	}
@@ -559,6 +560,9 @@ func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syn
 
 	for i := len(candidates) - 1; i >= 0; i-- {
 		candidate := candidates[i]
+		if syncUntil != 0 && candidate.utime > syncUntil {
+			continue
+		}
 		if uint64(candidate.utime)+minAge > nowUnix {
 			continue
 		}

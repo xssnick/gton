@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -276,7 +277,7 @@ func (s *Server) lookupBlock(ctx context.Context, query ton.LookupBlock) (ton.Bl
 
 	switch selector {
 	case 1:
-		id, err := s.store.LookupBlockBySeqNo(ctx, key, uint32(query.ID.Seqno))
+		id, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: uint32(query.ID.Seqno)})
 		return id, query.Mode >> 4, err
 	case 2:
 		id, err := s.store.LookupBlockByLT(ctx, key, query.LT)
@@ -293,7 +294,7 @@ type accountReference struct {
 	shard       ton.BlockIDExt
 	shardProof  []*cell.Cell
 	masterState *cell.Cell
-	masterCache *liveBlockFragments
+	masterCache *liveview.BlockView
 }
 
 func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, request string, keepMasterState bool) (accountReference, error) {
@@ -338,7 +339,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 			return accountReference{}, err
 		}
 		ref.master = base
-		ref.masterState = masterFragments.stateRoot
+		ref.masterState = masterFragments.StateRoot()
 		ref.masterCache = masterFragments
 	}
 	if account.Workchain == masterchainID {

@@ -32,9 +32,6 @@ const (
 	peerPingMinDelay           = 500 * time.Millisecond
 	peerPingJitter             = 500 * time.Millisecond
 	peerPingFanout             = 6
-	adnlPingMinDelay           = 30 * time.Second
-	adnlPingJitter             = 20 * time.Second
-	adnlPingFanout             = 5
 	overlayPeerTTL             = 10 * time.Minute
 	overlayFutureSkew          = 60 * time.Second
 	downloadQueryTimeout       = 15 * time.Second
@@ -81,6 +78,8 @@ const (
 	peerRebroadcastQueueBytes  = int64(1024 << 20)
 	externalRebroadcastFanout  = 5
 	laggedExternalFanout       = 3
+	minLocalExternalFanout     = 3
+	maxLocalExternalFanout     = maxPeersPerOverlay
 	localRebroadcastAttempts   = 3
 	dhtServerStoreMaxKeys      = 300000
 
@@ -92,7 +91,7 @@ const (
 	masterchainProtoVersionMajor   = 1
 	masterchainProtoVersionMinor   = 0
 	shardchainProtoVersionMajor    = 3
-	shardchainProtoVersionMinor    = 0
+	shardchainProtoVersionMinor    = 1
 	ordinarySimpleBroadcastMaxSize = 768
 
 	peerStopUnreliability = 5.0
@@ -180,6 +179,7 @@ type Options struct {
 	ExternalMessageAdmission  ExternalMessageAdmission
 	BlockReceivedObserver     BlockReceivedObserver
 	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
+	LocalExternalFanout       int
 	CustomOverlays            []CustomOverlayConfig
 }
 
@@ -232,7 +232,7 @@ type SyncLagProvider interface {
 }
 
 type ExternalMessageEvent struct {
-	// IsLocal is true when the message originated from the local liteserver API.
+	// IsLocal is true when the message originated from the local API path.
 	IsLocal bool
 	// Body is the raw external message BOC.
 	Body []byte

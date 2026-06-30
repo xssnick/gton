@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -15,6 +16,42 @@ func TestServiceNewKeepsZeroTTLs(t *testing.T) {
 	if svc.archiveTTL != 0 {
 		t.Fatalf("archive ttl = %s, want 0", svc.archiveTTL)
 	}
+}
+
+func TestServiceMaintenanceStopsAfterSyncUntilFrozen(t *testing.T) {
+	svc := &Service{
+		log:             zerolog.Nop(),
+		node:            newFrozenTestNode(t),
+		syncUntil:       200,
+		maintenanceWake: make(chan struct{}, 1),
+	}
+
+	svc.runServiceMaintenance(context.Background())
+}
+
+func TestMaintenanceTasksSkipAfterSyncUntilFrozen(t *testing.T) {
+	svc := &Service{
+		log:             zerolog.Nop(),
+		node:            newFrozenTestNode(t),
+		syncUntil:       200,
+		archiveTTL:      24,
+		maintenanceWake: make(chan struct{}, 1),
+		stateSerializer: &stateSerializer{},
+	}
+
+	if pruned, err := svc.runPersistentStateGCOnce(context.Background()); err != nil || pruned {
+		t.Fatalf("persistent state gc = (%v, %v), want (false, nil)", pruned, err)
+	}
+	if pruned, err := svc.runArchiveGCOnce(context.Background()); err != nil || pruned {
+		t.Fatalf("archive gc = (%v, %v), want (false, nil)", pruned, err)
+	}
+	if ran, err := svc.runPendingCellGenerationMigration(context.Background()); err != nil || ran {
+		t.Fatalf("pending migration = (%v, %v), want (false, nil)", ran, err)
+	}
+	if err := svc.processPersistentStateSerialization(context.Background()); err != nil {
+		t.Fatalf("state serialization: %v", err)
+	}
+	svc.afterPersistentStateSerialized(context.Background(), testBlockID(-1, topShard, 100), PersistentStateSerializationAll)
 }
 
 func TestNextServiceMaintenanceTaskPriority(t *testing.T) {

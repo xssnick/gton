@@ -48,7 +48,7 @@ const (
 	archiveSliceMasterchainBlocks   = 100
 	keyArchiveMasterchainBlocks     = 200000
 
-	metaDBVersion                  = 2
+	metaDBVersion                  = 3
 	blockMetaVersion               = 2
 	currentStateVersion            = 1
 	artifactRefVersion             = 2

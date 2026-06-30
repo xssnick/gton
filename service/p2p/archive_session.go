@@ -78,6 +78,9 @@ func (a *ArchiveSession) Close() {
 }
 
 func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, options ArchiveDownloadOptions) (*archive.Downloaded, error) {
+	if a.node.IsOffline() {
+		return nil, ErrOffline
+	}
 	sub, err := a.node.subscriptionForBlock(ton.BlockIDExt{Workchain: shard.Workchain, Shard: shard.Shard})
 	if err != nil {
 		return nil, err

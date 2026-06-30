@@ -2,6 +2,8 @@ package p2p
 
 import "github.com/xssnick/tonutils-go/adnl/overlay"
 
+const publicBroadcastFECMaxActiveStreams = 4096
+
 type overlayFECRelayPeerSet struct {
 	sub *overlaySubscription
 }
@@ -39,7 +41,9 @@ func (s *overlaySubscription) broadcastFECRelayState() *overlay.BroadcastFECRela
 	defer s.mx.Unlock()
 
 	if s.fecRelayState == nil {
-		s.fecRelayState = overlay.NewBroadcastFECRelayState()
+		state := overlay.NewBroadcastFECRelayState()
+		state.SetLimits(publicBroadcastFECMaxActiveStreams, overlay.DefaultFECBroadcastMaxActiveBytes)
+		s.fecRelayState = state
 	}
 	return s.fecRelayState
 }

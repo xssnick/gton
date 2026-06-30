@@ -122,6 +122,15 @@ func TestSendExternalMessageDropsWhenAdmissionFails(t *testing.T) {
 	}
 }
 
+func TestSendExternalMessageRejectsOffline(t *testing.T) {
+	node, _ := newSendExternalMessageTestNode(t)
+	node.EnterOffline("test")
+
+	if err := node.SendExternalMessage(context.Background(), []byte{1}, nil); !errors.Is(err, ErrOffline) {
+		t.Fatalf("send external message error = %v, want %v", err, ErrOffline)
+	}
+}
+
 func TestSendCheckedExternalMessageRunsCheckedAdmission(t *testing.T) {
 	node, sub := newSendExternalMessageTestNode(t)
 	peer := testRebroadcastQueuePeer("peer-a")
@@ -131,11 +140,11 @@ func TestSendCheckedExternalMessageRunsCheckedAdmission(t *testing.T) {
 	node.externalMessageAdmission = admission
 
 	body := testExternalMessageBOC(t)
-	key, err := externalMessageDestinationAddress(body)
+	parsed, err := parseExternalMessageData(body)
 	if err != nil {
-		t.Fatalf("parse test external message address: %v", err)
+		t.Fatalf("parse test external message: %v", err)
 	}
-	if err = node.SendCheckedExternalMessage(context.Background(), body, key, nil, nil); err != nil {
+	if err = node.SendCheckedExternalMessage(context.Background(), body, parsed.message.DstAddr, nil, nil); err != nil {
 		t.Fatalf("send checked external message failed: %v", err)
 	}
 	if len(admission.events) != 1 {
@@ -166,7 +175,7 @@ func TestSendCheckedExternalMessageMarksAdmissionLocal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse test external message: %v", err)
 	}
-	if err = node.SendCheckedExternalMessage(context.Background(), body, parsed.address, parsed.root, parsed.message); err != nil {
+	if err = node.SendCheckedExternalMessage(context.Background(), body, parsed.message.DstAddr, parsed.root, parsed.message); err != nil {
 		t.Fatalf("send checked external message failed: %v", err)
 	}
 
@@ -298,11 +307,11 @@ func newSendExternalMessageTestNode(t *testing.T) (*Node, *overlaySubscription) 
 func sendTestExternalMessage(t *testing.T, node *Node, body []byte) error {
 	t.Helper()
 
-	key, err := externalMessageDestinationAddress(body)
+	parsed, err := parseExternalMessageData(body)
 	if err != nil {
-		t.Fatalf("parse test external message address: %v", err)
+		t.Fatalf("parse test external message: %v", err)
 	}
-	return node.SendExternalMessage(context.Background(), body, key)
+	return node.SendExternalMessage(context.Background(), body, parsed.message.DstAddr)
 }
 
 func testExternalMessageBOCWithBodyByte(t *testing.T, body byte) []byte {

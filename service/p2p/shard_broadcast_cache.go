@@ -121,6 +121,12 @@ func shardBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
 	return int64(len(blockBOC)*2 + len(proofBOC)*2 + shardBroadcastBlockCacheOverhead)
 }
 
+func cloneBlockID(block ton.BlockIDExt) ton.BlockIDExt {
+	block.RootHash = bytes.Clone(block.RootHash)
+	block.FileHash = bytes.Clone(block.FileHash)
+	return block
+}
+
 func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 	if downloaded == nil {
 		return false
@@ -321,10 +327,4 @@ func validateShardBroadcastBlock(downloaded *DownloadedBlock) (validatedShardBro
 		proofRoot:   roots.proofRoot,
 		stateUpdate: downloaded.StateUpdate,
 	}, nil
-}
-
-func cloneBlockID(block ton.BlockIDExt) ton.BlockIDExt {
-	block.RootHash = bytes.Clone(block.RootHash)
-	block.FileHash = bytes.Clone(block.FileHash)
-	return block
 }

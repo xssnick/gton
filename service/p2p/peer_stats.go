@@ -17,6 +17,7 @@ type peerStats struct {
 	roundtrip             time.Duration
 	unreliability         float64
 	alive                 bool
+	pending               bool
 	lastReceiveAt         time.Time
 	lastSuccessAt         time.Time
 	failedQueries         uint64
@@ -51,25 +52,35 @@ func (p *overlayPeer) isKnownOverlayPeer(now time.Time) bool {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
-	return p.announced != nil && announcedNodeIsFresh(p.announced, now)
+	return !p.pending && p.announced != nil && announcedNodeIsFresh(p.announced, now)
 }
 
 func (p *overlayPeer) isAliveKnownOverlayPeer(now time.Time) bool {
 	if p.fixedMember {
-		return p.hasOpenConnection()
+		if !p.hasOpenConnection() {
+			return false
+		}
+
+		p.statsMx.Lock()
+		defer p.statsMx.Unlock()
+
+		return p.alive && (!p.lastReceiveAt.IsZero() || !p.lastSuccessAt.IsZero())
 	}
 
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
-	return p.announced != nil && announcedNodeIsFresh(p.announced, now) && p.alive
+	return !p.pending && p.announced != nil && announcedNodeIsFresh(p.announced, now) && p.alive
 }
 
-func (p *overlayPeer) canAdvertise(now time.Time) bool {
+func (p *overlayPeer) advertisedNodeSnapshot(now time.Time) *overlay.Node {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
-	return p.announced != nil && announcedNodeIsFresh(p.announced, now) && p.alive
+	if p.pending || p.announced == nil || !announcedNodeIsFresh(p.announced, now) || !p.alive {
+		return nil
+	}
+	return cloneOverlayNode(p.announced)
 }
 
 func (p *overlayPeer) mergeAnnouncement(v1 *overlay.Node) {
@@ -92,6 +103,7 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 		roundtrip:             p.roundtrip,
 		unreliability:         p.unreliability,
 		alive:                 p.alive,
+		pending:               p.pending,
 		lastReceiveAt:         p.lastReceiveAt,
 		lastSuccessAt:         p.lastSuccessAt,
 		failedQueries:         p.failedQueries,
@@ -112,33 +124,36 @@ func (p *overlayPeer) applyCapabilities(cap Capabilities) {
 	p.capabilitiesFlags = cap.Flags
 }
 
-func (p *overlayPeer) querySuccess(rtt time.Duration) {
+func (p *overlayPeer) querySuccess(rtt time.Duration) bool {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
 	now := time.Now()
-	p.noteSuccessLocked(now)
+	promoted := p.noteSuccessLocked(now)
 	if rtt <= 0 {
-		return
+		return promoted
 	}
 	if p.roundtrip == 0 {
 		p.roundtrip = rtt
-		return
+		return promoted
 	}
 	p.roundtrip = (p.roundtrip + rtt) / 2
+	return promoted
 }
 
 func (p *overlayPeer) queryFailed() {
-	if p.fixedMember {
-		return
-	}
-
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
 	p.missedPings++
 	p.unreliability++
 	p.failedQueries++
+	if p.fixedMember {
+		if p.lastReceiveAt.IsZero() && p.lastSuccessAt.IsZero() {
+			p.alive = false
+		}
+		return
+	}
 	if p.missedPings >= 3 && !p.lastReceiveAt.IsZero() && time.Since(p.lastReceiveAt) >= 15*time.Second {
 		p.alive = false
 	}
@@ -187,7 +202,9 @@ func (p *overlayPeer) archiveLargeDownloadSuccess(bytes int64, elapsed time.Dura
 	p.archiveLargeBytesSec = p.archiveLargeBytesSec*0.7 + speed*0.3
 }
 
-func (p *overlayPeer) noteSuccessLocked(now time.Time) {
+func (p *overlayPeer) noteSuccessLocked(now time.Time) bool {
+	promoted := p.pending
+	p.pending = false
 	p.missedPings = 0
 	p.alive = true
 	p.lastReceiveAt = now
@@ -196,6 +213,7 @@ func (p *overlayPeer) noteSuccessLocked(now time.Time) {
 	if p.unreliability < 0 {
 		p.unreliability = 0
 	}
+	return promoted
 }
 
 func (p *overlayPeer) downloadFailed(slowPenalty time.Duration) {
@@ -205,13 +223,54 @@ func (p *overlayPeer) downloadFailed(slowPenalty time.Duration) {
 	p.downloadSlowUntil = time.Now().Add(slowPenalty)
 }
 
-func (p *overlayPeer) noteReceive() {
+func (p *overlayPeer) noteReceive() bool {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
+	promoted := p.pending
+	p.pending = false
 	p.missedPings = 0
 	p.alive = true
 	p.lastReceiveAt = time.Now()
+	return promoted
+}
+
+func (p *overlayPeer) markPending() {
+	if p.fixedMember {
+		return
+	}
+
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	p.pending = true
+	p.alive = false
+	p.lastReceiveAt = time.Time{}
+	p.lastSuccessAt = time.Time{}
+}
+
+func (p *overlayPeer) isPending() bool {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	return p.pending
+}
+
+func (p *overlayPeer) tryBeginWarmup() bool {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	if p.warmupRunning {
+		return false
+	}
+	p.warmupRunning = true
+	return true
+}
+
+func (p *overlayPeer) finishWarmup() {
+	p.statsMx.Lock()
+	p.warmupRunning = false
+	p.statsMx.Unlock()
 }
 
 func (p *overlayPeer) shouldStopQuerying() bool {
@@ -417,13 +476,6 @@ func nextPeerPingDelay() time.Duration {
 		return peerPingMinDelay
 	}
 	return peerPingMinDelay + time.Duration(rand.Int64N(int64(peerPingJitter)))
-}
-
-func nextADNLPingDelay() time.Duration {
-	if adnlPingJitter <= 0 {
-		return adnlPingMinDelay
-	}
-	return adnlPingMinDelay + time.Duration(rand.Int64N(int64(adnlPingJitter)))
 }
 
 func nextDHTSeedCooldownDelay() time.Duration {

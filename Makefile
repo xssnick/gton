@@ -4,7 +4,7 @@ BUILD_DIR := build
 PACKAGE := ./cmd/node
 BINARY := gton-node
 GIT_COMMIT ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
-LDFLAGS := -w -s -X main.GitCommit=$(GIT_COMMIT)
+LDFLAGS := -w -s -X github.com/xssnick/gton/cmd/node/node.GitCommit=$(GIT_COMMIT)
 
 build: prepare-build
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) $(PACKAGE)

@@ -23,6 +23,7 @@ type Syncer struct {
 	importer   *stateImportCoordinator
 	log        zerolog.Logger
 	syncBefore time.Duration
+	syncUntil  uint32
 }
 
 type blockStateSnapshot struct {
@@ -32,6 +33,7 @@ type blockStateSnapshot struct {
 
 type SyncerOptions struct {
 	SyncBefore time.Duration
+	SyncUntil  uint32
 }
 
 func NewSyncer(source Source, storage storage2.StateStorage, opts SyncerOptions, logger ...*zerolog.Logger) *Syncer {
@@ -50,6 +52,7 @@ func NewSyncer(source Source, storage storage2.StateStorage, opts SyncerOptions,
 		importer:   newStateImportCoordinator(log),
 		log:        log,
 		syncBefore: syncBefore,
+		syncUntil:  opts.SyncUntil,
 	}
 }
 

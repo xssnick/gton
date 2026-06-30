@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	admission "github.com/xssnick/gton/service/externalmsg"
+	"github.com/xssnick/gton/service/liveview"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -206,8 +209,8 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 	if !bytes.Equal(sender.body, body) {
 		t.Fatalf("forwarded body = %x, want %x", sender.body, body)
 	}
-	if want := externalMessageAddressKey(addr); sender.address != want {
-		t.Fatalf("forwarded address key = %#v, want %#v", sender.address, want)
+	if sender.address == nil || !sender.address.Equals(addr) {
+		t.Fatalf("forwarded address = %v, want %v", sender.address, addr)
 	}
 	if sender.count != 1 {
 		t.Fatalf("send count = %d, want 1", sender.count)
@@ -262,8 +265,8 @@ func TestHandleSendMessageWithLiveStoreCachesBlockFragments(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publish live block artifacts: %v", err)
 	}
-	if live.cachedBlockFragments(block) == nil {
-		t.Fatal("live block fragments were not prepared on publish")
+	if _, err := live.BlockFragments(context.Background(), block); err != nil {
+		t.Fatalf("live block fragments were not prepared on publish: %v", err)
 	}
 	live.SetLiveCurrentState(&storage.CurrentState{Masterchain: blockState})
 
@@ -465,6 +468,13 @@ func TestSendMessageBroadcastCapacityErrorReason(t *testing.T) {
 	got := sendMessageBroadcastErrorReason(extmsg.ErrExternalBroadcastCapacityExceeded)
 	if got != sendMessageErrorReasonBroadcastCapacity {
 		t.Fatalf("broadcast error reason = %q, want %q", got, sendMessageErrorReasonBroadcastCapacity)
+	}
+}
+
+func TestSendMessageOfflineErrorReason(t *testing.T) {
+	got := sendMessageBroadcastErrorReason(p2p.ErrOffline)
+	if got != sendMessageErrorReasonOffline {
+		t.Fatalf("broadcast error reason = %q, want %q", got, sendMessageErrorReasonOffline)
 	}
 }
 
@@ -974,9 +984,13 @@ func TestLiveStorePublishesCurrentFromFlushedMarkersWithoutPayload(t *testing.T)
 	}
 
 	for _, state := range []storage.BlockState{current.Masterchain, current.Shards[storage.ShardKeyFromBlock(shard)]} {
+		meta, err := storage.BuildBlockMetaFromState(state)
+		if err != nil {
+			t.Fatalf("build marker meta %s: %v", storage.FormatBlockRef(state.Block), err)
+		}
 		if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 			Block:           state.Block,
-			Meta:            storage.BuildBlockMetaFromState(state),
+			Meta:            meta,
 			State:           &state,
 			ArtifactFlushed: true,
 			StateFlushed:    true,
@@ -1322,7 +1336,7 @@ func TestLiveStoreLookupSeqnoUsesCurrentStateBeforeStorage(t *testing.T) {
 	live.SetLiveCurrentState(current)
 
 	key := storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}
-	got, err := live.LookupBlockBySeqNo(context.Background(), key, 11)
+	got, err := live.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: 11})
 	if err != nil {
 		t.Fatalf("lookup live seqno: %v", err)
 	}
@@ -1333,7 +1347,7 @@ func TestLiveStoreLookupSeqnoUsesCurrentStateBeforeStorage(t *testing.T) {
 		t.Fatalf("storage seq lookup calls = %d, want 0", store.seqLookupCalls)
 	}
 
-	if _, err = live.LookupBlockBySeqNo(context.Background(), key, 12); !errors.Is(err, storage.ErrNotFound) {
+	if _, err = live.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: 12}); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("missing seqno error = %v, want ErrNotFound", err)
 	}
 	if store.seqLookupCalls != 0 {
@@ -1352,7 +1366,7 @@ func TestLiveStoreLookupSeqnoUsesPendingBlockBeforeStorage(t *testing.T) {
 	}
 
 	key := storage.BlockHistoryKey{Workchain: id.Workchain, Shard: id.Shard}
-	got, err := live.LookupBlockBySeqNo(context.Background(), key, id.SeqNo)
+	got, err := live.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: id.SeqNo})
 	if err != nil {
 		t.Fatalf("lookup pending seqno: %v", err)
 	}
@@ -1403,18 +1417,20 @@ func TestLiveStoreHistoryIndexesMatchLookupRules(t *testing.T) {
 	first := testLiveStoreIndexBlock(1, key)
 	second := testLiveStoreIndexBlock(2, key)
 
-	live.mu.Lock()
-	live.putBlockLocked(storage.BlockKey(first), &liveBlock{
-		id:              first,
-		meta:            &storage.BlockMeta{ID: first, StartLT: 1, EndLT: 100, GenUTime: 1000},
-		artifactFlushed: true,
-	})
-	live.putBlockLocked(storage.BlockKey(second), &liveBlock{
-		id:              second,
-		meta:            &storage.BlockMeta{ID: second, StartLT: 150, EndLT: 200, GenUTime: 1001},
-		artifactFlushed: true,
-	})
-	live.mu.Unlock()
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:           first,
+		Meta:            &storage.BlockMeta{ID: first, StartLT: 1, EndLT: 100, GenUTime: 1000},
+		ArtifactFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish first live block: %v", err)
+	}
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:           second,
+		Meta:            &storage.BlockMeta{ID: second, StartLT: 150, EndLT: 200, GenUTime: 1001},
+		ArtifactFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish second live block: %v", err)
+	}
 
 	got, err := live.LookupBlockByLT(context.Background(), key, 75)
 	if err != nil {
@@ -1468,20 +1484,30 @@ func TestLiveStoreLookupBlockByAccountLTUsesLowerBoundShardPath(t *testing.T) {
 	topKey := storage.BlockHistoryKey{Workchain: 0, Shard: shards[0]}
 	pathKey := storage.BlockHistoryKey{Workchain: 0, Shard: shards[2]}
 	topBlock := testLiveStoreIndexBlock(50, topKey)
+	pathPrev := testLiveStoreIndexBlock(19, pathKey)
 	pathBlock := testLiveStoreIndexBlock(20, pathKey)
 
-	live.mu.Lock()
-	live.putBlockLocked(storage.BlockKey(topBlock), &liveBlock{
-		id:              topBlock,
-		meta:            &storage.BlockMeta{ID: topBlock, StartLT: 1, EndLT: 500},
-		artifactFlushed: true,
-	})
-	live.putBlockLocked(storage.BlockKey(pathBlock), &liveBlock{
-		id:              pathBlock,
-		meta:            &storage.BlockMeta{ID: pathBlock, StartLT: 150, EndLT: 200},
-		artifactFlushed: true,
-	})
-	live.mu.Unlock()
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:           topBlock,
+		Meta:            &storage.BlockMeta{ID: topBlock, StartLT: 1, EndLT: 500},
+		ArtifactFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish top live block: %v", err)
+	}
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:           pathPrev,
+		Meta:            &storage.BlockMeta{ID: pathPrev, StartLT: 1, EndLT: 100},
+		ArtifactFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish previous path live block: %v", err)
+	}
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:           pathBlock,
+		Meta:            &storage.BlockMeta{ID: pathBlock, StartLT: 150, EndLT: 200},
+		ArtifactFlushed: true,
+	}); err != nil {
+		t.Fatalf("publish path live block: %v", err)
+	}
 
 	got, err := live.LookupBlockByAccountLT(context.Background(), 0, account, 125)
 	if err != nil {
@@ -1502,33 +1528,38 @@ func TestLiveStoreTrimRemovesHistoryIndexEntries(t *testing.T) {
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: int64(0x4000000000000000)}
 	blocks := make([]ton.BlockIDExt, 0, 3)
 
-	live.mu.Lock()
 	for seqno := uint32(1); seqno <= 3; seqno++ {
 		block := testLiveStoreIndexBlock(seqno, key)
-		live.putBlockLocked(storage.BlockKey(block), &liveBlock{
-			id: block,
-			meta: &storage.BlockMeta{
+		if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+			Block: block,
+			Meta: &storage.BlockMeta{
 				ID:       block,
 				StartLT:  uint64(seqno*100 + 1),
 				EndLT:    uint64(seqno*100 + 100),
 				GenUTime: 1000 + seqno,
 			},
-			artifactFlushed: true,
-		})
-		live.trimBlocksLocked(liveBlockShard)
+			ArtifactFlushed: true,
+		}); err != nil {
+			t.Fatalf("publish live block %d: %v", seqno, err)
+		}
 		blocks = append(blocks, block)
 	}
-	live.mu.Unlock()
+	store.ltLookup = map[fakeLTLookupKey]ton.BlockIDExt{
+		fakeLTKey(key, 150): blocks[0],
+	}
+	store.utimeLookup = map[fakeUnixLookupKey]ton.BlockIDExt{
+		fakeUnixKey(key, 1001): blocks[0],
+	}
 
 	got, err := live.LookupBlockByLT(context.Background(), key, 150)
 	if err != nil {
-		t.Fatalf("lookup lt before first retained live block: %v", err)
+		t.Fatalf("lookup lt before first retained block: %v", err)
 	}
-	if !blockIDEqual(got, blocks[1]) {
-		t.Fatalf("lt lookup before first retained block = %+v, want %+v", got, blocks[1])
+	if !blockIDEqual(got, blocks[0]) {
+		t.Fatalf("lt lookup before first retained block = %+v, want backing block %+v", got, blocks[0])
 	}
-	if store.ltLookupCalls != 0 {
-		t.Fatalf("storage lt lookup calls = %d, want 0", store.ltLookupCalls)
+	if store.ltLookupCalls != 1 {
+		t.Fatalf("storage lt lookup calls = %d, want 1", store.ltLookupCalls)
 	}
 
 	got, err = live.LookupBlockByLT(context.Background(), key, 350)
@@ -1541,13 +1572,13 @@ func TestLiveStoreTrimRemovesHistoryIndexEntries(t *testing.T) {
 
 	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1001)
 	if err != nil {
-		t.Fatalf("lookup unix time before first retained live block: %v", err)
+		t.Fatalf("lookup unix time before first retained block: %v", err)
 	}
-	if !blockIDEqual(got, blocks[1]) {
-		t.Fatalf("unix time lookup before first retained block = %+v, want %+v", got, blocks[1])
+	if !blockIDEqual(got, blocks[0]) {
+		t.Fatalf("unix time lookup before first retained block = %+v, want backing block %+v", got, blocks[0])
 	}
-	if store.utimeLookupCalls != 0 {
-		t.Fatalf("storage unix time lookup calls = %d, want 0", store.utimeLookupCalls)
+	if store.utimeLookupCalls != 1 {
+		t.Fatalf("storage unix time lookup calls = %d, want 1", store.utimeLookupCalls)
 	}
 
 	got, err = live.LookupBlockByUnixTime(context.Background(), key, 1003)
@@ -1864,9 +1895,6 @@ func TestLiveStoreCheckpointFlushDoesNotRememberMissingBlocks(t *testing.T) {
 	live := NewLiveStore(&fakeStore{})
 
 	live.MarkLiveBlockStatesFlushed([]ton.BlockIDExt{missing})
-	if len(live.flushed) != 0 {
-		t.Fatalf("missing checkpoint-flushed blocks remembered = %d, want 0", len(live.flushed))
-	}
 }
 
 func TestLiveStoreBlockRootAcceptsTrustedStoredRootWithMode31BOC(t *testing.T) {
@@ -3051,11 +3079,11 @@ func TestLiveBlockFragmentsCachesAccountProofAndStates(t *testing.T) {
 		t.Fatalf("build fragments: %v", err)
 	}
 
-	proof, state, err := fragments.accountProof(accountID, false)
+	proof, state, err := fragments.AccountProof(accountID, false)
 	if err != nil {
 		t.Fatalf("first account proof: %v", err)
 	}
-	cachedProof, cachedState, err := fragments.accountProof(accountID, false)
+	cachedProof, cachedState, err := fragments.AccountProof(accountID, false)
 	if err != nil {
 		t.Fatalf("cached account proof: %v", err)
 	}
@@ -3073,7 +3101,7 @@ func TestLiveBlockFragmentsCachesAccountProofAndStates(t *testing.T) {
 		t.Fatal("account state was rebuilt instead of reused")
 	}
 
-	prunedProof, prunedState, err := fragments.accountProof(accountID, true)
+	prunedProof, prunedState, err := fragments.AccountProof(accountID, true)
 	if err != nil {
 		t.Fatalf("pruned account proof: %v", err)
 	}
@@ -3083,7 +3111,7 @@ func TestLiveBlockFragmentsCachesAccountProofAndStates(t *testing.T) {
 	if prunedState == nil || !prunedState.IsSpecial() || prunedState.GetType() != cell.MerkleProofCellType {
 		t.Fatalf("pruned account state is not a merkle proof: %v", prunedState)
 	}
-	cachedPrunedProof, cachedPrunedState, err := fragments.accountProof(accountID, true)
+	cachedPrunedProof, cachedPrunedState, err := fragments.AccountProof(accountID, true)
 	if err != nil {
 		t.Fatalf("cached pruned account proof: %v", err)
 	}
@@ -3092,9 +3120,6 @@ func TestLiveBlockFragmentsCachesAccountProofAndStates(t *testing.T) {
 	}
 	if prunedState != cachedPrunedState {
 		t.Fatal("pruned account state was rebuilt instead of reused")
-	}
-	if len(fragments.accountProofs) != 1 {
-		t.Fatalf("cached account proofs = %d, want 1", len(fragments.accountProofs))
 	}
 }
 
@@ -3358,7 +3383,7 @@ func TestRunMethodConfigBuildsCppC7Extras(t *testing.T) {
 		int32(tlb.ConfigParamPrecompiledContracts): testPrecompiledConfigCell(t, code.Hash(), 777),
 	})
 
-	cfg, err := runMethodConfig(master, stateRoot, 1500, code)
+	cfg, err := liveview.RunMethodConfig(master, stateRoot, 1500, code)
 	if err != nil {
 		t.Fatalf("run method config: %v", err)
 	}
@@ -3429,25 +3454,21 @@ func TestExternalMessageLimitsFromBaseConfigUsesPreloadedSizeLimits(t *testing.T
 		int32(tlb.ConfigParamGlobalVersion): testGlobalVersionCell(t, 13),
 		int32(tlb.ConfigParamSizeLimits):    sizeLimits,
 	})
-	extra, err := mcStateExtra(stateRoot)
+	block, blockRoot := testBlockForState(t, masterchainID, masterchainShard, master.SeqNo, stateRoot)
+	fragments, err := liveview.NewBlockView(block, blockRoot, stateRoot)
 	if err != nil {
-		t.Fatalf("load mc state extra: %v", err)
+		t.Fatalf("build block view: %v", err)
 	}
-	base, err := buildRunMethodBaseConfig(master, extra)
-	if err != nil {
-		t.Fatalf("build base config: %v", err)
-	}
-
-	got, err := externalMessageLimitsFromBaseConfig(base)
+	got, err := fragments.ExternalMessageLimits()
 	if err != nil {
 		t.Fatalf("external message limits: %v", err)
 	}
-	if got.maxSize != 4096 || got.maxDepth != 12 {
+	if got.MaxSize != 4096 || got.MaxDepth != 12 {
 		t.Fatalf("limits = %+v, want maxSize 4096 maxDepth 12", got)
 	}
 }
 
-func TestRunMethodConfigRejectsOldGlobalVersion(t *testing.T) {
+func TestRunMethodConfigRejectsUnsupportedGlobalVersion(t *testing.T) {
 	master := ton.BlockIDExt{
 		Workchain: masterchainID,
 		Shard:     masterchainShard,
@@ -3455,12 +3476,13 @@ func TestRunMethodConfigRejectsOldGlobalVersion(t *testing.T) {
 		RootHash:  bytes.Repeat([]byte{0x21}, 32),
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
+	unsupportedVersion := uint32(tvm.MaxSupportedGlobalVersion + 1)
 	stateRoot := testMasterStateWithConfig(t, master, map[int32]*cell.Cell{
-		int32(tlb.ConfigParamGlobalVersion): testGlobalVersionCell(t, 12),
+		int32(tlb.ConfigParamGlobalVersion): testGlobalVersionCell(t, unsupportedVersion),
 	})
 
-	_, err := runMethodConfig(master, stateRoot, 1500, nil)
-	if err == nil || !strings.Contains(err.Error(), "unsupported global version 12") {
+	_, err := liveview.RunMethodConfig(master, stateRoot, 1500, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsupported global version") || !strings.Contains(err.Error(), "maximum supported") {
 		t.Fatalf("run method config error = %v, want unsupported global version", err)
 	}
 }
@@ -3541,7 +3563,7 @@ func TestBlockFragmentsSkipsBlockMetaOnSuccessfulLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("block fragments: %v", err)
 	}
-	if fragments == nil || fragments.stateRoot != stateRoot {
+	if fragments == nil || fragments.StateRoot() != stateRoot {
 		t.Fatal("unexpected fragments state root")
 	}
 	if store.blockMetaCalls != 0 {
@@ -4934,6 +4956,99 @@ func TestHandleDispatchQueueMessagesEmptyQueueWithBOC(t *testing.T) {
 	}
 }
 
+func TestCollectDispatchQueueMessagesExactFitComplete(t *testing.T) {
+	account := bytes.Repeat([]byte{0x31}, 32)
+	dispatchQueue := testDispatchQueue(t, testDispatchQueueAccount{
+		addr: account,
+		lts:  []uint64{10},
+	})
+
+	messages, roots, complete, err := collectDispatchQueueMessages(dispatchQueue, account, 0, 1, true, true)
+	if err != nil {
+		t.Fatalf("collect dispatch queue messages: %v", err)
+	}
+	if !complete {
+		t.Fatalf("complete = false, want true")
+	}
+	if len(messages) != 1 || len(roots) != 1 {
+		t.Fatalf("messages = %d roots = %d, want 1 and 1", len(messages), len(roots))
+	}
+	if !bytes.Equal(messages[0].Addr, account) || messages[0].LT != 10 {
+		t.Fatalf("unexpected message: %+v", messages[0])
+	}
+}
+
+func TestCollectDispatchQueueMessagesExactFitIncompleteSameAccount(t *testing.T) {
+	account := bytes.Repeat([]byte{0x32}, 32)
+	dispatchQueue := testDispatchQueue(t, testDispatchQueueAccount{
+		addr: account,
+		lts:  []uint64{10, 20},
+	})
+
+	messages, _, complete, err := collectDispatchQueueMessages(dispatchQueue, account, 0, 1, true, false)
+	if err != nil {
+		t.Fatalf("collect dispatch queue messages: %v", err)
+	}
+	if complete {
+		t.Fatalf("complete = true, want false")
+	}
+	if len(messages) != 1 || !bytes.Equal(messages[0].Addr, account) || messages[0].LT != 10 {
+		t.Fatalf("unexpected messages: %+v", messages)
+	}
+}
+
+func TestCollectDispatchQueueMessagesExactFitIncompleteNextAccount(t *testing.T) {
+	firstAccount := bytes.Repeat([]byte{0x33}, 32)
+	nextAccount := bytes.Repeat([]byte{0x34}, 32)
+	dispatchQueue := testDispatchQueue(t,
+		testDispatchQueueAccount{
+			addr: firstAccount,
+			lts:  []uint64{10},
+		},
+		testDispatchQueueAccount{
+			addr: nextAccount,
+			lts:  []uint64{20},
+		},
+	)
+
+	messages, _, complete, err := collectDispatchQueueMessages(dispatchQueue, firstAccount, 0, 1, false, false)
+	if err != nil {
+		t.Fatalf("collect dispatch queue messages: %v", err)
+	}
+	if complete {
+		t.Fatalf("complete = true, want false")
+	}
+	if len(messages) != 1 || !bytes.Equal(messages[0].Addr, firstAccount) || messages[0].LT != 10 {
+		t.Fatalf("unexpected messages: %+v", messages)
+	}
+}
+
+func TestCollectDispatchQueueMessagesExactFitIncompleteAfterSkippedAccount(t *testing.T) {
+	firstAccount := bytes.Repeat([]byte{0x35}, 32)
+	nextAccount := bytes.Repeat([]byte{0x36}, 32)
+	dispatchQueue := testDispatchQueue(t,
+		testDispatchQueueAccount{
+			addr: firstAccount,
+			lts:  []uint64{10},
+		},
+		testDispatchQueueAccount{
+			addr: nextAccount,
+			lts:  []uint64{20, 30},
+		},
+	)
+
+	messages, _, complete, err := collectDispatchQueueMessages(dispatchQueue, firstAccount, 10, 1, false, false)
+	if err != nil {
+		t.Fatalf("collect dispatch queue messages: %v", err)
+	}
+	if complete {
+		t.Fatalf("complete = true, want false")
+	}
+	if len(messages) != 1 || !bytes.Equal(messages[0].Addr, nextAccount) || messages[0].LT != 20 {
+		t.Fatalf("unexpected messages: %+v", messages)
+	}
+}
+
 func TestHandleOutMsgQueueSizesUsesCurrentMasterAndShardStates(t *testing.T) {
 	masterBase := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 20}
 	shardBase := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 30}
@@ -5010,13 +5125,22 @@ func TestValidatorStatsCountParsesBlockCreateStatsLayouts(t *testing.T) {
 }
 
 func testServer(store Store) *Server {
+	tvmInstance := tvm.NewTVM()
+	checker, err := admission.NewChecker(admission.Options{
+		Store: store,
+		TVM:   tvmInstance,
+	})
+	if err != nil {
+		panic(err)
+	}
 	return &Server{
 		store:                  store,
 		zeroState:              ton.ZeroStateIDExt{Workchain: masterchainID, RootHash: bytes.Repeat([]byte{0x01}, 32), FileHash: bytes.Repeat([]byte{0x02}, 32)},
 		version:                DefaultVersion,
 		capabilities:           DefaultCapabilities,
-		tvm:                    tvm.NewTVM(),
+		tvm:                    tvmInstance,
 		sendMessageCache:       newSendMessageCache(),
+		externalMessageChecker: checker,
 		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
 		now: func() time.Time {
 			return time.Unix(1700000000, 0)
@@ -5756,6 +5880,29 @@ func testCurrencyCollectionCell() (*cell.Cell, error) {
 	return tlb.ToCell(&tlb.CurrencyCollection{Coins: tlb.ZeroCoins})
 }
 
+type testUint64BoundaryAugmentation struct{}
+
+func (testUint64BoundaryAugmentation) SkipExtra(loader *cell.Slice) error {
+	_, err := loader.LoadUInt(64)
+	return err
+}
+
+func (testUint64BoundaryAugmentation) EmptyExtra() (*cell.Cell, error) {
+	return testUint64BoundaryCell(), nil
+}
+
+func (testUint64BoundaryAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
+	return testUint64BoundaryCell(), nil
+}
+
+func (testUint64BoundaryAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
+	return testUint64BoundaryCell(), nil
+}
+
+func testUint64BoundaryCell() *cell.Cell {
+	return cell.BeginCell().MustStoreUInt(0, 64).EndCell()
+}
+
 func testShardStateStats(t *testing.T) *cell.Cell {
 	t.Helper()
 
@@ -6126,6 +6273,44 @@ func testShardHashLeaf(t *testing.T, block ton.BlockIDExt, nextValidatorShard in
 		t.Fatalf("build shard descriptor: %v", err)
 	}
 	return cell.BeginCell().MustStoreUInt(0, 1).MustStoreBuilder(desc.ToBuilder()).EndCell()
+}
+
+type testDispatchQueueAccount struct {
+	addr []byte
+	lts  []uint64
+}
+
+func testDispatchQueue(t *testing.T, accounts ...testDispatchQueueAccount) *cell.AugmentedDictionary {
+	t.Helper()
+
+	dispatchQueue, err := cell.NewAugDict(256, testUint64BoundaryAugmentation{})
+	if err != nil {
+		t.Fatalf("create dispatch queue dict: %v", err)
+	}
+
+	for _, account := range accounts {
+		messages := cell.NewDict(64)
+		for _, lt := range account.lts {
+			_, msg := testTransactionWithInMsg(t, account.addr, lt)
+			envelope := testMsgEnvelopeWithMetadata(t, msg, account.addr, 1, lt)
+			enqueued := cell.BeginCell().
+				MustStoreUInt(lt, 64).
+				MustStoreRef(envelope).
+				EndCell()
+			if err = messages.Set(cell.BeginCell().MustStoreUInt(lt, 64).EndCell(), enqueued); err != nil {
+				t.Fatalf("set dispatch queue message: %v", err)
+			}
+		}
+
+		accountQueue := cell.BeginCell().
+			MustStoreDict(messages).
+			MustStoreUInt(uint64(len(account.lts)), 48).
+			EndCell()
+		if err = dispatchQueue.Set(accountKey(account.addr), accountQueue); err != nil {
+			t.Fatalf("set dispatch queue account: %v", err)
+		}
+	}
+	return dispatchQueue
 }
 
 func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size uint64) *cell.Cell {
@@ -6610,6 +6795,7 @@ type fakeStore struct {
 	stateRoots  map[string]*cell.Cell
 	zeroStates  map[storage.BlockRootHash][]byte
 	ltLookup    map[fakeLTLookupKey]ton.BlockIDExt
+	utimeLookup map[fakeUnixLookupKey]ton.BlockIDExt
 
 	seqLookupByKey       map[fakeSeqLookupKey]ton.BlockIDExt
 	blockDataCalls       int
@@ -6675,16 +6861,26 @@ func fakeLTKey(key storage.BlockHistoryKey, lt uint64) fakeLTLookupKey {
 	return fakeLTLookupKey{workchain: key.Workchain, shard: key.Shard, lt: lt}
 }
 
+type fakeUnixLookupKey struct {
+	workchain int32
+	shard     int64
+	utime     uint32
+}
+
+func fakeUnixKey(key storage.BlockHistoryKey, utime uint32) fakeUnixLookupKey {
+	return fakeUnixLookupKey{workchain: key.Workchain, shard: key.Shard, utime: utime}
+}
+
 type fakeMessageSender struct {
 	body    []byte
-	address extmsg.AddressKey
+	address *address.Address
 	root    *cell.Cell
 	message *tlb.ExternalMessage
 	err     error
 	count   int
 }
 
-func (s *fakeMessageSender) SendCheckedExternalMessage(_ context.Context, body []byte, address extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage) error {
+func (s *fakeMessageSender) SendCheckedExternalMessage(_ context.Context, body []byte, address *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error {
 	s.body = append([]byte(nil), body...)
 	s.address = address
 	s.root = root
@@ -6944,7 +7140,7 @@ func (s *fakeStore) WaitMasterchainSeqno(ctx context.Context, seqno uint32, time
 	for {
 		current, err := s.CurrentState(waitCtx)
 		if err == nil {
-			currentSeqno := currentMasterchainSeqno(current)
+			currentSeqno := current.Masterchain.Block.SeqNo
 			if currentSeqno >= seqno {
 				return nil
 			}
@@ -7009,16 +7205,16 @@ func (s *fakeStore) BlockMeta(_ context.Context, block ton.BlockIDExt) (*storage
 	meta, ok := s.metas[key]
 	if !ok {
 		if state := s.blockStates[key]; state != nil {
-			return storage.BuildBlockMetaFromState(*state), nil
+			return storage.BuildBlockMetaFromState(*state)
 		}
 		return nil, storage.ErrNotFound
 	}
 	return meta.Clone(), nil
 }
 
-func (s *fakeStore) LookupBlockBySeqNo(_ context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
+func (s *fakeStore) LookupBlockBySeqNo(_ context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
 	s.seqLookupCalls++
-	if block, ok := s.seqLookupByKey[fakeSeqKey(key, seqno)]; ok {
+	if block, ok := s.seqLookupByKey[fakeSeqKey(ref.HistoryKey(), ref.SeqNo)]; ok {
 		return *cloneBlockID(block), nil
 	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
@@ -7043,7 +7239,10 @@ func (s *fakeStore) LookupBlockByAccountLT(_ context.Context, workchain int32, a
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
-func (s *fakeStore) LookupBlockByUnixTime(context.Context, storage.BlockHistoryKey, uint32) (ton.BlockIDExt, error) {
+func (s *fakeStore) LookupBlockByUnixTime(_ context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
 	s.utimeLookupCalls++
+	if block, ok := s.utimeLookup[fakeUnixKey(key, utime)]; ok {
+		return *cloneBlockID(block), nil
+	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }

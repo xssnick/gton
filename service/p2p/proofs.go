@@ -20,10 +20,16 @@ type ProofDownload struct {
 }
 
 func (n *Node) DownloadBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (ProofDownload, error) {
+	if n.IsOffline() {
+		return ProofDownload{}, ErrOffline
+	}
 	return n.downloadProof(ctx, block, allowPartial, false)
 }
 
 func (n *Node) DownloadKeyBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (ProofDownload, error) {
+	if n.IsOffline() {
+		return ProofDownload{}, ErrOffline
+	}
 	return n.downloadProof(ctx, block, allowPartial, true)
 }
 

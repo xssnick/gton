@@ -67,22 +67,22 @@ func newStateCellPrewriter(log zerolog.Logger, store stateCellPrewriteStore, max
 	}
 }
 
-func (w *stateCellPrewriter) start(ctx context.Context, runAsync func(func())) {
+func (w *stateCellPrewriter) start(ctx context.Context, writeCtx context.Context, runAsync func(func())) {
 	if w == nil {
 		return
 	}
 	w.startOnce.Do(func() {
 		runAsync(func() {
-			w.run(ctx)
+			w.run(ctx, writeCtx)
 		})
 	})
 }
 
-func (w *stateCellPrewriter) run(ctx context.Context) {
+func (w *stateCellPrewriter) run(ctx context.Context, writeCtx context.Context) {
 	for {
 		batch, ok := w.popBatch()
 		if ok {
-			w.process(batch)
+			w.process(writeCtx, batch)
 			continue
 		}
 
@@ -95,7 +95,7 @@ func (w *stateCellPrewriter) run(ctx context.Context) {
 					w.close(ctx.Err())
 					return
 				}
-				w.process(batch)
+				w.process(writeCtx, batch)
 			}
 		}
 	}
@@ -250,9 +250,9 @@ func (b stateCellPrewriteBatch) canAddMore() bool {
 	return stateCellPrewriteBatchBytes == 0 || b.bytes < stateCellPrewriteBatchBytes
 }
 
-func (w *stateCellPrewriter) process(batch stateCellPrewriteBatch) {
+func (w *stateCellPrewriter) process(ctx context.Context, batch stateCellPrewriteBatch) {
 	records := storage.NewStateCellRecordChunks(batch.chunks, batch.bytes)
-	if err := w.store.SaveStateCellRecords(context.Background(), records); err != nil {
+	if err := w.store.SaveStateCellRecords(ctx, records); err != nil {
 		w.fail(fmt.Errorf("prewrite state cells: %w", err))
 		return
 	}

@@ -20,7 +20,7 @@ const (
 	DefaultPath                             = "config.json"
 	DefaultGlobalConfigPath                 = "global.config.json"
 	DefaultGlobalConfigURL                  = "https://ton-blockchain.github.io/global.config.json"
-	DefaultSyncBefore                       = 4 * time.Hour
+	DefaultSyncBefore                       = 6 * time.Hour
 	ArchiveFromZeroSyncBefore               = int64(-1)
 	DefaultStateTTL                         = 2 * 24 * time.Hour
 	DefaultArchiveTTL                       = 7 * 24 * time.Hour
@@ -39,10 +39,13 @@ const (
 	DefaultLargeBOCShardReadWorkers         = int64(2)
 	DefaultPersistentStateLargeBOCBatchSize = int64(512 << 10)
 	DefaultArtifactFileMaxOpen              = int64(512)
-	DefaultLiteMasterBlockCache             = 128
-	DefaultLiteShardBlockCache              = 1024
+	DefaultLiteMasterBlockCache             = 32
+	DefaultLiteShardBlockCache              = 128
 	DefaultLiteListen                       = "0.0.0.0:7445"
 	DefaultLiteSendMessageBroadcastMaxDelay = 100 * time.Millisecond
+	DefaultLiteSendMessageBroadcastFanout   = 5
+	MinLiteSendMessageBroadcastFanout       = 3
+	MaxLiteSendMessageBroadcastFanout       = 20
 	DefaultMetricsNamespace                 = "gton"
 	defaultStorageDir                       = "data"
 	defaultADNLPort                         = 30303
@@ -70,6 +73,7 @@ type Config struct {
 type TON struct {
 	GlobalConfigPath string `json:"global_config_path"`
 	SyncBefore       int64  `json:"sync_before"`
+	SyncUntil        int64  `json:"sync_until"`
 	StateTTL         int64  `json:"state_ttl"`
 	ArchiveTTL       int64  `json:"archive_ttl"`
 
@@ -99,6 +103,7 @@ type Lite struct {
 	ShardBlockCache                    int        `json:"shard_block_cache"`
 	SendMessageBroadcastBytesPerSecond int64      `json:"send_message_broadcast_bytes_per_second"`
 	SendMessageBroadcastMaxDelayMS     int64      `json:"send_message_broadcast_max_delay_ms"`
+	SendMessageBroadcastFanout         int        `json:"send_message_broadcast_fanout"`
 	Limits                             LiteLimits `json:"limits"`
 }
 
@@ -179,6 +184,7 @@ func defaultConfig() Config {
 			MasterBlockCache:               DefaultLiteMasterBlockCache,
 			ShardBlockCache:                DefaultLiteShardBlockCache,
 			SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
+			SendMessageBroadcastFanout:     DefaultLiteSendMessageBroadcastFanout,
 		},
 		Storage: Storage{
 			CellTotalCacheSize:               DefaultCellTotalCache,
@@ -254,6 +260,7 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		MasterBlockCache:               DefaultLiteMasterBlockCache,
 		ShardBlockCache:                DefaultLiteShardBlockCache,
 		SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
+		SendMessageBroadcastFanout:     DefaultLiteSendMessageBroadcastFanout,
 	}
 	cfg.Storage = Storage{
 		Dir:                              storageDir,
@@ -502,6 +509,19 @@ func (cfg Config) SyncBefore() (time.Duration, error) {
 	return time.Duration(cfg.TON.SyncBefore) * time.Second, nil
 }
 
+func (cfg Config) SyncUntil() (uint32, error) {
+	if cfg.TON.SyncUntil < 0 {
+		return 0, fmt.Errorf("ton.sync_until cannot be negative")
+	}
+	if cfg.TON.SyncUntil == 0 {
+		return 0, nil
+	}
+	if cfg.TON.SyncUntil > int64(^uint32(0)) {
+		return 0, fmt.Errorf("ton.sync_until is too large")
+	}
+	return uint32(cfg.TON.SyncUntil), nil
+}
+
 func (cfg Config) ArchiveFromZero() bool {
 	return cfg.TON.SyncBefore == ArchiveFromZeroSyncBefore
 }
@@ -568,6 +588,20 @@ func (cfg Config) LiteSendMessageBroadcastCapacity() (LiteSendMessageBroadcastCa
 		BytesPerSecond: cfg.Lite.SendMessageBroadcastBytesPerSecond,
 		MaxDelay:       time.Duration(delayMS) * time.Millisecond,
 	}, nil
+}
+
+func (cfg Config) LiteSendMessageBroadcastFanout() (int, error) {
+	fanout := cfg.Lite.SendMessageBroadcastFanout
+	if fanout == 0 {
+		return DefaultLiteSendMessageBroadcastFanout, nil
+	}
+	if fanout < MinLiteSendMessageBroadcastFanout {
+		return 0, fmt.Errorf("liteserver.send_message_broadcast_fanout cannot be less than %d", MinLiteSendMessageBroadcastFanout)
+	}
+	if fanout > MaxLiteSendMessageBroadcastFanout {
+		return 0, fmt.Errorf("liteserver.send_message_broadcast_fanout cannot exceed %d", MaxLiteSendMessageBroadcastFanout)
+	}
+	return fanout, nil
 }
 
 func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, error) {

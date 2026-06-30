@@ -12,7 +12,13 @@ import (
 )
 
 func TestBuildBlockMetaFromParsedShardBlockDoesNotUseHeaderMasterRef(t *testing.T) {
-	id := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 21}
+	id := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     masterchainShard,
+		SeqNo:     21,
+		RootHash:  bytes.Repeat([]byte{0x55}, 32),
+		FileHash:  bytes.Repeat([]byte{0x66}, 32),
+	}
 	masterRef := tlb.ExtBlkRef{
 		EndLt:    100,
 		SeqNo:    19,

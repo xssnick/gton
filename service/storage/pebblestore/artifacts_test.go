@@ -23,6 +23,19 @@ type testArchiveImport struct {
 	Links      []storage.ServedBlockLink
 }
 
+type testArtifactMetricsObserver struct {
+	archivePackageBytes  int64
+	persistentStateBytes int64
+}
+
+func (o *testArtifactMetricsObserver) AddArchivePackageBytes(delta int64) {
+	o.archivePackageBytes += delta
+}
+
+func (o *testArtifactMetricsObserver) AddPersistentStateBytes(delta int64) {
+	o.persistentStateBytes += delta
+}
+
 func saveTestArchiveArtifacts(store *Store, imported testArchiveImport) error {
 	entries := make([]storage.StateCheckpointBlock, 0, len(imported.FullBlocks))
 	if len(imported.FullBlocks) == 0 {
@@ -542,6 +555,8 @@ func TestArchivePackageMetadataTracksFirstMasterBlock(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	metricsObserver := &testArtifactMetricsObserver{}
+	store.SetArtifactMetricsObserver(metricsObserver)
 
 	firstSaved := ton.BlockIDExt{
 		Workchain: -1,
@@ -594,6 +609,9 @@ func TestArchivePackageMetadataTracksFirstMasterBlock(t *testing.T) {
 	}
 	if meta.path == "" || meta.size == 0 {
 		t.Fatalf("archive package meta did not record path/size: %+v", meta)
+	}
+	if metricsObserver.archivePackageBytes != meta.size {
+		t.Fatalf("archive package metric bytes = %d, want %d", metricsObserver.archivePackageBytes, meta.size)
 	}
 }
 
@@ -1871,6 +1889,68 @@ func TestOpenRemovesDeletePendingArchivePack(t *testing.T) {
 	}
 }
 
+func TestDeleteArchivePackageRecordsSkipsDirtyPack(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	block := testArchivePruneBlock(62, 0x62)
+	path := saveArchivePruneBlock(t, store, block, 6200, 0, nil)
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat archive pack: %v", err)
+	}
+	if _, err = store.markPackAppendDirty(path, stat.Size()); err != nil {
+		t.Fatalf("mark dirty append: %v", err)
+	}
+	store.artifactMu.Lock()
+	store.markPendingPackSync(store.pendingArchiveSync, path, stat.Size(), stat.Size(), stat.Size())
+
+	archiveID, err := store.ArchiveInfo(ctx, int32(block.SeqNo), block.Workchain, block.Shard)
+	if err != nil {
+		store.artifactMu.Unlock()
+		t.Fatalf("archive info: %v", err)
+	}
+	raw, err := store.getHotCopy(ctx, hotKeyArchivePackage(archiveID))
+	if err != nil {
+		store.artifactMu.Unlock()
+		t.Fatalf("load archive package meta: %v", err)
+	}
+	meta, err := decodeArchivePackageMeta(raw)
+	if err != nil {
+		store.artifactMu.Unlock()
+		t.Fatalf("decode archive package meta: %v", err)
+	}
+
+	paths, deletedPackages, deletedKeys, err := store.deleteArchivePackageRecords(ctx, []archivePackageMeta{meta}, block.SeqNo+archiveSliceMasterchainBlocks)
+	delete(store.pendingArchiveSync, path)
+	store.artifactMu.Unlock()
+	if err != nil {
+		t.Fatalf("delete archive package records: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("delete paths = %v, want none", paths)
+	}
+	if deletedPackages != 0 {
+		t.Fatalf("deleted packages = %d, want 0", deletedPackages)
+	}
+	if deletedKeys != 0 {
+		t.Fatalf("deleted keys = %d, want 0", deletedKeys)
+	}
+	if _, err = store.ArchiveInfo(ctx, int32(block.SeqNo), block.Workchain, block.Shard); err != nil {
+		t.Fatalf("archive info after dirty skip: %v", err)
+	}
+	if _, err = store.getHotCopy(ctx, hotKeyPackDeletePending(meta.path)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("delete pending marker after dirty skip = %v, want ErrNotFound", err)
+	}
+	if err = store.clearPackAppendDirty(path); err != nil {
+		t.Fatalf("clear dirty append marker: %v", err)
+	}
+}
+
 func TestOpenTruncatesArchivePackToPublishedRefs(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(Options{Dir: dir})
@@ -2197,6 +2277,8 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
+	metricsObserver := &testArtifactMetricsObserver{}
+	store.SetArtifactMetricsObserver(metricsObserver)
 
 	block := ton.BlockIDExt{
 		Workchain: 0,
@@ -2234,6 +2316,9 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save persistent state file: %v", err)
 	}
+	if metricsObserver.persistentStateBytes != int64(len(data)) {
+		t.Fatalf("persistent state metric bytes = %d, want %d", metricsObserver.persistentStateBytes, len(data))
+	}
 
 	size, err := store.PersistentStateSize(context.Background(), block, master, 0)
 	if err != nil {
@@ -2264,12 +2349,15 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 	if !bytes.Equal(meta.StateRootHash, stateRootHash) {
 		t.Fatalf("state root hash = %x, want %x", meta.StateRootHash, stateRootHash)
 	}
-	if _, err = store.LookupBlockBySeqNo(context.Background(), storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
+	if _, err = store.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRefFromBlock(block)); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("persistent state metadata lookup by seqno error = %v, want ErrNotFound", err)
 	}
 
 	if err = store.DeletePersistentStateFile(context.Background(), block, master, 0); err != nil {
 		t.Fatalf("delete persistent state file: %v", err)
+	}
+	if metricsObserver.persistentStateBytes != 0 {
+		t.Fatalf("persistent state metric bytes after delete = %d, want 0", metricsObserver.persistentStateBytes)
 	}
 	if _, err = store.PersistentStateSize(context.Background(), block, master, 0); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("persistent state size after delete error = %v, want not found", err)
@@ -2287,12 +2375,12 @@ func TestSavePersistentStateFileServesSizeSliceAndMeta(t *testing.T) {
 	if len(meta.StateFileHash) != 0 {
 		t.Fatalf("state file hash after delete = %x, want empty", meta.StateFileHash)
 	}
-	if _, err = store.LookupBlockBySeqNo(context.Background(), storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
+	if _, err = store.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRefFromBlock(block)); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("persistent state metadata lookup by seqno after delete error = %v, want ErrNotFound", err)
 	}
 }
 
-func TestDeletePersistentStateFileDeletesEmptyBlockMeta(t *testing.T) {
+func TestDeletePersistentStateFileClearsSnapshotOnlyBlockMeta(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2329,14 +2417,22 @@ func TestDeletePersistentStateFileDeletesEmptyBlockMeta(t *testing.T) {
 		EffectiveShard:   0,
 		Ref:              &storage.ArtifactRef{Path: path, Size: int64(len(data))},
 		FileHash:         bytes.Repeat([]byte{0x15}, 32),
+		StateRootHash:    bytes.Repeat([]byte{0x16}, 32),
 	}); err != nil {
 		t.Fatalf("save persistent state file: %v", err)
 	}
 	if err = store.DeletePersistentStateFile(context.Background(), block, master, 0); err != nil {
 		t.Fatalf("delete persistent state file: %v", err)
 	}
-	if _, err = store.BlockMeta(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("empty persistent state block meta after delete error = %v, want ErrNotFound", err)
+	meta, err := store.BlockMeta(context.Background(), block)
+	if err != nil {
+		t.Fatalf("load persistent state block meta after delete: %v", err)
+	}
+	if meta.Has(storage.BlockMetaHasStateSnapshot) {
+		t.Fatal("persistent state delete left snapshot flag in block meta")
+	}
+	if len(meta.StateFileHash) != 0 {
+		t.Fatalf("persistent state delete left state file hash %x", meta.StateFileHash)
 	}
 }
 

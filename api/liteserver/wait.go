@@ -5,6 +5,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/xssnick/gton/service/liveview"
+
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -169,9 +171,9 @@ func waitMasterchainError(err error) *ton.LSError {
 	switch {
 	case err == nil:
 		return nil
-	case errors.Is(err, errWaitMasterchainTimeout), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, liveview.ErrWaitMasterchainTimeout), errors.Is(err, context.DeadlineExceeded):
 		return &ton.LSError{Code: errCodeTimeout, Text: "timeout"}
-	case errors.Is(err, errWaitMasterchainTooFar):
+	case errors.Is(err, liveview.ErrWaitMasterchainTooFar):
 		return &ton.LSError{Code: errCodeNotReady, Text: "too big masterchain block seqno"}
 	case errors.Is(err, context.Canceled):
 		return &ton.LSError{Code: errCodeTimeout, Text: "timeout"}

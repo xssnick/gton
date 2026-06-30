@@ -37,7 +37,7 @@ func TestOverlayPeerLivenessRecoversAfterInboundTraffic(t *testing.T) {
 	}
 }
 
-func TestFixedOverlayPeerIgnoresPingFailures(t *testing.T) {
+func TestFixedOverlayPeerKeepsFailureStatsWithoutEviction(t *testing.T) {
 	peer := &overlayPeer{
 		fixedMember:   true,
 		alive:         true,
@@ -50,33 +50,27 @@ func TestFixedOverlayPeerIgnoresPingFailures(t *testing.T) {
 
 	stats := peer.statsSnapshot()
 	if !stats.alive {
-		t.Fatal("fixed overlay peer should stay alive after ping failures")
+		t.Fatal("fixed overlay peer with prior traffic should stay alive after failures")
 	}
-	if stats.failedQueries != 0 || stats.unreliability != 0 {
-		t.Fatalf("fixed overlay ping failures should not affect peer score: failed=%d unreliability=%f", stats.failedQueries, stats.unreliability)
+	if stats.failedQueries != 8 || stats.unreliability != 8 {
+		t.Fatalf("fixed overlay failures should be visible in stats: failed=%d unreliability=%f", stats.failedQueries, stats.unreliability)
 	}
 }
 
-func TestCustomFixedOverlaySkipsADNLPingTargets(t *testing.T) {
-	peerID := testPeerID("fixed")
-	sub := &overlaySubscription{
-		spec: overlaySpec{
-			Kind: overlayKindCustomFixed,
-		},
-		peers: map[PeerID]*overlayPeer{
-			peerID: {
-				id:            peerID,
-				fixedMember:   true,
-				overlay:       &overlay.ADNLOverlayWrapper{},
-				alive:         true,
-				lastReceiveAt: time.Now(),
-			},
-		},
-		neighbours: []PeerID{peerID},
+func TestFixedOverlayPeerNeedsTrafficBeforeAlive(t *testing.T) {
+	peer := &overlayPeer{
+		fixedMember: true,
+		overlay:     &overlay.ADNLOverlayWrapper{},
+		alive:       true,
 	}
 
-	if targets := sub.adnlPingTargets(); len(targets) != 0 {
-		t.Fatalf("custom fixed overlay should not ADNL-ping peers, got %d targets", len(targets))
+	if peer.isAliveKnownOverlayPeer(time.Now()) {
+		t.Fatal("fixed overlay peer without receive or success should not be alive known")
+	}
+
+	peer.noteReceive()
+	if !peer.isAliveKnownOverlayPeer(time.Now()) {
+		t.Fatal("fixed overlay peer should become alive known after inbound traffic")
 	}
 }
 
@@ -730,8 +724,11 @@ func TestAnnounceSelfRetriesAfterDHTWarmup(t *testing.T) {
 	if fake.storeOverlayCalls != 2 {
 		t.Fatalf("expected 2 overlay store attempts, got %d", fake.storeOverlayCalls)
 	}
-	if fake.findOverlayNodesCalls == 0 {
-		t.Fatalf("expected DHT warmup to query overlay nodes before retry")
+	if fake.findAddressesCalls != 1 {
+		t.Fatalf("expected address DHT warmup before retry, got %d", fake.findAddressesCalls)
+	}
+	if fake.findOverlayNodesCalls != 1 {
+		t.Fatalf("expected overlay DHT warmup before retry, got %d", fake.findOverlayNodesCalls)
 	}
 	if got := timeoutDuration(t, fake.storeAddressDeadline); got < dhtStoreTimeout-time.Second {
 		t.Fatalf("store address timeout too short: %s", got)
@@ -739,8 +736,51 @@ func TestAnnounceSelfRetriesAfterDHTWarmup(t *testing.T) {
 	if got := timeoutDuration(t, fake.storeOverlayDeadline); got < dhtStoreTimeout-time.Second {
 		t.Fatalf("store overlay timeout too short: %s", got)
 	}
+	if got := timeoutDuration(t, fake.findAddressesDeadline); got < dhtFindTimeout-time.Second {
+		t.Fatalf("find address timeout too short: %s", got)
+	}
 	if got := timeoutDuration(t, fake.findOverlayNodesDeadline); got < dhtFindTimeout-time.Second {
 		t.Fatalf("find overlay timeout too short: %s", got)
+	}
+}
+
+func TestAnnounceSelfSkipsDHTStoreWhenOffline(t *testing.T) {
+	logger := discardLogger()
+	node, err := New(Options{
+		Logger:             &logger,
+		ListenAddr:         "127.0.0.1:30303",
+		PeerServingStorage: newTestPeerStore(),
+		StateFilesDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	node.gateway.SetAddressList([]adnladdr.Address{&adnladdr.UDP{IP: []byte{127, 0, 0, 1}, Port: 30303}})
+	fake := &fakeDHTClient{}
+	node.dht = fake
+	node.EnterOffline("test")
+
+	if err = node.announceSelf(context.Background()); !errors.Is(err, ErrOffline) {
+		t.Fatalf("announce self error = %v, want %v", err, ErrOffline)
+	}
+	if fake.storeAddressCalls != 0 {
+		t.Fatalf("offline announce stored address %d times", fake.storeAddressCalls)
+	}
+	if fake.storeOverlayCalls != 0 {
+		t.Fatalf("offline announce stored overlay %d times", fake.storeOverlayCalls)
+	}
+	if fake.findAddressesCalls != 0 || fake.findOverlayNodesCalls != 0 {
+		t.Fatalf("offline announce warmed DHT addresses=%d overlays=%d", fake.findAddressesCalls, fake.findOverlayNodesCalls)
+	}
+}
+
+func TestDHTServerPublishSkipsStoreWhenOffline(t *testing.T) {
+	node := newTestNode(t)
+	node.EnterOffline("test")
+
+	if err := node.publishDHTServerAddress(context.Background(), adnladdr.List{}); !errors.Is(err, ErrOffline) {
+		t.Fatalf("publish DHT server address error = %v, want %v", err, ErrOffline)
 	}
 }
 
@@ -749,6 +789,7 @@ var errNoAliveStore = errors.New("no alive nodes found to store this key")
 type fakeDHTClient struct {
 	storeAddressCalls        int
 	storeOverlayCalls        int
+	findAddressesCalls       int
 	findOverlayNodesCalls    int
 	storeAddressErrs         []error
 	storeOverlayErrs         []error
@@ -776,6 +817,7 @@ func (f *fakeDHTClient) FindOverlayNodes(ctx context.Context, _ []byte, _ ...*dh
 }
 
 func (f *fakeDHTClient) FindAddresses(ctx context.Context, _ []byte) (*adnladdr.List, ed25519.PublicKey, error) {
+	f.findAddressesCalls++
 	f.findAddressesDeadline, _ = ctx.Deadline()
 	if f.findAddressesErr != nil {
 		return nil, nil, f.findAddressesErr

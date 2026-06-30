@@ -241,7 +241,7 @@ func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare lazy final root record: %v", err)
 	}
-	lazyRoot, err := nonfinalLazyCellRecord(rootRecord.Hash, rootRecord.Data, func(hash cell.Hash) (*cell.Cell, error) {
+	lazyRoot, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(rootRecord.Hash[:], rootRecord.Data), func(hash cell.Hash) (*cell.Cell, error) {
 		finalLoads++
 		if hash != branch.HashKey() {
 			return nil, cell.ErrLazyRefNotFound
@@ -278,56 +278,6 @@ func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 	}
 	if len(store.loads) != 0 {
 		t.Fatalf("non-final loader was used on final path")
-	}
-}
-
-func TestLiveStoreNonfinalCellIndexUsesNearestPendingBlock(t *testing.T) {
-	live := &LiveStore{
-		nonFinalPending:    map[storage.BlockRootHash]liveNonfinalPending{},
-		nonFinalOrderIndex: map[storage.BlockRootHash]int{},
-		nonFinalCellIndex:  map[cell.Hash][]liveNonfinalCellIndexEntry{},
-	}
-
-	var hash cell.Hash
-	hash[0] = 0x91
-	firstData := []byte{0x01}
-	secondData := []byte{0x02}
-
-	first := testNonfinalArtifact(t, 0, masterchainShard, 11, cell.BeginCell().MustStoreUInt(0x41, 8).EndCell()).Block
-	second := testNonfinalArtifact(t, 0, masterchainShard, 12, cell.BeginCell().MustStoreUInt(0x42, 8).EndCell(), first).Block
-	firstKey := storage.BlockKey(first)
-	secondKey := storage.BlockKey(second)
-
-	live.putNonfinalPendingLocked(firstKey, liveNonfinalPending{
-		block: first,
-		cells: storage.NewStateCellRecords([]storage.EncodedCellRecord{{Hash: hash, Data: firstData}}),
-	})
-	live.putNonfinalPendingLocked(secondKey, liveNonfinalPending{
-		block: second,
-		cells: storage.NewStateCellRecords([]storage.EncodedCellRecord{{Hash: hash, Data: secondData}}),
-	})
-
-	if got := live.nonfinalCellDataLocked(second, hash); !bytes.Equal(got, secondData) {
-		t.Fatalf("second block cell data = %x, want %x", got, secondData)
-	}
-	if got := live.nonfinalCellDataLocked(first, hash); !bytes.Equal(got, firstData) {
-		t.Fatalf("first block cell data = %x, want %x", got, firstData)
-	}
-
-	live.deleteNonfinalPendingLocked(secondKey)
-	if got := live.nonfinalCellDataLocked(second, hash); got != nil {
-		t.Fatalf("deleted second block cell data = %x, want nil", got)
-	}
-	if got := live.nonfinalCellDataLocked(first, hash); !bytes.Equal(got, firstData) {
-		t.Fatalf("first block cell data after cleanup = %x, want %x", got, firstData)
-	}
-	if entries := live.nonFinalCellIndex[hash]; len(entries) != 1 || entries[0].block != firstKey {
-		t.Fatalf("cell index after second cleanup = %#v, want only first block", entries)
-	}
-
-	live.deleteNonfinalPendingLocked(firstKey)
-	if entries := live.nonFinalCellIndex[hash]; len(entries) != 0 {
-		t.Fatalf("cell index after full cleanup = %#v, want empty", entries)
 	}
 }
 
@@ -404,7 +354,7 @@ func TestLiveStoreNonfinalUsesStateUpdateLazyOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load pending fragments: %v", err)
 	}
-	gotAccount, err := fragments.accountCell(accountID)
+	gotAccount, err := fragments.AccountCell(accountID)
 	if err != nil {
 		t.Fatalf("load account from lazy non-final state: %v", err)
 	}
@@ -412,16 +362,6 @@ func TestLiveStoreNonfinalUsesStateUpdateLazyOverlay(t *testing.T) {
 		t.Fatalf("account hash mismatch")
 	}
 
-	fullCells, err := storage.PrepareReachableStateCells(nextState)
-	if err != nil {
-		t.Fatalf("count full state cells: %v", err)
-	}
-	live.mu.RLock()
-	overlayCells := live.nonFinalPending[storage.BlockKey(pendingBlock)].cells.Len()
-	live.mu.RUnlock()
-	if overlayCells >= fullCells.Len() {
-		t.Fatalf("overlay cells = %d, want less than full state cells %d", overlayCells, fullCells.Len())
-	}
 }
 
 func TestLiveStoreNonfinalRejectsStateUpdateFromDifferentPreviousRoot(t *testing.T) {
@@ -498,12 +438,6 @@ func TestLiveStoreNonfinalWaitsBeforePreparingStateUpdate(t *testing.T) {
 		t.Fatalf("not-ready child state err = %v, want ErrNotFound", err)
 	}
 
-	live.mu.RLock()
-	_, waiting := live.nonFinalWaiting[storage.BlockKey(childBlock)]
-	live.mu.RUnlock()
-	if !waiting {
-		t.Fatal("not-ready child was not kept in waiting queue")
-	}
 }
 
 func TestLiveStoreNonfinalDoesNotEnterLookupIndexes(t *testing.T) {
@@ -521,7 +455,7 @@ func TestLiveStoreNonfinalDoesNotEnterLookupIndexes(t *testing.T) {
 	}
 
 	key := storage.BlockHistoryKey{Workchain: pending.Block.Workchain, Shard: pending.Block.Shard}
-	if _, err := live.LookupBlockBySeqNo(context.Background(), key, pending.Block.SeqNo); !errors.Is(err, storage.ErrNotFound) {
+	if _, err := live.LookupBlockBySeqNo(context.Background(), storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: pending.Block.SeqNo}); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("non-final seqno lookup err = %v, want ErrNotFound", err)
 	}
 	if _, err := live.LookupBlockByLT(context.Background(), key, 150); !errors.Is(err, storage.ErrNotFound) {
@@ -636,12 +570,6 @@ func TestLiveStoreNonfinalDropsBlocksTooFarAheadOfCurrentMaster(t *testing.T) {
 		t.Fatalf("too-far state err = %v, want ErrNotFound", err)
 	}
 
-	live.mu.RLock()
-	waiting := len(live.nonFinalWaiting)
-	live.mu.RUnlock()
-	if waiting != 0 {
-		t.Fatalf("waiting non-final blocks = %d, want 0", waiting)
-	}
 }
 
 func TestLiveStoreNonfinalDropsTooFarAheadWithMetaOnlyCurrent(t *testing.T) {
@@ -667,38 +595,6 @@ func TestLiveStoreNonfinalDropsTooFarAheadWithMetaOnlyCurrent(t *testing.T) {
 	if _, err = live.BlockState(context.Background(), tooFar.Block); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("too-far state err = %v, want ErrNotFound", err)
 	}
-}
-
-func TestLiveStoreNonfinalOrderIndexTracksDeletes(t *testing.T) {
-	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{NonFinalEnabled: true, NonFinalCache: 8})
-	blocks := []ton.BlockIDExt{
-		{Workchain: 0, Shard: 1, SeqNo: 1, RootHash: bytes.Repeat([]byte{0x01}, 32), FileHash: bytes.Repeat([]byte{0x11}, 32)},
-		{Workchain: 0, Shard: 2, SeqNo: 2, RootHash: bytes.Repeat([]byte{0x02}, 32), FileHash: bytes.Repeat([]byte{0x12}, 32)},
-		{Workchain: 0, Shard: 3, SeqNo: 3, RootHash: bytes.Repeat([]byte{0x03}, 32), FileHash: bytes.Repeat([]byte{0x13}, 32)},
-	}
-
-	live.mu.Lock()
-	for i, block := range blocks {
-		key := storage.BlockKey(block)
-		live.putNonfinalPendingLocked(key, liveNonfinalPending{block: block})
-		if idx := live.nonfinalOrderIndexLocked(key); idx != i {
-			t.Fatalf("pending index for %d = %d, want %d", i, idx, i)
-		}
-	}
-
-	live.deleteNonfinalPendingLocked(storage.BlockKey(blocks[1]))
-	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); idx != 1 {
-		t.Fatalf("tail pending index after middle delete = %d, want 1", idx)
-	}
-	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[1])); idx != -1 {
-		t.Fatalf("deleted pending index = %d, want -1", idx)
-	}
-
-	live.deleteNonfinalPendingLocked(storage.BlockKey(blocks[0]))
-	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); idx != 0 {
-		t.Fatalf("tail pending index after head delete = %d, want 0", idx)
-	}
-	live.mu.Unlock()
 }
 
 func TestHandleNonfinalPendingShardBlocksEnabled(t *testing.T) {
@@ -794,7 +690,7 @@ func testNonfinalStoreStateCellRecords(t *testing.T, store *fakeLazyCellStore, r
 	t.Helper()
 
 	if err := records.ForEach(func(record storage.EncodedCellRecord) error {
-		loaded, err := nonfinalLazyCellRecord(record.Hash, record.Data, store.LazyCellLoader())
+		loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(record.Hash[:], record.Data), store.LazyCellLoader())
 		if err != nil {
 			return err
 		}

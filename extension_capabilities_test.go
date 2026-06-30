@@ -1,9 +1,9 @@
 package gton
 
 import (
-	"github.com/xssnick/gton/api/liteserver"
 	"github.com/xssnick/gton/service/hooks"
+	"github.com/xssnick/gton/service/liveview"
 )
 
 var _ hooks.Network = extensionNetwork{}
-var _ hooks.Store = (*liteserver.LiveStore)(nil)
+var _ hooks.Store = (*liveview.Store)(nil)

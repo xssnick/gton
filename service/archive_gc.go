@@ -19,6 +19,12 @@ func (s *Service) runArchiveGCOnce(ctx context.Context) (bool, error) {
 	if s.archiveTTL <= 0 {
 		return false, nil
 	}
+	if s.syncUntilFrozen() {
+		s.log.Debug().
+			Uint32("sync_until", s.syncUntil).
+			Msg("skipping archive ttl gc after sync_until")
+		return false, nil
+	}
 
 	store := s.storage
 

@@ -1,4 +1,4 @@
-package liteserver
+package liveview
 
 import (
 	"context"
@@ -23,14 +23,14 @@ const (
 	liveShardHashesProofCacheLimit    = 64
 )
 
-type liveBlockFragments struct {
+type BlockView struct {
 	mu sync.Mutex
 
 	block               ton.BlockIDExt
 	stateRoot           *cell.Cell
 	blockStateRootProof *cell.Cell
 	accountsRoot        *cell.Cell
-	shardHeader         runMethodShardHeader
+	shardHeader         RunMethodShardHeader
 
 	masterExtra        *tlb.McStateExtra
 	accountProofs      map[accountProofKey]accountProofValue
@@ -38,7 +38,7 @@ type liveBlockFragments struct {
 	baseConfig         *runMethodBaseConfig
 	globalLibs         *cell.Dictionary
 	librariesLoaded    bool
-	extMsgLimits       externalMessageSizeLimits
+	extMsgLimits       ExternalMessageSizeLimits
 	extMsgLimitsLoaded bool
 	lazyLoad           liveLoadGroup[liveBlockFragmentLoadKey]
 }
@@ -84,7 +84,7 @@ type liveBlockFragmentLoadKey struct {
 	pruned  bool
 }
 
-func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*liveBlockFragments, error) {
+func buildBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
 	blockProof, err := blockStateRootProof(blockRoot)
 	if err != nil {
 		return nil, fmt.Errorf("build block state root proof: %w", err)
@@ -108,7 +108,7 @@ func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRo
 		return nil, fmt.Errorf("load shard state header: %w", err)
 	}
 
-	return &liveBlockFragments{
+	return &BlockView{
 		block:               *cloneBlockID(block),
 		stateRoot:           stateRoot,
 		blockStateRootProof: blockProof,
@@ -117,7 +117,11 @@ func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRo
 	}, nil
 }
 
-func (f *liveBlockFragments) prewarmForLiteServer() {
+func NewBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
+	return buildBlockView(block, blockRoot, stateRoot)
+}
+
+func (f *BlockView) prewarmHotPath() {
 	if f.block.Workchain != masterchainID {
 		return
 	}
@@ -128,11 +132,55 @@ func (f *liveBlockFragments) prewarmForLiteServer() {
 	_, _ = f.globalLibraries()
 }
 
-func (f *liveBlockFragments) accountCell(accountID []byte) (*cell.Cell, error) {
+func (f *BlockView) Block() ton.BlockIDExt {
+	return *cloneBlockID(f.block)
+}
+
+func (f *BlockView) StateRoot() *cell.Cell {
+	return f.stateRoot
+}
+
+func (f *BlockView) BlockStateRootProof() *cell.Cell {
+	return f.blockStateRootProof
+}
+
+func (f *BlockView) Header() RunMethodShardHeader {
+	return f.shardHeader
+}
+
+func (f *BlockView) AccountCell(accountID []byte) (*cell.Cell, error) {
+	return f.accountCell(accountID)
+}
+
+func (f *BlockView) AccountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
+	return f.accountProof(accountID, pruned)
+}
+
+func (f *BlockView) McStateExtra() (*tlb.McStateExtra, error) {
+	return f.mcStateExtra()
+}
+
+func (f *BlockView) ShardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
+	return f.shardHashesProof(workchain, shard, exact)
+}
+
+func (f *BlockView) RunMethodConfig(now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
+	return f.runMethodConfig(now, code)
+}
+
+func (f *BlockView) RunMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Cell, error) {
+	return f.runMethodLibraries(accountLibs)
+}
+
+func (f *BlockView) GlobalLibraries() (*cell.Dictionary, error) {
+	return f.globalLibraries()
+}
+
+func (f *BlockView) accountCell(accountID []byte) (*cell.Cell, error) {
 	return accountCellFromAccountsRoot(f.accountsRoot, accountID)
 }
 
-func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
+func (f *BlockView) accountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
 	var key accountProofKey
 	if len(accountID) == len(key.accountID) {
 		copy(key.accountID[:], accountID)
@@ -153,7 +201,7 @@ func (f *liveBlockFragments) accountProof(accountID []byte, pruned bool) ([]*cel
 	return f.buildAccountProof(accountID, pruned)
 }
 
-func (f *liveBlockFragments) accountFullProof(accountID []byte, key accountProofKey) ([]*cell.Cell, *cell.Cell, error) {
+func (f *BlockView) accountFullProof(accountID []byte, key accountProofKey) ([]*cell.Cell, *cell.Cell, error) {
 	f.mu.Lock()
 	if result, ok := f.cachedAccountProofResultLocked(key, false); ok {
 		f.mu.Unlock()
@@ -188,7 +236,7 @@ func (f *liveBlockFragments) accountFullProof(accountID []byte, key accountProof
 	return result.proof, result.state, nil
 }
 
-func (f *liveBlockFragments) accountPrunedState(key accountProofKey, proof []*cell.Cell, fullState *cell.Cell) (*cell.Cell, error) {
+func (f *BlockView) accountPrunedState(key accountProofKey, proof []*cell.Cell, fullState *cell.Cell) (*cell.Cell, error) {
 	f.mu.Lock()
 	if result, ok := f.cachedAccountProofResultLocked(key, true); ok {
 		f.mu.Unlock()
@@ -226,7 +274,7 @@ func (f *liveBlockFragments) accountPrunedState(key accountProofKey, proof []*ce
 	return result.state, nil
 }
 
-func (f *liveBlockFragments) cachedAccountProofResultLocked(key accountProofKey, pruned bool) (accountProofResult, bool) {
+func (f *BlockView) cachedAccountProofResultLocked(key accountProofKey, pruned bool) (accountProofResult, bool) {
 	cached, ok := f.accountProofs[key]
 	if !ok || cached.proof == nil {
 		return accountProofResult{}, false
@@ -243,7 +291,7 @@ func (f *liveBlockFragments) cachedAccountProofResultLocked(key accountProofKey,
 	return accountProofResult{proof: cached.proof, state: cached.fullState}, true
 }
 
-func (f *liveBlockFragments) rememberAccountProofState(key accountProofKey, proof []*cell.Cell, state *cell.Cell, pruned bool) accountProofResult {
+func (f *BlockView) rememberAccountProofState(key accountProofKey, proof []*cell.Cell, state *cell.Cell, pruned bool) accountProofResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -280,7 +328,7 @@ func (f *liveBlockFragments) rememberAccountProofState(key accountProofKey, proo
 	return accountProofResult{proof: cached.proof, state: state}
 }
 
-func (f *liveBlockFragments) buildAccountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
+func (f *BlockView) buildAccountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
 	stateProof, state, err := accountStateProofAndCell(f.stateRoot, accountID)
 	if err != nil {
 		return nil, nil, err
@@ -297,7 +345,7 @@ func (f *liveBlockFragments) buildAccountProof(accountID []byte, pruned bool) ([
 	return []*cell.Cell{f.blockStateRootProof, stateProof}, state, nil
 }
 
-func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {
+func (f *BlockView) mcStateExtra() (*tlb.McStateExtra, error) {
 	f.mu.Lock()
 	if f.masterExtra != nil {
 		extra := f.masterExtra
@@ -343,7 +391,7 @@ func (f *liveBlockFragments) mcStateExtra() (*tlb.McStateExtra, error) {
 	return extra, nil
 }
 
-func (f *liveBlockFragments) shardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
+func (f *BlockView) shardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
 	key := shardHashesProofKey{workchain: workchain, shard: shard, exact: exact}
 
 	f.mu.Lock()
@@ -395,15 +443,15 @@ func (f *liveBlockFragments) shardHashesProof(workchain int32, shard int64, exac
 	return proof, nil
 }
 
-func (f *liveBlockFragments) runMethodConfig(now uint32, code *cell.Cell) (runMethodConfigInfo, error) {
+func (f *BlockView) runMethodConfig(now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
 	base, err := f.runMethodBaseConfig()
 	if err != nil {
-		return runMethodConfigInfo{}, err
+		return RunMethodConfigInfo{}, err
 	}
 	return runMethodConfigFromBase(base, now, code)
 }
 
-func (f *liveBlockFragments) runMethodBaseConfig() (*runMethodBaseConfig, error) {
+func (f *BlockView) runMethodBaseConfig() (*runMethodBaseConfig, error) {
 	f.mu.Lock()
 	if f.baseConfig != nil {
 		config := f.baseConfig
@@ -450,7 +498,7 @@ func (f *liveBlockFragments) runMethodBaseConfig() (*runMethodBaseConfig, error)
 	return config, nil
 }
 
-func (f *liveBlockFragments) runMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Cell, error) {
+func (f *BlockView) runMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Cell, error) {
 	globalLibs, err := f.globalLibraries()
 	if err != nil {
 		return nil, err
@@ -458,7 +506,7 @@ func (f *liveBlockFragments) runMethodLibraries(accountLibs *cell.Dictionary) ([
 	return runMethodLibrariesFromGlobal(globalLibs, accountLibs), nil
 }
 
-func (f *liveBlockFragments) globalLibraries() (*cell.Dictionary, error) {
+func (f *BlockView) globalLibraries() (*cell.Dictionary, error) {
 	f.mu.Lock()
 	if f.librariesLoaded {
 		globalLibs := f.globalLibs

@@ -204,12 +204,13 @@ func formatStatusWithNow(snapshot service2.StatusSnapshot, showPeers bool, now t
 				fmt.Fprintf(&b, "    no active neighbours\n")
 				continue
 			}
-			fmt.Fprintf(&b, "    %-5s %-12s %6s %8s  %s\n", "alive", "last ok", "fail", "score", "addr")
+			fmt.Fprintf(&b, "    %-5s %-12s %-12s %6s %8s  %s\n", "alive", "last rx", "last ok", "fail", "score", "addr")
 			for _, peer := range overlay.Neighbours {
 				fmt.Fprintf(
 					&b,
-					"    %-5s %-12s %6d %8.1f  %s\n",
+					"    %-5s %-12s %-12s %6d %8.1f  %s\n",
 					formatBool(peer.Alive),
+					formatSince(peer.LastReceiveAt),
 					formatSince(peer.LastSuccessAt),
 					peer.FailedQueries,
 					peer.Unreliability,

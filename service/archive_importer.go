@@ -67,6 +67,7 @@ type archiveCatchUpRunner struct {
 	checkpointDone                 chan archiveCheckpointResult
 	checkpointStates               appliedStateSet
 	stateCells                     *archiveStateCellOverlay
+	syncUntilReached               bool
 }
 
 func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *storage.CurrentState, target ton.BlockIDExt) (*storage.CurrentState, error) {
@@ -95,7 +96,7 @@ func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *s
 		lastCheckpoint:         started,
 		lastCheckpointSeqno:    current.ShardClientSeqno,
 		checkpointBlocksTarget: s.archiveCatchUpCheckpointBlocks,
-		stateCells:             newArchiveStateCellOverlay(s.stateCellLoader()),
+		stateCells:             newArchiveStateCellOverlay(s.stateCellLoader(), &s.lazyCellLoads),
 	}
 	runner.startRemainingLagSeconds, runner.hasStartRemainingLag = runner.archiveRemainingLagSeconds()
 
@@ -142,6 +143,10 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			return nil, fmt.Errorf("archive pipeline returned window #%d after current seqno %d", window.startSeqno, r.current.ShardClientSeqno)
 		}
 		if len(window.masterStates) == 0 {
+			if r.syncUntilReached {
+				s.enterSyncUntilOffline(r.current, PreparedBlock{})
+				break
+			}
 			return nil, fmt.Errorf("archive window #%d did not provide next masterchain blocks", window.startSeqno)
 		}
 
@@ -176,6 +181,10 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			Msg("archive shard-client window applied")
 
 		if next.ShardClientSeqno <= before {
+			if r.syncUntilReached {
+				s.enterSyncUntilOffline(r.current, PreparedBlock{})
+				break
+			}
 			return nil, fmt.Errorf("archive window #%d did not advance shard client seqno %d", window.startSeqno, before)
 		}
 		r.current = next
@@ -188,6 +197,15 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 
 		if _, err = r.finishCheckpoint(false); err != nil {
 			return nil, err
+		}
+		if r.syncUntilReached {
+			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
+				if _, err = r.persistCheckpoint("sync_until"); err != nil {
+					return nil, err
+				}
+			}
+			s.enterSyncUntilOffline(r.current, PreparedBlock{})
+			break
 		}
 		if s.cellGenerationSwitchRequestActive() {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {

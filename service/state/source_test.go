@@ -20,7 +20,7 @@ func TestChoosePersistentKeyBlockSkipsFreshAndNonPersistent(t *testing.T) {
 		{block: ton.BlockIDExt{SeqNo: 20}, utime: persistent},
 		{block: ton.BlockIDExt{SeqNo: 30}, utime: nonPersistent},
 		{block: ton.BlockIDExt{SeqNo: 40}, utime: freshPersistent},
-	}, now, DefaultSyncBefore)
+	}, now, DefaultSyncBefore, 0)
 	if !ok {
 		t.Fatal("expected persistent key block")
 	}
@@ -40,7 +40,7 @@ func TestChoosePersistentKeyBlockUsesSyncBefore(t *testing.T) {
 		{block: ton.BlockIDExt{SeqNo: 20}, utime: recentPersistent},
 	}
 
-	got, ok := choosePersistentKeyBlock(candidates, now, time.Hour)
+	got, ok := choosePersistentKeyBlock(candidates, now, time.Hour, 0)
 	if !ok {
 		t.Fatal("expected fallback persistent key block")
 	}
@@ -48,7 +48,7 @@ func TestChoosePersistentKeyBlockUsesSyncBefore(t *testing.T) {
 		t.Fatalf("unexpected default sync_before key block seqno %d", got.SeqNo)
 	}
 
-	got, ok = choosePersistentKeyBlock(candidates, now, 10*time.Minute)
+	got, ok = choosePersistentKeyBlock(candidates, now, 10*time.Minute, 0)
 	if !ok {
 		t.Fatal("expected recent persistent key block")
 	}
@@ -66,8 +66,28 @@ func TestChoosePersistentKeyBlockDoesNotUseResumedAnchorAsBoundary(t *testing.T)
 	_, ok := choosePersistentKeyBlock([]keyBlockCandidate{
 		{block: ton.BlockIDExt{SeqNo: 10}, utime: resumedAnchor},
 		{block: ton.BlockIDExt{SeqNo: 20}, utime: nonPersistent},
-	}, now, time.Hour)
+	}, now, time.Hour, 0)
 	if ok {
 		t.Fatal("resumed anchor without previous key block must not be selected as persistent boundary")
+	}
+}
+
+func TestChoosePersistentKeyBlockUsesSyncUntil(t *testing.T) {
+	now := time.Unix(13_500_000, 0)
+	bucket := uint32(1 << 17)
+	prev := uint32(99 * bucket)
+	first := uint32(100*bucket + 1000)
+	second := uint32(101*bucket + 1000)
+
+	got, ok := choosePersistentKeyBlock([]keyBlockCandidate{
+		{block: ton.BlockIDExt{SeqNo: 10}, utime: prev},
+		{block: ton.BlockIDExt{SeqNo: 20}, utime: first},
+		{block: ton.BlockIDExt{SeqNo: 30}, utime: second},
+	}, now, DefaultSyncBefore, first)
+	if !ok {
+		t.Fatal("expected persistent key block before sync_until")
+	}
+	if got.SeqNo != 20 {
+		t.Fatalf("unexpected key block seqno %d", got.SeqNo)
 	}
 }

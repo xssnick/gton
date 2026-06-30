@@ -19,6 +19,14 @@ type testBlockReceivedExtension struct {
 	events []hooks.BlockReceivedEvent
 }
 
+func (e *testBlockReceivedExtension) Start(context.Context) error {
+	return nil
+}
+
+func (e *testBlockReceivedExtension) Close(context.Context) error {
+	return nil
+}
+
 func (e *testBlockReceivedExtension) OnBlockApplied(context.Context, hooks.BlockAppliedEvent) error {
 	return nil
 }

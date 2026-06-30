@@ -126,7 +126,7 @@ func (s *Server) lookupBlockForProof(ctx context.Context, query ton.LookupBlockW
 
 	switch selector {
 	case 1:
-		return s.store.LookupBlockBySeqNo(ctx, key, uint32(query.ID.Seqno))
+		return s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: uint32(query.ID.Seqno)})
 	case 2:
 		return s.store.LookupBlockByLT(ctx, key, query.LT)
 	default:
@@ -167,12 +167,12 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 		return nil, nil, err
 	}
 
-	mcBlock, err := oldMasterBlockStateProof(fragments.stateRoot, proved)
+	mcBlock, err := oldMasterBlockStateProof(fragments.StateRoot(), proved)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return fragments.blockStateRootProof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), mcBlock.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
+	return fragments.BlockStateRootProof().ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), mcBlock.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
 func oldMasterBlockIDFromInfo(info *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
@@ -311,7 +311,7 @@ func (s *Server) masterRefForBlock(ctx context.Context, id ton.BlockIDExt) (ton.
 		return ton.BlockIDExt{}, fmt.Errorf("%w: block doesn't have masterchain ref", storage.ErrNotFound)
 	}
 
-	resolved, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+	resolved, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: masterchainID, Shard: masterchainShard, SeqNo: meta.MasterchainRefSeqno})
 	if err != nil {
 		return ton.BlockIDExt{}, fmt.Errorf("lookup masterchain ref #%d: %w", meta.MasterchainRefSeqno, err)
 	}

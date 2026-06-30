@@ -10,13 +10,13 @@ import (
 )
 
 func TestParseLevelOverrides(t *testing.T) {
-	overrides, err := ParseLevelOverrides("liteserver=debug, p2p=warn, pebblestore=error")
+	overrides, err := ParseLevelOverrides("api=debug, p2p=warn, pebblestore=error")
 	if err != nil {
 		t.Fatalf("parse overrides: %v", err)
 	}
 
-	if overrides["liteserver"] != zerolog.DebugLevel {
-		t.Fatalf("liteserver level = %s, want debug", overrides["liteserver"])
+	if overrides["api"] != zerolog.DebugLevel {
+		t.Fatalf("api level = %s, want debug", overrides["api"])
 	}
 	if overrides["p2p"] != zerolog.WarnLevel {
 		t.Fatalf("p2p level = %s, want warn", overrides["p2p"])
@@ -27,13 +27,13 @@ func TestParseLevelOverrides(t *testing.T) {
 }
 
 func TestParseLevelOverridesRejectsInvalidInput(t *testing.T) {
-	if _, err := ParseLevelOverrides("liteserver"); err == nil {
+	if _, err := ParseLevelOverrides("api"); err == nil {
 		t.Fatal("expected missing level separator error")
 	}
 	if _, err := ParseLevelOverrides("=debug"); err == nil {
 		t.Fatal("expected empty category error")
 	}
-	if _, err := ParseLevelOverrides("liteserver=nope"); err == nil {
+	if _, err := ParseLevelOverrides("api=nope"); err == nil {
 		t.Fatal("expected invalid level error")
 	}
 }
@@ -43,15 +43,15 @@ func TestFactoryAppliesCategoryOverride(t *testing.T) {
 	factory := NewFactory(&out, Config{
 		Level: zerolog.InfoLevel,
 		Overrides: map[string]zerolog.Level{
-			"liteserver": zerolog.DebugLevel,
-			"p2p":        zerolog.WarnLevel,
+			"api": zerolog.DebugLevel,
+			"p2p": zerolog.WarnLevel,
 		},
 		JSON: true,
 	})
 
-	liteserver := factory.Category("liteserver")
-	if !liteserver.Debug().Enabled() {
-		t.Fatal("liteserver debug should be enabled")
+	api := factory.Category("api")
+	if !api.Debug().Enabled() {
+		t.Fatal("api debug should be enabled")
 	}
 	p2p := factory.Category("p2p")
 	if p2p.Info().Enabled() {
@@ -126,10 +126,10 @@ func TestFactoryBaseLoggerFiltersOverridesByComponent(t *testing.T) {
 
 func TestFormatLevelOverridesIsStable(t *testing.T) {
 	got := FormatLevelOverrides(map[string]zerolog.Level{
-		"p2p":        zerolog.WarnLevel,
-		"liteserver": zerolog.DebugLevel,
+		"p2p": zerolog.WarnLevel,
+		"api": zerolog.DebugLevel,
 	})
-	want := "liteserver=debug,p2p=warn"
+	want := "api=debug,p2p=warn"
 	if got != want {
 		t.Fatalf("formatted overrides = %q, want %q", got, want)
 	}

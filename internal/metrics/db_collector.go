@@ -2,9 +2,11 @@ package metrics
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"time"
 
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,6 +33,7 @@ type dbCollector struct {
 	ingests                   *prometheus.Desc
 	readCells                 *prometheus.Desc
 	writtenCells              *prometheus.Desc
+	lazyCellLoads             *prometheus.Desc
 }
 
 func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
@@ -146,6 +149,12 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 			shardLabels,
 			nil,
 		),
+		lazyCellLoads: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "lazy_cell_loads_total"),
+			"Successful lazy state cell loads by serving layer.",
+			[]string{"layer"},
+			nil,
+		),
 	}
 }
 
@@ -168,6 +177,7 @@ func (c *dbCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ingests
 	ch <- c.readCells
 	ch <- c.writtenCells
+	ch <- c.lazyCellLoads
 }
 
 func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
@@ -181,8 +191,37 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.available, prometheus.GaugeValue, 1)
+	c.collectLazyCellLoads(ch, status.LazyCellLoads)
 	for _, generation := range status.CellGenerations {
 		c.collectGeneration(ch, generation)
+	}
+}
+
+func (c *dbCollector) collectLazyCellLoads(ch chan<- prometheus.Metric, dbLoads []storage.LazyCellLoadMetric) {
+	counts := map[string]uint64{
+		storage.LazyCellLoadLayerStateWindow:  0,
+		storage.LazyCellLoadLayerDecodedCache: 0,
+		storage.LazyCellLoadLayerPebble:       0,
+	}
+	for _, metric := range c.metrics.lazyCellLoads() {
+		if metric.Layer != "" {
+			counts[metric.Layer] += metric.Count
+		}
+	}
+	for _, metric := range dbLoads {
+		if metric.Layer != "" {
+			counts[metric.Layer] += metric.Count
+		}
+	}
+
+	layers := make([]string, 0, len(counts))
+	for layer := range counts {
+		layers = append(layers, layer)
+	}
+	sort.Strings(layers)
+
+	for _, layer := range layers {
+		ch <- prometheus.MustNewConstMetric(c.lazyCellLoads, prometheus.CounterValue, float64(counts[layer]), layer)
 	}
 }
 

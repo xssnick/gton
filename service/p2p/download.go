@@ -55,6 +55,9 @@ type CompressedBlockStateProvider interface {
 }
 
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+	if n.IsOffline() {
+		return nil, ErrOffline
+	}
 	return n.blockFullFromLocalOrOverlay(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
 		return n.blockFullFromOverlayOrShardBroadcast(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
 			return n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
@@ -63,6 +66,9 @@ func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*Do
 }
 
 func (n *Node) ProbeBlockFull(ctx context.Context, block ton.BlockIDExt, opts ProbeBlockFullOptions) (*DownloadedBlock, error) {
+	if n.IsOffline() {
+		return nil, ErrOffline
+	}
 	return n.blockFullFromLocalOrOverlay(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
 		return n.blockFullFromOverlayOrShardBroadcast(ctx, block, func(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
 			return n.probeBlockFromOverlay(ctx, block, opts)
@@ -158,10 +164,16 @@ func (n *Node) cachedLocalBlockFull(ctx context.Context, block ton.BlockIDExt) (
 }
 
 func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	return n.prefetchShardBlockFull(ctx, block, "")
 }
 
 func (n *Node) PrefetchShardBlockFullFromBroadcastHint(ctx context.Context, block ton.BlockIDExt) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	return n.prefetchShardBlockFull(ctx, block, shardDescriptionBroadcastKind)
 }
 
@@ -243,6 +255,9 @@ func (n *Node) prefetchShardBlockFullFromOverlayOrBroadcast(ctx context.Context,
 }
 
 func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
+	if n.IsOffline() {
+		return nil, ErrOffline
+	}
 	if cached, err := n.masterchainNextBroadcastBlock(prev); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
@@ -271,6 +286,9 @@ func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (
 }
 
 func (n *Node) ProbeNextBlockFull(ctx context.Context, prev ton.BlockIDExt, opts ProbeNextBlockFullOptions) (*DownloadedBlock, error) {
+	if n.IsOffline() {
+		return nil, ErrOffline
+	}
 	if cached, err := n.masterchainNextBroadcastBlock(prev); err == nil {
 		return cached, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
@@ -306,6 +324,9 @@ func (n *Node) ProbeNextBlockFull(ctx context.Context, prev ton.BlockIDExt, opts
 }
 
 func (n *Node) NextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (ton.BlockIDExt, error) {
+	if n.IsOffline() {
+		return ton.BlockIDExt{}, ErrOffline
+	}
 	if cached, err := n.masterchainNextBroadcastBlock(prev); err == nil {
 		return cached.ID, nil
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
@@ -1482,7 +1503,10 @@ func (n *Node) stateForCompressedBlockDecompressionPrev(ctx context.Context, pre
 		if stateErr != nil {
 			return nil, stateErr
 		}
-		meta = tnstore.BuildBlockMetaFromState(*state)
+		meta, err = tnstore.BuildBlockMetaFromState(*state)
+		if err != nil {
+			return nil, err
+		}
 	} else if err != nil {
 		return nil, err
 	}
@@ -1614,7 +1638,7 @@ func newVerifiedDownloadedBlockWithProofShape(kind string, id ton.BlockIDExt, pr
 	if parsed.StateUpdate == nil {
 		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
 	}
-	if err = cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
+	if err := cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
 		return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
 	}
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)

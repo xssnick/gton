@@ -402,7 +402,7 @@ func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
 	if snapshot.TPS <= 0 {
 		t.Fatalf("tps = %f, want positive", snapshot.TPS)
 	}
-	if _, err := store.LookupBlockBySeqNo(context.Background(), tnstore.BlockHistoryKey{Workchain: -1, Shard: topShard}, block.SeqNo); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err := store.LookupBlockBySeqNo(context.Background(), tnstore.BlockSeqRefFromBlock(block)); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("pebble seqno lookup error = %v, want ErrNotFound", err)
 	}
 }

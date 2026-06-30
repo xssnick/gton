@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/xssnick/gton/api/liteserver"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/blocksync"
+	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/state"
@@ -85,7 +85,7 @@ type shardStateDownload struct {
 	prev            ton.BlockIDExt
 	block           PreparedBlock
 	err             error
-	source          string
+	source          SyncBlockSource
 	downloadElapsed time.Duration
 	prepareElapsed  time.Duration
 }
@@ -141,7 +141,7 @@ type Service struct {
 	liveStateUsesBlockCache bool
 	sync                    SyncObserver
 	applyHooks              *blockApplyHookRunner
-	externalMessageChecker  *liteserver.ExternalMessageChecker
+	externalMessageChecker  *externalmsg.Checker
 	externalMessageHooks    *externalMessageHookRunner
 	blockReceivedHooks      *blockReceivedHookRunner
 
@@ -193,12 +193,14 @@ type Service struct {
 	stateCellLoaderMu                  sync.RWMutex
 	stateCellLoaders                   map[uint64]cell.LazyCellLoader
 	stateCellLoaderSnapshot            atomic.Value
+	lazyCellLoads                      lazyCellLoadCounters
 	nextStateCellLoaderID              uint64
 	stateSerializer                    *stateSerializer
 	maintenanceWake                    chan struct{}
 	stateTTL                           time.Duration
 	archiveTTL                         time.Duration
 	archiveFromZero                    bool
+	syncUntil                          uint32
 	syncDiskSpacePath                  string
 	minSyncDiskFreeBytes               uint64
 	minStateSerializationDiskFreeBytes uint64
@@ -235,6 +237,7 @@ type Options struct {
 	StateTTL                                time.Duration
 	ArchiveTTL                              time.Duration
 	ArchiveFromZero                         bool
+	SyncUntil                               uint32
 	StorageDir                              string
 	MinSyncDiskFreeBytes                    uint64
 	MinStateSerializationDiskFreeBytes      uint64
@@ -243,7 +246,7 @@ type Options struct {
 	StateSerializeOnePass                   bool
 	SyncObserver                            SyncObserver
 	Extension                               hooks.Extension
-	ExternalMessageChecker                  *liteserver.ExternalMessageChecker
+	ExternalMessageChecker                  *externalmsg.Checker
 }
 
 type CurrentStatePublisher interface {
@@ -265,12 +268,42 @@ type SyncObserver interface {
 	ObserveSyncPersist(SyncPersistObservation)
 }
 
+type SyncBlockSource string
+
+const (
+	SyncBlockSourceUnknown            SyncBlockSource = "unknown"
+	SyncBlockSourceBroadcast          SyncBlockSource = "broadcast"
+	SyncBlockSourceBroadcastQueue     SyncBlockSource = "broadcast_queue"
+	SyncBlockSourceBroadcastCandidate SyncBlockSource = "broadcast_candidate"
+	SyncBlockSourceBroadcastCache     SyncBlockSource = "broadcast_cache"
+	SyncBlockSourceBroadcastHint      SyncBlockSource = "broadcast_hint"
+	SyncBlockSourceQueue              SyncBlockSource = "queue"
+	SyncBlockSourcePeerProbe          SyncBlockSource = "peer_probe"
+	SyncBlockSourceNextBlock          SyncBlockSource = "next_block"
+	SyncBlockSourceIndexed            SyncBlockSource = "indexed"
+	SyncBlockSourceNextDescription    SyncBlockSource = "next_description"
+	SyncBlockSourcePeerCatchUp        SyncBlockSource = "peer_catch_up"
+	SyncBlockSourceCatchUp            SyncBlockSource = "catch_up"
+	SyncBlockSourceProbe              SyncBlockSource = "probe"
+	SyncBlockSourceStored             SyncBlockSource = "stored"
+)
+
+type SyncBlockOrigin string
+
+const (
+	SyncBlockOriginUnknown   SyncBlockOrigin = "unknown"
+	SyncBlockOriginBroadcast SyncBlockOrigin = "broadcast"
+	SyncBlockOriginDownload  SyncBlockOrigin = "download"
+	SyncBlockOriginStored    SyncBlockOrigin = "stored"
+	SyncBlockOriginOther     SyncBlockOrigin = "other"
+)
+
 type SyncBlockObservation struct {
 	Pipeline         string
 	Chain            string
 	Shard            string
-	Source           string
-	Origin           string
+	Source           SyncBlockSource
+	Origin           SyncBlockOrigin
 	Result           string
 	CatchUp          bool
 	DownloadDuration time.Duration
@@ -314,10 +347,10 @@ func (s *Service) observeSyncBlock(observation SyncBlockObservation) {
 		observation.Shard = "unknown"
 	}
 	if observation.Source == "" {
-		observation.Source = "unknown"
+		observation.Source = SyncBlockSourceUnknown
 	}
 	if observation.Origin == "" {
-		observation.Origin = syncBlockOriginForSource(observation.Source)
+		observation.Origin = SyncBlockOriginUnknown
 	}
 	if observation.Result == "" {
 		observation.Result = "unknown"
@@ -341,37 +374,48 @@ func (s *Service) observeSyncObtain(observation SyncObtainObservation) {
 	s.sync.ObserveSyncObtain(observation)
 }
 
-func syncBlockOriginForSource(source string) string {
+func syncBlockOriginForSource(source SyncBlockSource) SyncBlockOrigin {
 	switch source {
-	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "broadcast_hint", "queue":
-		return "broadcast"
-	case "peer_probe", "next_block", "indexed", "next_description", "peer_catch_up", "catch_up", "probe":
-		return "download"
-	case "stored":
-		return "stored"
+	case SyncBlockSourceBroadcast, SyncBlockSourceBroadcastQueue, SyncBlockSourceBroadcastCandidate, SyncBlockSourceBroadcastCache, SyncBlockSourceBroadcastHint, SyncBlockSourceQueue:
+		return SyncBlockOriginBroadcast
+	case SyncBlockSourcePeerProbe, SyncBlockSourceNextBlock, SyncBlockSourceIndexed, SyncBlockSourceNextDescription, SyncBlockSourcePeerCatchUp, SyncBlockSourceCatchUp, SyncBlockSourceProbe:
+		return SyncBlockOriginDownload
+	case SyncBlockSourceStored:
+		return SyncBlockOriginStored
 	case "":
-		return "unknown"
+		return SyncBlockOriginUnknown
 	default:
-		return "other"
+		return SyncBlockOriginOther
 	}
 }
 
-func syncBlockSourceForDownloadedBlock(defaultSource string, downloaded p2p.DownloadedBlock) string {
+func syncBlockSourceForDownloadedBlock(defaultSource SyncBlockSource, downloaded p2p.DownloadedBlock) SyncBlockSource {
 	return syncBlockSourceForKind(defaultSource, downloaded.Kind)
 }
 
-func syncBlockSourceForVerifiedBlock(defaultSource string, block VerifiedBlock) string {
+func syncBlockSourceForVerifiedBlock(defaultSource SyncBlockSource, block VerifiedBlock) SyncBlockSource {
 	return syncBlockSourceForKind(defaultSource, block.Kind)
 }
 
-func syncBlockSourceForKind(defaultSource string, kind string) string {
+func syncBlockOriginForKind(kind string) SyncBlockOrigin {
+	switch kind {
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2", "tonNode.newShardBlockBroadcast":
+		return SyncBlockOriginBroadcast
+	case "local full block cache", "local next block cache", "stored block":
+		return SyncBlockOriginStored
+	default:
+		return SyncBlockOriginDownload
+	}
+}
+
+func syncBlockSourceForKind(defaultSource SyncBlockSource, kind string) SyncBlockSource {
 	switch kind {
 	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
-		return "broadcast_cache"
+		return SyncBlockSourceBroadcastCache
 	case "tonNode.newShardBlockBroadcast":
-		return "broadcast_hint"
+		return SyncBlockSourceBroadcastHint
 	case "local full block cache", "local next block cache", "stored block":
-		return "stored"
+		return SyncBlockSourceStored
 	default:
 		return defaultSource
 	}
@@ -533,20 +577,13 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		stateTTL:                           opts.StateTTL,
 		archiveTTL:                         opts.ArchiveTTL,
 		archiveFromZero:                    opts.ArchiveFromZero,
+		syncUntil:                          opts.SyncUntil,
 		syncDiskSpacePath:                  opts.StorageDir,
 		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
 	}
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization, opts.PersistentStateLargeBOCBatchSize, opts.StateSerializeOnePass)
 	return svc
-}
-
-func (s *Service) nextStateCellPrewriter() *stateCellPrewriter {
-	if s.stateCellPrewrite == nil {
-		return nil
-	}
-	s.stateCellPrewrite.start(s.currentStatePersistContext(), s.runAsync)
-	return s.stateCellPrewrite
 }
 
 func (s *Service) nextCheckpointBlocks() uint32 {
@@ -593,6 +630,9 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
+		if s.stateCellPrewrite != nil {
+			s.stateCellPrewrite.start(ctx, s.currentStatePersistContext(), s.runAsync)
+		}
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
 		})
@@ -849,6 +889,12 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 				s.node.SetRebroadcastQuiet(false)
 				quiet = false
 			}
+			if s.syncUntilFrozen() {
+				s.log.Info().
+					Uint32("sync_until", s.syncUntil).
+					Msg("current state sync stopped after sync_until")
+				return
+			}
 			if !s.waitCurrentStatePoll(ctx, currentStateLivePollDelay) {
 				return
 			}
@@ -907,6 +953,10 @@ func (s *Service) runBlockProcessor(ctx context.Context) {
 			if !ok {
 				return
 			}
+			if s.syncUntilFrozen() {
+				synced.Reject()
+				continue
+			}
 			targetJobs := jobs
 			if isHotMasterchainSyncedBlock(synced) {
 				targetJobs = masterHotJobs
@@ -937,6 +987,10 @@ func (s *Service) runBlockProcessorWorker(ctx context.Context, priorityJobs, job
 		synced, ok := nextSyncedBlockProcessorJob(ctx, priorityJobs, jobs)
 		if !ok {
 			return
+		}
+		if s.syncUntilFrozen() {
+			synced.Reject()
+			continue
 		}
 
 		if err := s.processSyncedBlock(ctx, synced); err != nil {
@@ -986,15 +1040,16 @@ func nextSyncedBlockProcessorJob(ctx context.Context, priorityJobs, jobs <-chan 
 }
 
 func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.SyncedBlock) (err error) {
-	source := "broadcast"
+	source := SyncBlockSourceBroadcast
 	if synced.CatchUp {
-		source = "peer_catch_up"
+		source = SyncBlockSourcePeerCatchUp
 	}
 	observation := SyncBlockObservation{
 		Pipeline:         "blocksync",
 		Chain:            syncChainLabel(synced.Downloaded.ID),
 		Shard:            syncShardLabel(synced.Downloaded.ID),
 		Source:           source,
+		Origin:           syncBlockOriginForSource(source),
 		Result:           "success",
 		CatchUp:          synced.CatchUp,
 		DownloadDuration: synced.DownloadElapsed,

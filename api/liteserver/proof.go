@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"sort"
 
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -54,7 +55,7 @@ func (s *Server) accountProof(ctx context.Context, block ton.BlockIDExt, account
 	if err != nil {
 		return nil, nil, err
 	}
-	return fragments.accountProof(accountID, pruned)
+	return fragments.AccountProof(accountID, pruned)
 }
 
 func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, addr *address.Address) ([]*cell.Cell, ton.BlockIDExt, error) {
@@ -63,18 +64,18 @@ func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, ad
 		return nil, ton.BlockIDExt{}, err
 	}
 
-	extra, err := fragments.mcStateExtra()
+	extra, err := fragments.McStateExtra()
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
 	leafShard := accountLeafShard(addr)
-	stateProof, err := fragments.shardHashesProof(addr.Workchain(), leafShard, false)
+	stateProof, err := fragments.ShardHashesProof(addr.Workchain(), leafShard, false)
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
-	proof := []*cell.Cell{fragments.blockStateRootProof, stateProof}
+	proof := []*cell.Cell{fragments.BlockStateRootProof(), stateProof}
 
 	shardBlock, _, err := shardInfoFromHashes(extra.ShardHashes, addr.Workchain(), leafShard, false)
 	if err != nil {
@@ -137,7 +138,7 @@ func (s *Server) loadStateRootHash(ctx context.Context, id ton.BlockIDExt) ([]by
 	return bytes.Clone(meta.StateRootHash), nil
 }
 
-func (s *Server) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error) {
+func (s *Server) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveview.BlockView, error) {
 	return s.store.BlockFragments(ctx, block)
 }
 

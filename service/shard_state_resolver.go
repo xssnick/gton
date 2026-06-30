@@ -279,7 +279,8 @@ func (r *shardStateResolver) statsSnapshot() shardStateResolverStats {
 func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
 	master := r.master.Block
 	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells, &blockApplyHookMeta{
-		MasterchainRef: &master,
+		InclusionMasterRef:   &master,
+		InclusionMasterState: r.master.Cell,
 	})
 }
 

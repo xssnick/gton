@@ -31,8 +31,8 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 		if err != nil {
 			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
 		}
-		stateRoot = fragments.stateRoot
-		blockProof = fragments.blockStateRootProof
+		stateRoot = fragments.StateRoot()
+		blockProof = fragments.BlockStateRootProof()
 	} else {
 		root, err := s.loadStateRoot(ctx, *query.ID)
 		if err != nil {
@@ -101,8 +101,8 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 		if err != nil {
 			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
 		}
-		stateRoot = fragments.stateRoot
-		blockProof = fragments.blockStateRootProof
+		stateRoot = fragments.StateRoot()
+		blockProof = fragments.BlockStateRootProof()
 	} else {
 		root, err := s.loadStateRoot(ctx, *query.ID)
 		if err != nil {
@@ -287,9 +287,11 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 			return nil, nil, false, fmt.Errorf("invalid empty account dispatch queue")
 		}
 
+		accountExhausted := false
 		for remaining > 0 {
 			key, value, err := lookupNextAccountDispatchMessage(accountQueue.Messages, lt)
 			if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+				accountExhausted = true
 				break
 			}
 			if err != nil {
@@ -312,17 +314,73 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 			}
 		}
 
+		if !accountExhausted {
+			first = true
+			break
+		}
 		first = false
 		lt = 0
 	}
-	return messages, roots, false, nil
+
+	hasNext, err := dispatchQueueHasNextMessage(dispatchQueue, currentAddr, origAddr, lt, first, oneAccount)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return messages, roots, !hasNext, nil
+}
+
+func dispatchQueueHasNextMessage(dispatchQueue *cell.AugmentedDictionary, currentAddr []byte, origAddr []byte, lt uint64, first bool, oneAccount bool) (bool, error) {
+	for {
+		key, value, err := lookupNextDispatchQueueAccount(dispatchQueue, currentAddr, first)
+		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("lookup dispatch queue account: %w", err)
+		}
+
+		addr, err := loadDispatchQueueKeyBits(key, 256)
+		if err != nil {
+			return false, fmt.Errorf("load dispatch queue account address: %w", err)
+		}
+		if oneAccount && !bytes.Equal(addr, origAddr) {
+			return false, nil
+		}
+
+		accountQueue, err := loadAccountDispatchQueue(value)
+		if err != nil {
+			return false, fmt.Errorf("load account dispatch queue: %w", err)
+		}
+		if accountQueue.Count == 0 || accountQueue.Messages == nil || accountQueue.Messages.IsEmpty() {
+			return false, fmt.Errorf("invalid empty account dispatch queue")
+		}
+
+		_, _, err = lookupNextAccountDispatchMessage(accountQueue.Messages, lt)
+		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			currentAddr = addr
+			first = false
+			lt = 0
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("lookup account dispatch message: %w", err)
+		}
+		return true, nil
+	}
 }
 
 func lookupNextDispatchQueueAccount(dispatchQueue *cell.AugmentedDictionary, addr []byte, allowEq bool) (*cell.Cell, *cell.Slice, error) {
 	if dispatchQueue == nil || dispatchQueue.IsEmpty() {
 		return nil, nil, cell.ErrNoSuchKeyInDict
 	}
-	return dispatchQueue.LookupNearestKey(cell.BeginCell().MustStoreSlice(addr, 256).EndCell(), true, allowEq, false)
+	key, value, err := dispatchQueue.LookupNearestKey(cell.BeginCell().MustStoreSlice(addr, 256).EndCell(), true, allowEq, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err = value.LoadUInt(64); err != nil {
+		return nil, nil, fmt.Errorf("load dispatch queue account extra: %w", err)
+	}
+	return key, value, nil
 }
 
 func lookupNextAccountDispatchMessage(messages *cell.Dictionary, lt uint64) (*cell.Cell, *cell.Slice, error) {

@@ -74,6 +74,13 @@ func (s *Service) afterPersistentStateSerialized(ctx context.Context, persistent
 			Msg("skipping cell generation migration check for partial persistent state serialization")
 		return
 	}
+	if s.syncUntilFrozen() {
+		s.log.Info().
+			Uint32("sync_until", s.syncUntil).
+			Str("persistent_state", storage.FormatBlockRef(persistent)).
+			Msg("skipping cell generation migration check after sync_until")
+		return
+	}
 
 	store := s.storage
 
@@ -783,7 +790,7 @@ func (s *Service) importSerializedPersistentCurrent(ctx context.Context, store s
 	candidate := &cellGenerationCandidate{
 		generation: generation,
 		current:    current,
-		cells:      newStateCellWindowCache(store.LazyCellLoaderInGeneration(generation)),
+		cells:      newStateCellWindowCache(store.LazyCellLoaderInGeneration(generation), &s.lazyCellLoads),
 	}
 	if err := store.SaveCellGenerationMigrationProgress(ctx, generation, current); err != nil {
 		return nil, fmt.Errorf("save initial cell generation migration progress: %w", err)
@@ -850,7 +857,7 @@ func (s *Service) loadCellGenerationMigrationProgress(ctx context.Context, store
 	return &cellGenerationCandidate{
 		generation: generation,
 		current:    current,
-		cells:      newStateCellWindowCache(store.LazyCellLoaderInGeneration(generation)),
+		cells:      newStateCellWindowCache(store.LazyCellLoaderInGeneration(generation), &s.lazyCellLoads),
 	}, nil
 }
 
@@ -1137,7 +1144,7 @@ func (s *Service) newCellGenerationShardResolver(ctx context.Context, store stor
 }
 
 func (s *Service) loadCandidateNextMasterBlock(ctx context.Context, prev ton.BlockIDExt) (PreparedBlock, error) {
-	next, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, prev.SeqNo+1)
+	next, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: prev.SeqNo + 1})
 	if err != nil {
 		return PreparedBlock{}, fmt.Errorf("load stored next masterchain block after %s: %w", storage.FormatBlockRef(prev), err)
 	}

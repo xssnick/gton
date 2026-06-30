@@ -16,7 +16,17 @@ import (
 )
 
 type stateUpdateApplier interface {
-	applyBlockStateUpdate(previous []*tnstore.BlockState, block PreparedBlock) (*cell.Cell, error)
+	applyBlockStateUpdate(previous []*tnstore.BlockState, block PreparedBlock) (stateUpdateApplyResult, error)
+}
+
+type stateUpdateApplyResult struct {
+	PreviousRoot *cell.Cell
+	NextRoot     *cell.Cell
+}
+
+type appliedBlockState struct {
+	PreviousRoot *cell.Cell
+	Next         *tnstore.BlockState
 }
 
 func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
@@ -133,35 +143,41 @@ func ApplyBlock(current *tnstore.BlockState, block PreparedBlock) (*tnstore.Bloc
 }
 
 func ApplyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock) (*tnstore.BlockState, error) {
-	return applyBlockWithPreviousStates(previous, block, nil)
+	applied, err := applyBlockWithPreviousStates(previous, block, nil)
+	if err != nil {
+		return nil, err
+	}
+	return applied.Next, nil
 }
 
-func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock, applier stateUpdateApplier) (*tnstore.BlockState, error) {
+func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock, applier stateUpdateApplier) (appliedBlockState, error) {
 	stateUpdate := block.StateUpdate
 	if stateUpdate == nil {
-		return nil, fmt.Errorf("prepared block %s has no state update", block.BlockRef())
+		return appliedBlockState{}, fmt.Errorf("prepared block %s has no state update", block.BlockRef())
 	}
 
-	var nextRoot *cell.Cell
+	var result stateUpdateApplyResult
 	var err error
 	if applier != nil {
-		nextRoot, err = applier.applyBlockStateUpdate(previous, block)
+		result, err = applier.applyBlockStateUpdate(previous, block)
 	} else {
-		var currentRoot *cell.Cell
-		currentRoot, err = previousStateRoot(previous)
+		result.PreviousRoot, err = previousStateRoot(previous)
 		if err == nil {
-			nextRoot, _, err = cell.ApplyMerkleUpdate(currentRoot, stateUpdate)
+			result.NextRoot, _, err = cell.ApplyMerkleUpdate(result.PreviousRoot, stateUpdate)
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("apply state update for %s: %w", tnstore.FormatBlockRef(block.ID), err)
+		return appliedBlockState{}, fmt.Errorf("apply state update for %s: %w", tnstore.FormatBlockRef(block.ID), err)
 	}
 
-	next, err := tnstore.ParseStateProof(&block.ID, nextRoot, nil, nil, nil)
+	next, err := tnstore.ParseStateProof(&block.ID, result.NextRoot, nil, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("parse next state from %s: %w", tnstore.FormatBlockRef(block.ID), err)
+		return appliedBlockState{}, fmt.Errorf("parse next state from %s: %w", tnstore.FormatBlockRef(block.ID), err)
 	}
-	return next, nil
+	return appliedBlockState{
+		PreviousRoot: result.PreviousRoot,
+		Next:         next,
+	}, nil
 }
 
 func previousStateRoot(previous []*tnstore.BlockState) (*cell.Cell, error) {

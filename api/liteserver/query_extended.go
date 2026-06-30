@@ -11,6 +11,8 @@ import (
 	"sort"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	admission "github.com/xssnick/gton/service/externalmsg"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -34,6 +36,7 @@ const (
 	sendMessageErrorReasonNotReady           = "not_ready"
 	sendMessageErrorReasonTVMRejected        = "tvm_rejected"
 	sendMessageErrorReasonCheckFailed        = "check_failed"
+	sendMessageErrorReasonOffline            = "offline"
 	sendMessageErrorReasonBroadcastCapacity  = "broadcast_capacity"
 	sendMessageErrorReasonBroadcastFailed    = "broadcast_failed"
 )
@@ -99,7 +102,7 @@ func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.Send
 	if !ok {
 		return sendMessageLSError(sendMessageErrorReasonDuplicate, "cannot send external message : duplicate message")
 	}
-	msgCell, msg, err := parseExternalMessage(query.Body)
+	msgCell, msg, err := admission.ParseMessage(query.Body)
 	if err != nil {
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageErrorReasonParseFailed, errorPrefix+": "+err.Error())
@@ -119,7 +122,7 @@ func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.Send
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
-	if err := s.messageSender.SendCheckedExternalMessage(ctx, query.Body, addrKey, checkResult.Root, checkResult.Message); err != nil {
+	if err := s.messageSender.SendCheckedExternalMessage(ctx, query.Body, msg.DstAddr, checkResult.Root, checkResult.Message); err != nil {
 		s.dropExternalMessageAddressLimit(addrKey)
 		s.dropCachedSendMessage(cacheKey)
 		return sendMessageLSError(sendMessageBroadcastErrorReason(err), errorPrefix+": "+err.Error())
@@ -146,7 +149,7 @@ func sendMessageCheckErrorReason(err error) string {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
 		return sendMessageErrorReasonNotReady
-	case errors.Is(err, ErrExternalMessageRejected):
+	case errors.Is(err, admission.ErrRejected):
 		return sendMessageErrorReasonTVMRejected
 	default:
 		return sendMessageErrorReasonCheckFailed
@@ -154,6 +157,9 @@ func sendMessageCheckErrorReason(err error) string {
 }
 
 func sendMessageBroadcastErrorReason(err error) string {
+	if errors.Is(err, p2p.ErrOffline) {
+		return sendMessageErrorReasonOffline
+	}
 	if errors.Is(err, extmsg.ErrExternalBroadcastCapacityExceeded) {
 		return sendMessageErrorReasonBroadcastCapacity
 	}
@@ -209,7 +215,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	extra, err := fragments.mcStateExtra()
+	extra, err := fragments.McStateExtra()
 	if err != nil {
 		return errorResponse(err, "cannot unpack masterchain state")
 	}
@@ -222,7 +228,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return errorResponse(err, "cannot load shard info")
 	}
 
-	stateProof, err := fragments.shardHashesProof(query.Workchain, query.Shard, query.Exact)
+	stateProof, err := fragments.ShardHashesProof(query.Workchain, query.Shard, query.Exact)
 	if err != nil {
 		return errorResponse(err, "cannot create shard info proof")
 	}
@@ -230,7 +236,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 	return ton.ShardInfo{
 		ID:               cloneBlockID(*query.ID),
 		ShardBlock:       cloneBlockID(shardBlock),
-		ShardProof:       []*cell.Cell{fragments.blockStateRootProof, stateProof},
+		ShardProof:       []*cell.Cell{fragments.BlockStateRootProof(), stateProof},
 		ShardDescription: leaf,
 	}
 }
@@ -253,11 +259,11 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*id))
 	}
 
-	stateProof, err := configProof(fragments.stateRoot, effectiveMode, all, params)
+	stateProof, err := configProof(fragments.StateRoot(), effectiveMode, all, params)
 	if err != nil {
 		return errorResponse(err, "cannot create config proof")
 	}
-	proof := []*cell.Cell{fragments.blockStateRootProof, stateProof}
+	proof := []*cell.Cell{fragments.BlockStateRootProof(), stateProof}
 
 	return ton.ConfigAll{
 		Mode:        int(effectiveMode),
@@ -308,7 +314,7 @@ func (s *Server) previousKeyBlockRoot(ctx context.Context, id ton.BlockIDExt) (t
 		return ton.BlockIDExt{}, nil, storage.ErrNotFound
 	}
 
-	keyBlock, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, block.BlockInfo.PrevKeyBlockSeqno)
+	keyBlock, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: masterchainID, Shard: masterchainShard, SeqNo: block.BlockInfo.PrevKeyBlockSeqno})
 	if err != nil {
 		return ton.BlockIDExt{}, nil, err
 	}
@@ -345,7 +351,7 @@ func (s *Server) handleLibraries(ctx context.Context, query ton.GetLibraries) an
 		return errorResponse(err, "cannot load current masterchain state")
 	}
 
-	libraries, err := fragments.globalLibraries()
+	libraries, err := fragments.GlobalLibraries()
 	if err != nil {
 		return errorResponse(err, "cannot load libraries")
 	}
@@ -367,7 +373,7 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	libraries, err := fragments.globalLibraries()
+	libraries, err := fragments.GlobalLibraries()
 	if err != nil {
 		return errorResponse(err, "cannot load libraries")
 	}
@@ -377,11 +383,11 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 		return errorResponse(err, "cannot load libraries")
 	}
 
-	dataProof, err := librariesProof(fragments.stateRoot, query.LibraryList, query.Mode)
+	dataProof, err := librariesProof(fragments.StateRoot(), query.LibraryList, query.Mode)
 	if err != nil {
 		return errorResponse(err, "cannot create library proof")
 	}
-	proof := []*cell.Cell{fragments.blockStateRootProof, dataProof}
+	proof := []*cell.Cell{fragments.BlockStateRootProof(), dataProof}
 
 	return ton.LibraryResultWithProof{
 		ID:         cloneBlockID(*query.ID),
@@ -840,11 +846,11 @@ func (s *Server) handleValidatorStats(ctx context.Context, query ton.GetValidato
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
 
-	dataProof, count, complete, err := validatorStatsProofAndCount(fragments.stateRoot, query.Mode, query.Limit, query.StartAfter)
+	dataProof, count, complete, err := validatorStatsProofAndCount(fragments.StateRoot(), query.Mode, query.Limit, query.StartAfter)
 	if err != nil {
 		return errorResponse(err, "cannot load validator stats")
 	}
-	proof := []*cell.Cell{fragments.blockStateRootProof, dataProof}
+	proof := []*cell.Cell{fragments.BlockStateRootProof(), dataProof}
 
 	return ton.ValidatorStats{
 		Mode:       query.Mode & 0xff,
@@ -868,8 +874,8 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 		if err != nil {
 			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
 		}
-		root = fragments.stateRoot
-		blockProof = fragments.blockStateRootProof
+		root = fragments.StateRoot()
+		blockProof = fragments.BlockStateRootProof()
 	} else {
 		stateRoot, err := s.loadStateRoot(ctx, *query.ID)
 		if err != nil {

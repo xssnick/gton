@@ -12,9 +12,12 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	admission "github.com/xssnick/gton/service/externalmsg"
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -29,34 +32,21 @@ const (
 )
 
 type Store interface {
-	LiveStoreBacking
-	CurrentAccountBlocks(ctx context.Context, workchain int32, account []byte) (CurrentAccountBlockIDs, error)
+	liveview.Backing
+	CurrentAccountBlocks(ctx context.Context, workchain int32, account []byte) (liveview.CurrentAccountBlockIDs, error)
 	BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
-	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveBlockFragments, error)
+	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveview.BlockView, error)
 	CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error)
 	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error
 	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
 }
 
-type LiveStoreBacking interface {
-	// BlockData returns bytes that remain valid for the duration of the call
-	// chain. The liteserver treats the returned slice as read-only.
-	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
-	BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error)
-	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
-	CurrentState(ctx context.Context) (*storage.CurrentState, error)
-	BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error)
-	LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error)
-	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
-	LookupBlockBySeqNo(ctx context.Context, key storage.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error)
-	LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
-	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
-	LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
-	LazyCellLoader() cell.LazyCellLoader
+type MessageSender interface {
+	SendCheckedExternalMessage(ctx context.Context, body []byte, dst *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error
 }
 
-type MessageSender interface {
-	SendCheckedExternalMessage(ctx context.Context, body []byte, address extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage) error
+type MessageChecker interface {
+	CheckExternalMessage(ctx context.Context, body []byte, root *cell.Cell, msg *tlb.ExternalMessage) (admission.CheckResult, error)
 }
 
 type QueryObserver interface {
@@ -83,27 +73,27 @@ type Options struct {
 	ListenAddr    string
 	NonFinal      bool
 	ZeroState     ton.ZeroStateIDExt
-	Version       int32
-	Capabilities  int64
 	RequestLimits RequestLimitOptions
 }
 
 type Server struct {
-	log           zerolog.Logger
-	store         Store
-	messageSender MessageSender
-	queryObserver QueryObserver
-	privateKey    ed25519.PrivateKey
-	listenAddr    string
-	nonFinal      bool
-	zeroState     ton.ZeroStateIDExt
-	version       int32
-	capabilities  int64
-	now           func() time.Time
-	tvm           *tvm.TVM
-	requestLimits RequestLimitOptions
+	log            zerolog.Logger
+	store          Store
+	messageSender  MessageSender
+	messageChecker MessageChecker
+	queryObserver  QueryObserver
+	privateKey     ed25519.PrivateKey
+	listenAddr     string
+	nonFinal       bool
+	zeroState      ton.ZeroStateIDExt
+	version        int32
+	capabilities   int64
+	now            func() time.Time
+	tvm            *tvm.TVM
+	requestLimits  RequestLimitOptions
 
 	sendMessageCache       *sendMessageCache
+	externalMessageChecker *admission.Checker
 	externalMessageLimiter *extmsg.AddressLimiter
 	requestLimiter         *requestLimiter
 	connectionTracker      *clientConnectionTracker
@@ -134,34 +124,42 @@ func New(opts Options) (*Server, error) {
 		log = opts.Logger.With().Str("component", "liteserver").Logger()
 	}
 
-	version := opts.Version
-	if version == 0 {
-		version = DefaultVersion
-	}
-
-	capabilities := opts.Capabilities
-	if capabilities == 0 {
-		capabilities = DefaultCapabilities
-	}
 	if err := validateRequestLimitOptions(opts.RequestLimits); err != nil {
 		return nil, err
+	}
+
+	tvmInstance := tvm.NewTVM()
+	messageChecker, _ := opts.MessageSender.(MessageChecker)
+	var externalMessageChecker *admission.Checker
+	if messageChecker == nil {
+		var err error
+		externalMessageChecker, err = admission.NewChecker(admission.Options{
+			Logger: &log,
+			Store:  opts.Store,
+			TVM:    tvmInstance,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &Server{
 		log:                    log,
 		store:                  opts.Store,
 		messageSender:          opts.MessageSender,
+		messageChecker:         messageChecker,
 		queryObserver:          opts.QueryObserver,
 		privateKey:             opts.PrivateKey,
 		listenAddr:             opts.ListenAddr,
 		nonFinal:               opts.NonFinal,
 		zeroState:              cloneZeroState(opts.ZeroState),
-		version:                version,
-		capabilities:           capabilities,
+		version:                DefaultVersion,
+		capabilities:           DefaultCapabilities,
 		now:                    time.Now,
-		tvm:                    tvm.NewTVM(),
+		tvm:                    tvmInstance,
 		requestLimits:          opts.RequestLimits,
 		sendMessageCache:       newSendMessageCache(),
+		externalMessageChecker: externalMessageChecker,
 		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
 		requestLimiter:         newRequestLimiter(opts.RequestLimits),
 		connectionTracker:      newClientConnectionTracker(opts.RequestLimits),

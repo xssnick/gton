@@ -9,13 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
-	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/ton"
@@ -171,12 +169,4 @@ func startMetricsServer(ctx context.Context, logger zerolog.Logger, addr string,
 	}()
 
 	return nil
-}
-
-func resolveConfigPath(longPath string) string {
-	longPath = strings.TrimSpace(longPath)
-	if longPath == "" {
-		return nodeconfig.DefaultPath
-	}
-	return longPath
 }

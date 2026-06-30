@@ -98,9 +98,10 @@ type pendingPackSync struct {
 }
 
 type pendingPackWrite struct {
-	seq       uint64
-	cleanSize int64
-	size      int64
+	seq            uint64
+	cleanSize      int64
+	metricBaseSize int64
+	size           int64
 }
 
 type syncedArtifactPacks struct {
@@ -241,8 +242,20 @@ func (s *Store) clearSyncedPackFilesLocked(pending map[string]pendingPackWrite, 
 	for _, item := range items {
 		if current, ok := pending[item.path]; ok && current.seq == item.seq {
 			delete(pending, item.path)
+			s.observeArchivePackageBytes(current.size - current.metricBaseSize)
 		}
 	}
+}
+
+func packSizeBeforeAppend(path string) (int64, error) {
+	stat, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("stat pack before append %s: %w", path, err)
+	}
+	return stat.Size(), nil
 }
 
 func (s *Store) deleteSyncedPackAppendMarkers(batch *pebble.Batch, packs syncedArtifactPacks) error {
@@ -373,6 +386,10 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 		if err := s.ensureCleanPackTail(path, s.pendingArchiveSync); err != nil {
 			return nil, nil, err
 		}
+		metricBaseSize, err := packSizeBeforeAppend(path)
+		if err != nil {
+			return nil, nil, err
+		}
 
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 		if err != nil {
@@ -441,7 +458,7 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 
 		groupReg.size = size
 		registrations = append(registrations, groupReg)
-		s.markPendingPackSync(s.pendingArchiveSync, path, cleanSize, size)
+		s.markPendingPackSync(s.pendingArchiveSync, path, cleanSize, metricBaseSize, size)
 	}
 
 	return refs, registrations, nil
@@ -488,6 +505,10 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 	if err := s.ensureCleanPackTail(path, s.pendingKeyProofSync); err != nil {
 		return nil, err
 	}
+	metricBaseSize, err := packSizeBeforeAppend(path)
+	if err != nil {
+		return nil, err
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -515,7 +536,7 @@ func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton
 		s.discardPackTail(path, cleanSize, "failed close")
 		return nil, err
 	}
-	s.markPendingPackSync(s.pendingKeyProofSync, path, cleanSize, size)
+	s.markPendingPackSync(s.pendingKeyProofSync, path, cleanSize, metricBaseSize, size)
 	return &storage.ArtifactRef{
 		ArchivePackage:   true,
 		ArchivePackageID: keyProofPackageRefID(keyProofPackageID(block.SeqNo)),
@@ -1250,15 +1271,17 @@ func (s *Store) writeStateArtifactFile(block ton.BlockIDExt, data []byte) (*stor
 	}, nil
 }
 
-func (s *Store) markPendingPackSync(pending map[string]pendingPackWrite, path string, cleanSize int64, size int64) {
+func (s *Store) markPendingPackSync(pending map[string]pendingPackWrite, path string, cleanSize int64, metricBaseSize int64, size int64) {
 	s.artifactSyncSeq++
 	if current, ok := pending[path]; ok {
 		cleanSize = current.cleanSize
+		metricBaseSize = current.metricBaseSize
 	}
 	pending[path] = pendingPackWrite{
-		seq:       s.artifactSyncSeq,
-		cleanSize: cleanSize,
-		size:      size,
+		seq:            s.artifactSyncSeq,
+		cleanSize:      cleanSize,
+		metricBaseSize: metricBaseSize,
+		size:           size,
 	}
 }
 

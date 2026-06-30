@@ -34,7 +34,15 @@ func (s *Service) runDelayedServiceMaintenance(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
+	case <-s.maintenanceWake:
 	case <-timer.C:
+	}
+
+	if s.syncUntilFrozen() {
+		s.log.Info().
+			Uint32("sync_until", s.syncUntil).
+			Msg("skipping service maintenance after sync_until")
+		return
 	}
 
 	s.runServiceMaintenance(ctx)
@@ -53,6 +61,13 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 	}
 
 	for {
+		if s.syncUntilFrozen() {
+			s.log.Info().
+				Uint32("sync_until", s.syncUntil).
+				Msg("stopping service maintenance after sync_until")
+			return
+		}
+
 		now := time.Now()
 		persistentStateGCDue := !now.Before(nextPersistentStateGC)
 		archiveGCDue := !nextArchiveGC.IsZero() && !now.Before(nextArchiveGC)
@@ -218,6 +233,10 @@ func (s *Service) cellGenerationMigrationPending(ctx context.Context) (bool, err
 }
 
 func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, error) {
+	if s.syncUntilFrozen() {
+		return false, nil
+	}
+
 	store := s.storage
 
 	pending, err := store.PendingCellGenerationMigration(ctx)

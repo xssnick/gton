@@ -77,6 +77,16 @@ func testDummyHash(prefix byte, seqno uint32) []byte {
 	return hash
 }
 
+func testFullBlockID(workchain int32, shard int64, seqno uint32, rootPrefix byte, filePrefix byte) ton.BlockIDExt {
+	return ton.BlockIDExt{
+		Workchain: workchain,
+		Shard:     shard,
+		SeqNo:     seqno,
+		RootHash:  testDummyHash(rootPrefix, seqno),
+		FileHash:  testDummyHash(filePrefix, seqno),
+	}
+}
+
 func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	peerA := testZeroStatePeer("a")
 	peerB := testZeroStatePeer("b")
@@ -259,11 +269,12 @@ func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
 func testZeroStatePeer(label string) *overlayPeer {
 	id := testPeerID(label)
 	return &overlayPeer{
-		id:          id,
-		addr:        label,
-		fixedMember: true,
-		overlay:     &overlay.ADNLOverlayWrapper{},
-		alive:       true,
+		id:            id,
+		addr:          label,
+		fixedMember:   true,
+		overlay:       &overlay.ADNLOverlayWrapper{},
+		alive:         true,
+		lastReceiveAt: time.Now(),
 	}
 }
 
@@ -335,12 +346,8 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	ctx := context.Background()
 	store := newTestPebbleStore(t)
 	dir := store.StateFilesDir()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(0x0800000000000000),
-		SeqNo:     63272132,
-	}
-	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	block := testFullBlockID(0, int64(0x0800000000000000), 63272132, 0x11, 0x22)
+	master := testFullBlockID(-1, int64(-1<<63), block.SeqNo, 0x33, 0x44)
 	root := mustTestShardStateCell(t, block)
 	rootHash := root.HashKey(0)
 	name, err := tnstore.PersistentStateFileName(block, master, 0)
@@ -408,12 +415,8 @@ func TestTryImportReusableStagedStateFileUsesPeerStorage(t *testing.T) {
 	ctx := context.Background()
 	store := newTestPebbleStore(t)
 	dir := store.StateFilesDir()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(0x0800000000000000),
-		SeqNo:     63272133,
-	}
-	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	block := testFullBlockID(0, int64(0x0800000000000000), 63272133, 0x12, 0x23)
+	master := testFullBlockID(-1, int64(-1<<63), block.SeqNo, 0x34, 0x45)
 	root := mustTestShardStateCell(t, block)
 	rootHash := root.HashKey(0)
 	data := root.ToBOCWithOptions(cell.BOCSerializeOptions{
@@ -474,16 +477,12 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	ctx := context.Background()
 	store := newTestPebbleStore(t)
 	dir := store.StateFilesDir()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(-1 << 63),
-		SeqNo:     63272132,
-	}
+	block := testFullBlockID(0, int64(-1<<63), 63272132, 0x11, 0x22)
 	root := mustTestShardStateCellWithAccounts(t, block, 0, 1)
 	rootHash := root.HashKey(0)
 	proof := testFullMerkleProof(t, root)
 
-	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	master := testFullBlockID(-1, int64(-1<<63), block.SeqNo, 0x33, 0x44)
 	name, err := tnstore.PersistentStateFileName(block, master, block.Shard)
 	if err != nil {
 		t.Fatalf("split header file name: %v", err)
@@ -501,7 +500,8 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 			Path: path,
 			Size: int64(len(proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}))),
 		},
-		FileHash: bytes.Repeat([]byte{0x55}, 32),
+		FileHash:      bytes.Repeat([]byte{0x55}, 32),
+		StateRootHash: rootHash[:],
 	}); err != nil {
 		t.Fatalf("save reusable split header file metadata: %v", err)
 	}
@@ -533,6 +533,51 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	}
 	if _, err = os.Stat(path); err != nil {
 		t.Fatalf("cleanup should keep reusable split header file, got %v", err)
+	}
+}
+
+func TestSaveSplitPersistentStateHeaderStoresStateRootHash(t *testing.T) {
+	ctx := context.Background()
+	store := newTestPebbleStore(t)
+	dir := store.StateFilesDir()
+	block := testFullBlockID(0, int64(-1<<63), 63272132, 0x11, 0x22)
+	root := mustTestShardStateCellWithAccounts(t, block, 0, 1)
+	rootHash := root.HashKey(0)
+	proof := testFullMerkleProof(t, root)
+	data := proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+
+	master := testFullBlockID(-1, int64(-1<<63), block.SeqNo, 0x33, 0x44)
+	name, err := tnstore.PersistentStateFileName(block, master, block.Shard)
+	if err != nil {
+		t.Fatalf("split header file name: %v", err)
+	}
+	path := filepath.Join(dir, name)
+	if err = os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write split header file: %v", err)
+	}
+
+	node := &Node{
+		log:           zerolog.Nop(),
+		peerStorage:   store,
+		stateFilesDir: dir,
+	}
+	staged := &stagedStateFile{
+		effectiveShard: block.Shard,
+		peerAddr:       "127.0.0.1:30303",
+		path:           path,
+		size:           int64(len(data)),
+		fileHash:       bytes.Repeat([]byte{0x55}, 32),
+	}
+	if err = node.savePersistentStateFile(block, master, staged, rootHash[:]); err != nil {
+		t.Fatalf("save split persistent state header file: %v", err)
+	}
+
+	file, err := store.PersistentStateFile(ctx, block, master, block.Shard)
+	if err != nil {
+		t.Fatalf("load saved split header metadata: %v", err)
+	}
+	if !bytes.Equal(file.StateRootHash, rootHash[:]) {
+		t.Fatalf("state root hash = %x, want %x", file.StateRootHash, rootHash)
 	}
 }
 
@@ -642,7 +687,8 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 			Path: path,
 			Size: int64(len(boc)),
 		},
-		FileHash: bytes.Repeat([]byte{0x55}, 32),
+		FileHash:      bytes.Repeat([]byte{0x55}, 32),
+		StateRootHash: part.rootHash,
 	}); err != nil {
 		t.Fatalf("save reusable split part file metadata: %v", err)
 	}
@@ -656,9 +702,10 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 		stateFilesDir: dir,
 	}
 	downloader := persistentStateSnapshotDownloader{
-		node:   node,
-		block:  block,
-		master: master,
+		node:          node,
+		block:         block,
+		master:        master,
+		stateRootHash: bytes.Repeat([]byte{0x66}, 32),
 	}
 	res := downloader.stageSplitPart(ctx, 0, 1, part, make(chan struct{}, 1))
 	if res.err != nil {
@@ -721,9 +768,10 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 		stateFilesDir: store.StateFilesDir(),
 	}
 	downloader := persistentStateSnapshotDownloader{
-		node:   node,
-		block:  block,
-		master: master,
+		node:          node,
+		block:         block,
+		master:        master,
+		stateRootHash: bytes.Repeat([]byte{0x66}, 32),
 	}
 	staged := &stagedStateFile{
 		effectiveShard: int64(part.effectiveShard),
@@ -753,12 +801,8 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 
 func TestSplitStatePartRootImportsWhenImporterDisablesPartReuse(t *testing.T) {
 	ctx := context.Background()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(-1 << 63),
-		SeqNo:     63272132,
-	}
-	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	block := testFullBlockID(0, int64(-1<<63), 63272132, 0x11, 0x22)
+	master := testFullBlockID(-1, int64(-1<<63), block.SeqNo, 0x33, 0x44)
 	partRoot := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
 	partRootHash := partRoot.HashKey()
 	part := splitStatePart{
@@ -810,12 +854,8 @@ func TestSplitStatePartRootImportsWhenImporterDisablesPartReuse(t *testing.T) {
 
 func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	ctx := context.Background()
-	block := ton.BlockIDExt{
-		Workchain: 0,
-		Shard:     int64(-1 << 63),
-		SeqNo:     63272132,
-	}
-	master := ton.BlockIDExt{Workchain: -1, Shard: int64(-1 << 63), SeqNo: block.SeqNo}
+	block := testFullBlockID(0, int64(-1<<63), 63272132, 0x11, 0x22)
+	master := testFullBlockID(-1, int64(-1<<63), block.SeqNo, 0x33, 0x44)
 	splitDepth := uint32(4)
 	fullRoot := mustTestShardStateCellWithAccountIDs(
 		t,

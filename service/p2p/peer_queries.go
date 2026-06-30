@@ -134,8 +134,8 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 	}
 	defer s.node.finishInbound()
 
-	if peer != nil {
-		peer.noteReceive()
+	if peer != nil && peer.noteReceive() {
+		s.peerPromoted(peer)
 	}
 	parent := context.Background()
 	if s.node.runCtx != nil {
@@ -143,6 +143,15 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 	}
 	ctx, cancel := context.WithTimeout(parent, peerQueryTimeout)
 	defer cancel()
+
+	startedAt := time.Now()
+	queryKind := queryTypeName(req)
+	queryLog := s.log.Trace().
+		Str("kind", queryKind)
+	if peer != nil {
+		queryLog = queryLog.Str("peer", peer.addr)
+	}
+	queryLog.Msg("received overlay query")
 
 	if !s.isActive() {
 		s.sendForgetPeer(ctx, peer)
@@ -156,13 +165,22 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		}
 		logEvt := s.log.Debug().
 			Err(err).
-			Str("kind", queryTypeName(req))
+			Str("kind", queryKind)
 		if peer != nil {
 			logEvt = logEvt.Str("peer", peer.addr)
 		}
 		logEvt.Msg("failed to answer overlay query")
 		return err
 	}
+	answerLog := s.log.Trace().
+		Str("kind", queryKind).
+		Str("response", queryTypeName(resp)).
+		Dur("elapsed", time.Since(startedAt))
+	if peer != nil {
+		answerLog = answerLog.Str("peer", peer.addr)
+	}
+	answerLog.Msg("answering overlay query")
+
 	if err = answer(ctx, resp); errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -182,6 +200,15 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
+	}
+
+	if s.spec.Kind == overlayKindCustomFixed {
+		switch req.(type) {
+		case overlay.GetRandomPeers:
+			return nil, errors.New("overlay is private")
+		default:
+			return nil, errors.New("overlay query is not supported in private overlay")
+		}
 	}
 
 	switch query := req.(type) {

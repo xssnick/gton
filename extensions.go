@@ -6,7 +6,7 @@ import (
 	"github.com/xssnick/gton/service/hooks"
 )
 
-func extensionFromFactory(factory ExtensionFactory, node hooks.Node) (hooks.Extension, error) {
+func extensionFromFactory(factory hooks.ExtensionFactory, node hooks.Node) (hooks.Extension, error) {
 	if factory == nil {
 		return nil, nil
 	}

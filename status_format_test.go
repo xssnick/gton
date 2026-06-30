@@ -50,6 +50,7 @@ func TestFormatStatusReadableSections(t *testing.T) {
 						{
 							Addr:          "127.0.0.1:30303",
 							Alive:         true,
+							LastReceiveAt: time.Now().Add(-30 * time.Second),
 							LastSuccessAt: time.Now().Add(-time.Minute),
 							FailedQueries: 2,
 							Unreliability: 1.5,
@@ -106,6 +107,7 @@ func TestFormatStatusReadableSections(t *testing.T) {
 						{
 							Addr:          "127.0.0.1:30303",
 							Alive:         true,
+							LastReceiveAt: time.Now().Add(-30 * time.Second),
 							LastSuccessAt: time.Now().Add(-time.Minute),
 							FailedQueries: 2,
 							Unreliability: 1.5,
@@ -124,7 +126,7 @@ func TestFormatStatusReadableSections(t *testing.T) {
 	for _, want := range []string{
 		"Overlays\n",
 		"  masterchain",
-		"    alive last ok        fail    score  addr",
+		"    alive last rx      last ok        fail    score  addr",
 		"lag_seconds=10s",
 	} {
 		if !strings.Contains(out, want) {

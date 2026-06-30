@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/xssnick/gton/api/liteserver"
 
+	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/p2p"
 
@@ -50,7 +50,7 @@ func (s *Service) AcceptCheckedExternalMessage(ctx context.Context, event p2p.Ex
 	return s.runExternalMessageHooks(ctx, event.IsLocal, event.Root, event.Message)
 }
 
-func (s *Service) checkExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent) (liteserver.ExternalMessageCheckResult, error) {
+func (s *Service) checkExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent) (externalmsg.CheckResult, error) {
 	if event.Root != nil && event.Message != nil {
 		return s.externalMessageChecker.Check(ctx, event.Body, event.Root, event.Message)
 	}

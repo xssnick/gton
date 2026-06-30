@@ -139,7 +139,7 @@ func printCurrent(ctx context.Context, store *pebblestore.Store) {
 }
 
 func inspectMaster(ctx context.Context, store *pebblestore.Store, seqno uint32) {
-	block, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, seqno)
+	block, err := store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: masterchainID, Shard: masterchainShard, SeqNo: seqno})
 	if err != nil {
 		fmt.Printf("master_seqno=%d lookup_error=%v\n", seqno, err)
 		return
@@ -201,7 +201,7 @@ func printBlock(ctx context.Context, store *pebblestore.Store, label string, mas
 	masterRefError := ""
 	if meta.MasterchainRefKnown() {
 		masterRef = meta.MasterchainRefSeqno
-		ref, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+		ref, err := store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: masterchainID, Shard: masterchainShard, SeqNo: meta.MasterchainRefSeqno})
 		if err != nil {
 			masterRefError = err.Error()
 		} else {

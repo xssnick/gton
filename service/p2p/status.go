@@ -11,6 +11,8 @@ import (
 
 type StatusSnapshot struct {
 	ListenAddr            string
+	Offline               bool
+	OfflineReason         string
 	LatestMasterchain     *ton.BlockIDExt
 	LatestBasechain       *ton.BlockIDExt
 	LatestBasechainShards []ton.BlockIDExt
@@ -35,6 +37,7 @@ type NeighbourStatusSnapshot struct {
 	ID            string
 	Addr          string
 	Alive         bool
+	LastReceiveAt time.Time
 	LastSuccessAt time.Time
 	FailedQueries uint64
 	Unreliability float64
@@ -112,8 +115,10 @@ type fecReceiverCounterSnapshot struct {
 func (n *Node) StatusSnapshot() StatusSnapshot {
 	subscriptions := n.subscriptionsSnapshot()
 	snapshot := StatusSnapshot{
-		ListenAddr: n.listenAddr,
-		Overlays:   make([]OverlayStatusSnapshot, 0, len(subscriptions)),
+		ListenAddr:    n.listenAddr,
+		Offline:       n.IsOffline(),
+		OfflineReason: n.OfflineReason(),
+		Overlays:      make([]OverlayStatusSnapshot, 0, len(subscriptions)),
 	}
 
 	n.latestBlocksMx.RLock()
@@ -479,6 +484,7 @@ func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {
 			ID:            peer.id.String(),
 			Addr:          peer.addr,
 			Alive:         stats.alive,
+			LastReceiveAt: stats.lastReceiveAt,
 			LastSuccessAt: stats.lastSuccessAt,
 			FailedQueries: stats.failedQueries,
 			Unreliability: stats.unreliability,

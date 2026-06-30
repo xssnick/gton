@@ -217,6 +217,7 @@ Simplified example:
   "ton": {
     "global_config_path": "global.config.json",
     "sync_before": 14400,
+    "sync_until": 0,
     "state_ttl": 172800,
     "archive_ttl": 604800,
     "next_checkpoint_blocks": 200,
@@ -241,7 +242,8 @@ Simplified example:
     "master_block_cache": 128,
     "shard_block_cache": 1024,
     "send_message_broadcast_bytes_per_second": 0,
-    "send_message_broadcast_max_delay_ms": 100
+    "send_message_broadcast_max_delay_ms": 100,
+    "send_message_broadcast_fanout": 5
   },
   "storage": {
     "dir": "data",
@@ -274,6 +276,7 @@ Simplified example:
 | --- | --- |
 | `global_config_path` | Path to the TON global config. If the file is missing, it is downloaded during startup. |
 | `sync_before` | Minimum persistent state age for initial sync, in seconds. Defaults to `14400` (4 hours). Set to `-1` only for Archival liteserver mode. |
+| `sync_until` | Optional UNIX block time cutoff. Defaults to `0` (disabled). When set, the node syncs only up to blocks not newer than this time, then switches p2p offline while keeping liteserver data available. |
 | `state_ttl` | Current-state TTL for cell generation rotation, in seconds. Defaults to `172800` (2 days). Set to `0` to disable automatic cell DB generation rotation and keep the current-state DB generation forever. Required to be `0` when `sync_before=-1`. |
 | `archive_ttl` | How long archive packages are kept, in seconds. Defaults to `604800` (7 days). Set to `0` to keep archives forever. Required to be `0` when `sync_before=-1`. |
 | `next_checkpoint_blocks` | Current-state checkpoint frequency during next-block sync, in masterchain blocks. Defaults to `200`. |
@@ -308,6 +311,7 @@ Simplified example:
 | `shard_block_cache` | Live cache size for shard blocks. |
 | `send_message_broadcast_bytes_per_second` | Leaky-bucket capacity for external message broadcast traffic. `0` disables the limit. |
 | `send_message_broadcast_max_delay_ms` | Maximum pacing delay before `sendMessage` is rejected with `reason="broadcast_capacity"`. Defaults to `100`; set to `0` for no backlog. |
+| `send_message_broadcast_fanout` | Number of active public-overlay peers selected for external message broadcasts originated by liteserver `sendMessage`. Defaults to `5` when omitted or set to `0`; valid range is `3` to `20`. When the node is lagged, the local-send fanout is halved, with a minimum of `1`. Inbound overlay rebroadcast fanout is unchanged. |
 
 ### `storage`
 
@@ -422,8 +426,10 @@ func main() {
         panic(err)
     }
 
-    opts := gton.DefaultNodeOptions()
-    opts.Config = cfg
+    opts, err := cfg.NodeOptions(gton.DefaultNodeOptions())
+    if err != nil {
+        panic(err)
+    }
     opts.GlobalConfig = globalConfig
     opts.Logger = zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
     opts.Extension = extension.New
@@ -452,8 +458,10 @@ if err != nil {
     panic(err)
 }
 
-opts := gton.DefaultNodeOptions()
-opts.Config = nodeCfg
+opts, err := nodeCfg.NodeOptions(gton.DefaultNodeOptions())
+if err != nil {
+    panic(err)
+}
 opts.GlobalConfig = globalConfig
 opts.Logger = zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 opts.Extension = extension.NewFactory(extensionCfg)
@@ -461,7 +469,10 @@ opts.Extension = extension.NewFactory(extensionCfg)
 err = gton.RunNode(context.Background(), opts)
 ```
 
-See `example_extension/` for a complete static apply logger example.
+See `example_extension/` for a complete static apply logger and live transaction
+replay checker example. The example is a separate Go module with a local
+`replace` to the repository root, so it does not become part of the main
+module's `./...` package set.
 
 The extension factory must have this signature:
 
@@ -476,6 +487,8 @@ The returned value receives hook events through:
 
 ```go
 type Extension interface {
+    Start(context.Context) error
+    Close(context.Context) error
     OnBlockApplied(context.Context, BlockAppliedEvent) error
     OnExternalMessage(context.Context, ExternalMessageEvent) error
     OnBlockReceived(context.Context, BlockReceivedEvent) error
@@ -484,13 +497,15 @@ type Extension interface {
 
 `OnBlockApplied` is called after a block state update is applied and before that block flow can continue to checkpoint or persist. Block apply hook delivery is at least once: the same block apply call may be repeated if the node crashes or is hard-stopped before the block flow is fully persisted/checkpointed. If the method returns an error, the node retries the same event after a short delay and does not advance that block flow until the extension returns `nil`. This retry only blocks the affected block dependency branch; shard block apply is parallel, so other independent branches may continue and may call the same extension concurrently.
 
-`OnExternalMessage` is called after an external message is accepted by TVM emulation and before it is rebroadcast further. `event.IsLocal` is `true` when the message came from this node's liteserver API and `false` for overlay broadcasts. If the method returns an error, that external message is dropped without retry.
+`Start` is called after the node services are started. `Close` is called during shutdown and should block until the extension exits or the context is done. Extensions with no background work should return `nil`.
+
+`OnExternalMessage` is called after an external message is accepted by TVM emulation and before it is rebroadcast further. `event.IsLocal` is `true` when the message came from this node's local API path and `false` for overlay broadcasts. If the method returns an error, that external message is dropped without retry.
 
 `OnBlockReceived` is called when a block is received from broadcasts, downloads, or archive imports. `event.IsSigned` is `true` for signed block artifacts and downloaded/imported full blocks, and `false` for shard block candidates. If the method returns an error, the node logs it and continues the block flow.
 
 Extension implementations must be thread-safe. They must also treat every object received in hook events as borrowed for the duration of the call only. Do not retain event fields, cells, metadata, state pointers, or payload slices after the hook returns. If an extension needs data later, it must copy or serialize the exact data it owns before returning.
 
-`BlockAppliedEvent` includes block/proof BOC payloads, block root cell, block metadata, parsed applied state, and masterchain reference for shard blocks. The block id is available as `event.Meta.ID`. `MasterchainRef` is `nil` for masterchain blocks. The node does not parse `tlb.Block` for extensions automatically; extensions that need parsed block data should parse it from `BlockRoot` themselves.
+`BlockAppliedEvent` includes block/proof BOC payloads, block root cell, block metadata, applied state roots, and the inclusion masterchain reference/state for shard blocks. The block id is available as `event.Meta.ID`. `InclusionMasterRef` and `InclusionMasterState` are `nil` for masterchain blocks. The node does not resolve execution masterchain data on the apply hot path. Extensions that need the execution master reference should parse `tlb.Block` from `BlockRoot`; state can then be taken from the event roots when it is already present or loaded through the normal read-only store APIs.
 
 `BlockReceivedEvent` includes the received block/proof BOC payloads, block root cell, block metadata, and `IsSigned`. The block id is available as `event.Meta.ID`.
 
@@ -511,6 +526,14 @@ func New(node hooks.Node) (hooks.Extension, error) {
     return extension{}, nil
 }
 
+func (extension) Start(ctx context.Context) error {
+    return nil
+}
+
+func (extension) Close(ctx context.Context) error {
+    return nil
+}
+
 func (extension) OnBlockApplied(ctx context.Context, event hooks.BlockAppliedEvent) error {
     return nil
 }
@@ -527,5 +550,6 @@ func (extension) OnBlockReceived(ctx context.Context, event hooks.BlockReceivedE
 Build a custom node binary from the wrapper package:
 
 ```bash
-CGO_ENABLED=0 go build -o gton-node-with-extension ./cmd/my-node
+cd example_extension
+CGO_ENABLED=0 go build -o gton-node-with-extensions .
 ```

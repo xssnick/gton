@@ -10,6 +10,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const blockApplyHookRetryDelay = 50 * time.Millisecond
@@ -21,7 +22,8 @@ type blockApplyHookRunner struct {
 }
 
 type blockApplyHookMeta struct {
-	MasterchainRef *ton.BlockIDExt
+	InclusionMasterRef   *ton.BlockIDExt
+	InclusionMasterState *cell.Cell
 }
 
 func newBlockApplyHookRunner(log zerolog.Logger, extension hooks.Extension) *blockApplyHookRunner {
@@ -37,19 +39,22 @@ func newBlockApplyHookRunner(log zerolog.Logger, extension hooks.Extension) *blo
 }
 
 func (s *Service) applyBlockWithHooks(ctx context.Context, previous []*storage.BlockState, block PreparedBlock, applier stateUpdateApplier, meta *blockApplyHookMeta) (*storage.BlockState, error) {
-	next, err := applyBlockWithPreviousStates(previous, block, applier)
+	applied, err := applyBlockWithPreviousStates(previous, block, applier)
 	if err != nil {
 		return nil, err
 	}
+	next := applied.Next
 
 	if s.applyHooks != nil && meta != nil {
 		if err = s.applyHooks.run(ctx, hooks.BlockAppliedEvent{
-			BlockBOC:       block.BlockBOC,
-			ProofBOC:       block.ProofBOC,
-			BlockRoot:      block.BlockRoot,
-			Meta:           block.Meta,
-			State:          next.Parsed,
-			MasterchainRef: meta.MasterchainRef,
+			BlockBOC:             block.BlockBOC,
+			ProofBOC:             block.ProofBOC,
+			BlockRoot:            block.BlockRoot,
+			Meta:                 block.Meta,
+			PreviousState:        applied.PreviousRoot,
+			CurrentState:         next.Cell,
+			InclusionMasterRef:   meta.InclusionMasterRef,
+			InclusionMasterState: meta.InclusionMasterState,
 		}); err != nil {
 			return nil, err
 		}

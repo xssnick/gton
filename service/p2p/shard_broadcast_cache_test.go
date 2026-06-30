@@ -377,7 +377,6 @@ func testShardBroadcastDownloadedBlock(t *testing.T, seqno uint32, payload uint6
 
 	proof := testBlockProofCell(t, block, nil)
 	proofBOC := proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-
 	return DownloadedBlock{
 		ID:               block,
 		Kind:             "tonNode.blockBroadcast",

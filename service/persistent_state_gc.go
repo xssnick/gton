@@ -13,6 +13,13 @@ const (
 )
 
 func (s *Service) runPersistentStateGCOnce(ctx context.Context) (bool, error) {
+	if s.syncUntilFrozen() {
+		s.log.Debug().
+			Uint32("sync_until", s.syncUntil).
+			Msg("skipping persistent state gc after sync_until")
+		return false, nil
+	}
+
 	store := s.storage
 
 	lease, err := s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskPersistentStateGC)

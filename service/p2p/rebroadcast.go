@@ -487,11 +487,21 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
+		if s != nil && s.spec.Kind == overlayKindCustomFixed {
+			if s.node != nil && s.node.rebroadcastLagged() {
+				return laggedExternalFanout
+			}
+			return s.peerLimit()
+		}
+		if req.local && s != nil && s.node != nil {
+			fanout := s.node.effectiveLocalExternalFanout()
+			if s.node.rebroadcastLagged() {
+				return laggedLocalExternalFanout(fanout)
+			}
+			return fanout
+		}
 		if s != nil && s.node != nil && s.node.rebroadcastLagged() {
 			return laggedExternalFanout
-		}
-		if s != nil && s.spec.Kind == overlayKindCustomFixed {
-			return s.peerLimit()
 		}
 		return externalRebroadcastFanout
 	}
@@ -502,6 +512,34 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 		return quietRebroadcastFanout
 	}
 	return rebroadcastFanout
+}
+
+func normalizeLocalExternalFanout(fanout int) (int, error) {
+	if fanout == 0 {
+		return externalRebroadcastFanout, nil
+	}
+	if fanout < minLocalExternalFanout {
+		return 0, fmt.Errorf("local external broadcast fanout cannot be less than %d", minLocalExternalFanout)
+	}
+	if fanout > maxLocalExternalFanout {
+		return 0, fmt.Errorf("local external broadcast fanout cannot exceed %d", maxLocalExternalFanout)
+	}
+	return fanout, nil
+}
+
+func laggedLocalExternalFanout(fanout int) int {
+	fanout /= 2
+	if fanout < 1 {
+		return 1
+	}
+	return fanout
+}
+
+func (n *Node) effectiveLocalExternalFanout() int {
+	if n.localExternalFanout == 0 {
+		return externalRebroadcastFanout
+	}
+	return n.localExternalFanout
 }
 
 func selectRebroadcastQueueTargetsWithPreferred(candidates []*overlayPeer, tried map[PeerID]struct{}, preferred map[PeerID]struct{}, limit int) []*overlayPeer {

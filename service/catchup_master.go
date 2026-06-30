@@ -523,7 +523,7 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 	}
 }
 
-func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, string, time.Duration, error) {
+func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
 
 	cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
@@ -598,7 +598,7 @@ func (s *Service) waitNextMasterchainApplyCandidate(
 	probeReturned <-chan struct{},
 	result <-chan nextBlockProbeResult,
 	cancel context.CancelFunc,
-) (PreparedBlock, string, time.Duration, error) {
+) (PreparedBlock, SyncBlockSource, time.Duration, error) {
 	queryDone := queryCtx.Done()
 	for {
 		select {
@@ -662,7 +662,7 @@ func (s *Service) waitNextMasterchainApplyCandidate(
 
 type nextBlockProbeResult struct {
 	block          PreparedBlock
-	source         string
+	source         SyncBlockSource
 	prepareElapsed time.Duration
 	err            error
 }
@@ -680,7 +680,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepareElapsed := time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
-			source:         syncBlockSourceForDownloadedBlock("peer_probe", *downloaded),
+			source:         syncBlockSourceForDownloadedBlock(SyncBlockSourcePeerProbe, *downloaded),
 			prepareElapsed: prepareElapsed,
 			err:            fmt.Errorf("verify probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 		}
@@ -690,7 +690,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepareElapsed = time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
-			source:         syncBlockSourceForVerifiedBlock("peer_probe", verified),
+			source:         syncBlockSourceForVerifiedBlock(SyncBlockSourcePeerProbe, verified),
 			prepareElapsed: prepareElapsed,
 			err:            fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 		}
@@ -699,7 +699,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepared.PrepareElapsed = prepareElapsed
 	return nextBlockProbeResult{
 		block:          prepared,
-		source:         syncBlockSourceForKind("peer_probe", verified.Kind),
+		source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, verified.Kind),
 		prepareElapsed: prepared.PrepareElapsed,
 	}
 }

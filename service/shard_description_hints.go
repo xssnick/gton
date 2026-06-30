@@ -35,12 +35,18 @@ func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
 			if !ok {
 				return
 			}
+			if s.syncUntilFrozen() {
+				continue
+			}
 			s.rememberShardDescriptionHint(ev)
 		}
 	}
 }
 
 func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
+	if s.syncUntilFrozen() {
+		return
+	}
 	if ev.ShardDescription == nil || ev.Block.Workchain == -1 || !ev.ShardDescription.Block.Equals(&ev.Block) {
 		return
 	}

@@ -13,6 +13,7 @@ import (
 type DBStatus struct {
 	Meta            *MetaDBStatus
 	CellGenerations []CellDBGenerationStatus
+	LazyCellLoads   []storage.LazyCellLoadMetric
 }
 
 type MetaDBStatus struct {
@@ -67,6 +68,7 @@ func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
 	generations := s.openCellGenerationStatusTargets()
 	status := DBStatus{
 		CellGenerations: make([]CellDBGenerationStatus, 0, len(generations)),
+		LazyCellLoads:   s.lazyCellLoads.snapshot(),
 	}
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {

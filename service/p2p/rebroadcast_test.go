@@ -794,6 +794,7 @@ func TestEnqueueRebroadcastPrefersNeighbours(t *testing.T) {
 
 func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
 	node := newTestNode(t)
+	node.localExternalFanout = 7
 	peers := map[PeerID]*overlayPeer{}
 	for i := 0; i < 8; i++ {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
@@ -816,16 +817,17 @@ func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
 		t.Fatal("expected local external rebroadcast enqueue")
 	}
 
-	if got := countQueuedRebroadcasts(peers, true); got != externalRebroadcastFanout {
-		t.Fatalf("queued local external rebroadcasts = %d, want %d", got, externalRebroadcastFanout)
+	if got := countQueuedRebroadcasts(peers, true); got != node.localExternalFanout {
+		t.Fatalf("queued local external rebroadcasts = %d, want %d", got, node.localExternalFanout)
 	}
 }
 
 func TestEnqueueLocalExternalRebroadcastReducesFanoutWhenLagged(t *testing.T) {
 	node := newTestNode(t)
+	node.localExternalFanout = 15
 	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	peers := map[PeerID]*overlayPeer{}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 15; i++ {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
@@ -846,27 +848,37 @@ func TestEnqueueLocalExternalRebroadcastReducesFanoutWhenLagged(t *testing.T) {
 		t.Fatal("expected local external rebroadcast enqueue")
 	}
 
-	if got := countQueuedRebroadcasts(peers, true); got != laggedExternalFanout {
-		t.Fatalf("queued local external rebroadcasts = %d, want %d", got, laggedExternalFanout)
+	want := laggedLocalExternalFanout(node.localExternalFanout)
+	if got := countQueuedRebroadcasts(peers, true); got != want {
+		t.Fatalf("queued local external rebroadcasts = %d, want %d", got, want)
 	}
 }
 
 func TestExternalRebroadcastFanoutThreshold(t *testing.T) {
 	node := newTestNode(t)
+	node.localExternalFanout = 15
 	sub := &overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
 	}
 	req := rebroadcastRequest{kind: "tonNode.externalMessageBroadcast"}
+	localReq := rebroadcastRequest{kind: "tonNode.externalMessageBroadcast", local: true}
 
 	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold}
 	if got := sub.rebroadcastFanoutForRequest(req); got != externalRebroadcastFanout {
 		t.Fatalf("fanout at threshold = %d, want %d", got, externalRebroadcastFanout)
 	}
+	if got := sub.rebroadcastFanoutForRequest(localReq); got != node.localExternalFanout {
+		t.Fatalf("local fanout at threshold = %d, want %d", got, node.localExternalFanout)
+	}
 
 	node.syncLag = &testSyncLagProvider{lag: rebroadcastFECLagThreshold + 1}
 	if got := sub.rebroadcastFanoutForRequest(req); got != laggedExternalFanout {
 		t.Fatalf("fanout above threshold = %d, want %d", got, laggedExternalFanout)
+	}
+	wantLocalLagged := laggedLocalExternalFanout(node.localExternalFanout)
+	if got := sub.rebroadcastFanoutForRequest(localReq); got != wantLocalLagged {
+		t.Fatalf("local fanout above threshold = %d, want %d", got, wantLocalLagged)
 	}
 
 	blockReq := rebroadcastRequest{kind: "tonNode.blockBroadcastCompressedV2"}
@@ -881,8 +893,96 @@ func TestExternalRebroadcastFanoutThreshold(t *testing.T) {
 	if got := custom.rebroadcastFanoutForRequest(req); got != laggedExternalFanout {
 		t.Fatalf("custom external fanout while lagged = %d, want %d", got, laggedExternalFanout)
 	}
+	if got := custom.rebroadcastFanoutForRequest(localReq); got != laggedExternalFanout {
+		t.Fatalf("custom local external fanout while lagged = %d, want %d", got, laggedExternalFanout)
+	}
 	if got := custom.rebroadcastFanoutForRequest(blockReq); got != custom.peerLimit() {
 		t.Fatalf("custom block fanout while lagged = %d, want %d", got, custom.peerLimit())
+	}
+}
+
+func TestLocalExternalFanoutValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		fanout  int
+		want    int
+		wantErr bool
+	}{
+		{
+			name:   "default",
+			fanout: 0,
+			want:   externalRebroadcastFanout,
+		},
+		{
+			name:   "minimum",
+			fanout: minLocalExternalFanout,
+			want:   minLocalExternalFanout,
+		},
+		{
+			name:   "maximum",
+			fanout: maxLocalExternalFanout,
+			want:   maxLocalExternalFanout,
+		},
+		{
+			name:    "below minimum",
+			fanout:  2,
+			wantErr: true,
+		},
+		{
+			name:    "above maximum",
+			fanout:  maxLocalExternalFanout + 1,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeLocalExternalFanout(tt.fanout)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected fanout validation to fail")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validate fanout: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("fanout = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLaggedLocalExternalFanout(t *testing.T) {
+	tests := []struct {
+		name   string
+		fanout int
+		want   int
+	}{
+		{
+			name:   "minimum configured fanout",
+			fanout: 3,
+			want:   1,
+		},
+		{
+			name:   "odd fanout",
+			fanout: 15,
+			want:   7,
+		},
+		{
+			name:   "even fanout",
+			fanout: 20,
+			want:   10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := laggedLocalExternalFanout(tt.fanout); got != tt.want {
+				t.Fatalf("lagged fanout = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 

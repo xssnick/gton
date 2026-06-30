@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/xssnick/gton/internal/extmsg"
+	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/p2p"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -13,34 +13,24 @@ import (
 )
 
 type extensionNetwork struct {
-	node *p2p.Node
+	node    *p2p.Node
+	checker *externalmsg.Checker
 }
 
 func (n extensionNetwork) SendExternalMessage(ctx context.Context, body []byte, dst *address.Address) error {
-	key, err := extensionExternalMessageAddressKey(dst)
-	if err != nil {
-		return err
-	}
-	return n.node.SendExternalMessage(ctx, body, key)
+	return n.node.SendExternalMessage(ctx, body, dst)
 }
 
 func (n extensionNetwork) SendCheckedExternalMessage(ctx context.Context, body []byte, dst *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error {
-	key, err := extensionExternalMessageAddressKey(dst)
-	if err != nil {
-		return err
-	}
-	return n.node.SendCheckedExternalMessage(ctx, body, key, root, msg)
+	return n.node.SendCheckedExternalMessage(ctx, body, dst, root, msg)
 }
 
-func extensionExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey, error) {
-	if addr == nil {
-		return extmsg.AddressKey{}, errors.New("external message destination address is nil")
+func (n extensionNetwork) CheckExternalMessage(ctx context.Context, body []byte, root *cell.Cell, msg *tlb.ExternalMessage) (externalmsg.CheckResult, error) {
+	if n.checker == nil {
+		return externalmsg.CheckResult{}, errors.New("external message checker is not configured")
 	}
-	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
-		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
+	if root != nil && msg != nil {
+		return n.checker.Check(ctx, body, root, msg)
 	}
-
-	key := extmsg.AddressKey{Workchain: addr.Workchain()}
-	copy(key.Account[:], addr.Data())
-	return key, nil
+	return n.checker.CheckBOC(ctx, body)
 }

@@ -2,15 +2,19 @@ package p2p
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
+	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
@@ -19,14 +23,17 @@ func (n *Node) isPublicServer() bool {
 }
 
 func (n *Node) startGateway() error {
+	// TODO: optimize specific workers to own worker pools later.
+	listenThreads := runtime.GOMAXPROCS(0) * 2
+
 	if n.isPublicServer() {
 		if err := n.configurePublicAddress(); err != nil {
 			return err
 		}
-		return n.gateway.StartServer(n.listenAddr)
+		return n.gateway.StartServer(n.listenAddr, listenThreads)
 	}
 
-	return n.gateway.StartClient()
+	return n.gateway.StartClient(listenThreads)
 }
 
 func (n *Node) configurePublicAddress() error {
@@ -87,6 +94,8 @@ func (n *Node) attachSubscriptionPeers(sub *overlaySubscription) {
 }
 
 func (n *Node) runEventLoop(ctx context.Context) {
+	defer close(n.events)
+
 	for {
 		event, ok := n.eventQueue.Pop(ctx)
 		if !ok {
@@ -110,6 +119,9 @@ func (n *Node) runAnnounceLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			if n.IsOffline() {
+				return
+			}
 			delay := publicAnnounceEvery
 			if err := n.announceSelf(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 				n.log.Warn().Err(err).Msg("failed to announce ordinary-node surface")
@@ -121,6 +133,9 @@ func (n *Node) runAnnounceLoop(ctx context.Context) {
 }
 
 func (n *Node) announceSelf(ctx context.Context) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	if !n.isPublicServer() || n.dht == nil {
 		return nil
 	}
@@ -170,23 +185,41 @@ func (n *Node) selfOverlayNode(spec overlaySpec) (*overlay.Node, error) {
 }
 
 func (n *Node) storeAddressWithRetry(ctx context.Context, addrList address.List) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	store := func(attemptCtx context.Context) error {
+		if n.IsOffline() {
+			return ErrOffline
+		}
 		_, _, err := n.dht.StoreAddress(attemptCtx, addrList, publicAnnounceTTL, n.privKey)
 		return err
 	}
-	return n.retryStoreWithWarmup(ctx, store)
+	return n.retryStoreWithWarmup(ctx, store, n.warmupDHTAddress)
 }
 
 func (n *Node) storeOverlayNodeWithRetry(ctx context.Context, overlayKey []byte, nodes *overlay.NodesList) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	store := func(attemptCtx context.Context) error {
+		if n.IsOffline() {
+			return ErrOffline
+		}
 		_, _, err := n.dht.StoreOverlayNodes(attemptCtx, overlayKey, nodes, publicAnnounceTTL)
 		return err
 	}
-	return n.retryStoreWithWarmup(ctx, store)
+	warmup := func(warmCtx context.Context) error {
+		return n.warmupDHTOverlay(warmCtx, overlayKey)
+	}
+	return n.retryStoreWithWarmup(ctx, store, warmup)
 }
 
-func (n *Node) retryStoreWithWarmup(ctx context.Context, store func(context.Context) error) error {
+func (n *Node) retryStoreWithWarmup(ctx context.Context, store, warmup func(context.Context) error) error {
 	attempt := func() error {
+		if n.IsOffline() {
+			return ErrOffline
+		}
 		storeCtx, cancel := context.WithTimeout(ctx, dhtStoreTimeout)
 		defer cancel()
 		return store(storeCtx)
@@ -197,31 +230,49 @@ func (n *Node) retryStoreWithWarmup(ctx context.Context, store func(context.Cont
 		return err
 	}
 
-	if warmErr := n.warmupDHT(ctx); warmErr != nil && !errors.Is(warmErr, context.Canceled) {
+	if n.IsOffline() {
+		return ErrOffline
+	}
+	if warmErr := warmup(ctx); warmErr != nil && !errors.Is(warmErr, context.Canceled) {
 		n.log.Debug().Err(warmErr).Msg("failed to warm up DHT before retrying store")
 	}
 	return attempt()
 }
 
-func (n *Node) warmupDHT(ctx context.Context) error {
+func (n *Node) warmupDHTAddress(ctx context.Context) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	if n.dht == nil {
 		return nil
 	}
 
-	var errs []error
-	for _, sub := range n.subscriptionsSnapshot() {
-		if !sub.spec.DHTDiscovery {
-			continue
-		}
-		warmCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
-		_, _, err := n.dht.FindOverlayNodes(warmCtx, sub.spec.FullID)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		errs = append(errs, fmt.Errorf("%s: %w", sub.spec.Name, err))
+	warmCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
+	defer cancel()
+
+	_, _, err := n.dht.FindAddresses(warmCtx, n.gateway.GetID())
+	if errors.Is(err, dht.ErrDHTValueIsNotFound) {
+		return nil
 	}
-	return errors.Join(errs...)
+	return err
+}
+
+func (n *Node) warmupDHTOverlay(ctx context.Context, overlayKey []byte) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
+	if n.dht == nil {
+		return nil
+	}
+
+	warmCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
+	defer cancel()
+
+	_, _, err := n.dht.FindOverlayNodes(warmCtx, overlayKey)
+	if errors.Is(err, dht.ErrDHTValueIsNotFound) {
+		return nil
+	}
+	return err
 }
 
 func isTransientDHTStoreError(err error) bool {
@@ -234,7 +285,33 @@ func cloneOverlayNode(node *overlay.Node) *overlay.Node {
 	}
 
 	cloned := *node
+	cloned.ID = cloneOverlayNodeID(node.ID)
 	cloned.Overlay = append([]byte(nil), node.Overlay...)
 	cloned.Signature = append([]byte(nil), node.Signature...)
 	return &cloned
+}
+
+func cloneOverlayNodeID(id any) any {
+	switch key := id.(type) {
+	case keys.PublicKeyED25519:
+		return keys.PublicKeyED25519{Key: append(ed25519.PublicKey(nil), key.Key...)}
+	case keys.PublicKeyAES:
+		return keys.PublicKeyAES{Key: append([]byte(nil), key.Key...)}
+	default:
+		return id
+	}
+}
+
+func overlayNodeHasSerializableID(node *overlay.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch key := node.ID.(type) {
+	case keys.PublicKeyED25519:
+		return len(key.Key) == ed25519.PublicKeySize
+	case keys.PublicKeyAES:
+		return len(key.Key) == ed25519.PublicKeySize
+	default:
+		return false
+	}
 }

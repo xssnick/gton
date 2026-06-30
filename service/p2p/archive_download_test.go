@@ -107,11 +107,24 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	session := node.BeginArchiveSession()
 	defer session.Close()
 
-	peerOverlay, _ := newTestOverlayWrapper()
+	peerOverlay, base := newTestOverlayWrapper()
 	archiveRLDP := &testArchiveRLDP{
 		adnl:        newTestOverlayADNL(),
 		queryResult: ArchiveInfo{ID: 777},
 		asyncErr:    context.DeadlineExceeded,
+	}
+	var archiveInfoQueries int
+	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
+		payload := testOverlayQueryPayload(req)
+		if _, ok := payload.(GetArchiveInfo); !ok {
+			t.Fatalf("unexpected archive info query payload %T", payload)
+		}
+
+		archiveInfoQueries++
+		if out, ok := result.(*tl.Serializable); ok {
+			*out = ArchiveInfo{ID: 777}
+		}
+		return nil
 	}
 	peer := &overlayPeer{
 		id:          peerID,
@@ -129,6 +142,12 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	}
 	if candidate.archiveID != 777 {
 		t.Fatalf("archive id = %d, want 777", candidate.archiveID)
+	}
+	if archiveInfoQueries != 1 {
+		t.Fatalf("archive info ADNL queries = %d, want 1", archiveInfoQueries)
+	}
+	if archiveRLDP.queryCalls != 0 {
+		t.Fatalf("archive info used RLDP DoQuery %d times, want 0", archiveRLDP.queryCalls)
 	}
 	if candidate.hasSeed {
 		t.Fatal("seed probe failure should return candidate without seed")
@@ -194,12 +213,22 @@ func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 func testArchiveDownloadPeer(t *testing.T, label string, archiveID int64, data []byte, delay time.Duration) *overlayPeer {
 	t.Helper()
 
-	peerOverlay, _ := newTestOverlayWrapper()
+	peerOverlay, base := newTestOverlayWrapper()
 	archiveRLDP := &testArchiveRLDP{
 		adnl:        newTestOverlayADNL(),
 		queryResult: ArchiveInfo{ID: archiveID},
 		asyncResult: data,
 		asyncDelay:  delay,
+	}
+	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
+		payload := testOverlayQueryPayload(req)
+		if _, ok := payload.(GetArchiveInfo); !ok {
+			t.Fatalf("unexpected archive info query payload %T", payload)
+		}
+		if out, ok := result.(*tl.Serializable); ok {
+			*out = ArchiveInfo{ID: archiveID}
+		}
+		return nil
 	}
 	return &overlayPeer{
 		id:          testPeerID(label),
@@ -221,6 +250,7 @@ func testArchivePackBytes(label string) []byte {
 type testArchiveRLDP struct {
 	adnl        *testOverlayADNL
 	queryResult tl.Serializable
+	queryCalls  int
 	asyncErr    error
 	asyncResult []byte
 	asyncDelay  time.Duration
@@ -237,6 +267,7 @@ func (r *testArchiveRLDP) GetRateInfo() (int64, int64) {
 func (r *testArchiveRLDP) Close() {}
 
 func (r *testArchiveRLDP) DoQuery(_ context.Context, _ uint64, _ tl.Serializable, result tl.Serializable) error {
+	r.queryCalls++
 	if out, ok := result.(*tl.Serializable); ok {
 		*out = r.queryResult
 	}

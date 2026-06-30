@@ -19,6 +19,14 @@ func New(n hooks.Node) (hooks.Extension, error) {
 	return applyLogger{log: n.Logger}, nil
 }
 
+func (l applyLogger) Start(context.Context) error {
+	return nil
+}
+
+func (l applyLogger) Close(context.Context) error {
+	return nil
+}
+
 func (l applyLogger) OnExternalMessage(ctx context.Context, e hooks.ExternalMessageEvent) error {
 	logEvent := l.log.Info().Bool("is_local", e.IsLocal)
 	if e.MessageParsed != nil && e.MessageParsed.DstAddr != nil {

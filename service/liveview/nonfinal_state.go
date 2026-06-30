@@ -1,4 +1,4 @@
-package liteserver
+package liveview
 
 import (
 	"bytes"
@@ -37,7 +37,7 @@ func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.Laz
 func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedStateUpdate, error) {
 	root := block.Root
 	if root == nil && len(block.BlockData) > 0 {
-		parsed, err := parseTrustedBlockBOC(block.Block, block.BlockData)
+		parsed, err := ParseTrustedBlockBOC(block.Block, block.BlockData)
 		if err != nil {
 			return nonfinalParsedStateUpdate{}, err
 		}

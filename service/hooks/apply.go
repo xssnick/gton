@@ -13,6 +13,10 @@ import (
 // Extension methods may be called concurrently because shard blocks are applied in
 // parallel. Implementations must be thread-safe.
 type Extension interface {
+	// Start runs after the node services are started.
+	Start(context.Context) error
+	// Close stops the extension and waits until it exits or the context is done.
+	Close(context.Context) error
 	// OnBlockApplied runs after a block is applied and before that block flow
 	// can continue to checkpoint/persist. Returning an error retries only this
 	// block flow until nil or context cancellation.
@@ -27,6 +31,9 @@ type Extension interface {
 	OnBlockReceived(context.Context, BlockReceivedEvent) error
 }
 
+// ExtensionFactory initializes an extension from node capabilities.
+type ExtensionFactory func(Node) (Extension, error)
+
 type BlockAppliedEvent struct {
 	// BlockBOC is the raw block BOC bytes that were applied.
 	BlockBOC []byte
@@ -36,15 +43,21 @@ type BlockAppliedEvent struct {
 	BlockRoot *cell.Cell
 	// Meta describes the applied block identity and known block metadata.
 	Meta *storage.BlockMeta
-	// State is the parsed state after applying this block.
-	State *tlb.ShardStateUnsplit
-	// MasterchainRef is set for shard blocks to the including masterchain block.
+	// PreviousState is the state root that block.StateUpdate was applied to.
+	// For shard merges this is a ShardStateSplit root containing both previous shards.
+	PreviousState *cell.Cell
+	// CurrentState is the state root after applying this block.
+	CurrentState *cell.Cell
+	// InclusionMasterRef is set for shard blocks to the including masterchain block.
 	// It is nil for masterchain blocks.
-	MasterchainRef *ton.BlockIDExt
+	InclusionMasterRef *ton.BlockIDExt
+	// InclusionMasterState is set for shard blocks to the including masterchain
+	// state root. It is nil for masterchain blocks.
+	InclusionMasterState *cell.Cell
 }
 
 type ExternalMessageEvent struct {
-	// IsLocal is true when the message came from this node's liteserver API,
+	// IsLocal is true when the message came from this node's local API path,
 	// not from an overlay broadcast.
 	IsLocal bool
 	// MessageRoot is the parsed root cell of the external message.

@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/gton/api/liteserver"
-	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/internal/metrics"
-	service2 "github.com/xssnick/gton/service"
+	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/blocksync"
+	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/hooks"
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
@@ -29,15 +29,53 @@ const (
 	topShard        = int64(-1 << 63)
 )
 
-// ExtensionFactory initializes a statically linked hook extension.
-type ExtensionFactory func(hooks.Node) (hooks.Extension, error)
+type MetricsOptions struct {
+	Enabled    bool
+	ListenAddr string
+	Namespace  string
+}
+
+type StorageOptions struct {
+	Dir                              string
+	CellTotalCacheSize               int64
+	DecodedCellCache                 DecodedCellCacheOptions
+	CellShardMemTableSize            int
+	CellMemTableStopWritesThreshold  int
+	LargeBOCShardReadWorkers         int
+	PersistentStateLargeBOCBatchSize int
+	StateSerializeOnePass            bool
+	ArtifactFileMaxOpen              int
+}
+
+type DecodedCellCacheOptions struct {
+	Enabled       bool
+	Shards        int
+	BytesPerEntry int64
+	MinEntries    int
+	MaxEntries    int
+}
 
 // NodeOptions configures RunNode.
 type NodeOptions struct {
-	Config       nodeconfig.Config
 	GlobalConfig *liteclient.GlobalConfig
 	Logger       zerolog.Logger
-	Extension    ExtensionFactory
+	P2P          p2p.Options
+	Metrics      MetricsOptions
+	Storage      StorageOptions
+	Extension    hooks.ExtensionFactory
+
+	SyncBefore                time.Duration
+	SyncUntil                 uint32
+	ArchiveFromZero           bool
+	StateTTL                  time.Duration
+	ArchiveTTL                time.Duration
+	NextCheckpointBlocks      uint32
+	ArchiveCheckpointBlocks   uint32
+	CheckpointBytes           uint64
+	SyncBackpressureWindows   uint32
+	DisableStateSerialization bool
+
+	LiveView *liveview.Options
 
 	ArchiveCheckpointPeriod time.Duration
 	ArchivePrefetchWindows  int
@@ -49,17 +87,17 @@ type NodeOptions struct {
 func DefaultNodeOptions() NodeOptions {
 	return NodeOptions{
 		Logger:                  zerolog.Nop(),
-		ArchiveCheckpointPeriod: service2.DefaultArchiveCatchUpCheckpointPeriod,
-		ArchivePrefetchWindows:  service2.DefaultArchiveCatchUpPrefetchWindows,
+		ArchiveCheckpointPeriod: service.DefaultArchiveCatchUpCheckpointPeriod,
+		ArchivePrefetchWindows:  service.DefaultArchiveCatchUpPrefetchWindows,
 	}
 }
 
 func applyNodeOptionDefaults(opts NodeOptions) NodeOptions {
 	if opts.ArchiveCheckpointPeriod == 0 {
-		opts.ArchiveCheckpointPeriod = service2.DefaultArchiveCatchUpCheckpointPeriod
+		opts.ArchiveCheckpointPeriod = service.DefaultArchiveCatchUpCheckpointPeriod
 	}
 	if opts.ArchivePrefetchWindows == 0 {
-		opts.ArchivePrefetchWindows = service2.DefaultArchiveCatchUpPrefetchWindows
+		opts.ArchivePrefetchWindows = service.DefaultArchiveCatchUpPrefetchWindows
 	}
 	return opts
 }
@@ -80,7 +118,6 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	cell.MaxBOCCells = maxNodeBOCCells
 	logger.Debug().Int("max_boc_cells", cell.MaxBOCCells).Msg("configured BOC parser limits")
 
-	cfg := runOpts.Config
 	globalConfig := runOpts.GlobalConfig
 	if globalConfig == nil {
 		return fmt.Errorf("global config is required")
@@ -89,34 +126,19 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	ctx, shutdownCtx, stop := signalContexts(parentCtx)
 	defer stop()
 
-	globalConfigPath := cfg.GlobalConfigPath()
 	globalConfigZeroState, err := zeroStateBlockFromGlobalConfig(globalConfig)
 	if err != nil {
-		logger.Error().Err(err).Str("global_config", globalConfigPath).Msg("failed to load global config zerostate")
-		return fmt.Errorf("load global config zerostate %s: %w", globalConfigPath, err)
+		logger.Error().Err(err).Msg("failed to load global config zerostate")
+		return fmt.Errorf("load global config zerostate: %w", err)
 	}
 
-	opts, err := p2pOptionsFromConfig(cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load p2p options")
-		return fmt.Errorf("load p2p options: %w", err)
-	}
+	opts := runOpts.P2P
 	opts.GlobalConfig = globalConfig
 	opts.Logger = &baseLogger
 
-	liteOpts, err := liteserverOptionsFromConfig(cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load liteserver options")
-		return fmt.Errorf("load liteserver options: %w", err)
-	}
-	metricsOpts, err := metricsOptionsFromConfig(cfg)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load metrics options")
-		return fmt.Errorf("load metrics options: %w", err)
-	}
+	metricsOpts := runOpts.Metrics
 	var runtimeMetrics *metrics.Metrics
-	var syncObserver service2.SyncObserver
-	var queryObserver liteserver.QueryObserver
+	var syncObserver service.SyncObserver
 	if metricsOpts.Enabled {
 		runtimeMetrics = metrics.New(metricsOpts.Namespace)
 		if err = startMetricsServer(ctx, logger, metricsOpts.ListenAddr, runtimeMetrics.Handler()); err != nil {
@@ -124,24 +146,12 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 			return fmt.Errorf("start metrics server %s: %w", metricsOpts.ListenAddr, err)
 		}
 		syncObserver = runtimeMetrics
-		queryObserver = runtimeMetrics
 	}
-	syncBefore, err := cfg.SyncBefore()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load sync options")
-		return fmt.Errorf("load sync options: %w", err)
-	}
-	archiveFromZero := cfg.ArchiveFromZero()
-	stateTTL, err := cfg.StateTTL()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load state ttl option")
-		return fmt.Errorf("load state ttl option: %w", err)
-	}
-	archiveTTL, err := cfg.ArchiveTTL()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load archive ttl option")
-		return fmt.Errorf("load archive ttl option: %w", err)
-	}
+	syncBefore := runOpts.SyncBefore
+	syncUntil := runOpts.SyncUntil
+	archiveFromZero := runOpts.ArchiveFromZero
+	stateTTL := runOpts.StateTTL
+	archiveTTL := runOpts.ArchiveTTL
 	if archiveFromZero && stateTTL != 0 {
 		logger.Error().
 			Dur("state_ttl", stateTTL).
@@ -154,67 +164,24 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 			Msg("ton.sync_before=-1 requires ton.archive_ttl=0")
 		return fmt.Errorf("ton.sync_before=-1 requires ton.archive_ttl=0")
 	}
-	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load next checkpoint blocks option")
-		return fmt.Errorf("load next checkpoint blocks option: %w", err)
-	}
-	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load archive checkpoint blocks option")
-		return fmt.Errorf("load archive checkpoint blocks option: %w", err)
-	}
-	checkpointBytes, err := cfg.CheckpointBytes()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load checkpoint bytes option")
-		return fmt.Errorf("load checkpoint bytes option: %w", err)
-	}
-	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load sync backpressure windows option")
-		return fmt.Errorf("load sync backpressure windows option: %w", err)
-	}
+	nextCheckpointBlocks := runOpts.NextCheckpointBlocks
+	archiveCheckpointBlocks := runOpts.ArchiveCheckpointBlocks
+	checkpointBytes := runOpts.CheckpointBytes
+	syncBackpressureWindows := runOpts.SyncBackpressureWindows
 
-	storageDir := cfg.StorageDir()
+	storageOpts := runOpts.Storage
+	storageDir := storageOpts.Dir
 	if storageDir == "" {
 		logger.Error().Msg("storage.dir is required")
 		return fmt.Errorf("storage.dir is required")
 	}
-	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage cell cache option")
-		return fmt.Errorf("load storage cell cache option: %w", err)
-	}
-	decodedCellCacheOpts, err := cfg.DecodedCellCacheOptions()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage decoded cell cache option")
-		return fmt.Errorf("load storage decoded cell cache option: %w", err)
-	}
-	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage cell memtable option")
-		return fmt.Errorf("load storage cell memtable option: %w", err)
-	}
-	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage cell memtable stop writes threshold option")
-		return fmt.Errorf("load storage cell memtable stop writes threshold option: %w", err)
-	}
-	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage large boc shard read workers option")
-		return fmt.Errorf("load storage large boc shard read workers option: %w", err)
-	}
-	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage persistent state large boc batch size option")
-		return fmt.Errorf("load storage persistent state large boc batch size option: %w", err)
-	}
-	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to load storage artifact file max open option")
-		return fmt.Errorf("load storage artifact file max open option: %w", err)
-	}
+	cellTotalCacheSize := storageOpts.CellTotalCacheSize
+	decodedCellCacheOpts := storageOpts.DecodedCellCache
+	cellShardMemTableSize := storageOpts.CellShardMemTableSize
+	cellMemTableStopWritesThreshold := storageOpts.CellMemTableStopWritesThreshold
+	largeBOCShardReadWorkers := storageOpts.LargeBOCShardReadWorkers
+	persistentStateLargeBOCBatchSize := storageOpts.PersistentStateLargeBOCBatchSize
+	artifactFileMaxOpen := storageOpts.ArtifactFileMaxOpen
 	storageOpenStarted := time.Now()
 	logger.Info().
 		Str("storage", "pebble").
@@ -273,7 +240,6 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	if err = ensureStoredZeroStateMatchesGlobalConfig(ctx, store, globalConfigZeroState); err != nil {
 		logger.Error().
 			Err(err).
-			Str("global_config", globalConfigPath).
 			Str("configured_zerostate", formatBlockID(globalConfigZeroState)).
 			Msg("stored zerostate does not match global config")
 		return err
@@ -291,43 +257,55 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	blockSync := blocksync.New(&baseLogger, node)
 
 	stateLogger := &baseLogger
-	stateSource := service2.NewP2PStateSource(node, stateLogger)
+	stateSource := service.NewP2PStateSource(node, stateLogger)
 
 	stateSync := state.NewSyncer(stateSource, store, state.SyncerOptions{
 		SyncBefore: syncBefore,
+		SyncUntil:  syncUntil,
 	}, stateLogger)
 
-	liveLiteStore := liteserver.NewLiveStore(store, liteserver.LiveStoreOptions{
-		MasterBlockCache: liteOpts.MasterBlockCache,
-		ShardBlockCache:  liteOpts.ShardBlockCache,
-		NonFinalEnabled:  liteOpts.NonFinalEnabled,
+	liveViewOptions := liveview.Options{
+		MasterBlockCache: liveview.DefaultMasterBlockCache,
+		ShardBlockCache:  liveview.DefaultShardBlockCache,
 		LiveBlockCache:   liveBlockCache,
-	})
-	extensionLogger := baseLogger.With().Str("source", "extension").Logger()
-	extensionNode := hooks.Node{
-		Network: extensionNetwork{node: node},
-		Store:   liveLiteStore,
-		Logger:  extensionLogger,
 	}
-	extension, err := extensionFromFactory(runOpts.Extension, extensionNode)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to initialize static extension")
-		return fmt.Errorf("initialize static extension: %w", err)
+	if runOpts.LiveView != nil {
+		liveViewOptions = *runOpts.LiveView
+		liveViewOptions.LiveBlockCache = liveBlockCache
 	}
+	liveStore := liveview.New(store, liveViewOptions)
 
-	currentStatePublisher := service2.CurrentStatePublisher(liveLiteStore)
+	currentStatePublisher := service.CurrentStatePublisher(liveStore)
 	externalMessageLogger := componentLogger(baseLogger, "external_message")
-	externalMessageChecker, err := liteserver.NewExternalMessageChecker(liteserver.ExternalMessageCheckOptions{
+	externalMessageChecker, err := externalmsg.NewChecker(externalmsg.Options{
 		Logger: &externalMessageLogger,
-		Store:  liveLiteStore,
+		Store:  liveStore,
 	})
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to initialize external message checker")
 		return fmt.Errorf("initialize external message checker: %w", err)
 	}
 
+	extensionFactory := runOpts.Extension
+	extensionLogger := baseLogger.With().Str("source", "extension").Logger()
+	var metricsCapability any
+	if runtimeMetrics != nil {
+		metricsCapability = runtimeMetrics
+	}
+	extensionNode := hooks.Node{
+		Network: extensionNetwork{node: node, checker: externalMessageChecker},
+		Store:   liveStore,
+		Logger:  extensionLogger,
+		Metrics: metricsCapability,
+	}
+	extension, err := extensionFromFactory(extensionFactory, extensionNode)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to initialize static extension")
+		return fmt.Errorf("initialize static extension: %w", err)
+	}
+
 	serviceLogger := componentLogger(baseLogger, "service")
-	svc := service2.New(serviceLogger, node, blockSync, store, stateSync, service2.Options{
+	svc := service.New(serviceLogger, node, blockSync, store, stateSync, service.Options{
 		ArchiveCatchUpCheckpointBlocks:          archiveCheckpointBlocks,
 		ArchiveCatchUpCheckpointPeriod:          runOpts.ArchiveCheckpointPeriod,
 		ArchiveCatchUpPrefetchWindows:           runOpts.ArchivePrefetchWindows,
@@ -336,16 +314,17 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		SyncBackpressureWindows:                 syncBackpressureWindows,
 		CurrentStatePublisher:                   currentStatePublisher,
 		LiveBlockCache:                          liveBlockCache,
-		CurrentStatePublisherUsesLiveBlockCache: liveLiteStore != nil,
+		CurrentStatePublisherUsesLiveBlockCache: liveStore != nil,
 		ShutdownContext:                         shutdownCtx,
 		StateFilesDir:                           stateFilesDir,
 		StateTTL:                                stateTTL,
 		ArchiveTTL:                              archiveTTL,
 		ArchiveFromZero:                         archiveFromZero,
+		SyncUntil:                               syncUntil,
 		StorageDir:                              storageDir,
-		DisableStateSerialization:               cfg.DisableStateSerialization,
+		DisableStateSerialization:               runOpts.DisableStateSerialization,
 		PersistentStateLargeBOCBatchSize:        persistentStateLargeBOCBatchSize,
-		StateSerializeOnePass:                   cfg.Storage.StateSerializeOnePass,
+		StateSerializeOnePass:                   storageOpts.StateSerializeOnePass,
 		SyncObserver:                            syncObserver,
 		Extension:                               extension,
 		ExternalMessageChecker:                  externalMessageChecker,
@@ -359,31 +338,14 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
 			ServiceStatusReader: svc.StatusSnapshot,
 			DBStatusReader:      store.DBStatus,
+			LazyCellLoadReader:  svc.LazyCellLoadMetrics,
 			ArchivePackagesDir:  filepath.Join(storageDir, "archive", "packages"),
 			StateFilesDir:       stateFilesDir,
 		}); err != nil {
 			logger.Error().Err(err).Msg("failed to initialize runtime metrics collectors")
 			return fmt.Errorf("initialize runtime metrics collectors: %w", err)
 		}
-	}
-
-	var liteSrv *liteserver.Server
-	if liteOpts.Enabled {
-		liteSrv, err = liteserver.New(liteserver.Options{
-			Logger:        &baseLogger,
-			Store:         liveLiteStore,
-			MessageSender: node,
-			QueryObserver: queryObserver,
-			PrivateKey:    liteOpts.PrivateKey,
-			ListenAddr:    liteOpts.ListenAddr,
-			NonFinal:      liteOpts.NonFinalEnabled,
-			ZeroState:     zeroStateIDFromBlock(globalConfigZeroState),
-			RequestLimits: liteOpts.Limits,
-		})
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to initialize liteserver")
-			return fmt.Errorf("initialize liteserver: %w", err)
-		}
+		store.SetArtifactMetricsObserver(runtimeMetrics)
 	}
 
 	if err = node.Start(ctx); err != nil {
@@ -400,36 +362,29 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 
 	svc.Start(ctx)
 
-	if liteSrv != nil {
-		if err = liteSrv.Start(ctx); err != nil {
-			logger.Error().Err(err).Str("listen_addr", liteOpts.ListenAddr).Msg("failed to start liteserver")
+	if extension != nil {
+		if err = extension.Start(ctx); err != nil {
+			logger.Error().Err(err).Msg("failed to start static extension")
 			stop()
 			svc.Wait()
 			blockSyncWG.Wait()
 			node.Wait()
-			return fmt.Errorf("start liteserver %s: %w", liteOpts.ListenAddr, err)
+			return fmt.Errorf("start static extension: %w", err)
 		}
 	}
 
 	logger.Info().
-		Str("global_config", globalConfigPath).
 		Str("listen_addr", fallbackString(opts.ListenAddr, "<client-mode>")).
 		Str("adnl_id", node.LocalID().Base64()).
 		Bool("dht_server", opts.DHTListenAddr != "").
 		Str("dht_listen_addr", fallbackString(opts.DHTListenAddr, "<client-mode>")).
-		Bool("liteserver", liteOpts.Enabled).
-		Str("liteserver_listen_addr", fallbackString(liteOpts.ListenAddr, "<disabled>")).
-		Int("liteserver_query_workers", liteclient.ServerQueryWorkers).
-		Int64("liteserver_send_message_broadcast_bytes_per_second", opts.ExternalBroadcastCapacity.BytesPerSecond).
-		Dur("liteserver_send_message_broadcast_max_delay", opts.ExternalBroadcastCapacity.MaxDelay).
-		Int("liteserver_capacity_per_ip", liteOpts.Limits.CapacityPerIP).
-		Float64("liteserver_cooling_per_sec", liteOpts.Limits.CoolingPerSec).
-		Int("liteserver_max_connections_per_ip", liteOpts.Limits.MaxConnectionsPerIP).
-		Dur("liteserver_max_keep_alive", liteOpts.Limits.MaxKeepAlive).
+		Int64("external_message_broadcast_bytes_per_second", opts.ExternalBroadcastCapacity.BytesPerSecond).
+		Dur("external_message_broadcast_max_delay", opts.ExternalBroadcastCapacity.MaxDelay).
 		Bool("metrics", metricsOpts.Enabled).
 		Str("metrics_listen_addr", fallbackString(metricsOpts.ListenAddr, "<disabled>")).
 		Bool("archive_from_zero", archiveFromZero).
 		Dur("sync_before", syncBefore).
+		Uint32("sync_until", syncUntil).
 		Dur("state_ttl", stateTTL).
 		Dur("archive_ttl", archiveTTL).
 		Uint32("next_checkpoint_blocks", nextCheckpointBlocks).
@@ -440,8 +395,8 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		Int("archive_prefetch_windows", runOpts.ArchivePrefetchWindows).
 		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
 		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
-		Bool("state_serialize_one_pass", cfg.Storage.StateSerializeOnePass).
-		Bool("disable_state_serialization", cfg.DisableStateSerialization).
+		Bool("state_serialize_one_pass", storageOpts.StateSerializeOnePass).
+		Bool("disable_state_serialization", runOpts.DisableStateSerialization).
 		Msg("service started")
 
 	if runOpts.ConsoleInput != nil && runOpts.ConsoleOutput != nil {
@@ -450,17 +405,16 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 
 	<-ctx.Done()
 	logger.Info().Msg("shutting down")
-	if liteSrv != nil {
-		if err := liteSrv.Close(); err != nil {
-			logger.Warn().Err(err).Msg("failed to stop liteserver")
+	if extension != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := extension.Close(closeCtx); err != nil {
+			logger.Warn().Err(err).Msg("failed to stop static extension")
 		}
+		cancel()
 	}
 	svc.Wait()
 	blockSyncWG.Wait()
 	node.Wait()
-	if liteSrv != nil {
-		liteSrv.Wait()
-	}
 	closeStore()
 	logger.Info().Msg("shutdown complete")
 	return nil
