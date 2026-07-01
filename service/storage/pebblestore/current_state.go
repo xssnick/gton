@@ -44,6 +44,10 @@ func (s *Store) validateCurrentStateRecordMetadata(ctx context.Context, label st
 }
 
 func validateCurrentStateRecordBlockMetadata(reader pebbleReader, recordLabel string, blockLabel string, current storage.BlockState) error {
+	if err := validateFullBlockIDHashes(current.Block); err != nil {
+		return err
+	}
+
 	saved, err := blockStateMetaFromReader(reader, current.Block)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -179,6 +183,11 @@ func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage
 
 func validateCheckpointStateArtifacts(entries []storage.StateCheckpointBlock) error {
 	for _, entry := range entries {
+		if entry.State != nil {
+			if err := validateFullBlockIDHashes(entry.State.Block); err != nil {
+				return err
+			}
+		}
 		if entry.State == nil || entry.State.Block.SeqNo == 0 {
 			continue
 		}
@@ -244,8 +253,14 @@ func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, ori
 	if isEmptyBlockID(origin) {
 		return 0, fmt.Errorf("cell generation origin persistent state is empty")
 	}
+	if err := validateFullBlockIDHashes(origin); err != nil {
+		return 0, err
+	}
 	if isEmptyBlockID(expectedCurrent) {
 		return 0, fmt.Errorf("expected current state block is empty")
+	}
+	if err := validateFullBlockIDHashes(expectedCurrent); err != nil {
+		return 0, err
 	}
 
 	if err := s.verifyCurrentStateRootsPresentInGeneration(ctx, generation, current); err != nil {
@@ -262,6 +277,14 @@ func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, ori
 func (s *Store) DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Context, origin ton.BlockIDExt, current *storage.CurrentState, preserveStateMeta []ton.BlockIDExt) (int, error) {
 	if isEmptyBlockID(origin) {
 		return 0, fmt.Errorf("cell generation origin persistent state is empty")
+	}
+	if err := validateFullBlockIDHashes(origin); err != nil {
+		return 0, err
+	}
+	for _, block := range preserveStateMeta {
+		if err := validateFullBlockIDHashes(block); err != nil {
+			return 0, err
+		}
 	}
 
 	db, err := s.acquireHotDB(ctx)
@@ -419,6 +442,10 @@ func prepareBlockStateHeader(state *storage.BlockState) (storage.BlockState, cel
 	var zero cell.Hash
 	var stateRootHash cell.Hash
 	saved := *state
+	if err := validateFullBlockIDHashes(saved.Block); err != nil {
+		return storage.BlockState{}, stateRootHash, err
+	}
+
 	if len(saved.StateRootHash) == 0 && saved.Cell != nil {
 		hash := saved.Cell.HashKey(0)
 		saved.StateRootHash = hash[:]
@@ -493,7 +520,14 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	defer s.releaseHotDB()
 
 	s.hotWriteMu.Lock()
-	defer s.hotWriteMu.Unlock()
+	hotWriteLocked := true
+	unlockHotWrite := func() {
+		if hotWriteLocked {
+			s.hotWriteMu.Unlock()
+			hotWriteLocked = false
+		}
+	}
+	defer unlockHotWrite()
 
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -521,14 +555,31 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	for _, write := range artifactWrites {
 		mergeCheckpointBlockMeta(blockMetas, write.meta)
 	}
+	mergeStateBlockMeta := func(state storage.BlockState) error {
+		meta, err := storage.BuildBlockMetaFromState(state)
+		if err != nil {
+			return err
+		}
+		mergeCheckpointBlockMeta(blockMetas, meta)
+		return nil
+	}
 	for _, state := range prepared {
-		mergeCheckpointBlockMeta(blockMetas, storage.BuildBlockMetaFromState(state.saved))
+		if err := mergeStateBlockMeta(state.saved); err != nil {
+			s.mu.Unlock()
+			return timing, err
+		}
 	}
 	if current != nil {
-		mergeCheckpointBlockMeta(blockMetas, storage.BuildBlockMetaFromState(current.Masterchain))
+		if err := mergeStateBlockMeta(current.Masterchain); err != nil {
+			s.mu.Unlock()
+			return timing, err
+		}
 		for _, key := range storage.SortedShardKeys(current.Shards) {
 			shard := current.Shards[key]
-			mergeCheckpointBlockMeta(blockMetas, storage.BuildBlockMetaFromState(shard))
+			if err := mergeStateBlockMeta(shard); err != nil {
+				s.mu.Unlock()
+				return timing, err
+			}
 		}
 	}
 
@@ -571,6 +622,8 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 		return timing, err
 	}
 	timing.MetadataSync = time.Since(hotSyncStarted)
+	unlockHotWrite()
+
 	s.deleteArchivePackageRegistrationCache(artifactRegistrations)
 	if syncArtifacts {
 		s.clearSyncedArtifactPacks(syncedPacks)
@@ -615,6 +668,10 @@ func (s *Store) validateCurrentStateMetadata(db *pebble.DB, current *storage.Cur
 }
 
 func (s *Store) validateCurrentStateBlockMetadata(db *pebble.DB, label string, current storage.BlockState, prepared map[storage.BlockRootHash]storage.BlockState) error {
+	if err := validateFullBlockIDHashes(current.Block); err != nil {
+		return err
+	}
+
 	if saved, ok := prepared[storage.BlockKey(current.Block)]; ok {
 		return validateCurrentStateBlockMetaMatch(label, current, saved)
 	}

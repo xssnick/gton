@@ -221,9 +221,6 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 		}
 	}
 
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	state, err := n.stateForCompressedBlockDecompressionPrev(ctx, prev)
 	if err != nil {
 		if errors.Is(err, tnstore.ErrNotFound) {

@@ -45,3 +45,23 @@ func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
 		t.Fatalf("first retained key = %x, want %x", svc.shardDescriptionOrder[0], firstKept)
 	}
 }
+
+func TestRememberShardDescriptionHintSkipsAfterSyncUntilFrozen(t *testing.T) {
+	block := testBlockID(0, topShard, 10)
+	svc := &Service{
+		node:      newFrozenTestNode(t),
+		syncUntil: 200,
+	}
+
+	svc.rememberShardDescriptionHint(p2p.BroadcastEvent{
+		Block: block,
+		Kind:  "tonNode.newShardBlockBroadcast",
+		ShardDescription: &p2p.ShardBlockDescription{
+			Block: block,
+		},
+	})
+
+	if len(svc.shardDescriptionHints) != 0 {
+		t.Fatalf("shard description hints = %d, want 0", len(svc.shardDescriptionHints))
+	}
+}

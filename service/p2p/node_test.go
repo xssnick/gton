@@ -12,7 +12,6 @@ import (
 
 	"github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -518,7 +517,7 @@ func TestStartDHTClientUsesSeparateGateway(t *testing.T) {
 	}
 }
 
-func TestStartDHTServerUsesDedicatedGatewayIDAndInnerClient(t *testing.T) {
+func TestStartDHTServerUsesDedicatedGatewayIDAndServerBackend(t *testing.T) {
 	node := newTestNode(t)
 	node.dhtListenAddr = freeUDPAddr(t)
 	node.externalIP = net.ParseIP("127.0.0.1").To4()
@@ -538,12 +537,12 @@ func TestStartDHTServerUsesDedicatedGatewayIDAndInnerClient(t *testing.T) {
 		t.Fatal("expected DHT server to be initialized")
 	}
 
-	client, ok := node.dht.(*dht.Client)
+	backend, ok := node.dht.(*serverDHTBackend)
 	if !ok {
-		t.Fatalf("expected p2p DHT handle to use inner client, got %T", node.dht)
+		t.Fatalf("expected p2p DHT handle to use server backend, got %T", node.dht)
 	}
-	if client != node.dhtServer.Client {
-		t.Fatal("expected p2p DHT handle to point at DHT server inner client")
+	if backend.Server != node.dhtServer {
+		t.Fatal("expected p2p DHT handle to point at DHT server")
 	}
 
 	if node.dhtGateway == nil {

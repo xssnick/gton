@@ -293,7 +293,7 @@ func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 			storage.BlockKey(shardA): {Block: shardA},
 			storage.BlockKey(shardB): {Block: shardB},
 		},
-		downloadedFactory: func(block ton.BlockIDExt) storage.DownloadedState {
+		downloadedFactory: func(block ton.BlockIDExt) DownloadedState {
 			return &trackingDownloadedState{
 				block:          block,
 				currentDecodes: &currentDecodes,
@@ -636,7 +636,7 @@ type fakeSource struct {
 	zeroStates         map[storage.BlockRootHash]*storage.BlockState
 	states             map[storage.BlockRootHash]*storage.BlockState
 	keyBlockBatches    map[uint32]KeyBlockBatch
-	downloadedFactory  func(block ton.BlockIDExt) storage.DownloadedState
+	downloadedFactory  func(block ton.BlockIDExt) DownloadedState
 	errByBlock         map[storage.BlockRootHash]error
 	errSequenceByBlock map[storage.BlockRootHash][]error
 	downloadCount      map[storage.BlockRootHash]int
@@ -695,7 +695,7 @@ func (f *fakeSource) BlockFull(_ context.Context, block ton.BlockIDExt) (*storag
 	return testServedBlockFull(block), nil
 }
 
-func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (storage.DownloadedState, error) {
+func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (DownloadedState, error) {
 	key := storage.BlockKey(block)
 
 	f.mu.Lock()
@@ -790,7 +790,7 @@ func newImmediateDownloadedState(state *storage.BlockState) storage.DownloadedSt
 	return &immediateDownloadedState{state: storage.CloneBlockState(state)}
 }
 
-func newImmediateDownloadedStateWithArtifact(state *storage.BlockState) storage.DownloadedState {
+func newImmediateDownloadedStateWithArtifact(state *storage.BlockState) DownloadedState {
 	if state == nil {
 		return &immediateDownloadedState{}
 	}

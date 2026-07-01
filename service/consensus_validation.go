@@ -140,9 +140,6 @@ func (s *Service) checkMasterchainHardforkConsensus(current *tnstore.BlockState,
 }
 
 func (c *checkedMasterchainConsensus) validateFor(current *tnstore.BlockState, block ton.BlockIDExt) error {
-	if c == nil {
-		return fmt.Errorf("masterchain block %s has no checked consensus", tnstore.FormatBlockRef(block))
-	}
 	if !c.block.Equals(&block) {
 		return fmt.Errorf("checked consensus block mismatch: checked=%s block=%s", tnstore.FormatBlockRef(c.block), tnstore.FormatBlockRef(block))
 	}

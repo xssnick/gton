@@ -61,8 +61,15 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load current state: %w", err)
 	}
+	if err = s.checkCurrentBeforeSyncUntil(ctx, current); err != nil {
+		return err
+	}
 
 	for {
+		if s.syncUntilFrozen() {
+			return nil
+		}
+
 		if current.ShardClientSeqno == 0 {
 			current.ShardClientSeqno = current.Masterchain.Block.SeqNo
 		}
@@ -153,6 +160,9 @@ func (s *Service) catchUpCurrentState(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if s.syncUntilFrozen() {
+			return nil
+		}
 		if !next.changed {
 			woken, err := s.waitCurrentStatePersistOrWake(ctx)
 			if err != nil {
@@ -232,7 +242,7 @@ type queuedMasterchainFuture struct {
 
 type cachedMasterchainBlockForApply struct {
 	block          PreparedBlock
-	source         string
+	source         SyncBlockSource
 	prepareElapsed time.Duration
 }
 
@@ -662,14 +672,14 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 	prepared.PrepareElapsed = time.Since(started)
 	return cachedMasterchainBlockForApply{
 		block:          prepared,
-		source:         "broadcast_candidate",
+		source:         SyncBlockSourceBroadcastCandidate,
 		prepareElapsed: prepared.PrepareElapsed,
 	}, nil
 }
 
 func (s *Service) takeCachedMasterchainBlockForApply(ctx context.Context, prev, target ton.BlockIDExt) (cachedMasterchainBlockForApply, error) {
 	if downloaded, ok := s.takeQueuedMasterchainBlock(prev, target); ok {
-		return cachedMasterchainBlockForApply{block: downloaded, source: "broadcast_queue"}, nil
+		return cachedMasterchainBlockForApply{block: downloaded, source: SyncBlockSourceBroadcastQueue}, nil
 	}
 
 	return s.promoteQueuedMasterchainBroadcastCandidate(ctx, prev, target)

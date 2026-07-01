@@ -1,6 +1,7 @@
 package logutil
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -18,9 +19,11 @@ type Config struct {
 }
 
 type Factory struct {
-	writer    io.Writer
-	level     zerolog.Level
-	overrides map[string]zerolog.Level
+	writer     io.Writer
+	baseWriter io.Writer
+	level      zerolog.Level
+	baseLevel  zerolog.Level
+	overrides  map[string]zerolog.Level
 }
 
 func ParseLevel(raw string) (zerolog.Level, error) {
@@ -54,10 +57,28 @@ func NewFactory(out io.Writer, cfg Config) Factory {
 		overrides[category] = level
 	}
 
+	writer := logWriter(out, cfg.JSON)
+	baseWriter := writer
+	baseLevel := cfg.Level
+	for _, level := range overrides {
+		if level < baseLevel {
+			baseLevel = level
+		}
+	}
+	if len(overrides) > 0 {
+		baseWriter = levelOverrideWriter{
+			writer:    writer,
+			level:     cfg.Level,
+			overrides: overrides,
+		}
+	}
+
 	return Factory{
-		writer:    logWriter(out, cfg.JSON),
-		level:     cfg.Level,
-		overrides: overrides,
+		writer:     writer,
+		baseWriter: baseWriter,
+		level:      cfg.Level,
+		baseLevel:  baseLevel,
+		overrides:  overrides,
 	}
 }
 
@@ -151,9 +172,8 @@ func (f Factory) Category(category string) zerolog.Logger {
 	return newLogger(f.writer, f.LevelFor(category))
 }
 
-func (f Factory) CategoryPtr(category string) *zerolog.Logger {
-	logger := f.Category(category)
-	return &logger
+func (f Factory) Base() zerolog.Logger {
+	return newLogger(f.baseWriter, f.baseLevel)
 }
 
 func (f Factory) Component(component string) zerolog.Logger {
@@ -169,6 +189,45 @@ func (f Factory) LevelFor(category string) zerolog.Level {
 		return level
 	}
 	return f.level
+}
+
+type levelOverrideWriter struct {
+	writer    io.Writer
+	level     zerolog.Level
+	overrides map[string]zerolog.Level
+}
+
+func (w levelOverrideWriter) Write(p []byte) (int, error) {
+	return w.WriteLevel(zerolog.NoLevel, p)
+}
+
+func (w levelOverrideWriter) WriteLevel(level zerolog.Level, p []byte) (int, error) {
+	if level != zerolog.NoLevel && level < w.levelForEvent(p) {
+		return len(p), nil
+	}
+	n, err := w.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+	return len(p), nil
+}
+
+func (w levelOverrideWriter) levelForEvent(p []byte) zerolog.Level {
+	component := eventComponent(p)
+	if level, ok := w.overrides[component]; ok {
+		return level
+	}
+	return w.level
+}
+
+func eventComponent(p []byte) string {
+	var event struct {
+		Component string `json:"component"`
+	}
+	if err := json.Unmarshal(p, &event); err != nil {
+		return ""
+	}
+	return normalizeCategory(event.Component)
 }
 
 func logWriter(out io.Writer, useJSON bool) io.Writer {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,6 +90,26 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 	}
 	if resp != nil {
 		t.Fatalf("unexpected getOutMsgQueueProof response %T", resp)
+	}
+}
+
+func TestCustomFixedOverlayDoesNotAnswerGetRandomPeers(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name: "custom.private-a",
+			Kind: overlayKindCustomFixed,
+		},
+		log: discardLogger(),
+	}
+
+	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, overlay.GetRandomPeers{})
+	if err == nil || !strings.Contains(err.Error(), "overlay is private") {
+		t.Fatalf("getRandomPeers error = %v, want private overlay reject", err)
+	}
+	if resp != nil {
+		t.Fatalf("unexpected getRandomPeers response %T", resp)
 	}
 }
 
@@ -343,6 +364,152 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 
 	if !hasSelf || !hasForeign {
 		t.Fatalf("missing nodes in getRandomPeers response: self=%v foreign=%v", hasSelf, hasForeign)
+	}
+}
+
+func TestOverlayNodeIdentityRejectsMalformedIDWithoutPanic(t *testing.T) {
+	node := newTestNode(t)
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{ShortID: make([]byte, 32)},
+	}
+	malformed := overlay.Node{
+		Overlay: sub.spec.ShortID,
+		Version: int32(time.Now().Unix()),
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("overlayNodeIdentity panicked on malformed node ID: %v", recovered)
+		}
+	}()
+
+	_, err := sub.overlayNodeIdentity(malformed)
+	if err == nil || !strings.Contains(err.Error(), "unsupported overlay node key type") {
+		t.Fatalf("overlayNodeIdentity error = %v, want unsupported key type", err)
+	}
+}
+
+func TestHandleGetRandomPeersSkipsMalformedAnnouncement(t *testing.T) {
+	node := newTestNode(t)
+	zeroHash := make([]byte, 32)
+	spec, err := buildOverlaySpec(zeroHash, -1, topShard, "masterchain")
+	if err != nil {
+		t.Fatalf("build overlay spec: %v", err)
+	}
+
+	sub := &overlaySubscription{
+		node:  node,
+		spec:  spec,
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{},
+	}
+	malformedPeerID := testPeerID("malformed")
+	sub.peers[malformedPeerID] = &overlayPeer{
+		id:        malformedPeerID,
+		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:     true,
+	}
+
+	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
+	for _, node := range res.List {
+		if !overlayNodeHasSerializableID(&node) {
+			t.Fatalf("getRandomPeers returned malformed node: %#v", node)
+		}
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("getRandomPeers response serialization panicked: %v", recovered)
+		}
+	}()
+	if _, err = tl.Serialize(res, true); err != nil {
+		t.Fatalf("serialize getRandomPeers response: %v", err)
+	}
+}
+
+func TestOverlayNodesSnapshotConcurrentAnnouncementUpdate(t *testing.T) {
+	node := newTestNode(t)
+	zeroHash := make([]byte, 32)
+	spec, err := buildOverlaySpec(zeroHash, -1, topShard, "masterchain")
+	if err != nil {
+		t.Fatalf("build overlay spec: %v", err)
+	}
+
+	_, firstKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate first key: %v", err)
+	}
+	firstNode, err := overlay.NewNode(spec.FullID, firstKey)
+	if err != nil {
+		t.Fatalf("build first overlay node: %v", err)
+	}
+	_, secondKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate second key: %v", err)
+	}
+	secondNode, err := overlay.NewNode(spec.FullID, secondKey)
+	if err != nil {
+		t.Fatalf("build second overlay node: %v", err)
+	}
+
+	peerID := testPeerID("peer")
+	peer := &overlayPeer{id: peerID, alive: true}
+	peer.mergeAnnouncement(firstNode)
+	sub := &overlaySubscription{
+		node: node,
+		spec: spec,
+		peers: map[PeerID]*overlayPeer{
+			peerID: peer,
+		},
+	}
+
+	start := make(chan struct{})
+	done := make(chan struct{})
+	errCh := make(chan string, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 2000; i++ {
+			if i%2 == 0 {
+				peer.mergeAnnouncement(firstNode)
+				continue
+			}
+			peer.mergeAnnouncement(secondNode)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 2000; i++ {
+			for _, advertised := range sub.overlayNodesSnapshot() {
+				if !overlayNodeHasSerializableID(&advertised) {
+					select {
+					case errCh <- "snapshot returned malformed advertised node":
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+	close(start)
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent announcement snapshot test timed out")
+	}
+	select {
+	case msg := <-errCh:
+		t.Fatal(msg)
+	default:
 	}
 }
 

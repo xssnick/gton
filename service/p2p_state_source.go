@@ -137,7 +137,7 @@ func (s *p2pStateSource) keyBlockProof(ctx context.Context, block ton.BlockIDExt
 	return state.ProofDownload{Data: proof.Data, Link: proof.Link}, err
 }
 
-func (s *p2pStateSource) DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (storage.DownloadedState, error) {
+func (s *p2pStateSource) DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (state.DownloadedState, error) {
 	s.log.Info().
 		Str("block", storage.FormatBlockRef(block)).
 		Str("masterchain", storage.FormatBlockRef(master)).

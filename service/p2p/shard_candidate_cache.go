@@ -64,9 +64,6 @@ func newShardBlockCandidateCache(ttl time.Duration, maxBytes int64, maxItems int
 }
 
 func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, now time.Time) ([]DownloadedBlock, error) {
-	if c == nil {
-		return nil, tnstore.ErrNotFound
-	}
 	if err := validateShardBlockCandidate(downloaded); err != nil {
 		return nil, err
 	}
@@ -110,9 +107,6 @@ func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, no
 }
 
 func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, now time.Time) ([]DownloadedBlock, error) {
-	if c == nil {
-		return nil, tnstore.ErrNotFound
-	}
 	if len(proofs) == 0 {
 		return nil, nil
 	}
@@ -305,7 +299,7 @@ func shardDescriptionProofBytes(proof ShardDescriptionProof) int64 {
 }
 
 func (n *Node) rememberShardBlockCandidate(downloaded *DownloadedBlock) {
-	if n == nil || n.shardCandidateCache == nil || downloaded == nil || isMasterchainBlock(downloaded.ID) {
+	if downloaded == nil || isMasterchainBlock(downloaded.ID) {
 		return
 	}
 
@@ -321,7 +315,7 @@ func (n *Node) rememberShardBlockCandidate(downloaded *DownloadedBlock) {
 }
 
 func (n *Node) RememberShardDescriptionProofs(proofs []ShardDescriptionProof) {
-	if n == nil || n.shardCandidateCache == nil || len(proofs) == 0 {
+	if len(proofs) == 0 {
 		return
 	}
 

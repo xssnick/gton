@@ -252,37 +252,6 @@ selected:
 	return res
 }
 
-func (s *overlaySubscription) adnlPingTargets() []*overlayPeer {
-	if s.spec.Kind == overlayKindCustomFixed {
-		return nil
-	}
-
-	peers := s.neighbourPeerSnapshots()
-	if len(peers) == 0 {
-		return nil
-	}
-
-	now := time.Now()
-	alive := peers[:0]
-	for _, peer := range peers {
-		if peer.isAliveKnownOverlayPeer(now) {
-			alive = append(alive, peer)
-		}
-	}
-	if len(alive) > 0 {
-		peers = alive
-	}
-	if len(peers) > 1 {
-		rand.Shuffle(len(peers), func(i, j int) {
-			peers[i], peers[j] = peers[j], peers[i]
-		})
-	}
-	if len(peers) > adnlPingFanout {
-		peers = peers[:adnlPingFanout]
-	}
-	return peers
-}
-
 func minInt(a, b int) int {
 	if a < b {
 		return a

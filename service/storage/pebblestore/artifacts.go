@@ -62,7 +62,11 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 					storage.FormatBlockRef(entry.State.Block),
 				)
 			}
-			meta = storage.MergeBlockMeta(meta, storage.BuildBlockMetaFromState(*entry.State))
+			stateMeta, err := storage.BuildBlockMetaFromState(*entry.State)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			meta = storage.MergeBlockMeta(meta, stateMeta)
 		}
 		var blockRef *storage.ArtifactRef
 		blockRefIndex := noQueuedRef
@@ -142,6 +146,9 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 	}
 	if len(block.Block) == 0 && len(block.Proof) == 0 {
 		return nil, nil, fmt.Errorf("served block %s has no block data or proof", storage.FormatBlockRef(block.ID))
+	}
+	if err := validateFullBlockIDHashes(block.ID); err != nil {
+		return nil, nil, err
 	}
 
 	isLink := storage.ServedBlockProofIsLink(block.ID, block.IsLink)
@@ -261,6 +268,13 @@ func mergePendingBlockMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, m
 }
 
 func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
+	if err := validateFullBlockIDHashes(prev); err != nil {
+		return err
+	}
+	if err := validateFullBlockIDHashes(next); err != nil {
+		return err
+	}
+
 	pendingKey := storage.BlockKey(prev)
 	if meta := metas[pendingKey]; meta != nil {
 		if !blockMetaHasServedFull(meta) {
@@ -388,6 +402,10 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 	if len(data) == 0 {
 		return nil
 	}
+	if err := validateFullBlockIDHashes(block); err != nil {
+		return err
+	}
+
 	if ref == nil {
 		var err error
 		ref, err = s.writeStateArtifactFile(block, data)
@@ -409,6 +427,18 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 }
 
 func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error {
+	if err := validateFullBlockIDHashes(file.Block); err != nil {
+		return err
+	}
+	if err := validateFullBlockIDHashes(file.MasterchainBlock); err != nil {
+		return err
+	}
+	if err := validateFixedHash("persistent state file hash", file.FileHash); err != nil {
+		return err
+	}
+	if err := validateFixedHash("persistent state root hash", file.StateRootHash); err != nil {
+		return err
+	}
 	if file.Ref.Size <= 0 {
 		return fmt.Errorf("persistent state file size is invalid")
 	}
@@ -419,6 +449,14 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 		return fmt.Errorf("persistent state file offset must be zero")
 	}
 	if err := s.validatePersistentStateArtifactPath(file.Block, file.MasterchainBlock, file.EffectiveShard, file.Ref.Path); err != nil {
+		return err
+	}
+
+	previousSize := int64(0)
+	previous, err := s.persistentStateFileRecord(context.Background(), file.Block, file.MasterchainBlock, file.EffectiveShard)
+	if err == nil {
+		previousSize = previous.size
+	} else if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
 
@@ -435,7 +473,7 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 	record := encodePersistentStateFileRecord(&stored)
 	key := hotKeyPersistentStateFile(stored.Block, stored.MasterchainBlock, stored.EffectiveShard)
 
-	return s.withHotBatch(func(batch *pebble.Batch) error {
+	if err := s.withHotBatch(func(batch *pebble.Batch) error {
 		if err := batch.Set(key, record, pebble.NoSync); err != nil {
 			return err
 		}
@@ -443,7 +481,12 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 			return s.setMergedBlockMeta(batch, meta)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	s.observePersistentStateBytes(stored.Ref.Size - previousSize)
+	return nil
 }
 
 func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error {
@@ -453,6 +496,19 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 	}
 
 	key := hotKeyPersistentStateFile(block, masterchainBlock, effectiveShard)
+	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return err
+	}
+
+	removedBytes := int64(0)
+	stat, err := os.Stat(path)
+	if err == nil && stat.Size() > 0 {
+		removedBytes = stat.Size()
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
 	if err = s.withHotBatch(func(batch *pebble.Batch) error {
 		if err := batch.Delete(key, pebble.NoSync); err != nil {
 			return err
@@ -465,13 +521,10 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 		return err
 	}
 
-	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
-	if err != nil {
-		return err
-	}
 	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	s.observePersistentStateBytes(-removedBytes)
 	return nil
 }
 

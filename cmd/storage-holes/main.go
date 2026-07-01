@@ -115,9 +115,10 @@ func main() {
 		Bool("check_seq_index", opts.checkSeqIndex).
 		Msg("opening node storage")
 
+	storageLogger := logs.Category("pebblestore")
 	store, err := pebblestore.Open(pebblestore.Options{
 		Dir:      opts.dbDir,
-		Logger:   logs.CategoryPtr("pebblestore"),
+		Logger:   &storageLogger,
 		ReadOnly: true,
 	})
 	if err != nil {
@@ -278,10 +279,11 @@ func (c *holeChecker) finishReport() holeReport {
 }
 
 func (c *holeChecker) checkMaster(ctx context.Context, seqno uint32, initial bool) error {
-	master, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{
+	master, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{
 		Workchain: masterchainID,
 		Shard:     masterchainShard,
-	}, seqno)
+		SeqNo:     seqno,
+	})
 	if err != nil {
 		c.addHole(seqno, "master_seq_index", ton.BlockIDExt{
 			Workchain: masterchainID,
@@ -348,7 +350,7 @@ func (c *holeChecker) checkShardChain(ctx context.Context, masterSeqno uint32, b
 	if !meta.MasterchainRefKnown() {
 		c.addHole(masterSeqno, "shard_master_ref", block, fmt.Errorf("shard block has no masterchain ref"))
 	} else {
-		ref, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, meta.MasterchainRefSeqno)
+		ref, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: masterchainID, Shard: masterchainShard, SeqNo: meta.MasterchainRefSeqno})
 		if err != nil {
 			c.addHole(masterSeqno, "shard_master_ref_index", block, err)
 		} else if ref.Workchain != masterchainID || ref.Shard != masterchainShard || ref.SeqNo != meta.MasterchainRefSeqno || len(ref.RootHash) != 32 || len(ref.FileHash) != 32 {
@@ -360,10 +362,11 @@ func (c *holeChecker) checkShardChain(ctx context.Context, masterSeqno uint32, b
 	}
 
 	if c.opts.checkSeqIndex {
-		indexed, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{
+		indexed, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{
 			Workchain: block.Workchain,
 			Shard:     block.Shard,
-		}, block.SeqNo)
+			SeqNo:     block.SeqNo,
+		})
 		if err != nil {
 			c.addHole(masterSeqno, "shard_seq_index", block, err)
 		} else if !indexed.Equals(&block) {

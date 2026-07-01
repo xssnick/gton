@@ -1053,7 +1053,10 @@ func (s *testCellGenerationMigrationStore) BlockMeta(_ context.Context, block to
 		return meta.Clone(), nil
 	}
 	if state := s.blockStates[storage.BlockKey(block)]; state != nil {
-		meta := storage.BuildBlockMetaFromState(*state)
+		meta, err := storage.BuildBlockMetaFromState(*state)
+		if err != nil {
+			return nil, err
+		}
 		meta.GenUTime = uint32(time.Now().Unix())
 		return meta, nil
 	}

@@ -50,10 +50,6 @@ func (n *Node) BeginArchiveSession() *ArchiveSession {
 }
 
 func (a *ArchiveSession) Close() {
-	if a == nil {
-		return
-	}
-
 	a.mx.Lock()
 	if a.closed {
 		a.mx.Unlock()
@@ -82,10 +78,9 @@ func (a *ArchiveSession) Close() {
 }
 
 func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, options ArchiveDownloadOptions) (*archive.Downloaded, error) {
-	if a == nil || a.node == nil {
-		return nil, errors.New("archive session is not initialized")
+	if a.node.IsOffline() {
+		return nil, ErrOffline
 	}
-
 	sub, err := a.node.subscriptionForBlock(ton.BlockIDExt{Workchain: shard.Workchain, Shard: shard.Shard})
 	if err != nil {
 		return nil, err
@@ -112,7 +107,7 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 }
 
 func (a *ArchiveSession) RejectArchivePeer(shard archive.ShardID, peerAddr string, reason string) bool {
-	if a == nil || a.node == nil || peerAddr == "" {
+	if a == nil || peerAddr == "" {
 		return false
 	}
 
@@ -129,7 +124,7 @@ func (a *ArchiveSession) RejectArchivePeer(shard archive.ShardID, peerAddr strin
 		return false
 	}
 
-	a.rejectArchivePeer(nil, pool, shard, peer, reason)
+	a.rejectArchivePeer(a.node.runtimeContext(), pool, shard, peer, reason)
 	return true
 }
 
@@ -192,9 +187,6 @@ func (a *ArchiveSession) archivePeerPool(sub *overlaySubscription) *archivePeerP
 }
 
 func (a *ArchiveSession) pinArchivePeer(peer *overlayPeer) {
-	if a == nil || a.node == nil {
-		return
-	}
 	peerID := archivePeerID(peer)
 	if peerID.IsZero() {
 		return
@@ -215,10 +207,6 @@ func (a *ArchiveSession) pinArchivePeer(peer *overlayPeer) {
 }
 
 func (a *ArchiveSession) selectedArchivePeerID(shard archive.ShardID) PeerID {
-	if a == nil {
-		return PeerID{}
-	}
-
 	a.mx.Lock()
 	defer a.mx.Unlock()
 
@@ -226,9 +214,6 @@ func (a *ArchiveSession) selectedArchivePeerID(shard archive.ShardID) PeerID {
 }
 
 func (a *ArchiveSession) selectArchivePeer(shard archive.ShardID, peer *overlayPeer) {
-	if a == nil {
-		return
-	}
 	peerID := archivePeerID(peer)
 	if peerID.IsZero() {
 		return
@@ -244,7 +229,7 @@ func (a *ArchiveSession) selectArchivePeer(shard archive.ShardID, peer *overlayP
 }
 
 func (a *ArchiveSession) clearSelectedArchivePeerID(shard archive.ShardID, peerID PeerID) {
-	if a == nil || peerID.IsZero() {
+	if peerID.IsZero() {
 		return
 	}
 
@@ -257,9 +242,6 @@ func (a *ArchiveSession) clearSelectedArchivePeerID(shard archive.ShardID, peerI
 }
 
 func (a *ArchiveSession) unpinArchivePeer(peer *overlayPeer) {
-	if a == nil {
-		return
-	}
 	peerID := archivePeerID(peer)
 	if peerID.IsZero() {
 		return
@@ -269,7 +251,7 @@ func (a *ArchiveSession) unpinArchivePeer(peer *overlayPeer) {
 }
 
 func (a *ArchiveSession) unpinArchivePeerID(peerID PeerID) {
-	if a == nil || peerID.IsZero() {
+	if peerID.IsZero() {
 		return
 	}
 
@@ -285,9 +267,6 @@ func (a *ArchiveSession) unpinArchivePeerID(peerID PeerID) {
 }
 
 func (a *ArchiveSession) noteArchivePeerSuccess(peer *overlayPeer) {
-	if a == nil {
-		return
-	}
 	a.pinArchivePeer(peer)
 
 	peerID := archivePeerID(peer)
@@ -301,9 +280,6 @@ func (a *ArchiveSession) noteArchivePeerSuccess(peer *overlayPeer) {
 }
 
 func (a *ArchiveSession) noteArchivePeerAvailable(peer *overlayPeer) {
-	if a == nil {
-		return
-	}
 	a.pinArchivePeer(peer)
 }
 
@@ -350,10 +326,6 @@ func (a *ArchiveSession) archivePeerTimeout(peer *overlayPeer, base time.Duratio
 }
 
 func (a *ArchiveSession) archivePeerDeadlineFailures(peer *overlayPeer) (int, bool) {
-	if a == nil {
-		return 0, false
-	}
-
 	peerID := archivePeerID(peer)
 	if peerID.IsZero() {
 		return 0, false

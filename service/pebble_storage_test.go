@@ -136,7 +136,7 @@ func TestPebbleStorageKeepsMetadataOnlyBlocksOutOfHistoryIndexes(t *testing.T) {
 	if meta.GenUTime != 120 || meta.EndLT != 2999 {
 		t.Fatalf("metadata-only block meta = %+v", meta)
 	}
-	if _, err := store.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 11); !errors.Is(err, storage.ErrNotFound) {
+	if _, err := store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: 0, Shard: topShard, SeqNo: 11}); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("metadata-only lookup by seqno error = %v, want ErrNotFound", err)
 	}
 	if _, err := store.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: 0, Shard: topShard}, 500); !errors.Is(err, storage.ErrNotFound) {

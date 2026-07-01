@@ -728,10 +728,16 @@ func (s *overlaySubscription) findArchiveInfo(ctx context.Context, session *Arch
 }
 
 func (s *overlaySubscription) queryArchiveInfo(ctx context.Context, peer *overlayPeer, masterchainSeqno uint32, shard archive.ShardID, timeout time.Duration) (ArchiveInfo, error) {
-	resp, err := s.queryFromPeerWithLimits(ctx, peer, archiveInfoQuery(masterchainSeqno, shard), timeout, 1024)
-	if err != nil {
+	queryCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var resp tl.Serializable
+	startedAt := time.Now()
+	if err := peer.overlay.Query(queryCtx, archiveInfoQuery(masterchainSeqno, shard), &resp); err != nil {
+		s.handlePeerQueryFailure(peer, err)
 		return ArchiveInfo{}, err
 	}
+	peer.querySuccess(time.Since(startedAt))
 
 	info, ok := resp.(ArchiveInfo)
 	if ok {

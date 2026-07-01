@@ -277,10 +277,14 @@ func (r *shardStateResolver) statsSnapshot() shardStateResolverStats {
 }
 
 func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
-	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells)
+	master := r.master.Block
+	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells, &blockApplyHookMeta{
+		InclusionMasterRef:   &master,
+		InclusionMasterState: r.master.Cell,
+	})
 }
 
-func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock, applier stateUpdateApplier) (*storage.BlockState, error) {
+func (s *Service) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock, applier stateUpdateApplier, hook *blockApplyHookMeta) (*storage.BlockState, error) {
 	if !downloaded.ID.Equals(&target) {
 		return nil, fmt.Errorf("shard resolver downloaded %s instead of target %s", downloaded.BlockRef(), storage.FormatBlockRef(target))
 	}
@@ -305,7 +309,7 @@ func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDE
 	}
 	event.Msg("applying shard state dependency")
 
-	next, err := applyBlockWithPreviousStates(previous, downloaded, applier)
+	next, err := s.applyBlockWithHooks(ctx, previous, downloaded, applier, hook)
 	if err != nil {
 		return nil, fmt.Errorf("apply shard block %s: %w", downloaded.BlockRef(), err)
 	}
@@ -313,10 +317,6 @@ func (s *Service) applyResolvedShardBlock(_ context.Context, target ton.BlockIDE
 }
 
 func (s *Service) stateCellLoader() cell.LazyCellLoader {
-	if s == nil {
-		return nil
-	}
-
 	var base cell.LazyCellLoader
 	if s.storage != nil {
 		base = s.storage.LazyCellLoader()
@@ -340,7 +340,7 @@ func (s *Service) stateCellLoader() cell.LazyCellLoader {
 }
 
 func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
-	if s == nil || loader == nil {
+	if loader == nil {
 		return func() {}
 	}
 
@@ -366,10 +366,6 @@ func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
 }
 
 func (s *Service) stateCellLoadersSnapshot() []cell.LazyCellLoader {
-	if s == nil {
-		return nil
-	}
-
 	loaders, _ := s.stateCellLoaderSnapshot.Load().([]cell.LazyCellLoader)
 	return loaders
 }

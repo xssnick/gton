@@ -3,14 +3,14 @@ package metrics
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 
-	"github.com/xssnick/gton/liteserver"
 	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,11 +20,6 @@ import (
 
 const (
 	ChainMasterchain = "masterchain"
-
-	liteserverNoErrorCodeLabel          = "0"
-	liteserverUnspecifiedErrorCodeLabel = "unspecified"
-	liteserverNoErrorReasonLabel        = "none"
-	liteserverUnspecifiedReasonLabel    = "unspecified"
 )
 
 type Metrics struct {
@@ -32,13 +27,8 @@ type Metrics struct {
 	namespace           string
 	serviceStatusReader func() service.StatusSnapshot
 	dbStatusReader      func(context.Context) (pebblestore.DBStatus, error)
+	lazyCellLoadReader  func() []storage.LazyCellLoadMetric
 	artifactStatus      *storageArtifactStatusReader
-
-	liteserverQueryDuration *prometheus.HistogramVec
-	liteserverQueryHandler  *prometheus.HistogramVec
-	liteserverQueryWait     *prometheus.HistogramVec
-	liteserverQueries       *prometheus.CounterVec
-	liteserverInflight      prometheus.Gauge
 
 	syncBlocks                *prometheus.CounterVec
 	syncBlockOrigins          *prometheus.CounterVec
@@ -58,6 +48,7 @@ type Metrics struct {
 type RuntimeReaders struct {
 	ServiceStatusReader func() service.StatusSnapshot
 	DBStatusReader      func(context.Context) (pebblestore.DBStatus, error)
+	LazyCellLoadReader  func() []storage.LazyCellLoadMetric
 	ArchivePackagesDir  string
 	StateFilesDir       string
 }
@@ -74,39 +65,6 @@ func New(namespace string) *Metrics {
 	m := &Metrics{
 		registry:  registry,
 		namespace: namespace,
-		liteserverQueryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: namespace,
-			Subsystem: "liteserver",
-			Name:      "query_duration_seconds",
-			Help:      "Total liteserver query duration in seconds, including waitMasterchainSeqno wait time.",
-			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"method", "response", "error_code", "reason"}),
-		liteserverQueryHandler: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: namespace,
-			Subsystem: "liteserver",
-			Name:      "query_handler_duration_seconds",
-			Help:      "Liteserver query handler duration in seconds, without waitMasterchainSeqno wait time.",
-			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"method", "response", "error_code", "reason"}),
-		liteserverQueryWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: namespace,
-			Subsystem: "liteserver",
-			Name:      "query_wait_seconds",
-			Help:      "Liteserver waitMasterchainSeqno wait duration in seconds.",
-			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		}, []string{"method", "response", "error_code", "reason"}),
-		liteserverQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: namespace,
-			Subsystem: "liteserver",
-			Name:      "queries_total",
-			Help:      "Total liteserver queries by method and response.",
-		}, []string{"method", "response", "error_code", "reason"}),
-		liteserverInflight: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Subsystem: "liteserver",
-			Name:      "inflight_queries",
-			Help:      "Current number of liteserver queries being handled.",
-		}),
 		syncBlocks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "sync",
@@ -190,11 +148,6 @@ func New(namespace string) *Metrics {
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		m.liteserverQueryDuration,
-		m.liteserverQueryHandler,
-		m.liteserverQueryWait,
-		m.liteserverQueries,
-		m.liteserverInflight,
 		m.syncBlocks,
 		m.syncBlockOrigins,
 		m.syncBlockDownloadDuration,
@@ -214,10 +167,21 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
 
-func (m *Metrics) RegisterRuntimeCollectors(readers RuntimeReaders) error {
+func (m *Metrics) Namespace() string {
 	if m == nil {
-		return nil
+		return ""
 	}
+	return m.namespace
+}
+
+func (m *Metrics) RegisterCollector(collector prometheus.Collector) error {
+	if m == nil {
+		return errors.New("metrics registry is not configured")
+	}
+	return m.registry.Register(collector)
+}
+
+func (m *Metrics) RegisterRuntimeCollectors(readers RuntimeReaders) error {
 	if readers.ServiceStatusReader == nil {
 		return errors.New("service status metric reader is required")
 	}
@@ -226,7 +190,12 @@ func (m *Metrics) RegisterRuntimeCollectors(readers RuntimeReaders) error {
 	}
 	m.serviceStatusReader = readers.ServiceStatusReader
 	m.dbStatusReader = readers.DBStatusReader
-	m.artifactStatus = newStorageArtifactStatusReader(readers.ArchivePackagesDir, readers.StateFilesDir)
+	m.lazyCellLoadReader = readers.LazyCellLoadReader
+	artifactStatus, err := scanStorageArtifacts(context.Background(), readers.ArchivePackagesDir, readers.StateFilesDir)
+	if err != nil {
+		return fmt.Errorf("scan storage artifacts: %w", err)
+	}
+	m.artifactStatus = newStorageArtifactStatusReader(artifactStatus)
 	for _, collector := range []prometheus.Collector{
 		newServiceCollector(m, m.namespace),
 		newDBCollector(m, m.namespace),
@@ -247,71 +216,29 @@ func (m *Metrics) dbStatus(ctx context.Context) (pebblestore.DBStatus, error) {
 	return m.dbStatusReader(ctx)
 }
 
-func (m *Metrics) storageArtifactStatus(ctx context.Context) (storageArtifactStatus, error) {
-	return m.artifactStatus.Status(ctx)
+func (m *Metrics) lazyCellLoads() []storage.LazyCellLoadMetric {
+	if m.lazyCellLoadReader == nil {
+		return nil
+	}
+	return m.lazyCellLoadReader()
 }
 
-func (m *Metrics) AddLiteserverInflight(delta int) {
-	if m == nil || m.liteserverInflight == nil || delta == 0 {
+func (m *Metrics) storageArtifactStatus() storageArtifactStatus {
+	return m.artifactStatus.Status()
+}
+
+func (m *Metrics) AddArchivePackageBytes(delta int64) {
+	if m == nil || m.artifactStatus == nil {
 		return
 	}
-	m.liteserverInflight.Add(float64(delta))
+	m.artifactStatus.AddArchivePackageBytes(delta)
 }
 
-func (m *Metrics) ObserveLiteserverQuery(observation liteserver.QueryObservation) {
-	if m == nil || m.liteserverQueryDuration == nil || m.liteserverQueries == nil {
+func (m *Metrics) AddPersistentStateBytes(delta int64) {
+	if m == nil || m.artifactStatus == nil {
 		return
 	}
-	method := observation.Method
-	if method == "" {
-		method = "unknown"
-	}
-	response := observation.Response
-	if response == "" {
-		response = "unknown"
-	}
-	errorCode := liteserverErrorCodeLabel(observation)
-	errorReason := liteserverErrorReasonLabel(observation)
-	duration := observation.Duration
-	if duration < 0 {
-		duration = 0
-	}
-	waitDuration := observation.WaitDuration
-	if waitDuration < 0 {
-		waitDuration = 0
-	}
-
-	totalDuration := duration + waitDuration
-	m.liteserverQueryDuration.WithLabelValues(method, response, errorCode, errorReason).Observe(totalDuration.Seconds())
-	if m.liteserverQueryHandler != nil {
-		m.liteserverQueryHandler.WithLabelValues(method, response, errorCode, errorReason).Observe(duration.Seconds())
-	}
-	m.liteserverQueries.WithLabelValues(method, response, errorCode, errorReason).Inc()
-	if waitDuration > 0 && m.liteserverQueryWait != nil {
-		m.liteserverQueryWait.WithLabelValues(method, response, errorCode, errorReason).Observe(waitDuration.Seconds())
-	}
-}
-
-func liteserverErrorCodeLabel(observation liteserver.QueryObservation) string {
-	if observation.ErrorCode != 0 {
-		return strconv.FormatInt(int64(observation.ErrorCode), 10)
-	}
-	if observation.Error {
-		return liteserverUnspecifiedErrorCodeLabel
-	}
-	return liteserverNoErrorCodeLabel
-}
-
-func liteserverErrorReasonLabel(observation liteserver.QueryObservation) string {
-	if !observation.Error {
-		return liteserverNoErrorReasonLabel
-	}
-
-	reason := strings.TrimSpace(observation.ErrorReason)
-	if reason == "" {
-		return liteserverUnspecifiedReasonLabel
-	}
-	return reason
+	m.artifactStatus.AddPersistentStateBytes(delta)
 }
 
 func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
@@ -321,12 +248,8 @@ func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
 	pipeline := fallbackLabel(observation.Pipeline)
 	chain := fallbackLabel(observation.Chain)
 	shard := fallbackLabel(observation.Shard)
-	source := fallbackLabel(observation.Source)
-	origin := observation.Origin
-	if origin == "" {
-		origin = syncBlockOriginForMetricSource(observation.Source)
-	}
-	origin = fallbackLabel(origin)
+	source := fallbackLabel(string(observation.Source))
+	origin := fallbackLabel(string(observation.Origin))
 	result := fallbackLabel(observation.Result)
 	catchUp := strconv.FormatBool(observation.CatchUp)
 
@@ -359,21 +282,6 @@ func (m *Metrics) ObserveSyncObtain(observation service.SyncObtainObservation) {
 	}
 
 	m.syncObtainDuration.WithLabelValues(pipeline, stage, result, catchUp).Observe(duration.Seconds())
-}
-
-func syncBlockOriginForMetricSource(source string) string {
-	switch source {
-	case "broadcast", "broadcast_queue", "broadcast_candidate", "broadcast_cache", "broadcast_hint", "queue":
-		return "broadcast"
-	case "peer_probe", "next_block", "indexed", "next_description", "peer_catch_up", "catch_up", "probe":
-		return "download"
-	case "stored":
-		return "stored"
-	case "":
-		return "unknown"
-	default:
-		return "other"
-	}
 }
 
 func (m *Metrics) ObserveSyncPersist(observation service.SyncPersistObservation) {

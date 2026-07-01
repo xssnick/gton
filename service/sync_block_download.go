@@ -70,7 +70,7 @@ func (d exactBlockDownloadProbeDecision) probeTimeout() time.Duration {
 	return nextBlockBootstrapLiveProbeTimeout
 }
 
-func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.BlockIDExt, state exactBlockDownloadProbeState) (p2p.DownloadedBlock, string, error) {
+func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.BlockIDExt, state exactBlockDownloadProbeState) (p2p.DownloadedBlock, SyncBlockSource, error) {
 	decision := s.exactBlockDownloadProbeDecision(state)
 	queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
 	defer cancel()
@@ -111,7 +111,7 @@ func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.Bl
 			if res.downloaded == nil {
 				return p2p.DownloadedBlock{}, "", fmt.Errorf("probe block %s: empty response", storage.FormatBlockRef(block))
 			}
-			return *res.downloaded, syncBlockSourceForDownloadedBlock("peer_probe", *res.downloaded), nil
+			return *res.downloaded, syncBlockSourceForDownloadedBlock(SyncBlockSourcePeerProbe, *res.downloaded), nil
 		case <-logTimer.C:
 			waited := time.Duration(0)
 			if !state.started.IsZero() {

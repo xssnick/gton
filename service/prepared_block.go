@@ -13,8 +13,7 @@ import (
 )
 
 type PreparedBlock struct {
-	ID   ton.BlockIDExt
-	Kind string
+	ID ton.BlockIDExt
 
 	BlockBOC []byte
 	ProofBOC []byte
@@ -31,6 +30,7 @@ type PreparedBlock struct {
 	consensusChecked          *checkedMasterchainConsensus
 
 	IsLink       bool
+	Origin       SyncBlockOrigin
 	SourcePeerID p2p.PeerID
 }
 
@@ -165,7 +165,6 @@ func prepareVerifiedMasterchainBlockForNextSync(prev ton.BlockIDExt, block Verif
 func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRecords, elapsed time.Duration) PreparedBlock {
 	return PreparedBlock{
 		ID:                        block.ID,
-		Kind:                      block.Kind,
 		BlockBOC:                  block.BlockBOC,
 		ProofBOC:                  block.ProofBOC,
 		BlockRoot:                 block.BlockRoot,
@@ -177,6 +176,7 @@ func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRec
 		consensus:                 block.consensus,
 		consensusChecked:          block.consensusChecked,
 		IsLink:                    block.IsLink,
+		Origin:                    syncBlockOriginForKind(block.Kind),
 		SourcePeerID:              block.SourcePeerID,
 	}
 }

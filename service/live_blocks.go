@@ -78,9 +78,18 @@ func (s *Service) publishLiveCurrentBlockMarkers(current *storage.CurrentState) 
 	}
 
 	publish := func(state storage.BlockState) {
-		err := s.liveState.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		meta, err := storage.BuildBlockMetaFromState(state)
+		if err != nil {
+			s.log.Debug().
+				Err(err).
+				Str("block", storage.FormatBlockRef(state.Block)).
+				Msg("skip live current block marker")
+			return
+		}
+
+		err = s.liveState.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
 			Block:           state.Block,
-			Meta:            storage.BuildBlockMetaFromState(state),
+			Meta:            meta,
 			State:           &state,
 			ArtifactFlushed: true,
 			StateFlushed:    true,

@@ -50,14 +50,17 @@ func (s *Store) PruneArchivePackages(ctx context.Context, cutoffUnix uint32, max
 	stats.DeletedBlockMeta = deletedMeta
 	stats.DeletedMetadataKeys = deletedKeys
 
+	s.artifactMu.Lock()
 	paths, deletedPackages, deletedKeys, err := s.deleteArchivePackageRecords(ctx, packages, deleteBeforeSeqno)
 	if err != nil {
+		s.artifactMu.Unlock()
 		return stats, err
 	}
 	stats.DeletedPackages = deletedPackages
 	stats.DeletedMetadataKeys += deletedKeys
 
-	deletedFiles, deletedBytes, err := s.removeArchivePackageFiles(paths)
+	deletedFiles, deletedBytes, err := s.removeArchivePackageFilesLocked(paths)
+	s.artifactMu.Unlock()
 	if err != nil {
 		stats.DeletedPackageFiles = deletedFiles
 		stats.DeletedPackageBytes = deletedBytes
@@ -235,18 +238,19 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 	for _, item := range blocks {
 		block := item.block
 		meta := item.meta
+		ref := storage.BlockSeqRefFromBlock(block)
 		keys := [][]byte{
 			hotKeyBlockMeta(block),
-			hotKeyBlockSeqIndex(storage.BlockHistoryKey{Workchain: block.Workchain, Shard: block.Shard}, block.SeqNo),
+			hotKeyBlockSeqIndex(ref),
 			hotKeyBlockDataRef(block),
 			hotKeyProofRef(storage.ServedProofBlock, block),
 			hotKeyProofRef(storage.ServedProofBlockLink, block),
 		}
 		if meta.EndLT != 0 {
-			keys = append(keys, hotKeyBlockLTIndex(meta))
+			keys = append(keys, hotKeyBlockLTIndex(ref, meta.EndLT))
 		}
 		if meta.GenUTime != 0 {
-			keys = append(keys, hotKeyBlockUTimeIndex(meta))
+			keys = append(keys, hotKeyBlockUTimeIndex(ref, meta.GenUTime))
 		}
 		if isMasterchainBlock(block) && meta.Has(storage.BlockMetaIsKeyBlock) {
 			keys = append(keys, hotKeyKeyBlockSeqIndex(block.SeqNo))
@@ -281,23 +285,26 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 	}
 	defer s.releaseHotDB()
 
+	s.hotWriteMu.Lock()
+	defer s.hotWriteMu.Unlock()
+
 	deletePackage := map[int64]archivePackageMeta{}
 	pathSet := map[string]struct{}{}
 	for _, pkg := range packages {
 		if pkg.startSeq >= beforeSeqno {
 			continue
 		}
-		deletePackage[pkg.archiveID] = pkg
 		if pkg.path != "" {
+			if _, ok := s.pendingArchiveSync[s.artifactPath(pkg.path)]; ok {
+				continue
+			}
 			pathSet[pkg.path] = struct{}{}
 		}
+		deletePackage[pkg.archiveID] = pkg
 	}
 	if len(deletePackage) == 0 {
 		return nil, 0, 0, nil
 	}
-
-	s.hotWriteMu.Lock()
-	defer s.hotWriteMu.Unlock()
 
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
@@ -338,6 +345,14 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 		if startSeqno >= beforeSeqno {
 			continue
 		}
+		raw := iter.Value()
+		if len(raw) != 8 {
+			return nil, 0, deletedKeys, fmt.Errorf("invalid archive info payload")
+		}
+		archiveID := int64(binary.BigEndian.Uint64(raw))
+		if _, ok := deletePackage[archiveID]; !ok {
+			continue
+		}
 		if err := batch.Delete(bytes.Clone(key), pebble.NoSync); err != nil {
 			return nil, 0, deletedKeys, err
 		}
@@ -361,17 +376,38 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 }
 
 func (s *Store) removeArchivePackageFiles(paths []string) (int, uint64, error) {
+	s.artifactMu.Lock()
+	defer s.artifactMu.Unlock()
+
+	return s.removeArchivePackageFilesLocked(paths)
+}
+
+func (s *Store) removeArchivePackageFilesLocked(paths []string) (int, uint64, error) {
 	if len(paths) == 0 {
 		return 0, 0, nil
 	}
 
-	s.artifactMu.Lock()
-	defer s.artifactMu.Unlock()
+	deleted, deletedBytes, err := s.removeArchivePackageFilesFromDiskLocked(paths)
+	if err != nil {
+		return deleted, deletedBytes, err
+	}
 
+	if err := s.clearPackDeletePending(paths); err != nil {
+		return deleted, deletedBytes, err
+	}
+	return deleted, deletedBytes, nil
+}
+
+func (s *Store) removeArchivePackageFilesFromDiskLocked(paths []string) (int, uint64, error) {
 	deleted := 0
 	deletedBytes := uint64(0)
 	dirs := map[string]struct{}{}
 	for _, relPath := range paths {
+		relPath, err := s.packJournalPath(relPath)
+		if err != nil {
+			return deleted, deletedBytes, err
+		}
+
 		path := s.artifactPath(relPath)
 		delete(s.pendingArchiveSync, path)
 
@@ -392,6 +428,7 @@ func (s *Store) removeArchivePackageFiles(paths []string) (int, uint64, error) {
 		deleted++
 		if stat.Size() > 0 {
 			deletedBytes += uint64(stat.Size())
+			s.observeArchivePackageBytes(-stat.Size())
 		}
 		dirs[filepath.Dir(path)] = struct{}{}
 	}
@@ -405,9 +442,6 @@ func (s *Store) removeArchivePackageFiles(paths []string) (int, uint64, error) {
 		if err := syncDir(dir); err != nil {
 			return deleted, deletedBytes, fmt.Errorf("sync archive package dir %s: %w", dir, err)
 		}
-	}
-	if err := s.clearPackDeletePending(paths); err != nil {
-		return deleted, deletedBytes, err
 	}
 	return deleted, deletedBytes, nil
 }

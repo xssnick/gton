@@ -103,6 +103,9 @@ type PersistentStateIDV2 struct {
 }
 
 func (n *Node) DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
+	if n.IsOffline() {
+		return nil, ErrOffline
+	}
 	if block.SeqNo == 0 {
 		return n.downloadZeroStateSnapshot(ctx, block)
 	}
@@ -712,7 +715,7 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 		return nil, err
 	}
 
-	if err = n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+	if err = n.savePersistentStateFile(d.block, d.master, staged, d.stateRootHash); err != nil {
 		runtime.GC()
 		return nil, fmt.Errorf("store split persistent state header file: %w", err)
 	}
@@ -1031,7 +1034,7 @@ func (d persistentStateSnapshotDownloader) importSplitPart(ctx context.Context, 
 		}
 		return fmt.Errorf("import split state part %d cells: %w", idx+1, err)
 	}
-	if err := n.savePersistentStateFile(d.block, d.master, staged, nil); err != nil {
+	if err := n.savePersistentStateFile(d.block, d.master, staged, d.stateRootHash); err != nil {
 		return fmt.Errorf("store split state part %d file: %w", idx+1, err)
 	}
 

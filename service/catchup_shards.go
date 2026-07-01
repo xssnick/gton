@@ -44,11 +44,11 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 
 			indexed, err := s.lookupIndexedChainBlocks(ctx, prev, target, shardStateDownloadBuffer)
 			if err != nil {
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err, source: "indexed"})
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err, source: SyncBlockSourceIndexed})
 				return
 			}
 			if len(indexed) > 0 {
-				if !s.downloadKnownChainBlocks(ctx, downloads, prev, indexed, "indexed") {
+				if !s.downloadKnownChainBlocks(ctx, downloads, prev, indexed, SyncBlockSourceIndexed) {
 					return
 				}
 				prev = indexed[len(indexed)-1]
@@ -57,11 +57,11 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 
 			described, err := s.lookupNextChainBlockDescriptions(ctx, prev, target, nextBlockDescriptionLookahead)
 			if err != nil {
-				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err, source: "next_description"})
+				s.sendShardStateDownload(ctx, downloads, shardStateDownload{err: err, source: SyncBlockSourceNextDescription})
 				return
 			}
 			if len(described) > 0 {
-				if !s.downloadKnownChainBlocks(ctx, downloads, prev, described, "next_description") {
+				if !s.downloadKnownChainBlocks(ctx, downloads, prev, described, SyncBlockSourceNextDescription) {
 					return
 				}
 				prev = described[len(described)-1]
@@ -90,7 +90,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             err,
-					source:          "next_block",
+					source:          SyncBlockSourceNextBlock,
 					downloadElapsed: downloadElapsed,
 				})
 				return
@@ -98,7 +98,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			if downloaded.ID.Workchain != target.Workchain || downloaded.ID.Shard != target.Shard || downloaded.ID.SeqNo > target.SeqNo || downloaded.ID.SeqNo <= prev.SeqNo {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             fmt.Errorf("%w: next chain block after %s returned %s for target %s", errShardCatchUpNeedsSnapshot, storage.FormatBlockRef(prev), downloaded.BlockRef(), storage.FormatBlockRef(target)),
-					source:          syncBlockSourceForDownloadedBlock("next_block", downloaded),
+					source:          syncBlockSourceForDownloadedBlock(SyncBlockSourceNextBlock, downloaded),
 					downloadElapsed: downloadElapsed,
 				})
 				return
@@ -109,7 +109,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			if err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             err,
-					source:          syncBlockSourceForDownloadedBlock("next_block", downloaded),
+					source:          syncBlockSourceForDownloadedBlock(SyncBlockSourceNextBlock, downloaded),
 					downloadElapsed: downloadElapsed,
 					prepareElapsed:  time.Since(prepareStarted),
 				})
@@ -119,7 +119,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			if err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             err,
-					source:          syncBlockSourceForVerifiedBlock("next_block", verified),
+					source:          syncBlockSourceForVerifiedBlock(SyncBlockSourceNextBlock, verified),
 					downloadElapsed: downloadElapsed,
 					prepareElapsed:  time.Since(prepareStarted),
 				})
@@ -130,7 +130,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			item := shardStateDownload{
 				prev:            prev,
 				block:           prepared,
-				source:          syncBlockSourceForVerifiedBlock("next_block", verified),
+				source:          syncBlockSourceForVerifiedBlock(SyncBlockSourceNextBlock, verified),
 				downloadElapsed: downloadElapsed,
 				prepareElapsed:  prepared.PrepareElapsed,
 			}
@@ -146,21 +146,18 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 }
 
 func (s *Service) lookupIndexedChainBlocks(ctx context.Context, prev ton.BlockIDExt, target ton.BlockIDExt, limit int) ([]ton.BlockIDExt, error) {
-	key := storage.BlockHistoryKey{
-		Workchain: prev.Workchain,
-		Shard:     prev.Shard,
-	}
 	blocks := make([]ton.BlockIDExt, 0, limit)
 	for seqno := prev.SeqNo + 1; seqno <= target.SeqNo && len(blocks) < limit; seqno++ {
-		block, err := s.storage.LookupBlockBySeqNo(ctx, key, seqno)
+		ref := storage.BlockSeqRef{Workchain: prev.Workchain, Shard: prev.Shard, SeqNo: seqno}
+		block, err := s.storage.LookupBlockBySeqNo(ctx, ref)
 		if errors.Is(err, storage.ErrNotFound) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("lookup indexed block wc=%d shard=%016x seqno=%d: %w", key.Workchain, uint64(key.Shard), seqno, err)
+			return nil, fmt.Errorf("lookup indexed block wc=%d shard=%016x seqno=%d: %w", ref.Workchain, uint64(ref.Shard), seqno, err)
 		}
 		if block.Workchain != target.Workchain || block.Shard != target.Shard || block.SeqNo != seqno {
-			return nil, fmt.Errorf("%w: indexed block for wc=%d shard=%016x seqno=%d returned %s", errShardCatchUpNeedsSnapshot, key.Workchain, uint64(key.Shard), seqno, storage.FormatBlockRef(block))
+			return nil, fmt.Errorf("%w: indexed block for wc=%d shard=%016x seqno=%d returned %s", errShardCatchUpNeedsSnapshot, ref.Workchain, uint64(ref.Shard), seqno, storage.FormatBlockRef(block))
 		}
 
 		blocks = append(blocks, block)
@@ -207,7 +204,7 @@ func (s *Service) lookupNextChainBlockDescriptions(ctx context.Context, prev ton
 	return blocks, nil
 }
 
-func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<- shardStateDownload, prev ton.BlockIDExt, blocks []ton.BlockIDExt, source string) bool {
+func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<- shardStateDownload, prev ton.BlockIDExt, blocks []ton.BlockIDExt, source SyncBlockSource) bool {
 	if len(blocks) == 0 {
 		return true
 	}
@@ -222,7 +219,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 		Str("to", storage.FormatBlockRef(blocks[len(blocks)-1])).
 		Int("blocks", len(blocks)).
 		Int("workers", workers).
-		Str("source", source).
+		Str("source", string(source)).
 		Msg("downloading chain blocks in parallel")
 
 	jobs := make(chan shardStateDownloadJob)
@@ -343,6 +340,7 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 				Chain:            syncChainLabel(block),
 				Shard:            syncShardLabel(block),
 				Source:           source,
+				Origin:           syncBlockOriginForSource(source),
 				Result:           "success",
 				CatchUp:          true,
 				DownloadDuration: attemptElapsed,
@@ -353,7 +351,8 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 			Pipeline:         "exact_block_download",
 			Chain:            syncChainLabel(block),
 			Shard:            syncShardLabel(block),
-			Source:           "peer_probe",
+			Source:           SyncBlockSourcePeerProbe,
+			Origin:           SyncBlockOriginDownload,
 			Result:           syncBlockResultForError(err),
 			CatchUp:          true,
 			DownloadDuration: attemptElapsed,

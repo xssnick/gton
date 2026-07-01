@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -14,6 +15,40 @@ import (
 type BlockHistoryKey struct {
 	Workchain int32
 	Shard     int64
+}
+
+type BlockSeqRef struct {
+	Workchain int32
+	Shard     int64
+	SeqNo     uint32
+}
+
+func BlockSeqRefFromBlock(block ton.BlockIDExt) BlockSeqRef {
+	return BlockSeqRef{
+		Workchain: block.Workchain,
+		Shard:     block.Shard,
+		SeqNo:     block.SeqNo,
+	}
+}
+
+func (r BlockSeqRef) HistoryKey() BlockHistoryKey {
+	return BlockHistoryKey{
+		Workchain: r.Workchain,
+		Shard:     r.Shard,
+	}
+}
+
+var ErrInvalidBlockIDHashes = errors.New("block id has invalid hashes")
+
+func BlockIDHashesKnown(id ton.BlockIDExt) bool {
+	return len(id.RootHash) == 32 && len(id.FileHash) == 32
+}
+
+func ValidateBlockIDHashes(id ton.BlockIDExt) error {
+	if BlockIDHashesKnown(id) {
+		return nil
+	}
+	return ErrInvalidBlockIDHashes
 }
 
 // AccountShardCandidates returns the shard IDs along the account prefix path.
@@ -346,6 +381,10 @@ func VerifyBlockIdentity(id ton.BlockIDExt, block *tlb.Block) error {
 }
 
 func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockMeta, error) {
+	if err := ValidateBlockIDHashes(id); err != nil {
+		return nil, err
+	}
+
 	meta := &BlockMeta{
 		ID:       id,
 		Flags:    BlockMetaHasBlockData,
@@ -394,7 +433,11 @@ func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockM
 	return meta, nil
 }
 
-func BuildBlockMetaFromState(state BlockState) *BlockMeta {
+func BuildBlockMetaFromState(state BlockState) (*BlockMeta, error) {
+	if err := ValidateBlockIDHashes(state.Block); err != nil {
+		return nil, err
+	}
+
 	meta := &BlockMeta{
 		ID:            state.Block,
 		Flags:         BlockMetaHasStateSnapshot | BlockMetaHasStateCells,
@@ -407,7 +450,7 @@ func BuildBlockMetaFromState(state BlockState) *BlockMeta {
 	if state.MasterchainRef != nil {
 		meta.MasterchainRefSeqno = state.MasterchainRef.SeqNo
 	}
-	return meta
+	return meta, nil
 }
 
 func blockRefToBlockIDExt(workchain int32, shard int64, ref tlb.ExtBlkRef) ton.BlockIDExt {

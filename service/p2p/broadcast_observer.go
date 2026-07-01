@@ -4,6 +4,7 @@ import "time"
 
 const (
 	broadcastPipelineStageFECDecode         = "fec_decode"
+	broadcastPipelineStageQueue             = "queue"
 	broadcastPipelineStageClassify          = "classify"
 	broadcastPipelineStageCandidateDecode   = "candidate_decode"
 	broadcastPipelineStageShardDescValidate = "shard_desc_validate"
@@ -21,14 +22,14 @@ func (n *Node) SetBroadcastPipelineObserver(observer BroadcastPipelineObserver) 
 }
 
 func (n *Node) startBroadcastPipelineStage() time.Time {
-	if n == nil || n.broadcastPipelineObserver == nil {
+	if n.broadcastPipelineObserver == nil {
 		return time.Time{}
 	}
 	return time.Now()
 }
 
 func (n *Node) observeBroadcastPipelineStageSince(started time.Time, stage string, kind string, delivery Delivery, result string) {
-	if started.IsZero() || n == nil || n.broadcastPipelineObserver == nil {
+	if started.IsZero() || n.broadcastPipelineObserver == nil {
 		return
 	}
 
@@ -36,7 +37,7 @@ func (n *Node) observeBroadcastPipelineStageSince(started time.Time, stage strin
 }
 
 func (n *Node) observeBroadcastPipelineStageDuration(stage string, kind string, delivery Delivery, result string, duration time.Duration) {
-	if n == nil || n.broadcastPipelineObserver == nil {
+	if n.broadcastPipelineObserver == nil {
 		return
 	}
 

@@ -144,7 +144,7 @@ func Open(opts Options) (*Store, error) {
 
 	stageStarted = time.Now()
 	logger.Info().Uint32("version", metaDBVersion).Msg("checking metadb version")
-	if err = ensureMetaDBVersion(hot, opts.ReadOnly); err != nil {
+	if err = ensureMetaDBVersion(hot, opts.ReadOnly, logger); err != nil {
 		_ = hot.Close()
 		hotCache.Unref()
 		return nil, fmt.Errorf("check metadb version: %w", err)
@@ -163,20 +163,6 @@ func Open(opts Options) (*Store, error) {
 		_ = hot.Close()
 		hotCache.Unref()
 		return nil, fmt.Errorf("load cell generation manifest: %w", err)
-	}
-	var migrations startupMigrations
-	if !opts.ReadOnly {
-		manifest, migrations, err = runStartupMigrations(hot, manifest)
-		if err != nil {
-			_ = hot.Close()
-			hotCache.Unref()
-			return nil, fmt.Errorf("run storage startup migrations: %w", err)
-		}
-		if !isEmptyBlockID(migrations.activeOrigin) {
-			logger.Info().
-				Str("origin_persistent_state", storage.FormatBlockRef(migrations.activeOrigin)).
-				Msg("migrated active cell generation origin from current state")
-		}
 	}
 	logger.Info().
 		Uint64("active_cell_generation", manifest.active).

@@ -362,6 +362,7 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 		loaderGeneration = 0
 	}
 	if loaded, ok := s.cellCache.get(cacheGeneration, hash); ok {
+		s.lazyCellLoads.observeDecodedCache()
 		return loaded, nil
 	}
 
@@ -369,6 +370,7 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 	if err != nil {
 		return nil, err
 	}
+	s.lazyCellLoads.observePebble()
 	loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(loaderGeneration))
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)

@@ -173,7 +173,7 @@ func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	current.Block = prepared.Meta.PrevRefs[0]
 
 	prepared.ProofBOC = nil
-	next, _, err := (&Service{}).applyMasterchainTransition(current, prepared, nil, nil)
+	next, _, err := (&Service{}).applyMasterchainTransition(context.Background(), current, prepared, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("apply stored masterchain transition: %v", err)
 	}
@@ -248,10 +248,11 @@ func TestMerkleUpdateWindowCacheDoesNotLoadOldTreeDuringApply(t *testing.T) {
 	}
 
 	window := newStateCellWindowCache(base)
-	got, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: from}}, update, mustPreparedStateUpdateCells(t, update))
+	applied, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: from}}, update, mustPreparedStateUpdateCells(t, update))
 	if err != nil {
 		t.Fatalf("apply cached merkle update: %v", err)
 	}
+	got := applied.NextRoot
 	if got.HashKey() != to.HashKey() {
 		t.Fatalf("applied root hash mismatch: got=%x want=%x", got.HashKey(), to.HashKey())
 	}
@@ -303,10 +304,11 @@ func TestMerkleUpdateWindowCacheStoresDestinationCellsWithLogicalHashes(t *testi
 			return nil, fmt.Errorf("unexpected base load %x", hash[:])
 		}
 	})
-	got, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: from}}, update, mustPreparedStateUpdateCells(t, update))
+	applied, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: from}}, update, mustPreparedStateUpdateCells(t, update))
 	if err != nil {
 		t.Fatalf("apply direct merkle update: %v", err)
 	}
+	got := applied.NextRoot
 	want, _, err := cell.ApplyMerkleUpdate(from.Virtualize(0), update)
 	if err != nil {
 		t.Fatalf("apply reference merkle update: %v", err)
@@ -377,10 +379,11 @@ func TestMerkleUpdateWindowCacheCrossChecksVirtualizedDestinationWithApplyMerkle
 			return nil, fmt.Errorf("unexpected base load %x", hash[:])
 		}
 	})
-	got, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: fromRoot}}, update, mustPreparedStateUpdateCells(t, update))
+	applied, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: fromRoot}}, update, mustPreparedStateUpdateCells(t, update))
 	if err != nil {
 		t.Fatalf("apply direct merkle update: %v", err)
 	}
+	got := applied.NextRoot
 
 	want, _, err := cell.ApplyMerkleUpdate(fromRoot.Virtualize(0), update)
 	if err != nil {
@@ -449,10 +452,11 @@ func TestMerkleUpdateWindowCacheUsesPreparedDestinationCells(t *testing.T) {
 			return nil, fmt.Errorf("unexpected base load %x", hash[:])
 		}
 	})
-	got, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: fromRoot}}, update, prepared)
+	applied, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: fromRoot}}, update, prepared)
 	if err != nil {
 		t.Fatalf("apply prepared merkle update: %v", err)
 	}
+	got := applied.NextRoot
 
 	want, _, err := cell.ApplyMerkleUpdate(fromRoot.Virtualize(0), update)
 	if err != nil {
@@ -505,10 +509,11 @@ func TestMerkleUpdateWindowCacheSupportsMergePreviousStates(t *testing.T) {
 	window := newStateCellWindowCache(func(hash cell.Hash) (*cell.Cell, error) {
 		return nil, fmt.Errorf("unexpected base load %x", hash[:])
 	})
-	got, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: left}, {Cell: right}}, update, mustPreparedStateUpdateCells(t, update))
+	applied, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: left}, {Cell: right}}, update, mustPreparedStateUpdateCells(t, update))
 	if err != nil {
 		t.Fatalf("apply merge merkle update: %v", err)
 	}
+	got := applied.NextRoot
 	if got.HashKey() != to.HashKey() {
 		t.Fatalf("merge destination hash mismatch: got=%x want=%x", got.HashKey(), to.HashKey())
 	}
@@ -549,18 +554,20 @@ func TestStateCellWindowCacheCarriesCellsAcrossMerkleUpdates(t *testing.T) {
 		return stable, nil
 	})
 
-	root1, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1))
+	applied1, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1))
 	if err != nil {
 		t.Fatalf("apply first update: %v", err)
 	}
+	root1 := applied1.NextRoot
 	if root1.HashKey() != state1.HashKey() {
 		t.Fatalf("first state hash mismatch: got=%x want=%x", root1.HashKey(), state1.HashKey())
 	}
 
-	root2, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: root1}}, update2, mustPreparedStateUpdateCells(t, update2))
+	applied2, err := window.applyMerkleUpdate([]*tnstore.BlockState{{Cell: root1}}, update2, mustPreparedStateUpdateCells(t, update2))
 	if err != nil {
 		t.Fatalf("apply second update: %v", err)
 	}
+	root2 := applied2.NextRoot
 	if root2.HashKey() != state2.HashKey() {
 		t.Fatalf("second state hash mismatch: got=%x want=%x", root2.HashKey(), state2.HashKey())
 	}
@@ -626,18 +633,20 @@ func TestArchiveStateCellOverlayCarriesCellsAcrossMerkleUpdates(t *testing.T) {
 		return stable, nil
 	})
 
-	root1, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1), nil, 0)
+	applied1, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1), nil, 0)
 	if err != nil {
 		t.Fatalf("apply first archive update: %v", err)
 	}
+	root1 := applied1.NextRoot
 	if root1.HashKey() != state1.HashKey() {
 		t.Fatalf("first state hash mismatch: got=%x want=%x", root1.HashKey(), state1.HashKey())
 	}
 
-	root2, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: root1}}, update2, mustPreparedStateUpdateCells(t, update2), nil, 0)
+	applied2, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: root1}}, update2, mustPreparedStateUpdateCells(t, update2), nil, 0)
 	if err != nil {
 		t.Fatalf("apply second archive update: %v", err)
 	}
+	root2 := applied2.NextRoot
 	if root2.HashKey() != state2.HashKey() {
 		t.Fatalf("second state hash mismatch: got=%x want=%x", root2.HashKey(), state2.HashKey())
 	}
@@ -675,10 +684,11 @@ func TestArchiveStateCellOverlayRetriesPendingCheckpointCells(t *testing.T) {
 
 	overlay := newArchiveStateCellOverlay(nil)
 	update1 := mustMerkleUpdateCell(t, state0, state1)
-	root1, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1), nil, 0)
+	applied1, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1), nil, 0)
 	if err != nil {
 		t.Fatalf("apply first archive update: %v", err)
 	}
+	root1 := applied1.NextRoot
 	failedCheckpoint := overlay.beginCheckpoint()
 	failedRecords := failedCheckpoint.records()
 	if !hasCellRecord(failedRecords, state1.HashKey()) {
@@ -1000,6 +1010,22 @@ func TestArchiveStateCellOverlayAdoptDoesNotDedupeRecords(t *testing.T) {
 	}
 }
 
+func TestStateCellWindowLazyLoadMetricsCountHits(t *testing.T) {
+	var counters lazyCellLoadCounters
+	root := cell.BeginCell().MustStoreUInt(0x91, 8).EndCell()
+	window := newStateCellWindowCache(nil, &counters)
+
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, root)); err != nil {
+		t.Fatalf("add prepared records: %v", err)
+	}
+	if _, err := window.loader()(root.HashKey()); err != nil {
+		t.Fatalf("load cached state cell: %v", err)
+	}
+	if got := lazyCellLoadMetricCount(counters.snapshot(), tnstore.LazyCellLoadLayerStateWindow); got != 1 {
+		t.Fatalf("state window lazy loads = %d, want 1", got)
+	}
+}
+
 func mustProofBody(tb testing.TB, root *cell.Cell, recursiveRefs ...int) *cell.Cell {
 	tb.Helper()
 
@@ -1080,6 +1106,16 @@ func removePreparedCellRecord(records tnstore.StateCellRecords, hash cell.Hash) 
 		encoded = append(encoded, record)
 	}
 	return tnstore.NewStateCellRecords(encoded)
+}
+
+func lazyCellLoadMetricCount(metrics []tnstore.LazyCellLoadMetric, layer string) uint64 {
+	var count uint64
+	for _, metric := range metrics {
+		if metric.Layer == layer {
+			count += metric.Count
+		}
+	}
+	return count
 }
 
 func hasCellRecord(records []tnstore.EncodedCellRecord, hash cell.Hash) bool {

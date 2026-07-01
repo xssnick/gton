@@ -75,9 +75,6 @@ func newIdentifiedBroadcastPayload(msg any, identity []byte) *broadcastPayload {
 }
 
 func (p *broadcastPayload) bytes() ([]byte, error) {
-	if p == nil {
-		return nil, nil
-	}
 	if p.serialized {
 		return p.payload, p.err
 	}
@@ -88,10 +85,6 @@ func (p *broadcastPayload) bytes() ([]byte, error) {
 }
 
 func (p *broadcastPayload) fingerprint(overlayID []byte) (string, error) {
-	if p == nil {
-		return "", nil
-	}
-
 	identity := p.identity
 	if len(identity) == 0 {
 		payload, err := p.bytes()
@@ -147,8 +140,8 @@ func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, m
 	}
 
 	kind := broadcastKindLabel(msg)
-	if peer != nil {
-		peer.noteReceive()
+	if peer != nil && peer.noteReceive() {
+		s.peerPromoted(peer)
 	}
 	if !s.node.canAcceptBroadcast(kind, false) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "broadcast_admission_closed")
@@ -275,13 +268,23 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
 			return nil, nil
 		}
-		addrKey, err := externalMessageDestinationAddress(data.Message.Data)
+		parsed, err := parseExternalMessageData(data.Message.Data)
 		if err != nil {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return nil, nil
 		}
+		addrKey := parsed.address
 		if err = s.node.addExternalMessageAddressLimit(addrKey, now); err != nil {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "address_rate_limited")
+			return nil, nil
+		}
+		if err = s.node.acceptExternalMessage(s.node.runtimeContext(), ExternalMessageEvent{
+			Body:    data.Message.Data,
+			Root:    parsed.root,
+			Message: parsed.message,
+		}); err != nil {
+			s.node.dropExternalMessageAddressLimit(addrKey, now)
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "external_message_rejected")
 			return nil, nil
 		}
 
@@ -473,7 +476,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		return nil, nil
 	}
 
-	downloaded, sigSet, err := s.node.decodeBroadcastBlock(s.node.runCtx, msg)
+	downloaded, sigSet, err := s.node.decodeBroadcastBlock(s.node.runtimeContext(), msg)
 	if err != nil {
 		stateNotReady := isBroadcastDecompressionStateNotReady(err)
 		var rebroadcast *rebroadcastRequest
@@ -635,6 +638,9 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	downloaded.SourcePeerID = sourcePeerID
 	s.node.rememberShardBlockCandidate(downloaded)
 	s.node.publishNonfinalDownloadedBlock(downloaded, storage.LiveBlockNonfinalCandidate)
+	if s.node.blockReceivedHooks && !isMasterchainBlock(downloaded.ID) {
+		s.node.observeBlockReceived(s.node.runtimeContext(), downloaded, false)
+	}
 
 	accepted := &acceptedBroadcast{
 		fingerprint: fingerprint,
@@ -674,6 +680,9 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 			}
 			n.observeBroadcastPipelineStageSince(cacheStarted, broadcastPipelineStageHotCacheNotify, accepted.event.Kind, accepted.event.Delivery, cacheResult)
 			n.publishNonfinalDownloadedBlock(accepted.event.Downloaded, storage.LiveBlockNonfinalSigned)
+			if n.blockReceivedHooks {
+				n.observeBlockReceived(n.runtimeContext(), accepted.event.Downloaded, true)
+			}
 		}
 		if n.eventQueue.Push(*accepted.event) {
 			acceptedNoted = true

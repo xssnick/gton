@@ -111,7 +111,6 @@ func TestDownloadNextBlockFullUsesMasterchainBroadcastCacheBeforeOverlay(t *test
 	if !got.ID.Equals(&broadcast.ID) {
 		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(broadcast.ID))
 	}
-
 	desc, err := node.NextBlockDescription(context.Background(), prev)
 	if err != nil {
 		t.Fatalf("next block description: %v", err)
@@ -144,6 +143,32 @@ func TestAcceptBroadcastCachesMasterchainNextBroadcast(t *testing.T) {
 	}
 }
 
+func TestAcceptBroadcastObservesSignedMasterchainBlockReceived(t *testing.T) {
+	node := newTestNode(t)
+	observer := &testBlockReceivedObserver{hooks: true}
+	node.blockReceivedObserver = observer
+	node.blockReceivedHooks = observer.BlockReceivedHooksEnabled()
+	prev := testStoredMasterBlockID(240)
+	broadcast := testMasterchainBroadcastDownloadedBlock(t, prev, 241, 0x241)
+
+	node.acceptBroadcast(acceptedBroadcast{
+		fingerprint: "masterchain-received-hook",
+		event: &BroadcastEvent{
+			Kind:       broadcast.Kind,
+			Block:      broadcast.ID,
+			Downloaded: &broadcast,
+		},
+	})
+
+	if len(observer.events) != 1 {
+		t.Fatalf("block received events = %d, want 1", len(observer.events))
+	}
+	event := observer.events[0]
+	if !event.IsSigned || event.Downloaded != &broadcast {
+		t.Fatalf("unexpected block received event: %+v", event)
+	}
+}
+
 func testMasterchainBroadcastDownloadedBlock(t *testing.T, prev ton.BlockIDExt, seqno uint32, payload uint64) DownloadedBlock {
 	t.Helper()
 
@@ -158,7 +183,6 @@ func testMasterchainBroadcastDownloadedBlock(t *testing.T, prev ton.BlockIDExt, 
 
 	proof := testBlockProofCell(t, block, nil)
 	proofBOC := proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-
 	return DownloadedBlock{
 		ID:       block,
 		Kind:     "tonNode.blockBroadcast",

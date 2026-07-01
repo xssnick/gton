@@ -167,7 +167,7 @@ func (s *Service) durableMasterchainBlock(ctx context.Context, masterSeqno uint3
 		return durable, nil
 	}
 
-	master, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, masterSeqno)
+	master, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: masterSeqno})
 	if err != nil {
 		return ton.BlockIDExt{}, fmt.Errorf("lookup durable masterchain block #%d: %w", masterSeqno, err)
 	}

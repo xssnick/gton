@@ -155,6 +155,11 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 
 	for idx := range window.masterSequence {
 		downloaded := window.masterSequence[idx]
+		if r.service.preparedMasterBlockAfterSyncUntil(downloaded) {
+			r.syncUntilReached = true
+			break
+		}
+
 		proof := window.masterProofs[downloaded.ID.SeqNo]
 		if proof == nil || !proof.block.Equals(&downloaded.ID) {
 			var err error
@@ -173,7 +178,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		}
 		downloaded.consensusChecked = checked
 
-		next, timing, err := r.service.applyMasterchainTransition(master, downloaded, checked, applier)
+		next, timing, err := r.service.applyMasterchainTransition(ctx, master, downloaded, checked, applier, &blockApplyHookMeta{})
 		window.masterApplyElapsed += timing.total
 		window.masterPrepareElapsed += timing.prepare
 		window.masterConsensusElapsed += timing.consensus
@@ -181,7 +186,12 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		if err != nil {
 			return nil, fmt.Errorf("apply archive master block %s: %w", downloaded.BlockRef(), err)
 		}
-		r.service.resetMasterDependentCachesForKeyBlock(&downloaded)
+
+		r.service.publishLiveBlockArtifacts(downloaded, next)
+		r.service.rememberAppliedMasterchainState(next)
+		r.service.rememberSeenMasterchainBlock(next.Block)
+		r.service.rememberMasterState(ctx, next, &downloaded)
+
 		master = next
 		window.masterSequence[idx].releaseStateUpdatePayload()
 		downloaded.releaseStateUpdatePayload()
@@ -229,7 +239,7 @@ func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context
 			Shards:           make(map[storage.ShardKey]storage.BlockState, len(targets)),
 		}
 
-		shards, err := r.applyArchiveShardTargets(ctx, masterState.Block, prevShards, applied, window.archiveBlocks, targets, window)
+		shards, err := r.applyArchiveShardTargets(ctx, masterState, prevShards, applied, window.archiveBlocks, targets, window)
 		if err != nil {
 			return nil, fmt.Errorf("apply archive shard blocks at masterchain seqno %d: %w", seqno, err)
 		}
@@ -240,10 +250,11 @@ func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context
 	return next, nil
 }
 
-func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, master ton.BlockIDExt, current map[storage.ShardKey]storage.BlockState, applied map[storage.BlockRootHash]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock, targets []ton.BlockIDExt, window *shardClientArchiveWindow) (map[storage.ShardKey]*storage.BlockState, error) {
+func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, masterState *storage.BlockState, current map[storage.ShardKey]storage.BlockState, applied map[storage.BlockRootHash]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock, targets []ton.BlockIDExt, window *shardClientArchiveWindow) (map[storage.ShardKey]*storage.BlockState, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
+	master := masterState.Block
 
 	applier := window.stateCells.metered(nil)
 
@@ -264,7 +275,10 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 			mu:     &blockLoaderMu,
 		}.load,
 		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
-			return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, applier)
+			return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, applier, &blockApplyHookMeta{
+				InclusionMasterRef:   &master,
+				InclusionMasterState: masterState.Cell,
+			})
 		},
 		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded PreparedBlock, _ time.Duration) error {
 			setShardStateMasterchainRef(state, master)
@@ -376,6 +390,7 @@ func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.Curre
 		return nil, fmt.Errorf("persist archive current state %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}
 	cells.complete()
+	r.service.markLiveCheckpointStatesFlushed(entries)
 
 	r.service.log.Debug().
 		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).

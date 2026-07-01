@@ -729,7 +729,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		return nil, err
 	}
 	if a.header != nil && a.header.staged != nil {
-		if err = a.node.savePersistentStateFile(a.block, a.master, a.header.staged, nil); err != nil {
+		if err = a.node.savePersistentStateFile(a.block, a.master, a.header.staged, a.stateRootHash); err != nil {
 			return nil, fmt.Errorf("store split persistent state header file: %w", err)
 		}
 	}
@@ -766,7 +766,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		if !merged {
 			return nil, fmt.Errorf("%w: duplicate account in split state part %d", errStateSnapshotInvalid, i+1)
 		}
-		if err = a.node.savePersistentStateFile(a.block, a.master, part.staged, nil); err != nil {
+		if err = a.node.savePersistentStateFile(a.block, a.master, part.staged, a.stateRootHash); err != nil {
 			return nil, fmt.Errorf("store split persistent state part %d file: %w", i+1, err)
 		}
 

@@ -73,6 +73,34 @@ func (a testBroadcastAdmission) CanAcceptBroadcast(BroadcastAdmissionRequest) bo
 	return bool(a)
 }
 
+type testExternalMessageAdmission struct {
+	events []ExternalMessageEvent
+	err    error
+}
+
+func (a *testExternalMessageAdmission) AcceptExternalMessage(_ context.Context, event ExternalMessageEvent) error {
+	a.events = append(a.events, event)
+	return a.err
+}
+
+func (a *testExternalMessageAdmission) AcceptCheckedExternalMessage(_ context.Context, event ExternalMessageEvent) error {
+	a.events = append(a.events, event)
+	return a.err
+}
+
+type testBlockReceivedObserver struct {
+	events []BlockReceivedEvent
+	hooks  bool
+}
+
+func (o *testBlockReceivedObserver) ObserveBlockReceived(_ context.Context, event BlockReceivedEvent) {
+	o.events = append(o.events, event)
+}
+
+func (o *testBlockReceivedObserver) BlockReceivedHooksEnabled() bool {
+	return o.hooks
+}
+
 func newTestPebbleStore(tb testing.TB) *pebblestore.Store {
 	tb.Helper()
 

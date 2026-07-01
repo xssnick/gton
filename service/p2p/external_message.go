@@ -18,18 +18,43 @@ import (
 const maxExternalMessageBOCCells = 1 << 17
 
 func (s *overlaySubscription) serveSendExtMessage(ctx context.Context, msg tonnodeapi.ExternalMessage) (tl.Serializable, error) {
-	addrKey, err := externalMessageDestinationAddress(msg.Data)
+	parsed, err := parseExternalMessageData(msg.Data)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.node.SendExternalMessage(ctx, msg.Data, addrKey); err != nil {
+	if err := s.node.sendExternalMessage(ctx, msg.Data, parsed.address, parsed.root, parsed.message, false, false); err != nil {
 		return nil, err
 	}
 	return Success{}, nil
 }
 
-func (n *Node) SendExternalMessage(ctx context.Context, data []byte, addrKey extmsg.AddressKey) error {
+func (n *Node) SendExternalMessage(ctx context.Context, data []byte, dst *address.Address) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
+	addrKey, err := checkedExternalMessageAddressKey(dst)
+	if err != nil {
+		return err
+	}
+	return n.sendExternalMessage(ctx, data, addrKey, nil, nil, false, true)
+}
+
+func (n *Node) SendCheckedExternalMessage(ctx context.Context, data []byte, dst *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
+	addrKey, err := checkedExternalMessageAddressKey(dst)
+	if err != nil {
+		return err
+	}
+	return n.sendExternalMessage(ctx, data, addrKey, root, msg, true, true)
+}
+
+func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey extmsg.AddressKey, root *cell.Cell, msg *tlb.ExternalMessage, checked bool, isLocal bool) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	if len(data) == 0 {
 		return errors.New("external message is empty")
 	}
@@ -66,6 +91,22 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte, addrKey ext
 	if len(pending) == 0 {
 		return nil
 	}
+
+	ev := ExternalMessageEvent{
+		IsLocal: isLocal,
+		Body:    data,
+		Root:    root,
+		Message: msg,
+	}
+
+	if checked {
+		err = n.acceptCheckedExternalMessage(ctx, ev)
+	} else {
+		err = n.acceptExternalMessage(ctx, ev)
+	}
+	if err != nil {
+		return err
+	}
 	if n.externalBroadcastPacer == nil {
 		return n.enqueueExternalMessageTargets(addrKey, pending, payload, now)
 	}
@@ -75,6 +116,27 @@ func (n *Node) SendExternalMessage(ctx context.Context, data []byte, addrKey ext
 		return err
 	}
 	return n.enqueueExternalMessageTargets(addrKey, pending, payload, time.Now())
+}
+
+func (n *Node) acceptExternalMessage(ctx context.Context, event ExternalMessageEvent) error {
+	if n.externalMessageAdmission == nil {
+		return nil
+	}
+	return n.externalMessageAdmission.AcceptExternalMessage(ctx, event)
+}
+
+func (n *Node) acceptCheckedExternalMessage(ctx context.Context, event ExternalMessageEvent) error {
+	if n.externalMessageAdmission == nil {
+		return nil
+	}
+	return n.externalMessageAdmission.AcceptCheckedExternalMessage(ctx, event)
+}
+
+func (n *Node) runtimeContext() context.Context {
+	if n.runCtx == nil {
+		return context.Background()
+	}
+	return n.runCtx
 }
 
 type externalMessageTarget struct {
@@ -188,40 +250,76 @@ func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, 
 	return sub, nil
 }
 
+type parsedExternalMessage struct {
+	root    *cell.Cell
+	message *tlb.ExternalMessage
+	address extmsg.AddressKey
+}
+
+func parseExternalMessageData(data []byte) (parsedExternalMessage, error) {
+	root, message, err := parseExternalMessageRoot(data)
+	if err != nil {
+		return parsedExternalMessage{}, err
+	}
+	return parsedExternalMessage{
+		root:    root,
+		message: message,
+		address: externalMessageAddressKey(message.DstAddr),
+	}, nil
+}
+
 func externalMessageDestinationAddress(data []byte) (extmsg.AddressKey, error) {
+	parsed, err := parseExternalMessageData(data)
+	if err != nil {
+		return extmsg.AddressKey{}, err
+	}
+	return parsed.address, nil
+}
+
+func parseExternalMessageRoot(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {
 	root, err := cell.FromBOCWithOptions(data, cell.BOCParseOptions{
 		MaxCells: maxExternalMessageBOCCells,
 	})
 	if err != nil {
-		return extmsg.AddressKey{}, fmt.Errorf("parse external message BOC: %w", err)
+		return nil, nil, fmt.Errorf("parse external message BOC: %w", err)
 	}
 
 	loader, err := root.BeginParse()
 	if err != nil {
-		return extmsg.AddressKey{}, fmt.Errorf("begin parse external message: %w", err)
+		return nil, nil, fmt.Errorf("begin parse external message: %w", err)
 	}
 
 	magic, err := loader.PreloadUInt(2)
 	if err != nil || magic != 0b10 {
-		return extmsg.AddressKey{}, errors.New("external message must begin with ext_in_msg_info$10")
+		return nil, nil, errors.New("external message must begin with ext_in_msg_info$10")
 	}
 	var msg tlb.ExternalMessage
 	if err = tlb.LoadFromCell(&msg, loader); err != nil {
-		return extmsg.AddressKey{}, fmt.Errorf("parse external message: %w", err)
+		return nil, nil, fmt.Errorf("parse external message: %w", err)
 	}
 	if msg.DstAddr == nil {
-		return extmsg.AddressKey{}, errors.New("external message has no destination address")
+		return nil, nil, errors.New("external message has no destination address")
 	}
 	if msg.DstAddr.Type() != address.StdAddress || msg.DstAddr.BitsLen() != 256 {
-		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
+		return nil, nil, errors.New("external message destination address is not a std 256-bit address")
 	}
-	return externalMessageAddressKey(msg.DstAddr), nil
+	return root, &msg, nil
 }
 
 func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
 	key := extmsg.AddressKey{Workchain: addr.Workchain()}
 	copy(key.Account[:], addr.Data())
 	return key
+}
+
+func checkedExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey, error) {
+	if addr == nil {
+		return extmsg.AddressKey{}, errors.New("external message destination address is nil")
+	}
+	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
+		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
+	}
+	return externalMessageAddressKey(addr), nil
 }
 
 func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {

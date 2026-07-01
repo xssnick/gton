@@ -39,7 +39,7 @@ func observeShardBlockObtain(ctx context.Context, started time.Time) {
 }
 
 func (r *shardObtainRecorder) observe(started time.Time, finished time.Time) {
-	if r == nil || started.IsZero() || finished.Before(started) {
+	if started.IsZero() || finished.Before(started) {
 		return
 	}
 
@@ -52,20 +52,12 @@ func (r *shardObtainRecorder) observe(started time.Time, finished time.Time) {
 }
 
 func (r *shardObtainRecorder) count() int {
-	if r == nil {
-		return 0
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.intervals)
 }
 
 func (r *shardObtainRecorder) duration() time.Duration {
-	if r == nil {
-		return 0
-	}
-
 	r.mu.Lock()
 	intervals := append([]shardObtainInterval(nil), r.intervals...)
 	r.mu.Unlock()

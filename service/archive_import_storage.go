@@ -17,7 +17,12 @@ func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.D
 	if err != nil {
 		return nil, err
 	}
-	return s.prepareImportedArchiveBlocks(imported, splitDepth)
+	result, err := s.prepareImportedArchiveBlocks(imported, splitDepth)
+	if err != nil {
+		return nil, err
+	}
+	s.observeImportedArchiveBlocksReceived(ctx, imported, result)
+	return result, nil
 }
 
 func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) (*archive.Imported, error) {
@@ -33,6 +38,26 @@ func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) 
 		return nil, err
 	}
 	return imported, nil
+}
+
+func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, imported *archive.Imported, result *archiveImportResult) {
+	if s.blockReceivedHooks == nil || imported == nil || result == nil {
+		return
+	}
+
+	seenBlocks := map[storage.BlockRootHash]struct{}{}
+	for _, full := range imported.FullBlocks {
+		key := storage.BlockKey(full.ID)
+		if _, exists := seenBlocks[key]; exists {
+			continue
+		}
+		seenBlocks[key] = struct{}{}
+
+		block, ok := result.blocks[key]
+		if ok {
+			s.observePreparedBlockReceived(ctx, block, true)
+		}
+	}
 }
 
 func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, splitDepth uint32) (*archiveImportResult, error) {
@@ -64,7 +89,6 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 		}
 		blocks[key] = PreparedBlock{
 			ID:                        full.ID,
-			Kind:                      "archive block",
 			BlockBOC:                  full.Block,
 			ProofBOC:                  full.Proof,
 			BlockRoot:                 prepared.Block,

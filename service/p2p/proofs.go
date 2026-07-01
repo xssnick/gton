@@ -20,10 +20,16 @@ type ProofDownload struct {
 }
 
 func (n *Node) DownloadBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (ProofDownload, error) {
+	if n.IsOffline() {
+		return ProofDownload{}, ErrOffline
+	}
 	return n.downloadProof(ctx, block, allowPartial, false)
 }
 
 func (n *Node) DownloadKeyBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (ProofDownload, error) {
+	if n.IsOffline() {
+		return ProofDownload{}, ErrOffline
+	}
 	return n.downloadProof(ctx, block, allowPartial, true)
 }
 
@@ -241,7 +247,7 @@ func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *o
 		return ProofDownload{}, ErrBlockNotAvailable
 	}
 	if err = validateDownloadedProof(block, data, isLink, keyBlock); err != nil {
-		if s.node == nil || !s.node.IsHardfork(block) {
+		if !s.node.IsHardfork(block) {
 			return ProofDownload{}, err
 		}
 		if hardforkErr := validateDownloadedHardforkProof(block, data, isLink, keyBlock); hardforkErr != nil {

@@ -35,6 +35,13 @@ func TestLoadDefaults(t *testing.T) {
 	if syncBefore != DefaultSyncBefore {
 		t.Fatalf("unexpected sync before %s", syncBefore)
 	}
+	syncUntil, err := cfg.SyncUntil()
+	if err != nil {
+		t.Fatalf("sync until: %v", err)
+	}
+	if syncUntil != 0 {
+		t.Fatalf("unexpected sync_until %d", syncUntil)
+	}
 	if cfg.TON.StateTTL != int64(DefaultStateTTL/time.Second) {
 		t.Fatalf("unexpected state_ttl %d", cfg.TON.StateTTL)
 	}
@@ -110,6 +117,13 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if capacity.MaxDelay != DefaultLiteSendMessageBroadcastMaxDelay {
 		t.Fatalf("unexpected default liteserver send message broadcast max delay %s", capacity.MaxDelay)
+	}
+	fanout, err := cfg.LiteSendMessageBroadcastFanout()
+	if err != nil {
+		t.Fatalf("liteserver send message broadcast fanout: %v", err)
+	}
+	if fanout != DefaultLiteSendMessageBroadcastFanout {
+		t.Fatalf("unexpected default liteserver send message broadcast fanout %d", fanout)
 	}
 	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
 		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
@@ -225,7 +239,7 @@ func TestLoadCustomOverlays(t *testing.T) {
 }
 
 func TestLoadLiteSendMessageBroadcastCapacity(t *testing.T) {
-	path := writeTestConfig(t, `{"liteserver":{"send_message_broadcast_bytes_per_second":123456,"send_message_broadcast_max_delay_ms":75}}`)
+	path := writeTestConfig(t, `{"liteserver":{"send_message_broadcast_bytes_per_second":123456,"send_message_broadcast_max_delay_ms":75,"send_message_broadcast_fanout":15}}`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -241,6 +255,13 @@ func TestLoadLiteSendMessageBroadcastCapacity(t *testing.T) {
 	}
 	if capacity.MaxDelay != 75*time.Millisecond {
 		t.Fatalf("unexpected max delay %s", capacity.MaxDelay)
+	}
+	fanout, err := cfg.LiteSendMessageBroadcastFanout()
+	if err != nil {
+		t.Fatalf("liteserver send message broadcast fanout: %v", err)
+	}
+	if fanout != 15 {
+		t.Fatalf("unexpected fanout %d", fanout)
 	}
 }
 
@@ -273,6 +294,40 @@ func TestLoadLiteSendMessageBroadcastCapacityRejectsNegative(t *testing.T) {
 	}
 }
 
+func TestLoadLiteSendMessageBroadcastFanoutRejectsOutOfRange(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "negative",
+			body: `{"liteserver":{"send_message_broadcast_fanout":-1}}`,
+		},
+		{
+			name: "below minimum",
+			body: `{"liteserver":{"send_message_broadcast_fanout":2}}`,
+		},
+		{
+			name: "above maximum",
+			body: `{"liteserver":{"send_message_broadcast_fanout":21}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestConfig(t, tt.body)
+
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			if _, err = cfg.LiteSendMessageBroadcastFanout(); err == nil {
+				t.Fatal("expected invalid liteserver send message broadcast fanout to fail")
+			}
+		})
+	}
+}
+
 func TestLoadLiteLimits(t *testing.T) {
 	path := writeTestConfig(t, `{"liteserver":{"limits":{"capacity_per_ip":100,"cooling_per_sec":20,"max_connections_per_ip":50,"max_keep_alive_seconds":60}}}`)
 
@@ -296,7 +351,7 @@ func TestLoadLiteLimits(t *testing.T) {
 }
 
 func TestLoadSyncOptions(t *testing.T) {
-	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"state_ttl":86400,"archive_ttl":172800,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789,"sync_backpressure_windows":6}}`)
+	path := writeTestConfig(t, `{"ton":{"sync_before":7200,"sync_until":1719763200,"state_ttl":86400,"archive_ttl":172800,"next_checkpoint_blocks":700,"archive_checkpoint_blocks":2100,"checkpoint_bytes":123456789,"sync_backpressure_windows":6}}`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -309,6 +364,13 @@ func TestLoadSyncOptions(t *testing.T) {
 	}
 	if syncBefore != 2*time.Hour {
 		t.Fatalf("unexpected sync before %s", syncBefore)
+	}
+	syncUntil, err := cfg.SyncUntil()
+	if err != nil {
+		t.Fatalf("sync until: %v", err)
+	}
+	if syncUntil != 1719763200 {
+		t.Fatalf("unexpected sync until %d", syncUntil)
 	}
 	stateTTL, err := cfg.StateTTL()
 	if err != nil {
@@ -581,10 +643,24 @@ func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
-	path := writeTestConfig(t, `{"logging":{"level":"debug"}}`)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "logging",
+			body: `{"logging":{"level":"debug"}}`,
+		},
+	}
 
-	if _, err := Load(path); err == nil {
-		t.Fatal("expected unknown config field to fail")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTestConfig(t, tt.body)
+
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected unknown config field to fail")
+			}
+		})
 	}
 }
 
@@ -639,6 +715,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.Lite.SendMessageBroadcastMaxDelayMS != int64(DefaultLiteSendMessageBroadcastMaxDelay/time.Millisecond) {
 		t.Fatalf("unexpected liteserver send message broadcast max delay %d", cfg.Lite.SendMessageBroadcastMaxDelayMS)
+	}
+	if cfg.Lite.SendMessageBroadcastFanout != DefaultLiteSendMessageBroadcastFanout {
+		t.Fatalf("unexpected liteserver send message broadcast fanout %d", cfg.Lite.SendMessageBroadcastFanout)
 	}
 	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
 		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
@@ -727,6 +806,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"sync_before"`)) {
 		t.Fatal("generated config should use sync_before key")
 	}
+	if !bytes.Contains(data, []byte(`"sync_until"`)) {
+		t.Fatal("generated config should use sync_until key")
+	}
 	if !bytes.Contains(data, []byte(`"state_ttl"`)) {
 		t.Fatal("generated config should use state_ttl key")
 	}
@@ -741,6 +823,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"send_message_broadcast_max_delay_ms"`)) {
 		t.Fatal("generated config should use send_message_broadcast_max_delay_ms key")
+	}
+	if !bytes.Contains(data, []byte(`"send_message_broadcast_fanout"`)) {
+		t.Fatal("generated config should use send_message_broadcast_fanout key")
 	}
 	if !bytes.Contains(data, []byte(`"limits"`)) {
 		t.Fatal("generated config should use liteserver limits key")
@@ -816,6 +901,29 @@ func TestSyncBeforeValidation(t *testing.T) {
 	cfg.TON.SyncBefore = -2
 	if _, err := cfg.SyncBefore(); err == nil {
 		t.Fatal("expected negative sync_before other than -1 to fail")
+	}
+}
+
+func TestSyncUntilValidation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.TON.SyncUntil = 0
+
+	syncUntil, err := cfg.SyncUntil()
+	if err != nil {
+		t.Fatalf("zero sync_until should be allowed: %v", err)
+	}
+	if syncUntil != 0 {
+		t.Fatalf("unexpected sync_until %d", syncUntil)
+	}
+
+	cfg.TON.SyncUntil = -1
+	if _, err = cfg.SyncUntil(); err == nil {
+		t.Fatal("expected negative sync_until to fail")
+	}
+
+	cfg.TON.SyncUntil = int64(^uint32(0)) + 1
+	if _, err = cfg.SyncUntil(); err == nil {
+		t.Fatal("expected too large sync_until to fail")
 	}
 }
 

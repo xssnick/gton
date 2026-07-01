@@ -60,7 +60,7 @@ func (n *Node) startDHTServer(ctx context.Context, cfg *liteclient.GlobalConfig)
 
 	n.dhtGateway = dhtGateway
 	n.dhtServer = server
-	n.dht = server.Client
+	n.dht = &serverDHTBackend{Server: server}
 
 	n.runAsync(func() {
 		n.runDHTServerPublishLoop(ctx, addrList)
@@ -101,6 +101,9 @@ func (n *Node) runDHTServerPublishLoop(ctx context.Context, addrList address.Lis
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			if n.IsOffline() {
+				return
+			}
 			delay := publicAnnounceTTL / 2
 			if err := n.publishDHTServerAddress(ctx, addrList); err != nil {
 				n.log.Warn().Err(err).Msg("failed to publish DHT server address")
@@ -112,6 +115,9 @@ func (n *Node) runDHTServerPublishLoop(ctx context.Context, addrList address.Lis
 }
 
 func (n *Node) publishDHTServerAddress(ctx context.Context, addrList address.List) error {
+	if n.IsOffline() {
+		return ErrOffline
+	}
 	if n.dhtServer == nil || len(n.dhtPrivKey) == 0 {
 		return nil
 	}

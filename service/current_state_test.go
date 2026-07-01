@@ -25,6 +25,34 @@ func testPeerID(label string) p2p.PeerID {
 	return p2p.PeerID(sha256.Sum256([]byte(label)))
 }
 
+func newFrozenTestNode(t *testing.T) *p2p.Node {
+	t.Helper()
+
+	logger := zerolog.Nop()
+	node, err := p2p.New(p2p.Options{
+		Logger:        &logger,
+		Storage:       openTestPebbleStorage(t),
+		StateFilesDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create p2p node: %v", err)
+	}
+	node.EnterOffline("ton.sync_until reached")
+	return node
+}
+
+type recordingSyncObserver struct {
+	blocks []SyncBlockObservation
+}
+
+func (o *recordingSyncObserver) ObserveSyncBlock(observation SyncBlockObservation) {
+	o.blocks = append(o.blocks, observation)
+}
+
+func (o *recordingSyncObserver) ObserveSyncObtain(SyncObtainObservation) {}
+
+func (o *recordingSyncObserver) ObserveSyncPersist(SyncPersistObservation) {}
+
 func testCurrentBlockStates(current *tnstore.CurrentState) []*tnstore.BlockState {
 	if current == nil {
 		return nil
@@ -221,6 +249,71 @@ func TestPublishCommittedCurrentStateDoesNotRegressStatus(t *testing.T) {
 	}
 }
 
+func TestCatchUpCurrentStateReturnsAfterSyncUntilOffline(t *testing.T) {
+	ctx := context.Background()
+	cutoff := uint32(200)
+	master := testBlockID(-1, topShard, 100)
+	current := &tnstore.CurrentState{
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	svc := &Service{
+		log:  zerolog.Nop(),
+		node: newFrozenTestNode(t),
+		storage: &testCellGenerationMigrationStore{
+			current: current,
+			blockMetas: map[tnstore.BlockRootHash]*tnstore.BlockMeta{
+				tnstore.BlockKey(master): &tnstore.BlockMeta{ID: master, GenUTime: cutoff},
+			},
+		},
+		syncUntil:        cutoff,
+		currentStateWake: make(chan struct{}, 1),
+	}
+	if err := svc.catchUpCurrentState(ctx); err != nil {
+		t.Fatalf("catch up current state: %v", err)
+	}
+}
+
+func TestInitialStateSyncStopsAfterSyncUntilFrozen(t *testing.T) {
+	cutoff := uint32(200)
+	master := testBlockID(-1, topShard, 100)
+	current := &tnstore.CurrentState{
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+	svc := &Service{
+		log:  zerolog.Nop(),
+		node: newFrozenTestNode(t),
+		storage: &testCellGenerationMigrationStore{
+			current: current,
+			blockMetas: map[tnstore.BlockRootHash]*tnstore.BlockMeta{
+				tnstore.BlockKey(master): &tnstore.BlockMeta{ID: master, GenUTime: cutoff},
+			},
+		},
+		syncUntil:        cutoff,
+		currentStateWake: make(chan struct{}, 1),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.runInitialStateSync(context.Background())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("initial state sync did not stop after sync_until freeze")
+	}
+}
+
 func TestMarkLiveCheckpointStatesFlushedPublishesAllEntries(t *testing.T) {
 	flusher := &testLiveCheckpointFlusher{}
 	svc := &Service{liveState: flusher}
@@ -367,17 +460,17 @@ func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		kind string
-		want string
+		want SyncBlockSource
 	}{
-		{name: "plain overlay download", kind: "tonNode.dataFull", want: "next_block"},
-		{name: "broadcast cache", kind: "tonNode.blockBroadcastCompressedV2", want: "broadcast_cache"},
-		{name: "shard description broadcast hint", kind: "tonNode.newShardBlockBroadcast", want: "broadcast_hint"},
-		{name: "stored full block", kind: "local full block cache", want: "stored"},
-		{name: "stored next block", kind: "local next block cache", want: "stored"},
-		{name: "stored block data", kind: "stored block", want: "stored"},
+		{name: "plain overlay download", kind: "tonNode.dataFull", want: SyncBlockSourceNextBlock},
+		{name: "broadcast cache", kind: "tonNode.blockBroadcastCompressedV2", want: SyncBlockSourceBroadcastCache},
+		{name: "shard description broadcast hint", kind: "tonNode.newShardBlockBroadcast", want: SyncBlockSourceBroadcastHint},
+		{name: "stored full block", kind: "local full block cache", want: SyncBlockSourceStored},
+		{name: "stored next block", kind: "local next block cache", want: SyncBlockSourceStored},
+		{name: "stored block data", kind: "stored block", want: SyncBlockSourceStored},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := syncBlockSourceForDownloadedBlock("next_block", p2p.DownloadedBlock{Kind: tc.kind})
+			got := syncBlockSourceForDownloadedBlock(SyncBlockSourceNextBlock, p2p.DownloadedBlock{Kind: tc.kind})
 			if got != tc.want {
 				t.Fatalf("source = %q, want %q", got, tc.want)
 			}
@@ -386,8 +479,53 @@ func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
 }
 
 func TestSyncBlockOriginTreatsBroadcastHintAsBroadcast(t *testing.T) {
-	if got := syncBlockOriginForSource("broadcast_hint"); got != "broadcast" {
+	if got := syncBlockOriginForSource(SyncBlockSourceBroadcastHint); got != SyncBlockOriginBroadcast {
 		t.Fatalf("origin = %q, want broadcast", got)
+	}
+}
+
+func TestObserveSyncBlockKeepsExplicitOrigin(t *testing.T) {
+	observer := &recordingSyncObserver{}
+	svc := &Service{sync: observer}
+
+	svc.observeSyncBlock(SyncBlockObservation{
+		Pipeline: "next_block_bootstrap",
+		Chain:    "shardchain",
+		Shard:    "basechain",
+		Source:   SyncBlockSourceNextBlock,
+		Origin:   SyncBlockOriginBroadcast,
+		Result:   "success",
+	})
+
+	if len(observer.blocks) != 1 {
+		t.Fatalf("observed blocks = %d, want 1", len(observer.blocks))
+	}
+	got := observer.blocks[0]
+	if got.Source != SyncBlockSourceNextBlock {
+		t.Fatalf("source = %q, want next_block", got.Source)
+	}
+	if got.Origin != SyncBlockOriginBroadcast {
+		t.Fatalf("origin = %q, want broadcast", got.Origin)
+	}
+}
+
+func TestPreparedBlockTracksOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		want SyncBlockOrigin
+	}{
+		{name: "full block broadcast", kind: "tonNode.blockBroadcastCompressedV2", want: SyncBlockOriginBroadcast},
+		{name: "shard hint broadcast", kind: "tonNode.newShardBlockBroadcast", want: SyncBlockOriginBroadcast},
+		{name: "overlay download", kind: "tonNode.dataFull", want: SyncBlockOriginDownload},
+		{name: "stored block", kind: "stored block", want: SyncBlockOriginStored},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared := preparedBlockWithStateCells(VerifiedBlock{Kind: tc.kind}, tnstore.StateCellRecords{}, 0)
+			if prepared.Origin != tc.want {
+				t.Fatalf("origin = %q, want %q", prepared.Origin, tc.want)
+			}
+		})
 	}
 }
 
@@ -598,6 +736,54 @@ func TestPersistArchiveCurrentStateStoresHistoricalAppliedStates(t *testing.T) {
 	}
 	if _, err := store.BlockState(ctx, historical.Block); err != nil {
 		t.Fatalf("load historical archive state: %v", err)
+	}
+}
+
+func TestPersistArchiveCurrentStateMarksLiveCheckpointStatesFlushed(t *testing.T) {
+	ctx := context.Background()
+	store := openTestPebbleStorage(t)
+	flusher := &testLiveCheckpointFlusher{}
+
+	master := testBlockID(-1, topShard, 72)
+	shard := testBlockID(0, topShard, 132)
+	shardKey := tnstore.ShardKeyFromBlock(shard)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+			Cell:  testShardStateCell(t, master),
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{
+			shardKey: {
+				Block: shard,
+				Cell:  testShardStateCell(t, shard),
+			},
+		},
+	}
+	entries := testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current)
+	runner := &archiveCatchUpRunner{
+		service: &Service{log: zerolog.Nop(), storage: store, liveState: flusher},
+		ctx:     ctx,
+	}
+
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, entries, nil); err != nil {
+		t.Fatalf("persist archive current state: %v", err)
+	}
+
+	var want []ton.BlockIDExt
+	for _, entry := range entries {
+		if entry.State != nil {
+			want = append(want, entry.State.Block)
+		}
+	}
+	if len(flusher.blocks) != len(want) {
+		t.Fatalf("flushed live states = %d, want %d", len(flusher.blocks), len(want))
+	}
+	for i := range want {
+		if !flusher.blocks[i].Equals(&want[i]) {
+			t.Fatalf("flushed live state[%d] = %s, want %s", i, tnstore.FormatBlockRef(flusher.blocks[i]), tnstore.FormatBlockRef(want[i]))
+		}
 	}
 }
 
@@ -1437,7 +1623,7 @@ func TestNextMasterchainApplyCandidateReturnsPreparedPeerResult(t *testing.T) {
 	prepared.PrepareElapsed = 7 * time.Millisecond
 	result <- nextBlockProbeResult{
 		block:          prepared,
-		source:         "peer_probe",
+		source:         SyncBlockSourcePeerProbe,
 		prepareElapsed: prepared.PrepareElapsed,
 	}
 
@@ -1508,7 +1694,7 @@ func TestNextMasterchainApplyCandidateDoesNotTimeoutAfterProbeReturned(t *testin
 	prepared.PrepareElapsed = 5 * time.Millisecond
 	result <- nextBlockProbeResult{
 		block:          prepared,
-		source:         "peer_probe",
+		source:         SyncBlockSourcePeerProbe,
 		prepareElapsed: prepared.PrepareElapsed,
 	}
 
@@ -1530,7 +1716,7 @@ func TestNextMasterchainApplyCandidateDoesNotTimeoutAfterProbeReturned(t *testin
 
 type nextMasterchainApplyCandidateTestResult struct {
 	block          PreparedBlock
-	source         string
+	source         SyncBlockSource
 	prepareElapsed time.Duration
 	err            error
 }

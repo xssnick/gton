@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/gton/service/storage"
@@ -18,9 +19,24 @@ func (s *Store) closeCellGenerations() error {
 		if cells == nil {
 			continue
 		}
-		if closeErr := cells.close(); closeErr != nil {
+		started := time.Now()
+		refs := cells.refs.Load()
+		event := s.log.Info()
+		if refs > 0 {
+			event = s.log.Warn()
+		}
+		event.
+			Uint64("cell_generation", id).
+			Int64("refs", refs).
+			Msg("closing celldb generation")
+		logger := s.log.With().Uint64("cell_generation", id).Logger()
+		if closeErr := cells.closeWithLogger(logger); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close celldb generation %d: %w", id, closeErr))
 		}
+		s.log.Info().
+			Uint64("cell_generation", id).
+			Dur("elapsed", time.Since(started)).
+			Msg("closed celldb generation")
 	}
 	return err
 }
@@ -207,6 +223,9 @@ func (s *Store) SaveCellGenerationMigrationProgress(ctx context.Context, generat
 	if err != nil {
 		return err
 	}
+	if err := validateMigrationProgressBlockIDs(current); err != nil {
+		return err
+	}
 	return s.setHotRecord(ctx, hotKeyCellGenerationCurrent(generation), encodeCellGenerationMigrationProgress(current), pebble.Sync)
 }
 
@@ -224,6 +243,31 @@ func (s *Store) cellGenerationMigrationProgressForEncode(ctx context.Context, cu
 	return encoded, nil
 }
 
+func validateMigrationProgressBlockIDs(current *storage.CurrentState) error {
+	if err := validateMigrationProgressBlockStateID(current.Masterchain); err != nil {
+		return err
+	}
+	for _, key := range storage.SortedShardKeys(current.Shards) {
+		shard := current.Shards[key]
+		if err := validateMigrationProgressBlockStateID(shard); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMigrationProgressBlockStateID(state storage.BlockState) error {
+	if err := validateFullBlockIDHashes(state.Block); err != nil {
+		return err
+	}
+	if state.MasterchainRef != nil {
+		if err := validateFullBlockIDHashes(*state.MasterchainRef); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) resolveMigrationProgressBlockMasterRef(ctx context.Context, state *storage.BlockState) error {
 	if state == nil || isMasterchainBlock(state.Block) {
 		return nil
@@ -236,23 +280,19 @@ func (s *Store) resolveMigrationProgressBlockMasterRef(ctx context.Context, stat
 	if !isMasterchainBlock(ref) {
 		return fmt.Errorf("shard state %s masterchain ref is not masterchain: %s", storage.FormatBlockRef(state.Block), storage.FormatBlockRef(ref))
 	}
-	if fullBlockIDHashesKnown(ref) {
+	if storage.BlockIDHashesKnown(ref) {
 		return nil
 	}
 
-	resolved, err := s.lookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, ref.SeqNo)
+	resolved, err := s.lookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: ref.SeqNo})
 	if err != nil {
 		return fmt.Errorf("lookup masterchain ref #%d: %w", ref.SeqNo, err)
 	}
-	if !fullBlockIDHashesKnown(resolved) {
+	if !storage.BlockIDHashesKnown(resolved) {
 		return fmt.Errorf("resolved masterchain ref is not full: %s", storage.FormatBlockRef(resolved))
 	}
 	state.MasterchainRef = &resolved
 	return nil
-}
-
-func fullBlockIDHashesKnown(id ton.BlockIDExt) bool {
-	return len(id.RootHash) == 32 && len(id.FileHash) == 32
 }
 
 func (s *Store) BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) (uint64, error) {
@@ -262,6 +302,9 @@ func (s *Store) BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) 
 	default:
 	}
 	if err := s.ensureWritable(); err != nil {
+		return 0, err
+	}
+	if err := validateFullBlockIDHashes(origin); err != nil {
 		return 0, err
 	}
 

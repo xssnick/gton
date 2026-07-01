@@ -8,14 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-)
-
-const (
-	storageArtifactRefreshInterval = time.Minute
-	storageArtifactRetryInterval   = 10 * time.Second
 )
 
 type storageArtifactStatus struct {
@@ -24,12 +18,8 @@ type storageArtifactStatus struct {
 }
 
 type storageArtifactStatusReader struct {
-	archivePackagesDir string
-	stateFilesDir      string
-
-	mu          sync.Mutex
-	nextRefresh time.Time
-	status      storageArtifactStatus
+	mu     sync.RWMutex
+	status storageArtifactStatus
 }
 
 type storageArtifactCollector struct {
@@ -39,10 +29,9 @@ type storageArtifactCollector struct {
 	persistentStateBytes *prometheus.Desc
 }
 
-func newStorageArtifactStatusReader(archivePackagesDir string, stateFilesDir string) *storageArtifactStatusReader {
+func newStorageArtifactStatusReader(status storageArtifactStatus) *storageArtifactStatusReader {
 	return &storageArtifactStatusReader{
-		archivePackagesDir: archivePackagesDir,
-		stateFilesDir:      stateFilesDir,
+		status: status,
 	}
 }
 
@@ -70,35 +59,45 @@ func (c *storageArtifactCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *storageArtifactCollector) Collect(ch chan<- prometheus.Metric) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	status, err := c.metrics.storageArtifactStatus(ctx)
-	if err != nil {
-		return
-	}
+	status := c.metrics.storageArtifactStatus()
 
 	ch <- prometheus.MustNewConstMetric(c.archivePackageBytes, prometheus.GaugeValue, float64(status.ArchivePackageBytes))
 	ch <- prometheus.MustNewConstMetric(c.persistentStateBytes, prometheus.GaugeValue, float64(status.PersistentStateBytes))
 }
 
-func (r *storageArtifactStatusReader) Status(ctx context.Context) (storageArtifactStatus, error) {
+func (r *storageArtifactStatusReader) Status() storageArtifactStatus {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.status
+}
+
+func (r *storageArtifactStatusReader) AddArchivePackageBytes(delta int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := time.Now()
-	if now.Before(r.nextRefresh) {
-		return r.status, nil
+	r.status.ArchivePackageBytes = addStorageArtifactBytes(r.status.ArchivePackageBytes, delta)
+}
+
+func (r *storageArtifactStatusReader) AddPersistentStateBytes(delta int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.status.PersistentStateBytes = addStorageArtifactBytes(r.status.PersistentStateBytes, delta)
+}
+
+func addStorageArtifactBytes(current uint64, delta int64) uint64 {
+	if delta >= 0 {
+		return current + uint64(delta)
 	}
 
-	status, err := scanStorageArtifacts(ctx, r.archivePackagesDir, r.stateFilesDir)
-	if err != nil {
-		r.nextRefresh = now.Add(storageArtifactRetryInterval)
-		return r.status, err
+	removed := uint64(-delta)
+	if removed > current {
+		// Storage metrics reflect external files. Manual file changes or crash recovery
+		// can make a delete event disagree with the startup scan; keep the gauge valid.
+		return 0
 	}
-	r.status = status
-	r.nextRefresh = now.Add(storageArtifactRefreshInterval)
-	return status, nil
+	return current - removed
 }
 
 func scanStorageArtifacts(ctx context.Context, archivePackagesDir string, stateFilesDir string) (storageArtifactStatus, error) {

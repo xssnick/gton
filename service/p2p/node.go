@@ -44,10 +44,19 @@ type dhtBackend interface {
 }
 
 var _ dhtBackend = (*dht.Client)(nil)
+var _ dhtBackend = (*serverDHTBackend)(nil)
+
+var ErrOffline = errors.New("p2p node is offline")
+
+type serverDHTBackend struct {
+	*dht.Server
+}
+
+func (b *serverDHTBackend) Close() {}
 
 type Node struct {
 	log                 zerolog.Logger
-	cfgPath             string
+	globalConfig        *liteclient.GlobalConfig
 	listenAddr          string
 	externalIP          net.IP
 	privKey             ed25519.PrivateKey
@@ -67,16 +76,24 @@ type Node struct {
 	processedExternalMessages *eventDeduper
 	externalMessageLimiter    *extmsg.AddressLimiter
 	externalBroadcastPacer    *externalBroadcastPacer
+	localExternalFanout       int
 
 	onceStop sync.Once
 	stopped  chan struct{}
 	wg       sync.WaitGroup
+	offline  atomic.Bool
+
+	networkStarted atomic.Bool
+
+	offlineReasonMu sync.RWMutex
+	offlineReason   string
 
 	inboundMx       sync.Mutex
 	inboundStopping bool
 	inboundWG       sync.WaitGroup
 
 	runCtx                          context.Context
+	runCancel                       context.CancelFunc
 	zeroStateFileHash               []byte
 	zeroStateBlock                  ton.BlockIDExt
 	initBlock                       ton.BlockIDExt
@@ -91,6 +108,9 @@ type Node struct {
 	syncLag                         SyncLagProvider
 	signatureVerifier               BroadcastSignatureVerifier
 	broadcastAdmission              BroadcastAdmission
+	externalMessageAdmission        ExternalMessageAdmission
+	blockReceivedObserver           BlockReceivedObserver
+	blockReceivedHooks              bool
 	broadcastPipelineObserver       BroadcastPipelineObserver
 	shardBroadcastCache             *shardBroadcastBlockCache
 	shardCandidateCache             *shardBlockCandidateCache
@@ -182,11 +202,6 @@ func New(opts Options) (*Node, error) {
 		}
 	}
 
-	cfgPath := opts.GlobalConfigPath
-	if cfgPath == "" {
-		cfgPath = DefaultGlobalConfigPath
-	}
-
 	priv, err := privateKeyOrGenerate(opts.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("load ADNL key: %w", err)
@@ -236,6 +251,10 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	localExternalFanout, err := normalizeLocalExternalFanout(opts.LocalExternalFanout)
+	if err != nil {
+		return nil, err
+	}
 
 	stateFilesDir, err := prepareStateFilesDir(opts.StateFilesDir)
 	if err != nil {
@@ -244,7 +263,7 @@ func New(opts Options) (*Node, error) {
 
 	return &Node{
 		log:                             logger,
-		cfgPath:                         cfgPath,
+		globalConfig:                    opts.GlobalConfig,
 		listenAddr:                      opts.ListenAddr,
 		externalIP:                      append(net.IP(nil), opts.ExternalIP...),
 		externalPort:                    opts.ExternalPort,
@@ -262,6 +281,7 @@ func New(opts Options) (*Node, error) {
 		processedExternalMessages:       newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		externalMessageLimiter:          extmsg.NewDefaultAddressLimiter(),
 		externalBroadcastPacer:          externalBroadcastPacer,
+		localExternalFanout:             localExternalFanout,
 		stopped:                         make(chan struct{}),
 		subscriptions:                   map[string]*overlaySubscription{},
 		monitorMinSplitDepth:            map[int32]uint32{},
@@ -277,6 +297,9 @@ func New(opts Options) (*Node, error) {
 		syncLag:                         opts.SyncLag,
 		signatureVerifier:               opts.SignatureVerifier,
 		broadcastAdmission:              opts.BroadcastAdmission,
+		externalMessageAdmission:        opts.ExternalMessageAdmission,
+		blockReceivedObserver:           opts.BlockReceivedObserver,
+		blockReceivedHooks:              blockReceivedHooksEnabled(opts.BlockReceivedObserver),
 		shardBroadcastCache:             newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		shardCandidateCache:             newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
 		shardBroadcastWaiters:           map[storage2.BlockRootHash][]chan struct{}{},
@@ -303,6 +326,9 @@ func (n *Node) SetRuntimeCallbacks(callbacks RuntimeCallbacks) {
 	n.syncLag = callbacks
 	n.signatureVerifier = callbacks
 	n.broadcastAdmission = callbacks
+	n.externalMessageAdmission = callbacks
+	n.blockReceivedObserver = callbacks
+	n.blockReceivedHooks = blockReceivedHooksEnabled(callbacks)
 }
 
 func protocolDiagnosticLoggable(msg string) bool {
@@ -350,9 +376,9 @@ func (n *Node) Events() <-chan BroadcastEvent {
 }
 
 func (n *Node) Start(ctx context.Context) error {
-	cfg, err := liteclient.GetConfigFromFile(n.cfgPath)
-	if err != nil {
-		return fmt.Errorf("load TON config: %w", err)
+	cfg := n.globalConfig
+	if cfg == nil {
+		return fmt.Errorf("global config is required")
 	}
 
 	zeroBlock := blockIDFromConfig(cfg.Validator.ZeroState)
@@ -370,7 +396,9 @@ func (n *Node) Start(ctx context.Context) error {
 		return err
 	}
 
-	n.runCtx = ctx
+	runCtx, runCancel := context.WithCancel(ctx)
+	n.runCtx = runCtx
+	n.runCancel = runCancel
 	n.zeroStateFileHash = append([]byte(nil), zeroBlock.FileHash...)
 	n.zeroStateBlock = zeroBlock
 	n.initBlock = initBlock
@@ -405,9 +433,12 @@ func (n *Node) Start(ctx context.Context) error {
 	if err = n.startGateway(); err != nil {
 		return fmt.Errorf("start ADNL gateway: %w", err)
 	}
+	n.networkStarted.Store(true)
 
-	if err = n.startDHT(ctx, cfg); err != nil {
+	if err = n.startDHT(runCtx, cfg); err != nil {
 		_ = n.gateway.Close()
+		n.networkStarted.Store(false)
+		runCancel()
 		return err
 	}
 
@@ -416,22 +447,22 @@ func (n *Node) Start(ctx context.Context) error {
 		n.startSubscription(sub)
 	}
 	n.runAsync(func() {
-		n.runEventLoop(ctx)
+		n.runEventLoop(runCtx)
 	})
 	n.runAsync(func() {
-		n.runShardBroadcastCacheJanitor(ctx)
+		n.runShardBroadcastCacheJanitor(runCtx)
 	})
 	n.runAsync(func() {
-		n.runSubscriptionLifecycleLoop(ctx)
+		n.runSubscriptionLifecycleLoop(runCtx)
 	})
 	if n.isPublicServer() {
 		n.runAsync(func() {
-			n.runAnnounceLoop(ctx)
+			n.runAnnounceLoop(runCtx)
 		})
 	}
 
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		n.stop()
 	}()
 
@@ -469,22 +500,56 @@ func (n *Node) Wait() {
 	<-n.stopped
 }
 
+func (n *Node) EnterOffline(reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "offline mode requested"
+	}
+	if !n.offline.CompareAndSwap(false, true) {
+		return
+	}
+
+	n.offlineReasonMu.Lock()
+	n.offlineReason = reason
+	n.offlineReasonMu.Unlock()
+
+	n.log.Info().
+		Str("reason", reason).
+		Msg("entering p2p offline mode")
+	n.stop()
+}
+
+func (n *Node) IsOffline() bool {
+	return n.offline.Load()
+}
+
+func (n *Node) OfflineReason() string {
+	n.offlineReasonMu.RLock()
+	defer n.offlineReasonMu.RUnlock()
+	return n.offlineReason
+}
+
 func (n *Node) stop() {
 	n.onceStop.Do(func() {
 		defer close(n.stopped)
 
+		networkStarted := n.networkStarted.Load()
+		if n.runCancel != nil {
+			n.runCancel()
+		}
 		n.stopAcceptingInbound()
 
-		if n.dhtServer != nil {
-			_ = n.dhtServer.Close()
+		if networkStarted {
+			if n.dhtServer != nil {
+				_ = n.dhtServer.Close()
+			}
+			if n.dhtServer == nil && n.dht != nil {
+				n.dht.Close()
+			}
+			if n.dhtGateway != nil {
+				_ = n.dhtGateway.Close()
+			}
+			_ = n.gateway.Close()
 		}
-		if n.dhtServer == nil && n.dht != nil {
-			n.dht.Close()
-		}
-		if n.dhtGateway != nil {
-			_ = n.dhtGateway.Close()
-		}
-		_ = n.gateway.Close()
 
 		n.eventQueue.Close()
 		n.closePeerRebroadcastQueues()
@@ -906,16 +971,14 @@ func (p *peerPool) acquireOverlay(pooled *pooledPeer, overlayID []byte, maxUnaut
 
 func (p *peerPool) releaseOverlay(pooled *pooledPeer, overlayKey string, adnlOverlay *overlay.ADNLOverlayWrapper, rldpOverlay *overlay.RLDPOverlayWrapper) {
 	var closeBase *pooledPeer
+	var closeADNL *overlay.ADNLOverlayWrapper
+	var closeRLDP *overlay.RLDPOverlayWrapper
 
 	p.mx.Lock()
 	if refs := pooled.overlayRefs[overlayKey]; refs <= 1 {
 		delete(pooled.overlayRefs, overlayKey)
-		if adnlOverlay != nil {
-			adnlOverlay.Close()
-		}
-		if rldpOverlay != nil {
-			rldpOverlay.Close()
-		}
+		closeADNL = adnlOverlay
+		closeRLDP = rldpOverlay
 	} else {
 		pooled.overlayRefs[overlayKey] = refs - 1
 	}
@@ -929,6 +992,12 @@ func (p *peerPool) releaseOverlay(pooled *pooledPeer, overlayKey string, adnlOve
 	}
 	p.mx.Unlock()
 
+	if closeADNL != nil {
+		closeADNL.Close()
+	}
+	if closeRLDP != nil {
+		closeRLDP.Close()
+	}
 	if closeBase != nil {
 		closeBase.close()
 	}
@@ -1040,10 +1109,6 @@ func (d *eventDeduper) Seen(key string, now time.Time) bool {
 }
 
 func (d *eventDeduper) Forget(key string) {
-	if d == nil {
-		return
-	}
-
 	d.mx.Lock()
 	defer d.mx.Unlock()
 

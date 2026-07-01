@@ -8,10 +8,6 @@ import (
 var _ p2p.BroadcastAdmission = (*Service)(nil)
 
 func (s *Service) CanAcceptBroadcast(_ p2p.BroadcastAdmissionRequest) bool {
-	if s == nil {
-		return true
-	}
-
 	return !s.broadcastAdmissionClosedAtomic.Load()
 }
 
@@ -24,7 +20,7 @@ func (s *Service) observeBroadcastFlushedCurrentState(current *storage.CurrentSt
 }
 
 func (s *Service) observeBroadcastCurrentState(current *storage.CurrentState, flushed bool) {
-	if s == nil || current == nil {
+	if current == nil {
 		return
 	}
 

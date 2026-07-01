@@ -720,7 +720,7 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		masterProofs:          masterResult.consensusProofs,
 		archiveBlocks:         masterImport.blocks,
 		archiveImports:        []*archiveImportResult{masterImport},
-		stateCells:            newArchiveStateCellOverlay(baseCellLoader),
+		stateCells:            newArchiveStateCellOverlay(baseCellLoader, &r.service.lazyCellLoads),
 		masterWait:            masterWait,
 		masterPrecheckElapsed: masterResult.precheckElapsed,
 	}

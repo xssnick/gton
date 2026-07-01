@@ -42,6 +42,10 @@ type masterBlockMetaForStateSerialization struct {
 }
 
 func (s *Service) processPersistentStateSerialization(ctx context.Context) error {
+	if s.syncUntilFrozen() {
+		return nil
+	}
+
 	scheduler := s.stateSerializer.store
 	if err := s.waitCurrentStatePersist(ctx); err != nil {
 		return err
@@ -447,7 +451,7 @@ func (s *Service) latestKnownKeyBlockAtOrBefore(ctx context.Context, block ton.B
 		current := block
 		if seqno != block.SeqNo {
 			var err error
-			current, err = s.storage.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, seqno)
+			current, err = s.storage.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: seqno})
 			if err != nil {
 				return ton.BlockIDExt{}, 0, err
 			}
@@ -483,7 +487,7 @@ func (s *Service) loadStateSerializationMasterBlocks(ctx context.Context, fromSe
 		default:
 		}
 
-		block, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockHistoryKey{Workchain: -1, Shard: topShard}, seqno)
+		block, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: seqno})
 		if err != nil {
 			return nil, ton.BlockIDExt{}, 0, fmt.Errorf("lookup masterchain block #%d: %w", seqno, err)
 		}

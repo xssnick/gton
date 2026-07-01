@@ -939,7 +939,7 @@ func saveTestServedMasterBlockMeta(t *testing.T, store *pebblestore.Store, block
 	}
 }
 
-func (s *countingSeqNoLookupStore) LookupBlockBySeqNo(ctx context.Context, key tnstore.BlockHistoryKey, seqno uint32) (ton.BlockIDExt, error) {
+func (s *countingSeqNoLookupStore) LookupBlockBySeqNo(ctx context.Context, ref tnstore.BlockSeqRef) (ton.BlockIDExt, error) {
 	s.lookupBlockBySeqNoCalls++
 	return ton.BlockIDExt{}, tnstore.ErrNotFound
 }

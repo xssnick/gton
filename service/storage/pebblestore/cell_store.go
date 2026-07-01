@@ -167,10 +167,15 @@ func cellGenerationShardDir(dir string, generation uint64, shard int) string {
 }
 
 func (c *cellStore) close() error {
+	return c.closeWithLogger(zerolog.Nop())
+}
+
+func (c *cellStore) closeWithLogger(logger zerolog.Logger) error {
 	if c == nil {
 		return nil
 	}
 
+	started := time.Now()
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
 	if c.closed {
@@ -189,18 +194,37 @@ func (c *cellStore) close() error {
 			continue
 		}
 		if shard.db != nil {
+			shardStarted := time.Now()
+			logger.Info().Int("shard", i).Msg("closing celldb shard")
 			err = errors.Join(err, shard.db.Close())
+			logger.Info().
+				Int("shard", i).
+				Dur("elapsed", time.Since(shardStarted)).
+				Msg("closed celldb shard")
 		}
 		c.shards[i] = nil
 	}
 	if c.fileCache != nil {
+		stageStarted := time.Now()
+		logger.Info().Msg("closing celldb file cache")
 		c.fileCache.Unref()
 		c.fileCache = nil
+		logger.Info().
+			Dur("elapsed", time.Since(stageStarted)).
+			Msg("closed celldb file cache")
 	}
 	if c.cache != nil {
+		stageStarted := time.Now()
+		logger.Info().Msg("closing celldb cache")
 		c.cache.Unref()
 		c.cache = nil
+		logger.Info().
+			Dur("elapsed", time.Since(stageStarted)).
+			Msg("closed celldb cache")
 	}
+	logger.Debug().
+		Dur("elapsed", time.Since(started)).
+		Msg("closed celldb store")
 	return err
 }
 

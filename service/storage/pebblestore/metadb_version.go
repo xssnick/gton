@@ -7,10 +7,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/storage"
 )
 
-func ensureMetaDBVersion(db *pebble.DB, readOnly bool) error {
+func ensureMetaDBVersion(db *pebble.DB, readOnly bool, log zerolog.Logger) error {
 	raw, closer, err := pebbleReaderGet(db, hotKeyMetaDBVersion())
 	if err == nil {
 		defer func() { _ = closer.Close() }()
@@ -19,10 +20,13 @@ func ensureMetaDBVersion(db *pebble.DB, readOnly bool) error {
 		if err != nil {
 			return err
 		}
-		if version != metaDBVersion {
-			return fmt.Errorf("unsupported metadb version %d, expected %d; rebuild metadb", version, metaDBVersion)
+		if version == metaDBVersion {
+			return nil
 		}
-		return nil
+		if readOnly {
+			return fmt.Errorf("metadb version %d requires writable migration to %d", version, metaDBVersion)
+		}
+		return runMetaDBMigrations(db, version, log)
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return err
