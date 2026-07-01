@@ -129,6 +129,9 @@ func TestLoadDefaults(t *testing.T) {
 		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
 		t.Fatalf("unexpected default liteserver limits: %+v", cfg.Lite.Limits)
 	}
+	if cfg.Lite.AllowDuplicateExternals {
+		t.Fatal("duplicate liteserver externals should be disabled by default")
+	}
 	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
 	if err != nil {
 		t.Fatalf("cell total cache size: %v", err)
@@ -262,6 +265,18 @@ func TestLoadLiteSendMessageBroadcastCapacity(t *testing.T) {
 	}
 	if fanout != 15 {
 		t.Fatalf("unexpected fanout %d", fanout)
+	}
+}
+
+func TestLoadLiteAllowDuplicateExternals(t *testing.T) {
+	path := writeTestConfig(t, `{"liteserver":{"allow_duplicate_externals":true}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.Lite.AllowDuplicateExternals {
+		t.Fatal("expected liteserver duplicate externals to be allowed")
 	}
 }
 
@@ -719,6 +734,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Lite.SendMessageBroadcastFanout != DefaultLiteSendMessageBroadcastFanout {
 		t.Fatalf("unexpected liteserver send message broadcast fanout %d", cfg.Lite.SendMessageBroadcastFanout)
 	}
+	if cfg.Lite.AllowDuplicateExternals {
+		t.Fatal("expected generated liteserver duplicate externals to be disabled")
+	}
 	if cfg.Lite.Limits.CapacityPerIP != 0 || cfg.Lite.Limits.CoolingPerSec != 0 ||
 		cfg.Lite.Limits.MaxConnectionsPerIP != 0 || cfg.Lite.Limits.MaxKeepAliveSeconds != 0 {
 		t.Fatalf("unexpected generated liteserver limits: %+v", cfg.Lite.Limits)
@@ -826,6 +844,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"send_message_broadcast_fanout"`)) {
 		t.Fatal("generated config should use send_message_broadcast_fanout key")
+	}
+	if !bytes.Contains(data, []byte(`"allow_duplicate_externals"`)) {
+		t.Fatal("generated config should use allow_duplicate_externals key")
 	}
 	if !bytes.Contains(data, []byte(`"limits"`)) {
 		t.Fatal("generated config should use liteserver limits key")

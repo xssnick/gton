@@ -76,6 +76,7 @@ type Node struct {
 	processedExternalMessages *eventDeduper
 	externalMessageLimiter    *extmsg.AddressLimiter
 	externalBroadcastPacer    *externalBroadcastPacer
+	allowDuplicateExternals   bool
 	localExternalFanout       int
 
 	onceStop sync.Once
@@ -281,6 +282,7 @@ func New(opts Options) (*Node, error) {
 		processedExternalMessages:       newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		externalMessageLimiter:          extmsg.NewDefaultAddressLimiter(),
 		externalBroadcastPacer:          externalBroadcastPacer,
+		allowDuplicateExternals:         opts.AllowDuplicateExternals,
 		localExternalFanout:             localExternalFanout,
 		stopped:                         make(chan struct{}),
 		subscriptions:                   map[string]*overlaySubscription{},

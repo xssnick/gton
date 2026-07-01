@@ -83,7 +83,7 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 
 	pending := make([]externalMessageTarget, 0, len(targets))
 	for _, target := range targets {
-		if n.processedExternalMessages.Seen(target.hash, now) || n.myExternalMessages.Seen(target.hash, now) {
+		if !n.allowDuplicateExternals && n.externalMessageSeen(target.hash, now) {
 			continue
 		}
 		pending = append(pending, target)
@@ -123,6 +123,10 @@ func (n *Node) acceptExternalMessage(ctx context.Context, event ExternalMessageE
 		return nil
 	}
 	return n.externalMessageAdmission.AcceptExternalMessage(ctx, event)
+}
+
+func (n *Node) externalMessageSeen(hash string, now time.Time) bool {
+	return n.processedExternalMessages.Seen(hash, now) || n.myExternalMessages.Seen(hash, now)
 }
 
 func (n *Node) acceptCheckedExternalMessage(ctx context.Context, event ExternalMessageEvent) error {

@@ -16,6 +16,7 @@ func TestLiteserverOptionsFromConfig(t *testing.T) {
 		Lite: nodeconfig.Lite{
 			Enabled:                            true,
 			NonFinalEnabled:                    true,
+			AllowDuplicateExternals:            true,
 			Key:                                liteserverTestSeed(3),
 			ListenAddr:                         "0.0.0.0:7445",
 			MasterBlockCache:                   11,
@@ -41,6 +42,9 @@ func TestLiteserverOptionsFromConfig(t *testing.T) {
 	}
 	if !opts.NonFinalEnabled {
 		t.Fatal("expected liteserver non-final mode to be enabled")
+	}
+	if !opts.AllowDuplicateExternals {
+		t.Fatal("expected liteserver duplicate externals to be allowed")
 	}
 	if opts.ListenAddr != "0.0.0.0:7445" {
 		t.Fatalf("unexpected liteserver listen addr %q", opts.ListenAddr)
@@ -82,6 +86,7 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 		Lite: nodeconfig.Lite{
 			Enabled:                            true,
 			NonFinalEnabled:                    true,
+			AllowDuplicateExternals:            true,
 			Key:                                liteserverTestSeed(3),
 			ListenAddr:                         "0.0.0.0:7445",
 			MasterBlockCache:                   11,
@@ -108,6 +113,9 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 	}
 	if runOpts.P2P.LocalExternalFanout != 15 {
 		t.Fatalf("unexpected external broadcast fanout %d", runOpts.P2P.LocalExternalFanout)
+	}
+	if !runOpts.P2P.AllowDuplicateExternals {
+		t.Fatal("expected duplicate external messages to be allowed in p2p options")
 	}
 	if runOpts.Extension == nil {
 		t.Fatal("expected liteserver extension factory")

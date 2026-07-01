@@ -179,6 +179,7 @@ type Options struct {
 	ExternalMessageAdmission  ExternalMessageAdmission
 	BlockReceivedObserver     BlockReceivedObserver
 	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
+	AllowDuplicateExternals   bool
 	LocalExternalFanout       int
 	CustomOverlays            []CustomOverlayConfig
 }
