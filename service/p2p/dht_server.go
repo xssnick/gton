@@ -18,6 +18,8 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 )
 
+const dhtUnknownNetworkID = int32(-1)
+
 func (n *Node) startDHTServer(ctx context.Context, cfg *liteclient.GlobalConfig) error {
 	if len(n.dhtPrivKey) == 0 {
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -41,6 +43,7 @@ func (n *Node) startDHTServer(ctx context.Context, cfg *liteclient.GlobalConfig)
 	addrList := dhtGateway.GetAddressList()
 
 	store := dht.NewMemoryValueStore(dhtServerStoreMaxKeys)
+	cfg = dhtServerGlobalConfig(cfg)
 	server, err := dht.NewServerFromConfig(dhtGateway, n.dhtPrivKey, cfg, store)
 	if err != nil {
 		_ = store.Close()
@@ -67,6 +70,19 @@ func (n *Node) startDHTServer(ctx context.Context, cfg *liteclient.GlobalConfig)
 	})
 
 	return nil
+}
+
+func dhtServerGlobalConfig(cfg *liteclient.GlobalConfig) *liteclient.GlobalConfig {
+	if cfg == nil || cfg.DHT.NetworkID != nil {
+		return cfg
+	}
+
+	// The reference node maps the current dht.config.global format, which has no
+	// network_id field, to -1 before creating a DHT server.
+	networkID := dhtUnknownNetworkID
+	cfgCopy := *cfg
+	cfgCopy.DHT.NetworkID = &networkID
+	return &cfgCopy
 }
 
 func (n *Node) dhtPublishedAddress() (address.Address, error) {
