@@ -284,6 +284,7 @@ func New(opts Options) (*Node, error) {
 		externalBroadcastPacer:          externalBroadcastPacer,
 		allowDuplicateExternals:         opts.AllowDuplicateExternals,
 		localExternalFanout:             localExternalFanout,
+		runCtx:                          context.Background(),
 		stopped:                         make(chan struct{}),
 		subscriptions:                   map[string]*overlaySubscription{},
 		monitorMinSplitDepth:            map[int32]uint32{},
@@ -479,16 +480,16 @@ func (n *Node) runAsync(fn func()) {
 	}()
 }
 
-func (n *Node) startSubscription(sub *overlaySubscription) {
-	if sub == nil || n.runCtx == nil {
-		return
-	}
-
+func (n *Node) startSubscription(sub *overlaySubscription) bool {
 	ctx, cancel := context.WithCancel(n.runCtx)
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return false
+	}
 	token, ok := sub.setRunCancel(cancel)
 	if !ok {
 		cancel()
-		return
+		return false
 	}
 
 	sub.startCustomTwoStepRebroadcastWorker(ctx)
@@ -496,6 +497,7 @@ func (n *Node) startSubscription(sub *overlaySubscription) {
 		defer sub.clearRunCancel(token)
 		sub.run(ctx)
 	})
+	return true
 }
 
 func (n *Node) Wait() {
@@ -1324,7 +1326,7 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 }
 
 func (n *Node) subscriptionForBlock(block ton.BlockIDExt) (*overlaySubscription, error) {
-	if n.runCtx == nil || len(n.zeroStateFileHash) == 0 {
+	if len(n.zeroStateFileHash) == 0 {
 		return nil, errors.New("node is not started")
 	}
 

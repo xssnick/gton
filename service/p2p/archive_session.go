@@ -78,6 +78,9 @@ func (a *ArchiveSession) Close() {
 }
 
 func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, options ArchiveDownloadOptions) (*archive.Downloaded, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if a.node.IsOffline() {
 		return nil, ErrOffline
 	}

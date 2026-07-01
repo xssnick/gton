@@ -120,6 +120,27 @@ func TestOverlayBlockForDownloadUsesMonitorMinSplitDepth(t *testing.T) {
 	}
 }
 
+func TestStartSubscriptionSkipsStoppedNode(t *testing.T) {
+	node := newTestNode(t)
+	runCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	node.runCtx = runCtx
+
+	sub := &overlaySubscription{
+		node:       node,
+		spec:       overlaySpec{Name: "basechain"},
+		log:        discardLogger(),
+		peers:      map[PeerID]*overlayPeer{},
+		peerNotify: make(chan struct{}, 1),
+	}
+	if node.startSubscription(sub) {
+		t.Fatal("stopped node should not start overlay subscription")
+	}
+	if sub.stopRun() {
+		t.Fatal("stopped node should not install subscription cancel")
+	}
+}
+
 func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
 	node := newTestNode(t)
 	node.zeroStateFileHash = make([]byte, 32)
@@ -167,7 +188,6 @@ func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
 
 func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 	node := newTestNode(t)
-	node.runCtx = context.Background()
 	sub := &overlaySubscription{
 		node: node,
 		spec: overlaySpec{

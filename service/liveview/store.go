@@ -508,7 +508,7 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 	}
 
 	var fragments *BlockView
-	if root != nil && state != nil && state.Cell != nil {
+	if !artifacts.AvailabilityOnly && root != nil && state != nil && state.Cell != nil {
 		// Fragment preparation is a live read hot-path optimization. Some publishers and
 		// tests use hash-valid cache artifacts which are not full parseable block/state cells.
 		built, err := buildBlockView(block, root, state.Cell)
@@ -533,13 +533,14 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 
 func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveBlockArtifacts {
 	cloned := storage.LiveBlockArtifacts{
-		Block:           artifacts.Block,
-		Root:            artifacts.Root,
-		BlockData:       artifacts.BlockData,
-		Meta:            artifacts.Meta.Clone(),
-		State:           storage.CloneBlockState(artifacts.State),
-		ArtifactFlushed: artifacts.ArtifactFlushed,
-		StateFlushed:    artifacts.StateFlushed,
+		Block:            artifacts.Block,
+		Root:             artifacts.Root,
+		BlockData:        artifacts.BlockData,
+		Meta:             artifacts.Meta.Clone(),
+		State:            storage.CloneBlockState(artifacts.State),
+		ArtifactFlushed:  artifacts.ArtifactFlushed,
+		StateFlushed:     artifacts.StateFlushed,
+		AvailabilityOnly: artifacts.AvailabilityOnly,
 	}
 	if len(artifacts.Proofs) > 0 {
 		cloned.Proofs = make([]storage.LiveBlockProofArtifact, 0, len(artifacts.Proofs))

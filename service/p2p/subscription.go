@@ -323,7 +323,7 @@ func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay tim
 		defer timer.Stop()
 
 		var nodeDone <-chan struct{}
-		if s.node != nil && s.node.runCtx != nil {
+		if s.node != nil {
 			nodeDone = s.node.runCtx.Done()
 		}
 
@@ -980,7 +980,7 @@ func (s *overlaySubscription) notifyPeersChangedLocked() {
 }
 
 func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
-	if s.node == nil || s.node.runCtx == nil || peer == nil || !s.isActive() {
+	if s.node == nil || peer == nil || !s.isActive() {
 		return
 	}
 	if !peer.tryBeginWarmup() {
@@ -1057,7 +1057,7 @@ func (s *overlaySubscription) startPingPeers(ctx context.Context) {
 }
 
 func (s *overlaySubscription) runMaintenanceAsync(fn func()) {
-	if s.node != nil && s.node.runCtx != nil {
+	if s.node != nil {
 		s.node.runAsync(fn)
 		return
 	}

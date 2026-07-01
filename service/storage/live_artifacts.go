@@ -19,6 +19,8 @@ type LiveBlockArtifacts struct {
 	Proofs          []LiveBlockProofArtifact
 	ArtifactFlushed bool
 	StateFlushed    bool
+	// AvailabilityOnly makes the block visible without preparing live read fragments.
+	AvailabilityOnly bool
 }
 
 type LiveBlockNonfinalKind uint8

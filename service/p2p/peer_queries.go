@@ -137,11 +137,7 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 	if peer != nil && peer.noteReceive() {
 		s.peerPromoted(peer)
 	}
-	parent := context.Background()
-	if s.node.runCtx != nil {
-		parent = s.node.runCtx
-	}
-	ctx, cancel := context.WithTimeout(parent, peerQueryTimeout)
+	ctx, cancel := context.WithTimeout(s.node.runCtx, peerQueryTimeout)
 	defer cancel()
 
 	startedAt := time.Now()
@@ -660,7 +656,7 @@ func (s *overlaySubscription) serveArchiveSlice(ctx context.Context, archiveID, 
 }
 
 func (s *overlaySubscription) handleGetRandomPeers(_ context.Context, query overlay.GetRandomPeers) overlay.NodesList {
-	if len(query.List.List) > 0 && s.node.runCtx != nil {
+	if len(query.List.List) > 0 {
 		go s.learnAdvertisedPeers(query.List.List)
 	}
 
@@ -673,10 +669,6 @@ func (s *overlaySubscription) handleGetRandomPeers(_ context.Context, query over
 }
 
 func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
-	if s.node.runCtx == nil {
-		return
-	}
-
 	for _, peer := range peers {
 		if !s.canLearnAdvertisedPeer(peer) {
 			continue

@@ -11,7 +11,11 @@ func (s *Service) NonfinalCellLoader() cell.LazyCellLoader {
 	return s.stateCellLoader()
 }
 
-func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState) {
+type liveBlockPublishOptions struct {
+	availabilityOnly bool
+}
+
+func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState, options liveBlockPublishOptions) {
 	if downloaded.BlockRoot == nil {
 		s.log.Debug().
 			Str("block", downloaded.BlockRef()).
@@ -39,12 +43,13 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 	}
 
 	artifacts := storage.LiveBlockArtifacts{
-		Block:     downloaded.ID,
-		Root:      downloaded.BlockRoot,
-		BlockData: blockData,
-		Meta:      liveBlockArtifactMeta(downloaded.ID, downloaded.Meta, blockData, proofs),
-		State:     state,
-		Proofs:    proofs,
+		Block:            downloaded.ID,
+		Root:             downloaded.BlockRoot,
+		BlockData:        blockData,
+		Meta:             liveBlockArtifactMeta(downloaded.ID, downloaded.Meta, blockData, proofs),
+		State:            state,
+		Proofs:           proofs,
+		AvailabilityOnly: options.availabilityOnly,
 	}
 
 	liveArtifacts := artifacts

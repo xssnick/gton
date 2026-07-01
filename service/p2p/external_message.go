@@ -137,9 +137,6 @@ func (n *Node) acceptCheckedExternalMessage(ctx context.Context, event ExternalM
 }
 
 func (n *Node) runtimeContext() context.Context {
-	if n.runCtx == nil {
-		return context.Background()
-	}
 	return n.runCtx
 }
 
@@ -239,7 +236,7 @@ func externalMessageLeafShard(key extmsg.AddressKey) int64 {
 }
 
 func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, error) {
-	if n.runCtx == nil || len(n.zeroStateFileHash) == 0 {
+	if len(n.zeroStateFileHash) == 0 {
 		return nil, errors.New("node is not started")
 	}
 

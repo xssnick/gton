@@ -187,7 +187,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 			return nil, fmt.Errorf("apply archive master block %s: %w", downloaded.BlockRef(), err)
 		}
 
-		r.service.publishLiveBlockArtifacts(downloaded, next)
+		r.service.publishLiveBlockArtifacts(downloaded, next, liveBlockPublishOptions{availabilityOnly: true})
 		r.service.rememberAppliedMasterchainState(next)
 		r.service.rememberSeenMasterchainBlock(next.Block)
 		r.service.rememberMasterState(ctx, next, &downloaded)

@@ -257,7 +257,7 @@ func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
 }
 
 func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
-	if s.node.runCtx == nil || s.node.runCtx.Err() != nil || peer == nil {
+	if s.node == nil || s.node.runCtx.Err() != nil || peer == nil {
 		return
 	}
 	if !peer.initRebroadcastQueues() {

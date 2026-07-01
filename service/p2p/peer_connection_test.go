@@ -405,9 +405,13 @@ func TestCustomFixedPeerOnlyAnswersOverlayPingInOverlayLayer(t *testing.T) {
 func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 	peerPool, pooled, _ := newTestLeasedPooledPeer("pending-public")
 	shortID := []byte{0x31}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	node := &Node{
-		log:  discardLogger(),
-		pool: peerPool,
+		log:    discardLogger(),
+		runCtx: runCtx,
+		pool:   peerPool,
 	}
 	sub := &overlaySubscription{
 		node: node,

@@ -633,7 +633,7 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 		return applied, err
 	}
 
-	r.service.publishLiveBlockArtifacts(prepared, nextMaster)
+	r.service.publishLiveBlockArtifacts(prepared, nextMaster, liveBlockPublishOptions{})
 	r.service.rememberAppliedMasterchainState(nextMaster)
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
 	r.service.rememberMasterState(r.ctx, nextMaster, &prepared)
@@ -1218,7 +1218,7 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 	setShardStateMasterchainRef(state, r.master.Block)
 	setPreparedShardMasterchainRef(&downloaded, r.master.Block)
 
-	r.service.publishLiveBlockArtifacts(downloaded, state)
+	r.service.publishLiveBlockArtifacts(downloaded, state, liveBlockPublishOptions{})
 	if r.service.rememberCompressedBlockState(state) && r.service.node != nil {
 		r.service.node.NotifyCompressedBlockStateReady(state.Block)
 	}

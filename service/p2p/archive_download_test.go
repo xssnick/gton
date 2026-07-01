@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,23 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
 )
+
+func TestDownloadArchiveCanceledContextDoesNotCreateSubscription(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, 32)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	session := node.BeginArchiveSession()
+	_, err := session.DownloadArchive(ctx, 1, archive.ShardID{Workchain: 0, Shard: topShard}, ArchiveDownloadOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("download archive error = %v, want context.Canceled", err)
+	}
+	if len(node.subscriptions) != 0 {
+		t.Fatalf("subscriptions after canceled archive download = %d, want 0", len(node.subscriptions))
+	}
+}
 
 func TestArchivePackDownloadLimitRejectsEndlessFullSlices(t *testing.T) {
 	var offset int64
