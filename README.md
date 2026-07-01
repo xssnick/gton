@@ -241,6 +241,7 @@ Simplified example:
     "listen_addr": "0.0.0.0:7445",
     "master_block_cache": 128,
     "shard_block_cache": 1024,
+    "allow_duplicate_externals": false,
     "send_message_broadcast_bytes_per_second": 0,
     "send_message_broadcast_max_delay_ms": 100,
     "send_message_broadcast_fanout": 5
@@ -309,6 +310,7 @@ Simplified example:
 | `listen_addr` | Liteserver listener address. Defaults to `0.0.0.0:7445`. |
 | `master_block_cache` | Live cache size for masterchain blocks. |
 | `shard_block_cache` | Live cache size for shard blocks. |
+| `allow_duplicate_externals` | When `true`, duplicate external messages submitted through liteserver `sendMessage` are checked and broadcast again. Defaults to `false`; duplicates are accepted as a successful no-op. |
 | `send_message_broadcast_bytes_per_second` | Leaky-bucket capacity for external message broadcast traffic. `0` disables the limit. |
 | `send_message_broadcast_max_delay_ms` | Maximum pacing delay before `sendMessage` is rejected with `reason="broadcast_capacity"`. Defaults to `100`; set to `0` for no backlog. |
 | `send_message_broadcast_fanout` | Number of active public-overlay peers selected for external message broadcasts originated by liteserver `sendMessage`. Defaults to `5` when omitted or set to `0`; valid range is `3` to `20`. When the node is lagged, the local-send fanout is halved, with a minimum of `1`. Inbound overlay rebroadcast fanout is unchanged. |

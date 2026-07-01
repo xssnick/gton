@@ -10,11 +10,12 @@ import (
 )
 
 type ExtensionConfig struct {
-	PrivateKey    ed25519.PrivateKey
-	ListenAddr    string
-	NonFinal      bool
-	ZeroState     ton.ZeroStateIDExt
-	RequestLimits RequestLimitOptions
+	PrivateKey              ed25519.PrivateKey
+	ListenAddr              string
+	NonFinal                bool
+	AllowDuplicateExternals bool
+	ZeroState               ton.ZeroStateIDExt
+	RequestLimits           RequestLimitOptions
 }
 
 type Extension struct {
@@ -30,15 +31,16 @@ func NewExtension(node hooks.Node, cfg ExtensionConfig) (*Extension, error) {
 	}
 
 	server, err := New(Options{
-		Logger:        &node.Logger,
-		Store:         node.Store,
-		MessageSender: node.Network,
-		QueryObserver: queryObserver,
-		PrivateKey:    cfg.PrivateKey,
-		ListenAddr:    cfg.ListenAddr,
-		NonFinal:      cfg.NonFinal,
-		ZeroState:     cfg.ZeroState,
-		RequestLimits: cfg.RequestLimits,
+		Logger:                  &node.Logger,
+		Store:                   node.Store,
+		MessageSender:           node.Network,
+		QueryObserver:           queryObserver,
+		PrivateKey:              cfg.PrivateKey,
+		ListenAddr:              cfg.ListenAddr,
+		NonFinal:                cfg.NonFinal,
+		AllowDuplicateExternals: cfg.AllowDuplicateExternals,
+		ZeroState:               cfg.ZeroState,
+		RequestLimits:           cfg.RequestLimits,
 	})
 	if err != nil {
 		return nil, err

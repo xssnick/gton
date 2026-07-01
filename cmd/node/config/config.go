@@ -97,6 +97,7 @@ type DHT struct {
 type Lite struct {
 	Enabled                            bool       `json:"enabled"`
 	NonFinalEnabled                    bool       `json:"non_final_enabled"`
+	AllowDuplicateExternals            bool       `json:"allow_duplicate_externals"`
 	Key                                []byte     `json:"key"`
 	ListenAddr                         string     `json:"listen_addr"`
 	MasterBlockCache                   int        `json:"master_block_cache"`

@@ -75,6 +75,32 @@ func TestSendExternalMessageIgnoresBroadcastDeduper(t *testing.T) {
 	}
 }
 
+func TestSendExternalMessageAllowsDuplicateWhenConfigured(t *testing.T) {
+	node, sub := newSendExternalMessageTestNode(t)
+	node.allowDuplicateExternals = true
+	peer := testRebroadcastQueuePeer("peer-a")
+	sub.peers[peer.id] = peer
+
+	body := testExternalMessageBOC(t)
+	if err := sendTestExternalMessage(t, node, body); err != nil {
+		t.Fatalf("first send external message failed: %v", err)
+	}
+	if got, ok := peer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatalf("expected first local rebroadcast")
+	} else if got.kind != "tonNode.externalMessageBroadcast" || !got.local {
+		t.Fatalf("unexpected first queued rebroadcast: %#v", got)
+	}
+
+	if err := sendTestExternalMessage(t, node, body); err != nil {
+		t.Fatalf("duplicate send external message failed: %v", err)
+	}
+	if got, ok := peer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatalf("expected duplicate local rebroadcast")
+	} else if got.kind != "tonNode.externalMessageBroadcast" || !got.local {
+		t.Fatalf("unexpected duplicate queued rebroadcast: %#v", got)
+	}
+}
+
 func TestSendExternalMessageRunsAdmissionBeforeQueue(t *testing.T) {
 	node, sub := newSendExternalMessageTestNode(t)
 	peer := testRebroadcastQueuePeer("peer-a")

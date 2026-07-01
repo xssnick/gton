@@ -21,6 +21,7 @@ import (
 type liteserverOptions struct {
 	Enabled                   bool
 	NonFinalEnabled           bool
+	AllowDuplicateExternals   bool
 	ListenAddr                string
 	PrivateKey                ed25519.PrivateKey
 	MasterBlockCache          int
@@ -43,6 +44,7 @@ func configureLiteserver(runOpts *gton.NodeOptions, cfg nodeconfig.Config, globa
 	}
 	runOpts.P2P.ExternalBroadcastCapacity = opts.ExternalBroadcastCapacity
 	runOpts.P2P.LocalExternalFanout = opts.ExternalBroadcastFanout
+	runOpts.P2P.AllowDuplicateExternals = opts.AllowDuplicateExternals
 
 	if opts.Enabled {
 		if runOpts.Extension != nil {
@@ -62,22 +64,24 @@ func configureLiteserver(runOpts *gton.NodeOptions, cfg nodeconfig.Config, globa
 func liteserverExtensionFactory(opts liteserverOptions, zeroState ton.ZeroStateIDExt) hooks.ExtensionFactory {
 	return func(node hooks.Node) (hooks.Extension, error) {
 		return liteserver.NewExtension(node, liteserver.ExtensionConfig{
-			PrivateKey:    opts.PrivateKey,
-			ListenAddr:    opts.ListenAddr,
-			NonFinal:      opts.NonFinalEnabled,
-			ZeroState:     zeroState,
-			RequestLimits: opts.Limits,
+			PrivateKey:              opts.PrivateKey,
+			ListenAddr:              opts.ListenAddr,
+			NonFinal:                opts.NonFinalEnabled,
+			AllowDuplicateExternals: opts.AllowDuplicateExternals,
+			ZeroState:               zeroState,
+			RequestLimits:           opts.Limits,
 		})
 	}
 }
 
 func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, error) {
 	opts := liteserverOptions{
-		Enabled:          cfg.Lite.Enabled,
-		NonFinalEnabled:  cfg.Lite.NonFinalEnabled,
-		ListenAddr:       strings.TrimSpace(cfg.Lite.ListenAddr),
-		MasterBlockCache: cfg.Lite.MasterBlockCache,
-		ShardBlockCache:  cfg.Lite.ShardBlockCache,
+		Enabled:                 cfg.Lite.Enabled,
+		NonFinalEnabled:         cfg.Lite.NonFinalEnabled,
+		AllowDuplicateExternals: cfg.Lite.AllowDuplicateExternals,
+		ListenAddr:              strings.TrimSpace(cfg.Lite.ListenAddr),
+		MasterBlockCache:        cfg.Lite.MasterBlockCache,
+		ShardBlockCache:         cfg.Lite.ShardBlockCache,
 	}
 	if opts.ListenAddr == "" {
 		opts.ListenAddr = nodeconfig.DefaultLiteListen

@@ -220,15 +220,28 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 	}
 
 	dup := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
-	lsErr, ok := dup.(ton.LSError)
+	dupStatus, ok := dup.(ton.SendMessageStatus)
 	if !ok {
-		t.Fatalf("duplicate response type = %T, want ton.LSError: %+v", dup, dup)
+		t.Fatalf("duplicate response type = %T, want ton.SendMessageStatus: %+v", dup, dup)
 	}
-	if lsErr.Text != "cannot send external message : duplicate message" {
-		t.Fatalf("duplicate error text = %q", lsErr.Text)
+	if dupStatus.Status != 1 {
+		t.Fatalf("duplicate status = %d, want 1", dupStatus.Status)
 	}
 	if sender.count != 1 {
-		t.Fatalf("duplicate was forwarded, send count = %d", sender.count)
+		t.Fatalf("duplicate no-op forwarded message, send count = %d", sender.count)
+	}
+
+	srv.allowDuplicateExternals = true
+	allowedDup := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
+	allowedStatus, ok := allowedDup.(ton.SendMessageStatus)
+	if !ok {
+		t.Fatalf("allowed duplicate response type = %T, want ton.SendMessageStatus: %+v", allowedDup, allowedDup)
+	}
+	if allowedStatus.Status != 1 {
+		t.Fatalf("allowed duplicate status = %d, want 1", allowedStatus.Status)
+	}
+	if sender.count != 2 {
+		t.Fatalf("allowed duplicate send count = %d, want 2", sender.count)
 	}
 }
 

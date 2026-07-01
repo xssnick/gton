@@ -65,32 +65,34 @@ type QueryObservation struct {
 }
 
 type Options struct {
-	Logger        *zerolog.Logger
-	Store         Store
-	MessageSender MessageSender
-	QueryObserver QueryObserver
-	PrivateKey    ed25519.PrivateKey
-	ListenAddr    string
-	NonFinal      bool
-	ZeroState     ton.ZeroStateIDExt
-	RequestLimits RequestLimitOptions
+	Logger                  *zerolog.Logger
+	Store                   Store
+	MessageSender           MessageSender
+	QueryObserver           QueryObserver
+	PrivateKey              ed25519.PrivateKey
+	ListenAddr              string
+	NonFinal                bool
+	AllowDuplicateExternals bool
+	ZeroState               ton.ZeroStateIDExt
+	RequestLimits           RequestLimitOptions
 }
 
 type Server struct {
-	log            zerolog.Logger
-	store          Store
-	messageSender  MessageSender
-	messageChecker MessageChecker
-	queryObserver  QueryObserver
-	privateKey     ed25519.PrivateKey
-	listenAddr     string
-	nonFinal       bool
-	zeroState      ton.ZeroStateIDExt
-	version        int32
-	capabilities   int64
-	now            func() time.Time
-	tvm            *tvm.TVM
-	requestLimits  RequestLimitOptions
+	log                     zerolog.Logger
+	store                   Store
+	messageSender           MessageSender
+	messageChecker          MessageChecker
+	queryObserver           QueryObserver
+	privateKey              ed25519.PrivateKey
+	listenAddr              string
+	nonFinal                bool
+	allowDuplicateExternals bool
+	zeroState               ton.ZeroStateIDExt
+	version                 int32
+	capabilities            int64
+	now                     func() time.Time
+	tvm                     *tvm.TVM
+	requestLimits           RequestLimitOptions
 
 	sendMessageCache       *sendMessageCache
 	externalMessageChecker *admission.Checker
@@ -144,26 +146,27 @@ func New(opts Options) (*Server, error) {
 	}
 
 	return &Server{
-		log:                    log,
-		store:                  opts.Store,
-		messageSender:          opts.MessageSender,
-		messageChecker:         messageChecker,
-		queryObserver:          opts.QueryObserver,
-		privateKey:             opts.PrivateKey,
-		listenAddr:             opts.ListenAddr,
-		nonFinal:               opts.NonFinal,
-		zeroState:              cloneZeroState(opts.ZeroState),
-		version:                DefaultVersion,
-		capabilities:           DefaultCapabilities,
-		now:                    time.Now,
-		tvm:                    tvmInstance,
-		requestLimits:          opts.RequestLimits,
-		sendMessageCache:       newSendMessageCache(),
-		externalMessageChecker: externalMessageChecker,
-		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
-		requestLimiter:         newRequestLimiter(opts.RequestLimits),
-		connectionTracker:      newClientConnectionTracker(opts.RequestLimits),
-		blockProofBases:        make(map[storage.BlockRootHash]*blockProofBase),
+		log:                     log,
+		store:                   opts.Store,
+		messageSender:           opts.MessageSender,
+		messageChecker:          messageChecker,
+		queryObserver:           opts.QueryObserver,
+		privateKey:              opts.PrivateKey,
+		listenAddr:              opts.ListenAddr,
+		nonFinal:                opts.NonFinal,
+		allowDuplicateExternals: opts.AllowDuplicateExternals,
+		zeroState:               cloneZeroState(opts.ZeroState),
+		version:                 DefaultVersion,
+		capabilities:            DefaultCapabilities,
+		now:                     time.Now,
+		tvm:                     tvmInstance,
+		requestLimits:           opts.RequestLimits,
+		sendMessageCache:        newSendMessageCache(),
+		externalMessageChecker:  externalMessageChecker,
+		externalMessageLimiter:  extmsg.NewDefaultAddressLimiter(),
+		requestLimiter:          newRequestLimiter(opts.RequestLimits),
+		connectionTracker:       newClientConnectionTracker(opts.RequestLimits),
+		blockProofBases:         make(map[storage.BlockRootHash]*blockProofBase),
 	}, nil
 }
 

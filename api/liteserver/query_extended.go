@@ -29,7 +29,6 @@ const (
 
 	sendMessageErrorReasonNotConfigured      = "not_configured"
 	sendMessageErrorReasonOversized          = "oversized"
-	sendMessageErrorReasonDuplicate          = "duplicate"
 	sendMessageErrorReasonParseFailed        = "parse_failed"
 	sendMessageErrorReasonRateLimited        = "rate_limited"
 	sendMessageErrorReasonAddressLimiterFull = "address_limiter_full"
@@ -98,33 +97,43 @@ func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.Send
 		return sendMessageLSError(sendMessageErrorReasonOversized, errorPrefix+fmt.Sprintf(": external message is too large: %d", len(query.Body)))
 	}
 
-	cacheKey, ok := s.cacheSendMessage(query.Body)
-	if !ok {
-		return sendMessageLSError(sendMessageErrorReasonDuplicate, "cannot send external message : duplicate message")
+	var cacheKey uint64
+	cacheMessage := !s.allowDuplicateExternals
+	if cacheMessage {
+		var ok bool
+		cacheKey, ok = s.cacheSendMessage(query.Body)
+		if !ok {
+			return ton.SendMessageStatus{Status: 1}, ""
+		}
+	}
+	dropCached := func() {
+		if cacheMessage {
+			s.dropCachedSendMessage(cacheKey)
+		}
 	}
 	msgCell, msg, err := admission.ParseMessage(query.Body)
 	if err != nil {
-		s.dropCachedSendMessage(cacheKey)
+		dropCached()
 		return sendMessageLSError(sendMessageErrorReasonParseFailed, errorPrefix+": "+err.Error())
 	}
 
 	addrKey := externalMessageAddressKey(msg.DstAddr)
 	if err = s.checkExternalMessageAddressLimit(addrKey); err != nil {
-		s.dropCachedSendMessage(cacheKey)
+		dropCached()
 		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
 	checkResult, err := s.checkExternalMessage(ctx, query.Body, msgCell, msg)
 	if err != nil {
-		s.dropCachedSendMessage(cacheKey)
+		dropCached()
 		return sendMessageLSError(sendMessageCheckErrorReason(err), errorPrefix+": "+err.Error())
 	}
 	if err = s.addExternalMessageAddressLimit(addrKey); err != nil {
-		s.dropCachedSendMessage(cacheKey)
+		dropCached()
 		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
 	}
 	if err := s.messageSender.SendCheckedExternalMessage(ctx, query.Body, msg.DstAddr, checkResult.Root, checkResult.Message); err != nil {
 		s.dropExternalMessageAddressLimit(addrKey)
-		s.dropCachedSendMessage(cacheKey)
+		dropCached()
 		return sendMessageLSError(sendMessageBroadcastErrorReason(err), errorPrefix+": "+err.Error())
 	}
 	return ton.SendMessageStatus{Status: 1}, ""
