@@ -297,7 +297,7 @@ type accountReference struct {
 	masterCache *liveview.BlockView
 }
 
-func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, request string, keepMasterState bool) (accountReference, error) {
+func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, request string, keepMasterState bool, withShardProof bool) (accountReference, error) {
 	if id == nil {
 		return accountReference{}, fmt.Errorf("reference block id for a %s is invalid", request)
 	}
@@ -346,7 +346,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 		return ref, nil
 	}
 
-	proof, shardBlock, err := s.masterShardProof(ctx, base, addr)
+	proof, shardBlock, err := s.masterShardProof(ref.masterCache, addr, withShardProof)
 	if errors.Is(err, storage.ErrNotFound) {
 		ref.shard = ton.BlockIDExt{}
 		ref.shardProof = proof
@@ -362,7 +362,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 }
 
 func (s *Server) accountState(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, pruned bool) (ton.AccountState, error) {
-	ref, err := s.resolveAccountReference(ctx, id, account, "getAccountState()", false)
+	ref, err := s.resolveAccountReference(ctx, id, account, "getAccountState()", false, true)
 	if err != nil {
 		return ton.AccountState{}, err
 	}

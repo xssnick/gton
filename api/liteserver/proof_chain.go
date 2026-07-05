@@ -205,6 +205,22 @@ func (s *Server) shardBlockProofLinks(ctx context.Context, master ton.BlockIDExt
 		return nil, fmt.Errorf("masterchain block id must be specified")
 	}
 
+	key := liteResponseKey{kind: liteResponseShardBlockLinks, a: storage.BlockKey(master), b: storage.BlockKey(target)}
+	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
+		return s.buildShardBlockProofLinks(ctx, master, target)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	links, ok := value.([]ton.ShardBlockLink)
+	if !ok {
+		return nil, fmt.Errorf("invalid shard block proof links cache value")
+	}
+	return links, nil
+}
+
+func (s *Server) buildShardBlockProofLinks(ctx context.Context, master ton.BlockIDExt, target ton.BlockIDExt) ([]ton.ShardBlockLink, error) {
 	current := master
 	links := make([]ton.ShardBlockLink, 0, 2)
 	for {

@@ -298,6 +298,17 @@ func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T
 	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "signature_check_failed"); got != 1 {
 		t.Fatalf("dropped broadcast count = %d, want 1", got)
 	}
+
+	duplicate := sub.classifyBroadcast(nil, msg, []byte{0x01}, DeliveryFEC, false, testPeerID("peer"))
+	if duplicate != nil {
+		t.Fatalf("duplicate shard block broadcast was accepted: %+v", duplicate)
+	}
+	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "seen"); got != 1 {
+		t.Fatalf("duplicate shard block drop count = %d, want 1", got)
+	}
+	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "signature_check_failed"); got != 1 {
+		t.Fatalf("signature precheck drop count after duplicate = %d, want 1", got)
+	}
 }
 
 func TestBroadcastTransientSignatureFailureReleasesDeduper(t *testing.T) {
@@ -373,7 +384,10 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 		t.Fatalf("accepted broadcast count = %d, want 1", got)
 	}
 
-	node.acceptBroadcast(*accepted)
+	duplicate := sub.classifyBroadcast(source, msg, payload, DeliveryFEC, false, PeerID{})
+	if duplicate != nil {
+		t.Fatalf("duplicate shard block broadcast was accepted: %+v", duplicate)
+	}
 	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "seen"); got != 1 {
 		t.Fatalf("seen broadcast drop count = %d, want 1", got)
 	}

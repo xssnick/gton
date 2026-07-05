@@ -67,18 +67,11 @@ func (g *archiveDownloadBackpressureGate) wait(ctx context.Context) error {
 }
 
 func (r *archiveCatchUpRunner) pauseArchiveDownloadsForCheckpointBackpressure() func() {
-	if r == nil {
-		return func() {}
-	}
-
 	r.downloadGate.pause()
 	return r.downloadGate.resume
 }
 
 func (r *archiveCatchUpRunner) waitArchiveDownloadBackpressure(ctx context.Context) error {
-	if r == nil {
-		return nil
-	}
 	return r.downloadGate.wait(ctx)
 }
 

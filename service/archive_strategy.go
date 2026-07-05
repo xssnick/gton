@@ -223,7 +223,7 @@ func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archive
 }
 
 func (r *archiveCatchUpRunner) rejectArchiveImportPeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
-	if r == nil || r.archiveSession == nil || peer == "" {
+	if r.archiveSession == nil || peer == "" {
 		return false
 	}
 

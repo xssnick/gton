@@ -102,6 +102,9 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 	}
 
 	value, err := s.blockProofBaseLoad.do(ctx, key, func() (any, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		s.blockProofBasesMu.Lock()
 		cached := s.blockProofBases[key]
 		s.blockProofBasesMu.Unlock()
@@ -266,6 +269,22 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 }
 
 func (s *Server) blockProofLinkForward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkForward, error) {
+	key := liteResponseKey{kind: liteResponseBlockProofLinkForward, a: storage.BlockKey(from), b: storage.BlockKey(to)}
+	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
+		return s.buildBlockProofLinkForward(ctx, from, to)
+	})
+	if err != nil {
+		return ton.BlockLinkForward{}, err
+	}
+
+	link, ok := value.(ton.BlockLinkForward)
+	if !ok {
+		return ton.BlockLinkForward{}, fmt.Errorf("invalid block proof forward link cache value")
+	}
+	return link, nil
+}
+
+func (s *Server) buildBlockProofLinkForward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkForward, error) {
 	fromRoot, err := s.forwardSourceRoot(ctx, from)
 	if err != nil {
 		return ton.BlockLinkForward{}, fmt.Errorf("load source proof for %s: %w", storage.FormatBlockRef(from), err)
@@ -336,6 +355,22 @@ func (s *Server) forwardConfigProofBOC(from ton.BlockIDExt, fromRoot *cell.Cell)
 }
 
 func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkBackward, error) {
+	key := liteResponseKey{kind: liteResponseBlockProofLinkBackward, a: storage.BlockKey(from), b: storage.BlockKey(to)}
+	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
+		return s.buildBlockProofLinkBackward(ctx, from, to)
+	})
+	if err != nil {
+		return ton.BlockLinkBackward{}, err
+	}
+
+	link, ok := value.(ton.BlockLinkBackward)
+	if !ok {
+		return ton.BlockLinkBackward{}, fmt.Errorf("invalid block proof backward link cache value")
+	}
+	return link, nil
+}
+
+func (s *Server) buildBlockProofLinkBackward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkBackward, error) {
 	fromRoot, _, err := s.storedMasterProofRoot(ctx, from, true)
 	if err != nil {
 		return ton.BlockLinkBackward{}, fmt.Errorf("load source proof link for %s: %w", storage.FormatBlockRef(from), err)

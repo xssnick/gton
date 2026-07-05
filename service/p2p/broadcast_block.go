@@ -77,6 +77,36 @@ func decodeBroadcastBlock(msg any) (*DownloadedBlock, *blockproof.ValidatorSigna
 	}
 }
 
+func predecodeBlockBroadcastSignatureCheck(kind string, block ton.BlockIDExt, msg any) (*cell.Cell, *blockproof.ValidatorSignatureSet, bool, error) {
+	switch data := msg.(type) {
+	case tonnodeapi.BlockBroadcast:
+		proofRoot, err := parseDownloadedBlockProof(kind, data.Proof)
+		if err != nil {
+			return nil, nil, true, err
+		}
+		signatures, err := ordinaryBroadcastValidatorSignatureSet(data.CatchainSeqno, data.ValidatorSetHash, data.Signatures)
+		if err != nil {
+			return nil, nil, true, err
+		}
+		return proofRoot, signatures, true, nil
+	case tonnodeapi.BlockBroadcastCompressedV2:
+		proofRoot, err := parseDownloadedBlockProof(kind, data.Proof)
+		if err != nil {
+			return nil, nil, true, err
+		}
+		signatures, err := broadcastSignatureSetFromTL(data.SignatureSet)
+		if err != nil {
+			return nil, nil, true, err
+		}
+		if isMasterchainBlock(block) && !signatures.Final() {
+			return nil, nil, true, errBroadcastSignatureSetNonFinal
+		}
+		return proofRoot, signatures, true, nil
+	default:
+		return nil, nil, false, nil
+	}
+}
+
 func decodeBlockCandidateBroadcast(msg any) (*DownloadedBlock, error) {
 	switch data := msg.(type) {
 	case tonnodeapi.NewBlockCandidateBroadcast:

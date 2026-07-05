@@ -37,6 +37,7 @@ type Store interface {
 	BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
 	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveview.BlockView, error)
 	CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error)
+	MasterchainSeqnoReady(seqno uint32) bool
 	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error
 	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
 }
@@ -75,6 +76,10 @@ type Options struct {
 	AllowDuplicateExternals bool
 	ZeroState               ton.ZeroStateIDExt
 	RequestLimits           RequestLimitOptions
+	// QueryConcurrency bounds concurrently executing query handlers; parked
+	// waitMasterchainSeqno requests and inline snapshot queries do not consume
+	// it. Zero means GOMAXPROCS*4.
+	QueryConcurrency int
 }
 
 type Server struct {
@@ -99,6 +104,9 @@ type Server struct {
 	externalMessageLimiter *extmsg.AddressLimiter
 	requestLimiter         *requestLimiter
 	connectionTracker      *clientConnectionTracker
+	respCache              *liteResponseCache
+	queryExecutor          *queryExecutor
+	waitLimiter            *waitLimiter
 
 	server *liteclient.Server
 	cancel context.CancelFunc
@@ -166,6 +174,9 @@ func New(opts Options) (*Server, error) {
 		externalMessageLimiter:  extmsg.NewDefaultAddressLimiter(),
 		requestLimiter:          newRequestLimiter(opts.RequestLimits),
 		connectionTracker:       newClientConnectionTracker(opts.RequestLimits),
+		respCache:               newLiteResponseCache(),
+		queryExecutor:           newQueryExecutor(opts.QueryConcurrency),
+		waitLimiter:             newWaitLimiter(opts.RequestLimits.MaxWaitsPerIP),
 		blockProofBases:         make(map[storage.BlockRootHash]*blockProofBase),
 	}, nil
 }
@@ -181,7 +192,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.requestLimiter != nil {
 		srv.SetQueryPrecheck(s.precheckQueryRequest)
 	}
-	srv.SetQueryHandler(s.handleQueryRequest)
+	srv.SetQueryHandler(s.dispatchQueryRequest)
 	srv.SetConnectionHook(func(client *liteclient.ServerClient) error {
 		event := s.log.Debug().Str("remote_ip", client.IP()).Uint16("remote_port", client.Port())
 		if s.connectionTracker != nil {
@@ -380,55 +391,6 @@ func (s *Server) precheckQueryRequest(ctx context.Context, client *liteclient.Se
 	}
 
 	return nil, false
-}
-
-func (s *Server) handleQueryRequest(ctx context.Context, client *liteclient.ServerClient, data tl.Serializable) (tl.Serializable, error) {
-	if s.connectionTracker != nil && s.connectionTracker.keepAliveEnabled() {
-		if s.requestLimiter == nil {
-			s.connectionTracker.beginRequest(client, s.now())
-		}
-		defer s.connectionTracker.endRequest(client, s.now())
-	}
-
-	event := s.log.Debug()
-	if !event.Enabled() && s.queryObserver == nil {
-		return s.handleQueryData(ctx, data), nil
-	}
-
-	if s.queryObserver != nil {
-		s.queryObserver.AddLiteserverInflight(1)
-		defer s.queryObserver.AddLiteserverInflight(-1)
-	}
-
-	resp, timing := s.handleQueryDataWithTiming(ctx, data)
-	if s.queryObserver != nil {
-		s.queryObserver.ObserveLiteserverQuery(queryObservationFromResponse(resp, timing))
-	}
-	if !event.Enabled() {
-		return resp, nil
-	}
-
-	event = event.
-		Str("query", timing.queryName()).
-		Str("response", liteserverTypeName(resp)).
-		Dur("duration", timing.duration).
-		Str("remote_ip", client.IP()).
-		Uint16("remote_port", client.Port())
-	if timing.sequence != "" && timing.sequence != timing.query {
-		event = event.Str("sequence", timing.sequence)
-	}
-	if timing.waitDuration > 0 {
-		event = event.Dur("wait_duration", timing.waitDuration)
-	}
-	if lsErr, ok := resp.(ton.LSError); ok {
-		event = event.Int32("error_code", lsErr.Code)
-	}
-	if timing.errorReason != "" {
-		event = event.Str("error_reason", timing.errorReason)
-	}
-	event.Msg("handled liteserver query")
-
-	return resp, nil
 }
 
 func queryObservationFromResponse(resp tl.Serializable, timing queryLogTiming) QueryObservation {

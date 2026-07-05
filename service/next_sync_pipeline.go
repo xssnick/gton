@@ -272,7 +272,7 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 	if mode == nextSyncToTarget && master.Block.SeqNo >= target.SeqNo {
 		return current, 0, nil
 	}
-	s.rememberMasterState(ctx, master, nil)
+	s.rememberMasterState(ctx, master, nil, nil)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -636,7 +636,7 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 	r.service.publishLiveBlockArtifacts(prepared, nextMaster, liveBlockPublishOptions{})
 	r.service.rememberAppliedMasterchainState(nextMaster)
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
-	r.service.rememberMasterState(r.ctx, nextMaster, &prepared)
+	r.service.rememberMasterState(r.ctx, nextMaster, &prepared, targets)
 	applyCells.remember(prepared.ID, prepared.StateUpdateToCells)
 	applied.master = nextMaster
 	applied.stateUpdateCells = prepared.StateUpdateToCells
@@ -662,17 +662,6 @@ func (r *nextSyncRunner) startShardPrefetch(applied <-chan nextAppliedMaster) <-
 		defer close(out)
 
 		for item := range applied {
-			if item.err == nil && item.master != nil && !item.shardTargetsParsed {
-				targets, elapsed, err := r.shardTargetsForMasterBlock(item.block)
-				item.shardTargets = targets
-				item.shardTargetsParsed = true
-				item.shardTargetParse = elapsed
-				if err != nil {
-					item.err = err
-				} else {
-					item.shardPrefetchTargets = r.scheduleShardPrefetch(item.master.Block, targets)
-				}
-			}
 			if !r.sendAppliedMaster(out, item) {
 				return
 			}

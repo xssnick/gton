@@ -231,15 +231,12 @@ func runMethodStack(methodID uint64, params []byte) (*vmcore.Stack, error) {
 }
 
 func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, mode uint32) (runMethodAccount, error) {
-	ref, err := s.resolveAccountReference(ctx, id, account, "runSmcMethod()", true)
+	ref, err := s.resolveAccountReference(ctx, id, account, "runSmcMethod()", true, mode&1 != 0)
 	if err != nil {
 		return runMethodAccount{}, err
 	}
 
 	shardProof := ref.shardProof
-	if mode&1 == 0 {
-		shardProof = nil
-	}
 	if !isFullBlockID(&ref.shard) {
 		return runMethodAccount{
 			base:        ref.base,

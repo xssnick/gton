@@ -19,6 +19,9 @@ type RequestLimitOptions struct {
 	CoolingPerSec       float64
 	MaxConnectionsPerIP int
 	MaxKeepAlive        time.Duration
+	// MaxWaitsPerIP caps parked waitMasterchainSeqno requests per client
+	// address. Zero means the default of 256.
+	MaxWaitsPerIP int
 }
 
 func validateRequestLimitOptions(opts RequestLimitOptions) error {
@@ -33,6 +36,9 @@ func validateRequestLimitOptions(opts RequestLimitOptions) error {
 	}
 	if opts.MaxKeepAlive < 0 {
 		return fmt.Errorf("liteserver max keep alive cannot be negative")
+	}
+	if opts.MaxWaitsPerIP < 0 {
+		return fmt.Errorf("liteserver max waits per IP cannot be negative")
 	}
 	if (opts.CapacityPerIP == 0) != (opts.CoolingPerSec == 0) {
 		return fmt.Errorf("liteserver request capacity per IP and cooling per second must be configured together")

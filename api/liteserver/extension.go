@@ -16,6 +16,7 @@ type ExtensionConfig struct {
 	AllowDuplicateExternals bool
 	ZeroState               ton.ZeroStateIDExt
 	RequestLimits           RequestLimitOptions
+	QueryConcurrency        int
 }
 
 type Extension struct {
@@ -41,6 +42,7 @@ func NewExtension(node hooks.Node, cfg ExtensionConfig) (*Extension, error) {
 		AllowDuplicateExternals: cfg.AllowDuplicateExternals,
 		ZeroState:               cfg.ZeroState,
 		RequestLimits:           cfg.RequestLimits,
+		QueryConcurrency:        cfg.QueryConcurrency,
 	})
 	if err != nil {
 		return nil, err

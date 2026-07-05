@@ -113,6 +113,9 @@ type LiteLimits struct {
 	CoolingPerSec       float64 `json:"cooling_per_sec"`
 	MaxConnectionsPerIP int64   `json:"max_connections_per_ip"`
 	MaxKeepAliveSeconds int64   `json:"max_keep_alive_seconds"`
+	// MaxWaitsPerIP caps parked waitMasterchainSeqno requests per client
+	// address; 0 applies the default of 256.
+	MaxWaitsPerIP int64 `json:"max_waits_per_ip"`
 }
 
 type Storage struct {

@@ -97,10 +97,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/xssnick/raptorq v1.4.0 h1:Bms8lgT7aEPRP8YBRuS+8w7Cic8GP9BbvFT1NrWvi24=
 github.com/xssnick/raptorq v1.4.0/go.mod h1:mo5n6T4yaqZkNVMWonRuMS0tcyD4XQ6PwwTjaY3ZwQY=
-github.com/xssnick/tonutils-go v1.17.1-0.20260630162442-08f0eb2ac414 h1:K/8RqHYNTsM3wn0MutGLj4wJbZ/Pl7ths67tWIjR14w=
-github.com/xssnick/tonutils-go v1.17.1-0.20260630162442-08f0eb2ac414/go.mod h1:Ind3q0JM2N/63zfWR7rSGmUpUZaiGxregm9nZc/xGx4=
-github.com/xssnick/tonutils-go v1.17.1-0.20260701100827-ad69860473e8 h1:OERcY/xdy6haHLiq4NPFjoC2hYN6BiutOe9jIWvhfCk=
-github.com/xssnick/tonutils-go v1.17.1-0.20260701100827-ad69860473e8/go.mod h1:Ind3q0JM2N/63zfWR7rSGmUpUZaiGxregm9nZc/xGx4=
+github.com/xssnick/tonutils-go v1.17.1-0.20260705162929-0952ea1e6d93 h1:PWy1ARdyIwQxzV/RCK69D+NZ426DDheE8pKptwM1LQs=
+github.com/xssnick/tonutils-go v1.17.1-0.20260705162929-0952ea1e6d93/go.mod h1:Ind3q0JM2N/63zfWR7rSGmUpUZaiGxregm9nZc/xGx4=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=

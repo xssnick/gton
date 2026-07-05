@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	tnstate "github.com/xssnick/gton/service/state"
@@ -1143,6 +1144,9 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 	if written != candidate.size {
 		return nil, fmt.Errorf("persistent state size mismatch: wrote=%d want=%d", written, candidate.size)
 	}
+	if err = file.Sync(); err != nil {
+		return nil, err
+	}
 	if err = file.Close(); err != nil {
 		return nil, err
 	}
@@ -1157,6 +1161,10 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		return nil, err
 	}
 	path = finalPath
+	if err = syncStateFileDir(filepath.Dir(finalPath)); err != nil {
+		success = true
+		return nil, err
+	}
 
 	success = true
 	n.log.Info().
@@ -1193,4 +1201,17 @@ func removeIncompleteStateFiles(dir string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func syncStateFileDir(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+
+	if err = file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
+		return err
+	}
+	return nil
 }

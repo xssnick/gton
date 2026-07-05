@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestDownloadElapsedExcludingInlinePrepare(t *testing.T) {
@@ -44,23 +45,21 @@ func TestDownloadElapsedExcludingInlinePrepare(t *testing.T) {
 	}
 }
 
-func TestShardPrefetchParsesTargetsFromMasterBlockExtra(t *testing.T) {
-	downloaded := mustLoadFixtureDownloadedBlock(t)
-	prepared := PreparedBlock{
-		ID:        downloaded.ID,
-		BlockRoot: downloaded.Block,
-		BlockBOC:  downloaded.BlockBOC,
-	}
-
+func TestShardPrefetchForwardsParsedTargets(t *testing.T) {
 	runner := &nextSyncRunner{
 		ctx:     context.Background(),
 		service: &Service{},
 	}
+	target := testBlockID(0, topShard, 100)
+	targets := []ton.BlockIDExt{target}
 
 	applied := make(chan nextAppliedMaster, 1)
 	applied <- nextAppliedMaster{
-		block:  prepared,
-		master: &storage.BlockState{Block: downloaded.ID},
+		master:               &storage.BlockState{Block: testBlockID(-1, topShard, 99)},
+		shardTargets:         targets,
+		shardTargetsParsed:   true,
+		shardTargetParse:     time.Millisecond,
+		shardPrefetchTargets: len(targets),
 	}
 	close(applied)
 
@@ -72,7 +71,16 @@ func TestShardPrefetchParsesTargetsFromMasterBlockExtra(t *testing.T) {
 	if item.err != nil {
 		t.Fatalf("startShardPrefetch returned error: %v", item.err)
 	}
-	if len(item.shardTargets) == 0 {
-		t.Fatal("expected shard targets from master block extra")
+	if !item.shardTargetsParsed {
+		t.Fatal("expected startShardPrefetch to preserve parsed shard targets flag")
+	}
+	if item.shardTargetParse != time.Millisecond {
+		t.Fatalf("shard target parse duration = %s, want %s", item.shardTargetParse, time.Millisecond)
+	}
+	if item.shardPrefetchTargets != len(targets) {
+		t.Fatalf("shard prefetch target count = %d, want %d", item.shardPrefetchTargets, len(targets))
+	}
+	if len(item.shardTargets) != len(targets) || !item.shardTargets[0].Equals(&target) {
+		t.Fatalf("shard targets = %v, want %v", item.shardTargets, targets)
 	}
 }

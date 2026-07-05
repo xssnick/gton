@@ -13,6 +13,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -27,6 +28,11 @@ import (
 )
 
 var GitCommit = "unknown"
+
+// liteserverSendQueueSize overrides the per-connection answer queue size:
+// responses are produced concurrently, so pipelined backend clients need
+// enough headroom to absorb answer bursts without drops.
+const liteserverSendQueueSize = 4096
 
 type cliCommands struct {
 	version         bool
@@ -125,9 +131,13 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		fmt.Fprintf(os.Stderr, "liteserver query workers cannot be negative: %d\n", startOpts.LiteQueryWorkers)
 		os.Exit(1)
 	}
-	if startOpts.LiteQueryWorkers > 0 {
-		liteclient.ServerQueryWorkers = startOpts.LiteQueryWorkers
+	liteQueryConcurrency := startOpts.LiteQueryWorkers
+	if liteQueryConcurrency == 0 {
+		liteQueryConcurrency = runtime.GOMAXPROCS(0) * 4
 	}
+	// Query answers are produced concurrently now: give pipelined backend
+	// clients enough per-connection send buffer to absorb response bursts.
+	liteclient.ServerClientSendQueueSize = liteserverSendQueueSize
 
 	pprofCtx, stopPprof := context.WithCancel(context.Background())
 	defer stopPprof()
@@ -148,7 +158,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	runOpts.Logger = logs.Base()
 	runOpts.ConsoleInput = os.Stdin
 	runOpts.ConsoleOutput = os.Stdout
-	liteOpts, err := configureLiteserver(&runOpts, cfg, globalConfig)
+	liteOpts, err := configureLiteserver(&runOpts, cfg, globalConfig, liteQueryConcurrency)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -156,7 +166,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	logger.Info().
 		Bool("liteserver", liteOpts.Enabled).
 		Str("liteserver_listen_addr", fallbackString(liteOpts.ListenAddr, "<disabled>")).
-		Int("liteserver_query_workers", liteclient.ServerQueryWorkers).
+		Int("liteserver_query_concurrency", liteOpts.QueryConcurrency).
 		Int64("liteserver_send_message_broadcast_bytes_per_second", liteOpts.ExternalBroadcastCapacity.BytesPerSecond).
 		Dur("liteserver_send_message_broadcast_max_delay", liteOpts.ExternalBroadcastCapacity.MaxDelay).
 		Int("liteserver_send_message_broadcast_fanout", liteOpts.ExternalBroadcastFanout).
@@ -164,6 +174,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		Float64("liteserver_cooling_per_sec", liteOpts.Limits.CoolingPerSec).
 		Int("liteserver_max_connections_per_ip", liteOpts.Limits.MaxConnectionsPerIP).
 		Dur("liteserver_max_keep_alive", liteOpts.Limits.MaxKeepAlive).
+		Int("liteserver_max_waits_per_ip", liteOpts.Limits.MaxWaitsPerIP).
 		Msg("configured liteserver")
 
 	if len(extensions) > 0 {

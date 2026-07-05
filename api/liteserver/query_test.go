@@ -4728,7 +4728,7 @@ func TestWaitMasterchainSeqnoPrefixRunsWrappedQueryAfterLiveState(t *testing.T) 
 
 	done := make(chan tl.Serializable, 1)
 	go func() {
-		done <- srv.handleQueryData(context.Background(), parsed)
+		done <- srv.handleQueryData(context.Background(), parsed, nil)
 	}()
 
 	select {
@@ -4787,7 +4787,7 @@ func TestWaitMasterchainSeqnoPrefixWaitsForReadableLiveCurrent(t *testing.T) {
 
 	done := make(chan tl.Serializable, 1)
 	go func() {
-		done <- srv.handleQueryData(context.Background(), req)
+		done <- srv.handleQueryData(context.Background(), req, nil)
 	}()
 
 	select {
@@ -4827,7 +4827,7 @@ func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 		ton.WaitMasterchainSeqno{Seqno: 21, Timeout: 1},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
-	resp := srv.handleQueryData(context.Background(), timeoutReq)
+	resp := srv.handleQueryData(context.Background(), timeoutReq, nil)
 	errResp, ok := resp.(ton.LSError)
 	if !ok {
 		t.Fatalf("timeout response type = %T, want ton.LSError: %+v", resp, resp)
@@ -4840,7 +4840,7 @@ func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 		ton.WaitMasterchainSeqno{Seqno: 121, Timeout: 500},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
-	resp = srv.handleQueryData(context.Background(), tooFarReq)
+	resp = srv.handleQueryData(context.Background(), tooFarReq, nil)
 	errResp, ok = resp.(ton.LSError)
 	if !ok {
 		t.Fatalf("too-far response type = %T, want ton.LSError: %+v", resp, resp)
@@ -5155,13 +5155,14 @@ func testServer(store Store) *Server {
 		sendMessageCache:       newSendMessageCache(),
 		externalMessageChecker: checker,
 		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
+		respCache:              newLiteResponseCache(),
 		now: func() time.Time {
 			return time.Unix(1700000000, 0)
 		},
 	}
 }
 
-func testCurrentStateWithLiveBlock(t *testing.T, seqno uint32) (*storage.CurrentState, *cell.Cell, []byte) {
+func testCurrentStateWithLiveBlock(t testing.TB, seqno uint32) (*storage.CurrentState, *cell.Cell, []byte) {
 	t.Helper()
 
 	root := cell.BeginCell().MustStoreUInt(uint64(seqno), 32).EndCell()
@@ -7134,6 +7135,13 @@ func (s *fakeStore) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*
 		return nil, err
 	}
 	return buildLiveBlockFragments(block, blockRoot, stateRoot)
+}
+
+func (s *fakeStore) MasterchainSeqnoReady(seqno uint32) bool {
+	if s.current == nil {
+		return false
+	}
+	return s.current.Masterchain.Block.SeqNo >= seqno
 }
 
 func (s *fakeStore) WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error {

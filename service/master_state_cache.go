@@ -30,7 +30,7 @@ type monitorSplitDepthKey struct {
 	workchain    int32
 }
 
-func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockState, block *PreparedBlock) {
+func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
 	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
 		return
 	}
@@ -38,7 +38,7 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 	s.resetMasterDependentCachesForKeyBlock(block)
 
 	rememberedCompressedState := s.rememberCompressedBlockState(state)
-	s.updateP2PShardOverlays(ctx, state, block)
+	s.updateP2PShardOverlays(ctx, state, block, shardTargets)
 
 	key := storage.BlockKey(state.Block)
 	cloned := storage.CloneBlockState(state)
@@ -263,7 +263,7 @@ func monitorSplitDepthKeyBlock(state *storage.BlockState) (ton.BlockIDExt, error
 	}, nil
 }
 
-func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock) {
+func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
 	if s.node == nil {
 		return
 	}
@@ -279,7 +279,7 @@ func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.Blo
 
 	s.node.SetMonitorMinSplitDepth(0, depth)
 
-	shards, err := s.masterBlockShardTargets(ctx, state, block)
+	shards, err := s.masterBlockShardTargets(ctx, state, block, shardTargets)
 	if err != nil {
 		s.log.Debug().
 			Err(err).
@@ -295,8 +295,16 @@ func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.Blo
 	}
 }
 
-func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.BlockState, block *PreparedBlock) ([]ton.BlockIDExt, error) {
+func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.BlockState, block *PreparedBlock, precomputed []ton.BlockIDExt) ([]ton.BlockIDExt, error) {
 	if block != nil {
+		// The apply pipeline already parsed the block and derived the shard
+		// targets before applying its transition; reuse them instead of a second
+		// full block parse on the hot path. ShardBlocksFromMasterBlock is a pure
+		// function of the block's shard hashes, so the result is identical.
+		if precomputed != nil {
+			return precomputed, nil
+		}
+
 		parsed, err := parsePreparedBlock(*block)
 		if err != nil {
 			return nil, fmt.Errorf("parse master block %s: %w", block.BlockRef(), err)

@@ -17,7 +17,14 @@ type stateCheckpointData struct {
 }
 
 func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
-	appliedEntries := cloneStateCheckpointEntries(entries)
+	// entries always come from appliedStateSet.checkpoint(), which already
+	// produced an independent snapshot (deep-cloned block states, shared immutable
+	// payload bytes) decoupled from the live set. That snapshot is single-use and
+	// is not read again after the persist, so re-cloning it here would just be a
+	// second full clone of ~400 block states per checkpoint. The archive path
+	// (persistArchiveCurrentState) already hands the same checkpoint() entries
+	// straight to saveStateCheckpoint without re-cloning; mirror that.
+	appliedEntries := entries
 	if len(appliedEntries) == 0 {
 		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
 	}
@@ -99,24 +106,6 @@ func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*s
 		}
 	}
 	return next
-}
-
-func cloneStateCheckpointEntries(entries []storage.StateCheckpointBlock) []storage.StateCheckpointBlock {
-	if len(entries) == 0 {
-		return nil
-	}
-	cloned := make([]storage.StateCheckpointBlock, 0, len(entries))
-	for _, entry := range entries {
-		if entry.State == nil {
-			continue
-		}
-		cloned = append(cloned, storage.StateCheckpointBlock{
-			State:    storage.CloneBlockState(entry.State),
-			Artifact: cloneServedBlockFullSharedPayload(entry.Artifact),
-			Links:    cloneServedBlockLinks(entry.Links),
-		})
-	}
-	return cloned
 }
 
 func checkpointEntryStates(entries []storage.StateCheckpointBlock) []*storage.BlockState {

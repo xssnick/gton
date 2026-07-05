@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -44,10 +45,16 @@ type runMethodBaseConfig struct {
 	PrevBlocks    any
 	Config        tlb.BlockchainConfig
 	Unpacked      runMethodUnpackedConfigCells
+	Precompiled   *cell.Dictionary
+}
+
+type runMethodStoragePrice struct {
+	since uint64
+	value *cell.Slice
 }
 
 type runMethodUnpackedConfigCells struct {
-	StoragePrices *cell.Cell
+	StoragePrices []runMethodStoragePrice
 	Params        [runMethodConfigParamCount]*cell.Cell
 }
 
@@ -97,6 +104,11 @@ func buildRunMethodBaseConfig(master ton.BlockIDExt, extra *tlb.McStateExtra) (*
 		return nil, err
 	}
 
+	precompiled, err := loadRunMethodPrecompiledContracts(config)
+	if err != nil {
+		return nil, err
+	}
+
 	return &runMethodBaseConfig{
 		Root:          config.Root,
 		Present:       true,
@@ -104,6 +116,7 @@ func buildRunMethodBaseConfig(master ton.BlockIDExt, extra *tlb.McStateExtra) (*
 		PrevBlocks:    prevBlocks,
 		Config:        config,
 		Unpacked:      unpacked,
+		Precompiled:   precompiled,
 	}, nil
 }
 
@@ -113,7 +126,7 @@ func runMethodConfigFromBase(base *runMethodBaseConfig, now uint32, code *cell.C
 		return RunMethodConfigInfo{}, err
 	}
 
-	precompiled, err := runMethodPrecompiledGas(base.Config, code)
+	precompiled, err := runMethodPrecompiledGas(base.Precompiled, code)
 	if err != nil {
 		return RunMethodConfigInfo{}, err
 	}
@@ -286,7 +299,11 @@ func runMethodBlockIDTuple(id ton.BlockIDExt) tuple.Tuple {
 }
 
 func loadRunMethodUnpackedConfigCells(config tlb.BlockchainConfig) (runMethodUnpackedConfigCells, error) {
-	storagePrices, err := runMethodConfigParamCell(config, tlb.ConfigParamStoragePrices)
+	storagePricesRoot, err := runMethodConfigParamCell(config, tlb.ConfigParamStoragePrices)
+	if err != nil {
+		return runMethodUnpackedConfigCells{}, err
+	}
+	storagePrices, err := loadRunMethodStoragePrices(storagePricesRoot)
 	if err != nil {
 		return runMethodUnpackedConfigCells{}, err
 	}
@@ -307,10 +324,7 @@ func loadRunMethodUnpackedConfigCells(config tlb.BlockchainConfig) (runMethodUnp
 }
 
 func runMethodUnpackedConfig(config runMethodUnpackedConfigCells, now uint32) (tuple.Tuple, error) {
-	storagePrices, err := runMethodCurrentStoragePrices(config.StoragePrices, now)
-	if err != nil {
-		return tuple.Tuple{}, err
-	}
+	storagePrices := runMethodCurrentStoragePrices(config.StoragePrices, now)
 
 	values := []any{runMethodMaybeSlice(storagePrices)}
 	for _, paramCell := range config.Params {
@@ -324,7 +338,7 @@ func runMethodUnpackedConfig(config runMethodUnpackedConfigCells, now uint32) (t
 	return tuple.NewTupleValue(values...), nil
 }
 
-func runMethodCurrentStoragePrices(root *cell.Cell, now uint32) (*cell.Slice, error) {
+func loadRunMethodStoragePrices(root *cell.Cell) ([]runMethodStoragePrice, error) {
 	if root == nil {
 		return nil, nil
 	}
@@ -334,21 +348,24 @@ func runMethodCurrentStoragePrices(root *cell.Cell, now uint32) (*cell.Slice, er
 		return nil, err
 	}
 
-	var best *cell.Slice
-	var bestSince uint64
+	prices := make([]runMethodStoragePrice, 0, len(entries))
 	for _, entry := range entries {
 		since, err := entry.Key.LoadUInt(32)
 		if err != nil {
 			return nil, err
 		}
-		if since > uint64(now) || best != nil && since <= bestSince {
-			continue
-		}
-		best = entry.Value.Copy()
-		bestSince = since
+		prices = append(prices, runMethodStoragePrice{since: since, value: entry.Value})
 	}
+	sort.Slice(prices, func(i, j int) bool { return prices[i].since < prices[j].since })
+	return prices, nil
+}
 
-	return best, nil
+func runMethodCurrentStoragePrices(prices []runMethodStoragePrice, now uint32) *cell.Slice {
+	idx := sort.Search(len(prices), func(i int) bool { return prices[i].since > uint64(now) })
+	if idx == 0 {
+		return nil
+	}
+	return prices[idx-1].value.Copy()
 }
 
 func runMethodConfigParamSlice(param *cell.Cell) (*cell.Slice, error) {
@@ -377,8 +394,8 @@ func runMethodMaybeSlice(value *cell.Slice) any {
 	return value
 }
 
-func runMethodPrecompiledGas(config tlb.BlockchainConfig, code *cell.Cell) (*big.Int, error) {
-	if config.Root == nil || code == nil {
+func loadRunMethodPrecompiledContracts(config tlb.BlockchainConfig) (*cell.Dictionary, error) {
+	if config.Root == nil {
 		return nil, nil
 	}
 
@@ -389,8 +406,15 @@ func runMethodPrecompiledGas(config tlb.BlockchainConfig, code *cell.Cell) (*big
 	if precompiled.List == nil || precompiled.List.IsEmpty() {
 		return nil, nil
 	}
+	return precompiled.List, nil
+}
 
-	value, err := precompiled.List.LoadValue(accountKey(code.Hash()))
+func runMethodPrecompiledGas(precompiled *cell.Dictionary, code *cell.Cell) (*big.Int, error) {
+	if precompiled == nil || code == nil {
+		return nil, nil
+	}
+
+	value, err := precompiled.LoadValue(accountKey(code.Hash()))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		return nil, nil
 	}

@@ -29,30 +29,38 @@ func (t queryLogTiming) queryName() string {
 	return t.query
 }
 
-func (s *Server) handleQueryData(ctx context.Context, data any) tl.Serializable {
+// handleQueryData processes a query synchronously. A nil response is returned
+// only when the gate fails to admit the query because the client disconnected.
+func (s *Server) handleQueryData(ctx context.Context, data any, gate *executorGate) tl.Serializable {
 	switch q := data.(type) {
 	case liteclient.LiteServerQuery:
-		return s.handleQueryData(ctx, q.Data)
+		return s.handleQueryData(ctx, q.Data, gate)
 	case liteclient.LiteServerQueryPrefix:
 		return ton.LSError{Code: errCodeProtoViolation, Text: "missing liteserver function after queryPrefix"}
 	case []tl.Serializable:
-		return s.handleQuerySequence(ctx, q)
+		return s.handleQuerySequence(ctx, q, gate)
 	default:
+		if !gate.enter(ctx) {
+			return nil
+		}
 		return s.handleQuery(ctx, q)
 	}
 }
 
-func (s *Server) handleQueryDataWithTiming(ctx context.Context, data any) (tl.Serializable, queryLogTiming) {
+func (s *Server) handleQueryDataWithTiming(ctx context.Context, data any, gate *executorGate) (tl.Serializable, queryLogTiming) {
 	switch q := data.(type) {
 	case liteclient.LiteServerQuery:
-		return s.handleQueryDataWithTiming(ctx, q.Data)
+		return s.handleQueryDataWithTiming(ctx, q.Data, gate)
 	case liteclient.LiteServerQueryPrefix:
 		started := time.Now()
 		resp := ton.LSError{Code: errCodeProtoViolation, Text: "missing liteserver function after queryPrefix"}
 		return resp, queryLogTiming{query: liteserverTypeName(q), duration: time.Since(started)}
 	case []tl.Serializable:
-		return s.handleQuerySequenceWithTiming(ctx, q)
+		return s.handleQuerySequenceWithTiming(ctx, q, gate)
 	default:
+		if !gate.enter(ctx) {
+			return nil, queryLogTiming{query: liteserverQueryLogName(q)}
+		}
 		return s.handleStandaloneQueryWithTiming(ctx, q)
 	}
 }
@@ -75,7 +83,7 @@ func (s *Server) handleStandaloneQueryWithTiming(ctx context.Context, query any)
 	}
 }
 
-func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.Serializable) (tl.Serializable, queryLogTiming) {
+func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.Serializable, gate *executorGate) (tl.Serializable, queryLogTiming) {
 	sequence := liteserverQuerySequenceLogName(items)
 	if len(items) == 0 {
 		resp := ton.LSError{Code: errCodeProtoViolation, Text: "empty liteserver query"}
@@ -104,7 +112,7 @@ func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.S
 				return resp, queryLogTiming{query: liteserverTypeName(q), sequence: sequence, waitDuration: waitDuration}
 			}
 
-			resp, timing := s.handleQueryDataWithTiming(ctx, q.Data)
+			resp, timing := s.handleQueryDataWithTiming(ctx, q.Data, gate)
 			timing.sequence = sequence
 			timing.waitDuration += waitDuration
 			return resp, timing
@@ -114,6 +122,9 @@ func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.S
 				return resp, queryLogTiming{query: liteserverQueryLogName(item), sequence: sequence, waitDuration: waitDuration}
 			}
 
+			if !gate.enter(ctx) {
+				return nil, queryLogTiming{query: liteserverQueryLogName(item), sequence: sequence, waitDuration: waitDuration}
+			}
 			resp, timing := s.handleStandaloneQueryWithTiming(ctx, item)
 			timing.sequence = sequence
 			timing.waitDuration += waitDuration
@@ -125,7 +136,7 @@ func (s *Server) handleQuerySequenceWithTiming(ctx context.Context, items []tl.S
 	return resp, queryLogTiming{query: "missing", sequence: sequence, waitDuration: waitDuration}
 }
 
-func (s *Server) handleQuerySequence(ctx context.Context, items []tl.Serializable) tl.Serializable {
+func (s *Server) handleQuerySequence(ctx context.Context, items []tl.Serializable, gate *executorGate) tl.Serializable {
 	if len(items) == 0 {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "empty liteserver query"}
 	}
@@ -142,10 +153,13 @@ func (s *Server) handleQuerySequence(ctx context.Context, items []tl.Serializabl
 			if i != len(items)-1 {
 				return ton.LSError{Code: errCodeProtoViolation, Text: "unexpected query after liteServer.query"}
 			}
-			return s.handleQueryData(ctx, q.Data)
+			return s.handleQueryData(ctx, q.Data, gate)
 		default:
 			if i != len(items)-1 {
 				return ton.LSError{Code: errCodeProtoViolation, Text: "unexpected query after liteserver function"}
+			}
+			if !gate.enter(ctx) {
+				return nil
 			}
 			return s.handleQuery(ctx, item)
 		}

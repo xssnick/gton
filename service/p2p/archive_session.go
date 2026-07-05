@@ -110,7 +110,7 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 }
 
 func (a *ArchiveSession) RejectArchivePeer(shard archive.ShardID, peerAddr string, reason string) bool {
-	if a == nil || peerAddr == "" {
+	if peerAddr == "" {
 		return false
 	}
 

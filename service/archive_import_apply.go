@@ -190,7 +190,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		r.service.publishLiveBlockArtifacts(downloaded, next, liveBlockPublishOptions{availabilityOnly: true})
 		r.service.rememberAppliedMasterchainState(next)
 		r.service.rememberSeenMasterchainBlock(next.Block)
-		r.service.rememberMasterState(ctx, next, &downloaded)
+		r.service.rememberMasterState(ctx, next, &downloaded, nil)
 
 		master = next
 		window.masterSequence[idx].releaseStateUpdatePayload()

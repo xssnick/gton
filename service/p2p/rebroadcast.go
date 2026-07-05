@@ -487,25 +487,25 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
-		if s != nil && s.spec.Kind == overlayKindCustomFixed {
+		if s.spec.Kind == overlayKindCustomFixed {
 			if s.node != nil && s.node.rebroadcastLagged() {
 				return laggedExternalFanout
 			}
 			return s.peerLimit()
 		}
-		if req.local && s != nil && s.node != nil {
+		if req.local && s.node != nil {
 			fanout := s.node.effectiveLocalExternalFanout()
 			if s.node.rebroadcastLagged() {
 				return laggedLocalExternalFanout(fanout)
 			}
 			return fanout
 		}
-		if s != nil && s.node != nil && s.node.rebroadcastLagged() {
+		if s.node != nil && s.node.rebroadcastLagged() {
 			return laggedExternalFanout
 		}
 		return externalRebroadcastFanout
 	}
-	if s != nil && s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.Kind == overlayKindCustomFixed {
 		return s.peerLimit()
 	}
 	if s.node != nil && s.node.rebroadcastQuiet.Load() {

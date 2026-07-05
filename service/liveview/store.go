@@ -370,9 +370,11 @@ func (s *Store) SetLiveCurrentState(current *storage.CurrentState) {
 	}
 }
 
+// CurrentState returns the published state snapshot. The snapshot is immutable
+// once published and shared between callers; treat it as read-only.
 func (s *Store) CurrentState(_ context.Context) (*storage.CurrentState, error) {
 	s.mu.RLock()
-	current := storage.CloneCurrentState(s.current)
+	current := s.current
 	s.mu.RUnlock()
 	if current != nil {
 		return current, nil
@@ -810,6 +812,9 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 		return fragments, nil
 	}
 	value, err := s.fragmentLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		if fragments := s.cachedBlockFragments(block); fragments != nil {
 			return fragments, nil
 		}
@@ -847,6 +852,9 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 
 func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	value, err := s.blockDataLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		cached, err := s.cachedBlockData(ctx, block)
 		if err == nil {
 			return cached.Data, nil
@@ -884,6 +892,9 @@ func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) (
 
 func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liveBlockLoadResult, error) {
 	value, err := s.blockLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		cached, err := s.cachedBlockData(ctx, block)
 		if err == nil {
 			data := cached.Data
@@ -940,6 +951,15 @@ func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liv
 
 func (s *Store) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	return s.backing.ZeroState(ctx, block)
+}
+
+// MasterchainSeqnoReady reports whether the given masterchain seqno is already
+// served without waiting.
+func (s *Store) MasterchainSeqnoReady(seqno uint32) bool {
+	s.mu.RLock()
+	ready := s.readyMasterSeqno
+	s.mu.RUnlock()
+	return ready >= seqno
 }
 
 func (s *Store) WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error {
@@ -1044,10 +1064,8 @@ func (s *Store) blockDataReadyLocked(block ton.BlockIDExt) bool {
 	if currentHasBlockState(s.current, block) {
 		return true
 	}
-	if s.liveBlockCache != nil {
-		if _, err := s.liveBlockCache.BlockData(context.Background(), block); err == nil {
-			return true
-		}
+	if s.liveBlockCache != nil && s.liveBlockCache.HasBlockData(block) {
+		return true
 	}
 
 	cached := s.blocks[storage.BlockKey(block)]
@@ -1117,6 +1135,8 @@ func accountShardPrefix(prefix uint64, length int) int64 {
 	return int64((prefix & ^(x - 1)) | x)
 }
 
+// cachedBlockState returns a copy of the cached state struct; the nested cells
+// and byte slices are shared read-only with the cache.
 func (s *Store) cachedBlockState(block ton.BlockIDExt) *storage.BlockState {
 	key, ok := liveBlockLookupKeyFromBlock(block)
 	if !ok {
@@ -1129,19 +1149,18 @@ func (s *Store) cachedBlockState(block ton.BlockIDExt) *storage.BlockState {
 	if !ok {
 		return nil
 	}
-	return storage.CloneBlockState(&state)
+	return &state
 }
 
+// cachedBlockMeta returns the shared cached meta; indexed metas are immutable
+// once published, callers treat them as read-only.
 func (s *Store) cachedBlockMeta(block ton.BlockIDExt) *storage.BlockMeta {
 	key := storage.BlockKey(block)
 
 	s.mu.RLock()
 	meta := s.metas[key]
 	s.mu.RUnlock()
-	if meta == nil {
-		return nil
-	}
-	return meta.Clone()
+	return meta
 }
 
 func (s *Store) cachedBlockBySeqNo(ref storage.BlockSeqRef) (ton.BlockIDExt, bool) {

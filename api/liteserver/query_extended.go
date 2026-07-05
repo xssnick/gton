@@ -175,40 +175,61 @@ func sendMessageBroadcastErrorReason(err error) string {
 	return sendMessageErrorReasonBroadcastFailed
 }
 
+type allShardsInfoParts struct {
+	proof *cell.Cell
+	data  *cell.Cell
+}
+
 func (s *Server) handleAllShardsInfo(ctx context.Context, id *ton.BlockIDExt) any {
 	if !isFullBlockID(id) || id.Workchain != masterchainID {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	root, err := s.loadBlockRoot(ctx, *id)
+	key := liteResponseKey{kind: liteResponseAllShardsInfo, a: storage.BlockKey(*id)}
+	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
+		return s.buildAllShardsInfoParts(ctx, *id)
+	})
 	if err != nil {
-		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*id))
+		return errorResponse(err, "cannot load all shards info")
+	}
+
+	parts, ok := value.(allShardsInfoParts)
+	if !ok {
+		return ton.LSError{Code: errCodeInternal, Text: "invalid all shards info cache value"}
+	}
+	return ton.AllShardsInfo{
+		ID:    cloneBlockID(*id),
+		Proof: []*cell.Cell{parts.proof},
+		Data:  parts.data,
+	}
+}
+
+func (s *Server) buildAllShardsInfoParts(ctx context.Context, id ton.BlockIDExt) (allShardsInfoParts, error) {
+	root, err := s.loadBlockRoot(ctx, id)
+	if err != nil {
+		return allShardsInfoParts{}, queryErrorFromResponse(errorResponse(err, "cannot load block "+storage.FormatBlockRef(id)))
 	}
 
 	loader, err := root.BeginParse()
 	if err != nil {
-		return errorResponse(err, "cannot unpack block "+storage.FormatBlockRef(*id))
+		return allShardsInfoParts{}, queryErrorFromResponse(errorResponse(err, "cannot unpack block "+storage.FormatBlockRef(id)))
 	}
 
 	var block tlb.Block
 	if err = tlb.LoadFromCell(&block, loader); err != nil {
-		return errorResponse(err, "cannot unpack block "+storage.FormatBlockRef(*id))
+		return allShardsInfoParts{}, queryErrorFromResponse(errorResponse(err, "cannot unpack block "+storage.FormatBlockRef(id)))
 	}
 	if block.Extra == nil || block.Extra.Custom == nil || block.Extra.Custom.ShardHashes == nil {
-		return ton.LSError{Code: errCodeInternal, Text: "cannot unpack header of block " + cxxBlockIDExtString(*id)}
+		return allShardsInfoParts{}, newQueryError(errCodeInternal, "cannot unpack header of block "+cxxBlockIDExtString(id))
 	}
 
 	proof, err := allShardsInfoProof(root)
 	if err != nil {
-		return errorResponse(err, "cannot create all shards proof")
+		return allShardsInfoParts{}, queryErrorFromResponse(errorResponse(err, "cannot create all shards proof"))
 	}
 
 	data := cell.BeginCell().MustStoreDict(block.Extra.Custom.ShardHashes).EndCell()
-	return ton.AllShardsInfo{
-		ID:    cloneBlockID(*id),
-		Proof: []*cell.Cell{proof},
-		Data:  data,
-	}
+	return allShardsInfoParts{proof: proof, data: data}, nil
 }
 
 func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) any {

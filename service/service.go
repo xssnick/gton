@@ -770,7 +770,7 @@ func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *S
 		latestMaster = *snapshot.LatestMasterchain
 	}
 
-	if s != nil && s.storage != nil {
+	if s.storage != nil {
 		shards, err := s.masterShardBlocks(ctx, latestMaster)
 		if err == nil {
 			setStatusLatestBasechain(snapshot, shards)

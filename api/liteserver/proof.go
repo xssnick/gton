@@ -32,21 +32,36 @@ const (
 	configModePreviousKeyBlock  uint32 = 0x8000
 )
 
+// blockHeaderProofModeMask keeps only the mode bits visitBlockHeader interprets,
+// so unknown bits do not multiply cache entries for the same proof.
+const blockHeaderProofModeMask uint32 = 1 | 2 | 16 | 32 | 64
+
 func (s *Server) blockHeader(ctx context.Context, id ton.BlockIDExt, mode uint32) (ton.BlockHeader, error) {
-	root, err := s.loadBlockRoot(ctx, id)
+	key := liteResponseKey{kind: liteResponseBlockHeader, mode: mode & blockHeaderProofModeMask, a: storage.BlockKey(id)}
+	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
+		root, err := s.loadBlockRoot(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		proof, err := blockHeaderProof(root, id, mode)
+		if err != nil {
+			return nil, err
+		}
+		return proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
+	})
 	if err != nil {
 		return ton.BlockHeader{}, err
 	}
 
-	proof, err := blockHeaderProof(root, id, mode)
-	if err != nil {
-		return ton.BlockHeader{}, err
+	headerProof, ok := value.([]byte)
+	if !ok {
+		return ton.BlockHeader{}, errors.New("invalid block header cache value")
 	}
-
 	return ton.BlockHeader{
 		ID:          cloneBlockID(id),
 		Mode:        mode,
-		HeaderProof: proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+		HeaderProof: headerProof,
 	}, nil
 }
 
@@ -58,31 +73,35 @@ func (s *Server) accountProof(ctx context.Context, block ton.BlockIDExt, account
 	return fragments.AccountProof(accountID, pruned)
 }
 
-func (s *Server) masterShardProof(ctx context.Context, master ton.BlockIDExt, addr *address.Address) ([]*cell.Cell, ton.BlockIDExt, error) {
-	fragments, err := s.blockFragments(ctx, master)
-	if err != nil {
-		return nil, ton.BlockIDExt{}, err
-	}
-
+func (s *Server) masterShardProof(fragments *liveview.BlockView, addr *address.Address, withProof bool) ([]*cell.Cell, ton.BlockIDExt, error) {
 	extra, err := fragments.McStateExtra()
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
 	leafShard := accountLeafShard(addr)
-	stateProof, err := fragments.ShardHashesProof(addr.Workchain(), leafShard, false)
+	shardBlock, _, resolveErr := shardInfoFromHashes(extra.ShardHashes, addr.Workchain(), leafShard, false)
+	if resolveErr != nil && !errors.Is(resolveErr, storage.ErrNotFound) {
+		return nil, ton.BlockIDExt{}, resolveErr
+	}
+	if !withProof {
+		return nil, shardBlock, resolveErr
+	}
+
+	// The proof visits the shard tree path to the resolved leaf, which is identical
+	// for every account inside that shard, so cache it by the true shard instead of
+	// the per-account prefix. The unresolved case keeps the prefix to prove absence.
+	proofShard := leafShard
+	if resolveErr == nil {
+		proofShard = shardBlock.Shard
+	}
+	stateProof, err := fragments.ShardHashesProof(addr.Workchain(), proofShard, false)
 	if err != nil {
 		return nil, ton.BlockIDExt{}, err
 	}
 
 	proof := []*cell.Cell{fragments.BlockStateRootProof(), stateProof}
-
-	shardBlock, _, err := shardInfoFromHashes(extra.ShardHashes, addr.Workchain(), leafShard, false)
-	if err != nil {
-		return proof, ton.BlockIDExt{}, err
-	}
-
-	return proof, shardBlock, nil
+	return proof, shardBlock, resolveErr
 }
 
 func accountLeafShard(addr *address.Address) int64 {

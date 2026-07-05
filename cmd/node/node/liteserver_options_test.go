@@ -98,7 +98,7 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 	}
 	var runOpts gton.NodeOptions
 
-	_, err := configureLiteserver(&runOpts, cfg, liteserverTestGlobalConfig())
+	_, err := configureLiteserver(&runOpts, cfg, liteserverTestGlobalConfig(), 0)
 	if err != nil {
 		t.Fatalf("configure liteserver: %v", err)
 	}

@@ -21,7 +21,7 @@ func TestMasterBlockShardTargetsUsesBlockExtra(t *testing.T) {
 		Meta:      downloaded.Meta,
 	}
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: downloaded.ID}, &prepared)
+	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: downloaded.ID}, &prepared, nil)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -30,12 +30,27 @@ func TestMasterBlockShardTargetsUsesBlockExtra(t *testing.T) {
 	}
 }
 
+func TestMasterBlockShardTargetsReusesPrecomputed(t *testing.T) {
+	// With a prepared block present, precomputed targets must be returned verbatim
+	// without re-parsing the block, so the apply pipeline pays a single parse.
+	precomputed := []ton.BlockIDExt{testBlockID(0, topShard, 42)}
+	prepared := PreparedBlock{ID: testBlockID(-1, topShard, 41)}
+
+	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: prepared.ID}, &prepared, precomputed)
+	if err != nil {
+		t.Fatalf("masterBlockShardTargets returned error: %v", err)
+	}
+	if len(shards) != 1 || !shards[0].Equals(&precomputed[0]) {
+		t.Fatalf("masterBlockShardTargets did not return precomputed targets: %v", shards)
+	}
+}
+
 func TestMasterBlockShardTargetsFallsBackToState(t *testing.T) {
 	master := testBlockID(-1, topShard, 10)
 	shard := testBlockID(0, topShard, 11)
 	state := testShardTargetsMasterState(t, master, shard)
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), state, nil)
+	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), state, nil, nil)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -90,7 +105,7 @@ func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	svc.rememberMasterState(context.Background(), testMonitorMasterStateWithKeyBlock(t, nonKey, 9, keyBlock, false), &PreparedBlock{
 		ID:   nonKey,
 		Meta: &storage.BlockMeta{ID: nonKey},
-	})
+	}, nil)
 
 	got, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(4), keyBlock, false), 0)
 	if err != nil {
@@ -106,7 +121,7 @@ func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	svc.rememberMasterState(context.Background(), testMonitorMasterStateWithKeyBlock(t, key, 9, key, true), &PreparedBlock{
 		ID:   key,
 		Meta: meta,
-	})
+	}, nil)
 
 	got, err = svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithKeyBlock(t, key, 9, key, true), 0)
 	if err != nil {
