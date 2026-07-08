@@ -11,7 +11,6 @@ import (
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	"github.com/xssnick/tonutils-go/tvm/tuple"
 	vmcore "github.com/xssnick/tonutils-go/tvm/vm"
@@ -20,7 +19,6 @@ import (
 const (
 	runMethodSupportedMode uint32 = 0x3f
 	runMethodMaxParamBytes        = 65536
-	runMethodGasLimit      int64  = 300000
 )
 
 type runMethodAccount struct {
@@ -68,7 +66,7 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 	account, err := liveview.LoadRunMethodAccountState(info.accountCell)
 	if err != nil {
 		if query.Mode&2 != 0 {
-			result.StateProof, err = s.runMethodInactiveAccountProof(info.accountCell)
+			result.StateProof, err = liveview.RunMethodInactiveAccountProof(s.tvm, info.accountCell)
 			if err != nil {
 				return errorResponse(err, "cannot create account state proof")
 			}
@@ -76,90 +74,34 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		return result
 	}
 
-	var config liveview.RunMethodConfigInfo
-	if info.masterCache != nil {
-		config, err = info.masterCache.RunMethodConfig(info.genUTime, account.StateInit.Code)
-	} else {
-		config, err = liveview.RunMethodConfig(info.master, info.masterState, info.genUTime, account.StateInit.Code)
-	}
-	if err != nil {
-		return errorResponse(err, "cannot load masterchain config")
-	}
-
-	var accountLibs *cell.Dictionary
-	if query.Mode&2 == 0 {
-		accountLibs = account.StateInit.Lib
-	}
-
-	var libraries []*cell.Cell
-	if info.masterCache != nil {
-		libraries, err = info.masterCache.RunMethodLibraries(accountLibs)
-	} else {
-		libraries, err = liveview.RunMethodLibraries(info.masterState, accountLibs)
-	}
-	if err != nil {
-		return errorResponse(err, "cannot load libraries")
-	}
-
-	c7, err := liveview.RunMethodC7(liveview.RunMethodC7Config{
+	exec, err := liveview.ExecuteRunMethod(s.tvm, account, liveview.RunMethodRequest{
+		Source: liveview.RunMethodSource{
+			Master:      info.master,
+			MasterState: info.masterState,
+			View:        info.masterCache,
+		},
 		Address:     account.Address,
-		Code:        account.StateInit.Code,
-		ConfigRoot:  config.Root,
-		HasConfig:   config.Present,
-		PrevBlocks:  config.PrevBlocks,
-		Unpacked:    config.Unpacked,
-		Precompiled: config.Precompiled,
+		AccountRoot: info.accountCell,
+		Stack:       stack,
 		Now:         info.genUTime,
 		LT:          info.genLT,
-		Balance:     liveview.AccountBalanceTuple(account),
-		DuePayment:  liveview.AccountDuePayment(account),
+		Proof:       query.Mode&2 != 0,
 	})
-	if err != nil {
-		return errorResponse(err, "cannot create c7")
-	}
-
-	execConfig := tvm.ExecutionConfig{
-		Libraries:        libraries,
-		GlobalVersion:    config.GlobalVersion,
-		GlobalVersionSet: true,
-	}
-
-	var execResult *tvm.ExecutionResult
-	if query.Mode&2 != 0 {
-		execConfig.AccountRoot = info.accountCell
-		execResult, err = s.tvm.ExecuteGetMethod(
-			nil,
-			nil,
-			c7,
-			vmcore.GasWithLimit(runMethodGasLimit),
-			stack,
-			execConfig,
-		)
-	} else {
-		execResult, err = s.tvm.ExecuteGetMethod(
-			account.StateInit.Code,
-			account.StateInit.Data,
-			c7,
-			vmcore.GasWithLimit(runMethodGasLimit),
-			stack,
-			execConfig,
-		)
-	}
 	if err != nil {
 		return errorResponse(err, "cannot run get method")
 	}
 
-	result.ExitCode = int32(execResult.ExitCode)
+	result.ExitCode = int32(exec.Result.ExitCode)
 
 	if query.Mode&4 != 0 {
-		resultStack, err := vmStackToCell(execResult.Stack)
+		resultStack, err := vmStackToCell(exec.Result.Stack)
 		if err != nil {
 			return errorResponse(err, "cannot serialize resulting stack")
 		}
 		result.Result = resultStack
 	}
 	if query.Mode&8 != 0 {
-		c7ForResult := c7
+		c7ForResult := exec.C7
 		if query.Mode&32 == 0 {
 			c7ForResult, err = liveview.RunMethodC7(liveview.RunMethodC7Config{
 				Address: account.Address,
@@ -178,7 +120,7 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 		}
 	}
 	if query.Mode&2 != 0 {
-		result.StateProof = execResult.Proof
+		result.StateProof = exec.Result.Proof
 	}
 
 	return result
@@ -218,16 +160,7 @@ func runMethodStack(methodID uint64, params []byte) (*vmcore.Stack, error) {
 		values = append(values, value)
 	}
 
-	vmStack := vmcore.NewStack()
-	for _, value := range values {
-		if err := pushVMStackValue(vmStack, value); err != nil {
-			return nil, err
-		}
-	}
-	if err := vmStack.PushInt(big.NewInt(int64(methodID))); err != nil {
-		return nil, err
-	}
-	return vmStack, nil
+	return liveview.NewRunMethodStack(methodID, values)
 }
 
 func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, mode uint32) (runMethodAccount, error) {
@@ -260,7 +193,7 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 		masterCache = fragments
 	}
 
-	shardFragments, err := s.blockFragments(ctx, ref.shard)
+	shardFragments, err := s.store.BlockFragments(ctx, ref.shard)
 	if err != nil {
 		return runMethodAccount{}, fmt.Errorf("load run method shard fragments: %w", err)
 	}
@@ -296,7 +229,7 @@ func (s *Server) runMethodAccount(ctx context.Context, id *ton.BlockIDExt, accou
 }
 
 func (s *Server) runMethodMasterState(ctx context.Context, shard ton.BlockIDExt) (ton.BlockIDExt, *cell.Cell, *liveview.BlockView, error) {
-	shardFragments, err := s.blockFragments(ctx, shard)
+	shardFragments, err := s.store.BlockFragments(ctx, shard)
 	if err != nil {
 		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("load shard state fragments: %w", err)
 	}
@@ -308,7 +241,7 @@ func (s *Server) runMethodMasterState(ctx context.Context, shard ton.BlockIDExt)
 	if err != nil {
 		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("load shard state master ref: %w", err)
 	}
-	fragments, err := s.blockFragments(ctx, master)
+	fragments, err := s.store.BlockFragments(ctx, master)
 	if err != nil {
 		return ton.BlockIDExt{}, nil, nil, fmt.Errorf("load master state fragments %s: %w", storage.FormatBlockRef(master), err)
 	}
@@ -397,42 +330,6 @@ func runMethodExtBlkRef(ref tlb.ExtBlkRef) ton.BlockIDExt {
 	}
 }
 
-func (s *Server) runMethodInactiveAccountProof(accountCell *cell.Cell) (*cell.Cell, error) {
-	res, err := s.tvm.ExecuteGetMethod(
-		nil,
-		nil,
-		tuple.Tuple{},
-		vmcore.GasWithLimit(runMethodGasLimit),
-		vmcore.NewStack(),
-		tvm.ExecutionConfig{AccountRoot: accountCell},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return res.Proof, nil
-}
-
-func pushVMStackValue(stack *vmcore.Stack, value any) error {
-	return stack.PushAny(tlbToVMStackValue(value))
-}
-
-func tlbToVMStackValue(value any) any {
-	switch v := value.(type) {
-	case []any:
-		values := make([]any, len(v))
-		for i := range v {
-			values[i] = tlbToVMStackValue(v[i])
-		}
-		return tuple.NewTupleValue(values...)
-	case tlb.StackNaN:
-		return vmcore.NaN{}
-	case *tlb.StackNaN:
-		return vmcore.NaN{}
-	default:
-		return value
-	}
-}
-
 func vmStackToCell(stack *vmcore.Stack) (*cell.Cell, error) {
 	cp := stack.Copy()
 	tlbStack := tlb.NewStack()
@@ -492,49 +389,4 @@ func stackValueToCell(value any) (*cell.Cell, error) {
 		return nil, err
 	}
 	return builder.EndCell(), nil
-}
-
-func normalizeTupleValues(values []any) []any {
-	out := make([]any, len(values))
-	for i, value := range values {
-		out[i] = normalizeTupleValue(value)
-	}
-	return out
-}
-
-func normalizeTupleValue(value any) any {
-	switch v := value.(type) {
-	case int:
-		return big.NewInt(int64(v))
-	case int8:
-		return big.NewInt(int64(v))
-	case int16:
-		return big.NewInt(int64(v))
-	case int32:
-		return big.NewInt(int64(v))
-	case int64:
-		return big.NewInt(v)
-	case uint8:
-		return new(big.Int).SetUint64(uint64(v))
-	case uint16:
-		return new(big.Int).SetUint64(uint64(v))
-	case uint32:
-		return new(big.Int).SetUint64(uint64(v))
-	case uint64:
-		return new(big.Int).SetUint64(v)
-	case *big.Int:
-		if v == nil {
-			return nil
-		}
-		return new(big.Int).Set(v)
-	default:
-		return value
-	}
-}
-
-func bigOrZero(value *big.Int) *big.Int {
-	if value == nil {
-		return big.NewInt(0)
-	}
-	return new(big.Int).Set(value)
 }

@@ -177,7 +177,7 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 			stack = append(stack, refCell)
 		}
 
-		if err := writer.add(current, currentMeta, refs); err != nil {
+		if err := writer.addWithHash(currentMeta.Hash, current, refs); err != nil {
 			return stateCellSaveStats{}, err
 		}
 		progress.processed++
@@ -308,7 +308,7 @@ type stateBOCRefs struct {
 	count int
 }
 
-type stateBOCRefLayout struct {
+type stateCellRecordLayout struct {
 	d1          byte
 	d2          byte
 	slowRefs    byte
@@ -376,17 +376,13 @@ func (s *Store) newStateCellBatchWriter(ctx context.Context, generation uint64) 
 	}, nil
 }
 
-func (w *stateCellBatchWriter) add(cl *cell.Cell, meta cell.Metadata, refs []cell.RefMetadata) error {
-	return w.addWithHash(meta.Hash, cl, refs)
-}
-
 func (w *stateCellBatchWriter) addWithHash(hash cell.Hash, cl *cell.Cell, refs []cell.RefMetadata) error {
-	valueLen, d1, d2, err := stateCellEncodedLen(cl, refs)
+	valueLen, layout, err := stateCellEncodedLen(cl, refs)
 	if err != nil {
 		return err
 	}
 	if err = w.cells.setDeferred(hash[:], valueLen, func(value []byte) {
-		encodeStateCellRecordTo(value, cl, refs, d1, d2)
+		encodeStateCellRecordTo(value, cl, refs, layout)
 	}); err != nil {
 		return err
 	}
@@ -403,24 +399,25 @@ func (w *stateCellBatchWriter) addBOCCell(cl cell.BOCCellView, refs *stateBOCRef
 	})
 }
 
-func stateCellEncodedLen(cl *cell.Cell, refs []cell.RefMetadata) (int, byte, byte, error) {
+func stateCellEncodedLen(cl *cell.Cell, refs []cell.RefMetadata) (int, stateCellRecordLayout, error) {
 	cellBits := cl.BitsSize()
 	if cellBits > 1023 {
-		return 0, 0, 0, fmt.Errorf("cell bits length is too large: %d", cellBits)
+		return 0, stateCellRecordLayout{}, fmt.Errorf("cell bits length is too large: %d", cellBits)
 	}
 	if len(refs) > 4 {
-		return 0, 0, 0, fmt.Errorf("cell refs count is too large: %d", len(refs))
+		return 0, stateCellRecordLayout{}, fmt.Errorf("cell refs count is too large: %d", len(refs))
 	}
 
 	d1, d2 := stateCellRecordDescriptors(cl, len(refs), cellBits)
+	layout := stateCellRecordLayout{d1: d1, d2: d2}
 	size := 2 + cl.SerializedBOCBodySize()
 	refsSize := 0
 	compactRefsSize := 1
 	hasCommonRef := false
-	for _, ref := range refs {
+	for i, ref := range refs {
 		hashesCount := storage.CellRefHashesCount(ref.LevelMask.Mask)
 		if len(ref.Hashes) != hashesCount || len(ref.Depths) != hashesCount {
-			return 0, 0, 0, fmt.Errorf("invalid ref metadata for %x: hashes=%d depths=%d want=%d", ref.Hash[:], len(ref.Hashes), len(ref.Depths), hashesCount)
+			return 0, stateCellRecordLayout{}, fmt.Errorf("invalid ref metadata for %x: hashes=%d depths=%d want=%d", ref.Hash[:], len(ref.Hashes), len(ref.Depths), hashesCount)
 		}
 		refSize := 1 + hashesCount*(cellRecordHashSize+cellRecordDepthSize)
 		refsSize += refSize
@@ -429,29 +426,31 @@ func stateCellEncodedLen(cl *cell.Cell, refs []cell.RefMetadata) (int, byte, byt
 			compactRefsSize += cellRecordHashSize + cellRecordDepthSize
 			continue
 		}
+		layout.slowRefs |= 1 << uint(i)
 		compactRefsSize += refSize
 	}
 	if hasCommonRef && compactRefsSize <= refsSize {
+		layout.compactRefs = true
 		size += compactRefsSize
 	} else {
 		size += refsSize
 	}
-	return size, d1, d2, nil
+	return size, layout, nil
 }
 
-func stateBOCCellEncodedLen(cl cell.BOCCellView, refs *stateBOCRefs) (int, stateBOCRefLayout, error) {
+func stateBOCCellEncodedLen(cl cell.BOCCellView, refs *stateBOCRefs) (int, stateCellRecordLayout, error) {
 	if refs.count > 4 {
-		return 0, stateBOCRefLayout{}, fmt.Errorf("cell refs count is too large: %d", refs.count)
+		return 0, stateCellRecordLayout{}, fmt.Errorf("cell refs count is too large: %d", refs.count)
 	}
 	if int(cl.D1&7) != refs.count {
-		return 0, stateBOCRefLayout{}, fmt.Errorf("cell refs count mismatch: descriptor=%d refs=%d", cl.D1&7, refs.count)
+		return 0, stateCellRecordLayout{}, fmt.Errorf("cell refs count mismatch: descriptor=%d refs=%d", cl.D1&7, refs.count)
 	}
 	dataLen := int(cl.D2/2 + cl.D2%2)
 	if len(cl.Body) != dataLen {
-		return 0, stateBOCRefLayout{}, fmt.Errorf("cell body size mismatch: got=%d want=%d", len(cl.Body), dataLen)
+		return 0, stateCellRecordLayout{}, fmt.Errorf("cell body size mismatch: got=%d want=%d", len(cl.Body), dataLen)
 	}
 
-	layout := stateBOCRefLayout{d1: cl.D1, d2: cl.D2}
+	layout := stateCellRecordLayout{d1: cl.D1, d2: cl.D2}
 	size := 2 + len(cl.Body)
 	refsSize := 0
 	compactRefsSize := 1
@@ -460,7 +459,7 @@ func stateBOCCellEncodedLen(cl cell.BOCCellView, refs *stateBOCRefs) (int, state
 		ref := refs.items[i]
 		hashesCount := storage.CellRefHashesCount(ref.LevelMask.Mask)
 		if int(ref.Count) < hashesCount {
-			return 0, stateBOCRefLayout{}, fmt.Errorf("invalid boc ref metadata for %x: hashes=%d want=%d", ref.Hash[:], ref.Count, hashesCount)
+			return 0, stateCellRecordLayout{}, fmt.Errorf("invalid boc ref metadata for %x: hashes=%d want=%d", ref.Hash[:], ref.Count, hashesCount)
 		}
 		refSize := 1 + hashesCount*(cellRecordHashSize+cellRecordDepthSize)
 		refsSize += refSize
@@ -489,29 +488,6 @@ func stateCellRefCommon(ref cell.RefMetadata) bool {
 	return ref.LevelMask.Mask == 0 && len(ref.Hashes) == 1 && len(ref.Depths) == 1
 }
 
-func stateCellCompactRefLayout(refs []cell.RefMetadata) (byte, bool) {
-	if len(refs) == 0 {
-		return 0, false
-	}
-
-	refsSize := 0
-	compactRefsSize := 1
-	hasCommonRef := false
-	var slowRefs byte
-	for i, ref := range refs {
-		refSize := 1 + len(ref.Hashes)*(cellRecordHashSize+cellRecordDepthSize)
-		refsSize += refSize
-		if stateCellRefCommon(ref) {
-			hasCommonRef = true
-			compactRefsSize += cellRecordHashSize + cellRecordDepthSize
-			continue
-		}
-		slowRefs |= 1 << uint(i)
-		compactRefsSize += refSize
-	}
-	return slowRefs, hasCommonRef && compactRefsSize <= refsSize
-}
-
 func stateCellRecordDescriptors(cl *cell.Cell, refsCount int, bitLen uint) (byte, byte) {
 	d1 := byte(refsCount)
 	if cl.IsSpecial() {
@@ -526,23 +502,23 @@ func stateCellRecordDescriptors(cl *cell.Cell, refsCount int, bitLen uint) (byte
 	return d1, d2
 }
 
-func encodeStateCellRecordTo(buf []byte, cl *cell.Cell, refs []cell.RefMetadata, d1 byte, d2 byte) {
-	slowRefs, compactRefs := stateCellCompactRefLayout(refs)
+func encodeStateCellRecordTo(buf []byte, cl *cell.Cell, refs []cell.RefMetadata, layout stateCellRecordLayout) {
 	pos := 0
-	if compactRefs {
+	d1 := layout.d1
+	if layout.compactRefs {
 		d1 |= cellRecordCompactRefsFlag
 	}
 	buf[pos] = d1
-	buf[pos+1] = d2
+	buf[pos+1] = layout.d2
 	pos += 2
 
 	pos += cl.SerializeBOCBodyTo(buf[pos:])
-	if compactRefs {
-		buf[pos] = slowRefs
+	if layout.compactRefs {
+		buf[pos] = layout.slowRefs
 		pos++
 	}
 	for i, ref := range refs {
-		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+		if layout.compactRefs && layout.slowRefs&(1<<uint(i)) == 0 {
 			copy(buf[pos:pos+cellRecordHashSize], ref.Hashes[0][:])
 			pos += cellRecordHashSize
 			binary.BigEndian.PutUint16(buf[pos:pos+cellRecordDepthSize], ref.Depths[0])
@@ -564,7 +540,7 @@ func encodeStateCellRecordTo(buf []byte, cl *cell.Cell, refs []cell.RefMetadata,
 	}
 }
 
-func encodeStateBOCCellRecordTo(buf []byte, cl cell.BOCCellView, refs *stateBOCRefs, layout stateBOCRefLayout) {
+func encodeStateBOCCellRecordTo(buf []byte, cl cell.BOCCellView, refs *stateBOCRefs, layout stateCellRecordLayout) {
 	pos := 0
 	d1 := layout.d1
 	if layout.compactRefs {

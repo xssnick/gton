@@ -216,12 +216,13 @@ func cloneServedBlockFullSharedPayload(block *storage.ServedBlockFull) *storage.
 		return nil
 	}
 	return &storage.ServedBlockFull{
-		ID:                     block.ID,
+		ID:                     cloneServiceBlockID(block.ID),
 		Proof:                  block.Proof,
 		Block:                  block.Block,
 		Meta:                   block.Meta.Clone(),
 		IsLink:                 block.IsLink,
 		ArchiveShardSplitDepth: block.ArchiveShardSplitDepth,
+		MessageEntries:         block.MessageEntries,
 	}
 }
 
@@ -229,5 +230,12 @@ func cloneServedBlockLinks(links []storage.ServedBlockLink) []storage.ServedBloc
 	if len(links) == 0 {
 		return nil
 	}
-	return append([]storage.ServedBlockLink(nil), links...)
+	cloned := make([]storage.ServedBlockLink, len(links))
+	for i := range links {
+		cloned[i] = storage.ServedBlockLink{
+			Prev: cloneServiceBlockID(links[i].Prev),
+			Next: cloneServiceBlockID(links[i].Next),
+		}
+	}
+	return cloned
 }

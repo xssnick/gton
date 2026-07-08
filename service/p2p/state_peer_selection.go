@@ -133,31 +133,45 @@ func (n *Node) prioritizeStateSnapshotPeers(peers []*overlayPeer) []*overlayPeer
 
 	leases := n.downloadPeerLeaseSnapshot(peers)
 	now := time.Now()
-	prioritized := append([]*overlayPeer(nil), peers...)
-	sort.SliceStable(prioritized, func(i, j int) bool {
-		left := prioritized[i]
-		right := prioritized[j]
-		leftStats := left.statsSnapshot()
-		rightStats := right.statsSnapshot()
-		leftLeases := leases[left.id]
-		rightLeases := leases[right.id]
 
-		leftSlow := leftStats.downloadSlowUntil.After(now)
-		rightSlow := rightStats.downloadSlowUntil.After(now)
-		if leftSlow != rightSlow {
-			return !leftSlow
+	type rankedStatePeer struct {
+		peer   *overlayPeer
+		slow   bool
+		score  float64
+		leases int
+	}
+	ranked := make([]rankedStatePeer, len(peers))
+	for i, peer := range peers {
+		stats := peer.statsSnapshot()
+		peerLeases := leases[peer.id]
+		ranked[i] = rankedStatePeer{
+			peer:   peer,
+			slow:   stats.downloadSlowUntil.After(now),
+			score:  downloadPeerScore(stats, statePeerSpeed(stats), peerLeases, now),
+			leases: peerLeases,
 		}
+	}
 
-		leftScore := downloadPeerScore(leftStats, statePeerSpeed(leftStats), leftLeases, now)
-		rightScore := downloadPeerScore(rightStats, statePeerSpeed(rightStats), rightLeases, now)
-		if leftScore != rightScore {
-			return leftScore > rightScore
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i]
+		right := ranked[j]
+
+		if left.slow != right.slow {
+			return !left.slow
 		}
-		if leftLeases != rightLeases {
-			return leftLeases < rightLeases
+		if left.score != right.score {
+			return left.score > right.score
+		}
+		if left.leases != right.leases {
+			return left.leases < right.leases
 		}
 		return false
 	})
+
+	prioritized := make([]*overlayPeer, len(ranked))
+	for i, entry := range ranked {
+		prioritized[i] = entry.peer
+	}
 	return prioritized
 }
 
@@ -168,34 +182,50 @@ func (n *Node) prioritizeBlockDownloadPeers(peers []*overlayPeer) []*overlayPeer
 
 	leases := n.downloadPeerLeaseSnapshot(peers)
 	now := time.Now()
-	prioritized := append([]*overlayPeer(nil), peers...)
-	sort.SliceStable(prioritized, func(i, j int) bool {
-		left := prioritized[i]
-		right := prioritized[j]
-		leftStats := left.statsSnapshot()
-		rightStats := right.statsSnapshot()
-		leftLeases := leases[left.id]
-		rightLeases := leases[right.id]
 
-		leftSlow := leftStats.downloadSlowUntil.After(now)
-		rightSlow := rightStats.downloadSlowUntil.After(now)
-		if leftSlow != rightSlow {
-			return !leftSlow
+	type rankedBlockPeer struct {
+		peer     *overlayPeer
+		slow     bool
+		score    float64
+		leases   int
+		bytesSec float64
+	}
+	ranked := make([]rankedBlockPeer, len(peers))
+	for i, peer := range peers {
+		stats := peer.statsSnapshot()
+		peerLeases := leases[peer.id]
+		ranked[i] = rankedBlockPeer{
+			peer:     peer,
+			slow:     stats.downloadSlowUntil.After(now),
+			score:    downloadPeerScore(stats, blockPeerSpeed(stats), peerLeases, now),
+			leases:   peerLeases,
+			bytesSec: stats.downloadBytesSec,
 		}
+	}
 
-		leftScore := downloadPeerScore(leftStats, blockPeerSpeed(leftStats), leftLeases, now)
-		rightScore := downloadPeerScore(rightStats, blockPeerSpeed(rightStats), rightLeases, now)
-		if leftScore != rightScore {
-			return leftScore > rightScore
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i]
+		right := ranked[j]
+
+		if left.slow != right.slow {
+			return !left.slow
 		}
-		if leftLeases != rightLeases {
-			return leftLeases < rightLeases
+		if left.score != right.score {
+			return left.score > right.score
 		}
-		if leftStats.downloadBytesSec != rightStats.downloadBytesSec {
-			return leftStats.downloadBytesSec > rightStats.downloadBytesSec
+		if left.leases != right.leases {
+			return left.leases < right.leases
+		}
+		if left.bytesSec != right.bytesSec {
+			return left.bytesSec > right.bytesSec
 		}
 		return false
 	})
+
+	prioritized := make([]*overlayPeer, len(ranked))
+	for i, entry := range ranked {
+		prioritized[i] = entry.peer
+	}
 	return prioritized
 }
 
@@ -210,12 +240,22 @@ func (s *overlaySubscription) prioritizeLiveNextPeers(peers []*overlayPeer, pref
 		leases = s.node.downloadPeerLeaseSnapshot(peers)
 	}
 
-	prioritized := append([]*overlayPeer(nil), peers...)
-	sort.SliceStable(prioritized, func(i, j int) bool {
-		leftPeer := prioritized[i]
-		rightPeer := prioritized[j]
-		left := liveNextPeerRankFor(leftPeer, preferredPeerID, states[leftPeer.id], leases[leftPeer.id], now)
-		right := liveNextPeerRankFor(rightPeer, preferredPeerID, states[rightPeer.id], leases[rightPeer.id], now)
+	// Rank once per peer (one statsSnapshot each) instead of per comparison.
+	type rankedLiveNextPeer struct {
+		peer *overlayPeer
+		rank liveNextPeerRank
+	}
+	ranked := make([]rankedLiveNextPeer, len(peers))
+	for i, peer := range peers {
+		ranked[i] = rankedLiveNextPeer{
+			peer: peer,
+			rank: liveNextPeerRankFor(peer, preferredPeerID, states[peer.id], leases[peer.id], now),
+		}
+	}
+
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i].rank
+		right := ranked[j].rank
 
 		if left.unavailable != right.unavailable {
 			return !left.unavailable
@@ -252,6 +292,11 @@ func (s *overlaySubscription) prioritizeLiveNextPeers(peers []*overlayPeer, pref
 		}
 		return false
 	})
+
+	prioritized := make([]*overlayPeer, len(ranked))
+	for i, entry := range ranked {
+		prioritized[i] = entry.peer
+	}
 	return prioritized
 }
 

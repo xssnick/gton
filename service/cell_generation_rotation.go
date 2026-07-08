@@ -309,10 +309,6 @@ func (s *Service) beginPendingCellGenerationMigration(ctx context.Context) (*exc
 	return &exclusiveServiceTaskLease{service: s, task: exclusiveServiceTaskCellGenerationMigration}, nil
 }
 
-func (s *Service) cellGenerationMigrationActive() bool {
-	return s.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration)
-}
-
 func (s *Service) StopCellGenerationMigration(ctx context.Context) error {
 	store := s.storage
 

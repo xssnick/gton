@@ -143,22 +143,24 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	defer stopPprof()
 	startPprof(pprofCtx, logger, strings.TrimSpace(startOpts.PprofAddr))
 
-	globalConfig, err := prepareGlobalConfig(context.Background(), logger, cfg, startOpts.GlobalConfigURL, startOpts.ReplaceGlobalConfig)
+	runtimeOpts, err := cfg.RuntimeOptions(startOpts.Node)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
-	runOpts, err := cfg.NodeOptions(startOpts.Node)
+	globalConfig, err := prepareGlobalConfig(context.Background(), logger, runtimeOpts.GlobalConfigPath, startOpts.GlobalConfigURL, startOpts.ReplaceGlobalConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+
+	runOpts := runtimeOpts.Node
 	runOpts.GlobalConfig = globalConfig
 	runOpts.Logger = logs.Base()
 	runOpts.ConsoleInput = os.Stdin
 	runOpts.ConsoleOutput = os.Stdout
-	liteOpts, err := configureLiteserver(&runOpts, cfg, globalConfig, liteQueryConcurrency)
+	liteOpts, liteExtension, err := configureLiteserver(&runOpts, cfg, runtimeOpts, globalConfig, liteQueryConcurrency)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -177,12 +179,37 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		Int("liteserver_max_waits_per_ip", liteOpts.Limits.MaxWaitsPerIP).
 		Msg("configured liteserver")
 
-	if len(extensions) > 0 {
-		var ext hooks.ExtensionComposer = extensions
-		if runOpts.Extension != nil {
-			ext = append(extensions, runOpts.Extension)
-		}
-		runOpts.Extension = ext.New
+	httpOpts, httpExtension, err := configureHTTPAPI(cfg, runtimeOpts, globalConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	logger.Info().
+		Bool("http_api", httpOpts.Enabled).
+		Str("http_api_listen_addr", fallbackString(httpOpts.ListenAddr, "<disabled>")).
+		Dur("http_api_request_timeout", httpOpts.RequestTimeout).
+		Msg("configured http api")
+
+	// Single extension composition site: user-provided extensions first, kept
+	// as-is (nil entries still fail fast inside RunNode), then any factory
+	// already present on the node options, then the internal liteserver and
+	// HTTP API extensions.
+	factories := make(hooks.ExtensionComposer, 0, len(extensions)+3)
+	factories = append(factories, extensions...)
+	if runOpts.Extension != nil {
+		factories = append(factories, runOpts.Extension)
+	}
+	if liteExtension != nil {
+		factories = append(factories, liteExtension)
+	}
+	if httpExtension != nil {
+		factories = append(factories, httpExtension)
+	}
+	switch {
+	case len(factories) == 1 && factories[0] != nil:
+		runOpts.Extension = factories[0]
+	case len(factories) > 0:
+		runOpts.Extension = factories.New
 	}
 
 	err = gton.RunNode(context.Background(), runOpts)
@@ -289,8 +316,7 @@ func loadNodeConfig(ctx context.Context, path string, keyOnly bool) (nodeconfig.
 	return result.Config, result.Created, nil
 }
 
-func prepareGlobalConfig(ctx context.Context, logger zerolog.Logger, cfg nodeconfig.Config, url string, replace bool) (*liteclient.GlobalConfig, error) {
-	path := cfg.GlobalConfigPath()
+func prepareGlobalConfig(ctx context.Context, logger zerolog.Logger, path string, url string, replace bool) (*liteclient.GlobalConfig, error) {
 	result, err := nodeconfig.EnsureGlobalConfig(ctx, path, url, replace)
 	if err != nil {
 		logger.Error().

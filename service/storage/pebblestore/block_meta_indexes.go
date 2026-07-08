@@ -125,24 +125,20 @@ func validateStoredBlockMetaUpdate(meta *storage.BlockMeta) error {
 }
 
 func validateBlockMetaBlockIDHashes(meta *storage.BlockMeta) error {
-	if err := validateFullBlockIDHashes(meta.ID); err != nil {
+	if err := storage.ValidateBlockIDHashes(meta.ID); err != nil {
 		return err
 	}
 	for _, ref := range meta.PrevRefs {
-		if err := validateFullBlockIDHashes(ref); err != nil {
+		if err := storage.ValidateBlockIDHashes(ref); err != nil {
 			return err
 		}
 	}
 	for _, ref := range meta.NextRefs {
-		if err := validateFullBlockIDHashes(ref); err != nil {
+		if err := storage.ValidateBlockIDHashes(ref); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func validateFullBlockIDHashes(id ton.BlockIDExt) error {
-	return storage.ValidateBlockIDHashes(id)
 }
 
 func validateFixedHash(label string, hash []byte) error {
@@ -180,6 +176,26 @@ func (s *Store) LookupBlockBySeqNo(ctx context.Context, ref storage.BlockSeqRef)
 }
 
 func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]ton.BlockIDExt, error) {
+	metas, err := s.nextKeyBlockMetas(ctx, after, limit, true)
+	if err != nil {
+		return nil, err
+	}
+
+	blocks := make([]ton.BlockIDExt, 0, len(metas))
+	for _, meta := range metas {
+		blocks = append(blocks, meta.ID)
+	}
+	return blocks, nil
+}
+
+// NextKeyBlockMetas returns metadata for known key blocks with seqno > after in
+// ascending order. Unlike NextKeyBlocks, which serves peers and therefore only
+// returns blocks whose full data is served, it has no served-full requirement.
+func (s *Store) NextKeyBlockMetas(ctx context.Context, after uint32, limit int) ([]*storage.BlockMeta, error) {
+	return s.nextKeyBlockMetas(ctx, after, limit, false)
+}
+
+func (s *Store) nextKeyBlockMetas(ctx context.Context, after uint32, limit int, requireServedFull bool) ([]*storage.BlockMeta, error) {
 	if limit <= 0 || after == ^uint32(0) {
 		return nil, storage.ErrNotFound
 	}
@@ -202,8 +218,8 @@ func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]t
 	}
 	defer func() { _ = iter.Close() }()
 
-	blocks := make([]ton.BlockIDExt, 0, limit)
-	for ok := iter.SeekGE(hotKeyKeyBlockSeqIndex(after + 1)); ok && len(blocks) < limit; ok = iter.Next() {
+	metas := make([]*storage.BlockMeta, 0, limit)
+	for ok := iter.SeekGE(hotKeyKeyBlockSeqIndex(after + 1)); ok && len(metas) < limit; ok = iter.Next() {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -234,18 +250,21 @@ func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]t
 		if err != nil {
 			return nil, err
 		}
-		if !meta.Has(storage.BlockMetaIsKeyBlock) || !meta.Has(storage.BlockMetaHasServedFull) {
+		if !meta.Has(storage.BlockMetaIsKeyBlock) {
 			continue
 		}
-		blocks = append(blocks, block)
+		if requireServedFull && !meta.Has(storage.BlockMetaHasServedFull) {
+			continue
+		}
+		metas = append(metas, meta)
 	}
 	if err = iter.Error(); err != nil {
 		return nil, err
 	}
-	if len(blocks) == 0 {
+	if len(metas) == 0 {
 		return nil, storage.ErrNotFound
 	}
-	return blocks, nil
+	return metas, nil
 }
 
 func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
@@ -432,7 +451,7 @@ func setBlockMetaHistoryIndexes(batch *pebble.Batch, existing *storage.BlockMeta
 	if !blockMetaIndexedInHistory(meta) {
 		return nil
 	}
-	if err := validateFullBlockIDHashes(meta.ID); err != nil {
+	if err := storage.ValidateBlockIDHashes(meta.ID); err != nil {
 		return err
 	}
 	ref := storage.BlockSeqRefFromBlock(meta.ID)
@@ -625,11 +644,11 @@ func blockMetaServedFullFromReader(reader pebbleReader, block ton.BlockIDExt) (b
 	}
 	defer func() { _ = closer.Close() }()
 
-	meta, err := decodeBlockMeta(block, metaRaw)
+	flags, err := decodeBlockMetaFlags(metaRaw)
 	if err != nil {
 		return false, err
 	}
-	return meta.Has(storage.BlockMetaHasServedFull), nil
+	return flags&storage.BlockMetaHasServedFull != 0, nil
 }
 
 func decodeKeyBlockSeqIndexKey(key []byte) (uint32, error) {

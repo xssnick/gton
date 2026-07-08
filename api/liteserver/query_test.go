@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	"github.com/xssnick/gton/service/blockproof"
 	admission "github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/p2p"
@@ -232,6 +234,7 @@ func TestHandleSendMessageForwardsExternalBOC(t *testing.T) {
 	}
 
 	srv.allowDuplicateExternals = true
+	srv.externalMessageSender = nil
 	allowedDup := srv.handleQuery(context.Background(), ton.SendMessage{Body: body})
 	allowedStatus, ok := allowedDup.(ton.SendMessageStatus)
 	if !ok {
@@ -515,7 +518,7 @@ func TestHandleSendMessageRejectsAddressOverLimitBeforeTVM(t *testing.T) {
 	srv := testServer(&fakeStore{})
 	srv.messageSender = &fakeMessageSender{}
 
-	key := externalMessageAddressKey(addr)
+	key := admission.AddressKey(addr)
 	now := srv.now()
 	for i := 0; i < extmsg.DefaultAddressLimit; i++ {
 		if err := srv.externalMessageLimiter.Add(key, now); err != nil {
@@ -839,7 +842,7 @@ func TestLiveStoreCachedBlockRootKeepsSharedUnflushedBlockPinned(t *testing.T) {
 	firstRoot := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	firstData := testBlockBOC(firstRoot)
 	first := testBlockIDForData(masterchainID, masterchainShard, 51, firstRoot, firstData)
-	if err := shared.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	if err := shared.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
 		Block:     first,
 		BlockData: firstData,
 	}); err != nil {
@@ -857,7 +860,7 @@ func TestLiveStoreCachedBlockRootKeepsSharedUnflushedBlockPinned(t *testing.T) {
 	secondRoot := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
 	secondData := testBlockBOC(secondRoot)
 	second := testBlockIDForData(masterchainID, masterchainShard, 52, secondRoot, secondData)
-	if err = shared.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	if err = shared.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
 		Block:     second,
 		BlockData: secondData,
 	}); err != nil {
@@ -2356,7 +2359,7 @@ func TestGetBlockProofForwardDestProofUsesVirtualizedStoredProofRoot(t *testing.
 func TestBlockHeaderProofBOCVirtualizesNonZeroLevelSourceRoot(t *testing.T) {
 	stateRoot := cell.BeginCell().MustStoreUInt(0xbb, 8).EndCell()
 	id, root := testBlockForState(t, masterchainID, masterchainShard, 7, stateRoot)
-	storedProof, err := blockStateRootProof(root)
+	storedProof, err := blockproof.BlockStateRootProof(root)
 	if err != nil {
 		t.Fatalf("create block state root proof: %v", err)
 	}
@@ -2368,7 +2371,7 @@ func TestBlockHeaderProofBOCVirtualizesNonZeroLevelSourceRoot(t *testing.T) {
 		t.Fatal("test source root should have non-zero level")
 	}
 
-	headerProof, err := blockHeaderProofBOC(sourceRoot, id, 0)
+	headerProof, err := blockproof.BlockHeaderProofBOC(sourceRoot, id, 0)
 	if err != nil {
 		t.Fatalf("create header proof: %v", err)
 	}
@@ -2466,7 +2469,7 @@ func TestStoredMasterProofExportsKeyBlockLinkFromFullProof(t *testing.T) {
 		},
 	}
 
-	data, err := testServer(store).storedMasterProof(context.Background(), keyID, true)
+	data, err := blockproof.StoredMasterProof(context.Background(), store, keyID, true)
 	if err != nil {
 		t.Fatalf("stored master proof: %v", err)
 	}
@@ -2517,7 +2520,7 @@ func TestStoredMasterProofUsesStoredLinkWhenFullProofIsAbsent(t *testing.T) {
 		},
 	}
 
-	gotRoot, parsed, err := testServer(store).storedMasterProofRoot(context.Background(), keyID, true)
+	gotRoot, parsed, err := blockproof.StoredMasterProofRoot(context.Background(), store, keyID, true)
 	if err != nil {
 		t.Fatalf("stored master proof root: %v", err)
 	}
@@ -2552,7 +2555,7 @@ func TestStoredMasterProofAcceptsStoredMasterLinkWithSignatures(t *testing.T) {
 		},
 	}
 
-	gotRoot, parsed, err := testServer(store).storedMasterProofRoot(context.Background(), keyID, true)
+	gotRoot, parsed, err := blockproof.StoredMasterProofRoot(context.Background(), store, keyID, true)
 	if err != nil {
 		t.Fatalf("stored master proof root: %v", err)
 	}
@@ -2584,7 +2587,7 @@ func TestStoredMasterProofDoesNotFallbackFromKeyBlockToOrdinaryProof(t *testing.
 		},
 	}
 
-	_, err := testServer(store).storedMasterProof(context.Background(), keyID, true)
+	_, err := blockproof.StoredMasterProof(context.Background(), store, keyID, true)
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("stored master proof error = %v, want ErrNotFound", err)
 	}
@@ -3430,9 +3433,15 @@ func TestRunMethodConfigBuildsCppC7Extras(t *testing.T) {
 	if !ok || unpacked.Len() != 7 {
 		t.Fatalf("unpacked config = %#v, want tuple len 7", cfg.Unpacked)
 	}
+	// The c7 storage-prices entry is the raw dict value slice of the window
+	// active at now (C++-exact, see tvm currentStoragePricesSlice): magic #cc
+	// then valid_since. At now=1500 the active window is since=1000.
 	storagePrices := testSliceAt(t, unpacked, 0)
-	if got, err := storagePrices.LoadUInt(16); err != nil || got != 0x1000 {
-		t.Fatalf("storage price marker = (%x, %v), want 1000", got, err)
+	if got, err := storagePrices.LoadUInt(8); err != nil || got != 0xcc {
+		t.Fatalf("storage price magic = (%x, %v), want cc", got, err)
+	}
+	if got, err := storagePrices.LoadUInt(32); err != nil || got != 1000 {
+		t.Fatalf("storage price valid_since = (%d, %v), want 1000 (active at now=1500)", got, err)
 	}
 	globalID := testSliceAt(t, unpacked, 1)
 	if got, err := globalID.LoadUInt(32); err != nil || got != 0x12345678 {
@@ -3572,7 +3581,7 @@ func TestBlockFragmentsSkipsBlockMetaOnSuccessfulLoad(t *testing.T) {
 	}
 	srv := testServer(store)
 
-	fragments, err := srv.blockFragments(context.Background(), id)
+	fragments, err := srv.store.BlockFragments(context.Background(), id)
 	if err != nil {
 		t.Fatalf("block fragments: %v", err)
 	}
@@ -3891,7 +3900,7 @@ func TestHandleConfigParamsStateInfoFlagsIncludeRequestedStateRoots(t *testing.T
 	}
 
 	body = mustUnwrapProof(t, cfg.ConfigProof, shardStateRoot.Hash(0))
-	extra, err := loadMcStateExtraPrefix(body)
+	extra, err := blockproof.LoadMcStateExtraPrefix(body, true)
 	if err != nil {
 		t.Fatalf("load master state extra from proof: %v", err)
 	}
@@ -4119,7 +4128,7 @@ func TestShardHashesProofFollowsRequestedShardPath(t *testing.T) {
 	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 14}
 	stateRoot := testMasterStateWithShardHashes(t, base, testForkedShardHashes(t, left, right))
 
-	proof, err := shardHashesProof(stateRoot, left.Workchain, 1, false)
+	proof, err := blockproof.ShardHashesProof(stateRoot, left.Workchain, 1, false)
 	if err != nil {
 		t.Fatalf("create shard hashes proof: %v", err)
 	}
@@ -4132,7 +4141,7 @@ func TestShardHashesProofFollowsRequestedShardPath(t *testing.T) {
 		t.Fatalf("load master state extra from proof: %v", err)
 	}
 
-	got, _, err := shardInfoFromHashes(extra.ShardHashes, left.Workchain, left.Shard, true)
+	got, _, err := blockproof.ShardInfoFromHashes(extra.ShardHashes, left.Workchain, left.Shard, true)
 	if err != nil {
 		t.Fatalf("load selected shard from proof: %v", err)
 	}
@@ -4140,7 +4149,7 @@ func TestShardHashesProofFollowsRequestedShardPath(t *testing.T) {
 		t.Fatalf("selected shard = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
 	}
 
-	if _, _, err = shardInfoFromHashes(extra.ShardHashes, right.Workchain, right.Shard, true); err == nil {
+	if _, _, err = blockproof.ShardInfoFromHashes(extra.ShardHashes, right.Workchain, right.Shard, true); err == nil {
 		t.Fatal("expected sibling shard branch to stay pruned")
 	}
 }
@@ -4728,7 +4737,8 @@ func TestWaitMasterchainSeqnoPrefixRunsWrappedQueryAfterLiveState(t *testing.T) 
 
 	done := make(chan tl.Serializable, 1)
 	go func() {
-		done <- srv.handleQueryData(context.Background(), parsed, nil)
+		resp, _ := srv.handleQueryDataWithTiming(context.Background(), parsed, nil)
+		done <- resp
 	}()
 
 	select {
@@ -4787,7 +4797,8 @@ func TestWaitMasterchainSeqnoPrefixWaitsForReadableLiveCurrent(t *testing.T) {
 
 	done := make(chan tl.Serializable, 1)
 	go func() {
-		done <- srv.handleQueryData(context.Background(), req, nil)
+		resp, _ := srv.handleQueryDataWithTiming(context.Background(), req, nil)
+		done <- resp
 	}()
 
 	select {
@@ -4827,7 +4838,7 @@ func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 		ton.WaitMasterchainSeqno{Seqno: 21, Timeout: 1},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
-	resp := srv.handleQueryData(context.Background(), timeoutReq, nil)
+	resp, _ := srv.handleQueryDataWithTiming(context.Background(), timeoutReq, nil)
 	errResp, ok := resp.(ton.LSError)
 	if !ok {
 		t.Fatalf("timeout response type = %T, want ton.LSError: %+v", resp, resp)
@@ -4840,7 +4851,7 @@ func TestWaitMasterchainSeqnoPrefixErrors(t *testing.T) {
 		ton.WaitMasterchainSeqno{Seqno: 121, Timeout: 500},
 		ton.GetMasterchainInfoExt{Mode: 0},
 	)
-	resp = srv.handleQueryData(context.Background(), tooFarReq, nil)
+	resp, _ = srv.handleQueryDataWithTiming(context.Background(), tooFarReq, nil)
 	errResp, ok = resp.(ton.LSError)
 	if !ok {
 		t.Fatalf("too-far response type = %T, want ton.LSError: %+v", resp, resp)
@@ -5152,7 +5163,7 @@ func testServer(store Store) *Server {
 		version:                DefaultVersion,
 		capabilities:           DefaultCapabilities,
 		tvm:                    tvmInstance,
-		sendMessageCache:       newSendMessageCache(),
+		sendMessageCache:       admission.NewMessageCache(),
 		externalMessageChecker: checker,
 		externalMessageLimiter: extmsg.NewDefaultAddressLimiter(),
 		respCache:              newLiteResponseCache(),
@@ -5449,7 +5460,7 @@ func testShardStateWithAccount(t *testing.T, block ton.BlockIDExt, accountID []b
 	if err != nil {
 		t.Fatalf("build shard account: %v", err)
 	}
-	if err = accounts.Set(accountKey(accountID), shardAccount); err != nil {
+	if err = accounts.Set(blockproof.AccountKey(accountID), shardAccount); err != nil {
 		t.Fatalf("set shard account: %v", err)
 	}
 
@@ -5502,7 +5513,7 @@ func testMasterStateWithActiveAccountLibrarySets(t *testing.T, block ton.BlockID
 	if err != nil {
 		t.Fatalf("build shard account: %v", err)
 	}
-	if err = accounts.Set(accountKey(accountID), shardAccount); err != nil {
+	if err = accounts.Set(blockproof.AccountKey(accountID), shardAccount); err != nil {
 		t.Fatalf("set shard account: %v", err)
 	}
 
@@ -5536,7 +5547,7 @@ func testMasterStateWithActiveAccountLibrarySets(t *testing.T, block ton.BlockID
 	libDict := cell.NewDict(256)
 	for _, lib := range globalLibs {
 		descr := cell.BeginCell().MustStoreUInt(0, 2).MustStoreRef(lib).EndCell()
-		if err = libDict.Set(accountKey(lib.Hash()), descr); err != nil {
+		if err = libDict.Set(blockproof.AccountKey(lib.Hash()), descr); err != nil {
 			t.Fatalf("set library: %v", err)
 		}
 	}
@@ -5578,7 +5589,7 @@ func testActiveAccountCellWithStateLibraries(t *testing.T, workchain int32, acco
 	libDict := cell.NewDict(256)
 	for _, lib := range libs {
 		descr := cell.BeginCell().MustStoreUInt(0, 2).MustStoreRef(lib).EndCell()
-		if err := libDict.Set(accountKey(lib.Hash()), descr); err != nil {
+		if err := libDict.Set(blockproof.AccountKey(lib.Hash()), descr); err != nil {
 			t.Fatalf("set account library: %v", err)
 		}
 	}
@@ -5948,12 +5959,24 @@ func testGlobalVersionCell(t *testing.T, version uint32) *cell.Cell {
 func testStoragePricesConfigCell(t *testing.T) *cell.Cell {
 	t.Helper()
 
+	// Config param 18 is Hashmap 32 ConfigStoragePrices keyed by valid_since;
+	// tvm.PrepareConfig requires valid #cc entries whose valid_since equals the
+	// key. Two windows (since 1000 and 2000) so now=1500 selects the 1000 one.
 	dict := cell.NewDict(32)
-	if err := dict.SetIntKey(big.NewInt(1000), cell.BeginCell().MustStoreUInt(0x1000, 16).EndCell()); err != nil {
-		t.Fatalf("set active storage prices: %v", err)
-	}
-	if err := dict.SetIntKey(big.NewInt(2000), cell.BeginCell().MustStoreUInt(0x2000, 16).EndCell()); err != nil {
-		t.Fatalf("set future storage prices: %v", err)
+	for _, since := range []uint32{1000, 2000} {
+		value, err := tlb.ToCell(&tlb.ConfigStoragePrices{
+			ValidSince:  since,
+			BitPrice:    uint64(since) + 1,
+			CellPrice:   uint64(since) + 2,
+			MCBitPrice:  uint64(since) + 3,
+			MCCellPrice: uint64(since) + 4,
+		})
+		if err != nil {
+			t.Fatalf("build storage prices %d: %v", since, err)
+		}
+		if err := dict.SetIntKey(big.NewInt(int64(since)), value); err != nil {
+			t.Fatalf("set storage prices %d: %v", since, err)
+		}
 	}
 	return dict.AsCell()
 }
@@ -5966,7 +5989,7 @@ func testPrecompiledConfigCell(t *testing.T, codeHash []byte, gas uint64) *cell.
 	if err != nil {
 		t.Fatalf("build precompiled smc: %v", err)
 	}
-	if err = list.Set(accountKey(codeHash), smc); err != nil {
+	if err = list.Set(blockproof.AccountKey(codeHash), smc); err != nil {
 		t.Fatalf("set precompiled smc: %v", err)
 	}
 
@@ -6093,7 +6116,7 @@ func testMasterStateWithLibraries(t *testing.T, block ton.BlockIDExt, libs []*ce
 	libDict := cell.NewDict(256)
 	for _, lib := range libs {
 		descr := cell.BeginCell().MustStoreUInt(0, 2).MustStoreRef(lib).MustStoreDict(cell.NewDict(256)).EndCell()
-		if err := libDict.Set(accountKey(lib.Hash()), descr); err != nil {
+		if err := libDict.Set(blockproof.AccountKey(lib.Hash()), descr); err != nil {
 			t.Fatalf("set library: %v", err)
 		}
 	}
@@ -6320,7 +6343,7 @@ func testDispatchQueue(t *testing.T, accounts ...testDispatchQueueAccount) *cell
 			MustStoreDict(messages).
 			MustStoreUInt(uint64(len(account.lts)), 48).
 			EndCell()
-		if err = dispatchQueue.Set(accountKey(account.addr), accountQueue); err != nil {
+		if err = dispatchQueue.Set(blockproof.AccountKey(account.addr), accountQueue); err != nil {
 			t.Fatalf("set dispatch queue account: %v", err)
 		}
 	}
@@ -6389,7 +6412,7 @@ func testBlockWithTransactionsAndInMsgDesc(t *testing.T, workchain int32, shard 
 	if err != nil {
 		t.Fatalf("create account blocks dict: %v", err)
 	}
-	if err = accountBlocks.Set(accountKey(account), accountBlock); err != nil {
+	if err = accountBlocks.Set(blockproof.AccountKey(account), accountBlock); err != nil {
 		t.Fatalf("set account block: %v", err)
 	}
 
@@ -6552,7 +6575,7 @@ func testInMsgDescr(t *testing.T, msg, envelope, tx *cell.Cell) *cell.Cell {
 		MustStoreRef(tx).
 		MustStoreCoins(0).
 		EndCell()
-	if err = dict.Set(accountKey(msg.Hash()), value); err != nil {
+	if err = dict.Set(blockproof.AccountKey(msg.Hash()), value); err != nil {
 		t.Fatalf("set inbound message descriptor: %v", err)
 	}
 
@@ -6810,6 +6833,7 @@ type fakeStore struct {
 	zeroStates  map[storage.BlockRootHash][]byte
 	ltLookup    map[fakeLTLookupKey]ton.BlockIDExt
 	utimeLookup map[fakeUnixLookupKey]ton.BlockIDExt
+	msgLookup   map[fakeMessageLookupKey]storage.MessageTransactionRef
 
 	seqLookupByKey       map[fakeSeqLookupKey]ton.BlockIDExt
 	blockDataCalls       int
@@ -6817,6 +6841,7 @@ type fakeStore struct {
 	ltLookupCalls        int
 	accountLTLookupCalls int
 	utimeLookupCalls     int
+	msgLookupCalls       int
 	currentCalls         int
 	blockStateCalls      int
 	blockMetaCalls       int
@@ -6883,6 +6908,11 @@ type fakeUnixLookupKey struct {
 
 func fakeUnixKey(key storage.BlockHistoryKey, utime uint32) fakeUnixLookupKey {
 	return fakeUnixLookupKey{workchain: key.Workchain, shard: key.Shard, utime: utime}
+}
+
+type fakeMessageLookupKey struct {
+	kind storage.MessageTransactionKind
+	key  storage.MessageTransactionKey
 }
 
 type fakeMessageSender struct {
@@ -7010,7 +7040,7 @@ func testBlockProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.Cell,
 func testBlockStateRootProofEnvelopeBOC(t *testing.T, id ton.BlockIDExt, root *cell.Cell, signatures *cell.Cell) []byte {
 	t.Helper()
 
-	proof, err := blockStateRootProof(root)
+	proof, err := blockproof.BlockStateRootProof(root)
 	if err != nil {
 		t.Fatalf("create block state root proof: %v", err)
 	}
@@ -7266,4 +7296,160 @@ func (s *fakeStore) LookupBlockByUnixTime(_ context.Context, key storage.BlockHi
 		return *cloneBlockID(block), nil
 	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func (s *fakeStore) LookupMessageTransaction(_ context.Context, kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, error) {
+	s.msgLookupCalls++
+	if ref, ok := s.msgLookup[fakeMessageLookupKey{kind: kind, key: key}]; ok {
+		return ref, nil
+	}
+	return storage.MessageTransactionRef{}, storage.ErrNotFound
+}
+
+func accountPrunedProof(account *cell.Cell) (*cell.Cell, error) {
+	source, err := account.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
+	root := source.BaseCell().WithTrace(nil)
+	builder := blockproof.NewProofBuilder(root)
+	loader, err := builder.Root().BeginParse()
+	if err != nil {
+		return nil, err
+	}
+	if err = visitPrunedAccount(loader); err != nil {
+		return nil, err
+	}
+	return builder.CreateProof()
+}
+
+func visitPrunedAccount(loader *cell.Slice) error {
+	isAccount, err := loader.LoadBoolBit()
+	if err != nil || !isAccount {
+		return err
+	}
+
+	if _, err = loader.LoadAddr(); err != nil {
+		return err
+	}
+
+	var storageInfo tlb.StorageInfo
+	if err = tlb.LoadFromCell(&storageInfo, loader); err != nil {
+		return err
+	}
+
+	if _, err = loader.LoadUInt(64); err != nil {
+		return err
+	}
+	if _, err = loader.LoadBigCoins(); err != nil {
+		return err
+	}
+
+	extraCurrencies, err := loader.LoadDict(32)
+	if err != nil {
+		return err
+	}
+	if extraCurrencies != nil && !extraCurrencies.IsEmpty() {
+		if _, err = extraCurrencies.LoadAll(); err != nil {
+			return err
+		}
+	}
+
+	active, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if active {
+		return skipPrunedStateInit(loader)
+	}
+
+	frozen, err := loader.LoadBoolBit()
+	if err != nil || !frozen {
+		return err
+	}
+	_, err = loader.LoadSlice(256)
+	return err
+}
+
+func skipPrunedStateInit(loader *cell.Slice) error {
+	hasDepth, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if hasDepth {
+		if _, err = loader.LoadUInt(5); err != nil {
+			return err
+		}
+	}
+
+	hasTickTock, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if hasTickTock {
+		if _, err = loader.LoadBoolBit(); err != nil {
+			return err
+		}
+		if _, err = loader.LoadBoolBit(); err != nil {
+			return err
+		}
+	}
+
+	for range 3 {
+		hasRef, err := loader.LoadBoolBit()
+		if err != nil {
+			return err
+		}
+		if hasRef {
+			if err = loader.SkipBitsAndRefs(0, 1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func mcStateExtra(root *cell.Cell) (*tlb.McStateExtra, error) {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
+	var state tlb.ShardStateUnsplit
+	if err := tlb.LoadFromCell(&state, loader); err != nil {
+		return nil, err
+	}
+	if state.McStateExtra == nil {
+		return nil, fmt.Errorf("state is missing mc_state_extra")
+	}
+
+	extraLoader, err := state.McStateExtra.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+
+	var extra tlb.McStateExtra
+	if err := tlb.LoadFromCell(&extra, extraLoader); err != nil {
+		return nil, err
+	}
+	return &extra, nil
+}
+
+func currentMasterchainInfo(current *storage.CurrentState) (ton.BlockIDExt, []byte, uint32, error) {
+	if current == nil {
+		return ton.BlockIDExt{}, nil, 0, storage.ErrNotFound
+	}
+
+	block := current.Masterchain.Block
+	stateRoot := current.Masterchain.StateRootHash
+	lastUTime := uint32(0)
+	if current.Masterchain.Parsed != nil {
+		lastUTime = current.Masterchain.Parsed.GenUTime
+	}
+
+	if len(stateRoot) != 32 {
+		return ton.BlockIDExt{}, nil, 0, fmt.Errorf("masterchain state root hash is missing")
+	}
+	return block, stateRoot, lastUTime, nil
 }

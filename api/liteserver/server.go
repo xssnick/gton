@@ -99,7 +99,8 @@ type Server struct {
 	tvm                     *tvm.TVM
 	requestLimits           RequestLimitOptions
 
-	sendMessageCache       *sendMessageCache
+	sendMessageCache       *admission.MessageCache
+	externalMessageSender  *admission.Sender
 	externalMessageChecker *admission.Checker
 	externalMessageLimiter *extmsg.AddressLimiter
 	requestLimiter         *requestLimiter
@@ -153,7 +154,7 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 
-	return &Server{
+	server := &Server{
 		log:                     log,
 		store:                   opts.Store,
 		messageSender:           opts.MessageSender,
@@ -169,7 +170,7 @@ func New(opts Options) (*Server, error) {
 		now:                     time.Now,
 		tvm:                     tvmInstance,
 		requestLimits:           opts.RequestLimits,
-		sendMessageCache:        newSendMessageCache(),
+		sendMessageCache:        admission.NewMessageCache(),
 		externalMessageChecker:  externalMessageChecker,
 		externalMessageLimiter:  extmsg.NewDefaultAddressLimiter(),
 		requestLimiter:          newRequestLimiter(opts.RequestLimits),
@@ -178,7 +179,15 @@ func New(opts Options) (*Server, error) {
 		queryExecutor:           newQueryExecutor(opts.QueryConcurrency),
 		waitLimiter:             newWaitLimiter(opts.RequestLimits.MaxWaitsPerIP),
 		blockProofBases:         make(map[storage.BlockRootHash]*blockProofBase),
-	}, nil
+	}
+	if server.messageSender != nil {
+		externalMessageSender, err := server.newExternalMessageSender()
+		if err != nil {
+			return nil, err
+		}
+		server.externalMessageSender = externalMessageSender
+	}
+	return server, nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -310,14 +319,24 @@ func (s *Server) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	var err error
+	if s.server != nil {
+		err = s.server.Close()
+	}
+	if s.queryExecutor != nil {
+		s.queryExecutor.Close()
+	}
 	if s.server == nil {
 		return nil
 	}
-	return s.server.Close()
+	return err
 }
 
 func (s *Server) Wait() {
 	s.wg.Wait()
+	if s.queryExecutor != nil {
+		s.queryExecutor.Wait()
+	}
 }
 
 func configureLiteclientLogger(logger zerolog.Logger) {

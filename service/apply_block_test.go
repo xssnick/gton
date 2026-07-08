@@ -28,11 +28,12 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 
 	if _, err := store.SaveStateCheckpointEntries(context.Background(), []tnstore.StateCheckpointBlock{{
 		Artifact: &tnstore.ServedBlockFull{
-			ID:     downloaded.ID,
-			Block:  downloaded.BlockBOC,
-			Proof:  proofBOC,
-			Meta:   downloaded.Meta,
-			IsLink: downloaded.IsLink,
+			ID:             downloaded.ID,
+			Block:          downloaded.BlockBOC,
+			Proof:          proofBOC,
+			Meta:           downloaded.Meta,
+			IsLink:         downloaded.IsLink,
+			MessageEntries: []tnstore.MessageTransactionIndexEntry{},
 		},
 	}}, tnstore.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save fixture block: %v", err)
@@ -625,7 +626,7 @@ func TestArchiveStateCellOverlayCarriesCellsAcrossMerkleUpdates(t *testing.T) {
 	update2 := mustMerkleUpdateCell(t, mustProofBody(t, state1, 1), mustProofBody(t, state2, 1))
 
 	var baseLoads int
-	overlay := newArchiveStateCellOverlay(func(hash cell.Hash) (*cell.Cell, error) {
+	overlay := newStateCellWindowCache(func(hash cell.Hash) (*cell.Cell, error) {
 		if hash != stable.HashKey() {
 			return nil, fmt.Errorf("unexpected base load %x", hash[:])
 		}
@@ -682,7 +683,7 @@ func TestArchiveStateCellOverlayRetriesPendingCheckpointCells(t *testing.T) {
 	state1 := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	state2 := cell.BeginCell().MustStoreUInt(0x12, 8).EndCell()
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	update1 := mustMerkleUpdateCell(t, state0, state1)
 	applied1, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1), nil, 0)
 	if err != nil {
@@ -717,7 +718,7 @@ func TestArchiveStateCellOverlayRetriesPendingCheckpointCells(t *testing.T) {
 func TestServiceStateCellLoaderKeepsArchiveCheckpointCellsVisible(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 	checkpoint := overlay.beginCheckpoint()
 	if checkpoint == nil {
@@ -860,7 +861,7 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 	releasedRoot := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	cache := newStateCellEncodedCache(1)
-	if err := cache.addRecords(mustPreparedReachableStateCells(t, releasedRoot), nil); err != nil {
+	if err := cache.stageRecords(mustPreparedReachableStateCells(t, releasedRoot), nil).enqueue(); err != nil {
 		t.Fatalf("add source records: %v", err)
 	}
 
@@ -874,7 +875,7 @@ func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 
 	baseRoot := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
 	baseCache := newStateCellEncodedCache(1)
-	if err := baseCache.addRecords(mustPreparedReachableStateCells(t, baseRoot), nil); err != nil {
+	if err := baseCache.stageRecords(mustPreparedReachableStateCells(t, baseRoot), nil).enqueue(); err != nil {
 		t.Fatalf("add base records: %v", err)
 	}
 
@@ -902,8 +903,8 @@ func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
 
-	base := newArchiveStateCellOverlay(nil)
-	overlay := newArchiveStateCellOverlay(nil)
+	base := newStateCellWindowCache(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
@@ -926,7 +927,7 @@ func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 func TestArchiveStateCellOverlayLoaderDropsReleasedRecordsWithoutBase(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
@@ -945,7 +946,7 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 	first[0] = 1
 	second[0] = 2
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: []byte{1, 2, 3, 4},
 	}))
@@ -973,12 +974,12 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 
 func TestArchiveStateCellOverlayAdoptsWindowCellsOnEmission(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
-	windowCells := newArchiveStateCellOverlay(nil)
-	if err := windowCells.rememberPrepared(root, mustPreparedReachableStateCells(t, root), nil, 0); err != nil {
+	windowCells := newStateCellWindowCache(nil)
+	if err := windowCells.rememberApplied(root, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember window cells: %v", err)
 	}
 
-	checkpointCells := newArchiveStateCellOverlay(nil)
+	checkpointCells := newStateCellWindowCache(nil)
 	if got := checkpointCells.byteSize(); got != 0 {
 		t.Fatalf("checkpoint overlay starts with %d bytes, want 0", got)
 	}
@@ -998,9 +999,9 @@ func TestArchiveStateCellOverlayAdoptDoesNotDedupeRecords(t *testing.T) {
 		hash: []byte{1, 2, 3},
 	})
 
-	windowCells := newArchiveStateCellOverlay(nil)
+	windowCells := newStateCellWindowCache(nil)
 	windowCells.addPreparedRecords(records)
-	checkpointCells := newArchiveStateCellOverlay(nil)
+	checkpointCells := newStateCellWindowCache(nil)
 	checkpointCells.addPreparedRecords(records)
 
 	checkpointCells.adoptRecordsFrom(windowCells)
@@ -1023,6 +1024,90 @@ func TestStateCellWindowLazyLoadMetricsCountHits(t *testing.T) {
 	}
 	if got := lazyCellLoadMetricCount(counters.snapshot(), tnstore.LazyCellLoadLayerStateWindow); got != 1 {
 		t.Fatalf("state window lazy loads = %d, want 1", got)
+	}
+}
+
+func TestStateCellWindowCacheMemoizesDecodedCells(t *testing.T) {
+	child := cell.BeginCell().MustStoreUInt(0x71, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+
+	window := newStateCellWindowCache(nil)
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, root)); err != nil {
+		t.Fatalf("add prepared records: %v", err)
+	}
+
+	loader := window.loader()
+	first, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load root: %v", err)
+	}
+	second, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("reload root: %v", err)
+	}
+	if second != first {
+		t.Fatal("repeated window loads should return the memoized decoded cell")
+	}
+
+	// The memoized cell still resolves refs through the window cache.
+	loadedChild, err := second.PeekRef(0)
+	if err != nil {
+		t.Fatalf("peek memoized root ref: %v", err)
+	}
+	if loadedChild, err = loadedChild.Prewarm(); err != nil {
+		t.Fatalf("prewarm memoized root ref: %v", err)
+	}
+	if loadedChild.HashKey() != child.HashKey() {
+		t.Fatal("memoized root ref hash mismatch")
+	}
+
+	// Re-adding identical records is deduplicated and keeps the memoized cell.
+	if err = window.addPreparedRecords(mustPreparedReachableStateCells(t, root)); err != nil {
+		t.Fatalf("re-add prepared records: %v", err)
+	}
+	third, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load root after identical re-add: %v", err)
+	}
+	if third != first {
+		t.Fatal("identical record re-add should keep the memoized cell")
+	}
+}
+
+func TestStateCellEncodedCacheMemoInvalidatedOnRecordReplacement(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x61, 8).EndCell()
+
+	cache := newStateCellEncodedCache(1)
+	if err := cache.stageRecords(mustPreparedReachableStateCells(t, root), nil).enqueue(); err != nil {
+		t.Fatalf("add records: %v", err)
+	}
+
+	first, err := cache.loadWith(root.HashKey(), nil)
+	if err != nil {
+		t.Fatalf("load record: %v", err)
+	}
+	if again, err := cache.loadWith(root.HashKey(), nil); err != nil || again != first {
+		t.Fatalf("repeated load = (%v, %v), want memoized cell", again, err)
+	}
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	idx := cache.index[root.HashKey()]
+	if cache.decoded[idx].Load() != first {
+		t.Fatal("decoded slot does not hold the memoized cell")
+	}
+	if cache.setRecordLocked(root.HashKey(), cache.records[idx].Data) {
+		t.Fatal("identical record replacement should be a no-op")
+	}
+	if cache.decoded[idx].Load() != first {
+		t.Fatal("identical record replacement should keep the memoized cell")
+	}
+	if !cache.setRecordLocked(root.HashKey(), []byte{0xde, 0xad}) {
+		t.Fatal("record replacement should report a change")
+	}
+	if cache.decoded[idx].Load() != nil {
+		t.Fatal("record replacement should invalidate the memoized cell")
 	}
 }
 

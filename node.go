@@ -21,6 +21,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -274,12 +275,14 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		liveViewOptions.LiveBlockCache = liveBlockCache
 	}
 	liveStore := liveview.New(store, liveViewOptions)
+	tvmInstance := tvm.NewTVM()
 
 	currentStatePublisher := service.CurrentStatePublisher(liveStore)
 	externalMessageLogger := componentLogger(baseLogger, "external_message")
 	externalMessageChecker, err := externalmsg.NewChecker(externalmsg.Options{
 		Logger: &externalMessageLogger,
 		Store:  liveStore,
+		TVM:    tvmInstance,
 	})
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to initialize external message checker")
@@ -295,6 +298,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	extensionNode := hooks.Node{
 		Network: extensionNetwork{node: node, checker: externalMessageChecker},
 		Store:   liveStore,
+		TVM:     tvmInstance,
 		Logger:  extensionLogger,
 		Metrics: metricsCapability,
 	}
@@ -331,7 +335,6 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	})
 	node.SetRuntimeCallbacks(svc)
 	if currentStatePublisher != nil {
-		currentStatePublisher.SetNonfinalCellLoader(svc.NonfinalCellLoader())
 		node.SetBlockCacheObserver(currentStatePublisher)
 	}
 	if runtimeMetrics != nil {

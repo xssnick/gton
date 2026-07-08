@@ -22,6 +22,8 @@ type CurrentAccountBlockIDs struct {
 
 func cloneBlockID(id ton.BlockIDExt) *ton.BlockIDExt {
 	cloned := id
+	cloned.RootHash = bytes.Clone(id.RootHash)
+	cloned.FileHash = bytes.Clone(id.FileHash)
 	return &cloned
 }
 
@@ -47,5 +49,6 @@ type Backing interface {
 	LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
+	LookupMessageTransaction(ctx context.Context, kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, error)
 	LazyCellLoader() cell.LazyCellLoader
 }

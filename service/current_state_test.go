@@ -115,10 +115,11 @@ func testStateCheckpointArtifactForCurrent(state *tnstore.BlockState, current *t
 		}
 	}
 	return &tnstore.ServedBlockFull{
-		ID:    block,
-		Block: []byte{0x01},
-		Proof: []byte{0x02},
-		Meta:  meta,
+		ID:             block,
+		Block:          []byte{0x01},
+		Proof:          []byte{0x02},
+		Meta:           meta,
+		MessageEntries: []tnstore.MessageTransactionIndexEntry{},
 	}
 }
 
@@ -399,6 +400,10 @@ func (f *testLiveCheckpointFlusher) SetLiveCurrentState(current *tnstore.Current
 	f.current = current
 }
 
+func (f *testLiveCheckpointFlusher) SetLiveCurrentStateSnapshot(current *tnstore.CurrentState) {
+	f.current = current
+}
+
 func (f *testLiveCheckpointFlusher) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
 	f.blocks = append(f.blocks, blocks...)
 }
@@ -470,7 +475,7 @@ func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
 		{name: "stored block data", kind: "stored block", want: SyncBlockSourceStored},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := syncBlockSourceForDownloadedBlock(SyncBlockSourceNextBlock, p2p.DownloadedBlock{Kind: tc.kind})
+			got := syncBlockSourceForKind(SyncBlockSourceNextBlock, tc.kind)
 			if got != tc.want {
 				t.Fatalf("source = %q, want %q", got, tc.want)
 			}
@@ -814,15 +819,15 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 		StateRootHash: stateRootHash[:],
 	}
 
-	overlay := newArchiveStateCellOverlay(store.LazyCellLoader())
+	overlay := newStateCellWindowCache(store.LazyCellLoader())
 	currentCells, err := tnstore.PrepareReachableStateCells(current.Masterchain.Cell)
 	if err != nil {
 		t.Fatalf("prepare current cells: %v", err)
 	}
-	if err = overlay.rememberPrepared(current.Masterchain.Cell, currentCells, nil, 0); err != nil {
+	if err = overlay.rememberApplied(current.Masterchain.Cell, currentCells); err != nil {
 		t.Fatalf("remember current cells: %v", err)
 	}
-	if err = overlay.rememberPrepared(historicalRoot, preparedCells, nil, 0); err != nil {
+	if err = overlay.rememberApplied(historicalRoot, preparedCells); err != nil {
 		t.Fatalf("remember historical cells: %v", err)
 	}
 	checkpointCells := overlay.beginCheckpoint()
@@ -845,6 +850,72 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 	}
 }
 
+func TestPersistArchiveCurrentStateUsesPrewrittenCells(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := openTestPebbleStorage(t)
+
+	svc := &Service{log: zerolog.Nop(), storage: store}
+	svc.stateCellPrewrite = newStateCellPrewriter(zerolog.Nop(), store, 0)
+	svc.stateCellPrewrite.start(ctx, ctx, func(fn func()) { go fn() })
+
+	master := testBlockID(-1, topShard, 73)
+	current := &tnstore.CurrentState{
+		SyncedAt:         time.Now(),
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+			Cell:  testShardStateCell(t, master),
+		},
+		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
+	}
+
+	historicalBlock := testBlockID(0, topShard, 133)
+	historicalRoot := testShardStateCell(t, historicalBlock)
+	preparedCells, err := tnstore.PrepareReachableStateCells(historicalRoot)
+	if err != nil {
+		t.Fatalf("prepare historical cells: %v", err)
+	}
+	stateRootHash := historicalRoot.HashKey(0)
+	historical := &tnstore.BlockState{
+		Block:         historicalBlock,
+		StateRootHash: stateRootHash[:],
+	}
+
+	overlay := newStateCellWindowCache(store.LazyCellLoader())
+	overlay.setPrewriter(svc.stateCellPrewrite)
+	currentCells, err := tnstore.PrepareReachableStateCells(current.Masterchain.Cell)
+	if err != nil {
+		t.Fatalf("prepare current cells: %v", err)
+	}
+	if err = overlay.rememberApplied(current.Masterchain.Cell, currentCells); err != nil {
+		t.Fatalf("remember current cells: %v", err)
+	}
+	if err = overlay.rememberApplied(historicalRoot, preparedCells); err != nil {
+		t.Fatalf("remember historical cells: %v", err)
+	}
+
+	checkpointCells := overlay.beginCheckpoint()
+	if target, ok := checkpointCells.prewriteTarget(); !ok || target == 0 {
+		t.Fatalf("checkpoint cells not marked prewritten: target=%d ok=%v", target, ok)
+	}
+
+	entries := append([]tnstore.StateCheckpointBlock{
+		testStateCheckpointEntryForCurrent(historical, current),
+	}, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current)...)
+	runner := &archiveCatchUpRunner{service: svc, ctx: ctx}
+
+	if _, err = runner.persistArchiveCurrentState(current, 1, 0, entries, checkpointCells); err != nil {
+		t.Fatalf("persist archive current state: %v", err)
+	}
+	if _, err = store.BlockState(ctx, historical.Block); err != nil {
+		t.Fatalf("load historical archive state: %v", err)
+	}
+	if _, err = store.LoadStateCellTree(ctx, historical.Block, historical.StateRootHash); err != nil {
+		t.Fatalf("load historical archive state cells: %v", err)
+	}
+}
+
 func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
@@ -852,8 +923,8 @@ func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
-	overlay := newArchiveStateCellOverlay(nil)
-	if err := overlay.rememberPrepared(root, mustPreparedReachableStateCells(t, root), nil, 0); err != nil {
+	overlay := newStateCellWindowCache(nil)
+	if err := overlay.rememberApplied(root, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember checkpoint cells: %v", err)
 	}
 
@@ -1098,7 +1169,7 @@ func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.
 	preparedCells := mustPreparedReachableStateCells(t, root)
 	preparedCells = removePreparedCellRecord(preparedCells, root.HashKey())
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(preparedCells)
 
 	rootHash := root.HashKey(0)

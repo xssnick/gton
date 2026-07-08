@@ -916,7 +916,7 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 		ID:     block,
 		Block:  blockData,
 		Proof:  proofData,
-		IsLink: false,
+		IsLink: false, MessageEntries: []storage.MessageTransactionIndexEntry{},
 	}); err != nil {
 		t.Fatalf("save cached block: %v", err)
 	}
@@ -952,7 +952,7 @@ func TestDownloadNextBlockFullUsesLiveCacheBeforeOverlay(t *testing.T) {
 	next.FileHash = append([]byte(nil), fileHash[:]...)
 
 	proofData := testBlockProofCell(t, next, testProofSignatureSet()).ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
 		Block:     next,
 		BlockData: blockData,
 		Meta: &storage.BlockMeta{
@@ -1009,7 +1009,7 @@ func TestDownloadBlockProofUsesLiveCacheBeforeOverlay(t *testing.T) {
 	}
 
 	keyBlock, fullProof, linkProof := testPeerMasterBlockProof(t, 151)
-	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
 		Block: keyBlock,
 		Proofs: []storage.LiveBlockProofArtifact{
 			{Kind: storage.ServedProofBlock, Data: fullProof},
@@ -1038,7 +1038,7 @@ func TestDownloadBlockProofUsesLiveCacheBeforeOverlay(t *testing.T) {
 
 	linkOnlyBlock := testStoredMasterBlockID(152)
 	linkOnlyProof := []byte{0x15, 0x02}
-	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+	err = node.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
 		Block: linkOnlyBlock,
 		Proofs: []storage.LiveBlockProofArtifact{
 			{Kind: storage.ServedProofKeyBlockLink, Data: linkOnlyProof},

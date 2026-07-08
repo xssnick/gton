@@ -169,6 +169,9 @@ type Service struct {
 	shardDescriptionHints map[storage.BlockRootHash]shardDescriptionHint
 	shardDescriptionOrder []storage.BlockRootHash
 
+	preparedShardBlocks     preparedShardBlockCache
+	preparedShardBlockSlots chan struct{}
+
 	nextMasterchainMx               sync.Mutex
 	nextMasterchainQueue            map[storage.BlockRootHash]queuedMasterchainBlock
 	nextMasterchainBySeqno          map[uint32]storage.BlockRootHash
@@ -251,6 +254,9 @@ type Options struct {
 
 type CurrentStatePublisher interface {
 	SetLiveCurrentState(*storage.CurrentState)
+	// SetLiveCurrentStateSnapshot takes ownership of an already-private
+	// snapshot instead of cloning the state like SetLiveCurrentState does.
+	SetLiveCurrentStateSnapshot(*storage.CurrentState)
 	MarkLiveCurrentStateFlushed(*storage.CurrentState)
 	MarkLiveBlockStatesFlushed([]ton.BlockIDExt)
 	MarkLiveBlockFlushed(ton.BlockIDExt)
@@ -387,14 +393,6 @@ func syncBlockOriginForSource(source SyncBlockSource) SyncBlockOrigin {
 	default:
 		return SyncBlockOriginOther
 	}
-}
-
-func syncBlockSourceForDownloadedBlock(defaultSource SyncBlockSource, downloaded p2p.DownloadedBlock) SyncBlockSource {
-	return syncBlockSourceForKind(defaultSource, downloaded.Kind)
-}
-
-func syncBlockSourceForVerifiedBlock(defaultSource SyncBlockSource, block VerifiedBlock) SyncBlockSource {
-	return syncBlockSourceForKind(defaultSource, block.Kind)
 }
 
 func syncBlockOriginForKind(kind string) SyncBlockOrigin {
@@ -573,6 +571,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		currentStateWake:                   make(chan struct{}, 1),
 		shardDescriptionWake:               make(chan struct{}, 1),
 		shardDescriptionHints:              map[storage.BlockRootHash]shardDescriptionHint{},
+		preparedShardBlockSlots:            make(chan struct{}, preparedShardBlockWorkers),
 		maintenanceWake:                    make(chan struct{}, 1),
 		stateTTL:                           opts.StateTTL,
 		archiveTTL:                         opts.ArchiveTTL,
@@ -583,6 +582,9 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
 	}
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization, opts.PersistentStateLargeBOCBatchSize, opts.StateSerializeOnePass)
+	if svc.liveState != nil {
+		svc.liveState.SetNonfinalCellLoader(svc.stateCellLoader())
+	}
 	return svc
 }
 
@@ -1118,7 +1120,10 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	}
 
 	// Shard states are advanced only by the main sync pipeline. Broadcast blocks
-	// are kept as download/cache hints so they cannot compete with live tail apply.
+	// are kept as download/cache hints so they cannot compete with live tail
+	// apply; preparing them ahead here turns the commit-stage resolve into a
+	// take of ready state-update cells.
+	s.prepareShardBlockAheadFromVerified(verified)
 	observation.PrepareDuration = time.Since(prepareStarted)
 	return nil
 }

@@ -33,7 +33,7 @@ func benchFilledLiveBlockCache(b *testing.B, blocks int) (*LiveBlockCache, []ton
 	for i := 0; i < blocks; i++ {
 		block := benchLiveBlockCacheBlock(i)
 		ids = append(ids, block)
-		if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+		if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 			Block:     block,
 			BlockData: data,
 		}); err != nil {
@@ -72,7 +72,7 @@ func BenchmarkLiveBlockCacheMixedParallel(b *testing.B) {
 			i++
 			if i%1024 == 0 {
 				block := benchLiveBlockCacheBlock(4096 + rnd.Intn(1<<20))
-				if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+				if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 					Block:     block,
 					BlockData: data,
 				}); err != nil {

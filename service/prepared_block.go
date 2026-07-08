@@ -25,9 +25,13 @@ type PreparedBlock struct {
 	StateUpdate               *cell.Cell
 	StateUpdateToCells        storage.StateCellRecords
 	StateUpdateToCellsElapsed time.Duration
-	PrepareElapsed            time.Duration
-	consensus                 *masterchainConsensusProof
-	consensusChecked          *checkedMasterchainConsensus
+	// MessageEntries is extracted once on the prepare stage so live publish and
+	// checkpoint persistence do not re-parse the block; nil when the block did
+	// not parse as a full TLB block.
+	MessageEntries   []storage.MessageTransactionIndexEntry
+	PrepareElapsed   time.Duration
+	consensus        *masterchainConsensusProof
+	consensusChecked *checkedMasterchainConsensus
 
 	IsLink       bool
 	Origin       SyncBlockOrigin
@@ -95,7 +99,7 @@ func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error
 
 	var consensus *masterchainConsensusProof
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard && downloaded.Proof != nil {
-		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof)
+		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof, downloaded.SignaturesVerifiedKey)
 		if err != nil {
 			return VerifiedBlock{}, fmt.Errorf("prepare masterchain consensus proof %s: %w", downloaded.BlockRef(), err)
 		}
@@ -134,7 +138,16 @@ func prepareVerifiedBlockForApply(block VerifiedBlock) (PreparedBlock, error) {
 		return PreparedBlock{}, fmt.Errorf("prepare state update target cells for %s: %w", block.BlockRef(), err)
 	}
 
-	return preparedBlockWithStateCells(block, cells, time.Since(started)), nil
+	prepared := preparedBlockWithStateCells(block, cells, time.Since(started))
+	// Extraction failure means the parser cannot fully decode a consensus-valid
+	// block (TLB drift after a protocol upgrade). Fail the block instead of
+	// persisting it without message->tx index entries.
+	entries, err := storage.MessageTransactionEntriesFromBlockCell(block.ID, block.BlockRoot)
+	if err != nil {
+		return PreparedBlock{}, fmt.Errorf("extract message transaction entries for %s: %w", block.BlockRef(), err)
+	}
+	prepared.MessageEntries = entries
+	return prepared, nil
 }
 
 func prepareVerifiedMasterchainBlockForNextSync(prev ton.BlockIDExt, block VerifiedBlock) (PreparedBlock, error) {

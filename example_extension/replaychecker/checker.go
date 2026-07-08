@@ -2,6 +2,8 @@ package replaychecker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -47,11 +49,44 @@ func (r *replayChecker) OnBlockApplied(ctx context.Context, event hooks.BlockApp
 		block = storage.FormatBlockRef(event.Meta.ID)
 	}
 
-	logEvent := r.log.Info()
-	if err != nil {
-		logEvent = r.log.Warn().Err(err)
+	// A replay mismatch means the checker's re-execution diverged from the
+	// applied state — a fundamental correctness failure for the collator
+	// blueprint. Returning an error would make the apply-hook runner retry the
+	// block flow forever (wedging checkpoint/persist), and returning nil would
+	// silently skip the divergence. Neither is acceptable: we LOG the structured
+	// details, then PANIC to stop the node hard so the divergence cannot be
+	// ignored. Only a transient infrastructure error (store/context) — which a
+	// retry can actually fix — is propagated instead.
+	if err != nil && errors.Is(err, ErrMismatch) {
+		r.log.Error().
+			Err(err).
+			Str("block", block).
+			Int("accounts", result.Accounts).
+			Int("transactions", result.Transactions).
+			Int("mismatches", result.Mismatches).
+			Dur("replay_elapsed", elapsed).
+			Dur("tx_emulation_elapsed", result.EmulationElapsed).
+			Msg("applied block transaction replay MISMATCH: emulated state diverged from applied state")
+		panic(fmt.Sprintf(
+			"replaychecker: block %s replay mismatch (%d/%d accounts diverged, %d transactions): %v",
+			block, result.Mismatches, result.Accounts, result.Transactions, err,
+		))
 	}
-	logEvent.
+
+	if err != nil {
+		// Transient infrastructure error: propagate so the apply-hook runner
+		// retries this block flow (a re-read of the store/state may succeed).
+		r.log.Warn().
+			Err(err).
+			Str("block", block).
+			Int("accounts", result.Accounts).
+			Int("transactions", result.Transactions).
+			Dur("replay_elapsed", elapsed).
+			Msg("applied block transaction replay could not complete; will retry")
+		return err
+	}
+
+	r.log.Info().
 		Str("block", block).
 		Int("accounts", result.Accounts).
 		Int("transactions", result.Transactions).
@@ -59,5 +94,5 @@ func (r *replayChecker) OnBlockApplied(ctx context.Context, event hooks.BlockApp
 		Dur("tx_emulation_elapsed", result.EmulationElapsed).
 		Msg("applied block transaction replay checked")
 
-	return err
+	return nil
 }

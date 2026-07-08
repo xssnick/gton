@@ -333,6 +333,12 @@ type DownloadedBlock struct {
 	IsLink bool
 
 	VerifiedRootHash bool
+	// SignaturesVerifiedKey is the blockproof.ValidatorSignatureSet.ContentKey
+	// of a validator signature set that already passed the broadcast-level
+	// signature check for this block; nil when no such check happened.
+	// Consumers may skip re-verifying a signature set whose content key
+	// equals this one.
+	SignaturesVerifiedKey []byte
 }
 
 func (b DownloadedBlock) BlockRef() string {

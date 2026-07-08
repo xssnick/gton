@@ -54,7 +54,7 @@ func testStateCheckpointArtifact(state *tnstore.BlockState) *tnstore.ServedBlock
 		ID:    block,
 		Block: []byte{0x01},
 		Proof: []byte{0x02},
-		Meta:  meta,
+		Meta:  meta, MessageEntries: []tnstore.MessageTransactionIndexEntry{},
 	}
 }
 
@@ -184,9 +184,13 @@ func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
 	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
+	if !pool.hasPeer(peer.id) {
+		t.Fatal("archive-only peer rotated after a single zero-state not-available")
+	}
 
+	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
 	if pool.hasPeer(peer.id) {
-		t.Fatal("archive-only peer survived zero-state not-available rotation")
+		t.Fatal("archive-only peer survived repeated zero-state not-available rotation")
 	}
 }
 

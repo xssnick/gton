@@ -16,7 +16,7 @@ func TestLiveBlockCachePinsUnflushedArtifactsUntilFlush(t *testing.T) {
 	firstData := []byte{0x11}
 	firstProof := []byte{0x21}
 
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     first,
 		BlockData: firstData,
 		Proofs: []LiveBlockProofArtifact{{
@@ -26,7 +26,7 @@ func TestLiveBlockCachePinsUnflushedArtifactsUntilFlush(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publish first block: %v", err)
 	}
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     second,
 		BlockData: []byte{0x12},
 	}); err != nil {
@@ -60,14 +60,14 @@ func TestLiveBlockCacheEvictsFlushedArtifacts(t *testing.T) {
 	first := testLiveBlockCacheBlockID(1)
 	second := testLiveBlockCacheBlockID(2)
 
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:           first,
 		BlockData:       []byte{0x11},
 		ArtifactFlushed: true,
 	}); err != nil {
 		t.Fatalf("publish first block: %v", err)
 	}
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:           second,
 		BlockData:       []byte{0x12},
 		ArtifactFlushed: true,
@@ -88,7 +88,7 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 	block := testLiveBlockCacheBlockID(1)
 	data := []byte{0x11}
 
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     block,
 		BlockData: data,
 	}); err != nil {
@@ -105,7 +105,7 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 		t.Fatalf("cached block data = %x, want %x", cached.Data, data)
 	}
 
-	if err = cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err = cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:           block,
 		ArtifactFlushed: true,
 	}); err != nil {

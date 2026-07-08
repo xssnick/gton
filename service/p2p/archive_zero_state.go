@@ -26,6 +26,7 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 
 	shard := archiveShardFromBlock(block)
 	pool := a.archivePeerPool(sub)
+	pool.noteZeroStateRequest(shard, block)
 	tried := map[PeerID]struct{}{}
 	var errs []error
 
@@ -198,14 +199,7 @@ func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *ove
 	}
 
 	elapsed := time.Since(started)
-	if noteArchivePeerDownload(shard, peer, int64(len(data)), elapsed) {
-		a.node.log.Debug().
-			Str("peer", peer.addr).
-			Str("block", formatBlockRef(block)).
-			Str("size", formatByteSize(int64(len(data)))).
-			Dur("elapsed", elapsed).
-			Msg("zero state download peer too slow")
-	}
+	noteArchivePeerDownload(shard, peer, int64(len(data)), elapsed)
 	pool.markSuccess(shard, peer)
 	a.noteArchivePeerSuccess(peer)
 	a.selectArchivePeer(shard, peer)

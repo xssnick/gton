@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -81,6 +82,23 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	}
 
 	key := storage.BlockKey(block)
+	s.mu.Lock()
+	if pending, ok := s.nonFinalPending[key]; ok {
+		// The pending map is keyed by the block root hash, so an existing entry
+		// already holds identical content (typically the candidate broadcast that
+		// preceded this signed one). Merge the kind bit directly instead of
+		// re-running the whole parse/apply/index pipeline; a bare map write keeps
+		// the order and cell indexes untouched.
+		if pending.kind&kind != kind {
+			pending.kind |= kind
+			s.nonFinalPending[key] = pending
+		}
+		s.deleteNonfinalWaitingLocked(key)
+		s.mu.Unlock()
+		return false, nil
+	}
+	s.mu.Unlock()
+
 	loader := s.nonfinalBlockCellLoader(block)
 	var state *storage.BlockState
 	var meta *storage.BlockMeta
@@ -108,6 +126,11 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 		meta = parsed.meta
 		update = parsed.update
 		artifacts.Meta = storage.MergeBlockMeta(meta, artifacts.Meta)
+		// Waiting entries are remembered from `original`; carry the parse results
+		// over so promotion retries skip re-deriving them from the raw block.
+		original.Root = parsed.root
+		original.StateUpdate = parsed.update
+		original.Meta = artifacts.Meta
 		if s.nonfinalTooFarAheadOfCurrentMaster(artifacts.Meta) {
 			s.deleteNonfinalWaiting(block)
 			return false, nil
@@ -231,7 +254,7 @@ func (s *Store) NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.Bloc
 	signed := make([]ton.BlockIDExt, 0)
 	candidates := make([]ton.BlockIDExt, 0)
 	for _, pending := range s.nonFinalPending {
-		if filter != nil && !shardIntersects(*filter, storage.ShardKeyFromBlock(pending.block)) {
+		if filter != nil && !blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(pending.block)) {
 			continue
 		}
 		if pending.kind&storage.LiveBlockNonfinalSigned != 0 {
@@ -670,7 +693,7 @@ func (s *Store) nonfinalCoveredByCurrentLocked(block ton.BlockIDExt) bool {
 	key := storage.ShardKeyFromBlock(block)
 	for _, shard := range s.current.Shards {
 		shardKey := storage.ShardKeyFromBlock(shard.Block)
-		if !shardIntersects(key, shardKey) {
+		if !blockproof.ShardIntersects(key, shardKey) {
 			continue
 		}
 		if shard.Block.SeqNo >= block.SeqNo {

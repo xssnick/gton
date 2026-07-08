@@ -52,6 +52,40 @@ func decodeBlockIDFromHashes(workchain int32, shard int64, seqno uint32, data []
 	}, nil
 }
 
+func encodeMessageTransactionRef(ref storage.MessageTransactionRef) []byte {
+	buf := make([]byte, 0, 4+32+8+32+80)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(ref.Workchain))
+	buf = append(buf, ref.Account[:]...)
+	buf = binary.BigEndian.AppendUint64(buf, ref.LT)
+	buf = append(buf, ref.Hash[:]...)
+	return append(buf, encodeBlockID(ref.Block)...)
+}
+
+func decodeMessageTransactionRef(data []byte) (storage.MessageTransactionRef, error) {
+	if len(data) != 4+32+8+32+80 {
+		return storage.MessageTransactionRef{}, fmt.Errorf("invalid message transaction ref size %d", len(data))
+	}
+
+	ref := storage.MessageTransactionRef{
+		Workchain: int32(binary.BigEndian.Uint32(data[:4])),
+		LT:        binary.BigEndian.Uint64(data[36:44]),
+	}
+	copy(ref.Account[:], data[4:36])
+	copy(ref.Hash[:], data[44:76])
+
+	block, err := decodeBlockID(data[76:])
+	if err != nil {
+		return storage.MessageTransactionRef{}, err
+	}
+	ref.Block = block
+	return ref, nil
+}
+
+// blockMetaMinEncodedLen is the fixed header of an encoded block meta:
+// version byte, flags word, gen utime, start/end lt, the two hash length
+// bytes, the masterchain ref flag byte and the prev/next ref count bytes.
+const blockMetaMinEncodedLen = 1 + 4 + 4 + 8 + 8 + 1 + 1 + 1 + 1 + 1
+
 func encodeBlockMeta(meta *storage.BlockMeta) []byte {
 	if meta == nil {
 		return nil
@@ -81,8 +115,22 @@ func encodeBlockMeta(meta *storage.BlockMeta) []byte {
 	return buf
 }
 
+// decodeBlockMetaFlags reads just the flags word from an encoded block meta
+// without decoding the whole record. It applies the same header validation
+// (minimal payload length and version byte) as decodeBlockMeta; the flags
+// live in the fixed header, so deeper payload corruption is not detected.
+func decodeBlockMetaFlags(data []byte) (storage.BlockMetaFlags, error) {
+	if len(data) < blockMetaMinEncodedLen {
+		return 0, fmt.Errorf("block meta payload too small")
+	}
+	if data[0] != blockMetaVersion {
+		return 0, fmt.Errorf("unsupported block meta version %d", data[0])
+	}
+	return storage.BlockMetaFlags(binary.BigEndian.Uint32(data[1:5])), nil
+}
+
 func decodeBlockMeta(id ton.BlockIDExt, data []byte) (*storage.BlockMeta, error) {
-	if len(data) < 1+4+4+8+8+1+1+1+1+1 {
+	if len(data) < blockMetaMinEncodedLen {
 		return nil, fmt.Errorf("block meta payload too small")
 	}
 	if data[0] != blockMetaVersion {
@@ -333,13 +381,13 @@ func readMigrationProgressBlockState(data []byte, pos int) (storage.BlockState, 
 }
 
 func encodeCellRecord(record *storage.CellRecord) []byte {
-	buf := make([]byte, cellRecordEncodedLen(record.D2, record.Refs))
-	encodeCellRecordTo(buf, record)
+	size, slowRefs, compactRefs := cellRecordEncodedLen(record.D2, record.Refs)
+	buf := make([]byte, size)
+	encodeCellRecordTo(buf, record, slowRefs, compactRefs)
 	return buf
 }
 
-func encodeCellRecordTo(buf []byte, record *storage.CellRecord) {
-	slowRefs, compactRefs := cellRecordCompactRefLayout(record.Refs)
+func encodeCellRecordTo(buf []byte, record *storage.CellRecord, slowRefs byte, compactRefs bool) {
 	pos := 0
 	d1 := record.D1
 	if compactRefs {
@@ -373,7 +421,7 @@ func encodeCellRecordTo(buf []byte, record *storage.CellRecord) {
 	}
 }
 
-func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) int {
+func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) (int, byte, bool) {
 	size := 2 + int(d2/2+d2%2)
 	slowRefs, compactRefs := cellRecordCompactRefLayout(refs)
 	if compactRefs {
@@ -386,7 +434,7 @@ func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) int {
 		}
 		size += 1 + len(ref.Hashes) + len(ref.Depths)
 	}
-	return size
+	return size, slowRefs, compactRefs
 }
 
 func cellRecordRefCommon(ref storage.CellRefRecord) bool {

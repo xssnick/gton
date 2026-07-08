@@ -244,3 +244,24 @@ func TestAppliedStateSetTracksArtifactBytes(t *testing.T) {
 		t.Fatalf("artifact bytes after take = %d, want 0", got)
 	}
 }
+
+func TestAppliedStateSetCloneCopiesArtifactIDs(t *testing.T) {
+	prev := testBlockID(0, topShard, 14)
+	next := testBlockID(0, topShard, 15)
+	artifact := cloneServedBlockFullSharedPayload(&storage.ServedBlockFull{ID: next})
+	links := cloneServedBlockLinks([]storage.ServedBlockLink{{Prev: prev, Next: next}})
+
+	artifact.ID.RootHash[0] = 0xA1
+	links[0].Prev.RootHash[0] = 0xA2
+	links[0].Next.RootHash[0] = 0xA3
+
+	if next.RootHash[0] == 0xA1 {
+		t.Fatal("artifact clone shares block id root hash backing array")
+	}
+	if prev.RootHash[0] == 0xA2 {
+		t.Fatal("link clone shares prev id root hash backing array")
+	}
+	if next.RootHash[0] == 0xA3 {
+		t.Fatal("link clone shares next id root hash backing array")
+	}
+}

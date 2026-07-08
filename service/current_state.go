@@ -921,6 +921,10 @@ func (s *Service) currentStateForNextMasterState(ctx context.Context, current *s
 }
 
 func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
+	if prepared, ok := s.preparedShardBlocks.take(block); ok {
+		return prepared, nil
+	}
+
 	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block, true)
 	if err == nil {
 		return downloaded, nil

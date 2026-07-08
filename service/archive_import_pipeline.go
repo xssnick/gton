@@ -710,6 +710,8 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		return archivePreparedMasterWindow{}, fmt.Errorf("archive master import #%d returned no data", startSeqno)
 	}
 
+	windowStateCells := newStateCellWindowCache(baseCellLoader, &r.service.lazyCellLoads)
+	windowStateCells.setPrewriter(r.service.stateCellPrewrite)
 	window := &shardClientArchiveWindow{
 		startSeqno:            startSeqno,
 		masterStats:           masterImport.stats,
@@ -720,7 +722,7 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		masterProofs:          masterResult.consensusProofs,
 		archiveBlocks:         masterImport.blocks,
 		archiveImports:        []*archiveImportResult{masterImport},
-		stateCells:            newArchiveStateCellOverlay(baseCellLoader, &r.service.lazyCellLoads),
+		stateCells:            windowStateCells,
 		masterWait:            masterWait,
 		masterPrecheckElapsed: masterResult.precheckElapsed,
 	}

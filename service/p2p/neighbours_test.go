@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -625,8 +626,8 @@ func TestStartSeedFromDHTSetsCooldownAfterSearch(t *testing.T) {
 	sub.startSeedFromDHT(context.Background())
 	node.wg.Wait()
 
-	if fake.findOverlayNodesCalls != 1 {
-		t.Fatalf("expected one DHT search, got %d", fake.findOverlayNodesCalls)
+	if calls := fake.findOverlayNodesCallCount(); calls != 1 {
+		t.Fatalf("expected one DHT search, got %d", calls)
 	}
 
 	sub.seedMx.Lock()
@@ -642,8 +643,8 @@ func TestStartSeedFromDHTSetsCooldownAfterSearch(t *testing.T) {
 	sub.startSeedFromDHT(ctx)
 	node.wg.Wait()
 
-	if fake.findOverlayNodesCalls != 1 {
-		t.Fatalf("cooldown should block immediate DHT search, got %d calls", fake.findOverlayNodesCalls)
+	if calls := fake.findOverlayNodesCallCount(); calls != 1 {
+		t.Fatalf("cooldown should block immediate DHT search, got %d calls", calls)
 	}
 }
 
@@ -671,8 +672,8 @@ func TestStartSeedFromDHTRefreshesWhenPeerPoolIsFull(t *testing.T) {
 	sub.startSeedFromDHT(context.Background())
 	node.wg.Wait()
 
-	if fake.findOverlayNodesCalls != 1 {
-		t.Fatalf("expected DHT refresh search with full peer pool, got %d", fake.findOverlayNodesCalls)
+	if calls := fake.findOverlayNodesCallCount(); calls != 1 {
+		t.Fatalf("expected DHT refresh search with full peer pool, got %d", calls)
 	}
 }
 
@@ -787,6 +788,7 @@ func TestDHTServerPublishSkipsStoreWhenOffline(t *testing.T) {
 var errNoAliveStore = errors.New("no alive nodes found to store this key")
 
 type fakeDHTClient struct {
+	mx                       sync.Mutex
 	storeAddressCalls        int
 	storeOverlayCalls        int
 	findAddressesCalls       int
@@ -803,12 +805,23 @@ type fakeDHTClient struct {
 
 func (f *fakeDHTClient) Close() {}
 
+func (f *fakeDHTClient) findOverlayNodesCallCount() int {
+	f.mx.Lock()
+	defer f.mx.Unlock()
+
+	return f.findOverlayNodesCalls
+}
+
 func (f *fakeDHTClient) FindOverlayNodes(ctx context.Context, _ []byte, _ ...*dht.Continuation) (*overlay.NodesList, *dht.Continuation, error) {
+	f.mx.Lock()
 	f.findOverlayNodesCalls++
 	f.findOverlayNodesDeadline, _ = ctx.Deadline()
-	if f.findOverlayNodesWait != nil {
+	wait := f.findOverlayNodesWait
+	f.mx.Unlock()
+
+	if wait != nil {
 		select {
-		case <-f.findOverlayNodesWait:
+		case <-wait:
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		}
@@ -817,10 +830,14 @@ func (f *fakeDHTClient) FindOverlayNodes(ctx context.Context, _ []byte, _ ...*dh
 }
 
 func (f *fakeDHTClient) FindAddresses(ctx context.Context, _ []byte) (*adnladdr.List, ed25519.PublicKey, error) {
+	f.mx.Lock()
 	f.findAddressesCalls++
 	f.findAddressesDeadline, _ = ctx.Deadline()
-	if f.findAddressesErr != nil {
-		return nil, nil, f.findAddressesErr
+	err := f.findAddressesErr
+	f.mx.Unlock()
+
+	if err != nil {
+		return nil, nil, err
 	}
 	return &adnladdr.List{}, nil, nil
 }
@@ -830,12 +847,18 @@ func (f *fakeDHTClient) FindValue(context.Context, *dht.Key, ...*dht.Continuatio
 }
 
 func (f *fakeDHTClient) StoreAddress(ctx context.Context, _ adnladdr.List, _ time.Duration, _ ed25519.PrivateKey) (int, []byte, error) {
+	f.mx.Lock()
+	defer f.mx.Unlock()
+
 	f.storeAddressCalls++
 	f.storeAddressDeadline, _ = ctx.Deadline()
 	return 1, nil, popErr(&f.storeAddressErrs)
 }
 
 func (f *fakeDHTClient) StoreOverlayNodes(ctx context.Context, _ []byte, _ *overlay.NodesList, _ time.Duration) (int, []byte, error) {
+	f.mx.Lock()
+	defer f.mx.Unlock()
+
 	f.storeOverlayCalls++
 	f.storeOverlayDeadline, _ = ctx.Deadline()
 	return 1, nil, popErr(&f.storeOverlayErrs)

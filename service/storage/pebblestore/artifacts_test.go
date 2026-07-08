@@ -205,7 +205,7 @@ func TestCheckpointArchiveArtifactsKeepsSameBatchMetaAndNextLink(t *testing.T) {
 				GenUTime: 123,
 				StartLT:  10,
 				EndLT:    20,
-			},
+			}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}, {
 			ID:    next,
 			Block: []byte{0x03},
@@ -216,6 +216,7 @@ func TestCheckpointArchiveArtifactsKeepsSameBatchMetaAndNextLink(t *testing.T) {
 				StartLT:  20,
 				EndLT:    30,
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: next}},
 	}); err != nil {
@@ -243,10 +244,11 @@ func testLinkPreviousBlock(block ton.BlockIDExt, masterSeqno uint32) *storage.Se
 		meta.MasterchainRefSeqno = masterSeqno
 	}
 	return &storage.ServedBlockFull{
-		ID:    block,
-		Block: []byte{0x01},
-		Proof: []byte{0x02},
-		Meta:  meta,
+		ID:             block,
+		Block:          []byte{0x01},
+		Proof:          []byte{0x02},
+		Meta:           meta,
+		MessageEntries: []storage.MessageTransactionIndexEntry{},
 	}
 }
 
@@ -259,7 +261,7 @@ func TestCheckpointArchiveArtifactsRejectsEmptyFullBlock(t *testing.T) {
 
 	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
 	err = saveTestArchiveArtifacts(store, testArchiveImport{
-		FullBlocks: []*storage.ServedBlockFull{{ID: block}},
+		FullBlocks: []*storage.ServedBlockFull{{ID: block, MessageEntries: []storage.MessageTransactionIndexEntry{}}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "has no block data or proof") {
 		t.Fatalf("save empty full block err = %v, want empty block error", err)
@@ -279,8 +281,9 @@ func TestCheckpointArchiveArtifactsRejectsMetadataOnlyFullBlock(t *testing.T) {
 	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
 	err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:   block,
-			Meta: &storage.BlockMeta{ID: block},
+			ID:             block,
+			Meta:           &storage.BlockMeta{ID: block},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "has no block data or proof") {
@@ -303,8 +306,9 @@ func TestCheckpointArchiveArtifactsRejectsForgedServedFullFlag(t *testing.T) {
 	meta.Mark(storage.BlockMetaHasServedFull)
 	err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:   block,
-			Meta: meta,
+			ID:             block,
+			Meta:           meta,
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "has no block data or proof") {
@@ -333,6 +337,7 @@ func TestCheckpointArchiveArtifactsRejectsFullBlockMetaNextRefs(t *testing.T) {
 				ID:       block,
 				NextRefs: []ton.BlockIDExt{next},
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "cannot set next refs directly") {
@@ -353,9 +358,10 @@ func TestCheckpointArchiveArtifactsDoesNotMarkPartialBlockAsServedFull(t *testin
 	block := testServedBlockID(-1, int64(-1<<63), 102, 4)
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: []byte{0x01},
-			Meta:  &storage.BlockMeta{ID: block, GenUTime: 123},
+			ID:             block,
+			Block:          []byte{0x01},
+			Meta:           &storage.BlockMeta{ID: block, GenUTime: 123},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save partial archive import: %v", err)
@@ -386,8 +392,9 @@ func TestCheckpointArchiveArtifactsRejectsInvalidBlockDataWithoutMeta(t *testing
 	block := testServedBlockID(-1, int64(-1<<63), 103, 5)
 	err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: []byte{0x01},
+			ID:             block,
+			Block:          []byte{0x01},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "parse block boc") {
@@ -490,9 +497,10 @@ func TestCheckpointArchiveArtifactsStoresOriginalBlockBOC(t *testing.T) {
 
 	err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: append([]byte(nil), blockData...),
-			Meta:  &storage.BlockMeta{ID: block, GenUTime: 123, StartLT: 10, EndLT: 20},
+			ID:             block,
+			Block:          append([]byte(nil), blockData...),
+			Meta:           &storage.BlockMeta{ID: block, GenUTime: 123, StartLT: 10, EndLT: 20},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err != nil {
@@ -575,14 +583,16 @@ func TestArchivePackageMetadataTracksFirstMasterBlock(t *testing.T) {
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{
 			{
-				ID:    firstSaved,
-				Block: []byte{0x01},
-				Meta:  &storage.BlockMeta{ID: firstSaved, GenUTime: 1500, StartLT: 15, EndLT: 16},
+				ID:             firstSaved,
+				Block:          []byte{0x01},
+				Meta:           &storage.BlockMeta{ID: firstSaved, GenUTime: 1500, StartLT: 15, EndLT: 16},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 			{
-				ID:    earlier,
-				Block: []byte{0x02},
-				Meta:  &storage.BlockMeta{ID: earlier, GenUTime: 1200, StartLT: 12, EndLT: 13},
+				ID:             earlier,
+				Block:          []byte{0x02},
+				Meta:           &storage.BlockMeta{ID: earlier, GenUTime: 1200, StartLT: 12, EndLT: 13},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 	}); err != nil {
@@ -632,10 +642,11 @@ func TestCheckpointArchiveArtifactsRegistersInlineMasterPackageMetadata(t *testi
 
 	err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: []byte{0x01},
-			Proof: []byte{0x02},
-			Meta:  &storage.BlockMeta{ID: block, GenUTime: 1500, StartLT: 15, EndLT: 16},
+			ID:             block,
+			Block:          []byte{0x01},
+			Proof:          []byte{0x02},
+			Meta:           &storage.BlockMeta{ID: block, GenUTime: 1500, StartLT: 15, EndLT: 16},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err != nil {
@@ -759,7 +770,7 @@ func TestCheckpointArchiveArtifactsRegistersInlineShardPackage(t *testing.T) {
 				ID:    master,
 				Block: []byte{0x01},
 				Proof: []byte{0x02},
-				Meta:  &storage.BlockMeta{ID: master, GenUTime: 1800, StartLT: 17, EndLT: 18},
+				Meta:  &storage.BlockMeta{ID: master, GenUTime: 1800, StartLT: 17, EndLT: 18}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 			{
 				ID:    shard,
@@ -771,7 +782,7 @@ func TestCheckpointArchiveArtifactsRegistersInlineShardPackage(t *testing.T) {
 					GenUTime:            1800,
 					StartLT:             18,
 					EndLT:               19,
-				},
+				}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 	})
@@ -814,10 +825,11 @@ func TestArchivePackIDsFollowCppPackageIndexOrder(t *testing.T) {
 	baseMaster := testServedBlockID(-1, topShard, 20000, 0x60)
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    baseMaster,
-			Block: []byte{0x01},
-			Proof: []byte{0x02},
-			Meta:  &storage.BlockMeta{ID: baseMaster, GenUTime: 20000, StartLT: 20, EndLT: 21},
+			ID:             baseMaster,
+			Block:          []byte{0x01},
+			Proof:          []byte{0x02},
+			Meta:           &storage.BlockMeta{ID: baseMaster, GenUTime: 20000, StartLT: 20, EndLT: 21},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save base master package: %v", err)
@@ -834,10 +846,11 @@ func TestArchivePackIDsFollowCppPackageIndexOrder(t *testing.T) {
 	nextMaster := testServedBlockID(-1, topShard, 20150, 0x61)
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    nextMaster,
-			Block: []byte{0x03},
-			Proof: []byte{0x04},
-			Meta:  &storage.BlockMeta{ID: nextMaster, GenUTime: 20150, StartLT: 22, EndLT: 23},
+			ID:             nextMaster,
+			Block:          []byte{0x03},
+			Proof:          []byte{0x04},
+			Meta:           &storage.BlockMeta{ID: nextMaster, GenUTime: 20150, StartLT: 22, EndLT: 23},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save next master package: %v", err)
@@ -864,6 +877,7 @@ func TestArchivePackIDsFollowCppPackageIndexOrder(t *testing.T) {
 				StartLT:             24,
 				EndLT:               25,
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save shard package: %v", err)
@@ -971,10 +985,11 @@ func TestAppendArchiveEntriesReusesLoadedPackageIDs(t *testing.T) {
 
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    master,
-			Block: []byte{0x01},
-			Proof: []byte{0x02},
-			Meta:  masterMeta,
+			ID:             master,
+			Block:          []byte{0x01},
+			Proof:          []byte{0x02},
+			Meta:           masterMeta,
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save master archive: %v", err)
@@ -984,7 +999,7 @@ func TestAppendArchiveEntriesReusesLoadedPackageIDs(t *testing.T) {
 			ID:    shardA,
 			Block: []byte{0x03},
 			Proof: []byte{0x04},
-			Meta:  shardMeta(shardA),
+			Meta:  shardMeta(shardA), MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save shard archive: %v", err)
@@ -1048,7 +1063,7 @@ func TestArchiveInfoUsesKeyBlockPackageBaseInsidePreviousSliceRange(t *testing.T
 					GenUTime: oldMaster.SeqNo,
 					StartLT:  0,
 					EndLT:    1,
-				},
+				}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 			{
 				ID:    oldShard,
@@ -1060,7 +1075,7 @@ func TestArchiveInfoUsesKeyBlockPackageBaseInsidePreviousSliceRange(t *testing.T
 					GenUTime:            oldMaster.SeqNo,
 					StartLT:             1,
 					EndLT:               2,
-				},
+				}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 	}); err != nil {
@@ -1086,7 +1101,7 @@ func TestArchiveInfoUsesKeyBlockPackageBaseInsidePreviousSliceRange(t *testing.T
 					GenUTime: keyMaster.SeqNo,
 					StartLT:  3,
 					EndLT:    4,
-				},
+				}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 			{
 				ID:    newShard,
@@ -1098,7 +1113,7 @@ func TestArchiveInfoUsesKeyBlockPackageBaseInsidePreviousSliceRange(t *testing.T
 					GenUTime:            keyMaster.SeqNo,
 					StartLT:             5,
 					EndLT:               6,
-				},
+				}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 	}); err != nil {
@@ -1158,6 +1173,7 @@ func TestCheckpointArchiveArtifactsRejectsInlineShardPackageWithoutMasterRef(t *
 				StartLT:  181,
 				EndLT:    182,
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "masterchain reference is required") {
@@ -1195,6 +1211,7 @@ func TestCheckpointArchiveArtifactsKeyBlockProofUsesKeyArchivePack(t *testing.T)
 				StartLT:  345678,
 				EndLT:    345679,
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save key proof: %v", err)
@@ -1247,6 +1264,7 @@ func TestPendingKeyProofPackKeepsFirstCleanSize(t *testing.T) {
 				StartLT:  345678,
 				EndLT:    345679,
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save committed key proof: %v", err)
@@ -1327,6 +1345,7 @@ func TestCheckpointArchiveRegistrationsUsePendingKeyBlockPackageStart(t *testing
 					StartLT:  123,
 					EndLT:    124,
 				},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 		{
@@ -1340,6 +1359,7 @@ func TestCheckpointArchiveRegistrationsUsePendingKeyBlockPackageStart(t *testing
 					StartLT:  124,
 					EndLT:    125,
 				},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 	}
@@ -1389,6 +1409,7 @@ func TestCheckpointArchiveAppendUsesStateMasterchainRefForShardArtifact(t *testi
 				StartLT:  uint64(shard.SeqNo),
 				EndLT:    uint64(shard.SeqNo + 1),
 			},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		},
 	}}
 
@@ -1448,10 +1469,11 @@ func TestCheckpointArchiveArtifactsReplacesMissingArtifactRefs(t *testing.T) {
 	proofData := []byte{0x44, 0x55, 0x66}
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: blockData,
-			Proof: proofData,
-			Meta:  &storage.BlockMeta{ID: block, GenUTime: 123, StartLT: 10, EndLT: 20},
+			ID:             block,
+			Block:          blockData,
+			Proof:          proofData,
+			Meta:           &storage.BlockMeta{ID: block, GenUTime: 123, StartLT: 10, EndLT: 20},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save block full: %v", err)
@@ -1495,13 +1517,13 @@ func TestArchiveInfoNormalizesSplitShardPrefix(t *testing.T) {
 				ID:    master,
 				Block: []byte{0},
 				Proof: []byte{3},
-				Meta:  &storage.BlockMeta{ID: master, GenUTime: 420, StartLT: 41, EndLT: 42},
+				Meta:  &storage.BlockMeta{ID: master, GenUTime: 420, StartLT: 41, EndLT: 42}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 			{
 				ID:    block,
 				Block: []byte{1},
 				Proof: []byte{2},
-				Meta:  &storage.BlockMeta{ID: block, MasterchainRefSeqno: master.SeqNo, GenUTime: 420, StartLT: 42, EndLT: 43},
+				Meta:  &storage.BlockMeta{ID: block, MasterchainRefSeqno: master.SeqNo, GenUTime: 420, StartLT: 42, EndLT: 43}, MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		},
 	}); err != nil {
@@ -1538,20 +1560,22 @@ func TestArchivePackIDSeparatesBasechainFullAndSplitShard(t *testing.T) {
 	}
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    master,
-			Block: []byte{0},
-			Proof: []byte{5},
-			Meta:  &storage.BlockMeta{ID: master, GenUTime: 1560, StartLT: 155, EndLT: 156},
+			ID:             master,
+			Block:          []byte{0},
+			Proof:          []byte{5},
+			Meta:           &storage.BlockMeta{ID: master, GenUTime: 1560, StartLT: 155, EndLT: 156},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save master archive: %v", err)
 	}
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    full,
-			Block: []byte{1},
-			Proof: []byte{2},
-			Meta:  &storage.BlockMeta{ID: full, MasterchainRefSeqno: master.SeqNo, GenUTime: 1560, StartLT: 156, EndLT: 157},
+			ID:             full,
+			Block:          []byte{1},
+			Proof:          []byte{2},
+			Meta:           &storage.BlockMeta{ID: full, MasterchainRefSeqno: master.SeqNo, GenUTime: 1560, StartLT: 156, EndLT: 157},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save full basechain archive: %v", err)
@@ -1567,10 +1591,11 @@ func TestArchivePackIDSeparatesBasechainFullAndSplitShard(t *testing.T) {
 	}
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    split,
-			Block: []byte{3},
-			Proof: []byte{4},
-			Meta:  &storage.BlockMeta{ID: split, MasterchainRefSeqno: master.SeqNo, GenUTime: 1560, StartLT: 158, EndLT: 159},
+			ID:             split,
+			Block:          []byte{3},
+			Proof:          []byte{4},
+			Meta:           &storage.BlockMeta{ID: split, MasterchainRefSeqno: master.SeqNo, GenUTime: 1560, StartLT: 158, EndLT: 159},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save split basechain archive: %v", err)
@@ -1601,10 +1626,11 @@ func TestArchivePackIDSeparatesDeepShardPrefixes(t *testing.T) {
 	shardB := testShardID(0xb68c000000000000)
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    master,
-			Block: []byte{0x01},
-			Proof: []byte{0x02},
-			Meta:  &storage.BlockMeta{ID: master, GenUTime: 3085024, StartLT: 99, EndLT: 100},
+			ID:             master,
+			Block:          []byte{0x01},
+			Proof:          []byte{0x02},
+			Meta:           &storage.BlockMeta{ID: master, GenUTime: 3085024, StartLT: 99, EndLT: 100},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save master archive: %v", err)
@@ -1630,6 +1656,7 @@ func TestArchivePackIDSeparatesDeepShardPrefixes(t *testing.T) {
 					StartLT:             uint64(100 + idx),
 					EndLT:               uint64(101 + idx),
 				},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			}},
 		}); err != nil {
 			t.Fatalf("save shard %016x archive: %v", uint64(shard), err)
@@ -1666,9 +1693,10 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 		t.Helper()
 		if err := saveTestArchiveArtifacts(store, testArchiveImport{
 			FullBlocks: []*storage.ServedBlockFull{{
-				ID:    block,
-				Block: []byte{byte(block.SeqNo)},
-				Meta:  &storage.BlockMeta{ID: block, GenUTime: utime, StartLT: uint64(block.SeqNo), EndLT: uint64(block.SeqNo + 1)},
+				ID:             block,
+				Block:          []byte{byte(block.SeqNo)},
+				Meta:           &storage.BlockMeta{ID: block, GenUTime: utime, StartLT: uint64(block.SeqNo), EndLT: uint64(block.SeqNo + 1)},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			}},
 		}); err != nil {
 			t.Fatalf("save block %d: %v", block.SeqNo, err)
@@ -1961,9 +1989,10 @@ func TestOpenTruncatesArchivePackToPublishedRefs(t *testing.T) {
 	block := testArchivePruneBlock(42, 0x42)
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    block,
-			Block: []byte{0x42},
-			Meta:  &storage.BlockMeta{ID: block, GenUTime: 4200, StartLT: 42, EndLT: 43},
+			ID:             block,
+			Block:          []byte{0x42},
+			Meta:           &storage.BlockMeta{ID: block, GenUTime: 4200, StartLT: 42, EndLT: 43},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save block: %v", err)
@@ -2107,6 +2136,7 @@ func saveArchivePruneBlock(t *testing.T, store *Store, block ton.BlockIDExt, uti
 			StartLT:  uint64(block.SeqNo),
 			EndLT:    uint64(block.SeqNo + 1),
 		},
+		MessageEntries: []storage.MessageTransactionIndexEntry{},
 	}
 	if len(proof) > 0 {
 		full.Proof = proof
@@ -2155,6 +2185,7 @@ func testArchivePackageCacheBlock(block ton.BlockIDExt, blockData []byte, proofD
 			StartLT:  uint64(block.SeqNo),
 			EndLT:    uint64(block.SeqNo + 1),
 		},
+		MessageEntries: []storage.MessageTransactionIndexEntry{},
 	}
 }
 
@@ -2238,10 +2269,11 @@ func TestArtifactSlicesReturnNotFoundOnTruncatedFiles(t *testing.T) {
 
 	if err = saveTestArchiveArtifacts(store, testArchiveImport{
 		FullBlocks: []*storage.ServedBlockFull{{
-			ID:    master,
-			Block: []byte{9, 8, 7},
-			Proof: []byte{6, 5, 4},
-			Meta:  &storage.BlockMeta{ID: master, GenUTime: 780, StartLT: 78, EndLT: 79},
+			ID:             master,
+			Block:          []byte{9, 8, 7},
+			Proof:          []byte{6, 5, 4},
+			Meta:           &storage.BlockMeta{ID: master, GenUTime: 780, StartLT: 78, EndLT: 79},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		}},
 	}); err != nil {
 		t.Fatalf("save archive import: %v", err)

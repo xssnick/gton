@@ -197,17 +197,25 @@ func (s *p2pStateSource) blockStateRootArtifact(ctx context.Context, block ton.B
 	if len(meta.StateRootHash) == 0 {
 		return nil, nil, fmt.Errorf("block has no state update target")
 	}
+	// Checkpoint artifacts require the message->tx index extracted at ingest;
+	// the state anchor blocks bypass the sync prepare stages, so extract here
+	// from the already verified root.
+	messageEntries, err := storage.MessageTransactionEntriesFromBlockCell(downloaded.ID, root)
+	if err != nil {
+		return nil, nil, fmt.Errorf("extract message transaction entries for %s: %w", storage.FormatBlockRef(block), err)
+	}
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
 		Str("state_root_hash", fmt.Sprintf("%x", meta.StateRootHash)).
 		Msg("resolved block state root for snapshot validation")
 	return &storage.ServedBlockFull{
-		ID:     downloaded.ID,
-		Proof:  downloaded.ProofBOC,
-		Block:  downloaded.BlockBOC,
-		Meta:   meta,
-		IsLink: storage.ServedBlockProofIsLink(downloaded.ID, downloaded.IsLink),
+		ID:             downloaded.ID,
+		Proof:          downloaded.ProofBOC,
+		Block:          downloaded.BlockBOC,
+		Meta:           meta,
+		IsLink:         storage.ServedBlockProofIsLink(downloaded.ID, downloaded.IsLink),
+		MessageEntries: messageEntries,
 	}, meta.StateRootHash, nil
 }
 

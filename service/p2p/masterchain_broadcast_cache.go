@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -86,6 +85,8 @@ func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now 
 		meta:         downloaded.Meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
 		bytes:        size,
+
+		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
 
 	c.storeEntry(entry, now)
@@ -131,45 +132,13 @@ func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock
 	return true
 }
 
-func (n *Node) masterchainNextBroadcastBlock(prev ton.BlockIDExt) (*DownloadedBlock, error) {
-	return n.masterchainNextBroadcastCache.BlockAfter(prev)
-}
-
 func (n *Node) watchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan struct{}, func()) {
 	if !isMasterchainBlock(prev) {
 		return nil, func() {}
 	}
 
 	key := tnstore.BlockKey(prev)
-	ch := make(chan struct{})
-
-	n.masterchainNextBroadcastWaitMx.Lock()
-	if n.masterchainNextBroadcastWaiters == nil {
-		n.masterchainNextBroadcastWaiters = map[tnstore.BlockRootHash][]chan struct{}{}
-	}
-	n.masterchainNextBroadcastWaiters[key] = append(n.masterchainNextBroadcastWaiters[key], ch)
-	n.masterchainNextBroadcastWaitMx.Unlock()
-
-	var once sync.Once
-	cancel := func() {
-		once.Do(func() {
-			n.masterchainNextBroadcastWaitMx.Lock()
-			waiters := n.masterchainNextBroadcastWaiters[key]
-			for i, waiter := range waiters {
-				if waiter == ch {
-					waiters = append(waiters[:i], waiters[i+1:]...)
-					break
-				}
-			}
-			if len(waiters) == 0 {
-				delete(n.masterchainNextBroadcastWaiters, key)
-			} else {
-				n.masterchainNextBroadcastWaiters[key] = waiters
-			}
-			n.masterchainNextBroadcastWaitMx.Unlock()
-		})
-	}
-	return ch, cancel
+	return n.masterchainNextBroadcastWaiters.watch(key)
 }
 
 func (n *Node) notifyMasterchainNextBroadcastBlock(prev ton.BlockIDExt) {
@@ -178,13 +147,5 @@ func (n *Node) notifyMasterchainNextBroadcastBlock(prev ton.BlockIDExt) {
 	}
 
 	key := tnstore.BlockKey(prev)
-
-	n.masterchainNextBroadcastWaitMx.Lock()
-	waiters := n.masterchainNextBroadcastWaiters[key]
-	delete(n.masterchainNextBroadcastWaiters, key)
-	n.masterchainNextBroadcastWaitMx.Unlock()
-
-	for _, waiter := range waiters {
-		close(waiter)
-	}
+	n.masterchainNextBroadcastWaiters.notify(key)
 }

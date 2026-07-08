@@ -1,9 +1,10 @@
 package liveview
 
 import (
-	"context"
 	"errors"
 	"fmt"
+
+	"github.com/xssnick/gton/service/blockproof"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -16,50 +17,24 @@ type ExternalMessageSizeLimits struct {
 }
 
 func (f *BlockView) ExternalMessageLimits() (ExternalMessageSizeLimits, error) {
-	f.mu.Lock()
-	if f.extMsgLimitsLoaded {
-		limits := f.extMsgLimits
-		f.mu.Unlock()
-		return limits, nil
-	}
-	f.mu.Unlock()
-
-	value, err := f.lazyLoad.do(context.Background(), liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadExternalMessageLimits}, func() (any, error) {
-		f.mu.Lock()
-		if f.extMsgLimitsLoaded {
-			limits := f.extMsgLimits
-			f.mu.Unlock()
-			return limits, nil
-		}
-		f.mu.Unlock()
-
-		base, err := f.runMethodBaseConfig()
-		if err != nil {
-			return ExternalMessageSizeLimits{}, err
-		}
-		limits, err := externalMessageLimitsFromBaseConfig(base)
-		if err != nil {
-			return ExternalMessageSizeLimits{}, err
-		}
-
-		f.mu.Lock()
-		if !f.extMsgLimitsLoaded {
-			f.extMsgLimits = limits
-			f.extMsgLimitsLoaded = true
-		} else {
-			limits = f.extMsgLimits
-		}
-		f.mu.Unlock()
-		return limits, nil
-	})
-	if err != nil {
-		return ExternalMessageSizeLimits{}, err
-	}
-	limits, ok := value.(ExternalMessageSizeLimits)
-	if !ok {
-		return ExternalMessageSizeLimits{}, errors.New("invalid external message limits cache value")
-	}
-	return limits, nil
+	return lazyLoadFragment(f,
+		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadExternalMessageLimits},
+		func() (ExternalMessageSizeLimits, bool) { return f.extMsgLimits, f.extMsgLimitsLoaded },
+		func(limits ExternalMessageSizeLimits) ExternalMessageSizeLimits {
+			if !f.extMsgLimitsLoaded {
+				f.extMsgLimits = limits
+				f.extMsgLimitsLoaded = true
+			}
+			return f.extMsgLimits
+		},
+		func() (ExternalMessageSizeLimits, error) {
+			base, err := f.runMethodBaseConfig()
+			if err != nil {
+				return ExternalMessageSizeLimits{}, err
+			}
+			return externalMessageLimitsFromBaseConfig(base)
+		},
+	)
 }
 
 func CheckExternalMessageLimits(limits ExternalMessageSizeLimits, data []byte, root *cell.Cell) error {
@@ -80,17 +55,16 @@ func (f *BlockView) ExternalMessageAccount(addr *address.Address) (*tlb.ShardAcc
 }
 
 func externalMessageLimitsFromBaseConfig(base *runMethodBaseConfig) (ExternalMessageSizeLimits, error) {
-	param := base.Unpacked.Params[runMethodConfigParamSizeLimitsIndex]
+	// The config epoch resolves the ext-message limits once at build time.
+	return base.epoch.extMsgLimits, nil
+}
 
-	var limits tlb.SizeLimitsConfig
-	if param == nil {
-		var err error
-		// Preserve tonutils-go's default size limits when config param 43 is absent.
-		limits, err = base.Config.GetSizeLimitsConfig()
-		if err != nil {
-			return ExternalMessageSizeLimits{}, err
-		}
-	} else if err := tlb.Parse(&limits, param); err != nil {
+// externalMessageLimitsFromConfigRoot resolves the ext-message size/depth
+// limits from a blockchain config root (param 43, defaults applied when
+// absent). Called once per config epoch.
+func externalMessageLimitsFromConfigRoot(root *cell.Cell) (ExternalMessageSizeLimits, error) {
+	limits, err := (tlb.BlockchainConfig{Root: root}).GetSizeLimitsConfig()
+	if err != nil {
 		return ExternalMessageSizeLimits{}, err
 	}
 
@@ -111,7 +85,7 @@ func externalMessageAccountFromAccountsRoot(accountsRoot *cell.Cell, addr *addre
 		return shard, account, err
 	}
 
-	value, err := accountsRoot.AsDict(256).LoadValue(accountKey(addr.Data()))
+	value, err := accountsRoot.AsDict(256).LoadValue(blockproof.AccountKey(addr.Data()))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		shard := emptyShardAccount()
 		account, parseErr := accountStateFromShardAccount(shard)

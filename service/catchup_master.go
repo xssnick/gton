@@ -143,19 +143,24 @@ func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 	if current != nil {
 		s.rememberAppliedMasterchainState(&current.Masterchain)
 	}
-	if !s.publishLiveCurrentStateChanged(current) {
+	snapshot := s.publishLiveCurrentStateChanged(current)
+	if snapshot == nil {
 		return
 	}
 	if s.liveState != nil {
-		s.liveState.SetLiveCurrentState(current)
+		s.liveState.SetLiveCurrentStateSnapshot(snapshot)
 		s.liveState.MarkLiveCurrentStateFlushed(current)
 	}
 	s.wakeServiceMaintenance()
 }
 
-func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) bool {
+// publishLiveCurrentStateChanged clones current once, publishes the clone as
+// the node-wide current status and returns it so callers can reuse it as an
+// immutable snapshot (e.g. hand it to the live view without a second clone).
+// Returns nil when current is nil or behind the already-published status.
+func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) *storage.CurrentState {
 	if current == nil {
-		return false
+		return nil
 	}
 
 	next := storage.CloneCurrentState(current)
@@ -163,7 +168,7 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	s.currentStatusMu.Lock()
 	if currentStateBehind(next, s.currentStatus) {
 		s.currentStatusMu.Unlock()
-		return false
+		return nil
 	}
 	s.currentStatus = next
 	s.currentStatusMu.Unlock()
@@ -173,7 +178,7 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	if s.node != nil {
 		s.node.NotifyCompressedBlockStateReady(currentStateCompressedBlockStateRefs(next)...)
 	}
-	return true
+	return next
 }
 
 func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.BlockIDExt {
@@ -193,6 +198,9 @@ func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.B
 func (s *Service) rememberAppliedMasterchainState(state *storage.BlockState) {
 	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard {
 		return
+	}
+	if s.node != nil {
+		s.node.NoteAppliedMasterchainSeqno(state.Block.SeqNo)
 	}
 
 	next := storage.CloneBlockState(state)
@@ -277,21 +285,55 @@ func (s *Service) applyMasterchainTransition(ctx context.Context, current *stora
 	return next, finish(), nil
 }
 
-func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
+// beginNextBlockCheckpointLocked validates persist availability and prepares
+// the checkpoint. Called with currentStatePersistMu held; on error the mutex
+// is released before returning.
+func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
 	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		s.currentStatePersistMu.Unlock()
-		return nil, err
+		return stateCheckpointData{}, err
 	}
-
 	checkpoint, err := prepareStateCheckpoint(current, entries, cells)
 	if err != nil {
 		s.currentStatePersistMu.Unlock()
+		return stateCheckpointData{}, err
+	}
+	timing.checkpoints++
+	return checkpoint, nil
+}
+
+// saveNextBlockCheckpointLocked runs the checkpoint save and is the single
+// owner of releasing currentStatePersistMu: it unlocks exactly once on every
+// path. onError runs before the unlock on the failure path so persist errors
+// become visible to the next flush before the mutex is released.
+func (s *Service) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint stateCheckpointData, cells *stateCellCheckpointCache, onCommitted func(), onError func(error)) (*storage.CurrentState, []SyncPersistStageObservation, time.Duration, error) {
+	started := time.Now()
+	committed, stages, err := s.saveStateCheckpoint(ctx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget)
+	elapsed := time.Since(started)
+	if err != nil {
+		if onError != nil {
+			onError(err)
+		}
+		s.currentStatePersistMu.Unlock()
+		return nil, stages, elapsed, err
+	}
+
+	if onCommitted != nil {
+		onCommitted()
+	}
+	cells.complete()
+	s.currentStatePersistMu.Unlock()
+	return committed, stages, elapsed, nil
+}
+
+func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
+	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells)
+	if err != nil {
 		return nil, err
 	}
 	master := current.Masterchain.Block
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
-	timing.checkpoints++
 
 	s.log.Debug().
 		Str("masterchain", storage.FormatBlockRef(master)).
@@ -306,13 +348,12 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 			defer onDone()
 		}
 
-		started := time.Now()
-		committed, stages, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget)
-		elapsed := time.Since(started)
-		if err != nil {
-			wrapped := fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
+		var wrapped error
+		committed, stages, elapsed, err := s.saveNextBlockCheckpointLocked(persistCtx, checkpoint, cells, onCommitted, func(saveErr error) {
+			wrapped = fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), saveErr)
 			s.setCurrentStatePersistError(wrapped)
-			s.currentStatePersistMu.Unlock()
+		})
+		if err != nil {
 			s.observeSyncPersist(SyncPersistObservation{
 				Mode:          "next_block_async",
 				Result:        "error",
@@ -330,12 +371,6 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 				Msg("next-block shard-client checkpoint failed")
 			return
 		}
-
-		if onCommitted != nil {
-			onCommitted()
-		}
-		cells.complete()
-		s.currentStatePersistMu.Unlock()
 
 		s.observeSyncPersist(SyncPersistObservation{
 			Mode:          "next_block_async",
@@ -361,27 +396,19 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 }
 
 func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
-	if err := s.checkCurrentStatePersistAllowed(); err != nil {
-		s.currentStatePersistMu.Unlock()
-		return nil, err
-	}
-	checkpoint, err := prepareStateCheckpoint(current, entries, cells)
+	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells)
 	if err != nil {
-		s.currentStatePersistMu.Unlock()
 		return nil, err
 	}
 	master := current.Masterchain.Block
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
-	timing.checkpoints++
 	if onDone != nil {
 		defer onDone()
 	}
 
-	started := time.Now()
 	persistCtx := s.currentStatePersistContext()
-	committed, stages, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget)
-	elapsed := time.Since(started)
+	committed, stages, elapsed, err := s.saveNextBlockCheckpointLocked(persistCtx, checkpoint, cells, onCommitted, nil)
 	if err != nil {
 		s.observeSyncPersist(SyncPersistObservation{
 			Mode:          "next_block_sync",
@@ -391,15 +418,8 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 			States:        len(checkpoint.entries),
 			Stages:        stages,
 		})
-		s.currentStatePersistMu.Unlock()
 		return nil, fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 	}
-
-	if onCommitted != nil {
-		onCommitted()
-	}
-	cells.complete()
-	s.currentStatePersistMu.Unlock()
 
 	s.observeSyncPersist(SyncPersistObservation{
 		Mode:          "next_block_sync",
@@ -680,7 +700,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepareElapsed := time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
-			source:         syncBlockSourceForDownloadedBlock(SyncBlockSourcePeerProbe, *downloaded),
+			source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, downloaded.Kind),
 			prepareElapsed: prepareElapsed,
 			err:            fmt.Errorf("verify probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 		}
@@ -690,7 +710,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepareElapsed = time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
-			source:         syncBlockSourceForVerifiedBlock(SyncBlockSourcePeerProbe, verified),
+			source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, verified.Kind),
 			prepareElapsed: prepareElapsed,
 			err:            fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 		}

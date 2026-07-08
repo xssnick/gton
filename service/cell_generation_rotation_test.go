@@ -452,11 +452,11 @@ func TestPendingCellGenerationMigrationLeaseIgnoresStartLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin pending migration: %v", err)
 	}
-	if !svc.cellGenerationMigrationActive() {
+	if !svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
 		t.Fatal("pending migration lease did not mark migration active")
 	}
 	lease.release()
-	if svc.cellGenerationMigrationActive() {
+	if svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
 		t.Fatal("pending migration lease did not release")
 	}
 }
@@ -522,7 +522,7 @@ func TestRunPendingCellGenerationMigrationOpensGenerationBeforeCompactionWait(t 
 	if store.cellGenerationDBMetricsCalls != 1 {
 		t.Fatalf("pending generation metrics calls = %d, want 1", store.cellGenerationDBMetricsCalls)
 	}
-	if svc.cellGenerationMigrationActive() {
+	if svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
 		t.Fatal("pending migration lease was not released after compaction wait")
 	}
 	if svc.cellGenerationMigrationRun != nil {

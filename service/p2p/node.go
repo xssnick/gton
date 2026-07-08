@@ -86,6 +86,10 @@ type Node struct {
 
 	networkStarted atomic.Bool
 
+	// appliedMasterchainSeqno is the highest masterchain seqno the service has
+	// applied; broadcasts at or below it are dropped before signature work.
+	appliedMasterchainSeqno atomic.Uint32
+
 	offlineReasonMu sync.RWMutex
 	offlineReason   string
 
@@ -98,7 +102,6 @@ type Node struct {
 	zeroStateFileHash               []byte
 	zeroStateBlock                  ton.BlockIDExt
 	initBlock                       ton.BlockIDExt
-	hardforks                       []ton.BlockIDExt
 	hardforkSet                     map[blockIDFullKey]struct{}
 	externalPort                    uint16
 	dhtListenAddr                   string
@@ -115,11 +118,9 @@ type Node struct {
 	broadcastPipelineObserver       BroadcastPipelineObserver
 	shardBroadcastCache             *shardBroadcastBlockCache
 	shardCandidateCache             *shardBlockCandidateCache
-	shardBroadcastWaitMx            sync.Mutex
-	shardBroadcastWaiters           map[storage2.BlockRootHash][]chan struct{}
+	shardBroadcastWaiters           keyedBroadcastWaiters
 	masterchainNextBroadcastCache   *masterchainNextBroadcastCache
-	masterchainNextBroadcastWaitMx  sync.Mutex
-	masterchainNextBroadcastWaiters map[storage2.BlockRootHash][]chan struct{}
+	masterchainNextBroadcastWaiters keyedBroadcastWaiters
 	blockCacheObserver              BlockCacheObserver
 	rebroadcastQuiet                atomic.Bool
 
@@ -263,64 +264,62 @@ func New(opts Options) (*Node, error) {
 	}
 
 	return &Node{
-		log:                             logger,
-		globalConfig:                    opts.GlobalConfig,
-		listenAddr:                      opts.ListenAddr,
-		externalIP:                      append(net.IP(nil), opts.ExternalIP...),
-		externalPort:                    opts.ExternalPort,
-		privKey:                         priv,
-		localID:                         localID,
-		dhtPrivKey:                      dhtPriv,
-		gateway:                         gateway,
-		dhtListenAddr:                   opts.DHTListenAddr,
-		pool:                            newPeerPool(gateway),
-		events:                          make(chan BroadcastEvent, broadcastEventBuffer),
-		eventQueue:                      newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
-		deduper:                         newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		customFanoutDeduper:             newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		myExternalMessages:              newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
-		processedExternalMessages:       newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
-		externalMessageLimiter:          extmsg.NewDefaultAddressLimiter(),
-		externalBroadcastPacer:          externalBroadcastPacer,
-		allowDuplicateExternals:         opts.AllowDuplicateExternals,
-		localExternalFanout:             localExternalFanout,
-		runCtx:                          context.Background(),
-		stopped:                         make(chan struct{}),
-		subscriptions:                   map[string]*overlaySubscription{},
-		monitorMinSplitDepth:            map[int32]uint32{},
-		latestBasechainShards:           map[storage2.ShardKey]ton.BlockIDExt{},
-		observedMasterchainNotify:       make(chan struct{}),
-		seenMasterchainNotify:           make(chan struct{}),
-		latestBasechainNotify:           make(chan struct{}),
-		rawMasterchainNotify:            make(chan struct{}),
-		storage:                         storage,
-		peerStorage:                     peerStorage,
-		liveBlockCache:                  liveBlockCache,
-		compressedState:                 opts.CompressedState,
-		syncLag:                         opts.SyncLag,
-		signatureVerifier:               opts.SignatureVerifier,
-		broadcastAdmission:              opts.BroadcastAdmission,
-		externalMessageAdmission:        opts.ExternalMessageAdmission,
-		blockReceivedObserver:           opts.BlockReceivedObserver,
-		blockReceivedHooks:              blockReceivedHooksEnabled(opts.BlockReceivedObserver),
-		shardBroadcastCache:             newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
-		shardCandidateCache:             newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
-		shardBroadcastWaiters:           map[storage2.BlockRootHash][]chan struct{}{},
-		masterchainNextBroadcastCache:   newMasterchainNextBroadcastCache(masterchainNextBroadcastCacheTTL, masterchainNextBroadcastCacheMaxBytes, masterchainNextBroadcastCacheMaxItems),
-		masterchainNextBroadcastWaiters: map[storage2.BlockRootHash][]chan struct{}{},
-		rebroadcastThrottleLast:         map[string]time.Time{},
-		rebroadcastFECSlots:             newRebroadcastFECSlotLimits(),
-		rebroadcastFECPeers:             newRebroadcastFECPeerLimits(),
-		pendingBroadcasts:               map[string]pendingBlockBroadcastDecode{},
-		pendingBroadcastByPrev:          map[storage2.BlockRootHash]map[string]struct{}{},
-		broadcastStats:                  map[broadcastStatKey]uint64{},
-		fecReceiverLast:                 map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
-		fecReceiverTotals:               map[string]fecReceiverCounterSnapshot{},
-		stateFilesDir:                   stateFilesDir,
-		peerUse:                         map[PeerID]peerUse{},
-		stateCellImportSlot:             make(chan struct{}, 1),
-		stateSplitPartDecodeSlot:        make(chan struct{}, 1),
-		customOverlays:                  append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
+		log:                           logger,
+		globalConfig:                  opts.GlobalConfig,
+		listenAddr:                    opts.ListenAddr,
+		externalIP:                    append(net.IP(nil), opts.ExternalIP...),
+		externalPort:                  opts.ExternalPort,
+		privKey:                       priv,
+		localID:                       localID,
+		dhtPrivKey:                    dhtPriv,
+		gateway:                       gateway,
+		dhtListenAddr:                 opts.DHTListenAddr,
+		pool:                          newPeerPool(gateway),
+		events:                        make(chan BroadcastEvent, broadcastEventBuffer),
+		eventQueue:                    newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
+		deduper:                       newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		customFanoutDeduper:           newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		myExternalMessages:            newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		processedExternalMessages:     newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
+		externalMessageLimiter:        extmsg.NewDefaultAddressLimiter(),
+		externalBroadcastPacer:        externalBroadcastPacer,
+		allowDuplicateExternals:       opts.AllowDuplicateExternals,
+		localExternalFanout:           localExternalFanout,
+		runCtx:                        context.Background(),
+		stopped:                       make(chan struct{}),
+		subscriptions:                 map[string]*overlaySubscription{},
+		monitorMinSplitDepth:          map[int32]uint32{},
+		latestBasechainShards:         map[storage2.ShardKey]ton.BlockIDExt{},
+		observedMasterchainNotify:     make(chan struct{}),
+		seenMasterchainNotify:         make(chan struct{}),
+		latestBasechainNotify:         make(chan struct{}),
+		rawMasterchainNotify:          make(chan struct{}),
+		storage:                       storage,
+		peerStorage:                   peerStorage,
+		liveBlockCache:                liveBlockCache,
+		compressedState:               opts.CompressedState,
+		syncLag:                       opts.SyncLag,
+		signatureVerifier:             opts.SignatureVerifier,
+		broadcastAdmission:            opts.BroadcastAdmission,
+		externalMessageAdmission:      opts.ExternalMessageAdmission,
+		blockReceivedObserver:         opts.BlockReceivedObserver,
+		blockReceivedHooks:            blockReceivedHooksEnabled(opts.BlockReceivedObserver),
+		shardBroadcastCache:           newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
+		shardCandidateCache:           newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
+		masterchainNextBroadcastCache: newMasterchainNextBroadcastCache(masterchainNextBroadcastCacheTTL, masterchainNextBroadcastCacheMaxBytes, masterchainNextBroadcastCacheMaxItems),
+		rebroadcastThrottleLast:       map[string]time.Time{},
+		rebroadcastFECSlots:           newRebroadcastFECSlotLimits(),
+		rebroadcastFECPeers:           newRebroadcastFECPeerLimits(),
+		pendingBroadcasts:             map[string]pendingBlockBroadcastDecode{},
+		pendingBroadcastByPrev:        map[storage2.BlockRootHash]map[string]struct{}{},
+		broadcastStats:                map[broadcastStatKey]uint64{},
+		fecReceiverLast:               map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
+		fecReceiverTotals:             map[string]fecReceiverCounterSnapshot{},
+		stateFilesDir:                 stateFilesDir,
+		peerUse:                       map[PeerID]peerUse{},
+		stateCellImportSlot:           make(chan struct{}, 1),
+		stateSplitPartDecodeSlot:      make(chan struct{}, 1),
+		customOverlays:                append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
 	}, nil
 }
 
@@ -405,7 +404,6 @@ func (n *Node) Start(ctx context.Context) error {
 	n.zeroStateFileHash = append([]byte(nil), zeroBlock.FileHash...)
 	n.zeroStateBlock = zeroBlock
 	n.initBlock = initBlock
-	n.hardforks = hardforks
 	n.hardforkSet = hardforkSet
 	if len(hardforks) > 0 {
 		n.log.Info().

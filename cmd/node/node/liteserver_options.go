@@ -32,10 +32,18 @@ type liteserverOptions struct {
 	ExternalBroadcastFanout   int
 }
 
-func configureLiteserver(runOpts *gton.NodeOptions, cfg nodeconfig.Config, globalConfig *liteclient.GlobalConfig, queryConcurrency int) (liteserverOptions, error) {
-	opts, err := liteserverOptionsFromConfig(cfg)
+// configureLiteserver applies liteserver-related node options and returns the
+// liteserver extension factory, nil when the liteserver is disabled.
+func configureLiteserver(
+	runOpts *gton.NodeOptions,
+	cfg nodeconfig.Config,
+	runtimeOpts nodeconfig.RuntimeOptions,
+	globalConfig *liteclient.GlobalConfig,
+	queryConcurrency int,
+) (liteserverOptions, hooks.ExtensionFactory, error) {
+	opts, err := liteserverOptionsFromConfig(cfg, runtimeOpts)
 	if err != nil {
-		return liteserverOptions{}, err
+		return liteserverOptions{}, nil, err
 	}
 	opts.QueryConcurrency = queryConcurrency
 
@@ -48,19 +56,15 @@ func configureLiteserver(runOpts *gton.NodeOptions, cfg nodeconfig.Config, globa
 	runOpts.P2P.LocalExternalFanout = opts.ExternalBroadcastFanout
 	runOpts.P2P.AllowDuplicateExternals = opts.AllowDuplicateExternals
 
-	if opts.Enabled {
-		if runOpts.Extension != nil {
-			return liteserverOptions{}, fmt.Errorf("liteserver cannot be enabled together with a custom static extension")
-		}
-
-		zeroState, err := liteserverZeroStateFromGlobalConfig(globalConfig)
-		if err != nil {
-			return liteserverOptions{}, err
-		}
-		runOpts.Extension = liteserverExtensionFactory(opts, zeroState)
+	if !opts.Enabled {
+		return opts, nil, nil
 	}
 
-	return opts, nil
+	zeroState, err := liteserverZeroStateFromGlobalConfig(globalConfig)
+	if err != nil {
+		return liteserverOptions{}, nil, err
+	}
+	return opts, liteserverExtensionFactory(opts, zeroState), nil
 }
 
 func liteserverExtensionFactory(opts liteserverOptions, zeroState ton.ZeroStateIDExt) hooks.ExtensionFactory {
@@ -77,7 +81,7 @@ func liteserverExtensionFactory(opts liteserverOptions, zeroState ton.ZeroStateI
 	}
 }
 
-func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, error) {
+func liteserverOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions) (liteserverOptions, error) {
 	opts := liteserverOptions{
 		Enabled:                 cfg.Lite.Enabled,
 		NonFinalEnabled:         cfg.Lite.NonFinalEnabled,
@@ -111,20 +115,11 @@ func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, erro
 	}
 	opts.Limits = limits
 
-	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
-	if err != nil {
-		return liteserverOptions{}, err
-	}
 	opts.ExternalBroadcastCapacity = p2p.ExternalBroadcastCapacityOptions{
-		BytesPerSecond: capacity.BytesPerSecond,
-		MaxDelay:       capacity.MaxDelay,
+		BytesPerSecond: runtimeOpts.LiteSendMessageBroadcastCapacity.BytesPerSecond,
+		MaxDelay:       runtimeOpts.LiteSendMessageBroadcastCapacity.MaxDelay,
 	}
-
-	fanout, err := cfg.LiteSendMessageBroadcastFanout()
-	if err != nil {
-		return liteserverOptions{}, err
-	}
-	opts.ExternalBroadcastFanout = fanout
+	opts.ExternalBroadcastFanout = runtimeOpts.LiteSendMessageBroadcastFanout
 
 	return opts, nil
 }

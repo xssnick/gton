@@ -31,14 +31,14 @@ func (s *Store) SavePersistentStateSerializerState(ctx context.Context, state *s
 	if !isMasterchainBlock(state.LastBlock) {
 		return fmt.Errorf("persistent state serializer last block is not masterchain: %s", storage.FormatBlockRef(state.LastBlock))
 	}
-	if err := validateFullBlockIDHashes(state.LastBlock); err != nil {
+	if err := storage.ValidateBlockIDHashes(state.LastBlock); err != nil {
 		return err
 	}
 	if state.LastWrittenBlock.SeqNo != 0 && !isMasterchainBlock(state.LastWrittenBlock) {
 		return fmt.Errorf("persistent state serializer last written block is not masterchain: %s", storage.FormatBlockRef(state.LastWrittenBlock))
 	}
 	if state.LastWrittenBlock.SeqNo != 0 {
-		if err := validateFullBlockIDHashes(state.LastWrittenBlock); err != nil {
+		if err := storage.ValidateBlockIDHashes(state.LastWrittenBlock); err != nil {
 			return err
 		}
 	}
@@ -58,7 +58,7 @@ func (s *Store) SaveActivePersistentStateSerialization(ctx context.Context, acti
 	if !isMasterchainBlock(active.Block) {
 		return fmt.Errorf("active persistent state serialization block is not masterchain: %s", storage.FormatBlockRef(active.Block))
 	}
-	if err := validateFullBlockIDHashes(active.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(active.Block); err != nil {
 		return err
 	}
 
@@ -73,11 +73,11 @@ func (s *Store) SavePersistentStateDescription(ctx context.Context, desc *storag
 	if !isMasterchainBlock(desc.MasterchainBlock) {
 		return fmt.Errorf("persistent state description masterchain block is invalid: %s", storage.FormatBlockRef(desc.MasterchainBlock))
 	}
-	if err := validateFullBlockIDHashes(desc.MasterchainBlock); err != nil {
+	if err := storage.ValidateBlockIDHashes(desc.MasterchainBlock); err != nil {
 		return err
 	}
 	for _, shard := range desc.ShardBlocks {
-		if err := validateFullBlockIDHashes(shard.Block); err != nil {
+		if err := storage.ValidateBlockIDHashes(shard.Block); err != nil {
 			return err
 		}
 	}

@@ -69,7 +69,7 @@ func TestArchivePackMagicRejectsInvalidFirstSlice(t *testing.T) {
 	}
 }
 
-func TestSlowCompletedArchiveDownloadKeepsPeerPinned(t *testing.T) {
+func TestCompletedArchiveDownloadKeepsStickyPeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	peer := &overlayPeer{id: testPeerID("slow-archive"), addr: "slow-archive", alive: true}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
@@ -91,9 +91,9 @@ func TestSlowCompletedArchiveDownloadKeepsPeerPinned(t *testing.T) {
 		peer:        peer,
 		archiveID:   100,
 		seedSlice:   seed,
-		seedElapsed: archiveSmallPackSlowElapsed + time.Second,
+		seedElapsed: time.Second,
 		hasSeed:     true,
-	})
+	}, true)
 	if err != nil {
 		t.Fatalf("download archive: %v", err)
 	}
@@ -103,11 +103,14 @@ func TestSlowCompletedArchiveDownloadKeepsPeerPinned(t *testing.T) {
 	if _, ok := node.pinnedPeerIDs()[peer.id]; !ok {
 		t.Fatal("slow completed archive download should keep peer pinned")
 	}
-	if pool.coolingDown(shard, peer) {
-		t.Fatal("slow completed archive download should not cool down peer")
+	if selected := session.selectedArchivePeerID(shard); selected != peer.id {
+		t.Fatalf("completed archive download selected peer = %s, want %s", selected.String(), peer.id.String())
 	}
-	if !peer.statsSnapshot().downloadSlowUntil.After(time.Now()) {
-		t.Fatal("slow completed archive download should still update slow score")
+	if pool.coolingDown(shard, peer) {
+		t.Fatal("completed archive download should not cool down peer")
+	}
+	if peer.statsSnapshot().downloadSlowUntil.After(time.Now()) {
+		t.Fatal("completed archive download should not set fixed slow penalty")
 	}
 }
 
@@ -154,7 +157,7 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	sub.peers[peerID] = peer
 	pool.addBorrowedPeer(peer)
 
-	candidate, err := sub.fetchArchiveCandidate(context.Background(), session, pool, peer, 10, shard)
+	candidate, err := sub.fetchArchiveCandidate(context.Background(), session, pool, peer, 10, shard, true)
 	if err != nil {
 		t.Fatalf("fetch archive candidate: %v", err)
 	}
@@ -225,6 +228,82 @@ func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 	}
 	if pool.coolingDown(shard, primary) {
 		t.Fatal("hedge-lost primary should not be cooled down")
+	}
+}
+
+func TestArchiveComparativeHedgeReplacesStickyWithFasterPeer(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+		spec: overlaySpec{ShortID: []byte{1}},
+	}
+	pool := testArchivePool(sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	primaryPack := testArchivePackBytes("primary")
+	fastPack := testArchivePackBytes("fast")
+	primary := testArchiveDownloadPeer(t, "primary", 100, primaryPack, 120*time.Millisecond)
+	fast := testArchiveDownloadPeer(t, "fast", 200, fastPack, 10*time.Millisecond)
+	pool.addArchiveOnlyPeer(primary)
+	pool.addArchiveOnlyPeer(fast)
+	session.selectArchivePeer(shard, primary)
+
+	downloaded, err := sub.downloadArchiveFromResolved(context.Background(), session, pool, resolvedArchive{
+		MasterchainSeqno: 10,
+		Shard:            shard,
+		ArchiveID:        100,
+		peer:             primary,
+		peers:            []*overlayPeer{primary, fast},
+	}, ArchiveDownloadOptions{})
+	if err != nil {
+		t.Fatalf("comparative hedge archive: %v", err)
+	}
+	if downloaded.Peer != fast.addr {
+		t.Fatalf("comparative hedge winner = %q, want %q", downloaded.Peer, fast.addr)
+	}
+	if string(downloaded.Data) != string(fastPack) {
+		t.Fatal("comparative hedge returned data from the wrong peer")
+	}
+	if selected := session.selectedArchivePeerID(shard); selected != fast.id {
+		t.Fatalf("selected archive peer = %s, want %s", selected.String(), fast.id.String())
+	}
+}
+
+func TestArchiveComparativeHedgeRacesSmallPackSeedProbe(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := &overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+		spec: overlaySpec{ShortID: []byte{1}},
+	}
+	pool := testArchivePool(sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	primaryPack := testArchivePackBytes("primary")
+	fastPack := testArchivePackBytes("fast")
+	primary := testArchiveDownloadPeer(t, "primary", 100, primaryPack, 120*time.Millisecond)
+	fast := testArchiveDownloadPeer(t, "fast", 200, fastPack, 10*time.Millisecond)
+	pool.addArchiveOnlyPeer(primary)
+	pool.addArchiveOnlyPeer(fast)
+	session.selectArchivePeer(shard, primary)
+
+	resolved, err := sub.resolveArchive(context.Background(), session, pool, 10, shard, ArchiveDownloadOptions{})
+	if err != nil {
+		t.Fatalf("resolve archive with comparative hedge: %v", err)
+	}
+	if resolved.Peer != fast.addr {
+		t.Fatalf("resolved archive peer = %q, want %q", resolved.Peer, fast.addr)
+	}
+	if !resolved.hasSeed || string(resolved.seedSlice) != string(fastPack) {
+		t.Fatal("resolved archive did not use fast peer seed")
+	}
+	if selected := session.selectedArchivePeerID(shard); selected != fast.id {
+		t.Fatalf("selected archive peer = %s, want %s", selected.String(), fast.id.String())
 	}
 }
 

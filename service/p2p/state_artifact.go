@@ -471,17 +471,15 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 
 	stagedPath := staged.path
 	lazyRoot, err := n.decodeAndImportStagedStateCellTreeAs(ctx, block, storageBlock, staged, wantRootHash, hashKind)
-	if err == nil {
-		n.log.Info().
-			Str("block", formatPersistentStateBlockRef(block, effectiveShard)).
-			Str("path", stagedPath).
-			Msg("reusable staged state snapshot switched to lazy celldb root")
-		return staged, lazyRoot, nil
-	}
-	if errors.Is(err, context.Canceled) {
+	if err != nil {
 		return nil, nil, err
 	}
-	return nil, nil, err
+
+	n.log.Info().
+		Str("block", formatPersistentStateBlockRef(block, effectiveShard)).
+		Str("path", stagedPath).
+		Msg("reusable staged state snapshot switched to lazy celldb root")
+	return staged, lazyRoot, nil
 }
 
 func (n *Node) importStagedStateBOCView(ctx context.Context, storageBlock ton.BlockIDExt, staged *stagedStateFile, view *cell.BOCView) (*cell.Cell, error) {

@@ -3,7 +3,9 @@ package pebblestore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
@@ -231,6 +233,12 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 	return s.saveCellRecordSet(ctx, storage.NewStateCellRecords(records), sync, generation, dedupe)
 }
 
+// stateCellSaveShardedMinRecords is the record count at which saveCellRecordSet
+// fans the write out to one worker per celldb shard. Small sets (single-block
+// prewrites on the live tail) stay on the single-writer path to avoid spawning
+// goroutines for a handful of cells.
+const stateCellSaveShardedMinRecords = 4096
+
 func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCellRecords, sync bool, generation uint64, dedupe bool) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
 	if records.Empty() {
@@ -246,15 +254,91 @@ func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCell
 	}
 	defer cells.release()
 
+	if records.Len() >= stateCellSaveShardedMinRecords {
+		stats, err = saveCellRecordSetSharded(ctx, cells, records, dedupe)
+	} else {
+		stats, err = saveCellRecordShard(ctx, cells, records, dedupe, allCellDBShards, stateCellImportBatchTargetBytes)
+	}
+	if err != nil {
+		return stats, err
+	}
+
+	if sync {
+		if err := cells.flush(); err != nil {
+			return stats, err
+		}
+	}
+	return stats, nil
+}
+
+// saveCellRecordSetSharded writes records with one worker per celldb shard.
+// Every worker scans the full record set and keeps only its shard's records
+// (hash-routed), so batch building and memtable commits run on all shard DBs
+// concurrently. Deduplication stays correct per worker because a hash always
+// routes to the same shard.
+func saveCellRecordSetSharded(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool) (cellRecordBatchStats, error) {
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var shardStats [cellDBShardCount]cellRecordBatchStats
+	var shardErrs [cellDBShardCount]error
+	for shard := 0; shard < cellDBShardCount; shard++ {
+		wg.Add(1)
+		go func(shard int) {
+			defer wg.Done()
+			shardStats[shard], shardErrs[shard] = saveCellRecordShard(workerCtx, cells, records, dedupe, shard, stateCellImportBatchTargetBytes/cellDBShardCount)
+			if shardErrs[shard] != nil {
+				cancel()
+			}
+		}(shard)
+	}
+	wg.Wait()
+
+	var stats cellRecordBatchStats
+	var firstErr error
+	for shard := 0; shard < cellDBShardCount; shard++ {
+		stats.written += shardStats[shard].written
+		stats.skipped += shardStats[shard].skipped
+		stats.bytes += shardStats[shard].bytes
+		if shardErrs[shard] != nil && firstErr == nil {
+			firstErr = shardErrs[shard]
+		}
+	}
+	if firstErr != nil && errors.Is(firstErr, context.Canceled) && ctx.Err() == nil {
+		// Prefer the root-cause error over cancellations it triggered in siblings.
+		for shard := 0; shard < cellDBShardCount; shard++ {
+			if shardErrs[shard] != nil && !errors.Is(shardErrs[shard], context.Canceled) {
+				firstErr = shardErrs[shard]
+				break
+			}
+		}
+	}
+	return stats, firstErr
+}
+
+// allCellDBShards makes saveCellRecordShard accept every record instead of
+// filtering by shard index.
+const allCellDBShards = -1
+
+func saveCellRecordShard(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool, shard int, flushTargetBytes int) (cellRecordBatchStats, error) {
+	var stats cellRecordBatchStats
 	writer := cells.newBatchWriter()
 	defer writer.close()
 
 	var written map[cell.Hash]struct{}
 	if dedupe {
-		written = make(map[cell.Hash]struct{}, records.Len())
+		capacityHint := records.Len()
+		if shard != allCellDBShards {
+			capacityHint /= cellDBShardCount
+		}
+		written = make(map[cell.Hash]struct{}, capacityHint)
 	}
 	i := 0
 	if err := records.ForEach(func(record storage.EncodedCellRecord) error {
+		if shard != allCellDBShards && cellShardIndex(record.Hash) != shard {
+			return nil
+		}
 		if i&0x3fff == 0 {
 			select {
 			case <-ctx.Done():
@@ -282,7 +366,7 @@ func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCell
 		stats.written++
 		stats.bytes += int64(len(record.Data))
 
-		if writer.bytesInBatch >= stateCellImportBatchTargetBytes {
+		if writer.bytesInBatch >= flushTargetBytes {
 			if _, err := writer.flush(); err != nil {
 				return err
 			}
@@ -294,11 +378,6 @@ func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCell
 
 	if _, err := writer.flush(); err != nil {
 		return stats, err
-	}
-	if sync {
-		if err := cells.flush(); err != nil {
-			return stats, err
-		}
 	}
 	return stats, nil
 }
@@ -332,6 +411,13 @@ func (s *Store) LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoade
 }
 
 func (s *Store) lazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
+	if generation == 0 && s.lazyCellLoaderZero != nil {
+		return s.lazyCellLoaderZero
+	}
+	return s.newLazyCellLoaderForGeneration(generation)
+}
+
+func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
 	return func(hash cell.Hash) (*cell.Cell, error) {
 		loaded, err := s.loadLazyCellFromGeneration(context.Background(), generation, hash[:])
 		if err != nil {
@@ -346,22 +432,10 @@ func (s *Store) loadLazyCell(ctx context.Context, hash []byte) (*cell.Cell, erro
 }
 
 func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
-	requestedGeneration := generation
-	if generation == 0 {
-		var err error
-		generation, err = s.activeCellGenerationID()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	cacheGeneration := generation
-	loaderGeneration := generation
-	if requestedGeneration == 0 {
-		cacheGeneration = 0
-		loaderGeneration = 0
-	}
-	if loaded, ok := s.cellCache.get(cacheGeneration, hash); ok {
+	// Generation 0 means "the active generation": the decoded-cell cache keys
+	// it as 0 and acquireCellStore resolves it to the active generation under
+	// its own lock, so cache hits never touch the store-wide mutex.
+	if loaded, ok := s.cellCache.get(generation, hash); ok {
 		s.lazyCellLoads.observeDecodedCache()
 		return loaded, nil
 	}
@@ -371,10 +445,10 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 		return nil, err
 	}
 	s.lazyCellLoads.observePebble()
-	loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(loaderGeneration))
+	loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(generation))
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}
-	s.cellCache.set(cacheGeneration, hash, loaded)
+	s.cellCache.set(generation, hash, loaded)
 	return loaded, nil
 }

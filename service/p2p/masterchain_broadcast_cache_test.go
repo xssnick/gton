@@ -134,7 +134,7 @@ func TestAcceptBroadcastCachesMasterchainNextBroadcast(t *testing.T) {
 		},
 	})
 
-	got, err := node.masterchainNextBroadcastBlock(prev)
+	got, err := node.masterchainNextBroadcastCache.BlockAfter(prev)
 	if err != nil {
 		t.Fatalf("load cached masterchain broadcast: %v", err)
 	}

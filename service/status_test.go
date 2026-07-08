@@ -319,11 +319,10 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 	}
 	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks)
 
-	block, root, data, meta := mustStatusFixtureBlock(t)
+	block, _, data, meta := mustStatusFixtureBlock(t)
 	meta.GenUTime = 100
-	if err = cache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err = cache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block:     block,
-		Root:      root,
 		BlockData: data,
 		Meta:      meta,
 		Proofs: []tnstore.LiveBlockProofArtifact{{
@@ -363,11 +362,10 @@ func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks)
 
-	block, root, data, meta := mustStatusFixtureBlock(t)
+	block, _, data, meta := mustStatusFixtureBlock(t)
 	meta.GenUTime = 100
-	if err := cache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block:     block,
-		Root:      root,
 		BlockData: data,
 		Meta:      meta,
 		Proofs: []tnstore.LiveBlockProofArtifact{{

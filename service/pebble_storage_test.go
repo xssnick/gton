@@ -29,18 +29,20 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 
 	if _, err := store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
 		Artifact: &storage.ServedBlockFull{
-			ID:    prev,
-			Block: []byte{0x70},
-			Proof: []byte{0x71},
-			Meta:  &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
+			ID:             prev,
+			Block:          []byte{0x70},
+			Proof:          []byte{0x71},
+			Meta:           &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
 	}, {
 		Artifact: &storage.ServedBlockFull{
-			ID:    block,
-			Block: blockData,
-			Proof: proofData,
-			Meta:  &storage.BlockMeta{ID: block, GenUTime: block.SeqNo},
+			ID:             block,
+			Block:          blockData,
+			Proof:          proofData,
+			Meta:           &storage.BlockMeta{ID: block, GenUTime: block.SeqNo},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		},
 	}}, storage.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save block full: %v", err)
@@ -54,9 +56,10 @@ func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	archiveData := []byte{0x55, 0x44}
 	if _, err := store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
 		Artifact: &storage.ServedBlockFull{
-			ID:    archiveBlock,
-			Block: archiveData,
-			Meta:  &storage.BlockMeta{ID: archiveBlock, GenUTime: 1010, StartLT: 101, EndLT: 102},
+			ID:             archiveBlock,
+			Block:          archiveData,
+			Meta:           &storage.BlockMeta{ID: archiveBlock, GenUTime: 1010, StartLT: 101, EndLT: 102},
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		},
 	}}, storage.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save archive import: %v", err)
@@ -660,10 +663,11 @@ func saveTestPebbleFullBlockMeta(t *testing.T, store *pebblestore.Store, meta *s
 				StateRootHash: bytes.Repeat([]byte{0x03}, 32),
 			},
 			Artifact: &storage.ServedBlockFull{
-				ID:    master,
-				Block: []byte{0x03},
-				Proof: []byte{0x04},
-				Meta:  &storage.BlockMeta{ID: master, GenUTime: 1},
+				ID:             master,
+				Block:          []byte{0x03},
+				Proof:          []byte{0x04},
+				Meta:           &storage.BlockMeta{ID: master, GenUTime: 1},
+				MessageEntries: []storage.MessageTransactionIndexEntry{},
 			},
 		})
 	}
@@ -673,10 +677,11 @@ func saveTestPebbleFullBlockMeta(t *testing.T, store *pebblestore.Store, meta *s
 			StateRootHash: bytes.Repeat([]byte{0x01}, 32),
 		},
 		Artifact: &storage.ServedBlockFull{
-			ID:    fullMeta.ID,
-			Block: []byte{0x01},
-			Proof: []byte{0x02},
-			Meta:  fullMeta,
+			ID:             fullMeta.ID,
+			Block:          []byte{0x01},
+			Proof:          []byte{0x02},
+			Meta:           fullMeta,
+			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		},
 	})
 	if _, err := store.SaveStateCheckpointEntries(context.Background(), entries, storage.StateCellRecords{}, nil); err != nil {

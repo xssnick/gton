@@ -82,8 +82,12 @@ func TestSyncerSyncCurrentStoresSnapshot(t *testing.T) {
 		t.Fatalf("expected pending master state not to be downloaded, got %d", got)
 	}
 	for _, block := range []ton.BlockIDExt{master, base, aux} {
-		if store.artifacts[storage.BlockKey(block)] == nil {
+		artifact := store.artifacts[storage.BlockKey(block)]
+		if artifact == nil {
 			t.Fatalf("checkpoint artifact for %s was not stored", storage.FormatBlockRef(block))
+		}
+		if artifact.MessageEntries == nil {
+			t.Fatalf("checkpoint artifact for %s has nil message transaction index", storage.FormatBlockRef(block))
 		}
 	}
 }
@@ -728,10 +732,11 @@ func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ to
 
 func testServedBlockFull(block ton.BlockIDExt) *storage.ServedBlockFull {
 	return &storage.ServedBlockFull{
-		ID:    block,
-		Proof: []byte{0x01},
-		Block: []byte{0x02},
-		Meta:  &storage.BlockMeta{ID: block, GenUTime: 1},
+		ID:             block,
+		Proof:          []byte{0x01},
+		Block:          []byte{0x02},
+		Meta:           &storage.BlockMeta{ID: block, GenUTime: 1},
+		MessageEntries: []storage.MessageTransactionIndexEntry{},
 	}
 }
 

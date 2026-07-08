@@ -141,35 +141,8 @@ func (r *persistentStateChunkReader) Read(dst []byte) (int, error) {
 	if r.readOffset >= r.size {
 		return 0, io.EOF
 	}
-
-	for len(r.current) == 0 {
-		if r.nextChunk < len(r.chunks) && r.chunks[r.nextChunk] != nil {
-			chunk := r.chunks[r.nextChunk]
-			r.current = chunk
-			r.chunks[r.nextChunk] = nil
-			r.nextChunk++
-			break
-		}
-
-		if r.results == nil {
-			if r.err != nil {
-				return 0, r.err
-			}
-			return 0, io.ErrUnexpectedEOF
-		}
-
-		res, ok := <-r.results
-		if !ok {
-			r.results = nil
-			continue
-		}
-		if res.err != nil {
-			r.fail(res)
-			return 0, r.err
-		}
-
-		r.addDownloadedChunk(res)
-		r.logProgress()
+	if err := r.waitCurrentChunk(); err != nil {
+		return 0, err
 	}
 
 	n := copy(dst, r.current)
@@ -182,12 +155,68 @@ func (r *persistentStateChunkReader) Read(dst []byte) (int, error) {
 	return n, nil
 }
 
-func (r *persistentStateChunkReader) Len() int {
-	left := r.size - r.readOffset
-	if left <= 0 {
-		return 0
+// WriteTo streams every remaining chunk to w with a single Write per chunk,
+// letting io.Copy skip its generic 32KB shuttle buffer. Output, hashing and
+// prefix capture are byte-identical to draining the reader via Read.
+func (r *persistentStateChunkReader) WriteTo(w io.Writer) (int64, error) {
+	var written int64
+	for r.readOffset < r.size {
+		if err := r.waitCurrentChunk(); err != nil {
+			return written, err
+		}
+
+		chunk := r.current
+		r.current = nil
+		n, err := w.Write(chunk)
+		if n > 0 {
+			r.recordRead(chunk[:n])
+			r.readOffset += int64(n)
+			written += int64(n)
+		}
+		if err != nil {
+			return written, err
+		}
+		if n < len(chunk) {
+			r.current = chunk[n:]
+			return written, io.ErrShortWrite
+		}
 	}
-	return int(left)
+	return written, nil
+}
+
+// waitCurrentChunk fills r.current with the next sequential chunk, consuming
+// download results until it becomes available.
+func (r *persistentStateChunkReader) waitCurrentChunk() error {
+	for len(r.current) == 0 {
+		if r.nextChunk < len(r.chunks) && r.chunks[r.nextChunk] != nil {
+			chunk := r.chunks[r.nextChunk]
+			r.current = chunk
+			r.chunks[r.nextChunk] = nil
+			r.nextChunk++
+			break
+		}
+
+		if r.results == nil {
+			if r.err != nil {
+				return r.err
+			}
+			return io.ErrUnexpectedEOF
+		}
+
+		res, ok := <-r.results
+		if !ok {
+			r.results = nil
+			continue
+		}
+		if res.err != nil {
+			r.fail(res)
+			return r.err
+		}
+
+		r.addDownloadedChunk(res)
+		r.logProgress()
+	}
+	return nil
 }
 
 func (r *persistentStateChunkReader) Close() {

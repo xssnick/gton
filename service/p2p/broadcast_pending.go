@@ -34,6 +34,10 @@ type pendingBlockBroadcastDecode struct {
 	rebroadcast  *rebroadcastRequest
 	expiresAt    time.Time
 	bytes        int64
+	// verifiedSignaturesKey carries the ContentKey of the signature set that
+	// passed the predecode check, so the deferred decode result keeps the
+	// signatures-already-verified mark.
+	verifiedSignaturesKey []byte
 }
 
 func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDecode) {
@@ -157,6 +161,7 @@ func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, r
 
 		n.forgetPendingBlockBroadcastDecode(req.fingerprint)
 		downloaded.SourcePeerID = req.sourcePeerID
+		downloaded.SignaturesVerifiedKey = req.verifiedSignaturesKey
 		rebroadcast := pendingBlockBroadcastRebroadcast(req.rebroadcast)
 		block := cloneBlockID(req.block)
 		accepted := acceptedBroadcast{
@@ -196,7 +201,7 @@ func (n *Node) decodePendingBlockBroadcast(ctx context.Context, req pendingBlock
 		if req.proofRoot == nil {
 			return nil, fmt.Errorf("pending compressed V2 broadcast %s has no parsed proof root", formatBlockRef(req.block))
 		}
-		downloaded, _, err := n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, req.proofRoot, req.prev)
+		downloaded, _, err := n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, req.proofRoot, nil, req.prev)
 		return downloaded, err
 	default:
 		return nil, fmt.Errorf("unexpected pending block broadcast %T", req.msg)

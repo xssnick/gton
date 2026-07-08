@@ -516,14 +516,6 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 			Msg("persistent state snapshot peer failed, trying next peer")
 	}
 
-	recordBatchError := func(err error) {
-		if errors.Is(err, context.Canceled) {
-			failedErrs = append(failedErrs, err)
-			return
-		}
-		failedErrs = append(failedErrs, err)
-	}
-
 	var candidates []persistentStateCandidate
 	flushCandidates := func() (*stagedStateFile, bool) {
 		if len(candidates) == 0 {
@@ -535,7 +527,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 		if err == nil {
 			return staged, true
 		}
-		recordBatchError(err)
+		failedErrs = append(failedErrs, err)
 		return nil, false
 	}
 
@@ -1223,9 +1215,6 @@ func formatByteSize(size int64) string {
 
 	if i == 0 {
 		return fmt.Sprintf("%.0f %s", value, units[i])
-	}
-	if i == 1 || i == 2 || i == 3 || i == 4 {
-		return fmt.Sprintf("%.2f %s", value, units[i])
 	}
 	return fmt.Sprintf("%.2f %s", value, units[i])
 }

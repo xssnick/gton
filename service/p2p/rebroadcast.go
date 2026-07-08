@@ -453,7 +453,9 @@ func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastReq
 		return candidates
 	}
 
-	filtered := candidates[:0]
+	// The candidates slice is shared with the snapshot cache, filter into a
+	// fresh slice instead of truncating it in place.
+	filtered := make([]*overlayPeer, 0, len(candidates))
 	for _, peer := range candidates {
 		if peer.id == req.sourcePeerID {
 			continue

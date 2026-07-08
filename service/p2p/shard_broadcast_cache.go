@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
@@ -91,6 +90,8 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		meta:         meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
 		bytes:        size,
+
+		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
 
 	c.storeEntry(entry, now)
@@ -195,47 +196,12 @@ func (n *Node) watchShardBroadcastBlock(block ton.BlockIDExt) (<-chan struct{}, 
 	}
 
 	key := tnstore.BlockKey(block)
-	ch := make(chan struct{})
-
-	n.shardBroadcastWaitMx.Lock()
-	if n.shardBroadcastWaiters == nil {
-		n.shardBroadcastWaiters = map[tnstore.BlockRootHash][]chan struct{}{}
-	}
-	n.shardBroadcastWaiters[key] = append(n.shardBroadcastWaiters[key], ch)
-	n.shardBroadcastWaitMx.Unlock()
-
-	var once sync.Once
-	cancel := func() {
-		once.Do(func() {
-			n.shardBroadcastWaitMx.Lock()
-			waiters := n.shardBroadcastWaiters[key]
-			for i, waiter := range waiters {
-				if waiter == ch {
-					waiters = append(waiters[:i], waiters[i+1:]...)
-					break
-				}
-			}
-			if len(waiters) == 0 {
-				delete(n.shardBroadcastWaiters, key)
-			} else {
-				n.shardBroadcastWaiters[key] = waiters
-			}
-			n.shardBroadcastWaitMx.Unlock()
-		})
-	}
-	return ch, cancel
+	return n.shardBroadcastWaiters.watch(key)
 }
 
 func (n *Node) notifyShardBroadcastBlock(block ton.BlockIDExt) {
 	key := tnstore.BlockKey(block)
-	n.shardBroadcastWaitMx.Lock()
-	waiters := n.shardBroadcastWaiters[key]
-	delete(n.shardBroadcastWaiters, key)
-	n.shardBroadcastWaitMx.Unlock()
-
-	for _, waiter := range waiters {
-		close(waiter)
-	}
+	n.shardBroadcastWaiters.notify(key)
 }
 
 func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {

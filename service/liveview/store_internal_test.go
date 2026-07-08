@@ -73,6 +73,10 @@ func (noopBacking) LookupBlockByUnixTime(context.Context, storage.BlockHistoryKe
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
+func (noopBacking) LookupMessageTransaction(context.Context, storage.MessageTransactionKind, storage.MessageTransactionKey) (storage.MessageTransactionRef, error) {
+	return storage.MessageTransactionRef{}, storage.ErrNotFound
+}
+
 func (noopBacking) LazyCellLoader() cell.LazyCellLoader {
 	return nil
 }

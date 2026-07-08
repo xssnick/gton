@@ -66,6 +66,10 @@ type PreparedBlock struct {
 	StateUpdate               *cell.Cell
 	StateUpdateToCells        storage.StateCellRecords
 	StateUpdateToCellsElapsed time.Duration
+	// MessageEntries is extracted once by the import prepare workers; the
+	// checkpoint artifact writer requires it and never re-parses block data.
+	// Always non-nil for successfully prepared blocks (empty = no messages).
+	MessageEntries []storage.MessageTransactionIndexEntry
 }
 
 func (s ShardID) IsMasterchain() bool {

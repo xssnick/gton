@@ -246,6 +246,13 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 	if err != nil {
 		return PreparedBlock{}, err
 	}
+	// Extraction failure means the parser cannot fully decode a consensus-valid
+	// block (TLB drift after a protocol upgrade). Fail the import instead of
+	// persisting the block without message->tx index entries.
+	messageEntries, err := storage.MessageTransactionEntriesFromParsedBlock(id, block)
+	if err != nil {
+		return PreparedBlock{}, fmt.Errorf("extract message transaction entries: %w", err)
+	}
 	return PreparedBlock{
 		Block:       root,
 		Parsed:      block,
@@ -257,6 +264,7 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 		},
 		StateUpdateToCells:        cells,
 		StateUpdateToCellsElapsed: time.Since(started),
+		MessageEntries:            messageEntries,
 	}, nil
 }
 

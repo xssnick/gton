@@ -24,6 +24,7 @@ type checkpointArtifactWrite struct {
 	proofRefs       map[storage.ServedProofKind]*storage.ArtifactRef
 	proofRefIndexes map[storage.ServedProofKind]int
 	meta            *storage.BlockMeta
+	messageEntries  []storage.MessageTransactionIndexEntry
 }
 
 func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpointBlock) ([]checkpointArtifactWrite, []archivePackRegistration, []storage.ServedBlockLink, error) {
@@ -73,6 +74,14 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 		if len(entry.Artifact.Block) > 0 {
 			blockRefIndex = queueArchiveAppend(packfile.KindBlock, entry.Artifact.ID, meta, entry.Artifact.ArchiveShardSplitDepth, entry.Artifact.Block)
 		}
+		// Checkpoint artifacts must carry the message->tx index extracted once at
+		// the ingest stage (empty slice = no indexable messages). The storage
+		// layer never parses block data: deriving entries here would hide parser
+		// gaps and silently persist blocks that tryLocateTx cannot serve.
+		messageEntries := entry.Artifact.MessageEntries
+		if messageEntries == nil {
+			return nil, nil, nil, fmt.Errorf("checkpoint artifact %s has no message transaction index entries", storage.FormatBlockRef(entry.Artifact.ID))
+		}
 
 		proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
 		proofRefIndexes := make(map[storage.ServedProofKind]int, len(proofKinds))
@@ -100,6 +109,7 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 			proofRefs:       proofRefs,
 			proofRefIndexes: proofRefIndexes,
 			meta:            meta,
+			messageEntries:  messageEntries,
 		})
 	}
 
@@ -129,6 +139,9 @@ func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkp
 		if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRefs); err != nil {
 			return err
 		}
+		if err := setMessageTransactionIndexes(batch, write.messageEntries); err != nil {
+			return err
+		}
 	}
 
 	pendingLinks := make(map[storage.BlockRootHash]ton.BlockIDExt, len(links))
@@ -147,7 +160,7 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 	if len(block.Block) == 0 && len(block.Proof) == 0 {
 		return nil, nil, fmt.Errorf("served block %s has no block data or proof", storage.FormatBlockRef(block.ID))
 	}
-	if err := validateFullBlockIDHashes(block.ID); err != nil {
+	if err := storage.ValidateBlockIDHashes(block.ID); err != nil {
 		return nil, nil, err
 	}
 
@@ -268,10 +281,10 @@ func mergePendingBlockMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, m
 }
 
 func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
-	if err := validateFullBlockIDHashes(prev); err != nil {
+	if err := storage.ValidateBlockIDHashes(prev); err != nil {
 		return err
 	}
-	if err := validateFullBlockIDHashes(next); err != nil {
+	if err := storage.ValidateBlockIDHashes(next); err != nil {
 		return err
 	}
 
@@ -402,7 +415,7 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 	if len(data) == 0 {
 		return nil
 	}
-	if err := validateFullBlockIDHashes(block); err != nil {
+	if err := storage.ValidateBlockIDHashes(block); err != nil {
 		return err
 	}
 
@@ -427,10 +440,10 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 }
 
 func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error {
-	if err := validateFullBlockIDHashes(file.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(file.Block); err != nil {
 		return err
 	}
-	if err := validateFullBlockIDHashes(file.MasterchainBlock); err != nil {
+	if err := storage.ValidateBlockIDHashes(file.MasterchainBlock); err != nil {
 		return err
 	}
 	if err := validateFixedHash("persistent state file hash", file.FileHash); err != nil {

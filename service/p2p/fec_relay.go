@@ -12,16 +12,9 @@ func (set overlayFECRelayPeerSet) Peers() []overlay.BroadcastPeer {
 	if set.sub == nil {
 		return nil
 	}
-
-	candidates := set.sub.rebroadcastCandidates()
-	peers := make([]overlay.BroadcastPeer, 0, len(candidates))
-	for _, peer := range candidates {
-		if peer == nil || peer.overlay == nil {
-			continue
-		}
-		peers = append(peers, peer.overlay)
-	}
-	return peers
+	// Called for every received FEC part; the relay skips source/completed
+	// peers itself, so the shared cached snapshot is returned as is.
+	return set.sub.broadcastPeersSnapshot()
 }
 
 func (s *overlaySubscription) configureBroadcastFECRelay(peer *overlayPeer) {

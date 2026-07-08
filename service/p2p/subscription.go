@@ -44,6 +44,7 @@ type overlaySubscription struct {
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
+	broadcastTargets    atomic.Pointer[broadcastTargetsSnapshot]
 	fecRelayState       *overlay.BroadcastFECRelayState
 	twoStepState        *overlay.BroadcastTwoStepState
 	twoStepQueue        *boundedQueue[rebroadcastRequest]
@@ -406,6 +407,80 @@ type seedConnectResult struct {
 	err      error
 }
 
+// seedConnectPool fans overlay nodes found during a DHT seed search out to a
+// bounded set of connect workers and counts successful attachments. It is
+// shared by the subscription seed search and the archive peer pool discovery.
+type seedConnectPool struct {
+	ctx       context.Context
+	jobs      chan overlay.Node
+	results   chan seedConnectResult
+	workers   sync.WaitGroup
+	collector sync.WaitGroup
+	connected atomic.Int64
+	finished  bool
+}
+
+// runSeedConnectPool starts parallelism connect workers plus a collector that
+// logs failed connects with connectErrMsg. Feed nodes with send and always
+// call finish (idempotent, single-goroutine use) before reading connected.
+func runSeedConnectPool(ctx context.Context, log zerolog.Logger, connectErrMsg string, parallelism int, connect func(overlay.Node) (bool, error)) *seedConnectPool {
+	p := &seedConnectPool{
+		ctx:     ctx,
+		jobs:    make(chan overlay.Node),
+		results: make(chan seedConnectResult, parallelism),
+	}
+
+	for i := 0; i < parallelism; i++ {
+		p.workers.Add(1)
+		go func() {
+			defer p.workers.Done()
+			for node := range p.jobs {
+				attached, err := connect(node)
+				p.results <- seedConnectResult{attached: attached, err: err}
+			}
+		}()
+	}
+
+	p.collector.Add(1)
+	go func() {
+		defer p.collector.Done()
+		for res := range p.results {
+			if res.err != nil {
+				log.Debug().Err(res.err).Msg(connectErrMsg)
+				continue
+			}
+			if res.attached {
+				p.connected.Add(1)
+			}
+		}
+	}()
+
+	return p
+}
+
+// send hands a node to the workers; it reports false once ctx is done.
+func (p *seedConnectPool) send(node overlay.Node) bool {
+	select {
+	case p.jobs <- node:
+		return true
+	case <-p.ctx.Done():
+		return false
+	}
+}
+
+// finish stops accepting nodes and waits for workers and collector to drain.
+func (p *seedConnectPool) finish() {
+	if p.finished {
+		return
+	}
+	p.finished = true
+
+	close(p.jobs)
+	p.workers.Wait()
+	close(p.results)
+	p.collector.Wait()
+}
+
 type adnlNopper interface {
 	SendNop(context.Context) error
 }
@@ -429,7 +504,6 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 		err        error
 		requests   int
 		nodesSeen  int
-		connected  atomic.Int64
 		startedAt  = time.Now()
 		knownStart = len(s.knownPeersSnapshot())
 		aliveStart = s.aliveKnownPeerCount()
@@ -444,79 +518,10 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 			Msg("searching overlay peers in DHT")
 	}
 
-	jobs := make(chan overlay.Node)
-	results := make(chan seedConnectResult, dhtSeedConnectParallelism)
-	var workers sync.WaitGroup
-	for i := 0; i < dhtSeedConnectParallelism; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for node := range jobs {
-				attached, err := s.connectDHTOverlayNode(ctx, node)
-				results <- seedConnectResult{attached: attached, err: err}
-			}
-		}()
-	}
-
-	var collector sync.WaitGroup
-	collector.Add(1)
-	collectorCtx, cancelCollector := context.WithCancel(ctx)
-	go func() {
-		defer collector.Done()
-		for {
-			select {
-			case res, ok := <-results:
-				if !ok {
-					return
-				}
-				if res.err != nil {
-					s.log.Debug().Err(res.err).Msg("failed to connect overlay node")
-					continue
-				}
-				if res.attached {
-					connected.Add(1)
-				}
-			case <-collectorCtx.Done():
-				for res := range results {
-					if res.err != nil {
-						s.log.Debug().Err(res.err).Msg("failed to connect overlay node")
-						continue
-					}
-					if res.attached {
-						connected.Add(1)
-					}
-				}
-				return
-			}
-		}
-	}()
-	jobsClosed := false
-	seedFinished := false
-	finishWorkers := func() {
-		if !jobsClosed {
-			close(jobs)
-			jobsClosed = true
-		}
-		workers.Wait()
-		close(results)
-		cancelCollector()
-		collector.Wait()
-		seedFinished = true
-	}
-	defer func() {
-		if !seedFinished {
-			finishWorkers()
-		}
-	}()
-
-	sendNode := func(node overlay.Node) bool {
-		select {
-		case jobs <- node:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	seedPool := runSeedConnectPool(ctx, s.log, "failed to connect overlay node", dhtSeedConnectParallelism, func(node overlay.Node) (bool, error) {
+		return s.connectDHTOverlayNode(ctx, node)
+	})
+	defer seedPool.finish()
 
 	maxRequests := 8
 	if refreshOnly {
@@ -562,7 +567,7 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 					replacements++
 				}
 			}
-			if !sendNode(node) {
+			if !seedPool.send(node) {
 				break
 			}
 		}
@@ -572,14 +577,14 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 		}
 	}
 
-	finishWorkers()
+	seedPool.finish()
 
-	if logSearch || connected.Load() > 0 {
+	if logSearch || seedPool.connected.Load() > 0 {
 		s.log.Debug().
 			Dur("elapsed", time.Since(startedAt)).
 			Int("dht_requests", requests).
 			Int("dht_nodes", nodesSeen).
-			Int64("connected_peers", connected.Load()).
+			Int64("connected_peers", seedPool.connected.Load()).
 			Int("known_peers", len(s.knownPeersSnapshot())).
 			Int("alive_peers", s.aliveKnownPeerCount()).
 			Msg("overlay peer DHT search finished")
@@ -970,6 +975,7 @@ func (s *overlaySubscription) peerNotifySnapshot() <-chan struct{} {
 }
 
 func (s *overlaySubscription) notifyPeersChangedLocked() {
+	s.broadcastTargets.Store(nil)
 	if s.peerNotify == nil {
 		s.peerNotify = make(chan struct{}, 1)
 	}

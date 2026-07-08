@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 var (
@@ -35,6 +36,7 @@ type Store struct {
 	retiredGenerations              []uint64
 	nextCellGeneration              uint64
 	cellCache                       *decodedCellCache
+	lazyCellLoaderZero              cell.LazyCellLoader
 	lazyCellLoads                   lazyCellLoadCounters
 	dir                             string
 	cellCacheSize                   int64

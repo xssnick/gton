@@ -257,11 +257,11 @@ func validateMigrationProgressBlockIDs(current *storage.CurrentState) error {
 }
 
 func validateMigrationProgressBlockStateID(state storage.BlockState) error {
-	if err := validateFullBlockIDHashes(state.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(state.Block); err != nil {
 		return err
 	}
 	if state.MasterchainRef != nil {
-		if err := validateFullBlockIDHashes(*state.MasterchainRef); err != nil {
+		if err := storage.ValidateBlockIDHashes(*state.MasterchainRef); err != nil {
 			return err
 		}
 	}
@@ -304,7 +304,7 @@ func (s *Store) BeginCellGeneration(ctx context.Context, origin ton.BlockIDExt) 
 	if err := s.ensureWritable(); err != nil {
 		return 0, err
 	}
-	if err := validateFullBlockIDHashes(origin); err != nil {
+	if err := storage.ValidateBlockIDHashes(origin); err != nil {
 		return 0, err
 	}
 

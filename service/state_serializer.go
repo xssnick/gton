@@ -604,7 +604,7 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 	hash := sha256.New()
 	writer := io.MultiWriter(contextWriter{ctx: ctx, w: tmp}, hash)
 
-	releaseCompactions := throttleStateSerializationCompactions(s.store)
+	releaseCompactions := s.store.ThrottleCellCompactions()
 	if onePassLargeBOC {
 		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
 	} else {
@@ -641,10 +641,6 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 		size:     stat.Size(),
 		fileHash: hash.Sum(nil),
 	}, nil
-}
-
-func throttleStateSerializationCompactions(store storage.Storage) func() {
-	return store.ThrottleCellCompactions()
 }
 
 func (s *stateSerializer) lazyStateRoot(ctx context.Context, target stateSerializationTarget, loader cell.LazyCellLoader) (*cell.Cell, error) {

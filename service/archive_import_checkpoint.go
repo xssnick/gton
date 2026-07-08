@@ -19,6 +19,24 @@ type archiveCheckpointResult struct {
 	err              error
 }
 
+type archiveProgressGoalKind uint8
+
+const (
+	archiveProgressGoalNone archiveProgressGoalKind = iota
+	archiveProgressGoalLiveTail
+	archiveProgressGoalSyncUntil
+)
+
+type archiveProgressGoal struct {
+	kind                     archiveProgressGoalKind
+	remainingSeconds         int64
+	hasKnownRemainingSeconds bool
+}
+
+func (g archiveProgressGoal) knownRemaining() bool {
+	return g.hasKnownRemainingSeconds
+}
+
 type archiveDownloadBackpressureGate struct {
 	mu     sync.Mutex
 	done   chan struct{}
@@ -106,16 +124,54 @@ func (s *Service) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Dura
 }
 
 func (r *archiveCatchUpRunner) archiveLiveTailLagSeconds() (int64, bool) {
-	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
-	return masterchainBlockLagSeconds(blockUTime, time.Now().Unix())
+	return r.archiveLiveTailLagSecondsAt(time.Now())
 }
 
-func (r *archiveCatchUpRunner) archiveRemainingLagSeconds() (int64, bool) {
-	lagSeconds, ok := r.archiveLiveTailLagSeconds()
-	if !ok {
-		return 0, false
+func (r *archiveCatchUpRunner) archiveLiveTailLagSecondsAt(now time.Time) (int64, bool) {
+	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
+	return masterchainBlockLagSeconds(blockUTime, now.Unix())
+}
+
+func (r *archiveCatchUpRunner) archiveProgressGoalAt(now time.Time) archiveProgressGoal {
+	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
+
+	goal := archiveSyncUntilProgressGoal(r.service.syncUntil, blockUTime, now.Unix())
+	if goal.kind != archiveProgressGoalNone {
+		return goal
 	}
-	return remainingLagSeconds(lagSeconds), true
+
+	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, now.Unix())
+	if !ok {
+		return archiveProgressGoal{}
+	}
+	return archiveProgressGoal{
+		kind:                     archiveProgressGoalLiveTail,
+		remainingSeconds:         remainingLagSeconds(lagSeconds),
+		hasKnownRemainingSeconds: true,
+	}
+}
+
+func archiveSyncUntilProgressGoal(syncUntil uint32, blockUTime int64, nowUnix int64) archiveProgressGoal {
+	if syncUntil == 0 {
+		return archiveProgressGoal{}
+	}
+	// Future sync_until does not shorten the current archive download; live-tail is still the active target.
+	if int64(syncUntil) >= nowUnix {
+		return archiveProgressGoal{}
+	}
+
+	goal := archiveProgressGoal{kind: archiveProgressGoalSyncUntil}
+	if blockUTime <= 0 {
+		return goal
+	}
+
+	remaining := int64(syncUntil) - blockUTime
+	if remaining < 0 {
+		remaining = 0
+	}
+	goal.remainingSeconds = remaining
+	goal.hasKnownRemainingSeconds = true
+	return goal
 }
 
 func (r *archiveCatchUpRunner) shouldWaitArchiveCheckpointBackpressure() bool {

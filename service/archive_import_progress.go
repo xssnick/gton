@@ -360,6 +360,7 @@ func (r *archiveCatchUpRunner) logProgress() error {
 	windowStats := stats.since(r.lastProgressStats)
 	progress := formatCatchUpProgress(done, total)
 	eta := formatCatchUpETA(done, total, time.Since(r.started))
+	progressGoal := r.archiveProgressGoalAt(now)
 
 	event := r.service.log.Info().
 		Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
@@ -377,14 +378,27 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		Int64("window_archive_bytes", windowStats.bytes).
 		Uint64("window_archive_blocks", windowStats.blocks).
 		Uint64("window_archive_entries", windowStats.entries)
-	if lagSeconds, ok := r.archiveLiveTailLagSeconds(); ok {
+	if progressGoal.kind == archiveProgressGoalSyncUntil {
+		event = event.Uint32("sync_until", r.service.syncUntil)
+		if progressGoal.knownRemaining() {
+			event = event.Int64("remaining_sync_until_seconds", progressGoal.remainingSeconds)
+		}
+		if r.startProgressGoal.kind == archiveProgressGoalSyncUntil &&
+			r.startProgressGoal.knownRemaining() &&
+			progressGoal.knownRemaining() {
+			progress = formatLagCatchUpProgress(r.startProgressGoal.remainingSeconds, progressGoal.remainingSeconds)
+			eta = formatLagCatchUpETA(r.startProgressGoal.remainingSeconds, progressGoal.remainingSeconds, time.Since(r.started))
+		} else {
+			eta = "unknown"
+		}
+	} else if lagSeconds, ok := r.archiveLiveTailLagSecondsAt(now); ok {
 		remainingLag := remainingLagSeconds(lagSeconds)
 		event = event.
 			Int64("master_lag_seconds", lagSeconds).
 			Int64("remaining_lag_seconds", remainingLag)
-		if r.hasStartRemainingLag {
-			progress = formatLagCatchUpProgress(r.startRemainingLagSeconds, remainingLag)
-			eta = formatLagCatchUpETA(r.startRemainingLagSeconds, remainingLag, time.Since(r.started))
+		if r.startProgressGoal.kind == archiveProgressGoalLiveTail && r.startProgressGoal.knownRemaining() {
+			progress = formatLagCatchUpProgress(r.startProgressGoal.remainingSeconds, remainingLag)
+			eta = formatLagCatchUpETA(r.startProgressGoal.remainingSeconds, remainingLag, time.Since(r.started))
 		}
 	} else {
 		event = event.Int64("remaining", int64(targetRemainingBlocks))

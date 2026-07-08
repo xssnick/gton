@@ -52,7 +52,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		ID:     next,
 		Proof:  []byte{0xAA, 0xBB},
 		Block:  []byte{0xCC, 0xDD},
-		IsLink: false,
+		IsLink: false, MessageEntries: []tnstore.MessageTransactionIndexEntry{},
 	}
 	if err := storage.SaveBlockFull(full); err != nil {
 		t.Fatalf("save block full: %v", err)
@@ -208,7 +208,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 	next := testStoredMasterBlockID(71)
 	blockData := []byte{0x71, 0x01}
 	proofData := []byte{0x71, 0x02}
-	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block:     next,
 		BlockData: blockData,
 		Meta: &tnstore.BlockMeta{
@@ -302,7 +302,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 
 	keyBlock := testStoredMasterBlockID(72)
 	proofData := []byte{0x72, 0x01}
-	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block: keyBlock,
 		Proofs: []tnstore.LiveBlockProofArtifact{
 			{Kind: tnstore.ServedProofBlock, Data: proofData},
@@ -331,7 +331,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 
 	linkOnlyBlock := testStoredMasterBlockID(73)
 	linkOnlyProof := []byte{0x73, 0x01}
-	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block: linkOnlyBlock,
 		Proofs: []tnstore.LiveBlockProofArtifact{
 			{Kind: tnstore.ServedProofKeyBlockLink, Data: linkOnlyProof},
@@ -419,7 +419,7 @@ func TestDispatchPeerQueryShardNextDescriptionRequiresMasterchain(t *testing.T) 
 
 	prev := testStoredBlockID(20)
 	next := testStoredBlockID(21)
-	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: next, Proof: []byte{1}, Block: []byte{2}}); err != nil {
+	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: next, Proof: []byte{1}, Block: []byte{2}, MessageEntries: []tnstore.MessageTransactionIndexEntry{}}); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
 	if err = storage.LinkNextBlock(prev, next); err != nil {
@@ -615,7 +615,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	stateData := []byte{0x50, 0x51, 0x52, 0x53}
 	archiveData := []byte{0x60, 0x61, 0x62}
 
-	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: block, Proof: blockProof, Block: blockData}); err != nil {
+	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: block, Proof: blockProof, Block: blockData, MessageEntries: []tnstore.MessageTransactionIndexEntry{}}); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
 	if err = storage.SaveBlockProof(tnstore.ServedProofBlock, block, blockProof, nil); err != nil {
@@ -932,7 +932,7 @@ func saveTestServedMasterBlockMeta(t *testing.T, store *pebblestore.Store, block
 			ID:    block,
 			Block: []byte{0x01},
 			Proof: []byte{0x02},
-			Meta:  meta,
+			Meta:  meta, MessageEntries: []tnstore.MessageTransactionIndexEntry{},
 		},
 	}}, tnstore.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save served master block meta %s: %v", tnstore.FormatBlockRef(block), err)

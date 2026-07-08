@@ -141,9 +141,10 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 	defer cancel()
 
 	startedAt := time.Now()
-	queryKind := queryTypeName(req)
+	// Event.Type only evaluates the %T reflection when the event is enabled,
+	// keeping the disabled trace/debug paths free of per-query fmt.Sprintf.
 	queryLog := s.log.Trace().
-		Str("kind", queryKind)
+		Type("kind", req)
 	if peer != nil {
 		queryLog = queryLog.Str("peer", peer.addr)
 	}
@@ -161,7 +162,7 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		}
 		logEvt := s.log.Debug().
 			Err(err).
-			Str("kind", queryKind)
+			Type("kind", req)
 		if peer != nil {
 			logEvt = logEvt.Str("peer", peer.addr)
 		}
@@ -169,8 +170,8 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		return err
 	}
 	answerLog := s.log.Trace().
-		Str("kind", queryKind).
-		Str("response", queryTypeName(resp)).
+		Type("kind", req).
+		Type("response", resp).
 		Dur("elapsed", time.Since(startedAt))
 	if peer != nil {
 		answerLog = answerLog.Str("peer", peer.addr)
@@ -681,10 +682,6 @@ func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
 			s.log.Debug().Err(err).Msg("failed to connect peer learned from overlay query")
 		}
 	}
-}
-
-func queryTypeName(query any) string {
-	return fmt.Sprintf("%T", query)
 }
 
 func (s *overlaySubscription) hasStoredProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (bool, error) {

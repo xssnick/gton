@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/bits"
 	"sort"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	"github.com/xssnick/gton/service/blockproof"
 	admission "github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
@@ -90,53 +90,40 @@ func (s *Server) handleSendMessage(ctx context.Context, query ton.SendMessage) a
 func (s *Server) handleSendMessageWithReason(ctx context.Context, query ton.SendMessage) (tl.Serializable, string) {
 	const errorPrefix = "cannot apply external message to current state "
 
-	if s.messageSender == nil {
-		return sendMessageLSError(sendMessageErrorReasonNotConfigured, errorPrefix+": not configured")
-	}
-	if len(query.Body) > maxExternalMessageBroadcastDataSize {
-		return sendMessageLSError(sendMessageErrorReasonOversized, errorPrefix+fmt.Sprintf(": external message is too large: %d", len(query.Body)))
+	sender := s.externalMessageSender
+	if sender == nil {
+		if s.messageSender == nil {
+			return sendMessageLSError(sendMessageErrorReasonNotConfigured, errorPrefix+": not configured")
+		}
+		var err error
+		sender, err = s.newExternalMessageSender()
+		if err != nil {
+			return sendMessageLSError(sendMessageErrorReasonNotConfigured, errorPrefix+": "+err.Error())
+		}
+		s.externalMessageSender = sender
 	}
 
-	var cacheKey uint64
-	cacheMessage := !s.allowDuplicateExternals
-	if cacheMessage {
-		var ok bool
-		cacheKey, ok = s.cacheSendMessage(query.Body)
-		if !ok {
-			return ton.SendMessageStatus{Status: 1}, ""
-		}
-	}
-	dropCached := func() {
-		if cacheMessage {
-			s.dropCachedSendMessage(cacheKey)
-		}
-	}
-	msgCell, msg, err := admission.ParseMessage(query.Body)
-	if err != nil {
-		dropCached()
-		return sendMessageLSError(sendMessageErrorReasonParseFailed, errorPrefix+": "+err.Error())
-	}
-
-	addrKey := externalMessageAddressKey(msg.DstAddr)
-	if err = s.checkExternalMessageAddressLimit(addrKey); err != nil {
-		dropCached()
-		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
-	}
-	checkResult, err := s.checkExternalMessage(ctx, query.Body, msgCell, msg)
-	if err != nil {
-		dropCached()
-		return sendMessageLSError(sendMessageCheckErrorReason(err), errorPrefix+": "+err.Error())
-	}
-	if err = s.addExternalMessageAddressLimit(addrKey); err != nil {
-		dropCached()
-		return sendMessageLSError(sendMessageAddressLimitErrorReason(err), errorPrefix+": "+err.Error())
-	}
-	if err := s.messageSender.SendCheckedExternalMessage(ctx, query.Body, msg.DstAddr, checkResult.Root, checkResult.Message); err != nil {
-		s.dropExternalMessageAddressLimit(addrKey)
-		dropCached()
-		return sendMessageLSError(sendMessageBroadcastErrorReason(err), errorPrefix+": "+err.Error())
+	if err := sender.Send(ctx, query.Body); err != nil {
+		return sendMessageLSError(sendMessageErrorReason(err), errorPrefix+": "+err.Error())
 	}
 	return ton.SendMessageStatus{Status: 1}, ""
+}
+
+func sendMessageErrorReason(err error) string {
+	switch {
+	case errors.Is(err, admission.ErrMessageTooLarge):
+		return sendMessageErrorReasonOversized
+	case errors.Is(err, admission.ErrParseFailed):
+		return sendMessageErrorReasonParseFailed
+	case errors.Is(err, extmsg.ErrAddressRateLimited), errors.Is(err, extmsg.ErrAddressLimiterFull):
+		return sendMessageAddressLimitErrorReason(err)
+	case errors.Is(err, storage.ErrNotFound), errors.Is(err, admission.ErrRejected):
+		return sendMessageCheckErrorReason(err)
+	case errors.Is(err, admission.ErrBroadcastFailed):
+		return sendMessageBroadcastErrorReason(err)
+	default:
+		return sendMessageErrorReasonCheckFailed
+	}
 }
 
 func sendMessageLSError(reason string, text string) (tl.Serializable, string) {
@@ -233,14 +220,14 @@ func (s *Server) buildAllShardsInfoParts(ctx context.Context, id ton.BlockIDExt)
 }
 
 func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) any {
-	if shardPrefixLen(uint64(query.Shard)) < 0 {
+	if blockproof.ShardPrefixLen(uint64(query.Shard)) < 0 {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
 	}
 	if !isFullBlockID(query.ID) || query.ID.Workchain != masterchainID {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	fragments, err := s.blockFragments(ctx, *query.ID)
+	fragments, err := s.store.BlockFragments(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
@@ -250,7 +237,7 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 		return errorResponse(err, "cannot unpack masterchain state")
 	}
 
-	shardBlock, leaf, err := shardInfoFromHashes(extra.ShardHashes, query.Workchain, query.Shard, query.Exact)
+	shardBlock, leaf, err := blockproof.ShardInfoFromHashes(extra.ShardHashes, query.Workchain, query.Shard, query.Exact)
 	if errors.Is(err, storage.ErrNotFound) {
 		shardBlock = ton.BlockIDExt{}
 		leaf = nil
@@ -271,6 +258,11 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 	}
 }
 
+type configAllParts struct {
+	stateProof  []byte
+	configProof []byte
+}
+
 func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int32, all bool, params []int32) any {
 	if !isFullBlockID(id) || id.Workchain != masterchainID {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "configuration parameters can be loaded with respect to a masterchain block only"}
@@ -284,7 +276,32 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		effectiveMode |= configModeNeedCapabilities
 	}
 
-	fragments, err := s.blockFragments(ctx, *id)
+	if all {
+		// getConfigAll is fully deterministic per (block, effectiveMode): both
+		// proof BOCs are rebuilt from immutable block content, so memoize them.
+		// getConfigParams stays uncached: its params set varies per client and
+		// would only dilute the shared cache.
+		key := liteResponseKey{kind: liteResponseConfigAll, mode: effectiveMode, a: storage.BlockKey(*id)}
+		value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
+			return s.buildConfigAllParts(ctx, *id, effectiveMode)
+		})
+		if err != nil {
+			return errorResponse(err, "cannot load config")
+		}
+
+		parts, ok := value.(configAllParts)
+		if !ok {
+			return ton.LSError{Code: errCodeInternal, Text: "invalid config cache value"}
+		}
+		return ton.ConfigAll{
+			Mode:        int(effectiveMode),
+			ID:          cloneBlockID(*id),
+			StateProof:  parts.stateProof,
+			ConfigProof: parts.configProof,
+		}
+	}
+
+	fragments, err := s.store.BlockFragments(ctx, *id)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*id))
 	}
@@ -301,6 +318,23 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		StateProof:  proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 		ConfigProof: proof[1].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
+}
+
+func (s *Server) buildConfigAllParts(ctx context.Context, id ton.BlockIDExt, effectiveMode uint32) (configAllParts, error) {
+	fragments, err := s.store.BlockFragments(ctx, id)
+	if err != nil {
+		return configAllParts{}, queryErrorFromResponse(errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(id)))
+	}
+
+	stateProof, err := configProof(fragments.StateRoot(), effectiveMode, true, nil)
+	if err != nil {
+		return configAllParts{}, queryErrorFromResponse(errorResponse(err, "cannot create config proof"))
+	}
+
+	return configAllParts{
+		stateProof:  fragments.BlockStateRootProof().ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+		configProof: stateProof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
+	}, nil
 }
 
 func (s *Server) handlePreviousKeyBlockConfig(ctx context.Context, id ton.BlockIDExt, mode uint32, all bool, params []int32) any {
@@ -376,7 +410,7 @@ func (s *Server) handleLibraries(ctx context.Context, query ton.GetLibraries) an
 		return errorResponse(err, "cannot obtain current masterchain state")
 	}
 
-	fragments, err := s.blockFragments(ctx, current.Masterchain.Block)
+	fragments, err := s.store.BlockFragments(ctx, current.Masterchain.Block)
 	if err != nil {
 		return errorResponse(err, "cannot load current masterchain state")
 	}
@@ -398,7 +432,7 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	fragments, err := s.blockFragments(ctx, *query.ID)
+	fragments, err := s.store.BlockFragments(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
@@ -537,7 +571,7 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 					return ton.LSError{Code: errCodeProtoViolation, Text: "cannot locate transaction in block with specified logical time"}
 				}
 
-				tx, err = findBlockTransaction(block.root, account, cursorLT)
+				tx, err = block.findTransaction(account, cursorLT)
 				if errors.Is(err, storage.ErrNotFound) {
 					if len(roots) > 0 {
 						return getTransactionsResponse(roots, ids)
@@ -598,6 +632,21 @@ type transactionSearchBlock struct {
 	root    *cell.Cell
 	startLT uint64
 	endLT   uint64
+	// accounts memoizes the block's parsed ShardAccountBlocks so transaction
+	// chains that stay inside one block parse the block prefix only once. The
+	// block is local to a single query handler, so no locking is needed.
+	accounts *tlb.ShardAccountBlocks
+}
+
+func (b *transactionSearchBlock) findTransaction(account []byte, lt uint64) (*cell.Cell, error) {
+	if b.accounts == nil {
+		accounts, err := blockTransactionAccounts(b.root)
+		if err != nil {
+			return nil, err
+		}
+		b.accounts = accounts
+	}
+	return findTransactionInAccountBlocks(b.accounts, account, lt)
 }
 
 func transactionSearchBlockFromRoot(id ton.BlockIDExt, root *cell.Cell) (*transactionSearchBlock, error) {
@@ -622,14 +671,14 @@ func accountTransactionFromCurrentBlock(block *transactionSearchBlock, workchain
 	if block == nil {
 		return nil, nil, storage.ErrNotFound
 	}
-	if !blockContainsAccount(block.id, workchain, account) {
+	if !blockproof.BlockContainsAccount(block.id, workchain, account) {
 		return nil, nil, errBlockCannotContainAccount
 	}
 	if !block.containsLT(lt) {
 		return nil, nil, storage.ErrNotFound
 	}
 
-	tx, err := findBlockTransaction(block.root, account, lt)
+	tx, err := block.findTransaction(account, lt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -637,7 +686,7 @@ func accountTransactionFromCurrentBlock(block *transactionSearchBlock, workchain
 }
 
 func (s *Server) accountTransactionFromShardHint(ctx context.Context, current *transactionSearchBlock, workchain int32, account []byte, lt uint64) (*cell.Cell, *transactionSearchBlock, error) {
-	if current == nil || !blockContainsAccount(current.id, workchain, account) {
+	if current == nil || !blockproof.BlockContainsAccount(current.id, workchain, account) {
 		return nil, nil, storage.ErrNotFound
 	}
 
@@ -648,7 +697,7 @@ func (s *Server) accountTransactionFromShardHint(ctx context.Context, current *t
 	if err != nil {
 		return nil, nil, storage.ErrNotFound
 	}
-	if !blockContainsAccount(hintedBlock, workchain, account) {
+	if !blockproof.BlockContainsAccount(hintedBlock, workchain, account) {
 		return nil, nil, storage.ErrNotFound
 	}
 
@@ -665,7 +714,7 @@ func (s *Server) accountTransactionFromShardHint(ctx context.Context, current *t
 		return nil, nil, storage.ErrNotFound
 	}
 
-	tx, err := findBlockTransaction(root, account, lt)
+	tx, err := block.findTransaction(account, lt)
 	if err != nil {
 		return nil, nil, storage.ErrNotFound
 	}
@@ -677,7 +726,7 @@ func (s *Server) lookupBlockByAccountLT(ctx context.Context, workchain int32, ac
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
-	if !blockContainsAccount(block, workchain, account) {
+	if !blockproof.BlockContainsAccount(block, workchain, account) {
 		return ton.BlockIDExt{}, errBlockCannotContainAccount
 	}
 	return block, nil
@@ -744,15 +793,6 @@ func cxxBlockIDExtString(block ton.BlockIDExt) string {
 	return fmt.Sprintf("(%d,%016x,%d):%x:%x", block.Workchain, uint64(block.Shard), block.SeqNo, block.RootHash, block.FileHash)
 }
 
-func blockContainsAccount(block ton.BlockIDExt, workchain int32, account []byte) bool {
-	if block.Workchain != workchain || len(account) != 32 {
-		return false
-	}
-
-	addr := address.NewAddress(0, byte(workchain), account)
-	return tlb.ShardID(uint64(block.Shard)).ContainsAddress(addr)
-}
-
 func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.ListBlockTransactions) any {
 	if !isFullBlockID(query.ID) {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid BlockIdExt"}
@@ -769,7 +809,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 	proofRoot := root
 	var proofBuilder *cell.MerkleProofBuilder
 	if query.Mode&32 != 0 {
-		proofBuilder = newLiteServerProofBuilder(root)
+		proofBuilder = blockproof.NewProofBuilder(root)
 		proofRoot = proofBuilder.Root()
 	}
 
@@ -828,7 +868,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 	proofRoot := root
 	var proofBuilder *cell.MerkleProofBuilder
 	if query.Mode&32 != 0 || query.Mode&256 != 0 {
-		proofBuilder = newLiteServerProofBuilder(root)
+		proofBuilder = blockproof.NewProofBuilder(root)
 		proofRoot = proofBuilder.Root()
 	}
 
@@ -871,7 +911,7 @@ func (s *Server) handleValidatorStats(ctx context.Context, query ton.GetValidato
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	fragments, err := s.blockFragments(ctx, *query.ID)
+	fragments, err := s.store.BlockFragments(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load masterchain state "+storage.FormatBlockRef(*query.ID))
 	}
@@ -900,7 +940,7 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 	var blockProof *cell.Cell
 	var root *cell.Cell
 	if query.Mode&1 != 0 {
-		fragments, err := s.blockFragments(ctx, *query.ID)
+		fragments, err := s.store.BlockFragments(ctx, *query.ID)
 		if err != nil {
 			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
 		}
@@ -938,7 +978,7 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 func (s *Server) handleOutMsgQueueSizes(ctx context.Context, query ton.GetOutMsgQueueSizes) any {
 	var filter *storage.ShardKey
 	if query.Mode&1 != 0 {
-		if shardPrefixLen(uint64(query.Shard)) < 0 {
+		if blockproof.ShardPrefixLen(uint64(query.Shard)) < 0 {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
 		}
 		filter = &storage.ShardKey{Workchain: query.WC, Shard: query.Shard}
@@ -950,12 +990,12 @@ func (s *Server) handleOutMsgQueueSizes(ctx context.Context, query ton.GetOutMsg
 	}
 
 	blocks := make([]ton.BlockIDExt, 0, 1+len(current.Shards))
-	if filter == nil || shardIntersects(*filter, storage.ShardKeyFromBlock(current.Masterchain.Block)) {
+	if filter == nil || blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(current.Masterchain.Block)) {
 		blocks = append(blocks, current.Masterchain.Block)
 	}
 	for _, key := range storage.SortedShardKeys(current.Shards) {
 		state := current.Shards[key]
-		if filter != nil && !shardIntersects(*filter, storage.ShardKeyFromBlock(state.Block)) {
+		if filter != nil && !blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(state.Block)) {
 			continue
 		}
 		blocks = append(blocks, state.Block)
@@ -1038,7 +1078,7 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 	eof := false
 
 	for len(out) < limit {
-		accountKeyCell, accountValue, err := data.shardAccounts.Accounts.LookupNearestKey(accountKey(currentAccount), fetchNext, allowSameAccount, false)
+		accountKeyCell, accountValue, err := data.shardAccounts.Accounts.LookupNearestKey(blockproof.AccountKey(currentAccount), fetchNext, allowSameAccount, false)
 		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 			eof = true
 			break
@@ -1241,7 +1281,7 @@ func transactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell
 		return nil, fmt.Errorf("no InMsg in InMsgDescr for message with hash %x", msgHash)
 	}
 
-	value, err := inMsgDescr.LoadValueWithExtra(accountKey(msgHash))
+	value, err := inMsgDescr.LoadValueWithExtra(blockproof.AccountKey(msgHash))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		return nil, fmt.Errorf("no InMsg in InMsgDescr for message with hash %x", msgHash)
 	}
@@ -1389,11 +1429,15 @@ func findBlockTransaction(root *cell.Cell, account []byte, lt uint64) (*cell.Cel
 	if err != nil {
 		return nil, err
 	}
+	return findTransactionInAccountBlocks(shardAccounts, account, lt)
+}
+
+func findTransactionInAccountBlocks(shardAccounts *tlb.ShardAccountBlocks, account []byte, lt uint64) (*cell.Cell, error) {
 	if shardAccounts.Accounts == nil {
 		return nil, storage.ErrNotFound
 	}
 
-	accountValue, err := shardAccounts.Accounts.LoadValueWithExtra(accountKey(account))
+	accountValue, err := shardAccounts.Accounts.LoadValueWithExtra(blockproof.AccountKey(account))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		return nil, storage.ErrNotFound
 	}
@@ -1419,174 +1463,6 @@ func findBlockTransaction(root *cell.Cell, account []byte, lt uint64) (*cell.Cel
 	return transactionCellFromValue(txValue)
 }
 
-func mcStateExtra(root *cell.Cell) (*tlb.McStateExtra, error) {
-	loader, err := root.BeginParse()
-	if err != nil {
-		return nil, err
-	}
-
-	var state tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&state, loader); err != nil {
-		return nil, err
-	}
-	if state.McStateExtra == nil {
-		return nil, fmt.Errorf("state is missing mc_state_extra")
-	}
-
-	extraLoader, err := state.McStateExtra.BeginParse()
-	if err != nil {
-		return nil, err
-	}
-
-	var extra tlb.McStateExtra
-	if err := tlb.LoadFromCell(&extra, extraLoader); err != nil {
-		return nil, err
-	}
-	return &extra, nil
-}
-
-func shardInfoFromHashes(hashes *cell.Dictionary, wc int32, shard int64, exact bool) (ton.BlockIDExt, *cell.Cell, error) {
-	if hashes == nil {
-		return ton.BlockIDExt{}, nil, storage.ErrNotFound
-	}
-
-	wcKey := cell.BeginCell().MustStoreInt(int64(wc), 32).EndCell()
-	wcValue, err := hashes.LoadValue(wcKey)
-	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return ton.BlockIDExt{}, nil, storage.ErrNotFound
-	}
-	if err != nil {
-		return ton.BlockIDExt{}, nil, err
-	}
-
-	root, err := wcValue.LoadRefCell()
-	if err != nil {
-		return ton.BlockIDExt{}, nil, err
-	}
-
-	trueShard, leaf, err := findShardLeaf(root, uint64(shard), exact)
-	if err != nil {
-		return ton.BlockIDExt{}, nil, err
-	}
-
-	block, err := blockIDFromShardLeaf(wc, trueShard, leaf)
-	if err != nil {
-		return ton.BlockIDExt{}, nil, err
-	}
-	return block, leaf, nil
-}
-
-func findShardLeaf(root *cell.Cell, shard uint64, exact bool) (int64, *cell.Cell, error) {
-	prefixLen := shardPrefixLen(shard)
-	if prefixLen < 0 {
-		return 0, nil, storage.ErrNotFound
-	}
-
-	node := root
-	z := shard
-	m := uint64(math.MaxUint64)
-	remaining := prefixLen
-	for {
-		loader, err := node.BeginParse()
-		if err != nil {
-			return 0, nil, err
-		}
-		typ, err := loader.LoadUInt(1)
-		if err != nil {
-			return 0, nil, err
-		}
-		if typ == 0 {
-			if remaining != 0 && exact {
-				return 0, nil, storage.ErrNotFound
-			}
-			trueShard := (shard | m) - (m >> 1)
-			return int64(trueShard), node, nil
-		}
-
-		if remaining == 0 || loader.BitsLeft() != 0 || loader.RefsNum() != 2 {
-			return 0, nil, storage.ErrNotFound
-		}
-
-		node, err = loader.BaseCell().PeekRef(int(z >> 63))
-		if err != nil {
-			return 0, nil, err
-		}
-		z <<= 1
-		remaining--
-		m >>= 1
-	}
-}
-
-func blockIDFromShardLeaf(wc int32, shard int64, leaf *cell.Cell) (ton.BlockIDExt, error) {
-	loader, err := leaf.BeginParse()
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	typ, err := loader.LoadUInt(1)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if typ != 0 {
-		return ton.BlockIDExt{}, fmt.Errorf("shard leaf has invalid tag")
-	}
-
-	magic, err := loader.LoadUInt(4)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-
-	switch magic {
-	case 0xa:
-		var desc tlb.ShardDesc
-		if err = tlb.LoadFromCell(&desc, loader, true); err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		return ton.BlockIDExt{Workchain: wc, Shard: shard, SeqNo: desc.SeqNo, RootHash: desc.RootHash, FileHash: desc.FileHash}, nil
-	case 0xb:
-		var desc tlb.ShardDescB
-		if err = tlb.LoadFromCell(&desc, loader, true); err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		return ton.BlockIDExt{Workchain: wc, Shard: shard, SeqNo: desc.SeqNo, RootHash: desc.RootHash, FileHash: desc.FileHash}, nil
-	default:
-		return ton.BlockIDExt{}, fmt.Errorf("wrong ShardDesc magic: %x", magic)
-	}
-}
-
-func shardPrefixLen(shard uint64) int {
-	if shard == 0 {
-		return -1
-	}
-	low := shard & -shard
-	if low == 0 {
-		return -1
-	}
-	return 63 - bits.TrailingZeros64(low)
-}
-
-func shardIntersects(a, b storage.ShardKey) bool {
-	if a.Workchain != b.Workchain {
-		return false
-	}
-	aLen := shardPrefixLen(uint64(a.Shard))
-	bLen := shardPrefixLen(uint64(b.Shard))
-	if aLen < 0 || bLen < 0 {
-		return false
-	}
-	minLen := aLen
-	if bLen < minLen {
-		minLen = bLen
-	}
-	return shardPrefix(uint64(a.Shard), minLen) == shardPrefix(uint64(b.Shard), minLen)
-}
-
-func shardPrefix(shard uint64, length int) uint64 {
-	if length <= 0 {
-		return 0
-	}
-	return shard >> (64 - length)
-}
-
 func libraryEntriesFromDict(libraries *cell.Dictionary, hashes [][]byte, mode uint32) ([]*ton.LibraryEntry, error) {
 	if libraries == nil {
 		return nil, nil
@@ -1595,7 +1471,7 @@ func libraryEntriesFromDict(libraries *cell.Dictionary, hashes [][]byte, mode ui
 	hashes = uniqueHashes(hashes, 16)
 	result := make([]*ton.LibraryEntry, 0, len(hashes))
 	for _, hash := range hashes {
-		value, err := libraries.LoadValue(accountKey(hash))
+		value, err := libraries.LoadValue(blockproof.AccountKey(hash))
 		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 			continue
 		}
@@ -1626,39 +1502,6 @@ func libraryEntriesFromDict(libraries *cell.Dictionary, hashes [][]byte, mode ui
 		result = append(result, &ton.LibraryEntry{Hash: hash, Data: data})
 	}
 	return result, nil
-}
-
-func librariesDict(stateRoot *cell.Cell) (*cell.Dictionary, error) {
-	stateLoader, err := stateRoot.BeginParse()
-	if err != nil {
-		return nil, err
-	}
-
-	var state tlb.ShardStateUnsplit
-	if err := tlb.LoadFromCell(&state, stateLoader); err != nil {
-		return nil, err
-	}
-	if state.Stats == nil {
-		return nil, fmt.Errorf("state is missing shard state extras")
-	}
-
-	loader, err := state.Stats.BeginParse()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := loader.LoadUInt(64); err != nil {
-		return nil, err
-	}
-	if _, err := loader.LoadUInt(64); err != nil {
-		return nil, err
-	}
-	if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), loader); err != nil {
-		return nil, err
-	}
-	if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), loader); err != nil {
-		return nil, err
-	}
-	return loader.LoadDict(256)
 }
 
 func validatorStatsCount(stateRoot *cell.Cell, mode uint32, limit int32, startAfter []byte) (int32, bool, error) {
@@ -1703,7 +1546,7 @@ type creatorStatsDict interface {
 }
 
 func blockCreateStatsDict(stateRoot *cell.Cell) (creatorStatsDict, error) {
-	prefix, err := loadMcStateExtraPrefix(stateRoot)
+	prefix, err := blockproof.LoadMcStateExtraPrefix(stateRoot, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1821,7 +1664,7 @@ func outMsgQueueSize(stateRoot *cell.Cell) (uint64, error) {
 		return 0, err
 	}
 
-	state, err := visitShardStateHeader(loader)
+	state, err := blockproof.VisitShardStateHeader(loader)
 	if err != nil {
 		return 0, err
 	}

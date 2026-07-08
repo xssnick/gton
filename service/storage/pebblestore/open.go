@@ -234,6 +234,7 @@ func Open(opts Options) (*Store, error) {
 		pendingArchiveSync:              map[string]pendingPackWrite{},
 		pendingKeyProofSync:             map[string]pendingPackWrite{},
 	}
+	store.lazyCellLoaderZero = store.newLazyCellLoaderForGeneration(0)
 	if !opts.ReadOnly {
 		stageStarted = time.Now()
 		logger.Info().Msg("recovering artifact pack journals")

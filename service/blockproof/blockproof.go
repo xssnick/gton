@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/bits"
@@ -423,6 +424,53 @@ func (s *ValidatorSignatureSet) IsSimplex() bool {
 	return s.simplex
 }
 
+// ContentKey digests everything a successful signature check of this set for
+// blockID proves: the signed-payload inputs and the canonical (deduplicated,
+// order-independent) signature list. Two sets with equal keys are
+// interchangeable for "signatures already verified" purposes, so a later
+// verification of an equal set against the same block may be skipped.
+func (s *ValidatorSignatureSet) ContentKey(blockID ton.BlockIDExt) []byte {
+	hasher := sha256.New()
+	var scratch [8]byte
+	writeUint32 := func(v uint32) {
+		binary.BigEndian.PutUint32(scratch[:4], v)
+		hasher.Write(scratch[:4])
+	}
+	writeBytes := func(data []byte) {
+		writeUint32(uint32(len(data)))
+		hasher.Write(data)
+	}
+
+	writeBytes(blockID.RootHash)
+	writeUint32(s.catchainSeqno)
+	writeUint32(s.validatorSetHash)
+	flags := uint32(0)
+	if s.final {
+		flags |= 1
+	}
+	if s.simplex {
+		flags |= 2
+	}
+	writeUint32(flags)
+	if s.simplex {
+		writeBytes(s.sessionID)
+		binary.BigEndian.PutUint64(scratch[:], uint64(s.slot))
+		hasher.Write(scratch[:])
+		writeBytes(s.candidateData)
+	}
+
+	sigs := cloneSignatures(s.signatures)
+	sort.Slice(sigs, func(i, j int) bool {
+		return bytes.Compare(sigs[i].NodeIDShort, sigs[j].NodeIDShort) < 0
+	})
+	writeUint32(uint32(len(sigs)))
+	for _, sig := range sigs {
+		writeBytes(sig.NodeIDShort)
+		writeBytes(sig.Signature)
+	}
+	return hasher.Sum(nil)
+}
+
 func MasterchainValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {
 	if block.Workchain != -1 {
 		return nil, fmt.Errorf("only masterchain blocks are supported, got %s", tnstore.FormatBlockRef(*block))
@@ -603,13 +651,13 @@ func checkSignaturesPayload(toSign []byte, sigSet *ValidatorSignatureSet, sigs [
 		return fmt.Errorf("incorrect validator set hash")
 	}
 
-	sort.Slice(sigs, func(i, j int) bool {
-		return bytes.Compare(sigs[i].NodeIDShort, sigs[j].NodeIDShort) < 0
-	})
-
-	var signedWeight uint64
-	var prevNodeID [32]byte
-	hasPrevNodeID := false
+	type weightedSignature struct {
+		signature []byte
+		validator preparedValidator
+		nodeID    [32]byte
+	}
+	entries := make([]weightedSignature, 0, len(sigs))
+	seen := make(map[[32]byte]struct{}, len(sigs))
 	for _, sig := range sigs {
 		var nodeID [32]byte
 		if len(sig.NodeIDShort) != len(nodeID) {
@@ -617,22 +665,37 @@ func checkSignaturesPayload(toSign []byte, sigSet *ValidatorSignatureSet, sigs [
 		}
 		copy(nodeID[:], sig.NodeIDShort)
 
-		if hasPrevNodeID && prevNodeID == nodeID {
+		if _, ok := seen[nodeID]; ok {
 			return fmt.Errorf("duplicated node signature")
 		}
-		prevNodeID = nodeID
-		hasPrevNodeID = true
+		seen[nodeID] = struct{}{}
 
 		v, ok := validators.validators[nodeID]
 		if !ok {
 			return fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
 		}
-		if !ed25519.Verify(v.publicKey, toSign, sig.Signature) {
-			return fmt.Errorf("incorrect signature of validator %s", hex.EncodeToString(sig.NodeIDShort))
+		entries = append(entries, weightedSignature{signature: sig.Signature, validator: v, nodeID: nodeID})
+	}
+
+	// Verify heaviest validators first so the 2/3 cutoff below is reached with
+	// the fewest Ed25519 checks.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].validator.weight != entries[j].validator.weight {
+			return entries[i].validator.weight > entries[j].validator.weight
+		}
+		return bytes.Compare(entries[i].nodeID[:], entries[j].nodeID[:]) < 0
+	})
+
+	var signedWeight uint64
+	for _, entry := range entries {
+		if !ed25519.Verify(entry.validator.publicKey, toSign, entry.signature) {
+			return fmt.Errorf("incorrect signature of validator %s", hex.EncodeToString(entry.nodeID[:]))
 		}
 
-		signedWeight += v.weight
-		if signedWeight > validators.totalWeight {
+		signedWeight += entry.validator.weight
+		// Stop verifying once the 2/3 threshold below is already reached,
+		// matching the reference validator-set check_signatures behavior.
+		if 3*signedWeight > 2*validators.totalWeight {
 			break
 		}
 	}

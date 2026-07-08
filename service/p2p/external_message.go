@@ -269,14 +269,6 @@ func parseExternalMessageData(data []byte) (parsedExternalMessage, error) {
 	}, nil
 }
 
-func externalMessageDestinationAddress(data []byte) (extmsg.AddressKey, error) {
-	parsed, err := parseExternalMessageData(data)
-	if err != nil {
-		return extmsg.AddressKey{}, err
-	}
-	return parsed.address, nil
-}
-
 func parseExternalMessageRoot(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {
 	root, err := cell.FromBOCWithOptions(data, cell.BOCParseOptions{
 		MaxCells: maxExternalMessageBOCCells,

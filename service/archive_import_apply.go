@@ -29,7 +29,7 @@ type shardClientArchiveWindow struct {
 	masterProofs   map[uint32]*masterchainConsensusProof
 	archiveBlocks  map[storage.BlockRootHash]PreparedBlock
 	archiveImports []*archiveImportResult
-	stateCells     *archiveStateCellOverlay
+	stateCells     *stateCellWindowCache
 	appliedStates  appliedStateSet
 	shardArchives  int
 	splitDepth     uint32
@@ -378,28 +378,41 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 	return shards, nil
 }
 
-func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.CurrentState, checkpointBlocks uint32, lockElapsed time.Duration, entries []storage.StateCheckpointBlock, cells *archiveStateCellCheckpoint) (*storage.CurrentState, error) {
+func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.CurrentState, checkpointBlocks uint32, lockElapsed time.Duration, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (*storage.CurrentState, error) {
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("archive current state has no block states")
 	}
 
 	storedCurrent := currentStateWithoutCells(current)
 	started := time.Now()
-	persisted, _, err := r.service.saveStateCheckpoint(r.ctx, storedCurrent, entries, cells.cells(), 0)
+	// Cells applied through the window caches were already streamed to celldb by
+	// the state cell prewriter; when every checkpoint cache is fully enqueued the
+	// persist only waits for the prewriter to reach the target and flushes.
+	// Otherwise fall back to writing the checkpoint cells synchronously.
+	checkpointCells := storage.StateCellRecords{}
+	cellPrewriteTarget, prewritten := cells.prewriteTarget()
+	if !prewritten {
+		checkpointCells = cells.cells()
+	}
+	persisted, stages, err := r.service.saveStateCheckpoint(r.ctx, storedCurrent, entries, checkpointCells, cellPrewriteTarget)
 	if err != nil {
 		return nil, fmt.Errorf("persist archive current state %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}
 	cells.complete()
 	r.service.markLiveCheckpointStatesFlushed(entries)
 
-	r.service.log.Debug().
+	event := r.service.log.Debug().
 		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
 		Uint32("shard_client_seqno", current.ShardClientSeqno).
 		Uint32("checkpoint_blocks", checkpointBlocks).
 		Int("states", len(entries)).
 		Int("shards", len(current.Shards)).
+		Bool("cells_prewritten", prewritten).
 		Dur("lock_wait", lockElapsed).
-		Dur("elapsed", time.Since(started)).
-		Msg("archive shard-client checkpoint persisted")
+		Dur("elapsed", time.Since(started))
+	for _, stage := range stages {
+		event = event.Dur("stage_"+stage.Stage, stage.Duration)
+	}
+	event.Msg("archive shard-client checkpoint persisted")
 	return persisted, nil
 }

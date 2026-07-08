@@ -55,8 +55,7 @@ type archiveCatchUpRunner struct {
 	lastCheckpoint                 time.Time
 	lastCheckpointSeqno            uint32
 	checkpointBlocksTarget         uint32
-	startRemainingLagSeconds       int64
-	hasStartRemainingLag           bool
+	startProgressGoal              archiveProgressGoal
 	shardBlocksApplied             uint64
 	shardBlocksReused              uint64
 	lastProgressShardBlocksApplied uint64
@@ -66,7 +65,7 @@ type archiveCatchUpRunner struct {
 	pipelineWaitStarted            time.Time
 	checkpointDone                 chan archiveCheckpointResult
 	checkpointStates               appliedStateSet
-	stateCells                     *archiveStateCellOverlay
+	stateCells                     *stateCellWindowCache
 	syncUntilReached               bool
 }
 
@@ -96,9 +95,10 @@ func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *s
 		lastCheckpoint:         started,
 		lastCheckpointSeqno:    current.ShardClientSeqno,
 		checkpointBlocksTarget: s.archiveCatchUpCheckpointBlocks,
-		stateCells:             newArchiveStateCellOverlay(s.stateCellLoader(), &s.lazyCellLoads),
+		stateCells:             newStateCellWindowCache(s.stateCellLoader(), &s.lazyCellLoads),
 	}
-	runner.startRemainingLagSeconds, runner.hasStartRemainingLag = runner.archiveRemainingLagSeconds()
+	runner.stateCells.setPrewriter(s.stateCellPrewrite)
+	runner.startProgressGoal = runner.archiveProgressGoalAt(started)
 
 	return runner.run()
 }

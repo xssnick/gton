@@ -36,8 +36,13 @@ func TestWaitLimiterCapsPerIP(t *testing.T) {
 }
 
 func TestQueryExecutorShedsWhenPendingFull(t *testing.T) {
-	executor := &queryExecutor{tasks: make(chan executorTask, 1)}
+	executor := &queryExecutor{tasks: make(chan executorTask, 1), done: make(chan struct{})}
+	executor.wg.Add(1)
 	go executor.worker()
+	defer func() {
+		executor.Close()
+		executor.Wait()
+	}()
 
 	// Capture the only worker so subsequent runs deterministically queue.
 	release, ok := executor.occupy(context.Background())
@@ -62,8 +67,13 @@ func TestQueryExecutorShedsWhenPendingFull(t *testing.T) {
 }
 
 func TestQueryExecutorDropsQueuedOnContextCancel(t *testing.T) {
-	executor := &queryExecutor{tasks: make(chan executorTask, 1)}
+	executor := &queryExecutor{tasks: make(chan executorTask, 1), done: make(chan struct{})}
+	executor.wg.Add(1)
 	go executor.worker()
+	defer func() {
+		executor.Close()
+		executor.Wait()
+	}()
 
 	// Capture the only worker so the next run deterministically queues.
 	release, ok := executor.occupy(context.Background())
@@ -83,6 +93,27 @@ func TestQueryExecutorDropsQueuedOnContextCancel(t *testing.T) {
 	case <-ran:
 		t.Fatal("cancelled queued query still ran")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestQueryExecutorCloseStopsWorkers(t *testing.T) {
+	executor := newQueryExecutor(2)
+	executor.Close()
+
+	done := make(chan struct{})
+	go func() {
+		executor.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("query executor workers did not stop")
+	}
+
+	if executor.run(context.Background(), func() {}) {
+		t.Fatal("closed executor accepted a task")
 	}
 }
 

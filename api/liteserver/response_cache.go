@@ -19,6 +19,8 @@ const (
 	liteResponseShardBlockLinks
 	liteResponseBlockProofLinkForward
 	liteResponseBlockProofLinkBackward
+	liteResponseConfigAll
+	liteResponseLookupMasterProofs
 )
 
 type liteResponseKey struct {
@@ -34,7 +36,11 @@ type liteResponseKey struct {
 type liteResponseCache struct {
 	mu    sync.RWMutex
 	items map[liteResponseKey]any
+	// order is a FIFO of cached keys. It grows up to liteResponseCacheLimit and
+	// then becomes a circular buffer: head indexes the oldest key, which is
+	// evicted and overwritten in place on every insert at capacity.
 	order []liteResponseKey
+	head  int
 	load  liveLoadGroup[liteResponseKey]
 }
 
@@ -70,11 +76,12 @@ func (c *liteResponseCache) do(ctx context.Context, key liteResponseKey, build f
 			value = existing
 		} else {
 			c.items[key] = value
-			c.order = append(c.order, key)
-			if len(c.order) > liteResponseCacheLimit {
-				delete(c.items, c.order[0])
-				copy(c.order, c.order[1:])
-				c.order = c.order[:len(c.order)-1]
+			if len(c.order) < liteResponseCacheLimit {
+				c.order = append(c.order, key)
+			} else {
+				delete(c.items, c.order[c.head])
+				c.order[c.head] = key
+				c.head = (c.head + 1) % len(c.order)
 			}
 		}
 		c.mu.Unlock()

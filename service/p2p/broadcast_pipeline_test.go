@@ -808,7 +808,7 @@ func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 		FileHash:  fileHash,
 	}
 	proofBOC := testPeerBlockProofEnvelopeBOC(t, block, blockCell, nil)
-	proofCell, err := parseDownloadedBlockProof("test pending broadcast proof", proofBOC)
+	proofCell, err := parseDownloadedBlockProof(proofBOC)
 	if err != nil {
 		t.Fatalf("parse pending broadcast proof: %v", err)
 	}

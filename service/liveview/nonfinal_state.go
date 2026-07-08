@@ -53,7 +53,11 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 	root = normalized
 
 	meta := block.Meta
-	var stateUpdate *cell.Cell
+	// A publisher-provided update was already extracted and Merkle-validated at
+	// decode time (see LiveBlockArtifacts.StateUpdate); parse and validate only
+	// what is missing.
+	stateUpdate := block.StateUpdate
+	updateValidated := stateUpdate != nil
 	if meta == nil {
 		parsed, err := storage.ParseVerifiedBlockCell(block.Block, root)
 		if err != nil {
@@ -63,7 +67,9 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 		if err != nil {
 			return nonfinalParsedStateUpdate{}, err
 		}
-		stateUpdate = parsed.StateUpdate
+		if stateUpdate == nil {
+			stateUpdate = parsed.StateUpdate
+		}
 	}
 	if meta == nil || len(meta.StateRootHash) != 32 {
 		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
@@ -79,8 +85,10 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 	if stateUpdate == nil {
 		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
 	}
-	if err = cell.ValidateMerkleUpdate(stateUpdate); err != nil {
-		return nonfinalParsedStateUpdate{}, fmt.Errorf("validate non-final state update: %w", err)
+	if !updateValidated {
+		if err = cell.ValidateMerkleUpdate(stateUpdate); err != nil {
+			return nonfinalParsedStateUpdate{}, fmt.Errorf("validate non-final state update: %w", err)
+		}
 	}
 
 	return nonfinalParsedStateUpdate{

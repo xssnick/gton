@@ -43,6 +43,10 @@ type ServedBlockFull struct {
 	Meta                   *BlockMeta
 	IsLink                 bool
 	ArchiveShardSplitDepth uint32
+	// MessageEntries optionally carries the message->transaction index entries
+	// precomputed when Block was parsed. Checkpoint persistence requires a
+	// non-nil slice, where an empty slice means no indexable messages.
+	MessageEntries []MessageTransactionIndexEntry
 }
 
 type ServedBlockLink struct {
@@ -108,11 +112,12 @@ func (b *ServedBlockFull) Clone() *ServedBlockFull {
 		return nil
 	}
 	return &ServedBlockFull{
-		ID:                     b.ID,
+		ID:                     cloneBlockID(b.ID),
 		Proof:                  append([]byte(nil), b.Proof...),
 		Block:                  append([]byte(nil), b.Block...),
 		Meta:                   b.Meta.Clone(),
 		IsLink:                 b.IsLink,
 		ArchiveShardSplitDepth: b.ArchiveShardSplitDepth,
+		MessageEntries:         cloneMessageTransactionEntries(b.MessageEntries),
 	}
 }

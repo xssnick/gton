@@ -77,7 +77,7 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 	})
 
 	b.Run("direct-state", func(b *testing.B) {
-		valueLen, d1, d2, err := stateCellEncodedLen(root, refs)
+		valueLen, layout, err := stateCellEncodedLen(root, refs)
 		if err != nil {
 			b.Fatalf("state cell encoded len: %v", err)
 		}
@@ -88,7 +88,7 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			encodeStateCellRecordTo(buf, root, refs, d1, d2)
+			encodeStateCellRecordTo(buf, root, refs, layout)
 		}
 	})
 }

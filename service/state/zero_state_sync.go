@@ -26,7 +26,7 @@ func (s *Syncer) SyncZeroStateCurrent(ctx context.Context) (*storage.CurrentStat
 	s.log.Info().
 		Str("masterchain", storage.FormatBlockRef(zeroBlock)).
 		Msg("importing masterchain zero state")
-	masterState, err := s.importZeroState(ctx, zeroBlock, zeroBlock)
+	masterState, err := s.ImportZeroState(ctx, zeroBlock, zeroBlock)
 	if err != nil {
 		return nil, fmt.Errorf("import masterchain zero state %s: %w", storage.FormatBlockRef(zeroBlock), err)
 	}
@@ -53,7 +53,7 @@ func (s *Syncer) SyncZeroStateCurrent(ctx context.Context) (*storage.CurrentStat
 			Str("shard", storage.FormatBlockRef(shardBlock)).
 			Str("masterchain", storage.FormatBlockRef(zeroBlock)).
 			Msg("importing shard zero state")
-		shardState, err := s.importZeroState(ctx, shardBlock, zeroBlock)
+		shardState, err := s.ImportZeroState(ctx, shardBlock, zeroBlock)
 		if err != nil {
 			return nil, fmt.Errorf("import shard zero state %s: %w", storage.FormatBlockRef(shardBlock), err)
 		}
@@ -77,10 +77,6 @@ func (s *Syncer) SyncZeroStateCurrent(ctx context.Context) (*storage.CurrentStat
 }
 
 func (s *Syncer) ImportZeroState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt) (*storage.BlockState, error) {
-	return s.importZeroState(ctx, block, master)
-}
-
-func (s *Syncer) importZeroState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt) (*storage.BlockState, error) {
 	if block.SeqNo != 0 {
 		return nil, fmt.Errorf("state is not zerostate: %s", storage.FormatBlockRef(block))
 	}

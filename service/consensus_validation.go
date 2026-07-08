@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 
@@ -162,7 +163,7 @@ func (s *Service) checkedConsensusForPreparedBlock(current *tnstore.BlockState, 
 	return s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
 }
 
-func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell) (*masterchainConsensusProof, *blockproof.Parsed, error) {
+func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, verifiedSignaturesKey []byte) (*masterchainConsensusProof, *blockproof.Parsed, error) {
 	if proofRoot == nil {
 		return nil, nil, fmt.Errorf("masterchain block %s has no parsed proof root", tnstore.FormatBlockRef(block))
 	}
@@ -171,7 +172,7 @@ func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell
 	if err != nil {
 		return nil, nil, err
 	}
-	proof, err := masterchainConsensusProofFromParsed(block, parsed)
+	proof, err := masterchainConsensusProofFromParsed(block, parsed, verifiedSignaturesKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -187,10 +188,10 @@ func prepareMasterchainConsensusProofBOC(block ton.BlockIDExt, proofBOC []byte) 
 	if err != nil {
 		return nil, err
 	}
-	return masterchainConsensusProofFromParsed(block, parsed)
+	return masterchainConsensusProofFromParsed(block, parsed, nil)
 }
 
-func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproof.Parsed) (*masterchainConsensusProof, error) {
+func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproof.Parsed, verifiedSignaturesKey []byte) (*masterchainConsensusProof, error) {
 	if block.Workchain != -1 || block.Shard != topShard {
 		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(block))
 	}
@@ -213,6 +214,14 @@ func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproo
 		proofSignatures, signaturePrepareErr = blockproof.PrepareMasterchainSignatureSet(block, parsed.Block, parsed.Proof.Signatures)
 	}
 
+	// The broadcast layer already verified a signature set for this block; if
+	// the proof carries exactly the same content, a second Ed25519 pass proves
+	// nothing new and is skipped.
+	signaturesChecked := false
+	if proofSignatures != nil && signaturePrepareErr == nil && len(verifiedSignaturesKey) > 0 {
+		signaturesChecked = bytes.Equal(proofSignatures.ContentKey(block), verifiedSignaturesKey)
+	}
+
 	return &masterchainConsensusProof{
 		block:               block,
 		prevRef:             parsed.Meta.PrevRefs[0],
@@ -222,6 +231,7 @@ func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproo
 		vertSeqnoIncr:       parsed.Block.BlockInfo.VertSeqnoIncr,
 		proofSignatures:     proofSignatures,
 		signaturePrepareErr: signaturePrepareErr,
+		signaturesChecked:   signaturesChecked,
 	}, nil
 }
 

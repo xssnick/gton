@@ -35,6 +35,14 @@ type LiveBlockCacheBlock struct {
 	artifactFlushed bool
 }
 
+type LiveBlockCacheArtifacts struct {
+	Block           ton.BlockIDExt
+	BlockData       []byte
+	Meta            *BlockMeta
+	Proofs          []LiveBlockProofArtifact
+	ArtifactFlushed bool
+}
+
 type CachedBlockData struct {
 	Data            []byte
 	ArtifactFlushed bool
@@ -52,7 +60,7 @@ func NewLiveBlockCache(max int) *LiveBlockCache {
 	}
 }
 
-func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockArtifacts) error {
+func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtifacts) error {
 	if c == nil || !validLiveBlockID(artifacts.Block) {
 		return nil
 	}

@@ -1,12 +1,12 @@
-package liteserver
+package externalmsg
 
 import (
 	"testing"
 	"time"
 )
 
-func TestSendMessageCacheMarkDropAndExpiry(t *testing.T) {
-	cache := newSendMessageCache()
+func TestMessageCacheMarkDropAndExpiry(t *testing.T) {
+	cache := NewMessageCache()
 	now := time.Unix(1700000000, 0)
 
 	if !cache.Mark(1, now) {
@@ -24,18 +24,18 @@ func TestSendMessageCacheMarkDropAndExpiry(t *testing.T) {
 	if !cache.Mark(2, now) {
 		t.Fatal("first mark for second key should accept message")
 	}
-	if !cache.Mark(2, now.Add(sendMessageCacheTTL)) {
+	if !cache.Mark(2, now.Add(messageCacheTTL)) {
 		t.Fatal("expired message should be accepted again")
 	}
 }
 
-func TestSendMessageCachePrunesOverflowPerShard(t *testing.T) {
-	cache := newSendMessageCache()
-	cache.maxEntries = sendMessageCacheShards
+func TestMessageCachePrunesOverflowPerShard(t *testing.T) {
+	cache := NewMessageCache()
+	cache.maxEntries = messageCacheShards
 	now := time.Unix(1700000000, 0)
 
 	first := uint64(7)
-	second := first + sendMessageCacheShards
+	second := first + messageCacheShards
 
 	if !cache.Mark(first, now) {
 		t.Fatal("first mark should accept message")

@@ -14,41 +14,56 @@ func prioritizeArchivePeersWithLeases(shard archive.ShardID, peers []*overlayPee
 
 	now := time.Now()
 	basechain := shard.Workchain == 0
-	prioritized := append([]*overlayPeer(nil), peers...)
-	sort.SliceStable(prioritized, func(i, j int) bool {
-		left := prioritized[i]
-		right := prioritized[j]
 
-		leftStats := left.statsSnapshot()
-		rightStats := right.statsSnapshot()
-
-		leftLeases := leases[left.id]
-		rightLeases := leases[right.id]
-
-		leftTier := archivePeerTier(leftStats, basechain, now)
-		rightTier := archivePeerTier(rightStats, basechain, now)
-		if leftTier != rightTier {
-			return leftTier < rightTier
+	// Decorate-sort-undecorate: one statsSnapshot and one score computation per
+	// peer instead of per comparison, which also keeps the comparator
+	// consistent when stats change mid-sort.
+	type rankedArchivePeer struct {
+		peer          *overlayPeer
+		tier          int
+		largeCapacity bool
+		score         float64
+		speed         float64
+		leases        int
+	}
+	ranked := make([]rankedArchivePeer, len(peers))
+	for i, peer := range peers {
+		stats := peer.statsSnapshot()
+		peerLeases := leases[peer.id]
+		speed := archivePeerSpeed(stats, basechain)
+		ranked[i] = rankedArchivePeer{
+			peer:          peer,
+			tier:          archivePeerTier(stats, basechain, now),
+			largeCapacity: archivePeerHasAvailableLargeCapacity(stats, peerLeases, basechain),
+			score:         archiveDownloadPeerScore(stats, speed, peerLeases, basechain, now),
+			speed:         speed,
+			leases:        peerLeases,
 		}
+	}
 
-		leftLarge := archivePeerHasAvailableLargeCapacity(leftStats, leftLeases, basechain)
-		rightLarge := archivePeerHasAvailableLargeCapacity(rightStats, rightLeases, basechain)
-		if leftLarge != rightLarge {
-			return leftLarge
-		}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i]
+		right := ranked[j]
 
-		leftSpeed := archivePeerSpeed(leftStats, basechain)
-		rightSpeed := archivePeerSpeed(rightStats, basechain)
-		leftScore := archiveDownloadPeerScore(leftStats, leftSpeed, leftLeases, basechain, now)
-		rightScore := archiveDownloadPeerScore(rightStats, rightSpeed, rightLeases, basechain, now)
-		if leftScore != rightScore {
-			return leftScore > rightScore
+		if left.tier != right.tier {
+			return left.tier < right.tier
 		}
-		if leftLeases != rightLeases {
-			return leftLeases < rightLeases
+		if left.largeCapacity != right.largeCapacity {
+			return left.largeCapacity
 		}
-		return leftSpeed > rightSpeed
+		if left.score != right.score {
+			return left.score > right.score
+		}
+		if left.leases != right.leases {
+			return left.leases < right.leases
+		}
+		return left.speed > right.speed
 	})
+
+	prioritized := make([]*overlayPeer, len(ranked))
+	for i, entry := range ranked {
+		prioritized[i] = entry.peer
+	}
 	return prioritized
 }
 
@@ -128,26 +143,21 @@ func noteArchivePeerSeedSuccess(shard archive.ShardID, peer *overlayPeer, bytes 
 		return
 	}
 
-	peer.downloadSuccess(bytes, elapsed, archiveSlowThreshold(shard.Workchain == 0), archiveSlowPeerPenalty)
+	peer.downloadSuccess(bytes, elapsed, 0, archiveSlowPeerPenalty)
 }
 
-func noteArchivePeerDownload(shard archive.ShardID, peer *overlayPeer, bytes int64, elapsed time.Duration) bool {
+func noteArchivePeerDownload(shard archive.ShardID, peer *overlayPeer, bytes int64, elapsed time.Duration) {
 	if peer == nil || bytes <= 0 || elapsed <= 0 {
-		return false
+		return
 	}
 
 	if archiveSpeedSampleReliable(bytes) {
-		peer.downloadSuccess(bytes, elapsed, archiveSlowThreshold(shard.Workchain == 0), archiveSlowPeerPenalty)
+		peer.downloadSuccess(bytes, elapsed, 0, archiveSlowPeerPenalty)
 		peer.archiveLargeDownloadSuccess(bytes, elapsed)
-		return archiveDownloadTooSlow(shard, bytes, elapsed)
+		return
 	}
 
 	peer.querySuccess(0)
-	if archiveDownloadTooSlow(shard, bytes, elapsed) {
-		peer.downloadFailed(archiveSlowPeerPenalty)
-		return true
-	}
-	return false
 }
 
 func archiveSlowThreshold(basechain bool) float64 {
@@ -166,14 +176,4 @@ func archiveGoodThreshold(basechain bool) float64 {
 
 func archiveSpeedSampleReliable(bytes int64) bool {
 	return bytes >= archiveSpeedSampleMinBytes
-}
-
-func archiveDownloadTooSlow(shard archive.ShardID, bytes int64, elapsed time.Duration) bool {
-	if bytes <= 0 || elapsed <= 0 {
-		return false
-	}
-	if archiveSpeedSampleReliable(bytes) {
-		return float64(bytes)/elapsed.Seconds() < archiveSlowThreshold(shard.Workchain == 0)
-	}
-	return elapsed >= archiveSmallPackSlowElapsed
 }

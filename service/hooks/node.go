@@ -12,6 +12,7 @@ import (
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -20,6 +21,7 @@ import (
 type Node struct {
 	Network Network
 	Store   Store
+	TVM     *tvm.TVM
 	Logger  zerolog.Logger
 	Metrics any
 }
@@ -51,6 +53,7 @@ type Store interface {
 	LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
+	LookupMessageTransaction(ctx context.Context, kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, error)
 
 	MasterchainSeqnoReady(seqno uint32) bool
 	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error

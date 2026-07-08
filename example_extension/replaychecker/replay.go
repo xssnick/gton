@@ -2,17 +2,18 @@ package replaychecker
 
 import (
 	"bytes"
+	"container/list"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/hooks"
@@ -33,6 +34,16 @@ const (
 	masterchainShard int64 = -1 << 63
 )
 
+// configEpochCacheLimit bounds the per-config-epoch cache. The blockchain
+// config changes only at key blocks, so a handful of entries cover the live
+// window plus occasional historic replays. Mirrors gton's liveview cache.
+const configEpochCacheLimit = 4
+
+// storageStatCacheLimit bounds the cross-block account storage-stat LRU. Each
+// entry is one hot contract's (pre-state hash -> stat cell) pair; 4096 keeps
+// the busiest contracts warm across blocks while staying small.
+const storageStatCacheLimit = 4096
+
 var ErrMismatch = errors.New("tvm replay mismatch")
 
 type ValidatorOptions struct {
@@ -41,7 +52,6 @@ type ValidatorOptions struct {
 }
 
 type Validator struct {
-	mu    sync.Mutex
 	inner *replayValidator
 	store hooks.Store
 }
@@ -50,25 +60,25 @@ type Result struct {
 	Accounts         int
 	Transactions     int
 	EmulationElapsed time.Duration
+	// Mismatches is the number of accounts whose replay diverged from the
+	// applied state for this block. Zero means the block replayed bit-identically.
+	Mismatches int
 }
 
 func NewValidator(opts ValidatorOptions) *Validator {
 	return &Validator{
 		store: opts.Store,
 		inner: &replayValidator{
-			cache:         newExecutionConfigCache(opts.Logger.With().Str("component", "replaychecker-cache").Logger()),
+			configs:       newConfigEpochCache(opts.Logger.With().Str("component", "replaychecker-cache").Logger()),
+			storageStats:  newStorageStatCache(storageStatCacheLimit),
 			tvm:           tvm.NewTVM(),
 			log:           opts.Logger,
-			mismatch:      map[string]accountMismatch{},
 			mismatchLimit: -1,
 		},
 	}
 }
 
 func (v *Validator) ValidateAppliedBlock(ctx context.Context, event hooks.BlockAppliedEvent) (Result, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
 	block, err := loadedBlockFromAppliedEvent(event)
 	if err != nil {
 		return Result{}, err
@@ -91,7 +101,7 @@ func (v *Validator) ValidateAppliedBlock(ctx context.Context, event hooks.BlockA
 	if err != nil {
 		return Result{}, err
 	}
-	execCtx, err := v.inner.cache.blockContext(master, masterState, block.Parsed.BlockInfo.GenUtime)
+	execCtx, err := v.inner.blockContext(master, masterState, block)
 	if err != nil {
 		return Result{}, fmt.Errorf("prepare execution context %s: %w", storage.FormatBlockRef(block.ID), err)
 	}
@@ -100,17 +110,22 @@ func (v *Validator) ValidateAppliedBlock(ctx context.Context, event hooks.BlockA
 	if block.Parsed.BlockInfo.NotMaster {
 		masterSeqno = master.SeqNo
 	}
-	validation, err := v.inner.validateBlockViews(ctx, masterSeqno, accounts, previousViews, expectedView, block, execCtx)
+
+	// A fresh per-block mismatch scope; state never leaks across blocks and the
+	// map cannot re-trip after a divergence has been reported once.
+	scope := newMismatchScope(masterSeqno, block.ID.Workchain, v.inner.mismatchLimit)
+	validation, err := v.inner.validateBlock(ctx, masterSeqno, accounts, previousViews, expectedView, block, execCtx, scope)
 	result := Result{
 		Accounts:         validation.Accounts,
 		Transactions:     validation.Transactions,
 		EmulationElapsed: validation.EmulationElapsed,
+		Mismatches:       scope.len(),
 	}
 	if err != nil {
 		return result, err
 	}
-	if v.inner.hasAccountMismatch(masterSeqno, block.ID.Workchain, accounts) {
-		return result, fmt.Errorf("%w: %s", ErrMismatch, storage.FormatBlockRef(block.ID))
+	if result.Mismatches > 0 {
+		return result, fmt.Errorf("%w: %s (%d accounts)", ErrMismatch, storage.FormatBlockRef(block.ID), result.Mismatches)
 	}
 	return result, nil
 }
@@ -247,34 +262,22 @@ type transactionWork struct {
 	Hash      cell.Hash
 }
 
-var (
-	tvmIntMinusOne = big.NewInt(-1)
-	tvmIntZero     = big.NewInt(0)
-
-	defaultInMsgParamsTuple = tuple.NewTupleValue(
-		tvmIntZero,
-		tvmIntZero,
-		cell.BeginCell().MustStoreUInt(0, 2).ToSlice(),
-		tvmIntZero,
-		tvmIntZero,
-		tvmIntZero,
-		tvmIntZero,
-		tvmIntZero,
-		nil,
-		nil,
-	)
-	zeroCurrencyTuple = tuple.NewTupleValue(tvmIntZero, nil)
-)
+// blockExecutionContext is the per-block execution context: the immutable tvm
+// block context (config epoch + prev blocks + global libraries + block time/lt),
+// its global version, and the block rand seed used to derive per-account seeds.
+type blockExecutionContext struct {
+	block         *tvm.BlockContext
+	globalVersion int
+}
 
 type replayValidator struct {
-	cache         *executionConfigCache
+	configs       *configEpochCache
+	storageStats  *storageStatCache
 	tvm           *tvm.TVM
 	log           zerolog.Logger
 	mismatchLimit int
 	vmTraceAddr   string
 	vmTraceLT     uint64
-	mu            sync.Mutex
-	mismatch      map[string]accountMismatch
 }
 
 type accountMismatch struct {
@@ -288,30 +291,12 @@ type accountMismatch struct {
 }
 
 type accountMismatchTx struct {
-	LT                  uint64                  `json:"lt"`
-	ExpectedTxHash      string                  `json:"expected_tx_hash,omitempty"`
-	GotTxHash           string                  `json:"got_tx_hash,omitempty"`
-	ExpectedTxBOCBase64 string                  `json:"expected_tx_boc_base64,omitempty"`
-	GotTxBOCBase64      string                  `json:"got_tx_boc_base64,omitempty"`
-	InMsgBOCBase64      string                  `json:"in_msg_boc_base64,omitempty"`
-	Config              accountMismatchTxConfig `json:"config"`
-}
-
-type accountMismatchTxConfig struct {
-	GlobalVersion                int      `json:"global_version"`
-	Now                          uint32   `json:"now"`
-	BlockLT                      int64    `json:"block_lt"`
-	LogicalTime                  int64    `json:"logical_time"`
-	RandSeedBase64               string   `json:"rand_seed_base64,omitempty"`
-	ConfigRootBOCBase64          string   `json:"config_root_boc_base64,omitempty"`
-	PrevBlocksStackBOCBase64     string   `json:"prev_blocks_stack_boc_base64,omitempty"`
-	UnpackedConfigStackBOCBase64 string   `json:"unpacked_config_stack_boc_base64,omitempty"`
-	PrecompiledGasStackBOCBase64 string   `json:"precompiled_gas_stack_boc_base64,omitempty"`
-	IncomingValueStackBOCBase64  string   `json:"incoming_value_stack_boc_base64,omitempty"`
-	StorageFees                  int64    `json:"storage_fees"`
-	DuePaymentNano               string   `json:"due_payment_nano,omitempty"`
-	InMsgParamsStackBOCBase64    string   `json:"in_msg_params_stack_boc_base64,omitempty"`
-	LibrariesBOCBase64           []string `json:"libraries_boc_base64,omitempty"`
+	LT                  uint64 `json:"lt"`
+	ExpectedTxHash      string `json:"expected_tx_hash,omitempty"`
+	GotTxHash           string `json:"got_tx_hash,omitempty"`
+	ExpectedTxBOCBase64 string `json:"expected_tx_boc_base64,omitempty"`
+	GotTxBOCBase64      string `json:"got_tx_boc_base64,omitempty"`
+	InMsgBOCBase64      string `json:"in_msg_boc_base64,omitempty"`
 }
 
 type accountMismatchDetails struct {
@@ -321,13 +306,136 @@ type accountMismatchDetails struct {
 	firstTx                   *accountMismatchTx
 }
 
+// mismatchKey is a fixed struct key for the mismatch map: cheaper than a
+// per-tx fmt.Sprintf and allocation-free.
+type mismatchKey struct {
+	masterSeqno uint32
+	workchain   int32
+	account     [32]byte
+}
+
+func newMismatchKey(masterSeqno uint32, workchain int32, account []byte) mismatchKey {
+	var key mismatchKey
+	key.masterSeqno = masterSeqno
+	key.workchain = workchain
+	copy(key.account[:], account)
+	return key
+}
+
+// mismatchScope collects the account mismatches of a single block replay. It is
+// created fresh per ValidateAppliedBlock so state never leaks across blocks, and
+// it is safe for concurrent lanes (all access is behind mu).
+type mismatchScope struct {
+	masterSeqno uint32
+	workchain   int32
+	limit       int
+
+	mu      sync.Mutex
+	entries map[mismatchKey]accountMismatch
+}
+
+func newMismatchScope(masterSeqno uint32, workchain int32, limit int) *mismatchScope {
+	return &mismatchScope{
+		masterSeqno: masterSeqno,
+		workchain:   workchain,
+		limit:       limit,
+		entries:     map[mismatchKey]accountMismatch{},
+	}
+}
+
+func (s *mismatchScope) collects() bool {
+	return s.limit != 0
+}
+
+func (s *mismatchScope) len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.entries)
+}
+
+func (s *mismatchScope) has(account []byte) bool {
+	key := newMismatchKey(s.masterSeqno, s.workchain, account)
+	s.mu.Lock()
+	_, ok := s.entries[key]
+	s.mu.Unlock()
+	return ok
+}
+
+func (s *mismatchScope) add(account []byte, details accountMismatchDetails) {
+	if !s.collects() {
+		return
+	}
+	key := newMismatchKey(s.masterSeqno, s.workchain, account)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.limit > 0 {
+		if _, exists := s.entries[key]; !exists && len(s.entries) >= s.limit {
+			return
+		}
+	}
+
+	mismatch := accountMismatch{
+		MasterSeqno:               s.masterSeqno,
+		Workchain:                 s.workchain,
+		Address:                   accountAddressRaw(s.workchain, account),
+		FromShardAccountBOCBase64: details.fromShardAccountBOCBase64,
+		ToShardAccountBOCBase64:   details.toShardAccountBOCBase64,
+		GotShardAccountBOCBase64:  details.gotShardAccountBOCBase64,
+		FirstTx:                   details.firstTx,
+	}
+	if existing, ok := s.entries[key]; ok {
+		mismatch = mergeAccountMismatch(existing, mismatch)
+	}
+	s.entries[key] = mismatch
+}
+
+// updateIfExists merges freshly collected details into an already recorded
+// mismatch, but does not create a new one.
+func (s *mismatchScope) updateIfExists(account []byte, details accountMismatchDetails) {
+	if !s.collects() {
+		return
+	}
+	key := newMismatchKey(s.masterSeqno, s.workchain, account)
+	update := accountMismatch{
+		MasterSeqno:               s.masterSeqno,
+		Workchain:                 s.workchain,
+		Address:                   accountAddressRaw(s.workchain, account),
+		FromShardAccountBOCBase64: details.fromShardAccountBOCBase64,
+		ToShardAccountBOCBase64:   details.toShardAccountBOCBase64,
+		GotShardAccountBOCBase64:  details.gotShardAccountBOCBase64,
+		FirstTx:                   details.firstTx,
+	}
+
+	s.mu.Lock()
+	if existing, ok := s.entries[key]; ok {
+		s.entries[key] = mergeAccountMismatch(existing, update)
+	}
+	s.mu.Unlock()
+}
+
+// snapshot returns a copy of the collected mismatches for logging.
+func (s *mismatchScope) snapshot() []accountMismatch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.entries) == 0 {
+		return nil
+	}
+	out := make([]accountMismatch, 0, len(s.entries))
+	for _, m := range s.entries {
+		out = append(out, m)
+	}
+	return out
+}
+
 type blockValidationResult struct {
 	Transactions     int
 	Accounts         int
 	EmulationElapsed time.Duration
 }
 
-func (v *replayValidator) validateBlockViews(ctx context.Context, masterSeqno uint32, accounts []accountBlockWork, previousViews []*shardStateView, expectedView *shardStateView, block loadedBlock, execCtx *blockExecutionContext) (blockValidationResult, error) {
+func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32, accounts []accountBlockWork, previousViews []*shardStateView, expectedView *shardStateView, block loadedBlock, execCtx *blockExecutionContext, scope *mismatchScope) (blockValidationResult, error) {
 	result := blockValidationResult{
 		Accounts: len(accounts),
 	}
@@ -344,51 +452,99 @@ func (v *replayValidator) validateBlockViews(ctx context.Context, masterSeqno ui
 	blockLog.Info().
 		Int("accounts", len(accounts)).
 		Int("transactions", countTransactions(accounts)).
-		Int("global_version", execCtx.master.bundle.globalVersion).
+		Int("global_version", execCtx.globalVersion).
 		Msg("replaying block transactions")
 
-	machine, err := v.tvm.WithGlobalVersion(execCtx.master.bundle.globalVersion)
-	if err != nil {
-		return result, err
+	// Per-account execution is independent: each account's inbound messages are
+	// fixed by the block body, and the *BlockContext / *PreparedConfig are
+	// immutable and shared. Run accounts over a worker pool; each account's tx
+	// chain stays sequential inside its lane and uses its own TVM handle
+	// (WithGlobalVersion returns a shallow copy sharing immutable dispatch tables).
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(accounts) {
+		workers = len(accounts)
+	}
+	if workers < 1 {
+		workers = 1
 	}
 
-	for _, account := range accounts {
-		select {
-		case <-ctx.Done():
-			return result, ctx.Err()
-		default:
-		}
+	var (
+		totalTxs     int64
+		totalElapsed int64 // nanoseconds
+		next         int64
+		firstErr     atomic.Pointer[error]
+	)
 
-		emulationElapsed, txs, err := v.validateAccountBlock(masterSeqno, previousViews, expectedView, block, execCtx, &machine, account)
-		result.EmulationElapsed += emulationElapsed
-		result.Transactions += txs
+	lane := func() error {
+		machine, err := v.tvm.WithGlobalVersion(execCtx.globalVersion)
 		if err != nil {
-			return result, err
+			return err
+		}
+		for {
+			idx := int(atomic.AddInt64(&next, 1)) - 1
+			if idx >= len(accounts) {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			elapsed, txs, err := v.validateAccountBlock(masterSeqno, previousViews, expectedView, block, execCtx, &machine, accounts[idx], scope)
+			atomic.AddInt64(&totalTxs, int64(txs))
+			atomic.AddInt64(&totalElapsed, int64(elapsed))
+			if err != nil {
+				return err
+			}
 		}
 	}
 
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := lane(); err != nil {
+				e := err
+				firstErr.CompareAndSwap(nil, &e)
+			}
+		}()
+	}
+	wg.Wait()
+
+	result.Transactions = int(atomic.LoadInt64(&totalTxs))
+	result.EmulationElapsed = time.Duration(atomic.LoadInt64(&totalElapsed))
+	if errp := firstErr.Load(); errp != nil {
+		return result, *errp
+	}
 	return result, nil
 }
 
-func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*shardStateView, expected *shardStateView, block loadedBlock, execCtx *blockExecutionContext, machine *tvm.TVM, account accountBlockWork) (time.Duration, int, error) {
-	current, err := accountFromPreviousStates(previous, block.ID.Workchain, account.Account)
-	if err != nil {
-		return 0, 0, fmt.Errorf("load previous account %s: %w", accountAddressRaw(block.ID.Workchain, account.Account), err)
-	}
-	current, err = materializeShardAccount(current)
-	if err != nil {
-		return 0, 0, fmt.Errorf("materialize previous account %s: %w", accountAddressRaw(block.ID.Workchain, account.Account), err)
-	}
-	initial := current
-
+func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*shardStateView, expected *shardStateView, block loadedBlock, execCtx *blockExecutionContext, machine *tvm.TVM, account accountBlockWork, scope *mismatchScope) (time.Duration, int, error) {
 	addr := accountAddress(block.ID.Workchain, account.Account)
+
+	// The previous account comes straight from a dict descent on the previous
+	// state root; the lazy *tlb.ShardAccount carries trusted hashes and loads
+	// on demand through the sharded decoded-cell cache. No BOC roundtrip.
+	initialShard, err := accountFromPreviousStates(previous, block.ID.Workchain, account.Account)
+	if err != nil {
+		return 0, 0, fmt.Errorf("load previous account %s: %w", addr.StringRaw(), err)
+	}
+	preStateHash := shardAccountStateHash(initialShard)
+
+	current, err := tvm.PrepareAccount(initialShard, addr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("prepare previous account %s: %w", addr.StringRaw(), err)
+	}
+
 	var details accountMismatchDetails
 	addMismatch := func(got *tlb.ShardAccount) {
-		v.fillAccountMismatchDetails(&details, expected, account.Account, initial, got)
-		v.addMismatchWithDetails(masterSeqno, block.ID.Workchain, account.Account, details)
+		v.fillAccountMismatchDetails(scope, &details, expected, account.Account, initialShard, got)
+		scope.add(account.Account, details)
 	}
 	setFirstTx := func(before *tlb.ShardAccount, txDetails accountMismatchTx) {
-		if !v.collectsMismatches() {
+		if !scope.collects() {
 			return
 		}
 		if details.firstTx == nil {
@@ -398,22 +554,42 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 			details.firstTx = &txDetails
 		}
 	}
+
+	// Seed the storage stat from the cross-block LRU only when the cached entry
+	// matches this account's PRE-state hash exactly (so a stale entry is simply
+	// ignored). SAFETY: tvm only validates a supplied stat against the account's
+	// StorageExtra dict hash for global version >= 11 non-masterchain large
+	// accounts; for masterchain/small accounts it does not, so the exact
+	// pre-state-hash gate is what keeps the seed sound.
+	accountStorageStat := v.storageStats.get(block.ID.Workchain, account.Account, preStateHash)
+
 	var total time.Duration
 	var txCount int
-	var accountStorageStat *cell.Cell
+	var currentShard = initialShard
 
 	for _, tx := range account.Txs {
 		txCount++
-		var cfg tvm.TransactionEmulationConfig
-		var res *tvm.TransactionExecutionResult
-		var elapsed time.Duration
-		var err error
-		var finishTrace func()
+		opts := tvm.TransactionOptions{
+			LogicalTime:        int64(tx.Parsed.LT),
+			AccountStorageStat: accountStorageStat,
+		}
+
+		var (
+			res         *tvm.TransactionExecutionResult
+			elapsed     time.Duration
+			finishTrace func()
+			emuErr      error
+		)
+
+		if traceHook, finish := v.startVMTrace(addr.StringRaw(), tx.Parsed.LT); traceHook != nil {
+			opts.TraceHook = traceHook
+			finishTrace = finish
+		}
 
 		if tx.Parsed.IO.In == nil || tx.InMsgCell == nil {
 			desc, ok := tx.Parsed.Description.(tlb.TransactionDescriptionTickTock)
 			if !ok {
-				addMismatch(current)
+				addMismatch(currentShard)
 				v.log.Warn().
 					Uint32("master_seqno", masterSeqno).
 					Str("block", storage.FormatBlockRef(block.ID)).
@@ -423,52 +599,34 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 					Msg("transaction has no input message; go transaction emulator cannot replay it yet")
 				break
 			}
-
-			cfg, err = execCtx.tickTockTransactionConfig(block, current, tx.Parsed)
-			if err != nil {
-				return total, txCount, fmt.Errorf("build tick/tock transaction config %s lt=%d: %w", addr.StringRaw(), tx.Parsed.LT, err)
-			}
-			cfg.AccountStorageStat = accountStorageStat
-
-			if traceHook, finish := v.startVMTrace(addr.StringRaw(), tx.Parsed.LT); traceHook != nil {
-				cfg.TraceHook = traceHook
-				finishTrace = finish
-			}
 			started := time.Now()
-			res, err = machine.EmulateTickTockTransaction(current, desc.IsTock, cfg)
+			res, emuErr = machine.EmulateTickTockTransaction(execCtx.block, current, desc.IsTock, opts)
 			elapsed = time.Since(started)
-			total += elapsed
 		} else {
-			cfg, err = execCtx.transactionConfig(block, current, tx.Parsed)
-			if err != nil {
-				return total, txCount, fmt.Errorf("build transaction config %s lt=%d: %w", addr.StringRaw(), tx.Parsed.LT, err)
+			var msg *tvm.PreparedMessage
+			msg, emuErr = tvm.PrepareParsedMessage(tx.InMsgCell, tx.Parsed.IO.In)
+			if emuErr == nil {
+				started := time.Now()
+				res, emuErr = machine.EmulateTransaction(execCtx.block, current, msg, opts)
+				elapsed = time.Since(started)
 			}
-			cfg.AccountStorageStat = accountStorageStat
-
-			if traceHook, finish := v.startVMTrace(addr.StringRaw(), tx.Parsed.LT); traceHook != nil {
-				cfg.TraceHook = traceHook
-				finishTrace = finish
-			}
-			started := time.Now()
-			res, err = machine.EmulateTransaction(current, tx.InMsgCell, cfg)
-			elapsed = time.Since(started)
-			total += elapsed
 		}
 		if finishTrace != nil {
 			finishTrace()
 		}
+		total += elapsed
 
 		gasUsed := int64(0)
 		if res != nil {
 			gasUsed = res.GasUsed
 		}
 
-		if err != nil {
-			txDetails := v.accountMismatchTxDetails(execCtx, tx, tx.InMsgCell, cfg)
-			setFirstTx(current, txDetails)
-			addMismatch(current)
+		if emuErr != nil {
+			txDetails := v.accountMismatchTxDetails(scope, tx)
+			setFirstTx(currentShard, txDetails)
+			addMismatch(currentShard)
 			v.log.Warn().
-				Err(err).
+				Err(emuErr).
 				Uint32("master_seqno", masterSeqno).
 				Str("block", storage.FormatBlockRef(block.ID)).
 				Str("address", addr.StringRaw()).
@@ -478,10 +636,10 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 				Msg("transaction emulation failed")
 			break
 		}
-		if res == nil || res.Transaction == nil || res.TransactionCell == nil || res.ShardAccount == nil || res.ShardAccountCell == nil {
-			txDetails := v.accountMismatchTxDetails(execCtx, tx, tx.InMsgCell, cfg)
-			setFirstTx(current, txDetails)
-			addMismatch(current)
+		if res == nil || res.TransactionCell == nil || res.NextAccount == nil {
+			txDetails := v.accountMismatchTxDetails(scope, tx)
+			setFirstTx(currentShard, txDetails)
+			addMismatch(currentShard)
 			v.log.Warn().
 				Uint32("master_seqno", masterSeqno).
 				Str("block", storage.FormatBlockRef(block.ID)).
@@ -493,13 +651,14 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 			break
 		}
 
+		nextShard := res.NextAccount.ShardAccount()
 		gotTxHash := res.TransactionCell.HashKey()
 		if gotTxHash != tx.Hash {
-			txDetails := v.accountMismatchTxDetails(execCtx, tx, tx.InMsgCell, cfg)
+			txDetails := v.accountMismatchTxDetails(scope, tx)
 			txDetails.GotTxHash = hex.EncodeToString(gotTxHash[:])
 			txDetails.GotTxBOCBase64 = cellBOCBase64(res.TransactionCell)
-			setFirstTx(current, txDetails)
-			addMismatch(res.ShardAccount)
+			setFirstTx(currentShard, txDetails)
+			addMismatch(nextShard)
 			v.log.Warn().
 				Uint32("master_seqno", masterSeqno).
 				Str("block", storage.FormatBlockRef(block.ID)).
@@ -521,34 +680,68 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 				Msg("tx emulated")
 		}
 
-		current = res.ShardAccount
+		// tx N's result feeds tx N+1 with ZERO re-parse / re-materialize.
+		current = res.NextAccount
+		currentShard = nextShard
 		accountStorageStat = res.AccountStorageStat
 	}
 
-	v.compareAccountResult(masterSeqno, block.ID, expected, account, details, initial, current)
+	v.compareAccountResult(masterSeqno, block.ID, expected, account, details, initialShard, currentShard, scope)
+
+	// Store the resulting (post-state hash -> stat) for the next block's replay
+	// of this hot account.
+	if accountStorageStat != nil && currentShard != nil {
+		v.storageStats.put(block.ID.Workchain, account.Account, shardAccountStateHash(currentShard), accountStorageStat)
+	}
 	return total, txCount, nil
 }
 
-func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.BlockIDExt, expectedView *shardStateView, account accountBlockWork, details accountMismatchDetails, from *tlb.ShardAccount, got *tlb.ShardAccount) {
+func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.BlockIDExt, expectedView *shardStateView, account accountBlockWork, details accountMismatchDetails, from *tlb.ShardAccount, got *tlb.ShardAccount, scope *mismatchScope) {
 	addr := accountAddress(block.Workchain, account.Account)
-	expectedAccountHash := account.Expected
-	var expectedAccountHashKey cell.Hash
+
+	if got == nil || got.Account == nil {
+		v.fillAccountMismatchDetails(scope, &details, expectedView, account.Account, from, got)
+		scope.add(account.Account, details)
+		v.log.Warn().
+			Uint32("master_seqno", masterSeqno).
+			Str("block", storage.FormatBlockRef(block)).
+			Str("address", addr.StringRaw()).
+			Msg("missing emulated account result")
+		return
+	}
+
+	// HAPPY PATH: the account block's HashUpdate.NewHash is the expected
+	// post-state account root hash. Compare against the produced hash first; on
+	// a match there is nothing more to do (no post-state dict descent, no parse).
+	gotAccountHash := got.Account.HashKey()
+	if bytes.Equal(gotAccountHash[:], account.Expected) {
+		// Still reconcile any mismatch recorded during the tx loop (e.g. a tx
+		// hash mismatch that nonetheless landed on the expected account root).
+		if scope.has(account.Account) {
+			v.fillAccountMismatchDetails(scope, &details, expectedView, account.Account, from, got)
+			scope.updateIfExists(account.Account, details)
+		}
+		return
+	}
+
+	// DIVERGENCE: descend the expected post-state dict only now, for diagnostics.
 	addMismatch := func() {
-		v.fillAccountMismatchDetails(&details, expectedView, account.Account, from, got)
-		v.addMismatchWithDetails(masterSeqno, block.Workchain, account.Account, details)
+		v.fillAccountMismatchDetails(scope, &details, expectedView, account.Account, from, got)
+		scope.add(account.Account, details)
 	}
 	defer func() {
-		if !v.accountMismatchExists(masterSeqno, block.Workchain, account.Account) {
+		if !scope.has(account.Account) {
 			return
 		}
-		v.fillAccountMismatchDetails(&details, expectedView, account.Account, from, got)
-		v.addMismatchDetailsIfExists(masterSeqno, block.Workchain, account.Account, details)
+		v.fillAccountMismatchDetails(scope, &details, expectedView, account.Account, from, got)
+		scope.updateIfExists(account.Account, details)
 	}()
 
+	expectedAccountHash := account.Expected
 	expectedShard, err := expectedView.account(account.Account)
 	if err == nil {
-		expectedAccountHashKey = expectedShard.Account.HashKey()
-		expectedAccountHash = expectedAccountHashKey[:]
+		expectedHashKey := expectedShard.Account.HashKey()
+		expectedAccountHash = expectedHashKey[:]
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		addMismatch()
 		v.log.Warn().
@@ -571,35 +764,18 @@ func (v *replayValidator) compareAccountResult(masterSeqno uint32, block ton.Blo
 			Msg("account block state update differs from post-state account root")
 	}
 
-	if got == nil || got.Account == nil {
-		addMismatch()
-		v.log.Warn().
-			Uint32("master_seqno", masterSeqno).
-			Str("block", storage.FormatBlockRef(block)).
-			Str("address", addr.StringRaw()).
-			Msg("missing emulated account result")
-		return
-	}
-
-	gotAccountHash := got.Account.HashKey()
-	if !bytes.Equal(gotAccountHash[:], expectedAccountHash) {
-		addMismatch()
-		v.log.Warn().
-			Uint32("master_seqno", masterSeqno).
-			Str("block", storage.FormatBlockRef(block)).
-			Str("address", addr.StringRaw()).
-			Str("expected_account_hash", hex.EncodeToString(expectedAccountHash)).
-			Str("got_account_hash", hex.EncodeToString(gotAccountHash[:])).
-			Msg("account root hash mismatch")
-	}
+	addMismatch()
+	v.log.Warn().
+		Uint32("master_seqno", masterSeqno).
+		Str("block", storage.FormatBlockRef(block)).
+		Str("address", addr.StringRaw()).
+		Str("expected_account_hash", hex.EncodeToString(expectedAccountHash)).
+		Str("got_account_hash", hex.EncodeToString(gotAccountHash[:])).
+		Msg("account root hash mismatch")
 }
 
-func (v *replayValidator) collectsMismatches() bool {
-	return v.mismatchLimit != 0
-}
-
-func (v *replayValidator) fillAccountMismatchDetails(details *accountMismatchDetails, expected *shardStateView, account []byte, from *tlb.ShardAccount, got *tlb.ShardAccount) {
-	if !v.collectsMismatches() || details == nil {
+func (v *replayValidator) fillAccountMismatchDetails(scope *mismatchScope, details *accountMismatchDetails, expected *shardStateView, account []byte, from *tlb.ShardAccount, got *tlb.ShardAccount) {
+	if !scope.collects() || details == nil {
 		return
 	}
 
@@ -614,11 +790,16 @@ func (v *replayValidator) fillAccountMismatchDetails(details *accountMismatchDet
 	}
 }
 
-func (v *replayValidator) accountMismatchTxDetails(execCtx *blockExecutionContext, tx transactionWork, msgCell *cell.Cell, cfg tvm.TransactionEmulationConfig) accountMismatchTx {
-	if !v.collectsMismatches() {
+func (v *replayValidator) accountMismatchTxDetails(scope *mismatchScope, tx transactionWork) accountMismatchTx {
+	if !scope.collects() {
 		return accountMismatchTx{}
 	}
-	return execCtx.accountMismatchTxDetails(tx, msgCell, cfg)
+	return accountMismatchTx{
+		LT:                  tx.Parsed.LT,
+		ExpectedTxHash:      hex.EncodeToString(tx.Hash[:]),
+		ExpectedTxBOCBase64: cellBOCBase64(tx.Cell),
+		InMsgBOCBase64:      cellBOCBase64(tx.InMsgCell),
+	}
 }
 
 func (v *replayValidator) startVMTrace(addr string, lt uint64) (vmcore.TraceHook, func()) {
@@ -644,83 +825,6 @@ func (v *replayValidator) startVMTrace(addr string, lt uint64) (vmcore.TraceHook
 			Msg("vm trace")
 	}
 	return traceHook, finish
-}
-
-func (v *replayValidator) addMismatchWithDetails(masterSeqno uint32, workchain int32, account []byte, details accountMismatchDetails) {
-	if !v.collectsMismatches() {
-		return
-	}
-
-	key := fmt.Sprintf("%d:%d:%x", masterSeqno, workchain, account)
-
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	if v.mismatchLimit > 0 {
-		if _, exists := v.mismatch[key]; !exists && len(v.mismatch) >= v.mismatchLimit {
-			return
-		}
-	}
-
-	mismatch := accountMismatch{
-		MasterSeqno:               masterSeqno,
-		Workchain:                 workchain,
-		Address:                   accountAddressRaw(workchain, account),
-		FromShardAccountBOCBase64: details.fromShardAccountBOCBase64,
-		ToShardAccountBOCBase64:   details.toShardAccountBOCBase64,
-		GotShardAccountBOCBase64:  details.gotShardAccountBOCBase64,
-		FirstTx:                   details.firstTx,
-	}
-
-	if existing, ok := v.mismatch[key]; ok {
-		mismatch = mergeAccountMismatch(existing, mismatch)
-	}
-	v.mismatch[key] = mismatch
-}
-
-func (v *replayValidator) addMismatchDetailsIfExists(masterSeqno uint32, workchain int32, account []byte, details accountMismatchDetails) {
-	if !v.collectsMismatches() {
-		return
-	}
-
-	key := fmt.Sprintf("%d:%d:%x", masterSeqno, workchain, account)
-	update := accountMismatch{
-		MasterSeqno:               masterSeqno,
-		Workchain:                 workchain,
-		Address:                   accountAddressRaw(workchain, account),
-		FromShardAccountBOCBase64: details.fromShardAccountBOCBase64,
-		ToShardAccountBOCBase64:   details.toShardAccountBOCBase64,
-		GotShardAccountBOCBase64:  details.gotShardAccountBOCBase64,
-		FirstTx:                   details.firstTx,
-	}
-
-	v.mu.Lock()
-	if existing, ok := v.mismatch[key]; ok {
-		v.mismatch[key] = mergeAccountMismatch(existing, update)
-	}
-	v.mu.Unlock()
-}
-
-func (v *replayValidator) hasAccountMismatch(masterSeqno uint32, workchain int32, accounts []accountBlockWork) bool {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	for _, account := range accounts {
-		key := fmt.Sprintf("%d:%d:%x", masterSeqno, workchain, account.Account)
-		if _, ok := v.mismatch[key]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func (v *replayValidator) accountMismatchExists(masterSeqno uint32, workchain int32, account []byte) bool {
-	key := fmt.Sprintf("%d:%d:%x", masterSeqno, workchain, account)
-
-	v.mu.Lock()
-	_, ok := v.mismatch[key]
-	v.mu.Unlock()
-	return ok
 }
 
 func mergeAccountMismatch(dst accountMismatch, src accountMismatch) accountMismatch {
@@ -792,86 +896,13 @@ func cellBOCBase64(root *cell.Cell) string {
 	return base64.StdEncoding.EncodeToString(boc)
 }
 
-func cellsBOCBase64(cells []*cell.Cell) []string {
-	if len(cells) == 0 {
+// shardAccountStateHash returns the hash of the account state root (the value
+// that identifies the account's stored state), or nil when unavailable.
+func shardAccountStateHash(shard *tlb.ShardAccount) []byte {
+	if shard == nil || shard.Account == nil {
 		return nil
 	}
-	out := make([]string, 0, len(cells))
-	for _, root := range cells {
-		if encoded := cellBOCBase64(root); encoded != "" {
-			out = append(out, encoded)
-		}
-	}
-	return out
-}
-
-func stackValueBOCBase64(value any) string {
-	serializable, err := stackSerializableValue(value)
-	if err != nil {
-		return ""
-	}
-	root := cell.BeginCell()
-	if err = tlb.SerializeStackValue(root, serializable); err != nil {
-		return ""
-	}
-	return cellBOCBase64(root.EndCell())
-}
-
-func stackSerializableValue(value any) (any, error) {
-	switch v := value.(type) {
-	case tuple.Tuple:
-		out := make([]any, 0, v.Len())
-		for i := 0; i < v.Len(); i++ {
-			item, err := v.Index(i)
-			if err != nil {
-				return nil, err
-			}
-			serializable, err := stackSerializableValue(item)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, serializable)
-		}
-		return out, nil
-	case *big.Int:
-		if v == nil {
-			return nil, nil
-		}
-		return new(big.Int).Set(v), nil
-	case *cell.Cell:
-		if v == nil {
-			return nil, nil
-		}
-		return v, nil
-	case *cell.Slice:
-		if v == nil {
-			return nil, nil
-		}
-		return v, nil
-	case *cell.Builder:
-		if v == nil {
-			return nil, nil
-		}
-		return v, nil
-	default:
-		return value, nil
-	}
-}
-
-func bigIntString(value any) string {
-	switch v := value.(type) {
-	case nil:
-		return ""
-	case *big.Int:
-		if v == nil {
-			return ""
-		}
-		return v.String()
-	case big.Int:
-		return v.String()
-	default:
-		return fmt.Sprint(v)
-	}
+	return shard.Account.Hash()
 }
 
 func countTransactions(accounts []accountBlockWork) int {
@@ -1001,30 +1032,6 @@ func transactionInputMessageCell(txCell *cell.Cell) (*cell.Cell, error) {
 	return ioLoader.LoadRefCell()
 }
 
-func materializeShardAccount(shard *tlb.ShardAccount) (*tlb.ShardAccount, error) {
-	root, err := tlb.ToCell(shard)
-	if err != nil {
-		return nil, err
-	}
-	root, err = materializeCell(root)
-	if err != nil {
-		return nil, err
-	}
-
-	var out tlb.ShardAccount
-	if err = tlb.Parse(&out, root); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func materializeCell(root *cell.Cell) (*cell.Cell, error) {
-	if root == nil {
-		return nil, nil
-	}
-	return cell.FromBOC(root.ToBOC())
-}
-
 type shardStateView struct {
 	block  ton.BlockIDExt
 	root   *cell.Cell
@@ -1145,72 +1152,43 @@ func accountKey(accountID []byte) *cell.Cell {
 	return cell.BeginCell().MustStoreSlice(accountID, 256).EndCell()
 }
 
-type executionConfigCache struct {
+// ------------------------------------------------------------------------
+// config epoch cache: one *tvm.PreparedConfig per config root hash (bounded LRU)
+// ------------------------------------------------------------------------
+
+type configEpochCache struct {
 	log zerolog.Logger
-	mu  sync.Mutex
 
-	masters map[string]*masterExecutionContext
-	bundles map[string]*configBundle
+	mu      sync.Mutex
+	entries map[cell.Hash]*list.Element
+	order   *list.List
 }
 
-type masterExecutionContext struct {
-	master     ton.BlockIDExt
-	stateRoot  *cell.Cell
-	prevBlocks tuple.Tuple
-	bundle     *configBundle
+type configEpochEntry struct {
+	key   cell.Hash
+	epoch *configEpoch
 }
 
-type blockExecutionContext struct {
-	master   *masterExecutionContext
-	now      uint32
-	unpacked tuple.Tuple
-}
-
-type configBundle struct {
-	config        tlb.BlockchainConfig
+// configEpoch is the immutable per-config-epoch state derived once from a config
+// root: the prepared tvm config and its global version.
+type configEpoch struct {
+	prepared      *tvm.PreparedConfig
 	globalVersion int
-	libraries     []*cell.Cell
-
-	mu          sync.Mutex
-	unpacked    map[uint32]tuple.Tuple
-	precompiled map[cell.Hash]*big.Int
 }
 
-func newExecutionConfigCache(log zerolog.Logger) *executionConfigCache {
-	return &executionConfigCache{
+func newConfigEpochCache(log zerolog.Logger) *configEpochCache {
+	return &configEpochCache{
 		log:     log,
-		masters: map[string]*masterExecutionContext{},
-		bundles: map[string]*configBundle{},
+		entries: map[cell.Hash]*list.Element{},
+		order:   list.New(),
 	}
 }
 
-func (c *executionConfigCache) blockContext(master ton.BlockIDExt, masterState *cell.Cell, now uint32) (*blockExecutionContext, error) {
-	masterCtx, err := c.masterContext(master, masterState)
-	if err != nil {
-		return nil, err
-	}
-	unpacked, err := masterCtx.bundle.unpackedConfig(now)
-	if err != nil {
-		return nil, err
-	}
-	return &blockExecutionContext{
-		master:   masterCtx,
-		now:      now,
-		unpacked: unpacked,
-	}, nil
-}
-
-func (c *executionConfigCache) masterContext(master ton.BlockIDExt, masterState *cell.Cell) (*masterExecutionContext, error) {
-	stateHash := masterState.HashKey(0)
-	masterKey := fmt.Sprintf("%x:%x", storage.BlockKey(master), stateHash[:])
-
-	c.mu.Lock()
-	if cached := c.masters[masterKey]; cached != nil {
-		c.mu.Unlock()
-		return cached, nil
-	}
-	c.mu.Unlock()
-
+// blockContext resolves the per-block execution context for an applied block:
+// the config-epoch prepared config (LRU-cached by config root hash) plus this
+// block's prev-blocks tuple, global libraries and block time/lt, assembled into
+// an immutable *tvm.BlockContext shared by every account lane of the block.
+func (v *replayValidator) blockContext(master ton.BlockIDExt, masterState *cell.Cell, block loadedBlock) (*blockExecutionContext, error) {
 	extra, err := mcStateExtra(masterState)
 	if err != nil {
 		return nil, err
@@ -1218,464 +1196,207 @@ func (c *executionConfigCache) masterContext(master ton.BlockIDExt, masterState 
 	if extra.ConfigParams.Config.Params == nil || extra.ConfigParams.Config.Params.IsEmpty() {
 		return nil, fmt.Errorf("masterchain config is empty")
 	}
-
 	configRoot := extra.ConfigParams.Config.Params.AsCell()
-	configHash := configRoot.Hash()
-	libraries, librariesKey, err := globalLibraries(masterState)
+
+	epoch, err := v.configs.forRoot(configRoot)
 	if err != nil {
 		return nil, err
-	}
-	bundleKey := hex.EncodeToString(configHash) + ":" + librariesKey
-
-	c.mu.Lock()
-	bundle := c.bundles[bundleKey]
-	c.mu.Unlock()
-	if bundle == nil {
-		config := tlb.BlockchainConfig{Root: configRoot}
-		version, err := config.GetGlobalVersion()
-		if err != nil {
-			return nil, err
-		}
-		globalVersion := int(version.Version)
-		if globalVersion < tvm.MinSupportedGlobalVersion {
-			return nil, fmt.Errorf("unsupported global version %d, minimum supported is %d", globalVersion, tvm.MinSupportedGlobalVersion)
-		}
-
-		bundle = &configBundle{
-			config:        config,
-			globalVersion: globalVersion,
-			libraries:     libraries,
-			unpacked:      map[uint32]tuple.Tuple{},
-			precompiled:   map[cell.Hash]*big.Int{},
-		}
-		c.mu.Lock()
-		if existing := c.bundles[bundleKey]; existing != nil {
-			bundle = existing
-		} else {
-			c.bundles[bundleKey] = bundle
-			c.log.Debug().
-				Str("config_hash", hex.EncodeToString(configHash)).
-				Str("libraries_hash", librariesKey).
-				Int("global_version", globalVersion).
-				Msg("cached masterchain config bundle")
-		}
-		c.mu.Unlock()
 	}
 
 	prevBlocks, err := runMethodPrevBlocksInfo(master, masterState)
 	if err != nil {
 		return nil, err
 	}
-	masterCtx := &masterExecutionContext{
-		master:     master,
-		stateRoot:  masterState,
-		prevBlocks: prevBlocks,
-		bundle:     bundle,
+
+	// BlockContext.Libraries carries GLOBAL libraries only; per-account libraries
+	// come from PrepareAccount and the runtime merges them.
+	libraries, _, err := globalLibraries(masterState)
+	if err != nil {
+		return nil, err
+	}
+
+	blockLT := block.Parsed.BlockInfo.StartLt
+	blockCtx, err := epoch.prepared.NewBlockContext(tvm.BlockOptions{
+		Now:        block.Parsed.BlockInfo.GenUtime,
+		BlockLT:    int64(blockLT),
+		RandSeed:   block.Parsed.Extra.RandSeed,
+		PrevBlocks: prevBlocks,
+		Libraries:  libraries,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &blockExecutionContext{
+		block:         blockCtx,
+		globalVersion: epoch.globalVersion,
+	}, nil
+}
+
+func (c *configEpochCache) forRoot(configRoot *cell.Cell) (*configEpoch, error) {
+	key := configRoot.HashKey()
+
+	c.mu.Lock()
+	if element, ok := c.entries[key]; ok {
+		c.order.MoveToFront(element)
+		epoch := element.Value.(*configEpochEntry).epoch
+		c.mu.Unlock()
+		return epoch, nil
+	}
+	c.mu.Unlock()
+
+	epoch, err := buildConfigEpoch(configRoot)
+	if err != nil {
+		return nil, err
 	}
 
 	c.mu.Lock()
-	c.masters[masterKey] = masterCtx
-	c.mu.Unlock()
-	return masterCtx, nil
+	defer c.mu.Unlock()
+	if element, ok := c.entries[key]; ok {
+		// A concurrent replay built the same epoch; keep the published one.
+		c.order.MoveToFront(element)
+		return element.Value.(*configEpochEntry).epoch, nil
+	}
+	c.entries[key] = c.order.PushFront(&configEpochEntry{key: key, epoch: epoch})
+	for len(c.entries) > configEpochCacheLimit {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.entries, oldest.Value.(*configEpochEntry).key)
+	}
+	c.log.Debug().
+		Str("config_hash", hex.EncodeToString(key[:])).
+		Int("global_version", epoch.globalVersion).
+		Msg("cached prepared config epoch")
+	return epoch, nil
 }
 
-func (b *blockExecutionContext) transactionConfig(block loadedBlock, shard *tlb.ShardAccount, tx *tlb.Transaction) (tvm.TransactionEmulationConfig, error) {
-	if tx == nil || tx.IO.In == nil {
-		return tvm.TransactionEmulationConfig{}, fmt.Errorf("transaction input message is required")
-	}
-
-	logicalTime, err := uint64ToInt64(tx.LT, "transaction lt")
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-	blockLT, err := uint64ToInt64(block.Parsed.BlockInfo.StartLt, "block lt")
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-
-	code, err := transactionComputeCode(shard, tx.IO.In)
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-	precompiled, err := b.master.bundle.precompiledGas(code)
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-	storageFees := transactionStorageFeesBig(tx)
-	incomingCoins, incomingExtra, err := transactionIncomingValue(shard, tx.IO.In, storageFees)
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-	inMsgParams, err := transactionInMsgParams(tx.IO.In, incomingCoins, incomingExtra)
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-
-	return tvm.TransactionEmulationConfig{
-		Now:                 block.Parsed.BlockInfo.GenUtime,
-		BlockLT:             blockLT,
-		LogicalTime:         logicalTime,
-		RandSeed:            transactionRandSeed(block.Parsed.Extra.RandSeed, tx.AccountAddr),
-		ConfigRoot:          b.master.bundle.config.Root,
-		PrevBlocks:          b.master.prevBlocks,
-		UnpackedConfig:      b.unpacked,
-		PrecompiledGasUsage: precompiled,
-		Libraries:           b.master.bundle.libraries,
-		IncomingValue:       currencyTuple(incomingCoins, incomingExtra),
-		StorageFees:         storageFeesInt64(storageFees),
-		DuePayment:          transactionDuePayment(tx),
-		InMsgParams:         inMsgParams,
-	}, nil
-}
-
-func (b *blockExecutionContext) tickTockTransactionConfig(block loadedBlock, shard *tlb.ShardAccount, tx *tlb.Transaction) (tvm.TransactionEmulationConfig, error) {
-	if tx == nil {
-		return tvm.TransactionEmulationConfig{}, fmt.Errorf("transaction is required")
-	}
-
-	logicalTime, err := uint64ToInt64(tx.LT, "transaction lt")
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-	blockLT, err := uint64ToInt64(block.Parsed.BlockInfo.StartLt, "block lt")
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-
-	code, err := transactionComputeCode(shard, nil)
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-	precompiled, err := b.master.bundle.precompiledGas(code)
-	if err != nil {
-		return tvm.TransactionEmulationConfig{}, err
-	}
-
-	storageFees := transactionStorageFeesBig(tx)
-	return tvm.TransactionEmulationConfig{
-		Now:                 block.Parsed.BlockInfo.GenUtime,
-		BlockLT:             blockLT,
-		LogicalTime:         logicalTime,
-		RandSeed:            transactionRandSeed(block.Parsed.Extra.RandSeed, tx.AccountAddr),
-		ConfigRoot:          b.master.bundle.config.Root,
-		PrevBlocks:          b.master.prevBlocks,
-		UnpackedConfig:      b.unpacked,
-		PrecompiledGasUsage: precompiled,
-		Libraries:           b.master.bundle.libraries,
-		IncomingValue:       currencyTuple(nil, nil),
-		StorageFees:         storageFeesInt64(storageFees),
-		DuePayment:          transactionDuePayment(tx),
-		InMsgParams:         defaultInMsgParams(),
-	}, nil
-}
-
-func (b *blockExecutionContext) accountMismatchTxDetails(tx transactionWork, msgCell *cell.Cell, cfg tvm.TransactionEmulationConfig) accountMismatchTx {
-	return accountMismatchTx{
-		LT:                  tx.Parsed.LT,
-		ExpectedTxHash:      hex.EncodeToString(tx.Hash[:]),
-		ExpectedTxBOCBase64: cellBOCBase64(tx.Cell),
-		InMsgBOCBase64:      cellBOCBase64(msgCell),
-		Config: accountMismatchTxConfig{
-			GlobalVersion:                b.master.bundle.globalVersion,
-			Now:                          cfg.Now,
-			BlockLT:                      cfg.BlockLT,
-			LogicalTime:                  cfg.LogicalTime,
-			RandSeedBase64:               base64.StdEncoding.EncodeToString(cfg.RandSeed),
-			ConfigRootBOCBase64:          cellBOCBase64(cfg.ConfigRoot),
-			PrevBlocksStackBOCBase64:     stackValueBOCBase64(cfg.PrevBlocks),
-			UnpackedConfigStackBOCBase64: stackValueBOCBase64(cfg.UnpackedConfig),
-			PrecompiledGasStackBOCBase64: stackValueBOCBase64(cfg.PrecompiledGasUsage),
-			IncomingValueStackBOCBase64:  stackValueBOCBase64(cfg.IncomingValue),
-			StorageFees:                  cfg.StorageFees,
-			DuePaymentNano:               bigIntString(cfg.DuePayment),
-			InMsgParamsStackBOCBase64:    stackValueBOCBase64(cfg.InMsgParams),
-			LibrariesBOCBase64:           cellsBOCBase64(cfg.Libraries),
-		},
-	}
-}
-
-func (b *configBundle) unpackedConfig(now uint32) (tuple.Tuple, error) {
-	b.mu.Lock()
-	if cached, ok := b.unpacked[now]; ok {
-		b.mu.Unlock()
-		return cached, nil
-	}
-	b.mu.Unlock()
-
-	unpacked, err := runMethodUnpackedConfig(b.config, now)
-	if err != nil {
-		return tuple.Tuple{}, err
-	}
-
-	b.mu.Lock()
-	b.unpacked[now] = unpacked
-	b.mu.Unlock()
-	return unpacked, nil
-}
-
-func (b *configBundle) precompiledGas(code *cell.Cell) (*big.Int, error) {
-	if code == nil {
-		return nil, nil
-	}
-
-	hash := code.HashKey()
-
-	b.mu.Lock()
-	if cached, ok := b.precompiled[hash]; ok {
-		b.mu.Unlock()
-		if cached == nil {
-			return nil, nil
-		}
-		return new(big.Int).Set(cached), nil
-	}
-	b.mu.Unlock()
-
-	gas, err := runMethodPrecompiledGasByHash(b.config, hash)
+func buildConfigEpoch(configRoot *cell.Cell) (*configEpoch, error) {
+	prepared, err := tvm.PrepareConfig(configRoot)
 	if err != nil {
 		return nil, err
 	}
-	var stored *big.Int
-	if gas != nil {
-		stored = new(big.Int).Set(gas)
+	globalVersion := int(prepared.GlobalVersion())
+	if globalVersion < tvm.MinSupportedGlobalVersion {
+		return nil, fmt.Errorf("unsupported global version %d, minimum supported is %d", globalVersion, tvm.MinSupportedGlobalVersion)
 	}
-
-	b.mu.Lock()
-	b.precompiled[hash] = stored
-	b.mu.Unlock()
-	if gas == nil {
-		return nil, nil
-	}
-	return new(big.Int).Set(gas), nil
+	return &configEpoch{
+		prepared:      prepared,
+		globalVersion: globalVersion,
+	}, nil
 }
 
-func uint64ToInt64(value uint64, name string) (int64, error) {
-	if value > math.MaxInt64 {
-		return 0, fmt.Errorf("%s %d exceeds int64", name, value)
-	}
-	return int64(value), nil
+// ------------------------------------------------------------------------
+// cross-block account storage-stat LRU (thread-safe, bounded by entry count)
+// ------------------------------------------------------------------------
+
+// storageStatKey identifies a hot account across blocks.
+type storageStatKey struct {
+	workchain int32
+	account   [32]byte
 }
 
-func transactionRandSeed(blockRandSeed []byte, account []byte) []byte {
-	var stack [64]byte
-	total := len(blockRandSeed) + len(account)
-	var data []byte
-	if total <= len(stack) {
-		n := copy(stack[:], blockRandSeed)
-		copy(stack[n:], account)
-		data = stack[:total]
-	} else {
-		data = make([]byte, 0, total)
-		data = append(data, blockRandSeed...)
-		data = append(data, account...)
-	}
-	sum := sha256.Sum256(data)
-	return sum[:]
+type storageStatValue struct {
+	stateHash [32]byte // the shard-account state hash the stat corresponds to
+	stat      *cell.Cell
 }
 
-func transactionComputeCode(shard *tlb.ShardAccount, msg *tlb.Message) (*cell.Cell, error) {
-	if shard != nil && shard.Account != nil {
-		var account tlb.AccountState
-		if err := tlb.Parse(&account, shard.Account); err != nil {
-			return nil, err
-		}
-		if account.IsValid && account.StateInit != nil && account.StateInit.Code != nil {
-			return account.StateInit.Code, nil
-		}
-	}
+// storageStatCache is a bounded LRU mapping an account to the storage-stat
+// dictionary produced by its last replayed transaction, tagged with the
+// resulting account state hash. A seed is only used when the tagged hash equals
+// the account's PRE-state hash for the next replay, so a stale entry is ignored.
+type storageStatCache struct {
+	limit int
 
-	if msg != nil {
-		switch m := msg.Msg.(type) {
-		case *tlb.InternalMessage:
-			if m.StateInit != nil {
-				return m.StateInit.Code, nil
-			}
-		case *tlb.ExternalMessage:
-			if m.StateInit != nil {
-				return m.StateInit.Code, nil
-			}
-		}
-	}
-	return nil, nil
+	mu      sync.Mutex
+	entries map[storageStatKey]*list.Element
+	order   *list.List
 }
 
-func transactionIncomingValue(shard *tlb.ShardAccount, msg *tlb.Message, storageFees *big.Int) (*big.Int, *cell.Dictionary, error) {
-	if msg == nil || msg.MsgType != tlb.MsgTypeInternal {
-		return nil, nil, nil
-	}
-
-	internal := msg.AsInternal()
-	remaining := new(big.Int).Set(internal.Amount.Nano())
-	if !internal.Bounce {
-		balance, err := shardAccountBalance(shard)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		afterStorage := new(big.Int).Add(balance, internal.Amount.Nano())
-		if storageFees != nil {
-			afterStorage.Sub(afterStorage, storageFees)
-		}
-		if afterStorage.Sign() < 0 {
-			return nil, nil, fmt.Errorf("message value after storage fees is negative")
-		}
-		if remaining.Cmp(afterStorage) > 0 {
-			remaining = afterStorage
-		}
-	}
-
-	return remaining, internal.ExtraCurrencies, nil
+type storageStatCacheEntry struct {
+	key   storageStatKey
+	value storageStatValue
 }
 
-func transactionInMsgParams(msg *tlb.Message, remainingCoins *big.Int, remainingExtra *cell.Dictionary) (tuple.Tuple, error) {
-	if msg == nil {
-		return defaultInMsgParams(), nil
+func newStorageStatCache(limit int) *storageStatCache {
+	if limit < 1 {
+		limit = 1
 	}
-
-	switch msg.MsgType {
-	case tlb.MsgTypeInternal:
-		internal := msg.AsInternal()
-		stateInit, err := messageStateInitCell(internal.StateInit)
-		if err != nil {
-			return tuple.Tuple{}, err
-		}
-
-		return tuple.NewTupleValue(
-			boolToTVMInt(internal.Bounce),
-			boolToTVMInt(internal.Bounced),
-			cell.BeginCell().MustStoreAddr(internal.SrcAddr).ToSlice(),
-			internal.FwdFee.Nano(),
-			new(big.Int).SetUint64(internal.CreatedLT),
-			new(big.Int).SetUint64(uint64(internal.CreatedAt)),
-			internal.Amount.Nano(),
-			transactionBigOrZero(remainingCoins),
-			extraCurrencyCell(remainingExtra),
-			stateInit,
-		), nil
-	case tlb.MsgTypeExternalIn:
-		external := msg.AsExternalIn()
-		stateInit, err := messageStateInitCell(external.StateInit)
-		if err != nil {
-			return tuple.Tuple{}, err
-		}
-
-		return tuple.NewTupleValue(
-			tvmIntZero,
-			tvmIntZero,
-			cell.BeginCell().MustStoreAddr(external.SrcAddr).ToSlice(),
-			tvmIntZero,
-			tvmIntZero,
-			tvmIntZero,
-			tvmIntZero,
-			tvmIntZero,
-			nil,
-			stateInit,
-		), nil
-	default:
-		return defaultInMsgParams(), nil
+	return &storageStatCache{
+		limit:   limit,
+		entries: map[storageStatKey]*list.Element{},
+		order:   list.New(),
 	}
 }
 
-func messageStateInitCell(stateInit *tlb.StateInit) (*cell.Cell, error) {
-	if stateInit == nil {
-		return nil, nil
+func storageStatCacheKey(workchain int32, account []byte) (storageStatKey, bool) {
+	var key storageStatKey
+	if len(account) != len(key.account) {
+		return storageStatKey{}, false
 	}
-	return tlb.ToCell(stateInit)
+	key.workchain = workchain
+	copy(key.account[:], account)
+	return key, true
 }
 
-func defaultInMsgParams() tuple.Tuple {
-	return defaultInMsgParamsTuple.Copy()
-}
-
-func boolToTVMInt(value bool) *big.Int {
-	if value {
-		return tvmIntMinusOne
-	}
-	return tvmIntZero
-}
-
-func currencyTuple(coins *big.Int, extra *cell.Dictionary) tuple.Tuple {
-	if (coins == nil || coins.Sign() == 0) && (extra == nil || extra.IsEmpty()) {
-		return zeroCurrencyTuple.Copy()
-	}
-	if coins == nil {
-		coins = tvmIntZero
-	}
-	return tuple.NewTupleValue(new(big.Int).Set(coins), extraCurrencyCell(extra))
-}
-
-func extraCurrencyCell(extra *cell.Dictionary) *cell.Cell {
-	if extra != nil && !extra.IsEmpty() {
-		return extra.AsCell()
-	}
-	return nil
-}
-
-func transactionBigOrZero(value *big.Int) *big.Int {
-	if value == nil {
-		return big.NewInt(0)
-	}
-	return new(big.Int).Set(value)
-}
-
-func shardAccountBalance(shard *tlb.ShardAccount) (*big.Int, error) {
-	if shard == nil || shard.Account == nil {
-		return big.NewInt(0), nil
-	}
-
-	var account tlb.AccountState
-	if err := tlb.Parse(&account, shard.Account); err != nil {
-		return nil, err
-	}
-	if !account.IsValid {
-		return big.NewInt(0), nil
-	}
-	return new(big.Int).Set(account.Balance.Nano()), nil
-}
-
-func storageFeesInt64(fees *big.Int) int64 {
-	if !fees.IsInt64() {
-		return math.MaxInt64
-	}
-	return fees.Int64()
-}
-
-func transactionStorageFeesBig(tx *tlb.Transaction) *big.Int {
-	phase := transactionStoragePhase(tx)
-	if phase == nil {
-		return big.NewInt(0)
-	}
-	return new(big.Int).Set(phase.StorageFeesCollected.Nano())
-}
-
-func transactionDuePayment(tx *tlb.Transaction) *big.Int {
-	phase := transactionStoragePhase(tx)
-	if phase == nil || phase.StorageFeesDue == nil {
-		return big.NewInt(0)
-	}
-	return phase.StorageFeesDue.Nano()
-}
-
-func transactionStoragePhase(tx *tlb.Transaction) *tlb.StoragePhase {
-	if tx == nil {
+// get returns the cached storage stat for the account only when the cached
+// entry's state hash matches preStateHash exactly (else nil).
+func (c *storageStatCache) get(workchain int32, account []byte, preStateHash []byte) *cell.Cell {
+	if len(preStateHash) != 32 {
 		return nil
 	}
-	switch desc := tx.Description.(type) {
-	case tlb.TransactionDescriptionOrdinary:
-		return desc.StoragePhase
-	case tlb.TransactionDescriptionTickTock:
-		return &desc.StoragePhase
-	case tlb.TransactionDescriptionStorage:
-		return &desc.StoragePhase
-	case tlb.TransactionDescriptionSplitPrepare:
-		return desc.StoragePhase
-	case tlb.TransactionDescriptionMergePrepare:
-		return &desc.StoragePhase
-	case tlb.TransactionDescriptionMergeInstall:
-		return desc.StoragePhase
-	default:
+	key, ok := storageStatCacheKey(workchain, account)
+	if !ok {
 		return nil
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	element, ok := c.entries[key]
+	if !ok {
+		return nil
+	}
+	entry := element.Value.(*storageStatCacheEntry)
+	if !bytes.Equal(entry.value.stateHash[:], preStateHash) {
+		return nil
+	}
+	c.order.MoveToFront(element)
+	return entry.value.stat
 }
+
+// put stores (stateHash -> stat) for the account, evicting the LRU tail when
+// over the bound.
+func (c *storageStatCache) put(workchain int32, account []byte, stateHash []byte, stat *cell.Cell) {
+	if stat == nil || len(stateHash) != 32 {
+		return
+	}
+	key, ok := storageStatCacheKey(workchain, account)
+	if !ok {
+		return
+	}
+
+	var value storageStatValue
+	copy(value.stateHash[:], stateHash)
+	value.stat = stat
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element, ok := c.entries[key]; ok {
+		element.Value.(*storageStatCacheEntry).value = value
+		c.order.MoveToFront(element)
+		return
+	}
+	c.entries[key] = c.order.PushFront(&storageStatCacheEntry{key: key, value: value})
+	for len(c.entries) > c.limit {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.entries, oldest.Value.(*storageStatCacheEntry).key)
+	}
+}
+
+// ------------------------------------------------------------------------
+// master config / prev-blocks / global libraries derivation (ported minimal
+// versions; the tvm derives everything else internally)
+// ------------------------------------------------------------------------
 
 func globalLibraries(masterState *cell.Cell) ([]*cell.Cell, string, error) {
 	libraries, err := librariesDict(masterState)
@@ -1875,115 +1596,6 @@ func runMethodBlockIDTuple(id ton.BlockIDExt) tuple.Tuple {
 		new(big.Int).SetBytes(id.RootHash),
 		new(big.Int).SetBytes(id.FileHash),
 	)
-}
-
-func runMethodUnpackedConfig(config tlb.BlockchainConfig, now uint32) (tuple.Tuple, error) {
-	storagePrices, err := runMethodCurrentStoragePrices(config, now)
-	if err != nil {
-		return tuple.Tuple{}, err
-	}
-
-	values := []any{runMethodMaybeSlice(storagePrices)}
-	for _, id := range []uint32{
-		tlb.ConfigParamGlobalID,
-		tlb.ConfigParamGasPricesMasterchain,
-		tlb.ConfigParamGasPricesBasechain,
-		tlb.ConfigParamMsgForwardPricesMasterchain,
-		tlb.ConfigParamMsgForwardPricesBasechain,
-		tlb.ConfigParamSizeLimits,
-	} {
-		param, err := runMethodConfigParamSlice(config, id)
-		if err != nil {
-			return tuple.Tuple{}, err
-		}
-		values = append(values, runMethodMaybeSlice(param))
-	}
-
-	return tuple.NewTupleValue(values...), nil
-}
-
-func runMethodCurrentStoragePrices(config tlb.BlockchainConfig, now uint32) (*cell.Slice, error) {
-	root, err := runMethodConfigParamCell(config, tlb.ConfigParamStoragePrices)
-	if err != nil || root == nil {
-		return nil, err
-	}
-
-	entries, err := root.AsDict(32).LoadAll()
-	if err != nil {
-		return nil, err
-	}
-
-	var best *cell.Slice
-	var bestSince uint64
-	for _, entry := range entries {
-		since, err := entry.Key.LoadUInt(32)
-		if err != nil {
-			return nil, err
-		}
-		if since > uint64(now) || best != nil && since <= bestSince {
-			continue
-		}
-		best = entry.Value.Copy()
-		bestSince = since
-	}
-
-	return best, nil
-}
-
-func runMethodConfigParamSlice(config tlb.BlockchainConfig, id uint32) (*cell.Slice, error) {
-	param, err := runMethodConfigParamCell(config, id)
-	if err != nil || param == nil {
-		return nil, err
-	}
-	return param.BeginParse()
-}
-
-func runMethodConfigParamCell(config tlb.BlockchainConfig, id uint32) (*cell.Cell, error) {
-	if config.Root == nil {
-		return nil, nil
-	}
-
-	param, err := config.GetParam(id)
-	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
-		return nil, nil
-	}
-	return param, err
-}
-
-func runMethodMaybeSlice(value *cell.Slice) any {
-	if value == nil {
-		return nil
-	}
-	return value
-}
-
-func runMethodPrecompiledGasByHash(config tlb.BlockchainConfig, hash cell.Hash) (*big.Int, error) {
-	if config.Root == nil {
-		return nil, nil
-	}
-
-	precompiled, err := config.GetPrecompiledContractsConfig()
-	if err != nil {
-		return nil, err
-	}
-	if precompiled.List == nil || precompiled.List.IsEmpty() {
-		return nil, nil
-	}
-
-	value, err := precompiled.List.LoadValue(accountKey(hash[:]))
-	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var smc tlb.PrecompiledSmc
-	if err = tlb.LoadFromCell(&smc, value); err != nil {
-		return nil, err
-	}
-
-	return new(big.Int).SetUint64(smc.GasUsage), nil
 }
 
 func librariesDict(stateRoot *cell.Cell) (*cell.Dictionary, error) {

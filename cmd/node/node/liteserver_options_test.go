@@ -33,7 +33,7 @@ func TestLiteserverOptionsFromConfig(t *testing.T) {
 		},
 	}
 
-	opts, err := liteserverOptionsFromConfig(cfg)
+	opts, err := liteserverOptionsFromConfig(cfg, liteserverRuntimeOptionsForTest(cfg))
 	if err != nil {
 		t.Fatalf("liteserver options: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 	}
 	var runOpts gton.NodeOptions
 
-	_, err := configureLiteserver(&runOpts, cfg, liteserverTestGlobalConfig(), 0)
+	_, factory, err := configureLiteserver(&runOpts, cfg, liteserverRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig(), 0)
 	if err != nil {
 		t.Fatalf("configure liteserver: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 	if !runOpts.P2P.AllowDuplicateExternals {
 		t.Fatal("expected duplicate external messages to be allowed in p2p options")
 	}
-	if runOpts.Extension == nil {
+	if factory == nil {
 		t.Fatal("expected liteserver extension factory")
 	}
 }
@@ -129,17 +129,18 @@ func TestLiteserverOptionsRequireKeyWhenEnabled(t *testing.T) {
 		},
 	}
 
-	if _, err := liteserverOptionsFromConfig(cfg); err == nil {
+	if _, err := liteserverOptionsFromConfig(cfg, liteserverRuntimeOptionsForTest(cfg)); err == nil {
 		t.Fatal("expected enabled liteserver without key to fail")
 	}
 }
 
 func TestLiteserverOptionsDefaultLimitsDisabled(t *testing.T) {
-	opts, err := liteserverOptionsFromConfig(nodeconfig.Config{
+	cfg := nodeconfig.Config{
 		Lite: nodeconfig.Lite{
 			Key: liteserverTestSeed(3),
 		},
-	})
+	}
+	opts, err := liteserverOptionsFromConfig(cfg, liteserverRuntimeOptionsForTest(cfg))
 	if err != nil {
 		t.Fatalf("liteserver options: %v", err)
 	}
@@ -185,16 +186,32 @@ func TestLiteserverOptionsRejectInvalidLimits(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := liteserverOptionsFromConfig(nodeconfig.Config{
+			cfg := nodeconfig.Config{
 				Lite: nodeconfig.Lite{
 					Key:    liteserverTestSeed(3),
 					Limits: tt.limits,
 				},
-			})
+			}
+			_, err := liteserverOptionsFromConfig(cfg, liteserverRuntimeOptionsForTest(cfg))
 			if err == nil {
 				t.Fatal("expected invalid liteserver limits to fail")
 			}
 		})
+	}
+}
+
+func liteserverRuntimeOptionsForTest(cfg nodeconfig.Config) nodeconfig.RuntimeOptions {
+	fanout := cfg.Lite.SendMessageBroadcastFanout
+	if fanout == 0 {
+		fanout = nodeconfig.DefaultLiteSendMessageBroadcastFanout
+	}
+
+	return nodeconfig.RuntimeOptions{
+		LiteSendMessageBroadcastCapacity: nodeconfig.LiteSendMessageBroadcastCapacity{
+			BytesPerSecond: cfg.Lite.SendMessageBroadcastBytesPerSecond,
+			MaxDelay:       time.Duration(cfg.Lite.SendMessageBroadcastMaxDelayMS) * time.Millisecond,
+		},
+		LiteSendMessageBroadcastFanout: fanout,
 	}
 }
 

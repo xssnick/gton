@@ -112,7 +112,7 @@ func (m *BlockMeta) Clone() *BlockMeta {
 	}
 
 	cloned := &BlockMeta{
-		ID:                  m.ID,
+		ID:                  cloneBlockID(m.ID),
 		Flags:               m.Flags,
 		GenUTime:            m.GenUTime,
 		StartLT:             m.StartLT,
@@ -121,13 +121,19 @@ func (m *BlockMeta) Clone() *BlockMeta {
 		StateFileHash:       bytes.Clone(m.StateFileHash),
 		MasterchainRefSeqno: m.MasterchainRefSeqno,
 	}
-	if len(m.PrevRefs) > 0 {
-		cloned.PrevRefs = make([]ton.BlockIDExt, len(m.PrevRefs))
-		copy(cloned.PrevRefs, m.PrevRefs)
+	cloned.PrevRefs = cloneBlockIDs(m.PrevRefs)
+	cloned.NextRefs = cloneBlockIDs(m.NextRefs)
+	return cloned
+}
+
+func cloneBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
+	if len(blocks) == 0 {
+		return nil
 	}
-	if len(m.NextRefs) > 0 {
-		cloned.NextRefs = make([]ton.BlockIDExt, len(m.NextRefs))
-		copy(cloned.NextRefs, m.NextRefs)
+
+	cloned := make([]ton.BlockIDExt, len(blocks))
+	for i := range blocks {
+		cloned[i] = cloneBlockID(blocks[i])
 	}
 	return cloned
 }

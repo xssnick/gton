@@ -80,14 +80,11 @@ func (s *Server) finishQuery(ctx context.Context, client *liteclient.ServerClien
 		defer s.queryObserver.AddLiteserverInflight(-1)
 	}
 
+	// The timing variant is always used; when neither debug logging nor the
+	// query observer consumes the result, its residual cost is two clock reads
+	// because the debug names resolve lazily inside queryLogTiming.
 	event := s.log.Debug()
-	var resp tl.Serializable
-	var timing queryLogTiming
-	if !event.Enabled() && s.queryObserver == nil {
-		resp = s.handleQueryData(ctx, data, gate)
-	} else {
-		resp, timing = s.handleQueryDataWithTiming(ctx, data, gate)
-	}
+	resp, timing := s.handleQueryDataWithTiming(ctx, data, gate)
 	if resp == nil {
 		// The client disconnected while the query waited for an executor slot.
 		s.endQueryRequest(client)
@@ -99,14 +96,15 @@ func (s *Server) finishQuery(ctx context.Context, client *liteclient.ServerClien
 		s.queryObserver.ObserveLiteserverQuery(queryObservationFromResponse(resp, timing))
 	}
 	if event.Enabled() {
+		queryName := timing.queryName()
 		event = event.
-			Str("query", timing.queryName()).
+			Str("query", queryName).
 			Str("response", liteserverTypeName(resp)).
 			Dur("duration", timing.duration).
 			Str("remote_ip", client.IP()).
 			Uint16("remote_port", client.Port())
-		if timing.sequence != "" && timing.sequence != timing.query {
-			event = event.Str("sequence", timing.sequence)
+		if sequence := timing.sequenceName(); sequence != "" && sequence != queryName {
+			event = event.Str("sequence", sequence)
 		}
 		if timing.waitDuration > 0 {
 			event = event.Dur("wait_duration", timing.waitDuration)
@@ -126,7 +124,7 @@ func (s *Server) shedQuery(client *liteclient.ServerClient, queryID []byte, data
 	resp := ton.LSError{Code: errCodeTooManyRequests, Text: text}
 	client.Answer(queryID, resp)
 
-	timing := queryLogTiming{query: liteserverQueryLogName(data), errorReason: reason}
+	timing := queryLogTiming{query: data, errorReason: reason}
 	if s.queryObserver != nil {
 		s.queryObserver.ObserveLiteserverQuery(queryObservationFromResponse(resp, timing))
 	}
@@ -205,7 +203,10 @@ func isFastLiteserverQuery(query any) bool {
 // dequeue, and a full backlog is shed explicitly instead of stalling the
 // connection read loops.
 type queryExecutor struct {
-	tasks chan executorTask
+	tasks     chan executorTask
+	done      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 type executorTask struct {
@@ -220,26 +221,40 @@ func newQueryExecutor(concurrency int) *queryExecutor {
 
 	executor := &queryExecutor{
 		tasks: make(chan executorTask, concurrency*queryExecutorPendingFactor),
+		done:  make(chan struct{}),
 	}
 	for i := 0; i < concurrency; i++ {
+		executor.wg.Add(1)
 		go executor.worker()
 	}
 	return executor
 }
 
 func (e *queryExecutor) worker() {
-	for task := range e.tasks {
-		if task.ctx.Err() != nil {
-			// The client disconnected while the task waited in the queue.
-			continue
+	defer e.wg.Done()
+	for {
+		select {
+		case <-e.done:
+			return
+		case task := <-e.tasks:
+			if task.ctx.Err() != nil {
+				// The client disconnected while the task waited in the queue.
+				continue
+			}
+			task.fn()
 		}
-		task.fn()
 	}
 }
 
 // run enqueues fn for the worker pool. It returns false when the backlog is
 // full and the query must be shed.
 func (e *queryExecutor) run(ctx context.Context, fn func()) bool {
+	select {
+	case <-e.done:
+		return false
+	default:
+	}
+
 	select {
 	case e.tasks <- executorTask{ctx: ctx, fn: fn}:
 		return true
@@ -261,11 +276,16 @@ func (e *queryExecutor) occupy(ctx context.Context) (func(), bool) {
 		ctx: context.Background(),
 		fn: func() {
 			close(picked)
-			<-done
+			select {
+			case <-done:
+			case <-e.done:
+			}
 		},
 	}
 
 	select {
+	case <-e.done:
+		return nil, false
 	case e.tasks <- hold:
 	case <-ctx.Done():
 		return nil, false
@@ -277,11 +297,26 @@ func (e *queryExecutor) occupy(ctx context.Context) (func(), bool) {
 	case <-ctx.Done():
 		// The hold is already queued; unpark the worker once it takes it.
 		go func() {
-			<-picked
-			close(done)
+			select {
+			case <-picked:
+				close(done)
+			case <-e.done:
+			}
 		}()
 		return nil, false
+	case <-e.done:
+		return nil, false
 	}
+}
+
+func (e *queryExecutor) Close() {
+	e.closeOnce.Do(func() {
+		close(e.done)
+	})
+}
+
+func (e *queryExecutor) Wait() {
+	e.wg.Wait()
 }
 
 // executorGate defers capturing a worker until the query part of a parked

@@ -34,6 +34,7 @@ var (
 	hotPrefixArchivePackageIndex   = []byte{0x1F}
 	hotPrefixPackAppendDirty       = []byte{0x20}
 	hotPrefixPackDeletePending     = []byte{0x21}
+	hotPrefixMessageTransaction    = []byte{0x22}
 )
 
 func hotKeyMetaDBVersion() []byte {
@@ -96,6 +97,19 @@ func hotKeyBlockUTimeSeekGE(key storage.BlockHistoryKey, utime uint32) []byte {
 	buf := hotKeyBlockUTimePrefix(key)
 	buf = binary.BigEndian.AppendUint32(buf, utime)
 	return binary.BigEndian.AppendUint32(buf, 0)
+}
+
+func hotKeyMessageTransaction(kind storage.MessageTransactionKind, key storage.MessageTransactionKey) []byte {
+	buf := append([]byte(nil), hotPrefixMessageTransaction...)
+	buf = append(buf, byte(kind))
+	buf = appendMessageTransactionAddress(buf, key.Source)
+	buf = appendMessageTransactionAddress(buf, key.Destination)
+	return binary.BigEndian.AppendUint64(buf, key.CreatedLT)
+}
+
+func appendMessageTransactionAddress(buf []byte, addr storage.MessageTransactionAddress) []byte {
+	buf = binary.BigEndian.AppendUint32(buf, uint32(addr.Workchain))
+	return append(buf, addr.Account[:]...)
 }
 
 func hotKeyCurrentState() []byte {

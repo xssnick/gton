@@ -67,10 +67,11 @@ func testStateCheckpointArtifactForCurrent(state *storage.BlockState, current *s
 		}
 	}
 	return &storage.ServedBlockFull{
-		ID:    block,
-		Block: []byte{0x01},
-		Proof: []byte{0x02},
-		Meta:  meta,
+		ID:             block,
+		Block:          []byte{0x01},
+		Proof:          []byte{0x02},
+		Meta:           meta,
+		MessageEntries: []storage.MessageTransactionIndexEntry{},
 	}
 }
 

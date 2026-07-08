@@ -26,6 +26,7 @@ func preparedBlockCheckpointArtifacts(block PreparedBlock, splitDepth uint32) (*
 		Meta:                   block.Meta.Clone(),
 		IsLink:                 storage.ServedBlockProofIsLink(block.ID, block.IsLink),
 		ArchiveShardSplitDepth: splitDepth,
+		MessageEntries:         block.MessageEntries,
 	}
 
 	var links []storage.ServedBlockLink

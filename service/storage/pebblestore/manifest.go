@@ -1,6 +1,7 @@
 package pebblestore
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ func (s *Store) manifestLocked() cellGenerationManifest {
 	return cellGenerationManifest{
 		active:       s.activeCellGeneration,
 		next:         s.nextCellGeneration,
-		activeOrigin: s.activeCellOrigin,
+		activeOrigin: cloneManifestBlockID(s.activeCellOrigin),
 		pending:      cloneCellGenerationPendingMigration(s.pendingCellMigration),
 		retired:      cloneUint64Slice(s.retiredGenerations),
 	}
@@ -218,7 +219,14 @@ func cloneCellGenerationPendingMigration(pending *cellGenerationPendingMigration
 		return nil
 	}
 	cloned := *pending
+	cloned.origin = cloneManifestBlockID(pending.origin)
 	return &cloned
+}
+
+func cloneManifestBlockID(block ton.BlockIDExt) ton.BlockIDExt {
+	block.RootHash = bytes.Clone(block.RootHash)
+	block.FileHash = bytes.Clone(block.FileHash)
+	return block
 }
 
 func cloneUint64Slice(values []uint64) []uint64 {

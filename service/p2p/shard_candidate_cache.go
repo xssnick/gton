@@ -38,10 +38,20 @@ type shardBlockCandidateCache struct {
 }
 
 type shardBlockCandidateEntry struct {
-	block      DownloadedBlock
+	block      shardBlockCandidate
 	receivedAt time.Time
 	expiresAt  time.Time
 	bytes      int64
+}
+
+type shardBlockCandidate struct {
+	id                    ton.BlockIDExt
+	blockRoot             *cell.Cell
+	blockBOC              []byte
+	meta                  *tnstore.BlockMeta
+	stateUpdate           *cell.Cell
+	sourcePeerID          PeerID
+	signaturesVerifiedKey []byte
 }
 
 type shardDescriptionProofEntry struct {
@@ -73,7 +83,7 @@ func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, no
 
 	key := tnstore.BlockKey(downloaded.ID)
 	entry := shardBlockCandidateEntry{
-		block:      cloneShardBlockCandidate(downloaded),
+		block:      shardBlockCandidateFrom(downloaded),
 		receivedAt: now,
 		expiresAt:  now.Add(c.ttl),
 		bytes:      shardBlockCandidateBytes(downloaded),
@@ -165,19 +175,14 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 }
 
 func (c *shardBlockCandidateCache) assembleLocked(candidate shardBlockCandidateEntry, proof shardDescriptionProofEntry) ([]DownloadedBlock, error) {
-	if !candidate.block.ID.Equals(&proof.block) {
-		return nil, fmt.Errorf("shard candidate %s proof belongs to %s", formatBlockRef(candidate.block.ID), formatBlockRef(proof.block))
+	if !candidate.block.id.Equals(&proof.block) {
+		return nil, fmt.Errorf("shard candidate %s proof belongs to %s", formatBlockRef(candidate.block.id), formatBlockRef(proof.block))
 	}
 	if err := blockproof.CheckProofShape(proof.block, proof.proof, true); err != nil {
 		return nil, err
 	}
 
-	block := candidate.block
-	block.Kind = shardDescriptionBroadcastKind
-	block.Proof = proof.proof
-	block.ProofBOC = proof.proofBOC
-	block.IsLink = true
-	block.VerifiedRootHash = true
+	block := candidate.block.downloaded(proof)
 	return []DownloadedBlock{block}, nil
 }
 
@@ -277,17 +282,33 @@ func validateShardDescriptionProof(proof ShardDescriptionProof) error {
 	return nil
 }
 
-func cloneShardBlockCandidate(downloaded DownloadedBlock) DownloadedBlock {
-	cloned := downloaded
-	cloned.ID = cloneBlockID(downloaded.ID)
-	cloned.BlockBOC = downloaded.BlockBOC
-	cloned.ProofBOC = nil
-	cloned.Proof = nil
-	cloned.IsLink = false
-	if downloaded.Meta != nil {
-		cloned.Meta = downloaded.Meta.Clone()
+func shardBlockCandidateFrom(downloaded DownloadedBlock) shardBlockCandidate {
+	return shardBlockCandidate{
+		id:                    cloneBlockID(downloaded.ID),
+		blockRoot:             downloaded.Block,
+		blockBOC:              downloaded.BlockBOC,
+		meta:                  downloaded.Meta.Clone(),
+		stateUpdate:           downloaded.StateUpdate,
+		sourcePeerID:          downloaded.SourcePeerID,
+		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
-	return cloned
+}
+
+func (c shardBlockCandidate) downloaded(proof shardDescriptionProofEntry) DownloadedBlock {
+	return DownloadedBlock{
+		ID:                    cloneBlockID(c.id),
+		Kind:                  shardDescriptionBroadcastKind,
+		Block:                 c.blockRoot,
+		Proof:                 proof.proof,
+		BlockBOC:              c.blockBOC,
+		ProofBOC:              proof.proofBOC,
+		Meta:                  c.meta.Clone(),
+		StateUpdate:           c.stateUpdate,
+		SourcePeerID:          c.sourcePeerID,
+		IsLink:                true,
+		VerifiedRootHash:      true,
+		SignaturesVerifiedKey: append([]byte(nil), c.signaturesVerifiedKey...),
+	}
 }
 
 func shardBlockCandidateBytes(downloaded DownloadedBlock) int64 {

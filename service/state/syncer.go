@@ -370,7 +370,7 @@ func (s *Syncer) appendSnapshotCheckpointEntry(ctx context.Context, entries *[]s
 
 	*entries = append(*entries, storage2.StateCheckpointBlock{
 		State:    state,
-		Artifact: artifact.Clone(),
+		Artifact: artifact,
 	})
 	return nil
 }
@@ -464,7 +464,7 @@ func (s *Syncer) publishDownloadedBlockState(ctx context.Context, state *storage
 	}
 	_, err := s.storage.SaveStateCheckpointEntries(ctx, []storage2.StateCheckpointBlock{{
 		State:    state,
-		Artifact: artifact.Clone(),
+		Artifact: artifact,
 	}}, storage2.StateCellRecords{}, nil)
 	return err
 }

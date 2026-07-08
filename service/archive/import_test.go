@@ -80,6 +80,11 @@ func TestImportBytesStoresInlineBlocks(t *testing.T) {
 	if len(imported.PreparedBlocks) != 1 {
 		t.Fatalf("expected one prepared block, got %d", len(imported.PreparedBlocks))
 	}
+	for _, prepared := range imported.PreparedBlocks {
+		if prepared.MessageEntries == nil {
+			t.Fatal("expected prepared block to carry extracted message entries")
+		}
+	}
 	if imported.Stats.StateUpdateCells == 0 {
 		t.Fatal("expected prepared state update cells")
 	}
