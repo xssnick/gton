@@ -19,6 +19,11 @@ func (v *countingBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(conte
 	return nil
 }
 
+func (v *countingBroadcastSignatureVerifier) CheckBlockFinalitySignatures(context.Context, BlockFinalitySignatureCheck) (*BlockFinalitySignatureCheckResult, error) {
+	v.calls.Add(1)
+	return &BlockFinalitySignatureCheckResult{SignaturesVerifiedKey: []byte("test-finality")}, nil
+}
+
 func (v *countingBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(_ context.Context, req ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {
 	return &ShardBlockDescription{
 		Block:         req.Block,
@@ -30,8 +35,8 @@ func TestNoteAppliedMasterchainSeqnoIsMonotonic(t *testing.T) {
 	node := newTestNode(t)
 
 	master := testBlockID(-1, topShard, 100)
-	if node.staleAppliedMasterchainBroadcast(master) {
-		t.Fatal("broadcast considered stale before any applied seqno is known")
+	if node.alreadyAppliedMasterchainBroadcast(master) {
+		t.Fatal("broadcast considered already applied before any applied seqno is known")
 	}
 
 	node.NoteAppliedMasterchainSeqno(100)
@@ -40,24 +45,24 @@ func TestNoteAppliedMasterchainSeqnoIsMonotonic(t *testing.T) {
 		t.Fatalf("applied seqno regressed to %d", got)
 	}
 
-	if !node.staleAppliedMasterchainBroadcast(testBlockID(-1, topShard, 100)) {
-		t.Fatal("broadcast at applied seqno is not stale")
+	if !node.alreadyAppliedMasterchainBroadcast(testBlockID(-1, topShard, 100)) {
+		t.Fatal("broadcast at applied seqno is not already applied")
 	}
-	if !node.staleAppliedMasterchainBroadcast(testBlockID(-1, topShard, 99)) {
-		t.Fatal("broadcast below applied seqno is not stale")
+	if !node.alreadyAppliedMasterchainBroadcast(testBlockID(-1, topShard, 99)) {
+		t.Fatal("broadcast below applied seqno is not already applied")
 	}
-	if node.staleAppliedMasterchainBroadcast(testBlockID(-1, topShard, 101)) {
-		t.Fatal("broadcast above applied seqno reported stale")
+	if node.alreadyAppliedMasterchainBroadcast(testBlockID(-1, topShard, 101)) {
+		t.Fatal("broadcast above applied seqno reported already applied")
 	}
-	if node.staleAppliedMasterchainBroadcast(testBlockID(0, topShard, 1)) {
-		t.Fatal("shard broadcast reported stale by masterchain seqno")
+	if node.alreadyAppliedMasterchainBroadcast(testBlockID(0, topShard, 1)) {
+		t.Fatal("shard broadcast reported already applied by masterchain seqno")
 	}
 }
 
-// TestClassifyDropsStaleAppliedMasterchainBroadcastBeforeSignatureCheck pins
+// TestClassifyDropsAlreadyAppliedMasterchainBroadcastBeforeSignatureCheck pins
 // the ordering: a masterchain broadcast at or below the applied seqno must be
 // dropped before the validator-signature verifier is consulted.
-func TestClassifyDropsStaleAppliedMasterchainBroadcastBeforeSignatureCheck(t *testing.T) {
+func TestClassifyDropsAlreadyAppliedMasterchainBroadcastBeforeSignatureCheck(t *testing.T) {
 	node := newTestNode(t)
 	verifier := &countingBroadcastSignatureVerifier{}
 	node.signatureVerifier = verifier
@@ -103,13 +108,13 @@ func TestClassifyDropsStaleAppliedMasterchainBroadcastBeforeSignatureCheck(t *te
 	node.NoteAppliedMasterchainSeqno(300)
 
 	if accepted := classify(broadcast(300, 2)); accepted != nil {
-		t.Fatalf("stale broadcast at applied seqno was accepted: %+v", accepted)
+		t.Fatalf("already-applied broadcast at applied seqno was accepted: %+v", accepted)
 	}
 	if accepted := classify(broadcast(299, 3)); accepted != nil {
-		t.Fatalf("stale broadcast below applied seqno was accepted: %+v", accepted)
+		t.Fatalf("already-applied broadcast below applied seqno was accepted: %+v", accepted)
 	}
 	if calls := verifier.calls.Load(); calls != 1 {
-		t.Fatalf("stale broadcasts reached the signature verifier: %d calls, want 1", calls)
+		t.Fatalf("already-applied broadcasts reached the signature verifier: %d calls, want 1", calls)
 	}
 
 	if accepted := classify(broadcast(301, 4)); accepted != nil {
@@ -117,5 +122,39 @@ func TestClassifyDropsStaleAppliedMasterchainBroadcastBeforeSignatureCheck(t *te
 	}
 	if calls := verifier.calls.Load(); calls != 2 {
 		t.Fatalf("broadcast above applied seqno made %d signature checks, want 2", calls)
+	}
+}
+
+func TestClassifyBlockFinalityBroadcastRejectsOrdinarySignatureSetBeforeSignatureCheck(t *testing.T) {
+	node := newTestNode(t)
+	verifier := &countingBroadcastSignatureVerifier{}
+	node.signatureVerifier = verifier
+
+	sub := &overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x04, 0x05, 0x06},
+		},
+		log: discardLogger(),
+	}
+
+	msg := BlockFinalityBroadcast{
+		ID: testBlockID(0, topShard, 302),
+		SignatureSet: tonnodeapi.SignatureSetOrdinary{
+			CatchainSeqno:    10,
+			ValidatorSetHash: 20,
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize block finality broadcast: %v", err)
+	}
+
+	if accepted := sub.classifyBroadcast(nil, msg, payload, DeliverySimple, false, testPeerID("peer")); accepted != nil {
+		t.Fatalf("ordinary finality broadcast was accepted: %+v", accepted)
+	}
+	if calls := verifier.calls.Load(); calls != 0 {
+		t.Fatalf("ordinary finality broadcast reached the signature verifier: %d calls", calls)
 	}
 }

@@ -192,7 +192,7 @@ func (s *Service) emitDirectMasterchainBroadcast(ctx context.Context, ev p2p.Bro
 	if ev.Downloaded == nil || !ev.Downloaded.ID.Equals(&ev.Block) {
 		return false
 	}
-	if !fullBlockBroadcastKind(ev.Kind) {
+	if !directDownloadedBroadcastKind(ev.Kind) {
 		return false
 	}
 
@@ -640,6 +640,10 @@ func fullBlockBroadcastKind(kind string) bool {
 	default:
 		return false
 	}
+}
+
+func directDownloadedBroadcastKind(kind string) bool {
+	return fullBlockBroadcastKind(kind) || kind == "tonNode.blockFinalityBroadcast"
 }
 
 func (s *Service) emit(ctx context.Context, block *SyncedBlock) bool {

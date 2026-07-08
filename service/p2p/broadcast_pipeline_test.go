@@ -251,6 +251,27 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	}
 	observer.requireStage(t, broadcastPipelineStageShardDescValidate, "tonNode.newShardBlockBroadcast", DeliveryFEC, broadcastPipelineResultSuccess)
 
+	finality := BlockFinalityBroadcast{
+		ID: downloaded.ID,
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			Final:            false,
+			CatchainSeqno:    7,
+			ValidatorSetHash: 8,
+			SessionID:        bytes.Repeat([]byte{0x44}, 32),
+			Slot:             3,
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            downloaded.ID,
+				CollatedFileHash: bytes.Repeat([]byte{0x45}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
+		},
+	}
+	if err := sub.handleOverlayBroadcast(nil, finality, DeliverySimple, true, sourceID); err != nil {
+		t.Fatalf("handle block finality broadcast: %v", err)
+	}
+	observer.requireStage(t, broadcastPipelineStageFinalitySigCheck, blockFinalityBroadcastKind, DeliverySimple, broadcastPipelineResultSuccess)
+	observer.requireStage(t, broadcastPipelineStageFinalityAssemble, blockFinalityBroadcastKind, DeliverySimple, broadcastPipelineResultMiss)
+
 	node.acceptBroadcast(acceptedBroadcast{
 		fingerprint: "hot-cache",
 		deduped:     true,

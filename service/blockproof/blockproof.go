@@ -144,6 +144,18 @@ func LinkFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, []byte, 
 	return root, root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
 }
 
+func ProofFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell, signatures *cell.Cell) (*cell.Cell, []byte, error) {
+	root, err := tlb.ToCell(&BlockProof{
+		ProofFor:   blockIDExtTLBFromBlock(id),
+		Root:       proofRoot,
+		Signatures: signatures,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("serialize block proof %s: %w", tnstore.FormatBlockRef(id), err)
+	}
+	return root, root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}), nil
+}
+
 func CheckProofShape(id ton.BlockIDExt, proofRoot *cell.Cell, isLink bool) error {
 	return checkProofShape(id, proofRoot, isLink, false)
 }
@@ -422,6 +434,88 @@ func (s *ValidatorSignatureSet) IsFinal() bool {
 
 func (s *ValidatorSignatureSet) IsSimplex() bool {
 	return s.simplex
+}
+
+func (s *ValidatorSignatureSet) FinalitySignaturesCell(validators *PreparedValidatorSet) (*cell.Cell, error) {
+	if !s.simplex {
+		return nil, fmt.Errorf("block finality signatures must use simplex signature set")
+	}
+	if !s.final {
+		return nil, fmt.Errorf("non-final validator signatures cannot be stored in block proof")
+	}
+
+	signatures, weight, err := s.signaturesDict(validators)
+	if err != nil {
+		return nil, err
+	}
+
+	candidateData := cell.BeginCell()
+	if err := candidateData.StoreBinarySnake(s.candidateData); err != nil {
+		return nil, fmt.Errorf("store simplex candidate data: %w", err)
+	}
+	return tlb.ToCell(&blockSignaturesSimplex{
+		ValidatorSetHash: s.validatorSetHash,
+		CatchainSeqno:    s.catchainSeqno,
+		SigCount:         uint32(len(s.signatures)),
+		SigWeight:        weight,
+		Signatures:       signatures,
+		SessionID:        bytes.Clone(s.sessionID),
+		Slot:             uint32(s.slot),
+		CandidateData:    candidateData.EndCell(),
+	})
+}
+
+func (s *ValidatorSignatureSet) signaturesDict(validators *PreparedValidatorSet) (*cell.Dictionary, uint64, error) {
+	if len(validators.validators) == 0 {
+		return nil, 0, fmt.Errorf("validator set is empty")
+	}
+	if s.catchainSeqno != validators.catchainSeqno {
+		return nil, 0, fmt.Errorf("incorrect validator catchain seqno")
+	}
+	if s.validatorSetHash != validators.setHash {
+		return nil, 0, fmt.Errorf("incorrect validator set hash")
+	}
+
+	signatures := cloneSignatures(s.signatures)
+	sort.Slice(signatures, func(i, j int) bool {
+		return bytes.Compare(signatures[i].NodeIDShort, signatures[j].NodeIDShort) < 0
+	})
+
+	dict := cell.NewDict(16)
+	seen := make(map[[32]byte]struct{}, len(signatures))
+	var weight uint64
+	for i, sig := range signatures {
+		var nodeID [32]byte
+		if len(sig.NodeIDShort) != len(nodeID) {
+			return nil, 0, fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
+		}
+		if len(sig.Signature) != ed25519.SignatureSize {
+			return nil, 0, fmt.Errorf("invalid validator signature len %d", len(sig.Signature))
+		}
+		copy(nodeID[:], sig.NodeIDShort)
+		if _, ok := seen[nodeID]; ok {
+			return nil, 0, fmt.Errorf("duplicated node signature")
+		}
+		seen[nodeID] = struct{}{}
+
+		validator, ok := validators.validators[nodeID]
+		if !ok {
+			return nil, 0, fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
+		}
+		weight += validator.weight
+
+		value := cell.BeginCell().
+			MustStoreSlice(sig.NodeIDShort, 256).
+			MustStoreUInt(5, 4).
+			MustStoreSlice(sig.Signature[:32], 256).
+			MustStoreSlice(sig.Signature[32:], 256).
+			EndCell()
+		key := cell.BeginCell().MustStoreUInt(uint64(i), 16).EndCell()
+		if err := dict.Set(key, value); err != nil {
+			return nil, 0, fmt.Errorf("store validator signature %d: %w", i, err)
+		}
+	}
+	return dict, weight, nil
 }
 
 // ContentKey digests everything a successful signature check of this set for

@@ -8,6 +8,8 @@ const (
 	broadcastPipelineStageClassify          = "classify"
 	broadcastPipelineStageCandidateDecode   = "candidate_decode"
 	broadcastPipelineStageShardDescValidate = "shard_desc_validate"
+	broadcastPipelineStageFinalitySigCheck  = "block_finality_signature_check"
+	broadcastPipelineStageFinalityAssemble  = "block_finality_assemble"
 	broadcastPipelineStageHotCacheNotify    = "hot_cache_notify"
 	broadcastPipelineStageExactPop          = "exact_pop"
 

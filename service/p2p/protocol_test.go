@@ -89,6 +89,55 @@ func TestCompressedV2BroadcastSignatureSetDecodesAsValueType(t *testing.T) {
 	}
 }
 
+func TestBlockFinalityBroadcastRoundTrip(t *testing.T) {
+	msg := BlockFinalityBroadcast{
+		ID: ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+			SeqNo:     125,
+			RootHash:  bytes.Repeat([]byte{0x11}, 32),
+			FileHash:  bytes.Repeat([]byte{0x22}, 32),
+		},
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			Final:            true,
+			CatchainSeqno:    10,
+			ValidatorSetHash: 20,
+			Signatures: []tonnodeapi.BlockSignature{{
+				Who:       bytes.Repeat([]byte{0x33}, 32),
+				Signature: bytes.Repeat([]byte{0x44}, ed25519.SignatureSize),
+			}},
+			SessionID: bytes.Repeat([]byte{0x55}, 32),
+			Slot:      3,
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            ton.BlockIDExt{RootHash: make([]byte, 32), FileHash: make([]byte, 32)},
+				CollatedFileHash: bytes.Repeat([]byte{0x66}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
+		},
+	}
+
+	serialized, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize block finality broadcast: %v", err)
+	}
+
+	var parsed any
+	if _, err = tl.Parse(&parsed, serialized, true); err != nil {
+		t.Fatalf("parse block finality broadcast: %v", err)
+	}
+
+	broadcast, ok := parsed.(BlockFinalityBroadcast)
+	if !ok {
+		t.Fatalf("unexpected type after parse: %T", parsed)
+	}
+	if !broadcast.ID.Equals(&msg.ID) {
+		t.Fatalf("unexpected block after parse: %s", formatBlockRef(broadcast.ID))
+	}
+	if _, ok = broadcast.SignatureSet.(tonnodeapi.SignatureSetSimplex); !ok {
+		t.Fatalf("unexpected signature set type after parse: %T", broadcast.SignatureSet)
+	}
+}
+
 func TestDownloadTypesRoundTrip(t *testing.T) {
 	msg := DataFullCompressed{
 		ID: ton.BlockIDExt{

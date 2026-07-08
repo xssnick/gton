@@ -244,6 +244,21 @@ func BlockHeaderProof(root *cell.Cell, id ton.BlockIDExt, mode uint32) (*cell.Ce
 	})
 }
 
+func BroadcastProofRoot(id ton.BlockIDExt, root *cell.Cell) (*cell.Cell, error) {
+	hash := root.HashKey()
+	if !bytes.Equal(hash[:], id.RootHash) {
+		return nil, fmt.Errorf("block root hash mismatch for %s", storage.FormatBlockRef(id))
+	}
+
+	const mode = 1 | 2 | 16
+	return CreateUsageProof(root, func(root *cell.Cell) error {
+		if err := visitBlockHeader(root, id, mode); err != nil {
+			return err
+		}
+		return visitKeyBlockValidatorConfig(root)
+	})
+}
+
 func BlockStateRootProof(root *cell.Cell) (*cell.Cell, error) {
 	if root != nil {
 		root = root.Virtualize(0)
@@ -544,6 +559,46 @@ func LoadBlockExtra(root *cell.Cell) (tlb.BlockExtra, error) {
 		return tlb.BlockExtra{}, err
 	}
 	return blockExtra, nil
+}
+
+func visitKeyBlockValidatorConfig(root *cell.Cell) error {
+	extra, err := LoadBlockExtra(root)
+	if err != nil {
+		return err
+	}
+	if extra.Custom == nil || !extra.Custom.KeyBlock {
+		return nil
+	}
+	if extra.Custom.ConfigParams == nil || extra.Custom.ConfigParams.Config.Params == nil {
+		return fmt.Errorf("key block extra is missing config params")
+	}
+
+	cfg := tlb.BlockchainConfig{Root: extra.Custom.ConfigParams.Config.Params.AsCell()}
+	for _, id := range []uint32{
+		tlb.ConfigParamCatchainConfig,
+		tlb.ConfigParamPrevValidators,
+		tlb.ConfigParamPrevTempValidators,
+		tlb.ConfigParamCurrentValidators,
+		tlb.ConfigParamCurrentTempValidators,
+		tlb.ConfigParamNextValidators,
+		tlb.ConfigParamNextTempValidators,
+	} {
+		if err = visitConfigParam(cfg, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func visitConfigParam(cfg tlb.BlockchainConfig, id uint32) error {
+	param, err := cfg.GetParam(id)
+	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return VisitCellRecursive(param)
 }
 
 func VisitMcStateExtraInfo(info *cell.Cell) error {

@@ -118,6 +118,7 @@ type Node struct {
 	broadcastPipelineObserver       BroadcastPipelineObserver
 	shardBroadcastCache             *shardBroadcastBlockCache
 	shardCandidateCache             *shardBlockCandidateCache
+	blockFinalityCache              *blockFinalityCache
 	shardBroadcastWaiters           keyedBroadcastWaiters
 	masterchainNextBroadcastCache   *masterchainNextBroadcastCache
 	masterchainNextBroadcastWaiters keyedBroadcastWaiters
@@ -306,6 +307,7 @@ func New(opts Options) (*Node, error) {
 		blockReceivedHooks:            blockReceivedHooksEnabled(opts.BlockReceivedObserver),
 		shardBroadcastCache:           newShardBroadcastBlockCache(shardBroadcastBlockCacheTTL, shardBroadcastBlockCacheMaxBytes, shardBroadcastBlockCacheMaxItems),
 		shardCandidateCache:           newShardBlockCandidateCache(shardBlockCandidateCacheTTL, shardBlockCandidateCacheMaxBytes, shardBlockCandidateCacheMaxItems),
+		blockFinalityCache:            newBlockFinalityCache(blockFinalityCacheTTL, blockFinalityCacheMaxBytes, blockFinalityCacheMaxItems),
 		masterchainNextBroadcastCache: newMasterchainNextBroadcastCache(masterchainNextBroadcastCacheTTL, masterchainNextBroadcastCacheMaxBytes, masterchainNextBroadcastCacheMaxItems),
 		rebroadcastThrottleLast:       map[string]time.Time{},
 		rebroadcastFECSlots:           newRebroadcastFECSlotLimits(),

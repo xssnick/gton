@@ -48,6 +48,12 @@ func (testAcceptBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(contex
 	return nil
 }
 
+func (testAcceptBroadcastSignatureVerifier) CheckBlockFinalitySignatures(_ context.Context, req BlockFinalitySignatureCheck) (*BlockFinalitySignatureCheckResult, error) {
+	return &BlockFinalitySignatureCheckResult{
+		SignaturesVerifiedKey: []byte("test-finality"),
+	}, nil
+}
+
 func (testAcceptBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(_ context.Context, req ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {
 	return &ShardBlockDescription{
 		Block:         req.Block,
@@ -61,6 +67,10 @@ type testRejectBroadcastSignatureVerifier struct {
 
 func (v testRejectBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(context.Context, BlockBroadcastSignatureCheck) error {
 	return v.err
+}
+
+func (v testRejectBroadcastSignatureVerifier) CheckBlockFinalitySignatures(context.Context, BlockFinalitySignatureCheck) (*BlockFinalitySignatureCheckResult, error) {
+	return nil, v.err
 }
 
 func (v testRejectBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(context.Context, ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {

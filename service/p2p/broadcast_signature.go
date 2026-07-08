@@ -36,6 +36,21 @@ func (n *Node) checkBlockBroadcastSignatures(kind string, block ton.BlockIDExt, 
 	})
 }
 
+func (n *Node) checkBlockFinalitySignatures(kind string, block ton.BlockIDExt, signatures *blockproof.ValidatorSignatureSet) (*BlockFinalitySignatureCheckResult, error) {
+	if n.signatureVerifier == nil {
+		return nil, fmt.Errorf("broadcast signature verifier is not configured")
+	}
+
+	ctx, cancel := context.WithTimeout(n.runtimeContext(), broadcastSignatureTimeout)
+	defer cancel()
+
+	return n.signatureVerifier.CheckBlockFinalitySignatures(ctx, BlockFinalitySignatureCheck{
+		Kind:       kind,
+		Block:      block,
+		Signatures: signatures,
+	})
+}
+
 func (n *Node) validateShardDescriptionBroadcast(block ton.BlockIDExt, catchainSeqno int32, data []byte) (*ShardBlockDescription, error) {
 	if n.signatureVerifier == nil {
 		return nil, fmt.Errorf("broadcast signature verifier is not configured")

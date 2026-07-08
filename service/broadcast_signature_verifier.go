@@ -131,6 +131,35 @@ func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.Blo
 	return blockproof.CheckPreparedSignatures(req.Block, signatures, validators)
 }
 
+func (s *Service) CheckBlockFinalitySignatures(ctx context.Context, req p2p.BlockFinalitySignatureCheck) (*p2p.BlockFinalitySignatureCheckResult, error) {
+	if !req.Signatures.IsSimplex() {
+		return nil, fmt.Errorf("block finality broadcast %s has non-simplex validator signatures", storage.FormatBlockRef(req.Block))
+	}
+	if req.Block.Workchain == -1 && !req.Signatures.Final() {
+		return nil, fmt.Errorf("masterchain block %s has non-final validator signatures", storage.FormatBlockRef(req.Block))
+	}
+
+	validators, err := s.broadcastValidatorSetForSignatures(ctx, req.Block, req.Signatures.CatchainSeqno(), req.Signatures.ValidatorSetHash())
+	if err != nil {
+		return nil, err
+	}
+	if err = blockproof.CheckPreparedSignatures(req.Block, req.Signatures, validators); err != nil {
+		return nil, err
+	}
+
+	var signaturesCell *cell.Cell
+	if req.Block.Workchain == -1 {
+		signaturesCell, err = req.Signatures.FinalitySignaturesCell(validators)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &p2p.BlockFinalitySignatureCheckResult{
+		SignaturesCell:        signaturesCell,
+		SignaturesVerifiedKey: req.Signatures.ContentKey(req.Block),
+	}, nil
+}
+
 func (s *Service) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p.ShardDescriptionSignatureCheck) (*p2p.ShardBlockDescription, error) {
 	desc, err := parseShardTopBlockDescription(req.Block, req.CatchainSeqno, req.Data)
 	if err != nil {

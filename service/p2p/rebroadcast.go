@@ -32,6 +32,7 @@ var quietRebroadcastIntervals = map[string]time.Duration{
 	"tonNode.newBlockCandidateBroadcast":             250 * time.Millisecond,
 	"tonNode.newBlockCandidateBroadcastCompressed":   250 * time.Millisecond,
 	"tonNode.newBlockCandidateBroadcastCompressedV2": 250 * time.Millisecond,
+	blockFinalityBroadcastKind:                       250 * time.Millisecond,
 	"tonNode.newShardBlockBroadcast":                 500 * time.Millisecond,
 	"tonNode.externalMessageBroadcast":               100 * time.Millisecond,
 	"tonNode.ihrMessageBroadcast":                    100 * time.Millisecond,
@@ -121,7 +122,8 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 	switch kind {
 	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2",
 		"tonNode.newBlockCandidateBroadcast", "tonNode.newBlockCandidateBroadcastCompressed",
-		"tonNode.newBlockCandidateBroadcastCompressedV2":
+		"tonNode.newBlockCandidateBroadcastCompressedV2",
+		blockFinalityBroadcastKind:
 		return rebroadcastPlan{mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender}
 	case "tonNode.newShardBlockBroadcast":
 		if payloadLen <= ordinarySimpleBroadcastMaxSize {

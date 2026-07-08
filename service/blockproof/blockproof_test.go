@@ -1,6 +1,7 @@
 package blockproof
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
@@ -243,6 +244,56 @@ func TestPreparedValidatorSetCopiesValidatorKeys(t *testing.T) {
 
 	if err := CheckPreparedSignatures(block, signed, prepared); err != nil {
 		t.Fatalf("prepared validator set should not share validator keys: %v", err)
+	}
+}
+
+func TestValidatorSignatureSetFinalitySignaturesCellRoundTrip(t *testing.T) {
+	block := testBlockID(0, 83)
+	validators, privateKeys := testValidators(t, 4)
+	catchainSeqno := uint32(9)
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("validator set hash: %v", err)
+	}
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	candidate := testSimplexCandidate(t, block)
+	sessionID := bytes.Repeat([]byte{0x42}, 32)
+
+	base := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, nil, true, sessionID, 11, candidate)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	signatures := testSignatures(t, validators[:3], privateKeys[:3], payload)
+	signed := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, true, sessionID, 11, candidate)
+
+	signaturesCell, err := signed.FinalitySignaturesCell(prepared)
+	if err != nil {
+		t.Fatalf("signatures cell: %v", err)
+	}
+	parsed, err := ParseValidatorSignatureSetCell(signaturesCell)
+	if err != nil {
+		t.Fatalf("parse signatures cell: %v", err)
+	}
+	if !bytes.Equal(parsed.ContentKey(block), signed.ContentKey(block)) {
+		t.Fatalf("content key mismatch after round trip")
+	}
+	if err = CheckPreparedSignatures(block, parsed, prepared); err != nil {
+		t.Fatalf("check parsed signatures: %v", err)
+	}
+
+	approve := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, nil, false, sessionID, 11, candidate)
+	if _, err = approve.FinalitySignaturesCell(prepared); err == nil {
+		t.Fatal("non-final simplex signatures cell was accepted")
+	}
+
+	ordinary := NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, signatures)
+	if _, err = ordinary.FinalitySignaturesCell(prepared); err == nil {
+		t.Fatal("ordinary signatures cell was accepted as finality")
 	}
 }
 

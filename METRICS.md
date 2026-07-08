@@ -152,7 +152,8 @@ Common `direction` values for `gton_p2p_broadcasts_total` are `accepted` and
 
 Common `reason` values for `gton_p2p_broadcast_dropped_total` include `seen`,
 `invalid_payload`, `decode_failed`, `signature_parse_failed`, and
-`signature_check_failed`.
+`signature_check_failed`. Masterchain block broadcasts at or below the highest
+locally applied masterchain seqno use `already_applied`.
 
 `gton_p2p_broadcast_pipeline_stage_duration_seconds` intentionally has no block
 id, root hash, file hash, or peer label. `stage="fec_decode"` is measured inside
