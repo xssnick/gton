@@ -30,6 +30,7 @@ import (
 	funcsop "github.com/xssnick/tonutils-go/tvm/op/funcs"
 	stackop "github.com/xssnick/tonutils-go/tvm/op/stack"
 	"github.com/xssnick/tonutils-go/tvm/tuple"
+	vmcore "github.com/xssnick/tonutils-go/tvm/vm"
 )
 
 func TestHandleMasterchainInfoExtModeZero(t *testing.T) {
@@ -3498,7 +3499,7 @@ func TestRunMethodConfigRejectsUnsupportedGlobalVersion(t *testing.T) {
 		RootHash:  bytes.Repeat([]byte{0x21}, 32),
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
-	unsupportedVersion := uint32(tvm.MaxSupportedGlobalVersion + 1)
+	unsupportedVersion := uint32(vmcore.MaxSupportedGlobalVersion + 1)
 	stateRoot := testMasterStateWithConfig(t, master, map[int32]*cell.Cell{
 		int32(tlb.ConfigParamGlobalVersion): testGlobalVersionCell(t, unsupportedVersion),
 	})
@@ -5960,7 +5961,7 @@ func testStoragePricesConfigCell(t *testing.T) *cell.Cell {
 	t.Helper()
 
 	// Config param 18 is Hashmap 32 ConfigStoragePrices keyed by valid_since;
-	// tvm.PrepareConfig requires valid #cc entries whose valid_since equals the
+	// tvm.PrepareBlockchainConfig requires valid #cc entries whose valid_since equals the
 	// key. Two windows (since 1000 and 2000) so now=1500 selects the 1000 one.
 	dict := cell.NewDict(32)
 	for _, since := range []uint32{1000, 2000} {

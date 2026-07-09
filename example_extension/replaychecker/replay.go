@@ -456,10 +456,10 @@ func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32,
 		Msg("replaying block transactions")
 
 	// Per-account execution is independent: each account's inbound messages are
-	// fixed by the block body, and the *BlockContext / *PreparedConfig are
-	// immutable and shared. Run accounts over a worker pool; each account's tx
-	// chain stays sequential inside its lane and uses its own TVM handle
-	// (WithGlobalVersion returns a shallow copy sharing immutable dispatch tables).
+	// fixed by the block body, and the *BlockContext / *PreparedBlockchainConfig
+	// are immutable and shared. Run accounts over a worker pool; each account's
+	// tx chain stays sequential inside its lane while sharing the immutable TVM
+	// dispatch tables.
 	workers := runtime.GOMAXPROCS(0)
 	if workers > len(accounts) {
 		workers = len(accounts)
@@ -476,10 +476,7 @@ func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32,
 	)
 
 	lane := func() error {
-		machine, err := v.tvm.WithGlobalVersion(execCtx.globalVersion)
-		if err != nil {
-			return err
-		}
+		machine := v.tvm
 		for {
 			idx := int(atomic.AddInt64(&next, 1)) - 1
 			if idx >= len(accounts) {
@@ -491,7 +488,7 @@ func (v *replayValidator) validateBlock(ctx context.Context, masterSeqno uint32,
 			default:
 			}
 
-			elapsed, txs, err := v.validateAccountBlock(masterSeqno, previousViews, expectedView, block, execCtx, &machine, accounts[idx], scope)
+			elapsed, txs, err := v.validateAccountBlock(masterSeqno, previousViews, expectedView, block, execCtx, machine, accounts[idx], scope)
 			atomic.AddInt64(&totalTxs, int64(txs))
 			atomic.AddInt64(&totalElapsed, int64(elapsed))
 			if err != nil {
@@ -1153,7 +1150,7 @@ func accountKey(accountID []byte) *cell.Cell {
 }
 
 // ------------------------------------------------------------------------
-// config epoch cache: one *tvm.PreparedConfig per config root hash (bounded LRU)
+// config epoch cache: one *tvm.PreparedBlockchainConfig per config root hash (bounded LRU)
 // ------------------------------------------------------------------------
 
 type configEpochCache struct {
@@ -1172,7 +1169,7 @@ type configEpochEntry struct {
 // configEpoch is the immutable per-config-epoch state derived once from a config
 // root: the prepared tvm config and its global version.
 type configEpoch struct {
-	prepared      *tvm.PreparedConfig
+	prepared      *tvm.PreparedBlockchainConfig
 	globalVersion int
 }
 
@@ -1271,14 +1268,11 @@ func (c *configEpochCache) forRoot(configRoot *cell.Cell) (*configEpoch, error) 
 }
 
 func buildConfigEpoch(configRoot *cell.Cell) (*configEpoch, error) {
-	prepared, err := tvm.PrepareConfig(configRoot)
+	prepared, err := tvm.PrepareBlockchainConfig(configRoot)
 	if err != nil {
 		return nil, err
 	}
 	globalVersion := int(prepared.GlobalVersion())
-	if globalVersion < tvm.MinSupportedGlobalVersion {
-		return nil, fmt.Errorf("unsupported global version %d, minimum supported is %d", globalVersion, tvm.MinSupportedGlobalVersion)
-	}
 	return &configEpoch{
 		prepared:      prepared,
 		globalVersion: globalVersion,

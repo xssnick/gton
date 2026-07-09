@@ -25,7 +25,7 @@ const liveConfigEpochCacheLimit = 4
 // expose. It is built once per config epoch and shared by every BlockView
 // whose master state carries the same config root.
 type liveConfigEpoch struct {
-	prepared     *tvm.PreparedConfig
+	prepared     *tvm.PreparedBlockchainConfig
 	precompiled  map[cell.Hash]uint64
 	extMsgLimits ExternalMessageSizeLimits
 }
@@ -87,7 +87,7 @@ func buildLiveConfigEpoch(configRoot *cell.Cell) (*liveConfigEpoch, error) {
 		return nil, err
 	}
 
-	prepared, err := tvm.PrepareConfig(root)
+	prepared, err := tvm.PrepareBlockchainConfig(root)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +137,7 @@ func (e *liveConfigEpoch) precompiledGas(code *cell.Cell) *big.Int {
 	return new(big.Int).SetUint64(gas)
 }
 
-// liveConfigPrecompiledContracts mirrors the precompiled map PreparedConfig
+// liveConfigPrecompiledContracts mirrors the precompiled map PreparedBlockchainConfig
 // holds internally: the run-method c7 needs the gas usage as an explicit
 // value, which the tvm does not expose.
 func liveConfigPrecompiledContracts(root *cell.Cell) (map[cell.Hash]uint64, error) {
@@ -169,13 +169,12 @@ func liveConfigPrecompiledContracts(root *cell.Cell) (map[cell.Hash]uint64, erro
 }
 
 type RunMethodConfigInfo struct {
-	Prepared      *tvm.PreparedConfig
-	Root          *cell.Cell
-	Present       bool
-	GlobalVersion int
-	PrevBlocks    any
-	Unpacked      any
-	Precompiled   *big.Int
+	Prepared    *tvm.PreparedBlockchainConfig
+	Root        *cell.Cell
+	Present     bool
+	PrevBlocks  any
+	Unpacked    any
+	Precompiled *big.Int
 }
 
 // runMethodBaseConfig is the per-master-block execution base: the shared
@@ -225,13 +224,12 @@ func runMethodConfigFromBase(base *runMethodBaseConfig, now uint32, code *cell.C
 	}
 
 	return RunMethodConfigInfo{
-		Prepared:      base.epoch.prepared,
-		Root:          base.epoch.prepared.Root(),
-		Present:       true,
-		GlobalVersion: int(base.epoch.prepared.GlobalVersion()),
-		PrevBlocks:    base.prevBlocks,
-		Unpacked:      unpacked,
-		Precompiled:   base.epoch.precompiledGas(code),
+		Prepared:    base.epoch.prepared,
+		Root:        base.epoch.prepared.Root(),
+		Present:     true,
+		PrevBlocks:  base.prevBlocks,
+		Unpacked:    unpacked,
+		Precompiled: base.epoch.precompiledGas(code),
 	}, nil
 }
 

@@ -66,7 +66,11 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 	account, err := liveview.LoadRunMethodAccountState(info.accountCell)
 	if err != nil {
 		if query.Mode&2 != 0 {
-			result.StateProof, err = liveview.RunMethodInactiveAccountProof(s.tvm, info.accountCell)
+			result.StateProof, err = liveview.RunMethodInactiveAccountProof(s.tvm, liveview.RunMethodSource{
+				Master:      info.master,
+				MasterState: info.masterState,
+				View:        info.masterCache,
+			}, info.genUTime, info.accountCell)
 			if err != nil {
 				return errorResponse(err, "cannot create account state proof")
 			}

@@ -222,7 +222,7 @@ func (f *BlockView) RunMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Ce
 }
 
 // BlockContext builds an immutable tvm execution context for this block's
-// master config epoch: the prepared config, prev-blocks tuple and the global
+// master config epoch: the prepared blockchain config, prev-blocks tuple and the global
 // libraries. Account-scoped libraries come from the prepared account, so only
 // the global library collection is attached here. The returned context is
 // safe to share and reuse across accounts and messages of the same block.

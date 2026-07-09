@@ -8,7 +8,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/tonutils-go v1.17.1-0.20260708062554-cc538c21778e
+	github.com/xssnick/tonutils-go v1.17.1-0.20260709142412-16e047642e6b
 	golang.org/x/sys v0.46.0
 )
 

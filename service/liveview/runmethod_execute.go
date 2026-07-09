@@ -91,8 +91,6 @@ func RunMethodStackValues(stack *vmcore.Stack) ([]any, error) {
 
 func ExecuteRunMethod(vm *tvm.TVM, account tlb.AccountState, req RunMethodRequest) (RunMethodExecutionResult, error) {
 	view := req.Source.View
-	master := req.Source.Master
-	masterState := req.Source.MasterState
 	addr := req.Address
 	accountRoot := req.AccountRoot
 	stack := req.Stack
@@ -103,13 +101,7 @@ func ExecuteRunMethod(vm *tvm.TVM, account tlb.AccountState, req RunMethodReques
 	code := stateInit.Code
 	data := stateInit.Data
 
-	var config RunMethodConfigInfo
-	var err error
-	if view != nil {
-		config, err = view.RunMethodConfig(now, code)
-	} else {
-		config, err = RunMethodConfig(master, masterState, now, code)
-	}
+	config, err := runMethodExecutionConfig(req.Source, now, code)
 	if err != nil {
 		return RunMethodExecutionResult{}, fmt.Errorf("load masterchain config: %w", err)
 	}
@@ -123,7 +115,7 @@ func ExecuteRunMethod(vm *tvm.TVM, account tlb.AccountState, req RunMethodReques
 	if view != nil {
 		libraries, err = view.RunMethodLibraries(accountLibs)
 	} else {
-		libraries, err = RunMethodLibraries(masterState, accountLibs)
+		libraries, err = RunMethodLibraries(req.Source.MasterState, accountLibs)
 	}
 	if err != nil {
 		return RunMethodExecutionResult{}, fmt.Errorf("load libraries: %w", err)
@@ -147,9 +139,8 @@ func ExecuteRunMethod(vm *tvm.TVM, account tlb.AccountState, req RunMethodReques
 	}
 
 	execConfig := tvm.ExecutionConfig{
-		Libraries:        libraries,
-		GlobalVersion:    config.GlobalVersion,
-		GlobalVersionSet: true,
+		Libraries: libraries,
+		Config:    config.Prepared,
 	}
 
 	if proof {
@@ -175,14 +166,29 @@ func ExecuteRunMethod(vm *tvm.TVM, account tlb.AccountState, req RunMethodReques
 	}, nil
 }
 
-func RunMethodInactiveAccountProof(vm *tvm.TVM, accountRoot *cell.Cell) (*cell.Cell, error) {
+func runMethodExecutionConfig(source RunMethodSource, now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
+	if source.View != nil {
+		return source.View.RunMethodConfig(now, code)
+	}
+	return RunMethodConfig(source.Master, source.MasterState, now, code)
+}
+
+func RunMethodInactiveAccountProof(vm *tvm.TVM, source RunMethodSource, now uint32, accountRoot *cell.Cell) (*cell.Cell, error) {
+	config, err := runMethodExecutionConfig(source, now, nil)
+	if err != nil {
+		return nil, fmt.Errorf("load masterchain config: %w", err)
+	}
+
 	res, err := vm.ExecuteGetMethod(
 		nil,
 		nil,
 		tuple.Tuple{},
 		vmcore.GasWithLimit(RunMethodGasLimit),
 		vmcore.NewStack(),
-		tvm.ExecutionConfig{AccountRoot: accountRoot},
+		tvm.ExecutionConfig{
+			AccountRoot: accountRoot,
+			Config:      config.Prepared,
+		},
 	)
 	if err != nil {
 		return nil, err

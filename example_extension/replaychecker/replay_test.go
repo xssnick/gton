@@ -183,7 +183,7 @@ func fatBlockExecutionContext(tb testing.TB, fixture fatFixture, block *tlb.Bloc
 	now := fixture.TransactionConfigs[0].Now
 	blockLT := fixture.TransactionConfigs[0].BlockLT
 
-	prepared, err := tvm.PrepareConfig(fatCell(tb, fixture.Config.ConfigRootBOCBase64))
+	prepared, err := tvm.PrepareBlockchainConfig(fatCell(tb, fixture.Config.ConfigRootBOCBase64))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func fatBlockExecutionContext(tb testing.TB, fixture fatFixture, block *tlb.Bloc
 // cell hash and the final account root hash matched the applied state.
 //
 // This exercises the whole migrated hot path against real data: the config
-// epoch cache / prepared config, the per-block BlockContext with derived
+// epoch cache / prepared blockchain config, the per-block BlockContext with derived
 // per-account rand seeds and per-tx logical time, PrepareAccount without a BOC
 // roundtrip, single-parse chaining through NextAccount, the AccountStorageStat
 // carry, and the happy-path compare.
@@ -281,7 +281,7 @@ func TestValidateAccountBlockDetectsDivergence(t *testing.T) {
 
 // TestValidateAccountBlockConcurrentLanes runs the same account set through the
 // parallel lanes design (many goroutines, one shared immutable BlockContext /
-// PreparedConfig, per-lane TVM handle) and asserts identical results to the
+// PreparedBlockchainConfig, per-lane TVM handle) and asserts identical results to the
 // sequential run. Run under -race to prove the lanes are data-race free.
 func TestValidateAccountBlockConcurrentLanes(t *testing.T) {
 	loaded := loadFatFixture(t)
@@ -317,9 +317,6 @@ func TestValidateAccountBlockConcurrentLanes(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			machine := tvm.NewTVM()
-			if m, err := machine.WithGlobalVersion(loaded.execCtx.globalVersion); err == nil {
-				machine = &m
-			}
 			for {
 				idx := nextIdx()
 				if idx >= len(loaded.accounts) {

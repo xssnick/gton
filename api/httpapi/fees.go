@@ -110,9 +110,9 @@ func (s *Server) handleEstimateFee(ctx context.Context, params requestParams) (a
 		return nil, internalError("cannot prepare message: " + err.Error())
 	}
 	res, err := s.tvm.EmulateTransaction(block, account, message, tvm.TransactionOptions{
-		LogicalTime:         int64(info.genLT + 2),
-		RandSeed:            randomSeed(),
-		ChksigAlwaysSucceed: ignoreChkSig,
+		LogicalTime:                 int64(info.genLT + 2),
+		RandSeed:                    randomSeed(),
+		SignatureCheckAlwaysSucceed: ignoreChkSig,
 	})
 	if err != nil {
 		return nil, internalError("cannot estimate fee: " + err.Error())
