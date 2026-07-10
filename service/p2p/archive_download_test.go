@@ -73,10 +73,10 @@ func TestCompletedArchiveDownloadKeepsStickyPeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	peer := &overlayPeer{id: testPeerID("slow-archive"), addr: "slow-archive", alive: true}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
@@ -118,12 +118,12 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	peerID := testPeerID("archive-info")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:   discardLogger(),
 		node:  node,
 		spec:  overlaySpec{ShortID: []byte{1}},
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
@@ -188,11 +188,11 @@ func TestArchiveInfoPinsPeerAndSeedProbeIsOptional(t *testing.T) {
 func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
 		spec: overlaySpec{ShortID: []byte{1}},
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
@@ -234,11 +234,11 @@ func TestArchiveHedgedDownloadReturnsFastHedgePeer(t *testing.T) {
 func TestArchiveComparativeHedgeReplacesStickyWithFasterPeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
 		spec: overlaySpec{ShortID: []byte{1}},
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
@@ -275,11 +275,11 @@ func TestArchiveComparativeHedgeReplacesStickyWithFasterPeer(t *testing.T) {
 func TestArchiveComparativeHedgeRacesSmallPackSeedProbe(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
 		spec: overlaySpec{ShortID: []byte{1}},
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()

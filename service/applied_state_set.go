@@ -87,7 +87,7 @@ func (s *appliedStateSet) completeCheckpoint(checkpoint appliedStateCheckpoint) 
 
 	for idx, key := range checkpoint.keys {
 		if entry, ok := s.states[key]; ok {
-			if len(checkpoint.versions) == len(checkpoint.keys) && entry.version != checkpoint.versions[idx] {
+			if entry.version != checkpoint.versions[idx] {
 				continue
 			}
 			s.artifactBytes -= entry.artifact.bytes

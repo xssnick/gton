@@ -1,7 +1,6 @@
 package node
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -59,9 +58,6 @@ func httpapiOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.Runt
 		Enabled:        cfg.HTTPAPI.Enabled,
 		ListenAddr:     listenAddr,
 		RequestTimeout: runtimeOpts.HTTPAPI.RequestTimeout,
-	}
-	if opts.Enabled && opts.ListenAddr == "" {
-		return httpapiOptions{}, fmt.Errorf("http_api.listen_addr is required when http_api.enabled is true")
 	}
 	return opts, nil
 }

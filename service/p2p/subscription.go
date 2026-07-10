@@ -83,16 +83,6 @@ func (s *overlaySubscription) setActive(active bool, deleteAt time.Time) bool {
 	return true
 }
 
-func (s *overlaySubscription) inactiveExpiresAt() (time.Time, bool) {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	if !s.inactive || s.inactiveDeleteAt.IsZero() {
-		return time.Time{}, false
-	}
-	return s.inactiveDeleteAt, true
-}
-
 func (s *overlaySubscription) inactiveExpired(now time.Time) bool {
 	s.mx.Lock()
 	defer s.mx.Unlock()
@@ -307,11 +297,7 @@ func (s *overlaySubscription) runSeedFromDHT(ctx context.Context, targetPeers in
 		defer s.finishSeedFromDHT()
 		s.seedFromDHT(ctx, targetPeers)
 	}
-	if s.node != nil {
-		s.node.runAsync(run)
-		return
-	}
-	go run()
+	s.node.runAsync(run)
 }
 
 func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay time.Duration) {
@@ -323,16 +309,11 @@ func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay tim
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 
-		var nodeDone <-chan struct{}
-		if s.node != nil {
-			nodeDone = s.node.runCtx.Done()
-		}
-
 		select {
 		case <-ctx.Done():
 			s.clearScheduledSeedFromDHT()
 			return
-		case <-nodeDone:
+		case <-s.node.runCtx.Done():
 			s.clearScheduledSeedFromDHT()
 			return
 		case <-timer.C:
@@ -345,11 +326,7 @@ func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay tim
 
 		s.startSeedFromDHTTarget(ctx, targetPeers)
 	}
-	if s.node != nil {
-		s.node.runAsync(run)
-		return
-	}
-	go run()
+	s.node.runAsync(run)
 }
 
 func (s *overlaySubscription) clearScheduledSeedFromDHT() {
@@ -367,7 +344,7 @@ func (s *overlaySubscription) finishSeedFromDHT() {
 }
 
 func (s *overlaySubscription) startSeedFromFixedNodes(ctx context.Context) {
-	if !s.isActive() || s.node == nil || s.node.dht == nil {
+	if !s.isActive() || s.node.dht == nil {
 		return
 	}
 
@@ -492,7 +469,7 @@ type overlayNodeIdentity struct {
 }
 
 func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) {
-	if s.node == nil || s.node.dht == nil {
+	if s.node.dht == nil {
 		return
 	}
 	if !s.isActive() {
@@ -697,7 +674,7 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 }
 
 func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
-	if s.node == nil || s.node.dht == nil || !s.isActive() {
+	if s.node.dht == nil || !s.isActive() {
 		return
 	}
 	if s.aliveKnownPeerCount() >= s.peerLimit()-1 {
@@ -903,9 +880,6 @@ func (s *overlaySubscription) peerLimit() int {
 }
 
 func (s *overlaySubscription) protectedPeerIDs() map[PeerID]struct{} {
-	if s.node == nil {
-		return nil
-	}
 	return s.node.protectedPeerIDs()
 }
 
@@ -986,7 +960,7 @@ func (s *overlaySubscription) notifyPeersChangedLocked() {
 }
 
 func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
-	if s.node == nil || peer == nil || !s.isActive() {
+	if peer == nil || !s.isActive() {
 		return
 	}
 	if !peer.tryBeginWarmup() {
@@ -1063,11 +1037,7 @@ func (s *overlaySubscription) startPingPeers(ctx context.Context) {
 }
 
 func (s *overlaySubscription) runMaintenanceAsync(fn func()) {
-	if s.node != nil {
-		s.node.runAsync(fn)
-		return
-	}
-	go fn()
+	s.node.runAsync(fn)
 }
 
 func (s *overlaySubscription) beginRefreshPeers() bool {

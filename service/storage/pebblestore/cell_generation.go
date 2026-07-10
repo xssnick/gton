@@ -407,16 +407,6 @@ func (s *Store) openCellGeneration(ctx context.Context, generation uint64) error
 	return nil
 }
 
-func (s *Store) AbortCellGeneration(ctx context.Context, generation uint64) error {
-	if err := s.deleteCellGenerationMigrationProgress(ctx, generation); err != nil {
-		return err
-	}
-	if err := s.clearPendingCellGeneration(ctx, generation); err != nil {
-		return err
-	}
-	return s.closeAndRemoveCellGeneration(ctx, generation, false)
-}
-
 func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64) error {
 	select {
 	case <-ctx.Done():
@@ -491,24 +481,17 @@ func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64
 	return nil
 }
 
-func (s *Store) DeleteCellGeneration(ctx context.Context, generation uint64) error {
+func (s *Store) CleanupCellGeneration(ctx context.Context, generation uint64) error {
 	if err := s.deleteCellGenerationMigrationProgress(ctx, generation); err != nil {
 		return err
 	}
-	if err := s.closeAndRemoveCellGeneration(ctx, generation, false); err != nil {
+	if err := s.closeAndRemoveCellGeneration(ctx, generation); err != nil {
 		return err
 	}
 	return s.removeRetiredCellGeneration(ctx, generation)
 }
 
-func (s *Store) CleanupCellGeneration(ctx context.Context, generation uint64) error {
-	if err := s.DeleteCellGeneration(ctx, generation); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) CleanupRetiredCellGenerations(ctx context.Context) error {
+func (s *Store) cleanupRetiredCellGenerations(ctx context.Context) error {
 	retired := s.retiredCellGenerationSnapshot()
 	for _, generation := range retired {
 		if err := s.CleanupCellGeneration(ctx, generation); err != nil {
@@ -547,7 +530,7 @@ func (s *Store) removeCellGenerationDirs(generation uint64) error {
 	return err
 }
 
-func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uint64, allowActive bool) error {
+func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uint64) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -565,7 +548,7 @@ func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uin
 		s.mu.Unlock()
 		return errPebbleClosed
 	}
-	if !allowActive && generation == s.activeCellGeneration {
+	if generation == s.activeCellGeneration {
 		s.mu.Unlock()
 		return fmt.Errorf("cannot remove active cell generation %d", generation)
 	}
@@ -616,48 +599,6 @@ func (s *Store) retiredCellGenerationSnapshot() []uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneUint64Slice(s.retiredGenerations)
-}
-
-func (s *Store) clearPendingCellGeneration(ctx context.Context, generation uint64) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	db, err := s.acquireHotDB(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.releaseHotDB()
-
-	s.hotWriteMu.Lock()
-	defer s.hotWriteMu.Unlock()
-
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return errPebbleClosed
-	}
-	if s.pendingCellMigration == nil || s.pendingCellMigration.generation != generation {
-		s.mu.Unlock()
-		return nil
-	}
-
-	manifest := s.manifestLocked()
-	manifest.pending = nil
-	s.mu.Unlock()
-
-	if err := db.Set(hotKeyCellGenerationManifest(), encodeCellGenerationManifest(manifest), pebble.Sync); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	if s.pendingCellMigration != nil && s.pendingCellMigration.generation == generation {
-		s.pendingCellMigration = nil
-	}
-	s.mu.Unlock()
-	return nil
 }
 
 func (s *Store) removeRetiredCellGeneration(ctx context.Context, generation uint64) error {

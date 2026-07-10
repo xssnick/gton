@@ -24,35 +24,6 @@ type RuntimeOptions struct {
 	HTTPAPI                          HTTPAPIOptions
 }
 
-type tonRuntimeOptions struct {
-	SyncBefore              time.Duration
-	SyncUntil               uint32
-	ArchiveFromZero         bool
-	StateTTL                time.Duration
-	ArchiveTTL              time.Duration
-	NextCheckpointBlocks    uint32
-	ArchiveCheckpointBlocks uint32
-	CheckpointBytes         uint64
-	SyncBackpressureWindows uint32
-}
-
-type storageRuntimeOptions struct {
-	Dir                              string
-	CellTotalCacheSize               int64
-	DecodedCellCache                 DecodedCellCacheOptions
-	CellShardMemTableSize            int
-	CellMemTableStopWritesThreshold  int
-	LargeBOCShardReadWorkers         int
-	PersistentStateLargeBOCBatchSize int
-	StateSerializeOnePass            bool
-	ArtifactFileMaxOpen              int
-}
-
-type liteSendMessageBroadcastOptions struct {
-	Capacity LiteSendMessageBroadcastCapacity
-	Fanout   int
-}
-
 func (cfg Config) RuntimeOptions(nodeOpts gton.NodeOptions) (RuntimeOptions, error) {
 	p2pOpts, err := p2pOptionsFromConfig(cfg)
 	if err != nil {
@@ -72,12 +43,15 @@ func (cfg Config) RuntimeOptions(nodeOpts gton.NodeOptions) (RuntimeOptions, err
 	}
 	nodeOpts.Storage = storageOpts
 
-	tonOpts, err := tonRuntimeOptionsFromConfig(cfg)
-	if err != nil {
+	if err = applyTONOptionsFromConfig(&nodeOpts, cfg); err != nil {
 		return RuntimeOptions{}, err
 	}
 
-	liteSendOpts, err := liteSendMessageBroadcastOptionsFromConfig(cfg.Lite)
+	liteSendCapacity, err := liteSendMessageBroadcastCapacityFromConfig(cfg.Lite)
+	if err != nil {
+		return RuntimeOptions{}, err
+	}
+	liteSendFanout, err := liteSendMessageBroadcastFanoutFromConfig(cfg.Lite)
 	if err != nil {
 		return RuntimeOptions{}, err
 	}
@@ -87,123 +61,94 @@ func (cfg Config) RuntimeOptions(nodeOpts gton.NodeOptions) (RuntimeOptions, err
 		return RuntimeOptions{}, err
 	}
 
-	nodeOpts.SyncBefore = tonOpts.SyncBefore
-	nodeOpts.SyncUntil = tonOpts.SyncUntil
-	nodeOpts.ArchiveFromZero = tonOpts.ArchiveFromZero
-	nodeOpts.StateTTL = tonOpts.StateTTL
-	nodeOpts.ArchiveTTL = tonOpts.ArchiveTTL
-	nodeOpts.NextCheckpointBlocks = tonOpts.NextCheckpointBlocks
-	nodeOpts.ArchiveCheckpointBlocks = tonOpts.ArchiveCheckpointBlocks
-	nodeOpts.CheckpointBytes = tonOpts.CheckpointBytes
-	nodeOpts.SyncBackpressureWindows = tonOpts.SyncBackpressureWindows
 	nodeOpts.DisableStateSerialization = cfg.DisableStateSerialization
 
 	return RuntimeOptions{
 		Node:                             nodeOpts,
 		GlobalConfigPath:                 globalConfigPath(cfg.TON),
-		LiteSendMessageBroadcastCapacity: liteSendOpts.Capacity,
-		LiteSendMessageBroadcastFanout:   liteSendOpts.Fanout,
+		LiteSendMessageBroadcastCapacity: liteSendCapacity,
+		LiteSendMessageBroadcastFanout:   liteSendFanout,
 		HTTPAPI:                          httpAPIOpts,
 	}, nil
 }
 
+func applyTONOptionsFromConfig(nodeOpts *gton.NodeOptions, cfg Config) error {
+	syncBefore, archiveFromZero, err := syncBeforeFromConfig(cfg.TON)
+	if err != nil {
+		return err
+	}
+	syncUntil, err := uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil)
+	if err != nil {
+		return err
+	}
+	stateTTL, err := durationSeconds("ton.state_ttl", cfg.TON.StateTTL, true)
+	if err != nil {
+		return err
+	}
+	archiveTTL, err := durationSeconds("ton.archive_ttl", cfg.TON.ArchiveTTL, true)
+	if err != nil {
+		return err
+	}
+	nextCheckpointBlocks, err := uint32ConfigValue("ton.next_checkpoint_blocks", cfg.TON.NextCheckpointBlocks, uint32(DefaultNextCheckpointBlocks))
+	if err != nil {
+		return err
+	}
+	archiveCheckpointBlocks, err := uint32ConfigValue("ton.archive_checkpoint_blocks", cfg.TON.ArchiveCheckpointBlocks, uint32(DefaultArchiveCheckpointBlocks))
+	if err != nil {
+		return err
+	}
+	checkpointBytes, err := checkpointBytesFromConfig(cfg.TON)
+	if err != nil {
+		return err
+	}
+	syncBackpressureWindows, err := uint32ConfigValue("ton.sync_backpressure_windows", cfg.TON.SyncBackpressureWindows, uint32(DefaultSyncBackpressureWindows))
+	if err != nil {
+		return err
+	}
+
+	nodeOpts.SyncBefore = syncBefore
+	nodeOpts.SyncUntil = syncUntil
+	nodeOpts.ArchiveFromZero = archiveFromZero
+	nodeOpts.StateTTL = stateTTL
+	nodeOpts.ArchiveTTL = archiveTTL
+	nodeOpts.NextCheckpointBlocks = nextCheckpointBlocks
+	nodeOpts.ArchiveCheckpointBlocks = archiveCheckpointBlocks
+	nodeOpts.CheckpointBytes = checkpointBytes
+	nodeOpts.SyncBackpressureWindows = syncBackpressureWindows
+	return nil
+}
+
 func storageOptionsFromConfig(cfg Config) (gton.StorageOptions, error) {
-	opts, err := storageRuntimeOptionsFromConfig(cfg)
+	cellTotalCacheSize, err := cellTotalCacheSizeFromConfig(cfg.Storage)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
+	decodedCellCacheOpts, err := decodedCellCacheOptionsFromConfig(cfg.Storage)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
+	cellShardMemTableSize, err := intConfigValue("storage.cell_shard_memtable_size", cfg.Storage.CellShardMemTableSize, DefaultCellShardMemTable)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
+	cellMemTableStopWritesThreshold, err := intConfigValue("storage.cell_memtable_stop_writes_threshold", cfg.Storage.CellMemTableStopWritesThreshold, DefaultCellMemTableStopWritesThreshold)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
+	largeBOCShardReadWorkers, err := intConfigValue("storage.large_boc_shard_read_workers", cfg.Storage.LargeBOCShardReadWorkers, DefaultLargeBOCShardReadWorkers)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
+	persistentStateLargeBOCBatchSize, err := intConfigValue("storage.persistent_state_large_boc_batch_size", cfg.Storage.PersistentStateLargeBOCBatchSize, DefaultPersistentStateLargeBOCBatchSize)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
+	artifactFileMaxOpen, err := intConfigValue("storage.artifact_file_max_open", cfg.Storage.ArtifactFileMaxOpen, DefaultArtifactFileMaxOpen)
 	if err != nil {
 		return gton.StorageOptions{}, err
 	}
 
 	return gton.StorageOptions{
-		Dir:                              opts.Dir,
-		CellTotalCacheSize:               opts.CellTotalCacheSize,
-		DecodedCellCache:                 decodedCellCacheOptions(opts.DecodedCellCache),
-		CellShardMemTableSize:            opts.CellShardMemTableSize,
-		CellMemTableStopWritesThreshold:  opts.CellMemTableStopWritesThreshold,
-		LargeBOCShardReadWorkers:         opts.LargeBOCShardReadWorkers,
-		PersistentStateLargeBOCBatchSize: opts.PersistentStateLargeBOCBatchSize,
-		StateSerializeOnePass:            opts.StateSerializeOnePass,
-		ArtifactFileMaxOpen:              opts.ArtifactFileMaxOpen,
-	}, nil
-}
-
-func tonRuntimeOptionsFromConfig(cfg Config) (tonRuntimeOptions, error) {
-	syncBefore, archiveFromZero, err := syncBeforeFromConfig(cfg.TON)
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	syncUntil, err := uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil)
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	stateTTL, err := durationSeconds("ton.state_ttl", cfg.TON.StateTTL, true)
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	archiveTTL, err := durationSeconds("ton.archive_ttl", cfg.TON.ArchiveTTL, true)
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	nextCheckpointBlocks, err := uint32ConfigValue("ton.next_checkpoint_blocks", cfg.TON.NextCheckpointBlocks, uint32(DefaultNextCheckpointBlocks))
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	archiveCheckpointBlocks, err := uint32ConfigValue("ton.archive_checkpoint_blocks", cfg.TON.ArchiveCheckpointBlocks, uint32(DefaultArchiveCheckpointBlocks))
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	checkpointBytes, err := checkpointBytesFromConfig(cfg.TON)
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-	syncBackpressureWindows, err := uint32ConfigValue("ton.sync_backpressure_windows", cfg.TON.SyncBackpressureWindows, uint32(DefaultSyncBackpressureWindows))
-	if err != nil {
-		return tonRuntimeOptions{}, err
-	}
-
-	return tonRuntimeOptions{
-		SyncBefore:              syncBefore,
-		SyncUntil:               syncUntil,
-		ArchiveFromZero:         archiveFromZero,
-		StateTTL:                stateTTL,
-		ArchiveTTL:              archiveTTL,
-		NextCheckpointBlocks:    nextCheckpointBlocks,
-		ArchiveCheckpointBlocks: archiveCheckpointBlocks,
-		CheckpointBytes:         checkpointBytes,
-		SyncBackpressureWindows: syncBackpressureWindows,
-	}, nil
-}
-
-func storageRuntimeOptionsFromConfig(cfg Config) (storageRuntimeOptions, error) {
-	cellTotalCacheSize, err := cellTotalCacheSizeFromConfig(cfg.Storage)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-	decodedCellCacheOpts, err := decodedCellCacheOptionsFromConfig(cfg.Storage)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-	cellShardMemTableSize, err := intConfigValue("storage.cell_shard_memtable_size", cfg.Storage.CellShardMemTableSize, DefaultCellShardMemTable)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-	cellMemTableStopWritesThreshold, err := intConfigValue("storage.cell_memtable_stop_writes_threshold", cfg.Storage.CellMemTableStopWritesThreshold, DefaultCellMemTableStopWritesThreshold)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-	largeBOCShardReadWorkers, err := intConfigValue("storage.large_boc_shard_read_workers", cfg.Storage.LargeBOCShardReadWorkers, DefaultLargeBOCShardReadWorkers)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-	persistentStateLargeBOCBatchSize, err := intConfigValue("storage.persistent_state_large_boc_batch_size", cfg.Storage.PersistentStateLargeBOCBatchSize, DefaultPersistentStateLargeBOCBatchSize)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-	artifactFileMaxOpen, err := intConfigValue("storage.artifact_file_max_open", cfg.Storage.ArtifactFileMaxOpen, DefaultArtifactFileMaxOpen)
-	if err != nil {
-		return storageRuntimeOptions{}, err
-	}
-
-	return storageRuntimeOptions{
 		Dir:                              strings.TrimSpace(cfg.Storage.Dir),
 		CellTotalCacheSize:               cellTotalCacheSize,
 		DecodedCellCache:                 decodedCellCacheOpts,
@@ -273,31 +218,31 @@ func cellTotalCacheSizeFromConfig(cfg Storage) (int64, error) {
 	return cfg.CellTotalCacheSize, nil
 }
 
-func decodedCellCacheOptionsFromConfig(cfg Storage) (DecodedCellCacheOptions, error) {
-	opts := DecodedCellCacheOptions{
+func decodedCellCacheOptionsFromConfig(cfg Storage) (gton.DecodedCellCacheOptions, error) {
+	opts := gton.DecodedCellCacheOptions{
 		Enabled:       cfg.DecodedCellCacheEnabled,
 		BytesPerEntry: cfg.DecodedCellCacheBytesPerEntry,
 	}
 	if cfg.DecodedCellCacheShards < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards cannot be negative")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards cannot be negative")
 	}
 	if cfg.DecodedCellCacheBytesPerEntry < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_bytes_per_entry cannot be negative")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_bytes_per_entry cannot be negative")
 	}
 	if cfg.DecodedCellCacheMinEntries < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot be negative")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot be negative")
 	}
 	if cfg.DecodedCellCacheMaxEntries < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries cannot be negative")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries cannot be negative")
 	}
 	if cfg.DecodedCellCacheMinEntries > int64(int(^uint(0)>>1)) {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries is too large")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries is too large")
 	}
 	if cfg.DecodedCellCacheMaxEntries > int64(int(^uint(0)>>1)) {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries is too large")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries is too large")
 	}
 	if cfg.DecodedCellCacheShards > int64(int(^uint(0)>>1)) {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards is too large")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards is too large")
 	}
 
 	opts.Shards = int(cfg.DecodedCellCacheShards)
@@ -316,19 +261,9 @@ func decodedCellCacheOptionsFromConfig(cfg Storage) (DecodedCellCacheOptions, er
 		opts.MaxEntries = int(DefaultDecodedCellCacheMaxEntries)
 	}
 	if opts.MinEntries > opts.MaxEntries {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot exceed storage.decoded_cell_cache_max_entries")
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot exceed storage.decoded_cell_cache_max_entries")
 	}
 	return opts, nil
-}
-
-func decodedCellCacheOptions(opts DecodedCellCacheOptions) gton.DecodedCellCacheOptions {
-	return gton.DecodedCellCacheOptions{
-		Enabled:       opts.Enabled,
-		Shards:        opts.Shards,
-		BytesPerEntry: opts.BytesPerEntry,
-		MinEntries:    opts.MinEntries,
-		MaxEntries:    opts.MaxEntries,
-	}
 }
 
 func p2pOptionsFromConfig(cfg Config) (p2p.Options, error) {
@@ -363,21 +298,6 @@ func p2pOptionsFromConfig(cfg Config) (p2p.Options, error) {
 	}
 
 	return opts, nil
-}
-
-func liteSendMessageBroadcastOptionsFromConfig(cfg Lite) (liteSendMessageBroadcastOptions, error) {
-	capacity, err := liteSendMessageBroadcastCapacityFromConfig(cfg)
-	if err != nil {
-		return liteSendMessageBroadcastOptions{}, err
-	}
-	fanout, err := liteSendMessageBroadcastFanoutFromConfig(cfg)
-	if err != nil {
-		return liteSendMessageBroadcastOptions{}, err
-	}
-	return liteSendMessageBroadcastOptions{
-		Capacity: capacity,
-		Fanout:   fanout,
-	}, nil
 }
 
 func liteSendMessageBroadcastCapacityFromConfig(cfg Lite) (LiteSendMessageBroadcastCapacity, error) {

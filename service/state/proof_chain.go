@@ -81,16 +81,20 @@ func (s *Syncer) configuredTrustedKeyBlockAnchor(ctx context.Context) (trustedKe
 
 	var trusted trustedKeyBlock
 	if initBlock.SeqNo == 0 {
-		zeroBlock, err := s.source.ZeroStateBlock(ctx)
+		var zeroBlock ton.BlockIDExt
+		zeroBlock, err = s.source.ZeroStateBlock(ctx)
 		if err != nil {
 			return trustedKeyBlock{}, err
 		}
 		trusted, err = s.trustedZeroState(ctx, zeroBlock)
+		if err != nil {
+			return trustedKeyBlock{}, err
+		}
 	} else {
 		trusted, err = s.trustedInitBlock(ctx, initBlock)
-	}
-	if err != nil {
-		return trustedKeyBlock{}, err
+		if err != nil {
+			return trustedKeyBlock{}, err
+		}
 	}
 
 	if err = validateTrustedKeyBlockAnchor(trusted.block); err != nil {

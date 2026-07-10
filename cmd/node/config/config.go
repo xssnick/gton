@@ -143,14 +143,6 @@ type Storage struct {
 	ArtifactFileMaxOpen              int64  `json:"artifact_file_max_open"`
 }
 
-type DecodedCellCacheOptions struct {
-	Enabled       bool
-	Shards        int
-	BytesPerEntry int64
-	MinEntries    int
-	MaxEntries    int
-}
-
 type LiteSendMessageBroadcastCapacity struct {
 	BytesPerSecond int64
 	MaxDelay       time.Duration

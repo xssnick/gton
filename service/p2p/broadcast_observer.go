@@ -4,7 +4,6 @@ import "time"
 
 const (
 	broadcastPipelineStageFECDecode         = "fec_decode"
-	broadcastPipelineStageQueue             = "queue"
 	broadcastPipelineStageClassify          = "classify"
 	broadcastPipelineStageCandidateDecode   = "candidate_decode"
 	broadcastPipelineStageShardDescValidate = "shard_desc_validate"

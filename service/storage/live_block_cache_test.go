@@ -120,6 +120,18 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 	}
 }
 
+func TestLiveBlockCacheRejectsInvalidBlockID(t *testing.T) {
+	cache := NewLiveBlockCache(1)
+
+	err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
+		Block:     ton.BlockIDExt{},
+		BlockData: []byte{0x11},
+	})
+	if !errors.Is(err, ErrInvalidBlockIDHashes) {
+		t.Fatalf("publish invalid block error = %v, want ErrInvalidBlockIDHashes", err)
+	}
+}
+
 func testLiveBlockCacheBlockID(seqno uint32) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: 0,

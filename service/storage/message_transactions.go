@@ -120,30 +120,18 @@ func messageTransactionRefFromTLB(id ton.BlockIDExt, tx *tlb.Transaction) (Messa
 		return MessageTransactionRef{}, err
 	}
 
-	hash := tx.Hash
-	if len(hash) == 0 {
-		txCell, err := tx.ToCell()
-		if err != nil {
-			return MessageTransactionRef{}, fmt.Errorf("serialize transaction: %w", err)
-		}
-		hash = txCell.Hash()
-	}
-	if len(hash) != 32 {
-		return MessageTransactionRef{}, fmt.Errorf("transaction hash has invalid size %d", len(hash))
-	}
-
 	ref := MessageTransactionRef{
 		Block:     id,
 		Workchain: id.Workchain,
 		Account:   account.Account,
 		LT:        tx.LT,
 	}
-	copy(ref.Hash[:], hash)
+	copy(ref.Hash[:], tx.Hash)
 	return ref, nil
 }
 
 func messageTransactionEntryFromMessage(kind MessageTransactionKind, msg *tlb.Message, ref MessageTransactionRef) (MessageTransactionIndexEntry, bool) {
-	if msg == nil || msg.Msg == nil {
+	if msg.Msg == nil {
 		return MessageTransactionIndexEntry{}, false
 	}
 

@@ -369,9 +369,6 @@ func (c *cellStore) flush() error {
 		if !dirty[i] {
 			continue
 		}
-		if shard == nil || shard.db == nil {
-			continue
-		}
 		wg.Add(1)
 		go func(i int, db *pebble.DB) {
 			defer wg.Done()

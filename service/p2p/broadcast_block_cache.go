@@ -147,9 +147,6 @@ func (c *broadcastBlockCache) deleteEntryLocked(entry *broadcastBlockCacheEntry)
 		entry.element = nil
 	}
 	c.bytes -= entry.bytes
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 }
 
 func (e *broadcastBlockCacheEntry) downloaded(defaultKind string) *DownloadedBlock {

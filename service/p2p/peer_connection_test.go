@@ -149,7 +149,7 @@ func TestQueryCandidatesSkipClosedPeers(t *testing.T) {
 	closedConn.Close()
 	fallbackOverlay, _ := newTestOverlayWrapper()
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		spec: overlaySpec{
 			ProtoVersionMajor: shardchainProtoVersionMajor,
@@ -161,7 +161,7 @@ func TestQueryCandidatesSkipClosedPeers(t *testing.T) {
 			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: fallbackOverlay, announced: &overlay.Node{Version: now}, alive: true},
 		},
 		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
-	}
+	})
 
 	got := sub.queryCandidates(0, 0)
 	if len(got) != 2 {
@@ -186,11 +186,11 @@ func TestHandlePeerQueryFailureRemovesClosedPeer(t *testing.T) {
 		alive:     true,
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{testPeerID("peer-1"): peer},
 		neighbours: []PeerID{testPeerID("peer-1")},
-	}
+	})
 
 	sub.handlePeerQueryFailure(peer, adnl.ErrPeerConnClosed)
 
@@ -223,7 +223,7 @@ func TestAttachPublicInboundPeerStartsRandomPeerWarmup(t *testing.T) {
 		runCtx:  runCtx,
 		pool:    peerPool,
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		log:  discardLogger(),
 		spec: overlaySpec{
@@ -234,7 +234,7 @@ func TestAttachPublicInboundPeerStartsRandomPeerWarmup(t *testing.T) {
 		},
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 
 	warmed := make(chan struct{}, 1)
 	base.queryResponder = func(req tl.Serializable, _ tl.Serializable) error {
@@ -292,7 +292,7 @@ func TestAttachCustomFixedPeerWarmsADNLWithNop(t *testing.T) {
 		runCtx:  runCtx,
 		pool:    peerPool,
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		log:  discardLogger(),
 		spec: overlaySpec{
@@ -302,7 +302,7 @@ func TestAttachCustomFixedPeerWarmsADNLWithNop(t *testing.T) {
 		},
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 
 	if !sub.attachPooledPeer(pooled, nil) {
 		t.Fatal("custom fixed peer was not attached")
@@ -352,7 +352,7 @@ func TestCustomFixedPeerOnlyAnswersOverlayPingInOverlayLayer(t *testing.T) {
 		runCtx:  runCtx,
 		pool:    peerPool,
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		log:  discardLogger(),
 		spec: overlaySpec{
@@ -362,7 +362,7 @@ func TestCustomFixedPeerOnlyAnswersOverlayPingInOverlayLayer(t *testing.T) {
 		},
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 
 	if !sub.attachPooledPeer(pooled, nil) {
 		t.Fatal("custom fixed peer was not attached")
@@ -413,7 +413,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 		runCtx: runCtx,
 		pool:   peerPool,
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		log:  discardLogger(),
 		spec: overlaySpec{
@@ -421,7 +421,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 			ShortID: shortID,
 		},
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 	announcedPub := testPeerID("pending-public-key")
 	announced := &overlay.Node{
 		ID:      keys.PublicKeyED25519{Key: ed25519.PublicKey(announcedPub[:])},
@@ -520,7 +520,7 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 		runCtx:  runCtx,
 		pool:    peerPool,
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		log:  discardLogger(),
 		spec: overlaySpec{
@@ -531,7 +531,7 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 		},
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 
 	var warmupCalls atomic.Int32
 	firstWarmupDone := make(chan struct{})
@@ -619,11 +619,11 @@ func TestPingPeersRunsPeerQueriesConcurrently(t *testing.T) {
 	const peerCount = 3
 	const queryDelay = 150 * time.Millisecond
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:   discardLogger(),
 		spec:  overlaySpec{Kind: overlayKindPublicShard, QueryCapabilities: true},
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 	now := int32(time.Now().Unix())
 	for i := 0; i < peerCount; i++ {
 		id := testPeerID(string(rune('a' + i)))
@@ -658,12 +658,12 @@ func TestStartPingPeersDoesNotBlockCaller(t *testing.T) {
 		log:    discardLogger(),
 		runCtx: runCtx,
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		log:   discardLogger(),
 		spec:  overlaySpec{Kind: overlayKindPublicShard, QueryCapabilities: true},
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 	id := testPeerID("slow")
 	wrapper, base := newTestOverlayWrapper()
 	base.queryResponder = func(tl.Serializable, tl.Serializable) error {

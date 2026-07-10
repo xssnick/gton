@@ -743,9 +743,10 @@ func testNonfinalArtifact(t *testing.T, workchain int32, shard int64, seqno uint
 	copy(prevRefs, prevs)
 
 	return storage.LiveBlockArtifacts{
-		Block:     block,
-		Root:      blockRoot,
-		BlockData: testBlockBOC(blockRoot),
+		Block:            block,
+		Root:             blockRoot,
+		BlockData:        testBlockBOC(blockRoot),
+		AvailabilityOnly: true,
 		Meta: &storage.BlockMeta{
 			ID:            block,
 			StateRootHash: stateRootHash,

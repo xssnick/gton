@@ -114,10 +114,6 @@ func newArchivePeerPool(sub *overlaySubscription) *archivePeerPool {
 }
 
 func (p *archivePeerPool) startKeepalive() {
-	if p.sub == nil || p.sub.node == nil || p.sub.node.runCtx == nil {
-		return
-	}
-
 	ctx := p.sub.node.runCtx
 	p.sub.node.runAsync(func() {
 		p.runKeepalive(ctx)
@@ -296,10 +292,6 @@ func (p *archivePeerPool) downloadCandidates(session *ArchiveSession, shard arch
 }
 
 func (p *archivePeerPool) selectedPeer(session *ArchiveSession, shard archive.ShardID) *overlayPeer {
-	if session == nil {
-		return nil
-	}
-
 	peerID := session.selectedArchivePeerID(shard)
 	if peerID.IsZero() {
 		return nil
@@ -908,7 +900,7 @@ func (p *archivePeerPool) removePeerLocked(peerID PeerID) *overlayPeer {
 }
 
 func (p *archivePeerPool) startDHTDiscovery(ctx context.Context) <-chan struct{} {
-	if p.sub.node == nil || p.sub.node.dht == nil || !p.sub.isActive() {
+	if p.sub.node.dht == nil || !p.sub.isActive() {
 		return nil
 	}
 
@@ -936,11 +928,7 @@ func (p *archivePeerPool) startDHTDiscovery(ctx context.Context) <-chan struct{}
 		}()
 		p.discoverFromDHT(ctx)
 	}
-	if p.sub.node != nil {
-		p.sub.node.runAsync(run)
-		return done
-	}
-	go run()
+	p.sub.node.runAsync(run)
 	return done
 }
 
@@ -1055,11 +1043,7 @@ func (p *archivePeerPool) startRandomPeerRefresh(ctx context.Context) {
 			p.exchangeRandomPeers(ctx, peer)
 		}
 	}
-	if p.sub.node != nil {
-		p.sub.node.runAsync(run)
-		return
-	}
-	go run()
+	p.sub.node.runAsync(run)
 }
 
 func (p *archivePeerPool) exchangeRandomPeers(ctx context.Context, peer *overlayPeer) {

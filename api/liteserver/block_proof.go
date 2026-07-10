@@ -370,14 +370,6 @@ func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt
 	return link, nil
 }
 
-func (s *Server) blockIsKey(ctx context.Context, id ton.BlockIDExt) (bool, error) {
-	meta, err := s.store.BlockMeta(ctx, id)
-	if err != nil {
-		return false, err
-	}
-	return meta.Has(storage.BlockMetaIsKeyBlock), nil
-}
-
 func (s *Server) prevKeyBlockInState(req blockProofRequest, seqno uint32) (ton.BlockIDExt, error) {
 	if req.baseIsKey && req.base.SeqNo <= seqno {
 		return req.base, nil

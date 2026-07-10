@@ -101,7 +101,7 @@ func (c *masterchainNextBroadcastCache) blockAfterAt(prev ton.BlockIDExt, now ti
 	if !isMasterchainBlock(prev) {
 		return nil, tnstore.ErrNotFound
 	}
-	return c.broadcastBlockCache.blockAt(tnstore.BlockKey(prev), now)
+	return c.blockAt(tnstore.BlockKey(prev), now)
 }
 
 func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {

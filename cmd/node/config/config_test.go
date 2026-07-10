@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/xssnick/gton"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -21,6 +23,11 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+	nodeOpts := runtimeOpts.Node
 
 	if cfg.TON.GlobalConfigPath != DefaultGlobalConfigPath {
 		t.Fatalf("unexpected TON config path %q", cfg.TON.GlobalConfigPath)
@@ -28,67 +35,35 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TON.SyncBefore != int64(DefaultSyncBefore/time.Second) {
 		t.Fatalf("unexpected sync_before %d", cfg.TON.SyncBefore)
 	}
-	syncBefore, err := cfg.SyncBefore()
-	if err != nil {
-		t.Fatalf("sync before: %v", err)
+	if nodeOpts.SyncBefore != DefaultSyncBefore {
+		t.Fatalf("unexpected sync before %s", nodeOpts.SyncBefore)
 	}
-	if syncBefore != DefaultSyncBefore {
-		t.Fatalf("unexpected sync before %s", syncBefore)
-	}
-	syncUntil, err := cfg.SyncUntil()
-	if err != nil {
-		t.Fatalf("sync until: %v", err)
-	}
-	if syncUntil != 0 {
-		t.Fatalf("unexpected sync_until %d", syncUntil)
+	if nodeOpts.SyncUntil != 0 {
+		t.Fatalf("unexpected sync_until %d", nodeOpts.SyncUntil)
 	}
 	if cfg.TON.StateTTL != int64(DefaultStateTTL/time.Second) {
 		t.Fatalf("unexpected state_ttl %d", cfg.TON.StateTTL)
 	}
-	stateTTL, err := cfg.StateTTL()
-	if err != nil {
-		t.Fatalf("state ttl: %v", err)
-	}
-	if stateTTL != DefaultStateTTL {
-		t.Fatalf("unexpected state ttl %s", stateTTL)
+	if nodeOpts.StateTTL != DefaultStateTTL {
+		t.Fatalf("unexpected state ttl %s", nodeOpts.StateTTL)
 	}
 	if cfg.TON.ArchiveTTL != int64(DefaultArchiveTTL/time.Second) {
 		t.Fatalf("unexpected archive_ttl %d", cfg.TON.ArchiveTTL)
 	}
-	archiveTTL, err := cfg.ArchiveTTL()
-	if err != nil {
-		t.Fatalf("archive ttl: %v", err)
+	if nodeOpts.ArchiveTTL != DefaultArchiveTTL {
+		t.Fatalf("unexpected archive ttl %s", nodeOpts.ArchiveTTL)
 	}
-	if archiveTTL != DefaultArchiveTTL {
-		t.Fatalf("unexpected archive ttl %s", archiveTTL)
+	if int64(nodeOpts.NextCheckpointBlocks) != DefaultNextCheckpointBlocks {
+		t.Fatalf("unexpected next checkpoint blocks %d", nodeOpts.NextCheckpointBlocks)
 	}
-	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
-	if err != nil {
-		t.Fatalf("next checkpoint blocks: %v", err)
+	if int64(nodeOpts.ArchiveCheckpointBlocks) != DefaultArchiveCheckpointBlocks {
+		t.Fatalf("unexpected archive checkpoint blocks %d", nodeOpts.ArchiveCheckpointBlocks)
 	}
-	if int64(nextCheckpointBlocks) != DefaultNextCheckpointBlocks {
-		t.Fatalf("unexpected next checkpoint blocks %d", nextCheckpointBlocks)
+	if int64(nodeOpts.CheckpointBytes) != DefaultCheckpointBytes {
+		t.Fatalf("unexpected checkpoint bytes %d", nodeOpts.CheckpointBytes)
 	}
-	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
-	if err != nil {
-		t.Fatalf("archive checkpoint blocks: %v", err)
-	}
-	if int64(archiveCheckpointBlocks) != DefaultArchiveCheckpointBlocks {
-		t.Fatalf("unexpected archive checkpoint blocks %d", archiveCheckpointBlocks)
-	}
-	checkpointBytes, err := cfg.CheckpointBytes()
-	if err != nil {
-		t.Fatalf("checkpoint bytes: %v", err)
-	}
-	if int64(checkpointBytes) != DefaultCheckpointBytes {
-		t.Fatalf("unexpected checkpoint bytes %d", checkpointBytes)
-	}
-	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
-	if err != nil {
-		t.Fatalf("sync backpressure windows: %v", err)
-	}
-	if int64(syncBackpressureWindows) != DefaultSyncBackpressureWindows {
-		t.Fatalf("unexpected sync backpressure windows %d", syncBackpressureWindows)
+	if int64(nodeOpts.SyncBackpressureWindows) != DefaultSyncBackpressureWindows {
+		t.Fatalf("unexpected sync backpressure windows %d", nodeOpts.SyncBackpressureWindows)
 	}
 	if cfg.DisableStateSerialization {
 		t.Fatal("state serialization should be enabled by default")
@@ -108,20 +83,14 @@ func TestLoadDefaults(t *testing.T) {
 	if len(cfg.CustomOverlays) != 0 {
 		t.Fatalf("unexpected custom overlays %d", len(cfg.CustomOverlays))
 	}
-	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
-	if err != nil {
-		t.Fatalf("liteserver send message broadcast capacity: %v", err)
-	}
+	capacity := runtimeOpts.LiteSendMessageBroadcastCapacity
 	if capacity.BytesPerSecond != 0 {
 		t.Fatalf("unexpected default liteserver send message broadcast capacity %d", capacity.BytesPerSecond)
 	}
 	if capacity.MaxDelay != DefaultLiteSendMessageBroadcastMaxDelay {
 		t.Fatalf("unexpected default liteserver send message broadcast max delay %s", capacity.MaxDelay)
 	}
-	fanout, err := cfg.LiteSendMessageBroadcastFanout()
-	if err != nil {
-		t.Fatalf("liteserver send message broadcast fanout: %v", err)
-	}
+	fanout := runtimeOpts.LiteSendMessageBroadcastFanout
 	if fanout != DefaultLiteSendMessageBroadcastFanout {
 		t.Fatalf("unexpected default liteserver send message broadcast fanout %d", fanout)
 	}
@@ -132,17 +101,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Lite.AllowDuplicateExternals {
 		t.Fatal("duplicate liteserver externals should be disabled by default")
 	}
-	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
-	if err != nil {
-		t.Fatalf("cell total cache size: %v", err)
-	}
+	storageOpts := nodeOpts.Storage
+	cellTotalCacheSize := storageOpts.CellTotalCacheSize
 	if cellTotalCacheSize != DefaultCellTotalCache {
 		t.Fatalf("unexpected cell total cache size %d", cellTotalCacheSize)
 	}
-	decodedCellCache, err := cfg.DecodedCellCacheOptions()
-	if err != nil {
-		t.Fatalf("decoded cell cache options: %v", err)
-	}
+	decodedCellCache := storageOpts.DecodedCellCache
 	if decodedCellCache.Enabled != DefaultDecodedCellCacheEnabled {
 		t.Fatalf("unexpected decoded cell cache enabled %v", decodedCellCache.Enabled)
 	}
@@ -158,41 +122,26 @@ func TestLoadDefaults(t *testing.T) {
 	if int64(decodedCellCache.MaxEntries) != DefaultDecodedCellCacheMaxEntries {
 		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
 	}
-	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
-	if err != nil {
-		t.Fatalf("cell shard memtable size: %v", err)
-	}
+	cellShardMemTableSize := storageOpts.CellShardMemTableSize
 	if int64(cellShardMemTableSize) != DefaultCellShardMemTable {
 		t.Fatalf("unexpected cell shard memtable size %d", cellShardMemTableSize)
 	}
-	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
-	if err != nil {
-		t.Fatalf("cell memtable stop writes threshold: %v", err)
-	}
+	cellMemTableStopWritesThreshold := storageOpts.CellMemTableStopWritesThreshold
 	if int64(cellMemTableStopWritesThreshold) != DefaultCellMemTableStopWritesThreshold {
 		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
 	}
-	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
-	if err != nil {
-		t.Fatalf("large boc shard read workers: %v", err)
-	}
+	largeBOCShardReadWorkers := storageOpts.LargeBOCShardReadWorkers
 	if int64(largeBOCShardReadWorkers) != DefaultLargeBOCShardReadWorkers {
 		t.Fatalf("unexpected large boc shard read workers %d", largeBOCShardReadWorkers)
 	}
-	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
-	if err != nil {
-		t.Fatalf("persistent state large boc batch size: %v", err)
-	}
+	persistentStateLargeBOCBatchSize := storageOpts.PersistentStateLargeBOCBatchSize
 	if int64(persistentStateLargeBOCBatchSize) != DefaultPersistentStateLargeBOCBatchSize {
 		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
 	}
 	if cfg.Storage.StateSerializeOnePass {
 		t.Fatal("state serialize one-pass should be disabled by default")
 	}
-	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
-	if err != nil {
-		t.Fatalf("artifact file max open: %v", err)
-	}
+	artifactFileMaxOpen := storageOpts.ArtifactFileMaxOpen
 	if int64(artifactFileMaxOpen) != DefaultArtifactFileMaxOpen {
 		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
 	}
@@ -249,7 +198,7 @@ func TestLoadLiteSendMessageBroadcastCapacity(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 
-	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
+	capacity, err := liteSendMessageBroadcastCapacityFromConfig(cfg.Lite)
 	if err != nil {
 		t.Fatalf("liteserver send message broadcast capacity: %v", err)
 	}
@@ -259,7 +208,7 @@ func TestLoadLiteSendMessageBroadcastCapacity(t *testing.T) {
 	if capacity.MaxDelay != 75*time.Millisecond {
 		t.Fatalf("unexpected max delay %s", capacity.MaxDelay)
 	}
-	fanout, err := cfg.LiteSendMessageBroadcastFanout()
+	fanout, err := liteSendMessageBroadcastFanoutFromConfig(cfg.Lite)
 	if err != nil {
 		t.Fatalf("liteserver send message broadcast fanout: %v", err)
 	}
@@ -302,7 +251,7 @@ func TestLoadLiteSendMessageBroadcastCapacityRejectsNegative(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load config: %v", err)
 			}
-			if _, err = cfg.LiteSendMessageBroadcastCapacity(); err == nil {
+			if _, err = liteSendMessageBroadcastCapacityFromConfig(cfg.Lite); err == nil {
 				t.Fatal("expected negative capacity config to fail")
 			}
 		})
@@ -336,7 +285,7 @@ func TestLoadLiteSendMessageBroadcastFanoutRejectsOutOfRange(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load config: %v", err)
 			}
-			if _, err = cfg.LiteSendMessageBroadcastFanout(); err == nil {
+			if _, err = liteSendMessageBroadcastFanoutFromConfig(cfg.Lite); err == nil {
 				t.Fatal("expected invalid liteserver send message broadcast fanout to fail")
 			}
 		})
@@ -372,62 +321,34 @@ func TestLoadSyncOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
+	nodeOpts := gton.DefaultNodeOptions()
+	if err = applyTONOptionsFromConfig(&nodeOpts, cfg); err != nil {
+		t.Fatalf("TON options: %v", err)
+	}
 
-	syncBefore, err := cfg.SyncBefore()
-	if err != nil {
-		t.Fatalf("sync before: %v", err)
+	if nodeOpts.SyncBefore != 2*time.Hour {
+		t.Fatalf("unexpected sync before %s", nodeOpts.SyncBefore)
 	}
-	if syncBefore != 2*time.Hour {
-		t.Fatalf("unexpected sync before %s", syncBefore)
+	if nodeOpts.SyncUntil != 1719763200 {
+		t.Fatalf("unexpected sync until %d", nodeOpts.SyncUntil)
 	}
-	syncUntil, err := cfg.SyncUntil()
-	if err != nil {
-		t.Fatalf("sync until: %v", err)
+	if nodeOpts.StateTTL != 24*time.Hour {
+		t.Fatalf("unexpected state ttl %s", nodeOpts.StateTTL)
 	}
-	if syncUntil != 1719763200 {
-		t.Fatalf("unexpected sync until %d", syncUntil)
+	if nodeOpts.ArchiveTTL != 48*time.Hour {
+		t.Fatalf("unexpected archive ttl %s", nodeOpts.ArchiveTTL)
 	}
-	stateTTL, err := cfg.StateTTL()
-	if err != nil {
-		t.Fatalf("state ttl: %v", err)
+	if nodeOpts.NextCheckpointBlocks != 700 {
+		t.Fatalf("unexpected next checkpoint blocks %d", nodeOpts.NextCheckpointBlocks)
 	}
-	if stateTTL != 24*time.Hour {
-		t.Fatalf("unexpected state ttl %s", stateTTL)
+	if nodeOpts.ArchiveCheckpointBlocks != 2100 {
+		t.Fatalf("unexpected archive checkpoint blocks %d", nodeOpts.ArchiveCheckpointBlocks)
 	}
-	archiveTTL, err := cfg.ArchiveTTL()
-	if err != nil {
-		t.Fatalf("archive ttl: %v", err)
+	if nodeOpts.CheckpointBytes != 123456789 {
+		t.Fatalf("unexpected checkpoint bytes %d", nodeOpts.CheckpointBytes)
 	}
-	if archiveTTL != 48*time.Hour {
-		t.Fatalf("unexpected archive ttl %s", archiveTTL)
-	}
-	nextCheckpointBlocks, err := cfg.NextCheckpointBlocks()
-	if err != nil {
-		t.Fatalf("next checkpoint blocks: %v", err)
-	}
-	if nextCheckpointBlocks != 700 {
-		t.Fatalf("unexpected next checkpoint blocks %d", nextCheckpointBlocks)
-	}
-	archiveCheckpointBlocks, err := cfg.ArchiveCheckpointBlocks()
-	if err != nil {
-		t.Fatalf("archive checkpoint blocks: %v", err)
-	}
-	if archiveCheckpointBlocks != 2100 {
-		t.Fatalf("unexpected archive checkpoint blocks %d", archiveCheckpointBlocks)
-	}
-	checkpointBytes, err := cfg.CheckpointBytes()
-	if err != nil {
-		t.Fatalf("checkpoint bytes: %v", err)
-	}
-	if checkpointBytes != 123456789 {
-		t.Fatalf("unexpected checkpoint bytes %d", checkpointBytes)
-	}
-	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
-	if err != nil {
-		t.Fatalf("sync backpressure windows: %v", err)
-	}
-	if syncBackpressureWindows != 6 {
-		t.Fatalf("unexpected sync backpressure windows %d", syncBackpressureWindows)
+	if nodeOpts.SyncBackpressureWindows != 6 {
+		t.Fatalf("unexpected sync backpressure windows %d", nodeOpts.SyncBackpressureWindows)
 	}
 }
 
@@ -439,7 +360,11 @@ func TestLoadOldSyncOptionsUsesBackpressureDefault(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 
-	syncBackpressureWindows, err := cfg.SyncBackpressureWindows()
+	syncBackpressureWindows, err := uint32ConfigValue(
+		"ton.sync_backpressure_windows",
+		cfg.TON.SyncBackpressureWindows,
+		uint32(DefaultSyncBackpressureWindows),
+	)
 	if err != nil {
 		t.Fatalf("sync backpressure windows: %v", err)
 	}
@@ -456,7 +381,7 @@ func TestLoadZeroTTLs(t *testing.T) {
 		t.Fatalf("load config: %v", err)
 	}
 
-	stateTTL, err := cfg.StateTTL()
+	stateTTL, err := durationSeconds("ton.state_ttl", cfg.TON.StateTTL, true)
 	if err != nil {
 		t.Fatalf("state ttl: %v", err)
 	}
@@ -464,7 +389,7 @@ func TestLoadZeroTTLs(t *testing.T) {
 		t.Fatalf("unexpected state ttl %s", stateTTL)
 	}
 
-	archiveTTL, err := cfg.ArchiveTTL()
+	archiveTTL, err := durationSeconds("ton.archive_ttl", cfg.TON.ArchiveTTL, true)
 	if err != nil {
 		t.Fatalf("archive ttl: %v", err)
 	}
@@ -496,20 +421,17 @@ func TestStorageOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.StorageDir() != "data/node" {
-		t.Fatalf("unexpected storage dir %q", cfg.StorageDir())
-	}
-	cellTotalCacheSize, err := cfg.CellTotalCacheSize()
+	storageOpts, err := storageOptionsFromConfig(cfg)
 	if err != nil {
-		t.Fatalf("cell total cache size: %v", err)
+		t.Fatalf("storage options: %v", err)
 	}
-	if cellTotalCacheSize != 8<<30 {
-		t.Fatalf("unexpected cell total cache size %d", cellTotalCacheSize)
+	if storageOpts.Dir != "data/node" {
+		t.Fatalf("unexpected storage dir %q", storageOpts.Dir)
 	}
-	decodedCellCache, err := cfg.DecodedCellCacheOptions()
-	if err != nil {
-		t.Fatalf("decoded cell cache options: %v", err)
+	if storageOpts.CellTotalCacheSize != 8<<30 {
+		t.Fatalf("unexpected cell total cache size %d", storageOpts.CellTotalCacheSize)
 	}
+	decodedCellCache := storageOpts.DecodedCellCache
 	if decodedCellCache.Enabled {
 		t.Fatal("decoded cell cache should be disabled")
 	}
@@ -525,43 +447,23 @@ func TestStorageOptions(t *testing.T) {
 	if decodedCellCache.MaxEntries != 2000 {
 		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
 	}
-	cellShardMemTableSize, err := cfg.CellShardMemTableSize()
-	if err != nil {
-		t.Fatalf("cell shard memtable size: %v", err)
+	if storageOpts.CellShardMemTableSize != 1<<30 {
+		t.Fatalf("unexpected cell shard memtable size %d", storageOpts.CellShardMemTableSize)
 	}
-	if cellShardMemTableSize != 1<<30 {
-		t.Fatalf("unexpected cell shard memtable size %d", cellShardMemTableSize)
+	if storageOpts.CellMemTableStopWritesThreshold != 3 {
+		t.Fatalf("unexpected cell memtable stop writes threshold %d", storageOpts.CellMemTableStopWritesThreshold)
 	}
-	cellMemTableStopWritesThreshold, err := cfg.CellMemTableStopWritesThreshold()
-	if err != nil {
-		t.Fatalf("cell memtable stop writes threshold: %v", err)
+	if storageOpts.LargeBOCShardReadWorkers != 8 {
+		t.Fatalf("unexpected large boc shard read workers %d", storageOpts.LargeBOCShardReadWorkers)
 	}
-	if cellMemTableStopWritesThreshold != 3 {
-		t.Fatalf("unexpected cell memtable stop writes threshold %d", cellMemTableStopWritesThreshold)
+	if storageOpts.PersistentStateLargeBOCBatchSize != 2<<20 {
+		t.Fatalf("unexpected persistent state large boc batch size %d", storageOpts.PersistentStateLargeBOCBatchSize)
 	}
-	largeBOCShardReadWorkers, err := cfg.LargeBOCShardReadWorkers()
-	if err != nil {
-		t.Fatalf("large boc shard read workers: %v", err)
-	}
-	if largeBOCShardReadWorkers != 8 {
-		t.Fatalf("unexpected large boc shard read workers %d", largeBOCShardReadWorkers)
-	}
-	persistentStateLargeBOCBatchSize, err := cfg.PersistentStateLargeBOCBatchSize()
-	if err != nil {
-		t.Fatalf("persistent state large boc batch size: %v", err)
-	}
-	if persistentStateLargeBOCBatchSize != 2<<20 {
-		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
-	}
-	if !cfg.Storage.StateSerializeOnePass {
+	if !storageOpts.StateSerializeOnePass {
 		t.Fatal("state serialize one-pass should be enabled")
 	}
-	artifactFileMaxOpen, err := cfg.ArtifactFileMaxOpen()
-	if err != nil {
-		t.Fatalf("artifact file max open: %v", err)
-	}
-	if artifactFileMaxOpen != 123 {
-		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
+	if storageOpts.ArtifactFileMaxOpen != 123 {
+		t.Fatalf("unexpected artifact file max open %d", storageOpts.ArtifactFileMaxOpen)
 	}
 }
 
@@ -594,7 +496,7 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := tt.cfg.DecodedCellCacheOptions(); err == nil {
+			if _, err := decodedCellCacheOptionsFromConfig(tt.cfg.Storage); err == nil {
 				t.Fatal("expected invalid decoded cell cache options to fail")
 			}
 		})
@@ -610,7 +512,11 @@ func TestStorageLargeBOCOptionsRejectInvalidValues(t *testing.T) {
 		{
 			name: "negative large boc shard read workers",
 			run: func(cfg Config) error {
-				_, err := cfg.LargeBOCShardReadWorkers()
+				_, err := intConfigValue(
+					"storage.large_boc_shard_read_workers",
+					cfg.Storage.LargeBOCShardReadWorkers,
+					DefaultLargeBOCShardReadWorkers,
+				)
 				return err
 			},
 			cfg: Config{Storage: Storage{LargeBOCShardReadWorkers: -1}},
@@ -618,7 +524,11 @@ func TestStorageLargeBOCOptionsRejectInvalidValues(t *testing.T) {
 		{
 			name: "negative persistent state large boc batch size",
 			run: func(cfg Config) error {
-				_, err := cfg.PersistentStateLargeBOCBatchSize()
+				_, err := intConfigValue(
+					"storage.persistent_state_large_boc_batch_size",
+					cfg.Storage.PersistentStateLargeBOCBatchSize,
+					DefaultPersistentStateLargeBOCBatchSize,
+				)
 				return err
 			},
 			cfg: Config{Storage: Storage{PersistentStateLargeBOCBatchSize: -1}},
@@ -640,7 +550,11 @@ func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
 		PersistentStateLargeBOCBatchSize: 0,
 	}}
 
-	workers, err := cfg.LargeBOCShardReadWorkers()
+	workers, err := intConfigValue(
+		"storage.large_boc_shard_read_workers",
+		cfg.Storage.LargeBOCShardReadWorkers,
+		DefaultLargeBOCShardReadWorkers,
+	)
 	if err != nil {
 		t.Fatalf("large boc shard read workers: %v", err)
 	}
@@ -648,7 +562,11 @@ func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
 		t.Fatalf("large boc shard read workers = %d, want %d", workers, DefaultLargeBOCShardReadWorkers)
 	}
 
-	batchSize, err := cfg.PersistentStateLargeBOCBatchSize()
+	batchSize, err := intConfigValue(
+		"storage.persistent_state_large_boc_batch_size",
+		cfg.Storage.PersistentStateLargeBOCBatchSize,
+		DefaultPersistentStateLargeBOCBatchSize,
+	)
 	if err != nil {
 		t.Fatalf("persistent state large boc batch size: %v", err)
 	}
@@ -902,25 +820,25 @@ func TestSyncBeforeValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.SyncBefore = ArchiveFromZeroSyncBefore
 
-	syncBefore, err := cfg.SyncBefore()
+	syncBefore, archiveFromZero, err := syncBeforeFromConfig(cfg.TON)
 	if err != nil {
 		t.Fatalf("archive-from-zero sync_before should be allowed: %v", err)
 	}
 	if syncBefore != 0 {
 		t.Fatalf("unexpected archive-from-zero sync before %s", syncBefore)
 	}
-	if !cfg.ArchiveFromZero() {
+	if !archiveFromZero {
 		t.Fatal("archive-from-zero mode should be enabled")
 	}
 
 	cfg.TON.SyncBefore = 0
 
-	if _, err := cfg.SyncBefore(); err == nil {
+	if _, _, err := syncBeforeFromConfig(cfg.TON); err == nil {
 		t.Fatal("expected zero sync_before to fail")
 	}
 
 	cfg.TON.SyncBefore = -2
-	if _, err := cfg.SyncBefore(); err == nil {
+	if _, _, err := syncBeforeFromConfig(cfg.TON); err == nil {
 		t.Fatal("expected negative sync_before other than -1 to fail")
 	}
 }
@@ -929,7 +847,7 @@ func TestSyncUntilValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.SyncUntil = 0
 
-	syncUntil, err := cfg.SyncUntil()
+	syncUntil, err := uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil)
 	if err != nil {
 		t.Fatalf("zero sync_until should be allowed: %v", err)
 	}
@@ -938,12 +856,12 @@ func TestSyncUntilValidation(t *testing.T) {
 	}
 
 	cfg.TON.SyncUntil = -1
-	if _, err = cfg.SyncUntil(); err == nil {
+	if _, err = uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil); err == nil {
 		t.Fatal("expected negative sync_until to fail")
 	}
 
 	cfg.TON.SyncUntil = int64(^uint32(0)) + 1
-	if _, err = cfg.SyncUntil(); err == nil {
+	if _, err = uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil); err == nil {
 		t.Fatal("expected too large sync_until to fail")
 	}
 }
@@ -952,7 +870,11 @@ func TestSyncBackpressureWindowsValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.SyncBackpressureWindows = 0
 
-	windows, err := cfg.SyncBackpressureWindows()
+	windows, err := uint32ConfigValue(
+		"ton.sync_backpressure_windows",
+		cfg.TON.SyncBackpressureWindows,
+		uint32(DefaultSyncBackpressureWindows),
+	)
 	if err != nil {
 		t.Fatalf("zero sync_backpressure_windows should use default: %v", err)
 	}
@@ -961,7 +883,11 @@ func TestSyncBackpressureWindowsValidation(t *testing.T) {
 	}
 
 	cfg.TON.SyncBackpressureWindows = -1
-	if _, err = cfg.SyncBackpressureWindows(); err == nil {
+	if _, err = uint32ConfigValue(
+		"ton.sync_backpressure_windows",
+		cfg.TON.SyncBackpressureWindows,
+		uint32(DefaultSyncBackpressureWindows),
+	); err == nil {
 		t.Fatal("expected negative sync_backpressure_windows to fail")
 	}
 }
@@ -970,7 +896,7 @@ func TestStateTTLValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.StateTTL = 0
 
-	stateTTL, err := cfg.StateTTL()
+	stateTTL, err := durationSeconds("ton.state_ttl", cfg.TON.StateTTL, true)
 	if err != nil {
 		t.Fatalf("zero state_ttl should be allowed: %v", err)
 	}
@@ -979,7 +905,7 @@ func TestStateTTLValidation(t *testing.T) {
 	}
 
 	cfg.TON.StateTTL = -1
-	if _, err = cfg.StateTTL(); err == nil {
+	if _, err = durationSeconds("ton.state_ttl", cfg.TON.StateTTL, true); err == nil {
 		t.Fatal("expected negative state_ttl to fail")
 	}
 }
@@ -988,7 +914,7 @@ func TestArchiveTTLValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.ArchiveTTL = 0
 
-	archiveTTL, err := cfg.ArchiveTTL()
+	archiveTTL, err := durationSeconds("ton.archive_ttl", cfg.TON.ArchiveTTL, true)
 	if err != nil {
 		t.Fatalf("zero archive_ttl should be allowed: %v", err)
 	}
@@ -997,7 +923,7 @@ func TestArchiveTTLValidation(t *testing.T) {
 	}
 
 	cfg.TON.ArchiveTTL = -1
-	if _, err = cfg.ArchiveTTL(); err == nil {
+	if _, err = durationSeconds("ton.archive_ttl", cfg.TON.ArchiveTTL, true); err == nil {
 		t.Fatal("expected negative archive_ttl to fail")
 	}
 }

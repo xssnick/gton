@@ -54,6 +54,44 @@ func saveTestArchiveArtifacts(store *Store, imported testArchiveImport) error {
 	return err
 }
 
+func TestSetServedBlockFullArtifactRefsRejectsMissingProofRef(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	block := &storage.ServedBlockFull{
+		ID: testServedBlockID(-1, topShard, 42, 0x42),
+	}
+	kind := storage.ServedProofBlock
+	err = store.withHotBatch(func(batch *pebble.Batch) error {
+		return store.setServedBlockFullArtifactRefs(
+			batch,
+			block,
+			[]storage.ServedProofKind{kind},
+			nil,
+			map[storage.ServedProofKind]*storage.ArtifactRef{},
+		)
+	})
+	if err == nil {
+		t.Fatal("missing proof ref was accepted")
+	}
+	if !strings.Contains(err.Error(), "proof ref invariant violated") {
+		t.Fatalf("missing proof ref error = %v, want invariant violation", err)
+	}
+	if !strings.Contains(err.Error(), string(kind)) {
+		t.Fatalf("missing proof ref error = %v, want proof kind %q", err, kind)
+	}
+	if !strings.Contains(err.Error(), storage.FormatBlockRef(block.ID)) {
+		t.Fatalf("missing proof ref error = %v, want block context", err)
+	}
+}
+
 func TestCheckpointArchiveArtifactsAllowsShardSplitNextChildrenAcrossBatches(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -83,6 +121,48 @@ func TestCheckpointArchiveArtifactsAllowsShardSplitNextChildrenAcrossBatches(t *
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: left}},
 	}); err != nil {
 		t.Fatalf("link left split child: %v", err)
+	}
+
+	got, err := readNextBlockLink(context.Background(), store, prev)
+	if err != nil {
+		t.Fatalf("load next block link: %v", err)
+	}
+	if !got.Equals(&left) {
+		t.Fatalf("next block link = %s, want left split child %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
+	}
+}
+
+func TestCheckpointArchiveArtifactsAllowsBothShardSplitChildrenAfterDurableParent(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
+	left := testServedBlockID(0, int64(0x4000000000000000), 101, 2)
+	right := testServedBlockID(0, int64(-0x4000000000000000), 101, 3)
+	master := testServedBlockID(-1, int64(-1<<63), 90, 4)
+
+	if err = saveTestArchiveArtifacts(store, testArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(master, 0),
+			testLinkPreviousBlock(prev, master.SeqNo),
+		},
+	}); err != nil {
+		t.Fatalf("save durable split parent: %v", err)
+	}
+	if err = saveTestArchiveArtifacts(store, testArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(right, master.SeqNo),
+			testLinkPreviousBlock(left, master.SeqNo),
+		},
+		Links: []storage.ServedBlockLink{
+			{Prev: prev, Next: right},
+			{Prev: prev, Next: left},
+		},
+	}); err != nil {
+		t.Fatalf("save split children: %v", err)
 	}
 
 	got, err := readNextBlockLink(context.Background(), store, prev)
@@ -455,6 +535,27 @@ func TestStoredZeroStateBlocks(t *testing.T) {
 	}
 	if !containsBlock(blocks, blockA) || !containsBlock(blocks, blockB) {
 		t.Fatalf("stored zerostate blocks = %#v, want both test blocks", blocks)
+	}
+}
+
+func TestSaveZeroStateRejectsEmptyData(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x12}, 32),
+	}
+	if err = store.SaveZeroState(block, nil, nil); err == nil {
+		t.Fatal("empty zerostate data was accepted")
+	}
+	if _, err = store.ZeroState(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("zerostate after rejected save error = %v, want ErrNotFound", err)
 	}
 }
 

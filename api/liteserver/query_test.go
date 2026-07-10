@@ -1200,8 +1200,9 @@ func TestLiveStoreCurrentMasterchainInfoUsesLiveMetaUTime(t *testing.T) {
 			StateRootHash: stateRootHash,
 			GenUTime:      12346,
 		},
-		ArtifactFlushed: true,
-		StateFlushed:    true,
+		ArtifactFlushed:  true,
+		StateFlushed:     true,
+		AvailabilityOnly: true,
 	}); err != nil {
 		t.Fatalf("publish live artifact: %v", err)
 	}
@@ -1697,8 +1698,9 @@ func TestLiveStorePublishedArtifactsAreAuthoritative(t *testing.T) {
 			Kind: storage.ServedProofBlock,
 			Data: proofData,
 		}},
-		ArtifactFlushed: true,
-		StateFlushed:    true,
+		ArtifactFlushed:  true,
+		StateFlushed:     true,
+		AvailabilityOnly: true,
 	}); err != nil {
 		t.Fatalf("publish live artifacts: %v", err)
 	}
@@ -1744,13 +1746,14 @@ func TestLiveStoreDoesNotReadFutureMasterBlockFromBacking(t *testing.T) {
 	}
 	live := NewLiveStore(store)
 	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-		Block:           currentID,
-		Root:            currentBlockRoot,
-		BlockData:       currentData,
-		Meta:            &storage.BlockMeta{ID: currentID, StateRootHash: currentRoot.Hash(0)},
-		State:           &storage.BlockState{Block: currentID, StateRootHash: currentRoot.Hash(0), Cell: currentRoot},
-		ArtifactFlushed: true,
-		StateFlushed:    true,
+		Block:            currentID,
+		Root:             currentBlockRoot,
+		BlockData:        currentData,
+		Meta:             &storage.BlockMeta{ID: currentID, StateRootHash: currentRoot.Hash(0)},
+		State:            &storage.BlockState{Block: currentID, StateRootHash: currentRoot.Hash(0), Cell: currentRoot},
+		ArtifactFlushed:  true,
+		StateFlushed:     true,
+		AvailabilityOnly: true,
 	}); err != nil {
 		t.Fatalf("publish current live artifacts: %v", err)
 	}
@@ -1841,11 +1844,12 @@ func TestLiveStoreDoesNotTrimUnflushedLiveState(t *testing.T) {
 
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
 	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-		Block:           id,
-		Root:            blockRoot,
-		BlockData:       blockData,
-		State:           &state,
-		ArtifactFlushed: true,
+		Block:            id,
+		Root:             blockRoot,
+		BlockData:        blockData,
+		State:            &state,
+		ArtifactFlushed:  true,
+		AvailabilityOnly: true,
 	}); err != nil {
 		t.Fatalf("publish live artifacts: %v", err)
 	}
@@ -1880,11 +1884,12 @@ func TestLiveStoreTrimsCheckpointFlushedHistoricalState(t *testing.T) {
 
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 0, ShardBlockCache: 0})
 	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-		Block:           id,
-		Root:            blockRoot,
-		BlockData:       blockData,
-		State:           &state,
-		ArtifactFlushed: true,
+		Block:            id,
+		Root:             blockRoot,
+		BlockData:        blockData,
+		State:            &state,
+		ArtifactFlushed:  true,
+		AvailabilityOnly: true,
 	}); err != nil {
 		t.Fatalf("publish live artifacts: %v", err)
 	}

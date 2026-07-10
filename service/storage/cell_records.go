@@ -797,10 +797,6 @@ func cellRecordBits(record *CellRecord) (uint, error) {
 	if record.D2%2 == 0 {
 		return uint(bodyLen * 8), nil
 	}
-	if bodyLen == 0 {
-		return 0, fmt.Errorf("invalid partial cell body size")
-	}
-
 	last := record.Data[bodyLen-1]
 	terminatorBit := -1
 	for i := 0; i < 7; i++ {

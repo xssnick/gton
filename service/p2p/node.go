@@ -35,7 +35,6 @@ import (
 )
 
 type dhtBackend interface {
-	Close()
 	FindOverlayNodes(ctx context.Context, overlayKey []byte, continuation ...*dht.Continuation) (*overlay.NodesList, *dht.Continuation, error)
 	FindAddresses(ctx context.Context, key []byte) (*adnladdr.List, ed25519.PublicKey, error)
 	FindValue(ctx context.Context, key *dht.Key, continuation ...*dht.Continuation) (*dht.Value, *dht.Continuation, error)
@@ -44,15 +43,9 @@ type dhtBackend interface {
 }
 
 var _ dhtBackend = (*dht.Client)(nil)
-var _ dhtBackend = (*serverDHTBackend)(nil)
+var _ dhtBackend = (*dht.Server)(nil)
 
 var ErrOffline = errors.New("p2p node is offline")
-
-type serverDHTBackend struct {
-	*dht.Server
-}
-
-func (b *serverDHTBackend) Close() {}
 
 type Node struct {
 	log                 zerolog.Logger
@@ -64,6 +57,7 @@ type Node struct {
 	dhtPrivKey          ed25519.PrivateKey
 	gateway             *adnl.Gateway
 	dhtGateway          *adnl.Gateway
+	dhtClient           *dht.Client
 	dhtServer           *dht.Server
 	dht                 dhtBackend
 	pool                *peerPool
@@ -543,11 +537,11 @@ func (n *Node) stop() {
 		n.stopAcceptingInbound()
 
 		if networkStarted {
+			if n.dhtClient != nil {
+				n.dhtClient.Close()
+			}
 			if n.dhtServer != nil {
 				_ = n.dhtServer.Close()
-			}
-			if n.dhtServer == nil && n.dht != nil {
-				n.dht.Close()
 			}
 			if n.dhtGateway != nil {
 				_ = n.dhtGateway.Close()
@@ -875,6 +869,7 @@ func (n *Node) startDHTClient(cfg *liteclient.GlobalConfig) error {
 	}
 
 	n.dhtGateway = dhtGateway
+	n.dhtClient = client
 	n.dht = client
 
 	return nil

@@ -12,6 +12,7 @@ import (
 
 	"github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -126,13 +127,13 @@ func TestStartSubscriptionSkipsStoppedNode(t *testing.T) {
 	cancel()
 	node.runCtx = runCtx
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:       node,
 		spec:       overlaySpec{Name: "basechain"},
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 	if node.startSubscription(sub) {
 		t.Fatal("stopped node should not start overlay subscription")
 	}
@@ -188,7 +189,7 @@ func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
 
 func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "basechain",
@@ -196,7 +197,7 @@ func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 	sub.setActive(false, time.Now().Add(time.Minute))
 
 	err := sub.answerPeerQuery(nil, GetCapabilities{}, func(context.Context, tl.Serializable) error {
@@ -511,8 +512,8 @@ func TestStartDHTClientUsesSeparateGateway(t *testing.T) {
 		t.Fatalf("start DHT client: %v", err)
 	}
 	t.Cleanup(func() {
-		if node.dht != nil {
-			node.dht.Close()
+		if node.dhtClient != nil {
+			node.dhtClient.Close()
 		}
 	})
 
@@ -557,11 +558,11 @@ func TestStartDHTServerUsesDedicatedGatewayIDAndServerBackend(t *testing.T) {
 		t.Fatal("expected DHT server to be initialized")
 	}
 
-	backend, ok := node.dht.(*serverDHTBackend)
+	backend, ok := node.dht.(*dht.Server)
 	if !ok {
 		t.Fatalf("expected p2p DHT handle to use server backend, got %T", node.dht)
 	}
-	if backend.Server != node.dhtServer {
+	if backend != node.dhtServer {
 		t.Fatal("expected p2p DHT handle to point at DHT server")
 	}
 

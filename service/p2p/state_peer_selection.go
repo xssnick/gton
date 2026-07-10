@@ -235,10 +235,7 @@ func (s *overlaySubscription) prioritizeLiveNextPeers(peers []*overlayPeer, pref
 	}
 
 	states := s.liveNextPeerSnapshot(peers)
-	leases := map[PeerID]int{}
-	if s.node != nil {
-		leases = s.node.downloadPeerLeaseSnapshot(peers)
-	}
+	leases := s.node.downloadPeerLeaseSnapshot(peers)
 
 	// Rank once per peer (one statsSnapshot each) instead of per comparison.
 	type rankedLiveNextPeer struct {

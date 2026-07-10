@@ -277,7 +277,6 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	liveStore := liveview.New(store, liveViewOptions)
 	tvmInstance := tvm.NewTVM()
 
-	currentStatePublisher := service.CurrentStatePublisher(liveStore)
 	externalMessageLogger := componentLogger(baseLogger, "external_message")
 	externalMessageChecker, err := externalmsg.NewChecker(externalmsg.Options{
 		Logger: &externalMessageLogger,
@@ -316,9 +315,9 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		NextBlockCheckpointBlocks:               nextCheckpointBlocks,
 		CheckpointBytes:                         checkpointBytes,
 		SyncBackpressureWindows:                 syncBackpressureWindows,
-		CurrentStatePublisher:                   currentStatePublisher,
+		CurrentStatePublisher:                   liveStore,
 		LiveBlockCache:                          liveBlockCache,
-		CurrentStatePublisherUsesLiveBlockCache: liveStore != nil,
+		CurrentStatePublisherUsesLiveBlockCache: true,
 		ShutdownContext:                         shutdownCtx,
 		StateFilesDir:                           stateFilesDir,
 		StateTTL:                                stateTTL,
@@ -334,9 +333,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		ExternalMessageChecker:                  externalMessageChecker,
 	})
 	node.SetRuntimeCallbacks(svc)
-	if currentStatePublisher != nil {
-		node.SetBlockCacheObserver(currentStatePublisher)
-	}
+	node.SetBlockCacheObserver(liveStore)
 	if runtimeMetrics != nil {
 		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
 			ServiceStatusReader: svc.StatusSnapshot,

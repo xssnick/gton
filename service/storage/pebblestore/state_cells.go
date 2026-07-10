@@ -399,7 +399,7 @@ func (s *Store) CellRecordInGeneration(ctx context.Context, generation uint64, h
 }
 
 func (s *Store) LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	return s.loadLazyCell(ctx, hash)
+	return s.loadLazyCellFromGeneration(ctx, 0, hash)
 }
 
 func (s *Store) LazyCellLoader() cell.LazyCellLoader {
@@ -425,10 +425,6 @@ func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellL
 		}
 		return loaded, nil
 	}
-}
-
-func (s *Store) loadLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	return s.loadLazyCellFromGeneration(ctx, 0, hash)
 }
 
 func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {

@@ -76,11 +76,11 @@ func TestFixedOverlayPeerNeedsTrafficBeforeAlive(t *testing.T) {
 }
 
 func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: make([]PeerID, 0, maxQueryNeighbours),
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxQueryNeighbours; i++ {
@@ -120,14 +120,14 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 
 func TestReloadNeighboursKeepsLeasedWorstPeer(t *testing.T) {
 	leasedID := testPeerID("a")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		node: &Node{
 			peerUse: map[PeerID]peerUse{leasedID: {downloads: 1}},
 		},
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: make([]PeerID, 0, maxQueryNeighbours),
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxQueryNeighbours; i++ {
@@ -165,12 +165,12 @@ func TestReloadNeighboursKeepsLeasedWorstPeer(t *testing.T) {
 func TestReloadNeighboursKeepsSessionPinnedArchivePeer(t *testing.T) {
 	pinnedID := testPeerID("a")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		node:       node,
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: make([]PeerID, 0, maxQueryNeighbours),
-	}
+	})
 	session := node.BeginArchiveSession()
 	defer session.Close()
 
@@ -210,12 +210,12 @@ func TestReloadNeighboursKeepsSessionPinnedArchivePeer(t *testing.T) {
 
 func TestReloadNeighboursDoesNotRandomRotateLeasedNeighbours(t *testing.T) {
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		node:       node,
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: make([]PeerID, 0, maxQueryNeighbours),
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxQueryNeighbours; i++ {
@@ -254,14 +254,14 @@ func TestReloadNeighboursDoesNotRandomRotateLeasedNeighbours(t *testing.T) {
 
 func TestReloadNeighboursPrunesDeadLeasedPeer(t *testing.T) {
 	deadID := testPeerID("dead")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		node: &Node{
 			peerUse: map[PeerID]peerUse{deadID: {downloads: 1}},
 		},
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: []PeerID{deadID},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	sub.peers[deadID] = &overlayPeer{
@@ -294,12 +294,12 @@ func TestReloadNeighboursPrunesDeadLeasedPeer(t *testing.T) {
 func TestReloadNeighboursPrunesDeadSessionPinnedArchivePeer(t *testing.T) {
 	deadID := testPeerID("dead")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		node:       node,
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: []PeerID{deadID},
-	}
+	})
 	session := node.BeginArchiveSession()
 	defer session.Close()
 
@@ -333,11 +333,11 @@ func TestReloadNeighboursPrunesDeadSessionPinnedArchivePeer(t *testing.T) {
 }
 
 func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: []PeerID{testPeerID("dead")},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	deadID := testPeerID("dead")
@@ -368,10 +368,10 @@ func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 }
 
 func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
@@ -394,10 +394,10 @@ func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
 }
 
 func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
@@ -424,10 +424,10 @@ func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
 }
 
 func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
@@ -466,7 +466,7 @@ func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			peerPool, pooled, _ := newTestLeasedPooledPeer("candidate-" + tt.name)
 			protectedID := testPeerID("protected-" + tt.name)
-			sub := &overlaySubscription{
+			sub := testOverlaySubscription(&overlaySubscription{
 				log: discardLogger(),
 				node: &Node{
 					pool: peerPool,
@@ -476,7 +476,7 @@ func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
 				},
 				spec:  overlaySpec{ShortID: []byte{0x01}, Kind: overlayKindPublicShard},
 				peers: map[PeerID]*overlayPeer{},
-			}
+			})
 
 			now := int32(time.Now().Unix())
 			protected := &overlayPeer{
@@ -513,10 +513,10 @@ func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
 }
 
 func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < maxPeersPerOverlay; i++ {
@@ -543,11 +543,11 @@ func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
 }
 
 func TestPingTargetsRotateNeighbours(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{},
 		neighbours: []PeerID{},
-	}
+	})
 
 	now := int32(time.Now().Unix())
 	for i := 0; i < 8; i++ {
@@ -574,11 +574,11 @@ func TestPingTargetsRotateNeighbours(t *testing.T) {
 }
 
 func TestEnsurePeersReturnsWhenFirstPeerArrives(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -616,11 +616,11 @@ func TestStartSeedFromDHTSetsCooldownAfterSearch(t *testing.T) {
 	fake := &fakeDHTClient{}
 	node.dht = fake
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	before := time.Now()
 	sub.startSeedFromDHT(context.Background())
@@ -653,11 +653,11 @@ func TestStartSeedFromDHTRefreshesWhenPeerPoolIsFull(t *testing.T) {
 	fake := &fakeDHTClient{}
 	node.dht = fake
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 	for i := 0; i < maxPeersPerOverlay; i++ {
 		id := testPeerID(string(rune('a' + i)))
 		sub.peers[id] = &overlayPeer{
@@ -802,8 +802,6 @@ type fakeDHTClient struct {
 	findOverlayNodesDeadline time.Time
 	findAddressesDeadline    time.Time
 }
-
-func (f *fakeDHTClient) Close() {}
 
 func (f *fakeDHTClient) findOverlayNodesCallCount() int {
 	f.mx.Lock()

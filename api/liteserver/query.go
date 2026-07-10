@@ -419,13 +419,10 @@ func errorResponse(err error, fallback string) ton.LSError {
 	}
 	if errors.Is(err, storage.ErrNotFound) {
 		text := fallback + ": not found"
-		if err != nil && err.Error() != storage.ErrNotFound.Error() {
+		if err.Error() != storage.ErrNotFound.Error() {
 			text = fallback + ": " + err.Error()
 		}
 		return ton.LSError{Code: errCodeNotReady, Text: text}
-	}
-	if err == nil {
-		return ton.LSError{Code: errCodeInternal, Text: fallback}
 	}
 	return ton.LSError{Code: errCodeInternal, Text: fallback + ": " + err.Error()}
 }

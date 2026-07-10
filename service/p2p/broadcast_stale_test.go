@@ -67,14 +67,14 @@ func TestClassifyDropsAlreadyAppliedMasterchainBroadcastBeforeSignatureCheck(t *
 	verifier := &countingBroadcastSignatureVerifier{}
 	node.signatureVerifier = verifier
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "masterchain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	proofBOC := cell.BeginCell().EndCell().ToBOC()
 	broadcast := func(seqno uint32, marker byte) tonnodeapi.BlockBroadcast {
@@ -130,14 +130,14 @@ func TestClassifyBlockFinalityBroadcastRejectsOrdinarySignatureSetBeforeSignatur
 	verifier := &countingBroadcastSignatureVerifier{}
 	node.signatureVerifier = verifier
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x04, 0x05, 0x06},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	msg := BlockFinalityBroadcast{
 		ID: testBlockID(0, topShard, 302),

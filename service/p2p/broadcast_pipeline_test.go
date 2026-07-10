@@ -52,28 +52,16 @@ func (o *testBroadcastPipelineObserver) requireStage(t *testing.T, stage string,
 	t.Fatalf("missing broadcast pipeline observation stage=%s kind=%s delivery=%s result=%s in %#v", stage, kind, delivery, result, o.observations)
 }
 
-func (o *testBroadcastPipelineObserver) requireNoStage(t *testing.T, stage string, kind string, delivery Delivery) {
-	t.Helper()
-
-	for _, observation := range o.observations {
-		if observation.Stage == stage &&
-			observation.Kind == kind &&
-			observation.Delivery == delivery {
-			t.Fatalf("unexpected broadcast pipeline observation stage=%s kind=%s delivery=%s in %#v", stage, kind, delivery, o.observations)
-		}
-	}
-}
-
 func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePrecheck(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "masterchain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	tests := []struct {
 		name  string
@@ -127,14 +115,14 @@ func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePreche
 
 func TestClassifyBroadcastUsesPeerAsFECSourcePeerID(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	peer := &overlayPeer{id: testPeerID("peer-a"), addr: "peer-a"}
 	block := testBlockID(0, topShard, 202)
 	msg := tonnodeapi.NewShardBlockBroadcast{
@@ -156,14 +144,14 @@ func TestClassifyBroadcastUsesPeerAsFECSourcePeerID(t *testing.T) {
 
 func TestClassifyBroadcastDoesNotSerializeInvalidPayload(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	payload := newSerializedBroadcastPayload(make(chan struct{}))
 
 	accepted, err := sub.classifyBroadcastPayload(nil, tonnodeapi.NewExternalMessageBroadcast{}, payload, DeliveryFEC, false, testPeerID("peer"))
@@ -180,14 +168,14 @@ func TestClassifyBroadcastDoesNotSerializeInvalidPayload(t *testing.T) {
 
 func TestClassifyDuplicateIdentifiedBroadcastDoesNotSerializePayload(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	downloaded := testShardBroadcastDownloadedBlock(t, 207, 0x207)
 	msg := tonnodeapi.NewBlockCandidateBroadcast{
@@ -217,7 +205,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	node.SetBroadcastPipelineObserver(observer)
 
 	sourceID := testPeerID("source")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:         "custom.private-a",
@@ -226,7 +214,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 			BlockSenders: map[PeerID]struct{}{sourceID: {}},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	downloaded := testShardBroadcastDownloadedBlock(t, 206, 0x206)
 	candidate := tonnodeapi.NewBlockCandidateBroadcast{
@@ -294,14 +282,14 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T) {
 	node := newTestNode(t)
 	node.signatureVerifier = testRejectBroadcastSignatureVerifier{err: errors.New("bad signatures")}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	block := testBlockID(0, topShard, 202)
 	msg := tonnodeapi.NewShardBlockBroadcast{
@@ -361,7 +349,7 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 	node := newTestNode(t)
 	source := testRebroadcastQueuePeer("source")
 	target := testRebroadcastQueuePeer("target")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
@@ -372,7 +360,7 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 			source.id: source,
 			target.id: target,
 		},
-	}
+	})
 	block := testBlockID(0, topShard, 203)
 	msg := tonnodeapi.NewShardBlockBroadcast{
 		Block: tonnodeapi.NewShardBlock{
@@ -419,7 +407,7 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 
 func TestCustomOverlayRejectsUnauthorizedBlockSender(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:         "custom.private-a",
@@ -428,7 +416,7 @@ func TestCustomOverlayRejectsUnauthorizedBlockSender(t *testing.T) {
 			BlockSenders: map[PeerID]struct{}{testPeerID("allowed"): {}},
 		},
 		log: discardLogger(),
-	}
+	})
 	block := testBlockID(0, topShard, 204)
 	msg := tonnodeapi.NewShardBlockBroadcast{
 		Block: tonnodeapi.NewShardBlock{
@@ -456,7 +444,7 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 	observer := &testBroadcastPipelineObserver{}
 	node.SetBroadcastPipelineObserver(observer)
 	sourceID := testPeerID("source")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:         "custom.private-a",
@@ -465,7 +453,7 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 			BlockSenders: map[PeerID]struct{}{sourceID: {}},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	block := testBlockID(0, topShard, 204)
 	msg := tonnodeapi.NewShardBlockBroadcast{
@@ -537,7 +525,7 @@ func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
 
 			source := testRebroadcastQueuePeer("source")
 			target := testRebroadcastQueuePeer("target")
-			sub := &overlaySubscription{
+			sub := testOverlaySubscription(&overlaySubscription{
 				node: node,
 				spec: overlaySpec{
 					Name:    "basechain",
@@ -548,7 +536,7 @@ func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
 					source.id: source,
 					target.id: target,
 				},
-			}
+			})
 			payload, err := tl.Serialize(tt.msg, true)
 			if err != nil {
 				t.Fatalf("serialize candidate broadcast: %v", err)
@@ -577,7 +565,7 @@ func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
 func TestCustomOverlayDropsIHRBroadcast(t *testing.T) {
 	node := newTestNode(t)
 	sourceID := testPeerID("source")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:       "custom.private-a",
@@ -586,7 +574,7 @@ func TestCustomOverlayDropsIHRBroadcast(t *testing.T) {
 			MsgSenders: map[PeerID]int{sourceID: 1},
 		},
 		log: discardLogger(),
-	}
+	})
 	msg := IhrMessageBroadcast{
 		Message: IhrMessage{Data: []byte{0x01}},
 	}
@@ -606,7 +594,7 @@ func TestCustomOverlayDropsIHRBroadcast(t *testing.T) {
 
 func TestCustomOverlayDropsSelfBroadcast(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:         "custom.private-a",
@@ -615,7 +603,7 @@ func TestCustomOverlayDropsSelfBroadcast(t *testing.T) {
 			BlockSenders: map[PeerID]struct{}{node.localID: {}},
 		},
 		log: discardLogger(),
-	}
+	})
 	block := testBlockID(0, topShard, 211)
 	msg := tonnodeapi.NewShardBlockBroadcast{
 		Block: tonnodeapi.NewShardBlock{
@@ -640,14 +628,14 @@ func TestCustomOverlayDropsSelfBroadcast(t *testing.T) {
 
 func TestPublicOverlayAcceptsIHRBroadcast(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	msg := IhrMessageBroadcast{
 		Message: IhrMessage{Data: []byte{0x01}},
 	}
@@ -807,7 +795,7 @@ func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 	provider.failOnce.Store(true)
 	node.compressedState = provider
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
@@ -815,7 +803,7 @@ func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	blockCell := testPeerBlockRoot(t, 0, topShard, 213)
 	blockBOC := serializeCompressedBlockRoot(blockCell)
@@ -892,14 +880,14 @@ func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 
 func TestClassifyExternalMessageBroadcastCachesByBodyHash(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	data := testExternalMessageBOC(t)
 	msg := tonnodeapi.NewExternalMessageBroadcast{
 		Message: tonnodeapi.ExternalMessage{Data: data},
@@ -924,14 +912,14 @@ func TestClassifyExternalMessageBroadcastRunsAdmission(t *testing.T) {
 	node := newTestNode(t)
 	admission := &testExternalMessageAdmission{}
 	node.externalMessageAdmission = admission
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	data := testExternalMessageBOC(t)
 	msg := tonnodeapi.NewExternalMessageBroadcast{
 		Message: tonnodeapi.ExternalMessage{Data: data},
@@ -965,14 +953,14 @@ func TestClassifyExternalMessageBroadcastDropsWhenAdmissionFails(t *testing.T) {
 	node := newTestNode(t)
 	wantErr := errors.New("reject external")
 	node.externalMessageAdmission = &testExternalMessageAdmission{err: wantErr}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	data := testExternalMessageBOC(t)
 	msg := tonnodeapi.NewExternalMessageBroadcast{
 		Message: tonnodeapi.ExternalMessage{Data: data},
@@ -989,14 +977,14 @@ func TestClassifyExternalMessageBroadcastDropsWhenAdmissionFails(t *testing.T) {
 
 func TestHandleOverlayBroadcastRejectsInvalidUntrustedFECForRelay(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	err := sub.handleOverlayBroadcast(nil, tonnodeapi.NewExternalMessageBroadcast{}, DeliveryFEC, false, testPeerID("peer"))
 	if !errors.Is(err, errBroadcastRejected) {
@@ -1006,14 +994,14 @@ func TestHandleOverlayBroadcastRejectsInvalidUntrustedFECForRelay(t *testing.T) 
 
 func TestClassifyExternalMessageBroadcastLimitsPerAddress(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 
 	for i := 0; i < extmsg.DefaultAddressLimit; i++ {
 		data := testExternalMessageBOCWithBody(t, uint64(i))
@@ -1045,14 +1033,14 @@ func TestClassifyExternalMessageBroadcastLimitsPerAddress(t *testing.T) {
 
 func TestClassifyExternalMessageBroadcastSkipsOwnMessage(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	data := []byte{0xAA, 0xBB}
 	msg := tonnodeapi.NewExternalMessageBroadcast{
 		Message: tonnodeapi.ExternalMessage{Data: data},
@@ -1072,14 +1060,14 @@ func TestClassifyExternalMessageBroadcastSkipsOwnMessage(t *testing.T) {
 
 func TestClassifyExternalMessageBroadcastRejectsOversizeData(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:    "basechain",
 			ShortID: []byte{0x01, 0x02, 0x03},
 		},
 		log: discardLogger(),
-	}
+	})
 	msg := tonnodeapi.NewExternalMessageBroadcast{
 		Message: tonnodeapi.ExternalMessage{Data: make([]byte, maxOverlayPayloadSize+1)},
 	}
@@ -1095,14 +1083,14 @@ func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProc
 		t.Run(string(delivery), func(t *testing.T) {
 			node := newTestNode(t)
 			node.broadcastAdmission = testBroadcastAdmission(false)
-			sub := &overlaySubscription{
+			sub := testOverlaySubscription(&overlaySubscription{
 				node: node,
 				spec: overlaySpec{
 					Name:    "basechain",
 					ShortID: []byte{0x01, 0x02, 0x03},
 				},
 				log: discardLogger(),
-			}
+			})
 			peer := testRebroadcastQueuePeer("peer")
 			block := testBlockID(0, topShard, 77)
 			msg := tonnodeapi.NewBlockCandidateBroadcast{

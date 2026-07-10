@@ -372,6 +372,22 @@ func TestSyncerUsesConfiguredZeroStateWhenInitBlockIsEmpty(t *testing.T) {
 	}
 }
 
+func TestSyncerConfiguredTrustedKeyBlockAnchorPreservesZeroStateError(t *testing.T) {
+	emptyInit := ton.BlockIDExt{}
+	zero := testStateBlock(-1, topShard, 0)
+	source := &fakeSource{
+		initBlock:      &emptyInit,
+		zeroBlock:      &zero,
+		zeroStateError: context.Canceled,
+	}
+	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
+
+	_, err := syncer.configuredTrustedKeyBlockAnchor(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("trusted key block anchor error = %v, want context.Canceled", err)
+	}
+}
+
 func TestSyncerSyncZeroStateCurrentStoresMasterAndShardZeroStates(t *testing.T) {
 	zero := testStateBlock(-1, topShard, 0)
 	shard := testStateBlock(0, topShard, 0)
@@ -637,6 +653,7 @@ type fakeSource struct {
 	initBlock          *ton.BlockIDExt
 	zeroBlock          *ton.BlockIDExt
 	zeroState          *storage.BlockState
+	zeroStateError     error
 	zeroStates         map[storage.BlockRootHash]*storage.BlockState
 	states             map[storage.BlockRootHash]*storage.BlockState
 	keyBlockBatches    map[uint32]KeyBlockBatch
@@ -668,6 +685,9 @@ func (f *fakeSource) IsHardfork(context.Context, ton.BlockIDExt) bool {
 }
 
 func (f *fakeSource) ZeroState(_ context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
+	if f.zeroStateError != nil {
+		return nil, f.zeroStateError
+	}
 	if f.zeroStates != nil {
 		if state := f.zeroStates[storage.BlockKey(block)]; state != nil {
 			return newImmediateDownloadedState(state), nil

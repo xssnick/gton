@@ -743,9 +743,6 @@ func liveNextEarlyFailureCount(peerCount int) int {
 
 func (s *overlaySubscription) blockDownloadCandidates() []*overlayPeer {
 	peers := s.queryCandidates(0, 0)
-	if s.node == nil {
-		return peers
-	}
 	return s.node.prioritizeBlockDownloadPeers(peers)
 }
 

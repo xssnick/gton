@@ -42,7 +42,12 @@ type BlockView struct {
 	librariesLoaded    bool
 	extMsgLimits       ExternalMessageSizeLimits
 	extMsgLimitsLoaded bool
-	lazyLoad           liveLoadGroup[liveBlockFragmentLoadKey]
+	mcExtraLoad        liveLoadGroup[struct{}, *tlb.McStateExtra]
+	accountProofLoad   liveLoadGroup[accountProofLoadKey, accountProofResult]
+	shardHashesLoad    liveLoadGroup[shardHashesProofKey, *cell.Cell]
+	baseConfigLoad     liveLoadGroup[struct{}, *runMethodBaseConfig]
+	globalLibsLoad     liveLoadGroup[struct{}, *cell.Dictionary]
+	extMsgLimitsLoad   liveLoadGroup[struct{}, ExternalMessageSizeLimits]
 }
 
 type accountProofKey struct {
@@ -68,21 +73,8 @@ type shardHashesProofKey struct {
 	exact     bool
 }
 
-type liveBlockFragmentLoadKind uint8
-
-const (
-	liveBlockFragmentLoadMcExtra liveBlockFragmentLoadKind = iota
-	liveBlockFragmentLoadAccountProof
-	liveBlockFragmentLoadShardHashes
-	liveBlockFragmentLoadBaseConfig
-	liveBlockFragmentLoadGlobalLibraries
-	liveBlockFragmentLoadExternalMessageLimits
-)
-
-type liveBlockFragmentLoadKey struct {
-	kind    liveBlockFragmentLoadKind
+type accountProofLoadKey struct {
 	account accountProofKey
-	shard   shardHashesProofKey
 	pruned  bool
 }
 
@@ -92,7 +84,7 @@ type liveBlockFragmentLoadKey struct {
 // concurrently stored value wins. get and put are called with view.mu held;
 // put stores the built value or adopts an existing one and returns the
 // canonical value. build runs without the lock.
-func lazyLoadFragment[V any](view *BlockView, key liveBlockFragmentLoadKey, get func() (V, bool), put func(V) V, build func() (V, error)) (V, error) {
+func lazyLoadFragment[K comparable, V any](view *BlockView, group *liveLoadGroup[K, V], key K, get func() (V, bool), put func(V) V, build func() (V, error)) (V, error) {
 	view.mu.Lock()
 	cached, ok := get()
 	view.mu.Unlock()
@@ -100,7 +92,7 @@ func lazyLoadFragment[V any](view *BlockView, key liveBlockFragmentLoadKey, get 
 		return cached, nil
 	}
 
-	value, err := view.lazyLoad.do(context.Background(), key, func() (any, error) {
+	value, err := group.do(context.Background(), key, func() (V, error) {
 		view.mu.Lock()
 		cached, ok := get()
 		view.mu.Unlock()
@@ -110,7 +102,8 @@ func lazyLoadFragment[V any](view *BlockView, key liveBlockFragmentLoadKey, get 
 
 		built, err := build()
 		if err != nil {
-			return nil, err
+			var zero V
+			return zero, err
 		}
 
 		view.mu.Lock()
@@ -122,15 +115,7 @@ func lazyLoadFragment[V any](view *BlockView, key liveBlockFragmentLoadKey, get 
 		var zero V
 		return zero, err
 	}
-
-	typed, ok := value.(V)
-	if !ok {
-		// The shared singleflight group stores heterogeneous fragment types
-		// under one key type; a mismatch means two getters collided on a key.
-		var zero V
-		return zero, fmt.Errorf("invalid %T cache value", zero)
-	}
-	return typed, nil
+	return value, nil
 }
 
 func buildBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
@@ -273,8 +258,8 @@ func (f *BlockView) accountProof(accountID []byte, pruned bool) ([]*cell.Cell, *
 }
 
 func (f *BlockView) accountFullProof(accountID []byte, key accountProofKey) ([]*cell.Cell, *cell.Cell, error) {
-	result, err := lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadAccountProof, account: key},
+	result, err := lazyLoadFragment(f, &f.accountProofLoad,
+		accountProofLoadKey{account: key},
 		func() (accountProofResult, bool) { return f.cachedAccountProofResultLocked(key, false) },
 		func(result accountProofResult) accountProofResult {
 			return f.rememberAccountProofStateLocked(key, result.proof, result.state, false)
@@ -294,8 +279,8 @@ func (f *BlockView) accountFullProof(accountID []byte, key accountProofKey) ([]*
 }
 
 func (f *BlockView) accountPrunedState(key accountProofKey, proof []*cell.Cell, fullState *cell.Cell) (*cell.Cell, error) {
-	result, err := lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadAccountProof, account: key, pruned: true},
+	result, err := lazyLoadFragment(f, &f.accountProofLoad,
+		accountProofLoadKey{account: key, pruned: true},
 		func() (accountProofResult, bool) { return f.cachedAccountProofResultLocked(key, true) },
 		func(result accountProofResult) accountProofResult {
 			return f.rememberAccountProofStateLocked(key, result.proof, result.state, true)
@@ -389,8 +374,7 @@ func (f *BlockView) buildAccountProof(accountID []byte, pruned bool) ([]*cell.Ce
 }
 
 func (f *BlockView) mcStateExtra() (*tlb.McStateExtra, error) {
-	return lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadMcExtra},
+	return lazyLoadFragment(f, &f.mcExtraLoad, struct{}{},
 		func() (*tlb.McStateExtra, bool) { return f.masterExtra, f.masterExtra != nil },
 		func(extra *tlb.McStateExtra) *tlb.McStateExtra {
 			if f.masterExtra == nil {
@@ -410,8 +394,7 @@ func (f *BlockView) mcStateExtra() (*tlb.McStateExtra, error) {
 
 func (f *BlockView) shardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
 	key := shardHashesProofKey{workchain: workchain, shard: shard, exact: exact}
-	return lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadShardHashes, shard: key},
+	return lazyLoadFragment(f, &f.shardHashesLoad, key,
 		func() (*cell.Cell, bool) {
 			proof := f.shardHashesProofs[key]
 			return proof, proof != nil
@@ -447,8 +430,7 @@ func (f *BlockView) runMethodConfig(now uint32, code *cell.Cell) (RunMethodConfi
 }
 
 func (f *BlockView) runMethodBaseConfig() (*runMethodBaseConfig, error) {
-	return lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadBaseConfig},
+	return lazyLoadFragment(f, &f.baseConfigLoad, struct{}{},
 		func() (*runMethodBaseConfig, bool) { return f.baseConfig, f.baseConfig != nil },
 		func(config *runMethodBaseConfig) *runMethodBaseConfig {
 			if f.baseConfig == nil {
@@ -475,8 +457,7 @@ func (f *BlockView) runMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Ce
 }
 
 func (f *BlockView) globalLibraries() (*cell.Dictionary, error) {
-	return lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadGlobalLibraries},
+	return lazyLoadFragment(f, &f.globalLibsLoad, struct{}{},
 		func() (*cell.Dictionary, bool) { return f.globalLibs, f.librariesLoaded },
 		func(globalLibs *cell.Dictionary) *cell.Dictionary {
 			if !f.librariesLoaded {

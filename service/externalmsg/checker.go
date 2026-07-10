@@ -272,8 +272,6 @@ func blockIDEqual(a ton.BlockIDExt, b ton.BlockIDExt) bool {
 
 func randSeed() []byte {
 	var seed [32]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		return nil
-	}
+	rand.Read(seed[:])
 	return seed[:]
 }

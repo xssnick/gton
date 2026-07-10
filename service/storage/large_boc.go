@@ -43,9 +43,6 @@ func LargeBOCMetaRecordFromCellRecord(record *CellRecord) (cell.LargeBOCMetaReco
 	if err != nil {
 		return cell.LargeBOCMetaRecord{}, err
 	}
-	if bits > 1023 {
-		return cell.LargeBOCMetaRecord{}, fmt.Errorf("cell bits length is too large: %d", bits)
-	}
 
 	meta := cell.LargeBOCMetaRecord{
 		D1:     record.D1,
@@ -104,10 +101,6 @@ func LargeBOCMetaRecordFromEncodedCellRecord(hash []byte, data []byte) (cell.Lar
 func largeBOCMetaRecordFromParsedEncodedCellRecord(record largeBOCEncodedCellRecord, bits uint) (cell.LargeBOCMetaRecord, error) {
 	if len(record.hash) != cellHashSize {
 		return cell.LargeBOCMetaRecord{}, fmt.Errorf("cell hash size mismatch: %d", len(record.hash))
-	}
-
-	if bits > 1023 {
-		return cell.LargeBOCMetaRecord{}, fmt.Errorf("cell bits length is too large: %d", bits)
 	}
 
 	meta := cell.LargeBOCMetaRecord{
@@ -208,25 +201,18 @@ func AppendLargeBOCRecordFromEncodedCellRecord(hash []byte, encoded []byte, aren
 	if err != nil {
 		return cell.LargeBOCRecord{}, arena, err
 	}
-	payload, arena, err := appendLargeBOCPayloadRecordFromParsedEncodedCellRecord(record, bits, arena)
-	if err != nil {
-		return cell.LargeBOCRecord{}, arena, err
-	}
+	payload, arena := appendLargeBOCPayloadRecordFromParsedEncodedCellRecord(record, bits, arena)
 	return cell.LargeBOCRecord{Meta: meta, Payload: payload}, arena, nil
 }
 
-func appendLargeBOCPayloadRecordFromParsedEncodedCellRecord(record largeBOCEncodedCellRecord, bits uint, arena []byte) (cell.LargeBOCPayloadRecord, []byte, error) {
-	if bits > 1023 {
-		return cell.LargeBOCPayloadRecord{}, arena, fmt.Errorf("cell bits length is too large: %d", bits)
-	}
-
+func appendLargeBOCPayloadRecordFromParsedEncodedCellRecord(record largeBOCEncodedCellRecord, bits uint, arena []byte) (cell.LargeBOCPayloadRecord, []byte) {
 	start := len(arena)
 	arena = append(arena, record.data...)
 	payload := arena[start:]
 	if tailBits := bits % 8; tailBits != 0 {
 		payload[len(payload)-1] &= byte(0xff << (8 - tailBits))
 	}
-	return cell.LargeBOCPayloadRecord{Data: payload}, arena, nil
+	return cell.LargeBOCPayloadRecord{Data: payload}, arena
 }
 
 func largeBOCPayloadDataFromCellRecord(record *CellRecord) ([]byte, uint, error) {
@@ -234,15 +220,7 @@ func largeBOCPayloadDataFromCellRecord(record *CellRecord) ([]byte, uint, error)
 	if err != nil {
 		return nil, 0, err
 	}
-	if bits > 1023 {
-		return nil, 0, fmt.Errorf("cell bits length is too large: %d", bits)
-	}
-
-	bodyLen := int((bits + 7) / 8)
-	if len(record.Data) < bodyLen {
-		return nil, 0, fmt.Errorf("cell body size mismatch: got=%d want=%d", len(record.Data), bodyLen)
-	}
-	return record.Data[:bodyLen], bits, nil
+	return record.Data, bits, nil
 }
 
 func largeBOCPayloadDataFromEncodedCellRecord(encoded []byte) ([]byte, uint, error) {
@@ -260,9 +238,6 @@ func largeBOCPayloadDataFromEncodedCellRecord(encoded []byte) ([]byte, uint, err
 	bits, err := largeBOCEncodedCellBits(d2, data)
 	if err != nil {
 		return nil, 0, err
-	}
-	if bits > 1023 {
-		return nil, 0, fmt.Errorf("cell bits length is too large: %d", bits)
 	}
 	return data, bits, nil
 }
@@ -352,10 +327,6 @@ func largeBOCEncodedCellBits(d2 byte, data []byte) (uint, error) {
 	if d2%2 == 0 {
 		return uint(bodyLen * 8), nil
 	}
-	if bodyLen == 0 {
-		return 0, fmt.Errorf("invalid partial cell body size")
-	}
-
 	last := data[bodyLen-1]
 	terminatorBit := -1
 	for i := 0; i < 7; i++ {

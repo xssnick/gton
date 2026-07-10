@@ -267,9 +267,6 @@ func (n *Node) deletePendingBlockBroadcastDecodeLocked(fingerprint string) {
 	delete(n.pendingBroadcasts, fingerprint)
 	n.deletePendingBlockBroadcastPrevIndexLocked(req)
 	n.pendingBroadcastBytes -= req.bytes
-	if n.pendingBroadcastBytes < 0 {
-		n.pendingBroadcastBytes = 0
-	}
 }
 
 func (n *Node) addPendingBlockBroadcastPrevIndexLocked(req pendingBlockBroadcastDecode) {

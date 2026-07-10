@@ -34,7 +34,7 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -42,7 +42,7 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetCapabilities{})
 	if err != nil {
@@ -95,14 +95,14 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 
 func TestCustomFixedOverlayDoesNotAnswerGetRandomPeers(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name: "custom.private-a",
 			Kind: overlayKindCustomFixed,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, overlay.GetRandomPeers{})
 	if err == nil || !strings.Contains(err.Error(), "overlay is private") {
@@ -216,11 +216,11 @@ func TestLocalExternalRebroadcastQueueHasPriority(t *testing.T) {
 
 func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
 		log:  discardLogger(),
-	}
+	})
 
 	block := testBlockID(0, topShard, 42)
 	data := []byte{0xAA, 0xBB, 0xCC}
@@ -258,11 +258,11 @@ func TestDispatchPeerQuerySendExtMessageRejectsInvalidMessage(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
 		log:  discardLogger(),
-	}
+	})
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, SendExtMessage{
 		Message: tonnodeapi.ExternalMessage{Data: []byte{0xAA, 0xBB}},
@@ -307,12 +307,12 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 		t.Fatalf("build overlay spec: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	_, foreignPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -369,10 +369,10 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 
 func TestOverlayNodeIdentityRejectsMalformedIDWithoutPanic(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{ShortID: make([]byte, 32)},
-	}
+	})
 	malformed := overlay.Node{
 		Overlay: sub.spec.ShortID,
 		Version: int32(time.Now().Unix()),
@@ -398,12 +398,12 @@ func TestHandleGetRandomPeersSkipsMalformedAnnouncement(t *testing.T) {
 		t.Fatalf("build overlay spec: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 	malformedPeerID := testPeerID("malformed")
 	sub.peers[malformedPeerID] = &overlayPeer{
 		id:        malformedPeerID,
@@ -456,13 +456,13 @@ func TestOverlayNodesSnapshotConcurrentAnnouncementUpdate(t *testing.T) {
 	peerID := testPeerID("peer")
 	peer := &overlayPeer{id: peerID, alive: true}
 	peer.mergeAnnouncement(firstNode)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: spec,
 		peers: map[PeerID]*overlayPeer{
 			peerID: peer,
 		},
-	}
+	})
 
 	start := make(chan struct{})
 	done := make(chan struct{})
@@ -522,12 +522,12 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		t.Fatalf("build overlay spec: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	now := time.Now()
 	for i := 0; i < maxRandomPeerReply*3; i++ {
@@ -579,12 +579,12 @@ func TestConnectOverlayNodeSkipsSelf(t *testing.T) {
 		t.Fatalf("build overlay spec: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	self, err := node.selfOverlayNode(spec)
 	if err != nil {
@@ -620,12 +620,12 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 		t.Fatalf("build overlay spec: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  spec,
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{},
-	}
+	})
 
 	_, foreignPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -824,7 +824,7 @@ func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
 }
 
 func TestKnownPeerCountIgnoresInboundOnlyPeers(t *testing.T) {
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		peers: map[PeerID]*overlayPeer{
 			testPeerID("inbound-only"): {},
@@ -834,7 +834,7 @@ func TestKnownPeerCountIgnoresInboundOnlyPeers(t *testing.T) {
 				lastReceiveAt: time.Now(),
 			},
 		},
-	}
+	})
 
 	if got := len(sub.peers); got != 2 {
 		t.Fatalf("unexpected total peer count: got %d want 2", got)

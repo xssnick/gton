@@ -632,9 +632,7 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
-		if s.stateCellPrewrite != nil {
-			s.stateCellPrewrite.start(ctx, s.currentStatePersistContext(), s.runAsync)
-		}
+		s.stateCellPrewrite.start(ctx, s.currentStatePersistContext(), s.runAsync)
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
 		})
@@ -665,10 +663,8 @@ func (s *Service) Wait() {
 func (s *Service) StatusSnapshot() StatusSnapshot {
 	snapshot := StatusSnapshot{
 		StatusSnapshot: s.node.StatusSnapshot(),
+		BlockSync:      s.blockSync.StatusSnapshot(),
 		BackgroundTask: s.backgroundTaskStatus(),
-	}
-	if s.blockSync != nil {
-		snapshot.BlockSync = s.blockSync.StatusSnapshot()
 	}
 
 	ctx := context.Background()
@@ -772,26 +768,24 @@ func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *S
 		latestMaster = *snapshot.LatestMasterchain
 	}
 
-	if s.storage != nil {
-		shards, err := s.masterShardBlocks(ctx, latestMaster)
-		if err == nil {
-			setStatusLatestBasechain(snapshot, shards)
-			return
-		}
-		if !latestMaster.Equals(&current.Masterchain.Block) {
-			s.log.Debug().
-				Err(err).
-				Str("latest_masterchain", storage.FormatBlockRef(latestMaster)).
-				Str("current_masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
-				Msg("skip latest basechain status because latest shard blocks are unavailable")
-			return
-		}
+	shards, err := s.masterShardBlocks(ctx, latestMaster)
+	if err == nil {
+		setStatusLatestBasechain(snapshot, shards)
+		return
 	}
-	shards := make([]ton.BlockIDExt, 0, len(current.Shards))
+	if !latestMaster.Equals(&current.Masterchain.Block) {
+		s.log.Debug().
+			Err(err).
+			Str("latest_masterchain", storage.FormatBlockRef(latestMaster)).
+			Str("current_masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
+			Msg("skip latest basechain status because latest shard blocks are unavailable")
+		return
+	}
+	currentShards := make([]ton.BlockIDExt, 0, len(current.Shards))
 	for _, shard := range current.Shards {
-		shards = append(shards, shard.Block)
+		currentShards = append(currentShards, shard.Block)
 	}
-	setStatusLatestBasechain(snapshot, shards)
+	setStatusLatestBasechain(snapshot, currentShards)
 }
 
 func setStatusLatestBasechain(snapshot *StatusSnapshot, shards []ton.BlockIDExt) {

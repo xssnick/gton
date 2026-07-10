@@ -201,9 +201,6 @@ func (c *shardBlockCandidateCache) pruneExpiredLocked(now time.Time) {
 		delete(c.proofs, key)
 		c.bytes -= entry.bytes
 	}
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 }
 
 func (c *shardBlockCandidateCache) pruneOverflowLocked() {
@@ -237,9 +234,6 @@ func (c *shardBlockCandidateCache) pruneOverflowLocked() {
 			entry := c.proofs[oldestKey]
 			delete(c.proofs, oldestKey)
 			c.bytes -= entry.bytes
-		}
-		if c.bytes < 0 {
-			c.bytes = 0
 		}
 	}
 }

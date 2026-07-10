@@ -223,52 +223,15 @@ func (s *Store) setServedBlockFullArtifactRefs(batch *pebble.Batch, block *stora
 	for _, kind := range proofKinds {
 		ref := proofRefs[kind]
 		if ref == nil {
-			continue
+			return fmt.Errorf(
+				"proof ref invariant violated: kind=%q block=%s",
+				kind,
+				storage.FormatBlockRef(block.ID),
+			)
 		}
 		if err := batch.Set(hotKeyStoredProofRef(kind, block.ID), encodeArtifactRef(ref), pebble.NoSync); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (s *Store) artifactAvailable(ctx context.Context, key []byte) error {
-	raw, err := s.getHotCopy(ctx, key)
-	if err != nil {
-		return err
-	}
-	ref, err := decodeArtifactRef(raw)
-	if err != nil {
-		return err
-	}
-	return s.checkArtifactRef(ref)
-}
-
-func (s *Store) checkArtifactRef(ref *storage.ArtifactRef) error {
-	if ref == nil {
-		return storage.ErrNotFound
-	}
-	if ref.Offset < 0 || ref.Size < 0 {
-		return storage.ErrNotFound
-	}
-	const maxInt64 = int64(^uint64(0) >> 1)
-	if ref.Offset > maxInt64-ref.Size {
-		return storage.ErrNotFound
-	}
-
-	path, err := s.artifactRefPath(context.Background(), ref)
-	if err != nil {
-		return err
-	}
-	stat, err := os.Stat(s.artifactPath(path))
-	if err != nil {
-		if isMissingArtifactError(err) {
-			return storage.ErrNotFound
-		}
-		return err
-	}
-	if stat.Size() < ref.Offset+ref.Size {
-		return storage.ErrNotFound
 	}
 	return nil
 }
@@ -319,6 +282,9 @@ func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHas
 		if err := s.requireNextBlockLinkTargetMaterialized(metas, prev, next); err != nil {
 			return err
 		}
+		// Later links read metas before Pebble, so preserve the durable fields in
+		// the staged view before adding a next-link delta.
+		mergePendingBlockMeta(metas, meta)
 		if len(meta.NextRefs) > 0 {
 			return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
 		}
@@ -413,7 +379,7 @@ func recordPendingNextBlockLink(metas map[storage.BlockRootHash]*storage.BlockMe
 
 func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
 	if len(data) == 0 {
-		return nil
+		return fmt.Errorf("zerostate data is empty")
 	}
 	if err := storage.ValidateBlockIDHashes(block); err != nil {
 		return err

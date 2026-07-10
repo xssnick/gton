@@ -168,16 +168,10 @@ func (m *Metrics) Handler() http.Handler {
 }
 
 func (m *Metrics) Namespace() string {
-	if m == nil {
-		return ""
-	}
 	return m.namespace
 }
 
 func (m *Metrics) RegisterCollector(collector prometheus.Collector) error {
-	if m == nil {
-		return errors.New("metrics registry is not configured")
-	}
 	return m.registry.Register(collector)
 }
 
@@ -228,89 +222,90 @@ func (m *Metrics) storageArtifactStatus() storageArtifactStatus {
 }
 
 func (m *Metrics) AddArchivePackageBytes(delta int64) {
-	if m == nil || m.artifactStatus == nil {
-		return
-	}
 	m.artifactStatus.AddArchivePackageBytes(delta)
 }
 
 func (m *Metrics) AddPersistentStateBytes(delta int64) {
-	if m == nil || m.artifactStatus == nil {
-		return
-	}
 	m.artifactStatus.AddPersistentStateBytes(delta)
 }
 
 func (m *Metrics) ObserveSyncBlock(observation service.SyncBlockObservation) {
-	if m == nil || m.syncBlocks == nil {
-		return
-	}
-	pipeline := fallbackLabel(observation.Pipeline)
-	chain := fallbackLabel(observation.Chain)
-	shard := fallbackLabel(observation.Shard)
-	source := fallbackLabel(string(observation.Source))
-	origin := fallbackLabel(string(observation.Origin))
-	result := fallbackLabel(observation.Result)
 	catchUp := strconv.FormatBool(observation.CatchUp)
 
-	m.syncBlocks.WithLabelValues(pipeline, chain, source, result, catchUp).Inc()
-	if m.syncBlockOrigins != nil {
-		m.syncBlockOrigins.WithLabelValues(pipeline, chain, origin, result, catchUp).Inc()
+	m.syncBlocks.WithLabelValues(
+		observation.Pipeline,
+		observation.Chain,
+		string(observation.Source),
+		observation.Result,
+		catchUp,
+	).Inc()
+	m.syncBlockOrigins.WithLabelValues(
+		observation.Pipeline,
+		observation.Chain,
+		string(observation.Origin),
+		observation.Result,
+		catchUp,
+	).Inc()
+	if observation.DownloadDuration > 0 {
+		m.syncBlockDownloadDuration.WithLabelValues(
+			observation.Pipeline,
+			observation.Chain,
+			string(observation.Source),
+			observation.Result,
+			catchUp,
+		).Observe(observation.DownloadDuration.Seconds())
 	}
-	if observation.DownloadDuration > 0 && m.syncBlockDownloadDuration != nil {
-		m.syncBlockDownloadDuration.WithLabelValues(pipeline, chain, source, result, catchUp).Observe(observation.DownloadDuration.Seconds())
+	if observation.PrepareDuration > 0 {
+		m.syncBlockPrepareDuration.WithLabelValues(
+			observation.Pipeline,
+			observation.Chain,
+			observation.Shard,
+			string(observation.Source),
+			observation.Result,
+			catchUp,
+		).Observe(observation.PrepareDuration.Seconds())
 	}
-	if observation.PrepareDuration > 0 && m.syncBlockPrepareDuration != nil {
-		m.syncBlockPrepareDuration.WithLabelValues(pipeline, chain, shard, source, result, catchUp).Observe(observation.PrepareDuration.Seconds())
-	}
-	if observation.ApplyDuration > 0 && m.syncBlockApplyDuration != nil {
-		m.syncBlockApplyDuration.WithLabelValues(pipeline, chain, result).Observe(observation.ApplyDuration.Seconds())
+	if observation.ApplyDuration > 0 {
+		m.syncBlockApplyDuration.WithLabelValues(
+			observation.Pipeline,
+			observation.Chain,
+			observation.Result,
+		).Observe(observation.ApplyDuration.Seconds())
 	}
 }
 
 func (m *Metrics) ObserveSyncObtain(observation service.SyncObtainObservation) {
-	if m == nil || m.syncObtainDuration == nil {
-		return
-	}
-	pipeline := fallbackLabel(observation.Pipeline)
-	stage := fallbackLabel(observation.Stage)
-	result := fallbackLabel(observation.Result)
 	catchUp := strconv.FormatBool(observation.CatchUp)
 	duration := observation.Duration
 	if duration < 0 {
 		duration = 0
 	}
 
-	m.syncObtainDuration.WithLabelValues(pipeline, stage, result, catchUp).Observe(duration.Seconds())
+	m.syncObtainDuration.WithLabelValues(
+		observation.Pipeline,
+		observation.Stage,
+		observation.Result,
+		catchUp,
+	).Observe(duration.Seconds())
 }
 
 func (m *Metrics) ObserveSyncPersist(observation service.SyncPersistObservation) {
-	if m == nil || m.syncCheckpoints == nil {
-		return
+	m.syncCheckpoints.WithLabelValues(observation.Mode, observation.Result).Inc()
+	if observation.Duration > 0 {
+		m.syncPersistDuration.WithLabelValues(observation.Mode, observation.Result).Observe(observation.Duration.Seconds())
 	}
-	mode := fallbackLabel(observation.Mode)
-	result := fallbackLabel(observation.Result)
-	m.syncCheckpoints.WithLabelValues(mode, result).Inc()
-	if observation.Duration > 0 && m.syncPersistDuration != nil {
-		m.syncPersistDuration.WithLabelValues(mode, result).Observe(observation.Duration.Seconds())
+	if observation.QueueDuration > 0 {
+		m.syncPersistQueueDuration.WithLabelValues(observation.Mode, observation.Result).Observe(observation.QueueDuration.Seconds())
 	}
-	if observation.QueueDuration > 0 && m.syncPersistQueueDuration != nil {
-		m.syncPersistQueueDuration.WithLabelValues(mode, result).Observe(observation.QueueDuration.Seconds())
-	}
-	if m.syncPersistStageDuration != nil {
-		for _, stage := range observation.Stages {
-			if stage.Duration <= 0 {
-				continue
-			}
-			m.syncPersistStageDuration.WithLabelValues(mode, fallbackLabel(stage.Stage), result).Observe(stage.Duration.Seconds())
+	for _, stage := range observation.Stages {
+		if stage.Duration <= 0 {
+			continue
 		}
+		m.syncPersistStageDuration.WithLabelValues(observation.Mode, stage.Stage, observation.Result).Observe(stage.Duration.Seconds())
 	}
 }
 
 func (m *Metrics) ObserveBroadcastPipelineStage(observation p2p.BroadcastPipelineStageObservation) {
-	if m == nil || m.p2pBroadcastPipelineStageDuration == nil {
-		return
-	}
 	duration := observation.Duration
 	if duration < 0 {
 		duration = 0

@@ -159,10 +159,7 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 		if len(indexes) == 0 {
 			continue
 		}
-		shard := cells.shards[shardIdx]
-		if shard == nil || shard.db == nil {
-			return stats, errPebbleClosed
-		}
+		db := cells.shards[shardIdx].db
 
 		wg.Add(1)
 		go func(shardIdx int, db *pebble.DB, indexes []int) {
@@ -178,7 +175,7 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 			if err := largeBOCLoadShardRecordIndexes(ctx, cells, db, shardIdx, indexes, hashes, shardReadWorkers, visit); err != nil {
 				errs <- err
 			}
-		}(shardIdx, shard.db, indexes)
+		}(shardIdx, db, indexes)
 	}
 	wg.Wait()
 	close(errs)

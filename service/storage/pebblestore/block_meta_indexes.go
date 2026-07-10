@@ -234,24 +234,37 @@ func (s *Store) nextKeyBlockMetas(ctx context.Context, after uint32, limit int, 
 		if err != nil {
 			return nil, err
 		}
-		if !isMasterchainBlock(block) {
-			continue
-		}
 
 		raw, closer, err := pebbleReaderGet(snap, hotKeyBlockMeta(block))
 		if errors.Is(err, storage.ErrNotFound) {
-			continue
+			return nil, fmt.Errorf(
+				"key block index invariant violated for %s: block metadata is missing",
+				storage.FormatBlockRef(block),
+			)
 		}
 		if err != nil {
 			return nil, err
 		}
-		meta, err := decodeBlockMeta(block, raw)
-		_ = closer.Close()
-		if err != nil {
-			return nil, err
+		meta, decodeErr := decodeBlockMeta(block, raw)
+		closeErr := closer.Close()
+		if decodeErr != nil {
+			decodeErr = fmt.Errorf("decode key block metadata %s: %w", storage.FormatBlockRef(block), decodeErr)
+			if closeErr != nil {
+				return nil, errors.Join(
+					decodeErr,
+					fmt.Errorf("close key block metadata %s: %w", storage.FormatBlockRef(block), closeErr),
+				)
+			}
+			return nil, decodeErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close key block metadata %s: %w", storage.FormatBlockRef(block), closeErr)
 		}
 		if !meta.Has(storage.BlockMetaIsKeyBlock) {
-			continue
+			return nil, fmt.Errorf(
+				"key block index invariant violated for %s: metadata is not marked as key block",
+				storage.FormatBlockRef(block),
+			)
 		}
 		if requireServedFull && !meta.Has(storage.BlockMetaHasServedFull) {
 			continue

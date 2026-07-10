@@ -274,14 +274,6 @@ func CheckMasterchainSignatures(blockID ton.BlockIDExt, block *tlb.Block, signat
 	return CheckPreparedMasterchainSignaturesWithValidators(blockID, sigSet, validators)
 }
 
-func CheckMasterchainSignaturesWithValidators(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell, validators []*tlb.ValidatorAddr) error {
-	sigSet, err := PrepareMasterchainSignatureSet(blockID, block, signatures)
-	if err != nil {
-		return err
-	}
-	return CheckPreparedMasterchainSignaturesWithValidators(blockID, sigSet, validators)
-}
-
 func LiteSignatureSet(signatures *cell.Cell) (any, error) {
 	if signatures == nil {
 		return nil, fmt.Errorf("masterchain block proof has no validator signatures")
@@ -426,10 +418,6 @@ func (s *ValidatorSignatureSet) Final() bool {
 
 func (s *ValidatorSignatureSet) ValidatorSetHash() uint32 {
 	return s.validatorSetHash
-}
-
-func (s *ValidatorSignatureSet) IsFinal() bool {
-	return s.final
 }
 
 func (s *ValidatorSignatureSet) IsSimplex() bool {

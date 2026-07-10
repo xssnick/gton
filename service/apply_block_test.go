@@ -84,10 +84,11 @@ func TestApplyBlockFromFixture(t *testing.T) {
 		t.Fatalf("prepare block: %v", err)
 	}
 
-	next, err := ApplyBlock(current, prepared)
+	applied, err := applyBlockWithPreviousStates([]*tnstore.BlockState{current}, prepared, nil)
 	if err != nil {
 		t.Fatalf("apply block: %v", err)
 	}
+	next := applied.Next
 
 	if !next.Block.Equals(&downloaded.ID) {
 		t.Fatalf("unexpected next block id %s", tnstore.FormatBlockRef(next.Block))
@@ -200,7 +201,7 @@ func TestApplyBlockRejectsWrongCurrentState(t *testing.T) {
 		t.Fatalf("prepare block: %v", err)
 	}
 
-	if _, err := ApplyBlock(current, prepared); err == nil {
+	if _, err := applyBlockWithPreviousStates([]*tnstore.BlockState{current}, prepared, nil); err == nil {
 		t.Fatal("expected apply block to reject wrong current state")
 	}
 }

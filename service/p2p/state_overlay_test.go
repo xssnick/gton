@@ -90,16 +90,18 @@ func testFullBlockID(workchain int32, shard int64, seqno uint32, rootPrefix byte
 func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	peerA := testZeroStatePeer("a")
 	peerB := testZeroStatePeer("b")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		peers: map[PeerID]*overlayPeer{
 			peerA.id: peerA,
 			peerB.id: peerB,
 		},
-	}
+	})
 	pool := testArchivePool(sub)
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+	session := sub.node.BeginArchiveSession()
+	defer session.Close()
 
-	got := zeroStateArchiveCandidates(pool, nil, shard, map[PeerID]struct{}{
+	got := zeroStateArchiveCandidates(pool, session, shard, map[PeerID]struct{}{
 		peerA.id: {},
 	})
 	if len(got) != 1 {
@@ -113,13 +115,13 @@ func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 func TestZeroStateDeadlineGraceKeepsPeerCandidate(t *testing.T) {
 	peer := testZeroStatePeer("slow")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
 		peers: map[PeerID]*overlayPeer{
 			peer.id: peer,
 		},
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
@@ -148,13 +150,13 @@ func TestZeroStateDeadlineGraceKeepsPeerCandidate(t *testing.T) {
 func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
 	peer := testZeroStatePeer("live")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
 		peers: map[PeerID]*overlayPeer{
 			peer.id: peer,
 		},
-	}
+	})
 	pool := testArchivePool(sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
@@ -173,10 +175,10 @@ func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
 func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
 	peer := testZeroStatePeer("archive-only")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
-	}
+	})
 	pool := testArchivePool(sub)
 	pool.addArchiveOnlyPeer(peer)
 	session := node.BeginArchiveSession()
@@ -212,11 +214,11 @@ func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
 		log:     discardLogger(),
 		peerUse: map[PeerID]peerUse{},
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:  discardLogger(),
 		node: node,
 		spec: overlaySpec{ShortID: []byte{0x01}},
-	}
+	})
 	block := testBlockID(-1, topShard, 42)
 	downloader := persistentStateSnapshotDownloader{
 		node:   node,

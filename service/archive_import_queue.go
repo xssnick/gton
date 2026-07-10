@@ -123,10 +123,8 @@ func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
 		prepareHotQueued:       len(q.prepareHot),
 		preparePrefetchQueued:  len(q.preparePrefetch),
 	}
-	if q.downloadedBytes != nil {
-		snapshot.downloadedBytes = q.downloadedBytes.size()
-		snapshot.downloadedBytesLimit = q.downloadedBytes.limit()
-	}
+	snapshot.downloadedBytes = q.downloadedBytes.size()
+	snapshot.downloadedBytesLimit = q.downloadedBytes.limit()
 	return snapshot
 }
 
@@ -172,11 +170,9 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	q.activeDownload.Add(1)
 	defer q.activeDownload.Add(-1)
 
-	if q.downloadedBytes != nil {
-		if err := q.downloadedBytes.wait(job.ctx); err != nil {
-			job.done <- archiveImportQueueResult{err: err}
-			return
-		}
+	if err := q.downloadedBytes.wait(job.ctx); err != nil {
+		job.done <- archiveImportQueueResult{err: err}
+		return
 	}
 
 	downloaded, err := r.downloadArchiveFile(job.ctx, job.masterchainSeqno, job.shard, q.archiveDownloadsStarved())
@@ -185,9 +181,7 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 		return
 	}
 	downloadedBytes := uint64(len(downloaded.Data))
-	if q.downloadedBytes != nil {
-		q.downloadedBytes.add(downloadedBytes)
-	}
+	q.downloadedBytes.add(downloadedBytes)
 
 	prepare := archivePrepareJob{
 		ctx:        job.ctx,
@@ -200,9 +194,7 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	select {
 	case q.prepareJobs(job.priority) <- prepare:
 	case <-job.ctx.Done():
-		if q.downloadedBytes != nil {
-			q.downloadedBytes.release(downloadedBytes)
-		}
+		q.downloadedBytes.release(downloadedBytes)
 		job.done <- archiveImportQueueResult{err: job.ctx.Err()}
 	}
 }
@@ -212,9 +204,7 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 		if job.downloaded != nil {
 			job.downloaded.Data = nil
 		}
-		if q.downloadedBytes != nil {
-			q.downloadedBytes.release(job.bytes)
-		}
+		q.downloadedBytes.release(job.bytes)
 	}
 
 	if err := job.ctx.Err(); err != nil {
@@ -234,13 +224,10 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 }
 
 func (q *archiveImportQueue) archiveDownloadsStarved() bool {
-	if q == nil {
-		return false
-	}
 	if q.activePrepare.Load() > 0 || len(q.prepareHot) > 0 || len(q.preparePrefetch) > 0 {
 		return false
 	}
-	return q.downloadedBytes == nil || q.downloadedBytes.size() == 0
+	return q.downloadedBytes.size() == 0
 }
 
 func nextArchivePriorityJob[T any](ctx context.Context, hot <-chan T, prefetch <-chan T, zero T) (T, bool) {
@@ -291,9 +278,6 @@ type archiveDownloadByteGate struct {
 }
 
 func newArchiveDownloadByteGate(max uint64) *archiveDownloadByteGate {
-	if max == 0 {
-		return nil
-	}
 	return &archiveDownloadByteGate{
 		max:  max,
 		done: make(chan struct{}),
@@ -301,10 +285,6 @@ func newArchiveDownloadByteGate(max uint64) *archiveDownloadByteGate {
 }
 
 func (g *archiveDownloadByteGate) wait(ctx context.Context) error {
-	if g == nil || g.max == 0 {
-		return nil
-	}
-
 	for {
 		g.mu.Lock()
 		if g.bytes < g.max {
@@ -323,7 +303,7 @@ func (g *archiveDownloadByteGate) wait(ctx context.Context) error {
 }
 
 func (g *archiveDownloadByteGate) add(bytes uint64) {
-	if g == nil || bytes == 0 {
+	if bytes == 0 {
 		return
 	}
 
@@ -337,7 +317,7 @@ func (g *archiveDownloadByteGate) add(bytes uint64) {
 }
 
 func (g *archiveDownloadByteGate) release(bytes uint64) {
-	if g == nil || bytes == 0 {
+	if bytes == 0 {
 		return
 	}
 
@@ -352,10 +332,6 @@ func (g *archiveDownloadByteGate) release(bytes uint64) {
 }
 
 func (g *archiveDownloadByteGate) size() uint64 {
-	if g == nil {
-		return 0
-	}
-
 	g.mu.Lock()
 	bytes := g.bytes
 	g.mu.Unlock()
@@ -363,9 +339,6 @@ func (g *archiveDownloadByteGate) size() uint64 {
 }
 
 func (g *archiveDownloadByteGate) limit() uint64 {
-	if g == nil {
-		return 0
-	}
 	return g.max
 }
 

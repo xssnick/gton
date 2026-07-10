@@ -479,10 +479,16 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 
 func (s *overlaySubscription) servePrepareZeroState(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
 	data, err := s.node.peerStorage.ZeroState(ctx, block)
-	if err == nil && len(data) > 0 {
-		return PreparedState{}, nil
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return NotFoundState{}, nil
 	}
-	return NotFoundState{}, nil
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return NotFoundState{}, nil
+	}
+	return PreparedState{}, nil
 }
 
 func (s *overlaySubscription) serveZeroStateData(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {

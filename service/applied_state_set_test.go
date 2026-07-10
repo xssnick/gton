@@ -230,7 +230,11 @@ func TestAppliedStateSetTracksArtifactBytes(t *testing.T) {
 		t.Fatalf("artifact bytes after replace = %d, want %d", got, want)
 	}
 
-	checkpoint := appliedStateCheckpoint{keys: []storage.BlockRootHash{storage.BlockKey(first.Block)}}
+	firstKey := storage.BlockKey(first.Block)
+	checkpoint := appliedStateCheckpoint{
+		keys:     []storage.BlockRootHash{firstKey},
+		versions: []uint64{states.states[firstKey].version},
+	}
 	states.completeCheckpoint(checkpoint)
 	if got, want := states.byteSize(), uint64(3); got != want {
 		t.Fatalf("artifact bytes after checkpoint complete = %d, want %d", got, want)

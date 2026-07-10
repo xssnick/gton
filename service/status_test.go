@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/blocksync"
 	"github.com/xssnick/gton/service/p2p"
 	tnstore "github.com/xssnick/gton/service/storage"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -52,8 +54,9 @@ func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 	}
 
 	svc := &Service{
-		node:    node,
-		storage: store,
+		node:      node,
+		blockSync: statusTestBlockSync(node),
+		storage:   store,
 	}
 	snapshot := svc.StatusSnapshot()
 
@@ -102,8 +105,9 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 	}
 
 	svc := &Service{
-		node:    node,
-		storage: store,
+		node:      node,
+		blockSync: statusTestBlockSync(node),
+		storage:   store,
 	}
 	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
@@ -144,8 +148,9 @@ func TestStatusSnapshotIncludesAppliedMasterchainProgress(t *testing.T) {
 	appliedMaster := testBlockID(-1, topShard, 105)
 
 	svc := &Service{
-		node:    node,
-		storage: store,
+		node:      node,
+		blockSync: statusTestBlockSync(node),
+		storage:   store,
 		currentStatus: &tnstore.CurrentState{
 			Masterchain: tnstore.BlockState{
 				Block:  currentMaster,
@@ -186,8 +191,9 @@ func TestStatusSnapshotIncludesSplitBasechainShards(t *testing.T) {
 	right := testBlockID(0, int64(-0x4000000000000000), 201)
 
 	svc := &Service{
-		node:    node,
-		storage: store,
+		node:      node,
+		blockSync: statusTestBlockSync(node),
+		storage:   store,
 	}
 	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
@@ -230,7 +236,7 @@ func TestStatusSnapshotPrefersLocalShardClientBasechainLatest(t *testing.T) {
 			LatestBasechain: &staleBase,
 		},
 	}
-	svc := &Service{}
+	svc := &Service{storage: openTestPebbleStorage(t)}
 	svc.populateStatusLatestBasechain(context.Background(), &snapshot, &tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{Block: localMaster},
 		Shards: map[tnstore.ShardKey]tnstore.BlockState{
@@ -335,6 +341,7 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 
 	svc := &Service{
 		node:           node,
+		blockSync:      statusTestBlockSync(node),
 		storage:        store,
 		liveBlockCache: cache,
 	}
@@ -403,6 +410,11 @@ func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
 	if _, err := store.LookupBlockBySeqNo(context.Background(), tnstore.BlockSeqRefFromBlock(block)); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("pebble seqno lookup error = %v, want ErrNotFound", err)
 	}
+}
+
+func statusTestBlockSync(node *p2p.Node) *blocksync.Service {
+	logger := zerolog.Nop()
+	return blocksync.New(&logger, node)
 }
 
 func mustStatusFixtureBlock(t *testing.T) (ton.BlockIDExt, *cell.Cell, []byte, *tnstore.BlockMeta) {

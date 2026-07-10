@@ -322,38 +322,7 @@ func (c *artifactFileCache) cancelWaiter() {
 }
 
 func (s *Store) readArtifactFileRange(ctx context.Context, path string, offset int64, size int64, minFileSize int64) ([]byte, error) {
-	if s.artifactFiles != nil {
-		return s.artifactFiles.readRange(ctx, path, offset, size, minFileSize)
-	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		if isMissingArtifactError(err) {
-			return nil, storage.ErrNotFound
-		}
-		return nil, err
-	}
-	defer func() { _ = file.Close() }()
-
-	stat, err := file.Stat()
-	if err != nil {
-		if isMissingArtifactError(err) {
-			return nil, storage.ErrNotFound
-		}
-		return nil, err
-	}
-	if stat.Size() < minFileSize || offset+size > stat.Size() {
-		return nil, storage.ErrNotFound
-	}
-
-	data := make([]byte, size)
-	if _, err = file.ReadAt(data, offset); err != nil {
-		if isMissingArtifactError(err) {
-			return nil, storage.ErrNotFound
-		}
-		return nil, err
-	}
-	return data, nil
+	return s.artifactFiles.readRange(ctx, path, offset, size, minFileSize)
 }
 
 func artifactRangeOverflow(offset int64, size int64) bool {

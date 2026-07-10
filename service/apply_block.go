@@ -133,23 +133,6 @@ func blockMetaWithoutArtifactFlags(meta *tnstore.BlockMeta) *tnstore.BlockMeta {
 	return cloned
 }
 
-// ApplyBlock validates that downloaded contains a state transition from current
-// and returns the next state embedded into block.state_update.
-//
-// TON blocks carry MERKLE_UPDATE, so the next state is reconstructed by
-// applying block.state_update to the current state tree.
-func ApplyBlock(current *tnstore.BlockState, block PreparedBlock) (*tnstore.BlockState, error) {
-	return ApplyBlockWithPreviousStates([]*tnstore.BlockState{current}, block)
-}
-
-func ApplyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock) (*tnstore.BlockState, error) {
-	applied, err := applyBlockWithPreviousStates(previous, block, nil)
-	if err != nil {
-		return nil, err
-	}
-	return applied.Next, nil
-}
-
 func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock, applier stateUpdateApplier) (appliedBlockState, error) {
 	stateUpdate := block.StateUpdate
 	if stateUpdate == nil {

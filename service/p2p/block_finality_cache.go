@@ -302,9 +302,6 @@ func (c *blockFinalityCache) deleteEntryLocked(entry blockFinalityCacheEntry) {
 	default:
 		panic(fmt.Sprintf("unknown block finality cache entry %T", entry))
 	}
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 }
 
 func (e *blockFinalityCandidateEntry) blockFinalityCacheExpiresAt() time.Time {

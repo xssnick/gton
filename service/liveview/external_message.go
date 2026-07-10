@@ -17,8 +17,7 @@ type ExternalMessageSizeLimits struct {
 }
 
 func (f *BlockView) ExternalMessageLimits() (ExternalMessageSizeLimits, error) {
-	return lazyLoadFragment(f,
-		liveBlockFragmentLoadKey{kind: liveBlockFragmentLoadExternalMessageLimits},
+	return lazyLoadFragment(f, &f.extMsgLimitsLoad, struct{}{},
 		func() (ExternalMessageSizeLimits, bool) { return f.extMsgLimits, f.extMsgLimitsLoaded },
 		func(limits ExternalMessageSizeLimits) ExternalMessageSizeLimits {
 			if !f.extMsgLimitsLoaded {

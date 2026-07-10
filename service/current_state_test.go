@@ -86,10 +86,6 @@ func testStateCheckpointEntriesForCurrent(states []*tnstore.BlockState, current 
 	return entries
 }
 
-func testStateCheckpointEntry(state *tnstore.BlockState) tnstore.StateCheckpointBlock {
-	return testStateCheckpointEntryForCurrent(state, nil)
-}
-
 func testStateCheckpointEntryForCurrent(state *tnstore.BlockState, current *tnstore.CurrentState) tnstore.StateCheckpointBlock {
 	entry := tnstore.StateCheckpointBlock{State: state}
 	if state != nil && state.Block.SeqNo != 0 {

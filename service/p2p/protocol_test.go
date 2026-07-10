@@ -312,10 +312,10 @@ func TestSimpleBroadcastSignatureMatchesReferenceShape(t *testing.T) {
 		Signature:   ed25519.Sign(priv, toSign),
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: newTestNode(t),
 		spec: overlaySpec{Name: "test"},
-	}
+	})
 	if !checkSimpleBroadcastDate(int32(msg.Date)) {
 		t.Fatalf("test timestamp unexpectedly rejected")
 	}

@@ -23,10 +23,6 @@ type shardDescriptionHint struct {
 }
 
 func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
-	if s.blockSync == nil {
-		return
-	}
-
 	for {
 		select {
 		case <-ctx.Done():

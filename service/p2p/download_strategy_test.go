@@ -278,7 +278,7 @@ func TestPreferDownloadPeerMovesSourceFirst(t *testing.T) {
 }
 
 func TestChainBlockDownloadSuccessPinsPeer(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
 	other := &overlayPeer{id: testPeerID("other"), addr: "other", alive: true}
@@ -295,7 +295,7 @@ func TestChainBlockDownloadSuccessPinsPeer(t *testing.T) {
 }
 
 func TestChainBlockDownloadSuccessPinsSmallBlock(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(0, topShard, 77)
 	peer := &overlayPeer{id: testPeerID("fast-small"), addr: "fast-small", alive: true}
 
@@ -313,7 +313,7 @@ func TestChainBlockDownloadSuccessPinsSmallBlock(t *testing.T) {
 }
 
 func TestLargeSlowBlockDownloadDoesNotStayPinned(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(0, topShard, 77)
 	peer := &overlayPeer{id: testPeerID("slow-large"), addr: "slow-large", alive: true}
 
@@ -328,7 +328,7 @@ func TestLargeSlowBlockDownloadDoesNotStayPinned(t *testing.T) {
 }
 
 func TestChainBlockUnavailableDoesNotSlowUntilConfirmed(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
 
@@ -348,7 +348,7 @@ func TestChainBlockUnavailableDoesNotSlowUntilConfirmed(t *testing.T) {
 }
 
 func TestChainBlockUnavailableSlowsAfterAnotherPeerSucceeds(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	stale := &overlayPeer{id: testPeerID("stale"), addr: "stale", alive: true}
 	fresh := &overlayPeer{id: testPeerID("fresh"), addr: "fresh", alive: true}
@@ -368,7 +368,7 @@ func TestChainBlockUnavailableSlowsAfterAnotherPeerSucceeds(t *testing.T) {
 }
 
 func TestLiveNextUnavailablePenalizesAndClearsPinnedMasterPeer(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	stale := &overlayPeer{id: testPeerID("stale"), addr: "stale", alive: true}
 	fresh := &overlayPeer{id: testPeerID("fresh"), addr: "fresh", alive: true}
@@ -393,7 +393,7 @@ func TestLiveNextUnavailablePenalizesAndClearsPinnedMasterPeer(t *testing.T) {
 }
 
 func TestLiveNextUnavailableDoesNotClearBasechainSticky(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(0, topShard, 77)
 	peer := &overlayPeer{id: testPeerID("base-fast"), addr: "base-fast", alive: true}
 
@@ -409,7 +409,7 @@ func TestLiveNextUnavailableDoesNotClearBasechainSticky(t *testing.T) {
 }
 
 func TestLiveNextPeerScorePrefersLowerLatency(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	slow := &overlayPeer{id: testPeerID("slow"), addr: "slow", alive: true}
 	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
@@ -429,7 +429,7 @@ func TestLiveNextPeerScorePrefersLowerLatency(t *testing.T) {
 
 func TestLiveNextPeerScoreKeepsSlowPeerBehindHealthy(t *testing.T) {
 	now := time.Now()
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	slow := &overlayPeer{id: testPeerID("slow"), addr: "slow", alive: true, downloadSlowUntil: now.Add(time.Minute)}
 	healthy := &overlayPeer{id: testPeerID("healthy"), addr: "healthy", alive: true}
@@ -451,13 +451,13 @@ func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 	now := int32(time.Now().Unix())
 	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
 	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		peers: map[PeerID]*overlayPeer{
 			sticky.id: sticky,
 			fast.id:   fast,
 		},
-	}
+	})
 	chain := testBlockID(-1, topShard, 41)
 	block := &DownloadedBlock{
 		ID:       testBlockID(-1, topShard, 42),
@@ -481,13 +481,13 @@ func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
 	now := int32(time.Now().Unix())
 	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
 	preferred := &overlayPeer{id: testPeerID("preferred"), addr: "preferred", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		peers: map[PeerID]*overlayPeer{
 			sticky.id:    sticky,
 			preferred.id: preferred,
 		},
-	}
+	})
 	chain := testBlockID(-1, topShard, 41)
 
 	sub.noteChainBlockDownloadSuccess(chain, sticky, &DownloadedBlock{
@@ -505,7 +505,7 @@ func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
 }
 
 func TestLiveNextPeerScoreAccountsForBlockSize(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	smallFast := &overlayPeer{id: testPeerID("small-fast"), addr: "small-fast", alive: true}
 	bigFast := &overlayPeer{id: testPeerID("big-fast"), addr: "big-fast", alive: true}
@@ -526,7 +526,7 @@ func TestLiveNextPeerScoreAccountsForBlockSize(t *testing.T) {
 }
 
 func TestLiveNextPeerScoreRewardsAvailabilityAfterMisses(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	alwaysFast := &overlayPeer{id: testPeerID("always-fast"), addr: "always-fast", alive: true}
 	earlyAvailable := &overlayPeer{id: testPeerID("early-available"), addr: "early-available", alive: true}
@@ -547,7 +547,7 @@ func TestLiveNextPeerScoreRewardsAvailabilityAfterMisses(t *testing.T) {
 }
 
 func TestChainBlockFailureClearsPinnedPeer(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	chain := testBlockID(-1, topShard, 41)
 	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true}
 
@@ -563,7 +563,7 @@ func TestChainBlockFailureClearsPinnedPeer(t *testing.T) {
 }
 
 func TestChainBlockPinnedPeerIsPerChain(t *testing.T) {
-	sub := &overlaySubscription{log: discardLogger()}
+	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	master := testBlockID(-1, topShard, 41)
 	base := testBlockID(0, topShard, 77)
 	masterPeer := &overlayPeer{id: testPeerID("master-fast"), addr: "master-fast", alive: true}
@@ -701,7 +701,7 @@ func TestQueryCandidatesKeepNeighboursFirstButFallBackToOtherPeers(t *testing.T)
 	now := int32(time.Now().Unix())
 	overlayWrapper := &overlay.ADNLOverlayWrapper{}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		spec: overlaySpec{
 			ProtoVersionMajor: shardchainProtoVersionMajor,
@@ -713,7 +713,7 @@ func TestQueryCandidatesKeepNeighboursFirstButFallBackToOtherPeers(t *testing.T)
 			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
 		},
 		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
-	}
+	})
 
 	got := sub.queryCandidates(0, 0)
 	if len(got) != 3 {
@@ -763,12 +763,12 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 		versionMinor: shardchainProtoVersionMinor,
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log:        discardLogger(),
 		spec:       overlaySpec{ProtoVersionMajor: shardchainProtoVersionMajor, ProtoVersionMinor: shardchainProtoVersionMinor},
 		peers:      peers,
 		neighbours: neighbours,
-	}
+	})
 
 	got := sub.hedgedQueryCandidates(0, 0, 4)
 	if len(got) != 4 {
@@ -830,7 +830,7 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 	now := int32(time.Now().Unix())
 	overlayWrapper := &overlay.ADNLOverlayWrapper{}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		spec: overlaySpec{
 			ProtoVersionMajor: masterchainProtoVersionMajor,
@@ -866,7 +866,7 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 			},
 		},
 		neighbours: []PeerID{testPeerID("dead-neighbour"), testPeerID("alive-neighbour")},
-	}
+	})
 
 	got := sub.aliveNeighbourPeers(masterchainProtoVersionMajor, masterchainProtoVersionMinor)
 	if len(got) != 1 {

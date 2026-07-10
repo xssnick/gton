@@ -61,8 +61,8 @@ func NewLiveBlockCache(max int) *LiveBlockCache {
 }
 
 func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtifacts) error {
-	if c == nil || !validLiveBlockID(artifacts.Block) {
-		return nil
+	if err := ValidateBlockIDHashes(artifacts.Block); err != nil {
+		return err
 	}
 
 	key := BlockKey(artifacts.Block)
@@ -113,10 +113,6 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 
 	c.evictLocked()
 	return nil
-}
-
-func validLiveBlockID(block ton.BlockIDExt) bool {
-	return len(block.RootHash) == 32 && len(block.FileHash) == 32
 }
 
 func liveBlockCacheProofs(proofs []LiveBlockProofArtifact) map[ServedProofKind][]byte {
@@ -196,7 +192,7 @@ func (c *LiveBlockCache) BlockProof(_ context.Context, kind ServedProofKind, blo
 }
 
 func (c *LiveBlockCache) MarkBlockFlushed(block ton.BlockIDExt) {
-	if c == nil || !validLiveBlockID(block) {
+	if c == nil || !BlockIDHashesKnown(block) {
 		return
 	}
 

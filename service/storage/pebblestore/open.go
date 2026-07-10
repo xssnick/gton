@@ -248,7 +248,7 @@ func Open(opts Options) (*Store, error) {
 		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("recovered artifact pack journals")
 		stageStarted = time.Now()
 		logger.Info().Msg("cleaning retired cell generations")
-		if err = store.CleanupRetiredCellGenerations(context.Background()); err != nil {
+		if err = store.cleanupRetiredCellGenerations(context.Background()); err != nil {
 			_ = store.closeCellGenerations()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()

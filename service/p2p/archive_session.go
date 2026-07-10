@@ -255,7 +255,7 @@ func (a *ArchiveSession) clearSelectedArchivePeerID(shard archive.ShardID, peerI
 }
 
 func (a *ArchiveSession) shouldHedgeArchiveDownload(shard archive.ShardID, alternatives bool, now time.Time) bool {
-	if a == nil || !alternatives {
+	if !alternatives {
 		return false
 	}
 
@@ -275,7 +275,7 @@ func (a *ArchiveSession) shouldHedgeArchiveDownload(shard archive.ShardID, alter
 }
 
 func (a *ArchiveSession) noteArchiveHedge(shard archive.ShardID, alternatives bool, now time.Time) {
-	if a == nil || !alternatives {
+	if !alternatives {
 		return
 	}
 
@@ -329,7 +329,7 @@ func (a *ArchiveSession) noteArchivePeerAvailable(peer *overlayPeer) {
 }
 
 func (a *ArchiveSession) archivePeerDeadlineGrace(peer *overlayPeer, err error) bool {
-	if a == nil || !errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
@@ -397,23 +397,18 @@ func archivePinnedPeerTimeout(base time.Duration, max time.Duration, failures in
 
 func (a *ArchiveSession) rejectArchivePeer(ctx context.Context, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, reason string) {
 	peerID := downloadPeerID(peer)
-	selected := a != nil && !peerID.IsZero() && a.selectedArchivePeerID(shard) == peerID
-	verdict := archivePeerFailureVerdict{useless: pool == nil}
-	if pool != nil {
-		verdict = pool.noteFailure(shard, peer, reason)
-	}
+	selected := !peerID.IsZero() && a.selectedArchivePeerID(shard) == peerID
+	verdict := pool.noteFailure(shard, peer, reason)
 
-	if a != nil {
-		// Any cooldown-earning failure leaves the peer unable to serve this
-		// shard for a while, so the sticky selection moves on right away.
-		if verdict.useless || verdict.cooldown > 0 {
-			a.clearSelectedArchivePeerID(shard, peerID)
-			a.unpinArchivePeer(peer)
-		} else if !selected {
-			a.unpinArchivePeer(peer)
-		}
+	// Any cooldown-earning failure leaves the peer unable to serve this
+	// shard for a while, so the sticky selection moves on right away.
+	if verdict.useless || verdict.cooldown > 0 {
+		a.clearSelectedArchivePeerID(shard, peerID)
+		a.unpinArchivePeer(peer)
+	} else if !selected {
+		a.unpinArchivePeer(peer)
 	}
-	if pool != nil && verdict.useless {
+	if verdict.useless {
 		pool.refreshUseless(ctx, shard)
 	}
 }

@@ -399,17 +399,6 @@ func TestMetricsSyncBlockExplicitOriginOverridesDownloadSourceOrigin(t *testing.
 	}
 }
 
-func TestNilMetricsObserverMethodsAreNoop(t *testing.T) {
-	var m *Metrics
-
-	m.ObserveSyncBlock(service.SyncBlockObservation{})
-	m.ObserveSyncObtain(service.SyncObtainObservation{})
-	m.ObserveSyncPersist(service.SyncPersistObservation{})
-	m.ObserveBroadcastPipelineStage(p2p.BroadcastPipelineStageObservation{})
-	m.AddArchivePackageBytes(1)
-	m.AddPersistentStateBytes(1)
-}
-
 func metricsBody(t *testing.T, m *Metrics) string {
 	t.Helper()
 

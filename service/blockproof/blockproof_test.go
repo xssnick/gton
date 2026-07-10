@@ -129,7 +129,7 @@ func TestCheckPreparedSignaturesAcceptsOrdinaryAndSimplexVotes(t *testing.T) {
 
 			var signed *ValidatorSignatureSet
 			if tt.set.IsSimplex() {
-				signed = NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, tt.set.IsFinal(), sessionID, 11, candidate)
+				signed = NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, tt.set.Final(), sessionID, 11, candidate)
 			} else {
 				signed = NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, signatures)
 			}

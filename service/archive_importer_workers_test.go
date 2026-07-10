@@ -177,7 +177,9 @@ func TestArchiveImportQueueDownloadJobWaitsForCheckpointBackpressure(t *testing.
 	resume := runner.pauseArchiveDownloadsForCheckpointBackpressure()
 	t.Cleanup(resume)
 
-	queue := &archiveImportQueue{}
+	queue := &archiveImportQueue{
+		downloadedBytes: newArchiveDownloadByteGate(100),
+	}
 	done := make(chan archiveImportQueueResult, 1)
 	go queue.runDownloadJob(runner, archiveDownloadJob{
 		ctx:              context.Background(),

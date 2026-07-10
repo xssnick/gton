@@ -43,9 +43,6 @@ func TestCellGenerationMigrationCanceledLeavesPendingIntent(t *testing.T) {
 	if !store.began {
 		t.Fatal("migration did not begin candidate generation")
 	}
-	if store.aborted {
-		t.Fatal("canceled migration aborted pending candidate generation")
-	}
 }
 
 func TestCellGenerationMigrationFailureLeavesPendingIntent(t *testing.T) {
@@ -63,9 +60,6 @@ func TestCellGenerationMigrationFailureLeavesPendingIntent(t *testing.T) {
 	}
 	if !store.began {
 		t.Fatal("migration did not begin candidate generation")
-	}
-	if store.aborted {
-		t.Fatal("failed migration aborted pending candidate generation")
 	}
 }
 
@@ -87,9 +81,6 @@ func TestCellGenerationMigrationCanceledWithNonContextErrorLeavesPendingIntent(t
 	}
 	if !errors.Is(err, errCellGenerationMigrationTest) {
 		t.Fatalf("migration error = %v, want test failure", err)
-	}
-	if store.aborted {
-		t.Fatal("canceled migration with non-context error aborted pending candidate generation")
 	}
 }
 
@@ -189,9 +180,6 @@ func TestStartCellGenerationMigrationPersistsIntentBeforeAsyncRun(t *testing.T) 
 	}
 
 	svc.Wait()
-	if store.aborted {
-		t.Fatal("failed async migration aborted pending generation")
-	}
 }
 
 func TestStartCellGenerationMigrationRejectsMissingPersistentStateBeforeIntent(t *testing.T) {
@@ -884,8 +872,6 @@ type testCellGenerationMigrationStore struct {
 	ignoreContextErr             bool
 	began                        bool
 	beginCount                   int
-	aborted                      bool
-	abortedGeneration            uint64
 	dropped                      bool
 	droppedGeneration            uint64
 	pending                      *storage.CellGenerationInfo
@@ -954,15 +940,6 @@ func (s *testCellGenerationMigrationStore) BeginCellGeneration(_ context.Context
 		s.cancelOnBegin()
 	}
 	return s.pending.ID, nil
-}
-
-func (s *testCellGenerationMigrationStore) AbortCellGeneration(_ context.Context, generation uint64) error {
-	s.aborted = true
-	s.abortedGeneration = generation
-	if s.pending != nil && s.pending.ID == generation {
-		s.pending = nil
-	}
-	return nil
 }
 
 func (s *testCellGenerationMigrationStore) DropPendingCellGeneration(_ context.Context, generation uint64) error {

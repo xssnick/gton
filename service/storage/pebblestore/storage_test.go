@@ -2110,7 +2110,7 @@ func TestSaveStateCellTreeStoresPrunedRefAsRawCell(t *testing.T) {
 	if err = store.flushCellDBs(initialCellGenerationID); err != nil {
 		t.Fatalf("flush cells: %v", err)
 	}
-	loadedRoot, err := store.loadLazyCell(ctx, root.Hash())
+	loadedRoot, err := store.LoadCell(ctx, root.Hash())
 	if err != nil {
 		t.Fatalf("load root: %v", err)
 	}
@@ -2532,7 +2532,7 @@ func TestStateCellPrewriteAllowsCheckpointWithoutCellBatch(t *testing.T) {
 	}
 
 	rootHash := root.HashKey()
-	_, err = store.loadLazyCell(ctx, rootHash[:])
+	_, err = store.LoadCell(ctx, rootHash[:])
 	if err != nil {
 		t.Fatalf("load prewritten lazy root: %v", err)
 	}
@@ -3354,11 +3354,11 @@ func TestCellGenerationMigrationProgressSurvivesRestart(t *testing.T) {
 	if !loaded.Masterchain.Block.Equals(&origin) {
 		t.Fatalf("progress masterchain = %s, want %s", storage.FormatBlockRef(loaded.Masterchain.Block), storage.FormatBlockRef(origin))
 	}
-	if err = store.AbortCellGeneration(ctx, generation); err != nil {
-		t.Fatalf("abort generation: %v", err)
+	if err = store.DropPendingCellGeneration(ctx, generation); err != nil {
+		t.Fatalf("drop pending generation: %v", err)
 	}
 	if _, err = store.CellGenerationMigrationProgress(ctx, generation); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("aborted generation progress error = %v, want ErrNotFound", err)
+		t.Fatalf("dropped generation progress error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -3597,10 +3597,10 @@ func TestLazyCellLoadMetricsCountDecodedCacheAndPebble(t *testing.T) {
 	})
 
 	rootHash := root.HashKey(0)
-	if _, err = store.loadLazyCell(ctx, rootHash[:]); err != nil {
+	if _, err = store.LoadCell(ctx, rootHash[:]); err != nil {
 		t.Fatalf("load lazy cell from pebble: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, rootHash[:]); err != nil {
+	if _, err = store.LoadCell(ctx, rootHash[:]); err != nil {
 		t.Fatalf("load lazy cell from decoded cache: %v", err)
 	}
 
@@ -4099,7 +4099,7 @@ func TestSaveStateCellTreeStoresConcretePrunedParentByRawHash(t *testing.T) {
 	if err = store.flushCellDBs(initialCellGenerationID); err != nil {
 		t.Fatalf("flush cells: %v", err)
 	}
-	loadedRoot, err := store.loadLazyCell(ctx, root.Hash())
+	loadedRoot, err := store.LoadCell(ctx, root.Hash())
 	if err != nil {
 		t.Fatalf("load root: %v", err)
 	}
@@ -4259,7 +4259,7 @@ func TestSaveStateCellTreeDoesNotValidateMissingLazyBoundary(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save state with missing lazy boundary: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
+	if _, err = store.LoadCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("lazy boundary was unexpectedly restored: %v", err)
 	}
 }
@@ -4316,7 +4316,7 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save state with missing lazy data cell: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
+	if _, err = store.LoadCell(ctx, rightHash[:]); err != nil {
 		t.Fatalf("lazy data cell was not persisted: %v", err)
 	}
 }

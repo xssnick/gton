@@ -259,7 +259,7 @@ func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
 }
 
 func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
-	if s.node == nil || s.node.runCtx.Err() != nil || peer == nil {
+	if s.node.runCtx.Err() != nil || peer == nil {
 		return
 	}
 	if !peer.initRebroadcastQueues() {
@@ -492,19 +492,19 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
 		if s.spec.Kind == overlayKindCustomFixed {
-			if s.node != nil && s.node.rebroadcastLagged() {
+			if s.node.rebroadcastLagged() {
 				return laggedExternalFanout
 			}
 			return s.peerLimit()
 		}
-		if req.local && s.node != nil {
+		if req.local {
 			fanout := s.node.effectiveLocalExternalFanout()
 			if s.node.rebroadcastLagged() {
 				return laggedLocalExternalFanout(fanout)
 			}
 			return fanout
 		}
-		if s.node != nil && s.node.rebroadcastLagged() {
+		if s.node.rebroadcastLagged() {
 			return laggedExternalFanout
 		}
 		return externalRebroadcastFanout
@@ -512,7 +512,7 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 	if s.spec.Kind == overlayKindCustomFixed {
 		return s.peerLimit()
 	}
-	if s.node != nil && s.node.rebroadcastQuiet.Load() {
+	if s.node.rebroadcastQuiet.Load() {
 		return quietRebroadcastFanout
 	}
 	return rebroadcastFanout
@@ -616,15 +616,10 @@ func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overl
 	}
 
 	plan := s.rebroadcastPlan(req.kind, payloadLen)
-	switch plan.mode {
-	case rebroadcastModeSimple:
+	if plan.mode == rebroadcastModeSimple {
 		return s.rebroadcastSimpleToPeer(ctx, peer, req, plan)
-	case rebroadcastModeFEC:
-		return s.rebroadcastFECToPeer(ctx, peer, req, plan)
-	default:
-		s.log.Debug().Str("kind", req.kind).Msg("skipping rebroadcast because the delivery mode is unknown")
-		return false
 	}
+	return s.rebroadcastFECToPeer(ctx, peer, req, plan)
 }
 
 func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
