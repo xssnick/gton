@@ -11,21 +11,19 @@ import (
 )
 
 type peerStats struct {
-	versionMajor          int32
-	versionMinor          int32
-	capabilitiesFlags     uint32
-	roundtrip             time.Duration
-	unreliability         float64
-	alive                 bool
-	pending               bool
-	lastReceiveAt         time.Time
-	lastSuccessAt         time.Time
-	failedQueries         uint64
-	downloadBytesSec      float64
-	downloadCount         uint64
-	archiveLargeBytesSec  float64
-	archiveLargeDownloads uint64
-	downloadSlowUntil     time.Time
+	versionMajor      int32
+	versionMinor      int32
+	capabilitiesFlags uint32
+	roundtrip         time.Duration
+	unreliability     float64
+	alive             bool
+	pending           bool
+	lastReceiveAt     time.Time
+	lastSuccessAt     time.Time
+	failedQueries     uint64
+	downloadBytesSec  float64
+	downloadCount     uint64
+	downloadSlowUntil time.Time
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
@@ -97,21 +95,19 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 	defer p.statsMx.Unlock()
 
 	return peerStats{
-		versionMajor:          p.versionMajor,
-		versionMinor:          p.versionMinor,
-		capabilitiesFlags:     p.capabilitiesFlags,
-		roundtrip:             p.roundtrip,
-		unreliability:         p.unreliability,
-		alive:                 p.alive,
-		pending:               p.pending,
-		lastReceiveAt:         p.lastReceiveAt,
-		lastSuccessAt:         p.lastSuccessAt,
-		failedQueries:         p.failedQueries,
-		downloadBytesSec:      p.downloadBytesSec,
-		downloadCount:         p.downloadCount,
-		archiveLargeBytesSec:  p.archiveLargeBytesSec,
-		archiveLargeDownloads: p.archiveLargeDownloads,
-		downloadSlowUntil:     p.downloadSlowUntil,
+		versionMajor:      p.versionMajor,
+		versionMinor:      p.versionMinor,
+		capabilitiesFlags: p.capabilitiesFlags,
+		roundtrip:         p.roundtrip,
+		unreliability:     p.unreliability,
+		alive:             p.alive,
+		pending:           p.pending,
+		lastReceiveAt:     p.lastReceiveAt,
+		lastSuccessAt:     p.lastSuccessAt,
+		failedQueries:     p.failedQueries,
+		downloadBytesSec:  p.downloadBytesSec,
+		downloadCount:     p.downloadCount,
+		downloadSlowUntil: p.downloadSlowUntil,
 	}
 }
 
@@ -182,24 +178,6 @@ func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowTh
 	} else {
 		p.downloadSlowUntil = time.Time{}
 	}
-}
-
-func (p *overlayPeer) archiveLargeDownloadSuccess(bytes int64, elapsed time.Duration) {
-	if bytes < archiveLargeSpeedSampleMinBytes || elapsed <= 0 {
-		return
-	}
-
-	speed := float64(bytes) / elapsed.Seconds()
-
-	p.statsMx.Lock()
-	defer p.statsMx.Unlock()
-
-	p.archiveLargeDownloads++
-	if p.archiveLargeBytesSec == 0 {
-		p.archiveLargeBytesSec = speed
-		return
-	}
-	p.archiveLargeBytesSec = p.archiveLargeBytesSec*0.7 + speed*0.3
 }
 
 func (p *overlayPeer) noteSuccessLocked(now time.Time) bool {

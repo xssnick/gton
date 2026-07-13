@@ -96,7 +96,9 @@ func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 			peerB.id: peerB,
 		},
 	})
-	pool := testArchivePool(sub)
+	pool := testArchivePool(t, sub)
+	addTestArchiveOnlyPeer(pool, peerA)
+	addTestArchiveOnlyPeer(pool, peerB)
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 	session := sub.node.BeginArchiveSession()
 	defer session.Close()
@@ -110,9 +112,14 @@ func TestZeroStateArchiveCandidatesSkipsTriedPeers(t *testing.T) {
 	if got[0].id != peerB.id {
 		t.Fatalf("unexpected candidate %s, want %s", got[0].addr, peerB.addr)
 	}
+
+	withoutSession := zeroStateArchiveCandidates(pool, nil, shard, nil)
+	if len(withoutSession) != 2 {
+		t.Fatalf("zero-state discovery without session returned %d candidates, want 2", len(withoutSession))
+	}
 }
 
-func TestZeroStateDeadlineGraceKeepsPeerCandidate(t *testing.T) {
+func TestZeroStateDeadlineImmediatelyDemotesSelectedPeer(t *testing.T) {
 	peer := testZeroStatePeer("slow")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -122,32 +129,29 @@ func TestZeroStateDeadlineGraceKeepsPeerCandidate(t *testing.T) {
 			peer.id: peer,
 		},
 	})
-	pool := testArchivePool(sub)
+	pool := testArchivePool(t, sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
+	before := peer.statsSnapshot()
 
-	pool.markAvailable(shard, peer)
-	session.noteArchivePeerAvailable(peer)
-	tried := map[PeerID]struct{}{}
-	if !session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded) {
-		t.Fatal("deadline grace should keep zero-state peer retryable")
+	session.selectArchivePeer(shard, peer)
+	if session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded) {
+		t.Fatal("zero-byte deadline kept zero-state peer retryable")
 	}
 
-	got := zeroStateArchiveCandidates(pool, session, shard, tried)
-	if len(got) == 0 || got[0].id != peer.id {
-		t.Fatalf("deadline-graced peer was not retried: %#v", got)
+	if selected := session.selectedArchivePeerID(shard); !selected.IsZero() {
+		t.Fatalf("zero-state deadline kept selected peer: %s", selected.String())
 	}
-	failures, pinned := session.archivePeerDeadlineFailures(peer)
-	if !pinned || failures != 1 {
-		t.Fatalf("deadline failures = %d pinned=%v, want 1 and pinned", failures, pinned)
+	if _, pinned := node.pinnedPeerIDs()[peer.id]; pinned {
+		t.Fatal("zero-state deadline kept selected peer pinned")
 	}
-	if pool.coolingDown(shard, peer) {
-		t.Fatal("deadline grace should not cool down zero-state peer")
+	if after := peer.statsSnapshot(); after != before {
+		t.Fatalf("zero-state archive deadline changed live stats: before=%+v after=%+v", before, after)
 	}
 }
 
-func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
+func TestZeroStateNotAvailableDoesNotAdoptLivePeer(t *testing.T) {
 	peer := testZeroStatePeer("live")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -157,7 +161,7 @@ func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
 			peer.id: peer,
 		},
 	})
-	pool := testArchivePool(sub)
+	pool := testArchivePool(t, sub)
 	session := node.BeginArchiveSession()
 	defer session.Close()
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
@@ -167,8 +171,8 @@ func TestZeroStateNotAvailableKeepsBorrowedLivePeer(t *testing.T) {
 	if _, ok := sub.peers[peer.id]; !ok {
 		t.Fatal("borrowed live peer was removed from live pool")
 	}
-	if !pool.hasPeer(peer.id) {
-		t.Fatal("borrowed live peer was removed from archive pool")
+	if testArchivePoolHasPeer(pool, peer.id) {
+		t.Fatal("archive pool adopted the live peer pointer")
 	}
 }
 
@@ -179,19 +183,19 @@ func TestZeroStateNotAvailableRotatesArchiveOnlyPeer(t *testing.T) {
 		log:  discardLogger(),
 		node: node,
 	})
-	pool := testArchivePool(sub)
-	pool.addArchiveOnlyPeer(peer)
+	pool := testArchivePool(t, sub)
+	addTestArchiveOnlyPeer(pool, peer)
 	session := node.BeginArchiveSession()
 	defer session.Close()
 	shard := archiveShardFromBlock(testBlockID(-1, topShard, 0))
 
 	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
-	if !pool.hasPeer(peer.id) {
+	if !testArchivePoolHasPeer(pool, peer.id) {
 		t.Fatal("archive-only peer rotated after a single zero-state not-available")
 	}
 
 	session.rejectArchivePeer(context.Background(), pool, shard, peer, archivePeerRejectStateNotAvailable)
-	if pool.hasPeer(peer.id) {
+	if testArchivePoolHasPeer(pool, peer.id) {
 		t.Fatal("archive-only peer survived repeated zero-state not-available rotation")
 	}
 }

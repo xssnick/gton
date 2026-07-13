@@ -84,6 +84,7 @@ type PersistentStateFile struct {
 	Ref              *ArtifactRef
 	FileHash         []byte
 	StateRootHash    []byte
+	CellsCount       uint64
 }
 
 type ArtifactRef struct {

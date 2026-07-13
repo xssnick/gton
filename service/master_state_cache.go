@@ -22,6 +22,12 @@ const (
 type compressedBlockStateEntry struct {
 	state    *storage.BlockState
 	storedAt time.Time
+	version  uint64
+}
+
+type compressedBlockStateOrderEntry struct {
+	key     storage.BlockRootHash
+	version uint64
 }
 
 type monitorSplitDepthKey struct {
@@ -35,8 +41,6 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 		return
 	}
 
-	s.resetMasterDependentCachesForKeyBlock(block)
-
 	rememberedCompressedState := s.rememberCompressedBlockState(state)
 	s.updateP2PShardOverlays(ctx, state, block, shardTargets)
 
@@ -48,14 +52,18 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 		s.masterStateCache = make(map[storage.BlockRootHash]*storage.BlockState, masterStateCacheLimit)
 	}
 	if _, ok := s.masterStateCache[key]; !ok {
+		if len(s.masterStateCacheKeys) == cap(s.masterStateCacheKeys) && s.masterStateCacheHead > 0 {
+			copy(s.masterStateCacheKeys, s.masterStateCacheKeys[s.masterStateCacheHead:])
+			s.masterStateCacheKeys = s.masterStateCacheKeys[:len(s.masterStateCacheKeys)-s.masterStateCacheHead]
+			s.masterStateCacheHead = 0
+		}
 		s.masterStateCacheKeys = append(s.masterStateCacheKeys, key)
 	}
 	s.masterStateCache[key] = cloned
 
-	for len(s.masterStateCacheKeys) > masterStateCacheLimit {
-		evict := s.masterStateCacheKeys[0]
-		copy(s.masterStateCacheKeys, s.masterStateCacheKeys[1:])
-		s.masterStateCacheKeys = s.masterStateCacheKeys[:len(s.masterStateCacheKeys)-1]
+	for len(s.masterStateCacheKeys)-s.masterStateCacheHead > masterStateCacheLimit {
+		evict := s.masterStateCacheKeys[s.masterStateCacheHead]
+		s.masterStateCacheHead++
 		delete(s.masterStateCache, evict)
 	}
 	s.masterStateCacheMu.Unlock()
@@ -65,13 +73,19 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 	}
 }
 
-func (s *Service) resetMasterDependentCachesForKeyBlock(block *PreparedBlock) {
+func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockState, block *PreparedBlock) error {
 	if block == nil || block.Meta == nil || !block.Meta.Has(storage.BlockMetaIsKeyBlock) {
-		return
+		return nil
 	}
 
+	config, err := broadcastValidatorConfigFromMasterchainState(state)
+	if err != nil {
+		return fmt.Errorf("load broadcast validator config from key block %s: %w", block.BlockRef(), err)
+	}
+
+	s.broadcastValidatorCache.putConfig(state.Block, config)
 	s.resetMonitorSplitDepthCache()
-	s.broadcastValidatorCache.reset()
+	return nil
 }
 
 func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
@@ -80,29 +94,37 @@ func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
 	}
 
 	key := storage.BlockKey(state.Block)
-	now := time.Now()
-	entry := compressedBlockStateEntry{
-		state:    storage.CloneBlockState(state),
-		storedAt: now,
-	}
-
+	cloned := storage.CloneBlockState(state)
 	s.compressedStateMu.Lock()
 	defer s.compressedStateMu.Unlock()
+	now := time.Now()
 
 	if s.compressedStateCache == nil {
 		s.compressedStateCache = make(map[storage.BlockRootHash]compressedBlockStateEntry, compressedBlockStateCacheLimit)
 	}
-	if _, ok := s.compressedStateCache[key]; !ok {
-		s.compressedStateOrder = append(s.compressedStateOrder, key)
+	s.compressedStateVersion++
+	entry := compressedBlockStateEntry{
+		state:    cloned,
+		storedAt: now,
+		version:  s.compressedStateVersion,
 	}
 	s.compressedStateCache[key] = entry
+	if len(s.compressedStateOrder) == cap(s.compressedStateOrder) && s.compressedStateOrderHead > 0 {
+		copy(s.compressedStateOrder, s.compressedStateOrder[s.compressedStateOrderHead:])
+		s.compressedStateOrder = s.compressedStateOrder[:len(s.compressedStateOrder)-s.compressedStateOrderHead]
+		s.compressedStateOrderHead = 0
+	}
+	s.compressedStateOrder = append(s.compressedStateOrder, compressedBlockStateOrderEntry{
+		key:     key,
+		version: entry.version,
+	})
 
 	s.pruneCompressedBlockStatesLocked(now)
-	for len(s.compressedStateOrder) > compressedBlockStateCacheLimit {
-		evict := s.compressedStateOrder[0]
-		copy(s.compressedStateOrder, s.compressedStateOrder[1:])
-		s.compressedStateOrder = s.compressedStateOrder[:len(s.compressedStateOrder)-1]
-		delete(s.compressedStateCache, evict)
+	for len(s.compressedStateCache) > compressedBlockStateCacheLimit {
+		s.evictOldestCompressedBlockStateLocked()
+	}
+	if len(s.compressedStateOrder)-s.compressedStateOrderHead > compressedBlockStateCacheLimit*2 {
+		s.compactCompressedBlockStateOrderLocked()
 	}
 	return true
 }
@@ -128,23 +150,61 @@ func (s *Service) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.Blo
 func (s *Service) pruneCompressedBlockStatesLocked(now time.Time) {
 	if len(s.compressedStateCache) == 0 {
 		s.compressedStateOrder = nil
+		s.compressedStateOrderHead = 0
 		return
 	}
 
+	for s.compressedStateOrderHead < len(s.compressedStateOrder) {
+		oldest := s.compressedStateOrder[s.compressedStateOrderHead]
+		entry, ok := s.compressedStateCache[oldest.key]
+		if !ok || entry.version != oldest.version {
+			s.compressedStateOrderHead++
+			continue
+		}
+		if entry.storedAt.Add(compressedBlockStateCacheTTL).After(now) {
+			break
+		}
+		delete(s.compressedStateCache, oldest.key)
+		s.compressedStateOrderHead++
+	}
+	if s.compressedStateOrderHead == len(s.compressedStateOrder) {
+		s.compressedStateOrder = s.compressedStateOrder[:0]
+		s.compressedStateOrderHead = 0
+	}
+}
+
+func (s *Service) evictOldestCompressedBlockStateLocked() {
+	for s.compressedStateOrderHead < len(s.compressedStateOrder) {
+		oldest := s.compressedStateOrder[s.compressedStateOrderHead]
+		s.compressedStateOrderHead++
+
+		entry, ok := s.compressedStateCache[oldest.key]
+		if !ok || entry.version != oldest.version {
+			continue
+		}
+		delete(s.compressedStateCache, oldest.key)
+		if s.compressedStateOrderHead == len(s.compressedStateOrder) {
+			s.compressedStateOrder = s.compressedStateOrder[:0]
+			s.compressedStateOrderHead = 0
+		}
+		return
+	}
+	s.compressedStateOrder = s.compressedStateOrder[:0]
+	s.compressedStateOrderHead = 0
+}
+
+func (s *Service) compactCompressedBlockStateOrderLocked() {
 	write := 0
-	for _, key := range s.compressedStateOrder {
-		entry, ok := s.compressedStateCache[key]
-		if !ok {
+	for _, ordered := range s.compressedStateOrder[s.compressedStateOrderHead:] {
+		entry, ok := s.compressedStateCache[ordered.key]
+		if !ok || entry.version != ordered.version {
 			continue
 		}
-		if !entry.storedAt.Add(compressedBlockStateCacheTTL).After(now) {
-			delete(s.compressedStateCache, key)
-			continue
-		}
-		s.compressedStateOrder[write] = key
+		s.compressedStateOrder[write] = ordered
 		write++
 	}
 	s.compressedStateOrder = s.compressedStateOrder[:write]
+	s.compressedStateOrderHead = 0
 }
 
 func (s *Service) resetMonitorSplitDepthCache() {
@@ -303,6 +363,12 @@ func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.Bl
 		// function of the block's shard hashes, so the result is identical.
 		if precomputed != nil {
 			return precomputed, nil
+		}
+		// Archive apply already has the parsed destination state. Its shard
+		// hashes are the committed result of this block, so avoid parsing the
+		// prepared block again just to update overlays.
+		if state != nil && state.Block.Equals(&block.ID) && state.Parsed != nil && state.Parsed.McStateExtra != nil {
+			return state2.ShardBlocksFromMasterState(state)
 		}
 
 		parsed, err := parsePreparedBlock(*block)

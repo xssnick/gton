@@ -358,6 +358,53 @@ func TestPrepareReachableStateCellsUsesExactRecordBacking(t *testing.T) {
 	}
 }
 
+func TestPrepareStateUpdateCellsArenaGrowthPreservesRecords(t *testing.T) {
+	root, cells := benchmarkCellGraph(t, 512, 4)
+	update, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
+		MustStoreSlice(root.Hash(0), 256).
+		MustStoreSlice(root.Hash(0), 256).
+		MustStoreUInt(uint64(root.Depth(0)), 16).
+		MustStoreUInt(uint64(root.Depth(0)), 16).
+		MustStoreRef(root).
+		MustStoreRef(root).
+		EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("create merkle update: %v", err)
+	}
+
+	records, err := PrepareStateUpdateCells(update)
+	if err != nil {
+		t.Fatalf("prepare state update cells: %v", err)
+	}
+	if records.Len() != cells {
+		t.Fatalf("prepared records = %d, want %d", records.Len(), cells)
+	}
+
+	checked := 0
+	err = WalkReachableStateCells(root, func(current *cell.Cell, meta cell.Metadata) error {
+		want, err := PrepareEncodedCellRecordFromCellMetadata(current, meta)
+		if err != nil {
+			return err
+		}
+		got := records.Data(meta.Hash)
+		if !bytes.Equal(got, want.Data) {
+			t.Fatalf("record %x changed while growing arena", meta.Hash[:])
+		}
+		if cap(got) != len(got) {
+			t.Fatalf("record %x backing capacity = %d, want exact %d", meta.Hash[:], cap(got), len(got))
+		}
+		checked++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk expected state cells: %v", err)
+	}
+	if checked != cells {
+		t.Fatalf("checked records = %d, want %d", checked, cells)
+	}
+}
+
 func TestLargeBOCPrunedMetadataUsesPrunedHashesDepths(t *testing.T) {
 	leaf := cell.BeginCell().MustStoreUInt(0xBEEF, 16).EndCell()
 	hidden := cell.BeginCell().MustStoreUInt(0xA7, 8).MustStoreRef(leaf).EndCell()

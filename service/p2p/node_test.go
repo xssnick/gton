@@ -66,6 +66,10 @@ func TestPendingBroadcastExpiryReleasesDeduper(t *testing.T) {
 
 func TestPendingBroadcastDecodeSnapshotForPrevUsesIndex(t *testing.T) {
 	node := newTestNode(t)
+	runCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	node.runCtx = runCtx
+
 	now := time.Unix(100, 0)
 	prevA := testBlockID(-1, topShard, 10)
 	prevB := testBlockID(-1, topShard, 11)
@@ -84,6 +88,7 @@ func TestPendingBroadcastDecodeSnapshotForPrevUsesIndex(t *testing.T) {
 		receivedAt:  now,
 		msg:         struct{}{},
 	})
+	node.wg.Wait()
 
 	reqs := node.pendingBlockBroadcastDecodeSnapshotForPrev(prevA, now)
 	if len(reqs) != 1 || reqs[0].fingerprint != "pending-a" {

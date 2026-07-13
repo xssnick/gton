@@ -43,6 +43,7 @@ const (
 	pebbleDiskFullRetryMinBytes    = defaultPebbleCellTargetFileSize
 
 	stateCellImportBatchTargetBytes = 128 << 20
+	stateBOCImportMaxBatchBytes     = 256 << 20
 	stateCellSaveProgressInterval   = 5 * time.Second
 	archivePackageMasterchainBlocks = 20000
 	archiveSliceMasterchainBlocks   = 100
@@ -52,7 +53,8 @@ const (
 	blockMetaVersion               = 2
 	currentStateVersion            = 1
 	artifactRefVersion             = 2
-	persistentStateVersion         = 1
+	persistentStateVersionV1       = 1
+	persistentStateVersion         = 2
 	archivePackageVersion          = 1
 	cellGenerationMigrationVersion = 2
 

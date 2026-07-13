@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -157,7 +158,7 @@ func libraryEntries(libraries *cell.Dictionary, hashes [][]byte) ([]libraryEntry
 		if err != nil {
 			return nil, err
 		}
-		if !strings.EqualFold(tonHash(lib.Hash()), tonHash(hash)) {
+		if !bytes.Equal(lib.Hash(), hash) {
 			continue
 		}
 

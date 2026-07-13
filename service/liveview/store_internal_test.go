@@ -3,7 +3,10 @@ package liveview
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -76,6 +79,149 @@ func TestStorePublishLiveBlockArtifactsRejectsInvalidReadFragments(t *testing.T)
 			t.Fatalf("load availability-only block root: %v", err)
 		}
 	})
+}
+
+func TestPrepareLiveBlockArtifactsOnlyReparsesMessageEntriesForNonFinal(t *testing.T) {
+	raw, err := os.ReadFile("../testdata/masterchain_block_fixture.json")
+	if err != nil {
+		t.Fatalf("read block fixture: %v", err)
+	}
+	var fixture struct {
+		RawBOCBase64 string `json:"raw_boc_base64"`
+	}
+	if err = json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode block fixture: %v", err)
+	}
+	boc, err := base64.StdEncoding.DecodeString(fixture.RawBOCBase64)
+	if err != nil {
+		t.Fatalf("decode block boc: %v", err)
+	}
+	root, err := cell.FromBOC(boc)
+	if err != nil {
+		t.Fatalf("parse block boc: %v", err)
+	}
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     masterchainShard,
+		SeqNo:     58508098,
+		RootHash:  root.Hash(),
+		FileHash:  bytes.Repeat([]byte{0x55}, 32),
+	}
+	artifacts := storage.LiveBlockArtifacts{
+		Block:            block,
+		Root:             root,
+		AvailabilityOnly: true,
+	}
+
+	finalOnly, err := prepareLiveBlockArtifacts(artifacts, false)
+	if err != nil {
+		t.Fatalf("prepare final-only artifacts: %v", err)
+	}
+	if finalOnly.messageEntries != nil {
+		t.Fatalf("final-only artifacts rebuilt %d message entries", len(finalOnly.messageEntries))
+	}
+
+	nonFinal, err := prepareLiveBlockArtifacts(artifacts, true)
+	if err != nil {
+		t.Fatalf("prepare non-final artifacts: %v", err)
+	}
+	if len(nonFinal.messageEntries) == 0 {
+		t.Fatal("non-final artifacts did not rebuild message entries")
+	}
+}
+
+func TestStoreReleasesCurrentCachesWhenBlockLeavesCurrent(t *testing.T) {
+	retiredBlock := testLiveBlockID(-1, masterchainShard, 40, 0x40)
+	currentBlock := testLiveBlockID(-1, masterchainShard, 41, 0x41)
+	keptShard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+	proof := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
+
+	retired := &BlockView{
+		retainCurrentCaches: true,
+		accountProofs: map[accountProofKey]accountProofValue{
+			{}: {proof: []*cell.Cell{proof}},
+		},
+		shardHashesProofs: map[shardHashesProofKey]*cell.Cell{{}: proof},
+		externalMsgAccounts: map[externalMessageAccountKey]externalMessageAccountValue{
+			{}: {},
+		},
+	}
+	kept := &BlockView{
+		retainCurrentCaches: true,
+		accountProofs: map[accountProofKey]accountProofValue{
+			{}: {proof: []*cell.Cell{proof}},
+		},
+		externalMsgAccounts: map[externalMessageAccountKey]externalMessageAccountValue{
+			{}: {},
+		},
+	}
+
+	live := New(noopBacking{})
+	live.blocks[storage.BlockKey(retiredBlock)] = &liveBlock{id: retiredBlock, fragments: retired}
+	live.blocks[storage.BlockKey(keptShard)] = &liveBlock{id: keptShard, fragments: kept}
+	previous := &storage.CurrentState{
+		Masterchain: storage.BlockState{Block: retiredBlock},
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(keptShard): {Block: keptShard},
+		},
+	}
+	next := &storage.CurrentState{
+		Masterchain: storage.BlockState{Block: currentBlock},
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(keptShard): {Block: keptShard},
+		},
+	}
+
+	live.releaseRetiredCurrentCachesLocked(previous, next)
+
+	if retired.retainCurrentCaches || retired.accountProofs != nil || retired.shardHashesProofs != nil || retired.externalMsgAccounts != nil {
+		t.Fatal("retired block retained current-view caches")
+	}
+	if !kept.retainCurrentCaches || len(kept.accountProofs) != 1 || len(kept.externalMsgAccounts) != 1 {
+		t.Fatal("current shard cache was released")
+	}
+
+	retired.mu.Lock()
+	retired.rememberAccountProofStateLocked(accountProofKey{}, []*cell.Cell{proof}, proof, false)
+	retired.mu.Unlock()
+	if retired.accountProofs != nil {
+		t.Fatal("retired block repopulated its account proof cache")
+	}
+}
+
+func TestStoreReleasesMessageIndexAfterArtifactFlush(t *testing.T) {
+	block := testLiveBlockID(-1, masterchainShard, 50, 0x50)
+	entry := storage.MessageTransactionIndexEntry{
+		Kind: storage.MessageTransactionInbound,
+		Ref:  storage.MessageTransactionRef{Block: block},
+	}
+	key := storage.BlockKey(block)
+	live := New(noopBacking{})
+	live.current = &storage.CurrentState{Masterchain: storage.BlockState{Block: block}}
+	live.blocks[key] = &liveBlock{
+		id:             block,
+		messageEntries: []storage.MessageTransactionIndexEntry{entry},
+	}
+	live.addMessageTransactionIndexLocked(key, []storage.MessageTransactionIndexEntry{entry})
+
+	live.MarkLiveBlockFlushed(block)
+
+	if len(live.messageIndex) != 0 || len(live.messageBlockIndex) != 0 {
+		t.Fatal("flushed block retained its message transaction index")
+	}
+	if cached := live.blocks[key]; cached == nil || cached.messageEntries != nil {
+		t.Fatal("flushed block retained message transaction entries")
+	}
+}
+
+func testLiveBlockID(workchain int32, shard int64, seqno uint32, fill byte) ton.BlockIDExt {
+	return ton.BlockIDExt{
+		Workchain: workchain,
+		Shard:     shard,
+		SeqNo:     seqno,
+		RootHash:  bytes.Repeat([]byte{fill}, 32),
+		FileHash:  bytes.Repeat([]byte{fill + 1}, 32),
+	}
 }
 
 type noopBacking struct{}

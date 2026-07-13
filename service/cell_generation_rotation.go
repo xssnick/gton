@@ -36,6 +36,11 @@ type cellGenerationCandidate struct {
 	cells      *stateCellWindowCache
 }
 
+type cellGenerationCandidateBlockLoad struct {
+	block PreparedBlock
+	err   error
+}
+
 type cellGenerationMigrationRun struct {
 	cancel context.CancelCauseFunc
 	done   chan struct{}
@@ -969,12 +974,25 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 	shardCache := map[storage.BlockRootHash]*storage.BlockState{}
 	resolver := s.newCellGenerationShardResolver(ctx, store, candidate, shardCache)
 	processed := uint32(0)
+	checkpointBlocks := uint32(0)
 	started := time.Now()
 	startSeqno := candidate.current.Masterchain.Block.SeqNo
 	lastLog := started
 	lastLogProcessed := processed
 	shardBlocksApplied := uint64(0)
 	shardBlocksReused := uint64(0)
+	workCtx, cancelWork := context.WithCancel(ctx)
+	var prefetched <-chan cellGenerationCandidateBlockLoad
+	var checkpointFlush <-chan error
+	defer func() {
+		cancelWork()
+		if prefetched != nil {
+			<-prefetched
+		}
+		if checkpointFlush != nil {
+			<-checkpointFlush
+		}
+	}()
 
 	if target.Masterchain.Block.SeqNo > startSeqno {
 		s.log.Info().
@@ -988,6 +1006,15 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 			Msg("catching up next celldb generation from stored blocks")
 	}
 
+	var downloaded PreparedBlock
+	if candidate.current.Masterchain.Block.SeqNo < target.Masterchain.Block.SeqNo {
+		var err error
+		downloaded, err = s.loadCandidateNextMasterBlock(ctx, candidate.current.Masterchain.Block)
+		if err != nil {
+			return err
+		}
+	}
+
 	for candidate.current.Masterchain.Block.SeqNo < target.Masterchain.Block.SeqNo {
 		select {
 		case <-ctx.Done():
@@ -995,10 +1022,10 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 		default:
 		}
 
-		downloaded, err := s.loadCandidateNextMasterBlock(ctx, candidate.current.Masterchain.Block)
-		if err != nil {
-			return err
+		if downloaded.ID.SeqNo < target.Masterchain.Block.SeqNo {
+			prefetched = s.prefetchCellGenerationCandidateBlock(workCtx, downloaded.ID)
 		}
+
 		nextMaster, _, err := s.applyMasterchainTransition(ctx, &candidate.current.Masterchain, downloaded, nil, candidate.cells, nil)
 		if err != nil {
 			return fmt.Errorf("apply candidate masterchain transition after %s: %w", storage.FormatBlockRef(candidate.current.Masterchain.Block), err)
@@ -1020,25 +1047,46 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 		shardBlocksApplied += uint64(shardStats.applied)
 		shardBlocksReused += uint64(shardStats.reused)
 		processed++
+		checkpointBlocks++
 
 		now := time.Now()
 		if now.Sub(lastLog) >= cellGenerationMigrationProgressInterval && candidate.current.Masterchain.Block.SeqNo < target.Masterchain.Block.SeqNo {
 			s.logCellGenerationCandidateCatchUpProgress(
-				candidate, target, startSeqno, processed, lastLogProcessed,
+				candidate, target, startSeqno, processed, checkpointBlocks, lastLogProcessed,
 				started, lastLog, now, shardBlocksApplied, shardBlocksReused, false,
 			)
 			lastLog = now
 			lastLogProcessed = processed
 		}
 
-		if processed%s.nextCheckpointBlocks() == 0 {
-			if err = s.flushCellGenerationCandidate(ctx, store, candidate); err != nil {
-				return fmt.Errorf("flush cell generation candidate checkpoint at %s: %w", storage.FormatBlockRef(candidate.current.Masterchain.Block), err)
+		if checkpointBlocks >= s.nextCheckpointBlocks() || candidate.cells.activeByteSize() >= s.checkpointBytesTarget() {
+			if checkpointFlush != nil {
+				if err = <-checkpointFlush; err != nil {
+					checkpointFlush = nil
+					return err
+				}
+				checkpointFlush = nil
 			}
-			if err = store.SaveCellGenerationMigrationProgress(ctx, candidate.generation, candidate.current); err != nil {
-				return fmt.Errorf("save cell generation migration progress: %w", err)
-			}
+			checkpointFlush = s.startCellGenerationCandidateCheckpoint(workCtx, store, candidate)
+			checkpointBlocks = 0
 		}
+
+		if prefetched != nil {
+			loaded := <-prefetched
+			prefetched = nil
+			if loaded.err != nil {
+				return loaded.err
+			}
+			downloaded = loaded.block
+		}
+	}
+
+	if checkpointFlush != nil {
+		if err := <-checkpointFlush; err != nil {
+			checkpointFlush = nil
+			return err
+		}
+		checkpointFlush = nil
 	}
 
 	if !candidate.current.Masterchain.Block.Equals(&target.Masterchain.Block) {
@@ -1047,11 +1095,48 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 	if processed > 0 {
 		now := time.Now()
 		s.logCellGenerationCandidateCatchUpProgress(
-			candidate, target, startSeqno, processed, lastLogProcessed,
+			candidate, target, startSeqno, processed, checkpointBlocks, lastLogProcessed,
 			started, lastLog, now, shardBlocksApplied, shardBlocksReused, true,
 		)
 	}
 	return nil
+}
+
+func (s *Service) prefetchCellGenerationCandidateBlock(ctx context.Context, previous ton.BlockIDExt) <-chan cellGenerationCandidateBlockLoad {
+	done := make(chan cellGenerationCandidateBlockLoad, 1)
+	go func() {
+		block, err := s.loadCandidateNextMasterBlock(ctx, previous)
+		done <- cellGenerationCandidateBlockLoad{block: block, err: err}
+	}()
+	return done
+}
+
+func (s *Service) startCellGenerationCandidateCheckpoint(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate) <-chan error {
+	checkpoint := candidate.cells.beginCheckpoint()
+	if checkpoint == nil {
+		return nil
+	}
+
+	generation := candidate.generation
+	current := storage.CloneCurrentState(candidate.current)
+	done := make(chan error, 1)
+	go func() {
+		records := checkpoint.records()
+		if len(records) > 0 {
+			if err := store.SaveEncodedCellsInGeneration(ctx, generation, records, true); err != nil {
+				done <- fmt.Errorf("flush cell generation candidate checkpoint at %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
+				return
+			}
+		}
+		if err := store.SaveCellGenerationMigrationProgress(ctx, generation, current); err != nil {
+			done <- fmt.Errorf("save cell generation migration progress at %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
+			return
+		}
+
+		checkpoint.complete()
+		done <- nil
+	}()
+	return done
 }
 
 func (s *Service) logCellGenerationCandidateCatchUpProgress(
@@ -1059,6 +1144,7 @@ func (s *Service) logCellGenerationCandidateCatchUpProgress(
 	target *storage.CurrentState,
 	startSeqno uint32,
 	processed uint32,
+	checkpointBlocks uint32,
 	lastLogProcessed uint32,
 	started time.Time,
 	lastLog time.Time,
@@ -1081,7 +1167,7 @@ func (s *Service) logCellGenerationCandidateCatchUpProgress(
 		Uint32("processed_masterchain_blocks", processed).
 		Uint32("total_masterchain_blocks", total).
 		Uint32("remaining", remaining).
-		Uint32("pending_checkpoint_blocks", processed%s.nextCheckpointBlocks()).
+		Uint32("pending_checkpoint_blocks", checkpointBlocks).
 		Uint64("pending_checkpoint_bytes", candidate.cells.byteSize()).
 		Uint64("applied_shard_blocks", shardBlocksApplied).
 		Uint64("reused_shard_blocks", shardBlocksReused).

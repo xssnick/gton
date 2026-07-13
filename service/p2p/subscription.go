@@ -31,6 +31,10 @@ type overlaySubscription struct {
 	runToken            *struct{}
 	inactive            bool
 	inactiveDeleteAt    time.Time
+	activityLeases      uint32
+	pendingInactive     bool
+	pendingDeleteAt     time.Time
+	removed             bool
 	seedMx              sync.Mutex
 	seedRunning         bool
 	seedScheduled       bool
@@ -63,12 +67,31 @@ func (s *overlaySubscription) isActive() bool {
 func (s *overlaySubscription) setActive(active bool, deleteAt time.Time) bool {
 	s.mx.Lock()
 	defer s.mx.Unlock()
+	return s.setActiveLocked(active, deleteAt)
+}
+
+func (s *overlaySubscription) setActiveLocked(active bool, deleteAt time.Time) bool {
+	if s.removed {
+		return false
+	}
 
 	if active {
-		changed := s.inactive
+		changed := s.inactive || s.pendingInactive
 		s.inactive = false
 		s.inactiveDeleteAt = time.Time{}
+		s.pendingInactive = false
+		s.pendingDeleteAt = time.Time{}
 		return changed
+	}
+
+	if s.activityLeases > 0 {
+		if !s.pendingInactive {
+			s.pendingInactive = true
+			s.pendingDeleteAt = deleteAt
+		} else if s.pendingDeleteAt.IsZero() {
+			s.pendingDeleteAt = deleteAt
+		}
+		return false
 	}
 
 	if s.inactive {
@@ -86,8 +109,45 @@ func (s *overlaySubscription) setActive(active bool, deleteAt time.Time) bool {
 func (s *overlaySubscription) inactiveExpired(now time.Time) bool {
 	s.mx.Lock()
 	defer s.mx.Unlock()
+	return s.inactiveExpiredLocked(now)
+}
 
-	return s.inactive && !s.inactiveDeleteAt.IsZero() && !now.Before(s.inactiveDeleteAt)
+func (s *overlaySubscription) inactiveExpiredLocked(now time.Time) bool {
+	return !s.removed && s.activityLeases == 0 && s.inactive && !s.inactiveDeleteAt.IsZero() && !now.Before(s.inactiveDeleteAt)
+}
+
+func (s *overlaySubscription) beginArchiveUse() (func(), error) {
+	s.mx.Lock()
+	if s.removed {
+		s.mx.Unlock()
+		return nil, errors.New("overlay subscription was removed")
+	}
+
+	if s.inactive {
+		s.pendingInactive = true
+		s.pendingDeleteAt = s.inactiveDeleteAt
+		s.inactive = false
+		s.inactiveDeleteAt = time.Time{}
+	}
+	s.activityLeases++
+	s.mx.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(s.releaseArchiveUse)
+	}, nil
+}
+
+func (s *overlaySubscription) releaseArchiveUse() {
+	s.mx.Lock()
+	s.activityLeases--
+	if s.activityLeases == 0 && s.pendingInactive {
+		s.inactive = true
+		s.inactiveDeleteAt = s.pendingDeleteAt
+		s.pendingInactive = false
+		s.pendingDeleteAt = time.Time{}
+	}
+	s.mx.Unlock()
 }
 
 func (s *overlaySubscription) setRunCancel(cancel context.CancelFunc) (*struct{}, bool) {
@@ -180,24 +240,22 @@ type overlayPeer struct {
 	rldpOverlay *overlay.RLDPOverlayWrapper
 	release     func()
 
-	statsMx               sync.Mutex
-	versionMajor          int32
-	versionMinor          int32
-	capabilitiesFlags     uint32
-	roundtrip             time.Duration
-	unreliability         float64
-	missedPings           uint32
-	alive                 bool
-	pending               bool
-	warmupRunning         bool
-	lastReceiveAt         time.Time
-	lastSuccessAt         time.Time
-	failedQueries         uint64
-	downloadBytesSec      float64
-	downloadCount         uint64
-	archiveLargeBytesSec  float64
-	archiveLargeDownloads uint64
-	downloadSlowUntil     time.Time
+	statsMx           sync.Mutex
+	versionMajor      int32
+	versionMinor      int32
+	capabilitiesFlags uint32
+	roundtrip         time.Duration
+	unreliability     float64
+	missedPings       uint32
+	alive             bool
+	pending           bool
+	warmupRunning     bool
+	lastReceiveAt     time.Time
+	lastSuccessAt     time.Time
+	failedQueries     uint64
+	downloadBytesSec  float64
+	downloadCount     uint64
+	downloadSlowUntil time.Time
 
 	rebroadcastMx         sync.Mutex
 	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
@@ -645,32 +703,27 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 		return false, fmt.Errorf("overlay node has no addresses")
 	}
 
-	for _, addr := range addrList.Addresses {
-		udpAddr, err := adnladdr.DialString(addr)
-		if err != nil {
-			continue
-		}
-		pooled, err := s.node.pool.Get(udpAddr, identity.pub)
-		if err != nil {
-			continue
-		}
-		attached := s.attachPooledPeer(pooled, &node)
-		if attached {
-			event := s.log.Debug()
-			if s.aliveKnownPeerCount() <= 3 {
-				event = s.log.Info()
-			}
-			event.
-				Str("peer", pooled.addr).
-				Str("peer_id", pooled.id.String()).
-				Msg("connected overlay peer")
-		} else {
-			s.node.pool.closeIfUnused(pooled)
-		}
-		return attached, nil
+	udpAddr, err := firstPeerEndpoint(addrList.Addresses)
+	if err != nil {
+		return false, err
 	}
-
-	return false, fmt.Errorf("failed to dial any address for overlay peer")
+	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(identity.peerID, udpAddr, identity.pub)
+	if err != nil {
+		return false, fmt.Errorf("connect overlay peer endpoint: %w", err)
+	}
+	attached := s.attachPooledPeer(pooled, &node)
+	releaseEndpoint()
+	if attached {
+		event := s.log.Debug()
+		if s.aliveKnownPeerCount() <= 3 {
+			event = s.log.Info()
+		}
+		event.
+			Str("peer", pooled.addr).
+			Str("peer_id", pooled.id.String()).
+			Msg("connected overlay peer")
+	}
+	return attached, nil
 }
 
 func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
@@ -729,27 +782,33 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 		return false, fmt.Errorf("fixed node public key does not match requested ADNL id")
 	}
 
-	for _, addr := range addrList.Addresses {
-		udpAddr, err := adnladdr.DialString(addr)
-		if err != nil {
-			continue
-		}
-		pooled, err := s.node.pool.Get(udpAddr, pub)
-		if err != nil {
-			continue
-		}
-		if s.attachPooledPeer(pooled, nil) {
-			s.log.Debug().
-				Str("peer", pooled.addr).
-				Str("peer_id", pooled.id.String()).
-				Msg("connected fixed custom overlay peer")
-			return true, nil
-		}
-		s.node.pool.closeIfUnused(pooled)
-		return false, nil
+	udpAddr, err := firstPeerEndpoint(addrList.Addresses)
+	if err != nil {
+		return false, err
 	}
+	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(nodeID, udpAddr, pub)
+	if err != nil {
+		return false, fmt.Errorf("connect fixed node endpoint: %w", err)
+	}
+	attached := s.attachPooledPeer(pooled, nil)
+	releaseEndpoint()
+	if attached {
+		s.log.Debug().
+			Str("peer", pooled.addr).
+			Str("peer_id", pooled.id.String()).
+			Msg("connected fixed custom overlay peer")
+	}
+	return attached, nil
+}
 
-	return false, fmt.Errorf("failed to dial any fixed node address")
+func firstPeerEndpoint(addresses []adnladdr.Address) (string, error) {
+	for _, addr := range addresses {
+		endpoint, err := adnladdr.DialString(addr)
+		if err == nil {
+			return endpoint, nil
+		}
+	}
+	return "", errors.New("peer has no supported endpoint")
 }
 
 func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNodeIdentity, error) {
@@ -1343,6 +1402,20 @@ func (s *overlaySubscription) removePeer(id PeerID) {
 	if peer != nil {
 		peer.close()
 	}
+}
+
+func (s *overlaySubscription) removePeerIfCurrent(peer *overlayPeer) {
+	s.mx.Lock()
+	if s.peers[peer.id] != peer {
+		s.mx.Unlock()
+		return
+	}
+	delete(s.peers, peer.id)
+	s.removeNeighbourLocked(peer.id)
+	s.notifyPeersChangedLocked()
+	s.mx.Unlock()
+
+	peer.close()
 }
 
 func (s *overlaySubscription) aliveKnownPeerCount() int {

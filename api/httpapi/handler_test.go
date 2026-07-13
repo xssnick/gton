@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -495,4 +497,142 @@ func stringResult(t *testing.T, body responseBody) string {
 		t.Fatalf("decode string result: %v\n%s", err, body.Result)
 	}
 	return result
+}
+
+type benchmarkResponseWriter struct {
+	header http.Header
+	bytes.Buffer
+}
+
+func (w *benchmarkResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *benchmarkResponseWriter) WriteHeader(int) {}
+
+func benchmarkJSONResponse() successEnvelope {
+	transactions := make([]shortTxID, 40)
+	for i := range transactions {
+		transactions[i] = shortTxID{
+			Type:    shortTxIDType,
+			Mode:    shortTxIDMode,
+			Account: "0:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			LT:      "1234567890123456",
+			Hash:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}
+	}
+	return successEnvelope{
+		OK: true,
+		Result: blockTransactions{
+			Type:         blockTransactionsType,
+			ReqCount:     uint32(len(transactions)),
+			Transactions: transactions,
+		},
+		Extra: "1783269917:_:0.001",
+	}
+}
+
+func BenchmarkJSONEncoders(b *testing.B) {
+	value := benchmarkJSONResponse()
+
+	b.Run("encoding_json", func(b *testing.B) {
+		w := &benchmarkResponseWriter{header: http.Header{}}
+		b.ReportAllocs()
+		for b.Loop() {
+			w.Reset()
+			if err := json.NewEncoder(w).Encode(value); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("go_json", func(b *testing.B) {
+		server := &Server{}
+		w := &benchmarkResponseWriter{header: http.Header{}}
+		b.ReportAllocs()
+		for b.Loop() {
+			w.Reset()
+			server.writeJSON(w, http.StatusOK, value)
+		}
+	})
+}
+
+func TestWriteJSONMatchesStandardLibrary(t *testing.T) {
+	value := benchmarkJSONResponse()
+	value.Extra = "<tag>&\u2028\u2029"
+
+	var want bytes.Buffer
+	if err := json.NewEncoder(&want).Encode(value); err != nil {
+		t.Fatalf("encode with standard library: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	new(Server).writeJSON(recorder, http.StatusAccepted, value)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusAccepted)
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), want.Bytes()) {
+		t.Fatalf("response differs from encoding/json:\n got %s\nwant %s", recorder.Body.Bytes(), want.Bytes())
+	}
+
+	var decoded successEnvelope
+	if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode response with standard library: %v", err)
+	}
+}
+
+func TestDecodeJSONBody(t *testing.T) {
+	t.Run("whitespace is an empty object", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(" \n\t "))
+		var body map[string]json.RawMessage
+		if err := decodeJSONBody(request, maxBodyBytes, &body); err != nil {
+			t.Fatal(err)
+		}
+		if body == nil || len(body) != 0 {
+			t.Fatalf("decoded body = %#v, want empty object", body)
+		}
+	})
+
+	t.Run("body limit", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"value":1}`))
+		var body map[string]json.RawMessage
+		err := decodeJSONBody(request, 4, &body)
+		var tooLarge *http.MaxBytesError
+		if !errors.As(err, &tooLarge) {
+			t.Fatalf("error = %v, want MaxBytesError", err)
+		}
+	})
+}
+
+func BenchmarkDecodeJSONBody(b *testing.B) {
+	small := []byte(`{"address":"0:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}`)
+	large := make([]byte, 0, 64<<10)
+	large = append(large, `{"boc":"`...)
+	large = append(large, bytes.Repeat([]byte{'a'}, (64<<10)-len(large)-2)...)
+	large = append(large, '"', '}')
+
+	benchmarks := []struct {
+		name          string
+		payload       []byte
+		contentLength int64
+	}{
+		{name: "small", payload: small, contentLength: int64(len(small))},
+		{name: "64KiB", payload: large, contentLength: int64(len(large))},
+		{name: "oversized_content_length", payload: small, contentLength: maxBodyBytes},
+	}
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				request := &http.Request{
+					Body:          io.NopCloser(bytes.NewReader(benchmark.payload)),
+					ContentLength: benchmark.contentLength,
+				}
+				var body map[string]json.RawMessage
+				if err := decodeJSONBody(request, maxBodyBytes, &body); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

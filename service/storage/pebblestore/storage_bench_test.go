@@ -3,6 +3,8 @@ package pebblestore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -158,6 +160,81 @@ func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkPebbleSaveStateBOCViewParallel(b *testing.B) {
+	root, cells := benchmarkCellGraph(b, 32768, 4)
+	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithIndex:     true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	view, err := cell.OpenBOCView(bytes.NewReader(boc), int64(len(boc)), cell.BOCViewOptions{RequireIndex: true})
+	if err != nil {
+		b.Fatalf("open benchmark boc view: %v", err)
+	}
+	store := openBenchmarkStore(b, Options{})
+	block := benchmarkBlockID(2)
+	workers := stateBOCImportWorkerCount(view.Cells())
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if err := store.saveStateBOCView(context.Background(), 0, block, view); err != nil {
+			b.Fatalf("save boc view state cells: %v", err)
+		}
+	}
+	b.ReportMetric(float64(cells), "cells/op")
+	b.ReportMetric(float64(workers), "workers")
+	b.ReportMetric(float64(stateBOCImportWorkerBatchTarget(workers)*workers)/(1<<20), "batch-MiB")
+}
+
+func BenchmarkStateBOCBatchBudget(b *testing.B) {
+	const (
+		workers       = cellDBShardCount
+		writtenBytes  = 128 << 20
+		recordSize    = 512
+		initialBudget = stateCellImportBatchTargetBytes
+	)
+
+	for _, aggregateBudget := range []int{128 << 20, 256 << 20, 512 << 20} {
+		b.Run(fmt.Sprintf("aggregate=%dMiB", aggregateBudget>>20), func(b *testing.B) {
+			store := openBenchmarkStore(b, Options{})
+			workerTarget := aggregateBudget / workers
+			workerInitial := initialBudget / workers
+			flushes := (writtenBytes + workerTarget - 1) / workerTarget
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				writer := store.cells.newBatchWriter(cellShardBatchInitialSize(workerInitial))
+				for i := 0; i < writtenBytes/recordSize; i++ {
+					var hash cell.Hash
+					hash[0] = byte(i%cellDBShardCount) << 5
+					binary.BigEndian.PutUint64(hash[24:], uint64(i))
+					if err := writer.setDeferred(hash[:], recordSize, func(value []byte) {
+						value[0] = byte(i)
+					}); err != nil {
+						writer.close()
+						b.Fatalf("add batch record: %v", err)
+					}
+					if writer.bytesInBatch >= workerTarget {
+						if _, err := writer.flush(); err != nil {
+							writer.close()
+							b.Fatalf("flush batch: %v", err)
+						}
+					}
+				}
+				if _, err := writer.flush(); err != nil {
+					writer.close()
+					b.Fatalf("flush final batch: %v", err)
+				}
+				writer.close()
+			}
+			b.ReportMetric(float64(writtenBytes), "bytes/op")
+			b.ReportMetric(float64(flushes), "flushes/op")
+		})
+	}
 }
 
 func BenchmarkPebbleSaveStateCellTree(b *testing.B) {

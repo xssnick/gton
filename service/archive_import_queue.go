@@ -2,8 +2,8 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"runtime"
-	"sync"
 	"sync/atomic"
 
 	"github.com/xssnick/gton/service/archive"
@@ -21,7 +21,6 @@ type archiveImportQueue struct {
 	downloadPrefetch chan archiveDownloadJob
 	prepareHot       chan archivePrepareJob
 	preparePrefetch  chan archivePrepareJob
-	downloadedBytes  *archiveDownloadByteGate
 	activeDownload   atomic.Int64
 	activePrepare    atomic.Int64
 }
@@ -38,7 +37,6 @@ type archiveDownloadJob struct {
 type archivePrepareJob struct {
 	ctx        context.Context
 	downloaded *archive.Downloaded
-	bytes      uint64
 	splitDepth uint32
 	priority   archiveImportPriority
 	done       chan archiveImportQueueResult
@@ -51,30 +49,30 @@ type archiveImportQueueResult struct {
 	err       error
 }
 
+type archiveImportPeerError struct {
+	peer      string
+	archiveID int64
+	err       error
+}
+
+func (e *archiveImportPeerError) Error() string {
+	return fmt.Sprintf("archive %d from %s: %v", e.archiveID, e.peer, e.err)
+}
+
+func (e *archiveImportPeerError) Unwrap() error {
+	return e.err
+}
+
 func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *archiveImportQueue {
 	downloadWorkers := archiveDownloadWorkers()
-	downloadBudget := archiveDownloadWorkerBudget(downloadWorkers)
 	prepareWorkers := archiveCPUWorkers()
-	prepareBudget := archivePrepareWorkerBudget(prepareWorkers)
 	queue := &archiveImportQueue{
 		downloadHot:      make(chan archiveDownloadJob, downloadWorkers),
 		downloadPrefetch: make(chan archiveDownloadJob, downloadWorkers),
 		prepareHot:       make(chan archivePrepareJob, prepareWorkers),
 		preparePrefetch:  make(chan archivePrepareJob, prepareWorkers),
-		downloadedBytes:  newArchiveDownloadByteGate(r.archiveCheckpointBackpressureBytes()),
 	}
-	for worker := 0; worker < downloadBudget.hotOnly; worker++ {
-		go func() {
-			for {
-				job, ok := nextArchiveHotJob(ctx, queue.downloadHot, archiveDownloadJob{})
-				if !ok {
-					return
-				}
-				queue.runDownloadJob(r, job)
-			}
-		}()
-	}
-	for worker := 0; worker < downloadBudget.shared; worker++ {
+	for worker := 0; worker < downloadWorkers; worker++ {
 		go func() {
 			for {
 				job, ok := nextArchivePriorityJob(ctx, queue.downloadHot, queue.downloadPrefetch, archiveDownloadJob{})
@@ -85,18 +83,7 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 			}
 		}()
 	}
-	for worker := 0; worker < prepareBudget.hotOnly; worker++ {
-		go func() {
-			for {
-				job, ok := nextArchiveHotJob(ctx, queue.prepareHot, archivePrepareJob{})
-				if !ok {
-					return
-				}
-				queue.runPrepareJob(r, job)
-			}
-		}()
-	}
-	for worker := 0; worker < prepareBudget.shared; worker++ {
+	for worker := 0; worker < prepareWorkers; worker++ {
 		go func() {
 			for {
 				job, ok := nextArchivePriorityJob(ctx, queue.prepareHot, queue.preparePrefetch, archivePrepareJob{})
@@ -123,8 +110,6 @@ func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
 		prepareHotQueued:       len(q.prepareHot),
 		preparePrefetchQueued:  len(q.preparePrefetch),
 	}
-	snapshot.downloadedBytes = q.downloadedBytes.size()
-	snapshot.downloadedBytesLimit = q.downloadedBytes.limit()
 	return snapshot
 }
 
@@ -136,6 +121,13 @@ func (q *archiveImportQueue) importArchive(ctx context.Context, masterchainSeqno
 
 	select {
 	case result := <-done:
+		if result.err != nil && result.peer != "" {
+			return nil, &archiveImportPeerError{
+				peer:      result.peer,
+				archiveID: result.archiveID,
+				err:       result.err,
+			}
+		}
 		return result.imported, result.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -170,23 +162,14 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	q.activeDownload.Add(1)
 	defer q.activeDownload.Add(-1)
 
-	if err := q.downloadedBytes.wait(job.ctx); err != nil {
-		job.done <- archiveImportQueueResult{err: err}
-		return
-	}
-
 	downloaded, err := r.downloadArchiveFile(job.ctx, job.masterchainSeqno, job.shard, q.archiveDownloadsStarved())
 	if err != nil {
 		job.done <- archiveImportQueueResult{err: err}
 		return
 	}
-	downloadedBytes := uint64(len(downloaded.Data))
-	q.downloadedBytes.add(downloadedBytes)
-
 	prepare := archivePrepareJob{
 		ctx:        job.ctx,
 		downloaded: downloaded,
-		bytes:      downloadedBytes,
 		splitDepth: job.splitDepth,
 		priority:   job.priority,
 		done:       job.done,
@@ -194,7 +177,7 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	select {
 	case q.prepareJobs(job.priority) <- prepare:
 	case <-job.ctx.Done():
-		q.downloadedBytes.release(downloadedBytes)
+		downloaded.Data = nil
 		job.done <- archiveImportQueueResult{err: job.ctx.Err()}
 	}
 }
@@ -204,7 +187,6 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 		if job.downloaded != nil {
 			job.downloaded.Data = nil
 		}
-		q.downloadedBytes.release(job.bytes)
 	}
 
 	if err := job.ctx.Err(); err != nil {
@@ -227,7 +209,7 @@ func (q *archiveImportQueue) archiveDownloadsStarved() bool {
 	if q.activePrepare.Load() > 0 || len(q.prepareHot) > 0 || len(q.preparePrefetch) > 0 {
 		return false
 	}
-	return q.downloadedBytes.size() == 0
+	return true
 }
 
 func nextArchivePriorityJob[T any](ctx context.Context, hot <-chan T, prefetch <-chan T, zero T) (T, bool) {
@@ -241,15 +223,6 @@ func nextArchivePriorityJob[T any](ctx context.Context, hot <-chan T, prefetch <
 	case job := <-hot:
 		return job, true
 	case job := <-prefetch:
-		return job, true
-	case <-ctx.Done():
-		return zero, false
-	}
-}
-
-func nextArchiveHotJob[T any](ctx context.Context, hot <-chan T, zero T) (T, bool) {
-	select {
-	case job := <-hot:
 		return job, true
 	case <-ctx.Done():
 		return zero, false
@@ -270,83 +243,6 @@ func (q *archiveImportQueue) prepareJobs(priority archiveImportPriority) chan ar
 	return q.preparePrefetch
 }
 
-type archiveDownloadByteGate struct {
-	max   uint64
-	mu    sync.Mutex
-	done  chan struct{}
-	bytes uint64
-}
-
-func newArchiveDownloadByteGate(max uint64) *archiveDownloadByteGate {
-	return &archiveDownloadByteGate{
-		max:  max,
-		done: make(chan struct{}),
-	}
-}
-
-func (g *archiveDownloadByteGate) wait(ctx context.Context) error {
-	for {
-		g.mu.Lock()
-		if g.bytes < g.max {
-			g.mu.Unlock()
-			return nil
-		}
-		done := g.done
-		g.mu.Unlock()
-
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (g *archiveDownloadByteGate) add(bytes uint64) {
-	if bytes == 0 {
-		return
-	}
-
-	g.mu.Lock()
-	if g.bytes > ^uint64(0)-bytes {
-		g.bytes = ^uint64(0)
-	} else {
-		g.bytes += bytes
-	}
-	g.mu.Unlock()
-}
-
-func (g *archiveDownloadByteGate) release(bytes uint64) {
-	if bytes == 0 {
-		return
-	}
-
-	g.mu.Lock()
-	if bytes > g.bytes {
-		g.bytes = 0
-	} else {
-		g.bytes -= bytes
-	}
-	g.broadcast()
-	g.mu.Unlock()
-}
-
-func (g *archiveDownloadByteGate) size() uint64 {
-	g.mu.Lock()
-	bytes := g.bytes
-	g.mu.Unlock()
-	return bytes
-}
-
-func (g *archiveDownloadByteGate) limit() uint64 {
-	return g.max
-}
-
-func (g *archiveDownloadByteGate) broadcast() {
-	close(g.done)
-	g.done = make(chan struct{})
-}
-
 func archiveCPUWorkers() int {
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 1 {
@@ -364,53 +260,4 @@ func archiveDownloadWorkers() int {
 		return archiveDownloadWorkerMax
 	}
 	return workers
-}
-
-type archiveWorkerBudget struct {
-	hotOnly int
-	shared  int
-}
-
-func archiveDownloadWorkerBudget(workers int) archiveWorkerBudget {
-	if workers <= 1 {
-		return archiveWorkerBudget{shared: workers}
-	}
-
-	hotOnly := workers / 4
-	if hotOnly < archiveDownloadHotWorkerMin {
-		hotOnly = archiveDownloadHotWorkerMin
-	}
-	if hotOnly > archiveDownloadHotWorkerMax {
-		hotOnly = archiveDownloadHotWorkerMax
-	}
-	if hotOnly >= workers {
-		hotOnly = workers - 1
-	}
-
-	return archiveWorkerBudget{
-		hotOnly: hotOnly,
-		shared:  workers - hotOnly,
-	}
-}
-
-func archivePrepareWorkerBudget(workers int) archiveWorkerBudget {
-	if workers <= 1 {
-		return archiveWorkerBudget{shared: workers}
-	}
-
-	hotOnly := workers / 8
-	if hotOnly < archivePrepareHotWorkerMin {
-		hotOnly = archivePrepareHotWorkerMin
-	}
-	if hotOnly > archivePrepareHotWorkerMax {
-		hotOnly = archivePrepareHotWorkerMax
-	}
-	if hotOnly >= workers {
-		hotOnly = workers - 1
-	}
-
-	return archiveWorkerBudget{
-		hotOnly: hotOnly,
-		shared:  workers - hotOnly,
-	}
 }

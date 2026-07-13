@@ -323,7 +323,7 @@ const allCellDBShards = -1
 
 func saveCellRecordShard(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool, shard int, flushTargetBytes int) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
-	writer := cells.newBatchWriter()
+	writer := cells.newBatchWriter(cellShardBatchInitialSize(stateCellImportBatchTargetBytes))
 	defer writer.close()
 
 	var written map[cell.Hash]struct{}

@@ -7,9 +7,9 @@ import (
 	"unsafe"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -18,21 +18,21 @@ func TestMasterchainValidatorCacheResetsByPrevKeyBlock(t *testing.T) {
 	var cache masterchainValidatorCache
 
 	firstKey := masterchainValidatorCacheKey{prevKeyBlockSeqno: 100, catchainSeqno: 7, validatorSetHash: 11}
-	firstValidators := []*tlb.ValidatorAddr{nil}
+	firstValidators := &blockproof.PreparedValidatorSet{}
 	cache.put(firstKey, firstValidators)
 
-	if validators, ok := cache.get(firstKey); !ok || len(validators) != len(firstValidators) {
+	if validators, ok := cache.get(firstKey); !ok || validators != firstValidators {
 		t.Fatal("expected validator cache hit before epoch reset")
 	}
 
 	secondKey := masterchainValidatorCacheKey{prevKeyBlockSeqno: 200, catchainSeqno: 8, validatorSetHash: 22}
-	secondValidators := []*tlb.ValidatorAddr{nil, nil}
+	secondValidators := &blockproof.PreparedValidatorSet{}
 	cache.put(secondKey, secondValidators)
 
 	if _, ok := cache.get(firstKey); ok {
 		t.Fatal("expected validator cache miss after prev key block changed")
 	}
-	if validators, ok := cache.get(secondKey); !ok || len(validators) != len(secondValidators) {
+	if validators, ok := cache.get(secondKey); !ok || validators != secondValidators {
 		t.Fatal("expected validator cache hit for the new epoch")
 	}
 }
@@ -42,15 +42,53 @@ func TestMasterchainValidatorCacheKeepsEpochVariants(t *testing.T) {
 
 	firstKey := masterchainValidatorCacheKey{prevKeyBlockSeqno: 100, catchainSeqno: 7, validatorSetHash: 11}
 	secondKey := masterchainValidatorCacheKey{prevKeyBlockSeqno: 100, catchainSeqno: 8, validatorSetHash: 22}
+	firstValidators := &blockproof.PreparedValidatorSet{}
+	secondValidators := &blockproof.PreparedValidatorSet{}
 
-	cache.put(firstKey, []*tlb.ValidatorAddr{nil})
-	cache.put(secondKey, []*tlb.ValidatorAddr{nil, nil})
+	cache.put(firstKey, firstValidators)
+	cache.put(secondKey, secondValidators)
 
-	if validators, ok := cache.get(firstKey); !ok || len(validators) != 1 {
+	if validators, ok := cache.get(firstKey); !ok || validators != firstValidators {
 		t.Fatal("expected first validator set to stay cached inside the epoch")
 	}
-	if validators, ok := cache.get(secondKey); !ok || len(validators) != 2 {
+	if validators, ok := cache.get(secondKey); !ok || validators != secondValidators {
 		t.Fatal("expected second validator set to stay cached inside the epoch")
+	}
+}
+
+func TestMasterchainValidatorCacheReusesPreparedSet(t *testing.T) {
+	var cache masterchainValidatorCache
+	key := masterchainValidatorCacheKey{prevKeyBlockSeqno: 100, catchainSeqno: 7, validatorSetHash: 11}
+	prepared := &blockproof.PreparedValidatorSet{}
+	replacement := &blockproof.PreparedValidatorSet{}
+
+	if cached := cache.put(key, prepared); cached != prepared {
+		t.Fatal("expected first prepared validator set to be cached")
+	}
+	if cached := cache.put(key, replacement); cached != prepared {
+		t.Fatal("expected repeated put to reuse the cached prepared validator set")
+	}
+	if cached, ok := cache.get(key); !ok || cached != prepared {
+		t.Fatal("expected cache hit to return the original prepared validator set")
+	}
+}
+
+func BenchmarkMasterchainValidatorCacheHit(b *testing.B) {
+	key := masterchainValidatorCacheKey{
+		prevKeyBlockSeqno: 100,
+		catchainSeqno:     7,
+		validatorSetHash:  11,
+	}
+	prepared := &blockproof.PreparedValidatorSet{}
+	var cache masterchainValidatorCache
+	cache.put(key, prepared)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		cached, ok := cache.get(key)
+		if !ok || cached != prepared {
+			b.Fatal("cache miss")
+		}
 	}
 }
 

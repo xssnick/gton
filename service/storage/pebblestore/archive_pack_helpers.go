@@ -101,7 +101,10 @@ type pendingPackWrite struct {
 	seq            uint64
 	cleanSize      int64
 	metricBaseSize int64
-	size           int64
+	// writebackSize is the file size already handed to a background writeback
+	// sync by the prewrite path; bytes past it are dirty page-cache tail.
+	writebackSize int64
+	size          int64
 }
 
 type syncedArtifactPacks struct {
@@ -277,6 +280,10 @@ func (s *Store) abandonPendingArtifactPacks() {
 	s.abandonPendingPackFilesLocked(s.pendingArchiveSync)
 	s.abandonPendingPackFilesLocked(s.pendingKeyProofSync)
 	s.artifactMu.Unlock()
+	// Callers hold artifactPublishMu; the truncation above invalidated every
+	// streamed append, so drop the staged refs and registrations with it.
+	s.prewrittenArtifacts = nil
+	s.prewrittenPackRegs = nil
 }
 
 func (s *Store) abandonPendingPackFilesLocked(pending map[string]pendingPackWrite) {
@@ -335,6 +342,9 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 
 	records := make([]archiveAppendRecord, 0, len(requests))
 	claimedArchiveIDs := newArchivePackClaims()
+	if err := s.claimPrewrittenPackRegs(claimedArchiveIDs); err != nil {
+		return nil, nil, err
+	}
 	for idx, request := range requests {
 		masterSeqno, err := archiveEntryMasterSeqno(request.block, request.meta)
 		if err != nil {
@@ -798,7 +808,11 @@ func (c *archivePackClaims) baseLoaded(baseSeqno uint32) bool {
 
 func (c *archivePackClaims) markBaseLoaded(baseSeqno uint32, nextIndex uint32) {
 	c.loadedBase[baseSeqno] = struct{}{}
-	c.nextIndex[baseSeqno] = nextIndex
+	// Keep the max: staged prewritten registrations may already have advanced
+	// the index past what the committed per-base state knows about.
+	if nextIndex > c.nextIndex[baseSeqno] {
+		c.nextIndex[baseSeqno] = nextIndex
+	}
 }
 
 func (c *archivePackClaims) nextPackageIndex(baseSeqno uint32) uint32 {
@@ -1182,31 +1196,32 @@ func (s *Store) deleteArchivePackageRegistrationCache(registrations []archivePac
 }
 
 func (s *Store) registerArchiveInfo(batch *pebble.Batch, baseSeq uint32, startSeq uint32, workchain int32, shard int64, archiveID int64) error {
-	registered, err := s.archiveInfoRegistered(baseSeq, startSeq, workchain, shard, archiveID)
+	stored, err := s.storedArchiveInfoID(baseSeq, startSeq, workchain, shard)
+	if errors.Is(err, storage.ErrNotFound) {
+		return batch.Set(hotKeyArchiveInfo(baseSeq, startSeq, workchain, shard), encodeInt64(archiveID), pebble.NoSync)
+	}
 	if err != nil {
 		return err
 	}
-	if registered {
-		return nil
+	if stored != archiveID {
+		// Silently re-pointing the descriptor would orphan the pack meta stored
+		// under the old id; a committed descriptor must keep its id forever.
+		return fmt.Errorf("archive info conflict base=%d start=%d wc=%d shard=%016x stored_archive_id=%d new_archive_id=%d", baseSeq, startSeq, workchain, uint64(shard), stored, archiveID)
 	}
-
-	return batch.Set(hotKeyArchiveInfo(baseSeq, startSeq, workchain, shard), encodeInt64(archiveID), pebble.NoSync)
+	return nil
 }
 
-func (s *Store) archiveInfoRegistered(baseSeq uint32, startSeq uint32, workchain int32, shard int64, archiveID int64) (bool, error) {
+func (s *Store) storedArchiveInfoID(baseSeq uint32, startSeq uint32, workchain int32, shard int64) (int64, error) {
 	raw, closer, err := pebbleReaderGet(s.hot, hotKeyArchiveInfo(baseSeq, startSeq, workchain, shard))
-	if errors.Is(err, storage.ErrNotFound) {
-		return false, nil
-	}
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	defer func() { _ = closer.Close() }()
 
 	if len(raw) != 8 {
-		return false, fmt.Errorf("invalid archive info payload")
+		return 0, fmt.Errorf("invalid archive info payload")
 	}
-	return int64(binary.BigEndian.Uint64(raw)) == archiveID, nil
+	return int64(binary.BigEndian.Uint64(raw)), nil
 }
 
 func isKeyProofKind(kind storage.ServedProofKind) bool {
@@ -1273,14 +1288,17 @@ func (s *Store) writeStateArtifactFile(block ton.BlockIDExt, data []byte) (*stor
 
 func (s *Store) markPendingPackSync(pending map[string]pendingPackWrite, path string, cleanSize int64, metricBaseSize int64, size int64) {
 	s.artifactSyncSeq++
+	writebackSize := cleanSize
 	if current, ok := pending[path]; ok {
 		cleanSize = current.cleanSize
 		metricBaseSize = current.metricBaseSize
+		writebackSize = current.writebackSize
 	}
 	pending[path] = pendingPackWrite{
 		seq:            s.artifactSyncSeq,
 		cleanSize:      cleanSize,
 		metricBaseSize: metricBaseSize,
+		writebackSize:  writebackSize,
 		size:           size,
 	}
 }

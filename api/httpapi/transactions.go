@@ -257,26 +257,27 @@ func (s *Server) blockTransactionPage(ctx context.Context, params requestParams)
 	return id, count, page, nil
 }
 
+// skipSingleRef bounds an aug dict leaf value of the `^X` shape without
+// materializing the ref.
+func skipSingleRef(loader *cell.Slice) error {
+	return loader.SkipBitsAndRefs(0, 1)
+}
+
 // walkBlockTransactions iterates block transactions in (account, lt) ascending
-// order — the order block.ListTransactions() produces — via aug-dict cursor
-// lookups, without TLB-decoding any transaction. fn returns false to stop.
+// order — the order block.ListTransactions() produces — with lazy aug-dict
+// iterators, without TLB-decoding any transaction. fn returns false to stop;
+// nothing past the stop point is materialized.
 func walkBlockTransactions(accounts *tlb.ShardAccountBlocks, fn func(entry blockTxEntry) (bool, error)) error {
 	if accounts.Accounts == nil || accounts.Accounts.AugmentedDictionary == nil {
 		return nil
 	}
 
-	currentAccount := make([]byte, 32)
-	allowSameAccount := true
-	for {
-		accountKeyCell, accountValue, err := accounts.Accounts.LookupNearestKey(blockproof.AccountKey(currentAccount), true, allowSameAccount, false)
-		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("lookup account block: %w", err)
-		}
-
-		accountKeyLoader, err := accountKeyCell.BeginParse()
+	accIt, err := accounts.Accounts.IteratorExtra(false, false)
+	if err != nil {
+		return fmt.Errorf("range account blocks: %w", err)
+	}
+	for accIt.Next() {
+		accountKeyLoader, err := accIt.Key().BeginParse()
 		if err != nil {
 			return fmt.Errorf("begin parse account key: %w", err)
 		}
@@ -284,53 +285,51 @@ func walkBlockTransactions(accounts *tlb.ShardAccountBlocks, fn func(entry block
 		if err != nil {
 			return fmt.Errorf("load account key: %w", err)
 		}
-		accountBlock, err := accountBlockFromValue(accountValue)
+
+		// acc_trans#5 account_addr:bits256 transactions:(HashmapAug 64 ^Transaction CurrencyCollection)
+		accountValue := accIt.Value()
+		magic, err := accountValue.LoadUInt(4)
 		if err != nil {
-			return err
+			return fmt.Errorf("load account block magic: %w", err)
+		}
+		if magic != 0x5 {
+			return fmt.Errorf("invalid account block magic %x", magic)
+		}
+		if err = accountValue.SkipBits(256); err != nil {
+			return fmt.Errorf("load account block address: %w", err)
 		}
 
-		if accountBlock.Transactions != nil && accountBlock.Transactions.AugmentedDictionary != nil {
-			currentLT := uint64(0)
-			allowSameLT := true
-			for {
-				txKeyCell, txValue, err := accountBlock.Transactions.LookupNearestKey(
-					cell.BeginCell().MustStoreUInt(currentLT, 64).EndCell(),
-					true,
-					allowSameLT,
-					false,
-				)
-				if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-					break
-				}
-				if err != nil {
-					return fmt.Errorf("lookup account transaction: %w", err)
-				}
+		txIt, err := accountValue.AugDictInlineIterator(64, tlb.AugAccountTransactions{}, skipSingleRef, false, false)
+		if err != nil {
+			return fmt.Errorf("range account transactions: %w", err)
+		}
+		for txIt.Next() {
+			txKeyLoader, err := txIt.Key().BeginParse()
+			if err != nil {
+				return fmt.Errorf("begin parse transaction lt: %w", err)
+			}
+			lt, err := txKeyLoader.LoadUInt(64)
+			if err != nil {
+				return fmt.Errorf("load transaction lt: %w", err)
+			}
+			txCell, err := txIt.Value().LoadRefCell()
+			if err != nil {
+				return fmt.Errorf("load transaction cell: %w", err)
+			}
 
-				txKeyLoader, err := txKeyCell.BeginParse()
-				if err != nil {
-					return fmt.Errorf("begin parse transaction lt: %w", err)
-				}
-				lt, err := txKeyLoader.LoadUInt(64)
-				if err != nil {
-					return fmt.Errorf("load transaction lt: %w", err)
-				}
-				txCell, err := transactionCellFromValue(txValue)
-				if err != nil {
-					return err
-				}
-
-				cont, err := fn(blockTxEntry{account: account, lt: lt, cell: txCell})
-				if err != nil || !cont {
-					return err
-				}
-				currentLT = lt
-				allowSameLT = false
+			cont, err := fn(blockTxEntry{account: account, lt: lt, cell: txCell})
+			if err != nil || !cont {
+				return err
 			}
 		}
-
-		currentAccount = account
-		allowSameAccount = false
+		if err = txIt.Err(); err != nil {
+			return fmt.Errorf("range account transactions: %w", err)
+		}
 	}
+	if err = accIt.Err(); err != nil {
+		return fmt.Errorf("range account blocks: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) handleTransactions(ctx context.Context, params requestParams) (any, *apiError) {
@@ -708,41 +707,48 @@ func findBlockTransactionCell(accounts *tlb.ShardAccountBlocks, account []byte, 
 		return nil, fmt.Errorf("load account block: %w", err)
 	}
 
-	accountBlock, err := accountBlockFromValue(accountValue)
-	if err != nil {
-		return nil, err
-	}
-	if accountBlock.Transactions == nil || accountBlock.Transactions.AugmentedDictionary == nil {
-		return nil, storage.ErrNotFound
-	}
-
-	txValue, err := accountBlock.Transactions.LoadValueWithExtra(cell.BeginCell().MustStoreUInt(lt, 64).EndCell())
-	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return nil, storage.ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("load account transaction: %w", err)
-	}
-	return transactionCellFromValue(txValue)
-}
-
-func accountBlockFromValue(value *cell.Slice) (*tlb.AccountBlock, error) {
-	if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), value); err != nil {
+	// LoadValueWithExtra keeps the augmentation in front of the value
+	if err = (tlb.AugShardAccountBlocks{}).SkipExtra(accountValue); err != nil {
 		return nil, fmt.Errorf("load account block augmentation: %w", err)
 	}
 
-	var accountBlock tlb.AccountBlock
-	if err := tlb.LoadFromCell(&accountBlock, value); err != nil {
-		return nil, fmt.Errorf("load account block: %w", err)
+	// acc_trans#5 account_addr:bits256 transactions:(HashmapAug 64 ^Transaction CurrencyCollection)
+	magic, err := accountValue.LoadUInt(4)
+	if err != nil {
+		return nil, fmt.Errorf("load account block magic: %w", err)
 	}
-	return &accountBlock, nil
-}
+	if magic != 0x5 {
+		return nil, fmt.Errorf("invalid account block magic %x", magic)
+	}
+	if err = accountValue.SkipBits(256); err != nil {
+		return nil, fmt.Errorf("load account block address: %w", err)
+	}
 
-func transactionCellFromValue(value *cell.Slice) (*cell.Cell, error) {
-	if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), value); err != nil {
-		return nil, fmt.Errorf("load transaction augmentation: %w", err)
+	// a positioned inline iterator doubles as a point lookup: the first item is
+	// the exact key or the transaction is absent
+	txIt, err := accountValue.AugDictInlineIteratorAt(64, tlb.AugAccountTransactions{}, skipSingleRef,
+		cell.BeginCell().MustStoreUInt(lt, 64).EndCell(), false, false, true)
+	if err != nil {
+		return nil, fmt.Errorf("load account transaction: %w", err)
 	}
-	txCell, err := value.LoadRefCell()
+	if !txIt.Next() {
+		if err = txIt.Err(); err != nil {
+			return nil, fmt.Errorf("load account transaction: %w", err)
+		}
+		return nil, storage.ErrNotFound
+	}
+	txKeyLoader, err := txIt.Key().BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse transaction lt: %w", err)
+	}
+	foundLT, err := txKeyLoader.LoadUInt(64)
+	if err != nil {
+		return nil, fmt.Errorf("load transaction lt: %w", err)
+	}
+	if foundLT != lt {
+		return nil, storage.ErrNotFound
+	}
+	txCell, err := txIt.Value().LoadRefCell()
 	if err != nil {
 		return nil, fmt.Errorf("load transaction cell: %w", err)
 	}
@@ -763,9 +769,13 @@ type tonBlockRef struct {
 }
 
 func extTransactionFromTLB(typeName string, workchain int32, block tonBlockRef, tx *tlb.Transaction, txCell *cell.Cell) (extTransaction, error) {
+	inboundCell, err := transactionInboundMessageCell(txCell)
+	if err != nil {
+		return extTransaction{}, err
+	}
 	fees := transactionFees(tx)
 
-	inMsg, err := extMessageFromTLB(tx.IO.In)
+	inMsg, err := extMessageFromTLB(tx.IO.In, inboundCell)
 	if err != nil {
 		return extTransaction{}, err
 	}
@@ -793,7 +803,11 @@ func extTransactionFromTLB(typeName string, workchain int32, block tonBlockRef, 
 }
 
 func rawTransactionFromTLB(workchain int32, tx *tlb.Transaction, txCell *cell.Cell) (rawTransaction, error) {
-	inMsg, err := rawMessageFromTLB(tx.IO.In)
+	inboundCell, err := transactionInboundMessageCell(txCell)
+	if err != nil {
+		return rawTransaction{}, err
+	}
+	inMsg, err := rawMessageFromTLB(tx.IO.In, inboundCell)
 	if err != nil {
 		return rawTransaction{}, err
 	}
@@ -827,14 +841,80 @@ func rawTransactionFromTLB(workchain int32, tx *tlb.Transaction, txCell *cell.Ce
 	}, nil
 }
 
-func rawMessageFromTLB(msg *tlb.Message) (*rawMessage, error) {
-	if msg == nil || msg.Msg == nil {
-		return nil, nil
+func transactionInboundMessageCell(txCell *cell.Cell) (*cell.Cell, error) {
+	loader, err := txCell.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse transaction messages: %w", err)
+	}
+	magic, err := loader.LoadUInt(4)
+	if err != nil {
+		return nil, fmt.Errorf("load transaction magic: %w", err)
+	}
+	if magic != 0b0111 {
+		return nil, fmt.Errorf("invalid transaction magic %b", magic)
+	}
+	const headerBits = 256 + 64 + 256 + 64 + 32 + 15 + 2 + 2
+	if err = loader.SkipBits(headerBits); err != nil {
+		return nil, fmt.Errorf("load transaction header: %w", err)
+	}
+	ioCell, err := loader.LoadRefCell()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction messages: %w", err)
 	}
 
-	msgCell, err := msg.ToCell()
+	io, err := ioCell.BeginParse()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("begin parse transaction messages: %w", err)
+	}
+	hasInbound, err := io.LoadBoolBit()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction inbound message flag: %w", err)
+	}
+	if !hasInbound {
+		return nil, nil
+	}
+	inbound, err := io.LoadRefCell()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction inbound message: %w", err)
+	}
+	return inbound, nil
+}
+
+type originalMessage struct {
+	message tlb.Message
+	cell    *cell.Cell
+}
+
+func originalMessages(list *tlb.MessagesList) ([]originalMessage, error) {
+	if list == nil || list.List == nil {
+		return []originalMessage{}, nil
+	}
+
+	items, err := list.List.LoadAll()
+	if err != nil {
+		return nil, fmt.Errorf("load outbound messages: %w", err)
+	}
+	messages := make([]originalMessage, len(items))
+	for i, item := range items {
+		msgCell, err := item.Value.LoadRefCell()
+		if err != nil {
+			return nil, fmt.Errorf("load outbound message %d: %w", i, err)
+		}
+		loader, err := msgCell.BeginParse()
+		if err != nil {
+			return nil, fmt.Errorf("begin parse outbound message %d: %w", i, err)
+		}
+		if err = tlb.LoadFromCell(&messages[i].message, loader); err != nil {
+			return nil, fmt.Errorf("parse outbound message %d: %w", i, err)
+		}
+		messages[i].cell = msgCell
+	}
+	return messages, nil
+}
+
+func rawMessageFromTLB(msg *tlb.Message, msgCell *cell.Cell) (*rawMessage, error) {
+	if msg == nil || msg.Msg == nil {
+		return nil, nil
 	}
 
 	formatted := rawMessage{
@@ -879,11 +959,7 @@ func rawMessageFromTLB(msg *tlb.Message) (*rawMessage, error) {
 }
 
 func rawOutMessagesFromTLB(list *tlb.MessagesList) ([]rawMessage, *big.Int, error) {
-	if list == nil {
-		return []rawMessage{}, big.NewInt(0), nil
-	}
-
-	messages, err := list.ToSlice()
+	messages, err := originalMessages(list)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -891,14 +967,14 @@ func rawOutMessagesFromTLB(list *tlb.MessagesList) ([]rawMessage, *big.Int, erro
 	totalFees := big.NewInt(0)
 	out := make([]rawMessage, 0, len(messages))
 	for i := range messages {
-		msg, err := rawMessageFromTLB(&messages[i])
+		msg, err := rawMessageFromTLB(&messages[i].message, messages[i].cell)
 		if err != nil {
 			return nil, nil, err
 		}
 		if msg == nil {
 			continue
 		}
-		totalFees.Add(totalFees, messageForwardFee(&messages[i]))
+		totalFees.Add(totalFees, messageForwardFee(&messages[i].message))
 		out = append(out, *msg)
 	}
 	return out, totalFees, nil
@@ -954,14 +1030,9 @@ func transactionFees(tx *tlb.Transaction) feeBreakdown {
 	return feeBreakdown{storage: storage, other: other}
 }
 
-func extMessageFromTLB(msg *tlb.Message) (*extMessage, error) {
+func extMessageFromTLB(msg *tlb.Message, msgCell *cell.Cell) (*extMessage, error) {
 	if msg == nil || msg.Msg == nil {
 		return nil, nil
-	}
-
-	msgCell, err := msg.ToCell()
-	if err != nil {
-		return nil, err
 	}
 
 	formatted := extMessage{
@@ -1006,18 +1077,14 @@ func extMessageFromTLB(msg *tlb.Message) (*extMessage, error) {
 }
 
 func outMessagesFromTLB(list *tlb.MessagesList) ([]extMessage, error) {
-	if list == nil {
-		return []extMessage{}, nil
-	}
-
-	messages, err := list.ToSlice()
+	messages, err := originalMessages(list)
 	if err != nil {
 		return nil, err
 	}
 
 	out := make([]extMessage, 0, len(messages))
 	for i := range messages {
-		msg, err := extMessageFromTLB(&messages[i])
+		msg, err := extMessageFromTLB(&messages[i].message, messages[i].cell)
 		if err != nil {
 			return nil, err
 		}

@@ -1035,11 +1035,11 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
 
 	svc.currentStatePersistMu.Lock()
-	checkpoint := runner.checkpoint()
+	checkpoint, artifactPrewriteTarget := runner.checkpoint()
 	cells := runner.stateCells.beginCheckpoint()
 	callbackDone := make(chan struct{})
 	callbackSawUnlocked := false
-	next, err := svc.persistNextBlockCurrentStateLocked(current, &runner.timing, checkpoint.entries, cells, func() {
+	next, err := svc.persistNextBlockCurrentStateLocked(current, &runner.timing, checkpoint.entries, cells, artifactPrewriteTarget, func() {
 		if svc.currentStatePersistMu.TryLock() {
 			callbackSawUnlocked = true
 			svc.currentStatePersistMu.Unlock()

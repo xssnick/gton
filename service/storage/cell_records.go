@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/bits"
+	"slices"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -54,6 +55,7 @@ type stateCellRecordBuilder struct {
 	records []EncodedCellRecord
 	index   map[cell.Hash]int
 	bytes   uint64
+	arena   []byte
 }
 
 func NewStateCellRecords(records []EncodedCellRecord) StateCellRecords {
@@ -171,12 +173,6 @@ func (b *stateCellRecordBuilder) add(record EncodedCellRecord) {
 	if b.index == nil {
 		b.index = make(map[cell.Hash]int)
 	}
-	if idx, ok := b.index[record.Hash]; ok {
-		b.bytes -= uint64(len(b.records[idx].Data))
-		b.records[idx].Data = record.Data
-		b.bytes += uint64(len(record.Data))
-		return
-	}
 	b.index[record.Hash] = len(b.records)
 	b.records = append(b.records, record)
 	b.bytes += uint64(len(record.Data))
@@ -186,7 +182,25 @@ func (b *stateCellRecordBuilder) alloc(size int) []byte {
 	if size <= 0 {
 		return nil
 	}
-	return make([]byte, size)
+
+	start := len(b.arena)
+	if cap(b.arena)-start < size {
+		b.arena = slices.Grow(b.arena, size)
+
+		// Grow moved the arena, so point existing records at its new backing
+		// array. Traversal deduplicates before encoding, making record data a
+		// contiguous prefix in insertion order.
+		offset := 0
+		for i := range b.records {
+			end := offset + len(b.records[i].Data)
+			b.records[i].Data = b.arena[offset:end:end]
+			offset = end
+		}
+	}
+
+	end := start + size
+	b.arena = b.arena[:end]
+	return b.arena[start:end:end]
 }
 
 func (b *stateCellRecordBuilder) build() StateCellRecords {
@@ -327,16 +341,50 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 	}
 
 	var builder stateCellRecordBuilder
-	err := walkReachableStateUpdateCells(root.Virtualize(0), func(current *cell.Cell, meta cell.Metadata) error {
+	stack := []*cell.Cell{root.Virtualize(0)}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if current == nil {
+			continue
+		}
+		if current.IsLazy() {
+			loader, err := current.BeginParse()
+			if err != nil {
+				return StateCellRecords{}, fmt.Errorf("load reachable state update cell %x: %w", current.Hash(), err)
+			}
+			current = loader.BaseCell()
+		}
+
+		if current.GetType() == cell.PrunedCellType && current.ActualLevel() == current.EffectiveLevel()+1 {
+			continue
+		}
+
+		meta := current.GetMetadata()
+		hash := meta.Hash
+		if _, ok := builder.index[hash]; ok {
+			continue
+		}
+
 		record, err := prepareReachableStateUpdateCellRecord(current, meta, builder.alloc)
 		if err != nil {
-			return fmt.Errorf("build reachable state update cell record %x: %w", meta.Hash[:], err)
+			return StateCellRecords{}, fmt.Errorf("build reachable state update cell record %x: %w", meta.Hash[:], err)
 		}
 		builder.add(record)
-		return nil
-	})
-	if err != nil {
-		return StateCellRecords{}, err
+
+		if current.GetType() == cell.PrunedCellType {
+			continue
+		}
+		for i, ref := range meta.Refs {
+			if ref.Lazy {
+				return StateCellRecords{}, fmt.Errorf("reachable state update ref %d from %x is lazy", i, hash[:])
+			}
+			refCell, err := current.PeekRef(i)
+			if err != nil {
+				return StateCellRecords{}, fmt.Errorf("load reachable state update ref %d from %x: %w", i, hash[:], err)
+			}
+			stack = append(stack, refCell)
+		}
 	}
 	return builder.build(), nil
 }
@@ -376,55 +424,6 @@ func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {
 		return nil, err
 	}
 	return raw, nil
-}
-
-func walkReachableStateUpdateCells(root *cell.Cell, visit func(*cell.Cell, cell.Metadata) error) error {
-	stack := []*cell.Cell{root}
-	seen := map[cell.Hash]struct{}{}
-	for len(stack) > 0 {
-		current := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if current == nil {
-			continue
-		}
-		if current.IsLazy() {
-			loader, err := current.BeginParse()
-			if err != nil {
-				return fmt.Errorf("load reachable state update cell %x: %w", current.Hash(), err)
-			}
-			current = loader.BaseCell()
-		}
-
-		if current.GetType() == cell.PrunedCellType && current.ActualLevel() == current.EffectiveLevel()+1 {
-			continue
-		}
-
-		meta := current.GetMetadata()
-		hash := meta.Hash
-		if _, ok := seen[hash]; ok {
-			continue
-		}
-		seen[hash] = struct{}{}
-
-		if err := visit(current, meta); err != nil {
-			return err
-		}
-		if current.GetType() == cell.PrunedCellType {
-			continue
-		}
-
-		for i, ref := range meta.Refs {
-			if ref.Lazy {
-				return fmt.Errorf("reachable state update ref %d from %x is lazy", i, hash[:])
-			}
-			refCell, err := current.PeekRef(i)
-			if err != nil {
-				return fmt.Errorf("load reachable state update ref %d from %x: %w", i, hash[:], err)
-			}
-			stack = append(stack, refCell)
-		}
-	}
-	return nil
 }
 
 func PrepareReachableStateCells(root *cell.Cell) (StateCellRecords, error) {

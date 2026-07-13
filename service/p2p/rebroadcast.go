@@ -341,6 +341,20 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if !s.node.allowRebroadcast(&req) {
 		return false
 	}
+	candidates := s.rebroadcastCandidatesForRequest(req)
+	if len(candidates) == 0 {
+		s.node.noteRebroadcastDropped(req)
+		return false
+	}
+	if err := req.materializePayload(); err != nil {
+		s.node.noteRebroadcastDropped(req)
+		s.log.Debug().
+			Err(err).
+			Str("kind", req.kind).
+			Str("queue", req.queueName()).
+			Msg("dropping rebroadcast request because payload cannot be serialized")
+		return false
+	}
 
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
@@ -395,7 +409,6 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	}
 	req.queuedAt = time.Now()
 
-	candidates := s.rebroadcastCandidatesForRequest(req)
 	preferred := s.rebroadcastPreferredCandidateIDs(req)
 	fanout := s.rebroadcastFanoutForRequest(req)
 	attempts := 1

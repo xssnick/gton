@@ -20,20 +20,21 @@ type archiveShardBlockLoader struct {
 }
 
 type shardClientArchiveWindow struct {
-	startSeqno     uint32
-	masterStats    *archive.ImportStats
-	totalStats     *archive.ImportStats
-	masterStates   map[uint32]*storage.BlockState
-	masterBlocks   map[uint32]PreparedBlock
-	masterSequence []PreparedBlock
-	masterProofs   map[uint32]*masterchainConsensusProof
-	archiveBlocks  map[storage.BlockRootHash]PreparedBlock
-	archiveImports []*archiveImportResult
-	stateCells     *stateCellWindowCache
-	appliedStates  appliedStateSet
-	shardArchives  int
-	splitDepth     uint32
-	masterWait     time.Duration
+	startSeqno       uint32
+	masterStats      *archive.ImportStats
+	totalStats       *archive.ImportStats
+	masterStates     map[uint32]*storage.BlockState
+	masterBlocks     map[uint32]PreparedBlock
+	masterSequence   []PreparedBlock
+	masterProofs     map[uint32]*masterchainConsensusProof
+	archiveBlocks    map[storage.BlockRootHash]PreparedBlock
+	archiveImports   []*archiveImportResult
+	stateCells       *stateCellWindowCache
+	appliedStates    appliedStateSet
+	shardArchives    int
+	splitDepth       uint32
+	masterWait       time.Duration
+	syncUntilReached bool
 
 	masterApplyElapsed       time.Duration
 	masterPrecheckElapsed    time.Duration
@@ -156,7 +157,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 	for idx := range window.masterSequence {
 		downloaded := window.masterSequence[idx]
 		if r.service.preparedMasterBlockAfterSyncUntil(downloaded) {
-			r.syncUntilReached = true
+			window.syncUntilReached = true
 			break
 		}
 
@@ -185,6 +186,10 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		window.masterStateUpdateElapsed += timing.stateUpdate
 		if err != nil {
 			return nil, fmt.Errorf("apply archive master block %s: %w", downloaded.BlockRef(), err)
+		}
+
+		if err = r.service.updateMasterDependentCachesForKeyBlock(next, &downloaded); err != nil {
+			return nil, err
 		}
 
 		r.service.publishLiveBlockArtifacts(downloaded, next, liveBlockPublishOptions{availabilityOnly: true})
@@ -394,7 +399,7 @@ func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.Curre
 	if !prewritten {
 		checkpointCells = cells.cells()
 	}
-	persisted, stages, err := r.service.saveStateCheckpoint(r.ctx, storedCurrent, entries, checkpointCells, cellPrewriteTarget)
+	persisted, stages, err := r.service.saveStateCheckpoint(r.ctx, storedCurrent, entries, checkpointCells, cellPrewriteTarget, 0)
 	if err != nil {
 		return nil, fmt.Errorf("persist archive current state %s: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}

@@ -359,7 +359,7 @@ func TestCheckPreparedSignaturesRejectsSimplexCandidateBlockMismatch(t *testing.
 func TestCheckPreparedMasterchainSignaturesRejectsNonFinalSimplex(t *testing.T) {
 	block := testBlockID(-1, 78)
 	set := NewSimplexValidatorSignatureSet(9, 0x12345678, nil, false, make([]byte, 32), 11, []byte{0x01})
-	if err := CheckPreparedMasterchainSignaturesWithValidators(block, set, nil); err == nil {
+	if err := CheckPreparedMasterchainSignatures(block, set, nil); err == nil {
 		t.Fatal("expected non-final simplex masterchain signatures to be rejected")
 	}
 }
@@ -374,7 +374,7 @@ func testBlockID(workchain int32, seqno uint32) ton.BlockIDExt {
 	}
 }
 
-func testValidators(t *testing.T, count int) ([]*tlb.ValidatorAddr, []ed25519.PrivateKey) {
+func testValidators(t testing.TB, count int) ([]*tlb.ValidatorAddr, []ed25519.PrivateKey) {
 	t.Helper()
 
 	validators := make([]*tlb.ValidatorAddr, count)
@@ -396,7 +396,7 @@ func testValidators(t *testing.T, count int) ([]*tlb.ValidatorAddr, []ed25519.Pr
 	return validators, privateKeys
 }
 
-func testSignatures(t *testing.T, validators []*tlb.ValidatorAddr, privateKeys []ed25519.PrivateKey, payload []byte) []ton.Signature {
+func testSignatures(t testing.TB, validators []*tlb.ValidatorAddr, privateKeys []ed25519.PrivateKey, payload []byte) []ton.Signature {
 	t.Helper()
 
 	signatures := make([]ton.Signature, len(validators))
@@ -411,6 +411,43 @@ func testSignatures(t *testing.T, validators []*tlb.ValidatorAddr, privateKeys [
 		}
 	}
 	return signatures
+}
+
+func BenchmarkPrepareValidatorSet(b *testing.B) {
+	validators, _ := testValidators(b, 100)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		prepared, err := PrepareValidatorSet(9, validators)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = prepared
+	}
+}
+
+func BenchmarkCheckPreparedSignatures(b *testing.B) {
+	block := testBlockID(-1, 90)
+	validators, privateKeys := testValidators(b, 100)
+	prepared, err := PrepareValidatorSet(9, validators)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	base := NewOrdinaryValidatorSignatureSet(9, prepared.Hash(), nil)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		b.Fatal(err)
+	}
+	signatures := testSignatures(b, validators, privateKeys, payload)
+	signed := NewOrdinaryValidatorSignatureSet(9, prepared.Hash(), signatures)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := CheckPreparedSignatures(block, signed, prepared); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func testSimplexCandidate(t *testing.T, block ton.BlockIDExt) []byte {

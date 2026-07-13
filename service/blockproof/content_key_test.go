@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -187,5 +189,40 @@ func TestCheckPreparedSignaturesRejectsDuplicatesAndUnknownUpFront(t *testing.T)
 	set = NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, withUnknown)
 	if err = CheckPreparedSignatures(block, set, prepared); err == nil {
 		t.Fatal("signature of unknown validator was accepted")
+	}
+}
+
+func TestCheckPreparedSignaturesIdentifiesFirstInvalidByWeight(t *testing.T) {
+	block := testBlockID(-1, 57)
+	validators, privateKeys := testWeightedValidators(t, []uint64{40, 35, 25})
+	catchainSeqno := uint32(5)
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	base := NewOrdinaryValidatorSignatureSet(catchainSeqno, prepared.Hash(), nil)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	signatures := testSignatures(t, validators, privateKeys, payload)
+	for _, idx := range []int{0, 1} {
+		signatures[idx].Signature = bytes.Clone(signatures[idx].Signature)
+		signatures[idx].Signature[0] ^= 1
+	}
+
+	set := NewOrdinaryValidatorSignatureSet(catchainSeqno, prepared.Hash(), []ton.Signature{
+		signatures[2],
+		signatures[1],
+		signatures[0],
+	})
+	err = CheckPreparedSignatures(block, set, prepared)
+	if err == nil {
+		t.Fatal("invalid batch was accepted")
+	}
+	wantValidator := hex.EncodeToString(signatures[0].NodeIDShort)
+	if !strings.Contains(err.Error(), wantValidator) {
+		t.Fatalf("error %q does not identify first invalid validator %s", err, wantValidator)
 	}
 }

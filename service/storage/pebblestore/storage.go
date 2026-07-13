@@ -10,6 +10,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -65,6 +66,10 @@ type Store struct {
 	artifactSyncSeq     uint64
 	pendingArchiveSync  map[string]pendingPackWrite
 	pendingKeyProofSync map[string]pendingPackWrite
+	// prewrittenArtifacts and prewrittenPackRegs hold streamed pack append
+	// results between checkpoints; both are guarded by artifactPublishMu.
+	prewrittenArtifacts map[storage.BlockRootHash]prewrittenArtifactRecord
+	prewrittenPackRegs  map[int64]archivePackRegistration
 	closed              bool
 }
 

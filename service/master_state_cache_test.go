@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/service/storage"
 
@@ -45,6 +46,21 @@ func TestMasterBlockShardTargetsReusesPrecomputed(t *testing.T) {
 	}
 }
 
+func TestMasterBlockShardTargetsUsesLoadedStateBeforePreparedBlock(t *testing.T) {
+	master := testBlockID(-1, topShard, 43)
+	shard := testBlockID(0, topShard, 44)
+	state := testShardTargetsMasterState(t, master, shard)
+	prepared := PreparedBlock{ID: master}
+
+	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), state, &prepared, nil)
+	if err != nil {
+		t.Fatalf("masterBlockShardTargets returned error: %v", err)
+	}
+	if len(shards) != 1 || !shards[0].Equals(&shard) {
+		t.Fatalf("masterBlockShardTargets returned %v, want %s", shards, storage.FormatBlockRef(shard))
+	}
+}
+
 func TestMasterBlockShardTargetsFallsBackToState(t *testing.T) {
 	master := testBlockID(-1, topShard, 10)
 	shard := testBlockID(0, topShard, 11)
@@ -59,6 +75,103 @@ func TestMasterBlockShardTargetsFallsBackToState(t *testing.T) {
 	}
 	if !shards[0].Equals(&shard) {
 		t.Fatalf("masterBlockShardTargets shard = %s, want %s", storage.FormatBlockRef(shards[0]), storage.FormatBlockRef(shard))
+	}
+}
+
+func TestCompressedBlockStateCacheRefreshPreservesFreshEntry(t *testing.T) {
+	root := cell.BeginCell().EndCell()
+	state := func(seqno uint32) *storage.BlockState {
+		return &storage.BlockState{
+			Block: testBlockID(0, topShard, seqno),
+			Cell:  root,
+		}
+	}
+
+	svc := &Service{}
+	refreshed := state(1)
+	svc.rememberCompressedBlockState(refreshed)
+	for seqno := uint32(2); seqno <= compressedBlockStateCacheLimit; seqno++ {
+		svc.rememberCompressedBlockState(state(seqno))
+	}
+	svc.rememberCompressedBlockState(refreshed)
+	svc.rememberCompressedBlockState(state(compressedBlockStateCacheLimit + 1))
+
+	if _, ok := svc.cachedCompressedBlockState(refreshed.Block); !ok {
+		t.Fatal("refreshed compressed state was evicted as the oldest entry")
+	}
+	if _, ok := svc.cachedCompressedBlockState(state(2).Block); ok {
+		t.Fatal("oldest non-refreshed compressed state was retained")
+	}
+	if got := len(svc.compressedStateCache); got != compressedBlockStateCacheLimit {
+		t.Fatalf("compressed state cache size = %d, want %d", got, compressedBlockStateCacheLimit)
+	}
+}
+
+func TestCompressedBlockStateCacheCompactsRefreshHistory(t *testing.T) {
+	state := &storage.BlockState{
+		Block: testBlockID(0, topShard, 1),
+		Cell:  cell.BeginCell().EndCell(),
+	}
+	svc := &Service{}
+	for i := 0; i < compressedBlockStateCacheLimit*3; i++ {
+		svc.rememberCompressedBlockState(state)
+	}
+
+	if got := len(svc.compressedStateCache); got != 1 {
+		t.Fatalf("compressed state cache size = %d, want 1", got)
+	}
+	if got := len(svc.compressedStateOrder) - svc.compressedStateOrderHead; got > compressedBlockStateCacheLimit*2 {
+		t.Fatalf("compressed state order size = %d, want at most %d", got, compressedBlockStateCacheLimit*2)
+	}
+}
+
+func TestCompressedBlockStateCacheRejectsExpiredEntry(t *testing.T) {
+	state := &storage.BlockState{
+		Block: testBlockID(0, topShard, 2),
+		Cell:  cell.BeginCell().EndCell(),
+	}
+	svc := &Service{}
+	svc.rememberCompressedBlockState(state)
+
+	key := storage.BlockKey(state.Block)
+	svc.compressedStateMu.Lock()
+	entry := svc.compressedStateCache[key]
+	entry.storedAt = time.Now().Add(-compressedBlockStateCacheTTL)
+	svc.compressedStateCache[key] = entry
+	svc.compressedStateMu.Unlock()
+
+	if _, ok := svc.cachedCompressedBlockState(state.Block); ok {
+		t.Fatal("expired compressed state was returned")
+	}
+	svc.compressedStateMu.Lock()
+	_, cached := svc.compressedStateCache[key]
+	svc.compressedStateMu.Unlock()
+	if cached {
+		t.Fatal("expired compressed state was not invalidated")
+	}
+}
+
+func TestRememberMasterStateCacheStaysBounded(t *testing.T) {
+	root := cell.BeginCell().EndCell()
+	svc := &Service{}
+	for seqno := uint32(1); seqno <= masterStateCacheLimit+100; seqno++ {
+		svc.rememberMasterState(context.Background(), &storage.BlockState{
+			Block: testBlockID(-1, topShard, seqno),
+			Cell:  root,
+		}, nil, nil)
+	}
+
+	if got := len(svc.masterStateCache); got != masterStateCacheLimit {
+		t.Fatalf("master state cache size = %d, want %d", got, masterStateCacheLimit)
+	}
+	if got := len(svc.masterStateCacheKeys) - svc.masterStateCacheHead; got != masterStateCacheLimit {
+		t.Fatalf("master state cache order size = %d, want %d", got, masterStateCacheLimit)
+	}
+	if _, ok := svc.masterStateCache[storage.BlockKey(testBlockID(-1, topShard, 100))]; ok {
+		t.Fatal("old master state remained cached")
+	}
+	if _, ok := svc.masterStateCache[storage.BlockKey(testBlockID(-1, topShard, masterStateCacheLimit+100))]; !ok {
+		t.Fatal("newest master state was not cached")
 	}
 }
 
@@ -94,7 +207,7 @@ func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
 	}
 }
 
-func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
+func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	svc := &Service{}
 	keyBlock := testMasterBlockID(1)
 	if _, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithKeyBlock(t, keyBlock, 7, keyBlock, true), 0); err != nil {
@@ -102,10 +215,15 @@ func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	}
 
 	nonKey := testMasterBlockID(2)
-	svc.rememberMasterState(context.Background(), testMonitorMasterStateWithKeyBlock(t, nonKey, 9, keyBlock, false), &PreparedBlock{
+	nonKeyState := testMonitorMasterStateWithKeyBlock(t, nonKey, 9, keyBlock, false)
+	nonKeyPrepared := PreparedBlock{
 		ID:   nonKey,
 		Meta: &storage.BlockMeta{ID: nonKey},
-	}, nil)
+	}
+	if err := svc.updateMasterDependentCachesForKeyBlock(nonKeyState, &nonKeyPrepared); err != nil {
+		t.Fatalf("updateMasterDependentCachesForKeyBlock non-key: %v", err)
+	}
+	svc.rememberMasterState(context.Background(), nonKeyState, &nonKeyPrepared, nil)
 
 	got, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(4), keyBlock, false), 0)
 	if err != nil {
@@ -118,12 +236,17 @@ func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	key := testMasterBlockID(3)
 	meta := &storage.BlockMeta{ID: key}
 	meta.Mark(storage.BlockMetaIsKeyBlock)
-	svc.rememberMasterState(context.Background(), testMonitorMasterStateWithKeyBlock(t, key, 9, key, true), &PreparedBlock{
+	keyState := testMonitorMasterStateWithKeyBlock(t, key, 9, key, true)
+	keyPrepared := PreparedBlock{
 		ID:   key,
 		Meta: meta,
-	}, nil)
+	}
+	if err = svc.updateMasterDependentCachesForKeyBlock(keyState, &keyPrepared); err != nil {
+		t.Fatalf("updateMasterDependentCachesForKeyBlock key: %v", err)
+	}
+	svc.rememberMasterState(context.Background(), keyState, &keyPrepared, nil)
 
-	got, err = svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithKeyBlock(t, key, 9, key, true), 0)
+	got, err = svc.cachedMonitorMinSplitDepth(keyState, 0)
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth after key master: %v", err)
 	}
@@ -132,34 +255,68 @@ func TestRememberMasterStateKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	}
 }
 
-func TestResetMasterDependentCachesForKeyBlockResetsBroadcastValidatorConfig(t *testing.T) {
-	svc := &Service{}
-	first := testBlockID(-1, topShard, 10)
-	config := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
-	svc.broadcastValidatorCache.putConfig(first, config)
-
-	if _, ok := svc.broadcastValidatorCache.getConfig(testBlockID(-1, topShard, 11)); !ok {
-		t.Fatal("expected broadcast validator config cache hit before reset")
+func TestUpdateMasterDependentCachesPublishesKeyBlockValidatorConfigBeforeCurrentStatus(t *testing.T) {
+	old := testBlockID(-1, topShard, 10)
+	key := testBlockID(-1, topShard, 11)
+	keyState := testMonitorMasterStateWithKeyBlock(t, key, 9, key, true)
+	expected, err := broadcastValidatorConfigFromMasterchainState(keyState)
+	if err != nil {
+		t.Fatalf("broadcastValidatorConfigFromMasterchainState: %v", err)
 	}
 
-	nonKey := testBlockID(-1, topShard, 12)
-	svc.resetMasterDependentCachesForKeyBlock(&PreparedBlock{
-		ID:   nonKey,
-		Meta: &storage.BlockMeta{ID: nonKey},
-	})
-	if _, ok := svc.broadcastValidatorCache.getConfig(testBlockID(-1, topShard, 13)); !ok {
-		t.Fatal("non-key master block reset broadcast validator config cache")
+	oldConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
+	if oldConfig.rootHash == expected.rootHash {
+		t.Fatal("test requires different old and key-block config roots")
 	}
+	svc := &Service{
+		currentStatus: &storage.CurrentState{
+			Masterchain: storage.BlockState{Block: old},
+			Shards:      map[storage.ShardKey]storage.BlockState{},
+		},
+	}
+	svc.broadcastValidatorCache.putConfig(old, oldConfig)
 
-	key := testBlockID(-1, topShard, 14)
 	meta := &storage.BlockMeta{ID: key}
 	meta.Mark(storage.BlockMetaIsKeyBlock)
-	svc.resetMasterDependentCachesForKeyBlock(&PreparedBlock{
+	if err = svc.updateMasterDependentCachesForKeyBlock(keyState, &PreparedBlock{
 		ID:   key,
 		Meta: meta,
-	})
-	if _, ok := svc.broadcastValidatorCache.getConfig(testBlockID(-1, topShard, 15)); ok {
-		t.Fatal("expected broadcast validator config cache miss after key block reset")
+	}); err != nil {
+		t.Fatalf("updateMasterDependentCachesForKeyBlock: %v", err)
+	}
+
+	got, err := svc.currentBroadcastValidatorConfig(context.Background())
+	if err != nil {
+		t.Fatalf("currentBroadcastValidatorConfig: %v", err)
+	}
+	if got.rootHash != expected.rootHash {
+		t.Fatal("broadcast validator config was not updated from the applied key-block state")
+	}
+	if !svc.currentStatus.Masterchain.Block.Equals(&old) {
+		t.Fatal("test current status unexpectedly advanced to the key block")
+	}
+}
+
+func TestUpdateMasterDependentCachesKeepsConfigWhenKeyBlockStateIsInvalid(t *testing.T) {
+	old := testBlockID(-1, topShard, 20)
+	oldConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
+	svc := &Service{}
+	svc.broadcastValidatorCache.putConfig(old, oldConfig)
+
+	key := testBlockID(-1, topShard, 21)
+	meta := &storage.BlockMeta{ID: key}
+	meta.Mark(storage.BlockMetaIsKeyBlock)
+	err := svc.updateMasterDependentCachesForKeyBlock(&storage.BlockState{
+		Block: key,
+		Cell:  cell.BeginCell().EndCell(),
+	}, &PreparedBlock{ID: key, Meta: meta})
+	if err == nil {
+		t.Fatal("invalid key-block state did not return an error")
+	}
+
+	got, ok := svc.broadcastValidatorCache.getConfig()
+	if !ok || got.rootHash != oldConfig.rootHash {
+		t.Fatal("invalid key-block state replaced the previous validator config")
 	}
 }
 

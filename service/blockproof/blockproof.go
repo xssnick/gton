@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/bits"
+	"slices"
 	"sort"
 
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -271,7 +272,11 @@ func CheckMasterchainSignatures(blockID ton.BlockIDExt, block *tlb.Block, signat
 	if err != nil {
 		return err
 	}
-	return CheckPreparedMasterchainSignaturesWithValidators(blockID, sigSet, validators)
+	prepared, err := PrepareValidatorSet(sigSet.catchainSeqno, validators)
+	if err != nil {
+		return fmt.Errorf("prepare validator set for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	}
+	return CheckPreparedMasterchainSignatures(blockID, sigSet, prepared)
 }
 
 func LiteSignatureSet(signatures *cell.Cell) (any, error) {
@@ -375,7 +380,7 @@ func PrepareValidatorSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, sigS
 	return sigSet, nil
 }
 
-func CheckPreparedMasterchainSignaturesWithValidators(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators []*tlb.ValidatorAddr) error {
+func CheckPreparedMasterchainSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) error {
 	if blockID.Workchain != -1 {
 		return fmt.Errorf("validator signatures are only supported for masterchain blocks, got %s", tnstore.FormatBlockRef(blockID))
 	}
@@ -385,12 +390,7 @@ func CheckPreparedMasterchainSignaturesWithValidators(blockID ton.BlockIDExt, si
 	if sigSet == nil {
 		return CheckPreparedSignatures(blockID, sigSet, nil)
 	}
-
-	prepared, err := PrepareValidatorSet(sigSet.catchainSeqno, validators)
-	if err != nil {
-		return fmt.Errorf("prepare validator set for %s: %w", tnstore.FormatBlockRef(blockID), err)
-	}
-	return CheckPreparedSignatures(blockID, sigSet, prepared)
+	return CheckPreparedSignatures(blockID, sigSet, validators)
 }
 
 func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) error {
@@ -402,7 +402,7 @@ func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureS
 	if err != nil {
 		return fmt.Errorf("build validator signature payload for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
-	if err = checkSignaturesPayload(payload, sigSet, cloneSignatures(sigSet.signatures), validators); err != nil {
+	if err = checkSignaturesPayload(payload, sigSet, sigSet.signatures, validators); err != nil {
 		return fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
 	return nil
@@ -464,7 +464,7 @@ func (s *ValidatorSignatureSet) signaturesDict(validators *PreparedValidatorSet)
 		return nil, 0, fmt.Errorf("incorrect validator set hash")
 	}
 
-	signatures := cloneSignatures(s.signatures)
+	signatures := slices.Clone(s.signatures)
 	sort.Slice(signatures, func(i, j int) bool {
 		return bytes.Compare(signatures[i].NodeIDShort, signatures[j].NodeIDShort) < 0
 	})
@@ -541,7 +541,7 @@ func (s *ValidatorSignatureSet) ContentKey(blockID ton.BlockIDExt) []byte {
 		writeBytes(s.candidateData)
 	}
 
-	sigs := cloneSignatures(s.signatures)
+	sigs := slices.Clone(s.signatures)
 	sort.Slice(sigs, func(i, j int) bool {
 		return bytes.Compare(sigs[i].NodeIDShort, sigs[j].NodeIDShort) < 0
 	})

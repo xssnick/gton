@@ -33,8 +33,6 @@ type archiveWindowPipelineSnapshot struct {
 	downloadPrefetchQueued int
 	prepareHotQueued       int
 	preparePrefetchQueued  int
-	downloadedBytes        uint64
-	downloadedBytesLimit   uint64
 }
 
 type archiveImportQueueSnapshot struct {
@@ -44,8 +42,6 @@ type archiveImportQueueSnapshot struct {
 	downloadPrefetchQueued int
 	prepareHotQueued       int
 	preparePrefetchQueued  int
-	downloadedBytes        uint64
-	downloadedBytesLimit   uint64
 }
 
 type archiveCatchUpProgressStats struct {
@@ -211,8 +207,6 @@ func (p *archiveWindowPipelineProgress) snapshot() archiveWindowPipelineSnapshot
 		snapshot.downloadPrefetchQueued = queueSnapshot.downloadPrefetchQueued
 		snapshot.prepareHotQueued = queueSnapshot.prepareHotQueued
 		snapshot.preparePrefetchQueued = queueSnapshot.preparePrefetchQueued
-		snapshot.downloadedBytes = queueSnapshot.downloadedBytes
-		snapshot.downloadedBytesLimit = queueSnapshot.downloadedBytesLimit
 	}
 	return snapshot
 }
@@ -222,9 +216,6 @@ func (s archiveWindowPipelineSnapshot) activeString() string {
 }
 
 func (s archiveWindowPipelineSnapshot) queueString() string {
-	if s.downloadedBytesLimit > 0 {
-		return fmt.Sprintf("download(h/p)=%d/%d prepare(h/p)=%d/%d downloaded_bytes=%d/%d", s.downloadHotQueued, s.downloadPrefetchQueued, s.prepareHotQueued, s.preparePrefetchQueued, s.downloadedBytes, s.downloadedBytesLimit)
-	}
 	return fmt.Sprintf("download(h/p)=%d/%d prepare(h/p)=%d/%d", s.downloadHotQueued, s.downloadPrefetchQueued, s.prepareHotQueued, s.preparePrefetchQueued)
 }
 

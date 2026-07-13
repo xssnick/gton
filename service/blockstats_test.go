@@ -11,6 +11,7 @@ import (
 	"github.com/xssnick/gton/service/p2p"
 	tnstore "github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -97,4 +98,77 @@ func TestStatsFromDownloadedBlockFixture(t *testing.T) {
 	if txCount != uint32(stats.Transactions) {
 		t.Fatalf("transaction count = %d, want %d", txCount, stats.Transactions)
 	}
+}
+
+func TestBlockTransactionCountMatchesRangeFixture(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	parsed, err := tnstore.ParseVerifiedBlockCell(downloaded.ID, downloaded.Block)
+	if err != nil {
+		t.Fatalf("parse fixture block: %v", err)
+	}
+
+	want, err := blockTransactionCountWithRanges(parsed)
+	if err != nil {
+		t.Fatalf("count fixture transactions with ranges: %v", err)
+	}
+	got, err := tnstore.BlockTransactionCountFromParsed(downloaded.ID, parsed)
+	if err != nil {
+		t.Fatalf("count fixture transactions directly: %v", err)
+	}
+	if got != want {
+		t.Fatalf("direct transaction count = %d, range count = %d", got, want)
+	}
+}
+
+func BenchmarkBlockTransactionCountFromParsed(b *testing.B) {
+	downloaded := mustLoadFixtureDownloadedBlock(b)
+	parsed, err := tnstore.ParseVerifiedBlockCell(downloaded.ID, downloaded.Block)
+	if err != nil {
+		b.Fatalf("parse fixture block: %v", err)
+	}
+
+	b.Run("range", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := blockTransactionCountWithRanges(parsed); err != nil {
+				b.Fatalf("count fixture transactions with ranges: %v", err)
+			}
+		}
+	})
+	b.Run("count", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := tnstore.BlockTransactionCountFromParsed(downloaded.ID, parsed); err != nil {
+				b.Fatalf("count fixture transactions directly: %v", err)
+			}
+		}
+	})
+}
+
+func blockTransactionCountWithRanges(block *tlb.Block) (uint32, error) {
+	var shardAccounts tlb.ShardAccountBlocks
+	if err := tlb.LoadFromCell(&shardAccounts, block.Extra.ShardAccountBlocks.MustBeginParse()); err != nil {
+		return 0, err
+	}
+	accounts, err := shardAccounts.Accounts.Range(false, false)
+	if err != nil {
+		return 0, err
+	}
+
+	var total uint32
+	for _, item := range accounts {
+		if err = tlb.LoadFromCell(new(tlb.CurrencyCollection), item.Value); err != nil {
+			return 0, err
+		}
+		var accountBlock tlb.AccountBlock
+		if err = tlb.LoadFromCell(&accountBlock, item.Value); err != nil {
+			return 0, err
+		}
+		transactions, err := accountBlock.Transactions.Range(false, false)
+		if err != nil {
+			return 0, err
+		}
+		total += uint32(len(transactions))
+	}
+	return total, nil
 }

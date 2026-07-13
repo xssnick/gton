@@ -9,11 +9,12 @@ import (
 )
 
 type stateCheckpointData struct {
-	live               *storage.CurrentState
-	persisted          *storage.CurrentState
-	entries            []storage.StateCheckpointBlock
-	cells              storage.StateCellRecords
-	cellPrewriteTarget uint64
+	live                   *storage.CurrentState
+	persisted              *storage.CurrentState
+	entries                []storage.StateCheckpointBlock
+	cells                  storage.StateCellRecords
+	cellPrewriteTarget     uint64
+	artifactPrewriteTarget uint64
 }
 
 func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
@@ -42,7 +43,7 @@ func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.Sta
 	}, nil
 }
 
-func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
+func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64, artifactPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
 	var stages []SyncPersistStageObservation
 
 	if cellPrewriteTarget > 0 {
@@ -59,6 +60,17 @@ func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.Curr
 			return nil, stages, err
 		}
 		stages = appendSyncPersistStage(stages, "flush_prewrite_cells", time.Since(stageStarted))
+	}
+
+	// Waits after the cell flush on purpose: artifact appends keep streaming in
+	// the background while the flush runs, so this wait is usually near-zero.
+	if artifactPrewriteTarget > 0 {
+		stageStarted := time.Now()
+		if err := s.artifactPrewrite.wait(ctx, artifactPrewriteTarget); err != nil {
+			stages = appendSyncPersistStage(stages, "wait_artifact_prewrite", time.Since(stageStarted))
+			return nil, stages, err
+		}
+		stages = appendSyncPersistStage(stages, "wait_artifact_prewrite", time.Since(stageStarted))
 	}
 
 	timing, err := s.storage.SaveStateCheckpointEntries(ctx, entries, cells, current)

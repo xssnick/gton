@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,7 +12,6 @@ import (
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -19,6 +19,20 @@ type archiveMasterImportTask struct {
 	startSeqno uint32
 	cancel     context.CancelFunc
 	done       chan archiveMasterImportResult
+}
+
+type archiveMasterDownloadTask struct {
+	startSeqno uint32
+	cancel     context.CancelFunc
+	done       chan archiveMasterDownloadResult
+
+	mu      sync.Mutex
+	claimed bool
+}
+
+type archiveMasterDownloadResult struct {
+	downloaded *archive.Downloaded
+	err        error
 }
 
 type archiveMasterImportResult struct {
@@ -87,6 +101,7 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 	planningCellLoader := r.stateCells.loader()
 	pending := make([]archivePendingWindow, 0, r.archivePendingWindowLimit())
 	var planningErr error
+	planningStopped := false
 
 	var masterTask *archiveMasterImportTask
 	defer func() {
@@ -95,8 +110,8 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 		}
 	}()
 
-	for planning.ShardClientSeqno < targetSeqno || len(pending) > 0 {
-		for planningErr == nil && r.canScheduleArchiveWindow(planning, len(pending), targetSeqno) {
+	for (!planningStopped && planning.ShardClientSeqno < targetSeqno) || len(pending) > 0 {
+		for !planningStopped && planningErr == nil && r.canScheduleArchiveWindow(planning, len(pending), targetSeqno) {
 			planningProgress := progress
 			if len(pending) > 0 {
 				planningProgress = nil
@@ -133,11 +148,34 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 			masterTask = prepared.nextMasterTask
 
 			if len(prepared.window.masterStates) == 0 {
-				select {
-				case out <- archiveWindowResult{window: prepared.window}:
-				case <-ctx.Done():
+				if masterTask != nil {
+					masterTask.cancel()
+					masterTask = nil
 				}
-				return
+				if !prepared.window.syncUntilReached {
+					err = fmt.Errorf("archive window #%d did not advance masterchain", prepared.window.startSeqno)
+					prepared.window.releaseImportedData()
+					if len(pending) > 0 {
+						planningErr = err
+						progress.setPending(pending, planning.ShardClientSeqno+1, "draining")
+						break
+					}
+
+					cancelTasks()
+					select {
+					case out <- archiveWindowResult{err: err}:
+					case <-ctx.Done():
+					}
+					return
+				}
+
+				pending = append(pending, archivePendingWindow{
+					window: prepared.window,
+					shards: newCompletedArchiveWindowShardImportTask(),
+				})
+				planningStopped = true
+				progress.setPending(pending, planning.ShardClientSeqno+1, "draining")
+				break
 			}
 
 			nextPlanning, err := advanceArchivePipelineCurrent(planning, prepared.window)
@@ -164,6 +202,15 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 			})
 			planning = nextPlanning
 			planningCellLoader = prepared.window.stateCells.loader()
+			if prepared.window.syncUntilReached {
+				planningStopped = true
+				if masterTask != nil {
+					masterTask.cancel()
+					masterTask = nil
+				}
+				progress.setPending(pending, planning.ShardClientSeqno+1, "draining")
+				break
+			}
 			progress.setPending(pending, planning.ShardClientSeqno+1, "planning")
 			if r.shouldEmitReadyArchiveWindow(pending) {
 				break
@@ -195,14 +242,18 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 			return
 		}
 
-		nextEmitted, err := advanceArchivePipelineCurrent(emitted, next.window)
-		if err != nil {
-			cancelTasks()
-			select {
-			case out <- archiveWindowResult{window: next.window, err: err}:
-			case <-ctx.Done():
+		nextEmitted := emitted
+		if len(next.window.masterStates) > 0 {
+			var err error
+			nextEmitted, err = advanceArchivePipelineCurrent(emitted, next.window)
+			if err != nil {
+				cancelTasks()
+				select {
+				case out <- archiveWindowResult{window: next.window, err: err}:
+				case <-ctx.Done():
+				}
+				return
 			}
-			return
 		}
 
 		next.shards.setStage("emit")
@@ -214,7 +265,7 @@ func (r *archiveCatchUpRunner) runShardClientArchiveWindowPipeline(ctx context.C
 		}
 		emitted = nextEmitted
 		pending = pending[1:]
-		if planningErr != nil {
+		if planningErr != nil || planningStopped {
 			progress.setPending(pending, planning.ShardClientSeqno+1, "draining")
 		} else {
 			progress.setPending(pending, planning.ShardClientSeqno+1, "planning")
@@ -332,7 +383,7 @@ func (r *archiveCatchUpRunner) nextArchiveWindowWithProgress() (*shardClientArch
 	}
 }
 
-func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, queue *archiveImportQueue, start *storage.BlockState, targetSeqno uint32) *archiveMasterImportTask {
+func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, queue *archiveImportQueue, start *storage.BlockState, targetSeqno uint32, prefetched *archiveMasterDownloadTask) *archiveMasterImportTask {
 	taskCtx, cancel := context.WithCancel(ctx)
 	startSeqno := start.Block.SeqNo + 1
 	task := &archiveMasterImportTask{
@@ -341,35 +392,163 @@ func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, que
 		done:       make(chan archiveMasterImportResult, 1),
 	}
 	go func() {
-		result := archiveMasterImportResult{}
+		defer cancel()
+		if prefetched != nil {
+			defer prefetched.discard()
+		}
 		splitDepth, err := monitorMinSplitDepth(start, 0)
 		if err != nil {
-			result.err = fmt.Errorf("load archive split depth for %s: %w", storage.FormatBlockRef(start.Block), err)
-			task.done <- result
+			task.done <- archiveMasterImportResult{
+				err: fmt.Errorf("load archive split depth for %s: %w", storage.FormatBlockRef(start.Block), err),
+			}
 			return
 		}
-		downloaded, err := r.loadArchiveImport(taskCtx, queue, startSeqno, archive.ShardID{Workchain: -1, Shard: topShard}, splitDepth, archiveImportPriorityHot)
-		if err != nil {
-			result.err = fmt.Errorf("master archive #%d: %w", startSeqno, err)
-			task.done <- result
-			return
-		}
+		masterShard := archive.ShardID{Workchain: -1, Shard: topShard}
+		cacheKey := archiveImportCacheKey{masterchainSeqno: startSeqno, shard: masterShard, splitDepth: splitDepth}
+		for retry := 0; ; retry++ {
+			result := archiveMasterImportResult{}
+			downloaded, loadErr := r.loadArchiveImport(taskCtx, queue, startSeqno, masterShard, splitDepth, archiveImportPriorityHot, prefetched)
+			prefetched = nil
 
-		result.imported = downloaded.imported
-		result.masterSequence, err = r.archiveMasterBlocksForWindow(start, downloaded.imported.blocks, startSeqno, targetSeqno)
-		if err == nil {
-			result.consensusProofs, result.precheckElapsed, err = r.precheckArchiveMasterConsensus(taskCtx, start, result.masterSequence)
+			rejectReason := p2p.ArchivePeerRejectImportFailed
+			err = loadErr
+			if err == nil {
+				result.imported = downloaded.imported
+				if result.imported == nil {
+					err = fmt.Errorf("master archive #%d import returned no data", startSeqno)
+				} else {
+					result.masterSequence, err = r.archiveMasterBlocksForWindow(start, result.imported.blocks, startSeqno, targetSeqno)
+					if err != nil {
+						rejectReason = p2p.ArchivePeerRejectImportIncomplete
+					} else {
+						precheckSequence := result.masterSequence
+						for idx, block := range precheckSequence {
+							if r.service.preparedMasterBlockAfterSyncUntil(block) {
+								precheckSequence = precheckSequence[:idx]
+								break
+							}
+						}
+						result.consensusProofs, result.precheckElapsed, err = r.precheckArchiveMasterConsensus(taskCtx, start, precheckSequence)
+					}
+				}
+			}
+			if err == nil {
+				task.done <- result
+				return
+			}
+
+			if taskCtx.Err() != nil {
+				task.done <- archiveMasterImportResult{err: taskCtx.Err()}
+				return
+			}
+
+			if loadErr == nil {
+				r.importCache.drop(cacheKey)
+			}
+
+			var peer string
+			var archiveID int64
+			var peerErr *archiveImportPeerError
+			if errors.As(err, &peerErr) {
+				peer = peerErr.peer
+				archiveID = peerErr.archiveID
+			} else if result.imported != nil && result.imported.stats != nil {
+				peer = result.imported.stats.Peer
+				archiveID = result.imported.stats.ArchiveID
+			}
+			if peer != "" {
+				r.rejectArchiveImportPeer(masterShard, peer, archiveID, rejectReason, err)
+			}
+
+			if retry < archiveImportPeerRetries {
+				continue
+			}
+
+			task.done <- archiveMasterImportResult{err: fmt.Errorf("master archive #%d: %w", startSeqno, err)}
+			return
 		}
-		result.err = err
-		task.done <- result
 	}()
 	return task
+}
+
+func (r *archiveCatchUpRunner) startArchiveMasterDownload(ctx context.Context, startSeqno uint32) *archiveMasterDownloadTask {
+	taskCtx, cancel := context.WithCancel(ctx)
+	task := &archiveMasterDownloadTask{
+		startSeqno: startSeqno,
+		cancel:     cancel,
+		done:       make(chan archiveMasterDownloadResult),
+	}
+	go func() {
+		defer cancel()
+		downloaded, err := r.downloadArchiveFile(taskCtx, startSeqno, archive.ShardID{Workchain: -1, Shard: topShard}, false)
+		task.complete(taskCtx, archiveMasterDownloadResult{downloaded: downloaded, err: err})
+	}()
+	return task
+}
+
+func (t *archiveMasterDownloadTask) complete(ctx context.Context, result archiveMasterDownloadResult) {
+	select {
+	case t.done <- result:
+	case <-ctx.Done():
+		releaseArchiveMasterDownloadResult(result)
+	}
+}
+
+func (t *archiveMasterDownloadTask) take(ctx context.Context) (*archive.Downloaded, error) {
+	if t == nil {
+		return nil, nil
+	}
+	if !t.claim() {
+		return nil, fmt.Errorf("master archive download #%d was already consumed", t.startSeqno)
+	}
+
+	select {
+	case result := <-t.done:
+		if result.err != nil {
+			releaseArchiveMasterDownloadResult(result)
+			return nil, result.err
+		}
+		return result.downloaded, result.err
+	case <-ctx.Done():
+		t.cancel()
+		return nil, ctx.Err()
+	}
+}
+
+func (t *archiveMasterDownloadTask) discard() {
+	if t == nil || !t.claim() {
+		return
+	}
+	t.cancel()
+}
+
+func (t *archiveMasterDownloadTask) claim() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.claimed {
+		return false
+	}
+	t.claimed = true
+	return true
+}
+
+func releaseArchiveMasterDownloadResult(result archiveMasterDownloadResult) {
+	if result.downloaded != nil {
+		result.downloaded.Data = nil
+	}
 }
 
 func newArchiveWindowShardImportTask() *archiveWindowShardImportTask {
 	return &archiveWindowShardImportTask{
 		done:  make(chan error, 1),
 		stage: "starting",
+	}
+}
+
+func newCompletedArchiveWindowShardImportTask() *archiveWindowShardImportTask {
+	return &archiveWindowShardImportTask{
+		stage:    "ready",
+		finished: true,
 	}
 }
 
@@ -439,6 +618,17 @@ func archiveMasterBlockMap(blocks map[storage.BlockRootHash]PreparedBlock) map[u
 	return masterBlocks
 }
 
+func nextArchiveMasterDownloadSeqno(sequence []PreparedBlock, targetSeqno uint32) (uint32, bool) {
+	if len(sequence) == 0 {
+		return 0, false
+	}
+	lastSeqno := sequence[len(sequence)-1].ID.SeqNo
+	if lastSeqno >= targetSeqno {
+		return 0, false
+	}
+	return lastSeqno + 1, true
+}
+
 func archiveMasterBlockSequence(start *storage.BlockState, targetSeqno uint32, startSeqno uint32, masterBlocks map[uint32]PreparedBlock) ([]PreparedBlock, error) {
 	sequence := make([]PreparedBlock, 0, len(masterBlocks))
 	for seqno := start.Block.SeqNo + 1; seqno != 0 && seqno <= targetSeqno; seqno++ {
@@ -470,8 +660,8 @@ func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Contex
 
 	started := time.Now()
 	proofs := make([]*masterchainConsensusProof, len(blocks))
-	validators := make([][]*tlb.ValidatorAddr, len(blocks))
-	validatorsByKey := map[masterchainValidatorCacheKey][]*tlb.ValidatorAddr{}
+	validators := make([]*blockproof.PreparedValidatorSet, len(blocks))
+	validatorsByKey := map[masterchainValidatorCacheKey]*blockproof.PreparedValidatorSet{}
 	expectedPrev := start.Block
 
 	for i, downloaded := range blocks {
@@ -517,7 +707,7 @@ func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Contex
 	return checked, time.Since(started), nil
 }
 
-func precheckMasterchainSignatures(ctx context.Context, blocks []PreparedBlock, proofs []*masterchainConsensusProof, validators [][]*tlb.ValidatorAddr) error {
+func precheckMasterchainSignatures(ctx context.Context, blocks []PreparedBlock, proofs []*masterchainConsensusProof, validators []*blockproof.PreparedValidatorSet) error {
 	workers := archiveMasterConsensusPrecheckParallelism
 	if len(blocks) < workers {
 		workers = len(blocks)
@@ -539,7 +729,7 @@ func precheckMasterchainSignatures(ctx context.Context, blocks []PreparedBlock, 
 				}
 
 				proof := proofs[idx]
-				err := blockproof.CheckPreparedMasterchainSignaturesWithValidators(blocks[idx].ID, proof.proofSignatures, validators[idx])
+				err := blockproof.CheckPreparedMasterchainSignatures(blocks[idx].ID, proof.proofSignatures, validators[idx])
 				if err != nil {
 					select {
 					case errs <- fmt.Errorf("precheck masterchain consensus for %s: %w", storage.FormatBlockRef(blocks[idx].ID), err):
@@ -572,9 +762,34 @@ func precheckMasterchainSignatures(ctx context.Context, blocks []PreparedBlock, 
 	}
 }
 
-func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, priority archiveImportPriority) (archiveImportDownload, error) {
+func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, priority archiveImportPriority, prefetched *archiveMasterDownloadTask) (archiveImportDownload, error) {
+	defer func() {
+		if prefetched != nil {
+			prefetched.discard()
+		}
+	}()
+
 	key := archiveImportCacheKey{masterchainSeqno: masterchainSeqno, shard: shard, splitDepth: splitDepth}
 	load := func(loadCtx context.Context) (*archiveImportResult, error) {
+		if prefetched != nil {
+			task := prefetched
+			prefetched = nil
+			if task.startSeqno != masterchainSeqno {
+				task.discard()
+				return nil, fmt.Errorf("prefetched master archive starts at %d, want %d", task.startSeqno, masterchainSeqno)
+			}
+			downloaded, err := task.take(loadCtx)
+			if err == nil {
+				return r.prepareDownloadedArchive(loadCtx, masterchainSeqno, shard, splitDepth, downloaded)
+			}
+			if loadCtx.Err() != nil {
+				return nil, loadCtx.Err()
+			}
+			r.service.log.Debug().
+				Err(err).
+				Uint32("masterchain_seqno", masterchainSeqno).
+				Msg("prefetched master archive failed, downloading normally")
+		}
 		if queue != nil {
 			return queue.importArchive(loadCtx, masterchainSeqno, shard, splitDepth, priority)
 		}
@@ -582,10 +797,13 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 		if err != nil {
 			return nil, err
 		}
-		return r.prepareArchiveDownload(loadCtx, masterchainSeqno, shard, splitDepth, downloaded)
+		return r.prepareDownloadedArchive(loadCtx, masterchainSeqno, shard, splitDepth, downloaded)
 	}
 	if r.importCache == nil {
 		imported, err := load(ctx)
+		if imported != nil {
+			imported.cacheKey = key
+		}
 		return archiveImportDownload{imported: imported}, err
 	}
 
@@ -602,7 +820,28 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 			Int("blocks", len(downloaded.imported.blocks)).
 			Msg("using preloaded archive import")
 	}
+	if downloaded.imported != nil {
+		downloaded.imported.cacheKey = key
+	}
 	return downloaded, nil
+}
+
+func (r *archiveCatchUpRunner) prepareDownloadedArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, downloaded *archive.Downloaded) (*archiveImportResult, error) {
+	if downloaded == nil {
+		return nil, fmt.Errorf("archive download #%d %s returned no data", masterchainSeqno, shard.String())
+	}
+	peer := downloaded.Peer
+	archiveID := downloaded.ArchiveID
+	imported, err := r.prepareArchiveDownload(ctx, masterchainSeqno, shard, splitDepth, downloaded)
+	downloaded.Data = nil
+	if err != nil && peer != "" {
+		return nil, &archiveImportPeerError{
+			peer:      peer,
+			archiveID: archiveID,
+			err:       err,
+		}
+	}
+	return imported, err
 }
 
 func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, hedge bool) (*archive.Downloaded, error) {
@@ -698,7 +937,7 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		if masterTask != nil {
 			masterTask.cancel()
 		}
-		masterTask = r.startArchiveMasterImport(ctx, queue, startMaster, targetSeqno)
+		masterTask = r.startArchiveMasterImport(ctx, queue, startMaster, targetSeqno, nil)
 	}
 
 	masterResult, masterWait, err := masterTask.wait(ctx)
@@ -728,9 +967,37 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 	}
 	masterImport.blocks = nil
 
+	reachesSyncUntil := false
+	for _, block := range masterResult.masterSequence {
+		if r.service.preparedMasterBlockAfterSyncUntil(block) {
+			reachesSyncUntil = true
+			break
+		}
+	}
+	var nextMasterDownload *archiveMasterDownloadTask
+	if nextSeqno, ok := nextArchiveMasterDownloadSeqno(masterResult.masterSequence, targetSeqno); ok && !reachesSyncUntil {
+		nextMasterDownload = r.startArchiveMasterDownload(ctx, nextSeqno)
+	}
+	defer func() {
+		if nextMasterDownload != nil {
+			nextMasterDownload.discard()
+		}
+	}()
+
 	progress.setPlanning(startSeqno, "master_apply")
 	lastMaster, err := r.applyArchiveMasterBlocks(ctx, startMaster, window)
 	if err != nil {
+		r.importCache.drop(masterImport.cacheKey)
+		if stats := masterImport.stats; stats != nil && stats.Peer != "" {
+			r.rejectArchiveImportPeer(
+				archive.ShardID{Workchain: -1, Shard: topShard},
+				stats.Peer,
+				stats.ArchiveID,
+				p2p.ArchivePeerRejectImportFailed,
+				err,
+			)
+		}
+		window.releaseImportedData()
 		return archivePreparedMasterWindow{}, err
 	}
 	window.masterBlocks = nil
@@ -744,8 +1011,13 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 	}
 
 	var nextMasterTask *archiveMasterImportTask
-	if lastMaster.Block.SeqNo < targetSeqno {
-		nextMasterTask = r.startArchiveMasterImport(ctx, queue, lastMaster, targetSeqno)
+	if !window.syncUntilReached && lastMaster.Block.SeqNo < targetSeqno {
+		var prefetched *archiveMasterDownloadTask
+		if nextMasterDownload != nil && nextMasterDownload.startSeqno == lastMaster.Block.SeqNo+1 {
+			prefetched = nextMasterDownload
+			nextMasterDownload = nil
+		}
+		nextMasterTask = r.startArchiveMasterImport(ctx, queue, lastMaster, targetSeqno, prefetched)
 	}
 
 	return archivePreparedMasterWindow{

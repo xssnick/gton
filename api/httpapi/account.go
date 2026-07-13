@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -87,6 +88,13 @@ type walletInformation struct {
 	SignatureAllowed  *bool                 `json:"is_signature_allowed,omitempty"`
 }
 
+type suspendedAddressCache struct {
+	mu     sync.Mutex
+	root   cell.Hash
+	list   *tlb.SuspendedAddressList
+	loaded bool
+}
+
 func (s *Server) handleAddressBalance(ctx context.Context, params requestParams) (any, *apiError) {
 	snapshot, apiErr := s.loadAccountSnapshot(ctx, params)
 	if apiErr != nil {
@@ -124,7 +132,7 @@ func (s *Server) handleAddressInformation(ctx context.Context, params requestPar
 
 	// The suspended flag needs a masterchain config descent, and only this
 	// handler reports it, so it is computed here instead of in the snapshot.
-	suspended, err := suspendedAddress(snapshot.runMethod, snapshot.addr, snapshot.syncUTime)
+	suspended, err := s.suspendedAddress(snapshot.runMethod, snapshot.addr, snapshot.syncUTime)
 	if err != nil {
 		return nil, internalError("cannot check suspended address: " + err.Error())
 	}
@@ -263,12 +271,11 @@ func (s *Server) enrichWalletInformation(ctx context.Context, snapshot accountSn
 	info.WalletID = walletID
 
 	if walletSupportsSeqno(version) {
-		seqno, apiErr := s.walletGetMethodInt(ctx, snapshot, "seqno")
-		if apiErr != nil {
-			return apiErr
+		seqno, err := walletSeqnoFromData(version, snapshot.account.StateInit.Data)
+		if err != nil {
+			return internalError("cannot parse wallet seqno: " + err.Error())
 		}
-		seqnoValue := seqno.Uint64()
-		info.Seqno = &seqnoValue
+		info.Seqno = &seqno
 	}
 
 	if walletSupportsSignatureFlag(version) {
@@ -353,6 +360,19 @@ func walletSupportsSignatureFlag(version wallet.Version) bool {
 	return version == wallet.V5R1Beta || version == wallet.V5R1Final
 }
 
+func walletSeqnoFromData(version wallet.Version, data *cell.Cell) (uint64, error) {
+	loader, err := data.BeginParse()
+	if err != nil {
+		return 0, err
+	}
+	if version == wallet.V5R1Beta || version == wallet.V5R1Final {
+		if _, err = loader.LoadBoolBit(); err != nil {
+			return 0, err
+		}
+	}
+	return loader.LoadUInt(32)
+}
+
 func walletIDFromData(version wallet.Version, data *cell.Cell) (*int64, error) {
 	loader, err := data.BeginParse()
 	if err != nil {
@@ -413,7 +433,7 @@ func walletVersion(state *tlb.AccountState, shard *tlb.ShardAccount) wallet.Vers
 	return wallet.GetWalletVersion(account)
 }
 
-func suspendedAddress(info runMethodAccount, addr *address.Address, now uint32) (bool, error) {
+func (s *Server) suspendedAddress(info runMethodAccount, addr *address.Address, now uint32) (bool, error) {
 	if info.masterFragments == nil {
 		return false, nil
 	}
@@ -422,10 +442,7 @@ func suspendedAddress(info runMethodAccount, addr *address.Address, now uint32) 
 	if err != nil {
 		return false, err
 	}
-	list, err := (tlb.BlockchainConfig{Root: extra.ConfigParams.Config.Params.AsCell()}).GetSuspendedAddressList()
-	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) || errors.Is(err, tlb.ErrBlockchainConfigRootNil) {
-		return false, nil
-	}
+	list, err := s.suspended.load(extra.ConfigParams.Config.Params.AsCell())
 	if err != nil {
 		return false, err
 	}
@@ -442,6 +459,34 @@ func suspendedAddress(info runMethodAccount, addr *address.Address, now uint32) 
 		return false, nil
 	}
 	return err == nil, err
+}
+
+func (c *suspendedAddressCache) load(root *cell.Cell) (*tlb.SuspendedAddressList, error) {
+	if root == nil {
+		return nil, nil
+	}
+	hash := root.HashKey()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.loaded && c.root == hash {
+		return c.list, nil
+	}
+
+	list, err := (tlb.BlockchainConfig{Root: root}).GetSuspendedAddressList()
+	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) || errors.Is(err, tlb.ErrBlockchainConfigRootNil) {
+		list = nil
+		err = nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	c.root = hash
+	c.list = list
+	c.loaded = true
+	return list, nil
 }
 
 func transactionIDFromShardAccount(shard *tlb.ShardAccount) internalTransactionID {

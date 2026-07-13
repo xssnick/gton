@@ -3,7 +3,10 @@ package pebblestore
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -16,6 +19,8 @@ import (
 const (
 	stateCellSaveSourceDFS     = "dfs"
 	stateCellSaveSourceBOCView = "boc_view"
+
+	stateBOCImportMinCellsPerWorker = 4096
 )
 
 type stateCellTreeSave struct {
@@ -40,53 +45,169 @@ func (s *Store) saveStateCellTree(ctx context.Context, req stateCellTreeSave) (s
 }
 
 func (s *Store) saveStateBOCView(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) error {
-	writer, err := s.newStateCellBatchWriter(ctx, generation)
-	if err != nil {
-		return err
+	workerCount := stateBOCImportWorkerCount(view.Cells())
+	workerBatchTargetBytes := stateBOCImportWorkerBatchTarget(workerCount)
+	workerBatchInitialBytes := stateCellImportBatchTargetBytes / workerCount
+	writers := make([]*stateCellBatchWriter, workerCount)
+	for i := range writers {
+		writer, err := s.newStateCellBatchWriter(ctx, generation, workerBatchInitialBytes)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				writers[j].close()
+			}
+			return err
+		}
+		writers[i] = writer
 	}
-	defer writer.close()
+	defer func() {
+		for _, writer := range writers {
+			writer.close()
+		}
+	}()
 
-	progress := newStateCellSaveProgress(s.log, block, stateCellSaveSourceBOCView, uint64(view.Cells()), writer, zerolog.InfoLevel)
+	progress := newStateCellSaveProgress(
+		s.log,
+		block,
+		stateCellSaveSourceBOCView,
+		uint64(view.Cells()),
+		writers[0],
+		zerolog.InfoLevel,
+	)
 	progress.logStart()
 
-	var scratch []byte
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	work := stateBOCImport{
+		ctx:              workerCtx,
+		view:             view,
+		batchTargetBytes: workerBatchTargetBytes,
+		progress:         &progress,
+	}
+
+	workerErrs := make([]error, workerCount)
+	var wg sync.WaitGroup
+	for i, writer := range writers {
+		start := uint32(uint64(view.Cells()) * uint64(i) / uint64(workerCount))
+		end := uint32(uint64(view.Cells()) * uint64(i+1) / uint64(workerCount))
+		wg.Add(1)
+		go func(i int, writer *stateCellBatchWriter, start, end uint32) {
+			defer wg.Done()
+
+			workerErrs[i] = work.saveRange(writer, start, end)
+			if workerErrs[i] != nil {
+				cancel()
+			}
+		}(i, writer, start, end)
+	}
+	wg.Wait()
+
+	if err := stateBOCImportError(ctx, workerErrs); err != nil {
+		return err
+	}
+
+	progress.logDone()
+	return nil
+}
+
+type stateBOCImport struct {
+	ctx              context.Context
+	view             *cell.BOCView
+	batchTargetBytes int
+	progress         *stateCellSaveProgress
+
+	flushMu sync.Mutex
+}
+
+func (s *stateBOCImport) saveRange(writer *stateCellBatchWriter, start, end uint32) error {
+	reader := s.view.NewReader()
 	var refs stateBOCRefs
-	for idx := uint32(0); idx < view.Cells(); idx++ {
-		if progress.processed&0x3fff == 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
+	processed := int64(0)
+
+	flush := func() error {
+		s.flushMu.Lock()
+		defer s.flushMu.Unlock()
+
+		if err := s.ctx.Err(); err != nil {
+			return err
+		}
+		stats, err := writer.flush()
+		if err != nil {
+			return err
+		}
+
+		s.progress.processed += processed
+		processed = 0
+		s.progress.addFlush(stats, -1)
+		return nil
+	}
+
+	for idx := start; idx < end; idx++ {
+		if (idx-start)&0x3fff == 0 {
+			if err := s.ctx.Err(); err != nil {
+				return err
 			}
 		}
 
-		bocCell, nextScratch, err := view.ReadCell(idx, scratch)
-		scratch = nextScratch
+		bocCell, err := reader.ReadCell(idx)
 		if err != nil {
 			return fmt.Errorf("load boc state cell #%d: %w", idx, err)
 		}
-
-		if err = stateCellRefsForBOCView(view, bocCell, &refs); err != nil {
+		if err = stateCellRefsForBOCView(s.view, bocCell, &refs); err != nil {
 			return fmt.Errorf("load boc state cell refs hash=%x index=%d: %w", bocCell.Meta.Hash[:], idx, err)
 		}
-
 		if err = writer.addBOCCell(bocCell, &refs); err != nil {
 			return err
 		}
-		progress.processed++
+		processed++
 
-		if writer.pendingBytes() >= stateCellImportBatchTargetBytes {
-			if err = progress.flush(); err != nil {
+		if writer.pendingBytes() >= s.batchTargetBytes {
+			if err = flush(); err != nil {
 				return err
 			}
 		}
 	}
 
-	if err = progress.flush(); err != nil {
+	return flush()
+}
+
+func stateBOCImportWorkerCount(cells uint32) int {
+	workers := int((uint64(cells) + stateBOCImportMinCellsPerWorker - 1) / stateBOCImportMinCellsPerWorker)
+	workers = min(workers, runtime.GOMAXPROCS(0), cellDBShardCount)
+	if workers == 0 {
+		return 1
+	}
+	return workers
+}
+
+func stateBOCImportWorkerBatchTarget(workers int) int {
+	aggregate := min(stateBOCImportMaxBatchBytes, stateCellImportBatchTargetBytes*workers)
+	return aggregate / workers
+}
+
+func stateBOCImportError(ctx context.Context, workerErrs []error) error {
+	var firstErr error
+	for _, err := range workerErrs {
+		if err != nil {
+			firstErr = err
+			break
+		}
+	}
+	if firstErr == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	progress.logDone()
-	return nil
+	if !errors.Is(firstErr, context.Canceled) {
+		return firstErr
+	}
+
+	for _, err := range workerErrs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+	return firstErr
 }
 
 func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCellTreeSave) (stateCellSaveStats, error) {
@@ -105,7 +226,7 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 		}
 	}
 
-	writer, err := s.newStateCellBatchWriter(ctx, generation)
+	writer, err := s.newStateCellBatchWriter(ctx, generation, stateCellImportBatchTargetBytes)
 	if err != nil {
 		return stateCellSaveStats{}, err
 	}
@@ -239,22 +360,26 @@ func (p *stateCellSaveProgress) flush() error {
 	if err != nil {
 		return err
 	}
+	p.addFlush(stats, p.writer.pendingCells())
+	return nil
+}
+
+func (p *stateCellSaveProgress) addFlush(stats stateCellWriteStats, pendingCells int) {
 	p.applied += stats.cells
 	p.bytesWritten += stats.bytes
 
 	now := time.Now()
 	if now.Sub(p.lastLog) >= stateCellSaveProgressInterval {
-		p.logProgress(false, now)
+		p.logProgress(false, now, pendingCells)
 		p.lastLog = now
 	}
-	return nil
 }
 
 func (p *stateCellSaveProgress) logDone() {
-	p.logProgress(true, time.Now())
+	p.logProgress(true, time.Now(), -1)
 }
 
-func (p *stateCellSaveProgress) logProgress(done bool, now time.Time) {
+func (p *stateCellSaveProgress) logProgress(done bool, now time.Time, pendingCells int) {
 	elapsed := now.Sub(p.started)
 	event := p.log.WithLevel(p.level).
 		Str("block", p.blockRef).
@@ -270,7 +395,10 @@ func (p *stateCellSaveProgress) logProgress(done bool, now time.Time) {
 		event.Msg("state cells imported into celldb")
 		return
 	}
-	event.Int("pending_batch_cells", p.writer.pendingCells()).Msg("state to cell db import progress")
+	if pendingCells >= 0 {
+		event.Int("pending_batch_cells", pendingCells)
+	}
+	event.Msg("state to cell db import progress")
 }
 
 func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*cell.Cell, error) {
@@ -278,11 +406,10 @@ func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*c
 		return nil, [4]*cell.Cell{}, fmt.Errorf("cell refs count is too large: %d", len(meta.Refs))
 	}
 
-	refs := make([]cell.RefMetadata, len(meta.Refs))
+	refs := meta.Refs
 	var refCells [4]*cell.Cell
 	for i, metaRef := range meta.Refs {
 		if metaRef.Lazy {
-			refs[i] = metaRef
 			continue
 		}
 
@@ -290,15 +417,21 @@ func stateCellRefs(cl *cell.Cell, meta cell.Metadata) ([]cell.RefMetadata, [4]*c
 		if err != nil {
 			return nil, [4]*cell.Cell{}, err
 		}
-		refMeta := refCell.GetMetadata()
-		refs[i] = cell.RefMetadata{
-			Hash:      refMeta.Hash,
-			LevelMask: refMeta.LevelMask,
-			Hashes:    refMeta.Hashes,
-			Depths:    refMeta.Depths,
-			Lazy:      refCell.IsLazy(),
-		}
 		refCells[i] = refCell
+
+		// GetMetadata exposes the logical ref at the parent's effective level.
+		// A concrete branch above a pruned boundary must instead be persisted by
+		// its raw hash and metadata so it can be loaded back without the proof.
+		if metaRef.Hash != refCell.HashKey() {
+			refMeta := refCell.GetMetadata()
+			refs[i] = cell.RefMetadata{
+				Hash:      refMeta.Hash,
+				LevelMask: refMeta.LevelMask,
+				Hashes:    refMeta.Hashes,
+				Depths:    refMeta.Depths,
+				Lazy:      refCell.IsLazy(),
+			}
+		}
 	}
 	return refs, refCells, nil
 }
@@ -363,14 +496,14 @@ type stateCellBatchWriter struct {
 	cellGeneration uint64
 }
 
-func (s *Store) newStateCellBatchWriter(ctx context.Context, generation uint64) (*stateCellBatchWriter, error) {
+func (s *Store) newStateCellBatchWriter(ctx context.Context, generation uint64, batchInitialBytes int) (*stateCellBatchWriter, error) {
 	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
 		return nil, err
 	}
 
 	return &stateCellBatchWriter{
-		cells:          cells.newBatchWriter(),
+		cells:          cells.newBatchWriter(cellShardBatchInitialSize(batchInitialBytes)),
 		cellStore:      cells,
 		cellGeneration: cells.generation,
 	}, nil

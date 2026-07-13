@@ -260,24 +260,24 @@ func BenchmarkRequestLimiterAllowAfterManyIdleBuckets(b *testing.B) {
 	base := time.Unix(100, 0)
 	triggerAt := base.Add(30 * time.Minute)
 
-	b.ReportAllocs()
-	b.StopTimer()
-	for i := 0; i < b.N; i++ {
-		limiter := newRequestLimiter(RequestLimitOptions{
-			CapacityPerIP: 1,
-			CoolingPerSec: 1,
-		})
-		for j := 0; j < buckets; j++ {
-			if !limiter.allow(ips[j], base) {
-				b.Fatal("request should be allowed")
-			}
-		}
-
-		b.StartTimer()
-		if !limiter.allow(ips[buckets], triggerAt) {
+	limiter := newRequestLimiter(RequestLimitOptions{
+		CapacityPerIP: 1,
+		CoolingPerSec: 1,
+	})
+	for j := 0; j < buckets; j++ {
+		if !limiter.allow(ips[j], base) {
 			b.Fatal("request should be allowed")
 		}
-		b.StopTimer()
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		// step one second per call so the capacity-1 bucket refills each time
+		if !limiter.allow(ips[buckets], triggerAt.Add(time.Duration(i)*time.Second)) {
+			b.Fatal("request should be allowed")
+		}
 	}
 }
 

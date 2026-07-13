@@ -53,6 +53,10 @@ func TestTryLocateTransactionUsesMessageIndex(t *testing.T) {
 	if _, ok := lookup[locateLookupKey{kind: storage.MessageTransactionOutbound, key: outboundKey}]; !ok {
 		t.Fatal("outbound message transaction was not indexed")
 	}
+	wantTxHash := txCell.Hash()
+	if got := lookup[locateLookupKey{kind: storage.MessageTransactionInbound, key: inboundKey}].Hash; !bytes.Equal(got[:], wantTxHash) {
+		t.Fatalf("indexed transaction hash = %x, want original cell hash %x", got, wantTxHash)
+	}
 
 	store := &locateTestStore{
 		root:   blockRoot{block: block, root: root},
@@ -99,6 +103,51 @@ func TestTryLocateTransactionUsesMessageIndex(t *testing.T) {
 	}
 	if store.calls[2] != (locateLookupKey{kind: storage.MessageTransactionOutbound, key: outboundKey}) {
 		t.Fatalf("tryLocateSourceTx lookup = %+v", store.calls[2])
+	}
+}
+
+func TestTransactionMessageHashesUseOriginalRefStoredCells(t *testing.T) {
+	account := bytes.Repeat([]byte{0x55}, 32)
+	source := bytes.Repeat([]byte{0x10}, 32)
+	destination := bytes.Repeat([]byte{0x20}, 32)
+	txCell, inCell, outCell := testHTTPAPITransactionWithRefStoredMessages(t, account, source, destination)
+
+	tx, apiErr := parseAccountTransaction(txCell)
+	if apiErr != nil {
+		t.Fatalf("parse transaction: %s", apiErr.message)
+	}
+	normalizedIn, err := tx.IO.In.ToCell()
+	if err != nil {
+		t.Fatalf("normalize inbound message: %v", err)
+	}
+	outMessages, err := tx.IO.Out.ToSlice()
+	if err != nil {
+		t.Fatalf("parse outbound messages: %v", err)
+	}
+	normalizedOut, err := outMessages[0].ToCell()
+	if err != nil {
+		t.Fatalf("normalize outbound message: %v", err)
+	}
+	if bytes.Equal(normalizedIn.Hash(), inCell.Hash()) || bytes.Equal(normalizedOut.Hash(), outCell.Hash()) {
+		t.Fatal("fixture message layout was preserved by reserialization")
+	}
+
+	raw, err := rawTransactionFromTLB(0, tx, txCell)
+	if err != nil {
+		t.Fatalf("format raw transaction: %v", err)
+	}
+	extended, err := extTransactionFromTLB(rawTransactionExtType, 0, tonBlockRef{}, tx, txCell)
+	if err != nil {
+		t.Fatalf("format extended transaction: %v", err)
+	}
+
+	wantIn := tonHash(inCell.Hash())
+	wantOut := tonHash(outCell.Hash())
+	if raw.InMsg == nil || raw.InMsg.Hash != wantIn || len(raw.OutMsgs) != 1 || raw.OutMsgs[0].Hash != wantOut {
+		t.Fatalf("raw message hashes = in:%+v out:%+v, want %s/%s", raw.InMsg, raw.OutMsgs, wantIn, wantOut)
+	}
+	if extended.InMsg == nil || extended.InMsg.Hash != wantIn || len(extended.OutMsgs) != 1 || extended.OutMsgs[0].Hash != wantOut {
+		t.Fatalf("extended message hashes = in:%+v out:%+v, want %s/%s", extended.InMsg, extended.OutMsgs, wantIn, wantOut)
 	}
 }
 
@@ -195,6 +244,113 @@ func testHTTPAPITransactionWithMessages(t *testing.T, account []byte, inSource [
 	return txCell
 }
 
+func testHTTPAPITransactionWithRefStoredMessages(t *testing.T, account, source, destination []byte) (*cell.Cell, *cell.Cell, *cell.Cell) {
+	t.Helper()
+
+	inCell := testHTTPAPIRefStoredMessage(t, source, account, 54, 0x11)
+	outCell := testHTTPAPIRefStoredMessage(t, account, destination, 56, 0x22)
+	var inMessage tlb.Message
+	if err := tlb.LoadFromCell(&inMessage, inCell.MustBeginParse()); err != nil {
+		t.Fatalf("parse inbound message: %v", err)
+	}
+	outDict := cell.NewDict(15)
+	if err := outDict.Set(
+		cell.BeginCell().MustStoreUInt(0, 15).EndCell(),
+		cell.BeginCell().MustStoreRef(outCell).EndCell(),
+	); err != nil {
+		t.Fatalf("set outbound message: %v", err)
+	}
+
+	tx := tlb.Transaction{
+		AccountAddr: account,
+		LT:          55,
+		PrevTxHash:  bytes.Repeat([]byte{0x01}, 32),
+		PrevTxLT:    54,
+		Now:         1700000000,
+		OutMsgCount: 1,
+		OrigStatus:  tlb.AccountStatusActive,
+		EndStatus:   tlb.AccountStatusActive,
+		TotalFees:   tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
+		StateUpdate: tlb.HashUpdate{
+			OldHash: bytes.Repeat([]byte{0x02}, 32),
+			NewHash: bytes.Repeat([]byte{0x03}, 32),
+		},
+		Description: tlb.TransactionDescriptionOrdinary{
+			ComputePhase: tlb.ComputePhase{Phase: tlb.ComputePhaseSkipped{Reason: tlb.ComputeSkipReason{Type: tlb.ComputeSkipReasonNoState}}},
+			Aborted:      true,
+		},
+	}
+	tx.IO.In = &inMessage
+	tx.IO.Out = &tlb.MessagesList{List: outDict}
+	normalized, err := tlb.ToCell(&tx)
+	if err != nil {
+		t.Fatalf("build transaction: %v", err)
+	}
+	originalIO := cell.BeginCell().
+		MustStoreBoolBit(true).
+		MustStoreRef(inCell).
+		MustStoreDict(outDict).
+		EndCell()
+	return testHTTPAPIReplaceTransactionIO(t, normalized, originalIO), inCell, outCell
+}
+
+func testHTTPAPIRefStoredMessage(t *testing.T, source, destination []byte, createdLT uint64, marker uint64) *cell.Cell {
+	t.Helper()
+
+	stateInit, err := tlb.ToCell(&tlb.StateInit{})
+	if err != nil {
+		t.Fatalf("build state init: %v", err)
+	}
+	body := cell.BeginCell().MustStoreUInt(marker, 32).EndCell()
+	return cell.BeginCell().
+		MustStoreBoolBit(false).
+		MustStoreBoolBit(true).
+		MustStoreBoolBit(true).
+		MustStoreBoolBit(false).
+		MustStoreAddr(address.NewAddress(0, 0, source)).
+		MustStoreAddr(address.NewAddress(0, 0, destination)).
+		MustStoreCoins(0).
+		MustStoreDict(nil).
+		MustStoreCoins(0).
+		MustStoreCoins(0).
+		MustStoreUInt(createdLT, 64).
+		MustStoreUInt(1700000000, 32).
+		MustStoreBoolBit(true).
+		MustStoreBoolBit(true).
+		MustStoreRef(stateInit).
+		MustStoreBoolBit(true).
+		MustStoreRef(body).
+		EndCell()
+}
+
+func testHTTPAPIReplaceTransactionIO(t *testing.T, tx, io *cell.Cell) *cell.Cell {
+	t.Helper()
+
+	loader := tx.MustBeginParse()
+	bits := loader.BitsLeft()
+	data, err := loader.LoadSlice(bits)
+	if err != nil {
+		t.Fatalf("load transaction bits: %v", err)
+	}
+	refs := make([]*cell.Cell, loader.RefsNum())
+	for i := range refs {
+		refs[i], err = loader.LoadRefCell()
+		if err != nil {
+			t.Fatalf("load transaction ref %d: %v", i, err)
+		}
+	}
+	if len(refs) != 3 {
+		t.Fatalf("transaction refs = %d, want 3", len(refs))
+	}
+	refs[0] = io
+
+	builder := cell.BeginCell().MustStoreSlice(data, bits)
+	for _, ref := range refs {
+		builder.MustStoreRef(ref)
+	}
+	return builder.EndCell()
+}
+
 func testHTTPAPIBlockWithTransaction(t *testing.T, workchain int32, shard int64, account []byte, lt uint64, tx *cell.Cell) *cell.Cell {
 	t.Helper()
 
@@ -208,7 +364,7 @@ type testHTTPAPIAccountTxs struct {
 	txs     map[uint64]*cell.Cell
 }
 
-func testHTTPAPIBlockWithAccountTxs(t *testing.T, workchain int32, shard int64, accounts []testHTTPAPIAccountTxs) *cell.Cell {
+func testHTTPAPIBlockWithAccountTxs(t testing.TB, workchain int32, shard int64, accounts []testHTTPAPIAccountTxs) *cell.Cell {
 	t.Helper()
 
 	accountBlocks, err := cell.NewAugDict(256, testHTTPAPICurrencyCollectionAugmentation{})
@@ -299,7 +455,7 @@ func testHTTPAPICurrencyCollectionCell() (*cell.Cell, error) {
 	return tlb.ToCell(&tlb.CurrencyCollection{Coins: tlb.ZeroCoins})
 }
 
-func testHTTPAPIAugDictRootCell(t *testing.T, dict *cell.AugmentedDictionary) *cell.Cell {
+func testHTTPAPIAugDictRootCell(t testing.TB, dict *cell.AugmentedDictionary) *cell.Cell {
 	t.Helper()
 
 	wrapped, err := dict.ToCell()
@@ -319,6 +475,44 @@ func testHTTPAPIAugDictRootCell(t *testing.T, dict *cell.AugmentedDictionary) *c
 		t.Fatalf("load augmented dictionary root: %v", err)
 	}
 	return root
+}
+
+func BenchmarkWalkBlockTransactions(b *testing.B) {
+	const (
+		accountCount        = 16
+		transactionsPerAcct = 32
+	)
+
+	txCell := cell.BeginCell().EndCell()
+	accountTxs := make([]testHTTPAPIAccountTxs, accountCount)
+	for accountIndex := range accountTxs {
+		account := make([]byte, 32)
+		account[31] = byte(accountIndex + 1)
+		txs := make(map[uint64]*cell.Cell, transactionsPerAcct)
+		for txIndex := range transactionsPerAcct {
+			txs[uint64(txIndex+1)] = txCell
+		}
+		accountTxs[accountIndex] = testHTTPAPIAccountTxs{account: account, txs: txs}
+	}
+	root := testHTTPAPIBlockWithAccountTxs(b, 0, masterchainShard, accountTxs)
+	accounts, err := blockAccountBlocks(root)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		count := 0
+		if err := walkBlockTransactions(accounts, func(blockTxEntry) (bool, error) {
+			count++
+			return true, nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if count != accountCount*transactionsPerAcct {
+			b.Fatalf("transaction count = %d", count)
+		}
+	}
 }
 
 func testHTTPAPIAccountKey(account []byte) *cell.Cell {

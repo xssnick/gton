@@ -35,6 +35,15 @@ var (
 	hotPrefixPackAppendDirty       = []byte{0x20}
 	hotPrefixPackDeletePending     = []byte{0x21}
 	hotPrefixMessageTransaction    = []byte{0x22}
+	hotPrefixPersistentStateCells  = []byte{0x23}
+)
+
+type persistentStatePartClass byte
+
+const (
+	persistentStatePartUnsplit persistentStatePartClass = iota
+	persistentStatePartSplitAccount
+	persistentStatePartSplitHeader
 )
 
 func hotKeyMetaDBVersion() []byte {
@@ -181,6 +190,36 @@ func hotKeyPersistentStateFile(block ton.BlockIDExt, masterchainBlock ton.BlockI
 	buf := appendPrefixAndBlockID(hotPrefixStateFileRef, block)
 	buf = append(buf, encodeBlockID(masterchainBlock)...)
 	return binary.BigEndian.AppendUint64(buf, uint64(effectiveShard))
+}
+
+func hotKeyPersistentStateCellsPrefix(block ton.BlockIDExt, effectiveShard int64) []byte {
+	buf := append([]byte(nil), hotPrefixPersistentStateCells...)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(block.Workchain))
+	buf = append(buf, byte(persistentStatePartClassFor(block, effectiveShard)))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(block.Shard))
+	return binary.BigEndian.AppendUint64(buf, uint64(effectiveShard))
+}
+
+func hotKeyPersistentStateCells(block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) []byte {
+	buf := hotKeyPersistentStateCellsPrefix(block, effectiveShard)
+	buf = binary.BigEndian.AppendUint32(buf, masterchainBlock.SeqNo)
+	buf = append(buf, encodeBlockID(block)...)
+	return append(buf, encodeBlockID(masterchainBlock)...)
+}
+
+func hotKeyPersistentStateCellsSeek(block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) []byte {
+	buf := hotKeyPersistentStateCellsPrefix(block, effectiveShard)
+	return binary.BigEndian.AppendUint32(buf, masterchainBlock.SeqNo)
+}
+
+func persistentStatePartClassFor(block ton.BlockIDExt, effectiveShard int64) persistentStatePartClass {
+	if effectiveShard == 0 {
+		return persistentStatePartUnsplit
+	}
+	if effectiveShard == block.Shard {
+		return persistentStatePartSplitHeader
+	}
+	return persistentStatePartSplitAccount
 }
 
 func hotKeyArchivePackageStart(seqno uint32) []byte {

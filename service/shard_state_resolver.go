@@ -1,9 +1,11 @@
 package service
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,7 +16,12 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-const shardStateResolverCacheLimit = 2048
+const (
+	shardStateResolverCacheLimit = 2048
+	// Leave one-eighth insertion headroom so the ordered prune is amortized
+	// while every completed insertion stays bounded.
+	shardStateResolverCacheRetain = shardStateResolverCacheLimit * 7 / 8
+)
 
 type shardStateApplyFunc func(context.Context, ton.BlockIDExt, []*storage.BlockState, PreparedBlock) (*storage.BlockState, error)
 type shardStateAfterApplyFunc func(context.Context, *storage.BlockState, PreparedBlock, time.Duration) error
@@ -39,6 +46,12 @@ type shardStateResolverStats struct {
 	applyElapsed  time.Duration
 	blocksApplied int
 	blocksReused  int
+}
+
+type shardStateCacheEviction struct {
+	key   storage.BlockRootHash
+	seqno uint32
+	empty bool
 }
 
 type shardStateResolver struct {
@@ -240,21 +253,28 @@ func (r *shardStateResolver) evictCacheLocked() {
 		return
 	}
 
-	var evictKey storage.BlockRootHash
-	var evictSeqno uint32
-	first := true
+	evictions := make([]shardStateCacheEviction, 0, len(r.cache))
 	for key, state := range r.cache {
-		if state == nil {
-			evictKey = key
-			break
+		eviction := shardStateCacheEviction{key: key, empty: state == nil}
+		if state != nil {
+			eviction.seqno = state.Block.SeqNo
 		}
-		if first || state.Block.SeqNo < evictSeqno {
-			evictKey = key
-			evictSeqno = state.Block.SeqNo
-			first = false
-		}
+		evictions = append(evictions, eviction)
 	}
-	delete(r.cache, evictKey)
+	slices.SortFunc(evictions, func(a, b shardStateCacheEviction) int {
+		if a.empty != b.empty {
+			if a.empty {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(a.seqno, b.seqno)
+	})
+
+	remove := len(r.cache) - shardStateResolverCacheRetain
+	for _, eviction := range evictions[:remove] {
+		delete(r.cache, eviction.key)
+	}
 }
 
 func (r *shardStateResolver) markReused() {

@@ -11,6 +11,15 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+const liveExternalMessageAccountCacheLimit = 64
+
+type externalMessageAccountKey [32]byte
+
+type externalMessageAccountValue struct {
+	shard   *tlb.ShardAccount
+	account *tlb.AccountState
+}
+
 type ExternalMessageSizeLimits struct {
 	MaxSize  uint32
 	MaxDepth uint16
@@ -50,7 +59,41 @@ func CheckExternalMessageLimits(limits ExternalMessageSizeLimits, data []byte, r
 }
 
 func (f *BlockView) ExternalMessageAccount(addr *address.Address) (*tlb.ShardAccount, *tlb.AccountState, error) {
-	return externalMessageAccountFromAccountsRoot(f.accountsRoot, addr)
+	var key externalMessageAccountKey
+	copy(key[:], addr.Data())
+
+	f.mu.Lock()
+	cached, ok := f.externalMsgAccounts[key]
+	f.mu.Unlock()
+	if ok {
+		return cached.shard, cached.account, nil
+	}
+
+	shard, account, err := externalMessageAccountFromAccountsRoot(f.accountsRoot, addr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	f.mu.Lock()
+	if cached, ok = f.externalMsgAccounts[key]; ok {
+		f.mu.Unlock()
+		return cached.shard, cached.account, nil
+	}
+	if !f.retainCurrentCaches {
+		f.mu.Unlock()
+		return shard, account, nil
+	}
+	if f.externalMsgAccounts == nil {
+		f.externalMsgAccounts = make(map[externalMessageAccountKey]externalMessageAccountValue)
+	} else if len(f.externalMsgAccounts) >= liveExternalMessageAccountCacheLimit {
+		for evicted := range f.externalMsgAccounts {
+			delete(f.externalMsgAccounts, evicted)
+			break
+		}
+	}
+	f.externalMsgAccounts[key] = externalMessageAccountValue{shard: shard, account: account}
+	f.mu.Unlock()
+	return shard, account, nil
 }
 
 func externalMessageLimitsFromBaseConfig(base *runMethodBaseConfig) (ExternalMessageSizeLimits, error) {

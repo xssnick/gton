@@ -59,6 +59,7 @@ func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
 		storage:         store,
 		stateSerializer: newStateSerializer(zerolog.Nop(), store, t.TempDir(), false, 0, false),
 	}
+	svc.enableAutomaticStateSerialization()
 	if err := svc.processPersistentStateSerialization(ctx); err != nil {
 		t.Fatalf("process persistent state serialization: %v", err)
 	}
@@ -138,6 +139,53 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 	}
 	if !bytes.Equal(onePass.Bytes(), want) {
 		t.Fatal("one-pass synthetic root boc mismatch")
+	}
+}
+
+func TestStateSerializerRecordsActualLargeBOCCellCount(t *testing.T) {
+	store := openTestPebbleStorage(t)
+	ctx := context.Background()
+
+	leaf := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0x22, 8).MustStoreRef(leaf).EndCell()
+	records := make([]*tnstore.CellRecord, 0, 2)
+	for _, cl := range []*cell.Cell{leaf, root} {
+		record, err := tnstore.CellRecordFromCell(cl)
+		if err != nil {
+			t.Fatalf("cell record: %v", err)
+		}
+		records = append(records, record)
+	}
+	if err := store.SaveCells(records); err != nil {
+		t.Fatalf("save cells: %v", err)
+	}
+
+	master := testPebbleBlockID(-1, topShard, 100)
+	target := stateSerializationTarget{
+		block: testPebbleBlockID(0, topShard, 101),
+		state: &tnstore.BlockState{StateRootHash: root.Hash()},
+		kind:  "basechain",
+	}
+	part := state2.PersistentStatePart{Kind: state2.PersistentStatePartUnsplit, Root: root}
+
+	tests := []struct {
+		name    string
+		onePass bool
+	}{
+		{name: "two_pass"},
+		{name: "one_pass", onePass: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serializer := newStateSerializer(zerolog.Nop(), store, t.TempDir(), false, 0, test.onePass)
+			file, err := serializer.serializeStatePart(ctx, master, target, part, test.onePass, 1)
+			if err != nil {
+				t.Fatalf("serialize state part: %v", err)
+			}
+			if file.cellsCount != 2 {
+				t.Fatalf("serialized cells = %d, want 2", file.cellsCount)
+			}
+		})
 	}
 }
 
@@ -324,6 +372,7 @@ func TestStateSerializerTreatsExistingFinalFileAsReady(t *testing.T) {
 		},
 		FileHash:      bytes.Repeat([]byte{1}, 32),
 		StateRootHash: bytes.Repeat([]byte{2}, 32),
+		CellsCount:    123,
 	}); err != nil {
 		t.Fatalf("save persistent state file meta: %v", err)
 	}
@@ -337,6 +386,27 @@ func TestStateSerializerTreatsExistingFinalFileAsReady(t *testing.T) {
 	}
 	if file.path != path || file.size != int64(len("complete")) {
 		t.Fatalf("unexpected existing state file: %#v", file)
+	}
+
+	if err = os.Remove(path); err != nil {
+		t.Fatalf("remove serialized state file: %v", err)
+	}
+	hint, err := serializer.persistentStateCellsCountHint(context.Background(), master, block, 0)
+	if err != nil {
+		t.Fatalf("load previous cells count hint: %v", err)
+	}
+	if hint != 123 {
+		t.Fatalf("cells count hint = %d, want 123", hint)
+	}
+
+	nextMaster := testPebbleBlockID(-1, topShard, master.SeqNo+100)
+	nextBlock := testPebbleBlockID(block.Workchain, block.Shard, block.SeqNo+100)
+	hint, err = serializer.persistentStateCellsCountHint(context.Background(), nextMaster, nextBlock, 0)
+	if err != nil {
+		t.Fatalf("load prior compatible cells count hint: %v", err)
+	}
+	if hint != 123 {
+		t.Fatalf("prior compatible cells count hint = %d, want 123", hint)
 	}
 }
 

@@ -222,12 +222,25 @@ func largeBOCLoadShardRecordIndexes(ctx context.Context, cells *cellStore, db *p
 	return joinedErr
 }
 
-func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble.DB, shardIdx int, workerIdx int, indexes []int, hashes []cell.Hash, visit largeBOCRecordVisitor) error {
+func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble.DB, shardIdx int, workerIdx int, indexes []int, hashes []cell.Hash, visit largeBOCRecordVisitor) (retErr error) {
 	var loaded uint64
 	defer func() {
 		cells.addReadCells(shardIdx, loaded)
 	}()
 
+	firstHash := hashes[indexes[0]]
+	iter, err := db.NewIter(&pebble.IterOptions{LowerBound: firstHash[:]})
+	if err != nil {
+		return fmt.Errorf("open celldb shard %d iterator: %w", shardIdx, err)
+	}
+	defer func() {
+		if err := iter.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close celldb shard %d iterator: %w", shardIdx, err))
+		}
+	}()
+
+	var previousHash cell.Hash
+	valid := false
 	for n, index := range indexes {
 		if n&0x3fff == 0 {
 			select {
@@ -238,21 +251,23 @@ func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble
 		}
 
 		hash := hashes[index]
-		value, closer, err := db.Get(hash[:])
-		if err != nil {
-			if errors.Is(err, pebble.ErrNotFound) {
-				err = storage.ErrNotFound
-			}
-			return fmt.Errorf("load cell %x: %w", hash[:], err)
+		if n == 0 || hash != previousHash {
+			valid = iter.SeekGE(hash[:])
+			previousHash = hash
 		}
-		if err = visit(shardIdx, workerIdx, index, hash[:], value); err != nil {
-			_ = closer.Close()
+		if !valid || !bytes.Equal(iter.Key(), hash[:]) {
+			if err := iter.Error(); err != nil {
+				return fmt.Errorf("load cell %x: %w", hash[:], err)
+			}
+			return fmt.Errorf("load cell %x: %w", hash[:], storage.ErrNotFound)
+		}
+		if err := visit(shardIdx, workerIdx, index, hash[:], iter.Value()); err != nil {
 			return fmt.Errorf("decode cell %x: %w", hash[:], err)
 		}
-		if err = closer.Close(); err != nil {
-			return fmt.Errorf("close cell %x value: %w", hash[:], err)
-		}
 		loaded++
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("iterate celldb shard %d: %w", shardIdx, err)
 	}
 	return nil
 }

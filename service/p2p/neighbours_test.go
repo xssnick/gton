@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -162,7 +163,7 @@ func TestReloadNeighboursKeepsLeasedWorstPeer(t *testing.T) {
 	}
 }
 
-func TestReloadNeighboursKeepsSessionPinnedArchivePeer(t *testing.T) {
+func TestReloadNeighboursDoesNotProtectArchiveSelection(t *testing.T) {
 	pinnedID := testPeerID("a")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -190,7 +191,10 @@ func TestReloadNeighboursKeepsSessionPinnedArchivePeer(t *testing.T) {
 		sub.peers[id] = peer
 		sub.neighbours = append(sub.neighbours, id)
 	}
-	session.noteArchivePeerSuccess(sub.peers[pinnedID])
+	session.selectArchivePeer(archive.ShardID{Workchain: -1, Shard: topShard}, sub.peers[pinnedID])
+	if _, protected := node.protectedPeerIDs()[pinnedID]; protected {
+		t.Fatal("archive selection entered live neighbour protection")
+	}
 
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
@@ -203,8 +207,8 @@ func TestReloadNeighboursKeepsSessionPinnedArchivePeer(t *testing.T) {
 
 	sub.reloadNeighbours()
 
-	if !sub.hasNeighbourLocked(pinnedID) {
-		t.Fatalf("session-pinned archive neighbour was rotated")
+	if sub.hasNeighbourLocked(pinnedID) {
+		t.Fatalf("archive-selected unreliable neighbour was protected from normal rotation")
 	}
 }
 
@@ -311,7 +315,7 @@ func TestReloadNeighboursPrunesDeadSessionPinnedArchivePeer(t *testing.T) {
 		alive:         false,
 		lastReceiveAt: time.Now().Add(-time.Minute),
 	}
-	session.noteArchivePeerSuccess(sub.peers[deadID])
+	session.selectArchivePeer(archive.ShardID{Workchain: -1, Shard: topShard}, sub.peers[deadID])
 
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
@@ -788,19 +792,22 @@ func TestDHTServerPublishSkipsStoreWhenOffline(t *testing.T) {
 var errNoAliveStore = errors.New("no alive nodes found to store this key")
 
 type fakeDHTClient struct {
-	mx                       sync.Mutex
-	storeAddressCalls        int
-	storeOverlayCalls        int
-	findAddressesCalls       int
-	findOverlayNodesCalls    int
-	storeAddressErrs         []error
-	storeOverlayErrs         []error
-	findAddressesErr         error
-	findOverlayNodesWait     <-chan struct{}
-	storeAddressDeadline     time.Time
-	storeOverlayDeadline     time.Time
-	findOverlayNodesDeadline time.Time
-	findAddressesDeadline    time.Time
+	mx                           sync.Mutex
+	storeAddressCalls            int
+	storeOverlayCalls            int
+	findAddressesCalls           int
+	findOverlayNodesCalls        int
+	storeAddressErrs             []error
+	storeOverlayErrs             []error
+	findAddressesErr             error
+	findOverlayNodesWait         <-chan struct{}
+	findOverlayNodesWaitAt       int
+	findOverlayNodesStarted      chan<- struct{}
+	findOverlayNodesContinuation *dht.Continuation
+	storeAddressDeadline         time.Time
+	storeOverlayDeadline         time.Time
+	findOverlayNodesDeadline     time.Time
+	findAddressesDeadline        time.Time
 }
 
 func (f *fakeDHTClient) findOverlayNodesCallCount() int {
@@ -813,18 +820,28 @@ func (f *fakeDHTClient) findOverlayNodesCallCount() int {
 func (f *fakeDHTClient) FindOverlayNodes(ctx context.Context, _ []byte, _ ...*dht.Continuation) (*overlay.NodesList, *dht.Continuation, error) {
 	f.mx.Lock()
 	f.findOverlayNodesCalls++
+	call := f.findOverlayNodesCalls
 	f.findOverlayNodesDeadline, _ = ctx.Deadline()
 	wait := f.findOverlayNodesWait
+	waitAt := f.findOverlayNodesWaitAt
+	started := f.findOverlayNodesStarted
+	continuation := f.findOverlayNodesContinuation
 	f.mx.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
 
-	if wait != nil {
+	if wait != nil && (waitAt == 0 || call == waitAt) {
 		select {
 		case <-wait:
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		}
 	}
-	return &overlay.NodesList{}, nil, nil
+	return &overlay.NodesList{}, continuation, nil
 }
 
 func (f *fakeDHTClient) FindAddresses(ctx context.Context, _ []byte) (*adnladdr.List, ed25519.PublicKey, error) {

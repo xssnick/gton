@@ -1,16 +1,18 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	gojson "github.com/goccy/go-json"
 )
 
 const apiPrefix = "/api/v2/"
@@ -264,18 +266,30 @@ func decodeJSONBody(r *http.Request, maxBodyBytes int64, dst any) error {
 	}
 	defer body.Close()
 
-	data, err := io.ReadAll(body)
+	initialCapacity := r.ContentLength
+	if initialCapacity < 0 {
+		initialCapacity = 0
+	}
+	if maxBodyBytes > 0 && initialCapacity > maxBodyBytes {
+		initialCapacity = maxBodyBytes
+	}
+	const maxInitialCapacity = int64(64 << 10)
+	if initialCapacity > maxInitialCapacity {
+		initialCapacity = maxInitialCapacity
+	}
+
+	var buffer bytes.Buffer
+	buffer.Grow(int(initialCapacity) + bytes.MinRead)
+	_, err := buffer.ReadFrom(body)
 	if err != nil {
 		return err
 	}
-	if len(strings.TrimSpace(string(data))) == 0 {
+	data := bytes.TrimSpace(buffer.Bytes())
+	if len(data) == 0 {
 		data = []byte("{}")
 	}
 
-	if err = json.Unmarshal(data, dst); err != nil {
-		return err
-	}
-	return nil
+	return json.Unmarshal(data, dst)
 }
 
 func jsonRPCParams(raw json.RawMessage) (requestParams, *apiError) {
@@ -511,7 +525,7 @@ func (s *Server) writeFailure(w http.ResponseWriter, status int, envelope failur
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
+	if err := gojson.NewEncoder(w).Encode(value); err != nil {
 		s.log.Warn().Err(err).Msg("failed to write http api response")
 	}
 }

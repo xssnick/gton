@@ -146,6 +146,7 @@ type Service struct {
 	blockReceivedHooks      *blockReceivedHookRunner
 
 	stateCellPrewrite *stateCellPrewriter
+	artifactPrewrite  *artifactPrewriter
 
 	archiveCatchUpCheckpointBlocks uint32
 	archiveCatchUpCheckpointPeriod time.Duration
@@ -184,9 +185,12 @@ type Service struct {
 	masterStateCacheMu              sync.Mutex
 	masterStateCache                map[storage.BlockRootHash]*storage.BlockState
 	masterStateCacheKeys            []storage.BlockRootHash
+	masterStateCacheHead            int
 	compressedStateMu               sync.Mutex
 	compressedStateCache            map[storage.BlockRootHash]compressedBlockStateEntry
-	compressedStateOrder            []storage.BlockRootHash
+	compressedStateOrder            []compressedBlockStateOrderEntry
+	compressedStateOrderHead        int
+	compressedStateVersion          uint64
 	monitorSplitDepthMu             sync.Mutex
 	monitorSplitDepth               map[monitorSplitDepthKey]uint32
 
@@ -199,6 +203,7 @@ type Service struct {
 	lazyCellLoads                      lazyCellLoadCounters
 	nextStateCellLoaderID              uint64
 	stateSerializer                    *stateSerializer
+	automaticStateSerializationReady   atomic.Bool
 	maintenanceWake                    chan struct{}
 	stateTTL                           time.Duration
 	archiveTTL                         time.Duration
@@ -561,6 +566,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		externalMessageHooks:               newExternalMessageHookRunner(logger, opts.Extension),
 		blockReceivedHooks:                 newBlockReceivedHookRunner(logger, opts.Extension),
 		stateCellPrewrite:                  newStateCellPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
+		artifactPrewrite:                   newArtifactPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
 		archiveCatchUpCheckpointPeriod:     opts.ArchiveCatchUpCheckpointPeriod,
 		archiveCatchUpPrefetchWindows:      opts.ArchiveCatchUpPrefetchWindows,
@@ -633,6 +639,7 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		s.stateCellPrewrite.start(ctx, s.currentStatePersistContext(), s.runAsync)
+		s.artifactPrewrite.start(ctx, s.runAsync)
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
 		})

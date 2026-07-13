@@ -3,6 +3,7 @@ package liteserver
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -119,14 +120,19 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: blocks, ShardBlockCache: blocks})
 
 	for i := 0; i < blocks; i++ {
-		rootByte := byte(i%250 + 1)
-		fileByte := byte((i+1)%250 + 1)
+		// Root hashes must be unique per block: the live store keys blocks by
+		// root hash, so colliding hashes overwrite earlier blocks and drop
+		// their history index entries.
+		rootHash := bytes.Repeat([]byte{0x01}, 32)
+		fileHash := bytes.Repeat([]byte{0x02}, 32)
+		binary.BigEndian.PutUint32(rootHash, uint32(i+1))
+		binary.BigEndian.PutUint32(fileHash, uint32(i+1))
 		block := ton.BlockIDExt{
 			Workchain: 0,
 			Shard:     int64(i+1) << 3,
 			SeqNo:     uint32(i + 1),
-			RootHash:  bytes.Repeat([]byte{rootByte}, 32),
-			FileHash:  bytes.Repeat([]byte{fileByte}, 32),
+			RootHash:  rootHash,
+			FileHash:  fileHash,
 		}
 		meta := &storage.BlockMeta{
 			ID:       block,

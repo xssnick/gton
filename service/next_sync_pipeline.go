@@ -51,6 +51,7 @@ type nextSyncRunner struct {
 	stagedBlocks                      uint32
 	checkpointMu                      sync.Mutex
 	checkpointStates                  appliedStateSet
+	artifactPrewriteSeq               uint64
 	stateCells                        *stateCellWindowCache
 	shardCache                        map[storage.BlockRootHash]*storage.BlockState
 	shardResolver                     *shardStateResolver
@@ -253,6 +254,8 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 	if s.cellGenerationSwitchActive() {
 		return nil, 0, errCellGenerationMigrationRunning
 	}
+	s.enableAutomaticStateSerialization()
+
 	if err := s.waitSyncDiskSpace(ctx, method); err != nil {
 		return nil, 0, err
 	}
@@ -619,6 +622,12 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 	applyTiming.total += transitionTiming.total
 	applied.applyTiming = applyTiming
 	if err != nil {
+		applied.err = err
+		observe(syncBlockResultForError(err), applyTiming.total)
+		return applied, err
+	}
+
+	if err = r.service.updateMasterDependentCachesForKeyBlock(nextMaster, &prepared); err != nil {
 		applied.err = err
 		observe(syncBlockResultForError(err), applyTiming.total)
 		return applied, err
@@ -1008,7 +1017,7 @@ func (r *nextSyncRunner) flushStaged(mode flushStagedMode, reason string) error 
 	lockElapsed := time.Since(queuedAt)
 	r.timing.persist += lockElapsed
 
-	checkpoint := r.checkpoint()
+	checkpoint, artifactPrewriteTarget := r.checkpoint()
 	cells := r.stateCells.beginCheckpoint()
 	releaseCells := r.retainCheckpointCellLoader(cells)
 	onCommitted := func() {
@@ -1018,9 +1027,9 @@ func (r *nextSyncRunner) flushStaged(mode flushStagedMode, reason string) error 
 	var next *storage.CurrentState
 	var err error
 	if mode == flushStagedSync {
-		next, err = r.service.persistNextBlockCurrentStateSyncLocked(r.current, &r.timing, reason, checkpoint.entries, cells, onCommitted, releaseCells, lockElapsed)
+		next, err = r.service.persistNextBlockCurrentStateSyncLocked(r.current, &r.timing, reason, checkpoint.entries, cells, artifactPrewriteTarget, onCommitted, releaseCells, lockElapsed)
 	} else {
-		next, err = r.service.persistNextBlockCurrentStateLocked(r.current, &r.timing, checkpoint.entries, cells, onCommitted, releaseCells, lockElapsed, queuedAt)
+		next, err = r.service.persistNextBlockCurrentStateLocked(r.current, &r.timing, checkpoint.entries, cells, artifactPrewriteTarget, onCommitted, releaseCells, lockElapsed, queuedAt)
 	}
 	if err != nil {
 		releaseCells()
@@ -1201,8 +1210,7 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 	if err != nil {
 		return err
 	}
-	r.rememberCheckpointState(state, artifact, links)
-	return nil
+	return r.rememberCheckpointState(state, artifact, links)
 }
 
 func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) error {
@@ -1219,20 +1227,30 @@ func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) e
 	if err != nil {
 		return err
 	}
-	r.rememberCheckpointState(item.master, artifact, links)
+	return r.rememberCheckpointState(item.master, artifact, links)
+}
+
+func (r *nextSyncRunner) rememberCheckpointState(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) error {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+	r.checkpointStates.rememberWithArtifacts(state, artifact, links)
+	// Stream the artifact append ahead of the checkpoint while holding
+	// checkpointMu, so a checkpoint snapshot always covers exactly the staged
+	// entries whose prewrite sequence it waits for.
+	seq, err := r.service.artifactPrewrite.enqueue(state, artifact)
+	if err != nil {
+		return err
+	}
+	if seq > r.artifactPrewriteSeq {
+		r.artifactPrewriteSeq = seq
+	}
 	return nil
 }
 
-func (r *nextSyncRunner) rememberCheckpointState(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
-	r.checkpointMu.Lock()
-	r.checkpointStates.rememberWithArtifacts(state, artifact, links)
-	r.checkpointMu.Unlock()
-}
-
-func (r *nextSyncRunner) checkpoint() appliedStateCheckpoint {
+func (r *nextSyncRunner) checkpoint() (appliedStateCheckpoint, uint64) {
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
-	return r.checkpointStates.checkpoint()
+	return r.checkpointStates.checkpoint(), r.artifactPrewriteSeq
 }
 
 func (r *nextSyncRunner) completeCheckpoint(checkpoint appliedStateCheckpoint) {

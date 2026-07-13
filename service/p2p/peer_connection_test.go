@@ -89,6 +89,10 @@ func (m *testOverlayADNL) GetID() []byte {
 	return []byte("test-peer")
 }
 
+func (m *testOverlayADNL) Stats() adnl.PeerStats {
+	return adnl.PeerStats{}
+}
+
 func (m *testOverlayADNL) Close() {
 	m.closeFn()
 }

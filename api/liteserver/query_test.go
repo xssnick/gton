@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -4652,10 +4654,35 @@ func TestGetTransactionsZeroLTMatchesCppEmptyList(t *testing.T) {
 	}
 }
 
+func BenchmarkTransactionSearchBlockRepeatedAccount(b *testing.B) {
+	const transactionCount = 64
+
+	account := bytes.Repeat([]byte{0x55}, 32)
+	txs := make(map[uint64]*cell.Cell, transactionCount)
+	for i := range transactionCount {
+		txs[uint64(i+1)] = cell.BeginCell().EndCell()
+	}
+	root := testBlockWithTransactions(b, 0, masterchainShard, account, txs)
+	id := testBlockIDForRoot(0, masterchainShard, 1, root)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		block, err := transactionSearchBlockFromRoot(id, root)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for i := range transactionCount {
+			if _, err = block.findTransaction(account, uint64(i+1)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
 func TestListBlockTransactionsMode256ReturnsTransactionMetadata(t *testing.T) {
 	account := bytes.Repeat([]byte{0x66}, 32)
 	initiator := bytes.Repeat([]byte{0x77}, 32)
-	tx, msg := testTransactionWithInMsg(t, account, 42)
+	tx, msg := testTransactionWithRefStoredInMsg(t, account, 42)
 	envelope := testMsgEnvelopeWithMetadata(t, msg, initiator, 3, 99)
 	inMsgDesc := testInMsgDescr(t, msg, envelope, tx)
 	root := testBlockWithTransactionsAndInMsgDesc(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
@@ -4694,6 +4721,56 @@ func TestListBlockTransactionsMode256ReturnsTransactionMetadata(t *testing.T) {
 	}
 }
 
+func TestListBlockTransactionsMetadataProofPrunesUnusedTransactionRefs(t *testing.T) {
+	account := bytes.Repeat([]byte{0x66}, 32)
+	initiator := bytes.Repeat([]byte{0x77}, 32)
+	tx, msg := testTransactionWithRefStoredInMsg(t, account, 42)
+	envelope := testMsgEnvelopeWithMetadata(t, msg, initiator, 3, 99)
+	inMsgDesc := testInMsgDescr(t, msg, envelope, tx)
+	root := testBlockWithTransactionsAndInMsgDesc(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+		42: tx,
+	}, inMsgDesc)
+	id := testBlockIDForRoot(0, masterchainShard, 1, root)
+	srv := testServer(&fakeStore{blocks: map[storage.BlockRootHash][]byte{
+		storage.BlockKey(id): testBlockBOC(root),
+	}})
+
+	resp := srv.handleQuery(context.Background(), ton.ListBlockTransactions{
+		ID:    cloneBlockID(id),
+		Mode:  7 | 32 | 256,
+		Count: 1,
+	})
+	list, ok := resp.(ton.BlockTransactions)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.BlockTransactions: %+v", resp, resp)
+	}
+	if len(list.TransactionIds) != 1 || list.TransactionIds[0].Metadata == nil {
+		t.Fatalf("metadata is missing from transaction list: %+v", list.TransactionIds)
+	}
+	proofBody, err := cell.UnwrapProof(list.Proof, id.RootHash)
+	if err != nil {
+		t.Fatalf("unwrap proof: %v", err)
+	}
+	proofTx, err := findBlockTransaction(proofBody, account, 42)
+	if err != nil {
+		t.Fatalf("find proof transaction: %v", err)
+	}
+	assertRefType(t, proofTx, 0, cell.OrdinaryCellType)
+	assertRefType(t, proofTx, 1, cell.PrunedCellType)
+	assertRefType(t, proofTx, 2, cell.PrunedCellType)
+	io := proofTx.MustPeekRef(0).MustBeginParse()
+	if hasInbound, err := io.LoadBoolBit(); err != nil || !hasInbound {
+		t.Fatalf("load proof inbound message flag: has=%v err=%v", hasInbound, err)
+	}
+	proofMsg, err := io.LoadRefCell()
+	if err != nil {
+		t.Fatalf("load proof inbound message: %v", err)
+	}
+	if proofMsg.GetType() != cell.PrunedCellType {
+		t.Fatalf("inbound message proof type = %d, want pruned", proofMsg.GetType())
+	}
+}
+
 func TestListBlockTransactionsMode256ErrorsWhenInMsgDescrEntryMissing(t *testing.T) {
 	account := bytes.Repeat([]byte{0x67}, 32)
 	tx, _ := testTransactionWithInMsg(t, account, 42)
@@ -4725,6 +4802,40 @@ func TestListBlockTransactionsMode256ErrorsWhenInMsgDescrEntryMissing(t *testing
 	if !strings.Contains(lsErr.Text, "no InMsg in InMsgDescr for message with hash") {
 		t.Fatalf("error = %q, want missing InMsgDescr entry", lsErr.Text)
 	}
+}
+
+func BenchmarkListBlockTransactionsMetadataProof(b *testing.B) {
+	const transactionCount = 64
+
+	account := bytes.Repeat([]byte{0x66}, 32)
+	initiator := bytes.Repeat([]byte{0x77}, 32)
+	tx, msg := testTransactionWithRefStoredInMsg(b, account, 42)
+	envelope := testMsgEnvelopeWithMetadata(b, msg, initiator, 3, 99)
+	inMsgDesc := testInMsgDescr(b, msg, envelope, tx)
+	txs := make(map[uint64]*cell.Cell, transactionCount)
+	for i := range transactionCount {
+		txs[uint64(i+1)] = tx
+	}
+	root := testBlockWithTransactionsAndInMsgDesc(b, 0, masterchainShard, account, txs, inMsgDesc)
+
+	var proofSize int
+	b.ReportAllocs()
+	for b.Loop() {
+		builder := blockproof.NewProofBuilder(root)
+		list, err := listBlockTransactions(builder.Root(), 7|32|256, transactionCount, nil, true)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(list.items) != transactionCount {
+			b.Fatalf("transaction count = %d", len(list.items))
+		}
+		proof, err := builder.CreateProof()
+		if err != nil {
+			b.Fatal(err)
+		}
+		proofSize = len(proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}))
+	}
+	b.ReportMetric(float64(proofSize), "proof-B")
 }
 
 func TestWaitMasterchainSeqnoPrefixRunsWrappedQueryAfterLiveState(t *testing.T) {
@@ -6390,11 +6501,11 @@ func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size 
 	return root
 }
 
-func testBlockWithTransactions(t *testing.T, workchain int32, shard int64, account []byte, txs map[uint64]*cell.Cell) *cell.Cell {
+func testBlockWithTransactions(t testing.TB, workchain int32, shard int64, account []byte, txs map[uint64]*cell.Cell) *cell.Cell {
 	return testBlockWithTransactionsAndInMsgDesc(t, workchain, shard, account, txs, cell.BeginCell().EndCell())
 }
 
-func testBlockWithTransactionsAndInMsgDesc(t *testing.T, workchain int32, shard int64, account []byte, txs map[uint64]*cell.Cell, inMsgDesc *cell.Cell) *cell.Cell {
+func testBlockWithTransactionsAndInMsgDesc(t testing.TB, workchain int32, shard int64, account []byte, txs map[uint64]*cell.Cell, inMsgDesc *cell.Cell) *cell.Cell {
 	t.Helper()
 
 	txDict, err := cell.NewAugDict(64, testCurrencyCollectionAugmentation{})
@@ -6469,7 +6580,7 @@ func testBlockWithTransactionsAndInMsgDesc(t *testing.T, workchain int32, shard 
 	return root
 }
 
-func testTransactionWithInMsg(t *testing.T, account []byte, lt uint64) (*cell.Cell, *cell.Cell) {
+func testTransactionWithInMsg(t testing.TB, account []byte, lt uint64) (*cell.Cell, *cell.Cell) {
 	t.Helper()
 
 	src := address.NewAddress(0, 0, bytes.Repeat([]byte{0x10}, 32))
@@ -6515,6 +6626,106 @@ func testTransactionWithInMsg(t *testing.T, account []byte, lt uint64) (*cell.Ce
 	return txCell, msgCell
 }
 
+func testTransactionWithRefStoredInMsg(t testing.TB, account []byte, lt uint64) (*cell.Cell, *cell.Cell) {
+	t.Helper()
+
+	code := testMessageCellChain(12, 0x11)
+	body := testMessageCellChain(12, 0x22)
+	stateInit, err := tlb.ToCell(&tlb.StateInit{Code: code})
+	if err != nil {
+		t.Fatalf("build state init: %v", err)
+	}
+	msgCell := cell.BeginCell().
+		MustStoreBoolBit(false).
+		MustStoreBoolBit(true).
+		MustStoreBoolBit(true).
+		MustStoreBoolBit(false).
+		MustStoreAddr(address.NewAddress(0, 0, bytes.Repeat([]byte{0x10}, 32))).
+		MustStoreAddr(address.NewAddress(0, 0, account)).
+		MustStoreCoins(0).
+		MustStoreDict(nil).
+		MustStoreCoins(0).
+		MustStoreCoins(0).
+		MustStoreUInt(lt-1, 64).
+		MustStoreUInt(1700000000, 32).
+		MustStoreBoolBit(true).
+		MustStoreBoolBit(true).
+		MustStoreRef(stateInit).
+		MustStoreBoolBit(true).
+		MustStoreRef(body).
+		EndCell()
+
+	var msg tlb.Message
+	if err = tlb.LoadFromCell(&msg, msgCell.MustBeginParse()); err != nil {
+		t.Fatalf("parse inbound message: %v", err)
+	}
+	tx := tlb.Transaction{
+		AccountAddr: account,
+		LT:          lt,
+		PrevTxHash:  bytes.Repeat([]byte{0x01}, 32),
+		PrevTxLT:    lt - 1,
+		Now:         1700000000,
+		OrigStatus:  tlb.AccountStatusActive,
+		EndStatus:   tlb.AccountStatusActive,
+		TotalFees:   tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
+		StateUpdate: tlb.HashUpdate{
+			OldHash: bytes.Repeat([]byte{0x02}, 32),
+			NewHash: bytes.Repeat([]byte{0x03}, 32),
+		},
+		Description: tlb.TransactionDescriptionOrdinary{
+			ComputePhase: tlb.ComputePhase{Phase: tlb.ComputePhaseSkipped{Reason: tlb.ComputeSkipReason{Type: tlb.ComputeSkipReasonNoState}}},
+			Aborted:      true,
+		},
+	}
+	tx.IO.In = &msg
+	normalized, err := tlb.ToCell(&tx)
+	if err != nil {
+		t.Fatalf("build transaction: %v", err)
+	}
+	originalIO := cell.BeginCell().
+		MustStoreBoolBit(true).
+		MustStoreRef(msgCell).
+		MustStoreDict(nil).
+		EndCell()
+	return testReplaceTransactionIO(t, normalized, originalIO), msgCell
+}
+
+func testMessageCellChain(length int, marker uint64) *cell.Cell {
+	root := cell.BeginCell().MustStoreUInt(marker, 32).EndCell()
+	for i := range length {
+		root = cell.BeginCell().MustStoreUInt(uint64(i), 32).MustStoreRef(root).EndCell()
+	}
+	return root
+}
+
+func testReplaceTransactionIO(t testing.TB, tx, io *cell.Cell) *cell.Cell {
+	t.Helper()
+
+	loader := tx.MustBeginParse()
+	bits := loader.BitsLeft()
+	data, err := loader.LoadSlice(bits)
+	if err != nil {
+		t.Fatalf("load transaction bits: %v", err)
+	}
+	refs := make([]*cell.Cell, loader.RefsNum())
+	for i := range refs {
+		refs[i], err = loader.LoadRefCell()
+		if err != nil {
+			t.Fatalf("load transaction ref %d: %v", i, err)
+		}
+	}
+	if len(refs) != 3 {
+		t.Fatalf("transaction refs = %d, want 3", len(refs))
+	}
+	refs[0] = io
+
+	builder := cell.BeginCell().MustStoreSlice(data, bits)
+	for _, ref := range refs {
+		builder.MustStoreRef(ref)
+	}
+	return builder.EndCell()
+}
+
 func testTransactionWithPrev(t *testing.T, account []byte, lt uint64, prevLT uint64, prevHash []byte) *cell.Cell {
 	t.Helper()
 
@@ -6550,7 +6761,7 @@ func testTransactionWithPrev(t *testing.T, account []byte, lt uint64, prevLT uin
 	return txCell
 }
 
-func testMsgEnvelopeWithMetadata(t *testing.T, msg *cell.Cell, initiator []byte, depth int32, lt uint64) *cell.Cell {
+func testMsgEnvelopeWithMetadata(t testing.TB, msg *cell.Cell, initiator []byte, depth int32, lt uint64) *cell.Cell {
 	t.Helper()
 
 	return cell.BeginCell().
@@ -6568,7 +6779,7 @@ func testMsgEnvelopeWithMetadata(t *testing.T, msg *cell.Cell, initiator []byte,
 		EndCell()
 }
 
-func testInMsgDescr(t *testing.T, msg, envelope, tx *cell.Cell) *cell.Cell {
+func testInMsgDescr(t testing.TB, msg, envelope, tx *cell.Cell) *cell.Cell {
 	t.Helper()
 
 	dict, err := cell.NewAugDict(256, testImportFeesAugmentation{})
@@ -6807,7 +7018,7 @@ func testEmptyShardAccounts(t *testing.T) *tlb.ShardAccountsAugDict {
 	return &tlb.ShardAccountsAugDict{AugmentedDictionary: accounts}
 }
 
-func testAugDictRootCell(t *testing.T, dict *cell.AugmentedDictionary) *cell.Cell {
+func testAugDictRootCell(t testing.TB, dict *cell.AugmentedDictionary) *cell.Cell {
 	t.Helper()
 
 	wrapped, err := dict.ToCell()
@@ -7458,4 +7669,166 @@ func currentMasterchainInfo(current *storage.CurrentState) (ton.BlockIDExt, []by
 		return ton.BlockIDExt{}, nil, 0, fmt.Errorf("masterchain state root hash is missing")
 	}
 	return block, stateRoot, lastUTime, nil
+}
+
+func testBlockWithManyAccountTransactions(t testing.TB, accounts int, txsPerAccount func(i int) int) (*cell.Cell, []ton.TransactionID3) {
+	t.Helper()
+
+	accountBlocks, err := cell.NewAugDict(256, testCurrencyCollectionAugmentation{})
+	if err != nil {
+		t.Fatalf("create account blocks dict: %v", err)
+	}
+
+	var all []ton.TransactionID3
+	for a := 0; a < accounts; a++ {
+		account := make([]byte, 32)
+		binary.BigEndian.PutUint32(account[:4], uint32(a)*2654435761)
+		binary.BigEndian.PutUint32(account[28:], uint32(a))
+
+		txDict, err := cell.NewAugDict(64, testCurrencyCollectionAugmentation{})
+		if err != nil {
+			t.Fatalf("create tx dict: %v", err)
+		}
+		for i := 0; i < txsPerAccount(a); i++ {
+			lt := uint64(1000 + a*10 + i)
+			tx := cell.BeginCell().MustStoreUInt(uint64(a)<<32|uint64(i), 64).EndCell()
+			if err = txDict.Set(cell.BeginCell().MustStoreUInt(lt, 64).EndCell(), cell.BeginCell().MustStoreRef(tx).EndCell()); err != nil {
+				t.Fatalf("set tx: %v", err)
+			}
+			all = append(all, ton.TransactionID3{Account: account, LT: lt})
+		}
+
+		accountBlock := cell.BeginCell().
+			MustStoreUInt(0x5, 4).
+			MustStoreSlice(account, 256).
+			MustStoreBuilder(testAugDictRootCell(t, txDict).ToBuilder()).
+			MustStoreRef(cell.BeginCell().EndCell()).
+			EndCell()
+		if err = accountBlocks.Set(blockproof.AccountKey(account), accountBlock); err != nil {
+			t.Fatalf("set account block: %v", err)
+		}
+	}
+
+	shardBlocks, err := tlb.ToCell(&tlb.ShardAccountBlocks{
+		Accounts: &tlb.ShardAccountBlocksAugDict{AugmentedDictionary: accountBlocks},
+	})
+	if err != nil {
+		t.Fatalf("build shard account blocks: %v", err)
+	}
+
+	extra := &tlb.BlockExtra{
+		InMsgDesc:          cell.BeginCell().EndCell(),
+		OutMsgDesc:         cell.BeginCell().EndCell(),
+		ShardAccountBlocks: shardBlocks,
+		RandSeed:           bytes.Repeat([]byte{0x01}, 32),
+		CreatedBy:          bytes.Repeat([]byte{0x02}, 32),
+	}
+
+	var header tlb.BlockHeader
+	header.Version = 1
+	header.Shard = tlb.ShardIdent{PrefixBits: 0, WorkchainID: 0, ShardPrefix: 1 << 63}
+	header.SeqNo = 1
+	header.StartLt = 1
+	header.EndLt = 100
+	header.GenUtime = 1000
+	header.NotMaster = true
+	header.MasterRef = &tlb.ExtBlkRef{
+		RootHash: bytes.Repeat([]byte{0x05}, 32),
+		FileHash: bytes.Repeat([]byte{0x06}, 32),
+	}
+	header.PrevRef = tlb.BlkPrevInfo{Prev1: tlb.ExtBlkRef{
+		RootHash: bytes.Repeat([]byte{0x03}, 32),
+		FileHash: bytes.Repeat([]byte{0x04}, 32),
+	}}
+
+	root, err := tlb.ToCell(&tlb.Block{
+		GlobalID:    -239,
+		BlockInfo:   header,
+		ValueFlow:   cell.BeginCell().EndCell(),
+		StateUpdate: cell.BeginCell().EndCell(),
+		Extra:       extra,
+	})
+	if err != nil {
+		t.Fatalf("build block: %v", err)
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		if c := bytes.Compare(all[i].Account, all[j].Account); c != 0 {
+			return c < 0
+		}
+		return all[i].LT < all[j].LT
+	})
+	return root, all
+}
+
+// TestListBlockTransactionsPagingCoversAllTransactions pages through a
+// multi-account block in both directions with several page sizes and checks
+// the concatenation matches the account/LT-ordered full listing exactly, with
+// a verifiable proof on every page.
+func TestListBlockTransactionsPagingCoversAllTransactions(t *testing.T) {
+	root, expectedAsc := testBlockWithManyAccountTransactions(t, 25, func(i int) int { return 1 + i%3 })
+	id := testBlockIDForRoot(0, masterchainShard, 1, root)
+	srv := testServer(&fakeStore{blocks: map[storage.BlockRootHash][]byte{
+		storage.BlockKey(id): testBlockBOC(root),
+	}})
+
+	for _, reverse := range []bool{false, true} {
+		expected := make([]ton.TransactionID3, len(expectedAsc))
+		copy(expected, expectedAsc)
+		if reverse {
+			for i, j := 0, len(expected)-1; i < j; i, j = i+1, j-1 {
+				expected[i], expected[j] = expected[j], expected[i]
+			}
+		}
+
+		for _, pageSize := range []uint32{1, 3, 7, 40} {
+			var got []ton.TransactionID3
+			var after *ton.TransactionID3
+			for page := 0; ; page++ {
+				mode := uint32(7 | 32)
+				if reverse {
+					mode |= 64
+				}
+				if after != nil {
+					mode |= 128
+				}
+				resp := srv.handleQuery(context.Background(), ton.ListBlockTransactions{
+					ID:    cloneBlockID(id),
+					Mode:  mode,
+					Count: pageSize,
+					After: after,
+				})
+				list, ok := resp.(ton.BlockTransactions)
+				if !ok {
+					t.Fatalf("reverse=%v pageSize=%d page=%d: response type = %T: %+v", reverse, pageSize, page, resp, resp)
+				}
+				if list.Proof == nil {
+					t.Fatalf("reverse=%v pageSize=%d page=%d: missing proof", reverse, pageSize, page)
+				}
+				if _, err := cell.UnwrapProof(list.Proof, id.RootHash); err != nil {
+					t.Fatalf("reverse=%v pageSize=%d page=%d: unwrap proof: %v", reverse, pageSize, page, err)
+				}
+				for _, txID := range list.TransactionIds {
+					got = append(got, ton.TransactionID3{Account: txID.Account, LT: txID.LT})
+				}
+				if !list.Incomplete {
+					break
+				}
+				if len(list.TransactionIds) == 0 {
+					t.Fatalf("reverse=%v pageSize=%d page=%d: empty incomplete page", reverse, pageSize, page)
+				}
+				last := list.TransactionIds[len(list.TransactionIds)-1]
+				after = &ton.TransactionID3{Account: last.Account, LT: last.LT}
+			}
+
+			if len(got) != len(expected) {
+				t.Fatalf("reverse=%v pageSize=%d: got %d transactions, want %d", reverse, pageSize, len(got), len(expected))
+			}
+			for i := range expected {
+				if got[i].LT != expected[i].LT || !bytes.Equal(got[i].Account, expected[i].Account) {
+					t.Fatalf("reverse=%v pageSize=%d item=%d: got (%x, %d), want (%x, %d)", reverse, pageSize, i, got[i].Account, got[i].LT, expected[i].Account, expected[i].LT)
+				}
+			}
+		}
+	}
 }

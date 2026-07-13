@@ -68,42 +68,59 @@ func TestBroadcastValidatorCacheKeepsShardVariants(t *testing.T) {
 	}
 }
 
-func TestBroadcastValidatorCacheKeepsConfigUntilReset(t *testing.T) {
+func TestBroadcastValidatorCacheRejectsStaleConfigPut(t *testing.T) {
 	var cache broadcastValidatorCache
 
-	firstBlock := testBlockID(-1, topShard, 10)
-	firstConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
-	if _, ok := cache.getConfig(firstBlock); ok {
+	oldBlock := testBlockID(-1, topShard, 10)
+	oldConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
+	if _, ok := cache.getConfig(); ok {
 		t.Fatal("empty broadcast validator config cache returned a hit")
 	}
-	cache.putConfig(firstBlock, firstConfig)
+	cache.putConfig(oldBlock, oldConfig)
 
-	got, ok := cache.getConfig(firstBlock)
-	if !ok || got.rootHash != firstConfig.rootHash {
-		t.Fatal("expected broadcast validator config cache hit for the same master block")
-	}
-
-	secondBlock := testBlockID(-1, topShard, 11)
-	got, ok = cache.getConfig(secondBlock)
-	if !ok || got.rootHash != firstConfig.rootHash {
-		t.Fatal("expected broadcast validator config cache hit for a later non-key master block")
-	}
-
-	key := broadcastValidatorCacheKey{
-		configRootHash:   firstConfig.rootHash,
+	oldKey := broadcastValidatorCacheKey{
+		configRootHash:   oldConfig.rootHash,
 		workchain:        0,
 		shard:            topShard,
 		catchainSeqno:    7,
 		validatorSetHash: 11,
 	}
-	cache.put(key, &blockproof.PreparedValidatorSet{})
+	oldSet := &blockproof.PreparedValidatorSet{}
+	cache.put(oldKey, oldSet)
 
-	cache.reset()
-	if _, ok = cache.getConfig(secondBlock); ok {
-		t.Fatal("expected broadcast validator config cache miss after reset")
+	keyBlock := testBlockID(-1, topShard, 20)
+	keyConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(2)}
+	cache.putConfig(keyBlock, keyConfig)
+
+	got := cache.putConfig(oldBlock, oldConfig)
+	if got.rootHash != keyConfig.rootHash {
+		t.Fatal("stale config put did not return the newer key-block config")
 	}
-	if _, ok = cache.get(key); ok {
-		t.Fatal("expected broadcast validator entries to be cleared after reset")
+
+	got, ok := cache.getConfig()
+	if !ok || got.rootHash != keyConfig.rootHash {
+		t.Fatal("stale config put replaced the newer key-block config")
+	}
+	if _, ok = cache.get(oldKey); ok {
+		t.Fatal("old validator entries remained cached after the config root changed")
+	}
+
+	cache.put(oldKey, oldSet)
+	if _, ok = cache.get(oldKey); ok {
+		t.Fatal("late validator set put restored an entry from the old config root")
+	}
+
+	keyBlockKey := broadcastValidatorCacheKey{
+		configRootHash:   keyConfig.rootHash,
+		workchain:        0,
+		shard:            topShard,
+		catchainSeqno:    8,
+		validatorSetHash: 22,
+	}
+	keyBlockSet := &blockproof.PreparedValidatorSet{}
+	cache.put(keyBlockKey, keyBlockSet)
+	if set, ok := cache.get(keyBlockKey); !ok || set != keyBlockSet {
+		t.Fatal("new key-block validator set was not cached")
 	}
 }
 

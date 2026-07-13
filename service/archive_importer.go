@@ -27,10 +27,6 @@ const (
 	archiveDownloadWorkerMin                  = 16
 	archiveDownloadWorkerMax                  = 20
 	archiveDownloadWorkerMultiplier           = 4
-	archiveDownloadHotWorkerMin               = 2
-	archiveDownloadHotWorkerMax               = 8
-	archivePrepareHotWorkerMin                = 1
-	archivePrepareHotWorkerMax                = 2
 	archiveCatchUpMaxAdaptiveCheckpointBlocks = 4000
 	archiveCatchUpCheckpointSlowThreshold     = time.Second
 	archiveCatchUpCheckpointFastThreshold     = 400 * time.Millisecond
@@ -66,7 +62,6 @@ type archiveCatchUpRunner struct {
 	checkpointDone                 chan archiveCheckpointResult
 	checkpointStates               appliedStateSet
 	stateCells                     *stateCellWindowCache
-	syncUntilReached               bool
 }
 
 func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *storage.CurrentState, target ton.BlockIDExt) (*storage.CurrentState, error) {
@@ -143,16 +138,20 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			return nil, fmt.Errorf("archive pipeline returned window #%d after current seqno %d", window.startSeqno, r.current.ShardClientSeqno)
 		}
 		if len(window.masterStates) == 0 {
-			if r.syncUntilReached {
+			if window.syncUntilReached {
+				window.releaseImportedData()
 				s.enterSyncUntilOffline(r.current, PreparedBlock{})
 				break
 			}
+			window.releaseImportedData()
 			return nil, fmt.Errorf("archive window #%d did not provide next masterchain blocks", window.startSeqno)
 		}
 
 		applyStarted := time.Now()
 		next, err := r.applyShardClientArchiveWindow(r.ctx, r.current, window)
 		if err != nil {
+			r.dropArchiveWindowImportCache(window)
+			window.releaseImportedData()
 			if isArchiveCatchUpRetryError(err) {
 				if err = r.restartPipeline(err); err != nil {
 					return nil, err
@@ -181,7 +180,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			Msg("archive shard-client window applied")
 
 		if next.ShardClientSeqno <= before {
-			if r.syncUntilReached {
+			if window.syncUntilReached {
 				s.enterSyncUntilOffline(r.current, PreparedBlock{})
 				break
 			}
@@ -198,7 +197,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		if _, err = r.finishCheckpoint(false); err != nil {
 			return nil, err
 		}
-		if r.syncUntilReached {
+		if window.syncUntilReached {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
 				if _, err = r.persistCheckpoint("sync_until"); err != nil {
 					return nil, err
@@ -324,4 +323,15 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		Int("shards", len(r.current.Shards)).
 		Msg(doneMsg)
 	return r.current, nil
+}
+
+func (r *archiveCatchUpRunner) dropArchiveWindowImportCache(window *shardClientArchiveWindow) {
+	if window == nil {
+		return
+	}
+	for _, imported := range window.archiveImports {
+		if imported != nil {
+			r.importCache.drop(imported.cacheKey)
+		}
+	}
 }

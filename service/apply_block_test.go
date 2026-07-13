@@ -859,6 +859,56 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 	}
 }
 
+func TestLoadStateCellEncodedCachesUsesNewestPendingFirst(t *testing.T) {
+	var hash cell.Hash
+	hash[0] = 1
+	olderCell := cell.BeginCell().MustStoreUInt(1, 8).EndCell()
+	newerCell := cell.BeginCell().MustStoreUInt(2, 8).EndCell()
+
+	older := newStateCellEncodedCache(1)
+	older.setRecordLocked(hash, []byte{1})
+	older.decoded[0].Store(olderCell)
+	newer := newStateCellEncodedCache(1)
+	newer.setRecordLocked(hash, []byte{1})
+	newer.decoded[0].Store(newerCell)
+
+	loaded, err := loadStateCellEncodedCaches(nil, []*stateCellEncodedCache{older, newer}, hash, nil)
+	if err != nil {
+		t.Fatalf("load pending cell: %v", err)
+	}
+	if loaded != newerCell {
+		t.Fatal("pending cache lookup did not prefer the newest cache")
+	}
+}
+
+func TestStateCellWindowAdoptRecordsPreservesNewestLookupPriority(t *testing.T) {
+	var hash cell.Hash
+	hash[0] = 1
+	olderCell := cell.BeginCell().MustStoreUInt(1, 8).EndCell()
+	newerCell := cell.BeginCell().MustStoreUInt(2, 8).EndCell()
+
+	older := newStateCellEncodedCache(1)
+	older.setRecordLocked(hash, []byte{1})
+	older.decoded[0].Store(olderCell)
+	newer := newStateCellEncodedCache(1)
+	newer.setRecordLocked(hash, []byte{1})
+	newer.decoded[0].Store(newerCell)
+
+	source := newStateCellWindowCache(nil)
+	source.active = newer
+	source.pending = []*stateCellEncodedCache{older}
+	destination := newStateCellWindowCache(nil)
+	destination.adoptRecordsFrom(source)
+
+	loaded, err := destination.loader()(hash)
+	if err != nil {
+		t.Fatalf("load adopted cell: %v", err)
+	}
+	if loaded != newerCell {
+		t.Fatal("adopted cache lookup did not prefer the newest active source")
+	}
+}
+
 func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 	releasedRoot := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	cache := newStateCellEncodedCache(1)

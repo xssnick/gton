@@ -262,7 +262,8 @@ func loadStateCellEncodedCaches(active *stateCellEncodedCache, pending []*stateC
 	if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err
 	}
-	for _, cache := range pending {
+	for i := len(pending) - 1; i >= 0; i-- {
+		cache := pending[i]
 		loaded, err = cache.loadWith(hash, loader)
 		if err == nil {
 			return loaded, nil
@@ -559,6 +560,17 @@ func (w *stateCellWindowCache) byteSize() uint64 {
 	return total
 }
 
+func (w *stateCellWindowCache) activeByteSize() uint64 {
+	if w == nil {
+		return 0
+	}
+
+	w.mu.RLock()
+	active := w.active
+	w.mu.RUnlock()
+	return active.byteSize()
+}
+
 // adoptRecordsFrom moves the populated record caches of src into this window's
 // pending set, so cells applied through src stay resolvable until they are
 // checkpointed here. Used by archive catch-up when a window is committed.
@@ -569,13 +581,13 @@ func (w *stateCellWindowCache) adoptRecordsFrom(src *stateCellWindowCache) {
 
 	sources := src.loaderSources()
 	caches := make([]*stateCellEncodedCache, 0, 1+len(sources.pending))
-	if sources.active.len() > 0 {
-		caches = append(caches, sources.active)
-	}
 	for _, cache := range sources.pending {
 		if cache.len() > 0 {
 			caches = append(caches, cache)
 		}
+	}
+	if sources.active.len() > 0 {
+		caches = append(caches, sources.active)
 	}
 	if len(caches) == 0 {
 		return
@@ -609,6 +621,15 @@ func cachedLazyCell(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) 
 }
 
 func (c *stateCellCheckpointCache) records() []storage.EncodedCellRecord {
+	if c != nil && len(c.caches) == 1 {
+		// beginCheckpoint detaches this cache from the active writer, so the
+		// record slice stays immutable until complete removes it from pending.
+		cache := c.caches[0]
+		cache.mu.RLock()
+		records := cache.records
+		cache.mu.RUnlock()
+		return records
+	}
 	return c.cells().AppendTo(nil)
 }
 

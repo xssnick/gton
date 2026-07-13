@@ -19,8 +19,10 @@ func downloadPeerID(peer *overlayPeer) PeerID {
 }
 
 type peerUse struct {
-	downloads int
-	pins      int
+	downloads       int
+	queries         int
+	pins            int
+	endpointPending chan struct{}
 }
 
 func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
@@ -29,14 +31,23 @@ func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
 		return func() {}
 	}
 
-	n.peerUseMx.Lock()
-	if n.peerUse == nil {
-		n.peerUse = map[PeerID]peerUse{}
+	for {
+		n.peerUseMx.Lock()
+		if n.peerUse == nil {
+			n.peerUse = map[PeerID]peerUse{}
+		}
+		use := n.peerUse[peerID]
+		if use.endpointPending != nil {
+			done := use.endpointPending
+			n.peerUseMx.Unlock()
+			<-done
+			continue
+		}
+		use.downloads++
+		n.peerUse[peerID] = use
+		n.peerUseMx.Unlock()
+		break
 	}
-	use := n.peerUse[peerID]
-	use.downloads++
-	n.peerUse[peerID] = use
-	n.peerUseMx.Unlock()
 
 	return func() {
 		n.peerUseMx.Lock()
@@ -46,7 +57,47 @@ func (n *Node) acquireDownloadPeer(peer *overlayPeer) func() {
 		if use.downloads > 0 {
 			use.downloads--
 		}
-		if use.downloads == 0 && use.pins == 0 {
+		if use.downloads == 0 && use.queries == 0 && use.pins == 0 && use.endpointPending == nil {
+			delete(n.peerUse, peerID)
+			return
+		}
+		n.peerUse[peerID] = use
+	}
+}
+
+func (n *Node) acquireQueryPeer(peer *overlayPeer) func() {
+	peerID := downloadPeerID(peer)
+	if peerID.IsZero() {
+		return func() {}
+	}
+
+	for {
+		n.peerUseMx.Lock()
+		if n.peerUse == nil {
+			n.peerUse = map[PeerID]peerUse{}
+		}
+		use := n.peerUse[peerID]
+		if use.endpointPending != nil {
+			done := use.endpointPending
+			n.peerUseMx.Unlock()
+			<-done
+			continue
+		}
+		use.queries++
+		n.peerUse[peerID] = use
+		n.peerUseMx.Unlock()
+		break
+	}
+
+	return func() {
+		n.peerUseMx.Lock()
+		defer n.peerUseMx.Unlock()
+
+		use := n.peerUse[peerID]
+		if use.queries > 0 {
+			use.queries--
+		}
+		if use.downloads == 0 && use.queries == 0 && use.pins == 0 && use.endpointPending == nil {
 			delete(n.peerUse, peerID)
 			return
 		}
@@ -89,7 +140,7 @@ func (n *Node) protectedPeerIDs() map[PeerID]struct{} {
 
 	protected := make(map[PeerID]struct{}, len(n.peerUse))
 	for peerID, use := range n.peerUse {
-		if use.downloads > 0 || use.pins > 0 {
+		if use.downloads > 0 || use.queries > 0 || use.pins > 0 || use.endpointPending != nil {
 			protected[peerID] = struct{}{}
 		}
 	}
@@ -118,7 +169,7 @@ func (n *Node) pinPeer(peerID PeerID) func() {
 		if use.pins > 0 {
 			use.pins--
 		}
-		if use.downloads == 0 && use.pins == 0 {
+		if use.downloads == 0 && use.queries == 0 && use.pins == 0 && use.endpointPending == nil {
 			delete(n.peerUse, peerID)
 			return
 		}
@@ -398,7 +449,7 @@ func (n *Node) acquirePreferredStateSnapshotProbe(probes []persistentStatePeerPr
 		if use.downloads > 0 {
 			use.downloads--
 		}
-		if use.downloads == 0 && use.pins == 0 {
+		if use.downloads == 0 && use.queries == 0 && use.pins == 0 && use.endpointPending == nil {
 			delete(n.peerUse, selectedPeerID)
 			return
 		}

@@ -254,7 +254,9 @@ func (s *Store) loadStoredCurrentState(ctx context.Context) (*storage.CurrentSta
 		})
 	}
 
-	s.current = storage.CloneCurrentState(loaded)
+	next := storage.CloneCurrentState(loaded)
+	s.releaseRetiredCurrentCachesLocked(s.current, next)
+	s.current = next
 	s.pendingCurrent = nil
 	s.rememberCurrentBlockStatesLocked(s.current)
 	s.updateMasterchainInfoLocked(s.current)
@@ -418,7 +420,7 @@ func (s *Store) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []b
 }
 
 func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
-	prepared, err := prepareLiveBlockArtifacts(artifacts)
+	prepared, err := prepareLiveBlockArtifacts(artifacts, s.nonFinalEnabled)
 	if err != nil {
 		return err
 	}
@@ -446,7 +448,7 @@ func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) 
 	return nil
 }
 
-func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePreparedBlockArtifacts, error) {
+func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, nonFinalEnabled bool) (livePreparedBlockArtifacts, error) {
 	block := artifacts.Block
 	if !isFullBlockID(&block) {
 		return livePreparedBlockArtifacts{}, storage.ErrNotFound
@@ -514,12 +516,10 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 	}
 
 	messageEntries := artifacts.MessageEntries
-	if messageEntries == nil && root != nil {
+	if nonFinalEnabled && messageEntries == nil && root != nil {
 		// Some tests and availability-only publishers use hash-valid cells that are not
-		// full TLB blocks. The persistent store remains authoritative for locate queries,
-		// so live message indexing is best-effort and must not reject those artifacts.
-		// Publishers that already parsed the block provide entries via MessageEntries
-		// (non-nil, possibly empty) and skip this parse.
+		// full TLB blocks. Non-final locate queries cannot fall back to persistent storage,
+		// so their live message index is best-effort and must not reject those artifacts.
 		if entries, err := storage.MessageTransactionEntriesFromBlockCell(block, root); err == nil {
 			messageEntries = entries
 		}
@@ -603,6 +603,8 @@ func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 	if cached := s.blocks[key]; cached != nil {
 		evictableBefore := s.liveBlockEvictableLocked(cached)
 		cached.artifactFlushed = true
+		cached.messageEntries = nil
+		s.removeMessageTransactionIndexLocked(key)
 		s.adjustLiveEvictableStateLocked(cached, evictableBefore)
 		published := s.publishPendingCurrentLocked()
 		if s.nonFinalEnabled {
@@ -1005,6 +1007,7 @@ func (s *Store) publishPendingCurrentLocked() bool {
 		return false
 	}
 
+	s.releaseRetiredCurrentCachesLocked(s.current, s.pendingCurrent)
 	s.current = s.pendingCurrent
 	s.pendingCurrent = nil
 	s.rememberCurrentBlockStatesLocked(s.current)
@@ -1288,6 +1291,9 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 			s.adjustLiveEvictableLocked(existingKind, -1)
 		}
 	}
+	if block.artifactFlushed {
+		block.messageEntries = nil
+	}
 
 	s.blocks[key] = block
 	s.refreshBlockIndexLocked(block.id)
@@ -1417,6 +1423,26 @@ func (s *Store) rememberCurrentBlockStatesLocked(current *storage.CurrentState) 
 	s.rememberBlockStateLocked(current.Masterchain)
 	for _, shard := range current.Shards {
 		s.rememberBlockStateLocked(shard)
+	}
+}
+
+func (s *Store) releaseRetiredCurrentCachesLocked(previous, next *storage.CurrentState) {
+	if previous == nil {
+		return
+	}
+
+	release := func(block ton.BlockIDExt) {
+		if currentHasBlockState(next, block) {
+			return
+		}
+		if cached := s.blocks[storage.BlockKey(block)]; cached != nil && cached.fragments != nil {
+			cached.fragments.releaseCurrentCaches()
+		}
+	}
+
+	release(previous.Masterchain.Block)
+	for _, shard := range previous.Shards {
+		release(shard.Block)
 	}
 }
 

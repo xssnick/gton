@@ -34,20 +34,22 @@ type BlockView struct {
 	accountsRoot        *cell.Cell
 	shardHeader         RunMethodShardHeader
 
-	masterExtra        *tlb.McStateExtra
-	accountProofs      map[accountProofKey]accountProofValue
-	shardHashesProofs  map[shardHashesProofKey]*cell.Cell
-	baseConfig         *runMethodBaseConfig
-	globalLibs         *cell.Dictionary
-	librariesLoaded    bool
-	extMsgLimits       ExternalMessageSizeLimits
-	extMsgLimitsLoaded bool
-	mcExtraLoad        liveLoadGroup[struct{}, *tlb.McStateExtra]
-	accountProofLoad   liveLoadGroup[accountProofLoadKey, accountProofResult]
-	shardHashesLoad    liveLoadGroup[shardHashesProofKey, *cell.Cell]
-	baseConfigLoad     liveLoadGroup[struct{}, *runMethodBaseConfig]
-	globalLibsLoad     liveLoadGroup[struct{}, *cell.Dictionary]
-	extMsgLimitsLoad   liveLoadGroup[struct{}, ExternalMessageSizeLimits]
+	masterExtra         *tlb.McStateExtra
+	accountProofs       map[accountProofKey]accountProofValue
+	shardHashesProofs   map[shardHashesProofKey]*cell.Cell
+	retainCurrentCaches bool
+	baseConfig          *runMethodBaseConfig
+	globalLibs          *cell.Dictionary
+	librariesLoaded     bool
+	externalMsgAccounts map[externalMessageAccountKey]externalMessageAccountValue
+	extMsgLimits        ExternalMessageSizeLimits
+	extMsgLimitsLoaded  bool
+	mcExtraLoad         liveLoadGroup[struct{}, *tlb.McStateExtra]
+	accountProofLoad    liveLoadGroup[accountProofLoadKey, accountProofResult]
+	shardHashesLoad     liveLoadGroup[shardHashesProofKey, *cell.Cell]
+	baseConfigLoad      liveLoadGroup[struct{}, *runMethodBaseConfig]
+	globalLibsLoad      liveLoadGroup[struct{}, *cell.Dictionary]
+	extMsgLimitsLoad    liveLoadGroup[struct{}, ExternalMessageSizeLimits]
 }
 
 type accountProofKey struct {
@@ -148,7 +150,17 @@ func buildBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.
 		blockStateRootProof: blockProof,
 		accountsRoot:        accountsRoot,
 		shardHeader:         header,
+		retainCurrentCaches: true,
 	}, nil
+}
+
+func (f *BlockView) releaseCurrentCaches() {
+	f.mu.Lock()
+	f.retainCurrentCaches = false
+	f.accountProofs = nil
+	f.shardHashesProofs = nil
+	f.externalMsgAccounts = nil
+	f.mu.Unlock()
 }
 
 func NewBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
@@ -323,6 +335,10 @@ func (f *BlockView) cachedAccountProofResultLocked(key accountProofKey, pruned b
 // rememberAccountProofStateLocked publishes a built proof/state pair, adopting
 // any concurrently stored parts. The caller must hold f.mu.
 func (f *BlockView) rememberAccountProofStateLocked(key accountProofKey, proof []*cell.Cell, state *cell.Cell, pruned bool) accountProofResult {
+	if !f.retainCurrentCaches {
+		return accountProofResult{proof: proof, state: state}
+	}
+
 	if f.accountProofs == nil {
 		f.accountProofs = map[accountProofKey]accountProofValue{}
 	}
@@ -400,6 +416,9 @@ func (f *BlockView) shardHashesProof(workchain int32, shard int64, exact bool) (
 			return proof, proof != nil
 		},
 		func(proof *cell.Cell) *cell.Cell {
+			if !f.retainCurrentCaches {
+				return proof
+			}
 			if cached := f.shardHashesProofs[key]; cached != nil {
 				return cached
 			}

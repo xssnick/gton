@@ -45,6 +45,7 @@ type Server struct {
 	now            func() time.Time
 	zeroState      ton.ZeroStateIDExt
 	routes         map[string]route
+	suspended      suspendedAddressCache
 
 	server   *http.Server
 	listener net.Listener

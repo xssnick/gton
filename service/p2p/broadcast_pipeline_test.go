@@ -198,6 +198,33 @@ func TestClassifyDuplicateIdentifiedBroadcastDoesNotSerializePayload(t *testing.
 	}
 }
 
+func TestAcceptedIdentifiedBroadcastWithoutTargetsDoesNotSerializePayload(t *testing.T) {
+	node := newTestNode(t)
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+	msg := IhrMessageBroadcast{Message: IhrMessage{Data: []byte{0x01}}}
+	payload := newIdentifiedBroadcastPayload(msg, bytes.Repeat([]byte{0xBC}, 32))
+
+	accepted, err := sub.classifyBroadcastPayload(nil, msg, payload, DeliveryTwoStep, false, testPeerID("source"))
+	if err != nil {
+		t.Fatalf("classify identified broadcast: %v", err)
+	}
+	if accepted == nil || accepted.rebroadcast == nil {
+		t.Fatal("identified broadcast was not accepted")
+	}
+	node.acceptBroadcast(*accepted)
+
+	if payload.serialized {
+		t.Fatal("accepted broadcast without rebroadcast targets serialized payload")
+	}
+}
+
 func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	node := newTestNode(t)
 	node.SetBlockCacheObserver(&testBlockCacheObserver{nonfinalEnabled: true})

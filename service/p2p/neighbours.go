@@ -245,6 +245,10 @@ func (s *overlaySubscription) markPeerQueryFailed(peer *overlayPeer) {
 	}
 
 	s.mx.Lock()
+	if s.peers[peer.id] != peer {
+		s.mx.Unlock()
+		return
+	}
 	removed := s.removeNeighbourLocked(peer.id)
 	s.mx.Unlock()
 	if removed {

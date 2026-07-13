@@ -707,21 +707,24 @@ type persistentStateFileRecord struct {
 	size          int64
 	fileHash      []byte
 	stateRootHash []byte
+	cellsCount    uint64
 }
 
 func encodePersistentStateFileRecord(file *storage.PersistentStateFile) []byte {
-	buf := make([]byte, 0, 1+1+len(file.FileHash)+1+len(file.StateRootHash)+8)
+	buf := make([]byte, 0, 1+1+len(file.FileHash)+1+len(file.StateRootHash)+8+8)
 	buf = append(buf, persistentStateVersion)
 	buf = appendLenBytes(buf, file.FileHash)
 	buf = appendLenBytes(buf, file.StateRootHash)
-	return binary.BigEndian.AppendUint64(buf, uint64(file.Ref.Size))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(file.Ref.Size))
+	return binary.BigEndian.AppendUint64(buf, file.CellsCount)
 }
 
 func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, error) {
 	if len(data) < 1+1+1+8 {
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
-	if data[0] != persistentStateVersion {
+	version := data[0]
+	if version != persistentStateVersionV1 && version != persistentStateVersion {
 		return nil, fmt.Errorf("persistent state file version mismatch")
 	}
 	pos := 1
@@ -738,18 +741,44 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 	}
 	pos = next
 
-	if len(data)-pos != 8 {
+	tailSize := 8
+	if version == persistentStateVersion {
+		tailSize += 8
+	}
+	if len(data)-pos != tailSize {
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
 	size := int64(binary.BigEndian.Uint64(data[pos : pos+8]))
 	if size < 0 {
 		return nil, fmt.Errorf("persistent state file size is invalid")
 	}
+	pos += 8
+
+	cellsCount := uint64(0)
+	if version == persistentStateVersion {
+		cellsCount = binary.BigEndian.Uint64(data[pos : pos+8])
+	}
 	return &persistentStateFileRecord{
 		size:          size,
 		fileHash:      fileHash,
 		stateRootHash: stateRootHash,
+		cellsCount:    cellsCount,
 	}, nil
+}
+
+func encodePersistentStateCellsCount(count uint64) []byte {
+	return binary.BigEndian.AppendUint64(nil, count)
+}
+
+func decodePersistentStateCellsCount(data []byte) (uint64, error) {
+	if len(data) != 8 {
+		return 0, fmt.Errorf("persistent state cells count size mismatch: %d", len(data))
+	}
+	count := binary.BigEndian.Uint64(data)
+	if count == 0 {
+		return 0, fmt.Errorf("persistent state cells count is zero")
+	}
+	return count, nil
 }
 
 func appendLenBytes(dst []byte, data []byte) []byte {

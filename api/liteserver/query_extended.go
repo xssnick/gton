@@ -632,10 +632,11 @@ type transactionSearchBlock struct {
 	root    *cell.Cell
 	startLT uint64
 	endLT   uint64
-	// accounts memoizes the block's parsed ShardAccountBlocks so transaction
-	// chains that stay inside one block parse the block prefix only once. The
-	// block is local to a single query handler, so no locking is needed.
-	accounts *tlb.ShardAccountBlocks
+
+	// The parsed dictionaries belong to a single query handler, so chains that
+	// stay inside one block can reuse them without locking.
+	accounts     *tlb.ShardAccountBlocks
+	accountBlock *tlb.AccountBlock
 }
 
 func (b *transactionSearchBlock) findTransaction(account []byte, lt uint64) (*cell.Cell, error) {
@@ -646,7 +647,24 @@ func (b *transactionSearchBlock) findTransaction(account []byte, lt uint64) (*ce
 		}
 		b.accounts = accounts
 	}
-	return findTransactionInAccountBlocks(b.accounts, account, lt)
+	if b.accountBlock == nil {
+		if b.accounts.Accounts == nil {
+			return nil, storage.ErrNotFound
+		}
+
+		value, err := b.accounts.Accounts.LoadValueWithExtra(blockproof.AccountKey(account))
+		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return nil, storage.ErrNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("load account block: %w", err)
+		}
+		b.accountBlock, err = accountBlockFromValue(value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return findTransactionInAccountBlock(b.accountBlock, lt)
 }
 
 func transactionSearchBlockFromRoot(id ton.BlockIDExt, root *cell.Cell) (*transactionSearchBlock, error) {
@@ -813,7 +831,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 		proofRoot = proofBuilder.Root()
 	}
 
-	txs, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
+	txs, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After, true)
 	if err != nil {
 		return errorResponse(err, "cannot list block transactions")
 	}
@@ -872,7 +890,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 		proofRoot = proofBuilder.Root()
 	}
 
-	list, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After)
+	list, err := listBlockTransactions(proofRoot, query.Mode, query.Count, query.After, false)
 	if err != nil {
 		return errorResponse(err, "cannot list block transactions")
 	}
@@ -1040,8 +1058,21 @@ type blockTransactionList struct {
 	incomplete bool
 }
 
-func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after *ton.TransactionID3) (blockTransactionList, error) {
-	data, err := blockTransactionData(root, mode&256 != 0)
+// skipSingleRef bounds an aug dict leaf value of the `^X` shape without
+// materializing the ref.
+func skipSingleRef(loader *cell.Slice) error {
+	return loader.SkipBitsAndRefs(0, 1)
+}
+
+// listBlockTransactions walks ShardAccountBlocks with positioned iterators:
+// one descent to the start position per dictionary instead of a root-to-leaf
+// lookup per returned item, visiting the same cells, so proofs built from a
+// traced root are unchanged. attachMetadata distinguishes the plain variant
+// (metadata objects go into transaction ids) from the Ext one, which only
+// needs the InMsgDescr path visited so the proof retains it.
+func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after *ton.TransactionID3, attachMetadata bool) (blockTransactionList, error) {
+	withMetadata := mode&256 != 0
+	data, err := blockTransactionData(root, withMetadata)
 	if err != nil {
 		return blockTransactionList{}, err
 	}
@@ -1058,36 +1089,34 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 		limit = maxListBlockTransactions
 	}
 
-	startAccount := make([]byte, 32)
-	startLT := uint64(0)
-	if reverse {
-		for i := range startAccount {
-			startAccount[i] = 0xff
-		}
-		startLT = math.MaxUint64
-	}
+	accounts := data.shardAccounts.Accounts.AugmentedDictionary
+	var accIt *cell.AugDictIterator
+	var continueAccount []byte
+	var continueLT uint64
 	if mode&128 != 0 && after != nil {
-		startAccount = after.Account
-		startLT = after.LT
+		continueAccount = after.Account
+		continueLT = after.LT
+		accIt, err = accounts.IteratorExtraAt(blockproof.AccountKey(continueAccount), reverse, false, true)
+	} else {
+		accIt, err = accounts.IteratorExtra(reverse, false)
+	}
+	if err != nil {
+		return blockTransactionList{}, fmt.Errorf("lookup account block: %w", err)
 	}
 
 	out := make([]blockTxItem, 0, limit)
-	currentAccount := startAccount
-	allowSameAccount := true
-	fetchNext := !reverse
 	eof := false
 
 	for len(out) < limit {
-		accountKeyCell, accountValue, err := data.shardAccounts.Accounts.LookupNearestKey(blockproof.AccountKey(currentAccount), fetchNext, allowSameAccount, false)
-		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+		if !accIt.Next() {
+			if err = accIt.Err(); err != nil {
+				return blockTransactionList{}, fmt.Errorf("lookup account block: %w", err)
+			}
 			eof = true
 			break
 		}
-		if err != nil {
-			return blockTransactionList{}, fmt.Errorf("lookup account block: %w", err)
-		}
 
-		accountKeyLoader, err := accountKeyCell.BeginParse()
+		accountKeyLoader, err := accIt.Key().BeginParse()
 		if err != nil {
 			return blockTransactionList{}, fmt.Errorf("begin parse account key: %w", err)
 		}
@@ -1095,68 +1124,67 @@ func listBlockTransactions(root *cell.Cell, mode uint32, reqCount uint32, after 
 		if err != nil {
 			return blockTransactionList{}, fmt.Errorf("load account key: %w", err)
 		}
-		accountBlock, err := accountBlockFromValue(accountValue)
+
+		// acc_trans#5 account_addr:bits256 transactions:(HashmapAug 64 ^Transaction CurrencyCollection)
+		accountValue := accIt.Value()
+		magic, err := accountValue.LoadUInt(4)
 		if err != nil {
-			return blockTransactionList{}, err
+			return blockTransactionList{}, fmt.Errorf("load account block magic: %w", err)
+		}
+		if magic != 0x5 {
+			return blockTransactionList{}, fmt.Errorf("invalid account block magic %x", magic)
+		}
+		if err = accountValue.SkipBits(256); err != nil {
+			return blockTransactionList{}, fmt.Errorf("load account block address: %w", err)
 		}
 
-		txStart := startLT
-		if !bytes.Equal(account, startAccount) {
-			txStart = 0
-			if reverse {
-				txStart = math.MaxUint64
+		var ltIt *cell.AugDictIterator
+		if continueAccount != nil && bytes.Equal(account, continueAccount) {
+			startLT := cell.BeginCell().MustStoreUInt(continueLT, 64).EndCell()
+			ltIt, err = accountValue.AugDictInlineIteratorAt(64, tlb.AugAccountTransactions{}, skipSingleRef, startLT, reverse, false, false)
+		} else {
+			ltIt, err = accountValue.AugDictInlineIterator(64, tlb.AugAccountTransactions{}, skipSingleRef, reverse, false)
+		}
+		if err != nil {
+			return blockTransactionList{}, fmt.Errorf("lookup account transaction: %w", err)
+		}
+
+		for len(out) < limit && ltIt.Next() {
+			txKeyLoader, err := ltIt.Key().BeginParse()
+			if err != nil {
+				return blockTransactionList{}, fmt.Errorf("begin parse transaction lt: %w", err)
 			}
-		}
+			lt, err := txKeyLoader.LoadUInt(64)
+			if err != nil {
+				return blockTransactionList{}, fmt.Errorf("load transaction lt: %w", err)
+			}
+			txCell, err := ltIt.Value().LoadRefCell()
+			if err != nil {
+				return blockTransactionList{}, fmt.Errorf("load transaction cell: %w", err)
+			}
 
-		if accountBlock.Transactions != nil && accountBlock.Transactions.AugmentedDictionary != nil {
-			currentLT := txStart
-			for len(out) < limit {
-				txKeyCell, txValue, err := accountBlock.Transactions.LookupNearestKey(
-					cell.BeginCell().MustStoreUInt(currentLT, 64).EndCell(),
-					fetchNext,
-					false,
-					false,
-				)
-				if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-					break
-				}
-				if err != nil {
-					return blockTransactionList{}, fmt.Errorf("lookup account transaction: %w", err)
-				}
-
-				txKeyLoader, err := txKeyCell.BeginParse()
-				if err != nil {
-					return blockTransactionList{}, fmt.Errorf("begin parse transaction lt: %w", err)
-				}
-				lt, err := txKeyLoader.LoadUInt(64)
-				if err != nil {
-					return blockTransactionList{}, fmt.Errorf("load transaction lt: %w", err)
-				}
-				txCell, err := transactionCellFromValue(txValue)
-				if err != nil {
-					return blockTransactionList{}, err
-				}
-
-				item := blockTxItem{
-					account: account,
-					lt:      lt,
-					hash:    txCell.Hash(),
-					cell:    txCell,
-				}
-				if mode&256 != 0 {
+			item := blockTxItem{
+				account: account,
+				lt:      lt,
+				hash:    txCell.Hash(),
+				cell:    txCell,
+			}
+			if withMetadata {
+				if attachMetadata {
 					metadata, err := transactionMetadata(data.inMsgDescr, txCell)
 					if err != nil {
 						return blockTransactionList{}, err
 					}
 					item.metadata = metadata
+				} else if err = visitTransactionMetadata(data.inMsgDescr, txCell); err != nil {
+					return blockTransactionList{}, err
 				}
-				out = append(out, item)
-				currentLT = lt
 			}
+			out = append(out, item)
 		}
-
-		currentAccount = account
-		allowSameAccount = false
+		if err = ltIt.Err(); err != nil {
+			return blockTransactionList{}, fmt.Errorf("lookup account transaction: %w", err)
+		}
 	}
 
 	return blockTransactionList{items: out, incomplete: !eof}, nil
@@ -1234,8 +1262,29 @@ func blockTransactionData(root *cell.Cell, withMetadata bool) (blockTransactions
 	return blockTransactionsData{shardAccounts: &shardAccounts, inMsgDescr: inMsgDescr}, nil
 }
 
+// skipCurrencyCollection consumes a CurrencyCollection without materializing
+// coin values or the extra-currency dictionary; the skipped dict ref stays
+// unvisited so proof contents are unchanged.
+func skipCurrencyCollection(loader *cell.Slice) error {
+	coinsLen, err := loader.LoadUInt(4)
+	if err != nil {
+		return err
+	}
+	if err = loader.SkipBits(uint(coinsLen) * 8); err != nil {
+		return err
+	}
+	hasExtra, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if !hasExtra {
+		return nil
+	}
+	return loader.SkipBitsAndRefs(0, 1)
+}
+
 func accountBlockFromValue(value *cell.Slice) (*tlb.AccountBlock, error) {
-	if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), value); err != nil {
+	if err := skipCurrencyCollection(value); err != nil {
 		return nil, fmt.Errorf("load account block augmentation: %w", err)
 	}
 
@@ -1247,7 +1296,7 @@ func accountBlockFromValue(value *cell.Slice) (*tlb.AccountBlock, error) {
 }
 
 func transactionCellFromValue(value *cell.Slice) (*cell.Cell, error) {
-	if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), value); err != nil {
+	if err := skipCurrencyCollection(value); err != nil {
 		return nil, fmt.Errorf("load transaction augmentation: %w", err)
 	}
 	txCell, err := value.LoadRefCell()
@@ -1258,22 +1307,35 @@ func transactionCellFromValue(value *cell.Slice) (*cell.Cell, error) {
 }
 
 func transactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell) (*ton.TransactionMetadata, error) {
-	loader, err := txCell.BeginParse()
-	if err != nil {
-		return nil, fmt.Errorf("begin parse transaction: %w", err)
+	envelope, err := transactionInboundMessageEnvelope(inMsgDescr, txCell)
+	if err != nil || envelope == nil {
+		return nil, err
 	}
+	return msgEnvelopeMetadata(envelope)
+}
 
-	var tx tlb.Transaction
-	if err := tlb.LoadFromCell(&tx, loader); err != nil {
-		return nil, fmt.Errorf("load transaction: %w", err)
+// visitTransactionMetadata walks the same InMsgDescr path as transactionMetadata
+// so a traced root retains it in the proof, but only loads the envelope cell
+// without validating the metadata payload, mirroring the C++
+// process_all_in_msg_metadata behaviour of listBlockTransactionsExt.
+func visitTransactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell) error {
+	envelope, err := transactionInboundMessageEnvelope(inMsgDescr, txCell)
+	if err != nil || envelope == nil {
+		return err
 	}
-	if tx.IO.In == nil {
+	if _, err = envelope.BeginParse(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func transactionInboundMessageEnvelope(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell) (*cell.Cell, error) {
+	msg, err := transactionInboundMessageCell(txCell)
+	if err != nil {
+		return nil, err
+	}
+	if msg == nil {
 		return nil, nil
-	}
-
-	msg, err := tx.IO.In.ToCell()
-	if err != nil {
-		return nil, fmt.Errorf("load transaction inbound message: %w", err)
 	}
 
 	msgHash := msg.Hash()
@@ -1299,14 +1361,71 @@ func transactionMetadata(inMsgDescr *cell.AugmentedDictionary, txCell *cell.Cell
 	if err != nil {
 		return nil, err
 	}
-	return msgEnvelopeMetadata(envelope)
+	return envelope, nil
+}
+
+func transactionInboundMessageCell(txCell *cell.Cell) (*cell.Cell, error) {
+	loader, err := txCell.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse transaction: %w", err)
+	}
+
+	magic, err := loader.LoadUInt(4)
+	if err != nil {
+		return nil, fmt.Errorf("load transaction magic: %w", err)
+	}
+	if magic != 0b0111 {
+		return nil, fmt.Errorf("invalid transaction magic %b", magic)
+	}
+	const headerBits = 256 + 64 + 256 + 64 + 32 + 15 + 2 + 2
+	if err = loader.SkipBits(headerBits); err != nil {
+		return nil, fmt.Errorf("load transaction header: %w", err)
+	}
+
+	ioCell, err := loader.LoadRefCell()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction messages: %w", err)
+	}
+	if err = tlb.LoadFromCell(new(tlb.CurrencyCollection), loader); err != nil {
+		return nil, fmt.Errorf("load transaction total fees: %w", err)
+	}
+	if loader.BitsLeft() != 0 || loader.RefsNum() != 2 {
+		return nil, fmt.Errorf("invalid transaction tail: %d bits, %d refs", loader.BitsLeft(), loader.RefsNum())
+	}
+
+	io, err := ioCell.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse transaction messages: %w", err)
+	}
+	hasInbound, err := io.LoadBoolBit()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction inbound message flag: %w", err)
+	}
+	var inbound *cell.Cell
+	if hasInbound {
+		inbound, err = io.LoadRefCell()
+		if err != nil {
+			return nil, fmt.Errorf("load transaction inbound message: %w", err)
+		}
+	}
+	if _, err = io.LoadDict(15); err != nil {
+		return nil, fmt.Errorf("load transaction outbound messages: %w", err)
+	}
+	if io.BitsLeft() != 0 || io.RefsNum() != 0 {
+		return nil, fmt.Errorf("invalid transaction messages tail: %d bits, %d refs", io.BitsLeft(), io.RefsNum())
+	}
+	return inbound, nil
 }
 
 func skipImportFees(loader *cell.Slice) error {
-	if _, err := loader.LoadBigCoins(); err != nil {
+	coinsLen, err := loader.LoadUInt(4)
+	if err != nil {
 		return err
 	}
-	return tlb.LoadFromCell(new(tlb.CurrencyCollection), loader)
+	if err = loader.SkipBits(uint(coinsLen) * 8); err != nil {
+		return err
+	}
+	return skipCurrencyCollection(loader)
 }
 
 func inMsgEnvelope(loader *cell.Slice) (*cell.Cell, error) {
@@ -1449,6 +1568,10 @@ func findTransactionInAccountBlocks(shardAccounts *tlb.ShardAccountBlocks, accou
 	if err != nil {
 		return nil, err
 	}
+	return findTransactionInAccountBlock(accountBlock, lt)
+}
+
+func findTransactionInAccountBlock(accountBlock *tlb.AccountBlock, lt uint64) (*cell.Cell, error) {
 	if accountBlock.Transactions == nil {
 		return nil, storage.ErrNotFound
 	}

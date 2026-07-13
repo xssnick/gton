@@ -891,6 +891,170 @@ type pooledPeer struct {
 	overlayRefs map[string]int
 }
 
+var errPeerEndpointBusy = errors.New("peer endpoint is in active use")
+
+// acquirePeerEndpoint treats the first connection for a PeerID as canonical.
+// Later DHT announcements reuse that transport instead of changing its route.
+func (n *Node) acquirePeerEndpoint(peerID PeerID, addr string, key ed25519.PublicKey) (*pooledPeer, func(), error) {
+	if err := validatePeerEndpointIdentity(peerID, key); err != nil {
+		return nil, nil, err
+	}
+
+	n.peerUseMx.Lock()
+	if n.peerUse == nil {
+		n.peerUse = map[PeerID]peerUse{}
+	}
+	use := n.peerUse[peerID]
+	if use.endpointPending != nil {
+		n.peerUseMx.Unlock()
+		return nil, nil, errPeerEndpointBusy
+	}
+
+	n.pool.mx.Lock()
+	pooled := n.pool.peers[peerID]
+	if pooled != nil {
+		pooled.refs++
+		n.pool.mx.Unlock()
+
+		use.queries++
+		n.peerUse[peerID] = use
+		n.peerUseMx.Unlock()
+		return pooled, n.releasePeerEndpoint(peerID, pooled, nil), nil
+	}
+	n.pool.mx.Unlock()
+
+	if use.downloads > 0 || use.queries > 0 {
+		n.peerUseMx.Unlock()
+		return nil, nil, errPeerEndpointBusy
+	}
+
+	pending := make(chan struct{})
+	use.endpointPending = pending
+	n.peerUse[peerID] = use
+	n.peerUseMx.Unlock()
+
+	connected, err := n.pool.Get(addr, key)
+	if err != nil {
+		n.cancelPeerEndpointPending(peerID, pending)
+		return nil, nil, err
+	}
+	pooled = connected
+	if pooled.id != peerID {
+		n.pool.closeIfUnused(pooled)
+		n.cancelPeerEndpointPending(peerID, pending)
+		return nil, nil, fmt.Errorf("peer endpoint identity mismatch: got %s want %s", pooled.id.String(), peerID.String())
+	}
+	if !n.pool.retain(pooled) {
+		n.cancelPeerEndpointPending(peerID, pending)
+		return nil, nil, errors.New("peer endpoint disconnected during acquisition")
+	}
+
+	n.peerUseMx.Lock()
+	use = n.peerUse[peerID]
+	use.queries++
+	n.peerUse[peerID] = use
+	n.peerUseMx.Unlock()
+	return pooled, n.releasePeerEndpoint(peerID, pooled, pending), nil
+}
+
+// acquireArchivePeerEndpoint retains the canonical transport without entering
+// ordinary live query/download accounting. The returned overlay handle has its
+// own lifetime and can therefore be rotated by the archive pool independently
+// from the live overlay roster.
+func (n *Node) acquireArchivePeerEndpoint(peerID PeerID, addr string, key ed25519.PublicKey) (*pooledPeer, func(), error) {
+	if err := validatePeerEndpointIdentity(peerID, key); err != nil {
+		return nil, nil, err
+	}
+	if pooled := n.pool.retainByID(peerID); pooled != nil {
+		return pooled, releaseRetainedPeer(n.pool, pooled), nil
+	}
+
+	pooled, err := n.pool.Get(addr, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pooled.id != peerID {
+		n.pool.closeIfUnused(pooled)
+		return nil, nil, fmt.Errorf("peer endpoint identity mismatch: got %s want %s", pooled.id.String(), peerID.String())
+	}
+	if !n.pool.retain(pooled) {
+		return nil, nil, errors.New("peer endpoint disconnected during acquisition")
+	}
+	return pooled, releaseRetainedPeer(n.pool, pooled), nil
+}
+
+func validatePeerEndpointIdentity(peerID PeerID, key ed25519.PublicKey) error {
+	if peerID.IsZero() {
+		return errors.New("peer endpoint identity is empty")
+	}
+	if len(key) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid peer endpoint public key size %d", len(key))
+	}
+	rawID, err := tl.Hash(keys.PublicKeyED25519{Key: key})
+	if err != nil {
+		return fmt.Errorf("hash peer endpoint public key: %w", err)
+	}
+	keyID, err := NewPeerID(rawID)
+	if err != nil {
+		return fmt.Errorf("parse peer endpoint identity: %w", err)
+	}
+	if keyID != peerID {
+		return fmt.Errorf("peer endpoint public key does not match identity %s", peerID.String())
+	}
+	return nil
+}
+
+func releaseRetainedPeer(pool *peerPool, peer *pooledPeer) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			pool.releaseRetained(peer)
+		})
+	}
+}
+
+func (n *Node) releasePeerEndpoint(peerID PeerID, pooled *pooledPeer, pending chan struct{}) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			n.peerUseMx.Lock()
+			use := n.peerUse[peerID]
+			if use.queries > 0 {
+				use.queries--
+			}
+			if pending != nil && use.endpointPending == pending {
+				use.endpointPending = nil
+				close(pending)
+			}
+			if use.downloads == 0 && use.queries == 0 && use.pins == 0 && use.endpointPending == nil {
+				delete(n.peerUse, peerID)
+			} else {
+				n.peerUse[peerID] = use
+			}
+			n.peerUseMx.Unlock()
+
+			n.pool.releaseRetained(pooled)
+		})
+	}
+}
+
+func (n *Node) cancelPeerEndpointPending(peerID PeerID, pending chan struct{}) {
+	n.peerUseMx.Lock()
+	defer n.peerUseMx.Unlock()
+
+	use := n.peerUse[peerID]
+	if use.endpointPending != pending {
+		return
+	}
+	use.endpointPending = nil
+	close(pending)
+	if use.downloads == 0 && use.queries == 0 && use.pins == 0 {
+		delete(n.peerUse, peerID)
+		return
+	}
+	n.peerUse[peerID] = use
+}
+
 func newPeerPool(gateway *adnl.Gateway) *peerPool {
 	return &peerPool{
 		gateway: gateway,
@@ -938,12 +1102,18 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 		overlayRefs: map[string]int{},
 	}
 	rldpClient.SetOnDisconnect(func() {
-		p.mx.Lock()
-		delete(p.peers, id)
-		p.mx.Unlock()
+		p.removeDisconnected(id, pooled)
 	})
 	p.peers[id] = pooled
 	return pooled, true, nil
+}
+
+func (p *peerPool) removeDisconnected(id PeerID, disconnected *pooledPeer) {
+	p.mx.Lock()
+	if p.peers[id] == disconnected {
+		delete(p.peers, id)
+	}
+	p.mx.Unlock()
 }
 
 func (p *peerPool) acquireOverlay(pooled *pooledPeer, overlayID []byte, maxUnauthBroadcastSize uint32, allowBroadcastFEC bool, trustUnauthorizedBroadcast bool) (*overlay.ADNLOverlayWrapper, *overlay.RLDPOverlayWrapper, func()) {
@@ -1011,6 +1181,51 @@ func (p *peerPool) closeIfUnused(pooled *pooledPeer) {
 
 	p.mx.Lock()
 	if pooled.refs == 0 && len(pooled.overlayRefs) == 0 && p.peers[pooled.id] == pooled {
+		delete(p.peers, pooled.id)
+		closeBase = pooled
+	}
+	p.mx.Unlock()
+
+	if closeBase != nil {
+		closeBase.close()
+	}
+}
+
+func (p *peerPool) retain(pooled *pooledPeer) bool {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if p.peers[pooled.id] != pooled {
+		return false
+	}
+	pooled.refs++
+	return true
+}
+
+func (p *peerPool) retainByID(peerID PeerID) *pooledPeer {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	pooled := p.peers[peerID]
+	if pooled == nil {
+		return nil
+	}
+	pooled.refs++
+	return pooled
+}
+
+func (p *peerPool) releaseRetained(pooled *pooledPeer) {
+	if pooled == nil {
+		return
+	}
+
+	var closeBase *pooledPeer
+
+	p.mx.Lock()
+	if pooled.refs > 0 {
+		pooled.refs--
+	}
+	if pooled.refs == 0 && p.peers[pooled.id] == pooled {
 		delete(p.peers, pooled.id)
 		closeBase = pooled
 	}
@@ -1320,19 +1535,39 @@ func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, 
 	return sub, true
 }
 
+func (n *Node) getOrActivateSubscription(spec overlaySpec) (*overlaySubscription, bool) {
+	key := overlaySpecKey(spec)
+	for {
+		sub, _ := n.getOrCreateSubscription(spec)
+
+		n.subscriptionsMx.Lock()
+		if n.subscriptions[key] != sub {
+			n.subscriptionsMx.Unlock()
+			continue
+		}
+		sub.mx.Lock()
+		reactivated := sub.setActiveLocked(true, time.Time{})
+		sub.mx.Unlock()
+		n.subscriptionsMx.Unlock()
+		return sub, reactivated
+	}
+}
+
 func (n *Node) subscriptionForBlock(block ton.BlockIDExt) (*overlaySubscription, error) {
+	return n.subscriptionForOverlayBlock(n.overlayBlockForDownload(block))
+}
+
+func (n *Node) subscriptionForOverlayBlock(block ton.BlockIDExt) (*overlaySubscription, error) {
 	if len(n.zeroStateFileHash) == 0 {
 		return nil, errors.New("node is not started")
 	}
 
-	overlayBlock := n.overlayBlockForDownload(block)
-	spec, err := buildOverlaySpec(n.zeroStateFileHash, overlayBlock.Workchain, overlayBlock.Shard, overlayName(overlayBlock.Workchain, overlayBlock.Shard))
+	spec, err := buildOverlaySpec(n.zeroStateFileHash, block.Workchain, block.Shard, overlayName(block.Workchain, block.Shard))
 	if err != nil {
 		return nil, fmt.Errorf("build overlay for %s: %w", formatBlockRef(block), err)
 	}
 
-	sub, _ := n.getOrCreateSubscription(spec)
-	sub.setActive(true, time.Time{})
+	sub, _ := n.getOrActivateSubscription(spec)
 	n.startSubscription(sub)
 	return sub, nil
 }
@@ -1362,8 +1597,8 @@ func (n *Node) SetActiveShardOverlays(blocks []ton.BlockIDExt) error {
 		key := overlaySpecKey(spec)
 		active[key] = struct{}{}
 
-		sub, _ := n.getOrCreateSubscription(spec)
-		if sub.setActive(true, time.Time{}) {
+		sub, reactivated := n.getOrActivateSubscription(spec)
+		if reactivated {
 			n.log.Debug().
 				Str("overlay", spec.Name).
 				Msg("reactivated shard overlay")
@@ -1471,20 +1706,21 @@ func (n *Node) stopExpiredInactiveSubscriptions(now time.Time) {
 }
 
 func (n *Node) deleteInactiveSubscription(key string, sub *overlaySubscription, now time.Time) bool {
-	if !sub.inactiveExpired(now) {
-		return false
-	}
-
 	n.subscriptionsMx.Lock()
 	if n.subscriptions[key] != sub {
 		n.subscriptionsMx.Unlock()
 		return false
 	}
-	if !sub.inactiveExpired(now) {
+
+	sub.mx.Lock()
+	if !sub.inactiveExpiredLocked(now) {
+		sub.mx.Unlock()
 		n.subscriptionsMx.Unlock()
 		return false
 	}
 	delete(n.subscriptions, key)
+	sub.removed = true
+	sub.mx.Unlock()
 	n.subscriptionsMx.Unlock()
 
 	sub.close()

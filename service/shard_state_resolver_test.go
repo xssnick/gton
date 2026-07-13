@@ -140,6 +140,33 @@ func TestShardStateResolverResolvesMergeFromTwoChildren(t *testing.T) {
 	}
 }
 
+func TestShardStateResolverCacheEvictionRetainsNewestBatch(t *testing.T) {
+	resolver := &shardStateResolver{
+		cache: make(map[storage.BlockRootHash]*storage.BlockState, shardStateResolverCacheLimit+1),
+	}
+	for seqno := uint32(0); seqno <= shardStateResolverCacheLimit; seqno++ {
+		block := testBlockID(0, topShard, seqno)
+		resolver.cache[storage.BlockKey(block)] = &storage.BlockState{Block: block}
+	}
+
+	resolver.evictCacheLocked()
+
+	if got := len(resolver.cache); got != shardStateResolverCacheRetain {
+		t.Fatalf("resolver cache size = %d, want %d", got, shardStateResolverCacheRetain)
+	}
+	removed := shardStateResolverCacheLimit + 1 - shardStateResolverCacheRetain
+	for seqno := uint32(0); seqno < uint32(removed); seqno++ {
+		if _, ok := resolver.cache[storage.BlockKey(testBlockID(0, topShard, seqno))]; ok {
+			t.Fatalf("old shard state seqno %d remained cached", seqno)
+		}
+	}
+	for seqno := uint32(removed); seqno <= shardStateResolverCacheLimit; seqno++ {
+		if _, ok := resolver.cache[storage.BlockKey(testBlockID(0, topShard, seqno))]; !ok {
+			t.Fatalf("new shard state seqno %d was evicted", seqno)
+		}
+	}
+}
+
 func TestValidateShardDescriptionPrefetchUsesRelatedCurrentShard(t *testing.T) {
 	parent := testBlockID(0, topShard, 10)
 	leftShard := int64(tlb.ShardID(uint64(parent.Shard)).GetChild(true))

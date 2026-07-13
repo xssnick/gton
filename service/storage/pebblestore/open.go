@@ -288,6 +288,7 @@ func Open(opts Options) (*Store, error) {
 		Bool("pebble_value_blocks", false).
 		Int64("cell_lbase_max_bytes", defaultPebbleCellLBaseMaxBytes).
 		Int("state_cell_import_batch_target_bytes", stateCellImportBatchTargetBytes).
+		Int("state_boc_import_max_batch_bytes", stateBOCImportMaxBatchBytes).
 		Int("artifact_file_max_open", opts.ArtifactFileMaxOpen).
 		Int("cell_memtable_stop_writes_threshold", opts.CellMemTableStopWritesThreshold).
 		Int("cell_l0_compaction_threshold", defaultPebbleCellL0CompactionThreshold).

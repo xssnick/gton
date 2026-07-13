@@ -174,7 +174,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 		return false, nil
 	}
 
-	prepared, err := prepareLiveBlockArtifacts(artifacts)
+	prepared, err := prepareLiveBlockArtifacts(artifacts, s.nonFinalEnabled)
 	if err != nil {
 		if keepWaiting {
 			s.deleteNonfinalWaiting(block)

@@ -288,7 +288,7 @@ func (s *Service) applyMasterchainTransition(ctx context.Context, current *stora
 // beginNextBlockCheckpointLocked validates persist availability and prepares
 // the checkpoint. Called with currentStatePersistMu held; on error the mutex
 // is released before returning.
-func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
+func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64) (stateCheckpointData, error) {
 	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		s.currentStatePersistMu.Unlock()
 		return stateCheckpointData{}, err
@@ -298,6 +298,7 @@ func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, 
 		s.currentStatePersistMu.Unlock()
 		return stateCheckpointData{}, err
 	}
+	checkpoint.artifactPrewriteTarget = artifactPrewriteTarget
 	timing.checkpoints++
 	return checkpoint, nil
 }
@@ -308,7 +309,7 @@ func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, 
 // become visible to the next flush before the mutex is released.
 func (s *Service) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint stateCheckpointData, cells *stateCellCheckpointCache, onCommitted func(), onError func(error)) (*storage.CurrentState, []SyncPersistStageObservation, time.Duration, error) {
 	started := time.Now()
-	committed, stages, err := s.saveStateCheckpoint(ctx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget)
+	committed, stages, err := s.saveStateCheckpoint(ctx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget, checkpoint.artifactPrewriteTarget)
 	elapsed := time.Since(started)
 	if err != nil {
 		if onError != nil {
@@ -326,8 +327,8 @@ func (s *Service) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint 
 	return committed, stages, elapsed, nil
 }
 
-func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
-	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells)
+func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
+	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
 	if err != nil {
 		return nil, err
 	}
@@ -395,8 +396,8 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 	return checkpoint.live, nil
 }
 
-func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
-	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells)
+func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
+	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
 	if err != nil {
 		return nil, err
 	}

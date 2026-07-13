@@ -864,7 +864,7 @@ func (s *overlaySubscription) handlePeerQueryFailure(peer *overlayPeer, err erro
 	}
 
 	if errors.Is(err, adnl.ErrPeerConnClosed) || !peer.hasOpenConnection() {
-		s.removePeer(peer.id)
+		s.removePeerIfCurrent(peer)
 		return
 	}
 
@@ -1342,7 +1342,7 @@ func decodeCompressedBlockV2WithProofRoot(data DataFullCompressedV2, state *cell
 		return nil, ErrCompressedBlockStateNotReady
 	}
 
-	roots, err := cell.DecompressBOC(data.BlockCompressed, maxDecompressedBlockSize, state)
+	roots, block, err := cell.DecompressBOCSerialized(data.BlockCompressed, maxDecompressedBlockSize, state, compressedBlockRootSerializeOptions)
 	if err != nil {
 		return nil, fmt.Errorf("decompress tonNode.dataFullCompressedV2: %w", err)
 	}
@@ -1350,7 +1350,6 @@ func decodeCompressedBlockV2WithProofRoot(data DataFullCompressedV2, state *cell
 		return nil, fmt.Errorf("expected 1 root in tonNode.dataFullCompressedV2, got %d", len(roots))
 	}
 
-	block := serializeCompressedBlockRoot(roots[0])
 	return newVerifiedDownloadedBlockWithProofShape(
 		"tonNode.dataFullCompressedV2",
 		data.ID,
@@ -1372,12 +1371,11 @@ func decodeCompressedBlockV2WithProofRootForHardfork(data DataFullCompressedV2, 
 		return nil, cause
 	}
 
-	roots, err := cell.DecompressBOC(data.BlockCompressed, maxDecompressedBlockSize, state)
+	roots, block, err := cell.DecompressBOCSerialized(data.BlockCompressed, maxDecompressedBlockSize, state, compressedBlockRootSerializeOptions)
 	if err != nil || len(roots) != 1 {
 		return nil, cause
 	}
 
-	block := serializeCompressedBlockRoot(roots[0])
 	return newVerifiedDownloadedHardforkBlock("tonNode.dataFullCompressedV2", data.ID, data.Proof, block, data.IsLink, proofRoot, roots[0], cause)
 }
 
@@ -1464,11 +1462,15 @@ func decodeRawDownloadedBlock(kind string, id ton.BlockIDExt, proof []byte, data
 }
 
 func decodeRawDownloadedBlockWithProofRoot(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell) (*DownloadedBlock, error) {
+	return decodeRawDownloadedBlockWithShape(kind, id, proof, data, isLink, proofRoot, true)
+}
+
+func decodeRawDownloadedBlockWithShape(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, validateStateUpdate bool) (*DownloadedBlock, error) {
 	blockRoot, err := parseDownloadedBlockData(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s block: %w", kind, err)
 	}
-	return newVerifiedDownloadedBlockWithProofShape(
+	return newVerifiedDownloadedBlockWithShape(
 		kind,
 		id,
 		proof,
@@ -1477,6 +1479,7 @@ func decodeRawDownloadedBlockWithProofRoot(kind string, id ton.BlockIDExt, proof
 		proofRoot,
 		blockRoot,
 		false,
+		validateStateUpdate,
 	)
 }
 
@@ -1525,6 +1528,15 @@ func newVerifiedDownloadedHardforkBlock(kind string, id ton.BlockIDExt, proof []
 }
 
 func newVerifiedDownloadedBlockWithProofShape(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, blockRoot *cell.Cell, hardfork bool) (*DownloadedBlock, error) {
+	return newVerifiedDownloadedBlockWithShape(kind, id, proof, data, isLink, proofRoot, blockRoot, hardfork, true)
+}
+
+// newVerifiedDownloadedBlockWithShape verifies and assembles a downloaded
+// block. validateStateUpdate runs the standalone merkle-update consistency
+// walk; broadcast decode paths skip it because the block content is anchored
+// by the root/file hash checks below plus validator signatures, and the apply
+// path re-validates the update against the actual previous state.
+func newVerifiedDownloadedBlockWithShape(kind string, id ton.BlockIDExt, proof []byte, data []byte, isLink bool, proofRoot *cell.Cell, blockRoot *cell.Cell, hardfork bool, validateStateUpdate bool) (*DownloadedBlock, error) {
 	if len(proof) == 0 {
 		return nil, fmt.Errorf("%s proof is empty", kind)
 	}
@@ -1569,8 +1581,10 @@ func newVerifiedDownloadedBlockWithProofShape(kind string, id ton.BlockIDExt, pr
 	if parsed.StateUpdate == nil {
 		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
 	}
-	if err := cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
-		return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
+	if validateStateUpdate {
+		if err := cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
+			return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
+		}
 	}
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
 	if err != nil {
@@ -1634,11 +1648,16 @@ func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
 	}
 }
 
+// compressedBlockRootSerializeOptions reproduce the canonical block file
+// serialization, so the sha256 of the produced bytes matches the block file
+// hash.
+var compressedBlockRootSerializeOptions = cell.BOCSerializeOptions{
+	WithCRC32C:    true,
+	WithIndex:     true,
+	WithCacheBits: true,
+	WithIntHashes: true,
+}
+
 func serializeCompressedBlockRoot(root *cell.Cell) []byte {
-	return root.ToBOCWithOptions(cell.BOCSerializeOptions{
-		WithCRC32C:    true,
-		WithIndex:     true,
-		WithCacheBits: true,
-		WithIntHashes: true,
-	})
+	return root.ToBOCWithOptions(compressedBlockRootSerializeOptions)
 }

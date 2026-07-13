@@ -42,7 +42,7 @@ type masterBlockMetaForStateSerialization struct {
 }
 
 func (s *Service) processPersistentStateSerialization(ctx context.Context) error {
-	if s.syncUntilFrozen() {
+	if s.syncUntilFrozen() || !s.automaticStateSerializationReady.Load() {
 		return nil
 	}
 

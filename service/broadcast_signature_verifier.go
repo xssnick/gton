@@ -32,7 +32,6 @@ type broadcastValidatorCacheKey struct {
 
 type broadcastValidatorCache struct {
 	mu             sync.Mutex
-	configBlock    storage.BlockRootHash
 	configBlockSeq uint32
 	config         broadcastValidatorConfig
 	configLoaded   bool
@@ -41,49 +40,33 @@ type broadcastValidatorCache struct {
 	entries        map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet
 }
 
-func (c *broadcastValidatorCache) getConfig(block ton.BlockIDExt) (broadcastValidatorConfig, bool) {
-	key := storage.BlockKey(block)
-
+func (c *broadcastValidatorCache) getConfig() (broadcastValidatorConfig, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.configLoaded {
 		return broadcastValidatorConfig{}, false
 	}
-	if block.SeqNo < c.configBlockSeq {
-		return broadcastValidatorConfig{}, false
-	}
-	if block.SeqNo == c.configBlockSeq && c.configBlock != key {
-		return broadcastValidatorConfig{}, false
-	}
 	return c.config, true
 }
 
 func (c *broadcastValidatorCache) putConfig(block ton.BlockIDExt, config broadcastValidatorConfig) broadcastValidatorConfig {
-	key := storage.BlockKey(block)
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.configBlock = key
+	if c.configLoaded && block.SeqNo <= c.configBlockSeq {
+		return c.config
+	}
+
 	c.configBlockSeq = block.SeqNo
 	c.config = config
 	c.configLoaded = true
-	return config
-}
-
-func (c *broadcastValidatorCache) reset() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.configBlock = storage.BlockRootHash{}
-	c.configBlockSeq = 0
-	c.config = broadcastValidatorConfig{}
-	c.configLoaded = false
-	c.configRootHash = cell.Hash{}
-	c.initialized = false
-	clear(c.entries)
-	c.entries = nil
+	if !c.initialized || c.configRootHash != config.rootHash {
+		c.configRootHash = config.rootHash
+		c.initialized = true
+		c.entries = make(map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet)
+	}
+	return c.config
 }
 
 func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) (*blockproof.PreparedValidatorSet, bool) {
@@ -101,6 +84,9 @@ func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *block
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.configLoaded && c.config.rootHash != key.configRootHash {
+		return set
+	}
 	if !c.initialized || c.configRootHash != key.configRootHash {
 		c.configRootHash = key.configRootHash
 		c.initialized = true
@@ -291,16 +277,16 @@ func broadcastValidatorSetFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockI
 }
 
 func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcastValidatorConfig, error) {
+	if config, ok := s.broadcastValidatorCache.getConfig(); ok {
+		return config, nil
+	}
+
 	current, err := s.currentStatusSnapshot(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return broadcastValidatorConfig{}, fmt.Errorf("%w: load live current state for broadcast signature check: %w", p2p.ErrBroadcastSignatureRetryable, err)
 		}
 		return broadcastValidatorConfig{}, fmt.Errorf("load live current state for broadcast signature check: %w", err)
-	}
-
-	if config, ok := s.broadcastValidatorCache.getConfig(current.Masterchain.Block); ok {
-		return config, nil
 	}
 
 	masterState, err := s.loadMasterStateForConsensus(ctx, current.Masterchain.Block)
@@ -310,15 +296,23 @@ func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcas
 		}
 		return broadcastValidatorConfig{}, fmt.Errorf("load masterchain state %s for broadcast signature check: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}
-	cfg, err := blockproof.ConfigFromMasterchainState(masterState)
+	config, err := broadcastValidatorConfigFromMasterchainState(masterState)
+	if err != nil {
+		return broadcastValidatorConfig{}, err
+	}
+	return s.broadcastValidatorCache.putConfig(current.Masterchain.Block, config), nil
+}
+
+func broadcastValidatorConfigFromMasterchainState(state *storage.BlockState) (broadcastValidatorConfig, error) {
+	cfg, err := blockproof.ConfigFromMasterchainState(state)
 	if err != nil {
 		return broadcastValidatorConfig{}, err
 	}
 	if cfg.Root == nil {
-		return broadcastValidatorConfig{}, fmt.Errorf("masterchain state %s has empty validator config root", storage.FormatBlockRef(current.Masterchain.Block))
+		return broadcastValidatorConfig{}, fmt.Errorf("masterchain state %s has empty validator config root", storage.FormatBlockRef(state.Block))
 	}
-	return s.broadcastValidatorCache.putConfig(current.Masterchain.Block, broadcastValidatorConfig{
+	return broadcastValidatorConfig{
 		rootHash: cfg.Root.HashKey(),
 		cfg:      cfg,
-	}), nil
+	}, nil
 }

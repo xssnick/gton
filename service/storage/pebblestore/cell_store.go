@@ -347,8 +347,11 @@ func (c *cellStore) has(hash []byte) (bool, error) {
 	return pebbleReaderHas(shard.db, hash)
 }
 
-func (c *cellStore) newBatchWriter() *cellBatchWriter {
-	return &cellBatchWriter{store: c}
+func (c *cellStore) newBatchWriter(shardBatchInitialSize int) *cellBatchWriter {
+	return &cellBatchWriter{
+		store:                 c,
+		shardBatchInitialSize: shardBatchInitialSize,
+	}
 }
 
 func (c *cellStore) flush() error {
@@ -486,7 +489,8 @@ func (c *cellStore) ioStatus(now time.Time) [cellDBShardCount]cellStoreIOStatus 
 }
 
 type cellBatchWriter struct {
-	store *cellStore
+	store                 *cellStore
+	shardBatchInitialSize int
 
 	batches [cellDBShardCount]*pebble.Batch
 
@@ -618,13 +622,12 @@ func (w *cellBatchWriter) ensureBatch(hash []byte) (int, error) {
 		return 0, err
 	}
 	if w.batches[idx] == nil {
-		w.batches[idx] = newCellShardBatch(shard.db)
+		w.batches[idx] = newCellShardBatch(shard.db, w.shardBatchInitialSize)
 	}
 	return idx, nil
 }
 
-func newCellShardBatch(db *pebble.DB) *pebble.Batch {
-	size := cellShardBatchInitialSize()
+func newCellShardBatch(db *pebble.DB, size int) *pebble.Batch {
 	return db.NewBatchWithSize(size, pebble.WithMaxRetainedSizeBytes(size))
 }
 
@@ -636,8 +639,8 @@ func cellShardMemTableSize(total int) int {
 	return shard
 }
 
-func cellShardBatchInitialSize() int {
-	size := stateCellImportBatchTargetBytes / cellDBShardCount
+func cellShardBatchInitialSize(aggregateBytes int) int {
+	size := aggregateBytes / cellDBShardCount
 	if size < 1<<20 {
 		return 1 << 20
 	}

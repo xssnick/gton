@@ -54,6 +54,30 @@ func TestMaintenanceTasksSkipAfterSyncUntilFrozen(t *testing.T) {
 	svc.afterPersistentStateSerialized(context.Background(), testBlockID(-1, topShard, 100), PersistentStateSerializationAll)
 }
 
+func TestAutomaticStateSerializationWaitsForNextSync(t *testing.T) {
+	svc := &Service{
+		stateSerializer: &stateSerializer{},
+		maintenanceWake: make(chan struct{}, 1),
+	}
+
+	if err := svc.processPersistentStateSerialization(context.Background()); err != nil {
+		t.Fatalf("state serialization before next sync: %v", err)
+	}
+	if svc.automaticStateSerializationReady.Load() {
+		t.Fatal("automatic state serialization is ready before next sync")
+	}
+
+	svc.enableAutomaticStateSerialization()
+	if !svc.automaticStateSerializationReady.Load() {
+		t.Fatal("automatic state serialization is not ready after next sync starts")
+	}
+	select {
+	case <-svc.maintenanceWake:
+	default:
+		t.Fatal("maintenance worker was not woken after next sync started")
+	}
+}
+
 func TestNextServiceMaintenanceTaskPriority(t *testing.T) {
 	tests := []struct {
 		name             string

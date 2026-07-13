@@ -13,6 +13,7 @@ type archiveImportResult struct {
 	stats      *archive.ImportStats
 	blocks     map[storage.BlockRootHash]PreparedBlock
 	splitDepth uint32
+	cacheKey   archiveImportCacheKey
 }
 
 type archiveImportCacheKey struct {
@@ -117,6 +118,16 @@ func (c *archiveImportCache) loadOnce(ctx context.Context, key archiveImportCach
 	return archiveImportCacheLoad{archiveImportDownload: archiveImportDownload{imported: result}}, err
 }
 
+func (c *archiveImportCache) drop(key archiveImportCacheKey) {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
+}
+
 func (c *archiveImportCache) dropBefore(masterchainSeqno uint32) {
 	if c == nil {
 		return
@@ -159,6 +170,7 @@ func cloneArchiveImportResult(result *archiveImportResult) *archiveImportResult 
 		stats:      cloneImportStats(result.stats),
 		blocks:     make(map[storage.BlockRootHash]PreparedBlock, len(result.blocks)),
 		splitDepth: result.splitDepth,
+		cacheKey:   result.cacheKey,
 	}
 	for key, block := range result.blocks {
 		if block.Meta != nil {
