@@ -18,92 +18,232 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestTryLocateTransactionUsesMessageIndex(t *testing.T) {
+func TestTryLocateSourceTransactionFromBlock(t *testing.T) {
 	account := bytes.Repeat([]byte{0x55}, 32)
-	source := bytes.Repeat([]byte{0x10}, 32)
 	destination := bytes.Repeat([]byte{0x20}, 32)
-	inLT := uint64(777)
-	outLT := uint64(778)
+	foreignAccount := bytes.Repeat([]byte{0x01}, 32)
+	transactionLT := uint64(55)
+	createdLT := transactionLT + 3
 
-	txCell := testHTTPAPITransactionWithMessages(t, account, source, destination, inLT, outLT)
-	root := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, account, 55, txCell)
+	outputs := []*tlb.Message{
+		testHTTPAPIInternalMessage(account, bytes.Repeat([]byte{0x31}, 32), transactionLT+1),
+		testHTTPAPIInternalMessage(account, bytes.Repeat([]byte{0x32}, 32), transactionLT+2),
+		testHTTPAPIInternalMessage(account, destination, createdLT),
+	}
+	txCell := testHTTPAPIMessageTransaction(t, account, transactionLT, 0, make([]byte, 32), nil, outputs)
+	root := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+		{account: foreignAccount, txs: map[uint64]*cell.Cell{1: cell.BeginCell().MustStoreUInt(0, 4).EndCell()}},
+		{account: account, txs: map[uint64]*cell.Cell{transactionLT: txCell}},
+	})
 	block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+	lookup := testHTTPAPIAccountLTLookup(0, account, createdLT)
+	store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{lookup: block}, []blockRoot{{block: block, root: root}})
 
-	inboundKey := storage.MessageTransactionKey{
-		Source:      testHTTPAPIMessageAddress(t, 0, source),
-		Destination: testHTTPAPIMessageAddress(t, 0, account),
-		CreatedLT:   inLT,
-	}
-	outboundKey := storage.MessageTransactionKey{
-		Source:      testHTTPAPIMessageAddress(t, 0, account),
-		Destination: testHTTPAPIMessageAddress(t, 0, destination),
-		CreatedLT:   outLT,
-	}
-	entries, err := storage.MessageTransactionEntriesFromBlockCell(block, root)
-	if err != nil {
-		t.Fatalf("extract message transaction entries: %v", err)
-	}
-	lookup := make(map[locateLookupKey]storage.MessageTransactionRef, len(entries))
-	for _, entry := range entries {
-		lookup[locateLookupKey{kind: entry.Kind, key: entry.Key}] = entry.Ref
-	}
-	if _, ok := lookup[locateLookupKey{kind: storage.MessageTransactionInbound, key: inboundKey}]; !ok {
-		t.Fatal("inbound message transaction was not indexed")
-	}
-	if _, ok := lookup[locateLookupKey{kind: storage.MessageTransactionOutbound, key: outboundKey}]; !ok {
-		t.Fatal("outbound message transaction was not indexed")
-	}
-	wantTxHash := txCell.Hash()
-	if got := lookup[locateLookupKey{kind: storage.MessageTransactionInbound, key: inboundKey}].Hash; !bytes.Equal(got[:], wantTxHash) {
-		t.Fatalf("indexed transaction hash = %x, want original cell hash %x", got, wantTxHash)
-	}
-
-	store := &locateTestStore{
-		root:   blockRoot{block: block, root: root},
-		lookup: lookup,
-	}
 	srv := newTestServer()
 	srv.store = store
-
-	result, apiErr := srv.handleTryLocateTx(context.Background(), requestParams{query: mapValues(map[string]string{
-		"source":      address.NewAddress(0, 0, source).String(),
-		"destination": address.NewAddress(0, 0, account).String(),
-		"created_lt":  "777",
-	})})
-	if apiErr != nil {
-		t.Fatalf("tryLocateTx error: %v", apiErr.message)
-	}
-	tx := result.(extTransaction)
-	if tx.Type != extTransactionType || tx.TransactionID.LT != "55" || tx.InMsg == nil {
-		t.Fatalf("unexpected located transaction: %+v", tx)
-	}
-	if store.calls[0] != (locateLookupKey{kind: storage.MessageTransactionInbound, key: inboundKey}) {
-		t.Fatalf("tryLocateTx lookup = %+v", store.calls[0])
-	}
-
-	_, apiErr = srv.handleTryLocateResultTx(context.Background(), requestParams{query: mapValues(map[string]string{
-		"source":      address.NewAddress(0, 0, source).String(),
-		"destination": address.NewAddress(0, 0, account).String(),
-		"created_lt":  "777",
-	})})
-	if apiErr != nil {
-		t.Fatalf("tryLocateResultTx error: %v", apiErr.message)
-	}
-	if store.calls[1] != (locateLookupKey{kind: storage.MessageTransactionInbound, key: inboundKey}) {
-		t.Fatalf("tryLocateResultTx lookup = %+v", store.calls[1])
-	}
-
-	_, apiErr = srv.handleTryLocateSourceTx(context.Background(), requestParams{query: mapValues(map[string]string{
+	result, apiErr := srv.handleTryLocateSourceTx(context.Background(), requestParams{query: mapValues(map[string]string{
 		"source":      address.NewAddress(0, 0, account).String(),
 		"destination": address.NewAddress(0, 0, destination).String(),
-		"created_lt":  "778",
+		"created_lt":  fmt.Sprintf("%d", createdLT),
 	})})
 	if apiErr != nil {
 		t.Fatalf("tryLocateSourceTx error: %v", apiErr.message)
 	}
-	if store.calls[2] != (locateLookupKey{kind: storage.MessageTransactionOutbound, key: outboundKey}) {
-		t.Fatalf("tryLocateSourceTx lookup = %+v", store.calls[2])
+	tx := result.(extTransaction)
+	if tx.TransactionID.LT != fmt.Sprintf("%d", transactionLT) || len(tx.OutMsgs) != 3 {
+		t.Fatalf("unexpected located source transaction: %+v", tx)
 	}
+	if !reflect.DeepEqual(store.lookupCalls, []accountLTLookup{lookup}) {
+		t.Fatalf("lookup calls = %+v, want %+v", store.lookupCalls, []accountLTLookup{lookup})
+	}
+	if store.rootCalls[storage.BlockKey(block)] != 1 {
+		t.Fatalf("block root loads = %v, want one", store.rootCalls)
+	}
+}
+
+type tryLocateTestHandler struct {
+	name string
+	run  func(*Server, context.Context, requestParams) (any, *apiError)
+}
+
+func TestTryLocateResultTransactionFromBlocks(t *testing.T) {
+	source := bytes.Repeat([]byte{0x10}, 32)
+	destination := bytes.Repeat([]byte{0x55}, 32)
+	foreignAccount := bytes.Repeat([]byte{0x01}, 32)
+	createdLT := uint64(54)
+	transactionLT := uint64(1_000_060)
+
+	firstRoot := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+		{account: foreignAccount, txs: map[uint64]*cell.Cell{60: cell.BeginCell().MustStoreUInt(0, 4).EndCell()}},
+	})
+	inbound := testHTTPAPIInternalMessage(source, destination, createdLT)
+	txCell := testHTTPAPIMessageTransaction(t, destination, transactionLT, 0, make([]byte, 32), inbound, nil)
+	resultRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, destination, transactionLT, txCell)
+	firstBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, firstRoot)
+	resultBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 2, resultRoot)
+	firstLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT)
+	resultLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT+messageLookupLTStep)
+
+	for _, handler := range []tryLocateTestHandler{
+		{name: "tryLocateTx", run: func(s *Server, ctx context.Context, params requestParams) (any, *apiError) {
+			return s.handleTryLocateTx(ctx, params)
+		}},
+		{name: "tryLocateResultTx", run: func(s *Server, ctx context.Context, params requestParams) (any, *apiError) {
+			return s.handleTryLocateResultTx(ctx, params)
+		}},
+	} {
+		t.Run(handler.name, func(t *testing.T) {
+			store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{
+				firstLookup:  firstBlock,
+				resultLookup: resultBlock,
+			}, []blockRoot{{block: firstBlock, root: firstRoot}, {block: resultBlock, root: resultRoot}})
+			srv := newTestServer()
+			srv.store = store
+
+			result, apiErr := handler.run(srv, context.Background(), requestParams{query: mapValues(map[string]string{
+				"source":      address.NewAddress(0, 0, source).String(),
+				"destination": address.NewAddress(0, 0, destination).String(),
+				"created_lt":  fmt.Sprintf("%d", createdLT),
+			})})
+			if apiErr != nil {
+				t.Fatalf("locate result transaction: %v", apiErr.message)
+			}
+			tx := result.(extTransaction)
+			if tx.TransactionID.LT != fmt.Sprintf("%d", transactionLT) || tx.InMsg == nil {
+				t.Fatalf("unexpected located result transaction: %+v", tx)
+			}
+			if !reflect.DeepEqual(store.lookupCalls, []accountLTLookup{firstLookup, resultLookup}) {
+				t.Fatalf("lookup calls = %+v, want two LT probes", store.lookupCalls)
+			}
+		})
+	}
+}
+
+func TestTryLocateResultTransactionFollowsAccountHistory(t *testing.T) {
+	source := bytes.Repeat([]byte{0x10}, 32)
+	destination := bytes.Repeat([]byte{0x55}, 32)
+	foreignAccount := bytes.Repeat([]byte{0x01}, 32)
+	createdLT := uint64(54)
+
+	resultTx := testHTTPAPIMessageTransaction(t, destination, 500_000, 0, make([]byte, 32),
+		testHTTPAPIInternalMessage(source, destination, createdLT), nil)
+	latestTx := testHTTPAPIMessageTransaction(t, destination, 1_000_060, 500_000, resultTx.Hash(),
+		testHTTPAPIInternalMessage(bytes.Repeat([]byte{0x99}, 32), destination, createdLT), nil)
+	foreignTx := testHTTPAPIChainTransaction(t, foreignAccount, 60, 0, make([]byte, 32))
+	firstRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, foreignAccount, 60, foreignTx)
+	resultRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, destination, 500_000, resultTx)
+	latestRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, destination, 1_000_060, latestTx)
+	firstBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, firstRoot)
+	resultBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 2, resultRoot)
+	latestBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 3, latestRoot)
+	initialLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT)
+	probeLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT+messageLookupLTStep)
+	historyLookup := testHTTPAPIAccountLTLookup(0, destination, 500_000)
+	store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{
+		initialLookup: firstBlock,
+		probeLookup:   latestBlock,
+		historyLookup: resultBlock,
+	}, []blockRoot{
+		{block: firstBlock, root: firstRoot},
+		{block: resultBlock, root: resultRoot},
+		{block: latestBlock, root: latestRoot},
+	})
+
+	srv := newTestServer()
+	srv.store = store
+	result, apiErr := srv.handleTryLocateResultTx(context.Background(), requestParams{query: mapValues(map[string]string{
+		"source":      address.NewAddress(0, 0, source).String(),
+		"destination": address.NewAddress(0, 0, destination).String(),
+		"created_lt":  fmt.Sprintf("%d", createdLT),
+	})})
+	if apiErr != nil {
+		t.Fatalf("locate result transaction: %v", apiErr.message)
+	}
+	if tx := result.(extTransaction); tx.TransactionID.LT != "500000" {
+		t.Fatalf("located transaction LT = %s, want 500000", tx.TransactionID.LT)
+	}
+	if !reflect.DeepEqual(store.lookupCalls, []accountLTLookup{initialLookup, probeLookup, historyLookup}) {
+		t.Fatalf("lookup calls = %+v, want two probes and one history lookup", store.lookupCalls)
+	}
+}
+
+func TestTryLocateTransactionNotFoundAfterBoundedProbes(t *testing.T) {
+	source := bytes.Repeat([]byte{0x10}, 32)
+	destination := bytes.Repeat([]byte{0x55}, 32)
+	createdLT := uint64(54)
+	store := newMessageLookupTestStore(nil, nil)
+	srv := newTestServer()
+	srv.store = store
+
+	_, apiErr := srv.handleTryLocateTx(context.Background(), requestParams{query: mapValues(map[string]string{
+		"source":      address.NewAddress(0, 0, source).String(),
+		"destination": address.NewAddress(0, 0, destination).String(),
+		"created_lt":  fmt.Sprintf("%d", createdLT),
+	})})
+	if apiErr == nil || apiErr.status != 404 || apiErr.message != "transaction was not found" {
+		t.Fatalf("unexpected error: %+v", apiErr)
+	}
+	if len(store.lookupCalls) != 3 {
+		t.Fatalf("lookup calls = %d, want three bounded probes", len(store.lookupCalls))
+	}
+	for i, call := range store.lookupCalls {
+		want := createdLT + uint64(i)*messageLookupLTStep
+		if call.lt != want || call.workchain != 0 || call.account != testHTTPAPIAccountArray(destination) {
+			t.Fatalf("probe %d = %+v, want LT %d for destination", i, call, want)
+		}
+	}
+}
+
+func TestTryLocateTransactionRequiresFullMessageIdentity(t *testing.T) {
+	expectedSource := bytes.Repeat([]byte{0x10}, 32)
+	expectedDestination := bytes.Repeat([]byte{0x55}, 32)
+	createdLT := uint64(54)
+
+	t.Run("inbound source", func(t *testing.T) {
+		wrongSource := bytes.Repeat([]byte{0x99}, 32)
+		txCell := testHTTPAPIMessageTransaction(t, expectedDestination, 80, 0, make([]byte, 32),
+			testHTTPAPIInternalMessage(wrongSource, expectedDestination, createdLT), nil)
+		root := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, expectedDestination, 80, txCell)
+		block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+		lookup := testHTTPAPIAccountLTLookup(0, expectedDestination, createdLT)
+		store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{lookup: block},
+			[]blockRoot{{block: block, root: root}})
+		srv := newTestServer()
+		srv.store = store
+
+		_, apiErr := srv.handleTryLocateResultTx(context.Background(), requestParams{query: mapValues(map[string]string{
+			"source":      address.NewAddress(0, 0, expectedSource).String(),
+			"destination": address.NewAddress(0, 0, expectedDestination).String(),
+			"created_lt":  fmt.Sprintf("%d", createdLT),
+		})})
+		if apiErr == nil || apiErr.status != 404 {
+			t.Fatalf("wrong inbound source error = %+v, want 404", apiErr)
+		}
+	})
+
+	t.Run("outbound destination", func(t *testing.T) {
+		wrongDestination := bytes.Repeat([]byte{0x88}, 32)
+		transactionLT := uint64(55)
+		outboundCreatedLT := transactionLT + 1
+		txCell := testHTTPAPIMessageTransaction(t, expectedSource, transactionLT, 0, make([]byte, 32), nil,
+			[]*tlb.Message{testHTTPAPIInternalMessage(expectedSource, wrongDestination, outboundCreatedLT)})
+		root := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, expectedSource, transactionLT, txCell)
+		block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+		lookup := testHTTPAPIAccountLTLookup(0, expectedSource, outboundCreatedLT)
+		store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{lookup: block},
+			[]blockRoot{{block: block, root: root}})
+		srv := newTestServer()
+		srv.store = store
+
+		_, apiErr := srv.handleTryLocateSourceTx(context.Background(), requestParams{query: mapValues(map[string]string{
+			"source":      address.NewAddress(0, 0, expectedSource).String(),
+			"destination": address.NewAddress(0, 0, expectedDestination).String(),
+			"created_lt":  fmt.Sprintf("%d", outboundCreatedLT),
+		})})
+		if apiErr == nil || apiErr.status != 404 {
+			t.Fatalf("wrong outbound destination error = %+v, want 404", apiErr)
+		}
+	})
 }
 
 func TestTransactionMessageHashesUseOriginalRefStoredCells(t *testing.T) {
@@ -158,14 +298,7 @@ type blockRoot struct {
 
 type locateTestStore struct {
 	testStore
-	root   blockRoot
-	lookup map[locateLookupKey]storage.MessageTransactionRef
-	calls  []locateLookupKey
-}
-
-type locateLookupKey struct {
-	kind storage.MessageTransactionKind
-	key  storage.MessageTransactionKey
+	root blockRoot
 }
 
 func (s *locateTestStore) BlockRoot(_ context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
@@ -175,60 +308,103 @@ func (s *locateTestStore) BlockRoot(_ context.Context, block ton.BlockIDExt) (*c
 	return s.root.root, nil
 }
 
-func (s *locateTestStore) LookupMessageTransaction(_ context.Context, kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, error) {
-	call := locateLookupKey{kind: kind, key: key}
-	s.calls = append(s.calls, call)
-	ref, ok := s.lookup[call]
-	if !ok {
-		return storage.MessageTransactionRef{}, storage.ErrNotFound
-	}
-	return ref, nil
+type accountLTLookup struct {
+	workchain int32
+	account   [32]byte
+	lt        uint64
 }
 
-func testHTTPAPITransactionWithMessages(t *testing.T, account []byte, inSource []byte, outDestination []byte, inLT uint64, outLT uint64) *cell.Cell {
+type messageLookupTestStore struct {
+	testStore
+	blocks      map[accountLTLookup]ton.BlockIDExt
+	roots       map[storage.BlockRootHash]*cell.Cell
+	lookupCalls []accountLTLookup
+	rootCalls   map[storage.BlockRootHash]int
+}
+
+func newMessageLookupTestStore(blocks map[accountLTLookup]ton.BlockIDExt, roots []blockRoot) *messageLookupTestStore {
+	store := &messageLookupTestStore{
+		blocks:    blocks,
+		roots:     make(map[storage.BlockRootHash]*cell.Cell, len(roots)),
+		rootCalls: make(map[storage.BlockRootHash]int, len(roots)),
+	}
+	for _, entry := range roots {
+		store.roots[storage.BlockKey(entry.block)] = entry.root
+	}
+	return store
+}
+
+func (s *messageLookupTestStore) BlockRoot(_ context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
+	key := storage.BlockKey(block)
+	root, ok := s.roots[key]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	s.rootCalls[key]++
+	return root, nil
+}
+
+func (s *messageLookupTestStore) LookupBlockByAccountLT(_ context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
+	lookup := testHTTPAPIAccountLTLookup(workchain, account, lt)
+	s.lookupCalls = append(s.lookupCalls, lookup)
+	block, ok := s.blocks[lookup]
+	if !ok {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return block, nil
+}
+
+func testHTTPAPIAccountLTLookup(workchain int32, account []byte, lt uint64) accountLTLookup {
+	return accountLTLookup{workchain: workchain, account: testHTTPAPIAccountArray(account), lt: lt}
+}
+
+func testHTTPAPIAccountArray(account []byte) [32]byte {
+	var value [32]byte
+	copy(value[:], account)
+	return value
+}
+
+func testHTTPAPIInternalMessage(source, destination []byte, createdLT uint64) *tlb.Message {
+	return &tlb.Message{Msg: &tlb.InternalMessage{
+		IHRDisabled: true,
+		Bounce:      true,
+		SrcAddr:     address.NewAddress(0, 0, source),
+		DstAddr:     address.NewAddress(0, 0, destination),
+		Amount:      tlb.ZeroCoins,
+		CreatedLT:   createdLT,
+		Body:        cell.BeginCell().EndCell(),
+	}}
+}
+
+func testHTTPAPIMessageTransaction(t *testing.T, account []byte, lt, prevLT uint64, prevHash []byte, inbound *tlb.Message, outputs []*tlb.Message) *cell.Cell {
 	t.Helper()
 
-	inMsg := &tlb.Message{Msg: &tlb.InternalMessage{
-		IHRDisabled: true,
-		Bounce:      true,
-		SrcAddr:     address.NewAddress(0, 0, inSource),
-		DstAddr:     address.NewAddress(0, 0, account),
-		Amount:      tlb.ZeroCoins,
-		CreatedLT:   inLT,
-		Body:        cell.BeginCell().EndCell(),
-	}}
-	outMsg := &tlb.Message{Msg: &tlb.InternalMessage{
-		IHRDisabled: true,
-		Bounce:      true,
-		SrcAddr:     address.NewAddress(0, 0, account),
-		DstAddr:     address.NewAddress(0, 0, outDestination),
-		Amount:      tlb.ZeroCoins,
-		CreatedLT:   outLT,
-		Body:        cell.BeginCell().EndCell(),
-	}}
-	outMsgCell, err := outMsg.ToCell()
-	if err != nil {
-		t.Fatalf("build outgoing message: %v", err)
-	}
-	outDict := cell.NewDict(15)
-	if err = outDict.Set(cell.BeginCell().MustStoreUInt(0, 15).EndCell(), cell.BeginCell().MustStoreRef(outMsgCell).EndCell()); err != nil {
-		t.Fatalf("set outgoing message: %v", err)
+	var outList *tlb.MessagesList
+	if len(outputs) > 0 {
+		outDict := cell.NewDict(15)
+		for i, output := range outputs {
+			messageCell, err := output.ToCell()
+			if err != nil {
+				t.Fatalf("build outgoing message %d: %v", i, err)
+			}
+			if err = outDict.Set(cell.BeginCell().MustStoreUInt(uint64(i), 15).EndCell(),
+				cell.BeginCell().MustStoreRef(messageCell).EndCell()); err != nil {
+				t.Fatalf("set outgoing message %d: %v", i, err)
+			}
+		}
+		outList = &tlb.MessagesList{List: outDict}
 	}
 
-	txCell, err := tlb.ToCell(&tlb.Transaction{
+	tx := tlb.Transaction{
 		AccountAddr: bytes.Clone(account),
-		LT:          55,
-		PrevTxHash:  bytes.Repeat([]byte{0x01}, 32),
-		PrevTxLT:    54,
+		LT:          lt,
+		PrevTxHash:  bytes.Clone(prevHash),
+		PrevTxLT:    prevLT,
 		Now:         1700000000,
-		OutMsgCount: 1,
+		OutMsgCount: uint16(len(outputs)),
 		OrigStatus:  tlb.AccountStatusActive,
 		EndStatus:   tlb.AccountStatusActive,
-		IO: struct {
-			In  *tlb.Message      `tlb:"maybe ^"`
-			Out *tlb.MessagesList `tlb:"maybe ^"`
-		}{In: inMsg, Out: &tlb.MessagesList{List: outDict}},
-		TotalFees: tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
+		TotalFees:   tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
 		StateUpdate: tlb.HashUpdate{
 			OldHash: bytes.Repeat([]byte{0x02}, 32),
 			NewHash: bytes.Repeat([]byte{0x03}, 32),
@@ -237,7 +413,10 @@ func testHTTPAPITransactionWithMessages(t *testing.T, account []byte, inSource [
 			ComputePhase: tlb.ComputePhase{Phase: tlb.ComputePhaseSkipped{Reason: tlb.ComputeSkipReason{Type: tlb.ComputeSkipReasonNoState}}},
 			Aborted:      true,
 		},
-	})
+	}
+	tx.IO.In = inbound
+	tx.IO.Out = outList
+	txCell, err := tlb.ToCell(&tx)
 	if err != nil {
 		t.Fatalf("build transaction: %v", err)
 	}
@@ -367,6 +546,7 @@ type testHTTPAPIAccountTxs struct {
 func testHTTPAPIBlockWithAccountTxs(t testing.TB, workchain int32, shard int64, accounts []testHTTPAPIAccountTxs) *cell.Cell {
 	t.Helper()
 
+	endLT := uint64(100)
 	accountBlocks, err := cell.NewAugDict(256, testHTTPAPICurrencyCollectionAugmentation{})
 	if err != nil {
 		t.Fatalf("create account blocks dict: %v", err)
@@ -377,6 +557,9 @@ func testHTTPAPIBlockWithAccountTxs(t testing.TB, workchain int32, shard int64, 
 			t.Fatalf("create transaction dict: %v", err)
 		}
 		for lt, tx := range entry.txs {
+			if lt >= endLT {
+				endLT = lt + 1
+			}
 			if err = txDict.Set(cell.BeginCell().MustStoreUInt(lt, 64).EndCell(), cell.BeginCell().MustStoreRef(tx).EndCell()); err != nil {
 				t.Fatalf("set transaction: %v", err)
 			}
@@ -405,7 +588,7 @@ func testHTTPAPIBlockWithAccountTxs(t testing.TB, workchain int32, shard int64, 
 	header.Version = 1
 	header.SeqNo = 1
 	header.StartLt = 1
-	header.EndLt = 100
+	header.EndLt = endLT
 	header.GenUtime = 1000
 	header.Shard = tlb.ShardIdent{PrefixBits: 0, WorkchainID: workchain, ShardPrefix: uint64(shard)}
 	header.PrevRef = tlb.BlkPrevInfo{Prev1: tlb.ExtBlkRef{
@@ -515,18 +698,47 @@ func BenchmarkWalkBlockTransactions(b *testing.B) {
 	}
 }
 
-func testHTTPAPIAccountKey(account []byte) *cell.Cell {
-	return cell.BeginCell().MustStoreSlice(account, 256).EndCell()
+func BenchmarkFindBlockTransactionBefore(b *testing.B) {
+	for _, foreignAccounts := range []int{1, 64, 256} {
+		b.Run(fmt.Sprintf("foreign_accounts_%d", foreignAccounts), func(b *testing.B) {
+			target := bytes.Repeat([]byte{0xff}, 32)
+			accountTxs := make([]testHTTPAPIAccountTxs, 0, foreignAccounts+1)
+			for i := 0; i < foreignAccounts; i++ {
+				account := bytes.Repeat([]byte{0xff}, 32)
+				account[30] = byte(i >> 8)
+				account[31] = byte(i)
+				accountTxs = append(accountTxs, testHTTPAPIAccountTxs{
+					account: account,
+					txs:     map[uint64]*cell.Cell{1: cell.BeginCell().EndCell()},
+				})
+			}
+			wantCell := cell.BeginCell().MustStoreUInt(0x7, 4).EndCell()
+			accountTxs = append(accountTxs, testHTTPAPIAccountTxs{
+				account: target,
+				txs:     map[uint64]*cell.Cell{55: wantCell},
+			})
+			root := testHTTPAPIBlockWithAccountTxs(b, 0, masterchainShard, accountTxs)
+			accounts, err := blockAccountBlocks(root)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			for b.Loop() {
+				entry, err := findBlockTransactionBefore(accounts, target, 56)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if entry.lt != 55 || entry.cell != wantCell {
+					b.Fatalf("unexpected transaction: LT %d", entry.lt)
+				}
+			}
+		})
+	}
 }
 
-func testHTTPAPIMessageAddress(t *testing.T, workchain int32, account []byte) storage.MessageTransactionAddress {
-	t.Helper()
-
-	addr, err := storage.MessageTransactionAddressFromRaw(workchain, account)
-	if err != nil {
-		t.Fatalf("message transaction address: %v", err)
-	}
-	return addr
+func testHTTPAPIAccountKey(account []byte) *cell.Cell {
+	return cell.BeginCell().MustStoreSlice(account, 256).EndCell()
 }
 
 func mapValues(values map[string]string) url.Values {

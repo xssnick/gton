@@ -43,10 +43,6 @@ type ServedBlockFull struct {
 	Meta                   *BlockMeta
 	IsLink                 bool
 	ArchiveShardSplitDepth uint32
-	// MessageEntries optionally carries the message->transaction index entries
-	// precomputed when Block was parsed. Checkpoint persistence requires a
-	// non-nil slice, where an empty slice means no indexable messages.
-	MessageEntries []MessageTransactionIndexEntry
 }
 
 type ServedBlockLink struct {
@@ -84,7 +80,6 @@ type PersistentStateFile struct {
 	Ref              *ArtifactRef
 	FileHash         []byte
 	StateRootHash    []byte
-	CellsCount       uint64
 }
 
 type ArtifactRef struct {
@@ -119,6 +114,5 @@ func (b *ServedBlockFull) Clone() *ServedBlockFull {
 		Meta:                   b.Meta.Clone(),
 		IsLink:                 b.IsLink,
 		ArchiveShardSplitDepth: b.ArchiveShardSplitDepth,
-		MessageEntries:         cloneMessageTransactionEntries(b.MessageEntries),
 	}
 }

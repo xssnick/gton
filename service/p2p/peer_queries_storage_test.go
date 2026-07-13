@@ -117,7 +117,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		ID:     next,
 		Proof:  []byte{0xAA, 0xBB},
 		Block:  []byte{0xCC, 0xDD},
-		IsLink: false, MessageEntries: []tnstore.MessageTransactionIndexEntry{},
+		IsLink: false,
 	}
 	if err := storage.SaveBlockFull(full); err != nil {
 		t.Fatalf("save block full: %v", err)
@@ -484,7 +484,7 @@ func TestDispatchPeerQueryShardNextDescriptionRequiresMasterchain(t *testing.T) 
 
 	prev := testStoredBlockID(20)
 	next := testStoredBlockID(21)
-	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: next, Proof: []byte{1}, Block: []byte{2}, MessageEntries: []tnstore.MessageTransactionIndexEntry{}}); err != nil {
+	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: next, Proof: []byte{1}, Block: []byte{2}}); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
 	if err = storage.LinkNextBlock(prev, next); err != nil {
@@ -680,7 +680,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	stateData := []byte{0x50, 0x51, 0x52, 0x53}
 	archiveData := []byte{0x60, 0x61, 0x62}
 
-	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: block, Proof: blockProof, Block: blockData, MessageEntries: []tnstore.MessageTransactionIndexEntry{}}); err != nil {
+	if err = storage.SaveBlockFull(&tnstore.ServedBlockFull{ID: block, Proof: blockProof, Block: blockData}); err != nil {
 		t.Fatalf("save block full: %v", err)
 	}
 	if err = storage.SaveBlockProof(tnstore.ServedProofBlock, block, blockProof, nil); err != nil {
@@ -997,7 +997,7 @@ func saveTestServedMasterBlockMeta(t *testing.T, store *pebblestore.Store, block
 			ID:    block,
 			Block: []byte{0x01},
 			Proof: []byte{0x02},
-			Meta:  meta, MessageEntries: []tnstore.MessageTransactionIndexEntry{},
+			Meta:  meta,
 		},
 	}}, tnstore.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save served master block meta %s: %v", tnstore.FormatBlockRef(block), err)

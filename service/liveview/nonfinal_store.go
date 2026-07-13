@@ -115,7 +115,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 
 		state, meta, cells, err = nonfinalStateFromSnapshot(artifacts, loader)
 	} else {
-		parsed, parseErr := nonfinalParseStateUpdate(artifacts)
+		parsed, parseErr := nonfinalParseStateUpdate(artifacts, kind&storage.LiveBlockNonfinalCandidate == 0)
 		if parseErr != nil {
 			if keepWaiting {
 				s.deleteNonfinalWaiting(block)
@@ -174,7 +174,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 		return false, nil
 	}
 
-	prepared, err := prepareLiveBlockArtifacts(artifacts, s.nonFinalEnabled)
+	prepared, err := prepareLiveBlockArtifacts(artifacts)
 	if err != nil {
 		if keepWaiting {
 			s.deleteNonfinalWaiting(block)

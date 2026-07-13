@@ -916,7 +916,7 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 		ID:     block,
 		Block:  blockData,
 		Proof:  proofData,
-		IsLink: false, MessageEntries: []storage.MessageTransactionIndexEntry{},
+		IsLink: false,
 	}); err != nil {
 		t.Fatalf("save cached block: %v", err)
 	}

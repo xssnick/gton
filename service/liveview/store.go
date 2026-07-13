@@ -52,8 +52,6 @@ type Store struct {
 	seqIndex           map[liveSeqKey]ton.BlockIDExt
 	ltIndex            map[liveHistoryKey][]liveLTIndexEntry
 	unixIndex          map[liveHistoryKey][]liveUnixIndexEntry
-	messageIndex       map[liveMessageTransactionKey]storage.MessageTransactionRef
-	messageBlockIndex  map[storage.BlockRootHash][]liveMessageTransactionKey
 	flushed            map[storage.BlockRootHash]liveBlockFlush
 	liveBlockCache     *storage.LiveBlockCache
 	masterOrder        liveBlockOrder
@@ -82,8 +80,7 @@ type liveBlock struct {
 	artifactFlushed bool
 	stateFlushed    bool
 
-	fragments      *BlockView
-	messageEntries []storage.MessageTransactionIndexEntry
+	fragments *BlockView
 }
 
 type liveBlockFlush struct {
@@ -104,7 +101,6 @@ type livePreparedBlockArtifacts struct {
 	state           *storage.BlockState
 	fragments       *BlockView
 	proofs          []storage.LiveBlockProofArtifact
-	messageEntries  []storage.MessageTransactionIndexEntry
 	artifactFlushed bool
 	stateFlushed    bool
 }
@@ -187,8 +183,6 @@ func New(store Backing, opts ...Options) *Store {
 		seqIndex:           map[liveSeqKey]ton.BlockIDExt{},
 		ltIndex:            map[liveHistoryKey][]liveLTIndexEntry{},
 		unixIndex:          map[liveHistoryKey][]liveUnixIndexEntry{},
-		messageIndex:       map[liveMessageTransactionKey]storage.MessageTransactionRef{},
-		messageBlockIndex:  map[storage.BlockRootHash][]liveMessageTransactionKey{},
 		flushed:            map[storage.BlockRootHash]liveBlockFlush{},
 		liveBlockCache:     liveBlockCache,
 		masterOrder:        newLiveBlockOrder(),
@@ -420,7 +414,7 @@ func (s *Store) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []b
 }
 
 func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
-	prepared, err := prepareLiveBlockArtifacts(artifacts, s.nonFinalEnabled)
+	prepared, err := prepareLiveBlockArtifacts(artifacts)
 	if err != nil {
 		return err
 	}
@@ -448,7 +442,7 @@ func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) 
 	return nil
 }
 
-func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, nonFinalEnabled bool) (livePreparedBlockArtifacts, error) {
+func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePreparedBlockArtifacts, error) {
 	block := artifacts.Block
 	if !isFullBlockID(&block) {
 		return livePreparedBlockArtifacts{}, storage.ErrNotFound
@@ -515,16 +509,6 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, nonFinalEna
 		fragments.prewarmHotPath()
 	}
 
-	messageEntries := artifacts.MessageEntries
-	if nonFinalEnabled && messageEntries == nil && root != nil {
-		// Some tests and availability-only publishers use hash-valid cells that are not
-		// full TLB blocks. Non-final locate queries cannot fall back to persistent storage,
-		// so their live message index is best-effort and must not reject those artifacts.
-		if entries, err := storage.MessageTransactionEntriesFromBlockCell(block, root); err == nil {
-			messageEntries = entries
-		}
-	}
-
 	return livePreparedBlockArtifacts{
 		block:           block,
 		root:            root,
@@ -533,7 +517,6 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, nonFinalEna
 		state:           state,
 		fragments:       fragments,
 		proofs:          proofs,
-		messageEntries:  messageEntries,
 		artifactFlushed: artifacts.ArtifactFlushed,
 		stateFlushed:    artifacts.StateFlushed,
 	}, nil
@@ -546,7 +529,6 @@ func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveB
 		BlockData:        artifacts.BlockData,
 		Meta:             artifacts.Meta.Clone(),
 		State:            storage.CloneBlockState(artifacts.State),
-		MessageEntries:   artifacts.MessageEntries,
 		StateUpdate:      artifacts.StateUpdate,
 		ArtifactFlushed:  artifacts.ArtifactFlushed,
 		StateFlushed:     artifacts.StateFlushed,
@@ -577,7 +559,6 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 		artifactFlushed: prepared.artifactFlushed || flushed.artifact,
 		stateFlushed:    prepared.stateFlushed || flushed.state,
 		fragments:       prepared.fragments,
-		messageEntries:  prepared.messageEntries,
 	})
 	if prepared.state != nil {
 		s.rememberBlockStateLocked(*prepared.state)
@@ -603,8 +584,6 @@ func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 	if cached := s.blocks[key]; cached != nil {
 		evictableBefore := s.liveBlockEvictableLocked(cached)
 		cached.artifactFlushed = true
-		cached.messageEntries = nil
-		s.removeMessageTransactionIndexLocked(key)
 		s.adjustLiveEvictableStateLocked(cached, evictableBefore)
 		published := s.publishPendingCurrentLocked()
 		if s.nonFinalEnabled {
@@ -762,13 +741,6 @@ func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHist
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 	return block, nil
-}
-
-func (s *Store) LookupMessageTransaction(ctx context.Context, kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, error) {
-	if ref, ok := s.cachedMessageTransaction(kind, key); ok {
-		return ref, nil
-	}
-	return s.backing.LookupMessageTransaction(ctx, kind, key)
 }
 
 func (s *Store) BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
@@ -932,13 +904,9 @@ func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liv
 			return nil, err
 		}
 		if err = s.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-			Block:     block,
-			Root:      root,
-			BlockData: data,
-			// The block was loaded back from the persistent store, whose
-			// message-transaction index already covers it; skip re-extracting
-			// entries for this backfill publish.
-			MessageEntries:  []storage.MessageTransactionIndexEntry{},
+			Block:           block,
+			Root:            root,
+			BlockData:       data,
 			ArtifactFlushed: true,
 		}); err != nil {
 			return nil, err
@@ -1215,13 +1183,6 @@ func (s *Store) cachedBlockByUnixTime(key storage.BlockHistoryKey, utime uint32)
 	return *cloneBlockID(entries[idx].block), true
 }
 
-func (s *Store) cachedMessageTransaction(kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, bool) {
-	s.mu.RLock()
-	ref, ok := s.messageIndex[liveMessageTransactionKey{kind: kind, key: key}]
-	s.mu.RUnlock()
-	return ref, ok
-}
-
 func (s *Store) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
 	key := storage.BlockKey(block)
 
@@ -1282,19 +1243,12 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 		if block.fragments == nil {
 			block.fragments = existing.fragments
 		}
-		if len(block.messageEntries) == 0 {
-			block.messageEntries = existing.messageEntries
-		}
 		existingKind := liveBlockKind(existing.id)
 		s.removeBlockOrderLocked(key, existingKind)
 		if existingEvictable {
 			s.adjustLiveEvictableLocked(existingKind, -1)
 		}
 	}
-	if block.artifactFlushed {
-		block.messageEntries = nil
-	}
-
 	s.blocks[key] = block
 	s.refreshBlockIndexLocked(block.id)
 	kind := liveBlockKind(block.id)
@@ -1451,7 +1405,6 @@ func (s *Store) refreshBlockIndexLocked(block ton.BlockIDExt) {
 	if old := s.metas[key]; old != nil {
 		s.removeMetaHistoryIndexLocked(old)
 	}
-	s.removeMessageTransactionIndexLocked(key)
 	delete(s.metas, key)
 	delete(s.seqIndex, liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo})
 
@@ -1473,7 +1426,6 @@ func (s *Store) refreshBlockIndexLocked(block ton.BlockIDExt) {
 		} else if cached.root != nil {
 			indexed = true
 		}
-		s.addMessageTransactionIndexLocked(key, cached.messageEntries)
 	}
 	if indexed {
 		s.seqIndex[liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}] = block
@@ -1561,38 +1513,6 @@ func (s *Store) removeMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 			}
 		}
 	}
-}
-
-func (s *Store) addMessageTransactionIndexLocked(blockKey storage.BlockRootHash, entries []storage.MessageTransactionIndexEntry) {
-	if len(entries) == 0 {
-		return
-	}
-
-	keys := make([]liveMessageTransactionKey, 0, len(entries))
-	for _, entry := range entries {
-		key := liveMessageTransactionKey{
-			kind: entry.Kind,
-			key:  entry.Key,
-		}
-		s.messageIndex[key] = entry.Ref
-		keys = append(keys, key)
-	}
-	s.messageBlockIndex[blockKey] = keys
-}
-
-func (s *Store) removeMessageTransactionIndexLocked(blockKey storage.BlockRootHash) {
-	keys := s.messageBlockIndex[blockKey]
-	if len(keys) == 0 {
-		return
-	}
-
-	for _, key := range keys {
-		ref, ok := s.messageIndex[key]
-		if ok && storage.BlockKey(ref.Block) == blockKey {
-			delete(s.messageIndex, key)
-		}
-	}
-	delete(s.messageBlockIndex, blockKey)
 }
 
 func (s *Store) removeBlockOrderLocked(key storage.BlockRootHash, kind liveBlockCacheKind) {
@@ -1788,11 +1708,6 @@ type liveUnixIndexEntry struct {
 	genUTime uint32
 	seqno    uint32
 	block    ton.BlockIDExt
-}
-
-type liveMessageTransactionKey struct {
-	kind storage.MessageTransactionKind
-	key  storage.MessageTransactionKey
 }
 
 type liveBlockLookupKey struct {

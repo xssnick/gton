@@ -189,7 +189,7 @@ func (s *overlaySubscription) sendForgetPeer(ctx context.Context, peer *overlayP
 		return
 	}
 	_ = peer.overlay.SendCustomMessage(ctx, ForgetPeer{})
-	s.removePeer(peer.id)
+	s.removePeerIfCurrent(peer)
 }
 
 func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overlayPeer, req any) (tl.Serializable, error) {

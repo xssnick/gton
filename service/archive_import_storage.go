@@ -97,7 +97,6 @@ func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, split
 			StateUpdateToCells:        prepared.StateUpdateToCells,
 			StateUpdateToCellsElapsed: prepared.StateUpdateToCellsElapsed,
 			PrepareElapsed:            prepared.StateUpdateToCellsElapsed,
-			MessageEntries:            prepared.MessageEntries,
 			IsLink:                    storage.ServedBlockProofIsLink(full.ID, full.IsLink),
 		}
 	}

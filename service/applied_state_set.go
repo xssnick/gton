@@ -222,7 +222,6 @@ func cloneServedBlockFullSharedPayload(block *storage.ServedBlockFull) *storage.
 		Meta:                   block.Meta.Clone(),
 		IsLink:                 block.IsLink,
 		ArchiveShardSplitDepth: block.ArchiveShardSplitDepth,
-		MessageEntries:         block.MessageEntries,
 	}
 }
 

@@ -118,7 +118,11 @@ func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlay
 	return pool, pooled, base
 }
 
-func TestArchiveScoutAddressLookupUsesPeerTimeout(t *testing.T) {
+func TestArchiveScoutAddressLookupUsesArchiveTimeout(t *testing.T) {
+	if dhtSeedPeerTimeout != 5*time.Second {
+		t.Fatalf("live peer discovery timeout = %s, want 5s", dhtSeedPeerTimeout)
+	}
+
 	_, selfKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatalf("generate self key: %v", err)
@@ -165,8 +169,11 @@ func TestArchiveScoutAddressLookupUsesPeerTimeout(t *testing.T) {
 	fake.mx.Lock()
 	lookupDeadline := fake.findAddressesDeadline
 	fake.mx.Unlock()
-	if got := timeoutDuration(t, lookupDeadline); got < dhtSeedPeerTimeout-time.Second {
-		t.Fatalf("archive seed address lookup timeout too short: %s", got)
+	got := timeoutDuration(t, lookupDeadline)
+	timeoutTooShort := got < archiveDHTAddressTimeout-time.Second
+	timeoutTooLong := got > archiveDHTAddressTimeout
+	if timeoutTooShort || timeoutTooLong {
+		t.Fatalf("archive address lookup timeout = %s, want about %s", got, archiveDHTAddressTimeout)
 	}
 	identity, err := sub.overlayNodeIdentity(*peerNode)
 	if err != nil {

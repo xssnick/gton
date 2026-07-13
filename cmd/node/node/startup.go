@@ -32,7 +32,7 @@ var GitCommit = "unknown"
 // liteserverSendQueueSize overrides the per-connection answer queue size:
 // responses are produced concurrently, so pipelined backend clients need
 // enough headroom to absorb answer bursts without drops.
-const liteserverSendQueueSize = 4096
+const liteserverSendQueueSize = 2048
 
 type cliCommands struct {
 	version         bool

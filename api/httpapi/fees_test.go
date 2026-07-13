@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestEstimateFeesFromTransactionUsesOrdinaryPhases(t *testing.T) {
@@ -46,5 +47,31 @@ func TestEstimateFeesFromTransactionUsesOrdinaryPhases(t *testing.T) {
 	}
 	if got.FwdFee != 333 {
 		t.Fatalf("fwd_fee = %d, want 333", got.FwdFee)
+	}
+}
+
+func TestEstimateFeeMessageUsageStopsAtSeenCell(t *testing.T) {
+	const depth = 64
+
+	root := cell.BeginCell().EndCell()
+	for range depth {
+		root = cell.BeginCell().MustStoreRef(root).MustStoreRef(root).EndCell()
+	}
+
+	usage, rootBits, rootSeen, err := estimateFeeMessageUsage(root)
+	if err != nil {
+		t.Fatalf("estimate message usage: %v", err)
+	}
+	if !rootSeen {
+		t.Fatal("root was not counted")
+	}
+	if rootBits != 0 {
+		t.Fatalf("root bits = %d, want 0", rootBits)
+	}
+	if usage.cells != depth+1 {
+		t.Fatalf("cells = %d, want %d", usage.cells, depth+1)
+	}
+	if usage.bits != 0 {
+		t.Fatalf("bits = %d, want 0", usage.bits)
 	}
 }

@@ -24,6 +24,8 @@ type peerStats struct {
 	downloadBytesSec  float64
 	downloadCount     uint64
 	downloadSlowUntil time.Time
+	lastPongAt        time.Time
+	probeFailures     uint32
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
@@ -108,6 +110,8 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 		downloadBytesSec:  p.downloadBytesSec,
 		downloadCount:     p.downloadCount,
 		downloadSlowUntil: p.downloadSlowUntil,
+		lastPongAt:        p.lastPongAt,
+		probeFailures:     p.probeFailures,
 	}
 }
 

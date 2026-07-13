@@ -24,7 +24,10 @@ type testOverlayADNL struct {
 	answerResponder   func(ctx context.Context, queryID []byte, result tl.Serializable) error
 	nopResponder      func(ctx context.Context) error
 	disconnectHandler func(addr string, key ed25519.PublicKey)
+	statsFn           func() adnl.PeerStats
 	sent              []tl.Serializable
+	reinits           atomic.Int64
+	nops              atomic.Int64
 }
 
 func newTestOverlayADNL() *testOverlayADNL {
@@ -64,10 +67,15 @@ func (m *testOverlayADNL) Query(_ context.Context, req tl.Serializable, result t
 }
 
 func (m *testOverlayADNL) SendNop(ctx context.Context) error {
+	m.nops.Add(1)
 	if m.nopResponder != nil {
 		return m.nopResponder(ctx)
 	}
 	return nil
+}
+
+func (m *testOverlayADNL) Reinit() {
+	m.reinits.Add(1)
 }
 
 func (m *testOverlayADNL) Answer(ctx context.Context, queryID []byte, result tl.Serializable) error {
@@ -90,6 +98,9 @@ func (m *testOverlayADNL) GetID() []byte {
 }
 
 func (m *testOverlayADNL) Stats() adnl.PeerStats {
+	if m.statsFn != nil {
+		return m.statsFn()
+	}
 	return adnl.PeerStats{}
 }
 
@@ -691,4 +702,57 @@ func TestStartPingPeersDoesNotBlockCaller(t *testing.T) {
 
 	cancel()
 	node.wg.Wait()
+}
+
+func TestStaleMaintenanceDoesNotRemoveReplacementPeer(t *testing.T) {
+	id := testPeerID("maintenance-replacement")
+	oldWrapper, oldBase := newTestOverlayWrapper()
+	freshWrapper, freshBase := newTestOverlayWrapper()
+	oldPeer := &overlayPeer{id: id, overlay: oldWrapper}
+	freshPeer := &overlayPeer{id: id, overlay: freshWrapper, release: freshBase.Close}
+	sub := testOverlaySubscription(&overlaySubscription{
+		peers: map[PeerID]*overlayPeer{id: freshPeer},
+	})
+
+	oldBase.Close()
+	if sub.peerReadyForMaintenance(context.Background(), oldPeer) {
+		t.Fatal("closed stale peer reported ready for maintenance")
+	}
+
+	sub.mx.Lock()
+	current := sub.peers[id]
+	sub.mx.Unlock()
+	if current != freshPeer {
+		t.Fatal("stale maintenance removed the replacement peer")
+	}
+	select {
+	case <-freshBase.GetCloserCtx().Done():
+		t.Fatal("stale maintenance closed the replacement transport")
+	default:
+	}
+}
+
+func TestStaleForgetDoesNotRemoveReplacementPeer(t *testing.T) {
+	id := testPeerID("forget-replacement")
+	oldWrapper, _ := newTestOverlayWrapper()
+	freshWrapper, freshBase := newTestOverlayWrapper()
+	oldPeer := &overlayPeer{id: id, overlay: oldWrapper}
+	freshPeer := &overlayPeer{id: id, overlay: freshWrapper, release: freshBase.Close}
+	sub := testOverlaySubscription(&overlaySubscription{
+		peers: map[PeerID]*overlayPeer{id: freshPeer},
+	})
+
+	sub.sendForgetPeer(context.Background(), oldPeer)
+
+	sub.mx.Lock()
+	current := sub.peers[id]
+	sub.mx.Unlock()
+	if current != freshPeer {
+		t.Fatal("stale forget removed the replacement peer")
+	}
+	select {
+	case <-freshBase.GetCloserCtx().Done():
+		t.Fatal("stale forget closed the replacement transport")
+	default:
+	}
 }

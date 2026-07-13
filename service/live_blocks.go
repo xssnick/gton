@@ -44,7 +44,6 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 		Meta:             liveBlockArtifactMeta(downloaded.ID, downloaded.Meta, blockData, proofs),
 		State:            state,
 		Proofs:           proofs,
-		MessageEntries:   downloaded.MessageEntries,
 		AvailabilityOnly: options.availabilityOnly,
 	}
 

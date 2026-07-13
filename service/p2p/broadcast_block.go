@@ -19,6 +19,7 @@ import (
 var errBroadcastSignatureSetUnsupported = errors.New("broadcast signature set is not supported")
 var errBroadcastSignatureSetNonFinal = errors.New("broadcast signature set is not final")
 var errBroadcastDecompressionStateNotReady = errors.New("compressed broadcast previous state is not ready")
+var errBlockFileHashMismatch = errors.New("file hash mismatch")
 
 type broadcastDecompressionStateNotReadyError struct {
 	err       error
@@ -137,11 +138,25 @@ func decodeBlockCandidateBroadcast(msg any) (*DownloadedBlock, error) {
 			return nil, fmt.Errorf("decompress tonNode.newBlockCandidateBroadcastCompressed: %w", err)
 		}
 
-		root, err := parseDownloadedBlockData(decompressed)
+		// the wire payload is a mode-2 re-serialization (see the C++ sender),
+		// while FileHash covers the canonical mode-31 bytes — parse and
+		// re-serialize in one pass over the parser's cell graph
+		roots, blockBOC, err := cell.ReserializeBOC(decompressed, compressedBlockRootSerializeOptions)
 		if err != nil {
 			return nil, fmt.Errorf("parse tonNode.newBlockCandidateBroadcastCompressed block: %w", err)
 		}
-		return newVerifiedBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcastCompressed", data.ID, serializeCompressedBlockRoot(root), root)
+		if len(roots) != 1 {
+			return nil, fmt.Errorf("expected 1 root in tonNode.newBlockCandidateBroadcastCompressed, got %d", len(roots))
+		}
+		downloaded, err := newVerifiedBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcastCompressed", data.ID, blockBOC, roots[0])
+		if errors.Is(err, errBlockFileHashMismatch) {
+			// the graph fast path keeps sender-side duplicate cells while the
+			// reference node deduplicates on re-serialization; retry with the
+			// canonical serializer before rejecting, so a candidate a C++ node
+			// would accept is not dropped here
+			downloaded, err = newVerifiedBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcastCompressed", data.ID, serializeCompressedBlockRoot(roots[0]), roots[0])
+		}
+		return downloaded, err
 	case tonnodeapi.NewBlockCandidateBroadcastCompressedV2:
 		roots, blockBOC, err := cell.DecompressBOCSerialized(data.Compressed, maxDecompressedBlockSize, nil, compressedBlockRootSerializeOptions)
 		if err != nil {
@@ -181,7 +196,7 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 
 	sum := sha256.Sum256(data)
 	if !bytes.Equal(sum[:], id.FileHash) {
-		return nil, fmt.Errorf("%s file hash mismatch for %s", kind, formatBlockRef(id))
+		return nil, fmt.Errorf("%s %w for %s", kind, errBlockFileHashMismatch, formatBlockRef(id))
 	}
 
 	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
@@ -191,9 +206,11 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 	if parsed.StateUpdate == nil {
 		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
 	}
-	if err = cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
-		return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
-	}
+	// The standalone merkle-update walk is intentionally skipped: candidate
+	// content is anchored by the root/file hash checks above, the finality
+	// assemble path only pairs candidates whose full ID matches a
+	// signature-verified block, and the liveview non-final store validates
+	// candidate-origin updates itself before building speculative state.
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
 	if err != nil {
 		return nil, fmt.Errorf("%s build block meta %s: %w", kind, formatBlockRef(id), err)
@@ -287,7 +304,58 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 	if state == nil {
 		return nil, nil, errBroadcastDecompressionStateNotReady
 	}
-	return decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot, signatures)
+	downloaded, sigSet, err := decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot, signatures)
+	if err == nil {
+		n.scheduleCompressedStateChain(state, downloaded)
+	}
+	return downloaded, sigSet, err
+}
+
+// scheduleCompressedStateChain applies the just-decoded merkle update to the
+// state it was decompressed against and remembers the resulting materialized
+// next-state tree, so the following block's state-aware decompression finds
+// an in-memory root instead of walking lazy celldb cells. Every current
+// caller decodes only after the validator-signature check, but the chain does
+// not depend on that ordering: the content is pinned by the block's root/file
+// hash checks, so entries for real block IDs are always genuine and forged
+// IDs only occupy bounded TTL'd cache slots nobody asks for. The apply
+// pipeline later overwrites the entry with the canonical state.
+func (n *Node) scheduleCompressedStateChain(prevState *cell.Cell, downloaded *DownloadedBlock) {
+	if n.compressedState == nil || prevState == nil || downloaded == nil || downloaded.StateUpdate == nil {
+		return
+	}
+	meta := downloaded.Meta
+	if meta == nil || len(meta.StateRootHash) != 32 {
+		return
+	}
+
+	block := downloaded.ID
+	update := downloaded.StateUpdate
+	stateRootHash := append([]byte(nil), meta.StateRootHash...)
+	n.runAsync(func() {
+		next, _, err := cell.ApplyMerkleUpdate(prevState, update)
+		if err != nil {
+			n.log.Debug().
+				Err(err).
+				Str("block", formatBlockRef(block)).
+				Msg("skip compressed state chain: merkle update does not apply")
+			return
+		}
+		nextHash := next.HashKey(0)
+		if !bytes.Equal(nextHash[:], stateRootHash) {
+			n.log.Debug().
+				Str("block", formatBlockRef(block)).
+				Msg("skip compressed state chain: state root hash mismatch")
+			return
+		}
+		if n.compressedState.RememberCompressedBlockState(&tnstore.BlockState{
+			Block:         block,
+			StateRootHash: stateRootHash,
+			Cell:          next,
+		}) {
+			n.NotifyCompressedBlockStateReady(block)
+		}
+	})
 }
 
 // decodeBlockBroadcastCompressedV2WithProofRoot decodes a compressed-v2 block

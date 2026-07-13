@@ -96,10 +96,12 @@ func TestClassifyDropsAlreadyAppliedMasterchainBroadcastBeforeSignatureCheck(t *
 		return sub.classifyBroadcast(nil, msg, payload, DeliverySimple, false, testPeerID("peer"))
 	}
 
-	// Fresh broadcast reaches the signature verifier (the junk block payload
-	// fails decode afterwards, which is fine for this test).
-	if accepted := classify(broadcast(300, 1)); accepted != nil {
-		t.Fatalf("junk broadcast was accepted: %+v", accepted)
+	// Fresh broadcast reaches the signature verifier. With verified
+	// signatures the decode is offloaded, so classify acknowledges the
+	// broadcast without an event; the junk payload fails decode later on the
+	// pool, which is fine for this test.
+	if accepted := classify(broadcast(300, 1)); accepted == nil || accepted.event != nil {
+		t.Fatalf("fresh broadcast should be acknowledged for async decode without an event, got %+v", accepted)
 	}
 	if calls := verifier.calls.Load(); calls != 1 {
 		t.Fatalf("fresh broadcast made %d signature checks, want 1", calls)
@@ -117,8 +119,8 @@ func TestClassifyDropsAlreadyAppliedMasterchainBroadcastBeforeSignatureCheck(t *
 		t.Fatalf("already-applied broadcasts reached the signature verifier: %d calls, want 1", calls)
 	}
 
-	if accepted := classify(broadcast(301, 4)); accepted != nil {
-		t.Fatalf("junk broadcast was accepted: %+v", accepted)
+	if accepted := classify(broadcast(301, 4)); accepted == nil || accepted.event != nil {
+		t.Fatalf("broadcast above applied seqno should be acknowledged for async decode, got %+v", accepted)
 	}
 	if calls := verifier.calls.Load(); calls != 2 {
 		t.Fatalf("broadcast above applied seqno made %d signature checks, want 2", calls)

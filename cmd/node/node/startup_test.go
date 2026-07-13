@@ -12,6 +12,12 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 )
 
+func TestLiteServerSendQueueSize(t *testing.T) {
+	if liteserverSendQueueSize != 2048 {
+		t.Fatalf("liteserver send queue size = %d, want %d", liteserverSendQueueSize, 2048)
+	}
+}
+
 func TestWriteLiteServerPublicKey(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
 	cfg := nodeconfig.Config{Lite: nodeconfig.Lite{Key: seed}}

@@ -111,11 +111,10 @@ func testStateCheckpointArtifactForCurrent(state *tnstore.BlockState, current *t
 		}
 	}
 	return &tnstore.ServedBlockFull{
-		ID:             block,
-		Block:          []byte{0x01},
-		Proof:          []byte{0x02},
-		Meta:           meta,
-		MessageEntries: []tnstore.MessageTransactionIndexEntry{},
+		ID:    block,
+		Block: []byte{0x01},
+		Proof: []byte{0x02},
+		Meta:  meta,
 	}
 }
 

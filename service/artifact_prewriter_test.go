@@ -65,11 +65,10 @@ func testArtifactPrewriterBlockState(seqno uint32, seed byte) (*storage.BlockSta
 		StateRootHash: bytes.Repeat([]byte{seed + 2}, 32),
 	}
 	artifact := &storage.ServedBlockFull{
-		ID:             block,
-		Block:          []byte{seed, 0x01},
-		Proof:          []byte{seed, 0x02},
-		Meta:           &storage.BlockMeta{ID: block, GenUTime: seqno},
-		MessageEntries: []storage.MessageTransactionIndexEntry{},
+		ID:    block,
+		Block: []byte{seed, 0x01},
+		Proof: []byte{seed, 0x02},
+		Meta:  &storage.BlockMeta{ID: block, GenUTime: seqno},
 	}
 	return state, artifact
 }

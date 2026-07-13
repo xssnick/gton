@@ -34,7 +34,11 @@ func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.Laz
 	return state, block.Meta.Clone(), records, nil
 }
 
-func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedStateUpdate, error) {
+// nonfinalParseStateUpdate extracts and validates the block's Merkle state
+// update. updateTrusted marks a publisher-provided StateUpdate as coming from
+// a signed, hash-anchored block whose update needs no standalone validation;
+// candidate-origin updates are unsigned, so they are always validated here.
+func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts, updateTrusted bool) (nonfinalParsedStateUpdate, error) {
 	root := block.Root
 	if root == nil && len(block.BlockData) > 0 {
 		parsed, err := ParseTrustedBlockBOC(block.Block, block.BlockData)
@@ -53,11 +57,8 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 	root = normalized
 
 	meta := block.Meta
-	// A publisher-provided update was already extracted and Merkle-validated at
-	// decode time (see LiveBlockArtifacts.StateUpdate); parse and validate only
-	// what is missing.
 	stateUpdate := block.StateUpdate
-	updateValidated := stateUpdate != nil
+	updateValidated := stateUpdate != nil && updateTrusted
 	if meta == nil {
 		parsed, err := storage.ParseVerifiedBlockCell(block.Block, root)
 		if err != nil {

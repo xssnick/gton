@@ -24,7 +24,6 @@ type checkpointArtifactWrite struct {
 	proofRefs       map[storage.ServedProofKind]*storage.ArtifactRef
 	proofRefIndexes map[storage.ServedProofKind]int
 	meta            *storage.BlockMeta
-	messageEntries  []storage.MessageTransactionIndexEntry
 }
 
 // prepareCheckpointArtifactWrites resolves the artifact writes for checkpoint
@@ -118,15 +117,6 @@ func (s *Store) buildCheckpointArtifactWrites(entries []storage.StateCheckpointB
 		if len(entry.Artifact.Block) > 0 {
 			blockRefIndex = queueArchiveAppend(packfile.KindBlock, entry.Artifact.ID, meta, entry.Artifact.ArchiveShardSplitDepth, entry.Artifact.Block)
 		}
-		// Checkpoint artifacts must carry the message->tx index extracted once at
-		// the ingest stage (empty slice = no indexable messages). The storage
-		// layer never parses block data: deriving entries here would hide parser
-		// gaps and silently persist blocks that tryLocateTx cannot serve.
-		messageEntries := entry.Artifact.MessageEntries
-		if messageEntries == nil {
-			return nil, nil, fmt.Errorf("checkpoint artifact %s has no message transaction index entries", storage.FormatBlockRef(entry.Artifact.ID))
-		}
-
 		proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
 		proofRefIndexes := make(map[storage.ServedProofKind]int, len(proofKinds))
 		for _, kind := range proofKinds {
@@ -152,7 +142,6 @@ func (s *Store) buildCheckpointArtifactWrites(entries []storage.StateCheckpointB
 			proofRefs:       proofRefs,
 			proofRefIndexes: proofRefIndexes,
 			meta:            meta,
-			messageEntries:  messageEntries,
 		})
 	}
 
@@ -180,9 +169,6 @@ func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkp
 	}
 	for _, write := range writes {
 		if err := s.setServedBlockFullArtifactRefs(batch, write.block, write.proofKinds, write.blockRef, write.proofRefs); err != nil {
-			return err
-		}
-		if err := setMessageTransactionIndexes(batch, write.messageEntries); err != nil {
 			return err
 		}
 	}
@@ -494,17 +480,9 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 	}
 	record := encodePersistentStateFileRecord(&stored)
 	key := hotKeyPersistentStateFile(stored.Block, stored.MasterchainBlock, stored.EffectiveShard)
-	cellsKey := hotKeyPersistentStateCells(stored.Block, stored.MasterchainBlock, stored.EffectiveShard)
 
 	if err := s.withHotBatch(func(batch *pebble.Batch) error {
 		if err := batch.Set(key, record, pebble.NoSync); err != nil {
-			return err
-		}
-		if stored.CellsCount > 0 {
-			if err := batch.Set(cellsKey, encodePersistentStateCellsCount(stored.CellsCount), pebble.NoSync); err != nil {
-				return err
-			}
-		} else if err := batch.Delete(cellsKey, pebble.NoSync); err != nil {
 			return err
 		}
 		if stored.EffectiveShard == 0 {
@@ -526,7 +504,6 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 	}
 
 	key := hotKeyPersistentStateFile(block, masterchainBlock, effectiveShard)
-	cellsKey := hotKeyPersistentStateCells(block, masterchainBlock, effectiveShard)
 	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
 	if err != nil {
 		return err
@@ -542,9 +519,6 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 
 	if err = s.withHotBatch(func(batch *pebble.Batch) error {
 		if err := batch.Delete(key, pebble.NoSync); err != nil {
-			return err
-		}
-		if err := batch.Delete(cellsKey, pebble.NoSync); err != nil {
 			return err
 		}
 		if effectiveShard == 0 {
@@ -750,7 +724,6 @@ func (s *Store) PersistentStateFile(ctx context.Context, block ton.BlockIDExt, m
 		},
 		FileHash:      bytes.Clone(record.fileHash),
 		StateRootHash: bytes.Clone(record.stateRootHash),
-		CellsCount:    record.cellsCount,
 	}, nil
 }
 
@@ -785,32 +758,6 @@ func (s *Store) persistentStateFileRecord(ctx context.Context, block ton.BlockID
 		return nil, err
 	}
 	return decodePersistentStateFileRecord(raw)
-}
-
-func (s *Store) PersistentStateCellsCountHint(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (uint64, error) {
-	prefix := hotKeyPersistentStateCellsPrefix(block, effectiveShard)
-	db, err := s.acquireHotDB(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer s.releaseHotDB()
-
-	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	if !iter.SeekLT(hotKeyPersistentStateCellsSeek(block, masterchainBlock, effectiveShard)) {
-		if err = iter.Error(); err != nil {
-			return 0, err
-		}
-		return 0, storage.ErrNotFound
-	}
-	return decodePersistentStateCellsCount(iter.Value())
 }
 
 func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error) {

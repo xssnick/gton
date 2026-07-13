@@ -30,7 +30,6 @@ type MaintenanceStorage interface {
 
 type PersistentStateSerializationStorage interface {
 	DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error
-	PersistentStateCellsCountHint(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (uint64, error)
 	SaveCellsInGeneration(ctx context.Context, generation uint64, records []*CellRecord) error
 	CellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*CellRecord, error)
 	LargeBOCLoadMeta(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error)
@@ -76,7 +75,6 @@ type BlockMetaStorage interface {
 	LookupBlockByLT(ctx context.Context, key BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
-	LookupMessageTransaction(ctx context.Context, kind MessageTransactionKind, key MessageTransactionKey) (MessageTransactionRef, error)
 }
 
 type CellStorage interface {

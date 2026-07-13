@@ -11,6 +11,7 @@ const (
 	broadcastPipelineStageFinalityAssemble  = "block_finality_assemble"
 	broadcastPipelineStageHotCacheNotify    = "hot_cache_notify"
 	broadcastPipelineStageExactPop          = "exact_pop"
+	broadcastPipelineStageDecodeAsync       = "decode_async"
 
 	broadcastPipelineResultSuccess = "success"
 	broadcastPipelineResultDrop    = "drop"

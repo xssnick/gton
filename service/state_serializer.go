@@ -74,10 +74,9 @@ const (
 )
 
 type serializedStateFile struct {
-	path       string
-	size       int64
-	fileHash   []byte
-	cellsCount uint64
+	path     string
+	size     int64
+	fileHash []byte
 }
 
 func newStateSerializer(logger zerolog.Logger, store storage.Storage, dir string, disableAutomatic bool, largeBOCBatchSize int, stateSerializeOnePass bool) *stateSerializer {
@@ -416,11 +415,6 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 			if !errors.Is(err, storage.ErrNotFound) {
 				return fmt.Errorf("check existing %s state %s part %s: %w", target.kind, storage.FormatBlockRef(target.block), part.Kind, err)
 			}
-			cellsCountHint, err := s.persistentStateCellsCountHint(ctx, master, target.block, part.EffectiveShard)
-			if err != nil {
-				return fmt.Errorf("load previous %s state %s part %s cells count: %w", target.kind, storage.FormatBlockRef(target.block), part.Kind, err)
-			}
-
 			s.log.Info().
 				Str("block", storage.FormatBlockRef(target.block)).
 				Str("masterchain", storage.FormatBlockRef(master)).
@@ -432,10 +426,9 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 				Int("part_index", partIndex+1).
 				Int("parts", len(parts)).
 				Bool("one_pass_large_boc", onePassLargeBOC).
-				Uint64("cells_count_hint", cellsCountHint).
 				Msg("serializing persistent state part")
 
-			file, err = s.serializeStatePart(ctx, master, target, part, onePassLargeBOC, cellsCountHint)
+			file, err = s.serializeStatePart(ctx, master, target, part, onePassLargeBOC)
 			if err != nil {
 				return fmt.Errorf("serialize %s state %s part %s: %w", target.kind, storage.FormatBlockRef(target.block), part.Kind, err)
 			}
@@ -450,7 +443,6 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 				},
 				FileHash:      file.fileHash,
 				StateRootHash: target.state.StateRootHash,
-				CellsCount:    file.cellsCount,
 			}); err != nil {
 				return fmt.Errorf("register persistent state file: %w", err)
 			}
@@ -462,8 +454,6 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 				Str("part", part.Kind.String()).
 				Int64("effective_shard", part.EffectiveShard).
 				Int64("size", file.size).
-				Uint64("cells", file.cellsCount).
-				Uint64("cells_count_hint", cellsCountHint).
 				Str("path", file.path).
 				Msg("persistent state part serialized and registered")
 		}
@@ -488,24 +478,6 @@ func (s *stateSerializer) existingSerializedState(ctx context.Context, master to
 		path: finalPath,
 		size: size,
 	}, nil
-}
-
-func (s *stateSerializer) persistentStateCellsCountHint(ctx context.Context, master ton.BlockIDExt, block ton.BlockIDExt, effectiveShard int64) (uint64, error) {
-	file, err := s.store.PersistentStateFile(ctx, block, master, effectiveShard)
-	if err == nil && file.CellsCount > 0 {
-		// Metadata can outlive a missing artifact. Its count came from the exact
-		// previous traversal of this state part and is the best recovery hint.
-		return file.CellsCount, nil
-	}
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return 0, err
-	}
-
-	count, err := s.store.PersistentStateCellsCountHint(ctx, block, master, effectiveShard)
-	if errors.Is(err, storage.ErrNotFound) {
-		return 0, nil
-	}
-	return count, err
 }
 
 func (s *stateSerializer) loadTargets(ctx context.Context, master ton.BlockIDExt, scope PersistentStateSerializationScope) ([]stateSerializationTarget, error) {
@@ -591,7 +563,7 @@ func (s *stateSerializer) useOnePassLargeBOCForStateSerialization(target stateSe
 	return s.stateSerializeOnePass || useOnePassLargeBOCForStateSerialization(target, parts)
 }
 
-func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.BlockIDExt, target stateSerializationTarget, part state2.PersistentStatePart, onePassLargeBOC bool, cellsCountHint uint64) (serializedStateFile, error) {
+func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.BlockIDExt, target stateSerializationTarget, part state2.PersistentStatePart, onePassLargeBOC bool) (serializedStateFile, error) {
 	var err error
 	if part.Kind != state2.PersistentStatePartUnsplit {
 		records, err := splitStateCellRecords(ctx, part.Root)
@@ -633,9 +605,9 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 
 	releaseCompactions := s.store.ThrottleCellCompactions()
 	if onePassLargeBOC {
-		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, cellsCountHint, s.largeBOCBatchSize)
+		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
 	} else {
-		err = cell.ToLargeBOC(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, cellsCountHint, s.largeBOCBatchSize)
+		err = cell.ToLargeBOC(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
 	}
 	releaseCompactions()
 	progressStop()
@@ -663,13 +635,10 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 		return serializedStateFile{}, err
 	}
 
-	// The metadata phase visits every deduplicated cell hash exactly once in
-	// both two-pass and one-pass serializers, so this is the actual graph size.
 	return serializedStateFile{
-		path:       finalPath,
-		size:       stat.Size(),
-		fileHash:   hash.Sum(nil),
-		cellsCount: loader.metaLoaded.Load(),
+		path:     finalPath,
+		size:     stat.Size(),
+		fileHash: hash.Sum(nil),
 	}, nil
 }
 

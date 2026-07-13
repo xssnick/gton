@@ -28,12 +28,11 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 
 	if _, err := store.SaveStateCheckpointEntries(context.Background(), []tnstore.StateCheckpointBlock{{
 		Artifact: &tnstore.ServedBlockFull{
-			ID:             downloaded.ID,
-			Block:          downloaded.BlockBOC,
-			Proof:          proofBOC,
-			Meta:           downloaded.Meta,
-			IsLink:         downloaded.IsLink,
-			MessageEntries: []tnstore.MessageTransactionIndexEntry{},
+			ID:     downloaded.ID,
+			Block:  downloaded.BlockBOC,
+			Proof:  proofBOC,
+			Meta:   downloaded.Meta,
+			IsLink: downloaded.IsLink,
 		},
 	}}, tnstore.StateCellRecords{}, nil); err != nil {
 		t.Fatalf("save fixture block: %v", err)

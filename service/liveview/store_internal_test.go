@@ -3,10 +3,7 @@ package liveview
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"os"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -47,10 +44,9 @@ func TestStorePublishLiveBlockArtifactsRejectsInvalidReadFragments(t *testing.T)
 		Cell:          stateRoot,
 	}
 	artifacts := storage.LiveBlockArtifacts{
-		Block:          block,
-		Root:           root,
-		State:          &state,
-		MessageEntries: []storage.MessageTransactionIndexEntry{},
+		Block: block,
+		Root:  root,
+		State: &state,
 	}
 
 	t.Run("read artifacts", func(t *testing.T) {
@@ -79,55 +75,6 @@ func TestStorePublishLiveBlockArtifactsRejectsInvalidReadFragments(t *testing.T)
 			t.Fatalf("load availability-only block root: %v", err)
 		}
 	})
-}
-
-func TestPrepareLiveBlockArtifactsOnlyReparsesMessageEntriesForNonFinal(t *testing.T) {
-	raw, err := os.ReadFile("../testdata/masterchain_block_fixture.json")
-	if err != nil {
-		t.Fatalf("read block fixture: %v", err)
-	}
-	var fixture struct {
-		RawBOCBase64 string `json:"raw_boc_base64"`
-	}
-	if err = json.Unmarshal(raw, &fixture); err != nil {
-		t.Fatalf("decode block fixture: %v", err)
-	}
-	boc, err := base64.StdEncoding.DecodeString(fixture.RawBOCBase64)
-	if err != nil {
-		t.Fatalf("decode block boc: %v", err)
-	}
-	root, err := cell.FromBOC(boc)
-	if err != nil {
-		t.Fatalf("parse block boc: %v", err)
-	}
-	block := ton.BlockIDExt{
-		Workchain: -1,
-		Shard:     masterchainShard,
-		SeqNo:     58508098,
-		RootHash:  root.Hash(),
-		FileHash:  bytes.Repeat([]byte{0x55}, 32),
-	}
-	artifacts := storage.LiveBlockArtifacts{
-		Block:            block,
-		Root:             root,
-		AvailabilityOnly: true,
-	}
-
-	finalOnly, err := prepareLiveBlockArtifacts(artifacts, false)
-	if err != nil {
-		t.Fatalf("prepare final-only artifacts: %v", err)
-	}
-	if finalOnly.messageEntries != nil {
-		t.Fatalf("final-only artifacts rebuilt %d message entries", len(finalOnly.messageEntries))
-	}
-
-	nonFinal, err := prepareLiveBlockArtifacts(artifacts, true)
-	if err != nil {
-		t.Fatalf("prepare non-final artifacts: %v", err)
-	}
-	if len(nonFinal.messageEntries) == 0 {
-		t.Fatal("non-final artifacts did not rebuild message entries")
-	}
 }
 
 func TestStoreReleasesCurrentCachesWhenBlockLeavesCurrent(t *testing.T) {
@@ -189,31 +136,6 @@ func TestStoreReleasesCurrentCachesWhenBlockLeavesCurrent(t *testing.T) {
 	}
 }
 
-func TestStoreReleasesMessageIndexAfterArtifactFlush(t *testing.T) {
-	block := testLiveBlockID(-1, masterchainShard, 50, 0x50)
-	entry := storage.MessageTransactionIndexEntry{
-		Kind: storage.MessageTransactionInbound,
-		Ref:  storage.MessageTransactionRef{Block: block},
-	}
-	key := storage.BlockKey(block)
-	live := New(noopBacking{})
-	live.current = &storage.CurrentState{Masterchain: storage.BlockState{Block: block}}
-	live.blocks[key] = &liveBlock{
-		id:             block,
-		messageEntries: []storage.MessageTransactionIndexEntry{entry},
-	}
-	live.addMessageTransactionIndexLocked(key, []storage.MessageTransactionIndexEntry{entry})
-
-	live.MarkLiveBlockFlushed(block)
-
-	if len(live.messageIndex) != 0 || len(live.messageBlockIndex) != 0 {
-		t.Fatal("flushed block retained its message transaction index")
-	}
-	if cached := live.blocks[key]; cached == nil || cached.messageEntries != nil {
-		t.Fatal("flushed block retained message transaction entries")
-	}
-}
-
 func testLiveBlockID(workchain int32, shard int64, seqno uint32, fill byte) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: workchain,
@@ -268,10 +190,6 @@ func (noopBacking) LookupBlockByAccountLT(context.Context, int32, []byte, uint64
 
 func (noopBacking) LookupBlockByUnixTime(context.Context, storage.BlockHistoryKey, uint32) (ton.BlockIDExt, error) {
 	return ton.BlockIDExt{}, storage.ErrNotFound
-}
-
-func (noopBacking) LookupMessageTransaction(context.Context, storage.MessageTransactionKind, storage.MessageTransactionKey) (storage.MessageTransactionRef, error) {
-	return storage.MessageTransactionRef{}, storage.ErrNotFound
 }
 
 func (noopBacking) LazyCellLoader() cell.LazyCellLoader {

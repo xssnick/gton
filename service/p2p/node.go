@@ -65,6 +65,9 @@ type Node struct {
 	eventQueue          *boundedQueue[BroadcastEvent]
 	deduper             *eventDeduper
 	customFanoutDeduper *eventDeduper
+	decodedBroadcasts   decodedBroadcastCache
+	decodeQueue         chan offloadedBroadcastDecode
+	decodeWorkersOnce   sync.Once
 
 	myExternalMessages        *eventDeduper
 	processedExternalMessages *eventDeduper
@@ -912,6 +915,13 @@ func (n *Node) acquirePeerEndpoint(peerID PeerID, addr string, key ed25519.Publi
 
 	n.pool.mx.Lock()
 	pooled := n.pool.peers[peerID]
+	if pooled != nil && pooledPeerClosed(pooled) {
+		// The transport is already closed but the asynchronous disconnect
+		// cascade has not pruned the pool entry yet; reusing it would attach
+		// a dead connection. Prune like removeDisconnected and reconnect.
+		delete(n.pool.peers, peerID)
+		pooled = nil
+	}
 	if pooled != nil {
 		pooled.refs++
 		n.pool.mx.Unlock()
@@ -1085,7 +1095,10 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	defer p.mx.Unlock()
 
 	if pooled := p.peers[id]; pooled != nil {
-		return pooled, false, nil
+		if !pooledPeerClosed(pooled) {
+			return pooled, false, nil
+		}
+		delete(p.peers, id)
 	}
 
 	wrapper := overlay.CreateExtendedADNL(peer)
@@ -1210,8 +1223,27 @@ func (p *peerPool) retainByID(peerID PeerID) *pooledPeer {
 	if pooled == nil {
 		return nil
 	}
+	if pooledPeerClosed(pooled) {
+		delete(p.peers, peerID)
+		return nil
+	}
 	pooled.refs++
 	return pooled
+}
+
+// pooledPeerClosed reports whether the pooled transport has already been
+// closed underneath (the disconnect cascade prunes the pool asynchronously,
+// so a closed entry can linger in the map for a moment).
+func pooledPeerClosed(pooled *pooledPeer) bool {
+	if pooled == nil || pooled.adnl == nil {
+		return false
+	}
+	select {
+	case <-pooled.adnl.GetCloserCtx().Done():
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *peerPool) releaseRetained(pooled *pooledPeer) {

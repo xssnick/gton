@@ -115,11 +115,10 @@ func TestSaveStateCheckpointEntriesRejectsIncompleteArtifactBlockIDHashes(t *tes
 	block := ton.BlockIDExt{Workchain: 0, Shard: topShard, SeqNo: 44}
 	_, err = store.SaveStateCheckpointEntries(context.Background(), []storage.StateCheckpointBlock{{
 		Artifact: &storage.ServedBlockFull{
-			ID:             block,
-			Block:          []byte{0x01},
-			Proof:          []byte{0x02},
-			Meta:           &storage.BlockMeta{ID: block, StartLT: 10, EndLT: 20},
-			MessageEntries: []storage.MessageTransactionIndexEntry{},
+			ID:    block,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  &storage.BlockMeta{ID: block, StartLT: 10, EndLT: 20},
 		},
 	}}, storage.StateCellRecords{}, nil)
 	if !errors.Is(err, storage.ErrInvalidBlockIDHashes) {
@@ -155,11 +154,10 @@ func TestSaveStateCheckpointEntriesRejectsIncompleteCurrentBlockIDHashes(t *test
 
 	_, err = store.SaveStateCheckpointEntries(context.Background(), []storage.StateCheckpointBlock{{
 		Artifact: &storage.ServedBlockFull{
-			ID:             block,
-			Block:          []byte{0x01},
-			Proof:          []byte{0x02},
-			Meta:           &storage.BlockMeta{ID: block, GenUTime: 123, StartLT: 10, EndLT: 20},
-			MessageEntries: []storage.MessageTransactionIndexEntry{},
+			ID:    block,
+			Block: []byte{0x01},
+			Proof: []byte{0x02},
+			Meta:  &storage.BlockMeta{ID: block, GenUTime: 123, StartLT: 10, EndLT: 20},
 		},
 	}}, storage.StateCellRecords{}, current)
 	if !errors.Is(err, storage.ErrInvalidBlockIDHashes) {
@@ -1372,16 +1370,14 @@ func TestStateCheckpointEntriesPublishesBlockArtifactsAfterPackSync(t *testing.T
 				EndLT:    20,
 				PrevRefs: []ton.BlockIDExt{prev},
 			},
-			MessageEntries: []storage.MessageTransactionIndexEntry{},
 		},
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: block}},
 	}, {
 		Artifact: &storage.ServedBlockFull{
-			ID:             prev,
-			Block:          []byte{0x20},
-			Proof:          []byte{0x21},
-			Meta:           &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
-			MessageEntries: []storage.MessageTransactionIndexEntry{},
+			ID:    prev,
+			Block: []byte{0x20},
+			Proof: []byte{0x21},
+			Meta:  &storage.BlockMeta{ID: prev, GenUTime: prev.SeqNo},
 		},
 	}}, storage.StateCellRecords{}, current)
 	if err != nil {
@@ -1479,10 +1475,9 @@ func TestStateCheckpointEntriesRejectsNonZeroStateWithPartialArtifact(t *testing
 	_, err = store.SaveStateCheckpointEntries(ctx, []storage.StateCheckpointBlock{{
 		State: state,
 		Artifact: &storage.ServedBlockFull{
-			ID:             state.Block,
-			Block:          []byte{0x30, 0x31},
-			Meta:           &storage.BlockMeta{ID: state.Block, GenUTime: 123},
-			MessageEntries: []storage.MessageTransactionIndexEntry{},
+			ID:    state.Block,
+			Block: []byte{0x30, 0x31},
+			Meta:  &storage.BlockMeta{ID: state.Block, GenUTime: 123},
 		},
 	}}, storage.StateCellRecords{}, current)
 	if err == nil || !strings.Contains(err.Error(), "artifact has no proof") {

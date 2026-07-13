@@ -52,35 +52,6 @@ func decodeBlockIDFromHashes(workchain int32, shard int64, seqno uint32, data []
 	}, nil
 }
 
-func encodeMessageTransactionRef(ref storage.MessageTransactionRef) []byte {
-	buf := make([]byte, 0, 4+32+8+32+80)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(ref.Workchain))
-	buf = append(buf, ref.Account[:]...)
-	buf = binary.BigEndian.AppendUint64(buf, ref.LT)
-	buf = append(buf, ref.Hash[:]...)
-	return append(buf, encodeBlockID(ref.Block)...)
-}
-
-func decodeMessageTransactionRef(data []byte) (storage.MessageTransactionRef, error) {
-	if len(data) != 4+32+8+32+80 {
-		return storage.MessageTransactionRef{}, fmt.Errorf("invalid message transaction ref size %d", len(data))
-	}
-
-	ref := storage.MessageTransactionRef{
-		Workchain: int32(binary.BigEndian.Uint32(data[:4])),
-		LT:        binary.BigEndian.Uint64(data[36:44]),
-	}
-	copy(ref.Account[:], data[4:36])
-	copy(ref.Hash[:], data[44:76])
-
-	block, err := decodeBlockID(data[76:])
-	if err != nil {
-		return storage.MessageTransactionRef{}, err
-	}
-	ref.Block = block
-	return ref, nil
-}
-
 // blockMetaMinEncodedLen is the fixed header of an encoded block meta:
 // version byte, flags word, gen utime, start/end lt, the two hash length
 // bytes, the masterchain ref flag byte and the prev/next ref count bytes.
@@ -707,16 +678,14 @@ type persistentStateFileRecord struct {
 	size          int64
 	fileHash      []byte
 	stateRootHash []byte
-	cellsCount    uint64
 }
 
 func encodePersistentStateFileRecord(file *storage.PersistentStateFile) []byte {
-	buf := make([]byte, 0, 1+1+len(file.FileHash)+1+len(file.StateRootHash)+8+8)
+	buf := make([]byte, 0, 1+1+len(file.FileHash)+1+len(file.StateRootHash)+8)
 	buf = append(buf, persistentStateVersion)
 	buf = appendLenBytes(buf, file.FileHash)
 	buf = appendLenBytes(buf, file.StateRootHash)
-	buf = binary.BigEndian.AppendUint64(buf, uint64(file.Ref.Size))
-	return binary.BigEndian.AppendUint64(buf, file.CellsCount)
+	return binary.BigEndian.AppendUint64(buf, uint64(file.Ref.Size))
 }
 
 func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, error) {
@@ -724,7 +693,7 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
 	version := data[0]
-	if version != persistentStateVersionV1 && version != persistentStateVersion {
+	if version != persistentStateVersion && version != persistentStateCellsCountVersion {
 		return nil, fmt.Errorf("persistent state file version mismatch")
 	}
 	pos := 1
@@ -742,7 +711,7 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 	pos = next
 
 	tailSize := 8
-	if version == persistentStateVersion {
+	if version == persistentStateCellsCountVersion {
 		tailSize += 8
 	}
 	if len(data)-pos != tailSize {
@@ -752,33 +721,11 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 	if size < 0 {
 		return nil, fmt.Errorf("persistent state file size is invalid")
 	}
-	pos += 8
-
-	cellsCount := uint64(0)
-	if version == persistentStateVersion {
-		cellsCount = binary.BigEndian.Uint64(data[pos : pos+8])
-	}
 	return &persistentStateFileRecord{
 		size:          size,
 		fileHash:      fileHash,
 		stateRootHash: stateRootHash,
-		cellsCount:    cellsCount,
 	}, nil
-}
-
-func encodePersistentStateCellsCount(count uint64) []byte {
-	return binary.BigEndian.AppendUint64(nil, count)
-}
-
-func decodePersistentStateCellsCount(data []byte) (uint64, error) {
-	if len(data) != 8 {
-		return 0, fmt.Errorf("persistent state cells count size mismatch: %d", len(data))
-	}
-	count := binary.BigEndian.Uint64(data)
-	if count == 0 {
-		return 0, fmt.Errorf("persistent state cells count is zero")
-	}
-	return count, nil
 }
 
 func appendLenBytes(dst []byte, data []byte) []byte {

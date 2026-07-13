@@ -1145,7 +1145,7 @@ func TestRemovePeerStopsRebroadcastWorkers(t *testing.T) {
 	})
 
 	sub.startPeerRebroadcastWorker(peer)
-	sub.removePeer(peer.id)
+	sub.removePeerIfCurrent(peer)
 
 	done := make(chan struct{})
 	go func() {

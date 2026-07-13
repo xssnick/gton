@@ -34,6 +34,10 @@ func (p *testFailOnceCompressedStateProvider) StateRootForCompressedBlock(contex
 	return p.state, nil
 }
 
+func (p *testFailOnceCompressedStateProvider) RememberCompressedBlockState(*tnstore.BlockState) bool {
+	return false
+}
+
 func (o *testBroadcastPipelineObserver) ObserveBroadcastPipelineStage(observation BroadcastPipelineStageObservation) {
 	o.observations = append(o.observations, observation)
 }

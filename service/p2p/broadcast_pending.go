@@ -145,7 +145,16 @@ func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, r
 			continue
 		}
 
+		started := n.startBroadcastPipelineStage()
 		downloaded, err := n.decodePendingBlockBroadcast(ctx, req)
+		result := broadcastPipelineResultSuccess
+		if err != nil {
+			result = broadcastPipelineResultError
+			if isBroadcastDecompressionStateNotReady(err) {
+				result = broadcastPipelineResultMiss
+			}
+		}
+		n.observeBroadcastPipelineStageSince(started, broadcastPipelineStageDecodeAsync, req.kind, req.delivery, result)
 		if err != nil {
 			if isBroadcastDecompressionStateNotReady(err) {
 				continue

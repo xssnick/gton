@@ -22,11 +22,10 @@ func testPrewriteServedBlock(block ton.BlockIDExt, masterSeqno uint32, blockData
 		meta.MasterchainRefSeqno = masterSeqno
 	}
 	return &storage.ServedBlockFull{
-		ID:             block,
-		Block:          blockData,
-		Proof:          proofData,
-		Meta:           meta,
-		MessageEntries: []storage.MessageTransactionIndexEntry{},
+		ID:    block,
+		Block: blockData,
+		Proof: proofData,
+		Meta:  meta,
 	}
 }
 

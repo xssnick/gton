@@ -20,7 +20,7 @@ import (
 
 const (
 	DefaultAPIVersion     = "v2.1.13-7b98025"
-	maxBodyBytes          = int64(18 << 20)
+	maxBodyBytes          = int64(8 << 20)
 	defaultRequestTimeout = 10 * time.Second
 )
 

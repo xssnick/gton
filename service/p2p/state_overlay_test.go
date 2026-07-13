@@ -54,7 +54,7 @@ func testStateCheckpointArtifact(state *tnstore.BlockState) *tnstore.ServedBlock
 		ID:    block,
 		Block: []byte{0x01},
 		Proof: []byte{0x02},
-		Meta:  meta, MessageEntries: []tnstore.MessageTransactionIndexEntry{},
+		Meta:  meta,
 	}
 }
 

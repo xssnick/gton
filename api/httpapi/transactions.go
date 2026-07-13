@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
@@ -33,6 +34,9 @@ const (
 	shortTxIDMode            = 135
 	defaultHistoryLimit      = 10
 	maxHistoryLimit          = 100
+	messageLookupBlockLimit  = 40
+	messageLookupMinHistory  = 10
+	messageLookupLTStep      = 1_000_000
 )
 
 type blockTransactions struct {
@@ -478,97 +482,274 @@ func (s *Server) handleTransactionsStd(ctx context.Context, params requestParams
 }
 
 func (s *Server) handleTryLocateTx(ctx context.Context, params requestParams) (any, *apiError) {
-	return s.handleTryLocateMessageTransaction(ctx, params, storage.MessageTransactionInbound)
+	return s.handleTryLocateInboundMessageTransaction(ctx, params)
 }
 
 func (s *Server) handleTryLocateResultTx(ctx context.Context, params requestParams) (any, *apiError) {
-	return s.handleTryLocateMessageTransaction(ctx, params, storage.MessageTransactionInbound)
+	return s.handleTryLocateInboundMessageTransaction(ctx, params)
 }
 
 func (s *Server) handleTryLocateSourceTx(ctx context.Context, params requestParams) (any, *apiError) {
-	return s.handleTryLocateMessageTransaction(ctx, params, storage.MessageTransactionOutbound)
+	query, apiErr := messageTransactionQueryFromParams(params)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	located, apiErr := s.locateOutboundMessageTransaction(ctx, query)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	return formatLocatedMessageTransaction(located)
 }
 
-func (s *Server) handleTryLocateMessageTransaction(ctx context.Context, params requestParams, kind storage.MessageTransactionKind) (any, *apiError) {
-	key, apiErr := messageTransactionKeyFromParams(params)
+func (s *Server) handleTryLocateInboundMessageTransaction(ctx context.Context, params requestParams) (any, *apiError) {
+	query, apiErr := messageTransactionQueryFromParams(params)
 	if apiErr != nil {
 		return nil, apiErr
 	}
 
-	ref, err := s.store.LookupMessageTransaction(ctx, kind, key)
-	if err != nil {
-		return nil, internalError("cannot locate transaction: " + err.Error())
-	}
-
-	tx, txCell, apiErr := s.loadLocatedTransaction(ctx, ref)
+	located, apiErr := s.locateInboundMessageTransaction(ctx, query)
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	formatted, err := extTransactionFromTLB(extTransactionType, ref.Workchain, tonBlockRef{block: ref.Block}, tx, txCell)
+	return formatLocatedMessageTransaction(located)
+}
+
+type messageTransactionQuery struct {
+	source      *address.Address
+	destination *address.Address
+	createdLT   uint64
+}
+
+type locatedMessageTransaction struct {
+	block ton.BlockIDExt
+	cell  *cell.Cell
+}
+
+func messageTransactionQueryFromParams(params requestParams) (messageTransactionQuery, *apiError) {
+	source, _, _, apiErr := parseStdAddressParam(params, "source")
+	if apiErr != nil {
+		return messageTransactionQuery{}, apiErr
+	}
+	destination, _, _, apiErr := parseStdAddressParam(params, "destination")
+	if apiErr != nil {
+		return messageTransactionQuery{}, apiErr
+	}
+	createdLT, ok, apiErr := params.optionalUint64("created_lt")
+	if apiErr != nil {
+		return messageTransactionQuery{}, apiErr
+	}
+	if !ok {
+		return messageTransactionQuery{}, validationError("failed to parse request: missing required field \"created_lt\"")
+	}
+
+	return messageTransactionQuery{source: source, destination: destination, createdLT: createdLT}, nil
+}
+
+func formatLocatedMessageTransaction(located locatedMessageTransaction) (any, *apiError) {
+	tx, apiErr := parseAccountTransaction(located.cell)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	formatted, err := extTransactionFromTLB(extTransactionType, located.block.Workchain,
+		tonBlockRef{block: located.block}, tx, located.cell)
 	if err != nil {
 		return nil, internalError("cannot format transaction: " + err.Error())
 	}
 	return formatted, nil
 }
 
-func messageTransactionKeyFromParams(params requestParams) (storage.MessageTransactionKey, *apiError) {
-	source, apiErr := messageTransactionAddressFromParams(params, "source")
-	if apiErr != nil {
-		return storage.MessageTransactionKey{}, apiErr
+func messageTransactionNotFound() *apiError {
+	return &apiError{
+		status:  http.StatusNotFound,
+		code:    http.StatusNotFound,
+		message: "transaction was not found",
 	}
-	destination, apiErr := messageTransactionAddressFromParams(params, "destination")
-	if apiErr != nil {
-		return storage.MessageTransactionKey{}, apiErr
-	}
-	createdLT, ok, apiErr := params.optionalUint64("created_lt")
-	if apiErr != nil {
-		return storage.MessageTransactionKey{}, apiErr
-	}
-	if !ok {
-		return storage.MessageTransactionKey{}, validationError("failed to parse request: missing required field \"created_lt\"")
-	}
-
-	return storage.MessageTransactionKey{
-		Source:      source,
-		Destination: destination,
-		CreatedLT:   createdLT,
-	}, nil
 }
 
-func messageTransactionAddressFromParams(params requestParams, name string) (storage.MessageTransactionAddress, *apiError) {
-	addr, _, raw, apiErr := parseAddressParam(params, name)
-	if apiErr != nil {
-		return storage.MessageTransactionAddress{}, apiErr
-	}
-	parsed, err := storage.MessageTransactionAddressFromTON(addr)
-	if err != nil {
-		return storage.MessageTransactionAddress{}, addressParamError(params, name, raw)
-	}
-	return parsed, nil
-}
-
-func (s *Server) loadLocatedTransaction(ctx context.Context, ref storage.MessageTransactionRef) (*tlb.Transaction, *cell.Cell, *apiError) {
-	accounts, apiErr := s.loadBlockAccountBlocks(ctx, ref.Block)
-	if apiErr != nil {
-		return nil, nil, apiErr
-	}
-
-	txCell, err := findBlockTransactionCell(accounts, ref.Account[:], ref.LT)
+func (s *Server) locateOutboundMessageTransaction(ctx context.Context, query messageTransactionQuery) (locatedMessageTransaction, *apiError) {
+	account := query.source.Data()
+	block, err := s.store.LookupBlockByAccountLT(ctx, query.source.Workchain(), account, query.createdLT)
 	if errors.Is(err, storage.ErrNotFound) {
-		return nil, nil, internalError("cannot locate transaction in indexed block")
+		return locatedMessageTransaction{}, messageTransactionNotFound()
 	}
 	if err != nil {
-		return nil, nil, internalError("cannot list block transactions: " + err.Error())
+		return locatedMessageTransaction{}, internalError("cannot locate transaction block: " + err.Error())
 	}
-	if !bytes.Equal(txCell.Hash(), ref.Hash[:]) {
-		return nil, nil, internalError("located transaction hash mismatch")
+	if !blockproof.BlockContainsAccount(block, query.source.Workchain(), account) {
+		return locatedMessageTransaction{}, internalError("cannot locate transaction: block cannot contain source account")
 	}
 
-	tx, apiErr := parseAccountTransaction(txCell)
+	accounts, apiErr := s.loadBlockAccountBlocks(ctx, block)
 	if apiErr != nil {
-		return nil, nil, apiErr
+		return locatedMessageTransaction{}, apiErr
 	}
-	return tx, txCell, nil
+
+	entry, err := findBlockTransactionBefore(accounts, account, query.createdLT)
+	if errors.Is(err, storage.ErrNotFound) {
+		return locatedMessageTransaction{}, messageTransactionNotFound()
+	}
+	if err != nil {
+		return locatedMessageTransaction{}, internalError("cannot locate source transaction: " + err.Error())
+	}
+
+	header, err := parseTransactionLookupHeader(entry.cell)
+	if err != nil {
+		return locatedMessageTransaction{}, internalError("cannot parse source transaction: " + err.Error())
+	}
+	if header.lt != entry.lt {
+		return locatedMessageTransaction{}, internalError("cannot locate source transaction: transaction LT does not match dictionary key")
+	}
+	if !bytes.Equal(header.account[:], account) {
+		return locatedMessageTransaction{}, internalError("cannot locate source transaction: transaction account does not match account block")
+	}
+
+	// TON assigns an outbound message created_lt as transaction LT + 1 + its
+	// output dictionary index, so one point lookup identifies the message.
+	delta := query.createdLT - header.lt
+	if delta == 0 || delta > uint64(header.outMsgCount) {
+		return locatedMessageTransaction{}, messageTransactionNotFound()
+	}
+	messageCell, err := transactionOutboundMessageCell(header.io, uint16(delta-1))
+	if errors.Is(err, storage.ErrNotFound) {
+		return locatedMessageTransaction{}, messageTransactionNotFound()
+	}
+	if err != nil {
+		return locatedMessageTransaction{}, internalError("cannot load source transaction message: " + err.Error())
+	}
+	match, err := internalMessageMatches(messageCell, query)
+	if err != nil {
+		return locatedMessageTransaction{}, internalError("cannot parse source transaction message: " + err.Error())
+	}
+	if !match {
+		return locatedMessageTransaction{}, messageTransactionNotFound()
+	}
+
+	return locatedMessageTransaction{block: block, cell: entry.cell}, nil
+}
+
+func (s *Server) locateInboundMessageTransaction(ctx context.Context, query messageTransactionQuery) (locatedMessageTransaction, *apiError) {
+	account := query.destination.Data()
+	seenBlocks := make(map[storage.BlockRootHash]struct{}, 3)
+	seenTransactions := make(map[uint64]struct{}, messageLookupBlockLimit)
+
+	// An inbound message may be processed well after it was created. Match the
+	// bounded LT probes used by ton-http-api instead of allowing an unbounded
+	// archive scan on a request path.
+	for probe := uint64(0); probe < 3; probe++ {
+		offset := probe * messageLookupLTStep
+		if offset > ^uint64(0)-query.createdLT {
+			break
+		}
+
+		block, err := s.store.LookupBlockByAccountLT(ctx, query.destination.Workchain(), account, query.createdLT+offset)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return locatedMessageTransaction{}, internalError("cannot locate transaction block: " + err.Error())
+		}
+		if !blockproof.BlockContainsAccount(block, query.destination.Workchain(), account) {
+			return locatedMessageTransaction{}, internalError("cannot locate transaction: block cannot contain destination account")
+		}
+
+		blockKey := storage.BlockKey(block)
+		if _, ok := seenBlocks[blockKey]; ok {
+			continue
+		}
+		seenBlocks[blockKey] = struct{}{}
+
+		accounts, apiErr := s.loadBlockAccountBlocks(ctx, block)
+		if apiErr != nil {
+			return locatedMessageTransaction{}, apiErr
+		}
+		entries, err := latestBlockTransactions(accounts, account, messageLookupBlockLimit)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return locatedMessageTransaction{}, internalError("cannot locate result transaction: " + err.Error())
+		}
+		current := &accountTxBlock{id: block, accounts: accounts}
+		for i := range entries {
+			entries[i].block = current
+		}
+		// A single descending iterator covers a dense account block. Sparse blocks
+		// are extended to ten history items, while dense blocks stay capped at the
+		// same forty-item bound as ton-http-api.
+		historyLimit := len(entries)
+		if historyLimit < messageLookupMinHistory {
+			historyLimit = messageLookupMinHistory
+		}
+		for scanned := 0; scanned < historyLimit && scanned < len(entries); scanned++ {
+			entry := entries[scanned]
+			if _, ok := seenTransactions[entry.lt]; ok {
+				break
+			}
+			seenTransactions[entry.lt] = struct{}{}
+
+			header, err := parseTransactionLookupHeader(entry.cell)
+			if err != nil {
+				return locatedMessageTransaction{}, internalError("cannot parse result transaction: " + err.Error())
+			}
+			if header.lt != entry.lt {
+				return locatedMessageTransaction{}, internalError("cannot locate result transaction: transaction LT does not match dictionary key")
+			}
+			if !bytes.Equal(header.account[:], account) {
+				return locatedMessageTransaction{}, internalError("cannot locate result transaction: transaction account does not match account block")
+			}
+			if header.lt <= query.createdLT {
+				break
+			}
+
+			messageCell, err := transactionInboundMessageCellFromIO(header.io)
+			if err != nil {
+				return locatedMessageTransaction{}, internalError("cannot load result transaction message: " + err.Error())
+			}
+			if messageCell != nil {
+				match, err := internalMessageMatches(messageCell, query)
+				if err != nil {
+					return locatedMessageTransaction{}, internalError("cannot parse result transaction message: " + err.Error())
+				}
+				if match {
+					return locatedMessageTransaction{block: entry.block.id, cell: entry.cell}, nil
+				}
+			}
+
+			if header.prevLT == 0 {
+				break
+			}
+			if header.prevLT >= header.lt {
+				return locatedMessageTransaction{}, internalError("cannot locate result transaction: invalid previous transaction LT")
+			}
+			if scanned+1 < len(entries) {
+				previous := entries[scanned+1]
+				if previous.lt != header.prevLT || previous.cell.HashKey() != header.prevHash {
+					return locatedMessageTransaction{}, internalError("cannot locate result transaction: previous transaction does not match account block")
+				}
+				continue
+			}
+			if len(entries) >= historyLimit {
+				break
+			}
+
+			previousCell, previousBlock, err := s.lookupAccountTransactionCell(ctx,
+				query.destination.Workchain(), account, header.prevLT, current)
+			if errors.Is(err, storage.ErrNotFound) {
+				break
+			}
+			if err != nil {
+				return locatedMessageTransaction{}, internalError("cannot locate previous result transaction: " + err.Error())
+			}
+			if previousCell.HashKey() != header.prevHash {
+				return locatedMessageTransaction{}, internalError("cannot locate result transaction: previous transaction hash mismatch")
+			}
+			current = previousBlock
+			entries = append(entries, accountTxEntry{block: previousBlock, lt: header.prevLT, cell: previousCell})
+		}
+	}
+
+	return locatedMessageTransaction{}, messageTransactionNotFound()
 }
 
 func blockTransactionCount(params requestParams) (uint32, *apiError) {
@@ -607,66 +788,113 @@ type accountTxBlock struct {
 	accounts *tlb.ShardAccountBlocks
 }
 
+type accountTxEntry struct {
+	block *accountTxBlock
+	lt    uint64
+	cell  *cell.Cell
+}
+
+type accountTransactionBlockLookupError struct {
+	err error
+}
+
+func (e *accountTransactionBlockLookupError) Error() string {
+	return e.err.Error()
+}
+
+func (e *accountTransactionBlockLookupError) Unwrap() error {
+	return e.err
+}
+
+var errAccountBlockMismatch = errors.New("block cannot contain requested account")
+
 // loadAccountTransaction locates one account transaction by logical time and
 // extracts only its cell via the ShardAccountBlocks aug-dict descent, without
 // decoding any other transaction of the block. current may carry the block from
 // the previous history iteration; the returned block should be passed back on
 // the next call to reuse it.
 func (s *Server) loadAccountTransaction(ctx context.Context, workchain int32, account []byte, lt uint64, current *accountTxBlock) (*tlb.Transaction, *cell.Cell, *accountTxBlock, *apiError) {
+	txCell, block, apiErr := s.loadAccountTransactionCell(ctx, workchain, account, lt, current)
+	if apiErr != nil {
+		return nil, nil, nil, apiErr
+	}
+	tx, apiErr := parseAccountTransaction(txCell)
+	if apiErr != nil {
+		return nil, nil, nil, apiErr
+	}
+	return tx, txCell, block, nil
+}
+
+func (s *Server) loadAccountTransactionCell(ctx context.Context, workchain int32, account []byte, lt uint64, current *accountTxBlock) (*cell.Cell, *accountTxBlock, *apiError) {
+	txCell, block, err := s.lookupAccountTransactionCell(ctx, workchain, account, lt, current)
+	var blockLookupErr *accountTransactionBlockLookupError
+	if errors.As(err, &blockLookupErr) {
+		return nil, nil, internalError("cannot locate transaction block: " + blockLookupErr.Error())
+	}
+	if errors.Is(err, errAccountBlockMismatch) {
+		return nil, nil, validationError("failed to parse request: block cannot contain requested account")
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil, validationError("failed to parse request: cannot locate transaction in block with specified logical time")
+	}
+	if err != nil {
+		return nil, nil, internalError("cannot list block transactions: " + err.Error())
+	}
+	return txCell, block, nil
+}
+
+func (s *Server) lookupAccountTransactionCell(ctx context.Context, workchain int32, account []byte, lt uint64, current *accountTxBlock) (*cell.Cell, *accountTxBlock, error) {
 	// (account, lt) identifies a transaction chain-wide, so a hit in the cached
 	// block is always the right transaction; on a miss fall back to the
 	// authoritative account-LT index.
 	if current != nil {
 		txCell, err := findBlockTransactionCell(current.accounts, account, lt)
 		if err == nil {
-			tx, apiErr := parseAccountTransaction(txCell)
-			if apiErr != nil {
-				return nil, nil, nil, apiErr
-			}
-			return tx, txCell, current, nil
+			return txCell, current, nil
 		}
 		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, nil, nil, internalError("cannot list block transactions: " + err.Error())
+			return nil, nil, fmt.Errorf("load cached account transaction: %w", err)
 		}
 	}
 
 	block, err := s.store.LookupBlockByAccountLT(ctx, workchain, account, lt)
 	if err != nil {
-		return nil, nil, nil, internalError("cannot locate transaction block: " + err.Error())
+		return nil, nil, &accountTransactionBlockLookupError{err: err}
 	}
 	if !blockproof.BlockContainsAccount(block, workchain, account) {
-		return nil, nil, nil, validationError("failed to parse request: block cannot contain requested account")
+		return nil, nil, errAccountBlockMismatch
 	}
 
-	accounts, apiErr := s.loadBlockAccountBlocks(ctx, block)
-	if apiErr != nil {
-		return nil, nil, nil, apiErr
+	accounts, err := s.loadBlockAccountBlocksData(ctx, block)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	txCell, err := findBlockTransactionCell(accounts, account, lt)
-	if errors.Is(err, storage.ErrNotFound) {
-		return nil, nil, nil, validationError("failed to parse request: cannot locate transaction in block with specified logical time")
-	}
 	if err != nil {
-		return nil, nil, nil, internalError("cannot list block transactions: " + err.Error())
+		return nil, nil, fmt.Errorf("load account transaction: %w", err)
 	}
-	tx, apiErr := parseAccountTransaction(txCell)
-	if apiErr != nil {
-		return nil, nil, nil, apiErr
-	}
-	return tx, txCell, &accountTxBlock{id: block, accounts: accounts}, nil
+	return txCell, &accountTxBlock{id: block, accounts: accounts}, nil
 }
 
 // loadBlockAccountBlocks loads the ShardAccountBlocks aug-dict of a block
 // without decoding the block header or any transaction.
 func (s *Server) loadBlockAccountBlocks(ctx context.Context, id ton.BlockIDExt) (*tlb.ShardAccountBlocks, *apiError) {
+	accounts, err := s.loadBlockAccountBlocksData(ctx, id)
+	if err != nil {
+		return nil, internalError("cannot load block transactions: " + err.Error())
+	}
+	return accounts, nil
+}
+
+func (s *Server) loadBlockAccountBlocksData(ctx context.Context, id ton.BlockIDExt) (*tlb.ShardAccountBlocks, error) {
 	root, err := s.store.BlockRoot(ctx, id)
 	if err != nil {
-		return nil, internalError("cannot load block: " + err.Error())
+		return nil, fmt.Errorf("load block: %w", err)
 	}
 	accounts, err := blockAccountBlocks(root)
 	if err != nil {
-		return nil, internalError("cannot unpack block: " + err.Error())
+		return nil, fmt.Errorf("unpack block: %w", err)
 	}
 	return accounts, nil
 }
@@ -695,11 +923,76 @@ func blockAccountBlocks(root *cell.Cell) (*tlb.ShardAccountBlocks, error) {
 // ShardAccountBlocks aug-dict by (account, lt) key without decoding it.
 // Returns storage.ErrNotFound when the block has no such transaction.
 func findBlockTransactionCell(accounts *tlb.ShardAccountBlocks, account []byte, lt uint64) (*cell.Cell, error) {
+	accountTransactions, err := blockAccountTransactions(accounts, account)
+	if err != nil {
+		return nil, err
+	}
+
+	// A positioned inline iterator doubles as a point lookup: the first item is
+	// the exact key or the transaction is absent.
+	txIt, err := accountTransactions.AugDictInlineIteratorAt(64, tlb.AugAccountTransactions{}, skipSingleRef,
+		uint64Cell(lt), false, false, true)
+	if err != nil {
+		return nil, fmt.Errorf("load account transaction: %w", err)
+	}
+	entry, err := nextAccountTransaction(txIt)
+	if err != nil {
+		return nil, err
+	}
+	if entry.lt != lt {
+		return nil, storage.ErrNotFound
+	}
+	return entry.cell, nil
+}
+
+func findBlockTransactionBefore(accounts *tlb.ShardAccountBlocks, account []byte, lt uint64) (accountTxEntry, error) {
+	accountTransactions, err := blockAccountTransactions(accounts, account)
+	if err != nil {
+		return accountTxEntry{}, err
+	}
+
+	txIt, err := accountTransactions.AugDictInlineIteratorAt(64, tlb.AugAccountTransactions{}, skipSingleRef,
+		uint64Cell(lt), true, false, false)
+	if err != nil {
+		return accountTxEntry{}, fmt.Errorf("load account transaction before LT: %w", err)
+	}
+	return nextAccountTransaction(txIt)
+}
+
+func latestBlockTransactions(accounts *tlb.ShardAccountBlocks, account []byte, limit int) ([]accountTxEntry, error) {
+	accountTransactions, err := blockAccountTransactions(accounts, account)
+	if err != nil {
+		return nil, err
+	}
+
+	txIt, err := accountTransactions.AugDictInlineIterator(64, tlb.AugAccountTransactions{}, skipSingleRef, true, false)
+	if err != nil {
+		return nil, fmt.Errorf("load latest account transactions: %w", err)
+	}
+
+	entries := make([]accountTxEntry, 0, limit)
+	for len(entries) < limit && txIt.Next() {
+		entry, err := accountTransactionFromIterator(txIt)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err = txIt.Err(); err != nil {
+		return nil, fmt.Errorf("load latest account transactions: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, storage.ErrNotFound
+	}
+	return entries, nil
+}
+
+func blockAccountTransactions(accounts *tlb.ShardAccountBlocks, account []byte) (*cell.Slice, error) {
 	if accounts.Accounts == nil || accounts.Accounts.AugmentedDictionary == nil {
 		return nil, storage.ErrNotFound
 	}
 
-	accountValue, err := accounts.Accounts.LoadValueWithExtra(blockproof.AccountKey(account))
+	accountTransactions, err := accounts.Accounts.LoadValueWithExtra(blockproof.AccountKey(account))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		return nil, storage.ErrNotFound
 	}
@@ -708,51 +1001,56 @@ func findBlockTransactionCell(accounts *tlb.ShardAccountBlocks, account []byte, 
 	}
 
 	// LoadValueWithExtra keeps the augmentation in front of the value
-	if err = (tlb.AugShardAccountBlocks{}).SkipExtra(accountValue); err != nil {
+	if err = (tlb.AugShardAccountBlocks{}).SkipExtra(accountTransactions); err != nil {
 		return nil, fmt.Errorf("load account block augmentation: %w", err)
 	}
 
 	// acc_trans#5 account_addr:bits256 transactions:(HashmapAug 64 ^Transaction CurrencyCollection)
-	magic, err := accountValue.LoadUInt(4)
+	magic, err := accountTransactions.LoadUInt(4)
 	if err != nil {
 		return nil, fmt.Errorf("load account block magic: %w", err)
 	}
 	if magic != 0x5 {
 		return nil, fmt.Errorf("invalid account block magic %x", magic)
 	}
-	if err = accountValue.SkipBits(256); err != nil {
+	storedAccount, err := accountTransactions.LoadSlice(256)
+	if err != nil {
 		return nil, fmt.Errorf("load account block address: %w", err)
 	}
+	if !bytes.Equal(storedAccount, account) {
+		return nil, fmt.Errorf("account block address does not match dictionary key")
+	}
+	return accountTransactions, nil
+}
 
-	// a positioned inline iterator doubles as a point lookup: the first item is
-	// the exact key or the transaction is absent
-	txIt, err := accountValue.AugDictInlineIteratorAt(64, tlb.AugAccountTransactions{}, skipSingleRef,
-		cell.BeginCell().MustStoreUInt(lt, 64).EndCell(), false, false, true)
-	if err != nil {
-		return nil, fmt.Errorf("load account transaction: %w", err)
-	}
+func nextAccountTransaction(txIt *cell.AugDictIterator) (accountTxEntry, error) {
 	if !txIt.Next() {
-		if err = txIt.Err(); err != nil {
-			return nil, fmt.Errorf("load account transaction: %w", err)
+		if err := txIt.Err(); err != nil {
+			return accountTxEntry{}, fmt.Errorf("load account transaction: %w", err)
 		}
-		return nil, storage.ErrNotFound
+		return accountTxEntry{}, storage.ErrNotFound
 	}
+	return accountTransactionFromIterator(txIt)
+}
+
+func accountTransactionFromIterator(txIt *cell.AugDictIterator) (accountTxEntry, error) {
 	txKeyLoader, err := txIt.Key().BeginParse()
 	if err != nil {
-		return nil, fmt.Errorf("begin parse transaction lt: %w", err)
+		return accountTxEntry{}, fmt.Errorf("begin parse transaction LT: %w", err)
 	}
-	foundLT, err := txKeyLoader.LoadUInt(64)
+	lt, err := txKeyLoader.LoadUInt(64)
 	if err != nil {
-		return nil, fmt.Errorf("load transaction lt: %w", err)
-	}
-	if foundLT != lt {
-		return nil, storage.ErrNotFound
+		return accountTxEntry{}, fmt.Errorf("load transaction LT: %w", err)
 	}
 	txCell, err := txIt.Value().LoadRefCell()
 	if err != nil {
-		return nil, fmt.Errorf("load transaction cell: %w", err)
+		return accountTxEntry{}, fmt.Errorf("load transaction cell: %w", err)
 	}
-	return txCell, nil
+	return accountTxEntry{lt: lt, cell: txCell}, nil
+}
+
+func uint64Cell(value uint64) *cell.Cell {
+	return cell.BeginCell().MustStoreUInt(value, 64).EndCell()
 }
 
 func parseAccountTransaction(txCell *cell.Cell) (*tlb.Transaction, *apiError) {
@@ -841,6 +1139,67 @@ func rawTransactionFromTLB(workchain int32, tx *tlb.Transaction, txCell *cell.Ce
 	}, nil
 }
 
+type transactionLookupHeader struct {
+	account     [32]byte
+	lt          uint64
+	prevHash    cell.Hash
+	prevLT      uint64
+	outMsgCount uint16
+	io          *cell.Cell
+}
+
+func parseTransactionLookupHeader(txCell *cell.Cell) (transactionLookupHeader, error) {
+	loader, err := txCell.BeginParse()
+	if err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("begin parse transaction: %w", err)
+	}
+	magic, err := loader.LoadUInt(4)
+	if err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction magic: %w", err)
+	}
+	if magic != 0b0111 {
+		return transactionLookupHeader{}, fmt.Errorf("invalid transaction magic %b", magic)
+	}
+	var account [32]byte
+	if err = loader.LoadSliceInto(account[:], 256); err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction account: %w", err)
+	}
+	lt, err := loader.LoadUInt(64)
+	if err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction LT: %w", err)
+	}
+	var prevHash cell.Hash
+	if err = loader.LoadSliceInto(prevHash[:], 256); err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load previous transaction hash: %w", err)
+	}
+	prevLT, err := loader.LoadUInt(64)
+	if err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load previous transaction LT: %w", err)
+	}
+	if err = loader.SkipBits(32); err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction time: %w", err)
+	}
+	outMsgCount, err := loader.LoadUInt(15)
+	if err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction output message count: %w", err)
+	}
+	if err = loader.SkipBits(4); err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction account statuses: %w", err)
+	}
+	ioCell, err := loader.LoadRefCell()
+	if err != nil {
+		return transactionLookupHeader{}, fmt.Errorf("load transaction messages: %w", err)
+	}
+	return transactionLookupHeader{
+		account:     account,
+		lt:          lt,
+		prevHash:    prevHash,
+		prevLT:      prevLT,
+		outMsgCount: uint16(outMsgCount),
+		io:          ioCell,
+	}, nil
+}
+
 func transactionInboundMessageCell(txCell *cell.Cell) (*cell.Cell, error) {
 	loader, err := txCell.BeginParse()
 	if err != nil {
@@ -861,7 +1220,10 @@ func transactionInboundMessageCell(txCell *cell.Cell) (*cell.Cell, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load transaction messages: %w", err)
 	}
+	return transactionInboundMessageCellFromIO(ioCell)
+}
 
+func transactionInboundMessageCellFromIO(ioCell *cell.Cell) (*cell.Cell, error) {
 	io, err := ioCell.BeginParse()
 	if err != nil {
 		return nil, fmt.Errorf("begin parse transaction messages: %w", err)
@@ -878,6 +1240,187 @@ func transactionInboundMessageCell(txCell *cell.Cell) (*cell.Cell, error) {
 		return nil, fmt.Errorf("load transaction inbound message: %w", err)
 	}
 	return inbound, nil
+}
+
+func transactionOutboundMessageCell(ioCell *cell.Cell, index uint16) (*cell.Cell, error) {
+	io, err := ioCell.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("begin parse transaction messages: %w", err)
+	}
+	hasInbound, err := io.LoadBoolBit()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction inbound message flag: %w", err)
+	}
+	if hasInbound {
+		if err = io.SkipBitsAndRefs(0, 1); err != nil {
+			return nil, fmt.Errorf("skip transaction inbound message: %w", err)
+		}
+	}
+	outMessages, err := io.LoadDict(15)
+	if err != nil {
+		return nil, fmt.Errorf("load transaction output messages: %w", err)
+	}
+	if outMessages == nil {
+		return nil, storage.ErrNotFound
+	}
+	messageValue, err := outMessages.LoadValueByUintKey(uint64(index))
+	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load transaction output message %d: %w", index, err)
+	}
+	messageCell, err := messageValue.LoadRefCell()
+	if err != nil {
+		return nil, fmt.Errorf("load transaction output message %d: %w", index, err)
+	}
+	return messageCell, nil
+}
+
+var errUnsupportedMessageLookupAddress = errors.New("message address is not a standard 256-bit address")
+
+type messageLookupAddress struct {
+	workchain int32
+	account   [32]byte
+}
+
+func internalMessageMatches(messageCell *cell.Cell, query messageTransactionQuery) (bool, error) {
+	loader, err := messageCell.BeginParse()
+	if err != nil {
+		return false, fmt.Errorf("begin parse message: %w", err)
+	}
+	isExternal, err := loader.LoadBoolBit()
+	if err != nil {
+		return false, fmt.Errorf("load message type: %w", err)
+	}
+	if isExternal {
+		return false, nil
+	}
+	if _, err = loader.LoadUInt(3); err != nil {
+		return false, fmt.Errorf("load internal message flags: %w", err)
+	}
+
+	source, err := loadMessageLookupAddress(loader)
+	if errors.Is(err, errUnsupportedMessageLookupAddress) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load internal message source: %w", err)
+	}
+	destination, err := loadMessageLookupAddress(loader)
+	if errors.Is(err, errUnsupportedMessageLookupAddress) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load internal message destination: %w", err)
+	}
+	if err = skipMessageLookupCoins(loader); err != nil {
+		return false, fmt.Errorf("load internal message amount: %w", err)
+	}
+	if err = skipMessageLookupMaybeRef(loader); err != nil {
+		return false, fmt.Errorf("load internal message extra currencies: %w", err)
+	}
+	if err = skipMessageLookupCoins(loader); err != nil {
+		return false, fmt.Errorf("load internal message IHR fee: %w", err)
+	}
+	if err = skipMessageLookupCoins(loader); err != nil {
+		return false, fmt.Errorf("load internal message forward fee: %w", err)
+	}
+	createdLT, err := loader.LoadUInt(64)
+	if err != nil {
+		return false, fmt.Errorf("load internal message created LT: %w", err)
+	}
+
+	return createdLT == query.createdLT &&
+		source.workchain == query.source.Workchain() &&
+		bytes.Equal(source.account[:], query.source.Data()) &&
+		destination.workchain == query.destination.Workchain() &&
+		bytes.Equal(destination.account[:], query.destination.Data()), nil
+}
+
+func loadMessageLookupAddress(loader *cell.Slice) (messageLookupAddress, error) {
+	kind, err := loader.LoadUInt(2)
+	if err != nil {
+		return messageLookupAddress{}, err
+	}
+
+	switch kind {
+	case 0:
+		return messageLookupAddress{}, errUnsupportedMessageLookupAddress
+	case 1:
+		bits, err := loader.LoadUInt(9)
+		if err != nil {
+			return messageLookupAddress{}, err
+		}
+		if err = loader.SkipBits(uint(bits)); err != nil {
+			return messageLookupAddress{}, err
+		}
+		return messageLookupAddress{}, errUnsupportedMessageLookupAddress
+	case 2:
+		if err = skipMessageLookupAnycast(loader); err != nil {
+			return messageLookupAddress{}, err
+		}
+		workchain, err := loader.LoadUInt(8)
+		if err != nil {
+			return messageLookupAddress{}, err
+		}
+		value := messageLookupAddress{workchain: int32(int8(workchain))}
+		if err = loader.LoadSliceInto(value.account[:], 256); err != nil {
+			return messageLookupAddress{}, err
+		}
+		return value, nil
+	case 3:
+		if err = skipMessageLookupAnycast(loader); err != nil {
+			return messageLookupAddress{}, err
+		}
+		bits, err := loader.LoadUInt(9)
+		if err != nil {
+			return messageLookupAddress{}, err
+		}
+		if err = loader.SkipBits(32 + uint(bits)); err != nil {
+			return messageLookupAddress{}, err
+		}
+		return messageLookupAddress{}, errUnsupportedMessageLookupAddress
+	default:
+		return messageLookupAddress{}, fmt.Errorf("unsupported message address kind %d", kind)
+	}
+}
+
+func skipMessageLookupAnycast(loader *cell.Slice) error {
+	hasAnycast, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if !hasAnycast {
+		return nil
+	}
+	depth, err := loader.LoadUInt(5)
+	if err != nil {
+		return err
+	}
+	if depth == 0 || depth > 30 {
+		return fmt.Errorf("invalid anycast depth %d", depth)
+	}
+	return loader.SkipBits(uint(depth))
+}
+
+func skipMessageLookupCoins(loader *cell.Slice) error {
+	byteLen, err := loader.LoadUInt(4)
+	if err != nil {
+		return err
+	}
+	return loader.SkipBits(uint(byteLen * 8))
+}
+
+func skipMessageLookupMaybeRef(loader *cell.Slice) error {
+	hasRef, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if !hasRef {
+		return nil
+	}
+	return loader.SkipBitsAndRefs(0, 1)
 }
 
 type originalMessage struct {

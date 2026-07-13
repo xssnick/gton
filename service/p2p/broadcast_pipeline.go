@@ -678,7 +678,93 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		}()
 	}
 
-	downloaded, sigSet, err := s.node.decodeBroadcastBlock(s.node.runtimeContext(), msg, proofRoot, preSigSet)
+	// the same block arrives once per delivery path (public FEC + custom
+	// two-step) under different broadcast fingerprints; the decode result is
+	// pinned by the block id, so reuse it instead of decoding again
+	downloaded, sigSet, cached := s.node.cachedDecodedBroadcast(kind, block)
+	if cached && !signaturesChecked {
+		// v1 tonNode.blockBroadcastCompressed carries its validator
+		// signatures inside the payload, so preSigSet is nil and a cached
+		// sigSet (the first copy's, possibly unverified) would gate every
+		// later copy: a peer could pair valid block bytes with invalid
+		// signatures to suppress honest copies for the cache TTL. Re-decode
+		// and verify this payload's own signatures instead.
+		downloaded, sigSet, cached = nil, nil, false
+	}
+	if cached {
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind)
+		if preSigSet != nil {
+			sigSet = preSigSet
+		}
+	}
+
+	// kinds whose signatures are already verified can leave the expensive
+	// decode to the bounded pool: joining the signature check first keeps the
+	// trust gate on this thread (a failure still suppresses FEC relay), while
+	// a nil return right after lets the overlay relay the hash-verified,
+	// signature-verified payload without waiting out a multi-MB decode
+	if !cached && signaturesChecked {
+		if sigErr := <-sigCheck; sigErr != nil {
+			s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, sigErr)
+			s.log.Debug().
+				Err(sigErr).
+				Str("block", formatBlockRef(block)).
+				Str("kind", kind).
+				Str("source_peer_id", sourcePeerID.String()).
+				Msg("dropping block broadcast because validator signatures are not verified")
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
+			return nil, nil
+		}
+		sigCheck = nil
+
+		rebroadcast, rbErr := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+		if rbErr != nil {
+			s.node.deduper.Forget(fingerprint)
+			return nil, rbErr
+		}
+		if s.node.enqueueBroadcastDecode(offloadedBroadcastDecode{
+			fingerprint:  fingerprint,
+			overlay:      s.spec.Name,
+			delivery:     delivery,
+			trusted:      trusted,
+			kind:         kind,
+			block:        block,
+			sourcePeerID: sourcePeerID,
+			receivedAt:   time.Now(),
+			msg:          msg,
+			proofRoot:    proofRoot,
+			preSigSet:    preSigSet,
+			rebroadcast:  rebroadcast,
+		}) {
+			// the ack counts as "accepted" for relay purposes even though the
+			// decode may still fail on the pool (mirrors the reference node,
+			// which relays after signature validation, not after decode);
+			// block is set so custom-overlay fanout of the signature-verified
+			// payload does not wait out the decode — the fanout deduper keeps
+			// the worker's completion from fanning out a second time
+			blockCopy := cloneBlockID(block)
+			accepted := &acceptedBroadcast{
+				fingerprint: fingerprint,
+				deduped:     true,
+				block:       &blockCopy,
+				rebroadcast: rebroadcast,
+			}
+			if block.Workchain == -1 && block.Shard == topShard {
+				wake := block
+				accepted.masterchainWake = &wake
+			}
+			return accepted, nil
+		}
+	}
+
+	if !cached {
+		downloaded, sigSet, err = s.node.decodeBroadcastBlock(s.node.runtimeContext(), msg, proofRoot, preSigSet)
+		// v1 payloads carry unverified signatures at this point, and their
+		// deliveries never read the cache anyway — cache only verified kinds
+		if err == nil && downloaded != nil && signaturesChecked {
+			s.node.rememberDecodedBroadcast(kind, block, downloaded, sigSet)
+		}
+	}
 	if sigCheck != nil {
 		if sigErr := <-sigCheck; sigErr != nil {
 			s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, sigErr)
@@ -848,21 +934,28 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 		return nil, nil
 	}
 
-	decodeStarted := s.node.startBroadcastPipelineStage()
-	downloaded, err := decodeBlockCandidateBroadcast(msg)
-	decodeResult := broadcastPipelineResultSuccess
-	if err != nil {
-		decodeResult = broadcastPipelineResultError
-	}
-	s.node.observeBroadcastPipelineStageSince(decodeStarted, broadcastPipelineStageCandidateDecode, kind, delivery, decodeResult)
-	if err != nil {
-		s.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Str("kind", kind).
-			Msg("dropping block candidate broadcast because payload decode failed")
-		s.node.noteBroadcastDrop(s.spec.Name, kind, "decode_failed")
-		return nil, nil
+	downloaded, _, cached := s.node.cachedDecodedBroadcast(kind, block)
+	if cached {
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind)
+	} else {
+		decodeStarted := s.node.startBroadcastPipelineStage()
+		var err error
+		downloaded, err = decodeBlockCandidateBroadcast(msg)
+		decodeResult := broadcastPipelineResultSuccess
+		if err != nil {
+			decodeResult = broadcastPipelineResultError
+		}
+		s.node.observeBroadcastPipelineStageSince(decodeStarted, broadcastPipelineStageCandidateDecode, kind, delivery, decodeResult)
+		if err != nil {
+			s.log.Debug().
+				Err(err).
+				Str("block", formatBlockRef(block)).
+				Str("kind", kind).
+				Msg("dropping block candidate broadcast because payload decode failed")
+			s.node.noteBroadcastDrop(s.spec.Name, kind, "decode_failed")
+			return nil, nil
+		}
+		s.node.rememberDecodedBroadcast(kind, block, downloaded, nil)
 	}
 
 	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)

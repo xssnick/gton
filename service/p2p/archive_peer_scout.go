@@ -557,7 +557,7 @@ func (p *archivePeerPool) scoutExistingArchivePeer(peer *overlayPeer) {
 func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 	endpoint := offer.endpoint
 	if endpoint == "" {
-		addressCtx, cancel := context.WithTimeout(p.ctx, dhtSeedPeerTimeout)
+		addressCtx, cancel := context.WithTimeout(p.ctx, archiveDHTAddressTimeout)
 		addrList, _, err := findPeerAddresses(addressCtx, p.sub.node.dht, offer.identity.peerID[:])
 		cancel()
 		if err != nil {

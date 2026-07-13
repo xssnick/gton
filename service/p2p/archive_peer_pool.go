@@ -33,6 +33,7 @@ const (
 	archivePeerNoBenefitTTL            = 5 * time.Minute
 	archivePeerReplacementCooldown     = time.Minute
 	archivePoolInactiveGrace           = time.Minute
+	archiveDHTAddressTimeout           = 15 * time.Second
 	archiveRandomPeerQueryTimeout      = 5 * time.Second
 	archiveTransientRandomReplyLimit   = maxRandomPeerReply
 	archivePeerReplacementFactor       = 1.25

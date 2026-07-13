@@ -52,6 +52,10 @@ type ProbeBlockFullOptions struct {
 
 type CompressedBlockStateProvider interface {
 	StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error)
+	// RememberCompressedBlockState offers a materialized state produced on
+	// the broadcast decode path so subsequent state-aware decompressions of
+	// the next block find an in-memory tree instead of a lazy celldb root.
+	RememberCompressedBlockState(state *tnstore.BlockState) bool
 }
 
 func (n *Node) DownloadBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
@@ -1624,7 +1628,13 @@ func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
 		return nil, fmt.Errorf("invalid max size %d", maxSize)
 	}
 
+	// blocks compress roughly 2-4x, so 4x the compressed size lands within
+	// one attempt for almost every payload; every retry re-decodes the whole
+	// prefix, so undershooting is far more expensive than overshooting
 	size := 1 << 20
+	if estimated := 4 * len(data); estimated > size {
+		size = estimated
+	}
 	if size > maxSize {
 		size = maxSize
 	}
@@ -1641,7 +1651,7 @@ func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
 			return nil, fmt.Errorf("decompressed data exceeds %d bytes", maxSize)
 		}
 
-		size *= 2
+		size *= 4
 		if size > maxSize {
 			size = maxSize
 		}

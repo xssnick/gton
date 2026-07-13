@@ -3498,7 +3498,7 @@ func TestExternalMessageLimitsFromBaseConfigUsesPreloadedSizeLimits(t *testing.T
 	}
 }
 
-func TestRunMethodConfigRejectsUnsupportedGlobalVersion(t *testing.T) {
+func TestRunMethodConfigUsesLatestSupportedTVMForFutureGlobalVersion(t *testing.T) {
 	master := ton.BlockIDExt{
 		Workchain: masterchainID,
 		Shard:     masterchainShard,
@@ -3506,14 +3506,17 @@ func TestRunMethodConfigRejectsUnsupportedGlobalVersion(t *testing.T) {
 		RootHash:  bytes.Repeat([]byte{0x21}, 32),
 		FileHash:  bytes.Repeat([]byte{0x22}, 32),
 	}
-	unsupportedVersion := uint32(vmcore.MaxSupportedGlobalVersion + 1)
+	futureVersion := uint32(vmcore.MaxSupportedGlobalVersion + 1)
 	stateRoot := testMasterStateWithConfig(t, master, map[int32]*cell.Cell{
-		int32(tlb.ConfigParamGlobalVersion): testGlobalVersionCell(t, unsupportedVersion),
+		int32(tlb.ConfigParamGlobalVersion): testGlobalVersionCell(t, futureVersion),
 	})
 
-	_, err := liveview.RunMethodConfig(master, stateRoot, 1500, nil)
-	if err == nil || !strings.Contains(err.Error(), "unsupported global version") || !strings.Contains(err.Error(), "maximum supported") {
-		t.Fatalf("run method config error = %v, want unsupported global version", err)
+	cfg, err := liveview.RunMethodConfig(master, stateRoot, 1500, nil)
+	if err != nil {
+		t.Fatalf("run method config for future global version %d: %v", futureVersion, err)
+	}
+	if got := cfg.Prepared.GlobalVersion(); got != uint32(vmcore.MaxSupportedGlobalVersion) {
+		t.Fatalf("effective TVM global version = %d, want %d", got, vmcore.MaxSupportedGlobalVersion)
 	}
 }
 
@@ -7050,7 +7053,6 @@ type fakeStore struct {
 	zeroStates  map[storage.BlockRootHash][]byte
 	ltLookup    map[fakeLTLookupKey]ton.BlockIDExt
 	utimeLookup map[fakeUnixLookupKey]ton.BlockIDExt
-	msgLookup   map[fakeMessageLookupKey]storage.MessageTransactionRef
 
 	seqLookupByKey       map[fakeSeqLookupKey]ton.BlockIDExt
 	blockDataCalls       int
@@ -7058,7 +7060,6 @@ type fakeStore struct {
 	ltLookupCalls        int
 	accountLTLookupCalls int
 	utimeLookupCalls     int
-	msgLookupCalls       int
 	currentCalls         int
 	blockStateCalls      int
 	blockMetaCalls       int
@@ -7125,11 +7126,6 @@ type fakeUnixLookupKey struct {
 
 func fakeUnixKey(key storage.BlockHistoryKey, utime uint32) fakeUnixLookupKey {
 	return fakeUnixLookupKey{workchain: key.Workchain, shard: key.Shard, utime: utime}
-}
-
-type fakeMessageLookupKey struct {
-	kind storage.MessageTransactionKind
-	key  storage.MessageTransactionKey
 }
 
 type fakeMessageSender struct {
@@ -7513,14 +7509,6 @@ func (s *fakeStore) LookupBlockByUnixTime(_ context.Context, key storage.BlockHi
 		return *cloneBlockID(block), nil
 	}
 	return ton.BlockIDExt{}, storage.ErrNotFound
-}
-
-func (s *fakeStore) LookupMessageTransaction(_ context.Context, kind storage.MessageTransactionKind, key storage.MessageTransactionKey) (storage.MessageTransactionRef, error) {
-	s.msgLookupCalls++
-	if ref, ok := s.msgLookup[fakeMessageLookupKey{kind: kind, key: key}]; ok {
-		return ref, nil
-	}
-	return storage.MessageTransactionRef{}, storage.ErrNotFound
 }
 
 func accountPrunedProof(account *cell.Cell) (*cell.Cell, error) {

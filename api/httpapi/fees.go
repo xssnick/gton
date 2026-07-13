@@ -337,13 +337,14 @@ func estimateFeeMessageUsage(root *cell.Cell) (messageUsage, uint64, bool, error
 			rootBits = uint64(loaded.BitsSize())
 		}
 		key := loaded.HashKey()
-		if _, ok := seen[key]; !ok {
-			seen[key] = struct{}{}
-			usage.cells++
-			usage.bits += uint64(loaded.BitsSize())
-			if isRoot {
-				rootSeen = true
-			}
+		if _, ok := seen[key]; ok {
+			return nil
+		}
+		seen[key] = struct{}{}
+		usage.cells++
+		usage.bits += uint64(loaded.BitsSize())
+		if isRoot {
+			rootSeen = true
 		}
 
 		for slice.RefsNum() > 0 {

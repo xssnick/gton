@@ -88,6 +88,13 @@ func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockSta
 	return nil
 }
 
+// RememberCompressedBlockState exposes the compressed-state cache to the p2p
+// broadcast decode path, which chains freshly decoded merkle updates onto the
+// state they were decompressed against.
+func (s *Service) RememberCompressedBlockState(state *storage.BlockState) bool {
+	return s.rememberCompressedBlockState(state)
+}
+
 func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
 	if state == nil || state.Cell == nil {
 		return false
@@ -419,6 +426,15 @@ func (s *Service) loadMasterStateForConsensus(ctx context.Context, block ton.Blo
 }
 
 func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
+	// The compressed-state cache holds in-memory apply-time or decode-chained
+	// trees (materialized at least along recently changed paths); it must be
+	// consulted before currentStatus/liveState, whose Cell roots are swapped
+	// for lazy celldb roots after every checkpoint — a lazy root would make
+	// state-aware decompression walk pebble cell by cell.
+	if state, ok := s.cachedCompressedBlockState(block); ok {
+		return state.Cell, nil
+	}
+
 	s.currentStatusMu.RLock()
 	state, err := currentStateBlockState(s.currentStatus, block)
 	s.currentStatusMu.RUnlock()
@@ -458,10 +474,6 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			return nil, err
 		}
-	}
-
-	if state, ok := s.cachedCompressedBlockState(block); ok {
-		return state.Cell, nil
 	}
 
 	if block.Workchain != -1 || block.Shard != topShard {

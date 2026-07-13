@@ -55,6 +55,9 @@ type overlaySubscription struct {
 	twoStepQueueClosed  bool
 	refreshRunning      bool
 	peerPingRunning     bool
+	fixedProbeRunning   bool
+	softRecoveries      uint64
+	hardRecoveries      uint64
 }
 
 func (s *overlaySubscription) isActive() bool {
@@ -257,6 +260,13 @@ type overlayPeer struct {
 	downloadCount     uint64
 	downloadSlowUntil time.Time
 
+	attachedAt              time.Time
+	lastPongAt              time.Time
+	probeFailures           uint32
+	lastSoftRecoveryAt      time.Time
+	lastHardRecoveryAt      time.Time
+	softRecoveriesSinceSeen uint32
+
 	rebroadcastMx         sync.Mutex
 	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
 	rebroadcastQueue      *boundedQueue[rebroadcastRequest]
@@ -283,6 +293,14 @@ func (s *overlaySubscription) run(ctx context.Context) {
 	pingTimer := time.NewTimer(nextPeerPingDelay())
 	defer pingTimer.Stop()
 
+	var probeTimer *time.Timer
+	var probeC <-chan time.Time
+	if s.spec.Kind == overlayKindCustomFixed {
+		probeTimer = time.NewTimer(nextFixedProbeDelay())
+		defer probeTimer.Stop()
+		probeC = probeTimer.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -298,6 +316,9 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		case <-pingTimer.C:
 			s.startPingPeers(ctx)
 			pingTimer.Reset(nextPeerPingDelay())
+		case <-probeC:
+			s.startProbeFixedPeers(ctx)
+			probeTimer.Reset(nextFixedProbeDelay())
 		}
 	}
 }
@@ -790,6 +811,7 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 	if err != nil {
 		return false, fmt.Errorf("connect fixed node endpoint: %w", err)
 	}
+	reinitFreshFixedTransport(pooled)
 	attached := s.attachPooledPeer(pooled, nil)
 	releaseEndpoint()
 	if attached {
@@ -799,6 +821,28 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 			Msg("connected fixed custom overlay peer")
 	}
 	return attached, nil
+}
+
+// reinitFreshFixedTransport restores restart semantics for an
+// outbound-created transport: registerClient copies the gateway address
+// list, whose ReinitDate is the process start time, so without this a
+// rebuilt connection would keep the previous reinit epoch and a remote that
+// remembers our old sequence numbers would drop the fresh low-seqno packets
+// as duplicates. Reinit is applied only before any traffic in either
+// direction: inbound means the pair already works, outbound means a channel
+// may be pending and resetting it mid-handshake could collide with another
+// overlay attaching the same peer.
+func reinitFreshFixedTransport(pooled *pooledPeer) {
+	if pooled == nil || pooled.adnl == nil {
+		return
+	}
+	stats := pooled.adnl.Stats()
+	if stats.Inbound.Packets != 0 || stats.Outbound.Packets != 0 {
+		return
+	}
+	if reiniter, ok := pooled.adnl.ADNL.(adnlReiniter); ok {
+		reiniter.Reinit()
+	}
 }
 
 func firstPeerEndpoint(addresses []adnladdr.Address) (string, error) {
@@ -920,6 +964,7 @@ func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *over
 		rldpOverlay: rldpOverlay,
 		release:     release,
 		alive:       !fixedMember,
+		attachedAt:  time.Now(),
 	}
 }
 
@@ -1133,6 +1178,23 @@ func (s *overlaySubscription) endPeerPing() {
 	s.maintenanceMx.Unlock()
 }
 
+func (s *overlaySubscription) beginFixedProbe() bool {
+	s.maintenanceMx.Lock()
+	defer s.maintenanceMx.Unlock()
+
+	if s.fixedProbeRunning {
+		return false
+	}
+	s.fixedProbeRunning = true
+	return true
+}
+
+func (s *overlaySubscription) endFixedProbe() {
+	s.maintenanceMx.Lock()
+	s.fixedProbeRunning = false
+	s.maintenanceMx.Unlock()
+}
+
 func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 	peer.overlay.SetBroadcastHandlerWithInfo(func(msg tl.Serializable, info overlay.BroadcastInfo) error {
 		var sourcePeerID PeerID
@@ -1156,7 +1218,7 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 		case overlay.Broadcast:
 			return s.handleSimpleBroadcast(peer, data)
 		case ForgetPeer:
-			s.removePeer(peer.id)
+			s.removePeerIfCurrent(peer)
 			return nil
 		default:
 			return nil
@@ -1170,16 +1232,12 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 			return s.answerRLDPQuery(peer, transferID, query)
 		})
 	}
-	peer.overlay.SetDisconnectHandler(func(_ string, key ed25519.PublicKey) {
-		rawID, err := tl.Hash(keys.PublicKeyED25519{Key: key})
-		if err != nil {
-			return
-		}
-		id, err := NewPeerID(rawID)
-		if err != nil {
-			return
-		}
-		s.removePeer(id)
+	peer.overlay.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
+		// Remove by pointer, not by id: the disconnect cascade runs
+		// asynchronously and a recovery path may have already re-attached a
+		// fresh peer object for the same id, which must survive this
+		// stale callback.
+		s.removePeerIfCurrent(peer)
 	})
 }
 
@@ -1308,7 +1366,7 @@ func (s *overlaySubscription) peerReadyForMaintenance(ctx context.Context, peer 
 	case <-ctx.Done():
 		return false
 	case <-peer.overlay.GetCloserCtx().Done():
-		s.removePeer(peer.id)
+		s.removePeerIfCurrent(peer)
 		return false
 	default:
 		return true
@@ -1389,19 +1447,6 @@ func (s *overlaySubscription) peerPromoted(peer *overlayPeer) {
 	s.mx.Unlock()
 
 	s.reloadNeighbours()
-}
-
-func (s *overlaySubscription) removePeer(id PeerID) {
-	s.mx.Lock()
-	peer := s.peers[id]
-	delete(s.peers, id)
-	s.removeNeighbourLocked(id)
-	s.notifyPeersChangedLocked()
-	s.mx.Unlock()
-
-	if peer != nil {
-		peer.close()
-	}
 }
 
 func (s *overlaySubscription) removePeerIfCurrent(peer *overlayPeer) {

@@ -582,6 +582,10 @@ func TestWriteJSONMatchesStandardLibrary(t *testing.T) {
 }
 
 func TestDecodeJSONBody(t *testing.T) {
+	if maxBodyBytes != 8<<20 {
+		t.Fatalf("max body bytes = %d, want %d", maxBodyBytes, 8<<20)
+	}
+
 	t.Run("whitespace is an empty object", func(t *testing.T) {
 		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(" \n\t "))
 		var body map[string]json.RawMessage
