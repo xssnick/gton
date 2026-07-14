@@ -19,8 +19,19 @@ import (
 const archivePruneMetadataBatchKeys = 10000
 
 type archivePruneBlockDelete struct {
-	block ton.BlockIDExt
-	meta  *storage.BlockMeta
+	block                ton.BlockIDExt
+	meta                 *storage.BlockMeta
+	retainPersistentMeta bool
+	stateRootHash        []byte
+}
+
+type archivePrunePersistentStateRetention struct {
+	stateRootHash   []byte
+	unsplitFileHash []byte
+}
+
+type archivePruneIteratorReader interface {
+	NewIter(*pebble.IterOptions) (*pebble.Iterator, error)
 }
 
 func (s *Store) PruneArchivePackages(ctx context.Context, cutoffUnix uint32, maxStartGroups int) (storage.ArchivePruneStats, error) {
@@ -158,6 +169,12 @@ func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uin
 
 	snap := db.NewSnapshot()
 	defer func() { _ = snap.Close() }()
+	// Snapshot flags also describe cell checkpoints. Actual persistent-state
+	// file records are the ownership source for metadata retained past archive TTL.
+	retainedPersistentStates, err := archivePrunePersistentStateRetentions(ctx, snap, nil)
+	if err != nil {
+		return 0, 0, err
+	}
 
 	iter, err := snap.NewIter(&pebble.IterOptions{
 		LowerBound: bytes.Clone(hotPrefixBlockMeta),
@@ -214,10 +231,20 @@ func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uin
 		if err != nil {
 			return deletedMeta, deletedKeys, err
 		}
-		if !archivePruneDeleteBlockMeta(block, meta, beforeSeqno, cutoffUnix) {
+		retained, retainPersistentMeta := retainedPersistentStates[storage.BlockKey(block)]
+		if isArchivePrunedSnapshotMeta(meta) {
+			if retainPersistentMeta && bytes.Equal(meta.StateRootHash, retained.stateRootHash) {
+				continue
+			}
+		} else if !archivePruneDeleteBlockMeta(block, meta, beforeSeqno, cutoffUnix) {
 			continue
 		}
-		pending = append(pending, archivePruneBlockDelete{block: block, meta: meta})
+		pending = append(pending, archivePruneBlockDelete{
+			block:                block,
+			meta:                 meta,
+			retainPersistentMeta: retainPersistentMeta,
+			stateRootHash:        retained.stateRootHash,
+		})
 		if len(pending) >= archivePruneMetadataBatchKeys {
 			if err = flush(); err != nil {
 				return deletedMeta, deletedKeys, err
@@ -233,6 +260,78 @@ func (s *Store) deleteArchivedBlockMetadata(ctx context.Context, beforeSeqno uin
 	return deletedMeta, deletedKeys, nil
 }
 
+func archivePrunePersistentStateRetentions(ctx context.Context, reader archivePruneIteratorReader, excludedKeys map[string]struct{}) (map[storage.BlockRootHash]archivePrunePersistentStateRetention, error) {
+	iter, err := reader.NewIter(&pebble.IterOptions{
+		LowerBound: bytes.Clone(hotPrefixStateFileRef),
+		UpperBound: prefixUpperBound(hotPrefixStateFileRef),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	retained := map[storage.BlockRootHash]archivePrunePersistentStateRetention{}
+	for ok := iter.First(); ok; ok = iter.Next() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		if _, excluded := excludedKeys[string(iter.Key())]; excluded {
+			continue
+		}
+
+		block, master, effectiveShard, err := decodePersistentStateFileKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		record, err := decodePersistentStateFileRecord(iter.Value())
+		if err != nil {
+			return nil, err
+		}
+		if err = validateFixedHash("persistent state root hash", record.stateRootHash); err != nil {
+			return nil, fmt.Errorf("decode persistent state %s retention: %w", storage.FormatBlockRef(block), err)
+		}
+		var unsplitFileHash []byte
+		if effectiveShard == 0 {
+			if err = validateFixedHash("persistent state file hash", record.fileHash); err != nil {
+				return nil, fmt.Errorf("decode persistent state %s retention: %w", storage.FormatBlockRef(block), err)
+			}
+			unsplitFileHash = record.fileHash
+		}
+		if err = addArchivePrunePersistentStateRetention(retained, block, record.stateRootHash, unsplitFileHash); err != nil {
+			return nil, err
+		}
+		if err = addArchivePrunePersistentStateRetention(retained, master, nil, nil); err != nil {
+			return nil, err
+		}
+	}
+	if err = iter.Error(); err != nil {
+		return nil, err
+	}
+	return retained, nil
+}
+
+func addArchivePrunePersistentStateRetention(
+	retained map[storage.BlockRootHash]archivePrunePersistentStateRetention,
+	block ton.BlockIDExt,
+	stateRootHash []byte,
+	unsplitFileHash []byte,
+) error {
+	key := storage.BlockKey(block)
+	existing := retained[key]
+	if len(existing.stateRootHash) == 0 {
+		existing.stateRootHash = bytes.Clone(stateRootHash)
+	} else if len(stateRootHash) != 0 && !bytes.Equal(existing.stateRootHash, stateRootHash) {
+		return fmt.Errorf("persistent state %s has conflicting state root hashes", storage.FormatBlockRef(block))
+	}
+	if len(existing.unsplitFileHash) == 0 {
+		existing.unsplitFileHash = bytes.Clone(unsplitFileHash)
+	}
+	retained[key] = existing
+	return nil
+}
+
 func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []archivePruneBlockDelete) (int, error) {
 	deleted := 0
 	for _, item := range blocks {
@@ -240,11 +339,18 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 		meta := item.meta
 		ref := storage.BlockSeqRefFromBlock(block)
 		keys := [][]byte{
-			hotKeyBlockMeta(block),
 			hotKeyBlockSeqIndex(ref),
 			hotKeyBlockDataRef(block),
 			hotKeyProofRef(storage.ServedProofBlock, block),
 			hotKeyProofRef(storage.ServedProofBlockLink, block),
+		}
+		if item.retainPersistentMeta {
+			retained := archivePrunedSnapshotMeta(block, meta, item.stateRootHash)
+			if err := batch.Set(hotKeyBlockMeta(block), encodeBlockMeta(retained), pebble.NoSync); err != nil {
+				return deleted, err
+			}
+		} else {
+			keys = append(keys, hotKeyBlockMeta(block))
 		}
 		if meta.EndLT != 0 {
 			keys = append(keys, hotKeyBlockLTIndex(ref, meta.EndLT))
@@ -263,6 +369,28 @@ func (s *Store) deleteArchivedBlockMetadataBatch(batch *pebble.Batch, blocks []a
 		}
 	}
 	return deleted, nil
+}
+
+func archivePrunedSnapshotMeta(block ton.BlockIDExt, meta *storage.BlockMeta, stateRootHash []byte) *storage.BlockMeta {
+	// Persistent-state file records own the file hash and payload. Archive GC only
+	// keeps the timestamp and state root required by persistent-state consumers,
+	// without retaining archive payload flags, references, or history indexes.
+	return &storage.BlockMeta{
+		ID:            block,
+		Flags:         storage.BlockMetaHasStateSnapshot,
+		GenUTime:      meta.GenUTime,
+		StateRootHash: bytes.Clone(stateRootHash),
+	}
+}
+
+func isArchivePrunedSnapshotMeta(meta *storage.BlockMeta) bool {
+	return meta.Flags == storage.BlockMetaHasStateSnapshot &&
+		meta.StartLT == 0 &&
+		meta.EndLT == 0 &&
+		len(meta.StateFileHash) == 0 &&
+		meta.MasterchainRefSeqno == 0 &&
+		len(meta.PrevRefs) == 0 &&
+		len(meta.NextRefs) == 0
 }
 
 func archivePruneDeleteBlockMeta(block ton.BlockIDExt, meta *storage.BlockMeta, beforeSeqno uint32, cutoffUnix uint32) bool {

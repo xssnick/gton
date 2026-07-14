@@ -312,7 +312,18 @@ func oldestRetainedPersistentStateSeqno(retained map[uint32]struct{}) uint32 {
 func (s *Store) persistentStateFileExpired(ctx context.Context, master ton.BlockIDExt, nowUnix uint64) (bool, error) {
 	meta, err := s.BlockMeta(ctx, master)
 	if errors.Is(err, storage.ErrNotFound) {
-		return true, nil
+		endTime, descErr := s.persistentStateDescriptionEndTime(ctx, master)
+		if errors.Is(descErr, storage.ErrNotFound) {
+			return true, nil
+		}
+		if descErr != nil {
+			return false, fmt.Errorf("load persistent state description %s: %w", storage.FormatBlockRef(master), descErr)
+		}
+
+		// Archive GC in older releases could remove block metadata before the
+		// persistent-state TTL. Automatic snapshots also persist the exact TTL
+		// in their description, so preserve those files across an upgrade.
+		return endTime < nowUnix, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("load persistent state master block meta %s: %w", storage.FormatBlockRef(master), err)
@@ -321,6 +332,21 @@ func (s *Store) persistentStateFileExpired(ctx context.Context, master ton.Block
 		return true, nil
 	}
 	return persistentStateFileTTL(meta.GenUTime) < nowUnix, nil
+}
+
+func (s *Store) persistentStateDescriptionEndTime(ctx context.Context, master ton.BlockIDExt) (uint64, error) {
+	raw, err := s.getHotCopy(ctx, hotKeyPersistentStateDescription(master.SeqNo))
+	if err != nil {
+		return 0, err
+	}
+	desc, err := decodePersistentStateDescription(raw)
+	if err != nil {
+		return 0, err
+	}
+	if !desc.MasterchainBlock.Equals(&master) {
+		return 0, storage.ErrNotFound
+	}
+	return desc.EndTime, nil
 }
 
 func persistentStateFileTTL(ts uint32) uint64 {

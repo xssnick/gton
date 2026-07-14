@@ -1234,7 +1234,7 @@ func (s *Service) loadCandidateNextMasterBlock(ctx context.Context, prev ton.Blo
 }
 
 func (s *Service) loadCandidateBlockForApply(ctx context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
-	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block, false)
+	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block)
 	if err != nil {
 		return PreparedBlock{}, fmt.Errorf("load stored candidate block %s: %w", storage.FormatBlockRef(block), err)
 	}

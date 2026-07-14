@@ -3,7 +3,6 @@ package service
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -46,48 +45,41 @@ func downloadedBlockRoot(downloaded p2p.DownloadedBlock) (*cell.Cell, error) {
 	return unwrapped, nil
 }
 
-func prepareBlockData(kind string, id ton.BlockIDExt, data []byte) (VerifiedBlock, error) {
+func prepareStoredBlockForApply(id ton.BlockIDExt, full *tnstore.ServedBlockFull) (PreparedBlock, error) {
+	started := time.Now()
+	data := full.Block
 	root, err := cell.FromBOC(data)
 	if err != nil {
-		return VerifiedBlock{}, fmt.Errorf("parse %s boc %s: %w", kind, tnstore.FormatBlockRef(id), err)
+		return PreparedBlock{}, fmt.Errorf("parse stored block boc %s: %w", tnstore.FormatBlockRef(id), err)
 	}
+	// Keep the apply-time root invariant used by the reference node. The file
+	// hash and block metadata were already verified before this artifact became
+	// servable, so repeating those checks on every stored apply is unnecessary.
 	rootHash := root.HashKey()
 	if !bytes.Equal(rootHash[:], id.RootHash) {
-		return VerifiedBlock{}, fmt.Errorf("%s root hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
-	}
-
-	sum := sha256.Sum256(data)
-	if !bytes.Equal(sum[:], id.FileHash) {
-		return VerifiedBlock{}, fmt.Errorf("%s file hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
+		return PreparedBlock{}, fmt.Errorf("stored block root hash mismatch for %s", tnstore.FormatBlockRef(id))
 	}
 
 	block, err := tnstore.ParseVerifiedBlockCell(id, root)
 	if err != nil {
-		return VerifiedBlock{}, err
+		return PreparedBlock{}, err
 	}
 	if block.StateUpdate == nil {
-		return VerifiedBlock{}, fmt.Errorf("%s block %s has no state update", kind, tnstore.FormatBlockRef(id))
+		return PreparedBlock{}, fmt.Errorf("stored block %s has no state update", tnstore.FormatBlockRef(id))
 	}
-	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, block)
-	if err != nil {
-		return VerifiedBlock{}, fmt.Errorf("build %s block meta %s: %w", kind, tnstore.FormatBlockRef(id), err)
+	if full.Meta == nil {
+		return PreparedBlock{}, fmt.Errorf("stored block %s has no metadata", tnstore.FormatBlockRef(id))
 	}
 
-	return VerifiedBlock{
+	verified := VerifiedBlock{
 		ID:          id,
-		Kind:        kind,
+		Kind:        "stored block",
 		BlockRoot:   root,
 		BlockBOC:    data,
-		Meta:        meta,
+		ProofBOC:    full.Proof,
+		Meta:        full.Meta,
 		StateUpdate: block.StateUpdate,
-	}, nil
-}
-
-func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (PreparedBlock, error) {
-	started := time.Now()
-	verified, err := prepareBlockData(kind, id, data)
-	if err != nil {
-		return PreparedBlock{}, err
+		IsLink:      full.IsLink,
 	}
 	prepared, err := prepareVerifiedBlockForApply(verified)
 	if err != nil {
@@ -97,40 +89,12 @@ func prepareBlockDataForApply(kind string, id ton.BlockIDExt, data []byte) (Prep
 	return prepared, nil
 }
 
-func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt, persistMeta bool) (PreparedBlock, error) {
+func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt) (PreparedBlock, error) {
 	full, err := store.BlockFull(ctx, id)
 	if err != nil {
 		return PreparedBlock{}, err
 	}
-
-	downloaded, err := prepareBlockDataForApply("stored block", id, full.Block)
-	if err != nil {
-		return PreparedBlock{}, err
-	}
-	downloaded.ProofBOC = full.Proof
-	downloaded.IsLink = full.IsLink
-	if full.Meta != nil {
-		downloaded.Meta = tnstore.MergeBlockMeta(downloaded.Meta, full.Meta)
-		downloaded.Meta.ID = id
-	}
-	if persistMeta {
-		if err = store.SaveBlockMeta(blockMetaWithoutArtifactFlags(downloaded.Meta)); err != nil {
-			return PreparedBlock{}, fmt.Errorf("persist stored block meta %s: %w", tnstore.FormatBlockRef(id), err)
-		}
-	}
-	return downloaded, nil
-}
-
-func blockMetaWithoutArtifactFlags(meta *tnstore.BlockMeta) *tnstore.BlockMeta {
-	cloned := meta.Clone()
-	cloned.Flags &^= tnstore.BlockMetaHasServedFull |
-		tnstore.BlockMetaServedFullIsLink |
-		tnstore.BlockMetaHasBlockData |
-		tnstore.BlockMetaHasProofBlock |
-		tnstore.BlockMetaHasProofBlockLink |
-		tnstore.BlockMetaHasProofKeyBlock |
-		tnstore.BlockMetaHasProofKeyBlockLink
-	return cloned
+	return prepareStoredBlockForApply(id, full)
 }
 
 func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock, applier stateUpdateApplier) (appliedBlockState, error) {

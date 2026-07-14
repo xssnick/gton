@@ -505,7 +505,7 @@ func setBlockMetaHistoryIndexes(batch *pebble.Batch, existing *storage.BlockMeta
 }
 
 func blockMetaIndexedInHistory(meta *storage.BlockMeta) bool {
-	return meta != nil && blockMetaHasStoredMetadata(meta)
+	return meta != nil && blockMetaHasStoredMetadata(meta) && !isArchivePrunedSnapshotMeta(meta)
 }
 
 func deleteBlockMetaHistoryIndexes(batch *pebble.Batch, meta *storage.BlockMeta) error {

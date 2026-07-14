@@ -38,7 +38,7 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 		t.Fatalf("save fixture block: %v", err)
 	}
 
-	prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID, false)
+	prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID)
 	if err != nil {
 		t.Fatalf("load stored block: %v", err)
 	}
@@ -50,6 +50,45 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 	}
 	if prepared.IsLink != downloaded.IsLink {
 		t.Fatalf("stored proof link flag = %v, want %v", prepared.IsLink, downloaded.IsLink)
+	}
+}
+
+type storedBlockForApplyTestStore struct {
+	tnstore.Storage
+	full               *tnstore.ServedBlockFull
+	saveBlockMetaCalls int
+}
+
+func (s *storedBlockForApplyTestStore) BlockFull(context.Context, ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
+	return s.full, nil
+}
+
+func (s *storedBlockForApplyTestStore) SaveBlockMeta(*tnstore.BlockMeta) error {
+	s.saveBlockMetaCalls++
+	return nil
+}
+
+func BenchmarkLoadStoredBlockForApply(b *testing.B) {
+	downloaded := mustLoadFixtureDownloadedBlock(b)
+	store := &storedBlockForApplyTestStore{
+		full: &tnstore.ServedBlockFull{
+			ID:     downloaded.ID,
+			Block:  downloaded.BlockBOC,
+			Proof:  downloaded.ProofBOC,
+			Meta:   downloaded.Meta,
+			IsLink: downloaded.IsLink,
+		},
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if prepared.StateUpdate == nil {
+			b.Fatal("stored block state update is missing")
+		}
 	}
 }
 
@@ -106,40 +145,66 @@ func TestApplyBlockFromFixture(t *testing.T) {
 	}
 }
 
-func TestPrepareBlockDataRejectsBlockIDHashMismatches(t *testing.T) {
+func TestLoadStoredBlockForApplyRejectsRootHashMismatch(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
-
-	tests := []struct {
-		name   string
-		mutate func(*ton.BlockIDExt)
-	}{
-		{
-			name: "root hash mismatch",
-			mutate: func(id *ton.BlockIDExt) {
-				id.RootHash = append([]byte(nil), id.RootHash...)
-				id.RootHash[0] ^= 0x01
-			},
-		},
-		{
-			name: "file hash mismatch",
-			mutate: func(id *ton.BlockIDExt) {
-				id.FileHash = append([]byte(nil), id.FileHash...)
-				id.FileHash[0] ^= 0x01
-			},
+	id := downloaded.ID
+	id.RootHash = append([]byte(nil), id.RootHash...)
+	id.RootHash[0] ^= 0x01
+	meta := downloaded.Meta.Clone()
+	meta.ID = id
+	store := &storedBlockForApplyTestStore{
+		full: &tnstore.ServedBlockFull{
+			ID:    id,
+			Block: downloaded.BlockBOC,
+			Meta:  meta,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			id := downloaded.ID
-			id.RootHash = append([]byte(nil), id.RootHash...)
-			id.FileHash = append([]byte(nil), id.FileHash...)
-			tt.mutate(&id)
+	_, err := loadStoredBlockForApply(context.Background(), store, id)
+	if err == nil || !strings.Contains(err.Error(), "root hash mismatch") {
+		t.Fatalf("load stored block error = %v, want root hash mismatch", err)
+	}
+}
 
-			if _, err := prepareBlockData("fixture block", id, downloaded.BlockBOC); err == nil {
-				t.Fatal("block data with mismatched BlockID hash was accepted")
-			}
-		})
+func TestLoadStoredBlockForApplyDoesNotReverifyFileHashOrRewriteMeta(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	id := downloaded.ID
+	id.FileHash = append([]byte(nil), id.FileHash...)
+	id.FileHash[0] ^= 0x01
+	meta := downloaded.Meta.Clone()
+	meta.ID = id
+	store := &storedBlockForApplyTestStore{
+		full: &tnstore.ServedBlockFull{
+			ID:     id,
+			Block:  downloaded.BlockBOC,
+			Proof:  downloaded.ProofBOC,
+			Meta:   meta,
+			IsLink: downloaded.IsLink,
+		},
+	}
+
+	prepared, err := loadStoredBlockForApply(context.Background(), store, id)
+	if err != nil {
+		t.Fatalf("load stored block: %v", err)
+	}
+	if store.saveBlockMetaCalls != 0 {
+		t.Fatalf("SaveBlockMeta calls = %d, want 0", store.saveBlockMetaCalls)
+	}
+	if prepared.Meta == nil || !prepared.Meta.ID.Equals(&id) {
+		t.Fatalf("prepared meta ID = %v, want %s", prepared.Meta, tnstore.FormatBlockRef(id))
+	}
+	if prepared.StateUpdate == nil || prepared.StateUpdateToCells.Len() == 0 {
+		t.Fatal("stored block state update was not prepared")
+	}
+}
+
+func TestPrepareDownloadedBlockForApplyRejectsUnverifiedRootHash(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	downloaded.VerifiedRootHash = false
+
+	_, err := prepareDownloadedBlockForApply(*downloaded)
+	if err == nil || !strings.Contains(err.Error(), "root hash is not verified") {
+		t.Fatalf("prepare downloaded block error = %v, want unverified root hash", err)
 	}
 }
 

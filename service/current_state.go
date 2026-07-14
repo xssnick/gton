@@ -925,7 +925,7 @@ func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.Blo
 		return prepared, nil
 	}
 
-	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block, true)
+	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block)
 	if err == nil {
 		return downloaded, nil
 	}

@@ -486,7 +486,7 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 			return err
 		}
 		if stored.EffectiveShard == 0 {
-			return s.setMergedBlockMeta(batch, meta)
+			return s.setPersistentStateSnapshotMeta(batch, meta)
 		}
 		return nil
 	}); err != nil {
@@ -495,6 +495,36 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 
 	s.observePersistentStateBytes(stored.Ref.Size - previousSize)
 	return nil
+}
+
+func (s *Store) setPersistentStateSnapshotMeta(batch *pebble.Batch, meta *storage.BlockMeta) error {
+	raw, closer, err := pebbleReaderGet(s.hot, hotKeyBlockMeta(meta.ID))
+	if errors.Is(err, storage.ErrNotFound) {
+		return s.setMergedBlockMeta(batch, meta)
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closer.Close() }()
+
+	existing, err := decodeBlockMeta(meta.ID, raw)
+	if err != nil {
+		return err
+	}
+	if isArchivePrunedSnapshotMeta(existing) {
+		if len(existing.StateRootHash) != 0 && !bytes.Equal(existing.StateRootHash, meta.StateRootHash) {
+			return fmt.Errorf("persistent state root hash conflicts with archive-pruned block meta %s", storage.FormatBlockRef(meta.ID))
+		}
+		if len(existing.StateRootHash) == 0 {
+			existing.StateRootHash = bytes.Clone(meta.StateRootHash)
+			return batch.Set(hotKeyBlockMeta(meta.ID), encodeBlockMeta(existing), pebble.NoSync)
+		}
+
+		// The persistent-state record owns the file hash. Preserve the compact
+		// marker so this update cannot recreate archive indexes.
+		return nil
+	}
+	return s.setMergedBlockMeta(batch, meta)
 }
 
 func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error {
@@ -509,12 +539,13 @@ func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockID
 }
 
 type persistentStateFileDelete struct {
-	block           ton.BlockIDExt
-	effectiveShard  int64
-	key             []byte
-	dir             string
-	diskFileRemoved bool
-	diskFileBytes   uint64
+	block            ton.BlockIDExt
+	masterchainBlock ton.BlockIDExt
+	effectiveShard   int64
+	key              []byte
+	dir              string
+	diskFileRemoved  bool
+	diskFileBytes    uint64
 }
 
 func (s *Store) unlinkPersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (persistentStateFileDelete, error) {
@@ -553,12 +584,13 @@ func (s *Store) unlinkPersistentStateFile(ctx context.Context, block ton.BlockID
 		s.observePersistentStateBytes(-removedBytes)
 	}
 	return persistentStateFileDelete{
-		block:           block,
-		effectiveShard:  effectiveShard,
-		key:             key,
-		dir:             filepath.Dir(path),
-		diskFileRemoved: diskFileExisted,
-		diskFileBytes:   uint64(removedBytes),
+		block:            block,
+		masterchainBlock: masterchainBlock,
+		effectiveShard:   effectiveShard,
+		key:              key,
+		dir:              filepath.Dir(path),
+		diskFileRemoved:  diskFileExisted,
+		diskFileBytes:    uint64(removedBytes),
 	}, nil
 }
 
@@ -585,12 +617,39 @@ func (s *Store) deletePersistentStateFileRecords(files []persistentStateFileDele
 	// untracked persistent-state file that pruning cannot discover. NoSync is
 	// sufficient because any later durability point is ordered after syncDir.
 	return s.withHotBatch(func(batch *pebble.Batch) error {
+		deletedKeys := make(map[string]struct{}, len(files))
+		for _, file := range files {
+			deletedKeys[string(file.key)] = struct{}{}
+		}
+		retained, err := archivePrunePersistentStateRetentions(context.Background(), s.hot, deletedKeys)
+		if err != nil {
+			return err
+		}
+
 		for _, file := range files {
 			if err := batch.Delete(file.key, pebble.NoSync); err != nil {
 				return err
 			}
 			if file.effectiveShard == 0 {
-				if err := s.clearPersistentStateSnapshotMeta(batch, file.block); err != nil {
+				retention, retainArchiveMarker := retained[storage.BlockKey(file.block)]
+				if err := s.clearPersistentStateSnapshotMeta(batch, file.block, retention, retainArchiveMarker); err != nil {
+					return err
+				}
+			}
+		}
+
+		checked := make(map[storage.BlockRootHash]struct{}, 2*len(files))
+		for _, file := range files {
+			for _, block := range []ton.BlockIDExt{file.block, file.masterchainBlock} {
+				key := storage.BlockKey(block)
+				if _, ok := checked[key]; ok {
+					continue
+				}
+				checked[key] = struct{}{}
+				if _, ok := retained[key]; ok {
+					continue
+				}
+				if err = s.deleteArchivePrunedSnapshotMeta(batch, block); err != nil {
 					return err
 				}
 			}
@@ -599,7 +658,7 @@ func (s *Store) deletePersistentStateFileRecords(files []persistentStateFileDele
 	})
 }
 
-func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.BlockIDExt) error {
+func (s *Store) deleteArchivePrunedSnapshotMeta(batch *pebble.Batch, block ton.BlockIDExt) error {
 	key := hotKeyBlockMeta(block)
 	raw, closer, err := pebbleReaderGet(s.hot, key)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -614,7 +673,52 @@ func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.
 	if err != nil {
 		return err
 	}
+	if !isArchivePrunedSnapshotMeta(meta) {
+		return nil
+	}
+	return batch.Delete(key, pebble.NoSync)
+}
+
+func (s *Store) clearPersistentStateSnapshotMeta(
+	batch *pebble.Batch,
+	block ton.BlockIDExt,
+	retention archivePrunePersistentStateRetention,
+	retainArchiveMarker bool,
+) error {
+	key := hotKeyBlockMeta(block)
+	raw, closer, err := pebbleReaderGet(s.hot, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closer.Close() }()
+
+	meta, err := decodeBlockMeta(block, raw)
+	if err != nil {
+		return err
+	}
+	if isArchivePrunedSnapshotMeta(meta) {
+		if !retainArchiveMarker {
+			return batch.Delete(key, pebble.NoSync)
+		}
+		if bytes.Equal(meta.StateRootHash, retention.stateRootHash) {
+			return nil
+		}
+		meta.StateRootHash = bytes.Clone(retention.stateRootHash)
+		return batch.Set(key, encodeBlockMeta(meta), pebble.NoSync)
+	}
 	existing := meta.Clone()
+	if len(retention.unsplitFileHash) != 0 {
+		meta.Mark(storage.BlockMetaHasStateSnapshot)
+		meta.StateRootHash = bytes.Clone(retention.stateRootHash)
+		meta.StateFileHash = bytes.Clone(retention.unsplitFileHash)
+		if err = batch.Set(key, encodeBlockMeta(meta), pebble.NoSync); err != nil {
+			return err
+		}
+		return setBlockMetaHistoryIndexes(batch, existing, meta)
+	}
 	meta.Flags &^= storage.BlockMetaHasStateSnapshot
 	meta.StateFileHash = nil
 	if !blockMetaIndexedInHistory(meta) {
