@@ -10,9 +10,10 @@ import (
 )
 
 type nonfinalParsedStateUpdate struct {
-	root   *cell.Cell
-	meta   *storage.BlockMeta
-	update *cell.Cell
+	root                 *cell.Cell
+	meta                 *storage.BlockMeta
+	update               *cell.Cell
+	validatedStateUpdate *cell.Cell
 }
 
 func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.LazyCellLoader) (*storage.BlockState, *storage.BlockMeta, storage.StateCellRecords, error) {
@@ -36,9 +37,10 @@ func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.Laz
 
 // nonfinalParseStateUpdate extracts and validates the block's Merkle state
 // update. updateTrusted marks a publisher-provided StateUpdate as coming from
-// a signed, hash-anchored block whose update needs no standalone validation;
-// candidate-origin updates are unsigned, so they are always validated here.
-func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts, updateTrusted bool) (nonfinalParsedStateUpdate, error) {
+// a signed, hash-anchored block whose update needs no standalone validation.
+// validatedStateUpdate is an exact immutable cell previously accepted here;
+// a different cell is always validated independently.
+func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts, updateTrusted bool, validatedStateUpdate *cell.Cell) (nonfinalParsedStateUpdate, error) {
 	root := block.Root
 	if root == nil && len(block.BlockData) > 0 {
 		parsed, err := ParseTrustedBlockBOC(block.Block, block.BlockData)
@@ -86,16 +88,23 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts, updateTrusted bo
 	if stateUpdate == nil {
 		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
 	}
-	if !updateValidated {
+	validationMemoMatches := stateUpdate == validatedStateUpdate
+	if !updateValidated && !validationMemoMatches {
 		if err = cell.ValidateMerkleUpdate(stateUpdate); err != nil {
 			return nonfinalParsedStateUpdate{}, fmt.Errorf("validate non-final state update: %w", err)
 		}
+		validationMemoMatches = true
 	}
 
+	var validationMemo *cell.Cell
+	if validationMemoMatches {
+		validationMemo = stateUpdate
+	}
 	return nonfinalParsedStateUpdate{
-		root:   root,
-		meta:   meta.Clone(),
-		update: stateUpdate,
+		root:                 root,
+		meta:                 meta.Clone(),
+		update:               stateUpdate,
+		validatedStateUpdate: validationMemo,
 	}, nil
 }
 

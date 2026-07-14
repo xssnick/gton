@@ -153,7 +153,7 @@ func (s *stateBOCImport) saveRange(writer *stateCellBatchWriter, start, end uint
 			return fmt.Errorf("load boc state cell #%d: %w", idx, err)
 		}
 		if err = stateCellRefsForBOCView(s.view, bocCell, &refs); err != nil {
-			return fmt.Errorf("load boc state cell refs hash=%x index=%d: %w", bocCell.Meta.Hash[:], idx, err)
+			return fmt.Errorf("load boc state cell refs hash=%x index=%d: %w", bocCell.Meta.Hash, idx, err)
 		}
 		if err = writer.addBOCCell(bocCell, &refs); err != nil {
 			return err
@@ -278,7 +278,14 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 		}
 		refs, refCells, err := stateCellRefs(current, currentMeta)
 		if err != nil {
-			return stateCellSaveStats{}, fmt.Errorf("load state cell refs hash=%x lazy=%t virtual=%t type=%d: %w", currentHash[:], current.IsLazy(), current.IsVirtualized(), current.GetType(), err)
+			return stateCellSaveStats{}, fmt.Errorf(
+				"load state cell refs hash=%x lazy=%t virtual=%t type=%d: %w",
+				currentHash,
+				current.IsLazy(),
+				current.IsVirtualized(),
+				current.GetType(),
+				err,
+			)
 		}
 		for i := 0; i < len(refs); i++ {
 			ref := refs[i]
@@ -291,7 +298,7 @@ func (s *Store) saveStateCellTreesDFSBatch(ctx context.Context, trees []stateCel
 			}
 			refCell := refCells[i]
 			if refCell == nil || refCell.IsLazy() {
-				return stateCellSaveStats{}, fmt.Errorf("state ref %x from parent %x ref=%d has no body", refHash[:], currentHash[:], i)
+				return stateCellSaveStats{}, fmt.Errorf("state ref %x from parent %x ref=%d has no body", refHash, currentHash, i)
 			}
 
 			visited[refHash] = struct{}{}
@@ -547,10 +554,17 @@ func stateCellEncodedLen(cl *cell.Cell, refs []cell.RefMetadata) (int, stateCell
 	refsSize := 0
 	compactRefsSize := 1
 	hasCommonRef := false
-	for i, ref := range refs {
+	for i := range refs {
+		ref := &refs[i]
 		hashesCount := storage.CellRefHashesCount(ref.LevelMask.Mask)
 		if len(ref.Hashes) != hashesCount || len(ref.Depths) != hashesCount {
-			return 0, stateCellRecordLayout{}, fmt.Errorf("invalid ref metadata for %x: hashes=%d depths=%d want=%d", ref.Hash[:], len(ref.Hashes), len(ref.Depths), hashesCount)
+			return 0, stateCellRecordLayout{}, fmt.Errorf(
+				"invalid ref metadata for %x: hashes=%d depths=%d want=%d",
+				ref.Hash,
+				len(ref.Hashes),
+				len(ref.Depths),
+				hashesCount,
+			)
 		}
 		refSize := 1 + hashesCount*(cellRecordHashSize+cellRecordDepthSize)
 		refsSize += refSize
@@ -589,10 +603,15 @@ func stateBOCCellEncodedLen(cl cell.BOCCellView, refs *stateBOCRefs) (int, state
 	compactRefsSize := 1
 	hasCommonRef := false
 	for i := 0; i < refs.count; i++ {
-		ref := refs.items[i]
+		ref := &refs.items[i]
 		hashesCount := storage.CellRefHashesCount(ref.LevelMask.Mask)
 		if int(ref.Count) < hashesCount {
-			return 0, stateCellRecordLayout{}, fmt.Errorf("invalid boc ref metadata for %x: hashes=%d want=%d", ref.Hash[:], ref.Count, hashesCount)
+			return 0, stateCellRecordLayout{}, fmt.Errorf(
+				"invalid boc ref metadata for %x: hashes=%d want=%d",
+				ref.Hash,
+				ref.Count,
+				hashesCount,
+			)
 		}
 		refSize := 1 + hashesCount*(cellRecordHashSize+cellRecordDepthSize)
 		refsSize += refSize
@@ -613,11 +632,11 @@ func stateBOCCellEncodedLen(cl cell.BOCCellView, refs *stateBOCRefs) (int, state
 	return size, layout, nil
 }
 
-func stateBOCRefCommon(ref cell.BOCCellMeta) bool {
+func stateBOCRefCommon(ref *cell.BOCCellMeta) bool {
 	return ref.LevelMask.Mask == 0 && ref.Count >= 1
 }
 
-func stateCellRefCommon(ref cell.RefMetadata) bool {
+func stateCellRefCommon(ref *cell.RefMetadata) bool {
 	return ref.LevelMask.Mask == 0 && len(ref.Hashes) == 1 && len(ref.Depths) == 1
 }
 

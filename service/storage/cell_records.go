@@ -58,6 +58,11 @@ type stateCellRecordBuilder struct {
 	arena   []byte
 }
 
+type encodedCellRecordRefLayout struct {
+	slowRefs    byte
+	compactRefs bool
+}
+
 func NewStateCellRecords(records []EncodedCellRecord) StateCellRecords {
 	result := StateCellRecords{
 		Records: records,
@@ -317,13 +322,14 @@ func prepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata,
 	cellBits := cl.BitsSize()
 
 	d1, d2 := cellRecordDescriptorsForLevelMask(cl, meta.LevelMask, len(meta.Refs), cellBits)
-	size, err := encodedCellRecordLenFromMetadata(d2, meta.Refs)
+	layout, err := encodedCellRecordCompactMetadataRefLayout(meta.Refs)
 	if err != nil {
 		return EncodedCellRecord{}, err
 	}
+	size := encodedCellRecordLenFromMetadata(d2, meta.Refs, layout)
 
 	encoded := alloc(size)
-	encodeCellRecordMetadataTo(encoded, cl, meta.Refs, d1, d2)
+	encodeCellRecordMetadataTo(encoded, cl, meta.Refs, d1, d2, layout)
 	return EncodedCellRecord{Hash: meta.Hash, Data: encoded}, nil
 }
 
@@ -360,15 +366,15 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 			continue
 		}
 
-		meta := current.GetMetadata()
-		hash := meta.Hash
+		hash := current.HashKey()
 		if _, ok := builder.index[hash]; ok {
 			continue
 		}
+		meta := current.GetMetadata()
 
 		record, err := prepareReachableStateUpdateCellRecord(current, meta, builder.alloc)
 		if err != nil {
-			return StateCellRecords{}, fmt.Errorf("build reachable state update cell record %x: %w", meta.Hash[:], err)
+			return StateCellRecords{}, fmt.Errorf("build reachable state update cell record %x: %w", hash, err)
 		}
 		builder.add(record)
 
@@ -377,11 +383,11 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 		}
 		for i, ref := range meta.Refs {
 			if ref.Lazy {
-				return StateCellRecords{}, fmt.Errorf("reachable state update ref %d from %x is lazy", i, hash[:])
+				return StateCellRecords{}, fmt.Errorf("reachable state update ref %d from %x is lazy", i, hash)
 			}
 			refCell, err := current.PeekRef(i)
 			if err != nil {
-				return StateCellRecords{}, fmt.Errorf("load reachable state update ref %d from %x: %w", i, hash[:], err)
+				return StateCellRecords{}, fmt.Errorf("load reachable state update ref %d from %x: %w", i, hash, err)
 			}
 			stack = append(stack, refCell)
 		}
@@ -634,30 +640,25 @@ func cellRecordBody(cl *cell.Cell, cellBits uint, bodyLen int) []byte {
 	return body
 }
 
-func encodedCellRecordLenFromMetadata(d2 byte, refs []cell.RefMetadata) (int, error) {
+func encodedCellRecordLenFromMetadata(d2 byte, refs []cell.RefMetadata, layout encodedCellRecordRefLayout) int {
 	size := 2 + int(d2/2+d2%2)
-	slowRefs, compactRefs, err := encodedCellRecordCompactMetadataRefLayout(refs)
-	if err != nil {
-		return 0, err
-	}
-	if compactRefs {
+	if layout.compactRefs {
 		size++
 	}
 	for i, ref := range refs {
 		hashesCount := CellRefHashesCount(ref.LevelMask.Mask)
-		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+		if layout.compactRefs && layout.slowRefs&(1<<uint(i)) == 0 {
 			size += encodedCellRecordHashSize + encodedCellRecordDepthSize
 			continue
 		}
 		size += 1 + hashesCount*(encodedCellRecordHashSize+encodedCellRecordDepthSize)
 	}
-	return size, nil
+	return size
 }
 
-func encodeCellRecordMetadataTo(buf []byte, cl *cell.Cell, refs []cell.RefMetadata, d1 byte, d2 byte) {
-	slowRefs, compactRefs, _ := encodedCellRecordCompactMetadataRefLayout(refs)
+func encodeCellRecordMetadataTo(buf []byte, cl *cell.Cell, refs []cell.RefMetadata, d1 byte, d2 byte, layout encodedCellRecordRefLayout) {
 	pos := 0
-	if compactRefs {
+	if layout.compactRefs {
 		d1 |= encodedCellRecordCompactRefsFlag
 	}
 	buf[pos] = d1
@@ -665,12 +666,12 @@ func encodeCellRecordMetadataTo(buf []byte, cl *cell.Cell, refs []cell.RefMetada
 	pos += 2
 
 	pos += cl.SerializeBOCBodyTo(buf[pos:])
-	if compactRefs {
-		buf[pos] = slowRefs
+	if layout.compactRefs {
+		buf[pos] = layout.slowRefs
 		pos++
 	}
 	for i, ref := range refs {
-		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+		if layout.compactRefs && layout.slowRefs&(1<<uint(i)) == 0 {
 			copy(buf[pos:pos+encodedCellRecordHashSize], ref.Hashes[0][:])
 			pos += encodedCellRecordHashSize
 			binary.BigEndian.PutUint16(buf[pos:pos+encodedCellRecordDepthSize], ref.Depths[0])
@@ -691,22 +692,33 @@ func encodeCellRecordMetadataTo(buf []byte, cl *cell.Cell, refs []cell.RefMetada
 	}
 }
 
-func encodedCellRecordCompactMetadataRefLayout(refs []cell.RefMetadata) (byte, bool, error) {
+func encodedCellRecordCompactMetadataRefLayout(refs []cell.RefMetadata) (encodedCellRecordRefLayout, error) {
 	if len(refs) == 0 {
-		return 0, false, nil
+		return encodedCellRecordRefLayout{}, nil
 	}
 
 	refsSize := 0
 	compactRefsSize := 1
 	hasCommonRef := false
-	var slowRefs byte
-	for i, ref := range refs {
+	var layout encodedCellRecordRefLayout
+	for i := range refs {
+		ref := &refs[i]
 		hashesCount := CellRefHashesCount(ref.LevelMask.Mask)
 		if len(ref.Hashes) != hashesCount || len(ref.Depths) != hashesCount {
-			return 0, false, fmt.Errorf("invalid ref metadata for %x: hashes=%d depths=%d want=%d", ref.Hash[:], len(ref.Hashes), len(ref.Depths), hashesCount)
+			return encodedCellRecordRefLayout{}, fmt.Errorf(
+				"invalid ref metadata for %x: hashes=%d depths=%d want=%d",
+				ref.Hash,
+				len(ref.Hashes),
+				len(ref.Depths),
+				hashesCount,
+			)
 		}
 		if hashesCount > 0 && ref.Hashes[hashesCount-1] != ref.Hash {
-			return 0, false, fmt.Errorf("top hash mismatch: got=%x want=%x", ref.Hashes[hashesCount-1][:], ref.Hash[:])
+			return encodedCellRecordRefLayout{}, fmt.Errorf(
+				"top hash mismatch: got=%x want=%x",
+				ref.Hashes[hashesCount-1],
+				ref.Hash,
+			)
 		}
 
 		refSize := 1 + hashesCount*(encodedCellRecordHashSize+encodedCellRecordDepthSize)
@@ -716,10 +728,11 @@ func encodedCellRecordCompactMetadataRefLayout(refs []cell.RefMetadata) (byte, b
 			compactRefsSize += encodedCellRecordHashSize + encodedCellRecordDepthSize
 			continue
 		}
-		slowRefs |= 1 << uint(i)
+		layout.slowRefs |= 1 << uint(i)
 		compactRefsSize += refSize
 	}
-	return slowRefs, hasCommonRef && compactRefsSize <= refsSize, nil
+	layout.compactRefs = hasCommonRef && compactRefsSize <= refsSize
+	return layout, nil
 }
 
 func cellRefRecordFromCell(ref *cell.Cell) CellRefRecord {

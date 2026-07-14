@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -398,6 +399,79 @@ func TestLiveStoreNonfinalRejectsStateUpdateFromDifferentPreviousRoot(t *testing
 	}
 }
 
+func TestLiveStoreNonfinalSignedValidatesExtractedStateUpdate(t *testing.T) {
+	live, base := testNonfinalLiveStoreWithCurrent(t)
+
+	updateFromRoot := cell.BeginCell().MustStoreRef(base.State.Cell).EndCell()
+	updateFrom, err := cell.CreatePrunedBranch(updateFromRoot, 1, 3)
+	if err != nil {
+		t.Fatalf("prune update source: %v", err)
+	}
+	updateToRoot := cell.BeginCell().MustStoreRef(cell.BeginCell().MustStoreUInt(0xa0, 8).EndCell()).EndCell()
+	updateTo, err := cell.CreatePrunedBranch(updateToRoot, 1, 3)
+	if err != nil {
+		t.Fatalf("prune update target: %v", err)
+	}
+	update := testNonfinalRawMerkleUpdate(t, updateFrom, updateTo)
+	if err = cell.ValidateMerkleUpdate(update); err == nil {
+		t.Fatal("invalid update fixture passed validation")
+	}
+
+	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 11, base.Block, update)
+	err = live.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            pendingBlock,
+		Root:             pendingRoot,
+		AvailabilityOnly: true,
+	}, storage.LiveBlockNonfinalSigned)
+	if err == nil {
+		t.Fatal("signed block with invalid extracted state update succeeded")
+	}
+	if !strings.Contains(err.Error(), "validate non-final state update") {
+		t.Fatalf("publish error = %v, want standalone state update validation", err)
+	}
+}
+
+func TestLiveStoreNonfinalChecksPreviousStateBeforePreparingRecords(t *testing.T) {
+	live, base := testNonfinalLiveStoreWithCurrent(t)
+
+	wrongBaseState := cell.BeginCell().MustStoreUInt(0xb1, 8).EndCell()
+	destinationChild := cell.BeginCell().MustStoreUInt(0xb2, 8).EndCell()
+	destination := cell.BeginCell().MustStoreUInt(0xb3, 8).MustStoreRef(destinationChild).EndCell()
+	record, err := storage.PrepareEncodedCellRecordFromCellMetadata(destination, destination.GetMetadata())
+	if err != nil {
+		t.Fatalf("prepare destination record: %v", err)
+	}
+	lazyDestination, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(record.Hash[:], record.Data), func(cell.Hash) (*cell.Cell, error) {
+		return nil, cell.ErrLazyRefNotFound
+	})
+	if err != nil {
+		t.Fatalf("build lazy destination: %v", err)
+	}
+	update, err := cell.CreateMerkleUpdate(wrongBaseState, lazyDestination)
+	if err != nil {
+		t.Fatalf("create merkle update: %v", err)
+	}
+
+	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 11, base.Block, update)
+	err = live.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            pendingBlock,
+		Root:             pendingRoot,
+		StateUpdate:      update,
+		AvailabilityOnly: true,
+		Meta: &storage.BlockMeta{
+			ID:            pendingBlock,
+			PrevRefs:      []ton.BlockIDExt{base.Block},
+			StateRootHash: bytes.Clone(lazyDestination.Hash()),
+		},
+	}, storage.LiveBlockNonfinalSigned)
+	if err == nil {
+		t.Fatal("publish with wrong previous state succeeded")
+	}
+	if !strings.Contains(err.Error(), "does not match previous state") {
+		t.Fatalf("publish error = %v, want previous state mismatch before record preparation", err)
+	}
+}
+
 func TestLiveStoreNonfinalWaitsBeforePreparingStateUpdate(t *testing.T) {
 	live, base := testNonfinalLiveStoreWithCurrent(t)
 
@@ -420,6 +494,10 @@ func TestLiveStoreNonfinalWaitsBeforePreparingStateUpdate(t *testing.T) {
 		Block:     childBlock,
 		Root:      childRoot,
 		BlockData: testBlockBOC(childRoot),
+		// Readiness must be checked before standalone validation. This invalid
+		// update is deferred while its parent is missing, then rejected once the
+		// parent makes the candidate eligible for promotion.
+		StateUpdate: cell.BeginCell().EndCell(),
 		Meta: &storage.BlockMeta{
 			ID:            childBlock,
 			PrevRefs:      []ton.BlockIDExt{parent.Block},
@@ -438,6 +516,71 @@ func TestLiveStoreNonfinalWaitsBeforePreparingStateUpdate(t *testing.T) {
 		t.Fatalf("not-ready child state err = %v, want ErrNotFound", err)
 	}
 
+	if err = live.PublishNonfinalBlockArtifacts(parent, storage.LiveBlockNonfinalSigned); err != nil {
+		t.Fatalf("publish parent: %v", err)
+	}
+	if _, err = live.BlockState(context.Background(), childBlock); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("invalid child state after parent err = %v, want ErrNotFound", err)
+	}
+	_, candidates = live.NonfinalPendingShardBlocks(nil)
+	if len(candidates) != 0 {
+		t.Fatalf("invalid child candidates after parent = %d, want 0", len(candidates))
+	}
+}
+
+func TestLiveStoreNonfinalValidatesWaitingCandidateOnce(t *testing.T) {
+	live, base := testNonfinalLiveStoreWithCurrent(t)
+
+	sourceChild := cell.BeginCell().MustStoreUInt(0xa1, 8).EndCell()
+	parentState := cell.BeginCell().MustStoreUInt(0xa2, 8).MustStoreRef(sourceChild).EndCell()
+	parent := testNonfinalArtifact(t, 0, masterchainShard, 11, parentState, base.Block)
+
+	record, err := storage.PrepareEncodedCellRecordFromCellMetadata(parentState, parentState.GetMetadata())
+	if err != nil {
+		t.Fatalf("prepare parent state record: %v", err)
+	}
+	sourceChildHash := sourceChild.HashKey()
+	sourceChildLoads := 0
+	lazyParentState, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(record.Hash[:], record.Data), func(hash cell.Hash) (*cell.Cell, error) {
+		if hash != sourceChildHash {
+			return nil, cell.ErrLazyRefNotFound
+		}
+		sourceChildLoads++
+		return sourceChild, nil
+	})
+	if err != nil {
+		t.Fatalf("build lazy parent state: %v", err)
+	}
+
+	childState := cell.BeginCell().MustStoreUInt(0xa3, 8).EndCell()
+	update, err := cell.CreateMerkleUpdate(lazyParentState, childState)
+	if err != nil {
+		t.Fatalf("create child state update: %v", err)
+	}
+	childBlock, childRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 12, parent.Block, update)
+	child := storage.LiveBlockArtifacts{
+		Block:            childBlock,
+		Root:             childRoot,
+		StateUpdate:      update,
+		AvailabilityOnly: true,
+	}
+
+	if err = live.PublishNonfinalBlockArtifacts(child, storage.LiveBlockNonfinalCandidate); err != nil {
+		t.Fatalf("publish waiting child: %v", err)
+	}
+	if err = live.PublishNonfinalBlockArtifacts(parent, storage.LiveBlockNonfinalSigned); err != nil {
+		t.Fatalf("publish parent: %v", err)
+	}
+	if sourceChildLoads != 1 {
+		t.Fatalf("source child loads = %d, want one standalone validation", sourceChildLoads)
+	}
+	if _, err = live.BlockState(context.Background(), child.Block); err != nil {
+		t.Fatalf("load promoted child state: %v", err)
+	}
+	_, candidates := live.NonfinalPendingShardBlocks(nil)
+	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+		t.Fatalf("candidates = %+v, want child", candidates)
+	}
 }
 
 func TestLiveStoreNonfinalDoesNotEnterLookupIndexes(t *testing.T) {
@@ -810,6 +953,24 @@ func testNonfinalBlockForStateUpdate(t *testing.T, workchain int32, shard int64,
 	}
 
 	return testBlockIDForRoot(workchain, shard, seqno, root), root
+}
+
+func testNonfinalRawMerkleUpdate(t *testing.T, from, to *cell.Cell) *cell.Cell {
+	t.Helper()
+
+	update, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
+		MustStoreSlice(from.Hash(0), 256).
+		MustStoreSlice(to.Hash(0), 256).
+		MustStoreUInt(uint64(from.Depth(0)), 16).
+		MustStoreUInt(uint64(to.Depth(0)), 16).
+		MustStoreRef(from).
+		MustStoreRef(to).
+		EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("build raw merkle update: %v", err)
+	}
+	return update
 }
 
 func testNonfinalStateWithTracedRootRefs(t *testing.T, state *cell.Cell, refsFrom *cell.Cell) *cell.Cell {
