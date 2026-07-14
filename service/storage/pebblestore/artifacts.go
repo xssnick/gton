@@ -498,42 +498,105 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 }
 
 func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error {
-	_, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+	deleted, err := s.unlinkPersistentStateFile(ctx, block, masterchainBlock, effectiveShard)
 	if err != nil {
 		return err
+	}
+	if err = syncPersistentStateDeleteDirs([]persistentStateFileDelete{deleted}); err != nil {
+		return err
+	}
+	return s.deletePersistentStateFileRecords([]persistentStateFileDelete{deleted})
+}
+
+type persistentStateFileDelete struct {
+	block           ton.BlockIDExt
+	effectiveShard  int64
+	key             []byte
+	dir             string
+	diskFileRemoved bool
+	diskFileBytes   uint64
+}
+
+func (s *Store) unlinkPersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (persistentStateFileDelete, error) {
+	if err := s.ensureWritable(); err != nil {
+		return persistentStateFileDelete{}, err
+	}
+
+	_, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return persistentStateFileDelete{}, err
 	}
 
 	key := hotKeyPersistentStateFile(block, masterchainBlock, effectiveShard)
 	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
 	if err != nil {
-		return err
+		return persistentStateFileDelete{}, err
 	}
 
 	removedBytes := int64(0)
+	diskFileExisted := false
 	stat, err := os.Stat(path)
-	if err == nil && stat.Size() > 0 {
-		removedBytes = stat.Size()
+	if err == nil {
+		diskFileExisted = true
+		if stat.Size() > 0 {
+			removedBytes = stat.Size()
+		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return persistentStateFileDelete{}, err
 	}
 
-	if err = s.withHotBatch(func(batch *pebble.Batch) error {
-		if err := batch.Delete(key, pebble.NoSync); err != nil {
+	removeErr := os.Remove(path)
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return persistentStateFileDelete{}, removeErr
+	}
+	if diskFileExisted {
+		s.observePersistentStateBytes(-removedBytes)
+	}
+	return persistentStateFileDelete{
+		block:           block,
+		effectiveShard:  effectiveShard,
+		key:             key,
+		dir:             filepath.Dir(path),
+		diskFileRemoved: diskFileExisted,
+		diskFileBytes:   uint64(removedBytes),
+	}, nil
+}
+
+func syncPersistentStateDeleteDirs(files []persistentStateFileDelete) error {
+	dirs := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		dirs[file.dir] = struct{}{}
+	}
+	for dir := range dirs {
+		if err := syncDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		if effectiveShard == 0 {
-			return s.clearPersistentStateSnapshotMeta(batch, block)
-		}
+	}
+	return nil
+}
+
+func (s *Store) deletePersistentStateFileRecords(files []persistentStateFileDelete) error {
+	if len(files) == 0 {
 		return nil
-	}); err != nil {
-		return err
 	}
 
-	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	s.observePersistentStateBytes(-removedBytes)
-	return nil
+	// Publish the metadata removal only after the directory entry is durable.
+	// A crash may then leave a retryable record for an absent file, but never an
+	// untracked persistent-state file that pruning cannot discover. NoSync is
+	// sufficient because any later durability point is ordered after syncDir.
+	return s.withHotBatch(func(batch *pebble.Batch) error {
+		for _, file := range files {
+			if err := batch.Delete(file.key, pebble.NoSync); err != nil {
+				return err
+			}
+			if file.effectiveShard == 0 {
+				if err := s.clearPersistentStateSnapshotMeta(batch, file.block); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.BlockIDExt) error {

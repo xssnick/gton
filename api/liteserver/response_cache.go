@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync"
 
-	"github.com/xssnick/gton/service/storage"
-
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -26,13 +24,32 @@ const (
 type liteResponseKey struct {
 	kind liteResponseKind
 	mode uint32
-	a    storage.BlockRootHash
-	b    storage.BlockRootHash
+	a    liteBlockKey
+	b    liteBlockKey
 }
 
-// liteResponseCache memoizes deterministic per-block response parts keyed by the
-// immutable block content hashes. Cached values are shared between responses and
-// must be treated as read-only.
+type liteBlockKey struct {
+	workchain int32
+	shard     int64
+	seqno     uint32
+	rootHash  [32]byte
+	fileHash  [32]byte
+}
+
+func liteBlockKeyFromBlock(block ton.BlockIDExt) liteBlockKey {
+	key := liteBlockKey{
+		workchain: block.Workchain,
+		shard:     block.Shard,
+		seqno:     block.SeqNo,
+	}
+	copy(key.rootHash[:], block.RootHash)
+	copy(key.fileHash[:], block.FileHash)
+	return key
+}
+
+// liteResponseCache memoizes deterministic per-block response parts keyed by
+// full block identities. Cached values are shared between responses and must be
+// treated as read-only.
 type liteResponseCache struct {
 	mu    sync.RWMutex
 	items map[liteResponseKey]any

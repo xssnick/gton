@@ -164,6 +164,10 @@ type Node struct {
 	latestBasechainNotify     chan struct{}
 	rawMasterchainNotify      chan struct{}
 	stateFilesDir             string
+	stateDownloadMx           sync.Mutex
+	stateDownloadBudget       uint64
+	stateDownloadReserved     uint64
+	stateDownloadActive       int
 	peerUseMx                 sync.RWMutex
 	peerUse                   map[PeerID]peerUse
 	stateCellImportSlot       chan struct{}

@@ -93,7 +93,7 @@ func (s *Server) prepareBlockProofRequest(ctx context.Context, query ton.GetBloc
 }
 
 func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (*blockProofBase, error) {
-	key := storage.BlockKey(block)
+	key := liteBlockKeyFromBlock(block)
 	s.blockProofBasesMu.Lock()
 	cached := s.blockProofBases[key]
 	s.blockProofBasesMu.Unlock()
@@ -137,7 +137,7 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 
 		s.blockProofBasesMu.Lock()
 		if s.blockProofBases == nil {
-			s.blockProofBases = make(map[storage.BlockRootHash]*blockProofBase)
+			s.blockProofBases = make(map[liteBlockKey]*blockProofBase)
 		}
 		if existing := s.blockProofBases[key]; existing != nil {
 			s.blockProofBasesMu.Unlock()
@@ -269,7 +269,7 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 }
 
 func (s *Server) blockProofLinkForward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkForward, error) {
-	key := liteResponseKey{kind: liteResponseBlockProofLinkForward, a: storage.BlockKey(from), b: storage.BlockKey(to)}
+	key := liteResponseKey{kind: liteResponseBlockProofLinkForward, a: liteBlockKeyFromBlock(from), b: liteBlockKeyFromBlock(to)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 		return s.buildBlockProofLinkForward(ctx, from, to)
 	})
@@ -355,7 +355,7 @@ func (s *Server) forwardConfigProofBOC(from ton.BlockIDExt, fromRoot *cell.Cell)
 }
 
 func (s *Server) blockProofLinkBackward(ctx context.Context, from ton.BlockIDExt, to ton.BlockIDExt) (ton.BlockLinkBackward, error) {
-	key := liteResponseKey{kind: liteResponseBlockProofLinkBackward, a: storage.BlockKey(from), b: storage.BlockKey(to)}
+	key := liteResponseKey{kind: liteResponseBlockProofLinkBackward, a: liteBlockKeyFromBlock(from), b: liteBlockKeyFromBlock(to)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 		return blockproof.BlockLinkBackward(ctx, s.store, from, to)
 	})

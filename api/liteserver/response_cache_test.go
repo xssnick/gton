@@ -1,16 +1,17 @@
 package liteserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"testing"
 
-	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func testCacheKey(i int) liteResponseKey {
-	var a storage.BlockRootHash
-	binary.BigEndian.PutUint64(a[:8], uint64(i))
+	var a liteBlockKey
+	binary.BigEndian.PutUint64(a.rootHash[:8], uint64(i))
 	return liteResponseKey{kind: liteResponseBlockHeader, a: a}
 }
 
@@ -39,6 +40,37 @@ func TestLiteResponseCacheReusesCachedValueWithoutRebuild(t *testing.T) {
 	c.mu.RUnlock()
 	if items != 1 || orderLen != 1 {
 		t.Fatalf("items = %d, order = %d, want 1, 1", items, orderLen)
+	}
+}
+
+func TestLiteResponseCacheSeparatesFullBlockIDs(t *testing.T) {
+	c := newLiteResponseCache()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     1 << 62,
+		SeqNo:     7,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x12}, 32),
+	}
+	forged := block
+	forged.FileHash = bytes.Repeat([]byte{0xff}, 32)
+
+	builds := 0
+	for i, id := range []ton.BlockIDExt{block, forged} {
+		key := liteResponseKey{kind: liteResponseBlockHeader, a: liteBlockKeyFromBlock(id)}
+		value, err := c.do(t.Context(), key, func(context.Context) (any, error) {
+			builds++
+			return i, nil
+		})
+		if err != nil {
+			t.Fatalf("cache full block id %d: %v", i, err)
+		}
+		if got, ok := value.(int); !ok || got != i {
+			t.Fatalf("cache full block id %d value = %v, want %d", i, value, i)
+		}
+	}
+	if builds != 2 {
+		t.Fatalf("builds = %d, want 2", builds)
 	}
 }
 

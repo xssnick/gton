@@ -132,6 +132,58 @@ func TestLiveBlockCacheRejectsInvalidBlockID(t *testing.T) {
 	}
 }
 
+func TestLiveBlockCacheRequiresFullBlockIDOnRead(t *testing.T) {
+	cache := NewLiveBlockCache(2)
+	block := testLiveBlockCacheBlockID(1)
+	prev := testLiveBlockCacheBlockID(0)
+	data := []byte{0x11}
+	proof := []byte{0x21}
+
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
+		Block:     block,
+		BlockData: data,
+		Meta:      &BlockMeta{ID: block, PrevRefs: []ton.BlockIDExt{prev}},
+		Proofs: []LiveBlockProofArtifact{{
+			Kind: ServedProofBlock,
+			Data: proof,
+		}},
+	}); err != nil {
+		t.Fatalf("publish block: %v", err)
+	}
+
+	forgedBlock := block
+	forgedBlock.FileHash = bytes.Repeat([]byte{0xff}, 32)
+	if _, err := cache.BlockData(t.Context(), forgedBlock); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("forged block data error = %v, want ErrNotFound", err)
+	}
+	if _, err := cache.BlockProof(t.Context(), ServedProofBlock, forgedBlock); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("forged block proof error = %v, want ErrNotFound", err)
+	}
+	if _, err := cache.BlockFull(t.Context(), forgedBlock); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("forged full block error = %v, want ErrNotFound", err)
+	}
+	if cache.HasBlockData(forgedBlock) {
+		t.Fatal("forged block reported cached data")
+	}
+
+	forgedPrev := prev
+	forgedPrev.SeqNo++
+	if _, err := cache.NextBlockFull(t.Context(), forgedPrev); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("next block for forged previous id error = %v, want ErrNotFound", err)
+	}
+
+	gotData, err := cache.BlockData(t.Context(), block)
+	if err != nil {
+		t.Fatalf("canonical block data: %v", err)
+	}
+	if !bytes.Equal(gotData, data) {
+		t.Fatalf("canonical block data = %x, want %x", gotData, data)
+	}
+	if _, err = cache.NextBlockFull(t.Context(), prev); err != nil {
+		t.Fatalf("next block for canonical previous id: %v", err)
+	}
+}
+
 func testLiveBlockCacheBlockID(seqno uint32) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: 0,

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/pebble/v2/vfs"
 	tnstate "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
@@ -1095,6 +1096,60 @@ func (n *Node) createStateFile(block ton.BlockIDExt, master ton.BlockIDExt, effe
 	return file, path, finalPath, nil
 }
 
+func (n *Node) reservePersistentStateDownload(size int64) (func(bool), error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("invalid persistent state size %d", size)
+	}
+	if n.stateFilesDir == "" {
+		return nil, fmt.Errorf("state files dir is empty")
+	}
+
+	requested := uint64(size)
+
+	n.stateDownloadMx.Lock()
+	if n.stateDownloadActive == 0 {
+		usage, err := vfs.Default.GetDiskUsage(n.stateFilesDir)
+		if err != nil {
+			n.stateDownloadMx.Unlock()
+			return nil, fmt.Errorf("%w: check filesystem usage: %v", errPersistentStateDownloadDiskBudget, err)
+		}
+		// Keep ten percent of currently available space outside the state
+		// download budget. The budget remains fixed while downloads overlap,
+		// avoiding double-counting bytes already written by active streams.
+		n.stateDownloadBudget = usage.AvailBytes - usage.AvailBytes/10
+		n.stateDownloadReserved = 0
+	}
+	if requested > n.stateDownloadBudget || n.stateDownloadReserved > n.stateDownloadBudget-requested {
+		budget := n.stateDownloadBudget
+		reserved := n.stateDownloadReserved
+		if n.stateDownloadActive == 0 {
+			n.stateDownloadBudget = 0
+		}
+		n.stateDownloadMx.Unlock()
+		return nil, fmt.Errorf("%w: size=%d reserved=%d budget=%d", errPersistentStateDownloadDiskBudget, size, reserved, budget)
+	}
+	n.stateDownloadReserved += requested
+	n.stateDownloadActive++
+	n.stateDownloadMx.Unlock()
+
+	released := false
+	return func(retained bool) {
+		n.stateDownloadMx.Lock()
+		if !released {
+			n.stateDownloadActive--
+			if !retained {
+				n.stateDownloadReserved -= requested
+			}
+			if n.stateDownloadActive == 0 {
+				n.stateDownloadBudget = 0
+				n.stateDownloadReserved = 0
+			}
+			released = true
+		}
+		n.stateDownloadMx.Unlock()
+	}, nil
+}
+
 func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 	ctx context.Context,
 	candidate persistentStateCandidate,
@@ -1102,6 +1157,12 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 	chunkLimiter chan struct{},
 ) (*stagedStateFile, error) {
 	n := d.node
+	releaseDisk, err := n.reservePersistentStateDownload(candidate.size)
+	if err != nil {
+		return nil, err
+	}
+	diskRetained := false
+	defer func() { releaseDisk(diskRetained) }()
 
 	reader, err := d.newPersistentStateChunkReader(ctx, candidate.peer, candidate.id, candidate.size, candidate.workers, chunkLimiter, seed)
 	if err != nil {
@@ -1119,8 +1180,10 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		if !closed {
 			_ = file.Close()
 		}
-		if !success {
-			_ = os.Remove(path)
+		if success {
+			diskRetained = true
+		} else if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			diskRetained = true
 		}
 	}()
 

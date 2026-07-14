@@ -38,7 +38,7 @@ const (
 const blockHeaderProofModeMask uint32 = 1 | 2 | 16 | 32 | 64
 
 func (s *Server) blockHeader(ctx context.Context, id ton.BlockIDExt, mode uint32) (ton.BlockHeader, error) {
-	key := liteResponseKey{kind: liteResponseBlockHeader, mode: mode & blockHeaderProofModeMask, a: storage.BlockKey(id)}
+	key := liteResponseKey{kind: liteResponseBlockHeader, mode: mode & blockHeaderProofModeMask, a: liteBlockKeyFromBlock(id)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 		root, err := s.loadBlockRoot(ctx, id)
 		if err != nil {

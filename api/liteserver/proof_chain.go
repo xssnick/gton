@@ -164,7 +164,7 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 		return nil, nil, nil
 	}
 
-	key := liteResponseKey{kind: liteResponseLookupMasterProofs, a: storage.BlockKey(client), b: storage.BlockKey(proved)}
+	key := liteResponseKey{kind: liteResponseLookupMasterProofs, a: liteBlockKeyFromBlock(client), b: liteBlockKeyFromBlock(proved)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 		return s.buildLookupClientMasterProofs(ctx, client, proved)
 	})
@@ -201,7 +201,7 @@ func (s *Server) shardBlockProofLinks(ctx context.Context, master ton.BlockIDExt
 		return nil, fmt.Errorf("masterchain block id must be specified")
 	}
 
-	key := liteResponseKey{kind: liteResponseShardBlockLinks, a: storage.BlockKey(master), b: storage.BlockKey(target)}
+	key := liteResponseKey{kind: liteResponseShardBlockLinks, a: liteBlockKeyFromBlock(master), b: liteBlockKeyFromBlock(target)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 		return blockproof.ShardBlockProofLinks(ctx, s.store, master, target)
 	})

@@ -1107,7 +1107,14 @@ func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, maxAnswer uint64, _ 
 		timeout = time.Until(deadline)
 	}
 
-	query, isArchiveSlice := testOverlayQueryPayload(req).(GetArchiveSlice)
+	payload := testOverlayQueryPayload(req)
+	query, isArchiveSlice := payload.(GetArchiveSlice)
+	stateQuery, isPersistentStateSlice := payload.(DownloadPersistentStateSliceV2)
+	isSlice := isArchiveSlice || isPersistentStateSlice
+	offset := query.Offset
+	if isPersistentStateSlice {
+		offset = stateQuery.Offset
+	}
 	r.mu.Lock()
 	r.asyncQueries = append(r.asyncQueries, testArchiveAsyncQuery{
 		request:   req,
@@ -1118,14 +1125,14 @@ func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, maxAnswer uint64, _ 
 	data := append([]byte(nil), r.asyncResult...)
 	delay := r.asyncDelay
 	waitForCancel := false
-	if isArchiveSlice {
-		if configured, ok := r.asyncErrors[query.Offset]; ok {
+	if isSlice {
+		if configured, ok := r.asyncErrors[offset]; ok {
 			asyncErr = configured
 		}
-		if configured, ok := r.asyncDelays[query.Offset]; ok {
+		if configured, ok := r.asyncDelays[offset]; ok {
 			delay = configured
 		}
-		waitForCancel = r.asyncWaitForCancel[query.Offset]
+		waitForCancel = r.asyncWaitForCancel[offset]
 	}
 	if asyncErr == nil {
 		r.asyncActive++
@@ -1194,7 +1201,7 @@ func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, maxAnswer uint64, _ 
 		}
 
 		r.mu.Lock()
-		r.asyncCompleted = append(r.asyncCompleted, query.Offset)
+		r.asyncCompleted = append(r.asyncCompleted, offset)
 		r.mu.Unlock()
 		select {
 		case result <- rldp.AsyncQueryResult{ResultBytes: data}:

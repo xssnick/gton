@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"sync"
@@ -18,7 +19,7 @@ type LiveBlockCache struct {
 	max int
 
 	blocks     sync.Map // BlockRootHash -> *LiveBlockCacheBlock
-	nextBlocks sync.Map // BlockRootHash of prev -> ton.BlockIDExt of next
+	nextBlocks sync.Map // BlockRootHash of prev -> liveBlockCacheNext
 
 	publishMu  sync.Mutex
 	count      int
@@ -33,6 +34,11 @@ type LiveBlockCacheBlock struct {
 	meta            *BlockMeta
 	proofs          map[ServedProofKind][]byte
 	artifactFlushed bool
+}
+
+type liveBlockCacheNext struct {
+	prev ton.BlockIDExt
+	next ton.BlockIDExt
 }
 
 type LiveBlockCacheArtifacts struct {
@@ -211,7 +217,11 @@ func (c *LiveBlockCache) cachedBlock(block ton.BlockIDExt) (*LiveBlockCacheBlock
 	if !ok {
 		return nil, false
 	}
-	return loaded.(*LiveBlockCacheBlock), true
+	cached := loaded.(*LiveBlockCacheBlock)
+	if !blockIDMatchesRootKey(cached.id, block) {
+		return nil, false
+	}
+	return cached, true
 }
 
 func (c *LiveBlockCache) cachedBlockFull(block ton.BlockIDExt) (*LiveBlockCacheBlock, ServedProofKind, bool) {
@@ -260,14 +270,22 @@ func (c *LiveBlockCache) nextBlock(prev ton.BlockIDExt) (ton.BlockIDExt, bool) {
 	if !ok {
 		return ton.BlockIDExt{}, false
 	}
-	return loaded.(ton.BlockIDExt), true
+	cached := loaded.(liveBlockCacheNext)
+	if !blockIDMatchesRootKey(cached.prev, prev) {
+		return ton.BlockIDExt{}, false
+	}
+	return cached.next, true
 }
 
 func (c *LiveBlockCache) setNextBlockLocked(prev ton.BlockIDExt, next ton.BlockIDExt) {
 	key := BlockKey(prev)
 	selected := next
 	if loaded, ok := c.nextBlocks.Load(key); ok {
-		current := loaded.(ton.BlockIDExt)
+		cached := loaded.(liveBlockCacheNext)
+		if !blockIDMatchesRootKey(cached.prev, prev) {
+			return
+		}
+		current := cached.next
 		if current.Equals(&next) {
 			return
 		}
@@ -279,9 +297,17 @@ func (c *LiveBlockCache) setNextBlockLocked(prev ton.BlockIDExt, next ton.BlockI
 		selected = chosen
 	}
 
-	c.nextBlocks.Store(key, selected)
+	c.nextBlocks.Store(key, liveBlockCacheNext{prev: prev, next: selected})
 	nextKey := BlockKey(selected)
 	c.prevKeys[nextKey] = append(c.prevKeys[nextKey], key)
+}
+
+func blockIDMatchesRootKey(cached, requested ton.BlockIDExt) bool {
+	return cached.Workchain == requested.Workchain &&
+		cached.Shard == requested.Shard &&
+		cached.SeqNo == requested.SeqNo &&
+		len(cached.RootHash) == 32 && len(requested.RootHash) == 32 &&
+		bytes.Equal(cached.FileHash, requested.FileHash)
 }
 
 func selectLiveBlockCacheSplitNext(prev ton.BlockIDExt, current ton.BlockIDExt, next ton.BlockIDExt) (ton.BlockIDExt, bool) {
@@ -361,7 +387,7 @@ func (c *LiveBlockCache) deleteBlockLocked(key BlockRootHash) {
 	}
 
 	for _, prev := range c.prevKeys[key] {
-		if loaded, ok := c.nextBlocks.Load(prev); ok && BlockKey(loaded.(ton.BlockIDExt)) == key {
+		if loaded, ok := c.nextBlocks.Load(prev); ok && BlockKey(loaded.(liveBlockCacheNext).next) == key {
 			c.nextBlocks.Delete(prev)
 		}
 	}

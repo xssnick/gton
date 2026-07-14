@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -456,7 +458,10 @@ func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64
 	if err := batch.Delete(hotKeyCellGenerationCurrent(generation), pebble.NoSync); err != nil {
 		return err
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	// Persist the manifest and progress removal before detaching the cell DB.
+	// Otherwise a crash during directory cleanup can reopen this generation as
+	// pending with only a subset of its shard directories left on disk.
+	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
 	}
 
@@ -501,6 +506,77 @@ func (s *Store) cleanupRetiredCellGenerations(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) cleanupUnreferencedCellGenerationDirs() error {
+	root := filepath.Join(s.dir, cellDBRootDir)
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	referenced := make(map[uint64]struct{}, 2+len(s.retiredGenerations))
+	referenced[s.activeCellGeneration] = struct{}{}
+	if s.pendingCellMigration != nil {
+		referenced[s.pendingCellMigration.generation] = struct{}{}
+	}
+	for _, generation := range s.retiredGenerations {
+		referenced[generation] = struct{}{}
+	}
+	s.mu.RUnlock()
+
+	orphans := make(map[uint64]struct{})
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		generation, parseErr := parseCellGenerationShardDirName(entry.Name())
+		if errors.Is(parseErr, storage.ErrNotFound) {
+			// Cleanup owns only canonical generation directories; leave any
+			// operator-created or future-format entries untouched.
+			continue
+		}
+		if parseErr != nil {
+			return parseErr
+		}
+		if _, referencedGeneration := referenced[generation]; !referencedGeneration {
+			orphans[generation] = struct{}{}
+		}
+	}
+
+	generations := make([]uint64, 0, len(orphans))
+	for generation := range orphans {
+		generations = append(generations, generation)
+	}
+	sort.Slice(generations, func(i, j int) bool {
+		return generations[i] < generations[j]
+	})
+	for _, generation := range generations {
+		if err = s.removeCellGenerationDirs(generation); err != nil {
+			return fmt.Errorf("remove unreferenced cell generation %d: %w", generation, err)
+		}
+		s.log.Info().
+			Uint64("cell_generation", generation).
+			Msg("removed unreferenced cell generation")
+	}
+	return nil
+}
+
+func parseCellGenerationShardDirName(name string) (uint64, error) {
+	var generation uint64
+	var shard int
+	n, err := fmt.Sscanf(name, cellGenerationDirTemplate, &generation, &shard)
+	if err != nil || n != 2 || shard < 0 || shard >= cellDBShardCount {
+		return 0, storage.ErrNotFound
+	}
+	if name != fmt.Sprintf(cellGenerationDirTemplate, generation, shard) {
+		return 0, storage.ErrNotFound
+	}
+	return generation, nil
+}
+
 func (s *Store) removeDetachedCellGeneration(generation uint64, cells *cellStore) {
 	var closeErr error
 	if cells != nil {
@@ -526,6 +602,9 @@ func (s *Store) removeCellGenerationDirs(generation uint64) error {
 		if removeErr := os.RemoveAll(cellGenerationShardDir(s.dir, generation, shard)); removeErr != nil {
 			err = errors.Join(err, removeErr)
 		}
+	}
+	if syncErr := syncDir(filepath.Join(s.dir, cellDBRootDir)); syncErr != nil && !errors.Is(syncErr, os.ErrNotExist) {
+		err = errors.Join(err, syncErr)
 	}
 	return err
 }
@@ -564,10 +643,8 @@ func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uin
 			errs = append(errs, err)
 		}
 	}
-	for shard := 0; shard < cellDBShardCount; shard++ {
-		if err := os.RemoveAll(cellGenerationShardDir(s.dir, generation, shard)); err != nil {
-			errs = append(errs, err)
-		}
+	if err := s.removeCellGenerationDirs(generation); err != nil {
+		errs = append(errs, err)
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err

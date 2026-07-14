@@ -68,9 +68,9 @@ type Store struct {
 	nonFinalWaiting    map[storage.BlockRootHash]liveNonfinalWaiting
 	nonFinalCellIndex  map[cell.Hash][]liveNonfinalCellIndexEntry
 	nonFinalCellLoader cell.LazyCellLoader
-	blockDataLoad      liveLoadGroup[storage.BlockRootHash, []byte]
-	blockLoad          liveLoadGroup[storage.BlockRootHash, *liveBlockLoadResult]
-	fragmentLoad       liveLoadGroup[storage.BlockRootHash, *BlockView]
+	blockDataLoad      liveLoadGroup[liveBlockLookupKey, []byte]
+	blockLoad          liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
+	fragmentLoad       liveLoadGroup[liveBlockLookupKey, *BlockView]
 }
 
 type liveBlock struct {
@@ -795,7 +795,12 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 	if fragments := s.cachedBlockFragments(block); fragments != nil {
 		return fragments, nil
 	}
-	fragments, err := s.fragmentLoad.do(ctx, storage.BlockKey(block), func() (*BlockView, error) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	fragments, err := s.fragmentLoad.do(ctx, key, func() (*BlockView, error) {
 		// Load detached from the initiating request so one disconnecting client
 		// cannot fail the shared result for concurrent waiters.
 		ctx := context.WithoutCancel(ctx)
@@ -831,7 +836,12 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 }
 
 func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	data, err := s.blockDataLoad.do(ctx, storage.BlockKey(block), func() ([]byte, error) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	data, err := s.blockDataLoad.do(ctx, key, func() ([]byte, error) {
 		// Load detached from the initiating request so one disconnecting client
 		// cannot fail the shared result for concurrent waiters.
 		ctx := context.WithoutCancel(ctx)
@@ -865,7 +875,12 @@ func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) (
 }
 
 func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liveBlockLoadResult, error) {
-	loaded, err := s.blockLoad.do(ctx, storage.BlockKey(block), func() (*liveBlockLoadResult, error) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	loaded, err := s.blockLoad.do(ctx, key, func() (*liveBlockLoadResult, error) {
 		// Load detached from the initiating request so one disconnecting client
 		// cannot fail the shared result for concurrent waiters.
 		ctx := context.WithoutCancel(ctx)
@@ -996,11 +1011,13 @@ func (s *Store) updateMasterchainInfoLocked(current *storage.CurrentState) {
 		lastUTime = current.Masterchain.Parsed.GenUTime
 	}
 	if meta := s.metas[storage.BlockKey(block)]; meta != nil {
-		if len(stateRootHash) == 0 {
-			stateRootHash = meta.StateRootHash
-		}
-		if lastUTime == 0 {
-			lastUTime = meta.GenUTime
+		if blockIDEqual(meta.ID, block) {
+			if len(stateRootHash) == 0 {
+				stateRootHash = meta.StateRootHash
+			}
+			if lastUTime == 0 {
+				lastUTime = meta.GenUTime
+			}
 		}
 	}
 
@@ -1040,7 +1057,7 @@ func (s *Store) blockDataReadyLocked(block ton.BlockIDExt) bool {
 	}
 
 	cached := s.blocks[storage.BlockKey(block)]
-	return cached != nil && cached.artifactFlushed
+	return cached != nil && blockIDEqual(cached.id, block) && cached.artifactFlushed
 }
 
 func (s *Store) updateReadyMasterSeqnoLocked() bool {
@@ -1131,6 +1148,9 @@ func (s *Store) cachedBlockMeta(block ton.BlockIDExt) *storage.BlockMeta {
 	s.mu.RLock()
 	meta := s.metas[key]
 	s.mu.RUnlock()
+	if meta != nil && !blockIDEqual(meta.ID, block) {
+		return nil
+	}
 	return meta
 }
 
@@ -1189,7 +1209,7 @@ func (s *Store) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
 	s.mu.RLock()
 	cached := s.blocks[key]
 	s.mu.RUnlock()
-	if cached == nil {
+	if cached == nil || !blockIDEqual(cached.id, block) {
 		return nil
 	}
 	return cached.root
@@ -1205,7 +1225,7 @@ func (s *Store) cachedBlockFragments(block ton.BlockIDExt) *BlockView {
 	s.mu.RLock()
 	cached := s.blocks[key]
 	s.mu.RUnlock()
-	if cached == nil {
+	if cached == nil || !blockIDEqual(cached.id, block) {
 		return nil
 	}
 	return cached.fragments
@@ -1216,7 +1236,7 @@ func (s *Store) rememberBlockFragments(block ton.BlockIDExt, fragments *BlockVie
 
 	s.mu.Lock()
 	cached := s.blocks[key]
-	if cached == nil {
+	if cached == nil || !blockIDEqual(cached.id, block) {
 		s.mu.Unlock()
 		return fragments
 	}

@@ -39,8 +39,9 @@ const (
 )
 
 var (
-	ErrStateNotAvailable    = errors.New("state snapshot is not available from fullnode")
-	errStateSnapshotInvalid = errors.New("downloaded state snapshot is invalid")
+	ErrStateNotAvailable                 = errors.New("state snapshot is not available from fullnode")
+	errStateSnapshotInvalid              = errors.New("downloaded state snapshot is invalid")
+	errPersistentStateDownloadDiskBudget = errors.New("persistent state download exceeds local disk budget")
 )
 
 func init() {
@@ -273,7 +274,7 @@ type persistentStateCandidate struct {
 	id         PersistentStateIDV2
 	size       int64
 	workers    int
-	chunkCount int
+	chunkCount int64
 }
 
 type persistentStateChunkSeed struct {
@@ -350,14 +351,14 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 	default:
 		return nil, fmt.Errorf("unexpected getPersistentStateSizeV2 response %T", sizeResp)
 	}
-	if size <= 0 {
-		return nil, fmt.Errorf("invalid persistent state size %d", size)
+	chunkCount, err := persistentStateChunkCount(size)
+	if err != nil {
+		return nil, err
 	}
 
 	workers := persistentStateChunkWorkers
-	chunkCount := int((size + persistentStateChunkSize - 1) / persistentStateChunkSize)
-	if chunkCount < workers {
-		workers = chunkCount
+	if chunkCount < int64(workers) {
+		workers = int(chunkCount)
 	}
 
 	d.node.log.Debug().
@@ -381,11 +382,19 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 func persistentStateCandidateProbeChunks(candidates []persistentStateCandidate) int {
 	probeChunks := persistentStatePeerProbeChunks
 	for _, candidate := range candidates {
-		if candidate.chunkCount < probeChunks {
-			probeChunks = candidate.chunkCount
+		if candidate.chunkCount < int64(probeChunks) {
+			probeChunks = int(candidate.chunkCount)
 		}
 	}
 	return probeChunks
+}
+
+func persistentStateChunkCount(size int64) (int64, error) {
+	if size <= 0 {
+		return 0, fmt.Errorf("invalid persistent state size %d", size)
+	}
+
+	return 1 + (size-1)/persistentStateChunkSize, nil
 }
 
 func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx context.Context, candidates []persistentStateCandidate, chunkLimiter chan struct{}) (*stagedStateFile, error) {
@@ -398,6 +407,9 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 		staged, err := d.stagePersistentStateFile(ctx, candidates[0], nil, chunkLimiter)
 		releasePeer()
 		if err != nil {
+			if errors.Is(err, errPersistentStateDownloadDiskBudget) {
+				return nil, err
+			}
 			candidates[0].peer.downloadFailed(stateSlowPeerPenalty)
 			return nil, fmt.Errorf("%s: %w", candidates[0].peer.addr, err)
 		}
@@ -459,6 +471,16 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 		staged, err := d.stagePersistentStateFile(ctx, probe.candidate, &probe.seed, chunkLimiter)
 		releasePeer()
 		if err != nil {
+			if errors.Is(err, errPersistentStateDownloadDiskBudget) {
+				attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", probe.candidate.peer.addr, err))
+				for j := range remaining {
+					if remaining[j].candidate.peer == probe.candidate.peer {
+						remaining = append(remaining[:j], remaining[j+1:]...)
+						break
+					}
+				}
+				continue
+			}
 			if errors.Is(err, context.Canceled) {
 				return nil, err
 			}
@@ -517,6 +539,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 	}
 
 	var candidates []persistentStateCandidate
+	var diskBudgetErrs []error
 	flushCandidates := func() (*stagedStateFile, bool) {
 		if len(candidates) == 0 {
 			return nil, false
@@ -526,6 +549,10 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 		candidates = nil
 		if err == nil {
 			return staged, true
+		}
+		if errors.Is(err, errPersistentStateDownloadDiskBudget) {
+			diskBudgetErrs = append(diskBudgetErrs, err)
+			return nil, false
 		}
 		failedErrs = append(failedErrs, err)
 		return nil, false
@@ -560,6 +587,9 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 
 	if staged, ok := flushCandidates(); ok {
 		return staged, nil
+	}
+	if len(diskBudgetErrs) > 0 {
+		return nil, errors.Join(diskBudgetErrs...)
 	}
 
 	return nil, fmt.Errorf("%w: %w", ErrStateNotAvailable, errors.Join(append(unavailableErrs, failedErrs...)...))
@@ -828,6 +858,9 @@ func (d persistentStateSnapshotDownloader) downloadSplitParts(ctx context.Contex
 		if missingSplitStateParts(downloaded) == 0 {
 			continue
 		}
+		if errors.Is(err, errPersistentStateDownloadDiskBudget) {
+			return nil, err
+		}
 
 		event := n.log.Debug()
 		if err != nil && errors.Is(err, errStateSnapshotInvalid) {
@@ -913,6 +946,9 @@ func (d persistentStateSnapshotDownloader) downloadSplitPartsPass(ctx context.Co
 			select {
 			case staged <- res:
 			case <-ctx.Done():
+				return
+			}
+			if errors.Is(res.err, errPersistentStateDownloadDiskBudget) {
 				return
 			}
 		}
@@ -1088,8 +1124,8 @@ type stateChunkResult struct {
 }
 
 func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.Context, candidate persistentStateCandidate, probeChunks int, chunkLimiter chan struct{}) (persistentStatePeerProbe, error) {
-	if probeChunks > candidate.chunkCount {
-		probeChunks = candidate.chunkCount
+	if int64(probeChunks) > candidate.chunkCount {
+		probeChunks = int(candidate.chunkCount)
 	}
 	if probeChunks <= 0 {
 		return persistentStatePeerProbe{}, fmt.Errorf("invalid persistent state probe chunks %d", probeChunks)
@@ -1104,7 +1140,7 @@ func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.
 		workers = probeChunks
 	}
 
-	jobs := make(chan int)
+	jobs := make(chan int64)
 	results := make(chan stateChunkResult, probeChunks)
 	var wg sync.WaitGroup
 
@@ -1128,7 +1164,7 @@ func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.
 
 	go func() {
 		defer close(jobs)
-		for idx := 0; idx < probeChunks; idx++ {
+		for idx := int64(0); idx < int64(probeChunks); idx++ {
 			select {
 			case jobs <- idx:
 			case <-ctx.Done():
@@ -1226,7 +1262,7 @@ func firstBytesHex(data []byte, limit int) string {
 	return hex.EncodeToString(data)
 }
 
-func (d persistentStateSnapshotDownloader) downloadPersistentStateChunk(ctx context.Context, peer *overlayPeer, id PersistentStateIDV2, idx int, size int64, chunkLimiter chan struct{}) stateChunkResult {
+func (d persistentStateSnapshotDownloader) downloadPersistentStateChunk(ctx context.Context, peer *overlayPeer, id PersistentStateIDV2, idx int64, size int64, chunkLimiter chan struct{}) stateChunkResult {
 	n := d.node
 
 	offset := int64(idx) * persistentStateChunkSize

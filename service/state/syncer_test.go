@@ -112,6 +112,107 @@ func TestSyncerReturnsShardDownloadError(t *testing.T) {
 	}
 }
 
+func TestSyncerPreservesShardErrorWhenSiblingIsCanceled(t *testing.T) {
+	master := testStateBlock(-1, topShard, 10)
+	failingShard := testStateBlock(0, leftShard, 11)
+	canceledShard := testStateBlock(0, rightShard, 12)
+	rootErr := errors.New("shard download failed")
+	siblingReady := make(chan struct{})
+	siblingCanceled := make(chan struct{})
+
+	source := &fakeSource{
+		master: master,
+		downloadState: func(ctx context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (DownloadedState, error) {
+			switch storage.BlockKey(block) {
+			case storage.BlockKey(failingShard):
+				<-siblingReady
+				return nil, rootErr
+			case storage.BlockKey(canceledShard):
+				close(siblingReady)
+				<-ctx.Done()
+				close(siblingCanceled)
+				return nil, ctx.Err()
+			default:
+				return nil, errors.New("unexpected shard download")
+			}
+		},
+	}
+
+	store := newTestStateStore()
+	savePendingMasterProgress(t, store, master, failingShard, canceledShard)
+	syncer := NewSyncer(source, store, SyncerOptions{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	_, err := syncer.SyncCurrent(ctx)
+	if !errors.Is(err, rootErr) {
+		t.Fatalf("sync error = %v, want root error %v", err, rootErr)
+	}
+	select {
+	case <-siblingCanceled:
+	default:
+		t.Fatal("sibling shard did not observe worker cancellation")
+	}
+}
+
+func TestFirstShardStateErrorIgnoresEarlierSiblingCancellation(t *testing.T) {
+	workerCtx, cancelWorker := context.WithCancel(t.Context())
+	cancelWorker()
+	rootErr := errors.New("shard download failed")
+
+	firstErr := firstShardStateError(t.Context(), nil, workerCtx.Err())
+	firstErr = firstShardStateError(t.Context(), firstErr, rootErr)
+	if !errors.Is(firstErr, rootErr) {
+		t.Fatalf("first error = %v, want root error %v", firstErr, rootErr)
+	}
+}
+
+func TestSyncerPreservesParentCancellationDuringShardSync(t *testing.T) {
+	master := testStateBlock(-1, topShard, 10)
+	shardA := testStateBlock(0, leftShard, 11)
+	shardB := testStateBlock(0, rightShard, 12)
+	started := make(chan struct{}, 2)
+
+	source := &fakeSource{
+		master: master,
+		downloadState: func(ctx context.Context, _ ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (DownloadedState, error) {
+			started <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	store := newTestStateStore()
+	savePendingMasterProgress(t, store, master, shardA, shardB)
+	syncer := NewSyncer(source, store, SyncerOptions{})
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		_, err := syncer.SyncCurrent(ctx)
+		result <- err
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("shard downloads did not start")
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sync error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync did not stop after parent cancellation")
+	}
+}
+
 func TestSyncerRetriesShardStateWithoutRepeatingMasterStage(t *testing.T) {
 	master := testStateBlock(-1, topShard, 10)
 	shard := testStateBlock(0, topShard, 11)
@@ -655,6 +756,7 @@ type fakeSource struct {
 	states             map[storage.BlockRootHash]*storage.BlockState
 	keyBlockBatches    map[uint32]KeyBlockBatch
 	downloadedFactory  func(block ton.BlockIDExt) DownloadedState
+	downloadState      func(context.Context, ton.BlockIDExt, ton.BlockIDExt, uint32) (DownloadedState, error)
 	errByBlock         map[storage.BlockRootHash]error
 	errSequenceByBlock map[storage.BlockRootHash][]error
 	downloadCount      map[storage.BlockRootHash]int
@@ -716,7 +818,11 @@ func (f *fakeSource) BlockFull(_ context.Context, block ton.BlockIDExt) (*storag
 	return testServedBlockFull(block), nil
 }
 
-func (f *fakeSource) DownloadState(_ context.Context, block ton.BlockIDExt, _ ton.BlockIDExt, _ uint32) (DownloadedState, error) {
+func (f *fakeSource) DownloadState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (DownloadedState, error) {
+	if f.downloadState != nil {
+		return f.downloadState(ctx, block, master, splitDepth)
+	}
+
 	key := storage.BlockKey(block)
 
 	f.mu.Lock()

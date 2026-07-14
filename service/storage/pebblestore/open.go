@@ -256,8 +256,18 @@ func Open(opts Options) (*Store, error) {
 			return nil, fmt.Errorf("cleanup retired cell generations: %w", err)
 		}
 		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("cleaned retired cell generations")
+		stageStarted = time.Now()
+		logger.Info().Msg("cleaning unreferenced cell generations")
+		if err = store.cleanupUnreferencedCellGenerationDirs(); err != nil {
+			_ = store.closeCellGenerations()
+			_ = hot.Close()
+			_ = store.artifactFiles.close()
+			hotCache.Unref()
+			return nil, fmt.Errorf("cleanup unreferenced cell generations: %w", err)
+		}
+		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("cleaned unreferenced cell generations")
 	} else {
-		logger.Info().Msg("skipped artifact repair and retired cell cleanup in read-only mode")
+		logger.Info().Msg("skipped artifact repair and cell generation cleanup in read-only mode")
 	}
 	logger.Info().
 		Int64("meta_cache_size", opts.MetaCacheSize).

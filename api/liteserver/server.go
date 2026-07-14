@@ -114,9 +114,9 @@ type Server struct {
 	wg     sync.WaitGroup
 
 	blockProofBasesMu   sync.Mutex
-	blockProofBases     map[storage.BlockRootHash]*blockProofBase
-	blockProofBaseOrder []storage.BlockRootHash
-	blockProofBaseLoad  liveLoadGroup[storage.BlockRootHash]
+	blockProofBases     map[liteBlockKey]*blockProofBase
+	blockProofBaseOrder []liteBlockKey
+	blockProofBaseLoad  liveLoadGroup[liteBlockKey]
 }
 
 func New(opts Options) (*Server, error) {
@@ -178,7 +178,7 @@ func New(opts Options) (*Server, error) {
 		respCache:               newLiteResponseCache(),
 		queryExecutor:           newQueryExecutor(opts.QueryConcurrency),
 		waitLimiter:             newWaitLimiter(opts.RequestLimits.MaxWaitsPerIP),
-		blockProofBases:         make(map[storage.BlockRootHash]*blockProofBase),
+		blockProofBases:         make(map[liteBlockKey]*blockProofBase),
 	}
 	if server.messageSender != nil {
 		externalMessageSender, err := server.newExternalMessageSender()

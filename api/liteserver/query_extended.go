@@ -172,7 +172,7 @@ func (s *Server) handleAllShardsInfo(ctx context.Context, id *ton.BlockIDExt) an
 		return ton.LSError{Code: errCodeProtoViolation, Text: "reference block must belong to the masterchain"}
 	}
 
-	key := liteResponseKey{kind: liteResponseAllShardsInfo, a: storage.BlockKey(*id)}
+	key := liteResponseKey{kind: liteResponseAllShardsInfo, a: liteBlockKeyFromBlock(*id)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 		return s.buildAllShardsInfoParts(ctx, *id)
 	})
@@ -281,7 +281,7 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		// proof BOCs are rebuilt from immutable block content, so memoize them.
 		// getConfigParams stays uncached: its params set varies per client and
 		// would only dilute the shared cache.
-		key := liteResponseKey{kind: liteResponseConfigAll, mode: effectiveMode, a: storage.BlockKey(*id)}
+		key := liteResponseKey{kind: liteResponseConfigAll, mode: effectiveMode, a: liteBlockKeyFromBlock(*id)}
 		value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
 			return s.buildConfigAllParts(ctx, *id, effectiveMode)
 		})
