@@ -108,7 +108,7 @@ func (b *ServedBlockFull) Clone() *ServedBlockFull {
 		return nil
 	}
 	return &ServedBlockFull{
-		ID:                     b.ID,
+		ID:                     cloneBlockID(b.ID),
 		Proof:                  append([]byte(nil), b.Proof...),
 		Block:                  append([]byte(nil), b.Block...),
 		Meta:                   b.Meta.Clone(),

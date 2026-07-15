@@ -23,10 +23,6 @@ type shardDescriptionHint struct {
 }
 
 func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
-	if s.blockSync == nil {
-		return
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -111,7 +107,7 @@ func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) p2p.ShardBlockD
 	}
 
 	cloned := p2p.ShardBlockDescription{
-		Block:            desc.Block,
+		Block:            cloneServiceBlockID(desc.Block),
 		CatchainSeqno:    desc.CatchainSeqno,
 		ValidatorSetHash: desc.ValidatorSetHash,
 		Data:             desc.Data,
@@ -120,16 +116,28 @@ func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) p2p.ShardBlockD
 	for _, link := range desc.Chain {
 		var masterchainRef *ton.BlockIDExt
 		if link.MasterchainRef != nil {
-			ref := *link.MasterchainRef
+			ref := cloneServiceBlockID(*link.MasterchainRef)
 			masterchainRef = &ref
 		}
 		cloned.Chain = append(cloned.Chain, p2p.ShardDescriptionLink{
-			Block:          link.Block,
-			PrevRefs:       link.PrevRefs,
+			Block:          cloneServiceBlockID(link.Block),
+			PrevRefs:       cloneServiceBlockIDs(link.PrevRefs),
 			MasterchainRef: masterchainRef,
 			ProofRoot:      link.ProofRoot,
 			ProofBOC:       link.ProofBOC,
 		})
+	}
+	return cloned
+}
+
+func cloneServiceBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	cloned := make([]ton.BlockIDExt, len(blocks))
+	for i := range blocks {
+		cloned[i] = cloneServiceBlockID(blocks[i])
 	}
 	return cloned
 }
@@ -140,13 +148,14 @@ func (s *Service) shardDescriptionHintSnapshot(now time.Time) []shardDescription
 
 	s.pruneShardDescriptionHintsLocked(now)
 
+	// Hints are cloned privately at remember time and never mutated afterwards,
+	// so the snapshot shares them instead of deep-cloning every Chain again.
 	hints := make([]shardDescriptionHint, 0, len(s.shardDescriptionOrder))
 	for _, key := range s.shardDescriptionOrder {
 		hint, ok := s.shardDescriptionHints[key]
 		if !ok {
 			continue
 		}
-		hint.Description = cloneShardBlockDescription(&hint.Description)
 		hints = append(hints, hint)
 	}
 	return hints

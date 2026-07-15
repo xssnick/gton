@@ -46,10 +46,12 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 		SkipPublicMsgSend: true,
 	}}
 
-	nodeOpts, err := cfg.NodeOptions(gton.DefaultNodeOptions())
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
 	if err != nil {
-		t.Fatalf("node options: %v", err)
+		t.Fatalf("runtime options: %v", err)
 	}
+	nodeOpts := runtimeOpts.Node
+
 	opts := nodeOpts.P2P
 	if !bytes.Equal(opts.PrivateKey, testPrivateKey(1)) {
 		t.Fatal("unexpected ADNL private key")

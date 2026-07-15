@@ -22,6 +22,9 @@ func (set customTwoStepPeerSet) Peers() []overlay.BroadcastPeer {
 	if set.sub == nil {
 		return nil
 	}
+	if set.sourcePeerID.IsZero() {
+		return set.sub.broadcastPeersSnapshot()
+	}
 
 	candidates := set.sub.rebroadcastCandidates()
 	peers := make([]overlay.BroadcastPeer, 0, len(candidates))
@@ -29,7 +32,7 @@ func (set customTwoStepPeerSet) Peers() []overlay.BroadcastPeer {
 		if peer == nil || peer.overlay == nil {
 			continue
 		}
-		if !set.sourcePeerID.IsZero() && peer.id == set.sourcePeerID {
+		if peer.id == set.sourcePeerID {
 			continue
 		}
 		peers = append(peers, peer.overlay)

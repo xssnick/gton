@@ -415,7 +415,6 @@ func (s *stateSerializer) run(ctx context.Context, master ton.BlockIDExt, scope 
 			if !errors.Is(err, storage.ErrNotFound) {
 				return fmt.Errorf("check existing %s state %s part %s: %w", target.kind, storage.FormatBlockRef(target.block), part.Kind, err)
 			}
-
 			s.log.Info().
 				Str("block", storage.FormatBlockRef(target.block)).
 				Str("masterchain", storage.FormatBlockRef(master)).
@@ -599,16 +598,26 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 		}
 	}()
 
+	cellsCountHint := s.previousPersistentStateCellsCountHint(ctx, master, target, part)
+	if cellsCountHint > 0 {
+		s.log.Info().
+			Str("block", storage.FormatBlockRef(target.block)).
+			Str("kind", stateSerializationLogKind(target, part)).
+			Int64("effective_shard", part.EffectiveShard).
+			Uint64("cells_count_hint", cellsCountHint).
+			Msg("presizing persistent state serialization from previous state cells count")
+	}
+
 	rootHash := part.Root.HashKey()
 	progressStop := startStateSerializationProgress(ctx, s.log, stateSerializationLogBlock(target, part), stateSerializationLogKind(target, part), loader)
 	hash := sha256.New()
 	writer := io.MultiWriter(contextWriter{ctx: ctx, w: tmp}, hash)
 
-	releaseCompactions := throttleStateSerializationCompactions(s.store)
+	releaseCompactions := s.store.ThrottleCellCompactions()
 	if onePassLargeBOC {
-		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
+		err = cell.ToLargeBOCOnePass(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, cellsCountHint, s.largeBOCBatchSize)
 	} else {
-		err = cell.ToLargeBOC(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, s.largeBOCBatchSize)
+		err = cell.ToLargeBOC(writer, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, cellsCountHint, s.largeBOCBatchSize)
 	}
 	releaseCompactions()
 	progressStop()
@@ -641,10 +650,6 @@ func (s *stateSerializer) serializeStatePart(ctx context.Context, master ton.Blo
 		size:     stat.Size(),
 		fileHash: hash.Sum(nil),
 	}, nil
-}
-
-func throttleStateSerializationCompactions(store storage.Storage) func() {
-	return store.ThrottleCellCompactions()
 }
 
 func (s *stateSerializer) lazyStateRoot(ctx context.Context, target stateSerializationTarget, loader cell.LazyCellLoader) (*cell.Cell, error) {

@@ -147,12 +147,12 @@ func TestEnqueueRebroadcastAdmissionClosedDropsRemoteBlock(t *testing.T) {
 	node := newTestNode(t)
 	node.broadcastAdmission = testBroadcastAdmission(false)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	if sub.enqueueRebroadcast(rebroadcastRequest{
 		subscription: sub,
@@ -173,12 +173,12 @@ func TestEnqueueRebroadcastAdmissionClosedKeepsLocalExternal(t *testing.T) {
 	node := newTestNode(t)
 	node.broadcastAdmission = testBroadcastAdmission(false)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	if !sub.enqueueRebroadcast(rebroadcastRequest{
 		subscription: sub,
@@ -199,7 +199,7 @@ func TestEnqueueRebroadcastAdmissionClosedDropsLocalBlockFanout(t *testing.T) {
 	node := newTestNode(t)
 	node.broadcastAdmission = testBroadcastAdmission(false)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:         "custom.private-a",
@@ -208,7 +208,7 @@ func TestEnqueueRebroadcastAdmissionClosedDropsLocalBlockFanout(t *testing.T) {
 		},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	if sub.enqueueRebroadcast(rebroadcastRequest{
 		subscription: sub,
@@ -389,7 +389,7 @@ func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name: "custom.private-a",
@@ -400,7 +400,7 @@ func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
 			peerA.id: peerA,
 			peerB.id: peerB,
 		},
-	}
+	})
 
 	ok := sub.sendCustomTwoStepRebroadcast(context.Background(), rebroadcastRequest{
 		subscription: sub,
@@ -426,7 +426,7 @@ func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
 func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
 	node := newTestNode(t)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:         "custom.private-a",
@@ -435,7 +435,7 @@ func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
 		},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	if !sub.enqueueRebroadcast(rebroadcastRequest{
 		subscription: sub,
@@ -461,7 +461,7 @@ func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
 func TestCustomBlockRebroadcastRequiresLocalBlockSender(t *testing.T) {
 	node := newTestNode(t)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name: "custom.private-a",
@@ -469,7 +469,7 @@ func TestCustomBlockRebroadcastRequiresLocalBlockSender(t *testing.T) {
 		},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	if sub.enqueueRebroadcast(rebroadcastRequest{
 		subscription: sub,
@@ -492,7 +492,7 @@ func TestCustomBlockRebroadcastRequiresLocalBlockSender(t *testing.T) {
 func TestCustomIHRRebroadcastUnsupported(t *testing.T) {
 	node := newTestNode(t)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name: "custom.private-a",
@@ -500,7 +500,7 @@ func TestCustomIHRRebroadcastUnsupported(t *testing.T) {
 		},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	if sub.enqueueRebroadcast(rebroadcastRequest{
 		subscription: sub,
@@ -638,7 +638,7 @@ func TestEnqueueRebroadcastSkipsSourcePeer(t *testing.T) {
 	node := newTestNode(t)
 	sourcePeer := testRebroadcastQueuePeer("source")
 	targetPeer := testRebroadcastQueuePeer("target")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
 		log:  discardLogger(),
@@ -646,7 +646,7 @@ func TestEnqueueRebroadcastSkipsSourcePeer(t *testing.T) {
 			sourcePeer.id: sourcePeer,
 			targetPeer.id: targetPeer,
 		},
-	}
+	})
 
 	req := rebroadcastRequest{
 		subscription: sub,
@@ -681,12 +681,12 @@ func TestEnqueueInboundBlockRebroadcastUsesCppNodeFanout(t *testing.T) {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: peers,
-	}
+	})
 
 	req := rebroadcastRequest{
 		subscription: sub,
@@ -716,12 +716,12 @@ func TestEnqueueInboundBlockRebroadcastSharesFECSource(t *testing.T) {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: peers,
-	}
+	})
 
 	req := rebroadcastRequest{
 		subscription: sub,
@@ -768,13 +768,13 @@ func TestEnqueueRebroadcastPrefersNeighbours(t *testing.T) {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:       node,
 		spec:       overlaySpec{Name: "basechain"},
 		log:        discardLogger(),
 		peers:      peers,
 		neighbours: []PeerID{testPeerID("g"), testPeerID("h")},
-	}
+	})
 
 	req := rebroadcastRequest{
 		subscription: sub,
@@ -800,12 +800,12 @@ func TestEnqueueLocalExternalRebroadcastUsesFullFanout(t *testing.T) {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: peers,
-	}
+	})
 
 	req := rebroadcastRequest{
 		subscription: sub,
@@ -831,12 +831,12 @@ func TestEnqueueLocalExternalRebroadcastReducesFanoutWhenLagged(t *testing.T) {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: peers,
-	}
+	})
 
 	req := rebroadcastRequest{
 		subscription: sub,
@@ -857,10 +857,10 @@ func TestEnqueueLocalExternalRebroadcastReducesFanoutWhenLagged(t *testing.T) {
 func TestExternalRebroadcastFanoutThreshold(t *testing.T) {
 	node := newTestNode(t)
 	node.localExternalFanout = 15
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
-	}
+	})
 	req := rebroadcastRequest{kind: "tonNode.externalMessageBroadcast"}
 	localReq := rebroadcastRequest{kind: "tonNode.externalMessageBroadcast", local: true}
 
@@ -886,10 +886,10 @@ func TestExternalRebroadcastFanoutThreshold(t *testing.T) {
 		t.Fatalf("block fanout while lagged = %d, want %d", got, rebroadcastFanout)
 	}
 
-	custom := &overlaySubscription{
+	custom := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "custom.private-a", Kind: overlayKindCustomFixed},
-	}
+	})
 	if got := custom.rebroadcastFanoutForRequest(req); got != laggedExternalFanout {
 		t.Fatalf("custom external fanout while lagged = %d, want %d", got, laggedExternalFanout)
 	}
@@ -993,12 +993,12 @@ func TestEnqueueSimpleRebroadcastSharesEnvelope(t *testing.T) {
 		peer := testRebroadcastQueuePeer(string(rune('a' + i)))
 		peers[peer.id] = peer
 	}
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: peers,
-	}
+	})
 
 	payload := []byte{0x01, 0x02, 0x03}
 	if !sub.enqueueRebroadcast(rebroadcastRequest{
@@ -1038,12 +1038,12 @@ func TestEnqueueSimpleRebroadcastSharesEnvelope(t *testing.T) {
 func TestEnqueueLocalRebroadcastRecordsDropWhenPeerQueuesAreFull(t *testing.T) {
 	node := newTestNode(t)
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:  node,
 		spec:  overlaySpec{Name: "basechain"},
 		log:   discardLogger(),
 		peers: map[PeerID]*overlayPeer{peer.id: peer},
-	}
+	})
 
 	for i := 0; i < peerRebroadcastQueueItems; i++ {
 		if !peer.localRebroadcastQueue.Push(rebroadcastRequest{
@@ -1074,10 +1074,10 @@ func TestPeerRebroadcastWorkerDropsStaleQueuedRequest(t *testing.T) {
 	node.runCtx = ctx
 
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		log:  discardLogger(),
-	}
+	})
 	workers := sub.peerRebroadcastWorkerCount()
 
 	for i := 0; i < workers; i++ {
@@ -1118,12 +1118,12 @@ func TestPeerRebroadcastWorkerDropsStaleQueuedRequest(t *testing.T) {
 }
 
 func TestPeerRebroadcastWorkerCountByOverlay(t *testing.T) {
-	master := &overlaySubscription{spec: overlaySpec{Workchain: -1, Shard: topShard}}
+	master := testOverlaySubscription(&overlaySubscription{spec: overlaySpec{Workchain: -1, Shard: topShard}})
 	if got := master.peerRebroadcastWorkerCount(); got != masterPeerRebroadcastWorkers {
 		t.Fatalf("masterchain workers = %d, want %d", got, masterPeerRebroadcastWorkers)
 	}
 
-	base := &overlaySubscription{spec: overlaySpec{Workchain: 0, Shard: topShard}}
+	base := testOverlaySubscription(&overlaySubscription{spec: overlaySpec{Workchain: 0, Shard: topShard}})
 	if got := base.peerRebroadcastWorkerCount(); got != basePeerRebroadcastWorkers {
 		t.Fatalf("basechain workers = %d, want %d", got, basePeerRebroadcastWorkers)
 	}
@@ -1136,16 +1136,16 @@ func TestRemovePeerStopsRebroadcastWorkers(t *testing.T) {
 	node.runCtx = ctx
 
 	peer := testRebroadcastQueuePeer("peer")
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:       node,
 		log:        discardLogger(),
 		spec:       overlaySpec{Workchain: 0, Shard: topShard},
 		peers:      map[PeerID]*overlayPeer{peer.id: peer},
 		neighbours: []PeerID{peer.id},
-	}
+	})
 
 	sub.startPeerRebroadcastWorker(peer)
-	sub.removePeer(peer.id)
+	sub.removePeerIfCurrent(peer)
 
 	done := make(chan struct{})
 	go func() {

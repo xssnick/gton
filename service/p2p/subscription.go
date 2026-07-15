@@ -31,6 +31,10 @@ type overlaySubscription struct {
 	runToken            *struct{}
 	inactive            bool
 	inactiveDeleteAt    time.Time
+	activityLeases      uint32
+	pendingInactive     bool
+	pendingDeleteAt     time.Time
+	removed             bool
 	seedMx              sync.Mutex
 	seedRunning         bool
 	seedScheduled       bool
@@ -44,12 +48,16 @@ type overlaySubscription struct {
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
+	broadcastTargets    atomic.Pointer[broadcastTargetsSnapshot]
 	fecRelayState       *overlay.BroadcastFECRelayState
 	twoStepState        *overlay.BroadcastTwoStepState
 	twoStepQueue        *boundedQueue[rebroadcastRequest]
 	twoStepQueueClosed  bool
 	refreshRunning      bool
 	peerPingRunning     bool
+	fixedProbeRunning   bool
+	softRecoveries      uint64
+	hardRecoveries      uint64
 }
 
 func (s *overlaySubscription) isActive() bool {
@@ -62,12 +70,31 @@ func (s *overlaySubscription) isActive() bool {
 func (s *overlaySubscription) setActive(active bool, deleteAt time.Time) bool {
 	s.mx.Lock()
 	defer s.mx.Unlock()
+	return s.setActiveLocked(active, deleteAt)
+}
+
+func (s *overlaySubscription) setActiveLocked(active bool, deleteAt time.Time) bool {
+	if s.removed {
+		return false
+	}
 
 	if active {
-		changed := s.inactive
+		changed := s.inactive || s.pendingInactive
 		s.inactive = false
 		s.inactiveDeleteAt = time.Time{}
+		s.pendingInactive = false
+		s.pendingDeleteAt = time.Time{}
 		return changed
+	}
+
+	if s.activityLeases > 0 {
+		if !s.pendingInactive {
+			s.pendingInactive = true
+			s.pendingDeleteAt = deleteAt
+		} else if s.pendingDeleteAt.IsZero() {
+			s.pendingDeleteAt = deleteAt
+		}
+		return false
 	}
 
 	if s.inactive {
@@ -82,21 +109,48 @@ func (s *overlaySubscription) setActive(active bool, deleteAt time.Time) bool {
 	return true
 }
 
-func (s *overlaySubscription) inactiveExpiresAt() (time.Time, bool) {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	if !s.inactive || s.inactiveDeleteAt.IsZero() {
-		return time.Time{}, false
-	}
-	return s.inactiveDeleteAt, true
-}
-
 func (s *overlaySubscription) inactiveExpired(now time.Time) bool {
 	s.mx.Lock()
 	defer s.mx.Unlock()
+	return s.inactiveExpiredLocked(now)
+}
 
-	return s.inactive && !s.inactiveDeleteAt.IsZero() && !now.Before(s.inactiveDeleteAt)
+func (s *overlaySubscription) inactiveExpiredLocked(now time.Time) bool {
+	return !s.removed && s.activityLeases == 0 && s.inactive && !s.inactiveDeleteAt.IsZero() && !now.Before(s.inactiveDeleteAt)
+}
+
+func (s *overlaySubscription) beginArchiveUse() (func(), error) {
+	s.mx.Lock()
+	if s.removed {
+		s.mx.Unlock()
+		return nil, errors.New("overlay subscription was removed")
+	}
+
+	if s.inactive {
+		s.pendingInactive = true
+		s.pendingDeleteAt = s.inactiveDeleteAt
+		s.inactive = false
+		s.inactiveDeleteAt = time.Time{}
+	}
+	s.activityLeases++
+	s.mx.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(s.releaseArchiveUse)
+	}, nil
+}
+
+func (s *overlaySubscription) releaseArchiveUse() {
+	s.mx.Lock()
+	s.activityLeases--
+	if s.activityLeases == 0 && s.pendingInactive {
+		s.inactive = true
+		s.inactiveDeleteAt = s.pendingDeleteAt
+		s.pendingInactive = false
+		s.pendingDeleteAt = time.Time{}
+	}
+	s.mx.Unlock()
 }
 
 func (s *overlaySubscription) setRunCancel(cancel context.CancelFunc) (*struct{}, bool) {
@@ -189,24 +243,29 @@ type overlayPeer struct {
 	rldpOverlay *overlay.RLDPOverlayWrapper
 	release     func()
 
-	statsMx               sync.Mutex
-	versionMajor          int32
-	versionMinor          int32
-	capabilitiesFlags     uint32
-	roundtrip             time.Duration
-	unreliability         float64
-	missedPings           uint32
-	alive                 bool
-	pending               bool
-	warmupRunning         bool
-	lastReceiveAt         time.Time
-	lastSuccessAt         time.Time
-	failedQueries         uint64
-	downloadBytesSec      float64
-	downloadCount         uint64
-	archiveLargeBytesSec  float64
-	archiveLargeDownloads uint64
-	downloadSlowUntil     time.Time
+	statsMx           sync.Mutex
+	versionMajor      int32
+	versionMinor      int32
+	capabilitiesFlags uint32
+	roundtrip         time.Duration
+	unreliability     float64
+	missedPings       uint32
+	alive             bool
+	pending           bool
+	warmupRunning     bool
+	lastReceiveAt     time.Time
+	lastSuccessAt     time.Time
+	failedQueries     uint64
+	downloadBytesSec  float64
+	downloadCount     uint64
+	downloadSlowUntil time.Time
+
+	attachedAt              time.Time
+	lastPongAt              time.Time
+	probeFailures           uint32
+	lastSoftRecoveryAt      time.Time
+	lastHardRecoveryAt      time.Time
+	softRecoveriesSinceSeen uint32
 
 	rebroadcastMx         sync.Mutex
 	localRebroadcastQueue *boundedQueue[rebroadcastRequest]
@@ -234,6 +293,14 @@ func (s *overlaySubscription) run(ctx context.Context) {
 	pingTimer := time.NewTimer(nextPeerPingDelay())
 	defer pingTimer.Stop()
 
+	var probeTimer *time.Timer
+	var probeC <-chan time.Time
+	if s.spec.Kind == overlayKindCustomFixed {
+		probeTimer = time.NewTimer(nextFixedProbeDelay())
+		defer probeTimer.Stop()
+		probeC = probeTimer.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -249,6 +316,9 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		case <-pingTimer.C:
 			s.startPingPeers(ctx)
 			pingTimer.Reset(nextPeerPingDelay())
+		case <-probeC:
+			s.startProbeFixedPeers(ctx)
+			probeTimer.Reset(nextFixedProbeDelay())
 		}
 	}
 }
@@ -306,11 +376,7 @@ func (s *overlaySubscription) runSeedFromDHT(ctx context.Context, targetPeers in
 		defer s.finishSeedFromDHT()
 		s.seedFromDHT(ctx, targetPeers)
 	}
-	if s.node != nil {
-		s.node.runAsync(run)
-		return
-	}
-	go run()
+	s.node.runAsync(run)
 }
 
 func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay time.Duration) {
@@ -322,16 +388,11 @@ func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay tim
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 
-		var nodeDone <-chan struct{}
-		if s.node != nil {
-			nodeDone = s.node.runCtx.Done()
-		}
-
 		select {
 		case <-ctx.Done():
 			s.clearScheduledSeedFromDHT()
 			return
-		case <-nodeDone:
+		case <-s.node.runCtx.Done():
 			s.clearScheduledSeedFromDHT()
 			return
 		case <-timer.C:
@@ -344,11 +405,7 @@ func (s *overlaySubscription) scheduleSeedFromDHT(ctx context.Context, delay tim
 
 		s.startSeedFromDHTTarget(ctx, targetPeers)
 	}
-	if s.node != nil {
-		s.node.runAsync(run)
-		return
-	}
-	go run()
+	s.node.runAsync(run)
 }
 
 func (s *overlaySubscription) clearScheduledSeedFromDHT() {
@@ -366,7 +423,7 @@ func (s *overlaySubscription) finishSeedFromDHT() {
 }
 
 func (s *overlaySubscription) startSeedFromFixedNodes(ctx context.Context) {
-	if !s.isActive() || s.node == nil || s.node.dht == nil {
+	if !s.isActive() || s.node.dht == nil {
 		return
 	}
 
@@ -406,6 +463,80 @@ type seedConnectResult struct {
 	err      error
 }
 
+// seedConnectPool fans overlay nodes found during a DHT seed search out to a
+// bounded set of connect workers and counts successful attachments. It is
+// shared by the subscription seed search and the archive peer pool discovery.
+type seedConnectPool struct {
+	ctx       context.Context
+	jobs      chan overlay.Node
+	results   chan seedConnectResult
+	workers   sync.WaitGroup
+	collector sync.WaitGroup
+	connected atomic.Int64
+	finished  bool
+}
+
+// runSeedConnectPool starts parallelism connect workers plus a collector that
+// logs failed connects with connectErrMsg. Feed nodes with send and always
+// call finish (idempotent, single-goroutine use) before reading connected.
+func runSeedConnectPool(ctx context.Context, log zerolog.Logger, connectErrMsg string, parallelism int, connect func(overlay.Node) (bool, error)) *seedConnectPool {
+	p := &seedConnectPool{
+		ctx:     ctx,
+		jobs:    make(chan overlay.Node),
+		results: make(chan seedConnectResult, parallelism),
+	}
+
+	for i := 0; i < parallelism; i++ {
+		p.workers.Add(1)
+		go func() {
+			defer p.workers.Done()
+			for node := range p.jobs {
+				attached, err := connect(node)
+				p.results <- seedConnectResult{attached: attached, err: err}
+			}
+		}()
+	}
+
+	p.collector.Add(1)
+	go func() {
+		defer p.collector.Done()
+		for res := range p.results {
+			if res.err != nil {
+				log.Debug().Err(res.err).Msg(connectErrMsg)
+				continue
+			}
+			if res.attached {
+				p.connected.Add(1)
+			}
+		}
+	}()
+
+	return p
+}
+
+// send hands a node to the workers; it reports false once ctx is done.
+func (p *seedConnectPool) send(node overlay.Node) bool {
+	select {
+	case p.jobs <- node:
+		return true
+	case <-p.ctx.Done():
+		return false
+	}
+}
+
+// finish stops accepting nodes and waits for workers and collector to drain.
+func (p *seedConnectPool) finish() {
+	if p.finished {
+		return
+	}
+	p.finished = true
+
+	close(p.jobs)
+	p.workers.Wait()
+	close(p.results)
+	p.collector.Wait()
+}
+
 type adnlNopper interface {
 	SendNop(context.Context) error
 }
@@ -417,7 +548,7 @@ type overlayNodeIdentity struct {
 }
 
 func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) {
-	if s.node == nil || s.node.dht == nil {
+	if s.node.dht == nil {
 		return
 	}
 	if !s.isActive() {
@@ -429,7 +560,6 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 		err        error
 		requests   int
 		nodesSeen  int
-		connected  atomic.Int64
 		startedAt  = time.Now()
 		knownStart = len(s.knownPeersSnapshot())
 		aliveStart = s.aliveKnownPeerCount()
@@ -444,79 +574,10 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 			Msg("searching overlay peers in DHT")
 	}
 
-	jobs := make(chan overlay.Node)
-	results := make(chan seedConnectResult, dhtSeedConnectParallelism)
-	var workers sync.WaitGroup
-	for i := 0; i < dhtSeedConnectParallelism; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for node := range jobs {
-				attached, err := s.connectDHTOverlayNode(ctx, node)
-				results <- seedConnectResult{attached: attached, err: err}
-			}
-		}()
-	}
-
-	var collector sync.WaitGroup
-	collector.Add(1)
-	collectorCtx, cancelCollector := context.WithCancel(ctx)
-	go func() {
-		defer collector.Done()
-		for {
-			select {
-			case res, ok := <-results:
-				if !ok {
-					return
-				}
-				if res.err != nil {
-					s.log.Debug().Err(res.err).Msg("failed to connect overlay node")
-					continue
-				}
-				if res.attached {
-					connected.Add(1)
-				}
-			case <-collectorCtx.Done():
-				for res := range results {
-					if res.err != nil {
-						s.log.Debug().Err(res.err).Msg("failed to connect overlay node")
-						continue
-					}
-					if res.attached {
-						connected.Add(1)
-					}
-				}
-				return
-			}
-		}
-	}()
-	jobsClosed := false
-	seedFinished := false
-	finishWorkers := func() {
-		if !jobsClosed {
-			close(jobs)
-			jobsClosed = true
-		}
-		workers.Wait()
-		close(results)
-		cancelCollector()
-		collector.Wait()
-		seedFinished = true
-	}
-	defer func() {
-		if !seedFinished {
-			finishWorkers()
-		}
-	}()
-
-	sendNode := func(node overlay.Node) bool {
-		select {
-		case jobs <- node:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	seedPool := runSeedConnectPool(ctx, s.log, "failed to connect overlay node", dhtSeedConnectParallelism, func(node overlay.Node) (bool, error) {
+		return s.connectDHTOverlayNode(ctx, node)
+	})
+	defer seedPool.finish()
 
 	maxRequests := 8
 	if refreshOnly {
@@ -562,7 +623,7 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 					replacements++
 				}
 			}
-			if !sendNode(node) {
+			if !seedPool.send(node) {
 				break
 			}
 		}
@@ -572,14 +633,14 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 		}
 	}
 
-	finishWorkers()
+	seedPool.finish()
 
-	if logSearch || connected.Load() > 0 {
+	if logSearch || seedPool.connected.Load() > 0 {
 		s.log.Debug().
 			Dur("elapsed", time.Since(startedAt)).
 			Int("dht_requests", requests).
 			Int("dht_nodes", nodesSeen).
-			Int64("connected_peers", connected.Load()).
+			Int64("connected_peers", seedPool.connected.Load()).
 			Int("known_peers", len(s.knownPeersSnapshot())).
 			Int("alive_peers", s.aliveKnownPeerCount()).
 			Msg("overlay peer DHT search finished")
@@ -663,36 +724,31 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 		return false, fmt.Errorf("overlay node has no addresses")
 	}
 
-	for _, addr := range addrList.Addresses {
-		udpAddr, err := adnladdr.DialString(addr)
-		if err != nil {
-			continue
-		}
-		pooled, err := s.node.pool.Get(udpAddr, identity.pub)
-		if err != nil {
-			continue
-		}
-		attached := s.attachPooledPeer(pooled, &node)
-		if attached {
-			event := s.log.Debug()
-			if s.aliveKnownPeerCount() <= 3 {
-				event = s.log.Info()
-			}
-			event.
-				Str("peer", pooled.addr).
-				Str("peer_id", pooled.id.String()).
-				Msg("connected overlay peer")
-		} else {
-			s.node.pool.closeIfUnused(pooled)
-		}
-		return attached, nil
+	udpAddr, err := firstPeerEndpoint(addrList.Addresses)
+	if err != nil {
+		return false, err
 	}
-
-	return false, fmt.Errorf("failed to dial any address for overlay peer")
+	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(identity.peerID, udpAddr, identity.pub)
+	if err != nil {
+		return false, fmt.Errorf("connect overlay peer endpoint: %w", err)
+	}
+	attached := s.attachPooledPeer(pooled, &node)
+	releaseEndpoint()
+	if attached {
+		event := s.log.Debug()
+		if s.aliveKnownPeerCount() <= 3 {
+			event = s.log.Info()
+		}
+		event.
+			Str("peer", pooled.addr).
+			Str("peer_id", pooled.id.String()).
+			Msg("connected overlay peer")
+	}
+	return attached, nil
 }
 
 func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
-	if s.node == nil || s.node.dht == nil || !s.isActive() {
+	if s.node.dht == nil || !s.isActive() {
 		return
 	}
 	if s.aliveKnownPeerCount() >= s.peerLimit()-1 {
@@ -747,27 +803,56 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 		return false, fmt.Errorf("fixed node public key does not match requested ADNL id")
 	}
 
-	for _, addr := range addrList.Addresses {
-		udpAddr, err := adnladdr.DialString(addr)
-		if err != nil {
-			continue
-		}
-		pooled, err := s.node.pool.Get(udpAddr, pub)
-		if err != nil {
-			continue
-		}
-		if s.attachPooledPeer(pooled, nil) {
-			s.log.Debug().
-				Str("peer", pooled.addr).
-				Str("peer_id", pooled.id.String()).
-				Msg("connected fixed custom overlay peer")
-			return true, nil
-		}
-		s.node.pool.closeIfUnused(pooled)
-		return false, nil
+	udpAddr, err := firstPeerEndpoint(addrList.Addresses)
+	if err != nil {
+		return false, err
 	}
+	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(nodeID, udpAddr, pub)
+	if err != nil {
+		return false, fmt.Errorf("connect fixed node endpoint: %w", err)
+	}
+	reinitFreshFixedTransport(pooled)
+	attached := s.attachPooledPeer(pooled, nil)
+	releaseEndpoint()
+	if attached {
+		s.log.Debug().
+			Str("peer", pooled.addr).
+			Str("peer_id", pooled.id.String()).
+			Msg("connected fixed custom overlay peer")
+	}
+	return attached, nil
+}
 
-	return false, fmt.Errorf("failed to dial any fixed node address")
+// reinitFreshFixedTransport restores restart semantics for an
+// outbound-created transport: registerClient copies the gateway address
+// list, whose ReinitDate is the process start time, so without this a
+// rebuilt connection would keep the previous reinit epoch and a remote that
+// remembers our old sequence numbers would drop the fresh low-seqno packets
+// as duplicates. Reinit is applied only before any traffic in either
+// direction: inbound means the pair already works, outbound means a channel
+// may be pending and resetting it mid-handshake could collide with another
+// overlay attaching the same peer.
+func reinitFreshFixedTransport(pooled *pooledPeer) {
+	if pooled == nil || pooled.adnl == nil {
+		return
+	}
+	stats := pooled.adnl.Stats()
+	if stats.Inbound.Packets != 0 || stats.Outbound.Packets != 0 {
+		return
+	}
+	if reiniter, ok := pooled.adnl.ADNL.(adnlReiniter); ok {
+		reiniter.Reinit()
+	}
+}
+
+func firstPeerEndpoint(addresses []adnladdr.Address) (string, error) {
+	for _, addr := range addresses {
+		endpoint, err := adnladdr.DialString(addr)
+		if err == nil {
+			return endpoint, nil
+		}
+	}
+	return "", errors.New("peer has no supported endpoint")
 }
 
 func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNodeIdentity, error) {
@@ -879,6 +964,7 @@ func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *over
 		rldpOverlay: rldpOverlay,
 		release:     release,
 		alive:       !fixedMember,
+		attachedAt:  time.Now(),
 	}
 }
 
@@ -898,9 +984,6 @@ func (s *overlaySubscription) peerLimit() int {
 }
 
 func (s *overlaySubscription) protectedPeerIDs() map[PeerID]struct{} {
-	if s.node == nil {
-		return nil
-	}
 	return s.node.protectedPeerIDs()
 }
 
@@ -970,6 +1053,7 @@ func (s *overlaySubscription) peerNotifySnapshot() <-chan struct{} {
 }
 
 func (s *overlaySubscription) notifyPeersChangedLocked() {
+	s.broadcastTargets.Store(nil)
 	if s.peerNotify == nil {
 		s.peerNotify = make(chan struct{}, 1)
 	}
@@ -980,7 +1064,7 @@ func (s *overlaySubscription) notifyPeersChangedLocked() {
 }
 
 func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
-	if s.node == nil || peer == nil || !s.isActive() {
+	if peer == nil || !s.isActive() {
 		return
 	}
 	if !peer.tryBeginWarmup() {
@@ -1057,11 +1141,7 @@ func (s *overlaySubscription) startPingPeers(ctx context.Context) {
 }
 
 func (s *overlaySubscription) runMaintenanceAsync(fn func()) {
-	if s.node != nil {
-		s.node.runAsync(fn)
-		return
-	}
-	go fn()
+	s.node.runAsync(fn)
 }
 
 func (s *overlaySubscription) beginRefreshPeers() bool {
@@ -1098,6 +1178,23 @@ func (s *overlaySubscription) endPeerPing() {
 	s.maintenanceMx.Unlock()
 }
 
+func (s *overlaySubscription) beginFixedProbe() bool {
+	s.maintenanceMx.Lock()
+	defer s.maintenanceMx.Unlock()
+
+	if s.fixedProbeRunning {
+		return false
+	}
+	s.fixedProbeRunning = true
+	return true
+}
+
+func (s *overlaySubscription) endFixedProbe() {
+	s.maintenanceMx.Lock()
+	s.fixedProbeRunning = false
+	s.maintenanceMx.Unlock()
+}
+
 func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 	peer.overlay.SetBroadcastHandlerWithInfo(func(msg tl.Serializable, info overlay.BroadcastInfo) error {
 		var sourcePeerID PeerID
@@ -1121,7 +1218,7 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 		case overlay.Broadcast:
 			return s.handleSimpleBroadcast(peer, data)
 		case ForgetPeer:
-			s.removePeer(peer.id)
+			s.removePeerIfCurrent(peer)
 			return nil
 		default:
 			return nil
@@ -1135,16 +1232,12 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 			return s.answerRLDPQuery(peer, transferID, query)
 		})
 	}
-	peer.overlay.SetDisconnectHandler(func(_ string, key ed25519.PublicKey) {
-		rawID, err := tl.Hash(keys.PublicKeyED25519{Key: key})
-		if err != nil {
-			return
-		}
-		id, err := NewPeerID(rawID)
-		if err != nil {
-			return
-		}
-		s.removePeer(id)
+	peer.overlay.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
+		// Remove by pointer, not by id: the disconnect cascade runs
+		// asynchronously and a recovery path may have already re-attached a
+		// fresh peer object for the same id, which must survive this
+		// stale callback.
+		s.removePeerIfCurrent(peer)
 	})
 }
 
@@ -1273,7 +1366,7 @@ func (s *overlaySubscription) peerReadyForMaintenance(ctx context.Context, peer 
 	case <-ctx.Done():
 		return false
 	case <-peer.overlay.GetCloserCtx().Done():
-		s.removePeer(peer.id)
+		s.removePeerIfCurrent(peer)
 		return false
 	default:
 		return true
@@ -1356,17 +1449,18 @@ func (s *overlaySubscription) peerPromoted(peer *overlayPeer) {
 	s.reloadNeighbours()
 }
 
-func (s *overlaySubscription) removePeer(id PeerID) {
+func (s *overlaySubscription) removePeerIfCurrent(peer *overlayPeer) {
 	s.mx.Lock()
-	peer := s.peers[id]
-	delete(s.peers, id)
-	s.removeNeighbourLocked(id)
+	if s.peers[peer.id] != peer {
+		s.mx.Unlock()
+		return
+	}
+	delete(s.peers, peer.id)
+	s.removeNeighbourLocked(peer.id)
 	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 
-	if peer != nil {
-		peer.close()
-	}
+	peer.close()
 }
 
 func (s *overlaySubscription) aliveKnownPeerCount() int {

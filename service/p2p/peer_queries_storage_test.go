@@ -3,6 +3,7 @@ package p2p
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,6 +23,70 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+type prepareZeroStatePeerStore struct {
+	tnstore.PeerServingStorage
+	data []byte
+	err  error
+}
+
+func (s prepareZeroStatePeerStore) ZeroState(context.Context, ton.BlockIDExt) ([]byte, error) {
+	return s.data, s.err
+}
+
+func TestServePrepareZeroStateDistinguishesStorageErrors(t *testing.T) {
+	storageFailure := errors.New("zero state storage failure")
+	tests := []struct {
+		name         string
+		data         []byte
+		err          error
+		wantPrepared bool
+		wantErr      error
+	}{
+		{name: "available", data: []byte{0x01}, wantPrepared: true},
+		{name: "empty", data: []byte{}},
+		{name: "not found", err: tnstore.ErrNotFound},
+		{name: "canceled", err: context.Canceled, wantErr: context.Canceled},
+		{name: "storage failure", err: storageFailure, wantErr: storageFailure},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := prepareZeroStatePeerStore{
+				PeerServingStorage: newTestPeerStore(),
+				data:               tt.data,
+				err:                tt.err,
+			}
+			sub := testOverlaySubscription(&overlaySubscription{
+				node: &Node{peerStorage: store},
+				log:  discardLogger(),
+			})
+
+			response, err := sub.servePrepareZeroState(context.Background(), testStoredMasterBlockID(0))
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("prepare zero state error = %v, want %v", err, tt.wantErr)
+				}
+				if response != nil {
+					t.Fatalf("prepare zero state response = %T, want nil", response)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("prepare zero state: %v", err)
+			}
+			if tt.wantPrepared {
+				if _, ok := response.(PreparedState); !ok {
+					t.Fatalf("prepare zero state response = %T, want PreparedState", response)
+				}
+				return
+			}
+			if _, ok := response.(NotFoundState); !ok {
+				t.Fatalf("prepare zero state response = %T, want NotFoundState", response)
+			}
+		})
+	}
+}
+
 func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
@@ -34,7 +99,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -42,7 +107,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	block := testStoredMasterBlockID(10)
 	next := testStoredMasterBlockID(11)
@@ -194,7 +259,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -202,13 +267,13 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	prev := testStoredMasterBlockID(70)
 	next := testStoredMasterBlockID(71)
 	blockData := []byte{0x71, 0x01}
 	proofData := []byte{0x71, 0x02}
-	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block:     next,
 		BlockData: blockData,
 		Meta: &tnstore.BlockMeta{
@@ -290,7 +355,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -298,11 +363,11 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	keyBlock := testStoredMasterBlockID(72)
 	proofData := []byte{0x72, 0x01}
-	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block: keyBlock,
 		Proofs: []tnstore.LiveBlockProofArtifact{
 			{Kind: tnstore.ServedProofBlock, Data: proofData},
@@ -331,7 +396,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 
 	linkOnlyBlock := testStoredMasterBlockID(73)
 	linkOnlyProof := []byte{0x73, 0x01}
-	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockArtifacts{
+	if err := node.liveBlockCache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
 		Block: linkOnlyBlock,
 		Proofs: []tnstore.LiveBlockProofArtifact{
 			{Kind: tnstore.ServedProofKeyBlockLink, Data: linkOnlyProof},
@@ -370,7 +435,7 @@ func TestDispatchPeerQueryDirectDownloadsErrorWhenMissing(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -378,7 +443,7 @@ func TestDispatchPeerQueryDirectDownloadsErrorWhenMissing(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	block := testStoredMasterBlockID(50)
 	if resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlock{Block: block}); err == nil || resp != nil {
@@ -407,7 +472,7 @@ func TestDispatchPeerQueryShardNextDescriptionRequiresMasterchain(t *testing.T) 
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "basechain",
@@ -415,7 +480,7 @@ func TestDispatchPeerQueryShardNextDescriptionRequiresMasterchain(t *testing.T) 
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	prev := testStoredBlockID(20)
 	next := testStoredBlockID(21)
@@ -447,7 +512,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "basechain",
@@ -455,7 +520,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	block := testStoredBlockID(20)
 	zeroBlock := testStoredBlockID(0)
@@ -592,7 +657,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -600,7 +665,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	block := testStoredMasterBlockID(60)
 	shardBlock := testStoredBlockID(63)
@@ -764,7 +829,7 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -772,7 +837,7 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	anchor := testStoredMasterBlockID(10)
 	saveTestServedMasterBlockMeta(t, store, anchor, true)
@@ -833,7 +898,7 @@ func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 	}
 	node.RememberSeenMasterchainBlock(keyBlock)
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -841,7 +906,7 @@ func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
 		Block:   anchor,
@@ -878,7 +943,7 @@ func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 	}
 	node.RememberSeenMasterchainBlock(keyBlock)
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -886,7 +951,7 @@ func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
 		Block:   testStoredMasterBlockID(10),
@@ -960,7 +1025,7 @@ func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 	cancel()
 	node.runCtx = ctx
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "masterchain",
@@ -968,7 +1033,7 @@ func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 			ProtoVersionMinor: masterchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 
 	answered := false
 	err = sub.answerPeerQuery(&overlayPeer{addr: "peer"}, GetCapabilities{}, func(context.Context, tl.Serializable) error {
@@ -995,7 +1060,7 @@ func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "masterchain"},
 		log:  discardLogger(),
@@ -1012,7 +1077,7 @@ func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
 			},
 		},
 		neighbours: []PeerID{testPeerID("peer-1")},
-	}
+	})
 	node.subscriptions = map[string]*overlaySubscription{"master": sub}
 
 	snapshot := node.StatusSnapshot()

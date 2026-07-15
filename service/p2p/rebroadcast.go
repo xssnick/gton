@@ -32,6 +32,7 @@ var quietRebroadcastIntervals = map[string]time.Duration{
 	"tonNode.newBlockCandidateBroadcast":             250 * time.Millisecond,
 	"tonNode.newBlockCandidateBroadcastCompressed":   250 * time.Millisecond,
 	"tonNode.newBlockCandidateBroadcastCompressedV2": 250 * time.Millisecond,
+	blockFinalityBroadcastKind:                       250 * time.Millisecond,
 	"tonNode.newShardBlockBroadcast":                 500 * time.Millisecond,
 	"tonNode.externalMessageBroadcast":               100 * time.Millisecond,
 	"tonNode.ihrMessageBroadcast":                    100 * time.Millisecond,
@@ -121,7 +122,8 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 	switch kind {
 	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2",
 		"tonNode.newBlockCandidateBroadcast", "tonNode.newBlockCandidateBroadcastCompressed",
-		"tonNode.newBlockCandidateBroadcastCompressedV2":
+		"tonNode.newBlockCandidateBroadcastCompressedV2",
+		blockFinalityBroadcastKind:
 		return rebroadcastPlan{mode: rebroadcastModeFEC, flags: overlay.BroadcastFlagAnySender}
 	case "tonNode.newShardBlockBroadcast":
 		if payloadLen <= ordinarySimpleBroadcastMaxSize {
@@ -257,7 +259,7 @@ func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
 }
 
 func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
-	if s.node == nil || s.node.runCtx.Err() != nil || peer == nil {
+	if s.node.runCtx.Err() != nil || peer == nil {
 		return
 	}
 	if !peer.initRebroadcastQueues() {
@@ -339,6 +341,20 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if !s.node.allowRebroadcast(&req) {
 		return false
 	}
+	candidates := s.rebroadcastCandidatesForRequest(req)
+	if len(candidates) == 0 {
+		s.node.noteRebroadcastDropped(req)
+		return false
+	}
+	if err := req.materializePayload(); err != nil {
+		s.node.noteRebroadcastDropped(req)
+		s.log.Debug().
+			Err(err).
+			Str("kind", req.kind).
+			Str("queue", req.queueName()).
+			Msg("dropping rebroadcast request because payload cannot be serialized")
+		return false
+	}
 
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
@@ -393,7 +409,6 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	}
 	req.queuedAt = time.Now()
 
-	candidates := s.rebroadcastCandidatesForRequest(req)
 	preferred := s.rebroadcastPreferredCandidateIDs(req)
 	fanout := s.rebroadcastFanoutForRequest(req)
 	attempts := 1
@@ -453,7 +468,9 @@ func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastReq
 		return candidates
 	}
 
-	filtered := candidates[:0]
+	// The candidates slice is shared with the snapshot cache, filter into a
+	// fresh slice instead of truncating it in place.
+	filtered := make([]*overlayPeer, 0, len(candidates))
 	for _, peer := range candidates {
 		if peer.id == req.sourcePeerID {
 			continue
@@ -487,28 +504,28 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
-		if s != nil && s.spec.Kind == overlayKindCustomFixed {
-			if s.node != nil && s.node.rebroadcastLagged() {
+		if s.spec.Kind == overlayKindCustomFixed {
+			if s.node.rebroadcastLagged() {
 				return laggedExternalFanout
 			}
 			return s.peerLimit()
 		}
-		if req.local && s != nil && s.node != nil {
+		if req.local {
 			fanout := s.node.effectiveLocalExternalFanout()
 			if s.node.rebroadcastLagged() {
 				return laggedLocalExternalFanout(fanout)
 			}
 			return fanout
 		}
-		if s != nil && s.node != nil && s.node.rebroadcastLagged() {
+		if s.node.rebroadcastLagged() {
 			return laggedExternalFanout
 		}
 		return externalRebroadcastFanout
 	}
-	if s != nil && s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.Kind == overlayKindCustomFixed {
 		return s.peerLimit()
 	}
-	if s.node != nil && s.node.rebroadcastQuiet.Load() {
+	if s.node.rebroadcastQuiet.Load() {
 		return quietRebroadcastFanout
 	}
 	return rebroadcastFanout
@@ -612,15 +629,10 @@ func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overl
 	}
 
 	plan := s.rebroadcastPlan(req.kind, payloadLen)
-	switch plan.mode {
-	case rebroadcastModeSimple:
+	if plan.mode == rebroadcastModeSimple {
 		return s.rebroadcastSimpleToPeer(ctx, peer, req, plan)
-	case rebroadcastModeFEC:
-		return s.rebroadcastFECToPeer(ctx, peer, req, plan)
-	default:
-		s.log.Debug().Str("kind", req.kind).Msg("skipping rebroadcast because the delivery mode is unknown")
-		return false
 	}
+	return s.rebroadcastFECToPeer(ctx, peer, req, plan)
 }
 
 func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {

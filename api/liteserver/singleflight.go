@@ -3,14 +3,7 @@ package liteserver
 import (
 	"context"
 	"sync"
-
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
-
-type liveBlockLoadResult struct {
-	root *cell.Cell
-	data []byte
-}
 
 type liveLoadGroup[K comparable] struct {
 	mu    sync.Mutex

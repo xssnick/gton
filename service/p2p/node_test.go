@@ -12,6 +12,7 @@ import (
 
 	"github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -65,6 +66,10 @@ func TestPendingBroadcastExpiryReleasesDeduper(t *testing.T) {
 
 func TestPendingBroadcastDecodeSnapshotForPrevUsesIndex(t *testing.T) {
 	node := newTestNode(t)
+	runCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	node.runCtx = runCtx
+
 	now := time.Unix(100, 0)
 	prevA := testBlockID(-1, topShard, 10)
 	prevB := testBlockID(-1, topShard, 11)
@@ -83,6 +88,7 @@ func TestPendingBroadcastDecodeSnapshotForPrevUsesIndex(t *testing.T) {
 		receivedAt:  now,
 		msg:         struct{}{},
 	})
+	node.wg.Wait()
 
 	reqs := node.pendingBlockBroadcastDecodeSnapshotForPrev(prevA, now)
 	if len(reqs) != 1 || reqs[0].fingerprint != "pending-a" {
@@ -126,13 +132,13 @@ func TestStartSubscriptionSkipsStoppedNode(t *testing.T) {
 	cancel()
 	node.runCtx = runCtx
 
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node:       node,
 		spec:       overlaySpec{Name: "basechain"},
 		log:        discardLogger(),
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
-	}
+	})
 	if node.startSubscription(sub) {
 		t.Fatal("stopped node should not start overlay subscription")
 	}
@@ -188,7 +194,7 @@ func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
 
 func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 	node := newTestNode(t)
-	sub := &overlaySubscription{
+	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
 			Name:              "basechain",
@@ -196,7 +202,7 @@ func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		log: discardLogger(),
-	}
+	})
 	sub.setActive(false, time.Now().Add(time.Minute))
 
 	err := sub.answerPeerQuery(nil, GetCapabilities{}, func(context.Context, tl.Serializable) error {
@@ -280,6 +286,41 @@ func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
 
 	if _, err = node.SeenMasterchainBlock(); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("raw broadcast moved seen masterchain: %v", err)
+	}
+}
+
+func TestMasterchainBroadcastAfterKeepsWakeWhenAlreadyAhead(t *testing.T) {
+	node := newTestNode(t)
+	prev := testBlockID(-1, topShard, 10)
+
+	seqno, wake := node.MasterchainBroadcastAfter(prev.SeqNo)
+	if seqno != 0 {
+		t.Fatalf("raw broadcast seqno = %d, want 0", seqno)
+	}
+	if wake == nil {
+		t.Fatal("raw broadcast wake is nil before the first broadcast")
+	}
+
+	node.trackRawMasterchainBroadcast(testBlockID(-1, topShard, 11))
+	select {
+	case <-wake:
+	default:
+		t.Fatal("first raw broadcast did not close the wake channel")
+	}
+
+	seqno, wake = node.MasterchainBroadcastAfter(prev.SeqNo)
+	if seqno != 11 {
+		t.Fatalf("raw broadcast seqno = %d, want 11", seqno)
+	}
+	if wake == nil {
+		t.Fatal("raw broadcast wake is nil while a broadcast is already ahead")
+	}
+
+	node.trackRawMasterchainBroadcast(testBlockID(-1, topShard, 12))
+	select {
+	case <-wake:
+	default:
+		t.Fatal("newer raw broadcast did not close the wake channel")
 	}
 }
 
@@ -511,8 +552,8 @@ func TestStartDHTClientUsesSeparateGateway(t *testing.T) {
 		t.Fatalf("start DHT client: %v", err)
 	}
 	t.Cleanup(func() {
-		if node.dht != nil {
-			node.dht.Close()
+		if node.dhtClient != nil {
+			node.dhtClient.Close()
 		}
 	})
 
@@ -557,11 +598,11 @@ func TestStartDHTServerUsesDedicatedGatewayIDAndServerBackend(t *testing.T) {
 		t.Fatal("expected DHT server to be initialized")
 	}
 
-	backend, ok := node.dht.(*serverDHTBackend)
+	backend, ok := node.dht.(*dht.Server)
 	if !ok {
 		t.Fatalf("expected p2p DHT handle to use server backend, got %T", node.dht)
 	}
-	if backend.Server != node.dhtServer {
+	if backend != node.dhtServer {
 		t.Fatal("expected p2p DHT handle to point at DHT server")
 	}
 

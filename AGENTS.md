@@ -18,7 +18,8 @@
 - Do not export pass-through methods from services.
 - If a method only forwards a call to a lower layer without adding meaning or policy, remove it.
 
-- Do not make reverse compatibility when changing some code or architecture. We are in an active development phase and can drop old data.
+- Preserve compatibility between released tags. Persisted data and protocol changes introduced by a released tag must include an explicit migration.
+- Do not add compatibility shims between commits or intermediate states of the same in-progress change. Update all callers, tests, and formats in that change directly.
 
 ## Package structure
 

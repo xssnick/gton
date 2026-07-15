@@ -72,6 +72,36 @@ func TestArchiveCatchUpTargetByLagDoesNotGuessTargetFromRemainingLag(t *testing.
 	}
 }
 
+func TestArchiveSyncUntilProgressGoalUsesCutoffTime(t *testing.T) {
+	goal := archiveSyncUntilProgressGoal(1000, 700, 1200)
+	if goal.kind != archiveProgressGoalSyncUntil {
+		t.Fatalf("progress goal kind = %d, want sync_until", goal.kind)
+	}
+	if !goal.knownRemaining() {
+		t.Fatal("sync_until progress should have known remaining seconds")
+	}
+	if goal.remainingSeconds != 300 {
+		t.Fatalf("remaining seconds = %d, want 300", goal.remainingSeconds)
+	}
+}
+
+func TestArchiveSyncUntilProgressGoalIgnoresFutureCutoff(t *testing.T) {
+	goal := archiveSyncUntilProgressGoal(1300, 700, 1200)
+	if goal.kind != archiveProgressGoalNone {
+		t.Fatalf("progress goal kind = %d, want none", goal.kind)
+	}
+}
+
+func TestArchiveSyncUntilProgressGoalKeepsCutoffWithoutBlockTime(t *testing.T) {
+	goal := archiveSyncUntilProgressGoal(1000, 0, 1200)
+	if goal.kind != archiveProgressGoalSyncUntil {
+		t.Fatalf("progress goal kind = %d, want sync_until", goal.kind)
+	}
+	if goal.knownRemaining() {
+		t.Fatal("sync_until progress with unknown block time should not have known remaining seconds")
+	}
+}
+
 func TestArchivePipelineSchedulingUsesPendingWindowLimit(t *testing.T) {
 	runner := &archiveCatchUpRunner{
 		service: &Service{archiveCatchUpPrefetchWindows: 2},
@@ -317,7 +347,7 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
 		current:                &storage.CurrentState{ShardClientSeqno: 1001},
-		stateCells:             newArchiveStateCellOverlay(nil),
+		stateCells:             newStateCellWindowCache(nil),
 	}
 	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 4095),

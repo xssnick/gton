@@ -50,10 +50,6 @@ func testStateCheckpointEntryForCurrent(state *storage.BlockState, current *stor
 	return entry
 }
 
-func testStateCheckpointArtifact(state *storage.BlockState) *storage.ServedBlockFull {
-	return testStateCheckpointArtifactForCurrent(state, nil)
-}
-
 func testStateCheckpointArtifactForCurrent(state *storage.BlockState, current *storage.CurrentState) *storage.ServedBlockFull {
 	block := state.Block
 	meta := &storage.BlockMeta{ID: block, GenUTime: block.SeqNo}

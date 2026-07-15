@@ -111,7 +111,7 @@ func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.Bl
 			if res.downloaded == nil {
 				return p2p.DownloadedBlock{}, "", fmt.Errorf("probe block %s: empty response", storage.FormatBlockRef(block))
 			}
-			return *res.downloaded, syncBlockSourceForDownloadedBlock(SyncBlockSourcePeerProbe, *res.downloaded), nil
+			return *res.downloaded, syncBlockSourceForKind(SyncBlockSourcePeerProbe, res.downloaded.Kind), nil
 		case <-logTimer.C:
 			waited := time.Duration(0)
 			if !state.started.IsZero() {

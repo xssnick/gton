@@ -66,6 +66,34 @@ func BenchmarkCollectCellRecords(b *testing.B) {
 	}
 }
 
+func BenchmarkPrepareStateUpdateCells(b *testing.B) {
+	root, cells := benchmarkCellGraph(b, 4096, 4)
+	update, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
+		MustStoreSlice(root.Hash(0), 256).
+		MustStoreSlice(root.Hash(0), 256).
+		MustStoreUInt(uint64(root.Depth(0)), 16).
+		MustStoreUInt(uint64(root.Depth(0)), 16).
+		MustStoreRef(root).
+		MustStoreRef(root).
+		EndCellSpecial(true)
+	if err != nil {
+		b.Fatalf("create merkle update: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ReportMetric(float64(cells), "cells/op")
+	for b.Loop() {
+		records, err := PrepareStateUpdateCells(update)
+		if err != nil {
+			b.Fatalf("prepare state update cells: %v", err)
+		}
+		if records.Len() != cells {
+			b.Fatalf("records count mismatch: got=%d want=%d", records.Len(), cells)
+		}
+	}
+}
+
 func benchmarkCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell, int) {
 	tb.Helper()
 	if leaves <= 0 {

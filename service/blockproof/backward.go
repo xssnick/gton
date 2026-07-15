@@ -9,20 +9,20 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-type mcStateExtraPrefix struct {
+type McStateExtraPrefix struct {
 	_           tlb.Magic           `tlb:"#cc26"`
 	ShardHashes *cell.Dictionary    `tlb:"dict 32"`
-	Config      mcStateConfigPrefix `tlb:"."`
+	Config      McStateConfigPrefix `tlb:"."`
 	Info        *cell.Cell          `tlb:"^"`
 }
 
-type mcStateConfigPrefix struct {
+type McStateConfigPrefix struct {
 	ConfigAddr []byte     `tlb:"bits 256"`
 	Config     *cell.Cell `tlb:"^"`
 }
 
 func OldMasterBlockIDFromState(stateRoot *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
-	prefix, err := loadMcStateExtraPrefix(stateRoot)
+	prefix, err := LoadMcStateExtraPrefix(stateRoot, false)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -51,23 +51,40 @@ func OldMasterBlockIDFromState(stateRoot *cell.Cell, seqno uint32) (ton.BlockIDE
 	return oldMasterBlockID(prevBlocks, seqno)
 }
 
-func loadMcStateExtraPrefix(stateRoot *cell.Cell) (mcStateExtraPrefix, error) {
+// LoadMcStateExtraPrefix extracts the mc_state_extra prefix from a masterchain
+// state root. With visitHeader set it walks the full shard-state header first,
+// so usage proofs built around it include the header cells; without it the
+// loader jumps straight to the extra ref and leaves the header untouched.
+func LoadMcStateExtraPrefix(stateRoot *cell.Cell, visitHeader bool) (McStateExtraPrefix, error) {
 	stateLoader, err := stateRoot.BeginParse()
 	if err != nil {
-		return mcStateExtraPrefix{}, err
-	}
-	custom, err := stateLoader.PeekRefCellAt(3)
-	if err != nil {
-		return mcStateExtraPrefix{}, err
+		return McStateExtraPrefix{}, err
 	}
 
-	var prefix mcStateExtraPrefix
+	var custom *cell.Cell
+	if visitHeader {
+		state, err := VisitShardStateHeader(stateLoader)
+		if err != nil {
+			return McStateExtraPrefix{}, err
+		}
+		if state.McStateExtra == nil {
+			return McStateExtraPrefix{}, fmt.Errorf("state is missing mc_state_extra")
+		}
+		custom = state.McStateExtra
+	} else {
+		custom, err = stateLoader.PeekRefCellAt(3)
+		if err != nil {
+			return McStateExtraPrefix{}, err
+		}
+	}
+
+	var prefix McStateExtraPrefix
 	loader, err := custom.BeginParse()
 	if err != nil {
-		return mcStateExtraPrefix{}, err
+		return McStateExtraPrefix{}, err
 	}
 	if err = tlb.LoadFromCell(&prefix, loader); err != nil {
-		return mcStateExtraPrefix{}, err
+		return McStateExtraPrefix{}, err
 	}
 	return prefix, nil
 }

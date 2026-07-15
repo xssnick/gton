@@ -6,6 +6,8 @@ import (
 
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
+
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
@@ -63,5 +65,38 @@ func TestRememberShardDescriptionHintSkipsAfterSyncUntilFrozen(t *testing.T) {
 
 	if len(svc.shardDescriptionHints) != 0 {
 		t.Fatalf("shard description hints = %d, want 0", len(svc.shardDescriptionHints))
+	}
+}
+
+func TestCloneShardBlockDescriptionCopiesBlockIDs(t *testing.T) {
+	block := testBlockID(0, topShard, 30)
+	prev := testBlockID(0, topShard, 29)
+	master := testBlockID(-1, topShard, 30)
+	desc := &p2p.ShardBlockDescription{
+		Block: block,
+		Chain: []p2p.ShardDescriptionLink{{
+			Block:          block,
+			PrevRefs:       []ton.BlockIDExt{prev},
+			MasterchainRef: &master,
+		}},
+	}
+
+	cloned := cloneShardBlockDescription(desc)
+	cloned.Block.RootHash[0] = 0xA1
+	cloned.Chain[0].Block.RootHash[0] = 0xA2
+	cloned.Chain[0].PrevRefs[0].RootHash[0] = 0xA3
+	cloned.Chain[0].MasterchainRef.RootHash[0] = 0xA4
+
+	if desc.Block.RootHash[0] == 0xA1 {
+		t.Fatal("clone shares description block root hash backing array")
+	}
+	if desc.Chain[0].Block.RootHash[0] == 0xA2 {
+		t.Fatal("clone shares link block root hash backing array")
+	}
+	if desc.Chain[0].PrevRefs[0].RootHash[0] == 0xA3 {
+		t.Fatal("clone shares prev ref root hash backing array")
+	}
+	if desc.Chain[0].MasterchainRef.RootHash[0] == 0xA4 {
+		t.Fatal("clone shares masterchain ref root hash backing array")
 	}
 }

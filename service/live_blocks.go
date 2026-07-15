@@ -4,12 +4,7 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm/cell"
 )
-
-func (s *Service) NonfinalCellLoader() cell.LazyCellLoader {
-	return s.stateCellLoader()
-}
 
 type liveBlockPublishOptions struct {
 	availabilityOnly bool
@@ -54,7 +49,12 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 
 	liveArtifacts := artifacts
 	if s.liveBlockCache != nil {
-		if err := s.liveBlockCache.PublishLiveBlockArtifacts(artifacts); err != nil {
+		if err := s.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
+			Block:     artifacts.Block,
+			BlockData: artifacts.BlockData,
+			Meta:      artifacts.Meta,
+			Proofs:    artifacts.Proofs,
+		}); err != nil {
 			s.log.Debug().
 				Err(err).
 				Str("block", storage.FormatBlockRef(downloaded.ID)).

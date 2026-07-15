@@ -81,14 +81,6 @@ func zeroStateBlockFromGlobalConfig(cfg *liteclient.GlobalConfig) (ton.BlockIDEx
 	return block, nil
 }
 
-func zeroStateIDFromBlock(block ton.BlockIDExt) ton.ZeroStateIDExt {
-	return ton.ZeroStateIDExt{
-		Workchain: block.Workchain,
-		RootHash:  append([]byte(nil), block.RootHash...),
-		FileHash:  append([]byte(nil), block.FileHash...),
-	}
-}
-
 func ensureStoredZeroStateMatchesGlobalConfig(ctx context.Context, store storedZeroStateReader, configured ton.BlockIDExt) error {
 	stored, err := store.StoredZeroStateBlocks(ctx)
 	if errors.Is(err, storage.ErrNotFound) {

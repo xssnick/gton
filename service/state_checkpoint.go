@@ -9,15 +9,23 @@ import (
 )
 
 type stateCheckpointData struct {
-	live               *storage.CurrentState
-	persisted          *storage.CurrentState
-	entries            []storage.StateCheckpointBlock
-	cells              storage.StateCellRecords
-	cellPrewriteTarget uint64
+	live                   *storage.CurrentState
+	persisted              *storage.CurrentState
+	entries                []storage.StateCheckpointBlock
+	cells                  storage.StateCellRecords
+	cellPrewriteTarget     uint64
+	artifactPrewriteTarget uint64
 }
 
 func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
-	appliedEntries := cloneStateCheckpointEntries(entries)
+	// entries always come from appliedStateSet.checkpoint(), which already
+	// produced an independent snapshot (deep-cloned block states, shared immutable
+	// payload bytes) decoupled from the live set. That snapshot is single-use and
+	// is not read again after the persist, so re-cloning it here would just be a
+	// second full clone of ~400 block states per checkpoint. The archive path
+	// (persistArchiveCurrentState) already hands the same checkpoint() entries
+	// straight to saveStateCheckpoint without re-cloning; mirror that.
+	appliedEntries := entries
 	if len(appliedEntries) == 0 {
 		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
 	}
@@ -35,7 +43,7 @@ func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.Sta
 	}, nil
 }
 
-func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
+func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64, artifactPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
 	var stages []SyncPersistStageObservation
 
 	if cellPrewriteTarget > 0 {
@@ -52,6 +60,17 @@ func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.Curr
 			return nil, stages, err
 		}
 		stages = appendSyncPersistStage(stages, "flush_prewrite_cells", time.Since(stageStarted))
+	}
+
+	// Waits after the cell flush on purpose: artifact appends keep streaming in
+	// the background while the flush runs, so this wait is usually near-zero.
+	if artifactPrewriteTarget > 0 {
+		stageStarted := time.Now()
+		if err := s.artifactPrewrite.wait(ctx, artifactPrewriteTarget); err != nil {
+			stages = appendSyncPersistStage(stages, "wait_artifact_prewrite", time.Since(stageStarted))
+			return nil, stages, err
+		}
+		stages = appendSyncPersistStage(stages, "wait_artifact_prewrite", time.Since(stageStarted))
 	}
 
 	timing, err := s.storage.SaveStateCheckpointEntries(ctx, entries, cells, current)
@@ -99,24 +118,6 @@ func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*s
 		}
 	}
 	return next
-}
-
-func cloneStateCheckpointEntries(entries []storage.StateCheckpointBlock) []storage.StateCheckpointBlock {
-	if len(entries) == 0 {
-		return nil
-	}
-	cloned := make([]storage.StateCheckpointBlock, 0, len(entries))
-	for _, entry := range entries {
-		if entry.State == nil {
-			continue
-		}
-		cloned = append(cloned, storage.StateCheckpointBlock{
-			State:    storage.CloneBlockState(entry.State),
-			Artifact: cloneServedBlockFullSharedPayload(entry.Artifact),
-			Links:    cloneServedBlockLinks(entry.Links),
-		})
-	}
-	return cloned
 }
 
 func checkpointEntryStates(entries []storage.StateCheckpointBlock) []*storage.BlockState {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -67,9 +68,9 @@ type Store struct {
 	nonFinalWaiting    map[storage.BlockRootHash]liveNonfinalWaiting
 	nonFinalCellIndex  map[cell.Hash][]liveNonfinalCellIndexEntry
 	nonFinalCellLoader cell.LazyCellLoader
-	blockDataLoad      liveLoadGroup[storage.BlockRootHash]
-	blockLoad          liveLoadGroup[storage.BlockRootHash]
-	fragmentLoad       liveLoadGroup[storage.BlockRootHash]
+	blockDataLoad      liveLoadGroup[liveBlockLookupKey, []byte]
+	blockLoad          liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
+	fragmentLoad       liveLoadGroup[liveBlockLookupKey, *BlockView]
 }
 
 type liveBlock struct {
@@ -123,17 +124,7 @@ func newLiveBlockOrder() liveBlockOrder {
 	}
 }
 
-func (o *liveBlockOrder) ensure() {
-	if o.items == nil {
-		o.items = list.New()
-	}
-	if o.index == nil {
-		o.index = map[storage.BlockRootHash]*list.Element{}
-	}
-}
-
 func (o *liveBlockOrder) pushBack(key storage.BlockRootHash) {
-	o.ensure()
 	if elem := o.index[key]; elem != nil {
 		o.items.MoveToBack(elem)
 		return
@@ -142,7 +133,6 @@ func (o *liveBlockOrder) pushBack(key storage.BlockRootHash) {
 }
 
 func (o *liveBlockOrder) remove(key storage.BlockRootHash) bool {
-	o.ensure()
 	elem := o.index[key]
 	if elem == nil {
 		return false
@@ -153,7 +143,6 @@ func (o *liveBlockOrder) remove(key storage.BlockRootHash) bool {
 }
 
 func (o *liveBlockOrder) front() *list.Element {
-	o.ensure()
 	return o.items.Front()
 }
 
@@ -259,7 +248,9 @@ func (s *Store) loadStoredCurrentState(ctx context.Context) (*storage.CurrentSta
 		})
 	}
 
-	s.current = storage.CloneCurrentState(loaded)
+	next := storage.CloneCurrentState(loaded)
+	s.releaseRetiredCurrentCachesLocked(s.current, next)
+	s.current = next
 	s.pendingCurrent = nil
 	s.rememberCurrentBlockStatesLocked(s.current)
 	s.updateMasterchainInfoLocked(s.current)
@@ -349,8 +340,12 @@ func (s *Store) loadStoredCurrentBlock(ctx context.Context, state storage.BlockS
 }
 
 func (s *Store) SetLiveCurrentState(current *storage.CurrentState) {
-	next := storage.CloneCurrentState(current)
+	s.SetLiveCurrentStateSnapshot(storage.CloneCurrentState(current))
+}
 
+// SetLiveCurrentStateSnapshot publishes an already-private snapshot. The store
+// takes ownership: the caller must not modify next after the call.
+func (s *Store) SetLiveCurrentStateSnapshot(next *storage.CurrentState) {
 	s.mu.Lock()
 	prevSeqno := currentMasterchainSeqno(s.current)
 	s.pendingCurrent = next
@@ -370,9 +365,11 @@ func (s *Store) SetLiveCurrentState(current *storage.CurrentState) {
 	}
 }
 
+// CurrentState returns the published state snapshot. The snapshot is immutable
+// once published and shared between callers; treat it as read-only.
 func (s *Store) CurrentState(_ context.Context) (*storage.CurrentState, error) {
 	s.mu.RLock()
-	current := storage.CloneCurrentState(s.current)
+	current := s.current
 	s.mu.RUnlock()
 	if current != nil {
 		return current, nil
@@ -421,20 +418,15 @@ func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) 
 	if err != nil {
 		return err
 	}
-	if s.liveBlockCache != nil {
-		cacheArtifacts := storage.LiveBlockArtifacts{
-			Block:           prepared.block,
-			Root:            prepared.root,
-			BlockData:       prepared.data,
-			Meta:            prepared.meta,
-			State:           prepared.state,
-			ArtifactFlushed: prepared.artifactFlushed,
-			StateFlushed:    prepared.stateFlushed,
-		}
-		cacheArtifacts.Proofs = prepared.proofs
-		if err = s.liveBlockCache.PublishLiveBlockArtifacts(cacheArtifacts); err != nil {
-			return err
-		}
+	cacheArtifacts := storage.LiveBlockCacheArtifacts{
+		Block:           prepared.block,
+		BlockData:       prepared.data,
+		Meta:            prepared.meta,
+		ArtifactFlushed: prepared.artifactFlushed,
+	}
+	cacheArtifacts.Proofs = prepared.proofs
+	if err = s.liveBlockCache.PublishLiveBlockArtifacts(cacheArtifacts); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
@@ -509,13 +501,12 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 
 	var fragments *BlockView
 	if !artifacts.AvailabilityOnly && root != nil && state != nil && state.Cell != nil {
-		// Fragment preparation is a live read hot-path optimization. Some publishers and
-		// tests use hash-valid cache artifacts which are not full parseable block/state cells.
 		built, err := buildBlockView(block, root, state.Cell)
-		if err == nil {
-			fragments = built
-			fragments.prewarmHotPath()
+		if err != nil {
+			return livePreparedBlockArtifacts{}, err
 		}
+		fragments = built
+		fragments.prewarmHotPath()
 	}
 
 	return livePreparedBlockArtifacts{
@@ -538,6 +529,7 @@ func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveB
 		BlockData:        artifacts.BlockData,
 		Meta:             artifacts.Meta.Clone(),
 		State:            storage.CloneBlockState(artifacts.State),
+		StateUpdate:      artifacts.StateUpdate,
 		ArtifactFlushed:  artifacts.ArtifactFlushed,
 		StateFlushed:     artifacts.StateFlushed,
 		AvailabilityOnly: artifacts.AvailabilityOnly,
@@ -584,9 +576,7 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 }
 
 func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
-	if s.liveBlockCache != nil {
-		s.liveBlockCache.MarkBlockFlushed(block)
-	}
+	s.liveBlockCache.MarkBlockFlushed(block)
 
 	key := storage.BlockKey(block)
 
@@ -769,20 +759,18 @@ func (s *Store) BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell
 }
 
 func (s *Store) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	if s.liveBlockCache != nil {
-		data, err := s.liveBlockCache.BlockData(ctx, block)
-		if err == nil {
-			return data, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
+	data, err := s.liveBlockCache.BlockData(ctx, block)
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
 	}
 	if !s.backingBlockAllowed(block) {
 		return nil, storage.ErrNotFound
 	}
 
-	data, err := s.loadStoredBlockData(ctx, block)
+	data, err = s.loadStoredBlockData(ctx, block)
 	if err != nil {
 		return nil, err
 	}
@@ -790,14 +778,12 @@ func (s *Store) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, er
 }
 
 func (s *Store) BlockProof(ctx context.Context, kind storage.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	if s.liveBlockCache != nil {
-		proof, err := s.liveBlockCache.BlockProof(ctx, kind, block)
-		if err == nil {
-			return proof, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
+	proof, err := s.liveBlockCache.BlockProof(ctx, kind, block)
+	if err == nil {
+		return proof, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
 	}
 	if !s.backingBlockAllowed(block) {
 		return nil, storage.ErrNotFound
@@ -809,7 +795,15 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 	if fragments := s.cachedBlockFragments(block); fragments != nil {
 		return fragments, nil
 	}
-	value, err := s.fragmentLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	fragments, err := s.fragmentLoad.do(ctx, key, func() (*BlockView, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		if fragments := s.cachedBlockFragments(block); fragments != nil {
 			return fragments, nil
 		}
@@ -838,15 +832,19 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 	if err != nil {
 		return nil, err
 	}
-	fragments, ok := value.(*BlockView)
-	if !ok {
-		return nil, errors.New("invalid live block fragments")
-	}
 	return fragments, nil
 }
 
 func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	value, err := s.blockDataLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	data, err := s.blockDataLoad.do(ctx, key, func() ([]byte, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		cached, err := s.cachedBlockData(ctx, block)
 		if err == nil {
 			return cached.Data, nil
@@ -860,30 +858,32 @@ func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) (
 			return nil, err
 		}
 
-		if s.liveBlockCache != nil {
-			err = s.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
-				Block:           block,
-				BlockData:       data,
-				ArtifactFlushed: true,
-			})
-			if err != nil {
-				return nil, err
-			}
+		err = s.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
+			Block:           block,
+			BlockData:       data,
+			ArtifactFlushed: true,
+		})
+		if err != nil {
+			return nil, err
 		}
 		return data, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	data, ok := value.([]byte)
-	if !ok {
-		return nil, errors.New("invalid live block data load result")
-	}
 	return data, nil
 }
 
 func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liveBlockLoadResult, error) {
-	value, err := s.blockLoad.do(ctx, storage.BlockKey(block), func() (any, error) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	loaded, err := s.blockLoad.do(ctx, key, func() (*liveBlockLoadResult, error) {
+		// Load detached from the initiating request so one disconnecting client
+		// cannot fail the shared result for concurrent waiters.
+		ctx := context.WithoutCancel(ctx)
 		cached, err := s.cachedBlockData(ctx, block)
 		if err == nil {
 			data := cached.Data
@@ -931,15 +931,20 @@ func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liv
 	if err != nil {
 		return nil, err
 	}
-	loaded, ok := value.(*liveBlockLoadResult)
-	if !ok {
-		return nil, errors.New("invalid live block load result")
-	}
 	return loaded, nil
 }
 
 func (s *Store) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	return s.backing.ZeroState(ctx, block)
+}
+
+// MasterchainSeqnoReady reports whether the given masterchain seqno is already
+// served without waiting.
+func (s *Store) MasterchainSeqnoReady(seqno uint32) bool {
+	s.mu.RLock()
+	ready := s.readyMasterSeqno
+	s.mu.RUnlock()
+	return ready >= seqno
 }
 
 func (s *Store) WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error {
@@ -985,6 +990,7 @@ func (s *Store) publishPendingCurrentLocked() bool {
 		return false
 	}
 
+	s.releaseRetiredCurrentCachesLocked(s.current, s.pendingCurrent)
 	s.current = s.pendingCurrent
 	s.pendingCurrent = nil
 	s.rememberCurrentBlockStatesLocked(s.current)
@@ -1005,11 +1011,13 @@ func (s *Store) updateMasterchainInfoLocked(current *storage.CurrentState) {
 		lastUTime = current.Masterchain.Parsed.GenUTime
 	}
 	if meta := s.metas[storage.BlockKey(block)]; meta != nil {
-		if len(stateRootHash) == 0 {
-			stateRootHash = meta.StateRootHash
-		}
-		if lastUTime == 0 {
-			lastUTime = meta.GenUTime
+		if blockIDEqual(meta.ID, block) {
+			if len(stateRootHash) == 0 {
+				stateRootHash = meta.StateRootHash
+			}
+			if lastUTime == 0 {
+				lastUTime = meta.GenUTime
+			}
 		}
 	}
 
@@ -1044,14 +1052,12 @@ func (s *Store) blockDataReadyLocked(block ton.BlockIDExt) bool {
 	if currentHasBlockState(s.current, block) {
 		return true
 	}
-	if s.liveBlockCache != nil {
-		if _, err := s.liveBlockCache.BlockData(context.Background(), block); err == nil {
-			return true
-		}
+	if s.liveBlockCache.HasBlockData(block) {
+		return true
 	}
 
 	cached := s.blocks[storage.BlockKey(block)]
-	return cached != nil && cached.artifactFlushed
+	return cached != nil && blockIDEqual(cached.id, block) && cached.artifactFlushed
 }
 
 func (s *Store) updateReadyMasterSeqnoLocked() bool {
@@ -1117,6 +1123,8 @@ func accountShardPrefix(prefix uint64, length int) int64 {
 	return int64((prefix & ^(x - 1)) | x)
 }
 
+// cachedBlockState returns a copy of the cached state struct; the nested cells
+// and byte slices are shared read-only with the cache.
 func (s *Store) cachedBlockState(block ton.BlockIDExt) *storage.BlockState {
 	key, ok := liveBlockLookupKeyFromBlock(block)
 	if !ok {
@@ -1129,19 +1137,21 @@ func (s *Store) cachedBlockState(block ton.BlockIDExt) *storage.BlockState {
 	if !ok {
 		return nil
 	}
-	return storage.CloneBlockState(&state)
+	return &state
 }
 
+// cachedBlockMeta returns the shared cached meta; indexed metas are immutable
+// once published, callers treat them as read-only.
 func (s *Store) cachedBlockMeta(block ton.BlockIDExt) *storage.BlockMeta {
 	key := storage.BlockKey(block)
 
 	s.mu.RLock()
 	meta := s.metas[key]
 	s.mu.RUnlock()
-	if meta == nil {
+	if meta != nil && !blockIDEqual(meta.ID, block) {
 		return nil
 	}
-	return meta.Clone()
+	return meta
 }
 
 func (s *Store) cachedBlockBySeqNo(ref storage.BlockSeqRef) (ton.BlockIDExt, bool) {
@@ -1199,18 +1209,14 @@ func (s *Store) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
 	s.mu.RLock()
 	cached := s.blocks[key]
 	s.mu.RUnlock()
-	if cached == nil {
+	if cached == nil || !blockIDEqual(cached.id, block) {
 		return nil
 	}
 	return cached.root
 }
 
 func (s *Store) cachedBlockData(ctx context.Context, block ton.BlockIDExt) (storage.CachedBlockData, error) {
-	if s.liveBlockCache != nil {
-		return s.liveBlockCache.CachedBlockData(ctx, block)
-	}
-
-	return storage.CachedBlockData{}, storage.ErrNotFound
+	return s.liveBlockCache.CachedBlockData(ctx, block)
 }
 
 func (s *Store) cachedBlockFragments(block ton.BlockIDExt) *BlockView {
@@ -1219,7 +1225,7 @@ func (s *Store) cachedBlockFragments(block ton.BlockIDExt) *BlockView {
 	s.mu.RLock()
 	cached := s.blocks[key]
 	s.mu.RUnlock()
-	if cached == nil {
+	if cached == nil || !blockIDEqual(cached.id, block) {
 		return nil
 	}
 	return cached.fragments
@@ -1230,7 +1236,7 @@ func (s *Store) rememberBlockFragments(block ton.BlockIDExt, fragments *BlockVie
 
 	s.mu.Lock()
 	cached := s.blocks[key]
-	if cached == nil {
+	if cached == nil || !blockIDEqual(cached.id, block) {
 		s.mu.Unlock()
 		return fragments
 	}
@@ -1263,7 +1269,6 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 			s.adjustLiveEvictableLocked(existingKind, -1)
 		}
 	}
-
 	s.blocks[key] = block
 	s.refreshBlockIndexLocked(block.id)
 	kind := liveBlockKind(block.id)
@@ -1392,6 +1397,26 @@ func (s *Store) rememberCurrentBlockStatesLocked(current *storage.CurrentState) 
 	s.rememberBlockStateLocked(current.Masterchain)
 	for _, shard := range current.Shards {
 		s.rememberBlockStateLocked(shard)
+	}
+}
+
+func (s *Store) releaseRetiredCurrentCachesLocked(previous, next *storage.CurrentState) {
+	if previous == nil {
+		return
+	}
+
+	release := func(block ton.BlockIDExt) {
+		if currentHasBlockState(next, block) {
+			return
+		}
+		if cached := s.blocks[storage.BlockKey(block)]; cached != nil && cached.fragments != nil {
+			cached.fragments.releaseCurrentCaches()
+		}
+	}
+
+	release(previous.Masterchain.Block)
+	for _, shard := range previous.Shards {
+		release(shard.Block)
 	}
 }
 
@@ -1669,7 +1694,7 @@ func maxKnownShardSeqno(key storage.BlockHistoryKey, states ...*storage.CurrentS
 		}
 		for _, shard := range current.Shards {
 			shardKey := storage.ShardKeyFromBlock(shard.Block)
-			if shardKey.Workchain != key.Workchain || !shardIntersects(shardKey, storage.ShardKey(key)) {
+			if shardKey.Workchain != key.Workchain || !blockproof.ShardIntersects(shardKey, storage.ShardKey(key)) {
 				continue
 			}
 			if !ok || shard.Block.SeqNo > max {

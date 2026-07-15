@@ -28,6 +28,11 @@ func (n *Node) publishNonfinalDownloadedBlock(downloaded *DownloadedBlock, kind 
 		Root:      downloaded.Block,
 		BlockData: downloaded.BlockBOC,
 		Meta:      downloaded.Meta,
+		// Extracted at broadcast/download decode; carrying it over lets the
+		// non-final store skip re-parsing the block. The store decides by
+		// artifact kind whether the update still needs merkle validation
+		// (unsigned candidates do).
+		StateUpdate: downloaded.StateUpdate,
 	}, kind); err != nil {
 		n.log.Debug().
 			Err(err).

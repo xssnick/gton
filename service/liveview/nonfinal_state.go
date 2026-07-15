@@ -10,9 +10,10 @@ import (
 )
 
 type nonfinalParsedStateUpdate struct {
-	root   *cell.Cell
-	meta   *storage.BlockMeta
-	update *cell.Cell
+	root                 *cell.Cell
+	meta                 *storage.BlockMeta
+	update               *cell.Cell
+	validatedStateUpdate *cell.Cell
 }
 
 func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.LazyCellLoader) (*storage.BlockState, *storage.BlockMeta, storage.StateCellRecords, error) {
@@ -34,7 +35,12 @@ func nonfinalStateFromSnapshot(block storage.LiveBlockArtifacts, loader cell.Laz
 	return state, block.Meta.Clone(), records, nil
 }
 
-func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedStateUpdate, error) {
+// nonfinalParseStateUpdate extracts and validates the block's Merkle state
+// update. updateTrusted marks a publisher-provided StateUpdate as coming from
+// a signed, hash-anchored block whose update needs no standalone validation.
+// validatedStateUpdate is an exact immutable cell previously accepted here;
+// a different cell is always validated independently.
+func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts, updateTrusted bool, validatedStateUpdate *cell.Cell) (nonfinalParsedStateUpdate, error) {
 	root := block.Root
 	if root == nil && len(block.BlockData) > 0 {
 		parsed, err := ParseTrustedBlockBOC(block.Block, block.BlockData)
@@ -53,7 +59,8 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 	root = normalized
 
 	meta := block.Meta
-	var stateUpdate *cell.Cell
+	stateUpdate := block.StateUpdate
+	updateValidated := stateUpdate != nil && updateTrusted
 	if meta == nil {
 		parsed, err := storage.ParseVerifiedBlockCell(block.Block, root)
 		if err != nil {
@@ -63,7 +70,9 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 		if err != nil {
 			return nonfinalParsedStateUpdate{}, err
 		}
-		stateUpdate = parsed.StateUpdate
+		if stateUpdate == nil {
+			stateUpdate = parsed.StateUpdate
+		}
 	}
 	if meta == nil || len(meta.StateRootHash) != 32 {
 		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
@@ -79,14 +88,23 @@ func nonfinalParseStateUpdate(block storage.LiveBlockArtifacts) (nonfinalParsedS
 	if stateUpdate == nil {
 		return nonfinalParsedStateUpdate{root: root, meta: meta.Clone()}, nil
 	}
-	if err = cell.ValidateMerkleUpdate(stateUpdate); err != nil {
-		return nonfinalParsedStateUpdate{}, fmt.Errorf("validate non-final state update: %w", err)
+	validationMemoMatches := stateUpdate == validatedStateUpdate
+	if !updateValidated && !validationMemoMatches {
+		if err = cell.ValidateMerkleUpdate(stateUpdate); err != nil {
+			return nonfinalParsedStateUpdate{}, fmt.Errorf("validate non-final state update: %w", err)
+		}
+		validationMemoMatches = true
 	}
 
+	var validationMemo *cell.Cell
+	if validationMemoMatches {
+		validationMemo = stateUpdate
+	}
 	return nonfinalParsedStateUpdate{
-		root:   root,
-		meta:   meta.Clone(),
-		update: stateUpdate,
+		root:                 root,
+		meta:                 meta.Clone(),
+		update:               stateUpdate,
+		validatedStateUpdate: validationMemo,
 	}, nil
 }
 

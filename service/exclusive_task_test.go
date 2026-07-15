@@ -31,7 +31,7 @@ func TestExclusiveServiceTaskBlocksMigrationDuringSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin migration after serialization release: %v", err)
 	}
-	if !svc.cellGenerationMigrationActive() {
+	if !svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
 		t.Fatal("migration task is not active")
 	}
 	if err = canStartExclusiveServiceTaskForTest(t, svc, exclusiveServiceTaskArchiveTTLGC); !errors.Is(err, errCellGenerationMigrationRunning) {

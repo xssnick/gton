@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/storage/pebblestore"
@@ -42,10 +43,63 @@ func newTestNode(tb testing.TB) *Node {
 	return node
 }
 
+func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
+	if sub.node == nil {
+		sub.node = &Node{}
+	}
+	if sub.node.runCtx == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		sub.node.runCtx = ctx
+	}
+	if sub.node.pool == nil {
+		sub.node.pool = &peerPool{peers: map[PeerID]*pooledPeer{}}
+	}
+
+	return sub
+}
+
+func (s *overlaySubscription) inactiveExpiresAt() (time.Time, bool) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if !s.inactive || s.inactiveDeleteAt.IsZero() {
+		return time.Time{}, false
+	}
+	return s.inactiveDeleteAt, true
+}
+
+func (s *overlaySubscription) aliveNeighbourPeers(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
+	candidates := s.neighbourPeerSnapshots()
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	alive := candidates[:0]
+	for _, peer := range candidates {
+		if !peer.isAliveKnownOverlayPeer(now) {
+			continue
+		}
+		if !peerEligible(peer.statsSnapshot(), requiredVersionMajor, requiredVersionMinor) {
+			continue
+		}
+		alive = append(alive, peer)
+	}
+
+	return s.orderPreferredPeers(alive, requiredVersionMajor, requiredVersionMinor)
+}
+
 type testAcceptBroadcastSignatureVerifier struct{}
 
 func (testAcceptBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(context.Context, BlockBroadcastSignatureCheck) error {
 	return nil
+}
+
+func (testAcceptBroadcastSignatureVerifier) CheckBlockFinalitySignatures(_ context.Context, req BlockFinalitySignatureCheck) (*BlockFinalitySignatureCheckResult, error) {
+	return &BlockFinalitySignatureCheckResult{
+		SignaturesVerifiedKey: []byte("test-finality"),
+	}, nil
 }
 
 func (testAcceptBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(_ context.Context, req ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {
@@ -61,6 +115,10 @@ type testRejectBroadcastSignatureVerifier struct {
 
 func (v testRejectBroadcastSignatureVerifier) CheckBlockBroadcastSignatures(context.Context, BlockBroadcastSignatureCheck) error {
 	return v.err
+}
+
+func (v testRejectBroadcastSignatureVerifier) CheckBlockFinalitySignatures(context.Context, BlockFinalitySignatureCheck) (*BlockFinalitySignatureCheckResult, error) {
+	return nil, v.err
 }
 
 func (v testRejectBroadcastSignatureVerifier) ValidateShardDescriptionBroadcast(context.Context, ShardDescriptionSignatureCheck) (*ShardBlockDescription, error) {

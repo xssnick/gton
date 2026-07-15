@@ -98,7 +98,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			if downloaded.ID.Workchain != target.Workchain || downloaded.ID.Shard != target.Shard || downloaded.ID.SeqNo > target.SeqNo || downloaded.ID.SeqNo <= prev.SeqNo {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             fmt.Errorf("%w: next chain block after %s returned %s for target %s", errShardCatchUpNeedsSnapshot, storage.FormatBlockRef(prev), downloaded.BlockRef(), storage.FormatBlockRef(target)),
-					source:          syncBlockSourceForDownloadedBlock(SyncBlockSourceNextBlock, downloaded),
+					source:          syncBlockSourceForKind(SyncBlockSourceNextBlock, downloaded.Kind),
 					downloadElapsed: downloadElapsed,
 				})
 				return
@@ -109,7 +109,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			if err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             err,
-					source:          syncBlockSourceForDownloadedBlock(SyncBlockSourceNextBlock, downloaded),
+					source:          syncBlockSourceForKind(SyncBlockSourceNextBlock, downloaded.Kind),
 					downloadElapsed: downloadElapsed,
 					prepareElapsed:  time.Since(prepareStarted),
 				})
@@ -119,7 +119,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			if err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             err,
-					source:          syncBlockSourceForVerifiedBlock(SyncBlockSourceNextBlock, verified),
+					source:          syncBlockSourceForKind(SyncBlockSourceNextBlock, verified.Kind),
 					downloadElapsed: downloadElapsed,
 					prepareElapsed:  time.Since(prepareStarted),
 				})
@@ -130,7 +130,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			item := shardStateDownload{
 				prev:            prev,
 				block:           prepared,
-				source:          syncBlockSourceForVerifiedBlock(SyncBlockSourceNextBlock, verified),
+				source:          syncBlockSourceForKind(SyncBlockSourceNextBlock, verified.Kind),
 				downloadElapsed: downloadElapsed,
 				prepareElapsed:  prepared.PrepareElapsed,
 			}
@@ -258,7 +258,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 					prepareElapsed:  prepareElapsed,
 				}
 				if err == nil {
-					item.source = syncBlockSourceForVerifiedBlock(source, verified)
+					item.source = syncBlockSourceForKind(source, verified.Kind)
 				} else {
 					item.source = source
 				}

@@ -87,7 +87,7 @@ func (s *appliedStateSet) completeCheckpoint(checkpoint appliedStateCheckpoint) 
 
 	for idx, key := range checkpoint.keys {
 		if entry, ok := s.states[key]; ok {
-			if len(checkpoint.versions) == len(checkpoint.keys) && entry.version != checkpoint.versions[idx] {
+			if entry.version != checkpoint.versions[idx] {
 				continue
 			}
 			s.artifactBytes -= entry.artifact.bytes
@@ -216,7 +216,7 @@ func cloneServedBlockFullSharedPayload(block *storage.ServedBlockFull) *storage.
 		return nil
 	}
 	return &storage.ServedBlockFull{
-		ID:                     block.ID,
+		ID:                     cloneServiceBlockID(block.ID),
 		Proof:                  block.Proof,
 		Block:                  block.Block,
 		Meta:                   block.Meta.Clone(),
@@ -229,5 +229,12 @@ func cloneServedBlockLinks(links []storage.ServedBlockLink) []storage.ServedBloc
 	if len(links) == 0 {
 		return nil
 	}
-	return append([]storage.ServedBlockLink(nil), links...)
+	cloned := make([]storage.ServedBlockLink, len(links))
+	for i := range links {
+		cloned[i] = storage.ServedBlockLink{
+			Prev: cloneServiceBlockID(links[i].Prev),
+			Next: cloneServiceBlockID(links[i].Next),
+		}
+	}
+	return cloned
 }

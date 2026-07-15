@@ -38,7 +38,7 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 		t.Fatalf("save fixture block: %v", err)
 	}
 
-	prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID, false)
+	prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID)
 	if err != nil {
 		t.Fatalf("load stored block: %v", err)
 	}
@@ -50,6 +50,45 @@ func TestLoadStoredBlockForApplyLoadsProof(t *testing.T) {
 	}
 	if prepared.IsLink != downloaded.IsLink {
 		t.Fatalf("stored proof link flag = %v, want %v", prepared.IsLink, downloaded.IsLink)
+	}
+}
+
+type storedBlockForApplyTestStore struct {
+	tnstore.Storage
+	full               *tnstore.ServedBlockFull
+	saveBlockMetaCalls int
+}
+
+func (s *storedBlockForApplyTestStore) BlockFull(context.Context, ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
+	return s.full, nil
+}
+
+func (s *storedBlockForApplyTestStore) SaveBlockMeta(*tnstore.BlockMeta) error {
+	s.saveBlockMetaCalls++
+	return nil
+}
+
+func BenchmarkLoadStoredBlockForApply(b *testing.B) {
+	downloaded := mustLoadFixtureDownloadedBlock(b)
+	store := &storedBlockForApplyTestStore{
+		full: &tnstore.ServedBlockFull{
+			ID:     downloaded.ID,
+			Block:  downloaded.BlockBOC,
+			Proof:  downloaded.ProofBOC,
+			Meta:   downloaded.Meta,
+			IsLink: downloaded.IsLink,
+		},
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		prepared, err := loadStoredBlockForApply(context.Background(), store, downloaded.ID)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if prepared.StateUpdate == nil {
+			b.Fatal("stored block state update is missing")
+		}
 	}
 }
 
@@ -83,10 +122,11 @@ func TestApplyBlockFromFixture(t *testing.T) {
 		t.Fatalf("prepare block: %v", err)
 	}
 
-	next, err := ApplyBlock(current, prepared)
+	applied, err := applyBlockWithPreviousStates([]*tnstore.BlockState{current}, prepared, nil)
 	if err != nil {
 		t.Fatalf("apply block: %v", err)
 	}
+	next := applied.Next
 
 	if !next.Block.Equals(&downloaded.ID) {
 		t.Fatalf("unexpected next block id %s", tnstore.FormatBlockRef(next.Block))
@@ -105,40 +145,66 @@ func TestApplyBlockFromFixture(t *testing.T) {
 	}
 }
 
-func TestPrepareBlockDataRejectsBlockIDHashMismatches(t *testing.T) {
+func TestLoadStoredBlockForApplyRejectsRootHashMismatch(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
-
-	tests := []struct {
-		name   string
-		mutate func(*ton.BlockIDExt)
-	}{
-		{
-			name: "root hash mismatch",
-			mutate: func(id *ton.BlockIDExt) {
-				id.RootHash = append([]byte(nil), id.RootHash...)
-				id.RootHash[0] ^= 0x01
-			},
-		},
-		{
-			name: "file hash mismatch",
-			mutate: func(id *ton.BlockIDExt) {
-				id.FileHash = append([]byte(nil), id.FileHash...)
-				id.FileHash[0] ^= 0x01
-			},
+	id := downloaded.ID
+	id.RootHash = append([]byte(nil), id.RootHash...)
+	id.RootHash[0] ^= 0x01
+	meta := downloaded.Meta.Clone()
+	meta.ID = id
+	store := &storedBlockForApplyTestStore{
+		full: &tnstore.ServedBlockFull{
+			ID:    id,
+			Block: downloaded.BlockBOC,
+			Meta:  meta,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			id := downloaded.ID
-			id.RootHash = append([]byte(nil), id.RootHash...)
-			id.FileHash = append([]byte(nil), id.FileHash...)
-			tt.mutate(&id)
+	_, err := loadStoredBlockForApply(context.Background(), store, id)
+	if err == nil || !strings.Contains(err.Error(), "root hash mismatch") {
+		t.Fatalf("load stored block error = %v, want root hash mismatch", err)
+	}
+}
 
-			if _, err := prepareBlockData("fixture block", id, downloaded.BlockBOC); err == nil {
-				t.Fatal("block data with mismatched BlockID hash was accepted")
-			}
-		})
+func TestLoadStoredBlockForApplyDoesNotReverifyFileHashOrRewriteMeta(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	id := downloaded.ID
+	id.FileHash = append([]byte(nil), id.FileHash...)
+	id.FileHash[0] ^= 0x01
+	meta := downloaded.Meta.Clone()
+	meta.ID = id
+	store := &storedBlockForApplyTestStore{
+		full: &tnstore.ServedBlockFull{
+			ID:     id,
+			Block:  downloaded.BlockBOC,
+			Proof:  downloaded.ProofBOC,
+			Meta:   meta,
+			IsLink: downloaded.IsLink,
+		},
+	}
+
+	prepared, err := loadStoredBlockForApply(context.Background(), store, id)
+	if err != nil {
+		t.Fatalf("load stored block: %v", err)
+	}
+	if store.saveBlockMetaCalls != 0 {
+		t.Fatalf("SaveBlockMeta calls = %d, want 0", store.saveBlockMetaCalls)
+	}
+	if prepared.Meta == nil || !prepared.Meta.ID.Equals(&id) {
+		t.Fatalf("prepared meta ID = %v, want %s", prepared.Meta, tnstore.FormatBlockRef(id))
+	}
+	if prepared.StateUpdate == nil || prepared.StateUpdateToCells.Len() == 0 {
+		t.Fatal("stored block state update was not prepared")
+	}
+}
+
+func TestPrepareDownloadedBlockForApplyRejectsUnverifiedRootHash(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	downloaded.VerifiedRootHash = false
+
+	_, err := prepareDownloadedBlockForApply(*downloaded)
+	if err == nil || !strings.Contains(err.Error(), "root hash is not verified") {
+		t.Fatalf("prepare downloaded block error = %v, want unverified root hash", err)
 	}
 }
 
@@ -199,7 +265,7 @@ func TestApplyBlockRejectsWrongCurrentState(t *testing.T) {
 		t.Fatalf("prepare block: %v", err)
 	}
 
-	if _, err := ApplyBlock(current, prepared); err == nil {
+	if _, err := applyBlockWithPreviousStates([]*tnstore.BlockState{current}, prepared, nil); err == nil {
 		t.Fatal("expected apply block to reject wrong current state")
 	}
 }
@@ -625,7 +691,7 @@ func TestArchiveStateCellOverlayCarriesCellsAcrossMerkleUpdates(t *testing.T) {
 	update2 := mustMerkleUpdateCell(t, mustProofBody(t, state1, 1), mustProofBody(t, state2, 1))
 
 	var baseLoads int
-	overlay := newArchiveStateCellOverlay(func(hash cell.Hash) (*cell.Cell, error) {
+	overlay := newStateCellWindowCache(func(hash cell.Hash) (*cell.Cell, error) {
 		if hash != stable.HashKey() {
 			return nil, fmt.Errorf("unexpected base load %x", hash[:])
 		}
@@ -682,7 +748,7 @@ func TestArchiveStateCellOverlayRetriesPendingCheckpointCells(t *testing.T) {
 	state1 := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	state2 := cell.BeginCell().MustStoreUInt(0x12, 8).EndCell()
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	update1 := mustMerkleUpdateCell(t, state0, state1)
 	applied1, err := overlay.applyPreparedMerkleUpdate([]*tnstore.BlockState{{Cell: state0}}, update1, mustPreparedStateUpdateCells(t, update1), nil, 0)
 	if err != nil {
@@ -717,7 +783,7 @@ func TestArchiveStateCellOverlayRetriesPendingCheckpointCells(t *testing.T) {
 func TestServiceStateCellLoaderKeepsArchiveCheckpointCellsVisible(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 	checkpoint := overlay.beginCheckpoint()
 	if checkpoint == nil {
@@ -857,10 +923,60 @@ func TestStateCellWindowCacheByteSizeTracksActiveAndPendingCells(t *testing.T) {
 	}
 }
 
+func TestLoadStateCellEncodedCachesUsesNewestPendingFirst(t *testing.T) {
+	var hash cell.Hash
+	hash[0] = 1
+	olderCell := cell.BeginCell().MustStoreUInt(1, 8).EndCell()
+	newerCell := cell.BeginCell().MustStoreUInt(2, 8).EndCell()
+
+	older := newStateCellEncodedCache(1)
+	older.setRecordLocked(hash, []byte{1})
+	older.decoded[0].Store(olderCell)
+	newer := newStateCellEncodedCache(1)
+	newer.setRecordLocked(hash, []byte{1})
+	newer.decoded[0].Store(newerCell)
+
+	loaded, err := loadStateCellEncodedCaches(nil, []*stateCellEncodedCache{older, newer}, hash, nil)
+	if err != nil {
+		t.Fatalf("load pending cell: %v", err)
+	}
+	if loaded != newerCell {
+		t.Fatal("pending cache lookup did not prefer the newest cache")
+	}
+}
+
+func TestStateCellWindowAdoptRecordsPreservesNewestLookupPriority(t *testing.T) {
+	var hash cell.Hash
+	hash[0] = 1
+	olderCell := cell.BeginCell().MustStoreUInt(1, 8).EndCell()
+	newerCell := cell.BeginCell().MustStoreUInt(2, 8).EndCell()
+
+	older := newStateCellEncodedCache(1)
+	older.setRecordLocked(hash, []byte{1})
+	older.decoded[0].Store(olderCell)
+	newer := newStateCellEncodedCache(1)
+	newer.setRecordLocked(hash, []byte{1})
+	newer.decoded[0].Store(newerCell)
+
+	source := newStateCellWindowCache(nil)
+	source.active = newer
+	source.pending = []*stateCellEncodedCache{older}
+	destination := newStateCellWindowCache(nil)
+	destination.adoptRecordsFrom(source)
+
+	loaded, err := destination.loader()(hash)
+	if err != nil {
+		t.Fatalf("load adopted cell: %v", err)
+	}
+	if loaded != newerCell {
+		t.Fatal("adopted cache lookup did not prefer the newest active source")
+	}
+}
+
 func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 	releasedRoot := cell.BeginCell().MustStoreUInt(0x51, 8).EndCell()
 	cache := newStateCellEncodedCache(1)
-	if err := cache.addRecords(mustPreparedReachableStateCells(t, releasedRoot), nil); err != nil {
+	if err := cache.stageRecords(mustPreparedReachableStateCells(t, releasedRoot), nil).enqueue(); err != nil {
 		t.Fatalf("add source records: %v", err)
 	}
 
@@ -874,7 +990,7 @@ func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 
 	baseRoot := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
 	baseCache := newStateCellEncodedCache(1)
-	if err := baseCache.addRecords(mustPreparedReachableStateCells(t, baseRoot), nil); err != nil {
+	if err := baseCache.stageRecords(mustPreparedReachableStateCells(t, baseRoot), nil).enqueue(); err != nil {
 		t.Fatalf("add base records: %v", err)
 	}
 
@@ -902,8 +1018,8 @@ func TestStateCellWindowLoaderUsesLiveSources(t *testing.T) {
 func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
 
-	base := newArchiveStateCellOverlay(nil)
-	overlay := newArchiveStateCellOverlay(nil)
+	base := newStateCellWindowCache(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
@@ -926,7 +1042,7 @@ func TestArchiveStateCellOverlayLoaderReleasesRecordsToBase(t *testing.T) {
 func TestArchiveStateCellOverlayLoaderDropsReleasedRecordsWithoutBase(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(mustPreparedReachableStateCells(t, root))
 
 	loader := overlay.loader()
@@ -945,7 +1061,7 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 	first[0] = 1
 	second[0] = 2
 
-	overlay := newArchiveStateCellOverlay(nil)
+	overlay := newStateCellWindowCache(nil)
 	overlay.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: []byte{1, 2, 3, 4},
 	}))
@@ -973,12 +1089,12 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 
 func TestArchiveStateCellOverlayAdoptsWindowCellsOnEmission(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
-	windowCells := newArchiveStateCellOverlay(nil)
-	if err := windowCells.rememberPrepared(root, mustPreparedReachableStateCells(t, root), nil, 0); err != nil {
+	windowCells := newStateCellWindowCache(nil)
+	if err := windowCells.rememberApplied(root, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember window cells: %v", err)
 	}
 
-	checkpointCells := newArchiveStateCellOverlay(nil)
+	checkpointCells := newStateCellWindowCache(nil)
 	if got := checkpointCells.byteSize(); got != 0 {
 		t.Fatalf("checkpoint overlay starts with %d bytes, want 0", got)
 	}
@@ -998,9 +1114,9 @@ func TestArchiveStateCellOverlayAdoptDoesNotDedupeRecords(t *testing.T) {
 		hash: []byte{1, 2, 3},
 	})
 
-	windowCells := newArchiveStateCellOverlay(nil)
+	windowCells := newStateCellWindowCache(nil)
 	windowCells.addPreparedRecords(records)
-	checkpointCells := newArchiveStateCellOverlay(nil)
+	checkpointCells := newStateCellWindowCache(nil)
 	checkpointCells.addPreparedRecords(records)
 
 	checkpointCells.adoptRecordsFrom(windowCells)
@@ -1023,6 +1139,90 @@ func TestStateCellWindowLazyLoadMetricsCountHits(t *testing.T) {
 	}
 	if got := lazyCellLoadMetricCount(counters.snapshot(), tnstore.LazyCellLoadLayerStateWindow); got != 1 {
 		t.Fatalf("state window lazy loads = %d, want 1", got)
+	}
+}
+
+func TestStateCellWindowCacheMemoizesDecodedCells(t *testing.T) {
+	child := cell.BeginCell().MustStoreUInt(0x71, 8).EndCell()
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+
+	window := newStateCellWindowCache(nil)
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, root)); err != nil {
+		t.Fatalf("add prepared records: %v", err)
+	}
+
+	loader := window.loader()
+	first, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load root: %v", err)
+	}
+	second, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("reload root: %v", err)
+	}
+	if second != first {
+		t.Fatal("repeated window loads should return the memoized decoded cell")
+	}
+
+	// The memoized cell still resolves refs through the window cache.
+	loadedChild, err := second.PeekRef(0)
+	if err != nil {
+		t.Fatalf("peek memoized root ref: %v", err)
+	}
+	if loadedChild, err = loadedChild.Prewarm(); err != nil {
+		t.Fatalf("prewarm memoized root ref: %v", err)
+	}
+	if loadedChild.HashKey() != child.HashKey() {
+		t.Fatal("memoized root ref hash mismatch")
+	}
+
+	// Re-adding identical records is deduplicated and keeps the memoized cell.
+	if err = window.addPreparedRecords(mustPreparedReachableStateCells(t, root)); err != nil {
+		t.Fatalf("re-add prepared records: %v", err)
+	}
+	third, err := loader(root.HashKey())
+	if err != nil {
+		t.Fatalf("load root after identical re-add: %v", err)
+	}
+	if third != first {
+		t.Fatal("identical record re-add should keep the memoized cell")
+	}
+}
+
+func TestStateCellEncodedCacheMemoInvalidatedOnRecordReplacement(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x61, 8).EndCell()
+
+	cache := newStateCellEncodedCache(1)
+	if err := cache.stageRecords(mustPreparedReachableStateCells(t, root), nil).enqueue(); err != nil {
+		t.Fatalf("add records: %v", err)
+	}
+
+	first, err := cache.loadWith(root.HashKey(), nil)
+	if err != nil {
+		t.Fatalf("load record: %v", err)
+	}
+	if again, err := cache.loadWith(root.HashKey(), nil); err != nil || again != first {
+		t.Fatalf("repeated load = (%v, %v), want memoized cell", again, err)
+	}
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	idx := cache.index[root.HashKey()]
+	if cache.decoded[idx].Load() != first {
+		t.Fatal("decoded slot does not hold the memoized cell")
+	}
+	if cache.setRecordLocked(root.HashKey(), cache.records[idx].Data) {
+		t.Fatal("identical record replacement should be a no-op")
+	}
+	if cache.decoded[idx].Load() != first {
+		t.Fatal("identical record replacement should keep the memoized cell")
+	}
+	if !cache.setRecordLocked(root.HashKey(), []byte{0xde, 0xad}) {
+		t.Fatal("record replacement should report a change")
+	}
+	if cache.decoded[idx].Load() != nil {
+		t.Fatal("record replacement should invalidate the memoized cell")
 	}
 }
 

@@ -52,6 +52,11 @@ func decodeBlockIDFromHashes(workchain int32, shard int64, seqno uint32, data []
 	}, nil
 }
 
+// blockMetaMinEncodedLen is the fixed header of an encoded block meta:
+// version byte, flags word, gen utime, start/end lt, the two hash length
+// bytes, the masterchain ref flag byte and the prev/next ref count bytes.
+const blockMetaMinEncodedLen = 1 + 4 + 4 + 8 + 8 + 1 + 1 + 1 + 1 + 1
+
 func encodeBlockMeta(meta *storage.BlockMeta) []byte {
 	if meta == nil {
 		return nil
@@ -81,8 +86,22 @@ func encodeBlockMeta(meta *storage.BlockMeta) []byte {
 	return buf
 }
 
+// decodeBlockMetaFlags reads just the flags word from an encoded block meta
+// without decoding the whole record. It applies the same header validation
+// (minimal payload length and version byte) as decodeBlockMeta; the flags
+// live in the fixed header, so deeper payload corruption is not detected.
+func decodeBlockMetaFlags(data []byte) (storage.BlockMetaFlags, error) {
+	if len(data) < blockMetaMinEncodedLen {
+		return 0, fmt.Errorf("block meta payload too small")
+	}
+	if data[0] != blockMetaVersion {
+		return 0, fmt.Errorf("unsupported block meta version %d", data[0])
+	}
+	return storage.BlockMetaFlags(binary.BigEndian.Uint32(data[1:5])), nil
+}
+
 func decodeBlockMeta(id ton.BlockIDExt, data []byte) (*storage.BlockMeta, error) {
-	if len(data) < 1+4+4+8+8+1+1+1+1+1 {
+	if len(data) < blockMetaMinEncodedLen {
 		return nil, fmt.Errorf("block meta payload too small")
 	}
 	if data[0] != blockMetaVersion {
@@ -333,13 +352,13 @@ func readMigrationProgressBlockState(data []byte, pos int) (storage.BlockState, 
 }
 
 func encodeCellRecord(record *storage.CellRecord) []byte {
-	buf := make([]byte, cellRecordEncodedLen(record.D2, record.Refs))
-	encodeCellRecordTo(buf, record)
+	size, slowRefs, compactRefs := cellRecordEncodedLen(record.D2, record.Refs)
+	buf := make([]byte, size)
+	encodeCellRecordTo(buf, record, slowRefs, compactRefs)
 	return buf
 }
 
-func encodeCellRecordTo(buf []byte, record *storage.CellRecord) {
-	slowRefs, compactRefs := cellRecordCompactRefLayout(record.Refs)
+func encodeCellRecordTo(buf []byte, record *storage.CellRecord, slowRefs byte, compactRefs bool) {
 	pos := 0
 	d1 := record.D1
 	if compactRefs {
@@ -373,7 +392,7 @@ func encodeCellRecordTo(buf []byte, record *storage.CellRecord) {
 	}
 }
 
-func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) int {
+func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) (int, byte, bool) {
 	size := 2 + int(d2/2+d2%2)
 	slowRefs, compactRefs := cellRecordCompactRefLayout(refs)
 	if compactRefs {
@@ -386,7 +405,7 @@ func cellRecordEncodedLen(d2 byte, refs []storage.CellRefRecord) int {
 		}
 		size += 1 + len(ref.Hashes) + len(ref.Depths)
 	}
-	return size
+	return size, slowRefs, compactRefs
 }
 
 func cellRecordRefCommon(ref storage.CellRefRecord) bool {
@@ -673,7 +692,8 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 	if len(data) < 1+1+1+8 {
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
-	if data[0] != persistentStateVersion {
+	version := data[0]
+	if version != persistentStateVersion && version != persistentStateCellsCountVersion {
 		return nil, fmt.Errorf("persistent state file version mismatch")
 	}
 	pos := 1
@@ -690,7 +710,11 @@ func decodePersistentStateFileRecord(data []byte) (*persistentStateFileRecord, e
 	}
 	pos = next
 
-	if len(data)-pos != 8 {
+	tailSize := 8
+	if version == persistentStateCellsCountVersion {
+		tailSize += 8
+	}
+	if len(data)-pos != tailSize {
 		return nil, fmt.Errorf("persistent state file payload truncated")
 	}
 	size := int64(binary.BigEndian.Uint64(data[pos : pos+8]))

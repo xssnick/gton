@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -27,7 +28,7 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 	var blockProof *cell.Cell
 	var stateRoot *cell.Cell
 	if query.Mode&1 != 0 {
-		fragments, err := s.blockFragments(ctx, *query.ID)
+		fragments, err := s.store.BlockFragments(ctx, *query.ID)
 		if err != nil {
 			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
 		}
@@ -44,7 +45,7 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 	proofRoot := stateRoot
 	var proofBuilder *cell.MerkleProofBuilder
 	if query.Mode&1 != 0 {
-		proofBuilder = newLiteServerProofBuilder(stateRoot)
+		proofBuilder = blockproof.NewProofBuilder(stateRoot)
 		proofRoot = proofBuilder.Root()
 	}
 
@@ -97,7 +98,7 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 	var blockProof *cell.Cell
 	var stateRoot *cell.Cell
 	if query.Mode&1 != 0 {
-		fragments, err := s.blockFragments(ctx, *query.ID)
+		fragments, err := s.store.BlockFragments(ctx, *query.ID)
 		if err != nil {
 			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
 		}
@@ -114,7 +115,7 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 	proofRoot := stateRoot
 	var proofBuilder *cell.MerkleProofBuilder
 	if query.Mode&1 != 0 {
-		proofBuilder = newLiteServerProofBuilder(stateRoot)
+		proofBuilder = blockproof.NewProofBuilder(stateRoot)
 		proofRoot = proofBuilder.Root()
 	}
 
@@ -173,7 +174,7 @@ func dispatchQueueFromStateRoot(stateRoot *cell.Cell) (*cell.AugmentedDictionary
 		return nil, err
 	}
 
-	state, err := visitShardStateHeader(loader)
+	state, err := blockproof.VisitShardStateHeader(loader)
 	if err != nil {
 		return nil, err
 	}

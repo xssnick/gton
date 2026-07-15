@@ -2,10 +2,12 @@ package externalmsg
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/liveview"
@@ -15,10 +17,15 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
-	"github.com/xssnick/tonutils-go/tvm/tuple"
 )
 
 const maxBOCCells = 1 << 17
+
+// blockContextCacheLimit bounds the prepared tvm block-context cache. A
+// context is keyed by the (account block, master block) pair the checker
+// validates against, so the live window needs one entry per current shard
+// block plus the masterchain block itself.
+const blockContextCacheLimit = 8
 
 var ErrRejected = errors.New("external message was not accepted")
 
@@ -37,6 +44,23 @@ type Checker struct {
 	log   zerolog.Logger
 	store Store
 	tvm   *tvm.TVM
+
+	mu       sync.Mutex
+	contexts map[blockContextKey]*list.Element
+	order    *list.List
+}
+
+// blockContextKey identifies the execution context of one accept check: the
+// account shard block provides the block time and logical time, the master
+// block provides the config epoch, prev-blocks info and global libraries.
+type blockContextKey struct {
+	account [32]byte
+	master  [32]byte
+}
+
+type blockContextEntry struct {
+	key   blockContextKey
+	block *tvm.BlockContext
 }
 
 type CheckResult struct {
@@ -61,9 +85,11 @@ func NewChecker(opts Options) (*Checker, error) {
 	}
 
 	return &Checker{
-		log:   log,
-		store: opts.Store,
-		tvm:   machine,
+		log:      log,
+		store:    opts.Store,
+		tvm:      machine,
+		contexts: map[blockContextKey]*list.Element{},
+		order:    list.New(),
 	}, nil
 }
 
@@ -81,14 +107,14 @@ func (c *Checker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, ms
 		return CheckResult{}, err
 	}
 
-	stateFragments, err := c.blockFragments(ctx, blocks.Account)
+	stateFragments, err := c.store.BlockFragments(ctx, blocks.Account)
 	if err != nil {
 		return CheckResult{}, err
 	}
 
 	masterFragments := stateFragments
 	if !blockIDEqual(blocks.Account, blocks.Master) {
-		masterFragments, err = c.blockFragments(ctx, blocks.Master)
+		masterFragments, err = c.store.BlockFragments(ctx, blocks.Master)
 		if err != nil {
 			return CheckResult{}, err
 		}
@@ -101,17 +127,6 @@ func (c *Checker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, ms
 		return CheckResult{}, err
 	}
 
-	var accountCode *cell.Cell
-	var accountLibraries *cell.Dictionary
-	if accountState.IsValid && accountState.StateInit != nil {
-		accountCode = accountState.StateInit.Code
-		accountLibraries = accountState.StateInit.Lib
-	}
-
-	config, err := masterFragments.RunMethodConfig(header.GenUTime, accountCode)
-	if err != nil {
-		return CheckResult{}, err
-	}
 	limits, err := masterFragments.ExternalMessageLimits()
 	if err != nil {
 		return CheckResult{}, err
@@ -120,31 +135,12 @@ func (c *Checker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, ms
 		return CheckResult{}, err
 	}
 
-	libraries, err := masterFragments.RunMethodLibraries(accountLibraries)
+	block, err := c.blockContext(blocks, header, masterFragments)
 	if err != nil {
 		return CheckResult{}, err
 	}
 
-	unpacked, _ := config.Unpacked.(tuple.Tuple)
-	machine, err := c.tvm.WithGlobalVersion(config.GlobalVersion)
-	if err != nil {
-		return CheckResult{}, err
-	}
-
-	checkConfig := tvm.CheckExternalMessageAcceptedConfig{
-		Now:                 header.GenUTime,
-		BlockLT:             int64(header.GenLT),
-		LogicalTime:         int64(header.GenLT + 2),
-		RandSeed:            randSeed(),
-		ConfigRoot:          config.Root,
-		PrevBlocks:          config.PrevBlocks,
-		UnpackedConfig:      unpacked,
-		DuePayment:          liveview.AccountDuePayment(*accountState),
-		PrecompiledGasUsage: config.Precompiled,
-		Libraries:           libraries,
-	}
-
-	accepted, err := machine.CheckExternalMessageAccepted(shardAccount, accountState, msgCell, msg, checkConfig)
+	accepted, err := c.checkAccepted(block, shardAccount, accountState, msgCell, msg, header)
 	if err != nil {
 		return CheckResult{}, fmt.Errorf("%w: cannot run message on account: %w", ErrRejected, err)
 	}
@@ -156,6 +152,76 @@ func (c *Checker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, ms
 		Message: msg,
 		Blocks:  blocks,
 	}, nil
+}
+
+func (c *Checker) checkAccepted(block *tvm.BlockContext, shardAccount *tlb.ShardAccount, accountState *tlb.AccountState, msgCell *cell.Cell, msg *tlb.ExternalMessage, header liveview.RunMethodShardHeader) (bool, error) {
+	account, err := tvm.PrepareParsedAccount(shardAccount, accountState, msg.DstAddr)
+	if err != nil {
+		return false, err
+	}
+	message, err := tvm.PrepareParsedMessage(msgCell, &tlb.Message{
+		MsgType: tlb.MsgTypeExternalIn,
+		Msg:     msg,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return c.tvm.CheckExternalMessageAccepted(block, account, message, tvm.TransactionOptions{
+		LogicalTime: int64(header.GenLT + 2),
+		RandSeed:    randSeed(),
+	})
+}
+
+// blockContext returns the tvm execution context for the (account block,
+// master block) pair, reusing a cached context when the checker already
+// validated another message against the same pair. The context carries only
+// block-scoped state (block time, prev blocks, config epoch, global
+// libraries); everything per-account or per-message is passed per call.
+func (c *Checker) blockContext(blocks liveview.CurrentAccountBlockIDs, header liveview.RunMethodShardHeader, master *liveview.BlockView) (*tvm.BlockContext, error) {
+	key, ok := blockContextCacheKey(blocks)
+	if !ok {
+		return master.BlockContext(header.GenUTime, header.GenLT)
+	}
+
+	c.mu.Lock()
+	if element, hit := c.contexts[key]; hit {
+		c.order.MoveToFront(element)
+		block := element.Value.(*blockContextEntry).block
+		c.mu.Unlock()
+		return block, nil
+	}
+	c.mu.Unlock()
+
+	block, err := master.BlockContext(header.GenUTime, header.GenLT)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element, hit := c.contexts[key]; hit {
+		// A concurrent check built the same context; keep the published one.
+		c.order.MoveToFront(element)
+		return element.Value.(*blockContextEntry).block, nil
+	}
+	c.contexts[key] = c.order.PushFront(&blockContextEntry{key: key, block: block})
+	for len(c.contexts) > blockContextCacheLimit {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.contexts, oldest.Value.(*blockContextEntry).key)
+	}
+	return block, nil
+}
+
+func blockContextCacheKey(blocks liveview.CurrentAccountBlockIDs) (blockContextKey, bool) {
+	var key blockContextKey
+	if len(blocks.Account.RootHash) != len(key.account) || len(blocks.Master.RootHash) != len(key.master) {
+		return blockContextKey{}, false
+	}
+	copy(key.account[:], blocks.Account.RootHash)
+	copy(key.master[:], blocks.Master.RootHash)
+	return key, true
 }
 
 func ParseMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {
@@ -196,10 +262,6 @@ func (c *Checker) currentBlocks(ctx context.Context, addr *address.Address) (liv
 	return c.store.CurrentAccountBlocks(ctx, addr.Workchain(), addr.Data())
 }
 
-func (c *Checker) blockFragments(ctx context.Context, block ton.BlockIDExt) (*liveview.BlockView, error) {
-	return c.store.BlockFragments(ctx, block)
-}
-
 func blockIDEqual(a ton.BlockIDExt, b ton.BlockIDExt) bool {
 	return a.Workchain == b.Workchain &&
 		a.Shard == b.Shard &&
@@ -210,8 +272,6 @@ func blockIDEqual(a ton.BlockIDExt, b ton.BlockIDExt) bool {
 
 func randSeed() []byte {
 	var seed [32]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		return nil
-	}
+	rand.Read(seed[:])
 	return seed[:]
 }

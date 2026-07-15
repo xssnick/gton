@@ -112,7 +112,7 @@ func (m *BlockMeta) Clone() *BlockMeta {
 	}
 
 	cloned := &BlockMeta{
-		ID:                  m.ID,
+		ID:                  cloneBlockID(m.ID),
 		Flags:               m.Flags,
 		GenUTime:            m.GenUTime,
 		StartLT:             m.StartLT,
@@ -121,13 +121,19 @@ func (m *BlockMeta) Clone() *BlockMeta {
 		StateFileHash:       bytes.Clone(m.StateFileHash),
 		MasterchainRefSeqno: m.MasterchainRefSeqno,
 	}
-	if len(m.PrevRefs) > 0 {
-		cloned.PrevRefs = make([]ton.BlockIDExt, len(m.PrevRefs))
-		copy(cloned.PrevRefs, m.PrevRefs)
+	cloned.PrevRefs = cloneBlockIDs(m.PrevRefs)
+	cloned.NextRefs = cloneBlockIDs(m.NextRefs)
+	return cloned
+}
+
+func cloneBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
+	if len(blocks) == 0 {
+		return nil
 	}
-	if len(m.NextRefs) > 0 {
-		cloned.NextRefs = make([]ton.BlockIDExt, len(m.NextRefs))
-		copy(cloned.NextRefs, m.NextRefs)
+
+	cloned := make([]ton.BlockIDExt, len(blocks))
+	for i := range blocks {
+		cloned[i] = cloneBlockID(blocks[i])
 	}
 	return cloned
 }
@@ -329,37 +335,38 @@ func countBlockTransactions(root *cell.Cell) (uint32, error) {
 	if err := tlb.LoadFromCell(&shardAccounts, loader); err != nil {
 		return 0, fmt.Errorf("load shard account blocks: %w", err)
 	}
-	if shardAccounts.Accounts == nil {
+	if shardAccounts.Accounts == nil || shardAccounts.Accounts.AugmentedDictionary == nil {
 		return 0, nil
 	}
 
-	accounts, err := shardAccounts.Accounts.Range(false, false)
+	// Walk leaf values without materializing account keys and count each
+	// inline transaction dict in place: this runs on every imported block.
+	var total uint64
+	err = shardAccounts.Accounts.ForEachValueExtra(func(value, _ *cell.Slice) (bool, error) {
+		// acc_trans#5 account_addr:bits256 transactions:(HashmapAug 64 ^Transaction CurrencyCollection)
+		magic, err := value.LoadUInt(4)
+		if err != nil {
+			return false, fmt.Errorf("load account block magic: %w", err)
+		}
+		if magic != 0x5 {
+			return false, fmt.Errorf("invalid account block magic %x", magic)
+		}
+		if err = value.SkipBits(256); err != nil {
+			return false, fmt.Errorf("load account block address: %w", err)
+		}
+
+		txCount, err := value.CountInlineDictLeaves(64)
+		if err != nil {
+			return false, fmt.Errorf("load account transactions: %w", err)
+		}
+		total += uint64(txCount)
+		if total > uint64(^uint32(0)) {
+			return false, fmt.Errorf("transaction count overflows uint32")
+		}
+		return true, nil
+	})
 	if err != nil {
 		return 0, fmt.Errorf("load shard account dictionary: %w", err)
-	}
-
-	var total uint64
-	for _, kv := range accounts {
-		if err := tlb.LoadFromCell(new(tlb.CurrencyCollection), kv.Value); err != nil {
-			return 0, fmt.Errorf("load account currency collection: %w", err)
-		}
-
-		var accountBlock tlb.AccountBlock
-		if err := tlb.LoadFromCell(&accountBlock, kv.Value); err != nil {
-			return 0, fmt.Errorf("load account block: %w", err)
-		}
-		if accountBlock.Transactions == nil {
-			continue
-		}
-
-		txs, err := accountBlock.Transactions.Range(false, false)
-		if err != nil {
-			return 0, fmt.Errorf("load account transactions: %w", err)
-		}
-		total += uint64(len(txs))
-		if total > uint64(^uint32(0)) {
-			return 0, fmt.Errorf("transaction count overflows uint32")
-		}
 	}
 
 	return uint32(total), nil

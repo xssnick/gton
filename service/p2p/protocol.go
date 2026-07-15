@@ -26,6 +26,7 @@ func init() {
 	tl.Register(OutMsgQueueProofEmpty{}, "tonNode.outMsgQueueProofEmpty = tonNode.OutMsgQueueProof")
 	tl.Register(GetOutMsgQueueProof{}, "tonNode.getOutMsgQueueProof dst_shard:tonNode.shardId blocks:(vector tonNode.blockIdExt) limits:tonNode.importedMsgQueueLimits = tonNode.OutMsgQueueProof")
 	tl.Register(SendExtMessage{}, "tonNode.slave.sendExtMessage message:tonNode.externalMessage = tonNode.Success")
+	tl.Register(BlockFinalityBroadcast{}, "tonNode.blockFinalityBroadcast id:tonNode.blockIdExt signature_set:tonNode.SignatureSet = tonNode.Broadcast")
 }
 
 type OverlayBroadcastID struct {
@@ -97,6 +98,11 @@ type GetOutMsgQueueProof struct {
 
 type SendExtMessage struct {
 	Message tonnodeapi.ExternalMessage `tl:"struct"`
+}
+
+type BlockFinalityBroadcast struct {
+	ID           ton.BlockIDExt `tl:"struct"`
+	SignatureSet any            `tl:"struct boxed [tonNode.signatureSet.ordinary,tonNode.signatureSet.simplex]"`
 }
 
 func checkSimpleBroadcastDate(ts int32) bool {

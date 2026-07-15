@@ -408,7 +408,7 @@ func masterchainBroadcastCandidateCacheable(block VerifiedBlock) bool {
 
 func masterchainBroadcastBlockKind(kind string) bool {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2", "tonNode.blockFinalityBroadcast":
 		return true
 	default:
 		return false
@@ -921,7 +921,11 @@ func (s *Service) currentStateForNextMasterState(ctx context.Context, current *s
 }
 
 func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
-	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block, true)
+	if prepared, ok := s.preparedShardBlocks.take(block); ok {
+		return prepared, nil
+	}
+
+	downloaded, err := loadStoredBlockForApply(ctx, s.storage, block)
 	if err == nil {
 		return downloaded, nil
 	}

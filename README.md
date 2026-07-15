@@ -419,7 +419,12 @@ func main() {
     }
 
     ctx := context.Background()
-    globalConfigPath := cfg.GlobalConfigPath()
+    runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+    if err != nil {
+        panic(err)
+    }
+
+    globalConfigPath := runtimeOpts.GlobalConfigPath
     if _, err = nodeconfig.EnsureGlobalConfig(ctx, globalConfigPath, nodeconfig.DefaultGlobalConfigURL, false); err != nil {
         panic(err)
     }
@@ -428,10 +433,7 @@ func main() {
         panic(err)
     }
 
-    opts, err := cfg.NodeOptions(gton.DefaultNodeOptions())
-    if err != nil {
-        panic(err)
-    }
+    opts := runtimeOpts.Node
     opts.GlobalConfig = globalConfig
     opts.Logger = zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
     opts.Extension = extension.New
@@ -451,7 +453,11 @@ nodeCfg, err := nodeconfig.Load("node.json")
 if err != nil {
     panic(err)
 }
-globalConfig, err := liteclient.GetConfigFromFile(nodeCfg.GlobalConfigPath())
+runtimeOpts, err := nodeCfg.RuntimeOptions(gton.DefaultNodeOptions())
+if err != nil {
+    panic(err)
+}
+globalConfig, err := liteclient.GetConfigFromFile(runtimeOpts.GlobalConfigPath)
 if err != nil {
     panic(err)
 }
@@ -460,10 +466,7 @@ if err != nil {
     panic(err)
 }
 
-opts, err := nodeCfg.NodeOptions(gton.DefaultNodeOptions())
-if err != nil {
-    panic(err)
-}
+opts := runtimeOpts.Node
 opts.GlobalConfig = globalConfig
 opts.Logger = zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 opts.Extension = extension.NewFactory(extensionCfg)

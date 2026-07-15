@@ -383,6 +383,109 @@ func TestHotMetaCodecsAvoidDuplicatedKeys(t *testing.T) {
 	}
 }
 
+func TestDecodeBlockMetaFlagsMatchesFullDecode(t *testing.T) {
+	makeBlock := func(seed byte, seqno uint32) ton.BlockIDExt {
+		return ton.BlockIDExt{
+			Workchain: 0,
+			Shard:     topShard,
+			SeqNo:     seqno,
+			RootHash:  bytes.Repeat([]byte{seed}, 32),
+			FileHash:  bytes.Repeat([]byte{seed ^ 0xff}, 32),
+		}
+	}
+	block := makeBlock(0x42, 42)
+
+	variants := []*storage.BlockMeta{
+		{ID: block},
+		{ID: block, GenUTime: 1000, StartLT: 2000, EndLT: 3000},
+		{
+			ID:            block,
+			StateRootHash: bytes.Repeat([]byte{0x11}, 32),
+			StateFileHash: bytes.Repeat([]byte{0x22}, 32),
+			PrevRefs:      []ton.BlockIDExt{makeBlock(0x41, 41)},
+		},
+		{
+			ID:                  block,
+			MasterchainRefSeqno: 40,
+			PrevRefs:            []ton.BlockIDExt{makeBlock(0x41, 41), makeBlock(0x40, 40)},
+			NextRefs:            []ton.BlockIDExt{makeBlock(0x43, 43)},
+		},
+	}
+
+	allFlags := storage.BlockMetaHasServedFull |
+		storage.BlockMetaServedFullIsLink |
+		storage.BlockMetaHasBlockData |
+		storage.BlockMetaHasProofBlock |
+		storage.BlockMetaHasProofBlockLink |
+		storage.BlockMetaHasProofKeyBlock |
+		storage.BlockMetaHasProofKeyBlockLink |
+		storage.BlockMetaHasStateSnapshot |
+		storage.BlockMetaIsKeyBlock |
+		storage.BlockMetaHasStateCells
+	for variantIdx, variant := range variants {
+		for flags := storage.BlockMetaFlags(0); ; flags++ {
+			meta := variant.Clone()
+			meta.Flags = flags
+			encoded := encodeBlockMeta(meta)
+
+			got, err := decodeBlockMetaFlags(encoded)
+			if err != nil {
+				t.Fatalf("variant %d: decode flags %#x: %v", variantIdx, uint32(flags), err)
+			}
+			if got != flags {
+				t.Fatalf("variant %d: decoded flags %#x, want %#x", variantIdx, uint32(got), uint32(flags))
+			}
+			decoded, err := decodeBlockMeta(meta.ID, encoded)
+			if err != nil {
+				t.Fatalf("variant %d: decode meta flags=%#x: %v", variantIdx, uint32(flags), err)
+			}
+			if decoded.Flags != got {
+				t.Fatalf("variant %d: full decode flags %#x, flags decode %#x", variantIdx, uint32(decoded.Flags), uint32(got))
+			}
+			if flags == allFlags {
+				break
+			}
+		}
+	}
+
+	// Undefined high bits must round-trip as raw uint32 payload.
+	meta := variants[3].Clone()
+	meta.Flags = storage.BlockMetaFlags(0x80000000) | storage.BlockMetaHasServedFull
+	encoded := encodeBlockMeta(meta)
+	if got, err := decodeBlockMetaFlags(encoded); err != nil || got != meta.Flags {
+		t.Fatalf("high bit flags decode = %#x, %v, want %#x", uint32(got), err, uint32(meta.Flags))
+	}
+
+	// Header validation parity with decodeBlockMeta: payloads truncated below
+	// the fixed header and unknown versions must fail in both decoders.
+	for length := 0; length < blockMetaMinEncodedLen; length++ {
+		if _, err := decodeBlockMeta(meta.ID, encoded[:length]); err == nil {
+			t.Fatalf("full decode of %d-byte payload succeeded", length)
+		}
+		if _, err := decodeBlockMetaFlags(encoded[:length]); err == nil {
+			t.Fatalf("flags decode of %d-byte payload succeeded", length)
+		}
+	}
+	badVersion := bytes.Clone(encoded)
+	badVersion[0] = blockMetaVersion + 1
+	if _, err := decodeBlockMeta(meta.ID, badVersion); err == nil {
+		t.Fatal("full decode of wrong version succeeded")
+	}
+	if _, err := decodeBlockMetaFlags(badVersion); err == nil {
+		t.Fatal("flags decode of wrong version succeeded")
+	}
+
+	// Flags live in the fixed header: a payload with an intact header but a
+	// corrupt tail still yields flags even though the full decode fails.
+	truncatedTail := encoded[:blockMetaMinEncodedLen]
+	if _, err := decodeBlockMeta(meta.ID, truncatedTail); err == nil {
+		t.Fatal("full decode of truncated tail succeeded")
+	}
+	if got, err := decodeBlockMetaFlags(truncatedTail); err != nil || got != meta.Flags {
+		t.Fatalf("truncated tail flags decode = %#x, %v, want %#x", uint32(got), err, uint32(meta.Flags))
+	}
+}
+
 func TestOpenRejectsMetaDBWithoutVersionRecord(t *testing.T) {
 	dir := t.TempDir()
 	hotDir := filepath.Join(dir, "metadb")
@@ -762,12 +865,12 @@ func TestStateCellDirectEncoderMatchesCellRecordCodec(t *testing.T) {
 	rootMeta := root.GetMetadata()
 	refs := rootMeta.Refs
 
-	valueLen, d1, d2, err := stateCellEncodedLen(root, refs)
+	valueLen, layout, err := stateCellEncodedLen(root, refs)
 	if err != nil {
 		t.Fatalf("state cell encoded len: %v", err)
 	}
 	got := make([]byte, valueLen)
-	encodeStateCellRecordTo(got, root, refs, d1, d2)
+	encodeStateCellRecordTo(got, root, refs, layout)
 
 	record, err := decodeCellRecord(rootMeta.Hash[:], got)
 	if err != nil {
@@ -2002,7 +2105,7 @@ func TestSaveStateCellTreeStoresPrunedRefAsRawCell(t *testing.T) {
 	if err = store.flushCellDBs(initialCellGenerationID); err != nil {
 		t.Fatalf("flush cells: %v", err)
 	}
-	loadedRoot, err := store.loadLazyCell(ctx, root.Hash())
+	loadedRoot, err := store.LoadCell(ctx, root.Hash())
 	if err != nil {
 		t.Fatalf("load root: %v", err)
 	}
@@ -2424,7 +2527,7 @@ func TestStateCellPrewriteAllowsCheckpointWithoutCellBatch(t *testing.T) {
 	}
 
 	rootHash := root.HashKey()
-	_, err = store.loadLazyCell(ctx, rootHash[:])
+	_, err = store.LoadCell(ctx, rootHash[:])
 	if err != nil {
 		t.Fatalf("load prewritten lazy root: %v", err)
 	}
@@ -3246,11 +3349,11 @@ func TestCellGenerationMigrationProgressSurvivesRestart(t *testing.T) {
 	if !loaded.Masterchain.Block.Equals(&origin) {
 		t.Fatalf("progress masterchain = %s, want %s", storage.FormatBlockRef(loaded.Masterchain.Block), storage.FormatBlockRef(origin))
 	}
-	if err = store.AbortCellGeneration(ctx, generation); err != nil {
-		t.Fatalf("abort generation: %v", err)
+	if err = store.DropPendingCellGeneration(ctx, generation); err != nil {
+		t.Fatalf("drop pending generation: %v", err)
 	}
 	if _, err = store.CellGenerationMigrationProgress(ctx, generation); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("aborted generation progress error = %v, want ErrNotFound", err)
+		t.Fatalf("dropped generation progress error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -3489,10 +3592,10 @@ func TestLazyCellLoadMetricsCountDecodedCacheAndPebble(t *testing.T) {
 	})
 
 	rootHash := root.HashKey(0)
-	if _, err = store.loadLazyCell(ctx, rootHash[:]); err != nil {
+	if _, err = store.LoadCell(ctx, rootHash[:]); err != nil {
 		t.Fatalf("load lazy cell from pebble: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, rootHash[:]); err != nil {
+	if _, err = store.LoadCell(ctx, rootHash[:]); err != nil {
 		t.Fatalf("load lazy cell from decoded cache: %v", err)
 	}
 
@@ -3991,7 +4094,7 @@ func TestSaveStateCellTreeStoresConcretePrunedParentByRawHash(t *testing.T) {
 	if err = store.flushCellDBs(initialCellGenerationID); err != nil {
 		t.Fatalf("flush cells: %v", err)
 	}
-	loadedRoot, err := store.loadLazyCell(ctx, root.Hash())
+	loadedRoot, err := store.LoadCell(ctx, root.Hash())
 	if err != nil {
 		t.Fatalf("load root: %v", err)
 	}
@@ -4151,7 +4254,7 @@ func TestSaveStateCellTreeDoesNotValidateMissingLazyBoundary(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save state with missing lazy boundary: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
+	if _, err = store.LoadCell(ctx, leafHash[:]); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("lazy boundary was unexpectedly restored: %v", err)
 	}
 }
@@ -4208,7 +4311,7 @@ func TestSaveStateCellTreePersistsMissingLazyDataCell(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save state with missing lazy data cell: %v", err)
 	}
-	if _, err = store.loadLazyCell(ctx, rightHash[:]); err != nil {
+	if _, err = store.LoadCell(ctx, rightHash[:]); err != nil {
 		t.Fatalf("lazy data cell was not persisted: %v", err)
 	}
 }
@@ -4318,4 +4421,175 @@ func lazyCellLoadMetricCount(metrics []storage.LazyCellLoadMetric, layer string)
 		}
 	}
 	return count
+}
+
+func TestSaveCellRecordsWritesChunksAndDedupes(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	generation, err := store.activeCellGenerationID()
+	if err != nil {
+		t.Fatalf("active cell generation: %v", err)
+	}
+
+	const count = 4096 + 512
+	records := make([]storage.EncodedCellRecord, 0, count+1)
+	for i := 0; i < count; i++ {
+		var hash cell.Hash
+		hash[0] = byte(i)
+		binary.BigEndian.PutUint64(hash[8:16], uint64(i))
+		data := make([]byte, 12)
+		binary.BigEndian.PutUint64(data, uint64(i))
+		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: data})
+	}
+	firstData := bytes.Clone(records[0].Data)
+	duplicate := records[0]
+	duplicate.Data = []byte{0xff}
+	records = append(records, duplicate)
+
+	set := storage.NewStateCellRecordChunks([][]storage.EncodedCellRecord{
+		records[:count/2],
+		records[count/2:],
+	}, 0)
+	stats, err := store.saveCellRecordSet(ctx, set, true, generation, true)
+	if err != nil {
+		t.Fatalf("save encoded cells: %v", err)
+	}
+	if stats.written != count || stats.skipped != 1 || stats.bytes != int64(count*len(firstData)) {
+		t.Fatalf("save stats = %+v, want written=%d skipped=1 bytes=%d", stats, count, count*len(firstData))
+	}
+
+	seenShards := map[int]struct{}{}
+	for i := 0; i < count; i += 61 {
+		raw, err := store.getCellCopyFromGeneration(ctx, generation, records[i].Hash[:])
+		if err != nil {
+			t.Fatalf("read cell %d back: %v", i, err)
+		}
+		if !bytes.Equal(raw, records[i].Data) {
+			t.Fatalf("cell %d data mismatch: got=%x want=%x", i, raw, records[i].Data)
+		}
+		seenShards[cellShardIndex(records[i].Hash)] = struct{}{}
+	}
+	if len(seenShards) != cellDBShardCount {
+		t.Fatalf("readback covered %d shards, want %d", len(seenShards), cellDBShardCount)
+	}
+	raw, err := store.getCellCopyFromGeneration(ctx, generation, records[0].Hash[:])
+	if err != nil {
+		t.Fatalf("read duplicated cell: %v", err)
+	}
+	if !bytes.Equal(raw, firstData) {
+		t.Fatalf("deduplicated cell data = %x, want first value %x", raw, firstData)
+	}
+}
+
+func TestSaveCellRecordsRejectsEmptyRecord(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	generation, err := store.activeCellGenerationID()
+	if err != nil {
+		t.Fatalf("active cell generation: %v", err)
+	}
+
+	type emptyRecordTestCase struct {
+		name  string
+		count int
+	}
+	tests := []emptyRecordTestCase{
+		{name: "single-writer", count: 8},
+		{name: "sharded", count: stateCellSaveShardedMinRecords},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := make([]storage.EncodedCellRecord, 0, tt.count)
+			for i := 0; i < tt.count; i++ {
+				var hash cell.Hash
+				hash[0] = byte(i)
+				binary.BigEndian.PutUint64(hash[8:16], uint64(i))
+				record := storage.EncodedCellRecord{Hash: hash, Data: []byte{0x01}}
+				if i == tt.count/2 {
+					record.Data = nil
+				}
+				records = append(records, record)
+			}
+
+			_, saveErr := store.saveCellRecordSet(ctx, storage.NewStateCellRecords(records), false, generation, false)
+			if saveErr == nil {
+				t.Fatal("expected empty record error")
+			}
+			if !strings.Contains(saveErr.Error(), "encoded cell record is empty") {
+				t.Fatalf("save empty record err = %v, want root cause", saveErr)
+			}
+		})
+	}
+}
+
+func TestSaveCellRecordsHonorsCanceledContext(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	type canceledContextTestCase struct {
+		name  string
+		count int
+		save  func(storage.StateCellRecords) (cellRecordBatchStats, error)
+	}
+	tests := []canceledContextTestCase{
+		{
+			name:  "single-writer",
+			count: 1,
+			save: func(records storage.StateCellRecords) (cellRecordBatchStats, error) {
+				return saveCellRecords(ctx, store.cells, records, false)
+			},
+		},
+		{
+			name:  "sharded",
+			count: stateCellSaveShardedMinRecords,
+			save: func(records storage.StateCellRecords) (cellRecordBatchStats, error) {
+				return saveCellRecordSetSharded(ctx, store.cells, records, false)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := make([]storage.EncodedCellRecord, tt.count)
+			for i := range records {
+				binary.BigEndian.PutUint64(records[i].Hash[24:], uint64(i))
+				records[i].Data = []byte{0x01}
+			}
+
+			stats, err := tt.save(storage.NewStateCellRecords(records))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("save canceled records err = %v, want context.Canceled", err)
+			}
+			if stats != (cellRecordBatchStats{}) {
+				t.Fatalf("save canceled records stats = %+v, want zero", stats)
+			}
+		})
+	}
 }

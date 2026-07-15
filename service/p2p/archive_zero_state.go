@@ -16,6 +16,11 @@ const (
 )
 
 func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockIDExt) (storage.DownloadedState, error) {
+	ctx, finish, err := a.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	if a.node.IsOffline() {
 		return nil, ErrOffline
 	}
@@ -25,7 +30,16 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 	}
 
 	shard := archiveShardFromBlock(block)
-	pool := a.archivePeerPool(sub)
+	pool, releasePool, err := a.useArchivePeerPool(sub)
+	if err != nil {
+		return nil, err
+	}
+	defer releasePool()
+	_, releaseDemand, err := pool.beginZeroStateRequest(shard, block)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseDemand()
 	tried := map[PeerID]struct{}{}
 	var errs []error
 
@@ -37,7 +51,7 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 			return nil, err
 		}
 
-		peers := zeroStateArchiveCandidates(pool, a, shard, tried)
+		peers := archiveDownloadRoundPeers(zeroStateArchiveCandidates(pool, a, shard, tried))
 		if len(peers) == 0 {
 			pool.refill(ctx, true)
 			if waitErr := sub.waitForZeroStateArchivePeer(ctx, pool, a, shard, tried); waitErr != nil {
@@ -75,7 +89,7 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 			retryable := false
 			if errors.Is(err, ErrStateNotAvailable) {
 				notAvailable++
-				a.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectStateNotAvailable)
+				a.clearSelectedArchivePeerID(shard, downloadPeerID(peer))
 			} else {
 				retryable = a.noteZeroStatePeerError(ctx, pool, shard, peer, err)
 			}
@@ -86,7 +100,7 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 		}
 
 		if notAvailable == len(peers) {
-			pool.refreshUseless(ctx, shard)
+			pool.refill(ctx, true)
 		} else {
 			pool.refill(ctx, false)
 		}
@@ -99,9 +113,6 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 }
 
 func (s *overlaySubscription) ensureZeroStateArchivePeers(ctx context.Context, pool *archivePeerPool, shard archive.ShardID) error {
-	if err := s.ensurePeers(ctx); err != nil {
-		return fmt.Errorf("bootstrap overlay peers: %w", err)
-	}
 	if pool.ready(shard) {
 		return nil
 	}
@@ -168,28 +179,29 @@ func zeroStateArchiveCandidates(pool *archivePeerPool, session *ArchiveSession, 
 }
 
 func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *overlaySubscription, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, block ton.BlockIDExt) (storage.DownloadedState, error) {
-	archiveRelease := pool.acquire(peer)
+	archiveRelease, ok := pool.acquireDownload(peer)
+	if !ok {
+		return nil, fmt.Errorf("archive peer left the pool: %w", ErrStateNotAvailable)
+	}
 	defer archiveRelease()
-	release := a.node.acquireDownloadPeer(peer)
-	defer release()
 
-	resp, err := sub.queryFromPeerWithLimits(ctx, peer, PrepareZeroState{Block: block}, a.archivePeerInfoTimeout(peer), persistentStateSmallAnswerMax)
+	resp, err := sub.queryArchiveFromPeerWithLimits(ctx, peer, PrepareZeroState{Block: block}, archiveInfoTimeout, persistentStateSmallAnswerMax)
 	if err != nil {
 		return nil, err
 	}
 	switch resp.(type) {
 	case PreparedState:
 	case NotFoundState:
+		pool.recordZeroStateDemandNotAvailable(block, peer)
 		return nil, ErrStateNotAvailable
 	default:
 		return nil, fmt.Errorf("unexpected prepareZeroState response %T", resp)
 	}
 
-	pool.markAvailable(shard, peer)
-	a.noteArchivePeerAvailable(peer)
+	pool.recordZeroStateDemandEvidence(block, peer, archivePeerDemandAvailable)
 
 	started := time.Now()
-	data, err := sub.queryRawFromPeerWithLimits(ctx, peer, DownloadZeroState{Block: block}, a.archivePeerSliceTimeout(peer), maxBlockDownloadAnswerSize)
+	data, err := sub.queryArchiveRawFromPeerWithLimits(ctx, peer, DownloadZeroState{Block: block}, archiveSliceTimeout, maxBlockDownloadAnswerSize)
 	if err != nil {
 		return nil, err
 	}
@@ -198,17 +210,10 @@ func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *ove
 	}
 
 	elapsed := time.Since(started)
-	if noteArchivePeerDownload(shard, peer, int64(len(data)), elapsed) {
-		a.node.log.Debug().
-			Str("peer", peer.addr).
-			Str("block", formatBlockRef(block)).
-			Str("size", formatByteSize(int64(len(data)))).
-			Dur("elapsed", elapsed).
-			Msg("zero state download peer too slow")
-	}
+	pool.noteArchiveDownload(shard, peer, int64(len(data)), elapsed)
 	pool.markSuccess(shard, peer)
-	a.noteArchivePeerSuccess(peer)
-	a.selectArchivePeer(shard, peer)
+	pool.recordZeroStateDemandEvidence(block, peer, archivePeerDemandProven)
+	a.selectArchivePeerFromPool(shard, peer, pool)
 
 	return &zeroStateSnapshotArtifact{
 		block: block,
@@ -216,13 +221,11 @@ func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *ove
 	}, nil
 }
 
-// noteZeroStatePeerError returns true when deadline grace keeps the peer eligible for another attempt.
 func (a *ArchiveSession) noteZeroStatePeerError(ctx context.Context, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) bool {
-	if a.archivePeerDeadlineGrace(peer, err) {
-		return true
+	if errors.Is(err, context.Canceled) {
+		return false
 	}
-
-	peer.downloadFailed(archiveSlowPeerPenalty)
+	pool.rememberTransportBlocked(downloadPeerID(peer), archivePeerUnreachableTTL)
 	a.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectStateDownloadFailed)
 	return false
 }

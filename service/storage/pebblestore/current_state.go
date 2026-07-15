@@ -44,7 +44,7 @@ func (s *Store) validateCurrentStateRecordMetadata(ctx context.Context, label st
 }
 
 func validateCurrentStateRecordBlockMetadata(reader pebbleReader, recordLabel string, blockLabel string, current storage.BlockState) error {
-	if err := validateFullBlockIDHashes(current.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(current.Block); err != nil {
 		return err
 	}
 
@@ -184,7 +184,7 @@ func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage
 func validateCheckpointStateArtifacts(entries []storage.StateCheckpointBlock) error {
 	for _, entry := range entries {
 		if entry.State != nil {
-			if err := validateFullBlockIDHashes(entry.State.Block); err != nil {
+			if err := storage.ValidateBlockIDHashes(entry.State.Block); err != nil {
 				return err
 			}
 		}
@@ -253,13 +253,13 @@ func (s *Store) SwitchCellGeneration(ctx context.Context, generation uint64, ori
 	if isEmptyBlockID(origin) {
 		return 0, fmt.Errorf("cell generation origin persistent state is empty")
 	}
-	if err := validateFullBlockIDHashes(origin); err != nil {
+	if err := storage.ValidateBlockIDHashes(origin); err != nil {
 		return 0, err
 	}
 	if isEmptyBlockID(expectedCurrent) {
 		return 0, fmt.Errorf("expected current state block is empty")
 	}
-	if err := validateFullBlockIDHashes(expectedCurrent); err != nil {
+	if err := storage.ValidateBlockIDHashes(expectedCurrent); err != nil {
 		return 0, err
 	}
 
@@ -278,11 +278,11 @@ func (s *Store) DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Contex
 	if isEmptyBlockID(origin) {
 		return 0, fmt.Errorf("cell generation origin persistent state is empty")
 	}
-	if err := validateFullBlockIDHashes(origin); err != nil {
+	if err := storage.ValidateBlockIDHashes(origin); err != nil {
 		return 0, err
 	}
 	for _, block := range preserveStateMeta {
-		if err := validateFullBlockIDHashes(block); err != nil {
+		if err := storage.ValidateBlockIDHashes(block); err != nil {
 			return 0, err
 		}
 	}
@@ -442,7 +442,7 @@ func prepareBlockStateHeader(state *storage.BlockState) (storage.BlockState, cel
 	var zero cell.Hash
 	var stateRootHash cell.Hash
 	saved := *state
-	if err := validateFullBlockIDHashes(saved.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(saved.Block); err != nil {
 		return storage.BlockState{}, stateRootHash, err
 	}
 
@@ -550,7 +550,14 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 		s.mu.Unlock()
 		return timing, errPebbleClosed
 	}
+	s.mu.Unlock()
 
+	// The batch assembly below runs without s.mu on purpose: it can involve
+	// per-block pebble reads and serialization, and holding the store-wide
+	// lock here stalls every reader that needs acquireHotDB/acquireCellStore.
+	// Read-modify-write atomicity of the hot records is provided by hotWriteMu
+	// (held above, same as mergeAndStoreBlockMeta), and the acquired hot db
+	// reference keeps s.hot usable until release.
 	blockMetas := make(map[storage.BlockRootHash]*storage.BlockMeta, len(prepared)+len(artifactWrites))
 	for _, write := range artifactWrites {
 		mergeCheckpointBlockMeta(blockMetas, write.meta)
@@ -565,19 +572,16 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	}
 	for _, state := range prepared {
 		if err := mergeStateBlockMeta(state.saved); err != nil {
-			s.mu.Unlock()
 			return timing, err
 		}
 	}
 	if current != nil {
 		if err := mergeStateBlockMeta(current.Masterchain); err != nil {
-			s.mu.Unlock()
 			return timing, err
 		}
 		for _, key := range storage.SortedShardKeys(current.Shards) {
 			shard := current.Shards[key]
 			if err := mergeStateBlockMeta(shard); err != nil {
-				s.mu.Unlock()
 				return timing, err
 			}
 		}
@@ -587,34 +591,38 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 	// then publish hot metadata and clear pack dirty markers atomically. If the
 	// process dies between the two, startup recovery truncates dirty pack tails.
 	if err := s.setCheckpointArtifactWrites(batch, artifactWrites, artifactRegistrations, artifactLinks, blockMetas); err != nil {
-		s.mu.Unlock()
 		return timing, err
 	}
 	if err := s.setMergedBlockMetas(batch, blockMetas); err != nil {
-		s.mu.Unlock()
 		return timing, err
 	}
 	if current != nil {
 		if err := batch.Set(hotKeyCurrentState(), encodeCurrentState(current), pebble.NoSync); err != nil {
-			s.mu.Unlock()
 			return timing, err
 		}
-		if firstCurrentState && isEmptyBlockID(s.activeCellOrigin) && !isEmptyBlockID(current.Masterchain.Block) {
-			origin := current.Masterchain.Block
-			manifest := s.manifestLocked()
-			manifest.activeOrigin = origin
-			if err := batch.Set(hotKeyCellGenerationManifest(), encodeCellGenerationManifest(manifest), pebble.NoSync); err != nil {
-				s.mu.Unlock()
-				return timing, err
+		if firstCurrentState && !isEmptyBlockID(current.Masterchain.Block) {
+			// s.activeCellOrigin and the manifest fields are s.mu-protected;
+			// snapshot the updated manifest under a minimal lock window.
+			var encodedManifest []byte
+			s.mu.Lock()
+			if isEmptyBlockID(s.activeCellOrigin) {
+				manifest := s.manifestLocked()
+				manifest.activeOrigin = current.Masterchain.Block
+				encodedManifest = encodeCellGenerationManifest(manifest)
 			}
-			newActiveOrigin = &origin
+			s.mu.Unlock()
+			if encodedManifest != nil {
+				if err := batch.Set(hotKeyCellGenerationManifest(), encodedManifest, pebble.NoSync); err != nil {
+					return timing, err
+				}
+				origin := current.Masterchain.Block
+				newActiveOrigin = &origin
+			}
 		}
 	}
 	if err := s.deleteSyncedPackAppendMarkers(batch, syncedPacks); err != nil {
-		s.mu.Unlock()
 		return timing, err
 	}
-	s.mu.Unlock()
 
 	hotSyncStarted := time.Now()
 	if err := batch.Commit(pebble.Sync); err != nil {
@@ -668,7 +676,7 @@ func (s *Store) validateCurrentStateMetadata(db *pebble.DB, current *storage.Cur
 }
 
 func (s *Store) validateCurrentStateBlockMetadata(db *pebble.DB, label string, current storage.BlockState, prepared map[storage.BlockRootHash]storage.BlockState) error {
-	if err := validateFullBlockIDHashes(current.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(current.Block); err != nil {
 		return err
 	}
 

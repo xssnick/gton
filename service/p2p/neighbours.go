@@ -196,27 +196,6 @@ func (s *overlaySubscription) preferredNeighbourPeers(requiredVersionMajor, requ
 	return s.orderPreferredPeers(candidates, requiredVersionMajor, requiredVersionMinor)
 }
 
-func (s *overlaySubscription) aliveNeighbourPeers(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
-	candidates := s.neighbourPeerSnapshots()
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	now := time.Now()
-	alive := candidates[:0]
-	for _, peer := range candidates {
-		if !peer.isAliveKnownOverlayPeer(now) {
-			continue
-		}
-		if !peerEligible(peer.statsSnapshot(), requiredVersionMajor, requiredVersionMinor) {
-			continue
-		}
-		alive = append(alive, peer)
-	}
-
-	return s.orderPreferredPeers(alive, requiredVersionMajor, requiredVersionMinor)
-}
-
 func (s *overlaySubscription) pingTargets() []*overlayPeer {
 	peers := s.preferredNeighbourPeers(0, 0)
 	if len(peers) == 0 {
@@ -266,6 +245,10 @@ func (s *overlaySubscription) markPeerQueryFailed(peer *overlayPeer) {
 	}
 
 	s.mx.Lock()
+	if s.peers[peer.id] != peer {
+		s.mx.Unlock()
+		return
+	}
 	removed := s.removeNeighbourLocked(peer.id)
 	s.mx.Unlock()
 	if removed {

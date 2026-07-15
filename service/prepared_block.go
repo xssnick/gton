@@ -95,7 +95,7 @@ func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error
 
 	var consensus *masterchainConsensusProof
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard && downloaded.Proof != nil {
-		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof)
+		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof, downloaded.SignaturesVerifiedKey)
 		if err != nil {
 			return VerifiedBlock{}, fmt.Errorf("prepare masterchain consensus proof %s: %w", downloaded.BlockRef(), err)
 		}

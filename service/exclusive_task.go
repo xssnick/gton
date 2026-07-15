@@ -212,10 +212,6 @@ func (t exclusiveServiceTask) backgroundStatus() string {
 }
 
 func (l *exclusiveServiceTaskLease) release() {
-	if l == nil || l.service == nil {
-		return
-	}
-
 	l.service.exclusiveTaskMu.Lock()
 	if l.service.exclusiveTask == l.task {
 		l.service.exclusiveTask = exclusiveServiceTaskNone

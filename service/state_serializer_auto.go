@@ -42,7 +42,7 @@ type masterBlockMetaForStateSerialization struct {
 }
 
 func (s *Service) processPersistentStateSerialization(ctx context.Context) error {
-	if s.syncUntilFrozen() {
+	if s.syncUntilFrozen() || !s.automaticStateSerializationReady.Load() {
 		return nil
 	}
 
@@ -89,21 +89,22 @@ func (s *Service) processPersistentStateSerialization(ctx context.Context) error
 		return nil
 	}
 
-	blocks, latestKey, latestKeyUTime, err := s.loadStateSerializationMasterBlocks(ctx, cursor.LastBlock.SeqNo+1, current.Masterchain.Block.SeqNo)
+	head := current.Masterchain.Block
+	blocks, latestKey, latestKeyUTime, err := s.loadStateSerializationKeyBlocks(ctx, cursor.LastBlock.SeqNo, head.SeqNo)
 	if err != nil {
 		return err
 	}
 
 	event := s.stateSerializer.log.Debug().
 		Str("from", storage.FormatBlockRef(cursor.LastBlock)).
-		Str("to", storage.FormatBlockRef(current.Masterchain.Block)).
-		Int("blocks", len(blocks))
+		Str("to", storage.FormatBlockRef(head)).
+		Int("key_blocks", len(blocks))
 	if latestKeyUTime != 0 {
 		event = event.
 			Str("latest_key_block", storage.FormatBlockRef(latestKey)).
 			Uint32("latest_key_utime", latestKeyUTime)
 	}
-	event.Msg("checking durable masterchain blocks for persistent state serialization")
+	event.Msg("checking durable masterchain key blocks for persistent state serialization")
 
 	for _, item := range blocks {
 		select {
@@ -112,19 +113,24 @@ func (s *Service) processPersistentStateSerialization(ctx context.Context) error
 		default:
 		}
 
-		if !item.meta.Has(storage.BlockMetaIsKeyBlock) {
-			if activePersistentStateSerializationMatches(active, item.block) {
-				if err = clearActivePersistentStateSerialization(ctx, scheduler, item.block); err != nil {
-					return err
-				}
-			}
-			if err = savePersistentStateSerializerCursor(ctx, scheduler, cursor, item.block, nil, 0); err != nil {
-				return err
-			}
-			continue
-		}
-
 		if err = s.processPersistentStateKeyBlock(ctx, scheduler, cursor, item.block, item.meta, latestKeyUTime, active, retryInterrupted); err != nil {
+			return err
+		}
+	}
+
+	// Every key block up to the scan head is handled; a stale interrupted-serialization
+	// marker pointing at a non-key block in the range would previously have been
+	// cleared while walking that block, so clear it here (idempotent for key
+	// blocks that already cleared their own marker above).
+	if active != nil && active.Block.SeqNo <= head.SeqNo {
+		if err = clearActivePersistentStateSerialization(ctx, scheduler, active.Block); err != nil {
+			return err
+		}
+	}
+	// Advance the cursor to the head in one write instead of one write per
+	// walked non-key block.
+	if cursor.LastBlock.SeqNo < head.SeqNo {
+		if err = savePersistentStateSerializerCursor(ctx, scheduler, cursor, head, nil, 0); err != nil {
 			return err
 		}
 	}
@@ -475,38 +481,49 @@ func (s *Service) latestKnownKeyBlockAtOrBefore(ctx context.Context, block ton.B
 	return ton.BlockIDExt{}, 0, storage.ErrNotFound
 }
 
-func (s *Service) loadStateSerializationMasterBlocks(ctx context.Context, fromSeqno uint32, toSeqno uint32) ([]masterBlockMetaForStateSerialization, ton.BlockIDExt, uint32, error) {
-	blocks := make([]masterBlockMetaForStateSerialization, 0, int(toSeqno-fromSeqno)+1)
+// loadStateSerializationKeyBlocks returns the known key blocks with
+// afterSeqno < seqno <= toSeqno in ascending order via the storage key-block
+// index, instead of materializing every masterchain block in the range.
+func (s *Service) loadStateSerializationKeyBlocks(ctx context.Context, afterSeqno uint32, toSeqno uint32) ([]masterBlockMetaForStateSerialization, ton.BlockIDExt, uint32, error) {
+	const keyBlockScanBatch = 128
+
+	var blocks []masterBlockMetaForStateSerialization
 	var latestKey ton.BlockIDExt
 	var latestKeyUTime uint32
 
-	for seqno := fromSeqno; seqno <= toSeqno; seqno++ {
-		select {
-		case <-ctx.Done():
-			return nil, ton.BlockIDExt{}, 0, ctx.Err()
-		default:
+	after := afterSeqno
+	for {
+		batch, err := s.storage.NextKeyBlockMetas(ctx, after, keyBlockScanBatch)
+		if errors.Is(err, storage.ErrNotFound) {
+			break
+		}
+		if err != nil {
+			return nil, ton.BlockIDExt{}, 0, fmt.Errorf("lookup key blocks after #%d: %w", after, err)
+		}
+		if len(batch) == 0 {
+			break
 		}
 
-		block, err := s.storage.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: seqno})
-		if err != nil {
-			return nil, ton.BlockIDExt{}, 0, fmt.Errorf("lookup masterchain block #%d: %w", seqno, err)
-		}
-		meta, err := s.storage.BlockMeta(ctx, block)
-		if err != nil {
-			return nil, ton.BlockIDExt{}, 0, fmt.Errorf("load masterchain block meta %s: %w", storage.FormatBlockRef(block), err)
-		}
-		if meta.Has(storage.BlockMetaIsKeyBlock) {
-			if meta.GenUTime == 0 {
-				return nil, ton.BlockIDExt{}, 0, fmt.Errorf("key block %s has no gen utime", storage.FormatBlockRef(block))
+		reachedEnd := false
+		for _, meta := range batch {
+			if meta.ID.SeqNo > toSeqno {
+				reachedEnd = true
+				break
 			}
-			latestKey = block
+			if meta.GenUTime == 0 {
+				return nil, ton.BlockIDExt{}, 0, fmt.Errorf("key block %s has no gen utime", storage.FormatBlockRef(meta.ID))
+			}
+			blocks = append(blocks, masterBlockMetaForStateSerialization{
+				block: meta.ID,
+				meta:  meta,
+			})
+			latestKey = meta.ID
 			latestKeyUTime = meta.GenUTime
 		}
-
-		blocks = append(blocks, masterBlockMetaForStateSerialization{
-			block: block,
-			meta:  meta,
-		})
+		if reachedEnd || len(batch) < keyBlockScanBatch {
+			break
+		}
+		after = batch[len(batch)-1].ID.SeqNo
 	}
 	return blocks, latestKey, latestKeyUTime, nil
 }

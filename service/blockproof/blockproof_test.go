@@ -1,6 +1,7 @@
 package blockproof
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
@@ -128,7 +129,7 @@ func TestCheckPreparedSignaturesAcceptsOrdinaryAndSimplexVotes(t *testing.T) {
 
 			var signed *ValidatorSignatureSet
 			if tt.set.IsSimplex() {
-				signed = NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, tt.set.IsFinal(), sessionID, 11, candidate)
+				signed = NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, tt.set.Final(), sessionID, 11, candidate)
 			} else {
 				signed = NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, signatures)
 			}
@@ -246,6 +247,56 @@ func TestPreparedValidatorSetCopiesValidatorKeys(t *testing.T) {
 	}
 }
 
+func TestValidatorSignatureSetFinalitySignaturesCellRoundTrip(t *testing.T) {
+	block := testBlockID(0, 83)
+	validators, privateKeys := testValidators(t, 4)
+	catchainSeqno := uint32(9)
+	setHash, err := ValidatorSetHash(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("validator set hash: %v", err)
+	}
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	candidate := testSimplexCandidate(t, block)
+	sessionID := bytes.Repeat([]byte{0x42}, 32)
+
+	base := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, nil, true, sessionID, 11, candidate)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	signatures := testSignatures(t, validators[:3], privateKeys[:3], payload)
+	signed := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, true, sessionID, 11, candidate)
+
+	signaturesCell, err := signed.FinalitySignaturesCell(prepared)
+	if err != nil {
+		t.Fatalf("signatures cell: %v", err)
+	}
+	parsed, err := ParseValidatorSignatureSetCell(signaturesCell)
+	if err != nil {
+		t.Fatalf("parse signatures cell: %v", err)
+	}
+	if !bytes.Equal(parsed.ContentKey(block), signed.ContentKey(block)) {
+		t.Fatalf("content key mismatch after round trip")
+	}
+	if err = CheckPreparedSignatures(block, parsed, prepared); err != nil {
+		t.Fatalf("check parsed signatures: %v", err)
+	}
+
+	approve := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, nil, false, sessionID, 11, candidate)
+	if _, err = approve.FinalitySignaturesCell(prepared); err == nil {
+		t.Fatal("non-final simplex signatures cell was accepted")
+	}
+
+	ordinary := NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, signatures)
+	if _, err = ordinary.FinalitySignaturesCell(prepared); err == nil {
+		t.Fatal("ordinary signatures cell was accepted as finality")
+	}
+}
+
 func TestPrepareValidatorSignatureSetRejectsHeaderMismatches(t *testing.T) {
 	blockID := testBlockID(-1, 80)
 	validators, _ := testValidators(t, 4)
@@ -308,7 +359,7 @@ func TestCheckPreparedSignaturesRejectsSimplexCandidateBlockMismatch(t *testing.
 func TestCheckPreparedMasterchainSignaturesRejectsNonFinalSimplex(t *testing.T) {
 	block := testBlockID(-1, 78)
 	set := NewSimplexValidatorSignatureSet(9, 0x12345678, nil, false, make([]byte, 32), 11, []byte{0x01})
-	if err := CheckPreparedMasterchainSignaturesWithValidators(block, set, nil); err == nil {
+	if err := CheckPreparedMasterchainSignatures(block, set, nil); err == nil {
 		t.Fatal("expected non-final simplex masterchain signatures to be rejected")
 	}
 }
@@ -323,7 +374,7 @@ func testBlockID(workchain int32, seqno uint32) ton.BlockIDExt {
 	}
 }
 
-func testValidators(t *testing.T, count int) ([]*tlb.ValidatorAddr, []ed25519.PrivateKey) {
+func testValidators(t testing.TB, count int) ([]*tlb.ValidatorAddr, []ed25519.PrivateKey) {
 	t.Helper()
 
 	validators := make([]*tlb.ValidatorAddr, count)
@@ -345,7 +396,7 @@ func testValidators(t *testing.T, count int) ([]*tlb.ValidatorAddr, []ed25519.Pr
 	return validators, privateKeys
 }
 
-func testSignatures(t *testing.T, validators []*tlb.ValidatorAddr, privateKeys []ed25519.PrivateKey, payload []byte) []ton.Signature {
+func testSignatures(t testing.TB, validators []*tlb.ValidatorAddr, privateKeys []ed25519.PrivateKey, payload []byte) []ton.Signature {
 	t.Helper()
 
 	signatures := make([]ton.Signature, len(validators))
@@ -360,6 +411,43 @@ func testSignatures(t *testing.T, validators []*tlb.ValidatorAddr, privateKeys [
 		}
 	}
 	return signatures
+}
+
+func BenchmarkPrepareValidatorSet(b *testing.B) {
+	validators, _ := testValidators(b, 100)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		prepared, err := PrepareValidatorSet(9, validators)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = prepared
+	}
+}
+
+func BenchmarkCheckPreparedSignatures(b *testing.B) {
+	block := testBlockID(-1, 90)
+	validators, privateKeys := testValidators(b, 100)
+	prepared, err := PrepareValidatorSet(9, validators)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	base := NewOrdinaryValidatorSignatureSet(9, prepared.Hash(), nil)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		b.Fatal(err)
+	}
+	signatures := testSignatures(b, validators, privateKeys, payload)
+	signed := NewOrdinaryValidatorSignatureSet(9, prepared.Hash(), signatures)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := CheckPreparedSignatures(block, signed, prepared); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func testSimplexCandidate(t *testing.T, block ton.BlockIDExt) []byte {

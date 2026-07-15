@@ -54,6 +54,44 @@ func saveTestArchiveArtifacts(store *Store, imported testArchiveImport) error {
 	return err
 }
 
+func TestSetServedBlockFullArtifactRefsRejectsMissingProofRef(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	block := &storage.ServedBlockFull{
+		ID: testServedBlockID(-1, topShard, 42, 0x42),
+	}
+	kind := storage.ServedProofBlock
+	err = store.withHotBatch(func(batch *pebble.Batch) error {
+		return store.setServedBlockFullArtifactRefs(
+			batch,
+			block,
+			[]storage.ServedProofKind{kind},
+			nil,
+			map[storage.ServedProofKind]*storage.ArtifactRef{},
+		)
+	})
+	if err == nil {
+		t.Fatal("missing proof ref was accepted")
+	}
+	if !strings.Contains(err.Error(), "proof ref invariant violated") {
+		t.Fatalf("missing proof ref error = %v, want invariant violation", err)
+	}
+	if !strings.Contains(err.Error(), string(kind)) {
+		t.Fatalf("missing proof ref error = %v, want proof kind %q", err, kind)
+	}
+	if !strings.Contains(err.Error(), storage.FormatBlockRef(block.ID)) {
+		t.Fatalf("missing proof ref error = %v, want block context", err)
+	}
+}
+
 func TestCheckpointArchiveArtifactsAllowsShardSplitNextChildrenAcrossBatches(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -83,6 +121,48 @@ func TestCheckpointArchiveArtifactsAllowsShardSplitNextChildrenAcrossBatches(t *
 		Links: []storage.ServedBlockLink{{Prev: prev, Next: left}},
 	}); err != nil {
 		t.Fatalf("link left split child: %v", err)
+	}
+
+	got, err := readNextBlockLink(context.Background(), store, prev)
+	if err != nil {
+		t.Fatalf("load next block link: %v", err)
+	}
+	if !got.Equals(&left) {
+		t.Fatalf("next block link = %s, want left split child %s", storage.FormatBlockRef(got), storage.FormatBlockRef(left))
+	}
+}
+
+func TestCheckpointArchiveArtifactsAllowsBothShardSplitChildrenAfterDurableParent(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	prev := testServedBlockID(0, int64(-1<<63), 100, 1)
+	left := testServedBlockID(0, int64(0x4000000000000000), 101, 2)
+	right := testServedBlockID(0, int64(-0x4000000000000000), 101, 3)
+	master := testServedBlockID(-1, int64(-1<<63), 90, 4)
+
+	if err = saveTestArchiveArtifacts(store, testArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(master, 0),
+			testLinkPreviousBlock(prev, master.SeqNo),
+		},
+	}); err != nil {
+		t.Fatalf("save durable split parent: %v", err)
+	}
+	if err = saveTestArchiveArtifacts(store, testArchiveImport{
+		FullBlocks: []*storage.ServedBlockFull{
+			testLinkPreviousBlock(right, master.SeqNo),
+			testLinkPreviousBlock(left, master.SeqNo),
+		},
+		Links: []storage.ServedBlockLink{
+			{Prev: prev, Next: right},
+			{Prev: prev, Next: left},
+		},
+	}); err != nil {
+		t.Fatalf("save split children: %v", err)
 	}
 
 	got, err := readNextBlockLink(context.Background(), store, prev)
@@ -448,6 +528,27 @@ func TestStoredZeroStateBlocks(t *testing.T) {
 	}
 	if !containsBlock(blocks, blockA) || !containsBlock(blocks, blockB) {
 		t.Fatalf("stored zerostate blocks = %#v, want both test blocks", blocks)
+	}
+}
+
+func TestSaveZeroStateRejectsEmptyData(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     int64(-1 << 63),
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x12}, 32),
+	}
+	if err = store.SaveZeroState(block, nil, nil); err == nil {
+		t.Fatal("empty zerostate data was accepted")
+	}
+	if _, err = store.ZeroState(context.Background(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("zerostate after rejected save error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1757,6 +1858,171 @@ func TestPruneArchivePackagesDeletesOldPackagesAfterBoundary(t *testing.T) {
 	}
 }
 
+func TestPruneArchivePackagesRetainsPersistentStateTTLMetadata(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	const secondsPerDay = uint64(24 * 60 * 60)
+
+	ctx := context.Background()
+	snapshotUTime := uint32(1 << 19)
+	nowUnix := uint64(snapshotUTime) + 8*secondsPerDay
+	cutoffUnix := uint32(nowUnix - 7*secondsPerDay)
+	if ttl := persistentStateFileTTL(snapshotUTime); ttl <= nowUnix {
+		t.Fatalf("persistent state ttl = %d, want after now %d", ttl, nowUnix)
+	}
+
+	snapshot := testArchivePruneBlock(10, 0x10)
+	old := testArchivePruneBlock(150, 0x20)
+	boundary := testArchivePruneBlock(220, 0x30)
+	newer := testArchivePruneBlock(320, 0x40)
+	stateBlock := testServedBlockID(0, int64(-1<<63), 77, 0x50)
+	staleStateBlock := testServedBlockID(0, int64(0x4000000000000000), 78, 0x60)
+
+	saveArchivePruneBlock(t, store, snapshot, snapshotUTime, storage.BlockMetaIsKeyBlock, []byte{0x91})
+	saveArchivePruneBlock(t, store, old, snapshotUTime+uint32(secondsPerDay/2), 0, nil)
+	saveArchivePruneBlock(t, store, boundary, cutoffUnix-1, 0, nil)
+	saveArchivePruneBlock(t, store, newer, cutoffUnix+1, 0, nil)
+	if err = store.SaveBlockMeta(&storage.BlockMeta{
+		ID:                  stateBlock,
+		GenUTime:            snapshotUTime,
+		StartLT:             uint64(stateBlock.SeqNo),
+		EndLT:               uint64(stateBlock.SeqNo + 1),
+		MasterchainRefSeqno: snapshot.SeqNo,
+	}); err != nil {
+		t.Fatalf("save basechain state block meta: %v", err)
+	}
+	if err = store.SaveBlockMeta(&storage.BlockMeta{
+		ID:                  staleStateBlock,
+		Flags:               storage.BlockMetaHasStateSnapshot | storage.BlockMetaHasStateCells,
+		GenUTime:            snapshotUTime,
+		StartLT:             uint64(staleStateBlock.SeqNo),
+		EndLT:               uint64(staleStateBlock.SeqNo + 1),
+		StateRootHash:       bytes.Repeat([]byte{0x61}, 32),
+		MasterchainRefSeqno: snapshot.SeqNo,
+	}); err != nil {
+		t.Fatalf("save stale checkpoint state meta: %v", err)
+	}
+
+	snapshotPath := saveTestPersistentStatePruneFileForBlock(t, store, stateBlock, snapshot)
+	saveTestPersistentStatePruneFile(t, store, boundary)
+	saveTestPersistentStatePruneFile(t, store, newer)
+	masterMeta, err := store.BlockMeta(ctx, snapshot)
+	if err != nil {
+		t.Fatalf("load master meta before archive prune: %v", err)
+	}
+	if masterMeta.Has(storage.BlockMetaHasStateSnapshot) {
+		t.Fatal("basechain-only persistent state unexpectedly marked master meta")
+	}
+
+	stats, err := store.PruneArchivePackages(ctx, cutoffUnix, 0)
+	if err != nil {
+		t.Fatalf("prune archive packages: %v", err)
+	}
+	if stats.DeletedBeforeSeqno != 210 {
+		t.Fatalf("deleted before seqno = %d, want 210", stats.DeletedBeforeSeqno)
+	}
+
+	masterMeta, err = store.BlockMeta(ctx, snapshot)
+	if err != nil {
+		t.Fatalf("load retained master ttl meta: %v", err)
+	}
+	if !isArchivePrunedSnapshotMeta(masterMeta) || len(masterMeta.StateRootHash) != 0 {
+		t.Fatalf("retained master ttl meta = %+v, want compact group marker", masterMeta)
+	}
+	if masterMeta.GenUTime != snapshotUTime {
+		t.Fatalf("retained master gen_utime = %d, want %d", masterMeta.GenUTime, snapshotUTime)
+	}
+	stateMeta, err := store.BlockMeta(ctx, stateBlock)
+	if err != nil {
+		t.Fatalf("load retained basechain state meta: %v", err)
+	}
+	wantStateRootHash := bytes.Repeat([]byte{byte(stateBlock.SeqNo + 1)}, 32)
+	if !isArchivePrunedSnapshotMeta(stateMeta) || !bytes.Equal(stateMeta.StateRootHash, wantStateRootHash) {
+		t.Fatalf("retained basechain state meta = %+v, want compact state-root marker", stateMeta)
+	}
+	if _, err = store.BlockMeta(ctx, staleStateBlock); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("stale checkpoint state meta error = %v, want ErrNotFound", err)
+	}
+	if _, err = store.BlockData(ctx, snapshot); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("pruned snapshot block data error = %v, want ErrNotFound", err)
+	}
+	if _, err = store.BlockProof(ctx, storage.ServedProofBlock, snapshot); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("pruned snapshot block proof error = %v, want ErrNotFound", err)
+	}
+	assertArchiveIndexesMissing := func() {
+		t.Helper()
+
+		for label, key := range map[string][]byte{
+			"master seqno": hotKeyBlockSeqIndex(storage.BlockSeqRefFromBlock(snapshot)),
+			"master lt":    hotKeyBlockLTIndex(storage.BlockSeqRefFromBlock(snapshot), uint64(snapshot.SeqNo+1)),
+			"master utime": hotKeyBlockUTimeIndex(storage.BlockSeqRefFromBlock(snapshot), snapshotUTime),
+			"key block":    hotKeyKeyBlockSeqIndex(snapshot.SeqNo),
+			"state seqno":  hotKeyBlockSeqIndex(storage.BlockSeqRefFromBlock(stateBlock)),
+			"state lt":     hotKeyBlockLTIndex(storage.BlockSeqRefFromBlock(stateBlock), uint64(stateBlock.SeqNo+1)),
+			"state utime":  hotKeyBlockUTimeIndex(storage.BlockSeqRefFromBlock(stateBlock), snapshotUTime),
+		} {
+			if _, indexErr := store.getHotCopy(ctx, key); !errors.Is(indexErr, storage.ErrNotFound) {
+				t.Fatalf("pruned snapshot %s index error = %v, want ErrNotFound", label, indexErr)
+			}
+		}
+	}
+	assertArchiveIndexesMissing()
+
+	resavedPath := saveTestPersistentStatePruneFileForBlock(t, store, stateBlock, snapshot)
+	if resavedPath != snapshotPath {
+		t.Fatalf("re-saved persistent state path = %s, want %s", resavedPath, snapshotPath)
+	}
+	stateMeta, err = store.BlockMeta(ctx, stateBlock)
+	if err != nil {
+		t.Fatalf("load re-saved snapshot meta: %v", err)
+	}
+	if !isArchivePrunedSnapshotMeta(stateMeta) || !bytes.Equal(stateMeta.StateRootHash, wantStateRootHash) {
+		t.Fatalf("re-saved snapshot meta = %+v, want compact state-root marker", stateMeta)
+	}
+	if stateMeta.GenUTime != snapshotUTime {
+		t.Fatalf("re-saved snapshot gen_utime = %d, want %d", stateMeta.GenUTime, snapshotUTime)
+	}
+	file, err := store.PersistentStateFile(ctx, stateBlock, snapshot, 0)
+	if err != nil {
+		t.Fatalf("load re-saved persistent state file: %v", err)
+	}
+	if !bytes.Equal(file.FileHash, bytes.Repeat([]byte{byte(stateBlock.SeqNo)}, 32)) ||
+		!bytes.Equal(file.StateRootHash, wantStateRootHash) {
+		t.Fatalf("re-saved persistent state hashes = file:%x root:%x", file.FileHash, file.StateRootHash)
+	}
+	assertArchiveIndexesMissing()
+
+	stateStats, err := store.PruneExpiredPersistentStateFiles(ctx, nowUnix, 2, 0)
+	if err != nil {
+		t.Fatalf("prune unexpired persistent state: %v", err)
+	}
+	if stateStats.DeletedFileRecords != 0 || stateStats.DeletedDiskFiles != 0 {
+		t.Fatalf("unexpired persistent state deleted records/files = %d/%d, want 0/0", stateStats.DeletedFileRecords, stateStats.DeletedDiskFiles)
+	}
+	assertTestPersistentStatePresentForBlock(t, store, stateBlock, snapshot, snapshotPath)
+
+	expiredNowUnix := persistentStateFileTTL(snapshotUTime) + 1
+	stateStats, err = store.PruneExpiredPersistentStateFiles(ctx, expiredNowUnix, 2, 0)
+	if err != nil {
+		t.Fatalf("prune expired persistent state: %v", err)
+	}
+	if stateStats.DeletedFileRecords != 1 || stateStats.DeletedDiskFiles != 1 {
+		t.Fatalf("expired persistent state deleted records/files = %d/%d, want 1/1", stateStats.DeletedFileRecords, stateStats.DeletedDiskFiles)
+	}
+	assertTestPersistentStatePrunedForBlock(t, store, stateBlock, snapshot, snapshotPath)
+	if _, err = store.BlockMeta(ctx, stateBlock); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expired basechain state compact meta error = %v, want ErrNotFound", err)
+	}
+	assertArchiveIndexesMissing()
+	if _, err = store.BlockMeta(ctx, snapshot); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expired master ttl marker error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestPruneArchivePackagesKeepsKeyProofPackForPrunedKeyBlock(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(Options{Dir: dir})
@@ -2621,8 +2887,14 @@ func saveTestPersistentStatePruneMasterMeta(t *testing.T, store *Store, master t
 func saveTestPersistentStatePruneFile(t *testing.T, store *Store, master ton.BlockIDExt) string {
 	t.Helper()
 
-	data := []byte{byte(master.SeqNo)}
-	name, err := storage.PersistentStateFileName(master, master, 0)
+	return saveTestPersistentStatePruneFileForBlock(t, store, master, master)
+}
+
+func saveTestPersistentStatePruneFileForBlock(t *testing.T, store *Store, block ton.BlockIDExt, master ton.BlockIDExt) string {
+	t.Helper()
+
+	data := []byte{byte(block.SeqNo)}
+	name, err := storage.PersistentStateFileName(block, master, 0)
 	if err != nil {
 		t.Fatalf("persistent state file name: %v", err)
 	}
@@ -2635,14 +2907,14 @@ func saveTestPersistentStatePruneFile(t *testing.T, store *Store, master ton.Blo
 	}
 
 	if err := store.SavePersistentStateFile(&storage.PersistentStateFile{
-		Block:            master,
+		Block:            block,
 		MasterchainBlock: master,
 		EffectiveShard:   0,
 		Ref:              &storage.ArtifactRef{Path: path, Size: int64(len(data))},
-		FileHash:         bytes.Repeat([]byte{byte(master.SeqNo)}, 32),
-		StateRootHash:    bytes.Repeat([]byte{byte(master.SeqNo + 1)}, 32),
+		FileHash:         bytes.Repeat([]byte{byte(block.SeqNo)}, 32),
+		StateRootHash:    bytes.Repeat([]byte{byte(block.SeqNo + 1)}, 32),
 	}); err != nil {
-		t.Fatalf("save persistent state file %s: %v", storage.FormatBlockRef(master), err)
+		t.Fatalf("save persistent state file %s: %v", storage.FormatBlockRef(block), err)
 	}
 	return path
 }
@@ -2650,8 +2922,14 @@ func saveTestPersistentStatePruneFile(t *testing.T, store *Store, master ton.Blo
 func assertTestPersistentStatePruned(t *testing.T, store *Store, master ton.BlockIDExt, path string) {
 	t.Helper()
 
-	if _, err := store.PersistentStateSize(context.Background(), master, master, 0); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("persistent state %s size error = %v, want ErrNotFound", storage.FormatBlockRef(master), err)
+	assertTestPersistentStatePrunedForBlock(t, store, master, master, path)
+}
+
+func assertTestPersistentStatePrunedForBlock(t *testing.T, store *Store, block ton.BlockIDExt, master ton.BlockIDExt, path string) {
+	t.Helper()
+
+	if _, err := store.PersistentStateSize(context.Background(), block, master, 0); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("persistent state %s size error = %v, want ErrNotFound", storage.FormatBlockRef(block), err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("persistent state file %s stat error = %v, want not exist", path, err)
@@ -2661,8 +2939,14 @@ func assertTestPersistentStatePruned(t *testing.T, store *Store, master ton.Bloc
 func assertTestPersistentStatePresent(t *testing.T, store *Store, master ton.BlockIDExt, path string) {
 	t.Helper()
 
-	if _, err := store.PersistentStateSize(context.Background(), master, master, 0); err != nil {
-		t.Fatalf("persistent state %s size: %v", storage.FormatBlockRef(master), err)
+	assertTestPersistentStatePresentForBlock(t, store, master, master, path)
+}
+
+func assertTestPersistentStatePresentForBlock(t *testing.T, store *Store, block ton.BlockIDExt, master ton.BlockIDExt, path string) {
+	t.Helper()
+
+	if _, err := store.PersistentStateSize(context.Background(), block, master, 0); err != nil {
+		t.Fatalf("persistent state %s size: %v", storage.FormatBlockRef(block), err)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("persistent state file %s stat: %v", path, err)

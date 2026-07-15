@@ -11,21 +11,21 @@ import (
 )
 
 type peerStats struct {
-	versionMajor          int32
-	versionMinor          int32
-	capabilitiesFlags     uint32
-	roundtrip             time.Duration
-	unreliability         float64
-	alive                 bool
-	pending               bool
-	lastReceiveAt         time.Time
-	lastSuccessAt         time.Time
-	failedQueries         uint64
-	downloadBytesSec      float64
-	downloadCount         uint64
-	archiveLargeBytesSec  float64
-	archiveLargeDownloads uint64
-	downloadSlowUntil     time.Time
+	versionMajor      int32
+	versionMinor      int32
+	capabilitiesFlags uint32
+	roundtrip         time.Duration
+	unreliability     float64
+	alive             bool
+	pending           bool
+	lastReceiveAt     time.Time
+	lastSuccessAt     time.Time
+	failedQueries     uint64
+	downloadBytesSec  float64
+	downloadCount     uint64
+	downloadSlowUntil time.Time
+	lastPongAt        time.Time
+	probeFailures     uint32
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
@@ -97,21 +97,21 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 	defer p.statsMx.Unlock()
 
 	return peerStats{
-		versionMajor:          p.versionMajor,
-		versionMinor:          p.versionMinor,
-		capabilitiesFlags:     p.capabilitiesFlags,
-		roundtrip:             p.roundtrip,
-		unreliability:         p.unreliability,
-		alive:                 p.alive,
-		pending:               p.pending,
-		lastReceiveAt:         p.lastReceiveAt,
-		lastSuccessAt:         p.lastSuccessAt,
-		failedQueries:         p.failedQueries,
-		downloadBytesSec:      p.downloadBytesSec,
-		downloadCount:         p.downloadCount,
-		archiveLargeBytesSec:  p.archiveLargeBytesSec,
-		archiveLargeDownloads: p.archiveLargeDownloads,
-		downloadSlowUntil:     p.downloadSlowUntil,
+		versionMajor:      p.versionMajor,
+		versionMinor:      p.versionMinor,
+		capabilitiesFlags: p.capabilitiesFlags,
+		roundtrip:         p.roundtrip,
+		unreliability:     p.unreliability,
+		alive:             p.alive,
+		pending:           p.pending,
+		lastReceiveAt:     p.lastReceiveAt,
+		lastSuccessAt:     p.lastSuccessAt,
+		failedQueries:     p.failedQueries,
+		downloadBytesSec:  p.downloadBytesSec,
+		downloadCount:     p.downloadCount,
+		downloadSlowUntil: p.downloadSlowUntil,
+		lastPongAt:        p.lastPongAt,
+		probeFailures:     p.probeFailures,
 	}
 }
 
@@ -182,24 +182,6 @@ func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowTh
 	} else {
 		p.downloadSlowUntil = time.Time{}
 	}
-}
-
-func (p *overlayPeer) archiveLargeDownloadSuccess(bytes int64, elapsed time.Duration) {
-	if bytes < archiveLargeSpeedSampleMinBytes || elapsed <= 0 {
-		return
-	}
-
-	speed := float64(bytes) / elapsed.Seconds()
-
-	p.statsMx.Lock()
-	defer p.statsMx.Unlock()
-
-	p.archiveLargeDownloads++
-	if p.archiveLargeBytesSec == 0 {
-		p.archiveLargeBytesSec = speed
-		return
-	}
-	p.archiveLargeBytesSec = p.archiveLargeBytesSec*0.7 + speed*0.3
 }
 
 func (p *overlayPeer) noteSuccessLocked(now time.Time) bool {
@@ -288,18 +270,14 @@ func announcedNodeIsFresh(node *overlay.Node, now time.Time) bool {
 	return !nodeTime.Before(now.Add(-overlayPeerTTL)) && !nodeTime.After(now.Add(overlayFutureSkew))
 }
 
-func (s *overlaySubscription) preferredPeers(requiredVersionMajor, requiredVersionMinor int32, allow func(*overlayPeer, peerStats) bool) []*overlayPeer {
-	candidates := make([]*overlayPeer, 0, len(s.peers))
-	for _, peer := range s.knownPeersSnapshot() {
+func (s *overlaySubscription) preferredPeers(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
+	known := s.knownPeersSnapshot()
+	candidates := make([]*overlayPeer, 0, len(known))
+	for _, peer := range known {
 		if peer.overlay == nil {
 			continue
 		}
-
-		stats := peer.statsSnapshot()
-		if !peerEligible(stats, requiredVersionMajor, requiredVersionMinor) {
-			continue
-		}
-		if allow != nil && !allow(peer, stats) {
+		if !peerEligible(peer.statsSnapshot(), requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
 		candidates = append(candidates, peer)
@@ -307,58 +285,61 @@ func (s *overlaySubscription) preferredPeers(requiredVersionMajor, requiredVersi
 	return s.orderPreferredPeers(candidates, requiredVersionMajor, requiredVersionMinor)
 }
 
+type rankedPeer struct {
+	peer  *overlayPeer
+	stats peerStats
+}
+
 func (s *overlaySubscription) orderPreferredPeers(candidates []*overlayPeer, requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
 	if len(candidates) == 0 {
 		return nil
 	}
 
+	remaining := make([]rankedPeer, len(candidates))
+	for i, peer := range candidates {
+		remaining[i] = rankedPeer{peer: peer, stats: peer.statsSnapshot()}
+	}
+
 	selected := make([]*overlayPeer, 0, len(candidates))
-	remaining := append([]*overlayPeer(nil), candidates...)
 	for len(remaining) > 0 {
-		chosen := s.choosePeer(remaining, requiredVersionMajor, requiredVersionMinor)
-		if chosen == nil {
-			sortPeersByPreference(remaining)
-			selected = append(selected, remaining...)
+		idx := s.choosePeerIndex(remaining, requiredVersionMajor, requiredVersionMinor)
+		if idx < 0 {
+			sortRankedPeersByPreference(remaining)
+			for _, ranked := range remaining {
+				selected = append(selected, ranked.peer)
+			}
 			break
 		}
 
-		selected = append(selected, chosen)
-		for idx, peer := range remaining {
-			if peer == chosen {
-				remaining = append(remaining[:idx], remaining[idx+1:]...)
-				break
-			}
-		}
+		selected = append(selected, remaining[idx].peer)
+		remaining = append(remaining[:idx], remaining[idx+1:]...)
 	}
 	return selected
 }
 
-func (s *overlaySubscription) choosePeer(peers []*overlayPeer, requiredVersionMajor, requiredVersionMinor int32) *overlayPeer {
+func (s *overlaySubscription) choosePeerIndex(peers []rankedPeer, requiredVersionMajor, requiredVersionMinor int32) int {
 	if len(peers) == 0 {
-		return nil
+		return -1
 	}
 
 	minUnreliability := math.MaxFloat64
-	for _, peer := range peers {
-		stats := peer.statsSnapshot()
-		if !peerEligible(stats, requiredVersionMajor, requiredVersionMinor) {
+	for _, ranked := range peers {
+		if !peerEligible(ranked.stats, requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
-		if stats.unreliability < minUnreliability {
-			minUnreliability = stats.unreliability
+		if ranked.stats.unreliability < minUnreliability {
+			minUnreliability = ranked.stats.unreliability
 		}
 	}
 	if minUnreliability == math.MaxFloat64 {
-		return nil
+		return -1
 	}
-	minRoundtrip := minPeerRoundtrip(peers, requiredVersionMajor, requiredVersionMinor)
+	minRoundtrip := minRankedPeerRoundtrip(peers, requiredVersionMajor, requiredVersionMinor)
 
-	var (
-		best *overlayPeer
-		sum  uint32
-	)
-	for _, peer := range peers {
-		stats := peer.statsSnapshot()
+	best := -1
+	var sum uint32
+	for idx, ranked := range peers {
+		stats := ranked.stats
 		if !peerEligible(stats, requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
@@ -378,22 +359,21 @@ func (s *overlaySubscription) choosePeer(peers []*overlayPeer, requiredVersionMa
 		weight := uint32(1) << (uint32(peerFailUnreliability) - unr)
 		sum += weight
 		if sum == weight || rand.IntN(int(sum)) < int(weight) {
-			best = peer
+			best = idx
 		}
 	}
 
 	return best
 }
 
-func minPeerRoundtrip(peers []*overlayPeer, requiredVersionMajor, requiredVersionMinor int32) time.Duration {
+func minRankedPeerRoundtrip(peers []rankedPeer, requiredVersionMajor, requiredVersionMinor int32) time.Duration {
 	var minRTT time.Duration
-	for _, peer := range peers {
-		stats := peer.statsSnapshot()
-		if !peerEligible(stats, requiredVersionMajor, requiredVersionMinor) || stats.roundtrip <= 0 {
+	for _, ranked := range peers {
+		if !peerEligible(ranked.stats, requiredVersionMajor, requiredVersionMinor) || ranked.stats.roundtrip <= 0 {
 			continue
 		}
-		if minRTT == 0 || stats.roundtrip < minRTT {
-			minRTT = stats.roundtrip
+		if minRTT == 0 || ranked.stats.roundtrip < minRTT {
+			minRTT = ranked.stats.roundtrip
 		}
 	}
 	return minRTT
@@ -436,9 +416,24 @@ func nextPeerRefreshDelay() time.Duration {
 }
 
 func sortPeersByPreference(peers []*overlayPeer) {
+	if len(peers) < 2 {
+		return
+	}
+
+	ranked := make([]rankedPeer, len(peers))
+	for i, peer := range peers {
+		ranked[i] = rankedPeer{peer: peer, stats: peer.statsSnapshot()}
+	}
+	sortRankedPeersByPreference(ranked)
+	for i, entry := range ranked {
+		peers[i] = entry.peer
+	}
+}
+
+func sortRankedPeersByPreference(peers []rankedPeer) {
 	sort.SliceStable(peers, func(i, j int) bool {
-		left := peers[i].statsSnapshot()
-		right := peers[j].statsSnapshot()
+		left := peers[i].stats
+		right := peers[j].stats
 		if left.unreliability != right.unreliability {
 			return left.unreliability < right.unreliability
 		}
@@ -454,7 +449,7 @@ func sortPeersByPreference(peers []*overlayPeer) {
 		if peerRoundtripLess(right, left) {
 			return false
 		}
-		return bytes.Compare(peers[i].id[:], peers[j].id[:]) < 0
+		return bytes.Compare(peers[i].peer.id[:], peers[j].peer.id[:]) < 0
 	})
 }
 
@@ -513,7 +508,7 @@ func (s *overlaySubscription) refreshTargets() []*overlayPeer {
 
 func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
 	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
-	others := s.preferredPeers(requiredVersionMajor, requiredVersionMinor, nil)
+	others := s.preferredPeers(requiredVersionMajor, requiredVersionMinor)
 	return mergePeerCandidates(neighbours, others)
 }
 
@@ -536,28 +531,82 @@ func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requir
 	seen := make(map[PeerID]struct{}, limit)
 	res = appendUniquePeerCandidates(res, seen, neighbours[:neighbourSlots], limit)
 
-	preferred := s.preferredPeers(requiredVersionMajor, requiredVersionMinor, nil)
+	preferred := s.preferredPeers(requiredVersionMajor, requiredVersionMinor)
 	sortPeersByPreference(preferred)
 	return appendUniquePeerCandidates(res, seen, preferred, limit)
 }
 
-func (s *overlaySubscription) rebroadcastCandidates() []*overlayPeer {
-	peers := s.rebroadcastCandidatesMatching(func(_ *overlayPeer, stats peerStats) bool {
-		return stats.alive
-	})
-	if len(peers) > 0 {
-		return peers
-	}
-	return s.rebroadcastCandidatesMatching(nil)
+// broadcastTargetsTTL bounds how stale the cached broadcast fan-out peer set
+// may be: FEC relay peer sets are consulted for every received FEC part, so
+// the set is rebuilt at most once per TTL instead of per part. Membership
+// changes additionally invalidate the cache via notifyPeersChangedLocked.
+const broadcastTargetsTTL = 200 * time.Millisecond
+
+type broadcastTargetsSnapshot struct {
+	builtAt   time.Time
+	peers     []*overlayPeer
+	broadcast []overlay.BroadcastPeer
 }
 
-func (s *overlaySubscription) rebroadcastCandidatesMatching(allow func(*overlayPeer, peerStats) bool) []*overlayPeer {
-	neighbours := s.preferredNeighbourPeers(0, 0)
-	others := s.preferredPeers(0, 0, allow)
-	if allow != nil {
-		neighbours = filterPeerCandidates(neighbours, allow)
+// rebroadcastCandidates returns the deduplicated union of neighbour and known
+// peers: alive ones when any exist, everything known otherwise. All consumers
+// either contact every returned peer or sample from it randomly, so no
+// preference ordering is computed. The slice is cached and shared between
+// callers - it must not be modified.
+func (s *overlaySubscription) rebroadcastCandidates() []*overlayPeer {
+	return s.broadcastTargetsSnapshot().peers
+}
+
+// broadcastPeersSnapshot is rebroadcastCandidates converted for tonutils-go
+// broadcast senders, under the same shared-slice contract.
+func (s *overlaySubscription) broadcastPeersSnapshot() []overlay.BroadcastPeer {
+	return s.broadcastTargetsSnapshot().broadcast
+}
+
+func (s *overlaySubscription) broadcastTargetsSnapshot() *broadcastTargetsSnapshot {
+	if snap := s.broadcastTargets.Load(); snap != nil && time.Since(snap.builtAt) < broadcastTargetsTTL {
+		return snap
 	}
-	return mergePeerCandidates(neighbours, others)
+
+	snap := s.buildBroadcastTargetsSnapshot()
+	s.broadcastTargets.Store(snap)
+	return snap
+}
+
+func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsSnapshot {
+	neighbours := s.neighbourPeerSnapshots()
+	known := s.knownPeersSnapshot()
+
+	capacity := len(neighbours) + len(known)
+	all := make([]*overlayPeer, 0, capacity)
+	alive := make([]*overlayPeer, 0, capacity)
+	seen := make(map[PeerID]struct{}, capacity)
+	for _, list := range [2][]*overlayPeer{neighbours, known} {
+		for _, peer := range list {
+			if _, ok := seen[peer.id]; ok {
+				continue
+			}
+			seen[peer.id] = struct{}{}
+			all = append(all, peer)
+			if peer.statsSnapshot().alive {
+				alive = append(alive, peer)
+			}
+		}
+	}
+
+	peers := all
+	if len(alive) > 0 {
+		peers = alive
+	}
+
+	broadcast := make([]overlay.BroadcastPeer, 0, len(peers))
+	for _, peer := range peers {
+		if peer.overlay == nil {
+			continue
+		}
+		broadcast = append(broadcast, peer.overlay)
+	}
+	return &broadcastTargetsSnapshot{builtAt: time.Now(), peers: peers, broadcast: broadcast}
 }
 
 func mergePeerCandidates(first, second []*overlayPeer) []*overlayPeer {
@@ -586,14 +635,4 @@ func appendUniquePeerCandidates(res []*overlayPeer, seen map[PeerID]struct{}, pe
 		res = append(res, peer)
 	}
 	return res
-}
-
-func filterPeerCandidates(peers []*overlayPeer, allow func(*overlayPeer, peerStats) bool) []*overlayPeer {
-	filtered := peers[:0]
-	for _, peer := range peers {
-		if allow(peer, peer.statsSnapshot()) {
-			filtered = append(filtered, peer)
-		}
-	}
-	return filtered
 }

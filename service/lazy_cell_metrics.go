@@ -26,8 +26,5 @@ func (c *lazyCellLoadCounters) snapshot() []storage.LazyCellLoadMetric {
 }
 
 func (s *Service) LazyCellLoadMetrics() []storage.LazyCellLoadMetric {
-	if s == nil {
-		return nil
-	}
 	return s.lazyCellLoads.snapshot()
 }

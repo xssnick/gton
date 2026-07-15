@@ -46,6 +46,8 @@ const (
 	DefaultLiteSendMessageBroadcastFanout   = 5
 	MinLiteSendMessageBroadcastFanout       = 3
 	MaxLiteSendMessageBroadcastFanout       = 20
+	DefaultHTTPAPIListen                    = "0.0.0.0:8081"
+	DefaultHTTPAPIRequestTimeout            = 10 * time.Second
 	DefaultMetricsNamespace                 = "gton"
 	defaultStorageDir                       = "data"
 	defaultADNLPort                         = 30303
@@ -64,6 +66,7 @@ type Config struct {
 	ADNL                      ADNL            `json:"adnl"`
 	DHT                       DHT             `json:"dht"`
 	Lite                      Lite            `json:"liteserver"`
+	HTTPAPI                   HTTPAPI         `json:"http_api"`
 	Storage                   Storage         `json:"storage"`
 	Metrics                   Metrics         `json:"metrics"`
 	CustomOverlays            []CustomOverlay `json:"custom_overlays"`
@@ -113,6 +116,15 @@ type LiteLimits struct {
 	CoolingPerSec       float64 `json:"cooling_per_sec"`
 	MaxConnectionsPerIP int64   `json:"max_connections_per_ip"`
 	MaxKeepAliveSeconds int64   `json:"max_keep_alive_seconds"`
+	// MaxWaitsPerIP caps parked waitMasterchainSeqno requests per client
+	// address; 0 applies the default of 256.
+	MaxWaitsPerIP int64 `json:"max_waits_per_ip"`
+}
+
+type HTTPAPI struct {
+	Enabled               bool   `json:"enabled"`
+	ListenAddr            string `json:"listen_addr"`
+	RequestTimeoutSeconds int64  `json:"request_timeout_seconds"`
 }
 
 type Storage struct {
@@ -131,17 +143,13 @@ type Storage struct {
 	ArtifactFileMaxOpen              int64  `json:"artifact_file_max_open"`
 }
 
-type DecodedCellCacheOptions struct {
-	Enabled       bool
-	Shards        int
-	BytesPerEntry int64
-	MinEntries    int
-	MaxEntries    int
-}
-
 type LiteSendMessageBroadcastCapacity struct {
 	BytesPerSecond int64
 	MaxDelay       time.Duration
+}
+
+type HTTPAPIOptions struct {
+	RequestTimeout time.Duration
 }
 
 type Metrics struct {
@@ -186,6 +194,10 @@ func defaultConfig() Config {
 			ShardBlockCache:                DefaultLiteShardBlockCache,
 			SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
 			SendMessageBroadcastFanout:     DefaultLiteSendMessageBroadcastFanout,
+		},
+		HTTPAPI: HTTPAPI{
+			ListenAddr:            DefaultHTTPAPIListen,
+			RequestTimeoutSeconds: int64(DefaultHTTPAPIRequestTimeout / time.Second),
 		},
 		Storage: Storage{
 			CellTotalCacheSize:               DefaultCellTotalCache,
@@ -239,12 +251,10 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		return Config{}, fmt.Errorf("resolve storage dir: %w", err)
 	}
 
+	// Everything except the generated keys, listen/external addresses, and the
+	// resolved paths matches defaultConfig() exactly.
 	cfg := defaultConfig()
 	cfg.TON.GlobalConfigPath = globalConfigPath
-	cfg.TON.NextCheckpointBlocks = DefaultNextCheckpointBlocks
-	cfg.TON.ArchiveCheckpointBlocks = DefaultArchiveCheckpointBlocks
-	cfg.TON.CheckpointBytes = DefaultCheckpointBytes
-	cfg.TON.SyncBackpressureWindows = DefaultSyncBackpressureWindows
 	cfg.ADNL = ADNL{
 		Key:          adnlSeed,
 		ListenAddr:   defaultADNLListen,
@@ -254,30 +264,9 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		Key:        dhtSeed,
 		ListenAddr: defaultDHTListen,
 	}
-	cfg.Lite = Lite{
-		Enabled:                        false,
-		Key:                            liteSeed,
-		ListenAddr:                     DefaultLiteListen,
-		MasterBlockCache:               DefaultLiteMasterBlockCache,
-		ShardBlockCache:                DefaultLiteShardBlockCache,
-		SendMessageBroadcastMaxDelayMS: int64(DefaultLiteSendMessageBroadcastMaxDelay / time.Millisecond),
-		SendMessageBroadcastFanout:     DefaultLiteSendMessageBroadcastFanout,
-	}
-	cfg.Storage = Storage{
-		Dir:                              storageDir,
-		CellTotalCacheSize:               DefaultCellTotalCache,
-		DecodedCellCacheEnabled:          DefaultDecodedCellCacheEnabled,
-		DecodedCellCacheShards:           DefaultDecodedCellCacheShards,
-		DecodedCellCacheBytesPerEntry:    DefaultDecodedCellCacheBytesPerEntry,
-		DecodedCellCacheMinEntries:       DefaultDecodedCellCacheMinEntries,
-		DecodedCellCacheMaxEntries:       DefaultDecodedCellCacheMaxEntries,
-		CellShardMemTableSize:            DefaultCellShardMemTable,
-		CellMemTableStopWritesThreshold:  DefaultCellMemTableStopWritesThreshold,
-		LargeBOCShardReadWorkers:         DefaultLargeBOCShardReadWorkers,
-		PersistentStateLargeBOCBatchSize: DefaultPersistentStateLargeBOCBatchSize,
-		StateSerializeOnePass:            false,
-		ArtifactFileMaxOpen:              DefaultArtifactFileMaxOpen,
-	}
+	cfg.Lite.Key = liteSeed
+	cfg.Lite.ListenAddr = DefaultLiteListen
+	cfg.Storage.Dir = storageDir
 
 	return cfg, nil
 }
@@ -350,272 +339,6 @@ func Load(path string) (Config, error) {
 	}
 
 	return cfg, nil
-}
-
-func (cfg Config) StorageDir() string {
-	return strings.TrimSpace(cfg.Storage.Dir)
-}
-
-func (cfg Config) CellTotalCacheSize() (int64, error) {
-	if cfg.Storage.CellTotalCacheSize < 0 {
-		return 0, fmt.Errorf("storage.cell_total_cache_size cannot be negative")
-	}
-	if cfg.Storage.CellTotalCacheSize == 0 {
-		return DefaultCellTotalCache, nil
-	}
-	return cfg.Storage.CellTotalCacheSize, nil
-}
-
-func (cfg Config) DecodedCellCacheOptions() (DecodedCellCacheOptions, error) {
-	opts := DecodedCellCacheOptions{
-		Enabled:       cfg.Storage.DecodedCellCacheEnabled,
-		BytesPerEntry: cfg.Storage.DecodedCellCacheBytesPerEntry,
-	}
-	if cfg.Storage.DecodedCellCacheShards < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards cannot be negative")
-	}
-	if cfg.Storage.DecodedCellCacheBytesPerEntry < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_bytes_per_entry cannot be negative")
-	}
-	if cfg.Storage.DecodedCellCacheMinEntries < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot be negative")
-	}
-	if cfg.Storage.DecodedCellCacheMaxEntries < 0 {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries cannot be negative")
-	}
-	if cfg.Storage.DecodedCellCacheMinEntries > int64(int(^uint(0)>>1)) {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries is too large")
-	}
-	if cfg.Storage.DecodedCellCacheMaxEntries > int64(int(^uint(0)>>1)) {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries is too large")
-	}
-	if cfg.Storage.DecodedCellCacheShards > int64(int(^uint(0)>>1)) {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards is too large")
-	}
-	opts.Shards = int(cfg.Storage.DecodedCellCacheShards)
-	opts.MinEntries = int(cfg.Storage.DecodedCellCacheMinEntries)
-	opts.MaxEntries = int(cfg.Storage.DecodedCellCacheMaxEntries)
-	if opts.Shards == 0 {
-		opts.Shards = int(DefaultDecodedCellCacheShards)
-	}
-	if opts.BytesPerEntry == 0 {
-		opts.BytesPerEntry = DefaultDecodedCellCacheBytesPerEntry
-	}
-	if opts.MinEntries == 0 {
-		opts.MinEntries = int(DefaultDecodedCellCacheMinEntries)
-	}
-	if opts.MaxEntries == 0 {
-		opts.MaxEntries = int(DefaultDecodedCellCacheMaxEntries)
-	}
-	if opts.MinEntries > opts.MaxEntries {
-		return DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot exceed storage.decoded_cell_cache_max_entries")
-	}
-	return opts, nil
-}
-
-func (cfg Config) CellShardMemTableSize() (int, error) {
-	if cfg.Storage.CellShardMemTableSize < 0 {
-		return 0, fmt.Errorf("storage.cell_shard_memtable_size cannot be negative")
-	}
-	value := cfg.Storage.CellShardMemTableSize
-	if value == 0 {
-		value = DefaultCellShardMemTable
-	}
-	maxInt := int64(int(^uint(0) >> 1))
-	if value > maxInt {
-		return 0, fmt.Errorf("storage.cell_shard_memtable_size is too large")
-	}
-	return int(value), nil
-}
-
-func (cfg Config) CellMemTableStopWritesThreshold() (int, error) {
-	if cfg.Storage.CellMemTableStopWritesThreshold < 0 {
-		return 0, fmt.Errorf("storage.cell_memtable_stop_writes_threshold cannot be negative")
-	}
-	value := cfg.Storage.CellMemTableStopWritesThreshold
-	if value == 0 {
-		value = DefaultCellMemTableStopWritesThreshold
-	}
-	maxInt := int64(int(^uint(0) >> 1))
-	if value > maxInt {
-		return 0, fmt.Errorf("storage.cell_memtable_stop_writes_threshold is too large")
-	}
-	return int(value), nil
-}
-
-func (cfg Config) LargeBOCShardReadWorkers() (int, error) {
-	if cfg.Storage.LargeBOCShardReadWorkers < 0 {
-		return 0, fmt.Errorf("storage.large_boc_shard_read_workers cannot be negative")
-	}
-	value := cfg.Storage.LargeBOCShardReadWorkers
-	if value == 0 {
-		value = DefaultLargeBOCShardReadWorkers
-	}
-	maxInt := int64(int(^uint(0) >> 1))
-	if value > maxInt {
-		return 0, fmt.Errorf("storage.large_boc_shard_read_workers is too large")
-	}
-	return int(value), nil
-}
-
-func (cfg Config) PersistentStateLargeBOCBatchSize() (int, error) {
-	if cfg.Storage.PersistentStateLargeBOCBatchSize < 0 {
-		return 0, fmt.Errorf("storage.persistent_state_large_boc_batch_size cannot be negative")
-	}
-	value := cfg.Storage.PersistentStateLargeBOCBatchSize
-	if value == 0 {
-		value = DefaultPersistentStateLargeBOCBatchSize
-	}
-	maxInt := int64(int(^uint(0) >> 1))
-	if value > maxInt {
-		return 0, fmt.Errorf("storage.persistent_state_large_boc_batch_size is too large")
-	}
-	return int(value), nil
-}
-
-func (cfg Config) ArtifactFileMaxOpen() (int, error) {
-	if cfg.Storage.ArtifactFileMaxOpen < 0 {
-		return 0, fmt.Errorf("storage.artifact_file_max_open cannot be negative")
-	}
-	value := cfg.Storage.ArtifactFileMaxOpen
-	if value == 0 {
-		value = DefaultArtifactFileMaxOpen
-	}
-	maxInt := int64(int(^uint(0) >> 1))
-	if value > maxInt {
-		return 0, fmt.Errorf("storage.artifact_file_max_open is too large")
-	}
-	return int(value), nil
-}
-
-func (cfg Config) GlobalConfigPath() string {
-	path := strings.TrimSpace(cfg.TON.GlobalConfigPath)
-	if path == "" {
-		return DefaultGlobalConfigPath
-	}
-	return path
-}
-
-func (cfg Config) SyncBefore() (time.Duration, error) {
-	if cfg.ArchiveFromZero() {
-		return 0, nil
-	}
-	if cfg.TON.SyncBefore <= 0 {
-		return 0, fmt.Errorf("ton.sync_before should be positive seconds")
-	}
-	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
-	if cfg.TON.SyncBefore > maxDurationSeconds {
-		return 0, fmt.Errorf("ton.sync_before is too large")
-	}
-	return time.Duration(cfg.TON.SyncBefore) * time.Second, nil
-}
-
-func (cfg Config) SyncUntil() (uint32, error) {
-	if cfg.TON.SyncUntil < 0 {
-		return 0, fmt.Errorf("ton.sync_until cannot be negative")
-	}
-	if cfg.TON.SyncUntil == 0 {
-		return 0, nil
-	}
-	if cfg.TON.SyncUntil > int64(^uint32(0)) {
-		return 0, fmt.Errorf("ton.sync_until is too large")
-	}
-	return uint32(cfg.TON.SyncUntil), nil
-}
-
-func (cfg Config) ArchiveFromZero() bool {
-	return cfg.TON.SyncBefore == ArchiveFromZeroSyncBefore
-}
-
-func (cfg Config) StateTTL() (time.Duration, error) {
-	if cfg.TON.StateTTL < 0 {
-		return 0, fmt.Errorf("ton.state_ttl cannot be negative")
-	}
-	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
-	if cfg.TON.StateTTL > maxDurationSeconds {
-		return 0, fmt.Errorf("ton.state_ttl is too large")
-	}
-	return time.Duration(cfg.TON.StateTTL) * time.Second, nil
-}
-
-func (cfg Config) ArchiveTTL() (time.Duration, error) {
-	if cfg.TON.ArchiveTTL < 0 {
-		return 0, fmt.Errorf("ton.archive_ttl cannot be negative")
-	}
-	const maxDurationSeconds = int64(time.Duration(1<<63-1) / time.Second)
-	if cfg.TON.ArchiveTTL > maxDurationSeconds {
-		return 0, fmt.Errorf("ton.archive_ttl is too large")
-	}
-	return time.Duration(cfg.TON.ArchiveTTL) * time.Second, nil
-}
-
-func (cfg Config) NextCheckpointBlocks() (uint32, error) {
-	return uint32ConfigValue("ton.next_checkpoint_blocks", cfg.TON.NextCheckpointBlocks, uint32(DefaultNextCheckpointBlocks))
-}
-
-func (cfg Config) ArchiveCheckpointBlocks() (uint32, error) {
-	return uint32ConfigValue("ton.archive_checkpoint_blocks", cfg.TON.ArchiveCheckpointBlocks, uint32(DefaultArchiveCheckpointBlocks))
-}
-
-func (cfg Config) CheckpointBytes() (uint64, error) {
-	if cfg.TON.CheckpointBytes < 0 {
-		return 0, fmt.Errorf("ton.checkpoint_bytes cannot be negative")
-	}
-	if cfg.TON.CheckpointBytes == 0 {
-		return uint64(DefaultCheckpointBytes), nil
-	}
-	return uint64(cfg.TON.CheckpointBytes), nil
-}
-
-func (cfg Config) SyncBackpressureWindows() (uint32, error) {
-	return uint32ConfigValue("ton.sync_backpressure_windows", cfg.TON.SyncBackpressureWindows, uint32(DefaultSyncBackpressureWindows))
-}
-
-func (cfg Config) LiteSendMessageBroadcastCapacity() (LiteSendMessageBroadcastCapacity, error) {
-	if cfg.Lite.SendMessageBroadcastBytesPerSecond < 0 {
-		return LiteSendMessageBroadcastCapacity{}, fmt.Errorf("liteserver.send_message_broadcast_bytes_per_second cannot be negative")
-	}
-	if cfg.Lite.SendMessageBroadcastMaxDelayMS < 0 {
-		return LiteSendMessageBroadcastCapacity{}, fmt.Errorf("liteserver.send_message_broadcast_max_delay_ms cannot be negative")
-	}
-
-	delayMS := cfg.Lite.SendMessageBroadcastMaxDelayMS
-	const maxDurationMilliseconds = int64(time.Duration(1<<63-1) / time.Millisecond)
-	if delayMS > maxDurationMilliseconds {
-		return LiteSendMessageBroadcastCapacity{}, fmt.Errorf("liteserver.send_message_broadcast_max_delay_ms is too large")
-	}
-
-	return LiteSendMessageBroadcastCapacity{
-		BytesPerSecond: cfg.Lite.SendMessageBroadcastBytesPerSecond,
-		MaxDelay:       time.Duration(delayMS) * time.Millisecond,
-	}, nil
-}
-
-func (cfg Config) LiteSendMessageBroadcastFanout() (int, error) {
-	fanout := cfg.Lite.SendMessageBroadcastFanout
-	if fanout == 0 {
-		return DefaultLiteSendMessageBroadcastFanout, nil
-	}
-	if fanout < MinLiteSendMessageBroadcastFanout {
-		return 0, fmt.Errorf("liteserver.send_message_broadcast_fanout cannot be less than %d", MinLiteSendMessageBroadcastFanout)
-	}
-	if fanout > MaxLiteSendMessageBroadcastFanout {
-		return 0, fmt.Errorf("liteserver.send_message_broadcast_fanout cannot exceed %d", MaxLiteSendMessageBroadcastFanout)
-	}
-	return fanout, nil
-}
-
-func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, error) {
-	if value < 0 {
-		return 0, fmt.Errorf("%s cannot be negative", field)
-	}
-	if value == 0 {
-		return defaultValue, nil
-	}
-	if value > int64(^uint32(0)) {
-		return 0, fmt.Errorf("%s is too large", field)
-	}
-	return uint32(value), nil
 }
 
 func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bool) (EnsureGlobalConfigResult, error) {

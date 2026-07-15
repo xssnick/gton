@@ -78,6 +78,37 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 			}
 		}
 	})
+
+	b.Run("newest-of-32-pending", func(b *testing.B) {
+		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		cache.active = newStateCellEncodedCache(1)
+		cache.pending = make([]*stateCellEncodedCache, 32)
+		for i := 0; i < len(cache.pending)-1; i++ {
+			other := cell.BeginCell().MustStoreUInt(uint64(i+1), 32).EndCell()
+			pending := newStateCellEncodedCache(1)
+			if err := pending.stageRecords(mustPreparedReachableStateCells(b, other), nil).enqueue(); err != nil {
+				b.Fatalf("add pending records: %v", err)
+			}
+			cache.pending[i] = pending
+		}
+		newest := newStateCellEncodedCache(records.Len())
+		if err := newest.stageRecords(records, nil).enqueue(); err != nil {
+			b.Fatalf("add newest pending records: %v", err)
+		}
+		cache.pending[len(cache.pending)-1] = newest
+		load := cache.loader()
+
+		b.ReportAllocs()
+		for b.Loop() {
+			loaded, err := load(rootHash)
+			if err != nil {
+				b.Fatalf("load root: %v", err)
+			}
+			if loaded.HashKey() != rootHash {
+				b.Fatalf("loaded root hash mismatch")
+			}
+		}
+	})
 }
 
 func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
@@ -89,7 +120,7 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 	rootHash := root.HashKey()
 
 	b.Run("active-root-hit", func(b *testing.B) {
-		overlay := newArchiveStateCellOverlay(rejectingBenchmarkCellLoader)
+		overlay := newStateCellWindowCache(rejectingBenchmarkCellLoader)
 		overlay.addPreparedRecords(records)
 		load := overlay.loader()
 
@@ -107,7 +138,7 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 	})
 
 	b.Run("pending-root-hit", func(b *testing.B) {
-		overlay := newArchiveStateCellOverlay(rejectingBenchmarkCellLoader)
+		overlay := newStateCellWindowCache(rejectingBenchmarkCellLoader)
 		overlay.addPreparedRecords(records)
 		checkpoint := overlay.beginCheckpoint()
 		if checkpoint == nil {

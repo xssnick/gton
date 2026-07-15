@@ -113,9 +113,6 @@ func (q *boundedQueue[T]) popLocked() (T, bool) {
 	q.items[0] = queuedItem[T]{}
 	q.items = q.items[1:]
 	q.bytes -= item.bytes
-	if q.bytes < 0 {
-		q.bytes = 0
-	}
 	if len(q.items) > 0 {
 		select {
 		case q.notify <- struct{}{}:

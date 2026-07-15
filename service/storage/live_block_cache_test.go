@@ -16,7 +16,7 @@ func TestLiveBlockCachePinsUnflushedArtifactsUntilFlush(t *testing.T) {
 	firstData := []byte{0x11}
 	firstProof := []byte{0x21}
 
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     first,
 		BlockData: firstData,
 		Proofs: []LiveBlockProofArtifact{{
@@ -26,7 +26,7 @@ func TestLiveBlockCachePinsUnflushedArtifactsUntilFlush(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publish first block: %v", err)
 	}
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     second,
 		BlockData: []byte{0x12},
 	}); err != nil {
@@ -60,14 +60,14 @@ func TestLiveBlockCacheEvictsFlushedArtifacts(t *testing.T) {
 	first := testLiveBlockCacheBlockID(1)
 	second := testLiveBlockCacheBlockID(2)
 
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:           first,
 		BlockData:       []byte{0x11},
 		ArtifactFlushed: true,
 	}); err != nil {
 		t.Fatalf("publish first block: %v", err)
 	}
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:           second,
 		BlockData:       []byte{0x12},
 		ArtifactFlushed: true,
@@ -88,7 +88,7 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 	block := testLiveBlockCacheBlockID(1)
 	data := []byte{0x11}
 
-	if err := cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     block,
 		BlockData: data,
 	}); err != nil {
@@ -105,7 +105,7 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 		t.Fatalf("cached block data = %x, want %x", cached.Data, data)
 	}
 
-	if err = cache.PublishLiveBlockArtifacts(LiveBlockArtifacts{
+	if err = cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:           block,
 		ArtifactFlushed: true,
 	}); err != nil {
@@ -117,6 +117,70 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 	}
 	if !cached.ArtifactFlushed {
 		t.Fatal("flushed block data reported as unflushed")
+	}
+}
+
+func TestLiveBlockCacheRejectsInvalidBlockID(t *testing.T) {
+	cache := NewLiveBlockCache(1)
+
+	err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
+		Block:     ton.BlockIDExt{},
+		BlockData: []byte{0x11},
+	})
+	if !errors.Is(err, ErrInvalidBlockIDHashes) {
+		t.Fatalf("publish invalid block error = %v, want ErrInvalidBlockIDHashes", err)
+	}
+}
+
+func TestLiveBlockCacheRequiresFullBlockIDOnRead(t *testing.T) {
+	cache := NewLiveBlockCache(2)
+	block := testLiveBlockCacheBlockID(1)
+	prev := testLiveBlockCacheBlockID(0)
+	data := []byte{0x11}
+	proof := []byte{0x21}
+
+	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
+		Block:     block,
+		BlockData: data,
+		Meta:      &BlockMeta{ID: block, PrevRefs: []ton.BlockIDExt{prev}},
+		Proofs: []LiveBlockProofArtifact{{
+			Kind: ServedProofBlock,
+			Data: proof,
+		}},
+	}); err != nil {
+		t.Fatalf("publish block: %v", err)
+	}
+
+	forgedBlock := block
+	forgedBlock.FileHash = bytes.Repeat([]byte{0xff}, 32)
+	if _, err := cache.BlockData(t.Context(), forgedBlock); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("forged block data error = %v, want ErrNotFound", err)
+	}
+	if _, err := cache.BlockProof(t.Context(), ServedProofBlock, forgedBlock); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("forged block proof error = %v, want ErrNotFound", err)
+	}
+	if _, err := cache.BlockFull(t.Context(), forgedBlock); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("forged full block error = %v, want ErrNotFound", err)
+	}
+	if cache.HasBlockData(forgedBlock) {
+		t.Fatal("forged block reported cached data")
+	}
+
+	forgedPrev := prev
+	forgedPrev.SeqNo++
+	if _, err := cache.NextBlockFull(t.Context(), forgedPrev); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("next block for forged previous id error = %v, want ErrNotFound", err)
+	}
+
+	gotData, err := cache.BlockData(t.Context(), block)
+	if err != nil {
+		t.Fatalf("canonical block data: %v", err)
+	}
+	if !bytes.Equal(gotData, data) {
+		t.Fatalf("canonical block data = %x, want %x", gotData, data)
+	}
+	if _, err = cache.NextBlockFull(t.Context(), prev); err != nil {
+		t.Fatalf("next block for canonical previous id: %v", err)
 	}
 }
 

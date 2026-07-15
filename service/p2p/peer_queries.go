@@ -141,9 +141,10 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 	defer cancel()
 
 	startedAt := time.Now()
-	queryKind := queryTypeName(req)
+	// Event.Type only evaluates the %T reflection when the event is enabled,
+	// keeping the disabled trace/debug paths free of per-query fmt.Sprintf.
 	queryLog := s.log.Trace().
-		Str("kind", queryKind)
+		Type("kind", req)
 	if peer != nil {
 		queryLog = queryLog.Str("peer", peer.addr)
 	}
@@ -161,7 +162,7 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		}
 		logEvt := s.log.Debug().
 			Err(err).
-			Str("kind", queryKind)
+			Type("kind", req)
 		if peer != nil {
 			logEvt = logEvt.Str("peer", peer.addr)
 		}
@@ -169,8 +170,8 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		return err
 	}
 	answerLog := s.log.Trace().
-		Str("kind", queryKind).
-		Str("response", queryTypeName(resp)).
+		Type("kind", req).
+		Type("response", resp).
 		Dur("elapsed", time.Since(startedAt))
 	if peer != nil {
 		answerLog = answerLog.Str("peer", peer.addr)
@@ -188,7 +189,7 @@ func (s *overlaySubscription) sendForgetPeer(ctx context.Context, peer *overlayP
 		return
 	}
 	_ = peer.overlay.SendCustomMessage(ctx, ForgetPeer{})
-	s.removePeer(peer.id)
+	s.removePeerIfCurrent(peer)
 }
 
 func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overlayPeer, req any) (tl.Serializable, error) {
@@ -478,10 +479,16 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 
 func (s *overlaySubscription) servePrepareZeroState(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
 	data, err := s.node.peerStorage.ZeroState(ctx, block)
-	if err == nil && len(data) > 0 {
-		return PreparedState{}, nil
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return NotFoundState{}, nil
 	}
-	return NotFoundState{}, nil
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return NotFoundState{}, nil
+	}
+	return PreparedState{}, nil
 }
 
 func (s *overlaySubscription) serveZeroStateData(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
@@ -681,10 +688,6 @@ func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
 			s.log.Debug().Err(err).Msg("failed to connect peer learned from overlay query")
 		}
 	}
-}
-
-func queryTypeName(query any) string {
-	return fmt.Sprintf("%T", query)
 }
 
 func (s *overlaySubscription) hasStoredProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (bool, error) {

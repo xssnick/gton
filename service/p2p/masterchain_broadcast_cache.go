@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -86,6 +85,8 @@ func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now 
 		meta:         downloaded.Meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
 		bytes:        size,
+
+		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
 
 	c.storeEntry(entry, now)
@@ -100,7 +101,7 @@ func (c *masterchainNextBroadcastCache) blockAfterAt(prev ton.BlockIDExt, now ti
 	if !isMasterchainBlock(prev) {
 		return nil, tnstore.ErrNotFound
 	}
-	return c.broadcastBlockCache.blockAt(tnstore.BlockKey(prev), now)
+	return c.blockAt(tnstore.BlockKey(prev), now)
 }
 
 func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
@@ -131,45 +132,25 @@ func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock
 	return true
 }
 
-func (n *Node) masterchainNextBroadcastBlock(prev ton.BlockIDExt) (*DownloadedBlock, error) {
-	return n.masterchainNextBroadcastCache.BlockAfter(prev)
-}
-
-func (n *Node) watchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan struct{}, func()) {
+// WatchMasterchainNextBroadcastBlock returns a channel that is closed when a
+// decoded masterchain broadcast following prev lands in the next-broadcast
+// cache, plus an unwatch func. A nil channel means prev is not masterchain.
+func (n *Node) WatchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan struct{}, func()) {
 	if !isMasterchainBlock(prev) {
 		return nil, func() {}
 	}
 
 	key := tnstore.BlockKey(prev)
-	ch := make(chan struct{})
+	return n.masterchainNextBroadcastWaiters.watch(key)
+}
 
-	n.masterchainNextBroadcastWaitMx.Lock()
-	if n.masterchainNextBroadcastWaiters == nil {
-		n.masterchainNextBroadcastWaiters = map[tnstore.BlockRootHash][]chan struct{}{}
+// HasMasterchainNextBroadcastBlock reports whether a decoded masterchain
+// broadcast following prev is already in the next-broadcast cache.
+func (n *Node) HasMasterchainNextBroadcastBlock(prev ton.BlockIDExt) bool {
+	if !isMasterchainBlock(prev) {
+		return false
 	}
-	n.masterchainNextBroadcastWaiters[key] = append(n.masterchainNextBroadcastWaiters[key], ch)
-	n.masterchainNextBroadcastWaitMx.Unlock()
-
-	var once sync.Once
-	cancel := func() {
-		once.Do(func() {
-			n.masterchainNextBroadcastWaitMx.Lock()
-			waiters := n.masterchainNextBroadcastWaiters[key]
-			for i, waiter := range waiters {
-				if waiter == ch {
-					waiters = append(waiters[:i], waiters[i+1:]...)
-					break
-				}
-			}
-			if len(waiters) == 0 {
-				delete(n.masterchainNextBroadcastWaiters, key)
-			} else {
-				n.masterchainNextBroadcastWaiters[key] = waiters
-			}
-			n.masterchainNextBroadcastWaitMx.Unlock()
-		})
-	}
-	return ch, cancel
+	return n.masterchainNextBroadcastCache.has(tnstore.BlockKey(prev), time.Now())
 }
 
 func (n *Node) notifyMasterchainNextBroadcastBlock(prev ton.BlockIDExt) {
@@ -178,13 +159,5 @@ func (n *Node) notifyMasterchainNextBroadcastBlock(prev ton.BlockIDExt) {
 	}
 
 	key := tnstore.BlockKey(prev)
-
-	n.masterchainNextBroadcastWaitMx.Lock()
-	waiters := n.masterchainNextBroadcastWaiters[key]
-	delete(n.masterchainNextBroadcastWaiters, key)
-	n.masterchainNextBroadcastWaitMx.Unlock()
-
-	for _, waiter := range waiters {
-		close(waiter)
-	}
+	n.masterchainNextBroadcastWaiters.notify(key)
 }

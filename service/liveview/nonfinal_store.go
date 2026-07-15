@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -27,17 +28,19 @@ type liveNonfinalCellIndexEntry struct {
 }
 
 type liveNonfinalWaiting struct {
-	artifacts storage.LiveBlockArtifacts
-	kind      storage.LiveBlockNonfinalKind
+	artifacts            storage.LiveBlockArtifacts
+	kind                 storage.LiveBlockNonfinalKind
+	validatedStateUpdate *cell.Cell
 }
 
 type liveNonfinalWaitingSnapshot struct {
-	artifacts storage.LiveBlockArtifacts
-	kind      storage.LiveBlockNonfinalKind
+	artifacts            storage.LiveBlockArtifacts
+	kind                 storage.LiveBlockNonfinalKind
+	validatedStateUpdate *cell.Cell
 }
 
 func (s *Store) PublishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) error {
-	published, err := s.publishNonfinalBlockArtifacts(artifacts, kind, true)
+	published, err := s.publishNonfinalBlockArtifacts(artifacts, kind, true, nil)
 	if err != nil {
 		return err
 	}
@@ -51,7 +54,7 @@ func (s *Store) NonfinalBlockCacheEnabled() bool {
 	return s.nonFinalEnabled
 }
 
-func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool) (bool, error) {
+func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool, validatedStateUpdate *cell.Cell) (bool, error) {
 	if !s.nonFinalEnabled {
 		return false, nil
 	}
@@ -81,6 +84,34 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	}
 
 	key := storage.BlockKey(block)
+	s.mu.Lock()
+	if pending, ok := s.nonFinalPending[key]; ok {
+		// The pending map is keyed by the block root hash, so an existing entry
+		// already holds identical content (typically the candidate broadcast that
+		// preceded this signed one). Merge the kind bit directly instead of
+		// re-running the whole parse/apply/index pipeline; a bare map write keeps
+		// the order and cell indexes untouched.
+		if pending.kind&kind != kind {
+			pending.kind |= kind
+			s.nonFinalPending[key] = pending
+		}
+		s.deleteNonfinalWaitingLocked(key)
+		s.mu.Unlock()
+		return false, nil
+	}
+	s.mu.Unlock()
+
+	// Parsed metadata is enough to decide whether this block can be prepared.
+	// Do not validate a potentially large state update until its predecessors exist.
+	if artifacts.Meta != nil {
+		s.mu.Lock()
+		ready := s.nonfinalReadyToPrepareLocked(key, block, artifacts.Meta, original, kind, keepWaiting, validatedStateUpdate)
+		s.mu.Unlock()
+		if !ready {
+			return false, nil
+		}
+	}
+
 	loader := s.nonfinalBlockCellLoader(block)
 	var state *storage.BlockState
 	var meta *storage.BlockMeta
@@ -88,16 +119,18 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	var update *cell.Cell
 	var err error
 	if artifacts.State != nil {
-		s.mu.Lock()
-		ready := s.nonfinalReadyToPrepareLocked(key, block, artifacts.Meta, original, kind, keepWaiting)
-		s.mu.Unlock()
-		if !ready {
-			return false, nil
+		if artifacts.Meta == nil {
+			s.mu.Lock()
+			ready := s.nonfinalReadyToPrepareLocked(key, block, artifacts.Meta, original, kind, keepWaiting, validatedStateUpdate)
+			s.mu.Unlock()
+			if !ready {
+				return false, nil
+			}
 		}
 
 		state, meta, cells, err = nonfinalStateFromSnapshot(artifacts, loader)
 	} else {
-		parsed, parseErr := nonfinalParseStateUpdate(artifacts)
+		parsed, parseErr := nonfinalParseStateUpdate(artifacts, kind&storage.LiveBlockNonfinalCandidate == 0, validatedStateUpdate)
 		if parseErr != nil {
 			if keepWaiting {
 				s.deleteNonfinalWaiting(block)
@@ -107,15 +140,24 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 		artifacts.Root = parsed.root
 		meta = parsed.meta
 		update = parsed.update
+		validatedStateUpdate = parsed.validatedStateUpdate
 		artifacts.Meta = storage.MergeBlockMeta(meta, artifacts.Meta)
+		// Waiting entries are remembered from `original`; carry the parse results
+		// over so promotion retries skip re-deriving them from the raw block.
+		original.Root = parsed.root
+		original.StateUpdate = parsed.update
+		original.Meta = artifacts.Meta
 		if s.nonfinalTooFarAheadOfCurrentMaster(artifacts.Meta) {
 			s.deleteNonfinalWaiting(block)
 			return false, nil
 		}
 
 		s.mu.Lock()
-		ready := s.nonfinalReadyToPrepareLocked(key, block, artifacts.Meta, original, kind, keepWaiting)
+		ready, readyErr := s.nonfinalStateUpdateReadyLocked(key, block, artifacts.Meta, update, original, kind, keepWaiting, validatedStateUpdate)
 		s.mu.Unlock()
+		if readyErr != nil {
+			return false, readyErr
+		}
 		if !ready {
 			return false, nil
 		}
@@ -145,7 +187,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	artifacts.Meta = nonfinalStateOnlyMeta(artifacts.Meta)
 
 	s.mu.Lock()
-	ready := s.nonfinalReadyToPrepareLocked(key, block, artifacts.Meta, original, kind, keepWaiting)
+	ready := s.nonfinalReadyToPrepareLocked(key, block, artifacts.Meta, original, kind, keepWaiting, validatedStateUpdate)
 	s.mu.Unlock()
 	if !ready {
 		return false, nil
@@ -160,7 +202,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	}
 
 	s.mu.Lock()
-	ready, err = s.nonfinalReadyToPublishLocked(key, block, prepared.meta, update, original, kind, keepWaiting)
+	ready, err = s.nonfinalStateUpdateReadyLocked(key, block, prepared.meta, update, original, kind, keepWaiting, validatedStateUpdate)
 	if !ready || err != nil {
 		s.mu.Unlock()
 		return false, err
@@ -184,14 +226,14 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	return true, nil
 }
 
-func (s *Store) nonfinalReadyToPrepareLocked(key storage.BlockRootHash, block ton.BlockIDExt, meta *storage.BlockMeta, original storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool) bool {
+func (s *Store) nonfinalReadyToPrepareLocked(key storage.BlockRootHash, block ton.BlockIDExt, meta *storage.BlockMeta, original storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool, validatedStateUpdate *cell.Cell) bool {
 	if s.nonfinalCoveredByCurrentLocked(block) {
 		s.deleteNonfinalWaitingLocked(key)
 		return false
 	}
 	if !s.nonfinalPrevRefsReadyLocked(meta) {
 		if keepWaiting {
-			s.rememberNonfinalWaitingLocked(original, kind)
+			s.rememberNonfinalWaitingLocked(original, kind, validatedStateUpdate)
 			s.trimNonfinalWaitingLocked()
 		}
 		return false
@@ -199,8 +241,10 @@ func (s *Store) nonfinalReadyToPrepareLocked(key storage.BlockRootHash, block to
 	return true
 }
 
-func (s *Store) nonfinalReadyToPublishLocked(key storage.BlockRootHash, block ton.BlockIDExt, meta *storage.BlockMeta, update *cell.Cell, original storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool) (bool, error) {
-	if !s.nonfinalReadyToPrepareLocked(key, block, meta, original, kind, keepWaiting) {
+// nonfinalStateUpdateReadyLocked is called before record preparation and again
+// under the publish lock, because current and pending states may change between them.
+func (s *Store) nonfinalStateUpdateReadyLocked(key storage.BlockRootHash, block ton.BlockIDExt, meta *storage.BlockMeta, update *cell.Cell, original storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool, validatedStateUpdate *cell.Cell) (bool, error) {
+	if !s.nonfinalReadyToPrepareLocked(key, block, meta, original, kind, keepWaiting, validatedStateUpdate) {
 		return false, nil
 	}
 	if update == nil {
@@ -210,7 +254,7 @@ func (s *Store) nonfinalReadyToPublishLocked(key storage.BlockRootHash, block to
 	previous, ok := s.nonfinalPreviousStatesLocked(meta)
 	if !ok {
 		if keepWaiting {
-			s.rememberNonfinalWaitingLocked(original, kind)
+			s.rememberNonfinalWaitingLocked(original, kind, validatedStateUpdate)
 			s.trimNonfinalWaitingLocked()
 		}
 		return false, nil
@@ -231,7 +275,7 @@ func (s *Store) NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.Bloc
 	signed := make([]ton.BlockIDExt, 0)
 	candidates := make([]ton.BlockIDExt, 0)
 	for _, pending := range s.nonFinalPending {
-		if filter != nil && !shardIntersects(*filter, storage.ShardKeyFromBlock(pending.block)) {
+		if filter != nil && !blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(pending.block)) {
 			continue
 		}
 		if pending.kind&storage.LiveBlockNonfinalSigned != 0 {
@@ -490,11 +534,17 @@ func (s *Store) removeNonfinalLookupIndexesLocked(block ton.BlockIDExt) {
 	}
 }
 
-func (s *Store) rememberNonfinalWaitingLocked(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind) {
+func (s *Store) rememberNonfinalWaitingLocked(artifacts storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, validatedStateUpdate *cell.Cell) {
 	key := storage.BlockKey(artifacts.Block)
 	waiting := s.nonFinalWaiting[key]
 	waiting.artifacts = cloneLiveBlockArtifacts(artifacts)
 	waiting.kind |= kind
+	if waiting.validatedStateUpdate != waiting.artifacts.StateUpdate {
+		waiting.validatedStateUpdate = nil
+	}
+	if validatedStateUpdate != nil && validatedStateUpdate == waiting.artifacts.StateUpdate {
+		waiting.validatedStateUpdate = validatedStateUpdate
+	}
 	s.nonFinalWaiting[key] = waiting
 }
 
@@ -564,7 +614,7 @@ func (s *Store) promoteNonfinalWaiting() {
 
 		progress := false
 		for _, item := range waiting {
-			published, err := s.publishNonfinalBlockArtifacts(item.artifacts, item.kind, false)
+			published, err := s.publishNonfinalBlockArtifacts(item.artifacts, item.kind, false, item.validatedStateUpdate)
 			if err != nil {
 				s.deleteNonfinalWaiting(item.artifacts.Block)
 				continue
@@ -670,7 +720,7 @@ func (s *Store) nonfinalCoveredByCurrentLocked(block ton.BlockIDExt) bool {
 	key := storage.ShardKeyFromBlock(block)
 	for _, shard := range s.current.Shards {
 		shardKey := storage.ShardKeyFromBlock(shard.Block)
-		if !shardIntersects(key, shardKey) {
+		if !blockproof.ShardIntersects(key, shardKey) {
 			continue
 		}
 		if shard.Block.SeqNo >= block.SeqNo {

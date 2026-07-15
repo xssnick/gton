@@ -56,9 +56,6 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 	}
 	var nextCellGenerationMigrationRetry time.Time
 	var nextStateSerialization time.Time
-	if s.stateSerializer != nil {
-		nextStateSerialization = time.Now()
-	}
 
 	for {
 		if s.syncUntilFrozen() {
@@ -69,6 +66,9 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 		}
 
 		now := time.Now()
+		if nextStateSerialization.IsZero() && s.stateSerializer != nil && s.automaticStateSerializationReady.Load() {
+			nextStateSerialization = now
+		}
 		persistentStateGCDue := !now.Before(nextPersistentStateGC)
 		archiveGCDue := !nextArchiveGC.IsZero() && !now.Before(nextArchiveGC)
 		stateSerializationDue := !nextStateSerialization.IsZero() && !now.Before(nextStateSerialization)
@@ -200,6 +200,12 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 		if !s.waitServiceMaintenanceWake(ctx, serviceMaintenanceWaitDelay(nextPersistentStateGCWait, nextArchiveGC, nextCellGenerationMigrationRetry, nextStateSerialization)) {
 			return
 		}
+	}
+}
+
+func (s *Service) enableAutomaticStateSerialization() {
+	if s.automaticStateSerializationReady.CompareAndSwap(false, true) {
+		s.wakeServiceMaintenance()
 	}
 }
 

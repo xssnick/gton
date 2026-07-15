@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
@@ -308,6 +309,11 @@ func (c *cellStore) throttleCompactions() func() {
 	return c.compactions.beginForegroundRead()
 }
 
+// cellShardIndex maps a cell hash to its celldb shard.
+func cellShardIndex(hash cell.Hash) int {
+	return int(hash[0] >> 5)
+}
+
 func (c *cellStore) shardForHash(hash []byte) (int, *cellDBShard, error) {
 	if len(hash) != 32 {
 		return 0, nil, fmt.Errorf("cell hash size mismatch: %d", len(hash))
@@ -341,8 +347,11 @@ func (c *cellStore) has(hash []byte) (bool, error) {
 	return pebbleReaderHas(shard.db, hash)
 }
 
-func (c *cellStore) newBatchWriter() *cellBatchWriter {
-	return &cellBatchWriter{store: c}
+func (c *cellStore) newBatchWriter(shardBatchInitialSize int) *cellBatchWriter {
+	return &cellBatchWriter{
+		store:                 c,
+		shardBatchInitialSize: shardBatchInitialSize,
+	}
 }
 
 func (c *cellStore) flush() error {
@@ -361,9 +370,6 @@ func (c *cellStore) flush() error {
 	errs := make([]error, len(c.shards))
 	for i, shard := range c.shards {
 		if !dirty[i] {
-			continue
-		}
-		if shard == nil || shard.db == nil {
 			continue
 		}
 		wg.Add(1)
@@ -483,7 +489,8 @@ func (c *cellStore) ioStatus(now time.Time) [cellDBShardCount]cellStoreIOStatus 
 }
 
 type cellBatchWriter struct {
-	store *cellStore
+	store                 *cellStore
+	shardBatchInitialSize int
 
 	batches [cellDBShardCount]*pebble.Batch
 
@@ -540,12 +547,42 @@ func (w *cellBatchWriter) flush() (stateCellWriteStats, error) {
 		return stats, nil
 	}
 
+	// Shard batches target independent pebble DBs, so their memtable commits can
+	// run concurrently. Keep the single-batch case inline to avoid goroutine
+	// overhead for per-shard writers.
+	var commitErrs [cellDBShardCount]error
+	pendingShards := 0
+	lastPending := -1
+	for i, batch := range w.batches {
+		if batch == nil || w.cellsByShard[i] == 0 {
+			continue
+		}
+		pendingShards++
+		lastPending = i
+	}
+	if pendingShards == 1 {
+		commitErrs[lastPending] = w.batches[lastPending].Commit(pebble.NoSync)
+	} else if pendingShards > 1 {
+		var wg sync.WaitGroup
+		for i, batch := range w.batches {
+			if batch == nil || w.cellsByShard[i] == 0 {
+				continue
+			}
+			wg.Add(1)
+			go func(i int, batch *pebble.Batch) {
+				defer wg.Done()
+				commitErrs[i] = batch.Commit(pebble.NoSync)
+			}(i, batch)
+		}
+		wg.Wait()
+	}
+
 	var firstErr error
 	for i, batch := range w.batches {
 		if batch == nil {
 			continue
 		}
-		if err := batch.Commit(pebble.NoSync); err != nil {
+		if err := commitErrs[i]; err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("commit celldb shard %d batch: %w", i, err)
 			}
@@ -585,13 +622,12 @@ func (w *cellBatchWriter) ensureBatch(hash []byte) (int, error) {
 		return 0, err
 	}
 	if w.batches[idx] == nil {
-		w.batches[idx] = newCellShardBatch(shard.db)
+		w.batches[idx] = newCellShardBatch(shard.db, w.shardBatchInitialSize)
 	}
 	return idx, nil
 }
 
-func newCellShardBatch(db *pebble.DB) *pebble.Batch {
-	size := cellShardBatchInitialSize()
+func newCellShardBatch(db *pebble.DB, size int) *pebble.Batch {
 	return db.NewBatchWithSize(size, pebble.WithMaxRetainedSizeBytes(size))
 }
 
@@ -603,8 +639,8 @@ func cellShardMemTableSize(total int) int {
 	return shard
 }
 
-func cellShardBatchInitialSize() int {
-	size := stateCellImportBatchTargetBytes / cellDBShardCount
+func cellShardBatchInitialSize(aggregateBytes int) int {
+	size := aggregateBytes / cellDBShardCount
 	if size < 1<<20 {
 		return 1 << 20
 	}

@@ -31,50 +31,34 @@ func TestArchiveDownloadWorkersUsesNetworkWorkerBudget(t *testing.T) {
 	}
 }
 
-func TestArchiveDownloadWorkerBudgetReservesHotWorkers(t *testing.T) {
-	tests := []struct {
-		workers int
-		hotOnly int
-		shared  int
-	}{
-		{workers: 1, hotOnly: 0, shared: 1},
-		{workers: 2, hotOnly: 1, shared: 1},
-		{workers: archiveDownloadWorkerMin, hotOnly: 4, shared: archiveDownloadWorkerMin - 4},
-		{workers: archiveDownloadWorkerMax, hotOnly: archiveDownloadWorkerMax / 4, shared: archiveDownloadWorkerMax - archiveDownloadWorkerMax/4},
+func TestArchiveImportQueuePreservesPeerOnPrepareError(t *testing.T) {
+	queue := &archiveImportQueue{
+		downloadHot: make(chan archiveDownloadJob, 1),
+	}
+	wantErr := errors.New("invalid archive")
+	done := make(chan error, 1)
+	go func() {
+		_, err := queue.importArchive(context.Background(), 100, archive.ShardID{Workchain: -1, Shard: -1 << 63}, 0, archiveImportPriorityHot)
+		done <- err
+	}()
+
+	job := <-queue.downloadHot
+	job.done <- archiveImportQueueResult{
+		peer:      "192.0.2.1:30303",
+		archiveID: 42,
+		err:       wantErr,
 	}
 
-	for _, tt := range tests {
-		got := archiveDownloadWorkerBudget(tt.workers)
-		if got.hotOnly != tt.hotOnly || got.shared != tt.shared {
-			t.Fatalf("worker budget for %d = hotOnly:%d shared:%d want hotOnly:%d shared:%d", tt.workers, got.hotOnly, got.shared, tt.hotOnly, tt.shared)
-		}
-		if got.hotOnly+got.shared != tt.workers {
-			t.Fatalf("worker budget for %d does not preserve worker count: %#v", tt.workers, got)
-		}
+	err := <-done
+	var peerErr *archiveImportPeerError
+	if !errors.As(err, &peerErr) {
+		t.Fatalf("prepare error type = %T, want archiveImportPeerError", err)
 	}
-}
-
-func TestArchivePrepareWorkerBudgetReservesSmallHotPool(t *testing.T) {
-	tests := []struct {
-		workers int
-		hotOnly int
-		shared  int
-	}{
-		{workers: 1, hotOnly: 0, shared: 1},
-		{workers: 2, hotOnly: 1, shared: 1},
-		{workers: 8, hotOnly: 1, shared: 7},
-		{workers: 16, hotOnly: archivePrepareHotWorkerMax, shared: 14},
-		{workers: 32, hotOnly: archivePrepareHotWorkerMax, shared: 30},
+	if peerErr.peer != "192.0.2.1:30303" || peerErr.archiveID != 42 {
+		t.Fatalf("prepare error peer metadata = %+v", peerErr)
 	}
-
-	for _, tt := range tests {
-		got := archivePrepareWorkerBudget(tt.workers)
-		if got.hotOnly != tt.hotOnly || got.shared != tt.shared {
-			t.Fatalf("prepare budget for %d = hotOnly:%d shared:%d want hotOnly:%d shared:%d", tt.workers, got.hotOnly, got.shared, tt.hotOnly, tt.shared)
-		}
-		if got.hotOnly+got.shared != tt.workers {
-			t.Fatalf("prepare budget for %d does not preserve worker count: %#v", tt.workers, got)
-		}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("prepare error does not wrap original error: %v", err)
 	}
 }
 
@@ -96,14 +80,12 @@ func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
 		downloadPrefetch: make(chan archiveDownloadJob, 2),
 		prepareHot:       make(chan archivePrepareJob, 2),
 		preparePrefetch:  make(chan archivePrepareJob, 2),
-		downloadedBytes:  newArchiveDownloadByteGate(1024),
 	}
 	queue.downloadHot <- archiveDownloadJob{}
 	queue.downloadPrefetch <- archiveDownloadJob{}
 	queue.preparePrefetch <- archivePrepareJob{}
 	queue.activeDownload.Add(3)
 	queue.activePrepare.Add(5)
-	queue.downloadedBytes.add(256)
 
 	snapshot := queue.snapshot()
 	if snapshot.activeDownload != 3 || snapshot.activePrepare != 5 {
@@ -111,36 +93,6 @@ func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
 	}
 	if snapshot.downloadHotQueued != 1 || snapshot.downloadPrefetchQueued != 1 || snapshot.prepareHotQueued != 0 || snapshot.preparePrefetchQueued != 1 {
 		t.Fatalf("queued jobs = download:%d/%d prepare:%d/%d, want download:1/1 prepare:0/1", snapshot.downloadHotQueued, snapshot.downloadPrefetchQueued, snapshot.prepareHotQueued, snapshot.preparePrefetchQueued)
-	}
-	if snapshot.downloadedBytes != 256 || snapshot.downloadedBytesLimit != 1024 {
-		t.Fatalf("downloaded bytes = %d/%d, want 256/1024", snapshot.downloadedBytes, snapshot.downloadedBytesLimit)
-	}
-}
-
-func TestArchiveDownloadByteGateWaitsUntilDownloadedBytesDrop(t *testing.T) {
-	gate := newArchiveDownloadByteGate(100)
-	gate.add(100)
-
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- gate.wait(context.Background())
-	}()
-
-	select {
-	case err := <-waitDone:
-		t.Fatalf("gate wait finished before release: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	gate.release(100)
-
-	select {
-	case err := <-waitDone:
-		if err != nil {
-			t.Fatalf("gate wait after release: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("gate wait did not finish after release")
 	}
 }
 
@@ -221,7 +173,6 @@ func TestArchiveImportQueueDownloadStarvedRequiresEmptyPrepareBacklog(t *testing
 	queue := &archiveImportQueue{
 		prepareHot:      make(chan archivePrepareJob, 1),
 		preparePrefetch: make(chan archivePrepareJob, 1),
-		downloadedBytes: newArchiveDownloadByteGate(100),
 	}
 	if !queue.archiveDownloadsStarved() {
 		t.Fatal("empty archive queue should be download-starved")
@@ -239,27 +190,19 @@ func TestArchiveImportQueueDownloadStarvedRequiresEmptyPrepareBacklog(t *testing
 	}
 	<-queue.prepareHot
 
-	queue.downloadedBytes.add(1)
-	if queue.archiveDownloadsStarved() {
-		t.Fatal("downloaded bytes waiting for prepare should disable archive download hedge")
-	}
 }
 
-func TestArchiveImportQueueReleasesDownloadedBytesWhenPrepareContextCanceled(t *testing.T) {
+func TestArchiveImportQueueReleasesDownloadedDataWhenPrepareContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	queue := &archiveImportQueue{
-		downloadedBytes: newArchiveDownloadByteGate(100),
-	}
+	queue := &archiveImportQueue{}
 	downloaded := &archive.Downloaded{Data: make([]byte, 80)}
-	queue.downloadedBytes.add(80)
 
 	done := make(chan archiveImportQueueResult, 1)
 	queue.runPrepareJob(&archiveCatchUpRunner{}, archivePrepareJob{
 		ctx:        ctx,
 		downloaded: downloaded,
-		bytes:      80,
 		done:       done,
 	})
 
@@ -270,9 +213,6 @@ func TestArchiveImportQueueReleasesDownloadedBytesWhenPrepareContextCanceled(t *
 		}
 	case <-time.After(time.Second):
 		t.Fatal("prepare job did not finish")
-	}
-	if got := queue.downloadedBytes.size(); got != 0 {
-		t.Fatalf("downloaded bytes after canceled prepare = %d, want 0", got)
 	}
 	if downloaded.Data != nil {
 		t.Fatal("downloaded data was not released after canceled prepare")

@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	archiveToNextLagSeconds          = 200
-	nextToArchiveLagSeconds          = 600
-	maxArchiveMonitorSplitDepth      = 12
-	archiveShardArchiveImportRetries = 2
+	archiveToNextLagSeconds     = 200
+	nextToArchiveLagSeconds     = 600
+	maxArchiveMonitorSplitDepth = 12
+	archiveImportPeerRetries    = 2
 )
 
 func masterchainBlockLagSeconds(blockUTime int64, nowUnix int64) (int64, bool) {
@@ -146,14 +146,14 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 			}
 			if r.rejectArchiveImportPeer(plan.shard, res.peer, res.archiveID, p2p.ArchivePeerRejectImportFailed, res.err) {
 				retries[res.idx]++
-				if retries[res.idx] <= archiveShardArchiveImportRetries {
+				if retries[res.idx] <= archiveImportPeerRetries {
 					if err := submit(res.idx); err != nil {
 						cancel()
 						firstErr = err
 					}
 					continue
 				}
-			} else if ctx.Err() == nil && retries[res.idx] < archiveShardArchiveImportRetries {
+			} else if ctx.Err() == nil && retries[res.idx] < archiveImportPeerRetries {
 				retries[res.idx]++
 				if err := submit(res.idx); err != nil {
 					cancel()
@@ -171,14 +171,14 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 		if err := validateArchiveImportCoversPlan(res.imported, plan); err != nil {
 			if r.rejectArchiveImportPeer(plan.shard, res.peer, res.archiveID, p2p.ArchivePeerRejectImportIncomplete, err) {
 				retries[res.idx]++
-				if retries[res.idx] <= archiveShardArchiveImportRetries {
+				if retries[res.idx] <= archiveImportPeerRetries {
 					if err := submit(res.idx); err != nil {
 						cancel()
 						firstErr = err
 					}
 					continue
 				}
-			} else if ctx.Err() == nil && retries[res.idx] < archiveShardArchiveImportRetries {
+			} else if ctx.Err() == nil && retries[res.idx] < archiveImportPeerRetries {
 				retries[res.idx]++
 				if err := submit(res.idx); err != nil {
 					cancel()
@@ -223,7 +223,7 @@ func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archive
 }
 
 func (r *archiveCatchUpRunner) rejectArchiveImportPeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
-	if r == nil || r.archiveSession == nil || peer == "" {
+	if r.archiveSession == nil || peer == "" {
 		return false
 	}
 

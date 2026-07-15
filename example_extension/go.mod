@@ -1,11 +1,11 @@
 module github.com/xssnick/gton/example_extension
 
-go 1.25.6
+go 1.26.0
 
 require (
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/gton v0.0.0
-	github.com/xssnick/tonutils-go v1.17.1-0.20260626102204-593da3ca5afa
+	github.com/xssnick/tonutils-go v1.17.1-0.20260709142412-16e047642e6b
 )
 
 require (
@@ -16,7 +16,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bwesterb/go-ristretto v1.2.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cloudflare/circl v1.6.3 // indirect
+	github.com/cloudflare/circl v1.6.4 // indirect
 	github.com/cockroachdb/crlib v0.0.0-20241112164430-1264a2edc35b // indirect
 	github.com/cockroachdb/errors v1.13.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
@@ -42,13 +42,15 @@ require (
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
-	github.com/xssnick/raptorq v1.4.0 // indirect
+	github.com/xssnick/raptorq v1.5.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
+	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
 replace github.com/xssnick/gton => ..
+
+replace github.com/xssnick/tonutils-go => ../../tonutils-go

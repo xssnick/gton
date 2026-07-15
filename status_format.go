@@ -200,18 +200,40 @@ func formatStatusWithNow(snapshot service2.StatusSnapshot, showPeers bool, now t
 			fmt.Fprintf(&b, "  %s\n", overlay.Name)
 			fmt.Fprintf(&b, "    %-18s %d / %d alive\n", "known peers", overlay.AliveKnownPeers, overlay.KnownPeers)
 			fmt.Fprintf(&b, "    %-18s %d / %d alive\n", "neighbours", overlay.AliveNeighbours, overlay.ActiveNeighbours)
+			if overlay.FixedProbes && (overlay.SoftRecoveries > 0 || overlay.HardRecoveries > 0) {
+				fmt.Fprintf(&b, "    %-18s %d soft / %d hard\n", "recoveries", overlay.SoftRecoveries, overlay.HardRecoveries)
+			}
 			if len(overlay.Neighbours) == 0 {
 				fmt.Fprintf(&b, "    no active neighbours\n")
 				continue
 			}
-			fmt.Fprintf(&b, "    %-5s %-12s %-12s %6s %8s  %s\n", "alive", "last rx", "last ok", "fail", "score", "addr")
+			if overlay.FixedProbes {
+				fmt.Fprintf(&b, "    %-5s %-16s %-16s %-16s %5s %-16s %-7s %6s %8s  %s\n", "alive", "last rx", "last ok", "pong", "pfail", "adnl rx", "chan", "fail", "score", "addr")
+				for _, peer := range overlay.Neighbours {
+					fmt.Fprintf(
+						&b,
+						"    %-5s %-16s %-16s %-16s %5d %-16s %-7s %6d %8.1f  %s\n",
+						formatBool(peer.Alive),
+						formatSince(peer.LastReceiveAt),
+						formatSince(peer.LastSuccessAt),
+						formatSince(peer.LastPongAt),
+						peer.ProbeFailures,
+						formatSince(peer.ADNLLastInAt),
+						fallbackString(peer.ADNLChannelState, "-"),
+						peer.FailedQueries,
+						peer.Unreliability,
+						peer.Addr,
+					)
+				}
+				continue
+			}
+			fmt.Fprintf(&b, "    %-5s %-12s %6s %8s  %s\n", "alive", "last rx", "fail", "score", "addr")
 			for _, peer := range overlay.Neighbours {
 				fmt.Fprintf(
 					&b,
-					"    %-5s %-12s %-12s %6d %8.1f  %s\n",
+					"    %-5s %-12s %6d %8.1f  %s\n",
 					formatBool(peer.Alive),
 					formatSince(peer.LastReceiveAt),
-					formatSince(peer.LastSuccessAt),
 					peer.FailedQueries,
 					peer.Unreliability,
 					peer.Addr,

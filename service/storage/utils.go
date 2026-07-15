@@ -83,10 +83,6 @@ func PersistentStateFileKeyHash(block ton.BlockIDExt, master ton.BlockIDExt, eff
 	}
 }
 
-func StoredProofKinds(blockData []byte, isLink bool) []ServedProofKind {
-	return StoredProofKindsForBlock(isLink, isKeyBlockData(blockData))
-}
-
 func StoredProofKindsForServedBlock(block ton.BlockIDExt, isLink bool, isKeyBlock bool) []ServedProofKind {
 	return StoredProofKindsForBlock(ServedBlockProofIsLink(block, isLink), isKeyBlock)
 }
@@ -234,21 +230,4 @@ type shardStateHeader struct {
 	Accounts        *cell.Cell     `tlb:"^"`
 	Stats           *cell.Cell     `tlb:"^"`
 	McStateExtra    *cell.Cell     `tlb:"maybe ^"`
-}
-
-func isKeyBlockData(data []byte) bool {
-	root, err := cell.FromBOC(data)
-	if err != nil {
-		return false
-	}
-
-	var block tlb.Block
-	loader, err := root.BeginParse()
-	if err != nil {
-		return false
-	}
-	if err = tlb.LoadFromCell(&block, loader); err != nil {
-		return false
-	}
-	return block.BlockInfo.KeyBlock
 }

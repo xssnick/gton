@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,16 @@ const (
 	largeBOCShardReadWorkerMinCell  = 4096
 )
 
+// growLargeBOCRecords extends dst by n zeroed records. It replaces the
+// append(dst, make([]T, n)...) pattern, which materializes and throws away a
+// batch-sized temporary slice on every loader call.
+func growLargeBOCRecords[T any](dst []T, n int) []T {
+	base := len(dst)
+	dst = slices.Grow(dst, n)[:base+n]
+	clear(dst[base:])
+	return dst
+}
+
 type largeBOCRecordVisitor func(shardIdx int, workerIdx int, index int, hash []byte, value []byte) error
 
 // LargeBOCLoadMeta loads compact cell metadata for tonutils-go large-BOC
@@ -33,7 +44,7 @@ func (s *Store) LargeBOCLoadMeta(ctx context.Context, hashes []cell.Hash, dst []
 
 func (s *Store) LargeBOCLoadMetaInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error) {
 	base := len(dst)
-	dst = append(dst, make([]cell.LargeBOCMetaRecord, len(hashes))...)
+	dst = growLargeBOCRecords(dst, len(hashes))
 
 	stats, err := s.largeBOCLoadRecords(ctx, generation, hashes, s.largeBOCShardReadWorkers, func(_ int, _ int, index int, hash []byte, value []byte) error {
 		meta, err := storage.LargeBOCMetaRecordFromEncodedCellRecord(hash, value)
@@ -59,7 +70,7 @@ func (s *Store) LargeBOCLoadPayload(ctx context.Context, hashes []cell.Hash, dst
 
 func (s *Store) LargeBOCLoadPayloadInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error) {
 	base := len(dst)
-	dst = append(dst, make([]cell.LargeBOCPayloadRecord, len(hashes))...)
+	dst = growLargeBOCRecords(dst, len(hashes))
 
 	var shardCounts [cellDBShardCount]int
 	for i := range hashes {
@@ -69,11 +80,12 @@ func (s *Store) LargeBOCLoadPayloadInGeneration(ctx context.Context, generation 
 	arenas := largeBOCPayloadWorkerArenas(shardCounts, s.largeBOCShardReadWorkers)
 
 	stats, err := s.largeBOCLoadRecords(ctx, generation, hashes, s.largeBOCShardReadWorkers, func(shardIdx int, workerIdx int, index int, _ []byte, value []byte) error {
-		payload, arena, err := storage.AppendLargeBOCPayloadRecordFromEncodedCellRecord(value, arenas[shardIdx][workerIdx])
+		arena := &arenas[shardIdx][workerIdx]
+		payload, buf, err := storage.AppendLargeBOCPayloadRecordFromEncodedCellRecord(value, arena.ensure(len(value)))
 		if err != nil {
 			return err
 		}
-		arenas[shardIdx][workerIdx] = arena
+		arena.buf = buf
 		dst[base+index] = payload
 		return nil
 	})
@@ -94,7 +106,7 @@ func (s *Store) LargeBOCLoadCells(ctx context.Context, hashes []cell.Hash, dst [
 
 func (s *Store) LargeBOCLoadCellsInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error) {
 	base := len(dst)
-	dst = append(dst, make([]cell.LargeBOCRecord, len(hashes))...)
+	dst = growLargeBOCRecords(dst, len(hashes))
 
 	var shardCounts [cellDBShardCount]int
 	for i := range hashes {
@@ -104,11 +116,12 @@ func (s *Store) LargeBOCLoadCellsInGeneration(ctx context.Context, generation ui
 	arenas := largeBOCPayloadWorkerArenas(shardCounts, s.largeBOCShardReadWorkers)
 
 	stats, err := s.largeBOCLoadRecords(ctx, generation, hashes, s.largeBOCShardReadWorkers, func(shardIdx int, workerIdx int, index int, hash []byte, value []byte) error {
-		record, arena, err := storage.AppendLargeBOCRecordFromEncodedCellRecord(hash, value, arenas[shardIdx][workerIdx])
+		arena := &arenas[shardIdx][workerIdx]
+		record, buf, err := storage.AppendLargeBOCRecordFromEncodedCellRecord(hash, value, arena.ensure(len(value)))
 		if err != nil {
 			return err
 		}
-		arenas[shardIdx][workerIdx] = arena
+		arena.buf = buf
 		dst[base+index] = record
 		return nil
 	})
@@ -159,10 +172,7 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 		if len(indexes) == 0 {
 			continue
 		}
-		shard := cells.shards[shardIdx]
-		if shard == nil || shard.db == nil {
-			return stats, errPebbleClosed
-		}
+		db := cells.shards[shardIdx].db
 
 		wg.Add(1)
 		go func(shardIdx int, db *pebble.DB, indexes []int) {
@@ -178,7 +188,7 @@ func (s *Store) largeBOCLoadRecords(ctx context.Context, generation uint64, hash
 			if err := largeBOCLoadShardRecordIndexes(ctx, cells, db, shardIdx, indexes, hashes, shardReadWorkers, visit); err != nil {
 				errs <- err
 			}
-		}(shardIdx, shard.db, indexes)
+		}(shardIdx, db, indexes)
 	}
 	wg.Wait()
 	close(errs)
@@ -225,12 +235,25 @@ func largeBOCLoadShardRecordIndexes(ctx context.Context, cells *cellStore, db *p
 	return joinedErr
 }
 
-func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble.DB, shardIdx int, workerIdx int, indexes []int, hashes []cell.Hash, visit largeBOCRecordVisitor) error {
+func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble.DB, shardIdx int, workerIdx int, indexes []int, hashes []cell.Hash, visit largeBOCRecordVisitor) (retErr error) {
 	var loaded uint64
 	defer func() {
 		cells.addReadCells(shardIdx, loaded)
 	}()
 
+	firstHash := hashes[indexes[0]]
+	iter, err := db.NewIter(&pebble.IterOptions{LowerBound: firstHash[:]})
+	if err != nil {
+		return fmt.Errorf("open celldb shard %d iterator: %w", shardIdx, err)
+	}
+	defer func() {
+		if err := iter.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close celldb shard %d iterator: %w", shardIdx, err))
+		}
+	}()
+
+	var previousHash cell.Hash
+	valid := false
 	for n, index := range indexes {
 		if n&0x3fff == 0 {
 			select {
@@ -241,21 +264,23 @@ func largeBOCLoadRecordIndexes(ctx context.Context, cells *cellStore, db *pebble
 		}
 
 		hash := hashes[index]
-		value, closer, err := db.Get(hash[:])
-		if err != nil {
-			if errors.Is(err, pebble.ErrNotFound) {
-				err = storage.ErrNotFound
-			}
-			return fmt.Errorf("load cell %x: %w", hash[:], err)
+		if n == 0 || hash != previousHash {
+			valid = iter.SeekGE(hash[:])
+			previousHash = hash
 		}
-		if err = visit(shardIdx, workerIdx, index, hash[:], value); err != nil {
-			_ = closer.Close()
+		if !valid || !bytes.Equal(iter.Key(), hash[:]) {
+			if err := iter.Error(); err != nil {
+				return fmt.Errorf("load cell %x: %w", hash[:], err)
+			}
+			return fmt.Errorf("load cell %x: %w", hash[:], storage.ErrNotFound)
+		}
+		if err := visit(shardIdx, workerIdx, index, hash[:], iter.Value()); err != nil {
 			return fmt.Errorf("decode cell %x: %w", hash[:], err)
 		}
-		if err = closer.Close(); err != nil {
-			return fmt.Errorf("close cell %x value: %w", hash[:], err)
-		}
 		loaded++
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("iterate celldb shard %d: %w", shardIdx, err)
 	}
 	return nil
 }
@@ -266,15 +291,48 @@ func largeBOCSortRecordIndexes(indexes []int, hashes []cell.Hash) {
 	})
 }
 
-func largeBOCPayloadWorkerArenas(shardCounts [cellDBShardCount]int, shardReadWorkers int) [cellDBShardCount][][]byte {
-	var arenas [cellDBShardCount][][]byte
+const (
+	// largeBOCPayloadArenaBytesPerCell presizes the first arena chunk slightly
+	// below the typical serialized payload average, so the chunk usually fills
+	// instead of leaving a proportional retained tail: one-pass serialization
+	// keeps every batch arena alive until the whole BoC is written.
+	largeBOCPayloadArenaBytesPerCell = 24
+	// largeBOCPayloadArenaChunkBytes is the rolling chunk size once the
+	// presized chunk is exhausted.
+	largeBOCPayloadArenaChunkBytes = 256 << 10
+)
+
+// largeBOCPayloadArena hands out payload bytes from rolling chunks. ensure
+// starts a fresh chunk instead of letting append regrow a chunk that returned
+// records already point into, which would retain both copies.
+type largeBOCPayloadArena struct {
+	buf []byte
+}
+
+// ensure returns a buffer with at least n spare bytes to append into. The
+// caller appends at most n bytes and stores the result back via buf.
+func (a *largeBOCPayloadArena) ensure(n int) []byte {
+	if cap(a.buf)-len(a.buf) < n {
+		size := largeBOCPayloadArenaChunkBytes
+		if n > size {
+			size = n
+		}
+		a.buf = make([]byte, 0, size)
+	}
+	return a.buf
+}
+
+func largeBOCPayloadWorkerArenas(shardCounts [cellDBShardCount]int, shardReadWorkers int) [cellDBShardCount][]largeBOCPayloadArena {
+	var arenas [cellDBShardCount][]largeBOCPayloadArena
 	for shardIdx, count := range shardCounts {
 		workers := largeBOCShardReadWorkerCount(count, shardReadWorkers)
-		arenas[shardIdx] = make([][]byte, workers)
+		arenas[shardIdx] = make([]largeBOCPayloadArena, workers)
 		for worker := 0; worker < workers; worker++ {
 			from := worker * count / workers
 			to := (worker + 1) * count / workers
-			arenas[shardIdx][worker] = make([]byte, 0, (to-from)*64)
+			if size := (to - from) * largeBOCPayloadArenaBytesPerCell; size > 0 {
+				arenas[shardIdx][worker].buf = make([]byte, 0, size)
+			}
 		}
 	}
 	return arenas

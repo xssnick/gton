@@ -63,6 +63,92 @@ func TestMergeBlockMetaOverwritesKnownZeroMasterchainRef(t *testing.T) {
 	}
 }
 
+func TestCloneBlockStateCopiesBlockIDHashes(t *testing.T) {
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     masterchainShard,
+		SeqNo:     20,
+		RootHash:  bytes.Repeat([]byte{0x33}, 32),
+		FileHash:  bytes.Repeat([]byte{0x44}, 32),
+	}
+	ref := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     masterchainShard,
+		SeqNo:     21,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+	state := &BlockState{Block: block, MasterchainRef: &ref}
+
+	cloned := CloneBlockState(state)
+	cloned.Block.RootHash[0] = 0xCC
+	cloned.Block.FileHash[0] = 0xDD
+	cloned.MasterchainRef.RootHash[0] = 0xAA
+	cloned.MasterchainRef.FileHash[0] = 0xBB
+
+	if state.Block.RootHash[0] == 0xCC {
+		t.Fatal("clone shares block root hash backing array")
+	}
+	if state.Block.FileHash[0] == 0xDD {
+		t.Fatal("clone shares block file hash backing array")
+	}
+	if state.MasterchainRef.RootHash[0] == 0xAA {
+		t.Fatal("clone shares masterchain ref root hash backing array")
+	}
+	if state.MasterchainRef.FileHash[0] == 0xBB {
+		t.Fatal("clone shares masterchain ref file hash backing array")
+	}
+
+	withoutCells := BlockStateWithoutCells(state)
+	withoutCells.Block.RootHash[0] = 0xEE
+	if state.Block.RootHash[0] == 0xEE {
+		t.Fatal("metadata clone shares block root hash backing array")
+	}
+}
+
+func TestBlockMetaCloneCopiesBlockIDHashes(t *testing.T) {
+	id := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     masterchainShard,
+		SeqNo:     20,
+		RootHash:  bytes.Repeat([]byte{0x11}, 32),
+		FileHash:  bytes.Repeat([]byte{0x12}, 32),
+	}
+	prev := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     masterchainShard,
+		SeqNo:     19,
+		RootHash:  bytes.Repeat([]byte{0x21}, 32),
+		FileHash:  bytes.Repeat([]byte{0x22}, 32),
+	}
+	next := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     masterchainShard,
+		SeqNo:     21,
+		RootHash:  bytes.Repeat([]byte{0x31}, 32),
+		FileHash:  bytes.Repeat([]byte{0x32}, 32),
+	}
+	meta := &BlockMeta{ID: id, PrevRefs: []ton.BlockIDExt{prev}, NextRefs: []ton.BlockIDExt{next}}
+
+	cloned := meta.Clone()
+	cloned.ID.RootHash[0] = 0xAA
+	cloned.ID.FileHash[0] = 0xAB
+	cloned.PrevRefs[0].RootHash[0] = 0xBA
+	cloned.PrevRefs[0].FileHash[0] = 0xBB
+	cloned.NextRefs[0].RootHash[0] = 0xCA
+	cloned.NextRefs[0].FileHash[0] = 0xCB
+
+	if meta.ID.RootHash[0] == 0xAA || meta.ID.FileHash[0] == 0xAB {
+		t.Fatal("clone shares meta id hash backing arrays")
+	}
+	if meta.PrevRefs[0].RootHash[0] == 0xBA || meta.PrevRefs[0].FileHash[0] == 0xBB {
+		t.Fatal("clone shares prev ref hash backing arrays")
+	}
+	if meta.NextRefs[0].RootHash[0] == 0xCA || meta.NextRefs[0].FileHash[0] == 0xCB {
+		t.Fatal("clone shares next ref hash backing arrays")
+	}
+}
+
 func TestStoredProofKindsForServedBlockTreatsNonMasterAsProofLink(t *testing.T) {
 	shard := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 21}
 	got := StoredProofKindsForServedBlock(shard, false, false)
@@ -269,6 +355,53 @@ func TestPrepareReachableStateCellsUsesExactRecordBacking(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("prepared no records")
+	}
+}
+
+func TestPrepareStateUpdateCellsArenaGrowthPreservesRecords(t *testing.T) {
+	root, cells := benchmarkCellGraph(t, 512, 4)
+	update, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
+		MustStoreSlice(root.Hash(0), 256).
+		MustStoreSlice(root.Hash(0), 256).
+		MustStoreUInt(uint64(root.Depth(0)), 16).
+		MustStoreUInt(uint64(root.Depth(0)), 16).
+		MustStoreRef(root).
+		MustStoreRef(root).
+		EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("create merkle update: %v", err)
+	}
+
+	records, err := PrepareStateUpdateCells(update)
+	if err != nil {
+		t.Fatalf("prepare state update cells: %v", err)
+	}
+	if records.Len() != cells {
+		t.Fatalf("prepared records = %d, want %d", records.Len(), cells)
+	}
+
+	checked := 0
+	err = WalkReachableStateCells(root, func(current *cell.Cell, meta cell.Metadata) error {
+		want, err := PrepareEncodedCellRecordFromCellMetadata(current, meta)
+		if err != nil {
+			return err
+		}
+		got := records.Data(meta.Hash)
+		if !bytes.Equal(got, want.Data) {
+			t.Fatalf("record %x changed while growing arena", meta.Hash[:])
+		}
+		if cap(got) != len(got) {
+			t.Fatalf("record %x backing capacity = %d, want exact %d", meta.Hash[:], cap(got), len(got))
+		}
+		checked++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk expected state cells: %v", err)
+	}
+	if checked != cells {
+		t.Fatalf("checked records = %d, want %d", checked, cells)
 	}
 }
 

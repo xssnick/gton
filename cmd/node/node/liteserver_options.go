@@ -26,16 +26,26 @@ type liteserverOptions struct {
 	PrivateKey                ed25519.PrivateKey
 	MasterBlockCache          int
 	ShardBlockCache           int
+	QueryConcurrency          int
 	Limits                    liteserver.RequestLimitOptions
 	ExternalBroadcastCapacity p2p.ExternalBroadcastCapacityOptions
 	ExternalBroadcastFanout   int
 }
 
-func configureLiteserver(runOpts *gton.NodeOptions, cfg nodeconfig.Config, globalConfig *liteclient.GlobalConfig) (liteserverOptions, error) {
-	opts, err := liteserverOptionsFromConfig(cfg)
+// configureLiteserver applies liteserver-related node options and returns the
+// liteserver extension factory, nil when the liteserver is disabled.
+func configureLiteserver(
+	runOpts *gton.NodeOptions,
+	cfg nodeconfig.Config,
+	runtimeOpts nodeconfig.RuntimeOptions,
+	globalConfig *liteclient.GlobalConfig,
+	queryConcurrency int,
+) (liteserverOptions, hooks.ExtensionFactory, error) {
+	opts, err := liteserverOptionsFromConfig(cfg, runtimeOpts)
 	if err != nil {
-		return liteserverOptions{}, err
+		return liteserverOptions{}, nil, err
 	}
+	opts.QueryConcurrency = queryConcurrency
 
 	runOpts.LiveView = &liveview.Options{
 		MasterBlockCache: opts.MasterBlockCache,
@@ -46,19 +56,15 @@ func configureLiteserver(runOpts *gton.NodeOptions, cfg nodeconfig.Config, globa
 	runOpts.P2P.LocalExternalFanout = opts.ExternalBroadcastFanout
 	runOpts.P2P.AllowDuplicateExternals = opts.AllowDuplicateExternals
 
-	if opts.Enabled {
-		if runOpts.Extension != nil {
-			return liteserverOptions{}, fmt.Errorf("liteserver cannot be enabled together with a custom static extension")
-		}
-
-		zeroState, err := liteserverZeroStateFromGlobalConfig(globalConfig)
-		if err != nil {
-			return liteserverOptions{}, err
-		}
-		runOpts.Extension = liteserverExtensionFactory(opts, zeroState)
+	if !opts.Enabled {
+		return opts, nil, nil
 	}
 
-	return opts, nil
+	zeroState, err := liteserverZeroStateFromGlobalConfig(globalConfig)
+	if err != nil {
+		return liteserverOptions{}, nil, err
+	}
+	return opts, liteserverExtensionFactory(opts, zeroState), nil
 }
 
 func liteserverExtensionFactory(opts liteserverOptions, zeroState ton.ZeroStateIDExt) hooks.ExtensionFactory {
@@ -70,11 +76,12 @@ func liteserverExtensionFactory(opts liteserverOptions, zeroState ton.ZeroStateI
 			AllowDuplicateExternals: opts.AllowDuplicateExternals,
 			ZeroState:               zeroState,
 			RequestLimits:           opts.Limits,
+			QueryConcurrency:        opts.QueryConcurrency,
 		})
 	}
 }
 
-func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, error) {
+func liteserverOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions) (liteserverOptions, error) {
 	opts := liteserverOptions{
 		Enabled:                 cfg.Lite.Enabled,
 		NonFinalEnabled:         cfg.Lite.NonFinalEnabled,
@@ -108,20 +115,11 @@ func liteserverOptionsFromConfig(cfg nodeconfig.Config) (liteserverOptions, erro
 	}
 	opts.Limits = limits
 
-	capacity, err := cfg.LiteSendMessageBroadcastCapacity()
-	if err != nil {
-		return liteserverOptions{}, err
-	}
 	opts.ExternalBroadcastCapacity = p2p.ExternalBroadcastCapacityOptions{
-		BytesPerSecond: capacity.BytesPerSecond,
-		MaxDelay:       capacity.MaxDelay,
+		BytesPerSecond: runtimeOpts.LiteSendMessageBroadcastCapacity.BytesPerSecond,
+		MaxDelay:       runtimeOpts.LiteSendMessageBroadcastCapacity.MaxDelay,
 	}
-
-	fanout, err := cfg.LiteSendMessageBroadcastFanout()
-	if err != nil {
-		return liteserverOptions{}, err
-	}
-	opts.ExternalBroadcastFanout = fanout
+	opts.ExternalBroadcastFanout = runtimeOpts.LiteSendMessageBroadcastFanout
 
 	return opts, nil
 }
@@ -139,6 +137,12 @@ func liteserverLimitOptionsFromConfig(cfg nodeconfig.LiteLimits) (liteserver.Req
 	if cfg.MaxKeepAliveSeconds < 0 {
 		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_keep_alive_seconds cannot be negative")
 	}
+	if cfg.MaxWaitsPerIP < 0 {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_waits_per_ip cannot be negative")
+	}
+	if cfg.MaxWaitsPerIP > int64(int(^uint(0)>>1)) {
+		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_waits_per_ip is too large")
+	}
 	if (cfg.CapacityPerIP == 0) != (cfg.CoolingPerSec == 0) {
 		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.capacity_per_ip and liteserver.limits.cooling_per_sec must be configured together")
 	}
@@ -154,11 +158,17 @@ func liteserverLimitOptionsFromConfig(cfg nodeconfig.LiteLimits) (liteserver.Req
 		return liteserver.RequestLimitOptions{}, fmt.Errorf("liteserver.limits.max_keep_alive_seconds is too large")
 	}
 
+	maxWaitsPerIP := int(cfg.MaxWaitsPerIP)
+	if maxWaitsPerIP == 0 {
+		maxWaitsPerIP = liteserver.DefaultMaxWaitsPerIP
+	}
+
 	return liteserver.RequestLimitOptions{
 		CapacityPerIP:       int(cfg.CapacityPerIP),
 		CoolingPerSec:       cfg.CoolingPerSec,
 		MaxConnectionsPerIP: int(cfg.MaxConnectionsPerIP),
 		MaxKeepAlive:        time.Duration(cfg.MaxKeepAliveSeconds) * time.Second,
+		MaxWaitsPerIP:       maxWaitsPerIP,
 	}, nil
 }
 

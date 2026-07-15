@@ -26,13 +26,57 @@ type checkpointArtifactWrite struct {
 	meta            *storage.BlockMeta
 }
 
+// prepareCheckpointArtifactWrites resolves the artifact writes for checkpoint
+// entries: results streamed ahead by PrewriteCheckpointArtifacts are consumed
+// as-is, everything else is appended to the pack files inline. Callers must
+// hold artifactPublishMu.
 func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpointBlock) ([]checkpointArtifactWrite, []archivePackRegistration, []storage.ServedBlockLink, error) {
+	writes := make([]checkpointArtifactWrite, 0, len(entries))
+	var links []storage.ServedBlockLink
+	var missEntries []storage.StateCheckpointBlock
+	var missIndexes []int
+	for _, entry := range entries {
+		if entry.Artifact == nil {
+			continue
+		}
+		links = append(links, entry.Links...)
+		if write, ok := s.takePrewrittenArtifactWrite(entry); ok {
+			writes = append(writes, write)
+			continue
+		}
+		missIndexes = append(missIndexes, len(writes))
+		writes = append(writes, checkpointArtifactWrite{})
+		missEntries = append(missEntries, entry)
+	}
+
+	var missRegistrations []archivePackRegistration
+	if len(missEntries) > 0 {
+		missWrites, built, err := s.buildCheckpointArtifactWrites(missEntries)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for i := range missWrites {
+			writes[missIndexes[i]] = missWrites[i]
+		}
+		missRegistrations = built
+	}
+	// Drain only after the miss-path build: the build seeds its pack id claims
+	// from the staged registrations, and draining first would let it hand their
+	// indexes out again.
+	registrations := append(s.drainPrewrittenPackRegistrations(), missRegistrations...)
+	return writes, registrations, links, nil
+}
+
+// buildCheckpointArtifactWrites appends the artifact payloads for entries into
+// the archive pack files and returns the produced writes (one per entry with
+// an artifact, in entry order) and pack registrations. Callers must hold
+// artifactPublishMu.
+func (s *Store) buildCheckpointArtifactWrites(entries []storage.StateCheckpointBlock) ([]checkpointArtifactWrite, []archivePackRegistration, error) {
 	const noQueuedRef = -1
 
 	writes := make([]checkpointArtifactWrite, 0, len(entries))
 	registrations := make([]archivePackRegistration, 0, len(entries))
 	appendRequests := make([]archiveAppendRequest, 0, len(entries)*2)
-	var links []storage.ServedBlockLink
 	queueArchiveAppend := func(kind string, block ton.BlockIDExt, meta *storage.BlockMeta, splitDepth uint32, data []byte) int {
 		idx := len(appendRequests)
 		appendRequests = append(appendRequests, archiveAppendRequest{
@@ -52,11 +96,11 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 
 		meta, proofKinds, err := servedBlockFullMeta(entry.Artifact)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 		if entry.State != nil {
 			if !entry.State.Block.Equals(&entry.Artifact.ID) {
-				return nil, nil, nil, fmt.Errorf(
+				return nil, nil, fmt.Errorf(
 					"checkpoint artifact %s state block mismatch %s",
 					storage.FormatBlockRef(entry.Artifact.ID),
 					storage.FormatBlockRef(entry.State.Block),
@@ -64,7 +108,7 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 			}
 			stateMeta, err := storage.BuildBlockMetaFromState(*entry.State)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, err
 			}
 			meta = storage.MergeBlockMeta(meta, stateMeta)
 		}
@@ -73,7 +117,6 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 		if len(entry.Artifact.Block) > 0 {
 			blockRefIndex = queueArchiveAppend(packfile.KindBlock, entry.Artifact.ID, meta, entry.Artifact.ArchiveShardSplitDepth, entry.Artifact.Block)
 		}
-
 		proofRefs := make(map[storage.ServedProofKind]*storage.ArtifactRef, len(proofKinds))
 		proofRefIndexes := make(map[storage.ServedProofKind]int, len(proofKinds))
 		for _, kind := range proofKinds {
@@ -83,7 +126,7 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 			if isKeyProofKind(kind) {
 				ref, err := s.appendKeyBlockProofEntry(kind, entry.Artifact.ID, entry.Artifact.Proof)
 				if err != nil {
-					return nil, nil, nil, err
+					return nil, nil, err
 				}
 				proofRefs[kind] = ref
 				continue
@@ -91,7 +134,6 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 			proofRefIndexes[kind] = queueArchiveAppend(packEntryKindForProofKind(kind), entry.Artifact.ID, meta, entry.Artifact.ArchiveShardSplitDepth, entry.Artifact.Proof)
 		}
 
-		links = append(links, entry.Links...)
 		writes = append(writes, checkpointArtifactWrite{
 			block:           entry.Artifact,
 			proofKinds:      proofKinds,
@@ -105,7 +147,7 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 
 	appendedRefs, appendRegistrations, err := s.appendArchiveEntries(appendRequests)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	registrations = append(registrations, appendRegistrations...)
 	for idx := range writes {
@@ -118,7 +160,7 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 		}
 	}
 
-	return writes, registrations, links, nil
+	return writes, registrations, nil
 }
 
 func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkpointArtifactWrite, registrations []archivePackRegistration, links []storage.ServedBlockLink, metas map[storage.BlockRootHash]*storage.BlockMeta) error {
@@ -147,7 +189,7 @@ func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []
 	if len(block.Block) == 0 && len(block.Proof) == 0 {
 		return nil, nil, fmt.Errorf("served block %s has no block data or proof", storage.FormatBlockRef(block.ID))
 	}
-	if err := validateFullBlockIDHashes(block.ID); err != nil {
+	if err := storage.ValidateBlockIDHashes(block.ID); err != nil {
 		return nil, nil, err
 	}
 
@@ -210,52 +252,15 @@ func (s *Store) setServedBlockFullArtifactRefs(batch *pebble.Batch, block *stora
 	for _, kind := range proofKinds {
 		ref := proofRefs[kind]
 		if ref == nil {
-			continue
+			return fmt.Errorf(
+				"proof ref invariant violated: kind=%q block=%s",
+				kind,
+				storage.FormatBlockRef(block.ID),
+			)
 		}
 		if err := batch.Set(hotKeyStoredProofRef(kind, block.ID), encodeArtifactRef(ref), pebble.NoSync); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (s *Store) artifactAvailable(ctx context.Context, key []byte) error {
-	raw, err := s.getHotCopy(ctx, key)
-	if err != nil {
-		return err
-	}
-	ref, err := decodeArtifactRef(raw)
-	if err != nil {
-		return err
-	}
-	return s.checkArtifactRef(ref)
-}
-
-func (s *Store) checkArtifactRef(ref *storage.ArtifactRef) error {
-	if ref == nil {
-		return storage.ErrNotFound
-	}
-	if ref.Offset < 0 || ref.Size < 0 {
-		return storage.ErrNotFound
-	}
-	const maxInt64 = int64(^uint64(0) >> 1)
-	if ref.Offset > maxInt64-ref.Size {
-		return storage.ErrNotFound
-	}
-
-	path, err := s.artifactRefPath(context.Background(), ref)
-	if err != nil {
-		return err
-	}
-	stat, err := os.Stat(s.artifactPath(path))
-	if err != nil {
-		if isMissingArtifactError(err) {
-			return storage.ErrNotFound
-		}
-		return err
-	}
-	if stat.Size() < ref.Offset+ref.Size {
-		return storage.ErrNotFound
 	}
 	return nil
 }
@@ -268,10 +273,10 @@ func mergePendingBlockMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, m
 }
 
 func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, pending map[storage.BlockRootHash]ton.BlockIDExt, prev ton.BlockIDExt, next ton.BlockIDExt) error {
-	if err := validateFullBlockIDHashes(prev); err != nil {
+	if err := storage.ValidateBlockIDHashes(prev); err != nil {
 		return err
 	}
-	if err := validateFullBlockIDHashes(next); err != nil {
+	if err := storage.ValidateBlockIDHashes(next); err != nil {
 		return err
 	}
 
@@ -306,6 +311,9 @@ func (s *Store) mergeNextBlockLinkWithPendingMeta(metas map[storage.BlockRootHas
 		if err := s.requireNextBlockLinkTargetMaterialized(metas, prev, next); err != nil {
 			return err
 		}
+		// Later links read metas before Pebble, so preserve the durable fields in
+		// the staged view before adding a next-link delta.
+		mergePendingBlockMeta(metas, meta)
 		if len(meta.NextRefs) > 0 {
 			return s.mergeSelectedNextBlockLink(metas, pending, prev, meta.NextRefs[0], next)
 		}
@@ -400,9 +408,9 @@ func recordPendingNextBlockLink(metas map[storage.BlockRootHash]*storage.BlockMe
 
 func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.ArtifactRef) error {
 	if len(data) == 0 {
-		return nil
+		return fmt.Errorf("zerostate data is empty")
 	}
-	if err := validateFullBlockIDHashes(block); err != nil {
+	if err := storage.ValidateBlockIDHashes(block); err != nil {
 		return err
 	}
 
@@ -427,10 +435,10 @@ func (s *Store) SaveZeroState(block ton.BlockIDExt, data []byte, ref *storage.Ar
 }
 
 func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error {
-	if err := validateFullBlockIDHashes(file.Block); err != nil {
+	if err := storage.ValidateBlockIDHashes(file.Block); err != nil {
 		return err
 	}
-	if err := validateFullBlockIDHashes(file.MasterchainBlock); err != nil {
+	if err := storage.ValidateBlockIDHashes(file.MasterchainBlock); err != nil {
 		return err
 	}
 	if err := validateFixedHash("persistent state file hash", file.FileHash); err != nil {
@@ -478,7 +486,7 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 			return err
 		}
 		if stored.EffectiveShard == 0 {
-			return s.setMergedBlockMeta(batch, meta)
+			return s.setPersistentStateSnapshotMeta(batch, meta)
 		}
 		return nil
 	}); err != nil {
@@ -489,46 +497,168 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 	return nil
 }
 
-func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error {
-	_, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+func (s *Store) setPersistentStateSnapshotMeta(batch *pebble.Batch, meta *storage.BlockMeta) error {
+	raw, closer, err := pebbleReaderGet(s.hot, hotKeyBlockMeta(meta.ID))
+	if errors.Is(err, storage.ErrNotFound) {
+		return s.setMergedBlockMeta(batch, meta)
+	}
 	if err != nil {
 		return err
+	}
+	defer func() { _ = closer.Close() }()
+
+	existing, err := decodeBlockMeta(meta.ID, raw)
+	if err != nil {
+		return err
+	}
+	if isArchivePrunedSnapshotMeta(existing) {
+		if len(existing.StateRootHash) != 0 && !bytes.Equal(existing.StateRootHash, meta.StateRootHash) {
+			return fmt.Errorf("persistent state root hash conflicts with archive-pruned block meta %s", storage.FormatBlockRef(meta.ID))
+		}
+		if len(existing.StateRootHash) == 0 {
+			existing.StateRootHash = bytes.Clone(meta.StateRootHash)
+			return batch.Set(hotKeyBlockMeta(meta.ID), encodeBlockMeta(existing), pebble.NoSync)
+		}
+
+		// The persistent-state record owns the file hash. Preserve the compact
+		// marker so this update cannot recreate archive indexes.
+		return nil
+	}
+	return s.setMergedBlockMeta(batch, meta)
+}
+
+func (s *Store) DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error {
+	deleted, err := s.unlinkPersistentStateFile(ctx, block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return err
+	}
+	if err = syncPersistentStateDeleteDirs([]persistentStateFileDelete{deleted}); err != nil {
+		return err
+	}
+	return s.deletePersistentStateFileRecords([]persistentStateFileDelete{deleted})
+}
+
+type persistentStateFileDelete struct {
+	block            ton.BlockIDExt
+	masterchainBlock ton.BlockIDExt
+	effectiveShard   int64
+	key              []byte
+	dir              string
+	diskFileRemoved  bool
+	diskFileBytes    uint64
+}
+
+func (s *Store) unlinkPersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (persistentStateFileDelete, error) {
+	if err := s.ensureWritable(); err != nil {
+		return persistentStateFileDelete{}, err
+	}
+
+	_, err := s.persistentStateFileRecord(ctx, block, masterchainBlock, effectiveShard)
+	if err != nil {
+		return persistentStateFileDelete{}, err
 	}
 
 	key := hotKeyPersistentStateFile(block, masterchainBlock, effectiveShard)
 	path, err := s.persistentStateArtifactPath(block, masterchainBlock, effectiveShard)
 	if err != nil {
-		return err
+		return persistentStateFileDelete{}, err
 	}
 
 	removedBytes := int64(0)
+	diskFileExisted := false
 	stat, err := os.Stat(path)
-	if err == nil && stat.Size() > 0 {
-		removedBytes = stat.Size()
+	if err == nil {
+		diskFileExisted = true
+		if stat.Size() > 0 {
+			removedBytes = stat.Size()
+		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return persistentStateFileDelete{}, err
 	}
 
-	if err = s.withHotBatch(func(batch *pebble.Batch) error {
-		if err := batch.Delete(key, pebble.NoSync); err != nil {
+	removeErr := os.Remove(path)
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return persistentStateFileDelete{}, removeErr
+	}
+	if diskFileExisted {
+		s.observePersistentStateBytes(-removedBytes)
+	}
+	return persistentStateFileDelete{
+		block:            block,
+		masterchainBlock: masterchainBlock,
+		effectiveShard:   effectiveShard,
+		key:              key,
+		dir:              filepath.Dir(path),
+		diskFileRemoved:  diskFileExisted,
+		diskFileBytes:    uint64(removedBytes),
+	}, nil
+}
+
+func syncPersistentStateDeleteDirs(files []persistentStateFileDelete) error {
+	dirs := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		dirs[file.dir] = struct{}{}
+	}
+	for dir := range dirs {
+		if err := syncDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		if effectiveShard == 0 {
-			return s.clearPersistentStateSnapshotMeta(batch, block)
-		}
-		return nil
-	}); err != nil {
-		return err
 	}
-
-	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	s.observePersistentStateBytes(-removedBytes)
 	return nil
 }
 
-func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.BlockIDExt) error {
+func (s *Store) deletePersistentStateFileRecords(files []persistentStateFileDelete) error {
+	if len(files) == 0 {
+		return nil
+	}
+
+	// Publish the metadata removal only after the directory entry is durable.
+	// A crash may then leave a retryable record for an absent file, but never an
+	// untracked persistent-state file that pruning cannot discover. NoSync is
+	// sufficient because any later durability point is ordered after syncDir.
+	return s.withHotBatch(func(batch *pebble.Batch) error {
+		deletedKeys := make(map[string]struct{}, len(files))
+		for _, file := range files {
+			deletedKeys[string(file.key)] = struct{}{}
+		}
+		retained, err := archivePrunePersistentStateRetentions(context.Background(), s.hot, deletedKeys)
+		if err != nil {
+			return err
+		}
+
+		for _, file := range files {
+			if err := batch.Delete(file.key, pebble.NoSync); err != nil {
+				return err
+			}
+			if file.effectiveShard == 0 {
+				retention, retainArchiveMarker := retained[storage.BlockKey(file.block)]
+				if err := s.clearPersistentStateSnapshotMeta(batch, file.block, retention, retainArchiveMarker); err != nil {
+					return err
+				}
+			}
+		}
+
+		checked := make(map[storage.BlockRootHash]struct{}, 2*len(files))
+		for _, file := range files {
+			for _, block := range []ton.BlockIDExt{file.block, file.masterchainBlock} {
+				key := storage.BlockKey(block)
+				if _, ok := checked[key]; ok {
+					continue
+				}
+				checked[key] = struct{}{}
+				if _, ok := retained[key]; ok {
+					continue
+				}
+				if err = s.deleteArchivePrunedSnapshotMeta(batch, block); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) deleteArchivePrunedSnapshotMeta(batch *pebble.Batch, block ton.BlockIDExt) error {
 	key := hotKeyBlockMeta(block)
 	raw, closer, err := pebbleReaderGet(s.hot, key)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -543,7 +673,52 @@ func (s *Store) clearPersistentStateSnapshotMeta(batch *pebble.Batch, block ton.
 	if err != nil {
 		return err
 	}
+	if !isArchivePrunedSnapshotMeta(meta) {
+		return nil
+	}
+	return batch.Delete(key, pebble.NoSync)
+}
+
+func (s *Store) clearPersistentStateSnapshotMeta(
+	batch *pebble.Batch,
+	block ton.BlockIDExt,
+	retention archivePrunePersistentStateRetention,
+	retainArchiveMarker bool,
+) error {
+	key := hotKeyBlockMeta(block)
+	raw, closer, err := pebbleReaderGet(s.hot, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closer.Close() }()
+
+	meta, err := decodeBlockMeta(block, raw)
+	if err != nil {
+		return err
+	}
+	if isArchivePrunedSnapshotMeta(meta) {
+		if !retainArchiveMarker {
+			return batch.Delete(key, pebble.NoSync)
+		}
+		if bytes.Equal(meta.StateRootHash, retention.stateRootHash) {
+			return nil
+		}
+		meta.StateRootHash = bytes.Clone(retention.stateRootHash)
+		return batch.Set(key, encodeBlockMeta(meta), pebble.NoSync)
+	}
 	existing := meta.Clone()
+	if len(retention.unsplitFileHash) != 0 {
+		meta.Mark(storage.BlockMetaHasStateSnapshot)
+		meta.StateRootHash = bytes.Clone(retention.stateRootHash)
+		meta.StateFileHash = bytes.Clone(retention.unsplitFileHash)
+		if err = batch.Set(key, encodeBlockMeta(meta), pebble.NoSync); err != nil {
+			return err
+		}
+		return setBlockMetaHistoryIndexes(batch, existing, meta)
+	}
 	meta.Flags &^= storage.BlockMetaHasStateSnapshot
 	meta.StateFileHash = nil
 	if !blockMetaIndexedInHistory(meta) {

@@ -44,6 +44,7 @@ type PersistentStateSerializationStorage interface {
 	SaveActivePersistentStateSerialization(ctx context.Context, active *PersistentStateSerializerActive) error
 	DeleteActivePersistentStateSerialization(ctx context.Context) error
 	SavePersistentStateDescription(ctx context.Context, desc *PersistentStateDescription) error
+	PersistentStateDescriptions(ctx context.Context) ([]PersistentStateDescription, error)
 }
 
 type CellGenerationStorage interface {
@@ -68,6 +69,9 @@ type BlockMetaStorage interface {
 	SaveBlockMeta(meta *BlockMeta) error
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*BlockMeta, error)
 	NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]ton.BlockIDExt, error)
+	// NextKeyBlockMetas iterates the same key-block index as NextKeyBlocks but
+	// without the served-full requirement, returning the stored metadata.
+	NextKeyBlockMetas(ctx context.Context, after uint32, limit int) ([]*BlockMeta, error)
 	LookupBlockBySeqNo(ctx context.Context, ref BlockSeqRef) (ton.BlockIDExt, error)
 	LookupBlockByLT(ctx context.Context, key BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)

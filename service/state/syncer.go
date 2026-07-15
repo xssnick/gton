@@ -243,8 +243,8 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterSnapshot blockState
 		err      error
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
 
 	results := make(chan shardStateResult, len(pendingPlans))
 	sem := make(chan struct{}, workers)
@@ -258,8 +258,8 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterSnapshot blockState
 
 			select {
 			case sem <- struct{}{}:
-			case <-ctx.Done():
-				results <- shardStateResult{err: ctx.Err()}
+			case <-workerCtx.Done():
+				results <- shardStateResult{err: workerCtx.Err()}
 				return
 			}
 			defer func() { <-sem }()
@@ -270,7 +270,7 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterSnapshot blockState
 				Uint32("split_depth", plan.splitDepth).
 				Msg("syncing shard state")
 
-			shardState, err := s.storage.BlockState(ctx, plan.block)
+			shardState, err := s.storage.BlockState(workerCtx, plan.block)
 			if err == nil {
 				s.log.Info().
 					Str("block", storage2.FormatBlockRef(plan.block)).
@@ -282,15 +282,15 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterSnapshot blockState
 			if !errors.Is(err, storage2.ErrNotFound) {
 				err = fmt.Errorf("load stored shard state %s: %w", storage2.FormatBlockRef(plan.block), err)
 			} else {
-				snapshot, err := s.downloadShardState(ctx, plan.block, master, plan.splitDepth)
+				snapshot, err := s.downloadShardState(workerCtx, plan.block, master, plan.splitDepth)
 				if err != nil && !errors.Is(err, context.Canceled) {
-					cancel()
+					cancelWorkers()
 				}
 				results <- shardStateResult{snapshot: snapshot, err: err}
 				return
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
-				cancel()
+				cancelWorkers()
 			}
 			results <- shardStateResult{err: err}
 		}()
@@ -313,16 +313,14 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterSnapshot blockState
 			}
 			res.snapshot.state.Cell = nil
 			res.snapshot.state.Parsed = nil
-			if err = s.storage.SaveStateSyncProgress(ctx, next); err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("persist pending state sync progress for %s: %w", storage2.FormatBlockRef(master), err)
-				cancel()
+			if firstErr == nil {
+				if err = s.storage.SaveStateSyncProgress(ctx, next); err != nil {
+					firstErr = fmt.Errorf("persist pending state sync progress for %s: %w", storage2.FormatBlockRef(master), err)
+					cancelWorkers()
+				}
 			}
-		case errors.Is(res.err, context.Canceled):
-			if firstErr == nil && ctx.Err() != nil {
-				firstErr = ctx.Err()
-			}
-		case firstErr == nil:
-			firstErr = res.err
+		case res.err != nil:
+			firstErr = firstShardStateError(ctx, firstErr, res.err)
 		}
 	}
 	if firstErr != nil {
@@ -350,6 +348,16 @@ func (s *Syncer) shardStatesStage(ctx context.Context, masterSnapshot blockState
 	return next, nil
 }
 
+func firstShardStateError(parentCtx context.Context, current, candidate error) error {
+	if current != nil {
+		return current
+	}
+	if errors.Is(candidate, context.Canceled) {
+		return parentCtx.Err()
+	}
+	return candidate
+}
+
 func (s *Syncer) appendSnapshotCheckpointEntry(ctx context.Context, entries *[]storage2.StateCheckpointBlock, state *storage2.BlockState, artifacts map[storage2.BlockRootHash]*storage2.ServedBlockFull) error {
 	if state.Block.SeqNo == 0 {
 		*entries = append(*entries, storage2.StateCheckpointBlock{State: state})
@@ -370,7 +378,7 @@ func (s *Syncer) appendSnapshotCheckpointEntry(ctx context.Context, entries *[]s
 
 	*entries = append(*entries, storage2.StateCheckpointBlock{
 		State:    state,
-		Artifact: artifact.Clone(),
+		Artifact: artifact,
 	})
 	return nil
 }
@@ -464,7 +472,7 @@ func (s *Syncer) publishDownloadedBlockState(ctx context.Context, state *storage
 	}
 	_, err := s.storage.SaveStateCheckpointEntries(ctx, []storage2.StateCheckpointBlock{{
 		State:    state,
-		Artifact: artifact.Clone(),
+		Artifact: artifact,
 	}}, storage2.StateCellRecords{}, nil)
 	return err
 }

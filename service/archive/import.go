@@ -73,10 +73,24 @@ func ImportBytes(ctx context.Context, archive *Downloaded, data []byte) (*Import
 	archiveRef := *archive
 	archiveRef.Data = nil
 	archiveRef.Bytes = int64(len(data))
-	return ImportStream(ctx, &archiveRef, bytes.NewReader(data))
+	// The whole pack is already resident in data; parse it in place and hand
+	// entries out as zero-copy sub-slices instead of re-copying every block and
+	// proof out of an io.Reader. This removes the ~2x peak (full pack plus a
+	// second copy of all entries) on the terabyte-scale import path. data is a
+	// single-use, non-pooled download buffer, so aliasing it is safe: the
+	// retained blocks keep its backing array alive via GC.
+	return importEntries(ctx, &archiveRef, func(handle func(packfile.Entry) error) error {
+		return packfile.ReadBytes(ctx, data, handle)
+	})
 }
 
 func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Imported, error) {
+	return importEntries(ctx, archive, func(handle func(packfile.Entry) error) error {
+		return packfile.Read(ctx, r, handle)
+	})
+}
+
+func importEntries(ctx context.Context, archive *Downloaded, read func(handle func(packfile.Entry) error) error) (*Imported, error) {
 	stats := &ImportStats{
 		MasterchainSeqno: archive.MasterchainSeqno,
 		ArchiveID:        archive.ArchiveID,
@@ -93,7 +107,7 @@ func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Impor
 	defer preparer.abort()
 
 	started := time.Now()
-	err := packfile.Read(ctx, r, func(entry packfile.Entry) error {
+	err := read(func(entry packfile.Entry) error {
 		if err := preparer.err(); err != nil {
 			return err
 		}

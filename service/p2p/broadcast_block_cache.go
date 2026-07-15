@@ -39,6 +39,9 @@ type broadcastBlockCacheEntry struct {
 	sourcePeerID PeerID
 	expiresAt    time.Time
 	bytes        int64
+	// signaturesVerifiedKey preserves DownloadedBlock.SignaturesVerifiedKey
+	// across the cache round-trip.
+	signaturesVerifiedKey []byte
 }
 
 func newBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int, kind string) broadcastBlockCache {
@@ -144,9 +147,6 @@ func (c *broadcastBlockCache) deleteEntryLocked(entry *broadcastBlockCacheEntry)
 		entry.element = nil
 	}
 	c.bytes -= entry.bytes
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 }
 
 func (e *broadcastBlockCacheEntry) downloaded(defaultKind string) *DownloadedBlock {
@@ -166,5 +166,7 @@ func (e *broadcastBlockCacheEntry) downloaded(defaultKind string) *DownloadedBlo
 		SourcePeerID:     e.sourcePeerID,
 		IsLink:           e.isLink,
 		VerifiedRootHash: true,
+
+		SignaturesVerifiedKey: append([]byte(nil), e.signaturesVerifiedKey...),
 	}
 }

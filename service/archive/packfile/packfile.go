@@ -123,6 +123,70 @@ func Read(ctx context.Context, r io.Reader, handle func(Entry) error) error {
 	}
 }
 
+// ReadBytes parses an in-memory package and yields each entry's Data as a
+// zero-copy sub-slice of data. It mirrors Read's framing and lenient
+// end-of-stream handling, but avoids the per-entry allocation+copy that Read
+// must perform when consuming an io.Reader.
+//
+// The handler MUST treat Entry.Data as read-only and MUST NOT assume it is
+// independent of data: retaining any entry keeps the whole data backing array
+// alive. Callers therefore pass a single-use, non-pooled buffer.
+func ReadBytes(ctx context.Context, data []byte, handle func(Entry) error) error {
+	if len(data) < HeaderSize {
+		return fmt.Errorf("read archive magic: %w", io.ErrUnexpectedEOF)
+	}
+	got := binary.LittleEndian.Uint32(data[:HeaderSize])
+	if got != PackageMagic {
+		return fmt.Errorf("archive package magic mismatch: got=%08x want=%08x", got, PackageMagic)
+	}
+
+	offset := int64(HeaderSize)
+	total := int64(len(data))
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if offset == total {
+			return nil
+		}
+		if offset+EntryHeaderSize > total {
+			return fmt.Errorf("read archive entry header: %w", io.ErrUnexpectedEOF)
+		}
+
+		header0 := binary.LittleEndian.Uint32(data[offset : offset+4])
+		if header0&0xffff != EntryMagic {
+			return fmt.Errorf("archive entry magic mismatch")
+		}
+
+		nameLen := int64(header0 >> 16)
+		dataLen := int64(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+		if dataLen > MaxDataSize {
+			return fmt.Errorf("archive entry %d bytes exceeds limit %d", dataLen, MaxDataSize)
+		}
+
+		nameOffset := offset + EntryHeaderSize
+		dataOffset := nameOffset + nameLen
+		if dataOffset+dataLen > total {
+			return fmt.Errorf("read archive entry data: %w", io.ErrUnexpectedEOF)
+		}
+
+		if err := handle(Entry{
+			Name:        string(data[nameOffset:dataOffset]),
+			Data:        data[dataOffset : dataOffset+dataLen],
+			EntryOffset: offset,
+			DataOffset:  dataOffset,
+			DataSize:    dataLen,
+		}); err != nil {
+			return err
+		}
+
+		offset = dataOffset + dataLen
+	}
+}
+
 func ensureWithSize(file *os.File) (int64, error) {
 	stat, err := file.Stat()
 	if err != nil {

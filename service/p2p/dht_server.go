@@ -63,7 +63,7 @@ func (n *Node) startDHTServer(ctx context.Context, cfg *liteclient.GlobalConfig)
 
 	n.dhtGateway = dhtGateway
 	n.dhtServer = server
-	n.dht = &serverDHTBackend{Server: server}
+	n.dht = server
 
 	n.runAsync(func() {
 		n.runDHTServerPublishLoop(ctx, addrList)

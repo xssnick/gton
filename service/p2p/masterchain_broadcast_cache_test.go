@@ -134,7 +134,7 @@ func TestAcceptBroadcastCachesMasterchainNextBroadcast(t *testing.T) {
 		},
 	})
 
-	got, err := node.masterchainNextBroadcastBlock(prev)
+	got, err := node.masterchainNextBroadcastCache.BlockAfter(prev)
 	if err != nil {
 		t.Fatalf("load cached masterchain broadcast: %v", err)
 	}
@@ -166,6 +166,41 @@ func TestAcceptBroadcastObservesSignedMasterchainBlockReceived(t *testing.T) {
 	event := observer.events[0]
 	if !event.IsSigned || event.Downloaded != &broadcast {
 		t.Fatalf("unexpected block received event: %+v", event)
+	}
+}
+
+func TestWatchMasterchainNextBroadcastBlockFiresOnStore(t *testing.T) {
+	node := newTestNode(t)
+	prev := testStoredMasterBlockID(250)
+	broadcast := testMasterchainBroadcastDownloadedBlock(t, prev, 251, 0x251)
+
+	wake, unwatch := node.WatchMasterchainNextBroadcastBlock(prev)
+	defer unwatch()
+	if wake == nil {
+		t.Fatal("watch returned nil channel for masterchain prev")
+	}
+	if node.HasMasterchainNextBroadcastBlock(prev) {
+		t.Fatal("cache reports next broadcast before store")
+	}
+
+	if !node.rememberMasterchainNextBroadcastBlock(&broadcast) {
+		t.Fatal("masterchain broadcast was not cached")
+	}
+
+	select {
+	case <-wake:
+	case <-time.After(time.Second):
+		t.Fatal("watch did not fire after the next broadcast was cached")
+	}
+	if !node.HasMasterchainNextBroadcastBlock(prev) {
+		t.Fatal("cache does not report the stored next broadcast")
+	}
+
+	if wake, _ := node.WatchMasterchainNextBroadcastBlock(testBlockID(0, topShard, 1)); wake != nil {
+		t.Fatal("watch returned a channel for non-masterchain prev")
+	}
+	if node.HasMasterchainNextBroadcastBlock(testBlockID(0, topShard, 1)) {
+		t.Fatal("cache reports next broadcast for non-masterchain prev")
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
-	"os"
 	"sort"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -135,28 +134,40 @@ func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMas
 }
 
 func (s *Store) deletePersistentStatePruneFiles(ctx context.Context, stats *storage.PersistentStatePruneStats, files []persistentStatePruneFile) error {
+	deleted := make([]persistentStateFileDelete, 0, len(files))
 	for _, file := range files {
-		diskFileSize, err := s.persistentStateDiskFileSize(file)
-		diskFileExists := !errors.Is(err, storage.ErrNotFound)
-		if errors.Is(err, storage.ErrNotFound) {
-			err = nil
-		}
-		if err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 
-		err = s.DeletePersistentStateFile(ctx, file.block, file.master, file.effectiveShard)
+		entry, err := s.unlinkPersistentStateFile(ctx, file.block, file.master, file.effectiveShard)
 		if errors.Is(err, storage.ErrNotFound) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
+		deleted = append(deleted, entry)
+	}
 
+	// All persistent-state artifacts share a directory in normal operation, so
+	// a prune run needs one directory sync rather than one per removed file.
+	// Metadata stays intact until every unlink is durable; a failure before that
+	// point therefore remains retryable on the next prune pass.
+	if err := syncPersistentStateDeleteDirs(deleted); err != nil {
+		return err
+	}
+	if err := s.deletePersistentStateFileRecords(deleted); err != nil {
+		return err
+	}
+
+	for _, entry := range deleted {
 		stats.DeletedFileRecords++
-		if diskFileExists {
+		if entry.diskFileRemoved {
 			stats.DeletedDiskFiles++
-			stats.DeletedDiskBytes += diskFileSize
+			stats.DeletedDiskBytes += entry.diskFileBytes
 		}
 	}
 	return nil
@@ -301,7 +312,18 @@ func oldestRetainedPersistentStateSeqno(retained map[uint32]struct{}) uint32 {
 func (s *Store) persistentStateFileExpired(ctx context.Context, master ton.BlockIDExt, nowUnix uint64) (bool, error) {
 	meta, err := s.BlockMeta(ctx, master)
 	if errors.Is(err, storage.ErrNotFound) {
-		return true, nil
+		endTime, descErr := s.persistentStateDescriptionEndTime(ctx, master)
+		if errors.Is(descErr, storage.ErrNotFound) {
+			return true, nil
+		}
+		if descErr != nil {
+			return false, fmt.Errorf("load persistent state description %s: %w", storage.FormatBlockRef(master), descErr)
+		}
+
+		// Archive GC in older releases could remove block metadata before the
+		// persistent-state TTL. Automatic snapshots also persist the exact TTL
+		// in their description, so preserve those files across an upgrade.
+		return endTime < nowUnix, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("load persistent state master block meta %s: %w", storage.FormatBlockRef(master), err)
@@ -312,6 +334,21 @@ func (s *Store) persistentStateFileExpired(ctx context.Context, master ton.Block
 	return persistentStateFileTTL(meta.GenUTime) < nowUnix, nil
 }
 
+func (s *Store) persistentStateDescriptionEndTime(ctx context.Context, master ton.BlockIDExt) (uint64, error) {
+	raw, err := s.getHotCopy(ctx, hotKeyPersistentStateDescription(master.SeqNo))
+	if err != nil {
+		return 0, err
+	}
+	desc, err := decodePersistentStateDescription(raw)
+	if err != nil {
+		return 0, err
+	}
+	if !desc.MasterchainBlock.Equals(&master) {
+		return 0, storage.ErrNotFound
+	}
+	return desc.EndTime, nil
+}
+
 func persistentStateFileTTL(ts uint32) uint64 {
 	x := uint64(ts) / (1 << 17)
 	if x == 0 {
@@ -319,22 +356,4 @@ func persistentStateFileTTL(ts uint32) uint64 {
 	}
 
 	return uint64(ts) + ((uint64(1) << 18) << bits.TrailingZeros64(x))
-}
-
-func (s *Store) persistentStateDiskFileSize(file persistentStatePruneFile) (uint64, error) {
-	path, err := s.persistentStateArtifactPath(file.block, file.master, file.effectiveShard)
-	if err != nil {
-		return 0, err
-	}
-	stat, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, storage.ErrNotFound
-	}
-	if err != nil {
-		return 0, err
-	}
-	if stat.Size() <= 0 {
-		return 0, nil
-	}
-	return uint64(stat.Size()), nil
 }

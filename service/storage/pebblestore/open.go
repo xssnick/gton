@@ -234,6 +234,7 @@ func Open(opts Options) (*Store, error) {
 		pendingArchiveSync:              map[string]pendingPackWrite{},
 		pendingKeyProofSync:             map[string]pendingPackWrite{},
 	}
+	store.lazyCellLoaderZero = store.newLazyCellLoaderForGeneration(0)
 	if !opts.ReadOnly {
 		stageStarted = time.Now()
 		logger.Info().Msg("recovering artifact pack journals")
@@ -247,7 +248,7 @@ func Open(opts Options) (*Store, error) {
 		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("recovered artifact pack journals")
 		stageStarted = time.Now()
 		logger.Info().Msg("cleaning retired cell generations")
-		if err = store.CleanupRetiredCellGenerations(context.Background()); err != nil {
+		if err = store.cleanupRetiredCellGenerations(context.Background()); err != nil {
 			_ = store.closeCellGenerations()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()
@@ -255,8 +256,18 @@ func Open(opts Options) (*Store, error) {
 			return nil, fmt.Errorf("cleanup retired cell generations: %w", err)
 		}
 		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("cleaned retired cell generations")
+		stageStarted = time.Now()
+		logger.Info().Msg("cleaning unreferenced cell generations")
+		if err = store.cleanupUnreferencedCellGenerationDirs(); err != nil {
+			_ = store.closeCellGenerations()
+			_ = hot.Close()
+			_ = store.artifactFiles.close()
+			hotCache.Unref()
+			return nil, fmt.Errorf("cleanup unreferenced cell generations: %w", err)
+		}
+		logger.Info().Dur("elapsed", time.Since(stageStarted)).Msg("cleaned unreferenced cell generations")
 	} else {
-		logger.Info().Msg("skipped artifact repair and retired cell cleanup in read-only mode")
+		logger.Info().Msg("skipped artifact repair and cell generation cleanup in read-only mode")
 	}
 	logger.Info().
 		Int64("meta_cache_size", opts.MetaCacheSize).
@@ -287,6 +298,7 @@ func Open(opts Options) (*Store, error) {
 		Bool("pebble_value_blocks", false).
 		Int64("cell_lbase_max_bytes", defaultPebbleCellLBaseMaxBytes).
 		Int("state_cell_import_batch_target_bytes", stateCellImportBatchTargetBytes).
+		Int("state_boc_import_max_batch_bytes", stateBOCImportMaxBatchBytes).
 		Int("artifact_file_max_open", opts.ArtifactFileMaxOpen).
 		Int("cell_memtable_stop_writes_threshold", opts.CellMemTableStopWritesThreshold).
 		Int("cell_l0_compaction_threshold", defaultPebbleCellL0CompactionThreshold).

@@ -3,6 +3,8 @@ package pebblestore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -77,7 +79,7 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 	})
 
 	b.Run("direct-state", func(b *testing.B) {
-		valueLen, d1, d2, err := stateCellEncodedLen(root, refs)
+		valueLen, layout, err := stateCellEncodedLen(root, refs)
 		if err != nil {
 			b.Fatalf("state cell encoded len: %v", err)
 		}
@@ -88,7 +90,7 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			encodeStateCellRecordTo(buf, root, refs, d1, d2)
+			encodeStateCellRecordTo(buf, root, refs, layout)
 		}
 	})
 }
@@ -158,6 +160,122 @@ func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkPebbleSaveStateBOCViewParallel(b *testing.B) {
+	root, cells := benchmarkCellGraph(b, 32768, 4)
+	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
+		WithIndex:     true,
+		WithTopHash:   true,
+		WithIntHashes: true,
+	})
+	view, err := cell.OpenBOCView(bytes.NewReader(boc), int64(len(boc)), cell.BOCViewOptions{RequireIndex: true})
+	if err != nil {
+		b.Fatalf("open benchmark boc view: %v", err)
+	}
+	store := openBenchmarkStore(b, Options{})
+	block := benchmarkBlockID(2)
+	workers := stateBOCImportWorkerCount(view.Cells())
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if err := store.saveStateBOCView(context.Background(), 0, block, view); err != nil {
+			b.Fatalf("save boc view state cells: %v", err)
+		}
+	}
+	b.ReportMetric(float64(cells), "cells/op")
+	b.ReportMetric(float64(workers), "workers")
+	b.ReportMetric(float64(stateBOCImportWorkerBatchTarget(workers)*workers)/(1<<20), "batch-MiB")
+}
+
+func BenchmarkStateBOCBatchBudget(b *testing.B) {
+	const (
+		workers       = cellDBShardCount
+		writtenBytes  = 128 << 20
+		recordSize    = 512
+		initialBudget = stateCellImportBatchTargetBytes
+	)
+
+	for _, aggregateBudget := range []int{128 << 20, 256 << 20, 512 << 20} {
+		b.Run(fmt.Sprintf("aggregate=%dMiB", aggregateBudget>>20), func(b *testing.B) {
+			store := openBenchmarkStore(b, Options{})
+			workerTarget := aggregateBudget / workers
+			workerInitial := initialBudget / workers
+			flushes := (writtenBytes + workerTarget - 1) / workerTarget
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				writer := store.cells.newBatchWriter(cellShardBatchInitialSize(workerInitial))
+				for i := 0; i < writtenBytes/recordSize; i++ {
+					var hash cell.Hash
+					hash[0] = byte(i%cellDBShardCount) << 5
+					binary.BigEndian.PutUint64(hash[24:], uint64(i))
+					if err := writer.setDeferred(hash[:], recordSize, func(value []byte) {
+						value[0] = byte(i)
+					}); err != nil {
+						writer.close()
+						b.Fatalf("add batch record: %v", err)
+					}
+					if writer.bytesInBatch >= workerTarget {
+						if _, err := writer.flush(); err != nil {
+							writer.close()
+							b.Fatalf("flush batch: %v", err)
+						}
+					}
+				}
+				if _, err := writer.flush(); err != nil {
+					writer.close()
+					b.Fatalf("flush final batch: %v", err)
+				}
+				writer.close()
+			}
+			b.ReportMetric(float64(writtenBytes), "bytes/op")
+			b.ReportMetric(float64(flushes), "flushes/op")
+		})
+	}
+}
+
+func BenchmarkSaveCellRecordSetSharded(b *testing.B) {
+	const (
+		recordCount = 1 << 16
+		valueSize   = 128
+	)
+
+	value := make([]byte, valueSize)
+	records := make([]storage.EncodedCellRecord, recordCount)
+	for i := range records {
+		var hash cell.Hash
+		hash[0] = byte(i%cellDBShardCount) << 5
+		binary.BigEndian.PutUint64(hash[24:], uint64(i))
+		records[i] = storage.EncodedCellRecord{
+			Hash: hash,
+			Data: value,
+		}
+	}
+	chunks := make([][]storage.EncodedCellRecord, 0, recordCount/4096)
+	for start := 0; start < len(records); start += 4096 {
+		chunks = append(chunks, records[start:start+4096])
+	}
+	set := storage.NewStateCellRecordChunks(chunks, recordCount*valueSize)
+	store := openBenchmarkStore(b, Options{})
+
+	b.ReportAllocs()
+	b.SetBytes(int64(recordCount * valueSize))
+	b.ReportMetric(recordCount, "cells/op")
+	b.ReportMetric(recordCount, "route-bytes/op")
+	b.ResetTimer()
+
+	for b.Loop() {
+		stats, err := saveCellRecordSetSharded(context.Background(), store.cells, set, false)
+		if err != nil {
+			b.Fatalf("save sharded cell records: %v", err)
+		}
+		if stats.written != recordCount {
+			b.Fatalf("written cells = %d, want %d", stats.written, recordCount)
+		}
+	}
 }
 
 func BenchmarkPebbleSaveStateCellTree(b *testing.B) {

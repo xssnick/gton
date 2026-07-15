@@ -191,6 +191,7 @@ type ExternalBroadcastCapacityOptions struct {
 
 type BroadcastSignatureVerifier interface {
 	CheckBlockBroadcastSignatures(ctx context.Context, req BlockBroadcastSignatureCheck) error
+	CheckBlockFinalitySignatures(ctx context.Context, req BlockFinalitySignatureCheck) (*BlockFinalitySignatureCheckResult, error)
 	ValidateShardDescriptionBroadcast(ctx context.Context, req ShardDescriptionSignatureCheck) (*ShardBlockDescription, error)
 }
 
@@ -199,6 +200,17 @@ type BlockBroadcastSignatureCheck struct {
 	Block      ton.BlockIDExt
 	Proof      *cell.Cell
 	Signatures *blockproof.ValidatorSignatureSet
+}
+
+type BlockFinalitySignatureCheck struct {
+	Kind       string
+	Block      ton.BlockIDExt
+	Signatures *blockproof.ValidatorSignatureSet
+}
+
+type BlockFinalitySignatureCheckResult struct {
+	SignaturesCell        *cell.Cell
+	SignaturesVerifiedKey []byte
 }
 
 type ShardDescriptionSignatureCheck struct {
@@ -333,6 +345,12 @@ type DownloadedBlock struct {
 	IsLink bool
 
 	VerifiedRootHash bool
+	// SignaturesVerifiedKey is the blockproof.ValidatorSignatureSet.ContentKey
+	// of a validator signature set that already passed the broadcast-level
+	// signature check for this block; nil when no such check happened.
+	// Consumers may skip re-verifying a signature set whose content key
+	// equals this one.
+	SignaturesVerifiedKey []byte
 }
 
 func (b DownloadedBlock) BlockRef() string {

@@ -5,9 +5,47 @@ import (
 	"time"
 
 	storage2 "github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/ton"
 )
+
+// statusPeersLocked lists the peers rendered in the status table. Custom
+// fixed overlays list every member: a probed peer that never delivered
+// anything (frozen from the start) is never promoted into neighbours and
+// would otherwise be invisible exactly when its diagnostics matter most.
+func (s *overlaySubscription) statusPeersLocked() []*overlayPeer {
+	if s.spec.Kind == overlayKindCustomFixed {
+		peers := make([]*overlayPeer, 0, len(s.peers))
+		for _, peer := range s.peers {
+			peers = append(peers, peer)
+		}
+		return peers
+	}
+
+	peers := make([]*overlayPeer, 0, len(s.neighbours))
+	for _, id := range s.neighbours {
+		peer := s.peers[id]
+		if peer == nil {
+			continue
+		}
+		peers = append(peers, peer)
+	}
+	return peers
+}
+
+func adnlChannelStateLabel(state adnl.PeerChannelState) string {
+	switch state {
+	case adnl.PeerChannelStateNone:
+		return "none"
+	case adnl.PeerChannelStatePending:
+		return "pending"
+	case adnl.PeerChannelStateReady:
+		return "ready"
+	default:
+		return "unknown"
+	}
+}
 
 type StatusSnapshot struct {
 	ListenAddr            string
@@ -30,17 +68,24 @@ type OverlayStatusSnapshot struct {
 	AliveKnownPeers  int
 	ActiveNeighbours int
 	AliveNeighbours  int
+	FixedProbes      bool
+	SoftRecoveries   uint64
+	HardRecoveries   uint64
 	Neighbours       []NeighbourStatusSnapshot
 }
 
 type NeighbourStatusSnapshot struct {
-	ID            string
-	Addr          string
-	Alive         bool
-	LastReceiveAt time.Time
-	LastSuccessAt time.Time
-	FailedQueries uint64
-	Unreliability float64
+	ID               string
+	Addr             string
+	Alive            bool
+	LastReceiveAt    time.Time
+	LastSuccessAt    time.Time
+	FailedQueries    uint64
+	Unreliability    float64
+	LastPongAt       time.Time
+	ProbeFailures    uint32
+	ADNLLastInAt     time.Time
+	ADNLChannelState string
 }
 
 type QueueStatusSnapshot struct {
@@ -460,8 +505,11 @@ func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {
 
 	now := time.Now()
 	snapshot := OverlayStatusSnapshot{
-		Name:       s.spec.Name,
-		Neighbours: make([]NeighbourStatusSnapshot, 0, len(s.neighbours)),
+		Name:           s.spec.Name,
+		FixedProbes:    s.spec.Kind == overlayKindCustomFixed,
+		SoftRecoveries: s.softRecoveries,
+		HardRecoveries: s.hardRecoveries,
+		Neighbours:     make([]NeighbourStatusSnapshot, 0, len(s.neighbours)),
 	}
 
 	for _, peer := range s.peers {
@@ -474,13 +522,9 @@ func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {
 		}
 	}
 
-	for _, id := range s.neighbours {
-		peer := s.peers[id]
-		if peer == nil {
-			continue
-		}
+	for _, peer := range s.statusPeersLocked() {
 		stats := peer.statsSnapshot()
-		snapshot.Neighbours = append(snapshot.Neighbours, NeighbourStatusSnapshot{
+		neighbour := NeighbourStatusSnapshot{
 			ID:            peer.id.String(),
 			Addr:          peer.addr,
 			Alive:         stats.alive,
@@ -488,7 +532,14 @@ func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {
 			LastSuccessAt: stats.lastSuccessAt,
 			FailedQueries: stats.failedQueries,
 			Unreliability: stats.unreliability,
-		})
+			LastPongAt:    stats.lastPongAt,
+			ProbeFailures: stats.probeFailures,
+		}
+		if adnlStats, ok := peer.adnlPairStats(); ok {
+			neighbour.ADNLLastInAt = adnlStats.Inbound.LastPacketAt
+			neighbour.ADNLChannelState = adnlChannelStateLabel(adnlStats.Channel.State)
+		}
+		snapshot.Neighbours = append(snapshot.Neighbours, neighbour)
 		if stats.alive {
 			snapshot.AliveNeighbours++
 		}

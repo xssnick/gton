@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
@@ -127,7 +128,7 @@ func (s *Server) handleNonfinalPendingShardBlocks(query ton.NonfinalGetPendingSh
 
 	var filter *storage.ShardKey
 	if query.Mode&1 != 0 {
-		if shardPrefixLen(uint64(query.Shard)) < 0 {
+		if blockproof.ShardPrefixLen(uint64(query.Shard)) < 0 {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
 		}
 		filter = &storage.ShardKey{Workchain: query.WC, Shard: query.Shard}
@@ -231,24 +232,6 @@ func (s *Server) masterchainInfoWithUTime(ctx context.Context) (ton.MasterchainI
 	return info, lastUTime, err
 }
 
-func currentMasterchainInfo(current *storage.CurrentState) (ton.BlockIDExt, []byte, uint32, error) {
-	if current == nil {
-		return ton.BlockIDExt{}, nil, 0, storage.ErrNotFound
-	}
-
-	block := current.Masterchain.Block
-	stateRoot := current.Masterchain.StateRootHash
-	lastUTime := uint32(0)
-	if current.Masterchain.Parsed != nil {
-		lastUTime = current.Masterchain.Parsed.GenUTime
-	}
-
-	if len(stateRoot) != 32 {
-		return ton.BlockIDExt{}, nil, 0, fmt.Errorf("masterchain state root hash is missing")
-	}
-	return block, stateRoot, lastUTime, nil
-}
-
 func (s *Server) masterchainInfo(block ton.BlockIDExt, stateRoot []byte) (ton.MasterchainInfo, error) {
 	if len(stateRoot) != 32 {
 		return ton.MasterchainInfo{}, fmt.Errorf("masterchain state root hash is missing")
@@ -297,7 +280,7 @@ type accountReference struct {
 	masterCache *liveview.BlockView
 }
 
-func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, request string, keepMasterState bool) (accountReference, error) {
+func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, request string, keepMasterState bool, withShardProof bool) (accountReference, error) {
 	if id == nil {
 		return accountReference{}, fmt.Errorf("reference block id for a %s is invalid", request)
 	}
@@ -334,7 +317,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 	}
 
 	if keepMasterState || account.Workchain != masterchainID {
-		masterFragments, err := s.blockFragments(ctx, base)
+		masterFragments, err := s.store.BlockFragments(ctx, base)
 		if err != nil {
 			return accountReference{}, err
 		}
@@ -346,7 +329,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 		return ref, nil
 	}
 
-	proof, shardBlock, err := s.masterShardProof(ctx, base, addr)
+	proof, shardBlock, err := s.masterShardProof(ref.masterCache, addr, withShardProof)
 	if errors.Is(err, storage.ErrNotFound) {
 		ref.shard = ton.BlockIDExt{}
 		ref.shardProof = proof
@@ -362,7 +345,7 @@ func (s *Server) resolveAccountReference(ctx context.Context, id *ton.BlockIDExt
 }
 
 func (s *Server) accountState(ctx context.Context, id *ton.BlockIDExt, account ton.AccountID, pruned bool) (ton.AccountState, error) {
-	ref, err := s.resolveAccountReference(ctx, id, account, "getAccountState()", false)
+	ref, err := s.resolveAccountReference(ctx, id, account, "getAccountState()", false, true)
 	if err != nil {
 		return ton.AccountState{}, err
 	}
@@ -389,25 +372,7 @@ func (s *Server) accountState(ctx context.Context, id *ton.BlockIDExt, account t
 }
 
 func isFullBlockID(id *ton.BlockIDExt) bool {
-	if id == nil || len(id.RootHash) != 32 || len(id.FileHash) != 32 {
-		return false
-	}
-	if id.Workchain == workchainInvalid || id.Shard == 0 || uint64(id.Shard)&7 != 0 || id.SeqNo > math.MaxInt32 {
-		return false
-	}
-	if id.Workchain == masterchainID && id.Shard != masterchainShard {
-		return false
-	}
-	return !isZeroHash(id.RootHash) && !isZeroHash(id.FileHash)
-}
-
-func isZeroHash(hash []byte) bool {
-	for _, b := range hash {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
+	return id != nil && blockproof.IsFullBlockID(*id)
 }
 
 func isCurrentMasterchainID(id ton.BlockIDExt) bool {
@@ -454,13 +419,10 @@ func errorResponse(err error, fallback string) ton.LSError {
 	}
 	if errors.Is(err, storage.ErrNotFound) {
 		text := fallback + ": not found"
-		if err != nil && err.Error() != storage.ErrNotFound.Error() {
+		if err.Error() != storage.ErrNotFound.Error() {
 			text = fallback + ": " + err.Error()
 		}
 		return ton.LSError{Code: errCodeNotReady, Text: text}
-	}
-	if err == nil {
-		return ton.LSError{Code: errCodeInternal, Text: fallback}
 	}
 	return ton.LSError{Code: errCodeInternal, Text: fallback + ": " + err.Error()}
 }

@@ -22,6 +22,8 @@ type CurrentAccountBlockIDs struct {
 
 func cloneBlockID(id ton.BlockIDExt) *ton.BlockIDExt {
 	cloned := id
+	cloned.RootHash = bytes.Clone(id.RootHash)
+	cloned.FileHash = bytes.Clone(id.FileHash)
 	return &cloned
 }
 

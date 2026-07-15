@@ -110,3 +110,31 @@ func (s *Server) loadStateRootWithBlockRoot(ctx context.Context, id ton.BlockIDE
 	}
 	return root, blockRoot, nil
 }
+
+func stateRootHashFromBlock(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) {
+	if _, err := storage.ParseVerifiedBlockCell(id, root); err != nil {
+		return nil, err
+	}
+
+	rootLoader, err := root.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("load block root %s: %w", storage.FormatBlockRef(id), err)
+	}
+
+	update, err := rootLoader.PeekRefCellAt(2)
+	if err != nil {
+		return nil, fmt.Errorf("block %s has no state update: %w", storage.FormatBlockRef(id), err)
+	}
+	updateLoader, err := update.BeginParse()
+	if err != nil {
+		return nil, fmt.Errorf("load block state update %s: %w", storage.FormatBlockRef(id), err)
+	}
+
+	nextState, err := updateLoader.PeekRefCellAt(1)
+	if err != nil {
+		return nil, fmt.Errorf("load block state update target %s: %w", storage.FormatBlockRef(id), err)
+	}
+
+	hash := nextState.HashKey(0)
+	return bytes.Clone(hash[:]), nil
+}

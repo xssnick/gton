@@ -1,10 +1,11 @@
 package liveview
 
 import (
+	"container/list"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -14,41 +15,173 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/tuple"
 )
 
-const (
-	runMethodConfigParamCount           = 6
-	runMethodConfigParamSizeLimitsIndex = 5
-)
+// liveConfigEpochCacheLimit bounds the shared per-config-epoch cache. The
+// blockchain config changes only at key blocks, so a couple of entries cover
+// the live window plus occasional historic queries.
+const liveConfigEpochCacheLimit = 4
 
-var runMethodConfigParamIDs = [runMethodConfigParamCount]uint32{
-	tlb.ConfigParamGlobalID,
-	tlb.ConfigParamGasPricesMasterchain,
-	tlb.ConfigParamGasPricesBasechain,
-	tlb.ConfigParamMsgForwardPricesMasterchain,
-	tlb.ConfigParamMsgForwardPricesBasechain,
-	tlb.ConfigParamSizeLimits,
+// liveConfigEpoch is everything derived from one blockchain config root: the
+// immutable tvm execution context plus the run-method extras the tvm does not
+// expose. It is built once per config epoch and shared by every BlockView
+// whose master state carries the same config root.
+type liveConfigEpoch struct {
+	prepared     *tvm.PreparedBlockchainConfig
+	precompiled  map[cell.Hash]uint64
+	extMsgLimits ExternalMessageSizeLimits
+}
+
+type liveConfigEpochEntry struct {
+	key   cell.Hash
+	epoch *liveConfigEpoch
+}
+
+var liveConfigEpochCache = struct {
+	mu      sync.Mutex
+	entries map[cell.Hash]*list.Element
+	order   *list.List
+}{
+	entries: map[cell.Hash]*list.Element{},
+	order:   list.New(),
+}
+
+// liveConfigEpochForRoot returns the shared config-epoch context for a config
+// root, building and caching it on first use (bounded LRU keyed by the config
+// root hash).
+func liveConfigEpochForRoot(configRoot *cell.Cell) (*liveConfigEpoch, error) {
+	key := configRoot.HashKey()
+
+	cache := &liveConfigEpochCache
+	cache.mu.Lock()
+	if element, ok := cache.entries[key]; ok {
+		cache.order.MoveToFront(element)
+		epoch := element.Value.(*liveConfigEpochEntry).epoch
+		cache.mu.Unlock()
+		return epoch, nil
+	}
+	cache.mu.Unlock()
+
+	epoch, err := buildLiveConfigEpoch(configRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if element, ok := cache.entries[key]; ok {
+		// A concurrent request built the same epoch; keep the published one.
+		cache.order.MoveToFront(element)
+		return element.Value.(*liveConfigEpochEntry).epoch, nil
+	}
+	cache.entries[key] = cache.order.PushFront(&liveConfigEpochEntry{key: key, epoch: epoch})
+	for len(cache.entries) > liveConfigEpochCacheLimit {
+		oldest := cache.order.Back()
+		cache.order.Remove(oldest)
+		delete(cache.entries, oldest.Value.(*liveConfigEpochEntry).key)
+	}
+	return epoch, nil
+}
+
+func buildLiveConfigEpoch(configRoot *cell.Cell) (*liveConfigEpoch, error) {
+	root, err := prewarmCachedCell(configRoot, liveConfigRootPrewarmDepth)
+	if err != nil {
+		return nil, err
+	}
+
+	prepared, err := tvm.PrepareBlockchainConfig(root)
+	if err != nil {
+		return nil, err
+	}
+
+	precompiled, err := liveConfigPrecompiledContracts(root)
+	if err != nil {
+		return nil, err
+	}
+
+	limits, err := externalMessageLimitsFromConfigRoot(root)
+	if err != nil {
+		return nil, err
+	}
+
+	return &liveConfigEpoch{
+		prepared:     prepared,
+		precompiled:  precompiled,
+		extMsgLimits: limits,
+	}, nil
+}
+
+// unpackedConfig builds the c7 unpacked-config value active at the given
+// block time. The entry layout comes from the prepared config and matches the
+// C++ representation (raw dict value slices).
+func (e *liveConfigEpoch) unpackedConfig(now uint32) (any, error) {
+	block, err := e.prepared.NewBlockContext(tvm.BlockOptions{Now: now})
+	if err != nil {
+		return nil, err
+	}
+	unpacked, ok := block.UnpackedConfig()
+	if !ok {
+		return nil, nil
+	}
+	return unpacked, nil
+}
+
+// precompiledGas returns the configured gas usage of a precompiled contract
+// code (config param 45), or nil when the code is not precompiled.
+func (e *liveConfigEpoch) precompiledGas(code *cell.Cell) *big.Int {
+	if code == nil || len(e.precompiled) == 0 {
+		return nil
+	}
+	gas, ok := e.precompiled[code.HashKey()]
+	if !ok {
+		return nil
+	}
+	return new(big.Int).SetUint64(gas)
+}
+
+// liveConfigPrecompiledContracts mirrors the precompiled map PreparedBlockchainConfig
+// holds internally: the run-method c7 needs the gas usage as an explicit
+// value, which the tvm does not expose.
+func liveConfigPrecompiledContracts(root *cell.Cell) (map[cell.Hash]uint64, error) {
+	precompiled, err := tlb.BlockchainConfig{Root: root}.GetPrecompiledContractsConfig()
+	if err != nil {
+		return nil, err
+	}
+	if precompiled.List == nil || precompiled.List.IsEmpty() {
+		return nil, nil
+	}
+
+	items, err := precompiled.List.LoadAll(true)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[cell.Hash]uint64, len(items))
+	for _, item := range items {
+		codeHash, err := item.Key.LoadSlice(256)
+		if err != nil {
+			return nil, err
+		}
+		var smc tlb.PrecompiledSmc
+		if err = tlb.LoadFromCell(&smc, item.Value); err != nil {
+			return nil, err
+		}
+		out[cell.Hash(codeHash)] = smc.GasUsage
+	}
+	return out, nil
 }
 
 type RunMethodConfigInfo struct {
-	Root          *cell.Cell
-	Present       bool
-	GlobalVersion int
-	PrevBlocks    any
-	Unpacked      any
-	Precompiled   *big.Int
+	Prepared    *tvm.PreparedBlockchainConfig
+	Root        *cell.Cell
+	Present     bool
+	PrevBlocks  any
+	Unpacked    any
+	Precompiled *big.Int
 }
 
+// runMethodBaseConfig is the per-master-block execution base: the shared
+// config-epoch context plus the master-specific prev-blocks tuple.
 type runMethodBaseConfig struct {
-	Root          *cell.Cell
-	Present       bool
-	GlobalVersion int
-	PrevBlocks    any
-	Config        tlb.BlockchainConfig
-	Unpacked      runMethodUnpackedConfigCells
-}
-
-type runMethodUnpackedConfigCells struct {
-	StoragePrices *cell.Cell
-	Params        [runMethodConfigParamCount]*cell.Cell
+	epoch      *liveConfigEpoch
+	prevBlocks tuple.Tuple
 }
 
 func RunMethodConfig(master ton.BlockIDExt, masterState *cell.Cell, now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
@@ -68,23 +201,9 @@ func buildRunMethodBaseConfig(master ton.BlockIDExt, extra *tlb.McStateExtra) (*
 		return nil, fmt.Errorf("masterchain config is empty")
 	}
 
-	root, err := prewarmCachedCell(extra.ConfigParams.Config.Params.AsCell(), liveConfigRootPrewarmDepth)
+	epoch, err := liveConfigEpochForRoot(extra.ConfigParams.Config.Params.AsCell())
 	if err != nil {
 		return nil, err
-	}
-
-	config := tlb.BlockchainConfig{Root: root}
-	version, err := config.GetGlobalVersion()
-	if err != nil {
-		return nil, err
-	}
-
-	globalVersion := int(version.Version)
-	if globalVersion < tvm.MinSupportedGlobalVersion {
-		return nil, fmt.Errorf("unsupported global version %d, minimum supported is %d", globalVersion, tvm.MinSupportedGlobalVersion)
-	}
-	if globalVersion > tvm.MaxSupportedGlobalVersion {
-		return nil, fmt.Errorf("unsupported global version %d, maximum supported is %d", globalVersion, tvm.MaxSupportedGlobalVersion)
 	}
 
 	prevBlocks, err := runMethodPrevBlocksInfo(master, extra)
@@ -92,39 +211,25 @@ func buildRunMethodBaseConfig(master ton.BlockIDExt, extra *tlb.McStateExtra) (*
 		return nil, err
 	}
 
-	unpacked, err := loadRunMethodUnpackedConfigCells(config)
-	if err != nil {
-		return nil, err
-	}
-
 	return &runMethodBaseConfig{
-		Root:          config.Root,
-		Present:       true,
-		GlobalVersion: globalVersion,
-		PrevBlocks:    prevBlocks,
-		Config:        config,
-		Unpacked:      unpacked,
+		epoch:      epoch,
+		prevBlocks: prevBlocks,
 	}, nil
 }
 
 func runMethodConfigFromBase(base *runMethodBaseConfig, now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
-	unpacked, err := runMethodUnpackedConfig(base.Unpacked, now)
-	if err != nil {
-		return RunMethodConfigInfo{}, err
-	}
-
-	precompiled, err := runMethodPrecompiledGas(base.Config, code)
+	unpacked, err := base.epoch.unpackedConfig(now)
 	if err != nil {
 		return RunMethodConfigInfo{}, err
 	}
 
 	return RunMethodConfigInfo{
-		Root:          base.Root,
-		Present:       base.Present,
-		GlobalVersion: base.GlobalVersion,
-		PrevBlocks:    base.PrevBlocks,
-		Unpacked:      unpacked,
-		Precompiled:   precompiled,
+		Prepared:    base.epoch.prepared,
+		Root:        base.epoch.prepared.Root(),
+		Present:     true,
+		PrevBlocks:  base.prevBlocks,
+		Unpacked:    unpacked,
+		Precompiled: base.epoch.precompiledGas(code),
 	}, nil
 }
 
@@ -283,127 +388,6 @@ func runMethodBlockIDTuple(id ton.BlockIDExt) tuple.Tuple {
 		new(big.Int).SetBytes(id.RootHash),
 		new(big.Int).SetBytes(id.FileHash),
 	)
-}
-
-func loadRunMethodUnpackedConfigCells(config tlb.BlockchainConfig) (runMethodUnpackedConfigCells, error) {
-	storagePrices, err := runMethodConfigParamCell(config, tlb.ConfigParamStoragePrices)
-	if err != nil {
-		return runMethodUnpackedConfigCells{}, err
-	}
-
-	var params [runMethodConfigParamCount]*cell.Cell
-	for i, id := range runMethodConfigParamIDs {
-		param, err := runMethodConfigParamCell(config, id)
-		if err != nil {
-			return runMethodUnpackedConfigCells{}, err
-		}
-		params[i] = param
-	}
-
-	return runMethodUnpackedConfigCells{
-		StoragePrices: storagePrices,
-		Params:        params,
-	}, nil
-}
-
-func runMethodUnpackedConfig(config runMethodUnpackedConfigCells, now uint32) (tuple.Tuple, error) {
-	storagePrices, err := runMethodCurrentStoragePrices(config.StoragePrices, now)
-	if err != nil {
-		return tuple.Tuple{}, err
-	}
-
-	values := []any{runMethodMaybeSlice(storagePrices)}
-	for _, paramCell := range config.Params {
-		param, err := runMethodConfigParamSlice(paramCell)
-		if err != nil {
-			return tuple.Tuple{}, err
-		}
-		values = append(values, runMethodMaybeSlice(param))
-	}
-
-	return tuple.NewTupleValue(values...), nil
-}
-
-func runMethodCurrentStoragePrices(root *cell.Cell, now uint32) (*cell.Slice, error) {
-	if root == nil {
-		return nil, nil
-	}
-
-	entries, err := root.AsDict(32).LoadAll()
-	if err != nil {
-		return nil, err
-	}
-
-	var best *cell.Slice
-	var bestSince uint64
-	for _, entry := range entries {
-		since, err := entry.Key.LoadUInt(32)
-		if err != nil {
-			return nil, err
-		}
-		if since > uint64(now) || best != nil && since <= bestSince {
-			continue
-		}
-		best = entry.Value.Copy()
-		bestSince = since
-	}
-
-	return best, nil
-}
-
-func runMethodConfigParamSlice(param *cell.Cell) (*cell.Slice, error) {
-	if param == nil {
-		return nil, nil
-	}
-	return param.BeginParse()
-}
-
-func runMethodConfigParamCell(config tlb.BlockchainConfig, id uint32) (*cell.Cell, error) {
-	if config.Root == nil {
-		return nil, nil
-	}
-
-	param, err := config.GetParam(id)
-	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
-		return nil, nil
-	}
-	return param, err
-}
-
-func runMethodMaybeSlice(value *cell.Slice) any {
-	if value == nil {
-		return nil
-	}
-	return value
-}
-
-func runMethodPrecompiledGas(config tlb.BlockchainConfig, code *cell.Cell) (*big.Int, error) {
-	if config.Root == nil || code == nil {
-		return nil, nil
-	}
-
-	precompiled, err := config.GetPrecompiledContractsConfig()
-	if err != nil {
-		return nil, err
-	}
-	if precompiled.List == nil || precompiled.List.IsEmpty() {
-		return nil, nil
-	}
-
-	value, err := precompiled.List.LoadValue(accountKey(code.Hash()))
-	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var smc tlb.PrecompiledSmc
-	if err = tlb.LoadFromCell(&smc, value); err != nil {
-		return nil, err
-	}
-
-	return new(big.Int).SetUint64(smc.GasUsage), nil
 }
 
 func RunMethodLibraries(masterState *cell.Cell, accountLibs *cell.Dictionary) ([]*cell.Cell, error) {

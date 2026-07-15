@@ -15,13 +15,70 @@ import (
 type nextBlockBootstrapProbeState struct {
 	consecutiveMisses int
 	liveTail          bool
+	// broadcastGraceSeqno is the raw-broadcast seqno the probe already granted
+	// a decode-grace hold for, so a broadcast whose local decode never
+	// completes delays at most one probe round.
+	broadcastGraceSeqno uint32
+	// lastObtainAt/obtainInterval pace the first probe of every height: at the
+	// live tail the next block is not due before roughly one block interval,
+	// so probing earlier only produces guaranteed misses and steals the win
+	// from the local broadcast pipeline.
+	lastObtainAt   time.Time
+	obtainInterval time.Duration
+	// lastObtainFromBroadcast gates the pace: parking the probe is a bet that
+	// the next block arrives by broadcast, and the bet is only placed while
+	// the previous block actually came that way. When broadcasts stop, the
+	// very next height reverts to immediate probing, so the download-only lag
+	// stays flat instead of drifting by pace headroom every block.
+	lastObtainFromBroadcast bool
+}
+
+func (s *nextBlockBootstrapProbeState) noteObtained(now time.Time, fromBroadcast bool) {
+	s.lastObtainFromBroadcast = fromBroadcast
+	last := s.lastObtainAt
+	s.lastObtainAt = now
+	if last.IsZero() {
+		return
+	}
+	gap := now.Sub(last)
+	if gap <= 0 || gap > nextBlockBootstrapPaceMaxGap {
+		return
+	}
+	if s.obtainInterval <= 0 {
+		s.obtainInterval = gap
+		return
+	}
+	// slew-limit the sample so a single stalled block cannot inflate the pace
+	if limit := s.obtainInterval * 2; gap > limit {
+		gap = limit
+	}
+	s.obtainInterval = (s.obtainInterval*7 + gap*3) / 10
+}
+
+// probeDelay returns how long the next block is still expected to take based
+// on the observed obtain cadence; zero when pacing does not apply.
+func (s nextBlockBootstrapProbeState) probeDelay(now time.Time) time.Duration {
+	if !s.liveTail || !s.lastObtainFromBroadcast || s.consecutiveMisses > 0 || s.obtainInterval <= 0 || s.lastObtainAt.IsZero() {
+		return 0
+	}
+	target := s.obtainInterval + nextBlockBootstrapPaceHeadroom
+	if target > nextBlockBootstrapPaceMaxDelay {
+		target = nextBlockBootstrapPaceMaxDelay
+	}
+	delay := target - now.Sub(s.lastObtainAt)
+	if delay < nextBlockBootstrapPaceMinDelay {
+		return 0
+	}
+	return delay
 }
 
 type nextBlockBootstrapProbeDecision struct {
 	peerLimit             int
 	consecutiveMisses     int
 	liveTail              bool
+	prevSeqno             uint32
 	rawBroadcastAhead     bool
+	rawBroadcastSeqno     uint32
 	observedAhead         bool
 	seenAhead             bool
 	queuedFutureAhead     bool
@@ -32,16 +89,33 @@ type nextBlockBootstrapProbeDecision struct {
 	hasLag                bool
 }
 
+// rawBroadcastNextPending reports that the raw broadcast signal points exactly
+// at the next needed block: its payload was received and its decode is still
+// in flight locally, so the probe should yield a grace window instead of
+// fanning out against its own pipeline.
+func (d nextBlockBootstrapProbeDecision) rawBroadcastNextPending() bool {
+	return d.rawBroadcastAhead && d.rawBroadcastSeqno == d.prevSeqno+1
+}
+
+// rawBroadcastBeyondNext reports a raw broadcast more than one block ahead:
+// the broadcast for the next needed block was missed, so only a download can
+// advance the chain and an urgent fanout is justified.
+func (d nextBlockBootstrapProbeDecision) rawBroadcastBeyondNext() bool {
+	return d.rawBroadcastAhead && d.rawBroadcastSeqno > d.prevSeqno+1
+}
+
 func (s *Service) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (nextBlockBootstrapProbeDecision, <-chan struct{}) {
 	decision := nextBlockBootstrapProbeDecision{
 		peerLimit:         nextBlockBootstrapProbePeers,
 		consecutiveMisses: state.consecutiveMisses,
 		liveTail:          state.liveTail,
+		prevSeqno:         prev.SeqNo,
 	}
 
 	var broadcastWake <-chan struct{}
 	if s.node != nil {
-		broadcastWake, decision.rawBroadcastAhead = s.node.MasterchainBroadcastAfter(prev.SeqNo)
+		decision.rawBroadcastSeqno, broadcastWake = s.node.MasterchainBroadcastAfter(prev.SeqNo)
+		decision.rawBroadcastAhead = decision.rawBroadcastSeqno > prev.SeqNo
 		if seqno, ok := s.observedMasterchainSeqnoAhead(prev.SeqNo, s.node.ObservedMasterchainBlock); ok {
 			decision.observedAhead = true
 			decision.noteAheadSeqno(prev.SeqNo, seqno)
@@ -100,7 +174,10 @@ func (d *nextBlockBootstrapProbeDecision) noteAheadSeqno(currentSeqno uint32, se
 }
 
 func (d nextBlockBootstrapProbeDecision) shouldUseUrgentFanout() bool {
-	if d.liveTail && (d.rawBroadcastAhead || d.observedAhead || d.seenAhead || d.queuedFutureAhead) {
+	// rawBroadcastNextPending intentionally does not widen the fanout: the
+	// next block's broadcast is already received and decoding locally, so the
+	// probe is only a fallback and hammering peers would race that decode.
+	if d.liveTail && (d.rawBroadcastBeyondNext() || d.observedAhead || d.seenAhead || d.queuedFutureAhead) {
 		return true
 	}
 	if d.consecutiveMisses >= nextBlockBootstrapUrgentMisses {
@@ -143,19 +220,24 @@ func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 	if current != nil {
 		s.rememberAppliedMasterchainState(&current.Masterchain)
 	}
-	if !s.publishLiveCurrentStateChanged(current) {
+	snapshot := s.publishLiveCurrentStateChanged(current)
+	if snapshot == nil {
 		return
 	}
 	if s.liveState != nil {
-		s.liveState.SetLiveCurrentState(current)
+		s.liveState.SetLiveCurrentStateSnapshot(snapshot)
 		s.liveState.MarkLiveCurrentStateFlushed(current)
 	}
 	s.wakeServiceMaintenance()
 }
 
-func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) bool {
+// publishLiveCurrentStateChanged clones current once, publishes the clone as
+// the node-wide current status and returns it so callers can reuse it as an
+// immutable snapshot (e.g. hand it to the live view without a second clone).
+// Returns nil when current is nil or behind the already-published status.
+func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) *storage.CurrentState {
 	if current == nil {
-		return false
+		return nil
 	}
 
 	next := storage.CloneCurrentState(current)
@@ -163,7 +245,7 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	s.currentStatusMu.Lock()
 	if currentStateBehind(next, s.currentStatus) {
 		s.currentStatusMu.Unlock()
-		return false
+		return nil
 	}
 	s.currentStatus = next
 	s.currentStatusMu.Unlock()
@@ -173,7 +255,7 @@ func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) 
 	if s.node != nil {
 		s.node.NotifyCompressedBlockStateReady(currentStateCompressedBlockStateRefs(next)...)
 	}
-	return true
+	return next
 }
 
 func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.BlockIDExt {
@@ -193,6 +275,9 @@ func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.B
 func (s *Service) rememberAppliedMasterchainState(state *storage.BlockState) {
 	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard {
 		return
+	}
+	if s.node != nil {
+		s.node.NoteAppliedMasterchainSeqno(state.Block.SeqNo)
 	}
 
 	next := storage.CloneBlockState(state)
@@ -277,21 +362,56 @@ func (s *Service) applyMasterchainTransition(ctx context.Context, current *stora
 	return next, finish(), nil
 }
 
-func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
+// beginNextBlockCheckpointLocked validates persist availability and prepares
+// the checkpoint. Called with currentStatePersistMu held; on error the mutex
+// is released before returning.
+func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64) (stateCheckpointData, error) {
 	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		s.currentStatePersistMu.Unlock()
-		return nil, err
+		return stateCheckpointData{}, err
 	}
-
 	checkpoint, err := prepareStateCheckpoint(current, entries, cells)
 	if err != nil {
 		s.currentStatePersistMu.Unlock()
+		return stateCheckpointData{}, err
+	}
+	checkpoint.artifactPrewriteTarget = artifactPrewriteTarget
+	timing.checkpoints++
+	return checkpoint, nil
+}
+
+// saveNextBlockCheckpointLocked runs the checkpoint save and is the single
+// owner of releasing currentStatePersistMu: it unlocks exactly once on every
+// path. onError runs before the unlock on the failure path so persist errors
+// become visible to the next flush before the mutex is released.
+func (s *Service) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint stateCheckpointData, cells *stateCellCheckpointCache, onCommitted func(), onError func(error)) (*storage.CurrentState, []SyncPersistStageObservation, time.Duration, error) {
+	started := time.Now()
+	committed, stages, err := s.saveStateCheckpoint(ctx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget, checkpoint.artifactPrewriteTarget)
+	elapsed := time.Since(started)
+	if err != nil {
+		if onError != nil {
+			onError(err)
+		}
+		s.currentStatePersistMu.Unlock()
+		return nil, stages, elapsed, err
+	}
+
+	if onCommitted != nil {
+		onCommitted()
+	}
+	cells.complete()
+	s.currentStatePersistMu.Unlock()
+	return committed, stages, elapsed, nil
+}
+
+func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
+	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
+	if err != nil {
 		return nil, err
 	}
 	master := current.Masterchain.Block
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
-	timing.checkpoints++
 
 	s.log.Debug().
 		Str("masterchain", storage.FormatBlockRef(master)).
@@ -306,13 +426,12 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 			defer onDone()
 		}
 
-		started := time.Now()
-		committed, stages, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget)
-		elapsed := time.Since(started)
-		if err != nil {
-			wrapped := fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
+		var wrapped error
+		committed, stages, elapsed, err := s.saveNextBlockCheckpointLocked(persistCtx, checkpoint, cells, onCommitted, func(saveErr error) {
+			wrapped = fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), saveErr)
 			s.setCurrentStatePersistError(wrapped)
-			s.currentStatePersistMu.Unlock()
+		})
+		if err != nil {
 			s.observeSyncPersist(SyncPersistObservation{
 				Mode:          "next_block_async",
 				Result:        "error",
@@ -330,12 +449,6 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 				Msg("next-block shard-client checkpoint failed")
 			return
 		}
-
-		if onCommitted != nil {
-			onCommitted()
-		}
-		cells.complete()
-		s.currentStatePersistMu.Unlock()
 
 		s.observeSyncPersist(SyncPersistObservation{
 			Mode:          "next_block_async",
@@ -360,28 +473,20 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 	return checkpoint.live, nil
 }
 
-func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
-	if err := s.checkCurrentStatePersistAllowed(); err != nil {
-		s.currentStatePersistMu.Unlock()
-		return nil, err
-	}
-	checkpoint, err := prepareStateCheckpoint(current, entries, cells)
+func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
+	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
 	if err != nil {
-		s.currentStatePersistMu.Unlock()
 		return nil, err
 	}
 	master := current.Masterchain.Block
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
-	timing.checkpoints++
 	if onDone != nil {
 		defer onDone()
 	}
 
-	started := time.Now()
 	persistCtx := s.currentStatePersistContext()
-	committed, stages, err := s.saveStateCheckpoint(persistCtx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget)
-	elapsed := time.Since(started)
+	committed, stages, elapsed, err := s.saveNextBlockCheckpointLocked(persistCtx, checkpoint, cells, onCommitted, nil)
 	if err != nil {
 		s.observeSyncPersist(SyncPersistObservation{
 			Mode:          "next_block_sync",
@@ -391,15 +496,8 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 			States:        len(checkpoint.entries),
 			Stages:        stages,
 		})
-		s.currentStatePersistMu.Unlock()
 		return nil, fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), err)
 	}
-
-	if onCommitted != nil {
-		onCommitted()
-	}
-	cells.complete()
-	s.currentStatePersistMu.Unlock()
 
 	s.observeSyncPersist(SyncPersistObservation{
 		Mode:          "next_block_sync",
@@ -523,7 +621,114 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 	}
 }
 
-func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
+// nextMasterchainProbeHoldDelay returns how long the probe should stay parked
+// before hitting peers: the pace delay while the next block is not yet due,
+// raised to a one-shot decode grace when the raw broadcast for exactly the
+// next block was already received and is decoding locally.
+func nextMasterchainProbeHoldDelay(decision *nextBlockBootstrapProbeDecision, state *nextBlockBootstrapProbeState, now time.Time) time.Duration {
+	if !decision.liveTail {
+		return 0
+	}
+	// a queued future block, a peer-observed newer head or a raw broadcast
+	// beyond the next block all mean the next block already exists somewhere
+	// and only a download can advance; do not park the probe
+	if decision.queuedFutureAhead || decision.observedAhead || decision.seenAhead || decision.rawBroadcastBeyondNext() {
+		return 0
+	}
+
+	// pacing assumes the head is current; with a real lag the next blocks are
+	// already produced somewhere and waiting out the cadence only adds delay
+	hold := time.Duration(0)
+	if !decision.hasLag || decision.lagSeconds < nextBlockBootstrapUrgentLagSeconds {
+		hold = state.probeDelay(now)
+	}
+	if decision.rawBroadcastNextPending() && state.broadcastGraceSeqno != decision.rawBroadcastSeqno {
+		state.broadcastGraceSeqno = decision.rawBroadcastSeqno
+		if nextBlockBootstrapDecodeGrace > hold {
+			hold = nextBlockBootstrapDecodeGrace
+		}
+	}
+	return hold
+}
+
+// holdNextMasterchainProbe parks the probe for up to hold, returning early
+// with the block when the local broadcast pipeline queues it, or with
+// ErrNotFound as soon as the decoded next block lands in the node broadcast
+// cache (the probe then consumes it locally without touching peers). A raw
+// broadcast for the next block arriving mid-hold extends the park once by the
+// decode grace; a raw broadcast beyond the next block ends the hold so the
+// fallback probe can catch up by download.
+func (s *Service) holdNextMasterchainProbe(ctx context.Context, prev, target ton.BlockIDExt, state *nextBlockBootstrapProbeState, hold time.Duration) (cachedMasterchainBlockForApply, error) {
+	deadline := time.Now().Add(hold)
+	timer := time.NewTimer(hold)
+	defer timer.Stop()
+
+	var rawWake <-chan struct{}
+	var nextBroadcastWake <-chan struct{}
+	if s.node != nil {
+		_, rawWake = s.node.MasterchainBroadcastAfter(prev.SeqNo)
+		wake, unwatch := s.node.WatchMasterchainNextBroadcastBlock(prev)
+		defer unwatch()
+		nextBroadcastWake = wake
+		// the decoded next block may already sit in the node broadcast cache
+		// (it can arrive while the previous block is still applying); the
+		// watch above only fires on future stores, so check before parking
+		if s.node.HasMasterchainNextBroadcastBlock(prev) {
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+		}
+	}
+
+	for {
+		select {
+		case <-nextBroadcastWake:
+			// the decoded broadcast for the next block landed in the node
+			// cache; end the hold so the probe picks it up without network
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+		case <-ctx.Done():
+			return cachedMasterchainBlockForApply{}, ctx.Err()
+		case <-s.currentStateWake:
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil || !errors.Is(err, storage.ErrNotFound) {
+				return cached, err
+			}
+		case <-rawWake:
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil || !errors.Is(err, storage.ErrNotFound) {
+				return cached, err
+			}
+			rawSeqno, wake := s.node.MasterchainBroadcastAfter(prev.SeqNo)
+			rawWake = wake
+			if rawSeqno == 0 {
+				continue
+			}
+			if rawSeqno > prev.SeqNo+1 {
+				return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+			}
+			if state.broadcastGraceSeqno == rawSeqno {
+				continue
+			}
+			// the raw broadcast for exactly the next block landed while
+			// parked: grant its decode the grace window before hitting peers
+			state.broadcastGraceSeqno = rawSeqno
+			graceDeadline := time.Now().Add(nextBlockBootstrapDecodeGrace)
+			if !graceDeadline.After(deadline) {
+				continue
+			}
+			deadline = graceDeadline
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(time.Until(deadline))
+		case <-timer.C:
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+		}
+	}
+}
+
+func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state *nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
 
 	cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
@@ -534,7 +739,20 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		return PreparedBlock{}, "", 0, err
 	}
 
-	decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
+	decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, *state)
+	if hold := nextMasterchainProbeHoldDelay(&decision, state, time.Now()); hold > 0 {
+		held, err := s.holdNextMasterchainProbe(ctx, prev, target, state, hold)
+		if err == nil {
+			return held.block, held.source, held.prepareElapsed, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return PreparedBlock{}, "", 0, err
+		}
+		// the hold expired without the broadcast pipeline delivering the
+		// block; refresh the ahead signals so the fallback probe fans out on
+		// the current picture
+		decision, broadcastWake = s.nextBlockBootstrapProbeDecision(prev, prevUTime, *state)
+	}
 	stagedPeerLimit := decision.stagedPeerLimit()
 	queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
 	if decision.peerLimit > nextBlockBootstrapProbePeers || stagedPeerLimit > decision.peerLimit {
@@ -680,7 +898,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepareElapsed := time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
-			source:         syncBlockSourceForDownloadedBlock(SyncBlockSourcePeerProbe, *downloaded),
+			source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, downloaded.Kind),
 			prepareElapsed: prepareElapsed,
 			err:            fmt.Errorf("verify probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 		}
@@ -690,7 +908,7 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 	prepareElapsed = time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
-			source:         syncBlockSourceForVerifiedBlock(SyncBlockSourcePeerProbe, verified),
+			source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, verified.Kind),
 			prepareElapsed: prepareElapsed,
 			err:            fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 		}

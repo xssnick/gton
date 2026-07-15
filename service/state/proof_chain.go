@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"sync"
 	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
@@ -17,12 +18,14 @@ import (
 const masterchainShard = int64(-1 << 63)
 
 const (
-	keyBlockLookupLimit        = 8
-	keyBlockProgressInfoEvery  = 64
-	keyBlockLookupRetryDelay   = time.Second
-	keyBlockLookupRetryLogEach = 5
-	DefaultSyncBefore          = 4 * time.Hour
-	initialStateDownloadWindow = 8 * time.Hour
+	// TON C++ full nodes clamp tonNode.getNextKeyBlockIds max_size to 8.
+	keyBlockLookupLimit          = 8
+	keyBlockProofDownloadWorkers = 4
+	keyBlockProgressInfoEvery    = 64
+	keyBlockLookupRetryDelay     = time.Second
+	keyBlockLookupRetryLogEach   = 5
+	DefaultSyncBefore            = 4 * time.Hour
+	initialStateDownloadWindow   = 8 * time.Hour
 )
 
 type trustedKeyBlock struct {
@@ -35,6 +38,11 @@ type keyBlockCandidate struct {
 	block                    ton.BlockIDExt
 	utime                    uint32
 	allowBoundaryWithoutPrev bool
+}
+
+type keyBlockProofDownload struct {
+	data []byte
+	err  error
 }
 
 var errNoPersistentKeyBlockCandidate = errors.New("no persistent key block state snapshot candidate")
@@ -81,16 +89,20 @@ func (s *Syncer) configuredTrustedKeyBlockAnchor(ctx context.Context) (trustedKe
 
 	var trusted trustedKeyBlock
 	if initBlock.SeqNo == 0 {
-		zeroBlock, err := s.source.ZeroStateBlock(ctx)
+		var zeroBlock ton.BlockIDExt
+		zeroBlock, err = s.source.ZeroStateBlock(ctx)
 		if err != nil {
 			return trustedKeyBlock{}, err
 		}
 		trusted, err = s.trustedZeroState(ctx, zeroBlock)
+		if err != nil {
+			return trustedKeyBlock{}, err
+		}
 	} else {
 		trusted, err = s.trustedInitBlock(ctx, initBlock)
-	}
-	if err != nil {
-		return trustedKeyBlock{}, err
+		if err != nil {
+			return trustedKeyBlock{}, err
+		}
 	}
 
 	if err = validateTrustedKeyBlockAnchor(trusted.block); err != nil {
@@ -187,12 +199,21 @@ func (s *Syncer) verifiedKeyBlockCandidates(ctx context.Context, trusted trusted
 }
 
 func (s *Syncer) verifyKeyBlockBatch(ctx context.Context, trusted *trustedKeyBlock, candidates *[]keyBlockCandidate, blocks []ton.BlockIDExt, verified *int) (bool, error) {
+	downloads := s.downloadKeyBlockProofBatch(ctx, blocks)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	advanced := false
 	firstAccepted := ton.BlockIDExt{}
 	lastAccepted := ton.BlockIDExt{}
 	accepted := 0
 
 	for idx, block := range blocks {
+		if err := ctx.Err(); err != nil {
+			return advanced, err
+		}
+
 		if block.Equals(&trusted.block) || block.SeqNo <= trusted.block.SeqNo {
 			continue
 		}
@@ -204,7 +225,12 @@ func (s *Syncer) verifyKeyBlockBatch(ctx context.Context, trusted *trustedKeyBlo
 			Int("batch", len(blocks)).
 			Msg("verifying key block proof in chain")
 
-		next, err := s.verifyMasterchainBlockFromTrustedKey(ctx, *trusted, block, true)
+		download := downloads[idx]
+		if download.err != nil {
+			return advanced, fmt.Errorf("download key block proof %s: %w", storage.FormatBlockRef(block), download.err)
+		}
+
+		next, err := s.verifyKeyBlockProofFromTrusted(ctx, *trusted, block, download.data)
 		if err != nil {
 			return advanced, fmt.Errorf("verify key block %s after %s: %w", storage.FormatBlockRef(block), storage.FormatBlockRef(trusted.block), err)
 		}
@@ -245,6 +271,44 @@ func (s *Syncer) verifyKeyBlockBatch(ctx context.Context, trusted *trustedKeyBlo
 	evt.Msg("verified next key block id batch")
 
 	return advanced, nil
+}
+
+func (s *Syncer) downloadKeyBlockProofBatch(ctx context.Context, blocks []ton.BlockIDExt) []keyBlockProofDownload {
+	downloads := make([]keyBlockProofDownload, len(blocks))
+	jobs := make(chan int, len(blocks))
+	for idx := range blocks {
+		jobs <- idx
+	}
+	close(jobs)
+
+	var workers sync.WaitGroup
+	for range min(keyBlockProofDownloadWorkers, len(blocks)) {
+		workers.Go(func() {
+			for idx := range jobs {
+				if err := ctx.Err(); err != nil {
+					downloads[idx].err = err
+					continue
+				}
+
+				downloads[idx].data, downloads[idx].err = s.downloadKeyBlockProof(ctx, blocks[idx])
+			}
+		})
+	}
+	workers.Wait()
+
+	return downloads
+}
+
+func (s *Syncer) downloadKeyBlockProof(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+	if block.Workchain != -1 || block.Shard != masterchainShard {
+		return nil, fmt.Errorf("expected masterchain block, got %s", storage.FormatBlockRef(block))
+	}
+
+	s.log.Debug().
+		Str("block", storage.FormatBlockRef(block)).
+		Msg("downloading key block proof for trusted chain verification")
+
+	return s.source.MasterchainProof(ctx, block, true)
 }
 
 func (s *Syncer) logRetryNextKeyBlocks(err error, from ton.BlockIDExt, retries int) {
@@ -363,7 +427,7 @@ func (s *Syncer) trustedInitBlock(ctx context.Context, block ton.BlockIDExt) (tr
 	}, nil
 }
 
-func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trusted trustedKeyBlock, block ton.BlockIDExt, requireKey bool) (trustedKeyBlock, error) {
+func (s *Syncer) verifyKeyBlockProofFromTrusted(ctx context.Context, trusted trustedKeyBlock, block ton.BlockIDExt, proof []byte) (trustedKeyBlock, error) {
 	if block.Workchain != -1 || block.Shard != masterchainShard {
 		return trustedKeyBlock{}, fmt.Errorf("expected masterchain block, got %s", storage.FormatBlockRef(block))
 	}
@@ -374,22 +438,11 @@ func (s *Syncer) verifyMasterchainBlockFromTrustedKey(ctx context.Context, trust
 		return trustedKeyBlock{}, fmt.Errorf("block does not advance trusted key block")
 	}
 
-	s.log.Debug().
-		Str("block", storage.FormatBlockRef(block)).
-		Str("trusted_key", storage.FormatBlockRef(trusted.block)).
-		Bool("require_key", requireKey).
-		Msg("downloading masterchain proof for trusted chain verification")
-
-	proof, err := s.source.MasterchainProof(ctx, block, requireKey)
-	if err != nil {
-		return trustedKeyBlock{}, err
-	}
-
 	parsed, err := blockproof.ParseBOC(block, proof)
 	if err != nil {
 		return trustedKeyBlock{}, err
 	}
-	if requireKey && !parsed.Block.BlockInfo.KeyBlock {
+	if !parsed.Block.BlockInfo.KeyBlock {
 		return trustedKeyBlock{}, fmt.Errorf("block %s is not a key block", storage.FormatBlockRef(block))
 	}
 	if parsed.Block.BlockInfo.PrevKeyBlockSeqno != trusted.block.SeqNo {

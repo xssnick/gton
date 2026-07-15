@@ -59,6 +59,7 @@ func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
 		storage:         store,
 		stateSerializer: newStateSerializer(zerolog.Nop(), store, t.TempDir(), false, 0, false),
 	}
+	svc.enableAutomaticStateSerialization()
 	if err := svc.processPersistentStateSerialization(ctx); err != nil {
 		t.Fatalf("process persistent state serialization: %v", err)
 	}

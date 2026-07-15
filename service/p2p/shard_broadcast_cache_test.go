@@ -282,6 +282,8 @@ func TestShardCandidateCacheAssemblesProofAfterCandidateBeforeOverflowPrune(t *t
 	cache := newShardBlockCandidateCache(time.Minute, 1<<20, 1)
 	now := time.Unix(300, 0)
 	downloaded := testShardBroadcastDownloadedBlock(t, 22, 0x22)
+	downloaded.SourcePeerID[0] = 0xA1
+	downloaded.SignaturesVerifiedKey = []byte{0xB1, 0xB2}
 
 	assembled, err := cache.StoreCandidate(testShardBlockCandidate(downloaded), now)
 	if err != nil {
@@ -347,6 +349,15 @@ func requireAssembledShardCandidate(t *testing.T, assembled []DownloadedBlock, w
 	}
 	if got.Proof == nil || len(got.ProofBOC) == 0 || !got.IsLink || !got.VerifiedRootHash {
 		t.Fatalf("assembled block is incomplete: proof=%v proof_boc=%d is_link=%v verified=%v", got.Proof != nil, len(got.ProofBOC), got.IsLink, got.VerifiedRootHash)
+	}
+	if got.Block == nil || len(got.BlockBOC) == 0 || got.Meta == nil || got.StateUpdate == nil {
+		t.Fatalf("assembled candidate payload is incomplete: block=%v block_boc=%d meta=%v state_update=%v", got.Block != nil, len(got.BlockBOC), got.Meta != nil, got.StateUpdate != nil)
+	}
+	if got.SourcePeerID != want.SourcePeerID {
+		t.Fatalf("assembled source peer = %x, want %x", got.SourcePeerID, want.SourcePeerID)
+	}
+	if string(got.SignaturesVerifiedKey) != string(want.SignaturesVerifiedKey) {
+		t.Fatalf("assembled signature key = %x, want %x", got.SignaturesVerifiedKey, want.SignaturesVerifiedKey)
 	}
 }
 
