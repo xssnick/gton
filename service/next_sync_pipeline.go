@@ -448,7 +448,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 			return
 		}
 
-		probeState.noteObtained(time.Now())
+		probeState.noteObtained(time.Now(), syncBlockOriginForSource(source) == SyncBlockOriginBroadcast)
 		item := nextMasterDownload{
 			prev:            prev,
 			block:           downloaded,

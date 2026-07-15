@@ -1561,7 +1561,7 @@ func TestNextMasterchainProbeHoldDelay(t *testing.T) {
 	}
 
 	// download-only signals cancel the pace, plain live tail keeps it
-	paced := &nextBlockBootstrapProbeState{liveTail: true, lastObtainAt: now, obtainInterval: time.Second}
+	paced := &nextBlockBootstrapProbeState{liveTail: true, lastObtainAt: now, obtainInterval: time.Second, lastObtainFromBroadcast: true}
 	seen := &nextBlockBootstrapProbeDecision{liveTail: true, prevSeqno: 100, seenAhead: true}
 	if hold := nextMasterchainProbeHoldDelay(seen, paced, now); hold != 0 {
 		t.Fatalf("seen-ahead hold = %s, want 0", hold)
@@ -1584,7 +1584,7 @@ func TestNextMasterchainProbeHoldDelay(t *testing.T) {
 	laggedRaw := *lagged
 	laggedRaw.rawBroadcastAhead = true
 	laggedRaw.rawBroadcastSeqno = 101
-	laggedState := &nextBlockBootstrapProbeState{liveTail: true, lastObtainAt: now, obtainInterval: time.Second}
+	laggedState := &nextBlockBootstrapProbeState{liveTail: true, lastObtainAt: now, obtainInterval: time.Second, lastObtainFromBroadcast: true}
 	if hold := nextMasterchainProbeHoldDelay(&laggedRaw, laggedState, now); hold != nextBlockBootstrapDecodeGrace {
 		t.Fatalf("lagged grace hold = %s, want %s", hold, nextBlockBootstrapDecodeGrace)
 	}
@@ -1598,12 +1598,12 @@ func TestNextBlockBootstrapProbePace(t *testing.T) {
 		t.Fatalf("delay without samples = %s, want 0", got)
 	}
 
-	state.noteObtained(start)
+	state.noteObtained(start, true)
 	if got := state.probeDelay(start); got != 0 {
 		t.Fatalf("delay after first obtain = %s, want 0", got)
 	}
 
-	state.noteObtained(start.Add(400 * time.Millisecond))
+	state.noteObtained(start.Add(400*time.Millisecond), true)
 	if state.obtainInterval != 400*time.Millisecond {
 		t.Fatalf("interval = %s, want 400ms", state.obtainInterval)
 	}
@@ -1624,8 +1624,20 @@ func TestNextBlockBootstrapProbePace(t *testing.T) {
 	}
 	state.consecutiveMisses = 0
 
+	// a download-sourced obtain means broadcasts are not delivering: the pace
+	// is a bet on the next broadcast, so it must not be placed
+	state.noteObtained(start.Add(800*time.Millisecond), false)
+	if got := state.probeDelay(start.Add(850 * time.Millisecond)); got != 0 {
+		t.Fatalf("download-sourced delay = %s, want 0", got)
+	}
+	// the next broadcast-sourced obtain re-arms the pace
+	state.noteObtained(start.Add(1200*time.Millisecond), true)
+	if got := state.probeDelay(start.Add(1250 * time.Millisecond)); got == 0 {
+		t.Fatal("broadcast-sourced obtain did not re-arm the pace")
+	}
+
 	// one stalled block cannot inflate the pace beyond the slew limit
-	state.noteObtained(start.Add(10 * time.Second))
+	state.noteObtained(start.Add(10*time.Second), true)
 	if state.obtainInterval > time.Second {
 		t.Fatalf("interval after stall = %s, want slew-limited", state.obtainInterval)
 	}

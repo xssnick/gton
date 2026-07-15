@@ -25,9 +25,16 @@ type nextBlockBootstrapProbeState struct {
 	// from the local broadcast pipeline.
 	lastObtainAt   time.Time
 	obtainInterval time.Duration
+	// lastObtainFromBroadcast gates the pace: parking the probe is a bet that
+	// the next block arrives by broadcast, and the bet is only placed while
+	// the previous block actually came that way. When broadcasts stop, the
+	// very next height reverts to immediate probing, so the download-only lag
+	// stays flat instead of drifting by pace headroom every block.
+	lastObtainFromBroadcast bool
 }
 
-func (s *nextBlockBootstrapProbeState) noteObtained(now time.Time) {
+func (s *nextBlockBootstrapProbeState) noteObtained(now time.Time, fromBroadcast bool) {
+	s.lastObtainFromBroadcast = fromBroadcast
 	last := s.lastObtainAt
 	s.lastObtainAt = now
 	if last.IsZero() {
@@ -51,7 +58,7 @@ func (s *nextBlockBootstrapProbeState) noteObtained(now time.Time) {
 // probeDelay returns how long the next block is still expected to take based
 // on the observed obtain cadence; zero when pacing does not apply.
 func (s nextBlockBootstrapProbeState) probeDelay(now time.Time) time.Duration {
-	if !s.liveTail || s.consecutiveMisses > 0 || s.obtainInterval <= 0 || s.lastObtainAt.IsZero() {
+	if !s.liveTail || !s.lastObtainFromBroadcast || s.consecutiveMisses > 0 || s.obtainInterval <= 0 || s.lastObtainAt.IsZero() {
 		return 0
 	}
 	target := s.obtainInterval + nextBlockBootstrapPaceHeadroom
