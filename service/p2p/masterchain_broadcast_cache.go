@@ -132,13 +132,25 @@ func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock
 	return true
 }
 
-func (n *Node) watchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan struct{}, func()) {
+// WatchMasterchainNextBroadcastBlock returns a channel that is closed when a
+// decoded masterchain broadcast following prev lands in the next-broadcast
+// cache, plus an unwatch func. A nil channel means prev is not masterchain.
+func (n *Node) WatchMasterchainNextBroadcastBlock(prev ton.BlockIDExt) (<-chan struct{}, func()) {
 	if !isMasterchainBlock(prev) {
 		return nil, func() {}
 	}
 
 	key := tnstore.BlockKey(prev)
 	return n.masterchainNextBroadcastWaiters.watch(key)
+}
+
+// HasMasterchainNextBroadcastBlock reports whether a decoded masterchain
+// broadcast following prev is already in the next-broadcast cache.
+func (n *Node) HasMasterchainNextBroadcastBlock(prev ton.BlockIDExt) bool {
+	if !isMasterchainBlock(prev) {
+		return false
+	}
+	return n.masterchainNextBroadcastCache.has(tnstore.BlockKey(prev), time.Now())
 }
 
 func (n *Node) notifyMasterchainNextBroadcastBlock(prev ton.BlockIDExt) {

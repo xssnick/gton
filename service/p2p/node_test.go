@@ -289,6 +289,41 @@ func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
 	}
 }
 
+func TestMasterchainBroadcastAfterKeepsWakeWhenAlreadyAhead(t *testing.T) {
+	node := newTestNode(t)
+	prev := testBlockID(-1, topShard, 10)
+
+	seqno, wake := node.MasterchainBroadcastAfter(prev.SeqNo)
+	if seqno != 0 {
+		t.Fatalf("raw broadcast seqno = %d, want 0", seqno)
+	}
+	if wake == nil {
+		t.Fatal("raw broadcast wake is nil before the first broadcast")
+	}
+
+	node.trackRawMasterchainBroadcast(testBlockID(-1, topShard, 11))
+	select {
+	case <-wake:
+	default:
+		t.Fatal("first raw broadcast did not close the wake channel")
+	}
+
+	seqno, wake = node.MasterchainBroadcastAfter(prev.SeqNo)
+	if seqno != 11 {
+		t.Fatalf("raw broadcast seqno = %d, want 11", seqno)
+	}
+	if wake == nil {
+		t.Fatal("raw broadcast wake is nil while a broadcast is already ahead")
+	}
+
+	node.trackRawMasterchainBroadcast(testBlockID(-1, topShard, 12))
+	select {
+	case <-wake:
+	default:
+		t.Fatal("newer raw broadcast did not close the wake channel")
+	}
+}
+
 func TestZeroStateBlockRequiresConfiguredZeroState(t *testing.T) {
 	node := newTestNode(t)
 

@@ -15,13 +15,63 @@ import (
 type nextBlockBootstrapProbeState struct {
 	consecutiveMisses int
 	liveTail          bool
+	// broadcastGraceSeqno is the raw-broadcast seqno the probe already granted
+	// a decode-grace hold for, so a broadcast whose local decode never
+	// completes delays at most one probe round.
+	broadcastGraceSeqno uint32
+	// lastObtainAt/obtainInterval pace the first probe of every height: at the
+	// live tail the next block is not due before roughly one block interval,
+	// so probing earlier only produces guaranteed misses and steals the win
+	// from the local broadcast pipeline.
+	lastObtainAt   time.Time
+	obtainInterval time.Duration
+}
+
+func (s *nextBlockBootstrapProbeState) noteObtained(now time.Time) {
+	last := s.lastObtainAt
+	s.lastObtainAt = now
+	if last.IsZero() {
+		return
+	}
+	gap := now.Sub(last)
+	if gap <= 0 || gap > nextBlockBootstrapPaceMaxGap {
+		return
+	}
+	if s.obtainInterval <= 0 {
+		s.obtainInterval = gap
+		return
+	}
+	// slew-limit the sample so a single stalled block cannot inflate the pace
+	if limit := s.obtainInterval * 2; gap > limit {
+		gap = limit
+	}
+	s.obtainInterval = (s.obtainInterval*7 + gap*3) / 10
+}
+
+// probeDelay returns how long the next block is still expected to take based
+// on the observed obtain cadence; zero when pacing does not apply.
+func (s nextBlockBootstrapProbeState) probeDelay(now time.Time) time.Duration {
+	if !s.liveTail || s.consecutiveMisses > 0 || s.obtainInterval <= 0 || s.lastObtainAt.IsZero() {
+		return 0
+	}
+	target := s.obtainInterval + nextBlockBootstrapPaceHeadroom
+	if target > nextBlockBootstrapPaceMaxDelay {
+		target = nextBlockBootstrapPaceMaxDelay
+	}
+	delay := target - now.Sub(s.lastObtainAt)
+	if delay < nextBlockBootstrapPaceMinDelay {
+		return 0
+	}
+	return delay
 }
 
 type nextBlockBootstrapProbeDecision struct {
 	peerLimit             int
 	consecutiveMisses     int
 	liveTail              bool
+	prevSeqno             uint32
 	rawBroadcastAhead     bool
+	rawBroadcastSeqno     uint32
 	observedAhead         bool
 	seenAhead             bool
 	queuedFutureAhead     bool
@@ -32,16 +82,33 @@ type nextBlockBootstrapProbeDecision struct {
 	hasLag                bool
 }
 
+// rawBroadcastNextPending reports that the raw broadcast signal points exactly
+// at the next needed block: its payload was received and its decode is still
+// in flight locally, so the probe should yield a grace window instead of
+// fanning out against its own pipeline.
+func (d nextBlockBootstrapProbeDecision) rawBroadcastNextPending() bool {
+	return d.rawBroadcastAhead && d.rawBroadcastSeqno == d.prevSeqno+1
+}
+
+// rawBroadcastBeyondNext reports a raw broadcast more than one block ahead:
+// the broadcast for the next needed block was missed, so only a download can
+// advance the chain and an urgent fanout is justified.
+func (d nextBlockBootstrapProbeDecision) rawBroadcastBeyondNext() bool {
+	return d.rawBroadcastAhead && d.rawBroadcastSeqno > d.prevSeqno+1
+}
+
 func (s *Service) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (nextBlockBootstrapProbeDecision, <-chan struct{}) {
 	decision := nextBlockBootstrapProbeDecision{
 		peerLimit:         nextBlockBootstrapProbePeers,
 		consecutiveMisses: state.consecutiveMisses,
 		liveTail:          state.liveTail,
+		prevSeqno:         prev.SeqNo,
 	}
 
 	var broadcastWake <-chan struct{}
 	if s.node != nil {
-		broadcastWake, decision.rawBroadcastAhead = s.node.MasterchainBroadcastAfter(prev.SeqNo)
+		decision.rawBroadcastSeqno, broadcastWake = s.node.MasterchainBroadcastAfter(prev.SeqNo)
+		decision.rawBroadcastAhead = decision.rawBroadcastSeqno > prev.SeqNo
 		if seqno, ok := s.observedMasterchainSeqnoAhead(prev.SeqNo, s.node.ObservedMasterchainBlock); ok {
 			decision.observedAhead = true
 			decision.noteAheadSeqno(prev.SeqNo, seqno)
@@ -100,7 +167,10 @@ func (d *nextBlockBootstrapProbeDecision) noteAheadSeqno(currentSeqno uint32, se
 }
 
 func (d nextBlockBootstrapProbeDecision) shouldUseUrgentFanout() bool {
-	if d.liveTail && (d.rawBroadcastAhead || d.observedAhead || d.seenAhead || d.queuedFutureAhead) {
+	// rawBroadcastNextPending intentionally does not widen the fanout: the
+	// next block's broadcast is already received and decoding locally, so the
+	// probe is only a fallback and hammering peers would race that decode.
+	if d.liveTail && (d.rawBroadcastBeyondNext() || d.observedAhead || d.seenAhead || d.queuedFutureAhead) {
 		return true
 	}
 	if d.consecutiveMisses >= nextBlockBootstrapUrgentMisses {
@@ -544,7 +614,114 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 	}
 }
 
-func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
+// nextMasterchainProbeHoldDelay returns how long the probe should stay parked
+// before hitting peers: the pace delay while the next block is not yet due,
+// raised to a one-shot decode grace when the raw broadcast for exactly the
+// next block was already received and is decoding locally.
+func nextMasterchainProbeHoldDelay(decision *nextBlockBootstrapProbeDecision, state *nextBlockBootstrapProbeState, now time.Time) time.Duration {
+	if !decision.liveTail {
+		return 0
+	}
+	// a queued future block, a peer-observed newer head or a raw broadcast
+	// beyond the next block all mean the next block already exists somewhere
+	// and only a download can advance; do not park the probe
+	if decision.queuedFutureAhead || decision.observedAhead || decision.seenAhead || decision.rawBroadcastBeyondNext() {
+		return 0
+	}
+
+	// pacing assumes the head is current; with a real lag the next blocks are
+	// already produced somewhere and waiting out the cadence only adds delay
+	hold := time.Duration(0)
+	if !decision.hasLag || decision.lagSeconds < nextBlockBootstrapUrgentLagSeconds {
+		hold = state.probeDelay(now)
+	}
+	if decision.rawBroadcastNextPending() && state.broadcastGraceSeqno != decision.rawBroadcastSeqno {
+		state.broadcastGraceSeqno = decision.rawBroadcastSeqno
+		if nextBlockBootstrapDecodeGrace > hold {
+			hold = nextBlockBootstrapDecodeGrace
+		}
+	}
+	return hold
+}
+
+// holdNextMasterchainProbe parks the probe for up to hold, returning early
+// with the block when the local broadcast pipeline queues it, or with
+// ErrNotFound as soon as the decoded next block lands in the node broadcast
+// cache (the probe then consumes it locally without touching peers). A raw
+// broadcast for the next block arriving mid-hold extends the park once by the
+// decode grace; a raw broadcast beyond the next block ends the hold so the
+// fallback probe can catch up by download.
+func (s *Service) holdNextMasterchainProbe(ctx context.Context, prev, target ton.BlockIDExt, state *nextBlockBootstrapProbeState, hold time.Duration) (cachedMasterchainBlockForApply, error) {
+	deadline := time.Now().Add(hold)
+	timer := time.NewTimer(hold)
+	defer timer.Stop()
+
+	var rawWake <-chan struct{}
+	var nextBroadcastWake <-chan struct{}
+	if s.node != nil {
+		_, rawWake = s.node.MasterchainBroadcastAfter(prev.SeqNo)
+		wake, unwatch := s.node.WatchMasterchainNextBroadcastBlock(prev)
+		defer unwatch()
+		nextBroadcastWake = wake
+		// the decoded next block may already sit in the node broadcast cache
+		// (it can arrive while the previous block is still applying); the
+		// watch above only fires on future stores, so check before parking
+		if s.node.HasMasterchainNextBroadcastBlock(prev) {
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+		}
+	}
+
+	for {
+		select {
+		case <-nextBroadcastWake:
+			// the decoded broadcast for the next block landed in the node
+			// cache; end the hold so the probe picks it up without network
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+		case <-ctx.Done():
+			return cachedMasterchainBlockForApply{}, ctx.Err()
+		case <-s.currentStateWake:
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil || !errors.Is(err, storage.ErrNotFound) {
+				return cached, err
+			}
+		case <-rawWake:
+			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+			if err == nil || !errors.Is(err, storage.ErrNotFound) {
+				return cached, err
+			}
+			rawSeqno, wake := s.node.MasterchainBroadcastAfter(prev.SeqNo)
+			rawWake = wake
+			if rawSeqno == 0 {
+				continue
+			}
+			if rawSeqno > prev.SeqNo+1 {
+				return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+			}
+			if state.broadcastGraceSeqno == rawSeqno {
+				continue
+			}
+			// the raw broadcast for exactly the next block landed while
+			// parked: grant its decode the grace window before hitting peers
+			state.broadcastGraceSeqno = rawSeqno
+			graceDeadline := time.Now().Add(nextBlockBootstrapDecodeGrace)
+			if !graceDeadline.After(deadline) {
+				continue
+			}
+			deadline = graceDeadline
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(time.Until(deadline))
+		case <-timer.C:
+			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+		}
+	}
+}
+
+func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state *nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
 	target := masterchainSeqnoTarget(^uint32(0))
 
 	cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
@@ -555,7 +732,20 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 		return PreparedBlock{}, "", 0, err
 	}
 
-	decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
+	decision, broadcastWake := s.nextBlockBootstrapProbeDecision(prev, prevUTime, *state)
+	if hold := nextMasterchainProbeHoldDelay(&decision, state, time.Now()); hold > 0 {
+		held, err := s.holdNextMasterchainProbe(ctx, prev, target, state, hold)
+		if err == nil {
+			return held.block, held.source, held.prepareElapsed, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return PreparedBlock{}, "", 0, err
+		}
+		// the hold expired without the broadcast pipeline delivering the
+		// block; refresh the ahead signals so the fallback probe fans out on
+		// the current picture
+		decision, broadcastWake = s.nextBlockBootstrapProbeDecision(prev, prevUTime, *state)
+	}
 	stagedPeerLimit := decision.stagedPeerLimit()
 	queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
 	if decision.peerLimit > nextBlockBootstrapProbePeers || stagedPeerLimit > decision.peerLimit {

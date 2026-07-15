@@ -105,7 +105,7 @@ func TestClassifyInvalidCompressedBlockBroadcastDoesNotWakeBeforeSignaturePreche
 			if first != nil {
 				t.Fatalf("invalid masterchain broadcast was accepted before signature precheck: %+v", first)
 			}
-			if _, ready := node.MasterchainBroadcastAfter(tt.block.SeqNo - 1); ready {
+			if seqno, _ := node.MasterchainBroadcastAfter(tt.block.SeqNo - 1); seqno != 0 {
 				t.Fatal("invalid masterchain broadcast should not wake before signature precheck")
 			}
 

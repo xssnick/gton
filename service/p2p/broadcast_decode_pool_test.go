@@ -122,6 +122,42 @@ func TestOffloadedBroadcastDecodeDeliversEventAndCachesResult(t *testing.T) {
 	}
 }
 
+func TestEnqueueBroadcastDecodeRoutesMasterchainToDedicatedLane(t *testing.T) {
+	node := newTestNode(t)
+
+	// initialize the pool lanes without relying on worker scheduling
+	node.decodeWorkersOnce.Do(func() {
+		node.decodeQueue = make(chan offloadedBroadcastDecode, broadcastDecodeQueueSize)
+		node.masterDecodeQueue = make(chan offloadedBroadcastDecode, broadcastMasterDecodeQueueSize)
+	})
+
+	master := testBlockID(-1, topShard, 10)
+	shard := testBlockID(0, topShard, 10)
+
+	if !node.enqueueBroadcastDecode(offloadedBroadcastDecode{fingerprint: "m", kind: "tonNode.blockBroadcastCompressedV2", block: master}) {
+		t.Fatal("masterchain decode enqueue refused")
+	}
+	if !node.enqueueBroadcastDecode(offloadedBroadcastDecode{fingerprint: "s", kind: "tonNode.blockBroadcastCompressedV2", block: shard}) {
+		t.Fatal("shard decode enqueue refused")
+	}
+
+	if got := len(node.masterDecodeQueue); got != 1 {
+		t.Fatalf("masterchain lane depth = %d, want 1", got)
+	}
+	if got := len(node.decodeQueue); got != 1 {
+		t.Fatalf("shared lane depth = %d, want 1", got)
+	}
+
+	select {
+	case req := <-node.masterDecodeQueue:
+		if !req.block.Equals(&master) {
+			t.Fatalf("masterchain lane holds %s", formatBlockRef(req.block))
+		}
+	default:
+		t.Fatal("masterchain lane is empty")
+	}
+}
+
 func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 	var cache decodedBroadcastCache
 	block := testBlockID(0, topShard, 5)

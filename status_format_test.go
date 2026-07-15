@@ -126,7 +126,7 @@ func TestFormatStatusReadableSections(t *testing.T) {
 	for _, want := range []string{
 		"Overlays\n",
 		"  masterchain",
-		"    alive last rx      last ok        fail    score  addr",
+		"    alive last rx        fail    score  addr",
 		"lag_seconds=10s",
 	} {
 		if !strings.Contains(out, want) {

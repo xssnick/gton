@@ -408,7 +408,7 @@ func masterchainBroadcastCandidateCacheable(block VerifiedBlock) bool {
 
 func masterchainBroadcastBlockKind(kind string) bool {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2", "tonNode.blockFinalityBroadcast":
 		return true
 	default:
 		return false

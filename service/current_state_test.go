@@ -464,6 +464,7 @@ func TestSyncBlockSourceForDownloadedBlock(t *testing.T) {
 	}{
 		{name: "plain overlay download", kind: "tonNode.dataFull", want: SyncBlockSourceNextBlock},
 		{name: "broadcast cache", kind: "tonNode.blockBroadcastCompressedV2", want: SyncBlockSourceBroadcastCache},
+		{name: "finality assembled broadcast", kind: "tonNode.blockFinalityBroadcast", want: SyncBlockSourceBroadcastCache},
 		{name: "shard description broadcast hint", kind: "tonNode.newShardBlockBroadcast", want: SyncBlockSourceBroadcastHint},
 		{name: "stored full block", kind: "local full block cache", want: SyncBlockSourceStored},
 		{name: "stored next block", kind: "local next block cache", want: SyncBlockSourceStored},
@@ -516,6 +517,7 @@ func TestPreparedBlockTracksOrigin(t *testing.T) {
 		want SyncBlockOrigin
 	}{
 		{name: "full block broadcast", kind: "tonNode.blockBroadcastCompressedV2", want: SyncBlockOriginBroadcast},
+		{name: "finality assembled broadcast", kind: "tonNode.blockFinalityBroadcast", want: SyncBlockOriginBroadcast},
 		{name: "shard hint broadcast", kind: "tonNode.newShardBlockBroadcast", want: SyncBlockOriginBroadcast},
 		{name: "overlay download", kind: "tonNode.dataFull", want: SyncBlockOriginDownload},
 		{name: "stored block", kind: "stored block", want: SyncBlockOriginStored},
@@ -1502,6 +1504,180 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	lagged, _ = (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{})
 	if lagged.peerLimit != nextBlockBootstrapWidePeers {
 		t.Fatalf("lagged catch-up probe peers = %d, want %d", lagged.peerLimit, nextBlockBootstrapWidePeers)
+	}
+}
+
+func TestNextBlockBootstrapRawBroadcastFanout(t *testing.T) {
+	prev := testMasterBlockID(100)
+
+	nextPending := nextBlockBootstrapProbeDecision{
+		peerLimit:         nextBlockBootstrapProbePeers,
+		liveTail:          true,
+		prevSeqno:         prev.SeqNo,
+		rawBroadcastAhead: true,
+		rawBroadcastSeqno: prev.SeqNo + 1,
+	}
+	if !nextPending.rawBroadcastNextPending() {
+		t.Fatal("raw broadcast at prev+1 should be next-pending")
+	}
+	if nextPending.shouldUseUrgentFanout() {
+		t.Fatal("next-pending raw broadcast must not trigger urgent fanout")
+	}
+
+	beyond := nextPending
+	beyond.rawBroadcastSeqno = prev.SeqNo + 2
+	if beyond.rawBroadcastNextPending() {
+		t.Fatal("raw broadcast beyond next must not be next-pending")
+	}
+	if !beyond.shouldUseUrgentFanout() {
+		t.Fatal("raw broadcast beyond next should trigger urgent fanout")
+	}
+}
+
+func TestNextMasterchainProbeHoldDelay(t *testing.T) {
+	now := time.Now()
+	state := &nextBlockBootstrapProbeState{liveTail: true}
+
+	decision := &nextBlockBootstrapProbeDecision{liveTail: true, prevSeqno: 100}
+	if hold := nextMasterchainProbeHoldDelay(decision, state, now); hold != 0 {
+		t.Fatalf("hold without signals = %s, want 0", hold)
+	}
+
+	// raw broadcast for exactly the next block grants the decode grace once
+	decision.rawBroadcastAhead = true
+	decision.rawBroadcastSeqno = 101
+	if hold := nextMasterchainProbeHoldDelay(decision, state, now); hold != nextBlockBootstrapDecodeGrace {
+		t.Fatalf("grace hold = %s, want %s", hold, nextBlockBootstrapDecodeGrace)
+	}
+	if hold := nextMasterchainProbeHoldDelay(decision, state, now); hold != 0 {
+		t.Fatalf("second grace hold = %s, want 0 (one-shot per seqno)", hold)
+	}
+
+	// catch-up mode never parks the probe
+	catchUpState := &nextBlockBootstrapProbeState{}
+	catchUpDecision := &nextBlockBootstrapProbeDecision{prevSeqno: 100, rawBroadcastAhead: true, rawBroadcastSeqno: 101}
+	if hold := nextMasterchainProbeHoldDelay(catchUpDecision, catchUpState, now); hold != 0 {
+		t.Fatalf("catch-up hold = %s, want 0", hold)
+	}
+
+	// download-only signals cancel the pace, plain live tail keeps it
+	paced := &nextBlockBootstrapProbeState{liveTail: true, lastObtainAt: now, obtainInterval: time.Second}
+	seen := &nextBlockBootstrapProbeDecision{liveTail: true, prevSeqno: 100, seenAhead: true}
+	if hold := nextMasterchainProbeHoldDelay(seen, paced, now); hold != 0 {
+		t.Fatalf("seen-ahead hold = %s, want 0", hold)
+	}
+	pacedOnly := &nextBlockBootstrapProbeDecision{liveTail: true, prevSeqno: 100}
+	if hold := nextMasterchainProbeHoldDelay(pacedOnly, paced, now); hold != time.Second+nextBlockBootstrapPaceHeadroom {
+		t.Fatalf("pace hold = %s, want %s", hold, time.Second+nextBlockBootstrapPaceHeadroom)
+	}
+
+	// a lagged head disables the pace but keeps the decode grace
+	lagged := &nextBlockBootstrapProbeDecision{
+		liveTail:   true,
+		prevSeqno:  100,
+		hasLag:     true,
+		lagSeconds: nextBlockBootstrapUrgentLagSeconds,
+	}
+	if hold := nextMasterchainProbeHoldDelay(lagged, paced, now); hold != 0 {
+		t.Fatalf("lagged pace hold = %s, want 0", hold)
+	}
+	laggedRaw := *lagged
+	laggedRaw.rawBroadcastAhead = true
+	laggedRaw.rawBroadcastSeqno = 101
+	laggedState := &nextBlockBootstrapProbeState{liveTail: true, lastObtainAt: now, obtainInterval: time.Second}
+	if hold := nextMasterchainProbeHoldDelay(&laggedRaw, laggedState, now); hold != nextBlockBootstrapDecodeGrace {
+		t.Fatalf("lagged grace hold = %s, want %s", hold, nextBlockBootstrapDecodeGrace)
+	}
+}
+
+func TestNextBlockBootstrapProbePace(t *testing.T) {
+	start := time.Now()
+	state := &nextBlockBootstrapProbeState{liveTail: true}
+
+	if got := state.probeDelay(start); got != 0 {
+		t.Fatalf("delay without samples = %s, want 0", got)
+	}
+
+	state.noteObtained(start)
+	if got := state.probeDelay(start); got != 0 {
+		t.Fatalf("delay after first obtain = %s, want 0", got)
+	}
+
+	state.noteObtained(start.Add(400 * time.Millisecond))
+	if state.obtainInterval != 400*time.Millisecond {
+		t.Fatalf("interval = %s, want 400ms", state.obtainInterval)
+	}
+	// target = interval + headroom, so the probe deadline sits past the
+	// typical broadcast arrival instead of racing it
+	wantDelay := 400*time.Millisecond + nextBlockBootstrapPaceHeadroom - 100*time.Millisecond
+	if got := state.probeDelay(start.Add(500 * time.Millisecond)); got != wantDelay {
+		t.Fatalf("delay = %s, want %s", got, wantDelay)
+	}
+	if got := state.probeDelay(start.Add(400*time.Millisecond + 400*time.Millisecond + nextBlockBootstrapPaceHeadroom)); got != 0 {
+		t.Fatalf("elapsed delay = %s, want 0", got)
+	}
+
+	// the miss retry loop must not be paced
+	state.consecutiveMisses = 1
+	if got := state.probeDelay(start.Add(500 * time.Millisecond)); got != 0 {
+		t.Fatalf("miss retry delay = %s, want 0", got)
+	}
+	state.consecutiveMisses = 0
+
+	// one stalled block cannot inflate the pace beyond the slew limit
+	state.noteObtained(start.Add(10 * time.Second))
+	if state.obtainInterval > time.Second {
+		t.Fatalf("interval after stall = %s, want slew-limited", state.obtainInterval)
+	}
+}
+
+func TestHoldNextMasterchainProbeReturnsQueuedBlock(t *testing.T) {
+	prev := testMasterBlockID(100)
+	next := testMasterBlockID(101)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+
+	state := &nextBlockBootstrapProbeState{liveTail: true}
+	type holdResult struct {
+		cached cachedMasterchainBlockForApply
+		err    error
+	}
+	done := make(chan holdResult, 1)
+	go func() {
+		cached, err := svc.holdNextMasterchainProbe(context.Background(), prev, masterchainSeqnoTarget(^uint32(0)), state, time.Second)
+		done <- holdResult{cached: cached, err: err}
+	}()
+
+	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(prev, next), testPeerID("peer-a"))
+	svc.wakeCurrentStateSync()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("hold returned error: %v", res.err)
+		}
+		if !res.cached.block.ID.Equals(&next) {
+			t.Fatalf("hold block = %s, want %s", res.cached.block.BlockRef(), tnstore.FormatBlockRef(next))
+		}
+		if res.cached.source != SyncBlockSourceBroadcastQueue {
+			t.Fatalf("hold source = %q, want broadcast_queue", res.cached.source)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hold did not return the queued block")
+	}
+}
+
+func TestHoldNextMasterchainProbeExpires(t *testing.T) {
+	prev := testMasterBlockID(100)
+	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	state := &nextBlockBootstrapProbeState{liveTail: true}
+
+	started := time.Now()
+	_, err := svc.holdNextMasterchainProbe(context.Background(), prev, masterchainSeqnoTarget(^uint32(0)), state, 30*time.Millisecond)
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("hold error = %v, want not found", err)
+	}
+	if time.Since(started) < 30*time.Millisecond {
+		t.Fatal("hold returned before the deadline")
 	}
 }
 

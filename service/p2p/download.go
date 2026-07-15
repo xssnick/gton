@@ -342,7 +342,7 @@ func (n *Node) downloadNextFromOverlay(ctx context.Context, prev ton.BlockIDExt)
 type nextBlockFullDownload func(context.Context) (*DownloadedBlock, error)
 
 func (n *Node) downloadNextFromOverlayOrMasterBroadcast(ctx context.Context, prev ton.BlockIDExt, download nextBlockFullDownload) (*DownloadedBlock, error) {
-	wake, unwatch := n.watchMasterchainNextBroadcastBlock(prev)
+	wake, unwatch := n.WatchMasterchainNextBroadcastBlock(prev)
 	if wake == nil {
 		return download(ctx)
 	}

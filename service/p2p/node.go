@@ -67,6 +67,7 @@ type Node struct {
 	customFanoutDeduper *eventDeduper
 	decodedBroadcasts   decodedBroadcastCache
 	decodeQueue         chan offloadedBroadcastDecode
+	masterDecodeQueue   chan offloadedBroadcastDecode
 	decodeWorkersOnce   sync.Once
 
 	myExternalMessages        *eventDeduper
@@ -616,14 +617,17 @@ func (n *Node) trackRawMasterchainBroadcast(block ton.BlockIDExt) {
 	n.latestBlocksMx.Unlock()
 }
 
-func (n *Node) MasterchainBroadcastAfter(seqno uint32) (<-chan struct{}, bool) {
+// MasterchainBroadcastAfter returns the latest raw masterchain broadcast seqno
+// above seqno, or zero when none was received, and a channel that is closed
+// when a newer raw masterchain broadcast arrives.
+func (n *Node) MasterchainBroadcastAfter(seqno uint32) (uint32, <-chan struct{}) {
 	n.latestBlocksMx.RLock()
 	defer n.latestBlocksMx.RUnlock()
 
 	if n.rawMasterchainBroadcast != nil && n.rawMasterchainBroadcast.SeqNo > seqno {
-		return nil, true
+		return n.rawMasterchainBroadcast.SeqNo, n.rawMasterchainNotify
 	}
-	return n.rawMasterchainNotify, false
+	return 0, n.rawMasterchainNotify
 }
 
 func (n *Node) RememberSeenMasterchainBlock(block ton.BlockIDExt) {

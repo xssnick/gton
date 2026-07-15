@@ -45,20 +45,34 @@ const (
 	nextBlockBootstrapWideLagSeconds   = 10
 	nextBlockBootstrapWideGapBlocks    = 8
 	nextBlockBootstrapLiveLagSeconds   = 10
-	exactBlockDownloadProbePeers       = 4
-	exactBlockDownloadWaitLogDelay     = time.Second
-	exactBlockDownloadWaitLogEvery     = 2 * time.Second
-	chainBlockDownloadRetries          = 3
-	chainBlockDownloadRetryDelay       = 500 * time.Millisecond
-	nextMasterchainQueueLimit          = 64
-	nextMasterchainQueueTTL            = 3 * time.Minute
-	nextMasterchainQueueMaxBytes       = 512 << 20
-	masterStateCacheLimit              = 2048
-	syncedBlockProcessorWorkers        = 8
-	syncedBlockPriorityQueueLimit      = 64
-	syncedBlockMasterHotWorkers        = 2
-	syncedBlockMasterHotQueueLimit     = 64
-	statusTPSMasterWindow              = 10
+	// nextBlockBootstrapDecodeGrace parks the fallback probe once per raw
+	// masterchain broadcast so the already-received payload can finish its
+	// local decode+verify instead of racing a peer download.
+	nextBlockBootstrapDecodeGrace = 500 * time.Millisecond
+	// pace bounds for the first probe of a height: the next block is not due
+	// before roughly one observed block interval, so the probe stays parked
+	// (wakes still cut through) instead of producing guaranteed misses. The
+	// headroom keeps the pace deadline past the typical broadcast arrival and
+	// decode, so the fallback probe does not race the own pipeline by a few
+	// milliseconds and download the block a broadcast is about to deliver.
+	nextBlockBootstrapPaceHeadroom = 100 * time.Millisecond
+	nextBlockBootstrapPaceMaxDelay = 3500 * time.Millisecond
+	nextBlockBootstrapPaceMinDelay = 20 * time.Millisecond
+	nextBlockBootstrapPaceMaxGap   = 30 * time.Second
+	exactBlockDownloadProbePeers   = 4
+	exactBlockDownloadWaitLogDelay = time.Second
+	exactBlockDownloadWaitLogEvery = 2 * time.Second
+	chainBlockDownloadRetries      = 3
+	chainBlockDownloadRetryDelay   = 500 * time.Millisecond
+	nextMasterchainQueueLimit      = 64
+	nextMasterchainQueueTTL        = 3 * time.Minute
+	nextMasterchainQueueMaxBytes   = 512 << 20
+	masterStateCacheLimit          = 2048
+	syncedBlockProcessorWorkers    = 8
+	syncedBlockPriorityQueueLimit  = 64
+	syncedBlockMasterHotWorkers    = 2
+	syncedBlockMasterHotQueueLimit = 64
+	statusTPSMasterWindow          = 10
 )
 
 const (
@@ -402,7 +416,7 @@ func syncBlockOriginForSource(source SyncBlockSource) SyncBlockOrigin {
 
 func syncBlockOriginForKind(kind string) SyncBlockOrigin {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2", "tonNode.newShardBlockBroadcast":
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2", "tonNode.newShardBlockBroadcast", "tonNode.blockFinalityBroadcast":
 		return SyncBlockOriginBroadcast
 	case "local full block cache", "local next block cache", "stored block":
 		return SyncBlockOriginStored
@@ -413,7 +427,7 @@ func syncBlockOriginForKind(kind string) SyncBlockOrigin {
 
 func syncBlockSourceForKind(defaultSource SyncBlockSource, kind string) SyncBlockSource {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2":
+	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2", "tonNode.blockFinalityBroadcast":
 		return SyncBlockSourceBroadcastCache
 	case "tonNode.newShardBlockBroadcast":
 		return SyncBlockSourceBroadcastHint

@@ -12,7 +12,12 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-const broadcastDecodeQueueSize = 64
+const (
+	broadcastDecodeQueueSize = 64
+	// masterchain decodes gate the live sync head, so they get a small
+	// dedicated lane that is never queued behind shard and candidate payloads.
+	broadcastMasterDecodeQueueSize = 16
+)
 
 // offloadedBroadcastDecode is a full-block broadcast whose validator
 // signatures already passed the predecode check on the listen thread; the
@@ -54,13 +59,19 @@ func (n *Node) enqueueBroadcastDecode(req offloadedBroadcastDecode) bool {
 	}
 	n.decodeWorkersOnce.Do(func() {
 		n.decodeQueue = make(chan offloadedBroadcastDecode, broadcastDecodeQueueSize)
+		n.masterDecodeQueue = make(chan offloadedBroadcastDecode, broadcastMasterDecodeQueueSize)
 		for i := 0; i < broadcastDecodeWorkerCount(); i++ {
 			n.runAsync(n.runBroadcastDecodeWorker)
 		}
+		n.runAsync(n.runMasterchainBroadcastDecodeWorker)
 	})
 
+	queue := n.decodeQueue
+	if isMasterchainBlock(req.block) {
+		queue = n.masterDecodeQueue
+	}
 	select {
-	case n.decodeQueue <- req:
+	case queue <- req:
 		return true
 	default:
 		return false
@@ -70,10 +81,38 @@ func (n *Node) enqueueBroadcastDecode(req offloadedBroadcastDecode) bool {
 func (n *Node) runBroadcastDecodeWorker() {
 	ctx := n.runtimeContext()
 	for {
+		// masterchain decodes gate the live head; drain their lane before
+		// picking up shard or candidate payloads
 		select {
 		case <-ctx.Done():
 			return
+		case req := <-n.masterDecodeQueue:
+			n.processOffloadedBroadcastDecode(ctx, req)
+			continue
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case req := <-n.masterDecodeQueue:
+			n.processOffloadedBroadcastDecode(ctx, req)
 		case req := <-n.decodeQueue:
+			n.processOffloadedBroadcastDecode(ctx, req)
+		}
+	}
+}
+
+// runMasterchainBroadcastDecodeWorker keeps one worker exclusively on the
+// masterchain lane so a burst of multi-MB shard decodes occupying the shared
+// workers cannot delay the next masterchain head.
+func (n *Node) runMasterchainBroadcastDecodeWorker() {
+	ctx := n.runtimeContext()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req := <-n.masterDecodeQueue:
 			n.processOffloadedBroadcastDecode(ctx, req)
 		}
 	}

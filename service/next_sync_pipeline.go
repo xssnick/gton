@@ -413,7 +413,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		probeState.liveTail = nextBlockBootstrapLiveTail(prevUTime, time.Now().Unix())
 
 		started := time.Now()
-		downloaded, source, prepareElapsed, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, probeState)
+		downloaded, source, prepareElapsed, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, &probeState)
 		elapsed := time.Since(started)
 		downloadElapsed := downloadElapsedExcludingInlinePrepare(elapsed, prepareElapsed)
 		if err != nil {
@@ -448,6 +448,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 			return
 		}
 
+		probeState.noteObtained(time.Now())
 		item := nextMasterDownload{
 			prev:            prev,
 			block:           downloaded,
