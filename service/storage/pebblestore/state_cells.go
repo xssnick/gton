@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/bits"
 	"sync"
 
 	"github.com/xssnick/gton/service/storage"
@@ -234,9 +235,8 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 }
 
 // stateCellSaveShardedMinRecords is the record count at which saveCellRecordSet
-// fans the write out to one worker per celldb shard. Small sets (single-block
-// prewrites on the live tail) stay on the single-writer path to avoid spawning
-// goroutines for a handful of cells.
+// routes work to one writer per celldb shard. Small live-tail prewrites stay on
+// the single-writer path to avoid goroutine and routing-table overhead.
 const stateCellSaveShardedMinRecords = 4096
 
 func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCellRecords, sync bool, generation uint64, dedupe bool) (cellRecordBatchStats, error) {
@@ -257,7 +257,7 @@ func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCell
 	if records.Len() >= stateCellSaveShardedMinRecords {
 		stats, err = saveCellRecordSetSharded(ctx, cells, records, dedupe)
 	} else {
-		stats, err = saveCellRecordShard(ctx, cells, records, dedupe, allCellDBShards, stateCellImportBatchTargetBytes)
+		stats, err = saveCellRecords(ctx, cells, records, dedupe)
 	}
 	if err != nil {
 		return stats, err
@@ -271,23 +271,40 @@ func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCell
 	return stats, nil
 }
 
-// saveCellRecordSetSharded writes records with one worker per celldb shard.
-// Every worker scans the full record set and keeps only its shard's records
-// (hash-routed), so batch building and memtable commits run on all shard DBs
-// concurrently. Deduplication stays correct per worker because a hash always
-// routes to the same shard.
+// saveCellRecordSetSharded routes every record once into compact per-shard
+// bitsets. Workers visit only their set bits and read records from the original
+// immutable chunks, preserving parallel Pebble batch construction without
+// copying record descriptors or cell payloads.
 func saveCellRecordSetSharded(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool) (cellRecordBatchStats, error) {
+	if err := ctx.Err(); err != nil {
+		return cellRecordBatchStats{}, err
+	}
+
+	chunks := records.AppendChunks(nil)
+	routes, err := buildCellShardRoutes(ctx, chunks)
+	if err != nil {
+		return cellRecordBatchStats{}, err
+	}
+
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var wg sync.WaitGroup
 	var shardStats [cellDBShardCount]cellRecordBatchStats
 	var shardErrs [cellDBShardCount]error
+	var wg sync.WaitGroup
 	for shard := 0; shard < cellDBShardCount; shard++ {
 		wg.Add(1)
 		go func(shard int) {
 			defer wg.Done()
-			shardStats[shard], shardErrs[shard] = saveCellRecordShard(workerCtx, cells, records, dedupe, shard, stateCellImportBatchTargetBytes/cellDBShardCount)
+			shardStats[shard], shardErrs[shard] = saveCellRecordShard(
+				workerCtx,
+				cells,
+				chunks,
+				routes,
+				records.Len(),
+				dedupe,
+				shard,
+			)
 			if shardErrs[shard] != nil {
 				cancel()
 			}
@@ -305,8 +322,9 @@ func saveCellRecordSetSharded(ctx context.Context, cells *cellStore, records sto
 			firstErr = shardErrs[shard]
 		}
 	}
+	// A worker failure cancels its siblings. Prefer that root cause over a
+	// sibling's derived context.Canceled error.
 	if firstErr != nil && errors.Is(firstErr, context.Canceled) && ctx.Err() == nil {
-		// Prefer the root-cause error over cancellations it triggered in siblings.
 		for shard := 0; shard < cellDBShardCount; shard++ {
 			if shardErrs[shard] != nil && !errors.Is(shardErrs[shard], context.Canceled) {
 				firstErr = shardErrs[shard]
@@ -317,28 +335,116 @@ func saveCellRecordSetSharded(ctx context.Context, cells *cellStore, records sto
 	return stats, firstErr
 }
 
-// allCellDBShards makes saveCellRecordShard accept every record instead of
-// filtering by shard index.
-const allCellDBShards = -1
+func buildCellShardRoutes(ctx context.Context, chunks [][]storage.EncodedCellRecord) ([][]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-func saveCellRecordShard(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool, shard int, flushTargetBytes int) (cellRecordBatchStats, error) {
+	routes := make([][]uint64, len(chunks))
+	totalWords := 0
+	for _, chunk := range chunks {
+		totalWords += ((len(chunk) + 63) / 64) * cellDBShardCount
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	routeWords := make([]uint64, totalWords)
+	offset := 0
+	position := 0
+	for chunkIndex, chunk := range chunks {
+		wordsPerShard := (len(chunk) + 63) / 64
+		chunkWords := wordsPerShard * cellDBShardCount
+		routes[chunkIndex] = routeWords[offset : offset+chunkWords]
+		offset += chunkWords
+
+		for i := range chunk {
+			if position&0x3fff == 0 {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
+			}
+			shard := cellShardIndex(chunk[i].Hash)
+			routes[chunkIndex][shard*wordsPerShard+(i>>6)] |= uint64(1) << uint(i&63)
+			position++
+		}
+	}
+	return routes, nil
+}
+
+func saveCellRecordShard(ctx context.Context, cells *cellStore, chunks [][]storage.EncodedCellRecord, routes [][]uint64, recordCount int, dedupe bool, shard int) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
 	writer := cells.newBatchWriter(cellShardBatchInitialSize(stateCellImportBatchTargetBytes))
 	defer writer.close()
 
 	var written map[cell.Hash]struct{}
 	if dedupe {
-		capacityHint := records.Len()
-		if shard != allCellDBShards {
-			capacityHint /= cellDBShardCount
+		written = make(map[cell.Hash]struct{}, recordCount/cellDBShardCount)
+	}
+	wordsVisited := 0
+	for chunkIndex, chunk := range chunks {
+		wordsPerShard := len(routes[chunkIndex]) / cellDBShardCount
+		routeBits := routes[chunkIndex][shard*wordsPerShard : (shard+1)*wordsPerShard]
+		for wordIndex, word := range routeBits {
+			if wordsVisited&0xff == 0 {
+				select {
+				case <-ctx.Done():
+					return stats, ctx.Err()
+				default:
+				}
+			}
+			wordsVisited++
+
+			for word != 0 {
+				recordIndex := wordIndex*64 + bits.TrailingZeros64(word)
+				word &= word - 1
+				record := &chunk[recordIndex]
+				if len(record.Data) == 0 {
+					return stats, fmt.Errorf("encoded cell record is empty")
+				}
+
+				if dedupe {
+					if _, ok := written[record.Hash]; ok {
+						stats.skipped++
+						continue
+					}
+					written[record.Hash] = struct{}{}
+				}
+
+				if err := writer.set(record.Hash[:], record.Data); err != nil {
+					return stats, err
+				}
+				stats.written++
+				stats.bytes += int64(len(record.Data))
+
+				if writer.bytesInBatch >= stateCellImportBatchTargetBytes/cellDBShardCount {
+					if _, err := writer.flush(); err != nil {
+						return stats, err
+					}
+				}
+			}
 		}
-		written = make(map[cell.Hash]struct{}, capacityHint)
+	}
+
+	if _, err := writer.flush(); err != nil {
+		return stats, err
+	}
+	return stats, nil
+}
+
+func saveCellRecords(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool) (cellRecordBatchStats, error) {
+	var stats cellRecordBatchStats
+	writer := cells.newBatchWriter(cellShardBatchInitialSize(stateCellImportBatchTargetBytes))
+	defer writer.close()
+
+	var written map[cell.Hash]struct{}
+	if dedupe {
+		written = make(map[cell.Hash]struct{}, records.Len())
 	}
 	i := 0
 	if err := records.ForEach(func(record storage.EncodedCellRecord) error {
-		if shard != allCellDBShards && cellShardIndex(record.Hash) != shard {
-			return nil
-		}
 		if i&0x3fff == 0 {
 			select {
 			case <-ctx.Done():
@@ -366,7 +472,8 @@ func saveCellRecordShard(ctx context.Context, cells *cellStore, records storage.
 		stats.written++
 		stats.bytes += int64(len(record.Data))
 
-		if writer.bytesInBatch >= flushTargetBytes {
+		shard := cellShardIndex(record.Hash)
+		if writer.bytesByShard[shard] >= stateCellImportBatchTargetBytes/cellDBShardCount {
 			if _, err := writer.flush(); err != nil {
 				return err
 			}

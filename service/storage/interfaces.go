@@ -44,6 +44,7 @@ type PersistentStateSerializationStorage interface {
 	SaveActivePersistentStateSerialization(ctx context.Context, active *PersistentStateSerializerActive) error
 	DeleteActivePersistentStateSerialization(ctx context.Context) error
 	SavePersistentStateDescription(ctx context.Context, desc *PersistentStateDescription) error
+	PersistentStateDescriptions(ctx context.Context) ([]PersistentStateDescription, error)
 }
 
 type CellGenerationStorage interface {

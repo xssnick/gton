@@ -4423,7 +4423,7 @@ func lazyCellLoadMetricCount(metrics []storage.LazyCellLoadMetric, layer string)
 	return count
 }
 
-func TestSaveCellRecordSetShardedWritesAndDedupes(t *testing.T) {
+func TestSaveCellRecordsWritesChunksAndDedupes(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -4440,10 +4440,8 @@ func TestSaveCellRecordSetShardedWritesAndDedupes(t *testing.T) {
 		t.Fatalf("active cell generation: %v", err)
 	}
 
-	// Enough records to take the sharded path, with hashes spread over every
-	// celldb shard and a tail of duplicates to exercise per-shard dedupe.
-	count := stateCellSaveShardedMinRecords + 512
-	records := make([]storage.EncodedCellRecord, 0, count+256)
+	const count = 4096 + 512
+	records := make([]storage.EncodedCellRecord, 0, count+1)
 	for i := 0; i < count; i++ {
 		var hash cell.Hash
 		hash[0] = byte(i)
@@ -4452,10 +4450,21 @@ func TestSaveCellRecordSetShardedWritesAndDedupes(t *testing.T) {
 		binary.BigEndian.PutUint64(data, uint64(i))
 		records = append(records, storage.EncodedCellRecord{Hash: hash, Data: data})
 	}
-	records = append(records, records[:256]...)
+	firstData := bytes.Clone(records[0].Data)
+	duplicate := records[0]
+	duplicate.Data = []byte{0xff}
+	records = append(records, duplicate)
 
-	if err = store.SaveEncodedCellsInGeneration(ctx, generation, records, true); err != nil {
+	set := storage.NewStateCellRecordChunks([][]storage.EncodedCellRecord{
+		records[:count/2],
+		records[count/2:],
+	}, 0)
+	stats, err := store.saveCellRecordSet(ctx, set, true, generation, true)
+	if err != nil {
 		t.Fatalf("save encoded cells: %v", err)
+	}
+	if stats.written != count || stats.skipped != 1 || stats.bytes != int64(count*len(firstData)) {
+		t.Fatalf("save stats = %+v, want written=%d skipped=1 bytes=%d", stats, count, count*len(firstData))
 	}
 
 	seenShards := map[int]struct{}{}
@@ -4472,9 +4481,16 @@ func TestSaveCellRecordSetShardedWritesAndDedupes(t *testing.T) {
 	if len(seenShards) != cellDBShardCount {
 		t.Fatalf("readback covered %d shards, want %d", len(seenShards), cellDBShardCount)
 	}
+	raw, err := store.getCellCopyFromGeneration(ctx, generation, records[0].Hash[:])
+	if err != nil {
+		t.Fatalf("read duplicated cell: %v", err)
+	}
+	if !bytes.Equal(raw, firstData) {
+		t.Fatalf("deduplicated cell data = %x, want first value %x", raw, firstData)
+	}
 }
 
-func TestSaveCellRecordSetShardedRejectsEmptyRecord(t *testing.T) {
+func TestSaveCellRecordsRejectsEmptyRecord(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {
@@ -4491,20 +4507,89 @@ func TestSaveCellRecordSetShardedRejectsEmptyRecord(t *testing.T) {
 		t.Fatalf("active cell generation: %v", err)
 	}
 
-	count := stateCellSaveShardedMinRecords
-	records := make([]storage.EncodedCellRecord, 0, count)
-	for i := 0; i < count; i++ {
-		var hash cell.Hash
-		hash[0] = byte(i)
-		binary.BigEndian.PutUint64(hash[8:16], uint64(i))
-		record := storage.EncodedCellRecord{Hash: hash, Data: []byte{0x01}}
-		if i == count/2 {
-			record.Data = nil
-		}
-		records = append(records, record)
+	type emptyRecordTestCase struct {
+		name  string
+		count int
 	}
+	tests := []emptyRecordTestCase{
+		{name: "single-writer", count: 8},
+		{name: "sharded", count: stateCellSaveShardedMinRecords},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := make([]storage.EncodedCellRecord, 0, tt.count)
+			for i := 0; i < tt.count; i++ {
+				var hash cell.Hash
+				hash[0] = byte(i)
+				binary.BigEndian.PutUint64(hash[8:16], uint64(i))
+				record := storage.EncodedCellRecord{Hash: hash, Data: []byte{0x01}}
+				if i == tt.count/2 {
+					record.Data = nil
+				}
+				records = append(records, record)
+			}
 
-	if err = store.SaveEncodedCellsInGeneration(ctx, generation, records, false); err == nil {
-		t.Fatal("expected empty record error from sharded save")
+			_, saveErr := store.saveCellRecordSet(ctx, storage.NewStateCellRecords(records), false, generation, false)
+			if saveErr == nil {
+				t.Fatal("expected empty record error")
+			}
+			if !strings.Contains(saveErr.Error(), "encoded cell record is empty") {
+				t.Fatalf("save empty record err = %v, want root cause", saveErr)
+			}
+		})
+	}
+}
+
+func TestSaveCellRecordsHonorsCanceledContext(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	type canceledContextTestCase struct {
+		name  string
+		count int
+		save  func(storage.StateCellRecords) (cellRecordBatchStats, error)
+	}
+	tests := []canceledContextTestCase{
+		{
+			name:  "single-writer",
+			count: 1,
+			save: func(records storage.StateCellRecords) (cellRecordBatchStats, error) {
+				return saveCellRecords(ctx, store.cells, records, false)
+			},
+		},
+		{
+			name:  "sharded",
+			count: stateCellSaveShardedMinRecords,
+			save: func(records storage.StateCellRecords) (cellRecordBatchStats, error) {
+				return saveCellRecordSetSharded(ctx, store.cells, records, false)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := make([]storage.EncodedCellRecord, tt.count)
+			for i := range records {
+				binary.BigEndian.PutUint64(records[i].Hash[24:], uint64(i))
+				records[i].Data = []byte{0x01}
+			}
+
+			stats, err := tt.save(storage.NewStateCellRecords(records))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("save canceled records err = %v, want context.Canceled", err)
+			}
+			if stats != (cellRecordBatchStats{}) {
+				t.Fatalf("save canceled records stats = %+v, want zero", stats)
+			}
+		})
 	}
 }

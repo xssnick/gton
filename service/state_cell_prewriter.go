@@ -233,8 +233,8 @@ func (w *stateCellPrewriter) popBatch() (stateCellPrewriteBatch, bool) {
 }
 
 func (b *stateCellPrewriteBatch) add(job stateCellPrewriteJob) {
-	var bytes uint64
-	b.chunks, bytes = job.records.AppendChunks(b.chunks)
+	bytes := job.records.ByteSize()
+	b.chunks = job.records.AppendChunks(b.chunks)
 	if bytes == 0 {
 		bytes = job.bytes
 	}

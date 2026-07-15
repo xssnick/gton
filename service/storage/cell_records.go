@@ -147,12 +147,12 @@ func (r StateCellRecords) AppendTo(records []EncodedCellRecord) []EncodedCellRec
 
 // AppendChunks exposes the existing record slices for batch writers that can
 // consume immutable records without flattening them into another large slice.
-func (r StateCellRecords) AppendChunks(chunks [][]EncodedCellRecord) ([][]EncodedCellRecord, uint64) {
+func (r StateCellRecords) AppendChunks(chunks [][]EncodedCellRecord) [][]EncodedCellRecord {
 	if len(r.Records) > 0 {
 		chunks = append(chunks, r.Records)
 	}
 	chunks = append(chunks, r.chunks...)
-	return chunks, r.ByteSize()
+	return chunks
 }
 
 func (r StateCellRecords) ForEach(fn func(EncodedCellRecord) error) error {
