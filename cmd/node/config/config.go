@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/xssnick/gton/service"
 )
 
 const (
@@ -139,6 +141,7 @@ type Storage struct {
 	CellMemTableStopWritesThreshold  int64  `json:"cell_memtable_stop_writes_threshold"`
 	LargeBOCShardReadWorkers         int64  `json:"large_boc_shard_read_workers"`
 	PersistentStateLargeBOCBatchSize int64  `json:"persistent_state_large_boc_batch_size"`
+	PersistentStateKeepRecent        int64  `json:"persistent_state_keep_recent"`
 	StateSerializeOnePass            bool   `json:"state_serialize_one_pass"`
 	ArtifactFileMaxOpen              int64  `json:"artifact_file_max_open"`
 }
@@ -210,6 +213,7 @@ func defaultConfig() Config {
 			CellMemTableStopWritesThreshold:  DefaultCellMemTableStopWritesThreshold,
 			LargeBOCShardReadWorkers:         DefaultLargeBOCShardReadWorkers,
 			PersistentStateLargeBOCBatchSize: DefaultPersistentStateLargeBOCBatchSize,
+			PersistentStateKeepRecent:        service.DefaultPersistentStateKeepRecent,
 			StateSerializeOnePass:            false,
 			ArtifactFileMaxOpen:              DefaultArtifactFileMaxOpen,
 		},
@@ -359,7 +363,8 @@ func EnsureGlobalConfig(ctx context.Context, path string, url string, replace bo
 		}
 	}
 
-	if err := downloadFile(ctx, path, url); err != nil {
+	client := http.Client{Timeout: globalConfigHTTPClient}
+	if err := downloadFile(ctx, &client, path, url); err != nil {
 		return EnsureGlobalConfigResult{}, err
 	}
 	return EnsureGlobalConfigResult{Downloaded: true}, nil
@@ -426,12 +431,7 @@ func DetectExternalIP(ctx context.Context) (string, error) {
 	return ip, nil
 }
 
-func downloadFile(ctx context.Context, path string, url string) error {
-	client := http.Client{Timeout: globalConfigHTTPClient}
-	return downloadFileWithClient(ctx, &client, path, url)
-}
-
-func downloadFileWithClient(ctx context.Context, client *http.Client, path string, url string) error {
+func downloadFile(ctx context.Context, client *http.Client, path string, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -480,6 +480,12 @@ func downloadFileWithClient(ctx context.Context, client *http.Client, path strin
 	return nil
 }
 
+type externalIPResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Query   string `json:"query"`
+}
+
 func lookupExternalIP(ctx context.Context, client *http.Client, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -498,11 +504,7 @@ func lookupExternalIP(ctx context.Context, client *http.Client, url string) (str
 		return "", fmt.Errorf("%s returned %s", url, resp.Status)
 	}
 
-	var res struct {
-		Status  string `json:"status"`
-		Message string `json:"message"`
-		Query   string `json:"query"`
-	}
+	var res externalIPResponse
 	if err = json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return "", fmt.Errorf("decode %s response: %w", url, err)
 	}

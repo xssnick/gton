@@ -187,8 +187,9 @@ func TestArchiveMasterImportDropsInvalidCacheAndRetriesWhenPeerIsGone(t *testing
 			}()
 
 			runner := &archiveCatchUpRunner{
-				service:     &Service{log: zerolog.Nop()},
-				importCache: cache,
+				service:        &Service{log: zerolog.Nop()},
+				archiveSession: newTestArchiveSession(t),
+				importCache:    cache,
 			}
 			result, _, err := runner.startArchiveMasterImport(ctx, queue, start, 11, nil).wait(ctx)
 			if err != nil {

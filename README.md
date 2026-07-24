@@ -258,6 +258,7 @@ Simplified example:
     "cell_memtable_stop_writes_threshold": 4,
     "large_boc_shard_read_workers": 2,
     "persistent_state_large_boc_batch_size": 524288,
+    "persistent_state_keep_recent": 2,
     "state_serialize_one_pass": false,
     "artifact_file_max_open": 512
   },
@@ -330,6 +331,7 @@ Simplified example:
 | `cell_memtable_stop_writes_threshold` | Pebble stop-writes threshold for memtables. |
 | `large_boc_shard_read_workers` | Per-cell-DB-shard parallel readers for large-BOC state serialization loads. Defaults to `2`; `0` uses the default. |
 | `persistent_state_large_boc_batch_size` | Large-BOC serialization batch size for persistent state files, in cells. Defaults to `524288`; `0` uses the default. |
+| `persistent_state_keep_recent` | Number of recent persistent-state groups always retained. Defaults to `2`; `0` also uses the default for compatibility with older configs. Set to `-1` to retain every persistent state and disable persistent-state cleanup, including low-disk emergency pruning. Older groups outside this count are still retained until their protocol TTL expires. |
 | `state_serialize_one_pass` | Forces persistent state serialization to use one-pass large-BOC serialization for every state part. Defaults to `false`. |
 | `artifact_file_max_open` | Open-file limit for block/state artifacts. |
 
@@ -391,7 +393,39 @@ The exported metrics cover liteserver latency, sync lag, block download/apply, c
 
 The node can call a statically linked extension from a custom node binary.
 
-The extension is compiled into the custom binary, so node builds do not need cgo. A custom binary imports `github.com/xssnick/gton`, parses its own CLI/config files, and passes typed startup values to `gton.RunNode`:
+The extension is compiled into the custom binary, so node builds do not need cgo.
+
+For a standard node build with an additional extension, use `node.Run` as the
+main entry point:
+
+```go
+package main
+
+import (
+    "github.com/xssnick/gton/cmd/node/node"
+    "my/project/extension"
+)
+
+func main() {
+    node.Run(extension.New)
+}
+```
+
+`node.Run` uses the same CLI and config bootstrap as the standard `./cmd/node`
+binary. It reads `config.json` (or the path passed through `--config`), starts
+the built-in extensions enabled there, including the liteserver and HTTP API,
+and composes them with the supplied extension factories. Multiple factories
+can be passed to `node.Run`.
+
+`gton.RunNode` is the lower-level entry point for a binary that owns its full
+startup flow. It accepts already resolved `gton.NodeOptions`; it does not read
+`config.json` or add the built-in extensions automatically. Loading a config
+with `Config.RuntimeOptions` and passing only `RuntimeOptions.Node` therefore
+does not enable the liteserver or HTTP API. A custom bootstrap must configure
+and compose those extensions explicitly.
+
+For example, a fully custom binary can parse its own CLI and config files, then
+pass typed startup values to `gton.RunNode`:
 
 ```go
 package main

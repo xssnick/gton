@@ -19,9 +19,6 @@ func (n *Node) publishNonfinalDownloadedBlock(downloaded *DownloadedBlock, kind 
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
 		return
 	}
-	if downloaded.Block == nil || len(downloaded.BlockBOC) == 0 {
-		return
-	}
 
 	if err := n.blockCacheObserver.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:     downloaded.ID,

@@ -222,7 +222,7 @@ func requireAssembledShardFinalityBlock(t *testing.T, candidate DownloadedBlock,
 
 	got := blocks[0]
 	if !got.ID.Equals(&candidate.ID) {
-		t.Fatalf("assembled block id = %s, want %s", formatBlockRef(got.ID), formatBlockRef(candidate.ID))
+		t.Fatalf("assembled block id = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(candidate.ID))
 	}
 	if got.Kind != blockFinalityBroadcastKind {
 		t.Fatalf("assembled kind = %q, want %q", got.Kind, blockFinalityBroadcastKind)
@@ -357,7 +357,6 @@ func testShardBlockFinality(block ton.BlockIDExt) checkedBlockFinality {
 	)
 	return checkedBlockFinality{
 		block:                 block,
-		signatures:            signatures,
 		signaturesVerifiedKey: signatures.ContentKey(block),
 		sourcePeerID:          testPeerID("finality"),
 		payloadBytes:          128,
@@ -404,7 +403,6 @@ func testMasterchainBlockFinality(t *testing.T, block ton.BlockIDExt) checkedBlo
 
 	return checkedBlockFinality{
 		block:                 block,
-		signatures:            signatures,
 		signaturesCell:        signaturesCell,
 		signaturesVerifiedKey: signatures.ContentKey(block),
 		sourcePeerID:          testPeerID("finality"),

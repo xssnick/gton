@@ -53,7 +53,7 @@ func TestDownloadNextFromOverlayOrMasterBroadcastUsesBroadcastDuringDownload(t *
 		t.Fatalf("download next race: %v", err)
 	case block := <-got:
 		if !block.ID.Equals(&broadcast.ID) {
-			t.Fatalf("block = %s, want %s", formatBlockRef(block.ID), formatBlockRef(broadcast.ID))
+			t.Fatalf("block = %s, want %s", storage.FormatBlockRef(block.ID), storage.FormatBlockRef(broadcast.ID))
 		}
 		if block.Kind != broadcast.Kind {
 			t.Fatalf("kind = %q, want %q", block.Kind, broadcast.Kind)
@@ -89,7 +89,7 @@ func TestDownloadNextFromOverlayOrMasterBroadcastPrefersReadyBroadcastOverPeerRe
 		t.Fatalf("download next race: %v", err)
 	}
 	if !got.ID.Equals(&broadcast.ID) {
-		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(broadcast.ID))
+		t.Fatalf("block = %s, want %s", storage.FormatBlockRef(got.ID), storage.FormatBlockRef(broadcast.ID))
 	}
 	if got.Kind != broadcast.Kind {
 		t.Fatalf("kind = %q, want %q", got.Kind, broadcast.Kind)
@@ -109,14 +109,14 @@ func TestDownloadNextBlockFullUsesMasterchainBroadcastCacheBeforeOverlay(t *test
 		t.Fatalf("download next block full: %v", err)
 	}
 	if !got.ID.Equals(&broadcast.ID) {
-		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(broadcast.ID))
+		t.Fatalf("block = %s, want %s", storage.FormatBlockRef(got.ID), storage.FormatBlockRef(broadcast.ID))
 	}
 	desc, err := node.NextBlockDescription(context.Background(), prev)
 	if err != nil {
 		t.Fatalf("next block description: %v", err)
 	}
 	if !desc.Equals(&broadcast.ID) {
-		t.Fatalf("description = %s, want %s", formatBlockRef(desc), formatBlockRef(broadcast.ID))
+		t.Fatalf("description = %s, want %s", storage.FormatBlockRef(desc), storage.FormatBlockRef(broadcast.ID))
 	}
 }
 
@@ -139,7 +139,7 @@ func TestAcceptBroadcastCachesMasterchainNextBroadcast(t *testing.T) {
 		t.Fatalf("load cached masterchain broadcast: %v", err)
 	}
 	if !got.ID.Equals(&broadcast.ID) {
-		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(broadcast.ID))
+		t.Fatalf("block = %s, want %s", storage.FormatBlockRef(got.ID), storage.FormatBlockRef(broadcast.ID))
 	}
 }
 

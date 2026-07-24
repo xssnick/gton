@@ -100,12 +100,82 @@ func TestArchiveUseLeaseAppliesPendingDeactivationAfterRelease(t *testing.T) {
 	}
 }
 
+func TestInactiveSubscriptionReplacementWaitsForReceiverGenerationClose(t *testing.T) {
+	node := newTestNode(t)
+	pool, pooled, _ := newTestLeasedPooledPeer("inactive-generation")
+	node.pool = pool
+	t.Cleanup(pooled.close)
+
+	spec := overlaySpec{
+		Name:        "inactive-generation",
+		Kind:        overlayKindPublicShard,
+		ShortID:     testPeerID("inactive-generation-overlay").Bytes(),
+		RandomPeers: false,
+	}
+	oldSub := mustGetOrCreateSubscription(t, node, spec)
+	_, _, releaseOld, err := pool.acquireOverlay(pooled, oldSub.broadcastReceiver, false)
+	if err != nil {
+		t.Fatalf("attach old receiver generation: %v", err)
+	}
+	t.Cleanup(releaseOld)
+
+	deleteAt := time.Now().Add(-time.Second)
+	oldSub.setActive(false, deleteAt)
+	cancelEntered := make(chan struct{})
+	allowCancel := make(chan struct{})
+	oldSub.mx.Lock()
+	oldSub.cancel = func() {
+		close(cancelEntered)
+		<-allowCancel
+	}
+	oldSub.mx.Unlock()
+
+	deleted := make(chan bool, 1)
+	go func() {
+		deleted <- node.deleteInactiveSubscription(overlaySpecKey(spec), oldSub, time.Now())
+	}()
+	select {
+	case <-cancelEntered:
+	case <-time.After(time.Second):
+		t.Fatal("inactive subscription close did not reach the cancellation barrier")
+	}
+
+	var replacement *overlaySubscription
+	created := make(chan error, 1)
+	go func() {
+		var createErr error
+		replacement, createErr = node.getOrCreateSubscription(spec)
+		created <- createErr
+	}()
+	select {
+	case createErr := <-created:
+		if createErr != nil {
+			t.Fatalf("create replacement subscription: %v", createErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement subscription remained blocked after old receiver closed")
+	}
+	if replacement == oldSub {
+		t.Fatal("inactive subscription generation was reused")
+	}
+	if replacement.peerByID(pooled.id) == nil {
+		t.Fatal("replacement receiver failed to attach the existing pooled peer")
+	}
+
+	close(allowCancel)
+	if !<-deleted {
+		t.Fatal("inactive subscription was not deleted")
+	}
+}
+
 func TestArchiveUseLeaseKeepsEnsurePeersActive(t *testing.T) {
 	_, sub, _ := newArchiveLeaseTestSubscription(t)
 	peerID := testPeerID("archive-lease-peer")
 	sub.peers[peerID] = &overlayPeer{
 		id:        peerID,
 		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		overlay:   &overlay.ADNLOverlayWrapper{},
+		release:   func() {},
 		alive:     true,
 	}
 

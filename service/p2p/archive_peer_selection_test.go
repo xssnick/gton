@@ -25,6 +25,7 @@ func testArchiveCandidate(label string) *overlayPeer {
 		overlay:   &overlay.ADNLOverlayWrapper{},
 		announced: &overlay.Node{Version: int32(time.Now().Unix())},
 		alive:     true,
+		release:   func() {},
 	}
 }
 
@@ -60,6 +61,9 @@ func testArchiveOnlyPoolPeer(tb testing.TB, pool *archivePeerPool, label string)
 func addTestArchiveOnlyPeer(pool *archivePeerPool, peer *overlayPeer) bool {
 	if peer == nil || peer.id.IsZero() {
 		return false
+	}
+	if peer.release == nil {
+		peer.release = func() {}
 	}
 
 	pool.pruneClosedPeers()
@@ -108,14 +112,28 @@ func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlay
 	rldpWrapper := overlay.CreateExtendedRLDP(baseRLDP)
 	id := testPeerID(label)
 	pooled := &pooledPeer{
-		id:          id,
-		addr:        label,
-		adnl:        adnlWrapper,
-		rldp:        rldpWrapper,
-		overlayRefs: map[string]int{},
+		id:              id,
+		addr:            label,
+		adnl:            adnlWrapper,
+		baseRLDP:        baseRLDP,
+		rldp:            rldpWrapper,
+		adnlOverlayRefs: map[*overlay.ADNLOverlayWrapper]int{},
+		rldpOverlayRefs: map[*overlay.RLDPOverlayWrapper]int{},
 	}
+	pooled.touch(time.Now())
 	pool := &peerPool{peers: map[PeerID]*pooledPeer{id: pooled}}
 	return pool, pooled, base
+}
+
+func mustNewTestOverlayPeer(tb testing.TB, sub *overlaySubscription, pooled *pooledPeer, announced *overlay.Node, fixedMember bool) *overlayPeer {
+	tb.Helper()
+	ensureTestBroadcastReceiver(tb, sub)
+
+	peer, err := sub.newOverlayPeer(pooled, announced, fixedMember)
+	if err != nil {
+		tb.Fatalf("create test overlay peer: %v", err)
+	}
+	return peer
 }
 
 func TestArchiveScoutAddressLookupUsesArchiveTimeout(t *testing.T) {
@@ -179,7 +197,7 @@ func TestArchiveScoutAddressLookupUsesArchiveTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve peer identity: %v", err)
 	}
-	if !pool.scout.peerBlocked(identity.peerID, time.Now()) {
+	if !pool.scout.retry.peerBlocked(identity.peerID, time.Now()) {
 		t.Fatal("unreachable archive peer was not added to the retry cache")
 	}
 }
@@ -252,7 +270,7 @@ func TestArchiveSessionSelectionIsShardLocal(t *testing.T) {
 	shardB := archive.ShardID{Workchain: 1, Shard: topShard}
 	peerA := testArchiveCandidate("peer-a")
 	peerB := testArchiveCandidate("peer-b")
-	session := (&Node{}).BeginArchiveSession()
+	session := (&Node{runCtx: context.Background()}).BeginArchiveSession()
 	defer session.Close()
 
 	session.selectArchivePeer(shardA, peerA)
@@ -271,7 +289,7 @@ func TestArchiveSessionSelectionIsShardLocal(t *testing.T) {
 	}
 }
 
-func TestArchiveSessionCloseClosesOnlyArchiveOnlyPeers(t *testing.T) {
+func TestArchiveSessionCloseDetachesOnlyArchiveOnlyPeers(t *testing.T) {
 	liveOverlay, liveConn := newTestOverlayWrapper()
 	livePeer := testArchiveCandidate("live")
 	livePeer.overlay = liveOverlay
@@ -288,7 +306,7 @@ func TestArchiveSessionCloseClosesOnlyArchiveOnlyPeers(t *testing.T) {
 			livePeer.id: livePeer,
 		},
 	})
-	archivePeer := sub.newOverlayPeer(pooledArchive, nil, false, true)
+	archivePeer := mustNewTestOverlayPeer(t, sub, pooledArchive, nil, false)
 	session := node.BeginArchiveSession()
 
 	pool, err := session.archivePeerPool(sub)
@@ -300,8 +318,8 @@ func TestArchiveSessionCloseClosesOnlyArchiveOnlyPeers(t *testing.T) {
 
 	select {
 	case <-archiveConn.GetCloserCtx().Done():
+		t.Fatal("archive session close skipped the idle transport grace period")
 	default:
-		t.Fatal("archive-only peer connection survived archive session close")
 	}
 	select {
 	case <-liveConn.GetCloserCtx().Done():
@@ -314,6 +332,15 @@ func TestArchiveSessionCloseClosesOnlyArchiveOnlyPeers(t *testing.T) {
 	if _, ok := sub.peers[archivePeer.id]; ok {
 		t.Fatal("archive-only peer leaked into live pool")
 	}
+	pooledArchive.touch(time.Now().Add(-peerPoolIdleTTL - time.Second))
+	if got := archivePool.pruneIdleLockedForTest(time.Now(), 0); got != 1 {
+		t.Fatalf("pruned idle archive transports = %d, want 1", got)
+	}
+	select {
+	case <-archiveConn.GetCloserCtx().Done():
+	default:
+		t.Fatal("expired archive-only transport survived idle pruning")
+	}
 }
 
 func TestArchivePoolKeepsOwnedPeerSeparateFromSameLivePeer(t *testing.T) {
@@ -325,8 +352,8 @@ func TestArchivePoolKeepsOwnedPeerSeparateFromSameLivePeer(t *testing.T) {
 		peers: map[PeerID]*overlayPeer{},
 	})
 	announced := &overlay.Node{Version: int32(time.Now().Unix())}
-	archivePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
-	livePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
+	archivePeer := mustNewTestOverlayPeer(t, sub, pooledPeer, announced, false)
+	livePeer := mustNewTestOverlayPeer(t, sub, pooledPeer, announced, false)
 	sub.peers[livePeer.id] = livePeer
 	pool := testArchivePool(t, sub)
 
@@ -356,13 +383,13 @@ func TestArchivePoolLeaseDoesNotEnterLivePeerAccounting(t *testing.T) {
 		peers: map[PeerID]*overlayPeer{},
 	})
 	announced := &overlay.Node{Version: int32(time.Now().Unix())}
-	archivePeer := sub.newOverlayPeer(pooledPeer, announced, false, true)
+	archivePeer := mustNewTestOverlayPeer(t, sub, pooledPeer, announced, false)
 	pool := testArchivePool(t, sub)
 
 	if !addTestArchiveOnlyPeer(pool, archivePeer) {
 		t.Fatal("expected archive-only peer to be added")
 	}
-	release, ok := pool.acquireDownload(archivePeer)
+	release, ok := pool.acquire(archivePeer)
 	if !ok {
 		t.Fatal("failed to lease archive-only peer")
 	}
@@ -482,17 +509,16 @@ func TestEnsureArchivePeersRefreshesReadyPoolWithoutWaiting(t *testing.T) {
 
 func TestArchiveOnlyPeerCloseDoesNotCloseSharedPooledADNL(t *testing.T) {
 	pool, pooled, base := newTestLeasedPooledPeer("shared")
-	overlayID := []byte{0x01}
 	sub := testOverlaySubscription(&overlaySubscription{
 		node: &Node{pool: pool},
 		spec: overlaySpec{
-			ShortID: overlayID,
+			ShortID: []byte{0x01},
 			Kind:    overlayKindPublicShard,
 		},
 	})
-	archivePeer := sub.newOverlayPeer(pooled, nil, false, true)
+	archivePeer := mustNewTestOverlayPeer(t, sub, pooled, nil, false)
 	archivePeer.initRebroadcastQueues()
-	livePeer := sub.newOverlayPeer(pooled, nil, false, true)
+	livePeer := mustNewTestOverlayPeer(t, sub, pooled, nil, false)
 	liveOverlay := livePeer.overlay
 
 	closeArchiveOnlyPeer(archivePeer)
@@ -508,19 +534,30 @@ func TestArchiveOnlyPeerCloseDoesNotCloseSharedPooledADNL(t *testing.T) {
 		t.Fatal("archive-only close closed shared pooled ADNL")
 	default:
 	}
-	if got := pooled.adnl.CreateOverlayWithSettings(overlayID, maxOverlayPayloadSize, true, false); got != liveOverlay {
+	got, err := pooled.adnl.AttachOverlay(sub.broadcastReceiver)
+	if err != nil {
+		t.Fatalf("reattach shared live overlay: %v", err)
+	}
+	if got != liveOverlay {
 		t.Fatal("archive-only close unregistered shared live overlay")
 	}
 
 	livePeer.close()
 	select {
 	case <-base.GetCloserCtx().Done():
+		t.Fatal("last overlay release skipped the idle transport grace period")
 	default:
-		t.Fatal("pooled ADNL survived last overlay release")
+	}
+	pooled.touch(time.Now().Add(-peerPoolIdleTTL - time.Second))
+	pool.pruneIdleLockedForTest(time.Now(), 0)
+	select {
+	case <-base.GetCloserCtx().Done():
+	default:
+		t.Fatal("expired pooled ADNL survived idle pruning")
 	}
 }
 
-func TestArchiveOnlyPeerCloseClosesUnusedPooledADNL(t *testing.T) {
+func TestArchiveOnlyPeerCloseRetainsTransportUntilIdleCapEviction(t *testing.T) {
 	pool, pooled, base := newTestLeasedPooledPeer("archive-only")
 	sub := testOverlaySubscription(&overlaySubscription{
 		node: &Node{pool: pool},
@@ -529,17 +566,28 @@ func TestArchiveOnlyPeerCloseClosesUnusedPooledADNL(t *testing.T) {
 			Kind:    overlayKindPublicShard,
 		},
 	})
-	archivePeer := sub.newOverlayPeer(pooled, nil, false, true)
+	archivePeer := mustNewTestOverlayPeer(t, sub, pooled, nil, false)
 
 	closeArchiveOnlyPeer(archivePeer)
 
 	select {
 	case <-base.GetCloserCtx().Done():
+		t.Fatal("unused archive-only transport skipped the idle grace period")
 	default:
-		t.Fatal("unused archive-only pooled ADNL survived close")
+	}
+	if len(pool.snapshot()) != 1 {
+		t.Fatal("idle archive-only pooled peer was removed immediately")
+	}
+
+	pooled.touch(time.Now().Add(-peerPoolIdleTTL - time.Second))
+	pool.pruneIdleLockedForTest(time.Now(), 0)
+	select {
+	case <-base.GetCloserCtx().Done():
+	default:
+		t.Fatal("expired archive-only pooled ADNL survived pruning")
 	}
 	if len(pool.snapshot()) != 0 {
-		t.Fatal("unused archive-only pooled peer survived in pool")
+		t.Fatal("expired archive-only pooled peer survived in pool")
 	}
 }
 
@@ -856,17 +904,13 @@ func TestArchivePoolKeepsLeasedClosedPeerUntilRelease(t *testing.T) {
 	}
 	conn.Close()
 
-	if pruned := pool.pruneClosedPeers(); pruned != 0 {
-		t.Fatalf("leased closed peer was pruned before release: %d", pruned)
-	}
+	pool.pruneClosedPeers()
 	if !testArchivePoolHasPeer(pool, peer.id) {
 		t.Fatal("leased closed peer was removed before release")
 	}
 
 	release()
-	if pruned := pool.pruneClosedPeers(); pruned != 1 {
-		t.Fatalf("closed peer was not pruned after release: %d", pruned)
-	}
+	pool.pruneClosedPeers()
 	if testArchivePoolHasPeer(pool, peer.id) {
 		t.Fatal("closed peer survived release and cleanup")
 	}
@@ -886,9 +930,7 @@ func TestArchivePoolPrunesDeadUnprovenArchiveOnlyPeers(t *testing.T) {
 		peer.alive = false
 	}
 
-	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != len(peers) {
-		t.Fatalf("unexpected dead unproven archive-only prune count: got %d want %d", pruned, len(peers))
-	}
+	pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now())
 	if usable := pool.usableSize(time.Now()); usable != 0 {
 		t.Fatalf("dead unproven archive-only peers should not be usable, got %d", usable)
 	}
@@ -918,9 +960,7 @@ func TestArchivePoolKeepsLeasedAndProvenDeadArchiveOnlyPeers(t *testing.T) {
 	leased.alive = false
 	proven.alive = false
 
-	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != 0 {
-		t.Fatalf("leased/proven dead archive-only peers were pruned: %d", pruned)
-	}
+	pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now())
 	if !testArchivePoolHasPeer(pool, leased.id) {
 		t.Fatal("leased dead archive-only peer was removed")
 	}
@@ -932,9 +972,7 @@ func TestArchivePoolKeepsLeasedAndProvenDeadArchiveOnlyPeers(t *testing.T) {
 	}
 
 	release()
-	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != 1 {
-		t.Fatalf("released dead unproven archive-only peer was not pruned: %d", pruned)
-	}
+	pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now())
 	if testArchivePoolHasPeer(pool, leased.id) {
 		t.Fatal("released dead unproven archive-only peer survived prune")
 	}
@@ -1183,9 +1221,7 @@ func TestArchivePoolKeepsStaleStandbyPeersUntilUsefulReplacement(t *testing.T) {
 		pool.markSuccess(shard, peer)
 	}
 
-	if removed := pool.pruneStaleArchiveOnlyPeers(time.Now()); removed != 0 {
-		t.Fatalf("pruned stale standby peers = %d, want 0", removed)
-	}
+	pool.pruneStaleArchiveOnlyPeers()
 	if got := pool.archiveOnlySize(); got != archivePeerRosterLimit {
 		t.Fatalf("archive-only peers after stale standby prune = %d, want %d", got, archivePeerRosterLimit)
 	}
@@ -1294,9 +1330,7 @@ func TestArchiveNotAvailableBackoffIsExactDemandOnly(t *testing.T) {
 		t.Fatalf("begin old archive demand: %v", err)
 	}
 
-	if !pool.recordDemandNotAvailable(oldProbe, peer.id, archivePeerNotAvailableTTL) {
-		t.Fatal("record old archive miss")
-	}
+	pool.recordDemandNotAvailable(oldProbe, peer.id, archivePeerNotAvailableTTL)
 	releaseOld()
 	_, releaseOldRetry, err := pool.beginArchiveRequest(shard, 100)
 	if err != nil {
@@ -1312,7 +1346,7 @@ func TestArchiveNotAvailableBackoffIsExactDemandOnly(t *testing.T) {
 	if got := pool.candidatesForArchive(shard, 100); len(got) != 0 {
 		t.Fatalf("old archive miss returned %d candidates after demand restart, want 0", len(got))
 	}
-	session := (&Node{}).BeginArchiveSession()
+	session := (&Node{runCtx: context.Background()}).BeginArchiveSession()
 	defer session.Close()
 	session.selectArchivePeerFromPool(shard, peer, pool)
 	if got := pool.downloadCandidatesForArchive(session, shard, 100, pool.candidates(shard)); len(got) != 0 {
@@ -1421,7 +1455,7 @@ func TestRotatedArchivePeerNegativeCacheBlocksReconnect(t *testing.T) {
 	if !pool.recentlyRejected(peer.id, time.Now()) {
 		t.Fatal("rotated junk peer missing from negative cache")
 	}
-	if pool.scout.peerBlocked(peer.id, time.Now()) {
+	if pool.scout.retry.peerBlocked(peer.id, time.Now()) {
 		t.Fatal("archive-only rejection leaked into getRandomPeers transport backoff")
 	}
 
@@ -1571,7 +1605,10 @@ func TestArchiveDownloadCandidatesPutSelectedPeerFirst(t *testing.T) {
 func TestArchiveSessionComparativeHedgeCadence(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	selected := testArchiveCandidate("selected")
-	node := &Node{peerUse: map[PeerID]peerUse{}}
+	node := &Node{
+		runCtx:  context.Background(),
+		peerUse: map[PeerID]peerUse{},
+	}
 	session := node.BeginArchiveSession()
 	defer session.Close()
 	now := time.Now()
@@ -1612,7 +1649,7 @@ func TestArchiveDownloadCandidatesDropMissingSelectedPeer(t *testing.T) {
 	pool := testArchivePool(t, sub)
 
 	session.selectArchivePeer(shard, selected)
-	if _, ok := node.pinnedPeerIDs()[selected.id]; ok {
+	if _, ok := node.protectedPeerIDs()[selected.id]; ok {
 		t.Fatal("archive selection entered live peer protection")
 	}
 
@@ -1623,7 +1660,7 @@ func TestArchiveDownloadCandidatesDropMissingSelectedPeer(t *testing.T) {
 	if selectedID := session.selectedArchivePeerID(shard); !selectedID.IsZero() {
 		t.Fatalf("missing selected archive peer was not cleared: %s", selectedID.String())
 	}
-	if _, ok := node.pinnedPeerIDs()[selected.id]; ok {
+	if _, ok := node.protectedPeerIDs()[selected.id]; ok {
 		t.Fatal("missing selected archive peer stayed pinned")
 	}
 }
@@ -1757,7 +1794,7 @@ func TestArchiveDownloadCandidatesKeepSelectedProvenPeerAfterAnnouncementExpires
 	if len(got) != 2 || got[0] != selected {
 		t.Fatalf("recent selected archive peer should stay first, got %#v", got)
 	}
-	if _, ok := node.pinnedPeerIDs()[selected.id]; ok {
+	if _, ok := node.protectedPeerIDs()[selected.id]; ok {
 		t.Fatal("recent archive selection entered live peer protection")
 	}
 }
@@ -1967,9 +2004,7 @@ func TestArchiveInfoDoesNotKeepDeadPeerActive(t *testing.T) {
 	peer.alive = false
 	peer.statsMx.Unlock()
 
-	if pruned := pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now()); pruned != 1 {
-		t.Fatalf("ArchiveInfo-only dead peer prune count = %d, want 1", pruned)
-	}
+	pool.pruneUnprovenDeadArchiveOnlyPeers(time.Now())
 	if got := pool.candidates(shard); len(got) != 0 {
 		t.Fatalf("ArchiveInfo-only dead peer remained a candidate: %#v", got)
 	}

@@ -14,7 +14,7 @@ func (s *overlaySubscription) neighbourPeerSnapshots() []*overlayPeer {
 	peers := make([]*overlayPeer, 0, len(s.neighbours))
 	for _, id := range s.neighbours {
 		peer := s.peers[id]
-		if peer == nil || !peer.hasOpenConnection() {
+		if !peer.hasOpenConnection() {
 			continue
 		}
 		peers = append(peers, peer)
@@ -67,7 +67,7 @@ func (s *overlaySubscription) pruneNeighboursLocked() {
 	filtered := s.neighbours[:0]
 	for _, id := range s.neighbours {
 		peer := s.peers[id]
-		if peer == nil || !peer.isAliveKnownOverlayPeer(now) || !peer.hasOpenConnection() {
+		if !peer.isAliveKnownOverlayPeer(now) || !peer.hasOpenConnection() {
 			if s.lastPingedNeighbour == id {
 				s.lastPingedNeighbour = PeerID{}
 			}
@@ -96,12 +96,12 @@ func (s *overlaySubscription) reloadNeighbours() {
 	s.mx.Lock()
 
 	s.pruneNeighboursLocked()
-	protected := s.protectedPeerIDs()
+	protected := s.node.protectedPeerIDs()
 
 	exchanged := false
 	excluded := map[PeerID]struct{}{}
 	for _, peer := range candidates {
-		if peer.id.IsZero() || peer.overlay == nil {
+		if peer.id.IsZero() {
 			continue
 		}
 		if _, skip := excluded[peer.id]; skip {
@@ -165,9 +165,6 @@ func (s *overlaySubscription) worstRotatableNeighbourLocked(protected map[PeerID
 			continue
 		}
 		peer := s.peers[id]
-		if peer == nil {
-			continue
-		}
 		stats := peer.statsSnapshot()
 		if stats.unreliability > worstUnreliability {
 			worstID = id

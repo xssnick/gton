@@ -139,9 +139,7 @@ func TestStartSubscriptionSkipsStoppedNode(t *testing.T) {
 		peers:      map[PeerID]*overlayPeer{},
 		peerNotify: make(chan struct{}, 1),
 	})
-	if node.startSubscription(sub) {
-		t.Fatal("stopped node should not start overlay subscription")
-	}
+	node.startSubscription(sub)
 	if sub.stopRun() {
 		t.Fatal("stopped node should not install subscription cancel")
 	}

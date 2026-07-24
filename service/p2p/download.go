@@ -81,10 +81,10 @@ func (n *Node) ProbeBlockFull(ctx context.Context, block ton.BlockIDExt, opts Pr
 }
 
 func (n *Node) blockFullFromLocalOrOverlay(ctx context.Context, block ton.BlockIDExt, load func(context.Context, ton.BlockIDExt) (*DownloadedBlock, error)) (*DownloadedBlock, error) {
-	if cached, ok := n.cachedShardBroadcastBlock(block); ok {
+	if cached, err := n.cachedShardBroadcastBlock(block); err == nil {
 		return cached, nil
 	}
-	if cached, ok := n.cachedLocalBlockFull(ctx, block); ok {
+	if cached, err := n.cachedLocalBlockFull(ctx, block); err == nil {
 		return cached, nil
 	}
 
@@ -93,7 +93,7 @@ func (n *Node) blockFullFromLocalOrOverlay(ctx context.Context, block ton.BlockI
 		return nil, err
 	}
 	if !res.ID.Equals(&block) {
-		return nil, fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
+		return nil, fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), tnstore.FormatBlockRef(block))
 	}
 	return res, nil
 }
@@ -105,7 +105,7 @@ func (n *Node) blockFullFromOverlayOrShardBroadcast(ctx context.Context, block t
 	}
 	defer unwatch()
 
-	return raceDownloadWithBroadcastWake(ctx, wake, func() (*DownloadedBlock, bool) {
+	return raceDownloadWithBroadcastWake(ctx, wake, func() (*DownloadedBlock, error) {
 		return n.cachedShardBroadcastBlock(block)
 	}, func(downloadCtx context.Context) (*DownloadedBlock, error) {
 		return load(downloadCtx, block)
@@ -119,10 +119,10 @@ func (n *Node) blockFullFromOverlayOrShardBroadcast(ctx context.Context, block t
 func raceDownloadWithBroadcastWake(
 	ctx context.Context,
 	wake <-chan struct{},
-	cached func() (*DownloadedBlock, bool),
+	cached func() (*DownloadedBlock, error),
 	download func(context.Context) (*DownloadedBlock, error),
 ) (*DownloadedBlock, error) {
-	if block, ok := cached(); ok {
+	if block, err := cached(); err == nil {
 		return block, nil
 	}
 
@@ -142,12 +142,12 @@ func raceDownloadWithBroadcastWake(
 	for {
 		select {
 		case res := <-result:
-			if block, ok := cached(); ok {
+			if block, err := cached(); err == nil {
 				return block, nil
 			}
 			return res.block, res.err
 		case <-wake:
-			if block, ok := cached(); ok {
+			if block, err := cached(); err == nil {
 				return block, nil
 			}
 			wake = nil
@@ -157,28 +157,34 @@ func raceDownloadWithBroadcastWake(
 	}
 }
 
-func (n *Node) cachedShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, bool) {
-	if cached, err := n.shardBroadcastBlock(block); err == nil {
-		return cached, true
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
+func (n *Node) cachedShardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, error) {
+	cached, err := n.shardBroadcastBlock(block)
+	if err != nil {
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(block)).
+			Str("block", tnstore.FormatBlockRef(block)).
 			Msg("failed to load cached shard broadcast block")
+		return nil, err
 	}
-	return nil, false
+	return cached, nil
 }
 
-func (n *Node) cachedLocalBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, bool) {
-	if cached, err := n.cachedBlockFull(ctx, block); err == nil {
-		return cached, true
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
+func (n *Node) cachedLocalBlockFull(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
+	cached, err := n.cachedBlockFull(ctx, block)
+	if err != nil {
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(block)).
+			Str("block", tnstore.FormatBlockRef(block)).
 			Msg("failed to load cached full block")
+		return nil, err
 	}
-	return nil, false
+	return cached, nil
 }
 
 func (n *Node) PrefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt) error {
@@ -197,21 +203,35 @@ func (n *Node) PrefetchShardBlockFullFromBroadcastHint(ctx context.Context, bloc
 
 func (n *Node) prefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt, cacheKind string) error {
 	if isMasterchainBlock(block) {
-		return fmt.Errorf("masterchain block %s is not a shard prefetch candidate", formatBlockRef(block))
+		return fmt.Errorf("masterchain block %s is not a shard prefetch candidate", tnstore.FormatBlockRef(block))
 	}
-	if n.shardBroadcastCache != nil && n.shardBroadcastCache.HasBlock(block) {
+	if n.shardBroadcastCache.HasBlock(block) {
 		return nil
 	}
 
-	res, err := n.prefetchShardBlockFullFromOverlayOrBroadcast(ctx, block)
+	wake, unwatch := n.watchShardBroadcastBlock(block)
+	defer unwatch()
+
+	prefetchCtx, cancel := context.WithTimeout(ctx, prefetchShardBlockTimeout)
+	defer cancel()
+
+	res, err := raceDownloadWithBroadcastWake(prefetchCtx, wake, func() (*DownloadedBlock, error) {
+		return n.cachedShardBroadcastBlock(block)
+	}, func(downloadCtx context.Context) (*DownloadedBlock, error) {
+		return n.probeBlockFromOverlay(downloadCtx, block, ProbeBlockFullOptions{
+			PeerLimit:       prefetchShardBlockPeers,
+			StagedPeerLimit: prefetchShardBlockWidePeers,
+			StageDelay:      prefetchShardBlockStageDelay,
+		})
+	})
 	if err != nil {
 		return err
 	}
-	if res == nil {
-		return nil
-	}
 	if !res.ID.Equals(&block) {
-		return fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), formatBlockRef(block))
+		return fmt.Errorf("peer returned %s for requested block %s", res.BlockRef(), tnstore.FormatBlockRef(block))
+	}
+	if n.shardBroadcastCache.HasBlock(block) {
+		return nil
 	}
 	if cacheKind != "" {
 		res.Kind = cacheKind
@@ -221,41 +241,22 @@ func (n *Node) prefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt,
 	return nil
 }
 
-func (n *Node) prefetchShardBlockFullFromOverlayOrBroadcast(ctx context.Context, block ton.BlockIDExt) (*DownloadedBlock, error) {
-	wake, unwatch := n.watchShardBroadcastBlock(block)
-	if wake == nil {
-		return n.downloadFromOverlay(ctx, block, tonnodeapi.DownloadBlockFull{Block: block})
-	}
-	defer unwatch()
-
-	prefetchCtx, cancel := context.WithTimeout(ctx, prefetchShardBlockTimeout)
-	defer cancel()
-
-	return raceDownloadWithBroadcastWake(prefetchCtx, wake, func() (*DownloadedBlock, bool) {
-		// A prefetch only needs the block in the cache, not returned.
-		return nil, n.shardBroadcastCache.HasBlock(block)
-	}, func(downloadCtx context.Context) (*DownloadedBlock, error) {
-		return n.probeBlockFromOverlay(downloadCtx, block, ProbeBlockFullOptions{
-			PeerLimit:       prefetchShardBlockPeers,
-			StagedPeerLimit: prefetchShardBlockWidePeers,
-			StageDelay:      prefetchShardBlockStageDelay,
-		})
-	})
-}
-
 // cachedMasterchainNextBroadcast mirrors cachedShardBroadcastBlock for the
 // masterchain next-broadcast cache: unexpected lookup errors are logged and
 // treated as a miss.
-func (n *Node) cachedMasterchainNextBroadcast(prev ton.BlockIDExt) (*DownloadedBlock, bool) {
-	if cached, err := n.masterchainNextBroadcastCache.BlockAfter(prev); err == nil {
-		return cached, true
-	} else if !errors.Is(err, tnstore.ErrNotFound) {
+func (n *Node) cachedMasterchainNextBroadcast(prev ton.BlockIDExt) (*DownloadedBlock, error) {
+	cached, err := n.masterchainNextBroadcastCache.BlockAfter(prev)
+	if err != nil {
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return nil, err
+		}
 		n.log.Debug().
 			Err(err).
-			Str("prev", formatBlockRef(prev)).
+			Str("prev", tnstore.FormatBlockRef(prev)).
 			Msg("failed to load cached masterchain next broadcast block")
+		return nil, err
 	}
-	return nil, false
+	return cached, nil
 }
 
 func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
@@ -277,11 +278,11 @@ func (n *Node) ProbeNextBlockFull(ctx context.Context, prev ton.BlockIDExt, opts
 	})
 }
 
-func (n *Node) nextBlockFullFromCacheOrOverlay(ctx context.Context, prev ton.BlockIDExt, download nextBlockFullDownload) (*DownloadedBlock, error) {
+func (n *Node) nextBlockFullFromCacheOrOverlay(ctx context.Context, prev ton.BlockIDExt, download func(context.Context) (*DownloadedBlock, error)) (*DownloadedBlock, error) {
 	if n.IsOffline() {
 		return nil, ErrOffline
 	}
-	if cached, ok := n.cachedMasterchainNextBroadcast(prev); ok {
+	if cached, err := n.cachedMasterchainNextBroadcast(prev); err == nil {
 		return cached, nil
 	}
 
@@ -290,7 +291,7 @@ func (n *Node) nextBlockFullFromCacheOrOverlay(ctx context.Context, prev ton.Blo
 	} else if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
 			Err(err).
-			Str("prev", formatBlockRef(prev)).
+			Str("prev", tnstore.FormatBlockRef(prev)).
 			Msg("failed to load cached next full block")
 	}
 
@@ -301,18 +302,18 @@ func (n *Node) NextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (t
 	if n.IsOffline() {
 		return ton.BlockIDExt{}, ErrOffline
 	}
-	if cached, ok := n.cachedMasterchainNextBroadcast(prev); ok {
+	if cached, err := n.cachedMasterchainNextBroadcast(prev); err == nil {
 		return cached.ID, nil
 	}
 
 	full, err := n.localNextServedBlockFull(ctx, prev)
-	if err == nil && full != nil {
+	if err == nil {
 		return full.ID, nil
 	}
-	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
+	if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
 			Err(err).
-			Str("prev", formatBlockRef(prev)).
+			Str("prev", tnstore.FormatBlockRef(prev)).
 			Msg("failed to load cached next block description")
 	}
 
@@ -339,16 +340,14 @@ func (n *Node) downloadNextFromOverlay(ctx context.Context, prev ton.BlockIDExt)
 	return sub.downloadNextFull(ctx, prev)
 }
 
-type nextBlockFullDownload func(context.Context) (*DownloadedBlock, error)
-
-func (n *Node) downloadNextFromOverlayOrMasterBroadcast(ctx context.Context, prev ton.BlockIDExt, download nextBlockFullDownload) (*DownloadedBlock, error) {
+func (n *Node) downloadNextFromOverlayOrMasterBroadcast(ctx context.Context, prev ton.BlockIDExt, download func(context.Context) (*DownloadedBlock, error)) (*DownloadedBlock, error) {
 	wake, unwatch := n.WatchMasterchainNextBroadcastBlock(prev)
 	if wake == nil {
 		return download(ctx)
 	}
 	defer unwatch()
 
-	return raceDownloadWithBroadcastWake(ctx, wake, func() (*DownloadedBlock, bool) {
+	return raceDownloadWithBroadcastWake(ctx, wake, func() (*DownloadedBlock, error) {
 		return n.cachedMasterchainNextBroadcast(prev)
 	}, download)
 }
@@ -358,7 +357,7 @@ func (n *Node) cachedBlockFull(ctx context.Context, block ton.BlockIDExt) (*Down
 	if err != nil {
 		return nil, err
 	}
-	return downloadedBlockFromStored("local full block cache", full)
+	return decodeRawDownloadedBlock("local full block cache", full.ID, full.Proof, full.Block, full.IsLink)
 }
 
 func (n *Node) cachedNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
@@ -366,47 +365,43 @@ func (n *Node) cachedNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*D
 	if err != nil {
 		return nil, err
 	}
-	return downloadedBlockFromStored("local next block cache", full)
+	return decodeRawDownloadedBlock("local next block cache", full.ID, full.Proof, full.Block, full.IsLink)
 }
 
 func (n *Node) localServedBlockFull(ctx context.Context, block ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
-	if n.liveBlockCache != nil {
-		full, err := n.liveBlockCache.BlockFull(ctx, block)
-		if err == nil {
-			return full, nil
-		}
-		if !errors.Is(err, tnstore.ErrNotFound) {
-			return nil, err
-		}
+	full, err := n.liveBlockCache.BlockFull(ctx, block)
+	if err == nil {
+		return full, nil
 	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+
 	return n.peerStorage.BlockFull(ctx, block)
 }
 
 func (n *Node) localNextServedBlockFull(ctx context.Context, prev ton.BlockIDExt) (*tnstore.ServedBlockFull, error) {
-	if n.liveBlockCache != nil {
-		full, err := n.liveBlockCache.NextBlockFull(ctx, prev)
-		if err == nil {
-			return full, nil
-		}
-		if !errors.Is(err, tnstore.ErrNotFound) {
-			return nil, err
-		}
+	full, err := n.liveBlockCache.NextBlockFull(ctx, prev)
+	if err == nil {
+		return full, nil
 	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+
 	return n.peerStorage.NextBlockFull(ctx, prev)
 }
 
 func (n *Node) localBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
-	if n.liveBlockCache != nil {
-		data, err := n.liveBlockCache.BlockData(ctx, block)
-		if err == nil {
-			return data, nil
-		}
-		if !errors.Is(err, tnstore.ErrNotFound) {
-			return nil, err
-		}
+	data, err := n.liveBlockCache.BlockData(ctx, block)
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
 	}
 
-	data, err := n.peerStorage.BlockData(ctx, block)
+	data, err = n.peerStorage.BlockData(ctx, block)
 	if err == nil {
 		return data, nil
 	}
@@ -422,23 +417,15 @@ func (n *Node) localBlockData(ctx context.Context, block ton.BlockIDExt) ([]byte
 }
 
 func (n *Node) localBlockProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	if n.liveBlockCache != nil {
-		proof, err := n.liveBlockCache.BlockProof(ctx, kind, block)
-		if err == nil {
-			return proof, nil
-		}
-		if !errors.Is(err, tnstore.ErrNotFound) {
-			return nil, err
-		}
+	proof, err := n.liveBlockCache.BlockProof(ctx, kind, block)
+	if err == nil {
+		return proof, nil
 	}
-	return n.peerStorage.BlockProof(ctx, kind, block)
-}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
 
-func downloadedBlockFromStored(kind string, full *tnstore.ServedBlockFull) (*DownloadedBlock, error) {
-	if full == nil {
-		return nil, tnstore.ErrNotFound
-	}
-	return decodeRawDownloadedBlock(kind, full.ID, full.Proof, full.Block, full.IsLink)
+	return n.peerStorage.BlockProof(ctx, kind, block)
 }
 
 func (n *Node) downloadFromOverlay(ctx context.Context, block ton.BlockIDExt, req tl.Serializable) (*DownloadedBlock, error) {
@@ -523,7 +510,7 @@ func (s *overlaySubscription) downloadBlockFullFromPeer(ctx context.Context, req
 		return DownloadedBlock{}, err
 	}
 	if !downloaded.ID.Equals(&requested) {
-		return DownloadedBlock{}, fmt.Errorf("peer returned %s for requested block %s", downloaded.BlockRef(), formatBlockRef(requested))
+		return DownloadedBlock{}, fmt.Errorf("peer returned %s for requested block %s", downloaded.BlockRef(), tnstore.FormatBlockRef(requested))
 	}
 	s.noteChainBlockDownloadSuccess(requested, peer, downloaded, time.Since(started))
 	return *downloaded, nil
@@ -860,9 +847,6 @@ func (s *overlaySubscription) queryFromPeerWithLimits(ctx context.Context, peer 
 }
 
 func (s *overlaySubscription) handlePeerQueryFailure(peer *overlayPeer, err error) {
-	if peer == nil {
-		return
-	}
 	if errors.Is(err, context.Canceled) {
 		return
 	}
@@ -925,10 +909,6 @@ func blockDownloadParallelism(peers []*overlayPeer) int {
 }
 
 func shouldGiveFirstBlockPeerExclusiveTry(peer *overlayPeer) bool {
-	if peer == nil {
-		return false
-	}
-
 	stats := peer.statsSnapshot()
 	if !stats.alive || stats.unreliability > 0 {
 		return false
@@ -953,10 +933,6 @@ func runConcurrentBlockDownloads(ctx context.Context, peers []*overlayPeer, para
 }
 
 func noteBlockDownloadSuccess(peer *overlayPeer, block *DownloadedBlock, elapsed time.Duration) {
-	if peer == nil {
-		return
-	}
-
 	bytes := downloadedBlockPayloadBytes(block)
 	if bytes <= 0 {
 		bytes = 1
@@ -974,7 +950,7 @@ func (s *overlaySubscription) noteChainBlockDownloadSuccess(chain ton.BlockIDExt
 	noteBlockDownloadSuccess(peer, block, elapsed)
 
 	bytes := downloadedBlockPayloadBytes(block)
-	if peer == nil || bytes <= 0 || elapsed <= 0 {
+	if bytes <= 0 || elapsed <= 0 {
 		return
 	}
 	speed := float64(bytes) / elapsed.Seconds()
@@ -1033,7 +1009,7 @@ func (s *overlaySubscription) noteChainBlockDownloadSuccess(chain ton.BlockIDExt
 
 func (s *overlaySubscription) noteLiveNextDownloadSuccess(chain ton.BlockIDExt, peer *overlayPeer, block *DownloadedBlock, elapsed time.Duration, liveNotAvailableMisses int64) {
 	s.noteChainBlockDownloadSuccess(chain, peer, block, elapsed)
-	if peer == nil || !isMasterchainBlock(chain) || elapsed <= 0 {
+	if !isMasterchainBlock(chain) || elapsed <= 0 {
 		return
 	}
 
@@ -1105,9 +1081,6 @@ func liveNextAvailabilitySample(bytes int64, misses int64) float64 {
 }
 
 func (s *overlaySubscription) noteChainBlockDownloadFailure(chain ton.BlockIDExt, peer *overlayPeer, err error) {
-	if peer == nil {
-		return
-	}
 	if errors.Is(err, ErrBlockNotAvailable) {
 		s.noteChainBlockUnavailable(chain, peer)
 		return
@@ -1207,9 +1180,6 @@ func (s *overlaySubscription) clearChainBlockPeerLocked(key chainDownloadKey) {
 }
 
 func downloadedBlockPayloadBytes(block *DownloadedBlock) int64 {
-	if block == nil {
-		return 0
-	}
 	return int64(len(block.BlockBOC) + len(block.ProofBOC))
 }
 
@@ -1261,7 +1231,7 @@ func decodeDownloadedBlock(resp tl.Serializable) (*DownloadedBlock, error) {
 }
 
 func decodeCompressedBlock(data DataFullCompressed) (*DownloadedBlock, error) {
-	decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
+	decompressed, err := decompressLZ4Block(data.Compressed)
 	if err != nil {
 		return nil, fmt.Errorf("decompress tonNode.dataFullCompressed: %w", err)
 	}
@@ -1290,7 +1260,7 @@ func decodeCompressedBlock(data DataFullCompressed) (*DownloadedBlock, error) {
 }
 
 func decodeCompressedHardforkBlock(data DataFullCompressed, cause error) (*DownloadedBlock, error) {
-	decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
+	decompressed, err := decompressLZ4Block(data.Compressed)
 	if err != nil {
 		return nil, cause
 	}
@@ -1435,7 +1405,7 @@ func (n *Node) stateForCompressedBlockDecompressionPrev(ctx context.Context, pre
 		return nil, err
 	}
 	if len(meta.StateRootHash) != 32 {
-		return nil, fmt.Errorf("%w: previous state root hash is not known for %s", tnstore.ErrNotFound, formatBlockRef(prev))
+		return nil, fmt.Errorf("%w: previous state root hash is not known for %s", tnstore.ErrNotFound, tnstore.FormatBlockRef(prev))
 	}
 
 	root, err := n.storage.LoadStateCellTree(ctx, prev, meta.StateRootHash)
@@ -1565,34 +1535,34 @@ func newVerifiedDownloadedBlockWithShape(kind string, id ton.BlockIDExt, proof [
 
 	rootHash := effectiveRoot.HashKey()
 	if !bytes.Equal(rootHash[:], id.RootHash) {
-		return nil, fmt.Errorf("%s root hash mismatch for %s", kind, formatBlockRef(id))
+		return nil, fmt.Errorf("%s root hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
 	}
 
 	sum := sha256.Sum256(data)
 	if !bytes.Equal(sum[:], id.FileHash) {
-		return nil, fmt.Errorf("%s file hash mismatch for %s", kind, formatBlockRef(id))
+		return nil, fmt.Errorf("%s file hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
 	}
 
 	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
 	if err != nil {
-		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, formatBlockRef(id), err)
+		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, tnstore.FormatBlockRef(id), err)
 	}
 	if hardfork {
 		if err = blockproof.ValidateHardforkBlock(id, parsed); err != nil {
-			return nil, fmt.Errorf("%s validate hardfork block %s: %w", kind, formatBlockRef(id), err)
+			return nil, fmt.Errorf("%s validate hardfork block %s: %w", kind, tnstore.FormatBlockRef(id), err)
 		}
 	}
 	if parsed.StateUpdate == nil {
-		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
+		return nil, fmt.Errorf("%s block %s has no state update", kind, tnstore.FormatBlockRef(id))
 	}
 	if validateStateUpdate {
 		if err := cell.ValidateMerkleUpdate(parsed.StateUpdate); err != nil {
-			return nil, fmt.Errorf("%s validate state update %s: %w", kind, formatBlockRef(id), err)
+			return nil, fmt.Errorf("%s validate state update %s: %w", kind, tnstore.FormatBlockRef(id), err)
 		}
 	}
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
 	if err != nil {
-		return nil, fmt.Errorf("%s build block meta %s: %w", kind, formatBlockRef(id), err)
+		return nil, fmt.Errorf("%s build block meta %s: %w", kind, tnstore.FormatBlockRef(id), err)
 	}
 
 	return &DownloadedBlock{
@@ -1611,23 +1581,19 @@ func newVerifiedDownloadedBlockWithShape(kind string, id ton.BlockIDExt, proof [
 
 func effectiveDownloadedBlockRoot(id ton.BlockIDExt, isLink bool, root *cell.Cell) (*cell.Cell, error) {
 	if root == nil {
-		return nil, fmt.Errorf("block %s has no parsed root", formatBlockRef(id))
+		return nil, fmt.Errorf("block %s has no parsed root", tnstore.FormatBlockRef(id))
 	}
 	if !isLink || root.GetType() != cell.MerkleProofCellType {
 		return root, nil
 	}
 	unwrapped, err := cell.UnwrapProof(root, id.RootHash)
 	if err != nil {
-		return nil, fmt.Errorf("unwrap merkle proof link for %s: %w", formatBlockRef(id), err)
+		return nil, fmt.Errorf("unwrap merkle proof link for %s: %w", tnstore.FormatBlockRef(id), err)
 	}
 	return unwrapped, nil
 }
 
-func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
-	if maxSize <= 0 {
-		return nil, fmt.Errorf("invalid max size %d", maxSize)
-	}
-
+func decompressLZ4Block(data []byte) ([]byte, error) {
 	// blocks compress roughly 2-4x, so 4x the compressed size lands within
 	// one attempt for almost every payload; every retry re-decodes the whole
 	// prefix, so undershooting is far more expensive than overshooting
@@ -1635,8 +1601,8 @@ func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
 	if estimated := 4 * len(data); estimated > size {
 		size = estimated
 	}
-	if size > maxSize {
-		size = maxSize
+	if size > maxDecompressedBlockSize {
+		size = maxDecompressedBlockSize
 	}
 
 	for {
@@ -1647,13 +1613,13 @@ func decompressLZ4Block(data []byte, maxSize int) ([]byte, error) {
 			return buf[:n], nil
 		case !errors.Is(err, lz4.ErrInvalidSourceShortBuffer):
 			return nil, err
-		case size == maxSize:
-			return nil, fmt.Errorf("decompressed data exceeds %d bytes", maxSize)
+		case size == maxDecompressedBlockSize:
+			return nil, fmt.Errorf("decompressed data exceeds %d bytes", maxDecompressedBlockSize)
 		}
 
 		size *= 4
-		if size > maxSize {
-			size = maxSize
+		if size > maxDecompressedBlockSize {
+			size = maxDecompressedBlockSize
 		}
 	}
 }

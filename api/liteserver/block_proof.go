@@ -64,7 +64,7 @@ func (s *Server) prepareBlockProofRequest(ctx context.Context, query ton.GetBloc
 	if to.SeqNo > base.SeqNo {
 		return blockProofRequest{}, fmt.Errorf("target block %s is newer than reference masterchain block %s", storage.FormatBlockRef(to), storage.FormatBlockRef(base))
 	}
-	if query.Mode&0x1000 == 0 && blockIDEqual(from, to) && blockIDEqual(from, base) {
+	if query.Mode&0x1000 == 0 && blockproof.BlockIDEqual(from, to) && blockproof.BlockIDEqual(from, base) {
 		return blockProofRequest{
 			from: from,
 			to:   to,
@@ -136,9 +136,6 @@ func (s *Server) loadBlockProofBase(ctx context.Context, block ton.BlockIDExt) (
 		}
 
 		s.blockProofBasesMu.Lock()
-		if s.blockProofBases == nil {
-			s.blockProofBases = make(map[liteBlockKey]*blockProofBase)
-		}
 		if existing := s.blockProofBases[key]; existing != nil {
 			s.blockProofBasesMu.Unlock()
 			return existing, nil
@@ -192,7 +189,7 @@ func (s *Server) blockProofTargetAndBase(ctx context.Context, from ton.BlockIDEx
 }
 
 func (s *Server) checkKnownMasterBlock(base *blockProofBase, id ton.BlockIDExt) error {
-	if blockIDEqual(base.block, id) {
+	if blockproof.BlockIDEqual(base.block, id) {
 		return nil
 	}
 
@@ -200,7 +197,7 @@ func (s *Server) checkKnownMasterBlock(base *blockProofBase, id ton.BlockIDExt) 
 	if err != nil {
 		return err
 	}
-	if !blockIDEqual(old, id) {
+	if !blockproof.BlockIDEqual(old, id) {
 		return fmt.Errorf("state contains %s for seqno %d", storage.FormatBlockRef(old), id.SeqNo)
 	}
 	return nil
@@ -210,7 +207,7 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 	current := req.from
 	steps := make([]any, 0, 2)
 
-	for len(steps) < maxBlockProofLinks && !blockIDEqual(current, req.to) {
+	for len(steps) < maxBlockProofLinks && !blockproof.BlockIDEqual(current, req.to) {
 		if current.SeqNo == req.to.SeqNo {
 			return ton.PartialBlockProof{}, fmt.Errorf("cannot have two different masterchain blocks %s and %s of the same height", storage.FormatBlockRef(req.to), storage.FormatBlockRef(current))
 		}
@@ -229,7 +226,7 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 		if err != nil {
 			return ton.PartialBlockProof{}, err
 		}
-		if prevKey.SeqNo > current.SeqNo || (prevKey.SeqNo == current.SeqNo && !blockIDEqual(prevKey, current)) {
+		if prevKey.SeqNo > current.SeqNo || (prevKey.SeqNo == current.SeqNo && !blockproof.BlockIDEqual(prevKey, current)) {
 			return ton.PartialBlockProof{}, fmt.Errorf("block %s cannot be the previous key block for %s", storage.FormatBlockRef(prevKey), storage.FormatBlockRef(current))
 		}
 		if prevKey.SeqNo != current.SeqNo {
@@ -261,9 +258,9 @@ func (s *Server) blockProofChain(ctx context.Context, req blockProofRequest) (to
 	}
 
 	return ton.PartialBlockProof{
-		Complete: blockIDEqual(current, req.to),
-		From:     cloneBlockID(req.from),
-		To:       cloneBlockID(current),
+		Complete: blockproof.BlockIDEqual(current, req.to),
+		From:     blockproof.CloneBlockID(req.from),
+		To:       blockproof.CloneBlockID(current),
 		Steps:    steps,
 	}, nil
 }
@@ -312,8 +309,8 @@ func (s *Server) buildBlockProofLinkForward(ctx context.Context, from ton.BlockI
 
 	return ton.BlockLinkForward{
 		ToKeyBlock:   toParsed.Meta.Has(storage.BlockMetaIsKeyBlock),
-		From:         cloneBlockID(from),
-		To:           cloneBlockID(to),
+		From:         blockproof.CloneBlockID(from),
+		To:           blockproof.CloneBlockID(to),
 		DestProof:    destProof,
 		ConfigProof:  configProof,
 		SignatureSet: signatures,

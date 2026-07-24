@@ -30,7 +30,7 @@ func newBlockReceivedHookRunner(log zerolog.Logger, extension hooks.Extension) *
 }
 
 func (s *Service) ObserveBlockReceived(ctx context.Context, event p2p.BlockReceivedEvent) {
-	if s.blockReceivedHooks == nil || event.Downloaded == nil {
+	if s.blockReceivedHooks == nil {
 		return
 	}
 
@@ -91,9 +91,6 @@ func blockReceivedMeta(downloaded *p2p.DownloadedBlock) *storage.BlockMeta {
 }
 
 func blockReceivedPreparedMeta(block PreparedBlock) *storage.BlockMeta {
-	if block.Meta == nil {
-		return &storage.BlockMeta{ID: block.ID}
-	}
 	if !block.Meta.ID.Equals(&block.ID) {
 		cloned := block.Meta.Clone()
 		cloned.ID = block.ID

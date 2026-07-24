@@ -2,10 +2,9 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"sort"
 	"time"
 
@@ -277,7 +276,7 @@ func (s *Service) tryPersistentStateKeyBlock(
 		}
 		return savePersistentStateSerializerCursor(ctx, scheduler, cursor, block, &block, meta.GenUTime)
 	}
-	if s.haveNewerPersistentState(meta.GenUTime, latestKeyUTime) {
+	if meta.GenUTime/(1<<17) < latestKeyUTime/(1<<17) {
 		if err := s.storePersistentStateDescription(ctx, scheduler, block, meta.GenUTime, ttl); err != nil {
 			return err
 		}
@@ -294,9 +293,10 @@ func (s *Service) tryPersistentStateKeyBlock(
 		return savePersistentStateSerializerCursor(ctx, scheduler, cursor, block, &block, meta.GenUTime)
 	}
 
-	delay := time.Duration(0)
-	if !retryInterrupted && s.stateSerializer.randomDelay != nil {
-		delay = s.stateSerializer.randomDelay()
+	var delay time.Duration
+	if !retryInterrupted {
+		seconds := int64(stateSerializationMaxJitter / time.Second)
+		delay = time.Duration(rand.Int64N(seconds+1)) * time.Second
 	}
 	if delay > 0 {
 		if err := saveActivePersistentStateSerialization(ctx, scheduler, block); err != nil {
@@ -313,7 +313,7 @@ func (s *Service) tryPersistentStateKeyBlock(
 	if err != nil {
 		return err
 	}
-	if err = s.ensurePersistentStateSerializationDiskSpace(ctx, block); err != nil {
+	if err = s.ensurePersistentStateSerializationDiskSpace(ctx, block, statFSSyncDiskSpace); err != nil {
 		lease.release()
 		return err
 	}
@@ -528,10 +528,6 @@ func (s *Service) loadStateSerializationKeyBlocks(ctx context.Context, afterSeqn
 	return blocks, latestKey, latestKeyUTime, nil
 }
 
-func (s *Service) haveNewerPersistentState(currentUTime uint32, latestKeyUTime uint32) bool {
-	return currentUTime/(1<<17) < latestKeyUTime/(1<<17)
-}
-
 func (s *stateSerializer) recordAutomaticFailure(seqno uint32) (int, bool) {
 	s.attemptMu.Lock()
 	defer s.attemptMu.Unlock()
@@ -545,17 +541,4 @@ func (s *stateSerializer) resetAutomaticAttempts(seqno uint32) {
 	s.attemptMu.Lock()
 	delete(s.automaticAttempts, seqno)
 	s.attemptMu.Unlock()
-}
-
-func randomStateSerializationDelay() time.Duration {
-	seconds := int64(stateSerializationMaxJitter / time.Second)
-	if seconds <= 0 {
-		return 0
-	}
-
-	value, err := rand.Int(rand.Reader, big.NewInt(seconds+1))
-	if err != nil {
-		return time.Duration(time.Now().UnixNano()%int64(stateSerializationMaxJitter)) * time.Nanosecond
-	}
-	return time.Duration(value.Int64()) * time.Second
 }

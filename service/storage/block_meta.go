@@ -51,6 +51,30 @@ func ValidateBlockIDHashes(id ton.BlockIDExt) error {
 	return ErrInvalidBlockIDHashes
 }
 
+// ShardPrefixCandidates returns the shard IDs from the root shard to the
+// 60-bit account prefix represented by prefix.
+func ShardPrefixCandidates(workchain int32, prefix uint64) []int64 {
+	if workchain == masterchainID {
+		return []int64{masterchainShard}
+	}
+
+	shards := make([]int64, 0, 61)
+	for length := uint32(0); length <= 60; length++ {
+		shards = append(shards, AccountShardPrefix(prefix, length))
+	}
+	return shards
+}
+
+// AccountShardPrefix returns the shard ID at depth along an account prefix.
+func AccountShardPrefix(prefix uint64, depth uint32) int64 {
+	if depth == 0 {
+		return masterchainShard
+	}
+
+	x := uint64(1) << (63 - depth)
+	return int64((prefix & ^(x - 1)) | x)
+}
+
 // AccountShardCandidates returns the shard IDs along the account prefix path.
 func AccountShardCandidates(workchain int32, account []byte) []int64 {
 	if workchain == masterchainID {
@@ -60,15 +84,7 @@ func AccountShardCandidates(workchain int32, account []byte) []int64 {
 		return nil
 	}
 
-	prefix := binary.BigEndian.Uint64(account[:8])
-	shards := make([]int64, 0, 61)
-	shards = append(shards, masterchainShard)
-	for length := 1; length <= 60; length++ {
-		x := uint64(1) << (63 - uint(length))
-		shard := (prefix & ^(x - 1)) | x
-		shards = append(shards, int64(shard))
-	}
-	return shards
+	return ShardPrefixCandidates(workchain, binary.BigEndian.Uint64(account[:8]))
 }
 
 type BlockMetaFlags uint32
@@ -147,7 +163,7 @@ func (m *BlockMeta) Mark(flag BlockMetaFlags) {
 }
 
 func (m *BlockMeta) MasterchainRefKnown() bool {
-	if m == nil || (m.ID.Workchain == masterchainID && m.ID.Shard == masterchainShard) {
+	if m.ID.Workchain == masterchainID && m.ID.Shard == masterchainShard {
 		return false
 	}
 	return m.MasterchainRefSeqno != 0 || m.ID.SeqNo == 0
@@ -226,12 +242,10 @@ func MergeBlockMeta(base *BlockMeta, next *BlockMeta) *BlockMeta {
 		merged.MasterchainRefSeqno = next.MasterchainRefSeqno
 	}
 	if len(next.PrevRefs) > 0 {
-		merged.PrevRefs = make([]ton.BlockIDExt, len(next.PrevRefs))
-		copy(merged.PrevRefs, next.PrevRefs)
+		merged.PrevRefs = cloneBlockIDs(next.PrevRefs)
 	}
 	if len(next.NextRefs) > 0 {
-		merged.NextRefs = make([]ton.BlockIDExt, len(next.NextRefs))
-		copy(merged.NextRefs, next.NextRefs)
+		merged.NextRefs = cloneBlockIDs(next.NextRefs)
 	}
 	return merged
 }

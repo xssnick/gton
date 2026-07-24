@@ -16,12 +16,12 @@ func TestEnsurePersistentStateSerializationDiskSpacePassesWhenEnoughSpace(t *tes
 		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
 		syncDiskSpacePath:                  "/db",
 		minStateSerializationDiskFreeBytes: 30 << 30,
-		syncDiskSpaceProbe: func(path string) (syncDiskSpaceStatus, error) {
-			return syncDiskSpaceStatus{Path: path, AvailableBytes: 30 << 30}, nil
-		},
+	}
+	probe := func(path string) (syncDiskSpaceStatus, error) {
+		return syncDiskSpaceStatus{Path: path, AvailableBytes: 30 << 30}, nil
 	}
 
-	if err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100)); err != nil {
+	if err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe); err != nil {
 		t.Fatalf("ensure disk space: %v", err)
 	}
 	if store.calls != 0 {
@@ -44,15 +44,15 @@ func TestEnsurePersistentStateSerializationDiskSpacePrunesPreviousState(t *testi
 		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
 		syncDiskSpacePath:                  "/db",
 		minStateSerializationDiskFreeBytes: 30 << 30,
-		syncDiskSpaceProbe: func(path string) (syncDiskSpaceStatus, error) {
-			available := probes[0]
-			probes = probes[1:]
-			return syncDiskSpaceStatus{Path: path, AvailableBytes: available}, nil
-		},
+	}
+	probe := func(path string) (syncDiskSpaceStatus, error) {
+		available := probes[0]
+		probes = probes[1:]
+		return syncDiskSpaceStatus{Path: path, AvailableBytes: available}, nil
 	}
 
 	target := testBlockID(-1, topShard, 100)
-	if err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), target); err != nil {
+	if err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), target, probe); err != nil {
 		t.Fatalf("ensure disk space: %v", err)
 	}
 	if store.calls != 1 {
@@ -70,17 +70,39 @@ func TestEnsurePersistentStateSerializationDiskSpaceFailsAfterPrune(t *testing.T
 		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
 		syncDiskSpacePath:                  "/db",
 		minStateSerializationDiskFreeBytes: 30 << 30,
-		syncDiskSpaceProbe: func(path string) (syncDiskSpaceStatus, error) {
-			return syncDiskSpaceStatus{Path: path, AvailableBytes: 1 << 30}, nil
-		},
+	}
+	probe := func(path string) (syncDiskSpaceStatus, error) {
+		return syncDiskSpaceStatus{Path: path, AvailableBytes: 1 << 30}, nil
 	}
 
-	err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100))
+	err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe)
 	if !errors.Is(err, errStateSerializationLowDiskSpace) {
 		t.Fatalf("ensure disk space error = %v, want low disk space", err)
 	}
 	if store.calls != 1 {
 		t.Fatalf("emergency prune calls = %d, want 1", store.calls)
+	}
+}
+
+func TestEnsurePersistentStateSerializationDiskSpaceKeepsAllStates(t *testing.T) {
+	store := &testPreviousPersistentStatePruneStore{}
+	svc := &Service{
+		storage:                            store,
+		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
+		persistentStateKeepRecent:          PersistentStateKeepAll,
+		syncDiskSpacePath:                  "/db",
+		minStateSerializationDiskFreeBytes: 30 << 30,
+	}
+	probe := func(path string) (syncDiskSpaceStatus, error) {
+		return syncDiskSpaceStatus{Path: path, AvailableBytes: 1 << 30}, nil
+	}
+
+	err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe)
+	if !errors.Is(err, errStateSerializationLowDiskSpace) {
+		t.Fatalf("ensure disk space error = %v, want low disk space", err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("emergency prune calls = %d, want 0", store.calls)
 	}
 }
 

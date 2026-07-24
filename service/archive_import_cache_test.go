@@ -156,14 +156,20 @@ func TestDropArchiveWindowImportCacheRemovesEverySource(t *testing.T) {
 	masterReloads := 0
 	if loaded, err := cache.load(ctx, masterKey, func(context.Context) (*archiveImportResult, error) {
 		masterReloads++
-		return &archiveImportResult{}, nil
+		return &archiveImportResult{
+			stats:  &archive.ImportStats{},
+			blocks: map[storage.BlockRootHash]PreparedBlock{},
+		}, nil
 	}); err != nil || loaded.cached {
 		t.Fatalf("master cache after window drop = cached:%v err:%v", loaded.cached, err)
 	}
 	shardReloads := 0
 	if loaded, err := cache.load(ctx, shardKey, func(context.Context) (*archiveImportResult, error) {
 		shardReloads++
-		return &archiveImportResult{}, nil
+		return &archiveImportResult{
+			stats:  &archive.ImportStats{},
+			blocks: map[storage.BlockRootHash]PreparedBlock{},
+		}, nil
 	}); err != nil || loaded.cached {
 		t.Fatalf("shard cache after window drop = cached:%v err:%v", loaded.cached, err)
 	}

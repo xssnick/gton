@@ -1,9 +1,12 @@
 package p2p
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestArchiveSessionLimitsConcurrentFullHedges(t *testing.T) {
-	session := (&Node{}).BeginArchiveSession()
+	session := (&Node{runCtx: context.Background()}).BeginArchiveSession()
 	defer session.Close()
 
 	releases := make([]func(), 0, archiveConcurrentHedgeLimit)

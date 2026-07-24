@@ -166,6 +166,12 @@ func canStartExclusiveServiceTaskForTest(t *testing.T, svc *Service, task exclus
 	return nil
 }
 
+func (s *Service) exclusiveServiceTaskActive(task exclusiveServiceTask) bool {
+	s.exclusiveTaskMu.Lock()
+	defer s.exclusiveTaskMu.Unlock()
+	return s.exclusiveTask == task
+}
+
 type exclusiveTaskTestStorage struct {
 	storage.Storage
 	maxReadAmp int64

@@ -140,23 +140,23 @@ func liveBlockCacheProofs(proofs []LiveBlockProofArtifact) map[ServedProofKind][
 }
 
 func (c *LiveBlockCache) BlockFull(_ context.Context, block ton.BlockIDExt) (*ServedBlockFull, error) {
-	cached, kind, ok := c.cachedBlockFull(block)
-	if !ok {
-		return nil, ErrNotFound
+	cached, kind, err := c.cachedBlockFull(block)
+	if err != nil {
+		return nil, err
 	}
 	return &ServedBlockFull{
 		ID:     cached.id,
 		Block:  cached.data,
 		Proof:  cached.proofs[kind],
 		Meta:   cached.meta.Clone(),
-		IsLink: liveBlockCacheProofIsLink(kind),
+		IsLink: kind == ServedProofBlockLink || kind == ServedProofKeyBlockLink,
 	}, nil
 }
 
 func (c *LiveBlockCache) NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*ServedBlockFull, error) {
-	next, ok := c.nextBlock(prev)
-	if !ok {
-		return nil, ErrNotFound
+	next, err := c.nextBlock(prev)
+	if err != nil {
+		return nil, err
 	}
 	return c.BlockFull(ctx, next)
 }
@@ -170,8 +170,8 @@ func (c *LiveBlockCache) BlockData(ctx context.Context, block ton.BlockIDExt) ([
 }
 
 func (c *LiveBlockCache) CachedBlockData(_ context.Context, block ton.BlockIDExt) (CachedBlockData, error) {
-	cached, ok := c.cachedBlock(block)
-	if !ok || len(cached.data) == 0 {
+	cached, err := c.cachedBlock(block)
+	if err != nil || len(cached.data) == 0 {
 		return CachedBlockData{}, ErrNotFound
 	}
 	return CachedBlockData{
@@ -181,14 +181,14 @@ func (c *LiveBlockCache) CachedBlockData(_ context.Context, block ton.BlockIDExt
 }
 
 func (c *LiveBlockCache) HasBlockData(block ton.BlockIDExt) bool {
-	cached, ok := c.cachedBlock(block)
-	return ok && len(cached.data) > 0
+	cached, err := c.cachedBlock(block)
+	return err == nil && len(cached.data) > 0
 }
 
 func (c *LiveBlockCache) BlockProof(_ context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	cached, ok := c.cachedBlock(block)
-	if !ok {
-		return nil, ErrNotFound
+	cached, err := c.cachedBlock(block)
+	if err != nil {
+		return nil, err
 	}
 	proof := cached.proofs[kind]
 	if len(proof) == 0 {
@@ -198,7 +198,7 @@ func (c *LiveBlockCache) BlockProof(_ context.Context, kind ServedProofKind, blo
 }
 
 func (c *LiveBlockCache) MarkBlockFlushed(block ton.BlockIDExt) {
-	if c == nil || !BlockIDHashesKnown(block) {
+	if !BlockIDHashesKnown(block) {
 		return
 	}
 
@@ -208,39 +208,35 @@ func (c *LiveBlockCache) MarkBlockFlushed(block ton.BlockIDExt) {
 	c.publishMu.Unlock()
 }
 
-func (c *LiveBlockCache) cachedBlock(block ton.BlockIDExt) (*LiveBlockCacheBlock, bool) {
-	if c == nil {
-		return nil, false
-	}
-
+func (c *LiveBlockCache) cachedBlock(block ton.BlockIDExt) (*LiveBlockCacheBlock, error) {
 	loaded, ok := c.blocks.Load(BlockKey(block))
 	if !ok {
-		return nil, false
+		return nil, ErrNotFound
 	}
 	cached := loaded.(*LiveBlockCacheBlock)
 	if !blockIDMatchesRootKey(cached.id, block) {
-		return nil, false
+		return nil, ErrNotFound
 	}
-	return cached, true
+	return cached, nil
 }
 
-func (c *LiveBlockCache) cachedBlockFull(block ton.BlockIDExt) (*LiveBlockCacheBlock, ServedProofKind, bool) {
-	cached, ok := c.cachedBlock(block)
-	if !ok || len(cached.data) == 0 {
-		return nil, "", false
+func (c *LiveBlockCache) cachedBlockFull(block ton.BlockIDExt) (*LiveBlockCacheBlock, ServedProofKind, error) {
+	cached, err := c.cachedBlock(block)
+	if err != nil || len(cached.data) == 0 {
+		return nil, "", ErrNotFound
 	}
 
-	kind, ok := liveBlockCacheProofKind(cached)
-	if !ok {
-		return nil, "", false
+	kind, err := liveBlockCacheProofKind(cached)
+	if err != nil {
+		return nil, "", err
 	}
-	return cached, kind, true
+	return cached, kind, nil
 }
 
-func liveBlockCacheProofKind(block *LiveBlockCacheBlock) (ServedProofKind, bool) {
+func liveBlockCacheProofKind(block *LiveBlockCacheBlock) (ServedProofKind, error) {
 	for _, kind := range ProofCandidates(block.meta) {
 		if len(block.proofs[kind]) > 0 {
-			return kind, true
+			return kind, nil
 		}
 	}
 
@@ -251,30 +247,22 @@ func liveBlockCacheProofKind(block *LiveBlockCacheBlock) (ServedProofKind, bool)
 		ServedProofKeyBlockLink,
 	} {
 		if len(block.proofs[kind]) > 0 {
-			return kind, true
+			return kind, nil
 		}
 	}
-	return "", false
+	return "", ErrNotFound
 }
 
-func liveBlockCacheProofIsLink(kind ServedProofKind) bool {
-	return kind == ServedProofBlockLink || kind == ServedProofKeyBlockLink
-}
-
-func (c *LiveBlockCache) nextBlock(prev ton.BlockIDExt) (ton.BlockIDExt, bool) {
-	if c == nil {
-		return ton.BlockIDExt{}, false
-	}
-
+func (c *LiveBlockCache) nextBlock(prev ton.BlockIDExt) (ton.BlockIDExt, error) {
 	loaded, ok := c.nextBlocks.Load(BlockKey(prev))
 	if !ok {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, ErrNotFound
 	}
 	cached := loaded.(liveBlockCacheNext)
 	if !blockIDMatchesRootKey(cached.prev, prev) {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, ErrNotFound
 	}
-	return cached.next, true
+	return cached.next, nil
 }
 
 func (c *LiveBlockCache) setNextBlockLocked(prev ton.BlockIDExt, next ton.BlockIDExt) {

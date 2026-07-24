@@ -26,9 +26,6 @@ func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.D
 }
 
 func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) (*archive.Imported, error) {
-	if downloaded == nil {
-		return nil, archive.ErrNotAvailable
-	}
 	if len(downloaded.Data) == 0 {
 		return nil, fmt.Errorf("import archive: empty downloaded archive data")
 	}
@@ -41,7 +38,7 @@ func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) 
 }
 
 func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, imported *archive.Imported, result *archiveImportResult) {
-	if s.blockReceivedHooks == nil || imported == nil || result == nil {
+	if s.blockReceivedHooks == nil {
 		return
 	}
 
@@ -61,9 +58,6 @@ func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, impo
 }
 
 func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, splitDepth uint32) (*archiveImportResult, error) {
-	if imported == nil {
-		return nil, fmt.Errorf("import archive: empty imported data")
-	}
 	if imported.Stats == nil {
 		return nil, fmt.Errorf("import archive: empty stats")
 	}

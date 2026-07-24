@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -39,7 +40,7 @@ type detectedHash struct {
 }
 
 func (s *Server) handleDetectAddress(_ context.Context, params requestParams) (any, *apiError) {
-	addr, givenType, _, apiErr := parseStdAddressParam(params, "address")
+	addr, givenType, apiErr := parseStdAddressParam(params, "address")
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -108,15 +109,15 @@ func parseAddressParam(params requestParams, name string) (*address.Address, str
 	return addr, givenType, raw, nil
 }
 
-func parseStdAddressParam(params requestParams, name string) (*address.Address, string, string, *apiError) {
+func parseStdAddressParam(params requestParams, name string) (*address.Address, string, *apiError) {
 	addr, givenType, raw, apiErr := parseAddressParam(params, name)
 	if apiErr != nil {
-		return nil, "", "", apiErr
+		return nil, "", apiErr
 	}
 	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
-		return nil, "", "", addressParamError(params, name, raw)
+		return nil, "", addressParamError(params, name, raw)
 	}
-	return addr, givenType, raw, nil
+	return addr, givenType, nil
 }
 
 func addressParamString(params requestParams, name string) (string, *apiError) {
@@ -124,8 +125,8 @@ func addressParamString(params requestParams, name string) (string, *apiError) {
 		return params.requiredString(name)
 	}
 
-	raw, _, err := params.stringValue(name)
-	if err != nil {
+	raw, err := params.stringValue(name)
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
 		return "", validationError("failed to parse get request: " + err.Error())
 	}
 	return raw, nil
@@ -162,15 +163,15 @@ func parseAddress(raw string) (*address.Address, string, error) {
 }
 
 func requiredHashParam(params requestParams, name string) ([]byte, *apiError) {
-	raw, ok, apiErr := params.optionalNonEmptyString(name)
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	if !ok {
+	raw, err := params.optionalNonEmptyString(name)
+	if errors.Is(err, errRequestParamNotFound) {
 		if params.isPost() {
 			return nil, params.postFieldError(name, "Field is missing")
 		}
 		return nil, validationError("empty " + name)
+	}
+	if err != nil {
+		return nil, asAPIError(err)
 	}
 
 	hash, err := parseHash(raw)

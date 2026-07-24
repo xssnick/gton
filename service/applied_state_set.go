@@ -32,10 +32,6 @@ type appliedStateCheckpoint struct {
 }
 
 func (s *appliedStateSet) rememberWithArtifacts(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
-	if state == nil {
-		return
-	}
-
 	s.rememberEntry(appliedStateEntry{
 		state:    checkpointBlockStateMetadata(state),
 		artifact: appliedBlockArtifactFrom(artifact, links).clone(),
@@ -137,9 +133,6 @@ func sortedStateEntryKeys(entries map[storage.BlockRootHash]appliedStateEntry) [
 }
 
 func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
-	if entry.state == nil {
-		return
-	}
 	if s.states == nil {
 		s.states = map[storage.BlockRootHash]appliedStateEntry{}
 	}
@@ -170,9 +163,6 @@ func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
 }
 
 func checkpointBlockStateMetadata(state *storage.BlockState) *storage.BlockState {
-	if state == nil {
-		return nil
-	}
 	metadata := storage.BlockStateWithoutCells(state)
 	if len(metadata.StateRootHash) == 0 && state.Cell != nil {
 		hash := state.Cell.HashKey(0)

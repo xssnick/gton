@@ -2,16 +2,18 @@ package p2p
 
 import (
 	"crypto/sha256"
-	"github.com/xssnick/gton/service/archive"
-	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 func init() {
-	tl.Register(OverlayBroadcastID{}, "overlay.broadcast.id src:int256 data_hash:int256 flags:int = overlay.broadcast.Id")
+	// Keep the released Go type serializable without replacing tonutils-go's
+	// canonical overlay.broadcast.id registration. The explicit constructor ID
+	// is the CRC of the canonical schema, so boxed bytes remain identical.
+	tl.Register(OverlayBroadcastID{}, "gton.overlayBroadcastID#51fd789a src:int256 data_hash:int256 flags:int = overlay.broadcast.Id")
 	tl.Register(BlockDescriptionEmpty{}, "tonNode.blockDescriptionEmpty = tonNode.BlockDescription")
 	tl.Register(BlockDescription{}, "tonNode.blockDescription id:tonNode.blockIdExt = tonNode.BlockDescription")
 	tl.Register(GetNextBlockDescription{}, "tonNode.getNextBlockDescription prev_block:tonNode.blockIdExt = tonNode.BlockDescription")
@@ -103,18 +105,6 @@ type SendExtMessage struct {
 type BlockFinalityBroadcast struct {
 	ID           ton.BlockIDExt `tl:"struct"`
 	SignatureSet any            `tl:"struct boxed [tonNode.signatureSet.ordinary,tonNode.signatureSet.simplex]"`
-}
-
-func checkSimpleBroadcastDate(ts int32) bool {
-	now := time.Now()
-	at := time.Unix(int64(ts), 0)
-	if at.Before(now.Add(-simpleBroadcastSkew)) {
-		return false
-	}
-	if at.After(now.Add(simpleBroadcastSkew)) {
-		return false
-	}
-	return true
 }
 
 func hashSimpleBroadcastPayload(data []byte) []byte {

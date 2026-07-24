@@ -20,9 +20,10 @@ const (
 	maxPeersPerOverlay    = 20
 	maxQueryNeighbours    = 16
 	maxOverlayPayloadSize = 16 << 20
+	peerPoolIdleTTL       = 130 * time.Second
+	peerPoolMaxIdle       = 2048
 	// C++ private overlays set the RLDP2 peer MTU to max broadcast size + 1024.
 	maxRLDPTwoStepTransferSize = maxOverlayPayloadSize + 1024
-	simpleBroadcastSkew        = 20 * time.Second
 	dhtRefreshInterval         = 90 * time.Second
 	peerRefreshMinDelay        = time.Second
 	peerRefreshJitter          = 0
@@ -156,7 +157,7 @@ type BroadcastAdmission interface {
 }
 
 func (e BroadcastEvent) BlockRef() string {
-	return formatBlockRef(e.Block)
+	return storage.FormatBlockRef(e.Block)
 }
 
 type Options struct {
@@ -354,11 +355,7 @@ type DownloadedBlock struct {
 }
 
 func (b DownloadedBlock) BlockRef() string {
-	return formatBlockRef(b.ID)
-}
-
-func formatBlockRef(block ton.BlockIDExt) string {
-	return storage.FormatBlockRef(block)
+	return storage.FormatBlockRef(b.ID)
 }
 
 func blockWithEffectiveShard(block ton.BlockIDExt, effectiveShard int64) ton.BlockIDExt {
@@ -369,5 +366,5 @@ func blockWithEffectiveShard(block ton.BlockIDExt, effectiveShard int64) ton.Blo
 }
 
 func formatPersistentStateBlockRef(block ton.BlockIDExt, effectiveShard int64) string {
-	return formatBlockRef(blockWithEffectiveShard(block, effectiveShard))
+	return storage.FormatBlockRef(blockWithEffectiveShard(block, effectiveShard))
 }

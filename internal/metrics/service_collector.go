@@ -89,19 +89,19 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		syncRecentTPS: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "sync", "recent_tps"),
-			"Recent local TPS over the service status window.",
+			"Average live applied-block TPS over the last 10 seconds by block generation time.",
 			nil,
 			nil,
 		),
 		syncRecentTx: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "sync", "recent_transactions"),
-			"Recent local transaction count over the service status window.",
+			"Live applied-block transactions in the last 10 seconds by block generation time.",
 			nil,
 			nil,
 		),
 		syncRecentComplete: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "sync", "recent_tps_complete"),
-			"Whether the recent TPS status window was fully available.",
+			"Whether the 10-second live applied-block TPS window was fully observed.",
 			nil,
 			nil,
 		),
@@ -295,7 +295,7 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *serviceCollector) Collect(ch chan<- prometheus.Metric) {
-	snapshot := c.metrics.serviceStatus()
+	snapshot := c.metrics.serviceStatusReader()
 
 	now := time.Now()
 	c.collectSync(ch, snapshot, now)
@@ -321,12 +321,12 @@ func (c *serviceCollector) collectSync(ch chan<- prometheus.Metric, snapshot ser
 		}
 	}
 
-	if snapshot.RecentTPS.WindowMasters > 0 {
-		ch <- prometheus.MustNewConstMetric(c.syncRecentTPS, prometheus.GaugeValue, snapshot.RecentTPS.TPS)
-		ch <- prometheus.MustNewConstMetric(c.syncRecentTx, prometheus.GaugeValue, float64(snapshot.RecentTPS.Transactions))
+	if snapshot.RecentTPS.DurationSeconds > 0 {
 		complete := 0.0
 		if snapshot.RecentTPS.Complete {
 			complete = 1
+			ch <- prometheus.MustNewConstMetric(c.syncRecentTPS, prometheus.GaugeValue, snapshot.RecentTPS.TPS)
+			ch <- prometheus.MustNewConstMetric(c.syncRecentTx, prometheus.GaugeValue, float64(snapshot.RecentTPS.Transactions))
 		}
 		ch <- prometheus.MustNewConstMetric(c.syncRecentComplete, prometheus.GaugeValue, complete)
 	}

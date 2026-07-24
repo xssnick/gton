@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/gton/service/storage"
@@ -95,11 +96,26 @@ func (s *Store) clearPackDeletePending(paths []string) error {
 }
 
 func (s *Store) packJournalPath(path string) (string, error) {
-	relPath, ok := s.archivePackArtifactPath(path)
-	if !ok {
+	if path == "" {
 		return "", fmt.Errorf("artifact path is not an archive pack: %s", path)
 	}
-	return relPath, nil
+	if filepath.IsAbs(path) {
+		relPath, err := s.relativeArtifactPath(path)
+		if err != nil {
+			return "", err
+		}
+		path = relPath
+	}
+
+	clean := filepath.Clean(path)
+	slashPath := filepath.ToSlash(clean)
+	if strings.HasPrefix(slashPath, "../") || strings.HasPrefix(slashPath, "/") {
+		return "", fmt.Errorf("artifact path is not an archive pack: %s", path)
+	}
+	if !strings.HasPrefix(slashPath, "archive/packages/") || !strings.HasSuffix(slashPath, ".pack") {
+		return "", fmt.Errorf("artifact path is not an archive pack: %s", path)
+	}
+	return filepath.FromSlash(slashPath), nil
 }
 
 func decodePackJournalPath(prefix []byte, key []byte) (string, error) {

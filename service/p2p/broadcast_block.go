@@ -18,8 +18,14 @@ import (
 
 var errBroadcastSignatureSetUnsupported = errors.New("broadcast signature set is not supported")
 var errBroadcastSignatureSetNonFinal = errors.New("broadcast signature set is not final")
+var errBlockBroadcastSignatureCheckNotApplicable = errors.New("block broadcast signature check is not applicable")
 var errBroadcastDecompressionStateNotReady = errors.New("compressed broadcast previous state is not ready")
 var errBlockFileHashMismatch = errors.New("file hash mismatch")
+
+type predecodedBlockBroadcastSignatureCheck struct {
+	proofRoot    *cell.Cell
+	signatureSet *blockproof.ValidatorSignatureSet
+}
 
 type broadcastDecompressionStateNotReadyError struct {
 	err       error
@@ -98,33 +104,39 @@ func decodeBroadcastBlock(msg any) (*DownloadedBlock, *blockproof.ValidatorSigna
 	}
 }
 
-func predecodeBlockBroadcastSignatureCheck(block ton.BlockIDExt, msg any) (*cell.Cell, *blockproof.ValidatorSignatureSet, bool, error) {
+func predecodeBlockBroadcastSignatureCheck(block ton.BlockIDExt, msg any) (predecodedBlockBroadcastSignatureCheck, error) {
 	switch data := msg.(type) {
 	case tonnodeapi.BlockBroadcast:
 		proofRoot, err := parseDownloadedBlockProof(data.Proof)
 		if err != nil {
-			return nil, nil, true, fmt.Errorf("parse tonNode.blockBroadcast proof: %w", err)
+			return predecodedBlockBroadcastSignatureCheck{}, fmt.Errorf("parse tonNode.blockBroadcast proof: %w", err)
 		}
 		signatures, err := ordinaryBroadcastValidatorSignatureSet(data.CatchainSeqno, data.ValidatorSetHash, data.Signatures)
 		if err != nil {
-			return nil, nil, true, err
+			return predecodedBlockBroadcastSignatureCheck{}, err
 		}
-		return proofRoot, signatures, true, nil
+		return predecodedBlockBroadcastSignatureCheck{
+			proofRoot:    proofRoot,
+			signatureSet: signatures,
+		}, nil
 	case tonnodeapi.BlockBroadcastCompressedV2:
 		proofRoot, err := parseDownloadedBlockProof(data.Proof)
 		if err != nil {
-			return nil, nil, true, fmt.Errorf("parse tonNode.blockBroadcastCompressedV2 proof: %w", err)
+			return predecodedBlockBroadcastSignatureCheck{}, fmt.Errorf("parse tonNode.blockBroadcastCompressedV2 proof: %w", err)
 		}
 		signatures, err := broadcastSignatureSetFromTL(data.SignatureSet)
 		if err != nil {
-			return nil, nil, true, err
+			return predecodedBlockBroadcastSignatureCheck{}, err
 		}
 		if isMasterchainBlock(block) && !signatures.Final() {
-			return nil, nil, true, errBroadcastSignatureSetNonFinal
+			return predecodedBlockBroadcastSignatureCheck{}, errBroadcastSignatureSetNonFinal
 		}
-		return proofRoot, signatures, true, nil
+		return predecodedBlockBroadcastSignatureCheck{
+			proofRoot:    proofRoot,
+			signatureSet: signatures,
+		}, nil
 	default:
-		return nil, nil, false, nil
+		return predecodedBlockBroadcastSignatureCheck{}, errBlockBroadcastSignatureCheckNotApplicable
 	}
 }
 
@@ -133,7 +145,7 @@ func decodeBlockCandidateBroadcast(msg any) (*DownloadedBlock, error) {
 	case tonnodeapi.NewBlockCandidateBroadcast:
 		return decodeRawBlockCandidateBroadcast("tonNode.newBlockCandidateBroadcast", data.ID, data.Data)
 	case tonnodeapi.NewBlockCandidateBroadcastCompressed:
-		decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
+		decompressed, err := decompressLZ4Block(data.Compressed)
 		if err != nil {
 			return nil, fmt.Errorf("decompress tonNode.newBlockCandidateBroadcastCompressed: %w", err)
 		}
@@ -191,20 +203,20 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 
 	rootHash := effectiveRoot.HashKey()
 	if !bytes.Equal(rootHash[:], id.RootHash) {
-		return nil, fmt.Errorf("%s root hash mismatch for %s", kind, formatBlockRef(id))
+		return nil, fmt.Errorf("%s root hash mismatch for %s", kind, tnstore.FormatBlockRef(id))
 	}
 
 	sum := sha256.Sum256(data)
 	if !bytes.Equal(sum[:], id.FileHash) {
-		return nil, fmt.Errorf("%s %w for %s", kind, errBlockFileHashMismatch, formatBlockRef(id))
+		return nil, fmt.Errorf("%s %w for %s", kind, errBlockFileHashMismatch, tnstore.FormatBlockRef(id))
 	}
 
 	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
 	if err != nil {
-		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, formatBlockRef(id), err)
+		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, tnstore.FormatBlockRef(id), err)
 	}
 	if parsed.StateUpdate == nil {
-		return nil, fmt.Errorf("%s block %s has no state update", kind, formatBlockRef(id))
+		return nil, fmt.Errorf("%s block %s has no state update", kind, tnstore.FormatBlockRef(id))
 	}
 	// The standalone merkle-update walk is intentionally skipped: candidate
 	// content is anchored by the root/file hash checks above, the finality
@@ -213,7 +225,7 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 	// candidate-origin updates itself before building speculative state.
 	meta, err := tnstore.BuildBlockMetaFromParsedBlock(id, parsed)
 	if err != nil {
-		return nil, fmt.Errorf("%s build block meta %s: %w", kind, formatBlockRef(id), err)
+		return nil, fmt.Errorf("%s build block meta %s: %w", kind, tnstore.FormatBlockRef(id), err)
 	}
 
 	return &DownloadedBlock{
@@ -228,7 +240,7 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 }
 
 func decodeBlockBroadcastCompressed(data tonnodeapi.BlockBroadcastCompressed) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
-	decompressed, err := decompressLZ4Block(data.Compressed, maxDecompressedBlockSize)
+	decompressed, err := decompressLZ4Block(data.Compressed)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decompress tonNode.blockBroadcastCompressed: %w", err)
 	}
@@ -301,9 +313,6 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 		}
 		return nil, nil, err
 	}
-	if state == nil {
-		return nil, nil, errBroadcastDecompressionStateNotReady
-	}
 	downloaded, sigSet, err := decodeBlockBroadcastCompressedV2WithProofRoot(data, state, proofRoot, signatures)
 	if err == nil {
 		n.scheduleCompressedStateChain(state, downloaded)
@@ -321,13 +330,10 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 // IDs only occupy bounded TTL'd cache slots nobody asks for. The apply
 // pipeline later overwrites the entry with the canonical state.
 func (n *Node) scheduleCompressedStateChain(prevState *cell.Cell, downloaded *DownloadedBlock) {
-	if n.compressedState == nil || prevState == nil || downloaded == nil || downloaded.StateUpdate == nil {
+	if n.compressedState == nil {
 		return
 	}
 	meta := downloaded.Meta
-	if meta == nil || len(meta.StateRootHash) != 32 {
-		return
-	}
 
 	block := downloaded.ID
 	update := downloaded.StateUpdate
@@ -337,14 +343,14 @@ func (n *Node) scheduleCompressedStateChain(prevState *cell.Cell, downloaded *Do
 		if err != nil {
 			n.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(block)).
+				Str("block", tnstore.FormatBlockRef(block)).
 				Msg("skip compressed state chain: merkle update does not apply")
 			return
 		}
 		nextHash := next.HashKey(0)
 		if !bytes.Equal(nextHash[:], stateRootHash) {
 			n.log.Debug().
-				Str("block", formatBlockRef(block)).
+				Str("block", tnstore.FormatBlockRef(block)).
 				Msg("skip compressed state chain: state root hash mismatch")
 			return
 		}

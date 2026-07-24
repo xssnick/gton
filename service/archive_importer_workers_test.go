@@ -8,7 +8,23 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/p2p"
 )
+
+func newTestArchiveSession(t *testing.T) *p2p.ArchiveSession {
+	t.Helper()
+
+	node, err := p2p.New(p2p.Options{
+		Storage:       openTestPebbleStorage(t),
+		StateFilesDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("new archive session node: %v", err)
+	}
+	session := node.BeginArchiveSession()
+	t.Cleanup(session.Close)
+	return session
+}
 
 func TestArchiveDownloadWorkersUsesNetworkWorkerBudget(t *testing.T) {
 	old := runtime.GOMAXPROCS(2)
@@ -103,7 +119,7 @@ func TestArchiveDownloadBackpressureGateWaitsUntilResumed(t *testing.T) {
 
 	waitDone := make(chan error, 1)
 	go func() {
-		waitDone <- runner.waitArchiveDownloadBackpressure(context.Background())
+		waitDone <- runner.downloadGate.wait(context.Background())
 	}()
 
 	select {
@@ -125,7 +141,7 @@ func TestArchiveDownloadBackpressureGateWaitsUntilResumed(t *testing.T) {
 }
 
 func TestArchiveImportQueueDownloadJobWaitsForCheckpointBackpressure(t *testing.T) {
-	runner := &archiveCatchUpRunner{}
+	runner := &archiveCatchUpRunner{archiveSession: newTestArchiveSession(t)}
 	resume := runner.pauseArchiveDownloadsForCheckpointBackpressure()
 	t.Cleanup(resume)
 

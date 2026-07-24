@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -27,7 +29,7 @@ func (n *Node) NextKeyBlocks(ctx context.Context, block ton.BlockIDExt, limit in
 		return KeyBlockBatch{}, ErrOffline
 	}
 	if block.Workchain != -1 || block.Shard != topShard {
-		return KeyBlockBatch{}, fmt.Errorf("next key block lookup requires masterchain block, got %s", formatBlockRef(block))
+		return KeyBlockBatch{}, fmt.Errorf("next key block lookup requires masterchain block, got %s", storage.FormatBlockRef(block))
 	}
 
 	if limit <= 0 {

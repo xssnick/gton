@@ -167,10 +167,14 @@ func ValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, valida
 func ValidatorSetHash(ccSeqno uint32, validators []*tlb.ValidatorAddr) (uint32, error) {
 	items := make([]ton.ValidatorItemHashable, len(validators))
 	for i, validator := range validators {
+		adnlAddr := validator.ADNLAddr
+		if len(adnlAddr) == 0 {
+			adnlAddr = make([]byte, 32)
+		}
 		items[i] = ton.ValidatorItemHashable{
-			Key:    bytes.Clone(validator.PublicKey.Key),
+			Key:    validator.PublicKey.Key,
 			Weight: validator.Weight,
-			Addr:   normalizeADNLAddr(validator.ADNLAddr),
+			Addr:   adnlAddr,
 		}
 	}
 

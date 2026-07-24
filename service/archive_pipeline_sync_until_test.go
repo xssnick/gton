@@ -21,7 +21,7 @@ func TestApplyArchiveMasterBlocksMarksSyncUntilOnWindow(t *testing.T) {
 		}},
 		masterStates:  map[uint32]*storage.BlockState{},
 		archiveBlocks: map[storage.BlockRootHash]PreparedBlock{},
-		stateCells:    newStateCellWindowCache(nil),
+		stateCells:    newTestStateCellWindowCache(nil),
 	}
 	runner := &archiveCatchUpRunner{
 		service: &Service{syncUntil: syncUntil},

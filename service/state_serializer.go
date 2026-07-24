@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -41,7 +42,6 @@ type stateSerializer struct {
 	disableAutomatic      bool
 	largeBOCBatchSize     int
 	stateSerializeOnePass bool
-	randomDelay           func() time.Duration
 
 	mu        sync.Mutex
 	activeRun *stateSerializationRun
@@ -90,15 +90,11 @@ func newStateSerializer(logger zerolog.Logger, store storage.Storage, dir string
 		disableAutomatic:      disableAutomatic,
 		largeBOCBatchSize:     largeBOCBatchSize,
 		stateSerializeOnePass: stateSerializeOnePass,
-		randomDelay:           randomStateSerializationDelay,
 		automaticAttempts:     make(map[uint32]int),
 	}
 }
 
 func (s *Service) StartPersistentStateSerialization(ctx context.Context, masterSeqno uint32, scope PersistentStateSerializationScope) error {
-	if s.stateSerializer == nil {
-		return errStateSerializationDir
-	}
 	if !scope.valid() {
 		return fmt.Errorf("unknown persistent state serialization scope: %d", scope)
 	}
@@ -112,7 +108,7 @@ func (s *Service) StartPersistentStateSerialization(ctx context.Context, masterS
 		lease.release()
 		return err
 	}
-	if err = s.ensurePersistentStateSerializationDiskSpace(ctx, master); err != nil {
+	if err = s.ensurePersistentStateSerializationDiskSpace(ctx, master, statFSSyncDiskSpace); err != nil {
 		lease.release()
 		return err
 	}
@@ -124,10 +120,22 @@ func (s *Service) StartPersistentStateSerialization(ctx context.Context, masterS
 }
 
 func (s *Service) CancelPersistentStateSerialization(ctx context.Context) error {
-	if s.stateSerializer == nil {
-		return errStateSerializationDir
+	s.stateSerializer.mu.Lock()
+	run := s.stateSerializer.activeRun
+	if run == nil {
+		s.stateSerializer.mu.Unlock()
+		return errStateSerializationNotRunning
 	}
-	return s.stateSerializer.cancel(ctx)
+	done := run.done
+	run.cancel(errStateSerializationCanceled)
+	s.stateSerializer.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return run.cleanupErr
+	}
 }
 
 func (s PersistentStateSerializationScope) valid() bool {
@@ -248,25 +256,6 @@ func (s *stateSerializer) acquire(ctx context.Context, master ton.BlockIDExt, sc
 	}
 	s.activeRun = run
 	return runCtx, run, nil
-}
-
-func (s *stateSerializer) cancel(ctx context.Context) error {
-	s.mu.Lock()
-	run := s.activeRun
-	if run == nil {
-		s.mu.Unlock()
-		return errStateSerializationNotRunning
-	}
-	done := run.done
-	run.cancel(errStateSerializationCanceled)
-	s.mu.Unlock()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		return run.cleanupErr
-	}
 }
 
 func (s *stateSerializer) finishRun(ctx context.Context, run *stateSerializationRun, err error) error {
@@ -1038,6 +1027,13 @@ func syncDir(path string) error {
 		return err
 	}
 	defer func() { _ = file.Close() }()
+
+	// Windows does not support flushing directory handles. Opening the
+	// directory above still validates that it exists and is accessible.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
 	if err = file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
 		return err
 	}

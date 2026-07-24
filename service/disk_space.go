@@ -16,20 +16,10 @@ type syncDiskSpaceStatus struct {
 
 type syncDiskSpaceProbe func(path string) (syncDiskSpaceStatus, error)
 
-func (s *Service) waitSyncDiskSpace(ctx context.Context, flow string) error {
+func (s *Service) waitSyncDiskSpace(ctx context.Context, flow string, probe syncDiskSpaceProbe, retryDelay time.Duration) error {
 	path := strings.TrimSpace(s.syncDiskSpacePath)
-	if path == "" || s.minSyncDiskFreeBytes == 0 {
+	if path == "" {
 		return nil
-	}
-
-	probe := s.syncDiskSpaceProbe
-	if probe == nil {
-		probe = statFSSyncDiskSpace
-	}
-
-	retryDelay := s.syncDiskSpaceRetryDelay
-	if retryDelay <= 0 {
-		retryDelay = syncDiskSpaceRetryDelay
 	}
 
 	for {

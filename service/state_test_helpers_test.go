@@ -64,6 +64,10 @@ func testShardStateCell(tb testing.TB, block ton.BlockIDExt) *cell.Cell {
 
 type testShardAccountsAugmentation struct{}
 
+func newTestStateCellWindowCache(base cell.LazyCellLoader) *stateCellWindowCache {
+	return newStateCellWindowCache(base, &lazyCellLoadCounters{})
+}
+
 func (testShardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {
 	if _, err := loader.LoadUInt(5); err != nil {
 		return err

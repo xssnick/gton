@@ -19,19 +19,13 @@ type customTwoStepPeerSet struct {
 }
 
 func (set customTwoStepPeerSet) Peers() []overlay.BroadcastPeer {
-	if set.sub == nil {
-		return nil
-	}
 	if set.sourcePeerID.IsZero() {
-		return set.sub.broadcastPeersSnapshot()
+		return set.sub.broadcastTargetsSnapshot().broadcast
 	}
 
-	candidates := set.sub.rebroadcastCandidates()
+	candidates := set.sub.broadcastTargetsSnapshot().peers
 	peers := make([]overlay.BroadcastPeer, 0, len(candidates))
 	for _, peer := range candidates {
-		if peer == nil || peer.overlay == nil {
-			continue
-		}
 		if peer.id == set.sourcePeerID {
 			continue
 		}
@@ -54,15 +48,6 @@ func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 	}
 }
 
-func (s *overlaySubscription) configureCustomTwoStepBroadcast(peer *overlayPeer) {
-	if s.spec.Kind != overlayKindCustomFixed {
-		return
-	}
-
-	peer.overlay.SetBroadcastPrecheckHandler(s.checkCustomTwoStepBroadcastSource)
-	peer.overlay.EnableBroadcastTwoStep(s.node.localID.Bytes(), customTwoStepPeerSet{sub: s}, s.customTwoStepState())
-}
-
 func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.BroadcastPrecheckInfo) error {
 	sourceID, err := NewPeerID(info.SourceID)
 	if err != nil {
@@ -79,16 +64,6 @@ func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.Bro
 
 	s.node.noteBroadcastDrop(s.spec.Name, customTwoStepBroadcastKind, "unauthorized_sender")
 	return fmt.Errorf("custom overlay broadcast source %s is not configured", sourceID.String())
-}
-
-func (s *overlaySubscription) customTwoStepState() *overlay.BroadcastTwoStepState {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	if s.twoStepState == nil {
-		s.twoStepState = overlay.NewBroadcastTwoStepState()
-	}
-	return s.twoStepState
 }
 
 func (s *overlaySubscription) startCustomTwoStepRebroadcastWorker(ctx context.Context) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
@@ -18,7 +19,7 @@ import (
 
 const (
 	runMethodSupportedMode uint32 = 0x3f
-	runMethodMaxParamBytes        = 65536
+	runMethodMaxParamBytes int    = 65536
 )
 
 type runMethodAccount struct {
@@ -51,8 +52,8 @@ func (s *Server) handleRunSmcMethod(ctx context.Context, query ton.RunSmcMethod)
 
 	result := ton.RunMethodResult{
 		Mode:       query.Mode,
-		ID:         cloneBlockID(info.base),
-		ShardBlock: cloneBlockID(info.shard),
+		ID:         blockproof.CloneBlockID(info.base),
+		ShardBlock: blockproof.CloneBlockID(info.shard),
 		ExitCode:   ton.ErrCodeContractNotInitialized,
 	}
 	if query.Mode&1 != 0 {

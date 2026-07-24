@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/xssnick/gton/service/p2p"
@@ -28,7 +29,6 @@ func TestServiceFillsGapWithNextBlocks(t *testing.T) {
 	node.next[blockKey(block11)] = &p2p.DownloadedBlock{ID: block12}
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -80,7 +80,6 @@ func TestServiceIgnoresDuplicatesAndOlderBroadcasts(t *testing.T) {
 	node.next[blockKey(block10)] = &p2p.DownloadedBlock{ID: block11}
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -126,7 +125,6 @@ func TestServiceUsesDecodedBroadcastPayloadWhenPresent(t *testing.T) {
 	block11 := testBlockID(-1, topShard, 11)
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -163,7 +161,6 @@ func TestServiceEmitsDecodedMasterchainBroadcastsWithoutCoalescing(t *testing.T)
 	block12 := testBlockID(-1, topShard, 12)
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -214,7 +211,6 @@ func TestServiceDoesNotAdvanceAfterRejectedBlock(t *testing.T) {
 	node.exact[blockKey(block12)] = &p2p.DownloadedBlock{ID: block12}
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -259,7 +255,6 @@ func TestServiceDropsFullBlockBroadcastWithoutDecodedPayload(t *testing.T) {
 	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -294,7 +289,6 @@ func TestServiceIgnoresNonMasterchainBroadcasts(t *testing.T) {
 	node.next[blockKey(base10)] = &p2p.DownloadedBlock{ID: base11}
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -326,7 +320,6 @@ func TestServiceEmitsShardDescriptionBroadcasts(t *testing.T) {
 
 	base10 := testBlockID(0, topShard, 10)
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -367,52 +360,53 @@ func TestServiceEmitsShardDescriptionBroadcasts(t *testing.T) {
 }
 
 func TestServiceRetriesGapUntilRecovered(t *testing.T) {
-	node := newStubNode(4)
+	synctest.Test(t, func(t *testing.T) {
+		node := newStubNode(4)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block11 := testBlockID(-1, topShard, 11)
-	block12 := testBlockID(-1, topShard, 12)
+		block10 := testBlockID(-1, topShard, 10)
+		block11 := testBlockID(-1, topShard, 11)
+		block12 := testBlockID(-1, topShard, 12)
 
-	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
-	node.nextErrors[blockKey(block10)] = []error{
-		errors.New("peer does not have the requested block"),
-		errors.New("peer does not have the requested block"),
-	}
-	node.next[blockKey(block10)] = &p2p.DownloadedBlock{ID: block11}
-	node.next[blockKey(block11)] = &p2p.DownloadedBlock{ID: block12}
+		node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
+		node.nextErrors[blockKey(block10)] = []error{
+			errors.New("peer does not have the requested block"),
+			errors.New("peer does not have the requested block"),
+		}
+		node.next[blockKey(block10)] = &p2p.DownloadedBlock{ID: block11}
+		node.next[blockKey(block11)] = &p2p.DownloadedBlock{ID: block12}
 
-	service := New(discardLogger(), node)
-	service.retryCount = 1
+		service := New(discardLogger(), node)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		service.Run(ctx)
-	}()
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			service.Run(ctx)
+		}()
 
-	node.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block10}
-	node.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block12}
-	close(node.events)
+		node.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block10}
+		node.events <- p2p.BroadcastEvent{Overlay: "masterchain", Kind: "block", Block: block12}
+		close(node.events)
 
-	got := collectSyncedBlocks(service.Blocks())
-	wg.Wait()
+		got := collectSyncedBlocks(service.Blocks())
+		wg.Wait()
 
-	if len(got) != 3 {
-		t.Fatalf("expected 3 synced blocks, got %d", len(got))
-	}
-	if !got[1].Downloaded.ID.Equals(&block11) || !got[2].Downloaded.ID.Equals(&block12) {
-		t.Fatalf("unexpected synced order: %+v", got)
-	}
-	if len(node.nextCalls) != 4 {
-		t.Fatalf("expected 4 next-block attempts, got %d", len(node.nextCalls))
-	}
-	if !node.nextCalls[0].Equals(&block10) || !node.nextCalls[1].Equals(&block10) || !node.nextCalls[2].Equals(&block10) || !node.nextCalls[3].Equals(&block11) {
-		t.Fatalf("unexpected next-block retry order: %+v", node.nextCalls)
-	}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 synced blocks, got %d", len(got))
+		}
+		if !got[1].Downloaded.ID.Equals(&block11) || !got[2].Downloaded.ID.Equals(&block12) {
+			t.Fatalf("unexpected synced order: %+v", got)
+		}
+		if len(node.nextCalls) != 4 {
+			t.Fatalf("expected 4 next-block attempts, got %d", len(node.nextCalls))
+		}
+		if !node.nextCalls[0].Equals(&block10) || !node.nextCalls[1].Equals(&block10) || !node.nextCalls[2].Equals(&block10) || !node.nextCalls[3].Equals(&block11) {
+			t.Fatalf("unexpected next-block retry order: %+v", node.nextCalls)
+		}
+	})
 }
 
 func TestServiceCoalescesFutureBroadcastsWithoutSkippingBlocks(t *testing.T) {
@@ -431,7 +425,6 @@ func TestServiceCoalescesFutureBroadcastsWithoutSkippingBlocks(t *testing.T) {
 	node.next[blockKey(block13)] = &p2p.DownloadedBlock{ID: block14}
 
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -539,7 +532,6 @@ func TestChainPendingBroadcastOverflowKeepsNearestSeqnos(t *testing.T) {
 func TestChainWaitForNextBlockUsesPendingBroadcastDuringDownload(t *testing.T) {
 	node := newBlockingNextNode()
 	service := New(discardLogger(), node)
-	service.retryCount = 1
 
 	prev := testBlockID(-1, topShard, 10)
 	next := testBlockID(-1, topShard, 11)

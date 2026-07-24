@@ -67,10 +67,9 @@ func TestFormatStatusReadableSections(t *testing.T) {
 		LocalMasterchainHasTx: true,
 		LocalBasechainHasTx:   true,
 		RecentTPS: service2.StatusTPSSnapshot{
-			WindowMasters:   10,
+			DurationSeconds: 10,
 			Transactions:    1234,
-			DurationSeconds: 45,
-			TPS:             27.422,
+			TPS:             123.4,
 			Complete:        true,
 		},
 	}, false, time.Unix(1000, 0))
@@ -80,7 +79,7 @@ func TestFormatStatusReadableSections(t *testing.T) {
 		"Chain Lag\n",
 		"masterchain  local=40 latest=42 lag_seconds=unknown block_time=unknown tx=7",
 		"basechain    local=77 latest=77 lag_seconds=unknown block_time=unknown tx=11",
-		"tps          window_masters=10 tx=1234 duration=45s tps=27.42",
+		"tps          window=10s tx=1234 tps=123.40",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("formatted status missing %q:\n%s", want, out)

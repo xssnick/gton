@@ -178,7 +178,7 @@ func mustTestPersistentStateSplitRoot(t *testing.T, block ton.BlockIDExt, accoun
 		if err != nil {
 			t.Fatalf("build account: %v", err)
 		}
-		if err = accounts.Set(cell.BeginCell().MustStoreBigInt(accountID, 256).EndCell(), account); err != nil {
+		if err = accounts.Set(cell.BeginCell().MustStoreSlice(accountID.FillBytes(make([]byte, 32)), 256).EndCell(), account); err != nil {
 			t.Fatalf("set account: %v", err)
 		}
 	}

@@ -40,14 +40,14 @@ type broadcastValidatorCache struct {
 	entries        map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet
 }
 
-func (c *broadcastValidatorCache) getConfig() (broadcastValidatorConfig, bool) {
+func (c *broadcastValidatorCache) getConfig() (broadcastValidatorConfig, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.configLoaded {
-		return broadcastValidatorConfig{}, false
+		return broadcastValidatorConfig{}, storage.ErrNotFound
 	}
-	return c.config, true
+	return c.config, nil
 }
 
 func (c *broadcastValidatorCache) putConfig(block ton.BlockIDExt, config broadcastValidatorConfig) broadcastValidatorConfig {
@@ -69,15 +69,18 @@ func (c *broadcastValidatorCache) putConfig(block ton.BlockIDExt, config broadca
 	return c.config
 }
 
-func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) (*blockproof.PreparedValidatorSet, bool) {
+func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.initialized || c.configRootHash != key.configRootHash {
-		return nil, false
+		return nil, storage.ErrNotFound
 	}
 	set, ok := c.entries[key]
-	return set, ok
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	return set, nil
 }
 
 func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *blockproof.PreparedValidatorSet) *blockproof.PreparedValidatorSet {
@@ -167,10 +170,6 @@ func (s *Service) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p
 }
 
 func newP2PShardBlockDescription(desc *shardTopBlockDescription) (*p2p.ShardBlockDescription, error) {
-	if desc == nil {
-		return nil, fmt.Errorf("shard top block description is empty")
-	}
-
 	out := &p2p.ShardBlockDescription{
 		Block:            desc.Block,
 		CatchainSeqno:    desc.CatchainSeqno,
@@ -206,11 +205,15 @@ func (s *Service) broadcastValidatorSetForSignatures(ctx context.Context, block 
 	}
 
 	key := broadcastValidatorCacheKeyFromBlock(config.rootHash, block, catchainSeqno, validatorSetHash)
-	if set, ok := s.broadcastValidatorCache.get(key); ok {
+	set, err := s.broadcastValidatorCache.get(key)
+	if err == nil {
 		return set, nil
 	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
+	}
 
-	set, err := broadcastValidatorSetFromConfig(config.cfg, block, catchainSeqno, validatorSetHash)
+	set, err = broadcastValidatorSetFromConfig(config.cfg, block, catchainSeqno, validatorSetHash)
 	if err != nil {
 		return nil, err
 	}
@@ -227,13 +230,15 @@ func broadcastValidatorCacheKeyFromBlock(configRootHash cell.Hash, block ton.Blo
 	}
 }
 
+type broadcastValidatorSetCandidate struct {
+	name string
+	load func() ([]*tlb.ValidatorAddr, error)
+}
+
 func broadcastValidatorSetFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) (*blockproof.PreparedValidatorSet, error) {
 	// Key-block boundaries can leave valid broadcasts signed by a known previous,
 	// current, or next validator set; the hash is checked before any set is used.
-	candidates := []struct {
-		name string
-		load func() ([]*tlb.ValidatorAddr, error)
-	}{
+	candidates := []broadcastValidatorSetCandidate{
 		{
 			name: "current",
 			load: func() ([]*tlb.ValidatorAddr, error) {
@@ -277,8 +282,12 @@ func broadcastValidatorSetFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockI
 }
 
 func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcastValidatorConfig, error) {
-	if config, ok := s.broadcastValidatorCache.getConfig(); ok {
+	config, err := s.broadcastValidatorCache.getConfig()
+	if err == nil {
 		return config, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return broadcastValidatorConfig{}, err
 	}
 
 	current, err := s.currentStatusSnapshot(ctx)
@@ -296,7 +305,7 @@ func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcas
 		}
 		return broadcastValidatorConfig{}, fmt.Errorf("load masterchain state %s for broadcast signature check: %w", storage.FormatBlockRef(current.Masterchain.Block), err)
 	}
-	config, err := broadcastValidatorConfigFromMasterchainState(masterState)
+	config, err = broadcastValidatorConfigFromMasterchainState(masterState)
 	if err != nil {
 		return broadcastValidatorConfig{}, err
 	}

@@ -46,15 +46,18 @@ type masterchainValidatorCache struct {
 	entries           map[masterchainValidatorCacheKey]*blockproof.PreparedValidatorSet
 }
 
-func (c *masterchainValidatorCache) get(key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, bool) {
+func (c *masterchainValidatorCache) get(key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.initialized || c.prevKeyBlockSeqno != key.prevKeyBlockSeqno {
-		return nil, false
+		return nil, tnstore.ErrNotFound
 	}
 	validators, ok := c.entries[key]
-	return validators, ok
+	if !ok {
+		return nil, tnstore.ErrNotFound
+	}
+	return validators, nil
 }
 
 func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, validators *blockproof.PreparedValidatorSet) *blockproof.PreparedValidatorSet {
@@ -74,9 +77,6 @@ func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, valida
 }
 
 func (s *Service) checkMasterchainBlockConsensusWithProof(current *tnstore.BlockState, proof *masterchainConsensusProof) (*checkedMasterchainConsensus, error) {
-	if proof == nil {
-		return nil, fmt.Errorf("masterchain block has no prepared consensus proof")
-	}
 	if proof.block.Workchain != -1 || proof.block.Shard != topShard {
 		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(proof.block))
 	}
@@ -164,10 +164,6 @@ func (s *Service) checkedConsensusForPreparedBlock(current *tnstore.BlockState, 
 }
 
 func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, verifiedSignaturesKey []byte) (*masterchainConsensusProof, *blockproof.Parsed, error) {
-	if proofRoot == nil {
-		return nil, nil, fmt.Errorf("masterchain block %s has no parsed proof root", tnstore.FormatBlockRef(block))
-	}
-
 	parsed, err := blockproof.ParseCell(block, proofRoot)
 	if err != nil {
 		return nil, nil, err
@@ -195,7 +191,7 @@ func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproo
 	if block.Workchain != -1 || block.Shard != topShard {
 		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(block))
 	}
-	if parsed == nil || parsed.Proof == nil || parsed.Block == nil || parsed.Meta == nil {
+	if parsed.Proof == nil || parsed.Block == nil || parsed.Meta == nil {
 		return nil, fmt.Errorf("masterchain block proof %s is incomplete", tnstore.FormatBlockRef(block))
 	}
 	if len(parsed.Meta.PrevRefs) != 1 {
@@ -251,8 +247,9 @@ func stateUpdateFromHash(block ton.BlockIDExt, update *cell.Cell) (cell.Hash, er
 }
 
 func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
-	if validators, ok := s.validatorCache.get(key); ok {
-		return validators, nil
+	cached, err := s.validatorCache.get(key)
+	if err == nil {
+		return cached, nil
 	}
 
 	cfg, err := blockproof.ConfigFromMasterchainState(current)

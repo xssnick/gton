@@ -81,13 +81,13 @@ func (s *Store) currentStateRecord(ctx context.Context, key []byte, label string
 		return nil, err
 	}
 	master, err := s.blockStateMeta(ctx, state.Masterchain.Block)
-	if err == nil {
-		state.Masterchain = master
-	} else if errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("load %s masterchain state %s: block state metadata is missing", label, storage.FormatBlockRef(state.Masterchain.Block))
-	} else {
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("load %s masterchain state %s: block state metadata is missing", label, storage.FormatBlockRef(state.Masterchain.Block))
+		}
 		return nil, fmt.Errorf("load %s masterchain state %s: %w", label, storage.FormatBlockRef(state.Masterchain.Block), err)
 	}
+	state.Masterchain = master
 
 	for key, shard := range state.Shards {
 		loaded, err := s.blockStateMeta(ctx, shard.Block)
@@ -237,9 +237,6 @@ func checkpointEntryStates(entries []storage.StateCheckpointBlock) []*storage.Bl
 }
 
 func mergeCheckpointBlockMeta(metas map[storage.BlockRootHash]*storage.BlockMeta, meta *storage.BlockMeta) {
-	if meta == nil {
-		return
-	}
 	key := storage.BlockKey(meta.ID)
 	merged := storage.MergeBlockMeta(metas[key], meta)
 	merged.ID = meta.ID
@@ -785,10 +782,6 @@ func (s *Store) saveCellGenerationSwitch(ctx context.Context, generation uint64,
 }
 
 func currentStateBlockKeepSet(current *storage.CurrentState, additional []ton.BlockIDExt) map[storage.BlockRootHash]struct{} {
-	if current == nil {
-		return nil
-	}
-
 	keep := make(map[storage.BlockRootHash]struct{}, 1+len(current.Shards)+len(additional))
 	keep[storage.BlockKey(current.Masterchain.Block)] = struct{}{}
 	for _, key := range storage.SortedShardKeys(current.Shards) {
@@ -872,9 +865,6 @@ func verifyCellGenerationSwitchBlockStateMetadata(db *pebble.DB, label string, c
 }
 
 func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
-	if left == nil || right == nil {
-		return left == right
-	}
 	if left.ShardClientSeqno != right.ShardClientSeqno {
 		return false
 	}
@@ -898,9 +888,6 @@ func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.Curre
 }
 
 func currentStateRootsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
-	if left == nil || right == nil {
-		return left == right
-	}
 	if !bytes.Equal(left.Masterchain.StateRootHash, right.Masterchain.StateRootHash) {
 		return false
 	}
@@ -973,7 +960,7 @@ func stateMetadataBeforeImportedState(block ton.BlockIDExt, meta *storage.BlockM
 	if isMasterchainBlock(block) {
 		return block.SeqNo < origin.SeqNo
 	}
-	if meta == nil || !meta.MasterchainRefKnown() {
+	if !meta.MasterchainRefKnown() {
 		return false
 	}
 	return meta.MasterchainRefSeqno < origin.SeqNo
@@ -1068,15 +1055,13 @@ func isEmptyBlockID(block ton.BlockIDExt) bool {
 	return block.Workchain == 0 &&
 		block.Shard == 0 &&
 		block.SeqNo == 0 &&
-		isZeroHash(block.RootHash) &&
-		isZeroHash(block.FileHash)
+		isEmptyBlockIDHash(block.RootHash) &&
+		isEmptyBlockIDHash(block.FileHash)
 }
 
-func isZeroHash(hash []byte) bool {
-	for _, b := range hash {
-		if b != 0 {
-			return false
-		}
+func isEmptyBlockIDHash(hash []byte) bool {
+	if len(hash) == 0 {
+		return true
 	}
-	return true
+	return len(hash) == 32 && [32]byte(hash) == [32]byte{}
 }

@@ -66,7 +66,7 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 		}
 
 		now := time.Now()
-		if nextStateSerialization.IsZero() && s.stateSerializer != nil && s.automaticStateSerializationReady.Load() {
+		if nextStateSerialization.IsZero() && s.automaticStateSerializationReady.Load() {
 			nextStateSerialization = now
 		}
 		persistentStateGCDue := !now.Before(nextPersistentStateGC)
@@ -259,7 +259,7 @@ func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, 
 	}
 	defer migrationLease.release()
 
-	runCtx, run, err := s.beginCellGenerationMigrationRun(s.currentStatePersistContext())
+	runCtx, run, err := s.beginCellGenerationMigrationRun(s.shutdownContext)
 	if err != nil {
 		return false, err
 	}

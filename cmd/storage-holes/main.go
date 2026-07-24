@@ -96,6 +96,13 @@ func main() {
 		os.Exit(2)
 	}
 
+	exitCode := run(opts)
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func run(opts options) int {
 	logs := logutil.NewFactory(os.Stdout, logutil.Config{
 		Level: opts.logLevel,
 		JSON:  opts.logJSON,
@@ -123,7 +130,7 @@ func main() {
 	})
 	if err != nil {
 		logger.Error().Err(err).Str("dir", opts.dbDir).Msg("failed to open storage")
-		os.Exit(1)
+		return 1
 	}
 	defer func() {
 		if err := store.Close(); err != nil {
@@ -150,11 +157,11 @@ func main() {
 	report, err := checker.run(ctx)
 	if writeErr := writeReport(opts.holesPath, report); writeErr != nil {
 		logger.Error().Err(writeErr).Str("path", opts.holesPath).Msg("failed to write holes report")
-		os.Exit(1)
+		return 1
 	}
 	if err != nil {
 		logger.Error().Err(err).Str("path", opts.holesPath).Msg("storage hole check failed")
-		os.Exit(1)
+		return 1
 	}
 	if len(report.Holes) > 0 {
 		logger.Error().
@@ -162,7 +169,7 @@ func main() {
 			Bool("truncated", report.Truncated).
 			Str("path", opts.holesPath).
 			Msg("storage holes found")
-		os.Exit(1)
+		return 1
 	}
 
 	logger.Info().
@@ -174,6 +181,7 @@ func main() {
 		Dur("elapsed", report.FinishedAt.Sub(report.StartedAt)).
 		Str("path", opts.holesPath).
 		Msg("storage hole check finished")
+	return 0
 }
 
 func parseOptions() (options, error) {
@@ -252,9 +260,7 @@ func (c *holeChecker) run(ctx context.Context) (holeReport, error) {
 		}
 
 		seqno := c.opts.seqno + uint32(offset)
-		if err := c.checkMaster(ctx, seqno, offset == 0); err != nil {
-			return c.finishReport(), err
-		}
+		c.checkMaster(ctx, seqno, offset == 0)
 		c.report.CheckedUntilSeqno = seqno
 		c.report.CheckedMasterBlocks++
 
@@ -278,7 +284,7 @@ func (c *holeChecker) finishReport() holeReport {
 	return c.report
 }
 
-func (c *holeChecker) checkMaster(ctx context.Context, seqno uint32, initial bool) error {
+func (c *holeChecker) checkMaster(ctx context.Context, seqno uint32, initial bool) {
 	master, err := c.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{
 		Workchain: masterchainID,
 		Shard:     masterchainShard,
@@ -290,22 +296,22 @@ func (c *holeChecker) checkMaster(ctx context.Context, seqno uint32, initial boo
 			Shard:     masterchainShard,
 			SeqNo:     seqno,
 		}, err)
-		return nil
+		return
 	}
 
 	_, parsed := c.checkBlock(ctx, seqno, "master", master, true)
 	if parsed == nil {
-		return nil
+		return
 	}
 	if parsed.Extra == nil || parsed.Extra.Custom == nil {
 		c.addHole(seqno, "master_shard_hashes", master, fmt.Errorf("master block has no custom extra"))
-		return nil
+		return
 	}
 
 	shards, err := ton.LoadShardsFromHashes(parsed.Extra.Custom.ShardHashes, false)
 	if err != nil {
 		c.addHole(seqno, "master_shard_hashes", master, err)
-		return nil
+		return
 	}
 	sort.Slice(shards, func(i, j int) bool {
 		if shards[i].Workchain != shards[j].Workchain {
@@ -319,7 +325,7 @@ func (c *holeChecker) checkMaster(ctx context.Context, seqno uint32, initial boo
 
 	for _, shard := range shards {
 		if c.stop {
-			return nil
+			return
 		}
 		if shard == nil {
 			c.addHole(seqno, "master_shard_hashes", master, fmt.Errorf("master shard hashes returned nil shard"))
@@ -328,7 +334,6 @@ func (c *holeChecker) checkMaster(ctx context.Context, seqno uint32, initial boo
 		c.report.CheckedShardRefs++
 		c.checkShardChain(ctx, seqno, *shard, !initial)
 	}
-	return nil
 }
 
 func (c *holeChecker) checkShardChain(ctx context.Context, masterSeqno uint32, block ton.BlockIDExt, checkPrev bool) {
@@ -449,18 +454,17 @@ func (c *holeChecker) addHole(masterSeqno uint32, scope string, block ton.BlockI
 	}
 
 	shouldLog := c.opts.holeLimit == 0 || len(c.report.Holes) < c.opts.holeLimit
-	if c.opts.holeLimit == 0 || len(c.report.Holes) < c.opts.holeLimit {
+	switch {
+	case shouldLog:
 		c.report.Holes = append(c.report.Holes, storageHole{
 			MasterSeqno: masterSeqno,
 			Scope:       scope,
 			Block:       blockToJSON(block),
 			Error:       message,
 		})
-	} else if !c.report.Truncated {
+	case !c.report.Truncated:
 		c.report.Truncated = true
 		shouldLog = true
-	} else {
-		c.report.Truncated = true
 	}
 
 	if shouldLog {

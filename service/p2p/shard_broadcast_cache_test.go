@@ -12,12 +12,20 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+func storeTestShardBroadcast(cache *shardBroadcastBlockCache, downloaded DownloadedBlock, meta *tnstore.BlockMeta) error {
+	validated, err := validateShardBroadcastBlock(&downloaded)
+	if err != nil {
+		return err
+	}
+	return cache.storeAt(downloaded, meta, validated.blockRoot, validated.proofRoot, validated.stateUpdate, time.Now())
+}
+
 func TestShardBroadcastCacheBlockCanBeReadRepeatedly(t *testing.T) {
 	cache := newShardBroadcastBlockCache(time.Minute, 1<<20, 16)
 	downloaded := testShardBroadcastDownloadedBlock(t, 10, 0x10)
 	meta := &tnstore.BlockMeta{ID: downloaded.ID, GenUTime: 123}
 
-	if err := cache.Store(downloaded, meta); err != nil {
+	if err := storeTestShardBroadcast(cache, downloaded, meta); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 
@@ -26,7 +34,7 @@ func TestShardBroadcastCacheBlockCanBeReadRepeatedly(t *testing.T) {
 		t.Fatalf("read block: %v", err)
 	}
 	if !got.ID.Equals(&downloaded.ID) {
-		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(downloaded.ID))
+		t.Fatalf("block = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(downloaded.ID))
 	}
 	if got.Kind != downloaded.Kind {
 		t.Fatalf("kind = %q, want %q", got.Kind, downloaded.Kind)
@@ -52,7 +60,7 @@ func TestShardBroadcastCacheBlockCanBeReadRepeatedly(t *testing.T) {
 		t.Fatalf("second read block: %v", err)
 	}
 	if !got.ID.Equals(&downloaded.ID) {
-		t.Fatalf("second block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(downloaded.ID))
+		t.Fatalf("second block = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(downloaded.ID))
 	}
 }
 
@@ -63,7 +71,7 @@ func TestShardBroadcastCacheOwnsStoredBlockID(t *testing.T) {
 	target.RootHash = append([]byte(nil), target.RootHash...)
 	target.FileHash = append([]byte(nil), target.FileHash...)
 
-	if err := cache.Store(downloaded, testShardBroadcastMeta(downloaded)); err != nil {
+	if err := storeTestShardBroadcast(cache, downloaded, testShardBroadcastMeta(downloaded)); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 
@@ -79,7 +87,7 @@ func TestShardBroadcastCacheOwnsStoredBlockID(t *testing.T) {
 		t.Fatalf("read block: %v", err)
 	}
 	if !got.ID.Equals(&target) {
-		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(target))
+		t.Fatalf("block = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(target))
 	}
 
 	got.ID.RootHash[0] ^= 0xff
@@ -90,7 +98,7 @@ func TestShardBroadcastCacheOwnsStoredBlockID(t *testing.T) {
 		t.Fatalf("read block again: %v", err)
 	}
 	if !again.ID.Equals(&target) {
-		t.Fatalf("second block = %s, want %s", formatBlockRef(again.ID), formatBlockRef(target))
+		t.Fatalf("second block = %s, want %s", tnstore.FormatBlockRef(again.ID), tnstore.FormatBlockRef(target))
 	}
 }
 
@@ -102,12 +110,12 @@ func TestShardBroadcastCachePrunesExpiredBlocks(t *testing.T) {
 	if err := cache.storeAt(downloaded, testShardBroadcastMeta(downloaded), downloaded.Block, downloaded.Proof, downloaded.StateUpdate, now); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
-	cache.Prune(now.Add(2 * time.Second))
+	cache.prune(now.Add(2 * time.Second))
 
 	if entries := shardBroadcastCacheLen(cache); entries != 0 {
 		t.Fatalf("cache entries = %d, want 0", entries)
 	}
-	if _, err := cache.blockAt(downloaded.ID, now.Add(2*time.Second)); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err := cache.broadcastBlockCache.blockAt(tnstore.BlockKey(downloaded.ID), now.Add(2*time.Second)); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("read expired err = %v, want ErrNotFound", err)
 	}
 }
@@ -129,13 +137,13 @@ func TestShardBroadcastCachePrunesOldestOverflow(t *testing.T) {
 		t.Fatalf("cache entries = %d, want 2", entries)
 	}
 	popAt := now.Add(10 * time.Second)
-	if _, err := cache.blockAt(first.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err := cache.broadcastBlockCache.blockAt(tnstore.BlockKey(first.ID), popAt); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("oldest read err = %v, want ErrNotFound", err)
 	}
-	if _, err := cache.blockAt(second.ID, popAt); err != nil {
+	if _, err := cache.broadcastBlockCache.blockAt(tnstore.BlockKey(second.ID), popAt); err != nil {
 		t.Fatalf("second block was evicted: %v", err)
 	}
-	if _, err := cache.blockAt(third.ID, popAt); err != nil {
+	if _, err := cache.broadcastBlockCache.blockAt(tnstore.BlockKey(third.ID), popAt); err != nil {
 		t.Fatalf("third block was evicted: %v", err)
 	}
 }
@@ -162,17 +170,17 @@ func TestShardBroadcastCacheReplacementMovesEntryToBack(t *testing.T) {
 	}
 
 	popAt := now.Add(10 * time.Second)
-	got, err := cache.blockAt(first.ID, popAt)
+	got, err := cache.broadcastBlockCache.blockAt(tnstore.BlockKey(first.ID), popAt)
 	if err != nil {
 		t.Fatalf("replaced first block was evicted: %v", err)
 	}
 	if got.Kind != "updated" {
 		t.Fatalf("replaced kind = %q, want updated", got.Kind)
 	}
-	if _, err = cache.blockAt(second.ID, popAt); !errors.Is(err, tnstore.ErrNotFound) {
+	if _, err = cache.broadcastBlockCache.blockAt(tnstore.BlockKey(second.ID), popAt); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("second block error = %v, want ErrNotFound", err)
 	}
-	if _, err = cache.blockAt(third.ID, popAt); err != nil {
+	if _, err = cache.broadcastBlockCache.blockAt(tnstore.BlockKey(third.ID), popAt); err != nil {
 		t.Fatalf("third block was evicted: %v", err)
 	}
 }
@@ -181,7 +189,7 @@ func TestDownloadBlockFullUsesShardBroadcastCacheBeforeOverlay(t *testing.T) {
 	node := newTestNode(t)
 	downloaded := testShardBroadcastDownloadedBlock(t, 15, 0x15)
 
-	if err := node.shardBroadcastCache.Store(downloaded, testShardBroadcastMeta(downloaded)); err != nil {
+	if err := storeTestShardBroadcast(node.shardBroadcastCache, downloaded, testShardBroadcastMeta(downloaded)); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 
@@ -210,7 +218,7 @@ func TestShardBroadcastCacheNotifiesWaiters(t *testing.T) {
 		t.Fatal("watch returned nil")
 	}
 
-	if err := node.shardBroadcastCache.Store(downloaded, testShardBroadcastMeta(downloaded)); err != nil {
+	if err := storeTestShardBroadcast(node.shardBroadcastCache, downloaded, testShardBroadcastMeta(downloaded)); err != nil {
 		t.Fatalf("store block: %v", err)
 	}
 	node.notifyShardBroadcastBlock(downloaded.ID)
@@ -243,7 +251,7 @@ func TestShardCandidateAndDescriptionProofAssemblesHotBlock(t *testing.T) {
 		t.Fatalf("download block: %v", err)
 	}
 	if !got.ID.Equals(&downloaded.ID) {
-		t.Fatalf("block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(downloaded.ID))
+		t.Fatalf("block = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(downloaded.ID))
 	}
 	if got.Kind != shardDescriptionBroadcastKind {
 		t.Fatalf("kind = %q, want %q", got.Kind, shardDescriptionBroadcastKind)
@@ -342,7 +350,7 @@ func requireAssembledShardCandidate(t *testing.T, assembled []DownloadedBlock, w
 	}
 	got := assembled[0]
 	if !got.ID.Equals(&want.ID) {
-		t.Fatalf("assembled block = %s, want %s", formatBlockRef(got.ID), formatBlockRef(want.ID))
+		t.Fatalf("assembled block = %s, want %s", tnstore.FormatBlockRef(got.ID), tnstore.FormatBlockRef(want.ID))
 	}
 	if got.Kind != shardDescriptionBroadcastKind {
 		t.Fatalf("assembled kind = %q, want %q", got.Kind, shardDescriptionBroadcastKind)

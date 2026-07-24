@@ -53,8 +53,21 @@ func hotKeyBlockMeta(id ton.BlockIDExt) []byte {
 }
 
 func hotKeyBlockSeqIndex(ref storage.BlockSeqRef) []byte {
-	buf := appendHistoryPrefix(hotPrefixBlockSeq, ref.HistoryKey())
+	return appendHotKeyBlockSeqIndex(nil, ref)
+}
+
+func appendHotKeyBlockSeqIndex(buf []byte, ref storage.BlockSeqRef) []byte {
+	buf = appendHotKeyBlockSeqPrefix(buf, ref.HistoryKey())
 	return binary.BigEndian.AppendUint32(buf, ref.SeqNo)
+}
+
+func appendHotKeyBlockSeqPrefix(buf []byte, key storage.BlockHistoryKey) []byte {
+	return appendHistoryPrefixTo(buf, hotPrefixBlockSeq, key)
+}
+
+func hotKeyBlockSeqWorkchainPrefix(workchain int32) []byte {
+	buf := append([]byte(nil), hotPrefixBlockSeq...)
+	return binary.BigEndian.AppendUint32(buf, uint32(workchain))
 }
 
 func hotKeyKeyBlockSeqIndex(seqno uint32) []byte {
@@ -62,7 +75,11 @@ func hotKeyKeyBlockSeqIndex(seqno uint32) []byte {
 }
 
 func hotKeyBlockLTPrefix(key storage.BlockHistoryKey) []byte {
-	return appendHistoryPrefix(hotPrefixBlockLT, key)
+	return appendHotKeyBlockLTPrefix(nil, key)
+}
+
+func appendHotKeyBlockLTPrefix(buf []byte, key storage.BlockHistoryKey) []byte {
+	return appendHistoryPrefixTo(buf, hotPrefixBlockLT, key)
 }
 
 func hotKeyBlockLTWorkchainPrefix(workchain int32) []byte {
@@ -77,13 +94,26 @@ func hotKeyBlockLTIndex(ref storage.BlockSeqRef, endLT uint64) []byte {
 }
 
 func hotKeyBlockLTSeekGE(key storage.BlockHistoryKey, lt uint64) []byte {
-	buf := hotKeyBlockLTPrefix(key)
+	return appendHotKeyBlockLTSeekGE(nil, key, lt)
+}
+
+func appendHotKeyBlockLTSeekGE(buf []byte, key storage.BlockHistoryKey, lt uint64) []byte {
+	buf = appendHotKeyBlockLTPrefix(buf, key)
 	buf = binary.BigEndian.AppendUint64(buf, lt)
 	return binary.BigEndian.AppendUint32(buf, 0)
 }
 
 func hotKeyBlockUTimePrefix(key storage.BlockHistoryKey) []byte {
-	return appendHistoryPrefix(hotPrefixBlockUTime, key)
+	return appendHotKeyBlockUTimePrefix(nil, key)
+}
+
+func appendHotKeyBlockUTimePrefix(buf []byte, key storage.BlockHistoryKey) []byte {
+	return appendHistoryPrefixTo(buf, hotPrefixBlockUTime, key)
+}
+
+func hotKeyBlockUTimeWorkchainPrefix(workchain int32) []byte {
+	buf := append([]byte(nil), hotPrefixBlockUTime...)
+	return binary.BigEndian.AppendUint32(buf, uint32(workchain))
 }
 
 func hotKeyBlockUTimeIndex(ref storage.BlockSeqRef, utime uint32) []byte {
@@ -93,7 +123,11 @@ func hotKeyBlockUTimeIndex(ref storage.BlockSeqRef, utime uint32) []byte {
 }
 
 func hotKeyBlockUTimeSeekGE(key storage.BlockHistoryKey, utime uint32) []byte {
-	buf := hotKeyBlockUTimePrefix(key)
+	return appendHotKeyBlockUTimeSeekGE(nil, key, utime)
+}
+
+func appendHotKeyBlockUTimeSeekGE(buf []byte, key storage.BlockHistoryKey, utime uint32) []byte {
+	buf = appendHotKeyBlockUTimePrefix(buf, key)
 	buf = binary.BigEndian.AppendUint32(buf, utime)
 	return binary.BigEndian.AppendUint32(buf, 0)
 }
@@ -208,8 +242,8 @@ func hotKeyPackDeletePendingPrefix() []byte {
 	return bytes.Clone(hotPrefixPackDeletePending)
 }
 
-func appendHistoryPrefix(prefix []byte, key storage.BlockHistoryKey) []byte {
-	buf := append([]byte(nil), prefix...)
+func appendHistoryPrefixTo(buf []byte, prefix []byte, key storage.BlockHistoryKey) []byte {
+	buf = append(buf, prefix...)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(key.Workchain))
 	return binary.BigEndian.AppendUint64(buf, uint64(key.Shard))
 }

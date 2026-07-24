@@ -13,13 +13,6 @@ func (n *Node) canAcceptBroadcast(kind string, local bool) bool {
 	})
 }
 
-func (n *Node) rebroadcastBlockedByAdmission(req *rebroadcastRequest) bool {
-	if req == nil {
-		return true
-	}
-	return !n.canAcceptBroadcast(req.kind, req.local)
-}
-
 func broadcastAdmissionExternalKind(kind string) bool {
 	switch kind {
 	case "tonNode.externalMessageBroadcast", "tonNode.ihrMessageBroadcast":

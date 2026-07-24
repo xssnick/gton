@@ -2,7 +2,6 @@ package gton
 
 import (
 	"context"
-	"errors"
 
 	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/p2p"
@@ -26,9 +25,6 @@ func (n extensionNetwork) SendCheckedExternalMessage(ctx context.Context, body [
 }
 
 func (n extensionNetwork) CheckExternalMessage(ctx context.Context, body []byte, root *cell.Cell, msg *tlb.ExternalMessage) (externalmsg.CheckResult, error) {
-	if n.checker == nil {
-		return externalmsg.CheckResult{}, errors.New("external message checker is not configured")
-	}
 	if root != nil && msg != nil {
 		return n.checker.Check(ctx, body, root, msg)
 	}

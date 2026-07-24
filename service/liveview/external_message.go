@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -27,7 +28,12 @@ type ExternalMessageSizeLimits struct {
 
 func (f *BlockView) ExternalMessageLimits() (ExternalMessageSizeLimits, error) {
 	return lazyLoadFragment(f, &f.extMsgLimitsLoad, struct{}{},
-		func() (ExternalMessageSizeLimits, bool) { return f.extMsgLimits, f.extMsgLimitsLoaded },
+		func() (ExternalMessageSizeLimits, error) {
+			if !f.extMsgLimitsLoaded {
+				return ExternalMessageSizeLimits{}, storage.ErrNotFound
+			}
+			return f.extMsgLimits, nil
+		},
 		func(limits ExternalMessageSizeLimits) ExternalMessageSizeLimits {
 			if !f.extMsgLimitsLoaded {
 				f.extMsgLimits = limits
@@ -40,7 +46,7 @@ func (f *BlockView) ExternalMessageLimits() (ExternalMessageSizeLimits, error) {
 			if err != nil {
 				return ExternalMessageSizeLimits{}, err
 			}
-			return externalMessageLimitsFromBaseConfig(base)
+			return base.epoch.extMsgLimits, nil
 		},
 	)
 }
@@ -94,11 +100,6 @@ func (f *BlockView) ExternalMessageAccount(addr *address.Address) (*tlb.ShardAcc
 	f.externalMsgAccounts[key] = externalMessageAccountValue{shard: shard, account: account}
 	f.mu.Unlock()
 	return shard, account, nil
-}
-
-func externalMessageLimitsFromBaseConfig(base *runMethodBaseConfig) (ExternalMessageSizeLimits, error) {
-	// The config epoch resolves the ext-message limits once at build time.
-	return base.epoch.extMsgLimits, nil
 }
 
 // externalMessageLimitsFromConfigRoot resolves the ext-message size/depth

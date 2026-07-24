@@ -59,7 +59,7 @@ func (c *storageArtifactCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *storageArtifactCollector) Collect(ch chan<- prometheus.Metric) {
-	status := c.metrics.storageArtifactStatus()
+	status := c.metrics.artifactStatus.Status()
 
 	ch <- prometheus.MustNewConstMetric(c.archivePackageBytes, prometheus.GaugeValue, float64(status.ArchivePackageBytes))
 	ch <- prometheus.MustNewConstMetric(c.persistentStateBytes, prometheus.GaugeValue, float64(status.PersistentStateBytes))

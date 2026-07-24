@@ -8,10 +8,37 @@ import (
 
 	"github.com/xssnick/gton/service/storage"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func newCompressedStateCacheTestService() *Service {
+	return &Service{
+		compressedStateCache: make(map[storage.BlockRootHash]compressedBlockStateEntry),
+	}
+}
+
+func newMonitorSplitDepthTestService() *Service {
+	return &Service{
+		monitorSplitDepth: make(map[monitorSplitDepthKey]uint32),
+	}
+}
+
+func newMasterStateCacheTestService(t testing.TB) *Service {
+	t.Helper()
+
+	store := openTestPebbleStorage(t)
+	return &Service{
+		log:                  zerolog.Nop(),
+		node:                 newServiceTestNodeWithStorage(t, store),
+		storage:              store,
+		masterStateCache:     make(map[storage.BlockRootHash]*storage.BlockState),
+		compressedStateCache: make(map[storage.BlockRootHash]compressedBlockStateEntry),
+		monitorSplitDepth:    make(map[monitorSplitDepthKey]uint32),
+	}
+}
 
 func TestMasterBlockShardTargetsUsesBlockExtra(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
@@ -66,7 +93,8 @@ func TestMasterBlockShardTargetsFallsBackToState(t *testing.T) {
 	shard := testBlockID(0, topShard, 11)
 	state := testShardTargetsMasterState(t, master, shard)
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), state, nil, nil)
+	svc := &Service{storage: openTestPebbleStorage(t)}
+	shards, err := svc.masterBlockShardTargets(context.Background(), state, nil, nil)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -87,19 +115,19 @@ func TestCompressedBlockStateCacheRefreshPreservesFreshEntry(t *testing.T) {
 		}
 	}
 
-	svc := &Service{}
+	svc := newCompressedStateCacheTestService()
 	refreshed := state(1)
-	svc.rememberCompressedBlockState(refreshed)
+	svc.RememberCompressedBlockState(refreshed)
 	for seqno := uint32(2); seqno <= compressedBlockStateCacheLimit; seqno++ {
-		svc.rememberCompressedBlockState(state(seqno))
+		svc.RememberCompressedBlockState(state(seqno))
 	}
-	svc.rememberCompressedBlockState(refreshed)
-	svc.rememberCompressedBlockState(state(compressedBlockStateCacheLimit + 1))
+	svc.RememberCompressedBlockState(refreshed)
+	svc.RememberCompressedBlockState(state(compressedBlockStateCacheLimit + 1))
 
-	if _, ok := svc.cachedCompressedBlockState(refreshed.Block); !ok {
+	if _, err := svc.cachedCompressedBlockState(refreshed.Block); err != nil {
 		t.Fatal("refreshed compressed state was evicted as the oldest entry")
 	}
-	if _, ok := svc.cachedCompressedBlockState(state(2).Block); ok {
+	if _, err := svc.cachedCompressedBlockState(state(2).Block); err == nil {
 		t.Fatal("oldest non-refreshed compressed state was retained")
 	}
 	if got := len(svc.compressedStateCache); got != compressedBlockStateCacheLimit {
@@ -112,9 +140,9 @@ func TestCompressedBlockStateCacheCompactsRefreshHistory(t *testing.T) {
 		Block: testBlockID(0, topShard, 1),
 		Cell:  cell.BeginCell().EndCell(),
 	}
-	svc := &Service{}
+	svc := newCompressedStateCacheTestService()
 	for i := 0; i < compressedBlockStateCacheLimit*3; i++ {
-		svc.rememberCompressedBlockState(state)
+		svc.RememberCompressedBlockState(state)
 	}
 
 	if got := len(svc.compressedStateCache); got != 1 {
@@ -130,8 +158,8 @@ func TestCompressedBlockStateCacheRejectsExpiredEntry(t *testing.T) {
 		Block: testBlockID(0, topShard, 2),
 		Cell:  cell.BeginCell().EndCell(),
 	}
-	svc := &Service{}
-	svc.rememberCompressedBlockState(state)
+	svc := newCompressedStateCacheTestService()
+	svc.RememberCompressedBlockState(state)
 
 	key := storage.BlockKey(state.Block)
 	svc.compressedStateMu.Lock()
@@ -140,7 +168,7 @@ func TestCompressedBlockStateCacheRejectsExpiredEntry(t *testing.T) {
 	svc.compressedStateCache[key] = entry
 	svc.compressedStateMu.Unlock()
 
-	if _, ok := svc.cachedCompressedBlockState(state.Block); ok {
+	if _, err := svc.cachedCompressedBlockState(state.Block); err == nil {
 		t.Fatal("expired compressed state was returned")
 	}
 	svc.compressedStateMu.Lock()
@@ -153,7 +181,7 @@ func TestCompressedBlockStateCacheRejectsExpiredEntry(t *testing.T) {
 
 func TestRememberMasterStateCacheStaysBounded(t *testing.T) {
 	root := cell.BeginCell().EndCell()
-	svc := &Service{}
+	svc := newMasterStateCacheTestService(t)
 	for seqno := uint32(1); seqno <= masterStateCacheLimit+100; seqno++ {
 		svc.rememberMasterState(context.Background(), &storage.BlockState{
 			Block: testBlockID(-1, topShard, seqno),
@@ -179,7 +207,7 @@ func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
 	keyBlock := testMasterBlockID(1)
 	master := testMonitorMasterStateWithKeyBlock(t, keyBlock, 7, keyBlock, true)
 
-	svc := &Service{}
+	svc := newMonitorSplitDepthTestService()
 	depth, err := svc.cachedMonitorMinSplitDepth(master, 0)
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth initial read: %v", err)
@@ -208,7 +236,7 @@ func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
 }
 
 func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
-	svc := &Service{}
+	svc := newMasterStateCacheTestService(t)
 	keyBlock := testMasterBlockID(1)
 	if _, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithKeyBlock(t, keyBlock, 7, keyBlock, true), 0); err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth initial read: %v", err)
@@ -314,8 +342,8 @@ func TestUpdateMasterDependentCachesKeepsConfigWhenKeyBlockStateIsInvalid(t *tes
 		t.Fatal("invalid key-block state did not return an error")
 	}
 
-	got, ok := svc.broadcastValidatorCache.getConfig()
-	if !ok || got.rootHash != oldConfig.rootHash {
+	got, err := svc.broadcastValidatorCache.getConfig()
+	if err != nil || got.rootHash != oldConfig.rootHash {
 		t.Fatal("invalid key-block state replaced the previous validator config")
 	}
 }
@@ -326,7 +354,7 @@ func TestCachedMonitorMinSplitDepthSeparatesKeyBlockEpochs(t *testing.T) {
 	newKey := testMasterBlockID(3)
 	newMaster := testMonitorMasterStateWithKeyBlock(t, newKey, 9, newKey, true)
 
-	svc := &Service{}
+	svc := newMonitorSplitDepthTestService()
 	oldDepth, err := svc.cachedMonitorMinSplitDepth(oldMaster, 0)
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth old key: %v", err)

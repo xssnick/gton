@@ -25,20 +25,73 @@ func testPeerID(label string) p2p.PeerID {
 	return p2p.PeerID(sha256.Sum256([]byte(label)))
 }
 
-func newFrozenTestNode(t *testing.T) *p2p.Node {
+func newServiceTestNode(t testing.TB) *p2p.Node {
+	t.Helper()
+
+	return newServiceTestNodeWithStorage(t, openTestPebbleStorage(t))
+}
+
+func newServiceTestNodeWithStorage(t testing.TB, store tnstore.Storage) *p2p.Node {
 	t.Helper()
 
 	logger := zerolog.Nop()
 	node, err := p2p.New(p2p.Options{
 		Logger:        &logger,
-		Storage:       openTestPebbleStorage(t),
+		Storage:       store,
 		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create p2p node: %v", err)
 	}
+	return node
+}
+
+func newFrozenTestNode(t testing.TB) *p2p.Node {
+	t.Helper()
+
+	node := newServiceTestNode(t)
 	node.EnterOffline("ton.sync_until reached")
 	return node
+}
+
+func newMasterchainQueueTestService() *Service {
+	return &Service{
+		currentStateWake:                make(chan struct{}, 1),
+		nextMasterchainQueue:            make(map[tnstore.BlockRootHash]queuedMasterchainBlock),
+		nextMasterchainBySeqno:          make(map[uint32]tnstore.BlockRootHash),
+		nextMasterchainCandidates:       make(map[tnstore.BlockRootHash]queuedMasterchainCandidate),
+		nextMasterchainCandidateBySeqno: make(map[uint32]tnstore.BlockRootHash),
+	}
+}
+
+func newMasterchainProbeTestService(t testing.TB) *Service {
+	t.Helper()
+
+	svc := newMasterchainQueueTestService()
+	svc.node = newServiceTestNode(t)
+	return svc
+}
+
+func mustNextBlockBootstrapProbeDecision(t testing.TB, svc *Service, prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) nextBlockBootstrapProbeDecision {
+	t.Helper()
+
+	decision, _, err := svc.nextBlockBootstrapProbeDecision(prev, prevUTime, state)
+	if err != nil {
+		t.Fatalf("make next-block bootstrap probe decision: %v", err)
+	}
+	return decision
+}
+
+func newCurrentStatePersistenceTestService(t testing.TB, store tnstore.Storage, shutdownContext context.Context) *Service {
+	t.Helper()
+
+	return &Service{
+		log:              zerolog.Nop(),
+		node:             newServiceTestNodeWithStorage(t, store),
+		storage:          store,
+		shutdownContext:  shutdownContext,
+		stateCellLoaders: make(map[uint64]cell.LazyCellLoader),
+	}
 }
 
 type recordingSyncObserver struct {
@@ -215,7 +268,7 @@ func TestStateMetadataPublishDoesNotMoveCurrentState(t *testing.T) {
 }
 
 func TestPublishCommittedCurrentStateDoesNotRegressStatus(t *testing.T) {
-	svc := &Service{}
+	svc := newMasterchainProbeTestService(t)
 
 	newerMaster := testBlockID(-1, topShard, 101)
 	olderMaster := testBlockID(-1, topShard, 100)
@@ -557,9 +610,11 @@ func TestStateRootForCompressedBlockUsesLiveShardState(t *testing.T) {
 func TestStateRootForCompressedBlockUsesRecentlyAppliedShardState(t *testing.T) {
 	block := testBlockID(0, topShard, 124)
 	root := testShardStateCell(t, block)
-	svc := &Service{}
+	svc := &Service{
+		compressedStateCache: make(map[tnstore.BlockRootHash]compressedBlockStateEntry),
+	}
 
-	if !svc.rememberCompressedBlockState(&tnstore.BlockState{
+	if !svc.RememberCompressedBlockState(&tnstore.BlockState{
 		Block: block,
 		Cell:  root,
 	}) {
@@ -617,9 +672,10 @@ func TestCurrentBroadcastValidatorConfigUsesLiveCurrentState(t *testing.T) {
 
 func TestShardPrefetchDoesNotMarkScheduledWhenSlotUnavailable(t *testing.T) {
 	runner := &nextSyncRunner{
-		service:            &Service{node: &p2p.Node{}},
-		ctx:                context.Background(),
-		shardPrefetchSlots: make(chan struct{}, 1),
+		service:                &Service{node: &p2p.Node{}},
+		ctx:                    context.Background(),
+		shardPrefetchSlots:     make(chan struct{}, 1),
+		shardPrefetchScheduled: map[tnstore.BlockRootHash]struct{}{},
 	}
 	runner.shardPrefetchSlots <- struct{}{}
 
@@ -689,7 +745,7 @@ func TestPersistArchiveCurrentStateReturnsSavedRoots(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current), nil)
+	persisted, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(testCurrentBlockStates(current), current), newTestStateCellWindowCache(nil).beginCheckpoint())
 	if err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
@@ -733,7 +789,7 @@ func TestPersistArchiveCurrentStateStoresHistoricalAppliedStates(t *testing.T) {
 		ctx:     ctx,
 	}
 
-	if _, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(states, current), nil); err != nil {
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, testStateCheckpointEntriesForCurrent(states, current), newTestStateCellWindowCache(nil).beginCheckpoint()); err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
 	if _, err := store.BlockState(ctx, historical.Block); err != nil {
@@ -769,7 +825,7 @@ func TestPersistArchiveCurrentStateMarksLiveCheckpointStatesFlushed(t *testing.T
 		ctx:     ctx,
 	}
 
-	if _, err := runner.persistArchiveCurrentState(current, 1, 0, entries, nil); err != nil {
+	if _, err := runner.persistArchiveCurrentState(current, 1, 0, entries, newTestStateCellWindowCache(nil).beginCheckpoint()); err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
 
@@ -816,7 +872,7 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 		StateRootHash: stateRootHash[:],
 	}
 
-	overlay := newStateCellWindowCache(store.LazyCellLoader())
+	overlay := newTestStateCellWindowCache(store.LazyCellLoader())
 	currentCells, err := tnstore.PrepareReachableStateCells(current.Masterchain.Cell)
 	if err != nil {
 		t.Fatalf("prepare current cells: %v", err)
@@ -879,7 +935,7 @@ func TestPersistArchiveCurrentStateUsesPrewrittenCells(t *testing.T) {
 		StateRootHash: stateRootHash[:],
 	}
 
-	overlay := newStateCellWindowCache(store.LazyCellLoader())
+	overlay := newTestStateCellWindowCache(store.LazyCellLoader())
 	overlay.setPrewriter(svc.stateCellPrewrite)
 	currentCells, err := tnstore.PrepareReachableStateCells(current.Masterchain.Cell)
 	if err != nil {
@@ -916,11 +972,11 @@ func TestPersistArchiveCurrentStateUsesPrewrittenCells(t *testing.T) {
 func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
-	svc := &Service{log: zerolog.Nop(), storage: store}
+	svc := newCurrentStatePersistenceTestService(t, store, nil)
 
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
-	overlay := newStateCellWindowCache(nil)
+	overlay := newTestStateCellWindowCache(nil)
 	if err := overlay.rememberApplied(root, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember checkpoint cells: %v", err)
 	}
@@ -944,9 +1000,10 @@ func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 		current:             current,
 		lastCheckpointSeqno: master.SeqNo - 1,
 		stateCells:          overlay,
+		importCache:         newArchiveImportCache(),
 	}
 	rememberFullCheckpointStateForTest(t, &runner.checkpointStates, &current.Masterchain)
-	if _, err := runner.startCheckpoint("test"); err != nil {
+	if err := runner.startCheckpoint("test"); err != nil {
 		t.Fatalf("start checkpoint: %v", err)
 	}
 	if _, err := runner.finishCheckpoint(true); err != nil {
@@ -962,7 +1019,7 @@ func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 func TestNextBlockCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
-	svc := &Service{log: zerolog.Nop(), storage: store, shutdownContext: ctx}
+	svc := newCurrentStatePersistenceTestService(t, store, ctx)
 
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
@@ -979,7 +1036,7 @@ func TestNextBlockCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) 
 		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
 	}
 
-	stateCells := newStateCellWindowCache(nil)
+	stateCells := newTestStateCellWindowCache(nil)
 	if err := stateCells.addPreparedStateRecords(rootHash, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember checkpoint cells: %v", err)
 	}
@@ -1004,7 +1061,7 @@ func TestNextBlockCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) 
 func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 	ctx := context.Background()
 	store := openTestPebbleStorage(t)
-	svc := &Service{log: zerolog.Nop(), storage: store, shutdownContext: ctx}
+	svc := newCurrentStatePersistenceTestService(t, store, ctx)
 
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
@@ -1021,7 +1078,7 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 		Shards: map[tnstore.ShardKey]tnstore.BlockState{},
 	}
 
-	stateCells := newStateCellWindowCache(nil)
+	stateCells := newTestStateCellWindowCache(nil)
 	if err := stateCells.addPreparedStateRecords(rootHash, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember checkpoint cells: %v", err)
 	}
@@ -1065,7 +1122,7 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 	if callbackSawUnlocked {
 		t.Fatal("checkpoint metadata callback ran after persist mutex was unlocked")
 	}
-	if stale := runner.stateCells.beginCheckpoint(); stale != nil {
+	if stale := runner.stateCells.beginCheckpoint(); len(stale.records()) != 0 {
 		t.Fatal("async checkpoint left completed cell snapshot pending")
 	}
 	if remaining := runner.checkpointStates.cloneEntries(); len(remaining) != 0 {
@@ -1076,17 +1133,15 @@ func TestNextBlockAsyncCheckpointCompletesSnapshotBeforeUnlock(t *testing.T) {
 func TestNextMasterApplyCellsArePrivateUntilCheckpointMetadata(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x52, 8).EndCell()
 	records := mustPreparedReachableStateCells(t, root)
-	shared := newStateCellWindowCache(nil)
+	shared := newTestStateCellWindowCache(nil)
 	applyCells := newNextMasterApplyCellWindow(func(hash cell.Hash) (*cell.Cell, error) {
 		return shared.loader()(hash)
 	})
 
 	block := testBlockID(-1, topShard, 75)
 	applyCells.remember(block, records)
-	if checkpoint := shared.beginCheckpoint(); checkpoint != nil {
-		if hasCellRecord(checkpoint.records(), root.HashKey()) {
-			t.Fatal("apply-ahead cells leaked into checkpoint before metadata")
-		}
+	if checkpoint := shared.beginCheckpoint(); hasCellRecord(checkpoint.records(), root.HashKey()) {
+		t.Fatal("apply-ahead cells leaked into checkpoint before metadata")
 	}
 
 	if err := shared.addPreparedStateRecords(root.HashKey(0), records); err != nil {
@@ -1094,9 +1149,6 @@ func TestNextMasterApplyCellsArePrivateUntilCheckpointMetadata(t *testing.T) {
 	}
 	applyCells.forget(block)
 	checkpoint := shared.beginCheckpoint()
-	if checkpoint == nil {
-		t.Fatal("committed master cells did not enter checkpoint")
-	}
 	if !hasCellRecord(checkpoint.records(), root.HashKey()) {
 		t.Fatal("checkpoint does not contain cells committed with metadata")
 	}
@@ -1106,7 +1158,7 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 	ctx := context.Background()
 	shutdownCtx, cancelShutdown := context.WithCancel(ctx)
 	store := openTestPebbleStorage(t)
-	svc := &Service{log: zerolog.Nop(), storage: store, shutdownContext: shutdownCtx}
+	svc := newCurrentStatePersistenceTestService(t, store, shutdownCtx)
 
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
@@ -1132,7 +1184,7 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 		current:      current,
 		stagedBlocks: 1,
 		timing:       newCatchUpTiming(time.Now()),
-		stateCells:   newStateCellWindowCache(nil),
+		stateCells:   newTestStateCellWindowCache(nil),
 	}
 	if err := runner.stateCells.addPreparedRecords(preparedCells); err != nil {
 		t.Fatalf("add prepared records: %v", err)
@@ -1159,14 +1211,14 @@ func TestFlushStagedCurrentAsyncFailureKeepsCheckpointStates(t *testing.T) {
 func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.T) {
 	ctx := context.Background()
 	store := openManualTestPebbleStorage(t)
-	svc := &Service{log: zerolog.Nop(), storage: store}
+	svc := newCurrentStatePersistenceTestService(t, store, nil)
 
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
 	preparedCells := mustPreparedReachableStateCells(t, root)
 	preparedCells = removePreparedCellRecord(preparedCells, root.HashKey())
 
-	overlay := newStateCellWindowCache(nil)
+	overlay := newTestStateCellWindowCache(nil)
 	overlay.addPreparedRecords(preparedCells)
 
 	rootHash := root.HashKey(0)
@@ -1193,7 +1245,7 @@ func TestArchiveCheckpointReleasesRetainedCellLoaderOnPersistFailure(t *testing.
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store before checkpoint: %v", err)
 	}
-	if _, err := runner.startCheckpoint("test"); err != nil {
+	if err := runner.startCheckpoint("test"); err != nil {
 		t.Fatalf("start checkpoint: %v", err)
 	}
 	if _, err := runner.finishCheckpoint(true); err == nil {
@@ -1307,11 +1359,11 @@ func TestVerifiedMasterchainQueueAcceptsBroadcastOutsideCatchUp(t *testing.T) {
 	next := testMasterBlockID(11)
 	downloaded := testPreparedMasterchainBlock(prev, next)
 
-	svc := &Service{}
+	svc := newMasterchainQueueTestService()
 	svc.queuePreparedMasterchainBlockFromSource(downloaded, p2p.PeerID{})
 
-	got, ok := svc.takeQueuedMasterchainBlock(prev, next)
-	if !ok {
+	got, err := svc.takeQueuedMasterchainBlock(prev, next)
+	if err != nil {
 		t.Fatal("expected queued masterchain block to be available")
 	}
 	if !got.ID.Equals(&next) {
@@ -1331,27 +1383,27 @@ func TestMasterchainBroadcastCandidateWaitsForValidation(t *testing.T) {
 		prevRef: prev,
 	}
 
-	svc := &Service{}
+	svc := newMasterchainQueueTestService()
 	svc.queueMasterchainBroadcastCandidateFromSource(downloaded, testPeerID("peer-a"))
 
-	if _, ok := svc.takeQueuedMasterchainBlock(prev, next); ok {
+	if _, err := svc.takeQueuedMasterchainBlock(prev, next); err == nil {
 		t.Fatal("unverified broadcast candidate must not be returned by verified fast path")
 	}
-	candidate, ok := svc.peekQueuedMasterchainCandidate(prev, next)
-	if !ok {
+	candidate, err := svc.peekQueuedMasterchainCandidate(prev, next)
+	if err != nil {
 		t.Fatal("expected queued masterchain broadcast candidate")
 	}
 	if candidate.sourcePeerID != testPeerID("peer-a") {
 		t.Fatalf("candidate source = %q, want peer-a", candidate.sourcePeerID)
 	}
-	future, ok := svc.queuedMasterchainFuture(testMasterBlockID(9))
-	if !ok || !future.block.Equals(&next) {
-		t.Fatalf("candidate future = %v %s, want %s", ok, tnstore.FormatBlockRef(future.block), tnstore.FormatBlockRef(next))
+	future, err := svc.queuedMasterchainFuture(testMasterBlockID(9))
+	if err != nil || !future.block.Equals(&next) {
+		t.Fatalf("candidate future = %v %s, want %s", err, tnstore.FormatBlockRef(future.block), tnstore.FormatBlockRef(next))
 	}
 }
 
 func TestVerifiedMasterchainQueueDropsFarFutureWhenFull(t *testing.T) {
-	svc := &Service{}
+	svc := newMasterchainQueueTestService()
 	for seqno := uint32(10); seqno < 10+nextMasterchainQueueLimit; seqno++ {
 		prev := testMasterBlockID(seqno)
 		next := testMasterBlockID(seqno + 1)
@@ -1364,10 +1416,10 @@ func TestVerifiedMasterchainQueueDropsFarFutureWhenFull(t *testing.T) {
 	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(farPrev, farNext), p2p.PeerID{})
 
 	oldestNext := testMasterBlockID(11)
-	if got, ok := svc.takeQueuedMasterchainBlock(oldestPrev, oldestNext); !ok || !got.ID.Equals(&oldestNext) {
-		t.Fatalf("expected oldest queued masterchain block to stay available, got ok=%v block=%s", ok, tnstore.FormatBlockRef(got.ID))
+	if got, err := svc.takeQueuedMasterchainBlock(oldestPrev, oldestNext); err != nil || !got.ID.Equals(&oldestNext) {
+		t.Fatalf("expected oldest queued masterchain block to stay available, got err=%v block=%s", err, tnstore.FormatBlockRef(got.ID))
 	}
-	if _, ok := svc.takeQueuedMasterchainBlock(farPrev, farNext); ok {
+	if _, err := svc.takeQueuedMasterchainBlock(farPrev, farNext); err == nil {
 		t.Fatal("expected far future masterchain block to be dropped")
 	}
 }
@@ -1376,16 +1428,16 @@ func TestVerifiedMasterchainQueueSeqnoIndexDoesNotDeleteReplacement(t *testing.T
 	oldPrev := testMasterBlockID(10)
 	newPrev := testMasterBlockID(20)
 	block := testMasterBlockID(21)
-	svc := &Service{}
+	svc := newMasterchainQueueTestService()
 
 	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(oldPrev, block), testPeerID("old"))
 	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(newPrev, block), testPeerID("new"))
 
-	if _, ok := svc.takeQueuedMasterchainBlock(oldPrev, block); ok {
+	if _, err := svc.takeQueuedMasterchainBlock(oldPrev, block); err == nil {
 		t.Fatal("expected same-seqno replacement to remove old prev entry")
 	}
-	if got, ok := svc.takeQueuedMasterchainBlock(newPrev, block); !ok || !got.ID.Equals(&block) {
-		t.Fatalf("expected replacement block, got ok=%v block=%s", ok, tnstore.FormatBlockRef(got.ID))
+	if got, err := svc.takeQueuedMasterchainBlock(newPrev, block); err != nil || !got.ID.Equals(&block) {
+		t.Fatalf("expected replacement block, got err=%v block=%s", err, tnstore.FormatBlockRef(got.ID))
 	}
 }
 
@@ -1393,11 +1445,11 @@ func TestQueuedMasterchainBlockAheadReportsFutureBlock(t *testing.T) {
 	current := testMasterBlockID(10)
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
-	svc := &Service{}
+	svc := newMasterchainQueueTestService()
 	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(futurePrev, future), p2p.PeerID{})
 
-	got, ok := svc.queuedMasterchainFuture(current)
-	if !ok {
+	got, err := svc.queuedMasterchainFuture(current)
+	if err != nil {
 		t.Fatal("expected queued future masterchain block")
 	}
 	if !got.block.Equals(&future) {
@@ -1409,11 +1461,11 @@ func TestQueuedMasterchainFutureReportsMissingSeqnoAndSource(t *testing.T) {
 	current := testMasterBlockID(10)
 	futurePrev := testMasterBlockID(12)
 	future := testMasterBlockID(13)
-	svc := &Service{}
+	svc := newMasterchainQueueTestService()
 	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
 
-	got, ok := svc.queuedMasterchainFuture(current)
-	if !ok {
+	got, err := svc.queuedMasterchainFuture(current)
+	if err != nil {
 		t.Fatal("expected queued future masterchain block")
 	}
 	if !got.block.Equals(&future) {
@@ -1429,12 +1481,13 @@ func TestQueuedMasterchainFutureReportsMissingSeqnoAndSource(t *testing.T) {
 
 func TestNextBlockBootstrapProbeDecisionWidensFanout(t *testing.T) {
 	prev := testMasterBlockID(100)
-	base, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{})
+	svc := newMasterchainProbeTestService(t)
+	base := mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{})
 	if base.peerLimit != nextBlockBootstrapProbePeers {
 		t.Fatalf("base probe peers = %d, want %d", base.peerLimit, nextBlockBootstrapProbePeers)
 	}
 
-	urgent, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{
+	urgent := mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{
 		consecutiveMisses: nextBlockBootstrapUrgentMisses,
 		liveTail:          true,
 	})
@@ -1442,7 +1495,7 @@ func TestNextBlockBootstrapProbeDecisionWidensFanout(t *testing.T) {
 		t.Fatalf("urgent probe peers = %d, want %d", urgent.peerLimit, nextBlockBootstrapUrgentPeers)
 	}
 
-	wide, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{
+	wide := mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{
 		consecutiveMisses: nextBlockBootstrapWideMisses,
 		liveTail:          true,
 	})
@@ -1450,7 +1503,7 @@ func TestNextBlockBootstrapProbeDecisionWidensFanout(t *testing.T) {
 		t.Fatalf("wide probe peers = %d, want %d", wide.peerLimit, nextBlockBootstrapWidePeers)
 	}
 
-	catchUpWide, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{
+	catchUpWide := mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{
 		consecutiveMisses: nextBlockBootstrapWideMisses,
 	})
 	if catchUpWide.peerLimit != nextBlockBootstrapWidePeers {
@@ -1462,10 +1515,10 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	prev := testMasterBlockID(100)
 	futurePrev := testMasterBlockID(101)
 	future := testMasterBlockID(102)
-	svc := &Service{}
+	svc := newMasterchainProbeTestService(t)
 	svc.queuePreparedMasterchainBlockFromSource(testPreparedMasterchainBlock(futurePrev, future), testPeerID("peer-a"))
 
-	queued, _ := svc.nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{})
+	queued := mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{})
 	if queued.peerLimit != nextBlockBootstrapProbePeers {
 		t.Fatalf("cold queued future probe peers = %d, want %d", queued.peerLimit, nextBlockBootstrapProbePeers)
 	}
@@ -1473,7 +1526,7 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 		t.Fatalf("cold queued future preferred source = %q, want empty", queued.preferredSourcePeerID)
 	}
 
-	queued, _ = svc.nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{liveTail: true})
+	queued = mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{liveTail: true})
 	if queued.peerLimit != nextBlockBootstrapUrgentPeers {
 		t.Fatalf("queued future probe peers = %d, want %d", queued.peerLimit, nextBlockBootstrapUrgentPeers)
 	}
@@ -1487,7 +1540,7 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 		t.Fatalf("queued future lowest missing = %d, want %d", queued.lowestMissingSeqno, prev.SeqNo+1)
 	}
 
-	baseLive, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, 0, nextBlockBootstrapProbeState{liveTail: true})
+	baseLive := mustNextBlockBootstrapProbeDecision(t, svc, prev, 0, nextBlockBootstrapProbeState{liveTail: true})
 	if baseLive.probeTimeout() != nextBlockBootstrapLiveProbeTimeout {
 		t.Fatalf("live probe timeout = %s, want %s", baseLive.probeTimeout(), nextBlockBootstrapLiveProbeTimeout)
 	}
@@ -1496,12 +1549,12 @@ func TestNextBlockBootstrapProbeDecisionUsesFutureQueueAndLag(t *testing.T) {
 	}
 
 	oldUTime := time.Now().Add(-time.Duration(nextBlockBootstrapWideLagSeconds+1) * time.Second).Unix()
-	lagged, _ := (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{liveTail: true})
+	lagged := mustNextBlockBootstrapProbeDecision(t, svc, prev, oldUTime, nextBlockBootstrapProbeState{liveTail: true})
 	if lagged.peerLimit != nextBlockBootstrapWidePeers {
 		t.Fatalf("lagged probe peers = %d, want %d", lagged.peerLimit, nextBlockBootstrapWidePeers)
 	}
 
-	lagged, _ = (&Service{}).nextBlockBootstrapProbeDecision(prev, oldUTime, nextBlockBootstrapProbeState{})
+	lagged = mustNextBlockBootstrapProbeDecision(t, svc, prev, oldUTime, nextBlockBootstrapProbeState{})
 	if lagged.peerLimit != nextBlockBootstrapWidePeers {
 		t.Fatalf("lagged catch-up probe peers = %d, want %d", lagged.peerLimit, nextBlockBootstrapWidePeers)
 	}
@@ -1646,7 +1699,7 @@ func TestNextBlockBootstrapProbePace(t *testing.T) {
 func TestHoldNextMasterchainProbeReturnsQueuedBlock(t *testing.T) {
 	prev := testMasterBlockID(100)
 	next := testMasterBlockID(101)
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := newMasterchainProbeTestService(t)
 
 	state := &nextBlockBootstrapProbeState{liveTail: true}
 	type holdResult struct {
@@ -1680,7 +1733,7 @@ func TestHoldNextMasterchainProbeReturnsQueuedBlock(t *testing.T) {
 
 func TestHoldNextMasterchainProbeExpires(t *testing.T) {
 	prev := testMasterBlockID(100)
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := newMasterchainProbeTestService(t)
 	state := &nextBlockBootstrapProbeState{liveTail: true}
 
 	started := time.Now()
@@ -1820,7 +1873,7 @@ func TestCurrentStateWakeInterruptsShardStateCatchUpRetry(t *testing.T) {
 func TestNextMasterchainApplyCandidateUsesBroadcastWhilePeerProbePrepares(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := newMasterchainQueueTestService()
 	result := make(chan nextBlockProbeResult, 1)
 
 	queryCtx, cancelQuery := context.WithCancel(context.Background())
@@ -1871,7 +1924,7 @@ func TestNextMasterchainApplyCandidateUsesBroadcastWhilePeerProbePrepares(t *tes
 func TestNextMasterchainApplyCandidateReturnsPreparedPeerResult(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := newMasterchainQueueTestService()
 	result := make(chan nextBlockProbeResult, 1)
 	prepared := testPreparedMasterchainBlock(prev, next)
 	prepared.PrepareElapsed = 7 * time.Millisecond
@@ -1913,7 +1966,7 @@ func TestNextMasterchainApplyCandidateReturnsPreparedPeerResult(t *testing.T) {
 func TestNextMasterchainApplyCandidateDoesNotTimeoutAfterProbeReturned(t *testing.T) {
 	prev := testMasterBlockID(10)
 	next := testMasterBlockID(11)
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := newMasterchainQueueTestService()
 	result := make(chan nextBlockProbeResult, 1)
 	probeReturned := make(chan struct{})
 	close(probeReturned)
@@ -2005,15 +2058,12 @@ func TestFlushStagedCurrentSyncPersistsAfterContextCancel(t *testing.T) {
 	defer cancelShutdown()
 
 	runner := &nextSyncRunner{
-		service: &Service{
-			log:             zerolog.Nop(),
-			storage:         store,
-			shutdownContext: shutdownCtx,
-		},
+		service:      newCurrentStatePersistenceTestService(t, store, shutdownCtx),
 		ctx:          ctx,
 		current:      current,
 		stagedBlocks: 1,
 		timing:       newCatchUpTiming(time.Now()),
+		stateCells:   newTestStateCellWindowCache(nil),
 	}
 	for _, state := range testCurrentBlockStates(current) {
 		rememberFullCheckpointStateForTest(t, &runner.checkpointStates, state)
@@ -2051,15 +2101,12 @@ func TestFlushStagedCurrentSyncStopsWhenShutdownContextCanceled(t *testing.T) {
 	cancelShutdown()
 
 	runner := &nextSyncRunner{
-		service: &Service{
-			log:             zerolog.Nop(),
-			storage:         store,
-			shutdownContext: shutdownCtx,
-		},
+		service:      newCurrentStatePersistenceTestService(t, store, shutdownCtx),
 		ctx:          ctx,
 		current:      current,
 		stagedBlocks: 1,
 		timing:       newCatchUpTiming(time.Now()),
+		stateCells:   newTestStateCellWindowCache(nil),
 	}
 	for _, state := range testCurrentBlockStates(current) {
 		rememberFullCheckpointStateForTest(t, &runner.checkpointStates, state)

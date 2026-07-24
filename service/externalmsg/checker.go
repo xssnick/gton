@@ -102,7 +102,7 @@ func (c *Checker) CheckBOC(ctx context.Context, data []byte) (CheckResult, error
 }
 
 func (c *Checker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, msg *tlb.ExternalMessage) (CheckResult, error) {
-	blocks, err := c.currentBlocks(ctx, msg.DstAddr)
+	blocks, err := c.store.CurrentAccountBlocks(ctx, msg.DstAddr.Workchain(), msg.DstAddr.Data())
 	if err != nil {
 		return CheckResult{}, err
 	}
@@ -256,10 +256,6 @@ func ParseMessage(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {
 	}
 
 	return root, &msg, nil
-}
-
-func (c *Checker) currentBlocks(ctx context.Context, addr *address.Address) (liveview.CurrentAccountBlockIDs, error) {
-	return c.store.CurrentAccountBlocks(ctx, addr.Workchain(), addr.Data())
 }
 
 func blockIDEqual(a ton.BlockIDExt, b ton.BlockIDExt) bool {

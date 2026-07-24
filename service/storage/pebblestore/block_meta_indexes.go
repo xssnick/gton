@@ -87,7 +87,7 @@ func blockStateMetaFromReader(reader pebbleReader, block ton.BlockIDExt) (storag
 }
 
 func blockStateMasterchainRefFromMeta(reader pebbleReader, meta *storage.BlockMeta) (*ton.BlockIDExt, error) {
-	if meta == nil || isMasterchainBlock(meta.ID) || !meta.MasterchainRefKnown() {
+	if isMasterchainBlock(meta.ID) || !meta.MasterchainRefKnown() {
 		return nil, nil
 	}
 
@@ -106,9 +106,6 @@ func (s *Store) SaveBlockMeta(meta *storage.BlockMeta) error {
 }
 
 func validateStoredBlockMetaUpdate(meta *storage.BlockMeta) error {
-	if meta == nil {
-		return fmt.Errorf("block meta is missing")
-	}
 	if len(meta.NextRefs) > 0 {
 		return fmt.Errorf("block meta %s cannot set next refs directly", storage.FormatBlockRef(meta.ID))
 	}
@@ -172,7 +169,133 @@ func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.B
 }
 
 func (s *Store) LookupBlockBySeqNo(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
-	return s.lookupServedBlockBySeqNo(ctx, ref)
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer s.releaseHotDB()
+
+	block, err := lookupBlockBySeqNoWithReader(db, ref)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if err = requireServedFullBlock(db, block); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return block, nil
+}
+
+func (s *Store) LookupBlockBySeqNoForPrefix(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer s.releaseHotDB()
+
+	var prefixBuf, seekBuf [32]byte
+	// Shard seqno ranges continue across split and merge boundaries, so a
+	// direct hit cannot conflict with another block on the prefix path.
+	directKey := appendHotKeyBlockSeqIndex(seekBuf[:0], ref)
+	direct, err := lookupBlockBySeqNoWithKey(db, ref, directKey)
+	if err == nil {
+		if err = requireServedFullBlock(db, direct); err != nil {
+			return ton.BlockIDExt{}, err
+		}
+		return direct, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return ton.BlockIDExt{}, err
+	}
+	if ref.Workchain == -1 {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+
+	snap := db.NewSnapshot()
+	defer func() { _ = snap.Close() }()
+
+	workchainPrefix := hotKeyBlockSeqWorkchainPrefix(ref.Workchain)
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: workchainPrefix,
+		UpperBound: prefixUpperBound(workchainPrefix),
+	})
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	maxDepth := uint32(60)
+	historyFound := false
+	for depth := uint32(0); depth <= maxDepth; depth++ {
+		select {
+		case <-ctx.Done():
+			return ton.BlockIDExt{}, ctx.Err()
+		default:
+		}
+
+		candidateKey := storage.BlockHistoryKey{
+			Workchain: ref.Workchain,
+			Shard:     storage.AccountShardPrefix(uint64(ref.Shard), depth),
+		}
+		block, err := lookupBlockBySeqNoInHistoryWithIterator(iter, candidateKey, ref.SeqNo, &prefixBuf, &seekBuf)
+		if errors.Is(err, errBlockHistoryMissing) {
+			if historyFound {
+				break
+			}
+			continue
+		}
+		historyFound = true
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return ton.BlockIDExt{}, err
+		}
+		if err = requireServedFullBlock(snap, block); err != nil {
+			return ton.BlockIDExt{}, err
+		}
+		return block, nil
+	}
+
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func lookupBlockBySeqNoInHistoryWithIterator(
+	iter *pebble.Iterator,
+	key storage.BlockHistoryKey,
+	seqno uint32,
+	prefixBuf, seekBuf *[32]byte,
+) (ton.BlockIDExt, error) {
+	prefix := appendHotKeyBlockSeqPrefix(prefixBuf[:0], key)
+	seek := appendHotKeyBlockSeqIndex(seekBuf[:0], storage.BlockSeqRef{
+		Workchain: key.Workchain,
+		Shard:     key.Shard,
+		SeqNo:     seqno,
+	})
+	ok := iter.SeekGE(seek)
+	if ok && bytes.HasPrefix(iter.Key(), prefix) {
+		indexedSeqno := binary.BigEndian.Uint32(iter.Key()[len(prefix) : len(prefix)+4])
+		if indexedSeqno == seqno {
+			return decodeBlockIDFromHashes(key.Workchain, key.Shard, seqno, iter.Value())
+		}
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	if err := iter.Error(); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+
+	var previous bool
+	if ok {
+		previous = iter.Prev()
+	} else {
+		previous = iter.SeekLT(seek)
+	}
+	if previous && bytes.HasPrefix(iter.Key(), prefix) {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	if err := iter.Error(); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return ton.BlockIDExt{}, errBlockHistoryMissing
 }
 
 func (s *Store) NextKeyBlocks(ctx context.Context, after uint32, limit int) ([]ton.BlockIDExt, error) {
@@ -318,12 +441,19 @@ func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey
 }
 
 func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
-	shards := storage.AccountShardCandidates(workchain, account)
-	if len(shards) == 0 {
+	if workchain != -1 && len(account) < 8 {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 
-	prefix := hotKeyBlockLTWorkchainPrefix(workchain)
+	var prefix uint64
+	if workchain != -1 {
+		prefix = binary.BigEndian.Uint64(account[:8])
+	}
+	return s.LookupBlockByLTForPrefix(ctx, storage.BlockHistoryKey{Workchain: workchain, Shard: int64(prefix)}, lt)
+}
+
+func (s *Store) LookupBlockByLTForPrefix(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	prefix := hotKeyBlockLTWorkchainPrefix(key.Workchain)
 
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {
@@ -343,17 +473,60 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 	}
 	defer func() { _ = iter.Close() }()
 
-	var best blockLTIndexRef
-	found := false
+	var prefixBuf, seekBuf [32]byte
+	direct, directErr := lookupBlockByLTInHistoryWithIterator(iter, key, lt, &prefixBuf, &seekBuf)
+	if directErr == nil {
+		meta, metaErr := blockLookupMetaFromReader(snap, direct.block)
+		if metaErr != nil && !errors.Is(metaErr, storage.ErrNotFound) {
+			return ton.BlockIDExt{}, metaErr
+		}
 
-	for _, shard := range shards {
+		directSafe := key.Workchain == -1 || storage.ShardPrefixLength(key.Shard) == 0
+		// The strict comparison preserves the split boundary: at StartLT the
+		// parent block may be the exact C++ result.
+		if metaErr == nil && meta.startLT != 0 && meta.startLT < lt {
+			directSafe = true
+		}
+		if directSafe {
+			if metaErr != nil {
+				return ton.BlockIDExt{}, metaErr
+			}
+			if meta.flags&storage.BlockMetaHasServedFull == 0 {
+				return ton.BlockIDExt{}, storage.ErrNotFound
+			}
+			return direct.block, nil
+		}
+	} else if !errors.Is(directErr, storage.ErrNotFound) && !errors.Is(directErr, errBlockHistoryMissing) {
+		return ton.BlockIDExt{}, directErr
+	}
+
+	var best blockHistoryIndexRef
+	found := false
+	historyFound := false
+
+	maxDepth := uint32(60)
+	if key.Workchain == -1 {
+		maxDepth = 0
+	}
+	for depth := uint32(0); depth <= maxDepth; depth++ {
 		select {
 		case <-ctx.Done():
 			return ton.BlockIDExt{}, ctx.Err()
 		default:
 		}
 
-		ref, err := lookupBlockByLTWithIterator(iter, storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
+		candidateKey := storage.BlockHistoryKey{
+			Workchain: key.Workchain,
+			Shard:     storage.AccountShardPrefix(uint64(key.Shard), depth),
+		}
+		ref, err := lookupBlockByLTInHistoryWithIterator(iter, candidateKey, lt, &prefixBuf, &seekBuf)
+		if errors.Is(err, errBlockHistoryMissing) {
+			if historyFound {
+				break
+			}
+			continue
+		}
+		historyFound = true
 		if errors.Is(err, storage.ErrNotFound) {
 			if iterErr := iter.Error(); iterErr != nil {
 				return ton.BlockIDExt{}, iterErr
@@ -362,6 +535,12 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 		}
 		if err != nil {
 			return ton.BlockIDExt{}, err
+		}
+		if ref.exact {
+			if err = requireServedFullBlock(snap, ref.block); err != nil {
+				return ton.BlockIDExt{}, err
+			}
+			return ref.block, nil
 		}
 
 		if !found || best.seqno > ref.seqno {
@@ -381,29 +560,219 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 	return best.block, nil
 }
 
-type blockLTIndexRef struct {
+type blockHistoryIndexRef struct {
 	block ton.BlockIDExt
 	seqno uint32
+	exact bool
 }
 
-func lookupBlockByLTWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (blockLTIndexRef, error) {
+var errBlockHistoryMissing = errors.New("block history is missing")
+
+func lookupBlockByLTInHistoryWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64, prefixBuf, seekBuf *[32]byte) (blockHistoryIndexRef, error) {
+	prefix := appendHotKeyBlockLTPrefix(prefixBuf[:0], key)
+	seek := appendHotKeyBlockLTSeekGE(seekBuf[:0], key, lt)
+	ok := iter.SeekGE(seek)
+	if ok && bytes.HasPrefix(iter.Key(), prefix) {
+		indexedLT := binary.BigEndian.Uint64(iter.Key()[len(prefix) : len(prefix)+8])
+		ref, err := decodeBlockLTIndexKey(iter.Key())
+		if err != nil {
+			return blockHistoryIndexRef{}, err
+		}
+		block, err := decodeBlockIDFromHashes(ref.Workchain, ref.Shard, ref.SeqNo, iter.Value())
+		if err != nil {
+			return blockHistoryIndexRef{}, err
+		}
+		return blockHistoryIndexRef{block: block, seqno: ref.SeqNo, exact: indexedLT == lt}, nil
+	}
+	if err := iter.Error(); err != nil {
+		return blockHistoryIndexRef{}, err
+	}
+
+	var previous bool
+	if ok {
+		previous = iter.Prev()
+	} else {
+		previous = iter.SeekLT(seek)
+	}
+	if previous && bytes.HasPrefix(iter.Key(), prefix) {
+		return blockHistoryIndexRef{}, storage.ErrNotFound
+	}
+	if err := iter.Error(); err != nil {
+		return blockHistoryIndexRef{}, err
+	}
+	return blockHistoryIndexRef{}, errBlockHistoryMissing
+}
+
+func lookupBlockByLTWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (blockHistoryIndexRef, error) {
 	prefix := hotKeyBlockLTPrefix(key)
 	if !iter.SeekGE(hotKeyBlockLTSeekGE(key, lt)) || !bytes.HasPrefix(iter.Key(), prefix) {
-		return blockLTIndexRef{}, storage.ErrNotFound
+		return blockHistoryIndexRef{}, storage.ErrNotFound
 	}
 	ref, err := decodeBlockLTIndexKey(iter.Key())
 	if err != nil {
-		return blockLTIndexRef{}, err
+		return blockHistoryIndexRef{}, err
 	}
 	block, err := decodeBlockIDFromHashes(ref.Workchain, ref.Shard, ref.SeqNo, iter.Value())
 	if err != nil {
-		return blockLTIndexRef{}, err
+		return blockHistoryIndexRef{}, err
 	}
-	return blockLTIndexRef{block: block, seqno: ref.SeqNo}, nil
+	indexedLT := binary.BigEndian.Uint64(iter.Key()[len(prefix) : len(prefix)+8])
+	return blockHistoryIndexRef{block: block, seqno: ref.SeqNo, exact: indexedLT == lt}, nil
 }
 
 func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
 	return s.lookupBlockByLowerBoundIndex(ctx, hotKeyBlockUTimePrefix(key), hotKeyBlockUTimeSeekGE(key, utime), decodeBlockUTimeIndexKey)
+}
+
+func (s *Store) LookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
+	prefix := hotKeyBlockUTimeWorkchainPrefix(key.Workchain)
+
+	db, err := s.acquireHotDB(ctx)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer s.releaseHotDB()
+
+	snap := db.NewSnapshot()
+	defer func() { _ = snap.Close() }()
+
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var prefixBuf, seekBuf [32]byte
+	direct, directErr := lookupBlockByUnixTimeInHistoryWithIterator(iter, key, utime, &prefixBuf, &seekBuf)
+	if directErr == nil {
+		directSafe := key.Workchain == -1 || storage.ShardPrefixLength(key.Shard) == 0
+		if !directSafe {
+			directSafe, err = unixTimeHistoryStartsBefore(iter, key, utime, &prefixBuf)
+			if err != nil {
+				return ton.BlockIDExt{}, err
+			}
+		}
+		if directSafe {
+			if err = requireServedFullBlock(snap, direct.block); err != nil {
+				return ton.BlockIDExt{}, err
+			}
+			return direct.block, nil
+		}
+	} else if !errors.Is(directErr, storage.ErrNotFound) && !errors.Is(directErr, errBlockHistoryMissing) {
+		return ton.BlockIDExt{}, directErr
+	}
+
+	var best blockHistoryIndexRef
+	found := false
+	historyFound := false
+
+	maxDepth := uint32(60)
+	if key.Workchain == -1 {
+		maxDepth = 0
+	}
+	for depth := uint32(0); depth <= maxDepth; depth++ {
+		select {
+		case <-ctx.Done():
+			return ton.BlockIDExt{}, ctx.Err()
+		default:
+		}
+
+		candidateKey := storage.BlockHistoryKey{
+			Workchain: key.Workchain,
+			Shard:     storage.AccountShardPrefix(uint64(key.Shard), depth),
+		}
+		ref, err := lookupBlockByUnixTimeInHistoryWithIterator(iter, candidateKey, utime, &prefixBuf, &seekBuf)
+		if errors.Is(err, errBlockHistoryMissing) {
+			if historyFound {
+				break
+			}
+			continue
+		}
+		historyFound = true
+		if errors.Is(err, storage.ErrNotFound) {
+			if iterErr := iter.Error(); iterErr != nil {
+				return ton.BlockIDExt{}, iterErr
+			}
+			continue
+		}
+		if err != nil {
+			return ton.BlockIDExt{}, err
+		}
+		if ref.exact {
+			if err = requireServedFullBlock(snap, ref.block); err != nil {
+				return ton.BlockIDExt{}, err
+			}
+			return ref.block, nil
+		}
+
+		if !found || best.seqno > ref.seqno {
+			best = ref
+			found = true
+		}
+	}
+	if err = iter.Error(); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	if !found {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	if err = requireServedFullBlock(snap, best.block); err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return best.block, nil
+}
+
+func lookupBlockByUnixTimeInHistoryWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, utime uint32, prefixBuf, seekBuf *[32]byte) (blockHistoryIndexRef, error) {
+	prefix := appendHotKeyBlockUTimePrefix(prefixBuf[:0], key)
+	seek := appendHotKeyBlockUTimeSeekGE(seekBuf[:0], key, utime)
+	ok := iter.SeekGE(seek)
+	if ok && bytes.HasPrefix(iter.Key(), prefix) {
+		indexedUTime := binary.BigEndian.Uint32(iter.Key()[len(prefix) : len(prefix)+4])
+		ref, err := decodeBlockUTimeIndexKey(iter.Key())
+		if err != nil {
+			return blockHistoryIndexRef{}, err
+		}
+		block, err := decodeBlockIDFromHashes(ref.Workchain, ref.Shard, ref.SeqNo, iter.Value())
+		if err != nil {
+			return blockHistoryIndexRef{}, err
+		}
+		return blockHistoryIndexRef{block: block, seqno: ref.SeqNo, exact: indexedUTime == utime}, nil
+	}
+	if err := iter.Error(); err != nil {
+		return blockHistoryIndexRef{}, err
+	}
+
+	var previous bool
+	if ok {
+		previous = iter.Prev()
+	} else {
+		previous = iter.SeekLT(seek)
+	}
+	if previous && bytes.HasPrefix(iter.Key(), prefix) {
+		return blockHistoryIndexRef{}, storage.ErrNotFound
+	}
+	if err := iter.Error(); err != nil {
+		return blockHistoryIndexRef{}, err
+	}
+	return blockHistoryIndexRef{}, errBlockHistoryMissing
+}
+
+func unixTimeHistoryStartsBefore(iter *pebble.Iterator, key storage.BlockHistoryKey, utime uint32, prefixBuf *[32]byte) (bool, error) {
+	prefix := appendHotKeyBlockUTimePrefix(prefixBuf[:0], key)
+	if !iter.SeekGE(prefix) || !bytes.HasPrefix(iter.Key(), prefix) {
+		if err := iter.Error(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	firstUTime := binary.BigEndian.Uint32(iter.Key()[len(prefix) : len(prefix)+4])
+	// Equal timestamps may cross a split boundary. Only an earlier timestamp
+	// in this history proves that no ancestor can match utime.
+	return firstUTime < utime, nil
 }
 
 func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {
@@ -509,9 +878,6 @@ func blockMetaIndexedInHistory(meta *storage.BlockMeta) bool {
 }
 
 func deleteBlockMetaHistoryIndexes(batch *pebble.Batch, meta *storage.BlockMeta) error {
-	if meta == nil {
-		return nil
-	}
 	ref := storage.BlockSeqRefFromBlock(meta.ID)
 	if err := batch.Delete(hotKeyBlockSeqIndex(ref), pebble.NoSync); err != nil {
 		return err
@@ -564,25 +930,14 @@ func (s *Store) lookupBlockBySeqNo(ctx context.Context, ref storage.BlockSeqRef)
 	return lookupBlockBySeqNoWithReader(db, ref)
 }
 
-func (s *Store) lookupServedBlockBySeqNo(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
-	db, err := s.acquireHotDB(ctx)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	defer s.releaseHotDB()
-
-	block, err := lookupBlockBySeqNoWithReader(db, ref)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if err = requireServedFullBlock(db, block); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	return block, nil
+func lookupBlockBySeqNoWithReader(reader pebbleReader, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
+	var keyBuf [32]byte
+	key := appendHotKeyBlockSeqIndex(keyBuf[:0], ref)
+	return lookupBlockBySeqNoWithKey(reader, ref, key)
 }
 
-func lookupBlockBySeqNoWithReader(reader pebbleReader, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
-	raw, closer, err := pebbleReaderGet(reader, hotKeyBlockSeqIndex(ref))
+func lookupBlockBySeqNoWithKey(reader pebbleReader, ref storage.BlockSeqRef, key []byte) (ton.BlockIDExt, error) {
+	raw, closer, err := pebbleReaderGet(reader, key)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -648,6 +1003,30 @@ func requireServedFullBlock(reader pebbleReader, block ton.BlockIDExt) error {
 		return storage.ErrNotFound
 	}
 	return nil
+}
+
+type blockLookupMeta struct {
+	flags   storage.BlockMetaFlags
+	startLT uint64
+}
+
+func blockLookupMetaFromReader(reader pebbleReader, block ton.BlockIDExt) (blockLookupMeta, error) {
+	metaRaw, closer, err := pebbleReaderGet(reader, hotKeyBlockMeta(block))
+	if err != nil {
+		return blockLookupMeta{}, err
+	}
+	defer func() { _ = closer.Close() }()
+
+	if len(metaRaw) < blockMetaMinEncodedLen {
+		return blockLookupMeta{}, fmt.Errorf("block meta payload too small")
+	}
+	if metaRaw[0] != blockMetaVersion {
+		return blockLookupMeta{}, fmt.Errorf("unsupported block meta version %d", metaRaw[0])
+	}
+	return blockLookupMeta{
+		flags:   storage.BlockMetaFlags(binary.BigEndian.Uint32(metaRaw[1:5])),
+		startLT: binary.BigEndian.Uint64(metaRaw[9:17]),
+	}, nil
 }
 
 func blockMetaServedFullFromReader(reader pebbleReader, block ton.BlockIDExt) (bool, error) {

@@ -166,18 +166,11 @@ func cellGenerationDBStatus(cells *cellStore, role string, origin ton.BlockIDExt
 	}
 
 	ioStatus := cells.ioStatus(now)
-	cacheLoaded := false
 	for shardIdx, shard := range cells.shards {
-		if shard == nil || shard.db == nil {
-			continue
-		}
-
 		metrics := shard.db.Metrics()
-		if !cacheLoaded {
-			cacheLoaded = true
+		if shardIdx == 0 {
 			status.Cache = pebbleDBCacheStatus(metrics)
 		}
-
 		shardStatus := pebbleDBShardStatus(shardIdx, metrics)
 		shardStatus.ReadCells = ioStatus[shardIdx].readCells
 		shardStatus.WrittenCells = ioStatus[shardIdx].writtenCells
@@ -237,15 +230,8 @@ func cellDBReadAmp(levels [7]pebble.LevelMetrics) int64 {
 }
 
 func cellStoreMaxReadAmp(cells *cellStore) int64 {
-	if cells == nil {
-		return 0
-	}
-
 	var maxReadAmp int64
 	for _, shard := range cells.shards {
-		if shard == nil || shard.db == nil {
-			continue
-		}
 		metrics := shard.db.Metrics()
 		readAmp := cellDBReadAmp(metrics.Levels)
 		if readAmp > maxReadAmp {
@@ -257,14 +243,7 @@ func cellStoreMaxReadAmp(cells *cellStore) int64 {
 
 func cellStoreDBMetrics(cells *cellStore) storage.CellGenerationDBMetrics {
 	var ret storage.CellGenerationDBMetrics
-	if cells == nil {
-		return ret
-	}
-
 	for _, shard := range cells.shards {
-		if shard == nil || shard.db == nil {
-			continue
-		}
 		metrics := shard.db.Metrics()
 		readAmp := cellDBReadAmp(metrics.Levels)
 		if readAmp > ret.MaxReadAmp {

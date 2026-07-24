@@ -14,6 +14,14 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
+func (r *nextSyncRunner) validateShardDescriptionPrefetch(desc *p2p.ShardBlockDescription) error {
+	currentBlocks, err := r.shardResolver.currentBlocksForBlock(desc.Block)
+	if err != nil {
+		return err
+	}
+	return validateShardDescriptionPrefetchAgainst(desc, currentBlocks)
+}
+
 func TestShardStateResolverResolvesSplitDescendantFromParent(t *testing.T) {
 	ctx := context.Background()
 	parent := testBlockID(0, topShard, 10)

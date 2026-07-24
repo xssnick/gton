@@ -58,9 +58,6 @@ func decodeBlockIDFromHashes(workchain int32, shard int64, seqno uint32, data []
 const blockMetaMinEncodedLen = 1 + 4 + 4 + 8 + 8 + 1 + 1 + 1 + 1 + 1
 
 func encodeBlockMeta(meta *storage.BlockMeta) []byte {
-	if meta == nil {
-		return nil
-	}
 	buf := make([]byte, 0, 256)
 	buf = append(buf, blockMetaVersion)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(meta.Flags))

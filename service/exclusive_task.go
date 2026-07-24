@@ -103,9 +103,6 @@ func (s *Service) exclusiveServiceTaskMaxLag(ctx context.Context, now time.Time)
 	current := storage.CloneCurrentState(s.currentStatus)
 	s.currentStatusMu.RUnlock()
 	if current == nil {
-		if s.storage == nil {
-			return 0, storage.ErrNotFound
-		}
 		var err error
 		current, err = s.storage.CurrentState(ctx)
 		if errors.Is(err, storage.ErrNotFound) {
@@ -148,14 +145,8 @@ func (s *Service) exclusiveServiceTaskMaxLag(ctx context.Context, now time.Time)
 }
 
 func exclusiveServiceTaskBlockLag(ctx context.Context, store storage.Storage, state *storage.BlockState, now time.Time) (time.Duration, error) {
-	if state == nil {
-		return 0, storage.ErrNotFound
-	}
 	if state.Parsed != nil && state.Parsed.GenUTime != 0 {
 		return time.Duration(now.Unix()-int64(state.Parsed.GenUTime)) * time.Second, nil
-	}
-	if store == nil {
-		return 0, storage.ErrNotFound
 	}
 
 	meta, err := store.BlockMeta(ctx, state.Block)
@@ -165,7 +156,7 @@ func exclusiveServiceTaskBlockLag(ctx context.Context, store storage.Storage, st
 	if err != nil {
 		return 0, fmt.Errorf("load block time for sync lag check %s: %w", storage.FormatBlockRef(state.Block), err)
 	}
-	if meta == nil || meta.GenUTime == 0 {
+	if meta.GenUTime == 0 {
 		return 0, storage.ErrNotFound
 	}
 	return time.Duration(now.Unix()-int64(meta.GenUTime)) * time.Second, nil
@@ -179,12 +170,6 @@ func (s *Service) canStartExclusiveServiceTaskLocked(task exclusiveServiceTask) 
 		return nil
 	}
 	return exclusiveServiceTaskError(s.exclusiveTask)
-}
-
-func (s *Service) exclusiveServiceTaskActive(task exclusiveServiceTask) bool {
-	s.exclusiveTaskMu.Lock()
-	defer s.exclusiveTaskMu.Unlock()
-	return s.exclusiveTask == task
 }
 
 func (s *Service) backgroundTaskStatus() string {

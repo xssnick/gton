@@ -65,19 +65,8 @@ func (b *PreparedBlock) releaseStateUpdatePayload() {
 	b.StateUpdateToCellsElapsed = 0
 }
 
-func preparedBlockRoot(block PreparedBlock) (*cell.Cell, error) {
-	if block.BlockRoot == nil {
-		return nil, fmt.Errorf("prepared block %s has no block root", block.BlockRef())
-	}
-	return block.BlockRoot, nil
-}
-
 func parsePreparedBlock(block PreparedBlock) (*tlb.Block, error) {
-	root, err := preparedBlockRoot(block)
-	if err != nil {
-		return nil, err
-	}
-	return storage.ParseVerifiedBlockCell(block.ID, root)
+	return storage.ParseVerifiedBlockCell(block.ID, block.BlockRoot)
 }
 
 func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error) {
@@ -124,10 +113,6 @@ func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error
 }
 
 func prepareVerifiedBlockForApply(block VerifiedBlock) (PreparedBlock, error) {
-	if block.StateUpdate == nil {
-		return PreparedBlock{}, fmt.Errorf("verified block %s has no state update", block.BlockRef())
-	}
-
 	started := time.Now()
 	cells, err := storage.PrepareStateUpdateCells(block.StateUpdate)
 	if err != nil {
@@ -142,7 +127,7 @@ func prepareVerifiedMasterchainBlockForNextSync(prev ton.BlockIDExt, block Verif
 	if block.ID.Workchain != -1 || block.ID.Shard != topShard {
 		return PreparedBlock{}, fmt.Errorf("next-sync block %s is not masterchain", block.BlockRef())
 	}
-	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
+	if len(block.Meta.PrevRefs) != 1 {
 		return PreparedBlock{}, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
 	}
 	if !block.Meta.PrevRefs[0].Equals(&prev) {

@@ -61,7 +61,7 @@ func TestStateCellPrewriterWaitsForQueuedRecords(t *testing.T) {
 func TestStateCellWindowCheckpointUsesPrewriteTarget(t *testing.T) {
 	store := &stateCellPrewriterTestStore{}
 	writer := newStateCellPrewriter(zerolog.Nop(), store, 1<<20)
-	window := newStateCellWindowCache(nil)
+	window := newTestStateCellWindowCache(nil)
 	window.setPrewriter(writer)
 
 	root := cell.BeginCell().MustStoreUInt(0x72, 8).EndCell()
@@ -79,7 +79,7 @@ func TestStateCellWindowCheckpointUsesPrewriteTarget(t *testing.T) {
 func TestStateCellWindowCheckpointDoesNotWaitForBlockedPrewriteEnqueue(t *testing.T) {
 	store := &stateCellPrewriterTestStore{}
 	writer := newStateCellPrewriter(zerolog.Nop(), store, 1)
-	window := newStateCellWindowCache(nil)
+	window := newTestStateCellWindowCache(nil)
 	window.setPrewriter(writer)
 
 	first := cell.BeginCell().MustStoreUInt(0x73, 8).EndCell()
@@ -124,9 +124,7 @@ func TestStateCellWindowCheckpointDoesNotWaitForBlockedPrewriteEnqueue(t *testin
 
 		select {
 		case checkpoint := <-checkpointDone:
-			if checkpoint == nil {
-				failure = "begin checkpoint returned nil"
-			} else if target, ok := checkpoint.prewriteTarget(); ok || target != 0 {
+			if target, ok := checkpoint.prewriteTarget(); ok || target != 0 {
 				failure = "checkpoint used prewrite target while enqueue was still pending"
 			}
 		case <-time.After(time.Second):

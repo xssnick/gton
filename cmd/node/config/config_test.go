@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton"
+	"github.com/xssnick/gton/service"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -137,6 +138,9 @@ func TestLoadDefaults(t *testing.T) {
 	persistentStateLargeBOCBatchSize := storageOpts.PersistentStateLargeBOCBatchSize
 	if int64(persistentStateLargeBOCBatchSize) != DefaultPersistentStateLargeBOCBatchSize {
 		t.Fatalf("unexpected persistent state large boc batch size %d", persistentStateLargeBOCBatchSize)
+	}
+	if storageOpts.PersistentStateKeepRecent != service.DefaultPersistentStateKeepRecent {
+		t.Fatalf("unexpected persistent state keep recent %d", storageOpts.PersistentStateKeepRecent)
 	}
 	if cfg.Storage.StateSerializeOnePass {
 		t.Fatal("state serialize one-pass should be disabled by default")
@@ -412,6 +416,7 @@ func TestStorageOptions(t *testing.T) {
 			"cell_memtable_stop_writes_threshold": 3,
 			"large_boc_shard_read_workers": 8,
 			"persistent_state_large_boc_batch_size": 2097152,
+			"persistent_state_keep_recent": 7,
 			"state_serialize_one_pass": true,
 			"artifact_file_max_open": 123
 		}
@@ -458,6 +463,9 @@ func TestStorageOptions(t *testing.T) {
 	}
 	if storageOpts.PersistentStateLargeBOCBatchSize != 2<<20 {
 		t.Fatalf("unexpected persistent state large boc batch size %d", storageOpts.PersistentStateLargeBOCBatchSize)
+	}
+	if storageOpts.PersistentStateKeepRecent != 7 {
+		t.Fatalf("unexpected persistent state keep recent %d", storageOpts.PersistentStateKeepRecent)
 	}
 	if !storageOpts.StateSerializeOnePass {
 		t.Fatal("state serialize one-pass should be enabled")
@@ -575,6 +583,38 @@ func TestStorageLargeBOCOptionsUseDefaultsForZero(t *testing.T) {
 	}
 }
 
+func TestStorageOptionsPersistentStateKeepRecent(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   int64
+		want    int
+		wantErr bool
+	}{
+		{name: "zero uses default", value: 0, want: service.DefaultPersistentStateKeepRecent},
+		{name: "keep all", value: -1, want: service.PersistentStateKeepAll},
+		{name: "positive", value: 7, want: 7},
+		{name: "less than keep all", value: -2, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts, err := storageOptionsFromConfig(Config{Storage: Storage{PersistentStateKeepRecent: tt.value}})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected invalid persistent state keep recent to fail")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("persistent state keep recent: %v", err)
+			}
+			if opts.PersistentStateKeepRecent != tt.want {
+				t.Fatalf("persistent state keep recent = %d, want %d", opts.PersistentStateKeepRecent, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	tests := []struct {
 		name string
@@ -689,6 +729,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if cfg.Storage.PersistentStateLargeBOCBatchSize != DefaultPersistentStateLargeBOCBatchSize {
 		t.Fatalf("unexpected persistent state large boc batch size %d", cfg.Storage.PersistentStateLargeBOCBatchSize)
+	}
+	if cfg.Storage.PersistentStateKeepRecent != service.DefaultPersistentStateKeepRecent {
+		t.Fatalf("unexpected persistent state keep recent %d", cfg.Storage.PersistentStateKeepRecent)
 	}
 	if cfg.Storage.StateSerializeOnePass {
 		t.Fatal("state serialize one-pass should be disabled by default")
@@ -941,7 +984,7 @@ func TestDownloadGlobalConfigWritesAndReplaces(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "global.config.json")
-	if err := downloadFileWithClient(context.Background(), client, path, "http://example.com/global.config.json"); err != nil {
+	if err := downloadFile(context.Background(), client, path, "http://example.com/global.config.json"); err != nil {
 		t.Fatalf("download global config: %v", err)
 	}
 	got, err := os.ReadFile(path)
@@ -953,7 +996,7 @@ func TestDownloadGlobalConfigWritesAndReplaces(t *testing.T) {
 	}
 
 	body = []byte(`{"updated":true}`)
-	if err = downloadFileWithClient(context.Background(), client, path, "http://example.com/global.config.json"); err != nil {
+	if err = downloadFile(context.Background(), client, path, "http://example.com/global.config.json"); err != nil {
 		t.Fatalf("replace global config: %v", err)
 	}
 	got, err = os.ReadFile(path)

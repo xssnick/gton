@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -35,7 +36,7 @@ func decodedBroadcastKey(kind string, block ton.BlockIDExt) string {
 	return kind + "\x00" + string(block.RootHash) + string(block.FileHash)
 }
 
-func (c *decodedBroadcastCache) get(kind string, block ton.BlockIDExt) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, bool) {
+func (c *decodedBroadcastCache) get(kind string, block ton.BlockIDExt) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, error) {
 	key := decodedBroadcastKey(kind, block)
 
 	c.mu.Lock()
@@ -43,23 +44,20 @@ func (c *decodedBroadcastCache) get(kind string, block ton.BlockIDExt) (*Downloa
 
 	entry, ok := c.entries[key]
 	if !ok {
-		return nil, nil, false
+		return nil, nil, storage.ErrNotFound
 	}
 	if time.Since(entry.storedAt) > decodedBroadcastCacheTTL {
 		delete(c.entries, key)
-		return nil, nil, false
+		return nil, nil, storage.ErrNotFound
 	}
 
 	// callers mutate per-delivery fields (SourcePeerID, SignaturesVerifiedKey),
 	// so hand out a copy; pointer fields are immutable after decode
 	downloaded := entry.downloaded
-	return &downloaded, entry.signatures, true
+	return &downloaded, entry.signatures, nil
 }
 
 func (c *decodedBroadcastCache) put(kind string, block ton.BlockIDExt, downloaded *DownloadedBlock, signatures *blockproof.ValidatorSignatureSet) {
-	if downloaded == nil {
-		return
-	}
 	key := decodedBroadcastKey(kind, block)
 	now := time.Now()
 
@@ -92,12 +90,4 @@ func (c *decodedBroadcastCache) put(kind string, block ton.BlockIDExt, downloade
 		signatures: signatures,
 		storedAt:   now,
 	}
-}
-
-func (n *Node) cachedDecodedBroadcast(kind string, block ton.BlockIDExt) (*DownloadedBlock, *blockproof.ValidatorSignatureSet, bool) {
-	return n.decodedBroadcasts.get(kind, block)
-}
-
-func (n *Node) rememberDecodedBroadcast(kind string, block ton.BlockIDExt, downloaded *DownloadedBlock, signatures *blockproof.ValidatorSignatureSet) {
-	n.decodedBroadcasts.put(kind, block, downloaded, signatures)
 }

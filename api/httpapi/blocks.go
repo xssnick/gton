@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -210,13 +211,15 @@ func (s *Server) handleConfigParam(ctx context.Context, params requestParams) (a
 }
 
 func configParamID(params requestParams) (int32, *apiError) {
-	configID, hasConfigID, apiErr := params.optionalInt32("config_id")
-	if apiErr != nil {
-		return 0, apiErr
+	configID, err := params.optionalInt32("config_id")
+	hasConfigID := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return 0, asAPIError(err)
 	}
-	param, hasParam, apiErr := params.optionalInt32("param")
-	if apiErr != nil {
-		return 0, apiErr
+	param, err := params.optionalInt32("param")
+	hasParam := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return 0, asAPIError(err)
 	}
 	if hasConfigID {
 		return configID, nil
@@ -249,13 +252,15 @@ func (s *Server) blockIDFromParams(ctx context.Context, params requestParams) (t
 		return ton.BlockIDExt{}, apiErr
 	}
 
-	rootHash, hasRootHash, apiErr := optionalHashParam(params, "root_hash")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, apiErr
+	rootHash, err := optionalHashParam(params, "root_hash")
+	hasRootHash := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, asAPIError(err)
 	}
-	fileHash, hasFileHash, apiErr := optionalHashParam(params, "file_hash")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, apiErr
+	fileHash, err := optionalHashParam(params, "file_hash")
+	hasFileHash := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, asAPIError(err)
 	}
 	if hasRootHash != hasFileHash {
 		return ton.BlockIDExt{}, validationError("failed to parse request: root_hash and file_hash must be specified together")
@@ -276,17 +281,20 @@ func (s *Server) blockIDFromParams(ctx context.Context, params requestParams) (t
 }
 
 func (s *Server) lookupBlock(ctx context.Context, workchain int32, shard int64, params requestParams) (ton.BlockIDExt, *apiError) {
-	seqno, hasSeqno, apiErr := params.optionalUint32("seqno")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, apiErr
+	seqno, err := params.optionalUint32("seqno")
+	hasSeqno := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, asAPIError(err)
 	}
-	lt, hasLT, apiErr := params.optionalUint64("lt")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, apiErr
+	lt, err := params.optionalUint64("lt")
+	hasLT := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, asAPIError(err)
 	}
-	utime, hasUTime, apiErr := params.optionalUint32("unixtime")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, apiErr
+	utime, err := params.optionalUint32("unixtime")
+	hasUTime := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, asAPIError(err)
 	}
 
 	selectors := 0
@@ -300,10 +308,7 @@ func (s *Server) lookupBlock(ctx context.Context, workchain int32, shard int64, 
 	}
 
 	key := storage.BlockHistoryKey{Workchain: workchain, Shard: shard}
-	var (
-		block ton.BlockIDExt
-		err   error
-	)
+	var block ton.BlockIDExt
 	switch {
 	case hasSeqno:
 		block, err = s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: workchain, Shard: shard, SeqNo: seqno})
@@ -337,13 +342,13 @@ func (s *Server) loadBlock(ctx context.Context, id ton.BlockIDExt) (tlb.Block, *
 }
 
 func (s *Server) configRoot(ctx context.Context, params requestParams) (*cell.Cell, *apiError) {
-	seqno, hasSeqno, apiErr := params.optionalUint32("seqno")
-	if apiErr != nil {
-		return nil, apiErr
+	seqno, err := params.optionalUint32("seqno")
+	hasSeqno := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
 
 	var block ton.BlockIDExt
-	var err error
 	if hasSeqno {
 		block, err = s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{
 			Workchain: masterchainWorkchain,
@@ -548,15 +553,15 @@ func configInfoFromCell(root *cell.Cell) configInfo {
 	}
 }
 
-func optionalHashParam(params requestParams, name string) ([]byte, bool, *apiError) {
-	raw, ok, apiErr := params.optionalNonEmptyString(name)
-	if apiErr != nil || !ok {
-		return nil, ok, apiErr
+func optionalHashParam(params requestParams, name string) ([]byte, error) {
+	raw, err := params.optionalNonEmptyString(name)
+	if err != nil {
+		return nil, err
 	}
 
 	hash, err := parseHash(raw)
 	if err != nil {
-		return nil, false, hashParamError(params, name, raw)
+		return nil, hashParamError(params, name, raw)
 	}
-	return hash, true, nil
+	return hash, nil
 }

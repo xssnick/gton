@@ -8,6 +8,7 @@ import (
 
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 )
 
@@ -106,20 +107,12 @@ func newArchiveWindowPipelineProgress() *archiveWindowPipelineProgress {
 }
 
 func (p *archiveWindowPipelineProgress) setQueue(queue *archiveImportQueue) {
-	if p == nil {
-		return
-	}
-
 	p.mu.Lock()
 	p.queue = queue
 	p.mu.Unlock()
 }
 
 func (p *archiveWindowPipelineProgress) setPlanning(seqno uint32, stage string) {
-	if p == nil {
-		return
-	}
-
 	p.mu.Lock()
 	p.frontSeqno = seqno
 	p.stage = stage
@@ -131,10 +124,6 @@ func (p *archiveWindowPipelineProgress) setPlanning(seqno uint32, stage string) 
 }
 
 func (p *archiveWindowPipelineProgress) setPending(pending []archivePendingWindow, planningSeqno uint32, planningStage string) {
-	if p == nil {
-		return
-	}
-
 	ready := 0
 	var frontSeqno uint32
 	var frontTask *archiveWindowShardImportTask
@@ -168,10 +157,6 @@ func (p *archiveWindowPipelineProgress) setPending(pending []archivePendingWindo
 }
 
 func (p *archiveWindowPipelineProgress) snapshot() archiveWindowPipelineSnapshot {
-	if p == nil {
-		return archiveWindowPipelineSnapshot{}
-	}
-
 	p.mu.RLock()
 	snapshot := archiveWindowPipelineSnapshot{
 		stage:          p.stage,
@@ -245,10 +230,6 @@ func (r *archiveCatchUpRunner) stopPipelineWaitProgress(now time.Time) {
 }
 
 func (r *archiveCatchUpRunner) recordArchiveWindowProgress(window *shardClientArchiveWindow, applyElapsed time.Duration) {
-	if window == nil {
-		return
-	}
-
 	stats := &r.progressStats
 	stats.windows++
 	stats.masterPrefetchWait += window.masterWait
@@ -260,40 +241,19 @@ func (r *archiveCatchUpRunner) recordArchiveWindowProgress(window *shardClientAr
 	stats.shardTargetParse += window.shardTargetElapsed
 	stats.shardApply += window.shardApplyElapsed
 	stats.applyWall += applyElapsed
-	if window.totalStats == nil {
-		if window.shardArchives > 0 {
-			stats.shardArchives += uint64(window.shardArchives)
-		}
-		return
-	}
-
 	stats.bytes += window.totalStats.Bytes
-	if window.totalStats.Blocks > 0 {
-		stats.blocks += uint64(window.totalStats.Blocks)
-	}
-	if window.totalStats.Entries > 0 {
-		stats.entries += uint64(window.totalStats.Entries)
-	}
+	stats.blocks += uint64(window.totalStats.Blocks)
+	stats.entries += uint64(window.totalStats.Entries)
 	stats.archiveDownload += window.totalStats.DownloadElapsed
 	stats.archiveImport += window.totalStats.ImportElapsed
 	stats.stateCells += window.totalStats.StateUpdateCells
 	stats.stateCellBytes += window.totalStats.StateUpdateCellBytes
 	stats.stateCellPrepare += window.totalStats.StateUpdateCellPrepare
 
-	shardArchives := window.totalStats.ShardArchives
-	if shardArchives == 0 {
-		shardArchives = window.shardArchives
-	}
-	if shardArchives > 0 {
-		stats.shardArchives += uint64(shardArchives)
-	}
+	stats.shardArchives += uint64(window.totalStats.ShardArchives)
 }
 
 func (w *shardClientArchiveWindow) releaseImportedData() {
-	if w == nil {
-		return
-	}
-
 	w.masterStats = nil
 	w.totalStats = nil
 	w.masterStates = nil
@@ -382,7 +342,8 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		} else {
 			eta = "unknown"
 		}
-	} else if lagSeconds, ok := r.archiveLiveTailLagSecondsAt(now); ok {
+	} else if blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain); blockUTime != 0 {
+		lagSeconds := now.Unix() - blockUTime
 		remainingLag := remainingLagSeconds(lagSeconds)
 		event = event.
 			Int64("master_lag_seconds", lagSeconds).
@@ -467,7 +428,9 @@ func (r *archiveCatchUpRunner) logProgress() error {
 }
 
 func isArchiveCatchUpRetryError(err error) bool {
-	return errors.Is(err, archive.ErrNotAvailable) || isExpectedRetryError(err)
+	return errors.Is(err, archive.ErrNotAvailable) ||
+		errors.Is(err, p2p.ErrNoArchivePeers) ||
+		isExpectedRetryError(err)
 }
 
 func (s *Service) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqno uint32, lastCheckpointSeqno uint32, lastCheckpoint time.Time, checkpointBlocks uint32, pendingBytes uint64) bool {
@@ -477,13 +440,10 @@ func (s *Service) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqn
 	if seqno >= targetSeqno {
 		return true
 	}
-	if checkpointBlocks == 0 {
-		checkpointBlocks = s.archiveCatchUpCheckpointBlocks
-	}
 	if seqno-lastCheckpointSeqno >= checkpointBlocks {
 		return true
 	}
-	if pendingBytes >= s.checkpointBytesTarget() {
+	if pendingBytes >= s.checkpointBytes {
 		return true
 	}
 	return time.Since(lastCheckpoint) >= s.archiveCatchUpCheckpointPeriod

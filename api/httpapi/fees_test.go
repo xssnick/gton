@@ -58,12 +58,9 @@ func TestEstimateFeeMessageUsageStopsAtSeenCell(t *testing.T) {
 		root = cell.BeginCell().MustStoreRef(root).MustStoreRef(root).EndCell()
 	}
 
-	usage, rootBits, rootSeen, err := estimateFeeMessageUsage(root)
+	usage, rootBits, err := estimateFeeMessageUsage(root)
 	if err != nil {
 		t.Fatalf("estimate message usage: %v", err)
-	}
-	if !rootSeen {
-		t.Fatal("root was not counted")
 	}
 	if rootBits != 0 {
 		t.Fatalf("root bits = %d, want 0", rootBits)

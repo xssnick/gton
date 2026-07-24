@@ -18,7 +18,7 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 	rootHash := root.HashKey()
 
 	b.Run("active-root-hit", func(b *testing.B) {
-		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		if err := cache.addPreparedRecords(records); err != nil {
 			b.Fatalf("add prepared records: %v", err)
 		}
@@ -38,7 +38,7 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 	})
 
 	b.Run("active-first-ref-chain", func(b *testing.B) {
-		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		if err := cache.addPreparedRecords(records); err != nil {
 			b.Fatalf("add prepared records: %v", err)
 		}
@@ -56,14 +56,11 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 	})
 
 	b.Run("pending-root-hit", func(b *testing.B) {
-		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		if err := cache.addPreparedRecords(records); err != nil {
 			b.Fatalf("add prepared records: %v", err)
 		}
-		checkpoint := cache.beginCheckpoint()
-		if checkpoint == nil {
-			b.Fatal("checkpoint is nil")
-		}
+		cache.beginCheckpoint()
 		load := cache.loader()
 
 		b.ReportAllocs()
@@ -80,7 +77,7 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 	})
 
 	b.Run("newest-of-32-pending", func(b *testing.B) {
-		cache := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		cache.active = newStateCellEncodedCache(1)
 		cache.pending = make([]*stateCellEncodedCache, 32)
 		for i := 0; i < len(cache.pending)-1; i++ {
@@ -120,7 +117,7 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 	rootHash := root.HashKey()
 
 	b.Run("active-root-hit", func(b *testing.B) {
-		overlay := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		overlay := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		overlay.addPreparedRecords(records)
 		load := overlay.loader()
 
@@ -138,12 +135,9 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 	})
 
 	b.Run("pending-root-hit", func(b *testing.B) {
-		overlay := newStateCellWindowCache(rejectingBenchmarkCellLoader)
+		overlay := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		overlay.addPreparedRecords(records)
-		checkpoint := overlay.beginCheckpoint()
-		if checkpoint == nil {
-			b.Fatal("checkpoint is nil")
-		}
+		overlay.beginCheckpoint()
 		load := overlay.loader()
 
 		b.ReportAllocs()

@@ -538,9 +538,13 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 	// Generation 0 means "the active generation": the decoded-cell cache keys
 	// it as 0 and acquireCellStore resolves it to the active generation under
 	// its own lock, so cache hits never touch the store-wide mutex.
-	if loaded, ok := s.cellCache.get(generation, hash); ok {
+	loaded, err := s.cellCache.get(generation, hash)
+	if err == nil {
 		s.lazyCellLoads.observeDecodedCache()
 		return loaded, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
 	}
 
 	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
@@ -548,7 +552,7 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 		return nil, err
 	}
 	s.lazyCellLoads.observePebble()
-	loaded, err := storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(generation))
+	loaded, err = storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(generation))
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}

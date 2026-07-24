@@ -121,9 +121,6 @@ func (s *p2pStateSource) MasterchainProof(ctx context.Context, block ton.BlockID
 	if err != nil {
 		return nil, fmt.Errorf("download block full %s: %w", storage.FormatBlockRef(block), err)
 	}
-	if downloaded == nil {
-		return nil, fmt.Errorf("download block full %s: empty response", storage.FormatBlockRef(block))
-	}
 	return downloaded.ProofBOC, nil
 }
 
@@ -169,9 +166,6 @@ func (s *p2pStateSource) blockStateRootArtifact(ctx context.Context, block ton.B
 	if err != nil {
 		return nil, nil, fmt.Errorf("download block: %w", err)
 	}
-	if downloaded == nil {
-		return nil, nil, fmt.Errorf("download block: empty response")
-	}
 	if len(downloaded.BlockBOC) == 0 {
 		return nil, nil, fmt.Errorf("downloaded block %s has no block data", storage.FormatBlockRef(block))
 	}
@@ -180,9 +174,6 @@ func (s *p2pStateSource) blockStateRootArtifact(ctx context.Context, block ton.B
 	}
 
 	root := downloaded.Block
-	if root == nil {
-		return nil, nil, fmt.Errorf("downloaded block %s is missing parsed cell", storage.FormatBlockRef(block))
-	}
 	if downloaded.IsLink && root.GetType() == cell.MerkleProofCellType {
 		root, err = cell.UnwrapProof(root, downloaded.ID.RootHash)
 		if err != nil {

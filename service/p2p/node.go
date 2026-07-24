@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -140,7 +139,7 @@ type Node struct {
 	broadcastStats   map[broadcastStatKey]uint64
 
 	fecReceiverStatsMx sync.Mutex
-	fecReceiverLast    map[fecReceiverPeerKey]fecReceiverCounterSnapshot
+	fecReceiverLast    map[string]fecReceiverCounterSnapshot
 	fecReceiverTotals  map[string]fecReceiverCounterSnapshot
 
 	localRebroadcastSent    atomic.Uint64
@@ -148,8 +147,9 @@ type Node struct {
 	peerRebroadcastSent     atomic.Uint64
 	peerRebroadcastDropped  atomic.Uint64
 
-	subscriptionsMx sync.RWMutex
-	subscriptions   map[string]*overlaySubscription
+	subscriptionsMx          sync.RWMutex
+	subscriptions            map[string]*overlaySubscription
+	publicBroadcastReceivers atomic.Pointer[publicBroadcastReceiverSnapshot]
 
 	monitorSplitMx       sync.RWMutex
 	monitorMinSplitDepth map[int32]uint32
@@ -266,7 +266,7 @@ func New(opts Options) (*Node, error) {
 		return nil, fmt.Errorf("prepare state files dir: %w", err)
 	}
 
-	return &Node{
+	node := &Node{
 		log:                           logger,
 		globalConfig:                  opts.GlobalConfig,
 		listenAddr:                    opts.ListenAddr,
@@ -277,7 +277,6 @@ func New(opts Options) (*Node, error) {
 		dhtPrivKey:                    dhtPriv,
 		gateway:                       gateway,
 		dhtListenAddr:                 opts.DHTListenAddr,
-		pool:                          newPeerPool(gateway),
 		events:                        make(chan BroadcastEvent, broadcastEventBuffer),
 		eventQueue:                    newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
 		deduper:                       newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
@@ -317,14 +316,16 @@ func New(opts Options) (*Node, error) {
 		pendingBroadcasts:             map[string]pendingBlockBroadcastDecode{},
 		pendingBroadcastByPrev:        map[storage2.BlockRootHash]map[string]struct{}{},
 		broadcastStats:                map[broadcastStatKey]uint64{},
-		fecReceiverLast:               map[fecReceiverPeerKey]fecReceiverCounterSnapshot{},
+		fecReceiverLast:               map[string]fecReceiverCounterSnapshot{},
 		fecReceiverTotals:             map[string]fecReceiverCounterSnapshot{},
 		stateFilesDir:                 stateFilesDir,
 		peerUse:                       map[PeerID]peerUse{},
 		stateCellImportSlot:           make(chan struct{}, 1),
 		stateSplitPartDecodeSlot:      make(chan struct{}, 1),
 		customOverlays:                append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
-	}, nil
+	}
+	node.pool = newPeerPool(gateway, node.resolvePublicBroadcastReceiver)
+	return node, nil
 }
 
 func (n *Node) SetRuntimeCallbacks(callbacks RuntimeCallbacks) {
@@ -388,7 +389,7 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 
 	zeroBlock := blockIDFromConfig(cfg.Validator.ZeroState)
-	if zeroBlock.Workchain != -1 || zeroBlock.Shard != topShard || zeroBlock.SeqNo != 0 || !validBlockID(zeroBlock) {
+	if zeroBlock.Workchain != -1 || zeroBlock.Shard != topShard || zeroBlock.SeqNo != 0 || !storage2.BlockIDHashesKnown(zeroBlock) {
 		return fmt.Errorf("global config contains invalid zero_state")
 	}
 
@@ -412,7 +413,7 @@ func (n *Node) Start(ctx context.Context) error {
 	if len(hardforks) > 0 {
 		n.log.Info().
 			Int("hardforks", len(hardforks)).
-			Str("init_block", formatBlockRef(initBlock)).
+			Str("init_block", storage2.FormatBlockRef(initBlock)).
 			Msg("loaded hardforks from global config")
 	}
 	specs, err := buildOverlaySpecs(n.zeroStateFileHash)
@@ -430,25 +431,33 @@ func (n *Node) Start(ctx context.Context) error {
 			Msg("loaded custom overlay config")
 	}
 	specs = append(specs, customSpecs...)
+	fail := func(err error) error {
+		n.closeSubscriptions()
+		runCancel()
+		return err
+	}
+	subscriptions := make([]*overlaySubscription, 0, len(specs))
 	for _, spec := range specs {
-		n.getOrCreateSubscription(spec)
+		sub, err := n.getOrCreateSubscription(spec)
+		if err != nil {
+			return fail(err)
+		}
+		subscriptions = append(subscriptions, sub)
 	}
 
 	n.gateway.SetConnectionHandler(n.handleInboundPeer)
 	if err = n.startGateway(); err != nil {
-		return fmt.Errorf("start ADNL gateway: %w", err)
+		return fail(fmt.Errorf("start ADNL gateway: %w", err))
 	}
 	n.networkStarted.Store(true)
 
 	if err = n.startDHT(runCtx, cfg); err != nil {
 		_ = n.gateway.Close()
 		n.networkStarted.Store(false)
-		runCancel()
-		return err
+		return fail(err)
 	}
 
-	for _, spec := range specs {
-		sub, _ := n.getOrCreateSubscription(spec)
+	for _, sub := range subscriptions {
 		n.startSubscription(sub)
 	}
 	n.runAsync(func() {
@@ -482,16 +491,16 @@ func (n *Node) runAsync(fn func()) {
 	}()
 }
 
-func (n *Node) startSubscription(sub *overlaySubscription) bool {
+func (n *Node) startSubscription(sub *overlaySubscription) {
 	ctx, cancel := context.WithCancel(n.runCtx)
 	if err := ctx.Err(); err != nil {
 		cancel()
-		return false
+		return
 	}
 	token, ok := sub.setRunCancel(cancel)
 	if !ok {
 		cancel()
-		return false
+		return
 	}
 
 	sub.startCustomTwoStepRebroadcastWorker(ctx)
@@ -499,7 +508,6 @@ func (n *Node) startSubscription(sub *overlaySubscription) bool {
 		defer sub.clearRunCancel(token)
 		sub.run(ctx)
 	})
-	return true
 }
 
 func (n *Node) Wait() {
@@ -558,7 +566,7 @@ func (n *Node) stop() {
 		}
 
 		n.eventQueue.Close()
-		n.closePeerRebroadcastQueues()
+		n.closeSubscriptions()
 
 		n.wg.Wait()
 		n.inboundWG.Wait()
@@ -567,6 +575,12 @@ func (n *Node) stop() {
 			_ = removeIncompleteStateFiles(n.stateFilesDir)
 		}
 	})
+}
+
+func (n *Node) closeSubscriptions() {
+	for _, sub := range n.subscriptionsSnapshot() {
+		sub.close()
+	}
 }
 
 func (n *Node) stopAcceptingInbound() {
@@ -698,9 +712,6 @@ func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
 	defer n.latestBlocksMx.Unlock()
 
 	key := storage2.ShardKeyFromBlock(block)
-	if n.latestBasechainShards == nil {
-		n.latestBasechainShards = map[storage2.ShardKey]ton.BlockIDExt{}
-	}
 	current, ok := n.latestBasechainShards[key]
 	if ok && current.SeqNo >= block.SeqNo {
 		return
@@ -715,19 +726,17 @@ func (n *Node) trackLatestBasechain(block ton.BlockIDExt) {
 }
 
 func (n *Node) ZeroStateBlock() (ton.BlockIDExt, error) {
-	block, ok := n.configuredZeroStateBlock()
-	if !ok {
+	if n.zeroStateBlock.Workchain != -1 || n.zeroStateBlock.Shard != topShard || n.zeroStateBlock.SeqNo != 0 || !storage2.BlockIDHashesKnown(n.zeroStateBlock) {
 		return ton.BlockIDExt{}, storage2.ErrNotFound
 	}
-	return block, nil
+	return n.zeroStateBlock, nil
 }
 
 func (n *Node) InitBlock() (ton.BlockIDExt, error) {
-	block, ok := n.configuredInitBlock()
-	if !ok {
+	if n.initBlock.Workchain != -1 || n.initBlock.Shard != topShard || !storage2.BlockIDHashesKnown(n.initBlock) {
 		return ton.BlockIDExt{}, storage2.ErrNotFound
 	}
-	return block, nil
+	return n.initBlock, nil
 }
 
 func (n *Node) IsHardfork(block ton.BlockIDExt) bool {
@@ -737,20 +746,6 @@ func (n *Node) IsHardfork(block ton.BlockIDExt) bool {
 	}
 	_, ok = n.hardforkSet[key]
 	return ok
-}
-
-func (n *Node) configuredZeroStateBlock() (ton.BlockIDExt, bool) {
-	if n.zeroStateBlock.Workchain != -1 || n.zeroStateBlock.Shard != topShard || n.zeroStateBlock.SeqNo != 0 || !validBlockID(n.zeroStateBlock) {
-		return ton.BlockIDExt{}, false
-	}
-	return n.zeroStateBlock, true
-}
-
-func (n *Node) configuredInitBlock() (ton.BlockIDExt, bool) {
-	if n.initBlock.Workchain != -1 || n.initBlock.Shard != topShard || !validBlockID(n.initBlock) {
-		return ton.BlockIDExt{}, false
-	}
-	return n.initBlock, true
 }
 
 func blockIDFromConfig(block liteclient.ConfigBlock) ton.BlockIDExt {
@@ -772,7 +767,7 @@ type blockIDFullKey struct {
 }
 
 func blockIDFullKeyFromBlock(block ton.BlockIDExt) (blockIDFullKey, bool) {
-	if !validBlockID(block) {
+	if !storage2.BlockIDHashesKnown(block) {
 		return blockIDFullKey{}, false
 	}
 
@@ -797,7 +792,7 @@ func hardforksFromConfig(blocks []liteclient.ConfigBlock) ([]ton.BlockIDExt, map
 		if hardfork.Workchain != -1 || hardfork.Shard != topShard {
 			return nil, nil, fmt.Errorf("global config contains non-masterchain hardfork")
 		}
-		if !validBlockID(hardfork) {
+		if !storage2.BlockIDHashesKnown(hardfork) {
 			return nil, nil, fmt.Errorf("global config contains invalid hardfork")
 		}
 
@@ -836,7 +831,7 @@ func initBlockFromConfig(block liteclient.ConfigBlock, zeroBlock ton.BlockIDExt,
 	}
 
 	initBlock = blockIDFromConfig(block)
-	if initBlock.Workchain != -1 || initBlock.Shard != topShard || !validBlockID(initBlock) {
+	if initBlock.Workchain != -1 || initBlock.Shard != topShard || !storage2.BlockIDHashesKnown(initBlock) {
 		return ton.BlockIDExt{}, fmt.Errorf("global config contains invalid init_block")
 	}
 	return latestInitBlockForHardforks(initBlock, hardforks), nil
@@ -887,22 +882,33 @@ func (n *Node) startDHTClient(cfg *liteclient.GlobalConfig) error {
 }
 
 type peerPool struct {
-	gateway *adnl.Gateway
-	mx      sync.RWMutex
-	peers   map[PeerID]*pooledPeer
+	gateway                   *adnl.Gateway
+	broadcastReceiverResolver overlay.BroadcastReceiverResolver
+	mx                        sync.RWMutex
+	peers                     map[PeerID]*pooledPeer
 }
 
 type pooledPeer struct {
-	id          PeerID
-	addr        string
-	pub         ed25519.PublicKey
-	adnl        *overlay.ADNLWrapper
-	rldp        *overlay.RLDPWrapper
-	refs        int
-	overlayRefs map[string]int
+	id              PeerID
+	addr            string
+	pub             ed25519.PublicKey
+	adnl            *overlay.ADNLWrapper
+	baseRLDP        *rldp.RLDP
+	rldp            *overlay.RLDPWrapper
+	refs            int
+	fixedMemberRefs int
+	adnlOverlayRefs map[*overlay.ADNLOverlayWrapper]int
+	rldpOverlayRefs map[*overlay.RLDPOverlayWrapper]int
+	lastUsedAt      atomic.Int64
+}
+
+type idlePooledPeer struct {
+	peer     *pooledPeer
+	lastUsed time.Time
 }
 
 var errPeerEndpointBusy = errors.New("peer endpoint is in active use")
+var errPooledPeerUnavailable = errors.New("pooled peer is no longer available")
 
 // acquirePeerEndpoint treats the first connection for a PeerID as canonical.
 // Later DHT announcements reuse that transport instead of changing its route.
@@ -912,9 +918,6 @@ func (n *Node) acquirePeerEndpoint(peerID PeerID, addr string, key ed25519.Publi
 	}
 
 	n.peerUseMx.Lock()
-	if n.peerUse == nil {
-		n.peerUse = map[PeerID]peerUse{}
-	}
 	use := n.peerUse[peerID]
 	if use.endpointPending != nil {
 		n.peerUseMx.Unlock()
@@ -1044,7 +1047,7 @@ func (n *Node) releasePeerEndpoint(peerID PeerID, pooled *pooledPeer, pending ch
 				use.endpointPending = nil
 				close(pending)
 			}
-			if use.downloads == 0 && use.queries == 0 && use.pins == 0 && use.endpointPending == nil {
+			if use.downloads == 0 && use.queries == 0 && use.endpointPending == nil {
 				delete(n.peerUse, peerID)
 			} else {
 				n.peerUse[peerID] = use
@@ -1066,17 +1069,18 @@ func (n *Node) cancelPeerEndpointPending(peerID PeerID, pending chan struct{}) {
 	}
 	use.endpointPending = nil
 	close(pending)
-	if use.downloads == 0 && use.queries == 0 && use.pins == 0 {
+	if use.downloads == 0 && use.queries == 0 {
 		delete(n.peerUse, peerID)
 		return
 	}
 	n.peerUse[peerID] = use
 }
 
-func newPeerPool(gateway *adnl.Gateway) *peerPool {
+func newPeerPool(gateway *adnl.Gateway, resolver overlay.BroadcastReceiverResolver) *peerPool {
 	return &peerPool{
-		gateway: gateway,
-		peers:   map[PeerID]*pooledPeer{},
+		gateway:                   gateway,
+		broadcastReceiverResolver: resolver,
+		peers:                     map[PeerID]*pooledPeer{},
 	}
 }
 
@@ -1100,33 +1104,60 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	}
 
 	p.mx.Lock()
-	defer p.mx.Unlock()
 
 	if pooled := p.peers[id]; pooled != nil {
 		if !pooledPeerClosed(pooled) {
+			pooled.touch(time.Now())
+			p.mx.Unlock()
 			return pooled, false, nil
 		}
 		delete(p.peers, id)
 	}
 
 	wrapper := overlay.CreateExtendedADNL(peer)
+	wrapper.SetBroadcastReceiverResolver(p.broadcastReceiverResolver)
 	baseRLDP := rldp.NewClientV2(wrapper)
-	baseRLDP.SetMaxUnexpectedTransferSize(maxRLDPTwoStepTransferSize)
 	rldpClient := overlay.CreateExtendedRLDP(baseRLDP)
 
 	pooled := &pooledPeer{
-		id:          id,
-		addr:        peer.RemoteAddr(),
-		pub:         append(ed25519.PublicKey(nil), peer.GetPubKey()...),
-		adnl:        wrapper,
-		rldp:        rldpClient,
-		overlayRefs: map[string]int{},
+		id:              id,
+		addr:            peer.RemoteAddr(),
+		pub:             append(ed25519.PublicKey(nil), peer.GetPubKey()...),
+		adnl:            wrapper,
+		baseRLDP:        baseRLDP,
+		rldp:            rldpClient,
+		adnlOverlayRefs: map[*overlay.ADNLOverlayWrapper]int{},
+		rldpOverlayRefs: map[*overlay.RLDPOverlayWrapper]int{},
 	}
+	pooled.touch(time.Now())
 	rldpClient.SetOnDisconnect(func() {
 		p.removeDisconnected(id, pooled)
 	})
 	p.peers[id] = pooled
+	stale := p.pruneIdleLocked(time.Now())
+	p.mx.Unlock()
+	for _, idle := range stale {
+		idle.close()
+	}
 	return pooled, true, nil
+}
+
+func (p *pooledPeer) touch(now time.Time) {
+	p.lastUsedAt.Store(now.UnixNano())
+}
+
+func (p *pooledPeer) lastUsed() time.Time {
+	lastUsed := time.Unix(0, p.lastUsedAt.Load())
+	stats := p.adnl.Stats()
+	return latestTime(lastUsed, stats.Inbound.LastPacketAt, stats.Outbound.LastPacketAt)
+}
+
+func (p *peerPool) touchByID(id PeerID, now time.Time) {
+	p.mx.RLock()
+	if pooled := p.peers[id]; pooled != nil {
+		pooled.touch(now)
+	}
+	p.mx.RUnlock()
 }
 
 func (p *peerPool) removeDisconnected(id PeerID, disconnected *pooledPeer) {
@@ -1137,71 +1168,89 @@ func (p *peerPool) removeDisconnected(id PeerID, disconnected *pooledPeer) {
 	p.mx.Unlock()
 }
 
-func (p *peerPool) acquireOverlay(pooled *pooledPeer, overlayID []byte, maxUnauthBroadcastSize uint32, allowBroadcastFEC bool, trustUnauthorizedBroadcast bool) (*overlay.ADNLOverlayWrapper, *overlay.RLDPOverlayWrapper, func()) {
-	key := string(overlayID)
-
+func (p *peerPool) acquireOverlay(pooled *pooledPeer, receiver *overlay.BroadcastReceiver, fixedMember bool) (*overlay.ADNLOverlayWrapper, *overlay.RLDPOverlayWrapper, func(), error) {
 	p.mx.Lock()
-	pooled.refs++
-	if pooled.overlayRefs == nil {
-		pooled.overlayRefs = map[string]int{}
+	if p.peers[pooled.id] != pooled || pooledPeerClosed(pooled) {
+		p.mx.Unlock()
+		return nil, nil, nil, errPooledPeerUnavailable
 	}
-	pooled.overlayRefs[key]++
-	p.mx.Unlock()
 
-	adnlOverlay := pooled.adnl.CreateOverlayWithSettings(overlayID, maxUnauthBroadcastSize, allowBroadcastFEC, trustUnauthorizedBroadcast)
-	rldpOverlay := pooled.rldp.CreateOverlay(overlayID)
+	adnlOverlay, err := pooled.adnl.AttachOverlay(receiver)
+	if err != nil {
+		p.mx.Unlock()
+		return nil, nil, nil, err
+	}
+	rldpOverlay := pooled.rldp.CreateOverlay(receiver.OverlayID())
+
+	pooled.refs++
+	pooled.adnlOverlayRefs[adnlOverlay]++
+	pooled.rldpOverlayRefs[rldpOverlay]++
+	if fixedMember {
+		pooled.fixedMemberRefs++
+		if pooled.fixedMemberRefs == 1 {
+			// C++ raises the unexpected RLDP receive MTU only for private-overlay
+			// peers. Public and unlisted peers keep tonutils-go's bounded default;
+			// expected query answers use their per-request limits independently.
+			pooled.baseRLDP.SetMaxUnexpectedTransferSize(maxRLDPTwoStepTransferSize)
+		}
+	}
+	p.mx.Unlock()
 
 	var once sync.Once
 	return adnlOverlay, rldpOverlay, func() {
 		once.Do(func() {
-			p.releaseOverlay(pooled, key, adnlOverlay, rldpOverlay)
+			p.releaseOverlay(pooled, adnlOverlay, rldpOverlay, fixedMember)
 		})
-	}
+	}, nil
 }
 
-func (p *peerPool) releaseOverlay(pooled *pooledPeer, overlayKey string, adnlOverlay *overlay.ADNLOverlayWrapper, rldpOverlay *overlay.RLDPOverlayWrapper) {
-	var closeBase *pooledPeer
-	var closeADNL *overlay.ADNLOverlayWrapper
-	var closeRLDP *overlay.RLDPOverlayWrapper
-
+func (p *peerPool) releaseOverlay(pooled *pooledPeer, adnlOverlay *overlay.ADNLOverlayWrapper, rldpOverlay *overlay.RLDPOverlayWrapper, fixedMember bool) {
 	p.mx.Lock()
-	if refs := pooled.overlayRefs[overlayKey]; refs <= 1 {
-		delete(pooled.overlayRefs, overlayKey)
-		closeADNL = adnlOverlay
-		closeRLDP = rldpOverlay
+	// Detach zero-ref wrappers before releasing the pool lock. Otherwise a
+	// concurrent acquire can reuse the same wrapper in the gap and a stale
+	// Close would detach the live generation.
+	if refs := pooled.adnlOverlayRefs[adnlOverlay]; refs <= 1 {
+		delete(pooled.adnlOverlayRefs, adnlOverlay)
+		adnlOverlay.Close()
 	} else {
-		pooled.overlayRefs[overlayKey] = refs - 1
+		pooled.adnlOverlayRefs[adnlOverlay] = refs - 1
+	}
+	if refs := pooled.rldpOverlayRefs[rldpOverlay]; refs <= 1 {
+		delete(pooled.rldpOverlayRefs, rldpOverlay)
+		rldpOverlay.Close()
+	} else {
+		pooled.rldpOverlayRefs[rldpOverlay] = refs - 1
 	}
 
 	if pooled.refs > 0 {
 		pooled.refs--
 	}
-	if pooled.refs == 0 && p.peers[pooled.id] == pooled {
-		delete(p.peers, pooled.id)
-		closeBase = pooled
+	if fixedMember {
+		pooled.fixedMemberRefs--
+		if pooled.fixedMemberRefs == 0 {
+			// The transport stays pooled for reuse by public overlays, so the
+			// raised private-overlay MTU is restored to the bounded default.
+			pooled.baseRLDP.SetMaxUnexpectedTransferSize(0)
+		}
+	}
+	var stale []*pooledPeer
+	if pooledPeerIdle(pooled) && p.peers[pooled.id] == pooled {
+		now := time.Now()
+		pooled.touch(now)
+		stale = p.pruneIdleLocked(now)
 	}
 	p.mx.Unlock()
 
-	if closeADNL != nil {
-		closeADNL.Close()
-	}
-	if closeRLDP != nil {
-		closeRLDP.Close()
-	}
-	if closeBase != nil {
-		closeBase.close()
+	for _, idle := range stale {
+		idle.close()
 	}
 }
 
 func (p *peerPool) closeIfUnused(pooled *pooledPeer) {
-	if pooled == nil {
-		return
-	}
-
 	var closeBase *pooledPeer
 
 	p.mx.Lock()
-	if pooled.refs == 0 && len(pooled.overlayRefs) == 0 && p.peers[pooled.id] == pooled {
+	if pooled.refs == 0 && len(pooled.adnlOverlayRefs) == 0 && len(pooled.rldpOverlayRefs) == 0 && p.peers[pooled.id] == pooled {
 		delete(p.peers, pooled.id)
 		closeBase = pooled
 	}
@@ -1243,9 +1292,6 @@ func (p *peerPool) retainByID(peerID PeerID) *pooledPeer {
 // closed underneath (the disconnect cascade prunes the pool asynchronously,
 // so a closed entry can linger in the map for a moment).
 func pooledPeerClosed(pooled *pooledPeer) bool {
-	if pooled == nil || pooled.adnl == nil {
-		return false
-	}
 	select {
 	case <-pooled.adnl.GetCloserCtx().Done():
 		return true
@@ -1255,25 +1301,76 @@ func pooledPeerClosed(pooled *pooledPeer) bool {
 }
 
 func (p *peerPool) releaseRetained(pooled *pooledPeer) {
-	if pooled == nil {
-		return
-	}
-
-	var closeBase *pooledPeer
-
 	p.mx.Lock()
 	if pooled.refs > 0 {
 		pooled.refs--
 	}
-	if pooled.refs == 0 && p.peers[pooled.id] == pooled {
-		delete(p.peers, pooled.id)
-		closeBase = pooled
+	var stale []*pooledPeer
+	if pooledPeerIdle(pooled) && p.peers[pooled.id] == pooled {
+		now := time.Now()
+		pooled.touch(now)
+		stale = p.pruneIdleLocked(now)
 	}
 	p.mx.Unlock()
 
-	if closeBase != nil {
-		closeBase.close()
+	for _, idle := range stale {
+		idle.close()
 	}
+}
+
+func (p *peerPool) pruneIdle(now time.Time) int {
+	p.mx.Lock()
+	stale := p.pruneIdleLocked(now)
+	p.mx.Unlock()
+
+	for _, idle := range stale {
+		idle.close()
+	}
+	return len(stale)
+}
+
+func (p *peerPool) pruneIdleLocked(now time.Time) []*pooledPeer {
+	// The idle count can never exceed the pool size, so a pool within the cap
+	// needs no per-peer Stats() scan at all; closed entries are still removed
+	// by removeDisconnected and retainByID.
+	if len(p.peers) <= peerPoolMaxIdle {
+		return nil
+	}
+
+	cutoff := now.Add(-peerPoolIdleTTL)
+	idle := make([]idlePooledPeer, 0, len(p.peers)-peerPoolMaxIdle)
+	for id, pooled := range p.peers {
+		if pooledPeerClosed(pooled) {
+			delete(p.peers, id)
+			continue
+		}
+		if !pooledPeerIdle(pooled) {
+			continue
+		}
+		lastUsed := pooled.lastUsed()
+		if lastUsed.After(cutoff) {
+			continue
+		}
+		idle = append(idle, idlePooledPeer{peer: pooled, lastUsed: lastUsed})
+	}
+
+	excess := len(idle) - peerPoolMaxIdle
+	if excess <= 0 {
+		return nil
+	}
+	sort.Slice(idle, func(i, j int) bool {
+		return idle[i].lastUsed.Before(idle[j].lastUsed)
+	})
+	stale := make([]*pooledPeer, 0, excess)
+	for _, candidate := range idle[:excess] {
+		delete(p.peers, candidate.peer.id)
+		stale = append(stale, candidate.peer)
+	}
+	return stale
+}
+
+func pooledPeerIdle(pooled *pooledPeer) bool {
+	return pooled.refs == 0 && len(pooled.adnlOverlayRefs) == 0 && len(pooled.rldpOverlayRefs) == 0
 }
 
 func (p *pooledPeer) close() {
@@ -1286,12 +1383,15 @@ func (p *pooledPeer) close() {
 	}
 }
 
-func (p *peerPool) snapshot() []*pooledPeer {
+func (p *peerPool) overlaySnapshot() []*pooledPeer {
 	p.mx.RLock()
 	defer p.mx.RUnlock()
 
 	list := make([]*pooledPeer, 0, len(p.peers))
 	for _, peer := range p.peers {
+		if len(peer.adnlOverlayRefs) == 0 {
+			continue
+		}
 		list = append(list, peer)
 	}
 	return list
@@ -1387,9 +1487,6 @@ func (d *eventDeduper) pruneOverflowLocked() {
 	}
 	for len(d.seen) > d.maxEntries {
 		elem := d.order.Front()
-		if elem == nil {
-			return
-		}
 		d.deleteEntryLocked(elem.Value.(*eventDeduperEntry))
 	}
 }
@@ -1399,10 +1496,8 @@ func (d *eventDeduper) deleteEntryLocked(entry *eventDeduperEntry) {
 		return
 	}
 	delete(d.seen, entry.key)
-	if elem := entry.element; elem != nil {
-		d.order.Remove(elem)
-		entry.element = nil
-	}
+	d.order.Remove(entry.element)
+	entry.element = nil
 }
 
 func buildOverlaySpecs(zeroStateFileHash []byte) ([]overlaySpec, error) {
@@ -1549,36 +1644,38 @@ func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, l
 }
 
 func overlaySpecKey(spec overlaySpec) string {
-	return hex.EncodeToString(spec.ShortID)
+	return string(spec.ShortID)
 }
 
-func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, bool) {
+func (n *Node) getOrCreateSubscription(spec overlaySpec) (*overlaySubscription, error) {
 	key := overlaySpecKey(spec)
 
 	n.subscriptionsMx.Lock()
 	if sub := n.subscriptions[key]; sub != nil {
 		n.subscriptionsMx.Unlock()
-		return sub, false
+		return sub, nil
 	}
 
-	sub := &overlaySubscription{
-		node:       n,
-		spec:       spec,
-		log:        n.log.With().Str("overlay", spec.Name).Logger(),
-		peers:      map[PeerID]*overlayPeer{},
-		peerNotify: make(chan struct{}, 1),
+	sub, err := n.newOverlaySubscription(spec)
+	if err != nil {
+		n.subscriptionsMx.Unlock()
+		return nil, err
 	}
 	n.subscriptions[key] = sub
+	n.publishPublicBroadcastReceiversLocked()
 	n.subscriptionsMx.Unlock()
 
 	n.attachSubscriptionPeers(sub)
-	return sub, true
+	return sub, nil
 }
 
-func (n *Node) getOrActivateSubscription(spec overlaySpec) (*overlaySubscription, bool) {
+func (n *Node) getOrActivateSubscription(spec overlaySpec) (*overlaySubscription, bool, error) {
 	key := overlaySpecKey(spec)
 	for {
-		sub, _ := n.getOrCreateSubscription(spec)
+		sub, err := n.getOrCreateSubscription(spec)
+		if err != nil {
+			return nil, false, err
+		}
 
 		n.subscriptionsMx.Lock()
 		if n.subscriptions[key] != sub {
@@ -1589,7 +1686,7 @@ func (n *Node) getOrActivateSubscription(spec overlaySpec) (*overlaySubscription
 		reactivated := sub.setActiveLocked(true, time.Time{})
 		sub.mx.Unlock()
 		n.subscriptionsMx.Unlock()
-		return sub, reactivated
+		return sub, reactivated, nil
 	}
 }
 
@@ -1604,10 +1701,13 @@ func (n *Node) subscriptionForOverlayBlock(block ton.BlockIDExt) (*overlaySubscr
 
 	spec, err := buildOverlaySpec(n.zeroStateFileHash, block.Workchain, block.Shard, overlayName(block.Workchain, block.Shard))
 	if err != nil {
-		return nil, fmt.Errorf("build overlay for %s: %w", formatBlockRef(block), err)
+		return nil, fmt.Errorf("build overlay for %s: %w", storage2.FormatBlockRef(block), err)
 	}
 
-	sub, _ := n.getOrActivateSubscription(spec)
+	sub, _, err := n.getOrActivateSubscription(spec)
+	if err != nil {
+		return nil, err
+	}
 	n.startSubscription(sub)
 	return sub, nil
 }
@@ -1616,9 +1716,6 @@ func (n *Node) SetMonitorMinSplitDepth(workchain int32, depth uint32) {
 	n.monitorSplitMx.Lock()
 	defer n.monitorSplitMx.Unlock()
 
-	if n.monitorMinSplitDepth == nil {
-		n.monitorMinSplitDepth = map[int32]uint32{}
-	}
 	n.monitorMinSplitDepth[workchain] = depth
 }
 
@@ -1637,7 +1734,10 @@ func (n *Node) SetActiveShardOverlays(blocks []ton.BlockIDExt) error {
 		key := overlaySpecKey(spec)
 		active[key] = struct{}{}
 
-		sub, reactivated := n.getOrActivateSubscription(spec)
+		sub, reactivated, err := n.getOrActivateSubscription(spec)
+		if err != nil {
+			return err
+		}
 		if reactivated {
 			n.log.Debug().
 				Str("overlay", spec.Name).
@@ -1727,6 +1827,7 @@ func (n *Node) runSubscriptionLifecycleLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			n.pool.pruneIdle(now)
 			n.stopExpiredInactiveSubscriptions(now)
 		}
 	}
@@ -1760,7 +1861,12 @@ func (n *Node) deleteInactiveSubscription(key string, sub *overlaySubscription, 
 	}
 	delete(n.subscriptions, key)
 	sub.removed = true
+	n.publishPublicBroadcastReceiversLocked()
 	sub.mx.Unlock()
+	// Keep subscription creation serialized until the old receiver generation
+	// is closed. AttachOverlay may then replace its still-attached wrappers
+	// without losing every pooled peer during shard reactivation.
+	sub.broadcastReceiver.Close()
 	n.subscriptionsMx.Unlock()
 
 	sub.close()

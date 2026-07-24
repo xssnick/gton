@@ -49,13 +49,7 @@ type ArchiveDownloadOptions struct {
 }
 
 func (n *Node) BeginArchiveSession() *ArchiveSession {
-	parentCtx := n.runtimeContext()
-	if parentCtx == nil {
-		// Archive sessions can be used by offline nodes before Node.Start has
-		// installed its runtime context; Close still owns their lifecycle.
-		parentCtx = context.Background()
-	}
-	opCtx, opCancel := context.WithCancel(parentCtx)
+	opCtx, opCancel := context.WithCancel(n.runCtx)
 
 	return &ArchiveSession{
 		node:          n,
@@ -351,10 +345,6 @@ func (a *ArchiveSession) selectedArchivePeerPool(shard archive.ShardID) *archive
 	defer a.mx.Unlock()
 
 	return a.selectedPools[archivePeerPoolKey(shard)]
-}
-
-func (a *ArchiveSession) selectArchivePeer(shard archive.ShardID, peer *overlayPeer) {
-	a.selectArchivePeerFromPool(shard, peer, nil)
 }
 
 func (a *ArchiveSession) selectArchivePeerFromPool(shard archive.ShardID, peer *overlayPeer, pool *archivePeerPool) {

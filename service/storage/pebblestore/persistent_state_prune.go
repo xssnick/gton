@@ -35,7 +35,11 @@ func (s *Store) PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix ui
 
 	sortPersistentStatePruneFiles(files)
 	retained := persistentStatePruneRetainedGroups(files, keepRecentGroups)
-	pendingMigrationSeqno, hasPendingMigration := s.pendingCellGenerationMigrationOriginSeqno()
+	pendingMigrationSeqno, pendingMigrationErr := s.pendingCellGenerationMigrationOriginSeqno()
+	if pendingMigrationErr != nil && !errors.Is(pendingMigrationErr, storage.ErrNotFound) {
+		return stats, pendingMigrationErr
+	}
+	hasPendingMigration := pendingMigrationErr == nil
 	stats.RetainedRecentGroups = len(retained)
 	stats.OldestRetainedMasterSeqno = oldestRetainedPersistentStateSeqno(retained)
 
@@ -77,14 +81,14 @@ func (s *Store) PruneExpiredPersistentStateFiles(ctx context.Context, nowUnix ui
 	return stats, nil
 }
 
-func (s *Store) pendingCellGenerationMigrationOriginSeqno() (uint32, bool) {
+func (s *Store) pendingCellGenerationMigrationOriginSeqno() (uint32, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if s.pendingCellMigration == nil {
-		return 0, false
+		return 0, storage.ErrNotFound
 	}
-	return s.pendingCellMigration.origin.SeqNo, true
+	return s.pendingCellMigration.origin.SeqNo, nil
 }
 
 func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMasterSeqno uint32) (storage.PersistentStatePruneStats, error) {
@@ -103,7 +107,11 @@ func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMas
 	}
 
 	sortPersistentStatePruneFiles(files)
-	pendingMigrationSeqno, hasPendingMigration := s.pendingCellGenerationMigrationOriginSeqno()
+	pendingMigrationSeqno, pendingMigrationErr := s.pendingCellGenerationMigrationOriginSeqno()
+	if pendingMigrationErr != nil && !errors.Is(pendingMigrationErr, storage.ErrNotFound) {
+		return stats, pendingMigrationErr
+	}
+	hasPendingMigration := pendingMigrationErr == nil
 	var previousSeqno uint32
 	for _, file := range files {
 		if file.master.SeqNo >= beforeMasterSeqno {
@@ -328,7 +336,7 @@ func (s *Store) persistentStateFileExpired(ctx context.Context, master ton.Block
 	if err != nil {
 		return false, fmt.Errorf("load persistent state master block meta %s: %w", storage.FormatBlockRef(master), err)
 	}
-	if meta == nil || meta.GenUTime == 0 {
+	if meta.GenUTime == 0 {
 		return true, nil
 	}
 	return persistentStateFileTTL(meta.GenUTime) < nowUnix, nil

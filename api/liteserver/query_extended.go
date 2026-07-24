@@ -59,7 +59,7 @@ func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 		}
 
 		return ton.BlockState{
-			ID:       cloneBlockID(*id),
+			ID:       blockproof.CloneBlockID(*id),
 			RootHash: id.RootHash,
 			FileHash: id.FileHash,
 			Data:     data,
@@ -75,7 +75,7 @@ func (s *Server) handleState(ctx context.Context, id *ton.BlockIDExt) any {
 	fileHash := sha256.Sum256(data)
 
 	return ton.BlockState{
-		ID:       cloneBlockID(*id),
+		ID:       blockproof.CloneBlockID(*id),
 		RootHash: root.Hash(0),
 		FileHash: fileHash[:],
 		Data:     data,
@@ -185,14 +185,14 @@ func (s *Server) handleAllShardsInfo(ctx context.Context, id *ton.BlockIDExt) an
 		return ton.LSError{Code: errCodeInternal, Text: "invalid all shards info cache value"}
 	}
 	return ton.AllShardsInfo{
-		ID:    cloneBlockID(*id),
+		ID:    blockproof.CloneBlockID(*id),
 		Proof: []*cell.Cell{parts.proof},
 		Data:  parts.data,
 	}
 }
 
 func (s *Server) buildAllShardsInfoParts(ctx context.Context, id ton.BlockIDExt) (allShardsInfoParts, error) {
-	root, err := s.loadBlockRoot(ctx, id)
+	root, err := s.store.BlockRoot(ctx, id)
 	if err != nil {
 		return allShardsInfoParts{}, queryErrorFromResponse(errorResponse(err, "cannot load block "+storage.FormatBlockRef(id)))
 	}
@@ -251,8 +251,8 @@ func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) an
 	}
 
 	return ton.ShardInfo{
-		ID:               cloneBlockID(*query.ID),
-		ShardBlock:       cloneBlockID(shardBlock),
+		ID:               blockproof.CloneBlockID(*query.ID),
+		ShardBlock:       blockproof.CloneBlockID(shardBlock),
 		ShardProof:       []*cell.Cell{fragments.BlockStateRootProof(), stateProof},
 		ShardDescription: leaf,
 	}
@@ -295,7 +295,7 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 		}
 		return ton.ConfigAll{
 			Mode:        int(effectiveMode),
-			ID:          cloneBlockID(*id),
+			ID:          blockproof.CloneBlockID(*id),
 			StateProof:  parts.stateProof,
 			ConfigProof: parts.configProof,
 		}
@@ -314,7 +314,7 @@ func (s *Server) handleConfig(ctx context.Context, id *ton.BlockIDExt, mode int3
 
 	return ton.ConfigAll{
 		Mode:        int(effectiveMode),
-		ID:          cloneBlockID(*id),
+		ID:          blockproof.CloneBlockID(*id),
 		StateProof:  proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 		ConfigProof: proof[1].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
@@ -350,14 +350,14 @@ func (s *Server) handlePreviousKeyBlockConfig(ctx context.Context, id ton.BlockI
 
 	return ton.ConfigAll{
 		Mode:        int(mode),
-		ID:          cloneBlockID(keyBlock),
+		ID:          blockproof.CloneBlockID(keyBlock),
 		StateProof:  nil,
 		ConfigProof: proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 	}
 }
 
 func (s *Server) previousKeyBlockRoot(ctx context.Context, id ton.BlockIDExt) (ton.BlockIDExt, *cell.Cell, error) {
-	root, err := s.loadBlockRoot(ctx, id)
+	root, err := s.store.BlockRoot(ctx, id)
 	if err != nil {
 		return ton.BlockIDExt{}, nil, err
 	}
@@ -383,7 +383,7 @@ func (s *Server) previousKeyBlockRoot(ctx context.Context, id ton.BlockIDExt) (t
 		return ton.BlockIDExt{}, nil, err
 	}
 
-	keyRoot, err := s.loadBlockRoot(ctx, keyBlock)
+	keyRoot, err := s.store.BlockRoot(ctx, keyBlock)
 	if err != nil {
 		return ton.BlockIDExt{}, nil, err
 	}
@@ -454,7 +454,7 @@ func (s *Server) handleLibrariesWithProof(ctx context.Context, query ton.GetLibr
 	proof := []*cell.Cell{fragments.BlockStateRootProof(), dataProof}
 
 	return ton.LibraryResultWithProof{
-		ID:         cloneBlockID(*query.ID),
+		ID:         blockproof.CloneBlockID(*query.ID),
 		Mode:       query.Mode,
 		Result:     entries,
 		StateProof: proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
@@ -478,7 +478,7 @@ func (s *Server) handleOneTransaction(ctx context.Context, query ton.GetOneTrans
 		return ton.LSError{Code: errCodeProtoViolation, Text: "requested account id is not contained in the shard of the specified block"}
 	}
 
-	root, err := s.loadBlockRoot(ctx, *query.ID)
+	root, err := s.store.BlockRoot(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*query.ID))
 	}
@@ -494,7 +494,7 @@ func (s *Server) handleOneTransaction(ctx context.Context, query ton.GetOneTrans
 	}
 
 	return ton.TransactionInfo{
-		ID:          cloneBlockID(*query.ID),
+		ID:          blockproof.CloneBlockID(*query.ID),
 		Proof:       proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
 		Transaction: data,
 	}
@@ -529,9 +529,11 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 
 	for cursorLT != 0 && len(roots) < limit {
 		tx, block, err := accountTransactionFromCurrentBlock(currentBlock, query.AccID.Workchain, account, cursorLT)
-		if errors.Is(err, storage.ErrNotFound) {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
 			tx, block, err = s.accountTransactionFromShardHint(ctx, currentBlock, query.AccID.Workchain, account, cursorLT)
-			if errors.Is(err, storage.ErrNotFound) {
+			switch {
+			case errors.Is(err, storage.ErrNotFound):
 				blockID, err := s.lookupBlockByAccountLT(ctx, query.AccID.Workchain, account, cursorLT)
 				if errors.Is(err, storage.ErrNotFound) {
 					if len(roots) > 0 {
@@ -549,7 +551,7 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 					return ton.LSError{Code: errCodeProtoViolation, Text: "cannot compute block with specified transaction: " + err.Error()}
 				}
 
-				root, err := s.loadBlockRoot(ctx, blockID)
+				root, err := s.store.BlockRoot(ctx, blockID)
 				if err != nil {
 					if len(roots) > 0 {
 						return getTransactionsResponse(roots, ids)
@@ -581,14 +583,14 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 				if err != nil {
 					return errorResponse(err, "cannot get transaction")
 				}
-			} else if err != nil {
+			case err != nil:
 				return errorResponse(err, "cannot get transaction")
 			}
 
 			currentBlock = block
-		} else if errors.Is(err, errBlockCannotContainAccount) {
+		case errors.Is(err, errBlockCannotContainAccount):
 			return ton.LSError{Code: errCodeProtoViolation, Text: err.Error()}
-		} else if err != nil {
+		case err != nil:
 			return errorResponse(err, "cannot get transaction")
 		}
 
@@ -612,7 +614,7 @@ func (s *Server) handleGetTransactions(ctx context.Context, query ton.GetTransac
 		}
 
 		roots = append(roots, tx)
-		ids = append(ids, cloneBlockID(block.id))
+		ids = append(ids, blockproof.CloneBlockID(block.id))
 
 		cursorLT = header.prevLT
 		if cursorLT == 0 {
@@ -719,7 +721,7 @@ func (s *Server) accountTransactionFromShardHint(ctx context.Context, current *t
 		return nil, nil, storage.ErrNotFound
 	}
 
-	root, err := s.loadBlockRoot(ctx, hintedBlock)
+	root, err := s.store.BlockRoot(ctx, hintedBlock)
 	if err != nil {
 		return nil, nil, storage.ErrNotFound
 	}
@@ -819,7 +821,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid start transaction id"}
 	}
 
-	root, err := s.loadBlockRoot(ctx, *query.ID)
+	root, err := s.store.BlockRoot(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*query.ID))
 	}
@@ -862,7 +864,7 @@ func (s *Server) handleListBlockTransactions(ctx context.Context, query ton.List
 	}
 
 	return ton.BlockTransactions{
-		ID:             cloneBlockID(*query.ID),
+		ID:             blockproof.CloneBlockID(*query.ID),
 		ReqCount:       int32(query.Count),
 		Incomplete:     txs.incomplete,
 		TransactionIds: ids,
@@ -878,7 +880,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid start transaction id"}
 	}
 
-	root, err := s.loadBlockRoot(ctx, *query.ID)
+	root, err := s.store.BlockRoot(ctx, *query.ID)
 	if err != nil {
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*query.ID))
 	}
@@ -910,7 +912,7 @@ func (s *Server) handleListBlockTransactionsExt(ctx context.Context, query ton.L
 	}
 
 	return ton.BlockTransactionsExt{
-		ID:           cloneBlockID(*query.ID),
+		ID:           blockproof.CloneBlockID(*query.ID),
 		ReqCount:     int32(query.Count),
 		Incomplete:   list.incomplete,
 		Transactions: txs,
@@ -942,7 +944,7 @@ func (s *Server) handleValidatorStats(ctx context.Context, query ton.GetValidato
 
 	return ton.ValidatorStats{
 		Mode:       query.Mode & 0xff,
-		ID:         cloneBlockID(*query.ID),
+		ID:         blockproof.CloneBlockID(*query.ID),
 		Count:      count,
 		Complete:   complete,
 		StateProof: proof[0].ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false}),
@@ -979,7 +981,7 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 
 	resp := ton.BlockOutMsgQueueSize{
 		Mode: query.Mode,
-		ID:   cloneBlockID(*query.ID),
+		ID:   blockproof.CloneBlockID(*query.ID),
 		Size: int64(size),
 	}
 	if query.Mode&1 != 0 {
@@ -1034,7 +1036,7 @@ func (s *Server) handleOutMsgQueueSizes(ctx context.Context, query ton.GetOutMsg
 			size = math.MaxInt32
 		}
 		sizes = append(sizes, ton.OutMsgQueueSize{
-			ID:   cloneBlockID(block),
+			ID:   blockproof.CloneBlockID(block),
 			Size: int32(size),
 		})
 	}

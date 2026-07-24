@@ -92,11 +92,6 @@ func (q *boundedQueue[T]) Pop(ctx context.Context) (T, bool) {
 }
 
 func (q *boundedQueue[T]) TryPop() (T, bool) {
-	var zero T
-	if q == nil {
-		return zero, false
-	}
-
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -187,10 +182,6 @@ func popPriority[T any](ctx context.Context, priority *boundedQueue[T], fallback
 }
 
 func queueWaitState[T any](q *boundedQueue[T]) (<-chan struct{}, <-chan struct{}, bool) {
-	if q == nil {
-		return nil, nil, true
-	}
-
 	q.mu.Lock()
 	defer q.mu.Unlock()
 

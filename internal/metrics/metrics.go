@@ -202,23 +202,11 @@ func (m *Metrics) RegisterRuntimeCollectors(readers RuntimeReaders) error {
 	return nil
 }
 
-func (m *Metrics) serviceStatus() service.StatusSnapshot {
-	return m.serviceStatusReader()
-}
-
-func (m *Metrics) dbStatus(ctx context.Context) (pebblestore.DBStatus, error) {
-	return m.dbStatusReader(ctx)
-}
-
 func (m *Metrics) lazyCellLoads() []storage.LazyCellLoadMetric {
 	if m.lazyCellLoadReader == nil {
 		return nil
 	}
 	return m.lazyCellLoadReader()
-}
-
-func (m *Metrics) storageArtifactStatus() storageArtifactStatus {
-	return m.artifactStatus.Status()
 }
 
 func (m *Metrics) AddArchivePackageBytes(delta int64) {

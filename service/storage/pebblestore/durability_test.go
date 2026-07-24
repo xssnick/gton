@@ -421,3 +421,18 @@ func TestDeletePersistentStateFileRetriesAfterDurableUnlink(t *testing.T) {
 		t.Fatalf("persistent state after retry = %v, want ErrNotFound", err)
 	}
 }
+
+func TestSyncFileAndDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "archive.pack")
+	if err := os.WriteFile(path, []byte("pack"), 0o644); err != nil {
+		t.Fatalf("write pack: %v", err)
+	}
+
+	if err := syncFile(path); err != nil {
+		t.Fatalf("sync file: %v", err)
+	}
+	if err := syncDir(dir); err != nil {
+		t.Fatalf("sync directory: %v", err)
+	}
+}

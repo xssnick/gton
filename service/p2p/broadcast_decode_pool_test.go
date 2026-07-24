@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/storage"
+
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -77,14 +79,14 @@ func TestOffloadedBroadcastDecodeDeliversEventAndCachesResult(t *testing.T) {
 	}
 
 	// first delivery: signatures verified synchronously, decode offloaded
-	accepted, err := firstSub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("first"))
+	result, err := firstSub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("first"))
 	if err != nil {
 		t.Fatalf("classify first delivery: %v", err)
 	}
-	if accepted == nil || accepted.event != nil {
-		t.Fatalf("first delivery should be acknowledged without an event, got %+v", accepted)
+	if result.disposition != broadcastDispositionAccept || result.accepted.event != nil {
+		t.Fatalf("first delivery should be acknowledged without an event, got %+v", result)
 	}
-	if accepted.rebroadcast == nil {
+	if result.accepted.rebroadcast == nil {
 		t.Fatal("first delivery acknowledgement is missing the rebroadcast payload")
 	}
 
@@ -107,18 +109,18 @@ func TestOffloadedBroadcastDecodeDeliversEventAndCachesResult(t *testing.T) {
 	// second delivery of the same block on another overlay: different
 	// fingerprint, so the deduper does not collapse it, but the decode cache
 	// completes it inline with an immediate event
-	accepted, err = secondSub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliveryTwoStep, false, testPeerID("second"))
+	result, err = secondSub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliveryTwoStep, false, testPeerID("second"))
 	if err != nil {
 		t.Fatalf("classify second delivery: %v", err)
 	}
-	if accepted == nil || accepted.event == nil || accepted.event.Downloaded == nil {
-		t.Fatalf("second delivery should reuse the cached decode inline, got %+v", accepted)
+	if result.disposition != broadcastDispositionAccept || result.accepted.event == nil || result.accepted.event.Downloaded == nil {
+		t.Fatalf("second delivery should reuse the cached decode inline, got %+v", result)
 	}
-	if !accepted.event.Downloaded.ID.Equals(&block) {
-		t.Fatalf("cached downloaded block mismatch: %+v", accepted.event.Downloaded)
+	if !result.accepted.event.Downloaded.ID.Equals(&block) {
+		t.Fatalf("cached downloaded block mismatch: %+v", result.accepted.event.Downloaded)
 	}
-	if accepted.event.Downloaded.SourcePeerID != testPeerID("second") {
-		t.Fatalf("cached delivery source peer = %s", accepted.event.Downloaded.SourcePeerID.String())
+	if result.accepted.event.Downloaded.SourcePeerID != testPeerID("second") {
+		t.Fatalf("cached delivery source peer = %s", result.accepted.event.Downloaded.SourcePeerID.String())
 	}
 }
 
@@ -151,7 +153,7 @@ func TestEnqueueBroadcastDecodeRoutesMasterchainToDedicatedLane(t *testing.T) {
 	select {
 	case req := <-node.masterDecodeQueue:
 		if !req.block.Equals(&master) {
-			t.Fatalf("masterchain lane holds %s", formatBlockRef(req.block))
+			t.Fatalf("masterchain lane holds %s", storage.FormatBlockRef(req.block))
 		}
 	default:
 		t.Fatal("masterchain lane is empty")
@@ -164,8 +166,8 @@ func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 	downloaded := &DownloadedBlock{ID: block, Kind: "tonNode.blockBroadcastCompressedV2"}
 
 	cache.put("kind", block, downloaded, nil)
-	got, _, ok := cache.get("kind", block)
-	if !ok {
+	got, _, err := cache.get("kind", block)
+	if err != nil {
 		t.Fatal("cache miss after put")
 	}
 	if got == downloaded {
@@ -173,15 +175,15 @@ func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 	}
 	got.SourcePeerID = testPeerID("mutated")
 
-	again, _, ok := cache.get("kind", block)
-	if !ok {
+	again, _, err := cache.get("kind", block)
+	if err != nil {
 		t.Fatal("cache miss on second get")
 	}
 	if again.SourcePeerID == testPeerID("mutated") {
 		t.Fatal("mutating a returned copy leaked into the cache")
 	}
 
-	if _, _, ok := cache.get("other-kind", block); ok {
+	if _, _, err := cache.get("other-kind", block); err == nil {
 		t.Fatal("cache hit across kinds")
 	}
 
@@ -189,7 +191,7 @@ func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 		downloaded: *downloaded,
 		storedAt:   time.Now().Add(-2 * decodedBroadcastCacheTTL),
 	}
-	if _, _, ok := cache.get("kind", block); ok {
+	if _, _, err := cache.get("kind", block); err == nil {
 		t.Fatal("expired entry served from cache")
 	}
 }

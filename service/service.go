@@ -72,7 +72,6 @@ const (
 	syncedBlockPriorityQueueLimit  = 64
 	syncedBlockMasterHotWorkers    = 2
 	syncedBlockMasterHotQueueLimit = 64
-	statusTPSMasterWindow          = 10
 )
 
 const (
@@ -158,6 +157,7 @@ type Service struct {
 	externalMessageChecker  *externalmsg.Checker
 	externalMessageHooks    *externalMessageHookRunner
 	blockReceivedHooks      *blockReceivedHookRunner
+	recentTPS               *recentTPSTracker
 
 	stateCellPrewrite *stateCellPrewriter
 	artifactPrewrite  *artifactPrewriter
@@ -226,8 +226,7 @@ type Service struct {
 	syncDiskSpacePath                  string
 	minSyncDiskFreeBytes               uint64
 	minStateSerializationDiskFreeBytes uint64
-	syncDiskSpaceProbe                 syncDiskSpaceProbe
-	syncDiskSpaceRetryDelay            time.Duration
+	persistentStateKeepRecent          int
 	exclusiveTaskMu                    sync.Mutex
 	exclusiveTask                      exclusiveServiceTask
 	cellMigrationMu                    sync.Mutex
@@ -265,6 +264,7 @@ type Options struct {
 	MinStateSerializationDiskFreeBytes      uint64
 	DisableStateSerialization               bool
 	PersistentStateLargeBOCBatchSize        int
+	PersistentStateKeepRecent               int
 	StateSerializeOnePass                   bool
 	SyncObserver                            SyncObserver
 	Extension                               hooks.Extension
@@ -529,6 +529,9 @@ type ShardStatusSnapshot struct {
 }
 
 type StatusTPSSnapshot struct {
+	// WindowMasters is kept for compatibility with the released status API.
+	//
+	// Deprecated: use DurationSeconds to identify the sampling window.
 	WindowMasters   int
 	Transactions    uint64
 	DurationSeconds int64
@@ -564,6 +567,9 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	if opts.MinStateSerializationDiskFreeBytes == 0 {
 		opts.MinStateSerializationDiskFreeBytes = stateSerializationMinDiskFreeBytes
 	}
+	if opts.PersistentStateKeepRecent == 0 {
+		opts.PersistentStateKeepRecent = DefaultPersistentStateKeepRecent
+	}
 
 	svc := &Service{
 		log:                                logger,
@@ -579,6 +585,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		externalMessageChecker:             opts.ExternalMessageChecker,
 		externalMessageHooks:               newExternalMessageHookRunner(logger, opts.Extension),
 		blockReceivedHooks:                 newBlockReceivedHookRunner(logger, opts.Extension),
+		recentTPS:                          newRecentTPSTracker(recentTPSWindow),
 		stateCellPrewrite:                  newStateCellPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		artifactPrewrite:                   newArtifactPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
@@ -592,6 +599,14 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		shardDescriptionWake:               make(chan struct{}, 1),
 		shardDescriptionHints:              map[storage.BlockRootHash]shardDescriptionHint{},
 		preparedShardBlockSlots:            make(chan struct{}, preparedShardBlockWorkers),
+		nextMasterchainQueue:               make(map[storage.BlockRootHash]queuedMasterchainBlock, nextMasterchainQueueLimit),
+		nextMasterchainBySeqno:             make(map[uint32]storage.BlockRootHash, nextMasterchainQueueLimit),
+		nextMasterchainCandidates:          make(map[storage.BlockRootHash]queuedMasterchainCandidate, nextMasterchainQueueLimit),
+		nextMasterchainCandidateBySeqno:    make(map[uint32]storage.BlockRootHash, nextMasterchainQueueLimit),
+		masterStateCache:                   make(map[storage.BlockRootHash]*storage.BlockState, masterStateCacheLimit),
+		compressedStateCache:               make(map[storage.BlockRootHash]compressedBlockStateEntry, compressedBlockStateCacheLimit),
+		monitorSplitDepth:                  make(map[monitorSplitDepthKey]uint32),
+		stateCellLoaders:                   make(map[uint64]cell.LazyCellLoader),
 		maintenanceWake:                    make(chan struct{}, 1),
 		stateTTL:                           opts.StateTTL,
 		archiveTTL:                         opts.ArchiveTTL,
@@ -600,38 +615,19 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		syncDiskSpacePath:                  opts.StorageDir,
 		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
+		persistentStateKeepRecent:          opts.PersistentStateKeepRecent,
 	}
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization, opts.PersistentStateLargeBOCBatchSize, opts.StateSerializeOnePass)
+	svc.storeStateCellLoadersSnapshotLocked()
 	if svc.liveState != nil {
 		svc.liveState.SetNonfinalCellLoader(svc.stateCellLoader())
 	}
 	return svc
 }
 
-func (s *Service) nextCheckpointBlocks() uint32 {
-	if s.nextBlockCheckpointBlocks != 0 {
-		return s.nextBlockCheckpointBlocks
-	}
-	return DefaultNextBlockCheckpointBlocks
-}
-
-func (s *Service) checkpointBytesTarget() uint64 {
-	if s.checkpointBytes != 0 {
-		return s.checkpointBytes
-	}
-	return DefaultCheckpointBytes
-}
-
-func (s *Service) syncBackpressureWindowCount() uint32 {
-	if s.syncBackpressureWindows != 0 {
-		return s.syncBackpressureWindows
-	}
-	return DefaultSyncBackpressureWindows
-}
-
 func checkpointBackpressureBlocks(target uint32, windows uint32) uint32 {
-	if windows == 0 {
-		windows = DefaultSyncBackpressureWindows
+	if target == 0 || windows == 0 {
+		return 0
 	}
 	if target > ^uint32(0)/windows {
 		return ^uint32(0)
@@ -640,8 +636,8 @@ func checkpointBackpressureBlocks(target uint32, windows uint32) uint32 {
 }
 
 func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
-	if windows == 0 {
-		windows = DefaultSyncBackpressureWindows
+	if target == 0 || windows == 0 {
+		return 0
 	}
 	windowCount := uint64(windows)
 	if target > ^uint64(0)/windowCount {
@@ -652,7 +648,10 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
-		s.stateCellPrewrite.start(ctx, s.currentStatePersistContext(), s.runAsync)
+		s.runAsync(func() {
+			s.recentTPS.run(ctx)
+		})
+		s.stateCellPrewrite.start(ctx, s.shutdownContext, s.runAsync)
 		s.artifactPrewrite.start(ctx, s.runAsync)
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
@@ -687,6 +686,7 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 		BlockSync:      s.blockSync.StatusSnapshot(),
 		BackgroundTask: s.backgroundTaskStatus(),
 	}
+	snapshot.RecentTPS = s.recentTPS.statusSnapshot()
 
 	ctx := context.Background()
 	current, err := s.currentStatusSnapshot(ctx)
@@ -698,7 +698,6 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 		snapshot.LocalMasterchainUtime = masterMetrics.Utime
 		snapshot.LocalMasterchainTx = masterMetrics.Transactions
 		snapshot.LocalMasterchainHasTx = masterMetrics.HasTransactions
-		snapshot.RecentTPS = s.recentTPSSnapshot(ctx, current, statusTPSMasterWindow)
 		for _, shard := range current.Shards {
 			if shard.Block.Workchain != 0 {
 				continue
@@ -780,10 +779,6 @@ func (s *Service) SyncLagSeconds() (int64, error) {
 }
 
 func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *StatusSnapshot, current *storage.CurrentState) {
-	if snapshot == nil || current == nil {
-		return
-	}
-
 	latestMaster := current.Masterchain.Block
 	if snapshot.LatestMasterchain != nil && snapshot.LatestMasterchain.SeqNo > latestMaster.SeqNo {
 		latestMaster = *snapshot.LatestMasterchain
@@ -866,9 +861,6 @@ func (s *Service) currentStatusSnapshot(ctx context.Context) (*storage.CurrentSt
 }
 
 func blockStateUtime(ctx context.Context, store storage.Storage, state *storage.BlockState) int64 {
-	if state == nil {
-		return 0
-	}
 	if state.Parsed != nil && state.Parsed.GenUTime != 0 {
 		return int64(state.Parsed.GenUTime)
 	}
@@ -876,12 +868,8 @@ func blockStateUtime(ctx context.Context, store storage.Storage, state *storage.
 }
 
 func blockUtimeFromMeta(ctx context.Context, store storage.Storage, block *ton.BlockIDExt) int64 {
-	if store == nil || block == nil {
-		return 0
-	}
-
 	meta, err := store.BlockMeta(ctx, *block)
-	if err != nil || meta == nil || meta.GenUTime == 0 {
+	if err != nil || meta.GenUTime == 0 {
 		return 0
 	}
 	return int64(meta.GenUTime)
@@ -1160,7 +1148,7 @@ func (s *Service) validateVerifiedMasterchainBlock(ctx context.Context, block Ve
 }
 
 func (s *Service) validateMasterchainBlockConsensus(ctx context.Context, block VerifiedBlock, validationLabel string) (ton.BlockIDExt, *checkedMasterchainConsensus, error) {
-	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
+	if len(block.Meta.PrevRefs) != 1 {
 		return ton.BlockIDExt{}, nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
 	}
 

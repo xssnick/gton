@@ -62,12 +62,7 @@ func ShardBlocksFromMasterState(state *storage.BlockState) ([]ton.BlockIDExt, er
 	if err != nil {
 		return nil, fmt.Errorf("load shard hashes for %s: %w", storage.FormatBlockRef(state.Block), err)
 	}
-
-	res := make([]ton.BlockIDExt, 0, len(shards))
-	for _, shard := range shards {
-		res = append(res, *shard)
-	}
-	return res, nil
+	return shards, nil
 }
 
 func ShardBlocksFromMasterBlock(block ton.BlockIDExt, parsed *tlb.Block) ([]ton.BlockIDExt, error) {
@@ -81,17 +76,12 @@ func ShardBlocksFromMasterBlock(block ton.BlockIDExt, parsed *tlb.Block) ([]ton.
 	if err != nil {
 		return nil, fmt.Errorf("load shard hashes for %s: %w", storage.FormatBlockRef(block), err)
 	}
-
-	res := make([]ton.BlockIDExt, 0, len(shards))
-	for _, shard := range shards {
-		res = append(res, *shard)
-	}
-	return res, nil
+	return shards, nil
 }
 
-func loadShardsFromHashes(shardHashes *cell.Dictionary) ([]*ton.BlockIDExt, error) {
+func loadShardsFromHashes(shardHashes *cell.Dictionary) ([]ton.BlockIDExt, error) {
 	if shardHashes == nil {
-		return []*ton.BlockIDExt{}, nil
+		return []ton.BlockIDExt{}, nil
 	}
 
 	kvs, err := shardHashes.LoadAll()
@@ -99,7 +89,7 @@ func loadShardsFromHashes(shardHashes *cell.Dictionary) ([]*ton.BlockIDExt, erro
 		return nil, fmt.Errorf("failed to load shard hashes dict: %w", err)
 	}
 
-	var shards []*ton.BlockIDExt
+	var shards []ton.BlockIDExt
 	for _, kv := range kvs {
 		workchain, err := kv.Key.LoadInt(32)
 		if err != nil {
@@ -175,19 +165,19 @@ func walkShardBinTree(node *cell.Slice, key *cell.Builder, fn func(key *cell.Cel
 	return walkShardBinTree(right, rightKey, fn)
 }
 
-func loadShardDesc(workchain int32, shardID int64, loader *cell.Slice) (*ton.BlockIDExt, error) {
+func loadShardDesc(workchain int32, shardID int64, loader *cell.Slice) (ton.BlockIDExt, error) {
 	tag, err := loader.LoadUInt(4)
 	if err != nil {
-		return nil, fmt.Errorf("load ShardDesc magic err: %w", err)
+		return ton.BlockIDExt{}, fmt.Errorf("load ShardDesc magic err: %w", err)
 	}
 
 	switch tag {
 	case 0xa:
 		var shardDesc tlb.ShardDesc
 		if err = tlb.LoadFromCell(&shardDesc, loader, true); err != nil {
-			return nil, fmt.Errorf("load ShardDesc err: %w", err)
+			return ton.BlockIDExt{}, fmt.Errorf("load ShardDesc err: %w", err)
 		}
-		return &ton.BlockIDExt{
+		return ton.BlockIDExt{
 			Workchain: workchain,
 			Shard:     shardID,
 			SeqNo:     shardDesc.SeqNo,
@@ -197,9 +187,9 @@ func loadShardDesc(workchain int32, shardID int64, loader *cell.Slice) (*ton.Blo
 	case 0xb:
 		var shardDesc tlb.ShardDescB
 		if err = tlb.LoadFromCell(&shardDesc, loader, true); err != nil {
-			return nil, fmt.Errorf("load ShardDescB err: %w", err)
+			return ton.BlockIDExt{}, fmt.Errorf("load ShardDescB err: %w", err)
 		}
-		return &ton.BlockIDExt{
+		return ton.BlockIDExt{
 			Workchain: workchain,
 			Shard:     shardID,
 			SeqNo:     shardDesc.SeqNo,
@@ -207,7 +197,7 @@ func loadShardDesc(workchain int32, shardID int64, loader *cell.Slice) (*ton.Blo
 			FileHash:  shardDesc.FileHash,
 		}, nil
 	default:
-		return nil, fmt.Errorf("wrong ShardDesc magic: %x", tag)
+		return ton.BlockIDExt{}, fmt.Errorf("wrong ShardDesc magic: %x", tag)
 	}
 }
 

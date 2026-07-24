@@ -82,13 +82,15 @@ func (n *Node) handleInboundPeer(peer adnl.Peer) error {
 	}
 
 	for _, sub := range n.subscriptionsSnapshot() {
-		sub.attachPooledPeer(pooled, nil)
+		if sub.adoptsInboundPeer(pooled.id) {
+			sub.attachPooledPeer(pooled, nil)
+		}
 	}
 	return nil
 }
 
 func (n *Node) attachSubscriptionPeers(sub *overlaySubscription) {
-	for _, peer := range n.pool.snapshot() {
+	for _, peer := range n.pool.overlaySnapshot() {
 		sub.attachPooledPeer(peer, nil)
 	}
 }
@@ -163,7 +165,7 @@ func (n *Node) announceSelf(ctx context.Context) error {
 			continue
 		}
 
-		self, err := n.selfOverlayNode(sub.spec)
+		self, err := overlay.NewNode(sub.spec.FullID, n.privKey)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("build overlay node for %s: %w", sub.spec.Name, err))
 			continue
@@ -178,10 +180,6 @@ func (n *Node) announceSelf(ctx context.Context) error {
 	}
 
 	return errors.Join(errs...)
-}
-
-func (n *Node) selfOverlayNode(spec overlaySpec) (*overlay.Node, error) {
-	return overlay.NewNode(spec.FullID, n.privKey)
 }
 
 func (n *Node) storeAddressWithRetry(ctx context.Context, addrList address.List) error {

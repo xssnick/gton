@@ -53,11 +53,6 @@ func newArchiveImportCache() *archiveImportCache {
 }
 
 func (c *archiveImportCache) load(ctx context.Context, key archiveImportCacheKey, load func(context.Context) (*archiveImportResult, error)) (archiveImportDownload, error) {
-	if c == nil {
-		imported, err := load(ctx)
-		return archiveImportDownload{imported: imported}, err
-	}
-
 	for {
 		loaded, err := c.loadOnce(ctx, key, load)
 		if !loaded.retry {
@@ -106,7 +101,7 @@ func (c *archiveImportCache) loadOnce(ctx context.Context, key archiveImportCach
 	result, err := load(ctx)
 
 	c.mu.Lock()
-	if err == nil && result != nil {
+	if err == nil {
 		c.entries[key] = cloneArchiveImportResult(result)
 	}
 	waiter.result = cloneArchiveImportResult(result)
@@ -119,20 +114,12 @@ func (c *archiveImportCache) loadOnce(ctx context.Context, key archiveImportCach
 }
 
 func (c *archiveImportCache) drop(key archiveImportCacheKey) {
-	if c == nil {
-		return
-	}
-
 	c.mu.Lock()
 	delete(c.entries, key)
 	c.mu.Unlock()
 }
 
 func (c *archiveImportCache) dropBefore(masterchainSeqno uint32) {
-	if c == nil {
-		return
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -144,19 +131,12 @@ func (c *archiveImportCache) dropBefore(masterchainSeqno uint32) {
 }
 
 func (c *archiveImportCache) stats() (int, uint64) {
-	if c == nil {
-		return 0, 0
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.entries), c.hitCount
 }
 
 func cloneImportStats(stats *archive.ImportStats) *archive.ImportStats {
-	if stats == nil {
-		return &archive.ImportStats{}
-	}
 	cloned := *stats
 	return &cloned
 }
@@ -173,9 +153,7 @@ func cloneArchiveImportResult(result *archiveImportResult) *archiveImportResult 
 		cacheKey:   result.cacheKey,
 	}
 	for key, block := range result.blocks {
-		if block.Meta != nil {
-			block.Meta = block.Meta.Clone()
-		}
+		block.Meta = block.Meta.Clone()
 		cloned.blocks[key] = block
 	}
 	return cloned

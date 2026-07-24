@@ -64,7 +64,7 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 		}
 
 		a.node.log.Info().
-			Str("block", formatBlockRef(block)).
+			Str("block", storage.FormatBlockRef(block)).
 			Int("peers", len(peers)).
 			Int("round", round+1).
 			Msg("requesting zero state from archive peers")
@@ -73,7 +73,7 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 		for _, peer := range peers {
 			a.node.log.Info().
 				Str("peer", peer.addr).
-				Str("block", formatBlockRef(block)).
+				Str("block", storage.FormatBlockRef(block)).
 				Msg("requesting zero state from archive peer")
 
 			artifact, err := a.downloadZeroStateFromPeer(ctx, sub, pool, shard, peer, block)
@@ -86,14 +86,13 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 			if errors.Is(err, context.Canceled) {
 				return nil, err
 			}
-			retryable := false
 			if errors.Is(err, ErrStateNotAvailable) {
 				notAvailable++
 				a.clearSelectedArchivePeerID(shard, downloadPeerID(peer))
 			} else {
-				retryable = a.noteZeroStatePeerError(ctx, pool, shard, peer, err)
+				a.noteZeroStatePeerError(ctx, pool, shard, peer, err)
 			}
-			if !retryable && !peer.id.IsZero() {
+			if !peer.id.IsZero() {
 				tried[peer.id] = struct{}{}
 			}
 			errs = append(errs, archiveDownloadError(peer, err))
@@ -179,7 +178,7 @@ func zeroStateArchiveCandidates(pool *archivePeerPool, session *ArchiveSession, 
 }
 
 func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *overlaySubscription, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, block ton.BlockIDExt) (storage.DownloadedState, error) {
-	archiveRelease, ok := pool.acquireDownload(peer)
+	archiveRelease, ok := pool.acquire(peer)
 	if !ok {
 		return nil, fmt.Errorf("archive peer left the pool: %w", ErrStateNotAvailable)
 	}
@@ -221,13 +220,12 @@ func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *ove
 	}, nil
 }
 
-func (a *ArchiveSession) noteZeroStatePeerError(ctx context.Context, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) bool {
+func (a *ArchiveSession) noteZeroStatePeerError(ctx context.Context, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, err error) {
 	if errors.Is(err, context.Canceled) {
-		return false
+		return
 	}
-	pool.rememberTransportBlocked(downloadPeerID(peer), archivePeerUnreachableTTL)
+	pool.rememberTransportBlocked(downloadPeerID(peer))
 	a.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectStateDownloadFailed)
-	return false
 }
 
 func archiveShardFromBlock(block ton.BlockIDExt) archive.ShardID {

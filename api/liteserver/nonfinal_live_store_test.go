@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -49,10 +51,10 @@ func TestLiveStoreNonfinalPublishesGaplessCellCache(t *testing.T) {
 		t.Fatalf("publish parent: %v", err)
 	}
 	signed, candidates = live.NonfinalPendingShardBlocks(nil)
-	if len(signed) != 2 || !blockIDEqual(signed[0], parent.Block) || !blockIDEqual(signed[1], child.Block) {
+	if len(signed) != 2 || !blockproof.BlockIDEqual(signed[0], parent.Block) || !blockproof.BlockIDEqual(signed[1], child.Block) {
 		t.Fatalf("signed pending = %+v, want parent and child", signed)
 	}
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], child.Block) {
 		t.Fatalf("candidate pending = %+v, want child", candidates)
 	}
 
@@ -95,10 +97,10 @@ func TestLiveStoreNonfinalPublishesGaplessCellCache(t *testing.T) {
 	store.cells[sharedBranch.HashKey()] = sharedBranch
 
 	signed, candidates = live.NonfinalPendingShardBlocks(nil)
-	if len(signed) != 1 || !blockIDEqual(signed[0], child.Block) {
+	if len(signed) != 1 || !blockproof.BlockIDEqual(signed[0], child.Block) {
 		t.Fatalf("signed pending after parent cleanup = %+v, want child", signed)
 	}
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], child.Block) {
 		t.Fatalf("candidate pending after parent cleanup = %+v, want child", candidates)
 	}
 	state, err = live.BlockState(context.Background(), child.Block)
@@ -145,7 +147,7 @@ func TestLiveStoreNonfinalPrunedDependencyUsesExactCellKey(t *testing.T) {
 	}
 
 	_, candidates := live.NonfinalPendingShardBlocks(nil)
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], pending.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], pending.Block) {
 		t.Fatalf("candidate pending = %+v, want pending", candidates)
 	}
 
@@ -226,7 +228,7 @@ func TestLiveStoreNonfinalUsesConfiguredCellLoaderBeforeStore(t *testing.T) {
 
 func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 	store := &fakeLazyCellStore{cells: map[cell.Hash]*cell.Cell{}}
-	live := NewLiveStore(store, LiveStoreOptions{
+	live := NewLiveStore(store, liveview.Options{
 		MasterBlockCache: 8,
 		ShardBlockCache:  8,
 		NonFinalEnabled:  true,
@@ -284,7 +286,7 @@ func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 
 func TestLiveStoreNonfinalUsesStateUpdateLazyOverlay(t *testing.T) {
 	store := &fakeLazyCellStore{cells: map[cell.Hash]*cell.Cell{}}
-	live := NewLiveStore(store, LiveStoreOptions{
+	live := NewLiveStore(store, liveview.Options{
 		MasterBlockCache: 8,
 		ShardBlockCache:  8,
 		NonFinalEnabled:  true,
@@ -578,7 +580,7 @@ func TestLiveStoreNonfinalValidatesWaitingCandidateOnce(t *testing.T) {
 		t.Fatalf("load promoted child state: %v", err)
 	}
 	_, candidates := live.NonfinalPendingShardBlocks(nil)
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], child.Block) {
 		t.Fatalf("candidates = %+v, want child", candidates)
 	}
 }
@@ -644,7 +646,7 @@ func TestShardStateMasterRefReadsInlineStatsMasterRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load shard state master ref: %v", err)
 	}
-	if !blockIDEqual(got, master) {
+	if !blockproof.BlockIDEqual(got, master) {
 		t.Fatalf("master ref = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(master))
 	}
 }
@@ -703,7 +705,7 @@ func TestLiveStoreNonfinalDropsBlocksTooFarAheadOfCurrentMaster(t *testing.T) {
 	}
 
 	signed, candidates := live.NonfinalPendingShardBlocks(nil)
-	if len(signed) != 1 || !blockIDEqual(signed[0], within.Block) {
+	if len(signed) != 1 || !blockproof.BlockIDEqual(signed[0], within.Block) {
 		t.Fatalf("signed pending = %+v, want only within-lead block", signed)
 	}
 	if len(candidates) != 0 {
@@ -756,7 +758,7 @@ func TestHandleNonfinalPendingShardBlocksEnabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("response type = %T, want ton.NonfinalPendingShardBlocks", resp)
 	}
-	if len(blocks.SignedBlocks) != 1 || !blockIDEqual(*blocks.SignedBlocks[0], pending.Block) {
+	if len(blocks.SignedBlocks) != 1 || !blockproof.BlockIDEqual(*blocks.SignedBlocks[0], pending.Block) {
 		t.Fatalf("signed blocks = %+v, want pending", blocks.SignedBlocks)
 	}
 	if len(blocks.Candidates) != 0 {
@@ -787,7 +789,7 @@ func testNonfinalLiveStoreWithCurrent(t *testing.T) (*LiveStore, storage.LiveBlo
 func testNonfinalLiveStoreWithCurrentStore(t *testing.T, store Store) (*LiveStore, storage.LiveBlockArtifacts) {
 	t.Helper()
 
-	live := NewLiveStore(store, LiveStoreOptions{
+	live := NewLiveStore(store, liveview.Options{
 		MasterBlockCache: 8,
 		ShardBlockCache:  8,
 		NonFinalEnabled:  true,

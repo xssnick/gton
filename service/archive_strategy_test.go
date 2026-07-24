@@ -7,12 +7,19 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func TestArchiveCatchUpRetriesWhenPeerPoolIsEmpty(t *testing.T) {
+	if !isArchiveCatchUpRetryError(p2p.ErrNoArchivePeers) {
+		t.Fatal("empty archive peer pool must restart the pipeline without closing the archive session")
+	}
+}
 
 func TestShouldSwitchNextToArchiveByLagUsesSwitchThreshold(t *testing.T) {
 	if shouldSwitchNextToArchiveByLag(nextToArchiveLagSeconds) {
@@ -30,45 +37,6 @@ func TestShouldSwitchArchiveToNextUsesLiveTailLag(t *testing.T) {
 	}
 	if shouldSwitchArchiveToNextByLag(archiveToNextLagSeconds) {
 		t.Fatal("archive catch-up should continue at the live tail boundary")
-	}
-}
-
-func TestArchiveCatchUpTargetByLagStartsAboveNextToArchiveThreshold(t *testing.T) {
-	current := &storage.CurrentState{
-		ShardClientSeqno: 1000,
-		Masterchain: storage.BlockState{
-			Block: ton.BlockIDExt{SeqNo: 1000},
-		},
-	}
-
-	archiveTarget, ok := archiveCatchUpTargetByLag(current, nextToArchiveLagSeconds+1)
-	if !ok {
-		t.Fatal("archive catch-up should start above the next-to-archive threshold")
-	}
-
-	want := ^uint32(0)
-	if archiveTarget.SeqNo != want {
-		t.Fatalf("archive target seqno mismatch: got %d want %d", archiveTarget.SeqNo, want)
-	}
-}
-
-func TestArchiveCatchUpTargetByLagDoesNotGuessTargetFromRemainingLag(t *testing.T) {
-	current := &storage.CurrentState{
-		ShardClientSeqno: 1000,
-		Masterchain: storage.BlockState{
-			Block: ton.BlockIDExt{SeqNo: 1000},
-		},
-	}
-
-	remaining := int64(12_345)
-	archiveTarget, ok := archiveCatchUpTargetByLag(current, archiveToNextLagSeconds+remaining)
-	if !ok {
-		t.Fatal("archive catch-up should start for large masterchain lag")
-	}
-
-	want := ^uint32(0)
-	if archiveTarget.SeqNo != want {
-		t.Fatalf("archive target seqno mismatch: got %d want %d", archiveTarget.SeqNo, want)
 	}
 }
 
@@ -141,20 +109,6 @@ func TestArchivePipelineSchedulingStopsNearLiveTail(t *testing.T) {
 	}
 }
 
-func TestArchivePipelinePendingWindowLimitUsesConfiguredPrefetch(t *testing.T) {
-	runner := &archiveCatchUpRunner{service: &Service{archiveCatchUpPrefetchWindows: 2}}
-	if got := runner.archivePendingWindowLimit(); got != 2 {
-		t.Fatalf("pending window limit = %d, want 2", got)
-	}
-}
-
-func TestArchivePipelinePendingWindowLimitUsesDefaultPrefetch(t *testing.T) {
-	runner := &archiveCatchUpRunner{service: &Service{}}
-	if got := runner.archivePendingWindowLimit(); got != DefaultArchiveCatchUpPrefetchWindows {
-		t.Fatalf("pending window limit = %d, want %d", got, DefaultArchiveCatchUpPrefetchWindows)
-	}
-}
-
 func TestMonitorMinSplitDepthAllowsMissingWorkchainConfig(t *testing.T) {
 	state := testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(10), testMasterBlockID(1), true)
 
@@ -192,7 +146,9 @@ func TestMonitorMinSplitDepthReadsWorkchainDescriptor(t *testing.T) {
 }
 
 func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
-	runner := &archiveCatchUpRunner{service: &Service{}}
+	runner := &archiveCatchUpRunner{
+		service: &Service{archiveCatchUpPrefetchWindows: DefaultArchiveCatchUpPrefetchWindows},
+	}
 
 	if runner.archiveReadyWindowBacklog() != archiveReadyWindowBacklog {
 		t.Fatalf("ready window backlog = %d, want %d", runner.archiveReadyWindowBacklog(), archiveReadyWindowBacklog)
@@ -212,7 +168,9 @@ func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
 }
 
 func TestArchivePipelineReadyWindowErrorEmitsImmediately(t *testing.T) {
-	runner := &archiveCatchUpRunner{service: &Service{}}
+	runner := &archiveCatchUpRunner{
+		service: &Service{archiveCatchUpPrefetchWindows: DefaultArchiveCatchUpPrefetchWindows},
+	}
 	if !runner.shouldEmitReadyArchiveWindow([]archivePendingWindow{testReadyArchiveWindow(errors.New("boom"))}) {
 		t.Fatal("pipeline should emit ready window errors immediately")
 	}
@@ -220,11 +178,12 @@ func TestArchivePipelineReadyWindowErrorEmitsImmediately(t *testing.T) {
 
 func TestArchiveCheckpointBackpressureWaitsAtConfiguredWindowTarget(t *testing.T) {
 	runner := &archiveCatchUpRunner{
-		service:                &Service{archiveCatchUpCheckpointBlocks: 2000},
+		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: DefaultCheckpointBytes, syncBackpressureWindows: DefaultSyncBackpressureWindows},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
 		current:                &storage.CurrentState{ShardClientSeqno: 8999},
+		stateCells:             newTestStateCellWindowCache(nil),
 	}
 	if runner.archiveCheckpointBackpressureBlocks() != 8000 {
 		t.Fatalf("checkpoint backpressure blocks = %d, want 8000", runner.archiveCheckpointBackpressureBlocks())
@@ -342,12 +301,12 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 	second[0] = 2
 
 	runner := &archiveCatchUpRunner{
-		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024},
+		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024, syncBackpressureWindows: DefaultSyncBackpressureWindows},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
 		current:                &storage.CurrentState{ShardClientSeqno: 1001},
-		stateCells:             newStateCellWindowCache(nil),
+		stateCells:             newTestStateCellWindowCache(nil),
 	}
 	runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 4095),
@@ -369,11 +328,12 @@ func TestArchiveCheckpointBackpressureCountsArtifactBytes(t *testing.T) {
 	second := &storage.BlockState{Block: testBlockID(0, topShard, 101)}
 
 	runner := &archiveCatchUpRunner{
-		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024},
+		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024, syncBackpressureWindows: DefaultSyncBackpressureWindows},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
 		current:                &storage.CurrentState{ShardClientSeqno: 1001},
+		stateCells:             newTestStateCellWindowCache(nil),
 	}
 	runner.checkpointStates.rememberWithArtifacts(first, &storage.ServedBlockFull{
 		ID:    first.Block,
@@ -422,9 +382,9 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 	second[0] = 2
 
 	runner := &nextSyncRunner{
-		service:      &Service{nextBlockCheckpointBlocks: 10, checkpointBytes: 1024},
+		service:      &Service{nextBlockCheckpointBlocks: 10, checkpointBytes: 1024, syncBackpressureWindows: DefaultSyncBackpressureWindows},
 		stagedBlocks: 9,
-		stateCells:   newStateCellWindowCache(nil),
+		stateCells:   newTestStateCellWindowCache(nil),
 	}
 	if err := runner.stateCells.addPreparedRecords(testStateCellRecords(map[cell.Hash][]byte{
 		first: make([]byte, 1023),
@@ -454,7 +414,7 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 }
 
 func TestArchiveCheckpointAdaptiveTargetUsesConfiguredBackpressureWindows(t *testing.T) {
-	service := &Service{archiveCatchUpCheckpointBlocks: 2000}
+	service := &Service{archiveCatchUpCheckpointBlocks: 2000, syncBackpressureWindows: DefaultSyncBackpressureWindows}
 	target := service.adaptArchiveCheckpointBlocks(4000, 2*time.Second)
 	if target != 4000 {
 		t.Fatalf("adaptive checkpoint target = %d, want 4000", target)
@@ -481,16 +441,13 @@ func TestArchiveAppliedStateUsesCheckpointArtifactPath(t *testing.T) {
 	setShardBlockMasterchainRef(meta, master)
 
 	window := &shardClientArchiveWindow{}
-	err := window.rememberAppliedArchiveState(state, PreparedBlock{
+	window.rememberAppliedArchiveState(state, PreparedBlock{
 		ID:       block,
 		BlockBOC: []byte{1, 2, 3},
 		ProofBOC: []byte{4, 5, 6},
 		Meta:     meta,
 		IsLink:   true,
 	}, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	checkpoint := window.appliedStates.checkpoint()
 	if len(checkpoint.entries) != 1 {

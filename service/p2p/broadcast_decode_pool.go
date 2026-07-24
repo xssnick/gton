@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/storage"
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/ton"
@@ -54,7 +55,7 @@ func broadcastDecodeWorkerCount() int {
 // The pool is tied to the node's single run: once the run context ends the
 // workers exit and later enqueues are refused.
 func (n *Node) enqueueBroadcastDecode(req offloadedBroadcastDecode) bool {
-	if n.runtimeContext().Err() != nil {
+	if n.runCtx.Err() != nil {
 		return false
 	}
 	n.decodeWorkersOnce.Do(func() {
@@ -79,7 +80,7 @@ func (n *Node) enqueueBroadcastDecode(req offloadedBroadcastDecode) bool {
 }
 
 func (n *Node) runBroadcastDecodeWorker() {
-	ctx := n.runtimeContext()
+	ctx := n.runCtx
 	for {
 		// masterchain decodes gate the live head; drain their lane before
 		// picking up shard or candidate payloads
@@ -107,7 +108,7 @@ func (n *Node) runBroadcastDecodeWorker() {
 // masterchain lane so a burst of multi-MB shard decodes occupying the shared
 // workers cannot delay the next masterchain head.
 func (n *Node) runMasterchainBroadcastDecodeWorker() {
-	ctx := n.runtimeContext()
+	ctx := n.runCtx
 	for {
 		select {
 		case <-ctx.Done():
@@ -128,8 +129,8 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 		return
 	}
 
-	downloaded, sigSet, cached := n.cachedDecodedBroadcast(req.kind, req.block)
-	if cached {
+	downloaded, sigSet, cacheErr := n.decodedBroadcasts.get(req.kind, req.block)
+	if cacheErr == nil {
 		n.noteBroadcast("decode_reused", req.overlay, req.kind)
 		if req.preSigSet != nil {
 			sigSet = req.preSigSet
@@ -150,11 +151,7 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 			n.handleOffloadedBroadcastDecodeError(req, err)
 			return
 		}
-		n.rememberDecodedBroadcast(req.kind, req.block, downloaded, sigSet)
-	}
-	if downloaded == nil {
-		n.noteBroadcastDrop(req.overlay, req.kind, "decode_failed")
-		return
+		n.decodedBroadcasts.put(req.kind, req.block, downloaded, sigSet)
 	}
 
 	downloaded.SourcePeerID = req.sourcePeerID
@@ -208,14 +205,14 @@ func (n *Node) handleOffloadedBroadcastDecodeError(req offloadedBroadcastDecode,
 			})
 			n.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(req.block)).
+				Str("block", storage.FormatBlockRef(req.block)).
 				Str("kind", req.kind).
 				Msg("queued offloaded block broadcast until previous state is available")
 			return
 		}
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(req.block)).
+			Str("block", storage.FormatBlockRef(req.block)).
 			Str("kind", req.kind).
 			Msg("dropping offloaded block broadcast because state-ready artifact is missing")
 		n.noteBroadcastDrop(req.overlay, req.kind, "state_artifact_missing")
@@ -224,7 +221,7 @@ func (n *Node) handleOffloadedBroadcastDecodeError(req offloadedBroadcastDecode,
 
 	n.log.Debug().
 		Err(err).
-		Str("block", formatBlockRef(req.block)).
+		Str("block", storage.FormatBlockRef(req.block)).
 		Str("kind", req.kind).
 		Msg("dropping offloaded block broadcast because payload decode failed")
 	n.noteBroadcastDrop(req.overlay, req.kind, "decode_failed")

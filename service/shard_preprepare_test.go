@@ -36,14 +36,14 @@ func TestPreparedShardBlockCacheTakeAndDedup(t *testing.T) {
 		t.Fatal("beginPrepare accepted while cached")
 	}
 
-	got, ok := cache.take(block)
-	if !ok {
+	got, err := cache.take(block)
+	if err != nil {
 		t.Fatal("prepared block not taken")
 	}
 	if !got.ID.Equals(&block) {
 		t.Fatalf("taken block %s, want seqno %d", got.BlockRef(), block.SeqNo)
 	}
-	if _, ok = cache.take(block); ok {
+	if _, err = cache.take(block); err == nil {
 		t.Fatal("prepared block taken twice")
 	}
 
@@ -63,10 +63,10 @@ func TestPreparedShardBlockCacheEvictsOldest(t *testing.T) {
 		cache.storePrepared(PreparedBlock{ID: testPreparedShardBlockID(i), BlockBOC: []byte{byte(i)}})
 	}
 
-	if _, ok := cache.take(testPreparedShardBlockID(0)); ok {
+	if _, err := cache.take(testPreparedShardBlockID(0)); err == nil {
 		t.Fatal("oldest entry survived eviction")
 	}
-	if _, ok := cache.take(testPreparedShardBlockID(preparedShardBlockMaxItems)); !ok {
+	if _, err := cache.take(testPreparedShardBlockID(preparedShardBlockMaxItems)); err != nil {
 		t.Fatal("newest entry evicted")
 	}
 }

@@ -3,7 +3,7 @@ package p2p
 import "context"
 
 func (n *Node) observeBlockReceived(ctx context.Context, downloaded *DownloadedBlock, isSigned bool) {
-	if !n.blockReceivedHooks || n.blockReceivedObserver == nil || downloaded == nil {
+	if !n.blockReceivedHooks || n.blockReceivedObserver == nil {
 		return
 	}
 

@@ -143,7 +143,7 @@ func TestCellGenerationCandidateResolverTreatsBlockOnlyStateAsMiss(t *testing.T)
 		current: &storage.CurrentState{
 			Shards: map[storage.ShardKey]storage.BlockState{},
 		},
-		cells: newStateCellWindowCache(nil),
+		cells: newTestStateCellWindowCache(nil),
 	}
 
 	resolver := svc.newCellGenerationShardResolver(context.Background(), store, candidate, nil)
@@ -360,7 +360,7 @@ func TestLogCellGenerationCandidateCatchUpProgress(t *testing.T) {
 			Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 125)},
 			Shards:      map[storage.ShardKey]storage.BlockState{},
 		},
-		cells: newStateCellWindowCache(nil),
+		cells: newTestStateCellWindowCache(nil),
 	}
 	target := &storage.CurrentState{
 		Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 200)},
@@ -396,7 +396,7 @@ func TestLogCellGenerationCandidateCatchUpProgress(t *testing.T) {
 func TestCellGenerationCandidateCheckpointKeepsApplyingIntoNextWindow(t *testing.T) {
 	firstHash := cell.Hash{1}
 	secondHash := cell.Hash{2}
-	cells := newStateCellWindowCache(nil)
+	cells := newTestStateCellWindowCache(nil)
 	if err := cells.addPreparedRecords(storage.NewStateCellRecords([]storage.EncodedCellRecord{{
 		Hash: firstHash,
 		Data: []byte{1, 2, 3},
@@ -631,7 +631,7 @@ func TestCellGenerationMigrationThrottlesActiveCompactionsDuringCandidateCatchUp
 			Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 100)},
 			Shards:      map[storage.ShardKey]storage.BlockState{},
 		},
-		cells: newStateCellWindowCache(nil),
+		cells: newTestStateCellWindowCache(nil),
 	}
 	target := &storage.CurrentState{
 		Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 101)},
@@ -667,7 +667,7 @@ func TestCellGenerationMigrationDoesNotThrottleActiveCompactionsWithoutCatchUp(t
 			Masterchain: storage.BlockState{Block: block},
 			Shards:      map[storage.ShardKey]storage.BlockState{},
 		},
-		cells: newStateCellWindowCache(nil),
+		cells: newTestStateCellWindowCache(nil),
 	}
 	target := &storage.CurrentState{
 		Masterchain: storage.BlockState{Block: block},
@@ -792,6 +792,7 @@ func TestPersistentImportStateMetadataUsesBlockMeta(t *testing.T) {
 func TestNextBlockCatchUpYieldsForCellGenerationSwitchRequest(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
+		storage:          openTestPebbleStorage(t),
 		currentStateWake: make(chan struct{}, 1),
 	}
 	current := &storage.CurrentState{
@@ -805,7 +806,7 @@ func TestNextBlockCatchUpYieldsForCellGenerationSwitchRequest(t *testing.T) {
 		mode:       nextSyncBootstrap,
 		method:     "next_block_bootstrap",
 		current:    current,
-		stateCells: newStateCellWindowCache(nil),
+		stateCells: newTestStateCellWindowCache(nil),
 	}
 
 	if !runner.shouldReturnAfterCommit() {

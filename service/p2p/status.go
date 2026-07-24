@@ -25,11 +25,7 @@ func (s *overlaySubscription) statusPeersLocked() []*overlayPeer {
 
 	peers := make([]*overlayPeer, 0, len(s.neighbours))
 	for _, id := range s.neighbours {
-		peer := s.peers[id]
-		if peer == nil {
-			continue
-		}
-		peers = append(peers, peer)
+		peers = append(peers, s.peers[id])
 	}
 	return peers
 }
@@ -140,12 +136,6 @@ type broadcastStatKey struct {
 	reason    string
 }
 
-type fecReceiverPeerKey struct {
-	overlay string
-	peer    PeerID
-	shared  bool
-}
-
 type fecReceiverCounterSnapshot struct {
 	dropped            uint64
 	evicted            uint64
@@ -234,9 +224,6 @@ func (n *Node) noteBroadcastWithReason(direction, overlay, kind, reason string) 
 	}
 
 	n.broadcastStatsMx.Lock()
-	if n.broadcastStats == nil {
-		n.broadcastStats = map[broadcastStatKey]uint64{}
-	}
 	n.broadcastStats[key]++
 	n.broadcastStatsMx.Unlock()
 }
@@ -301,9 +288,7 @@ func (n *Node) broadcastDropStatusSnapshot() []BroadcastDropStatusSnapshot {
 
 func (n *Node) queueStatusSnapshot() []QueueStatusSnapshot {
 	queues := make([]QueueStatusSnapshot, 0, 4)
-	if n.eventQueue != nil {
-		queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
-	}
+	queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
 	local, regular := n.peerRebroadcastQueueStatusSnapshot()
 	queues = append(queues, regular, local)
 	if customTwoStep, ok := n.customTwoStepQueueStatusSnapshot(); ok {
@@ -369,19 +354,10 @@ func (n *Node) rebroadcastStatusSnapshot() []RebroadcastStatusSnapshot {
 
 func (n *Node) fecReceiverStatusSnapshot(subscriptions []*overlaySubscription) []FECReceiverStatusSnapshot {
 	byOverlay := map[string]*FECReceiverStatusSnapshot{}
-	seen := map[fecReceiverPeerKey]struct{}{}
+	seen := map[string]struct{}{}
 
 	for _, sub := range subscriptions {
-		relayEnabled := sub.broadcastFECRelayEnabled()
-
-		sub.mx.Lock()
 		overlayName := sub.spec.Name
-		relayState := sub.fecRelayState
-		peers := make([]*overlayPeer, 0, len(sub.peers))
-		for _, peer := range sub.peers {
-			peers = append(peers, peer)
-		}
-		sub.mx.Unlock()
 
 		snapshot := byOverlay[overlayName]
 		if snapshot == nil {
@@ -389,32 +365,11 @@ func (n *Node) fecReceiverStatusSnapshot(subscriptions []*overlaySubscription) [
 			byOverlay[overlayName] = snapshot
 		}
 
-		if relayEnabled {
-			if relayState == nil {
-				continue
-			}
+		stats := sub.broadcastReceiver.FECBroadcastStats()
+		addFECReceiverSnapshotStats(snapshot, stats)
 
-			stats := relayState.Stats()
-			addFECReceiverSnapshotStats(snapshot, stats)
-
-			key := fecReceiverPeerKey{overlay: overlayName, shared: true}
-			seen[key] = struct{}{}
-			n.addFECReceiverCounterDeltas(key, stats)
-			continue
-		}
-
-		for _, peer := range peers {
-			if peer.overlay == nil {
-				continue
-			}
-
-			stats := peer.overlay.FECBroadcastStats()
-			addFECReceiverSnapshotStats(snapshot, stats)
-
-			key := fecReceiverPeerKey{overlay: overlayName, peer: peer.id}
-			seen[key] = struct{}{}
-			n.addFECReceiverCounterDeltas(key, stats)
-		}
+		seen[overlayName] = struct{}{}
+		n.addFECReceiverCounterDeltas(overlayName, stats)
 	}
 
 	n.fecReceiverStatsMx.Lock()
@@ -456,16 +411,9 @@ func addFECReceiverSnapshotStats(snapshot *FECReceiverStatusSnapshot, stats over
 	snapshot.DeliveredBroadcasts += stats.DeliveredBroadcasts
 }
 
-func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, stats overlay.FECBroadcastStats) {
+func (n *Node) addFECReceiverCounterDeltas(overlayName string, stats overlay.FECBroadcastStats) {
 	n.fecReceiverStatsMx.Lock()
 	defer n.fecReceiverStatsMx.Unlock()
-
-	if n.fecReceiverLast == nil {
-		n.fecReceiverLast = map[fecReceiverPeerKey]fecReceiverCounterSnapshot{}
-	}
-	if n.fecReceiverTotals == nil {
-		n.fecReceiverTotals = map[string]fecReceiverCounterSnapshot{}
-	}
 
 	current := fecReceiverCounterSnapshot{
 		dropped:            stats.DroppedTotal,
@@ -477,8 +425,8 @@ func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, stats overlay
 		fecRelaySent:       stats.FECRelaySentTotal,
 		fecRelayFailed:     stats.FECRelayFailedTotal,
 	}
-	last := n.fecReceiverLast[key]
-	totals := n.fecReceiverTotals[key.overlay]
+	last := n.fecReceiverLast[overlayName]
+	totals := n.fecReceiverTotals[overlayName]
 	totals.dropped += counterDelta(last.dropped, current.dropped)
 	totals.evicted += counterDelta(last.evicted, current.evicted)
 	totals.completed += counterDelta(last.completed, current.completed)
@@ -488,8 +436,8 @@ func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, stats overlay
 	totals.fecRelaySent += counterDelta(last.fecRelaySent, current.fecRelaySent)
 	totals.fecRelayFailed += counterDelta(last.fecRelayFailed, current.fecRelayFailed)
 
-	n.fecReceiverLast[key] = current
-	n.fecReceiverTotals[key.overlay] = totals
+	n.fecReceiverLast[overlayName] = current
+	n.fecReceiverTotals[overlayName] = totals
 }
 
 func counterDelta(previous, current uint64) uint64 {

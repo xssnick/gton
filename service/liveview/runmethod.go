@@ -82,7 +82,7 @@ func liveConfigEpochForRoot(configRoot *cell.Cell) (*liveConfigEpoch, error) {
 }
 
 func buildLiveConfigEpoch(configRoot *cell.Cell) (*liveConfigEpoch, error) {
-	root, err := prewarmCachedCell(configRoot, liveConfigRootPrewarmDepth)
+	root, err := configRoot.PrewarmRecursive(liveConfigRootPrewarmDepth)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +119,7 @@ func (e *liveConfigEpoch) unpackedConfig(now uint32) (any, error) {
 	}
 	unpacked, ok := block.UnpackedConfig()
 	if !ok {
-		return nil, nil
+		return nil, fmt.Errorf("prepared blockchain config has no unpacked config")
 	}
 	return unpacked, nil
 }

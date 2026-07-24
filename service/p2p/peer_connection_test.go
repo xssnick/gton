@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl"
+	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
@@ -28,6 +29,9 @@ type testOverlayADNL struct {
 	sent              []tl.Serializable
 	reinits           atomic.Int64
 	nops              atomic.Int64
+	id                []byte
+	pub               ed25519.PublicKey
+	remoteAddr        string
 }
 
 func newTestOverlayADNL() *testOverlayADNL {
@@ -54,6 +58,10 @@ func (m *testOverlayADNL) GetDisconnectHandler() func(addr string, key ed25519.P
 	return m.disconnectHandler
 }
 
+func (m *testOverlayADNL) GetQueryHandler() func(msg *adnl.MessageQuery) error {
+	return m.queryHandler
+}
+
 func (m *testOverlayADNL) SendCustomMessage(_ context.Context, req tl.Serializable) error {
 	m.sent = append(m.sent, req)
 	return nil
@@ -74,6 +82,10 @@ func (m *testOverlayADNL) SendNop(ctx context.Context) error {
 	return nil
 }
 
+func (m *testOverlayADNL) Ping(context.Context) (time.Duration, error) {
+	return 0, nil
+}
+
 func (m *testOverlayADNL) Reinit() {
 	m.reinits.Add(1)
 }
@@ -90,12 +102,24 @@ func (m *testOverlayADNL) GetCloserCtx() context.Context {
 }
 
 func (m *testOverlayADNL) RemoteAddr() string {
+	if m.remoteAddr != "" {
+		return m.remoteAddr
+	}
 	return "127.0.0.1:17555"
 }
 
 func (m *testOverlayADNL) GetID() []byte {
+	if len(m.id) > 0 {
+		return m.id
+	}
 	return []byte("test-peer")
 }
+
+func (m *testOverlayADNL) GetPubKey() ed25519.PublicKey {
+	return m.pub
+}
+
+func (*testOverlayADNL) SetAddresses(adnladdr.List) {}
 
 func (m *testOverlayADNL) Stats() adnl.PeerStats {
 	if m.statsFn != nil {
@@ -110,7 +134,20 @@ func (m *testOverlayADNL) Close() {
 
 func newTestOverlayWrapper() (*overlay.ADNLOverlayWrapper, *testOverlayADNL) {
 	base := newTestOverlayADNL()
-	wrapper := overlay.CreateExtendedADNL(base).CreateOverlayWithSettings([]byte{1}, 0, true, false)
+	overlayID := testPeerID("test-overlay")
+	receiver, err := overlay.NewBroadcastReceiver(overlayID[:], maxOverlayPayloadSize, true, false)
+	if err != nil {
+		panic(err)
+	}
+	closeBase := base.closeFn
+	base.closeFn = func() {
+		receiver.Close()
+		closeBase()
+	}
+	wrapper, err := overlay.CreateExtendedADNL(base).AttachOverlay(receiver)
+	if err != nil {
+		panic(err)
+	}
 	return wrapper, base
 }
 
@@ -267,6 +304,7 @@ func TestAttachPublicInboundPeerStartsRandomPeerWarmup(t *testing.T) {
 		return nil
 	}
 
+	ensureTestBroadcastReceiver(t, sub)
 	if !sub.attachPooledPeer(pooled, nil) {
 		t.Fatal("public inbound peer was not attached")
 	}
@@ -279,6 +317,33 @@ func TestAttachPublicInboundPeerStartsRandomPeerWarmup(t *testing.T) {
 
 	cancel()
 	node.wg.Wait()
+}
+
+func TestAttachPooledPeerRejectsClosedSubscription(t *testing.T) {
+	pool, pooled, _ := newTestLeasedPooledPeer("closed-subscription")
+	t.Cleanup(pooled.close)
+
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: &Node{
+			log:  discardLogger(),
+			pool: pool,
+		},
+		log: discardLogger(),
+		spec: overlaySpec{
+			Kind:    overlayKindPublicShard,
+			ShortID: testPeerID("closed-subscription-overlay").Bytes(),
+		},
+		peers: map[PeerID]*overlayPeer{},
+	})
+	ensureTestBroadcastReceiver(t, sub)
+	sub.close()
+
+	if sub.attachPooledPeer(pooled, nil) {
+		t.Fatal("closed subscription accepted a peer")
+	}
+	if len(sub.peers) != 0 || pooled.refs != 0 || len(pooled.adnlOverlayRefs) != 0 || len(pooled.rldpOverlayRefs) != 0 {
+		t.Fatal("closed subscription retained the rejected peer")
+	}
 }
 
 func TestAttachCustomFixedPeerWarmsADNLWithNop(t *testing.T) {
@@ -319,6 +384,7 @@ func TestAttachCustomFixedPeerWarmsADNLWithNop(t *testing.T) {
 		peerNotify: make(chan struct{}, 1),
 	})
 
+	ensureTestBroadcastReceiver(t, sub)
 	if !sub.attachPooledPeer(pooled, nil) {
 		t.Fatal("custom fixed peer was not attached")
 	}
@@ -360,7 +426,7 @@ func TestCustomFixedPeerOnlyAnswersOverlayPingInOverlayLayer(t *testing.T) {
 		return nil
 	}
 
-	shortID := []byte{0x43}
+	shortID := testPeerID("custom-query-overlay").Bytes()
 	node := &Node{
 		log:     discardLogger(),
 		privKey: selfKey,
@@ -379,6 +445,7 @@ func TestCustomFixedPeerOnlyAnswersOverlayPingInOverlayLayer(t *testing.T) {
 		peerNotify: make(chan struct{}, 1),
 	})
 
+	ensureTestBroadcastReceiver(t, sub)
 	if !sub.attachPooledPeer(pooled, nil) {
 		t.Fatal("custom fixed peer was not attached")
 	}
@@ -444,6 +511,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 		Version: int32(time.Now().Unix()),
 	}
 
+	ensureTestBroadcastReceiver(t, sub)
 	if !sub.attachPooledPeer(pooled, announced) {
 		t.Fatal("public advertised peer was not attached")
 	}
@@ -462,7 +530,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 	if len(sub.neighbours) != 0 {
 		t.Fatalf("pending public peer entered neighbours: %d", len(sub.neighbours))
 	}
-	if got := len(sub.rebroadcastCandidates()); got != 0 {
+	if got := len(sub.broadcastTargetsSnapshot().peers); got != 0 {
 		t.Fatalf("pending public peer entered rebroadcast candidates: %d", got)
 	}
 	if got := len(sub.overlayNodesSnapshot()); got != 0 {
@@ -483,7 +551,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 	if len(sub.neighbours) != 1 || sub.neighbours[0] != pooled.id {
 		t.Fatalf("promoted public peer neighbours = %#v, want %s", sub.neighbours, pooled.id.String())
 	}
-	if got := len(sub.rebroadcastCandidates()); got != 1 {
+	if got := len(sub.broadcastTargetsSnapshot().peers); got != 1 {
 		t.Fatalf("promoted public peer rebroadcast candidates = %d, want 1", got)
 	}
 	if got := len(sub.overlayNodesSnapshot()); got != 1 {
@@ -571,6 +639,7 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 		return nil
 	}
 
+	ensureTestBroadcastReceiver(t, sub)
 	if !sub.attachPooledPeer(pooled, announced) {
 		t.Fatal("public advertised peer was not attached")
 	}

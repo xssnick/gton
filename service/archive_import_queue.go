@@ -98,10 +98,6 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 }
 
 func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
-	if q == nil {
-		return archiveImportQueueSnapshot{}
-	}
-
 	snapshot := archiveImportQueueSnapshot{
 		activeDownload:         q.activeDownload.Load(),
 		activePrepare:          q.activePrepare.Load(),

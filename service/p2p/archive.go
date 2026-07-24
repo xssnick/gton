@@ -23,9 +23,9 @@ const (
 	archiveSliceParallelism    = 2
 	archiveSliceProbeSize      = 256 << 10
 	archivePackMaxBytes        = int64(2 << 30)
-	archiveInfoTimeout         = 3 * time.Second
-	archiveSliceProbeTimeout   = 5 * time.Second
-	archiveSliceInitialTimeout = 6 * time.Second
+	archiveInfoTimeout         = 6 * time.Second
+	archiveSliceProbeTimeout   = 10 * time.Second
+	archiveSliceInitialTimeout = 12 * time.Second
 	archiveSliceTimeout        = 15 * time.Second
 
 	archiveDiscoveryWait    = 2500 * time.Millisecond
@@ -35,6 +35,8 @@ const (
 	archiveHedgeExtraPeers        = 1
 	archiveDownloadRoundPeerLimit = 8
 )
+
+var ErrNoArchivePeers = errors.New("overlay has no archive peers")
 
 type archiveInfoResult struct {
 	peer      *overlayPeer
@@ -162,7 +164,7 @@ func (s *overlaySubscription) resolveArchive(ctx context.Context, session *Archi
 	// means the pool itself has no candidates.
 	peers := archiveDownloadRoundPeers(pool.downloadCandidatesForArchive(session, shard, masterchainSeqno, pool.candidates(shard)))
 	if len(peers) == 0 {
-		return resolvedArchive{}, errors.New("overlay has no archive peers")
+		return resolvedArchive{}, ErrNoArchivePeers
 	}
 
 	hedge := options.Hedge && len(peers) > 1
@@ -493,7 +495,7 @@ func (s *overlaySubscription) noteArchiveDownloadError(ctx context.Context, sess
 	if errors.Is(err, context.Canceled) {
 		return
 	}
-	pool.rememberTransportBlocked(downloadPeerID(peer), archivePeerUnreachableTTL)
+	pool.rememberTransportBlocked(downloadPeerID(peer))
 	session.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectDownloadFailed)
 }
 
@@ -511,7 +513,7 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, sessi
 	peer := candidate.peer
 	archiveID := candidate.archiveID
 
-	archiveRelease, ok := pool.acquireDownload(peer)
+	archiveRelease, ok := pool.acquire(peer)
 	if !ok {
 		return nil, fmt.Errorf("archive peer left the pool: %w", archive.ErrNotAvailable)
 	}
@@ -766,7 +768,7 @@ func (s *overlaySubscription) queryArchiveSliceWithTimeout(
 }
 
 func (s *overlaySubscription) fetchArchiveCandidate(ctx context.Context, session *ArchiveSession, pool *archivePeerPool, peer *overlayPeer, masterchainSeqno uint32, shard archive.ShardID, selectOnSeed bool) (archiveCandidate, error) {
-	archiveRelease, ok := pool.acquireDownload(peer)
+	archiveRelease, ok := pool.acquire(peer)
 	if !ok {
 		return archiveCandidate{}, fmt.Errorf("archive peer left the pool: %w", archive.ErrNotAvailable)
 	}
@@ -968,7 +970,7 @@ func (s *overlaySubscription) noteArchiveCandidateError(ctx context.Context, ses
 	if errors.Is(err, context.Canceled) {
 		return
 	}
-	pool.rememberTransportBlocked(downloadPeerID(peer), archivePeerUnreachableTTL)
+	pool.rememberTransportBlocked(downloadPeerID(peer))
 	session.rejectArchivePeer(ctx, pool, shard, peer, archivePeerRejectCandidateFailed)
 }
 

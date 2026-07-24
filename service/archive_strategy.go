@@ -12,7 +12,6 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
-	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -22,13 +21,6 @@ const (
 	maxArchiveMonitorSplitDepth = 12
 	archiveImportPeerRetries    = 2
 )
-
-func masterchainBlockLagSeconds(blockUTime int64, nowUnix int64) (int64, bool) {
-	if blockUTime == 0 {
-		return 0, false
-	}
-	return nowUnix - blockUTime, true
-}
 
 func shouldSwitchNextToArchiveByLag(lagSeconds int64) bool {
 	return lagSeconds > nextToArchiveLagSeconds
@@ -44,20 +36,6 @@ func remainingLagSeconds(lagSeconds int64) int64 {
 		return 0
 	}
 	return remaining
-}
-
-func archiveCatchUpTargetByLag(current *storage.CurrentState, lagSeconds int64) (ton.BlockIDExt, bool) {
-	if !shouldSwitchNextToArchiveByLag(lagSeconds) {
-		return ton.BlockIDExt{}, false
-	}
-
-	if current.Masterchain.Block.SeqNo == ^uint32(0) {
-		return ton.BlockIDExt{}, false
-	}
-
-	target := current.Masterchain.Block
-	target.SeqNo = ^uint32(0)
-	return target, true
 }
 
 func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, plans []archiveShardImportPlan, splitDepth uint32, priority archiveImportPriority) ([]*archiveImportResult, error) {
@@ -210,10 +188,6 @@ func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Contex
 }
 
 func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archiveShardImportPlan) error {
-	if imported == nil {
-		return fmt.Errorf("archive shard %s import returned empty result", plan.shard.String())
-	}
-
 	for _, block := range plan.needed {
 		if _, ok := imported.blocks[storage.BlockKey(block)]; !ok {
 			return fmt.Errorf("archive shard %s does not contain planned shard block %s", plan.shard.String(), storage.FormatBlockRef(block))
@@ -223,7 +197,7 @@ func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archive
 }
 
 func (r *archiveCatchUpRunner) rejectArchiveImportPeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
-	if r.archiveSession == nil || peer == "" {
+	if peer == "" {
 		return false
 	}
 

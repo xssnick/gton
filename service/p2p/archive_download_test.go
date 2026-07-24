@@ -77,8 +77,9 @@ func TestArchiveNetworkProbeLimits(t *testing.T) {
 		got  time.Duration
 		want time.Duration
 	}{
-		{name: "probe timeout", got: archiveSliceProbeTimeout, want: 5 * time.Second},
-		{name: "initial full slice timeout", got: archiveSliceInitialTimeout, want: 6 * time.Second},
+		{name: "archive info timeout", got: archiveInfoTimeout, want: 6 * time.Second},
+		{name: "probe timeout", got: archiveSliceProbeTimeout, want: 10 * time.Second},
+		{name: "initial full slice timeout", got: archiveSliceInitialTimeout, want: 12 * time.Second},
 		{name: "slice timeout", got: archiveSliceTimeout, want: 15 * time.Second},
 	}
 
@@ -91,6 +92,26 @@ func TestArchiveNetworkProbeLimits(t *testing.T) {
 	}
 	if archiveSliceProbeSize != 256<<10 {
 		t.Fatalf("probe size = %d, want %d", archiveSliceProbeSize, 256<<10)
+	}
+}
+
+func TestResolveArchiveWithoutCandidatesReturnsNoPeers(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := testOverlaySubscription(&overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+	})
+	pool := testArchivePool(t, sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	_, err := sub.resolveArchive(context.Background(), session, pool, 10, shard, ArchiveDownloadOptions{})
+	if !errors.Is(err, ErrNoArchivePeers) {
+		t.Fatalf("resolve archive error = %v, want no archive peers", err)
+	}
+	if errors.Is(err, archive.ErrNotAvailable) {
+		t.Fatalf("no archive peers error must not be classified as archive not available: %v", err)
 	}
 }
 
@@ -128,7 +149,7 @@ func TestCompletedArchiveDownloadKeepsStickyPeer(t *testing.T) {
 	if downloaded.Bytes != int64(len(seed)) {
 		t.Fatalf("downloaded bytes = %d, want %d", downloaded.Bytes, len(seed))
 	}
-	if _, ok := node.pinnedPeerIDs()[peer.id]; ok {
+	if _, ok := node.protectedPeerIDs()[peer.id]; ok {
 		t.Fatal("completed archive download entered live peer protection")
 	}
 	if selected := session.selectedArchivePeerID(shard); selected != peer.id {
@@ -210,7 +231,7 @@ func TestArchiveInfoWithoutSeedDoesNotProvePeer(t *testing.T) {
 	if query.maxAnswer != archiveSliceProbeSize+4096 {
 		t.Fatalf("archive probe max answer = %d, want %d", query.maxAnswer, archiveSliceProbeSize+4096)
 	}
-	if _, ok := node.pinnedPeerIDs()[peer.id]; ok {
+	if _, ok := node.protectedPeerIDs()[peer.id]; ok {
 		t.Fatal("archive info without bytes should not pin peer")
 	}
 	if got := pool.provenUsableSize(time.Now()); got != 0 {
@@ -255,7 +276,7 @@ func TestArchiveHedgeSeedProbeDoesNotPinLoser(t *testing.T) {
 	if selected := session.selectedArchivePeerID(shard); !selected.IsZero() {
 		t.Fatalf("hedge loser became selected: %s", selected.String())
 	}
-	if _, ok := node.pinnedPeerIDs()[peer.id]; ok {
+	if _, ok := node.protectedPeerIDs()[peer.id]; ok {
 		t.Fatal("hedge loser was pinned by a non-selecting seed probe")
 	}
 	pool.mx.Lock()
@@ -1029,6 +1050,7 @@ func testArchiveDownloadPeerWithRLDP(t *testing.T, label string, archiveID int64
 		rldpOverlay: overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1}),
 		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
 		alive:       true,
+		release:     func() {},
 	}, archiveRLDP
 }
 

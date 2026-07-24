@@ -134,9 +134,8 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 			LocalMasterchainUtime: time.Now().Unix() - 12,
 			LocalStateLoaded:      true,
 			RecentTPS: service.StatusTPSSnapshot{
-				WindowMasters:   1,
-				Transactions:    42,
-				DurationSeconds: 1,
+				DurationSeconds: 10,
+				Transactions:    420,
 				TPS:             42,
 				Complete:        true,
 			},
@@ -202,7 +201,7 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 0`,
 		namespace + `_sync_lag_seconds{chain="masterchain",shard="masterchain"}`,
 		namespace + `_sync_recent_tps 42`,
-		namespace + `_sync_recent_transactions 42`,
+		namespace + `_sync_recent_transactions 420`,
 		namespace + `_sync_recent_tps_complete 1`,
 		namespace + `_service_background_task{task="idle"} 1`,
 		namespace + `_p2p_broadcasts_total{direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
@@ -303,6 +302,49 @@ func TestSyncMetricsUseAppliedMasterchainForMasterGap(t *testing.T) {
 	removed := namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 6`
 	if strings.Contains(body, removed) {
 		t.Fatalf("metrics output contains coupled master gap %q\n%s", removed, body)
+	}
+}
+
+func TestSyncMetricsOmitIncompleteRecentTPS(t *testing.T) {
+	namespace := "testgton_incomplete_tps"
+	m := New(namespace)
+
+	err := m.RegisterRuntimeCollectors(RuntimeReaders{
+		ServiceStatusReader: func() service.StatusSnapshot {
+			return service.StatusSnapshot{
+				RecentTPS: service.StatusTPSSnapshot{
+					DurationSeconds: 10,
+					Transactions:    100,
+					TPS:             10,
+				},
+			}
+		},
+		DBStatusReader: func(context.Context) (pebblestore.DBStatus, error) {
+			return pebblestore.DBStatus{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("register runtime collectors: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, namespace+`_sync_recent_tps_complete 0`) {
+		t.Fatalf("metrics output does not report incomplete TPS window\n%s", body)
+	}
+	for _, metric := range []string{
+		namespace + `_sync_recent_tps `,
+		namespace + `_sync_recent_transactions `,
+	} {
+		if strings.Contains(body, metric) {
+			t.Fatalf("metrics output contains incomplete metric %q\n%s", metric, body)
+		}
 	}
 }
 

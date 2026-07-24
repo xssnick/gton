@@ -6,34 +6,33 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 var errStateSerializationLowDiskSpace = errors.New("free disk space is below persistent state serialization minimum")
 
-func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Context, target ton.BlockIDExt) error {
+func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Context, target ton.BlockIDExt, probe syncDiskSpaceProbe) error {
 	path := strings.TrimSpace(s.syncDiskSpacePath)
-	if path == "" || s.minStateSerializationDiskFreeBytes == 0 {
+	if path == "" {
 		return nil
 	}
 
-	status, err := s.checkPersistentStateSerializationDiskSpace(path)
+	status, err := checkPersistentStateSerializationDiskSpace(path, probe)
 	if err != nil {
 		return err
 	}
 	if status.AvailableBytes >= s.minStateSerializationDiskFreeBytes {
 		return nil
 	}
+	if s.persistentStateKeepRecent == PersistentStateKeepAll {
+		s.stateSerializationLowDiskFields(s.stateSerializer.log.Error(), target, path, status.AvailableBytes).
+			Msg("persistent state serialization skipped because all existing states are retained")
+		return s.stateSerializationLowDiskError(path, status.AvailableBytes)
+	}
 
-	s.stateSerializer.log.Warn().
-		Err(errStateSerializationLowDiskSpace).
-		Str("target", storage.FormatBlockRef(target)).
-		Str("path", path).
-		Uint64("available_bytes", status.AvailableBytes).
-		Str("available_size", formatByteSize(status.AvailableBytes)).
-		Uint64("required_bytes", s.minStateSerializationDiskFreeBytes).
-		Str("required_size", formatByteSize(s.minStateSerializationDiskFreeBytes)).
+	s.stateSerializationLowDiskFields(s.stateSerializer.log.Warn(), target, path, status.AvailableBytes).
 		Msg("not enough free disk space before persistent state serialization, pruning previous state")
 
 	stats, err := s.prunePreviousPersistentStateBeforeSerialization(ctx, target)
@@ -51,7 +50,7 @@ func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Contex
 			Msg("deleted previous persistent state before serialization")
 	}
 
-	status, err = s.checkPersistentStateSerializationDiskSpace(path)
+	status, err = checkPersistentStateSerializationDiskSpace(path, probe)
 	if err != nil {
 		return err
 	}
@@ -59,27 +58,29 @@ func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Contex
 		return nil
 	}
 
-	s.stateSerializer.log.Error().
-		Err(errStateSerializationLowDiskSpace).
-		Str("target", storage.FormatBlockRef(target)).
-		Str("path", path).
-		Uint64("available_bytes", status.AvailableBytes).
-		Str("available_size", formatByteSize(status.AvailableBytes)).
-		Uint64("required_bytes", s.minStateSerializationDiskFreeBytes).
-		Str("required_size", formatByteSize(s.minStateSerializationDiskFreeBytes)).
+	s.stateSerializationLowDiskFields(s.stateSerializer.log.Error(), target, path, status.AvailableBytes).
 		Int("deleted_file_records", stats.DeletedFileRecords).
 		Uint64("freed_bytes", stats.DeletedDiskBytes).
 		Str("freed_size", formatByteSize(stats.DeletedDiskBytes)).
 		Msg("persistent state serialization skipped because disk space is still low")
-	return fmt.Errorf("%w: available=%s required=%s path=%s", errStateSerializationLowDiskSpace, formatByteSize(status.AvailableBytes), formatByteSize(s.minStateSerializationDiskFreeBytes), path)
+	return s.stateSerializationLowDiskError(path, status.AvailableBytes)
 }
 
-func (s *Service) checkPersistentStateSerializationDiskSpace(path string) (syncDiskSpaceStatus, error) {
-	probe := s.syncDiskSpaceProbe
-	if probe == nil {
-		probe = statFSSyncDiskSpace
-	}
+func (s *Service) stateSerializationLowDiskFields(e *zerolog.Event, target ton.BlockIDExt, path string, availableBytes uint64) *zerolog.Event {
+	return e.Err(errStateSerializationLowDiskSpace).
+		Str("target", storage.FormatBlockRef(target)).
+		Str("path", path).
+		Uint64("available_bytes", availableBytes).
+		Str("available_size", formatByteSize(availableBytes)).
+		Uint64("required_bytes", s.minStateSerializationDiskFreeBytes).
+		Str("required_size", formatByteSize(s.minStateSerializationDiskFreeBytes))
+}
 
+func (s *Service) stateSerializationLowDiskError(path string, availableBytes uint64) error {
+	return fmt.Errorf("%w: available=%s required=%s path=%s", errStateSerializationLowDiskSpace, formatByteSize(availableBytes), formatByteSize(s.minStateSerializationDiskFreeBytes), path)
+}
+
+func checkPersistentStateSerializationDiskSpace(path string, probe syncDiskSpaceProbe) (syncDiskSpaceStatus, error) {
 	status, err := probe(path)
 	if err != nil {
 		return syncDiskSpaceStatus{}, fmt.Errorf("check free disk space before persistent state serialization: %w", err)

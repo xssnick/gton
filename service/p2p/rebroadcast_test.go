@@ -120,10 +120,15 @@ func TestSelectRebroadcastQueueTargetsSamplesFullPool(t *testing.T) {
 func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 	node := newTestNode(t)
 	node.SetRebroadcastQuiet(true)
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "basechain"},
+	})
 
 	req := &rebroadcastRequest{
-		kind:  "tonNode.externalMessageBroadcast",
-		local: true,
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		local:        true,
 	}
 	if !node.allowRebroadcast(req) {
 		t.Fatalf("local rebroadcast must bypass quiet throttle")
@@ -133,7 +138,8 @@ func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 	}
 
 	peerReq := &rebroadcastRequest{
-		kind: "tonNode.externalMessageBroadcast",
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
 	}
 	if !node.allowRebroadcast(peerReq) {
 		t.Fatalf("first peer rebroadcast should pass quiet throttle")
@@ -1082,10 +1088,11 @@ func TestPeerRebroadcastWorkerDropsStaleQueuedRequest(t *testing.T) {
 
 	for i := 0; i < workers; i++ {
 		if !peer.localRebroadcastQueue.Push(rebroadcastRequest{
-			kind:     "tonNode.externalMessageBroadcast",
-			payload:  []byte{byte(i + 1)},
-			local:    true,
-			queuedAt: time.Now().Add(-rebroadcastQueueMaxAge - time.Second),
+			subscription: sub,
+			kind:         "tonNode.externalMessageBroadcast",
+			payload:      []byte{byte(i + 1)},
+			local:        true,
+			queuedAt:     time.Now().Add(-rebroadcastQueueMaxAge - time.Second),
 		}) {
 			t.Fatalf("enqueue stale local rebroadcast %d", i)
 		}

@@ -155,7 +155,7 @@ func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer
 		return errors.New("shard is inactive")
 	}
 
-	resp, err := s.dispatchPeerQuery(ctx, peer, req)
+	resp, err := s.dispatchPeerQuery(ctx, req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
@@ -192,7 +192,7 @@ func (s *overlaySubscription) sendForgetPeer(ctx context.Context, peer *overlayP
 	s.removePeerIfCurrent(peer)
 }
 
-func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overlayPeer, req any) (tl.Serializable, error) {
+func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, req any) (tl.Serializable, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -625,7 +625,7 @@ func (s *overlaySubscription) seenMasterchainSeqnoForKeyBlockScan(ctx context.Co
 	}
 
 	current, err := s.node.storage.CurrentState(ctx)
-	if err == nil && validBlockID(current.Masterchain.Block) {
+	if err == nil && tnstore.BlockIDHashesKnown(current.Masterchain.Block) {
 		return current.Masterchain.Block.SeqNo, nil
 	}
 	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {

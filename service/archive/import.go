@@ -41,22 +41,6 @@ type blockParts struct {
 	savedFull bool
 }
 
-func canonicalArchiveProof(part *blockParts) ([]byte, bool, bool) {
-	if part == nil {
-		return nil, false, false
-	}
-	if isMasterchainBlock(part.id) {
-		if len(part.proof) == 0 {
-			return nil, false, false
-		}
-		return part.proof, false, true
-	}
-	if len(part.proofLink) == 0 {
-		return nil, false, false
-	}
-	return part.proofLink, true, true
-}
-
 func isMasterchainBlock(block ton.BlockIDExt) bool {
 	return block.Workchain == -1 && block.Shard == topShard
 }
@@ -190,12 +174,18 @@ func flushBlockPart(preparer *importedBlockPreparer, part *blockParts, stats *Im
 		Meta:  &storage.BlockMeta{ID: part.id},
 	}
 
-	proof, isLink, ok := canonicalArchiveProof(part)
-	if !ok {
-		return nil
+	if isMasterchainBlock(part.id) {
+		if len(part.proof) == 0 {
+			return nil
+		}
+		full.Proof = part.proof
+	} else {
+		if len(part.proofLink) == 0 {
+			return nil
+		}
+		full.Proof = part.proofLink
+		full.IsLink = true
 	}
-	full.Proof = proof
-	full.IsLink = isLink
 
 	if err := preparer.submit(full); err != nil {
 		return err

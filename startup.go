@@ -75,7 +75,7 @@ func zeroStateBlockFromGlobalConfig(cfg *liteclient.GlobalConfig) (ton.BlockIDEx
 		RootHash:  append([]byte(nil), cfg.Validator.ZeroState.RootHash...),
 		FileHash:  append([]byte(nil), cfg.Validator.ZeroState.FileHash...),
 	}
-	if block.Workchain != -1 || !validBlockID(block) {
+	if block.Workchain != -1 || !storage.BlockIDHashesKnown(block) {
 		return ton.BlockIDExt{}, fmt.Errorf("global config contains invalid zero_state")
 	}
 	return block, nil
@@ -100,10 +100,6 @@ func ensureStoredZeroStateMatchesGlobalConfig(ctx context.Context, store storedZ
 		}
 	}
 	return nil
-}
-
-func validBlockID(block ton.BlockIDExt) bool {
-	return len(block.RootHash) == 32 && len(block.FileHash) == 32
 }
 
 func formatBlockID(block ton.BlockIDExt) string {

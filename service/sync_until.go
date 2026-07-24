@@ -12,7 +12,7 @@ func (s *Service) syncUntilEnabled() bool {
 }
 
 func (s *Service) syncUntilFrozen() bool {
-	return s.syncUntilEnabled() && s.node != nil && s.node.IsOffline()
+	return s.syncUntilEnabled() && s.node.IsOffline()
 }
 
 func (s *Service) checkCurrentBeforeSyncUntil(ctx context.Context, current *storage.CurrentState) error {
@@ -33,17 +33,13 @@ func (s *Service) checkCurrentBeforeSyncUntil(ctx context.Context, current *stor
 }
 
 func (s *Service) preparedMasterBlockAfterSyncUntil(block PreparedBlock) bool {
-	if !s.syncUntilEnabled() || block.Meta == nil {
+	if !s.syncUntilEnabled() {
 		return false
 	}
 	return block.Meta.GenUTime > s.syncUntil
 }
 
 func (s *Service) enterSyncUntilOffline(current *storage.CurrentState, next PreparedBlock) {
-	if s.node == nil {
-		return
-	}
-
 	event := s.log.Info().
 		Uint32("sync_until", s.syncUntil)
 	if current != nil {

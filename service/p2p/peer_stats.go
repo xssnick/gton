@@ -29,9 +29,6 @@ type peerStats struct {
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
-	if p == nil || p.overlay == nil {
-		return false
-	}
 	if p.overlay.ADNLWrapper == nil || p.overlay.ADNL == nil {
 		return true
 	}
@@ -274,9 +271,6 @@ func (s *overlaySubscription) preferredPeers(requiredVersionMajor, requiredVersi
 	known := s.knownPeersSnapshot()
 	candidates := make([]*overlayPeer, 0, len(known))
 	for _, peer := range known {
-		if peer.overlay == nil {
-			continue
-		}
 		if !peerEligible(peer.statsSnapshot(), requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
@@ -543,32 +537,34 @@ func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requir
 const broadcastTargetsTTL = 200 * time.Millisecond
 
 type broadcastTargetsSnapshot struct {
-	builtAt   time.Time
-	peers     []*overlayPeer
-	broadcast []overlay.BroadcastPeer
+	generation uint64
+	builtAt    time.Time
+	peers      []*overlayPeer
+	broadcast  []overlay.BroadcastPeer
 }
 
-// rebroadcastCandidates returns the deduplicated union of neighbour and known
-// peers: alive ones when any exist, everything known otherwise. All consumers
-// either contact every returned peer or sample from it randomly, so no
-// preference ordering is computed. The slice is cached and shared between
-// callers - it must not be modified.
-func (s *overlaySubscription) rebroadcastCandidates() []*overlayPeer {
-	return s.broadcastTargetsSnapshot().peers
-}
-
-// broadcastPeersSnapshot is rebroadcastCandidates converted for tonutils-go
-// broadcast senders, under the same shared-slice contract.
-func (s *overlaySubscription) broadcastPeersSnapshot() []overlay.BroadcastPeer {
-	return s.broadcastTargetsSnapshot().broadcast
-}
-
+// broadcastTargetsSnapshot returns the deduplicated union of neighbour and
+// known peers: alive ones when any exist, everything known otherwise. The
+// slices are cached and shared between callers and must not be modified.
 func (s *overlaySubscription) broadcastTargetsSnapshot() *broadcastTargetsSnapshot {
-	if snap := s.broadcastTargets.Load(); snap != nil && time.Since(snap.builtAt) < broadcastTargetsTTL {
+	generation := s.broadcastTargetsGen.Load()
+	if snap := s.broadcastTargets.Load(); snap != nil && snap.generation == generation && time.Since(snap.builtAt) < broadcastTargetsTTL {
 		return snap
 	}
 
+	s.broadcastTargetsMx.Lock()
+	defer s.broadcastTargetsMx.Unlock()
+
+	generation = s.broadcastTargetsGen.Load()
+	if snap := s.broadcastTargets.Load(); snap != nil && snap.generation == generation && time.Since(snap.builtAt) < broadcastTargetsTTL {
+		return snap
+	}
+
+	// A membership change during the build leaves the snapshot stamped with
+	// the older generation, so the next caller rebuilds; consumers already
+	// tolerate snapshots up to the TTL stale.
 	snap := s.buildBroadcastTargetsSnapshot()
+	snap.generation = generation
 	s.broadcastTargets.Store(snap)
 	return snap
 }
@@ -601,9 +597,6 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 
 	broadcast := make([]overlay.BroadcastPeer, 0, len(peers))
 	for _, peer := range peers {
-		if peer.overlay == nil {
-			continue
-		}
 		broadcast = append(broadcast, peer.overlay)
 	}
 	return &broadcastTargetsSnapshot{builtAt: time.Now(), peers: peers, broadcast: broadcast}

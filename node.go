@@ -44,6 +44,7 @@ type StorageOptions struct {
 	CellMemTableStopWritesThreshold  int
 	LargeBOCShardReadWorkers         int
 	PersistentStateLargeBOCBatchSize int
+	PersistentStateKeepRecent        int
 	StateSerializeOnePass            bool
 	ArtifactFileMaxOpen              int
 }
@@ -103,19 +104,12 @@ func applyNodeOptionDefaults(opts NodeOptions) NodeOptions {
 	return opts
 }
 
-func componentLogger(base zerolog.Logger, component string) zerolog.Logger {
-	if component == "" {
-		return base
-	}
-	return base.With().Str("component", component).Logger()
-}
-
 // RunNode runs the gton node from already resolved startup options.
 func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	runOpts = applyNodeOptionDefaults(runOpts)
 
 	baseLogger := runOpts.Logger
-	logger := componentLogger(baseLogger, "main")
+	logger := baseLogger.With().Str("component", "main").Logger()
 	cell.MaxBOCCells = maxNodeBOCCells
 	logger.Debug().Int("max_boc_cells", cell.MaxBOCCells).Msg("configured BOC parser limits")
 
@@ -277,7 +271,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	liveStore := liveview.New(store, liveViewOptions)
 	tvmInstance := tvm.NewTVM()
 
-	externalMessageLogger := componentLogger(baseLogger, "external_message")
+	externalMessageLogger := baseLogger.With().Str("component", "external_message").Logger()
 	externalMessageChecker, err := externalmsg.NewChecker(externalmsg.Options{
 		Logger: &externalMessageLogger,
 		Store:  liveStore,
@@ -307,7 +301,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		return fmt.Errorf("initialize static extension: %w", err)
 	}
 
-	serviceLogger := componentLogger(baseLogger, "service")
+	serviceLogger := baseLogger.With().Str("component", "service").Logger()
 	svc := service.New(serviceLogger, node, blockSync, store, stateSync, service.Options{
 		ArchiveCatchUpCheckpointBlocks:          archiveCheckpointBlocks,
 		ArchiveCatchUpCheckpointPeriod:          runOpts.ArchiveCheckpointPeriod,
@@ -327,6 +321,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		StorageDir:                              storageDir,
 		DisableStateSerialization:               runOpts.DisableStateSerialization,
 		PersistentStateLargeBOCBatchSize:        persistentStateLargeBOCBatchSize,
+		PersistentStateKeepRecent:               storageOpts.PersistentStateKeepRecent,
 		StateSerializeOnePass:                   storageOpts.StateSerializeOnePass,
 		SyncObserver:                            syncObserver,
 		Extension:                               extension,
@@ -395,6 +390,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		Int("archive_prefetch_windows", runOpts.ArchivePrefetchWindows).
 		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
 		Int("persistent_state_large_boc_batch_size", persistentStateLargeBOCBatchSize).
+		Int("persistent_state_keep_recent", storageOpts.PersistentStateKeepRecent).
 		Bool("state_serialize_one_pass", storageOpts.StateSerializeOnePass).
 		Bool("disable_state_serialization", runOpts.DisableStateSerialization).
 		Msg("service started")

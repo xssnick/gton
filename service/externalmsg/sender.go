@@ -45,6 +45,12 @@ type Sender struct {
 	limiter        *extmsg.AddressLimiter
 }
 
+type sendAttempt struct {
+	cacheKey     uint64
+	cacheMessage bool
+	duplicate    bool
+}
+
 type senderStageError struct {
 	stage error
 	err   error
@@ -101,38 +107,55 @@ func NewSender(opts SenderOptions) (*Sender, error) {
 }
 
 func (s *Sender) Send(ctx context.Context, body []byte) error {
-	_, err := s.send(ctx, body, false)
+	attempt, err := s.beginSend(body)
+	if err != nil {
+		return err
+	}
+	if attempt.duplicate {
+		return nil
+	}
+
+	_, err = s.send(ctx, body, attempt)
 	return err
 }
 
 func (s *Sender) SendForHash(ctx context.Context, body []byte) (*cell.Cell, error) {
-	return s.send(ctx, body, true)
+	attempt, err := s.beginSend(body)
+	if err != nil {
+		return nil, err
+	}
+	if attempt.duplicate {
+		root, _, err := ParseMessage(body)
+		if err != nil {
+			return nil, senderStageError{stage: ErrParseFailed, err: err}
+		}
+		return root, nil
+	}
+
+	return s.send(ctx, body, attempt)
 }
 
-func (s *Sender) send(ctx context.Context, body []byte, needRoot bool) (*cell.Cell, error) {
+func (s *Sender) beginSend(body []byte) (sendAttempt, error) {
 	if s.maxBodyBytes > 0 && len(body) > s.maxBodyBytes {
-		return nil, fmt.Errorf("%w: %d", ErrMessageTooLarge, len(body))
+		return sendAttempt{}, fmt.Errorf("%w: %d", ErrMessageTooLarge, len(body))
 	}
 
-	var cacheKey uint64
-	cacheMessage := !s.allowDuplicate
-	if cacheMessage {
-		cacheKey = MessageCacheKey(body)
-		if !s.cache.Mark(cacheKey, s.now()) {
-			if !needRoot {
-				return nil, nil
-			}
-			root, _, err := ParseMessage(body)
-			if err != nil {
-				return nil, senderStageError{stage: ErrParseFailed, err: err}
-			}
-			return root, nil
-		}
+	if s.allowDuplicate {
+		return sendAttempt{}, nil
 	}
 
+	cacheKey := MessageCacheKey(body)
+	return sendAttempt{
+		cacheKey:     cacheKey,
+		cacheMessage: true,
+		duplicate:    !s.cache.Mark(cacheKey, s.now()),
+	}, nil
+}
+
+func (s *Sender) send(ctx context.Context, body []byte, attempt sendAttempt) (*cell.Cell, error) {
 	dropCached := func() {
-		if cacheMessage {
-			s.cache.Drop(cacheKey)
+		if attempt.cacheMessage {
+			s.cache.Drop(attempt.cacheKey)
 		}
 	}
 

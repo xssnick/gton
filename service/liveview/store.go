@@ -132,25 +132,16 @@ func (o *liveBlockOrder) pushBack(key storage.BlockRootHash) {
 	o.index[key] = o.items.PushBack(key)
 }
 
-func (o *liveBlockOrder) remove(key storage.BlockRootHash) bool {
+func (o *liveBlockOrder) remove(key storage.BlockRootHash) {
 	elem := o.index[key]
 	if elem == nil {
-		return false
+		return
 	}
 	o.items.Remove(elem)
 	delete(o.index, key)
-	return true
-}
-
-func (o *liveBlockOrder) front() *list.Element {
-	return o.items.Front()
 }
 
 func New(store Backing, opts ...Options) *Store {
-	if store == nil {
-		panic("liveview store backing is required")
-	}
-
 	cfg := Options{
 		MasterBlockCache: DefaultMasterBlockCache,
 		ShardBlockCache:  DefaultShardBlockCache,
@@ -271,10 +262,6 @@ func (s *Store) loadStoredCurrentState(ctx context.Context) (*storage.CurrentSta
 }
 
 func (s *Store) prepareStoredCurrentState(ctx context.Context, current *storage.CurrentState) (*storage.CurrentState, []storedCurrentBlock, error) {
-	if current == nil {
-		return nil, nil, storage.ErrNotFound
-	}
-
 	loaded := &storage.CurrentState{
 		SyncedAt:         current.SyncedAt,
 		ShardClientSeqno: current.ShardClientSeqno,
@@ -302,7 +289,7 @@ func (s *Store) prepareStoredCurrentState(ctx context.Context, current *storage.
 
 func (s *Store) loadStoredCurrentBlock(ctx context.Context, state storage.BlockState) (storedCurrentBlock, error) {
 	block := state.Block
-	if !isFullBlockID(&block) {
+	if !blockproof.IsFullBlockID(block) {
 		return storedCurrentBlock{}, storage.ErrNotFound
 	}
 	if _, err := s.backing.BlockData(ctx, block); err != nil {
@@ -444,7 +431,7 @@ func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) 
 
 func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePreparedBlockArtifacts, error) {
 	block := artifacts.Block
-	if !isFullBlockID(&block) {
+	if !blockproof.IsFullBlockID(block) {
 		return livePreparedBlockArtifacts{}, storage.ErrNotFound
 	}
 
@@ -501,7 +488,7 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 
 	var fragments *BlockView
 	if !artifacts.AvailabilityOnly && root != nil && state != nil && state.Cell != nil {
-		built, err := buildBlockView(block, root, state.Cell)
+		built, err := NewBlockView(block, root, state.Cell)
 		if err != nil {
 			return livePreparedBlockArtifacts{}, err
 		}
@@ -621,10 +608,6 @@ func (s *Store) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
 }
 
 func (s *Store) MarkLiveCurrentStateFlushed(current *storage.CurrentState) {
-	if current == nil {
-		return
-	}
-
 	s.mu.Lock()
 	s.markLiveBlockStateFlushedLocked(current.Masterchain.Block, true)
 	for _, shard := range current.Shards {
@@ -636,7 +619,7 @@ func (s *Store) MarkLiveCurrentStateFlushed(current *storage.CurrentState) {
 }
 
 func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
-	if state := s.cachedBlockState(block); state != nil {
+	if state, err := s.cachedBlockState(block); err == nil {
 		return state, nil
 	}
 	if !s.backingBlockAllowed(block) {
@@ -646,7 +629,8 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 }
 
 func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
-	if state := s.cachedBlockState(block); state != nil && state.Cell != nil {
+	state, err := s.cachedBlockState(block)
+	if err == nil && state.Cell != nil {
 		if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
 			return nil, storage.ErrNotFound
 		}
@@ -665,7 +649,7 @@ func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 }
 
 func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error) {
-	if cached := s.cachedBlockMeta(block); cached != nil {
+	if cached, err := s.cachedBlockMeta(block); err == nil {
 		return cached, nil
 	}
 	if !s.backingBlockAllowed(block) {
@@ -675,7 +659,7 @@ func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.B
 }
 
 func (s *Store) LookupBlockBySeqNo(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
-	if block, ok := s.cachedBlockBySeqNo(ref); ok {
+	if block, err := s.cachedBlockBySeqNo(ref); err == nil {
 		return block, nil
 	}
 	if !s.backingSeqnoLookupAllowed(ref) {
@@ -691,8 +675,56 @@ func (s *Store) LookupBlockBySeqNo(ctx context.Context, ref storage.BlockSeqRef)
 	return block, nil
 }
 
+func lookupBackingBlockBySeqNoForPrefix(ctx context.Context, backing Backing, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
+	if prefix, ok := backing.(prefixBacking); ok {
+		return prefix.LookupBlockBySeqNoForPrefix(ctx, ref)
+	}
+	// Backing predates prefix-aware lookups. The exact-shard methods preserve
+	// released behavior for implementations without the optional capability.
+	return backing.LookupBlockBySeqNo(ctx, ref)
+}
+
+func lookupBackingBlockByLTForPrefix(ctx context.Context, backing Backing, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	if prefix, ok := backing.(prefixBacking); ok {
+		return prefix.LookupBlockByLTForPrefix(ctx, key, lt)
+	}
+	return backing.LookupBlockByLT(ctx, key, lt)
+}
+
+func lookupBackingBlockByUnixTimeForPrefix(ctx context.Context, backing Backing, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
+	if prefix, ok := backing.(prefixBacking); ok {
+		return prefix.LookupBlockByUnixTimeForPrefix(ctx, key, utime)
+	}
+	return backing.LookupBlockByUnixTime(ctx, key, utime)
+}
+
+func (s *Store) LookupBlockBySeqNoForPrefix(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
+	if block, err := s.cachedBlockBySeqNo(ref); err == nil {
+		return block, nil
+	}
+	if !s.backingSeqnoLookupAllowed(ref) {
+		best, err := s.cachedBlockBySeqNoForPrefix(ref)
+		if err != nil {
+			return ton.BlockIDExt{}, err
+		}
+		return best.block, nil
+	}
+
+	block, err := lookupBackingBlockBySeqNoForPrefix(ctx, s.backing, ref)
+	if err == nil && s.backingBlockAllowed(block) {
+		return block, nil
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return ton.BlockIDExt{}, err
+	}
+	best, err := s.cachedBlockBySeqNoForPrefix(ref)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	return best.block, nil
+}
+
 func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
-	if block, ok := s.cachedBlockByLT(key, lt); ok {
+	if block, err := s.cachedBlockByLT(key, lt); err == nil {
 		return block, nil
 	}
 	block, err := s.backing.LookupBlockByLT(ctx, key, lt)
@@ -705,11 +737,41 @@ func (s *Store) LookupBlockByLT(ctx context.Context, key storage.BlockHistoryKey
 	return block, nil
 }
 
+func (s *Store) LookupBlockByLTForPrefix(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	if block, err := s.cachedDirectBlockByLTForPrefix(key, lt); err == nil {
+		return block, nil
+	}
+
+	best, bestErr := s.cachedBlockByLTForPrefix(key, lt)
+
+	block, err := lookupBackingBlockByLTForPrefix(ctx, s.backing, key, lt)
+	if err == nil && s.backingBlockAllowed(block) {
+		if errors.Is(bestErr, storage.ErrNotFound) || best.artifactFlushed {
+			return block, nil
+		}
+		meta, metaErr := s.backing.BlockMeta(ctx, block)
+		if metaErr != nil {
+			return ton.BlockIDExt{}, metaErr
+		}
+		candidate := blockPrefixCandidate{block: block, exact: meta.EndLT == lt}
+		if prefixCandidateBetter(candidate, best) {
+			best = candidate
+		}
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return ton.BlockIDExt{}, err
+	}
+	if bestErr != nil {
+		return ton.BlockIDExt{}, bestErr
+	}
+	return best.block, nil
+}
+
 func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
 	var best ton.BlockIDExt
 	found := false
 	for _, shard := range storage.AccountShardCandidates(workchain, account) {
-		if block, ok := s.cachedBlockByLT(storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt); ok {
+		block, err := s.cachedBlockByLT(storage.BlockHistoryKey{Workchain: workchain, Shard: shard}, lt)
+		if err == nil {
 			if !found || best.SeqNo > block.SeqNo {
 				best = block
 				found = true
@@ -730,7 +792,7 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 }
 
 func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
-	if block, ok := s.cachedBlockByUnixTime(key, utime); ok {
+	if block, err := s.cachedBlockByUnixTime(key, utime); err == nil {
 		return block, nil
 	}
 	block, err := s.backing.LookupBlockByUnixTime(ctx, key, utime)
@@ -743,8 +805,56 @@ func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHist
 	return block, nil
 }
 
+func (s *Store) LookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
+	if block, err := s.cachedDirectBlockByUnixTimeForPrefix(key, utime); err == nil {
+		return block, nil
+	}
+
+	best, bestErr := s.cachedBlockByUnixTimeForPrefix(key, utime)
+
+	block, err := lookupBackingBlockByUnixTimeForPrefix(ctx, s.backing, key, utime)
+	if err == nil && s.backingBlockAllowed(block) {
+		if errors.Is(bestErr, storage.ErrNotFound) || best.artifactFlushed {
+			return block, nil
+		}
+		meta, metaErr := s.backing.BlockMeta(ctx, block)
+		if metaErr != nil {
+			return ton.BlockIDExt{}, metaErr
+		}
+		candidate := blockPrefixCandidate{block: block, exact: meta.GenUTime == utime}
+		if prefixCandidateBetter(candidate, best) {
+			best = candidate
+		}
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return ton.BlockIDExt{}, err
+	}
+	if bestErr != nil {
+		return ton.BlockIDExt{}, bestErr
+	}
+	return best.block, nil
+}
+
+type blockPrefixCandidate struct {
+	block           ton.BlockIDExt
+	exact           bool
+	artifactFlushed bool
+}
+
+func prefixCandidateBetter(candidate, current blockPrefixCandidate) bool {
+	if candidate.exact != current.exact {
+		return candidate.exact
+	}
+	if candidate.exact {
+		return storage.ShardPrefixLength(candidate.block.Shard) < storage.ShardPrefixLength(current.block.Shard)
+	}
+	if candidate.block.SeqNo != current.block.SeqNo {
+		return candidate.block.SeqNo < current.block.SeqNo
+	}
+	return storage.ShardPrefixLength(candidate.block.Shard) < storage.ShardPrefixLength(current.block.Shard)
+}
+
 func (s *Store) BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
-	if root := s.cachedBlockRoot(block); root != nil {
+	if root, err := s.cachedBlockRoot(block); err == nil {
 		return root, nil
 	}
 	if !s.backingBlockAllowed(block) {
@@ -792,7 +902,7 @@ func (s *Store) BlockProof(ctx context.Context, kind storage.ServedProofKind, bl
 }
 
 func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*BlockView, error) {
-	if fragments := s.cachedBlockFragments(block); fragments != nil {
+	if fragments, err := s.cachedBlockFragments(block); err == nil {
 		return fragments, nil
 	}
 	key, ok := liveBlockLookupKeyFromBlock(block)
@@ -804,7 +914,7 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 		// Load detached from the initiating request so one disconnecting client
 		// cannot fail the shared result for concurrent waiters.
 		ctx := context.WithoutCancel(ctx)
-		if fragments := s.cachedBlockFragments(block); fragments != nil {
+		if fragments, err := s.cachedBlockFragments(block); err == nil {
 			return fragments, nil
 		}
 
@@ -823,7 +933,7 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 			return nil, err
 		}
 
-		fragments, err := buildBlockView(block, blockRoot, stateRoot)
+		fragments, err := NewBlockView(block, blockRoot, stateRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -845,7 +955,7 @@ func (s *Store) loadStoredBlockData(ctx context.Context, block ton.BlockIDExt) (
 		// Load detached from the initiating request so one disconnecting client
 		// cannot fail the shared result for concurrent waiters.
 		ctx := context.WithoutCancel(ctx)
-		cached, err := s.cachedBlockData(ctx, block)
+		cached, err := s.liveBlockCache.CachedBlockData(ctx, block)
 		if err == nil {
 			return cached.Data, nil
 		}
@@ -884,11 +994,11 @@ func (s *Store) loadStoredBlock(ctx context.Context, block ton.BlockIDExt) (*liv
 		// Load detached from the initiating request so one disconnecting client
 		// cannot fail the shared result for concurrent waiters.
 		ctx := context.WithoutCancel(ctx)
-		cached, err := s.cachedBlockData(ctx, block)
+		cached, err := s.liveBlockCache.CachedBlockData(ctx, block)
 		if err == nil {
 			data := cached.Data
-			root := s.cachedBlockRoot(block)
-			if root == nil {
+			root, rootErr := s.cachedBlockRoot(block)
+			if rootErr != nil {
 				parsed, err := ParseTrustedBlockBOC(block, data)
 				if err != nil {
 					return nil, err
@@ -1026,7 +1136,7 @@ func (s *Store) updateMasterchainInfoLocked(current *storage.CurrentState) {
 	}
 
 	s.masterchainInfo = liveMasterchainInfo{
-		block:         *cloneBlockID(block),
+		block:         cloneBlockID(block),
 		stateRootHash: stateRootHash,
 		lastUTime:     lastUTime,
 		valid:         true,
@@ -1103,8 +1213,8 @@ func currentAccountBlocksFromState(current *storage.CurrentState, workchain int3
 	}
 
 	prefix := binary.BigEndian.Uint64(account[:8])
-	for length := 60; length >= 1; length-- {
-		shardID := accountShardPrefix(prefix, length)
+	for length := uint32(60); length >= 1; length-- {
+		shardID := storage.AccountShardPrefix(prefix, length)
 		shard, ok := current.Shards[storage.ShardKey{Workchain: workchain, Shard: shardID}]
 		if ok {
 			return CurrentAccountBlockIDs{Master: master, Account: shard.Block}, nil
@@ -1118,53 +1228,51 @@ func currentAccountBlocksFromState(current *storage.CurrentState, workchain int3
 	return CurrentAccountBlockIDs{}, storage.ErrNotFound
 }
 
-func accountShardPrefix(prefix uint64, length int) int64 {
-	x := uint64(1) << (63 - uint(length))
-	return int64((prefix & ^(x - 1)) | x)
-}
-
 // cachedBlockState returns a copy of the cached state struct; the nested cells
 // and byte slices are shared read-only with the cache.
-func (s *Store) cachedBlockState(block ton.BlockIDExt) *storage.BlockState {
+func (s *Store) cachedBlockState(block ton.BlockIDExt) (*storage.BlockState, error) {
 	key, ok := liveBlockLookupKeyFromBlock(block)
 	if !ok {
-		return nil
+		return nil, storage.ErrNotFound
 	}
 
 	s.mu.RLock()
 	state, ok := s.states[key]
 	s.mu.RUnlock()
 	if !ok {
-		return nil
+		return nil, storage.ErrNotFound
 	}
-	return &state
+	return &state, nil
 }
 
 // cachedBlockMeta returns the shared cached meta; indexed metas are immutable
 // once published, callers treat them as read-only.
-func (s *Store) cachedBlockMeta(block ton.BlockIDExt) *storage.BlockMeta {
+func (s *Store) cachedBlockMeta(block ton.BlockIDExt) (*storage.BlockMeta, error) {
 	key := storage.BlockKey(block)
 
 	s.mu.RLock()
 	meta := s.metas[key]
 	s.mu.RUnlock()
 	if meta != nil && !blockIDEqual(meta.ID, block) {
-		return nil
+		return nil, storage.ErrNotFound
 	}
-	return meta
+	if meta == nil {
+		return nil, storage.ErrNotFound
+	}
+	return meta, nil
 }
 
-func (s *Store) cachedBlockBySeqNo(ref storage.BlockSeqRef) (ton.BlockIDExt, bool) {
+func (s *Store) cachedBlockBySeqNo(ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
 	s.mu.RLock()
 	block, ok := s.seqIndex[liveSeqKey{workchain: ref.Workchain, shard: ref.Shard, seqno: ref.SeqNo}]
 	s.mu.RUnlock()
 	if !ok {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
-	return *cloneBlockID(block), true
+	return cloneBlockID(block), nil
 }
 
-func (s *Store) cachedBlockByLT(key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, bool) {
+func (s *Store) cachedBlockByLT(key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1173,9 +1281,74 @@ func (s *Store) cachedBlockByLT(key storage.BlockHistoryKey, lt uint64) (ton.Blo
 		return entries[i].endLT >= lt
 	})
 	if geIdx < len(entries) && liveLTIndexCovers(entries, geIdx, lt) {
-		return *cloneBlockID(entries[geIdx].block), true
+		return cloneBlockID(entries[geIdx].block), nil
 	}
-	return ton.BlockIDExt{}, false
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func (s *Store) cachedBlockBySeqNoForPrefix(ref storage.BlockSeqRef) (blockPrefixCandidate, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	maxDepth := uint32(60)
+	if ref.Workchain == masterchainID {
+		maxDepth = 0
+	}
+	for depth := uint32(0); depth <= maxDepth; depth++ {
+		shard := storage.AccountShardPrefix(uint64(ref.Shard), depth)
+		block, ok := s.seqIndex[liveSeqKey{workchain: ref.Workchain, shard: shard, seqno: ref.SeqNo}]
+		if ok {
+			return s.cachedPrefixCandidateLocked(block, true), nil
+		}
+	}
+	return blockPrefixCandidate{}, storage.ErrNotFound
+}
+
+func (s *Store) cachedDirectBlockByLTForPrefix(key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entries := s.ltIndex[liveHistoryKey{workchain: key.Workchain, shard: key.Shard}]
+	idx := sort.Search(len(entries), func(i int) bool {
+		return entries[i].endLT >= lt
+	})
+	if idx >= len(entries) {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	if !prefixHistoryIsRoot(key) && idx == 0 && (entries[idx].startLT == 0 || entries[idx].startLT >= lt) {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return cloneBlockID(entries[idx].block), nil
+}
+
+func (s *Store) cachedBlockByLTForPrefix(key storage.BlockHistoryKey, lt uint64) (blockPrefixCandidate, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var best blockPrefixCandidate
+	found := false
+	maxDepth := uint32(60)
+	if key.Workchain == masterchainID {
+		maxDepth = 0
+	}
+	for depth := uint32(0); depth <= maxDepth; depth++ {
+		shard := storage.AccountShardPrefix(uint64(key.Shard), depth)
+		entries := s.ltIndex[liveHistoryKey{workchain: key.Workchain, shard: shard}]
+		idx := sort.Search(len(entries), func(i int) bool {
+			return entries[i].endLT >= lt
+		})
+		if idx < len(entries) {
+			candidate := blockPrefixCandidate{block: entries[idx].block, exact: entries[idx].endLT == lt}
+			if !found || prefixCandidateBetter(candidate, best) {
+				best = candidate
+				found = true
+			}
+		}
+	}
+	if !found {
+		return blockPrefixCandidate{}, storage.ErrNotFound
+	}
+	return s.cachedPrefixCandidateLocked(best.block, best.exact), nil
 }
 
 func liveLTIndexCovers(entries []liveLTIndexEntry, idx int, lt uint64) bool {
@@ -1186,7 +1359,7 @@ func liveLTIndexCovers(entries []liveLTIndexEntry, idx int, lt uint64) bool {
 	return idx > 0 && entries[idx-1].endLT <= lt
 }
 
-func (s *Store) cachedBlockByUnixTime(key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, bool) {
+func (s *Store) cachedBlockByUnixTime(key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1195,40 +1368,95 @@ func (s *Store) cachedBlockByUnixTime(key storage.BlockHistoryKey, utime uint32)
 		return entries[i].genUTime >= utime
 	})
 	if idx >= len(entries) {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 	if idx == 0 && utime < entries[idx].genUTime {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
-	return *cloneBlockID(entries[idx].block), true
+	return cloneBlockID(entries[idx].block), nil
 }
 
-func (s *Store) cachedBlockRoot(block ton.BlockIDExt) *cell.Cell {
+func (s *Store) cachedBlockByUnixTimeForPrefix(key storage.BlockHistoryKey, utime uint32) (blockPrefixCandidate, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var best blockPrefixCandidate
+	found := false
+	maxDepth := uint32(60)
+	if key.Workchain == masterchainID {
+		maxDepth = 0
+	}
+	for depth := uint32(0); depth <= maxDepth; depth++ {
+		shard := storage.AccountShardPrefix(uint64(key.Shard), depth)
+		entries := s.unixIndex[liveHistoryKey{workchain: key.Workchain, shard: shard}]
+		idx := sort.Search(len(entries), func(i int) bool {
+			return entries[i].genUTime >= utime
+		})
+		if idx < len(entries) {
+			candidate := blockPrefixCandidate{block: entries[idx].block, exact: entries[idx].genUTime == utime}
+			if !found || prefixCandidateBetter(candidate, best) {
+				best = candidate
+				found = true
+			}
+		}
+	}
+	if !found {
+		return blockPrefixCandidate{}, storage.ErrNotFound
+	}
+	return s.cachedPrefixCandidateLocked(best.block, best.exact), nil
+}
+
+func (s *Store) cachedDirectBlockByUnixTimeForPrefix(key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entries := s.unixIndex[liveHistoryKey{workchain: key.Workchain, shard: key.Shard}]
+	idx := sort.Search(len(entries), func(i int) bool {
+		return entries[i].genUTime >= utime
+	})
+	if idx >= len(entries) {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	if !prefixHistoryIsRoot(key) && entries[0].genUTime >= utime {
+		return ton.BlockIDExt{}, storage.ErrNotFound
+	}
+	return cloneBlockID(entries[idx].block), nil
+}
+
+func prefixHistoryIsRoot(key storage.BlockHistoryKey) bool {
+	return key.Workchain == masterchainID || storage.ShardPrefixLength(key.Shard) == 0
+}
+
+func (s *Store) cachedPrefixCandidateLocked(block ton.BlockIDExt, exact bool) blockPrefixCandidate {
+	candidate := blockPrefixCandidate{block: cloneBlockID(block), exact: exact}
+	if cached := s.blocks[storage.BlockKey(block)]; cached != nil && blockIDEqual(cached.id, block) {
+		candidate.artifactFlushed = cached.artifactFlushed
+	}
+	return candidate
+}
+
+func (s *Store) cachedBlockRoot(block ton.BlockIDExt) (*cell.Cell, error) {
 	key := storage.BlockKey(block)
 
 	s.mu.RLock()
 	cached := s.blocks[key]
 	s.mu.RUnlock()
-	if cached == nil || !blockIDEqual(cached.id, block) {
-		return nil
+	if cached == nil || !blockIDEqual(cached.id, block) || cached.root == nil {
+		return nil, storage.ErrNotFound
 	}
-	return cached.root
+	return cached.root, nil
 }
 
-func (s *Store) cachedBlockData(ctx context.Context, block ton.BlockIDExt) (storage.CachedBlockData, error) {
-	return s.liveBlockCache.CachedBlockData(ctx, block)
-}
-
-func (s *Store) cachedBlockFragments(block ton.BlockIDExt) *BlockView {
+func (s *Store) cachedBlockFragments(block ton.BlockIDExt) (*BlockView, error) {
 	key := storage.BlockKey(block)
 
 	s.mu.RLock()
 	cached := s.blocks[key]
 	s.mu.RUnlock()
-	if cached == nil || !blockIDEqual(cached.id, block) {
-		return nil
+	if cached == nil || !blockIDEqual(cached.id, block) || cached.fragments == nil {
+		return nil, storage.ErrNotFound
 	}
-	return cached.fragments
+	return cached.fragments, nil
 }
 
 func (s *Store) rememberBlockFragments(block ton.BlockIDExt, fragments *BlockView) *BlockView {
@@ -1294,7 +1522,7 @@ func (s *Store) trimBlocksLocked(kind liveBlockCacheKind) {
 
 	protected := s.protectedLiveBlocksLocked()
 	order := s.blockOrderLocked(kind)
-	for elem := order.front(); elem != nil && evictable > limit; {
+	for elem := order.items.Front(); elem != nil && evictable > limit; {
 		next := elem.Next()
 		key := elem.Value.(storage.BlockRootHash)
 		cached := s.blocks[key]
@@ -1367,7 +1595,7 @@ func (s *Store) liveBlockHasStateLocked(block ton.BlockIDExt) bool {
 }
 
 func (s *Store) rememberBlockStateLocked(state storage.BlockState) {
-	if !isFullBlockID(&state.Block) {
+	if !blockproof.IsFullBlockID(state.Block) {
 		return
 	}
 	if key, ok := liveBlockLookupKeyFromBlock(state.Block); ok {
@@ -1465,7 +1693,7 @@ func (s *Store) addMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 			startLT: meta.StartLT,
 			endLT:   meta.EndLT,
 			seqno:   meta.ID.SeqNo,
-			block:   *cloneBlockID(meta.ID),
+			block:   cloneBlockID(meta.ID),
 		}
 		entries := s.ltIndex[key]
 		if len(entries) == 0 || entries[len(entries)-1].endLT < entry.endLT || entries[len(entries)-1].endLT == entry.endLT && entries[len(entries)-1].seqno < entry.seqno {
@@ -1485,7 +1713,7 @@ func (s *Store) addMetaHistoryIndexLocked(meta *storage.BlockMeta) {
 		entry := liveUnixIndexEntry{
 			genUTime: meta.GenUTime,
 			seqno:    meta.ID.SeqNo,
-			block:    *cloneBlockID(meta.ID),
+			block:    cloneBlockID(meta.ID),
 		}
 		entries := s.unixIndex[key]
 		if len(entries) == 0 || entries[len(entries)-1].genUTime < entry.genUTime || entries[len(entries)-1].genUTime == entry.genUTime && entries[len(entries)-1].seqno < entry.seqno {
@@ -1615,7 +1843,7 @@ func liveBlockKind(block ton.BlockIDExt) liveBlockCacheKind {
 }
 
 func (s *Store) backingBlockAllowed(block ton.BlockIDExt) bool {
-	if !isFullBlockID(&block) {
+	if !blockproof.IsFullBlockID(block) {
 		return false
 	}
 
@@ -1642,12 +1870,14 @@ func (s *Store) backingSeqnoLookupAllowedLocked(ref storage.BlockSeqRef) bool {
 	}
 
 	if ref.Workchain == masterchainID && ref.Shard == masterchainShard {
-		maxSeqno, ok := maxKnownMasterSeqno(s.current, s.pendingCurrent)
-		return !ok || ref.SeqNo <= maxSeqno
+		return ref.SeqNo <= maxKnownMasterSeqno(s.current, s.pendingCurrent)
 	}
 
-	maxSeqno, ok := maxKnownShardSeqno(ref.HistoryKey(), s.current, s.pendingCurrent)
-	return !ok || ref.SeqNo <= maxSeqno
+	maxSeqno, err := maxKnownShardSeqno(ref.HistoryKey(), s.current, s.pendingCurrent)
+	if errors.Is(err, storage.ErrNotFound) {
+		return true
+	}
+	return ref.SeqNo <= maxSeqno
 }
 
 func (s *Store) currentRefersToBlockLocked(block ton.BlockIDExt) bool {
@@ -1669,25 +1899,23 @@ func currentRefersToBlock(current *storage.CurrentState, block ton.BlockIDExt) b
 	return false
 }
 
-func maxKnownMasterSeqno(states ...*storage.CurrentState) (uint32, bool) {
+func maxKnownMasterSeqno(states ...*storage.CurrentState) uint32 {
 	var max uint32
-	var ok bool
 	for _, current := range states {
 		if current == nil {
 			continue
 		}
 		seqno := current.Masterchain.Block.SeqNo
-		if !ok || seqno > max {
+		if seqno > max {
 			max = seqno
-			ok = true
 		}
 	}
-	return max, ok
+	return max
 }
 
-func maxKnownShardSeqno(key storage.BlockHistoryKey, states ...*storage.CurrentState) (uint32, bool) {
+func maxKnownShardSeqno(key storage.BlockHistoryKey, states ...*storage.CurrentState) (uint32, error) {
 	var max uint32
-	var ok bool
+	found := false
 	for _, current := range states {
 		if current == nil {
 			continue
@@ -1697,13 +1925,16 @@ func maxKnownShardSeqno(key storage.BlockHistoryKey, states ...*storage.CurrentS
 			if shardKey.Workchain != key.Workchain || !blockproof.ShardIntersects(shardKey, storage.ShardKey(key)) {
 				continue
 			}
-			if !ok || shard.Block.SeqNo > max {
+			if !found || shard.Block.SeqNo > max {
 				max = shard.Block.SeqNo
-				ok = true
+				found = true
 			}
 		}
 	}
-	return max, ok
+	if !found {
+		return 0, storage.ErrNotFound
+	}
+	return max, nil
 }
 
 type liveSeqKey struct {

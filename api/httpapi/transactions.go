@@ -174,7 +174,7 @@ func (s *Server) handleBlockTransactionsExt(ctx context.Context, params requestP
 		if apiErr != nil {
 			return nil, apiErr
 		}
-		formatted, err := extTransactionFromTLB(rawTransactionExtType, id.Workchain, tonBlockRef{block: id}, tx, entry.cell)
+		formatted, err := extTransactionFromTLB(rawTransactionExtType, id.Workchain, tx, entry.cell)
 		if err != nil {
 			return nil, internalError("cannot format transaction: " + err.Error())
 		}
@@ -220,13 +220,15 @@ func (s *Server) blockTransactionPage(ctx context.Context, params requestParams)
 		return ton.BlockIDExt{}, 0, blockTxPage{}, apiErr
 	}
 
-	afterLT, hasAfterLT, apiErr := params.optionalUint64("after_lt")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, 0, blockTxPage{}, apiErr
+	afterLT, err := params.optionalUint64("after_lt")
+	hasAfterLT := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, 0, blockTxPage{}, asAPIError(err)
 	}
-	afterHash, hasAfterHash, apiErr := optionalHashParam(params, "after_hash")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, 0, blockTxPage{}, apiErr
+	afterHash, err := optionalHashParam(params, "after_hash")
+	hasAfterHash := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, 0, blockTxPage{}, asAPIError(err)
 	}
 
 	// The after cursor carries no account, so the resume point cannot be sought
@@ -234,7 +236,7 @@ func (s *Server) blockTransactionPage(ctx context.Context, params requestParams)
 	// collecting from the entry right after the match.
 	found := !hasAfterLT && !hasAfterHash
 	page := blockTxPage{entries: make([]blockTxEntry, 0, count)}
-	err := walkBlockTransactions(accounts, func(entry blockTxEntry) (bool, error) {
+	err = walkBlockTransactions(accounts, func(entry blockTxEntry) (bool, error) {
 		if !found {
 			if hasAfterLT && entry.lt != afterLT {
 				return true, nil
@@ -337,7 +339,7 @@ func walkBlockTransactions(accounts *tlb.ShardAccountBlocks, fn func(entry block
 }
 
 func (s *Server) handleTransactions(ctx context.Context, params requestParams) (any, *apiError) {
-	addr, _, _, apiErr := parseStdAddressParam(params, "address")
+	addr, _, apiErr := parseStdAddressParam(params, "address")
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -350,17 +352,20 @@ func (s *Server) handleTransactions(ctx context.Context, params requestParams) (
 		return []extTransaction{}, nil
 	}
 
-	cursorLT, hasLT, apiErr := params.optionalUint64("lt")
-	if apiErr != nil {
-		return nil, apiErr
+	cursorLT, err := params.optionalUint64("lt")
+	hasLT := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
-	cursorHash, hasHash, apiErr := optionalHashParam(params, "hash")
-	if apiErr != nil {
-		return nil, apiErr
+	cursorHash, err := optionalHashParam(params, "hash")
+	hasHash := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
-	toLT, hasToLT, apiErr := params.optionalUint64("to_lt")
-	if apiErr != nil {
-		return nil, apiErr
+	toLT, err := params.optionalUint64("to_lt")
+	hasToLT := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
 	if !hasLT {
 		snapshot, apiErr := s.loadAccountSnapshot(ctx, params)
@@ -392,7 +397,7 @@ func (s *Server) handleTransactions(ctx context.Context, params requestParams) (
 			return nil, validationError("failed to parse request: transaction hash mismatch")
 		}
 
-		formatted, err := extTransactionFromTLB(extTransactionType, addr.Workchain(), tonBlockRef{block: block.id}, tx, txCell)
+		formatted, err := extTransactionFromTLB(extTransactionType, addr.Workchain(), tx, txCell)
 		if err != nil {
 			return nil, internalError("cannot format transaction: " + err.Error())
 		}
@@ -406,7 +411,7 @@ func (s *Server) handleTransactions(ctx context.Context, params requestParams) (
 }
 
 func (s *Server) handleTransactionsStd(ctx context.Context, params requestParams) (any, *apiError) {
-	addr, _, _, apiErr := parseStdAddressParam(params, "address")
+	addr, _, apiErr := parseStdAddressParam(params, "address")
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -416,17 +421,20 @@ func (s *Server) handleTransactionsStd(ctx context.Context, params requestParams
 		return nil, apiErr
 	}
 
-	cursorLT, hasLT, apiErr := params.optionalUint64("lt")
-	if apiErr != nil {
-		return nil, apiErr
+	cursorLT, err := params.optionalUint64("lt")
+	hasLT := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
-	cursorHash, hasHash, apiErr := optionalHashParam(params, "hash")
-	if apiErr != nil {
-		return nil, apiErr
+	cursorHash, err := optionalHashParam(params, "hash")
+	hasHash := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
-	toLT, hasToLT, apiErr := params.optionalUint64("to_lt")
-	if apiErr != nil {
-		return nil, apiErr
+	toLT, err := params.optionalUint64("to_lt")
+	hasToLT := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
 	if !hasLT {
 		snapshot, apiErr := s.loadAccountSnapshot(ctx, params)
@@ -481,14 +489,6 @@ func (s *Server) handleTransactionsStd(ctx context.Context, params requestParams
 	return rawTransactions{Type: rawTransactionsType, Transactions: out, PreviousTransactionID: previous}, nil
 }
 
-func (s *Server) handleTryLocateTx(ctx context.Context, params requestParams) (any, *apiError) {
-	return s.handleTryLocateInboundMessageTransaction(ctx, params)
-}
-
-func (s *Server) handleTryLocateResultTx(ctx context.Context, params requestParams) (any, *apiError) {
-	return s.handleTryLocateInboundMessageTransaction(ctx, params)
-}
-
 func (s *Server) handleTryLocateSourceTx(ctx context.Context, params requestParams) (any, *apiError) {
 	query, apiErr := messageTransactionQueryFromParams(params)
 	if apiErr != nil {
@@ -527,20 +527,20 @@ type locatedMessageTransaction struct {
 }
 
 func messageTransactionQueryFromParams(params requestParams) (messageTransactionQuery, *apiError) {
-	source, _, _, apiErr := parseStdAddressParam(params, "source")
+	source, _, apiErr := parseStdAddressParam(params, "source")
 	if apiErr != nil {
 		return messageTransactionQuery{}, apiErr
 	}
-	destination, _, _, apiErr := parseStdAddressParam(params, "destination")
+	destination, _, apiErr := parseStdAddressParam(params, "destination")
 	if apiErr != nil {
 		return messageTransactionQuery{}, apiErr
 	}
-	createdLT, ok, apiErr := params.optionalUint64("created_lt")
-	if apiErr != nil {
-		return messageTransactionQuery{}, apiErr
-	}
-	if !ok {
+	createdLT, err := params.optionalUint64("created_lt")
+	if errors.Is(err, errRequestParamNotFound) {
 		return messageTransactionQuery{}, validationError("failed to parse request: missing required field \"created_lt\"")
+	}
+	if err != nil {
+		return messageTransactionQuery{}, asAPIError(err)
 	}
 
 	return messageTransactionQuery{source: source, destination: destination, createdLT: createdLT}, nil
@@ -551,8 +551,7 @@ func formatLocatedMessageTransaction(located locatedMessageTransaction) (any, *a
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	formatted, err := extTransactionFromTLB(extTransactionType, located.block.Workchain,
-		tonBlockRef{block: located.block}, tx, located.cell)
+	formatted, err := extTransactionFromTLB(extTransactionType, located.block.Workchain, tx, located.cell)
 	if err != nil {
 		return nil, internalError("cannot format transaction: " + err.Error())
 	}
@@ -753,12 +752,12 @@ func (s *Server) locateInboundMessageTransaction(ctx context.Context, query mess
 }
 
 func blockTransactionCount(params requestParams) (uint32, *apiError) {
-	count, ok, apiErr := params.optionalUint32("count")
-	if apiErr != nil {
-		return 0, apiErr
-	}
-	if !ok {
+	count, err := params.optionalUint32("count")
+	if errors.Is(err, errRequestParamNotFound) {
 		return defaultTxCount, nil
+	}
+	if err != nil {
+		return 0, asAPIError(err)
 	}
 	if count > maxTxCount {
 		return maxTxCount, nil
@@ -767,12 +766,12 @@ func blockTransactionCount(params requestParams) (uint32, *apiError) {
 }
 
 func historyLimit(params requestParams) (int, *apiError) {
-	limit, ok, apiErr := params.optionalUint32("limit")
-	if apiErr != nil {
-		return 0, apiErr
-	}
-	if !ok {
+	limit, err := params.optionalUint32("limit")
+	if errors.Is(err, errRequestParamNotFound) {
 		return defaultHistoryLimit, nil
+	}
+	if err != nil {
+		return 0, asAPIError(err)
 	}
 	if limit > maxHistoryLimit {
 		return maxHistoryLimit, nil
@@ -1062,11 +1061,7 @@ func parseAccountTransaction(txCell *cell.Cell) (*tlb.Transaction, *apiError) {
 	return &tx, nil
 }
 
-type tonBlockRef struct {
-	block ton.BlockIDExt
-}
-
-func extTransactionFromTLB(typeName string, workchain int32, block tonBlockRef, tx *tlb.Transaction, txCell *cell.Cell) (extTransaction, error) {
+func extTransactionFromTLB(typeName string, workchain int32, tx *tlb.Transaction, txCell *cell.Cell) (extTransaction, error) {
 	inboundCell, err := transactionInboundMessageCell(txCell)
 	if err != nil {
 		return extTransaction{}, err
@@ -1529,8 +1524,7 @@ func messageForwardFee(msg *tlb.Message) *big.Int {
 		return total
 	}
 
-	switch typed := msg.Msg.(type) {
-	case *tlb.InternalMessage:
+	if typed, ok := msg.Msg.(*tlb.InternalMessage); ok {
 		total.Add(total, typed.FwdFee.Nano())
 		total.Add(total, typed.IHRFee.Nano())
 	}

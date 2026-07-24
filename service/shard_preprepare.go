@@ -36,7 +36,7 @@ type preparedShardBlockCache struct {
 	inflight map[storage.BlockRootHash]struct{}
 }
 
-func (c *preparedShardBlockCache) take(block ton.BlockIDExt) (PreparedBlock, bool) {
+func (c *preparedShardBlockCache) take(block ton.BlockIDExt) (PreparedBlock, error) {
 	key := storage.BlockKey(block)
 
 	c.mu.Lock()
@@ -44,17 +44,14 @@ func (c *preparedShardBlockCache) take(block ton.BlockIDExt) (PreparedBlock, boo
 
 	entry, ok := c.entries[key]
 	if !ok {
-		return PreparedBlock{}, false
+		return PreparedBlock{}, storage.ErrNotFound
 	}
 	delete(c.entries, key)
 	c.bytes -= entry.bytes
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 	if time.Since(entry.storedAt) > preparedShardBlockTTL {
-		return PreparedBlock{}, false
+		return PreparedBlock{}, storage.ErrNotFound
 	}
-	return entry.block, true
+	return entry.block, nil
 }
 
 // beginPrepare reserves the block for a prepare worker. It returns false when
@@ -142,9 +139,6 @@ func (c *preparedShardBlockCache) pruneLocked(now time.Time) {
 			delete(c.entries, key)
 		}
 	}
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 }
 
 // prepareShardBlockAheadFromVerified prepares an already-verified shard block
@@ -180,7 +174,7 @@ func (s *Service) prepareShardBlockAheadFromVerified(verified VerifiedBlock) {
 // prepareShardBlockAheadByID fetches a shard block (usually a broadcast-cache
 // hit after a description prefetch) and prepares it ahead of apply.
 func (s *Service) prepareShardBlockAheadByID(ctx context.Context, block ton.BlockIDExt) {
-	if block.Workchain == -1 || s.node == nil {
+	if block.Workchain == -1 {
 		return
 	}
 	if !s.preparedShardBlocks.beginPrepare(block) {
@@ -198,9 +192,6 @@ func (s *Service) prepareShardBlockAheadByID(ctx context.Context, block ton.Bloc
 	defer cancel()
 
 	downloaded, err := s.node.DownloadBlockFull(fetchCtx, block)
-	if err == nil && downloaded == nil {
-		err = storage.ErrNotFound
-	}
 	var verified VerifiedBlock
 	if err == nil {
 		verified, err = verifyDownloadedBlock(*downloaded)

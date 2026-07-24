@@ -86,20 +86,28 @@ type accountProofLoadKey struct {
 // concurrently stored value wins. get and put are called with view.mu held;
 // put stores the built value or adopts an existing one and returns the
 // canonical value. build runs without the lock.
-func lazyLoadFragment[K comparable, V any](view *BlockView, group *liveLoadGroup[K, V], key K, get func() (V, bool), put func(V) V, build func() (V, error)) (V, error) {
+func lazyLoadFragment[K comparable, V any](view *BlockView, group *liveLoadGroup[K, V], key K, get func() (V, error), put func(V) V, build func() (V, error)) (V, error) {
 	view.mu.Lock()
-	cached, ok := get()
+	cached, err := get()
 	view.mu.Unlock()
-	if ok {
+	if err == nil {
 		return cached, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		var zero V
+		return zero, err
 	}
 
 	value, err := group.do(context.Background(), key, func() (V, error) {
 		view.mu.Lock()
-		cached, ok := get()
+		cached, err := get()
 		view.mu.Unlock()
-		if ok {
+		if err == nil {
 			return cached, nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			var zero V
+			return zero, err
 		}
 
 		built, err := build()
@@ -120,7 +128,7 @@ func lazyLoadFragment[K comparable, V any](view *BlockView, group *liveLoadGroup
 	return value, nil
 }
 
-func buildBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
+func NewBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
 	blockProof, err := blockproof.BlockStateRootProof(blockRoot)
 	if err != nil {
 		return nil, fmt.Errorf("build block state root proof: %w", err)
@@ -133,7 +141,7 @@ func buildBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.
 		return nil, fmt.Errorf("load accounts dict root: %w", err)
 	}
 	if accountsRoot != nil && block.Workchain != masterchainID {
-		accountsRoot, err = prewarmCachedCell(accountsRoot, liveAccountsRootPrewarmDepth)
+		accountsRoot, err = accountsRoot.PrewarmRecursive(liveAccountsRootPrewarmDepth)
 		if err != nil {
 			return nil, fmt.Errorf("prewarm accounts dict root: %w", err)
 		}
@@ -145,7 +153,7 @@ func buildBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.
 	}
 
 	return &BlockView{
-		block:               *cloneBlockID(block),
+		block:               cloneBlockID(block),
 		stateRoot:           stateRoot,
 		blockStateRootProof: blockProof,
 		accountsRoot:        accountsRoot,
@@ -163,10 +171,6 @@ func (f *BlockView) releaseCurrentCaches() {
 	f.mu.Unlock()
 }
 
-func NewBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*BlockView, error) {
-	return buildBlockView(block, blockRoot, stateRoot)
-}
-
 func (f *BlockView) prewarmHotPath() {
 	if f.block.Workchain != masterchainID {
 		return
@@ -175,11 +179,11 @@ func (f *BlockView) prewarmHotPath() {
 	// Master config and global libraries are runMethod hot-path data. Prewarm is
 	// opportunistic because publish accepts hash-valid partial artifacts as well.
 	_, _ = f.runMethodBaseConfig()
-	_, _ = f.globalLibraries()
+	_, _ = f.GlobalLibraries()
 }
 
 func (f *BlockView) Block() ton.BlockIDExt {
-	return *cloneBlockID(f.block)
+	return cloneBlockID(f.block)
 }
 
 func (f *BlockView) StateRoot() *cell.Cell {
@@ -194,30 +198,6 @@ func (f *BlockView) Header() RunMethodShardHeader {
 	return f.shardHeader
 }
 
-func (f *BlockView) AccountCell(accountID []byte) (*cell.Cell, error) {
-	return f.accountCell(accountID)
-}
-
-func (f *BlockView) AccountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
-	return f.accountProof(accountID, pruned)
-}
-
-func (f *BlockView) McStateExtra() (*tlb.McStateExtra, error) {
-	return f.mcStateExtra()
-}
-
-func (f *BlockView) ShardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
-	return f.shardHashesProof(workchain, shard, exact)
-}
-
-func (f *BlockView) RunMethodConfig(now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
-	return f.runMethodConfig(now, code)
-}
-
-func (f *BlockView) RunMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Cell, error) {
-	return f.runMethodLibraries(accountLibs)
-}
-
 // BlockContext builds an immutable tvm execution context for this block's
 // master config epoch: the prepared blockchain config, prev-blocks tuple and the global
 // libraries. Account-scoped libraries come from the prepared account, so only
@@ -228,7 +208,7 @@ func (f *BlockView) BlockContext(now uint32, blockLT uint64) (*tvm.BlockContext,
 	if err != nil {
 		return nil, err
 	}
-	libraries, err := f.runMethodLibraries(nil)
+	libraries, err := f.RunMethodLibraries(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -240,15 +220,11 @@ func (f *BlockView) BlockContext(now uint32, blockLT uint64) (*tvm.BlockContext,
 	})
 }
 
-func (f *BlockView) GlobalLibraries() (*cell.Dictionary, error) {
-	return f.globalLibraries()
-}
-
-func (f *BlockView) accountCell(accountID []byte) (*cell.Cell, error) {
+func (f *BlockView) AccountCell(accountID []byte) (*cell.Cell, error) {
 	return accountCellFromAccountsRoot(f.accountsRoot, accountID)
 }
 
-func (f *BlockView) accountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
+func (f *BlockView) AccountProof(accountID []byte, pruned bool) ([]*cell.Cell, *cell.Cell, error) {
 	var key accountProofKey
 	if len(accountID) == len(key.accountID) {
 		copy(key.accountID[:], accountID)
@@ -272,7 +248,7 @@ func (f *BlockView) accountProof(accountID []byte, pruned bool) ([]*cell.Cell, *
 func (f *BlockView) accountFullProof(accountID []byte, key accountProofKey) ([]*cell.Cell, *cell.Cell, error) {
 	result, err := lazyLoadFragment(f, &f.accountProofLoad,
 		accountProofLoadKey{account: key},
-		func() (accountProofResult, bool) { return f.cachedAccountProofResultLocked(key, false) },
+		func() (accountProofResult, error) { return f.cachedAccountProofResultLocked(key, false) },
 		func(result accountProofResult) accountProofResult {
 			return f.rememberAccountProofStateLocked(key, result.proof, result.state, false)
 		},
@@ -293,7 +269,7 @@ func (f *BlockView) accountFullProof(accountID []byte, key accountProofKey) ([]*
 func (f *BlockView) accountPrunedState(key accountProofKey, proof []*cell.Cell, fullState *cell.Cell) (*cell.Cell, error) {
 	result, err := lazyLoadFragment(f, &f.accountProofLoad,
 		accountProofLoadKey{account: key, pruned: true},
-		func() (accountProofResult, bool) { return f.cachedAccountProofResultLocked(key, true) },
+		func() (accountProofResult, error) { return f.cachedAccountProofResultLocked(key, true) },
 		func(result accountProofResult) accountProofResult {
 			return f.rememberAccountProofStateLocked(key, result.proof, result.state, true)
 		},
@@ -315,21 +291,21 @@ func (f *BlockView) accountPrunedState(key accountProofKey, proof []*cell.Cell, 
 	return result.state, nil
 }
 
-func (f *BlockView) cachedAccountProofResultLocked(key accountProofKey, pruned bool) (accountProofResult, bool) {
+func (f *BlockView) cachedAccountProofResultLocked(key accountProofKey, pruned bool) (accountProofResult, error) {
 	cached, ok := f.accountProofs[key]
 	if !ok || cached.proof == nil {
-		return accountProofResult{}, false
+		return accountProofResult{}, storage.ErrNotFound
 	}
 	if pruned {
 		if !cached.prunedStateLoaded {
-			return accountProofResult{}, false
+			return accountProofResult{}, storage.ErrNotFound
 		}
-		return accountProofResult{proof: cached.proof, state: cached.prunedState}, true
+		return accountProofResult{proof: cached.proof, state: cached.prunedState}, nil
 	}
 	if !cached.fullStateLoaded {
-		return accountProofResult{}, false
+		return accountProofResult{}, storage.ErrNotFound
 	}
-	return accountProofResult{proof: cached.proof, state: cached.fullState}, true
+	return accountProofResult{proof: cached.proof, state: cached.fullState}, nil
 }
 
 // rememberAccountProofStateLocked publishes a built proof/state pair, adopting
@@ -389,9 +365,14 @@ func (f *BlockView) buildAccountProof(accountID []byte, pruned bool) ([]*cell.Ce
 	return []*cell.Cell{f.blockStateRootProof, stateProof}, state, nil
 }
 
-func (f *BlockView) mcStateExtra() (*tlb.McStateExtra, error) {
+func (f *BlockView) McStateExtra() (*tlb.McStateExtra, error) {
 	return lazyLoadFragment(f, &f.mcExtraLoad, struct{}{},
-		func() (*tlb.McStateExtra, bool) { return f.masterExtra, f.masterExtra != nil },
+		func() (*tlb.McStateExtra, error) {
+			if f.masterExtra == nil {
+				return nil, storage.ErrNotFound
+			}
+			return f.masterExtra, nil
+		},
 		func(extra *tlb.McStateExtra) *tlb.McStateExtra {
 			if f.masterExtra == nil {
 				f.masterExtra = extra
@@ -408,12 +389,15 @@ func (f *BlockView) mcStateExtra() (*tlb.McStateExtra, error) {
 	)
 }
 
-func (f *BlockView) shardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
+func (f *BlockView) ShardHashesProof(workchain int32, shard int64, exact bool) (*cell.Cell, error) {
 	key := shardHashesProofKey{workchain: workchain, shard: shard, exact: exact}
 	return lazyLoadFragment(f, &f.shardHashesLoad, key,
-		func() (*cell.Cell, bool) {
+		func() (*cell.Cell, error) {
 			proof := f.shardHashesProofs[key]
-			return proof, proof != nil
+			if proof == nil {
+				return nil, storage.ErrNotFound
+			}
+			return proof, nil
 		},
 		func(proof *cell.Cell) *cell.Cell {
 			if !f.retainCurrentCaches {
@@ -440,7 +424,7 @@ func (f *BlockView) shardHashesProof(workchain int32, shard int64, exact bool) (
 	)
 }
 
-func (f *BlockView) runMethodConfig(now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
+func (f *BlockView) RunMethodConfig(now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
 	base, err := f.runMethodBaseConfig()
 	if err != nil {
 		return RunMethodConfigInfo{}, err
@@ -450,7 +434,12 @@ func (f *BlockView) runMethodConfig(now uint32, code *cell.Cell) (RunMethodConfi
 
 func (f *BlockView) runMethodBaseConfig() (*runMethodBaseConfig, error) {
 	return lazyLoadFragment(f, &f.baseConfigLoad, struct{}{},
-		func() (*runMethodBaseConfig, bool) { return f.baseConfig, f.baseConfig != nil },
+		func() (*runMethodBaseConfig, error) {
+			if f.baseConfig == nil {
+				return nil, storage.ErrNotFound
+			}
+			return f.baseConfig, nil
+		},
 		func(config *runMethodBaseConfig) *runMethodBaseConfig {
 			if f.baseConfig == nil {
 				f.baseConfig = config
@@ -458,7 +447,7 @@ func (f *BlockView) runMethodBaseConfig() (*runMethodBaseConfig, error) {
 			return f.baseConfig
 		},
 		func() (*runMethodBaseConfig, error) {
-			extra, err := f.mcStateExtra()
+			extra, err := f.McStateExtra()
 			if err != nil {
 				return nil, err
 			}
@@ -467,17 +456,22 @@ func (f *BlockView) runMethodBaseConfig() (*runMethodBaseConfig, error) {
 	)
 }
 
-func (f *BlockView) runMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Cell, error) {
-	globalLibs, err := f.globalLibraries()
+func (f *BlockView) RunMethodLibraries(accountLibs *cell.Dictionary) ([]*cell.Cell, error) {
+	globalLibs, err := f.GlobalLibraries()
 	if err != nil {
 		return nil, err
 	}
 	return runMethodLibrariesFromGlobal(globalLibs, accountLibs), nil
 }
 
-func (f *BlockView) globalLibraries() (*cell.Dictionary, error) {
+func (f *BlockView) GlobalLibraries() (*cell.Dictionary, error) {
 	return lazyLoadFragment(f, &f.globalLibsLoad, struct{}{},
-		func() (*cell.Dictionary, bool) { return f.globalLibs, f.librariesLoaded },
+		func() (*cell.Dictionary, error) {
+			if !f.librariesLoaded {
+				return nil, storage.ErrNotFound
+			}
+			return f.globalLibs, nil
+		},
 		func(globalLibs *cell.Dictionary) *cell.Dictionary {
 			if !f.librariesLoaded {
 				f.globalLibs = globalLibs
@@ -498,7 +492,7 @@ func (f *BlockView) globalLibraries() (*cell.Dictionary, error) {
 func prewarmMcStateExtra(extra *tlb.McStateExtra) (*tlb.McStateExtra, error) {
 	var err error
 	if extra.Info != nil {
-		extra.Info, err = prewarmCachedCell(extra.Info, liveMasterInfoPrewarmDepth)
+		extra.Info, err = extra.Info.PrewarmRecursive(liveMasterInfoPrewarmDepth)
 		if err != nil {
 			return nil, err
 		}
@@ -516,16 +510,9 @@ func prewarmCachedDict(dict *cell.Dictionary, keySize uint, depth int) (*cell.Di
 		return dict, nil
 	}
 
-	root, err := prewarmCachedCell(dict.AsCell(), depth)
+	root, err := dict.AsCell().PrewarmRecursive(depth)
 	if err != nil {
 		return nil, err
 	}
 	return root.AsDict(keySize), nil
-}
-
-func prewarmCachedCell(root *cell.Cell, depth int) (*cell.Cell, error) {
-	if root == nil {
-		return nil, nil
-	}
-	return root.PrewarmRecursive(depth)
 }

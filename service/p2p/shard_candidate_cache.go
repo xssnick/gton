@@ -74,9 +74,6 @@ func newShardBlockCandidateCache(ttl time.Duration, maxBytes int64, maxItems int
 }
 
 func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, now time.Time) ([]DownloadedBlock, error) {
-	if err := validateShardBlockCandidate(downloaded); err != nil {
-		return nil, err
-	}
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return nil, fmt.Errorf("shard block candidate cache is disabled")
 	}
@@ -89,7 +86,7 @@ func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, no
 		bytes:      shardBlockCandidateBytes(downloaded),
 	}
 	if entry.bytes > c.maxBytes {
-		return nil, fmt.Errorf("block candidate %s is too large for shard block candidate cache: %d > %d", formatBlockRef(downloaded.ID), entry.bytes, c.maxBytes)
+		return nil, fmt.Errorf("block candidate %s is too large for shard block candidate cache: %d > %d", tnstore.FormatBlockRef(downloaded.ID), entry.bytes, c.maxBytes)
 	}
 
 	c.mu.Lock()
@@ -138,7 +135,7 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 			bytes:      shardDescriptionProofBytes(proof),
 		}
 		if entry.bytes > c.maxBytes {
-			return nil, fmt.Errorf("shard description proof %s is too large for shard block candidate cache: %d > %d", formatBlockRef(proof.Block), entry.bytes, c.maxBytes)
+			return nil, fmt.Errorf("shard description proof %s is too large for shard block candidate cache: %d > %d", tnstore.FormatBlockRef(proof.Block), entry.bytes, c.maxBytes)
 		}
 		entries = append(entries, entry)
 	}
@@ -176,7 +173,7 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 
 func (c *shardBlockCandidateCache) assembleLocked(candidate shardBlockCandidateEntry, proof shardDescriptionProofEntry) ([]DownloadedBlock, error) {
 	if !candidate.block.id.Equals(&proof.block) {
-		return nil, fmt.Errorf("shard candidate %s proof belongs to %s", formatBlockRef(candidate.block.id), formatBlockRef(proof.block))
+		return nil, fmt.Errorf("shard candidate %s proof belongs to %s", tnstore.FormatBlockRef(candidate.block.id), tnstore.FormatBlockRef(proof.block))
 	}
 	if err := blockproof.CheckProofShape(proof.block, proof.proof, true); err != nil {
 		return nil, err
@@ -238,37 +235,15 @@ func (c *shardBlockCandidateCache) pruneOverflowLocked() {
 	}
 }
 
-func validateShardBlockCandidate(downloaded DownloadedBlock) error {
-	if isMasterchainBlock(downloaded.ID) {
-		return fmt.Errorf("masterchain block %s is not a shard candidate cache candidate", formatBlockRef(downloaded.ID))
-	}
-	if !downloaded.VerifiedRootHash {
-		return fmt.Errorf("block candidate %s is not hash verified", formatBlockRef(downloaded.ID))
-	}
-	if len(downloaded.BlockBOC) == 0 {
-		return fmt.Errorf("block candidate %s has empty block data", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Block == nil {
-		return fmt.Errorf("block candidate %s has no parsed block root", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Meta == nil {
-		return fmt.Errorf("block candidate %s has no metadata", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.StateUpdate == nil {
-		return fmt.Errorf("block candidate %s has no state update", formatBlockRef(downloaded.ID))
-	}
-	return nil
-}
-
 func validateShardDescriptionProof(proof ShardDescriptionProof) error {
 	if isMasterchainBlock(proof.Block) {
-		return fmt.Errorf("masterchain block %s is not a shard description proof candidate", formatBlockRef(proof.Block))
+		return fmt.Errorf("masterchain block %s is not a shard description proof candidate", tnstore.FormatBlockRef(proof.Block))
 	}
 	if proof.Proof == nil {
-		return fmt.Errorf("shard description proof %s has no parsed proof", formatBlockRef(proof.Block))
+		return fmt.Errorf("shard description proof %s has no parsed proof", tnstore.FormatBlockRef(proof.Block))
 	}
 	if len(proof.ProofBOC) == 0 {
-		return fmt.Errorf("shard description proof %s has empty proof data", formatBlockRef(proof.Block))
+		return fmt.Errorf("shard description proof %s has empty proof data", tnstore.FormatBlockRef(proof.Block))
 	}
 	if err := blockproof.CheckProofShape(proof.Block, proof.Proof, true); err != nil {
 		return err
@@ -314,7 +289,7 @@ func shardDescriptionProofBytes(proof ShardDescriptionProof) int64 {
 }
 
 func (n *Node) rememberShardBlockCandidate(downloaded *DownloadedBlock) {
-	if downloaded == nil || isMasterchainBlock(downloaded.ID) {
+	if isMasterchainBlock(downloaded.ID) {
 		return
 	}
 
@@ -322,7 +297,7 @@ func (n *Node) rememberShardBlockCandidate(downloaded *DownloadedBlock) {
 	if err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(downloaded.ID)).
+			Str("block", tnstore.FormatBlockRef(downloaded.ID)).
 			Msg("failed to cache shard block candidate broadcast")
 		return
 	}

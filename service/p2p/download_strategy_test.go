@@ -976,7 +976,7 @@ func TestDownloadNextBlockFullUsesLiveCacheBeforeOverlay(t *testing.T) {
 		t.Fatalf("next block description from live cache: %v", err)
 	}
 	if !desc.Equals(&next) {
-		t.Fatalf("unexpected next description: got=%s want=%s", formatBlockRef(desc), formatBlockRef(next))
+		t.Fatalf("unexpected next description: got=%s want=%s", storage.FormatBlockRef(desc), storage.FormatBlockRef(next))
 	}
 
 	got, err := node.DownloadNextBlockFull(context.Background(), prev)

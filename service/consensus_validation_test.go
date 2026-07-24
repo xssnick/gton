@@ -21,7 +21,7 @@ func TestMasterchainValidatorCacheResetsByPrevKeyBlock(t *testing.T) {
 	firstValidators := &blockproof.PreparedValidatorSet{}
 	cache.put(firstKey, firstValidators)
 
-	if validators, ok := cache.get(firstKey); !ok || validators != firstValidators {
+	if validators, err := cache.get(firstKey); err != nil || validators != firstValidators {
 		t.Fatal("expected validator cache hit before epoch reset")
 	}
 
@@ -29,10 +29,10 @@ func TestMasterchainValidatorCacheResetsByPrevKeyBlock(t *testing.T) {
 	secondValidators := &blockproof.PreparedValidatorSet{}
 	cache.put(secondKey, secondValidators)
 
-	if _, ok := cache.get(firstKey); ok {
+	if _, err := cache.get(firstKey); err == nil {
 		t.Fatal("expected validator cache miss after prev key block changed")
 	}
-	if validators, ok := cache.get(secondKey); !ok || validators != secondValidators {
+	if validators, err := cache.get(secondKey); err != nil || validators != secondValidators {
 		t.Fatal("expected validator cache hit for the new epoch")
 	}
 }
@@ -48,10 +48,10 @@ func TestMasterchainValidatorCacheKeepsEpochVariants(t *testing.T) {
 	cache.put(firstKey, firstValidators)
 	cache.put(secondKey, secondValidators)
 
-	if validators, ok := cache.get(firstKey); !ok || validators != firstValidators {
+	if validators, err := cache.get(firstKey); err != nil || validators != firstValidators {
 		t.Fatal("expected first validator set to stay cached inside the epoch")
 	}
-	if validators, ok := cache.get(secondKey); !ok || validators != secondValidators {
+	if validators, err := cache.get(secondKey); err != nil || validators != secondValidators {
 		t.Fatal("expected second validator set to stay cached inside the epoch")
 	}
 }
@@ -68,7 +68,7 @@ func TestMasterchainValidatorCacheReusesPreparedSet(t *testing.T) {
 	if cached := cache.put(key, replacement); cached != prepared {
 		t.Fatal("expected repeated put to reuse the cached prepared validator set")
 	}
-	if cached, ok := cache.get(key); !ok || cached != prepared {
+	if cached, err := cache.get(key); err != nil || cached != prepared {
 		t.Fatal("expected cache hit to return the original prepared validator set")
 	}
 }
@@ -85,8 +85,8 @@ func BenchmarkMasterchainValidatorCacheHit(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		cached, ok := cache.get(key)
-		if !ok || cached != prepared {
+		cached, err := cache.get(key)
+		if err != nil || cached != prepared {
 			b.Fatal("cache miss")
 		}
 	}

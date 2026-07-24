@@ -11,25 +11,11 @@ type liveBlockPublishOptions struct {
 }
 
 func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState, options liveBlockPublishOptions) {
-	if downloaded.BlockRoot == nil {
-		s.log.Debug().
-			Str("block", downloaded.BlockRef()).
-			Msg("skip live block cache update")
-		return
-	}
-
-	var blockData []byte
-	if len(downloaded.BlockBOC) > 0 {
-		blockData = downloaded.BlockBOC
-	}
+	blockData := downloaded.BlockBOC
 
 	var proofs []storage.LiveBlockProofArtifact
 	if len(downloaded.ProofBOC) > 0 {
-		isKeyBlock := false
-		if downloaded.Meta != nil {
-			isKeyBlock = downloaded.Meta.Has(storage.BlockMetaIsKeyBlock)
-		}
-		for _, kind := range storage.StoredProofKindsForServedBlock(downloaded.ID, downloaded.IsLink, isKeyBlock) {
+		for _, kind := range storage.StoredProofKindsForServedBlock(downloaded.ID, downloaded.IsLink, downloaded.Meta.Has(storage.BlockMetaIsKeyBlock)) {
 			proofs = append(proofs, storage.LiveBlockProofArtifact{
 				Kind: kind,
 				Data: downloaded.ProofBOC,
@@ -78,7 +64,7 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 }
 
 func (s *Service) publishLiveCurrentBlockMarkers(current *storage.CurrentState) {
-	if s.liveState == nil || current == nil {
+	if s.liveState == nil {
 		return
 	}
 
@@ -114,14 +100,7 @@ func (s *Service) publishLiveCurrentBlockMarkers(current *storage.CurrentState) 
 }
 
 func liveBlockArtifactMeta(block ton.BlockIDExt, meta *storage.BlockMeta, blockData []byte, proofs []storage.LiveBlockProofArtifact) *storage.BlockMeta {
-	if meta == nil && len(blockData) == 0 && len(proofs) == 0 {
-		return nil
-	}
-
 	cloned := meta.Clone()
-	if cloned == nil {
-		cloned = &storage.BlockMeta{ID: block}
-	}
 	cloned.ID = block
 	if len(blockData) > 0 {
 		cloned.Mark(storage.BlockMetaHasBlockData)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -117,7 +118,7 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 }
 
 func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
-	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: blocks, ShardBlockCache: blocks})
+	live := NewLiveStore(&fakeStore{}, liveview.Options{MasterBlockCache: blocks, ShardBlockCache: blocks})
 
 	for i := 0; i < blocks; i++ {
 		// Root hashes must be unique per block: the live store keys blocks by
@@ -154,7 +155,7 @@ func benchmarkLiveStoreWithIndexes(blocks int) *LiveStore {
 func benchmarkLiveStoreWithCurrent(tb testing.TB, shards int) (*LiveStore, *storage.CurrentState, ton.BlockIDExt) {
 	tb.Helper()
 
-	live := NewLiveStore(&fakeStore{}, LiveStoreOptions{MasterBlockCache: 8, ShardBlockCache: shards + 8})
+	live := NewLiveStore(&fakeStore{}, liveview.Options{MasterBlockCache: 8, ShardBlockCache: shards + 8})
 	masterState, masterRoot := benchmarkBlockState(tb, masterchainID, masterchainShard, 1000)
 	current := &storage.CurrentState{
 		Masterchain: masterState,

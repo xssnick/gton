@@ -72,7 +72,7 @@ func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *s
 	if current.Masterchain.Block.SeqNo != current.ShardClientSeqno {
 		return nil, fmt.Errorf("current masterchain seqno %d differs from shard client seqno %d", current.Masterchain.Block.SeqNo, current.ShardClientSeqno)
 	}
-	if err := s.waitSyncDiskSpace(ctx, "archive_catchup"); err != nil {
+	if err := s.waitSyncDiskSpace(ctx, "archive_catchup", statFSSyncDiskSpace, syncDiskSpaceRetryDelay); err != nil {
 		return nil, err
 	}
 
@@ -100,10 +100,8 @@ func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *s
 
 func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	s := r.service
-	if r.archiveSession == nil && s.node != nil {
-		r.archiveSession = s.node.BeginArchiveSession()
-		defer r.archiveSession.Close()
-	}
+	r.archiveSession = s.node.BeginArchiveSession()
+	defer r.archiveSession.Close()
 
 	s.log.Info().
 		Str("from", storage.FormatBlockRef(r.current.Masterchain.Block)).
@@ -114,9 +112,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 
 	r.pipeline = r.startShardClientArchiveWindowPipeline()
 	defer func() {
-		if r.pipeline != nil {
-			r.pipeline.cancel()
-		}
+		r.pipeline.cancel()
 	}()
 
 	handoffToNext := false
@@ -215,7 +211,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 					Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 					Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 					Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-					Uint64("checkpoint_target_bytes", s.checkpointBytesTarget()).
+					Uint64("checkpoint_target_bytes", s.checkpointBytes).
 					Bool("checkpoint_in_flight", r.checkpointDone != nil).
 					Msg("persisting archive shard-client checkpoint before cell generation switch")
 				if _, err = r.persistCheckpoint("cell_generation_switch"); err != nil {
@@ -229,7 +225,8 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 				Msg("yielding archive shard-client catch-up for cell generation switch")
 			break
 		}
-		if lagSeconds, ok := r.archiveLiveTailLagSeconds(); ok && shouldSwitchArchiveToNextByLag(lagSeconds) {
+		blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
+		if lagSeconds := time.Now().Unix() - blockUTime; blockUTime != 0 && shouldSwitchArchiveToNextByLag(lagSeconds) {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
 				s.log.Info().
 					Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
@@ -238,7 +235,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 					Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 					Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 					Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-					Uint64("checkpoint_target_bytes", s.checkpointBytesTarget()).
+					Uint64("checkpoint_target_bytes", s.checkpointBytes).
 					Uint32("checkpoint_backpressure_blocks", r.archiveCheckpointBackpressureBlocks()).
 					Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 					Bool("checkpoint_in_flight", r.checkpointDone != nil).
@@ -260,7 +257,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			break
 		}
 		if r.checkpointDone == nil && s.shouldPersistArchiveCatchUpCheckpoint(r.current.ShardClientSeqno, r.target.SeqNo, r.lastCheckpointSeqno, r.lastCheckpoint, r.checkpointBlocksTarget, r.pendingArchiveCheckpointBytes()) {
-			if _, err = r.startCheckpoint("interval"); err != nil {
+			if err = r.startCheckpoint("interval"); err != nil {
 				return nil, err
 			}
 		}
@@ -274,7 +271,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 				Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 				Uint64("pending_checkpoint_bytes", pendingBytes).
 				Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-				Uint64("checkpoint_target_bytes", s.checkpointBytesTarget()).
+				Uint64("checkpoint_target_bytes", s.checkpointBytes).
 				Uint32("checkpoint_backpressure_blocks", backpressureBlocks).
 				Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 				Bool("checkpoint_in_flight", r.checkpointDone != nil).
@@ -300,7 +297,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 			Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 			Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 			Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-			Uint64("checkpoint_target_bytes", s.checkpointBytesTarget()).
+			Uint64("checkpoint_target_bytes", s.checkpointBytes).
 			Uint32("checkpoint_backpressure_blocks", r.archiveCheckpointBackpressureBlocks()).
 			Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 			Bool("checkpoint_in_flight", r.checkpointDone != nil).
@@ -326,12 +323,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 }
 
 func (r *archiveCatchUpRunner) dropArchiveWindowImportCache(window *shardClientArchiveWindow) {
-	if window == nil {
-		return
-	}
 	for _, imported := range window.archiveImports {
-		if imported != nil {
-			r.importCache.drop(imported.cacheKey)
-		}
+		r.importCache.drop(imported.cacheKey)
 	}
 }

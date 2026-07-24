@@ -172,10 +172,6 @@ func (c *cellStore) close() error {
 }
 
 func (c *cellStore) closeWithLogger(logger zerolog.Logger) error {
-	if c == nil {
-		return nil
-	}
-
 	started := time.Now()
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
@@ -189,40 +185,22 @@ func (c *cellStore) closeWithLogger(logger zerolog.Logger) error {
 	<-c.drained
 	c.closed = true
 
-	var err error
-	for i, shard := range c.shards {
-		if shard == nil {
-			continue
-		}
-		if shard.db != nil {
-			shardStarted := time.Now()
-			logger.Info().Int("shard", i).Msg("closing celldb shard")
-			err = errors.Join(err, shard.db.Close())
-			logger.Info().
-				Int("shard", i).
-				Dur("elapsed", time.Since(shardStarted)).
-				Msg("closed celldb shard")
-		}
-		c.shards[i] = nil
-	}
-	if c.fileCache != nil {
-		stageStarted := time.Now()
-		logger.Info().Msg("closing celldb file cache")
-		c.fileCache.Unref()
-		c.fileCache = nil
-		logger.Info().
-			Dur("elapsed", time.Since(stageStarted)).
-			Msg("closed celldb file cache")
-	}
-	if c.cache != nil {
-		stageStarted := time.Now()
-		logger.Info().Msg("closing celldb cache")
-		c.cache.Unref()
-		c.cache = nil
-		logger.Info().
-			Dur("elapsed", time.Since(stageStarted)).
-			Msg("closed celldb cache")
-	}
+	err := c.closeShards(logger)
+	stageStarted := time.Now()
+	logger.Info().Msg("closing celldb file cache")
+	c.fileCache.Unref()
+	c.fileCache = nil
+	logger.Info().
+		Dur("elapsed", time.Since(stageStarted)).
+		Msg("closed celldb file cache")
+
+	stageStarted = time.Now()
+	logger.Info().Msg("closing celldb cache")
+	c.cache.Unref()
+	c.cache = nil
+	logger.Info().
+		Dur("elapsed", time.Since(stageStarted)).
+		Msg("closed celldb cache")
 	logger.Debug().
 		Dur("elapsed", time.Since(started)).
 		Msg("closed celldb store")
@@ -230,10 +208,6 @@ func (c *cellStore) closeWithLogger(logger zerolog.Logger) error {
 }
 
 func (c *cellStore) closeAggressively() error {
-	if c == nil {
-		return nil
-	}
-
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
 	if c.closed {
@@ -251,31 +225,41 @@ func (c *cellStore) closeAggressively() error {
 	timer.Stop()
 	c.closed = true
 
-	var err error
+	err := c.closeShards(zerolog.Nop())
+	c.fileCache.Unref()
+	c.fileCache = nil
+	c.cache.Unref()
+	c.cache = nil
+	return err
+}
+
+func (c *cellStore) closeShards(logger zerolog.Logger) error {
+	var wg sync.WaitGroup
+	var errs [cellDBShardCount]error
 	for i, shard := range c.shards {
 		if shard == nil {
 			continue
 		}
-		if shard.db != nil {
-			err = errors.Join(err, shard.db.Close())
-		}
+
+		wg.Go(func() {
+			shardStarted := time.Now()
+			logger.Info().Int("shard", i).Msg("closing celldb shard")
+			errs[i] = shard.db.Close()
+			logger.Info().
+				Int("shard", i).
+				Dur("elapsed", time.Since(shardStarted)).
+				Msg("closed celldb shard")
+		})
+	}
+	wg.Wait()
+
+	for i := range c.shards {
 		c.shards[i] = nil
 	}
-	if c.fileCache != nil {
-		c.fileCache.Unref()
-		c.fileCache = nil
-	}
-	if c.cache != nil {
-		c.cache.Unref()
-		c.cache = nil
-	}
-	return err
+	return errors.Join(errs[:]...)
 }
 
 func (c *cellStore) acquire() error {
-	if c == nil {
-		return errPebbleClosed
-	}
 	if c.closing.Load() {
 		return errPebbleClosed
 	}
@@ -288,9 +272,6 @@ func (c *cellStore) acquire() error {
 }
 
 func (c *cellStore) release() {
-	if c == nil {
-		return
-	}
 	if c.refs.Add(-1) == 0 && c.closing.Load() {
 		c.signalDrained()
 	}
@@ -303,9 +284,6 @@ func (c *cellStore) signalDrained() {
 }
 
 func (c *cellStore) throttleCompactions() func() {
-	if c == nil || c.compactions == nil {
-		return func() {}
-	}
 	return c.compactions.beginForegroundRead()
 }
 
@@ -320,7 +298,7 @@ func (c *cellStore) shardForHash(hash []byte) (int, *cellDBShard, error) {
 	}
 	idx := int(hash[0] >> 5)
 	shard := c.shards[idx]
-	if shard == nil || shard.db == nil {
+	if shard == nil {
 		return 0, nil, errPebbleClosed
 	}
 	return idx, shard, nil
@@ -355,10 +333,6 @@ func (c *cellStore) newBatchWriter(shardBatchInitialSize int) *cellBatchWriter {
 }
 
 func (c *cellStore) flush() error {
-	if c == nil {
-		return errPebbleClosed
-	}
-
 	c.mu.Lock()
 	dirty := c.dirty
 	for i := range c.dirty {
@@ -391,10 +365,6 @@ func (c *cellStore) flush() error {
 }
 
 func (c *cellStore) dirtyShardsSnapshot() []int {
-	if c == nil {
-		return nil
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -408,7 +378,7 @@ func (c *cellStore) dirtyShardsSnapshot() []int {
 }
 
 func (c *cellStore) markDirty(idx int) {
-	if c == nil || idx < 0 || idx >= len(c.dirty) {
+	if idx < 0 || idx >= len(c.dirty) {
 		return
 	}
 	c.mu.Lock()
@@ -418,12 +388,8 @@ func (c *cellStore) markDirty(idx int) {
 
 func (c *cellStore) metrics() cellStoreMetrics {
 	var metrics cellStoreMetrics
-	if c == nil {
-		return metrics
-	}
-
 	for _, shard := range c.shards {
-		if shard == nil || shard.db == nil {
+		if shard == nil {
 			continue
 		}
 		dbMetrics := shard.db.Metrics()
@@ -441,14 +407,14 @@ func (c *cellStore) metrics() cellStoreMetrics {
 }
 
 func (c *cellStore) addReadCells(shard int, count uint64) {
-	if c == nil || count == 0 || shard < 0 || shard >= cellDBShardCount {
+	if count == 0 || shard < 0 || shard >= cellDBShardCount {
 		return
 	}
 	c.io.readCells[shard].Add(count)
 }
 
 func (c *cellStore) addWrittenCells(shard int, count uint64) {
-	if c == nil || count == 0 || shard < 0 || shard >= cellDBShardCount {
+	if count == 0 || shard < 0 || shard >= cellDBShardCount {
 		return
 	}
 	c.io.writtenCells[shard].Add(count)
@@ -456,10 +422,6 @@ func (c *cellStore) addWrittenCells(shard int, count uint64) {
 
 func (c *cellStore) ioStatus(now time.Time) [cellDBShardCount]cellStoreIOStatus {
 	var status [cellDBShardCount]cellStoreIOStatus
-	if c == nil {
-		return status
-	}
-
 	for i := range status {
 		status[i].readCells = c.io.readCells[i].Load()
 		status[i].writtenCells = c.io.writtenCells[i].Load()

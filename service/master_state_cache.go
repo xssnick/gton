@@ -37,20 +37,17 @@ type monitorSplitDepthKey struct {
 }
 
 func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
-	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
+	if state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
 		return
 	}
 
-	rememberedCompressedState := s.rememberCompressedBlockState(state)
+	rememberedCompressedState := s.RememberCompressedBlockState(state)
 	s.updateP2PShardOverlays(ctx, state, block, shardTargets)
 
 	key := storage.BlockKey(state.Block)
 	cloned := storage.CloneBlockState(state)
 
 	s.masterStateCacheMu.Lock()
-	if s.masterStateCache == nil {
-		s.masterStateCache = make(map[storage.BlockRootHash]*storage.BlockState, masterStateCacheLimit)
-	}
 	if _, ok := s.masterStateCache[key]; !ok {
 		if len(s.masterStateCacheKeys) == cap(s.masterStateCacheKeys) && s.masterStateCacheHead > 0 {
 			copy(s.masterStateCacheKeys, s.masterStateCacheKeys[s.masterStateCacheHead:])
@@ -68,13 +65,13 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 	}
 	s.masterStateCacheMu.Unlock()
 
-	if rememberedCompressedState && s.node != nil {
+	if rememberedCompressedState {
 		s.node.NotifyCompressedBlockStateReady(state.Block)
 	}
 }
 
 func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockState, block *PreparedBlock) error {
-	if block == nil || block.Meta == nil || !block.Meta.Has(storage.BlockMetaIsKeyBlock) {
+	if !block.Meta.Has(storage.BlockMetaIsKeyBlock) {
 		return nil
 	}
 
@@ -88,15 +85,10 @@ func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockSta
 	return nil
 }
 
-// RememberCompressedBlockState exposes the compressed-state cache to the p2p
-// broadcast decode path, which chains freshly decoded merkle updates onto the
-// state they were decompressed against.
+// RememberCompressedBlockState stores a state for compressed p2p broadcasts,
+// which chain freshly decoded merkle updates onto their base state.
 func (s *Service) RememberCompressedBlockState(state *storage.BlockState) bool {
-	return s.rememberCompressedBlockState(state)
-}
-
-func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
-	if state == nil || state.Cell == nil {
+	if state.Cell == nil {
 		return false
 	}
 
@@ -106,9 +98,6 @@ func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
 	defer s.compressedStateMu.Unlock()
 	now := time.Now()
 
-	if s.compressedStateCache == nil {
-		s.compressedStateCache = make(map[storage.BlockRootHash]compressedBlockStateEntry, compressedBlockStateCacheLimit)
-	}
 	s.compressedStateVersion++
 	entry := compressedBlockStateEntry{
 		state:    cloned,
@@ -136,7 +125,7 @@ func (s *Service) rememberCompressedBlockState(state *storage.BlockState) bool {
 	return true
 }
 
-func (s *Service) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.BlockState, bool) {
+func (s *Service) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.BlockState, error) {
 	key := storage.BlockKey(block)
 	now := time.Now()
 
@@ -145,13 +134,13 @@ func (s *Service) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.Blo
 
 	entry, ok := s.compressedStateCache[key]
 	if !ok {
-		return nil, false
+		return nil, storage.ErrNotFound
 	}
 	if !entry.storedAt.Add(compressedBlockStateCacheTTL).After(now) {
 		delete(s.compressedStateCache, key)
-		return nil, false
+		return nil, storage.ErrNotFound
 	}
-	return storage.CloneBlockState(entry.state), true
+	return storage.CloneBlockState(entry.state), nil
 }
 
 func (s *Service) pruneCompressedBlockStatesLocked(now time.Time) {
@@ -227,11 +216,9 @@ func (s *Service) cachedMonitorMinSplitDepth(state *storage.BlockState, workchai
 	}
 
 	s.monitorSplitDepthMu.Lock()
-	if s.monitorSplitDepth != nil {
-		if depth, ok := s.monitorSplitDepth[key]; ok {
-			s.monitorSplitDepthMu.Unlock()
-			return depth, nil
-		}
+	if depth, ok := s.monitorSplitDepth[key]; ok {
+		s.monitorSplitDepthMu.Unlock()
+		return depth, nil
 	}
 	s.monitorSplitDepthMu.Unlock()
 
@@ -241,9 +228,6 @@ func (s *Service) cachedMonitorMinSplitDepth(state *storage.BlockState, workchai
 	}
 
 	s.monitorSplitDepthMu.Lock()
-	if s.monitorSplitDepth == nil {
-		s.monitorSplitDepth = make(map[monitorSplitDepthKey]uint32)
-	}
 	s.monitorSplitDepth[key] = depth
 	s.monitorSplitDepthMu.Unlock()
 
@@ -331,10 +315,6 @@ func monitorSplitDepthKeyBlock(state *storage.BlockState) (ton.BlockIDExt, error
 }
 
 func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
-	if s.node == nil {
-		return
-	}
-
 	depth, err := s.cachedMonitorMinSplitDepth(state, 0)
 	if err != nil {
 		s.log.Debug().
@@ -374,7 +354,7 @@ func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.Bl
 		// Archive apply already has the parsed destination state. Its shard
 		// hashes are the committed result of this block, so avoid parsing the
 		// prepared block again just to update overlays.
-		if state != nil && state.Block.Equals(&block.ID) && state.Parsed != nil && state.Parsed.McStateExtra != nil {
+		if state.Block.Equals(&block.ID) && state.Parsed != nil && state.Parsed.McStateExtra != nil {
 			return state2.ShardBlocksFromMasterState(state)
 		}
 
@@ -383,10 +363,6 @@ func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.Bl
 			return nil, fmt.Errorf("parse master block %s: %w", block.BlockRef(), err)
 		}
 		return state2.ShardBlocksFromMasterBlock(block.ID, parsed)
-	}
-
-	if s.storage == nil {
-		return state2.ShardBlocksFromMasterState(state)
 	}
 
 	// Startup remembers the already-current master state before a prepared block
@@ -415,9 +391,9 @@ func (s *Service) loadMasterStateForConsensus(ctx context.Context, block ton.Blo
 		key := storage.BlockKey(block)
 
 		s.masterStateCacheMu.Lock()
-		cached := s.masterStateCache[key]
+		cached, ok := s.masterStateCache[key]
 		s.masterStateCacheMu.Unlock()
-		if cached != nil {
+		if ok {
 			return storage.CloneBlockState(cached), nil
 		}
 	}
@@ -431,19 +407,23 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 	// consulted before currentStatus/liveState, whose Cell roots are swapped
 	// for lazy celldb roots after every checkpoint — a lazy root would make
 	// state-aware decompression walk pebble cell by cell.
-	if state, ok := s.cachedCompressedBlockState(block); ok {
+	state, err := s.cachedCompressedBlockState(block)
+	if err == nil {
 		return state.Cell, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
 	}
 
 	s.currentStatusMu.RLock()
-	state, err := currentStateBlockState(s.currentStatus, block)
+	state, err = currentStateBlockState(s.currentStatus, block)
 	s.currentStatusMu.RUnlock()
 
 	if err == nil {
 		if state.Cell != nil {
 			return state.Cell, nil
 		}
-		if len(state.StateRootHash) == 32 && s.storage != nil {
+		if len(state.StateRootHash) == 32 {
 			root, err := s.storage.LoadStateCellTree(ctx, block, state.StateRootHash)
 			if err == nil {
 				return root, nil

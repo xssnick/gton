@@ -101,7 +101,7 @@ func TestArchiveScoutReplacesWorstPeerInFullRoster(t *testing.T) {
 	if !reserved || valuable.nextTryAt.IsZero() {
 		t.Fatal("evicted valuable peer was not moved to reserve")
 	}
-	if pool.recentlyRejected(peers[0].id, time.Now()) || pool.scout.peerBlocked(peers[0].id, time.Now()) {
+	if pool.recentlyRejected(peers[0].id, time.Now()) || pool.scout.retry.peerBlocked(peers[0].id, time.Now()) {
 		t.Fatal("evicted valuable peer entered the junk retry cache")
 	}
 }
@@ -473,9 +473,7 @@ func TestArchiveBackoffStillReoffersDisconnectedRandomRelay(t *testing.T) {
 	pool := testArchiveOfferPool(t, sub)
 	probe := beginTestArchiveRequest(t, pool, archive.ShardID{Workchain: -1, Shard: topShard}, 1)
 	peerID := testPeerID("blocked-random-relay")
-	if !pool.recordDemandNotAvailable(probe, peerID, archivePeerNotAvailableTTL) {
-		t.Fatal("record archive demand backoff")
-	}
+	pool.recordDemandNotAvailable(probe, peerID, archivePeerNotAvailableTTL)
 	pool.rememberRejected(peerID, archivePeerNoBenefitTTL)
 
 	now := time.Now()
@@ -531,9 +529,7 @@ func TestValuableScoutCanProbeDemandAfterNotAvailableBackoff(t *testing.T) {
 	peer := testArchiveCandidate("valuable-demand-retry")
 	peer.overlay = wrapper
 	defer closeArchiveOnlyPeer(peer)
-	if !pool.recordDemandNotAvailable(probe, peer.id, archivePeerNotAvailableTTL) {
-		t.Fatal("record archive demand backoff")
-	}
+	pool.recordDemandNotAvailable(probe, peer.id, archivePeerNotAvailableTTL)
 
 	archiveQueries := 0
 	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
@@ -599,7 +595,7 @@ func TestTransientRandomResponsePreventsUnreachableCache(t *testing.T) {
 	if pool.scoutConnectedTransientArchivePeer(peer, pool.probeSnapshots(4), false) {
 		t.Fatal("peer with a failed archive query entered the archive roster")
 	}
-	if pool.scout.peerBlocked(peer.id, time.Now()) || pool.scout.endpointBlocked(peer.addr, time.Now()) {
+	if pool.scout.retry.peerBlocked(peer.id, time.Now()) || pool.scout.retry.endpointBlocked(peer.addr, time.Now()) {
 		t.Fatal("successful random peer response was cached as an unreachable transport")
 	}
 	stats := pool.scoutStats.snapshot()

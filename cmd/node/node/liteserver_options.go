@@ -183,10 +183,6 @@ func liteserverPrivateKeyFromSeed(seed []byte, field string) (ed25519.PrivateKey
 }
 
 func liteserverZeroStateFromGlobalConfig(cfg *liteclient.GlobalConfig) (ton.ZeroStateIDExt, error) {
-	if cfg == nil {
-		return ton.ZeroStateIDExt{}, fmt.Errorf("global config is required")
-	}
-
 	zeroState := cfg.Validator.ZeroState
 	id := ton.ZeroStateIDExt{
 		Workchain: zeroState.Workchain,

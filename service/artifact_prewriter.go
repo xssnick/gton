@@ -110,7 +110,7 @@ func (w *artifactPrewriter) run(ctx context.Context) {
 }
 
 func (w *artifactPrewriter) enqueue(state *storage.BlockState, artifact *storage.ServedBlockFull) (uint64, error) {
-	if w == nil || artifact == nil {
+	if w == nil {
 		return 0, nil
 	}
 
@@ -208,11 +208,7 @@ func (w *artifactPrewriter) popJob() (artifactPrewriteJob, bool) {
 	job := w.jobs[w.head]
 	w.jobs[w.head] = artifactPrewriteJob{}
 	w.head++
-	if job.bytes > w.bytes {
-		w.bytes = 0
-	} else {
-		w.bytes -= job.bytes
-	}
+	w.bytes -= job.bytes
 	if w.head == len(w.jobs) {
 		w.jobs = nil
 		w.head = 0

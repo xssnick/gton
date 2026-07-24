@@ -275,7 +275,15 @@ func (noopBacking) LookupBlockBySeqNo(context.Context, storage.BlockSeqRef) (ton
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
+func (noopBacking) LookupBlockBySeqNoForPrefix(context.Context, storage.BlockSeqRef) (ton.BlockIDExt, error) {
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
 func (noopBacking) LookupBlockByLT(context.Context, storage.BlockHistoryKey, uint64) (ton.BlockIDExt, error) {
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func (noopBacking) LookupBlockByLTForPrefix(context.Context, storage.BlockHistoryKey, uint64) (ton.BlockIDExt, error) {
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
@@ -284,6 +292,10 @@ func (noopBacking) LookupBlockByAccountLT(context.Context, int32, []byte, uint64
 }
 
 func (noopBacking) LookupBlockByUnixTime(context.Context, storage.BlockHistoryKey, uint32) (ton.BlockIDExt, error) {
+	return ton.BlockIDExt{}, storage.ErrNotFound
+}
+
+func (noopBacking) LookupBlockByUnixTimeForPrefix(context.Context, storage.BlockHistoryKey, uint32) (ton.BlockIDExt, error) {
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 

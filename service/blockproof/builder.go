@@ -904,11 +904,9 @@ func IsFullBlockID(id ton.BlockIDExt) bool {
 	if id.Workchain == masterchainID && id.Shard != masterchainShard {
 		return false
 	}
-	return !isZeroHash(id.RootHash) && !isZeroHash(id.FileHash)
-}
 
-func isZeroHash(hash []byte) bool {
-	return len(hash) == 0 || bytes.Equal(hash, make([]byte, len(hash)))
+	var zeroHash [32]byte
+	return [32]byte(id.RootHash) != zeroHash && [32]byte(id.FileHash) != zeroHash
 }
 
 func CloneBlockID(id ton.BlockIDExt) *ton.BlockIDExt {

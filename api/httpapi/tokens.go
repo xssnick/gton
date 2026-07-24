@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,6 +26,8 @@ const (
 	tokenContentOffchain   = "offchain"
 	tokenNotDetectedStatus = 409
 )
+
+var errTokenStandardNotFound = errors.New("token standard not found")
 
 type tokenContent struct {
 	Type string `json:"type"`
@@ -81,17 +84,17 @@ func (s *Server) handleTokenData(ctx context.Context, params requestParams) (any
 
 	// Token kind detection is defined by mutually exclusive token-standard get methods.
 	// A non-zero get-method exit means this candidate standard is not implemented.
-	if result, found, apiErr := s.jettonMasterTokenData(ctx, snapshot); apiErr != nil || found {
-		return result, apiErr
+	if result, err := s.jettonMasterTokenData(snapshot); !errors.Is(err, errTokenStandardNotFound) {
+		return result, asAPIError(err)
 	}
-	if result, found, apiErr := s.jettonWalletTokenData(ctx, snapshot); apiErr != nil || found {
-		return result, apiErr
+	if result, err := s.jettonWalletTokenData(snapshot); !errors.Is(err, errTokenStandardNotFound) {
+		return result, asAPIError(err)
 	}
-	if result, found, apiErr := s.nftCollectionTokenData(ctx, snapshot); apiErr != nil || found {
-		return result, apiErr
+	if result, err := s.nftCollectionTokenData(snapshot); !errors.Is(err, errTokenStandardNotFound) {
+		return result, asAPIError(err)
 	}
-	if result, found, apiErr := s.nftItemTokenData(ctx, snapshot); apiErr != nil || found {
-		return result, apiErr
+	if result, err := s.nftItemTokenData(snapshot); !errors.Is(err, errTokenStandardNotFound) {
+		return result, asAPIError(err)
 	}
 
 	raw := strings.ToUpper(snapshot.addr.StringRaw())
@@ -102,39 +105,39 @@ func (s *Server) handleTokenData(ctx context.Context, params requestParams) (any
 	}
 }
 
-func (s *Server) jettonMasterTokenData(ctx context.Context, snapshot accountSnapshot) (any, bool, *apiError) {
-	res, ok, apiErr := s.tokenGetMethod(ctx, snapshot, "get_jetton_data")
-	if apiErr != nil || !ok {
-		return nil, ok, apiErr
+func (s *Server) jettonMasterTokenData(snapshot accountSnapshot) (any, error) {
+	res, err := s.tokenGetMethod(snapshot, "get_jetton_data")
+	if err != nil {
+		return nil, err
 	}
 
 	supply, err := res.Int(0)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton total supply: " + err.Error())
+		return nil, internalError("cannot parse jetton total supply: " + err.Error())
 	}
 	mintable, err := res.Int(1)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton mintable flag: " + err.Error())
+		return nil, internalError("cannot parse jetton mintable flag: " + err.Error())
 	}
 	adminSlice, err := res.Slice(2)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton admin address: " + err.Error())
+		return nil, internalError("cannot parse jetton admin address: " + err.Error())
 	}
 	admin, err := adminSlice.LoadAddr()
 	if err != nil {
-		return nil, false, internalError("cannot load jetton admin address: " + err.Error())
+		return nil, internalError("cannot load jetton admin address: " + err.Error())
 	}
 	contentCell, err := res.Cell(3)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton content: " + err.Error())
+		return nil, internalError("cannot parse jetton content: " + err.Error())
 	}
 	content, apiErr := tokenContentFromCell(contentCell)
 	if apiErr != nil {
-		return nil, false, apiErr
+		return nil, apiErr
 	}
 	walletCode, err := res.Cell(4)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton wallet code: " + err.Error())
+		return nil, internalError("cannot parse jetton wallet code: " + err.Error())
 	}
 
 	return jettonMasterData{
@@ -146,30 +149,30 @@ func (s *Server) jettonMasterTokenData(ctx context.Context, snapshot accountSnap
 		AdminAddress:     tokenAddressString(admin),
 		JettonContent:    content,
 		JettonWalletCode: bocBase64(walletCode),
-	}, true, nil
+	}, nil
 }
 
-func (s *Server) jettonWalletTokenData(ctx context.Context, snapshot accountSnapshot) (any, bool, *apiError) {
-	res, ok, apiErr := s.tokenGetMethod(ctx, snapshot, "get_wallet_data")
-	if apiErr != nil || !ok {
-		return nil, ok, apiErr
+func (s *Server) jettonWalletTokenData(snapshot accountSnapshot) (any, error) {
+	res, err := s.tokenGetMethod(snapshot, "get_wallet_data")
+	if err != nil {
+		return nil, err
 	}
 
 	balance, err := res.Int(0)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton wallet balance: " + err.Error())
+		return nil, internalError("cannot parse jetton wallet balance: " + err.Error())
 	}
 	owner, err := tokenAddressFromResult(res, 1)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton wallet owner: " + err.Error())
+		return nil, internalError("cannot parse jetton wallet owner: " + err.Error())
 	}
 	jetton, err := tokenAddressFromResult(res, 2)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton master address: " + err.Error())
+		return nil, internalError("cannot parse jetton master address: " + err.Error())
 	}
 	walletCode, err := res.Cell(3)
 	if err != nil {
-		return nil, false, internalError("cannot parse jetton wallet code: " + err.Error())
+		return nil, internalError("cannot parse jetton wallet code: " + err.Error())
 	}
 
 	return jettonWalletData{
@@ -180,30 +183,30 @@ func (s *Server) jettonWalletTokenData(ctx context.Context, snapshot accountSnap
 		Owner:            tokenAddressString(owner),
 		Jetton:           tokenAddressString(jetton),
 		JettonWalletCode: bocBase64(walletCode),
-	}, true, nil
+	}, nil
 }
 
-func (s *Server) nftCollectionTokenData(ctx context.Context, snapshot accountSnapshot) (any, bool, *apiError) {
-	res, ok, apiErr := s.tokenGetMethod(ctx, snapshot, "get_collection_data")
-	if apiErr != nil || !ok {
-		return nil, ok, apiErr
+func (s *Server) nftCollectionTokenData(snapshot accountSnapshot) (any, error) {
+	res, err := s.tokenGetMethod(snapshot, "get_collection_data")
+	if err != nil {
+		return nil, err
 	}
 
 	nextIndex, err := res.Int(0)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft collection next item index: " + err.Error())
+		return nil, internalError("cannot parse nft collection next item index: " + err.Error())
 	}
 	contentCell, err := res.Cell(1)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft collection content: " + err.Error())
+		return nil, internalError("cannot parse nft collection content: " + err.Error())
 	}
 	content, apiErr := tokenContentFromCell(contentCell)
 	if apiErr != nil {
-		return nil, false, apiErr
+		return nil, apiErr
 	}
 	owner, err := tokenAddressFromResult(res, 2)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft collection owner: " + err.Error())
+		return nil, internalError("cannot parse nft collection owner: " + err.Error())
 	}
 
 	return nftCollectionData{
@@ -213,44 +216,45 @@ func (s *Server) nftCollectionTokenData(ctx context.Context, snapshot accountSna
 		NextItemIndex:     nextIndex.String(),
 		OwnerAddress:      tokenAddressString(owner),
 		CollectionContent: content,
-	}, true, nil
+	}, nil
 }
 
-func (s *Server) nftItemTokenData(ctx context.Context, snapshot accountSnapshot) (any, bool, *apiError) {
-	res, ok, apiErr := s.tokenGetMethod(ctx, snapshot, "get_nft_data")
-	if apiErr != nil || !ok {
-		return nil, ok, apiErr
+func (s *Server) nftItemTokenData(snapshot accountSnapshot) (any, error) {
+	res, err := s.tokenGetMethod(snapshot, "get_nft_data")
+	if err != nil {
+		return nil, err
 	}
 
 	init, err := res.Int(0)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft item init flag: " + err.Error())
+		return nil, internalError("cannot parse nft item init flag: " + err.Error())
 	}
 	index, err := res.Int(1)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft item index: " + err.Error())
+		return nil, internalError("cannot parse nft item index: " + err.Error())
 	}
 	collection, err := tokenAddressFromResult(res, 2)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft item collection address: " + err.Error())
+		return nil, internalError("cannot parse nft item collection address: " + err.Error())
 	}
 	owner, err := tokenOptionalAddressFromResult(res, 3)
 	if err != nil {
-		return nil, false, internalError("cannot parse nft item owner address: " + err.Error())
+		return nil, internalError("cannot parse nft item owner address: " + err.Error())
 	}
 
 	content := tokenContent{Type: tokenContentOnchain, Data: map[string]string{}}
 	if isNil, err := res.IsNil(4); err != nil {
-		return nil, false, internalError("cannot parse nft item content: " + err.Error())
+		return nil, internalError("cannot parse nft item content: " + err.Error())
 	} else if !isNil {
 		contentCell, err := res.Cell(4)
 		if err != nil {
-			return nil, false, internalError("cannot parse nft item content: " + err.Error())
+			return nil, internalError("cannot parse nft item content: " + err.Error())
 		}
-		content, apiErr = tokenContentFromCell(contentCell)
+		parsedContent, apiErr := tokenContentFromCell(contentCell)
 		if apiErr != nil {
-			return nil, false, apiErr
+			return nil, apiErr
 		}
+		content = parsedContent
 	}
 
 	return nftItemData{
@@ -262,18 +266,18 @@ func (s *Server) nftItemTokenData(ctx context.Context, snapshot accountSnapshot)
 		CollectionAddress: tokenAddressString(collection),
 		OwnerAddress:      tokenAddressString(owner),
 		Content:           content,
-	}, true, nil
+	}, nil
 }
 
-func (s *Server) tokenGetMethod(ctx context.Context, snapshot accountSnapshot, method string, args ...any) (*ton.ExecutionResult, bool, *apiError) {
-	result, apiErr := s.executeRunMethod(args, tlb.MethodNameHash(method), snapshot.addr, snapshot.runMethod)
+func (s *Server) tokenGetMethod(snapshot accountSnapshot, method string) (*ton.ExecutionResult, error) {
+	result, apiErr := s.executeRunMethod(nil, tlb.MethodNameHash(method), snapshot.addr, snapshot.runMethod)
 	if apiErr != nil {
-		return nil, false, apiErr
+		return nil, apiErr
 	}
 	if result.Result == nil || result.Result.ExitCode != 0 {
-		return nil, false, nil
+		return nil, errTokenStandardNotFound
 	}
-	return ton.NewExecutionResult(result.Stack), true, nil
+	return ton.NewExecutionResult(result.Stack), nil
 }
 
 func tokenContentFromCell(root *cell.Cell) (tokenContent, *apiError) {

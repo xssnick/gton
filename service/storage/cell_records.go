@@ -248,7 +248,7 @@ func CellRecordFromCell(cl *cell.Cell) (*CellRecord, error) {
 
 	cellBits := cl.BitsSize()
 	refsCount := int(cl.RefsNum())
-	d1, d2 := cellRecordDescriptors(cl, refsCount, cellBits)
+	d1, d2 := cellRecordDescriptorsForLevelMask(cl, cl.LevelMask(), refsCount, cellBits)
 	data := cellRecordBody(cl, cellBits, int((cellBits+7)/8))
 	hash := cl.HashKey()
 
@@ -342,18 +342,11 @@ func PrepareStateUpdateCells(update *cell.Cell) (StateCellRecords, error) {
 }
 
 func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error) {
-	if root == nil {
-		return StateCellRecords{}, nil
-	}
-
 	var builder stateCellRecordBuilder
 	stack := []*cell.Cell{root.Virtualize(0)}
 	for len(stack) > 0 {
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if current == nil {
-			continue
-		}
 		if current.IsLazy() {
 			loader, err := current.BeginParse()
 			if err != nil {
@@ -408,7 +401,7 @@ func prepareReachableStateUpdateCellRecord(cl *cell.Cell, meta cell.Metadata, al
 }
 
 func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {
-	if cl == nil || cl.GetType() != cell.PrunedCellType || !cl.IsVirtualized() {
+	if !cl.IsVirtualized() {
 		return cl, nil
 	}
 
@@ -606,10 +599,6 @@ func DecodeCellRecordTrusted(hash []byte, data []byte) *CellRecord {
 		}
 	}
 	return record
-}
-
-func cellRecordDescriptors(cl *cell.Cell, refsCount int, bitLen uint) (byte, byte) {
-	return cellRecordDescriptorsForLevelMask(cl, cl.LevelMask(), refsCount, bitLen)
 }
 
 func cellRecordDescriptorsForLevelMask(cl *cell.Cell, levelMask cell.LevelMask, refsCount int, bitLen uint) (byte, byte) {

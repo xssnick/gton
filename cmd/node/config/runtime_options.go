@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton"
+	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/p2p"
 )
 
@@ -143,6 +144,10 @@ func storageOptionsFromConfig(cfg Config) (gton.StorageOptions, error) {
 	if err != nil {
 		return gton.StorageOptions{}, err
 	}
+	persistentStateKeepRecent, err := persistentStateKeepRecentFromConfig(cfg.Storage.PersistentStateKeepRecent)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
 	artifactFileMaxOpen, err := intConfigValue("storage.artifact_file_max_open", cfg.Storage.ArtifactFileMaxOpen, DefaultArtifactFileMaxOpen)
 	if err != nil {
 		return gton.StorageOptions{}, err
@@ -156,9 +161,18 @@ func storageOptionsFromConfig(cfg Config) (gton.StorageOptions, error) {
 		CellMemTableStopWritesThreshold:  cellMemTableStopWritesThreshold,
 		LargeBOCShardReadWorkers:         largeBOCShardReadWorkers,
 		PersistentStateLargeBOCBatchSize: persistentStateLargeBOCBatchSize,
+		PersistentStateKeepRecent:        persistentStateKeepRecent,
 		StateSerializeOnePass:            cfg.Storage.StateSerializeOnePass,
 		ArtifactFileMaxOpen:              artifactFileMaxOpen,
 	}, nil
+}
+
+func persistentStateKeepRecentFromConfig(value int64) (int, error) {
+	if value == service.PersistentStateKeepAll {
+		return service.PersistentStateKeepAll, nil
+	}
+
+	return intConfigValue("storage.persistent_state_keep_recent", value, service.DefaultPersistentStateKeepRecent)
 }
 
 func globalConfigPath(cfg TON) string {

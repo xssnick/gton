@@ -65,8 +65,6 @@ type Service struct {
 	out                   chan SyncedBlock
 	shardDescriptions     chan p2p.BroadcastEvent
 	shardDescriptionDrops atomic.Uint64
-	retryCount            int
-	retryDelay            time.Duration
 
 	chainsMu sync.Mutex
 	chains   map[string]*chain
@@ -102,8 +100,6 @@ func New(logger *zerolog.Logger, node Node) *Service {
 		node:              node,
 		out:               make(chan SyncedBlock, defaultOutputBuffer),
 		shardDescriptions: make(chan p2p.BroadcastEvent, defaultShardDescriptionBuffer),
-		retryCount:        defaultRetryCount,
-		retryDelay:        defaultRetryDelay,
 		chains:            map[string]*chain{},
 	}
 }
@@ -197,7 +193,7 @@ func (s *Service) emitDirectMasterchainBroadcast(ctx context.Context, ev p2p.Bro
 	}
 
 	downloaded := *ev.Downloaded
-	s.emitAsync(ctx, &SyncedBlock{
+	s.emitAsync(ctx, SyncedBlock{
 		Trigger:    ev,
 		Downloaded: downloaded,
 		CatchUp:    false,
@@ -419,7 +415,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 			return
 		}
 
-		if !c.service.emit(ctx, &SyncedBlock{
+		if !c.service.emit(ctx, SyncedBlock{
 			Trigger:         ev,
 			Downloaded:      downloaded,
 			CatchUp:         false,
@@ -484,7 +480,7 @@ func (c *chain) handleBroadcast(ctx context.Context, ev p2p.BroadcastEvent) {
 			return
 		}
 
-		if !c.service.emit(ctx, &SyncedBlock{
+		if !c.service.emit(ctx, SyncedBlock{
 			Trigger:         trigger,
 			Downloaded:      downloaded,
 			CatchUp:         true,
@@ -646,13 +642,13 @@ func directDownloadedBroadcastKind(kind string) bool {
 	return fullBlockBroadcastKind(kind) || kind == "tonNode.blockFinalityBroadcast"
 }
 
-func (s *Service) emit(ctx context.Context, block *SyncedBlock) bool {
+func (s *Service) emit(ctx context.Context, block SyncedBlock) bool {
 	block.ack = make(chan bool, 1)
 
 	select {
 	case <-ctx.Done():
 		return false
-	case s.out <- *block:
+	case s.out <- block:
 	}
 
 	select {
@@ -663,14 +659,12 @@ func (s *Service) emit(ctx context.Context, block *SyncedBlock) bool {
 	}
 }
 
-func (s *Service) emitAsync(ctx context.Context, block *SyncedBlock) bool {
+func (s *Service) emitAsync(ctx context.Context, block SyncedBlock) {
 	block.ack = nil
 
 	select {
 	case <-ctx.Done():
-		return false
-	case s.out <- *block:
-		return true
+	case s.out <- block:
 	}
 }
 
@@ -679,9 +673,6 @@ func (s *Service) downloadBlockWithRetry(ctx context.Context, block ton.BlockIDE
 		downloaded, err := s.node.DownloadBlockFull(ctx, block)
 		if err != nil {
 			return p2p.DownloadedBlock{}, err
-		}
-		if downloaded == nil {
-			return p2p.DownloadedBlock{}, fmt.Errorf("download block %s: empty response", storage.FormatBlockRef(block))
 		}
 		return *downloaded, nil
 	})
@@ -693,9 +684,6 @@ func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.Block
 		if err != nil {
 			return p2p.DownloadedBlock{}, err
 		}
-		if downloaded == nil {
-			return p2p.DownloadedBlock{}, fmt.Errorf("download next block after %s: empty response", storage.FormatBlockRef(prev))
-		}
 		return *downloaded, nil
 	})
 }
@@ -703,17 +691,17 @@ func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.Block
 func (s *Service) downloadWithRetry(ctx context.Context, label string, download func(context.Context) (p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
 	var lastErr error
 
-	for attempt := 1; attempt <= s.retryCount; attempt++ {
+	for attempt := 1; attempt <= defaultRetryCount; attempt++ {
 		downloaded, err := download(ctx)
 		if err == nil {
 			return downloaded, nil
 		}
 		lastErr = err
 
-		if attempt == s.retryCount {
+		if attempt == defaultRetryCount {
 			break
 		}
-		if err = waitOrDone(ctx, s.retryDelay); err != nil {
+		if err = waitOrDone(ctx, defaultRetryDelay); err != nil {
 			return p2p.DownloadedBlock{}, err
 		}
 	}

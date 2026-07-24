@@ -59,6 +59,7 @@ func (s *Service) applyBlockWithHooks(ctx context.Context, previous []*storage.B
 			return nil, err
 		}
 	}
+	s.recentTPS.observe(block.ID, block.BlockRoot, block.Meta.GenUTime, time.Now())
 	return next, nil
 }
 

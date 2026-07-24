@@ -127,24 +127,13 @@ func TestArtifactPrewriterWaitsForQueuedArtifacts(t *testing.T) {
 	}
 }
 
-func TestArtifactPrewriterSkipsNilArtifacts(t *testing.T) {
-	store := &artifactPrewriterTestStore{}
-	writer := newTestArtifactPrewriter(store, 1<<20)
-
-	state, _ := testArtifactPrewriterBlockState(101, 0x20)
-	seq, err := writer.enqueue(state, nil)
-	if err != nil {
-		t.Fatalf("enqueue nil artifact: %v", err)
-	}
-	if seq != 0 {
-		t.Fatalf("nil artifact enqueue seq = %d, want 0", seq)
-	}
-
+func TestArtifactPrewriterAllowsMissingCapability(t *testing.T) {
+	state, artifact := testArtifactPrewriterBlockState(101, 0x20)
 	var nilWriter *artifactPrewriter
-	if seq, err = nilWriter.enqueue(state, nil); err != nil || seq != 0 {
+	if seq, err := nilWriter.enqueue(state, artifact); err != nil || seq != 0 {
 		t.Fatalf("nil prewriter enqueue = %d/%v, want 0/nil", seq, err)
 	}
-	if err = nilWriter.wait(context.Background(), 5); err != nil {
+	if err := nilWriter.wait(context.Background(), 5); err != nil {
 		t.Fatalf("nil prewriter wait: %v", err)
 	}
 }

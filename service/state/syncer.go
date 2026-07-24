@@ -372,9 +372,6 @@ func (s *Syncer) appendSnapshotCheckpointEntry(ctx context.Context, entries *[]s
 			return err
 		}
 	}
-	if artifact == nil {
-		return fmt.Errorf("block artifact %s is missing", storage2.FormatBlockRef(state.Block))
-	}
 
 	*entries = append(*entries, storage2.StateCheckpointBlock{
 		State:    state,
@@ -478,7 +475,7 @@ func (s *Syncer) publishDownloadedBlockState(ctx context.Context, state *storage
 }
 
 func setShardMasterchainRef(state *storage2.BlockState, master ton.BlockIDExt) {
-	if state == nil || state.Block.Workchain == -1 {
+	if state.Block.Workchain == -1 {
 		return
 	}
 

@@ -20,9 +20,7 @@ import (
 // with overlay.pong. Peers that do not implement it still emit an ADNL-level
 // nop after receiving the packet, so the shared-pair inbound timestamp can
 // recover even when the query itself times out.
-//
-// Variables instead of constants so tests can shrink the timings.
-var (
+const (
 	fixedProbeMinDelay = 20 * time.Second
 	fixedProbeJitter   = 10 * time.Second
 	fixedProbeTimeout  = 3 * time.Second
@@ -45,40 +43,74 @@ var (
 	// send a low-impact ADNL nudge, but far less aggressively.
 	fixedRxStaleThreshold = 10 * time.Minute
 	fixedRxStaleCooldown  = 10 * time.Minute
+
+	fixedProbeParallelism = 4
 )
 
-const fixedProbeParallelism = 4
+type fixedProbePolicy struct {
+	minDelay              time.Duration
+	jitter                time.Duration
+	timeout               time.Duration
+	softFailures          uint32
+	silence               time.Duration
+	softRecoveryCooldown  time.Duration
+	hardMinSoftAttempts   uint32
+	hardSilence           time.Duration
+	hardRecoveryCooldown  time.Duration
+	pendingChannelTimeout time.Duration
+	rxStaleThreshold      time.Duration
+	rxStaleCooldown       time.Duration
+}
+
+func defaultFixedProbePolicy() fixedProbePolicy {
+	return fixedProbePolicy{
+		minDelay:              fixedProbeMinDelay,
+		jitter:                fixedProbeJitter,
+		timeout:               fixedProbeTimeout,
+		softFailures:          fixedProbeSoftFailures,
+		silence:               fixedProbeSilence,
+		softRecoveryCooldown:  fixedSoftRecoveryCooldown,
+		hardMinSoftAttempts:   fixedHardMinSoftAttempts,
+		hardSilence:           fixedHardSilence,
+		hardRecoveryCooldown:  fixedHardRecoveryCooldown,
+		pendingChannelTimeout: fixedPendingChannelTimeout,
+		rxStaleThreshold:      fixedRxStaleThreshold,
+		rxStaleCooldown:       fixedRxStaleCooldown,
+	}
+}
 
 type adnlReiniter interface {
 	Reinit()
 }
 
-func nextFixedProbeDelay() time.Duration {
-	if fixedProbeJitter <= 0 {
-		return fixedProbeMinDelay
+func nextFixedProbeDelay(policy fixedProbePolicy) time.Duration {
+	if policy.jitter <= 0 {
+		return policy.minDelay
 	}
-	return fixedProbeMinDelay + time.Duration(rand.Int64N(int64(fixedProbeJitter)))
+	return policy.minDelay + time.Duration(rand.Int64N(int64(policy.jitter)))
 }
 
-func (s *overlaySubscription) startProbeFixedPeers(ctx context.Context) {
+func (s *overlaySubscription) startProbeFixedPeers(ctx context.Context, policy fixedProbePolicy) {
 	if s.spec.Kind != overlayKindCustomFixed || !s.beginFixedProbe() {
 		return
 	}
-	s.runMaintenanceAsync(func() {
+	s.node.runAsync(func() {
 		defer s.endFixedProbe()
-		s.probeFixedPeers(ctx)
+		s.probeFixedPeers(ctx, policy)
 	})
 }
 
-func (s *overlaySubscription) probeFixedPeers(ctx context.Context) {
+func (s *overlaySubscription) probeFixedPeers(ctx context.Context, policy fixedProbePolicy) {
 	if !s.isActive() || s.spec.Kind != overlayKindCustomFixed {
 		return
 	}
-	s.runPeerMaintenance(ctx, s.peersSnapshot(), fixedProbeParallelism, s.probeFixedPeer)
+	s.runPeerMaintenance(ctx, s.peersSnapshot(), fixedProbeParallelism, func(ctx context.Context, peer *overlayPeer) {
+		s.probeFixedPeer(ctx, peer, policy)
+	})
 }
 
-func (s *overlaySubscription) probeFixedPeer(ctx context.Context, peer *overlayPeer) {
-	queryCtx, cancel := context.WithTimeout(ctx, fixedProbeTimeout)
+func (s *overlaySubscription) probeFixedPeer(ctx context.Context, peer *overlayPeer, policy fixedProbePolicy) {
+	queryCtx, cancel := context.WithTimeout(ctx, policy.timeout)
 	var pong overlay.Pong
 	err := peer.overlay.Query(queryCtx, overlay.Ping{}, &pong)
 	cancel()
@@ -98,7 +130,7 @@ func (s *overlaySubscription) probeFixedPeer(ctx context.Context, peer *overlayP
 	if ctx.Err() != nil {
 		return
 	}
-	s.evaluateFixedPeerRecovery(ctx, peer, now)
+	s.evaluateFixedPeerRecovery(ctx, peer, now, policy)
 }
 
 func (p *overlayPeer) notePongReceived(now time.Time) {
@@ -124,10 +156,10 @@ func (p *overlayPeer) noteProbeFailed() uint32 {
 // adnlPairStats reports transport-level statistics of the ADNL pair shared by
 // every overlay attached to this peer.
 func (p *overlayPeer) adnlPairStats() (adnl.PeerStats, bool) {
-	if p == nil || p.overlay == nil || p.overlay.ADNLWrapper == nil || p.overlay.ADNL == nil {
+	if p.overlay == nil || p.overlay.ADNLWrapper == nil || p.overlay.ADNL == nil {
 		return adnl.PeerStats{}, false
 	}
-	return p.overlay.ADNL.Stats(), true
+	return p.overlay.Stats(), true
 }
 
 type fixedRecoveryState struct {
@@ -140,7 +172,7 @@ type fixedRecoveryState struct {
 	softAttempts  uint32
 }
 
-func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, peer *overlayPeer, now time.Time) {
+func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, peer *overlayPeer, now time.Time, policy fixedProbePolicy) {
 	if s.spec.Kind != overlayKindCustomFixed {
 		return
 	}
@@ -149,7 +181,7 @@ func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, pee
 		return
 	}
 
-	state := peer.fixedRecoverySnapshot(now, stats.Inbound.LastPacketAt)
+	state := peer.fixedRecoverySnapshot(now, stats.Inbound.LastPacketAt, policy)
 	pairSeenAt := latestTime(state.attachedAt, state.lastPongAt, stats.Inbound.LastPacketAt)
 	pairSilence := now.Sub(pairSeenAt)
 
@@ -161,17 +193,17 @@ func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, pee
 	// transport even when ADNL inbound stays current.
 	pendingSince := latestTime(state.attachedAt, stats.CreatedAt, stats.Reinitialization.LastPeerEventAt)
 	if stats.Channel.State == adnl.PeerChannelStatePending &&
-		now.Sub(pendingSince) >= fixedPendingChannelTimeout &&
-		now.Sub(state.lastHardAt) >= fixedHardRecoveryCooldown {
+		now.Sub(pendingSince) >= policy.pendingChannelTimeout &&
+		now.Sub(state.lastHardAt) >= policy.hardRecoveryCooldown {
 		s.hardRecoverFixedPeer(ctx, peer, "channel_pending")
 		return
 	}
 
 	// Hard: the pair stayed dead through soft recoveries; tear the shared
 	// transport down and rebuild it from a fresh DHT resolve.
-	if pairSilence >= fixedHardSilence &&
-		state.softAttempts >= fixedHardMinSoftAttempts &&
-		now.Sub(state.lastHardAt) >= fixedHardRecoveryCooldown {
+	if pairSilence >= policy.hardSilence &&
+		state.softAttempts >= policy.hardMinSoftAttempts &&
+		now.Sub(state.lastHardAt) >= policy.hardRecoveryCooldown {
 		s.hardRecoverFixedPeer(ctx, peer, "pair_silent")
 		return
 	}
@@ -179,9 +211,9 @@ func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, pee
 	// Soft: probes keep failing and nothing arrives on the shared pair; send
 	// a nop. Once the pair has crossed tonutils-go's idle threshold, the
 	// transport sends that packet in root format with a fresh address list.
-	if state.probeFailures >= fixedProbeSoftFailures &&
-		pairSilence >= fixedProbeSilence &&
-		now.Sub(state.lastSoftAt) >= fixedSoftRecoveryCooldown {
+	if state.probeFailures >= policy.softFailures &&
+		pairSilence >= policy.silence &&
+		now.Sub(state.lastSoftAt) >= policy.softRecoveryCooldown {
 		s.softRecoverFixedPeer(ctx, peer, "pair_silent")
 		return
 	}
@@ -190,10 +222,10 @@ func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, pee
 	// in case its overlay-side state about us went stale. Gated on rx having
 	// flowed at least once, so legitimately quiet overlays (e.g. a
 	// sender-only role that never receives broadcasts) do not churn forever.
-	if pairSilence < fixedProbeSilence &&
+	if pairSilence < policy.silence &&
 		!state.lastReceiveAt.IsZero() &&
-		now.Sub(state.lastReceiveAt) >= fixedRxStaleThreshold &&
-		now.Sub(state.lastSoftAt) >= fixedRxStaleCooldown {
+		now.Sub(state.lastReceiveAt) >= policy.rxStaleThreshold &&
+		now.Sub(state.lastSoftAt) >= policy.rxStaleCooldown {
 		s.softRecoverFixedPeer(ctx, peer, "rx_stale")
 	}
 }
@@ -203,12 +235,12 @@ func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, pee
 // demonstrably alive pair (e.g. a remote that receives our pings but does
 // not implement overlay.ping) are not evidence of a dead pair, and
 // escalation to hard must restart from scratch after any sign of life.
-func (p *overlayPeer) fixedRecoverySnapshot(now time.Time, adnlInboundAt time.Time) fixedRecoveryState {
+func (p *overlayPeer) fixedRecoverySnapshot(now time.Time, adnlInboundAt time.Time, policy fixedProbePolicy) fixedRecoveryState {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
 	pairSeenAt := latestTime(p.attachedAt, p.lastPongAt, adnlInboundAt)
-	if now.Sub(pairSeenAt) < fixedProbeSilence {
+	if now.Sub(pairSeenAt) < policy.silence {
 		p.softRecoveriesSinceSeen = 0
 		p.probeFailures = 0
 	}

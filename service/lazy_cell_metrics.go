@@ -11,15 +11,10 @@ type lazyCellLoadCounters struct {
 }
 
 func (c *lazyCellLoadCounters) observeStateWindow() {
-	if c != nil {
-		c.stateWindow.Add(1)
-	}
+	c.stateWindow.Add(1)
 }
 
 func (c *lazyCellLoadCounters) snapshot() []storage.LazyCellLoadMetric {
-	if c == nil {
-		return nil
-	}
 	return []storage.LazyCellLoadMetric{
 		{Layer: storage.LazyCellLoadLayerStateWindow, Count: c.stateWindow.Load()},
 	}

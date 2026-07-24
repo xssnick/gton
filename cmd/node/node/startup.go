@@ -99,10 +99,17 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		return
 	}
 
+	exitCode := runConfiguredNode(startOpts, cfg, extensions)
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensions []hooks.ExtensionFactory) int {
 	logOutput, logFile, err := newLogOutput(os.Stdout, startOpts.LogFilePath, startOpts.LogFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid log file config: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if logFile != nil {
 		defer func() {
@@ -129,7 +136,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	if startOpts.LiteQueryWorkers < 0 {
 		logger.Error().Int("workers", startOpts.LiteQueryWorkers).Msg("invalid liteserver query workers")
 		fmt.Fprintf(os.Stderr, "liteserver query workers cannot be negative: %d\n", startOpts.LiteQueryWorkers)
-		os.Exit(1)
+		return 1
 	}
 	liteQueryConcurrency := startOpts.LiteQueryWorkers
 	if liteQueryConcurrency == 0 {
@@ -146,13 +153,13 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	runtimeOpts, err := cfg.RuntimeOptions(startOpts.Node)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	globalConfig, err := prepareGlobalConfig(context.Background(), logger, runtimeOpts.GlobalConfigPath, startOpts.GlobalConfigURL, startOpts.ReplaceGlobalConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	runOpts := runtimeOpts.Node
@@ -163,7 +170,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	liteOpts, liteExtension, err := configureLiteserver(&runOpts, cfg, runtimeOpts, globalConfig, liteQueryConcurrency)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	logger.Info().
 		Bool("liteserver", liteOpts.Enabled).
@@ -182,7 +189,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	httpOpts, httpExtension, err := configureHTTPAPI(cfg, runtimeOpts, globalConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	logger.Info().
 		Bool("http_api", httpOpts.Enabled).
@@ -214,10 +221,10 @@ func Run(extensions ...hooks.ExtensionFactory) {
 
 	err = gton.RunNode(context.Background(), runOpts)
 	if err == nil {
-		return
+		return 0
 	}
 	fmt.Fprintf(os.Stderr, "%v\n", err)
-	os.Exit(1)
+	return 1
 }
 
 func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommands, error) {

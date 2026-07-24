@@ -147,6 +147,7 @@ func TestApplyBlockWithHooksPassesStateRoots(t *testing.T) {
 
 	var event hooks.BlockAppliedEvent
 	svc := &Service{
+		recentTPS: newRecentTPSTracker(recentTPSWindow),
 		applyHooks: &blockApplyHookRunner{
 			log: zerolog.Nop(),
 			extension: blockApplyHookFunc(func(_ context.Context, e hooks.BlockAppliedEvent) error {

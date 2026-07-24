@@ -77,7 +77,6 @@ type blockFinalityAssembledEntry struct {
 
 type checkedBlockFinality struct {
 	block                 ton.BlockIDExt
-	signatures            *blockproof.ValidatorSignatureSet
 	signaturesCell        *cell.Cell
 	signaturesVerifiedKey []byte
 	sourcePeerID          PeerID
@@ -97,9 +96,6 @@ func newBlockFinalityCache(ttl time.Duration, maxBytes int64, maxItems int) *blo
 }
 
 func (c *blockFinalityCache) StoreCandidate(downloaded DownloadedBlock, now time.Time) ([]DownloadedBlock, error) {
-	if err := validateBlockFinalityCandidate(downloaded); err != nil {
-		return nil, err
-	}
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return nil, fmt.Errorf("block finality cache is disabled")
 	}
@@ -112,7 +108,7 @@ func (c *blockFinalityCache) StoreCandidate(downloaded DownloadedBlock, now time
 		bytes:     blockFinalityCandidateBytes(downloaded),
 	}
 	if entry.bytes > c.maxBytes {
-		return nil, fmt.Errorf("block candidate %s is too large for block finality cache: %d > %d", formatBlockRef(downloaded.ID), entry.bytes, c.maxBytes)
+		return nil, fmt.Errorf("block candidate %s is too large for block finality cache: %d > %d", tnstore.FormatBlockRef(downloaded.ID), entry.bytes, c.maxBytes)
 	}
 
 	var finality *blockFinalityEntry
@@ -150,9 +146,6 @@ func (c *blockFinalityCache) StoreCandidate(downloaded DownloadedBlock, now time
 }
 
 func (c *blockFinalityCache) StoreFinality(finality checkedBlockFinality, now time.Time) ([]DownloadedBlock, error) {
-	if err := validateBlockFinality(finality); err != nil {
-		return nil, err
-	}
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return nil, fmt.Errorf("block finality cache is disabled")
 	}
@@ -168,7 +161,7 @@ func (c *blockFinalityCache) StoreFinality(finality checkedBlockFinality, now ti
 		bytes:                 blockFinalityBytes(finality),
 	}
 	if entry.bytes > c.maxBytes {
-		return nil, fmt.Errorf("block finality %s is too large for block finality cache: %d > %d", formatBlockRef(finality.block), entry.bytes, c.maxBytes)
+		return nil, fmt.Errorf("block finality %s is too large for block finality cache: %d > %d", tnstore.FormatBlockRef(finality.block), entry.bytes, c.maxBytes)
 	}
 
 	var candidate *blockFinalityCandidateEntry
@@ -236,7 +229,7 @@ func (c *blockFinalityCache) forgetAssemblyReservation(key tnstore.BlockRootHash
 
 func assembleBlockFinality(candidate *blockFinalityCandidateEntry, finality *blockFinalityEntry) ([]DownloadedBlock, error) {
 	if !candidate.block.id.Equals(&finality.block) {
-		return nil, fmt.Errorf("block finality candidate %s finality belongs to %s", formatBlockRef(candidate.block.id), formatBlockRef(finality.block))
+		return nil, fmt.Errorf("block finality candidate %s finality belongs to %s", tnstore.FormatBlockRef(candidate.block.id), tnstore.FormatBlockRef(finality.block))
 	}
 
 	proofRoot, err := blockproof.BroadcastProofRoot(candidate.block.id, candidate.block.blockRoot)
@@ -275,9 +268,6 @@ func (c *blockFinalityCache) pruneExpiredLocked(now time.Time) {
 func (c *blockFinalityCache) pruneOverflowLocked() {
 	for c.order.Len() > c.maxItems || c.bytes > c.maxBytes {
 		elem := c.order.Front()
-		if elem == nil {
-			return
-		}
 		c.deleteEntryLocked(elem.Value.(blockFinalityCacheEntry))
 	}
 }
@@ -314,38 +304,6 @@ func (e *blockFinalityEntry) blockFinalityCacheExpiresAt() time.Time {
 
 func (e *blockFinalityAssembledEntry) blockFinalityCacheExpiresAt() time.Time {
 	return e.expiresAt
-}
-
-func validateBlockFinalityCandidate(downloaded DownloadedBlock) error {
-	if !downloaded.VerifiedRootHash {
-		return fmt.Errorf("block candidate %s is not hash verified", formatBlockRef(downloaded.ID))
-	}
-	if len(downloaded.BlockBOC) == 0 {
-		return fmt.Errorf("block candidate %s has empty block data", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Block == nil {
-		return fmt.Errorf("block candidate %s has no parsed block root", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Meta == nil {
-		return fmt.Errorf("block candidate %s has no metadata", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.StateUpdate == nil {
-		return fmt.Errorf("block candidate %s has no state update", formatBlockRef(downloaded.ID))
-	}
-	return nil
-}
-
-func validateBlockFinality(finality checkedBlockFinality) error {
-	if isMasterchainBlock(finality.block) && !finality.signatures.Final() {
-		return fmt.Errorf("masterchain block finality %s has non-final signatures", formatBlockRef(finality.block))
-	}
-	if isMasterchainBlock(finality.block) && finality.signaturesCell == nil {
-		return fmt.Errorf("masterchain block finality %s has no serialized signatures", formatBlockRef(finality.block))
-	}
-	if len(finality.signaturesVerifiedKey) == 0 {
-		return fmt.Errorf("block finality %s has no verified signature key", formatBlockRef(finality.block))
-	}
-	return nil
 }
 
 func blockFinalityCandidateFrom(downloaded DownloadedBlock) blockFinalityCandidate {
@@ -404,7 +362,7 @@ func (n *Node) rememberBlockFinalityCandidate(downloaded *DownloadedBlock) ([]Do
 	if err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(downloaded.ID)).
+			Str("block", tnstore.FormatBlockRef(downloaded.ID)).
 			Msg("failed to cache block candidate for finality broadcast")
 		return nil, err
 	}
@@ -416,7 +374,7 @@ func (n *Node) rememberBlockFinality(finality checkedBlockFinality) ([]Downloade
 	if err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(finality.block)).
+			Str("block", tnstore.FormatBlockRef(finality.block)).
 			Msg("failed to cache block finality broadcast")
 		return nil, err
 	}

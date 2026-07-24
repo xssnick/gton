@@ -6,13 +6,19 @@ import (
 )
 
 const (
-	persistentStateGCInterval         = 30 * time.Minute
-	persistentStateGCRetryDelay       = 5 * time.Minute
-	persistentStateGCKeepRecentGroups = 2
-	persistentStateGCMaxFilesPerRun   = 256
+	DefaultPersistentStateKeepRecent = 2
+	PersistentStateKeepAll           = -1
+	persistentStateGCInterval        = 30 * time.Minute
+	persistentStateGCRetryDelay      = 5 * time.Minute
+	persistentStateGCMaxFilesPerRun  = 256
 )
 
 func (s *Service) runPersistentStateGCOnce(ctx context.Context) (bool, error) {
+	if s.persistentStateKeepRecent == PersistentStateKeepAll {
+		s.log.Debug().Msg("skipping persistent state gc because all states are retained")
+		return false, nil
+	}
+
 	if s.syncUntilFrozen() {
 		s.log.Debug().
 			Uint32("sync_until", s.syncUntil).
@@ -35,11 +41,11 @@ func (s *Service) runPersistentStateGCOnce(ctx context.Context) (bool, error) {
 	nowUnix := uint64(started.Unix())
 	s.log.Info().
 		Uint64("now_unix", nowUnix).
-		Int("keep_recent_groups", persistentStateGCKeepRecentGroups).
+		Int("keep_recent_groups", s.persistentStateKeepRecent).
 		Int("max_files", persistentStateGCMaxFilesPerRun).
 		Msg("persistent state gc started")
 
-	stats, err := store.PruneExpiredPersistentStateFiles(ctx, nowUnix, persistentStateGCKeepRecentGroups, persistentStateGCMaxFilesPerRun)
+	stats, err := store.PruneExpiredPersistentStateFiles(ctx, nowUnix, s.persistentStateKeepRecent, persistentStateGCMaxFilesPerRun)
 	if err != nil {
 		return false, err
 	}

@@ -41,7 +41,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 	if !errors.Is(err, tnstore.ErrNotFound) {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(block)).
+			Str("block", tnstore.FormatBlockRef(block)).
 			Bool("allow_partial", allowPartial).
 			Bool("key_block", keyBlock).
 			Msg("failed to load cached block proof")
@@ -73,7 +73,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 			peers = peers[:proofDownloadPeerLimit]
 		}
 		for _, peer := range peers {
-			peerID := proofPeerID(peer)
+			peerID := peer.id
 			if !peerID.IsZero() {
 				tried[peerID] = struct{}{}
 			}
@@ -174,7 +174,7 @@ func (s *overlaySubscription) proofQueryCandidates(tried map[PeerID]struct{}) []
 
 	filtered := peers[:0]
 	for _, peer := range peers {
-		if _, ok := tried[proofPeerID(peer)]; ok {
+		if _, ok := tried[peer.id]; ok {
 			continue
 		}
 		filtered = append(filtered, peer)
@@ -194,13 +194,6 @@ func (s *overlaySubscription) waitForProofPeerDiscovery(ctx context.Context) err
 	case <-time.After(proofPeerDiscoveryDelay):
 		return nil
 	}
-}
-
-func proofPeerID(peer *overlayPeer) PeerID {
-	if peer == nil {
-		return PeerID{}
-	}
-	return peer.id
 }
 
 func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *overlayPeer, block ton.BlockIDExt, allowPartial bool, keyBlock bool) (ProofDownload, error) {
@@ -263,7 +256,7 @@ func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *o
 func validateDownloadedProof(block ton.BlockIDExt, data []byte, isLink bool, keyBlock bool) error {
 	root, err := cell.FromBOC(data)
 	if err != nil {
-		return fmt.Errorf("proof is not a valid BOC for %s: %w", formatBlockRef(block), err)
+		return fmt.Errorf("proof is not a valid BOC for %s: %w", tnstore.FormatBlockRef(block), err)
 	}
 	if err = blockproof.CheckProofShape(block, root, isLink); err != nil {
 		return err
@@ -274,7 +267,7 @@ func validateDownloadedProof(block ton.BlockIDExt, data []byte, isLink bool, key
 		return err
 	}
 	if keyBlock && !parsed.Block.BlockInfo.KeyBlock {
-		return fmt.Errorf("proof for %s is not a key block", formatBlockRef(block))
+		return fmt.Errorf("proof for %s is not a key block", tnstore.FormatBlockRef(block))
 	}
 	return nil
 }
@@ -282,7 +275,7 @@ func validateDownloadedProof(block ton.BlockIDExt, data []byte, isLink bool, key
 func validateDownloadedHardforkProof(block ton.BlockIDExt, data []byte, isLink bool, keyBlock bool) error {
 	root, err := cell.FromBOC(data)
 	if err != nil {
-		return fmt.Errorf("proof is not a valid BOC for %s: %w", formatBlockRef(block), err)
+		return fmt.Errorf("proof is not a valid BOC for %s: %w", tnstore.FormatBlockRef(block), err)
 	}
 	if err = blockproof.CheckHardforkProofShape(block, root, isLink); err != nil {
 		return err
@@ -293,7 +286,7 @@ func validateDownloadedHardforkProof(block ton.BlockIDExt, data []byte, isLink b
 		return err
 	}
 	if keyBlock && !parsed.Block.BlockInfo.KeyBlock {
-		return fmt.Errorf("proof for %s is not a key block", formatBlockRef(block))
+		return fmt.Errorf("proof for %s is not a key block", tnstore.FormatBlockRef(block))
 	}
 	if err = blockproof.ValidateHardforkBlock(block, parsed.Block); err != nil {
 		return err

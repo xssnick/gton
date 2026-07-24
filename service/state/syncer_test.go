@@ -416,38 +416,6 @@ func TestSyncerSerializesShardStateDecodeAndPersist(t *testing.T) {
 	}
 }
 
-func TestSyncerWalksKeyBlocksFromZeroStateToTailWithoutLatestLookup(t *testing.T) {
-	zero := testStateBlock(-1, topShard, 0)
-	key20 := testStateBlock(-1, topShard, 20)
-	key30 := testStateBlock(-1, topShard, 30)
-	key40 := testStateBlock(-1, topShard, 40)
-
-	source := &fakeSource{
-		master: zero,
-		keyBlockBatches: map[uint32]KeyBlockBatch{
-			0:  {Blocks: []ton.BlockIDExt{key20, key30}},
-			30: {Blocks: []ton.BlockIDExt{key40}, Incomplete: true},
-			40: {Incomplete: true},
-		},
-	}
-
-	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
-	blocks, err := syncer.keyBlockIDs(context.Background(), zero)
-	if err != nil {
-		t.Fatalf("walk key blocks: %v", err)
-	}
-
-	if got, want := len(blocks), 3; got != want {
-		t.Fatalf("unexpected key block count %d, want %d", got, want)
-	}
-	if !blocks[0].Equals(&key20) || !blocks[1].Equals(&key30) || !blocks[2].Equals(&key40) {
-		t.Fatalf("unexpected key block chain %#v", blocks)
-	}
-	if got := source.nextKeyBlockCalls; got != 3 {
-		t.Fatalf("unexpected next key block calls %d", got)
-	}
-}
-
 func TestSyncerUsesConfiguredZeroStateWhenInitBlockIsEmpty(t *testing.T) {
 	emptyInit := ton.BlockIDExt{}
 	zero := testStateBlock(-1, topShard, 0)
@@ -549,19 +517,6 @@ func TestSyncerSyncZeroStateCurrentStoresMasterAndShardZeroStates(t *testing.T) 
 	}
 	if _, err = store.StateSyncProgress(context.Background()); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("state sync progress err = %v, want ErrNotFound", err)
-	}
-}
-
-func TestSyncerRejectsNonMasterchainKeyBlockAnchor(t *testing.T) {
-	source := &fakeSource{}
-	syncer := NewSyncer(source, newTestStateStore(), SyncerOptions{})
-
-	_, err := syncer.keyBlockIDs(context.Background(), testStateBlock(0, 0, 0))
-	if err == nil {
-		t.Fatal("expected non-masterchain key block anchor error")
-	}
-	if got := source.nextKeyBlockCalls; got != 0 {
-		t.Fatalf("unexpected next key block calls %d", got)
 	}
 }
 

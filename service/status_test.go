@@ -57,6 +57,7 @@ func TestStatusSnapshotIncludesLocalChainProgress(t *testing.T) {
 		node:      node,
 		blockSync: statusTestBlockSync(node),
 		storage:   store,
+		recentTPS: newRecentTPSTracker(recentTPSWindow),
 	}
 	snapshot := svc.StatusSnapshot()
 
@@ -108,6 +109,7 @@ func TestStatusSnapshotUsesLiveCurrentState(t *testing.T) {
 		node:      node,
 		blockSync: statusTestBlockSync(node),
 		storage:   store,
+		recentTPS: newRecentTPSTracker(recentTPSWindow),
 	}
 	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
@@ -151,6 +153,7 @@ func TestStatusSnapshotIncludesAppliedMasterchainProgress(t *testing.T) {
 		node:      node,
 		blockSync: statusTestBlockSync(node),
 		storage:   store,
+		recentTPS: newRecentTPSTracker(recentTPSWindow),
 		currentStatus: &tnstore.CurrentState{
 			Masterchain: tnstore.BlockState{
 				Block:  currentMaster,
@@ -194,6 +197,7 @@ func TestStatusSnapshotIncludesSplitBasechainShards(t *testing.T) {
 		node:      node,
 		blockSync: statusTestBlockSync(node),
 		storage:   store,
+		recentTPS: newRecentTPSTracker(recentTPSWindow),
 	}
 	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
@@ -257,7 +261,7 @@ func TestCurrentBasechainLagSecondsUsesLocalShardUTime(t *testing.T) {
 	baseStale := testBlockID(0, topShard>>1, 11)
 	master := testBlockID(-1, topShard, 20)
 
-	lag, shards, ok := currentBasechainLagSeconds(time.Unix(1000, 0), &tnstore.CurrentState{
+	lag, shards := currentBasechainLagSeconds(time.Unix(1000, 0), &tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
 			Block:  master,
 			Parsed: &tlb.ShardStateUnsplit{GenUTime: 999},
@@ -273,9 +277,6 @@ func TestCurrentBasechainLagSecondsUsesLocalShardUTime(t *testing.T) {
 			},
 		},
 	})
-	if !ok {
-		t.Fatal("expected basechain lag")
-	}
 	if shards != 2 {
 		t.Fatalf("basechain shards = %d, want 2", shards)
 	}
@@ -344,6 +345,7 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 		blockSync:      statusTestBlockSync(node),
 		storage:        store,
 		liveBlockCache: cache,
+		recentTPS:      newRecentTPSTracker(recentTPSWindow),
 	}
 	svc.publishLiveCurrentStateChanged(&tnstore.CurrentState{
 		Masterchain: tnstore.BlockState{
@@ -362,53 +364,6 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 	}
 	if _, err := store.BlockData(context.Background(), block); !errors.Is(err, tnstore.ErrNotFound) {
 		t.Fatalf("pebble block data error = %v, want ErrNotFound", err)
-	}
-}
-
-func TestRecentTPSSnapshotUsesLastLiveBlockWithoutStorageHistory(t *testing.T) {
-	store := openTestPebbleStorage(t)
-	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks)
-
-	block, _, data, meta := mustStatusFixtureBlock(t)
-	meta.GenUTime = 100
-	if err := cache.PublishLiveBlockArtifacts(tnstore.LiveBlockCacheArtifacts{
-		Block:     block,
-		BlockData: data,
-		Meta:      meta,
-		Proofs: []tnstore.LiveBlockProofArtifact{{
-			Kind: tnstore.ServedProofBlock,
-			Data: []byte{0x01},
-		}},
-	}); err != nil {
-		t.Fatalf("publish live block: %v", err)
-	}
-
-	svc := &Service{
-		storage:        store,
-		liveBlockCache: cache,
-	}
-	snapshot := svc.recentTPSSnapshot(context.Background(), &tnstore.CurrentState{
-		Masterchain: tnstore.BlockState{Block: block},
-		Shards:      map[tnstore.ShardKey]tnstore.BlockState{},
-	}, statusTPSMasterWindow)
-
-	if !snapshot.Complete {
-		t.Fatalf("expected complete live TPS snapshot: %+v", snapshot)
-	}
-	if snapshot.WindowMasters != 1 {
-		t.Fatalf("window masters = %d, want 1", snapshot.WindowMasters)
-	}
-	if snapshot.Transactions == 0 {
-		t.Fatal("expected live transactions")
-	}
-	if snapshot.DurationSeconds != 1 {
-		t.Fatalf("duration = %d, want 1", snapshot.DurationSeconds)
-	}
-	if snapshot.TPS <= 0 {
-		t.Fatalf("tps = %f, want positive", snapshot.TPS)
-	}
-	if _, err := store.LookupBlockBySeqNo(context.Background(), tnstore.BlockSeqRefFromBlock(block)); !errors.Is(err, tnstore.ErrNotFound) {
-		t.Fatalf("pebble seqno lookup error = %v, want ErrNotFound", err)
 	}
 }
 

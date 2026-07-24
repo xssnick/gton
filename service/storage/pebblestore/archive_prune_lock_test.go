@@ -48,7 +48,10 @@ func TestRemoveArchivePackageFilesKeepsArtifactLockUntilDeleteMarkerCleared(t *t
 
 	done := make(chan removeArchivePackageFilesResult, 1)
 	go func() {
-		deleted, bytes, err := store.removeArchivePackageFiles([]string{relPath})
+		store.artifactMu.Lock()
+		defer store.artifactMu.Unlock()
+
+		deleted, bytes, err := store.removeArchivePackageFilesLocked([]string{relPath})
 		done <- removeArchivePackageFilesResult{deleted: deleted, bytes: bytes, err: err}
 	}()
 

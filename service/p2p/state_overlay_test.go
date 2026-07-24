@@ -136,14 +136,12 @@ func TestZeroStateDeadlineImmediatelyDemotesSelectedPeer(t *testing.T) {
 	before := peer.statsSnapshot()
 
 	session.selectArchivePeer(shard, peer)
-	if session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded) {
-		t.Fatal("zero-byte deadline kept zero-state peer retryable")
-	}
+	session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded)
 
 	if selected := session.selectedArchivePeerID(shard); !selected.IsZero() {
 		t.Fatalf("zero-state deadline kept selected peer: %s", selected.String())
 	}
-	if _, pinned := node.pinnedPeerIDs()[peer.id]; pinned {
+	if _, protected := node.protectedPeerIDs()[peer.id]; protected {
 		t.Fatal("zero-state deadline kept selected peer pinned")
 	}
 	if after := peer.statsSnapshot(); after != before {
@@ -393,9 +391,11 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		t.Fatalf("save reusable state file metadata: %v", err)
 	}
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       store,
-		stateFilesDir: dir,
+		log:                 zerolog.Nop(),
+		storage:             store,
+		peerStorage:         store,
+		stateFilesDir:       dir,
+		stateCellImportSlot: make(chan struct{}, 1),
 	}
 	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
 	if err != nil {
@@ -458,10 +458,11 @@ func TestTryImportReusableStagedStateFileUsesPeerStorage(t *testing.T) {
 	}
 
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       persistentStateFileMissingStore{Storage: store},
-		peerStorage:   store,
-		stateFilesDir: dir,
+		log:                 zerolog.Nop(),
+		storage:             persistentStateFileMissingStore{Storage: store},
+		peerStorage:         store,
+		stateFilesDir:       dir,
+		stateCellImportSlot: make(chan struct{}, 1),
 	}
 	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
 	if err != nil {
@@ -518,6 +519,7 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
+		peerStorage:   store,
 		stateFilesDir: dir,
 	}
 	header, err := persistentStateSnapshotDownloader{
@@ -709,6 +711,7 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
+		peerStorage:   store,
 		stateFilesDir: dir,
 	}
 	downloader := persistentStateSnapshotDownloader{
@@ -772,10 +775,12 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 	}
 
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       store,
-		peerStorage:   store,
-		stateFilesDir: store.StateFilesDir(),
+		log:                      zerolog.Nop(),
+		storage:                  store,
+		peerStorage:              store,
+		stateFilesDir:            store.StateFilesDir(),
+		stateCellImportSlot:      make(chan struct{}, 1),
+		stateSplitPartDecodeSlot: make(chan struct{}, 1),
 	}
 	downloader := persistentStateSnapshotDownloader{
 		node:          node,
@@ -794,7 +799,7 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 		t.Fatalf("import split part: %v", err)
 	}
 
-	loaded, err := node.loadImportedSplitStatePartRoot(ctx, block, part)
+	loaded, err := node.loadImportedSplitStatePartRoot(ctx, part)
 	if err != nil {
 		t.Fatalf("load imported split part cells: %v", err)
 	}
@@ -1223,7 +1228,7 @@ func mustTestShardStateCellWithAccountIDs(t *testing.T, block ton.BlockIDExt, ac
 		if err != nil {
 			t.Fatalf("build shard account: %v", err)
 		}
-		if err = accounts.Set(cell.BeginCell().MustStoreBigInt(accountID, 256).EndCell(), account); err != nil {
+		if err = accounts.Set(cell.BeginCell().MustStoreSlice(accountID.FillBytes(make([]byte, 32)), 256).EndCell(), account); err != nil {
 			t.Fatalf("set shard account: %v", err)
 		}
 	}

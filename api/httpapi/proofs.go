@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
@@ -87,9 +88,10 @@ func (s *Server) handleShardBlockProof(ctx context.Context, params requestParams
 }
 
 func (s *Server) shardProofFromBlock(ctx context.Context, params requestParams) (ton.BlockIDExt, *apiError) {
-	seqno, hasSeqno, apiErr := params.optionalUint32("from_seqno")
-	if apiErr != nil {
-		return ton.BlockIDExt{}, apiErr
+	seqno, err := params.optionalUint32("from_seqno")
+	hasSeqno := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return ton.BlockIDExt{}, asAPIError(err)
 	}
 	if !hasSeqno {
 		block, _, _, err := s.store.CurrentMasterchainInfo(ctx)

@@ -180,7 +180,7 @@ func (r *shardStateResolver) resolveOwned(ctx context.Context, block ton.BlockID
 	if err != nil {
 		return nil, err
 	}
-	r.markApplied(next, applyElapsed)
+	r.markApplied(applyElapsed)
 
 	if r.afterApplyState != nil {
 		if err = r.afterApplyState(ctx, next, downloaded, applyElapsed); err != nil {
@@ -283,7 +283,7 @@ func (r *shardStateResolver) markReused() {
 	r.mu.Unlock()
 }
 
-func (r *shardStateResolver) markApplied(state *storage.BlockState, elapsed time.Duration) {
+func (r *shardStateResolver) markApplied(elapsed time.Duration) {
 	r.mu.Lock()
 	r.stats.blocksApplied++
 	r.stats.applyElapsed += elapsed
@@ -337,10 +337,7 @@ func (s *Service) applyResolvedShardBlock(ctx context.Context, target ton.BlockI
 }
 
 func (s *Service) stateCellLoader() cell.LazyCellLoader {
-	var base cell.LazyCellLoader
-	if s.storage != nil {
-		base = s.storage.LazyCellLoader()
-	}
+	base := s.storage.LazyCellLoader()
 
 	return func(hash cell.Hash) (*cell.Cell, error) {
 		for _, loader := range s.stateCellLoadersSnapshot() {
@@ -352,24 +349,14 @@ func (s *Service) stateCellLoader() cell.LazyCellLoader {
 				return nil, err
 			}
 		}
-		if base == nil {
-			return nil, storage.ErrNotFound
-		}
 		return base(hash)
 	}
 }
 
 func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
-	if loader == nil {
-		return func() {}
-	}
-
 	s.stateCellLoaderMu.Lock()
 	s.nextStateCellLoaderID++
 	id := s.nextStateCellLoaderID
-	if s.stateCellLoaders == nil {
-		s.stateCellLoaders = map[uint64]cell.LazyCellLoader{}
-	}
 	s.stateCellLoaders[id] = loader
 	s.storeStateCellLoadersSnapshotLocked()
 	s.stateCellLoaderMu.Unlock()

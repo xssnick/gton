@@ -159,7 +159,7 @@ func (s *Server) handleWalletInformation(ctx context.Context, params requestPara
 		return info, nil
 	}
 
-	apiErr = s.enrichWalletInformation(ctx, snapshot, version, &info)
+	apiErr = s.enrichWalletInformation(snapshot, version, &info)
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -167,14 +167,15 @@ func (s *Server) handleWalletInformation(ctx context.Context, params requestPara
 }
 
 func (s *Server) loadAccountSnapshot(ctx context.Context, params requestParams) (accountSnapshot, *apiError) {
-	addr, _, _, apiErr := parseStdAddressParam(params, "address")
+	addr, _, apiErr := parseStdAddressParam(params, "address")
 	if apiErr != nil {
 		return accountSnapshot{}, apiErr
 	}
 
-	seqno, hasSeqno, apiErr := params.optionalUint32("seqno")
-	if apiErr != nil {
-		return accountSnapshot{}, apiErr
+	seqno, err := params.optionalUint32("seqno")
+	hasSeqno := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return accountSnapshot{}, asAPIError(err)
 	}
 
 	var seqnoPtr *uint32
@@ -259,7 +260,7 @@ func walletInformationFromSnapshot(snapshot accountSnapshot, version wallet.Vers
 	return info
 }
 
-func (s *Server) enrichWalletInformation(ctx context.Context, snapshot accountSnapshot, version wallet.Version, info *walletInformation) *apiError {
+func (s *Server) enrichWalletInformation(snapshot accountSnapshot, version wallet.Version, info *walletInformation) *apiError {
 	if snapshot.account == nil || snapshot.account.StateInit == nil || snapshot.account.StateInit.Data == nil {
 		return nil
 	}
@@ -279,7 +280,7 @@ func (s *Server) enrichWalletInformation(ctx context.Context, snapshot accountSn
 	}
 
 	if walletSupportsSignatureFlag(version) {
-		allowed, apiErr := s.walletGetMethodInt(ctx, snapshot, "is_signature_allowed")
+		allowed, apiErr := s.walletGetMethodInt(snapshot, "is_signature_allowed")
 		if apiErr != nil {
 			return apiErr
 		}
@@ -289,7 +290,7 @@ func (s *Server) enrichWalletInformation(ctx context.Context, snapshot accountSn
 	return nil
 }
 
-func (s *Server) walletGetMethodInt(ctx context.Context, snapshot accountSnapshot, method string) (*big.Int, *apiError) {
+func (s *Server) walletGetMethodInt(snapshot accountSnapshot, method string) (*big.Int, *apiError) {
 	result, apiErr := s.executeRunMethod(nil, tlb.MethodNameHash(method), snapshot.addr, snapshot.runMethod)
 	if apiErr != nil {
 		return nil, apiErr
