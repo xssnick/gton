@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/bits"
-	"slices"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -49,18 +48,32 @@ const (
 	encodedCellRecordCompactRefsFlag = 0x10
 	encodedCellRecordHashSize        = 32
 	encodedCellRecordDepthSize       = 2
+
+	stateCellRecordArenaInitialSize  = 4 << 10
+	stateCellRecordArenaMaxChunkSize = 64 << 10
 )
 
 type stateCellRecordBuilder struct {
-	records []EncodedCellRecord
-	index   map[cell.Hash]int
-	bytes   uint64
-	arena   []byte
+	records       []EncodedCellRecord
+	index         map[cell.Hash]int
+	bytes         uint64
+	arena         []byte
+	nextArenaSize int
 }
 
 type encodedCellRecordRefLayout struct {
 	slowRefs    byte
 	compactRefs bool
+}
+
+type stateCellRecordRef struct {
+	cell    *cell.Cell
+	logical *cell.Cell
+}
+
+type stateCellRecordRefs struct {
+	items [4]stateCellRecordRef
+	count int
 }
 
 func NewStateCellRecords(records []EncodedCellRecord) StateCellRecords {
@@ -188,21 +201,26 @@ func (b *stateCellRecordBuilder) alloc(size int) []byte {
 		return nil
 	}
 
-	start := len(b.arena)
-	if cap(b.arena)-start < size {
-		b.arena = slices.Grow(b.arena, size)
-
-		// Grow moved the arena, so point existing records at its new backing
-		// array. Traversal deduplicates before encoding, making record data a
-		// contiguous prefix in insertion order.
-		offset := 0
-		for i := range b.records {
-			end := offset + len(b.records[i].Data)
-			b.records[i].Data = b.arena[offset:end:end]
-			offset = end
+	if cap(b.arena)-len(b.arena) < size {
+		chunkSize := b.nextArenaSize
+		if chunkSize == 0 {
+			chunkSize = stateCellRecordArenaInitialSize
 		}
+		if chunkSize < size {
+			chunkSize = size
+		}
+		// Independent chunks keep existing record data stable without copying
+		// the entire encoded prefix every time the arena grows.
+		b.arena = make([]byte, 0, chunkSize)
+
+		nextArenaSize := chunkSize * 2
+		if nextArenaSize > stateCellRecordArenaMaxChunkSize {
+			nextArenaSize = stateCellRecordArenaMaxChunkSize
+		}
+		b.nextArenaSize = nextArenaSize
 	}
 
+	start := len(b.arena)
 	end := start + size
 	b.arena = b.arena[:end]
 	return b.arena[start:end:end]
@@ -363,41 +381,188 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 		if _, ok := builder.index[hash]; ok {
 			continue
 		}
-		meta := current.GetMetadata()
 
-		record, err := prepareReachableStateUpdateCellRecord(current, meta, builder.alloc)
+		var refs stateCellRecordRefs
+		if current.GetType() != cell.PrunedCellType {
+			refs.count = int(current.RefsNum())
+			for i := range refs.count {
+				ref, err := current.PeekRef(i)
+				if err != nil {
+					return StateCellRecords{}, fmt.Errorf(
+						"load reachable state update ref %d from %x: %w",
+						i,
+						hash,
+						err,
+					)
+				}
+				if ref.IsLazy() {
+					return StateCellRecords{}, fmt.Errorf(
+						"reachable state update ref %d from %x is lazy",
+						i,
+						hash,
+					)
+				}
+				refs.items[i] = stateCellRecordRef{
+					cell:    ref,
+					logical: stateCellLogicalRef(current, ref),
+				}
+			}
+		}
+
+		// GetMetadata builds hash, depth and ref slices for every cell. The
+		// state-update path only needs the encoded form, so write it directly.
+		record, err := prepareReachableStateUpdateCellRecord(current, refs, builder.alloc)
 		if err != nil {
 			return StateCellRecords{}, fmt.Errorf("build reachable state update cell record %x: %w", hash, err)
 		}
 		builder.add(record)
 
-		if current.GetType() == cell.PrunedCellType {
-			continue
-		}
-		for i, ref := range meta.Refs {
-			if ref.Lazy {
-				return StateCellRecords{}, fmt.Errorf("reachable state update ref %d from %x is lazy", i, hash)
-			}
-			refCell, err := current.PeekRef(i)
-			if err != nil {
-				return StateCellRecords{}, fmt.Errorf("load reachable state update ref %d from %x: %w", i, hash, err)
-			}
-			stack = append(stack, refCell)
+		for i := range refs.count {
+			stack = append(stack, refs.items[i].cell)
 		}
 	}
 	return builder.build(), nil
 }
 
-func prepareReachableStateUpdateCellRecord(cl *cell.Cell, meta cell.Metadata, alloc func(int) []byte) (EncodedCellRecord, error) {
-	if cl.GetType() != cell.PrunedCellType {
-		return prepareEncodedCellRecordFromCellMetadata(cl, meta, alloc)
+func prepareReachableStateUpdateCellRecord(
+	cl *cell.Cell,
+	refs stateCellRecordRefs,
+	alloc func(int) []byte,
+) (EncodedCellRecord, error) {
+	body := cl
+	if cl.GetType() == cell.PrunedCellType {
+		var err error
+		body, err = materializePrunedStateCell(cl)
+		if err != nil {
+			return EncodedCellRecord{}, err
+		}
 	}
 
-	pruned, err := materializePrunedStateCell(cl)
-	if err != nil {
-		return EncodedCellRecord{}, err
+	record := prepareEncodedStateCellRecord(cl, body, refs, alloc)
+	return record, nil
+}
+
+func prepareEncodedStateCellRecord(
+	view *cell.Cell,
+	body *cell.Cell,
+	refs stateCellRecordRefs,
+	alloc func(int) []byte,
+) EncodedCellRecord {
+	cellBits := body.BitsSize()
+	d1, d2 := cellRecordDescriptorsForLevelMask(body, view.LevelMask(), refs.count, cellBits)
+	layout, refsSize := encodedStateCellRefLayout(refs)
+	size := 2 + int(d2/2+d2%2) + refsSize
+
+	encoded := alloc(size)
+	encodeStateCellRecordTo(encoded, body, refs, d1, d2, layout)
+	return EncodedCellRecord{
+		Hash: view.HashKey(),
+		Data: encoded,
 	}
-	return prepareEncodedCellRecordFromCellMetadata(pruned, meta, alloc)
+}
+
+func encodeStateCellRecordTo(
+	buf []byte,
+	body *cell.Cell,
+	refs stateCellRecordRefs,
+	d1 byte,
+	d2 byte,
+	layout encodedCellRecordRefLayout,
+) {
+	pos := 0
+	if layout.compactRefs {
+		d1 |= encodedCellRecordCompactRefsFlag
+	}
+	buf[pos] = d1
+	buf[pos+1] = d2
+	pos += 2
+
+	pos += body.SerializeBOCBodyTo(buf[pos:])
+	if layout.compactRefs {
+		buf[pos] = layout.slowRefs
+		pos++
+	}
+	for i := range refs.count {
+		logicalRef := refs.items[i].logical
+		levelMask := logicalRef.LevelMask()
+		if layout.compactRefs && layout.slowRefs&(1<<uint(i)) == 0 {
+			hash := logicalRef.HashKey(0)
+			copy(buf[pos:pos+encodedCellRecordHashSize], hash[:])
+			pos += encodedCellRecordHashSize
+			binary.BigEndian.PutUint16(
+				buf[pos:pos+encodedCellRecordDepthSize],
+				logicalRef.Depth(0),
+			)
+			pos += encodedCellRecordDepthSize
+			continue
+		}
+
+		buf[pos] = levelMask.Mask
+		pos++
+		for level := 0; level <= levelMask.GetLevel(); level++ {
+			if !levelMask.IsSignificant(level) {
+				continue
+			}
+			hash := logicalRef.HashKey(level)
+			copy(buf[pos:pos+encodedCellRecordHashSize], hash[:])
+			pos += encodedCellRecordHashSize
+		}
+		for level := 0; level <= levelMask.GetLevel(); level++ {
+			if !levelMask.IsSignificant(level) {
+				continue
+			}
+			binary.BigEndian.PutUint16(
+				buf[pos:pos+encodedCellRecordDepthSize],
+				logicalRef.Depth(level),
+			)
+			pos += encodedCellRecordDepthSize
+		}
+	}
+}
+
+func encodedStateCellRefLayout(refs stateCellRecordRefs) (encodedCellRecordRefLayout, int) {
+	if refs.count == 0 {
+		return encodedCellRecordRefLayout{}, 0
+	}
+
+	refsSize := 0
+	compactRefsSize := 1
+	hasCommonRef := false
+	var layout encodedCellRecordRefLayout
+	for i := range refs.count {
+		logicalRef := refs.items[i].logical
+		levelMask := logicalRef.LevelMask()
+		hashesCount := CellRefHashesCount(levelMask.Mask)
+		refSize := 1 + hashesCount*(encodedCellRecordHashSize+encodedCellRecordDepthSize)
+		refsSize += refSize
+		if levelMask.Mask == 0 {
+			hasCommonRef = true
+			compactRefsSize += encodedCellRecordHashSize + encodedCellRecordDepthSize
+			continue
+		}
+		layout.slowRefs |= 1 << uint(i)
+		compactRefsSize += refSize
+	}
+	layout.compactRefs = hasCommonRef && compactRefsSize <= refsSize
+	if layout.compactRefs {
+		return layout, compactRefsSize
+	}
+	return layout, refsSize
+}
+
+func stateCellLogicalRef(parent *cell.Cell, ref *cell.Cell) *cell.Cell {
+	// Match tonutils cellRefView.logicalBoundaryRef: PeekRef already applies
+	// the parent view, while non-virtual Merkle parents shift children by one.
+	if parent.IsVirtualized() {
+		return ref
+	}
+
+	var level uint8
+	switch parent.GetType() {
+	case cell.MerkleProofCellType, cell.MerkleUpdateCellType:
+		level = 1
+	}
+	return ref.Virtualize(level)
 }
 
 func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {
@@ -545,13 +710,23 @@ func merkleUpdateTarget(update *cell.Cell) (*cell.Cell, error) {
 }
 
 func DecodeCellRecordTrusted(hash []byte, data []byte) *CellRecord {
+	record := &CellRecord{
+		Refs: make([]CellRefRecord, int(data[0]&7)),
+	}
+	decodeCellRecordTrustedInto(hash, data, record, record.Refs)
+	return record
+}
+
+func decodeCellRecordTrustedInto(hash []byte, data []byte, record *CellRecord, refs []CellRefRecord) {
 	pos := 0
 	storedD1 := data[pos]
 	compactRefs := storedD1&encodedCellRecordCompactRefsFlag != 0
-	record := &CellRecord{
+	refsCount := int(storedD1 & 7)
+	*record = CellRecord{
 		Hash: hash,
 		D1:   storedD1 &^ encodedCellRecordCompactRefsFlag,
 		D2:   data[pos+1],
+		Refs: refs[:refsCount],
 	}
 	pos += 2
 
@@ -559,8 +734,6 @@ func DecodeCellRecordTrusted(hash []byte, data []byte) *CellRecord {
 	record.Data = data[pos : pos+dataLen]
 	pos += dataLen
 
-	refsCount := int(record.D1 & 7)
-	record.Refs = make([]CellRefRecord, refsCount)
 	var slowRefs byte
 	if compactRefs && refsCount > 0 {
 		slowRefs = data[pos]
@@ -598,7 +771,6 @@ func DecodeCellRecordTrusted(hash []byte, data []byte) *CellRecord {
 			Depths:    depths,
 		}
 	}
-	return record
 }
 
 func cellRecordDescriptorsForLevelMask(cl *cell.Cell, levelMask cell.LevelMask, refsCount int, bitLen uint) (byte, byte) {

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/pierrec/lz4/v4"
@@ -215,7 +214,7 @@ func TestSlaveAndOutMsgQueueTypesRoundTrip(t *testing.T) {
 		{
 			name: "getOutMsgQueueProof",
 			msg: GetOutMsgQueueProof{
-				DstShard: archive.ShardID{Workchain: 0, Shard: topShard},
+				DstShard: tonnodeapi.ShardID{Workchain: 0, Shard: topShard},
 				Blocks: []ton.BlockIDExt{{
 					Workchain: 0,
 					Shard:     topShard,
@@ -240,6 +239,28 @@ func TestSlaveAndOutMsgQueueTypesRoundTrip(t *testing.T) {
 			name: "outMsgQueueProofEmpty",
 			msg:  OutMsgQueueProofEmpty{},
 			want: OutMsgQueueProofEmpty{},
+		},
+		{
+			name: "outMsgQueueProofBroadcast",
+			msg: OutMsgQueueProofBroadcast{
+				DstShard: tonnodeapi.ShardID{
+					Workchain: 0,
+					Shard:     topShard,
+				},
+				Block: ton.BlockIDExt{
+					Workchain: 0,
+					Shard:     topShard,
+					SeqNo:     11,
+					RootHash:  bytes.Repeat([]byte{0x12}, 32),
+					FileHash:  bytes.Repeat([]byte{0x13}, 32),
+				},
+				Limits: ImportedMsgQueueLimits{
+					MaxBytes: 4096,
+					MaxMsgs:  32,
+				},
+				Proof: OutMsgQueueProofEmpty{},
+			},
+			want: OutMsgQueueProofBroadcast{},
 		},
 	}
 

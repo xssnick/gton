@@ -18,8 +18,10 @@ import (
 var _ p2p.BroadcastSignatureVerifier = (*Service)(nil)
 
 type broadcastValidatorConfig struct {
-	rootHash cell.Hash
-	cfg      *tlb.BlockchainConfig
+	rootHash       cell.Hash
+	cfg            *tlb.BlockchainConfig
+	plumtreePolicy p2p.PlumtreePolicy
+	fastSync       fastSyncBlockchainConfig
 }
 
 type broadcastValidatorCacheKey struct {
@@ -67,6 +69,15 @@ func (c *broadcastValidatorCache) putConfig(block ton.BlockIDExt, config broadca
 		c.entries = make(map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet)
 	}
 	return c.config
+}
+
+func (s *Service) publishBroadcastValidatorConfig(
+	block ton.BlockIDExt,
+	config broadcastValidatorConfig,
+) broadcastValidatorConfig {
+	config = s.broadcastValidatorCache.putConfig(block, config)
+	s.node.SetPlumtreePolicy(config.plumtreePolicy)
+	return config
 }
 
 func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
@@ -309,7 +320,7 @@ func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcas
 	if err != nil {
 		return broadcastValidatorConfig{}, err
 	}
-	return s.broadcastValidatorCache.putConfig(current.Masterchain.Block, config), nil
+	return s.publishBroadcastValidatorConfig(current.Masterchain.Block, config), nil
 }
 
 func broadcastValidatorConfigFromMasterchainState(state *storage.BlockState) (broadcastValidatorConfig, error) {
@@ -320,8 +331,12 @@ func broadcastValidatorConfigFromMasterchainState(state *storage.BlockState) (br
 	if cfg.Root == nil {
 		return broadcastValidatorConfig{}, fmt.Errorf("masterchain state %s has empty validator config root", storage.FormatBlockRef(state.Block))
 	}
+
+	fastSync := fastSyncConfigFromConfig(cfg)
 	return broadcastValidatorConfig{
-		rootHash: cfg.Root.HashKey(),
-		cfg:      cfg,
+		rootHash:       cfg.Root.HashKey(),
+		cfg:            cfg,
+		plumtreePolicy: fastSync.plumtreePolicy(),
+		fastSync:       fastSync,
 	}, nil
 }

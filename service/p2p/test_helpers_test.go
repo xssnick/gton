@@ -50,9 +50,22 @@ func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
 	if sub.node == nil {
 		sub.node = &Node{}
 	}
+	if sub.quicEnvelope == nil && len(sub.spec.ShortID) == PeerIDSize {
+		envelope, err := newQUICOverlayEnvelope(sub.spec.ShortID, nil)
+		if err != nil {
+			panic(err)
+		}
+		sub.quicEnvelope = envelope
+	}
 	for _, peer := range sub.peers {
+		if peer.route == nil {
+			peer.route = newPeerRoute("")
+		}
 		if peer.overlay == nil {
 			peer.overlay = &overlay.ADNLOverlayWrapper{}
+		}
+		if peer.broadcastPeer == nil {
+			peer.broadcastPeer = peer.overlay
 		}
 		if peer.release == nil {
 			peer.release = func() {}

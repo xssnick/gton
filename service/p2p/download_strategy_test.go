@@ -663,7 +663,6 @@ func TestRunConcurrentKeyBlockQueriesPrefersNonEmptyBatch(t *testing.T) {
 		{id: testPeerID("with-key"), addr: "with-key"},
 	}
 	want := testBlockID(-1, topShard, 42)
-	semanticFailures := 0
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -678,8 +677,6 @@ func TestRunConcurrentKeyBlockQueriesPrefersNonEmptyBatch(t *testing.T) {
 		default:
 			return nil, context.Canceled
 		}
-	}, func(*overlayPeer) {
-		semanticFailures++
 	})
 	if err != nil {
 		t.Fatalf("queryKeyBlocksFromPeers: %v", err)
@@ -691,9 +688,6 @@ func TestRunConcurrentKeyBlockQueriesPrefersNonEmptyBatch(t *testing.T) {
 	}
 	if len(keyBlocks.Blocks) != 1 || !keyBlocks.Blocks[0].Equals(&want) {
 		t.Fatalf("unexpected key blocks: %#v", keyBlocks.Blocks)
-	}
-	if semanticFailures != 1 {
-		t.Fatalf("expected one semantic failure, got %d", semanticFailures)
 	}
 }
 
@@ -784,7 +778,7 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 	}
 }
 
-func TestRunConcurrentKeyBlockQueriesSkipsErrorResponse(t *testing.T) {
+func TestRunConcurrentKeyBlockQueriesSkipsQueryError(t *testing.T) {
 	peers := []*overlayPeer{
 		{id: testPeerID("error"), addr: "error"},
 		{id: testPeerID("with-key"), addr: "with-key"},
@@ -797,13 +791,13 @@ func TestRunConcurrentKeyBlockQueriesSkipsErrorResponse(t *testing.T) {
 	got, err := queryKeyBlocksFromPeers(ctx, peers, 2, 20*time.Millisecond, func(ctx context.Context, peer *overlayPeer) (tl.Serializable, error) {
 		switch peer.id {
 		case testPeerID("error"):
-			return KeyBlocks{Error: true}, nil
+			return nil, errors.New("key block lookup error")
 		case testPeerID("with-key"):
 			return KeyBlocks{Blocks: []ton.BlockIDExt{want}}, nil
 		default:
 			return nil, context.Canceled
 		}
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("queryKeyBlocksFromPeers: %v", err)
 	}

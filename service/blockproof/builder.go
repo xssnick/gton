@@ -648,20 +648,12 @@ func visitBlockCreateStats(loader *cell.Slice) error {
 	if err != nil {
 		return err
 	}
-	switch magic {
-	case 0x17:
-		_, err = loader.LoadDict(256)
-		return err
-	case 0x34:
-		_, err = loader.LoadAugDict(256, cell.ReadOnlyAugmentation{SkipExtraFn: skipUint32Boundary}, false)
-		return err
-	default:
+	// block_create_stats_ext#34 is schema-only: the reference collator never
+	// emits it and every node rejects a state that carries it.
+	if magic != 0x17 {
 		return fmt.Errorf("invalid block_create_stats magic %x", magic)
 	}
-}
-
-func skipUint32Boundary(loader *cell.Slice) error {
-	_, err := loader.LoadUInt(32)
+	_, err = loader.LoadDict(256)
 	return err
 }
 

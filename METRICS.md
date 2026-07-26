@@ -129,7 +129,7 @@ sync queues.
 | `gton_p2p_queue_max_items` | gauge | `queue` | Configured item limit for a P2P queue. |
 | `gton_p2p_queue_max_bytes` | gauge | `queue` | Configured byte limit for a P2P queue. |
 | `gton_p2p_queue_dropped_total` | counter | `queue` | Number of rejected pushes into a P2P queue. |
-| `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind` | Number of P2P broadcasts received, accepted, or successfully sent through the app-level rebroadcast queue by type. |
+| `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind`, `delivery` | Number of P2P broadcasts received, accepted, or successfully sent through the app-level rebroadcast queue by type and delivery mode. |
 | `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. |
 | `gton_p2p_broadcast_pipeline_stage_duration_seconds` | histogram | `stage`, `kind`, `delivery`, `result` | Inbound broadcast hot-path stage latency. Stages include `fec_decode`, `classify`, `candidate_decode`, `shard_desc_validate`, `hot_cache_notify`, and `exact_pop`. |
 | `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful app-level P2P rebroadcast queue sends. |
@@ -153,6 +153,11 @@ immediate transport peer from the broadcast signer. An unlisted peer is kept as
 an ingress transport but is not promoted into the overlay routing roster.
 Overlay-level relay sends are exported separately via
 `gton_p2p_broadcast_relay_sent_total`.
+
+Common `delivery` values are `simple`, `fec`, `two_step`, and `plumtree`.
+Inbound QUIC Plumtree broadcasts use `delivery="plumtree"`. For
+`direction="queue_rebroadcasted"`, the label describes the actual outgoing
+broadcast mode.
 
 Common `reason` values for `gton_p2p_broadcast_dropped_total` include `seen`,
 `invalid_payload`, `decode_failed`, `signature_parse_failed`, and

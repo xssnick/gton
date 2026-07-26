@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -89,10 +90,10 @@ const (
 	maxDecompressedBlockSize    = 32 << 20
 	maxRandomPeerReply          = 4
 
-	masterchainProtoVersionMajor   = 1
-	masterchainProtoVersionMinor   = 0
+	masterchainProtoVersionMajor   = 3
+	masterchainProtoVersionMinor   = 2
 	shardchainProtoVersionMajor    = 3
-	shardchainProtoVersionMinor    = 1
+	shardchainProtoVersionMinor    = 2
 	ordinarySimpleBroadcastMaxSize = 768
 
 	peerStopUnreliability = 5.0
@@ -106,7 +107,20 @@ const (
 	blockUnavailablePeerPenalty   = 10 * time.Second
 	blockUnavailableConfirmWindow = 3 * time.Second
 	blockSpeedSampleMin           = int64(64 << 10)
+
+	customQueryProbeMinDelay  = time.Second
+	customQueryProbeJitter    = time.Second
+	customQueryProbeTimeout   = time.Second
+	customQueryProbeMaxPeers  = 3
+	customQueryProbeMaxAnswer = 1024
+	fastSyncPingMinDelay      = time.Second
+	fastSyncPingJitter        = time.Second
+	fastSyncPingFanout        = 5
+	fastSyncPingMaxAnswer     = 1024
 )
+
+// inboundQUICQueryParallelism bounds project-local concurrent QUIC query work.
+const inboundQUICQueryParallelism = 64
 
 const (
 	prefetchShardBlockTimeout    = 2500 * time.Millisecond
@@ -118,9 +132,10 @@ const (
 type Delivery string
 
 const (
-	DeliverySimple  Delivery = "simple"
-	DeliveryFEC     Delivery = "fec"
-	DeliveryTwoStep Delivery = "two_step"
+	DeliverySimple   Delivery = "simple"
+	DeliveryFEC      Delivery = "fec"
+	DeliveryTwoStep  Delivery = "two_step"
+	DeliveryPlumtree Delivery = "plumtree"
 )
 
 type BroadcastEvent struct {
@@ -161,28 +176,30 @@ func (e BroadcastEvent) BlockRef() string {
 }
 
 type Options struct {
-	Logger                    *zerolog.Logger
-	GlobalConfig              *liteclient.GlobalConfig
-	PrivateKey                ed25519.PrivateKey
-	ListenAddr                string
-	ExternalIP                net.IP
-	ExternalPort              uint16
-	DHTPrivateKey             ed25519.PrivateKey
-	DHTListenAddr             string
-	StateFilesDir             string
-	Storage                   storage.Storage
-	PeerServingStorage        storage.PeerServingStorage
-	LiveBlockCache            *storage.LiveBlockCache
-	CompressedState           CompressedBlockStateProvider
-	SyncLag                   SyncLagProvider
-	SignatureVerifier         BroadcastSignatureVerifier
-	BroadcastAdmission        BroadcastAdmission
-	ExternalMessageAdmission  ExternalMessageAdmission
-	BlockReceivedObserver     BlockReceivedObserver
-	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
-	AllowDuplicateExternals   bool
-	LocalExternalFanout       int
-	CustomOverlays            []CustomOverlayConfig
+	Logger                           *zerolog.Logger
+	GlobalConfig                     *liteclient.GlobalConfig
+	PrivateKey                       ed25519.PrivateKey
+	ListenAddr                       string
+	ExternalIP                       net.IP
+	ExternalPort                     uint16
+	DHTPrivateKey                    ed25519.PrivateKey
+	DHTListenAddr                    string
+	StateFilesDir                    string
+	Storage                          storage.Storage
+	PeerServingStorage               storage.PeerServingStorage
+	LiveBlockCache                   *storage.LiveBlockCache
+	CompressedState                  CompressedBlockStateProvider
+	SyncLag                          SyncLagProvider
+	SignatureVerifier                BroadcastSignatureVerifier
+	BroadcastAdmission               BroadcastAdmission
+	ExternalMessageAdmission         ExternalMessageAdmission
+	BlockReceivedObserver            BlockReceivedObserver
+	ExternalBroadcastCapacity        ExternalBroadcastCapacityOptions
+	AllowDuplicateExternals          bool
+	LocalExternalFanout              int
+	CustomOverlays                   []CustomOverlayConfig
+	FastSyncCertificates             []overlay.MemberCertificate
+	FastSyncBroadcastSpeedMultiplier float64
 }
 
 type ExternalBroadcastCapacityOptions struct {
@@ -287,6 +304,8 @@ type CustomOverlayConfig struct {
 	Nodes             []CustomOverlayNodeConfig
 	SenderShards      []CustomOverlayShard
 	SkipPublicMsgSend bool
+	UseQUIC           bool
+	SendQueries       bool
 }
 
 type CustomOverlayNodeConfig struct {
@@ -294,6 +313,7 @@ type CustomOverlayNodeConfig struct {
 	MsgSender         bool
 	MsgSenderPriority int
 	BlockSender       bool
+	AcceptQueries     bool
 }
 
 type CustomOverlayShard struct {
@@ -306,6 +326,7 @@ type overlayKind uint8
 const (
 	overlayKindPublicShard overlayKind = iota
 	overlayKindCustomFixed
+	overlayKindFastSync
 )
 
 type overlaySpec struct {
@@ -319,15 +340,20 @@ type overlaySpec struct {
 	ProtoVersionMinor int32
 	FixedNodes        []PeerID
 	FixedNodeIDs      map[PeerID]struct{}
+	QueryAcceptors    []PeerID
 	MsgSenders        map[PeerID]int
 	BlockSenders      map[PeerID]struct{}
 	AuthorizedKeys    map[string]uint32
 	SenderShards      []CustomOverlayShard
 	SkipPublicMsgSend bool
+	UseQUIC           bool
+	SendQueries       bool
+	AcceptQueries     bool
 	Announce          bool
 	DHTDiscovery      bool
 	RandomPeers       bool
 	QueryCapabilities bool
+	FastSync          *fastSyncOverlaySpec
 }
 
 type DownloadedBlock struct {

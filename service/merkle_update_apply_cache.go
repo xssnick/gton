@@ -27,6 +27,11 @@ type stateCellEncodedCache struct {
 	prewriteToken   uint64
 }
 
+// stateCellPrewriteCapacityHint bounds the presized prewrite slice in
+// stageRecords so a large input whose records are mostly already in the window
+// cannot reserve far more than it appends.
+const stateCellPrewriteCapacityHint = 4096
+
 func newStateCellEncodedCache(capacity int) *stateCellEncodedCache {
 	if capacity < 1 {
 		capacity = 1
@@ -112,8 +117,15 @@ func (c *stateCellEncodedCache) stageRecords(records storage.StateCellRecords, p
 
 	c.mu.Lock()
 	var prewrite []storage.EncodedCellRecord
+	if prewriter != nil {
+		// Presize to the input, bounded so a set that is mostly already in the
+		// window cannot reserve an unbounded slice. Without a prewriter the
+		// slice is never read, so it is not built at all.
+		prewrite = make([]storage.EncodedCellRecord, 0, min(records.Len(), stateCellPrewriteCapacityHint))
+	}
 	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
-		if c.setRecordLocked(record.Hash, record.Data) {
+		// setRecordLocked must run for every record: it owns the window state.
+		if c.setRecordLocked(record.Hash, record.Data) && prewriter != nil {
 			prewrite = append(prewrite, record)
 		}
 		return nil

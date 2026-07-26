@@ -24,7 +24,13 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 	if a.node.IsOffline() {
 		return nil, ErrOffline
 	}
-	sub, err := a.node.subscriptionForBlock(block)
+	// Zero state is a bulk historical download served from the archive pool, so
+	// it uses the historical selector like archive packages do. The overlay
+	// chosen is the same either way - zero state always carries topShard, which
+	// historicalOverlayBlockForDownload leaves untouched - but this keeps it off
+	// FastSync, whose subscriptions have no DHT presence for the pool to work
+	// with.
+	sub, err := a.node.querySubscriptionForHistoricalBlock(block)
 	if err != nil {
 		return nil, err
 	}
@@ -177,12 +183,17 @@ func zeroStateArchiveCandidates(pool *archivePeerPool, session *ArchiveSession, 
 	return filtered
 }
 
-func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *overlaySubscription, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, block ton.BlockIDExt) (storage.DownloadedState, error) {
+func (a *ArchiveSession) downloadZeroStateFromPeer(ctx context.Context, sub *overlaySubscription, pool *archivePeerPool, shard archive.ShardID, peer *overlayPeer, block ton.BlockIDExt) (downloaded storage.DownloadedState, err error) {
 	archiveRelease, ok := pool.acquire(peer)
 	if !ok {
 		return nil, fmt.Errorf("archive peer left the pool: %w", ErrStateNotAvailable)
 	}
 	defer archiveRelease()
+
+	query := sub.beginPeerQueryOperation(peer)
+	defer func() {
+		query.finish(err)
+	}()
 
 	resp, err := sub.queryArchiveFromPeerWithLimits(ctx, peer, PrepareZeroState{Block: block}, archiveInfoTimeout, persistentStateSmallAnswerMax)
 	if err != nil {

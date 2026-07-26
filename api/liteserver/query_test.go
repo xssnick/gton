@@ -5506,16 +5506,35 @@ func TestHandleOutMsgQueueSizesUsesCurrentMasterAndShardStates(t *testing.T) {
 
 func TestValidatorStatsCountParsesBlockCreateStatsLayouts(t *testing.T) {
 	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 13}
-	for _, magic := range []uint64{0x17, 0x34} {
-		stateRoot := testMasterStateWithBlockCreateStats(t, base, magic)
 
-		count, complete, err := validatorStatsCount(stateRoot, 0, 10, nil)
-		if err != nil {
-			t.Fatalf("magic %#x validator stats count: %v", magic, err)
-		}
-		if count != 0 || !complete {
-			t.Fatalf("magic %#x count = %d, complete = %v, want 0 true", magic, count, complete)
-		}
+	stateRoot := testMasterStateWithBlockCreateStats(t, base, 0x17)
+	count, complete, err := validatorStatsCount(stateRoot, 0, 10, nil)
+	if err != nil {
+		t.Fatalf("block_create_stats#17 validator stats count: %v", err)
+	}
+	if count != 0 || !complete {
+		t.Fatalf("block_create_stats#17 count = %d, complete = %v, want 0 true", count, complete)
+	}
+}
+
+// TestValidatorStatsCountRejectsExtendedBlockCreateStats pins that
+// block_create_stats_ext#34 is refused rather than parsed. The reference
+// collator never emits that constructor, every node rejects a state carrying
+// it, and the reference liteserver refuses the query outright — answering it
+// would be a bit-compat divergence, not a feature.
+func TestValidatorStatsCountRejectsExtendedBlockCreateStats(t *testing.T) {
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 13}
+	stateRoot := testMasterStateWithBlockCreateStats(t, base, 0x34)
+
+	count, complete, err := validatorStatsCount(stateRoot, 0, 10, nil)
+	if err == nil {
+		t.Fatal("block_create_stats_ext#34 was accepted, want a rejection")
+	}
+	if !strings.Contains(err.Error(), "invalid block create stats magic 34") {
+		t.Fatalf("block_create_stats_ext#34 err = %v, want the magic rejection", err)
+	}
+	if count != 0 || complete {
+		t.Fatalf("rejected layout returned count = %d, complete = %v, want 0 false", count, complete)
 	}
 }
 

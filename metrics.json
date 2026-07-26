@@ -3886,7 +3886,7 @@
       "spec": {
         "id": 34,
         "title": "Accepted broadcast rate",
-        "description": "Accepted inbound P2P broadcasts by overlay and TL type.",
+        "description": "Accepted inbound P2P broadcasts by overlay, TL type, and delivery mode. QUIC Plumtree traffic uses delivery=plumtree.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -3905,8 +3905,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"accepted\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{overlay}} {{kind}}"
+                      "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"accepted\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} {{kind}} {{delivery}}"
                     }
                   }
                 }
@@ -3993,8 +3993,8 @@
                       "name": "$datasource"
                     },
                     "spec": {
-                      "expr": "sum by (instance, overlay, kind) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"queue_rebroadcasted\"}[$__rate_interval]))",
-                      "legendFormat": "queue {{instance}} {{overlay}} {{kind}}"
+                      "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"queue_rebroadcasted\"}[$__rate_interval]))",
+                      "legendFormat": "queue {{instance}} {{overlay}} {{kind}} {{delivery}}"
                     }
                   }
                 }

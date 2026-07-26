@@ -184,6 +184,13 @@ func formatStatusWithNow(snapshot service2.StatusSnapshot, showPeers bool, now t
 	fmt.Fprintf(&b, "  %-20s %s\n", "latest masterchain", formatBlock(snapshot.LatestMasterchain))
 	fmt.Fprintf(&b, "  %-20s %s\n", "latest basechain", formatBlock(snapshot.LatestBasechain))
 	fmt.Fprintf(&b, "  %-20s %d\n", "overlays", len(snapshot.Overlays))
+	fmt.Fprintf(
+		&b,
+		"  %-20s %d current / %d accepted\n",
+		"QUIC peers",
+		snapshot.QUICPeers,
+		snapshot.QUICPeersAccepted,
+	)
 	fmt.Fprintf(&b, "  %-20s %d / %d alive\n", "known peers", totalAliveKnownPeers, totalKnownPeers)
 	fmt.Fprintf(&b, "  %-20s %d / %d alive\n", "neighbours", totalAliveNeighbours, totalNeighbours)
 

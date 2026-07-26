@@ -241,7 +241,7 @@ func TestSendExternalMessageCustomOverlayCanSkipPublic(t *testing.T) {
 	if err := sendTestExternalMessage(t, node, body); err != nil {
 		t.Fatalf("send external message failed: %v", err)
 	}
-	if got, ok := customSub.customTwoStepQueueStatusSnapshot(); !ok {
+	if got, ok := customSub.twoStepQueueStatusSnapshot(); !ok {
 		t.Fatalf("expected custom two-step rebroadcast queue")
 	} else if got.Items != 1 {
 		t.Fatalf("custom two-step queued items = %d, want 1", got.Items)

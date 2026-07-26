@@ -26,6 +26,8 @@ type peerStats struct {
 	downloadSlowUntil time.Time
 	lastPongAt        time.Time
 	probeFailures     uint32
+	queryResponds     bool
+	queryIgnoreUntil  time.Time
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
@@ -109,6 +111,8 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 		downloadSlowUntil: p.downloadSlowUntil,
 		lastPongAt:        p.lastPongAt,
 		probeFailures:     p.probeFailures,
+		queryResponds:     p.queryResponds,
+		queryIgnoreUntil:  p.queryIgnoreUntil,
 	}
 }
 
@@ -119,6 +123,51 @@ func (p *overlayPeer) applyCapabilities(cap Capabilities) {
 	p.versionMajor = cap.VersionMajor
 	p.versionMinor = cap.VersionMinor
 	p.capabilitiesFlags = cap.Flags
+}
+
+func (p *overlayPeer) queryProbeSuccess(cap Capabilities, rtt time.Duration) (bool, bool) {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	becameReady := !p.queryResponds
+	p.versionMajor = cap.VersionMajor
+	p.versionMinor = cap.VersionMinor
+	p.capabilitiesFlags = cap.Flags
+	p.queryResponds = true
+
+	promoted := p.noteSuccessLocked(time.Now())
+	if rtt <= 0 {
+		return promoted, becameReady
+	}
+	if p.roundtrip == 0 {
+		p.roundtrip = rtt
+		return promoted, becameReady
+	}
+	p.roundtrip = (p.roundtrip + rtt) / 2
+	return promoted, becameReady
+}
+
+func (p *overlayPeer) queryProbeFailed() bool {
+	p.statsMx.Lock()
+	changed := p.queryResponds
+	p.queryResponds = false
+	p.statsMx.Unlock()
+	return changed
+}
+
+func (p *overlayPeer) ignoreApplicationQueries(until time.Time) {
+	p.statsMx.Lock()
+	p.queryIgnoreUntil = until
+	p.statsMx.Unlock()
+}
+
+func (p *overlayPeer) queryReady(now time.Time, requiredVersionMajor, requiredVersionMinor int32) bool {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	return p.queryResponds &&
+		!now.Before(p.queryIgnoreUntil) &&
+		peerEligibleVersion(p.versionMajor, p.versionMinor, requiredVersionMajor, requiredVersionMinor)
 }
 
 func (p *overlayPeer) querySuccess(rtt time.Duration) bool {
@@ -167,7 +216,6 @@ func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowTh
 	defer p.statsMx.Unlock()
 
 	now := time.Now()
-	p.noteSuccessLocked(now)
 	p.downloadCount++
 	if p.downloadBytesSec == 0 {
 		p.downloadBytesSec = speed
@@ -391,8 +439,12 @@ func peerRoundtripPenalty(roundtrip, minRoundtrip time.Duration) uint32 {
 }
 
 func peerEligible(stats peerStats, requiredVersionMajor, requiredVersionMinor int32) bool {
-	return stats.versionMajor > requiredVersionMajor ||
-		(stats.versionMajor == requiredVersionMajor && stats.versionMinor >= requiredVersionMinor)
+	return peerEligibleVersion(stats.versionMajor, stats.versionMinor, requiredVersionMajor, requiredVersionMinor)
+}
+
+func peerEligibleVersion(versionMajor, versionMinor, requiredVersionMajor, requiredVersionMinor int32) bool {
+	return versionMajor > requiredVersionMajor ||
+		(versionMajor == requiredVersionMajor && versionMinor >= requiredVersionMinor)
 }
 
 func nextNeighbourReloadDelay() time.Duration {
@@ -501,15 +553,36 @@ func (s *overlaySubscription) refreshTargets() []*overlayPeer {
 }
 
 func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
+	if s.spec.Kind == overlayKindCustomFixed {
+		return s.customQueryCandidates(requiredVersionMajor, requiredVersionMinor)
+	}
+	if s.spec.Kind == overlayKindFastSync {
+		return s.fastSyncQueryCandidates(
+			requiredVersionMajor,
+			requiredVersionMinor,
+		)
+	}
+
 	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
 	others := s.preferredPeers(requiredVersionMajor, requiredVersionMinor)
-	return mergePeerCandidates(neighbours, others)
+	peers := mergePeerCandidates(neighbours, others)
+	if len(peers) > 0 {
+		return peers
+	}
+
+	// C++ has a direct random-peer fallback after its neighbour roster is
+	// exhausted. It may still return a previously verified alive peer whose
+	// announcement is older than the normal 10-minute admission window.
+	return s.publicRandomQueryFallback(requiredVersionMajor, requiredVersionMinor)
 }
 
 func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requiredVersionMinor int32, limit int) []*overlayPeer {
 	peers := s.queryCandidates(requiredVersionMajor, requiredVersionMinor)
 	if limit <= 0 || len(peers) <= limit {
 		return peers
+	}
+	if s.spec.Kind == overlayKindCustomFixed {
+		return peers[:limit]
 	}
 
 	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
@@ -541,6 +614,7 @@ type broadcastTargetsSnapshot struct {
 	builtAt    time.Time
 	peers      []*overlayPeer
 	broadcast  []overlay.BroadcastPeer
+	plumtree   []PeerID
 }
 
 // broadcastTargetsSnapshot returns the deduplicated union of neighbour and
@@ -570,6 +644,7 @@ func (s *overlaySubscription) broadcastTargetsSnapshot() *broadcastTargetsSnapsh
 }
 
 func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsSnapshot {
+	now := time.Now()
 	neighbours := s.neighbourPeerSnapshots()
 	known := s.knownPeersSnapshot()
 
@@ -595,11 +670,26 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 		peers = alive
 	}
 
+	receivers := make([]*overlayPeer, 0, len(peers))
 	broadcast := make([]overlay.BroadcastPeer, 0, len(peers))
+	plumtree := make([]PeerID, 0, len(peers))
 	for _, peer := range peers {
-		broadcast = append(broadcast, peer.overlay)
+		if s.fastSync != nil &&
+			!s.fastSync.peerReceivesBroadcasts(peer.id) {
+			continue
+		}
+		receivers = append(receivers, peer)
+		broadcast = append(broadcast, peer.broadcastPeer)
+		if peer.route.quicReady(now) {
+			plumtree = append(plumtree, peer.id)
+		}
 	}
-	return &broadcastTargetsSnapshot{builtAt: time.Now(), peers: peers, broadcast: broadcast}
+	return &broadcastTargetsSnapshot{
+		builtAt:   now,
+		peers:     receivers,
+		broadcast: broadcast,
+		plumtree:  plumtree,
+	}
 }
 
 func mergePeerCandidates(first, second []*overlayPeer) []*overlayPeer {

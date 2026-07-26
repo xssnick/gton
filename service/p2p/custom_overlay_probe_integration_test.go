@@ -65,6 +65,12 @@ func (s *stubDHTBackend) FindAddresses(_ context.Context, key []byte) (*adnladdr
 	if err != nil {
 		return nil, nil, err
 	}
+	switch value := addr.(type) {
+	case *adnladdr.UDP:
+		addr = *value
+	case *adnladdr.UDP6:
+		addr = *value
+	}
 
 	now := int32(time.Now().Unix())
 	return &adnladdr.List{
@@ -140,7 +146,7 @@ func startProbeNodeHarness(t *testing.T, key ed25519.PrivateKey, listenAddr stri
 		privKey: key,
 		localID: probeTestPeerID(t, key),
 		gateway: gw,
-		pool:    newPeerPool(gw, nil),
+		pool:    newPeerPool(gw, nil, nil),
 		peerUse: map[PeerID]peerUse{},
 		dht:     backend,
 		runCtx:  ctx,

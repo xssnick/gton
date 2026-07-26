@@ -191,13 +191,8 @@ func signedTestSimpleBroadcast(tb testing.TB, payload tl.Serializable) overlay.B
 
 func TestUnlistedPublicBroadcastArrivingAsRLDPMessageUsesResolver(t *testing.T) {
 	peerID := testPeerID("unlisted-rldp-peer")
-	localID := testPeerID("rldp-local")
-	node := &Node{
-		log:           discardLogger(),
-		localID:       localID,
-		subscriptions: map[string]*overlaySubscription{},
-	}
-	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver)
+	node := newTestNode(t)
+	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver, nil)
 	publicOverlayID := testPeerID("rldp-public-overlay")
 	sub := mustGetOrCreateSubscription(t, node, overlaySpec{
 		Name:    "public.rldp",
@@ -244,12 +239,8 @@ func TestUnlistedPublicBroadcastArrivingAsRLDPMessageUsesResolver(t *testing.T) 
 }
 
 func TestPublicBroadcastReceiverResolverLifecycleAndCustomIsolation(t *testing.T) {
-	node := &Node{
-		log:           discardLogger(),
-		localID:       testPeerID("resolver-lifecycle-local"),
-		subscriptions: map[string]*overlaySubscription{},
-	}
-	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver)
+	node := newTestNode(t)
+	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver, nil)
 	publicOverlayID := testPeerID("resolver-lifecycle-public")
 	publicSpec := overlaySpec{
 		Name:    "public.lifecycle",
@@ -336,10 +327,22 @@ func TestReceivedBroadcastMetricsClassifyImmediatePeerRosterMembership(t *testin
 		t.Fatalf("handle unlisted broadcast disposition: %v", disposition)
 	}
 
-	if got := testBroadcastStatCount(node, "received_roster", sub.spec.Name, "tonNode.ihrMessageBroadcast"); got != 1 {
+	if got := testBroadcastStatCount(
+		node,
+		"received_roster",
+		sub.spec.Name,
+		"tonNode.ihrMessageBroadcast",
+		DeliverySimple,
+	); got != 1 {
 		t.Fatalf("received roster metric = %d, want 1", got)
 	}
-	if got := testBroadcastStatCount(node, "received_unlisted", sub.spec.Name, "tonNode.ihrMessageBroadcast"); got != 1 {
+	if got := testBroadcastStatCount(
+		node,
+		"received_unlisted",
+		sub.spec.Name,
+		"tonNode.ihrMessageBroadcast",
+		DeliverySimple,
+	); got != 1 {
 		t.Fatalf("received unlisted metric = %d, want 1", got)
 	}
 }
@@ -391,6 +394,7 @@ type testBroadcastRLDP struct {
 	adnl      rldp.ADNL
 	onQuery   func([]byte, *rldp.Query) error
 	onMessage func([]byte, []byte) error
+	sent      [][]byte
 }
 
 func (r *testBroadcastRLDP) GetADNL() rldp.ADNL {
@@ -406,6 +410,11 @@ func (*testBroadcastRLDP) Stats() rldp.Stats {
 }
 
 func (*testBroadcastRLDP) Close() {}
+
+func (r *testBroadcastRLDP) SendMessage(_ context.Context, payload []byte) error {
+	r.sent = append(r.sent, payload)
+	return nil
+}
 
 func (*testBroadcastRLDP) DoQuery(context.Context, uint64, tl.Serializable, tl.Serializable) error {
 	return nil
@@ -457,5 +466,34 @@ func BenchmarkResolvePublicBroadcastReceiver(b *testing.B) {
 	})
 	if failures.Load() != 0 {
 		b.Fatalf("resolver failures: %d", failures.Load())
+	}
+}
+
+// A FastSync overlay carries only its validator roster's traffic, so a sender
+// outside the authorized keys must be refused at any size - the reference node
+// builds it with OverlayPrivacyRules{0, 0, keys}. Every other overlay kind keeps
+// accepting unauthorized broadcasts up to the payload limit, because that is how
+// a public shard overlay learns blocks at all.
+func TestUnauthorizedBroadcastLimitIsZeroOnlyForFastSync(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		kind overlayKind
+		want uint32
+	}{
+		{name: "fast sync", kind: overlayKindFastSync, want: 0},
+		{name: "public shard", kind: overlayKindPublicShard, want: maxOverlayPayloadSize},
+		{name: "custom fixed", kind: overlayKindCustomFixed, want: maxOverlayPayloadSize},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := unauthorizedBroadcastLimit(test.kind); got != test.want {
+				t.Fatalf("unauthorized broadcast limit = %d, want %d", got, test.want)
+			}
+		})
 	}
 }

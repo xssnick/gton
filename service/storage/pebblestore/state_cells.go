@@ -239,6 +239,47 @@ func (s *Store) saveCellRecordBatch(ctx context.Context, records []storage.Encod
 // the single-writer path to avoid goroutine and routing-table overhead.
 const stateCellSaveShardedMinRecords = 4096
 
+const (
+	// liveStateCellBatchMinInitialBytes keeps a floor under the per-shard batch
+	// so tiny prewrites still avoid the first few grow-and-copy rounds.
+	liveStateCellBatchMinInitialBytes = 64 << 10
+	// liveStateCellBatchRecordOverhead covers the Pebble batch record framing
+	// around each value: kind byte, key and value varint lengths and the
+	// 32-byte cell hash. Real framing is ~36 B; the margin absorbs per-shard
+	// record count skew without growing the batch.
+	liveStateCellBatchRecordOverhead = 64
+)
+
+// liveStateCellBatchInitialSize sizes a live celldb batch from the payload it
+// is about to hold instead of always reserving the bulk-import target. Writing
+// one applied block used to reserve stateCellImportBatchTargetBytes across the
+// shards regardless of set size, so a few hundred kilobytes of state update
+// materialized 128 MiB of batch buffer.
+//
+// Bulk persistent-state import deliberately keeps the large batches: there the
+// reservation is a throughput parameter, not an overshoot. The flush thresholds
+// are separate checks and stay unchanged, so commit cadence is unaffected.
+func liveStateCellBatchInitialSize(records storage.StateCellRecords) int {
+	maxAggregateBytes := uint64(stateCellImportBatchTargetBytes)
+	estimatedBytes := records.ByteSize()
+	if estimatedBytes >= maxAggregateBytes {
+		return cellShardBatchInitialSize(stateCellImportBatchTargetBytes)
+	}
+
+	remaining := maxAggregateBytes - estimatedBytes
+	recordCount := uint64(records.Len())
+	if recordCount > remaining/liveStateCellBatchRecordOverhead {
+		return cellShardBatchInitialSize(stateCellImportBatchTargetBytes)
+	}
+	estimatedBytes += recordCount * liveStateCellBatchRecordOverhead
+
+	perShard := (estimatedBytes + cellDBShardCount - 1) / cellDBShardCount
+	if perShard < liveStateCellBatchMinInitialBytes {
+		return liveStateCellBatchMinInitialBytes
+	}
+	return int(perShard)
+}
+
 func (s *Store) saveCellRecordSet(ctx context.Context, records storage.StateCellRecords, sync bool, generation uint64, dedupe bool) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
 	if records.Empty() {
@@ -289,6 +330,7 @@ func saveCellRecordSetSharded(ctx context.Context, cells *cellStore, records sto
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	batchInitialSize := liveStateCellBatchInitialSize(records)
 	var shardStats [cellDBShardCount]cellRecordBatchStats
 	var shardErrs [cellDBShardCount]error
 	var wg sync.WaitGroup
@@ -304,6 +346,7 @@ func saveCellRecordSetSharded(ctx context.Context, cells *cellStore, records sto
 				records.Len(),
 				dedupe,
 				shard,
+				batchInitialSize,
 			)
 			if shardErrs[shard] != nil {
 				cancel()
@@ -374,9 +417,9 @@ func buildCellShardRoutes(ctx context.Context, chunks [][]storage.EncodedCellRec
 	return routes, nil
 }
 
-func saveCellRecordShard(ctx context.Context, cells *cellStore, chunks [][]storage.EncodedCellRecord, routes [][]uint64, recordCount int, dedupe bool, shard int) (cellRecordBatchStats, error) {
+func saveCellRecordShard(ctx context.Context, cells *cellStore, chunks [][]storage.EncodedCellRecord, routes [][]uint64, recordCount int, dedupe bool, shard int, batchInitialSize int) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
-	writer := cells.newBatchWriter(cellShardBatchInitialSize(stateCellImportBatchTargetBytes))
+	writer := cells.newBatchWriter(batchInitialSize)
 	defer writer.close()
 
 	var written map[cell.Hash]struct{}
@@ -436,7 +479,7 @@ func saveCellRecordShard(ctx context.Context, cells *cellStore, chunks [][]stora
 
 func saveCellRecords(ctx context.Context, cells *cellStore, records storage.StateCellRecords, dedupe bool) (cellRecordBatchStats, error) {
 	var stats cellRecordBatchStats
-	writer := cells.newBatchWriter(cellShardBatchInitialSize(stateCellImportBatchTargetBytes))
+	writer := cells.newBatchWriter(liveStateCellBatchInitialSize(records))
 	defer writer.close()
 
 	var written map[cell.Hash]struct{}
@@ -525,12 +568,26 @@ func (s *Store) lazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoad
 }
 
 func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
-	return func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := s.loadLazyCellFromGeneration(context.Background(), generation, hash[:])
+	loadMiss := func(hash cell.Hash) (*cell.Cell, error) {
+		loaded, err := s.loadLazyCellMissFromGeneration(context.Background(), generation, hash[:])
 		if err != nil {
 			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
 		}
 		return loaded, nil
+	}
+	// Resolve the cache branch once rather than per lookup.
+	if s.cellCache == nil {
+		return loadMiss
+	}
+
+	return func(hash cell.Hash) (*cell.Cell, error) {
+		// getHash reports storage.ErrNotFound and nothing else, so any error here
+		// is a plain miss.
+		if loaded, err := s.cellCache.getHash(generation, hash); err == nil {
+			s.lazyCellLoads.observeDecodedCache()
+			return loaded, nil
+		}
+		return loadMiss(hash)
 	}
 }
 
@@ -547,12 +604,24 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 		return nil, err
 	}
 
-	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
+	return s.loadLazyCellMissFromGeneration(ctx, generation, hash)
+}
+
+func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
+	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
 		return nil, err
 	}
+	defer cells.release()
+
+	raw, closer, err := cells.get(hash)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = closer.Close() }()
+
 	s.lazyCellLoads.observePebble()
-	loaded, err = storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash, raw), s.lazyCellLoaderForGeneration(generation))
+	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, s.lazyCellLoaderForGeneration(generation))
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}

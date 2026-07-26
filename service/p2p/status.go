@@ -45,6 +45,8 @@ func adnlChannelStateLabel(state adnl.PeerChannelState) string {
 
 type StatusSnapshot struct {
 	ListenAddr            string
+	QUICPeers             int
+	QUICPeersAccepted     uint64
 	Offline               bool
 	OfflineReason         string
 	LatestMasterchain     *ton.BlockIDExt
@@ -118,6 +120,7 @@ type BroadcastStatusSnapshot struct {
 	Direction string
 	Overlay   string
 	Kind      string
+	Delivery  Delivery
 	Reason    string
 	Count     uint64
 }
@@ -133,6 +136,7 @@ type broadcastStatKey struct {
 	direction string
 	overlay   string
 	kind      string
+	delivery  Delivery
 	reason    string
 }
 
@@ -155,6 +159,11 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 		OfflineReason: n.OfflineReason(),
 		Overlays:      make([]OverlayStatusSnapshot, 0, len(subscriptions)),
 	}
+
+	n.quicPeersMx.RLock()
+	snapshot.QUICPeers = len(n.quicPeers)
+	n.quicPeersMx.RUnlock()
+	snapshot.QUICPeersAccepted = n.quicPeersAccepted.Load()
 
 	n.latestBlocksMx.RLock()
 	if n.observedMasterchain != nil {
@@ -194,15 +203,26 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	return snapshot
 }
 
-func (n *Node) noteBroadcast(direction, overlay, kind string) {
-	n.noteBroadcastWithReason(direction, overlay, kind, "")
+func (n *Node) noteBroadcast(
+	direction string,
+	overlay string,
+	kind string,
+	delivery Delivery,
+) {
+	n.noteBroadcastWithReason(direction, overlay, kind, delivery, "")
 }
 
 func (n *Node) noteBroadcastDrop(overlay, kind, reason string) {
-	n.noteBroadcastWithReason("dropped", overlay, kind, reason)
+	n.noteBroadcastWithReason("dropped", overlay, kind, "", reason)
 }
 
-func (n *Node) noteBroadcastWithReason(direction, overlay, kind, reason string) {
+func (n *Node) noteBroadcastWithReason(
+	direction string,
+	overlay string,
+	kind string,
+	delivery Delivery,
+	reason string,
+) {
 	if direction == "" {
 		direction = "unknown"
 	}
@@ -220,6 +240,7 @@ func (n *Node) noteBroadcastWithReason(direction, overlay, kind, reason string) 
 		direction: direction,
 		overlay:   overlay,
 		kind:      kind,
+		delivery:  delivery,
 		reason:    reason,
 	}
 
@@ -241,6 +262,7 @@ func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
 			Direction: key.direction,
 			Overlay:   key.overlay,
 			Kind:      key.kind,
+			Delivery:  key.delivery,
 			Count:     count,
 		})
 	}
@@ -251,6 +273,9 @@ func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
 		}
 		if stats[i].Overlay != stats[j].Overlay {
 			return stats[i].Overlay < stats[j].Overlay
+		}
+		if stats[i].Delivery != stats[j].Delivery {
+			return stats[i].Delivery < stats[j].Delivery
 		}
 		return stats[i].Kind < stats[j].Kind
 	})
@@ -291,8 +316,8 @@ func (n *Node) queueStatusSnapshot() []QueueStatusSnapshot {
 	queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
 	local, regular := n.peerRebroadcastQueueStatusSnapshot()
 	queues = append(queues, regular, local)
-	if customTwoStep, ok := n.customTwoStepQueueStatusSnapshot(); ok {
-		queues = append(queues, customTwoStep)
+	if twoStep, ok := n.twoStepQueueStatusSnapshot(); ok {
+		queues = append(queues, twoStep)
 	}
 	return queues
 }
@@ -315,11 +340,11 @@ func (n *Node) peerRebroadcastQueueStatusSnapshot() (QueueStatusSnapshot, QueueS
 	return local, regular
 }
 
-func (n *Node) customTwoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
-	total := QueueStatusSnapshot{Name: customTwoStepRebroadcastQueueName}
+func (n *Node) twoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
+	total := QueueStatusSnapshot{Name: twoStepRebroadcastQueueName}
 	found := false
 	for _, sub := range n.subscriptionsSnapshot() {
-		next, ok := sub.customTwoStepQueueStatusSnapshot()
+		next, ok := sub.twoStepQueueStatusSnapshot()
 		if !ok {
 			continue
 		}

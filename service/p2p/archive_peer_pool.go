@@ -127,6 +127,7 @@ type archivePeerDemandRetryKey struct {
 
 type archivePeer struct {
 	peer             *overlayPeer
+	owned            bool
 	leases           int
 	addedAt          time.Time
 	archiveDownloads uint64
@@ -196,8 +197,10 @@ func newArchivePeerPool(sub *overlaySubscription) *archivePeerPool {
 		offers:                make(chan archivePeerOffer, archivePeerPendingLimit),
 		lastUsedAt:            now,
 	}
-	pool.startScoutWorkers()
-	pool.scoutWorkers.Go(pool.runArchiveDiscoveryLoop)
+	if !sub.usesDedicatedQueryPeers() {
+		pool.startScoutWorkers()
+		pool.scoutWorkers.Go(pool.runArchiveDiscoveryLoop)
+	}
 	return pool
 }
 
@@ -227,7 +230,7 @@ func (p *archivePeerPool) Close() {
 	p.mx.Lock()
 	archiveOnly := make([]*overlayPeer, 0, len(p.peers))
 	for peerID, entry := range p.peers {
-		if entry != nil && entry.peer != nil {
+		if entry != nil && entry.owned && entry.peer != nil {
 			archiveOnly = append(archiveOnly, entry.peer)
 		}
 		delete(p.peers, peerID)
@@ -300,18 +303,48 @@ func (p *archivePeerPool) touch(now time.Time) {
 
 func (p *archivePeerPool) enableContinuousDiscovery() {
 	p.mx.Lock()
-	if !p.closed {
+	if !p.closed && !p.sub.usesDedicatedQueryPeers() {
 		p.continuousDiscovery = true
 	}
 	p.mx.Unlock()
 }
 
 func (p *archivePeerPool) bootstrapLivePeers() {
+	if p.sub.spec.Kind == overlayKindCustomFixed {
+		p.bootstrapCustomQueryPeers()
+		return
+	}
+
 	for _, peer := range p.sub.peersSnapshot() {
 		if peer.id.IsZero() || !peer.hasOpenConnection() || len(peer.pub) != ed25519.PublicKeySize {
 			continue
 		}
 		p.offerArchiveLivePeer(peer)
+	}
+}
+
+func (p *archivePeerPool) bootstrapCustomQueryPeers() {
+	peers := p.sub.customQueryCandidates(0, 0)
+	now := time.Now()
+
+	p.mx.Lock()
+	defer p.mx.Unlock()
+	if p.closed {
+		return
+	}
+	for _, peer := range peers {
+		entry := p.peers[peer.id]
+		if entry == nil {
+			p.peers[peer.id] = &archivePeer{
+				peer:    peer,
+				addedAt: now,
+			}
+			continue
+		}
+		if !entry.owned && entry.peer != peer && entry.leases == 0 {
+			entry.peer = peer
+			entry.addedAt = now
+		}
 	}
 }
 
@@ -349,6 +382,10 @@ func (p *archivePeerPool) candidates(shard archive.ShardID) []*overlayPeer {
 	peers := make([]*overlayPeer, 0, len(p.peers))
 	for peerID, entry := range p.peers {
 		if !archivePeerUsable(entry, now) {
+			continue
+		}
+		if p.sub.usesDedicatedQueryPeers() &&
+			!entry.peer.queryReady(now, 0, 0) {
 			continue
 		}
 		if p.recentlyRejectedLocked(peerID, now) || p.transportBlockedLocked(peerID, now) || archivePeerCoolingDownLocked(state, peerID, now) {
@@ -982,7 +1019,10 @@ func (p *archivePeerPool) rotatePeer(stateKey string, candidate archivePeerRotat
 		return true
 	}
 	proven := p.provenPeerLocked(candidate.peerID)
-	peer := p.removePeerLocked(candidate.peerID)
+	// removePeerLocked only hands back peers this pool owns, so capture the
+	// address for logging before the entry is dropped.
+	addr := entry.peer.addr
+	peer, _ := p.removePeerLocked(candidate.peerID)
 	retryAfter := time.Duration(0)
 	switch {
 	case candidate.failure.badImports >= archivePeerBadImportRotateThreshold:
@@ -1003,7 +1043,7 @@ func (p *archivePeerPool) rotatePeer(stateKey string, candidate archivePeerRotat
 	closeArchiveOnlyPeer(peer)
 
 	p.log.Info().
-		Str("peer", peer.addr).
+		Str("peer", addr).
 		Str("peer_id", candidate.peerID.String()).
 		Str("archive_pool", stateKey).
 		Str("reason", candidate.failure.reason).
@@ -1147,6 +1187,9 @@ func (p *archivePeerPool) refill(ctx context.Context, urgent bool) <-chan struct
 	now := time.Now()
 	p.bootstrapLivePeers()
 	p.pruneClosedPeers()
+	if p.sub.usesDedicatedQueryPeers() {
+		return nil
+	}
 	p.pruneUnprovenDeadArchiveOnlyPeers(now)
 	p.pruneStaleArchiveOnlyPeers()
 	p.offerValuablePeers(now, urgent)
@@ -1289,7 +1332,7 @@ func (p *archivePeerPool) pruneClosedPeers() {
 			continue
 		}
 
-		if peer := p.removePeerLocked(peerID); peer != nil {
+		if peer, _ := p.removePeerLocked(peerID); peer != nil {
 			archiveOnly = append(archiveOnly, peer)
 		}
 	}
@@ -1312,7 +1355,7 @@ func (p *archivePeerPool) pruneUnprovenDeadArchiveOnlyPeers(now time.Time) {
 		if !archivePeerUnprovenDeadArchiveOnly(entry, now) {
 			continue
 		}
-		if peer := p.removePeerLocked(peerID); peer != nil {
+		if peer, _ := p.removePeerLocked(peerID); peer != nil {
 			archiveOnly = append(archiveOnly, peer)
 		}
 	}
@@ -1336,7 +1379,7 @@ func (p *archivePeerPool) pruneStaleArchiveOnlyPeers() {
 		if entry == nil {
 			break
 		}
-		if peer := p.removePeerLocked(peerID); peer != nil {
+		if peer, _ := p.removePeerLocked(peerID); peer != nil {
 			archiveOnly = append(archiveOnly, peer)
 		}
 	}
@@ -1347,10 +1390,15 @@ func (p *archivePeerPool) pruneStaleArchiveOnlyPeers() {
 	}
 }
 
-func (p *archivePeerPool) removePeerLocked(peerID PeerID) *overlayPeer {
+// removePeerLocked drops the pool entry for peerID. It reports whether an entry
+// was actually removed, and separately hands back the peer only when this pool
+// owns it and is therefore responsible for closing it. Callers that need "was it
+// removed" must use removed, not a non-nil peer: peers shared with the
+// subscription roster are removed but never returned.
+func (p *archivePeerPool) removePeerLocked(peerID PeerID) (owned *overlayPeer, removed bool) {
 	entry := p.peers[peerID]
 	if entry == nil {
-		return nil
+		return nil, false
 	}
 
 	delete(p.peers, peerID)
@@ -1369,7 +1417,10 @@ func (p *archivePeerPool) removePeerLocked(peerID PeerID) *overlayPeer {
 			delete(demand.peers, peerID)
 		}
 	}
-	return entry.peer
+	if entry.owned {
+		return entry.peer, true
+	}
+	return nil, true
 }
 
 func (p *archivePeerPool) startDHTDiscovery(ctx context.Context) <-chan struct{} {

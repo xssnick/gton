@@ -3,7 +3,6 @@ package p2p
 import (
 	"crypto/sha256"
 
-	"github.com/xssnick/gton/service/archive"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -27,8 +26,10 @@ func init() {
 	tl.Register(OutMsgQueueProof{}, "tonNode.outMsgQueueProof queue_proofs:bytes block_state_proofs:bytes msg_counts:(vector int) = tonNode.OutMsgQueueProof")
 	tl.Register(OutMsgQueueProofEmpty{}, "tonNode.outMsgQueueProofEmpty = tonNode.OutMsgQueueProof")
 	tl.Register(GetOutMsgQueueProof{}, "tonNode.getOutMsgQueueProof dst_shard:tonNode.shardId blocks:(vector tonNode.blockIdExt) limits:tonNode.importedMsgQueueLimits = tonNode.OutMsgQueueProof")
+	tl.Register(OutMsgQueueProofBroadcast{}, "tonNode.outMsgQueueProofBroadcast dst_shard:tonNode.shardId block:tonNode.blockIdExt limits:ImportedMsgQueueLimits proof:tonNode.OutMsgQueueProof = tonNode.Broadcast")
 	tl.Register(SendExtMessage{}, "tonNode.slave.sendExtMessage message:tonNode.externalMessage = tonNode.Success")
 	tl.Register(BlockFinalityBroadcast{}, "tonNode.blockFinalityBroadcast id:tonNode.blockIdExt signature_set:tonNode.SignatureSet = tonNode.Broadcast")
+	tl.Register(FinalityBroadcastID{}, "tonNode.finalityBroadcastId id:tonNode.blockIdExt = tonNode.FinalityBroadcastId")
 }
 
 type OverlayBroadcastID struct {
@@ -93,9 +94,16 @@ type OutMsgQueueProof struct {
 type OutMsgQueueProofEmpty struct{}
 
 type GetOutMsgQueueProof struct {
-	DstShard archive.ShardID        `tl:"struct"`
+	DstShard tonnodeapi.ShardID     `tl:"struct"`
 	Blocks   []ton.BlockIDExt       `tl:"vector struct"`
 	Limits   ImportedMsgQueueLimits `tl:"struct"`
+}
+
+type OutMsgQueueProofBroadcast struct {
+	DstShard tonnodeapi.ShardID     `tl:"struct"`
+	Block    ton.BlockIDExt         `tl:"struct"`
+	Limits   ImportedMsgQueueLimits `tl:"struct"`
+	Proof    any                    `tl:"struct boxed [tonNode.outMsgQueueProof,tonNode.outMsgQueueProofEmpty]"`
 }
 
 type SendExtMessage struct {
@@ -105,6 +113,10 @@ type SendExtMessage struct {
 type BlockFinalityBroadcast struct {
 	ID           ton.BlockIDExt `tl:"struct"`
 	SignatureSet any            `tl:"struct boxed [tonNode.signatureSet.ordinary,tonNode.signatureSet.simplex]"`
+}
+
+type FinalityBroadcastID struct {
+	ID ton.BlockIDExt `tl:"struct"`
 }
 
 func hashSimpleBroadcastPayload(data []byte) []byte {

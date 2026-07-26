@@ -18,7 +18,6 @@ func init() {
 	tl.Register(CompatAddressTCP6{}, "adnl.address.tcp6 ip:int128 port:int = adnl.Address")
 	tl.Register(CompatAddressTunnel{}, "adnl.address.tunnel to:int256 pubkey:PublicKey = adnl.Address")
 	tl.Register(CompatAddressReverse{}, "adnl.address.reverse = adnl.Address")
-	tl.Register(CompatAddressQUIC{}, "adnl.address.quic ip:int port:int = adnl.Address")
 	tl.Register(CompatAddressList{}, "")
 }
 
@@ -38,11 +37,6 @@ type CompatAddressTunnel struct {
 }
 
 type CompatAddressReverse struct{}
-
-type CompatAddressQUIC struct {
-	IP   []byte `tl:"int"`
-	Port int32  `tl:"int"`
-}
 
 type CompatAddressList struct {
 	Addresses  []any `tl:"vector struct boxed [adnl.address.udp,adnl.address.udp6,adnl.address.tcp,adnl.address.tcp6,adnl.address.tunnel,adnl.address.reverse,adnl.address.quic]"`
@@ -65,8 +59,8 @@ func findPeerAddresses(ctx context.Context, client dhtBackend, key []byte) (*adn
 
 	// Some public nodes still publish address lists with constructors that are
 	// not exposed by tonutils-go. Keep this fallback as an explicit network
-	// protocol boundary: it accepts those older records but only returns UDP
-	// addresses that the current node can actually dial.
+	// protocol boundary: it accepts those records but only retains address
+	// kinds supported by this node.
 	value, _, findErr := client.FindValue(ctx, &dht.Key{
 		ID:    key,
 		Name:  []byte("address"),
@@ -97,8 +91,12 @@ func parseCompatibleAddressList(data []byte) (*adnladdr.List, error) {
 	}
 
 	var raw CompatAddressList
-	if _, err := tl.Parse(&raw, data[4:], false); err != nil {
+	rest, err := tl.Parse(&raw, data[4:], false)
+	if err != nil {
 		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("unexpected trailing address list data")
 	}
 
 	list := &adnladdr.List{
@@ -111,20 +109,14 @@ func parseCompatibleAddressList(data []byte) (*adnladdr.List, error) {
 		switch typed := addr.(type) {
 		case adnladdr.UDP:
 			list.Addresses = append(list.Addresses, typed)
-		case *adnladdr.UDP:
-			if typed != nil {
-				list.Addresses = append(list.Addresses, typed)
-			}
 		case adnladdr.UDP6:
 			list.Addresses = append(list.Addresses, typed)
-		case *adnladdr.UDP6:
-			if typed != nil {
-				list.Addresses = append(list.Addresses, typed)
-			}
+		case adnladdr.QUIC:
+			list.Addresses = append(list.Addresses, typed)
 		}
 	}
 	if len(list.Addresses) == 0 {
-		return nil, fmt.Errorf("no supported UDP addresses in address list")
+		return nil, fmt.Errorf("no supported addresses in address list")
 	}
 	return list, nil
 }

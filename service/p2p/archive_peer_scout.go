@@ -559,7 +559,7 @@ func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 
 		// A PeerID has one canonical endpoint. Do not spend discovery time trying
 		// alternate addresses for the same transport identity.
-		endpoint, err = firstPeerEndpoint(addrList.Addresses)
+		endpoint, err = firstADNLEndpoint(addrList.Addresses)
 		if err != nil {
 			p.scout.rememberPeer(offer.identity.peerID)
 			p.scoutStats.transportFailure.Add(1)
@@ -935,6 +935,7 @@ func (p *archivePeerPool) admitArchiveOnlyPeer(peer *overlayPeer, result archive
 	}
 	entry := &archivePeer{
 		peer:    peer,
+		owned:   true,
 		addedAt: now,
 	}
 
@@ -968,8 +969,7 @@ func (p *archivePeerPool) admitArchiveOnlyPeer(peer *overlayPeer, result archive
 			return archivePeerAdmissionResult{}
 		}
 		evictedValuable = p.provenPeerLocked(evictID)
-		evicted = p.removePeerLocked(evictID)
-		replaced = evicted != nil
+		evicted, replaced = p.removePeerLocked(evictID)
 		if replaced {
 			evictedID = evictID
 			if evictedValuable {

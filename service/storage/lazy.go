@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"math/bits"
+	"sync"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -13,6 +15,73 @@ const (
 	cellHashSize  = 32
 	cellDepthSize = 2
 )
+
+type lazyCellRecordScratch struct {
+	record    CellRecord
+	refs      [4]CellRefRecord
+	lazyRefs  [4]cell.LazyRef
+	hashes    [4 * cellHashSize]byte
+	depths    [4]uint16
+	refDepths [4][4]uint16
+}
+
+var lazyCellRecordScratchPool = sync.Pool{
+	New: func() any {
+		return new(lazyCellRecordScratch)
+	},
+}
+
+// DecodeLazyCellRecordTrusted decodes an encoded database record directly
+// into a cell. The returned cell owns every byte it keeps from encoded.
+func DecodeLazyCellRecordTrusted(hash []byte, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
+	scratch := lazyCellRecordScratchPool.Get().(*lazyCellRecordScratch)
+	defer func() {
+		scratch.record = CellRecord{}
+		clear(scratch.refs[:])
+		clear(scratch.lazyRefs[:])
+		lazyCellRecordScratchPool.Put(scratch)
+	}()
+
+	decodeCellRecordTrustedInto(hash, encoded, &scratch.record, scratch.refs[:])
+	record := &scratch.record
+	if lazyCellType(record) == cell.PrunedCellType {
+		return prunedCellRecordView(record.Hash, record.D1, record.D2, record.Data)
+	}
+
+	levelMask := cell.LevelMask{Mask: record.D1 >> 5}
+	hashesCount := CellRefHashesCount(levelMask.Mask)
+	hashes := scratch.hashes[:hashesCount*cellHashSize]
+	depths := scratch.depths[:hashesCount]
+	lazyCellHashesDepthsInto(record, hashes, depths)
+
+	refs := scratch.lazyRefs[:len(record.Refs)]
+	for i, ref := range record.Refs {
+		refHashesCount := CellRefHashesCount(ref.LevelMask)
+		refDepths := scratch.refDepths[i][:refHashesCount]
+		for j := range refDepths {
+			refDepths[j] = binary.BigEndian.Uint16(ref.Depths[j*cellDepthSize : (j+1)*cellDepthSize])
+		}
+		refs[i] = cell.LazyRef{
+			LevelMask: cell.LevelMask{Mask: ref.LevelMask},
+			Hashes:    ref.Hashes,
+			Depths:    refDepths,
+		}
+	}
+
+	descriptors := uint16(record.D1)<<8 | uint16(record.D2)
+	loaded, err := cell.CreateWithLazyRefsUnsafe(
+		descriptors,
+		bytes.Clone(record.Data),
+		hashes,
+		depths,
+		refs,
+		loader,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return cellViewForRecordHash(loaded, record.Hash)
+}
 
 // LazyCellRecord rebuilds only the requested cell and leaves refs as lazy placeholders.
 func LazyCellRecord(record *CellRecord, loader cell.LazyCellLoader) (*cell.Cell, error) {
@@ -139,6 +208,14 @@ func lazyCellHashesDepths(record *CellRecord) ([]byte, []uint16, error) {
 
 	hashes := make([]byte, hashesCount*cellHashSize)
 	depths := make([]uint16, hashesCount)
+	lazyCellHashesDepthsInto(record, hashes, depths)
+	return hashes, depths, nil
+}
+
+func lazyCellHashesDepthsInto(record *CellRecord, hashes []byte, depths []uint16) {
+	levelMask := cell.LevelMask{Mask: record.D1 >> 5}
+	hashesCount := CellRefHashesCount(levelMask.Mask)
+	typ := lazyCellType(record)
 	isMerkle := typ == cell.MerkleProofCellType || typ == cell.MerkleUpdateCellType
 
 	var prevHash [cellHashSize]byte
@@ -198,8 +275,6 @@ func lazyCellHashesDepths(record *CellRecord) ([]byte, []uint16, error) {
 		copy(hashes[hashOffset:hashOffset+cellHashSize], sum[:])
 		hashIndex++
 	}
-
-	return hashes, depths, nil
 }
 
 func lazyCellType(record *CellRecord) cell.Type {

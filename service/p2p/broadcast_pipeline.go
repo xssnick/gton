@@ -29,6 +29,7 @@ const (
 type acceptedBroadcast struct {
 	fingerprint        string
 	deduped            bool
+	delivery           Delivery
 	block              *ton.BlockIDExt
 	event              *BroadcastEvent
 	extraEvents        []BroadcastEvent
@@ -195,6 +196,16 @@ func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, m
 }
 
 func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) (broadcastResult, error) {
+	if s.spec.Kind == overlayKindFastSync &&
+		!fastSyncBroadcastSupported(msg) {
+		s.node.noteBroadcastDrop(
+			s.spec.Name,
+			broadcastKindLabel(msg),
+			"unsupported_fast_sync_broadcast",
+		)
+		return ignoredBroadcastResult(), nil
+	}
+
 	if sourcePeerID.IsZero() && peer != nil {
 		sourcePeerID = peer.id
 	}
@@ -321,6 +332,7 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		return acceptedBroadcastResult(acceptedBroadcast{
 			fingerprint: hash,
 			deduped:     true,
+			delivery:    delivery,
 			rebroadcast: rebroadcast,
 		}), nil
 	case tonnodeapi.NewBlockCandidateBroadcast:
@@ -351,6 +363,10 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			data.SignatureSet,
 			peer, payload, delivery, trusted, sourcePeerID,
 		)
+	case OutMsgQueueProofBroadcast:
+		// cppnode currently leaves application processing disabled, while the
+		// overlay still relays an admitted broadcast.
+		return acceptedBroadcastResult(acceptedBroadcast{}), nil
 	case IhrMessageBroadcast:
 		kind := "tonNode.ihrMessageBroadcast"
 		if s.spec.Kind == overlayKindCustomFixed {
@@ -371,6 +387,7 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		}
 		return acceptedBroadcastResult(acceptedBroadcast{
 			fingerprint: fingerprint,
+			delivery:    delivery,
 			rebroadcast: rebroadcast,
 		}), nil
 	default:
@@ -570,6 +587,7 @@ func (s *overlaySubscription) inboundRebroadcast(kind string, payload []byte, pe
 		payload:      payload,
 		sourcePeerID: sourcePeerID,
 		skipOverlayRebroadcast: delivery == DeliveryTwoStep ||
+			delivery == DeliveryPlumtree ||
 			(delivery == DeliveryFEC && s.broadcastFECRelayEnabled()),
 	}
 }
@@ -594,6 +612,7 @@ func (s *overlaySubscription) inboundRebroadcastPayload(kind string, payload *br
 func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID) acceptedBroadcast {
 	return acceptedBroadcast{
 		fingerprint: fingerprint,
+		delivery:    delivery,
 		block:       block.Copy(),
 		event: &BroadcastEvent{
 			Overlay:      s.spec.Name,
@@ -685,7 +704,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		downloaded, sigSet, cached = nil, nil, false
 	}
 	if cached {
-		s.node.noteBroadcast("decode_reused", s.spec.Name, kind)
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
 		if preSigSet != nil {
 			sigSet = preSigSet
 		}
@@ -731,6 +750,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			accepted := acceptedBroadcast{
 				fingerprint: fingerprint,
 				deduped:     true,
+				delivery:    delivery,
 				block:       &blockCopy,
 				rebroadcast: rebroadcast,
 			}
@@ -826,6 +846,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		accepted := acceptedBroadcast{
 			fingerprint: fingerprint,
 			deduped:     true,
+			delivery:    delivery,
 			rebroadcast: rebroadcast,
 		}
 		if block.Workchain == -1 && block.Shard == topShard {
@@ -927,7 +948,7 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	downloaded, _, cacheErr := s.node.decodedBroadcasts.get(kind, block)
 	cached := cacheErr == nil
 	if cached {
-		s.node.noteBroadcast("decode_reused", s.spec.Name, kind)
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
 	} else {
 		decodeStarted := s.node.startBroadcastPipelineStage()
 		var err error
@@ -974,6 +995,7 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	accepted := acceptedBroadcast{
 		fingerprint: fingerprint,
 		deduped:     true,
+		delivery:    delivery,
 		block:       block.Copy(),
 		rebroadcast: rebroadcast,
 	}
@@ -1005,14 +1027,19 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 
 	if accepted.rebroadcast != nil {
 		if !acceptedNoted && !accepted.skipAcceptedMetric {
-			n.noteBroadcast("accepted", accepted.rebroadcast.subscription.spec.Name, accepted.rebroadcast.kind)
+			n.noteBroadcast(
+				"accepted",
+				accepted.rebroadcast.subscription.spec.Name,
+				accepted.rebroadcast.kind,
+				accepted.delivery,
+			)
 		}
 		if !accepted.rebroadcast.skipOverlayRebroadcast {
 			accepted.rebroadcast.subscription.enqueueRebroadcast(*accepted.rebroadcast)
 		}
 	}
 
-	n.enqueueCustomOverlayFanout(accepted)
+	n.enqueueBlockOverlayFanout(accepted)
 }
 
 func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric bool) bool {
@@ -1034,29 +1061,35 @@ func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric boo
 	if !n.eventQueue.Push(event) {
 		return false
 	}
+	if event.Delivery == DeliveryPlumtree {
+		n.plumtreeBroadcastLogOnce.Do(func() {
+			n.log.Info().
+				Str("overlay", event.Overlay).
+				Str("kind", event.Kind).
+				Str("block", storage.FormatBlockRef(event.Block)).
+				Str("source_peer_id", event.SourcePeerID.String()).
+				Msg("accepted first Plumtree broadcast")
+		})
+	}
 	if !skipAcceptedMetric {
-		n.noteBroadcast("accepted", event.Overlay, event.Kind)
+		n.noteBroadcast("accepted", event.Overlay, event.Kind, event.Delivery)
 	}
 	return true
 }
 
-func (n *Node) enqueueCustomOverlayFanout(accepted acceptedBroadcast) {
+func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) {
 	if accepted.rebroadcast == nil || accepted.block == nil {
 		return
 	}
 
-	class, ok := customFanoutClass(accepted.rebroadcast.kind)
+	class, ok := blockOverlayFanoutClass(accepted.rebroadcast.kind)
 	if !ok {
 		return
 	}
 
-	targets := n.customOverlayFanoutTargets(accepted)
-	if len(targets) == 0 {
-		return
-	}
-
-	key := customFanoutKey(class, *accepted.block)
-	if !n.customFanoutDeduper.Mark(key, time.Now()) {
+	customTargets := n.customOverlayFanoutTargets(accepted)
+	fastSyncTarget := n.fastSyncFanoutTarget(accepted)
+	if len(customTargets) == 0 && fastSyncTarget == nil {
 		return
 	}
 
@@ -1065,14 +1098,19 @@ func (n *Node) enqueueCustomOverlayFanout(accepted acceptedBroadcast) {
 		n.log.Debug().
 			Err(err).
 			Str("kind", source.kind).
-			Msg("dropping custom fanout because payload cannot be serialized")
+			Msg("dropping overlay fanout because payload cannot be serialized")
 		return
 	}
 	if len(source.payload) == 0 {
 		return
 	}
 
-	for _, sub := range targets {
+	key := blockOverlayFanoutKey(class, *accepted.block)
+	if !n.overlayFanoutDeduper.Mark(key, time.Now()) {
+		return
+	}
+
+	for _, sub := range customTargets {
 		req := rebroadcastRequest{
 			subscription: sub,
 			kind:         source.kind,
@@ -1083,6 +1121,14 @@ func (n *Node) enqueueCustomOverlayFanout(accepted acceptedBroadcast) {
 			continue
 		}
 		sub.enqueueRebroadcast(req)
+	}
+	if fastSyncTarget != nil {
+		n.sendFastSyncFanout(
+			fastSyncTarget,
+			source.kind,
+			source.payload,
+			*accepted.block,
+		)
 	}
 }
 
@@ -1106,13 +1152,146 @@ func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlay
 	return targets
 }
 
-func customFanoutClass(kind string) (string, bool) {
+func (n *Node) fastSyncFanoutTarget(
+	accepted acceptedBroadcast,
+) *overlaySubscription {
+	var sub *overlaySubscription
+	if accepted.rebroadcast.kind == "tonNode.newShardBlockBroadcast" {
+		sub = n.fastSyncSubscriptionForBlock(ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+		})
+	} else {
+		sub = n.fastSyncSubscriptionForBlock(*accepted.block)
+	}
+	if sub == nil ||
+		sub == accepted.rebroadcast.subscription ||
+		!sub.isActive() ||
+		!sub.fastSync.spec.localValidator {
+		return nil
+	}
+	return sub
+}
+
+func (n *Node) sendFastSyncFanout(
+	sub *overlaySubscription,
+	kind string,
+	payload []byte,
+	block ton.BlockIDExt,
+) {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2",
-		"tonNode.newBlockCandidateBroadcast", "tonNode.newBlockCandidateBroadcastCompressed",
-		"tonNode.newBlockCandidateBroadcastCompressedV2",
-		blockFinalityBroadcastKind:
+	case "tonNode.newBlockCandidateBroadcast",
+		"tonNode.newBlockCandidateBroadcastCompressed",
+		"tonNode.newBlockCandidateBroadcastCompressedV2":
+		if sub.fastSync.spec.plumtreeEnabled {
+			n.originateFastSyncPlumtreeFEC(sub, kind, payload)
+			return
+		}
+	case blockFinalityBroadcastKind:
+		if !sub.fastSync.spec.plumtreeEnabled {
+			return
+		}
+
+		broadcastID, err := finalityPlumtreeBroadcastID(block)
+		if err != nil {
+			sub.log.Debug().
+				Err(err).
+				Str("kind", kind).
+				Msg("dropping FastSync finality fanout")
+			return
+		}
+		n.originateFastSyncPlumtreeSimple(
+			sub,
+			kind,
+			broadcastID,
+			payload,
+		)
+		return
+	}
+
+	sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         kind,
+		payload:      payload,
+		local:        true,
+	})
+}
+
+func (n *Node) originateFastSyncPlumtreeFEC(
+	sub *overlaySubscription,
+	kind string,
+	payload []byte,
+) {
+	if !n.canAcceptBroadcast(kind, true) {
+		n.noteBroadcastDrop(
+			sub.spec.Name,
+			kind,
+			"broadcast_admission_closed",
+		)
+		return
+	}
+	if err := sub.plumtree.OriginateFEC(
+		overlay.BroadcastFlagAnySender,
+		payload,
+	); err != nil {
+		sub.log.Debug().
+			Err(err).
+			Str("kind", kind).
+			Msg("failed to originate FastSync Plumtree FEC broadcast")
+	}
+}
+
+func (n *Node) originateFastSyncPlumtreeSimple(
+	sub *overlaySubscription,
+	kind string,
+	broadcastID [sha256.Size]byte,
+	payload []byte,
+) {
+	if !n.canAcceptBroadcast(kind, true) {
+		n.noteBroadcastDrop(
+			sub.spec.Name,
+			kind,
+			"broadcast_admission_closed",
+		)
+		return
+	}
+	if err := sub.plumtree.OriginateSimple(
+		overlay.BroadcastFlagAnySender,
+		broadcastID,
+		payload,
+	); err != nil {
+		sub.log.Debug().
+			Err(err).
+			Str("kind", kind).
+			Msg("failed to originate FastSync Plumtree broadcast")
+	}
+}
+
+func finalityPlumtreeBroadcastID(
+	block ton.BlockIDExt,
+) ([sha256.Size]byte, error) {
+	hash, err := tl.Hash(FinalityBroadcastID{ID: block})
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+
+	var id [sha256.Size]byte
+	copy(id[:], hash)
+	return id, nil
+}
+
+func blockOverlayFanoutClass(kind string) (string, bool) {
+	switch kind {
+	case "tonNode.blockBroadcast",
+		"tonNode.blockBroadcastCompressed",
+		"tonNode.blockBroadcastCompressedV2":
 		return "block", true
+	case "tonNode.newBlockCandidateBroadcast",
+		"tonNode.newBlockCandidateBroadcastCompressed",
+		"tonNode.newBlockCandidateBroadcastCompressedV2":
+		return "candidate", true
+	case blockFinalityBroadcastKind:
+		return "finality", true
 	case "tonNode.newShardBlockBroadcast":
 		return "shard-desc", true
 	default:
@@ -1120,8 +1299,25 @@ func customFanoutClass(kind string) (string, bool) {
 	}
 }
 
-func customFanoutKey(class string, block ton.BlockIDExt) string {
+func blockOverlayFanoutKey(class string, block ton.BlockIDExt) string {
 	return class + ":" + storage.FormatBlockRef(block)
+}
+
+func fastSyncBroadcastSupported(msg any) bool {
+	switch msg.(type) {
+	case tonnodeapi.BlockBroadcast,
+		tonnodeapi.BlockBroadcastCompressed,
+		tonnodeapi.BlockBroadcastCompressedV2,
+		tonnodeapi.NewShardBlockBroadcast,
+		tonnodeapi.NewBlockCandidateBroadcast,
+		tonnodeapi.NewBlockCandidateBroadcastCompressed,
+		tonnodeapi.NewBlockCandidateBroadcastCompressedV2,
+		BlockFinalityBroadcast,
+		OutMsgQueueProofBroadcast:
+		return true
+	default:
+		return false
+	}
 }
 
 func broadcastKindLabel(msg any) string {
@@ -1144,6 +1340,8 @@ func broadcastKindLabel(msg any) string {
 		return "tonNode.newBlockCandidateBroadcastCompressedV2"
 	case BlockFinalityBroadcast:
 		return blockFinalityBroadcastKind
+	case OutMsgQueueProofBroadcast:
+		return "tonNode.outMsgQueueProofBroadcast"
 	case IhrMessageBroadcast:
 		return "tonNode.ihrMessageBroadcast"
 	default:

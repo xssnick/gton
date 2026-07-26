@@ -135,7 +135,7 @@ func (n *Node) downloadZeroStateSnapshot(ctx context.Context, block ton.BlockIDE
 }
 
 func (n *Node) downloadPersistentStateSnapshot(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
-	sub, err := n.subscriptionForBlock(block)
+	sub, err := n.querySubscriptionForHistoricalBlock(block)
 	if err != nil {
 		return nil, err
 	}
@@ -275,6 +275,7 @@ type persistentStateCandidate struct {
 	size       int64
 	workers    int
 	chunkCount int64
+	query      *peerQueryOperation
 }
 
 type persistentStateChunkSeed struct {
@@ -298,10 +299,17 @@ type persistentStateSnapshotDownloader struct {
 	peers         []*overlayPeer
 }
 
-func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx context.Context, peer *overlayPeer, effectiveShard int64) (*persistentStateCandidate, error) {
+func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx context.Context, peer *overlayPeer, effectiveShard int64) (candidate *persistentStateCandidate, err error) {
 	if !peer.hasOpenConnection() {
 		return nil, adnl.ErrPeerConnClosed
 	}
+
+	query := d.sub.beginPeerQueryOperation(peer)
+	defer func() {
+		if err != nil {
+			query.finish(err)
+		}
+	}()
 
 	if effectiveShard == 0 {
 		d.node.log.Debug().
@@ -376,7 +384,14 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 		size:       size,
 		workers:    workers,
 		chunkCount: chunkCount,
+		query:      query,
 	}, nil
+}
+
+func (c persistentStateCandidate) finishQuery(err error) {
+	if c.query != nil {
+		c.query.finish(err)
+	}
 }
 
 func persistentStateCandidateProbeChunks(candidates []persistentStateCandidate) int {
@@ -401,11 +416,18 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 	if len(candidates) == 0 {
 		return nil, errors.New("no persistent state candidates")
 	}
+	defer func() {
+		for _, candidate := range candidates {
+			candidate.finishQuery(context.Canceled)
+		}
+	}()
+
 	if len(candidates) == 1 {
 		started := time.Now()
 		releasePeer := d.node.acquireDownloadPeer(candidates[0].peer)
 		staged, err := d.stagePersistentStateFile(ctx, candidates[0], nil, chunkLimiter)
 		releasePeer()
+		candidates[0].finishQuery(err)
 		if err != nil {
 			if errors.Is(err, errPersistentStateDownloadDiskBudget) {
 				return nil, err
@@ -470,6 +492,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 		started := time.Now()
 		staged, err := d.stagePersistentStateFile(ctx, probe.candidate, &probe.seed, chunkLimiter)
 		releasePeer()
+		probe.candidate.finishQuery(err)
 		if err != nil {
 			if errors.Is(err, errPersistentStateDownloadDiskBudget) {
 				attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", probe.candidate.peer.addr, err))
@@ -539,6 +562,12 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 	}
 
 	var candidates []persistentStateCandidate
+	defer func() {
+		for _, candidate := range candidates {
+			candidate.finishQuery(context.Canceled)
+		}
+	}()
+
 	var diskBudgetErrs []error
 	flushCandidates := func() (*stagedStateFile, bool) {
 		if len(candidates) == 0 {
@@ -1123,7 +1152,13 @@ type stateChunkResult struct {
 	err       error
 }
 
-func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.Context, candidate persistentStateCandidate, probeChunks int, chunkLimiter chan struct{}) (persistentStatePeerProbe, error) {
+func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.Context, candidate persistentStateCandidate, probeChunks int, chunkLimiter chan struct{}) (probe persistentStatePeerProbe, err error) {
+	defer func() {
+		if err != nil {
+			candidate.finishQuery(err)
+		}
+	}()
+
 	if int64(probeChunks) > candidate.chunkCount {
 		probeChunks = int(candidate.chunkCount)
 	}

@@ -155,8 +155,8 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		p2pBroadcasts: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "broadcasts_total"),
-			"Total P2P broadcasts accepted or successfully sent through the app-level rebroadcast queue by type.",
-			[]string{"direction", "overlay", "kind"},
+			"Total P2P broadcasts received, accepted, or successfully sent through the app-level rebroadcast queue by type and delivery mode.",
+			[]string{"direction", "overlay", "kind", "delivery"},
 			nil,
 		),
 		p2pBroadcastDrops: prometheus.NewDesc(
@@ -399,7 +399,15 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 	}
 
 	for _, broadcast := range snapshot.Broadcasts {
-		ch <- prometheus.MustNewConstMetric(c.p2pBroadcasts, prometheus.CounterValue, float64(broadcast.Count), broadcast.Direction, broadcast.Overlay, broadcast.Kind)
+		ch <- prometheus.MustNewConstMetric(
+			c.p2pBroadcasts,
+			prometheus.CounterValue,
+			float64(broadcast.Count),
+			broadcast.Direction,
+			broadcast.Overlay,
+			broadcast.Kind,
+			string(broadcast.Delivery),
+		)
 	}
 	for _, drop := range snapshot.BroadcastDrops {
 		ch <- prometheus.MustNewConstMetric(c.p2pBroadcastDrops, prometheus.CounterValue, float64(drop.Count), drop.Overlay, drop.Kind, drop.Reason)

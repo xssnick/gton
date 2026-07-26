@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
@@ -297,6 +298,7 @@ func TestUpdateMasterDependentCachesPublishesKeyBlockValidatorConfigBeforeCurren
 		t.Fatal("test requires different old and key-block config roots")
 	}
 	svc := &Service{
+		node: &p2p.Node{},
 		currentStatus: &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: old},
 			Shards:      map[storage.ShardKey]storage.BlockState{},

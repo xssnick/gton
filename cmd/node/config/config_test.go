@@ -84,6 +84,24 @@ func TestLoadDefaults(t *testing.T) {
 	if len(cfg.CustomOverlays) != 0 {
 		t.Fatalf("unexpected custom overlays %d", len(cfg.CustomOverlays))
 	}
+	if cfg.FastSyncMemberCertificates == nil {
+		t.Fatal("fast sync member certificates should default to an empty list")
+	}
+	if len(cfg.FastSyncMemberCertificates) != 0 {
+		t.Fatalf("unexpected fast sync member certificates %d", len(cfg.FastSyncMemberCertificates))
+	}
+	if cfg.FastSyncBroadcastSpeedMultiplier != DefaultFastSyncBroadcastSpeedMultiplier {
+		t.Fatalf(
+			"unexpected fast sync broadcast speed multiplier %v",
+			cfg.FastSyncBroadcastSpeedMultiplier,
+		)
+	}
+	if nodeOpts.P2P.FastSyncBroadcastSpeedMultiplier != DefaultFastSyncBroadcastSpeedMultiplier {
+		t.Fatalf(
+			"unexpected runtime fast sync broadcast speed multiplier %v",
+			nodeOpts.P2P.FastSyncBroadcastSpeedMultiplier,
+		)
+	}
 	capacity := runtimeOpts.LiteSendMessageBroadcastCapacity
 	if capacity.BytesPerSecond != 0 {
 		t.Fatalf("unexpected default liteserver send message broadcast capacity %d", capacity.BytesPerSecond)
@@ -151,6 +169,38 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadFastSyncMemberCertificates(t *testing.T) {
+	first := []byte{0x01, 0x02, 0x03}
+	second := []byte{0x04, 0x05}
+	path := writeTestConfig(t, `{"fast_sync_member_certificates":[
+		"`+base64.StdEncoding.EncodeToString(first)+`",
+		"`+base64.StdEncoding.EncodeToString(second)+`"
+	]}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.FastSyncMemberCertificates) != 2 {
+		t.Fatalf(
+			"unexpected fast sync member certificate count %d",
+			len(cfg.FastSyncMemberCertificates),
+		)
+	}
+	if !bytes.Equal(cfg.FastSyncMemberCertificates[0], first) {
+		t.Fatalf(
+			"unexpected first fast sync member certificate %x",
+			cfg.FastSyncMemberCertificates[0],
+		)
+	}
+	if !bytes.Equal(cfg.FastSyncMemberCertificates[1], second) {
+		t.Fatalf(
+			"unexpected second fast sync member certificate %x",
+			cfg.FastSyncMemberCertificates[1],
+		)
+	}
+}
+
 func TestLoadCustomOverlays(t *testing.T) {
 	nodeID := bytes.Repeat([]byte{0x11}, 32)
 	path := writeTestConfig(t, `{"custom_overlays":[{
@@ -159,13 +209,16 @@ func TestLoadCustomOverlays(t *testing.T) {
 			"adnl_id":"`+base64.StdEncoding.EncodeToString(nodeID)+`",
 			"msg_sender":true,
 			"msg_sender_priority":7,
-			"block_sender":true
+			"block_sender":true,
+			"accept_queries":true
 		}],
 		"sender_shards":[{
 			"workchain":0,
 			"shard":-9223372036854775808
 		}],
-		"skip_public_msg_send":true
+		"skip_public_msg_send":true,
+		"use_quic":true,
+		"send_queries":true
 	}]}`)
 
 	cfg, err := Load(path)
@@ -176,14 +229,15 @@ func TestLoadCustomOverlays(t *testing.T) {
 		t.Fatalf("unexpected custom overlay count %d", len(cfg.CustomOverlays))
 	}
 	overlay := cfg.CustomOverlays[0]
-	if overlay.Name != "private-a" || !overlay.SkipPublicMsgSend {
+	if overlay.Name != "private-a" || !overlay.SkipPublicMsgSend || !overlay.UseQUIC || !overlay.SendQueries {
 		t.Fatalf("unexpected custom overlay metadata: %+v", overlay)
 	}
 	if len(overlay.Nodes) != 1 {
 		t.Fatalf("unexpected custom overlay node count %d", len(overlay.Nodes))
 	}
 	node := overlay.Nodes[0]
-	if !bytes.Equal(node.ADNLID, nodeID) || !node.MsgSender || node.MsgSenderPriority != 7 || !node.BlockSender {
+	if !bytes.Equal(node.ADNLID, nodeID) || !node.MsgSender || node.MsgSenderPriority != 7 ||
+		!node.BlockSender || !node.AcceptQueries {
 		t.Fatalf("unexpected custom overlay node: %+v", node)
 	}
 	if len(overlay.SenderShards) != 1 {
@@ -814,6 +868,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
 		t.Fatal("generated config should use an empty custom_overlays list")
+	}
+	if !bytes.Contains(data, []byte(`"fast_sync_member_certificates": []`)) {
+		t.Fatal("generated config should use an empty fast_sync_member_certificates list")
 	}
 
 	loaded, err := Load(path)

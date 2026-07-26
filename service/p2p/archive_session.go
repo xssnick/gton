@@ -107,10 +107,10 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 		return nil, ErrOffline
 	}
 
-	// Historical master and shard archives are both served by archival peers on
-	// the masterchain overlay. Availability and performance remain keyed by the
-	// requested shard inside the archive pool.
-	sub, err := a.node.subscriptionForOverlayBlock(ton.BlockIDExt{Workchain: -1, Shard: topShard})
+	sub, err := a.node.querySubscriptionForHistoricalBlock(ton.BlockIDExt{
+		Workchain: shard.Workchain,
+		Shard:     shard.Shard,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlayS
 	var resolveElapsed time.Duration
 	logBootstrapTiming := func(peer string, err error) {
 		event := sub.log.Debug()
-		if err != nil || ensureElapsed >= archiveBootstrapSlowLog || resolveElapsed >= archiveBootstrapSlowLog {
+		if err == nil && (ensureElapsed >= archiveBootstrapSlowLog || resolveElapsed >= archiveBootstrapSlowLog) {
 			event = sub.log.Info()
 		}
 		if !event.Enabled() {

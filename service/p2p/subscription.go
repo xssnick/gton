@@ -17,6 +17,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
+	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
 )
@@ -45,6 +46,7 @@ type overlaySubscription struct {
 	peers               map[PeerID]*overlayPeer
 	neighbours          []PeerID
 	lastPingedNeighbour PeerID
+	lastQueryProbed     PeerID
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
@@ -52,6 +54,9 @@ type overlaySubscription struct {
 	broadcastTargets    atomic.Pointer[broadcastTargetsSnapshot]
 	broadcastTargetsGen atomic.Uint64
 	broadcastReceiver   *overlay.BroadcastReceiver
+	plumtree            *plumtreeRuntime
+	fastSync            *fastSyncOverlayRuntime
+	quicEnvelope        *quicOverlayEnvelope
 	twoStepQueue        *boundedQueue[rebroadcastRequest]
 	twoStepQueueClosed  bool
 	refreshRunning      bool
@@ -59,6 +64,8 @@ type overlaySubscription struct {
 	fixedProbeRunning   bool
 	softRecoveries      uint64
 	hardRecoveries      uint64
+
+	advertisedPeerLearning atomic.Bool
 }
 
 func (s *overlaySubscription) isActive() bool {
@@ -207,6 +214,9 @@ func (s *overlaySubscription) stopRun() bool {
 
 func (s *overlaySubscription) close() {
 	s.stopRun()
+	if s.plumtree != nil {
+		s.plumtree.engine.Close()
+	}
 
 	s.mx.Lock()
 	s.removed = true
@@ -251,15 +261,20 @@ type liveNextPeerState struct {
 }
 
 type overlayPeer struct {
-	id          PeerID
-	addr        string
-	pub         ed25519.PublicKey
-	announced   *overlay.Node
-	fixedMember bool
-	overlay     *overlay.ADNLOverlayWrapper
-	rldp        *overlay.RLDPWrapper
-	rldpOverlay *overlay.RLDPOverlayWrapper
-	release     func()
+	node           *Node
+	id             PeerID
+	addr           string
+	route          *peerRoute
+	pub            ed25519.PublicKey
+	overlayID      []byte
+	announced      *overlay.Node
+	fixedMember    bool
+	overlay        *overlay.ADNLOverlayWrapper
+	rldp           *overlay.RLDPWrapper
+	rldpOverlay    *overlay.RLDPOverlayWrapper
+	queryTransport peerQueryTransport
+	broadcastPeer  overlay.BroadcastPeer
+	release        func()
 
 	statsMx           sync.Mutex
 	versionMajor      int32
@@ -277,6 +292,8 @@ type overlayPeer struct {
 	downloadBytesSec  float64
 	downloadCount     uint64
 	downloadSlowUntil time.Time
+	queryResponds     bool
+	queryIgnoreUntil  time.Time
 
 	attachedAt              time.Time
 	lastPongAt              time.Time
@@ -297,6 +314,18 @@ func (p *overlayPeer) close() {
 }
 
 func (s *overlaySubscription) run(ctx context.Context) {
+	var plumtreeDone chan struct{}
+	if s.plumtree != nil {
+		plumtreeDone = make(chan struct{})
+		go func() {
+			s.plumtree.run(ctx)
+			close(plumtreeDone)
+		}()
+		defer func() {
+			<-plumtreeDone
+		}()
+	}
+
 	s.log.Info().Msg("starting overlay peer discovery")
 	s.startPeerDiscovery(ctx)
 
@@ -306,8 +335,13 @@ func (s *overlaySubscription) run(ctx context.Context) {
 	defer refreshTimer.Stop()
 	neighbourTimer := time.NewTimer(0)
 	defer neighbourTimer.Stop()
-	pingTimer := time.NewTimer(nextPeerPingDelay())
-	defer pingTimer.Stop()
+	var pingTimer *time.Timer
+	var pingC <-chan time.Time
+	if s.spec.QueryCapabilities || s.spec.Kind == overlayKindCustomFixed && s.spec.SendQueries {
+		pingTimer = time.NewTimer(s.nextQueryProbeDelay())
+		defer pingTimer.Stop()
+		pingC = pingTimer.C
+	}
 
 	var probeTimer *time.Timer
 	var probeC <-chan time.Time
@@ -331,9 +365,9 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		case <-neighbourTimer.C:
 			s.reloadNeighbours()
 			neighbourTimer.Reset(nextNeighbourReloadDelay())
-		case <-pingTimer.C:
+		case <-pingC:
 			s.startPingPeers(ctx)
-			pingTimer.Reset(nextPeerPingDelay())
+			pingTimer.Reset(s.nextQueryProbeDelay())
 		case <-probeC:
 			s.startProbeFixedPeers(ctx, probePolicy)
 			probeTimer.Reset(nextFixedProbeDelay(probePolicy))
@@ -342,7 +376,8 @@ func (s *overlaySubscription) run(ctx context.Context) {
 }
 
 func (s *overlaySubscription) startPeerDiscovery(ctx context.Context) {
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.Kind == overlayKindCustomFixed ||
+		s.spec.Kind == overlayKindFastSync {
 		s.startSeedFromFixedNodes(ctx)
 		return
 	}
@@ -742,11 +777,14 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 		return false, fmt.Errorf("overlay node has no addresses")
 	}
 
-	udpAddr, err := firstPeerEndpoint(addrList.Addresses)
+	endpoint, err := peerEndpointFromAddresses(addrList.Addresses)
 	if err != nil {
 		return false, err
 	}
-	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(identity.peerID, udpAddr, identity.pub)
+	if quicAddr, quicErr := peerQUICRouteFromAddresses(addrList.Addresses); quicErr == nil {
+		endpoint.quicAddr = quicAddr
+	}
+	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(identity.peerID, endpoint, identity.pub)
 	if err != nil {
 		return false, fmt.Errorf("connect overlay peer endpoint: %w", err)
 	}
@@ -769,39 +807,99 @@ func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
 	if s.node.dht == nil || !s.isActive() {
 		return
 	}
-	if s.aliveKnownPeerCount() >= s.peerLimit()-1 {
+
+	atPeerLimit := s.aliveKnownPeerCount() >= s.peerLimit()-1
+	if atPeerLimit && !s.hasMissingFixedQUICRoute() {
 		return
 	}
 
-	connected := 0
+	candidates := make([]PeerID, 0, len(s.spec.FixedNodes))
 	for _, id := range s.spec.FixedNodes {
-		if ctx.Err() != nil {
-			return
-		}
-		if id == s.node.localID || s.hasPeer(id) {
+		if id == s.node.localID {
 			continue
 		}
 
-		connectCtx, cancel := context.WithTimeout(ctx, dhtSeedPeerTimeout)
-		attached, err := s.connectFixedNode(connectCtx, id)
-		cancel()
-		if err != nil {
-			s.log.Debug().
-				Err(err).
-				Str("peer_id", id.String()).
-				Msg("failed to connect fixed custom overlay peer")
+		peer := s.peerByID(id)
+		if peer != nil {
+			if !s.spec.UseQUIC || peer.route.quicAddr() != "" {
+				continue
+			}
+		} else if atPeerLimit {
 			continue
 		}
-		if attached {
-			connected++
+		candidates = append(candidates, id)
+	}
+	if s.fastSync != nil {
+		rand.Shuffle(len(candidates), func(i, j int) {
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		})
+	}
+
+	jobs := make(chan PeerID)
+	var (
+		workers   sync.WaitGroup
+		connected atomic.Int64
+	)
+	for range min(dhtSeedConnectParallelism, len(candidates)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+
+			for id := range jobs {
+				connectCtx, cancel := context.WithTimeout(
+					ctx,
+					dhtSeedPeerTimeout,
+				)
+				attached, err := s.connectFixedNode(connectCtx, id)
+				cancel()
+				if err != nil {
+					s.log.Debug().
+						Err(err).
+						Str("peer_id", id.String()).
+						Msg("failed to connect fixed overlay peer")
+					continue
+				}
+				if attached {
+					connected.Add(1)
+				}
+			}
+		}()
+	}
+	for _, id := range candidates {
+		select {
+		case jobs <- id:
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return
 		}
 	}
-	if connected > 0 {
+	close(jobs)
+	workers.Wait()
+
+	if connected.Load() > 0 {
 		s.log.Debug().
-			Int("connected_peers", connected).
+			Int64("connected_peers", connected.Load()).
 			Int("known_peers", len(s.knownPeersSnapshot())).
-			Msg("custom overlay fixed peer search finished")
+			Msg("fixed overlay peer search finished")
 	}
+}
+
+func (s *overlaySubscription) hasMissingFixedQUICRoute() bool {
+	if !s.spec.UseQUIC {
+		return false
+	}
+
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	for _, id := range s.spec.FixedNodes {
+		peer := s.peers[id]
+		if peer != nil && peer.route.quicAddr() == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerID) (bool, error) {
@@ -821,11 +919,19 @@ func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerI
 		return false, fmt.Errorf("fixed node public key does not match requested ADNL id")
 	}
 
-	udpAddr, err := firstPeerEndpoint(addrList.Addresses)
+	endpoint, err := peerEndpointFromAddresses(addrList.Addresses)
 	if err != nil {
 		return false, err
 	}
-	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(nodeID, udpAddr, pub)
+	quicAddr, quicErr := peerQUICRouteFromAddresses(addrList.Addresses)
+	if quicErr != nil {
+		if s.spec.UseQUIC {
+			return false, quicErr
+		}
+	} else {
+		endpoint.quicAddr = quicAddr
+	}
+	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(nodeID, endpoint, pub)
 	if err != nil {
 		return false, fmt.Errorf("connect fixed node endpoint: %w", err)
 	}
@@ -860,7 +966,7 @@ func reinitFreshFixedTransport(pooled *pooledPeer) {
 	}
 }
 
-func firstPeerEndpoint(addresses []adnladdr.Address) (string, error) {
+func firstADNLEndpoint(addresses []adnladdr.Address) (string, error) {
 	for _, addr := range addresses {
 		endpoint, err := adnladdr.DialString(addr)
 		if err == nil {
@@ -868,6 +974,23 @@ func firstPeerEndpoint(addresses []adnladdr.Address) (string, error) {
 		}
 	}
 	return "", errors.New("peer has no supported endpoint")
+}
+
+func peerEndpointFromAddresses(addresses []adnladdr.Address) (peerEndpoint, error) {
+	adnlAddr, err := firstADNLEndpoint(addresses)
+	if err != nil {
+		return peerEndpoint{}, err
+	}
+
+	return peerEndpoint{adnlAddr: adnlAddr}, nil
+}
+
+func peerQUICRouteFromAddresses(addresses []adnladdr.Address) (string, error) {
+	endpoint, err := adnlquic.PeerEndpoint(addresses)
+	if err != nil {
+		return "", fmt.Errorf("peer QUIC endpoint: %w", err)
+	}
+	return endpoint.String(), nil
 }
 
 func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNodeIdentity, error) {
@@ -937,7 +1060,11 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		}
 	}
 
-	state, err := s.newOverlayPeer(pooled, announced, s.spec.Kind == overlayKindCustomFixed)
+	fixedMember := s.spec.Kind == overlayKindCustomFixed
+	if s.fastSync != nil {
+		fixedMember = s.fastSync.permanent(pooled.id)
+	}
+	state, err := s.newOverlayPeer(pooled, announced, fixedMember)
 	if err != nil {
 		s.mx.Unlock()
 		s.log.Warn().
@@ -964,7 +1091,10 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	}
 	s.installHandlers(state)
 	s.startPeerRebroadcastWorker(state)
-	if announced != nil || s.spec.Kind == overlayKindCustomFixed || s.spec.Kind == overlayKindPublicShard {
+	if announced != nil ||
+		s.spec.Kind == overlayKindCustomFixed ||
+		s.spec.Kind == overlayKindFastSync ||
+		s.spec.Kind == overlayKindPublicShard {
 		s.reloadNeighbours()
 		s.startPeerWarmup(state)
 	}
@@ -981,10 +1111,13 @@ func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *over
 		return nil, err
 	}
 
-	return &overlayPeer{
+	peer := &overlayPeer{
+		node:        s.node,
 		id:          pooled.id,
 		addr:        pooled.addr,
-		pub:         append(ed25519.PublicKey(nil), pooled.pub...),
+		route:       pooled.route,
+		pub:         pooled.pub,
+		overlayID:   s.spec.ShortID,
 		announced:   cloneOverlayNode(announced),
 		fixedMember: fixedMember,
 		overlay:     adnlOverlay,
@@ -993,15 +1126,43 @@ func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *over
 		release:     release,
 		alive:       !fixedMember,
 		attachedAt:  time.Now(),
-	}, nil
+	}
+	if s.spec.UseQUIC {
+		peer.queryTransport = quicPeerQueryTransport{
+			peer:     peer,
+			envelope: s.quicEnvelope,
+		}
+		peer.broadcastPeer = quicRouteBroadcastPeer{
+			peer:     peer,
+			envelope: s.quicEnvelope,
+		}
+	} else {
+		peer.queryTransport = rldpPeerQueryTransport{
+			overlay:   rldpOverlay,
+			overlayID: s.spec.ShortID,
+		}
+		peer.broadcastPeer = peer.overlay
+	}
+	return peer, nil
 }
 
 func (s *overlaySubscription) acceptsPeerID(id PeerID) bool {
+	if s.fastSync != nil {
+		return s.fastSync.contains(id)
+	}
 	if s.spec.Kind != overlayKindCustomFixed {
 		return true
 	}
 	_, ok := s.spec.FixedNodeIDs[id]
 	return ok
+}
+
+// usesDedicatedQueryPeers reports whether this subscription routes queries
+// through its own configured roster instead of the public overlay peer set.
+// Such a subscription has no DHT presence, so the archive pool must neither
+// crawl for peers on it nor own their transports.
+func (s *overlaySubscription) usesDedicatedQueryPeers() bool {
+	return s.spec.Kind == overlayKindCustomFixed
 }
 
 // adoptsInboundPeer reports whether a raw inbound transport joins this
@@ -1013,7 +1174,14 @@ func (s *overlaySubscription) adoptsInboundPeer(id PeerID) bool {
 }
 
 func (s *overlaySubscription) peerLimit() int {
-	if s.spec.Kind == overlayKindCustomFixed && len(s.spec.FixedNodes) > maxPeersPerOverlay {
+	if s.spec.Kind == overlayKindFastSync {
+		expected := len(s.spec.FixedNodes) +
+			len(s.fastSync.spec.roster.rootPublicKeyIDs)*
+				FastSyncMemberSlotCount
+		return max(maxPeersPerOverlay, expected)
+	}
+	if s.spec.Kind == overlayKindCustomFixed &&
+		len(s.spec.FixedNodes) > maxPeersPerOverlay {
 		return len(s.spec.FixedNodes)
 	}
 	return maxPeersPerOverlay
@@ -1101,6 +1269,10 @@ func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
 
 		if s.spec.Kind == overlayKindCustomFixed {
 			s.warmupCustomFixedPeer(ctx, peer)
+			return
+		}
+		if s.spec.Kind == overlayKindFastSync {
+			s.warmupFastSyncPeer(ctx, peer)
 			return
 		}
 		if s.spec.QueryCapabilities {
@@ -1223,11 +1395,9 @@ func (s *overlaySubscription) installHandlers(peer *overlayPeer) {
 	peer.overlay.SetQueryHandler(func(msg *adnl.MessageQuery) error {
 		return s.answerADNLQuery(peer, msg)
 	})
-	if s.spec.Kind != overlayKindCustomFixed {
-		peer.rldpOverlay.SetOnQuery(func(transferID []byte, query *rldp.Query) error {
-			return s.answerRLDPQuery(peer, transferID, query)
-		})
-	}
+	peer.rldpOverlay.SetOnQuery(func(transferID []byte, query *rldp.Query) error {
+		return s.answerRLDPQuery(peer, transferID, query)
+	})
 	peer.overlay.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
 		// Remove by pointer, not by id: the disconnect cascade runs
 		// asynchronously and a recovery path may have already re-attached a
@@ -1246,7 +1416,11 @@ func (s *overlaySubscription) refreshPeers(ctx context.Context) {
 		return
 	}
 
-	s.runPeerMaintenance(ctx, peers, peerRefreshFanout, s.exchangeRandomPeers)
+	exchange := s.exchangeRandomPeers
+	if s.spec.Kind == overlayKindFastSync {
+		exchange = s.exchangeFastSyncRandomPeers
+	}
+	s.runPeerMaintenance(ctx, peers, peerRefreshFanout, exchange)
 }
 
 func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *overlayPeer) {
@@ -1290,6 +1464,14 @@ func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *ove
 }
 
 func (s *overlaySubscription) pingPeers(ctx context.Context) {
+	if s.spec.Kind == overlayKindCustomFixed {
+		s.probeCustomQueryPeers(ctx)
+		return
+	}
+	if s.spec.Kind == overlayKindFastSync {
+		s.pingFastSyncValidators(ctx)
+		return
+	}
 	if !s.isActive() || !s.spec.QueryCapabilities {
 		return
 	}
@@ -1389,6 +1571,13 @@ func (s *overlaySubscription) removePeerIfCurrent(peer *overlayPeer) {
 	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 
+	if s.fastSync != nil {
+		s.fastSync.setPeerAlive(peer.id, false)
+	}
+	if s.plumtree != nil {
+		s.plumtree.engine.RemovePeer(peer.id)
+		s.plumtree.notifyAlarmChanged()
+	}
 	peer.close()
 }
 
@@ -1415,7 +1604,8 @@ func (s *overlaySubscription) ensurePeers(ctx context.Context) error {
 	s.startPeerDiscovery(ctx)
 
 	for {
-		if s.aliveKnownPeerCount() > 0 {
+		if s.aliveKnownPeerCount() > 0 ||
+			s.publicRandomQueryFallbackPeer(0, 0) != nil {
 			return nil
 		}
 

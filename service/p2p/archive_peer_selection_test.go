@@ -19,14 +19,38 @@ import (
 
 func testArchiveCandidate(label string) *overlayPeer {
 	id := testPeerID(label)
-	return &overlayPeer{
+	adnlOverlay := &overlay.ADNLOverlayWrapper{}
+	peer := &overlayPeer{
 		id:        id,
 		addr:      label,
-		overlay:   &overlay.ADNLOverlayWrapper{},
+		overlay:   adnlOverlay,
 		announced: &overlay.Node{Version: int32(time.Now().Unix())},
 		alive:     true,
 		release:   func() {},
 	}
+	peer.queryTransport = testADNLPeerQueryTransport{peer: peer}
+	return peer
+}
+
+type testADNLPeerQueryTransport struct {
+	peer *overlayPeer
+}
+
+func (t testADNLPeerQueryTransport) Query(
+	ctx context.Context,
+	_ uint64,
+	req tl.Serializable,
+	result tl.Serializable,
+) error {
+	return t.peer.overlay.Query(ctx, req, result)
+}
+
+func (testADNLPeerQueryTransport) QueryRaw(
+	context.Context,
+	uint64,
+	tl.Serializable,
+) ([]byte, error) {
+	return nil, errors.New("raw query is not configured")
 }
 
 func testArchivePool(tb testing.TB, sub *overlaySubscription) *archivePeerPool {
@@ -74,6 +98,7 @@ func addTestArchiveOnlyPeer(pool *archivePeerPool, peer *overlayPeer) bool {
 	}
 	pool.peers[peer.id] = &archivePeer{
 		peer:    peer,
+		owned:   true,
 		addedAt: time.Now(),
 	}
 	return true
@@ -114,6 +139,7 @@ func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlay
 	pooled := &pooledPeer{
 		id:              id,
 		addr:            label,
+		route:           newPeerRoute(""),
 		adnl:            adnlWrapper,
 		baseRLDP:        baseRLDP,
 		rldp:            rldpWrapper,
@@ -2121,16 +2147,21 @@ func TestArchivePeerZeroStateProbeRecordsAvailabilityOnly(t *testing.T) {
 		t.Fatal("zero-state probe was not recorded")
 	}
 
+	servingRLDP := overlay.CreateExtendedRLDP(&testArchiveRLDP{
+		adnl:        newTestOverlayADNL(),
+		queryResult: PreparedState{},
+	}).CreateOverlay([]byte{0x01})
 	serving := &overlayPeer{
-		id:        testPeerID("zero-serving"),
-		addr:      "zero-serving",
-		overlay:   &overlay.ADNLOverlayWrapper{},
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
-		alive:     true,
-		rldpOverlay: overlay.CreateExtendedRLDP(&testArchiveRLDP{
-			adnl:        newTestOverlayADNL(),
-			queryResult: PreparedState{},
-		}).CreateOverlay([]byte{0x01}),
+		id:          testPeerID("zero-serving"),
+		addr:        "zero-serving",
+		overlay:     &overlay.ADNLOverlayWrapper{},
+		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:       true,
+		rldpOverlay: servingRLDP,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   servingRLDP,
+			overlayID: []byte{0x01},
+		},
 	}
 	result, err := pool.probeArchivePeerEvidence(context.Background(), serving, probe)
 	if err != nil {
@@ -2140,16 +2171,21 @@ func TestArchivePeerZeroStateProbeRecordsAvailabilityOnly(t *testing.T) {
 		t.Fatalf("zero-state evidence = %d, want available only", result.evidence)
 	}
 
+	missingRLDP := overlay.CreateExtendedRLDP(&testArchiveRLDP{
+		adnl:        newTestOverlayADNL(),
+		queryResult: NotFoundState{},
+	}).CreateOverlay([]byte{0x01})
 	missing := &overlayPeer{
-		id:        testPeerID("zero-missing"),
-		addr:      "zero-missing",
-		overlay:   &overlay.ADNLOverlayWrapper{},
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
-		alive:     true,
-		rldpOverlay: overlay.CreateExtendedRLDP(&testArchiveRLDP{
-			adnl:        newTestOverlayADNL(),
-			queryResult: NotFoundState{},
-		}).CreateOverlay([]byte{0x01}),
+		id:          testPeerID("zero-missing"),
+		addr:        "zero-missing",
+		overlay:     &overlay.ADNLOverlayWrapper{},
+		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:       true,
+		rldpOverlay: missingRLDP,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   missingRLDP,
+			overlayID: []byte{0x01},
+		},
 	}
 	if _, err = pool.probeArchivePeerEvidence(context.Background(), missing, probe); !errors.Is(err, ErrStateNotAvailable) {
 		t.Fatalf("missing zero-state probe error = %v, want not available", err)

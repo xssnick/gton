@@ -161,6 +161,43 @@ func (c *LiveBlockCache) NextBlockFull(ctx context.Context, prev ton.BlockIDExt)
 	return c.BlockFull(ctx, next)
 }
 
+func (c *LiveBlockCache) BlockMeta(_ context.Context, block ton.BlockIDExt) (*BlockMeta, error) {
+	cached, blockErr := c.cachedBlock(block)
+	next, nextErr := c.nextBlock(block)
+	if blockErr != nil && nextErr != nil {
+		return nil, ErrNotFound
+	}
+
+	meta := &BlockMeta{ID: block}
+	if cached != nil {
+		meta.ID = cached.id
+		meta = MergeBlockMeta(meta, cached.meta)
+
+		if len(cached.data) > 0 {
+			meta.Mark(BlockMetaHasBlockData)
+		}
+		for kind, proof := range cached.proofs {
+			if len(proof) > 0 {
+				meta.Mark(BlockMetaFlagForProof(kind))
+			}
+		}
+
+		if len(cached.data) > 0 {
+			if kind, err := liveBlockCacheProofKind(cached); err == nil {
+				meta.Mark(BlockMetaHasServedFull)
+				if kind == ServedProofBlockLink || kind == ServedProofKeyBlockLink {
+					meta.Mark(BlockMetaServedFullIsLink)
+				}
+			}
+		}
+	}
+	if nextErr == nil {
+		meta.NextRefs = []ton.BlockIDExt{next}
+	}
+
+	return meta, nil
+}
+
 func (c *LiveBlockCache) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	cached, err := c.CachedBlockData(ctx, block)
 	if err != nil {

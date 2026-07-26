@@ -13,6 +13,8 @@ import (
 	"github.com/xssnick/gton"
 	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
+	"github.com/xssnick/tonutils-go/tl"
 )
 
 var metricsNamespacePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -311,7 +313,25 @@ func p2pOptionsFromConfig(cfg Config) (p2p.Options, error) {
 		return p2p.Options{}, err
 	}
 
+	opts.FastSyncCertificates, err = fastSyncMemberCertificatesFromConfig(cfg.FastSyncMemberCertificates)
+	if err != nil {
+		return p2p.Options{}, err
+	}
+	opts.FastSyncBroadcastSpeedMultiplier, err = fastSyncBroadcastSpeedMultiplierFromConfig(
+		cfg.FastSyncBroadcastSpeedMultiplier,
+	)
+	if err != nil {
+		return p2p.Options{}, err
+	}
+
 	return opts, nil
+}
+
+func fastSyncBroadcastSpeedMultiplierFromConfig(value float64) (float64, error) {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("fast_sync_broadcast_speed_multiplier must be finite and positive")
+	}
+	return value, nil
 }
 
 func liteSendMessageBroadcastCapacityFromConfig(cfg Lite) (LiteSendMessageBroadcastCapacity, error) {
@@ -402,6 +422,33 @@ func uint32ConfigValueAllowZero(field string, value int64) (uint32, error) {
 	return uint32(value), nil
 }
 
+func fastSyncMemberCertificatesFromConfig(raw [][]byte) ([]overlay.MemberCertificate, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	certificates := make([]overlay.MemberCertificate, len(raw))
+	for i, data := range raw {
+		if len(data) == 0 {
+			return nil, fmt.Errorf("fast_sync_member_certificates[%d] is empty", i)
+		}
+
+		rest, err := tl.Parse(&certificates[i], data, true)
+		if err != nil {
+			return nil, fmt.Errorf("fast_sync_member_certificates[%d]: %w", i, err)
+		}
+		if len(rest) != 0 {
+			return nil, fmt.Errorf(
+				"fast_sync_member_certificates[%d] has %d trailing bytes",
+				i,
+				len(rest),
+			)
+		}
+	}
+
+	return certificates, nil
+}
+
 func customOverlaysFromConfig(raw []CustomOverlay) ([]p2p.CustomOverlayConfig, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -434,6 +481,7 @@ func customOverlaysFromConfig(raw []CustomOverlay) ([]p2p.CustomOverlayConfig, e
 				MsgSender:         node.MsgSender,
 				MsgSenderPriority: node.MsgSenderPriority,
 				BlockSender:       node.BlockSender,
+				AcceptQueries:     node.AcceptQueries,
 			})
 		}
 
@@ -450,6 +498,8 @@ func customOverlaysFromConfig(raw []CustomOverlay) ([]p2p.CustomOverlayConfig, e
 			Nodes:             nodes,
 			SenderShards:      shards,
 			SkipPublicMsgSend: overlay.SkipPublicMsgSend,
+			UseQUIC:           overlay.UseQUIC,
+			SendQueries:       overlay.SendQueries,
 		})
 	}
 	return overlays, nil

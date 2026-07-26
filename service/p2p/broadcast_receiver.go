@@ -12,10 +12,48 @@ type publicBroadcastReceiverSnapshot struct {
 	receivers map[string]*overlay.BroadcastReceiver
 }
 
+// unauthorizedBroadcastLimit caps broadcasts from senders outside the overlay's
+// authorized keys. A FastSync overlay only ever carries traffic from its
+// validator roster, so nothing outside it is acceptable at any size: the
+// reference node builds this overlay with OverlayPrivacyRules{0, 0, keys}
+// (full-node-fast-sync-overlays.cpp), where a non-zero size from an
+// unauthorized sender is Forbidden outright. Without the cap a certified
+// non-validator member could push a full-size FEC broadcast that only the block
+// signature check would eventually reject.
+func unauthorizedBroadcastLimit(kind overlayKind) uint32 {
+	if kind == overlayKindFastSync {
+		return 0
+	}
+	return maxOverlayPayloadSize
+}
+
 func (n *Node) newOverlaySubscription(spec overlaySpec) (*overlaySubscription, error) {
+	if spec.Kind == overlayKindFastSync && spec.FastSync == nil {
+		return nil, fmt.Errorf(
+			"create broadcast receiver for %s: missing fast sync spec",
+			spec.Name,
+		)
+	}
+
+	var memberCertificate *overlay.MemberCertificate
+	if spec.FastSync != nil {
+		memberCertificate = spec.FastSync.certificate
+	}
+	quicEnvelope, err := newQUICOverlayEnvelope(
+		spec.ShortID,
+		memberCertificate,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create QUIC envelope for %s: %w",
+			spec.Name,
+			err,
+		)
+	}
+
 	receiver, err := overlay.NewBroadcastReceiver(
 		spec.ShortID,
-		maxOverlayPayloadSize,
+		unauthorizedBroadcastLimit(spec.Kind),
 		spec.Kind != overlayKindCustomFixed,
 		false,
 	)
@@ -30,16 +68,44 @@ func (n *Node) newOverlaySubscription(spec overlaySpec) (*overlaySubscription, e
 		peers:             map[PeerID]*overlayPeer{},
 		peerNotify:        make(chan struct{}, 1),
 		broadcastReceiver: receiver,
+		quicEnvelope:      quicEnvelope,
 	}
 	receiver.SetBroadcastHandlerWithInfo(sub.handleReceivedBroadcast)
 	if len(spec.AuthorizedKeys) > 0 {
 		receiver.SetAuthorizedKeys(spec.AuthorizedKeys)
 	}
 
-	if spec.Kind == overlayKindCustomFixed {
+	if spec.Kind == overlayKindFastSync {
+		sub.fastSync, err = newFastSyncOverlayRuntime(
+			n,
+			spec.ShortID,
+			*spec.FastSync,
+			quicEnvelope,
+		)
+		if err != nil {
+			receiver.Close()
+			return nil, fmt.Errorf(
+				"create FastSync runtime for %s: %w",
+				spec.Name,
+				err,
+			)
+		}
+	}
+
+	switch spec.Kind {
+	case overlayKindCustomFixed:
 		receiver.SetBroadcastPrecheckHandler(sub.checkCustomTwoStepBroadcastSource)
-		receiver.EnableBroadcastTwoStep(n.localID.Bytes(), customTwoStepPeerSet{sub: sub})
-	} else {
+		receiver.EnableBroadcastTwoStep(n.localID.Bytes(), twoStepPeerSet{sub: sub})
+	case overlayKindFastSync:
+		receiver.EnableBroadcastTwoStep(n.localID.Bytes(), twoStepPeerSet{sub: sub})
+		fallthrough
+	default:
+		sub.plumtree, err = newPlumtreeRuntime(sub)
+		if err != nil {
+			receiver.Close()
+			return nil, fmt.Errorf("create Plumtree runtime for %s: %w", spec.Name, err)
+		}
+
 		receiver.SetFECBroadcastLimits(publicBroadcastFECMaxActiveStreams, overlay.DefaultFECBroadcastMaxActiveBytes)
 		receiver.EnableBroadcastFECRelay(n.localID.Bytes(), overlayFECRelayPeerSet{sub: sub})
 	}
@@ -93,7 +159,7 @@ func (s *overlaySubscription) handleReceivedBroadcast(msg tl.Serializable, info 
 		direction = "received_roster"
 	}
 	kind := broadcastKindLabel(msg)
-	s.node.noteBroadcast(direction, s.spec.Name, kind)
+	s.node.noteBroadcast(direction, s.spec.Name, kind, delivery)
 
 	sourcePeerID, err := NewPeerID(info.SourceID)
 	if err != nil {

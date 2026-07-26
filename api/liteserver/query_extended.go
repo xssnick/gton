@@ -1666,11 +1666,7 @@ func validatorStatsKey(startAfter []byte) *cell.Cell {
 	return cell.BeginCell().MustStoreUInt(0, 256).EndCell()
 }
 
-type creatorStatsDict interface {
-	LookupNearestKey(key *cell.Cell, fetchNext bool, allowEq bool, invertFirst bool) (*cell.Cell, *cell.Slice, error)
-}
-
-func blockCreateStatsDict(stateRoot *cell.Cell) (creatorStatsDict, error) {
+func blockCreateStatsDict(stateRoot *cell.Cell) (*cell.Dictionary, error) {
 	prefix, err := blockproof.LoadMcStateExtraPrefix(stateRoot, true)
 	if err != nil {
 		return nil, err
@@ -1716,27 +1712,14 @@ func blockCreateStatsDict(stateRoot *cell.Cell) (creatorStatsDict, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch magic {
-	case 0x17:
-		dict, err := loader.LoadDict(256)
-		if err != nil {
-			return nil, err
-		}
-		return dict, nil
-	case 0x34:
-		skipExtra := func(loader *cell.Slice) error {
-			_, err := loader.LoadUInt(32)
-			return err
-		}
-
-		dict, err := loader.LoadAugDict(256, cell.ReadOnlyAugmentation{SkipExtraFn: skipExtra}, false)
-		if err != nil {
-			return nil, err
-		}
-		return dict, nil
-	default:
+	// Only block_create_stats#17 exists in practice: the reference collator
+	// hardcodes that tag, and a state carrying block_create_stats_ext#34 is
+	// rejected at state load and at block validation, so the reference
+	// liteserver refuses this query rather than answering it.
+	if magic != 0x17 {
 		return nil, fmt.Errorf("invalid block create stats magic %x", magic)
 	}
+	return loader.LoadDict(256)
 }
 
 func validateCreatorStats(value *cell.Slice) error {

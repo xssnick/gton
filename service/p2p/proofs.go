@@ -47,14 +47,14 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 			Msg("failed to load cached block proof")
 	}
 
-	sub, err := n.subscriptionForBlock(block)
+	sub, err := n.querySubscriptionForBlock(block)
 	if err != nil {
 		return ProofDownload{}, err
 	}
 	if err = sub.ensurePeers(ctx); err != nil {
 		return ProofDownload{}, fmt.Errorf("bootstrap overlay peers: %w", err)
 	}
-	sub.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
+	sub.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
 
 	tried := map[PeerID]struct{}{}
 	var errs []error
@@ -86,7 +86,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 			errs = append(errs, err)
 			if wave+1 < proofDownloadWaves {
 				sub.reloadNeighbours()
-				sub.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
+				sub.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
 				if waitErr := sub.waitForProofPeerDiscovery(ctx); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 					errs = append(errs, waitErr)
 				}
@@ -184,7 +184,7 @@ func (s *overlaySubscription) proofQueryCandidates(tried map[PeerID]struct{}) []
 
 func (s *overlaySubscription) waitForProofPeerDiscovery(ctx context.Context) error {
 	notify := s.peerNotifySnapshot()
-	s.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
+	s.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
 
 	select {
 	case <-ctx.Done():
@@ -196,7 +196,12 @@ func (s *overlaySubscription) waitForProofPeerDiscovery(ctx context.Context) err
 	}
 }
 
-func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *overlayPeer, block ton.BlockIDExt, allowPartial bool, keyBlock bool) (ProofDownload, error) {
+func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *overlayPeer, block ton.BlockIDExt, allowPartial bool, keyBlock bool) (result ProofDownload, err error) {
+	query := s.beginPeerQueryOperation(peer)
+	defer func() {
+		query.finish(err)
+	}()
+
 	prepare := tl.Serializable(PrepareBlockProof{Block: block, AllowPartial: allowPartial})
 	if keyBlock {
 		prepare = PrepareKeyBlockProof{Block: block, AllowPartial: allowPartial}

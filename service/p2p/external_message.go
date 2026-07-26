@@ -16,18 +16,6 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func (s *overlaySubscription) serveSendExtMessage(ctx context.Context, msg tonnodeapi.ExternalMessage) (tl.Serializable, error) {
-	parsed, err := parseExternalMessageData(msg.Data)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.node.sendExternalMessage(ctx, msg.Data, parsed.address, parsed.root, parsed.message, false, false); err != nil {
-		return nil, err
-	}
-	return Success{}, nil
-}
-
 func (n *Node) SendExternalMessage(ctx context.Context, data []byte, dst *address.Address) error {
 	if n.IsOffline() {
 		return ErrOffline

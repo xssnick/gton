@@ -86,7 +86,21 @@ func (c *decodedCellCache) get(generation uint64, hash []byte) (*cell.Cell, erro
 		return nil, storage.ErrNotFound
 	}
 
-	key := newDecodedCellCacheKey(generation, hash)
+	return c.getKey(newDecodedCellCacheKey(generation, hash))
+}
+
+func (c *decodedCellCache) getHash(generation uint64, hash cell.Hash) (*cell.Cell, error) {
+	if c == nil {
+		return nil, storage.ErrNotFound
+	}
+
+	return c.getKey(decodedCellCacheKey{
+		generation: generation,
+		hash:       [32]byte(hash),
+	})
+}
+
+func (c *decodedCellCache) getKey(key decodedCellCacheKey) (*cell.Cell, error) {
 	shard := &c.shards[c.shardIndex(key.hash)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()

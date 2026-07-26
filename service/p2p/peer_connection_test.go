@@ -455,8 +455,8 @@ func TestCustomFixedPeerOnlyAnswersOverlayPingInOverlayLayer(t *testing.T) {
 	if err = base.queryHandler(&adnl.MessageQuery{
 		ID:   make([]byte, 32),
 		Data: overlay.WrapQuery(shortID, GetCapabilities{}),
-	}); err == nil || !strings.Contains(err.Error(), "overlay query is not supported in private overlay") {
-		t.Fatalf("custom fixed getCapabilities error = %v, want private overlay reject", err)
+	}); err == nil || !strings.Contains(err.Error(), "this node does not accept queries") {
+		t.Fatalf("custom fixed getCapabilities error = %v, want disabled-query reject", err)
 	}
 
 	select {
@@ -805,7 +805,11 @@ func TestStaleForgetDoesNotRemoveReplacementPeer(t *testing.T) {
 	id := testPeerID("forget-replacement")
 	oldWrapper, _ := newTestOverlayWrapper()
 	freshWrapper, freshBase := newTestOverlayWrapper()
-	oldPeer := &overlayPeer{id: id, overlay: oldWrapper}
+	oldPeer := &overlayPeer{
+		id:            id,
+		overlay:       oldWrapper,
+		broadcastPeer: oldWrapper,
+	}
 	freshPeer := &overlayPeer{id: id, overlay: freshWrapper, release: freshBase.Close}
 	sub := testOverlaySubscription(&overlaySubscription{
 		peers: map[PeerID]*overlayPeer{id: freshPeer},

@@ -6,32 +6,99 @@ import (
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/overlay"
+	"github.com/xssnick/tonutils-go/tl"
 )
 
 const (
-	customTwoStepBroadcastKind        = "overlay.broadcastTwostep"
-	customTwoStepRebroadcastQueueName = "custom_two_step_rebroadcast"
+	twoStepBroadcastKind        = "overlay.broadcastTwostep"
+	twoStepRebroadcastQueueName = "two_step_rebroadcast"
 )
 
-type customTwoStepPeerSet struct {
-	sub          *overlaySubscription
-	sourcePeerID PeerID
+type twoStepPeerSet struct {
+	sub *overlaySubscription
 }
 
-func (set customTwoStepPeerSet) Peers() []overlay.BroadcastPeer {
-	if set.sourcePeerID.IsZero() {
-		return set.sub.broadcastTargetsSnapshot().broadcast
-	}
-
-	candidates := set.sub.broadcastTargetsSnapshot().peers
+func (set twoStepPeerSet) Peers() []overlay.BroadcastPeer {
+	candidates := set.sub.twoStepCandidates(PeerID{})
 	peers := make([]overlay.BroadcastPeer, 0, len(candidates))
 	for _, peer := range candidates {
-		if peer.id == set.sourcePeerID {
+		if set.sub.spec.UseQUIC {
+			if peer.route.quicAddr() != "" {
+				peers = append(peers, quicRouteBroadcastPeer{
+					peer:     peer,
+					envelope: set.sub.quicEnvelope,
+				})
+			}
 			continue
 		}
-		peers = append(peers, peer.overlay)
+		peers = append(peers, customRLDPBroadcastPeer{
+			id:        peer.id,
+			transport: peer.rldpOverlay,
+		})
 	}
 	return peers
+}
+
+type customRLDPBroadcastPeer struct {
+	id        PeerID
+	transport *overlay.RLDPOverlayWrapper
+}
+
+func (p customRLDPBroadcastPeer) ID() []byte {
+	return p.id[:]
+}
+
+func (p customRLDPBroadcastPeer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
+	return p.transport.SendCustomMessage(ctx, req)
+}
+
+func (s *overlaySubscription) twoStepCandidates(sourcePeerID PeerID) []*overlayPeer {
+	candidates := s.broadcastTargetsSnapshot().peers
+	if sourcePeerID.IsZero() {
+		return candidates
+	}
+
+	peers := make([]*overlayPeer, 0, len(candidates))
+	for _, peer := range candidates {
+		if peer.id == sourcePeerID {
+			continue
+		}
+		peers = append(peers, peer)
+	}
+	return peers
+}
+
+func (s *overlaySubscription) resolveTwoStepPeerSet(
+	ctx context.Context,
+	sourcePeerID PeerID,
+) (overlay.StaticBroadcastPeerSet, []overlay.BroadcastTwoStepPeerError) {
+	candidates := s.twoStepCandidates(sourcePeerID)
+	peers := make(overlay.StaticBroadcastPeerSet, 0, len(candidates))
+	var failed []overlay.BroadcastTwoStepPeerError
+
+	for _, peer := range candidates {
+		if s.spec.UseQUIC {
+			_, err := peer.dialQUIC(ctx)
+			if err != nil {
+				failed = append(failed, overlay.BroadcastTwoStepPeerError{
+					PeerID: peer.id[:],
+					Err:    err,
+				})
+				continue
+			}
+			peers = append(peers, quicRouteBroadcastPeer{
+				peer:     peer,
+				envelope: s.quicEnvelope,
+			})
+			continue
+		}
+
+		peers = append(peers, customRLDPBroadcastPeer{
+			id:        peer.id,
+			transport: peer.rldpOverlay,
+		})
+	}
+	return peers, failed
 }
 
 func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
@@ -51,7 +118,7 @@ func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.BroadcastPrecheckInfo) error {
 	sourceID, err := NewPeerID(info.SourceID)
 	if err != nil {
-		s.node.noteBroadcastDrop(s.spec.Name, customTwoStepBroadcastKind, "invalid_source")
+		s.node.noteBroadcastDrop(s.spec.Name, twoStepBroadcastKind, "invalid_source")
 		return err
 	}
 
@@ -62,25 +129,26 @@ func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.Bro
 		return nil
 	}
 
-	s.node.noteBroadcastDrop(s.spec.Name, customTwoStepBroadcastKind, "unauthorized_sender")
+	s.node.noteBroadcastDrop(s.spec.Name, twoStepBroadcastKind, "unauthorized_sender")
 	return fmt.Errorf("custom overlay broadcast source %s is not configured", sourceID.String())
 }
 
-func (s *overlaySubscription) startCustomTwoStepRebroadcastWorker(ctx context.Context) {
-	if s.spec.Kind != overlayKindCustomFixed {
+func (s *overlaySubscription) startTwoStepRebroadcastWorker(ctx context.Context) {
+	if s.spec.Kind != overlayKindCustomFixed &&
+		s.spec.Kind != overlayKindFastSync {
 		return
 	}
-	queue, ok := s.initCustomTwoStepQueue()
+	queue, ok := s.initTwoStepQueue()
 	if !ok {
 		return
 	}
 
 	s.node.runAsync(func() {
-		s.runCustomTwoStepRebroadcastLoop(ctx, queue)
+		s.runTwoStepRebroadcastLoop(ctx, queue)
 	})
 }
 
-func (s *overlaySubscription) initCustomTwoStepQueue() (*boundedQueue[rebroadcastRequest], bool) {
+func (s *overlaySubscription) initTwoStepQueue() (*boundedQueue[rebroadcastRequest], bool) {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
@@ -93,17 +161,17 @@ func (s *overlaySubscription) initCustomTwoStepQueue() (*boundedQueue[rebroadcas
 	return s.twoStepQueue, true
 }
 
-func (s *overlaySubscription) customTwoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
+func (s *overlaySubscription) twoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
 	if s.twoStepQueue == nil {
 		return QueueStatusSnapshot{}, false
 	}
-	return s.twoStepQueue.StatusSnapshot(customTwoStepRebroadcastQueueName), true
+	return s.twoStepQueue.StatusSnapshot(twoStepRebroadcastQueueName), true
 }
 
-func (s *overlaySubscription) runCustomTwoStepRebroadcastLoop(ctx context.Context, queue *boundedQueue[rebroadcastRequest]) {
+func (s *overlaySubscription) runTwoStepRebroadcastLoop(ctx context.Context, queue *boundedQueue[rebroadcastRequest]) {
 	for {
 		req, ok := queue.Pop(ctx)
 		if !ok {
@@ -118,7 +186,7 @@ func (s *overlaySubscription) runCustomTwoStepRebroadcastLoop(ctx context.Contex
 			continue
 		}
 
-		if s.sendCustomTwoStepRebroadcast(ctx, req) {
+		if s.sendTwoStepRebroadcast(ctx, req) {
 			s.node.noteRebroadcastSent(req)
 		} else {
 			s.node.noteRebroadcastDropped(req)
@@ -126,9 +194,8 @@ func (s *overlaySubscription) runCustomTwoStepRebroadcastLoop(ctx context.Contex
 	}
 }
 
-func (s *overlaySubscription) enqueueCustomTwoStepRebroadcast(req rebroadcastRequest) bool {
-	peerSet := customTwoStepPeerSet{sub: s, sourcePeerID: req.sourcePeerID}
-	if len(peerSet.Peers()) == 0 {
+func (s *overlaySubscription) enqueueTwoStepRebroadcast(req rebroadcastRequest) bool {
+	if len(s.twoStepCandidates(req.sourcePeerID)) == 0 {
 		s.node.noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
@@ -137,7 +204,7 @@ func (s *overlaySubscription) enqueueCustomTwoStepRebroadcast(req rebroadcastReq
 		return false
 	}
 
-	queue, ok := s.initCustomTwoStepQueue()
+	queue, ok := s.initTwoStepQueue()
 	if !ok {
 		s.node.noteRebroadcastDropped(req)
 		return false
@@ -156,13 +223,13 @@ func (s *overlaySubscription) enqueueCustomTwoStepRebroadcast(req rebroadcastReq
 	return false
 }
 
-func (s *overlaySubscription) sendCustomTwoStepRebroadcast(ctx context.Context, req rebroadcastRequest) bool {
+func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req rebroadcastRequest) bool {
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
 		return false
 	}
 
-	plan := planCustomRebroadcast(req.kind, payloadLen)
+	plan := s.rebroadcastPlan(req.kind, payloadLen)
 	if plan.mode != rebroadcastModeFEC {
 		return false
 	}
@@ -170,22 +237,25 @@ func (s *overlaySubscription) sendCustomTwoStepRebroadcast(ctx context.Context, 
 	sendCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
 	defer cancel()
 
+	peerSet, resolveFailed := s.resolveTwoStepPeerSet(sendCtx, req.sourcePeerID)
+	s.markTwoStepPeerFailures(resolveFailed)
+
 	res, err := overlay.SendBroadcastTwoStep(sendCtx, overlay.BroadcastTwoStepSendRequest{
 		Key:         s.node.privKey,
 		Certificate: overlay.CertificateEmpty{},
 		LocalADNLID: s.node.localID.Bytes(),
 		Payload:     req.payload,
 		Flags:       plan.flags,
-		PeerSet:     customTwoStepPeerSet{sub: s, sourcePeerID: req.sourcePeerID},
+		PeerSet:     peerSet,
 	})
-	s.markCustomTwoStepPeerFailures(res.Failed)
+	s.markTwoStepPeerFailures(res.Failed)
 
 	if err != nil && res.Sent == 0 {
 		s.log.Debug().
 			Err(err).
 			Str("kind", req.kind).
-			Int("attempted", res.Attempted).
-			Int("failed", len(res.Failed)).
+			Int("attempted", res.Attempted+len(resolveFailed)).
+			Int("failed", len(res.Failed)+len(resolveFailed)).
 			Msg("failed to send custom two-step broadcast")
 		return false
 	}
@@ -194,13 +264,13 @@ func (s *overlaySubscription) sendCustomTwoStepRebroadcast(ctx context.Context, 
 			Err(err).
 			Str("kind", req.kind).
 			Int("sent", res.Sent).
-			Int("failed", len(res.Failed)).
+			Int("failed", len(res.Failed)+len(resolveFailed)).
 			Msg("partially sent custom two-step broadcast")
 	}
 	return res.Sent > 0
 }
 
-func (s *overlaySubscription) markCustomTwoStepPeerFailures(failed []overlay.BroadcastTwoStepPeerError) {
+func (s *overlaySubscription) markTwoStepPeerFailures(failed []overlay.BroadcastTwoStepPeerError) {
 	for _, peerErr := range failed {
 		id, err := NewPeerID(peerErr.PeerID)
 		if err != nil {

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
 	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -82,7 +81,7 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 	}
 
 	resp, err = sub.dispatchPeerQuery(context.Background(), GetOutMsgQueueProof{
-		DstShard: archive.ShardID{Workchain: 0, Shard: topShard},
+		DstShard: tonnodeapi.ShardID{Workchain: 0, Shard: topShard},
 		Limits:   ImportedMsgQueueLimits{MaxBytes: 1 << 20, MaxMsgs: 128},
 	})
 
@@ -114,7 +113,7 @@ func TestCustomFixedOverlayDoesNotAnswerGetRandomPeers(t *testing.T) {
 	}
 }
 
-func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
+func TestDispatchPeerQueryRejectsSendExtMessageFromOverlay(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,
@@ -124,58 +123,50 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	node.runCtx = runCtx
-	node.zeroStateFileHash = make([]byte, 32)
-
-	spec, err := buildOverlaySpec(node.zeroStateFileHash, 0, topShard, overlayName(0, topShard))
-	if err != nil {
-		t.Fatalf("build overlay spec: %v", err)
-	}
-	sub := mustGetOrCreateSubscription(t, node, spec)
 	peer := testRebroadcastQueuePeer("peer")
-	sub.mx.Lock()
-	sub.peers[peer.id] = peer
-	sub.mx.Unlock()
-
 	data := testExternalMessageBOC(t)
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), SendExtMessage{
-		Message: tonnodeapi.ExternalMessage{Data: data},
-	})
+	tests := []struct {
+		name string
+		spec overlaySpec
+	}{
+		{
+			name: "public overlay",
+			spec: overlaySpec{Name: "basechain"},
+		},
+		{
+			name: "custom overlay accepting queries",
+			spec: overlaySpec{
+				Name:          "custom.private",
+				Kind:          overlayKindCustomFixed,
+				AcceptQueries: true,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sub := testOverlaySubscription(&overlaySubscription{
+				node: node,
+				spec: tt.spec,
+				log:  discardLogger(),
+				peers: map[PeerID]*overlayPeer{
+					peer.id: peer,
+				},
+			})
 
-	if err != nil {
-		t.Fatalf("sendExtMessage: %v", err)
-	}
-	if _, ok := resp.(Success); !ok {
-		t.Fatalf("unexpected sendExtMessage response %T", resp)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	req, ok := peer.localRebroadcastQueue.Pop(ctx)
-	if !ok {
-		t.Fatal("expected external message rebroadcast request")
-	}
-	if req.kind != "tonNode.externalMessageBroadcast" {
-		t.Fatalf("unexpected rebroadcast kind %q", req.kind)
-	}
-	if req.subscription.spec.Name != "basechain" {
-		t.Fatalf("unexpected rebroadcast subscription %q", req.subscription.spec.Name)
-	}
-
-	var parsed any
-	if _, err = tl.Parse(&parsed, req.payload, true); err != nil {
-		t.Fatalf("parse broadcast payload: %v", err)
-	}
-	broadcast, ok := parsed.(tonnodeapi.NewExternalMessageBroadcast)
-	if !ok {
-		t.Fatalf("unexpected broadcast payload type %T", parsed)
-	}
-	if string(broadcast.Message.Data) != string(data) {
-		t.Fatalf("unexpected external message data %x", broadcast.Message.Data)
+			response, err := sub.dispatchPeerQuery(context.Background(), SendExtMessage{
+				Message: tonnodeapi.ExternalMessage{Data: data},
+			})
+			if err == nil || !strings.Contains(err.Error(), "query not from full-node master") {
+				t.Fatalf("sendExtMessage error = %v, want source reject", err)
+			}
+			if response != nil {
+				t.Fatalf("sendExtMessage response = %T, want nil", response)
+			}
+			if request, ok := peer.localRebroadcastQueue.TryPop(); ok {
+				t.Fatalf("unexpected external message rebroadcast %q", request.kind)
+			}
+		})
 	}
 }
 
@@ -690,7 +681,7 @@ func TestBuildOverlaySpecUsesCppNodeProtoVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build master overlay spec: %v", err)
 	}
-	if master.ProtoVersionMajor != masterchainProtoVersionMajor || master.ProtoVersionMinor != masterchainProtoVersionMinor {
+	if master.ProtoVersionMajor != 3 || master.ProtoVersionMinor != 2 {
 		t.Fatalf("unexpected master proto version %d.%d", master.ProtoVersionMajor, master.ProtoVersionMinor)
 	}
 
@@ -698,7 +689,7 @@ func TestBuildOverlaySpecUsesCppNodeProtoVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build base overlay spec: %v", err)
 	}
-	if base.ProtoVersionMajor != shardchainProtoVersionMajor || base.ProtoVersionMinor != shardchainProtoVersionMinor {
+	if base.ProtoVersionMajor != 3 || base.ProtoVersionMinor != 2 {
 		t.Fatalf("unexpected base proto version %d.%d", base.ProtoVersionMajor, base.ProtoVersionMinor)
 	}
 }
@@ -861,6 +852,7 @@ func testRebroadcastQueuePeer(id string) *overlayPeer {
 	peer := &overlayPeer{
 		id:      testPeerID(id),
 		addr:    id,
+		route:   newPeerRoute(""),
 		overlay: &overlay.ADNLOverlayWrapper{},
 		announced: &overlay.Node{
 			Version: int32(time.Now().Unix()),

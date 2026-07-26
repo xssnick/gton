@@ -40,6 +40,48 @@ func TestBroadcastTargetsExpiredRefreshIsSingleflight(t *testing.T) {
 	}
 }
 
+func TestBroadcastTargetsExcludeDeferredQUICRouteOnlyFromPlumtree(t *testing.T) {
+	peerID := testPeerID("deferred-plumtree-route")
+	route := newPeerRoute("127.0.0.1:3000")
+	peer := &overlayPeer{
+		id:          peerID,
+		route:       route,
+		fixedMember: true,
+		alive:       true,
+	}
+	sub := testOverlaySubscription(&overlaySubscription{
+		peers: map[PeerID]*overlayPeer{peerID: peer},
+	})
+
+	snapshot := sub.buildBroadcastTargetsSnapshot()
+	if len(snapshot.peers) != 1 ||
+		len(snapshot.broadcast) != 1 ||
+		len(snapshot.plumtree) != 1 {
+		t.Fatalf(
+			"eligible targets = peers %d, broadcasts %d, Plumtree %d; want 1, 1, 1",
+			len(snapshot.peers),
+			len(snapshot.broadcast),
+			len(snapshot.plumtree),
+		)
+	}
+
+	route.deferQUICDial(time.Now())
+	snapshot = sub.buildBroadcastTargetsSnapshot()
+	if len(snapshot.peers) != 1 ||
+		len(snapshot.broadcast) != 1 ||
+		len(snapshot.plumtree) != 0 {
+		t.Fatalf(
+			"deferred targets = peers %d, broadcasts %d, Plumtree %d; want 1, 1, 0",
+			len(snapshot.peers),
+			len(snapshot.broadcast),
+			len(snapshot.plumtree),
+		)
+	}
+	if !sub.PlumtreePeerReceivesBroadcasts(peerID) {
+		t.Fatal("QUIC retry delay changed Plumtree roster membership")
+	}
+}
+
 func BenchmarkBroadcastTargetsSnapshotCached(b *testing.B) {
 	sub := testOverlaySubscription(&overlaySubscription{
 		peers: map[PeerID]*overlayPeer{},

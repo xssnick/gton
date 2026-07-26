@@ -131,7 +131,7 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 
 	downloaded, sigSet, cacheErr := n.decodedBroadcasts.get(req.kind, req.block)
 	if cacheErr == nil {
-		n.noteBroadcast("decode_reused", req.overlay, req.kind)
+		n.noteBroadcast("decode_reused", req.overlay, req.kind, req.delivery)
 		if req.preSigSet != nil {
 			sigSet = req.preSigSet
 		}

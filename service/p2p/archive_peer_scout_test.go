@@ -624,6 +624,7 @@ func TestTransientArchiveScoutWaitsForRandomPeersBeforeAdmission(t *testing.T) {
 	archiveSliceStarted := make(chan GetArchiveSlice, 1)
 	archiveRLDP := &testArchiveRLDP{
 		adnl:               newTestOverlayADNL(),
+		queryResult:        ArchiveInfo{ID: 1},
 		asyncResult:        testArchivePackBytes("transient-admission"),
 		asyncStarted:       archiveSliceStarted,
 		asyncErrors:        map[int64]error{},
@@ -633,6 +634,10 @@ func TestTransientArchiveScoutWaitsForRandomPeersBeforeAdmission(t *testing.T) {
 	peer := testArchiveCandidate("transient-admission")
 	peer.overlay = wrapper
 	peer.rldpOverlay = overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1})
+	peer.queryTransport = rldpPeerQueryTransport{
+		overlay:   peer.rldpOverlay,
+		overlayID: []byte{1},
+	}
 
 	randomStarted := make(chan struct{})
 	releaseRandom := make(chan struct{}, 1)

@@ -51,7 +51,7 @@ type peerEndpointFixture struct {
 	pub     ed25519.PublicKey
 }
 
-func newPeerEndpointFixture(t *testing.T, endpoint string) *peerEndpointFixture {
+func newPeerEndpointFixture(t *testing.T, endpoint peerEndpoint) *peerEndpointFixture {
 	t.Helper()
 
 	_, gatewayKey, err := ed25519.GenerateKey(rand.Reader)
@@ -67,7 +67,7 @@ func newPeerEndpointFixture(t *testing.T, endpoint string) *peerEndpointFixture 
 	gateway := adnl.NewGatewayWithNetManager(gatewayKey, manager)
 	gateway.SetAddressList(nil)
 	node := &Node{
-		pool:    newPeerPool(gateway, nil),
+		pool:    newPeerPool(gateway, nil, nil),
 		peerUse: map[PeerID]peerUse{},
 	}
 
@@ -118,14 +118,18 @@ func (f *peerEndpointFixture) sendRoute(t *testing.T) string {
 }
 
 func TestAcquirePeerEndpointKeepsCanonicalAddress(t *testing.T) {
-	const (
-		canonical = "127.0.0.1:21001"
-		announced = "127.0.0.1:21002"
-	)
+	canonical := peerEndpoint{
+		adnlAddr: "127.0.0.1:21001",
+		quicAddr: "127.0.0.1:22001",
+	}
+	announced := peerEndpoint{
+		adnlAddr: "127.0.0.1:21002",
+		quicAddr: "127.0.0.1:22002",
+	}
 	fixture := newPeerEndpointFixture(t, canonical)
 
-	if route := fixture.sendRoute(t); route != canonical {
-		t.Fatalf("initial route = %s, want %s", route, canonical)
+	if route := fixture.sendRoute(t); route != canonical.adnlAddr {
+		t.Fatalf("initial route = %s, want %s", route, canonical.adnlAddr)
 	}
 
 	peer, release, err := fixture.node.acquirePeerEndpoint(fixture.peer.id, announced, fixture.pub)
@@ -138,21 +142,30 @@ func TestAcquirePeerEndpointKeepsCanonicalAddress(t *testing.T) {
 	release()
 	release()
 
-	if peer.addr != canonical {
-		t.Fatalf("committed endpoint = %s, want %s", peer.addr, canonical)
+	if peer.addr != canonical.adnlAddr {
+		t.Fatalf("committed ADNL endpoint = %s, want %s", peer.addr, canonical.adnlAddr)
 	}
-	if route := fixture.sendRoute(t); route != canonical {
-		t.Fatalf("route after alternate announcement = %s, want %s", route, canonical)
+	if peer.route.quicAddr() != canonical.quicAddr {
+		t.Fatalf("committed QUIC endpoint = %s, want %s", peer.route.quicAddr(), canonical.quicAddr)
+	}
+	if route := fixture.sendRoute(t); route != canonical.adnlAddr {
+		t.Fatalf("route after alternate announcement = %s, want %s", route, canonical.adnlAddr)
 	}
 }
 
 func TestAcquirePeerEndpointReusesCanonicalAddressWhileDownloading(t *testing.T) {
-	fixture := newPeerEndpointFixture(t, "127.0.0.1:21101")
+	fixture := newPeerEndpointFixture(t, peerEndpoint{
+		adnlAddr: "127.0.0.1:21101",
+		quicAddr: "127.0.0.1:22101",
+	})
 	overlayPeer := &overlayPeer{id: fixture.peer.id}
 	releaseDownload := fixture.node.acquireDownloadPeer(overlayPeer)
 	defer releaseDownload()
 
-	peer, release, err := fixture.node.acquirePeerEndpoint(fixture.peer.id, "127.0.0.1:21102", fixture.pub)
+	peer, release, err := fixture.node.acquirePeerEndpoint(fixture.peer.id, peerEndpoint{
+		adnlAddr: "127.0.0.1:21102",
+		quicAddr: "127.0.0.1:22102",
+	}, fixture.pub)
 	if err != nil {
 		t.Fatalf("reuse endpoint during download: %v", err)
 	}
@@ -170,7 +183,10 @@ func TestAcquirePeerEndpointReusesCanonicalAddressWhileDownloading(t *testing.T)
 }
 
 func TestAcquireArchivePeerEndpointDoesNotEnterLiveAccounting(t *testing.T) {
-	fixture := newPeerEndpointFixture(t, "127.0.0.1:21151")
+	fixture := newPeerEndpointFixture(t, peerEndpoint{
+		adnlAddr: "127.0.0.1:21151",
+		quicAddr: "127.0.0.1:22151",
+	})
 
 	peer, release, err := fixture.node.acquireArchivePeerEndpoint(fixture.peer.id, "127.0.0.1:21152", fixture.pub)
 	if err != nil {
@@ -189,6 +205,47 @@ func TestAcquireArchivePeerEndpointDoesNotEnterLiveAccounting(t *testing.T) {
 	}
 	if _, protected := fixture.node.protectedPeerIDs()[fixture.peer.id]; protected {
 		t.Fatal("archive endpoint protected the peer in live selection")
+	}
+}
+
+func TestNewOverlayPeerSharesPooledImmutableRoutingData(t *testing.T) {
+	fixture := newPeerEndpointFixture(t, peerEndpoint{
+		adnlAddr: "127.0.0.1:21201",
+		quicAddr: "127.0.0.1:22201",
+	})
+	overlayID := testPeerID("shared-pooled-routing-overlay")
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: fixture.node,
+		spec: overlaySpec{
+			ShortID: overlayID[:],
+		},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{},
+	})
+
+	peer, err := sub.newOverlayPeer(fixture.peer, nil, false)
+	if err != nil {
+		t.Fatalf("create overlay peer: %v", err)
+	}
+	t.Cleanup(func() {
+		peer.close()
+		sub.broadcastReceiver.Close()
+	})
+
+	if len(peer.pub) != ed25519.PublicKeySize {
+		t.Fatalf("overlay peer public key size = %d", len(peer.pub))
+	}
+	if &peer.pub[0] != &fixture.peer.pub[0] {
+		t.Fatal("overlay peer duplicated the pooled immutable public key")
+	}
+	if peer.route != fixture.peer.route {
+		t.Fatal("overlay peer did not share the pooled peer route")
+	}
+	if peer.route.quicAddr() != fixture.peer.route.quicAddr() {
+		t.Fatalf("overlay QUIC route = %q, want %q", peer.route.quicAddr(), fixture.peer.route.quicAddr())
+	}
+	if &peer.overlayID[0] != &sub.spec.ShortID[0] {
+		t.Fatal("overlay peer did not retain the canonical subscription overlay id")
 	}
 }
 

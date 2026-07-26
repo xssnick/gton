@@ -127,6 +127,24 @@ func TestNextValidatorsForBlockFallsBackToNextValidators(t *testing.T) {
 	testRequireValidator(t, validators, 0x11, 100)
 }
 
+func TestTotalValidatorsUsesPermanentSetWithoutSelection(t *testing.T) {
+	currentSet := testValidatorSetConfigCell(t, 0x44, 400)
+	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
+		tlb.ConfigParamCurrentValidators: currentSet,
+	})
+
+	set, err := cfg.GetCurrentValidators()
+	if err != nil {
+		t.Fatalf("load permanent validators: %v", err)
+	}
+	validators, err := TotalValidators(*set)
+	if err != nil {
+		t.Fatalf("total validators: %v", err)
+	}
+
+	testRequireValidator(t, validators, 0x44, 400)
+}
+
 func testRequireValidator(t *testing.T, validators []*tlb.ValidatorAddr, keyByte byte, weight uint64) {
 	t.Helper()
 

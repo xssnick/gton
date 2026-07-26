@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/archive/packfile"
 	"github.com/xssnick/gton/service/blockproof"
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -25,25 +24,24 @@ import (
 
 type prepareZeroStatePeerStore struct {
 	tnstore.PeerServingStorage
-	data []byte
+	size int64
 	err  error
 }
 
-func (s prepareZeroStatePeerStore) ZeroState(context.Context, ton.BlockIDExt) ([]byte, error) {
-	return s.data, s.err
+func (s prepareZeroStatePeerStore) ZeroStateSize(context.Context, ton.BlockIDExt) (int64, error) {
+	return s.size, s.err
 }
 
 func TestServePrepareZeroStateDistinguishesStorageErrors(t *testing.T) {
 	storageFailure := errors.New("zero state storage failure")
 	tests := []struct {
 		name         string
-		data         []byte
+		size         int64
 		err          error
 		wantPrepared bool
 		wantErr      error
 	}{
-		{name: "available", data: []byte{0x01}, wantPrepared: true},
-		{name: "empty", data: []byte{}},
+		{name: "available", size: 1, wantPrepared: true},
 		{name: "not found", err: tnstore.ErrNotFound},
 		{name: "canceled", err: context.Canceled, wantErr: context.Canceled},
 		{name: "storage failure", err: storageFailure, wantErr: storageFailure},
@@ -53,7 +51,7 @@ func TestServePrepareZeroStateDistinguishesStorageErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			store := prepareZeroStatePeerStore{
 				PeerServingStorage: newTestPeerStore(),
-				data:               tt.data,
+				size:               tt.size,
 				err:                tt.err,
 			}
 			sub := testOverlaySubscription(&overlaySubscription{
@@ -623,7 +621,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 
 	resp, err = sub.dispatchPeerQuery(context.Background(), GetShardArchiveInfo{
 		MasterchainSeqno: 21,
-		ShardPrefix:      archive.ShardID{Workchain: 0, Shard: topShard},
+		ShardPrefix:      tonnodeapi.ShardID{Workchain: 0, Shard: topShard},
 	})
 
 	if err != nil {
@@ -678,7 +676,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	blockData := []byte{0x10, 0x11, 0x12}
 	blockProof := []byte{0x20, 0x21}
 	keyBlock, keyProof, keyProofLink := testPeerMasterBlockProof(t, 61)
-	masterLinkBlock, masterLinkProof, masterLinkProofLink := testPeerMasterBlockProof(t, 64)
+	masterLinkBlock, _, masterLinkProofLink := testPeerMasterBlockProof(t, 64)
 	blockProofLink := []byte{0x30, 0x31}
 	zeroState := []byte{0x40, 0x41, 0x42}
 	stateData := []byte{0x50, 0x51, 0x52, 0x53}
@@ -693,8 +691,8 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	if err = storage.SaveBlockProof(tnstore.ServedProofKeyBlock, keyBlock, keyProof, nil); err != nil {
 		t.Fatalf("save key block proof: %v", err)
 	}
-	if err = storage.SaveBlockProof(tnstore.ServedProofBlock, masterLinkBlock, masterLinkProof, nil); err != nil {
-		t.Fatalf("save master block proof: %v", err)
+	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, masterLinkBlock, masterLinkProofLink, nil); err != nil {
+		t.Fatalf("save master block proof link: %v", err)
 	}
 	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, shardBlock, blockProofLink, nil); err != nil {
 		t.Fatalf("save block proof link: %v", err)
@@ -759,20 +757,16 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var got []byte
-			err := sub.answerPeerQuery(&overlayPeer{addr: "peer"}, tc.req, func(_ context.Context, resp tl.Serializable) error {
-				if _, ok := resp.(tl.Raw); !ok {
-					t.Fatalf("response type = %T, want tl.Raw", resp)
-				}
-				serialized, err := tl.Serialize(resp, true)
-				if err != nil {
-					return err
-				}
-				got = bytes.Clone(serialized)
-				return nil
-			})
+			resp, err := sub.handlePeerQuery(context.Background(), "peer", tc.req)
 			if err != nil {
 				t.Fatalf("answer query: %v", err)
+			}
+			if _, ok := resp.(tl.Raw); !ok {
+				t.Fatalf("response type = %T, want tl.Raw", resp)
+			}
+			got, err := tl.Serialize(resp, true)
+			if err != nil {
+				t.Fatal(err)
 			}
 			if !bytes.Equal(got, tc.want) {
 				t.Fatalf("serialized answer %x, want raw %x", got, tc.want)
@@ -1042,16 +1036,9 @@ func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	answered := false
-	err = sub.answerPeerQuery(&overlayPeer{addr: "peer"}, GetCapabilities{}, func(context.Context, tl.Serializable) error {
-		answered = true
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("answer peer query: %v", err)
-	}
-	if answered {
-		t.Fatal("query was answered after node context was canceled")
+	_, err = sub.handlePeerQuery(node.runCtx, "peer", GetCapabilities{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("handle peer query error = %v, want context cancellation", err)
 	}
 }
 

@@ -14,7 +14,6 @@ import (
 
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
-	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -203,11 +202,8 @@ func TestInactiveSubscriptionRejectsPeerQuery(t *testing.T) {
 	})
 	sub.setActive(false, time.Now().Add(time.Minute))
 
-	err := sub.answerPeerQuery(nil, GetCapabilities{}, func(context.Context, tl.Serializable) error {
-		t.Fatal("inactive subscription should not answer peer query")
-		return nil
-	})
-	if err == nil || err.Error() != "shard is inactive" {
+	_, err := sub.handlePeerQuery(context.Background(), "peer", GetCapabilities{})
+	if !errors.Is(err, errOverlayInactive) {
 		t.Fatalf("inactive query error = %v", err)
 	}
 }

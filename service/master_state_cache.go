@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p"
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
@@ -80,7 +81,7 @@ func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockSta
 		return fmt.Errorf("load broadcast validator config from key block %s: %w", block.BlockRef(), err)
 	}
 
-	s.broadcastValidatorCache.putConfig(state.Block, config)
+	s.publishBroadcastValidatorConfig(state.Block, config)
 	s.resetMonitorSplitDepthCache()
 	return nil
 }
@@ -339,6 +340,42 @@ func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.Blo
 			Err(err).
 			Str("masterchain", storage.FormatBlockRef(state.Block)).
 			Msg("failed to update p2p shard overlays")
+		return
+	}
+
+	config, err := s.broadcastValidatorCache.getConfig()
+	if errors.Is(err, storage.ErrNotFound) {
+		config, err = broadcastValidatorConfigFromMasterchainState(state)
+		if err == nil {
+			config = s.publishBroadcastValidatorConfig(state.Block, config)
+		}
+	}
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("masterchain", storage.FormatBlockRef(state.Block)).
+			Msg("failed to load FastSync overlay config")
+		return
+	}
+
+	fastSyncShards := make([]p2p.FastSyncShard, len(shards))
+	for i := range shards {
+		fastSyncShards[i] = p2p.FastSyncShard{
+			Workchain: shards[i].Workchain,
+			Shard:     shards[i].Shard,
+		}
+	}
+	err = s.node.SetFastSyncOverlays(p2p.FastSyncState{
+		Roster:                     config.fastSync.roster,
+		Shards:                     fastSyncShards,
+		MasterchainPlumtreeEnabled: config.fastSync.plumtreeEnabled(-1),
+		ShardPlumtreeEnabled:       config.fastSync.plumtreeEnabled(0),
+	})
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("masterchain", storage.FormatBlockRef(state.Block)).
+			Msg("failed to update FastSync overlays")
 	}
 }
 

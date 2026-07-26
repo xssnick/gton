@@ -1,6 +1,12 @@
 package pebblestore
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/tvm/cell"
+)
 
 func TestDecodedCellCacheConfigDefaults(t *testing.T) {
 	cfg, err := decodedCellCacheConfigFromOptions(Options{CellCacheSize: defaultPebbleCellTotalCacheSize})
@@ -48,6 +54,42 @@ func TestDecodedCellCacheDisabled(t *testing.T) {
 	}
 	if cache := newDecodedCellCache(cfg); cache != nil {
 		t.Fatal("disabled decoded cell cache should be nil")
+	}
+}
+
+func TestDecodedCellCacheHashLookupMatchesSliceLookup(t *testing.T) {
+	loaded := cell.BeginCell().MustStoreUInt(42, 64).EndCell()
+	hash := loaded.HashKey()
+
+	var disabled *decodedCellCache
+	if _, err := disabled.getHash(1, hash); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("disabled cache error = %v, want ErrNotFound", err)
+	}
+
+	cache := newDecodedCellCache(decodedCellCacheConfig{
+		enabled:       true,
+		shards:        1,
+		cacheBytes:    1,
+		bytesPerEntry: 1,
+		minEntries:    1,
+		maxEntries:    1,
+	})
+	cache.set(1, hash[:], loaded)
+
+	fromHash, err := cache.getHash(1, hash)
+	if err != nil {
+		t.Fatalf("get cached cell by hash: %v", err)
+	}
+	fromSlice, err := cache.get(1, hash[:])
+	if err != nil {
+		t.Fatalf("get cached cell by slice: %v", err)
+	}
+	if fromHash != loaded || fromSlice != loaded {
+		t.Fatal("hash and slice lookups should return the cached cell")
+	}
+
+	if _, err = cache.getHash(2, hash); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("different generation error = %v, want ErrNotFound", err)
 	}
 }
 

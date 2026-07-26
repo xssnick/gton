@@ -30,7 +30,13 @@ func (n *Node) startGateway() error {
 		if err := n.configurePublicAddress(); err != nil {
 			return err
 		}
-		return n.gateway.StartServer(n.listenAddr, listenThreads)
+		if err := n.startQUICServer(); err != nil {
+			return err
+		}
+		if err := n.gateway.StartServer(n.listenAddr, listenThreads); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	return n.gateway.StartClient(listenThreads)

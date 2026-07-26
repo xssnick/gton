@@ -3,10 +3,10 @@ package p2p
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,8 +17,6 @@ import (
 	"github.com/pierrec/lz4/v4"
 	"github.com/xssnick/tonutils-go/adnl"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
-	adnloverlay "github.com/xssnick/tonutils-go/adnl/overlay"
-	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -27,12 +25,94 @@ import (
 var ErrBlockNotAvailable = errors.New("peer does not have the requested block")
 var ErrCompressedBlockStateNotReady = errors.New("compressed block previous state is not ready")
 
+type peerQueryNotReadyError struct {
+	err error
+}
+
+func (e peerQueryNotReadyError) Error() string {
+	return e.err.Error()
+}
+
+func (e peerQueryNotReadyError) Unwrap() error {
+	return e.err
+}
+
+func asPeerQueryNotReady(err error) error {
+	return peerQueryNotReadyError{err: err}
+}
+
+func isPeerQueryNotReady(err error) bool {
+	var notReady peerQueryNotReadyError
+	return errors.As(err, &notReady) ||
+		errors.Is(err, ErrBlockNotAvailable) ||
+		errors.Is(err, ErrStateNotAvailable)
+}
+
+type peerQueryOperation struct {
+	subscription *overlaySubscription
+	peer         *overlayPeer
+	finished     sync.Once
+}
+
+func (s *overlaySubscription) beginPeerQueryOperation(peer *overlayPeer) *peerQueryOperation {
+	return &peerQueryOperation{
+		subscription: s,
+		peer:         peer,
+	}
+}
+
+func (q *peerQueryOperation) finish(err error) {
+	q.finished.Do(func() {
+		q.subscription.finishPeerQueryOperation(q.peer, err)
+	})
+}
+
+func (s *overlaySubscription) finishPeerQueryOperation(peer *overlayPeer, err error) {
+	// Concurrent and hedged callers cancel work that lost to another peer.
+	// That cancellation is not a peer outcome and must not affect readiness.
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+
+	if s.spec.Kind == overlayKindCustomFixed {
+		if err == nil {
+			return
+		}
+		if errors.Is(err, adnl.ErrPeerConnClosed) || !peer.hasOpenConnection() {
+			s.removePeerIfCurrent(peer)
+			return
+		}
+
+		peer.ignoreApplicationQueries(time.Now().Add(customQueryFailureCooldown))
+		return
+	}
+
+	if err == nil || isPeerQueryNotReady(err) {
+		// An operation spans a whole download - an archive package is up to 2 GiB
+		// and a persistent state slice is streamed to disk - so its duration is a
+		// throughput measurement, not a roundtrip. Feeding it to the RTT average
+		// would invert downloadPeerScore, which divides by 1+roundtrip and would
+		// then rank a fast peer that moved a lot of bytes below a slow one that
+		// moved few. Record the success only; short probes and pings keep the
+		// roundtrip average honest.
+		peer.querySuccess(0)
+		return
+	}
+
+	if s.spec.Kind == overlayKindFastSync &&
+		errors.Is(err, context.DeadlineExceeded) {
+		s.startFastSyncPeerPing(peer)
+	}
+	s.handlePeerQueryFailure(peer, err)
+}
+
 const (
 	liveNextUnavailablePenalty    = 3 * time.Second
 	liveNextProbeSoftTimeout      = 2500 * time.Millisecond
 	liveNextProbeEarlyFailDelay   = 1200 * time.Millisecond
 	liveNextProbeEarlyFailReserve = 4
 	shardDescriptionBroadcastKind = "tonNode.newShardBlockBroadcast"
+	customQueryFailureCooldown    = 3 * time.Second
 )
 
 type ProbeNextBlockFullOptions struct {
@@ -267,7 +347,7 @@ func (n *Node) DownloadNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (
 
 func (n *Node) ProbeNextBlockFull(ctx context.Context, prev ton.BlockIDExt, opts ProbeNextBlockFullOptions) (*DownloadedBlock, error) {
 	return n.nextBlockFullFromCacheOrOverlay(ctx, prev, func(queryCtx context.Context) (*DownloadedBlock, error) {
-		sub, err := n.subscriptionForBlock(prev)
+		sub, err := n.querySubscriptionForBlock(prev)
 		if err != nil {
 			return nil, err
 		}
@@ -317,7 +397,7 @@ func (n *Node) NextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (t
 			Msg("failed to load cached next block description")
 	}
 
-	sub, err := n.subscriptionForBlock(prev)
+	sub, err := n.querySubscriptionForBlock(prev)
 	if err != nil {
 		return ton.BlockIDExt{}, err
 	}
@@ -328,7 +408,7 @@ func (n *Node) NextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (t
 }
 
 func (n *Node) downloadNextFromOverlay(ctx context.Context, prev ton.BlockIDExt) (*DownloadedBlock, error) {
-	sub, err := n.subscriptionForBlock(prev)
+	sub, err := n.querySubscriptionForBlock(prev)
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +509,7 @@ func (n *Node) localBlockProof(ctx context.Context, kind tnstore.ServedProofKind
 }
 
 func (n *Node) downloadFromOverlay(ctx context.Context, block ton.BlockIDExt, req tl.Serializable) (*DownloadedBlock, error) {
-	sub, err := n.subscriptionForBlock(block)
+	sub, err := n.querySubscriptionForBlock(block)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +522,7 @@ func (n *Node) downloadFromOverlay(ctx context.Context, block ton.BlockIDExt, re
 }
 
 func (n *Node) probeBlockFromOverlay(ctx context.Context, block ton.BlockIDExt, opts ProbeBlockFullOptions) (*DownloadedBlock, error) {
-	sub, err := n.subscriptionForBlock(block)
+	sub, err := n.querySubscriptionForBlock(block)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +578,12 @@ func (s *overlaySubscription) probeBlockFull(ctx context.Context, block ton.Bloc
 // downloadBlockFullFromPeer queries one peer for a full block, decodes and
 // verifies it and records the download stats; shared by the parallel and the
 // staged-probe block download paths.
-func (s *overlaySubscription) downloadBlockFullFromPeer(ctx context.Context, requested ton.BlockIDExt, peer *overlayPeer, req tl.Serializable) (DownloadedBlock, error) {
+func (s *overlaySubscription) downloadBlockFullFromPeer(ctx context.Context, requested ton.BlockIDExt, peer *overlayPeer, req tl.Serializable) (result DownloadedBlock, err error) {
+	query := s.beginPeerQueryOperation(peer)
+	defer func() {
+		query.finish(err)
+	}()
+
 	started := time.Now()
 	resp, err := s.queryFromPeer(ctx, peer, req)
 	if err != nil {
@@ -626,18 +711,25 @@ func (s *overlaySubscription) nextBlockDescription(ctx context.Context, prev ton
 			s.noteChainBlockDownloadFailure(prev, peer, err)
 		},
 	}, func(ctx context.Context, peer *overlayPeer) (ton.BlockIDExt, error) {
+		query := s.beginPeerQueryOperation(peer)
+
 		resp, err := s.queryFromPeerWithLimits(ctx, peer, req, downloadNextDescTimeout, maxKeyBlockLookupAnswerSize)
 		if err != nil {
+			query.finish(err)
 			return ton.BlockIDExt{}, err
 		}
 
 		switch desc := resp.(type) {
 		case BlockDescription:
+			query.finish(nil)
 			return desc.ID, nil
 		case BlockDescriptionEmpty:
+			query.finish(ErrBlockNotAvailable)
 			return ton.BlockIDExt{}, ErrBlockNotAvailable
 		default:
-			return ton.BlockIDExt{}, fmt.Errorf("unexpected next block description response %T", resp)
+			err = fmt.Errorf("unexpected next block description response %T", resp)
+			query.finish(err)
+			return ton.BlockIDExt{}, err
 		}
 	})
 	if err != nil {
@@ -664,7 +756,12 @@ func (s *overlaySubscription) downloadNextFullFromPeers(ctx context.Context, cha
 	return &block, nil
 }
 
-func (s *overlaySubscription) downloadNextFullFromPeer(ctx context.Context, chain ton.BlockIDExt, peer *overlayPeer, req DownloadNextBlockFull, liveTail bool, liveNotAvailableMisses int64) (DownloadedBlock, error) {
+func (s *overlaySubscription) downloadNextFullFromPeer(ctx context.Context, chain ton.BlockIDExt, peer *overlayPeer, req DownloadNextBlockFull, liveTail bool, liveNotAvailableMisses int64) (result DownloadedBlock, err error) {
+	query := s.beginPeerQueryOperation(peer)
+	defer func() {
+		query.finish(err)
+	}()
+
 	started := time.Now()
 	resp, err := s.queryFromPeerWithLimits(ctx, peer, req, downloadNextQueryTimeout, maxBlockDownloadAnswerSize)
 	if err != nil {
@@ -836,12 +933,9 @@ func (s *overlaySubscription) queryFromPeerWithLimits(ctx context.Context, peer 
 	defer cancel()
 
 	var resp tl.Serializable
-	startedAt := time.Now()
-	if err := peer.rldpOverlay.DoQuery(queryCtx, maxAnswerSize, req, &resp); err != nil {
-		s.handlePeerQueryFailure(peer, err)
+	if err := peer.queryTransport.Query(queryCtx, maxAnswerSize, req, &resp); err != nil {
 		return nil, err
 	}
-	peer.querySuccess(time.Since(startedAt))
 
 	return resp, nil
 }
@@ -863,26 +957,11 @@ func (s *overlaySubscription) queryRawFromPeerWithLimits(ctx context.Context, pe
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	queryID := make([]byte, 32)
-	if _, err := rand.Read(queryID); err != nil {
+	answer, err := peer.queryTransport.QueryRaw(queryCtx, maxAnswerSize, req)
+	if err != nil {
 		return nil, err
 	}
-
-	result := make(chan rldp.AsyncQueryResult, 1)
-	startedAt := time.Now()
-	if err := peer.rldpOverlay.DoQueryAsync(queryCtx, maxAnswerSize, queryID, adnloverlay.WrapQuery(s.spec.ShortID, req), result); err != nil {
-		s.handlePeerQueryFailure(peer, err)
-		return nil, err
-	}
-
-	select {
-	case resp := <-result:
-		peer.querySuccess(time.Since(startedAt))
-		return resp.ResultBytes, nil
-	case <-queryCtx.Done():
-		s.handlePeerQueryFailure(peer, queryCtx.Err())
-		return nil, fmt.Errorf("response deadline exceeded, err: %w", queryCtx.Err())
-	}
+	return answer, nil
 }
 
 func (s *overlaySubscription) downloadFullFromPeers(ctx context.Context, requested ton.BlockIDExt, peers []*overlayPeer, req tl.Serializable) (*DownloadedBlock, error) {

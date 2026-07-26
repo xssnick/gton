@@ -3,6 +3,7 @@ package pebblestore
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -305,16 +306,25 @@ func (c *cellStore) shardForHash(hash []byte) (int, *cellDBShard, error) {
 }
 
 func (c *cellStore) getCopy(hash []byte) ([]byte, error) {
+	value, closer, err := c.get(hash)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = closer.Close() }()
+	return append([]byte(nil), value...), nil
+}
+
+func (c *cellStore) get(hash []byte) ([]byte, io.Closer, error) {
 	idx, shard, err := c.shardForHash(hash)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	value, err := pebbleReaderGetCopy(shard.db, hash, nil)
+	value, closer, err := pebbleReaderGet(shard.db, hash)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	c.addReadCells(idx, 1)
-	return value, nil
+	return value, closer, nil
 }
 
 func (c *cellStore) has(hash []byte) (bool, error) {
@@ -590,7 +600,20 @@ func (w *cellBatchWriter) ensureBatch(hash []byte) (int, error) {
 }
 
 func newCellShardBatch(db *pebble.DB, size int) *pebble.Batch {
-	return db.NewBatchWithSize(size, pebble.WithMaxRetainedSizeBytes(size))
+	return db.NewBatchWithSize(size, pebble.WithMaxRetainedSizeBytes(cellShardBatchRetainedSize(size)))
+}
+
+// cellShardBatchRetainedSize decouples the pooled-buffer cap from the initial
+// size. Pebble drops a batch buffer whose capacity exceeds the retention cap,
+// so tying the two together makes a payload-sized live batch discard its buffer
+// as soon as shard skew grows it past the estimate. The floor lets small live
+// batches survive a growth round and reuse pooled buffers, while bulk import
+// keeps exactly the cap it has today.
+func cellShardBatchRetainedSize(size int) int {
+	if size < 1<<20 {
+		return 1 << 20
+	}
+	return size
 }
 
 func cellShardMemTableSize(total int) int {

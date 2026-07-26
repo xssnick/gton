@@ -164,6 +164,20 @@ func ValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, valida
 	return shardValidatorsForSet(block, params, ccSeqno, shardValidatorsNum)
 }
 
+// TotalValidators returns every validator declared by a permanent validator set.
+func TotalValidators(validatorConfig tlb.ValidatorSetAny) ([]*tlb.ValidatorAddr, error) {
+	params, err := loadValidatorSetParams(validatorConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	validators := make([]*tlb.ValidatorAddr, len(params.entries))
+	for i := range params.entries {
+		validators[i] = params.entries[i].addr
+	}
+	return validators, nil
+}
+
 func ValidatorSetHash(ccSeqno uint32, validators []*tlb.ValidatorAddr) (uint32, error) {
 	items := make([]ton.ValidatorItemHashable, len(validators))
 	for i, validator := range validators {

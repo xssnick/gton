@@ -101,10 +101,17 @@ func (c *archiveImportCache) loadOnce(ctx context.Context, key archiveImportCach
 	result, err := load(ctx)
 
 	c.mu.Lock()
+	// One owned clone serves as both the cache entry and the waiters' source:
+	// every waiter clones it again before returning (see the waiter branch
+	// above), so it is only ever read through a clone and never escapes shared.
+	// On error waiter.result is unreachable, since the waiter branch returns on
+	// waiter.err first.
+	var cached *archiveImportResult
 	if err == nil {
-		c.entries[key] = cloneArchiveImportResult(result)
+		cached = cloneArchiveImportResult(result)
+		c.entries[key] = cached
 	}
-	waiter.result = cloneArchiveImportResult(result)
+	waiter.result = cached
 	waiter.err = err
 	delete(c.waiters, key)
 	close(waiter.done)

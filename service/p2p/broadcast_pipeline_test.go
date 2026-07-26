@@ -172,6 +172,49 @@ func TestClassifyBroadcastDoesNotSerializeInvalidPayload(t *testing.T) {
 	}
 }
 
+func TestFastSyncOutMsgQueueProofBroadcastIsRelayOnly(t *testing.T) {
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: newTestNode(t),
+		spec: overlaySpec{
+			Name:    "fast-sync.masterchain",
+			Kind:    overlayKindFastSync,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+	msg := OutMsgQueueProofBroadcast{}
+
+	if !fastSyncBroadcastSupported(msg) {
+		t.Fatal("out-msg queue proof broadcast is not enabled on FastSync")
+	}
+
+	result, err := sub.classifyBroadcastPayload(
+		nil,
+		msg,
+		newKnownBroadcastPayload([]byte{0x01}),
+		DeliverySimple,
+		false,
+		testPeerID("peer"),
+	)
+	if err != nil {
+		t.Fatalf("classify out-msg queue proof broadcast: %v", err)
+	}
+	if result.disposition != broadcastDispositionAccept {
+		t.Fatal("out-msg queue proof broadcast was not admitted for relay")
+	}
+	accepted := result.accepted
+	if accepted.fingerprint != "" ||
+		accepted.deduped ||
+		accepted.block != nil ||
+		accepted.event != nil ||
+		len(accepted.extraEvents) != 0 ||
+		accepted.masterchainWake != nil ||
+		accepted.rebroadcast != nil ||
+		accepted.skipAcceptedMetric {
+		t.Fatalf("relay-only broadcast scheduled application work: %+v", result.accepted)
+	}
+}
+
 func TestClassifyDuplicateIdentifiedBroadcastDoesNotSerializePayload(t *testing.T) {
 	node := newTestNode(t)
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -587,7 +630,13 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 	if _, ok := target.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("target peer should not receive app-level shard block rebroadcast when FEC relay is enabled")
 	}
-	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"basechain",
+		"tonNode.newShardBlockBroadcast",
+		DeliveryFEC,
+	); got != 1 {
 		t.Fatalf("accepted broadcast count = %d, want 1", got)
 	}
 
@@ -598,7 +647,13 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "seen"); got != 1 {
 		t.Fatalf("seen broadcast drop count = %d, want 1", got)
 	}
-	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"basechain",
+		"tonNode.newShardBlockBroadcast",
+		DeliveryFEC,
+	); got != 1 {
 		t.Fatalf("duplicate accepted broadcast count = %d, want 1", got)
 	}
 }
@@ -1027,7 +1082,7 @@ func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
 	if _, ok := target.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("pending completion repeated same-overlay rebroadcast")
 	}
-	snapshot, ok := customSub.customTwoStepQueueStatusSnapshot()
+	snapshot, ok := customSub.twoStepQueueStatusSnapshot()
 	if !ok {
 		t.Fatal("custom two-step queue was not initialized")
 	}
@@ -1369,13 +1424,48 @@ func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProc
 	}
 }
 
-func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 {
+func testBroadcastStatCount(
+	node *Node,
+	direction string,
+	overlay string,
+	kind string,
+	delivery Delivery,
+) uint64 {
 	for _, stat := range node.broadcastStatusSnapshot() {
-		if stat.Direction == direction && stat.Overlay == overlay && stat.Kind == kind {
+		if stat.Direction == direction &&
+			stat.Overlay == overlay &&
+			stat.Kind == kind &&
+			stat.Delivery == delivery {
 			return stat.Count
 		}
 	}
 	return 0
+}
+
+func TestBroadcastStatusSeparatesDeliveryModes(t *testing.T) {
+	node := newTestNode(t)
+
+	node.noteBroadcast("accepted", "masterchain", "tonNode.blockBroadcast", DeliverySimple)
+	node.noteBroadcast("accepted", "masterchain", "tonNode.blockBroadcast", DeliveryPlumtree)
+
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"masterchain",
+		"tonNode.blockBroadcast",
+		DeliverySimple,
+	); got != 1 {
+		t.Fatalf("simple accepted broadcast count = %d, want 1", got)
+	}
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"masterchain",
+		"tonNode.blockBroadcast",
+		DeliveryPlumtree,
+	); got != 1 {
+		t.Fatalf("Plumtree accepted broadcast count = %d, want 1", got)
+	}
 }
 
 func testBroadcastDropStatCount(node *Node, overlay, kind, reason string) uint64 {

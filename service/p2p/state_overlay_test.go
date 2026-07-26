@@ -205,12 +205,17 @@ func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
 		asyncResult: data,
 		asyncDelay:  150 * time.Millisecond,
 	}
+	rldpOverlay := overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01})
 	peer := &overlayPeer{
 		id:          testPeerID("probe-peer"),
 		addr:        "probe-peer",
-		rldpOverlay: overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01}),
-		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
-		alive:       true,
+		rldpOverlay: rldpOverlay,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   rldpOverlay,
+			overlayID: []byte{0x01},
+		},
+		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:     true,
 	}
 	node := &Node{
 		log:     discardLogger(),
@@ -1308,4 +1313,39 @@ func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header
 		t.Fatal("expected non-empty split parts")
 	}
 	return parts
+}
+
+func TestHistoricalOverlayBlockRandomizesPublicAncestorDepth(t *testing.T) {
+	node := &Node{
+		monitorMinSplitDepth: map[int32]uint32{0: 2},
+	}
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     shardPrefix(0x1234567890abcdef, 5),
+	}
+
+	seenDepths := make(map[int]struct{})
+	for range 256 {
+		selected := node.historicalOverlayBlockForDownload(block)
+		depth := tnstate.ShardPrefixLength(selected.Shard)
+		if depth < 0 || depth > 2 {
+			t.Fatalf("historical public overlay depth = %d, want [0,2]", depth)
+		}
+		if want := shardPrefix(block.Shard, uint32(depth)); selected.Shard != want {
+			t.Fatalf(
+				"historical public overlay shard = %016x, want ancestor %016x",
+				uint64(selected.Shard),
+				uint64(want),
+			)
+		}
+		seenDepths[depth] = struct{}{}
+	}
+	if len(seenDepths) != 3 {
+		t.Fatalf("historical public overlay depths = %v, want 0, 1, and 2", seenDepths)
+	}
+
+	master := ton.BlockIDExt{Workchain: -1, Shard: 0x4000000000000000}
+	if selected := node.historicalOverlayBlockForDownload(master); selected.Shard != topShard {
+		t.Fatalf("historical masterchain overlay shard = %016x, want top shard", uint64(selected.Shard))
+	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
+	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
@@ -47,27 +48,38 @@ var _ dhtBackend = (*dht.Server)(nil)
 var ErrOffline = errors.New("p2p node is offline")
 
 type Node struct {
-	log                 zerolog.Logger
-	globalConfig        *liteclient.GlobalConfig
-	listenAddr          string
-	externalIP          net.IP
-	privKey             ed25519.PrivateKey
-	localID             PeerID
-	dhtPrivKey          ed25519.PrivateKey
-	gateway             *adnl.Gateway
-	dhtGateway          *adnl.Gateway
-	dhtClient           *dht.Client
-	dhtServer           *dht.Server
-	dht                 dhtBackend
-	pool                *peerPool
-	events              chan BroadcastEvent
-	eventQueue          *boundedQueue[BroadcastEvent]
-	deduper             *eventDeduper
-	customFanoutDeduper *eventDeduper
-	decodedBroadcasts   decodedBroadcastCache
-	decodeQueue         chan offloadedBroadcastDecode
-	masterDecodeQueue   chan offloadedBroadcastDecode
-	decodeWorkersOnce   sync.Once
+	log                      zerolog.Logger
+	globalConfig             *liteclient.GlobalConfig
+	listenAddr               string
+	externalIP               net.IP
+	privKey                  ed25519.PrivateKey
+	quicPublicKey            ed25519.PublicKey
+	localID                  PeerID
+	dhtPrivKey               ed25519.PrivateKey
+	gateway                  *adnl.Gateway
+	quicGateway              *adnlquic.Gateway
+	quicPacketConn           net.PacketConn
+	quicServeDone            chan struct{}
+	quicServeErr             error
+	quicQuerySlots           chan struct{}
+	fastSyncQueryLimiter     fastSyncQueryLimiter
+	fastSyncBroadcastFECPace time.Duration
+	quicPeersMx              sync.RWMutex
+	quicPeers                map[PeerID]*authenticatedQUICPeer
+	quicPeersAccepted        atomic.Uint64
+	dhtGateway               *adnl.Gateway
+	dhtClient                *dht.Client
+	dhtServer                *dht.Server
+	dht                      dhtBackend
+	pool                     *peerPool
+	events                   chan BroadcastEvent
+	eventQueue               *boundedQueue[BroadcastEvent]
+	deduper                  *eventDeduper
+	overlayFanoutDeduper     *eventDeduper
+	decodedBroadcasts        decodedBroadcastCache
+	decodeQueue              chan offloadedBroadcastDecode
+	masterDecodeQueue        chan offloadedBroadcastDecode
+	decodeWorkersOnce        sync.Once
 
 	myExternalMessages        *eventDeduper
 	processedExternalMessages *eventDeduper
@@ -79,7 +91,12 @@ type Node struct {
 	onceStop sync.Once
 	stopped  chan struct{}
 	wg       sync.WaitGroup
-	offline  atomic.Bool
+	// asyncMx orders runAsync's wg.Add against stop's wg.Wait: inbound
+	// handlers are only drained after wg.Wait, so without the gate they could
+	// Add to a WaitGroup a concurrent Wait already saw at zero.
+	asyncMx      sync.Mutex
+	asyncStopped bool
+	offline      atomic.Bool
 
 	networkStarted atomic.Bool
 
@@ -149,7 +166,12 @@ type Node struct {
 
 	subscriptionsMx          sync.RWMutex
 	subscriptions            map[string]*overlaySubscription
+	fastSyncSubscriptions    map[FastSyncShard]*overlaySubscription
 	publicBroadcastReceivers atomic.Pointer[publicBroadcastReceiverSnapshot]
+	plumtreePolicy           atomic.Pointer[PlumtreePolicy]
+	plumtreePolicyLogOnce    sync.Once
+	plumtreeBroadcastLogOnce sync.Once
+	plumtreeBudget           *plumtreeMemoryBudget
 
 	monitorSplitMx       sync.RWMutex
 	monitorMinSplitDepth map[int32]uint32
@@ -174,6 +196,17 @@ type Node struct {
 	stateCellImportSlot       chan struct{}
 	stateSplitPartDecodeSlot  chan struct{}
 	customOverlays            []CustomOverlayConfig
+
+	// Certificates start from config and are then replaced by the ones
+	// validators push. The slice is copy-on-write: readers take it under the
+	// mutex and then use it without one.
+	fastSyncCertificatesMx sync.Mutex
+	fastSyncCertificates   []overlay.MemberCertificate
+
+	// Last applied FastSync state, kept so an imported certificate can
+	// reconcile overlays without waiting for the next masterchain block.
+	fastSyncStateMx sync.Mutex
+	fastSyncState   *FastSyncState
 }
 
 func New(opts Options) (*Node, error) {
@@ -229,6 +262,10 @@ func New(opts Options) (*Node, error) {
 	}
 
 	gateway := adnl.NewGateway(priv)
+	quicGateway, err := adnlquic.NewGateway(priv)
+	if err != nil {
+		return nil, fmt.Errorf("create QUIC gateway: %w", err)
+	}
 	localPub := priv.Public().(ed25519.PublicKey)
 	localIDRaw, err := tl.Hash(keys.PublicKeyED25519{Key: localPub})
 	if err != nil {
@@ -237,6 +274,13 @@ func New(opts Options) (*Node, error) {
 	localID, err := NewPeerID(localIDRaw)
 	if err != nil {
 		return nil, fmt.Errorf("parse local ADNL id: %w", err)
+	}
+	fastSyncCertificates, err := prepareFastSyncCertificates(
+		opts.FastSyncCertificates,
+		localID,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	peerStorage := opts.PeerServingStorage
@@ -260,6 +304,12 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	fastSyncBroadcastFECPace, err := normalizeFastSyncBroadcastFECPace(
+		opts.FastSyncBroadcastSpeedMultiplier,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	stateFilesDir, err := prepareStateFilesDir(opts.StateFilesDir)
 	if err != nil {
@@ -273,14 +323,20 @@ func New(opts Options) (*Node, error) {
 		externalIP:                    append(net.IP(nil), opts.ExternalIP...),
 		externalPort:                  opts.ExternalPort,
 		privKey:                       priv,
+		quicPublicKey:                 localPub,
 		localID:                       localID,
 		dhtPrivKey:                    dhtPriv,
 		gateway:                       gateway,
+		quicGateway:                   quicGateway,
+		quicQuerySlots:                make(chan struct{}, inboundQUICQueryParallelism),
+		fastSyncQueryLimiter:          newFastSyncQueryLimiter(),
+		fastSyncBroadcastFECPace:      fastSyncBroadcastFECPace,
+		quicPeers:                     make(map[PeerID]*authenticatedQUICPeer),
 		dhtListenAddr:                 opts.DHTListenAddr,
 		events:                        make(chan BroadcastEvent, broadcastEventBuffer),
 		eventQueue:                    newBoundedQueue(broadcastQueueMaxItems, broadcastQueueMaxBytes, broadcastEventBytes),
 		deduper:                       newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
-		customFanoutDeduper:           newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
+		overlayFanoutDeduper:          newEventDeduper(10*time.Minute, broadcastDeduperMaxEntries),
 		myExternalMessages:            newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		processedExternalMessages:     newEventDeduper(externalMessageCacheTTL, externalMessageCacheMax),
 		externalMessageLimiter:        extmsg.NewDefaultAddressLimiter(),
@@ -290,6 +346,8 @@ func New(opts Options) (*Node, error) {
 		runCtx:                        context.Background(),
 		stopped:                       make(chan struct{}),
 		subscriptions:                 map[string]*overlaySubscription{},
+		fastSyncSubscriptions:         map[FastSyncShard]*overlaySubscription{},
+		plumtreeBudget:                &plumtreeMemoryBudget{},
 		monitorMinSplitDepth:          map[int32]uint32{},
 		latestBasechainShards:         map[storage2.ShardKey]ton.BlockIDExt{},
 		observedMasterchainNotify:     make(chan struct{}),
@@ -323,8 +381,14 @@ func New(opts Options) (*Node, error) {
 		stateCellImportSlot:           make(chan struct{}, 1),
 		stateSplitPartDecodeSlot:      make(chan struct{}, 1),
 		customOverlays:                append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
+		fastSyncCertificates:          fastSyncCertificates,
 	}
-	node.pool = newPeerPool(gateway, node.resolvePublicBroadcastReceiver)
+	node.SetPlumtreePolicy(PlumtreePolicy{})
+	node.pool = newPeerPool(
+		gateway,
+		node.resolvePublicBroadcastReceiver,
+		node.handlePeerCustomMessage,
+	)
 	return node, nil
 }
 
@@ -336,6 +400,26 @@ func (n *Node) SetRuntimeCallbacks(callbacks RuntimeCallbacks) {
 	n.externalMessageAdmission = callbacks
 	n.blockReceivedObserver = callbacks
 	n.blockReceivedHooks = blockReceivedHooksEnabled(callbacks)
+}
+
+func (n *Node) SetPlumtreePolicy(policy PlumtreePolicy) {
+	n.plumtreePolicy.Store(&policy)
+
+	if len(policy.authorizedKeys) > 0 {
+		n.plumtreePolicyLogOnce.Do(func() {
+			n.log.Info().
+				Uint8("masterchain_protocol_version", policy.masterchainProtocolVersion).
+				Uint8("shard_protocol_version", policy.shardProtocolVersion).
+				Int("authorized_keys", len(policy.authorizedKeys)).
+				Msg("loaded Plumtree broadcast policy")
+		})
+	}
+
+	for _, entry := range n.subscriptionEntriesSnapshot() {
+		if entry.sub.plumtree != nil {
+			entry.sub.plumtree.notifyAlarmChanged()
+		}
+	}
 }
 
 func protocolDiagnosticLoggable(msg string) bool {
@@ -406,6 +490,10 @@ func (n *Node) Start(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
 	n.runCtx = runCtx
 	n.runCancel = runCancel
+	if err = runCtx.Err(); err != nil {
+		runCancel()
+		return err
+	}
 	n.zeroStateFileHash = append([]byte(nil), zeroBlock.FileHash...)
 	n.zeroStateBlock = zeroBlock
 	n.initBlock = initBlock
@@ -432,8 +520,28 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	specs = append(specs, customSpecs...)
 	fail := func(err error) error {
-		n.closeSubscriptions()
 		runCancel()
+		n.closeSubscriptions()
+		return err
+	}
+	failNetwork := func(err error) error {
+		runCancel()
+		n.stopAcceptingInbound()
+		if n.dhtClient != nil {
+			n.dhtClient.Close()
+		}
+		if n.dhtServer != nil {
+			_ = n.dhtServer.Close()
+		}
+		if n.dhtGateway != nil {
+			_ = n.dhtGateway.Close()
+		}
+		_ = n.gateway.Close()
+		_ = n.closeQUICGateway()
+		n.networkStarted.Store(false)
+		n.closeSubscriptions()
+		n.wg.Wait()
+		n.inboundWG.Wait()
 		return err
 	}
 	subscriptions := make([]*overlaySubscription, 0, len(specs))
@@ -446,16 +554,21 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 
 	n.gateway.SetConnectionHandler(n.handleInboundPeer)
+	n.quicGateway.SetConnectionHandler(n.handleInboundQUICPeer)
 	if err = n.startGateway(); err != nil {
-		return fail(fmt.Errorf("start ADNL gateway: %w", err))
+		return failNetwork(fmt.Errorf("start network gateways: %w", err))
 	}
-	n.networkStarted.Store(true)
 
 	if err = n.startDHT(runCtx, cfg); err != nil {
-		_ = n.gateway.Close()
-		n.networkStarted.Store(false)
-		return fail(err)
+		return failNetwork(err)
 	}
+	if err = runCtx.Err(); err != nil {
+		return failNetwork(err)
+	}
+	if err = n.checkQUICServer(); err != nil {
+		return failNetwork(err)
+	}
+	n.networkStarted.Store(true)
 
 	for _, sub := range subscriptions {
 		n.startSubscription(sub)
@@ -469,6 +582,7 @@ func (n *Node) Start(ctx context.Context) error {
 	n.runAsync(func() {
 		n.runSubscriptionLifecycleLoop(runCtx)
 	})
+	n.startQUICMonitor(runCtx)
 	if n.isPublicServer() {
 		n.runAsync(func() {
 			n.runAnnounceLoop(runCtx)
@@ -483,12 +597,19 @@ func (n *Node) Start(ctx context.Context) error {
 	return nil
 }
 
-func (n *Node) runAsync(fn func()) {
+func (n *Node) runAsync(fn func()) bool {
+	n.asyncMx.Lock()
+	if n.asyncStopped {
+		n.asyncMx.Unlock()
+		return false
+	}
 	n.wg.Add(1)
+	n.asyncMx.Unlock()
 	go func() {
 		defer n.wg.Done()
 		fn()
 	}()
+	return true
 }
 
 func (n *Node) startSubscription(sub *overlaySubscription) {
@@ -503,7 +624,7 @@ func (n *Node) startSubscription(sub *overlaySubscription) {
 		return
 	}
 
-	sub.startCustomTwoStepRebroadcastWorker(ctx)
+	sub.startTwoStepRebroadcastWorker(ctx)
 	n.runAsync(func() {
 		defer sub.clearRunCancel(token)
 		sub.run(ctx)
@@ -563,11 +684,15 @@ func (n *Node) stop() {
 				_ = n.dhtGateway.Close()
 			}
 			_ = n.gateway.Close()
+			_ = n.closeQUICGateway()
 		}
 
 		n.eventQueue.Close()
 		n.closeSubscriptions()
 
+		n.asyncMx.Lock()
+		n.asyncStopped = true
+		n.asyncMx.Unlock()
 		n.wg.Wait()
 		n.inboundWG.Wait()
 
@@ -884,13 +1009,132 @@ func (n *Node) startDHTClient(cfg *liteclient.GlobalConfig) error {
 type peerPool struct {
 	gateway                   *adnl.Gateway
 	broadcastReceiverResolver overlay.BroadcastReceiverResolver
-	mx                        sync.RWMutex
-	peers                     map[PeerID]*pooledPeer
+	// customMessage receives ADNL messages that carry no overlay envelope.
+	customMessage func(msg *adnl.MessageCustom) error
+	mx            sync.RWMutex
+	peers         map[PeerID]*pooledPeer
+}
+
+type peerEndpoint struct {
+	adnlAddr string
+	quicAddr string
+}
+
+type peerRoute struct {
+	quic                atomic.Pointer[string]
+	quicRefreshRequired atomic.Bool
+	quicRetryState      atomic.Int64
+	// quicDialSpawned bounds background dials to one goroutine per route: the
+	// retry gate alone cannot, because its claim happens inside the dial's
+	// address resolver, behind the gateway's per-peer dial mutex — a slow
+	// ungated dial there would let every relayed part spawn another waiter.
+	quicDialSpawned atomic.Bool
+}
+
+func newPeerRoute(quicAddr string) *peerRoute {
+	route := &peerRoute{}
+	route.setQUICAddr(quicAddr)
+	return route
+}
+
+func (r *peerRoute) setQUICAddr(addr string) {
+	if addr == "" {
+		return
+	}
+
+	if r.quic.CompareAndSwap(nil, &addr) {
+		r.quicRefreshRequired.Store(false)
+	}
+}
+
+func (r *peerRoute) refreshQUICAddr(addr string) {
+	r.quic.Store(&addr)
+	r.quicRefreshRequired.Store(false)
+}
+
+func (r *peerRoute) quicAddr() string {
+	addr := r.quic.Load()
+	if addr == nil {
+		return ""
+	}
+	return *addr
+}
+
+func (r *peerRoute) markQUICAddrStale() {
+	r.quicRefreshRequired.Store(true)
+}
+
+func (r *peerRoute) quicAddrStale() bool {
+	return r.quicRefreshRequired.Load()
+}
+
+// quicDialRetryDelay keeps a failed QUIC route out of the broadcast fanout
+// (Plumtree sends and FEC relay parts) until the eager-peer inactivity window
+// expires. This bounds repeated DHT resolves and handshakes without retaining
+// payloads or creating one timer per peer.
+const quicDialRetryDelay = plumtreeEagerInactivityTTL
+
+// quicReady reports whether the retry gate permits a dial attempt. Callers
+// must check it explicitly before dialing: the gate cannot live only in the
+// dial's address resolver because the gateway's live-outbound fast path never
+// invokes the resolver.
+func (r *peerRoute) quicReady(now time.Time) bool {
+	retryState := r.quicRetryState.Load()
+	return retryState <= 0 || now.UnixNano() >= retryState
+}
+
+// quicDialPermitted mirrors beginQUICDial's claim test without claiming: it
+// filters out routes with a dial already in flight or inside the retry window
+// before any dial goroutine is spawned.
+func (r *peerRoute) quicDialPermitted(now time.Time) bool {
+	retryState := r.quicRetryState.Load()
+	return retryState >= 0 && retryState <= now.UnixNano()
+}
+
+func (r *peerRoute) beginQUICDial(now time.Time) bool {
+	nowUnix := now.UnixNano()
+	for {
+		retryState := r.quicRetryState.Load()
+		if retryState < 0 || retryState > nowUnix {
+			return false
+		}
+		if r.quicRetryState.CompareAndSwap(retryState, -1) {
+			return true
+		}
+	}
+}
+
+func (r *peerRoute) finishQUICDial() {
+	r.quicRetryState.CompareAndSwap(-1, 0)
+}
+
+func (r *peerRoute) failQUICDial(now time.Time) {
+	retryAt := now.Add(quicDialRetryDelay).UnixNano()
+	for current := r.quicRetryState.Load(); current < retryAt; {
+		if r.quicRetryState.CompareAndSwap(current, retryAt) {
+			return
+		}
+		current = r.quicRetryState.Load()
+	}
+}
+
+func (r *peerRoute) deferQUICDial(now time.Time) {
+	retryAt := now.Add(quicDialRetryDelay).UnixNano()
+	for {
+		current := r.quicRetryState.Load()
+		if current < 0 || current >= retryAt {
+			return
+		}
+		if r.quicRetryState.CompareAndSwap(current, retryAt) {
+			return
+		}
+	}
 }
 
 type pooledPeer struct {
 	id              PeerID
 	addr            string
+	route           *peerRoute
 	pub             ed25519.PublicKey
 	adnl            *overlay.ADNLWrapper
 	baseRLDP        *rldp.RLDP
@@ -910,9 +1154,8 @@ type idlePooledPeer struct {
 var errPeerEndpointBusy = errors.New("peer endpoint is in active use")
 var errPooledPeerUnavailable = errors.New("pooled peer is no longer available")
 
-// acquirePeerEndpoint treats the first connection for a PeerID as canonical.
-// Later DHT announcements reuse that transport instead of changing its route.
-func (n *Node) acquirePeerEndpoint(peerID PeerID, addr string, key ed25519.PublicKey) (*pooledPeer, func(), error) {
+// acquirePeerEndpoint treats the first ADNL connection for a PeerID as canonical.
+func (n *Node) acquirePeerEndpoint(peerID PeerID, endpoint peerEndpoint, key ed25519.PublicKey) (*pooledPeer, func(), error) {
 	if err := validatePeerEndpointIdentity(peerID, key); err != nil {
 		return nil, nil, err
 	}
@@ -934,6 +1177,7 @@ func (n *Node) acquirePeerEndpoint(peerID PeerID, addr string, key ed25519.Publi
 		pooled = nil
 	}
 	if pooled != nil {
+		pooled.route.setQUICAddr(endpoint.quicAddr)
 		pooled.refs++
 		n.pool.mx.Unlock()
 
@@ -954,7 +1198,7 @@ func (n *Node) acquirePeerEndpoint(peerID PeerID, addr string, key ed25519.Publi
 	n.peerUse[peerID] = use
 	n.peerUseMx.Unlock()
 
-	connected, err := n.pool.Get(addr, key)
+	connected, err := n.pool.Get(endpoint, key)
 	if err != nil {
 		n.cancelPeerEndpointPending(peerID, pending)
 		return nil, nil, err
@@ -990,7 +1234,7 @@ func (n *Node) acquireArchivePeerEndpoint(peerID PeerID, addr string, key ed2551
 		return pooled, releaseRetainedPeer(n.pool, pooled), nil
 	}
 
-	pooled, err := n.pool.Get(addr, key)
+	pooled, err := n.pool.getADNL(addr, key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1076,15 +1320,33 @@ func (n *Node) cancelPeerEndpointPending(peerID PeerID, pending chan struct{}) {
 	n.peerUse[peerID] = use
 }
 
-func newPeerPool(gateway *adnl.Gateway, resolver overlay.BroadcastReceiverResolver) *peerPool {
+func newPeerPool(
+	gateway *adnl.Gateway,
+	resolver overlay.BroadcastReceiverResolver,
+	customMessage func(msg *adnl.MessageCustom) error,
+) *peerPool {
 	return &peerPool{
 		gateway:                   gateway,
 		broadcastReceiverResolver: resolver,
+		customMessage:             customMessage,
 		peers:                     map[PeerID]*pooledPeer{},
 	}
 }
 
-func (p *peerPool) Get(addr string, key ed25519.PublicKey) (*pooledPeer, error) {
+func (p *peerPool) Get(endpoint peerEndpoint, key ed25519.PublicKey) (*pooledPeer, error) {
+	peer, err := p.gateway.RegisterClient(endpoint.adnlAddr, key)
+	if err != nil {
+		return nil, err
+	}
+	pooled, _, err := p.wrapEndpoint(peer, endpoint)
+	if err != nil {
+		peer.Close()
+		return nil, err
+	}
+	return pooled, nil
+}
+
+func (p *peerPool) getADNL(addr string, key ed25519.PublicKey) (*pooledPeer, error) {
 	peer, err := p.gateway.RegisterClient(addr, key)
 	if err != nil {
 		return nil, err
@@ -1104,11 +1366,38 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	}
 
 	p.mx.Lock()
+	pooled, fresh, stale := p.wrapPeerLocked(peer, id)
+	p.mx.Unlock()
 
+	for _, idle := range stale {
+		idle.close()
+	}
+	return pooled, fresh, nil
+}
+
+func (p *peerPool) wrapEndpoint(peer adnl.Peer, endpoint peerEndpoint) (*pooledPeer, bool, error) {
+	id, err := NewPeerID(peer.GetID())
+	if err != nil {
+		return nil, false, err
+	}
+
+	p.mx.Lock()
+	pooled, fresh, stale := p.wrapPeerLocked(peer, id)
+	// Inbound ADNL peers have no discovered QUIC route. The first outbound
+	// address-list route learned for that live generation becomes canonical.
+	pooled.route.setQUICAddr(endpoint.quicAddr)
+	p.mx.Unlock()
+
+	for _, idle := range stale {
+		idle.close()
+	}
+	return pooled, fresh, nil
+}
+
+func (p *peerPool) wrapPeerLocked(peer adnl.Peer, id PeerID) (*pooledPeer, bool, []*pooledPeer) {
 	if pooled := p.peers[id]; pooled != nil {
 		if !pooledPeerClosed(pooled) {
 			pooled.touch(time.Now())
-			p.mx.Unlock()
 			return pooled, false, nil
 		}
 		delete(p.peers, id)
@@ -1116,12 +1405,18 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 
 	wrapper := overlay.CreateExtendedADNL(peer)
 	wrapper.SetBroadcastReceiverResolver(p.broadcastReceiverResolver)
+	if p.customMessage != nil {
+		// Non-overlay ADNL messages fall through to this handler; without it
+		// they are dropped before anything sees them.
+		wrapper.SetCustomMessageHandler(p.customMessage)
+	}
 	baseRLDP := rldp.NewClientV2(wrapper)
 	rldpClient := overlay.CreateExtendedRLDP(baseRLDP)
 
 	pooled := &pooledPeer{
 		id:              id,
 		addr:            peer.RemoteAddr(),
+		route:           newPeerRoute(""),
 		pub:             append(ed25519.PublicKey(nil), peer.GetPubKey()...),
 		adnl:            wrapper,
 		baseRLDP:        baseRLDP,
@@ -1135,11 +1430,7 @@ func (p *peerPool) wrap(peer adnl.Peer) (*pooledPeer, bool, error) {
 	})
 	p.peers[id] = pooled
 	stale := p.pruneIdleLocked(time.Now())
-	p.mx.Unlock()
-	for _, idle := range stale {
-		idle.close()
-	}
-	return pooled, true, nil
+	return pooled, true, stale
 }
 
 func (p *pooledPeer) touch(now time.Time) {
@@ -1574,9 +1865,11 @@ func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, l
 	nodes := make([][]byte, 0, len(cfg.Nodes))
 	fixedNodes := make([]PeerID, 0, len(cfg.Nodes))
 	fixedIDs := make(map[PeerID]struct{}, len(cfg.Nodes))
+	queryAcceptorIDs := make(map[PeerID]struct{}, len(cfg.Nodes))
 	msgSenders := map[PeerID]int{}
 	blockSenders := map[PeerID]struct{}{}
 	authorizedKeys := map[string]uint32{}
+	acceptQueries := false
 
 	for _, node := range cfg.Nodes {
 		if node.ADNLID.IsZero() {
@@ -1596,6 +1889,12 @@ func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, l
 			blockSenders[node.ADNLID] = struct{}{}
 			authorizedKeys[string(id)] = maxOverlayPayloadSize
 		}
+		if node.AcceptQueries {
+			queryAcceptorIDs[node.ADNLID] = struct{}{}
+		}
+		if node.ADNLID == localID && node.AcceptQueries {
+			acceptQueries = true
+		}
 	}
 	if len(nodes) == 0 {
 		return overlaySpec{}, false, fmt.Errorf("custom overlay %q has no nodes", cfg.Name)
@@ -1603,6 +1902,13 @@ func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, l
 
 	sort.Slice(nodes, func(i, j int) bool {
 		return bytes.Compare(nodes[i], nodes[j]) < 0
+	})
+	queryAcceptors := make([]PeerID, 0, len(queryAcceptorIDs))
+	for id := range queryAcceptorIDs {
+		queryAcceptors = append(queryAcceptors, id)
+	}
+	sort.Slice(queryAcceptors, func(i, j int) bool {
+		return bytes.Compare(queryAcceptors[i][:], queryAcceptors[j][:]) < 0
 	})
 
 	fullID, err := tl.Hash(tonnodeapi.CustomOverlayID{
@@ -1631,11 +1937,15 @@ func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, l
 		ProtoVersionMinor: shardchainProtoVersionMinor,
 		FixedNodes:        fixedNodes,
 		FixedNodeIDs:      fixedIDs,
+		QueryAcceptors:    queryAcceptors,
 		MsgSenders:        msgSenders,
 		BlockSenders:      blockSenders,
 		AuthorizedKeys:    authorizedKeys,
 		SenderShards:      append([]CustomOverlayShard(nil), cfg.SenderShards...),
 		SkipPublicMsgSend: cfg.SkipPublicMsgSend,
+		UseQUIC:           cfg.UseQUIC,
+		SendQueries:       cfg.SendQueries,
+		AcceptQueries:     acceptQueries,
 		Announce:          false,
 		DHTDiscovery:      false,
 		RandomPeers:       false,

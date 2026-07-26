@@ -7,10 +7,12 @@ import (
 )
 
 type PeerServingStorage interface {
+	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*BlockMeta, error)
 	BlockFull(ctx context.Context, block ton.BlockIDExt) (*ServedBlockFull, error)
 	NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*ServedBlockFull, error)
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	BlockProof(ctx context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error)
+	ZeroStateSize(ctx context.Context, block ton.BlockIDExt) (int64, error)
 	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	PersistentStateSize(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (int64, error)
 	PersistentStateSlice(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64, offset int64, maxSize int64) ([]byte, error)
