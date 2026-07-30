@@ -101,8 +101,8 @@ github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 h1:QsXLhRwVkPH
 github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9/go.mod h1:e+7c+V0mRRcFrHULuyBFUeTYm6Fu0A7jXfUKi67bMfE=
 github.com/xssnick/raptorq v1.5.1 h1:EZ6fWBl4ekUnPQSok4HtWLQ+bjv2OhU87qHIQTROnmk=
 github.com/xssnick/raptorq v1.5.1/go.mod h1:mo5n6T4yaqZkNVMWonRuMS0tcyD4XQ6PwwTjaY3ZwQY=
-github.com/xssnick/tonutils-go v1.18.1-0.20260730101542-29729f65f405 h1:1k5E7nPwAeoksOJYkepNO6Hh55U1+Gyl0wKP6ebJ6es=
-github.com/xssnick/tonutils-go v1.18.1-0.20260730101542-29729f65f405/go.mod h1:eiBvVinVAJho1H84mvAEAHxvAkYUdW6nmXpm4tZqqf8=
+github.com/xssnick/tonutils-go v1.18.1-0.20260730145237-4da011b3a8c9 h1:MwA978itK2uBrIB7pxWTqskUmpCsEXjT5S/KJMia3XI=
+github.com/xssnick/tonutils-go v1.18.1-0.20260730145237-4da011b3a8c9/go.mod h1:eiBvVinVAJho1H84mvAEAHxvAkYUdW6nmXpm4tZqqf8=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
