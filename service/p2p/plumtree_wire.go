@@ -58,6 +58,33 @@ func (c *plumtreeWireCursor) readInt32() (int32, error) {
 	return int32(value), err
 }
 
+func (c *plumtreeWireCursor) readStatsVector(name string) ([]int64, error) {
+	count, err := c.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	if count > plumtreeRegularEagerLimit {
+		return nil, fmt.Errorf(
+			"Plumtree stats %s vector has %d elements, max %d",
+			name,
+			count,
+			plumtreeRegularEagerLimit,
+		)
+	}
+
+	size := int(count) * 8
+	if len(c.buf) < size {
+		return nil, errPlumtreeWireShort
+	}
+
+	values := make([]int64, int(count))
+	for i := range values {
+		values[i] = int64(binary.LittleEndian.Uint64(c.buf))
+		c.buf = c.buf[8:]
+	}
+	return values, nil
+}
+
 func (c *plumtreeWireCursor) readDouble() (float64, error) {
 	if len(c.buf) < 8 {
 		return 0, errPlumtreeWireShort
@@ -398,4 +425,62 @@ func (m *RepairPlumtreePart) parse(data []byte, copyPayload bool) ([]byte, error
 	m.BroadcastID, m.Timestamp = id, timestamp
 	m.PartIndex, m.TreeIndex = partIndex, treeIndex
 	return rest, nil
+}
+
+func (m *PlumtreeStatsPush) Parse(data []byte) ([]byte, error) {
+	return m.parse(data, true)
+}
+
+func (m *PlumtreeStatsPush) ParseNoCopy(data []byte) ([]byte, error) {
+	return m.parse(data, false)
+}
+
+func (m *PlumtreeStatsPush) parse(data []byte, copyPayload bool) ([]byte, error) {
+	cursor := plumtreeWireCursor{buf: data, copyPayload: copyPayload}
+
+	constructor, err := cursor.readUint32()
+	if err != nil {
+		return nil, err
+	}
+	if constructor != plumtreeStatsRecordConstructorID {
+		return nil, fmt.Errorf(
+			"unsupported Plumtree stats record type %08x",
+			constructor,
+		)
+	}
+
+	var record PlumtreeStatsRecord
+	if record.Source, err = cursor.readInt256(); err != nil {
+		return nil, err
+	}
+	if record.Epoch, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+	if record.TreeIndex, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+	if record.EagerSimple, err = cursor.readStatsVector("eager_0"); err != nil {
+		return nil, err
+	}
+	if record.EagerRotating, err = cursor.readStatsVector("eager_index"); err != nil {
+		return nil, err
+	}
+	if record.DeliveredBroadcast, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+	if record.PartsInP99, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+	if record.UsefulAverageMS, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+	if record.UsefulMaximumMS, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+	if record.UsefulP99MS, err = cursor.readInt32(); err != nil {
+		return nil, err
+	}
+
+	m.Record = record
+	return cursor.buf, nil
 }

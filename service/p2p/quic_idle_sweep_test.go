@@ -92,3 +92,67 @@ func TestSweepIgnoresInboundPaths(t *testing.T) {
 		t.Fatalf("inbound path was removed from the registry")
 	}
 }
+
+// The route table is filed from inbound connections too, so without a bound it
+// grows with every peer id that ever handshaked with us and never shrinks.
+func TestPeerRouteSweepBoundsTheTable(t *testing.T) {
+	node := newTestNode(t)
+	now := time.Now()
+
+	for i := range maxPeerRoutes + 500 {
+		var id PeerID
+		id[0], id[1], id[2] = byte(i), byte(i>>8), byte(i>>16)
+		node.peerRoutes.get(id)
+	}
+	if got := node.peerRoutes.size(); got != maxPeerRoutes+500 {
+		t.Fatalf("filed %d routes, want %d", got, maxPeerRoutes+500)
+	}
+
+	if dropped := node.sweepPeerRoutes(now); dropped != 500 {
+		t.Fatalf("dropped %d routes, want 500", dropped)
+	}
+	if got := node.peerRoutes.size(); got != maxPeerRoutes {
+		t.Fatalf("table holds %d routes after the sweep, want %d", got, maxPeerRoutes)
+	}
+	if dropped := node.sweepPeerRoutes(now); dropped != 0 {
+		t.Fatalf("sweep dropped %d routes while at the bound", dropped)
+	}
+}
+
+// A route carries the learned QUIC address and the single-dial gate of a peer we
+// are talking to right now: taking it away loses the address and leaves the gate
+// claiming nothing. Garbage left by one-shot inbound connections goes instead.
+func TestPeerRouteSweepKeepsHeldAndUsefulRoutes(t *testing.T) {
+	node := newTestNode(t)
+
+	held := testPeerID("held-by-a-live-transport")
+	node.peerRoutes.get(held)
+	node.pool.mx.Lock()
+	node.pool.peers[held] = &pooledPeer{id: held}
+	node.pool.mx.Unlock()
+
+	useful := testPeerID("knows-a-quic-address")
+	node.peerRoutes.get(useful).setQUICAddr("1.2.3.4:4278")
+
+	for i := range maxPeerRoutes + 100 {
+		var id PeerID
+		id[0], id[1], id[2], id[3] = byte(i), byte(i>>8), byte(i>>16), 0xAA
+		node.peerRoutes.get(id)
+	}
+
+	if dropped := node.sweepPeerRoutes(time.Now()); dropped == 0 {
+		t.Fatal("sweep dropped nothing while over the bound")
+	}
+
+	node.peerRoutes.mx.RLock()
+	_, keptHeld := node.peerRoutes.routes[held]
+	_, keptUseful := node.peerRoutes.routes[useful]
+	node.peerRoutes.mx.RUnlock()
+
+	if !keptHeld {
+		t.Fatal("a route held by a live transport was swept")
+	}
+	if !keptUseful {
+		t.Fatal("a route with a learned QUIC address was swept before address-less ones")
+	}
+}

@@ -18,6 +18,16 @@ func TestLiteServerSendQueueSize(t *testing.T) {
 	}
 }
 
+func TestParseNodeFlagsRejectsNegativeArchivePrefetchWindows(t *testing.T) {
+	_, _, err := parseNodeFlags([]string{"--archive-prefetch-windows=-1"}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected negative archive prefetch windows error")
+	}
+	if err.Error() != "archive prefetch windows cannot be negative: -1" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestWriteLiteServerPublicKey(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
 	cfg := nodeconfig.Config{Lite: nodeconfig.Lite{Key: seed}}

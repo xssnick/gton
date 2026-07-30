@@ -260,7 +260,7 @@ func TestFastSyncPeerRuntimeNodeAdmission(t *testing.T) {
 			if _, err := runtime.EnrollNode(node, now); err == nil {
 				t.Fatal("invalid node was accepted")
 			}
-			if runtime.membership.Contains(remoteID) {
+			if runtime.membership.Contains(remoteID, now) {
 				t.Fatal("invalid node changed membership")
 			}
 			if counts := runtime.Counts(); counts.Known != 0 {

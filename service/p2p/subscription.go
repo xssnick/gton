@@ -1767,12 +1767,15 @@ func (s *overlaySubscription) aliveKnownPeersSnapshot() []*overlayPeer {
 	return peers
 }
 
-func (s *overlaySubscription) overlayNodesSnapshot() []overlay.Node {
+func (s *overlaySubscription) overlayNodesSnapshot(limit int) []overlay.Node {
 	// Drawn from the directory, not the live set: what we gossip is how other
 	// nodes learn about our peers and, symmetrically, how wide a surface we
 	// keep in the network. Narrowing it to the peers we happen to hold
 	// transports for is exactly what starved broadcast fanout at the old cap.
-	return s.advertisedDirectoryNodes(time.Now())
+	//
+	// The limit is pushed all the way down so the sampling, not the copying,
+	// is what runs under the subscription lock.
+	return s.advertisedDirectoryNodes(time.Now(), limit)
 }
 
 func (s *overlaySubscription) randomPeerAdvertisement() (overlay.NodesList, error) {
@@ -1793,14 +1796,13 @@ func (s *overlaySubscription) randomOverlayNodes(limit int) []overlay.Node {
 		return nil
 	}
 
-	list := s.overlayNodesSnapshot()
+	// Already a uniform sample of size limit; the shuffle only randomises the
+	// order we hand them out in.
+	list := s.overlayNodesSnapshot(limit)
 	if len(list) > 1 {
 		rand.Shuffle(len(list), func(i, j int) {
 			list[i], list[j] = list[j], list[i]
 		})
-	}
-	if len(list) > limit {
-		list = list[:limit]
 	}
 	return list
 }

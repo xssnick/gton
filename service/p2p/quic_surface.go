@@ -182,7 +182,7 @@ func (n *Node) startQUICMonitor(ctx context.Context) {
 		n.log.Error().
 			Str("reason", reason).
 			Msg("QUIC gateway exited while node was online")
-		go n.EnterOffline(reason)
+		go n.enterOfflineFailure(reason)
 	})
 }
 
@@ -291,10 +291,6 @@ func (n *Node) handleQUICQuery(
 	if err != nil {
 		return nil, fmt.Errorf("parse QUIC overlay query body: %w", err)
 	}
-	if err = sub.admitInboundQuery(req, now); err != nil {
-		return nil, err
-	}
-
 	queryCtx, cancel := context.WithTimeout(ctx, peerQueryTimeout)
 	defer cancel()
 

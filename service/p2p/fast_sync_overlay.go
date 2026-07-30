@@ -166,7 +166,7 @@ func (r *fastSyncOverlayRuntime) updateCertificate(
 }
 
 func (r *fastSyncOverlayRuntime) contains(id PeerID) bool {
-	return r.membership.Contains(id)
+	return r.membership.Contains(id, time.Now())
 }
 
 func (r *fastSyncOverlayRuntime) permanent(id PeerID) bool {

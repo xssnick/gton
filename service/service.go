@@ -221,21 +221,24 @@ type Service struct {
 	monitorSplitDepthMu             sync.Mutex
 	monitorSplitDepth               map[monitorSplitDepthKey]uint32
 
-	currentStatePersistMu              sync.Mutex
-	currentStatePersistErrMu           sync.Mutex
-	currentStatePersistErr             error
-	stateCellLoaderMu                  sync.RWMutex
-	stateCellLoaders                   map[uint64]cell.LazyCellLoader
-	stateCellLoaderSnapshot            atomic.Value
-	lazyCellLoads                      lazyCellLoadCounters
-	nextStateCellLoaderID              uint64
-	stateSerializer                    *stateSerializer
-	automaticStateSerializationReady   atomic.Bool
-	maintenanceWake                    chan struct{}
-	stateTTL                           time.Duration
-	archiveTTL                         time.Duration
-	archiveFromZero                    bool
-	syncUntil                          uint32
+	currentStatePersistMu            sync.Mutex
+	currentStatePersistErrMu         sync.Mutex
+	currentStatePersistErr           error
+	stateCellLoaderMu                sync.RWMutex
+	stateCellLoaders                 map[uint64]cell.LazyCellLoader
+	stateCellLoaderSnapshot          atomic.Value
+	lazyCellLoads                    lazyCellLoadCounters
+	nextStateCellLoaderID            uint64
+	stateSerializer                  *stateSerializer
+	automaticStateSerializationReady atomic.Bool
+	maintenanceWake                  chan struct{}
+	stateTTL                         time.Duration
+	archiveTTL                       time.Duration
+	archiveFromZero                  bool
+	syncUntil                        uint32
+	// syncUntilReached is set once this service decides it has synced up to
+	// ton.sync_until. See syncUntilFrozen.
+	syncUntilReached                   atomic.Bool
 	syncDiskSpacePath                  string
 	minSyncDiskFreeBytes               uint64
 	minStateSerializationDiskFreeBytes uint64

@@ -139,7 +139,7 @@ func TestFastSyncMembershipCachedOmittedCertificate(t *testing.T) {
 	); err != nil {
 		t.Fatalf("enroll certified node: %v", err)
 	}
-	if !membership.Contains(node) {
+	if !membership.Contains(node, now) {
 		t.Fatal("enrolled node is absent")
 	}
 	if membership.IsPermanent(node) {
@@ -249,7 +249,7 @@ func TestFastSyncMembershipStoredCertificateOnlyAdvances(t *testing.T) {
 				0,
 				now,
 			)
-			if retained := membership.Contains(node); retained != test.wantRetained {
+			if retained := membership.Contains(node, now); retained != test.wantRetained {
 				t.Fatalf(
 					"node retained = %t, want %t",
 					retained,
@@ -287,7 +287,7 @@ func TestFastSyncMembershipUnknownValidCertificateDoesNotEnroll(t *testing.T) {
 	if err := membership.AuthorizeMember(node, certificate, now); err != nil {
 		t.Fatalf("authorize unknown certified source: %v", err)
 	}
-	if membership.Contains(node) {
+	if membership.Contains(node, now) {
 		t.Fatal("inbound authorization auto-enrolled an unknown node")
 	}
 	if err := membership.AuthorizeOmitted(node, now); !errors.Is(
@@ -391,10 +391,10 @@ func TestFastSyncMembershipRetainsRootState(t *testing.T) {
 		now,
 	)
 
-	if !membership.Contains(retainedNode) {
+	if !membership.Contains(retainedNode, now) {
 		t.Fatal("retained-root node was evicted")
 	}
-	if membership.Contains(removedNode) {
+	if membership.Contains(removedNode, now) {
 		t.Fatal("removed-root node was retained")
 	}
 	retainedFlags, err := membership.PeerFlags(retainedPermanent)
@@ -484,10 +484,10 @@ func TestFastSyncMembershipPermanentDemotion(t *testing.T) {
 			now,
 		)
 
-		if !membership.Contains(node) || membership.IsPermanent(node) {
+		if !membership.Contains(node, now) || membership.IsPermanent(node) {
 			t.Fatalf(
 				"demoted node present = %t, permanent = %t",
-				membership.Contains(node),
+				membership.Contains(node, now),
 				membership.IsPermanent(node),
 			)
 		}
@@ -520,7 +520,7 @@ func TestFastSyncMembershipPermanentDemotion(t *testing.T) {
 			now,
 		)
 
-		if membership.Contains(node) {
+		if membership.Contains(node, now) {
 			t.Fatal("demoted node retained a certificate cleared by roster refresh")
 		}
 	})
@@ -1027,5 +1027,72 @@ func fastSyncMembershipTestCertificateCacheKey(
 	return fastSyncMemberCertificateCacheKey{
 		node: node,
 		hash: sha256.Sum256(encoded),
+	}
+}
+
+// Enrollment is not authorization forever: the QUIC path already rejects a peer
+// whose certificate expired, and Contains gates the ADNL/RLDP path, so answering
+// "member" from the map alone kept serving a de-authorized node until the next
+// roster update - hours, on a stable roster.
+func TestFastSyncMembershipDropsExpiredEnrollment(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_900, 0)
+	issuer := newFastSyncMembershipTestIssuer(t, 0x31)
+	membership := newFastSyncMembership(
+		fastSyncMembershipTestRoster([]PeerID{issuer.id}, nil),
+		0,
+	)
+	node := fastSyncTestPeerID(0x32)
+	expireAt := now.Add(time.Hour)
+	certificate := fastSyncMembershipTestCertificate(
+		t,
+		issuer,
+		node,
+		1,
+		0,
+		int32(expireAt.Unix()),
+	)
+
+	if err := membership.EnrollNode(node, 0, certificate, now); err != nil {
+		t.Fatalf("enroll certified node: %v", err)
+	}
+	if !membership.Contains(node, now) {
+		t.Fatal("freshly enrolled node is absent")
+	}
+
+	// Past the expiry and past overlay's expiry grace.
+	after := expireAt.Add(time.Minute)
+	if membership.Contains(node, after) {
+		t.Fatal("expired enrollment still counts as membership")
+	}
+	// The QUIC path must agree, so the two doors cannot disagree about a peer.
+	if err := membership.AuthorizeOmitted(node, after); err == nil {
+		t.Fatal("expired enrollment passed the certificate check")
+	}
+}
+
+// A permanent member has no certificate to expire.
+func TestFastSyncMembershipPermanentIgnoresExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_950, 0)
+	issuer := newFastSyncMembershipTestIssuer(t, 0x33)
+	membership := newFastSyncMembership(
+		fastSyncMembershipTestRoster([]PeerID{issuer.id}, nil),
+		0,
+	)
+	node := fastSyncTestPeerID(0x34)
+	membership.UpdateRoster(
+		fastSyncMembershipTestRoster([]PeerID{issuer.id}, []PeerID{node}),
+		0,
+		now,
+	)
+	if err := membership.EnrollPermanentNode(node, 0); err != nil {
+		t.Fatalf("enroll permanent node: %v", err)
+	}
+
+	if !membership.Contains(node, now.Add(1000*time.Hour)) {
+		t.Fatal("permanent member expired")
 	}
 }

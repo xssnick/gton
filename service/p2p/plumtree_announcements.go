@@ -43,6 +43,13 @@ type plumtreeAnnouncement struct {
 
 	previous *plumtreeAnnouncement
 	next     *plumtreeAnnouncement
+
+	// Second intrusive list, threading every announcement of one broadcast id
+	// across all peers. Without it both arming a new state and picking repair
+	// candidates walk every buffer of every peer under e.mu, and how much work
+	// that is, is decided by whoever sends us the most unverified IHAVEs.
+	broadcastPrevious *plumtreeAnnouncement
+	broadcastNext     *plumtreeAnnouncement
 }
 
 // An announcement handed out for verification: a value copy, so ed25519 runs off
@@ -98,9 +105,51 @@ func (e *plumtreeEngine) bufferAnnouncementLocked(
 	announcement.certificate = ownPlumtreeCertificate(certificate)
 
 	queue.push(announcement)
+	e.indexAnnouncementLocked(announcement)
 	for queue.count > plumtreeAnnouncementPeerLimit {
-		queue.remove(queue.oldest)
+		e.detachAnnouncementLocked(queue, queue.oldest)
 	}
+}
+
+// The by-broadcast list is maintained here rather than in the queue methods:
+// the queue does not know the engine, and every removal path must unindex.
+func (e *plumtreeEngine) indexAnnouncementLocked(announcement *plumtreeAnnouncement) {
+	if e.announcementsByBroadcast == nil {
+		e.announcementsByBroadcast = map[[sha256.Size]byte]*plumtreeAnnouncement{}
+	}
+	head := e.announcementsByBroadcast[announcement.key.broadcastID]
+	announcement.broadcastNext = head
+	if head != nil {
+		head.broadcastPrevious = announcement
+	}
+	e.announcementsByBroadcast[announcement.key.broadcastID] = announcement
+}
+
+func (e *plumtreeEngine) unindexAnnouncementLocked(announcement *plumtreeAnnouncement) {
+	if announcement.broadcastPrevious != nil {
+		announcement.broadcastPrevious.broadcastNext = announcement.broadcastNext
+	} else if e.announcementsByBroadcast[announcement.key.broadcastID] == announcement {
+		if announcement.broadcastNext != nil {
+			e.announcementsByBroadcast[announcement.key.broadcastID] = announcement.broadcastNext
+		} else {
+			delete(e.announcementsByBroadcast, announcement.key.broadcastID)
+		}
+	}
+	if announcement.broadcastNext != nil {
+		announcement.broadcastNext.broadcastPrevious = announcement.broadcastPrevious
+	}
+	announcement.broadcastPrevious = nil
+	announcement.broadcastNext = nil
+}
+
+// detachAnnouncementLocked is the only way an announcement leaves a queue: it
+// keeps the per-peer list and the by-broadcast index in step.
+func (e *plumtreeEngine) detachAnnouncementLocked(
+	queue *plumtreePeerAnnouncements,
+	announcement *plumtreeAnnouncement,
+) {
+	queue.remove(announcement)
+	e.unindexAnnouncementLocked(announcement)
 }
 
 // The issuer key is copied by the parser, but the signature aliases the inbound
@@ -156,10 +205,13 @@ func (e *plumtreeEngine) takeCandidatesLocked(
 	return into
 }
 
+// Walks only the announcements of this broadcast id, not every peer's buffer.
+// One entry per (peer, key) is guaranteed by the hasAnnouncementLocked check
+// before buffering, so this yields the same set as the per-peer lookup did.
 func (e *plumtreeEngine) matchedAnnouncements(key plumtreePartKey) []*plumtreeAnnouncement {
 	var matched []*plumtreeAnnouncement
-	for _, queue := range e.announcements {
-		if announcement := queue.byKey[key]; announcement != nil {
+	for announcement := e.announcementsByBroadcast[key.broadcastID]; announcement != nil; announcement = announcement.broadcastNext {
+		if announcement.key == key {
 			matched = append(matched, announcement)
 		}
 	}
@@ -171,7 +223,7 @@ func (e *plumtreeEngine) removeAnnouncementLocked(announcement *plumtreeAnnounce
 	if queue == nil {
 		return
 	}
-	queue.remove(announcement)
+	e.detachAnnouncementLocked(queue, announcement)
 	if queue.count == 0 {
 		delete(e.announcements, announcement.peer)
 	}
@@ -186,7 +238,9 @@ func (e *plumtreeEngine) hasAnnouncementLocked(key plumtreePartKey, from PeerID)
 func (e *plumtreeEngine) expireAnnouncementsLocked(now time.Time) {
 	cutoff := now.Add(-plumtreeAnnouncementTTL)
 	for peer, queue := range e.announcements {
-		queue.expire(cutoff)
+		for queue.oldest != nil && !queue.oldest.announcedAt.After(cutoff) {
+			e.detachAnnouncementLocked(queue, queue.oldest)
+		}
 		if queue.count == 0 {
 			delete(e.announcements, peer)
 		}
@@ -209,23 +263,20 @@ func (e *plumtreeEngine) armFECRepairLocked(key plumtreePartKey, announcedAt tim
 // Arms a broadcast whose state has just appeared, from the earliest announcement
 // of each part it lacks - announcements routinely precede the first payload part.
 //
-// One pass over the buffers, not one lookup per part index: this runs under e.mu
-// for every new broadcast.
+// Walks only this broadcast's announcements: it runs under e.mu for every new
+// broadcast, so a sweep over every peer's buffer would put the cost of the hot
+// path in the hands of whoever floods the most unverified IHAVEs.
 func (e *plumtreeEngine) armFECRepairForStateLocked(state *plumtreeFECState) {
-	for _, queue := range e.announcements {
-		for announcement := queue.oldest; announcement != nil; announcement = announcement.next {
-			key := announcement.key
-			if key.broadcastID != state.broadcastID ||
-				key.treeIndex == plumtreeSimpleTree ||
-				state.parts[key.partIndex] != nil {
-				continue
-			}
-			e.setFECRepairAtLocked(
-				state,
-				key.partIndex,
-				announcement.announcedAt.Add(plumtreeRepairDelay),
-			)
+	for announcement := e.announcementsByBroadcast[state.broadcastID]; announcement != nil; announcement = announcement.broadcastNext {
+		key := announcement.key
+		if key.treeIndex == plumtreeSimpleTree || state.parts[key.partIndex] != nil {
+			continue
 		}
+		e.setFECRepairAtLocked(
+			state,
+			key.partIndex,
+			announcement.announcedAt.Add(plumtreeRepairDelay),
+		)
 	}
 }
 
@@ -313,6 +364,14 @@ func (e *plumtreeEngine) StartVerifiedRepair(
 func (e *plumtreeEngine) DropPeerAnnouncements(peer PeerID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	queue := e.announcements[peer]
+	if queue == nil {
+		return
+	}
+	for queue.oldest != nil {
+		e.detachAnnouncementLocked(queue, queue.oldest)
+	}
 	delete(e.announcements, peer)
 }
 
@@ -362,10 +421,4 @@ func (q *plumtreePeerAnnouncements) remove(announcement *plumtreeAnnouncement) {
 	}
 	delete(q.byKey, announcement.key)
 	q.count--
-}
-
-func (q *plumtreePeerAnnouncements) expire(cutoff time.Time) {
-	for q.oldest != nil && !q.oldest.announcedAt.After(cutoff) {
-		q.remove(q.oldest)
-	}
 }

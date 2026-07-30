@@ -138,7 +138,7 @@ func (s *overlaySubscription) handleReceivedBroadcast(msg tl.Serializable, info 
 			// A peer feeding us broadcasts without holding an attachment is as
 			// alive as one that does; keep its directory row warm so it stays
 			// advertised and promotable.
-			s.noteDirectoryActivity(immediatePeerID, nil, "")
+			s.noteDirectoryActivity(immediatePeerID, "")
 		}
 	} else {
 		active = s.isActive()

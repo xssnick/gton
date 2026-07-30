@@ -107,6 +107,9 @@ func applyNodeOptionDefaults(opts NodeOptions) NodeOptions {
 
 // RunNode runs the gton node from already resolved startup options.
 func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
+	if runOpts.ArchivePrefetchWindows < 0 {
+		return fmt.Errorf("archive prefetch windows cannot be negative: %d", runOpts.ArchivePrefetchWindows)
+	}
 	runOpts = applyNodeOptionDefaults(runOpts)
 
 	baseLogger := runOpts.Logger
@@ -418,7 +421,22 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		go runConsole(ctx, logger, runOpts.ConsoleInput, runOpts.ConsoleOutput, svc, store.DBStatus)
 	}
 
-	<-ctx.Done()
+	// A node that stopped on its own because a subsystem died must take the
+	// process down with it: it can no longer sync, and leaving it up would keep
+	// the liteserver answering from a state that stopped advancing while the
+	// supervisor sees a healthy process. The deliberate ton.sync_until stop does
+	// not close Failed, so it still parks here until a signal arrives.
+	var nodeFailure string
+	select {
+	case <-ctx.Done():
+	case <-node.Failed():
+		nodeFailure = node.OfflineReason()
+		logger.Error().
+			Str("reason", nodeFailure).
+			Msg("p2p node stopped unexpectedly, shutting the node down")
+		stop()
+	}
+
 	logger.Info().Msg("shutting down")
 	if extension != nil {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -432,5 +450,8 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	node.Wait()
 	closeStore()
 	logger.Info().Msg("shutdown complete")
+	if nodeFailure != "" {
+		return fmt.Errorf("p2p node stopped unexpectedly: %s", nodeFailure)
+	}
 	return nil
 }

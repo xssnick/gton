@@ -97,7 +97,7 @@ func (s *overlaySubscription) exchangeRandomPeersEphemeral(ctx context.Context, 
 		return
 	}
 
-	s.noteDirectoryActivity(entry.id, entry.pub, entry.adnlAddr)
+	s.noteDirectoryActivity(entry.id, entry.adnlAddr)
 	for _, node := range res.List {
 		s.learnAdvertisedPeer(ctx, node)
 	}

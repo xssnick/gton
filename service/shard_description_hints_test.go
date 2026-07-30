@@ -54,6 +54,7 @@ func TestRememberShardDescriptionHintSkipsAfterSyncUntilFrozen(t *testing.T) {
 		node:      newFrozenTestNode(t),
 		syncUntil: 200,
 	}
+	freezeSyncUntil(t, svc)
 
 	svc.rememberShardDescriptionHint(p2p.BroadcastEvent{
 		Block: block,

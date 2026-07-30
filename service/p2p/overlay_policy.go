@@ -199,27 +199,6 @@ func (spec *overlaySpec) enforcesAcceptQueries() bool {
 	return spec.Kind == overlayKindCustomFixed
 }
 
-// newInboundQueryLimiters builds one limiter per overlay kind. The reference
-// node does the same — three RateLimiter instances, public, fast-sync and
-// custom, with identical defaults — because the limit is per traffic source,
-// not per overlay feature: a public overlay is the one every stranger can
-// reach, so it needs the cap at least as much as a certified FastSync member
-// does.
-func newInboundQueryLimiters() [3]inboundQueryLimiter {
-	return [3]inboundQueryLimiter{
-		overlayKindPublicShard: newInboundQueryLimiter(),
-		overlayKindCustomFixed: newInboundQueryLimiter(),
-		overlayKindFastSync:    newInboundQueryLimiter(),
-	}
-}
-
-// inboundQueryLimiter selects this overlay's share of the per-TL-type inbound
-// query budget. Each kind gets its own window so a flood on one overlay cannot
-// starve queries arriving on another.
-func (s *overlaySubscription) inboundQueryLimiter() *inboundQueryLimiter {
-	return &s.node.inboundQueryLimiters[s.spec.Kind]
-}
-
 // probeDrivenQueryReadiness reports that peer readiness is owned by the probe
 // loop, so an application-query outcome must park or drop the peer rather than
 // feed unreliability, failedQueries and RTT. On a fixed roster eviction is

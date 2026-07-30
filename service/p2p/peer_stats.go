@@ -73,13 +73,22 @@ func (p *overlayPeer) isAliveKnownOverlayPeer(now time.Time) bool {
 }
 
 func (p *overlayPeer) advertisedNodeSnapshot(now time.Time) *overlay.Node {
+	return cloneOverlayNode(p.advertisedNodeRef(now))
+}
+
+// advertisedNodeRef is advertisedNodeSnapshot without the copy. p.announced is
+// only ever replaced by mergeAnnouncement, never mutated in place, so the
+// returned node is safe to read after the lock is dropped - but it must not be
+// handed to a caller that mutates or retains it, hence the clone above for
+// everyone who does not clone the selection itself.
+func (p *overlayPeer) advertisedNodeRef(now time.Time) *overlay.Node {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
 	if p.pending || p.announced == nil || !announcedNodeIsFresh(p.announced, now) || !p.alive {
 		return nil
 	}
-	return cloneOverlayNode(p.announced)
+	return p.announced
 }
 
 func (p *overlayPeer) mergeAnnouncement(v1 *overlay.Node) {

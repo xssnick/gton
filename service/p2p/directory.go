@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"crypto/ed25519"
+	"math/rand/v2"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -121,24 +122,31 @@ func (s *overlaySubscription) markDirectoryLiveLocked(id PeerID, live bool) {
 	}
 }
 
-// noteDirectoryActivity records that a peer contacted us. For rows with no
+// noteDirectoryActivity refreshes a row we already keep. For rows with no
 // attachment this is the only liveness signal besides gossip, and without it a
 // peer that talks to us constantly would still age out of the directory and
 // stop being advertised.
-func (s *overlaySubscription) noteDirectoryActivity(id PeerID, pub ed25519.PublicKey, addr string) {
+//
+// It deliberately does NOT file an unknown peer. This runs before admission and
+// before the rate limiter, on a path any peer reaches with one unauthenticated
+// overlay query, and a row filed here carries no signed announcement: useless to
+// advertise, useless to promote, but it occupies one of maxPeersPerOverlay slots
+// and evicts a row that does carry one. Cheaply repeated, that pins
+// knownPeerCount at the cap, which stops learning from gossip and parks DHT
+// discovery in refresh-only mode. Rows are filed where there is proof the peer
+// is worth keeping - a signed overlay.Node, or an attachment we made ourselves.
+func (s *overlaySubscription) noteDirectoryActivity(id PeerID, addr string) {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
-	if entry := s.directory[id]; entry != nil {
-		entry.lastSeenAt = time.Now()
-		if addr != "" {
-			entry.adnlAddr = addr
-		}
+	entry := s.directory[id]
+	if entry == nil {
 		return
 	}
-	// An inbound peer we have never filed: record it, so a peer that found us
-	// first is a promotion candidate like any other.
-	s.rememberDirectoryPeerLocked(id, pub, addr, "", nil, time.Now())
+	entry.lastSeenAt = time.Now()
+	if addr != "" {
+		entry.adnlAddr = addr
+	}
 }
 
 func (s *overlaySubscription) forgetDirectoryPeer(id PeerID) {
@@ -184,32 +192,68 @@ func (s *overlaySubscription) directorySize() int {
 }
 
 // advertisedDirectoryNodes are the announcements this node gossips. Breadth here
-// is what keeps us present in other nodes' directories, so it is drawn from the
-// full directory rather than the small live set.
-func (s *overlaySubscription) advertisedDirectoryNodes(now time.Time) []overlay.Node {
+// is what keeps us present in other nodes' directories, so candidates are drawn
+// from the full directory rather than the small live set.
+//
+// Only `limit` of them are ever returned, so only `limit` are copied, and the
+// copies happen after s.mx is dropped. Building the whole list under the lock
+// cost ~300 deep clones to answer with three - and s.mx is taken from under the
+// plumtree engine lock on every forwarded broadcast part, so that time lands
+// directly on block propagation.
+func (s *overlaySubscription) advertisedDirectoryNodes(now time.Time, limit int) []overlay.Node {
+	if limit <= 0 {
+		return nil
+	}
+
+	selected := s.sampleAdvertisedNodes(now, limit)
+	list := make([]overlay.Node, 0, len(selected))
+	for _, node := range selected {
+		list = append(list, *cloneOverlayNode(node))
+	}
+	return list
+}
+
+// sampleAdvertisedNodes reservoir-samples up to limit advertisable nodes. The
+// returned pointers are never mutated in place by their owners (both
+// directoryEntry.announced and overlayPeer.announced are replaced wholesale), so
+// they stay safe to copy once the lock is gone.
+func (s *overlaySubscription) sampleAdvertisedNodes(now time.Time, limit int) []*overlay.Node {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
-	list := make([]overlay.Node, 0, len(s.directory)+len(s.peers))
-	seen := make(map[PeerID]struct{}, len(s.directory)+len(s.peers))
-	add := func(id PeerID, node *overlay.Node) {
-		if node == nil || !announcedNodeIsFresh(node, now) || !overlayNodeHasSerializableID(node) {
-			return
-		}
-		if _, dup := seen[id]; dup {
-			return
-		}
-		seen[id] = struct{}{}
-		list = append(list, *cloneOverlayNode(node))
+	advertisable := func(node *overlay.Node) bool {
+		return node != nil &&
+			announcedNodeIsFresh(node, now) &&
+			overlayNodeHasSerializableID(node)
 	}
 
-	for id, entry := range s.directory {
-		add(id, entry.announced)
+	reservoir := make([]*overlay.Node, 0, limit)
+	considered := 0
+	add := func(node *overlay.Node) {
+		if !advertisable(node) {
+			return
+		}
+		considered++
+		if len(reservoir) < limit {
+			reservoir = append(reservoir, node)
+			return
+		}
+		if at := rand.IntN(considered); at < limit {
+			reservoir[at] = node
+		}
+	}
+
+	for _, entry := range s.directory {
+		add(entry.announced)
 	}
 	// A live peer is known by definition; advertise it even if its directory
-	// row has not caught up yet.
+	// row has not caught up yet. Both maps are keyed by peer id, so checking the
+	// directory row is the whole dedup - no seen-set needed.
 	for id, peer := range s.peers {
-		add(id, peer.advertisedNodeSnapshot(now))
+		if entry, filed := s.directory[id]; filed && advertisable(entry.announced) {
+			continue
+		}
+		add(peer.advertisedNodeRef(now))
 	}
-	return list
+	return reservoir
 }

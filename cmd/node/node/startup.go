@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/xssnick/gton/service/hooks"
 	"io"
 	"net/http"
 	_ "net/http/pprof"
@@ -20,6 +19,7 @@ import (
 	"github.com/xssnick/gton"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/hooks"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl/keys"
@@ -255,7 +255,7 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	pprofAddrFlag := flags.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	liteQueryWorkersFlag := flags.Int("liteserver-query-workers", 0, "liteserver query worker goroutines, 0 uses tonutils default")
 	archiveCheckpointPeriodFlag := flags.Duration("archive-checkpoint-period", runOpts.ArchiveCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
-	archivePrefetchWindowsFlag := flags.Int("archive-prefetch-windows", runOpts.ArchivePrefetchWindows, "archive catch-up imported window prefetch depth")
+	archivePrefetchWindowsFlag := flags.Int("archive-prefetch-windows", runOpts.ArchivePrefetchWindows, "archive catch-up imported window prefetch depth, 0 uses the default")
 	if err := flags.Parse(args); err != nil {
 		return startupOptions{}, cliCommands{}, err
 	}
@@ -270,6 +270,9 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	}
 	if commands.version || commands.lsPubkey || commands.adnlID {
 		return startOpts, commands, nil
+	}
+	if *archivePrefetchWindowsFlag < 0 {
+		return startupOptions{}, cliCommands{}, fmt.Errorf("archive prefetch windows cannot be negative: %d", *archivePrefetchWindowsFlag)
 	}
 
 	level, err := logutil.ParseLevel(*verbosityFlag)

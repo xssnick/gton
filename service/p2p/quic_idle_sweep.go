@@ -33,6 +33,9 @@ func (n *Node) runQUICIdleSweepLoop(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			n.sweepIdleQUICPaths(now)
+			// Rides the same ticker: it reclaims per-peer bookkeeping nothing
+			// else frees, and is too cheap to deserve a goroutine of its own.
+			n.sweepPeerRoutes(now)
 		}
 	}
 }
@@ -136,4 +139,45 @@ func (n *Node) pinnedQUICPeers() map[PeerID]struct{} {
 		}
 	}
 	return pinned
+}
+
+// maxPeerRoutes bounds the node-wide route table. A route is ~150 bytes and one
+// is filed for every peer id that ever connected - inbound included, where the
+// only cost to the other side is an ADNL or QUIC handshake from a fresh key - so
+// without a bound the table is a slow, unbounded leak with a cheap accelerator.
+// The bound is far above any real working set: a node knows maxPeersPerOverlay
+// per overlay and dials a few hundred paths.
+const maxPeerRoutes = 20000
+
+// sweepPeerRoutes drops routes no live transport holds, once the table is over
+// its bound. Liveness is derived from the transports themselves rather than
+// reference-counted: routes are handed out in two places and released in a
+// dozen, and a single missed release would pin a route forever while a double
+// release would drop one out from under a live peer.
+func (n *Node) sweepPeerRoutes(now time.Time) int {
+	if n.peerRoutes.size() <= maxPeerRoutes {
+		return 0
+	}
+
+	held := n.routesHeldByTransports()
+	return n.peerRoutes.sweep(held, maxPeerRoutes, now)
+}
+
+// routesHeldByTransports takes the two locks one after the other, never nested,
+// so it cannot participate in a lock order at all.
+func (n *Node) routesHeldByTransports() map[PeerID]struct{} {
+	n.pool.mx.RLock()
+	held := make(map[PeerID]struct{}, len(n.pool.peers))
+	for id := range n.pool.peers {
+		held[id] = struct{}{}
+	}
+	n.pool.mx.RUnlock()
+
+	n.quicPeersMx.RLock()
+	for id := range n.quicPeers {
+		held[id] = struct{}{}
+	}
+	n.quicPeersMx.RUnlock()
+
+	return held
 }

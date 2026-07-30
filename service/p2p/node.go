@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"cmp"
 	"container/list"
 	"context"
 	"crypto/ed25519"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -62,7 +64,6 @@ type Node struct {
 	quicServeDone            chan struct{}
 	quicServeErr             error
 	quicQuerySlots           chan struct{}
-	inboundQueryLimiters     [3]inboundQueryLimiter
 	fastSyncBroadcastFECPace time.Duration
 	quicPeersMx              sync.RWMutex
 	quicPeers                map[PeerID]*authenticatedQUICPeer
@@ -99,6 +100,13 @@ type Node struct {
 	asyncMx      sync.Mutex
 	asyncStopped bool
 	offline      atomic.Bool
+	// offlineFailed separates "stopped because a subsystem died" from the
+	// deliberate offline of ton.sync_until. Both stop the node, but only the
+	// former is an incident: the service must not mistake it for a completed
+	// sync, and the process must exit non-zero so a supervisor restarts it.
+	offlineFailed atomic.Bool
+	onceFailed    sync.Once
+	failed        chan struct{}
 
 	networkStarted atomic.Bool
 
@@ -334,7 +342,6 @@ func New(opts Options) (*Node, error) {
 		gateway:                       gateway,
 		quicGateway:                   quicGateway,
 		quicQuerySlots:                make(chan struct{}, inboundQUICQueryParallelism),
-		inboundQueryLimiters:          newInboundQueryLimiters(),
 		fastSyncBroadcastFECPace:      fastSyncBroadcastFECPace,
 		quicPeers:                     make(map[PeerID]*authenticatedQUICPeer),
 		dhtListenAddr:                 opts.DHTListenAddr,
@@ -350,6 +357,7 @@ func New(opts Options) (*Node, error) {
 		localExternalFanout:           localExternalFanout,
 		runCtx:                        context.Background(),
 		stopped:                       make(chan struct{}),
+		failed:                        make(chan struct{}),
 		subscriptions:                 map[string]*overlaySubscription{},
 		fastSyncSubscriptions:         map[FastSyncShard]*overlaySubscription{},
 		plumtreeBudget:                &plumtreeMemoryBudget{},
@@ -669,8 +677,32 @@ func (n *Node) EnterOffline(reason string) {
 	n.stop()
 }
 
+// enterOfflineFailure is EnterOffline for an unexpected subsystem death. The
+// failure flag is raised before the node stops, so anything that observes
+// IsOffline during the teardown already sees that this was not deliberate.
+func (n *Node) enterOfflineFailure(reason string) {
+	n.offlineFailed.Store(true)
+	n.onceFailed.Do(func() {
+		close(n.failed)
+	})
+	n.EnterOffline(reason)
+}
+
 func (n *Node) IsOffline() bool {
 	return n.offline.Load()
+}
+
+// OfflineFailed reports whether the node went offline because something broke,
+// as opposed to the deliberate stop at ton.sync_until.
+func (n *Node) OfflineFailed() bool {
+	return n.offlineFailed.Load()
+}
+
+// Failed is closed when the node stops because a subsystem died. The deliberate
+// ton.sync_until stop never closes it: there the process is meant to keep
+// serving the frozen state.
+func (n *Node) Failed() <-chan struct{} {
+	return n.failed
 }
 
 func (n *Node) OfflineReason() string {
@@ -1056,6 +1088,9 @@ type peerRoute struct {
 	// address resolver, behind the gateway's per-peer dial mutex — a slow
 	// ungated dial there would let every relayed part spawn another waiter.
 	quicDialSpawned atomic.Bool
+	// lastUsedNanos is when a transport last asked for this route. Only the
+	// sweep reads it, and only for routes no transport holds any more.
+	lastUsedNanos atomic.Int64
 }
 
 // peerRouteTable keeps one peerRoute per peer id for the whole node. The route
@@ -1075,24 +1110,87 @@ func newPeerRouteTable() *peerRouteTable {
 	return &peerRouteTable{routes: map[PeerID]*peerRoute{}}
 }
 
-// get returns the route of a peer, creating it on first use. The pointer is
-// stable for the lifetime of the node, so every holder observes the same gate.
+// get returns the route of a peer, creating it on first use. The pointer stays
+// valid for as long as any transport holds it, so every holder observes the same
+// gate; sweepPeerRoutes only ever drops routes nobody holds.
 func (t *peerRouteTable) get(id PeerID) *peerRoute {
+	nowNanos := time.Now().UnixNano()
+
 	t.mx.RLock()
 	route := t.routes[id]
 	t.mx.RUnlock()
 	if route != nil {
+		route.lastUsedNanos.Store(nowNanos)
 		return route
 	}
 
 	t.mx.Lock()
 	defer t.mx.Unlock()
 	if route = t.routes[id]; route != nil {
+		route.lastUsedNanos.Store(nowNanos)
 		return route
 	}
 	route = newPeerRoute("")
+	route.lastUsedNanos.Store(nowNanos)
 	t.routes[id] = route
 	return route
+}
+
+// sweep bounds the table to maxRoutes.
+//
+// Routes any live transport still holds are never dropped: the route carries the
+// learned QUIC endpoint and the single-dial gate, and taking it away from a peer
+// we are talking to right now would lose the address and leave the gate claiming
+// nothing. Among the rest, routes that never learned an address go first - those
+// are what an inbound connection leaves behind, and they hold nothing worth
+// keeping - and only then the oldest of the useful ones.
+func (t *peerRouteTable) sweep(
+	held map[PeerID]struct{},
+	maxRoutes int,
+	now time.Time,
+) int {
+	t.mx.Lock()
+	defer t.mx.Unlock()
+
+	over := len(t.routes) - maxRoutes
+	if over <= 0 {
+		return 0
+	}
+
+	type victim struct {
+		id       PeerID
+		useful   bool
+		lastUsed int64
+	}
+	candidates := make([]victim, 0, len(t.routes))
+	for id, route := range t.routes {
+		if _, live := held[id]; live {
+			continue
+		}
+		candidates = append(candidates, victim{
+			id:       id,
+			useful:   route.quicAddr() != "",
+			lastUsed: route.lastUsedNanos.Load(),
+		})
+	}
+
+	slices.SortFunc(candidates, func(a, b victim) int {
+		if a.useful != b.useful {
+			if a.useful {
+				return 1
+			}
+			return -1
+		}
+		return cmp.Compare(a.lastUsed, b.lastUsed)
+	})
+
+	if over > len(candidates) {
+		over = len(candidates)
+	}
+	for _, candidate := range candidates[:over] {
+		delete(t.routes, candidate.id)
+	}
+	return over
 }
 
 func (t *peerRouteTable) size() int {

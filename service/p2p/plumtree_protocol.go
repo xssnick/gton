@@ -65,6 +65,7 @@ var (
 	broadcastPlumtreeIHaveConstructorID  uint32
 	broadcastPlumtreePruneConstructorID  uint32
 	broadcastPlumtreeUsefulConstructorID uint32
+	plumtreeStatsRecordConstructorID     uint32
 	plumtreeStatsPushConstructorID       uint32
 )
 
@@ -88,7 +89,7 @@ func init() {
 		BroadcastPlumtreeUseful{},
 		broadcastPlumtreeUsefulSchema,
 	)
-	tl.Register(PlumtreeStatsRecord{}, plumtreeStatsRecordSchema)
+	plumtreeStatsRecordConstructorID = tl.Register(PlumtreeStatsRecord{}, plumtreeStatsRecordSchema)
 	plumtreeStatsPushConstructorID = tl.Register(PlumtreeStatsPush{}, plumtreeStatsPushSchema)
 	tl.Register(PlumtreeFECID{}, plumtreeFECIDSchema)
 	tl.Register(BroadcastPlumtreeSimpleToSign{}, broadcastPlumtreeSimpleToSignSchema)

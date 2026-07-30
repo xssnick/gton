@@ -384,7 +384,7 @@ func (r *fastSyncPeerRuntime) UpdateRoster(
 
 	r.membership.UpdateRoster(roster, permanentFlags, now)
 	for id, peer := range r.peers {
-		if !r.membership.Contains(id) {
+		if !r.membership.Contains(id, now) {
 			r.removePeerLocked(id, peer)
 			continue
 		}

@@ -54,6 +54,19 @@ func newFrozenTestNode(t testing.TB) *p2p.Node {
 	return node
 }
 
+// freezeSyncUntil leaves a service exactly where enterSyncUntilOffline does: the
+// service knows it finished, and the node is offline. Being frozen is the
+// service's own conclusion - the node also goes offline when something breaks,
+// which must not read as a completed sync.
+func freezeSyncUntil(t testing.TB, svc *Service) {
+	t.Helper()
+
+	svc.syncUntilReached.Store(true)
+	if svc.node != nil {
+		svc.node.EnterOffline("ton.sync_until reached")
+	}
+}
+
 func newMasterchainQueueTestService() *Service {
 	return &Service{
 		currentStateWake:                make(chan struct{}),
@@ -322,6 +335,7 @@ func TestCatchUpCurrentStateReturnsAfterSyncUntilOffline(t *testing.T) {
 		syncUntil:        cutoff,
 		currentStateWake: make(chan struct{}),
 	}
+	freezeSyncUntil(t, svc)
 	if err := svc.catchUpCurrentState(ctx); err != nil {
 		t.Fatalf("catch up current state: %v", err)
 	}
@@ -349,6 +363,7 @@ func TestInitialStateSyncStopsAfterSyncUntilFrozen(t *testing.T) {
 		syncUntil:        cutoff,
 		currentStateWake: make(chan struct{}),
 	}
+	freezeSyncUntil(t, svc)
 
 	done := make(chan struct{})
 	go func() {

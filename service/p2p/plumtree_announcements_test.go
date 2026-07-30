@@ -309,3 +309,164 @@ func TestPlumtreeAnnouncementCapsPeersAskedPerPart(t *testing.T) {
 		)
 	}
 }
+
+// The by-broadcast index must stay in step with the per-peer queues through
+// every removal path, or arming a new state silently misses announcements (a
+// part is never repaired) or walks freed entries.
+func TestPlumtreeAnnouncementIndexTracksEveryRemovalPath(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_700, 0)
+	engine, broadcastID := plumtreeAnnouncementTestEngine(
+		t,
+		&plumtreeEngineTestVerifier{},
+		now,
+	)
+	source := plumtreeEngineTestSource(0x73)
+	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
+
+	peers := []PeerID{
+		plumtreeEngineTestPeer(20),
+		plumtreeEngineTestPeer(21),
+		plumtreeEngineTestPeer(22),
+	}
+	for _, peer := range peers {
+		if _, err := engine.HandleIHave(
+			t.Context(),
+			now,
+			peer,
+			plumtreeAnnouncementTestIHave(broadcastID, source, signature, now),
+		); err != nil {
+			t.Fatalf("handle announcement: %v", err)
+		}
+		// A second broadcast id per peer, so the index has to separate them.
+		other := plumtreeAnnouncementTestIHave(
+			plumtreeEngineTestID(4242),
+			source,
+			signature,
+			now,
+		)
+		if _, err := engine.HandleIHave(t.Context(), now, peer, other); err != nil {
+			t.Fatalf("handle other announcement: %v", err)
+		}
+	}
+
+	assertIndexMatchesQueues(t, engine)
+
+	// Removal path 1: consumed as a repair candidate.
+	engine.mu.Lock()
+	engine.takeCandidatesLocked(plumtreePartKey{
+		broadcastID: broadcastID,
+		partIndex:   0,
+		treeIndex:   1,
+	}, nil)
+	engine.mu.Unlock()
+	assertIndexMatchesQueues(t, engine)
+
+	// Removal path 2: the whole peer goes away.
+	engine.DropPeerAnnouncements(peers[0])
+	assertIndexMatchesQueues(t, engine)
+
+	// Removal path 3: TTL expiry.
+	engine.mu.Lock()
+	engine.expireAnnouncementsLocked(now.Add(2 * plumtreeAnnouncementTTL))
+	engine.mu.Unlock()
+	assertIndexMatchesQueues(t, engine)
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.announcementsByBroadcast) != 0 {
+		t.Fatalf(
+			"index kept %d broadcasts after every announcement expired",
+			len(engine.announcementsByBroadcast),
+		)
+	}
+}
+
+// A new broadcast's state must be armed from that broadcast's announcements
+// only: it walks the index, so a wrong thread would arm from a stranger's parts.
+func TestPlumtreeArmFECRepairUsesOnlyItsOwnBroadcast(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_800, 0)
+	engine, broadcastID := plumtreeAnnouncementTestEngine(
+		t,
+		&plumtreeEngineTestVerifier{},
+		now,
+	)
+	source := plumtreeEngineTestSource(0x74)
+	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
+
+	foreign := plumtreeEngineTestID(9999)
+	announcer := plumtreeEngineTestPeer(30)
+	for _, id := range [][sha256.Size]byte{broadcastID, foreign} {
+		if _, err := engine.HandleIHave(
+			t.Context(),
+			now,
+			announcer,
+			plumtreeAnnouncementTestIHave(id, source, signature, now),
+		); err != nil {
+			t.Fatalf("handle announcement: %v", err)
+		}
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	state := &plumtreeFECState{broadcastID: foreign, firstSeen: now}
+	engine.armFECRepairForStateLocked(state)
+
+	armed := 0
+	for i := range state.repairAt {
+		if !state.repairAt[i].IsZero() {
+			armed++
+		}
+	}
+	if armed != 1 {
+		t.Fatalf("armed %d parts from one announcement, want 1", armed)
+	}
+	// Part 0 is what the foreign announcement covers; anything else means the
+	// index handed us the other broadcast's entry.
+	if state.repairAt[0].IsZero() {
+		t.Fatal("the announced part was not armed")
+	}
+}
+
+func assertIndexMatchesQueues(t *testing.T, engine *plumtreeEngine) {
+	t.Helper()
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	queued := map[*plumtreeAnnouncement]struct{}{}
+	for _, queue := range engine.announcements {
+		for announcement := queue.oldest; announcement != nil; announcement = announcement.next {
+			queued[announcement] = struct{}{}
+		}
+	}
+
+	indexed := map[*plumtreeAnnouncement]struct{}{}
+	for id, head := range engine.announcementsByBroadcast {
+		if head == nil {
+			t.Fatalf("index holds a nil head for %x", id)
+		}
+		for announcement := head; announcement != nil; announcement = announcement.broadcastNext {
+			if announcement.key.broadcastID != id {
+				t.Fatalf("announcement for %x is threaded under %x", announcement.key.broadcastID, id)
+			}
+			if _, dup := indexed[announcement]; dup {
+				t.Fatal("index threads the same announcement twice")
+			}
+			indexed[announcement] = struct{}{}
+		}
+	}
+
+	if len(queued) != len(indexed) {
+		t.Fatalf("queues hold %d announcements, index holds %d", len(queued), len(indexed))
+	}
+	for announcement := range queued {
+		if _, ok := indexed[announcement]; !ok {
+			t.Fatalf("announcement %v is queued but not indexed", announcement.key)
+		}
+	}
+}

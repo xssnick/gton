@@ -291,45 +291,87 @@ func TestPlumtreeStatsPushPreflight(t *testing.T) {
 	t.Parallel()
 
 	source := bytes.Repeat([]byte{0x73}, sha256.Size)
-	boxed, err := tl.Serialize(PlumtreeStatsPush{
-		Record: PlumtreeStatsRecord{
-			Source:             source,
-			Epoch:              7,
-			TreeIndex:          3,
-			EagerSimple:        []int64{1, 2, 3, 4},
-			EagerRotating:      []int64{5, 6},
-			DeliveredBroadcast: 8,
-			PartsInP99:         30,
-			UsefulAverageMS:    11,
-			UsefulMaximumMS:    12,
-			UsefulP99MS:        20,
-		},
-	}, true)
-	if err != nil {
-		t.Fatalf("serialize stats push: %v", err)
+	record := PlumtreeStatsRecord{
+		Source:             source,
+		Epoch:              7,
+		TreeIndex:          3,
+		EagerSimple:        []int64{1, 2, 3, 4},
+		EagerRotating:      []int64{5, 6},
+		DeliveredBroadcast: 8,
+		PartsInP99:         30,
+		UsefulAverageMS:    11,
+		UsefulMaximumMS:    12,
+		UsefulP99MS:        20,
+	}
+	serialize := func(record PlumtreeStatsRecord) []byte {
+		wire, err := tl.Serialize(PlumtreeStatsPush{
+			Record: record,
+		}, true)
+		if err != nil {
+			t.Fatalf("serialize stats push: %v", err)
+		}
+		return wire
 	}
 
+	boxed := serialize(record)
 	var parsed PlumtreeStatsPush
-	if err = parsePlumtreeMessage(&parsed, boxed); err != nil {
+	if err := parsePlumtreeMessage(&parsed, boxed); err != nil {
 		t.Fatalf("parse stats push: %v", err)
 	}
 	if !bytes.Equal(parsed.Record.Source, source) ||
-		!slices.Equal(parsed.Record.EagerSimple, []int64{1, 2, 3, 4}) ||
-		!slices.Equal(parsed.Record.EagerRotating, []int64{5, 6}) {
-		t.Fatalf("parsed stats record = %+v", parsed.Record)
+		parsed.Record.Epoch != record.Epoch ||
+		parsed.Record.TreeIndex != record.TreeIndex ||
+		!slices.Equal(parsed.Record.EagerSimple, record.EagerSimple) ||
+		!slices.Equal(parsed.Record.EagerRotating, record.EagerRotating) ||
+		parsed.Record.DeliveredBroadcast != record.DeliveredBroadcast ||
+		parsed.Record.PartsInP99 != record.PartsInP99 ||
+		parsed.Record.UsefulAverageMS != record.UsefulAverageMS ||
+		parsed.Record.UsefulMaximumMS != record.UsefulMaximumMS ||
+		parsed.Record.UsefulP99MS != record.UsefulP99MS {
+		t.Fatalf("parsed stats record = %+v, want %+v", parsed.Record, record)
 	}
+
+	oversizedSimple := record
+	oversizedSimple.EagerSimple = []int64{1, 2, 3, 4, 5}
+	oversizedRotating := record
+	oversizedRotating.EagerRotating = []int64{1, 2, 3, 4, 5}
 
 	const firstVectorCountOffset = 8 + sha256.Size + 8
-	oversized := bytes.Clone(boxed)
-	binary.LittleEndian.PutUint32(oversized[firstVectorCountOffset:], 5)
-	var rejected PlumtreeStatsPush
-	if err = parsePlumtreeMessage(&rejected, oversized); err == nil {
-		t.Fatal("parser accepted an oversized stats eager vector")
-	}
+	hugeCount := bytes.Clone(boxed)
+	binary.LittleEndian.PutUint32(hugeCount[firstVectorCountOffset:], math.MaxUint32)
 
-	truncated := boxed[:len(boxed)-1]
-	if err = parsePlumtreeMessage(&rejected, truncated); err == nil {
-		t.Fatal("parser accepted a truncated stats push")
+	tests := []struct {
+		name string
+		wire []byte
+	}{
+		{
+			name: "oversized eager_0",
+			wire: serialize(oversizedSimple),
+		},
+		{
+			name: "oversized eager_index",
+			wire: serialize(oversizedRotating),
+		},
+		{
+			name: "huge eager_0 count",
+			wire: hugeCount,
+		},
+		{
+			name: "truncated",
+			wire: boxed[:len(boxed)-1],
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var rejected PlumtreeStatsPush
+			if err := parsePlumtreeMessage(&rejected, test.wire); err == nil {
+				t.Fatal("parser accepted invalid stats push")
+			}
+			if rejected.Record.EagerSimple != nil ||
+				rejected.Record.EagerRotating != nil {
+				t.Fatal("parser populated vectors before rejecting stats push")
+			}
+		})
 	}
 }
 

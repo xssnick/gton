@@ -100,6 +100,37 @@ func TestQUICMonitorEntersOfflineWithoutDeadlock(t *testing.T) {
 	if !node.IsOffline() {
 		t.Fatal("node remained online after unexpected QUIC listener failure")
 	}
+	// The incident must be distinguishable from the deliberate ton.sync_until
+	// stop: the service treats that one as a finished sync, and RunNode only
+	// takes the process down (non-zero exit, so a supervisor restarts) on this.
+	if !node.OfflineFailed() {
+		t.Fatal("unexpected QUIC failure was not marked as a failure")
+	}
+	select {
+	case <-node.Failed():
+	default:
+		t.Fatal("Failed was not closed after unexpected QUIC listener failure")
+	}
+}
+
+// The other side of the same coin: a deliberate offline is not an incident, so
+// it must neither raise the flag nor take the process down.
+func TestEnterOfflineIsNotMarkedAsFailure(t *testing.T) {
+	node := newTestNode(t)
+
+	node.EnterOffline("ton.sync_until=1 reached")
+
+	if !node.IsOffline() {
+		t.Fatal("node did not enter offline mode")
+	}
+	if node.OfflineFailed() {
+		t.Fatal("deliberate offline was marked as a failure")
+	}
+	select {
+	case <-node.Failed():
+		t.Fatal("deliberate offline closed Failed")
+	default:
+	}
 }
 
 func TestQUICMonitorIgnoresNormalCancellation(t *testing.T) {

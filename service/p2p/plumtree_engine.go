@@ -379,6 +379,8 @@ type plumtreeEngine struct {
 	// Unverified IHAVEs, bucketed per announcing peer. See
 	// plumtree_announcements.go.
 	announcements map[PeerID]*plumtreePeerAnnouncements
+	// Same announcements, threaded by broadcast id: see plumtreeAnnouncement.
+	announcementsByBroadcast map[[sha256.Size]byte]*plumtreeAnnouncement
 	// Earliest repairAt and earliest retention deadline, cached so NextAlarm stays
 	// an O(1) read instead of a scan on every run-loop turn.
 	fecRepairNext     time.Time
@@ -455,6 +457,7 @@ func (e *plumtreeEngine) Close() {
 	e.missingOldest = nil
 	e.missingNewest = nil
 	e.announcements = nil
+	e.announcementsByBroadcast = nil
 	e.repairs = nil
 	e.delivered = plumtreeRingSet[[sha256.Size]byte]{}
 	e.notFoundBody = nil

@@ -152,10 +152,6 @@ func (s *overlaySubscription) serveInboundQuery(query inboundQuery, data any) er
 		s.peerPromoted(query.row)
 	}
 
-	if err := s.admitInboundQuery(data, time.Now()); err != nil {
-		return err
-	}
-
 	ctx, cancel := context.WithTimeout(s.node.runCtx, peerQueryTimeout)
 	defer cancel()
 
@@ -180,7 +176,7 @@ func (s *overlaySubscription) serveInboundQuery(query inboundQuery, data any) er
 // tonutils drops the query with "got query for unregistered overlay", the peer
 // never gets its blocks, proofs or Pong, marks us unreliable and evicts us.
 func (s *overlaySubscription) serveDetachedADNLQuery(pooled *pooledPeer, msg *adnl.MessageQuery, unwrapped tl.Serializable) error {
-	s.noteDirectoryActivity(pooled.id, pooled.pub, pooled.addr)
+	s.noteDirectoryActivity(pooled.id, pooled.addr)
 	return s.serveInboundQuery(inboundQuery{
 		addr:   pooled.addr,
 		row:    s.rosterRow(pooled.id),
@@ -192,7 +188,7 @@ func (s *overlaySubscription) serveDetachedADNLQuery(pooled *pooledPeer, msg *ad
 }
 
 func (s *overlaySubscription) serveDetachedRLDPQuery(pooled *pooledPeer, transferID []byte, query *rldp.Query, unwrapped tl.Serializable) error {
-	s.noteDirectoryActivity(pooled.id, pooled.pub, pooled.addr)
+	s.noteDirectoryActivity(pooled.id, pooled.addr)
 	return s.serveInboundQuery(inboundQuery{
 		addr:   pooled.addr,
 		row:    s.rosterRow(pooled.id),
@@ -251,13 +247,6 @@ func (s *overlaySubscription) answerRLDPQuery(peer *overlayPeer, transferID []by
 			)
 		},
 	}, query.Data)
-}
-
-func (s *overlaySubscription) admitInboundQuery(req tl.Serializable, now time.Time) error {
-	if !s.inboundQueryLimiter().Allow(req, now) {
-		return errInboundQueryRateLimited
-	}
-	return nil
 }
 
 func (s *overlaySubscription) handlePeerQuery(

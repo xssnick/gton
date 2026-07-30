@@ -84,6 +84,7 @@ func TestServiceMaintenanceStopsAfterSyncUntilFrozen(t *testing.T) {
 		syncUntil:       200,
 		maintenanceWake: make(chan struct{}, 1),
 	}
+	freezeSyncUntil(t, svc)
 
 	svc.runServiceMaintenance(context.Background())
 }
@@ -97,6 +98,7 @@ func TestMaintenanceTasksSkipAfterSyncUntilFrozen(t *testing.T) {
 		maintenanceWake: make(chan struct{}, 1),
 		stateSerializer: &stateSerializer{},
 	}
+	freezeSyncUntil(t, svc)
 
 	if pruned, err := svc.runPersistentStateGCOnce(context.Background()); err != nil || pruned {
 		t.Fatalf("persistent state gc = (%v, %v), want (false, nil)", pruned, err)

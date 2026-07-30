@@ -534,7 +534,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 	if got := len(sub.broadcastTargetsSnapshot().peers); got != 0 {
 		t.Fatalf("pending public peer entered rebroadcast candidates: %d", got)
 	}
-	if got := len(sub.overlayNodesSnapshot()); got != 0 {
+	if got := len(sub.overlayNodesSnapshot(maxPeersPerOverlay)); got != 0 {
 		t.Fatalf("pending public peer was advertised: %d", got)
 	}
 
@@ -555,7 +555,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 	if got := len(sub.broadcastTargetsSnapshot().peers); got != 1 {
 		t.Fatalf("promoted public peer rebroadcast candidates = %d, want 1", got)
 	}
-	if got := len(sub.overlayNodesSnapshot()); got != 1 {
+	if got := len(sub.overlayNodesSnapshot(maxPeersPerOverlay)); got != 1 {
 		t.Fatalf("promoted public peer advertised nodes = %d, want 1", got)
 	}
 }

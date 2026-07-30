@@ -408,15 +408,20 @@ func (m *fastSyncMembership) PeerFlags(node PeerID) (uint32, error) {
 	return 0, ErrFastSyncNotFound
 }
 
-func (m *fastSyncMembership) Contains(node PeerID) bool {
+// Contains reports whether a peer is a member right now. Enrollment alone is not
+// enough: an enrolled member whose certificate has expired keeps its map entry
+// until the next roster update, and answering "member" for it would keep serving
+// over ADNL/RLDP a peer the QUIC path already rejects. Only the stored expiry is
+// checked - the signature was verified when the certificate was enrolled.
+func (m *fastSyncMembership) Contains(node PeerID, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if _, permanent := m.permanent[node]; permanent {
 		return true
 	}
-	_, enrolled := m.enrolled[node]
-	return enrolled
+	member, enrolled := m.enrolled[node]
+	return enrolled && !member.certificate.value.IsExpired(now)
 }
 
 func (m *fastSyncMembership) IsPermanent(node PeerID) bool {

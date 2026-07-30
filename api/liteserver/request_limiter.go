@@ -6,12 +6,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/xssnick/gton/internal/ratelimit"
 )
 
 const (
 	requestLimitPruneInterval           = time.Second
 	liteserverConnectionCleanupInterval = 5 * time.Second
-	maxRequestLimitNanos                = int64(1<<63 - 1)
 )
 
 type RequestLimitOptions struct {
@@ -46,153 +47,30 @@ func validateRequestLimitOptions(opts RequestLimitOptions) error {
 	return nil
 }
 
+// requestLimiter is the per-client-IP budget. The mechanism lives in
+// internal/ratelimit; this type keeps the liteserver's own vocabulary
+// (capacity/cooling, a nil limiter meaning disabled) over it.
 type requestLimiter struct {
-	requestNanos int64
-	burstNanos   int64
-	buckets      sync.Map
-}
-
-type requestLimitBucket struct {
-	until   atomic.Int64
-	deleted atomic.Bool
+	limiter *ratelimit.Limiter
 }
 
 func newRequestLimiter(opts RequestLimitOptions) *requestLimiter {
 	if opts.CapacityPerIP == 0 {
 		return nil
 	}
-	requestNanos := requestLimitCostNanos(opts.CoolingPerSec)
-	return &requestLimiter{
-		requestNanos: requestNanos,
-		burstNanos:   requestLimitBurstNanos(requestNanos, opts.CapacityPerIP),
+	limiter := ratelimit.New(opts.CoolingPerSec, opts.CapacityPerIP)
+	if limiter == nil {
+		return nil
 	}
+	return &requestLimiter{limiter: limiter}
 }
 
 func (l *requestLimiter) allow(ip string, now time.Time) bool {
-	nowNanos := now.UnixNano()
-	for {
-		bucket := l.bucket(ip)
-		if bucket.deleted.Load() {
-			l.buckets.CompareAndDelete(ip, bucket)
-			continue
-		}
-
-		allowed, until := l.reserve(bucket, nowNanos)
-		if !allowed {
-			return false
-		}
-		if !bucket.deleted.Load() {
-			return true
-		}
-
-		l.buckets.CompareAndDelete(ip, bucket)
-		replacement := &requestLimitBucket{}
-		replacement.until.Store(until)
-		loaded, stored := l.buckets.LoadOrStore(ip, replacement)
-		if !stored {
-			return true
-		}
-		active := loaded.(*requestLimitBucket)
-		if !active.deleted.Load() {
-			raiseRequestLimitBucketUntil(active, until)
-			return true
-		}
-	}
-}
-
-func (l *requestLimiter) bucket(ip string) *requestLimitBucket {
-	loaded, ok := l.buckets.Load(ip)
-	if ok {
-		return loaded.(*requestLimitBucket)
-	}
-
-	bucket := &requestLimitBucket{}
-	loaded, ok = l.buckets.LoadOrStore(ip, bucket)
-	if ok {
-		return loaded.(*requestLimitBucket)
-	}
-	return bucket
-}
-
-func (l *requestLimiter) reserve(bucket *requestLimitBucket, nowNanos int64) (bool, int64) {
-	for {
-		until := bucket.until.Load()
-		base := until
-		if base < nowNanos {
-			base = nowNanos
-		}
-		if base > maxRequestLimitNanos-l.requestNanos {
-			return false, until
-		}
-
-		next := base + l.requestNanos
-		if next-nowNanos > l.burstNanos {
-			return false, until
-		}
-		if bucket.until.CompareAndSwap(until, next) {
-			return true, next
-		}
-	}
+	return l.limiter.Allow(ip, now)
 }
 
 func (l *requestLimiter) prune(now time.Time) int {
-	nowNanos := now.UnixNano()
-	deleted := 0
-	l.buckets.Range(func(key, value any) bool {
-		bucket := value.(*requestLimitBucket)
-		if bucket.until.Load() > nowNanos {
-			return true
-		}
-		if !bucket.deleted.CompareAndSwap(false, true) {
-			return true
-		}
-		if l.buckets.CompareAndDelete(key, bucket) {
-			deleted++
-		}
-		return true
-	})
-	return deleted
-}
-
-func requestLimitCostNanos(coolingPerSecond float64) int64 {
-	if coolingPerSecond <= 0 || math.IsNaN(coolingPerSecond) {
-		return maxRequestLimitNanos
-	}
-	if math.IsInf(coolingPerSecond, 1) {
-		return 1
-	}
-
-	nanos := math.Ceil(float64(time.Second) / coolingPerSecond)
-	if nanos < 1 {
-		return 1
-	}
-	if nanos >= float64(maxRequestLimitNanos) {
-		return maxRequestLimitNanos
-	}
-	return int64(nanos)
-}
-
-func requestLimitBurstNanos(requestNanos int64, capacity int) int64 {
-	if requestNanos <= 0 || capacity <= 0 {
-		return 0
-	}
-	capacityNanos := int64(capacity)
-	if requestNanos > maxRequestLimitNanos/capacityNanos {
-		return maxRequestLimitNanos
-	}
-	return requestNanos * capacityNanos
-}
-
-func raiseRequestLimitBucketUntil(bucket *requestLimitBucket, until int64) {
-	for {
-		current := bucket.until.Load()
-		if current >= until || bucket.deleted.Load() {
-			return
-		}
-		if bucket.until.CompareAndSwap(current, until) {
-			return
-		}
-	}
+	return l.limiter.Prune(now)
 }
 
 type trackedLiteClient interface {

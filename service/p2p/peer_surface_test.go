@@ -478,7 +478,7 @@ func TestOverlayNodesSnapshotConcurrentAnnouncementUpdate(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 2000; i++ {
-			for _, advertised := range sub.overlayNodesSnapshot() {
+			for _, advertised := range sub.overlayNodesSnapshot(maxPeersPerOverlay) {
 				if !overlayNodeHasSerializableID(&advertised) {
 					select {
 					case errCh <- "snapshot returned malformed advertised node":
