@@ -136,7 +136,7 @@ func (r *plumtreeRuntime) processMessage(
 	switch binary.LittleEndian.Uint32(body[:4]) {
 	case broadcastPlumtreeSimpleConstructorID:
 		var message BroadcastPlumtreeSimple
-		if err = parsePlumtreeMessage(&message, body); err != nil {
+		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
 		result.actions, err = r.engine.HandleSimple(ctx, now, from, plumtreeSimpleEnvelope{
@@ -148,7 +148,7 @@ func (r *plumtreeRuntime) processMessage(
 		})
 	case broadcastPlumtreeFECConstructorID:
 		var message BroadcastPlumtreeFEC
-		if err = parsePlumtreeMessage(&message, body); err != nil {
+		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
 		result.actions, err = r.engine.HandleFEC(ctx, now, from, plumtreeFECEnvelope{
@@ -160,19 +160,19 @@ func (r *plumtreeRuntime) processMessage(
 		})
 	case broadcastPlumtreeIHaveConstructorID:
 		var message BroadcastPlumtreeIHave
-		if err = parsePlumtreeMessage(&message, body); err != nil {
+		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
 		result.actions, err = r.engine.HandleIHave(ctx, now, from, message)
 	case broadcastPlumtreePruneConstructorID:
 		var message BroadcastPlumtreePrune
-		if err = parsePlumtreeMessage(&message, body); err != nil {
+		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
 		err = r.engine.HandlePrune(now, from, message)
 	case broadcastPlumtreeUsefulConstructorID:
 		var message BroadcastPlumtreeUseful
-		if err = parsePlumtreeMessage(&message, body); err != nil {
+		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
 		err = r.engine.HandleUseful(now, from, message)
@@ -264,6 +264,7 @@ func (r *plumtreeRuntime) applyActions(
 	actions plumtreeActions,
 ) error {
 	r.enqueueOutbounds(r.prepareOutboundBatch(actions.Outbounds))
+	r.startVerifiedRepairs(actions.Candidates)
 	for _, repair := range actions.Repairs {
 		r.startRepair(repair)
 	}
@@ -329,6 +330,44 @@ func (r *plumtreeRuntime) deliver(delivery plumtreeDelivery) error {
 	return nil
 }
 
+// Checks the signature a buffered announcer deferred, then asks the survivors for
+// the part. Serial and on the caller's goroutine: candidates for one part carry
+// the same source signature over the same preimage, so only the first pays key
+// math and the rest hit the verifier's tuple cache.
+//
+// A candidate that fails is dropped and its peer banned for 5s. Nothing reaches
+// the network before the signature holds.
+func (r *plumtreeRuntime) startVerifiedRepairs(candidates []plumtreeRepairCandidate) {
+	for _, candidate := range candidates {
+		now := time.Now()
+		if err := validatePlumtreeTimestamp(candidate.PayloadTimestamp, now); err != nil {
+			continue
+		}
+
+		plumtreeIHaveVerifiableTotal.Add(1)
+		if _, err := r.engine.verifier.VerifyPlumtree(
+			r.sub.node.runCtx,
+			plumtreeVerification{
+				From:        candidate.Peer,
+				Source:      candidate.Source,
+				Certificate: candidate.Certificate,
+				DataSize:    uint32(candidate.DataSize),
+				SignedData:  candidate.CandidateSignedData(),
+				Signature:   candidate.Signature,
+			},
+		); err != nil {
+			if errors.Is(err, errPlumtreeSignatureInvalid) {
+				r.engine.DropPeerAnnouncements(candidate.Peer)
+			}
+			continue
+		}
+
+		if action, ok := r.engine.StartVerifiedRepair(now, candidate); ok {
+			r.startRepair(action)
+		}
+	}
+}
+
 func (r *plumtreeRuntime) startRepair(action plumtreeRepairAction) {
 	r.sub.node.runAsync(func() {
 		if err := r.runRepair(action); err != nil {
@@ -341,9 +380,8 @@ func (r *plumtreeRuntime) startRepair(action plumtreeRepairAction) {
 }
 
 func (r *plumtreeRuntime) runRepair(action plumtreeRepairAction) error {
-	// The successful path consumes the attempt inside HandleRepair*; for every
-	// other exit this releases the repair slot as a harmless unknown-attempt
-	// no-op.
+	// The successful path consumes the attempt inside HandleRepair*; every other
+	// exit releases the slot here, as a harmless unknown-attempt no-op.
 	defer func() {
 		_ = r.engine.FinishRepair(action.ID)
 	}()
@@ -610,8 +648,6 @@ func stopPlumtreeTimer(timer *time.Timer, running bool) {
 	}
 }
 
-// plumtreeBroadcastConstructor returns the Plumtree constructor id of the
-// body, or false when the body is not a Plumtree message.
 func plumtreeBroadcastConstructor(body []byte) (uint32, bool) {
 	if len(body) < 4 {
 		return 0, false
@@ -637,6 +673,16 @@ func (s *overlaySubscription) PlumtreeActivePeers(limit int) []PeerID {
 		return peers[:limit]
 	}
 	return peers
+}
+
+// The peers plumtree may push to right now. Their QUIC paths must survive the
+// idle sweep: closing the path of a mesh member is how this node fell out of
+// other nodes' broadcast trees before.
+func (s *overlaySubscription) plumtreePinnedPeers() []PeerID {
+	if s.plumtree == nil {
+		return nil
+	}
+	return s.PlumtreeActivePeers(plumtreeActiveNeighbourLimit)
 }
 
 func (s *overlaySubscription) PlumtreePeerReceivesBroadcasts(peer PeerID) bool {

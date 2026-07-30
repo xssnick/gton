@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
+
+	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 )
 
@@ -405,4 +407,64 @@ func requireCustomQueryCooldown(t *testing.T, peer *overlayPeer, startedAt time.
 	if stats.queryIgnoreUntil.Before(minUntil) {
 		t.Fatalf("custom query cooldown ends at %s, want at least %s", stats.queryIgnoreUntil, minUntil)
 	}
+}
+
+// On the live tail this node probes ahead of block production, so a peer
+// answering tonNode.dataFullEmpty just means the next block does not exist yet.
+// A custom overlay charges every non-nil query outcome to its acceptor, so
+// counting that answer as a fault dropped all of them into the readiness
+// cooldown on nearly every round - masterchain blocks come every ~5s while the
+// cooldown is 3s - and readyCustomQuerySubscription then stopped picking the
+// overlay at all, sending live-tail traffic to the public pool instead.
+func TestCustomLiveTailNextBlockEmptyDoesNotCoolDown(t *testing.T) {
+	prev := testBlockID(-1, topShard, 10)
+
+	t.Run("live tail is not a fault", func(t *testing.T) {
+		sub, peer := newQueryOutcomeSubscription(overlayKindCustomFixed, "custom-next-live")
+		peer.queryTransport = fixedTypedQueryTransport(tonnodeapi.DataFullEmpty{})
+
+		_, err := sub.downloadNextFullFromPeer(
+			context.Background(),
+			prev,
+			peer,
+			DownloadNextBlockFull{},
+			true,
+			0,
+		)
+		if !errors.Is(err, ErrBlockNotAvailable) {
+			t.Fatalf("next block error = %v, want not available", err)
+		}
+
+		if until := peer.statsSnapshot().queryIgnoreUntil; !until.IsZero() {
+			t.Fatalf("live-tail empty answer cooled the acceptor until %s", until)
+		}
+		now := time.Now()
+		if !peer.queryReady(now, 0, 0) {
+			t.Fatal("live-tail empty answer made the acceptor unready")
+		}
+		if !sub.hasReadyQueryPeer(now) {
+			t.Fatal("live-tail empty answer took the custom overlay out of query selection")
+		}
+	})
+
+	// Off the live tail the same answer does mean the acceptor could not serve
+	// what was asked for, which is exactly what the cooldown is for.
+	t.Run("catch-up still cools down", func(t *testing.T) {
+		sub, peer := newQueryOutcomeSubscription(overlayKindCustomFixed, "custom-next-catchup")
+		peer.queryTransport = fixedTypedQueryTransport(tonnodeapi.DataFullEmpty{})
+
+		startedAt := time.Now()
+		_, err := sub.downloadNextFullFromPeer(
+			context.Background(),
+			prev,
+			peer,
+			DownloadNextBlockFull{},
+			false,
+			0,
+		)
+		if !errors.Is(err, ErrBlockNotAvailable) {
+			t.Fatalf("next block error = %v, want not available", err)
+		}
+		requireCustomQueryCooldown(t, peer, startedAt)
+	})
 }

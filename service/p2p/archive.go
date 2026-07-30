@@ -17,8 +17,11 @@ import (
 )
 
 const (
-	archiveSliceSize           = 2 << 20
-	archiveSliceParallelism    = 2
+	archiveSliceSize = 2 << 20
+	// 3 in-flight 2MB slices keep the sticky peer's pipe full between slice
+	// round-trips during catch-up; going higher mostly concentrates more load
+	// on that single peer (starved downloads already hedge to a second peer).
+	archiveSliceParallelism    = 3
 	archiveSliceProbeSize      = 256 << 10
 	archivePackMaxBytes        = int64(2 << 30)
 	archiveInfoTimeout         = 6 * time.Second
@@ -605,14 +608,15 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, sessi
 		nextRequestOffset := offset
 		outstanding := 0
 		initialSlice := true
-		var pending archiveSliceResult
-		hasPending := false
+		// Out-of-order results park here until the contiguous offset arrives;
+		// requests are issued in offset order, so at most parallelism-1 results
+		// can precede the one being waited for.
+		pending := make(map[int64]archiveSliceResult, archiveSliceParallelism-1)
 
 		for {
-			var result archiveSliceResult
-			if hasPending && pending.offset == offset {
-				result = pending
-				hasPending = false
+			result, buffered := pending[offset]
+			if buffered {
+				delete(pending, offset)
 			} else {
 				for outstanding < archiveSliceParallelism && nextRequestOffset <= archivePackMaxBytes {
 					sliceTimeout := archiveSliceTimeout
@@ -657,11 +661,10 @@ func (s *overlaySubscription) downloadArchiveFromPeer(ctx context.Context, sessi
 				case result = <-results:
 				}
 				if result.offset != offset {
-					if hasPending {
+					if len(pending) >= archiveSliceParallelism-1 {
 						return nil, fmt.Errorf("archive slice pipeline returned unexpected offset: got=%d want=%d", result.offset, offset)
 					}
-					pending = result
-					hasPending = true
+					pending[result.offset] = result
 					continue
 				}
 			}

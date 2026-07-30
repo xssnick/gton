@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"reflect"
 	"testing"
@@ -10,6 +12,9 @@ import (
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/adnl/keys"
+	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -149,6 +154,109 @@ func TestMasterchainConsensusCheckedPathDoesNotLookupHardfork(t *testing.T) {
 
 	if _, err := svc.checkMasterchainBlockConsensusWithProof(current, proof); err != nil {
 		t.Fatalf("check consensus: %v", err)
+	}
+}
+
+// The prepare-stage signature preverify may mark a proof checked only after a
+// passing Ed25519 batch: a validator-cache miss and a failing batch must both
+// leave the proof for the full apply-time check, which owns the hardfork
+// fallback and the cache population.
+func TestPreverifyMasterchainConsensusSignatures(t *testing.T) {
+	block := testMasterBlockID(101)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate validator key: %v", err)
+	}
+	prepared, err := blockproof.PrepareValidatorSet(7, []*tlb.ValidatorAddr{{
+		PublicKey: tlb.SigPubKeyED25519{Key: pub},
+		Weight:    1,
+		ADNLAddr:  make([]byte, 32),
+	}})
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+	payload, err := tl.Serialize(ton.BlockID{RootHash: block.RootHash, FileHash: block.FileHash}, true)
+	if err != nil {
+		t.Fatalf("build signature payload: %v", err)
+	}
+	nodeID, err := tl.Hash(keys.PublicKeyED25519{Key: pub})
+	if err != nil {
+		t.Fatalf("hash validator key: %v", err)
+	}
+	key := masterchainValidatorCacheKey{prevKeyBlockSeqno: 1, catchainSeqno: 7, validatorSetHash: prepared.Hash()}
+	proof := &masterchainConsensusProof{
+		block:             block,
+		validatorCacheKey: key,
+		proofSignatures: blockproof.NewOrdinaryValidatorSignatureSet(7, prepared.Hash(), []ton.Signature{{
+			NodeIDShort: nodeID,
+			Signature:   ed25519.Sign(priv, payload),
+		}}),
+	}
+
+	svc := &Service{log: zerolog.Nop()}
+	svc.preverifyMasterchainConsensusSignatures(proof)
+	if proof.signaturesChecked {
+		t.Fatal("preverify marked the proof checked on a validator cache miss")
+	}
+
+	svc.validatorCache.put(key, prepared)
+	svc.preverifyMasterchainConsensusSignatures(proof)
+	if !proof.signaturesChecked {
+		t.Fatal("preverify did not mark a valid proof with a cached validator set")
+	}
+
+	// A failing batch must not mark: apply re-runs the full check and owns the
+	// failure path.
+	badProof := &masterchainConsensusProof{
+		block:             block,
+		validatorCacheKey: key,
+		proofSignatures: blockproof.NewOrdinaryValidatorSignatureSet(7, prepared.Hash(), []ton.Signature{{
+			NodeIDShort: nodeID,
+			Signature:   make([]byte, 64),
+		}}),
+	}
+	svc.preverifyMasterchainConsensusSignatures(badProof)
+	if badProof.signaturesChecked {
+		t.Fatal("preverify marked the proof checked after a failing signature batch")
+	}
+}
+
+func TestParsedProofCacheDeduplicatesByRootPointer(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	proofRoot, err := blockproof.BroadcastProofRoot(downloaded.ID, downloaded.Block)
+	if err != nil {
+		t.Fatalf("build fixture proof root: %v", err)
+	}
+	fullRoot, proofBOC, err := blockproof.LinkFromRoot(downloaded.ID, proofRoot)
+	if err != nil {
+		t.Fatalf("build fixture proof link: %v", err)
+	}
+
+	var cache parsedProofCache
+	first, err := cache.parse(downloaded.ID, fullRoot)
+	if err != nil {
+		t.Fatalf("parse fixture proof: %v", err)
+	}
+	second, err := cache.parse(downloaded.ID, fullRoot)
+	if err != nil {
+		t.Fatalf("parse fixture proof again: %v", err)
+	}
+	if first != second {
+		t.Fatal("same proof root pointer was parsed twice")
+	}
+
+	// A re-decoded copy of the same proof is a different pointer and must be
+	// parsed on its own: pointer identity is what guarantees content identity.
+	reparsedRoot, err := cell.FromBOC(proofBOC)
+	if err != nil {
+		t.Fatalf("reparse proof BOC: %v", err)
+	}
+	third, err := cache.parse(downloaded.ID, reparsedRoot)
+	if err != nil {
+		t.Fatalf("parse re-decoded proof: %v", err)
+	}
+	if third == first {
+		t.Fatal("different proof root pointers shared one parse result")
 	}
 }
 

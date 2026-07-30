@@ -178,6 +178,21 @@ func (r FastSyncValidatorRoster) ADNLIDs() []PeerID {
 	return slices.Clone(r.adnlIDs)
 }
 
+// rootCount and adnlIDsRef exist because the exported accessors above clone,
+// and three callers run where that allocation is not acceptable: peerLimit on
+// the peer-attach path, validatorPingTargets on the ping sweep, and the overlay
+// spec build. They stay unexported so a roster handed out of this package can
+// still only be read through the cloning accessors.
+func (r FastSyncValidatorRoster) rootCount() int {
+	return len(r.rootPublicKeyIDs)
+}
+
+// adnlIDsRef returns the backing slice. Callers must not mutate or retain it
+// beyond the roster's lifetime.
+func (r FastSyncValidatorRoster) adnlIDsRef() []PeerID {
+	return r.adnlIDs
+}
+
 func (r FastSyncValidatorRoster) ContainsADNL(id PeerID) bool {
 	_, found := slices.BinarySearchFunc(r.adnlIDs, id, compareFastSyncPeerID)
 	return found
@@ -214,6 +229,11 @@ func NewFastSyncShardSet(shards []FastSyncShard) FastSyncShardSet {
 
 func (s FastSyncShardSet) Shards() []FastSyncShard {
 	return slices.Clone(s.shards)
+}
+
+// shardsRef returns the backing slice; see adnlIDsRef for the contract.
+func (s FastSyncShardSet) shardsRef() []FastSyncShard {
+	return s.shards
 }
 
 func (s FastSyncShardSet) Select(requested FastSyncShard) (FastSyncShard, error) {

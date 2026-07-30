@@ -151,15 +151,16 @@ func TestFastSyncPeerLimitIncludesCertificateSlots(t *testing.T) {
 	sub := &overlaySubscription{
 		spec: overlaySpec{
 			Kind:       overlayKindFastSync,
-			FixedNodes: roster.adnlIDs,
+			FixedNodes: roster.adnlIDsRef(),
 		},
 		fastSync: &fastSyncOverlayRuntime{
 			spec: fastSyncOverlaySpec{roster: roster},
 		},
 	}
 
-	want := len(roster.adnlIDs) +
-		len(roster.rootPublicKeyIDs)*FastSyncMemberSlotCount
+	expected := len(roster.adnlIDsRef()) +
+		roster.rootCount()*FastSyncMemberSlotCount
+	want := max(maxPeersPerOverlay, expected)
 	if got := sub.peerLimit(); got != want {
 		t.Fatalf("FastSync peer limit = %d, want %d", got, want)
 	}
@@ -549,5 +550,94 @@ func fastSyncOverlayTestValidator(
 	return FastSyncValidator{
 		PublicKey: publicKey,
 		ADNLID:    adnlID,
+	}
+}
+
+// TestFastSyncAliveRootsSurviveRosterChange pins that a key block does not cost
+// us the knowledge of which validators answer. The overlay is rebuilt because
+// its authorized-key set changes, but liveness is not roster-specific, and
+// relearning it costs a full ping sweep during which selectValidator is unready.
+func TestFastSyncAliveRootsSurviveRosterChange(t *testing.T) {
+	staying := testPeerID("fast-sync-alive-staying")
+	leaving := testPeerID("fast-sync-alive-leaving")
+	joining := testPeerID("fast-sync-alive-joining")
+
+	before := NewFastSyncValidatorRoster(nil, []FastSyncValidator{
+		fastSyncOverlayTestValidator(0x31, staying),
+		fastSyncOverlayTestValidator(0x32, leaving),
+	}, nil)
+	after := NewFastSyncValidatorRoster(nil, []FastSyncValidator{
+		fastSyncOverlayTestValidator(0x31, staying),
+		fastSyncOverlayTestValidator(0x33, joining),
+	}, nil)
+
+	old := &fastSyncOverlayRuntime{
+		spec:           fastSyncOverlaySpec{roster: before},
+		aliveRootIndex: make(map[PeerID]int),
+	}
+	old.setValidatorAlive(staying, true)
+	old.setValidatorAlive(leaving, true)
+
+	carried := old.aliveRootsSnapshot()
+	if len(carried) != 2 {
+		t.Fatalf("carried %d alive validators, want 2", len(carried))
+	}
+
+	rebuilt := &fastSyncOverlayRuntime{
+		spec:           fastSyncOverlaySpec{roster: after},
+		aliveRootIndex: make(map[PeerID]int),
+	}
+	rebuilt.seedAliveRoots(carried)
+
+	if _, ok := rebuilt.aliveRootIndex[staying]; !ok {
+		t.Fatal("validator that stayed in the roster lost its liveness")
+	}
+	if _, ok := rebuilt.aliveRootIndex[leaving]; ok {
+		t.Fatal("validator dropped by the key block was seeded as alive")
+	}
+	if _, ok := rebuilt.aliveRootIndex[joining]; ok {
+		t.Fatal("validator we never probed was seeded as alive")
+	}
+}
+
+// TestFastSyncLivenessIsNotSeededWithoutTransports is the regression guard for
+// the ordering bug: seeding before attachSubscriptionPeers made a rebuilt
+// overlay report ready() while owning no peers, so querySubscriptionForBlock
+// preferred it over the public overlay and the download then failed outright
+// instead of falling back.
+func TestFastSyncLivenessIsNotSeededWithoutTransports(t *testing.T) {
+	validatorID := testPeerID("fast-sync-liveness-validator")
+	roster := NewFastSyncValidatorRoster(nil, []FastSyncValidator{
+		fastSyncOverlayTestValidator(0x41, validatorID),
+	}, nil)
+
+	sub := testOverlaySubscription(&overlaySubscription{
+		spec:  overlaySpec{Kind: overlayKindFastSync},
+		peers: make(map[PeerID]*overlayPeer),
+		fastSync: &fastSyncOverlayRuntime{
+			spec:           fastSyncOverlaySpec{roster: roster},
+			aliveRootIndex: make(map[PeerID]int),
+		},
+		log: discardLogger(),
+	})
+
+	sub.seedFastSyncLiveness([]PeerID{validatorID})
+	if len(sub.fastSync.aliveRoots) != 0 {
+		t.Fatal("liveness was seeded for a validator with no transport")
+	}
+	if sub.fastSync.ready() {
+		t.Fatal("overlay reported ready with no attached peers")
+	}
+
+	// With a transport attached the same seed does take effect.
+	peer := testReadyQueryPeer("fast-sync-liveness-peer")
+	peer.id = validatorID
+	sub.mx.Lock()
+	sub.peers[validatorID] = peer
+	sub.mx.Unlock()
+
+	sub.seedFastSyncLiveness([]PeerID{validatorID})
+	if len(sub.fastSync.aliveRoots) != 1 {
+		t.Fatalf("connected validator was not seeded: %d alive", len(sub.fastSync.aliveRoots))
 	}
 }

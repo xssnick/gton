@@ -15,7 +15,39 @@ const (
 	importedBlockPrepareQueuePerWorker = 2
 )
 
-var importedBlockPrepareSlots = make(chan struct{}, importedBlockPrepareParallelism())
+// Prepare slots are shared by every concurrent ImportBytes. A hot import (the
+// catch-up pipeline's serial master lane) must not queue behind a full house
+// of prefetch prepares, so a small reserve is only takeable by hot jobs; total
+// parallelism stays at importedBlockPrepareParallelism and hot jobs may use
+// shared slots too, so rare hot imports cannot starve prefetch.
+var (
+	importedBlockPrepareSharedSlots = make(chan struct{}, importedBlockPrepareParallelism()-importedBlockPrepareHotReserve())
+	importedBlockPrepareHotSlots    = make(chan struct{}, importedBlockPrepareHotReserve())
+)
+
+type hotImportPrepareKey struct{}
+
+// WithHotImportPrepare marks ctx so the ImportBytes prepare stage may take the
+// hot-reserved CPU slots instead of queueing behind prefetch imports.
+func WithHotImportPrepare(ctx context.Context) context.Context {
+	return context.WithValue(ctx, hotImportPrepareKey{}, true)
+}
+
+func hotImportPrepare(ctx context.Context) bool {
+	hot, _ := ctx.Value(hotImportPrepareKey{}).(bool)
+	return hot
+}
+
+func importedBlockPrepareHotReserve() int {
+	total := importedBlockPrepareParallelism()
+	if total <= 1 {
+		return 0
+	}
+	if total >= 16 {
+		return 2
+	}
+	return 1
+}
 
 type importedBlockPrepareJob struct {
 	order int
@@ -32,6 +64,7 @@ type importedBlockPrepareResult struct {
 type importedBlockPreparer struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
+	hot     bool
 	jobs    chan importedBlockPrepareJob
 	results chan importedBlockPrepareResult
 
@@ -52,6 +85,7 @@ func newImportedBlockPreparer(ctx context.Context) *importedBlockPreparer {
 	p := &importedBlockPreparer{
 		ctx:     prepareCtx,
 		cancel:  cancel,
+		hot:     hotImportPrepare(ctx),
 		jobs:    make(chan importedBlockPrepareJob, workers*importedBlockPrepareQueuePerWorker),
 		results: make(chan importedBlockPrepareResult, workers*importedBlockPrepareQueuePerWorker),
 		stopped: make(chan struct{}),
@@ -140,7 +174,8 @@ func (p *importedBlockPreparer) runWorker() {
 	defer p.workers.Done()
 
 	for job := range p.jobs {
-		if err := p.acquireSlot(); err != nil {
+		releaseSlot, err := p.acquireSlot()
+		if err != nil {
 			p.fail(err)
 			return
 		}
@@ -148,7 +183,7 @@ func (p *importedBlockPreparer) runWorker() {
 		started := time.Now()
 		prepared, err := prepareImportedBlock(job.full.ID, job.full.Block)
 		elapsed := time.Since(started)
-		releaseImportedBlockPrepareSlot()
+		releaseSlot()
 		if err != nil {
 			p.fail(fmt.Errorf("prepare imported block %s: %w", storage.FormatBlockRef(job.full.ID), err))
 			return
@@ -168,17 +203,32 @@ func (p *importedBlockPreparer) runWorker() {
 	}
 }
 
-func (p *importedBlockPreparer) acquireSlot() error {
+func (p *importedBlockPreparer) acquireSlot() (func(), error) {
+	if p.hot {
+		select {
+		case importedBlockPrepareSharedSlots <- struct{}{}:
+			return releaseImportedBlockPrepareSharedSlot, nil
+		case importedBlockPrepareHotSlots <- struct{}{}:
+			return releaseImportedBlockPrepareHotSlot, nil
+		case <-p.ctx.Done():
+			return nil, p.err()
+		}
+	}
+
 	select {
-	case importedBlockPrepareSlots <- struct{}{}:
-		return nil
+	case importedBlockPrepareSharedSlots <- struct{}{}:
+		return releaseImportedBlockPrepareSharedSlot, nil
 	case <-p.ctx.Done():
-		return p.err()
+		return nil, p.err()
 	}
 }
 
-func releaseImportedBlockPrepareSlot() {
-	<-importedBlockPrepareSlots
+func releaseImportedBlockPrepareSharedSlot() {
+	<-importedBlockPrepareSharedSlots
+}
+
+func releaseImportedBlockPrepareHotSlot() {
+	<-importedBlockPrepareHotSlots
 }
 
 func (p *importedBlockPreparer) collectResults() {

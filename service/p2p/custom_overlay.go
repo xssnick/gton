@@ -134,8 +134,7 @@ func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.Bro
 }
 
 func (s *overlaySubscription) startTwoStepRebroadcastWorker(ctx context.Context) {
-	if s.spec.Kind != overlayKindCustomFixed &&
-		s.spec.Kind != overlayKindFastSync {
+	if !s.spec.usesTwoStepDelivery() {
 		return
 	}
 	queue, ok := s.initTwoStepQueue()
@@ -291,7 +290,7 @@ func (s *overlaySubscription) peerByID(id PeerID) *overlayPeer {
 	return s.peers[id]
 }
 
-func (spec overlaySpec) sendsShard(workchain int32, shard int64) bool {
+func (spec *overlaySpec) sendsShard(workchain int32, shard int64) bool {
 	if len(spec.SenderShards) == 0 {
 		return true
 	}

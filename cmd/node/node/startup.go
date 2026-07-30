@@ -357,10 +357,27 @@ func globalConfigURLLabel(url string) string {
 	return url
 }
 
+const (
+	// pprofMutexProfileFraction samples one in N mutex contention events. Off
+	// by default in Go, which left /debug/pprof/mutex empty exactly when a
+	// stalled node needed it; 1/100 keeps the cost negligible while still
+	// showing which lock is contended.
+	pprofMutexProfileFraction = 100
+	// pprofBlockProfileRateNs samples, on average, one blocking event per this
+	// many nanoseconds spent blocked. At 1ms it ignores ordinary channel
+	// traffic and records only the stalls worth explaining.
+	pprofBlockProfileRateNs = 1_000_000
+)
+
 func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 	if addr == "" {
 		return
 	}
+
+	// Both profiles are inert unless enabled, so they are armed together with
+	// the endpoint that serves them.
+	runtime.SetMutexProfileFraction(pprofMutexProfileFraction)
+	runtime.SetBlockProfileRate(pprofBlockProfileRateNs)
 
 	server := &http.Server{
 		Addr:              addr,
@@ -381,6 +398,8 @@ func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 			Str("pprof_addr", addr).
 			Str("heap_url", "http://"+addr+"/debug/pprof/heap").
 			Str("profile_url", "http://"+addr+"/debug/pprof/profile").
+			Str("mutex_url", "http://"+addr+"/debug/pprof/mutex").
+			Str("block_url", "http://"+addr+"/debug/pprof/block").
 			Msg("started pprof server")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error().Err(err).Str("pprof_addr", addr).Msg("pprof server stopped")

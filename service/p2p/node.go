@@ -62,7 +62,7 @@ type Node struct {
 	quicServeDone            chan struct{}
 	quicServeErr             error
 	quicQuerySlots           chan struct{}
-	fastSyncQueryLimiter     fastSyncQueryLimiter
+	inboundQueryLimiters     [3]inboundQueryLimiter
 	fastSyncBroadcastFECPace time.Duration
 	quicPeersMx              sync.RWMutex
 	quicPeers                map[PeerID]*authenticatedQUICPeer
@@ -71,7 +71,9 @@ type Node struct {
 	dhtClient                *dht.Client
 	dhtServer                *dht.Server
 	dht                      dhtBackend
+	peerAddresses            peerAddressResolver
 	pool                     *peerPool
+	peerRoutes               *peerRouteTable
 	events                   chan BroadcastEvent
 	eventQueue               *boundedQueue[BroadcastEvent]
 	deduper                  *eventDeduper
@@ -120,6 +122,8 @@ type Node struct {
 	externalPort                    uint16
 	dhtListenAddr                   string
 	storage                         storage2.Storage
+	peerCache                       storage2.OverlayPeerCache
+	fastSyncCertificateStorage      storage2.FastSyncCertificateStorage
 	peerStorage                     storage2.PeerServingStorage
 	liveBlockCache                  *storage2.LiveBlockCache
 	compressedState                 CompressedBlockStateProvider
@@ -197,9 +201,9 @@ type Node struct {
 	stateSplitPartDecodeSlot  chan struct{}
 	customOverlays            []CustomOverlayConfig
 
-	// Certificates start from config and are then replaced by the ones
-	// validators push. The slice is copy-on-write: readers take it under the
-	// mutex and then use it without one.
+	// Certificates load from storage and are replaced by the ones validators
+	// push. The slice is copy-on-write: readers take it under the mutex and
+	// then use it without one.
 	fastSyncCertificatesMx sync.Mutex
 	fastSyncCertificates   []overlay.MemberCertificate
 
@@ -262,7 +266,7 @@ func New(opts Options) (*Node, error) {
 	}
 
 	gateway := adnl.NewGateway(priv)
-	quicGateway, err := adnlquic.NewGateway(priv)
+	quicGateway, err := adnlquic.NewGatewayWithLimits(nodeQUICLimits(), priv)
 	if err != nil {
 		return nil, fmt.Errorf("create QUIC gateway: %w", err)
 	}
@@ -275,14 +279,6 @@ func New(opts Options) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse local ADNL id: %w", err)
 	}
-	fastSyncCertificates, err := prepareFastSyncCertificates(
-		opts.FastSyncCertificates,
-		localID,
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	peerStorage := opts.PeerServingStorage
 	storage := opts.Storage
 	if storage != nil {
@@ -290,6 +286,15 @@ func New(opts Options) (*Node, error) {
 	}
 	if peerStorage == nil {
 		return nil, fmt.Errorf("peer serving storage is required")
+	}
+	fastSyncCertificates, err := loadFastSyncCertificates(
+		context.Background(),
+		opts.FastSyncCertificateStorage,
+		localID,
+		time.Now(),
+	)
+	if err != nil {
+		return nil, err
 	}
 	liveBlockCache := opts.LiveBlockCache
 	if liveBlockCache == nil {
@@ -305,7 +310,7 @@ func New(opts Options) (*Node, error) {
 		return nil, err
 	}
 	fastSyncBroadcastFECPace, err := normalizeFastSyncBroadcastFECPace(
-		opts.FastSyncBroadcastSpeedMultiplier,
+		fastSyncBroadcastSpeedMultiplier,
 	)
 	if err != nil {
 		return nil, err
@@ -329,7 +334,7 @@ func New(opts Options) (*Node, error) {
 		gateway:                       gateway,
 		quicGateway:                   quicGateway,
 		quicQuerySlots:                make(chan struct{}, inboundQUICQueryParallelism),
-		fastSyncQueryLimiter:          newFastSyncQueryLimiter(),
+		inboundQueryLimiters:          newInboundQueryLimiters(),
 		fastSyncBroadcastFECPace:      fastSyncBroadcastFECPace,
 		quicPeers:                     make(map[PeerID]*authenticatedQUICPeer),
 		dhtListenAddr:                 opts.DHTListenAddr,
@@ -355,6 +360,8 @@ func New(opts Options) (*Node, error) {
 		latestBasechainNotify:         make(chan struct{}),
 		rawMasterchainNotify:          make(chan struct{}),
 		storage:                       storage,
+		peerCache:                     opts.PeerCache,
+		fastSyncCertificateStorage:    opts.FastSyncCertificateStorage,
 		peerStorage:                   peerStorage,
 		liveBlockCache:                liveBlockCache,
 		compressedState:               opts.CompressedState,
@@ -384,11 +391,17 @@ func New(opts Options) (*Node, error) {
 		fastSyncCertificates:          fastSyncCertificates,
 	}
 	node.SetPlumtreePolicy(PlumtreePolicy{})
+	node.peerRoutes = newPeerRouteTable()
 	node.pool = newPeerPool(
 		gateway,
 		node.resolvePublicBroadcastReceiver,
 		node.handlePeerCustomMessage,
+		node.peerRoutes,
 	)
+	node.pool.detachedQuery = &detachedQueryHandlers{
+		adnl: node.serveDetachedADNLQuery,
+		rldp: node.serveDetachedRLDPQuery,
+	}
 	return node, nil
 }
 
@@ -581,6 +594,9 @@ func (n *Node) Start(ctx context.Context) error {
 	})
 	n.runAsync(func() {
 		n.runSubscriptionLifecycleLoop(runCtx)
+	})
+	n.runAsync(func() {
+		n.runQUICIdleSweepLoop(runCtx)
 	})
 	n.startQUICMonitor(runCtx)
 	if n.isPublicServer() {
@@ -1011,8 +1027,17 @@ type peerPool struct {
 	broadcastReceiverResolver overlay.BroadcastReceiverResolver
 	// customMessage receives ADNL messages that carry no overlay envelope.
 	customMessage func(msg *adnl.MessageCustom) error
+	detachedQuery *detachedQueryHandlers
+	routes        *peerRouteTable
 	mx            sync.RWMutex
 	peers         map[PeerID]*pooledPeer
+}
+
+// detachedQueryHandlers serve overlay queries arriving on a transport that has
+// no attachment for the target overlay.
+type detachedQueryHandlers struct {
+	adnl func(pooled *pooledPeer, msg *adnl.MessageQuery) error
+	rldp func(pooled *pooledPeer, transferID []byte, query *rldp.Query) error
 }
 
 type peerEndpoint struct {
@@ -1024,11 +1049,57 @@ type peerRoute struct {
 	quic                atomic.Pointer[string]
 	quicRefreshRequired atomic.Bool
 	quicRetryState      atomic.Int64
+	quicRetryMx         sync.Mutex
+	quicDialFailures    uint32
 	// quicDialSpawned bounds background dials to one goroutine per route: the
 	// retry gate alone cannot, because its claim happens inside the dial's
 	// address resolver, behind the gateway's per-peer dial mutex — a slow
 	// ungated dial there would let every relayed part spawn another waiter.
 	quicDialSpawned atomic.Bool
+}
+
+// peerRouteTable keeps one peerRoute per peer id for the whole node. The route
+// carries the learned QUIC endpoint and the single-dial gate, so it must
+// outlive any individual transport: a pooled peer pruned and re-wrapped, or the
+// same peer reached over both the pool and an inbound QUIC path, previously got
+// separate routes — which lost the learned address on every prune and left the
+// dial gate claiming nothing.
+//
+// Lock order: pool.mx -> peerRoutes.mx. The table is a leaf; it calls nothing.
+type peerRouteTable struct {
+	mx     sync.RWMutex
+	routes map[PeerID]*peerRoute
+}
+
+func newPeerRouteTable() *peerRouteTable {
+	return &peerRouteTable{routes: map[PeerID]*peerRoute{}}
+}
+
+// get returns the route of a peer, creating it on first use. The pointer is
+// stable for the lifetime of the node, so every holder observes the same gate.
+func (t *peerRouteTable) get(id PeerID) *peerRoute {
+	t.mx.RLock()
+	route := t.routes[id]
+	t.mx.RUnlock()
+	if route != nil {
+		return route
+	}
+
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	if route = t.routes[id]; route != nil {
+		return route
+	}
+	route = newPeerRoute("")
+	t.routes[id] = route
+	return route
+}
+
+func (t *peerRouteTable) size() int {
+	t.mx.RLock()
+	defer t.mx.RUnlock()
+
+	return len(t.routes)
 }
 
 func newPeerRoute(quicAddr string) *peerRoute {
@@ -1068,11 +1139,12 @@ func (r *peerRoute) quicAddrStale() bool {
 	return r.quicRefreshRequired.Load()
 }
 
-// quicDialRetryDelay keeps a failed QUIC route out of the broadcast fanout
-// (Plumtree sends and FEC relay parts) until the eager-peer inactivity window
-// expires. This bounds repeated DHT resolves and handshakes without retaining
-// payloads or creating one timer per peer.
-const quicDialRetryDelay = plumtreeEagerInactivityTTL
+// QUIC retries start at the eager-peer inactivity window, then back off while
+// the route keeps failing. A successful connection resets the delay.
+const (
+	quicDialRetryMinDelay = plumtreeEagerInactivityTTL
+	quicDialRetryMaxDelay = 30 * time.Second
+)
 
 // quicReady reports whether the retry gate permits a dial attempt. Callers
 // must check it explicitly before dialing: the gate cannot live only in the
@@ -1105,13 +1177,45 @@ func (r *peerRoute) beginQUICDial(now time.Time) bool {
 }
 
 func (r *peerRoute) finishQUICDial() {
-	r.quicRetryState.CompareAndSwap(-1, 0)
+	r.quicRetryMx.Lock()
+	if r.quicRetryState.CompareAndSwap(-1, 0) {
+		r.quicDialFailures = 0
+	}
+	r.quicRetryMx.Unlock()
+}
+
+func (r *peerRoute) succeedQUICDial(claimed bool) {
+	r.quicRetryMx.Lock()
+	defer r.quicRetryMx.Unlock()
+
+	if claimed {
+		if !r.quicRetryState.CompareAndSwap(-1, 0) {
+			return
+		}
+	} else {
+		for {
+			retryState := r.quicRetryState.Load()
+			if retryState < 0 {
+				return
+			}
+			if r.quicRetryState.CompareAndSwap(retryState, 0) {
+				break
+			}
+		}
+	}
+	r.quicDialFailures = 0
+	r.quicRefreshRequired.Store(false)
 }
 
 func (r *peerRoute) failQUICDial(now time.Time) {
-	retryAt := now.Add(quicDialRetryDelay).UnixNano()
+	r.quicRetryMx.Lock()
+	defer r.quicRetryMx.Unlock()
+
+	failures := r.quicDialFailures + 1
+	retryAt := now.Add(quicDialRetryDelay(failures)).UnixNano()
 	for current := r.quicRetryState.Load(); current < retryAt; {
 		if r.quicRetryState.CompareAndSwap(current, retryAt) {
+			r.quicDialFailures = failures
 			return
 		}
 		current = r.quicRetryState.Load()
@@ -1119,16 +1223,33 @@ func (r *peerRoute) failQUICDial(now time.Time) {
 }
 
 func (r *peerRoute) deferQUICDial(now time.Time) {
-	retryAt := now.Add(quicDialRetryDelay).UnixNano()
+	r.quicRetryMx.Lock()
+	defer r.quicRetryMx.Unlock()
+
+	nowUnix := now.UnixNano()
 	for {
 		current := r.quicRetryState.Load()
-		if current < 0 || current >= retryAt {
+		if current < 0 || current > nowUnix {
 			return
 		}
+		failures := r.quicDialFailures + 1
+		retryAt := now.Add(quicDialRetryDelay(failures)).UnixNano()
 		if r.quicRetryState.CompareAndSwap(current, retryAt) {
+			r.quicDialFailures = failures
 			return
 		}
 	}
+}
+
+func quicDialRetryDelay(failures uint32) time.Duration {
+	delay := quicDialRetryMinDelay
+	for failure := uint32(1); failure < failures && delay < quicDialRetryMaxDelay; failure++ {
+		delay *= 2
+	}
+	if delay > quicDialRetryMaxDelay {
+		return quicDialRetryMaxDelay
+	}
+	return delay
 }
 
 type pooledPeer struct {
@@ -1324,11 +1445,16 @@ func newPeerPool(
 	gateway *adnl.Gateway,
 	resolver overlay.BroadcastReceiverResolver,
 	customMessage func(msg *adnl.MessageCustom) error,
+	routes *peerRouteTable,
 ) *peerPool {
+	if routes == nil {
+		routes = newPeerRouteTable()
+	}
 	return &peerPool{
 		gateway:                   gateway,
 		broadcastReceiverResolver: resolver,
 		customMessage:             customMessage,
+		routes:                    routes,
 		peers:                     map[PeerID]*pooledPeer{},
 	}
 }
@@ -1416,7 +1542,7 @@ func (p *peerPool) wrapPeerLocked(peer adnl.Peer, id PeerID) (*pooledPeer, bool,
 	pooled := &pooledPeer{
 		id:              id,
 		addr:            peer.RemoteAddr(),
-		route:           newPeerRoute(""),
+		route:           p.routes.get(id),
 		pub:             append(ed25519.PublicKey(nil), peer.GetPubKey()...),
 		adnl:            wrapper,
 		baseRLDP:        baseRLDP,
@@ -1425,11 +1551,22 @@ func (p *peerPool) wrapPeerLocked(peer adnl.Peer, id PeerID) (*pooledPeer, bool,
 		rldpOverlayRefs: map[*overlay.RLDPOverlayWrapper]int{},
 	}
 	pooled.touch(time.Now())
+	// Serve overlay queries from peers we hold no attachment for. Without this
+	// the wrappers drop them as "unregistered overlay", so an unattached peer
+	// gets neither blocks nor Pong and evicts us as unreliable.
+	if p.detachedQuery != nil {
+		wrapper.SetOnUnknownOverlayQuery(func(msg *adnl.MessageQuery) error {
+			return p.detachedQuery.adnl(pooled, msg)
+		})
+		rldpClient.SetOnUnknownOverlayQuery(func(transferID []byte, query *rldp.Query) error {
+			return p.detachedQuery.rldp(pooled, transferID, query)
+		})
+	}
 	rldpClient.SetOnDisconnect(func() {
 		p.removeDisconnected(id, pooled)
 	})
 	p.peers[id] = pooled
-	stale := p.pruneIdleLocked(time.Now())
+	stale := p.pruneOverCapLocked(time.Now())
 	return pooled, true, stale
 }
 
@@ -1528,7 +1665,7 @@ func (p *peerPool) releaseOverlay(pooled *pooledPeer, adnlOverlay *overlay.ADNLO
 	if pooledPeerIdle(pooled) && p.peers[pooled.id] == pooled {
 		now := time.Now()
 		pooled.touch(now)
-		stale = p.pruneIdleLocked(now)
+		stale = p.pruneOverCapLocked(now)
 	}
 	p.mx.Unlock()
 
@@ -1600,7 +1737,7 @@ func (p *peerPool) releaseRetained(pooled *pooledPeer) {
 	if pooledPeerIdle(pooled) && p.peers[pooled.id] == pooled {
 		now := time.Now()
 		pooled.touch(now)
-		stale = p.pruneIdleLocked(now)
+		stale = p.pruneOverCapLocked(now)
 	}
 	p.mx.Unlock()
 
@@ -1609,9 +1746,15 @@ func (p *peerPool) releaseRetained(pooled *pooledPeer) {
 	}
 }
 
+func (p *peerPool) size() int {
+	p.mx.RLock()
+	defer p.mx.RUnlock()
+	return len(p.peers)
+}
+
 func (p *peerPool) pruneIdle(now time.Time) int {
 	p.mx.Lock()
-	stale := p.pruneIdleLocked(now)
+	stale := p.sweepIdleLocked(now)
 	p.mx.Unlock()
 
 	for _, idle := range stale {
@@ -1620,16 +1763,35 @@ func (p *peerPool) pruneIdle(now time.Time) int {
 	return len(stale)
 }
 
-func (p *peerPool) pruneIdleLocked(now time.Time) []*pooledPeer {
-	// The idle count can never exceed the pool size, so a pool within the cap
-	// needs no per-peer Stats() scan at all; closed entries are still removed
-	// by removeDisconnected and retainByID.
+// pruneOverCapLocked is the release-path variant: it only enforces the hard
+// cap, and only once the pool is over it, so releasing a peer never pays for a
+// per-peer Stats() scan. Expiring by TTL is the periodic sweep's job.
+func (p *peerPool) pruneOverCapLocked(now time.Time) []*pooledPeer {
 	if len(p.peers) <= peerPoolMaxIdle {
 		return nil
 	}
+	return p.sweepIdleLocked(now)
+}
 
+// sweepIdleLocked drops pooled transports nothing references any more: first
+// everything idle past the TTL, then the least recently used above the cap.
+//
+// The TTL used to be gated behind "pool larger than the cap", which made it
+// inert in practice: the pool only had to stay under peerPoolMaxIdle, so
+// unreferenced peers accumulated for as long as the node ran. Re-dialling a
+// peer when it is needed again is cheaper than holding its ADNL channel, its
+// RLDP client and that client's two goroutines indefinitely. This mirrors
+// sweepIdleQUICPaths, so both transports of a peer now decay together the way
+// quicIdleTTL already promises.
+//
+// Only peers with no refs and no overlay attachments are candidates, and
+// lastUsed also reflects real ADNL packet activity, so a transport still
+// carrying traffic is kept even when nothing holds a reference to it.
+func (p *peerPool) sweepIdleLocked(now time.Time) []*pooledPeer {
 	cutoff := now.Add(-peerPoolIdleTTL)
-	idle := make([]idlePooledPeer, 0, len(p.peers)-peerPoolMaxIdle)
+	var stale []*pooledPeer
+	idle := make([]idlePooledPeer, 0, len(p.peers))
+
 	for id, pooled := range p.peers {
 		if pooledPeerClosed(pooled) {
 			delete(p.peers, id)
@@ -1639,23 +1801,22 @@ func (p *peerPool) pruneIdleLocked(now time.Time) []*pooledPeer {
 			continue
 		}
 		lastUsed := pooled.lastUsed()
-		if lastUsed.After(cutoff) {
+		if !lastUsed.After(cutoff) {
+			delete(p.peers, id)
+			stale = append(stale, pooled)
 			continue
 		}
 		idle = append(idle, idlePooledPeer{peer: pooled, lastUsed: lastUsed})
 	}
 
-	excess := len(idle) - peerPoolMaxIdle
-	if excess <= 0 {
-		return nil
-	}
-	sort.Slice(idle, func(i, j int) bool {
-		return idle[i].lastUsed.Before(idle[j].lastUsed)
-	})
-	stale := make([]*pooledPeer, 0, excess)
-	for _, candidate := range idle[:excess] {
-		delete(p.peers, candidate.peer.id)
-		stale = append(stale, candidate.peer)
+	if excess := len(idle) - peerPoolMaxIdle; excess > 0 {
+		sort.Slice(idle, func(i, j int) bool {
+			return idle[i].lastUsed.Before(idle[j].lastUsed)
+		})
+		for _, candidate := range idle[:excess] {
+			delete(p.peers, candidate.peer.id)
+			stale = append(stale, candidate.peer)
+		}
 	}
 	return stale
 }
@@ -1836,7 +1997,6 @@ func buildOverlaySpec(zeroStateFileHash []byte, workchain int32, shard int64, na
 		ProtoVersionMajor: protoMajor,
 		ProtoVersionMinor: protoMinor,
 		Announce:          true,
-		DHTDiscovery:      true,
 		RandomPeers:       true,
 		QueryCapabilities: true,
 	}, nil
@@ -1947,7 +2107,6 @@ func buildCustomOverlaySpec(zeroStateFileHash []byte, cfg CustomOverlayConfig, l
 		SendQueries:       cfg.SendQueries,
 		AcceptQueries:     acceptQueries,
 		Announce:          false,
-		DHTDiscovery:      false,
 		RandomPeers:       false,
 		QueryCapabilities: false,
 	}, localMember, nil
@@ -2061,7 +2220,7 @@ func (n *Node) SetActiveShardOverlays(blocks []ton.BlockIDExt) error {
 		if _, ok := active[entry.key]; ok {
 			continue
 		}
-		if entry.sub.spec.Kind != overlayKindPublicShard {
+		if !entry.sub.spec.followsShardLifecycle() {
 			continue
 		}
 		if entry.sub.spec.Workchain == -1 && entry.sub.spec.Shard == topShard {
@@ -2137,7 +2296,12 @@ func (n *Node) runSubscriptionLifecycleLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			n.pool.pruneIdle(now)
+			if closed := n.pool.pruneIdle(now); closed > 0 {
+				n.log.Info().
+					Int("closed", closed).
+					Int("pooled", n.pool.size()).
+					Msg("closed idle pooled peers")
+			}
 			n.stopExpiredInactiveSubscriptions(now)
 		}
 	}
@@ -2254,6 +2418,29 @@ func (n *Node) subscriptionEntriesSnapshot() []subscriptionEntry {
 		})
 	}
 	return list
+}
+
+// subscriptionByOverlayShortID resolves an overlay by its wire id. Used by the
+// detached query path, which sees the overlay envelope but has no attachment.
+func (n *Node) subscriptionByOverlayShortID(id []byte) *overlaySubscription {
+	n.subscriptionsMx.RLock()
+	defer n.subscriptionsMx.RUnlock()
+
+	return n.subscriptions[string(id)]
+}
+
+// subscriptionByName resolves an overlay by its display name without
+// allocating; the subscription map holds a handful of entries.
+func (n *Node) subscriptionByName(name string) *overlaySubscription {
+	n.subscriptionsMx.RLock()
+	defer n.subscriptionsMx.RUnlock()
+
+	for _, sub := range n.subscriptions {
+		if sub.spec.Name == name {
+			return sub
+		}
+	}
+	return nil
 }
 
 func (n *Node) subscriptionsSnapshot() []*overlaySubscription {

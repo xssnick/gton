@@ -437,8 +437,8 @@ func TestArchiveInitialFullSliceUsesShortTimeout(t *testing.T) {
 	}
 
 	snapshot := archiveRLDP.snapshot()
-	if len(snapshot.asyncQueries) != 4 {
-		t.Fatalf("archive RLDP queries = %d, want info, probe, and 2 pipelined slices", len(snapshot.asyncQueries))
+	if want := 2 + archiveSliceParallelism; len(snapshot.asyncQueries) != want {
+		t.Fatalf("archive RLDP queries = %d, want info, probe, and %d pipelined slices", len(snapshot.asyncQueries), archiveSliceParallelism)
 	}
 	var got time.Duration
 	for _, record := range snapshot.asyncQueries {
@@ -456,7 +456,7 @@ func TestArchiveInitialFullSliceUsesShortTimeout(t *testing.T) {
 	}
 }
 
-func TestArchiveSliceDownloadPipelinesTwoRequests(t *testing.T) {
+func TestArchiveSliceDownloadPipelinesParallelRequests(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -509,8 +509,9 @@ func TestArchiveSliceDownloadAssemblesOutOfOrder(t *testing.T) {
 	binary.LittleEndian.PutUint32(data, packfile.PackageMagic)
 	peer, archiveRLDP := testArchiveDownloadPeerWithRLDP(t, "slice-out-of-order", 777, data, 0)
 	archiveRLDP.asyncDelays = map[int64]time.Duration{
-		0:                60 * time.Millisecond,
-		archiveSliceSize: 5 * time.Millisecond,
+		0:                    60 * time.Millisecond,
+		archiveSliceSize:     5 * time.Millisecond,
+		2 * archiveSliceSize: 30 * time.Millisecond,
 	}
 	addTestArchiveOnlyPeer(pool, peer)
 
@@ -594,9 +595,9 @@ func TestArchiveSliceDownloadCancellationStopsOutstandingRequests(t *testing.T) 
 	peer, archiveRLDP := testArchiveDownloadPeerWithRLDP(t, "slice-context-cancel", 777, nil, 0)
 	started := make(chan GetArchiveSlice, archiveSliceParallelism)
 	canceled := make(chan int64, archiveSliceParallelism)
-	archiveRLDP.asyncWaitForCancel = map[int64]bool{
-		0:                true,
-		archiveSliceSize: true,
+	archiveRLDP.asyncWaitForCancel = map[int64]bool{}
+	for i := 0; i < archiveSliceParallelism; i++ {
+		archiveRLDP.asyncWaitForCancel[int64(i)*archiveSliceSize] = true
 	}
 	archiveRLDP.asyncStarted = started
 	archiveRLDP.asyncCanceled = canceled
@@ -655,9 +656,17 @@ func TestArchiveSliceDownloadErrorCancelsOutstandingRequest(t *testing.T) {
 
 	sliceErr := errors.New("archive slice failed")
 	peer, archiveRLDP := testArchiveDownloadPeerWithRLDP(t, "slice-error-cancel", 777, nil, 0)
-	canceled := make(chan int64, 1)
+	// Every slice in flight beside the failing one must be canceled, and the
+	// order they report in is not defined.
+	canceled := make(chan int64, archiveSliceParallelism)
+	wantCanceled := map[int64]bool{}
+	archiveRLDP.asyncWaitForCancel = map[int64]bool{}
+	for i := 1; i < archiveSliceParallelism; i++ {
+		offset := int64(i) * archiveSliceSize
+		archiveRLDP.asyncWaitForCancel[offset] = true
+		wantCanceled[offset] = true
+	}
 	archiveRLDP.asyncErrors = map[int64]error{0: sliceErr}
-	archiveRLDP.asyncWaitForCancel = map[int64]bool{archiveSliceSize: true}
 	archiveRLDP.asyncCanceled = canceled
 	addTestArchiveOnlyPeer(pool, peer)
 
@@ -672,13 +681,16 @@ func TestArchiveSliceDownloadErrorCancelsOutstandingRequest(t *testing.T) {
 		t.Fatalf("download archive error = %q, want offset=0", err)
 	}
 
-	select {
-	case offset := <-canceled:
-		if offset != archiveSliceSize {
-			t.Fatalf("canceled archive offset = %d, want %d", offset, archiveSliceSize)
+	for len(wantCanceled) > 0 {
+		select {
+		case offset := <-canceled:
+			if !wantCanceled[offset] {
+				t.Fatalf("canceled archive offset = %d, want one of the outstanding slices", offset)
+			}
+			delete(wantCanceled, offset)
+		case <-time.After(time.Second):
+			t.Fatal("outstanding archive request was not canceled after slice error")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("outstanding archive request was not canceled after slice error")
 	}
 
 	snapshot := archiveRLDP.snapshot()

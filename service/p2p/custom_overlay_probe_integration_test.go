@@ -146,7 +146,7 @@ func startProbeNodeHarness(t *testing.T, key ed25519.PrivateKey, listenAddr stri
 		privKey: key,
 		localID: probeTestPeerID(t, key),
 		gateway: gw,
-		pool:    newPeerPool(gw, nil, nil),
+		pool:    newPeerPool(gw, nil, nil, nil),
 		peerUse: map[PeerID]peerUse{},
 		dht:     backend,
 		runCtx:  ctx,

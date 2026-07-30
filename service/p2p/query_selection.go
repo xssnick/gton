@@ -48,7 +48,7 @@ func (n *Node) readyCustomQuerySubscription(now time.Time) *overlaySubscription 
 	n.subscriptionsMx.RLock()
 	var selected *overlaySubscription
 	for _, sub := range n.subscriptions {
-		if sub.spec.Kind != overlayKindCustomFixed || !sub.spec.SendQueries {
+		if !sub.spec.preferredAsQuerySource() {
 			continue
 		}
 		if selected != nil && sub.spec.Name >= selected.spec.Name {
@@ -152,7 +152,7 @@ func (s *overlaySubscription) publicRandomQueryFallbackPeer(
 	requiredVersionMajor,
 	requiredVersionMinor int32,
 ) *overlayPeer {
-	if s.spec.Kind != overlayKindPublicShard {
+	if !s.spec.drawsRandomQueryFallback() {
 		return nil
 	}
 
@@ -206,24 +206,11 @@ func (p *overlayPeer) publicRandomQueryFallbackReady(
 }
 
 func (s *overlaySubscription) startQueryPeerDiscovery(ctx context.Context, target int) {
-	if s.spec.Kind == overlayKindCustomFixed ||
-		s.spec.Kind == overlayKindFastSync {
+	if s.spec.seedsFromFixedNodes() {
 		s.startSeedFromFixedNodes(ctx)
 		return
 	}
 	s.startSeedFromDHTTarget(ctx, target)
-}
-
-func (s *overlaySubscription) nextQueryProbeDelay() time.Duration {
-	if s.spec.Kind == overlayKindFastSync {
-		return fastSyncPingMinDelay +
-			time.Duration(rand.Int64N(int64(fastSyncPingJitter)))
-	}
-	if s.spec.Kind != overlayKindCustomFixed {
-		return nextPeerPingDelay()
-	}
-	return customQueryProbeMinDelay +
-		time.Duration(rand.Int64N(int64(customQueryProbeJitter)))
 }
 
 func (s *overlaySubscription) probeCustomQueryPeers(ctx context.Context) {

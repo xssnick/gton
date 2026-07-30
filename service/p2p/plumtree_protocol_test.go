@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"math"
 	"slices"
 	"testing"
@@ -781,9 +782,17 @@ func TestValidatePlumtreeMessages(t *testing.T) {
 		PayloadTimestamp: float64(now.Unix()),
 		DataSize:         plumtreeFECPartSize(plumtreeMaxPayloadSize),
 		DataHash:         id,
+		Signature:        bytes.Repeat([]byte{7}, ed25519.SignatureSize),
 	}
 	if err := validateBroadcastPlumtreeIHave(ihave, now); err != nil {
 		t.Fatalf("validate valid IHAVE: %v", err)
+	}
+	// A signature that can never verify must be refused before the announcement
+	// is buffered, since nothing downstream caps its length.
+	short := ihave
+	short.Signature = []byte{7}
+	if err := validateBroadcastPlumtreeIHave(short, now); err == nil {
+		t.Fatal("IHAVE with a short signature was accepted")
 	}
 	ihave.DataSize++
 	if err := validateBroadcastPlumtreeIHave(ihave, now); err == nil {
@@ -895,4 +904,149 @@ func FuzzParsePlumtreeBroadcast(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		fuzzParsePlumtreeBroadcast(data)
 	})
+}
+
+// A simple payload must stay pinned to the simple tree. validatePlumtreeControl
+// only relates the part and tree indices, and part 0 relates to FEC tree 1 just
+// as legitimately as to tree 0 - so an unpinned simple payload could take an FEC
+// slot, where getPartLocked never finds it again and where the IHAVE forwarded
+// for it carries a signature every neighbour verifies against the FEC preimage
+// and rejects, banning this node's plumtree traffic for the rejection window.
+func TestValidateBroadcastPlumtreeSimplePinsTreeIndex(t *testing.T) {
+	now := time.Now()
+	message := BroadcastPlumtreeSimple{
+		BroadcastID: bytes.Repeat([]byte{0x11}, 32),
+		Timestamp:   float64(now.Unix()),
+		TreeIndex:   plumtreeSimpleTree,
+		Data:        []byte{1, 2, 3},
+	}
+	if err := validateBroadcastPlumtreeSimple(message, now); err != nil {
+		t.Fatalf("simple tree rejected: %v", err)
+	}
+
+	for _, treeIndex := range []int32{
+		plumtreeFECTreeOffset,
+		plumtreeFECTreeOffset + 1,
+		plumtreeTreeSlots - 1,
+	} {
+		wrong := message
+		wrong.TreeIndex = treeIndex
+		if err := validateBroadcastPlumtreeSimple(wrong, now); err == nil {
+			t.Fatalf("simple payload accepted on tree %d", treeIndex)
+		}
+	}
+}
+
+// Reflection-based oracles for the compact serializers in
+// plumtree_engine_payload.go: production writes the bytes by hand, these prove
+// the two agree.
+func plumtreeFECBroadcastID(
+	flags int32,
+	fullDataHash []byte,
+	fullDataSize int32,
+	partSize int32,
+) ([sha256.Size]byte, error) {
+	if err := validatePlumtreeInt256(fullDataHash, "full data hash"); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	if err := validatePlumtreePayloadSize(fullDataSize); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	if partSize <= 0 || partSize != plumtreeFECPartSize(fullDataSize) {
+		return [sha256.Size]byte{}, fmt.Errorf("invalid Plumtree FEC part size %d", partSize)
+	}
+
+	boxed, err := tl.Serialize(PlumtreeFECID{
+		Flags:        flags,
+		FullDataHash: fullDataHash,
+		FullDataSize: fullDataSize,
+		PartSize:     partSize,
+	}, true)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("serialize Plumtree FEC id: %w", err)
+	}
+	return sha256.Sum256(boxed), nil
+}
+
+func plumtreeSimpleToSignBytes(
+	broadcastID []byte,
+	timestamp float64,
+	treeIndex int32,
+	dataSize int32,
+	dataHash []byte,
+) ([]byte, error) {
+	if err := validatePlumtreeInt256(broadcastID, "broadcast id"); err != nil {
+		return nil, err
+	}
+	if plumtreeInt256IsZero(broadcastID) {
+		return nil, fmt.Errorf("empty Plumtree broadcast id")
+	}
+	if err := validatePlumtreeInt256(dataHash, "data hash"); err != nil {
+		return nil, err
+	}
+	if math.IsNaN(timestamp) || math.IsInf(timestamp, 0) {
+		return nil, fmt.Errorf("invalid Plumtree timestamp")
+	}
+	if treeIndex != plumtreeSimpleTree {
+		return nil, fmt.Errorf("invalid Plumtree simple tree %d", treeIndex)
+	}
+	if err := validatePlumtreePayloadSize(dataSize); err != nil {
+		return nil, err
+	}
+
+	boxed, err := tl.Serialize(BroadcastPlumtreeSimpleToSign{
+		ID:        broadcastID,
+		Timestamp: timestamp,
+		TreeIndex: treeIndex,
+		DataSize:  dataSize,
+		DataHash:  dataHash,
+	}, true)
+	if err != nil {
+		return nil, fmt.Errorf("serialize Plumtree simple signature payload: %w", err)
+	}
+	return boxed, nil
+}
+
+func plumtreeFECToSignBytes(
+	broadcastID []byte,
+	timestamp float64,
+	partIndex int32,
+	treeIndex int32,
+	dataSize int32,
+	dataHash []byte,
+) ([]byte, error) {
+	if err := validatePlumtreeInt256(broadcastID, "broadcast id"); err != nil {
+		return nil, err
+	}
+	if plumtreeInt256IsZero(broadcastID) {
+		return nil, fmt.Errorf("empty Plumtree broadcast id")
+	}
+	if err := validatePlumtreeInt256(dataHash, "data hash"); err != nil {
+		return nil, err
+	}
+	if math.IsNaN(timestamp) || math.IsInf(timestamp, 0) {
+		return nil, fmt.Errorf("invalid Plumtree timestamp")
+	}
+	if partIndex < 0 || partIndex >= plumtreeFECTotalParts {
+		return nil, fmt.Errorf("invalid Plumtree FEC part index %d", partIndex)
+	}
+	if treeIndex != partIndex+plumtreeFECTreeOffset {
+		return nil, fmt.Errorf("Plumtree FEC part %d uses tree %d", partIndex, treeIndex)
+	}
+	if dataSize <= 0 || dataSize > plumtreeFECPartSize(plumtreeMaxPayloadSize) {
+		return nil, fmt.Errorf("invalid Plumtree FEC symbol size %d", dataSize)
+	}
+
+	boxed, err := tl.Serialize(BroadcastPlumtreeFECToSign{
+		ID:        broadcastID,
+		Timestamp: timestamp,
+		PartIndex: partIndex,
+		TreeIndex: treeIndex,
+		DataSize:  dataSize,
+		DataHash:  dataHash,
+	}, true)
+	if err != nil {
+		return nil, fmt.Errorf("serialize Plumtree FEC signature payload: %w", err)
+	}
+	return boxed, nil
 }

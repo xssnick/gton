@@ -21,6 +21,11 @@ import (
 const (
 	DefaultMasterBlockCache = 128
 	DefaultShardBlockCache  = 1024
+	// DefaultFragmentBuildWorkers bounds the shard-view prewarms that run off
+	// the publishing goroutine. Masterchain blocks get their own slot on top of
+	// this, and a publish that finds no free slot simply publishes the cold
+	// view, so this is a latency knob and never a correctness one.
+	DefaultFragmentBuildWorkers = 2
 )
 
 var (
@@ -35,6 +40,17 @@ type Options struct {
 	NonFinalCache      int
 	NonFinalCellLoader cell.LazyCellLoader
 	LiveBlockCache     *storage.LiveBlockCache
+	// FragmentBuildWorkers moves the per-block BlockView build (state root
+	// proof, accounts-dict prewarm, and for masterchain blocks the config epoch
+	// and global libraries) off the publishing goroutine. Publishing happens on
+	// the block apply path, so on a live node this is what keeps the prewarm out
+	// of the head latency. Zero keeps the build inline, which is what tests and
+	// non-final publishing want.
+	FragmentBuildWorkers int
+	// OnFragmentBuildError reports a failed background build. The block stays
+	// published and its view is rebuilt on the first query, so this is a
+	// diagnostic, not an error path.
+	OnFragmentBuildError func(ton.BlockIDExt, error)
 }
 
 type Store struct {
@@ -71,6 +87,10 @@ type Store struct {
 	blockDataLoad      liveLoadGroup[liveBlockLookupKey, []byte]
 	blockLoad          liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
 	fragmentLoad       liveLoadGroup[liveBlockLookupKey, *BlockView]
+
+	fragmentBuildSlots   chan struct{}
+	fragmentMasterSlots  chan struct{}
+	onFragmentBuildError func(ton.BlockIDExt, error)
 }
 
 type liveBlock struct {
@@ -81,6 +101,10 @@ type liveBlock struct {
 	stateFlushed    bool
 
 	fragments *BlockView
+	// currentCachesReleased records that the block left the current state while
+	// its view was still being built, so a view installed afterwards must not
+	// start filling the per-current caches again.
+	currentCachesReleased bool
 }
 
 type liveBlockFlush struct {
@@ -100,6 +124,7 @@ type livePreparedBlockArtifacts struct {
 	meta            *storage.BlockMeta
 	state           *storage.BlockState
 	fragments       *BlockView
+	wantFragments   bool
 	proofs          []storage.LiveBlockProofArtifact
 	artifactFlushed bool
 	stateFlushed    bool
@@ -165,6 +190,12 @@ func New(store Backing, opts ...Options) *Store {
 		liveBlockCache = storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
 	}
 
+	var fragmentBuildSlots, fragmentMasterSlots chan struct{}
+	if cfg.FragmentBuildWorkers > 0 {
+		fragmentBuildSlots = make(chan struct{}, cfg.FragmentBuildWorkers)
+		fragmentMasterSlots = make(chan struct{}, 1)
+	}
+
 	live := &Store{
 		backing:            store,
 		notify:             make(chan struct{}),
@@ -187,6 +218,10 @@ func New(store Backing, opts ...Options) *Store {
 		nonFinalWaiting:    map[storage.BlockRootHash]liveNonfinalWaiting{},
 		nonFinalCellIndex:  map[cell.Hash][]liveNonfinalCellIndexEntry{},
 		nonFinalCellLoader: nonFinalCellLoader,
+
+		fragmentBuildSlots:   fragmentBuildSlots,
+		fragmentMasterSlots:  fragmentMasterSlots,
+		onFragmentBuildError: cfg.OnFragmentBuildError,
 	}
 	live.loadInitialStoredCurrentState(context.Background())
 	return live
@@ -402,8 +437,27 @@ func (s *Store) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []b
 
 func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
+	if err == nil {
+		// Structural validation of the block root and state; a block whose view
+		// cannot be built is not published at all.
+		err = prepared.buildFragments()
+	}
 	if err != nil {
 		return err
+	}
+
+	// The prewarm is the expensive half and the only deferrable one. Deferred,
+	// it also installs the view itself, so the publish below must not.
+	deferredPrewarm := prepared.fragments
+	if s.fragmentPrewarmSlots(prepared.block) != nil {
+		prepared.fragments = nil
+	} else {
+		deferredPrewarm = nil
+		if prepared.fragments != nil {
+			if err = prewarmFragments(prepared.fragments); err != nil {
+				return err
+			}
+		}
 	}
 	cacheArtifacts := storage.LiveBlockCacheArtifacts{
 		Block:           prepared.block,
@@ -423,10 +477,76 @@ func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) 
 		s.notify = make(chan struct{})
 	}
 	s.mu.Unlock()
+
+	// Strictly after the block is in s.blocks: the prewarm installs the view
+	// through rememberBlockFragments, which drops it when the block is not there
+	// yet. Also strictly outside s.mu — non-final state cells are lazy and their
+	// loader re-enters the read lock.
+	if deferredPrewarm != nil {
+		s.scheduleFragmentPrewarm(prepared.block, deferredPrewarm)
+	}
+
 	if s.nonFinalEnabled {
 		s.promoteNonfinalWaiting()
 	}
 	return nil
+}
+
+// fragmentPrewarmSlots returns the semaphore a block's prewarm should occupy,
+// or nil when the store prewarms inline. Masterchain blocks get their own slot
+// because they are the ones that need the prewarm most (the config epoch,
+// prev-blocks tuple and global libraries are masterchain-only) while shard
+// publishes arrive in bursts from the shard apply workers and would otherwise
+// crowd them out.
+func (s *Store) fragmentPrewarmSlots(block ton.BlockIDExt) chan struct{} {
+	if block.Workchain == masterchainID {
+		return s.fragmentMasterSlots
+	}
+	return s.fragmentBuildSlots
+}
+
+func (s *Store) scheduleFragmentPrewarm(block ton.BlockIDExt, view *BlockView) {
+	slots := s.fragmentPrewarmSlots(block)
+	if slots == nil {
+		s.prewarmAndInstallFragments(block, view)
+		return
+	}
+
+	select {
+	case slots <- struct{}{}:
+	default:
+		// Every slot is busy. Publish the cold view anyway: it is fully usable,
+		// its cells just load lazily per query. Blocking the producer here would
+		// put the prewarm cost straight back on the block apply path.
+		s.rememberBlockFragments(block, view)
+		return
+	}
+	go func() {
+		defer func() { <-slots }()
+		s.prewarmAndInstallFragments(block, view)
+	}()
+}
+
+func (s *Store) prewarmAndInstallFragments(block ton.BlockIDExt, view *BlockView) {
+	key, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		return
+	}
+
+	// Through fragmentLoad so a query arriving mid-prewarm joins this call
+	// instead of running a second full build from storage.
+	_, err := s.fragmentLoad.do(context.Background(), key, func() (*BlockView, error) {
+		if cached, err := s.cachedBlockFragments(block); err == nil {
+			return cached, nil
+		}
+		if err := prewarmFragments(view); err != nil {
+			return nil, err
+		}
+		return s.rememberBlockFragments(block, view), nil
+	})
+	if err != nil && s.onFragmentBuildError != nil {
+		s.onFragmentBuildError(block, err)
+	}
 }
 
 func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePreparedBlockArtifacts, error) {
@@ -486,27 +606,47 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 		})
 	}
 
-	var fragments *BlockView
-	if !artifacts.AvailabilityOnly && root != nil && state != nil && state.Cell != nil {
-		built, err := NewBlockView(block, root, state.Cell)
-		if err != nil {
-			return livePreparedBlockArtifacts{}, err
-		}
-		fragments = built
-		fragments.prewarmHotPath()
-	}
-
 	return livePreparedBlockArtifacts{
 		block:           block,
 		root:            root,
 		data:            data,
 		meta:            meta,
 		state:           state,
-		fragments:       fragments,
+		wantFragments:   !artifacts.AvailabilityOnly && root != nil && state != nil && state.Cell != nil,
 		proofs:          proofs,
 		artifactFlushed: artifacts.ArtifactFlushed,
 		stateFlushed:    artifacts.StateFlushed,
 	}, nil
+}
+
+// buildFragments constructs the block view. It stays in the caller's goroutine
+// because it is also the structural validation of the block root and state:
+// today a block whose view cannot be built is not published at all, and the
+// non-final path additionally depends on that check before a reconstructed
+// state becomes the base of later non-final blocks. Only the prewarm, which is
+// the expensive half, is deferrable — see prewarmFragments.
+func (p *livePreparedBlockArtifacts) buildFragments() error {
+	if !p.wantFragments || p.fragments != nil {
+		return nil
+	}
+
+	built, err := NewBlockView(p.block, p.root, p.state.Cell)
+	if err != nil {
+		return err
+	}
+	p.fragments = built
+	return nil
+}
+
+// prewarmFragments does the lazy-cell work: the accounts-dict prewarm for shard
+// blocks and, for masterchain blocks, the config epoch, prev-blocks tuple and
+// global libraries. The view must not be shared yet.
+func prewarmFragments(view *BlockView) error {
+	if err := view.prewarmAccounts(); err != nil {
+		return err
+	}
+	view.prewarmHotPath()
+	return nil
 }
 
 func cloneLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) storage.LiveBlockArtifacts {
@@ -937,6 +1077,12 @@ func (s *Store) BlockFragments(ctx context.Context, block ton.BlockIDExt) (*Bloc
 		if err != nil {
 			return nil, err
 		}
+		// Prewarmed like the publish path: this rebuild also wins the race
+		// against a deferred prewarm whose block was queried the moment it was
+		// published, and a view installed cold there would stay cold.
+		if err = prewarmFragments(fragments); err != nil {
+			return nil, err
+		}
 		return s.rememberBlockFragments(block, fragments), nil
 	})
 	if err != nil {
@@ -1304,6 +1450,16 @@ func (s *Store) cachedBlockBySeqNoForPrefix(ref storage.BlockSeqRef) (blockPrefi
 	return blockPrefixCandidate{}, storage.ErrNotFound
 }
 
+// cachedDirectBlockByLTForPrefix answers from the live index only when that
+// index actually covers lt: the hit must have a predecessor inside the window,
+// otherwise the block that really contains lt predates the window and only the
+// backing store knows it. This mirrors ArchiveSlice::get_block_common, which
+// takes its early return solely under `ls + 1 == block_id.id.seqno` - a left
+// neighbour exists and is contiguous - and mirrors ArchiveManager cascading to
+// the next slice when a slice reports notready. The window is this node's hot
+// slice, so the check has to hold for the masterchain as well: the identically
+// shaped test in pebblestore may skip it for root histories because that index
+// spans all of history, and a window has no such guarantee.
 func (s *Store) cachedDirectBlockByLTForPrefix(key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1315,7 +1471,7 @@ func (s *Store) cachedDirectBlockByLTForPrefix(key storage.BlockHistoryKey, lt u
 	if idx >= len(entries) {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
-	if !prefixHistoryIsRoot(key) && idx == 0 && (entries[idx].startLT == 0 || entries[idx].startLT >= lt) {
+	if idx == 0 && (entries[idx].startLT == 0 || entries[idx].startLT >= lt) {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 	return cloneBlockID(entries[idx].block), nil
@@ -1406,6 +1562,9 @@ func (s *Store) cachedBlockByUnixTimeForPrefix(key storage.BlockHistoryKey, utim
 	return s.cachedPrefixCandidateLocked(best.block, best.exact), nil
 }
 
+// cachedDirectBlockByUnixTimeForPrefix carries the coverage requirement of
+// cachedDirectBlockByLTForPrefix over to the utime index: the oldest entry in
+// the window has to predate utime, otherwise the answer lies before the window.
 func (s *Store) cachedDirectBlockByUnixTimeForPrefix(key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1417,14 +1576,10 @@ func (s *Store) cachedDirectBlockByUnixTimeForPrefix(key storage.BlockHistoryKey
 	if idx >= len(entries) {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
-	if !prefixHistoryIsRoot(key) && entries[0].genUTime >= utime {
+	if entries[0].genUTime >= utime {
 		return ton.BlockIDExt{}, storage.ErrNotFound
 	}
 	return cloneBlockID(entries[idx].block), nil
-}
-
-func prefixHistoryIsRoot(key storage.BlockHistoryKey) bool {
-	return key.Workchain == masterchainID || storage.ShardPrefixLength(key.Shard) == 0
 }
 
 func (s *Store) cachedPrefixCandidateLocked(block ton.BlockIDExt, exact bool) blockPrefixCandidate {
@@ -1450,13 +1605,20 @@ func (s *Store) cachedBlockRoot(block ton.BlockIDExt) (*cell.Cell, error) {
 func (s *Store) cachedBlockFragments(block ton.BlockIDExt) (*BlockView, error) {
 	key := storage.BlockKey(block)
 
+	// Read the field itself under the lock: fragments is the one field of a
+	// published liveBlock that is written in place (by rememberBlockFragments),
+	// and with background builds that write races every live query.
 	s.mu.RLock()
 	cached := s.blocks[key]
+	var fragments *BlockView
+	if cached != nil && blockIDEqual(cached.id, block) {
+		fragments = cached.fragments
+	}
 	s.mu.RUnlock()
-	if cached == nil || !blockIDEqual(cached.id, block) || cached.fragments == nil {
+	if fragments == nil {
 		return nil, storage.ErrNotFound
 	}
-	return cached.fragments, nil
+	return fragments, nil
 }
 
 func (s *Store) rememberBlockFragments(block ton.BlockIDExt, fragments *BlockView) *BlockView {
@@ -1468,12 +1630,20 @@ func (s *Store) rememberBlockFragments(block ton.BlockIDExt, fragments *BlockVie
 		s.mu.Unlock()
 		return fragments
 	}
+	released := false
 	if cached.fragments != nil {
 		fragments = cached.fragments
 	} else {
 		cached.fragments = fragments
+		released = cached.currentCachesReleased
 	}
 	s.mu.Unlock()
+
+	// The block left the current state while this view was being built, so the
+	// per-current caches it would fill are never going to be read.
+	if released {
+		fragments.releaseCurrentCaches()
+	}
 	return fragments
 }
 
@@ -1488,6 +1658,7 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 		}
 		block.artifactFlushed = block.artifactFlushed || existing.artifactFlushed
 		block.stateFlushed = block.stateFlushed || existing.stateFlushed
+		block.currentCachesReleased = block.currentCachesReleased || existing.currentCachesReleased
 		if block.fragments == nil {
 			block.fragments = existing.fragments
 		}
@@ -1637,7 +1808,14 @@ func (s *Store) releaseRetiredCurrentCachesLocked(previous, next *storage.Curren
 		if currentHasBlockState(next, block) {
 			return
 		}
-		if cached := s.blocks[storage.BlockKey(block)]; cached != nil && cached.fragments != nil {
+		cached := s.blocks[storage.BlockKey(block)]
+		if cached == nil {
+			return
+		}
+		// Marked even when the view is missing: a build still in flight installs
+		// its view after this point and must not re-enable the caches.
+		cached.currentCachesReleased = true
+		if cached.fragments != nil {
 			cached.fragments.releaseCurrentCaches()
 		}
 	}

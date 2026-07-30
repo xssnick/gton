@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"net"
 	"net/netip"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 	tnstore "github.com/xssnick/gton/service/storage"
+	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
@@ -657,4 +659,95 @@ func testFreeQUICDerivedEndpoint(tb testing.TB) (netip.AddrPort, netip.AddrPort)
 	}
 	tb.Fatal("failed to allocate a QUIC port above 1000")
 	return netip.AddrPort{}, netip.AddrPort{}
+}
+
+// An inbound query arrives on a connection the peer already holds, so the
+// inactive-overlay notice must go back down that connection. Deriving an
+// outbound sender from the peer id instead dials, and for a peer this node has
+// never dialled itself that dial resolves through the DHT - all while the
+// handler still holds one of the 64 inbound query slots, which is how a handful
+// of unresolvable peers could stall every inbound QUIC query.
+//
+// The DHT stub blocks, so a regression shows up as both a non-zero call count
+// and a handler that only returns once the query deadline expires.
+func TestHandleQUICQueryDoesNotDialWhenOverlayIsInactive(t *testing.T) {
+	memberPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate member key: %v", err)
+	}
+	memberID, err := peerIDFromPublicKey(memberPub)
+	if err != nil {
+		t.Fatalf("member id: %v", err)
+	}
+	overlayID := testPeerID("quic-inactive-overlay").Bytes()
+
+	stub := &blockingOutboundRouteDHT{
+		// A non-nil list keeps the teardown of a failing run clean: the blocked
+		// resolve is released by the deferred close and must not dereference nil.
+		addresses: &adnladdr.List{},
+		pub:       memberPub,
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	defer close(stub.release)
+
+	node := newTestNode(t)
+	node.dht = stub
+
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:         "quic-inactive",
+			Kind:         overlayKindCustomFixed,
+			ShortID:      overlayID,
+			FixedNodeIDs: map[PeerID]struct{}{memberID: {}},
+		},
+		log:   discardLogger(),
+		peers: map[PeerID]*overlayPeer{},
+	})
+	sub.setActive(false, time.Time{})
+
+	node.subscriptionsMx.Lock()
+	node.subscriptions[string(overlayID)] = sub
+	node.subscriptionsMx.Unlock()
+
+	// Registering the peer with its key is what makes the outbound dial - and
+	// with it the DHT resolve - reachable from the inbound handler.
+	inbound := &authenticatedQUICPeer{
+		node:      node,
+		id:        memberID,
+		publicKey: memberPub,
+		route:     node.peerRoutes.get(memberID),
+	}
+	node.quicPeersMx.Lock()
+	node.quicPeers[memberID] = inbound
+	node.quicPeersMx.Unlock()
+
+	payload := testQUICOverlayQueryPayload(t, overlayID, overlay.Ping{})
+
+	done := make(chan struct{})
+	var (
+		answer   []byte
+		queryErr error
+	)
+	go func() {
+		defer close(done)
+		answer, queryErr = node.handleQUICQuery(context.Background(), inbound, payload)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("inbound query blocked, so it went out to the network")
+	}
+
+	if !errors.Is(queryErr, errOverlayInactive) || answer != nil {
+		t.Fatalf("inactive overlay result = (%x, %v), want nil overlay-inactive", answer, queryErr)
+	}
+	if calls := stub.calls.Load(); calls != 0 {
+		t.Fatalf("inbound query made %d DHT lookups, want 0", calls)
+	}
+	if addr := inbound.route.quicAddr(); addr != "" {
+		t.Fatalf("inbound query resolved a dial route = %q, want none", addr)
+	}
 }

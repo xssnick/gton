@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"slices"
 	"time"
 
@@ -50,10 +51,7 @@ func (e *plumtreeEngine) HandleSimple(
 	from PeerID,
 	envelope plumtreeSimpleEnvelope,
 ) (plumtreeActions, error) {
-	payloadContext := plumtreePayloadContext{
-		from:   from,
-		origin: plumtreePayloadOriginPush,
-	}
+	payloadContext := plumtreePayloadContext{from: from}
 	return e.handleSimple(ctx, now, payloadContext, envelope)
 }
 
@@ -63,10 +61,7 @@ func (e *plumtreeEngine) HandleFEC(
 	from PeerID,
 	envelope plumtreeFECEnvelope,
 ) (plumtreeActions, error) {
-	payloadContext := plumtreePayloadContext{
-		from:   from,
-		origin: plumtreePayloadOriginPush,
-	}
+	payloadContext := plumtreePayloadContext{from: from}
 	return e.handleFEC(ctx, now, payloadContext, envelope)
 }
 
@@ -83,7 +78,6 @@ func (e *plumtreeEngine) HandleRepairSimple(
 
 	payloadContext := plumtreePayloadContext{
 		from:        attempt.from,
-		origin:      plumtreePayloadOriginRepair,
 		expectedKey: attempt.key,
 	}
 	return e.handleSimple(ctx, now, payloadContext, envelope)
@@ -102,7 +96,6 @@ func (e *plumtreeEngine) HandleRepairFEC(
 
 	payloadContext := plumtreePayloadContext{
 		from:        attempt.from,
-		origin:      plumtreePayloadOriginRepair,
 		expectedKey: attempt.key,
 	}
 	return e.handleFEC(ctx, now, payloadContext, envelope)
@@ -297,9 +290,7 @@ func (e *plumtreeEngine) handleSimple(
 	if err != nil {
 		return plumtreeActions{}, err
 	}
-	// Every field but the timestamp window was fully validated at entry and is
-	// an immutable value copy, so only the window can go stale during
-	// verification.
+	// Only the timestamp window can go stale during verification.
 	commitNow := e.now()
 	if err = validatePlumtreeTimestamp(prepared.message.Timestamp, commitNow); err != nil {
 		return plumtreeActions{}, err
@@ -454,18 +445,15 @@ func (e *plumtreeEngine) handleFEC(
 	e.mu.Unlock()
 
 	// RaptorQ decode and the payload hash cost milliseconds on a full-size
-	// broadcast, so they run outside the engine lock. decodeMu serialises them
-	// per broadcast; other broadcasts, repair queries and the alarm loop keep
-	// making progress meanwhile. Signature verification and FEC origination
-	// already stay off the engine lock for the same reason.
+	// broadcast, so they run outside the engine lock, serialised per broadcast by
+	// decodeMu. Other broadcasts, repair queries and the alarm loop keep moving.
 	state.decodeMu.Lock()
 	defer state.decodeMu.Unlock()
 
-	// decoderReleased is set only under both decodeMu and mu, so a set flag
-	// here means a concurrent handler already completed or failed this
-	// broadcast. A nil decoder just has not been built yet: construction waits
-	// for the first symbol so the multi-hundred-KB buffer zeroing happens here
-	// instead of under the engine lock in recheckFECLocked.
+	// decoderReleased is set under both decodeMu and mu, so a set flag means a
+	// concurrent handler already completed or failed this broadcast. A nil decoder
+	// has just not been built yet: construction waits for the first symbol so the
+	// multi-hundred-KB zeroing stays out from under the engine lock.
 	if state.decoderReleased {
 		return actions, nil
 	}
@@ -517,8 +505,7 @@ func (e *plumtreeEngine) handleFEC(
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Close zeroes e.delivered while a decode may still be inside decodeMu;
-	// eviction does not set decoderReleased, so this is the first point where
+	// Eviction does not set decoderReleased, so this is the first point where
 	// shutdown becomes visible to a decode that straddled it.
 	if e.closed {
 		return actions, nil
@@ -535,6 +522,9 @@ func (e *plumtreeEngine) handleFEC(
 	}
 	e.stats.NoteDeliveredBroadcast()
 	state.isDelivered = true
+	// Assembling shortens the retention: from here the state only exists to serve
+	// repair queries, so re-arm the wake-up at the earlier deadline.
+	e.noteStateDeadlineLocked(plumtreeStateDeadline(state.firstSeen, true))
 	e.delivered.add(state.broadcastID)
 	data := state.decodeBuffer
 	e.releaseFECDecoderLocked(state)
@@ -557,18 +547,15 @@ func (e *plumtreeEngine) checkPayloadOriginLocked(
 			fmt.Errorf("original sender ignores Plumtree payload")
 	}
 
-	switch payloadContext.origin {
-	case plumtreePayloadOriginPush:
+	// An unset expectedKey means this was pushed to us, not requested: a repair's
+	// key always carries a non-zero broadcast id.
+	if payloadContext.expectedKey == (plumtreePartKey{}) {
 		if !slot.hasEager(payloadContext.from) {
 			return e.pruneActions(now, payloadContext.from, key),
 				fmt.Errorf("unsolicited Plumtree payload from non-eager peer")
 		}
-	case plumtreePayloadOriginRepair:
-		if payloadContext.expectedKey != key {
-			return plumtreeActions{}, fmt.Errorf("Plumtree repair response key mismatch")
-		}
-	default:
-		panic("invalid Plumtree payload origin")
+	} else if payloadContext.expectedKey != key {
+		return plumtreeActions{}, fmt.Errorf("Plumtree repair response key mismatch")
 	}
 
 	return plumtreeActions{}, nil
@@ -603,7 +590,7 @@ func (e *plumtreeEngine) recheckSimpleLocked(
 		return plumtreeActions{}, errPlumtreeClosed
 	}
 
-	if !e.hasStateLocked(key.broadcastID) && e.delivered.contains(key.broadcastID) {
+	if e.isSettledBroadcastLocked(key.broadcastID) {
 		return plumtreeActions{}, fmt.Errorf("known Plumtree simple broadcast")
 	}
 	return e.checkDuplicateSimpleLocked(now, from, key)
@@ -707,6 +694,9 @@ func (e *plumtreeEngine) recheckFECLocked(
 		decoderEstimatedBytes: decoderEstimatedBytes,
 	}
 	e.addFECStateLocked(state)
+	// Announcements for this broadcast may already be buffered; now that there is
+	// state to hang a deadline on, arm it from the earliest of them.
+	e.armFECRepairForStateLocked(state)
 	return state, plumtreeActions{}, nil
 }
 
@@ -775,13 +765,24 @@ func (e *plumtreeEngine) forwardPayloadToActiveLocked(
 	slot := &e.slots[part.treeIndex]
 	e.removeInactiveEagerLocked(slot, now, verdicts)
 
+	var lazyPeers [plumtreeActiveNeighbourLimit]PeerID
+	lazyCount := 0
+	for _, peer := range active {
+		if peer == e.localID || peer == from || slot.hasEager(peer) {
+			continue
+		}
+		lazyPeers[lazyCount] = peer
+		lazyCount++
+	}
+
 	controlCount := 0
 	if !from.IsZero() {
 		controlCount = 1
 	}
+	iHaveCapacity := max(0, plumtreeIHaveFanout-int(part.advertisedCount))
 	actions.Outbounds = slices.Grow(
 		actions.Outbounds,
-		controlCount+int(slot.eagerCount)+len(active),
+		controlCount+int(slot.eagerCount)+min(lazyCount, iHaveCapacity),
 	)
 	if !from.IsZero() {
 		actions.Outbounds = append(
@@ -799,16 +800,26 @@ func (e *plumtreeEngine) forwardPayloadToActiveLocked(
 		e.sendPayloadLocked(now, peer, slot, part, verdicts, actions)
 	}
 
-	for _, peer := range active {
-		if peer == e.localID || peer == from || slot.hasEager(peer) {
-			continue
+	randomize := lazyCount > iHaveCapacity
+	for i := 0; i < lazyCount &&
+		int(part.advertisedCount) < plumtreeIHaveFanout; i++ {
+		if randomize {
+			j := i + rand.IntN(lazyCount-i)
+			lazyPeers[i], lazyPeers[j] = lazyPeers[j], lazyPeers[i]
 		}
-		e.sendIHaveLocked(now, peer, slot, part, iHaveControl, actions)
+		e.sendIHaveLocked(
+			now,
+			lazyPeers[i],
+			slot,
+			part,
+			iHaveControl,
+			actions,
+		)
 	}
 }
 
-// sendPayloadLocked needs a roster verdict because eager peers are promoted
-// from inbound senders and may be absent from the active snapshot.
+// Needs a roster verdict: eager peers are promoted from inbound senders and may
+// be absent from the active snapshot.
 func (e *plumtreeEngine) sendPayloadLocked(
 	now time.Time,
 	peer PeerID,
@@ -838,8 +849,8 @@ func (e *plumtreeEngine) sendPayloadLocked(
 	return true
 }
 
-// sendIHaveLocked trusts the active snapshot: it was already filtered by the
-// same roster predicate plus QUIC readiness within the accepted snapshot TTL.
+// Trusts the active snapshot: already filtered by the same roster predicate plus
+// QUIC readiness within the snapshot TTL.
 func (e *plumtreeEngine) sendIHaveLocked(
 	now time.Time,
 	peer PeerID,
@@ -952,6 +963,7 @@ func plumtreeUnixSeconds(now time.Time) float64 {
 }
 
 func (e *plumtreeEngine) addFECStateLocked(state *plumtreeFECState) {
+	e.noteStateDeadlineLocked(plumtreeStateDeadline(state.firstSeen, state.isDelivered))
 	state.previous = e.fecNewest
 	if e.fecNewest != nil {
 		e.fecNewest.next = state
@@ -963,6 +975,7 @@ func (e *plumtreeEngine) addFECStateLocked(state *plumtreeFECState) {
 }
 
 func (e *plumtreeEngine) addSimpleStateLocked(state *plumtreeSimpleState) {
+	e.noteStateDeadlineLocked(plumtreeStateDeadline(state.firstSeen, true))
 	state.previous = e.simpleNewest
 	if e.simpleNewest != nil {
 		e.simpleNewest.next = state

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -537,6 +538,9 @@ func TestShardStateResolverUsesUpdatedCurrentState(t *testing.T) {
 }
 
 type fakeShardStateResolverEnv struct {
+	// mu guards every field: the resolver calls these callbacks from its own
+	// worker pool, and the apply-ahead stage adds a second concurrent caller.
+	mu           sync.Mutex
 	states       map[storage.BlockRootHash]*storage.BlockState
 	blocks       map[storage.BlockRootHash]PreparedBlock
 	stateLoads   map[storage.BlockRootHash]int
@@ -557,10 +561,14 @@ func newFakeShardStateResolverEnv() *fakeShardStateResolverEnv {
 }
 
 func (e *fakeShardStateResolverEnv) addState(block ton.BlockIDExt) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.states[storage.BlockKey(block)] = &storage.BlockState{Block: block}
 }
 
 func (e *fakeShardStateResolverEnv) addBlock(block ton.BlockIDExt, prevRefs ...ton.BlockIDExt) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.blocks[storage.BlockKey(block)] = PreparedBlock{
 		ID: block,
 		Meta: &storage.BlockMeta{
@@ -571,6 +579,8 @@ func (e *fakeShardStateResolverEnv) addBlock(block ton.BlockIDExt, prevRefs ...t
 }
 
 func (e *fakeShardStateResolverEnv) loadState(_ context.Context, state storage.BlockState) (*storage.BlockState, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	key := storage.BlockKey(state.Block)
 	e.stateLoads[key]++
 	e.stateLoadSeq = append(e.stateLoadSeq, state.Block)
@@ -583,6 +593,8 @@ func (e *fakeShardStateResolverEnv) loadState(_ context.Context, state storage.B
 }
 
 func (e *fakeShardStateResolverEnv) loadBlock(_ context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	key := storage.BlockKey(block)
 	e.blockLoads[key]++
 	e.blockLoadSeq = append(e.blockLoadSeq, block)
@@ -606,11 +618,15 @@ func (e *fakeShardStateResolverEnv) apply(_ context.Context, target ton.BlockIDE
 			return nil, fmt.Errorf("previous[%d] = %s, want %s", i, storage.FormatBlockRef(prev.Block), storage.FormatBlockRef(downloaded.Meta.PrevRefs[i]))
 		}
 	}
+	e.mu.Lock()
 	e.applied = append(e.applied, target)
+	e.mu.Unlock()
 	return &storage.BlockState{Block: target}, nil
 }
 
 func (e *fakeShardStateResolverEnv) save(_ context.Context, state *storage.BlockState) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.saved = append(e.saved, state.Block)
 	e.states[storage.BlockKey(state.Block)] = storage.CloneBlockState(state)
 	return nil

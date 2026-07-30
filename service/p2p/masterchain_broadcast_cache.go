@@ -83,15 +83,15 @@ func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock
 	if err := n.masterchainNextBroadcastCache.storeAt(*downloaded, time.Now()); err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", tnstore.FormatBlockRef(downloaded.ID)).
+			Stringer("block", tnstore.BlockRef(downloaded.ID)).
 			Msg("dropping masterchain block broadcast from next cache")
 		return false
 	}
 
 	prev := downloaded.Meta.PrevRefs[0]
 	n.log.Debug().
-		Str("block", tnstore.FormatBlockRef(downloaded.ID)).
-		Str("prev", tnstore.FormatBlockRef(prev)).
+		Stringer("block", tnstore.BlockRef(downloaded.ID)).
+		Stringer("prev", tnstore.BlockRef(prev)).
 		Msg("cached masterchain block broadcast")
 	n.notifyMasterchainNextBroadcastBlock(prev)
 	return true

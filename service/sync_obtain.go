@@ -30,6 +30,15 @@ func contextWithShardObtainRecorder(ctx context.Context, recorder *shardObtainRe
 	return context.WithValue(ctx, shardObtainRecorderContextKey{}, recorder)
 }
 
+// shardObtainRecorderFromContext lets a caller hand its own recorder to the
+// shard resolution it is about to start, so downloads performed by the
+// apply-ahead stage are still attributed to the master block that needed them
+// once the commit stage reports its obtain stats.
+func shardObtainRecorderFromContext(ctx context.Context) *shardObtainRecorder {
+	recorder, _ := ctx.Value(shardObtainRecorderContextKey{}).(*shardObtainRecorder)
+	return recorder
+}
+
 func observeShardBlockObtain(ctx context.Context, started time.Time) {
 	recorder, _ := ctx.Value(shardObtainRecorderContextKey{}).(*shardObtainRecorder)
 	if recorder == nil {

@@ -262,6 +262,7 @@ func (w *shardClientArchiveWindow) releaseImportedData() {
 	w.masterProofs = nil
 	w.archiveBlocks = nil
 	w.archiveImports = nil
+	w.shardTargets = nil
 	w.stateCells = nil
 	w.appliedStates = appliedStateSet{}
 }

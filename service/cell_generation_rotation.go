@@ -428,10 +428,7 @@ func (s *Service) requestCellGenerationSwitch(generation uint64, target ton.Bloc
 			Msg("cell generation switch requested")
 	}
 
-	select {
-	case s.currentStateWake <- struct{}{}:
-	default:
-	}
+	s.broadcastCurrentStateWake()
 }
 
 func (s *Service) clearCellGenerationSwitchRequest() {

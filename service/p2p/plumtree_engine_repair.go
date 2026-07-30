@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+// The fields are already range-checked by the message validators.
+func plumtreeControlKey(broadcastID []byte, partIndex, treeIndex int32) plumtreePartKey {
+	var key plumtreePartKey
+	copy(key.broadcastID[:], broadcastID)
+	key.partIndex = partIndex
+	key.treeIndex = treeIndex
+	return key
+}
+
 func (e *plumtreeEngine) HandleIHave(
 	ctx context.Context,
 	now time.Time,
@@ -23,12 +32,11 @@ func (e *plumtreeEngine) HandleIHave(
 		return plumtreeActions{}, err
 	}
 
-	var broadcastID [sha256.Size]byte
-	copy(broadcastID[:], message.BroadcastID)
-	key := plumtreePartKey{
-		broadcastID: broadcastID,
-		partIndex:   message.PartIndex,
-		treeIndex:   message.TreeIndex,
+	key := plumtreeControlKey(message.BroadcastID, message.PartIndex, message.TreeIndex)
+
+	source, certificate, err := decodePlumtreeIdentity(message.Source, message.Certificate)
+	if err != nil {
+		return plumtreeActions{}, err
 	}
 
 	e.mu.Lock()
@@ -40,12 +48,21 @@ func (e *plumtreeEngine) HandleIHave(
 		e.mu.Unlock()
 		return plumtreeActions{}, nil
 	}
-	e.mu.Unlock()
-
-	source, certificate, err := decodePlumtreeIdentity(message.Source, message.Certificate)
-	if err != nil {
-		return plumtreeActions{}, err
+	// Two cases must verify now instead of deferring: with no eager peer in the
+	// tree there is nothing to wait for, and a simple broadcast has no partial
+	// state to hang a deadline on.
+	//
+	// Deliberately NOT a case: "we hold no state for this broadcast". That is what
+	// a fabricated broadcast id looks like, so verifying those on arrival hands an
+	// attacker back the very cost this path avoids. A stale eager slot is broken by
+	// expireInactiveEagerLocked instead.
+	if key.treeIndex != plumtreeSimpleTree && e.slots[key.treeIndex].eagerCount > 0 {
+		e.bufferAnnouncementLocked(key, from, source, certificate, message, now)
+		e.armFECRepairLocked(key, now)
+		e.mu.Unlock()
+		return plumtreeActions{}, nil
 	}
+	e.mu.Unlock()
 
 	var signedData []byte
 	if message.TreeIndex == plumtreeSimpleTree {
@@ -71,6 +88,7 @@ func (e *plumtreeEngine) HandleIHave(
 		)
 	}
 
+	plumtreeIHaveVerifiableTotal.Add(1)
 	_, err = e.verifier.VerifyPlumtree(ctx, plumtreeVerification{
 		From:        from,
 		Source:      source,
@@ -82,8 +100,7 @@ func (e *plumtreeEngine) HandleIHave(
 	if err != nil {
 		return plumtreeActions{}, err
 	}
-	// Only the two timestamp windows can go stale during verification; the
-	// remaining fields were fully validated at entry and are value copies.
+	// Only the timestamp windows can go stale during verification.
 	commitNow := e.now()
 	if err = validatePlumtreeTimestamp(message.Timestamp, commitNow); err != nil {
 		return plumtreeActions{}, err
@@ -131,10 +148,16 @@ func (e *plumtreeEngine) ignoreIHaveLocked(
 	key plumtreePartKey,
 	from PeerID,
 ) bool {
-	if !e.hasStateLocked(key.broadcastID) && e.delivered.contains(key.broadcastID) {
+	if e.isSettledBroadcastLocked(key.broadcastID) {
 		return true
 	}
 	if e.getPartLocked(key) != nil {
+		return true
+	}
+
+	// Per-peer dedup only; the cap across peers is applied when candidates are
+	// selected, keeping it off the per-message path.
+	if e.hasAnnouncementLocked(key, from) {
 		return true
 	}
 
@@ -162,13 +185,7 @@ func (e *plumtreeEngine) HandlePrune(
 		return err
 	}
 
-	var broadcastID [sha256.Size]byte
-	copy(broadcastID[:], message.BroadcastID)
-	key := plumtreePartKey{
-		broadcastID: broadcastID,
-		partIndex:   message.PartIndex,
-		treeIndex:   message.TreeIndex,
-	}
+	key := plumtreeControlKey(message.BroadcastID, message.PartIndex, message.TreeIndex)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -176,7 +193,7 @@ func (e *plumtreeEngine) HandlePrune(
 	if e.closed {
 		return errPlumtreeClosed
 	}
-	if !e.hasStateLocked(key.broadcastID) && e.delivered.contains(key.broadcastID) {
+	if e.isSettledBroadcastLocked(key.broadcastID) {
 		return nil
 	}
 	part := e.getPartLocked(key)
@@ -201,13 +218,7 @@ func (e *plumtreeEngine) HandleUseful(
 		return err
 	}
 
-	var broadcastID [sha256.Size]byte
-	copy(broadcastID[:], message.BroadcastID)
-	key := plumtreePartKey{
-		broadcastID: broadcastID,
-		partIndex:   message.PartIndex,
-		treeIndex:   message.TreeIndex,
-	}
+	key := plumtreeControlKey(message.BroadcastID, message.PartIndex, message.TreeIndex)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -215,7 +226,7 @@ func (e *plumtreeEngine) HandleUseful(
 	if e.closed {
 		return errPlumtreeClosed
 	}
-	if !e.hasStateLocked(key.broadcastID) && e.delivered.contains(key.broadcastID) {
+	if e.isSettledBroadcastLocked(key.broadcastID) {
 		return nil
 	}
 	part := e.getPartLocked(key)
@@ -243,13 +254,7 @@ func (e *plumtreeEngine) HandleRepairQuery(
 		return nil, err
 	}
 
-	var broadcastID [sha256.Size]byte
-	copy(broadcastID[:], request.BroadcastID)
-	key := plumtreePartKey{
-		broadcastID: broadcastID,
-		partIndex:   request.PartIndex,
-		treeIndex:   request.TreeIndex,
-	}
+	key := plumtreeControlKey(request.BroadcastID, request.PartIndex, request.TreeIndex)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -296,11 +301,28 @@ func (e *plumtreeEngine) Alarm(now time.Time) plumtreeActions {
 		return plumtreeActions{}
 	}
 
+	// Scanned here rather than in NextAlarm, which runs after every message.
+	e.pendingExpireNext = time.Time{}
 	for i := range e.slots {
-		e.slots[i].expirePending(now)
+		slot := &e.slots[i]
+		slot.expirePending(now)
+		for j := range int(slot.pendingCount) {
+			e.notePendingDeadlineLocked(
+				slot.pending[j].sent.Add(plumtreePendingFeedbackTTL),
+			)
+		}
 	}
+	// Sweeping here, not while forwarding a payload, is what makes the inactivity
+	// TTL apply to a neighbour that stopped sending - the case that matters.
+	e.expireInactiveEagerLocked(now)
+	e.expireAnnouncementsLocked(now)
 
 	var actions plumtreeActions
+	// Before draining repairs: expiry moves ids into e.delivered, and a repair for
+	// a state removed two statements later would be dead on arrival.
+	e.expireBroadcastsLocked(now)
+	actions.Candidates = e.dueFECRepairsLocked(now, actions.Candidates)
+
 	for e.missingOldest != nil {
 		missing := e.missingOldest
 		if missing.repairAt.After(now) {
@@ -310,21 +332,52 @@ func (e *plumtreeEngine) Alarm(now time.Time) plumtreeActions {
 		e.eraseMissingLocked(missing.key)
 	}
 
-	expiredBefore := now.Add(-plumtreeBroadcastLifetime)
-	for e.fecOldest != nil && !e.fecOldest.firstSeen.After(expiredBefore) {
-		state := e.fecOldest
-		if state.isDelivered && !e.isOriginalSender {
-			e.stats.NoteFECPartsCollected(uint32(state.partCount))
-		}
-		e.removeFECStateLocked(state)
-		e.delivered.add(state.broadcastID)
-	}
-	for e.simpleOldest != nil && !e.simpleOldest.firstSeen.After(expiredBefore) {
-		state := e.simpleOldest
-		e.removeSimpleStateLocked(state)
-		e.delivered.add(state.broadcastID)
-	}
 	return actions
+}
+
+// An assembled broadcast expires sooner than one still collecting parts, so the
+// firstSeen-ordered list is not deadline-ordered and has to be walked whole. It is
+// bounded by the state budget.
+func (e *plumtreeEngine) expireBroadcastsLocked(now time.Time) {
+	e.stateExpireNext = time.Time{}
+
+	for state := e.fecOldest; state != nil; {
+		next := state.next
+		if deadline := plumtreeStateDeadline(state.firstSeen, state.isDelivered); !now.Before(deadline) {
+			if state.isDelivered && !e.isOriginalSender {
+				e.stats.NoteFECPartsCollected(uint32(state.partCount))
+			}
+			e.removeFECStateLocked(state)
+			e.delivered.add(state.broadcastID)
+		} else {
+			e.noteStateDeadlineLocked(deadline)
+		}
+		state = next
+	}
+
+	for state := e.simpleOldest; state != nil; {
+		next := state.next
+		if deadline := plumtreeStateDeadline(state.firstSeen, true); !now.Before(deadline) {
+			e.removeSimpleStateLocked(state)
+			e.delivered.add(state.broadcastID)
+		} else {
+			e.noteStateDeadlineLocked(deadline)
+		}
+		state = next
+	}
+}
+
+func plumtreeStateDeadline(firstSeen time.Time, delivered bool) time.Time {
+	if delivered {
+		return firstSeen.Add(plumtreeDeliveredStateTTL)
+	}
+	return firstSeen.Add(plumtreePendingStateTTL)
+}
+
+func (e *plumtreeEngine) noteStateDeadlineLocked(deadline time.Time) {
+	if e.stateExpireNext.IsZero() || deadline.Before(e.stateExpireNext) {
+		e.stateExpireNext = deadline
+	}
 }
 
 func (e *plumtreeEngine) NextAlarm() (time.Time, bool) {
@@ -342,32 +395,53 @@ func (e *plumtreeEngine) NextAlarm() (time.Time, bool) {
 		next = e.missingOldest.repairAt
 		hasNext = true
 	}
-	if e.fecOldest != nil {
-		deadline := e.fecOldest.firstSeen.Add(plumtreeBroadcastLifetime)
-		if !hasNext || deadline.Before(next) {
-			next = deadline
-			hasNext = true
-		}
+	if !e.fecRepairNext.IsZero() && (!hasNext || e.fecRepairNext.Before(next)) {
+		next = e.fecRepairNext
+		hasNext = true
 	}
-	if e.simpleOldest != nil {
-		deadline := e.simpleOldest.firstSeen.Add(plumtreeBroadcastLifetime)
-		if !hasNext || deadline.Before(next) {
-			next = deadline
-			hasNext = true
-		}
+	if !e.stateExpireNext.IsZero() && (!hasNext || e.stateExpireNext.Before(next)) {
+		next = e.stateExpireNext
+		hasNext = true
 	}
-	for i := range e.slots {
-		slot := &e.slots[i]
-		for j := range int(slot.pendingCount) {
-			deadline := slot.pending[j].sent.Add(plumtreePendingFeedbackTTL)
-			if !hasNext || deadline.Before(next) {
-				next = deadline
-				hasNext = true
-			}
-		}
+	if !e.pendingExpireNext.IsZero() && (!hasNext || e.pendingExpireNext.Before(next)) {
+		next = e.pendingExpireNext
+		hasNext = true
 	}
 
 	return next, hasNext
+}
+
+// Keeps pendingExpireNext a lower bound on the earliest pending deadline: a stale
+// value costs one extra wake-up, never a missed deadline.
+func (e *plumtreeEngine) notePendingDeadlineLocked(deadline time.Time) {
+	if e.pendingExpireNext.IsZero() || deadline.Before(e.pendingExpireNext) {
+		e.pendingExpireNext = deadline
+	}
+}
+
+// The size comes from the validated announcement and becomes the RLDP answer
+// budget.
+func (e *plumtreeEngine) newRepairLocked(
+	now time.Time,
+	key plumtreePartKey,
+	peer PeerID,
+	dataSize int32,
+) plumtreeRepairAction {
+	repairID := e.nextRepairIDLocked()
+	plumtreeRepairRequestsTotal.Add(1)
+	e.repairs[repairID] = plumtreeRepairAttempt{from: peer, key: key}
+	return plumtreeRepairAction{
+		ID: repairID,
+		To: peer,
+		Request: RepairPlumtreePart{
+			BroadcastID: key.broadcastID[:],
+			Timestamp:   plumtreeUnixSeconds(now),
+			PartIndex:   key.partIndex,
+			TreeIndex:   key.treeIndex,
+		},
+		Timeout:       plumtreeRepairTimeout,
+		MaxAnswerSize: uint64(dataSize) + plumtreeRepairMTUOverhead,
+	}
 }
 
 func (e *plumtreeEngine) startRepairRequestsLocked(
@@ -382,23 +456,10 @@ func (e *plumtreeEngine) startRepairRequestsLocked(
 			continue
 		}
 
-		repairID := e.nextRepairIDLocked()
-		e.repairs[repairID] = plumtreeRepairAttempt{
-			from: peer,
-			key:  missing.key,
-		}
-		actions.Repairs = append(actions.Repairs, plumtreeRepairAction{
-			ID: repairID,
-			To: peer,
-			Request: RepairPlumtreePart{
-				BroadcastID: missing.key.broadcastID[:],
-				Timestamp:   plumtreeUnixSeconds(now),
-				PartIndex:   missing.key.partIndex,
-				TreeIndex:   missing.key.treeIndex,
-			},
-			Timeout:       plumtreeRepairTimeout,
-			MaxAnswerSize: uint64(missing.dataSize) + plumtreeRepairMTUOverhead,
-		})
+		actions.Repairs = append(
+			actions.Repairs,
+			e.newRepairLocked(now, missing.key, peer, missing.dataSize),
+		)
 	}
 }
 
@@ -431,6 +492,12 @@ func (e *plumtreeEngine) takeRepairAttempt(
 	}
 	delete(e.repairs, repairID)
 	return attempt, nil
+}
+
+// No state of our own and already delivered: control messages about it are noise
+// from peers that have not caught up yet.
+func (e *plumtreeEngine) isSettledBroadcastLocked(id [sha256.Size]byte) bool {
+	return !e.hasStateLocked(id) && e.delivered.contains(id)
 }
 
 func (e *plumtreeEngine) hasStateLocked(id [sha256.Size]byte) bool {
@@ -503,8 +570,7 @@ func (e *plumtreeEngine) removeFECStateLocked(state *plumtreeFECState) {
 		1,
 		state.retainedWireBytes+state.decoderEstimatedBytes,
 	)
-	// Zero the accounting so a decode finishing concurrently with this eviction
-	// cannot release the same bytes twice; budget.release panics on underflow.
+	// So a decode finishing concurrently cannot release the same bytes twice.
 	state.retainedWireBytes = 0
 	state.decoderEstimatedBytes = 0
 }

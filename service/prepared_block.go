@@ -69,7 +69,7 @@ func parsePreparedBlock(block PreparedBlock) (*tlb.Block, error) {
 	return storage.ParseVerifiedBlockCell(block.ID, block.BlockRoot)
 }
 
-func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error) {
+func (s *Service) verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error) {
 	if len(downloaded.BlockBOC) == 0 {
 		return VerifiedBlock{}, fmt.Errorf("block %s has no block BOC", downloaded.BlockRef())
 	}
@@ -84,7 +84,7 @@ func verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error
 
 	var consensus *masterchainConsensusProof
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard && downloaded.Proof != nil {
-		consensus, _, err = prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof, downloaded.SignaturesVerifiedKey)
+		consensus, err = s.prepareMasterchainConsensusProof(downloaded.ID, downloaded.Proof, downloaded.SignaturesVerifiedKey)
 		if err != nil {
 			return VerifiedBlock{}, fmt.Errorf("prepare masterchain consensus proof %s: %w", downloaded.BlockRef(), err)
 		}
@@ -116,28 +116,20 @@ func prepareVerifiedBlockForApply(block VerifiedBlock) (PreparedBlock, error) {
 	started := time.Now()
 	cells, err := storage.PrepareStateUpdateCells(block.StateUpdate)
 	if err != nil {
-		return PreparedBlock{}, fmt.Errorf("prepare state update target cells for %s: %w", block.BlockRef(), err)
+		return PreparedBlock{}, prepareStateUpdateCellsError(block, err)
 	}
 
 	return preparedBlockWithStateCells(block, cells, time.Since(started)), nil
 }
 
+func prepareStateUpdateCellsError(block VerifiedBlock, err error) error {
+	return fmt.Errorf("prepare state update target cells for %s: %w", block.BlockRef(), err)
+}
+
 func prepareVerifiedMasterchainBlockForNextSync(prev ton.BlockIDExt, block VerifiedBlock) (PreparedBlock, error) {
 	started := time.Now()
-	if block.ID.Workchain != -1 || block.ID.Shard != topShard {
-		return PreparedBlock{}, fmt.Errorf("next-sync block %s is not masterchain", block.BlockRef())
-	}
-	if len(block.Meta.PrevRefs) != 1 {
-		return PreparedBlock{}, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
-	}
-	if !block.Meta.PrevRefs[0].Equals(&prev) {
-		return PreparedBlock{}, fmt.Errorf("%w: block=%s prev=%s expected=%s", errMasterchainPrevMismatch, block.BlockRef(), storage.FormatBlockRef(block.Meta.PrevRefs[0]), storage.FormatBlockRef(prev))
-	}
-	if block.consensus == nil || !block.consensus.block.Equals(&block.ID) {
-		return PreparedBlock{}, fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
-	}
-	if !block.consensus.prevRef.Equals(&prev) {
-		return PreparedBlock{}, fmt.Errorf("%w: block=%s consensus_prev=%s expected=%s", errMasterchainPrevMismatch, block.BlockRef(), storage.FormatBlockRef(block.consensus.prevRef), storage.FormatBlockRef(prev))
+	if err := checkVerifiedMasterchainBlockFollows(prev, block); err != nil {
+		return PreparedBlock{}, err
 	}
 	prepared, err := prepareVerifiedBlockForApply(block)
 	if err != nil {
@@ -145,6 +137,28 @@ func prepareVerifiedMasterchainBlockForNextSync(prev ton.BlockIDExt, block Verif
 	}
 	prepared.PrepareElapsed = time.Since(started)
 	return prepared, nil
+}
+
+// checkVerifiedMasterchainBlockFollows is the cheap gate that must run before
+// the expensive cell preparation, so a late or forked broadcast is rejected
+// without paying for a state-update walk.
+func checkVerifiedMasterchainBlockFollows(prev ton.BlockIDExt, block VerifiedBlock) error {
+	if block.ID.Workchain != -1 || block.ID.Shard != topShard {
+		return fmt.Errorf("next-sync block %s is not masterchain", block.BlockRef())
+	}
+	if len(block.Meta.PrevRefs) != 1 {
+		return fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
+	}
+	if !block.Meta.PrevRefs[0].Equals(&prev) {
+		return fmt.Errorf("%w: block=%s prev=%s expected=%s", errMasterchainPrevMismatch, block.BlockRef(), storage.FormatBlockRef(block.Meta.PrevRefs[0]), storage.FormatBlockRef(prev))
+	}
+	if block.consensus == nil || !block.consensus.block.Equals(&block.ID) {
+		return fmt.Errorf("masterchain block %s has no prepared consensus proof", block.BlockRef())
+	}
+	if !block.consensus.prevRef.Equals(&prev) {
+		return fmt.Errorf("%w: block=%s consensus_prev=%s expected=%s", errMasterchainPrevMismatch, block.BlockRef(), storage.FormatBlockRef(block.consensus.prevRef), storage.FormatBlockRef(prev))
+	}
+	return nil
 }
 
 func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRecords, elapsed time.Duration) PreparedBlock {
@@ -166,9 +180,9 @@ func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRec
 	}
 }
 
-func prepareDownloadedBlockForApply(downloaded p2p.DownloadedBlock) (PreparedBlock, error) {
+func (s *Service) prepareDownloadedBlockForApply(downloaded p2p.DownloadedBlock) (PreparedBlock, error) {
 	started := time.Now()
-	block, err := verifyDownloadedBlock(downloaded)
+	block, err := s.verifyDownloadedBlock(downloaded)
 	if err != nil {
 		return PreparedBlock{}, err
 	}

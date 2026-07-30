@@ -192,7 +192,7 @@ func signedTestSimpleBroadcast(tb testing.TB, payload tl.Serializable) overlay.B
 func TestUnlistedPublicBroadcastArrivingAsRLDPMessageUsesResolver(t *testing.T) {
 	peerID := testPeerID("unlisted-rldp-peer")
 	node := newTestNode(t)
-	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver, nil)
+	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver, nil, nil)
 	publicOverlayID := testPeerID("rldp-public-overlay")
 	sub := mustGetOrCreateSubscription(t, node, overlaySpec{
 		Name:    "public.rldp",
@@ -240,7 +240,7 @@ func TestUnlistedPublicBroadcastArrivingAsRLDPMessageUsesResolver(t *testing.T) 
 
 func TestPublicBroadcastReceiverResolverLifecycleAndCustomIsolation(t *testing.T) {
 	node := newTestNode(t)
-	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver, nil)
+	node.pool = newPeerPool(nil, node.resolvePublicBroadcastReceiver, nil, nil)
 	publicOverlayID := testPeerID("resolver-lifecycle-public")
 	publicSpec := overlaySpec{
 		Name:    "public.lifecycle",

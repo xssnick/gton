@@ -125,7 +125,7 @@ func TestApplyBlockFromFixture(t *testing.T) {
 		t.Fatalf("build current state from old update branch: %v", err)
 	}
 
-	prepared, err := prepareDownloadedBlockForApply(*downloaded)
+	prepared, err := (&Service{}).prepareDownloadedBlockForApply(*downloaded)
 	if err != nil {
 		t.Fatalf("prepare block: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestPrepareDownloadedBlockForApplyRejectsUnverifiedRootHash(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
 	downloaded.VerifiedRootHash = false
 
-	_, err := prepareDownloadedBlockForApply(*downloaded)
+	_, err := (&Service{}).prepareDownloadedBlockForApply(*downloaded)
 	if err == nil || !strings.Contains(err.Error(), "root hash is not verified") {
 		t.Fatalf("prepare downloaded block error = %v, want unverified root hash", err)
 	}
@@ -218,7 +218,7 @@ func TestPrepareDownloadedBlockForApplyRejectsUnverifiedRootHash(t *testing.T) {
 
 func TestApplyStoredMasterchainTransitionDoesNotRequireProof(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
-	prepared, err := prepareDownloadedBlockForApply(*downloaded)
+	prepared, err := (&Service{}).prepareDownloadedBlockForApply(*downloaded)
 	if err != nil {
 		t.Fatalf("prepare fixture block: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestApplyBlockRejectsWrongCurrentState(t *testing.T) {
 		StateRootHash: bytes32(0x42),
 	}
 
-	prepared, err := prepareDownloadedBlockForApply(*downloaded)
+	prepared, err := (&Service{}).prepareDownloadedBlockForApply(*downloaded)
 	if err != nil {
 		t.Fatalf("prepare block: %v", err)
 	}
@@ -1099,7 +1099,7 @@ func TestArchiveStateCellOverlayByteSizeTracksActiveAndPendingCells(t *testing.T
 func TestArchiveStateCellOverlayAdoptsWindowCellsOnEmission(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x53, 8).EndCell()
 	windowCells := newTestStateCellWindowCache(nil)
-	if err := windowCells.rememberApplied(root, mustPreparedReachableStateCells(t, root)); err != nil {
+	if err := rememberAppliedForTest(windowCells, root, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember window cells: %v", err)
 	}
 
@@ -1204,6 +1204,11 @@ func TestStateCellEncodedCacheMemoInvalidatedOnRecordReplacement(t *testing.T) {
 	cache := newStateCellEncodedCache(1)
 	if err := cache.stageRecords(mustPreparedReachableStateCells(t, root), nil).enqueue(); err != nil {
 		t.Fatalf("add records: %v", err)
+	}
+	// The memo slots this test is about live in the base map, so fold the
+	// staged layer into it first.
+	if folded, owed := cache.foldLayers(1, 1<<20); folded != 1 || owed {
+		t.Fatalf("fold staged layer = (%d, %v), want (1, false)", folded, owed)
 	}
 
 	first, err := cache.loadWith(root.HashKey(), nil)

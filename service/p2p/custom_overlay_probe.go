@@ -91,7 +91,7 @@ func nextFixedProbeDelay(policy fixedProbePolicy) time.Duration {
 }
 
 func (s *overlaySubscription) startProbeFixedPeers(ctx context.Context, policy fixedProbePolicy) {
-	if s.spec.Kind != overlayKindCustomFixed || !s.beginFixedProbe() {
+	if !s.spec.runsFixedPeerProbes() || !s.beginFixedProbe() {
 		return
 	}
 	s.node.runAsync(func() {
@@ -101,7 +101,7 @@ func (s *overlaySubscription) startProbeFixedPeers(ctx context.Context, policy f
 }
 
 func (s *overlaySubscription) probeFixedPeers(ctx context.Context, policy fixedProbePolicy) {
-	if !s.isActive() || s.spec.Kind != overlayKindCustomFixed {
+	if !s.isActive() || !s.spec.runsFixedPeerProbes() {
 		return
 	}
 	s.runPeerMaintenance(ctx, s.peersSnapshot(), fixedProbeParallelism, func(ctx context.Context, peer *overlayPeer) {
@@ -173,7 +173,7 @@ type fixedRecoveryState struct {
 }
 
 func (s *overlaySubscription) evaluateFixedPeerRecovery(ctx context.Context, peer *overlayPeer, now time.Time, policy fixedProbePolicy) {
-	if s.spec.Kind != overlayKindCustomFixed {
+	if !s.spec.runsFixedPeerProbes() {
 		return
 	}
 	stats, ok := peer.adnlPairStats()

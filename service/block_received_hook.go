@@ -30,6 +30,16 @@ func newBlockReceivedHookRunner(log zerolog.Logger, extension hooks.Extension) *
 }
 
 func (s *Service) ObserveBlockReceived(ctx context.Context, event p2p.BlockReceivedEvent) {
+	if event.FromBroadcast && event.IsSigned && event.Downloaded != nil {
+		// A decoded shard broadcast typically lands hundreds of ms before the
+		// master that includes it; preparing it now turns the commit-stage
+		// resolve into a take of ready state-update cells (masterchain blocks
+		// are rejected by the enqueue).
+		s.enqueueShardBlockPrepare(shardPrepareRequest{
+			block:      event.Downloaded.ID,
+			downloaded: event.Downloaded,
+		})
+	}
 	if s.blockReceivedHooks == nil {
 		return
 	}

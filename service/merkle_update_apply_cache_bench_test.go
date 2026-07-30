@@ -76,6 +76,52 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 		}
 	})
 
+	b.Run("staged-layer-root-hit", func(b *testing.B) {
+		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
+		if _, err := cache.stagePreparedRecords(records); err != nil {
+			b.Fatalf("stage prepared records: %v", err)
+		}
+		load := cache.loader()
+
+		b.ReportAllocs()
+		for b.Loop() {
+			loaded, err := load(rootHash)
+			if err != nil {
+				b.Fatalf("load root: %v", err)
+			}
+			if loaded.HashKey() != rootHash {
+				b.Fatalf("loaded root hash mismatch")
+			}
+		}
+	})
+
+	// The worst case the applier-side valve allows: the wanted cell sits in the
+	// oldest of a full set of staged layers, so every layer is probed first.
+	b.Run("oldest-of-max-staged-layers", func(b *testing.B) {
+		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
+		if _, err := cache.stagePreparedRecords(records); err != nil {
+			b.Fatalf("stage prepared records: %v", err)
+		}
+		for i := 0; i < stateCellWindowMaxStagedLayers-1; i++ {
+			other := cell.BeginCell().MustStoreUInt(uint64(i+1), 32).EndCell()
+			if _, err := cache.stagePreparedRecords(mustPreparedReachableStateCells(b, other)); err != nil {
+				b.Fatalf("stage prepared records: %v", err)
+			}
+		}
+		load := cache.loader()
+
+		b.ReportAllocs()
+		for b.Loop() {
+			loaded, err := load(rootHash)
+			if err != nil {
+				b.Fatalf("load root: %v", err)
+			}
+			if loaded.HashKey() != rootHash {
+				b.Fatalf("loaded root hash mismatch")
+			}
+		}
+	})
+
 	b.Run("newest-of-32-pending", func(b *testing.B) {
 		cache := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
 		cache.active = newStateCellEncodedCache(1)
@@ -106,6 +152,74 @@ func BenchmarkStateCellWindowCacheLoader(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkStateCellCacheStageRecords is the applier-side staging cost: one
+// prepared block's records published into a shard window cache. This is the
+// operation that used to hold the exclusive lock for the whole record walk.
+func BenchmarkStateCellCacheStageRecords(b *testing.B) {
+	root := benchmarkStateCellTree(b, 10240)
+	records, err := storage.PrepareReachableStateCells(root)
+	if err != nil {
+		b.Fatalf("prepare reachable cells: %v", err)
+	}
+	b.Logf("records per stage: %d", records.Len())
+
+	// fresh-window pays the window allocation too, which is what the original
+	// per-record staging benchmark measured; warm-window isolates the
+	// publication itself, which is the part that runs under the exclusive lock
+	// the loaders share.
+	b.Run("fresh-window", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			cache := newStateCellEncodedCache(4096)
+			if err := cache.stageRecords(records, nil).enqueue(); err != nil {
+				b.Fatalf("stage records: %v", err)
+			}
+		}
+	})
+
+	b.Run("warm-window", func(b *testing.B) {
+		cache := newStateCellEncodedCache(4096)
+
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := cache.stageRecords(records, nil).enqueue(); err != nil {
+				b.Fatalf("stage records: %v", err)
+			}
+		}
+	})
+
+	// The exclusive hold itself, which is what the loaders and the other shard
+	// appliers wait behind: everything else above runs before the lock.
+	b.Run("publish-prebuilt-layer", func(b *testing.B) {
+		cache := newStateCellEncodedCache(4096)
+		layer := newStateCellRecordLayer(records)
+
+		b.ReportAllocs()
+		for b.Loop() {
+			cache.stageLayer(layer, nil)
+		}
+	})
+}
+
+// BenchmarkStateCellWindowAddPreparedRecords is the end-to-end commit-side
+// cost: staging plus whatever indexing/compaction the window performs before
+// the records are considered absorbed.
+func BenchmarkStateCellWindowAddPreparedRecords(b *testing.B) {
+	root := benchmarkStateCellTree(b, 10240)
+	records, err := storage.PrepareReachableStateCells(root)
+	if err != nil {
+		b.Fatalf("prepare reachable cells: %v", err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		window := newTestStateCellWindowCache(rejectingBenchmarkCellLoader)
+		if err := window.addPreparedRecords(records); err != nil {
+			b.Fatalf("add prepared records: %v", err)
+		}
+	}
 }
 
 func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/p2p"
@@ -62,15 +63,25 @@ type nextSyncRunner struct {
 	shardDescriptionPrefetchMu        sync.Mutex
 	shardDescriptionPrefetchScheduled map[storage.BlockRootHash]struct{}
 	shardDescriptionPrefetchOrder     []storage.BlockRootHash
-	shardTarget                       time.Duration
-	shardWall                         time.Duration
-	shardApply                        time.Duration
-	shardApplied                      uint64
-	committed                         uint32
-	lastCheckpointDeferred            time.Time
-	lastBlockUTime                    uint32
-	lastLagSeconds                    int64
-	hasBlockTime                      bool
+	shardAheadWake                    chan struct{}
+	shardAheadMu                      sync.Mutex
+	shardAheadPending                 map[uint32]shardApplyAheadJob
+	shardAheadRecorders               map[storage.BlockRootHash]shardAheadRecorderEntry
+	shardStageMu                      sync.Mutex
+	shardStageDeferred                map[uint32][]deferredShardCheckpointState
+	// committedMasterSeqno is published by the commit stage and read by the
+	// apply-ahead stage to decide whether resolving a master can only touch
+	// shard blocks that master itself includes.
+	committedMasterSeqno   atomic.Uint32
+	shardTarget            time.Duration
+	shardWall              time.Duration
+	shardApply             time.Duration
+	shardApplied           uint64
+	committed              uint32
+	lastCheckpointDeferred time.Time
+	lastBlockUTime         uint32
+	lastLagSeconds         int64
+	hasBlockTime           bool
 }
 
 type nextMasterDownload struct {
@@ -302,6 +313,9 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 		shardPrefetchScheduled:            map[storage.BlockRootHash]struct{}{},
 		shardDescriptionPrefetchScheduled: map[storage.BlockRootHash]struct{}{},
 	}
+	// The starting master is the committed head: the apply-ahead stage may
+	// resolve the block right after it without owning anything older.
+	r.committedMasterSeqno.Store(r.current.Masterchain.Block.SeqNo)
 	r.shardResolver = newShardStateResolver(runCtx, shardStateResolverConfig{
 		current:         r.current.Shards,
 		cache:           r.shardCache,
@@ -316,6 +330,10 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 func (r *nextSyncRunner) run() (*storage.CurrentState, uint32, error) {
 	r.logStart()
 	r.startShardDescriptionPrefetch()
+	// Cancels the run context and drains the stage, so no shard state is applied
+	// into this run's cell window after it returns.
+	stopShardApplyAhead := r.startShardApplyAhead()
+	defer stopShardApplyAhead()
 
 	downloads := r.startMasterSource()
 	applied := r.startMasterApply(downloads)
@@ -412,6 +430,9 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		}
 		probeState.liveTail = nextBlockBootstrapLiveTail(prevUTime, time.Now().Unix())
 
+		// Taken before the probe so a block published while it runs is not
+		// waited out by the retry below.
+		stateWake := r.service.currentStateWakeChan()
 		started := time.Now()
 		downloaded, source, prepareElapsed, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, &probeState)
 		elapsed := time.Since(started)
@@ -439,7 +460,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 					Int("consecutive_misses", probeState.consecutiveMisses).
 					Bool("live_tail", probeState.liveTail).
 					Msg("next masterchain block is not available during bootstrap")
-				if !r.waitBootstrapRetry() {
+				if !r.waitBootstrapRetry(stateWake) {
 					return
 				}
 				continue
@@ -481,7 +502,10 @@ func (r *nextSyncRunner) shouldYieldBootstrapToArchive(prevUTime int64) bool {
 	return prevUTime != 0 && shouldSwitchNextToArchiveByLag(time.Now().Unix()-prevUTime)
 }
 
-func (r *nextSyncRunner) waitBootstrapRetry() bool {
+// waitBootstrapRetry parks until there is a reason to probe again. The caller
+// passes the wake it took before the probe that missed, so state published
+// while that probe ran is not waited out here.
+func (r *nextSyncRunner) waitBootstrapRetry(wake <-chan struct{}) bool {
 	if r.service.cellGenerationSwitchRequestActive() {
 		return false
 	}
@@ -492,7 +516,7 @@ func (r *nextSyncRunner) waitBootstrapRetry() bool {
 	select {
 	case <-r.ctx.Done():
 		return false
-	case <-r.service.currentStateWake:
+	case <-wake:
 		return !r.service.cellGenerationSwitchRequestActive()
 	case <-timer.C:
 		return !r.service.cellGenerationSwitchRequestActive()
@@ -623,10 +647,29 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 		return applied, err
 	}
 
+	// Publish the applied state to the caches the next block waits on before
+	// doing anything else with it: the next masterchain broadcast cannot be
+	// state-decompressed and its consensus proof cannot be validated until this
+	// state is visible, so every millisecond spent here lands on the live head.
+	// The key-block config above stays ahead of it because the FastSync roster
+	// reconcile below reads it.
+	r.service.rememberAppliedMasterCompressedState(nextMaster)
+	// Cheap and ordering-sensitive: the active overlay set is computed at this
+	// depth, and the next shard download resolves its overlay through it.
+	r.service.updateP2PMonitorMinSplitDepth(nextMaster)
+	// Both background consumers below retain this slice; neither may sort,
+	// dedupe or otherwise mutate it, and neither may the commit stage.
+	r.service.scheduleP2PShardOverlayUpdate(nextMaster, targets)
+
 	r.service.publishLiveBlockArtifacts(prepared, nextMaster, liveBlockPublishOptions{})
 	r.service.rememberAppliedMasterchainState(nextMaster)
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
-	r.service.rememberMasterState(r.ctx, nextMaster, &prepared, targets)
+	// Strictly after this master is published: the stage stamps the shard blocks
+	// it applies with this master as their inclusion ref, and a proof built for
+	// such a block resolves that ref by seqno, so the master must be visible
+	// first. Everything the commit stage does with these targets afterwards is
+	// then already done or in flight.
+	r.scheduleShardApplyAhead(nextMaster, targets)
 	applyCells.remember(prepared.ID, prepared.StateUpdateToCells)
 	applied.master = nextMaster
 	applied.stateUpdateCells = prepared.StateUpdateToCells
@@ -857,7 +900,7 @@ func (r *nextSyncRunner) prefetchShardDescriptionTarget(hint shardDescriptionHin
 	}
 
 	r.service.log.Debug().
-		Str("block", storage.FormatBlockRef(desc.Block)).
+		Stringer("block", storage.BlockRef(desc.Block)).
 		Str("overlay", hint.Overlay).
 		Int("chain_links", len(desc.Chain)).
 		Msg("prefetching shard block from description broadcast")
@@ -1014,7 +1057,8 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	r.timing.persist += item.stageElapsed
 	r.master = item.master
 
-	nextCurrent, shardStats, err := r.service.currentStateForNextMasterState(r.ctx, r.current, item.master, item.shardTargets, r.shardResolver)
+	commitCtx := r.shardApplyAheadContext(r.ctx, item.master.Block)
+	nextCurrent, shardStats, err := r.service.currentStateForNextMasterState(commitCtx, r.current, item.master, item.shardTargets, r.shardResolver)
 	r.observeMasterShardObtain(item, shardStats, err)
 	if err != nil {
 		return err
@@ -1023,13 +1067,19 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	resolverStats := r.takeShardResolverStats()
 	shardStats.apply += resolverStats.applyElapsed
 	shardStats.applied += resolverStats.blocksApplied
-	if err = r.rememberMasterCheckpointState(item); err != nil {
-		return err
-	}
 
 	r.current = nextCurrent
 	r.shardResolver.updateCurrent(r.current.Shards)
+	r.committedMasterSeqno.Store(r.current.Masterchain.Block.SeqNo)
+	// The committed head moved, so a master the stage had to skip may now be
+	// admissible without it receiving a new schedule.
+	r.wakeShardApplyAhead()
 	r.prefetchShardDescriptionHints()
+	// Publish the head before any durability staging: staging below contains
+	// the prewriter enqueues, which block under disk backpressure, and nothing
+	// in the publish path reads state the staging creates — the master's apply
+	// cells stay resolvable through the private apply window until
+	// rememberMasterCheckpointState moves them into the shared one.
 	snapshot := r.service.publishLiveCurrentStateChanged(r.current)
 	if r.service.liveState != nil {
 		if snapshot == nil {
@@ -1038,6 +1088,17 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 			snapshot = storage.CloneCurrentState(r.current)
 		}
 		r.service.liveState.SetLiveCurrentStateSnapshot(snapshot)
+	}
+
+	// Shards strictly before their inclusion master, and both before any
+	// checkpoint this commit can trigger (the flushes below are the only ones
+	// on this runner), so no checkpoint can contain a shard block without its
+	// staged master.
+	if err = r.stageDeferredShardCheckpointStates(item.master.Block.SeqNo); err != nil {
+		return err
+	}
+	if err = r.rememberMasterCheckpointState(item); err != nil {
+		return err
 	}
 	r.shardTarget += shardStats.targetParse
 	r.shardWall += shardStats.wall
@@ -1128,6 +1189,13 @@ func (r *nextSyncRunner) takeShardResolverStats() shardStateResolverStats {
 }
 
 func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded PreparedBlock, applyElapsed time.Duration) (err error) {
+	// Resolved before the observation defer on purpose: a missing inclusion
+	// master is a wiring bug, not a sync outcome worth reporting as one.
+	master, err := shardApplyMasterFromContext(ctx)
+	if err != nil {
+		return err
+	}
+
 	observation := SyncBlockObservation{
 		Pipeline:        r.method,
 		Chain:           syncChainLabel(downloaded.ID),
@@ -1146,20 +1214,74 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 		r.service.observeSyncBlock(observation)
 	}()
 
-	setShardStateMasterchainRef(state, r.master.Block)
-	setShardBlockMasterchainRef(downloaded.Meta, r.master.Block)
+	setShardStateMasterchainRef(state, master.Block)
+	setShardBlockMasterchainRef(downloaded.Meta, master.Block)
 
-	r.service.publishLiveBlockArtifacts(downloaded, state, liveBlockPublishOptions{})
+	// Same reason as the masterchain path: the next shard broadcast for this
+	// shard is state-compressed against this state, so publish it for decode
+	// before the (heavier) live-view publish.
 	if r.service.RememberCompressedBlockState(state) {
 		r.service.node.NotifyCompressedBlockStateReady(state.Block)
 	}
+	r.service.publishLiveBlockArtifacts(downloaded, state, liveBlockPublishOptions{})
 
-	splitDepth, err := r.service.cachedMonitorMinSplitDepth(r.master, downloaded.ID.Workchain)
+	splitDepth, err := r.service.cachedMonitorMinSplitDepth(master, downloaded.ID.Workchain)
 	if err != nil {
 		return err
 	}
+	// Durability staging is deferred to the commit of the inclusion master:
+	// everything above is caches and live visibility, but a staged checkpoint
+	// entry would let a checkpoint persist this shard block while the master
+	// its MasterchainRefSeqno points to is still uncommitted, leaving a
+	// dangling ref after an unclean restart.
 	artifact, links := preparedBlockCheckpointArtifacts(downloaded, splitDepth)
-	return r.rememberCheckpointState(state, artifact, links)
+	r.deferShardCheckpointState(master.Block.SeqNo, state, artifact, links)
+	return nil
+}
+
+// deferredShardCheckpointState is a resolved shard block whose checkpoint
+// staging waits for the commit of its inclusion master. The artifact payloads
+// alias the prepared block's immutable buffers and the state is retained by
+// the resolver cache anyway, so deferral adds no copies; the map holds at most
+// the targets of the masters in flight (the apply-ahead stage resolves one
+// master at a time plus the commit's own) and dies with the runner when a run
+// stops before committing them.
+type deferredShardCheckpointState struct {
+	state    *storage.BlockState
+	artifact *storage.ServedBlockFull
+	links    []storage.ServedBlockLink
+}
+
+func (r *nextSyncRunner) deferShardCheckpointState(masterSeqno uint32, state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
+	r.shardStageMu.Lock()
+	if r.shardStageDeferred == nil {
+		r.shardStageDeferred = map[uint32][]deferredShardCheckpointState{}
+	}
+	r.shardStageDeferred[masterSeqno] = append(r.shardStageDeferred[masterSeqno], deferredShardCheckpointState{
+		state:    state,
+		artifact: artifact,
+		links:    links,
+	})
+	r.shardStageMu.Unlock()
+}
+
+// stageDeferredShardCheckpointStates stages the shard blocks resolved for this
+// master. Called by commitOne after the master's shard resolution completed —
+// every afterApplyShardState for these targets runs inside the resolver tasks
+// that resolution waits on, so the deferred set is complete by then, whether
+// the apply-ahead stage or the commit stage owned the tasks.
+func (r *nextSyncRunner) stageDeferredShardCheckpointStates(masterSeqno uint32) error {
+	r.shardStageMu.Lock()
+	deferred := r.shardStageDeferred[masterSeqno]
+	delete(r.shardStageDeferred, masterSeqno)
+	r.shardStageMu.Unlock()
+
+	for _, shard := range deferred {
+		if err := r.rememberCheckpointState(shard.state, shard.artifact, shard.links); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) error {
@@ -1178,19 +1300,22 @@ func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) e
 
 func (r *nextSyncRunner) rememberCheckpointState(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) error {
 	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
 	r.checkpointStates.rememberWithArtifacts(state, artifact, links)
 	// Stream the artifact append ahead of the checkpoint while holding
 	// checkpointMu, so a checkpoint snapshot always covers exactly the staged
-	// entries whose prewrite sequence it waits for.
-	seq, err := r.service.artifactPrewrite.enqueue(state, artifact)
+	// entries whose prewrite sequence it waits for. Only the append runs under
+	// the mutex; the queue's backpressure wait runs after the unlock, so a
+	// prewriter stalled on disk still throttles this producer but cannot block
+	// the async checkpoint completion, which takes checkpointMu.
+	seq, wait, err := r.service.artifactPrewrite.enqueueDetached(state, artifact)
+	if err == nil && seq > r.artifactPrewriteSeq {
+		r.artifactPrewriteSeq = seq
+	}
+	r.checkpointMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if seq > r.artifactPrewriteSeq {
-		r.artifactPrewriteSeq = seq
-	}
-	return nil
+	return wait()
 }
 
 func (r *nextSyncRunner) checkpoint() (appliedStateCheckpoint, uint64) {
@@ -1267,6 +1392,14 @@ func (r *nextSyncRunner) latestTarget(currentSeqno uint32) (ton.BlockIDExt, erro
 }
 
 func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
+	// Everything below is log-only: skip the head lookup and the field
+	// formatting entirely when the level is off, since this runs per applied
+	// masterchain block on the live-head path.
+	event := r.service.log.Debug()
+	if !event.Enabled() {
+		return
+	}
+
 	latest, err := r.latestTarget(item.master.Block.SeqNo)
 	if err != nil {
 		latest = item.master.Block
@@ -1278,7 +1411,7 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 	blockUTime, lagSeconds := downloadedBlockTimeLag(item.block, time.Now())
 	elapsed := item.downloadElapsed + item.prepareElapsed + item.applyTiming.total
 
-	event := r.service.log.Debug().
+	event = event.
 		Str("block", item.block.BlockRef()).
 		Str("latest_masterchain", storage.FormatBlockRef(latest)).
 		Str("catchup_method", r.method).
@@ -1298,6 +1431,20 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 
 func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextShardClientApplyStats, blockStarted time.Time, masterPipelineWait time.Duration, appliedQueue int, applyBefore time.Duration, persistBefore time.Duration, checkpointsBefore uint32, shardTargetBefore time.Duration, shardWallBefore time.Duration, shardApplyBefore time.Duration, shardAppliedBefore uint64) {
 	blockElapsed := time.Since(blockStarted)
+
+	// The lag fields feed the periodic Info progress log, so they are computed
+	// unconditionally; everything else here is Debug-only and runs once per
+	// committed masterchain block on the live-head path.
+	blockUTime, lagSeconds := downloadedBlockTimeLag(item.block, time.Now())
+	r.lastBlockUTime = blockUTime
+	r.lastLagSeconds = lagSeconds
+	r.hasBlockTime = blockUTime != 0
+
+	event := r.service.log.Debug()
+	if !event.Enabled() {
+		return
+	}
+
 	latest, err := r.latestTarget(r.current.Masterchain.Block.SeqNo)
 	if err != nil {
 		latest = r.current.Masterchain.Block
@@ -1315,12 +1462,7 @@ func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextS
 		remaining = r.target.SeqNo - r.current.Masterchain.Block.SeqNo
 	}
 
-	blockUTime, lagSeconds := downloadedBlockTimeLag(item.block, time.Now())
-	r.lastBlockUTime = blockUTime
-	r.lastLagSeconds = lagSeconds
-	r.hasBlockTime = blockUTime != 0
-
-	event := r.service.log.Debug().
+	event = event.
 		Str("block", item.block.BlockRef()).
 		Str("prev", storage.FormatBlockRef(item.prev)).
 		Str("latest_masterchain", storage.FormatBlockRef(latest)).

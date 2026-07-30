@@ -359,7 +359,7 @@ func TestArchiveSessionCloseDetachesOnlyArchiveOnlyPeers(t *testing.T) {
 		t.Fatal("archive-only peer leaked into live pool")
 	}
 	pooledArchive.touch(time.Now().Add(-peerPoolIdleTTL - time.Second))
-	if got := archivePool.pruneIdleLockedForTest(time.Now(), 0); got != 1 {
+	if got := archivePool.pruneIdle(time.Now()); got != 1 {
 		t.Fatalf("pruned idle archive transports = %d, want 1", got)
 	}
 	select {
@@ -575,7 +575,7 @@ func TestArchiveOnlyPeerCloseDoesNotCloseSharedPooledADNL(t *testing.T) {
 	default:
 	}
 	pooled.touch(time.Now().Add(-peerPoolIdleTTL - time.Second))
-	pool.pruneIdleLockedForTest(time.Now(), 0)
+	pool.pruneIdle(time.Now())
 	select {
 	case <-base.GetCloserCtx().Done():
 	default:
@@ -606,7 +606,7 @@ func TestArchiveOnlyPeerCloseRetainsTransportUntilIdleCapEviction(t *testing.T) 
 	}
 
 	pooled.touch(time.Now().Add(-peerPoolIdleTTL - time.Second))
-	pool.pruneIdleLockedForTest(time.Now(), 0)
+	pool.pruneIdle(time.Now())
 	select {
 	case <-base.GetCloserCtx().Done():
 	default:
@@ -1316,8 +1316,8 @@ func TestArchivePoolForcedRefillStartsDHTWhenDue(t *testing.T) {
 }
 
 func TestArchivePoolDoesNotChangeLiveRosterLimit(t *testing.T) {
-	if maxPeersPerOverlay != 20 {
-		t.Fatalf("live overlay roster limit = %d, want 20", maxPeersPerOverlay)
+	if maxPeersPerOverlay != 300 {
+		t.Fatalf("live overlay roster limit = %d, want 300 (C++ reference max_peers)", maxPeersPerOverlay)
 	}
 	if archivePeerRosterLimit != 40 {
 		t.Fatalf("archive roster limit = %d, want 40", archivePeerRosterLimit)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -697,6 +698,177 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 
 	cancel()
 	node.wg.Wait()
+}
+
+func TestDHTCandidateReplacesBadPeerAtFullLiveLimit(t *testing.T) {
+	remotePub, remoteKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate remote key: %v", err)
+	}
+	remoteID := peerIDForQUICOutboundTest(t, remotePub)
+	dht := &outboundRouteDHT{
+		addresses: &adnladdr.List{
+			Addresses: []adnladdr.Address{
+				adnladdr.UDP{
+					IP:   net.IPv4(127, 0, 0, 1),
+					Port: 24101,
+				},
+			},
+		},
+		pub: remotePub,
+	}
+	node := newQUICRouteDiscoveryNode(t, dht)
+	spec, err := buildOverlaySpec(
+		make([]byte, PeerIDSize),
+		-1,
+		topShard,
+		"full-live-replacement",
+	)
+	if err != nil {
+		t.Fatalf("build public overlay: %v", err)
+	}
+	sub := testOverlaySubscription(&overlaySubscription{
+		node:      node,
+		log:       discardLogger(),
+		spec:      spec,
+		peers:     map[PeerID]*overlayPeer{},
+		directory: map[PeerID]*directoryEntry{},
+	})
+	t.Cleanup(func() {
+		sub.close()
+		node.wg.Wait()
+	})
+
+	now := time.Now()
+	var victimID PeerID
+	var victim *overlayPeer
+	var victimReleased atomic.Int32
+	for i := 0; i < sub.livePeerLimit(); i++ {
+		id := testPeerID("full-live-peer-" + string(rune(i)))
+		peer := &overlayPeer{
+			node:          node,
+			id:            id,
+			addr:          "127.0.0.1:24001",
+			pub:           remotePub,
+			route:         newPeerRoute(""),
+			overlay:       &overlay.ADNLOverlayWrapper{},
+			announced:     &overlay.Node{Version: int32(now.Unix())},
+			alive:         true,
+			lastReceiveAt: now,
+			release:       func() {},
+		}
+		if i == 0 {
+			victimID = id
+			victim = peer
+			peer.release = func() {
+				victimReleased.Add(1)
+			}
+		}
+		sub.peers[id] = peer
+		sub.rememberDirectoryPeerLocked(
+			id,
+			remotePub,
+			peer.addr,
+			"",
+			peer.announced,
+			now,
+		)
+		sub.markDirectoryLiveLocked(id, true)
+	}
+
+	announced, err := overlay.NewNode(spec.FullID, remoteKey)
+	if err != nil {
+		t.Fatalf("build candidate overlay node: %v", err)
+	}
+
+	attached, err := sub.connectDHTOverlayNode(context.Background(), *announced)
+	if err != nil {
+		t.Fatalf("connect candidate without replacement: %v", err)
+	}
+	if attached {
+		t.Fatal("full healthy live tier attached a candidate without an eligible victim")
+	}
+	node.pool.mx.RLock()
+	healthyPoolSize := len(node.pool.peers)
+	node.pool.mx.RUnlock()
+	if healthyPoolSize != 0 {
+		t.Fatalf("full healthy live tier left %d idle pooled transports, want 0", healthyPoolSize)
+	}
+	node.peerUseMx.RLock()
+	_, healthyEndpointRetained := node.peerUse[remoteID]
+	node.peerUseMx.RUnlock()
+	if healthyEndpointRetained {
+		t.Fatal("full healthy live tier retained the refused endpoint")
+	}
+
+	victim.statsMx.Lock()
+	victim.downloadSlowUntil = now.Add(time.Minute)
+	victim.statsMx.Unlock()
+
+	if send, replacement := sub.prepareDHTRefreshNode(*announced, 0); !send || !replacement {
+		t.Fatalf("DHT candidate admission = send %v replacement %v, want true/true", send, replacement)
+	}
+
+	attached, err = sub.connectDHTOverlayNode(context.Background(), *announced)
+	if err != nil {
+		t.Fatalf("connect DHT replacement: %v", err)
+	}
+	if !attached {
+		t.Fatal("full live tier did not attach the eligible DHT replacement")
+	}
+	if got := len(sub.peers); got != sub.livePeerLimit() {
+		t.Fatalf("live peers after replacement = %d, want %d", got, sub.livePeerLimit())
+	}
+	if sub.peers[remoteID] == nil {
+		t.Fatal("replacement peer is missing from the live tier")
+	}
+	if sub.peers[victimID] != nil {
+		t.Fatal("bad peer remained in the live tier")
+	}
+	if got := victimReleased.Load(); got != 1 {
+		t.Fatalf("bad peer release calls = %d, want 1", got)
+	}
+
+	sub.mx.Lock()
+	victimEntry := sub.directory[victimID]
+	replacementEntry := sub.directory[remoteID]
+	sub.mx.Unlock()
+	if victimEntry == nil || victimEntry.live {
+		t.Fatal("evicted peer must remain in the directory as non-live")
+	}
+	if replacementEntry == nil || !replacementEntry.live {
+		t.Fatal("replacement peer must be recorded as live in the directory")
+	}
+
+	node.pool.mx.RLock()
+	pooled := node.pool.peers[remoteID]
+	poolSize := len(node.pool.peers)
+	refs := 0
+	adnlOverlayRefs := 0
+	rldpOverlayRefs := 0
+	if pooled != nil {
+		refs = pooled.refs
+		adnlOverlayRefs = len(pooled.adnlOverlayRefs)
+		rldpOverlayRefs = len(pooled.rldpOverlayRefs)
+	}
+	node.pool.mx.RUnlock()
+	if pooled == nil || poolSize != 1 {
+		t.Fatalf("pooled replacement transport = %v, pool size = %d, want one transport", pooled != nil, poolSize)
+	}
+	if refs != 1 || adnlOverlayRefs != 1 || rldpOverlayRefs != 1 {
+		t.Fatalf(
+			"replacement transport refs = %d/%d/%d, want one overlay ownership reference",
+			refs,
+			adnlOverlayRefs,
+			rldpOverlayRefs,
+		)
+	}
+	node.peerUseMx.RLock()
+	_, endpointRetained := node.peerUse[remoteID]
+	node.peerUseMx.RUnlock()
+	if endpointRetained {
+		t.Fatal("DHT endpoint acquisition reference leaked after attach")
+	}
 }
 
 func TestPingPeersRunsPeerQueriesConcurrently(t *testing.T) {

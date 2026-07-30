@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,7 +205,7 @@ func TestRememberMasterStateCacheStaysBounded(t *testing.T) {
 	}
 }
 
-func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
+func TestCachedMonitorMinSplitDepthHitNeedsNoStateParse(t *testing.T) {
 	keyBlock := testMasterBlockID(1)
 	master := testMonitorMasterStateWithKeyBlock(t, keyBlock, 7, keyBlock, true)
 
@@ -217,8 +218,10 @@ func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
 		t.Fatalf("cachedMonitorMinSplitDepth initial read = %d, want 7", depth)
 	}
 
-	cached := testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(2), keyBlock, false)
-	got, err := svc.cachedMonitorMinSplitDepth(cached, 0)
+	// The same master without a parsed state can only be answered from the
+	// cache: any compute attempt would fail on the missing mc_state_extra.
+	probe := &storage.BlockState{Block: master.Block}
+	got, err := svc.cachedMonitorMinSplitDepth(probe, 0)
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth cached read: %v", err)
 	}
@@ -227,19 +230,16 @@ func TestCachedMonitorMinSplitDepthAvoidsConfigAfterFirstRead(t *testing.T) {
 	}
 
 	svc.resetMonitorSplitDepthCache()
-	got, err = svc.cachedMonitorMinSplitDepth(cached, 0)
-	if err != nil {
-		t.Fatalf("cachedMonitorMinSplitDepth after cache reset: %v", err)
-	}
-	if got != 0 {
-		t.Fatalf("cachedMonitorMinSplitDepth after cache reset = %d, want 0", got)
+	if _, err = svc.cachedMonitorMinSplitDepth(probe, 0); err == nil {
+		t.Fatal("cachedMonitorMinSplitDepth after cache reset did not recompute")
 	}
 }
 
 func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testing.T) {
 	svc := newMasterStateCacheTestService(t)
 	keyBlock := testMasterBlockID(1)
-	if _, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithKeyBlock(t, keyBlock, 7, keyBlock, true), 0); err != nil {
+	first := testMonitorMasterStateWithKeyBlock(t, keyBlock, 7, keyBlock, true)
+	if _, err := svc.cachedMonitorMinSplitDepth(first, 0); err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth initial read: %v", err)
 	}
 
@@ -254,7 +254,10 @@ func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testi
 	}
 	svc.rememberMasterState(context.Background(), nonKeyState, &nonKeyPrepared, nil)
 
-	got, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(4), keyBlock, false), 0)
+	// A non-key master must not reset the cache: the first master still hits
+	// without a state parse.
+	probe := &storage.BlockState{Block: first.Block}
+	got, err := svc.cachedMonitorMinSplitDepth(probe, 0)
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth after non-key master: %v", err)
 	}
@@ -275,6 +278,9 @@ func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testi
 	}
 	svc.rememberMasterState(context.Background(), keyState, &keyPrepared, nil)
 
+	if _, err = svc.cachedMonitorMinSplitDepth(probe, 0); err == nil {
+		t.Fatal("key block did not invalidate the monitor split depth cache")
+	}
 	got, err = svc.cachedMonitorMinSplitDepth(keyState, 0)
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth after key master: %v", err)
@@ -350,6 +356,9 @@ func TestUpdateMasterDependentCachesKeepsConfigWhenKeyBlockStateIsInvalid(t *tes
 	}
 }
 
+// A shard after-apply can query with an inclusion master from before a key
+// block after later masters were already cached; per-master entries must never
+// alias across the epoch boundary.
 func TestCachedMonitorMinSplitDepthSeparatesKeyBlockEpochs(t *testing.T) {
 	oldKey := testMasterBlockID(1)
 	oldMaster := testMonitorMasterStateWithKeyBlock(t, testMasterBlockID(2), 7, oldKey, false)
@@ -365,9 +374,9 @@ func TestCachedMonitorMinSplitDepthSeparatesKeyBlockEpochs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cachedMonitorMinSplitDepth new key: %v", err)
 	}
-	got, err := svc.cachedMonitorMinSplitDepth(testMonitorMasterStateWithoutWorkchainConfig(t, testMasterBlockID(4), oldKey, false), 0)
+	got, err := svc.cachedMonitorMinSplitDepth(&storage.BlockState{Block: oldMaster.Block}, 0)
 	if err != nil {
-		t.Fatalf("cachedMonitorMinSplitDepth old key after new key: %v", err)
+		t.Fatalf("cachedMonitorMinSplitDepth old master after new master: %v", err)
 	}
 	if oldDepth != 7 || newDepth != 9 || got != 7 {
 		t.Fatalf("split depths old=%d new=%d old-again=%d, want 7/9/7", oldDepth, newDepth, got)
@@ -595,4 +604,203 @@ func testShardTargetsDescCell(t *testing.T, shard ton.BlockIDExt) *cell.Cell {
 		t.Fatalf("build shard desc for %s: %v", storage.FormatBlockRef(shard), err)
 	}
 	return c
+}
+
+func TestMasterBlockShardTargetsReusesPrecomputedWithoutPreparedBlock(t *testing.T) {
+	// The deferred overlay reconcile carries the targets but not the prepared
+	// block, and it must never fall through to a storage read.
+	precomputed := []ton.BlockIDExt{testBlockID(0, topShard, 42)}
+	master := testBlockID(-1, topShard, 41)
+
+	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: master}, nil, precomputed)
+	if err != nil {
+		t.Fatalf("masterBlockShardTargets returned error: %v", err)
+	}
+	if len(shards) != 1 || !shards[0].Equals(&precomputed[0]) {
+		t.Fatalf("masterBlockShardTargets did not return precomputed targets: %v", shards)
+	}
+}
+
+func newShardOverlayUpdateTestService(hook func(context.Context, masterShardOverlayUpdate)) *Service {
+	return &Service{
+		log:                   zerolog.Nop(),
+		shutdownContext:       context.Background(),
+		reconcileOverlaysHook: hook,
+	}
+}
+
+func waitForShardOverlayWorkerIdle(t *testing.T, svc *Service) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		svc.shardOverlayMu.Lock()
+		idle := !svc.shardOverlayRunning && svc.shardOverlayPending == nil
+		svc.shardOverlayMu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("shard overlay worker did not become idle")
+}
+
+// The reconcile deactivates every shard overlay outside its own set, so two
+// updates must never run concurrently and an older one must never land after a
+// newer one. Coalescing intermediate states is correct: the desired set is a
+// pure function of the newest master state.
+func TestScheduleP2PShardOverlayUpdateCoalescesToLatestState(t *testing.T) {
+	release := make(chan struct{})
+	var seen []uint32
+	var mu sync.Mutex
+	entered := make(chan struct{}, 8)
+
+	svc := newShardOverlayUpdateTestService(func(_ context.Context, update masterShardOverlayUpdate) {
+		mu.Lock()
+		seen = append(seen, update.state.Block.SeqNo)
+		mu.Unlock()
+		entered <- struct{}{}
+		if update.state.Block.SeqNo == 10 {
+			<-release
+		}
+	})
+
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, nil)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first overlay update never started")
+	}
+
+	// Both land while the first reconcile is blocked; only the newest survives.
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(11)}, nil)
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(12)}, nil)
+	close(release)
+
+	waitForShardOverlayWorkerIdle(t, svc)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("overlay reconciles = %v, want the first and the coalesced latest", seen)
+	}
+	if seen[0] != 10 || seen[1] != 12 {
+		t.Fatalf("overlay reconciles = %v, want [10 12]", seen)
+	}
+}
+
+func TestScheduleP2PShardOverlayUpdateIgnoresOlderState(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 8)
+	var seen []uint32
+	var mu sync.Mutex
+
+	svc := newShardOverlayUpdateTestService(func(_ context.Context, update masterShardOverlayUpdate) {
+		mu.Lock()
+		seen = append(seen, update.state.Block.SeqNo)
+		mu.Unlock()
+		entered <- struct{}{}
+		if update.state.Block.SeqNo == 10 {
+			<-release
+		}
+	})
+
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, nil)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first overlay update never started")
+	}
+
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(12)}, nil)
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(11)}, nil)
+	close(release)
+
+	waitForShardOverlayWorkerIdle(t, svc)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[1] != 12 {
+		t.Fatalf("overlay reconciles = %v, want the stale seqno 11 to be dropped", seen)
+	}
+}
+
+func TestScheduleP2PShardOverlayUpdateStopsOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	reconciles := 0
+	svc := newShardOverlayUpdateTestService(func(context.Context, masterShardOverlayUpdate) {
+		reconciles++
+	})
+	svc.shutdownContext = ctx
+
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, nil)
+	waitForShardOverlayWorkerIdle(t, svc)
+	svc.Wait()
+
+	if reconciles != 0 {
+		t.Fatalf("overlay reconciles after shutdown = %d, want 0", reconciles)
+	}
+}
+
+func TestScheduleP2PShardOverlayUpdateSkipsNonMasterchainState(t *testing.T) {
+	reconciles := 0
+	svc := newShardOverlayUpdateTestService(func(context.Context, masterShardOverlayUpdate) {
+		reconciles++
+	})
+
+	svc.scheduleP2PShardOverlayUpdate(nil, nil)
+	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testBlockID(0, topShard, 10)}, nil)
+	svc.Wait()
+
+	if reconciles != 0 {
+		t.Fatalf("overlay reconciles for non-masterchain states = %d, want 0", reconciles)
+	}
+}
+
+// The masterchain apply loop publishes the applied state to the caches the next
+// block needs before doing anything slower with it, so this half must be
+// self-contained: both caches populated, no overlay reconcile.
+func TestRememberAppliedMasterCompressedStatePopulatesBothCaches(t *testing.T) {
+	svc := newMasterStateCacheTestService(t)
+	master := testMasterBlockID(41)
+	state := testShardTargetsMasterState(t, master, testBlockID(0, topShard, 42))
+
+	svc.rememberAppliedMasterCompressedState(state)
+
+	if _, err := svc.cachedCompressedBlockState(master); err != nil {
+		t.Fatalf("compressed state cache after apply: %v", err)
+	}
+	svc.masterStateCacheMu.Lock()
+	cached := svc.masterStateCache[storage.BlockKey(master)]
+	svc.masterStateCacheMu.Unlock()
+	if cached == nil || !cached.Block.Equals(&master) {
+		t.Fatalf("master state cache after apply = %v, want the applied state", cached)
+	}
+
+	// The overlay half is deferred, so nothing here may have touched it.
+	svc.monitorSplitDepthMu.Lock()
+	depths := len(svc.monitorSplitDepth)
+	svc.monitorSplitDepthMu.Unlock()
+	if depths != 0 {
+		t.Fatalf("monitor split depth entries = %d, want the overlay half to stay deferred", depths)
+	}
+}
+
+func TestRememberAppliedMasterCompressedStateIgnoresNonMasterchainState(t *testing.T) {
+	svc := newMasterStateCacheTestService(t)
+	shard := testBlockID(0, topShard, 42)
+
+	svc.rememberAppliedMasterCompressedState(&storage.BlockState{
+		Block: shard,
+		Cell:  cell.BeginCell().EndCell(),
+	})
+
+	svc.masterStateCacheMu.Lock()
+	entries := len(svc.masterStateCache)
+	svc.masterStateCacheMu.Unlock()
+	if entries != 0 {
+		t.Fatalf("master state cache entries for a shard state = %d, want 0", entries)
+	}
 }

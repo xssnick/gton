@@ -67,7 +67,7 @@ func newPeerEndpointFixture(t *testing.T, endpoint peerEndpoint) *peerEndpointFi
 	gateway := adnl.NewGatewayWithNetManager(gatewayKey, manager)
 	gateway.SetAddressList(nil)
 	node := &Node{
-		pool:    newPeerPool(gateway, nil, nil),
+		pool:    newPeerPool(gateway, nil, nil, nil),
 		peerUse: map[PeerID]peerUse{},
 	}
 

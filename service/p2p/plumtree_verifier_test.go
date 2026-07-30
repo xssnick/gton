@@ -376,6 +376,173 @@ func TestPlumtreeCertificateIssuerUsesDecodedValueType(t *testing.T) {
 	}
 }
 
+func TestPlumtreeSignatureVerifierCachesVerifiedSourceSignature(t *testing.T) {
+	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
+	node := &Node{}
+	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	verifier := newPlumtreeSignatureVerifier(
+		nodePlumtreePolicySource{node: node},
+		testPeerID("plumtree-signature-cache-overlay"),
+		0,
+	)
+	request := plumtreeVerifierRequest(
+		sourcePrivate,
+		plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		testPeerID("plumtree-signature-cache-from"),
+	)
+	now := time.Now()
+
+	signatureKey, cacheable := verifiedSignatureCacheKey(request)
+	if !cacheable {
+		t.Fatal("well-formed request reported as non-cacheable")
+	}
+	if _, err := verifier.verifyAt(request, now); err != nil {
+		t.Fatalf("verify authorized source: %v", err)
+	}
+	if !verifier.verified.contains(signatureKey) {
+		t.Fatal("verified signature tuple was not cached")
+	}
+
+	// The same part announced by another peer reuses the cached source
+	// signature.
+	request.From = testPeerID("plumtree-signature-cache-other-from")
+	if _, err := verifier.verifyAt(request, now); err != nil {
+		t.Fatalf("verify cached signature from another peer: %v", err)
+	}
+}
+
+func TestPlumtreeSignatureVerifierSignatureCacheHitSkipsKeyMath(t *testing.T) {
+	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
+	node := &Node{}
+	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	verifier := newPlumtreeSignatureVerifier(
+		nodePlumtreePolicySource{node: node},
+		testPeerID("plumtree-signature-hit-overlay"),
+		0,
+	)
+	request := plumtreeVerifierRequest(
+		sourcePrivate,
+		plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		testPeerID("plumtree-signature-hit-from"),
+	)
+	request.Signature[0] ^= 1
+
+	// Seeding the cache with this exact tuple must make verification pass
+	// without re-running ed25519.Verify, proving hits skip the key math and
+	// that lookups cover the full tuple including the signature bytes.
+	signatureKey, cacheable := verifiedSignatureCacheKey(request)
+	if !cacheable {
+		t.Fatal("well-formed request reported as non-cacheable")
+	}
+	verifier.verified.add(signatureKey)
+	if _, err := verifier.verifyAt(request, time.Now()); err != nil {
+		t.Fatalf("verify seeded signature tuple: %v", err)
+	}
+}
+
+func TestPlumtreeSignatureVerifierDoesNotCacheInvalidSignature(t *testing.T) {
+	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
+	node := &Node{}
+	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	verifier := newPlumtreeSignatureVerifier(
+		nodePlumtreePolicySource{node: node},
+		testPeerID("plumtree-signature-nocache-overlay"),
+		0,
+	)
+	request := plumtreeVerifierRequest(
+		sourcePrivate,
+		plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		testPeerID("plumtree-signature-nocache-from"),
+	)
+	request.Signature[0] ^= 1
+
+	if _, err := verifier.verifyAt(request, time.Now()); !errors.Is(
+		err,
+		errPlumtreeSignatureInvalid,
+	) {
+		t.Fatalf("invalid signature error = %v", err)
+	}
+	signatureKey, _ := verifiedSignatureCacheKey(request)
+	if verifier.verified.contains(signatureKey) {
+		t.Fatal("invalid signature tuple was cached")
+	}
+}
+
+func TestPlumtreeSignatureVerifierRejectionPrecedesSignatureCache(t *testing.T) {
+	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
+	node := &Node{}
+	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	verifier := newPlumtreeSignatureVerifier(
+		nodePlumtreePolicySource{node: node},
+		testPeerID("plumtree-signature-reject-cache-overlay"),
+		0,
+	)
+	from := testPeerID("plumtree-signature-reject-cache-from")
+	now := time.Now()
+
+	request := plumtreeVerifierRequest(
+		sourcePrivate,
+		plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		from,
+	)
+	if _, err := verifier.verifyAt(request, now); err != nil {
+		t.Fatalf("verify authorized source: %v", err)
+	}
+
+	bad := request
+	bad.Signature = append([]byte(nil), request.Signature...)
+	bad.Signature[0] ^= 1
+	if _, err := verifier.verifyAt(bad, now); !errors.Is(
+		err,
+		errPlumtreeSignatureInvalid,
+	) {
+		t.Fatalf("invalid signature error = %v", err)
+	}
+
+	// The peer rejection window must still apply even though this exact
+	// tuple sits in the verified signature cache.
+	if _, err := verifier.verifyAt(request, now.Add(time.Second)); !errors.Is(
+		err,
+		errPlumtreePeerSignaturesRejected,
+	) {
+		t.Fatalf("temporarily rejected signature error = %v", err)
+	}
+}
+
+func BenchmarkPlumtreeSignatureVerifierCachedSignature(b *testing.B) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		b.Fatalf("generate key: %v", err)
+	}
+	sourceID, err := peerIDFromED25519PublicKey(publicKey)
+	if err != nil {
+		b.Fatalf("derive peer ID: %v", err)
+	}
+	node := &Node{}
+	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	verifier := newPlumtreeSignatureVerifier(
+		nodePlumtreePolicySource{node: node},
+		testPeerID("plumtree-signature-bench-overlay"),
+		0,
+	)
+	request := plumtreeVerifierRequest(
+		privateKey,
+		plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		testPeerID("plumtree-signature-bench-from"),
+	)
+	now := time.Now()
+	if _, err = verifier.verifyAt(request, now); err != nil {
+		b.Fatalf("warm signature cache: %v", err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err = verifier.verifyAt(request, now); err != nil {
+			b.Fatalf("verify cached signature: %v", err)
+		}
+	}
+}
+
 func plumtreeCertifiedVerifierRequest(
 	t *testing.T,
 	issuerPublic ed25519.PublicKey,

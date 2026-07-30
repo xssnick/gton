@@ -13,7 +13,18 @@ import (
 )
 
 const (
-	fastSyncPeerVersionTTL        = 10 * time.Minute
+	// fastSyncPeerVersionTTL is the intake window: a descriptor older than this
+	// is not admitted (overlay-peers.cpp add_peer, Overlays::overlay_peer_ttl).
+	fastSyncPeerVersionTTL = 10 * time.Minute
+	// fastSyncPeerRetentionTTL is the window the random peer draw tolerates.
+	// Upstream uses two different ones: its periodic sweep drops a peer at
+	// overlay_peer_ttl (update_neighbours, overlay-peers.cpp:548), while
+	// get_random_peer and get_overlay_random_peers only discard at
+	// version+3600 (overlay-peers.cpp:613 and :656). Membership is unaffected
+	// either way — removal here costs a peer its place in the gossip answer,
+	// not its right to connect, which acceptsPeerID takes from the membership
+	// runtime.
+	fastSyncPeerRetentionTTL      = time.Hour
 	fastSyncPeerFutureClockSkew   = 60 * time.Second
 	fastSyncRandomPeerResultLimit = 4
 	fastSyncPeerDescriptorWindow  = 10 * time.Second
@@ -363,19 +374,6 @@ func (r *fastSyncPeerRuntime) SetAlive(id PeerID, alive bool) error {
 	return nil
 }
 
-func (r *fastSyncPeerRuntime) Forget(id PeerID) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	peer := r.peers[id]
-	if peer == nil {
-		return ErrFastSyncNotFound
-	}
-
-	r.removePeerLocked(id, peer)
-	return nil
-}
-
 func (r *fastSyncPeerRuntime) UpdateRoster(
 	roster FastSyncValidatorRoster,
 	permanentFlags uint32,
@@ -468,7 +466,7 @@ func (r *fastSyncPeerRuntime) RandomPeers(
 
 		id := r.aliveNonPermanent[index]
 		peer := r.peers[id]
-		if !fastSyncPeerVersionValid(peer.version, now) ||
+		if !fastSyncPeerRetained(peer.version, now) ||
 			r.membership.AuthorizeOmitted(id, now) != nil {
 			r.removePeerLocked(id, peer)
 			continue
@@ -729,6 +727,14 @@ func fastSyncPeerVersionValid(version int32, now time.Time) bool {
 	createdAt := time.Unix(int64(version), 0)
 	return !createdAt.Add(fastSyncPeerVersionTTL).Before(now) &&
 		!createdAt.After(now.Add(fastSyncPeerFutureClockSkew))
+}
+
+// fastSyncPeerRetained reports whether a peer already in the map survives the
+// sweep. Intake uses the shorter fastSyncPeerVersionTTL instead.
+func fastSyncPeerRetained(version int32, now time.Time) bool {
+	createdAt := time.Unix(int64(version), 0)
+	return !createdAt.Add(fastSyncPeerRetentionTTL).Before(now) &&
+		!createdAt.Add(-fastSyncPeerFutureClockSkew).After(now)
 }
 
 func nextFastSyncPeerRandom(value uint64) uint64 {

@@ -475,7 +475,7 @@ func TestPlumtreeEngineFECDecodesRaptorQThirtyOfFortyFive(t *testing.T) {
 			PartIndex:    partIndex,
 			TreeIndex:    partIndex + plumtreeFECTreeOffset,
 			Data:         symbol,
-			Signature:    []byte{0x91},
+			Signature:    bytes.Repeat([]byte{0x91}, ed25519.SignatureSize),
 		}
 		partHash := sha256.Sum256(symbol)
 		repairActions, handleErr := engine.HandleIHave(
@@ -551,6 +551,16 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 	broadcastID := plumtreeEngineTestID(23)
 	source := plumtreeEngineTestSource(0x53)
 	dataHash := sha256.Sum256([]byte{1})
+	// A deferred announcement only gets a repair deadline once we hold verified
+	// state for its broadcast; that is what decides the part is genuinely wanted.
+	// Part 1 is present, part 0 is the one being announced.
+	missingKey := plumtreeFECPartKey(broadcastID, 0)
+	engine.mu.Lock()
+	state := &plumtreeFECState{broadcastID: broadcastID, firstSeen: now}
+	state.parts[1] = &plumtreePartState{partIndex: 1, treeIndex: 2}
+	engine.addFECStateLocked(state)
+	engine.mu.Unlock()
+
 	for i := byte(0); i < plumtreeRepairTargetLimit+1; i++ {
 		from := plumtreeEngineTestPeer(30 + i)
 		actions, err := engine.HandleIHave(
@@ -567,7 +577,7 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 				PayloadTimestamp: plumtreeUnixSeconds(now),
 				DataSize:         1,
 				DataHash:         dataHash[:],
-				Signature:        []byte{1},
+				Signature:        bytes.Repeat([]byte{1}, ed25519.SignatureSize),
 			},
 		)
 		if err != nil {
@@ -577,31 +587,34 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 			t.Fatalf("target %d repaired before delay", i)
 		}
 	}
-	if verifier.calls.Load() != plumtreeRepairTargetLimit {
-		t.Fatalf(
-			"verifier calls = %d, want %d",
-			verifier.calls.Load(),
-			plumtreeRepairTargetLimit,
-		)
+	// With an eager peer on the part's tree the payload is expected to be pushed,
+	// so the announcements are buffered and none of them costs a verification.
+	if verifier.calls.Load() != 0 {
+		t.Fatalf("verifier calls = %d, want 0 for deferred announcements", verifier.calls.Load())
 	}
-	if actions := engine.Alarm(now.Add(plumtreeRepairDelay - time.Nanosecond)); len(actions.Repairs) != 0 {
-		t.Fatal("repair started before 200 ms")
+	if actions := engine.Alarm(now.Add(plumtreeRepairDelay - time.Nanosecond)); len(actions.Candidates) != 0 {
+		t.Fatal("candidates handed out before 200 ms")
 	}
 	actions := engine.Alarm(now.Add(plumtreeRepairDelay))
-	if len(actions.Repairs) != plumtreeRepairTargetLimit {
+	if len(actions.Candidates) != plumtreeRepairTargetLimit {
 		t.Fatalf(
-			"repair actions = %d, want %d",
-			len(actions.Repairs),
+			"candidates = %d, want %d",
+			len(actions.Candidates),
 			plumtreeRepairTargetLimit,
 		)
 	}
-	for _, action := range actions.Repairs {
-		if action.Timeout != 5*time.Second {
-			t.Fatalf("repair timeout = %v, want 5s", action.Timeout)
+	for _, candidate := range actions.Candidates {
+		if candidate.Key != missingKey {
+			t.Fatalf("candidate key = %+v, want %+v", candidate.Key, missingKey)
 		}
-		if action.MaxAnswerSize != 1+plumtreeRepairMTUOverhead {
-			t.Fatalf("repair max answer = %d", action.MaxAnswerSize)
+		if candidate.DataSize != 1 {
+			t.Fatalf("candidate data size = %d, want 1", candidate.DataSize)
 		}
+	}
+	// Candidates are consumed, so the same announcer is never asked twice for one
+	// part until it announces again.
+	if again := engine.Alarm(now.Add(2 * plumtreeRepairDelay)); len(again.Candidates) != 0 {
+		t.Fatalf("candidates handed out twice: %d", len(again.Candidates))
 	}
 
 	engine.mu.Lock()
@@ -620,10 +633,11 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 		t.Fatal("active-cap target was not consumed without a query")
 	}
 
-	if err := engine.FinishRepair(actions.Repairs[0].ID); err != nil {
-		t.Fatalf("finish repair: %v", err)
-	}
 	engine.mu.Lock()
+	for id := range engine.repairs {
+		delete(engine.repairs, id)
+		break
+	}
 	engine.startRepairRequestsLocked(now, &dropped, &cappedActions)
 	engine.mu.Unlock()
 	if len(cappedActions.Repairs) != 0 {
@@ -634,8 +648,7 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 func TestPlumtreeEngineBoundedCachesAndInactivity(t *testing.T) {
 	t.Parallel()
 
-	var delivered plumtreeDeliveredCache
-	delivered.values = make(map[[sha256.Size]byte]struct{}, plumtreeDeliveredLimit)
+	delivered := newPlumtreeRingSet[[sha256.Size]byte](plumtreeDeliveredLimit)
 	for i := 0; i < plumtreeDeliveredLimit; i++ {
 		delivered.add(plumtreeEngineTestID(uint32(i + 1)))
 	}
@@ -731,13 +744,16 @@ func TestPlumtreeEngineNextAlarm(t *testing.T) {
 	}
 
 	pendingAt := now
+	// Ages are chosen so the deadlines are strictly ordered:
+	// missing repair (+2s) < fec retention (+3s) < pending feedback (+5s)
+	// < simple retention (+4s is too early, so the simple state is the youngest).
 	simple := &plumtreeSimpleState{
 		broadcastID: plumtreeEngineTestID(641),
-		firstSeen:   now.Add(-14 * time.Second),
+		firstSeen:   now.Add(-time.Second),
 	}
 	fec := &plumtreeFECState{
 		broadcastID: plumtreeEngineTestID(642),
-		firstSeen:   now.Add(-17 * time.Second),
+		firstSeen:   now.Add(-7 * time.Second),
 	}
 	missing := &plumtreeMissingPart{
 		key: plumtreePartKey{
@@ -751,6 +767,7 @@ func TestPlumtreeEngineNextAlarm(t *testing.T) {
 		plumtreeEngineTestPeer(65),
 		pendingAt,
 	)
+	engine.notePendingDeadlineLocked(pendingAt.Add(plumtreePendingFeedbackTTL))
 	if !engine.budget.reserve(2, 0) {
 		engine.mu.Unlock()
 		t.Fatal("reserve alarm states")
@@ -768,11 +785,20 @@ func TestPlumtreeEngineNextAlarm(t *testing.T) {
 	plumtreeEngineTestRequireNextAlarm(
 		t,
 		engine,
-		fec.firstSeen.Add(plumtreeBroadcastLifetime),
+		fec.firstSeen.Add(plumtreePendingStateTTL),
 	)
 
 	engine.mu.Lock()
 	engine.removeFECStateLocked(fec)
+	engine.mu.Unlock()
+	plumtreeEngineTestRequireNextAlarm(
+		t,
+		engine,
+		simple.firstSeen.Add(plumtreeDeliveredStateTTL),
+	)
+
+	engine.mu.Lock()
+	engine.removeSimpleStateLocked(simple)
 	engine.mu.Unlock()
 	plumtreeEngineTestRequireNextAlarm(
 		t,
@@ -783,15 +809,10 @@ func TestPlumtreeEngineNextAlarm(t *testing.T) {
 	engine.mu.Lock()
 	engine.slots[plumtreeTreeSlots-1].removePending(plumtreeEngineTestPeer(65))
 	engine.mu.Unlock()
-	plumtreeEngineTestRequireNextAlarm(
-		t,
-		engine,
-		simple.firstSeen.Add(plumtreeBroadcastLifetime),
-	)
-
-	engine.mu.Lock()
-	engine.removeSimpleStateLocked(simple)
-	engine.mu.Unlock()
+	// Removing the last deadline leaves the cached bound pointing at it, which is
+	// deliberate: the bound is only ever early, so it costs one wake-up and Alarm
+	// clears it. That is the same settling the run loop does.
+	engine.Alarm(now)
 	if _, ok := engine.NextAlarm(); ok {
 		t.Fatal("cleared engine still has an alarm")
 	}
@@ -815,12 +836,12 @@ func TestPlumtreeEngineMissingPartFIFOIsBounded(t *testing.T) {
 		func() time.Time { return now },
 	)
 	engine.mu.Lock()
-	engine.promoteEagerLocked(&engine.slots[0], from, true, now)
+	engine.promoteEagerLocked(&engine.slots[1], from, true, now)
 	engine.mu.Unlock()
 
 	source := plumtreeEngineTestSource(0x65)
 	dataHash := sha256.Sum256([]byte{1})
-	for i := uint32(1); i <= plumtreeMissingLimit+1; i++ {
+	for i := uint32(1); i <= uint32(plumtreeAnnouncementPeerLimit)+1; i++ {
 		id := plumtreeEngineTestID(i)
 		actions, err := engine.HandleIHave(
 			t.Context(),
@@ -830,13 +851,13 @@ func TestPlumtreeEngineMissingPartFIFOIsBounded(t *testing.T) {
 				BroadcastID:      id[:],
 				Timestamp:        plumtreeUnixSeconds(now),
 				PartIndex:        0,
-				TreeIndex:        0,
+				TreeIndex:        1,
 				Source:           source,
 				Certificate:      overlay.CertificateEmpty{},
 				PayloadTimestamp: plumtreeUnixSeconds(now),
 				DataSize:         1,
 				DataHash:         dataHash[:],
-				Signature:        []byte{1},
+				Signature:        bytes.Repeat([]byte{1}, ed25519.SignatureSize),
 			},
 		)
 		if err != nil {
@@ -850,20 +871,26 @@ func TestPlumtreeEngineMissingPartFIFOIsBounded(t *testing.T) {
 	firstKey := plumtreePartKey{
 		broadcastID: plumtreeEngineTestID(1),
 		partIndex:   0,
-		treeIndex:   0,
+		treeIndex:   1,
 	}
 	secondKey := plumtreePartKey{
 		broadcastID: plumtreeEngineTestID(2),
 		partIndex:   0,
-		treeIndex:   0,
+		treeIndex:   1,
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	if len(engine.missing) != plumtreeMissingLimit {
-		t.Fatalf("missing parts = %d, want %d", len(engine.missing), plumtreeMissingLimit)
+	// Unverified announcements never reach e.missing; they live in the announcing
+	// peer's own bounded queue, where its own oldest entry is what gets evicted.
+	if len(engine.missing) != 0 {
+		t.Fatalf("unverified announcements created %d missing parts", len(engine.missing))
 	}
-	if engine.missing[firstKey] != nil || engine.missing[secondKey] == nil {
-		t.Fatal("missing part FIFO evicted the wrong entry")
+	queue := engine.announcements[from]
+	if queue == nil || queue.count != plumtreeAnnouncementPeerLimit {
+		t.Fatalf("buffered announcements = %v, want %d", queue, plumtreeAnnouncementPeerLimit)
+	}
+	if queue.byKey[firstKey] != nil || queue.byKey[secondKey] == nil {
+		t.Fatal("per-peer announcement queue evicted the wrong entry")
 	}
 }
 
@@ -976,7 +1003,7 @@ func TestPlumtreeEngineConcurrentFECDecoderCreatedAtCommit(t *testing.T) {
 			PartIndex:    partIndex,
 			TreeIndex:    partIndex + plumtreeFECTreeOffset,
 			Data:         partData,
-			Signature:    []byte{0x92},
+			Signature:    bytes.Repeat([]byte{0x92}, ed25519.SignatureSize),
 		}
 		envelope := plumtreeFECEnvelope{
 			Message: message,
@@ -1108,15 +1135,71 @@ func TestPlumtreeEngineRechecksTimestampAfterVerification(t *testing.T) {
 }
 
 func BenchmarkPlumtreeDeliveredCacheExactCount(b *testing.B) {
-	cache := plumtreeDeliveredCache{
-		values: make(map[[sha256.Size]byte]struct{}, plumtreeDeliveredLimit),
-	}
+	cache := newPlumtreeRingSet[[sha256.Size]byte](plumtreeDeliveredLimit)
 	var value uint32
 
 	b.ReportAllocs()
 	for b.Loop() {
 		value++
 		cache.add(plumtreeEngineTestID(value))
+	}
+}
+
+func TestPlumtreeForwardPayloadIHaveFanoutExcludesEager(t *testing.T) {
+	t.Parallel()
+
+	engine, active := plumtreeForwardBenchmarkEngine()
+	now := time.Unix(1_000_000, 0)
+	from := active[0]
+	eager := active[1]
+	slot := &engine.slots[0]
+	engine.promoteEagerLocked(slot, from, true, now)
+	engine.promoteEagerLocked(slot, eager, true, now)
+
+	part := plumtreePartState{
+		treeIndex: 0,
+		dataSize:  1,
+	}
+	actions := plumtreeActions{}
+	verdicts := engine.slotReceiveVerdictsLocked(slot)
+	engine.forwardPayloadToActiveLocked(
+		now,
+		from,
+		plumtreeEngineTestID(1),
+		&part,
+		active,
+		&verdicts,
+		&actions,
+	)
+
+	iHavePeers := make(map[PeerID]struct{}, plumtreeIHaveFanout)
+	fullCount := 0
+	for _, action := range actions.Outbounds {
+		switch action.Kind {
+		case plumtreeOutboundPayload:
+			fullCount++
+			if action.To != eager {
+				t.Fatalf("full payload sent to %v, want eager %v", action.To, eager)
+			}
+		case plumtreeOutboundIHave:
+			if action.To == from || action.To == eager {
+				t.Fatalf("IHAVE sent to eager peer %v", action.To)
+			}
+			if _, ok := iHavePeers[action.To]; ok {
+				t.Fatalf("duplicate IHAVE to %v", action.To)
+			}
+			iHavePeers[action.To] = struct{}{}
+		}
+	}
+	if fullCount != 1 {
+		t.Fatalf("full payloads = %d, want 1", fullCount)
+	}
+	if len(iHavePeers) != plumtreeIHaveFanout {
+		t.Fatalf(
+			"IHAVE peers = %d, want %d",
+			len(iHavePeers),
+			plumtreeIHaveFanout,
+		)
 	}
 }
 
@@ -1147,7 +1230,7 @@ func BenchmarkPlumtreeForwardPayloadActions(b *testing.B) {
 			&verdicts,
 			&actions,
 		)
-		if len(actions.Outbounds) != 1+plumtreeActiveNeighbourLimit {
+		if len(actions.Outbounds) != 1+plumtreeIHaveFanout {
 			b.Fatalf("outbounds = %d", len(actions.Outbounds))
 		}
 	}
@@ -1186,7 +1269,7 @@ func BenchmarkPlumtreeForwardAllFECActions(b *testing.B) {
 			)
 		}
 		if len(actions.Outbounds) !=
-			int(plumtreeFECTotalParts)*plumtreeActiveNeighbourLimit {
+			int(plumtreeFECTotalParts)*plumtreeIHaveFanout {
 			b.Fatalf("outbounds = %d", len(actions.Outbounds))
 		}
 	}
@@ -1205,6 +1288,7 @@ func plumtreeForwardBenchmarkEngine() (*plumtreeEngine, []PeerID) {
 		localID:         plumtreeEngineTestPeer(0xfe),
 		peers:           &plumtreeEngineTestPeers{receives: receives},
 		localEagerLimit: plumtreeRegularEagerLimit,
+		activities:      make(map[PeerID]plumtreePeerActivity),
 	}
 	return engine, active
 }
@@ -1261,7 +1345,7 @@ func plumtreeEngineTestSimple(
 		BroadcastID: id[:],
 		TreeIndex:   0,
 		Data:        data,
-		Signature:   []byte{0x81},
+		Signature:   bytes.Repeat([]byte{0x81}, ed25519.SignatureSize),
 	}
 }
 
@@ -1359,8 +1443,11 @@ func plumtreeEngineTestRequireNextAlarm(
 	if !ok {
 		t.Fatalf("NextAlarm() has no deadline, want %v", want)
 	}
-	if !got.Equal(want) {
-		t.Fatalf("NextAlarm() = %v, want %v", got, want)
+	// The cached bounds are deliberately allowed to be early - removing a deadline
+	// leaves the cache pointing at it until the next Alarm - so a wake-up no later
+	// than the true deadline is correct. Being late would miss it.
+	if got.After(want) {
+		t.Fatalf("NextAlarm() = %v, want no later than %v", got, want)
 	}
 }
 

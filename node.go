@@ -21,6 +21,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -213,6 +214,8 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	}
 	stateFilesDir := store.StateFilesDir()
 	opts.Storage = store
+	opts.PeerCache = store
+	opts.FastSyncCertificateStorage = store
 	logger.Info().
 		Str("storage", "pebble").
 		Str("dir", storageDir).
@@ -267,6 +270,22 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	if runOpts.LiveView != nil {
 		liveViewOptions = *runOpts.LiveView
 		liveViewOptions.LiveBlockCache = liveBlockCache
+	}
+	// Publishing happens on the block apply path, so the per-block view prewarm
+	// runs on build workers instead of the apply goroutines. Configured here
+	// rather than in liteserverOptions because it is a property of the node's
+	// apply pipeline, not of the liteserver.
+	if liveViewOptions.FragmentBuildWorkers == 0 {
+		liveViewOptions.FragmentBuildWorkers = liveview.DefaultFragmentBuildWorkers
+	}
+	if liveViewOptions.OnFragmentBuildError == nil {
+		fragmentLogger := baseLogger.With().Str("component", "liveview").Logger()
+		liveViewOptions.OnFragmentBuildError = func(block ton.BlockIDExt, err error) {
+			fragmentLogger.Debug().
+				Err(err).
+				Stringer("block", storage.BlockRef(block)).
+				Msg("failed to prewarm live block view")
+		}
 	}
 	liveStore := liveview.New(store, liveViewOptions)
 	tvmInstance := tvm.NewTVM()

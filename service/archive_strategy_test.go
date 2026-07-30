@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"math/big"
 	"testing"
@@ -511,7 +512,7 @@ func testArchiveStrategyMasterStateWithWorkchains(t *testing.T, workchains *cell
 }
 
 func TestArchiveMasterBlockSequenceStopsBeforeNonStartKeyBlock(t *testing.T) {
-	start := &storage.BlockState{Block: testMasterBlockID(10)}
+	start := testMasterBlockID(10)
 	blocks := map[uint32]PreparedBlock{
 		11: testArchiveMasterBlock(11, false),
 		12: testArchiveMasterBlock(12, true),
@@ -527,7 +528,7 @@ func TestArchiveMasterBlockSequenceStopsBeforeNonStartKeyBlock(t *testing.T) {
 }
 
 func TestArchiveMasterBlockSequenceAllowsStartKeyBlock(t *testing.T) {
-	start := &storage.BlockState{Block: testMasterBlockID(10)}
+	start := testMasterBlockID(10)
 	blocks := map[uint32]PreparedBlock{
 		11: testArchiveMasterBlock(11, true),
 		12: testArchiveMasterBlock(12, false),
@@ -553,4 +554,55 @@ func testArchiveMasterBlock(seqno uint32, keyBlock bool) PreparedBlock {
 
 func testMasterBlockID(seqno uint32) ton.BlockIDExt {
 	return testBlockID(-1, topShard, seqno)
+}
+
+func TestArchiveShardPrefixInputsIndexTargetsByMasterSeqno(t *testing.T) {
+	svc := &Service{}
+	start := testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32))
+	states := map[uint32]*storage.BlockState{
+		11: testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32)),
+		12: testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32)),
+	}
+
+	inputs, err := svc.archiveShardPrefixInputsForWindow(start, states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inputs.stateTargets) != len(states) {
+		t.Fatalf("state targets = %d, want %d", len(inputs.stateTargets), len(states))
+	}
+	for seqno := range states {
+		if _, ok := inputs.stateTargets[seqno]; !ok {
+			t.Fatalf("state targets missing master seqno %d", seqno)
+		}
+	}
+}
+
+func TestApplyShardClientArchiveWindowReusesPlannedShardTargets(t *testing.T) {
+	master := testMasterBlockID(11)
+	window := &shardClientArchiveWindow{
+		startSeqno: 11,
+		masterStates: map[uint32]*storage.BlockState{
+			// No parsed state: recomputing shard targets from it would fail,
+			// so the apply must reuse the planner-provided slice.
+			11: {Block: master, Cell: cell.BeginCell().EndCell()},
+		},
+		shardTargets: map[uint32][]ton.BlockIDExt{11: {}},
+	}
+	runner := &archiveCatchUpRunner{}
+
+	current := &storage.CurrentState{
+		ShardClientSeqno: 10,
+		Masterchain:      storage.BlockState{Block: testMasterBlockID(10)},
+	}
+	next, err := runner.applyShardClientArchiveWindow(context.Background(), current, window)
+	if err != nil {
+		t.Fatalf("apply archive window with planned targets: %v", err)
+	}
+	if next.ShardClientSeqno != 11 {
+		t.Fatalf("shard client seqno = %d, want 11", next.ShardClientSeqno)
+	}
+	if window.shardTargetElapsed != 0 {
+		t.Fatal("apply re-parsed shard targets despite planner-provided slice")
+	}
 }

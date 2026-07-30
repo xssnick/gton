@@ -1490,3 +1490,98 @@ func testExternalMessageBOCWithBody(t *testing.T, value uint64) []byte {
 	}
 	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 }
+
+// blockOverlayFanoutKey feeds overlayFanoutDeduper, so its shape is a dedup
+// contract and not just a log string: it must stay per (class, chain position)
+// and must not start distinguishing competing blocks at the same position.
+func TestBlockOverlayFanoutKeyIsPerClassAndChainPosition(t *testing.T) {
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     7,
+		RootHash:  bytes.Repeat([]byte{0x01}, 32),
+		FileHash:  bytes.Repeat([]byte{0x02}, 32),
+	}
+	fork := block
+	fork.RootHash = bytes.Repeat([]byte{0x03}, 32)
+	fork.FileHash = bytes.Repeat([]byte{0x04}, 32)
+
+	key := blockOverlayFanoutKey("block", block)
+	if want := "block:" + tnstore.FormatBlockRef(block); key != want {
+		t.Fatalf("fanout key = %q, want %q", key, want)
+	}
+	if got := blockOverlayFanoutKey("block", fork); got != key {
+		t.Fatalf("competing block at the same position got key %q, want the shared %q", got, key)
+	}
+	if got := blockOverlayFanoutKey("candidate", block); got == key {
+		t.Fatalf("candidate class shares the block class key %q", key)
+	}
+
+	next := block
+	next.SeqNo++
+	if got := blockOverlayFanoutKey("block", next); got == key {
+		t.Fatalf("next seqno shares the key %q", key)
+	}
+
+	shard := block
+	shard.Workchain = 0
+	if got := blockOverlayFanoutKey("block", shard); got == key {
+		t.Fatalf("other workchain shares the key %q", key)
+	}
+}
+
+// TestFastSyncDeclinedBroadcastsAreDropped covers the send-only case: when this
+// node publishes DoNotReceiveBroadcasts in its member flags, a peer that
+// ignores the flag must not make us spend decode work on the payload.
+func TestFastSyncDeclinedBroadcastsAreDropped(t *testing.T) {
+	node := newTestNode(t)
+
+	// receiveBroadcasts is false only for a validator under plumtree, which is
+	// exactly when the member flags say DoNotReceiveBroadcasts.
+	newSub := func(receiveBroadcasts bool) *overlaySubscription {
+		return testOverlaySubscription(&overlaySubscription{
+			node: node,
+			spec: overlaySpec{
+				Name:    "fast-sync.0",
+				Kind:    overlayKindFastSync,
+				ShortID: []byte{0x04, 0x05, 0x06},
+			},
+			fastSync: &fastSyncOverlayRuntime{
+				spec: fastSyncOverlaySpec{
+					localValidator:    true,
+					receiveBroadcasts: receiveBroadcasts,
+				},
+			},
+			log: discardLogger(),
+		})
+	}
+
+	msg := tonnodeapi.NewShardBlockBroadcast{}
+	payload := newSerializedBroadcastPayload(make(chan struct{}))
+
+	declined := newSub(false)
+	result, err := declined.classifyBroadcastPayload(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
+	if err != nil {
+		t.Fatalf("classify declined broadcast: %v", err)
+	}
+	if result.disposition != broadcastDispositionIgnore {
+		t.Fatalf("declined broadcast was accepted: %+v", result.accepted)
+	}
+	if payload.serialized {
+		t.Fatal("declined broadcast was serialized before being dropped")
+	}
+
+	// The gate is narrow: it asks the runtime, and a receiving overlay — which
+	// is every overlay that is not a plumtree validator, including one built
+	// from a zero-valued spec — never answers yes.
+	if !declined.fastSync.declinesBroadcasts() {
+		t.Fatal("a validator under plumtree must decline broadcasts")
+	}
+	if newSub(true).fastSync.declinesBroadcasts() {
+		t.Fatal("a receiving overlay must not decline broadcasts")
+	}
+	zeroValued := &fastSyncOverlayRuntime{}
+	if zeroValued.declinesBroadcasts() {
+		t.Fatal("a zero-valued runtime must read as receiving, not declining")
+	}
+}

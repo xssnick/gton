@@ -114,7 +114,9 @@ func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *block
 }
 
 func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.BlockBroadcastSignatureCheck) error {
-	parsed, err := blockproof.ParseCell(req.Block, req.Proof)
+	// The same decoded proof cell reaches the verify pipeline again through the
+	// p2p hot cache; share the parse with it.
+	parsed, err := s.parsedProofs.parse(req.Block, req.Proof)
 	if err != nil {
 		return err
 	}

@@ -50,6 +50,10 @@ type overlaySubscription struct {
 	chainDownloads      map[chainDownloadKey]*chainDownloadState
 	liveNextPeers       map[PeerID]*liveNextPeerState
 	peerNotify          chan struct{}
+	directory           map[PeerID]*directoryEntry
+	peerCacheMu         sync.Mutex
+	peerCachePrev       map[PeerID]*peerCacheEntry
+	peerCacheSeedOnce   sync.Once
 	broadcastTargetsMx  sync.Mutex
 	broadcastTargets    atomic.Pointer[broadcastTargetsSnapshot]
 	broadcastTargetsGen atomic.Uint64
@@ -276,6 +280,12 @@ type overlayPeer struct {
 	broadcastPeer  overlay.BroadcastPeer
 	release        func()
 
+	// Lock-free counters feeding the persistent peer cache: srcScore counts
+	// first-accepted broadcasts delivered by this peer, outboundOK marks that
+	// the peer answered an outbound query of ours (cache eligibility).
+	srcScore   atomic.Uint32
+	outboundOK atomic.Bool
+
 	statsMx           sync.Mutex
 	versionMajor      int32
 	versionMinor      int32
@@ -335,10 +345,16 @@ func (s *overlaySubscription) run(ctx context.Context) {
 	defer refreshTimer.Stop()
 	neighbourTimer := time.NewTimer(0)
 	defer neighbourTimer.Stop()
+	var peerCacheC <-chan time.Time
+	if s.peerCacheEnabled() {
+		peerCacheTicker := time.NewTicker(peerCacheSaveInterval)
+		defer peerCacheTicker.Stop()
+		peerCacheC = peerCacheTicker.C
+	}
 	var pingTimer *time.Timer
 	var pingC <-chan time.Time
-	if s.spec.QueryCapabilities || s.spec.Kind == overlayKindCustomFixed && s.spec.SendQueries {
-		pingTimer = time.NewTimer(s.nextQueryProbeDelay())
+	if s.spec.probesPeersPeriodically() {
+		pingTimer = time.NewTimer(s.spec.nextQueryProbeDelay())
 		defer pingTimer.Stop()
 		pingC = pingTimer.C
 	}
@@ -346,7 +362,7 @@ func (s *overlaySubscription) run(ctx context.Context) {
 	var probeTimer *time.Timer
 	var probeC <-chan time.Time
 	var probePolicy fixedProbePolicy
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.runsFixedPeerProbes() {
 		probePolicy = defaultFixedProbePolicy()
 		probeTimer = time.NewTimer(nextFixedProbeDelay(probePolicy))
 		defer probeTimer.Stop()
@@ -365,9 +381,11 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		case <-neighbourTimer.C:
 			s.reloadNeighbours()
 			neighbourTimer.Reset(nextNeighbourReloadDelay())
+		case <-peerCacheC:
+			s.node.runAsync(s.savePeerCacheSnapshot)
 		case <-pingC:
 			s.startPingPeers(ctx)
-			pingTimer.Reset(s.nextQueryProbeDelay())
+			pingTimer.Reset(s.spec.nextQueryProbeDelay())
 		case <-probeC:
 			s.startProbeFixedPeers(ctx, probePolicy)
 			probeTimer.Reset(nextFixedProbeDelay(probePolicy))
@@ -376,10 +394,18 @@ func (s *overlaySubscription) run(ctx context.Context) {
 }
 
 func (s *overlaySubscription) startPeerDiscovery(ctx context.Context) {
-	if s.spec.Kind == overlayKindCustomFixed ||
-		s.spec.Kind == overlayKindFastSync {
+	if s.spec.seedsFromFixedNodes() {
 		s.startSeedFromFixedNodes(ctx)
 		return
+	}
+	if s.peerCacheEnabled() {
+		// Once per subscription: redial the persisted roster alongside the
+		// DHT seed so restart warm-up does not wait on discovery.
+		s.peerCacheSeedOnce.Do(func() {
+			s.node.runAsync(func() {
+				s.seedFromPeerCache(ctx)
+			})
+		})
 	}
 	s.startSeedFromDHT(ctx)
 }
@@ -614,12 +640,12 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 		requests   int
 		nodesSeen  int
 		startedAt  = time.Now()
-		knownStart = len(s.knownPeersSnapshot())
+		knownStart = s.knownPeerCount()
 		aliveStart = s.aliveKnownPeerCount()
 	)
 
 	logSearch := aliveStart == 0
-	refreshOnly := aliveStart >= s.currentSeedTarget(targetPeers)
+	refreshOnly := knownStart >= s.currentSeedTarget(targetPeers)
 	if logSearch {
 		s.log.Info().
 			Int("known_peers", knownStart).
@@ -638,7 +664,7 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 	}
 
 	replacements := 0
-	for i := 0; i < maxRequests && (refreshOnly || s.aliveKnownPeerCount() < s.currentSeedTarget(targetPeers)); i++ {
+	for i := 0; i < maxRequests && (refreshOnly || s.knownPeerCount() < s.currentSeedTarget(targetPeers)); i++ {
 		lookupCtx, cancel := context.WithTimeout(ctx, dhtFindTimeout)
 		var nodes *overlay.NodesList
 		if cont == nil {
@@ -664,7 +690,7 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 		nodesSeen += len(nodes.List)
 
 		for _, node := range nodes.List {
-			if !refreshOnly && s.aliveKnownPeerCount() >= s.currentSeedTarget(targetPeers) {
+			if !refreshOnly && s.knownPeerCount() >= s.currentSeedTarget(targetPeers) {
 				break
 			}
 			if refreshOnly {
@@ -769,21 +795,43 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 	}
 	s.mx.Unlock()
 
-	addrList, _, err := findPeerAddresses(ctx, s.node.dht, identity.peerID[:])
-	if err != nil {
-		return false, fmt.Errorf("find ADNL addresses: %w", err)
-	}
-	if len(addrList.Addresses) == 0 {
-		return false, fmt.Errorf("overlay node has no addresses")
-	}
-
-	endpoint, err := peerEndpointFromAddresses(addrList.Addresses)
+	// Resolve rather than reuse the filed address. A DHT lookup is expensive,
+	// but nothing else re-checks an endpoint: acquirePeerEndpoint does no I/O
+	// (the ADNL handshake is lazy), so a dial to a peer that has moved fails
+	// silently later, and attachPooledPeer writes the same dead address back
+	// into the directory. Re-resolving on every gossip mention is what keeps a
+	// moved peer reachable at all. The other discovery paths that dial straight
+	// from a filed address - promotion and the peer cache - are seeded by this
+	// one, so this is where the address has to stay honest.
+	endpoint, err := s.resolvePeerEndpoint(ctx, peerID)
 	if err != nil {
 		return false, err
 	}
-	if quicAddr, quicErr := peerQUICRouteFromAddresses(addrList.Addresses); quicErr == nil {
-		endpoint.quicAddr = quicAddr
+
+	// File what we learned before deciding whether to dial: the address and the
+	// announcement are the valuable part, and they cost nothing to keep. A full
+	// live tier may still dial an eligible replacement; attachPooledPeer repeats
+	// the selection under the same lock before it commits the swap.
+	s.mx.Lock()
+	s.rememberDirectoryPeerLocked(
+		identity.peerID,
+		identity.pub,
+		endpoint.adnlAddr,
+		endpoint.quicAddr,
+		&node,
+		time.Now(),
+	)
+	canAttach := len(s.peers) < s.livePeerLimit()
+	if !canAttach {
+		protected := s.node.protectedPeerIDs()
+		evictID := s.peerReplacementCandidateLocked(peerID, time.Now(), protected)
+		canAttach = !evictID.IsZero()
 	}
+	s.mx.Unlock()
+	if !canAttach {
+		return false, nil
+	}
+
 	pooled, releaseEndpoint, err := s.node.acquirePeerEndpoint(identity.peerID, endpoint, identity.pub)
 	if err != nil {
 		return false, fmt.Errorf("connect overlay peer endpoint: %w", err)
@@ -801,6 +849,26 @@ func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node ove
 			Msg("connected overlay peer")
 	}
 	return attached, nil
+}
+
+// resolvePeerEndpoint finds a peer's endpoint in the DHT.
+func (s *overlaySubscription) resolvePeerEndpoint(ctx context.Context, id PeerID) (peerEndpoint, error) {
+	addrList, _, err := s.node.resolvePeerAddresses(ctx, id)
+	if err != nil {
+		return peerEndpoint{}, fmt.Errorf("find ADNL addresses: %w", err)
+	}
+	if len(addrList.Addresses) == 0 {
+		return peerEndpoint{}, fmt.Errorf("overlay node has no addresses")
+	}
+
+	endpoint, err := peerEndpointFromAddresses(addrList.Addresses)
+	if err != nil {
+		return peerEndpoint{}, err
+	}
+	if quicAddr, quicErr := peerQUICRouteFromAddresses(addrList.Addresses); quicErr == nil {
+		endpoint.quicAddr = quicAddr
+	}
+	return endpoint, nil
 }
 
 func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
@@ -829,7 +897,7 @@ func (s *overlaySubscription) seedFromFixedNodes(ctx context.Context) {
 		}
 		candidates = append(candidates, id)
 	}
-	if s.fastSync != nil {
+	if s.spec.shufflesSeedOrder() {
 		rand.Shuffle(len(candidates), func(i, j int) {
 			candidates[i], candidates[j] = candidates[j], candidates[i]
 		})
@@ -903,7 +971,7 @@ func (s *overlaySubscription) hasMissingFixedQUICRoute() bool {
 }
 
 func (s *overlaySubscription) connectFixedNode(ctx context.Context, nodeID PeerID) (bool, error) {
-	addrList, pub, err := findPeerAddresses(ctx, s.node.dht, nodeID[:])
+	addrList, pub, err := s.node.resolvePeerAddresses(ctx, nodeID)
 	if err != nil {
 		return false, fmt.Errorf("find ADNL addresses: %w", err)
 	}
@@ -1051,7 +1119,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 
 	var evicted *overlayPeer
 	var evictID PeerID
-	if len(s.peers) >= s.peerLimit() {
+	if len(s.peers) >= s.livePeerLimit() {
 		protected := s.node.protectedPeerIDs()
 		evictID = s.attachPeerEvictionCandidateLocked(pooled.id, protected)
 		if evictID.IsZero() {
@@ -1060,7 +1128,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		}
 	}
 
-	fixedMember := s.spec.Kind == overlayKindCustomFixed
+	fixedMember := s.spec.membersArePermanent()
 	if s.fastSync != nil {
 		fixedMember = s.fastSync.permanent(pooled.id)
 	}
@@ -1077,12 +1145,25 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 		evicted = s.peers[evictID]
 		delete(s.peers, evictID)
 		s.removeNeighbourLocked(evictID)
+		// Demotion, not amnesia: the directory row stays, so the peer is still
+		// advertised, still a promotion candidate, and still served through the
+		// detached query path.
+		s.markDirectoryLiveLocked(evictID, false)
 	}
-	if s.pendingOnAttach() {
+	if s.spec.peersStartPending() {
 		state.markPending()
 	}
 	state.initRebroadcastQueues()
 	s.peers[pooled.id] = state
+	s.rememberDirectoryPeerLocked(
+		pooled.id,
+		pooled.pub,
+		pooled.addr,
+		pooled.route.quicAddr(),
+		announced,
+		time.Now(),
+	)
+	s.markDirectoryLiveLocked(pooled.id, true)
 	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 
@@ -1091,18 +1172,9 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	}
 	s.installHandlers(state)
 	s.startPeerRebroadcastWorker(state)
-	if announced != nil ||
-		s.spec.Kind == overlayKindCustomFixed ||
-		s.spec.Kind == overlayKindFastSync ||
-		s.spec.Kind == overlayKindPublicShard {
-		s.reloadNeighbours()
-		s.startPeerWarmup(state)
-	}
+	s.reloadNeighbours()
+	s.startPeerWarmup(state)
 	return true
-}
-
-func (s *overlaySubscription) pendingOnAttach() bool {
-	return s.spec.Kind == overlayKindPublicShard
 }
 
 func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *overlay.Node, fixedMember bool) (*overlayPeer, error) {
@@ -1150,19 +1222,11 @@ func (s *overlaySubscription) acceptsPeerID(id PeerID) bool {
 	if s.fastSync != nil {
 		return s.fastSync.contains(id)
 	}
-	if s.spec.Kind != overlayKindCustomFixed {
+	if !s.spec.restrictsPeerIDs() {
 		return true
 	}
 	_, ok := s.spec.FixedNodeIDs[id]
 	return ok
-}
-
-// usesDedicatedQueryPeers reports whether this subscription routes queries
-// through its own configured roster instead of the public overlay peer set.
-// Such a subscription has no DHT presence, so the archive pool must neither
-// crawl for peers on it nor own their transports.
-func (s *overlaySubscription) usesDedicatedQueryPeers() bool {
-	return s.spec.Kind == overlayKindCustomFixed
 }
 
 // adoptsInboundPeer reports whether a raw inbound transport joins this
@@ -1170,17 +1234,30 @@ func (s *overlaySubscription) usesDedicatedQueryPeers() bool {
 // (membership-listed ones); public overlays serve unlisted ingress through
 // the broadcast-receiver resolver instead.
 func (s *overlaySubscription) adoptsInboundPeer(id PeerID) bool {
-	return s.spec.Kind == overlayKindCustomFixed && s.acceptsPeerID(id)
+	return s.spec.adoptsInboundPeers() && s.acceptsPeerID(id)
+}
+
+// livePeerLimit bounds the peers that hold a transport. It must cover every
+// subsystem that talks to peers at once — query neighbours, the plumtree active
+// set and the transient download/proof sets — with room to rotate; everything
+// beyond that is knowledge, which belongs in the directory. Fixed-membership
+// overlays are sized by their roster instead, since every member is expected to
+// be reachable.
+func (s *overlaySubscription) livePeerLimit() int {
+	if !s.spec.hasDirectoryTier() {
+		return s.peerLimit()
+	}
+	return maxLivePeersPerOverlay
 }
 
 func (s *overlaySubscription) peerLimit() int {
-	if s.spec.Kind == overlayKindFastSync {
+	if s.spec.usesFastSyncRoster() {
 		expected := len(s.spec.FixedNodes) +
-			len(s.fastSync.spec.roster.rootPublicKeyIDs)*
+			s.fastSync.spec.roster.rootCount()*
 				FastSyncMemberSlotCount
 		return max(maxPeersPerOverlay, expected)
 	}
-	if s.spec.Kind == overlayKindCustomFixed &&
+	if s.spec.rosterSizesPeerLimit() &&
 		len(s.spec.FixedNodes) > maxPeersPerOverlay {
 		return len(s.spec.FixedNodes)
 	}
@@ -1267,21 +1344,21 @@ func (s *overlaySubscription) startPeerWarmup(peer *overlayPeer) {
 		ctx, cancel := context.WithTimeout(s.node.runCtx, attachWarmupTimeout)
 		defer cancel()
 
-		if s.spec.Kind == overlayKindCustomFixed {
-			s.warmupCustomFixedPeer(ctx, peer)
-			return
-		}
-		if s.spec.Kind == overlayKindFastSync {
-			s.warmupFastSyncPeer(ctx, peer)
-			return
-		}
-		if s.spec.QueryCapabilities {
-			s.pingPeer(ctx, peer)
-		}
-		if ctx.Err() == nil && s.spec.RandomPeers {
-			s.exchangeRandomPeers(ctx, peer)
-		}
+		s.warmupPeer(ctx, peer)
 	})
+}
+
+// warmupPublicPeer is the default arm of warmupPeer. The two gates are
+// independent on purpose: a public overlay may advertise capabilities without
+// participating in peer gossip, and the ctx check keeps a timed-out warmup from
+// spending its whole budget on the exchange.
+func (s *overlaySubscription) warmupPublicPeer(ctx context.Context, peer *overlayPeer) {
+	if s.spec.QueryCapabilities {
+		s.pingPeer(ctx, peer)
+	}
+	if ctx.Err() == nil && s.spec.RandomPeers {
+		s.exchangeRandomPeers(ctx, peer)
+	}
 }
 
 func (s *overlaySubscription) warmupCustomFixedPeer(ctx context.Context, peer *overlayPeer) {
@@ -1305,7 +1382,7 @@ func (s *overlaySubscription) sendCustomFixedNop(ctx context.Context, peer *over
 }
 
 func (s *overlaySubscription) retryPendingPeerWarmup(peer *overlayPeer) {
-	if s.spec.Kind != overlayKindPublicShard || !peer.isPending() {
+	if !s.spec.peersStartPending() || !peer.isPending() {
 		return
 	}
 	s.startPeerWarmup(peer)
@@ -1411,13 +1488,15 @@ func (s *overlaySubscription) refreshPeers(ctx context.Context) {
 	if !s.isActive() || !s.spec.RandomPeers {
 		return
 	}
+	s.topUpLiveTier(ctx)
+	s.gossipWithDirectoryPeers(ctx)
 	peers := s.refreshTargets()
 	if len(peers) == 0 {
 		return
 	}
 
 	exchange := s.exchangeRandomPeers
-	if s.spec.Kind == overlayKindFastSync {
+	if s.spec.usesFastSyncPeerGossip() {
 		exchange = s.exchangeFastSyncRandomPeers
 	}
 	s.runPeerMaintenance(ctx, peers, peerRefreshFanout, exchange)
@@ -1454,24 +1533,49 @@ func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *ove
 	}
 
 	for _, node := range res.List {
-		if !s.canLearnAdvertisedPeer(node) {
-			continue
-		}
-		if _, err := s.connectOverlayNodeV1(ctx, node); err != nil {
-			s.log.Debug().Err(err).Msg("failed to connect peer learned from overlay")
-		}
+		s.learnAdvertisedPeer(ctx, node)
 	}
 }
 
-func (s *overlaySubscription) pingPeers(ctx context.Context) {
-	if s.spec.Kind == overlayKindCustomFixed {
-		s.probeCustomQueryPeers(ctx)
+// learnAdvertisedPeer files a gossiped node in the directory and attaches it
+// only while the live tier is short. Learning is what makes us a useful gossip
+// surface; attaching is what costs a handshake, wrappers and goroutines, so the
+// two are deliberately decoupled — C++ likewise records up to max_peers_ rows
+// while ever touching only its small working set.
+func (s *overlaySubscription) learnAdvertisedPeer(ctx context.Context, node overlay.Node) {
+	identity, err := s.overlayNodeIdentity(node)
+	if err != nil || identity.self {
 		return
 	}
-	if s.spec.Kind == overlayKindFastSync {
-		s.pingFastSyncValidators(ctx)
+	s.mx.Lock()
+	if peer := s.peers[identity.peerID]; peer != nil {
+		// Already live: refresh both the directory row and the peer's own
+		// announcement. The peer object is what isKnownOverlayPeer reads, and
+		// its announcement expires after overlayPeerTTL - so a live peer whose
+		// announcement is never refreshed silently drops out of the known set,
+		// and with it out of neighbours, broadcast targets and the plumtree
+		// roster, while we keep gossiping with it every second.
+		peer.mergeAnnouncement(&node)
+		s.rememberDirectoryPeerLocked(identity.peerID, identity.pub, "", "", &node, time.Now())
+		s.mx.Unlock()
 		return
 	}
+	s.mx.Unlock()
+
+	s.mx.Lock()
+	s.rememberDirectoryPeerLocked(identity.peerID, identity.pub, "", "", &node, time.Now())
+	shortOfLive := len(s.peers) < s.livePeerLimit()
+	s.mx.Unlock()
+
+	if !shortOfLive {
+		return
+	}
+	if _, err := s.connectOverlayNodeV1(ctx, node); err != nil {
+		s.log.Debug().Err(err).Msg("failed to connect peer learned from overlay")
+	}
+}
+
+func (s *overlaySubscription) pingPublicPeers(ctx context.Context) {
 	if !s.isActive() || !s.spec.QueryCapabilities {
 		return
 	}
@@ -1568,6 +1672,7 @@ func (s *overlaySubscription) removePeerIfCurrent(peer *overlayPeer) {
 	}
 	delete(s.peers, peer.id)
 	s.removeNeighbourLocked(peer.id)
+	s.markDirectoryLiveLocked(peer.id, false)
 	s.notifyPeersChangedLocked()
 	s.mx.Unlock()
 
@@ -1663,19 +1768,11 @@ func (s *overlaySubscription) aliveKnownPeersSnapshot() []*overlayPeer {
 }
 
 func (s *overlaySubscription) overlayNodesSnapshot() []overlay.Node {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	list := make([]overlay.Node, 0, len(s.peers))
-	now := time.Now()
-	for _, peer := range s.peers {
-		node := peer.advertisedNodeSnapshot(now)
-		if node == nil || !overlayNodeHasSerializableID(node) {
-			continue
-		}
-		list = append(list, *node)
-	}
-	return list
+	// Drawn from the directory, not the live set: what we gossip is how other
+	// nodes learn about our peers and, symmetrically, how wide a surface we
+	// keep in the network. Narrowing it to the peers we happen to hold
+	// transports for is exactly what starved broadcast fanout at the old cap.
+	return s.advertisedDirectoryNodes(time.Now())
 }
 
 func (s *overlaySubscription) randomPeerAdvertisement() (overlay.NodesList, error) {
@@ -1706,16 +1803,4 @@ func (s *overlaySubscription) randomOverlayNodes(limit int) []overlay.Node {
 		list = list[:limit]
 	}
 	return list
-}
-
-func (s *overlaySubscription) canLearnAdvertisedPeer(node overlay.Node) bool {
-	if s.aliveKnownPeerCount() < maxPeersPerOverlay {
-		return true
-	}
-
-	identity, err := s.overlayNodeIdentity(node)
-	if err != nil || identity.self {
-		return false
-	}
-	return s.hasPeer(identity.peerID)
 }

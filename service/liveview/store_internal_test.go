@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -322,5 +323,261 @@ func (b *blockingBlockDataBacking) BlockData(ctx context.Context, block ton.Bloc
 		return b.data, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func testFragmentBlockView(block ton.BlockIDExt) *BlockView {
+	return &BlockView{block: cloneBlockID(block), retainCurrentCaches: true}
+}
+
+// The view build doubles as the structural check on the block root and state,
+// so it stays synchronous: turning on background prewarm workers must not make
+// an unpublishable block publishable.
+func TestStorePublishStillRejectsInvalidFragmentsWithPrewarmWorkers(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(0x31, 8).EndCell()
+	stateRoot := cell.BeginCell().MustStoreUInt(0x32, 8).EndCell()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     1 << 62,
+		SeqNo:     35,
+		RootHash:  root.Hash(),
+		FileHash:  bytes.Repeat([]byte{0x36}, 32),
+	}
+	state := storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(), Cell: stateRoot}
+
+	live := New(noopBacking{}, Options{FragmentBuildWorkers: 2})
+	err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block: block,
+		Root:  root,
+		State: &state,
+	})
+	if err == nil {
+		t.Fatal("unparseable read fragments were accepted with prewarm workers enabled")
+	}
+	if _, err := live.BlockRoot(t.Context(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("block root after rejected publish = %v, want ErrNotFound", err)
+	}
+}
+
+func TestStoreFragmentPrewarmSlotsSeparateMasterFromShards(t *testing.T) {
+	master := testLiveBlockID(-1, masterchainShard, 41, 0x41)
+	shard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+
+	inline := New(noopBacking{})
+	if inline.fragmentPrewarmSlots(master) != nil || inline.fragmentPrewarmSlots(shard) != nil {
+		t.Fatal("prewarm slots exist without configured workers")
+	}
+
+	live := New(noopBacking{}, Options{FragmentBuildWorkers: 1})
+	masterSlots := live.fragmentPrewarmSlots(master)
+	shardSlots := live.fragmentPrewarmSlots(shard)
+	if masterSlots == nil || shardSlots == nil {
+		t.Fatal("prewarm slots missing with configured workers")
+	}
+	if masterSlots == shardSlots {
+		// A shard burst arrives from the shard apply workers and would otherwise
+		// crowd out the masterchain view, which is the one whose prewarm covers
+		// the config epoch and global libraries.
+		t.Fatal("masterchain prewarm shares the shard slots")
+	}
+}
+
+// A publish must never block on a busy prewarm slot: that would put the cost
+// back on the block apply path. The cold view is installed instead.
+func TestStoreFragmentPrewarmPublishesColdViewWhenSlotsAreBusy(t *testing.T) {
+	shard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+	live := New(noopBacking{}, Options{FragmentBuildWorkers: 1})
+	live.blocks[storage.BlockKey(shard)] = &liveBlock{id: shard}
+
+	live.fragmentBuildSlots <- struct{}{}
+	defer func() { <-live.fragmentBuildSlots }()
+
+	view := testFragmentBlockView(shard)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		live.scheduleFragmentPrewarm(shard, view)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduleFragmentPrewarm blocked on a busy slot")
+	}
+
+	cached, err := live.cachedBlockFragments(shard)
+	if err != nil {
+		t.Fatalf("cold view was not published: %v", err)
+	}
+	if cached != view {
+		t.Fatal("published view is not the one handed to the prewarm")
+	}
+}
+
+func TestStoreFragmentPrewarmInstallsView(t *testing.T) {
+	shard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+	live := New(noopBacking{}, Options{FragmentBuildWorkers: 1})
+	live.blocks[storage.BlockKey(shard)] = &liveBlock{id: shard}
+
+	view := testFragmentBlockView(shard)
+	live.scheduleFragmentPrewarm(shard, view)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		cached, err := live.cachedBlockFragments(shard)
+		if err == nil {
+			if cached != view {
+				t.Fatal("installed view is not the one handed to the prewarm")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background prewarm never installed the view")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A block can leave the current state while its view is still being prewarmed;
+// the view installed afterwards must not start filling the per-current caches.
+func TestStoreFragmentInstallHonoursReleasedCurrentCaches(t *testing.T) {
+	shard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+	live := New(noopBacking{})
+	live.blocks[storage.BlockKey(shard)] = &liveBlock{id: shard}
+
+	previous := &storage.CurrentState{
+		Masterchain: storage.BlockState{Block: testLiveBlockID(-1, masterchainShard, 40, 0x40)},
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shard): {Block: shard},
+		},
+	}
+	next := &storage.CurrentState{
+		Masterchain: storage.BlockState{Block: testLiveBlockID(-1, masterchainShard, 41, 0x41)},
+	}
+	live.releaseRetiredCurrentCachesLocked(previous, next)
+
+	view := testFragmentBlockView(shard)
+	if got := live.rememberBlockFragments(shard, view); got != view {
+		t.Fatal("view was not installed")
+	}
+	view.mu.Lock()
+	retained := view.retainCurrentCaches
+	view.mu.Unlock()
+	if retained {
+		t.Fatal("view installed after the block was retired still retains current caches")
+	}
+}
+
+func TestStoreFragmentInstallSkipsEvictedBlock(t *testing.T) {
+	shard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+	live := New(noopBacking{})
+
+	view := testFragmentBlockView(shard)
+	if got := live.rememberBlockFragments(shard, view); got != view {
+		t.Fatal("rememberBlockFragments did not return the caller's view for an absent block")
+	}
+	if len(live.blocks) != 0 {
+		t.Fatalf("live blocks after installing onto an absent block = %d, want 0", len(live.blocks))
+	}
+}
+
+// cachedBlockFragments used to read the field after releasing the read lock,
+// which raced rememberBlockFragments. Background prewarm makes that write
+// happen on every publish, so the read must stay inside the lock.
+func TestCachedBlockFragmentsIsRaceFreeAgainstInstall(t *testing.T) {
+	shard := testLiveBlockID(0, int64(1)<<62, 70, 0x70)
+	live := New(noopBacking{})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			live.mu.Lock()
+			live.blocks[storage.BlockKey(shard)] = &liveBlock{id: shard}
+			live.mu.Unlock()
+			live.rememberBlockFragments(shard, testFragmentBlockView(shard))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_, _ = live.cachedBlockFragments(shard)
+		}
+	}()
+	wg.Wait()
+}
+
+// masterchainHistoryKey is the history key every masterchain lookup lands on.
+var masterchainHistoryKey = storage.BlockHistoryKey{Workchain: masterchainID, Shard: -0x8000000000000000}
+
+func seedLiveHistory(live *Store, metas ...*storage.BlockMeta) {
+	live.mu.Lock()
+	defer live.mu.Unlock()
+	for _, meta := range metas {
+		live.addMetaHistoryIndexLocked(meta)
+	}
+}
+
+func testHistoryMeta(key storage.BlockHistoryKey, seqno uint32, startLT, endLT uint64, utime uint32) *storage.BlockMeta {
+	return &storage.BlockMeta{
+		ID: ton.BlockIDExt{
+			Workchain: key.Workchain,
+			Shard:     key.Shard,
+			SeqNo:     seqno,
+			RootHash:  bytes.Repeat([]byte{byte(seqno)}, 32),
+			FileHash:  bytes.Repeat([]byte{byte(seqno + 1)}, 32),
+		},
+		StartLT:  startLT,
+		EndLT:    endLT,
+		GenUTime: utime,
+	}
+}
+
+// The live index is a sliding window, so a hit whose predecessor is missing
+// from it says nothing about blocks older than the window: the answer has to
+// come from the backing store instead. Skipping that check for the masterchain
+// made lookupBlock hand clients the oldest cached master for any lt or utime
+// below the window.
+func TestCachedDirectLookupRequiresLiveWindowCoverage(t *testing.T) {
+	shardKey := storage.BlockHistoryKey{Workchain: 0, Shard: 1 << 62}
+
+	for _, tc := range []struct {
+		name string
+		key  storage.BlockHistoryKey
+	}{
+		{name: "masterchain", key: masterchainHistoryKey},
+		{name: "shard", key: shardKey},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live := New(noopBacking{})
+			seedLiveHistory(live,
+				testHistoryMeta(tc.key, 100, 2000, 2009, 2000),
+				testHistoryMeta(tc.key, 101, 2010, 2019, 2010),
+			)
+
+			if _, err := live.cachedDirectBlockByLTForPrefix(tc.key, 1000); !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("lt below the window: err = %v, want ErrNotFound", err)
+			}
+			if _, err := live.cachedDirectBlockByUnixTimeForPrefix(tc.key, 1000); !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("utime below the window: err = %v, want ErrNotFound", err)
+			}
+
+			// Covered lookups must still be answered from the window, or the
+			// live fast path would be gone.
+			block, err := live.cachedDirectBlockByLTForPrefix(tc.key, 2015)
+			if err != nil {
+				t.Fatalf("lt inside the window: unexpected error %v", err)
+			}
+			if block.SeqNo != 101 {
+				t.Fatalf("lt inside the window: seqno = %d, want 101", block.SeqNo)
+			}
+			block, err = live.cachedDirectBlockByUnixTimeForPrefix(tc.key, 2005)
+			if err != nil {
+				t.Fatalf("utime inside the window: unexpected error %v", err)
+			}
+			if block.SeqNo != 101 {
+				t.Fatalf("utime inside the window: seqno = %d, want 101", block.SeqNo)
+			}
+		})
 	}
 }

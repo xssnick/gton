@@ -313,3 +313,50 @@ func waitStateCellWindowByteSize(window *stateCellWindowCache, want uint64, time
 	}
 	return 0, false
 }
+
+func TestStateCellPrewriterDetachedEnqueueDoesNotBlockOnFullQueue(t *testing.T) {
+	store := &stateCellPrewriterTestStore{}
+	writer := newStateCellPrewriter(zerolog.Nop(), store, 1)
+
+	first := cell.BeginCell().MustStoreUInt(0x91, 8).EndCell()
+	if _, _, err := writer.enqueueDetached(mustPreparedReachableStateCells(t, first)); err != nil {
+		t.Fatalf("enqueue first records: %v", err)
+	}
+
+	// The queue is over its byte limit now; the append must still not block.
+	second := cell.BeginCell().MustStoreUInt(0x92, 8).EndCell()
+	seq, wait, err := writer.enqueueDetached(mustPreparedReachableStateCells(t, second))
+	if err != nil {
+		t.Fatalf("enqueue second records: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("second records sequence = %d, want 2", seq)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- wait() }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("backpressure wait returned before the queue drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer.start(ctx, context.Background(), func(fn func()) { go fn() })
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("backpressure wait after drain: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backpressure wait did not release after the queue drained")
+	}
+	if err := writer.wait(context.Background(), seq); err != nil {
+		t.Fatalf("wait for prewritten records: %v", err)
+	}
+	if got, want := store.recordCount(), 2; got != want {
+		t.Fatalf("prewritten records = %d, want %d", got, want)
+	}
+}

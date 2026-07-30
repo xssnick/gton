@@ -20,15 +20,19 @@ type archiveShardBlockLoader struct {
 }
 
 type shardClientArchiveWindow struct {
-	startSeqno       uint32
-	masterStats      *archive.ImportStats
-	totalStats       *archive.ImportStats
-	masterStates     map[uint32]*storage.BlockState
-	masterBlocks     map[uint32]PreparedBlock
-	masterSequence   []PreparedBlock
-	masterProofs     map[uint32]*masterchainConsensusProof
-	archiveBlocks    map[storage.BlockRootHash]PreparedBlock
-	archiveImports   []*archiveImportResult
+	startSeqno     uint32
+	masterStats    *archive.ImportStats
+	totalStats     *archive.ImportStats
+	masterStates   map[uint32]*storage.BlockState
+	masterBlocks   map[uint32]PreparedBlock
+	masterSequence []PreparedBlock
+	masterProofs   map[uint32]*masterchainConsensusProof
+	archiveBlocks  map[storage.BlockRootHash]PreparedBlock
+	archiveImports []*archiveImportResult
+	// shardTargets carries the planner's per-master-seqno shard targets to the
+	// runner (shared-immutable slices; written on the shard import task before
+	// it completes, read by the runner after the window is emitted).
+	shardTargets     map[uint32][]ton.BlockIDExt
 	stateCells       *stateCellWindowCache
 	appliedStates    appliedStateSet
 	shardArchives    int
@@ -85,11 +89,12 @@ func (r *archiveCatchUpRunner) importArchiveWindowShards(ctx context.Context, qu
 	window.splitDepth = splitDepth
 
 	task.setStage("shard_targets")
-	plans, splitDepth, err := r.service.missingArchiveShardImportPlansForWindow(prepared.startMaster, window.masterStates, window.archiveBlocks)
+	plans, inputs, err := r.service.missingArchiveShardImportPlansForWindow(prepared.startMaster, window.masterStates, window.archiveBlocks)
 	if err != nil {
 		return err
 	}
-	window.splitDepth = splitDepth
+	window.splitDepth = inputs.splitDepth
+	window.shardTargets = inputs.stateTargets
 	window.shardArchives = len(plans)
 
 	if len(plans) > 0 {
@@ -138,7 +143,7 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 	master := start
 	applier := window.stateCells
 	if window.masterSequence == nil {
-		sequence, err := archiveMasterBlockSequence(start, r.target.SeqNo, window.startSeqno, window.masterBlocks)
+		sequence, err := archiveMasterBlockSequence(start.Block, r.target.SeqNo, window.startSeqno, window.masterBlocks)
 		if err != nil {
 			return nil, err
 		}
@@ -214,11 +219,15 @@ func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context
 			break
 		}
 
-		targetStarted := time.Now()
-		targets, err := state2.ShardBlocksFromMasterState(masterState)
-		window.shardTargetElapsed += time.Since(targetStarted)
-		if err != nil {
-			return nil, fmt.Errorf("load shard blocks from archive master state %s: %w", storage.FormatBlockRef(masterState.Block), err)
+		targets, ok := window.shardTargets[seqno]
+		if !ok {
+			targetStarted := time.Now()
+			var err error
+			targets, err = state2.ShardBlocksFromMasterState(masterState)
+			window.shardTargetElapsed += time.Since(targetStarted)
+			if err != nil {
+				return nil, fmt.Errorf("load shard blocks from archive master state %s: %w", storage.FormatBlockRef(masterState.Block), err)
+			}
 		}
 
 		prevShards := next.Shards

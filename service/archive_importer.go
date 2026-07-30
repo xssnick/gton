@@ -16,7 +16,11 @@ const (
 
 	DefaultArchiveCatchUpCheckpointBlocks = 2000
 	DefaultArchiveCatchUpCheckpointPeriod = 2 * time.Minute
-	DefaultArchiveCatchUpPrefetchWindows  = 2
+	// Deliberately conservative: each pending window pins its imported pack
+	// payloads (blocks + prepared state-update cells) until the runner applies
+	// it, and archive packs can be huge. Operators with RAM to spare raise the
+	// ArchiveCatchUpPrefetchWindows option instead.
+	DefaultArchiveCatchUpPrefetchWindows = 2
 
 	archiveShardApplyParallelism              = 8
 	archiveMasterConsensusPrecheckParallelism = 8

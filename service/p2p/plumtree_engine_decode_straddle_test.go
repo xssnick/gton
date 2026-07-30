@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"runtime"
 	"testing"
@@ -88,7 +89,7 @@ func newPlumtreeDecodeStraddleFixture(t *testing.T) plumtreeDecodeStraddleFixtur
 			PartIndex:    partIndex,
 			TreeIndex:    partIndex + plumtreeFECTreeOffset,
 			Data:         encoder.GenSymbol(uint32(partIndex)),
-			Signature:    []byte{0xc4},
+			Signature:    bytes.Repeat([]byte{0xc4}, ed25519.SignatureSize),
 		}
 	}
 

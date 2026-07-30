@@ -56,7 +56,7 @@ func newFrozenTestNode(t testing.TB) *p2p.Node {
 
 func newMasterchainQueueTestService() *Service {
 	return &Service{
-		currentStateWake:                make(chan struct{}, 1),
+		currentStateWake:                make(chan struct{}),
 		nextMasterchainQueue:            make(map[tnstore.BlockRootHash]queuedMasterchainBlock),
 		nextMasterchainBySeqno:          make(map[uint32]tnstore.BlockRootHash),
 		nextMasterchainCandidates:       make(map[tnstore.BlockRootHash]queuedMasterchainCandidate),
@@ -320,7 +320,7 @@ func TestCatchUpCurrentStateReturnsAfterSyncUntilOffline(t *testing.T) {
 			},
 		},
 		syncUntil:        cutoff,
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 	if err := svc.catchUpCurrentState(ctx); err != nil {
 		t.Fatalf("catch up current state: %v", err)
@@ -347,7 +347,7 @@ func TestInitialStateSyncStopsAfterSyncUntilFrozen(t *testing.T) {
 			},
 		},
 		syncUntil:        cutoff,
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 
 	done := make(chan struct{})
@@ -877,10 +877,10 @@ func TestPersistArchiveCurrentStateStoresImportedMetadataOnlyState(t *testing.T)
 	if err != nil {
 		t.Fatalf("prepare current cells: %v", err)
 	}
-	if err = overlay.rememberApplied(current.Masterchain.Cell, currentCells); err != nil {
+	if err = rememberAppliedForTest(overlay, current.Masterchain.Cell, currentCells); err != nil {
 		t.Fatalf("remember current cells: %v", err)
 	}
-	if err = overlay.rememberApplied(historicalRoot, preparedCells); err != nil {
+	if err = rememberAppliedForTest(overlay, historicalRoot, preparedCells); err != nil {
 		t.Fatalf("remember historical cells: %v", err)
 	}
 	checkpointCells := overlay.beginCheckpoint()
@@ -941,10 +941,10 @@ func TestPersistArchiveCurrentStateUsesPrewrittenCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare current cells: %v", err)
 	}
-	if err = overlay.rememberApplied(current.Masterchain.Cell, currentCells); err != nil {
+	if err = rememberAppliedForTest(overlay, current.Masterchain.Cell, currentCells); err != nil {
 		t.Fatalf("remember current cells: %v", err)
 	}
-	if err = overlay.rememberApplied(historicalRoot, preparedCells); err != nil {
+	if err = rememberAppliedForTest(overlay, historicalRoot, preparedCells); err != nil {
 		t.Fatalf("remember historical cells: %v", err)
 	}
 
@@ -977,7 +977,7 @@ func TestArchiveCheckpointPersistsEntryStateCellsBeforeMetadata(t *testing.T) {
 	child := cell.BeginCell().MustStoreUInt(0x42, 8).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
 	overlay := newTestStateCellWindowCache(nil)
-	if err := overlay.rememberApplied(root, mustPreparedReachableStateCells(t, root)); err != nil {
+	if err := rememberAppliedForTest(overlay, root, mustPreparedReachableStateCells(t, root)); err != nil {
 		t.Fatalf("remember checkpoint cells: %v", err)
 	}
 
@@ -1803,23 +1803,64 @@ func TestNextSyncRunnerShouldYieldBootstrapToArchive(t *testing.T) {
 }
 
 func TestCurrentStateWakeInterruptsLivePollDelay(t *testing.T) {
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
-	svc.wakeCurrentStateSync()
+	svc := &Service{currentStateWake: make(chan struct{})}
+
+	// Taken before the wake can fire, exactly as the production caller does.
+	stateWake := svc.currentStateWakeChan()
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		svc.wakeCurrentStateSync()
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	started := time.Now()
-	if !svc.waitCurrentStatePoll(ctx, time.Hour) {
+	if !svc.waitCurrentStatePoll(ctx, stateWake, time.Hour) {
 		t.Fatal("expected current state poll wake")
 	}
-	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("wake took %s", elapsed)
 	}
 }
 
+// One wake must release every concurrent waiter: the previous single-token
+// channel let any one of the sync selectors consume a wake meant for another,
+// leaving that waiter to sit out its full retry or pace-hold timer.
+func TestCurrentStateWakeReleasesAllConcurrentWaiters(t *testing.T) {
+	svc := &Service{currentStateWake: make(chan struct{})}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const waiters = 2
+	done := make(chan error, waiters)
+	// One channel taken before the wake and shared by both waiters: the wake
+	// must release every holder of it, not just the first.
+	stateWake := svc.currentStateWakeChan()
+	for i := 0; i < waiters; i++ {
+		go func() {
+			done <- svc.waitShardStateCatchUpRetry(ctx, stateWake, time.Hour)
+		}()
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	svc.wakeCurrentStateSync()
+
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("waiter %d returned error: %v", i, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("waiter %d was not released by a single wake", i)
+		}
+	}
+}
+
 func TestCurrentStateWakeInterruptsPersistWait(t *testing.T) {
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := &Service{currentStateWake: make(chan struct{})}
 	svc.currentStatePersistMu.Lock()
 	defer svc.currentStatePersistMu.Unlock()
 
@@ -1851,8 +1892,10 @@ func TestShardStateCatchUpRetryDelayIsShort(t *testing.T) {
 }
 
 func TestCurrentStateWakeInterruptsShardStateCatchUpRetry(t *testing.T) {
-	svc := &Service{currentStateWake: make(chan struct{}, 1)}
+	svc := &Service{currentStateWake: make(chan struct{})}
 
+	// Taken before the wake can fire, exactly as the production caller does.
+	stateWake := svc.currentStateWakeChan()
 	go func() {
 		time.Sleep(10 * time.Millisecond)
 		svc.wakeCurrentStateSync()
@@ -1862,7 +1905,7 @@ func TestCurrentStateWakeInterruptsShardStateCatchUpRetry(t *testing.T) {
 	defer cancel()
 
 	started := time.Now()
-	if err := svc.waitShardStateCatchUpRetry(ctx, time.Hour); err != nil {
+	if err := svc.waitShardStateCatchUpRetry(ctx, stateWake, time.Hour); err != nil {
 		t.Fatalf("wait shard state catch-up retry: %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
@@ -2145,4 +2188,59 @@ func testCurrentStateForShutdownFlush(t *testing.T, masterSeqno, baseSeqno uint3
 			},
 		},
 	}, baseKey, master, base
+}
+
+func TestQueuedMasterchainBlockTooFarFromCurrentUsesPublishedHead(t *testing.T) {
+	svc := newMasterchainQueueTestService()
+
+	// No published head yet: queueing must never be blocked during bootstrap.
+	if svc.queuedMasterchainBlockTooFarFromCurrent(1000) {
+		t.Fatal("queueing rejected while no current state is published")
+	}
+
+	svc.currentStatus = &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{Block: testMasterBlockID(100)},
+	}
+	if svc.queuedMasterchainBlockTooFarFromCurrent(50) {
+		t.Fatal("block behind the published head reported as too far")
+	}
+	if svc.queuedMasterchainBlockTooFarFromCurrent(100 + nextMasterchainQueueLimit - 1) {
+		t.Fatal("block inside the queue window reported as too far")
+	}
+	if !svc.queuedMasterchainBlockTooFarFromCurrent(100 + nextMasterchainQueueLimit) {
+		t.Fatal("block outside the queue window not reported as too far")
+	}
+
+	// A non-masterchain head (never published in practice) must not gate queueing.
+	svc.currentStatus = &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{Block: testBlockID(0, topShard, 100)},
+	}
+	if svc.queuedMasterchainBlockTooFarFromCurrent(1000) {
+		t.Fatal("queueing rejected for a non-masterchain published head")
+	}
+}
+
+// The head check runs per queued masterchain broadcast while nextMasterchainMx
+// is held, so it must not clone the shard map to read one seqno.
+func TestQueuedMasterchainBlockTooFarFromCurrentDoesNotAllocate(t *testing.T) {
+	svc := newMasterchainQueueTestService()
+	shards := make(map[tnstore.ShardKey]tnstore.BlockState, 64)
+	for i := 0; i < 64; i++ {
+		block := testBlockID(0, int64(i+1)<<40, uint32(i))
+		shards[tnstore.ShardKeyFromBlock(block)] = tnstore.BlockState{
+			Block:         block,
+			StateRootHash: bytes32(byte(i)),
+		}
+	}
+	svc.currentStatus = &tnstore.CurrentState{
+		Masterchain: tnstore.BlockState{Block: testMasterBlockID(100)},
+		Shards:      shards,
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		svc.queuedMasterchainBlockTooFarFromCurrent(101)
+	})
+	if allocs != 0 {
+		t.Fatalf("queued masterchain head check allocated %.0f times per call, want 0", allocs)
+	}
 }

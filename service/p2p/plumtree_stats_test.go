@@ -3,8 +3,10 @@ package p2p
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -951,4 +953,73 @@ func plumtreeStatsTestPush(
 			UsefulP99MS:        40,
 		},
 	}
+}
+
+func newPlumtreeStatsJitter(step uint32) (plumtreeStatsJitter, error) {
+	if step > plumtreeStatsMaximumJitterStep {
+		return plumtreeStatsJitter{}, fmt.Errorf("invalid Plumtree stats jitter step %d", step)
+	}
+
+	return plumtreeStatsJitter{
+		delay: time.Duration(step) * plumtreeStatsJitterStepDuration,
+	}, nil
+}
+
+func newPlumtreeStatsEagerPeers(peers []PeerID) (plumtreeStatsEagerPeers, error) {
+	if len(peers) > plumtreeRegularEagerLimit {
+		return plumtreeStatsEagerPeers{}, fmt.Errorf(
+			"too many Plumtree stats eager peers: %d",
+			len(peers),
+		)
+	}
+
+	var result plumtreeStatsEagerPeers
+	result.count = uint8(copy(result.peers[:], peers))
+	return result, nil
+}
+
+func (s *plumtreeStats) Records() []PlumtreeStatsRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.epoch.store) == 0 {
+		return nil
+	}
+
+	records := make([]PlumtreeStatsRecord, 0, len(s.epoch.store))
+	for _, record := range s.epoch.store {
+		records = append(records, clonePlumtreeStatsRecord(record))
+	}
+	slices.SortFunc(records, func(left, right PlumtreeStatsRecord) int {
+		return bytes.Compare(left.Source, right.Source)
+	})
+
+	return records
+}
+
+func clonePlumtreeStatsRecord(record PlumtreeStatsRecord) PlumtreeStatsRecord {
+	record.Source = append([]byte(nil), record.Source...)
+	record.EagerSimple = append([]int64(nil), record.EagerSimple...)
+	record.EagerRotating = append([]int64(nil), record.EagerRotating...)
+	return record
+}
+
+func newPlumtreeStatsEagerSnapshot(
+	simple []PeerID,
+	rotating []PeerID,
+) (plumtreeStatsEagerSnapshot, error) {
+	simplePeers, err := newPlumtreeStatsEagerPeers(simple)
+	if err != nil {
+		return plumtreeStatsEagerSnapshot{}, err
+	}
+
+	rotatingPeers, err := newPlumtreeStatsEagerPeers(rotating)
+	if err != nil {
+		return plumtreeStatsEagerSnapshot{}, err
+	}
+
+	return plumtreeStatsEagerSnapshot{
+		simple:   simplePeers,
+		rotating: rotatingPeers,
+	}, nil
 }

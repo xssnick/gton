@@ -26,6 +26,29 @@ const (
 type shardStateApplyFunc func(context.Context, ton.BlockIDExt, []*storage.BlockState, PreparedBlock) (*storage.BlockState, error)
 type shardStateAfterApplyFunc func(context.Context, *storage.BlockState, PreparedBlock, time.Duration) error
 
+type shardApplyMasterContextKey struct{}
+
+// contextWithShardApplyMaster pins the masterchain state whose shard
+// description pulled these blocks in. The apply callbacks stamp
+// BlockState.MasterchainRef / BlockMeta.MasterchainRefSeqno from it (cppnode's
+// BlockHandle::masterchain_ref_block), so it must travel with the resolution
+// instead of being read from the commit stage's current master: the resolution
+// can run ahead of the commit, on another goroutine.
+func contextWithShardApplyMaster(ctx context.Context, master *storage.BlockState) context.Context {
+	if master == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, shardApplyMasterContextKey{}, master)
+}
+
+func shardApplyMasterFromContext(ctx context.Context) (*storage.BlockState, error) {
+	master, _ := ctx.Value(shardApplyMasterContextKey{}).(*storage.BlockState)
+	if master == nil {
+		return nil, errShardApplyMasterMissing
+	}
+	return master, nil
+}
+
 type shardStateResolverConfig struct {
 	current         map[storage.ShardKey]storage.BlockState
 	cache           map[storage.BlockRootHash]*storage.BlockState
@@ -231,6 +254,18 @@ func (r *shardStateResolver) updateCurrent(current map[storage.ShardKey]storage.
 	r.mu.Unlock()
 }
 
+// hasCurrentBlock reports that the block already is the shard-client tip for
+// its shard. The commit stage carries those over without touching the resolver
+// (keeping their original inclusion master), so the apply-ahead stage must not
+// resolve them either.
+func (r *shardStateResolver) hasCurrentBlock(block ton.BlockIDExt) bool {
+	r.mu.Lock()
+	current, ok := r.current[storage.ShardKeyFromBlock(block)]
+	r.mu.Unlock()
+
+	return ok && current.Block.Equals(&block)
+}
+
 func (r *shardStateResolver) currentBlocksForBlock(block ton.BlockIDExt) ([]ton.BlockIDExt, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -297,10 +332,15 @@ func (r *shardStateResolver) statsSnapshot() shardStateResolverStats {
 }
 
 func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
-	master := r.master.Block
+	master, err := shardApplyMasterFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	inclusion := master.Block
 	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells, &blockApplyHookMeta{
-		InclusionMasterRef:   &master,
-		InclusionMasterState: r.master.Cell,
+		InclusionMasterRef:   &inclusion,
+		InclusionMasterState: master.Cell,
 	})
 }
 
@@ -318,16 +358,21 @@ func (s *Service) applyResolvedShardBlock(ctx context.Context, target ton.BlockI
 		}
 	}
 
-	event := s.log.Debug().
-		Str("target", downloaded.BlockRef()).
-		Str("route", shardTransitionKind(target, downloaded.Meta.PrevRefs))
-	if len(previous) > 0 {
-		event.Str("prev", storage.FormatBlockRef(previous[0].Block))
+	// Guarded: this runs once per applied shard block on the commit path, and
+	// the field arguments (block-ref formatting, route classification) are
+	// evaluated by Go before zerolog can discard them on a disabled event.
+	if event := s.log.Debug(); event.Enabled() {
+		event.
+			Stringer("target", storage.BlockRef(downloaded.ID)).
+			Str("route", shardTransitionKind(target, downloaded.Meta.PrevRefs))
+		if len(previous) > 0 {
+			event.Stringer("prev", storage.BlockRef(previous[0].Block))
+		}
+		if len(previous) > 1 {
+			event.Stringer("prev_right", storage.BlockRef(previous[1].Block))
+		}
+		event.Msg("applying shard state dependency")
 	}
-	if len(previous) > 1 {
-		event.Str("prev_right", storage.FormatBlockRef(previous[1].Block))
-	}
-	event.Msg("applying shard state dependency")
 
 	next, err := s.applyBlockWithHooks(ctx, previous, downloaded, applier, hook)
 	if err != nil {

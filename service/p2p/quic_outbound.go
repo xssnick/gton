@@ -17,6 +17,8 @@ var errQUICRouteMissing = errors.New("quic peer route is missing")
 var errAuthenticatedQUICPeerNotFound = errors.New("authenticated quic peer is not connected")
 var errQUICDialDeferred = errors.New("QUIC dial retry is deferred")
 
+const quicAddressCacheMaxAge = 30 * time.Second
+
 // errQUICPeerOffline reports that a broadcast could not be sent because the peer
 // has no live outbound QUIC connection. Callers treat it as a dropped part, not
 // a peer failure: a background dial is already requested, and eviction of a
@@ -26,13 +28,6 @@ var errQUICPeerOffline = errors.New("quic peer has no live outbound connection")
 // quicRelayDialTimeout bounds the background dial (DHT resolve plus QUIC
 // handshake) started when a broadcast send finds no live outbound connection.
 const quicRelayDialTimeout = 10 * time.Second
-
-// C++ keeps inbound and outbound QUIC paths separate, so protocol responses use
-// the peer's independently resolved outbound path.
-type authenticatedQUICSender struct {
-	sub *overlaySubscription
-	id  PeerID
-}
 
 // quicBroadcastSource adapts an authenticated source to BroadcastPeer. C++
 // ignores FEC feedback, so sending a response is intentionally a no-op.
@@ -60,22 +55,24 @@ func (quicBroadcastSource) SendCustomMessage(
 	return nil
 }
 
-func (p authenticatedQUICSender) SendCustomMessage(
+// sendForgetPeerOverInboundPath answers on the path the query arrived on.
+// Deriving an outbound sender from the peer id instead would dial - and, for a
+// peer this node has never dialled itself, resolve through the DHT, since an
+// inbound connection never populates the route - all while the inbound handler
+// still holds one of its query slots. Peer.SendMessage falls back to the
+// inbound client, so the connection the peer already holds carries the notice.
+func (s *overlaySubscription) sendForgetPeerOverInboundPath(
 	ctx context.Context,
-	req tl.Serializable,
-) error {
-	payload, err := p.sub.quicEnvelope.Message(req)
+	peer *authenticatedQUICPeer,
+) {
+	if peer.peer == nil {
+		return
+	}
+	payload, err := s.quicEnvelope.Message(ForgetPeer{})
 	if err != nil {
-		return err
+		return
 	}
-	peer, err := p.sub.outboundQUICPeer(ctx, p.id)
-	if err != nil {
-		return err
-	}
-	if err = peer.SendOutboundMessage(ctx, payload); err != nil {
-		return fmt.Errorf("send quic overlay message: %w", err)
-	}
-	return nil
+	_ = peer.peer.SendMessage(ctx, payload)
 }
 
 func (p quicRouteBroadcastPeer) ID() []byte {
@@ -130,7 +127,7 @@ func (p *overlayPeer) requestBackgroundQUICDial() {
 }
 
 func (p *overlayPeer) dialQUIC(ctx context.Context) (*adnlquic.Peer, error) {
-	return p.quicPath().dial(ctx)
+	return p.quicPath().dialGated(ctx)
 }
 
 func (p *overlayPeer) quicPath() quicPeerPath {
@@ -165,7 +162,11 @@ func resolveQUICRoute(
 		return "", errQUICRouteMissing
 	}
 
-	addresses, resolvedPublicKey, err := findPeerAddresses(ctx, node.dht, id[:])
+	addresses, resolvedPublicKey, err := node.resolvePeerAddressesFresh(
+		ctx,
+		id,
+		quicAddressCacheMaxAge,
+	)
 	if err != nil {
 		return "", fmt.Errorf("resolve QUIC peer: %w", err)
 	}
@@ -178,17 +179,6 @@ func resolveQUICRoute(
 	}
 	route.refreshQUICAddr(addr)
 	return addr, nil
-}
-
-func (s *overlaySubscription) outboundQUICPeer(
-	ctx context.Context,
-	id PeerID,
-) (*adnlquic.Peer, error) {
-	path, err := s.quicPeerPath(id)
-	if err != nil {
-		return nil, err
-	}
-	return path.dial(ctx)
 }
 
 // quicPeerPath is the single owner of outbound QUIC dialing for a peer. id is
@@ -211,23 +201,6 @@ func (s *overlaySubscription) quicPeerPath(id PeerID) (quicPeerPath, error) {
 		return quicPeerPath{}, err
 	}
 	return peer.quicPath(), nil
-}
-
-func (p quicPeerPath) dial(ctx context.Context) (*adnlquic.Peer, error) {
-	peer, err := p.node.quicGateway.DialDefaultResolvedID(
-		ctx,
-		p.id[:],
-		p.publicKey,
-		p.resolveRoute,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("dial QUIC peer: %w", err)
-	}
-	return peer, nil
-}
-
-func (p quicPeerPath) resolveRoute(ctx context.Context) (string, error) {
-	return resolveQUICRoute(ctx, p.node, p.id, p.publicKey, p.route)
 }
 
 // dialGated dials with the per-route retry gate: one in-flight attempt, and a
@@ -261,9 +234,11 @@ func (p quicPeerPath) dialGated(ctx context.Context) (*adnlquic.Peer, error) {
 		},
 	)
 	if err == nil {
-		if claimed {
-			p.route.finishQUICDial()
-		}
+		p.route.succeedQUICDial(claimed)
+		// Queries, two-step broadcasts, Plumtree fanout, repairs and background
+		// relay dials all meet here, so the idle sweep can account for every
+		// outbound path consistently.
+		p.node.noteOutboundQUICPath(p.id)
 		return peer, nil
 	}
 	if errors.Is(err, errQUICDialDeferred) {

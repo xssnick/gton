@@ -669,7 +669,9 @@ func (s *Service) emitAsync(ctx context.Context, block SyncedBlock) {
 }
 
 func (s *Service) downloadBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	return s.downloadWithRetry(ctx, fmt.Sprintf("download block %s", storage.FormatBlockRef(block)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
+	return s.downloadWithRetry(ctx, func() string {
+		return "download block " + storage.FormatBlockRef(block)
+	}, func(ctx context.Context) (p2p.DownloadedBlock, error) {
 		downloaded, err := s.node.DownloadBlockFull(ctx, block)
 		if err != nil {
 			return p2p.DownloadedBlock{}, err
@@ -679,7 +681,9 @@ func (s *Service) downloadBlockWithRetry(ctx context.Context, block ton.BlockIDE
 }
 
 func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	return s.downloadWithRetry(ctx, fmt.Sprintf("download next block after %s", storage.FormatBlockRef(prev)), func(ctx context.Context) (p2p.DownloadedBlock, error) {
+	return s.downloadWithRetry(ctx, func() string {
+		return "download next block after " + storage.FormatBlockRef(prev)
+	}, func(ctx context.Context) (p2p.DownloadedBlock, error) {
 		downloaded, err := s.node.DownloadNextBlockFull(ctx, prev)
 		if err != nil {
 			return p2p.DownloadedBlock{}, err
@@ -688,7 +692,9 @@ func (s *Service) downloadNextBlockWithRetry(ctx context.Context, prev ton.Block
 	})
 }
 
-func (s *Service) downloadWithRetry(ctx context.Context, label string, download func(context.Context) (p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
+// downloadWithRetry takes the label lazily: it is only read when every attempt
+// failed, and formatting a block ref per download is pure waste on the hot path.
+func (s *Service) downloadWithRetry(ctx context.Context, label func() string, download func(context.Context) (p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= defaultRetryCount; attempt++ {
@@ -706,7 +712,7 @@ func (s *Service) downloadWithRetry(ctx context.Context, label string, download 
 		}
 	}
 
-	return p2p.DownloadedBlock{}, fmt.Errorf("%s: %w", label, lastErr)
+	return p2p.DownloadedBlock{}, fmt.Errorf("%s: %w", label(), lastErr)
 }
 
 func waitOrDone(ctx context.Context, delay time.Duration) error {

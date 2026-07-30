@@ -15,7 +15,7 @@ import (
 // anything (frozen from the start) is never promoted into neighbours and
 // would otherwise be invisible exactly when its diagnostics matter most.
 func (s *overlaySubscription) statusPeersLocked() []*overlayPeer {
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.statusListsWholeRoster() {
 		peers := make([]*overlayPeer, 0, len(s.peers))
 		for _, peer := range s.peers {
 			peers = append(peers, peer)
@@ -25,7 +25,12 @@ func (s *overlaySubscription) statusPeersLocked() []*overlayPeer {
 
 	peers := make([]*overlayPeer, 0, len(s.neighbours))
 	for _, id := range s.neighbours {
-		peers = append(peers, s.peers[id])
+		// A neighbour whose roster row is gone must not reach the callers, who
+		// dereference these entries; see the dangling-neighbour handling in
+		// pruneNeighboursLocked.
+		if peer := s.peers[id]; peer != nil {
+			peers = append(peers, peer)
+		}
 	}
 	return peers
 }
@@ -479,7 +484,7 @@ func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {
 	now := time.Now()
 	snapshot := OverlayStatusSnapshot{
 		Name:           s.spec.Name,
-		FixedProbes:    s.spec.Kind == overlayKindCustomFixed,
+		FixedProbes:    s.spec.runsFixedPeerProbes(),
 		SoftRecoveries: s.softRecoveries,
 		HardRecoveries: s.hardRecoveries,
 		Neighbours:     make([]NeighbourStatusSnapshot, 0, len(s.neighbours)),

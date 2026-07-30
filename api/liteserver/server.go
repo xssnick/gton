@@ -298,6 +298,14 @@ func (s *Server) Start(ctx context.Context) error {
 		}()
 	}
 
+	// The head warmer only exists while the liteserver runs, so a node without
+	// this extension never pays for it.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runHeadWarmer(runCtx)
+	}()
+
 	errCh := make(chan error, 1)
 	s.wg.Add(1)
 	go func() {

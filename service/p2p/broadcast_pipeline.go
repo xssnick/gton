@@ -196,20 +196,37 @@ func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, m
 }
 
 func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) (broadcastResult, error) {
-	if s.spec.Kind == overlayKindFastSync &&
-		!fastSyncBroadcastSupported(msg) {
-		s.node.noteBroadcastDrop(
-			s.spec.Name,
-			broadcastKindLabel(msg),
-			"unsupported_fast_sync_broadcast",
-		)
-		return ignoredBroadcastResult(), nil
+	if s.spec.restrictsBroadcastKinds() {
+		// We publish DoNotReceiveBroadcasts in our member flags when this
+		// overlay is send-only for us (a validator under plumtree), and drop
+		// what a peer sends anyway. Upstream gates the same six kinds inside
+		// OverlayImpl::process_broadcast — but not the two-step pair, which it
+		// processes regardless, so neither do we. Note this only suppresses
+		// application processing: the transport has already decoded and
+		// relayed by the time classify runs, so it does not save that work.
+		if delivery != DeliveryTwoStep &&
+			s.fastSync != nil && s.fastSync.declinesBroadcasts() {
+			s.node.noteBroadcastDrop(
+				s.spec.Name,
+				broadcastKindLabel(msg),
+				"fast_sync_broadcasts_declined",
+			)
+			return ignoredBroadcastResult(), nil
+		}
+		if !fastSyncBroadcastSupported(msg) {
+			s.node.noteBroadcastDrop(
+				s.spec.Name,
+				broadcastKindLabel(msg),
+				"unsupported_fast_sync_broadcast",
+			)
+			return ignoredBroadcastResult(), nil
+		}
 	}
 
 	if sourcePeerID.IsZero() && peer != nil {
 		sourcePeerID = peer.id
 	}
-	if s.spec.Kind == overlayKindCustomFixed && sourcePeerID == s.node.localID {
+	if s.spec.dropsSelfSourcedBroadcasts() && sourcePeerID == s.node.localID {
 		s.node.noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "self")
 		return ignoredBroadcastResult(), nil
 	}
@@ -369,7 +386,7 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		return acceptedBroadcastResult(acceptedBroadcast{}), nil
 	case IhrMessageBroadcast:
 		kind := "tonNode.ihrMessageBroadcast"
-		if s.spec.Kind == overlayKindCustomFixed {
+		if s.spec.dropsIHRBroadcasts() {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "unsupported_custom_broadcast")
 			return ignoredBroadcastResult(), nil
 		}
@@ -553,7 +570,7 @@ func (s *overlaySubscription) classifyBlockFinalityBroadcast(
 }
 
 func (s *overlaySubscription) allowCustomBroadcastSource(kind string, sourcePeerID PeerID, role customBroadcastRole) bool {
-	if s.spec.Kind != overlayKindCustomFixed {
+	if !s.spec.authorizesBroadcastSenders() {
 		return true
 	}
 	if sourcePeerID.IsZero() {
@@ -588,7 +605,7 @@ func (s *overlaySubscription) inboundRebroadcast(kind string, payload []byte, pe
 		sourcePeerID: sourcePeerID,
 		skipOverlayRebroadcast: delivery == DeliveryTwoStep ||
 			delivery == DeliveryPlumtree ||
-			(delivery == DeliveryFEC && s.broadcastFECRelayEnabled()),
+			(delivery == DeliveryFEC && s.spec.relaysFECBroadcasts()),
 	}
 }
 
@@ -654,6 +671,44 @@ func (s *overlaySubscription) blockFinalityBroadcastEvents(delivery Delivery, tr
 	return events
 }
 
+// broadcastSignatureJoin publishes one in-flight validator-signature check to
+// both of its consumers: the transport thread joins it to gate the relay/trust
+// decision, and the decode worker joins it before publishing anything the
+// decode produced. finish must be called exactly once.
+type broadcastSignatureJoin struct {
+	done chan struct{}
+	err  error
+}
+
+func newBroadcastSignatureJoin() *broadcastSignatureJoin {
+	return &broadcastSignatureJoin{done: make(chan struct{})}
+}
+
+func (j *broadcastSignatureJoin) finish(err error) {
+	j.err = err
+	close(j.done)
+}
+
+func (j *broadcastSignatureJoin) wait() error {
+	<-j.done
+	return j.err
+}
+
+// failed reports an outcome that is already known to be a failure. It never
+// blocks: overlapping the decode with a check still in flight is the point, so
+// an unresolved check reports false and the caller joins it after decoding.
+func (j *broadcastSignatureJoin) failed() bool {
+	if j == nil {
+		return false
+	}
+	select {
+	case <-j.done:
+		return j.err != nil
+	default:
+		return false
+	}
+}
+
 func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID, msg any, payload *broadcastPayload, peer *overlayPeer) (broadcastResult, error) {
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
@@ -681,11 +736,11 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 
 	// the validator-signature pass only needs the parsed proof root and the
 	// signature set, so it runs concurrently with the expensive block decode
-	var sigCheck chan error
+	var sigJoin *broadcastSignatureJoin
 	if signaturesChecked {
-		sigCheck = make(chan error, 1)
+		sigJoin = newBroadcastSignatureJoin()
 		go func() {
-			sigCheck <- s.node.checkBlockBroadcastSignatures(kind, block, proofRoot, preSigSet)
+			sigJoin.finish(s.node.checkBlockBroadcastSignatures(kind, block, proofRoot, preSigSet))
 		}()
 	}
 
@@ -710,18 +765,18 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		}
 	}
 
-	// kinds whose signatures are already verified can leave the expensive
-	// decode to the bounded pool: joining the signature check first keeps the
-	// trust gate on this thread (a failure still suppresses FEC relay), while
-	// a nil return right after lets the overlay relay the hash-verified,
-	// signature-verified payload without waiting out a multi-MB decode
+	// kinds whose signatures are already verified concurrently can leave the
+	// expensive decode to the bounded pool. The decode is enqueued before the
+	// signature join so the multi-MB decode overlaps the ed25519 pass; the
+	// worker joins sigJoin before publishing anything it decoded, while the
+	// join below keeps the trust gate on this thread (a failure still
+	// suppresses FEC relay), and a nil return right after lets the overlay
+	// relay the hash-verified, signature-verified payload without waiting out
+	// the decode
+	var rebroadcast *rebroadcastRequest
 	if !cached && signaturesChecked {
-		if sigErr := <-sigCheck; sigErr != nil {
-			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
-		}
-		sigCheck = nil
-
-		rebroadcast, rbErr := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+		var rbErr error
+		rebroadcast, rbErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 		if rbErr != nil {
 			s.node.deduper.Forget(fingerprint)
 			return broadcastResult{}, rbErr
@@ -738,8 +793,14 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			msg:          msg,
 			proofRoot:    proofRoot,
 			preSigSet:    preSigSet,
+			sigJoin:      sigJoin,
 			rebroadcast:  rebroadcast,
 		}) {
+			// a failed join owns the drop bookkeeping (dedupe forget + drop
+			// metric); the worker then discards its decode silently
+			if sigErr := sigJoin.wait(); sigErr != nil {
+				return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
+			}
 			// the ack counts as "accepted" for relay purposes even though the
 			// decode may still fail on the pool (mirrors the reference node,
 			// which relays after signature validation, not after decode);
@@ -760,24 +821,43 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			}
 			return acceptedBroadcastResult(accepted), nil
 		}
+		// pool refused: the decode below runs inline on this thread, so join
+		// the signature outcome first and keep the drop-before-decode ordering
+		if sigErr := sigJoin.wait(); sigErr != nil {
+			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
+		}
+		sigJoin = nil
 	}
 
 	if !cached {
+		// Reached either because the payload kind cannot be offloaded (v1
+		// carries its signatures inside the payload) or because the decode pool
+		// refused it. The latter means this multi-MB decode now runs on a
+		// transport receive goroutine, so it is measured separately from the
+		// pool's decode_async stage.
+		decodeStarted := s.node.startBroadcastPipelineStage()
 		downloaded, sigSet, err = s.node.decodeBroadcastBlock(s.node.runCtx, msg, proofRoot, preSigSet)
+		decodeResult := broadcastPipelineResultSuccess
+		if err != nil {
+			decodeResult = broadcastPipelineResultError
+			if isBroadcastDecompressionStateNotReady(err) {
+				decodeResult = broadcastPipelineResultMiss
+			}
+		}
+		s.node.observeBroadcastPipelineStageSince(decodeStarted, broadcastPipelineStageDecodeInline, kind, delivery, decodeResult)
 		// v1 payloads carry unverified signatures at this point, and their
 		// deliveries never read the cache anyway — cache only verified kinds
 		if err == nil && signaturesChecked {
 			s.node.decodedBroadcasts.put(kind, block, downloaded, sigSet)
 		}
 	}
-	if sigCheck != nil {
-		if sigErr := <-sigCheck; sigErr != nil {
+	if sigJoin != nil {
+		if sigErr := sigJoin.wait(); sigErr != nil {
 			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
 		}
 	}
 	if err != nil {
 		stateNotReady := isBroadcastDecompressionStateNotReady(err)
-		var rebroadcast *rebroadcastRequest
 		if stateNotReady {
 			pendingState, ok := broadcastDecompressionStateNotReady(err)
 			if !ok {
@@ -800,11 +880,13 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 				s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 				return ignoredBroadcastResult(), nil
 			}
-			var payloadErr error
-			rebroadcast, payloadErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
-			if payloadErr != nil {
-				s.node.deduper.Forget(fingerprint)
-				return broadcastResult{}, payloadErr
+			if rebroadcast == nil {
+				var payloadErr error
+				rebroadcast, payloadErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+				if payloadErr != nil {
+					s.node.deduper.Forget(fingerprint)
+					return broadcastResult{}, payloadErr
+				}
 			}
 
 			var verifiedSignaturesKey []byte
@@ -867,10 +949,12 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, err)
 	}
 
-	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
-	if err != nil {
-		s.node.deduper.Forget(fingerprint)
-		return broadcastResult{}, err
+	if rebroadcast == nil {
+		rebroadcast, err = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+		if err != nil {
+			s.node.deduper.Forget(fingerprint)
+			return broadcastResult{}, err
+		}
 	}
 
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourcePeerID)
@@ -1056,7 +1140,7 @@ func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric boo
 		}
 		n.observeBroadcastPipelineStageSince(cacheStarted, broadcastPipelineStageHotCacheNotify, event.Kind, event.Delivery, cacheResult)
 		n.publishNonfinalDownloadedBlock(event.Downloaded, storage.LiveBlockNonfinalSigned)
-		n.observeBlockReceived(n.runCtx, event.Downloaded, true)
+		n.observeBroadcastBlockReceived(n.runCtx, event.Downloaded, true)
 	}
 	if !n.eventQueue.Push(event) {
 		return false
@@ -1073,6 +1157,7 @@ func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric boo
 	}
 	if !skipAcceptedMetric {
 		n.noteBroadcast("accepted", event.Overlay, event.Kind, event.Delivery)
+		n.noteBroadcastSourcePeer(event.Overlay, event.SourcePeerID)
 	}
 	return true
 }
@@ -1138,7 +1223,7 @@ func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlay
 		if sub == nil || sub == accepted.rebroadcast.subscription {
 			continue
 		}
-		if sub.spec.Kind != overlayKindCustomFixed || !sub.isActive() {
+		if !sub.spec.originatesLocalBroadcasts() || !sub.isActive() {
 			continue
 		}
 		if _, ok := sub.spec.BlockSenders[n.localID]; !ok {
@@ -1152,6 +1237,14 @@ func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlay
 	return targets
 }
 
+// fastSyncFanoutTarget picks the FastSync overlay to re-originate an accepted
+// broadcast into. This is deliberately NOT what the reference node does: its
+// receive path relays into custom overlays only, and its FastSync sends come
+// exclusively from blocks the node produced itself. We have no block-origination
+// API yet, so the only way this node can feed a FastSync overlay is to forward
+// what it accepted elsewhere — a public-to-FastSync gateway. Revisit when a
+// send API exists: with one, a validator should originate its own blocks here
+// instead of re-emitting observed ones, which the FastSync relay already carries.
 func (n *Node) fastSyncFanoutTarget(
 	accepted acceptedBroadcast,
 ) *overlaySubscription {

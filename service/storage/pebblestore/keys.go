@@ -34,6 +34,8 @@ var (
 	hotPrefixArchivePackageIndex   = []byte{0x1F}
 	hotPrefixPackAppendDirty       = []byte{0x20}
 	hotPrefixPackDeletePending     = []byte{0x21}
+	hotPrefixOverlayPeerCache      = []byte{0x22}
+	hotPrefixFastSyncCertificates  = []byte{0x23}
 )
 
 func hotKeyMetaDBVersion() []byte {
@@ -142,6 +144,15 @@ func hotKeyStateSyncProgress() []byte {
 
 func hotKeyPersistentStateSerializer() []byte {
 	return bytes.Clone(hotPrefixStateSerializer)
+}
+
+func hotKeyOverlayPeerCache(overlayID []byte) []byte {
+	buf := append([]byte(nil), hotPrefixOverlayPeerCache...)
+	return append(buf, overlayID...)
+}
+
+func hotKeyFastSyncCertificates() []byte {
+	return bytes.Clone(hotPrefixFastSyncCertificates)
 }
 
 func hotKeyPersistentStateSerializerActive() []byte {

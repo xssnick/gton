@@ -51,7 +51,6 @@ const (
 	DefaultHTTPAPIListen                    = "0.0.0.0:8081"
 	DefaultHTTPAPIRequestTimeout            = 10 * time.Second
 	DefaultMetricsNamespace                 = "gton"
-	DefaultFastSyncBroadcastSpeedMultiplier = 1.0
 	defaultStorageDir                       = "data"
 	defaultADNLPort                         = 30303
 	defaultADNLListen                       = "0.0.0.0:30303"
@@ -65,17 +64,15 @@ const (
 var ErrConfigMissingWithExistingStorage = errors.New("config file is missing while storage metadata exists")
 
 type Config struct {
-	TON                              TON             `json:"ton"`
-	ADNL                             ADNL            `json:"adnl"`
-	DHT                              DHT             `json:"dht"`
-	Lite                             Lite            `json:"liteserver"`
-	HTTPAPI                          HTTPAPI         `json:"http_api"`
-	Storage                          Storage         `json:"storage"`
-	Metrics                          Metrics         `json:"metrics"`
-	CustomOverlays                   []CustomOverlay `json:"custom_overlays"`
-	FastSyncMemberCertificates       [][]byte        `json:"fast_sync_member_certificates"`
-	FastSyncBroadcastSpeedMultiplier float64         `json:"fast_sync_broadcast_speed_multiplier"`
-	DisableStateSerialization        bool            `json:"disable_state_serialization"`
+	TON                       TON             `json:"ton"`
+	ADNL                      ADNL            `json:"adnl"`
+	DHT                       DHT             `json:"dht"`
+	Lite                      Lite            `json:"liteserver"`
+	HTTPAPI                   HTTPAPI         `json:"http_api"`
+	Storage                   Storage         `json:"storage"`
+	Metrics                   Metrics         `json:"metrics"`
+	CustomOverlays            []CustomOverlay `json:"custom_overlays"`
+	DisableStateSerialization bool            `json:"disable_state_serialization"`
 }
 
 type TON struct {
@@ -226,9 +223,7 @@ func defaultConfig() Config {
 		Metrics: Metrics{
 			Namespace: DefaultMetricsNamespace,
 		},
-		CustomOverlays:                   []CustomOverlay{},
-		FastSyncMemberCertificates:       [][]byte{},
-		FastSyncBroadcastSpeedMultiplier: DefaultFastSyncBroadcastSpeedMultiplier,
+		CustomOverlays: []CustomOverlay{},
 	}
 }
 

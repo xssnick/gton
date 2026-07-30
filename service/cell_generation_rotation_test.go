@@ -457,16 +457,17 @@ func TestCellGenerationCandidateCheckpointKeepsApplyingIntoNextWindow(t *testing
 func TestCellGenerationSwitchRequestLifecycle(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 	target := testBlockID(-1, topShard, 200)
 
+	wake := svc.currentStateWakeChan()
 	svc.requestCellGenerationSwitch(2, target)
 	if !svc.cellGenerationSwitchRequestActive() {
 		t.Fatal("cell generation switch request is not active")
 	}
 	select {
-	case <-svc.currentStateWake:
+	case <-wake:
 	default:
 		t.Fatal("cell generation switch request did not wake current state loop")
 	}
@@ -793,7 +794,7 @@ func TestNextBlockCatchUpYieldsForCellGenerationSwitchRequest(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
 		storage:          openTestPebbleStorage(t),
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 	current := &storage.CurrentState{
 		Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 125)},
@@ -820,7 +821,7 @@ func TestNextBlockCatchUpYieldsForCellGenerationSwitchRequest(t *testing.T) {
 func TestBootstrapRetryStopsForCellGenerationSwitchRequest(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 	runner := &nextSyncRunner{
 		service: svc,
@@ -828,7 +829,7 @@ func TestBootstrapRetryStopsForCellGenerationSwitchRequest(t *testing.T) {
 	}
 
 	svc.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
-	if runner.waitBootstrapRetry() {
+	if runner.waitBootstrapRetry(svc.currentStateWakeChan()) {
 		t.Fatal("bootstrap retry kept waiting after cell generation switch request")
 	}
 }
@@ -836,7 +837,7 @@ func TestBootstrapRetryStopsForCellGenerationSwitchRequest(t *testing.T) {
 func TestCellGenerationSwitchNextBlockYieldThrottle(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 	now := time.Unix(1000, 0)
 
@@ -871,7 +872,7 @@ func TestCatchUpCurrentStateYieldsForActiveCellGenerationSwitch(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
 		storage:          store,
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 
 	if !svc.beginCellGenerationSwitch() {
@@ -904,7 +905,7 @@ func TestCatchUpCurrentStateYieldsForCellGenerationSwitchRequest(t *testing.T) {
 	svc := &Service{
 		log:              zerolog.Nop(),
 		storage:          &testCellGenerationMigrationStore{current: current},
-		currentStateWake: make(chan struct{}, 1),
+		currentStateWake: make(chan struct{}),
 	}
 
 	svc.requestCellGenerationSwitch(2, current.Masterchain.Block)

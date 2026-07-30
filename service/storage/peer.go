@@ -20,6 +20,21 @@ type PeerServingStorage interface {
 	ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error)
 }
 
+// OverlayPeerCache persists opaque per-overlay peer snapshots so a restarted
+// node can redial its previous roster without waiting for DHT discovery.
+type OverlayPeerCache interface {
+	SaveOverlayPeerCache(overlayID []byte, snapshot []byte) error
+	LoadOverlayPeerCache(overlayID []byte) ([]byte, error)
+}
+
+// FastSyncCertificateStorage persists the node's validated FastSync member
+// certificates as one opaque snapshot.
+type FastSyncCertificateStorage interface {
+	SaveFastSyncCertificateSnapshot(ctx context.Context, snapshot []byte) error
+	FastSyncCertificateSnapshot(ctx context.Context) ([]byte, error)
+	DeleteFastSyncCertificateSnapshot(ctx context.Context) error
+}
+
 type PeerServingStorageWriter interface {
 	SaveZeroState(block ton.BlockIDExt, data []byte, ref *ArtifactRef) error
 	SavePersistentStateFile(file *PersistentStateFile) error

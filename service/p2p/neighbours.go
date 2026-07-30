@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"time"
@@ -14,7 +15,7 @@ func (s *overlaySubscription) neighbourPeerSnapshots() []*overlayPeer {
 	peers := make([]*overlayPeer, 0, len(s.neighbours))
 	for _, id := range s.neighbours {
 		peer := s.peers[id]
-		if !peer.hasOpenConnection() {
+		if peer == nil || !peer.hasOpenConnection() {
 			continue
 		}
 		peers = append(peers, peer)
@@ -67,7 +68,10 @@ func (s *overlaySubscription) pruneNeighboursLocked() {
 	filtered := s.neighbours[:0]
 	for _, id := range s.neighbours {
 		peer := s.peers[id]
-		if !peer.isAliveKnownOverlayPeer(now) || !peer.hasOpenConnection() {
+		// A nil peer is a neighbour whose roster entry is gone; every keeper of
+		// the neighbours invariant funnels through this prune, so drop it here
+		// instead of letting later iterations dereference it.
+		if peer == nil || !peer.isAliveKnownOverlayPeer(now) || !peer.hasOpenConnection() {
 			if s.lastPingedNeighbour == id {
 				s.lastPingedNeighbour = PeerID{}
 			}
@@ -102,6 +106,13 @@ func (s *overlaySubscription) reloadNeighbours() {
 	excluded := map[PeerID]struct{}{}
 	for _, peer := range candidates {
 		if peer.id.IsZero() {
+			continue
+		}
+		// The candidate snapshot was taken outside the lock: the peer may have
+		// been evicted from the roster in the gap, and appending it would leave
+		// a neighbours entry with no peers entry — every later iteration over
+		// neighbours would then dereference nil.
+		if s.peers[peer.id] != peer {
 			continue
 		}
 		if _, skip := excluded[peer.id]; skip {
@@ -165,6 +176,11 @@ func (s *overlaySubscription) worstRotatableNeighbourLocked(protected map[PeerID
 			continue
 		}
 		peer := s.peers[id]
+		if peer == nil {
+			// Dangling entry (roster lost the peer): the worst neighbour by
+			// definition, and evicting it repairs the invariant.
+			return id, math.MaxFloat64
+		}
 		stats := peer.statsSnapshot()
 		if stats.unreliability > worstUnreliability {
 			worstID = id

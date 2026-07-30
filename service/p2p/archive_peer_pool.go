@@ -197,7 +197,7 @@ func newArchivePeerPool(sub *overlaySubscription) *archivePeerPool {
 		offers:                make(chan archivePeerOffer, archivePeerPendingLimit),
 		lastUsedAt:            now,
 	}
-	if !sub.usesDedicatedQueryPeers() {
+	if !sub.spec.usesDedicatedQueryPeers() {
 		pool.startScoutWorkers()
 		pool.scoutWorkers.Go(pool.runArchiveDiscoveryLoop)
 	}
@@ -303,14 +303,14 @@ func (p *archivePeerPool) touch(now time.Time) {
 
 func (p *archivePeerPool) enableContinuousDiscovery() {
 	p.mx.Lock()
-	if !p.closed && !p.sub.usesDedicatedQueryPeers() {
+	if !p.closed && !p.sub.spec.usesDedicatedQueryPeers() {
 		p.continuousDiscovery = true
 	}
 	p.mx.Unlock()
 }
 
 func (p *archivePeerPool) bootstrapLivePeers() {
-	if p.sub.spec.Kind == overlayKindCustomFixed {
+	if p.sub.spec.usesDedicatedQueryPeers() {
 		p.bootstrapCustomQueryPeers()
 		return
 	}
@@ -384,7 +384,7 @@ func (p *archivePeerPool) candidates(shard archive.ShardID) []*overlayPeer {
 		if !archivePeerUsable(entry, now) {
 			continue
 		}
-		if p.sub.usesDedicatedQueryPeers() &&
+		if p.sub.spec.usesDedicatedQueryPeers() &&
 			!entry.peer.queryReady(now, 0, 0) {
 			continue
 		}
@@ -1187,7 +1187,7 @@ func (p *archivePeerPool) refill(ctx context.Context, urgent bool) <-chan struct
 	now := time.Now()
 	p.bootstrapLivePeers()
 	p.pruneClosedPeers()
-	if p.sub.usesDedicatedQueryPeers() {
+	if p.sub.spec.usesDedicatedQueryPeers() {
 		return nil
 	}
 	p.pruneUnprovenDeadArchiveOnlyPeers(now)

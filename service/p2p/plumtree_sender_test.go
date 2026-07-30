@@ -187,8 +187,8 @@ func TestPlumtreeOutboundSendDefersFailedRosterRoute(t *testing.T) {
 
 	route.quicRetryState.Store(time.Now().Add(-time.Second).UnixNano())
 	secondRuntime.sendOutboundBatch(context.Background(), peerID, wires)
-	if got := dht.calls.Load(); got != 2 {
-		t.Fatalf("DHT lookups after retry delay = %d, want 2", got)
+	if got := dht.calls.Load(); got != 1 {
+		t.Fatalf("DHT lookups after retry delay = %d, want cached failure", got)
 	}
 }
 
@@ -197,11 +197,80 @@ func TestPeerRoutePlumtreeQUICRetryDeadlineOnlyExtends(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 
 	route.deferQUICDial(now)
-	want := now.Add(quicDialRetryDelay).UnixNano()
+	want := now.Add(quicDialRetryDelay(1)).UnixNano()
 	route.deferQUICDial(now.Add(-time.Second))
 
 	if got := route.quicRetryState.Load(); got != want {
 		t.Fatalf("retry deadline = %d, want %d", got, want)
+	}
+}
+
+func TestPeerRoutePlumtreeQUICRetryBacksOffAndResets(t *testing.T) {
+	route := newPeerRoute("")
+	now := time.Unix(1_000_000, 0)
+
+	for failure, wantDelay := range []time.Duration{
+		quicDialRetryMinDelay,
+		2 * quicDialRetryMinDelay,
+		quicDialRetryMaxDelay,
+		quicDialRetryMaxDelay,
+		quicDialRetryMaxDelay,
+	} {
+		if !route.beginQUICDial(now) {
+			t.Fatalf("failure %d: route rejected dial", failure+1)
+		}
+		route.failQUICDial(now)
+		want := now.Add(wantDelay).UnixNano()
+		if got := route.quicRetryState.Load(); got != want {
+			t.Fatalf(
+				"failure %d: retry deadline = %d, want %d",
+				failure+1,
+				got,
+				want,
+			)
+		}
+		now = time.Unix(0, want)
+	}
+
+	if !route.beginQUICDial(now) {
+		t.Fatal("route rejected successful retry")
+	}
+	route.finishQUICDial()
+	if route.quicDialFailures != 0 {
+		t.Fatalf("failures after successful dial = %d, want 0", route.quicDialFailures)
+	}
+
+	if !route.beginQUICDial(now) {
+		t.Fatal("route rejected dial after success")
+	}
+	route.failQUICDial(now)
+	want := now.Add(quicDialRetryMinDelay).UnixNano()
+	if got := route.quicRetryState.Load(); got != want {
+		t.Fatalf("retry deadline after reset = %d, want %d", got, want)
+	}
+}
+
+func TestPeerRouteExistingQUICPathClearsCooldown(t *testing.T) {
+	route := newPeerRoute("127.0.0.1:30303")
+	route.quicRetryState.Store(time.Now().Add(time.Minute).UnixNano())
+	route.quicRetryMx.Lock()
+	route.quicDialFailures = 3
+	route.quicRetryMx.Unlock()
+	route.markQUICAddrStale()
+
+	route.succeedQUICDial(false)
+
+	if got := route.quicRetryState.Load(); got != 0 {
+		t.Fatalf("retry state after existing path success = %d, want 0", got)
+	}
+	route.quicRetryMx.Lock()
+	failures := route.quicDialFailures
+	route.quicRetryMx.Unlock()
+	if failures != 0 {
+		t.Fatalf("failures after existing path success = %d, want 0", failures)
+	}
+	if route.quicAddrStale() {
+		t.Fatal("existing successful path left QUIC route stale")
 	}
 }
 

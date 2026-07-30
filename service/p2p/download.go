@@ -74,7 +74,7 @@ func (s *overlaySubscription) finishPeerQueryOperation(peer *overlayPeer, err er
 		return
 	}
 
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.probeDrivenQueryReadiness() {
 		if err == nil {
 			return
 		}
@@ -99,7 +99,7 @@ func (s *overlaySubscription) finishPeerQueryOperation(peer *overlayPeer, err er
 		return
 	}
 
-	if s.spec.Kind == overlayKindFastSync &&
+	if s.spec.pingsPeerOnQueryTimeout() &&
 		errors.Is(err, context.DeadlineExceeded) {
 		s.startFastSyncPeerPing(peer)
 	}
@@ -128,6 +128,12 @@ type ProbeBlockFullOptions struct {
 	StagedPeerLimit int
 	StageDelay      time.Duration
 	PreferredPeerID PeerID
+	// Speculative marks a probe for a block the peer is not expected to have
+	// yet, so "not available" is an answer rather than a fault by the peer. The
+	// shard prefetch runs off a broadcast description and deliberately asks
+	// ahead of the peer's own apply; catch-up, which asks for blocks that must
+	// already exist, leaves this false.
+	Speculative bool
 }
 
 type CompressedBlockStateProvider interface {
@@ -302,6 +308,7 @@ func (n *Node) prefetchShardBlockFull(ctx context.Context, block ton.BlockIDExt,
 			PeerLimit:       prefetchShardBlockPeers,
 			StagedPeerLimit: prefetchShardBlockWidePeers,
 			StageDelay:      prefetchShardBlockStageDelay,
+			Speculative:     true,
 		})
 	})
 	if err != nil {
@@ -564,7 +571,7 @@ func (s *overlaySubscription) probeBlockFull(ctx context.Context, block ton.Bloc
 		stageDelay:      opts.StageDelay,
 	}
 	downloaded, err := probeFullFromPeersWithOptions(ctx, peers, probeOpts, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
-		return s.downloadBlockFullFromPeer(ctx, block, peer, req)
+		return s.downloadBlockFullFromPeer(ctx, block, peer, req, opts.Speculative)
 	}, func(peer *overlayPeer, err error) {
 		s.noteChainBlockDownloadFailure(block, peer, err)
 	})
@@ -578,9 +585,19 @@ func (s *overlaySubscription) probeBlockFull(ctx context.Context, block ton.Bloc
 // downloadBlockFullFromPeer queries one peer for a full block, decodes and
 // verifies it and records the download stats; shared by the parallel and the
 // staged-probe block download paths.
-func (s *overlaySubscription) downloadBlockFullFromPeer(ctx context.Context, requested ton.BlockIDExt, peer *overlayPeer, req tl.Serializable) (result DownloadedBlock, err error) {
+func (s *overlaySubscription) downloadBlockFullFromPeer(ctx context.Context, requested ton.BlockIDExt, peer *overlayPeer, req tl.Serializable, speculative bool) (result DownloadedBlock, err error) {
 	query := s.beginPeerQueryOperation(peer)
 	defer func() {
+		// Same rule as the live-tail next-block probe: when this node asks for a
+		// block ahead of the peer's own apply, "not available" is the expected
+		// answer and must not be charged to the peer. An overlay whose readiness
+		// is probe-driven demotes on every non-nil outcome, and shard
+		// descriptions arrive several times per master round, so counting these
+		// kept a custom overlay's acceptors in the cooldown almost permanently.
+		if speculative && errors.Is(err, ErrBlockNotAvailable) {
+			query.finish(nil)
+			return
+		}
 		query.finish(err)
 	}()
 
@@ -759,6 +776,18 @@ func (s *overlaySubscription) downloadNextFullFromPeers(ctx context.Context, cha
 func (s *overlaySubscription) downloadNextFullFromPeer(ctx context.Context, chain ton.BlockIDExt, peer *overlayPeer, req DownloadNextBlockFull, liveTail bool, liveNotAvailableMisses int64) (result DownloadedBlock, err error) {
 	query := s.beginPeerQueryOperation(peer)
 	defer func() {
+		// On the live tail this node probes ahead of block production, so
+		// "the next block does not exist yet" is the expected answer, not a
+		// fault by the peer. An overlay whose readiness is probe-driven charges
+		// every non-nil outcome to the acceptor, so leaving this as an error put
+		// all of a custom overlay's acceptors into the cooldown on nearly every
+		// round and took the overlay out of query selection entirely. Only this
+		// probe is exempt: elsewhere "not available" does mean the acceptor
+		// could not serve what was asked for.
+		if liveTail && errors.Is(err, ErrBlockNotAvailable) {
+			query.finish(nil)
+			return
+		}
 		query.finish(err)
 	}()
 
@@ -968,7 +997,7 @@ func (s *overlaySubscription) downloadFullFromPeers(ctx context.Context, request
 	downloaded, err := runConcurrentBlockDownloads(ctx, peers, blockDownloadParallelism(peers), func(peer *overlayPeer, err error) {
 		s.noteChainBlockDownloadFailure(requested, peer, err)
 	}, func(ctx context.Context, peer *overlayPeer) (DownloadedBlock, error) {
-		return s.downloadBlockFullFromPeer(ctx, requested, peer, req)
+		return s.downloadBlockFullFromPeer(ctx, requested, peer, req, false)
 	})
 	if err != nil {
 		return nil, err

@@ -125,6 +125,44 @@ func TestStaleQUICRouteRefreshesTheSignedAddressList(t *testing.T) {
 	if route.quicAddrStale() {
 		t.Fatal("validated DHT refresh left the QUIC route stale")
 	}
+
+	route.markQUICAddrStale()
+	addr, err = resolveQUICRoute(
+		context.Background(),
+		node,
+		remoteID,
+		remotePub,
+		route,
+	)
+	if err != nil {
+		t.Fatalf("reuse recently checked DHT route: %v", err)
+	}
+	if addr != "127.0.0.2:25003" {
+		t.Fatalf("recent DHT route = %q, want explicit address", addr)
+	}
+	if got := dht.calls.Load(); got != 1 {
+		t.Fatalf("recent stale route DHT lookups = %d, want 1", got)
+	}
+
+	node.peerAddresses.mx.Lock()
+	entry := node.peerAddresses.cache[remoteID]
+	entry.cachedAt = time.Now().Add(-quicAddressCacheMaxAge)
+	node.peerAddresses.cache[remoteID] = entry
+	node.peerAddresses.mx.Unlock()
+
+	route.markQUICAddrStale()
+	if _, err = resolveQUICRoute(
+		context.Background(),
+		node,
+		remoteID,
+		remotePub,
+		route,
+	); err != nil {
+		t.Fatalf("refresh old cached DHT route: %v", err)
+	}
+	if got := dht.calls.Load(); got != 2 {
+		t.Fatalf("old stale route DHT lookups = %d, want 2", got)
+	}
 }
 
 func TestDHTAddressLookupSuppliesBothPeerRoutes(t *testing.T) {
@@ -416,7 +454,13 @@ func TestResolveQUICRouteUsesCachedAddressWithoutDHT(t *testing.T) {
 		route: newPeerRoute("127.0.0.1:25011"),
 	}
 
-	addr, err := peer.quicPath().resolveRoute(context.Background())
+	addr, err := resolveQUICRoute(
+		context.Background(),
+		peer.node,
+		peer.id,
+		peer.pub,
+		peer.route,
+	)
 	if err != nil {
 		t.Fatalf("resolve QUIC route: %v", err)
 	}
@@ -456,7 +500,13 @@ func TestResolveQUICRouteRejectsDifferentPeerIdentity(t *testing.T) {
 		route: newPeerRoute(""),
 	}
 
-	if _, err = peer.quicPath().resolveRoute(context.Background()); err == nil {
+	if _, err = resolveQUICRoute(
+		context.Background(),
+		peer.node,
+		peer.id,
+		peer.pub,
+		peer.route,
+	); err == nil {
 		t.Fatal("resolution accepted a different peer identity")
 	}
 	if got := peer.route.quicAddr(); got != "" {
@@ -882,6 +932,103 @@ func TestOverlayPeerDialQUICDoesNotReuseInboundOnlyPath(t *testing.T) {
 	}
 }
 
+func TestOverlayPeerDialQUICRecoversChangedEndpointThroughDHT(t *testing.T) {
+	node := newTestNode(t)
+	startQUICOutboundTestGateway(t, node.quicGateway)
+
+	remoteKey := quicOutboundTestKey(t)
+	remote, err := adnlquic.NewGateway(remoteKey)
+	if err != nil {
+		t.Fatalf("create remote QUIC gateway: %v", err)
+	}
+	remote.SetConnectionHandler(func(*adnlquic.Peer) error {
+		return nil
+	})
+	remoteAddr := startQUICOutboundTestGateway(t, remote)
+	remoteEndpoint, err := netip.ParseAddrPort(remoteAddr)
+	if err != nil {
+		t.Fatalf("parse remote QUIC endpoint: %v", err)
+	}
+
+	deadConn, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP: net.IPv4(127, 0, 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("reserve dead QUIC endpoint: %v", err)
+	}
+	deadAddr := deadConn.LocalAddr().String()
+	if err = deadConn.Close(); err != nil {
+		t.Fatalf("close dead QUIC endpoint: %v", err)
+	}
+
+	remoteID := peerIDForQUICOutboundTest(t, remote.PublicKey())
+	dht := &outboundRouteDHT{
+		addresses: &adnladdr.List{
+			Addresses: []adnladdr.Address{
+				adnladdr.QUIC{
+					IP:   net.IP(remoteEndpoint.Addr().AsSlice()),
+					Port: int32(remoteEndpoint.Port()),
+				},
+			},
+			ExpireAt: int32(time.Now().Add(time.Hour).Unix()),
+		},
+		pub: remote.PublicKey(),
+	}
+	node.dht = dht
+	route := newPeerRoute(deadAddr)
+	peer := &overlayPeer{
+		node:  node,
+		id:    remoteID,
+		pub:   remote.PublicKey(),
+		route: route,
+	}
+
+	failedCtx, cancelFailed := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	_, err = peer.dialQUIC(failedCtx)
+	cancelFailed()
+	if err == nil {
+		t.Fatal("dial to dead QUIC endpoint unexpectedly succeeded")
+	}
+	if !route.quicAddrStale() {
+		t.Fatal("failed post-resolution QUIC dial did not mark the route stale")
+	}
+	if route.quicReady(time.Now()) {
+		t.Fatal("failed post-resolution QUIC dial did not enter cooldown")
+	}
+	if got := dht.calls.Load(); got != 0 {
+		t.Fatalf("DHT lookups before stale recovery = %d, want 0", got)
+	}
+
+	route.quicRetryState.Store(time.Now().Add(-time.Second).UnixNano())
+	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), 5*time.Second)
+	outbound, err := peer.dialQUIC(recoveryCtx)
+	cancelRecovery()
+	if err != nil {
+		t.Fatalf("recover changed QUIC endpoint: %v", err)
+	}
+	if outbound == nil {
+		t.Fatal("recovered QUIC endpoint returned no peer")
+	}
+	if got := dht.calls.Load(); got != 1 {
+		t.Fatalf("DHT lookups during stale recovery = %d, want 1", got)
+	}
+	if got := route.quicAddr(); got != remoteAddr {
+		t.Fatalf("recovered QUIC route = %q, want %q", got, remoteAddr)
+	}
+	if route.quicAddrStale() {
+		t.Fatal("successful changed-endpoint dial left route stale")
+	}
+	if got := route.quicRetryState.Load(); got != 0 {
+		t.Fatalf("retry state after changed-endpoint recovery = %d, want 0", got)
+	}
+	route.quicRetryMx.Lock()
+	failures := route.quicDialFailures
+	route.quicRetryMx.Unlock()
+	if failures != 0 {
+		t.Fatalf("failures after changed-endpoint recovery = %d, want 0", failures)
+	}
+}
+
 func TestPlumtreeRuntimeDialsOutboundForAuthenticatedPeer(t *testing.T) {
 	remoteKey := quicOutboundTestKey(t)
 	var ingressQueries atomic.Int32
@@ -1086,8 +1233,13 @@ func TestQUICOutboundOperationsRequireRoute(t *testing.T) {
 	}).QueryRaw(context.Background(), 1024, overlay.Ping{}); !errors.Is(err, errQUICRouteMissing) {
 		t.Fatalf("raw query error = %v, want missing route", err)
 	}
+	typedPeer := &overlayPeer{
+		node:  peer.node,
+		pub:   peerPublicKey,
+		route: newPeerRoute(""),
+	}
 	if err = (quicPeerQueryTransport{
-		peer:     peer,
+		peer:     typedPeer,
 		envelope: envelope,
 	}).Query(context.Background(), 1024, overlay.Ping{}, &overlay.Pong{}); !errors.Is(err, errQUICRouteMissing) {
 		t.Fatalf("typed query error = %v, want missing route", err)
@@ -1180,7 +1332,7 @@ func newQUICRouteDiscoveryNode(t *testing.T, dht dhtBackend) *Node {
 	})
 
 	node.dht = dht
-	node.pool = newPeerPool(gateway, nil, nil)
+	node.pool = newPeerPool(gateway, nil, nil, nil)
 	runCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	node.runCtx = runCtx

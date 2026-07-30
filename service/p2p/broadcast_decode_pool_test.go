@@ -195,3 +195,32 @@ func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 		t.Fatal("expired entry served from cache")
 	}
 }
+
+func TestBroadcastDecodeWorkerCountFor(t *testing.T) {
+	tests := []struct {
+		procs int
+		want  int
+	}{
+		{procs: 1, want: broadcastDecodeWorkerMin},
+		{procs: 2, want: broadcastDecodeWorkerMin},
+		{procs: 4, want: broadcastDecodeWorkerMin},
+		{procs: 8, want: 4},
+		{procs: 16, want: broadcastDecodeWorkerMax},
+		{procs: 64, want: broadcastDecodeWorkerMax},
+	}
+
+	for _, tc := range tests {
+		if got := broadcastDecodeWorkerCountFor(tc.procs); got != tc.want {
+			t.Fatalf("broadcastDecodeWorkerCountFor(%d) = %d, want %d", tc.procs, got, tc.want)
+		}
+	}
+
+	// The pool is never allowed to run without workers: the alternative to a
+	// free worker is an inline decode on a transport receive goroutine.
+	if got := broadcastDecodeWorkerCountFor(0); got < broadcastDecodeWorkerMin {
+		t.Fatalf("broadcastDecodeWorkerCountFor(0) = %d, want at least %d", got, broadcastDecodeWorkerMin)
+	}
+	if got := broadcastDecodeWorkerCountFor(-1); got < broadcastDecodeWorkerMin {
+		t.Fatalf("broadcastDecodeWorkerCountFor(-1) = %d, want at least %d", got, broadcastDecodeWorkerMin)
+	}
+}

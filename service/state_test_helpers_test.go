@@ -7,6 +7,8 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -66,6 +68,25 @@ type testShardAccountsAugmentation struct{}
 
 func newTestStateCellWindowCache(base cell.LazyCellLoader) *stateCellWindowCache {
 	return newStateCellWindowCache(base, &lazyCellLoadCounters{})
+}
+
+// rememberAppliedForTest stages the records and then drains the prewrite
+// backpressure, which is the two-step the production appliers do around
+// reloading the applied root.
+func rememberAppliedForTest(w *stateCellWindowCache, root *cell.Cell, prepared storage.StateCellRecords) error {
+	wait, err := w.rememberApplied(root, prepared)
+	if err != nil {
+		return err
+	}
+	return wait()
+}
+
+func (w *stateCellWindowCache) addPreparedStateRecords(root cell.Hash, records storage.StateCellRecords) error {
+	wait, err := w.stagePreparedStateRecords(root, records)
+	if err != nil {
+		return err
+	}
+	return wait()
 }
 
 func (testShardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {

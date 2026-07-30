@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -149,8 +150,11 @@ func TestImportFastSyncCertificateRejects(t *testing.T) {
 				test.expireAt,
 			)
 
-			if node.importFastSyncCertificate(certificate, now) {
-				t.Fatal("invalid certificate was imported")
+			if err := node.importFastSyncCertificate(certificate, now); !errors.Is(
+				err,
+				errFastSyncCertificateNotStored,
+			) {
+				t.Fatalf("invalid certificate import error = %v", err)
 			}
 			if got := len(node.fastSyncCertificateSnapshot()); got != 0 {
 				t.Fatalf("stored certificates = %d, want 0", got)
@@ -176,8 +180,11 @@ func TestImportFastSyncCertificateNeedsRoster(t *testing.T) {
 		int32(now.Add(time.Hour).Unix()),
 	)
 
-	if node.importFastSyncCertificate(certificate, now) {
-		t.Fatal("certificate was imported without a roster")
+	if err := node.importFastSyncCertificate(certificate, now); !errors.Is(
+		err,
+		errFastSyncCertificateNotStored,
+	) {
+		t.Fatalf("certificate import error = %v", err)
 	}
 }
 
@@ -191,8 +198,8 @@ func TestImportFastSyncCertificateDedupesByIssuer(t *testing.T) {
 	first := fastSyncMembershipTestCertificate(
 		t, issuer, node.localID, 1, 0, int32(now.Add(time.Hour).Unix()),
 	)
-	if !node.importFastSyncCertificate(first, now) {
-		t.Fatal("first certificate was not imported")
+	if err := node.importFastSyncCertificate(first, now); err != nil {
+		t.Fatalf("import first certificate: %v", err)
 	}
 	stored := node.fastSyncCertificateSnapshot()
 	if len(stored) != 1 {
@@ -202,15 +209,18 @@ func TestImportFastSyncCertificateDedupesByIssuer(t *testing.T) {
 	same := fastSyncMembershipTestCertificate(
 		t, issuer, node.localID, 1, 0, first.ExpireAt,
 	)
-	if node.importFastSyncCertificate(same, now) {
-		t.Fatal("certificate with equal expiry replaced the stored one")
+	if err := node.importFastSyncCertificate(same, now); !errors.Is(
+		err,
+		errFastSyncCertificateNotStored,
+	) {
+		t.Fatalf("equal-expiry certificate import error = %v", err)
 	}
 
 	newer := fastSyncMembershipTestCertificate(
 		t, issuer, node.localID, 1, 0, first.ExpireAt+600,
 	)
-	if !node.importFastSyncCertificate(newer, now) {
-		t.Fatal("longer-lived certificate was not imported")
+	if err := node.importFastSyncCertificate(newer, now); err != nil {
+		t.Fatalf("import longer-lived certificate: %v", err)
 	}
 	updated := node.fastSyncCertificateSnapshot()
 	if len(updated) != 1 {
@@ -252,5 +262,63 @@ func TestHandlePeerCustomMessageIgnoresOtherTypes(t *testing.T) {
 	}
 	if got := len(node.fastSyncCertificateSnapshot()); got != 0 {
 		t.Fatalf("stored certificates after empty push = %d, want 0", got)
+	}
+}
+
+// Only a certificate whose issuer is still in the routing rosters is usable -
+// fastSyncLocalCertificate filters on exactly that. Refusing every new one once
+// the set is full let a validator-set rotation strand the node: the 32 slots
+// held unexpired but unroutable certificates, no replacement could be stored,
+// and every fast-sync overlay stayed down until they timed out, up to an hour.
+func TestStoreFastSyncCertificateEvictsUnroutedIssuers(t *testing.T) {
+	now := time.Unix(1_800_003_000, 0)
+	expireAt := int32(now.Add(time.Hour).Unix())
+
+	current := newFastSyncMembershipTestIssuer(t, 0xa1)
+	node := fastSyncCertificateTestNode(t, current)
+	roster := node.fastSyncState.Roster
+
+	// Fill every slot with certificates from issuers outside the roster.
+	for i := 0; i < fastSyncCertificateLimit; i++ {
+		stale := newFastSyncMembershipTestIssuer(t, byte(0x40+i))
+		certificate := fastSyncMembershipTestCertificate(
+			t, stale, node.localID, 1, 0, expireAt,
+		)
+		if err := node.storeFastSyncCertificate(stale.id, certificate, roster, now); err != nil {
+			t.Fatalf("seed certificate %d: %v", i, err)
+		}
+	}
+	if got := len(node.fastSyncCertificateSnapshot()); got != fastSyncCertificateLimit {
+		t.Fatalf("seeded certificates = %d, want %d", got, fastSyncCertificateLimit)
+	}
+
+	// A certificate from the validator that is actually routing must get in.
+	fresh := fastSyncMembershipTestCertificate(
+		t, current, node.localID, 1, 0, expireAt,
+	)
+	if err := node.importFastSyncCertificate(fresh, now); err != nil {
+		t.Fatalf("import certificate from a routing validator: %v", err)
+	}
+
+	stored := node.fastSyncCertificateSnapshot()
+	if len(stored) != fastSyncCertificateLimit {
+		t.Fatalf("stored certificates = %d, want %d", len(stored), fastSyncCertificateLimit)
+	}
+	found := false
+	for _, certificate := range stored {
+		issuerBytes, err := certificate.IssuerID()
+		if err != nil {
+			t.Fatalf("stored issuer id: %v", err)
+		}
+		issuer, err := NewPeerID(issuerBytes)
+		if err != nil {
+			t.Fatalf("stored issuer: %v", err)
+		}
+		if issuer == current.id {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a full set refused the only usable certificate")
 	}
 }

@@ -375,7 +375,7 @@ func (p *archivePeerPool) offerArchiveIdentity(node *overlay.Node, identity over
 		if entry != nil {
 			peer = entry.peer
 		}
-		relayDue := p.sub.spec.RandomPeers && peer == nil && !now.Before(p.randomExpandedUntil[identity.peerID])
+		relayDue := p.sub.spec.usesV1PeerGossip() && peer == nil && !now.Before(p.randomExpandedUntil[identity.peerID])
 		if !relayDue {
 			p.mx.Unlock()
 			if peer != nil {
@@ -542,7 +542,7 @@ func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 	endpoint := offer.endpoint
 	if endpoint == "" {
 		addressCtx, cancel := context.WithTimeout(p.ctx, archiveDHTAddressTimeout)
-		addrList, _, err := findPeerAddresses(addressCtx, p.sub.node.dht, offer.identity.peerID[:])
+		addrList, _, err := p.sub.node.resolvePeerAddresses(addressCtx, offer.identity.peerID)
 		cancel()
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
@@ -693,7 +693,7 @@ func (p *archivePeerPool) scoutConnectedTransientArchivePeer(peer *overlayPeer, 
 }
 
 func (p *archivePeerPool) exchangeTransientRandomPeers(ctx context.Context, peer *overlayPeer) bool {
-	if !p.sub.isActive() || !p.sub.spec.RandomPeers {
+	if !p.sub.isActive() || !p.sub.spec.usesV1PeerGossip() {
 		return false
 	}
 

@@ -88,6 +88,11 @@ var (
 )
 var errShardCatchUpNeedsSnapshot = errors.New("shard catch-up requires state snapshot")
 
+// errShardApplyMasterMissing guards the shard apply callbacks: they must never
+// fall back to the commit stage's current master, because the resolution they
+// serve can be started by the apply-ahead stage.
+var errShardApplyMasterMissing = errors.New("shard apply is missing its inclusion masterchain state")
+
 type shardBlockLoader func(context.Context, ton.BlockIDExt) (PreparedBlock, error)
 
 type timeoutError interface {
@@ -178,14 +183,21 @@ type Service struct {
 
 	stateMu sync.Mutex
 
+	// currentStateWake is a close-and-replace broadcast (the rawMasterchainNotify
+	// pattern): at least five sync selectors wait on it concurrently, and a
+	// single-token channel would let any one of them consume a wake meant for
+	// another — e.g. a shard retry eating the wake that should end the parked
+	// master probe hold. Access only through currentStateWakeChan and
+	// broadcastCurrentStateWake.
+	currentStateWakeMu    sync.Mutex
 	currentStateWake      chan struct{}
 	shardDescriptionWake  chan struct{}
 	shardDescriptionMu    sync.Mutex
 	shardDescriptionHints map[storage.BlockRootHash]shardDescriptionHint
 	shardDescriptionOrder []storage.BlockRootHash
 
-	preparedShardBlocks     preparedShardBlockCache
-	preparedShardBlockSlots chan struct{}
+	preparedShardBlocks preparedShardBlockCache
+	shardPrepareQueue   chan shardPrepareRequest
 
 	nextMasterchainMx               sync.Mutex
 	nextMasterchainQueue            map[storage.BlockRootHash]queuedMasterchainBlock
@@ -196,6 +208,7 @@ type Service struct {
 	nextMasterchainCandidateBytes   int64
 	validatorCache                  masterchainValidatorCache
 	broadcastValidatorCache         broadcastValidatorCache
+	parsedProofs                    parsedProofCache
 	masterStateCacheMu              sync.Mutex
 	masterStateCache                map[storage.BlockRootHash]*storage.BlockState
 	masterStateCacheKeys            []storage.BlockRootHash
@@ -235,9 +248,18 @@ type Service struct {
 	cellGenerationSwitchRequested      bool
 	cellGenerationNextBlockYieldAt     time.Time
 	cellGenerationSwitching            bool
+	masterPrepare                      masterPrepareFlight
 	currentStatusMu                    sync.RWMutex
 	currentStatus                      *storage.CurrentState
 	appliedMasterchainStatus           *storage.BlockState
+	shardOverlayMu                     sync.Mutex
+	shardOverlayPending                *masterShardOverlayUpdate
+	shardOverlayRunning                bool
+	shardOverlayReconcileMu            sync.Mutex
+	shardOverlayReconciledSeqno        uint32
+	// reconcileOverlaysHook replaces the overlay reconcile in tests; nil in
+	// production.
+	reconcileOverlaysHook func(context.Context, masterShardOverlayUpdate)
 
 	startOnce sync.Once
 	wg        sync.WaitGroup
@@ -595,10 +617,10 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		checkpointBytes:                    opts.CheckpointBytes,
 		syncBackpressureWindows:            opts.SyncBackpressureWindows,
 		shutdownContext:                    opts.ShutdownContext,
-		currentStateWake:                   make(chan struct{}, 1),
+		currentStateWake:                   make(chan struct{}),
 		shardDescriptionWake:               make(chan struct{}, 1),
 		shardDescriptionHints:              map[storage.BlockRootHash]shardDescriptionHint{},
-		preparedShardBlockSlots:            make(chan struct{}, preparedShardBlockWorkers),
+		shardPrepareQueue:                  make(chan shardPrepareRequest, preparedShardBlockQueueSize),
 		nextMasterchainQueue:               make(map[storage.BlockRootHash]queuedMasterchainBlock, nextMasterchainQueueLimit),
 		nextMasterchainBySeqno:             make(map[uint32]storage.BlockRootHash, nextMasterchainQueueLimit),
 		nextMasterchainCandidates:          make(map[storage.BlockRootHash]queuedMasterchainCandidate, nextMasterchainQueueLimit),
@@ -661,6 +683,9 @@ func (s *Service) Start(ctx context.Context) {
 		})
 		s.runAsync(func() {
 			s.runShardDescriptionProcessor(ctx)
+		})
+		s.runAsync(func() {
+			s.runShardPrepareWorkers(ctx)
 		})
 		s.runAsync(func() {
 			s.runDelayedServiceMaintenance(ctx)
@@ -885,6 +910,9 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 	}()
 
 	for {
+		// Taken before the sync attempt so state published while it runs is not
+		// waited out by the poll below.
+		stateWake := s.currentStateWakeChan()
 		err := s.ensureCurrentState(ctx)
 		if errors.Is(err, context.Canceled) {
 			return
@@ -900,7 +928,7 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 					Msg("current state sync stopped after sync_until")
 				return
 			}
-			if !s.waitCurrentStatePoll(ctx, currentStateLivePollDelay) {
+			if !s.waitCurrentStatePoll(ctx, stateWake, currentStateLivePollDelay) {
 				return
 			}
 			continue
@@ -1071,30 +1099,14 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 
 	prepareStarted := time.Now()
 	downloaded := synced.Downloaded
-	verified, err := verifyDownloadedBlock(downloaded)
+	verified, err := s.verifyDownloadedBlock(downloaded)
 	if err != nil {
 		observation.PrepareDuration = time.Since(prepareStarted)
 		return err
 	}
 
 	if s.log.GetLevel() <= zerolog.DebugLevel {
-		stats, err := StatsFromDownloadedBlock(downloaded)
-		if err != nil {
-			s.log.Debug().
-				Err(err).
-				Str("block", downloaded.BlockRef()).
-				Str("overlay", synced.Trigger.Overlay).
-				Bool("catch_up", synced.CatchUp).
-				Msg("failed to collect block stats")
-		} else {
-			s.log.Debug().
-				Str("block", downloaded.BlockRef()).
-				Uint32("seqno", downloaded.ID.SeqNo).
-				Str("overlay", synced.Trigger.Overlay).
-				Bool("catch_up", synced.CatchUp).
-				Int("transactions", stats.Transactions).
-				Msg("processed synced block")
-		}
+		s.logSyncedBlockStatsAsync(downloaded, synced.Trigger.Overlay, synced.CatchUp)
 	}
 
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
@@ -1109,7 +1121,11 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 			return err
 		}
 		verified.consensusChecked = checked
-		prepared, err := prepareVerifiedBlockForApply(verified)
+		// Shared with the next-block probe, which reaches the same decoded
+		// broadcast through the p2p hot cache and would otherwise walk the same
+		// state update a second time. Ordering is unchanged: consensus is
+		// validated first, so a deferred block never pays for the cells.
+		prepared, err := s.prepareVerifiedMasterchainBlockShared(ctx, verified)
 		if err != nil {
 			observation.PrepareDuration = time.Since(prepareStarted)
 			return err
@@ -1129,6 +1145,31 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	s.prepareShardBlockAheadFromVerified(verified)
 	observation.PrepareDuration = time.Since(prepareStarted)
 	return nil
+}
+
+// logSyncedBlockStatsAsync keeps the debug-only account-blocks walk of
+// StatsFromDownloadedBlock off the serial block processor, where it used to
+// run before consensus checks and prepare on every synced block.
+func (s *Service) logSyncedBlockStatsAsync(downloaded p2p.DownloadedBlock, overlay string, catchUp bool) {
+	s.runAsync(func() {
+		stats, err := StatsFromDownloadedBlock(downloaded)
+		if err != nil {
+			s.log.Debug().
+				Err(err).
+				Str("block", downloaded.BlockRef()).
+				Str("overlay", overlay).
+				Bool("catch_up", catchUp).
+				Msg("failed to collect block stats")
+			return
+		}
+		s.log.Debug().
+			Str("block", downloaded.BlockRef()).
+			Uint32("seqno", downloaded.ID.SeqNo).
+			Str("overlay", overlay).
+			Bool("catch_up", catchUp).
+			Int("transactions", stats.Transactions).
+			Msg("processed synced block")
+	})
 }
 
 func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, block VerifiedBlock) (*checkedMasterchainConsensus, error) {
@@ -1183,25 +1224,45 @@ func waitRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (s *Service) waitCurrentStatePoll(ctx context.Context, delay time.Duration) bool {
+// waitCurrentStatePoll parks between sync attempts. The caller passes the wake
+// it took before the attempt, so state published while that attempt ran is not
+// waited out here.
+func (s *Service) waitCurrentStatePoll(ctx context.Context, wake <-chan struct{}, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
 		return false
-	case <-s.currentStateWake:
+	case <-wake:
 		return true
 	case <-timer.C:
 		return true
 	}
 }
 
-func (s *Service) wakeCurrentStateSync() {
-	select {
-	case s.currentStateWake <- struct{}{}:
-	default:
+// currentStateWakeChan returns the channel the next wake closes. Waiters that
+// loop must take a fresh channel after each release, and take it before
+// re-checking the state the wake announces, so a wake between the check and the
+// select is never lost.
+func (s *Service) currentStateWakeChan() <-chan struct{} {
+	s.currentStateWakeMu.Lock()
+	ch := s.currentStateWake
+	s.currentStateWakeMu.Unlock()
+	return ch
+}
+
+func (s *Service) broadcastCurrentStateWake() {
+	s.currentStateWakeMu.Lock()
+	if s.currentStateWake != nil {
+		close(s.currentStateWake)
+		s.currentStateWake = make(chan struct{})
 	}
+	s.currentStateWakeMu.Unlock()
+}
+
+func (s *Service) wakeCurrentStateSync() {
+	s.broadcastCurrentStateWake()
 	s.wakeServiceMaintenance()
 }
 

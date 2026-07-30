@@ -323,12 +323,13 @@ func (n *Node) decodeBlockBroadcastCompressedV2WithProofRoot(ctx context.Context
 // scheduleCompressedStateChain applies the just-decoded merkle update to the
 // state it was decompressed against and remembers the resulting materialized
 // next-state tree, so the following block's state-aware decompression finds
-// an in-memory root instead of walking lazy celldb cells. Every current
-// caller decodes only after the validator-signature check, but the chain does
-// not depend on that ordering: the content is pinned by the block's root/file
-// hash checks, so entries for real block IDs are always genuine and forged
-// IDs only occupy bounded TTL'd cache slots nobody asks for. The apply
-// pipeline later overwrites the entry with the canonical state.
+// an in-memory root instead of walking lazy celldb cells. The pool decode now
+// runs concurrently with the validator-signature check, so this can be reached
+// for a block whose signatures later fail; the chain does not depend on that
+// ordering: the content is pinned by the block's root/file hash checks, so
+// entries for real block IDs are always genuine and forged IDs only occupy
+// bounded TTL'd cache slots nobody asks for. The apply pipeline later
+// overwrites the entry with the canonical state.
 func (n *Node) scheduleCompressedStateChain(prevState *cell.Cell, downloaded *DownloadedBlock) {
 	if n.compressedState == nil {
 		return

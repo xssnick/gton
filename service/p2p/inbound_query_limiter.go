@@ -10,75 +10,75 @@ import (
 )
 
 const (
-	fastSyncQueryRateWindowDuration = time.Second
-	fastSyncQueryGlobalLimit        = uint64(96)
-	fastSyncQueryHeavyLimit         = uint64(64)
-	fastSyncQueryMediumLimit        = uint64(72)
-	fastSyncQuerySmallLimit         = uint64(200)
+	inboundQueryRateWindowDuration = time.Second
+	inboundQueryGlobalLimit        = uint64(96)
+	inboundQueryHeavyLimit         = uint64(64)
+	inboundQueryMediumLimit        = uint64(72)
+	inboundQuerySmallLimit         = uint64(200)
 
 	fastSyncHeavyQueryCostUnit = uint64(2 << 20)
 	fastSyncZeroStateMaxSize   = uint64(16 << 20)
 )
 
-var errFastSyncQueryRateLimited = errors.New(
+var errInboundQueryRateLimited = errors.New(
 	"fast sync inbound query rate limit exceeded",
 )
 
-type fastSyncQueryClass uint8
+type inboundQueryClass uint8
 
 const (
-	fastSyncQueryUnlimited fastSyncQueryClass = iota
-	fastSyncQueryHeavy
-	fastSyncQueryMedium
-	fastSyncQuerySmall
+	inboundQueryUnlimited inboundQueryClass = iota
+	inboundQueryHeavy
+	inboundQueryMedium
+	inboundQuerySmall
 )
 
-type fastSyncQueryLimiter struct {
+type inboundQueryLimiter struct {
 	mu sync.Mutex
 
-	global fastSyncQueryRateWindow
-	heavy  fastSyncQueryRateWindow
-	medium fastSyncQueryRateWindow
-	small  fastSyncQueryRateWindow
+	global inboundQueryRateWindow
+	heavy  inboundQueryRateWindow
+	medium inboundQueryRateWindow
+	small  inboundQueryRateWindow
 }
 
-type fastSyncQueryRateWindow struct {
+type inboundQueryRateWindow struct {
 	duration time.Duration
 	limit    uint64
-	entries  []fastSyncQueryRateEntry
+	entries  []inboundQueryRateEntry
 	head     int
 	count    int
 	weight   uint64
 }
 
-type fastSyncQueryRateEntry struct {
+type inboundQueryRateEntry struct {
 	at     time.Time
 	weight uint64
 }
 
-func newFastSyncQueryLimiter() fastSyncQueryLimiter {
-	return fastSyncQueryLimiter{
-		global: newFastSyncQueryRateWindow(fastSyncQueryGlobalLimit),
-		heavy:  newFastSyncQueryRateWindow(fastSyncQueryHeavyLimit),
-		medium: newFastSyncQueryRateWindow(fastSyncQueryMediumLimit),
-		small:  newFastSyncQueryRateWindow(fastSyncQuerySmallLimit),
+func newInboundQueryLimiter() inboundQueryLimiter {
+	return inboundQueryLimiter{
+		global: newInboundQueryRateWindow(inboundQueryGlobalLimit),
+		heavy:  newInboundQueryRateWindow(inboundQueryHeavyLimit),
+		medium: newInboundQueryRateWindow(inboundQueryMediumLimit),
+		small:  newInboundQueryRateWindow(inboundQuerySmallLimit),
 	}
 }
 
-func newFastSyncQueryRateWindow(limit uint64) fastSyncQueryRateWindow {
-	return fastSyncQueryRateWindow{
-		duration: fastSyncQueryRateWindowDuration,
+func newInboundQueryRateWindow(limit uint64) inboundQueryRateWindow {
+	return inboundQueryRateWindow{
+		duration: inboundQueryRateWindowDuration,
 		limit:    limit,
-		entries:  make([]fastSyncQueryRateEntry, int(limit)),
+		entries:  make([]inboundQueryRateEntry, int(limit)),
 	}
 }
 
-func (l *fastSyncQueryLimiter) Allow(
+func (l *inboundQueryLimiter) Allow(
 	query tl.Serializable,
 	now time.Time,
 ) bool {
-	class, cost := fastSyncQueryCost(query)
-	if class == fastSyncQueryUnlimited {
+	class, cost := inboundQueryCost(query)
+	if class == inboundQueryUnlimited {
 		return true
 	}
 
@@ -86,7 +86,7 @@ func (l *fastSyncQueryLimiter) Allow(
 	defer l.mu.Unlock()
 
 	category := l.category(class)
-	if class == fastSyncQuerySmall {
+	if class == inboundQuerySmall {
 		if !category.allows(now, cost) {
 			return false
 		}
@@ -104,36 +104,36 @@ func (l *fastSyncQueryLimiter) Allow(
 	return true
 }
 
-func (l *fastSyncQueryLimiter) category(
-	class fastSyncQueryClass,
-) *fastSyncQueryRateWindow {
+func (l *inboundQueryLimiter) category(
+	class inboundQueryClass,
+) *inboundQueryRateWindow {
 	switch class {
-	case fastSyncQueryHeavy:
+	case inboundQueryHeavy:
 		return &l.heavy
-	case fastSyncQueryMedium:
+	case inboundQueryMedium:
 		return &l.medium
-	case fastSyncQuerySmall:
+	case inboundQuerySmall:
 		return &l.small
 	default:
 		panic("invalid fast sync query class")
 	}
 }
 
-func fastSyncQueryCost(
+func inboundQueryCost(
 	query tl.Serializable,
-) (fastSyncQueryClass, uint64) {
+) (inboundQueryClass, uint64) {
 	switch query := query.(type) {
 	case GetArchiveSlice:
-		return fastSyncQueryHeavy,
-			fastSyncHeavyQueryCost(positiveFastSyncQuerySize(
+		return inboundQueryHeavy,
+			inboundHeavyQueryCost(positiveInboundQuerySize(
 				int64(query.MaxSize),
 			))
 	case DownloadPersistentStateSliceV2:
-		return fastSyncQueryHeavy,
-			fastSyncHeavyQueryCost(positiveFastSyncQuerySize(query.MaxSize))
+		return inboundQueryHeavy,
+			inboundHeavyQueryCost(positiveInboundQuerySize(query.MaxSize))
 	case DownloadZeroState:
-		return fastSyncQueryHeavy,
-			fastSyncHeavyQueryCost(fastSyncZeroStateMaxSize)
+		return inboundQueryHeavy,
+			inboundHeavyQueryCost(fastSyncZeroStateMaxSize)
 
 	case tonnodeapi.DownloadBlock,
 		tonnodeapi.DownloadBlockFull,
@@ -144,7 +144,7 @@ func fastSyncQueryCost(
 		DownloadKeyBlockProof,
 		DownloadKeyBlockProofLink,
 		GetOutMsgQueueProof:
-		return fastSyncQueryMedium, 1
+		return inboundQueryMedium, 1
 
 	case GetNextBlockDescription,
 		PrepareBlockProof,
@@ -156,21 +156,21 @@ func fastSyncQueryCost(
 		GetShardArchiveInfo,
 		PreparePersistentState,
 		GetPersistentStateSizeV2:
-		return fastSyncQuerySmall, 1
+		return inboundQuerySmall, 1
 
 	default:
-		return fastSyncQueryUnlimited, 0
+		return inboundQueryUnlimited, 0
 	}
 }
 
-func positiveFastSyncQuerySize(size int64) uint64 {
+func positiveInboundQuerySize(size int64) uint64 {
 	if size <= 0 {
 		return 0
 	}
 	return uint64(size)
 }
 
-func fastSyncHeavyQueryCost(requestedMaxSize uint64) uint64 {
+func inboundHeavyQueryCost(requestedMaxSize uint64) uint64 {
 	cost := requestedMaxSize / fastSyncHeavyQueryCostUnit
 	if requestedMaxSize%fastSyncHeavyQueryCostUnit != 0 {
 		cost++
@@ -181,7 +181,7 @@ func fastSyncHeavyQueryCost(requestedMaxSize uint64) uint64 {
 	return cost
 }
 
-func (w *fastSyncQueryRateWindow) allows(
+func (w *inboundQueryRateWindow) allows(
 	now time.Time,
 	weight uint64,
 ) bool {
@@ -189,7 +189,7 @@ func (w *fastSyncQueryRateWindow) allows(
 	return weight <= w.limit && weight <= w.limit-w.weight
 }
 
-func (w *fastSyncQueryRateWindow) insert(
+func (w *inboundQueryRateWindow) insert(
 	now time.Time,
 	weight uint64,
 ) {
@@ -203,16 +203,16 @@ func (w *fastSyncQueryRateWindow) insert(
 	}
 
 	index := (w.head + w.count) % len(w.entries)
-	w.entries[index] = fastSyncQueryRateEntry{at: now, weight: weight}
+	w.entries[index] = inboundQueryRateEntry{at: now, weight: weight}
 	w.count++
 	w.weight += weight
 }
 
-func (w *fastSyncQueryRateWindow) prune(now time.Time) {
+func (w *inboundQueryRateWindow) prune(now time.Time) {
 	for w.count > 0 &&
 		now.Sub(w.entries[w.head].at) > w.duration {
 		w.weight -= w.entries[w.head].weight
-		w.entries[w.head] = fastSyncQueryRateEntry{}
+		w.entries[w.head] = inboundQueryRateEntry{}
 		w.head = (w.head + 1) % len(w.entries)
 		w.count--
 	}

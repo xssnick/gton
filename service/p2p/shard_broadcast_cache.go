@@ -90,7 +90,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 	if err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", tnstore.FormatBlockRef(downloaded.ID)).
+			Stringer("block", tnstore.BlockRef(downloaded.ID)).
 			Msg("dropping shard block broadcast from hot cache")
 		return false
 	}
@@ -98,13 +98,13 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.blockRoot, validated.proofRoot, validated.stateUpdate, time.Now()); err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", tnstore.FormatBlockRef(downloaded.ID)).
+			Stringer("block", tnstore.BlockRef(downloaded.ID)).
 			Msg("failed to cache shard block broadcast")
 		return false
 	}
 
 	n.log.Debug().
-		Str("block", tnstore.FormatBlockRef(downloaded.ID)).
+		Stringer("block", tnstore.BlockRef(downloaded.ID)).
 		Msg("cached shard block broadcast")
 	n.notifyShardBroadcastBlock(downloaded.ID)
 	return true
@@ -135,7 +135,7 @@ func (n *Node) shardBroadcastBlock(block ton.BlockIDExt) (*DownloadedBlock, erro
 	}
 	result = broadcastPipelineResultSuccess
 	n.log.Debug().
-		Str("block", tnstore.FormatBlockRef(block)).
+		Stringer("block", tnstore.BlockRef(block)).
 		Msg("using cached shard block broadcast")
 	return downloaded, nil
 }

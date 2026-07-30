@@ -12,6 +12,7 @@ import (
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -339,9 +340,15 @@ func (r *archiveCatchUpRunner) nextArchiveWindowWithProgress() (*shardClientArch
 	}
 }
 
-func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, queue *archiveImportQueue, start *storage.BlockState, targetSeqno uint32, prefetched *archiveMasterDownloadTask) *archiveMasterImportTask {
+// startArchiveMasterImport downloads, prepares and prechecks the master window
+// that begins after startBlock. configState only supplies epoch-scoped config
+// (monitor split depth, validator sets on precheck cache misses), so it may be
+// any applied state from the same validator epoch as the window's blocks: the
+// planner passes the previous window's start state while that window's masters
+// are still being applied (see prepareArchiveMasterWindow).
+func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, queue *archiveImportQueue, startBlock ton.BlockIDExt, configState *storage.BlockState, targetSeqno uint32, prefetched *archiveMasterDownloadTask) *archiveMasterImportTask {
 	taskCtx, cancel := context.WithCancel(ctx)
-	startSeqno := start.Block.SeqNo + 1
+	startSeqno := startBlock.SeqNo + 1
 	task := &archiveMasterImportTask{
 		startSeqno: startSeqno,
 		cancel:     cancel,
@@ -352,10 +359,10 @@ func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, que
 		if prefetched != nil {
 			defer prefetched.discard()
 		}
-		splitDepth, err := monitorMinSplitDepth(start, 0)
+		splitDepth, err := monitorMinSplitDepth(configState, 0)
 		if err != nil {
 			task.done <- archiveMasterImportResult{
-				err: fmt.Errorf("load archive split depth for %s: %w", storage.FormatBlockRef(start.Block), err),
+				err: fmt.Errorf("load archive split depth for %s: %w", storage.FormatBlockRef(configState.Block), err),
 			}
 			return
 		}
@@ -371,7 +378,7 @@ func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, que
 			if err == nil {
 				result.imported = downloaded.imported
 				result.masterSequence, err = archiveMasterBlockSequence(
-					start,
+					startBlock,
 					targetSeqno,
 					startSeqno,
 					archiveMasterBlockMap(result.imported.blocks),
@@ -386,7 +393,7 @@ func (r *archiveCatchUpRunner) startArchiveMasterImport(ctx context.Context, que
 							break
 						}
 					}
-					result.consensusProofs, result.precheckElapsed, err = r.precheckArchiveMasterConsensus(taskCtx, start, precheckSequence)
+					result.consensusProofs, result.precheckElapsed, err = r.precheckArchiveMasterConsensus(taskCtx, startBlock, configState, precheckSequence)
 				}
 			}
 			if err == nil {
@@ -563,13 +570,27 @@ func nextArchiveMasterDownloadSeqno(sequence []PreparedBlock, targetSeqno uint32
 	return lastSeqno + 1, true
 }
 
-func archiveMasterBlockSequence(start *storage.BlockState, targetSeqno uint32, startSeqno uint32, masterBlocks map[uint32]PreparedBlock) ([]PreparedBlock, error) {
+// archiveMasterOverlapStart reports the chain position the next master window
+// continues from when its prepare+precheck may start before this window's
+// masters are applied. That requires the whole sequence prechecked: a fully
+// prechecked window contains no key block (sequences break before them), so
+// the epoch config of this window's start state still covers the next window.
+// Key-block-started windows skip precheck and change the config mid-apply, so
+// their successor keeps the current wait-for-applied-state behavior.
+func archiveMasterOverlapStart(result archiveMasterImportResult) (ton.BlockIDExt, bool) {
+	if len(result.masterSequence) == 0 || len(result.consensusProofs) != len(result.masterSequence) {
+		return ton.BlockIDExt{}, false
+	}
+	return result.masterSequence[len(result.masterSequence)-1].ID, true
+}
+
+func archiveMasterBlockSequence(startBlock ton.BlockIDExt, targetSeqno uint32, startSeqno uint32, masterBlocks map[uint32]PreparedBlock) ([]PreparedBlock, error) {
 	sequence := make([]PreparedBlock, 0, len(masterBlocks))
-	for seqno := start.Block.SeqNo + 1; seqno != 0 && seqno <= targetSeqno; seqno++ {
+	for seqno := startBlock.SeqNo + 1; seqno != 0 && seqno <= targetSeqno; seqno++ {
 		downloaded, ok := masterBlocks[seqno]
 		if !ok {
-			if seqno == start.Block.SeqNo+1 {
-				return nil, fmt.Errorf("archive window #%d has no next masterchain block after %s", startSeqno, storage.FormatBlockRef(start.Block))
+			if seqno == startBlock.SeqNo+1 {
+				return nil, fmt.Errorf("archive window #%d has no next masterchain block after %s", startSeqno, storage.FormatBlockRef(startBlock))
 			}
 			break
 		}
@@ -581,7 +602,7 @@ func archiveMasterBlockSequence(start *storage.BlockState, targetSeqno uint32, s
 	return sequence, nil
 }
 
-func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Context, start *storage.BlockState, blocks []PreparedBlock) (map[uint32]*masterchainConsensusProof, time.Duration, error) {
+func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Context, startBlock ton.BlockIDExt, configState *storage.BlockState, blocks []PreparedBlock) (map[uint32]*masterchainConsensusProof, time.Duration, error) {
 	if len(blocks) == 0 {
 		return nil, 0, nil
 	}
@@ -593,7 +614,7 @@ func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Contex
 	proofs := make([]*masterchainConsensusProof, len(blocks))
 	validators := make([]*blockproof.PreparedValidatorSet, len(blocks))
 	validatorsByKey := map[masterchainValidatorCacheKey]*blockproof.PreparedValidatorSet{}
-	expectedPrev := start.Block
+	expectedPrev := startBlock
 
 	for i, downloaded := range blocks {
 		proof, err := prepareMasterchainConsensusProofBOC(downloaded.ID, downloaded.ProofBOC)
@@ -614,7 +635,7 @@ func (r *archiveCatchUpRunner) precheckArchiveMasterConsensus(ctx context.Contex
 		validatorSet, ok := validatorsByKey[key]
 		if !ok {
 			var err error
-			validatorSet, err = r.service.masterchainValidatorsForConsensus(start, downloaded.ID, key)
+			validatorSet, err = r.service.masterchainValidatorsForConsensus(configState, downloaded.ID, key)
 			if err != nil {
 				return nil, time.Since(started), err
 			}
@@ -752,7 +773,9 @@ func (r *archiveCatchUpRunner) loadArchiveImport(ctx context.Context, queue *arc
 func (r *archiveCatchUpRunner) prepareDownloadedArchive(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, downloaded *archive.Downloaded) (*archiveImportResult, error) {
 	peer := downloaded.Peer
 	archiveID := downloaded.ArchiveID
-	imported, err := r.prepareArchiveDownload(ctx, masterchainSeqno, shard, splitDepth, downloaded)
+	// Only the master lane prepares outside the import queue (prefetched or
+	// queue-less downloads), so these always rate as hot.
+	imported, err := r.prepareArchiveDownload(archive.WithHotImportPrepare(ctx), masterchainSeqno, shard, splitDepth, downloaded)
 	downloaded.Data = nil
 	if err != nil && peer != "" {
 		return nil, &archiveImportPeerError{
@@ -852,7 +875,7 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		if masterTask != nil {
 			masterTask.cancel()
 		}
-		masterTask = r.startArchiveMasterImport(ctx, queue, startMaster, targetSeqno, nil)
+		masterTask = r.startArchiveMasterImport(ctx, queue, startMaster.Block, startMaster, targetSeqno, nil)
 	}
 
 	masterResult, masterWait, err := masterTask.wait(ctx)
@@ -886,13 +909,24 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 			break
 		}
 	}
+	var nextMasterTask *archiveMasterImportTask
 	var nextMasterDownload *archiveMasterDownloadTask
 	if nextSeqno, ok := nextArchiveMasterDownloadSeqno(masterResult.masterSequence, targetSeqno); ok && !reachesSyncUntil {
-		nextMasterDownload = r.startArchiveMasterDownload(ctx, nextSeqno)
+		if overlapStart, ok := archiveMasterOverlapStart(masterResult); ok {
+			// Prepare and precheck of the next window are state-independent, so
+			// the whole import task overlaps with this window's master apply
+			// instead of prefetching only the raw download.
+			nextMasterTask = r.startArchiveMasterImport(ctx, queue, overlapStart, startMaster, targetSeqno, nil)
+		} else {
+			nextMasterDownload = r.startArchiveMasterDownload(ctx, nextSeqno)
+		}
 	}
 	defer func() {
 		if nextMasterDownload != nil {
 			nextMasterDownload.discard()
+		}
+		if nextMasterTask != nil {
+			nextMasterTask.cancel()
 		}
 	}()
 
@@ -924,21 +958,27 @@ func (r *archiveCatchUpRunner) prepareArchiveMasterWindow(ctx context.Context, q
 		}, nil
 	}
 
-	var nextMasterTask *archiveMasterImportTask
+	prepared := archivePreparedMasterWindow{
+		window:       window,
+		startMaster:  startMaster,
+		lastMaster:   lastMaster,
+		masterImport: masterImport,
+	}
 	if !window.syncUntilReached && lastMaster.Block.SeqNo < targetSeqno {
-		var prefetched *archiveMasterDownloadTask
-		if nextMasterDownload != nil && nextMasterDownload.startSeqno == lastMaster.Block.SeqNo+1 {
-			prefetched = nextMasterDownload
-			nextMasterDownload = nil
+		if nextMasterTask == nil || nextMasterTask.startSeqno != lastMaster.Block.SeqNo+1 {
+			if nextMasterTask != nil {
+				nextMasterTask.cancel()
+			}
+			var prefetched *archiveMasterDownloadTask
+			if nextMasterDownload != nil && nextMasterDownload.startSeqno == lastMaster.Block.SeqNo+1 {
+				prefetched = nextMasterDownload
+				nextMasterDownload = nil
+			}
+			nextMasterTask = r.startArchiveMasterImport(ctx, queue, lastMaster.Block, lastMaster, targetSeqno, prefetched)
 		}
-		nextMasterTask = r.startArchiveMasterImport(ctx, queue, lastMaster, targetSeqno, prefetched)
+		prepared.nextMasterTask = nextMasterTask
+		nextMasterTask = nil
 	}
 
-	return archivePreparedMasterWindow{
-		window:         window,
-		startMaster:    startMaster,
-		lastMaster:     lastMaster,
-		masterImport:   masterImport,
-		nextMasterTask: nextMasterTask,
-	}, nil
+	return prepared, nil
 }

@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -17,12 +16,28 @@ import (
 )
 
 const (
-	topShard              = int64(-1 << 63)
-	maxPeersPerOverlay    = 20
-	maxQueryNeighbours    = 16
-	maxOverlayPayloadSize = 16 << 20
-	peerPoolIdleTTL       = 130 * time.Second
-	peerPoolMaxIdle       = 2048
+	topShard = int64(-1 << 63)
+	// maxPeersPerOverlay matches the C++ reference OverlayOptions::max_peers_
+	// (300 since the plumtree rework; the historical 20 starved broadcast
+	// reception — with so few roster edges, losing a couple of active senders
+	// dropped the node out of everyone's fanout sets).
+	maxPeersPerOverlay = 300
+	// maxLivePeersPerOverlay bounds the peers holding a transport on a public
+	// overlay. Floor: maxQueryNeighbours (16) + plumtreeActiveNeighbourLimit
+	// (20) + the largest transient download/proof set (24) = 60 if fully
+	// disjoint; the rest is rotation headroom. C++ runs a live working set of
+	// ~30-46 per overlay while knowing maxPeersPerOverlay of them.
+	maxLivePeersPerOverlay = 64
+	maxQueryNeighbours     = 16
+	maxOverlayPayloadSize  = 16 << 20
+	peerPoolIdleTTL        = 130 * time.Second
+	// peerPoolMaxIdle is the backstop for unreferenced transports that all
+	// still look recently used; the TTL does the ordinary work. It mirrors
+	// maxOutboundQUICPaths and leaves room above the live working set
+	// (maxLivePeersPerOverlay per subscribed overlay) for rotation and for the
+	// transient download and proof sets. The former 2048 was never reached, so
+	// nothing was ever swept.
+	peerPoolMaxIdle = 256
 	// C++ private overlays set the RLDP2 peer MTU to max broadcast size + 1024.
 	maxRLDPTwoStepTransferSize = maxOverlayPayloadSize + 1024
 	dhtRefreshInterval         = 90 * time.Second
@@ -176,30 +191,30 @@ func (e BroadcastEvent) BlockRef() string {
 }
 
 type Options struct {
-	Logger                           *zerolog.Logger
-	GlobalConfig                     *liteclient.GlobalConfig
-	PrivateKey                       ed25519.PrivateKey
-	ListenAddr                       string
-	ExternalIP                       net.IP
-	ExternalPort                     uint16
-	DHTPrivateKey                    ed25519.PrivateKey
-	DHTListenAddr                    string
-	StateFilesDir                    string
-	Storage                          storage.Storage
-	PeerServingStorage               storage.PeerServingStorage
-	LiveBlockCache                   *storage.LiveBlockCache
-	CompressedState                  CompressedBlockStateProvider
-	SyncLag                          SyncLagProvider
-	SignatureVerifier                BroadcastSignatureVerifier
-	BroadcastAdmission               BroadcastAdmission
-	ExternalMessageAdmission         ExternalMessageAdmission
-	BlockReceivedObserver            BlockReceivedObserver
-	ExternalBroadcastCapacity        ExternalBroadcastCapacityOptions
-	AllowDuplicateExternals          bool
-	LocalExternalFanout              int
-	CustomOverlays                   []CustomOverlayConfig
-	FastSyncCertificates             []overlay.MemberCertificate
-	FastSyncBroadcastSpeedMultiplier float64
+	Logger                     *zerolog.Logger
+	GlobalConfig               *liteclient.GlobalConfig
+	PrivateKey                 ed25519.PrivateKey
+	ListenAddr                 string
+	ExternalIP                 net.IP
+	ExternalPort               uint16
+	DHTPrivateKey              ed25519.PrivateKey
+	DHTListenAddr              string
+	StateFilesDir              string
+	Storage                    storage.Storage
+	PeerServingStorage         storage.PeerServingStorage
+	LiveBlockCache             *storage.LiveBlockCache
+	CompressedState            CompressedBlockStateProvider
+	SyncLag                    SyncLagProvider
+	SignatureVerifier          BroadcastSignatureVerifier
+	BroadcastAdmission         BroadcastAdmission
+	ExternalMessageAdmission   ExternalMessageAdmission
+	BlockReceivedObserver      BlockReceivedObserver
+	ExternalBroadcastCapacity  ExternalBroadcastCapacityOptions
+	AllowDuplicateExternals    bool
+	LocalExternalFanout        int
+	CustomOverlays             []CustomOverlayConfig
+	PeerCache                  storage.OverlayPeerCache
+	FastSyncCertificateStorage storage.FastSyncCertificateStorage
 }
 
 type ExternalBroadcastCapacityOptions struct {
@@ -281,6 +296,11 @@ type ExternalMessageAdmission interface {
 type BlockReceivedEvent struct {
 	// IsSigned is true for signed block broadcasts and downloaded full blocks.
 	IsSigned bool
+	// FromBroadcast is true when the block arrived as a decoded broadcast
+	// rather than through a download path. Broadcast events are delivered even
+	// when extension hooks are disabled, so the observer can pre-prepare shard
+	// blocks at broadcast-arrival time.
+	FromBroadcast bool
 	// Downloaded contains the received block artifacts.
 	Downloaded *DownloadedBlock
 }
@@ -350,7 +370,6 @@ type overlaySpec struct {
 	SendQueries       bool
 	AcceptQueries     bool
 	Announce          bool
-	DHTDiscovery      bool
 	RandomPeers       bool
 	QueryCapabilities bool
 	FastSync          *fastSyncOverlaySpec

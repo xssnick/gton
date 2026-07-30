@@ -14,16 +14,22 @@ import (
 )
 
 const (
-	rebroadcastFECSymbolSize            = ordinarySimpleBroadcastMaxSize
-	rebroadcastQueueMaxAge              = 7 * time.Second
-	rebroadcastFECLagThreshold          = int64(5)
-	rebroadcastFECWaitPoll              = 10 * time.Millisecond
-	blockFECBackpressureSlots           = 2
-	externalFECBackpressureSlots        = 4
-	masterPeerRebroadcastWorkers        = 1
-	basePeerRebroadcastWorkers          = 2
-	rebroadcastFanout                   = 5
-	quietRebroadcastFanout              = 2
+	rebroadcastFECSymbolSize     = ordinarySimpleBroadcastMaxSize
+	rebroadcastQueueMaxAge       = 7 * time.Second
+	rebroadcastFECLagThreshold   = int64(5)
+	rebroadcastFECWaitPoll       = 10 * time.Millisecond
+	blockFECBackpressureSlots    = 2
+	externalFECBackpressureSlots = 4
+	masterPeerRebroadcastWorkers = 1
+	basePeerRebroadcastWorkers   = 2
+	rebroadcastFanout            = 5
+	quietRebroadcastFanout       = 2
+	// fastSyncBroadcastSpeedMultiplier divides the base delay between FastSync
+	// FEC parts. Kept internal so config does not expose a traffic knob.
+	// Matches the shipped validator-engine default (3.33), not the 1.0 struct
+	// default in full-node.h that no deployment runs with: 10ms per four
+	// symbols divided by the multiplier, i.e. ~3ms.
+	fastSyncBroadcastSpeedMultiplier    = 3.33
 	minFastSyncBroadcastSpeedMultiplier = 1e-9
 )
 
@@ -137,16 +143,6 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 		}
 		return rebroadcastPlan{mode: rebroadcastModeFEC}
 	}
-}
-
-func (s *overlaySubscription) rebroadcastPlan(kind string, payloadLen int) rebroadcastPlan {
-	if s.spec.Kind == overlayKindCustomFixed {
-		return planCustomRebroadcast(kind, payloadLen)
-	}
-	if s.spec.Kind == overlayKindFastSync {
-		return planFastSyncRebroadcast(kind, payloadLen)
-	}
-	return planRebroadcast(kind, payloadLen)
 }
 
 func planFastSyncRebroadcast(kind string, payloadLen int) rebroadcastPlan {
@@ -470,10 +466,10 @@ func (s *overlaySubscription) usesTwoStepRebroadcast(
 	if plan.mode != rebroadcastModeFEC {
 		return false
 	}
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.alwaysTwoStepFEC() {
 		return true
 	}
-	return s.spec.Kind == overlayKindFastSync &&
+	return s.spec.twoStepFECUnlessPlanOptsOut() &&
 		plan.flags&overlay.BroadcastFlagNoTwoStep == 0
 }
 
@@ -491,11 +487,11 @@ func (s *overlaySubscription) rebroadcastDelivery(
 }
 
 func (s *overlaySubscription) customRebroadcastUnsupported(kind string) bool {
-	return s.spec.Kind == overlayKindCustomFixed && kind == "tonNode.ihrMessageBroadcast"
+	return s.spec.dropsIHRBroadcasts() && kind == "tonNode.ihrMessageBroadcast"
 }
 
 func (s *overlaySubscription) customBlockRebroadcastBlocked(kind string) bool {
-	if s.spec.Kind != overlayKindCustomFixed {
+	if !s.spec.authorizesBroadcastSenders() {
 		return false
 	}
 	if _, ok := blockOverlayFanoutClass(kind); !ok {
@@ -548,7 +544,7 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
-		if s.spec.Kind == overlayKindCustomFixed {
+		if s.spec.floodsWholeRoster() {
 			if s.node.rebroadcastLagged() {
 				return laggedExternalFanout
 			}
@@ -566,7 +562,7 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 		}
 		return externalRebroadcastFanout
 	}
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.floodsWholeRoster() {
 		return s.peerLimit()
 	}
 	if s.node.rebroadcastQuiet.Load() {
@@ -739,7 +735,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 	}
 
 	pace := time.Duration(0)
-	if s.spec.Kind == overlayKindFastSync {
+	if s.spec.pacesFECBursts() {
 		pace = s.node.fastSyncBroadcastFECPace
 	}
 	err := sendFastFECToPeer(

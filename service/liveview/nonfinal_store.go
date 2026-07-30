@@ -194,6 +194,16 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	}
 
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
+	if err == nil {
+		// Kept inline (and its error kept fatal): this state was reconstructed
+		// from a merkle update, and the view build is the last structural check
+		// before it becomes queryable and becomes the base of later non-final
+		// blocks. It also does not run on the block apply path, so the prewarm
+		// stays here too rather than being deferred like the finalized path.
+		if err = prepared.buildFragments(); err == nil && prepared.fragments != nil {
+			err = prewarmFragments(prepared.fragments)
+		}
+	}
 	if err != nil {
 		if keepWaiting {
 			s.deleteNonfinalWaiting(block)

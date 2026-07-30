@@ -12,6 +12,10 @@ const (
 	broadcastPipelineStageHotCacheNotify    = "hot_cache_notify"
 	broadcastPipelineStageExactPop          = "exact_pop"
 	broadcastPipelineStageDecodeAsync       = "decode_async"
+	// decode_inline is the fallback taken when the decode pool refuses the
+	// payload: the decode then runs on the transport receive goroutine, so this
+	// stage is the signal that the pool is undersized.
+	broadcastPipelineStageDecodeInline = "decode_inline"
 
 	broadcastPipelineResultSuccess = "success"
 	broadcastPipelineResultDrop    = "drop"

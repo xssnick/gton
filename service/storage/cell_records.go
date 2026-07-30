@@ -150,6 +150,24 @@ func (r StateCellRecords) Has(hash cell.Hash) bool {
 	return len(r.Data(hash)) > 0
 }
 
+// Indexed reports whether lookups resolve through the builder's prebuilt hash
+// index rather than a linear scan, so overlays can reuse this set as an O(1)
+// lookup layer without rebuilding an index of their own.
+func (r StateCellRecords) Indexed() bool {
+	return r.index != nil
+}
+
+// IndexOf returns the position of a hash in Records through that same index.
+// It reports false for sets built without one, which have no stable positions
+// to hand out.
+func (r StateCellRecords) IndexOf(hash cell.Hash) (int, bool) {
+	if r.index == nil {
+		return 0, false
+	}
+	idx, ok := r.index[hash]
+	return idx, ok
+}
+
 func (r StateCellRecords) AppendTo(records []EncodedCellRecord) []EncodedCellRecord {
 	records = append(records, r.Records...)
 	for _, chunk := range r.chunks {

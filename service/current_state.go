@@ -500,16 +500,35 @@ func (s *Service) evictFarthestQueuedMasterchainBlockLocked() bool {
 }
 
 func (s *Service) queuedMasterchainBlockTooFarFromCurrent(prevSeqno uint32) bool {
+	currentSeqno, ok := s.currentStatusMasterchainSeqno()
+	if !ok {
+		return false
+	}
+	if prevSeqno <= currentSeqno {
+		return false
+	}
+	return prevSeqno-currentSeqno >= nextMasterchainQueueLimit
+}
+
+// currentStatusMasterchainSeqno reads the published masterchain head seqno
+// without cloning the whole current state: this runs per queued masterchain
+// broadcast while nextMasterchainMx is held, and the clone it replaces
+// allocated a map plus one BlockState per shard on every call. currentStatus is
+// only ever replaced wholesale by publishLiveCurrentStateChanged, so reading
+// its fields under the read lock is safe.
+func (s *Service) currentStatusMasterchainSeqno() (uint32, bool) {
 	s.currentStatusMu.RLock()
-	current := storage.CloneCurrentState(s.currentStatus)
-	s.currentStatusMu.RUnlock()
-	if current == nil || current.Masterchain.Block.Workchain != -1 || current.Masterchain.Block.Shard != topShard {
-		return false
+	defer s.currentStatusMu.RUnlock()
+
+	current := s.currentStatus
+	if current == nil {
+		return 0, false
 	}
-	if prevSeqno <= current.Masterchain.Block.SeqNo {
-		return false
+	block := current.Masterchain.Block
+	if block.Workchain != -1 || block.Shard != topShard {
+		return 0, false
 	}
-	return prevSeqno-current.Masterchain.Block.SeqNo >= nextMasterchainQueueLimit
+	return block.SeqNo, true
 }
 
 func (s *Service) takeQueuedMasterchainBlock(prev, target ton.BlockIDExt) (PreparedBlock, error) {
@@ -598,8 +617,13 @@ func (s *Service) promoteQueuedMasterchainBroadcastCandidate(ctx context.Context
 	}
 	block.consensusChecked = checked
 
-	prepared, err := prepareVerifiedBlockForApply(block)
+	prepared, err := s.prepareVerifiedMasterchainBlockShared(ctx, block)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The shared preparation can hand back this caller's own context
+			// error; that says nothing about the candidate, so keep it queued.
+			return cachedMasterchainBlockForApply{}, err
+		}
 		s.dropQueuedMasterchainCandidate(prev)
 		event := s.log.Debug().
 			Err(err).
@@ -719,7 +743,13 @@ func masterchainSeqnoTarget(seqno uint32) ton.BlockIDExt {
 
 func (s *Service) currentStateForNextMasterState(ctx context.Context, current *storage.CurrentState, masterState *storage.BlockState, targets []ton.BlockIDExt, resolver *shardStateResolver) (nextState *storage.CurrentState, stats nextShardClientApplyStats, err error) {
 	started := time.Now()
-	obtainRecorder := newShardObtainRecorder()
+	// The caller may hand in a recorder that already collected downloads for
+	// this master block (shard apply-ahead); reuse it so the reported obtain
+	// stats stay complete no matter which stage did the work.
+	obtainRecorder := shardObtainRecorderFromContext(ctx)
+	if obtainRecorder == nil {
+		obtainRecorder = newShardObtainRecorder()
+	}
 	defer func() {
 		stats.wall = time.Since(started)
 		stats.obtain = obtainRecorder.duration()
@@ -775,6 +805,9 @@ func (s *Service) currentStateForNextMasterState(ctx context.Context, current *s
 	results := make(chan shardResult, len(jobsList))
 	applyCtx, cancelApply := context.WithCancel(ctx)
 	applyCtx = contextWithShardObtainRecorder(applyCtx, obtainRecorder)
+	// Every shard block resolved for this master is stamped with it as the
+	// including master, so the resolution carries the state explicitly.
+	applyCtx = contextWithShardApplyMaster(applyCtx, masterState)
 	defer cancelApply()
 
 	var wg sync.WaitGroup
@@ -864,7 +897,7 @@ func (s *Service) loadOrDownloadBlockForApply(ctx context.Context, block ton.Blo
 	if err != nil {
 		return PreparedBlock{}, err
 	}
-	downloaded, err = prepareDownloadedBlockForApply(raw)
+	downloaded, err = s.prepareDownloadedBlockForApply(raw)
 	if err != nil {
 		return PreparedBlock{}, err
 	}

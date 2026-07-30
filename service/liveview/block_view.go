@@ -140,12 +140,6 @@ func NewBlockView(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Ce
 	} else if err != nil {
 		return nil, fmt.Errorf("load accounts dict root: %w", err)
 	}
-	if accountsRoot != nil && block.Workchain != masterchainID {
-		accountsRoot, err = accountsRoot.PrewarmRecursive(liveAccountsRootPrewarmDepth)
-		if err != nil {
-			return nil, fmt.Errorf("prewarm accounts dict root: %w", err)
-		}
-	}
 
 	header, err := runMethodShardStateHeader(stateRoot)
 	if err != nil {
@@ -169,6 +163,24 @@ func (f *BlockView) releaseCurrentCaches() {
 	f.shardHashesProofs = nil
 	f.externalMsgAccounts = nil
 	f.mu.Unlock()
+}
+
+// prewarmAccounts materializes the top of the accounts dictionary. It is split
+// out of NewBlockView because it walks lazy state cells (up to ~63 celldb
+// loads), which is exactly the part the finalized publish path defers off the
+// block apply goroutine. It must run before the view is published: readers
+// take accountsRoot without a lock, so swapping it on a shared view would race.
+func (f *BlockView) prewarmAccounts() error {
+	if f.accountsRoot == nil || f.block.Workchain == masterchainID {
+		return nil
+	}
+
+	warmed, err := f.accountsRoot.PrewarmRecursive(liveAccountsRootPrewarmDepth)
+	if err != nil {
+		return fmt.Errorf("prewarm accounts dict root: %w", err)
+	}
+	f.accountsRoot = warmed
+	return nil
 }
 
 func (f *BlockView) prewarmHotPath() {

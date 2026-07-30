@@ -188,7 +188,7 @@ func (n *Node) customExternalMessageTargets(addrKey extmsg.AddressKey, data []by
 	targets := make([]externalMessageTarget, 0)
 	skipPublic := false
 	for _, sub := range n.subscriptionsSnapshot() {
-		if sub == nil || sub.spec.Kind != overlayKindCustomFixed || !sub.isActive() {
+		if sub == nil || !sub.spec.originatesLocalBroadcasts() || !sub.isActive() {
 			continue
 		}
 		if _, ok := sub.spec.MsgSenders[n.localID]; !ok {

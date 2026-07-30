@@ -128,26 +128,40 @@ type advertisedPeerCandidate struct {
 
 var errOverlayInactive = errors.New("overlay is inactive")
 
-func (s *overlaySubscription) answerADNLQuery(peer *overlayPeer, msg *adnl.MessageQuery) error {
+// inboundQuery is one served query, independent of whether the sender is
+// attached to this overlay. A detached sender carries no wrappers, so the
+// liveness row and the answer transport are supplied separately.
+type inboundQuery struct {
+	addr   string
+	row    *overlayPeer              // liveness row; nil when unknown
+	forget func(ctx context.Context) // told the overlay is inactive
+	answer func(ctx context.Context, resp tl.Serializable) error
+}
+
+// serveInboundQuery is the shared body of every inbound query path: admission,
+// liveness, dispatch and the answer. Keeping detached senders on exactly this
+// path is what makes it safe to stop attaching every peer — an unattached peer
+// must still be served, or it marks us unreliable and drops us.
+func (s *overlaySubscription) serveInboundQuery(query inboundQuery, data any) error {
 	if !s.node.beginInbound() {
 		return nil
 	}
 	defer s.node.finishInbound()
 
-	if peer.noteReceive() {
-		s.peerPromoted(peer)
+	if query.row != nil && query.row.noteReceive() {
+		s.peerPromoted(query.row)
 	}
 
-	if err := s.admitInboundQuery(msg.Data, time.Now()); err != nil {
+	if err := s.admitInboundQuery(data, time.Now()); err != nil {
 		return err
 	}
 
 	ctx, cancel := context.WithTimeout(s.node.runCtx, peerQueryTimeout)
 	defer cancel()
 
-	resp, err := s.handlePeerQuery(ctx, peer.addr, msg.Data)
-	if errors.Is(err, errOverlayInactive) {
-		s.sendForgetPeer(ctx, peer)
+	resp, err := s.handlePeerQuery(ctx, query.addr, data)
+	if errors.Is(err, errOverlayInactive) && query.forget != nil {
+		query.forget(ctx)
 	}
 	if errors.Is(err, context.Canceled) {
 		return nil
@@ -155,60 +169,93 @@ func (s *overlaySubscription) answerADNLQuery(peer *overlayPeer, msg *adnl.Messa
 	if err != nil {
 		return err
 	}
-	if err = peer.overlay.Answer(ctx, msg.ID, resp); errors.Is(err, context.Canceled) {
+	if err = query.answer(ctx, resp); errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
+}
+
+// serveDetachedADNLQuery answers a query from a peer that holds no attachment to
+// this overlay. Without it, a peer we are not attached to is silently ignored:
+// tonutils drops the query with "got query for unregistered overlay", the peer
+// never gets its blocks, proofs or Pong, marks us unreliable and evicts us.
+func (s *overlaySubscription) serveDetachedADNLQuery(pooled *pooledPeer, msg *adnl.MessageQuery, unwrapped tl.Serializable) error {
+	s.noteDirectoryActivity(pooled.id, pooled.pub, pooled.addr)
+	return s.serveInboundQuery(inboundQuery{
+		addr:   pooled.addr,
+		row:    s.rosterRow(pooled.id),
+		forget: func(ctx context.Context) { s.sendDetachedForgetPeer(ctx, pooled) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return pooled.adnl.Answer(ctx, msg.ID, resp)
+		},
+	}, unwrapped)
+}
+
+func (s *overlaySubscription) serveDetachedRLDPQuery(pooled *pooledPeer, transferID []byte, query *rldp.Query, unwrapped tl.Serializable) error {
+	s.noteDirectoryActivity(pooled.id, pooled.pub, pooled.addr)
+	return s.serveInboundQuery(inboundQuery{
+		addr:   pooled.addr,
+		row:    s.rosterRow(pooled.id),
+		forget: func(ctx context.Context) { s.sendDetachedForgetPeer(ctx, pooled) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return pooled.rldp.SendAnswer(
+				ctx,
+				query.MaxAnswerSize,
+				query.Timeout,
+				query.ID,
+				transferID,
+				resp,
+			)
+		},
+	}, unwrapped)
+}
+
+// sendDetachedForgetPeer tells an unattached peer to drop us, over its pooled
+// transport: the attached path goes through the overlay broadcast peer, which a
+// detached sender does not have.
+func (s *overlaySubscription) sendDetachedForgetPeer(ctx context.Context, pooled *pooledPeer) {
+	_ = pooled.adnl.SendCustomMessage(ctx, overlay.WrapMessage(s.spec.ShortID, ForgetPeer{}))
+}
+
+func (s *overlaySubscription) rosterRow(id PeerID) *overlayPeer {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	return s.peers[id]
+}
+
+func (s *overlaySubscription) answerADNLQuery(peer *overlayPeer, msg *adnl.MessageQuery) error {
+	return s.serveInboundQuery(inboundQuery{
+		addr:   peer.addr,
+		row:    peer,
+		forget: func(ctx context.Context) { s.sendForgetPeer(ctx, peer) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return peer.overlay.Answer(ctx, msg.ID, resp)
+		},
+	}, msg.Data)
 }
 
 func (s *overlaySubscription) answerRLDPQuery(peer *overlayPeer, transferID []byte, query *rldp.Query) error {
-	if !s.node.beginInbound() {
-		return nil
-	}
-	defer s.node.finishInbound()
-
-	if peer.noteReceive() {
-		s.peerPromoted(peer)
-	}
-
-	if err := s.admitInboundQuery(query.Data, time.Now()); err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(s.node.runCtx, peerQueryTimeout)
-	defer cancel()
-
-	resp, err := s.handlePeerQuery(ctx, peer.addr, query.Data)
-	if errors.Is(err, errOverlayInactive) {
-		s.sendForgetPeer(ctx, peer)
-	}
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	err = peer.rldpOverlay.SendAnswer(
-		ctx,
-		query.MaxAnswerSize,
-		query.Timeout,
-		query.ID,
-		transferID,
-		resp,
-	)
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
+	return s.serveInboundQuery(inboundQuery{
+		addr:   peer.addr,
+		row:    peer,
+		forget: func(ctx context.Context) { s.sendForgetPeer(ctx, peer) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return peer.rldpOverlay.SendAnswer(
+				ctx,
+				query.MaxAnswerSize,
+				query.Timeout,
+				query.ID,
+				transferID,
+				resp,
+			)
+		},
+	}, query.Data)
 }
 
 func (s *overlaySubscription) admitInboundQuery(req tl.Serializable, now time.Time) error {
-	if s.spec.Kind != overlayKindFastSync {
-		return nil
-	}
-
-	if !s.node.fastSyncQueryLimiter.Allow(req, now) {
-		return errFastSyncQueryRateLimited
+	if !s.inboundQueryLimiter().Allow(req, now) {
+		return errInboundQueryRateLimited
 	}
 	return nil
 }
@@ -267,13 +314,13 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, req any) (t
 		return overlay.Pong{}, nil
 	}
 
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.privatePeerRoster() {
 		if _, ok := req.(overlay.GetRandomPeers); ok {
 			return nil, errors.New("overlay is private")
 		}
-		if !s.spec.AcceptQueries {
-			return nil, errors.New("this node does not accept queries")
-		}
+	}
+	if s.spec.enforcesAcceptQueries() && !s.spec.AcceptQueries {
+		return nil, errors.New("this node does not accept queries")
 	}
 
 	switch query := req.(type) {
@@ -741,7 +788,10 @@ func (s *overlaySubscription) learnAdvertisedPeers(ctx context.Context, peers []
 		if ctx.Err() != nil {
 			return
 		}
-		if s.aliveKnownPeerCount() >= maxPeersPerOverlay && !s.hasPeerPublicKey(peer.publicKey) {
+		// Bounded by what we know, not by what we hold transports for: the live
+		// tier is capped far below maxPeersPerOverlay, so counting it here would
+		// disable the gate entirely.
+		if s.knownPeerCount() >= maxPeersPerOverlay && !s.hasPeerPublicKey(peer.publicKey) {
 			continue
 		}
 

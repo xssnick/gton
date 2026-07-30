@@ -481,9 +481,14 @@ func (s *Store) LookupBlockByLTForPrefix(ctx context.Context, key storage.BlockH
 			return ton.BlockIDExt{}, metaErr
 		}
 
-		directSafe := key.Workchain == -1 || storage.ShardPrefixLength(key.Shard) == 0
-		// The strict comparison preserves the split boundary: at StartLT the
-		// parent block may be the exact C++ result.
+		// As in the unix-time lookup, only the masterchain may skip the descent
+		// on the shard alone: a workchain root shard splits, so its history is
+		// no more authoritative than any other.
+		directSafe := key.Workchain == -1
+		// The hit covers lt, so no prefix along the account path can hold an
+		// earlier match: a block with a smaller seqno ends before this one
+		// starts, hence before lt. The strict comparison preserves the split
+		// boundary: at StartLT the parent block may be the exact C++ result.
 		if metaErr == nil && meta.startLT != 0 && meta.startLT < lt {
 			directSafe = true
 		}
@@ -645,12 +650,16 @@ func (s *Store) LookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.
 	}
 	defer func() { _ = iter.Close() }()
 
-	var prefixBuf, seekBuf [32]byte
+	var prefixBuf, seekBuf, boundBuf [32]byte
 	direct, directErr := lookupBlockByUnixTimeInHistoryWithIterator(iter, key, utime, &prefixBuf, &seekBuf)
 	if directErr == nil {
-		directSafe := key.Workchain == -1 || storage.ShardPrefixLength(key.Shard) == 0
+		// Only the masterchain may skip the descent outright: its shard prefix
+		// never splits, so AccountShardPrefix collapses every depth onto this
+		// same history and maxDepth below is zero. A workchain root shard does
+		// split, so it has to be judged like any other history.
+		directSafe := key.Workchain == -1
 		if !directSafe {
-			directSafe, err = unixTimeHistoryStartsBefore(iter, key, utime, &prefixBuf)
+			directSafe, err = unixTimeHitIsSeqnoBracketed(iter, key, direct.seqno, &boundBuf)
 			if err != nil {
 				return ton.BlockIDExt{}, err
 			}
@@ -760,19 +769,37 @@ func lookupBlockByUnixTimeInHistoryWithIterator(iter *pebble.Iterator, key stora
 	return blockHistoryIndexRef{}, errBlockHistoryMissing
 }
 
-func unixTimeHistoryStartsBefore(iter *pebble.Iterator, key storage.BlockHistoryKey, utime uint32, prefixBuf *[32]byte) (bool, error) {
+// unixTimeHitIsSeqnoBracketed reports whether a direct hit can be returned
+// without walking the shard prefixes, and is the port of the only early return
+// ArchiveSlice::get_block_common takes: `ls + 1 == block_id.id.seqno`, where ls
+// is the last entry before the requested point and block_id the first one at or
+// after it. Adjacent seqnos leave no room for a block of another shard between
+// the two, so no prefix along the account path can hold an earlier match - a
+// block with a smaller seqno precedes the predecessor in the chain, and gen time
+// never decreases along it.
+//
+// A timestamp is a point rather than an interval, so unlike the logical-time
+// index there is no coverage test to make instead: the predecessor is what
+// carries the proof. Checking that the history merely *starts* before the
+// requested time does not, which is how a lookup landed on a post-merge parent
+// block while the child shard held the correct, earlier one.
+//
+// The iterator must still rest on the hit; it is left on the preceding entry,
+// which the caller either ignores or re-seeks past.
+func unixTimeHitIsSeqnoBracketed(iter *pebble.Iterator, key storage.BlockHistoryKey, seqno uint32, prefixBuf *[32]byte) (bool, error) {
 	prefix := appendHotKeyBlockUTimePrefix(prefixBuf[:0], key)
-	if !iter.SeekGE(prefix) || !bytes.HasPrefix(iter.Key(), prefix) {
+	if !iter.Prev() || !bytes.HasPrefix(iter.Key(), prefix) {
 		if err := iter.Error(); err != nil {
 			return false, err
 		}
 		return false, nil
 	}
 
-	firstUTime := binary.BigEndian.Uint32(iter.Key()[len(prefix) : len(prefix)+4])
-	// Equal timestamps may cross a split boundary. Only an earlier timestamp
-	// in this history proves that no ancestor can match utime.
-	return firstUTime < utime, nil
+	previous, err := decodeBlockUTimeIndexKey(iter.Key())
+	if err != nil {
+		return false, err
+	}
+	return previous.SeqNo+1 == seqno, nil
 }
 
 func (s *Store) mergeAndStoreBlockMeta(next *storage.BlockMeta) error {

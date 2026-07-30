@@ -1,11 +1,9 @@
 package p2p
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
-	"slices"
 	"sync"
 	"time"
 )
@@ -26,32 +24,9 @@ type plumtreeStatsJitter struct {
 	delay time.Duration
 }
 
-func newPlumtreeStatsJitter(step uint32) (plumtreeStatsJitter, error) {
-	if step > plumtreeStatsMaximumJitterStep {
-		return plumtreeStatsJitter{}, fmt.Errorf("invalid Plumtree stats jitter step %d", step)
-	}
-
-	return plumtreeStatsJitter{
-		delay: time.Duration(step) * plumtreeStatsJitterStepDuration,
-	}, nil
-}
-
 type plumtreeStatsEagerPeers struct {
 	peers [plumtreeRegularEagerLimit]PeerID
 	count uint8
-}
-
-func newPlumtreeStatsEagerPeers(peers []PeerID) (plumtreeStatsEagerPeers, error) {
-	if len(peers) > plumtreeRegularEagerLimit {
-		return plumtreeStatsEagerPeers{}, fmt.Errorf(
-			"too many Plumtree stats eager peers: %d",
-			len(peers),
-		)
-	}
-
-	var result plumtreeStatsEagerPeers
-	result.count = uint8(copy(result.peers[:], peers))
-	return result, nil
 }
 
 func (p *plumtreeStatsEagerPeers) contains(peer PeerID) bool {
@@ -67,26 +42,6 @@ func (p *plumtreeStatsEagerPeers) contains(peer PeerID) bool {
 type plumtreeStatsEagerSnapshot struct {
 	simple   plumtreeStatsEagerPeers
 	rotating plumtreeStatsEagerPeers
-}
-
-func newPlumtreeStatsEagerSnapshot(
-	simple []PeerID,
-	rotating []PeerID,
-) (plumtreeStatsEagerSnapshot, error) {
-	simplePeers, err := newPlumtreeStatsEagerPeers(simple)
-	if err != nil {
-		return plumtreeStatsEagerSnapshot{}, err
-	}
-
-	rotatingPeers, err := newPlumtreeStatsEagerPeers(rotating)
-	if err != nil {
-		return plumtreeStatsEagerSnapshot{}, err
-	}
-
-	return plumtreeStatsEagerSnapshot{
-		simple:   simplePeers,
-		rotating: rotatingPeers,
-	}, nil
 }
 
 type plumtreeStatsForward struct {
@@ -428,25 +383,6 @@ func (s *plumtreeStats) HandlePush(
 	}, nil
 }
 
-func (s *plumtreeStats) Records() []PlumtreeStatsRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if len(s.epoch.store) == 0 {
-		return nil
-	}
-
-	records := make([]PlumtreeStatsRecord, 0, len(s.epoch.store))
-	for _, record := range s.epoch.store {
-		records = append(records, clonePlumtreeStatsRecord(record))
-	}
-	slices.SortFunc(records, func(left, right PlumtreeStatsRecord) int {
-		return bytes.Compare(left.Source, right.Source)
-	})
-
-	return records
-}
-
 func (s *plumtreeStats) syncEpochLocked(now time.Time, jitter plumtreeStatsJitter) {
 	epoch := now.Unix() / int64(plumtreeStatsEpochDuration/time.Second)
 	if s.epoch.initialized && epoch <= s.epoch.epoch {
@@ -527,11 +463,4 @@ func plumtreeStatsForwardRecord(
 	result.ready = result.count != 0
 
 	return result
-}
-
-func clonePlumtreeStatsRecord(record PlumtreeStatsRecord) PlumtreeStatsRecord {
-	record.Source = append([]byte(nil), record.Source...)
-	record.EagerSimple = append([]int64(nil), record.EagerSimple...)
-	record.EagerRotating = append([]int64(nil), record.EagerRotating...)
-	return record
 }

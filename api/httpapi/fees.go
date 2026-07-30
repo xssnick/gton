@@ -117,13 +117,30 @@ func (s *Server) handleEstimateFee(ctx context.Context, params requestParams) (a
 	if err != nil {
 		return nil, internalError("cannot estimate fee: " + err.Error())
 	}
-	tx, err := res.ParseTransaction()
-	if err != nil {
-		return nil, internalError("cannot parse emulated transaction: " + err.Error())
-	}
-	sourceFees, apiErr = estimateFeesFromTransaction(sourceFees, tx)
+
+	result, apiErr := estimateFeeResult(sourceFees, res)
 	if apiErr != nil {
 		return nil, apiErr
+	}
+
+	return result, nil
+}
+
+func estimateFeeResult(sourceFees fees, result *tvm.TransactionExecutionResult) (queryFees, *apiError) {
+	// ton-http-api treats a rejected external message as a successful fee
+	// estimate: import and storage fees are still returned, while gas and
+	// outbound forwarding fees stay zero.
+	if result.Accepted {
+		tx, err := result.ParseTransaction()
+		if err != nil {
+			return queryFees{}, internalError("cannot parse emulated transaction: " + err.Error())
+		}
+
+		var apiErr *apiError
+		sourceFees, apiErr = estimateFeesFromTransaction(sourceFees, tx)
+		if apiErr != nil {
+			return queryFees{}, apiErr
+		}
 	}
 
 	return queryFees{

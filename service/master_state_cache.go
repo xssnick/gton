@@ -10,7 +10,6 @@ import (
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -18,6 +17,11 @@ import (
 const (
 	compressedBlockStateCacheLimit = 1024
 	compressedBlockStateCacheTTL   = 3 * time.Minute
+
+	// monitorSplitDepthCacheLimit bounds the per-master entries between key
+	// blocks; only the masters currently in the apply/commit pipeline are ever
+	// re-queried, so overflow simply recomputes.
+	monitorSplitDepthCacheLimit = 64
 )
 
 type compressedBlockStateEntry struct {
@@ -31,10 +35,16 @@ type compressedBlockStateOrderEntry struct {
 	version uint64
 }
 
+// monitorSplitDepthKey identifies the exact master state the depth was computed
+// from, so a hit needs no state parse at all and an entry can never be aliased
+// by a state from another config epoch: the shard after-apply path queries with
+// inclusion masters that may lag or lead the key-block reset, and any key
+// shared between masters would let a stale-epoch compute overwrite a fresh one.
+// The key-block reset is therefore only a freshness bound, not what keeps the
+// cache correct.
 type monitorSplitDepthKey struct {
-	keyBlockRoot storage.BlockRootHash
-	keyBlockSeq  uint32
-	workchain    int32
+	masterRoot storage.BlockRootHash
+	workchain  int32
 }
 
 func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
@@ -42,8 +52,21 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 		return
 	}
 
-	rememberedCompressedState := s.RememberCompressedBlockState(state)
+	s.rememberAppliedMasterCompressedState(state)
 	s.updateP2PShardOverlays(ctx, state, block, shardTargets)
+}
+
+// rememberAppliedMasterCompressedState publishes a freshly applied masterchain
+// state to the two caches the *next* block depends on: the state-aware
+// decompression cache read by the p2p broadcast decode, and the consensus cache
+// read when the next block's proof is validated. Both gate the next live head,
+// so the apply loop runs this before the slower publish and overlay work.
+func (s *Service) rememberAppliedMasterCompressedState(state *storage.BlockState) {
+	if state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
+		return
+	}
+
+	rememberedCompressedState := s.RememberCompressedBlockState(state)
 
 	key := storage.BlockKey(state.Block)
 	cloned := storage.CloneBlockState(state)
@@ -211,17 +234,17 @@ func (s *Service) resetMonitorSplitDepthCache() {
 }
 
 func (s *Service) cachedMonitorMinSplitDepth(state *storage.BlockState, workchain int32) (uint32, error) {
-	key, err := monitorSplitDepthCacheKey(state, workchain)
-	if err != nil {
-		return 0, err
+	key := monitorSplitDepthKey{
+		masterRoot: storage.BlockKey(state.Block),
+		workchain:  workchain,
 	}
 
 	s.monitorSplitDepthMu.Lock()
-	if depth, ok := s.monitorSplitDepth[key]; ok {
-		s.monitorSplitDepthMu.Unlock()
+	depth, ok := s.monitorSplitDepth[key]
+	s.monitorSplitDepthMu.Unlock()
+	if ok {
 		return depth, nil
 	}
-	s.monitorSplitDepthMu.Unlock()
 
 	depth, err := monitorMinSplitDepth(state, workchain)
 	if err != nil {
@@ -229,103 +252,56 @@ func (s *Service) cachedMonitorMinSplitDepth(state *storage.BlockState, workchai
 	}
 
 	s.monitorSplitDepthMu.Lock()
+	if len(s.monitorSplitDepth) >= monitorSplitDepthCacheLimit {
+		clear(s.monitorSplitDepth)
+	}
 	s.monitorSplitDepth[key] = depth
 	s.monitorSplitDepthMu.Unlock()
 
 	return depth, nil
 }
 
-func monitorSplitDepthCacheKey(state *storage.BlockState, workchain int32) (monitorSplitDepthKey, error) {
-	keyBlock, err := monitorSplitDepthKeyBlock(state)
-	if err != nil {
-		return monitorSplitDepthKey{}, err
-	}
-
-	return monitorSplitDepthKey{
-		keyBlockRoot: storage.BlockKey(keyBlock),
-		keyBlockSeq:  keyBlock.SeqNo,
-		workchain:    workchain,
-	}, nil
-}
-
-func monitorSplitDepthKeyBlock(state *storage.BlockState) (ton.BlockIDExt, error) {
-	if state.Parsed == nil || state.Parsed.McStateExtra == nil {
-		return ton.BlockIDExt{}, fmt.Errorf("masterchain state %s is missing mc_state_extra", storage.FormatBlockRef(state.Block))
-	}
-
-	var extra tlb.McStateExtra
-	loader, err := state.Parsed.McStateExtra.BeginParse()
-	if err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if err = tlb.LoadFromCell(&extra, loader); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if extra.Info == nil {
-		return ton.BlockIDExt{}, fmt.Errorf("masterchain state %s is missing mc_state_extra info", storage.FormatBlockRef(state.Block))
-	}
-
-	info, err := extra.Info.BeginParse()
-	if err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra info for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if _, err = info.LoadUInt(16); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra info flags for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if _, err = info.LoadUInt(32); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra validator list hash for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if _, err = info.LoadUInt(32); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra catchain seqno for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if _, err = info.LoadBoolBit(); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra next cc flag for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-
-	prevBlocks := &tlb.OldMcBlocksInfoAugDict{}
-	if err = prevBlocks.LoadFromCell(info); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra prev blocks for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-
-	afterKeyBlock, err := info.LoadBoolBit()
-	if err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra after key block flag for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	hasLastKeyBlock, err := info.LoadBoolBit()
-	if err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra last key block flag for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	if afterKeyBlock {
-		return state.Block, nil
-	}
-	if !hasLastKeyBlock {
-		return ton.BlockIDExt{}, fmt.Errorf("masterchain state %s has no last key block", storage.FormatBlockRef(state.Block))
-	}
-
-	var ref tlb.ExtBlkRef
-	if err = tlb.LoadFromCell(&ref, info); err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("parse mc_state_extra last key block for %s: %w", storage.FormatBlockRef(state.Block), err)
-	}
-	return ton.BlockIDExt{
-		Workchain: -1,
-		Shard:     topShard,
-		SeqNo:     ref.SeqNo,
-		RootHash:  append([]byte(nil), ref.RootHash...),
-		FileHash:  append([]byte(nil), ref.FileHash...),
-	}, nil
-}
-
 func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
+	if !s.updateP2PMonitorMinSplitDepth(state) {
+		return
+	}
+	s.reconcileP2PShardOverlays(ctx, state, block, shardTargets)
+}
+
+// updateP2PMonitorMinSplitDepth is the cheap half of the overlay update: on
+// non-key masters it is a cache hit, and node.overlayBlockForDownload needs the
+// depth before the next shard download picks an overlay, so it stays on the
+// apply loop even when the reconcile below is deferred.
+func (s *Service) updateP2PMonitorMinSplitDepth(state *storage.BlockState) bool {
 	depth, err := s.cachedMonitorMinSplitDepth(state, 0)
 	if err != nil {
 		s.log.Debug().
 			Err(err).
-			Str("masterchain", storage.FormatBlockRef(state.Block)).
+			Stringer("masterchain", storage.BlockRef(state.Block)).
 			Msg("failed to update p2p monitor split depth")
-		return
+		return false
 	}
 
 	s.node.SetMonitorMinSplitDepth(0, depth)
+	return true
+}
+
+// reconcileP2PShardOverlays is the expensive half: per-shard overlay specs, a
+// roster-sized map per shard in the FastSync spec build, and a full
+// activate/deactivate sweep. It must run after updateP2PMonitorMinSplitDepth
+// (the active set is computed at the monitor depth) and after the key-block
+// validator config was published.
+func (s *Service) reconcileP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
+	// Every reconcile — deferred or synchronous (startup, archive import) —
+	// funnels through here, because each one deactivates every shard overlay
+	// outside its own set: two running at once, or an older one landing after a
+	// newer one, wipes overlays the newer set just activated.
+	s.shardOverlayReconcileMu.Lock()
+	defer s.shardOverlayReconcileMu.Unlock()
+	if state.Block.SeqNo < s.shardOverlayReconciledSeqno {
+		return
+	}
+	s.shardOverlayReconciledSeqno = state.Block.SeqNo
 
 	shards, err := s.masterBlockShardTargets(ctx, state, block, shardTargets)
 	if err != nil {
@@ -379,15 +355,74 @@ func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.Blo
 	}
 }
 
-func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.BlockState, block *PreparedBlock, precomputed []ton.BlockIDExt) ([]ton.BlockIDExt, error) {
-	if block != nil {
-		// The apply pipeline already parsed the block and derived the shard
-		// targets before applying its transition; reuse them instead of a second
-		// full block parse on the hot path. ShardBlocksFromMasterBlock is a pure
-		// function of the block's shard hashes, so the result is identical.
-		if precomputed != nil {
-			return precomputed, nil
+type masterShardOverlayUpdate struct {
+	state   *storage.BlockState
+	targets []ton.BlockIDExt
+}
+
+// scheduleP2PShardOverlayUpdate moves the overlay reconcile off the masterchain
+// apply loop. Updates are latest-wins with a single in-flight worker: the
+// desired overlay set is a pure function of the newest master state, so
+// coalescing intermediate states is correct, while running two reconciles
+// concurrently is not — each one deactivates every shard overlay outside its
+// own set, so a late older update would wipe overlays a newer one just
+// activated.
+func (s *Service) scheduleP2PShardOverlayUpdate(state *storage.BlockState, targets []ton.BlockIDExt) {
+	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard {
+		return
+	}
+
+	s.shardOverlayMu.Lock()
+	if pending := s.shardOverlayPending; pending != nil && pending.state.Block.SeqNo >= state.Block.SeqNo {
+		s.shardOverlayMu.Unlock()
+		return
+	}
+	s.shardOverlayPending = &masterShardOverlayUpdate{state: state, targets: targets}
+	if s.shardOverlayRunning {
+		s.shardOverlayMu.Unlock()
+		return
+	}
+	s.shardOverlayRunning = true
+	s.shardOverlayMu.Unlock()
+
+	s.runAsync(s.runP2PShardOverlayUpdates)
+}
+
+func (s *Service) runP2PShardOverlayUpdates() {
+	ctx := s.shutdownContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for {
+		s.shardOverlayMu.Lock()
+		update := s.shardOverlayPending
+		s.shardOverlayPending = nil
+		if update == nil || ctx.Err() != nil {
+			s.shardOverlayRunning = false
+			s.shardOverlayMu.Unlock()
+			return
 		}
+		s.shardOverlayMu.Unlock()
+
+		if s.reconcileOverlaysHook != nil {
+			s.reconcileOverlaysHook(ctx, *update)
+			continue
+		}
+		s.reconcileP2PShardOverlays(ctx, update.state, nil, update.targets)
+	}
+}
+
+func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.BlockState, block *PreparedBlock, precomputed []ton.BlockIDExt) ([]ton.BlockIDExt, error) {
+	// The apply pipeline already parsed the block and derived the shard targets
+	// before applying its transition; reuse them instead of a second full block
+	// parse on the hot path. ShardBlocksFromMasterBlock is a pure function of the
+	// block's shard hashes, so the result is identical — which is also why the
+	// deferred overlay reconcile can carry the targets without the prepared block.
+	if precomputed != nil {
+		return precomputed, nil
+	}
+	if block != nil {
 		// Archive apply already has the parsed destination state. Its shard
 		// hashes are the committed result of this block, so avoid parsing the
 		// prepared block again just to update overlays.

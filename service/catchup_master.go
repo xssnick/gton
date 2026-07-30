@@ -583,6 +583,11 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 	defer ticker.Stop()
 
 	for {
+		// Taken before the probe: a wake landing between the probe and the
+		// select would otherwise be lost, and here that does not merely delay
+		// the wait — the wake is the only thing that reports "woken" rather
+		// than "the persist finished".
+		wake := s.currentStateWakeChan()
 		if s.currentStatePersistMu.TryLock() {
 			s.currentStatePersistMu.Unlock()
 			return false, s.takeCurrentStatePersistError()
@@ -591,7 +596,7 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 		select {
 		case <-ctx.Done():
 			return false, ctx.Err()
-		case <-s.currentStateWake:
+		case <-wake:
 			if s.currentStatePersistMu.TryLock() {
 				s.currentStatePersistMu.Unlock()
 				if err := s.takeCurrentStatePersistError(); err != nil {
@@ -646,14 +651,21 @@ func (s *Service) holdNextMasterchainProbe(ctx context.Context, prev, target ton
 	timer := time.NewTimer(hold)
 	defer timer.Stop()
 
+	stateWake := s.currentStateWakeChan()
 	_, rawWake := s.node.MasterchainBroadcastAfter(prev.SeqNo)
 	nextBroadcastWake, unwatch := s.node.WatchMasterchainNextBroadcastBlock(prev)
 	defer unwatch()
 	// the decoded next block may already sit in the node broadcast cache
 	// (it can arrive while the previous block is still applying); the
-	// watch above only fires on future stores, so check before parking
+	// watch above only fires on future stores, so check before parking.
+	// Same for the queue: the wake channel above only reports closes after
+	// its capture, so a block queued between the caller's miss and this
+	// point must be picked up by a check, not a wake.
 	if s.node.HasMasterchainNextBroadcastBlock(prev) {
 		return cachedMasterchainBlockForApply{}, storage.ErrNotFound
+	}
+	if cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target); err == nil || !errors.Is(err, storage.ErrNotFound) {
+		return cached, err
 	}
 
 	for {
@@ -664,7 +676,8 @@ func (s *Service) holdNextMasterchainProbe(ctx context.Context, prev, target ton
 			return cachedMasterchainBlockForApply{}, storage.ErrNotFound
 		case <-ctx.Done():
 			return cachedMasterchainBlockForApply{}, ctx.Err()
-		case <-s.currentStateWake:
+		case <-stateWake:
+			stateWake = s.currentStateWakeChan()
 			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
 			if err == nil || !errors.Is(err, storage.ErrNotFound) {
 				return cached, err
@@ -773,7 +786,10 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 			LiveTail:        decision.liveTail,
 		})
 		close(probeReturned)
-		result <- prepareNextBlockProbeResult(prev, downloaded, err)
+		// ctx, not queryCtx: the callers below cancel queryCtx as soon as they
+		// have a winner, and the shared preparation must not be abandoned
+		// half-way for the consumer that is still waiting on it.
+		result <- s.prepareNextBlockProbeResult(ctx, prev, downloaded, err)
 	}()
 
 	prepared, source, prepareElapsed, err := s.waitNextMasterchainApplyCandidate(
@@ -802,6 +818,18 @@ func (s *Service) waitNextMasterchainApplyCandidate(
 	cancel context.CancelFunc,
 ) (PreparedBlock, SyncBlockSource, time.Duration, error) {
 	queryDone := queryCtx.Done()
+	stateWake := s.currentStateWakeChan()
+	// A block queued between the caller's miss and the capture above closed a
+	// channel this wait never selects on; re-check before parking.
+	cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
+	if err == nil {
+		cancel()
+		return cached.block, cached.source, cached.prepareElapsed, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		cancel()
+		return PreparedBlock{}, "", 0, err
+	}
 	for {
 		select {
 		case res := <-result:
@@ -820,7 +848,8 @@ func (s *Service) waitNextMasterchainApplyCandidate(
 				return PreparedBlock{}, res.source, res.prepareElapsed, res.err
 			}
 			return res.block, res.source, res.prepareElapsed, nil
-		case <-s.currentStateWake:
+		case <-stateWake:
+			stateWake = s.currentStateWakeChan()
 			cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
 			if err == nil {
 				cancel()
@@ -869,13 +898,13 @@ type nextBlockProbeResult struct {
 	err            error
 }
 
-func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.DownloadedBlock, err error) nextBlockProbeResult {
+func (s *Service) prepareNextBlockProbeResult(ctx context.Context, prev ton.BlockIDExt, downloaded *p2p.DownloadedBlock, err error) nextBlockProbeResult {
 	if err != nil {
 		return nextBlockProbeResult{err: fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), err)}
 	}
 
 	prepareStarted := time.Now()
-	verified, err := verifyDownloadedBlock(*downloaded)
+	verified, err := s.verifyDownloadedBlock(*downloaded)
 	prepareElapsed := time.Since(prepareStarted)
 	if err != nil {
 		return nextBlockProbeResult{
@@ -885,21 +914,31 @@ func prepareNextBlockProbeResult(prev ton.BlockIDExt, downloaded *p2p.Downloaded
 		}
 	}
 
-	prepared, err := prepareVerifiedMasterchainBlockForNextSync(prev, verified)
-	prepareElapsed = time.Since(prepareStarted)
-	if err != nil {
-		return nextBlockProbeResult{
-			source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, verified.Kind),
-			prepareElapsed: prepareElapsed,
-			err:            fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err),
+	// Same gate order as before: reject a block that does not follow prev
+	// before paying for its state-update cells.
+	if err = checkVerifiedMasterchainBlockFollows(prev, verified); err == nil {
+		var prepared PreparedBlock
+		// Shared with the block-sync worker, which usually prepares the very
+		// same decoded broadcast concurrently.
+		prepared, err = s.prepareVerifiedMasterchainBlockShared(ctx, verified)
+		if err == nil {
+			// The probe goroutine runs in parallel with apply: pay for the
+			// signature batch of a downloaded block here so apply keeps only
+			// the hash checks. Broadcast-origin blocks are already marked.
+			s.preverifyMasterchainConsensusSignatures(prepared.consensus)
+			prepared.PrepareElapsed = time.Since(prepareStarted)
+			return nextBlockProbeResult{
+				block:          prepared,
+				source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, verified.Kind),
+				prepareElapsed: prepared.PrepareElapsed,
+			}
 		}
 	}
 
-	prepared.PrepareElapsed = prepareElapsed
 	return nextBlockProbeResult{
-		block:          prepared,
 		source:         syncBlockSourceForKind(SyncBlockSourcePeerProbe, verified.Kind),
-		prepareElapsed: prepared.PrepareElapsed,
+		prepareElapsed: time.Since(prepareStarted),
+		err:            fmt.Errorf("prepare probed next block after %s: %w", storage.FormatBlockRef(prev), err),
 	}
 }
 
@@ -911,12 +950,16 @@ func downloadedBlockTimeLag(downloaded PreparedBlock, now time.Time) (uint32, in
 }
 
 func (s *Service) downloadNextChainBlock(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
-	return s.downloadChainBlockWithRetry(ctx, fmt.Sprintf("download next block after %s", storage.FormatBlockRef(prev)), func(ctx context.Context) (*p2p.DownloadedBlock, error) {
+	return s.downloadChainBlockWithRetry(ctx, func() string {
+		return "download next block after " + storage.FormatBlockRef(prev)
+	}, func(ctx context.Context) (*p2p.DownloadedBlock, error) {
 		return s.node.DownloadNextBlockFull(ctx, prev)
 	})
 }
 
-func (s *Service) downloadChainBlockWithRetry(ctx context.Context, label string, download func(context.Context) (*p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
+// downloadChainBlockWithRetry takes the label lazily: it is only read when
+// every attempt failed.
+func (s *Service) downloadChainBlockWithRetry(ctx context.Context, label func() string, download func(context.Context) (*p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
 	var lastErr error
 	for attempt := 1; attempt <= chainBlockDownloadRetries; attempt++ {
 		downloaded, err := download(ctx)
@@ -933,5 +976,5 @@ func (s *Service) downloadChainBlockWithRetry(ctx context.Context, label string,
 		}
 	}
 
-	return p2p.DownloadedBlock{}, fmt.Errorf("%s: %w", label, lastErr)
+	return p2p.DownloadedBlock{}, fmt.Errorf("%s: %w", label(), lastErr)
 }

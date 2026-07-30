@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"fmt"
 	"math"
@@ -17,7 +18,17 @@ const (
 	plumtreeSimpleTree     int32 = 0
 	plumtreeFECTreeOffset  int32 = 1
 
+	// Timestamp acceptance window. Must stay at the upstream value
+	// (PLUMTREE_BROADCAST_LIFETIME = 20.0 in overlay/broadcast-plumtree.cpp): it is
+	// the clock-skew tolerance, so shrinking it silently rejects broadcasts every
+	// C++ node accepts. State retention is separate - see the two TTLs below.
 	plumtreeBroadcastLifetime = 20 * time.Second
+	// How long an assembled broadcast keeps its parts to answer repair queries. A
+	// neighbour asks within its own repair delay, and plumtreeRepairTimeout is 5s.
+	plumtreeDeliveredStateTTL = 5 * time.Second
+	// Longer than the delivered case: an unassembled broadcast still has repairs to
+	// attempt, and each may take plumtreeRepairTimeout.
+	plumtreePendingStateTTL = 10 * time.Second
 
 	broadcastNotFoundSchema  = "overlay.broadcastNotFound = overlay.Broadcast"
 	repairPlumtreePartSchema = "overlay.repairPlumtreePart broadcast_id:int256 timestamp:double " +
@@ -186,6 +197,13 @@ type BroadcastPlumtreeFECToSign struct {
 }
 
 func validateBroadcastPlumtreeSimple(message BroadcastPlumtreeSimple, now time.Time) error {
+	// validatePlumtreeControl only relates the two indices, and part 0 relates to
+	// FEC tree 1 as legitimately as to the simple tree. Without this pin a simple
+	// payload could take an FEC slot, where getPartLocked would never find it again
+	// and the IHAVE we forward would be signed against the wrong preimage.
+	if message.TreeIndex != plumtreeSimpleTree {
+		return fmt.Errorf("Plumtree simple payload uses tree %d", message.TreeIndex)
+	}
 	if err := validatePlumtreeControl(
 		message.BroadcastID,
 		message.Timestamp,
@@ -229,6 +247,11 @@ func validateBroadcastPlumtreeIHave(message BroadcastPlumtreeIHave, now time.Tim
 	}
 	if err := validatePlumtreeInt256(message.DataHash, "data hash"); err != nil {
 		return err
+	}
+	// An IHAVE is buffered before its signature is checked, so a signature that can
+	// never verify must be refused at the door rather than stored.
+	if len(message.Signature) != ed25519.SignatureSize {
+		return fmt.Errorf("invalid Plumtree signature length %d", len(message.Signature))
 	}
 
 	maxSize := plumtreeMaxPayloadSize
@@ -376,117 +399,6 @@ func plumtreeInt256IsZero(value []byte) bool {
 	return true
 }
 
-func plumtreeFECBroadcastID(
-	flags int32,
-	fullDataHash []byte,
-	fullDataSize int32,
-	partSize int32,
-) ([sha256.Size]byte, error) {
-	if err := validatePlumtreeInt256(fullDataHash, "full data hash"); err != nil {
-		return [sha256.Size]byte{}, err
-	}
-	if err := validatePlumtreePayloadSize(fullDataSize); err != nil {
-		return [sha256.Size]byte{}, err
-	}
-	if partSize <= 0 || partSize != plumtreeFECPartSize(fullDataSize) {
-		return [sha256.Size]byte{}, fmt.Errorf("invalid Plumtree FEC part size %d", partSize)
-	}
-
-	boxed, err := tl.Serialize(PlumtreeFECID{
-		Flags:        flags,
-		FullDataHash: fullDataHash,
-		FullDataSize: fullDataSize,
-		PartSize:     partSize,
-	}, true)
-	if err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("serialize Plumtree FEC id: %w", err)
-	}
-	return sha256.Sum256(boxed), nil
-}
-
-func plumtreeSimpleToSignBytes(
-	broadcastID []byte,
-	timestamp float64,
-	treeIndex int32,
-	dataSize int32,
-	dataHash []byte,
-) ([]byte, error) {
-	if err := validatePlumtreeInt256(broadcastID, "broadcast id"); err != nil {
-		return nil, err
-	}
-	if plumtreeInt256IsZero(broadcastID) {
-		return nil, fmt.Errorf("empty Plumtree broadcast id")
-	}
-	if err := validatePlumtreeInt256(dataHash, "data hash"); err != nil {
-		return nil, err
-	}
-	if math.IsNaN(timestamp) || math.IsInf(timestamp, 0) {
-		return nil, fmt.Errorf("invalid Plumtree timestamp")
-	}
-	if treeIndex != plumtreeSimpleTree {
-		return nil, fmt.Errorf("invalid Plumtree simple tree %d", treeIndex)
-	}
-	if err := validatePlumtreePayloadSize(dataSize); err != nil {
-		return nil, err
-	}
-
-	boxed, err := tl.Serialize(BroadcastPlumtreeSimpleToSign{
-		ID:        broadcastID,
-		Timestamp: timestamp,
-		TreeIndex: treeIndex,
-		DataSize:  dataSize,
-		DataHash:  dataHash,
-	}, true)
-	if err != nil {
-		return nil, fmt.Errorf("serialize Plumtree simple signature payload: %w", err)
-	}
-	return boxed, nil
-}
-
-func plumtreeFECToSignBytes(
-	broadcastID []byte,
-	timestamp float64,
-	partIndex int32,
-	treeIndex int32,
-	dataSize int32,
-	dataHash []byte,
-) ([]byte, error) {
-	if err := validatePlumtreeInt256(broadcastID, "broadcast id"); err != nil {
-		return nil, err
-	}
-	if plumtreeInt256IsZero(broadcastID) {
-		return nil, fmt.Errorf("empty Plumtree broadcast id")
-	}
-	if err := validatePlumtreeInt256(dataHash, "data hash"); err != nil {
-		return nil, err
-	}
-	if math.IsNaN(timestamp) || math.IsInf(timestamp, 0) {
-		return nil, fmt.Errorf("invalid Plumtree timestamp")
-	}
-	if partIndex < 0 || partIndex >= plumtreeFECTotalParts {
-		return nil, fmt.Errorf("invalid Plumtree FEC part index %d", partIndex)
-	}
-	if treeIndex != partIndex+plumtreeFECTreeOffset {
-		return nil, fmt.Errorf("Plumtree FEC part %d uses tree %d", partIndex, treeIndex)
-	}
-	if dataSize <= 0 || dataSize > plumtreeFECPartSize(plumtreeMaxPayloadSize) {
-		return nil, fmt.Errorf("invalid Plumtree FEC symbol size %d", dataSize)
-	}
-
-	boxed, err := tl.Serialize(BroadcastPlumtreeFECToSign{
-		ID:        broadcastID,
-		Timestamp: timestamp,
-		PartIndex: partIndex,
-		TreeIndex: treeIndex,
-		DataSize:  dataSize,
-		DataHash:  dataHash,
-	}, true)
-	if err != nil {
-		return nil, fmt.Errorf("serialize Plumtree FEC signature payload: %w", err)
-	}
-	return boxed, nil
-}
-
 func parseRepairPlumtreePart(data []byte) (RepairPlumtreePart, error) {
 	var request RepairPlumtreePart
 	rest, err := tl.ParseNoCopy(&request, data, true)
@@ -499,8 +411,19 @@ func parseRepairPlumtreePart(data []byte) (RepairPlumtreePart, error) {
 	return request, nil
 }
 
-// parsePlumtreeMessage parses one boxed Plumtree object into the concrete
-// message the caller selected by constructor id.
+// Takes the decoder's two return values rather than the message itself: that
+// keeps the message off an interface, and so off the heap.
+func plumtreeParsed(rest []byte, err error) error {
+	if err != nil {
+		return fmt.Errorf("parse Plumtree object: %w", err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("unexpected trailing Plumtree object data")
+	}
+	return nil
+}
+
+// The generic path, for the rare messages with no hand-written decoder.
 func parsePlumtreeMessage(message any, data []byte) error {
 	rest, err := tl.ParseNoCopy(message, data, true)
 	if err != nil {

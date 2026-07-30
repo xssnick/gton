@@ -33,6 +33,26 @@ type authenticatedQUICPeer struct {
 	id        PeerID
 	publicKey ed25519.PublicKey
 	addr      string
+	// outbound marks a path this node dialed. Only those are swept: an inbound
+	// path is the remote's resource and closing it would drop a peer that is
+	// actively feeding us.
+	outbound bool
+	// registeredAt bounds the idle age of a path that has not carried anything
+	// yet, so a freshly dialed peer is not swept before it is used.
+	registeredAt time.Time
+}
+
+// lastActive reports when this path last carried an outbound payload. The stamp
+// lives on the transport itself (adnlquic.Peer.LastOutbound), so every send and
+// query updates it and no call site can be forgotten. QUIC keep-alive (5s) is
+// shorter than the idle timeout (15s), so without this a path never expires.
+func (p *authenticatedQUICPeer) lastActive() time.Time {
+	if p.peer != nil {
+		if at := p.peer.LastOutbound(); !at.IsZero() {
+			return at
+		}
+	}
+	return p.registeredAt
 }
 
 type quicMembershipCertificateKind uint8
@@ -166,6 +186,17 @@ func (n *Node) startQUICMonitor(ctx context.Context) {
 	})
 }
 
+// noteOutboundQUICPath marks a path as one we dialed. Recorded at our own dial
+// sites rather than derived in the connection handler, which the gateway calls
+// for both directions.
+func (n *Node) noteOutboundQUICPath(id PeerID) {
+	n.quicPeersMx.Lock()
+	if peer := n.quicPeers[id]; peer != nil {
+		peer.outbound = true
+	}
+	n.quicPeersMx.Unlock()
+}
+
 func (n *Node) handleInboundQUICPeer(peer *adnlquic.Peer) error {
 	if !n.beginInbound() {
 		return context.Canceled
@@ -175,12 +206,15 @@ func (n *Node) handleInboundQUICPeer(peer *adnlquic.Peer) error {
 	var peerID PeerID
 	copy(peerID[:], peer.PeerID())
 	authenticated := &authenticatedQUICPeer{
-		peer:      peer,
-		node:      n,
-		route:     newPeerRoute(""),
-		id:        peerID,
-		publicKey: peer.PeerKey(),
-		addr:      peer.RemoteAddr(),
+		peer: peer,
+		node: n,
+		// Shared with the pooled transport for the same peer: a separate route
+		// would split the learned QUIC address and the single-dial gate.
+		route:        n.peerRoutes.get(peerID),
+		id:           peerID,
+		publicKey:    peer.PeerKey(),
+		addr:         peer.RemoteAddr(),
+		registeredAt: time.Now(),
 	}
 	n.quicPeersMx.Lock()
 	n.quicPeers[peerID] = authenticated
@@ -283,10 +317,7 @@ func (n *Node) handleQUICQuery(
 	resp, err := sub.handlePeerQuery(queryCtx, peer.addr, req)
 	if err != nil {
 		if errors.Is(err, errOverlayInactive) {
-			_ = (authenticatedQUICSender{
-				sub: sub,
-				id:  peer.id,
-			}).SendCustomMessage(queryCtx, ForgetPeer{})
+			sub.sendForgetPeerOverInboundPath(queryCtx, peer)
 		}
 		return nil, err
 	}

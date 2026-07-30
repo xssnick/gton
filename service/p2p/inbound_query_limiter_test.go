@@ -20,36 +20,36 @@ func TestFastSyncQueryCost(t *testing.T) {
 	tests := []struct {
 		name  string
 		query tl.Serializable
-		class fastSyncQueryClass
+		class inboundQueryClass
 		cost  uint64
 	}{
-		{"archive", GetArchiveSlice{MaxSize: 2<<20 + 1}, fastSyncQueryHeavy, 2},
-		{"persistent state", DownloadPersistentStateSliceV2{MaxSize: 2<<20 + 1}, fastSyncQueryHeavy, 2},
-		{"zero state", DownloadZeroState{}, fastSyncQueryHeavy, 8},
-		{"block", tonnodeapi.DownloadBlock{}, fastSyncQueryMedium, 1},
-		{"block full", tonnodeapi.DownloadBlockFull{}, fastSyncQueryMedium, 1},
-		{"next block full", DownloadNextBlockFull{}, fastSyncQueryMedium, 1},
-		{"next blocks full", DownloadNextBlocksFull{}, fastSyncQueryMedium, 1},
-		{"block proof", DownloadBlockProof{}, fastSyncQueryMedium, 1},
-		{"block proof link", DownloadBlockProofLink{}, fastSyncQueryMedium, 1},
-		{"key block proof", DownloadKeyBlockProof{}, fastSyncQueryMedium, 1},
-		{"key block proof link", DownloadKeyBlockProofLink{}, fastSyncQueryMedium, 1},
-		{"out queue proof", GetOutMsgQueueProof{}, fastSyncQueryMedium, 1},
-		{"next block description", GetNextBlockDescription{}, fastSyncQuerySmall, 1},
-		{"prepare block proof", PrepareBlockProof{}, fastSyncQuerySmall, 1},
-		{"prepare key block proof", PrepareKeyBlockProof{}, fastSyncQuerySmall, 1},
-		{"prepare block", PrepareBlock{}, fastSyncQuerySmall, 1},
-		{"prepare zero state", PrepareZeroState{}, fastSyncQuerySmall, 1},
-		{"next key blocks", GetNextKeyBlockIDs{}, fastSyncQuerySmall, 1},
-		{"archive info", GetArchiveInfo{}, fastSyncQuerySmall, 1},
-		{"shard archive info", GetShardArchiveInfo{}, fastSyncQuerySmall, 1},
-		{"prepare persistent state", PreparePersistentState{}, fastSyncQuerySmall, 1},
-		{"persistent state size", GetPersistentStateSizeV2{}, fastSyncQuerySmall, 1},
+		{"archive", GetArchiveSlice{MaxSize: 2<<20 + 1}, inboundQueryHeavy, 2},
+		{"persistent state", DownloadPersistentStateSliceV2{MaxSize: 2<<20 + 1}, inboundQueryHeavy, 2},
+		{"zero state", DownloadZeroState{}, inboundQueryHeavy, 8},
+		{"block", tonnodeapi.DownloadBlock{}, inboundQueryMedium, 1},
+		{"block full", tonnodeapi.DownloadBlockFull{}, inboundQueryMedium, 1},
+		{"next block full", DownloadNextBlockFull{}, inboundQueryMedium, 1},
+		{"next blocks full", DownloadNextBlocksFull{}, inboundQueryMedium, 1},
+		{"block proof", DownloadBlockProof{}, inboundQueryMedium, 1},
+		{"block proof link", DownloadBlockProofLink{}, inboundQueryMedium, 1},
+		{"key block proof", DownloadKeyBlockProof{}, inboundQueryMedium, 1},
+		{"key block proof link", DownloadKeyBlockProofLink{}, inboundQueryMedium, 1},
+		{"out queue proof", GetOutMsgQueueProof{}, inboundQueryMedium, 1},
+		{"next block description", GetNextBlockDescription{}, inboundQuerySmall, 1},
+		{"prepare block proof", PrepareBlockProof{}, inboundQuerySmall, 1},
+		{"prepare key block proof", PrepareKeyBlockProof{}, inboundQuerySmall, 1},
+		{"prepare block", PrepareBlock{}, inboundQuerySmall, 1},
+		{"prepare zero state", PrepareZeroState{}, inboundQuerySmall, 1},
+		{"next key blocks", GetNextKeyBlockIDs{}, inboundQuerySmall, 1},
+		{"archive info", GetArchiveInfo{}, inboundQuerySmall, 1},
+		{"shard archive info", GetShardArchiveInfo{}, inboundQuerySmall, 1},
+		{"prepare persistent state", PreparePersistentState{}, inboundQuerySmall, 1},
+		{"persistent state size", GetPersistentStateSizeV2{}, inboundQuerySmall, 1},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			class, cost := fastSyncQueryCost(test.query)
+			class, cost := inboundQueryCost(test.query)
 			if class != test.class || cost != test.cost {
 				t.Fatalf(
 					"cost = (%d, %d), want (%d, %d)",
@@ -62,10 +62,10 @@ func TestFastSyncQueryCost(t *testing.T) {
 		})
 	}
 
-	if class, _ := fastSyncQueryCost(&PrepareBlock{}); class != fastSyncQueryUnlimited {
+	if class, _ := inboundQueryCost(&PrepareBlock{}); class != inboundQueryUnlimited {
 		t.Fatal("pointer query was classified despite value-only TL decoding")
 	}
-	if class, _ := fastSyncQueryCost(overlay.Ping{}); class != fastSyncQueryUnlimited {
+	if class, _ := inboundQueryCost(overlay.Ping{}); class != inboundQueryUnlimited {
 		t.Fatal("uncategorized query was limited")
 	}
 }
@@ -82,7 +82,7 @@ func TestFastSyncHeavyQueryCost(t *testing.T) {
 		{math.MaxUint64, 1 << 43},
 	}
 	for _, test := range tests {
-		if cost := fastSyncHeavyQueryCost(test.size); cost != test.cost {
+		if cost := inboundHeavyQueryCost(test.size); cost != test.cost {
 			t.Fatalf("cost(%d) = %d, want %d", test.size, cost, test.cost)
 		}
 	}
@@ -96,13 +96,13 @@ func TestFastSyncQueryLimiterCategoryAndGlobalLimits(t *testing.T) {
 		query tl.Serializable
 		limit int
 	}{
-		{"heavy", GetArchiveSlice{}, int(fastSyncQueryHeavyLimit)},
-		{"medium", tonnodeapi.DownloadBlock{}, int(fastSyncQueryMediumLimit)},
-		{"small", PrepareBlock{}, int(fastSyncQuerySmallLimit)},
+		{"heavy", GetArchiveSlice{}, int(inboundQueryHeavyLimit)},
+		{"medium", tonnodeapi.DownloadBlock{}, int(inboundQueryMediumLimit)},
+		{"small", PrepareBlock{}, int(inboundQuerySmallLimit)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			limiter := newFastSyncQueryLimiter()
+			limiter := newInboundQueryLimiter()
 			for i := 0; i < test.limit; i++ {
 				if !limiter.Allow(test.query, now) {
 					t.Fatalf("request %d was rejected", i+1)
@@ -114,13 +114,13 @@ func TestFastSyncQueryLimiterCategoryAndGlobalLimits(t *testing.T) {
 		})
 	}
 
-	limiter := newFastSyncQueryLimiter()
-	for i := 0; i < int(fastSyncQueryMediumLimit); i++ {
+	limiter := newInboundQueryLimiter()
+	for i := 0; i < int(inboundQueryMediumLimit); i++ {
 		if !limiter.Allow(tonnodeapi.DownloadBlock{}, now) {
 			t.Fatalf("medium request %d was rejected", i+1)
 		}
 	}
-	for i := 0; i < int(fastSyncQueryGlobalLimit-fastSyncQueryMediumLimit); i++ {
+	for i := 0; i < int(inboundQueryGlobalLimit-inboundQueryMediumLimit); i++ {
 		if !limiter.Allow(GetArchiveSlice{}, now) {
 			t.Fatalf("heavy request %d was rejected by shared global limit", i+1)
 		}
@@ -138,26 +138,26 @@ func TestFastSyncQueryLimiterCategoryAndGlobalLimits(t *testing.T) {
 
 func TestFastSyncQueryLimiterWindowBoundaryAndHostileSize(t *testing.T) {
 	now := time.Unix(1_800_100_100, 0)
-	limiter := newFastSyncQueryLimiter()
-	for i := 0; i < int(fastSyncQuerySmallLimit); i++ {
+	limiter := newInboundQueryLimiter()
+	for i := 0; i < int(inboundQuerySmallLimit); i++ {
 		if !limiter.Allow(PrepareBlock{}, now) {
 			t.Fatalf("request %d was rejected", i+1)
 		}
 	}
 	if limiter.Allow(
 		PrepareBlock{},
-		now.Add(fastSyncQueryRateWindowDuration),
+		now.Add(inboundQueryRateWindowDuration),
 	) {
 		t.Fatal("request at the exact window boundary was accepted")
 	}
 	if !limiter.Allow(
 		PrepareBlock{},
-		now.Add(fastSyncQueryRateWindowDuration+time.Nanosecond),
+		now.Add(inboundQueryRateWindowDuration+time.Nanosecond),
 	) {
 		t.Fatal("request beyond the window boundary was rejected")
 	}
 
-	limiter = newFastSyncQueryLimiter()
+	limiter = newInboundQueryLimiter()
 	if limiter.Allow(
 		DownloadPersistentStateSliceV2{MaxSize: math.MaxInt64},
 		now,
@@ -170,18 +170,18 @@ func TestFastSyncQueryLimiterWindowBoundaryAndHostileSize(t *testing.T) {
 }
 
 func TestFastSyncQueryLimiterStorageRemainsBounded(t *testing.T) {
-	limiter := newFastSyncQueryLimiter()
+	limiter := newInboundQueryLimiter()
 	now := time.Unix(1_800_100_150, 0)
 
 	for range 10_000 {
 		if !limiter.Allow(PrepareBlock{}, now) {
 			t.Fatal("spaced request was rejected")
 		}
-		now = now.Add(2 * fastSyncQueryRateWindowDuration)
+		now = now.Add(2 * inboundQueryRateWindowDuration)
 	}
 
 	if limiter.small.count > len(limiter.small.entries) ||
-		len(limiter.small.entries) != int(fastSyncQuerySmallLimit) {
+		len(limiter.small.entries) != int(inboundQuerySmallLimit) {
 		t.Fatalf(
 			"small window storage = count %d, capacity %d",
 			limiter.small.count,
@@ -216,8 +216,8 @@ func TestFastSyncQUICQueryRateLimitRunsBeforeConcurrencyGate(t *testing.T) {
 	node.subscriptionsMx.Unlock()
 
 	now := time.Now()
-	for i := 0; i < int(fastSyncQuerySmallLimit); i++ {
-		if !node.fastSyncQueryLimiter.Allow(PrepareBlock{}, now) {
+	for i := 0; i < int(inboundQuerySmallLimit); i++ {
+		if !sub.inboundQueryLimiter().Allow(PrepareBlock{}, now) {
 			t.Fatalf("fill request %d was rejected", i+1)
 		}
 	}
@@ -237,7 +237,7 @@ func TestFastSyncQUICQueryRateLimitRunsBeforeConcurrencyGate(t *testing.T) {
 		&authenticatedQUICPeer{id: peerID},
 		testQUICOverlayQueryPayload(t, overlayID, PrepareBlock{}),
 	)
-	if !errors.Is(err, errFastSyncQueryRateLimited) {
+	if !errors.Is(err, errInboundQueryRateLimited) {
 		t.Fatalf("query error = %v, want rate limit", err)
 	}
 }
@@ -279,7 +279,7 @@ func TestFastSyncInboundQueryLimitIsSharedAcrossTransports(t *testing.T) {
 		if err == nil {
 			t.Fatalf("ADNL request %d did not reach storage", i+1)
 		}
-		if errors.Is(err, errFastSyncQueryRateLimited) {
+		if errors.Is(err, errInboundQueryRateLimited) {
 			t.Fatalf("ADNL request %d was rate limited", i+1)
 		}
 	}
@@ -288,7 +288,7 @@ func TestFastSyncInboundQueryLimitIsSharedAcrossTransports(t *testing.T) {
 		if err == nil {
 			t.Fatalf("RLDP request %d did not reach storage", i+1)
 		}
-		if errors.Is(err, errFastSyncQueryRateLimited) {
+		if errors.Is(err, errInboundQueryRateLimited) {
 			t.Fatalf("RLDP request %d was rate limited", i+1)
 		}
 	}
@@ -298,7 +298,7 @@ func TestFastSyncInboundQueryLimitIsSharedAcrossTransports(t *testing.T) {
 		&authenticatedQUICPeer{id: peerID},
 		testQUICOverlayQueryPayload(t, overlayID, req),
 	)
-	if !errors.Is(err, errFastSyncQueryRateLimited) {
+	if !errors.Is(err, errInboundQueryRateLimited) {
 		t.Fatalf("QUIC query error = %v, want rate limit", err)
 	}
 
@@ -325,7 +325,7 @@ func TestFastSyncInboundQueryLimitIsSharedAcrossTransports(t *testing.T) {
 		publicPeer,
 		&adnl.MessageQuery{Data: req},
 	)
-	if err == nil || errors.Is(err, errFastSyncQueryRateLimited) {
+	if err == nil || errors.Is(err, errInboundQueryRateLimited) {
 		t.Fatalf("public ADNL query error = %v, want storage error", err)
 	}
 	err = publicSub.answerRLDPQuery(
@@ -333,7 +333,7 @@ func TestFastSyncInboundQueryLimitIsSharedAcrossTransports(t *testing.T) {
 		nil,
 		&rldp.Query{Data: req},
 	)
-	if err == nil || errors.Is(err, errFastSyncQueryRateLimited) {
+	if err == nil || errors.Is(err, errInboundQueryRateLimited) {
 		t.Fatalf("public RLDP query error = %v, want storage error", err)
 	}
 	_, err = node.handleQUICQuery(
@@ -341,18 +341,70 @@ func TestFastSyncInboundQueryLimitIsSharedAcrossTransports(t *testing.T) {
 		&authenticatedQUICPeer{id: peerID},
 		testQUICOverlayQueryPayload(t, publicOverlayID, req),
 	)
-	if err == nil || errors.Is(err, errFastSyncQueryRateLimited) {
+	if err == nil || errors.Is(err, errInboundQueryRateLimited) {
 		t.Fatalf("public QUIC query error = %v, want storage error", err)
 	}
 }
 
 func BenchmarkFastSyncQueryLimiterAllow(b *testing.B) {
-	limiter := newFastSyncQueryLimiter()
+	limiter := newInboundQueryLimiter()
 	now := time.Unix(1_800_100_200, 0)
 
 	b.ReportAllocs()
 	for b.Loop() {
-		now = now.Add(2 * fastSyncQueryRateWindowDuration)
+		now = now.Add(2 * inboundQueryRateWindowDuration)
 		fastSyncQueryLimiterSink = limiter.Allow(PrepareBlock{}, now)
+	}
+}
+
+// TestInboundQueryLimitAppliesToEveryOverlayKind pins the reason this limiter
+// stopped being FastSync-only: the reference node runs the same limiter on its
+// public, fast-sync and custom overlays, and the public one is the overlay any
+// stranger can reach, so it needs the cap most.
+func TestInboundQueryLimitAppliesToEveryOverlayKind(t *testing.T) {
+	node := newTestNode(t)
+
+	for _, test := range []struct {
+		name string
+		kind overlayKind
+	}{
+		{"public", overlayKindPublicShard},
+		{"customFixed", overlayKindCustomFixed},
+		{"fastSync", overlayKindFastSync},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sub := &overlaySubscription{node: node, spec: overlaySpec{Kind: test.kind}}
+
+			now := time.Now()
+			for i := range int(inboundQuerySmallLimit) {
+				if err := sub.admitInboundQuery(PrepareBlock{}, now); err != nil {
+					t.Fatalf("fill request %d rejected: %v", i+1, err)
+				}
+			}
+			if err := sub.admitInboundQuery(PrepareBlock{}, now); !errors.Is(err, errInboundQueryRateLimited) {
+				t.Fatalf("request past the limit: got %v, want %v", err, errInboundQueryRateLimited)
+			}
+		})
+	}
+}
+
+// TestInboundQueryLimitsAreIndependentPerKind checks the budgets do not share a
+// window: a flood on one overlay must not starve queries arriving on another.
+func TestInboundQueryLimitsAreIndependentPerKind(t *testing.T) {
+	node := newTestNode(t)
+	public := &overlaySubscription{node: node, spec: overlaySpec{Kind: overlayKindPublicShard}}
+	fastSync := &overlaySubscription{node: node, spec: overlaySpec{Kind: overlayKindFastSync}}
+
+	now := time.Now()
+	for i := range int(inboundQuerySmallLimit) {
+		if err := public.admitInboundQuery(PrepareBlock{}, now); err != nil {
+			t.Fatalf("public fill request %d rejected: %v", i+1, err)
+		}
+	}
+	if err := public.admitInboundQuery(PrepareBlock{}, now); !errors.Is(err, errInboundQueryRateLimited) {
+		t.Fatalf("public request past the limit: got %v", err)
+	}
+	if err := fastSync.admitInboundQuery(PrepareBlock{}, now); err != nil {
+		t.Fatalf("FastSync must keep its own budget: %v", err)
 	}
 }

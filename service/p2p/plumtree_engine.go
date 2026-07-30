@@ -21,12 +21,16 @@ const (
 	plumtreeActiveRepairLimit    = 512
 	plumtreeRepairTargetLimit    = 5
 	plumtreeActiveNeighbourLimit = 20
+	plumtreeIHaveFanout          = 8
 
 	plumtreeOriginalEagerLimit = 1
 	plumtreeRegularEagerLimit  = 4
 
 	plumtreePendingFeedbackTTL = 5 * time.Second
-	plumtreeEagerInactivityTTL = 30 * time.Second
+	// How long a silent eager neighbour keeps its slot. Well under
+	// plumtreeBroadcastLifetime: the slot suppresses repairs for that part, so
+	// waiting too long means losing the broadcast rather than repairing it.
+	plumtreeEagerInactivityTTL = 10 * time.Second
 	plumtreeRepairDelay        = 200 * time.Millisecond
 	plumtreeRepairTimeout      = 5 * time.Second
 	plumtreeRepairMTUOverhead  = 4096
@@ -44,10 +48,9 @@ type plumtreePeerSet interface {
 	PlumtreePeersReceiveBroadcasts(peers []PeerID, out []bool)
 }
 
-// plumtreeReceiveVerdicts memoizes one batched roster check so a forward
-// decision asks the peer set once instead of once per candidate. A verdict set
-// is built under e.mu from the same eager slots it later answers for, so every
-// looked-up peer is present by construction.
+// One batched roster check, so a forward decision asks the peer set once instead
+// of once per candidate. Built under e.mu from the same eager slots it answers
+// for, so every looked-up peer is present by construction.
 type plumtreeReceiveVerdicts struct {
 	peers    []PeerID
 	receives []bool
@@ -78,8 +81,8 @@ func (e *plumtreeEngine) slotReceiveVerdictsLocked(
 	return e.receiveVerdicts(slices.Clone(slot.eager[:slot.eagerCount]))
 }
 
-// fecEagerReceiveVerdictsLocked collects the unique eager peers across every
-// FEC slot so OriginateFEC resolves the roster once for all 45 parts.
+// The unique eager peers across every FEC slot, so OriginateFEC resolves the
+// roster once for all 45 parts.
 func (e *plumtreeEngine) fecEagerReceiveVerdictsLocked() plumtreeReceiveVerdicts {
 	var unique []PeerID
 	for treeIndex := plumtreeFECTreeOffset; treeIndex < plumtreeTreeSlots; treeIndex++ {
@@ -224,6 +227,10 @@ type plumtreeActions struct {
 	Outbounds  []plumtreeOutboundAction
 	Repairs    []plumtreeRepairAction
 	Deliveries []plumtreeDelivery
+	// Candidates are buffered announcers whose signature still has to be
+	// verified before they can be asked for a part. The caller verifies them off
+	// the engine lock and feeds the survivors back through StartVerifiedRepair.
+	Candidates []plumtreeRepairCandidate
 }
 
 type plumtreeEngineConfig struct {
@@ -231,14 +238,6 @@ type plumtreeEngineConfig struct {
 	IsOriginalSender bool
 	Now              func() time.Time
 }
-
-type plumtreePayloadOrigin uint8
-
-const (
-	plumtreePayloadOriginUnknown plumtreePayloadOrigin = iota
-	plumtreePayloadOriginPush
-	plumtreePayloadOriginRepair
-)
 
 type plumtreePartKey struct {
 	broadcastID [sha256.Size]byte
@@ -248,7 +247,6 @@ type plumtreePartKey struct {
 
 type plumtreePayloadContext struct {
 	from        PeerID
-	origin      plumtreePayloadOrigin
 	expectedKey plumtreePartKey
 }
 
@@ -284,7 +282,7 @@ type plumtreePartState struct {
 	fullSentTo    [plumtreeRegularEagerLimit]PeerID
 	fullSentCount uint8
 	// Each part is forwarded once against one active-neighbour snapshot.
-	advertisedTo    [plumtreeActiveNeighbourLimit]PeerID
+	advertisedTo    [plumtreeIHaveFanout]PeerID
 	advertisedCount uint8
 }
 
@@ -303,18 +301,21 @@ type plumtreeFECState struct {
 	retainedWireBytes     uint64
 	decoderEstimatedBytes uint64
 
-	// decodeMu serialises RaptorQ work for this broadcast so it can run outside
-	// the engine lock. Lock order is decodeMu -> mu: never take decodeMu while
-	// holding mu. decoder, decodeBuffer and decoderPartCount belong to decodeMu;
-	// clearing decoder/decodeBuffer and setting decoderReleased additionally
-	// require mu. The decoder is built lazily under decodeMu on the first
-	// symbol, so "completed or failed" is signalled by decoderReleased, not by
-	// a nil decoder.
+	// decodeMu serialises RaptorQ work for this broadcast outside the engine lock.
+	// Lock order is decodeMu -> mu. decoder, decodeBuffer and decoderPartCount
+	// belong to decodeMu; clearing decoder/decodeBuffer and setting decoderReleased
+	// additionally require mu. The decoder is built lazily on the first symbol, so
+	// "completed or failed" is decoderReleased, not a nil decoder.
 	decodeMu        sync.Mutex
 	decoder         *raptorq.Decoder
 	decoderReleased bool
 	decodeBuffer    []byte
 	parts           [plumtreeFECTotalParts]*plumtreePartState
+
+	// Per part, measured from that part's earliest announcement; zero means nothing
+	// pending. A single per-broadcast minimum would repair a late-announced part
+	// early and prune the healthy eager peer still pushing it.
+	repairAt [plumtreeFECTotalParts]time.Time
 
 	previous *plumtreeFECState
 	next     *plumtreeFECState
@@ -349,13 +350,6 @@ type plumtreeRepairAttempt struct {
 	key  plumtreePartKey
 }
 
-type plumtreeDeliveredCache struct {
-	values map[[sha256.Size]byte]struct{}
-	order  [plumtreeDeliveredLimit][sha256.Size]byte
-	head   int
-	size   int
-}
-
 type plumtreeEngine struct {
 	mu sync.Mutex
 
@@ -382,10 +376,19 @@ type plumtreeEngine struct {
 	missingOldest *plumtreeMissingPart
 	missingNewest *plumtreeMissingPart
 
+	// Unverified IHAVEs, bucketed per announcing peer. See
+	// plumtree_announcements.go.
+	announcements map[PeerID]*plumtreePeerAnnouncements
+	// Earliest repairAt and earliest retention deadline, cached so NextAlarm stays
+	// an O(1) read instead of a scan on every run-loop turn.
+	fecRepairNext     time.Time
+	stateExpireNext   time.Time
+	pendingExpireNext time.Time
+
 	repairs      map[uint64]plumtreeRepairAttempt
 	nextRepairID uint64
 
-	delivered    plumtreeDeliveredCache
+	delivered    plumtreeRingSet[[sha256.Size]byte]
 	notFoundBody []byte
 	closed       bool
 }
@@ -421,11 +424,10 @@ func newPlumtreeEngine(
 		fecStates:        make(map[[sha256.Size]byte]*plumtreeFECState),
 		simpleStates:     make(map[[sha256.Size]byte]*plumtreeSimpleState),
 		missing:          make(map[plumtreePartKey]*plumtreeMissingPart),
+		announcements:    make(map[PeerID]*plumtreePeerAnnouncements),
 		repairs:          make(map[uint64]plumtreeRepairAttempt),
-		delivered: plumtreeDeliveredCache{
-			values: make(map[[sha256.Size]byte]struct{}, plumtreeDeliveredLimit),
-		},
-		notFoundBody: notFoundBody,
+		delivered:        newPlumtreeRingSet[[sha256.Size]byte](plumtreeDeliveredLimit),
+		notFoundBody:     notFoundBody,
 	}, nil
 }
 
@@ -452,33 +454,10 @@ func (e *plumtreeEngine) Close() {
 	e.missing = nil
 	e.missingOldest = nil
 	e.missingNewest = nil
+	e.announcements = nil
 	e.repairs = nil
-	e.delivered = plumtreeDeliveredCache{}
+	e.delivered = plumtreeRingSet[[sha256.Size]byte]{}
 	e.notFoundBody = nil
-}
-
-func (c *plumtreeDeliveredCache) contains(id [sha256.Size]byte) bool {
-	_, ok := c.values[id]
-	return ok
-}
-
-func (c *plumtreeDeliveredCache) add(id [sha256.Size]byte) {
-	if c.contains(id) {
-		return
-	}
-
-	if c.size < plumtreeDeliveredLimit {
-		index := (c.head + c.size) % plumtreeDeliveredLimit
-		c.order[index] = id
-		c.size++
-		c.values[id] = struct{}{}
-		return
-	}
-
-	delete(c.values, c.order[c.head])
-	c.order[c.head] = id
-	c.head = (c.head + 1) % plumtreeDeliveredLimit
-	c.values[id] = struct{}{}
 }
 
 func (s *plumtreeSlot) hasEager(peer PeerID) bool {
@@ -656,6 +635,29 @@ func (e *plumtreeEngine) promoteEagerLocked(
 	e.addEagerReferenceLocked(peer, now)
 }
 
+// Resolves the roster once for all slots rather than per slot. The verdicts must
+// cover the simple tree too: receivesBroadcasts reports false for a peer it was
+// not asked about, which would read as "gone" for a healthy one.
+func (e *plumtreeEngine) expireInactiveEagerLocked(now time.Time) {
+	var unique []PeerID
+	for i := range e.slots {
+		slot := &e.slots[i]
+		for j := range int(slot.eagerCount) {
+			if !slices.Contains(unique, slot.eager[j]) {
+				unique = append(unique, slot.eager[j])
+			}
+		}
+	}
+	if len(unique) == 0 {
+		return
+	}
+
+	verdicts := e.receiveVerdicts(unique)
+	for i := range e.slots {
+		e.removeInactiveEagerLocked(&e.slots[i], now, &verdicts)
+	}
+}
+
 func (e *plumtreeEngine) removeInactiveEagerLocked(
 	slot *plumtreeSlot,
 	now time.Time,
@@ -695,6 +697,7 @@ func (e *plumtreeEngine) registerFullSendLocked(
 		e.activities[peer] = activity
 	} else {
 		slot.reservePending(peer, now)
+		e.notePendingDeadlineLocked(now.Add(plumtreePendingFeedbackTTL))
 	}
 	part.addFullSent(peer)
 }
@@ -710,6 +713,7 @@ func (e *plumtreeEngine) RemovePeer(peer PeerID) {
 	for i := range e.slots {
 		e.removeEagerLocked(&e.slots[i], peer)
 	}
+	delete(e.announcements, peer)
 }
 
 func (e *plumtreeEngine) statsEagerPeers(

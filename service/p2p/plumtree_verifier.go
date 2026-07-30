@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"expvar"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
@@ -18,10 +20,11 @@ const (
 	plumtreeCertificateAllowFEC uint32 = 1
 	plumtreeCertificateTrusted  uint32 = 2
 
-	plumtreeCertificateCacheLimit      = 100
-	plumtreeCertificateCheckLimit      = 60
-	plumtreeCertificateCheckWindow     = 60 * time.Second
-	plumtreeSignatureRejectionDuration = 5 * time.Second
+	plumtreeCertificateCacheLimit       = 100
+	plumtreeCertificateCheckLimit       = 60
+	plumtreeCertificateCheckWindow      = 60 * time.Second
+	plumtreeSignatureRejectionDuration  = 5 * time.Second
+	plumtreeVerifiedSignatureCacheLimit = 4096
 )
 
 var (
@@ -44,25 +47,32 @@ type plumtreeCertificateFields struct {
 
 type plumtreeCertificateCacheKey [PeerIDSize * 2]byte
 
-type plumtreeCertificateCache struct {
-	values map[plumtreeCertificateCacheKey]struct{}
-	order  [plumtreeCertificateCacheLimit]plumtreeCertificateCacheKey
+type plumtreeRingSet[K comparable] struct {
+	values map[K]struct{}
+	order  []K
 	head   int
 	size   int
 }
 
-func (c *plumtreeCertificateCache) contains(key plumtreeCertificateCacheKey) bool {
+func newPlumtreeRingSet[K comparable](limit int) plumtreeRingSet[K] {
+	return plumtreeRingSet[K]{
+		values: make(map[K]struct{}, limit),
+		order:  make([]K, limit),
+	}
+}
+
+func (c *plumtreeRingSet[K]) contains(key K) bool {
 	_, ok := c.values[key]
 	return ok
 }
 
-func (c *plumtreeCertificateCache) add(key plumtreeCertificateCacheKey) {
+func (c *plumtreeRingSet[K]) add(key K) {
 	if c.contains(key) {
 		return
 	}
 
-	if c.size < plumtreeCertificateCacheLimit {
-		index := (c.head + c.size) % plumtreeCertificateCacheLimit
+	if c.size < len(c.order) {
+		index := (c.head + c.size) % len(c.order)
 		c.order[index] = key
 		c.size++
 		c.values[key] = struct{}{}
@@ -71,7 +81,7 @@ func (c *plumtreeCertificateCache) add(key plumtreeCertificateCacheKey) {
 
 	delete(c.values, c.order[c.head])
 	c.order[c.head] = key
-	c.head = (c.head + 1) % plumtreeCertificateCacheLimit
+	c.head = (c.head + 1) % len(c.order)
 	c.values[key] = struct{}{}
 }
 
@@ -79,17 +89,14 @@ type plumtreeCertificateLimiter struct {
 	checks    [plumtreeCertificateCheckLimit]time.Time
 	checkHead int
 	checkSize int
-	checked   plumtreeCertificateCache
+	checked   plumtreeRingSet[plumtreeCertificateCacheKey]
 }
 
 func newPlumtreeCertificateLimiter() *plumtreeCertificateLimiter {
 	return &plumtreeCertificateLimiter{
-		checked: plumtreeCertificateCache{
-			values: make(
-				map[plumtreeCertificateCacheKey]struct{},
-				plumtreeCertificateCacheLimit,
-			),
-		},
+		checked: newPlumtreeRingSet[plumtreeCertificateCacheKey](
+			plumtreeCertificateCacheLimit,
+		),
 	}
 }
 
@@ -125,6 +132,36 @@ type plumtreeSignatureVerifier struct {
 	rejectionQueue []plumtreeRejectedPeer
 	rejectionHead  int
 	scratch        []byte
+	verified       plumtreeRingSet[plumtreeVerifiedSignature]
+
+	signatureHits   atomic.Uint64
+	signatureMisses atomic.Uint64
+}
+
+// SignatureCacheStats reports how often the cache spared a key verification.
+// Monotonic since process start.
+func (v *plumtreeSignatureVerifier) SignatureCacheStats() (hits, misses uint64) {
+	return v.signatureHits.Load(), v.signatureMisses.Load()
+}
+
+// Process-wide counters behind /debug/vars, aggregated across every overlay's
+// verifier so the IHAVE signature load can be read from a running node.
+var (
+	plumtreeSignatureHitsTotal   atomic.Uint64
+	plumtreeSignatureMissesTotal atomic.Uint64
+	plumtreeRepairRequestsTotal  atomic.Uint64
+	plumtreeIHaveVerifiableTotal atomic.Uint64
+)
+
+func init() {
+	expvar.Publish("plumtree_signatures", expvar.Func(func() any {
+		return map[string]uint64{
+			"cache_hits":      plumtreeSignatureHitsTotal.Load(),
+			"verifications":   plumtreeSignatureMissesTotal.Load(),
+			"ihave_verified":  plumtreeIHaveVerifiableTotal.Load(),
+			"repairs_started": plumtreeRepairRequestsTotal.Load(),
+		}
+	}))
 }
 
 var _ plumtreeVerifier = (*plumtreeSignatureVerifier)(nil)
@@ -142,6 +179,9 @@ func newPlumtreeSignatureVerifier(
 		limiters:     make(map[PeerID]*plumtreeCertificateLimiter),
 		rejected:     make(map[PeerID]time.Time),
 		scratch:      make([]byte, 0, 256),
+		verified: newPlumtreeRingSet[plumtreeVerifiedSignature](
+			plumtreeVerifiedSignatureCacheLimit,
+		),
 	}
 }
 
@@ -149,6 +189,7 @@ func (v *plumtreeSignatureVerifier) VerifyPlumtree(
 	ctx context.Context,
 	request plumtreeVerification,
 ) (PeerID, error) {
+	signatureKey, cacheable := verifiedSignatureCacheKey(request)
 	select {
 	case v.gate <- struct{}{}:
 	case <-ctx.Done():
@@ -160,13 +201,15 @@ func (v *plumtreeSignatureVerifier) VerifyPlumtree(
 	}
 
 	now := time.Now()
-	source, err := v.precheckLocked(request, now)
+	source, verified, err := v.precheckLocked(request, signatureKey, cacheable, now)
 	<-v.gate
 	if err != nil {
 		return PeerID{}, err
 	}
-	if err = v.checkSourceSignature(request, now); err != nil {
-		return PeerID{}, err
+	if !verified {
+		if err = v.checkSourceSignature(request, signatureKey, cacheable, now); err != nil {
+			return PeerID{}, err
+		}
 	}
 	if err = ctx.Err(); err != nil {
 		return PeerID{}, err
@@ -178,40 +221,74 @@ func (v *plumtreeSignatureVerifier) verifyAt(
 	request plumtreeVerification,
 	now time.Time,
 ) (PeerID, error) {
+	signatureKey, cacheable := verifiedSignatureCacheKey(request)
 	v.gate <- struct{}{}
-	source, err := v.precheckLocked(request, now)
+	source, verified, err := v.precheckLocked(request, signatureKey, cacheable, now)
 	<-v.gate
 	if err != nil {
 		return PeerID{}, err
 	}
-	if err = v.checkSourceSignature(request, now); err != nil {
-		return PeerID{}, err
+	if !verified {
+		if err = v.checkSourceSignature(request, signatureKey, cacheable, now); err != nil {
+			return PeerID{}, err
+		}
 	}
 	return source, nil
 }
 
-// precheckLocked performs every check that reads or writes verifier state, so
-// that state stays gate-only. The one deliberately unchecked piece is the
-// source signature itself: the caller runs that ed25519.Verify after releasing
-// the gate, keeping the ~60us of key math off the per-overlay serialization
-// point. The rate-limited certificate signature check stays here because its
-// memoization cache is verifier state.
+// A comparable copy of the whole verified tuple, so a hit certifies exactly what
+// ed25519.Verify would re-establish. Raw bytes rather than a digest: lookups stay
+// on the map's native hash and collisions are ruled out. dataLen disambiguates
+// zero-padded payloads of different sizes.
+type plumtreeVerifiedSignature struct {
+	source     [ed25519.PublicKeySize]byte
+	signature  [ed25519.SignatureSize]byte
+	signedData [plumtreeFECToSignWireSize]byte
+	dataLen    uint8
+}
+
+// verifiedSignatureCacheKey reports oversized or malformed components as
+// non-cacheable; those take the full verification path.
+func verifiedSignatureCacheKey(
+	request plumtreeVerification,
+) (plumtreeVerifiedSignature, bool) {
+	if len(request.Source.Key) != ed25519.PublicKeySize ||
+		len(request.Signature) != ed25519.SignatureSize ||
+		len(request.SignedData) > plumtreeFECToSignWireSize {
+		return plumtreeVerifiedSignature{}, false
+	}
+
+	var key plumtreeVerifiedSignature
+	copy(key.source[:], request.Source.Key)
+	copy(key.signature[:], request.Signature)
+	copy(key.signedData[:], request.SignedData)
+	key.dataLen = uint8(len(request.SignedData))
+	return key, true
+}
+
+// Every check that reads or writes verifier state, so that state stays gate-only.
+// The source signature is deliberately left to the caller, which verifies it
+// after releasing the gate: ~60us of key math off the per-overlay serialization
+// point. The certificate check stays because its memoization cache is verifier
+// state. The returned flag reports an already-verified tuple.
 func (v *plumtreeSignatureVerifier) precheckLocked(
 	request plumtreeVerification,
+	signatureKey plumtreeVerifiedSignature,
+	cacheable bool,
 	now time.Time,
-) (PeerID, error) {
+) (PeerID, bool, error) {
 	policy := v.policySource.current()
 	v.updatePolicyLocked(policy)
 	if !policy.enabled(v.workchain) {
-		return PeerID{}, errPlumtreeDisabled
+		return PeerID{}, false, errPlumtreeDisabled
 	}
 	if request.DataSize == 0 || request.DataSize > uint32(plumtreeMaxPayloadSize) {
-		return PeerID{}, errPlumtreeSourceNotAllowed
+		return PeerID{}, false, errPlumtreeSourceNotAllowed
 	}
 
 	sourceID, err := peerIDFromED25519PublicKey(request.Source.Key)
 	if err != nil {
-		return PeerID{}, err
+		return PeerID{}, false, err
 	}
 	if !policy.authorizes(sourceID, request.DataSize) {
 		if err = v.checkCertificateLocked(
@@ -222,37 +299,54 @@ func (v *plumtreeSignatureVerifier) precheckLocked(
 			request.From,
 			now,
 		); err != nil {
-			return PeerID{}, err
+			return PeerID{}, false, err
 		}
 	}
 
 	v.expireRejectedLocked(now)
 	if until, ok := v.rejected[request.From]; ok && now.Before(until) {
-		return PeerID{}, errPlumtreePeerSignaturesRejected
+		return PeerID{}, false, errPlumtreePeerSignaturesRejected
 	}
 	if len(request.Source.Key) != ed25519.PublicKeySize {
-		return PeerID{}, fmt.Errorf(
+		return PeerID{}, false, fmt.Errorf(
 			"invalid Plumtree Ed25519 public key size %d",
 			len(request.Source.Key),
 		)
 	}
-	return sourceID, nil
+	if cacheable && v.verified.contains(signatureKey) {
+		v.signatureHits.Add(1)
+		plumtreeSignatureHitsTotal.Add(1)
+		return sourceID, true, nil
+	}
+	v.signatureMisses.Add(1)
+	plumtreeSignatureMissesTotal.Add(1)
+	return sourceID, false, nil
 }
 
 func (v *plumtreeSignatureVerifier) checkSourceSignature(
 	request plumtreeVerification,
+	signatureKey plumtreeVerifiedSignature,
+	cacheable bool,
 	now time.Time,
 ) error {
-	if ed25519.Verify(request.Source.Key, request.SignedData, request.Signature) {
+	valid := ed25519.Verify(request.Source.Key, request.SignedData, request.Signature)
+	if valid && !cacheable {
 		return nil
 	}
 
-	// Re-acquire the gate only to record the rejection; concurrent verifiers
-	// recording the same peer are harmless duplicate map writes.
+	// Only to record the outcome; concurrent verifiers landing the same signature
+	// or rejection are harmless duplicates.
 	v.gate <- struct{}{}
-	v.recordRejectionLocked(request.From, now)
+	if valid {
+		v.verified.add(signatureKey)
+	} else {
+		v.recordRejectionLocked(request.From, now)
+	}
 	<-v.gate
-	return errPlumtreeSignatureInvalid
+	if !valid {
+		return errPlumtreeSignatureInvalid
+	}
+	return nil
 }
 
 func (v *plumtreeSignatureVerifier) updatePolicyLocked(policy *PlumtreePolicy) {

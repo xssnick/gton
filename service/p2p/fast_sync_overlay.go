@@ -173,6 +173,14 @@ func (r *fastSyncOverlayRuntime) permanent(id PeerID) bool {
 	return r.membership.IsPermanent(id)
 }
 
+// declinesBroadcasts reports whether this overlay is send-only for us, i.e. we
+// published DoNotReceiveBroadcasts in our own member flags. Stated as the
+// conjunction rather than as !receiveBroadcasts so a zero-valued spec means
+// "receiving", which is what every overlay that is not a plumtree validator is.
+func (r *fastSyncOverlayRuntime) declinesBroadcasts() bool {
+	return r.spec.localValidator && !r.spec.receiveBroadcasts
+}
+
 func (r *fastSyncOverlayRuntime) peerReceivesBroadcasts(id PeerID) bool {
 	flags, err := r.membership.PeerFlags(id)
 	return err == nil && flags&fastSyncDoNotReceiveBroadcasts == 0
@@ -211,6 +219,49 @@ func (r *fastSyncOverlayRuntime) setValidatorAlive(
 	r.rootsMu.Unlock()
 }
 
+// aliveRootsSnapshot copies the validators currently known to answer, so a
+// rebuilt overlay can start from what the old one had learned.
+func (r *fastSyncOverlayRuntime) aliveRootsSnapshot() []PeerID {
+	r.rootsMu.Lock()
+	defer r.rootsMu.Unlock()
+	return slices.Clone(r.aliveRoots)
+}
+
+// seedAliveRoots re-arms liveness after a rebuild. setValidatorAlive filters
+// against the new roster, so validators dropped by the key block are discarded
+// here rather than needing to be filtered by the caller.
+func (r *fastSyncOverlayRuntime) seedAliveRoots(ids []PeerID) {
+	for _, id := range ids {
+		r.setValidatorAlive(id, true)
+	}
+}
+
+// seedFastSyncLiveness carries liveness into a rebuilt overlay, but only for
+// validators this subscription already holds an open transport to.
+//
+// The filter is the whole point. ready() is a count of aliveRoots and nothing
+// else, so seeding before the transports are attached would make the overlay
+// announce itself query-ready while owning no peers: readyFastSyncQuerySubscription
+// would hand it to querySubscriptionForBlock in preference to the public
+// overlay, and fastSyncQueryCandidates would then walk the whole roster finding
+// no peer, mark every seeded validator dead and return nothing — a download
+// failure where the unseeded path would simply have fallen back. Call this only
+// after attachSubscriptionPeers.
+func (s *overlaySubscription) seedFastSyncLiveness(ids []PeerID) {
+	if s.fastSync == nil || len(ids) == 0 {
+		return
+	}
+	connected := make([]PeerID, 0, len(ids))
+	for _, id := range ids {
+		peer := s.peerByID(id)
+		if peer == nil || !peer.hasOpenConnection() {
+			continue
+		}
+		connected = append(connected, id)
+	}
+	s.fastSync.seedAliveRoots(connected)
+}
+
 func (r *fastSyncOverlayRuntime) setPeerAlive(
 	id PeerID,
 	alive bool,
@@ -245,7 +296,7 @@ func (r *fastSyncOverlayRuntime) validatorPingTargets(
 	limit int,
 	localID PeerID,
 ) []PeerID {
-	ids := r.spec.roster.adnlIDs
+	ids := r.spec.roster.adnlIDsRef()
 	if limit <= 0 || len(ids) == 0 {
 		return nil
 	}
@@ -309,13 +360,10 @@ func (n *Node) applyFastSyncOverlaysLocked(state FastSyncState) error {
 		return nil
 	}
 
-	certificate, localValidator, err := n.fastSyncLocalCertificate(
+	certificate, localValidator := n.fastSyncLocalCertificate(
 		state.Roster,
 		time.Now(),
 	)
-	if err != nil {
-		return err
-	}
 
 	desiredShards := n.fastSyncDesiredShards(state.Shards)
 	if !localValidator && certificate == nil {
@@ -344,12 +392,31 @@ func (n *Node) applyFastSyncOverlaysLocked(state FastSyncState) error {
 	return n.reconcileFastSyncOverlays(desired)
 }
 
+// fastSyncLocalCertificate picks the stored certificate that still authorises
+// this node, or reports that the node is a validator and needs none.
+//
+// An unusable certificate is skipped, never fatal. The reference node does the
+// same, and the difference matters: this runs on every masterchain block, and
+// failing the whole call would leave every FastSync overlay — masterchain
+// included — frozen at its previous roster until some peer happened to push a
+// fresh certificate.
 func (n *Node) fastSyncLocalCertificate(
 	roster FastSyncValidatorRoster,
 	now time.Time,
-) (*overlay.MemberCertificate, bool, error) {
+) (*overlay.MemberCertificate, bool) {
 	if roster.ContainsADNL(n.localID) {
-		return nil, true, nil
+		return nil, true
+	}
+	// Not an error path, but the transition it precedes is invisible otherwise:
+	// once this node is in the roster, plumtree turns FastSync into a
+	// send-only overlay for it (receiveBroadcasts goes false), so a silent flip
+	// would look like FastSync simply stopped delivering.
+
+	skip := func(i int, err error) {
+		n.log.Debug().
+			Err(err).
+			Int("certificate", i).
+			Msg("skipping unusable FastSync certificate")
 	}
 
 	certificates := n.fastSyncCertificateSnapshot()
@@ -359,35 +426,23 @@ func (n *Node) fastSyncLocalCertificate(
 			continue
 		}
 		if err := certificate.CheckSlot(FastSyncMemberSlotCount); err != nil {
-			return nil, false, fmt.Errorf(
-				"fast sync certificate %d: %w",
-				i,
-				err,
-			)
+			skip(i, err)
+			continue
 		}
 		if err := certificate.CheckSignature(n.localID[:]); err != nil {
-			return nil, false, fmt.Errorf(
-				"fast sync certificate %d: %w",
-				i,
-				err,
-			)
+			skip(i, err)
+			continue
 		}
 
 		issuer, err := certificate.IssuerID()
 		if err != nil {
-			return nil, false, fmt.Errorf(
-				"fast sync certificate %d issuer: %w",
-				i,
-				err,
-			)
+			skip(i, err)
+			continue
 		}
 		issuerID, err := NewPeerID(issuer)
 		if err != nil {
-			return nil, false, fmt.Errorf(
-				"fast sync certificate %d issuer: %w",
-				i,
-				err,
-			)
+			skip(i, err)
+			continue
 		}
 		if !roster.ContainsRoot(issuerID) {
 			continue
@@ -395,15 +450,12 @@ func (n *Node) fastSyncLocalCertificate(
 
 		cloned, err := cloneFastSyncCertificate(certificate)
 		if err != nil {
-			return nil, false, fmt.Errorf(
-				"fast sync certificate %d: %w",
-				i,
-				err,
-			)
+			skip(i, err)
+			continue
 		}
-		return &cloned, false, nil
+		return &cloned, false
 	}
-	return nil, false, nil
+	return nil, false
 }
 
 func cloneFastSyncCertificate(
@@ -422,43 +474,6 @@ func cloneFastSyncCertificate(
 	}
 	certificate.Signature = slices.Clone(certificate.Signature)
 	return certificate, nil
-}
-
-func prepareFastSyncCertificates(
-	certificates []overlay.MemberCertificate,
-	localID PeerID,
-) ([]overlay.MemberCertificate, error) {
-	prepared := make(
-		[]overlay.MemberCertificate,
-		len(certificates),
-	)
-	for i, certificate := range certificates {
-		if err := certificate.CheckSlot(FastSyncMemberSlotCount); err != nil {
-			return nil, fmt.Errorf(
-				"fast sync certificate %d: %w",
-				i,
-				err,
-			)
-		}
-		if err := certificate.CheckSignature(localID[:]); err != nil {
-			return nil, fmt.Errorf(
-				"fast sync certificate %d: %w",
-				i,
-				err,
-			)
-		}
-
-		cloned, err := cloneFastSyncCertificate(certificate)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"fast sync certificate %d: %w",
-				i,
-				err,
-			)
-		}
-		prepared[i] = cloned
-	}
-	return prepared, nil
 }
 
 func (n *Node) fastSyncDesiredShards(
@@ -480,7 +495,7 @@ func (n *Node) fastSyncDesiredShards(
 		}
 		desired = append(desired, shard)
 	}
-	return NewFastSyncShardSet(desired).shards
+	return NewFastSyncShardSet(desired).shardsRef()
 }
 
 func (n *Node) buildFastSyncOverlaySpec(
@@ -501,11 +516,13 @@ func (n *Node) buildFastSyncOverlaySpec(
 	copy(zeroHash[:], n.zeroStateFileHash)
 
 	identity := NewFastSyncOverlayIdentity(zeroHash, shard)
-	fixedNodes := roster.adnlIDs
-	fixedIDs := make(map[PeerID]struct{}, len(fixedNodes))
+	// No FixedNodeIDs: acceptsPeerID answers from the live membership runtime
+	// for a FastSync overlay and never reaches the configured-roster lookup, so
+	// a roster-sized set per shard per masterchain block would only be built to
+	// be ignored.
+	fixedNodes := roster.adnlIDsRef()
 	authorizedKeys := make(map[string]uint32, len(fixedNodes))
 	for _, id := range fixedNodes {
-		fixedIDs[id] = struct{}{}
 		authorizedKeys[string(id[:])] = maxOverlayPayloadSize
 	}
 
@@ -559,7 +576,6 @@ func (n *Node) buildFastSyncOverlaySpec(
 		ProtoVersionMajor: protoMajor,
 		ProtoVersionMinor: protoMinor,
 		FixedNodes:        fixedNodes,
-		FixedNodeIDs:      fixedIDs,
 		QueryAcceptors:    fixedNodes,
 		AuthorizedKeys:    authorizedKeys,
 		UseQUIC:           true,
@@ -576,11 +592,19 @@ func (n *Node) reconcileFastSyncOverlays(
 ) error {
 	var removed []*overlaySubscription
 	type pendingFastSyncSubscription struct {
-		shard FastSyncShard
-		spec  overlaySpec
-		sub   *overlaySubscription
+		shard      FastSyncShard
+		spec       overlaySpec
+		sub        *overlaySubscription
+		aliveRoots []PeerID
 	}
 	start := make([]pendingFastSyncSubscription, 0, len(desired))
+	// A roster change rebuilds the overlay because the authorized-key set is
+	// baked into its broadcast receiver, but the knowledge of which validators
+	// answer is not roster-specific and is expensive to relearn: without this
+	// every key block would leave selectValidator unready until the ping sweep
+	// walked the set again. Upstream keeps the same state alive across its own
+	// delete_overlay+init for the same reason.
+	carriedAlive := make(map[FastSyncShard][]PeerID)
 
 	n.subscriptionsMx.Lock()
 	for shard, sub := range n.fastSyncSubscriptions {
@@ -602,6 +626,9 @@ func (n *Node) reconcileFastSyncOverlays(
 			continue
 		}
 
+		if sub.fastSync != nil {
+			carriedAlive[shard] = sub.fastSync.aliveRootsSnapshot()
+		}
 		removed = append(removed, sub)
 	}
 
@@ -615,9 +642,10 @@ func (n *Node) reconcileFastSyncOverlays(
 			return err
 		}
 		start = append(start, pendingFastSyncSubscription{
-			shard: shard,
-			spec:  spec,
-			sub:   sub,
+			shard:      shard,
+			spec:       spec,
+			sub:        sub,
+			aliveRoots: carriedAlive[shard],
 		})
 	}
 	for _, sub := range removed {
@@ -642,6 +670,7 @@ func (n *Node) reconcileFastSyncOverlays(
 	}
 	for _, pending := range start {
 		n.attachSubscriptionPeers(pending.sub)
+		pending.sub.seedFastSyncLiveness(pending.aliveRoots)
 		if n.networkStarted.Load() {
 			n.startSubscription(pending.sub)
 		}
@@ -697,6 +726,12 @@ func (s *overlaySubscription) pingFastSyncValidators(
 	if !s.isActive() || s.fastSync == nil {
 		return
 	}
+
+	// Sweep before picking targets. Upstream bounds its peer map at insert time
+	// (del_some_peers from add_peer); ours is bounded only by certificate
+	// issuance policy, so without this a node that stays up across many
+	// validator sets keeps every certified client it ever heard of.
+	s.fastSync.peers.Prune(time.Now())
 
 	ids := s.fastSync.validatorPingTargets(
 		rand.Uint64(),
@@ -841,11 +876,15 @@ func (s *overlaySubscription) learnFastSyncNodes(
 	nodes []overlay.NodeV2,
 	now time.Time,
 ) {
-	if len(nodes) == 0 ||
-		!s.advertisedPeerLearning.CompareAndSwap(false, true) {
+	if len(nodes) == 0 {
 		return
 	}
 
+	// Enrol first, unconditionally: gossip arrives about once a second, while a
+	// dial round walks its whole list at dhtSeedPeerTimeout each, so gating
+	// enrolment on the dial guard would drop most of what we learn whenever a
+	// batch of unreachable peers is being tried. EnrollNode is already bounded
+	// by the peer runtime's descriptor window.
 	learned := make([]PeerID, 0, len(nodes))
 	for _, node := range nodes {
 		id, err := s.fastSync.peers.EnrollNode(node, now)
@@ -862,7 +901,11 @@ func (s *overlaySubscription) learnFastSyncNodes(
 	}
 
 	if len(learned) == 0 {
-		s.advertisedPeerLearning.Store(false)
+		return
+	}
+
+	// Only the dial loop is single-flight.
+	if !s.advertisedPeerLearning.CompareAndSwap(false, true) {
 		return
 	}
 

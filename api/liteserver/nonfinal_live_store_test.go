@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/liveview"
@@ -1007,4 +1008,61 @@ func testNonfinalStateWithTracedRootRefs(t *testing.T, state *cell.Cell, refsFro
 		t.Fatalf("traced state hash mismatch")
 	}
 	return traced
+}
+
+// The node publishes live block artifacts from the block apply goroutines with
+// background prewarm workers configured, so the query path must be correct
+// while a freshly published block's view is still being prewarmed.
+func TestLiveStoreServesAccountStateWithBackgroundFragmentPrewarm(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x41}, 32)
+	code := cell.BeginCell().EndCell()
+	data := cell.BeginCell().EndCell()
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 4}
+	stateRoot, _ := testMasterStateWithActiveAccount(t, base, accountID, code, data)
+	block, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	blockState := storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot}
+	backing := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(block): testBlockBOC(blockRoot),
+		},
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(block): &blockState,
+		},
+	}
+
+	live := NewLiveStore(backing, liveview.Options{FragmentBuildWorkers: 1})
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     block,
+		Root:      blockRoot,
+		BlockData: testBlockBOC(blockRoot),
+		State:     &blockState,
+	}); err != nil {
+		t.Fatalf("publish live block artifacts: %v", err)
+	}
+	live.SetLiveCurrentState(&storage.CurrentState{Masterchain: blockState})
+
+	srv := testServer(live)
+	state, err := srv.accountState(context.Background(), &block, ton.AccountID{Workchain: masterchainID, ID: accountID}, false)
+	if err != nil {
+		t.Fatalf("get account state while the view is prewarming: %v", err)
+	}
+	if state.State == nil {
+		t.Fatal("account state is empty")
+	}
+
+	// The prewarm still lands, so later queries reuse the published view.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fragments, err := live.BlockFragments(context.Background(), block)
+		if err != nil {
+			t.Fatalf("load block fragments: %v", err)
+		}
+		if fragments != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("block view was never installed")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

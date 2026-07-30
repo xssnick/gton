@@ -509,16 +509,27 @@ func TestFastSyncPeerRuntimeRandomPeers(t *testing.T) {
 		}
 	}
 
-	staleAt := now.Add(fastSyncPeerVersionTTL + time.Second)
-	response, err = runtime.RandomPeers(staleAt, 9)
+	// The two windows are different, as they are upstream. The random draw
+	// tolerates a peer until version+3600 (overlay-peers.cpp:613/:656)...
+	pastIntake := now.Add(fastSyncPeerVersionTTL + time.Second)
+	response, err = runtime.RandomPeers(pastIntake, 9)
 	if err != nil {
-		t.Fatalf("random peers after ttl: %v", err)
+		t.Fatalf("random peers past the intake window: %v", err)
+	}
+	if len(response.Nodes) == 1 {
+		t.Fatal("the draw dropped peers at the intake window, want them retained")
+	}
+
+	// ...while the periodic sweep drops it at overlay_peer_ttl, which is what
+	// update_neighbours does (overlay-peers.cpp:548).
+	if removed := runtime.Prune(pastIntake); removed == 0 {
+		t.Fatal("the sweep kept peers past the intake window")
+	}
+	if response, err = runtime.RandomPeers(pastIntake, 9); err != nil {
+		t.Fatalf("random peers after the sweep: %v", err)
 	}
 	if len(response.Nodes) != 1 {
-		t.Fatalf("stale response node count = %d, want self only", len(response.Nodes))
-	}
-	if removed := runtime.Prune(staleAt); removed != 1 {
-		t.Fatalf("maintenance removed %d nodes, want 1", removed)
+		t.Fatalf("swept response node count = %d, want self only", len(response.Nodes))
 	}
 	counts = runtime.Counts()
 	if counts.Known != 1 ||

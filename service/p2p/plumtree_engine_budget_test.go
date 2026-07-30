@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"testing"
@@ -406,7 +407,7 @@ func TestPlumtreeMemoryBudgetReleasesRemoteFECDecoderAtTerminal(t *testing.T) {
 			PartIndex:    partIndex,
 			TreeIndex:    partIndex + plumtreeFECTreeOffset,
 			Data:         encoder.GenSymbol(uint32(partIndex)),
-			Signature:    []byte{0xf4},
+			Signature:    bytes.Repeat([]byte{0xf4}, ed25519.SignatureSize),
 		}
 		envelope := plumtreeEngineTestFECEnvelope(
 			t,
@@ -521,7 +522,7 @@ func TestPlumtreeMemoryBudgetCloseReleasesState(t *testing.T) {
 		PartIndex:    0,
 		TreeIndex:    plumtreeFECTreeOffset,
 		Data:         encoder.GenSymbol(0),
-		Signature:    []byte{0xa5},
+		Signature:    bytes.Repeat([]byte{0xa5}, ed25519.SignatureSize),
 	}
 	envelope := plumtreeEngineTestFECEnvelope(t, message, 0xa6)
 	if _, err = engine.HandleFEC(
