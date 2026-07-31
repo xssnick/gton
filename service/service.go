@@ -60,8 +60,6 @@ const (
 	nextBlockBootstrapPaceMinDelay = 20 * time.Millisecond
 	nextBlockBootstrapPaceMaxGap   = 30 * time.Second
 	exactBlockDownloadProbePeers   = 4
-	exactBlockDownloadWaitLogDelay = time.Second
-	exactBlockDownloadWaitLogEvery = 2 * time.Second
 	chainBlockDownloadRetries      = 3
 	chainBlockDownloadRetryDelay   = 500 * time.Millisecond
 	nextMasterchainQueueLimit      = 64
@@ -1108,10 +1106,6 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 		return err
 	}
 
-	if s.log.GetLevel() <= zerolog.DebugLevel {
-		s.logSyncedBlockStatsAsync(downloaded, synced.Trigger.Overlay, synced.CatchUp)
-	}
-
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
 		checked, err := s.validateSyncedMasterchainBlock(ctx, verified)
 		if err != nil {
@@ -1148,31 +1142,6 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 	s.prepareShardBlockAheadFromVerified(verified)
 	observation.PrepareDuration = time.Since(prepareStarted)
 	return nil
-}
-
-// logSyncedBlockStatsAsync keeps the debug-only account-blocks walk of
-// StatsFromDownloadedBlock off the serial block processor, where it used to
-// run before consensus checks and prepare on every synced block.
-func (s *Service) logSyncedBlockStatsAsync(downloaded p2p.DownloadedBlock, overlay string, catchUp bool) {
-	s.runAsync(func() {
-		stats, err := StatsFromDownloadedBlock(downloaded)
-		if err != nil {
-			s.log.Debug().
-				Err(err).
-				Str("block", downloaded.BlockRef()).
-				Str("overlay", overlay).
-				Bool("catch_up", catchUp).
-				Msg("failed to collect block stats")
-			return
-		}
-		s.log.Debug().
-			Str("block", downloaded.BlockRef()).
-			Uint32("seqno", downloaded.ID.SeqNo).
-			Str("overlay", overlay).
-			Bool("catch_up", catchUp).
-			Int("transactions", stats.Transactions).
-			Msg("processed synced block")
-	})
 }
 
 func (s *Service) validateSyncedMasterchainBlock(ctx context.Context, block VerifiedBlock) (*checkedMasterchainConsensus, error) {

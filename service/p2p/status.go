@@ -63,6 +63,7 @@ type StatusSnapshot struct {
 	Rebroadcast           []RebroadcastStatusSnapshot
 	Broadcasts            []BroadcastStatusSnapshot
 	BroadcastDrops        []BroadcastDropStatusSnapshot
+	Plumtree              []PlumtreeStatusSnapshot
 }
 
 type OverlayStatusSnapshot struct {
@@ -137,6 +138,21 @@ type BroadcastDropStatusSnapshot struct {
 	Count   uint64
 }
 
+type PlumtreeStatusSnapshot struct {
+	Overlay string
+
+	DirectParts   uint64
+	RecoveryParts uint64
+
+	SimpleMessages      uint64
+	FECMessages         uint64
+	IHaveMessages       uint64
+	PruneMessages       uint64
+	UsefulMessages      uint64
+	StatsPushMessages   uint64
+	RepairQueryMessages uint64
+}
+
 type broadcastStatKey struct {
 	direction string
 	overlay   string
@@ -204,8 +220,51 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	snapshot.Rebroadcast = n.rebroadcastStatusSnapshot()
 	snapshot.Broadcasts = n.broadcastStatusSnapshot()
 	snapshot.BroadcastDrops = n.broadcastDropStatusSnapshot()
+	snapshot.Plumtree = plumtreeStatusSnapshot(subscriptions)
 
 	return snapshot
+}
+
+func plumtreeStatusSnapshot(
+	subscriptions []*overlaySubscription,
+) []PlumtreeStatusSnapshot {
+	byOverlay := make(
+		map[string]*PlumtreeStatusSnapshot,
+		len(subscriptions),
+	)
+	for _, sub := range subscriptions {
+		if sub.plumtree == nil {
+			continue
+		}
+
+		overlay := sub.spec.Name
+		snapshot := byOverlay[overlay]
+		if snapshot == nil {
+			snapshot = &PlumtreeStatusSnapshot{Overlay: overlay}
+			byOverlay[overlay] = snapshot
+		}
+
+		telemetry := sub.plumtree.stats.telemetry.snapshot()
+		snapshot.DirectParts += telemetry.receivedParts[plumtreePartSourceDirect]
+		snapshot.RecoveryParts += telemetry.receivedParts[plumtreePartSourceRecovery]
+		snapshot.SimpleMessages += telemetry.receivedMessages[plumtreeMessageSimple]
+		snapshot.FECMessages += telemetry.receivedMessages[plumtreeMessageFEC]
+		snapshot.IHaveMessages += telemetry.receivedMessages[plumtreeMessageIHave]
+		snapshot.PruneMessages += telemetry.receivedMessages[plumtreeMessagePrune]
+		snapshot.UsefulMessages += telemetry.receivedMessages[plumtreeMessageUseful]
+		snapshot.StatsPushMessages += telemetry.receivedMessages[plumtreeMessageStatsPush]
+		snapshot.RepairQueryMessages += telemetry.receivedMessages[plumtreeMessageRepairQuery]
+	}
+
+	result := make([]PlumtreeStatusSnapshot, 0, len(byOverlay))
+	for _, snapshot := range byOverlay {
+		result = append(result, *snapshot)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Overlay < result[j].Overlay
+	})
+
+	return result
 }
 
 func (n *Node) noteBroadcast(

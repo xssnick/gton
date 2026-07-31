@@ -25,8 +25,35 @@ type quicZeroStatePeerStore struct {
 	data []byte
 }
 
+var (
+	quicMessageEnvelopeBenchmarkHeader quicOverlayHeader
+	quicMessageEnvelopeBenchmarkBody   []byte
+)
+
 func (s *quicZeroStatePeerStore) ZeroState(context.Context, ton.BlockIDExt) ([]byte, error) {
 	return s.data, nil
+}
+
+func BenchmarkParseQUICMessageEnvelopePlain(b *testing.B) {
+	overlayID := testPeerID("quic-message-envelope-benchmark").Bytes()
+	payload, err := tl.Serialize(overlay.Message{Overlay: overlayID}, true)
+	if err != nil {
+		b.Fatalf("serialize overlay message: %v", err)
+	}
+	payload, err = tl.Append(payload, overlay.Ping{}, true)
+	if err != nil {
+		b.Fatalf("serialize message body: %v", err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		quicMessageEnvelopeBenchmarkHeader,
+			quicMessageEnvelopeBenchmarkBody,
+			err = parseQUICMessageEnvelope(payload)
+		if err != nil {
+			b.Fatalf("parse message envelope: %v", err)
+		}
+	}
 }
 
 func TestParseQUICOverlayObject(t *testing.T) {
@@ -236,6 +263,65 @@ func TestHandleQUICQueryChecksFastSyncCertificate(t *testing.T) {
 		),
 	); !errors.Is(err, errQUICOverlayNotFound) {
 		t.Fatalf("empty unknown member certificate error = %v", err)
+	}
+}
+
+func TestParseQUICPlainMessageEnvelope(t *testing.T) {
+	overlayID := testPeerID("quic-plain-message-overlay").Bytes()
+	payload, err := tl.Serialize(overlay.Message{Overlay: overlayID}, true)
+	if err != nil {
+		t.Fatalf("serialize message envelope: %v", err)
+	}
+	payload, err = tl.Append(payload, overlay.Ping{}, true)
+	if err != nil {
+		t.Fatalf("serialize message body: %v", err)
+	}
+
+	header, body, err := parseQUICMessageEnvelope(payload)
+	if err != nil {
+		t.Fatalf("parse plain message: %v", err)
+	}
+	if !bytes.Equal(header.overlay, overlayID) {
+		t.Fatalf("overlay id = %x, want %x", header.overlay, overlayID)
+	}
+	if cap(header.overlay) != PeerIDSize {
+		t.Fatalf("overlay id capacity = %d, want %d", cap(header.overlay), PeerIDSize)
+	}
+	if &header.overlay[0] != &payload[4] {
+		t.Fatal("plain message overlay id does not alias the input")
+	}
+	if &body[0] != &payload[plainOverlayMessageEnvelopeSize] {
+		t.Fatal("plain message body does not alias the input")
+	}
+
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name:    "short overlay id",
+			payload: payload[:plainOverlayMessageEnvelopeSize-1],
+		},
+		{
+			name:    "missing body",
+			payload: payload[:plainOverlayMessageEnvelopeSize],
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotHeader, _, parseErr := parseQUICMessageEnvelope(test.payload)
+			if parseErr == nil {
+				t.Fatal("parse succeeded")
+			}
+			if test.name == "missing body" &&
+				!bytes.Equal(gotHeader.overlay, overlayID) {
+				t.Fatalf(
+					"overlay id on missing body = %x, want %x",
+					gotHeader.overlay,
+					overlayID,
+				)
+			}
+		})
 	}
 }
 

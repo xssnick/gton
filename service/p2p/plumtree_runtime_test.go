@@ -273,6 +273,25 @@ func TestPlumtreeRuntimeDispatchGatesConstructors(t *testing.T) {
 	if _, err = sub.plumtree.processRepairAnswer(ctx, action, []byte{1, 2}); err == nil {
 		t.Fatal("repair dispatch accepted a short answer")
 	}
+
+	if _, err = sub.plumtree.HandleRepairQuery(
+		ctx,
+		from,
+		RepairPlumtreePart{},
+	); err == nil {
+		t.Fatal("invalid repair query was accepted")
+	}
+
+	telemetry := sub.plumtree.stats.telemetry.snapshot()
+	if got := telemetry.receivedMessages[plumtreeMessagePrune]; got != 1 {
+		t.Fatalf("parsed PRUNE messages = %d, want 1", got)
+	}
+	if got := telemetry.receivedMessages[plumtreeMessageRepairQuery]; got != 1 {
+		t.Fatalf("parsed repair queries = %d, want 1", got)
+	}
+	if got := telemetry.receivedMessages[plumtreeMessageSimple]; got != 0 {
+		t.Fatalf("malformed simple messages counted = %d, want 0", got)
+	}
 }
 
 func TestQUICOverlayEnvelopeWrapMessageBodyOwnsOneContiguousWire(t *testing.T) {
@@ -327,5 +346,48 @@ func TestIsPlumtreeBroadcastRecognizesOnlyDirectMessageTypes(t *testing.T) {
 		if _, ok := plumtreeBroadcastConstructor(body); ok {
 			t.Fatalf("non-message body %x was recognized", body)
 		}
+	}
+}
+
+func TestPlumtreeStatusSnapshotAggregatesOverlayTelemetry(t *testing.T) {
+	t.Parallel()
+
+	firstStats := &plumtreeStats{}
+	firstStats.telemetry.notePartReceived(plumtreePartSourceDirect)
+	firstStats.telemetry.noteMessageReceived(plumtreeMessageFEC)
+	firstStats.telemetry.noteMessageReceived(plumtreeMessageIHave)
+
+	secondStats := &plumtreeStats{}
+	secondStats.telemetry.notePartReceived(plumtreePartSourceRecovery)
+	secondStats.telemetry.noteMessageReceived(plumtreeMessageIHave)
+	secondStats.telemetry.noteMessageReceived(plumtreeMessagePrune)
+
+	subscriptions := []*overlaySubscription{
+		{
+			spec:     overlaySpec{Name: "masterchain"},
+			plumtree: &plumtreeRuntime{stats: firstStats},
+		},
+		{
+			spec:     overlaySpec{Name: "masterchain"},
+			plumtree: &plumtreeRuntime{stats: secondStats},
+		},
+		{
+			spec: overlaySpec{Name: "custom"},
+		},
+	}
+
+	snapshot := plumtreeStatusSnapshot(subscriptions)
+	if len(snapshot) != 1 {
+		t.Fatalf("Plumtree overlay snapshots = %d, want 1", len(snapshot))
+	}
+
+	got := snapshot[0]
+	if got.Overlay != "masterchain" ||
+		got.DirectParts != 1 ||
+		got.RecoveryParts != 1 ||
+		got.FECMessages != 1 ||
+		got.IHaveMessages != 2 ||
+		got.PruneMessages != 1 {
+		t.Fatalf("aggregated Plumtree telemetry = %+v", got)
 	}
 }

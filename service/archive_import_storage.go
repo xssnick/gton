@@ -12,8 +12,12 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.Downloaded, splitDepth uint32) (*archiveImportResult, error) {
-	imported, err := loadDownloadedArchive(ctx, downloaded)
+func (s *Service) importArchiveBlocks(ctx context.Context, importer *archive.Importer, downloaded *archive.Downloaded, splitDepth uint32) (*archiveImportResult, error) {
+	if len(downloaded.Data) == 0 {
+		return nil, fmt.Errorf("import archive: empty downloaded archive data")
+	}
+
+	imported, err := importer.ImportBytes(ctx, downloaded, downloaded.Data)
 	if err != nil {
 		return nil, err
 	}
@@ -23,18 +27,6 @@ func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.D
 	}
 	s.observeImportedArchiveBlocksReceived(ctx, imported, result)
 	return result, nil
-}
-
-func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) (*archive.Imported, error) {
-	if len(downloaded.Data) == 0 {
-		return nil, fmt.Errorf("import archive: empty downloaded archive data")
-	}
-
-	imported, err := archive.ImportBytes(ctx, downloaded, downloaded.Data)
-	if err != nil {
-		return nil, err
-	}
-	return imported, nil
 }
 
 func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, imported *archive.Imported, result *archiveImportResult) {

@@ -172,10 +172,10 @@ func testGatedDecodeNode(t *testing.T, seqno uint32) (*Node, *overlaySubscriptio
 	return node, sub, verifier, provider, msg, block
 }
 
-// The decode job is enqueued before the transport thread joins the concurrent
-// signature check, so the multi-MB decode overlaps the ed25519 pass instead of
-// waiting it out.
-func TestFullBlockBroadcastDecodeStartsBeforeSignatureJoin(t *testing.T) {
+// The decode is reached only by a signature-verified payload: while the check
+// is gated no worker may touch the multi-MB payload, so a replayed broadcast
+// cannot buy decode capacity.
+func TestFullBlockBroadcastDecodeWaitsForSignatureCheck(t *testing.T) {
 	node, sub, verifier, provider, msg, block := testGatedDecodeNode(t, 214)
 	payload, err := tl.Serialize(msg, true)
 	if err != nil {
@@ -187,14 +187,12 @@ func TestFullBlockBroadcastDecodeStartsBeforeSignatureJoin(t *testing.T) {
 		dispositions <- sub.handleOverlayBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("source"))
 	}()
 
-	// the pool worker reaches the previous-state fetch inside the decode while
-	// the signature check is still gated
 	select {
 	case <-provider.called:
+		t.Fatal("decode started while the signature check was still in flight")
 	case disposition := <-dispositions:
 		t.Fatalf("classification finished before the signature check resolved: %v", disposition)
-	case <-time.After(5 * time.Second):
-		t.Fatal("decode did not start while the signature check was in flight")
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	close(verifier.release)
@@ -206,6 +204,12 @@ func TestFullBlockBroadcastDecodeStartsBeforeSignatureJoin(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("classification did not finish after the signature release")
+	}
+
+	select {
+	case <-provider.called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("decode did not start after the signatures were verified")
 	}
 
 	eventCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -222,12 +226,12 @@ func TestFullBlockBroadcastDecodeStartsBeforeSignatureJoin(t *testing.T) {
 	}
 }
 
-// A signature failure that resolves after the decode was enqueued must keep
-// all drop bookkeeping on the transport thread while the worker discards its
-// decode silently: no event, no decode cache entry, relay suppressed.
-func TestFullBlockBroadcastSignatureFailureAfterDecodeDropsSilently(t *testing.T) {
+// A failed signature check must cost nothing past the check itself: no decode
+// job, no event, no decode cache entry, relay suppressed, and the drop
+// bookkeeping recorded exactly once.
+func TestFullBlockBroadcastSignatureFailureSkipsDecode(t *testing.T) {
 	node, sub, verifier, provider, msg, block := testGatedDecodeNode(t, 215)
-	observer := newAwaitingBroadcastPipelineObserver(broadcastPipelineStageDecodeAsync, broadcastPipelineResultDrop)
+	observer := newAwaitingBroadcastPipelineObserver(broadcastPipelineStageBlockSigCheck, broadcastPipelineResultError)
 	node.SetBroadcastPipelineObserver(observer)
 	relayTarget := testRebroadcastQueuePeer("relay-target")
 	sub.peers = map[PeerID]*overlayPeer{relayTarget.id: relayTarget}
@@ -243,12 +247,6 @@ func TestFullBlockBroadcastSignatureFailureAfterDecodeDropsSilently(t *testing.T
 		dispositions <- sub.handleOverlayBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("source"))
 	}()
 
-	select {
-	case <-provider.called:
-	case <-time.After(5 * time.Second):
-		t.Fatal("decode did not start while the signature check was in flight")
-	}
-
 	verifier.release <- errors.New("bad signatures")
 
 	select {
@@ -260,10 +258,21 @@ func TestFullBlockBroadcastSignatureFailureAfterDecodeDropsSilently(t *testing.T
 		t.Fatal("classification did not finish after the signature release")
 	}
 
-	// join the worker: it records the decode as dropped once it sees the failed
-	// signature outcome
+	// the failed check is accounted as its own stage, not as a wasted decode
 	observer.waitAwaited(t)
 
+	select {
+	case <-provider.called:
+		t.Fatal("unverified broadcast reached the payload decode")
+	default:
+	}
+	for _, result := range []string{broadcastPipelineResultSuccess, broadcastPipelineResultError, broadcastPipelineResultMiss, broadcastPipelineResultDrop} {
+		for _, stage := range []string{broadcastPipelineStageDecodeAsync, broadcastPipelineStageDecodeInline} {
+			if got := observer.count(stage, result); got != 0 {
+				t.Fatalf("unverified broadcast produced %d %s/%s decode samples", got, stage, result)
+			}
+		}
+	}
 	if _, _, err := node.decodedBroadcasts.get("tonNode.blockBroadcastCompressedV2", block); err == nil {
 		t.Fatal("unverified decode was cached")
 	}
@@ -273,19 +282,15 @@ func TestFullBlockBroadcastSignatureFailureAfterDecodeDropsSilently(t *testing.T
 	if _, ok := relayTarget.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("unverified broadcast reached the app-level relay queue")
 	}
-	if observer.count(broadcastPipelineStageDecodeAsync, broadcastPipelineResultSuccess) != 0 {
-		t.Fatal("dropped decode was also accounted as a success")
-	}
 
-	// the transport thread is the single owner of the drop bookkeeping: the
-	// worker must not repeat the drop metric under any reason, and the
+	// the drop bookkeeping is recorded once, under one reason, and the
 	// permanent failure keeps the fingerprint deduped
 	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.blockBroadcastCompressedV2", "signature_check_failed"); got != 1 {
 		t.Fatalf("signature drop count = %d, want 1", got)
 	}
 	for _, reason := range []string{"decode_failed", "state_artifact_missing", "broadcast_admission_closed", "seen"} {
 		if got := testBroadcastDropStatCount(node, "basechain", "tonNode.blockBroadcastCompressedV2", reason); got != 0 {
-			t.Fatalf("decode worker repeated drop bookkeeping as %q: count = %d", reason, got)
+			t.Fatalf("unverified broadcast recorded an unexpected drop reason %q: count = %d", reason, got)
 		}
 	}
 	if !node.deduper.Seen(fingerprint, time.Now()) {

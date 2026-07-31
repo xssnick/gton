@@ -800,7 +800,7 @@ func (r *archiveCatchUpRunner) downloadArchiveFile(ctx context.Context, masterch
 }
 
 func (r *archiveCatchUpRunner) prepareArchiveDownload(ctx context.Context, masterchainSeqno uint32, shard archive.ShardID, splitDepth uint32, downloaded *archive.Downloaded) (*archiveImportResult, error) {
-	imported, err := r.service.importArchiveBlocks(ctx, downloaded, splitDepth)
+	imported, err := r.service.importArchiveBlocks(ctx, r.archiveImporter, downloaded, splitDepth)
 	if err != nil {
 		return nil, fmt.Errorf("import archive #%d %s: %w", masterchainSeqno, shard.String(), err)
 	}

@@ -101,15 +101,21 @@ func TestPlumtreeEngineSimpleRepairRelayAndDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handle first IHAVE: %v", err)
 	}
-	if len(actions.Repairs) != 1 {
-		t.Fatalf("repair actions = %d, want 1", len(actions.Repairs))
+	repairs := plumtreeEngineTestStartRepairs(
+		t,
+		engine,
+		now,
+		actions.Candidates,
+	)
+	if len(repairs) != 1 {
+		t.Fatalf("repair actions = %d, want 1", len(repairs))
 	}
 
 	firstEnvelope := plumtreeEngineTestSimpleEnvelope(t, firstMessage, 0xa1)
 	actions, err = engine.HandleRepairSimple(
 		t.Context(),
 		now,
-		actions.Repairs[0].ID,
+		repairs[0].ID,
 		firstEnvelope,
 	)
 	if err != nil {
@@ -498,19 +504,21 @@ func TestPlumtreeEngineFECDecodesRaptorQThirtyOfFortyFive(t *testing.T) {
 		if handleErr != nil {
 			t.Fatalf("handle FEC IHAVE part %d: %v", partIndex, handleErr)
 		}
-		if len(repairActions.Repairs) != 1 {
-			t.Fatalf(
-				"part %d repair actions = %d, want 1",
-				partIndex,
-				len(repairActions.Repairs),
-			)
+		repairs := plumtreeEngineTestStartRepairs(
+			t,
+			engine,
+			now,
+			repairActions.Candidates,
+		)
+		if len(repairs) != 1 {
+			t.Fatalf("part %d repair actions = %d, want 1", partIndex, len(repairs))
 		}
 
 		envelope := plumtreeEngineTestFECEnvelope(t, message, byte(partIndex))
 		actions, handleErr := engine.HandleRepairFEC(
 			t.Context(),
 			now,
-			repairActions.Repairs[0].ID,
+			repairs[0].ID,
 			envelope,
 		)
 		if handleErr != nil {
@@ -528,6 +536,14 @@ func TestPlumtreeEngineFECDecodesRaptorQThirtyOfFortyFive(t *testing.T) {
 	}
 	if partsUsed > int(plumtreeFECTotalParts) {
 		t.Fatalf("decoded after %d parts, limit is %d", partsUsed, plumtreeFECTotalParts)
+	}
+
+	telemetry := engine.stats.telemetry.snapshot()
+	if got := telemetry.receivedParts[plumtreePartSourceDirect]; got != 0 {
+		t.Fatalf("direct FEC parts = %d, want 0", got)
+	}
+	if got := telemetry.receivedParts[plumtreePartSourceRecovery]; got != uint64(partsUsed) {
+		t.Fatalf("recovery FEC parts = %d, want %d", got, partsUsed)
 	}
 }
 
@@ -551,10 +567,9 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 	broadcastID := plumtreeEngineTestID(23)
 	source := plumtreeEngineTestSource(0x53)
 	dataHash := sha256.Sum256([]byte{1})
-	// A deferred announcement only gets a repair deadline once we hold verified
-	// state for its broadcast; that is what decides the part is genuinely wanted.
-	// Part 1 is present, part 0 is the one being announced.
-	missingKey := plumtreeFECPartKey(broadcastID, 0)
+	// A verified part proves the broadcast, so every announcement below is taken
+	// on trust. Part 1 is present, part 0 is the one being announced.
+	missingKey := plumtreePartKey{broadcastID: broadcastID, partIndex: 0, treeIndex: 1}
 	engine.mu.Lock()
 	state := &plumtreeFECState{broadcastID: broadcastID, firstSeen: now}
 	state.parts[1] = &plumtreePartState{partIndex: 1, treeIndex: 2}
@@ -583,12 +598,10 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handle target %d: %v", i, err)
 		}
-		if len(actions.Repairs) != 0 {
-			t.Fatalf("target %d repaired before delay", i)
-		}
+		_ = actions
 	}
-	// With an eager peer on the part's tree the payload is expected to be pushed,
-	// so the announcements are buffered and none of them costs a verification.
+	// The broadcast is proven by the part we hold, so none of the announcements
+	// costs a verification.
 	if verifier.calls.Load() != 0 {
 		t.Fatalf("verifier calls = %d, want 0 for deferred announcements", verifier.calls.Load())
 	}
@@ -617,20 +630,21 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 		t.Fatalf("candidates handed out twice: %d", len(again.Candidates))
 	}
 
+	// A verified candidate is refused while the active-repair budget is full, and
+	// admitted once a slot frees up.
+	candidate := plumtreeRepairCandidate{
+		Key:      plumtreePartKey{broadcastID: broadcastID, partIndex: 2, treeIndex: 3},
+		Peer:     plumtreeEngineTestPeer(99),
+		DataSize: 1,
+	}
 	engine.mu.Lock()
-	var dropped plumtreeMissingPart
-	dropped.dataSize = 1
-	dropped.targetCount = 1
-	dropped.targets[0] = plumtreeEngineTestPeer(99)
 	for len(engine.repairs) < plumtreeActiveRepairLimit {
 		engine.nextRepairID++
 		engine.repairs[engine.nextRepairID] = plumtreeRepairAttempt{}
 	}
-	var cappedActions plumtreeActions
-	engine.startRepairRequestsLocked(now, &dropped, &cappedActions)
 	engine.mu.Unlock()
-	if len(cappedActions.Repairs) != 0 || dropped.sentTargets != 1 {
-		t.Fatal("active-cap target was not consumed without a query")
+	if _, ok := engine.StartVerifiedRepair(now, candidate); ok {
+		t.Fatal("repair started past the active-repair cap")
 	}
 
 	engine.mu.Lock()
@@ -638,10 +652,9 @@ func TestPlumtreeEngineRepairDelayTargetsAndActiveCap(t *testing.T) {
 		delete(engine.repairs, id)
 		break
 	}
-	engine.startRepairRequestsLocked(now, &dropped, &cappedActions)
 	engine.mu.Unlock()
-	if len(cappedActions.Repairs) != 0 {
-		t.Fatal("consumed target retried after capacity became available")
+	if _, ok := engine.StartVerifiedRepair(now, candidate); !ok {
+		t.Fatal("repair refused after capacity became available")
 	}
 }
 
@@ -863,9 +876,7 @@ func TestPlumtreeEngineMissingPartFIFOIsBounded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handle IHAVE %d: %v", i, err)
 		}
-		if len(actions.Repairs) != 0 {
-			t.Fatalf("IHAVE %d started an immediate repair", i)
-		}
+		_ = actions
 	}
 
 	firstKey := plumtreePartKey{
@@ -880,10 +891,17 @@ func TestPlumtreeEngineMissingPartFIFOIsBounded(t *testing.T) {
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	// Unverified announcements never reach e.missing; they live in the announcing
-	// peer's own bounded queue, where its own oldest entry is what gets evicted.
-	if len(engine.missing) != 0 {
-		t.Fatalf("unverified announcements created %d missing parts", len(engine.missing))
+	// A peer's own oldest entry is what its overflow evicts, and evicting the last
+	// announcer of a part takes the part with it.
+	if len(engine.missing) != plumtreeAnnouncementPeerLimit {
+		t.Fatalf(
+			"missing parts = %d, want one per surviving announcement (%d)",
+			len(engine.missing),
+			plumtreeAnnouncementPeerLimit,
+		)
+	}
+	if engine.missing[firstKey] != nil {
+		t.Fatal("the evicted announcement left its part behind with nobody to ask")
 	}
 	queue := engine.announcements[from]
 	if queue == nil || queue.count != plumtreeAnnouncementPeerLimit {
@@ -1042,6 +1060,14 @@ func TestPlumtreeEngineConcurrentFECDecoderCreatedAtCommit(t *testing.T) {
 		if err := <-results; err != nil {
 			t.Fatalf("handle concurrent FEC part: %v", err)
 		}
+	}
+
+	telemetry := engine.stats.telemetry.snapshot()
+	if got := telemetry.receivedParts[plumtreePartSourceDirect]; got != concurrentParts {
+		t.Fatalf("direct FEC parts = %d, want %d", got, concurrentParts)
+	}
+	if got := telemetry.receivedParts[plumtreePartSourceRecovery]; got != 0 {
+		t.Fatalf("recovery FEC parts = %d, want 0", got)
 	}
 
 	var heapGrowth uint64
@@ -1473,4 +1499,39 @@ func plumtreeEngineTestWaitForFECCommitLock(t *testing.T, want int) {
 		runtime.Gosched()
 	}
 	t.Fatalf("%d concurrent FEC handlers did not reach the commit lock", want)
+}
+
+// Drives one repair round the way plumtreeRuntime does: drain the deadline,
+// then turn each candidate into a query. The test verifier accepts everything,
+// so this stands in for the off-lock signature check.
+func plumtreeEngineTestDrainRepairs(
+	t *testing.T,
+	engine *plumtreeEngine,
+	now time.Time,
+) []plumtreeRepairAction {
+	t.Helper()
+
+	return plumtreeEngineTestStartRepairs(
+		t,
+		engine,
+		now,
+		engine.Alarm(now).Candidates,
+	)
+}
+
+func plumtreeEngineTestStartRepairs(
+	t *testing.T,
+	engine *plumtreeEngine,
+	now time.Time,
+	candidates []plumtreeRepairCandidate,
+) []plumtreeRepairAction {
+	t.Helper()
+
+	var repairs []plumtreeRepairAction
+	for _, candidate := range candidates {
+		if action, ok := engine.StartVerifiedRepair(now, candidate); ok {
+			repairs = append(repairs, action)
+		}
+	}
+	return repairs
 }

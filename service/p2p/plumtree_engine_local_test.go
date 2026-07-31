@@ -88,7 +88,7 @@ func TestPlumtreeEngineOriginateSimpleSignsRetainsAndFansOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("originate simple: %v", err)
 	}
-	if len(actions.Deliveries) != 0 || len(actions.Repairs) != 0 {
+	if len(actions.Deliveries) != 0 || len(actions.Candidates) != 0 {
 		t.Fatalf("unexpected local simple actions: %+v", actions)
 	}
 	if len(actions.Outbounds) != 1 {
@@ -256,7 +256,7 @@ func TestPlumtreeEngineOriginateFECMatchesRaptorQAndRepairWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("originate FEC: %v", err)
 	}
-	if len(actions.Deliveries) != 0 || len(actions.Repairs) != 0 {
+	if len(actions.Deliveries) != 0 || len(actions.Candidates) != 0 {
 		t.Fatalf("unexpected local FEC actions: %+v", actions)
 	}
 	if len(actions.Outbounds) != int(plumtreeFECTotalParts)*len(peers.active) {

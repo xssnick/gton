@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,6 +82,57 @@ type plumtreeStatsSnapshot struct {
 	usefulAverageMS    int32
 	usefulMaximumMS    int32
 	usefulP99MS        int32
+}
+
+type plumtreePartSource uint8
+
+const (
+	plumtreePartSourceDirect plumtreePartSource = iota
+	plumtreePartSourceRecovery
+	plumtreePartSourceCount
+)
+
+type plumtreeMessageKind uint8
+
+const (
+	plumtreeMessageSimple plumtreeMessageKind = iota
+	plumtreeMessageFEC
+	plumtreeMessageIHave
+	plumtreeMessagePrune
+	plumtreeMessageUseful
+	plumtreeMessageStatsPush
+	plumtreeMessageRepairQuery
+	plumtreeMessageKindCount
+)
+
+type plumtreeTelemetry struct {
+	receivedParts    [plumtreePartSourceCount]atomic.Uint64
+	receivedMessages [plumtreeMessageKindCount]atomic.Uint64
+}
+
+type plumtreeTelemetrySnapshot struct {
+	receivedParts    [plumtreePartSourceCount]uint64
+	receivedMessages [plumtreeMessageKindCount]uint64
+}
+
+func (t *plumtreeTelemetry) notePartReceived(source plumtreePartSource) {
+	t.receivedParts[source].Add(1)
+}
+
+func (t *plumtreeTelemetry) noteMessageReceived(kind plumtreeMessageKind) {
+	t.receivedMessages[kind].Add(1)
+}
+
+func (t *plumtreeTelemetry) snapshot() plumtreeTelemetrySnapshot {
+	var snapshot plumtreeTelemetrySnapshot
+	for source := range plumtreePartSourceCount {
+		snapshot.receivedParts[source] = t.receivedParts[source].Load()
+	}
+	for kind := range plumtreeMessageKindCount {
+		snapshot.receivedMessages[kind] = t.receivedMessages[kind].Load()
+	}
+
+	return snapshot
 }
 
 type plumtreeStatsCounters struct {
@@ -198,6 +250,10 @@ type plumtreeStats struct {
 
 	counters plumtreeStatsCounters
 	epoch    plumtreeStatsEpoch
+
+	// These counters sit outside the hourly protocol-statistics lock. Plumtree
+	// receive paths only pay one fixed atomic increment per observed event.
+	telemetry plumtreeTelemetry
 }
 
 func (s *plumtreeStats) NoteDeliveredBroadcast() {

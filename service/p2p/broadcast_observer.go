@@ -7,6 +7,7 @@ const (
 	broadcastPipelineStageClassify          = "classify"
 	broadcastPipelineStageCandidateDecode   = "candidate_decode"
 	broadcastPipelineStageShardDescValidate = "shard_desc_validate"
+	broadcastPipelineStageBlockSigCheck     = "block_broadcast_signature_check"
 	broadcastPipelineStageFinalitySigCheck  = "block_finality_signature_check"
 	broadcastPipelineStageFinalityAssemble  = "block_finality_assemble"
 	broadcastPipelineStageHotCacheNotify    = "hot_cache_notify"

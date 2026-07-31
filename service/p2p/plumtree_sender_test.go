@@ -88,6 +88,9 @@ func TestPlumtreeOutboundQueuePreservesPerPeerOrder(t *testing.T) {
 	if len(queue.peers) != 0 {
 		t.Fatalf("peer queue retained %d idle peers", len(queue.peers))
 	}
+	if queue.size != 0 {
+		t.Fatalf("peer queue retained size %d, want 0", queue.size)
+	}
 }
 
 func TestPlumtreeOutboundQueueBoundsStalledPeer(t *testing.T) {
@@ -115,6 +118,87 @@ func TestPlumtreeOutboundQueueBoundsStalledPeer(t *testing.T) {
 			peer,
 			plumtreeOutboundPerPeerLimit,
 		)
+	}
+	if dropped := queue.add(plumtreeWireBatch{
+		sends: []plumtreeWireSend{{
+			to:   peer,
+			wire: []byte{0xff},
+		}},
+	}); dropped != 1 {
+		t.Fatalf("dropped behind full in-flight batch = %d, want 1", dropped)
+	}
+
+	queue.finish(peer)
+	if dropped := queue.add(plumtreeWireBatch{
+		sends: []plumtreeWireSend{{
+			to:   peer,
+			wire: []byte{0xff},
+		}},
+	}); dropped != 0 {
+		t.Fatalf("message dropped after in-flight batch finished = %d, want 0", dropped)
+	}
+}
+
+func TestPlumtreeOutboundQueueBoundsPeerChurn(t *testing.T) {
+	sends := make([]plumtreeWireSend, plumtreeOutboundQueueLimit+1)
+	for index := range sends {
+		var peer PeerID
+		peer[0] = byte(index)
+		peer[1] = byte(index >> 8)
+		sends[index] = plumtreeWireSend{
+			to:   peer,
+			wire: []byte{byte(index)},
+		}
+	}
+
+	queue := newPlumtreeOutboundQueue()
+	if dropped := queue.add(plumtreeWireBatch{sends: sends}); dropped != 1 {
+		t.Fatalf("dropped messages = %d, want 1", dropped)
+	}
+	if queue.size != plumtreeOutboundQueueLimit {
+		t.Fatalf(
+			"queued messages = %d, want %d",
+			queue.size,
+			plumtreeOutboundQueueLimit,
+		)
+	}
+}
+
+func TestPlumtreeOutboundWorkerReusesAndStops(t *testing.T) {
+	node := newTestNode(t)
+	runtime := &plumtreeRuntime{
+		sub: &overlaySubscription{
+			node:  node,
+			log:   discardLogger(),
+			peers: map[PeerID]*overlayPeer{},
+		},
+	}
+	jobs := make(chan plumtreeOutboundJob)
+	done := make(chan PeerID, 2)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	exited := make(chan struct{})
+	go func() {
+		runtime.runOutboundWorker(ctx, jobs, done)
+		close(exited)
+	}()
+
+	for index := byte(1); index <= 2; index++ {
+		peer := plumtreeEngineTestPeer(index)
+		jobs <- plumtreeOutboundJob{
+			peer:  peer,
+			wires: [][]byte{{index}},
+		}
+		if completed := <-done; completed != peer {
+			t.Fatalf("completed peer = %v, want %v", completed, peer)
+		}
+	}
+
+	cancel()
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("outbound worker did not stop after parent cancellation")
 	}
 }
 

@@ -23,6 +23,11 @@ const (
 	// corresponding per-overlay concurrency bound in Go.
 	plumtreeOutboundParallelism = plumtreeActiveNeighbourLimit
 
+	// Bound all queued and in-flight messages even when peer IDs churn. The
+	// per-peer limit alone cannot cap the queue's map cardinality.
+	plumtreeOutboundQueueLimit = plumtreeOutboundParallelism *
+		plumtreeOutboundPerPeerLimit
+
 	// Stalled peers can reject every FEC part in a burst. Aggregate those
 	// expected resource-policy drops instead of writing one debug line per part.
 	plumtreeOutboundDropLogInterval = 30 * time.Second
@@ -41,10 +46,16 @@ type plumtreeWireBatch struct {
 	sends []plumtreeWireSend
 }
 
+type plumtreeOutboundJob struct {
+	peer  PeerID
+	wires [][]byte
+}
+
 type plumtreePeerOutbound struct {
-	pending [][]byte
-	active  bool
-	ready   bool
+	pending    [][]byte
+	active     bool
+	activeSize int
+	ready      bool
 }
 
 // plumtreeOutboundQueue is owned by one runtime loop. It preserves order for
@@ -53,6 +64,7 @@ type plumtreeOutboundQueue struct {
 	peers     map[PeerID]plumtreePeerOutbound
 	ready     []PeerID
 	readyHead int
+	size      int
 }
 
 func newPlumtreeOutboundQueue() plumtreeOutboundQueue {
@@ -65,12 +77,15 @@ func (q *plumtreeOutboundQueue) add(batch plumtreeWireBatch) int {
 	dropped := 0
 	for _, send := range batch.sends {
 		state := q.peers[send.to]
-		if len(state.pending) >= plumtreeOutboundPerPeerLimit {
+		if q.size >= plumtreeOutboundQueueLimit ||
+			len(state.pending)+state.activeSize >=
+				plumtreeOutboundPerPeerLimit {
 			dropped++
 			continue
 		}
 
 		state.pending = append(state.pending, send.wire)
+		q.size++
 		if !state.active && !state.ready {
 			state.ready = true
 			q.ready = append(q.ready, send.to)
@@ -98,6 +113,7 @@ func (q *plumtreeOutboundQueue) take() (PeerID, [][]byte, bool) {
 		sends := state.pending
 		state.pending = nil
 		state.active = true
+		state.activeSize = len(sends)
 		q.peers[peer] = state
 		q.compactReady()
 		return peer, sends, true
@@ -114,6 +130,8 @@ func (q *plumtreeOutboundQueue) finish(peer PeerID) {
 	}
 
 	state.active = false
+	q.size -= state.activeSize
+	state.activeSize = 0
 	if len(state.pending) == 0 {
 		delete(q.peers, peer)
 		return
@@ -204,24 +222,8 @@ func (r *plumtreeRuntime) enqueueOutbounds(batch plumtreeWireBatch) {
 	}
 }
 
-func (r *plumtreeRuntime) startOutboundSend(
-	ctx context.Context,
-	done chan<- PeerID,
-	peerID PeerID,
-	wires [][]byte,
-) {
-	r.sub.node.runAsync(func() {
-		r.sendOutboundBatch(ctx, peerID, wires)
-
-		select {
-		case done <- peerID:
-		case <-ctx.Done():
-		}
-	})
-}
-
 func (r *plumtreeRuntime) sendOutboundBatch(
-	parent context.Context,
+	ctx context.Context,
 	peerID PeerID,
 	wires [][]byte,
 ) {
@@ -233,9 +235,6 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(parent, plumtreeOutboundTimeout)
-	defer cancel()
-
 	peer, err := path.dialGated(ctx)
 	if err == nil {
 		for _, wire := range wires {
@@ -245,7 +244,7 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 			}
 		}
 	}
-	if err == nil || parent.Err() != nil {
+	if err == nil || ctx.Err() != nil {
 		return
 	}
 	if errors.Is(err, errQUICDialDeferred) {
@@ -255,4 +254,59 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 		Err(fmt.Errorf("send Plumtree message: %w", err)).
 		Str("peer_id", peerID.String()).
 		Msg("failed to send Plumtree messages")
+}
+
+func (r *plumtreeRuntime) runOutboundWorker(
+	parent context.Context,
+	jobs <-chan plumtreeOutboundJob,
+	done chan<- PeerID,
+) {
+	var sendCtx context.Context
+	var cancel context.CancelFunc
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
+
+	for {
+		var job plumtreeOutboundJob
+		var ok bool
+		select {
+		case <-parent.Done():
+			return
+		case job, ok = <-jobs:
+			if !ok {
+				return
+			}
+		}
+
+		renewWindow := sendCtx == nil
+		if !renewWindow {
+			deadline, hasDeadline := sendCtx.Deadline()
+			renewWindow = !hasDeadline ||
+				sendCtx.Err() != nil ||
+				time.Until(deadline) < plumtreeOutboundTimeout/2
+		}
+		if renewWindow {
+			if cancel != nil {
+				cancel()
+			}
+			// Plumtree fanout is best-effort. Sharing one deadline window
+			// across consecutive jobs keeps every send bounded to 2.5-5s
+			// without allocating a timer and context for every peer batch.
+			sendCtx, cancel = context.WithTimeout(
+				parent,
+				plumtreeOutboundTimeout,
+			)
+		}
+
+		r.sendOutboundBatch(sendCtx, job.peer, job.wires)
+
+		select {
+		case done <- job.peer:
+		case <-parent.Done():
+			return
+		}
+	}
 }

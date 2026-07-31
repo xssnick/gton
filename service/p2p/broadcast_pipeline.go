@@ -430,7 +430,7 @@ func (s *overlaySubscription) classifyFullBlockBroadcast(
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 		return ignoredBroadcastResult(), nil
 	}
-	if s.node.alreadyAppliedMasterchainBroadcast(block) {
+	if s.node.alreadyAppliedBroadcast(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
 		return ignoredBroadcastResult(), nil
 	}
@@ -460,7 +460,7 @@ func (s *overlaySubscription) classifyBlockCandidateBroadcast(
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 		return ignoredBroadcastResult(), nil
 	}
-	if s.node.alreadyAppliedMasterchainBroadcast(block) {
+	if s.node.alreadyAppliedBroadcast(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
 		return ignoredBroadcastResult(), nil
 	}
@@ -489,7 +489,7 @@ func (s *overlaySubscription) classifyBlockFinalityBroadcast(
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 		return ignoredBroadcastResult(), nil
 	}
-	if s.node.alreadyAppliedMasterchainBroadcast(block) {
+	if s.node.alreadyAppliedBroadcast(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
 		return ignoredBroadcastResult(), nil
 	}
@@ -671,44 +671,6 @@ func (s *overlaySubscription) blockFinalityBroadcastEvents(delivery Delivery, tr
 	return events
 }
 
-// broadcastSignatureJoin publishes one in-flight validator-signature check to
-// both of its consumers: the transport thread joins it to gate the relay/trust
-// decision, and the decode worker joins it before publishing anything the
-// decode produced. finish must be called exactly once.
-type broadcastSignatureJoin struct {
-	done chan struct{}
-	err  error
-}
-
-func newBroadcastSignatureJoin() *broadcastSignatureJoin {
-	return &broadcastSignatureJoin{done: make(chan struct{})}
-}
-
-func (j *broadcastSignatureJoin) finish(err error) {
-	j.err = err
-	close(j.done)
-}
-
-func (j *broadcastSignatureJoin) wait() error {
-	<-j.done
-	return j.err
-}
-
-// failed reports an outcome that is already known to be a failure. It never
-// blocks: overlapping the decode with a check still in flight is the point, so
-// an unresolved check reports false and the caller joins it after decoding.
-func (j *broadcastSignatureJoin) failed() bool {
-	if j == nil {
-		return false
-	}
-	select {
-	case <-j.done:
-		return j.err != nil
-	default:
-		return false
-	}
-}
-
 func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID, msg any, payload *broadcastPayload, peer *overlayPeer) (broadcastResult, error) {
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
@@ -734,14 +696,23 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	proofRoot := predecodedSignatureCheck.proofRoot
 	preSigSet := predecodedSignatureCheck.signatureSet
 
-	// the validator-signature pass only needs the parsed proof root and the
-	// signature set, so it runs concurrently with the expensive block decode
-	var sigJoin *broadcastSignatureJoin
+	// Nothing expensive may run on an unverified payload: the signature pass
+	// needs only the proof root and the signature set parsed above, so it goes
+	// first and the decode below is reached by verified broadcasts alone. This
+	// is the reference ordering — process_broadcast(blockBroadcastCompressedV2)
+	// gates obtain_state_for_decompression on validate_block_broadcast_signatures
+	// — and it is what keeps a replayed payload from buying a decode worker.
 	if signaturesChecked {
-		sigJoin = newBroadcastSignatureJoin()
-		go func() {
-			sigJoin.finish(s.node.checkBlockBroadcastSignatures(kind, block, proofRoot, preSigSet))
-		}()
+		checkStarted := s.node.startBroadcastPipelineStage()
+		sigErr := s.node.checkBlockBroadcastSignatures(kind, block, proofRoot, preSigSet)
+		checkResult := broadcastPipelineResultSuccess
+		if sigErr != nil {
+			checkResult = broadcastPipelineResultError
+		}
+		s.node.observeBroadcastPipelineStageSince(checkStarted, broadcastPipelineStageBlockSigCheck, kind, delivery, checkResult)
+		if sigErr != nil {
+			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
+		}
 	}
 
 	// the same block arrives once per delivery path (public FEC + custom
@@ -765,14 +736,9 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		}
 	}
 
-	// kinds whose signatures are already verified concurrently can leave the
-	// expensive decode to the bounded pool. The decode is enqueued before the
-	// signature join so the multi-MB decode overlaps the ed25519 pass; the
-	// worker joins sigJoin before publishing anything it decoded, while the
-	// join below keeps the trust gate on this thread (a failure still
-	// suppresses FEC relay), and a nil return right after lets the overlay
-	// relay the hash-verified, signature-verified payload without waiting out
-	// the decode
+	// kinds whose signatures are verified above can leave the expensive decode
+	// to the bounded pool and return right away, so the overlay relays the
+	// hash-verified, signature-verified payload without waiting out the decode
 	var rebroadcast *rebroadcastRequest
 	if !cached && signaturesChecked {
 		var rbErr error
@@ -793,14 +759,8 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			msg:          msg,
 			proofRoot:    proofRoot,
 			preSigSet:    preSigSet,
-			sigJoin:      sigJoin,
 			rebroadcast:  rebroadcast,
 		}) {
-			// a failed join owns the drop bookkeeping (dedupe forget + drop
-			// metric); the worker then discards its decode silently
-			if sigErr := sigJoin.wait(); sigErr != nil {
-				return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
-			}
 			// the ack counts as "accepted" for relay purposes even though the
 			// decode may still fail on the pool (mirrors the reference node,
 			// which relays after signature validation, not after decode);
@@ -821,12 +781,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			}
 			return acceptedBroadcastResult(accepted), nil
 		}
-		// pool refused: the decode below runs inline on this thread, so join
-		// the signature outcome first and keep the drop-before-decode ordering
-		if sigErr := sigJoin.wait(); sigErr != nil {
-			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
-		}
-		sigJoin = nil
+		// pool refused: the decode below runs inline on this thread
 	}
 
 	if !cached {
@@ -849,11 +804,6 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		// deliveries never read the cache anyway — cache only verified kinds
 		if err == nil && signaturesChecked {
 			s.node.decodedBroadcasts.put(kind, block, downloaded, sigSet)
-		}
-	}
-	if sigJoin != nil {
-		if sigErr := sigJoin.wait(); sigErr != nil {
-			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
 		}
 	}
 	if err != nil {
@@ -943,7 +893,15 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		return ignoredBroadcastResult(), nil
 	}
 	if !signaturesChecked {
+		// v1 compressed payloads carry their signatures inside the payload, so
+		// this kind alone pays the decode before it can be verified
+		checkStarted := s.node.startBroadcastPipelineStage()
 		err = s.node.checkBlockBroadcastSignatures(kind, block, downloaded.Proof, sigSet)
+		checkResult := broadcastPipelineResultSuccess
+		if err != nil {
+			checkResult = broadcastPipelineResultError
+		}
+		s.node.observeBroadcastPipelineStageSince(checkStarted, broadcastPipelineStageBlockSigCheck, kind, delivery, checkResult)
 	}
 	if err != nil {
 		return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, err)
@@ -969,30 +927,6 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	accepted.event.Downloaded = downloaded
 	accepted.rebroadcast = rebroadcast
 	return acceptedBroadcastResult(accepted), nil
-}
-
-// NoteAppliedMasterchainSeqno records the highest applied masterchain seqno.
-// Classify drops masterchain block broadcasts at or below it before any proof
-// parsing or signature verification, mirroring the reference node's
-// validate-broadcast early exit for already-applied blocks.
-func (n *Node) NoteAppliedMasterchainSeqno(seqno uint32) {
-	for {
-		current := n.appliedMasterchainSeqno.Load()
-		if seqno <= current {
-			return
-		}
-		if n.appliedMasterchainSeqno.CompareAndSwap(current, seqno) {
-			return
-		}
-	}
-}
-
-func (n *Node) alreadyAppliedMasterchainBroadcast(block ton.BlockIDExt) bool {
-	if !isMasterchainBlock(block) {
-		return false
-	}
-	applied := n.appliedMasterchainSeqno.Load()
-	return applied > 0 && block.SeqNo <= applied
 }
 
 // dropUnverifiedBroadcast is the single policy point for signature-check

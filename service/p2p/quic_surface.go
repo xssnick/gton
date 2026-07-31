@@ -22,6 +22,7 @@ const (
 	overlayQueryWithExtraConstructorID   = uint32(0x94ffc3e9)
 	overlayMessageConstructorID          = uint32(0x75252420)
 	overlayMessageWithExtraConstructorID = uint32(0xa232233d)
+	plainOverlayMessageEnvelopeSize      = 4 + PeerIDSize
 )
 
 var errQUICOverlayNotFound = errors.New("QUIC overlay is not subscribed")
@@ -433,12 +434,26 @@ func parseQUICMessageEnvelope(
 
 	switch binary.LittleEndian.Uint32(payload[:4]) {
 	case overlayMessageConstructorID:
-		var envelope overlay.Message
-		body, err := parseQUICOverlayBody(payload, &envelope)
-		return quicOverlayHeader{
-			overlay:         envelope.Overlay,
+		if len(payload) < plainOverlayMessageEnvelopeSize {
+			return quicOverlayHeader{}, nil, errors.New(
+				"plain QUIC overlay message header is too short",
+			)
+		}
+
+		// overlay.message is a fixed constructor followed by an int256.
+		// Parsing it directly avoids the generic TL dispatch and its 24-byte
+		// escaping overlay.Message allocation on every inbound message.
+		header := quicOverlayHeader{
+			overlay:         payload[4:plainOverlayMessageEnvelopeSize:plainOverlayMessageEnvelopeSize],
 			certificateKind: quicMembershipCertificateOmitted,
-		}, body, err
+		}
+		if len(payload) == plainOverlayMessageEnvelopeSize {
+			return header, nil, errors.New(
+				"missing boxed overlay payload",
+			)
+		}
+
+		return header, payload[plainOverlayMessageEnvelopeSize:], nil
 	case overlayMessageWithExtraConstructorID:
 		var envelope overlay.MessageWithExtra
 		body, err := parseQUICOverlayBody(payload, &envelope)

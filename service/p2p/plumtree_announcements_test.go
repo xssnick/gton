@@ -63,59 +63,189 @@ func plumtreeAnnouncementTestIHave(
 	}
 }
 
-// The property that makes deferring safe: an unverified announcement only ever
-// competes with other announcements from the same peer.
-func TestPlumtreeAnnouncementSpamDoesNotEvictAnotherPeer(t *testing.T) {
+// A verified payload part proves the broadcast, so its remaining IHAVEs cost no
+// key math at all.
+func TestPlumtreeProvenBroadcastSkipsIHaveVerification(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_800_000_500, 0)
-	engine, broadcastID := plumtreeAnnouncementTestEngine(
-		t,
-		&plumtreeEngineTestVerifier{},
-		now,
-	)
+	verifier := &plumtreeEngineTestVerifier{}
+	engine, broadcastID := plumtreeAnnouncementTestEngine(t, verifier, now)
+
 	source := plumtreeEngineTestSource(0x71)
 	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
-
-	honest := plumtreeEngineTestPeer(10)
 	if _, err := engine.HandleIHave(
 		t.Context(),
 		now,
-		honest,
+		plumtreeEngineTestPeer(10),
 		plumtreeAnnouncementTestIHave(broadcastID, source, signature, now),
 	); err != nil {
-		t.Fatalf("handle honest announcement: %v", err)
+		t.Fatalf("handle announcement: %v", err)
 	}
 
-	// Far past its own cap, with distinct broadcasts so nothing dedups.
-	spammer := plumtreeEngineTestPeer(11)
-	for i := range plumtreeAnnouncementPeerLimit * 4 {
-		id := plumtreeEngineTestID(uint32(1000 + i))
-		message := plumtreeAnnouncementTestIHave(id, source, signature, now)
-		if _, err := engine.HandleIHave(t.Context(), now, spammer, message); err != nil {
-			t.Fatalf("handle spam %d: %v", i, err)
-		}
+	if calls := verifier.calls.Load(); calls != 0 {
+		t.Fatalf("IHAVE of a broadcast we hold a part of was verified: %d", calls)
 	}
-
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	honestQueue := engine.announcements[honest]
-	if honestQueue == nil || honestQueue.count != 1 {
-		t.Fatalf("honest announcement was evicted by spam: %v", honestQueue)
-	}
-	if spamQueue := engine.announcements[spammer]; spamQueue.count != plumtreeAnnouncementPeerLimit {
-		t.Fatalf(
-			"spammer queue = %d, want capped at %d",
-			spamQueue.count,
-			plumtreeAnnouncementPeerLimit,
-		)
-	}
-	if len(engine.missing) != 0 {
-		t.Fatalf("unverified announcements created %d missing parts", len(engine.missing))
+	if len(engine.missing) != 1 {
+		t.Fatalf("missing parts = %d, want the announcement to arm one", len(engine.missing))
 	}
 }
 
-// A fabricated announcement costs one verification and nothing on the wire.
+// The first IHAVE of an unknown broadcast is the one that pays, and it marks the
+// broadcast so the next announcer does not pay again.
+func TestPlumtreeFirstIHaveVerifiesAndProvesBroadcast(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_550, 0)
+	verifier := &plumtreeEngineTestVerifier{}
+	engine, _ := plumtreeAnnouncementTestEngine(t, verifier, now)
+
+	unknown := plumtreeEngineTestID(4242)
+	source := plumtreeEngineTestSource(0x72)
+	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
+	for i := range 3 {
+		if _, err := engine.HandleIHave(
+			t.Context(),
+			now,
+			plumtreeEngineTestPeer(byte(20+i)),
+			plumtreeAnnouncementTestIHave(unknown, source, signature, now),
+		); err != nil {
+			t.Fatalf("handle announcer %d: %v", i, err)
+		}
+	}
+
+	if calls := verifier.calls.Load(); calls != 1 {
+		t.Fatalf("verifications = %d, want exactly the first announcer", calls)
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if !engine.provenLocked(unknown) {
+		t.Fatal("a verified IHAVE did not prove its broadcast")
+	}
+	missing := engine.missing[plumtreePartKey{broadcastID: unknown, partIndex: 0, treeIndex: 1}]
+	if missing == nil || missing.announcerCount != 3 {
+		t.Fatalf("announcers = %v, want all three recorded", missing)
+	}
+}
+
+func TestPlumtreeIHaveStartsRepairImmediatelyWithoutEagerPeer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		proven bool
+		simple bool
+	}{
+		{name: "first verified IHAVE"},
+		{name: "deferred IHAVE of proven broadcast", proven: true},
+		{name: "simple IHAVE", simple: true},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(1_800_000_575, 0)
+			engine := plumtreeEngineTestNew(
+				t,
+				plumtreeEngineTestPeer(1),
+				false,
+				&plumtreeEngineTestPeers{},
+				&plumtreeEngineTestVerifier{},
+				func() time.Time { return now },
+			)
+			broadcastID := plumtreeEngineTestID(4250 + uint32(index))
+			if test.proven {
+				engine.mu.Lock()
+				engine.proven.add(broadcastID)
+				engine.mu.Unlock()
+			}
+
+			message := plumtreeAnnouncementTestIHave(
+				broadcastID,
+				plumtreeEngineTestSource(0x73),
+				bytes.Repeat([]byte{1}, ed25519.SignatureSize),
+				now,
+			)
+			if test.simple {
+				message.TreeIndex = plumtreeSimpleTree
+			}
+
+			actions, err := engine.HandleIHave(
+				t.Context(),
+				now,
+				plumtreeEngineTestPeer(20),
+				message,
+			)
+			if err != nil {
+				t.Fatalf("handle announcement: %v", err)
+			}
+			if len(actions.Candidates) != 1 {
+				t.Fatalf(
+					"immediate repair candidates = %d, want 1",
+					len(actions.Candidates),
+				)
+			}
+
+			engine.mu.Lock()
+			defer engine.mu.Unlock()
+			if len(engine.missing) != 0 {
+				t.Fatalf(
+					"%d delayed repairs survived immediate handoff",
+					len(engine.missing),
+				)
+			}
+			if len(engine.announcements) != 0 {
+				t.Fatalf(
+					"%d announcement queues survived immediate handoff",
+					len(engine.announcements),
+				)
+			}
+		})
+	}
+}
+
+// Simple broadcasts have a single part, so there is no "rest" to defer: every
+// simple IHAVE verifies on arrival.
+func TestPlumtreeSimpleIHaveAlwaysVerifies(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_560, 0)
+	verifier := &plumtreeEngineTestVerifier{}
+	engine, _ := plumtreeAnnouncementTestEngine(t, verifier, now)
+
+	broadcastID := plumtreeEngineTestID(555)
+	source := plumtreeEngineTestSource(0x73)
+	dataHash := sha256.Sum256([]byte{9})
+	for i := range 2 {
+		message := BroadcastPlumtreeIHave{
+			BroadcastID:      broadcastID[:],
+			Timestamp:        plumtreeUnixSeconds(now),
+			PartIndex:        0,
+			TreeIndex:        plumtreeSimpleTree,
+			Source:           source,
+			Certificate:      overlay.CertificateEmpty{},
+			PayloadTimestamp: plumtreeUnixSeconds(now),
+			DataSize:         1,
+			DataHash:         dataHash[:],
+			Signature:        bytes.Repeat([]byte{1}, ed25519.SignatureSize),
+		}
+		if _, err := engine.HandleIHave(
+			t.Context(),
+			now,
+			plumtreeEngineTestPeer(byte(30+i)),
+			message,
+		); err != nil {
+			t.Fatalf("handle simple announcer %d: %v", i, err)
+		}
+	}
+
+	if calls := verifier.calls.Load(); calls != 2 {
+		t.Fatalf("simple verifications = %d, want one per announcer", calls)
+	}
+}
+
+// A fabricated announcement of a proven broadcast costs one deferred
+// verification and nothing on the wire.
 func TestPlumtreeAnnouncementForgeryProducesNoRepairQuery(t *testing.T) {
 	t.Parallel()
 
@@ -156,37 +286,27 @@ func TestPlumtreeAnnouncementForgeryProducesNoRepairQuery(t *testing.T) {
 	if len(actions.Candidates) != 1 {
 		t.Fatalf("candidates = %d, want 1", len(actions.Candidates))
 	}
-	if len(actions.Repairs) != 0 {
-		t.Fatalf("forged announcement produced %d repair queries", len(actions.Repairs))
-	}
-
 	candidate := actions.Candidates[0]
-	if _, err = verifier.verifyAt(plumtreeVerification{
+	verification := plumtreeVerification{
 		From:        candidate.Peer,
 		Source:      candidate.Source,
 		Certificate: candidate.Certificate,
 		DataSize:    uint32(candidate.DataSize),
 		SignedData:  candidate.CandidateSignedData(),
 		Signature:   candidate.Signature,
-	}, now); err == nil {
+	}
+	if _, err = verifier.verifyAt(verification, now); err == nil {
 		t.Fatal("forged candidate signature verified")
 	}
 	// The peer is banned exactly as it would have been at arrival time.
-	if _, err = verifier.verifyAt(plumtreeVerification{
-		From:        candidate.Peer,
-		Source:      candidate.Source,
-		Certificate: candidate.Certificate,
-		DataSize:    uint32(candidate.DataSize),
-		SignedData:  candidate.CandidateSignedData(),
-		Signature:   candidate.Signature,
-	}, now.Add(time.Second)); err == nil {
+	if _, err = verifier.verifyAt(verification, now.Add(time.Second)); err == nil {
 		t.Fatal("liar was not banned after a forged candidate")
 	}
 }
 
-// Deferring the signature must not delay the repair: the deadline is measured from
-// when the part was announced, even though state arrived later.
-func TestPlumtreeAnnouncementDeadlineUsesAnnouncementTime(t *testing.T) {
+// The deadline is measured from the announcement, so state arriving later
+// neither delays nor advances the repair.
+func TestPlumtreeRepairDeadlineUsesAnnouncementTime(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_800_000_600, 0)
@@ -195,7 +315,9 @@ func TestPlumtreeAnnouncementDeadlineUsesAnnouncementTime(t *testing.T) {
 		t,
 		plumtreeEngineTestPeer(1),
 		false,
-		&plumtreeEngineTestPeers{receives: map[PeerID]bool{eager: true}},
+		&plumtreeEngineTestPeers{
+			receives: map[PeerID]bool{eager: true},
+		},
 		&plumtreeEngineTestVerifier{},
 		func() time.Time { return now },
 	)
@@ -204,7 +326,7 @@ func TestPlumtreeAnnouncementDeadlineUsesAnnouncementTime(t *testing.T) {
 	engine.mu.Unlock()
 
 	broadcastID := plumtreeEngineTestID(8)
-	source := plumtreeEngineTestSource(0x72)
+	source := plumtreeEngineTestSource(0x74)
 	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
 	if _, err := engine.HandleIHave(
 		t.Context(),
@@ -212,16 +334,17 @@ func TestPlumtreeAnnouncementDeadlineUsesAnnouncementTime(t *testing.T) {
 		plumtreeEngineTestPeer(13),
 		plumtreeAnnouncementTestIHave(broadcastID, source, signature, now),
 	); err != nil {
-		t.Fatalf("buffer announcement before state: %v", err)
+		t.Fatalf("handle announcement before state: %v", err)
 	}
 
 	// State shows up 150ms later; the deadline stays announcement+200ms.
-	stateAt := now.Add(150 * time.Millisecond)
 	engine.mu.Lock()
-	state := &plumtreeFECState{broadcastID: broadcastID, firstSeen: stateAt}
+	state := &plumtreeFECState{
+		broadcastID: broadcastID,
+		firstSeen:   now.Add(150 * time.Millisecond),
+	}
 	state.parts[1] = &plumtreePartState{partIndex: 1, treeIndex: 2}
 	engine.addFECStateLocked(state)
-	engine.armFECRepairForStateLocked(state)
 	engine.mu.Unlock()
 
 	if actions := engine.Alarm(now.Add(plumtreeRepairDelay - time.Nanosecond)); len(actions.Candidates) != 0 {
@@ -232,52 +355,52 @@ func TestPlumtreeAnnouncementDeadlineUsesAnnouncementTime(t *testing.T) {
 	}
 }
 
-// Announcements for broadcasts we never get state for disappear on their own.
-func TestPlumtreeAnnouncementTTLDrainsWithoutEviction(t *testing.T) {
+// Announcements live and die with the part they announce: once its deadline has
+// been drained nothing is left buffered, so no separate sweep is needed.
+func TestPlumtreeAnnouncementsReleasedWithTheirPart(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_800_000_700, 0)
-	engine, _ := plumtreeAnnouncementTestEngine(
+	engine, broadcastID := plumtreeAnnouncementTestEngine(
 		t,
 		&plumtreeEngineTestVerifier{},
 		now,
 	)
-	// No state means no repair deadline, so nothing consumes the announcement and
-	// only the TTL can remove it. This is what a fabricated broadcast id looks like.
-	unknown := plumtreeEngineTestID(999)
 	from := plumtreeEngineTestPeer(14)
 	if _, err := engine.HandleIHave(
 		t.Context(),
 		now,
 		from,
 		plumtreeAnnouncementTestIHave(
-			unknown,
-			plumtreeEngineTestSource(0x73),
+			broadcastID,
+			plumtreeEngineTestSource(0x75),
 			bytes.Repeat([]byte{1}, ed25519.SignatureSize),
 			now,
 		),
 	); err != nil {
-		t.Fatalf("buffer announcement: %v", err)
+		t.Fatalf("handle announcement: %v", err)
 	}
 
-	engine.Alarm(now.Add(plumtreeAnnouncementTTL / 2))
 	engine.mu.Lock()
 	held := engine.announcements[from] != nil
 	engine.mu.Unlock()
 	if !held {
-		t.Fatal("announcement dropped before its TTL")
+		t.Fatal("announcement was not buffered")
 	}
 
-	engine.Alarm(now.Add(plumtreeAnnouncementTTL + time.Second))
+	engine.Alarm(now.Add(plumtreeRepairDelay))
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.announcements[from] != nil {
-		t.Fatal("announcement outlived its TTL")
+		t.Fatal("announcement outlived the part it announced")
+	}
+	if len(engine.missing) != 0 {
+		t.Fatalf("drained part left %d entries behind", len(engine.missing))
 	}
 }
 
-// Deferring must not widen how many peers get asked for one part: the cap
-// missing.targets applies on the eager path is applied at selection here.
+// Trusting the rest of a broadcast's IHAVEs must not widen how many peers get
+// asked for one part.
 func TestPlumtreeAnnouncementCapsPeersAskedPerPart(t *testing.T) {
 	t.Parallel()
 
@@ -287,7 +410,7 @@ func TestPlumtreeAnnouncementCapsPeersAskedPerPart(t *testing.T) {
 		&plumtreeEngineTestVerifier{},
 		now,
 	)
-	source := plumtreeEngineTestSource(0x74)
+	source := plumtreeEngineTestSource(0x76)
 	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
 	for i := range plumtreeRepairTargetLimit + 3 {
 		if _, err := engine.HandleIHave(
@@ -310,19 +433,19 @@ func TestPlumtreeAnnouncementCapsPeersAskedPerPart(t *testing.T) {
 	}
 }
 
-// The by-broadcast index must stay in step with the per-peer queues through
-// every removal path, or arming a new state silently misses announcements (a
-// part is never repaired) or walks freed entries.
-func TestPlumtreeAnnouncementIndexTracksEveryRemovalPath(t *testing.T) {
+// A part's announcer list and the per-peer queues are two views of the same
+// entries. If they drift, a part is either asked of a peer that no longer holds
+// the announcement or is never repaired at all.
+func TestPlumtreeAnnouncerListTracksEveryRemovalPath(t *testing.T) {
 	t.Parallel()
 
-	now := time.Unix(1_800_000_700, 0)
+	now := time.Unix(1_800_000_900, 0)
 	engine, broadcastID := plumtreeAnnouncementTestEngine(
 		t,
 		&plumtreeEngineTestVerifier{},
 		now,
 	)
-	source := plumtreeEngineTestSource(0x73)
+	source := plumtreeEngineTestSource(0x77)
 	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
 
 	peers := []PeerID{
@@ -331,142 +454,215 @@ func TestPlumtreeAnnouncementIndexTracksEveryRemovalPath(t *testing.T) {
 		plumtreeEngineTestPeer(22),
 	}
 	for _, peer := range peers {
-		if _, err := engine.HandleIHave(
-			t.Context(),
-			now,
-			peer,
-			plumtreeAnnouncementTestIHave(broadcastID, source, signature, now),
-		); err != nil {
-			t.Fatalf("handle announcement: %v", err)
-		}
-		// A second broadcast id per peer, so the index has to separate them.
-		other := plumtreeAnnouncementTestIHave(
-			plumtreeEngineTestID(4242),
-			source,
-			signature,
-			now,
-		)
-		if _, err := engine.HandleIHave(t.Context(), now, peer, other); err != nil {
-			t.Fatalf("handle other announcement: %v", err)
+		for _, id := range [][sha256.Size]byte{broadcastID, plumtreeEngineTestID(4242)} {
+			if _, err := engine.HandleIHave(
+				t.Context(),
+				now,
+				peer,
+				plumtreeAnnouncementTestIHave(id, source, signature, now),
+			); err != nil {
+				t.Fatalf("handle announcement: %v", err)
+			}
 		}
 	}
+	assertAnnouncerListsMatchQueues(t, engine)
 
-	assertIndexMatchesQueues(t, engine)
+	// Removal path 1: the whole peer goes away.
+	engine.RemovePeer(peers[0])
+	assertAnnouncerListsMatchQueues(t, engine)
 
-	// Removal path 1: consumed as a repair candidate.
+	// Removal path 2: the part arrives, so we stop waiting for it.
 	engine.mu.Lock()
-	engine.takeCandidatesLocked(plumtreePartKey{
+	engine.eraseMissingLocked(plumtreePartKey{
 		broadcastID: broadcastID,
 		partIndex:   0,
 		treeIndex:   1,
-	}, nil)
+	})
 	engine.mu.Unlock()
-	assertIndexMatchesQueues(t, engine)
+	assertAnnouncerListsMatchQueues(t, engine)
 
-	// Removal path 2: the whole peer goes away.
-	engine.DropPeerAnnouncements(peers[0])
-	assertIndexMatchesQueues(t, engine)
-
-	// Removal path 3: TTL expiry.
-	engine.mu.Lock()
-	engine.expireAnnouncementsLocked(now.Add(2 * plumtreeAnnouncementTTL))
-	engine.mu.Unlock()
-	assertIndexMatchesQueues(t, engine)
+	// Removal path 3: the deadline fires and the candidates are handed out.
+	engine.Alarm(now.Add(plumtreeRepairDelay))
+	assertAnnouncerListsMatchQueues(t, engine)
 
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	if len(engine.announcementsByBroadcast) != 0 {
-		t.Fatalf(
-			"index kept %d broadcasts after every announcement expired",
-			len(engine.announcementsByBroadcast),
-		)
+	if len(engine.announcements) != 0 {
+		t.Fatalf("%d peer queues survived every removal path", len(engine.announcements))
 	}
 }
 
-// A new broadcast's state must be armed from that broadcast's announcements
-// only: it walks the index, so a wrong thread would arm from a stranger's parts.
-func TestPlumtreeArmFECRepairUsesOnlyItsOwnBroadcast(t *testing.T) {
+// The Alarm drain relies on e.missing being ordered by deadline, which holds
+// only while every entry is created with the same delay. NextAlarm reads the
+// head and the drain stops at the first entry that is not due.
+func TestPlumtreeMissingListStaysOrderedByDeadline(t *testing.T) {
 	t.Parallel()
 
-	now := time.Unix(1_800_000_800, 0)
-	engine, broadcastID := plumtreeAnnouncementTestEngine(
+	base := time.Unix(1_800_001_000, 0)
+	now := base
+	eager := plumtreeEngineTestPeer(2)
+	peers := &plumtreeEngineTestPeers{
+		receives: map[PeerID]bool{eager: true},
+	}
+	engine := plumtreeEngineTestNew(
 		t,
+		plumtreeEngineTestPeer(1),
+		false,
+		peers,
 		&plumtreeEngineTestVerifier{},
-		now,
+		func() time.Time { return now },
 	)
-	source := plumtreeEngineTestSource(0x74)
-	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
+	engine.mu.Lock()
+	engine.promoteEagerLocked(&engine.slots[1], eager, true, now)
+	engine.mu.Unlock()
 
-	foreign := plumtreeEngineTestID(9999)
-	announcer := plumtreeEngineTestPeer(30)
-	for _, id := range [][sha256.Size]byte{broadcastID, foreign} {
+	source := plumtreeEngineTestSource(0x78)
+	signature := bytes.Repeat([]byte{1}, ed25519.SignatureSize)
+	for i := range 5 {
+		now = base.Add(time.Duration(i) * 10 * time.Millisecond)
 		if _, err := engine.HandleIHave(
 			t.Context(),
 			now,
-			announcer,
-			plumtreeAnnouncementTestIHave(id, source, signature, now),
+			plumtreeEngineTestPeer(byte(40+i)),
+			plumtreeAnnouncementTestIHave(
+				plumtreeEngineTestID(uint32(7000+i)),
+				source,
+				signature,
+				now,
+			),
 		); err != nil {
-			t.Fatalf("handle announcement: %v", err)
+			t.Fatalf("handle announcement %d: %v", i, err)
 		}
 	}
 
 	engine.mu.Lock()
-	defer engine.mu.Unlock()
-
-	state := &plumtreeFECState{broadcastID: foreign, firstSeen: now}
-	engine.armFECRepairForStateLocked(state)
-
-	armed := 0
-	for i := range state.repairAt {
-		if !state.repairAt[i].IsZero() {
-			armed++
+	previous := time.Time{}
+	count := 0
+	for entry := engine.missingOldest; entry != nil; entry = entry.next {
+		if entry.repairAt.Before(previous) {
+			t.Fatalf("missing list is not ordered by deadline at entry %d", count)
 		}
+		previous = entry.repairAt
+		count++
 	}
-	if armed != 1 {
-		t.Fatalf("armed %d parts from one announcement, want 1", armed)
+	engine.mu.Unlock()
+	if count != 5 {
+		t.Fatalf("walked %d entries, want 5", count)
 	}
-	// Part 0 is what the foreign announcement covers; anything else means the
-	// index handed us the other broadcast's entry.
-	if state.repairAt[0].IsZero() {
-		t.Fatal("the announced part was not armed")
+
+	next, ok := engine.NextAlarm()
+	if !ok {
+		t.Fatal("NextAlarm reported nothing pending")
+	}
+	if want := base.Add(plumtreeRepairDelay); !next.Equal(want) {
+		t.Fatalf("NextAlarm = %v, want the earliest deadline %v", next, want)
 	}
 }
 
-func assertIndexMatchesQueues(t *testing.T, engine *plumtreeEngine) {
+// Refusing new entries rather than evicting the oldest is what keeps the
+// imminent repairs: the oldest entry is the one about to fire.
+func TestPlumtreeMissingLimitRefusesNewestNotOldest(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_001_100, 0)
+	engine := plumtreeEngineTestNew(
+		t,
+		plumtreeEngineTestPeer(1),
+		false,
+		&plumtreeEngineTestPeers{},
+		&plumtreeEngineTestVerifier{},
+		func() time.Time { return now },
+	)
+
+	first := plumtreePartKey{
+		broadcastID: plumtreeEngineTestID(8000),
+		partIndex:   0,
+		treeIndex:   1,
+	}
+	engine.mu.Lock()
+	for i := range plumtreeMissingLimit {
+		key := plumtreePartKey{
+			broadcastID: plumtreeEngineTestID(uint32(8000 + i)),
+			partIndex:   0,
+			treeIndex:   1,
+		}
+		engine.addMissingLocked(&plumtreeMissingPart{
+			key:      key,
+			repairAt: now.Add(plumtreeRepairDelay),
+		})
+	}
+	engine.mu.Unlock()
+
+	overflow := plumtreeEngineTestID(7000)
+	if _, err := engine.HandleIHave(
+		t.Context(),
+		now,
+		plumtreeEngineTestPeer(50),
+		plumtreeAnnouncementTestIHave(
+			overflow,
+			plumtreeEngineTestSource(0x79),
+			bytes.Repeat([]byte{1}, ed25519.SignatureSize),
+			now,
+		),
+	); err != nil {
+		t.Fatalf("handle announcement at the limit: %v", err)
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.missing) != plumtreeMissingLimit {
+		t.Fatalf("missing = %d, want the limit held", len(engine.missing))
+	}
+	if engine.missing[first] == nil {
+		t.Fatal("the entry closest to firing was evicted to make room")
+	}
+	if engine.missing[plumtreePartKey{broadcastID: overflow, partIndex: 0, treeIndex: 1}] != nil {
+		t.Fatal("an entry was admitted past the limit")
+	}
+}
+
+func assertAnnouncerListsMatchQueues(t *testing.T, engine *plumtreeEngine) {
 	t.Helper()
 
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 
 	queued := map[*plumtreeAnnouncement]struct{}{}
-	for _, queue := range engine.announcements {
+	for peer, queue := range engine.announcements {
+		count := 0
 		for announcement := queue.oldest; announcement != nil; announcement = announcement.next {
+			if announcement.peer != peer {
+				t.Fatalf("announcement of %v sits in %v's queue", announcement.peer, peer)
+			}
+			if queue.byKey[announcement.key] != announcement {
+				t.Fatalf("queue map and list disagree for %v", peer)
+			}
 			queued[announcement] = struct{}{}
+			count++
+		}
+		if count != queue.count {
+			t.Fatalf("queue for %v counts %d but holds %d", peer, queue.count, count)
 		}
 	}
 
-	indexed := map[*plumtreeAnnouncement]struct{}{}
-	for id, head := range engine.announcementsByBroadcast {
-		if head == nil {
-			t.Fatalf("index holds a nil head for %x", id)
+	listed := map[*plumtreeAnnouncement]struct{}{}
+	for key, missing := range engine.missing {
+		if missing.announcerCount == 0 {
+			t.Fatalf("part %v is waiting with nobody to ask", key)
 		}
-		for announcement := head; announcement != nil; announcement = announcement.broadcastNext {
-			if announcement.key.broadcastID != id {
-				t.Fatalf("announcement for %x is threaded under %x", announcement.key.broadcastID, id)
+		for i := range int(missing.announcerCount) {
+			announcement := missing.announcers[i]
+			if announcement.key != key {
+				t.Fatalf("part %v lists an announcer of %v", key, announcement.key)
 			}
-			if _, dup := indexed[announcement]; dup {
-				t.Fatal("index threads the same announcement twice")
+			if _, ok := queued[announcement]; !ok {
+				t.Fatalf("part %v lists an announcer no queue holds", key)
 			}
-			indexed[announcement] = struct{}{}
+			listed[announcement] = struct{}{}
 		}
 	}
 
-	if len(queued) != len(indexed) {
-		t.Fatalf("queues hold %d announcements, index holds %d", len(queued), len(indexed))
-	}
-	for announcement := range queued {
-		if _, ok := indexed[announcement]; !ok {
-			t.Fatalf("announcement %v is queued but not indexed", announcement.key)
-		}
+	if len(listed) != len(queued) {
+		t.Fatalf("%d announcements queued but %d reachable from parts", len(queued), len(listed))
 	}
 }

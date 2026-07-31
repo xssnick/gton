@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -94,6 +95,41 @@ func TestQueryExecutorDropsQueuedOnContextCancel(t *testing.T) {
 		t.Fatal("cancelled queued query still ran")
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+func TestQueryExecutorOccupyQueuedCancelDoesNotLeak(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		executor := &queryExecutor{
+			tasks: make(chan executorTask, 1),
+			done:  make(chan struct{}),
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		type occupyResult struct {
+			release func()
+			ok      bool
+		}
+		result := make(chan occupyResult, 1)
+		go func() {
+			release, ok := executor.occupy(ctx)
+			result <- occupyResult{release: release, ok: ok}
+		}()
+
+		// Wait until occupy has queued the hold and is parked waiting for a
+		// worker to pick it. There is deliberately no worker: cancellation
+		// must not leave a cleanup goroutine waiting for one.
+		synctest.Wait()
+		if len(executor.tasks) != 1 {
+			t.Fatalf("queued holds = %d, want 1", len(executor.tasks))
+		}
+		cancel()
+
+		res := <-result
+		if res.ok || res.release != nil {
+			t.Fatal("cancelled queued occupy succeeded")
+		}
+	})
 }
 
 func TestQueryExecutorCloseStopsWorkers(t *testing.T) {

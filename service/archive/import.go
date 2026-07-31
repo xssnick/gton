@@ -53,7 +53,14 @@ type Imported struct {
 	PreparedBlocks map[storage.BlockRootHash]PreparedBlock
 }
 
-func ImportBytes(ctx context.Context, archive *Downloaded, data []byte) (*Imported, error) {
+// ImportBytes imports an in-memory archive using the Importer's shared block
+// preparation workers.
+func (i *Importer) ImportBytes(ctx context.Context, archive *Downloaded, data []byte) (*Imported, error) {
+	if err := i.begin(); err != nil {
+		return nil, err
+	}
+	defer i.end()
+
 	archiveRef := *archive
 	archiveRef.Data = nil
 	archiveRef.Bytes = int64(len(data))
@@ -63,18 +70,25 @@ func ImportBytes(ctx context.Context, archive *Downloaded, data []byte) (*Import
 	// second copy of all entries) on the terabyte-scale import path. data is a
 	// single-use, non-pooled download buffer, so aliasing it is safe: the
 	// retained blocks keep its backing array alive via GC.
-	return importEntries(ctx, &archiveRef, func(handle func(packfile.Entry) error) error {
+	return i.importEntries(ctx, &archiveRef, func(handle func(packfile.Entry) error) error {
 		return packfile.ReadBytes(ctx, data, handle)
 	})
 }
 
-func ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Imported, error) {
-	return importEntries(ctx, archive, func(handle func(packfile.Entry) error) error {
+// ImportStream imports an archive stream using the Importer's shared block
+// preparation workers.
+func (i *Importer) ImportStream(ctx context.Context, archive *Downloaded, r io.Reader) (*Imported, error) {
+	if err := i.begin(); err != nil {
+		return nil, err
+	}
+	defer i.end()
+
+	return i.importEntries(ctx, archive, func(handle func(packfile.Entry) error) error {
 		return packfile.Read(ctx, r, handle)
 	})
 }
 
-func importEntries(ctx context.Context, archive *Downloaded, read func(handle func(packfile.Entry) error) error) (*Imported, error) {
+func (i *Importer) importEntries(ctx context.Context, archive *Downloaded, read func(handle func(packfile.Entry) error) error) (*Imported, error) {
 	stats := &ImportStats{
 		MasterchainSeqno: archive.MasterchainSeqno,
 		ArchiveID:        archive.ArchiveID,
@@ -87,7 +101,7 @@ func importEntries(ctx context.Context, archive *Downloaded, read func(handle fu
 		PreparedBlocks: map[storage.BlockRootHash]PreparedBlock{},
 	}
 	parts := map[storage.BlockRootHash]*blockParts{}
-	preparer := newImportedBlockPreparer(ctx)
+	preparer := newImportedBlockPreparer(ctx, i.dispatcher)
 	defer preparer.abort()
 
 	started := time.Now()

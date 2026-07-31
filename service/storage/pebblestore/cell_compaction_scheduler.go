@@ -11,16 +11,21 @@ type pebbleCompactionController struct {
 	mu         sync.Mutex
 	cond       *sync.Cond
 	paused     bool
+	started    bool
+	stopped    bool
 	maxRunning int
 	running    int
 	foreground int
 	schedulers map[*pebbleCompactionScheduler]struct{}
+	grantPokes chan struct{} // Capacity one coalesces concurrent grant requests.
+	done       chan struct{}
 }
 
 type pebbleCompactionScheduler struct {
 	controller   *pebbleCompactionController
 	db           pebble.DBForCompaction
 	running      int
+	dbCalls      int
 	unregistered bool
 }
 
@@ -37,6 +42,8 @@ func newPebbleCompactionController(maxRunning int) *pebbleCompactionController {
 		paused:     true,
 		maxRunning: maxRunning,
 		schedulers: map[*pebbleCompactionScheduler]struct{}{},
+		grantPokes: make(chan struct{}, 1),
+		done:       make(chan struct{}),
 	}
 	controller.cond = sync.NewCond(&controller.mu)
 	return controller
@@ -48,16 +55,51 @@ func (c *pebbleCompactionController) newScheduler() *pebbleCompactionScheduler {
 
 func (c *pebbleCompactionController) start() {
 	c.mu.Lock()
+	if c.started {
+		c.mu.Unlock()
+		return
+	}
+	c.started = true
 	c.paused = false
+	if len(c.schedulers) == 0 {
+		c.stopped = true
+		close(c.done)
+		c.mu.Unlock()
+		return
+	}
 	c.mu.Unlock()
-	go c.tryGrant()
+
+	go c.grantLoop()
+	c.requestGrant()
+}
+
+func (c *pebbleCompactionController) grantLoop() {
+	defer close(c.done)
+
+	for range c.grantPokes {
+		c.mu.Lock()
+		stopped := c.stopped
+		c.mu.Unlock()
+		if stopped {
+			return
+		}
+
+		c.tryGrant()
+	}
+}
+
+func (c *pebbleCompactionController) requestGrant() {
+	select {
+	case c.grantPokes <- struct{}{}:
+	default:
+	}
 }
 
 func (c *pebbleCompactionController) reserve(s *pebbleCompactionScheduler) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.paused || s.unregistered || c.running >= c.effectiveMaxRunningLocked() {
+	if c.paused || c.stopped || s.unregistered || c.running >= c.effectiveMaxRunningLocked() {
 		return false
 	}
 	c.running++
@@ -67,16 +109,20 @@ func (c *pebbleCompactionController) reserve(s *pebbleCompactionScheduler) bool 
 
 func (c *pebbleCompactionController) release(s *pebbleCompactionScheduler) {
 	c.mu.Lock()
-	if c.running > 0 {
-		c.running--
-	}
-	if s.running > 0 {
-		s.running--
-	}
+	c.running--
+	s.running--
 	c.cond.Broadcast()
 	c.mu.Unlock()
 
-	go c.tryGrant()
+	c.requestGrant()
+}
+
+func (c *pebbleCompactionController) reject(s *pebbleCompactionScheduler) {
+	c.mu.Lock()
+	c.running--
+	s.running--
+	c.cond.Broadcast()
+	c.mu.Unlock()
 }
 
 func (c *pebbleCompactionController) tryGrant() {
@@ -92,11 +138,13 @@ func (c *pebbleCompactionController) tryGrant() {
 			if !c.reserve(scheduler) {
 				continue
 			}
-			if scheduler.db.Schedule(scheduler) {
+			if scheduler.schedule() {
 				granted = true
 				continue
 			}
-			c.release(scheduler)
+			// Schedule rejected the current state. Retry only after a new poke;
+			// retrying immediately can spin while the DB keeps rejecting it.
+			c.reject(scheduler)
 		}
 		if !granted {
 			return
@@ -132,7 +180,7 @@ func (c *pebbleCompactionController) snapshotGrantSchedulers() []*pebbleCompacti
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.paused || c.running >= c.effectiveMaxRunningLocked() {
+	if c.paused || c.stopped || c.running >= c.effectiveMaxRunningLocked() {
 		return nil
 	}
 
@@ -171,7 +219,7 @@ func (c *pebbleCompactionController) beginForegroundRead() func() {
 			}
 			c.mu.Unlock()
 
-			go c.tryGrant()
+			c.requestGrant()
 		})
 	}
 }
@@ -193,6 +241,8 @@ func (s *pebbleCompactionScheduler) Register(_ int, db pebble.DBForCompaction) {
 	s.db = db
 	c.schedulers[s] = struct{}{}
 	c.mu.Unlock()
+
+	c.requestGrant()
 }
 
 func (s *pebbleCompactionScheduler) Unregister() {
@@ -200,10 +250,21 @@ func (s *pebbleCompactionScheduler) Unregister() {
 	c.mu.Lock()
 	s.unregistered = true
 	delete(c.schedulers, s)
-	for s.running > 0 {
+	for s.running > 0 || s.dbCalls > 0 {
 		c.cond.Wait()
 	}
+	s.db = nil
+	stop := c.started && len(c.schedulers) == 0 && !c.stopped
+	if stop {
+		c.stopped = true
+	}
+	done := c.done
 	c.mu.Unlock()
+
+	if stop {
+		c.requestGrant()
+		<-done
+	}
 }
 
 func (s *pebbleCompactionScheduler) TrySchedule() (bool, pebble.CompactionGrantHandle) {
@@ -214,20 +275,49 @@ func (s *pebbleCompactionScheduler) TrySchedule() (bool, pebble.CompactionGrantH
 }
 
 func (s *pebbleCompactionScheduler) UpdateGetAllowedWithoutPermission() {
-	go s.controller.tryGrant()
+	s.controller.requestGrant()
 }
 
 func (s *pebbleCompactionScheduler) waitingCompaction() (pebble.WaitingCompaction, bool) {
-	s.controller.mu.Lock()
-	db := s.db
-	unregistered := s.unregistered
-	s.controller.mu.Unlock()
-	if db == nil || unregistered {
+	db, ok := s.beginDBCall()
+	if !ok {
 		return pebble.WaitingCompaction{}, false
 	}
+	defer s.endDBCall()
 
 	waiting, compaction := db.GetWaitingCompaction()
 	return compaction, waiting
+}
+
+func (s *pebbleCompactionScheduler) schedule() bool {
+	db, ok := s.beginDBCall()
+	if !ok {
+		return false
+	}
+	defer s.endDBCall()
+
+	return db.Schedule(s)
+}
+
+func (s *pebbleCompactionScheduler) beginDBCall() (pebble.DBForCompaction, bool) {
+	c := s.controller
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.stopped || s.unregistered || s.db == nil {
+		return nil, false
+	}
+
+	s.dbCalls++
+	return s.db, true
+}
+
+func (s *pebbleCompactionScheduler) endDBCall() {
+	c := s.controller
+	c.mu.Lock()
+	s.dbCalls--
+	c.cond.Broadcast()
+	c.mu.Unlock()
 }
 
 func (s *pebbleCompactionScheduler) Started() {}

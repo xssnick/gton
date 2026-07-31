@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
@@ -43,10 +44,11 @@ type archiveCatchUpRunner struct {
 	current *storage.CurrentState
 	target  ton.BlockIDExt
 
-	archiveSession *p2p.ArchiveSession
-	importCache    *archiveImportCache
-	pipeline       *archiveWindowPipeline
-	downloadGate   archiveDownloadBackpressureGate
+	archiveSession  *p2p.ArchiveSession
+	archiveImporter *archive.Importer
+	importCache     *archiveImportCache
+	pipeline        *archiveWindowPipeline
+	downloadGate    archiveDownloadBackpressureGate
 
 	started                        time.Time
 	startSeqno                     uint32
@@ -104,6 +106,9 @@ func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *s
 
 func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	s := r.service
+	r.archiveImporter = archive.NewImporter()
+	defer r.archiveImporter.Close()
+
 	r.archiveSession = s.node.BeginArchiveSession()
 	defer r.archiveSession.Close()
 

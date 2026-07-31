@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 	tnstate "github.com/xssnick/gton/service/state"
@@ -22,10 +21,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-const (
-	stateFileTempSuffix           = ".part"
-	stateArtifactProgressInterval = 5 * time.Second
-)
+const stateFileTempSuffix = ".part"
 
 type zeroStateSnapshotArtifact struct {
 	block  ton.BlockIDExt
@@ -738,16 +734,12 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 			return nil, err
 		}
 
-		stopProgress := a.startSplitStatePartProgress(ctx, part, i, "load_accounts")
 		partAccounts, err := tnstate.LoadShardAccountsRoot(root)
-		stopProgress()
 		if err != nil {
 			return nil, fmt.Errorf("%w: parse split state part %d accounts: %w", errStateSnapshotInvalid, i+1, err)
 		}
 
-		stopProgress = a.startSplitStatePartProgress(ctx, part, i, "merge_accounts")
 		merged, err := accounts.CombineWith(partAccounts)
-		stopProgress()
 		if err != nil {
 			return nil, fmt.Errorf("%w: merge split state part %d accounts: %w", errStateSnapshotInvalid, i+1, err)
 		}
@@ -948,40 +940,6 @@ func importBlockStateCells(ctx context.Context, cells storage.StateCellTreeImpor
 	}
 	lazyState.StateFileHash = state.StateFileHash
 	return lazyState, nil
-}
-
-func (a *splitPersistentStateSnapshotArtifact) startSplitStatePartProgress(ctx context.Context, part splitPersistentStatePartArtifact, index int, phase string) func() {
-	done := make(chan struct{})
-	started := time.Now()
-
-	go func() {
-		ticker := time.NewTicker(stateArtifactProgressInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				a.node.log.Info().
-					Str("peer", part.staged.peerAddr).
-					Str("block", formatPersistentStateBlockRef(a.block, int64(part.part.effectiveShard))).
-					Str("masterchain", storage.FormatBlockRef(a.master)).
-					Int("part", index+1).
-					Int("parts", len(a.parts)).
-					Str("phase", phase).
-					Str("size", formatByteSize(part.staged.size)).
-					Dur("elapsed", time.Since(started)).
-					Msg("split persistent state part decode progress")
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return func() {
-		close(done)
-	}
 }
 
 func (a *splitPersistentStateSnapshotArtifact) Cleanup() error {

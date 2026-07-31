@@ -229,6 +229,7 @@ func nextBlockBootstrapLiveTail(blockUTime int64, nowUnix int64) bool {
 func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 	s.observeBroadcastFlushedCurrentState(current)
 	s.rememberAppliedMasterchainState(&current.Masterchain)
+	s.rememberAppliedShardHeads(current.Shards)
 	snapshot := s.publishLiveCurrentStateChanged(current)
 	if snapshot == nil {
 		return
@@ -269,6 +270,21 @@ func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.B
 		refs = append(refs, shard.Block)
 	}
 	return refs
+}
+
+// rememberAppliedShardHeads publishes the applied top block of every followed
+// shard to classify, which drops broadcasts at or below them before parsing a
+// proof, checking signatures or decoding a payload.
+func (s *Service) rememberAppliedShardHeads(shards map[storage.ShardKey]storage.BlockState) {
+	if len(shards) == 0 {
+		return
+	}
+
+	heads := make([]ton.BlockIDExt, 0, len(shards))
+	for _, shard := range shards {
+		heads = append(heads, shard.Block)
+	}
+	s.node.NoteAppliedShardHeads(heads)
 }
 
 func (s *Service) rememberAppliedMasterchainState(state *storage.BlockState) {

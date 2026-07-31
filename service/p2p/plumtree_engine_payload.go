@@ -61,7 +61,10 @@ func (e *plumtreeEngine) HandleFEC(
 	from PeerID,
 	envelope plumtreeFECEnvelope,
 ) (plumtreeActions, error) {
-	payloadContext := plumtreePayloadContext{from: from}
+	payloadContext := plumtreePayloadContext{
+		from:       from,
+		partSource: plumtreePartSourceDirect,
+	}
 	return e.handleFEC(ctx, now, payloadContext, envelope)
 }
 
@@ -97,6 +100,7 @@ func (e *plumtreeEngine) HandleRepairFEC(
 	payloadContext := plumtreePayloadContext{
 		from:        attempt.from,
 		expectedKey: attempt.key,
+		partSource:  plumtreePartSourceRecovery,
 	}
 	return e.handleFEC(ctx, now, payloadContext, envelope)
 }
@@ -425,6 +429,7 @@ func (e *plumtreeEngine) handleFEC(
 	}
 	state.parts[prepared.key.partIndex] = part
 	state.partCount++
+	e.stats.telemetry.notePartReceived(payloadContext.partSource)
 	e.eraseMissingLocked(prepared.key)
 	e.noteActiveLocked(payloadContext.from, commitNow)
 
@@ -694,9 +699,6 @@ func (e *plumtreeEngine) recheckFECLocked(
 		decoderEstimatedBytes: decoderEstimatedBytes,
 	}
 	e.addFECStateLocked(state)
-	// Announcements for this broadcast may already be buffered; now that there is
-	// state to hang a deadline on, arm it from the earliest of them.
-	e.armFECRepairForStateLocked(state)
 	return state, plumtreeActions{}, nil
 }
 

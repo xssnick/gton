@@ -47,6 +47,8 @@ type serviceCollector struct {
 	p2pFECEvicted       *prometheus.Desc
 	p2pFECCompleted     *prometheus.Desc
 	p2pFECDeliveredHits *prometheus.Desc
+	p2pPlumtreeParts    *prometheus.Desc
+	p2pPlumtreeMessages *prometheus.Desc
 
 	blocksyncQueueItems    *prometheus.Desc
 	blocksyncQueueCapacity *prometheus.Desc
@@ -231,6 +233,18 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			[]string{"overlay"},
 			nil,
 		),
+		p2pPlumtreeParts: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "plumtree_fec_parts_received_total"),
+			"Total verified Plumtree FEC parts accepted from direct push or repair recovery.",
+			[]string{"overlay", "source"},
+			nil,
+		),
+		p2pPlumtreeMessages: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "plumtree_messages_received_total"),
+			"Total parsed inbound Plumtree messages by protocol type.",
+			[]string{"overlay", "type"},
+			nil,
+		),
 		blocksyncQueueItems: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "blocksync", "queue_items"),
 			"Current block sync queue length.",
@@ -288,6 +302,8 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pFECEvicted
 	ch <- c.p2pFECCompleted
 	ch <- c.p2pFECDeliveredHits
+	ch <- c.p2pPlumtreeParts
+	ch <- c.p2pPlumtreeMessages
 	ch <- c.blocksyncQueueItems
 	ch <- c.blocksyncQueueCapacity
 	ch <- c.blocksyncQueueDropped
@@ -411,6 +427,18 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 	}
 	for _, drop := range snapshot.BroadcastDrops {
 		ch <- prometheus.MustNewConstMetric(c.p2pBroadcastDrops, prometheus.CounterValue, float64(drop.Count), drop.Overlay, drop.Kind, drop.Reason)
+	}
+
+	for _, plumtree := range snapshot.Plumtree {
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeParts, prometheus.CounterValue, float64(plumtree.DirectParts), plumtree.Overlay, "direct")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeParts, prometheus.CounterValue, float64(plumtree.RecoveryParts), plumtree.Overlay, "recovery")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.SimpleMessages), plumtree.Overlay, "simple")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.FECMessages), plumtree.Overlay, "fec")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.IHaveMessages), plumtree.Overlay, "ihave")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.PruneMessages), plumtree.Overlay, "prune")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.UsefulMessages), plumtree.Overlay, "useful")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.StatsPushMessages), plumtree.Overlay, "stats_push")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.RepairQueryMessages), plumtree.Overlay, "repair_query")
 	}
 }
 

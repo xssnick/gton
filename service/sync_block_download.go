@@ -86,46 +86,13 @@ func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.Bl
 			Msg("probing exact chain block with urgent fanout")
 	}
 
-	type probeResult struct {
-		downloaded *p2p.DownloadedBlock
-		err        error
+	downloaded, err := s.node.ProbeBlockFull(queryCtx, block, p2p.ProbeBlockFullOptions{
+		PeerLimit:       decision.peerLimit,
+		StagedPeerLimit: decision.stagedPeerLimit,
+		StageDelay:      nextBlockBootstrapLiveStageDelay,
+	})
+	if err != nil {
+		return p2p.DownloadedBlock{}, "", fmt.Errorf("probe block %s: %w", storage.FormatBlockRef(block), err)
 	}
-	result := make(chan probeResult, 1)
-	go func() {
-		downloaded, err := s.node.ProbeBlockFull(queryCtx, block, p2p.ProbeBlockFullOptions{
-			PeerLimit:       decision.peerLimit,
-			StagedPeerLimit: decision.stagedPeerLimit,
-			StageDelay:      nextBlockBootstrapLiveStageDelay,
-		})
-		result <- probeResult{downloaded: downloaded, err: err}
-	}()
-
-	logTimer := time.NewTimer(exactBlockDownloadWaitLogDelay)
-	defer logTimer.Stop()
-	for {
-		select {
-		case res := <-result:
-			if res.err != nil {
-				return p2p.DownloadedBlock{}, "", fmt.Errorf("probe block %s: %w", storage.FormatBlockRef(block), res.err)
-			}
-			return *res.downloaded, syncBlockSourceForKind(SyncBlockSourcePeerProbe, res.downloaded.Kind), nil
-		case <-logTimer.C:
-			waited := time.Duration(0)
-			if !state.started.IsZero() {
-				waited = time.Since(state.started)
-			}
-			s.log.Info().
-				Str("block", storage.FormatBlockRef(block)).
-				Int("probe_peers", decision.peerLimit).
-				Int("staged_probe_peers", decision.stagedPeerLimit).
-				Int("consecutive_misses", decision.consecutiveMisses).
-				Dur("waited", waited).
-				Msg("waiting for exact chain block download")
-			logTimer.Reset(exactBlockDownloadWaitLogEvery)
-		case <-queryCtx.Done():
-			return p2p.DownloadedBlock{}, "", fmt.Errorf("probe block %s: %w", storage.FormatBlockRef(block), queryCtx.Err())
-		case <-ctx.Done():
-			return p2p.DownloadedBlock{}, "", ctx.Err()
-		}
-	}
+	return *downloaded, syncBlockSourceForKind(SyncBlockSourcePeerProbe, downloaded.Kind), nil
 }

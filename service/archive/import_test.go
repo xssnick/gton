@@ -32,7 +32,7 @@ func TestImportBytesBuildsFullBlocksAndNextLinks(t *testing.T) {
 		t.Fatalf("read test package: %v", err)
 	}
 
-	imported, err := ImportBytes(context.Background(), &Downloaded{
+	imported, err := newTestArchiveImporter(t).ImportBytes(context.Background(), &Downloaded{
 		MasterchainSeqno: 100,
 		ArchiveID:        777,
 		Peer:             "peer",
@@ -66,7 +66,7 @@ func TestImportBytesStoresInlineBlocks(t *testing.T) {
 		t.Fatalf("read test package: %v", err)
 	}
 
-	imported, err := ImportBytes(context.Background(), &Downloaded{
+	imported, err := newTestArchiveImporter(t).ImportBytes(context.Background(), &Downloaded{
 		MasterchainSeqno: 100,
 		ArchiveID:        778,
 		Shard:            ShardID{Workchain: 0, Shard: topShard},
@@ -103,7 +103,7 @@ func TestImportStreamDoesNotExposePartialArtifacts(t *testing.T) {
 		t.Fatalf("read test package: %v", err)
 	}
 
-	imported, err := ImportStream(context.Background(), &Downloaded{
+	imported, err := newTestArchiveImporter(t).ImportStream(context.Background(), &Downloaded{
 		MasterchainSeqno: 100,
 		Shard:            ShardID{Workchain: -1, Shard: topShard},
 	}, bytes.NewReader(data))
@@ -128,7 +128,7 @@ func TestImportStreamDoesNotLinkPartialBlockEntries(t *testing.T) {
 		t.Fatalf("read test package: %v", err)
 	}
 
-	imported, err := ImportStream(context.Background(), &Downloaded{
+	imported, err := newTestArchiveImporter(t).ImportStream(context.Background(), &Downloaded{
 		MasterchainSeqno: 100,
 		Shard:            ShardID{Workchain: -1, Shard: topShard},
 	}, bytes.NewReader(data))
@@ -179,7 +179,7 @@ func TestImportStreamMasterFullBlockIgnoresProofLinkOrder(t *testing.T) {
 				t.Fatalf("read test package: %v", err)
 			}
 
-			imported, err := ImportBytes(context.Background(), &Downloaded{
+			imported, err := newTestArchiveImporter(t).ImportBytes(context.Background(), &Downloaded{
 				MasterchainSeqno: 100,
 				ArchiveID:        779,
 				Shard:            ShardID{Workchain: -1, Shard: topShard},
@@ -247,7 +247,7 @@ func TestImportBytesSeqRangeTracksRequestedShard(t *testing.T) {
 		t.Fatalf("read test package: %v", err)
 	}
 
-	imported, err := ImportBytes(context.Background(), &Downloaded{
+	imported, err := newTestArchiveImporter(t).ImportBytes(context.Background(), &Downloaded{
 		MasterchainSeqno: master.SeqNo,
 		Shard:            ShardID{Workchain: -1, Shard: topShard},
 	}, data)
@@ -331,6 +331,14 @@ func TestShardIDContainsBlock(t *testing.T) {
 type testEntry struct {
 	name string
 	data []byte
+}
+
+func newTestArchiveImporter(t *testing.T) *Importer {
+	t.Helper()
+
+	importer := NewImporter()
+	t.Cleanup(importer.Close)
+	return importer
 }
 
 func writeTestPackage(t *testing.T, entries []testEntry) string {

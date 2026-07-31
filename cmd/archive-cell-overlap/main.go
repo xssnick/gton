@@ -181,13 +181,15 @@ func run() error {
 
 	started := time.Now()
 	ctx := context.Background()
+	importer := archive.NewImporter()
+	defer importer.Close()
 	windows := make([]completedWindow, 0, opts.windows)
 	current := newWindowBuilder(1, limits)
 	seenBlocks := make(map[storage.BlockRootHash]struct{})
 	var duplicateBlocksSkipped uint64
 
 	for _, group := range groups {
-		slice, err := readSlice(ctx, group, seenBlocks)
+		slice, err := readSlice(ctx, importer, group, seenBlocks)
 		if err != nil {
 			return fmt.Errorf("read archive slice %d: %w", group.seqno, err)
 		}
@@ -334,7 +336,7 @@ func collectPackGroups(root string, startSeqno uint64) ([]packGroup, error) {
 	return result, nil
 }
 
-func readSlice(ctx context.Context, group packGroup, seenBlocks map[storage.BlockRootHash]struct{}) (sliceStats, error) {
+func readSlice(ctx context.Context, importer *archive.Importer, group packGroup, seenBlocks map[storage.BlockRootHash]struct{}) (sliceStats, error) {
 	result := sliceStats{
 		seqno: group.seqno,
 		cells: make(map[cell.Hash]uint32),
@@ -344,7 +346,7 @@ func readSlice(ctx context.Context, group packGroup, seenBlocks map[storage.Bloc
 		if err != nil {
 			return sliceStats{}, fmt.Errorf("open %s: %w", path, err)
 		}
-		imported, importErr := archive.ImportStream(ctx, &archive.Downloaded{MasterchainSeqno: uint32(group.seqno)}, file)
+		imported, importErr := importer.ImportStream(ctx, &archive.Downloaded{MasterchainSeqno: uint32(group.seqno)}, file)
 		closeErr := file.Close()
 		if importErr != nil {
 			return sliceStats{}, fmt.Errorf("import %s: %w", path, importErr)

@@ -856,6 +856,37 @@ func TestPlumtreeStatsConcurrentCounters(t *testing.T) {
 	}
 }
 
+func TestPlumtreeTelemetrySnapshot(t *testing.T) {
+	t.Parallel()
+
+	var telemetry plumtreeTelemetry
+	for range 3 {
+		telemetry.notePartReceived(plumtreePartSourceDirect)
+	}
+	for range 2 {
+		telemetry.notePartReceived(plumtreePartSourceRecovery)
+	}
+	for kind := range plumtreeMessageKindCount {
+		for range int(kind) + 1 {
+			telemetry.noteMessageReceived(kind)
+		}
+	}
+
+	snapshot := telemetry.snapshot()
+	if got := snapshot.receivedParts[plumtreePartSourceDirect]; got != 3 {
+		t.Fatalf("direct parts = %d, want 3", got)
+	}
+	if got := snapshot.receivedParts[plumtreePartSourceRecovery]; got != 2 {
+		t.Fatalf("recovery parts = %d, want 2", got)
+	}
+	for kind := range plumtreeMessageKindCount {
+		want := uint64(kind) + 1
+		if got := snapshot.receivedMessages[kind]; got != want {
+			t.Fatalf("message kind %d = %d, want %d", kind, got, want)
+		}
+	}
+}
+
 func BenchmarkPlumtreeStatsNoteDeliveredBroadcast(b *testing.B) {
 	stats := &plumtreeStats{}
 	b.ReportAllocs()
@@ -887,6 +918,26 @@ func BenchmarkPlumtreeStatsNoteUsefulDelivery(b *testing.B) {
 	for b.Loop() {
 		stats.NoteUsefulDelivery(now, 1_000)
 	}
+}
+
+func BenchmarkPlumtreeTelemetry(b *testing.B) {
+	var telemetry plumtreeTelemetry
+
+	b.Run("message", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			telemetry.noteMessageReceived(plumtreeMessageFEC)
+		}
+	})
+	b.Run("message_and_part", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			telemetry.noteMessageReceived(plumtreeMessageFEC)
+			telemetry.notePartReceived(plumtreePartSourceDirect)
+		}
+	})
 }
 
 func plumtreeStatsTestPeer(marker byte) PeerID {

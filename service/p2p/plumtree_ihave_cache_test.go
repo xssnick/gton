@@ -11,10 +11,11 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
-// TestPlumtreeIHaveSameFECPartReusesVerifiedSignature drives the real
-// signature verifier through the engine exactly as the wire path does: one FEC
-// part announced by several distinct peers. All those IHAVEs carry the source's
-// signature over the same part metadata, so only the first may run key math.
+// Drives the real signature verifier through the engine exactly as the wire path
+// does: one FEC part announced by several distinct peers. The first announcer
+// proves the broadcast and is the only arrival that runs key math; the rest are
+// deferred, and when the repair deadline hands them back they carry the same
+// signature over the same preimage, so re-verifying them all is free.
 func TestPlumtreeIHaveSameFECPartReusesVerifiedSignature(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -52,6 +53,11 @@ func TestPlumtreeIHaveSameFECPartReusesVerifiedSignature(t *testing.T) {
 	broadcastID := plumtreeEngineTestID(7)
 	const partIndex = int32(3)
 	treeIndex := partIndex + plumtreeFECTreeOffset
+	eager := plumtreeEngineTestPeer(100)
+	peers.receives[eager] = true
+	engine.mu.Lock()
+	engine.promoteEagerLocked(&engine.slots[treeIndex], eager, true, now)
+	engine.mu.Unlock()
 	symbol := []byte("plumtree ihave cache symbol")
 	partHash := sha256.Sum256(symbol)
 	payloadTimestamp := plumtreeUnixSeconds(now)
@@ -90,9 +96,38 @@ func TestPlumtreeIHaveSameFECPartReusesVerifiedSignature(t *testing.T) {
 
 	hits, misses := verifier.SignatureCacheStats()
 	if misses != 1 {
-		t.Fatalf("signature verifications = %d, want 1", misses)
+		t.Fatalf("arrival verifications = %d, want only the first announcer", misses)
 	}
-	if hits != announcers-1 {
-		t.Fatalf("signature cache hits = %d, want %d", hits, announcers-1)
+	if hits != 0 {
+		t.Fatalf("deferred announcements consulted the cache %d times", hits)
+	}
+
+	actions := engine.Alarm(now.Add(plumtreeRepairDelay))
+	if len(actions.Candidates) != plumtreeRepairTargetLimit {
+		t.Fatalf(
+			"candidates = %d, want %d",
+			len(actions.Candidates),
+			plumtreeRepairTargetLimit,
+		)
+	}
+	for i, candidate := range actions.Candidates {
+		if _, err = verifier.verifyAt(plumtreeVerification{
+			From:        candidate.Peer,
+			Source:      candidate.Source,
+			Certificate: candidate.Certificate,
+			DataSize:    uint32(candidate.DataSize),
+			SignedData:  candidate.CandidateSignedData(),
+			Signature:   candidate.Signature,
+		}, now); err != nil {
+			t.Fatalf("verify candidate %d: %v", i, err)
+		}
+	}
+
+	hits, misses = verifier.SignatureCacheStats()
+	if misses != 1 {
+		t.Fatalf("repair verifications = %d, want the arrival one to still be the only key math", misses)
+	}
+	if hits != plumtreeRepairTargetLimit {
+		t.Fatalf("signature cache hits = %d, want %d", hits, plumtreeRepairTargetLimit)
 	}
 }

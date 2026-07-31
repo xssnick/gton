@@ -16,8 +16,14 @@ import (
 )
 
 const (
-	plumtreeDeliveredLimit       = 1000
-	plumtreeMissingLimit         = 1024
+	plumtreeDeliveredLimit = 1000
+	// Every announced part we lack takes an entry, so this is sized for a stall,
+	// not for the steady state (~300). Together with plumtreeRepairTargetLimit it
+	// is also the bound on buffered announcements.
+	plumtreeMissingLimit = 4096
+	// A broadcast is proven by one verified signature; the marker must outlive the
+	// broadcast, so it is sized well past plumtreeMaxActiveStates.
+	plumtreeProvenLimit          = 4096
 	plumtreeActiveRepairLimit    = 512
 	plumtreeRepairTargetLimit    = 5
 	plumtreeActiveNeighbourLimit = 20
@@ -225,11 +231,10 @@ type plumtreeDelivery struct {
 
 type plumtreeActions struct {
 	Outbounds  []plumtreeOutboundAction
-	Repairs    []plumtreeRepairAction
 	Deliveries []plumtreeDelivery
-	// Candidates are buffered announcers whose signature still has to be
-	// verified before they can be asked for a part. The caller verifies them off
-	// the engine lock and feeds the survivors back through StartVerifiedRepair.
+	// Buffered announcers of a part whose deadline has passed. The caller verifies
+	// them off the engine lock and feeds the survivors back through
+	// StartVerifiedRepair, which is the only place a repair query is built.
 	Candidates []plumtreeRepairCandidate
 }
 
@@ -248,6 +253,7 @@ type plumtreePartKey struct {
 type plumtreePayloadContext struct {
 	from        PeerID
 	expectedKey plumtreePartKey
+	partSource  plumtreePartSource
 }
 
 type plumtreePendingPeer struct {
@@ -312,11 +318,6 @@ type plumtreeFECState struct {
 	decodeBuffer    []byte
 	parts           [plumtreeFECTotalParts]*plumtreePartState
 
-	// Per part, measured from that part's earliest announcement; zero means nothing
-	// pending. A single per-broadcast minimum would repair a late-announced part
-	// early and prune the healthy eager peer still pushing it.
-	repairAt [plumtreeFECTotalParts]time.Time
-
 	previous *plumtreeFECState
 	next     *plumtreeFECState
 }
@@ -333,13 +334,17 @@ type plumtreeSimpleState struct {
 	next     *plumtreeSimpleState
 }
 
+// A part we are waiting on, and the sole repair timer. repairAt is always
+// creation + plumtreeRepairDelay, which is what keeps the list ordered by
+// deadline and lets NextAlarm and the Alarm drain read only the head.
+//
+// announcers are the buffered IHAVEs for this part, capped so a part is never
+// asked of more peers than plumtreeRepairTargetLimit.
 type plumtreeMissingPart struct {
-	key         plumtreePartKey
-	dataSize    int32
-	targets     [plumtreeRepairTargetLimit]PeerID
-	targetCount uint8
-	sentTargets uint8
-	repairAt    time.Time
+	key            plumtreePartKey
+	repairAt       time.Time
+	announcers     [plumtreeRepairTargetLimit]*plumtreeAnnouncement
+	announcerCount uint8
 
 	previous *plumtreeMissingPart
 	next     *plumtreeMissingPart
@@ -379,11 +384,11 @@ type plumtreeEngine struct {
 	// Unverified IHAVEs, bucketed per announcing peer. See
 	// plumtree_announcements.go.
 	announcements map[PeerID]*plumtreePeerAnnouncements
-	// Same announcements, threaded by broadcast id: see plumtreeAnnouncement.
-	announcementsByBroadcast map[[sha256.Size]byte]*plumtreeAnnouncement
-	// Earliest repairAt and earliest retention deadline, cached so NextAlarm stays
-	// an O(1) read instead of a scan on every run-loop turn.
-	fecRepairNext     time.Time
+	// Broadcast ids proven to exist by one verified signature, so the rest of their
+	// IHAVEs can be taken on trust. See plumtree_announcements.go.
+	proven plumtreeRingSet[[sha256.Size]byte]
+	// Earliest retention deadline, cached so NextAlarm stays an O(1) read instead
+	// of a scan on every run-loop turn.
 	stateExpireNext   time.Time
 	pendingExpireNext time.Time
 
@@ -429,6 +434,7 @@ func newPlumtreeEngine(
 		announcements:    make(map[PeerID]*plumtreePeerAnnouncements),
 		repairs:          make(map[uint64]plumtreeRepairAttempt),
 		delivered:        newPlumtreeRingSet[[sha256.Size]byte](plumtreeDeliveredLimit),
+		proven:           newPlumtreeRingSet[[sha256.Size]byte](plumtreeProvenLimit),
 		notFoundBody:     notFoundBody,
 	}, nil
 }
@@ -457,9 +463,9 @@ func (e *plumtreeEngine) Close() {
 	e.missingOldest = nil
 	e.missingNewest = nil
 	e.announcements = nil
-	e.announcementsByBroadcast = nil
 	e.repairs = nil
 	e.delivered = plumtreeRingSet[[sha256.Size]byte]{}
+	e.proven = plumtreeRingSet[[sha256.Size]byte]{}
 	e.notFoundBody = nil
 }
 
@@ -716,7 +722,7 @@ func (e *plumtreeEngine) RemovePeer(peer PeerID) {
 	for i := range e.slots {
 		e.removeEagerLocked(&e.slots[i], peer)
 	}
-	delete(e.announcements, peer)
+	e.dropPeerAnnouncementsLocked(peer)
 }
 
 func (e *plumtreeEngine) statsEagerPeers(

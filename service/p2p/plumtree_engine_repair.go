@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"time"
+
+	"github.com/xssnick/tonutils-go/adnl/keys"
 )
 
 // The fields are already range-checked by the message validators.
@@ -48,19 +50,21 @@ func (e *plumtreeEngine) HandleIHave(
 		e.mu.Unlock()
 		return plumtreeActions{}, nil
 	}
-	// Two cases must verify now instead of deferring: with no eager peer in the
-	// tree there is nothing to wait for, and a simple broadcast has no partial
-	// state to hang a deadline on.
-	//
-	// Deliberately NOT a case: "we hold no state for this broadcast". That is what
-	// a fabricated broadcast id looks like, so verifying those on arrival hands an
-	// attacker back the very cost this path avoids. A stale eager slot is broken by
-	// expireInactiveEagerLocked instead.
-	if key.treeIndex != plumtreeSimpleTree && e.slots[key.treeIndex].eagerCount > 0 {
-		e.bufferAnnouncementLocked(key, from, source, certificate, message, now)
-		e.armFECRepairLocked(key, now)
+	// A proven broadcast is one whose existence a signature has already
+	// established, so the rest of its FEC announcements are taken on trust and
+	// checked only if we end up asking that peer for the part. Simple broadcasts
+	// have a single part and so never have a "rest" to defer.
+	if key.treeIndex != plumtreeSimpleTree && e.provenLocked(key.broadcastID) {
+		actions := e.recordIHaveLocked(
+			key,
+			from,
+			source,
+			certificate,
+			message,
+			now,
+		)
 		e.mu.Unlock()
-		return plumtreeActions{}, nil
+		return actions, nil
 	}
 	e.mu.Unlock()
 
@@ -119,29 +123,49 @@ func (e *plumtreeEngine) HandleIHave(
 		return plumtreeActions{}, nil
 	}
 
+	if key.treeIndex != plumtreeSimpleTree {
+		e.proven.add(key.broadcastID)
+	}
+	return e.recordIHaveLocked(
+		key,
+		from,
+		source,
+		certificate,
+		message,
+		commitNow,
+	), nil
+}
+
+func (e *plumtreeEngine) recordIHaveLocked(
+	key plumtreePartKey,
+	from PeerID,
+	source keys.PublicKeyED25519,
+	certificate plumtreeCertificate,
+	message BroadcastPlumtreeIHave,
+	now time.Time,
+) plumtreeActions {
+	e.recordAnnouncementLocked(
+		key,
+		from,
+		source,
+		certificate,
+		message,
+		now,
+	)
+
 	missing := e.missing[key]
-	if missing == nil {
-		missing = &plumtreeMissingPart{
-			key:      key,
-			dataSize: message.DataSize,
-			repairAt: commitNow.Add(plumtreeRepairDelay),
-		}
-		e.addMissingLocked(missing)
-		for len(e.missing) > plumtreeMissingLimit {
-			e.eraseMissingLocked(e.missingOldest.key)
-		}
-	} else if message.DataSize > missing.dataSize {
-		missing.dataSize = message.DataSize
+	if missing == nil || e.slots[key.treeIndex].eagerCount != 0 {
+		return plumtreeActions{}
 	}
 
-	missing.targets[missing.targetCount] = from
-	missing.targetCount++
-
-	var actions plumtreeActions
-	if e.slots[key.treeIndex].eagerCount == 0 {
-		e.startRepairRequestsLocked(commitNow, missing, &actions)
+	// With no eager peer there is no payload path worth waiting for. Hand the
+	// announcers to the same verification boundary as delayed repairs; a freshly
+	// verified first IHAVE hits the verifier tuple cache there.
+	actions := plumtreeActions{
+		Candidates: e.takeCandidatesLocked(missing, nil),
 	}
-	return actions, nil
+	e.eraseMissingLocked(key)
+	return actions
 }
 
 func (e *plumtreeEngine) ignoreIHaveLocked(
@@ -155,22 +179,12 @@ func (e *plumtreeEngine) ignoreIHaveLocked(
 		return true
 	}
 
-	// Per-peer dedup only; the cap across peers is applied when candidates are
-	// selected, keeping it off the per-message path.
 	if e.hasAnnouncementLocked(key, from) {
 		return true
 	}
 
 	missing := e.missing[key]
-	if missing == nil {
-		return false
-	}
-	for i := range int(missing.targetCount) {
-		if missing.targets[i] == from {
-			return true
-		}
-	}
-	return int(missing.targetCount) >= plumtreeRepairTargetLimit
+	return missing != nil && int(missing.announcerCount) >= plumtreeRepairTargetLimit
 }
 
 func (e *plumtreeEngine) HandlePrune(
@@ -315,20 +329,20 @@ func (e *plumtreeEngine) Alarm(now time.Time) plumtreeActions {
 	// Sweeping here, not while forwarding a payload, is what makes the inactivity
 	// TTL apply to a neighbour that stopped sending - the case that matters.
 	e.expireInactiveEagerLocked(now)
-	e.expireAnnouncementsLocked(now)
 
 	var actions plumtreeActions
 	// Before draining repairs: expiry moves ids into e.delivered, and a repair for
-	// a state removed two statements later would be dead on arrival.
+	// a part erased two statements later would be dead on arrival.
 	e.expireBroadcastsLocked(now)
-	actions.Candidates = e.dueFECRepairsLocked(now, actions.Candidates)
 
-	for e.missingOldest != nil {
+	// Leftovers keep their deadline, which is already in the past, so NextAlarm
+	// brings us straight back for them.
+	for e.missingOldest != nil && len(actions.Candidates) < plumtreeCandidatesPerAlarm {
 		missing := e.missingOldest
 		if missing.repairAt.After(now) {
 			break
 		}
-		e.startRepairRequestsLocked(now, missing, &actions)
+		actions.Candidates = e.takeCandidatesLocked(missing, actions.Candidates)
 		e.eraseMissingLocked(missing.key)
 	}
 
@@ -395,10 +409,6 @@ func (e *plumtreeEngine) NextAlarm() (time.Time, bool) {
 		next = e.missingOldest.repairAt
 		hasNext = true
 	}
-	if !e.fecRepairNext.IsZero() && (!hasNext || e.fecRepairNext.Before(next)) {
-		next = e.fecRepairNext
-		hasNext = true
-	}
 	if !e.stateExpireNext.IsZero() && (!hasNext || e.stateExpireNext.Before(next)) {
 		next = e.stateExpireNext
 		hasNext = true
@@ -441,25 +451,6 @@ func (e *plumtreeEngine) newRepairLocked(
 		},
 		Timeout:       plumtreeRepairTimeout,
 		MaxAnswerSize: uint64(dataSize) + plumtreeRepairMTUOverhead,
-	}
-}
-
-func (e *plumtreeEngine) startRepairRequestsLocked(
-	now time.Time,
-	missing *plumtreeMissingPart,
-	actions *plumtreeActions,
-) {
-	for missing.sentTargets < missing.targetCount {
-		peer := missing.targets[missing.sentTargets]
-		missing.sentTargets++
-		if len(e.repairs) >= plumtreeActiveRepairLimit {
-			continue
-		}
-
-		actions.Repairs = append(
-			actions.Repairs,
-			e.newRepairLocked(now, missing.key, peer, missing.dataSize),
-		)
 	}
 }
 
@@ -552,6 +543,10 @@ func (e *plumtreeEngine) eraseMissingLocked(key plumtreePartKey) {
 		e.missingNewest = missing.previous
 	}
 	delete(e.missing, key)
+
+	for i := range int(missing.announcerCount) {
+		e.detachAnnouncementLocked(missing.announcers[i])
+	}
 }
 
 func (e *plumtreeEngine) removeFECStateLocked(state *plumtreeFECState) {

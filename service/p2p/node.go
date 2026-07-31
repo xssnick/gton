@@ -113,6 +113,9 @@ type Node struct {
 	// appliedMasterchainSeqno is the highest masterchain seqno the service has
 	// applied; broadcasts at or below it are dropped before signature work.
 	appliedMasterchainSeqno atomic.Uint32
+	// appliedShardHeads is the same gate for shards, rebuilt from every
+	// committed masterchain state; nil until the first one is published.
+	appliedShardHeads atomic.Pointer[appliedShardHeadTable]
 
 	offlineReasonMu sync.RWMutex
 	offlineReason   string
@@ -660,8 +663,22 @@ func (n *Node) Wait() {
 }
 
 func (n *Node) EnterOffline(reason string) {
+	n.enterOffline(reason, false)
+}
+
+// enterOfflineFailure is EnterOffline for an unexpected subsystem death. The
+// failure flag is raised before the offline transition, and the failure signal
+// is published only after its reason is ready for observers.
+func (n *Node) enterOfflineFailure(reason string) {
+	n.enterOffline(reason, true)
+}
+
+func (n *Node) enterOffline(reason string, failed bool) {
 	if strings.TrimSpace(reason) == "" {
 		reason = "offline mode requested"
+	}
+	if failed {
+		n.offlineFailed.Store(true)
 	}
 	if !n.offline.CompareAndSwap(false, true) {
 		return
@@ -671,21 +688,16 @@ func (n *Node) EnterOffline(reason string) {
 	n.offlineReason = reason
 	n.offlineReasonMu.Unlock()
 
+	if failed {
+		n.onceFailed.Do(func() {
+			close(n.failed)
+		})
+	}
+
 	n.log.Info().
 		Str("reason", reason).
 		Msg("entering p2p offline mode")
 	n.stop()
-}
-
-// enterOfflineFailure is EnterOffline for an unexpected subsystem death. The
-// failure flag is raised before the node stops, so anything that observes
-// IsOffline during the teardown already sees that this was not deliberate.
-func (n *Node) enterOfflineFailure(reason string) {
-	n.offlineFailed.Store(true)
-	n.onceFailed.Do(func() {
-		close(n.failed)
-	})
-	n.EnterOffline(reason)
 }
 
 func (n *Node) IsOffline() bool {

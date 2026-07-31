@@ -28,11 +28,9 @@ const (
 )
 
 // offloadedBroadcastDecode is a full-block broadcast whose validator
-// signatures passed the predecode parse on the listen thread; the expensive
-// payload decode runs on the bounded decode pool so multi-MB blocks do not
-// stall ADNL listeners or delay FEC relay to other peers. The ed25519 pass
-// itself may still be in flight when the decode is enqueued: sigJoin carries
-// its outcome, and the worker joins it before publishing anything it decoded.
+// signatures the transport thread already verified; the expensive payload
+// decode runs on the bounded decode pool so multi-MB blocks do not stall ADNL
+// listeners or delay FEC relay to other peers.
 type offloadedBroadcastDecode struct {
 	fingerprint  string
 	overlay      string
@@ -45,26 +43,7 @@ type offloadedBroadcastDecode struct {
 	msg          any
 	proofRoot    *cell.Cell
 	preSigSet    *blockproof.ValidatorSignatureSet
-	sigJoin      *broadcastSignatureJoin
 	rebroadcast  *rebroadcastRequest
-}
-
-// waitSignatures joins the signature check that was still in flight when the
-// decode was enqueued. A nil handle means the check already resolved before
-// the enqueue, so there is nothing to wait for.
-func (req offloadedBroadcastDecode) waitSignatures() error {
-	if req.sigJoin == nil {
-		return nil
-	}
-	return req.sigJoin.wait()
-}
-
-// signaturesAlreadyFailed reports a check that resolved as failed before a
-// worker picked this request up. It never blocks, so the overlap with a check
-// still in flight is unaffected; it only keeps a queue that drained slowly from
-// buying a multi-MB decode whose result could only be discarded.
-func (req offloadedBroadcastDecode) signaturesAlreadyFailed() bool {
-	return req.sigJoin.failed()
 }
 
 func broadcastDecodeWorkerCount() int {
@@ -163,12 +142,7 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 		return
 	}
 	if !n.canAcceptBroadcast(req.kind, false) {
-		// keep the single-owner split with the transport thread: a failed
-		// signature join already did its bookkeeping there, so only a verified
-		// broadcast is forgotten (letting a later redelivery re-run admission)
-		if req.waitSignatures() != nil {
-			return
-		}
+		// forget the fingerprint so a later redelivery re-runs admission
 		n.deduper.Forget(req.fingerprint)
 		n.noteBroadcastDrop(req.overlay, req.kind, "broadcast_admission_closed")
 		return
@@ -176,9 +150,6 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 
 	downloaded, sigSet, cacheErr := n.decodedBroadcasts.get(req.kind, req.block)
 	if cacheErr == nil {
-		if req.waitSignatures() != nil {
-			return
-		}
 		n.noteBroadcast("decode_reused", req.overlay, req.kind, req.delivery)
 		if req.preSigSet != nil {
 			sigSet = req.preSigSet
@@ -186,38 +157,15 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 	} else {
 		var err error
 		started := n.startBroadcastPipelineStage()
-		if req.signaturesAlreadyFailed() {
-			// The check failed while this request waited for a worker, so the
-			// decode is pure waste. The transport thread owns the
-			// signature-failure bookkeeping; only the stage sample is recorded
-			// here, keeping one sample per enqueued decode.
-			n.observeBroadcastPipelineStageSince(started, broadcastPipelineStageDecodeAsync, req.kind, req.delivery, broadcastPipelineResultDrop)
-			return
-		}
 		downloaded, sigSet, err = n.decodeBroadcastBlock(ctx, req.msg, req.proofRoot, req.preSigSet)
-		// the decode was enqueued before the transport thread joined the
-		// signature check, so join it here before publishing anything the
-		// decode produced. The stage duration therefore includes the residual
-		// signature wait — usually zero, since the ed25519 pass resolves in
-		// single-digit ms while the decode is the multi-MB part.
-		sigErr := req.waitSignatures()
 		result := broadcastPipelineResultSuccess
-		switch {
-		case sigErr != nil:
-			result = broadcastPipelineResultDrop
-		case err != nil:
+		if err != nil {
 			result = broadcastPipelineResultError
 			if isBroadcastDecompressionStateNotReady(err) {
 				result = broadcastPipelineResultMiss
 			}
 		}
 		n.observeBroadcastPipelineStageSince(started, broadcastPipelineStageDecodeAsync, req.kind, req.delivery, result)
-		if sigErr != nil {
-			// the transport thread owns the signature-failure bookkeeping
-			// (dedupe forget + drop metric + relay suppression); discard the
-			// decode without accepting or caching anything
-			return
-		}
 		if err != nil {
 			n.handleOffloadedBroadcastDecodeError(req, err)
 			return

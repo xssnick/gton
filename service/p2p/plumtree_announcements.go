@@ -4,32 +4,36 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
-	"slices"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
 )
 
-// Buffered IHAVEs whose signature is checked only if we end up asking that peer
-// for the part: measured, 99.98% of IHAVE verifications were never used.
+// Buffered IHAVEs for parts we are still waiting on.
 //
-// Unverified input reaches nothing shared - a flooding peer evicts only its own
-// entries, and e.missing and fecState.parts stay signature-gated.
+// Only the first IHAVE of a broadcast is verified on arrival, and only while no
+// payload part of it has been verified yet: one signature proves the broadcast
+// exists and that its source is authorised, and every part of a real FEC
+// broadcast exists by construction. The remaining IHAVEs are taken on trust and
+// checked at repair time, if we end up asking that peer for the part - measured,
+// 99.98% of IHAVE verifications were never used. Simple broadcasts always verify
+// on arrival: there is one part, so there is no "rest" to defer.
+//
+// Every announcement belongs to a live e.missing entry and dies with it, so the
+// buffers are bounded by plumtreeMissingLimit x plumtreeRepairTargetLimit and
+// need no sweep of their own. A peer that announces garbage occupies one of the
+// five slots of a part until the repair verifies it, fails, and bans it.
 
-const (
-	// Must exceed plumtreeFECTotalParts: a relay announces every part it holds, so
-	// a smaller cap would make a peer evict its own earlier announcements.
-	plumtreeAnnouncementPeerLimit = 2 * int(plumtreeFECTotalParts)
-	// Above plumtreeRepairDelay so an announcement outlives its own deadline, well
-	// below plumtreeBroadcastLifetime so fabricated ids drain on their own.
-	plumtreeAnnouncementTTL = 3 * time.Second
-	// One ed25519 verify each on the run-loop goroutine, which also dispatches
-	// sends. Leftovers keep their deadline and are picked up on the next turn.
-	plumtreeCandidatesPerAlarm = 32
-)
+// One ed25519 verify per candidate, on the run-loop goroutine that also
+// dispatches sends, so a single Alarm hands out no more than this.
+const plumtreeCandidatesPerAlarm = 32
+
+// Announcements per peer. Only a bound on how much one peer may hold across all
+// parts; the per-part bound that decides who gets asked is announcerCount.
+const plumtreeAnnouncementPeerLimit = 8 * plumtreeRepairTargetLimit
 
 // One buffered IHAVE. Fixed-size arrays, not the wire slices: IHAVE is parsed
-// with ParseNoCopy, so a retained slice would pin the QUIC frame for the TTL.
+// with ParseNoCopy, so a retained slice would pin the QUIC frame.
 type plumtreeAnnouncement struct {
 	key              plumtreePartKey
 	peer             PeerID
@@ -43,13 +47,6 @@ type plumtreeAnnouncement struct {
 
 	previous *plumtreeAnnouncement
 	next     *plumtreeAnnouncement
-
-	// Second intrusive list, threading every announcement of one broadcast id
-	// across all peers. Without it both arming a new state and picking repair
-	// candidates walk every buffer of every peer under e.mu, and how much work
-	// that is, is decided by whoever sends us the most unverified IHAVEs.
-	broadcastPrevious *plumtreeAnnouncement
-	broadcastNext     *plumtreeAnnouncement
 }
 
 // An announcement handed out for verification: a value copy, so ed25519 runs off
@@ -65,8 +62,9 @@ type plumtreeRepairCandidate struct {
 	DataSize         int32
 }
 
-// One peer's queue, oldest first: map for lookup by part, list for eviction and
-// TTL draining from the front.
+// One peer's queue, oldest first: map for lookup by part, list for eviction from
+// the front. It exists so banning a peer drops its announcements without walking
+// every part we are waiting on.
 type plumtreePeerAnnouncements struct {
 	byKey  map[plumtreePartKey]*plumtreeAnnouncement
 	oldest *plumtreeAnnouncement
@@ -74,9 +72,15 @@ type plumtreePeerAnnouncements struct {
 	count  int
 }
 
-// The caller has already checked, under this lock, that the peer has not
-// announced this part and that the per-part candidate cap leaves room.
-func (e *plumtreeEngine) bufferAnnouncementLocked(
+// A broadcast whose existence one verified signature has already established.
+func (e *plumtreeEngine) provenLocked(broadcastID [sha256.Size]byte) bool {
+	return e.proven.contains(broadcastID) || e.fecStates[broadcastID] != nil
+}
+
+// Records an IHAVE and arms the repair timer for its part. The caller has
+// already checked, under this lock, that the part is still wanted and that this
+// peer has not announced it.
+func (e *plumtreeEngine) recordAnnouncementLocked(
 	key plumtreePartKey,
 	from PeerID,
 	source keys.PublicKeyED25519,
@@ -84,6 +88,22 @@ func (e *plumtreeEngine) bufferAnnouncementLocked(
 	message BroadcastPlumtreeIHave,
 	now time.Time,
 ) {
+	missing := e.missing[key]
+	if missing == nil {
+		// Refuse the newest rather than evict the oldest: the list is ordered by
+		// deadline, so the oldest entry is the one about to fire.
+		if len(e.missing) >= plumtreeMissingLimit {
+			return
+		}
+		missing = &plumtreeMissingPart{
+			key:      key,
+			repairAt: now.Add(plumtreeRepairDelay),
+		}
+		e.addMissingLocked(missing)
+	} else if int(missing.announcerCount) >= plumtreeRepairTargetLimit {
+		return
+	}
+
 	queue := e.announcements[from]
 	if queue == nil {
 		queue = &plumtreePeerAnnouncements{
@@ -105,55 +125,16 @@ func (e *plumtreeEngine) bufferAnnouncementLocked(
 	announcement.certificate = ownPlumtreeCertificate(certificate)
 
 	queue.push(announcement)
-	e.indexAnnouncementLocked(announcement)
+	missing.announcers[missing.announcerCount] = announcement
+	missing.announcerCount++
+
 	for queue.count > plumtreeAnnouncementPeerLimit {
-		e.detachAnnouncementLocked(queue, queue.oldest)
+		e.dropAnnouncementLocked(queue.oldest)
 	}
-}
-
-// The by-broadcast list is maintained here rather than in the queue methods:
-// the queue does not know the engine, and every removal path must unindex.
-func (e *plumtreeEngine) indexAnnouncementLocked(announcement *plumtreeAnnouncement) {
-	if e.announcementsByBroadcast == nil {
-		e.announcementsByBroadcast = map[[sha256.Size]byte]*plumtreeAnnouncement{}
-	}
-	head := e.announcementsByBroadcast[announcement.key.broadcastID]
-	announcement.broadcastNext = head
-	if head != nil {
-		head.broadcastPrevious = announcement
-	}
-	e.announcementsByBroadcast[announcement.key.broadcastID] = announcement
-}
-
-func (e *plumtreeEngine) unindexAnnouncementLocked(announcement *plumtreeAnnouncement) {
-	if announcement.broadcastPrevious != nil {
-		announcement.broadcastPrevious.broadcastNext = announcement.broadcastNext
-	} else if e.announcementsByBroadcast[announcement.key.broadcastID] == announcement {
-		if announcement.broadcastNext != nil {
-			e.announcementsByBroadcast[announcement.key.broadcastID] = announcement.broadcastNext
-		} else {
-			delete(e.announcementsByBroadcast, announcement.key.broadcastID)
-		}
-	}
-	if announcement.broadcastNext != nil {
-		announcement.broadcastNext.broadcastPrevious = announcement.broadcastPrevious
-	}
-	announcement.broadcastPrevious = nil
-	announcement.broadcastNext = nil
-}
-
-// detachAnnouncementLocked is the only way an announcement leaves a queue: it
-// keeps the per-peer list and the by-broadcast index in step.
-func (e *plumtreeEngine) detachAnnouncementLocked(
-	queue *plumtreePeerAnnouncements,
-	announcement *plumtreeAnnouncement,
-) {
-	queue.remove(announcement)
-	e.unindexAnnouncementLocked(announcement)
 }
 
 // The issuer key is copied by the parser, but the signature aliases the inbound
-// QUIC frame and would pin it for the whole TTL.
+// QUIC frame and would pin it for as long as the announcement lives.
 func ownPlumtreeCertificate(certificate plumtreeCertificate) plumtreeCertificate {
 	switch certificate.kind {
 	case plumtreeCertificateLegacy:
@@ -164,66 +145,38 @@ func ownPlumtreeCertificate(certificate plumtreeCertificate) plumtreeCertificate
 	return certificate
 }
 
-// Takes up to plumtreeRepairTargetLimit announcers of a part. Consuming the
-// entries is what stops a peer being asked twice for the same part.
-func (e *plumtreeEngine) takeCandidatesLocked(
-	key plumtreePartKey,
-	into []plumtreeRepairCandidate,
-) []plumtreeRepairCandidate {
-	// Eager-path targets count against the same limit.
-	budget := plumtreeRepairTargetLimit
-	if missing := e.missing[key]; missing != nil {
-		budget -= int(missing.targetCount)
-	}
-	if budget <= 0 {
-		return into
-	}
+// Drops an announcement from both the peer queue and its part, taking the part
+// with it once nothing is left to ask.
+func (e *plumtreeEngine) dropAnnouncementLocked(announcement *plumtreeAnnouncement) {
+	e.detachAnnouncementLocked(announcement)
 
-	// Earliest announcer first, not map order: a flood of late garbage must not
-	// crowd honest announcers out of the budget.
-	matched := e.matchedAnnouncements(key)
-	slices.SortFunc(matched, func(a, b *plumtreeAnnouncement) int {
-		return a.announcedAt.Compare(b.announcedAt)
-	})
-	if len(matched) > budget {
-		matched = matched[:budget]
+	missing := e.missing[announcement.key]
+	if missing == nil {
+		return
 	}
-
-	for _, announcement := range matched {
-		into = append(into, plumtreeRepairCandidate{
-			Key:              announcement.key,
-			Peer:             announcement.peer,
-			Source:           keys.PublicKeyED25519{Key: announcement.source[:]},
-			Certificate:      announcement.certificate,
-			Signature:        announcement.signature[:],
-			DataHash:         announcement.dataHash[:],
-			PayloadTimestamp: announcement.payloadTimestamp,
-			DataSize:         announcement.dataSize,
-		})
-		e.removeAnnouncementLocked(announcement)
-	}
-	return into
-}
-
-// Walks only the announcements of this broadcast id, not every peer's buffer.
-// One entry per (peer, key) is guaranteed by the hasAnnouncementLocked check
-// before buffering, so this yields the same set as the per-peer lookup did.
-func (e *plumtreeEngine) matchedAnnouncements(key plumtreePartKey) []*plumtreeAnnouncement {
-	var matched []*plumtreeAnnouncement
-	for announcement := e.announcementsByBroadcast[key.broadcastID]; announcement != nil; announcement = announcement.broadcastNext {
-		if announcement.key == key {
-			matched = append(matched, announcement)
+	for i := range int(missing.announcerCount) {
+		if missing.announcers[i] != announcement {
+			continue
 		}
+		last := int(missing.announcerCount) - 1
+		missing.announcers[i] = missing.announcers[last]
+		missing.announcers[last] = nil
+		missing.announcerCount--
+		break
 	}
-	return matched
+	if missing.announcerCount == 0 {
+		e.eraseMissingLocked(missing.key)
+	}
 }
 
-func (e *plumtreeEngine) removeAnnouncementLocked(announcement *plumtreeAnnouncement) {
+// Removes an announcement from its peer queue only. Callers that are discarding
+// the part itself use this, so erasing a part cannot recurse back into it.
+func (e *plumtreeEngine) detachAnnouncementLocked(announcement *plumtreeAnnouncement) {
 	queue := e.announcements[announcement.peer]
 	if queue == nil {
 		return
 	}
-	e.detachAnnouncementLocked(queue, announcement)
+	queue.remove(announcement)
 	if queue.count == 0 {
 		delete(e.announcements, announcement.peer)
 	}
@@ -234,113 +187,38 @@ func (e *plumtreeEngine) hasAnnouncementLocked(key plumtreePartKey, from PeerID)
 	return queue != nil && queue.byKey[key] != nil
 }
 
-// Drains entries past the TTL. Called from Alarm, so there is no separate sweep.
-func (e *plumtreeEngine) expireAnnouncementsLocked(now time.Time) {
-	cutoff := now.Add(-plumtreeAnnouncementTTL)
-	for peer, queue := range e.announcements {
-		for queue.oldest != nil && !queue.oldest.announcedAt.After(cutoff) {
-			e.detachAnnouncementLocked(queue, queue.oldest)
-		}
-		if queue.count == 0 {
-			delete(e.announcements, peer)
-		}
-	}
-}
-
-// Schedules a revisit of the broadcast once the repair delay expires, measured
-// from the announcement so buffering does not postpone the repair.
-//
-// Simple broadcasts are never armed: their state exists only once the whole
-// payload is in hand, so the eager path repairs them immediately instead.
-func (e *plumtreeEngine) armFECRepairLocked(key plumtreePartKey, announcedAt time.Time) {
-	state := e.fecStates[key.broadcastID]
-	if state == nil || state.parts[key.partIndex] != nil {
-		return
-	}
-	e.setFECRepairAtLocked(state, key.partIndex, announcedAt.Add(plumtreeRepairDelay))
-}
-
-// Arms a broadcast whose state has just appeared, from the earliest announcement
-// of each part it lacks - announcements routinely precede the first payload part.
-//
-// Walks only this broadcast's announcements: it runs under e.mu for every new
-// broadcast, so a sweep over every peer's buffer would put the cost of the hot
-// path in the hands of whoever floods the most unverified IHAVEs.
-func (e *plumtreeEngine) armFECRepairForStateLocked(state *plumtreeFECState) {
-	for announcement := e.announcementsByBroadcast[state.broadcastID]; announcement != nil; announcement = announcement.broadcastNext {
-		key := announcement.key
-		if key.treeIndex == plumtreeSimpleTree || state.parts[key.partIndex] != nil {
-			continue
-		}
-		e.setFECRepairAtLocked(
-			state,
-			key.partIndex,
-			announcement.announcedAt.Add(plumtreeRepairDelay),
-		)
-	}
-}
-
-func (e *plumtreeEngine) setFECRepairAtLocked(
-	state *plumtreeFECState,
-	partIndex int32,
-	at time.Time,
-) {
-	current := state.repairAt[partIndex]
-	if current.IsZero() || at.Before(current) {
-		state.repairAt[partIndex] = at
-		current = at
-	}
-	if e.fecRepairNext.IsZero() || current.Before(e.fecRepairNext) {
-		e.fecRepairNext = current
-	}
-}
-
-// Collects candidates for every part still missing from a broadcast whose
-// deadline passed. Verified state decides what is wanted, announcements only whom
-// to ask.
-func (e *plumtreeEngine) dueFECRepairsLocked(
-	now time.Time,
+// Hands out every announcer of a part whose deadline has passed. The caller
+// erases the part right after, which releases the announcements.
+func (e *plumtreeEngine) takeCandidatesLocked(
+	missing *plumtreeMissingPart,
 	into []plumtreeRepairCandidate,
 ) []plumtreeRepairCandidate {
-	e.fecRepairNext = time.Time{}
-	for _, state := range e.fecStates {
-		usable := !state.isDelivered && !state.hasDecodeFailed
-		for partIndex := range state.repairAt {
-			at := state.repairAt[partIndex]
-			if at.IsZero() {
-				continue
-			}
-			// Leave the deadline so the next turn picks this part up.
-			if at.After(now) || len(into) >= plumtreeCandidatesPerAlarm {
-				if e.fecRepairNext.IsZero() || at.Before(e.fecRepairNext) {
-					e.fecRepairNext = at
-				}
-				continue
-			}
+	if state := e.fecStates[missing.key.broadcastID]; state != nil &&
+		(state.isDelivered || state.hasDecodeFailed) {
+		return into
+	}
 
-			state.repairAt[partIndex] = time.Time{}
-			if !usable || state.parts[partIndex] != nil {
-				continue
-			}
-			into = e.takeCandidatesLocked(plumtreeFECPartKey(
-				state.broadcastID,
-				int32(partIndex),
-			), into)
-		}
+	for i := range int(missing.announcerCount) {
+		announcement := missing.announcers[i]
+		into = append(into, plumtreeRepairCandidate{
+			Key:              announcement.key,
+			Peer:             announcement.peer,
+			Source:           keys.PublicKeyED25519{Key: announcement.source[:]},
+			Certificate:      announcement.certificate,
+			Signature:        announcement.signature[:],
+			DataHash:         announcement.dataHash[:],
+			PayloadTimestamp: announcement.payloadTimestamp,
+			DataSize:         announcement.dataSize,
+		})
 	}
 	return into
 }
 
-func plumtreeFECPartKey(broadcastID [sha256.Size]byte, partIndex int32) plumtreePartKey {
-	return plumtreePartKey{
-		broadcastID: broadcastID,
-		partIndex:   partIndex,
-		treeIndex:   partIndex + plumtreeFECTreeOffset,
-	}
-}
-
 // StartVerifiedRepair registers a repair query for a verified candidate, if the
 // part is still wanted. Takes the lock itself.
+//
+// DataSize comes from the announcement the caller has just verified, so the RLDP
+// answer budget is attested by the source rather than claimed by the announcer.
 func (e *plumtreeEngine) StartVerifiedRepair(
 	now time.Time,
 	candidate plumtreeRepairCandidate,
@@ -351,10 +229,10 @@ func (e *plumtreeEngine) StartVerifiedRepair(
 	if e.closed || len(e.repairs) >= plumtreeActiveRepairLimit {
 		return plumtreeRepairAction{}, false
 	}
-	if e.getPartLocked(candidate.Key) != nil {
+	if e.isSettledBroadcastLocked(candidate.Key.broadcastID) {
 		return plumtreeRepairAction{}, false
 	}
-	if !e.hasStateLocked(candidate.Key.broadcastID) {
+	if e.getPartLocked(candidate.Key) != nil {
 		return plumtreeRepairAction{}, false
 	}
 
@@ -365,14 +243,17 @@ func (e *plumtreeEngine) DropPeerAnnouncements(peer PeerID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	e.dropPeerAnnouncementsLocked(peer)
+}
+
+func (e *plumtreeEngine) dropPeerAnnouncementsLocked(peer PeerID) {
 	queue := e.announcements[peer]
 	if queue == nil {
 		return
 	}
 	for queue.oldest != nil {
-		e.detachAnnouncementLocked(queue, queue.oldest)
+		e.dropAnnouncementLocked(queue.oldest)
 	}
-	delete(e.announcements, peer)
 }
 
 // CandidateSignedData rebuilds the preimage the announcer signed.
@@ -419,6 +300,8 @@ func (q *plumtreePeerAnnouncements) remove(announcement *plumtreeAnnouncement) {
 	} else {
 		q.newest = announcement.previous
 	}
+	announcement.previous = nil
+	announcement.next = nil
 	delete(q.byKey, announcement.key)
 	q.count--
 }

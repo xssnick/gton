@@ -131,11 +131,13 @@ sync queues.
 | `gton_p2p_queue_dropped_total` | counter | `queue` | Number of rejected pushes into a P2P queue. |
 | `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind`, `delivery` | Number of P2P broadcasts received, accepted, or successfully sent through the app-level rebroadcast queue by type and delivery mode. |
 | `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. |
-| `gton_p2p_broadcast_pipeline_stage_duration_seconds` | histogram | `stage`, `kind`, `delivery`, `result` | Inbound broadcast hot-path stage latency. Stages include `fec_decode`, `classify`, `candidate_decode`, `shard_desc_validate`, `hot_cache_notify`, `exact_pop`, `decode_async` (block decode on the bounded decode pool), and `decode_inline` (block decode on the transport receive goroutine). The decode is enqueued on the pool *before* the transport thread joins the concurrent validator-signature check, so the two overlap: `decode_async` now also covers the residual signature wait the worker pays before publishing its result (usually zero, since the ed25519 pass resolves well inside the decode), and `result="drop"` there means the signatures failed after the decode and the result was discarded without being accepted or cached. `classify` still contains the full signature wait — the relay/trust decision is returned synchronously to the overlay, so that join cannot leave the transport thread — but it no longer serializes the decode behind it. `decode_inline` covers two cases: payload kinds that cannot be offloaded because their validator signatures are only verifiable after the decode (`tonNode.blockBroadcastCompressed`, i.e. v1), and payloads the decode pool refused. Compare it against `decode_async` per `kind`: a rising `decode_inline` rate on `tonNode.blockBroadcastCompressedV2` or `tonNode.blockBroadcast` is the pool-undersized signal, while v1 traffic is expected there. |
+| `gton_p2p_broadcast_pipeline_stage_duration_seconds` | histogram | `stage`, `kind`, `delivery`, `result` | Inbound broadcast hot-path stage latency. Stages include `fec_decode`, `classify`, `candidate_decode`, `shard_desc_validate`, `block_broadcast_signature_check`, `hot_cache_notify`, `exact_pop`, `decode_async` (block decode on the bounded decode pool), and `decode_inline` (block decode on the transport receive goroutine). `block_broadcast_signature_check` is the validator-signature pass over a full block broadcast, run on the transport thread *before* the payload decode is enqueued (the reference ordering: `validate_block_broadcast_signatures` gates `obtain_state_for_decompression`), so an unverified payload never buys a decode worker. It is measured separately but is contained in `classify`, which the relay/trust decision keeps on that thread anyway. `decode_inline` covers two cases: payload kinds that cannot be offloaded because their validator signatures are only verifiable after the decode (`tonNode.blockBroadcastCompressed`, i.e. v1 — the only kind whose signature check is sampled after its decode), and payloads the decode pool refused. Compare it against `decode_async` per `kind`: a rising `decode_inline` rate on `tonNode.blockBroadcastCompressedV2` or `tonNode.blockBroadcast` is the pool-undersized signal, while v1 traffic is expected there. |
 | `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful app-level P2P rebroadcast queue sends. |
 | `gton_p2p_rebroadcast_dropped_total` | counter | `queue` | Number of app-level P2P rebroadcast queue messages dropped before a successful send. |
 | `gton_p2p_broadcast_relay_sent_total` | counter | `overlay`, `delivery` | Number of successful overlay-level broadcast relay sends. `delivery="fec"` counts FEC part sends; `delivery="simple"` counts simple broadcast sends. |
 | `gton_p2p_broadcast_relay_failed_total` | counter | `overlay`, `delivery` | Number of failed overlay-level broadcast relay sends. `delivery="fec"` counts FEC part send failures; `delivery="simple"` counts simple broadcast send failures. |
+| `gton_p2p_plumtree_fec_parts_received_total` | counter | `overlay`, `source` | Number of verified Plumtree FEC parts accepted into the decoder. `source` is `direct` for eager push delivery or `recovery` for a successful repair response. |
+| `gton_p2p_plumtree_messages_received_total` | counter | `overlay`, `type` | Number of parsed inbound Plumtree protocol messages. |
 | `gton_blocksync_queue_items` | gauge | `queue` | Current block sync queue length. |
 | `gton_blocksync_queue_capacity` | gauge | `queue` | Block sync queue capacity. |
 | `gton_blocksync_queue_dropped_total` | counter | `queue` | Number of dropped block sync queue items. |
@@ -159,10 +161,19 @@ Inbound QUIC Plumtree broadcasts use `delivery="plumtree"`. For
 `direction="queue_rebroadcasted"`, the label describes the actual outgoing
 broadcast mode.
 
+Common `type` values for `gton_p2p_plumtree_messages_received_total` are
+`simple`, `fec`, `ihave`, `prune`, `useful`, `stats_push`, and `repair_query`.
+Direct messages are counted after their TL framing is parsed, before semantic
+acceptance or deduplication. Repair queries are counted after the QUIC query
+router has parsed them.
+
 Common `reason` values for `gton_p2p_broadcast_dropped_total` include `seen`,
 `invalid_payload`, `decode_failed`, `signature_parse_failed`, and
-`signature_check_failed`. Masterchain block broadcasts at or below the highest
-locally applied masterchain seqno use `already_applied`.
+`signature_check_failed`. Block broadcasts at or below the highest locally
+applied seqno of their chain use `already_applied` — the masterchain seqno for
+masterchain blocks, and the applied top block of that exact shard for shard
+blocks (a shard whose prefix has just changed through a split or a merge is not
+gated until the next committed masterchain state names it).
 
 `gton_p2p_broadcast_pipeline_stage_duration_seconds` intentionally has no block
 id, root hash, file hash, or peer label. `stage="fec_decode"` is measured inside
@@ -174,6 +185,8 @@ Useful examples:
 sum(rate(gton_p2p_queue_dropped_total[5m])) by (queue)
 gton_p2p_queue_items / gton_p2p_queue_max_items
 sum(gton_p2p_overlay_neighbours{state="alive"}) by (overlay)
+sum(rate(gton_p2p_plumtree_fec_parts_received_total[5m])) by (overlay, source)
+sum(rate(gton_p2p_plumtree_messages_received_total[5m])) by (overlay, type)
 histogram_quantile(0.95, sum(rate(gton_p2p_broadcast_pipeline_stage_duration_seconds_bucket[5m])) by (le, stage, delivery, kind))
 ```
 

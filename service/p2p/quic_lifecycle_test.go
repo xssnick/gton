@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -131,6 +132,48 @@ func TestEnterOfflineIsNotMarkedAsFailure(t *testing.T) {
 		t.Fatal("deliberate offline closed Failed")
 	default:
 	}
+}
+
+func TestOfflineFailurePublishesReasonBeforeSignal(t *testing.T) {
+	node := newTestNode(t)
+	const reason = "QUIC gateway stopped unexpectedly"
+
+	node.offlineReasonMu.Lock()
+	reasonLocked := true
+	defer func() {
+		if reasonLocked {
+			node.offlineReasonMu.Unlock()
+		}
+	}()
+
+	go node.enterOfflineFailure(reason)
+
+	for !node.IsOffline() {
+		select {
+		case <-node.Failed():
+			t.Fatal("Failed was closed before the offline reason could be published")
+		default:
+			runtime.Gosched()
+		}
+	}
+	select {
+	case <-node.Failed():
+		t.Fatal("Failed was closed while publishing the offline reason was blocked")
+	default:
+	}
+
+	node.offlineReasonMu.Unlock()
+	reasonLocked = false
+
+	select {
+	case <-node.Failed():
+	case <-time.After(time.Second):
+		t.Fatal("failure signal was not published after the reason lock was released")
+	}
+	if got := node.OfflineReason(); got != reason {
+		t.Fatalf("offline reason = %q, want %q", got, reason)
+	}
+	node.Wait()
 }
 
 func TestQUICMonitorIgnoresNormalCancellation(t *testing.T) {

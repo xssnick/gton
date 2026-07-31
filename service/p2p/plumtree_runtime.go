@@ -139,6 +139,7 @@ func (r *plumtreeRuntime) processMessage(
 		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
+		r.stats.telemetry.noteMessageReceived(plumtreeMessageSimple)
 		result.actions, err = r.engine.HandleSimple(ctx, now, from, plumtreeSimpleEnvelope{
 			Message: message,
 			Wire: plumtreePayloadWire{
@@ -151,6 +152,7 @@ func (r *plumtreeRuntime) processMessage(
 		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
+		r.stats.telemetry.noteMessageReceived(plumtreeMessageFEC)
 		result.actions, err = r.engine.HandleFEC(ctx, now, from, plumtreeFECEnvelope{
 			Message: message,
 			Wire: plumtreePayloadWire{
@@ -163,24 +165,28 @@ func (r *plumtreeRuntime) processMessage(
 		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
+		r.stats.telemetry.noteMessageReceived(plumtreeMessageIHave)
 		result.actions, err = r.engine.HandleIHave(ctx, now, from, message)
 	case broadcastPlumtreePruneConstructorID:
 		var message BroadcastPlumtreePrune
 		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
+		r.stats.telemetry.noteMessageReceived(plumtreeMessagePrune)
 		err = r.engine.HandlePrune(now, from, message)
 	case broadcastPlumtreeUsefulConstructorID:
 		var message BroadcastPlumtreeUseful
 		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
 			return plumtreeMessageResult{}, err
 		}
+		r.stats.telemetry.noteMessageReceived(plumtreeMessageUseful)
 		err = r.engine.HandleUseful(now, from, message)
 	case plumtreeStatsPushConstructorID:
 		var message PlumtreeStatsPush
 		if err = parsePlumtreeMessage(&message, body); err != nil {
 			return plumtreeMessageResult{}, err
 		}
+		r.stats.telemetry.noteMessageReceived(plumtreeMessageStatsPush)
 		eager := r.engine.statsEagerPeers(plumtreeSimpleTree)
 		var pushResult plumtreeStatsPushResult
 		pushResult, err = r.stats.HandlePush(
@@ -257,6 +263,7 @@ func (r *plumtreeRuntime) HandleRepairQuery(
 	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
 		return nil, errPlumtreeDisabled
 	}
+	r.stats.telemetry.noteMessageReceived(plumtreeMessageRepairQuery)
 	return r.engine.HandleRepairQuery(time.Now(), from, request)
 }
 
@@ -265,9 +272,6 @@ func (r *plumtreeRuntime) applyActions(
 ) error {
 	r.enqueueOutbounds(r.prepareOutboundBatch(actions.Outbounds))
 	r.startVerifiedRepairs(actions.Candidates)
-	for _, repair := range actions.Repairs {
-		r.startRepair(repair)
-	}
 	for _, delivery := range actions.Deliveries {
 		if err := r.deliver(delivery); err != nil {
 			return err
@@ -500,7 +504,23 @@ func (r *plumtreeRuntime) run(ctx context.Context) {
 	defer timer.Stop()
 
 	queue := newPlumtreeOutboundQueue()
+	jobs := make(chan plumtreeOutboundJob)
 	done := make(chan PeerID, plumtreeOutboundParallelism)
+	var workers sync.WaitGroup
+	workerCount := 0
+	startWorker := func() {
+		workerCount++
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			r.runOutboundWorker(ctx, jobs, done)
+		}()
+	}
+	defer func() {
+		close(jobs)
+		workers.Wait()
+	}()
+
 	activeSends := 0
 	dropLogEnabled := r.sub.log.Debug().Enabled()
 	droppedSinceLog := 0
@@ -512,8 +532,19 @@ func (r *plumtreeRuntime) run(ctx context.Context) {
 			if !ok {
 				break
 			}
-			activeSends++
-			r.startOutboundSend(ctx, done, peer, sends)
+			if activeSends == workerCount {
+				startWorker()
+			}
+			job := plumtreeOutboundJob{
+				peer:  peer,
+				wires: sends,
+			}
+			select {
+			case jobs <- job:
+				activeSends++
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		now := time.Now()
