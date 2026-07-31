@@ -2407,7 +2407,7 @@ func (n *Node) runSubscriptionLifecycleLoop(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			if closed := n.pool.pruneIdle(now); closed > 0 {
-				n.log.Info().
+				n.log.Debug().
 					Int("closed", closed).
 					Int("pooled", n.pool.size()).
 					Msg("closed idle pooled peers")
