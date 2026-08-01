@@ -9,7 +9,6 @@ import (
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/p2p"
-	"github.com/xssnick/gton/service/storage"
 )
 
 type archiveWindowPipelineProgress struct {
@@ -306,7 +305,6 @@ func (r *archiveCatchUpRunner) logProgress() error {
 	targetRemainingBlocks := r.target.SeqNo - r.current.ShardClientSeqno
 	windowBlocks := r.current.ShardClientSeqno - r.lastProgressSeqno
 	windowShardBlocksApplied := r.shardBlocksApplied - r.lastProgressShardBlocksApplied
-	windowShardBlocksReused := r.shardBlocksReused - r.lastProgressShardBlocksReused
 	windowElapsed := now.Sub(r.lastProgress)
 	stats := r.progressStats
 	windowStats := stats.since(r.lastProgressStats)
@@ -315,21 +313,14 @@ func (r *archiveCatchUpRunner) logProgress() error {
 	progressGoal := r.archiveProgressGoalAt(now)
 
 	event := r.service.log.Info().
-		Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
-		Str("target", storage.FormatBlockRef(r.target)).
+		Uint32("current", r.current.Masterchain.Block.SeqNo).
+		Uint32("target", r.target.SeqNo).
 		Str("catchup_method", "archive_shard_client").
-		Bool("checkpoint_in_flight", r.checkpointDone != nil).
-		Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 		Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 		Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
-		Uint32("processed_masterchain_blocks", done).
-		Uint64("applied_shard_blocks", r.shardBlocksApplied).
-		Uint32("total_masterchain_blocks", total).
-		Uint64("window_archive_windows", windowStats.windows).
 		Uint64("window_shard_archives", windowStats.shardArchives).
 		Int64("window_archive_bytes", windowStats.bytes).
-		Uint64("window_archive_blocks", windowStats.blocks).
-		Uint64("window_archive_entries", windowStats.entries)
+		Uint64("window_archive_blocks", windowStats.blocks)
 	if progressGoal.kind == archiveProgressGoalSyncUntil {
 		event = event.Uint32("sync_until", r.service.syncUntil)
 		if progressGoal.knownRemaining() {
@@ -357,12 +348,9 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		event = event.Int64("remaining", int64(targetRemainingBlocks))
 	}
 	event = event.
-		Uint64("checkpoints", stats.checkpoints).
-		Uint64("window_checkpoints", windowStats.checkpoints).
 		Dur("window_pipeline_wait", windowStats.pipelineWait).
 		Dur("window_master_prefetch_wait", windowStats.masterPrefetchWait).
 		Dur("window_archive_download", windowStats.archiveDownload).
-		Dur("window_archive_import", windowStats.archiveImport).
 		Dur("window_apply_wall", windowStats.applyWall).
 		Dur("window_master_apply", windowStats.masterApply).
 		Dur("window_master_precheck", windowStats.masterPrecheck).
@@ -371,26 +359,13 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		Dur("window_master_state_update", windowStats.masterStateUpdate).
 		Dur("window_shard_target_parse", windowStats.shardTargetParse).
 		Dur("window_shard_apply", windowStats.shardApply).
-		Uint64("state_cells", stats.stateCells).
-		Uint64("window_state_cells", windowStats.stateCells).
-		Uint64("state_cell_bytes", stats.stateCellBytes).
-		Uint64("window_state_cell_bytes", windowStats.stateCellBytes).
-		Dur("window_state_cell_prepare", windowStats.stateCellPrepare).
 		Dur("window_checkpoint_persist", windowStats.checkpointPersist).
 		Str("progress", progress).
 		Str("speed", formatBlockRate(done, time.Since(r.started))).
 		Str("window_speed", formatBlockRate(windowBlocks, windowElapsed)).
 		Str("shard_apply_speed", formatBlockRate64(windowShardBlocksApplied, windowElapsed)).
-		Str("shard_seen_speed", formatBlockRate64(windowShardBlocksApplied+windowShardBlocksReused, windowElapsed)).
 		Str("archive_download_speed", logutil.FormatByteRate(stats.bytes, stats.archiveDownload)).
 		Str("window_archive_download_speed", logutil.FormatByteRate(windowStats.bytes, windowStats.archiveDownload)).
-		Str("window_archive_ingest_speed", logutil.FormatByteRate(windowStats.bytes, windowElapsed)).
-		Str("archive_import_block_speed", formatBlockRate64(stats.blocks, stats.archiveImport)).
-		Str("window_archive_import_block_speed", formatBlockRate64(windowStats.blocks, windowStats.archiveImport)).
-		Str("state_cell_prepare_speed", logutil.FormatCellRate(stats.stateCells, stats.stateCellPrepare)).
-		Str("window_state_cell_prepare_speed", logutil.FormatCellRate(windowStats.stateCells, windowStats.stateCellPrepare)).
-		Str("state_cell_prepare_byte_speed", logutil.FormatByteRate(int64(stats.stateCellBytes), stats.stateCellPrepare)).
-		Str("window_state_cell_prepare_byte_speed", logutil.FormatByteRate(int64(windowStats.stateCellBytes), windowStats.stateCellPrepare)).
 		Str("window_bottleneck", archiveCatchUpDominantStage(
 			archiveCatchUpStageTiming{name: "pipeline_wait", elapsed: windowStats.pipelineWait},
 			archiveCatchUpStageTiming{name: "apply_wall", elapsed: windowStats.applyWall},

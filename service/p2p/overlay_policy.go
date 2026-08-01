@@ -290,11 +290,12 @@ func (spec *overlaySpec) relaysFECBroadcasts() bool {
 }
 
 // usesPlumtree reports whether a Plumtree runtime is built for this overlay.
-// Kept separate from relaysFECBroadcasts even though they agree today: they are
-// independent switches on the receiver and only happen to coincide for the
-// current three kinds.
+// Public overlays always support Plumtree. FastSync keeps its config-controlled
+// transport switch because it also changes overlay membership flags and legacy
+// two-step delivery.
 func (spec *overlaySpec) usesPlumtree() bool {
-	return spec.Kind != overlayKindCustomFixed
+	return spec.Kind == overlayKindPublicShard ||
+		spec.Kind == overlayKindFastSync && spec.FastSync.plumtreeEnabled
 }
 
 // usesTwoStepDelivery reports whether whole-roster overlay.broadcastTwostep is

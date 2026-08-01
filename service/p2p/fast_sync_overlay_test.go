@@ -139,6 +139,33 @@ func TestSetFastSyncOverlaysReconcilesValidatorShards(t *testing.T) {
 	}
 }
 
+func TestSetFastSyncOverlaysOmitsDisabledPlumtreeRuntime(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, PeerIDSize)
+
+	local := fastSyncOverlayTestValidator(0x31, node.localID)
+	state := FastSyncState{
+		Roster: NewFastSyncValidatorRoster(
+			nil,
+			[]FastSyncValidator{local},
+			nil,
+		),
+		Shards: []FastSyncShard{{
+			Workchain: 0,
+			Shard:     topShard,
+		}},
+	}
+
+	if err := node.SetFastSyncOverlays(state); err != nil {
+		t.Fatalf("set FastSync overlays: %v", err)
+	}
+	for shard, sub := range node.fastSyncSubscriptions {
+		if sub.plumtree != nil {
+			t.Fatalf("disabled FastSync overlay %v has a Plumtree runtime", shard)
+		}
+	}
+}
+
 func TestFastSyncPeerLimitIncludesCertificateSlots(t *testing.T) {
 	roots := make([]FastSyncValidator, 0, 5)
 	for i := range 5 {

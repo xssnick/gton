@@ -45,16 +45,8 @@ func newPlumtreeRuntime(sub *overlaySubscription) (*plumtreeRuntime, error) {
 		nodePlumtreePolicySource{node: sub.node},
 	)
 	if sub.fastSync != nil {
-		version := uint8(0)
-		if sub.fastSync.spec.plumtreeEnabled {
-			version = plumtreeProtocolVersion
-		}
 		policySource = &fixedPlumtreePolicySource{
-			policy: NewPlumtreePolicy(
-				version,
-				version,
-				sub.spec.FixedNodes,
-			),
+			policy: NewPlumtreePolicy(sub.spec.FixedNodes),
 		}
 	}
 
@@ -71,7 +63,6 @@ func newPlumtreeRuntime(sub *overlaySubscription) (*plumtreeRuntime, error) {
 		newPlumtreeSignatureVerifier(
 			policySource,
 			overlayID,
-			sub.spec.Workchain,
 		),
 		stats,
 	)
@@ -123,9 +114,6 @@ func (r *plumtreeRuntime) processMessage(
 	wire []byte,
 	body []byte,
 ) (plumtreeMessageResult, error) {
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return plumtreeMessageResult{}, errPlumtreeDisabled
-	}
 	if len(body) < 4 {
 		return plumtreeMessageResult{}, fmt.Errorf("Plumtree broadcast is too short")
 	}
@@ -216,9 +204,6 @@ func (r *plumtreeRuntime) OriginateSimple(
 	if !r.sub.isActive() {
 		return errOverlayInactive
 	}
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return errPlumtreeDisabled
-	}
 
 	actions, err := r.engine.OriginateSimple(
 		r.origin,
@@ -240,9 +225,6 @@ func (r *plumtreeRuntime) OriginateFEC(
 	if !r.sub.isActive() {
 		return errOverlayInactive
 	}
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return errPlumtreeDisabled
-	}
 
 	actions, err := r.engine.OriginateFEC(r.origin, flags, data)
 	r.notifyAlarmChanged()
@@ -259,9 +241,6 @@ func (r *plumtreeRuntime) HandleRepairQuery(
 ) ([]byte, error) {
 	if !r.sub.isActive() {
 		return nil, errOverlayInactive
-	}
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return nil, errPlumtreeDisabled
 	}
 	r.stats.telemetry.noteMessageReceived(plumtreeMessageRepairQuery)
 	return r.engine.HandleRepairQuery(time.Now(), from, request)
@@ -431,9 +410,6 @@ func (r *plumtreeRuntime) processRepairAnswer(
 	action plumtreeRepairAction,
 	answer []byte,
 ) (plumtreeActions, error) {
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return plumtreeActions{}, errPlumtreeDisabled
-	}
 	if len(answer) < 4 {
 		return plumtreeActions{}, fmt.Errorf("Plumtree repair answer is too short")
 	}
@@ -593,10 +569,6 @@ func (r *plumtreeRuntime) run(ctx context.Context) {
 
 func (r *plumtreeRuntime) nextAlarm(now time.Time) (time.Time, bool) {
 	next, scheduled := r.engine.NextAlarm()
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return next, scheduled
-	}
-
 	statsAt := r.stats.NextAt(now, r.statsJitterAt(now))
 	if !scheduled || statsAt.Before(next) {
 		return statsAt, true
@@ -605,10 +577,6 @@ func (r *plumtreeRuntime) nextAlarm(now time.Time) (time.Time, bool) {
 }
 
 func (r *plumtreeRuntime) tickStats(ctx context.Context, now time.Time) {
-	if !r.policySource.current().enabled(r.sub.spec.Workchain) {
-		return
-	}
-
 	jitter := r.statsJitterAt(now)
 	schedule := r.stats.Schedule(now, jitter)
 	eager := r.engine.statsEagerSnapshot(schedule.rotatingTree)

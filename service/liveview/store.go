@@ -271,7 +271,7 @@ func (s *Store) loadStoredCurrentState(ctx context.Context) (*storage.CurrentSta
 			meta:            block.meta,
 			artifactFlushed: true,
 			stateFlushed:    true,
-		})
+		}, nil)
 	}
 
 	next := storage.CloneCurrentState(loaded)
@@ -579,6 +579,9 @@ func prepareLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) (livePrepar
 	meta := artifacts.Meta.Clone()
 	state := storage.CloneBlockState(artifacts.State)
 	if state != nil {
+		if !blockIDEqual(state.Block, block) {
+			return livePreparedBlockArtifacts{}, fmt.Errorf("live block state mismatch: got %s want %s", storage.FormatBlockRef(state.Block), storage.FormatBlockRef(block))
+		}
 		stateMeta, err := storage.BuildBlockMetaFromState(*state)
 		if err != nil {
 			return livePreparedBlockArtifacts{}, err
@@ -686,10 +689,7 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 		artifactFlushed: prepared.artifactFlushed || flushed.artifact,
 		stateFlushed:    prepared.stateFlushed || flushed.state,
 		fragments:       prepared.fragments,
-	})
-	if prepared.state != nil {
-		s.rememberBlockStateLocked(*prepared.state)
-	}
+	}, prepared.state)
 	published := s.publishPendingCurrentLocked()
 	if s.current != nil && blockIDEqual(s.current.Masterchain.Block, prepared.block) {
 		s.updateMasterchainInfoLocked(s.current)
@@ -1647,7 +1647,16 @@ func (s *Store) rememberBlockFragments(block ton.BlockIDExt, fragments *BlockVie
 	return fragments
 }
 
-func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
+func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock, state *storage.BlockState) {
+	var stateKey liveBlockLookupKey
+	if state != nil {
+		var ok bool
+		stateKey, ok = liveBlockLookupKeyFromBlock(state.Block)
+		if !ok || !blockIDEqual(state.Block, block.id) {
+			panic("liveview: block state does not match block")
+		}
+	}
+
 	if existing := s.blocks[key]; existing != nil {
 		existingEvictable := s.liveBlockEvictableLocked(existing)
 		if block.root == nil {
@@ -1667,6 +1676,12 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock) {
 		if existingEvictable {
 			s.adjustLiveEvictableLocked(existingKind, -1)
 		}
+	}
+	// Publish block and state as one mutation. Refreshing after the block and
+	// again after its state makes the second refresh linearly remove the index
+	// entries that the first refresh just added.
+	if state != nil {
+		s.states[stateKey] = *storage.CloneBlockState(state)
 	}
 	s.blocks[key] = block
 	s.refreshBlockIndexLocked(block.id)

@@ -1,13 +1,9 @@
 package p2p
 
-const plumtreeProtocolVersion = 2
-
-// PlumtreePolicy is an immutable snapshot of the config that controls public
-// overlay Plumtree broadcasts.
+// PlumtreePolicy is an immutable snapshot of the validator keys authorized to
+// originate public overlay Plumtree broadcasts.
 type PlumtreePolicy struct {
-	masterchainProtocolVersion uint8
-	shardProtocolVersion       uint8
-	authorizedKeys             map[PeerID]struct{}
+	authorizedKeys map[PeerID]struct{}
 }
 
 type plumtreePolicySource interface {
@@ -33,28 +29,14 @@ func (s *fixedPlumtreePolicySource) current() *PlumtreePolicy {
 	return &s.policy
 }
 
-func NewPlumtreePolicy(
-	masterchainProtocolVersion,
-	shardProtocolVersion uint8,
-	authorizedKeys []PeerID,
-) PlumtreePolicy {
+func NewPlumtreePolicy(authorizedKeys []PeerID) PlumtreePolicy {
 	keys := make(map[PeerID]struct{}, len(authorizedKeys))
 	for _, id := range authorizedKeys {
 		keys[id] = struct{}{}
 	}
 	return PlumtreePolicy{
-		masterchainProtocolVersion: masterchainProtocolVersion,
-		shardProtocolVersion:       shardProtocolVersion,
-		authorizedKeys:             keys,
+		authorizedKeys: keys,
 	}
-}
-
-func (p PlumtreePolicy) enabled(workchain int32) bool {
-	version := p.shardProtocolVersion
-	if workchain == -1 {
-		version = p.masterchainProtocolVersion
-	}
-	return version >= plumtreeProtocolVersion
 }
 
 func (p PlumtreePolicy) authorizes(id PeerID, size uint32) bool {

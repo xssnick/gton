@@ -221,8 +221,19 @@ func TestFullBlockBroadcastDecodeWaitsForSignatureCheck(t *testing.T) {
 	if event.Downloaded == nil || !event.Downloaded.ID.Equals(&block) {
 		t.Fatalf("unexpected broadcast event: %#v", event)
 	}
-	if _, _, err := node.decodedBroadcasts.get(event.Kind, block); err != nil {
-		t.Fatal("verified decode was not cached")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, _, err := node.decodedBroadcasts.get(event.Kind, block)
+		if errors.Is(err, errDecodedBroadcastProcessed) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("verified decode cache state: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("verified decode was not released after processing")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

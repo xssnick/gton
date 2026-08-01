@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
-	"errors"
 	"testing"
 	"time"
 
@@ -97,7 +96,7 @@ func TestPlumtreeRuntimeRetainsInboundWireWithoutPayloadCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compute source id: %v", err)
 	}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 
 	from := testPeerID("plumtree-runtime-source")
 	sub.plumtree.engine.mu.Lock()
@@ -187,33 +186,7 @@ func TestPlumtreeRuntimeRetainsInboundWireWithoutPayloadCopy(t *testing.T) {
 	}
 }
 
-func TestPlumtreeRuntimeRejectsMessagesWhilePolicyDisabled(t *testing.T) {
-	node := newTestNode(t)
-	overlayID := testPeerID("disabled-plumtree-runtime")
-	sub, err := node.newOverlaySubscription(overlaySpec{
-		Name:      "disabled-plumtree",
-		Kind:      overlayKindPublicShard,
-		Workchain: 0,
-		ShortID:   overlayID[:],
-	})
-	if err != nil {
-		t.Fatalf("create subscription: %v", err)
-	}
-	t.Cleanup(sub.close)
-
-	body := make([]byte, 4)
-	body[0] = byte(broadcastPlumtreeSimpleConstructorID)
-	if err = sub.plumtree.HandleMessage(
-		context.Background(),
-		testPeerID("disabled-plumtree-peer"),
-		body,
-		body,
-	); !errors.Is(err, errPlumtreeDisabled) {
-		t.Fatalf("disabled Plumtree result = %v", err)
-	}
-}
-
-func TestPlumtreeRuntimeDispatchGatesConstructors(t *testing.T) {
+func TestPlumtreeRuntimeAlwaysDispatchesPublicConstructors(t *testing.T) {
 	node := newTestNode(t)
 	overlayID := testPeerID("plumtree-dispatch-runtime")
 	sub, err := node.newOverlaySubscription(overlaySpec{
@@ -226,8 +199,8 @@ func TestPlumtreeRuntimeDispatchGatesConstructors(t *testing.T) {
 		t.Fatalf("create subscription: %v", err)
 	}
 	t.Cleanup(sub.close)
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, nil))
-
+	// The node still has its initial empty validator policy. Public Plumtree is
+	// transport-active regardless; the policy only authorizes payload sources.
 	from := testPeerID("plumtree-dispatch-peer")
 	pruneBytes, err := tl.Serialize(BroadcastPlumtreePrune{
 		BroadcastID: bytes.Repeat([]byte{1}, sha256.Size),

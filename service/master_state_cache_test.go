@@ -498,30 +498,37 @@ func (testMonitorOldMcBlocksAugmentation) SkipExtra(loader *cell.Slice) error {
 	return tlb.LoadFromCell(&extra, loader)
 }
 
-func (testMonitorOldMcBlocksAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return tlb.ToCell(&tlb.KeyMaxLt{})
+func (testMonitorOldMcBlocksAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return storeTestMonitorKeyMaxLT(dst, tlb.KeyMaxLt{})
 }
 
-func (testMonitorOldMcBlocksAugmentation) LeafExtra(value *cell.Slice) (*cell.Cell, error) {
+func (testMonitorOldMcBlocksAugmentation) LeafExtra(value *cell.Slice, dst *cell.Builder) error {
 	var ref tlb.KeyExtBlkRef
 	if err := tlb.LoadFromCell(&ref, value.Copy()); err != nil {
-		return nil, err
+		return err
 	}
-	return tlb.ToCell(&tlb.KeyMaxLt{IsKey: ref.IsKey, MaxEndLT: ref.BlkRef.EndLt})
+	return storeTestMonitorKeyMaxLT(dst, tlb.KeyMaxLt{IsKey: ref.IsKey, MaxEndLT: ref.BlkRef.EndLt})
 }
 
-func (testMonitorOldMcBlocksAugmentation) CombineExtra(leftExtra, rightExtra *cell.Slice) (*cell.Cell, error) {
+func (testMonitorOldMcBlocksAugmentation) CombineExtra(leftExtra, rightExtra *cell.Slice, dst *cell.Builder) error {
 	var left, right tlb.KeyMaxLt
 	if err := tlb.LoadFromCell(&left, leftExtra.Copy()); err != nil {
-		return nil, err
+		return err
 	}
 	if err := tlb.LoadFromCell(&right, rightExtra.Copy()); err != nil {
-		return nil, err
+		return err
 	}
-	return tlb.ToCell(&tlb.KeyMaxLt{
+	return storeTestMonitorKeyMaxLT(dst, tlb.KeyMaxLt{
 		IsKey:    left.IsKey || right.IsKey,
 		MaxEndLT: max(left.MaxEndLT, right.MaxEndLT),
 	})
+}
+
+func storeTestMonitorKeyMaxLT(dst *cell.Builder, extra tlb.KeyMaxLt) error {
+	if err := dst.StoreBoolBit(extra.IsKey); err != nil {
+		return err
+	}
+	return dst.StoreUInt(extra.MaxEndLT, 64)
 }
 
 func testShardTargetsMasterState(t *testing.T, master ton.BlockIDExt, shards ...ton.BlockIDExt) *storage.BlockState {

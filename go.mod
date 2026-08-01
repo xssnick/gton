@@ -10,7 +10,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/raptorq v1.5.1
-	github.com/xssnick/tonutils-go v1.18.1-0.20260730145237-4da011b3a8c9
+	github.com/xssnick/tonutils-go v1.18.1-0.20260801052814-fc795b3d6ca7
 	golang.org/x/sys v0.47.0
 )
 

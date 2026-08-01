@@ -432,17 +432,9 @@ func (n *Node) SetPlumtreePolicy(policy PlumtreePolicy) {
 	if len(policy.authorizedKeys) > 0 {
 		n.plumtreePolicyLogOnce.Do(func() {
 			n.log.Info().
-				Uint8("masterchain_protocol_version", policy.masterchainProtocolVersion).
-				Uint8("shard_protocol_version", policy.shardProtocolVersion).
 				Int("authorized_keys", len(policy.authorizedKeys)).
 				Msg("loaded Plumtree broadcast policy")
 		})
-	}
-
-	for _, entry := range n.subscriptionEntriesSnapshot() {
-		if entry.sub.plumtree != nil {
-			entry.sub.plumtree.notifyAlarmChanged()
-		}
 	}
 }
 

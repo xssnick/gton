@@ -19,11 +19,10 @@ import (
 func TestPlumtreeSignatureVerifierStaleRejectionDoesNotShortenBan(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-stale-rejection-overlay"),
-		0,
 	)
 
 	from := testPeerID("plumtree-stale-rejection-from")

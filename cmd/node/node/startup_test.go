@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"net"
+	"strings"
 	"testing"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
 )
@@ -24,6 +27,23 @@ func TestParseNodeFlagsRejectsNegativeArchivePrefetchWindows(t *testing.T) {
 		t.Fatal("expected negative archive prefetch windows error")
 	}
 	if err.Error() != "archive prefetch windows cannot be negative: -1" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStartPprofRejectsOccupiedAddress(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on pprof test address: %v", err)
+	}
+	defer listener.Close()
+
+	addr := listener.Addr().String()
+	err = startPprof(t.Context(), zerolog.Nop(), addr)
+	if err == nil {
+		t.Fatal("expected occupied pprof address error")
+	}
+	if !strings.Contains(err.Error(), "listen pprof on "+addr) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -334,6 +335,122 @@ func TestShardCandidateCacheAssemblesCandidateAfterProofBeforeOverflowPrune(t *t
 		t.Fatalf("store candidate: %v", err)
 	}
 	requireAssembledShardCandidate(t, assembled, downloaded)
+}
+
+func TestShardCandidateCacheReleasesAssembledPayloadAndSuppressesDuplicates(t *testing.T) {
+	cache := newShardBlockCandidateCache(time.Minute, 1<<20, 16)
+	now := time.Unix(500, 0)
+	downloaded := testShardBroadcastDownloadedBlock(t, 24, 0x24)
+	candidate := testShardBlockCandidate(downloaded)
+	proof := ShardDescriptionProof{
+		Block:    downloaded.ID,
+		Proof:    downloaded.Proof,
+		ProofBOC: downloaded.ProofBOC,
+	}
+
+	if blocks, err := cache.StoreCandidate(candidate, now); err != nil || len(blocks) != 0 {
+		t.Fatalf("store candidate: blocks=%d err=%v", len(blocks), err)
+	}
+	blocks, err := cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("store proof: %v", err)
+	}
+	requireAssembledShardCandidate(t, blocks, downloaded)
+
+	key := tnstore.BlockKey(downloaded.ID)
+	if len(cache.candidates) != 0 || len(cache.proofs) != 0 {
+		t.Fatalf("assembled payload retained: candidates=%d proofs=%d", len(cache.candidates), len(cache.proofs))
+	}
+	if _, ok := cache.assembled[key]; !ok {
+		t.Fatal("assembled marker was not stored")
+	}
+	if cache.bytes != shardBlockCandidateCacheOverhead {
+		t.Fatalf("assembled cache bytes = %d, want %d", cache.bytes, shardBlockCandidateCacheOverhead)
+	}
+
+	if blocks, err = cache.StoreCandidate(candidate, now.Add(2*time.Second)); err != nil || len(blocks) != 0 {
+		t.Fatalf("store repeated candidate: blocks=%d err=%v", len(blocks), err)
+	}
+	if blocks, err = cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(3*time.Second)); err != nil || len(blocks) != 0 {
+		t.Fatalf("store repeated proof: blocks=%d err=%v", len(blocks), err)
+	}
+	if len(cache.candidates) != 0 || len(cache.proofs) != 0 {
+		t.Fatalf("duplicate payload retained: candidates=%d proofs=%d", len(cache.candidates), len(cache.proofs))
+	}
+}
+
+func TestShardCandidateCacheAssemblesRemainingLinksAfterBadProof(t *testing.T) {
+	cache := newShardBlockCandidateCache(time.Minute, 1<<20, 16)
+	now := time.Unix(700, 0)
+
+	// A candidate is keyed by root hash alone, so a peer can park one whose
+	// declared FileHash does not match the signed chain link. Assembling it
+	// fails, and it sits ahead of the healthy link in the same batch.
+	poisoned := testShardBroadcastDownloadedBlock(t, 26, 0x26)
+	badCandidate := testShardBlockCandidate(poisoned)
+	badCandidate.ID.FileHash = bytes.Repeat([]byte{0xEE}, 32)
+
+	healthy := testShardBroadcastDownloadedBlock(t, 27, 0x27)
+	goodCandidate := testShardBlockCandidate(healthy)
+
+	for _, candidate := range []DownloadedBlock{badCandidate, goodCandidate} {
+		if blocks, err := cache.StoreCandidate(candidate, now); err != nil || len(blocks) != 0 {
+			t.Fatalf("store candidate %s: blocks=%d err=%v", tnstore.FormatBlockRef(candidate.ID), len(blocks), err)
+		}
+	}
+
+	proofs := []ShardDescriptionProof{
+		{Block: poisoned.ID, Proof: poisoned.Proof, ProofBOC: poisoned.ProofBOC},
+		{Block: healthy.ID, Proof: healthy.Proof, ProofBOC: healthy.ProofBOC},
+	}
+	blocks, err := cache.StoreProofs(proofs, now.Add(time.Second))
+	if err == nil {
+		t.Fatal("bad chain link did not report an error")
+	}
+	requireAssembledShardCandidate(t, blocks, healthy)
+
+	// the healthy link is released and suppressed; the bad one keeps its payload
+	// so a corrected candidate can still assemble it
+	if _, ok := cache.assembled[tnstore.BlockKey(healthy.ID)]; !ok {
+		t.Fatal("healthy link was not marked assembled")
+	}
+	if _, ok := cache.assembled[tnstore.BlockKey(poisoned.ID)]; ok {
+		t.Fatal("failed link was marked assembled")
+	}
+	if _, ok := cache.candidates[tnstore.BlockKey(poisoned.ID)]; !ok {
+		t.Fatal("failed link lost its candidate payload")
+	}
+}
+
+func TestShardCandidateCacheAssembledMarkerExpires(t *testing.T) {
+	ttl := 10 * time.Millisecond
+	cache := newShardBlockCandidateCache(ttl, 1<<20, 16)
+	now := time.Unix(600, 0)
+	downloaded := testShardBroadcastDownloadedBlock(t, 25, 0x25)
+	candidate := testShardBlockCandidate(downloaded)
+	proof := ShardDescriptionProof{
+		Block:    downloaded.ID,
+		Proof:    downloaded.Proof,
+		ProofBOC: downloaded.ProofBOC,
+	}
+
+	if blocks, err := cache.StoreCandidate(candidate, now); err != nil || len(blocks) != 0 {
+		t.Fatalf("store candidate: blocks=%d err=%v", len(blocks), err)
+	}
+	blocks, err := cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(time.Millisecond))
+	if err != nil {
+		t.Fatalf("store proof: %v", err)
+	}
+	requireAssembledShardCandidate(t, blocks, downloaded)
+
+	if blocks, err = cache.StoreCandidate(candidate, now.Add(ttl+2*time.Millisecond)); err != nil || len(blocks) != 0 {
+		t.Fatalf("store candidate after marker expiry: blocks=%d err=%v", len(blocks), err)
+	}
+	blocks, err = cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(ttl+3*time.Millisecond))
+	if err != nil {
+		t.Fatalf("store proof after marker expiry: %v", err)
+	}
+	requireAssembledShardCandidate(t, blocks, downloaded)
 }
 
 func shardBroadcastCacheLen(cache *shardBroadcastBlockCache) int {

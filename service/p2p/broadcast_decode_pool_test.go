@@ -3,6 +3,7 @@ package p2p
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -106,21 +107,21 @@ func TestOffloadedBroadcastDecodeDeliversEventAndCachesResult(t *testing.T) {
 		t.Fatalf("event source peer = %s", event.Downloaded.SourcePeerID.String())
 	}
 
-	// second delivery of the same block on another overlay: different
-	// fingerprint, so the deduper does not collapse it, but the decode cache
-	// completes it inline with an immediate event
+	// second delivery of the same block on another overlay has a different
+	// fingerprint, but the processed marker keeps it relay-only instead of
+	// enqueueing the same application event again
 	result, err = secondSub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliveryTwoStep, false, testPeerID("second"))
 	if err != nil {
 		t.Fatalf("classify second delivery: %v", err)
 	}
-	if result.disposition != broadcastDispositionAccept || result.accepted.event == nil || result.accepted.event.Downloaded == nil {
-		t.Fatalf("second delivery should reuse the cached decode inline, got %+v", result)
+	if result.disposition != broadcastDispositionAccept || result.accepted.event != nil {
+		t.Fatalf("second delivery should skip the processed decode, got %+v", result)
 	}
-	if !result.accepted.event.Downloaded.ID.Equals(&block) {
-		t.Fatalf("cached downloaded block mismatch: %+v", result.accepted.event.Downloaded)
+	if result.accepted.block == nil || !result.accepted.block.Equals(&block) {
+		t.Fatalf("processed block mismatch: %+v", result.accepted.block)
 	}
-	if result.accepted.event.Downloaded.SourcePeerID != testPeerID("second") {
-		t.Fatalf("cached delivery source peer = %s", result.accepted.event.Downloaded.SourcePeerID.String())
+	if result.accepted.rebroadcast == nil {
+		t.Fatal("processed delivery is missing the rebroadcast payload")
 	}
 }
 
@@ -163,7 +164,12 @@ func TestEnqueueBroadcastDecodeRoutesMasterchainToDedicatedLane(t *testing.T) {
 func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 	var cache decodedBroadcastCache
 	block := testBlockID(0, topShard, 5)
-	downloaded := &DownloadedBlock{ID: block, Kind: "tonNode.blockBroadcastCompressedV2"}
+	downloaded := &DownloadedBlock{
+		ID:       block,
+		Kind:     "tonNode.blockBroadcastCompressedV2",
+		Block:    cell.BeginCell().EndCell(),
+		BlockBOC: []byte{0x01, 0x02, 0x03},
+	}
 
 	cache.put("kind", block, downloaded, nil)
 	got, _, err := cache.get("kind", block)
@@ -183,17 +189,77 @@ func TestDecodedBroadcastCacheTTLAndCopySemantics(t *testing.T) {
 		t.Fatal("mutating a returned copy leaked into the cache")
 	}
 
+	cache.markProcessed("kind", block)
+	if _, _, err := cache.get("kind", block); !errors.Is(err, errDecodedBroadcastProcessed) {
+		t.Fatalf("processed cache lookup error = %v, want %v", err, errDecodedBroadcastProcessed)
+	}
+	entry := cache.entries[decodedBroadcastKey("kind", block)]
+	if !entry.processed || entry.downloaded.Block != nil || len(entry.downloaded.BlockBOC) != 0 || entry.signatures != nil {
+		t.Fatalf("processed entry retained decoded payload: %#v", *entry)
+	}
+	cache.put("kind", block, downloaded, nil)
+	if _, _, err := cache.get("kind", block); !errors.Is(err, errDecodedBroadcastProcessed) {
+		t.Fatalf("late decoded result replaced processed marker: %v", err)
+	}
+
 	if _, _, err := cache.get("other-kind", block); err == nil {
 		t.Fatal("cache hit across kinds")
 	}
 
-	cache.entries[decodedBroadcastKey("kind", block)] = decodedBroadcastEntry{
-		downloaded: *downloaded,
-		storedAt:   time.Now().Add(-2 * decodedBroadcastCacheTTL),
-	}
+	cache.entries[decodedBroadcastKey("kind", block)].storedAt = time.Now().Add(-2 * decodedBroadcastCacheTTL)
 	if _, _, err := cache.get("kind", block); err == nil {
-		t.Fatal("expired entry served from cache")
+		t.Fatal("expired processed marker served from cache")
 	}
+}
+
+func TestDecodedBroadcastPayloadRemainsCachedWhenEventQueueRejects(t *testing.T) {
+	node := newTestNode(t)
+	node.eventQueue = newBoundedQueue[BroadcastEvent](0, 1, broadcastEventBytes)
+	block := testBlockID(0, topShard, 6)
+	kind := "tonNode.blockBroadcastCompressedV2"
+	downloaded := &DownloadedBlock{ID: block, Kind: kind}
+	node.decodedBroadcasts.put(kind, block, downloaded, nil)
+
+	node.acceptBroadcast(acceptedBroadcast{
+		fingerprint:         "decoded-event",
+		deduped:             true,
+		block:               block.Copy(),
+		processedDecodeKind: kind,
+		event: &BroadcastEvent{
+			Kind:  kind,
+			Block: block,
+		},
+	})
+
+	if _, _, err := node.decodedBroadcasts.get(kind, block); err != nil {
+		t.Fatalf("decoded payload was released after queue rejection: %v", err)
+	}
+}
+
+func BenchmarkDecodedBroadcastCacheLookup(b *testing.B) {
+	block := testBlockID(0, topShard, 5)
+	downloaded := &DownloadedBlock{ID: block, Kind: "tonNode.blockBroadcastCompressedV2"}
+	var cache decodedBroadcastCache
+	cache.put("kind", block, downloaded, nil)
+
+	b.Run("decoded", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, _, err := cache.get("kind", block); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	cache.markProcessed("kind", block)
+	b.Run("processed", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, _, err := cache.get("kind", block); !errors.Is(err, errDecodedBroadcastProcessed) {
+				b.Fatalf("lookup error = %v", err)
+			}
+		}
+	})
 }
 
 func TestBroadcastDecodeWorkerCountFor(t *testing.T) {

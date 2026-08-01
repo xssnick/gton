@@ -1193,10 +1193,6 @@ func (p *archivePeerPool) archivePeerShouldReplaceLocked(worstID PeerID, worst *
 
 func (p *archivePeerPool) logArchivePeerAdmission(peer *overlayPeer, result archivePeerProbeResult, admission archivePeerAdmissionResult) {
 	event := p.log.Debug()
-	importantRosterSize := admission.freshProven <= 1 || admission.roster == archivePeerRosterLimit
-	if admission.replaced || importantRosterSize {
-		event = p.log.Info()
-	}
 	event.
 		Str("peer", peer.addr).
 		Str("peer_id", peer.id.String()).

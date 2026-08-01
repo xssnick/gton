@@ -6019,22 +6019,16 @@ func (testShardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {
 	return tlb.LoadFromCell(&extra, loader)
 }
 
-func (testShardAccountsAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return testDepthBalanceInfoCell()
+func (testShardAccountsAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 10)
 }
 
-func (testShardAccountsAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testDepthBalanceInfoCell()
+func (testShardAccountsAugmentation) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 10)
 }
 
-func (testShardAccountsAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testDepthBalanceInfoCell()
-}
-
-func testDepthBalanceInfoCell() (*cell.Cell, error) {
-	return tlb.ToCell(&tlb.DepthBalanceInfo{
-		Currencies: tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
-	})
+func (testShardAccountsAugmentation) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 10)
 }
 
 type testOldMcBlocksAugmentation struct{}
@@ -6044,30 +6038,37 @@ func (testOldMcBlocksAugmentation) SkipExtra(loader *cell.Slice) error {
 	return tlb.LoadFromCell(&extra, loader)
 }
 
-func (testOldMcBlocksAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return tlb.ToCell(&tlb.KeyMaxLt{})
+func (testOldMcBlocksAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return storeTestKeyMaxLT(dst, tlb.KeyMaxLt{})
 }
 
-func (testOldMcBlocksAugmentation) LeafExtra(value *cell.Slice) (*cell.Cell, error) {
+func (testOldMcBlocksAugmentation) LeafExtra(value *cell.Slice, dst *cell.Builder) error {
 	var ref tlb.KeyExtBlkRef
 	if err := tlb.LoadFromCell(&ref, value.Copy()); err != nil {
-		return nil, err
+		return err
 	}
-	return tlb.ToCell(&tlb.KeyMaxLt{IsKey: ref.IsKey, MaxEndLT: ref.BlkRef.EndLt})
+	return storeTestKeyMaxLT(dst, tlb.KeyMaxLt{IsKey: ref.IsKey, MaxEndLT: ref.BlkRef.EndLt})
 }
 
-func (testOldMcBlocksAugmentation) CombineExtra(leftExtra, rightExtra *cell.Slice) (*cell.Cell, error) {
+func (testOldMcBlocksAugmentation) CombineExtra(leftExtra, rightExtra *cell.Slice, dst *cell.Builder) error {
 	var left, right tlb.KeyMaxLt
 	if err := tlb.LoadFromCell(&left, leftExtra.Copy()); err != nil {
-		return nil, err
+		return err
 	}
 	if err := tlb.LoadFromCell(&right, rightExtra.Copy()); err != nil {
-		return nil, err
+		return err
 	}
-	return tlb.ToCell(&tlb.KeyMaxLt{
+	return storeTestKeyMaxLT(dst, tlb.KeyMaxLt{
 		IsKey:    left.IsKey || right.IsKey,
 		MaxEndLT: max(left.MaxEndLT, right.MaxEndLT),
 	})
+}
+
+func storeTestKeyMaxLT(dst *cell.Builder, extra tlb.KeyMaxLt) error {
+	if err := dst.StoreBoolBit(extra.IsKey); err != nil {
+		return err
+	}
+	return dst.StoreUInt(extra.MaxEndLT, 64)
 }
 
 func testMcStateInfo(t *testing.T, seqno uint32) *cell.Cell {
@@ -6278,16 +6279,16 @@ func (testCurrencyCollectionAugmentation) SkipExtra(loader *cell.Slice) error {
 	return tlb.LoadFromCell(&extra, loader)
 }
 
-func (testCurrencyCollectionAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return testCurrencyCollectionCell()
+func (testCurrencyCollectionAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testCurrencyCollectionAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testCurrencyCollectionCell()
+func (testCurrencyCollectionAugmentation) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testCurrencyCollectionAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testCurrencyCollectionCell()
+func (testCurrencyCollectionAugmentation) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
 func testCurrencyCollectionCell() (*cell.Cell, error) {
@@ -6301,20 +6302,16 @@ func (testUint64BoundaryAugmentation) SkipExtra(loader *cell.Slice) error {
 	return err
 }
 
-func (testUint64BoundaryAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return testUint64BoundaryCell(), nil
+func (testUint64BoundaryAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 64)
 }
 
-func (testUint64BoundaryAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testUint64BoundaryCell(), nil
+func (testUint64BoundaryAugmentation) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 64)
 }
 
-func (testUint64BoundaryAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testUint64BoundaryCell(), nil
-}
-
-func testUint64BoundaryCell() *cell.Cell {
-	return cell.BeginCell().MustStoreUInt(0, 64).EndCell()
+func (testUint64BoundaryAugmentation) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 64)
 }
 
 func testShardStateStats(t *testing.T) *cell.Cell {
@@ -7495,24 +7492,16 @@ func (testImportFeesAugmentation) SkipExtra(loader *cell.Slice) error {
 	return skipImportFees(loader)
 }
 
-func (testImportFeesAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return testImportFeesCell()
+func (testImportFeesAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 9)
 }
 
-func (testImportFeesAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testImportFeesCell()
+func (testImportFeesAugmentation) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 9)
 }
 
-func (testImportFeesAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testImportFeesCell()
-}
-
-func testImportFeesCell() (*cell.Cell, error) {
-	cc, err := tlb.ToCell(tlb.CurrencyCollection{Coins: tlb.ZeroCoins})
-	if err != nil {
-		return nil, err
-	}
-	return cell.BeginCell().MustStoreCoins(0).MustStoreBuilder(cc.ToBuilder()).EndCell(), nil
+func (testImportFeesAugmentation) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 9)
 }
 
 func (s *fakeStore) BlockData(_ context.Context, block ton.BlockIDExt) ([]byte, error) {

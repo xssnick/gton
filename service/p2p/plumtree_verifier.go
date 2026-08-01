@@ -123,7 +123,6 @@ type plumtreeRejectedPeer struct {
 type plumtreeSignatureVerifier struct {
 	policySource plumtreePolicySource
 	overlayID    PeerID
-	workchain    int32
 
 	gate           chan struct{}
 	policy         *PlumtreePolicy
@@ -169,12 +168,10 @@ var _ plumtreeVerifier = (*plumtreeSignatureVerifier)(nil)
 func newPlumtreeSignatureVerifier(
 	policySource plumtreePolicySource,
 	overlayID PeerID,
-	workchain int32,
 ) *plumtreeSignatureVerifier {
 	return &plumtreeSignatureVerifier{
 		policySource: policySource,
 		overlayID:    overlayID,
-		workchain:    workchain,
 		gate:         make(chan struct{}, 1),
 		limiters:     make(map[PeerID]*plumtreeCertificateLimiter),
 		rejected:     make(map[PeerID]time.Time),
@@ -279,9 +276,6 @@ func (v *plumtreeSignatureVerifier) precheckLocked(
 ) (PeerID, bool, error) {
 	policy := v.policySource.current()
 	v.updatePolicyLocked(policy)
-	if !policy.enabled(v.workchain) {
-		return PeerID{}, false, errPlumtreeDisabled
-	}
 	if request.DataSize == 0 || request.DataSize > uint32(plumtreeMaxPayloadSize) {
 		return PeerID{}, false, errPlumtreeSourceNotAllowed
 	}

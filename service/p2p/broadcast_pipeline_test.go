@@ -247,6 +247,71 @@ func TestClassifyDuplicateIdentifiedBroadcastDoesNotSerializePayload(t *testing.
 	}
 }
 
+func TestProcessedCandidateBroadcastSkipsDecodedPipeline(t *testing.T) {
+	node := newTestNode(t)
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+
+	downloaded := testBlockFinalityCandidate(t, 208)
+	msg := tonnodeapi.NewBlockCandidateBroadcast{
+		ID:   downloaded.ID,
+		Data: downloaded.BlockBOC,
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize candidate broadcast: %v", err)
+	}
+
+	firstSource := testPeerID("first-source")
+	first, err := sub.classifyBroadcastPayload(
+		nil,
+		msg,
+		newKnownIdentifiedBroadcastPayload(payload, bytes.Repeat([]byte{0x11}, 32)),
+		DeliveryFEC,
+		false,
+		firstSource,
+	)
+	if err != nil {
+		t.Fatalf("classify first candidate: %v", err)
+	}
+	if first.disposition != broadcastDispositionAccept {
+		t.Fatal("first candidate was not accepted")
+	}
+	node.acceptBroadcast(first.accepted)
+	if _, _, err = node.decodedBroadcasts.get("tonNode.newBlockCandidateBroadcast", downloaded.ID); !errors.Is(err, errDecodedBroadcastProcessed) {
+		t.Fatalf("first candidate cache state = %v, want processed", err)
+	}
+
+	secondSource := testPeerID("second-source")
+	second, err := sub.classifyBroadcastPayload(
+		nil,
+		msg,
+		newKnownIdentifiedBroadcastPayload(payload, bytes.Repeat([]byte{0x22}, 32)),
+		DeliveryTwoStep,
+		false,
+		secondSource,
+	)
+	if err != nil {
+		t.Fatalf("classify repeated candidate: %v", err)
+	}
+	if second.disposition != broadcastDispositionAccept {
+		t.Fatal("repeated candidate was not accepted for relay")
+	}
+	node.acceptBroadcast(second.accepted)
+
+	key := tnstore.BlockKey(downloaded.ID)
+	cached := node.shardCandidateCache.candidates[key]
+	if cached.block.sourcePeerID != firstSource {
+		t.Fatalf("processed candidate ran pipeline again: source=%x want=%x", cached.block.sourcePeerID, firstSource)
+	}
+}
+
 func TestAcceptedIdentifiedBroadcastWithoutTargetsDoesNotSerializePayload(t *testing.T) {
 	node := newTestNode(t)
 	sub := testOverlaySubscription(&overlaySubscription{

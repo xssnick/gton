@@ -221,7 +221,7 @@ func (n *Node) handleInboundQUICPeer(peer *adnlquic.Peer) error {
 	n.quicPeers[peerID] = authenticated
 	n.quicPeersMx.Unlock()
 	if n.quicPeersAccepted.Add(1) == 1 {
-		n.log.Info().
+		n.log.Debug().
 			Str("peer_id", peerID.String()).
 			Str("peer", peer.RemoteAddr()).
 			Msg("accepted first inbound QUIC peer")

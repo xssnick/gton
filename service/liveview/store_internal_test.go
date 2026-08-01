@@ -30,6 +30,117 @@ func TestStoreCheckpointFlushDoesNotRememberMissingBlocks(t *testing.T) {
 	}
 }
 
+func TestStorePublishBlockWithStateMaintainsFinalIndexesAndEvictability(t *testing.T) {
+	block := testLiveBlockID(0, int64(1)<<62, 36, 0x36)
+	state := storage.BlockState{
+		Block:         block,
+		StateRootHash: bytes.Repeat([]byte{0x37}, 32),
+		StateFileHash: bytes.Repeat([]byte{0x38}, 32),
+	}
+	meta := &storage.BlockMeta{
+		ID:       block,
+		GenUTime: 1_720_000_000,
+		StartLT:  100,
+		EndLT:    200,
+	}
+	live := New(noopBacking{})
+
+	err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            block,
+		Meta:             meta,
+		State:            &state,
+		ArtifactFlushed:  true,
+		AvailabilityOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("publish block with state: %v", err)
+	}
+
+	blockKey := storage.BlockKey(block)
+	stateKey, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		t.Fatal("test block has an incomplete id")
+	}
+	if cached := live.blocks[blockKey]; cached == nil || !blockIDEqual(cached.id, block) {
+		t.Fatal("published block is missing")
+	}
+	if cached, ok := live.states[stateKey]; !ok || !blockIDEqual(cached.Block, block) {
+		t.Fatal("published block state is missing")
+	}
+	cachedMeta := live.metas[blockKey]
+	if cachedMeta == nil || cachedMeta.StartLT != meta.StartLT || cachedMeta.EndLT != meta.EndLT || cachedMeta.GenUTime != meta.GenUTime {
+		t.Fatalf("indexed meta = %+v, want merged block meta", cachedMeta)
+	}
+	seqKey := liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}
+	if indexed, ok := live.seqIndex[seqKey]; !ok || !blockIDEqual(indexed, block) {
+		t.Fatal("block is missing from seqno index")
+	}
+	historyKey := liveHistoryKey{workchain: block.Workchain, shard: block.Shard}
+	if entries := live.ltIndex[historyKey]; len(entries) != 1 || !blockIDEqual(entries[0].block, block) {
+		t.Fatalf("LT index entries = %d, want the published block", len(entries))
+	}
+	if entries := live.unixIndex[historyKey]; len(entries) != 1 || !blockIDEqual(entries[0].block, block) {
+		t.Fatalf("unix index entries = %d, want the published block", len(entries))
+	}
+	if live.shardEvictable != 0 {
+		t.Fatalf("evictable shard blocks = %d, want 0 for unflushed state", live.shardEvictable)
+	}
+
+	live.MarkLiveBlockStatesFlushed([]ton.BlockIDExt{block})
+	if live.shardEvictable != 1 {
+		t.Fatalf("evictable shard blocks after state flush = %d, want 1", live.shardEvictable)
+	}
+}
+
+func TestStoreRememberBlockStateWithoutLiveBlock(t *testing.T) {
+	block := testLiveBlockID(0, int64(1)<<62, 37, 0x37)
+	state := storage.BlockState{
+		Block:         block,
+		StateRootHash: bytes.Repeat([]byte{0x38}, 32),
+		StateFileHash: bytes.Repeat([]byte{0x39}, 32),
+	}
+	live := New(noopBacking{})
+
+	live.rememberBlockStateLocked(state)
+
+	blockKey := storage.BlockKey(block)
+	if live.blocks[blockKey] != nil {
+		t.Fatal("state-only publish created a live block")
+	}
+	stateKey, ok := liveBlockLookupKeyFromBlock(block)
+	if !ok {
+		t.Fatal("test block has an incomplete id")
+	}
+	if cached, ok := live.states[stateKey]; !ok || !blockIDEqual(cached.Block, block) {
+		t.Fatal("state-only publish did not remember the state")
+	}
+	if meta := live.metas[blockKey]; meta == nil || !blockIDEqual(meta.ID, block) {
+		t.Fatal("state-only publish did not index state metadata")
+	}
+	seqKey := liveSeqKey{workchain: block.Workchain, shard: block.Shard, seqno: block.SeqNo}
+	if indexed, ok := live.seqIndex[seqKey]; !ok || !blockIDEqual(indexed, block) {
+		t.Fatal("state-only publish did not update the seqno index")
+	}
+}
+
+func TestStorePublishRejectsMismatchedBlockState(t *testing.T) {
+	block := testLiveBlockID(0, int64(1)<<62, 38, 0x38)
+	state := storage.BlockState{Block: testLiveBlockID(0, int64(1)<<62, 39, 0x39)}
+	live := New(noopBacking{})
+
+	err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:            block,
+		State:            &state,
+		AvailabilityOnly: true,
+	})
+	if err == nil {
+		t.Fatal("mismatched block state was accepted")
+	}
+	if len(live.blocks) != 0 || len(live.states) != 0 || len(live.metas) != 0 {
+		t.Fatal("mismatched block state changed the live view")
+	}
+}
+
 func TestStorePublishLiveBlockArtifactsRejectsInvalidReadFragments(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x31, 8).EndCell()
 	stateRoot := cell.BeginCell().MustStoreUInt(0x32, 8).EndCell()

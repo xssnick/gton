@@ -79,12 +79,30 @@ func TestOverlayPolicyMatrix(t *testing.T) {
 					SendQueries:       true,
 					AcceptQueries:     true,
 					QueryCapabilities: true,
+					FastSync: &fastSyncOverlaySpec{
+						plumtreeEnabled: true,
+					},
 				}
 				if got := test.fn(&spec); got != kind.want {
 					t.Fatalf("%s on %s overlay = %v, want %v", test.name, kind.name, got, kind.want)
 				}
 			}
 		})
+	}
+}
+
+func TestOverlayPolicyFastSyncPlumtreeFlag(t *testing.T) {
+	spec := overlaySpec{
+		Kind:     overlayKindFastSync,
+		FastSync: &fastSyncOverlaySpec{},
+	}
+	if spec.usesPlumtree() {
+		t.Fatal("disabled FastSync transport created a Plumtree runtime")
+	}
+
+	spec.FastSync.plumtreeEnabled = true
+	if !spec.usesPlumtree() {
+		t.Fatal("enabled FastSync transport did not create a Plumtree runtime")
 	}
 }
 

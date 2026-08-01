@@ -28,11 +28,10 @@ func TestPlumtreeIHaveSameFECPartReusesVerifiedSignature(t *testing.T) {
 	source := keys.PublicKeyED25519{Key: publicKey}
 
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-ihave-cache-overlay"),
-		0,
 	)
 
 	now := time.Now()

@@ -2,7 +2,7 @@ package storage
 
 import (
 	"bytes"
-	"container/list"
+	"container/heap"
 	"context"
 	"sync"
 
@@ -15,17 +15,57 @@ const DefaultLiveBlockCacheMaxBlocks = 8192
 // lock-free: entries are immutable once stored, publishers replace them
 // wholesale under publishMu, and eviction runs in publish order (blocks age out
 // naturally, so FIFO matches the access pattern without touching on reads).
+// The eviction heap contains only removable entries: pinned checkpoint blocks
+// never get scanned when the cache temporarily grows beyond its soft limit.
 type LiveBlockCache struct {
 	max int
 
 	blocks     sync.Map // BlockRootHash -> *LiveBlockCacheBlock
 	nextBlocks sync.Map // BlockRootHash of prev -> liveBlockCacheNext
 
-	publishMu  sync.Mutex
-	count      int
-	order      *list.List // publish-order queue of BlockRootHash for eviction
-	orderIndex map[BlockRootHash]*list.Element
-	prevKeys   map[BlockRootHash][]BlockRootHash // BlockRootHash of next -> prev keys pointing at it
+	publishMu sync.Mutex
+	nextOrder uint64
+	entries   map[BlockRootHash]*liveBlockCacheEvictionEntry
+	evictable liveBlockCacheEvictionHeap
+	prevKeys  map[BlockRootHash][]BlockRootHash // BlockRootHash of next -> prev keys pointing at it
+}
+
+type liveBlockCacheEvictionEntry struct {
+	key       BlockRootHash
+	order     uint64
+	heapIndex int
+}
+
+type liveBlockCacheEvictionHeap []*liveBlockCacheEvictionEntry
+
+func (h liveBlockCacheEvictionHeap) Len() int {
+	return len(h)
+}
+
+func (h liveBlockCacheEvictionHeap) Less(i, j int) bool {
+	return h[i].order < h[j].order
+}
+
+func (h liveBlockCacheEvictionHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+
+func (h *liveBlockCacheEvictionHeap) Push(value any) {
+	entry := value.(*liveBlockCacheEvictionEntry)
+	entry.heapIndex = len(*h)
+	*h = append(*h, entry)
+}
+
+func (h *liveBlockCacheEvictionHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	entry := old[last]
+	old[last] = nil
+	entry.heapIndex = -1
+	*h = old[:last]
+	return entry
 }
 
 type LiveBlockCacheBlock struct {
@@ -59,10 +99,9 @@ func NewLiveBlockCache(max int) *LiveBlockCache {
 		max = DefaultLiveBlockCacheMaxBlocks
 	}
 	return &LiveBlockCache{
-		max:        max,
-		order:      list.New(),
-		orderIndex: map[BlockRootHash]*list.Element{},
-		prevKeys:   map[BlockRootHash][]BlockRootHash{},
+		max:      max,
+		entries:  map[BlockRootHash]*liveBlockCacheEvictionEntry{},
+		prevKeys: map[BlockRootHash][]BlockRootHash{},
 	}
 }
 
@@ -82,10 +121,10 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 	defer c.publishMu.Unlock()
 
 	block := &LiveBlockCacheBlock{id: artifacts.Block}
-	isNew := true
-	if loaded, ok := c.blocks.Load(key); ok {
+	entry := c.entries[key]
+	if entry != nil {
+		loaded, _ := c.blocks.Load(key)
 		*block = *loaded.(*LiveBlockCacheBlock)
-		isNew = false
 	}
 	block.artifactFlushed = block.artifactFlushed || artifacts.ArtifactFlushed
 	if len(artifacts.BlockData) > 0 {
@@ -107,9 +146,19 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 	}
 
 	c.blocks.Store(key, block)
-	if isNew {
-		c.count++
-		c.orderIndex[key] = c.order.PushBack(key)
+	if entry == nil {
+		entry = &liveBlockCacheEvictionEntry{
+			key:       key,
+			order:     c.nextOrder,
+			heapIndex: -1,
+		}
+		c.nextOrder++
+		c.entries[key] = entry
+	}
+	if evictable := liveBlockCacheBlockEvictable(block); evictable && entry.heapIndex < 0 {
+		heap.Push(&c.evictable, entry)
+	} else if !evictable && entry.heapIndex >= 0 {
+		heap.Remove(&c.evictable, entry.heapIndex)
 	}
 	if block.meta != nil {
 		for _, prev := range block.meta.PrevRefs {
@@ -371,27 +420,9 @@ func liveBlockCacheShardChild(shard int64, left bool) int64 {
 }
 
 func (c *LiveBlockCache) evictLocked() {
-	for c.count > c.max {
-		evicted := false
-		for elem := c.order.Front(); elem != nil; {
-			next := elem.Next()
-			key := elem.Value.(BlockRootHash)
-
-			var block *LiveBlockCacheBlock
-			if loaded, ok := c.blocks.Load(key); ok {
-				block = loaded.(*LiveBlockCacheBlock)
-			}
-			if liveBlockCacheBlockEvictable(block) {
-				c.deleteBlockLocked(key)
-				evicted = true
-				break
-			}
-
-			elem = next
-		}
-		if !evicted {
-			return
-		}
+	for len(c.entries) > c.max && len(c.evictable) > 0 {
+		entry := heap.Pop(&c.evictable).(*liveBlockCacheEvictionEntry)
+		c.deleteBlockLocked(entry.key)
 	}
 }
 
@@ -403,13 +434,13 @@ func liveBlockCacheBlockEvictable(block *LiveBlockCacheBlock) bool {
 }
 
 func (c *LiveBlockCache) deleteBlockLocked(key BlockRootHash) {
-	if _, ok := c.blocks.LoadAndDelete(key); ok {
-		c.count--
+	if entry := c.entries[key]; entry != nil {
+		if entry.heapIndex >= 0 {
+			heap.Remove(&c.evictable, entry.heapIndex)
+		}
+		delete(c.entries, key)
 	}
-	if elem := c.orderIndex[key]; elem != nil {
-		c.order.Remove(elem)
-		delete(c.orderIndex, key)
-	}
+	c.blocks.Delete(key)
 
 	for _, prev := range c.prevKeys[key] {
 		if loaded, ok := c.nextBlocks.Load(prev); ok && BlockKey(loaded.(liveBlockCacheNext).next) == key {

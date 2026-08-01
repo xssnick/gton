@@ -622,20 +622,16 @@ func (testHTTPAPICurrencyCollectionAugmentation) SkipExtra(loader *cell.Slice) e
 	return tlb.LoadFromCell(&extra, loader)
 }
 
-func (testHTTPAPICurrencyCollectionAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return testHTTPAPICurrencyCollectionCell()
+func (testHTTPAPICurrencyCollectionAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testHTTPAPICurrencyCollectionAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testHTTPAPICurrencyCollectionCell()
+func (testHTTPAPICurrencyCollectionAugmentation) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testHTTPAPICurrencyCollectionAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testHTTPAPICurrencyCollectionCell()
-}
-
-func testHTTPAPICurrencyCollectionCell() (*cell.Cell, error) {
-	return tlb.ToCell(&tlb.CurrencyCollection{Coins: tlb.ZeroCoins})
+func (testHTTPAPICurrencyCollectionAugmentation) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
 func testHTTPAPIAugDictRootCell(t testing.TB, dict *cell.AugmentedDictionary) *cell.Cell {

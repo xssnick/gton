@@ -69,11 +69,7 @@ func (c fastSyncBlockchainConfig) plumtreeEnabled(workchain int32) bool {
 // plumtreePolicy fails closed rather than failing: with no roster there are no
 // authorized keys, and PlumtreePolicy.authorizes then rejects every source.
 func (c fastSyncBlockchainConfig) plumtreePolicy() p2p.PlumtreePolicy {
-	return p2p.NewPlumtreePolicy(
-		c.masterchainPlumtreeVersion,
-		c.shardPlumtreeVersion,
-		c.roster.RootPublicKeyIDs(),
-	)
+	return p2p.NewPlumtreePolicy(c.roster.RootPublicKeyIDs())
 }
 
 // fastSyncValidators adapts one validator-set getter. A set that is absent or

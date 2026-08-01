@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -148,7 +149,10 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 
 	pprofCtx, stopPprof := context.WithCancel(context.Background())
 	defer stopPprof()
-	startPprof(pprofCtx, logger, strings.TrimSpace(startOpts.PprofAddr))
+	if err = startPprof(pprofCtx, logger, strings.TrimSpace(startOpts.PprofAddr)); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 1
+	}
 
 	runtimeOpts, err := cfg.RuntimeOptions(startOpts.Node)
 	if err != nil {
@@ -372,9 +376,14 @@ const (
 	pprofBlockProfileRateNs = 1_000_000
 )
 
-func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
+func startPprof(ctx context.Context, logger zerolog.Logger, addr string) error {
 	if addr == "" {
-		return
+		return nil
+	}
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen pprof on %s: %w", addr, err)
 	}
 
 	// Both profiles are inert unless enabled, so they are armed together with
@@ -404,10 +413,12 @@ func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 			Str("mutex_url", "http://"+addr+"/debug/pprof/mutex").
 			Str("block_url", "http://"+addr+"/debug/pprof/block").
 			Msg("started pprof server")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error().Err(err).Str("pprof_addr", addr).Msg("pprof server stopped")
 		}
 	}()
+
+	return nil
 }
 
 func writeLiteServerPublicKey(out io.Writer, cfg nodeconfig.Config, path string) error {

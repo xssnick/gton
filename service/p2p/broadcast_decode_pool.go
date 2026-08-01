@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"time"
 
@@ -149,6 +150,10 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 	}
 
 	downloaded, sigSet, cacheErr := n.decodedBroadcasts.get(req.kind, req.block)
+	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
+		n.noteBroadcast("decode_reused", req.overlay, req.kind, req.delivery)
+		return
+	}
 	if cacheErr == nil {
 		n.noteBroadcast("decode_reused", req.overlay, req.kind, req.delivery)
 		if req.preSigSet != nil {
@@ -180,11 +185,12 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 
 	block := cloneBlockID(req.block)
 	n.acceptBroadcast(acceptedBroadcast{
-		fingerprint:        req.fingerprint,
-		deduped:            true,
-		skipAcceptedMetric: true,
-		block:              &block,
-		rebroadcast:        pendingBlockBroadcastRebroadcast(req.rebroadcast),
+		fingerprint:         req.fingerprint,
+		deduped:             true,
+		skipAcceptedMetric:  true,
+		block:               &block,
+		rebroadcast:         pendingBlockBroadcastRebroadcast(req.rebroadcast),
+		processedDecodeKind: req.kind,
 		event: &BroadcastEvent{
 			Overlay:      req.overlay,
 			Delivery:     req.delivery,

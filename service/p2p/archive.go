@@ -988,9 +988,6 @@ func discardArchiveInfoAttempt(result archiveInfoAttemptResult) {
 
 func (s *overlaySubscription) logArchiveInfoHedgeResult(masterchainSeqno uint32, shard archive.ShardID, candidate archiveCandidate, primary bool, attempts int) {
 	event := s.log.Debug()
-	if !primary {
-		event = s.log.Info()
-	}
 	event.
 		Uint32("masterchain_seqno", masterchainSeqno).
 		Int32("workchain", shard.Workchain).

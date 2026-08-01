@@ -161,7 +161,7 @@ func (s *overlaySubscription) reloadNeighbours() {
 	s.mx.Unlock()
 
 	if before == 0 && after > 0 {
-		s.log.Info().
+		s.log.Debug().
 			Int("neighbours", after).
 			Int("alive_peers", len(candidates)).
 			Msg("selected overlay neighbours")

@@ -27,15 +27,16 @@ const (
 )
 
 type acceptedBroadcast struct {
-	fingerprint        string
-	deduped            bool
-	delivery           Delivery
-	block              *ton.BlockIDExt
-	event              *BroadcastEvent
-	extraEvents        []BroadcastEvent
-	masterchainWake    *ton.BlockIDExt
-	rebroadcast        *rebroadcastRequest
-	skipAcceptedMetric bool
+	fingerprint         string
+	deduped             bool
+	delivery            Delivery
+	block               *ton.BlockIDExt
+	event               *BroadcastEvent
+	extraEvents         []BroadcastEvent
+	masterchainWake     *ton.BlockIDExt
+	rebroadcast         *rebroadcastRequest
+	skipAcceptedMetric  bool
+	processedDecodeKind string
 }
 
 type broadcastDisposition uint8
@@ -643,6 +644,29 @@ func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, deliver
 	}
 }
 
+func (s *overlaySubscription) acceptedProcessedBlockBroadcast(
+	fingerprint string,
+	delivery Delivery,
+	kind string,
+	block ton.BlockIDExt,
+	payload *broadcastPayload,
+	peer *overlayPeer,
+) (broadcastResult, error) {
+	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+	if err != nil {
+		s.node.deduper.Forget(fingerprint)
+		return broadcastResult{}, err
+	}
+
+	return acceptedBroadcastResult(acceptedBroadcast{
+		fingerprint: fingerprint,
+		deduped:     true,
+		delivery:    delivery,
+		block:       block.Copy(),
+		rebroadcast: rebroadcast,
+	}), nil
+}
+
 func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, block ton.BlockIDExt, sourcePeerID PeerID, desc *ShardBlockDescription) acceptedBroadcast {
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, "tonNode.newShardBlockBroadcast", block, sourcePeerID)
 	accepted.event.ShardDescription = desc
@@ -719,6 +743,10 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	// two-step) under different broadcast fingerprints; the decode result is
 	// pinned by the block id, so reuse it instead of decoding again
 	downloaded, sigSet, cacheErr := s.node.decodedBroadcasts.get(kind, block)
+	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
+		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	}
 	cached := cacheErr == nil
 	if cached && !signaturesChecked {
 		// v1 tonNode.blockBroadcastCompressed carries its validator
@@ -926,6 +954,9 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	}
 	accepted.event.Downloaded = downloaded
 	accepted.rebroadcast = rebroadcast
+	if signaturesChecked {
+		accepted.processedDecodeKind = kind
+	}
 	return acceptedBroadcastResult(accepted), nil
 }
 
@@ -964,6 +995,10 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	}
 
 	downloaded, _, cacheErr := s.node.decodedBroadcasts.get(kind, block)
+	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
+		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	}
 	cached := cacheErr == nil
 	if cached {
 		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
@@ -1011,11 +1046,12 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	}
 
 	accepted := acceptedBroadcast{
-		fingerprint: fingerprint,
-		deduped:     true,
-		delivery:    delivery,
-		block:       block.Copy(),
-		rebroadcast: rebroadcast,
+		fingerprint:         fingerprint,
+		deduped:             true,
+		delivery:            delivery,
+		block:               block.Copy(),
+		rebroadcast:         rebroadcast,
+		processedDecodeKind: kind,
 	}
 	accepted.extraEvents = s.blockFinalityBroadcastEvents(delivery, trusted, assembled)
 
@@ -1058,6 +1094,15 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 	}
 
 	n.enqueueBlockOverlayFanout(accepted)
+	// A rejected application event remains retryable through another delivery, so
+	// only a successfully queued event may release the reusable decoded payload.
+	// An event-free accept (the candidate path, which carries only extraEvents)
+	// releases unconditionally: its payload is already pinned by the candidate
+	// and finality caches, which outlive this entry and are consulted before any
+	// network fetch.
+	if accepted.processedDecodeKind != "" && (accepted.event == nil || acceptedNoted) {
+		n.decodedBroadcasts.markProcessed(accepted.processedDecodeKind, *accepted.block)
+	}
 }
 
 func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric bool) bool {
@@ -1081,7 +1126,7 @@ func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric boo
 	}
 	if event.Delivery == DeliveryPlumtree {
 		n.plumtreeBroadcastLogOnce.Do(func() {
-			n.log.Info().
+			n.log.Debug().
 				Str("overlay", event.Overlay).
 				Str("kind", event.Kind).
 				Str("block", storage.FormatBlockRef(event.Block)).

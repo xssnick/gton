@@ -42,11 +42,10 @@ func TestPeerIDFromED25519PublicKeyMatchesTLHash(t *testing.T) {
 func TestPlumtreeSignatureVerifierAcceptsAuthorizedSource(t *testing.T) {
 	publicKey, privateKey, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-verifier-overlay"),
-		-1,
 	)
 	request := plumtreeVerifierRequest(
 		privateKey,
@@ -69,12 +68,11 @@ func TestPlumtreeSignatureVerifierAcceptsAuthorizedSource(t *testing.T) {
 func TestPlumtreeSignatureVerifierUsesFixedFastSyncAuthorization(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	source := &fixedPlumtreePolicySource{
-		policy: NewPlumtreePolicy(2, 2, []PeerID{sourceID}),
+		policy: NewPlumtreePolicy([]PeerID{sourceID}),
 	}
 	verifier := newPlumtreeSignatureVerifier(
 		source,
 		testPeerID("fast-sync-plumtree-verifier-overlay"),
-		0,
 	)
 
 	if _, err := verifier.verifyAt(
@@ -110,11 +108,10 @@ func TestPlumtreeSignatureVerifierUsesTrustedCertificate(t *testing.T) {
 	maxSize := uint32(4096)
 
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{issuerID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		overlayID,
-		0,
 	)
 	certificate := overlay.Certificate{
 		IssuedBy: keys.PublicKeyED25519{Key: issuerPublic},
@@ -155,11 +152,10 @@ func TestPlumtreeSignatureVerifierCanonicalizesDefaultV2Certificate(t *testing.T
 	flags := int32(plumtreeCertificateAllowFEC | plumtreeCertificateTrusted)
 
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{issuerID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		overlayID,
-		0,
 	)
 	certificate := overlay.CertificateV2{
 		IssuedBy: keys.PublicKeyED25519{Key: issuerPublic},
@@ -191,11 +187,10 @@ func TestPlumtreeSignatureVerifierRejectsNegativeCertificateExpiry(t *testing.T)
 	issuerPublic, _, issuerID := plumtreeVerifierKey(t)
 	_, sourcePrivate, _ := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{issuerID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-negative-expiry-overlay"),
-		0,
 	)
 	request := plumtreeVerifierRequest(
 		sourcePrivate,
@@ -223,11 +218,10 @@ func TestPlumtreeSignatureVerifierRejectsNegativeCertificateExpiry(t *testing.T)
 func TestPlumtreeSignatureVerifierTemporarilyRejectsBadSignaturePeer(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-signature-ban-overlay"),
-		0,
 	)
 	from := testPeerID("plumtree-signature-ban-from")
 	request := plumtreeVerifierRequest(
@@ -265,11 +259,10 @@ func TestPlumtreeSignatureVerifierCertificateRateLimitAndCache(t *testing.T) {
 	maxSize := uint32(4096)
 
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{issuerID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		overlayID,
-		0,
 	)
 
 	first := plumtreeCertifiedVerifierRequest(
@@ -325,11 +318,10 @@ func TestPlumtreeSignatureVerifierRunsSourceChecksConcurrently(t *testing.T) {
 
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-concurrent-overlay"),
-		0,
 	)
 
 	const verifiers = 8
@@ -379,11 +371,10 @@ func TestPlumtreeCertificateIssuerUsesDecodedValueType(t *testing.T) {
 func TestPlumtreeSignatureVerifierCachesVerifiedSourceSignature(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-signature-cache-overlay"),
-		0,
 	)
 	request := plumtreeVerifierRequest(
 		sourcePrivate,
@@ -414,11 +405,10 @@ func TestPlumtreeSignatureVerifierCachesVerifiedSourceSignature(t *testing.T) {
 func TestPlumtreeSignatureVerifierSignatureCacheHitSkipsKeyMath(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-signature-hit-overlay"),
-		0,
 	)
 	request := plumtreeVerifierRequest(
 		sourcePrivate,
@@ -443,11 +433,10 @@ func TestPlumtreeSignatureVerifierSignatureCacheHitSkipsKeyMath(t *testing.T) {
 func TestPlumtreeSignatureVerifierDoesNotCacheInvalidSignature(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-signature-nocache-overlay"),
-		0,
 	)
 	request := plumtreeVerifierRequest(
 		sourcePrivate,
@@ -471,11 +460,10 @@ func TestPlumtreeSignatureVerifierDoesNotCacheInvalidSignature(t *testing.T) {
 func TestPlumtreeSignatureVerifierRejectionPrecedesSignatureCache(t *testing.T) {
 	_, sourcePrivate, sourceID := plumtreeVerifierKey(t)
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-signature-reject-cache-overlay"),
-		0,
 	)
 	from := testPeerID("plumtree-signature-reject-cache-from")
 	now := time.Now()
@@ -519,11 +507,10 @@ func BenchmarkPlumtreeSignatureVerifierCachedSignature(b *testing.B) {
 		b.Fatalf("derive peer ID: %v", err)
 	}
 	node := &Node{}
-	node.SetPlumtreePolicy(NewPlumtreePolicy(2, 2, []PeerID{sourceID}))
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{sourceID}))
 	verifier := newPlumtreeSignatureVerifier(
 		nodePlumtreePolicySource{node: node},
 		testPeerID("plumtree-signature-bench-overlay"),
-		0,
 	)
 	request := plumtreeVerifierRequest(
 		privateKey,

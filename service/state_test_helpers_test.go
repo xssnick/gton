@@ -100,18 +100,20 @@ func (testShardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {
 	return err
 }
 
-func (testShardAccountsAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return cell.BeginCell().
-		MustStoreUInt(0, 5).
-		MustStoreBigCoins(big.NewInt(0)).
-		MustStoreDict(nil).
-		EndCell(), nil
+func (testShardAccountsAugmentation) EmptyExtra(dst *cell.Builder) error {
+	if err := dst.StoreUInt(0, 5); err != nil {
+		return err
+	}
+	if err := dst.StoreBigCoins(big.NewInt(0)); err != nil {
+		return err
+	}
+	return dst.StoreDict(nil)
 }
 
-func (testShardAccountsAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return nil, fmt.Errorf("test shard account leaf extra is not implemented")
+func (testShardAccountsAugmentation) LeafExtra(*cell.Slice, *cell.Builder) error {
+	return fmt.Errorf("test shard account leaf extra is not implemented")
 }
 
-func (testShardAccountsAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return nil, fmt.Errorf("test shard account combine extra is not implemented")
+func (testShardAccountsAugmentation) CombineExtra(*cell.Slice, *cell.Slice, *cell.Builder) error {
+	return fmt.Errorf("test shard account combine extra is not implemented")
 }
