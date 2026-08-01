@@ -79,7 +79,6 @@ func (s *Store) Close() error {
 	s.log.Info().
 		Int64("hot_refs", s.hotRefs.Load()).
 		Int("cell_generations", len(s.cellGenerations)).
-		Bool("artifact_file_cache", s.artifactFiles != nil).
 		Msg("closing pebble storage")
 
 	stageStarted := time.Now()
@@ -126,23 +125,19 @@ func (s *Store) Close() error {
 	if err := s.closeCellGenerations(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if s.artifactFiles != nil {
-		stageStarted = time.Now()
-		s.log.Info().Msg("closing artifact file cache")
-		if err := s.artifactFiles.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		s.log.Info().
-			Dur("elapsed", time.Since(stageStarted)).
-			Msg("closed artifact file cache")
+	stageStarted = time.Now()
+	s.log.Info().Msg("closing artifact file cache")
+	if err := s.artifactFiles.close(); err != nil && firstErr == nil {
+		firstErr = err
 	}
+	s.log.Info().
+		Dur("elapsed", time.Since(stageStarted)).
+		Msg("closed artifact file cache")
 	s.mu.Lock()
 	s.cells = nil
 	s.cellGenerations = nil
 	s.mu.Unlock()
-	if s.hotCache != nil {
-		s.hotCache.Unref()
-	}
+	s.hotCache.Unref()
 	s.log.Info().
 		Dur("elapsed", time.Since(started)).
 		Msg("closed pebble storage")

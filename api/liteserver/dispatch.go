@@ -295,14 +295,9 @@ func (e *queryExecutor) occupy(ctx context.Context) (func(), bool) {
 	case <-picked:
 		return func() { close(done) }, true
 	case <-ctx.Done():
-		// The hold is already queued; unpark the worker once it takes it.
-		go func() {
-			select {
-			case <-picked:
-				close(done)
-			case <-e.done:
-			}
-		}()
+		// The hold is already queued. Closing done now lets the worker pass
+		// through immediately whenever it takes the cancelled hold.
+		close(done)
 		return nil, false
 	case <-e.done:
 		return nil, false

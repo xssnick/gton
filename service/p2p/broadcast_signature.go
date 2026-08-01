@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -19,13 +20,13 @@ func (n *Node) checkBlockBroadcastSignatures(kind string, block ton.BlockIDExt, 
 		return fmt.Errorf("broadcast signature verifier is not configured")
 	}
 	if proof == nil {
-		return fmt.Errorf("block broadcast %s has no proof root", formatBlockRef(block))
+		return fmt.Errorf("block broadcast %s has no proof root", storage.FormatBlockRef(block))
 	}
 	if signatures == nil {
-		return fmt.Errorf("block broadcast %s has no validator signatures", formatBlockRef(block))
+		return fmt.Errorf("block broadcast %s has no validator signatures", storage.FormatBlockRef(block))
 	}
 
-	ctx, cancel := context.WithTimeout(n.runtimeContext(), broadcastSignatureTimeout)
+	ctx, cancel := context.WithTimeout(n.runCtx, broadcastSignatureTimeout)
 	defer cancel()
 
 	return n.signatureVerifier.CheckBlockBroadcastSignatures(ctx, BlockBroadcastSignatureCheck{
@@ -41,7 +42,7 @@ func (n *Node) checkBlockFinalitySignatures(kind string, block ton.BlockIDExt, s
 		return nil, fmt.Errorf("broadcast signature verifier is not configured")
 	}
 
-	ctx, cancel := context.WithTimeout(n.runtimeContext(), broadcastSignatureTimeout)
+	ctx, cancel := context.WithTimeout(n.runCtx, broadcastSignatureTimeout)
 	defer cancel()
 
 	return n.signatureVerifier.CheckBlockFinalitySignatures(ctx, BlockFinalitySignatureCheck{
@@ -56,7 +57,7 @@ func (n *Node) validateShardDescriptionBroadcast(block ton.BlockIDExt, catchainS
 		return nil, fmt.Errorf("broadcast signature verifier is not configured")
 	}
 
-	ctx, cancel := context.WithTimeout(n.runtimeContext(), broadcastSignatureTimeout)
+	ctx, cancel := context.WithTimeout(n.runCtx, broadcastSignatureTimeout)
 	defer cancel()
 
 	return n.signatureVerifier.ValidateShardDescriptionBroadcast(ctx, ShardDescriptionSignatureCheck{

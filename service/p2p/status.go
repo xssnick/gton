@@ -15,7 +15,7 @@ import (
 // anything (frozen from the start) is never promoted into neighbours and
 // would otherwise be invisible exactly when its diagnostics matter most.
 func (s *overlaySubscription) statusPeersLocked() []*overlayPeer {
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.statusListsWholeRoster() {
 		peers := make([]*overlayPeer, 0, len(s.peers))
 		for _, peer := range s.peers {
 			peers = append(peers, peer)
@@ -25,11 +25,12 @@ func (s *overlaySubscription) statusPeersLocked() []*overlayPeer {
 
 	peers := make([]*overlayPeer, 0, len(s.neighbours))
 	for _, id := range s.neighbours {
-		peer := s.peers[id]
-		if peer == nil {
-			continue
+		// A neighbour whose roster row is gone must not reach the callers, who
+		// dereference these entries; see the dangling-neighbour handling in
+		// pruneNeighboursLocked.
+		if peer := s.peers[id]; peer != nil {
+			peers = append(peers, peer)
 		}
-		peers = append(peers, peer)
 	}
 	return peers
 }
@@ -49,6 +50,8 @@ func adnlChannelStateLabel(state adnl.PeerChannelState) string {
 
 type StatusSnapshot struct {
 	ListenAddr            string
+	QUICPeers             int
+	QUICPeersAccepted     uint64
 	Offline               bool
 	OfflineReason         string
 	LatestMasterchain     *ton.BlockIDExt
@@ -60,6 +63,7 @@ type StatusSnapshot struct {
 	Rebroadcast           []RebroadcastStatusSnapshot
 	Broadcasts            []BroadcastStatusSnapshot
 	BroadcastDrops        []BroadcastDropStatusSnapshot
+	Plumtree              []PlumtreeStatusSnapshot
 }
 
 type OverlayStatusSnapshot struct {
@@ -122,6 +126,7 @@ type BroadcastStatusSnapshot struct {
 	Direction string
 	Overlay   string
 	Kind      string
+	Delivery  Delivery
 	Reason    string
 	Count     uint64
 }
@@ -133,17 +138,27 @@ type BroadcastDropStatusSnapshot struct {
 	Count   uint64
 }
 
+type PlumtreeStatusSnapshot struct {
+	Overlay string
+
+	DirectParts   uint64
+	RecoveryParts uint64
+
+	SimpleMessages      uint64
+	FECMessages         uint64
+	IHaveMessages       uint64
+	PruneMessages       uint64
+	UsefulMessages      uint64
+	StatsPushMessages   uint64
+	RepairQueryMessages uint64
+}
+
 type broadcastStatKey struct {
 	direction string
 	overlay   string
 	kind      string
+	delivery  Delivery
 	reason    string
-}
-
-type fecReceiverPeerKey struct {
-	overlay string
-	peer    PeerID
-	shared  bool
 }
 
 type fecReceiverCounterSnapshot struct {
@@ -165,6 +180,11 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 		OfflineReason: n.OfflineReason(),
 		Overlays:      make([]OverlayStatusSnapshot, 0, len(subscriptions)),
 	}
+
+	n.quicPeersMx.RLock()
+	snapshot.QUICPeers = len(n.quicPeers)
+	n.quicPeersMx.RUnlock()
+	snapshot.QUICPeersAccepted = n.quicPeersAccepted.Load()
 
 	n.latestBlocksMx.RLock()
 	if n.observedMasterchain != nil {
@@ -200,19 +220,73 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	snapshot.Rebroadcast = n.rebroadcastStatusSnapshot()
 	snapshot.Broadcasts = n.broadcastStatusSnapshot()
 	snapshot.BroadcastDrops = n.broadcastDropStatusSnapshot()
+	snapshot.Plumtree = plumtreeStatusSnapshot(subscriptions)
 
 	return snapshot
 }
 
-func (n *Node) noteBroadcast(direction, overlay, kind string) {
-	n.noteBroadcastWithReason(direction, overlay, kind, "")
+func plumtreeStatusSnapshot(
+	subscriptions []*overlaySubscription,
+) []PlumtreeStatusSnapshot {
+	byOverlay := make(
+		map[string]*PlumtreeStatusSnapshot,
+		len(subscriptions),
+	)
+	for _, sub := range subscriptions {
+		if sub.plumtree == nil {
+			continue
+		}
+
+		overlay := sub.spec.Name
+		snapshot := byOverlay[overlay]
+		if snapshot == nil {
+			snapshot = &PlumtreeStatusSnapshot{Overlay: overlay}
+			byOverlay[overlay] = snapshot
+		}
+
+		telemetry := sub.plumtree.stats.telemetry.snapshot()
+		snapshot.DirectParts += telemetry.receivedParts[plumtreePartSourceDirect]
+		snapshot.RecoveryParts += telemetry.receivedParts[plumtreePartSourceRecovery]
+		snapshot.SimpleMessages += telemetry.receivedMessages[plumtreeMessageSimple]
+		snapshot.FECMessages += telemetry.receivedMessages[plumtreeMessageFEC]
+		snapshot.IHaveMessages += telemetry.receivedMessages[plumtreeMessageIHave]
+		snapshot.PruneMessages += telemetry.receivedMessages[plumtreeMessagePrune]
+		snapshot.UsefulMessages += telemetry.receivedMessages[plumtreeMessageUseful]
+		snapshot.StatsPushMessages += telemetry.receivedMessages[plumtreeMessageStatsPush]
+		snapshot.RepairQueryMessages += telemetry.receivedMessages[plumtreeMessageRepairQuery]
+	}
+
+	result := make([]PlumtreeStatusSnapshot, 0, len(byOverlay))
+	for _, snapshot := range byOverlay {
+		result = append(result, *snapshot)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Overlay < result[j].Overlay
+	})
+
+	return result
+}
+
+func (n *Node) noteBroadcast(
+	direction string,
+	overlay string,
+	kind string,
+	delivery Delivery,
+) {
+	n.noteBroadcastWithReason(direction, overlay, kind, delivery, "")
 }
 
 func (n *Node) noteBroadcastDrop(overlay, kind, reason string) {
-	n.noteBroadcastWithReason("dropped", overlay, kind, reason)
+	n.noteBroadcastWithReason("dropped", overlay, kind, "", reason)
 }
 
-func (n *Node) noteBroadcastWithReason(direction, overlay, kind, reason string) {
+func (n *Node) noteBroadcastWithReason(
+	direction string,
+	overlay string,
+	kind string,
+	delivery Delivery,
+	reason string,
+) {
 	if direction == "" {
 		direction = "unknown"
 	}
@@ -230,13 +304,11 @@ func (n *Node) noteBroadcastWithReason(direction, overlay, kind, reason string) 
 		direction: direction,
 		overlay:   overlay,
 		kind:      kind,
+		delivery:  delivery,
 		reason:    reason,
 	}
 
 	n.broadcastStatsMx.Lock()
-	if n.broadcastStats == nil {
-		n.broadcastStats = map[broadcastStatKey]uint64{}
-	}
 	n.broadcastStats[key]++
 	n.broadcastStatsMx.Unlock()
 }
@@ -254,6 +326,7 @@ func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
 			Direction: key.direction,
 			Overlay:   key.overlay,
 			Kind:      key.kind,
+			Delivery:  key.delivery,
 			Count:     count,
 		})
 	}
@@ -264,6 +337,9 @@ func (n *Node) broadcastStatusSnapshot() []BroadcastStatusSnapshot {
 		}
 		if stats[i].Overlay != stats[j].Overlay {
 			return stats[i].Overlay < stats[j].Overlay
+		}
+		if stats[i].Delivery != stats[j].Delivery {
+			return stats[i].Delivery < stats[j].Delivery
 		}
 		return stats[i].Kind < stats[j].Kind
 	})
@@ -301,13 +377,11 @@ func (n *Node) broadcastDropStatusSnapshot() []BroadcastDropStatusSnapshot {
 
 func (n *Node) queueStatusSnapshot() []QueueStatusSnapshot {
 	queues := make([]QueueStatusSnapshot, 0, 4)
-	if n.eventQueue != nil {
-		queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
-	}
+	queues = append(queues, n.eventQueue.StatusSnapshot("broadcast"))
 	local, regular := n.peerRebroadcastQueueStatusSnapshot()
 	queues = append(queues, regular, local)
-	if customTwoStep, ok := n.customTwoStepQueueStatusSnapshot(); ok {
-		queues = append(queues, customTwoStep)
+	if twoStep, ok := n.twoStepQueueStatusSnapshot(); ok {
+		queues = append(queues, twoStep)
 	}
 	return queues
 }
@@ -330,11 +404,11 @@ func (n *Node) peerRebroadcastQueueStatusSnapshot() (QueueStatusSnapshot, QueueS
 	return local, regular
 }
 
-func (n *Node) customTwoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
-	total := QueueStatusSnapshot{Name: customTwoStepRebroadcastQueueName}
+func (n *Node) twoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
+	total := QueueStatusSnapshot{Name: twoStepRebroadcastQueueName}
 	found := false
 	for _, sub := range n.subscriptionsSnapshot() {
-		next, ok := sub.customTwoStepQueueStatusSnapshot()
+		next, ok := sub.twoStepQueueStatusSnapshot()
 		if !ok {
 			continue
 		}
@@ -369,19 +443,10 @@ func (n *Node) rebroadcastStatusSnapshot() []RebroadcastStatusSnapshot {
 
 func (n *Node) fecReceiverStatusSnapshot(subscriptions []*overlaySubscription) []FECReceiverStatusSnapshot {
 	byOverlay := map[string]*FECReceiverStatusSnapshot{}
-	seen := map[fecReceiverPeerKey]struct{}{}
+	seen := map[string]struct{}{}
 
 	for _, sub := range subscriptions {
-		relayEnabled := sub.broadcastFECRelayEnabled()
-
-		sub.mx.Lock()
 		overlayName := sub.spec.Name
-		relayState := sub.fecRelayState
-		peers := make([]*overlayPeer, 0, len(sub.peers))
-		for _, peer := range sub.peers {
-			peers = append(peers, peer)
-		}
-		sub.mx.Unlock()
 
 		snapshot := byOverlay[overlayName]
 		if snapshot == nil {
@@ -389,32 +454,11 @@ func (n *Node) fecReceiverStatusSnapshot(subscriptions []*overlaySubscription) [
 			byOverlay[overlayName] = snapshot
 		}
 
-		if relayEnabled {
-			if relayState == nil {
-				continue
-			}
+		stats := sub.broadcastReceiver.FECBroadcastStats()
+		addFECReceiverSnapshotStats(snapshot, stats)
 
-			stats := relayState.Stats()
-			addFECReceiverSnapshotStats(snapshot, stats)
-
-			key := fecReceiverPeerKey{overlay: overlayName, shared: true}
-			seen[key] = struct{}{}
-			n.addFECReceiverCounterDeltas(key, stats)
-			continue
-		}
-
-		for _, peer := range peers {
-			if peer.overlay == nil {
-				continue
-			}
-
-			stats := peer.overlay.FECBroadcastStats()
-			addFECReceiverSnapshotStats(snapshot, stats)
-
-			key := fecReceiverPeerKey{overlay: overlayName, peer: peer.id}
-			seen[key] = struct{}{}
-			n.addFECReceiverCounterDeltas(key, stats)
-		}
+		seen[overlayName] = struct{}{}
+		n.addFECReceiverCounterDeltas(overlayName, stats)
 	}
 
 	n.fecReceiverStatsMx.Lock()
@@ -456,16 +500,9 @@ func addFECReceiverSnapshotStats(snapshot *FECReceiverStatusSnapshot, stats over
 	snapshot.DeliveredBroadcasts += stats.DeliveredBroadcasts
 }
 
-func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, stats overlay.FECBroadcastStats) {
+func (n *Node) addFECReceiverCounterDeltas(overlayName string, stats overlay.FECBroadcastStats) {
 	n.fecReceiverStatsMx.Lock()
 	defer n.fecReceiverStatsMx.Unlock()
-
-	if n.fecReceiverLast == nil {
-		n.fecReceiverLast = map[fecReceiverPeerKey]fecReceiverCounterSnapshot{}
-	}
-	if n.fecReceiverTotals == nil {
-		n.fecReceiverTotals = map[string]fecReceiverCounterSnapshot{}
-	}
 
 	current := fecReceiverCounterSnapshot{
 		dropped:            stats.DroppedTotal,
@@ -477,8 +514,8 @@ func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, stats overlay
 		fecRelaySent:       stats.FECRelaySentTotal,
 		fecRelayFailed:     stats.FECRelayFailedTotal,
 	}
-	last := n.fecReceiverLast[key]
-	totals := n.fecReceiverTotals[key.overlay]
+	last := n.fecReceiverLast[overlayName]
+	totals := n.fecReceiverTotals[overlayName]
 	totals.dropped += counterDelta(last.dropped, current.dropped)
 	totals.evicted += counterDelta(last.evicted, current.evicted)
 	totals.completed += counterDelta(last.completed, current.completed)
@@ -488,8 +525,8 @@ func (n *Node) addFECReceiverCounterDeltas(key fecReceiverPeerKey, stats overlay
 	totals.fecRelaySent += counterDelta(last.fecRelaySent, current.fecRelaySent)
 	totals.fecRelayFailed += counterDelta(last.fecRelayFailed, current.fecRelayFailed)
 
-	n.fecReceiverLast[key] = current
-	n.fecReceiverTotals[key.overlay] = totals
+	n.fecReceiverLast[overlayName] = current
+	n.fecReceiverTotals[overlayName] = totals
 }
 
 func counterDelta(previous, current uint64) uint64 {
@@ -506,7 +543,7 @@ func (s *overlaySubscription) statusSnapshot() OverlayStatusSnapshot {
 	now := time.Now()
 	snapshot := OverlayStatusSnapshot{
 		Name:           s.spec.Name,
-		FixedProbes:    s.spec.Kind == overlayKindCustomFixed,
+		FixedProbes:    s.spec.runsFixedPeerProbes(),
 		SoftRecoveries: s.softRecoveries,
 		HardRecoveries: s.hardRecoveries,
 		Neighbours:     make([]NeighbourStatusSnapshot, 0, len(s.neighbours)),

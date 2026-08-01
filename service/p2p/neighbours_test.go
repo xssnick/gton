@@ -463,7 +463,7 @@ func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
 		use  peerUse
 	}{
 		{name: "download", use: peerUse{downloads: 1}},
-		{name: "pin", use: peerUse{pins: 1}},
+		{name: "query", use: peerUse{queries: 1}},
 	}
 
 	for _, tt := range tests {

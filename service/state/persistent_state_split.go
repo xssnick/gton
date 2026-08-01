@@ -1,9 +1,7 @@
 package state
 
 import (
-	"errors"
 	"fmt"
-	"math/big"
 	"math/bits"
 
 	storage2 "github.com/xssnick/gton/service/storage"
@@ -186,7 +184,7 @@ func visitCellRecursiveSeen(root *cell.Cell, seen map[cell.Hash]struct{}) error 
 }
 
 func WrapShardAccountsRoot(root *cell.Cell) (*cell.Cell, error) {
-	extra, err := root.AsAugDict(256, shardAccountsAugmentation{}).LoadRootExtra()
+	extra, err := root.AsAugDict(256, tlb.AugShardAccounts{}).LoadRootExtra()
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +202,7 @@ func WrapShardAccountsRoot(root *cell.Cell) (*cell.Cell, error) {
 }
 
 func NewShardAccountsAugDict() (*cell.AugmentedDictionary, error) {
-	return cell.NewAugDict(256, shardAccountsAugmentation{})
+	return cell.NewAugDict(256, tlb.AugShardAccounts{})
 }
 
 func LoadShardAccountsRoot(root *cell.Cell) (*cell.AugmentedDictionary, error) {
@@ -213,7 +211,7 @@ func LoadShardAccountsRoot(root *cell.Cell) (*cell.AugmentedDictionary, error) {
 		return nil, err
 	}
 	return loader.LoadAugDict(256, cell.ReadOnlyAugmentation{
-		SkipExtraFn: shardAccountsAugmentation{}.SkipExtra,
+		SkipExtraFn: tlb.AugShardAccounts{}.SkipExtra,
 	}, false)
 }
 
@@ -254,152 +252,4 @@ func ShardPrefixLength(shard int64) int {
 		return 64
 	}
 	return 63 - bits.TrailingZeros64(lowBit)
-}
-
-type shardAccountsAugmentation struct{}
-
-func (shardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {
-	if _, err := loadDepthBalanceInfo(loader); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (shardAccountsAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return storeDepthBalanceInfo(0, tlb.ZeroCoins, nil)
-}
-
-func (shardAccountsAugmentation) LeafExtra(value *cell.Slice) (*cell.Cell, error) {
-	var account tlb.ShardAccount
-	if err := tlb.LoadFromCell(&account, value); err != nil {
-		return nil, err
-	}
-	if account.Account == nil {
-		return storeDepthBalanceInfo(0, tlb.ZeroCoins, nil)
-	}
-
-	loader, err := account.Account.BeginParse()
-	if err != nil {
-		return nil, err
-	}
-
-	var state tlb.AccountState
-	if err := tlb.LoadFromCell(&state, loader); err != nil {
-		return nil, err
-	}
-	if !state.IsValid {
-		return storeDepthBalanceInfo(0, tlb.ZeroCoins, nil)
-	}
-
-	var depth uint64
-	if anycast := state.Address.Anycast(); anycast != nil {
-		depth = uint64(anycast.Depth())
-	}
-	return storeDepthBalanceInfo(depth, state.Balance, state.ExtraCurrencies)
-}
-
-func (shardAccountsAugmentation) CombineExtra(leftExtra, rightExtra *cell.Slice) (*cell.Cell, error) {
-	left, err := loadDepthBalanceInfo(leftExtra)
-	if err != nil {
-		return nil, err
-	}
-	right, err := loadDepthBalanceInfo(rightExtra)
-	if err != nil {
-		return nil, err
-	}
-
-	currencies, err := addCurrencyCollections(left.Currencies, right.Currencies)
-	if err != nil {
-		return nil, err
-	}
-	depth := left.Depth
-	if right.Depth > depth {
-		depth = right.Depth
-	}
-	return storeDepthBalanceInfo(uint64(depth), currencies.Coins, currencies.ExtraCurrencies)
-}
-
-func loadDepthBalanceInfo(loader *cell.Slice) (tlb.DepthBalanceInfo, error) {
-	var info tlb.DepthBalanceInfo
-	err := tlb.LoadFromCell(&info, loader)
-	return info, err
-}
-
-func storeDepthBalanceInfo(depth uint64, coins tlb.Coins, extra *cell.Dictionary) (*cell.Cell, error) {
-	if depth > 30 {
-		return nil, fmt.Errorf("invalid account depth %d", depth)
-	}
-
-	b := cell.BeginCell()
-	if err := b.StoreUInt(depth, 5); err != nil {
-		return nil, err
-	}
-	if err := b.StoreBigCoins(coins.Nano()); err != nil {
-		return nil, err
-	}
-	if isEmptyDict(extra) {
-		extra = nil
-	}
-	if err := b.StoreDict(extra); err != nil {
-		return nil, err
-	}
-	return b.EndCell(), nil
-}
-
-func addCurrencyCollections(left, right tlb.CurrencyCollection) (tlb.CurrencyCollection, error) {
-	coins, err := left.Coins.Add(right.Coins)
-	if err != nil {
-		return tlb.CurrencyCollection{}, err
-	}
-
-	extra, err := addExtraCurrencyDicts(left.ExtraCurrencies, right.ExtraCurrencies)
-	if err != nil {
-		return tlb.CurrencyCollection{}, err
-	}
-	return tlb.CurrencyCollection{Coins: coins, ExtraCurrencies: extra}, nil
-}
-
-func addExtraCurrencyDicts(left, right *cell.Dictionary) (*cell.Dictionary, error) {
-	if isEmptyDict(left) && isEmptyDict(right) {
-		return nil, nil
-	}
-
-	out := cell.NewDict(32)
-	for _, dict := range []*cell.Dictionary{left, right} {
-		if isEmptyDict(dict) {
-			continue
-		}
-
-		items, err := dict.Range(false, false)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range items {
-			amount, err := item.Value.LoadVarUInt(32)
-			if err != nil {
-				return nil, err
-			}
-
-			existing, err := out.LoadValue(item.Key)
-			if err == nil {
-				prev, loadErr := existing.LoadVarUInt(32)
-				if loadErr != nil {
-					return nil, loadErr
-				}
-				amount = new(big.Int).Add(prev, amount)
-			} else if !errors.Is(err, cell.ErrNoSuchKeyInDict) {
-				return nil, err
-			}
-
-			value := cell.BeginCell().MustStoreBigVarUInt(amount, 32).EndCell()
-			if err = out.Set(item.Key, value); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return out, nil
-}
-
-func isEmptyDict(dict *cell.Dictionary) bool {
-	return dict == nil || dict.IsEmpty()
 }

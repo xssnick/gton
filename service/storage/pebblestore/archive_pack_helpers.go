@@ -9,8 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"syscall"
 
@@ -294,7 +294,14 @@ func (s *Store) abandonPendingPackFilesLocked(pending map[string]pendingPackWrit
 }
 
 func syncFile(path string) error {
-	file, err := os.Open(path)
+	flags := os.O_RDONLY
+	if runtime.GOOS == "windows" {
+		// File.Sync uses FlushFileBuffers on Windows, which requires a handle
+		// opened with GENERIC_WRITE access.
+		flags = os.O_WRONLY
+	}
+
+	file, err := os.OpenFile(path, flags, 0)
 	if err != nil {
 		return err
 	}
@@ -308,6 +315,13 @@ func syncDir(path string) error {
 		return err
 	}
 	defer func() { _ = file.Close() }()
+
+	// Windows does not support flushing directory handles. Opening the
+	// directory above still validates that it exists and is accessible.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
 	if err = file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
 		return err
 	}
@@ -333,7 +347,11 @@ func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storag
 		if err != nil {
 			return 0, err
 		}
-		if pending, ok := latestPendingArchivePackageStart(pendingStarts, masterSeqno); ok && pending > baseSeqno {
+		pending, pendingErr := latestPendingArchivePackageStart(pendingStarts, masterSeqno)
+		if pendingErr != nil && !errors.Is(pendingErr, storage.ErrNotFound) {
+			return 0, pendingErr
+		}
+		if pendingErr == nil && pending > baseSeqno {
 			baseSeqno = pending
 		}
 		baseCache[masterSeqno] = baseSeqno
@@ -494,14 +512,14 @@ func archiveAppendPackageStarts(requests []archiveAppendRequest) []uint32 {
 	return starts
 }
 
-func latestPendingArchivePackageStart(starts []uint32, masterSeqno uint32) (uint32, bool) {
+func latestPendingArchivePackageStart(starts []uint32, masterSeqno uint32) (uint32, error) {
 	idx := sort.Search(len(starts), func(i int) bool {
 		return starts[i] > masterSeqno
 	})
 	if idx == 0 {
-		return 0, false
+		return 0, storage.ErrNotFound
 	}
-	return starts[idx-1], true
+	return starts[idx-1], nil
 }
 
 func (s *Store) appendKeyBlockProofEntry(kind storage.ServedProofKind, block ton.BlockIDExt, data []byte) (*storage.ArtifactRef, error) {
@@ -691,8 +709,12 @@ func (s *Store) archivePackIDForDescriptor(desc archivePackDescriptor, claimed *
 }
 
 func archivePackIDFromClaims(desc archivePackDescriptor, claimed *archivePackClaims) (int64, error) {
-	if archiveID, ok := claimed.archiveID(desc); ok {
+	archiveID, err := claimed.archiveID(desc)
+	if err == nil {
 		return archiveID, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return 0, err
 	}
 
 	if archivePackDescriptorIsBaseMaster(desc) {
@@ -784,9 +806,12 @@ func newArchivePackClaims() *archivePackClaims {
 	}
 }
 
-func (c *archivePackClaims) archiveID(desc archivePackDescriptor) (int64, bool) {
+func (c *archivePackClaims) archiveID(desc archivePackDescriptor) (int64, error) {
 	archiveID, ok := c.byDescriptor[desc]
-	return archiveID, ok
+	if !ok {
+		return 0, storage.ErrNotFound
+	}
+	return archiveID, nil
 }
 
 func (c *archivePackClaims) claim(id int64, desc archivePackDescriptor) bool {
@@ -1317,29 +1342,6 @@ func (s *Store) beginPackAppend(pending map[string]pendingPackWrite, path string
 		return "", 0, err
 	}
 	return relPath, cleanSize, nil
-}
-
-func (s *Store) archivePackArtifactPath(path string) (string, bool) {
-	if path == "" {
-		return "", false
-	}
-	if filepath.IsAbs(path) {
-		relPath, err := s.relativeArtifactPath(path)
-		if err != nil {
-			return "", false
-		}
-		path = relPath
-	}
-
-	clean := filepath.Clean(path)
-	slashPath := filepath.ToSlash(clean)
-	if strings.HasPrefix(slashPath, "../") || strings.HasPrefix(slashPath, "/") {
-		return "", false
-	}
-	if !strings.HasPrefix(slashPath, "archive/packages/") || !strings.HasSuffix(slashPath, ".pack") {
-		return "", false
-	}
-	return filepath.FromSlash(slashPath), true
 }
 
 func (s *Store) ensureCleanPackTail(path string, pending map[string]pendingPackWrite) error {

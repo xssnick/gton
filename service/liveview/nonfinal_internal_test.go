@@ -2,6 +2,7 @@ package liveview
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -36,18 +37,18 @@ func TestNonfinalCellIndexUsesNearestPendingBlock(t *testing.T) {
 		cells: storage.NewStateCellRecords([]storage.EncodedCellRecord{{Hash: hash, Data: secondData}}),
 	})
 
-	if got := live.nonfinalCellDataLocked(second, hash); !bytes.Equal(got, secondData) {
+	if got, err := live.nonfinalCellDataLocked(second, hash); err != nil || !bytes.Equal(got, secondData) {
 		t.Fatalf("second block cell data = %x, want %x", got, secondData)
 	}
-	if got := live.nonfinalCellDataLocked(first, hash); !bytes.Equal(got, firstData) {
+	if got, err := live.nonfinalCellDataLocked(first, hash); err != nil || !bytes.Equal(got, firstData) {
 		t.Fatalf("first block cell data = %x, want %x", got, firstData)
 	}
 
 	live.deleteNonfinalPendingLocked(secondKey)
-	if got := live.nonfinalCellDataLocked(second, hash); got != nil {
-		t.Fatalf("deleted second block cell data = %x, want nil", got)
+	if _, err := live.nonfinalCellDataLocked(second, hash); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("deleted second block cell data error = %v, want ErrNotFound", err)
 	}
-	if got := live.nonfinalCellDataLocked(first, hash); !bytes.Equal(got, firstData) {
+	if got, err := live.nonfinalCellDataLocked(first, hash); err != nil || !bytes.Equal(got, firstData) {
 		t.Fatalf("first block cell data after cleanup = %x, want %x", got, firstData)
 	}
 	if entries := live.nonFinalCellIndex[hash]; len(entries) != 1 || entries[0].block != firstKey {
@@ -76,21 +77,21 @@ func TestNonfinalOrderIndexTracksDeletes(t *testing.T) {
 	for i, block := range blocks {
 		key := storage.BlockKey(block)
 		live.putNonfinalPendingLocked(key, liveNonfinalPending{block: block})
-		if idx := live.nonfinalOrderIndexLocked(key); idx != i {
+		if idx, err := live.nonfinalOrderIndexLocked(key); err != nil || idx != i {
 			t.Fatalf("pending index for %d = %d, want %d", i, idx, i)
 		}
 	}
 
 	live.deleteNonfinalPendingLocked(storage.BlockKey(blocks[1]))
-	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); idx != 1 {
+	if idx, err := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); err != nil || idx != 1 {
 		t.Fatalf("tail pending index after middle delete = %d, want 1", idx)
 	}
-	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[1])); idx != -1 {
-		t.Fatalf("deleted pending index = %d, want -1", idx)
+	if _, err := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[1])); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("deleted pending index error = %v, want ErrNotFound", err)
 	}
 
 	live.deleteNonfinalPendingLocked(storage.BlockKey(blocks[0]))
-	if idx := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); idx != 0 {
+	if idx, err := live.nonfinalOrderIndexLocked(storage.BlockKey(blocks[2])); err != nil || idx != 0 {
 		t.Fatalf("tail pending index after head delete = %d, want 0", idx)
 	}
 	live.mu.Unlock()

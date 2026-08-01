@@ -18,9 +18,6 @@ import (
 func (s *Store) closeCellGenerations() error {
 	var err error
 	for id, cells := range s.cellGenerations {
-		if cells == nil {
-			continue
-		}
 		started := time.Now()
 		refs := cells.refs.Load()
 		event := s.log.Info()
@@ -271,7 +268,7 @@ func validateMigrationProgressBlockStateID(state storage.BlockState) error {
 }
 
 func (s *Store) resolveMigrationProgressBlockMasterRef(ctx context.Context, state *storage.BlockState) error {
-	if state == nil || isMasterchainBlock(state.Block) {
+	if isMasterchainBlock(state.Block) {
 		return nil
 	}
 	if state.MasterchainRef == nil {

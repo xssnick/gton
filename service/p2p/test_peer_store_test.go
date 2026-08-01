@@ -15,6 +15,7 @@ type testPeerStore struct {
 	mu sync.RWMutex
 
 	blocks       map[storage.BlockRootHash]*storage.ServedBlockFull
+	blockMetas   map[storage.BlockRootHash]*storage.BlockMeta
 	nextBlocks   map[storage.BlockRootHash]storage.BlockRootHash
 	blockData    map[storage.BlockRootHash][]byte
 	proofs       map[testPeerProofKey][]byte
@@ -27,6 +28,7 @@ type testPeerStore struct {
 func newTestPeerStore() *testPeerStore {
 	return &testPeerStore{
 		blocks:       map[storage.BlockRootHash]*storage.ServedBlockFull{},
+		blockMetas:   map[storage.BlockRootHash]*storage.BlockMeta{},
 		nextBlocks:   map[storage.BlockRootHash]storage.BlockRootHash{},
 		blockData:    map[storage.BlockRootHash][]byte{},
 		proofs:       map[testPeerProofKey][]byte{},
@@ -51,25 +53,44 @@ func (s *testPeerStore) SaveBlockFull(block *storage.ServedBlockFull) error {
 func (s *testPeerStore) saveBlockFullLocked(block *storage.ServedBlockFull) {
 	cloned := block.Clone()
 	s.blocks[storage.BlockKey(block.ID)] = cloned
+
+	meta := &storage.BlockMeta{ID: cloned.ID}
+	if cloned.Meta != nil {
+		meta = storage.MergeBlockMeta(meta, cloned.Meta)
+		meta.ID = cloned.ID
+	}
 	if len(cloned.Block) > 0 {
 		s.blockData[storage.BlockKey(cloned.ID)] = append([]byte(nil), cloned.Block...)
+		meta.Mark(storage.BlockMetaHasBlockData)
 	}
 	if len(cloned.Proof) > 0 {
-		isKeyBlock := false
-		if cloned.Meta != nil {
-			isKeyBlock = cloned.Meta.Has(storage.BlockMetaIsKeyBlock)
-		}
-		kinds := storage.StoredProofKindsForServedBlock(cloned.ID, cloned.IsLink, isKeyBlock)
+		kinds := storage.StoredProofKindsForServedBlock(
+			cloned.ID,
+			cloned.IsLink,
+			meta.Has(storage.BlockMetaIsKeyBlock),
+		)
 		for _, kind := range kinds {
 			s.proofs[s.proofKey(kind, cloned.ID)] = append([]byte(nil), cloned.Proof...)
+			meta.Mark(storage.BlockMetaFlagForProof(kind))
+		}
+		if len(cloned.Block) > 0 {
+			meta.Mark(storage.BlockMetaHasServedFull)
+			if storage.ServedBlockProofIsLink(cloned.ID, cloned.IsLink) {
+				meta.Mark(storage.BlockMetaServedFullIsLink)
+			}
 		}
 	}
+	s.mergeBlockMetaLocked(meta)
 }
 
 func (s *testPeerStore) LinkNextBlock(prev ton.BlockIDExt, next ton.BlockIDExt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextBlocks[storage.BlockKey(prev)] = storage.BlockKey(next)
+	s.mergeBlockMetaLocked(&storage.BlockMeta{
+		ID:       prev,
+		NextRefs: []ton.BlockIDExt{next},
+	})
 	return nil
 }
 
@@ -77,10 +98,18 @@ func (s *testPeerStore) SaveBlockProof(kind storage.ServedProofKind, block ton.B
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.proofs[s.proofKey(kind, block)] = append([]byte(nil), data...)
+	s.mergeBlockMetaLocked(&storage.BlockMeta{
+		ID:    block,
+		Flags: storage.BlockMetaFlagForProof(kind),
+	})
 	return nil
 }
 
 func (s *testPeerStore) SaveZeroState(block ton.BlockIDExt, data []byte, _ *storage.ArtifactRef) error {
+	if len(data) == 0 {
+		return fmt.Errorf("zerostate data is empty")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.zeroStates[storage.BlockKey(block)] = append([]byte(nil), data...)
@@ -104,6 +133,18 @@ func (s *testPeerStore) SavePersistentStateFile(file *storage.PersistentStateFil
 	defer s.mu.Unlock()
 	s.stateFiles[s.persistentStateKey(file.Block, file.MasterchainBlock, file.EffectiveShard)] = append([]byte(nil), data...)
 	return nil
+}
+
+func (s *testPeerStore) BlockMeta(_ context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	meta := s.blockMetas[storage.BlockKey(block)]
+	if meta == nil {
+		return nil, storage.ErrNotFound
+	}
+
+	return meta.Clone(), nil
 }
 
 func (s *testPeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
@@ -152,6 +193,21 @@ func (s *testPeerStore) BlockProof(_ context.Context, kind storage.ServedProofKi
 		return nil, storage.ErrNotFound
 	}
 	return append([]byte(nil), value...), nil
+}
+
+func (s *testPeerStore) ZeroStateSize(_ context.Context, block ton.BlockIDExt) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	value, ok := s.zeroStates[storage.BlockKey(block)]
+	if !ok {
+		return 0, storage.ErrNotFound
+	}
+	if len(value) == 0 {
+		return 0, fmt.Errorf("zerostate data is empty")
+	}
+
+	return int64(len(value)), nil
 }
 
 func (s *testPeerStore) ZeroState(_ context.Context, block ton.BlockIDExt) ([]byte, error) {
@@ -242,6 +298,11 @@ type testPeerProofKey struct {
 
 func (s *testPeerStore) proofKey(kind storage.ServedProofKind, block ton.BlockIDExt) testPeerProofKey {
 	return testPeerProofKey{kind: kind, block: storage.BlockKey(block)}
+}
+
+func (s *testPeerStore) mergeBlockMetaLocked(meta *storage.BlockMeta) {
+	key := storage.BlockKey(meta.ID)
+	s.blockMetas[key] = storage.MergeBlockMeta(s.blockMetas[key], meta)
 }
 
 type testPeerPersistentStateKey struct {

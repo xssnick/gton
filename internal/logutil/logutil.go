@@ -197,6 +197,10 @@ type levelOverrideWriter struct {
 	overrides map[string]zerolog.Level
 }
 
+type logEvent struct {
+	Component string `json:"component"`
+}
+
 func (w levelOverrideWriter) Write(p []byte) (int, error) {
 	return w.WriteLevel(zerolog.NoLevel, p)
 }
@@ -221,9 +225,7 @@ func (w levelOverrideWriter) levelForEvent(p []byte) zerolog.Level {
 }
 
 func eventComponent(p []byte) string {
-	var event struct {
-		Component string `json:"component"`
-	}
+	var event logEvent
 	if err := json.Unmarshal(p, &event); err != nil {
 		return ""
 	}
@@ -270,10 +272,6 @@ func WithComponent(base *zerolog.Logger, component string) zerolog.Logger {
 		return logger
 	}
 	return logger.With().Str("component", component).Logger()
-}
-
-func Discard() zerolog.Logger {
-	return New(io.Discard, zerolog.DebugLevel, false)
 }
 
 func init() {

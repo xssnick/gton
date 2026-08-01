@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
 	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -44,7 +43,7 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetCapabilities{})
+	resp, err := sub.dispatchPeerQuery(context.Background(), GetCapabilities{})
 	if err != nil {
 		t.Fatalf("getCapabilities: %v", err)
 	}
@@ -65,7 +64,7 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 		FileHash:  make([]byte, 32),
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: block})
+	resp, err = sub.dispatchPeerQuery(context.Background(), tonnodeapi.DownloadBlockFull{Block: block})
 	if err != nil {
 		t.Fatalf("downloadBlockFull stub: %v", err)
 	}
@@ -73,7 +72,7 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 		t.Fatalf("unexpected downloadBlockFull response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetArchiveInfo{MasterchainSeqno: 1})
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetArchiveInfo{MasterchainSeqno: 1})
 	if err != nil {
 		t.Fatalf("getArchiveInfo stub: %v", err)
 	}
@@ -81,10 +80,11 @@ func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 		t.Fatalf("unexpected getArchiveInfo response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetOutMsgQueueProof{
-		DstShard: archive.ShardID{Workchain: 0, Shard: topShard},
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetOutMsgQueueProof{
+		DstShard: tonnodeapi.ShardID{Workchain: 0, Shard: topShard},
 		Limits:   ImportedMsgQueueLimits{MaxBytes: 1 << 20, MaxMsgs: 128},
 	})
+
 	if err == nil || !strings.Contains(err.Error(), "not supported yet") {
 		t.Fatalf("getOutMsgQueueProof error = %v, want not supported yet", err)
 	}
@@ -104,7 +104,7 @@ func TestCustomFixedOverlayDoesNotAnswerGetRandomPeers(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, overlay.GetRandomPeers{})
+	resp, err := sub.dispatchPeerQuery(context.Background(), overlay.GetRandomPeers{})
 	if err == nil || !strings.Contains(err.Error(), "overlay is private") {
 		t.Fatalf("getRandomPeers error = %v, want private overlay reject", err)
 	}
@@ -113,7 +113,7 @@ func TestCustomFixedOverlayDoesNotAnswerGetRandomPeers(t *testing.T) {
 	}
 }
 
-func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
+func TestDispatchPeerQueryRejectsSendExtMessageFromOverlay(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
 		Logger:             &logger,
@@ -123,57 +123,50 @@ func TestDispatchPeerQuerySendExtMessageEnqueuesBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	node.runCtx = runCtx
-	node.zeroStateFileHash = make([]byte, 32)
-
-	spec, err := buildOverlaySpec(node.zeroStateFileHash, 0, topShard, overlayName(0, topShard))
-	if err != nil {
-		t.Fatalf("build overlay spec: %v", err)
-	}
-	sub, _ := node.getOrCreateSubscription(spec)
 	peer := testRebroadcastQueuePeer("peer")
-	sub.mx.Lock()
-	sub.peers[peer.id] = peer
-	sub.mx.Unlock()
-
 	data := testExternalMessageBOC(t)
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, SendExtMessage{
-		Message: tonnodeapi.ExternalMessage{Data: data},
-	})
-	if err != nil {
-		t.Fatalf("sendExtMessage: %v", err)
+	tests := []struct {
+		name string
+		spec overlaySpec
+	}{
+		{
+			name: "public overlay",
+			spec: overlaySpec{Name: "basechain"},
+		},
+		{
+			name: "custom overlay accepting queries",
+			spec: overlaySpec{
+				Name:          "custom.private",
+				Kind:          overlayKindCustomFixed,
+				AcceptQueries: true,
+			},
+		},
 	}
-	if _, ok := resp.(Success); !ok {
-		t.Fatalf("unexpected sendExtMessage response %T", resp)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sub := testOverlaySubscription(&overlaySubscription{
+				node: node,
+				spec: tt.spec,
+				log:  discardLogger(),
+				peers: map[PeerID]*overlayPeer{
+					peer.id: peer,
+				},
+			})
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	req, ok := peer.localRebroadcastQueue.Pop(ctx)
-	if !ok {
-		t.Fatal("expected external message rebroadcast request")
-	}
-	if req.kind != "tonNode.externalMessageBroadcast" {
-		t.Fatalf("unexpected rebroadcast kind %q", req.kind)
-	}
-	if req.subscription.spec.Name != "basechain" {
-		t.Fatalf("unexpected rebroadcast subscription %q", req.subscription.spec.Name)
-	}
-
-	var parsed any
-	if _, err = tl.Parse(&parsed, req.payload, true); err != nil {
-		t.Fatalf("parse broadcast payload: %v", err)
-	}
-	broadcast, ok := parsed.(tonnodeapi.NewExternalMessageBroadcast)
-	if !ok {
-		t.Fatalf("unexpected broadcast payload type %T", parsed)
-	}
-	if string(broadcast.Message.Data) != string(data) {
-		t.Fatalf("unexpected external message data %x", broadcast.Message.Data)
+			response, err := sub.dispatchPeerQuery(context.Background(), SendExtMessage{
+				Message: tonnodeapi.ExternalMessage{Data: data},
+			})
+			if err == nil || !strings.Contains(err.Error(), "query not from full-node master") {
+				t.Fatalf("sendExtMessage error = %v, want source reject", err)
+			}
+			if response != nil {
+				t.Fatalf("sendExtMessage response = %T, want nil", response)
+			}
+			if request, ok := peer.localRebroadcastQueue.TryPop(); ok {
+				t.Fatalf("unexpected external message rebroadcast %q", request.kind)
+			}
+		})
 	}
 }
 
@@ -243,7 +236,7 @@ func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 		t.Fatalf("catchain seqno = %d, want 7", accepted.event.ShardDescription.CatchainSeqno)
 	}
 	if !accepted.event.ShardDescription.Block.Equals(&block) {
-		t.Fatalf("description block = %s, want %s", formatBlockRef(accepted.event.ShardDescription.Block), formatBlockRef(block))
+		t.Fatalf("description block = %s, want %s", tnstore.FormatBlockRef(accepted.event.ShardDescription.Block), tnstore.FormatBlockRef(block))
 	}
 }
 
@@ -264,9 +257,10 @@ func TestDispatchPeerQuerySendExtMessageRejectsInvalidMessage(t *testing.T) {
 		log:  discardLogger(),
 	})
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, SendExtMessage{
+	resp, err := sub.dispatchPeerQuery(context.Background(), SendExtMessage{
 		Message: tonnodeapi.ExternalMessage{Data: []byte{0xAA, 0xBB}},
 	})
+
 	if err == nil {
 		t.Fatal("expected invalid external message error")
 	}
@@ -335,7 +329,7 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 		t.Fatalf("expected self and known peer, got %d entries", len(res.List))
 	}
 
-	self, err := node.selfOverlayNode(spec)
+	self, err := overlay.NewNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -484,7 +478,7 @@ func TestOverlayNodesSnapshotConcurrentAnnouncementUpdate(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 2000; i++ {
-			for _, advertised := range sub.overlayNodesSnapshot() {
+			for _, advertised := range sub.overlayNodesSnapshot(maxPeersPerOverlay) {
 				if !overlayNodeHasSerializableID(&advertised) {
 					select {
 					case errCh <- "snapshot returned malformed advertised node":
@@ -553,7 +547,7 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		t.Fatalf("getRandomPeers returned %d nodes, want %d", len(res.List), maxRandomPeerReply)
 	}
 
-	self, err := node.selfOverlayNode(spec)
+	self, err := overlay.NewNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -586,7 +580,7 @@ func TestConnectOverlayNodeSkipsSelf(t *testing.T) {
 		peers: map[PeerID]*overlayPeer{},
 	})
 
-	self, err := node.selfOverlayNode(spec)
+	self, err := overlay.NewNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -648,7 +642,7 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 		t.Fatalf("expected self and known peer for client node, got %d entries", len(res.List))
 	}
 
-	self, err := node.selfOverlayNode(spec)
+	self, err := overlay.NewNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -687,7 +681,7 @@ func TestBuildOverlaySpecUsesCppNodeProtoVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build master overlay spec: %v", err)
 	}
-	if master.ProtoVersionMajor != masterchainProtoVersionMajor || master.ProtoVersionMinor != masterchainProtoVersionMinor {
+	if master.ProtoVersionMajor != 3 || master.ProtoVersionMinor != 2 {
 		t.Fatalf("unexpected master proto version %d.%d", master.ProtoVersionMajor, master.ProtoVersionMinor)
 	}
 
@@ -695,7 +689,7 @@ func TestBuildOverlaySpecUsesCppNodeProtoVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build base overlay spec: %v", err)
 	}
-	if base.ProtoVersionMajor != shardchainProtoVersionMajor || base.ProtoVersionMinor != shardchainProtoVersionMinor {
+	if base.ProtoVersionMajor != 3 || base.ProtoVersionMinor != 2 {
 		t.Fatalf("unexpected base proto version %d.%d", base.ProtoVersionMajor, base.ProtoVersionMinor)
 	}
 }
@@ -791,7 +785,7 @@ func TestAcceptBroadcastDoesNotCacheShardBlockInPeerLayer(t *testing.T) {
 	}
 }
 
-func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
+func TestAcceptBroadcastDoesNotCacheUndecodedMasterchainBlock(t *testing.T) {
 	store := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
@@ -810,16 +804,11 @@ func TestAcceptBroadcastDoesNotCacheUnverifiedMasterchainBlock(t *testing.T) {
 			Overlay: "masterchain",
 			Kind:    "tonNode.blockBroadcast",
 			Block:   block,
-			Downloaded: &DownloadedBlock{
-				ID:       block,
-				BlockBOC: []byte{0xAA, 0xBB},
-				ProofBOC: []byte{0xCC},
-			},
 		},
 	})
 
 	if _, err := store.BlockFull(context.Background(), block); err == nil {
-		t.Fatal("unverified masterchain broadcast was cached")
+		t.Fatal("undecoded masterchain broadcast was cached")
 	}
 }
 
@@ -863,12 +852,14 @@ func testRebroadcastQueuePeer(id string) *overlayPeer {
 	peer := &overlayPeer{
 		id:      testPeerID(id),
 		addr:    id,
+		route:   newPeerRoute(""),
 		overlay: &overlay.ADNLOverlayWrapper{},
 		announced: &overlay.Node{
 			Version: int32(time.Now().Unix()),
 		},
 		alive:         true,
 		lastReceiveAt: time.Now(),
+		release:       func() {},
 	}
 	peer.initRebroadcastQueues()
 	return peer

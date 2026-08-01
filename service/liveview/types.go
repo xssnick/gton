@@ -20,11 +20,11 @@ type CurrentAccountBlockIDs struct {
 	Account ton.BlockIDExt
 }
 
-func cloneBlockID(id ton.BlockIDExt) *ton.BlockIDExt {
+func cloneBlockID(id ton.BlockIDExt) ton.BlockIDExt {
 	cloned := id
 	cloned.RootHash = bytes.Clone(id.RootHash)
 	cloned.FileHash = bytes.Clone(id.FileHash)
-	return &cloned
+	return cloned
 }
 
 func blockIDEqual(a ton.BlockIDExt, b ton.BlockIDExt) bool {
@@ -50,4 +50,12 @@ type Backing interface {
 	LookupBlockByAccountLT(ctx context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error)
 	LookupBlockByUnixTime(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
 	LazyCellLoader() cell.LazyCellLoader
+}
+
+// prefixBacking is an optional capability kept separate from Backing so
+// implementations of the released Backing interface remain source compatible.
+type prefixBacking interface {
+	LookupBlockBySeqNoForPrefix(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error)
+	LookupBlockByLTForPrefix(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
+	LookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
 }

@@ -8,7 +8,7 @@ import (
 
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/archive"
-	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/p2p"
 )
 
 type archiveWindowPipelineProgress struct {
@@ -106,20 +106,12 @@ func newArchiveWindowPipelineProgress() *archiveWindowPipelineProgress {
 }
 
 func (p *archiveWindowPipelineProgress) setQueue(queue *archiveImportQueue) {
-	if p == nil {
-		return
-	}
-
 	p.mu.Lock()
 	p.queue = queue
 	p.mu.Unlock()
 }
 
 func (p *archiveWindowPipelineProgress) setPlanning(seqno uint32, stage string) {
-	if p == nil {
-		return
-	}
-
 	p.mu.Lock()
 	p.frontSeqno = seqno
 	p.stage = stage
@@ -131,10 +123,6 @@ func (p *archiveWindowPipelineProgress) setPlanning(seqno uint32, stage string) 
 }
 
 func (p *archiveWindowPipelineProgress) setPending(pending []archivePendingWindow, planningSeqno uint32, planningStage string) {
-	if p == nil {
-		return
-	}
-
 	ready := 0
 	var frontSeqno uint32
 	var frontTask *archiveWindowShardImportTask
@@ -168,10 +156,6 @@ func (p *archiveWindowPipelineProgress) setPending(pending []archivePendingWindo
 }
 
 func (p *archiveWindowPipelineProgress) snapshot() archiveWindowPipelineSnapshot {
-	if p == nil {
-		return archiveWindowPipelineSnapshot{}
-	}
-
 	p.mu.RLock()
 	snapshot := archiveWindowPipelineSnapshot{
 		stage:          p.stage,
@@ -245,10 +229,6 @@ func (r *archiveCatchUpRunner) stopPipelineWaitProgress(now time.Time) {
 }
 
 func (r *archiveCatchUpRunner) recordArchiveWindowProgress(window *shardClientArchiveWindow, applyElapsed time.Duration) {
-	if window == nil {
-		return
-	}
-
 	stats := &r.progressStats
 	stats.windows++
 	stats.masterPrefetchWait += window.masterWait
@@ -260,40 +240,19 @@ func (r *archiveCatchUpRunner) recordArchiveWindowProgress(window *shardClientAr
 	stats.shardTargetParse += window.shardTargetElapsed
 	stats.shardApply += window.shardApplyElapsed
 	stats.applyWall += applyElapsed
-	if window.totalStats == nil {
-		if window.shardArchives > 0 {
-			stats.shardArchives += uint64(window.shardArchives)
-		}
-		return
-	}
-
 	stats.bytes += window.totalStats.Bytes
-	if window.totalStats.Blocks > 0 {
-		stats.blocks += uint64(window.totalStats.Blocks)
-	}
-	if window.totalStats.Entries > 0 {
-		stats.entries += uint64(window.totalStats.Entries)
-	}
+	stats.blocks += uint64(window.totalStats.Blocks)
+	stats.entries += uint64(window.totalStats.Entries)
 	stats.archiveDownload += window.totalStats.DownloadElapsed
 	stats.archiveImport += window.totalStats.ImportElapsed
 	stats.stateCells += window.totalStats.StateUpdateCells
 	stats.stateCellBytes += window.totalStats.StateUpdateCellBytes
 	stats.stateCellPrepare += window.totalStats.StateUpdateCellPrepare
 
-	shardArchives := window.totalStats.ShardArchives
-	if shardArchives == 0 {
-		shardArchives = window.shardArchives
-	}
-	if shardArchives > 0 {
-		stats.shardArchives += uint64(shardArchives)
-	}
+	stats.shardArchives += uint64(window.totalStats.ShardArchives)
 }
 
 func (w *shardClientArchiveWindow) releaseImportedData() {
-	if w == nil {
-		return
-	}
-
 	w.masterStats = nil
 	w.totalStats = nil
 	w.masterStates = nil
@@ -302,6 +261,7 @@ func (w *shardClientArchiveWindow) releaseImportedData() {
 	w.masterProofs = nil
 	w.archiveBlocks = nil
 	w.archiveImports = nil
+	w.shardTargets = nil
 	w.stateCells = nil
 	w.appliedStates = appliedStateSet{}
 }
@@ -345,7 +305,6 @@ func (r *archiveCatchUpRunner) logProgress() error {
 	targetRemainingBlocks := r.target.SeqNo - r.current.ShardClientSeqno
 	windowBlocks := r.current.ShardClientSeqno - r.lastProgressSeqno
 	windowShardBlocksApplied := r.shardBlocksApplied - r.lastProgressShardBlocksApplied
-	windowShardBlocksReused := r.shardBlocksReused - r.lastProgressShardBlocksReused
 	windowElapsed := now.Sub(r.lastProgress)
 	stats := r.progressStats
 	windowStats := stats.since(r.lastProgressStats)
@@ -354,21 +313,14 @@ func (r *archiveCatchUpRunner) logProgress() error {
 	progressGoal := r.archiveProgressGoalAt(now)
 
 	event := r.service.log.Info().
-		Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
-		Str("target", storage.FormatBlockRef(r.target)).
+		Uint32("current", r.current.Masterchain.Block.SeqNo).
+		Uint32("target", r.target.SeqNo).
 		Str("catchup_method", "archive_shard_client").
-		Bool("checkpoint_in_flight", r.checkpointDone != nil).
-		Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 		Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 		Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
-		Uint32("processed_masterchain_blocks", done).
-		Uint64("applied_shard_blocks", r.shardBlocksApplied).
-		Uint32("total_masterchain_blocks", total).
-		Uint64("window_archive_windows", windowStats.windows).
 		Uint64("window_shard_archives", windowStats.shardArchives).
 		Int64("window_archive_bytes", windowStats.bytes).
-		Uint64("window_archive_blocks", windowStats.blocks).
-		Uint64("window_archive_entries", windowStats.entries)
+		Uint64("window_archive_blocks", windowStats.blocks)
 	if progressGoal.kind == archiveProgressGoalSyncUntil {
 		event = event.Uint32("sync_until", r.service.syncUntil)
 		if progressGoal.knownRemaining() {
@@ -382,7 +334,8 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		} else {
 			eta = "unknown"
 		}
-	} else if lagSeconds, ok := r.archiveLiveTailLagSecondsAt(now); ok {
+	} else if blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain); blockUTime != 0 {
+		lagSeconds := now.Unix() - blockUTime
 		remainingLag := remainingLagSeconds(lagSeconds)
 		event = event.
 			Int64("master_lag_seconds", lagSeconds).
@@ -395,12 +348,9 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		event = event.Int64("remaining", int64(targetRemainingBlocks))
 	}
 	event = event.
-		Uint64("checkpoints", stats.checkpoints).
-		Uint64("window_checkpoints", windowStats.checkpoints).
 		Dur("window_pipeline_wait", windowStats.pipelineWait).
 		Dur("window_master_prefetch_wait", windowStats.masterPrefetchWait).
 		Dur("window_archive_download", windowStats.archiveDownload).
-		Dur("window_archive_import", windowStats.archiveImport).
 		Dur("window_apply_wall", windowStats.applyWall).
 		Dur("window_master_apply", windowStats.masterApply).
 		Dur("window_master_precheck", windowStats.masterPrecheck).
@@ -409,26 +359,13 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		Dur("window_master_state_update", windowStats.masterStateUpdate).
 		Dur("window_shard_target_parse", windowStats.shardTargetParse).
 		Dur("window_shard_apply", windowStats.shardApply).
-		Uint64("state_cells", stats.stateCells).
-		Uint64("window_state_cells", windowStats.stateCells).
-		Uint64("state_cell_bytes", stats.stateCellBytes).
-		Uint64("window_state_cell_bytes", windowStats.stateCellBytes).
-		Dur("window_state_cell_prepare", windowStats.stateCellPrepare).
 		Dur("window_checkpoint_persist", windowStats.checkpointPersist).
 		Str("progress", progress).
 		Str("speed", formatBlockRate(done, time.Since(r.started))).
 		Str("window_speed", formatBlockRate(windowBlocks, windowElapsed)).
 		Str("shard_apply_speed", formatBlockRate64(windowShardBlocksApplied, windowElapsed)).
-		Str("shard_seen_speed", formatBlockRate64(windowShardBlocksApplied+windowShardBlocksReused, windowElapsed)).
 		Str("archive_download_speed", logutil.FormatByteRate(stats.bytes, stats.archiveDownload)).
 		Str("window_archive_download_speed", logutil.FormatByteRate(windowStats.bytes, windowStats.archiveDownload)).
-		Str("window_archive_ingest_speed", logutil.FormatByteRate(windowStats.bytes, windowElapsed)).
-		Str("archive_import_block_speed", formatBlockRate64(stats.blocks, stats.archiveImport)).
-		Str("window_archive_import_block_speed", formatBlockRate64(windowStats.blocks, windowStats.archiveImport)).
-		Str("state_cell_prepare_speed", logutil.FormatCellRate(stats.stateCells, stats.stateCellPrepare)).
-		Str("window_state_cell_prepare_speed", logutil.FormatCellRate(windowStats.stateCells, windowStats.stateCellPrepare)).
-		Str("state_cell_prepare_byte_speed", logutil.FormatByteRate(int64(stats.stateCellBytes), stats.stateCellPrepare)).
-		Str("window_state_cell_prepare_byte_speed", logutil.FormatByteRate(int64(windowStats.stateCellBytes), windowStats.stateCellPrepare)).
 		Str("window_bottleneck", archiveCatchUpDominantStage(
 			archiveCatchUpStageTiming{name: "pipeline_wait", elapsed: windowStats.pipelineWait},
 			archiveCatchUpStageTiming{name: "apply_wall", elapsed: windowStats.applyWall},
@@ -467,7 +404,9 @@ func (r *archiveCatchUpRunner) logProgress() error {
 }
 
 func isArchiveCatchUpRetryError(err error) bool {
-	return errors.Is(err, archive.ErrNotAvailable) || isExpectedRetryError(err)
+	return errors.Is(err, archive.ErrNotAvailable) ||
+		errors.Is(err, p2p.ErrNoArchivePeers) ||
+		isExpectedRetryError(err)
 }
 
 func (s *Service) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqno uint32, lastCheckpointSeqno uint32, lastCheckpoint time.Time, checkpointBlocks uint32, pendingBytes uint64) bool {
@@ -477,13 +416,10 @@ func (s *Service) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqn
 	if seqno >= targetSeqno {
 		return true
 	}
-	if checkpointBlocks == 0 {
-		checkpointBlocks = s.archiveCatchUpCheckpointBlocks
-	}
 	if seqno-lastCheckpointSeqno >= checkpointBlocks {
 		return true
 	}
-	if pendingBytes >= s.checkpointBytesTarget() {
+	if pendingBytes >= s.checkpointBytes {
 		return true
 	}
 	return time.Since(lastCheckpoint) >= s.archiveCatchUpCheckpointPeriod

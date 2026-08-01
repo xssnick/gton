@@ -26,7 +26,7 @@ func (s *Server) handleShardBlockProof(ctx context.Context, query ton.GetShardBl
 	id := *query.ID
 	if id.Workchain == masterchainID {
 		return ton.ShardBlockProof{
-			MasterchainID: cloneBlockID(id),
+			MasterchainID: blockproof.CloneBlockID(id),
 			Links:         nil,
 		}
 	}
@@ -42,7 +42,7 @@ func (s *Server) handleShardBlockProof(ctx context.Context, query ton.GetShardBl
 	}
 
 	return ton.ShardBlockProof{
-		MasterchainID: cloneBlockID(master),
+		MasterchainID: blockproof.CloneBlockID(master),
 		Links:         links,
 	}
 }
@@ -92,9 +92,9 @@ func (s *Server) handleLookupBlockWithProof(ctx context.Context, query ton.Looku
 	}
 
 	return ton.LookupBlockResult{
-		ID:                 cloneBlockID(target),
+		ID:                 blockproof.CloneBlockID(target),
 		Mode:               query.Mode,
-		MCBlockID:          cloneBlockID(base),
+		MCBlockID:          blockproof.CloneBlockID(base),
 		ClientMCStateProof: clientMCStateProof,
 		MCBlockProof:       mcBlockProof,
 		ShardLinks:         links,
@@ -123,11 +123,11 @@ func (s *Server) lookupBlockForProof(ctx context.Context, query ton.LookupBlockW
 
 	switch selector {
 	case 1:
-		return s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: uint32(query.ID.Seqno)})
+		return s.lookupBlockBySeqNoForPrefix(ctx, storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: uint32(query.ID.Seqno)})
 	case 2:
-		return s.store.LookupBlockByLT(ctx, key, query.LT)
+		return s.lookupBlockByLTForPrefix(ctx, key, query.LT)
 	default:
-		return s.store.LookupBlockByUnixTime(ctx, key, query.UTime)
+		return s.lookupBlockByUnixTimeForPrefix(ctx, key, query.UTime)
 	}
 }
 
@@ -160,7 +160,7 @@ func (s *Server) lookupClientMasterProofs(ctx context.Context, client ton.BlockI
 	if !isFullBlockID(&client) || client.Workchain != masterchainID {
 		return nil, nil, fmt.Errorf("masterchain block id must be specified")
 	}
-	if blockIDEqual(client, proved) {
+	if blockproof.BlockIDEqual(client, proved) {
 		return nil, nil, nil
 	}
 

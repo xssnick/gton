@@ -184,7 +184,7 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	status, err := c.metrics.dbStatus(ctx)
+	status, err := c.metrics.dbStatusReader(ctx)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(c.available, prometheus.GaugeValue, 0)
 		return

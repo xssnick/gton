@@ -136,14 +136,12 @@ func TestZeroStateDeadlineImmediatelyDemotesSelectedPeer(t *testing.T) {
 	before := peer.statsSnapshot()
 
 	session.selectArchivePeer(shard, peer)
-	if session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded) {
-		t.Fatal("zero-byte deadline kept zero-state peer retryable")
-	}
+	session.noteZeroStatePeerError(context.Background(), pool, shard, peer, context.DeadlineExceeded)
 
 	if selected := session.selectedArchivePeerID(shard); !selected.IsZero() {
 		t.Fatalf("zero-state deadline kept selected peer: %s", selected.String())
 	}
-	if _, pinned := node.pinnedPeerIDs()[peer.id]; pinned {
+	if _, protected := node.protectedPeerIDs()[peer.id]; protected {
 		t.Fatal("zero-state deadline kept selected peer pinned")
 	}
 	if after := peer.statsSnapshot(); after != before {
@@ -207,12 +205,17 @@ func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
 		asyncResult: data,
 		asyncDelay:  150 * time.Millisecond,
 	}
+	rldpOverlay := overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01})
 	peer := &overlayPeer{
 		id:          testPeerID("probe-peer"),
 		addr:        "probe-peer",
-		rldpOverlay: overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01}),
-		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
-		alive:       true,
+		rldpOverlay: rldpOverlay,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   rldpOverlay,
+			overlayID: []byte{0x01},
+		},
+		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:     true,
 	}
 	node := &Node{
 		log:     discardLogger(),
@@ -393,9 +396,11 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 		t.Fatalf("save reusable state file metadata: %v", err)
 	}
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       store,
-		stateFilesDir: dir,
+		log:                 zerolog.Nop(),
+		storage:             store,
+		peerStorage:         store,
+		stateFilesDir:       dir,
+		stateCellImportSlot: make(chan struct{}, 1),
 	}
 	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
 	if err != nil {
@@ -458,10 +463,11 @@ func TestTryImportReusableStagedStateFileUsesPeerStorage(t *testing.T) {
 	}
 
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       persistentStateFileMissingStore{Storage: store},
-		peerStorage:   store,
-		stateFilesDir: dir,
+		log:                 zerolog.Nop(),
+		storage:             persistentStateFileMissingStore{Storage: store},
+		peerStorage:         store,
+		stateFilesDir:       dir,
+		stateCellImportSlot: make(chan struct{}, 1),
 	}
 	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
 	if err != nil {
@@ -518,6 +524,7 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
+		peerStorage:   store,
 		stateFilesDir: dir,
 	}
 	header, err := persistentStateSnapshotDownloader{
@@ -709,6 +716,7 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 	node := &Node{
 		log:           zerolog.Nop(),
 		storage:       store,
+		peerStorage:   store,
 		stateFilesDir: dir,
 	}
 	downloader := persistentStateSnapshotDownloader{
@@ -772,10 +780,12 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 	}
 
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       store,
-		peerStorage:   store,
-		stateFilesDir: store.StateFilesDir(),
+		log:                      zerolog.Nop(),
+		storage:                  store,
+		peerStorage:              store,
+		stateFilesDir:            store.StateFilesDir(),
+		stateCellImportSlot:      make(chan struct{}, 1),
+		stateSplitPartDecodeSlot: make(chan struct{}, 1),
 	}
 	downloader := persistentStateSnapshotDownloader{
 		node:          node,
@@ -794,7 +804,7 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 		t.Fatalf("import split part: %v", err)
 	}
 
-	loaded, err := node.loadImportedSplitStatePartRoot(ctx, block, part)
+	loaded, err := node.loadImportedSplitStatePartRoot(ctx, part)
 	if err != nil {
 		t.Fatalf("load imported split part cells: %v", err)
 	}
@@ -1223,7 +1233,7 @@ func mustTestShardStateCellWithAccountIDs(t *testing.T, block ton.BlockIDExt, ac
 		if err != nil {
 			t.Fatalf("build shard account: %v", err)
 		}
-		if err = accounts.Set(cell.BeginCell().MustStoreBigInt(accountID, 256).EndCell(), account); err != nil {
+		if err = accounts.Set(cell.BeginCell().MustStoreSlice(accountID.FillBytes(make([]byte, 32)), 256).EndCell(), account); err != nil {
 			t.Fatalf("set shard account: %v", err)
 		}
 	}
@@ -1303,4 +1313,39 @@ func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header
 		t.Fatal("expected non-empty split parts")
 	}
 	return parts
+}
+
+func TestHistoricalOverlayBlockRandomizesPublicAncestorDepth(t *testing.T) {
+	node := &Node{
+		monitorMinSplitDepth: map[int32]uint32{0: 2},
+	}
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     shardPrefix(0x1234567890abcdef, 5),
+	}
+
+	seenDepths := make(map[int]struct{})
+	for range 256 {
+		selected := node.historicalOverlayBlockForDownload(block)
+		depth := tnstate.ShardPrefixLength(selected.Shard)
+		if depth < 0 || depth > 2 {
+			t.Fatalf("historical public overlay depth = %d, want [0,2]", depth)
+		}
+		if want := shardPrefix(block.Shard, uint32(depth)); selected.Shard != want {
+			t.Fatalf(
+				"historical public overlay shard = %016x, want ancestor %016x",
+				uint64(selected.Shard),
+				uint64(want),
+			)
+		}
+		seenDepths[depth] = struct{}{}
+	}
+	if len(seenDepths) != 3 {
+		t.Fatalf("historical public overlay depths = %v, want 0, 1, and 2", seenDepths)
+	}
+
+	master := ton.BlockIDExt{Workchain: -1, Shard: 0x4000000000000000}
+	if selected := node.historicalOverlayBlockForDownload(master); selected.Shard != topShard {
+		t.Fatalf("historical masterchain overlay shard = %016x, want top shard", uint64(selected.Shard))
+	}
 }

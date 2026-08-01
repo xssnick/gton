@@ -110,30 +110,34 @@ func (w *artifactPrewriter) run(ctx context.Context) {
 }
 
 func (w *artifactPrewriter) enqueue(state *storage.BlockState, artifact *storage.ServedBlockFull) (uint64, error) {
-	if w == nil || artifact == nil {
-		return 0, nil
+	seq, wait, err := w.enqueueDetached(state, artifact)
+	if err != nil {
+		return 0, err
+	}
+	return seq, wait()
+}
+
+// enqueueDetached assigns the sequence and appends the job under the prewriter
+// mutex without ever blocking, so callers may enqueue while holding their own
+// locks. The returned wait is the queue's backpressure (it blocks while the
+// queue is over its limits) and must always be invoked — but only after the
+// caller released any lock its appliers or dependents contend on. Each
+// producer can overshoot the queue bound by at most its own in-flight job.
+func (w *artifactPrewriter) enqueueDetached(state *storage.BlockState, artifact *storage.ServedBlockFull) (uint64, func() error, error) {
+	if w == nil {
+		return 0, noPrewriteBackpressure, nil
 	}
 
 	jobBytes := servedBlockFullPayloadBytes(artifact)
 	w.mu.Lock()
-	for {
-		if w.err != nil {
-			err := w.err
-			w.mu.Unlock()
-			return 0, err
-		}
-		if w.closed {
-			w.mu.Unlock()
-			return 0, errArtifactPrewriterClosed
-		}
-		if w.hasQueueRoomLocked(jobBytes) {
-			break
-		}
-
-		done := w.done
+	if w.err != nil {
+		err := w.err
 		w.mu.Unlock()
-		<-done
-		w.mu.Lock()
+		return 0, nil, err
+	}
+	if w.closed {
+		w.mu.Unlock()
+		return 0, nil, errArtifactPrewriterClosed
 	}
 
 	w.next++
@@ -149,21 +153,43 @@ func (w *artifactPrewriter) enqueue(state *storage.BlockState, artifact *storage
 	})
 	w.signalWake()
 	w.mu.Unlock()
-	return seq, nil
+	return seq, w.waitQueueRoom, nil
 }
 
-func (w *artifactPrewriter) hasQueueRoomLocked(jobBytes uint64) bool {
+func (w *artifactPrewriter) waitQueueRoom() error {
+	for {
+		w.mu.Lock()
+		if w.err != nil {
+			err := w.err
+			w.mu.Unlock()
+			return err
+		}
+		if w.closed {
+			w.mu.Unlock()
+			return errArtifactPrewriterClosed
+		}
+		if w.queueWithinLimitsLocked() {
+			w.mu.Unlock()
+			return nil
+		}
+
+		done := w.done
+		w.mu.Unlock()
+		<-done
+	}
+}
+
+// queueWithinLimitsLocked is the post-append counterpart of the old admission
+// gate: a single (possibly oversized) queued job never blocks its producer.
+func (w *artifactPrewriter) queueWithinLimitsLocked() bool {
 	queuedJobs := len(w.jobs) - w.head
-	if queuedJobs == 0 {
+	if queuedJobs <= 1 {
 		return true
 	}
 	if queuedJobs >= artifactPrewriteQueueJobsLimit {
 		return false
 	}
-	if w.maxBytes > 0 && jobBytes > 0 && w.bytes+jobBytes > w.maxBytes {
-		return false
-	}
-	return true
+	return w.maxBytes == 0 || w.bytes <= w.maxBytes
 }
 
 func (w *artifactPrewriter) wait(ctx context.Context, target uint64) error {
@@ -208,11 +234,7 @@ func (w *artifactPrewriter) popJob() (artifactPrewriteJob, bool) {
 	job := w.jobs[w.head]
 	w.jobs[w.head] = artifactPrewriteJob{}
 	w.head++
-	if job.bytes > w.bytes {
-		w.bytes = 0
-	} else {
-		w.bytes -= job.bytes
-	}
+	w.bytes -= job.bytes
 	if w.head == len(w.jobs) {
 		w.jobs = nil
 		w.head = 0

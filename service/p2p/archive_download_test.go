@@ -34,6 +34,38 @@ func TestDownloadArchiveCanceledContextDoesNotCreateSubscription(t *testing.T) {
 	}
 }
 
+func TestDownloadShardArchiveUsesHistoricalPublicOverlay(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, 32)
+	node.SetMonitorMinSplitDepth(0, 1)
+
+	shard := archive.ShardID{
+		Workchain: 0,
+		Shard:     0x4000000000000000,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	if _, err := session.DownloadArchive(ctx, 1, shard, ArchiveDownloadOptions{}); err == nil {
+		t.Fatal("archive download without peers succeeded")
+	}
+	_, requested := findSubscriptionForOverlay(t, node, shard.Workchain, shard.Shard)
+	_, ancestor := findSubscriptionForOverlay(t, node, shard.Workchain, topShard)
+	if requested == ancestor {
+		t.Fatalf(
+			"historical archive public overlays: requested=%v ancestor=%v, want exactly one",
+			requested,
+			ancestor,
+		)
+	}
+	if _, ok := findSubscriptionForOverlay(t, node, -1, topShard); ok {
+		t.Fatal("shard archive created a masterchain overlay fallback")
+	}
+}
+
 func TestArchivePackDownloadLimitRejectsEndlessFullSlices(t *testing.T) {
 	var offset int64
 	fullSlices := int(archivePackMaxBytes / archiveSliceSize)
@@ -77,8 +109,9 @@ func TestArchiveNetworkProbeLimits(t *testing.T) {
 		got  time.Duration
 		want time.Duration
 	}{
-		{name: "probe timeout", got: archiveSliceProbeTimeout, want: 5 * time.Second},
-		{name: "initial full slice timeout", got: archiveSliceInitialTimeout, want: 6 * time.Second},
+		{name: "archive info timeout", got: archiveInfoTimeout, want: 6 * time.Second},
+		{name: "probe timeout", got: archiveSliceProbeTimeout, want: 10 * time.Second},
+		{name: "initial full slice timeout", got: archiveSliceInitialTimeout, want: 12 * time.Second},
 		{name: "slice timeout", got: archiveSliceTimeout, want: 15 * time.Second},
 	}
 
@@ -91,6 +124,26 @@ func TestArchiveNetworkProbeLimits(t *testing.T) {
 	}
 	if archiveSliceProbeSize != 256<<10 {
 		t.Fatalf("probe size = %d, want %d", archiveSliceProbeSize, 256<<10)
+	}
+}
+
+func TestResolveArchiveWithoutCandidatesReturnsNoPeers(t *testing.T) {
+	shard := archive.ShardID{Workchain: -1, Shard: topShard}
+	node := &Node{peerUse: map[PeerID]peerUse{}}
+	sub := testOverlaySubscription(&overlaySubscription{
+		log:  discardLogger(),
+		node: node,
+	})
+	pool := testArchivePool(t, sub)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+
+	_, err := sub.resolveArchive(context.Background(), session, pool, 10, shard, ArchiveDownloadOptions{})
+	if !errors.Is(err, ErrNoArchivePeers) {
+		t.Fatalf("resolve archive error = %v, want no archive peers", err)
+	}
+	if errors.Is(err, archive.ErrNotAvailable) {
+		t.Fatalf("no archive peers error must not be classified as archive not available: %v", err)
 	}
 }
 
@@ -128,7 +181,7 @@ func TestCompletedArchiveDownloadKeepsStickyPeer(t *testing.T) {
 	if downloaded.Bytes != int64(len(seed)) {
 		t.Fatalf("downloaded bytes = %d, want %d", downloaded.Bytes, len(seed))
 	}
-	if _, ok := node.pinnedPeerIDs()[peer.id]; ok {
+	if _, ok := node.protectedPeerIDs()[peer.id]; ok {
 		t.Fatal("completed archive download entered live peer protection")
 	}
 	if selected := session.selectedArchivePeerID(shard); selected != peer.id {
@@ -160,7 +213,7 @@ func TestArchiveInfoWithoutSeedDoesNotProvePeer(t *testing.T) {
 	archiveRLDP := &testArchiveRLDP{
 		adnl:        newTestOverlayADNL(),
 		queryResult: ArchiveInfo{ID: 777},
-		asyncErr:    context.DeadlineExceeded,
+		asyncErrors: map[int64]error{0: context.DeadlineExceeded},
 	}
 	var archiveInfoQueries int
 	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
@@ -175,12 +228,17 @@ func TestArchiveInfoWithoutSeedDoesNotProvePeer(t *testing.T) {
 		}
 		return nil
 	}
+	rldpOverlay := overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1})
 	peer := &overlayPeer{
 		id:          peerID,
 		addr:        "archive-info",
 		overlay:     peerOverlay,
-		rldpOverlay: overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1}),
-		alive:       true,
+		rldpOverlay: rldpOverlay,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   rldpOverlay,
+			overlayID: []byte{1},
+		},
+		alive: true,
 	}
 	sub.peers[peerID] = peer
 	addTestArchiveOnlyPeer(pool, peer)
@@ -189,17 +247,20 @@ func TestArchiveInfoWithoutSeedDoesNotProvePeer(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("fetch archive candidate error = %v, want context.DeadlineExceeded", err)
 	}
-	if archiveInfoQueries != 1 {
-		t.Fatalf("archive info ADNL queries = %d, want 1", archiveInfoQueries)
+	if archiveInfoQueries != 0 {
+		t.Fatalf("archive info ADNL queries = %d, want 0", archiveInfoQueries)
 	}
 	snapshot := archiveRLDP.snapshot()
 	if snapshot.queryCalls != 0 {
 		t.Fatalf("archive info used RLDP DoQuery %d times, want 0", snapshot.queryCalls)
 	}
-	if len(snapshot.asyncQueries) != 1 {
-		t.Fatalf("archive probe queries = %d, want 1", len(snapshot.asyncQueries))
+	if len(snapshot.asyncQueries) != 2 {
+		t.Fatalf("archive RLDP queries = %d, want 2", len(snapshot.asyncQueries))
 	}
-	query := snapshot.asyncQueries[0]
+	if _, ok := testOverlayQueryPayload(snapshot.asyncQueries[0].request).(GetArchiveInfo); !ok {
+		t.Fatalf("first RLDP query payload = %T, want GetArchiveInfo", testOverlayQueryPayload(snapshot.asyncQueries[0].request))
+	}
+	query := snapshot.asyncQueries[1]
 	probe, ok := testOverlayQueryPayload(query.request).(GetArchiveSlice)
 	if !ok {
 		t.Fatalf("archive probe payload = %T, want GetArchiveSlice", testOverlayQueryPayload(query.request))
@@ -210,7 +271,7 @@ func TestArchiveInfoWithoutSeedDoesNotProvePeer(t *testing.T) {
 	if query.maxAnswer != archiveSliceProbeSize+4096 {
 		t.Fatalf("archive probe max answer = %d, want %d", query.maxAnswer, archiveSliceProbeSize+4096)
 	}
-	if _, ok := node.pinnedPeerIDs()[peer.id]; ok {
+	if _, ok := node.protectedPeerIDs()[peer.id]; ok {
 		t.Fatal("archive info without bytes should not pin peer")
 	}
 	if got := pool.provenUsableSize(time.Now()); got != 0 {
@@ -255,7 +316,7 @@ func TestArchiveHedgeSeedProbeDoesNotPinLoser(t *testing.T) {
 	if selected := session.selectedArchivePeerID(shard); !selected.IsZero() {
 		t.Fatalf("hedge loser became selected: %s", selected.String())
 	}
-	if _, ok := node.pinnedPeerIDs()[peer.id]; ok {
+	if _, ok := node.protectedPeerIDs()[peer.id]; ok {
 		t.Fatal("hedge loser was pinned by a non-selecting seed probe")
 	}
 	pool.mx.Lock()
@@ -317,6 +378,7 @@ func TestArchiveSmallProbeContinuesFullDownload(t *testing.T) {
 		data[i] = byte(i)
 	}
 	peer := testArchiveDownloadPeer(t, "probe-continue", 777, data, 0)
+	peer.unreliability = 3
 	addTestArchiveOnlyPeer(pool, peer)
 
 	candidate, err := sub.fetchArchiveCandidate(context.Background(), session, pool, peer, 10, shard, true)
@@ -336,6 +398,13 @@ func TestArchiveSmallProbeContinuesFullDownload(t *testing.T) {
 	}
 	if string(downloaded.Data) != string(data) {
 		t.Fatalf("downloaded archive bytes = %d, want %d", len(downloaded.Data), len(data))
+	}
+	stats := peer.statsSnapshot()
+	if stats.unreliability != 2 {
+		t.Fatalf("archive operation unreliability = %v, want one success decrement to 2", stats.unreliability)
+	}
+	if stats.failedQueries != 0 {
+		t.Fatalf("archive operation recorded %d query failures", stats.failedQueries)
 	}
 }
 
@@ -368,8 +437,8 @@ func TestArchiveInitialFullSliceUsesShortTimeout(t *testing.T) {
 	}
 
 	snapshot := archiveRLDP.snapshot()
-	if len(snapshot.asyncQueries) != 3 {
-		t.Fatalf("archive slice queries = %d, want probe plus 2 pipelined slices", len(snapshot.asyncQueries))
+	if want := 2 + archiveSliceParallelism; len(snapshot.asyncQueries) != want {
+		t.Fatalf("archive RLDP queries = %d, want info, probe, and %d pipelined slices", len(snapshot.asyncQueries), archiveSliceParallelism)
 	}
 	var got time.Duration
 	for _, record := range snapshot.asyncQueries {
@@ -387,7 +456,7 @@ func TestArchiveInitialFullSliceUsesShortTimeout(t *testing.T) {
 	}
 }
 
-func TestArchiveSliceDownloadPipelinesTwoRequests(t *testing.T) {
+func TestArchiveSliceDownloadPipelinesParallelRequests(t *testing.T) {
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	node := &Node{peerUse: map[PeerID]peerUse{}}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -440,8 +509,9 @@ func TestArchiveSliceDownloadAssemblesOutOfOrder(t *testing.T) {
 	binary.LittleEndian.PutUint32(data, packfile.PackageMagic)
 	peer, archiveRLDP := testArchiveDownloadPeerWithRLDP(t, "slice-out-of-order", 777, data, 0)
 	archiveRLDP.asyncDelays = map[int64]time.Duration{
-		0:                60 * time.Millisecond,
-		archiveSliceSize: 5 * time.Millisecond,
+		0:                    60 * time.Millisecond,
+		archiveSliceSize:     5 * time.Millisecond,
+		2 * archiveSliceSize: 30 * time.Millisecond,
 	}
 	addTestArchiveOnlyPeer(pool, peer)
 
@@ -525,9 +595,9 @@ func TestArchiveSliceDownloadCancellationStopsOutstandingRequests(t *testing.T) 
 	peer, archiveRLDP := testArchiveDownloadPeerWithRLDP(t, "slice-context-cancel", 777, nil, 0)
 	started := make(chan GetArchiveSlice, archiveSliceParallelism)
 	canceled := make(chan int64, archiveSliceParallelism)
-	archiveRLDP.asyncWaitForCancel = map[int64]bool{
-		0:                true,
-		archiveSliceSize: true,
+	archiveRLDP.asyncWaitForCancel = map[int64]bool{}
+	for i := 0; i < archiveSliceParallelism; i++ {
+		archiveRLDP.asyncWaitForCancel[int64(i)*archiveSliceSize] = true
 	}
 	archiveRLDP.asyncStarted = started
 	archiveRLDP.asyncCanceled = canceled
@@ -586,9 +656,17 @@ func TestArchiveSliceDownloadErrorCancelsOutstandingRequest(t *testing.T) {
 
 	sliceErr := errors.New("archive slice failed")
 	peer, archiveRLDP := testArchiveDownloadPeerWithRLDP(t, "slice-error-cancel", 777, nil, 0)
-	canceled := make(chan int64, 1)
+	// Every slice in flight beside the failing one must be canceled, and the
+	// order they report in is not defined.
+	canceled := make(chan int64, archiveSliceParallelism)
+	wantCanceled := map[int64]bool{}
+	archiveRLDP.asyncWaitForCancel = map[int64]bool{}
+	for i := 1; i < archiveSliceParallelism; i++ {
+		offset := int64(i) * archiveSliceSize
+		archiveRLDP.asyncWaitForCancel[offset] = true
+		wantCanceled[offset] = true
+	}
 	archiveRLDP.asyncErrors = map[int64]error{0: sliceErr}
-	archiveRLDP.asyncWaitForCancel = map[int64]bool{archiveSliceSize: true}
 	archiveRLDP.asyncCanceled = canceled
 	addTestArchiveOnlyPeer(pool, peer)
 
@@ -603,13 +681,16 @@ func TestArchiveSliceDownloadErrorCancelsOutstandingRequest(t *testing.T) {
 		t.Fatalf("download archive error = %q, want offset=0", err)
 	}
 
-	select {
-	case offset := <-canceled:
-		if offset != archiveSliceSize {
-			t.Fatalf("canceled archive offset = %d, want %d", offset, archiveSliceSize)
+	for len(wantCanceled) > 0 {
+		select {
+		case offset := <-canceled:
+			if !wantCanceled[offset] {
+				t.Fatalf("canceled archive offset = %d, want one of the outstanding slices", offset)
+			}
+			delete(wantCanceled, offset)
+		case <-time.After(time.Second):
+			t.Fatal("outstanding archive request was not canceled after slice error")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("outstanding archive request was not canceled after slice error")
 	}
 
 	snapshot := archiveRLDP.snapshot()
@@ -1022,13 +1103,19 @@ func testArchiveDownloadPeerWithRLDP(t *testing.T, label string, archiveID int64
 		}
 		return nil
 	}
+	rldpOverlay := overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1})
 	return &overlayPeer{
 		id:          testPeerID(label),
 		addr:        label,
 		overlay:     peerOverlay,
-		rldpOverlay: overlay.CreateExtendedRLDP(archiveRLDP).CreateOverlay([]byte{1}),
-		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
-		alive:       true,
+		rldpOverlay: rldpOverlay,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   rldpOverlay,
+			overlayID: []byte{1},
+		},
+		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		alive:     true,
+		release:   func() {},
 	}, archiveRLDP
 }
 
@@ -1111,6 +1198,11 @@ func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, maxAnswer uint64, _ 
 	query, isArchiveSlice := payload.(GetArchiveSlice)
 	stateQuery, isPersistentStateSlice := payload.(DownloadPersistentStateSliceV2)
 	isSlice := isArchiveSlice || isPersistentStateSlice
+	typedQuery := false
+	switch payload.(type) {
+	case GetArchiveInfo, GetShardArchiveInfo, PrepareZeroState, PreparePersistentState, GetPersistentStateSizeV2:
+		typedQuery = true
+	}
 	offset := query.Offset
 	if isPersistentStateSlice {
 		offset = stateQuery.Offset
@@ -1123,6 +1215,7 @@ func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, maxAnswer uint64, _ 
 	})
 	asyncErr := r.asyncErr
 	data := append([]byte(nil), r.asyncResult...)
+	queryResult := r.queryResult
 	delay := r.asyncDelay
 	waitForCancel := false
 	if isSlice {
@@ -1147,13 +1240,20 @@ func (r *testArchiveRLDP) DoQueryAsync(ctx context.Context, maxAnswer uint64, _ 
 	if asyncErr != nil {
 		return asyncErr
 	}
+	if typedQuery && queryResult != nil {
+		var err error
+		data, err = tl.Serialize(queryResult, true)
+		if err != nil {
+			return err
+		}
+	}
 	if isArchiveSlice && started != nil {
 		select {
 		case started <- query:
 		default:
 		}
 	}
-	if doQueryGate != nil {
+	if doQueryGate != nil && isSlice {
 		<-doQueryGate
 	}
 	if isArchiveSlice {
@@ -1228,6 +1328,10 @@ func (r *testArchiveRLDP) snapshot() testArchiveRLDPSnapshot {
 func (r *testArchiveRLDP) SetOnQuery(func([]byte, *rldp.Query) error) {}
 
 func (r *testArchiveRLDP) SetOnMessage(func([]byte, []byte) error) {}
+
+func (*testArchiveRLDP) SendMessage(context.Context, []byte) error {
+	return nil
+}
 
 func (r *testArchiveRLDP) SetOnDisconnect(func()) {}
 

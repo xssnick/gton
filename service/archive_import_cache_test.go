@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/xssnick/gton/service/archive"
@@ -156,14 +158,20 @@ func TestDropArchiveWindowImportCacheRemovesEverySource(t *testing.T) {
 	masterReloads := 0
 	if loaded, err := cache.load(ctx, masterKey, func(context.Context) (*archiveImportResult, error) {
 		masterReloads++
-		return &archiveImportResult{}, nil
+		return &archiveImportResult{
+			stats:  &archive.ImportStats{},
+			blocks: map[storage.BlockRootHash]PreparedBlock{},
+		}, nil
 	}); err != nil || loaded.cached {
 		t.Fatalf("master cache after window drop = cached:%v err:%v", loaded.cached, err)
 	}
 	shardReloads := 0
 	if loaded, err := cache.load(ctx, shardKey, func(context.Context) (*archiveImportResult, error) {
 		shardReloads++
-		return &archiveImportResult{}, nil
+		return &archiveImportResult{
+			stats:  &archive.ImportStats{},
+			blocks: map[storage.BlockRootHash]PreparedBlock{},
+		}, nil
 	}); err != nil || loaded.cached {
 		t.Fatalf("shard cache after window drop = cached:%v err:%v", loaded.cached, err)
 	}
@@ -179,5 +187,109 @@ func testArchiveImportCacheBlock(seqno uint32, root byte, file byte) ton.BlockID
 		SeqNo:     seqno,
 		RootHash:  bytes.Repeat([]byte{root}, 32),
 		FileHash:  bytes.Repeat([]byte{file}, 32),
+	}
+}
+
+// TestArchiveImportCacheConcurrentMissIsolatesEveryCaller pins the ownership
+// contract behind the single loader-side clone: the cache entry doubles as the
+// waiters' source, so every waiter must still receive an independently mutable
+// result and the shared entry must stay pristine.
+func TestArchiveImportCacheConcurrentMissIsolatesEveryCaller(t *testing.T) {
+	ctx := context.Background()
+	cache := newArchiveImportCache()
+	block := testArchiveImportCacheBlock(10, 0x31, 0x32)
+	blockKey := storage.BlockKey(block)
+	key := archiveImportCacheKey{
+		masterchainSeqno: block.SeqNo,
+		shard:            archive.ShardID{Workchain: -1, Shard: topShard},
+	}
+
+	const callers = 32
+	var loads atomic.Int64
+	release := make(chan struct{})
+	load := func(context.Context) (*archiveImportResult, error) {
+		loads.Add(1)
+		// Hold the loader open so the other callers pile up as waiters.
+		<-release
+		return &archiveImportResult{
+			stats: &archive.ImportStats{},
+			blocks: map[storage.BlockRootHash]PreparedBlock{
+				blockKey: {ID: block, Meta: &storage.BlockMeta{ID: block}},
+			},
+			splitDepth: 3,
+		}, nil
+	}
+
+	var start, done sync.WaitGroup
+	start.Add(callers)
+	done.Add(callers)
+	results := make([]archiveImportDownload, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer done.Done()
+			start.Done()
+			results[i], errs[i] = cache.load(ctx, key, load)
+		}(i)
+	}
+	start.Wait()
+	close(release)
+	done.Wait()
+
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("underlying loader ran %d times, want exactly 1", got)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+		if results[i].imported == nil {
+			t.Fatalf("caller %d got a nil result", i)
+		}
+		if results[i].imported.splitDepth != 3 {
+			t.Fatalf("caller %d split depth = %d, want 3", i, results[i].imported.splitDepth)
+		}
+	}
+
+	// Every caller must own its result graph.
+	seen := map[*storage.BlockMeta]int{}
+	for i := range results {
+		meta := results[i].imported.blocks[blockKey].Meta
+		if meta == nil {
+			t.Fatalf("caller %d block meta is nil", i)
+		}
+		if previous, ok := seen[meta]; ok {
+			t.Fatalf("callers %d and %d share one *BlockMeta", previous, i)
+		}
+		seen[meta] = i
+		meta.MasterchainRefSeqno = uint32(i + 1)
+		results[i].imported.blocks = nil
+	}
+	for i := range results {
+		if results[i].imported.blocks != nil {
+			t.Fatalf("caller %d block map aliases another caller", i)
+		}
+	}
+
+	// The shared cache entry survived every caller mutating its own copy.
+	next, err := cache.load(ctx, key, func(context.Context) (*archiveImportResult, error) {
+		t.Fatal("cache miss after a successful load")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("load after concurrent miss: %v", err)
+	}
+	if !next.cached {
+		t.Fatal("load after concurrent miss did not hit the cache")
+	}
+	cachedBlock, ok := next.imported.blocks[blockKey]
+	if !ok {
+		t.Fatal("cached entry lost its blocks")
+	}
+	if cachedBlock.Meta.MasterchainRefSeqno != 0 {
+		t.Fatalf("cached entry was mutated through a caller result: %d", cachedBlock.Meta.MasterchainRefSeqno)
+	}
+	if next.imported.splitDepth != 3 {
+		t.Fatalf("cached split depth = %d, want 3", next.imported.splitDepth)
 	}
 }

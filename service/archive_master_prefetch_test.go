@@ -187,10 +187,11 @@ func TestArchiveMasterImportDropsInvalidCacheAndRetriesWhenPeerIsGone(t *testing
 			}()
 
 			runner := &archiveCatchUpRunner{
-				service:     &Service{log: zerolog.Nop()},
-				importCache: cache,
+				service:        &Service{log: zerolog.Nop()},
+				archiveSession: newTestArchiveSession(t),
+				importCache:    cache,
 			}
-			result, _, err := runner.startArchiveMasterImport(ctx, queue, start, 11, nil).wait(ctx)
+			result, _, err := runner.startArchiveMasterImport(ctx, queue, start.Block, start, 11, nil).wait(ctx)
 			if err != nil {
 				t.Fatalf("master import retry: %v", err)
 			}
@@ -244,7 +245,7 @@ func TestArchiveMasterImportDoesNotPrecheckBlockAfterSyncUntil(t *testing.T) {
 		service:     &Service{log: zerolog.Nop(), syncUntil: syncUntil},
 		importCache: cache,
 	}
-	result, _, err := runner.startArchiveMasterImport(ctx, nil, start, 11, nil).wait(ctx)
+	result, _, err := runner.startArchiveMasterImport(ctx, nil, start.Block, start, 11, nil).wait(ctx)
 	if err != nil {
 		t.Fatalf("master import at sync_until: %v", err)
 	}
@@ -263,5 +264,26 @@ func waitArchiveMasterDownloadProducer(t *testing.T, finished <-chan struct{}) {
 	case <-finished:
 	case <-time.After(time.Second):
 		t.Fatal("master archive download producer did not stop")
+	}
+}
+
+func TestArchiveMasterOverlapStartRequiresFullyPrecheckedSequence(t *testing.T) {
+	sequence := []PreparedBlock{testArchiveMasterBlock(11, false), testArchiveMasterBlock(12, false)}
+	proofs := map[uint32]*masterchainConsensusProof{11: {}, 12: {}}
+
+	start, ok := archiveMasterOverlapStart(archiveMasterImportResult{masterSequence: sequence, consensusProofs: proofs})
+	if !ok || !start.Equals(&sequence[1].ID) {
+		t.Fatalf("overlap start = %s,%v want %s,true", storage.FormatBlockRef(start), ok, storage.FormatBlockRef(sequence[1].ID))
+	}
+
+	if _, ok = archiveMasterOverlapStart(archiveMasterImportResult{masterSequence: sequence}); ok {
+		t.Fatal("window without prechecked proofs (key-block start) must not overlap the next master import")
+	}
+	trimmed := map[uint32]*masterchainConsensusProof{11: {}}
+	if _, ok = archiveMasterOverlapStart(archiveMasterImportResult{masterSequence: sequence, consensusProofs: trimmed}); ok {
+		t.Fatal("partially prechecked sequence must not overlap the next master import")
+	}
+	if _, ok = archiveMasterOverlapStart(archiveMasterImportResult{}); ok {
+		t.Fatal("empty master sequence must not overlap the next master import")
 	}
 }

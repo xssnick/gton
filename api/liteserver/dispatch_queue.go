@@ -57,7 +57,7 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 	var after []byte
 	allowEq := true
 	if query.Mode&2 != 0 {
-		after = bytes.Clone(query.AfterAddr)
+		after = query.AfterAddr
 		allowEq = false
 	} else {
 		after = make([]byte, 32)
@@ -70,7 +70,7 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 
 	resp := ton.DispatchQueueInfo{
 		Mode:                  query.Mode,
-		ID:                    cloneBlockID(*query.ID),
+		ID:                    blockproof.CloneBlockID(*query.ID),
 		AccountDispatchQueues: queues,
 		Complete:              complete,
 	}
@@ -126,7 +126,7 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 
 	messages, roots, complete, err := collectDispatchQueueMessages(
 		dispatchQueue,
-		bytes.Clone(query.Addr),
+		query.Addr,
 		query.AfterLT,
 		int(query.MaxMessages),
 		query.Mode&2 != 0,
@@ -138,7 +138,7 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 
 	resp := ton.DispatchQueueMessages{
 		Mode:     query.Mode,
-		ID:       cloneBlockID(*query.ID),
+		ID:       blockproof.CloneBlockID(*query.ID),
 		Messages: messages,
 		Complete: complete,
 	}
@@ -253,8 +253,8 @@ func collectDispatchQueueMessages(dispatchQueue *cell.AugmentedDictionary, addr 
 		remaining = 64
 	}
 
-	origAddr := bytes.Clone(addr)
-	currentAddr := bytes.Clone(addr)
+	origAddr := addr
+	currentAddr := addr
 	lt := afterLT
 	first := true
 	messages := make([]ton.DispatchQueueMessage, 0, remaining)
@@ -439,7 +439,7 @@ func loadDispatchQueueMessage(addr []byte, lt uint64, value *cell.Slice) (ton.Di
 	}
 
 	return ton.DispatchQueueMessage{
-		Addr:     bytes.Clone(addr),
+		Addr:     addr,
 		LT:       lt,
 		Hash:     envelope.Msg.Hash(),
 		Metadata: dispatchQueueMetadataFromEnvelope(envelope.Metadata),

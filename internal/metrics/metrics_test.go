@@ -96,12 +96,14 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 						Direction: "accepted",
 						Overlay:   "masterchain",
 						Kind:      "tonNode.blockBroadcastCompressedV2",
+						Delivery:  p2p.DeliveryPlumtree,
 						Count:     3,
 					},
 					{
 						Direction: "queue_rebroadcasted",
 						Overlay:   "masterchain",
 						Kind:      "tonNode.externalMessageBroadcast",
+						Delivery:  p2p.DeliveryFEC,
 						Count:     4,
 					},
 				},
@@ -129,14 +131,27 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 						FECRelayFailedTotal:     29,
 					},
 				},
+				Plumtree: []p2p.PlumtreeStatusSnapshot{
+					{
+						Overlay:             "masterchain",
+						DirectParts:         31,
+						RecoveryParts:       7,
+						SimpleMessages:      2,
+						FECMessages:         31,
+						IHaveMessages:       37,
+						PruneMessages:       5,
+						UsefulMessages:      23,
+						StatsPushMessages:   3,
+						RepairQueryMessages: 7,
+					},
+				},
 			},
 			LocalMasterchain:      &localMaster,
 			LocalMasterchainUtime: time.Now().Unix() - 12,
 			LocalStateLoaded:      true,
 			RecentTPS: service.StatusTPSSnapshot{
-				WindowMasters:   1,
-				Transactions:    42,
-				DurationSeconds: 1,
+				DurationSeconds: 10,
+				Transactions:    420,
 				TPS:             42,
 				Complete:        true,
 			},
@@ -202,11 +217,11 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 0`,
 		namespace + `_sync_lag_seconds{chain="masterchain",shard="masterchain"}`,
 		namespace + `_sync_recent_tps 42`,
-		namespace + `_sync_recent_transactions 42`,
+		namespace + `_sync_recent_transactions 420`,
 		namespace + `_sync_recent_tps_complete 1`,
 		namespace + `_service_background_task{task="idle"} 1`,
-		namespace + `_p2p_broadcasts_total{direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
-		namespace + `_p2p_broadcasts_total{direction="queue_rebroadcasted",kind="tonNode.externalMessageBroadcast",overlay="masterchain"} 4`,
+		namespace + `_p2p_broadcasts_total{delivery="plumtree",direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
+		namespace + `_p2p_broadcasts_total{delivery="fec",direction="queue_rebroadcasted",kind="tonNode.externalMessageBroadcast",overlay="masterchain"} 4`,
 		namespace + `_p2p_broadcast_dropped_total{kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain",reason="signature_check_failed"} 2`,
 		namespace + `_p2p_fec_receiver_active_streams{overlay="masterchain"} 2`,
 		namespace + `_p2p_fec_receiver_active_bytes{overlay="masterchain"} 4096`,
@@ -219,6 +234,15 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_p2p_broadcast_relay_failed_total{delivery="simple",overlay="masterchain"} 19`,
 		namespace + `_p2p_broadcast_relay_sent_total{delivery="fec",overlay="masterchain"} 23`,
 		namespace + `_p2p_broadcast_relay_failed_total{delivery="fec",overlay="masterchain"} 29`,
+		namespace + `_p2p_plumtree_fec_parts_received_total{overlay="masterchain",source="direct"} 31`,
+		namespace + `_p2p_plumtree_fec_parts_received_total{overlay="masterchain",source="recovery"} 7`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="simple"} 2`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="fec"} 31`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="ihave"} 37`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="prune"} 5`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="useful"} 23`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="stats_push"} 3`,
+		namespace + `_p2p_plumtree_messages_received_total{overlay="masterchain",type="repair_query"} 7`,
 		namespace + `_storage_archive_package_bytes 4`,
 		namespace + `_storage_persistent_state_bytes 21`,
 		namespace + `_storage_cell_db_generation{generation="active"} 1`,
@@ -303,6 +327,49 @@ func TestSyncMetricsUseAppliedMasterchainForMasterGap(t *testing.T) {
 	removed := namespace + `_sync_gap_blocks{chain="masterchain",shard="masterchain"} 6`
 	if strings.Contains(body, removed) {
 		t.Fatalf("metrics output contains coupled master gap %q\n%s", removed, body)
+	}
+}
+
+func TestSyncMetricsOmitIncompleteRecentTPS(t *testing.T) {
+	namespace := "testgton_incomplete_tps"
+	m := New(namespace)
+
+	err := m.RegisterRuntimeCollectors(RuntimeReaders{
+		ServiceStatusReader: func() service.StatusSnapshot {
+			return service.StatusSnapshot{
+				RecentTPS: service.StatusTPSSnapshot{
+					DurationSeconds: 10,
+					Transactions:    100,
+					TPS:             10,
+				},
+			}
+		},
+		DBStatusReader: func(context.Context) (pebblestore.DBStatus, error) {
+			return pebblestore.DBStatus{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("register runtime collectors: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, namespace+`_sync_recent_tps_complete 0`) {
+		t.Fatalf("metrics output does not report incomplete TPS window\n%s", body)
+	}
+	for _, metric := range []string{
+		namespace + `_sync_recent_tps `,
+		namespace + `_sync_recent_transactions `,
+	} {
+		if strings.Contains(body, metric) {
+			t.Fatalf("metrics output contains incomplete metric %q\n%s", metric, body)
+		}
 	}
 }
 

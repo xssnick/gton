@@ -7,11 +7,16 @@ const (
 	broadcastPipelineStageClassify          = "classify"
 	broadcastPipelineStageCandidateDecode   = "candidate_decode"
 	broadcastPipelineStageShardDescValidate = "shard_desc_validate"
+	broadcastPipelineStageBlockSigCheck     = "block_broadcast_signature_check"
 	broadcastPipelineStageFinalitySigCheck  = "block_finality_signature_check"
 	broadcastPipelineStageFinalityAssemble  = "block_finality_assemble"
 	broadcastPipelineStageHotCacheNotify    = "hot_cache_notify"
 	broadcastPipelineStageExactPop          = "exact_pop"
 	broadcastPipelineStageDecodeAsync       = "decode_async"
+	// decode_inline is the fallback taken when the decode pool refuses the
+	// payload: the decode then runs on the transport receive goroutine, so this
+	// stage is the signal that the pool is undersized.
+	broadcastPipelineStageDecodeInline = "decode_inline"
 
 	broadcastPipelineResultSuccess = "success"
 	broadcastPipelineResultDrop    = "drop"

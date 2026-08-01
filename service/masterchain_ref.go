@@ -7,7 +7,7 @@ import (
 )
 
 func setShardStateMasterchainRef(state *storage.BlockState, master ton.BlockIDExt) {
-	if state == nil || state.Block.Workchain == -1 {
+	if state.Block.Workchain == -1 {
 		return
 	}
 
@@ -18,18 +18,11 @@ func setShardStateMasterchainRef(state *storage.BlockState, master ton.BlockIDEx
 }
 
 func setShardBlockMasterchainRef(meta *storage.BlockMeta, master ton.BlockIDExt) {
-	if meta == nil || meta.ID.Workchain == -1 {
+	if meta.ID.Workchain == -1 {
 		return
 	}
 
 	// cppnode sets BlockHandle::masterchain_ref_block from the including master,
 	// so overwrite any stale value parsed from the shard header.
 	meta.MasterchainRefSeqno = master.SeqNo
-}
-
-func setPreparedShardMasterchainRef(block *PreparedBlock, master ton.BlockIDExt) {
-	if block == nil {
-		return
-	}
-	setShardBlockMasterchainRef(block.Meta, master)
 }

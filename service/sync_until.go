@@ -11,8 +11,15 @@ func (s *Service) syncUntilEnabled() bool {
 	return s.syncUntil != 0
 }
 
+// syncUntilFrozen reports the deliberate stop at ton.sync_until, where the node
+// is done and background work may legitimately wind down.
+//
+// Keyed on the service's own decision, not on node.IsOffline: the node also goes
+// offline when a subsystem dies, and reading that as a finished sync silently
+// parked persistent-state GC, archive GC and state serialization behind an
+// incident - with a log line claiming the sync had completed.
 func (s *Service) syncUntilFrozen() bool {
-	return s.syncUntilEnabled() && s.node != nil && s.node.IsOffline()
+	return s.syncUntilEnabled() && s.syncUntilReached.Load()
 }
 
 func (s *Service) checkCurrentBeforeSyncUntil(ctx context.Context, current *storage.CurrentState) error {
@@ -33,17 +40,13 @@ func (s *Service) checkCurrentBeforeSyncUntil(ctx context.Context, current *stor
 }
 
 func (s *Service) preparedMasterBlockAfterSyncUntil(block PreparedBlock) bool {
-	if !s.syncUntilEnabled() || block.Meta == nil {
+	if !s.syncUntilEnabled() {
 		return false
 	}
 	return block.Meta.GenUTime > s.syncUntil
 }
 
 func (s *Service) enterSyncUntilOffline(current *storage.CurrentState, next PreparedBlock) {
-	if s.node == nil {
-		return
-	}
-
 	event := s.log.Info().
 		Uint32("sync_until", s.syncUntil)
 	if current != nil {
@@ -63,6 +66,9 @@ func (s *Service) enterSyncUntilOffline(current *storage.CurrentState, next Prep
 	if next.Meta != nil {
 		reason = fmt.Sprintf("ton.sync_until=%d reached before %s utime=%d", s.syncUntil, storage.FormatBlockRef(next.ID), next.Meta.GenUTime)
 	}
+	// Raised before the node stops so no worker observes "offline" without also
+	// observing that this offline is the deliberate one.
+	s.syncUntilReached.Store(true)
 	s.node.EnterOffline(reason)
 	s.wakeServiceMaintenance()
 }

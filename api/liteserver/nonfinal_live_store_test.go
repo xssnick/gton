@@ -6,7 +6,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -49,10 +52,10 @@ func TestLiveStoreNonfinalPublishesGaplessCellCache(t *testing.T) {
 		t.Fatalf("publish parent: %v", err)
 	}
 	signed, candidates = live.NonfinalPendingShardBlocks(nil)
-	if len(signed) != 2 || !blockIDEqual(signed[0], parent.Block) || !blockIDEqual(signed[1], child.Block) {
+	if len(signed) != 2 || !blockproof.BlockIDEqual(signed[0], parent.Block) || !blockproof.BlockIDEqual(signed[1], child.Block) {
 		t.Fatalf("signed pending = %+v, want parent and child", signed)
 	}
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], child.Block) {
 		t.Fatalf("candidate pending = %+v, want child", candidates)
 	}
 
@@ -95,10 +98,10 @@ func TestLiveStoreNonfinalPublishesGaplessCellCache(t *testing.T) {
 	store.cells[sharedBranch.HashKey()] = sharedBranch
 
 	signed, candidates = live.NonfinalPendingShardBlocks(nil)
-	if len(signed) != 1 || !blockIDEqual(signed[0], child.Block) {
+	if len(signed) != 1 || !blockproof.BlockIDEqual(signed[0], child.Block) {
 		t.Fatalf("signed pending after parent cleanup = %+v, want child", signed)
 	}
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], child.Block) {
 		t.Fatalf("candidate pending after parent cleanup = %+v, want child", candidates)
 	}
 	state, err = live.BlockState(context.Background(), child.Block)
@@ -145,7 +148,7 @@ func TestLiveStoreNonfinalPrunedDependencyUsesExactCellKey(t *testing.T) {
 	}
 
 	_, candidates := live.NonfinalPendingShardBlocks(nil)
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], pending.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], pending.Block) {
 		t.Fatalf("candidate pending = %+v, want pending", candidates)
 	}
 
@@ -226,7 +229,7 @@ func TestLiveStoreNonfinalUsesConfiguredCellLoaderBeforeStore(t *testing.T) {
 
 func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 	store := &fakeLazyCellStore{cells: map[cell.Hash]*cell.Cell{}}
-	live := NewLiveStore(store, LiveStoreOptions{
+	live := NewLiveStore(store, liveview.Options{
 		MasterBlockCache: 8,
 		ShardBlockCache:  8,
 		NonFinalEnabled:  true,
@@ -284,7 +287,7 @@ func TestLiveStoreFinalLazyStateSkipsNonfinalLoader(t *testing.T) {
 
 func TestLiveStoreNonfinalUsesStateUpdateLazyOverlay(t *testing.T) {
 	store := &fakeLazyCellStore{cells: map[cell.Hash]*cell.Cell{}}
-	live := NewLiveStore(store, LiveStoreOptions{
+	live := NewLiveStore(store, liveview.Options{
 		MasterBlockCache: 8,
 		ShardBlockCache:  8,
 		NonFinalEnabled:  true,
@@ -578,7 +581,7 @@ func TestLiveStoreNonfinalValidatesWaitingCandidateOnce(t *testing.T) {
 		t.Fatalf("load promoted child state: %v", err)
 	}
 	_, candidates := live.NonfinalPendingShardBlocks(nil)
-	if len(candidates) != 1 || !blockIDEqual(candidates[0], child.Block) {
+	if len(candidates) != 1 || !blockproof.BlockIDEqual(candidates[0], child.Block) {
 		t.Fatalf("candidates = %+v, want child", candidates)
 	}
 }
@@ -644,7 +647,7 @@ func TestShardStateMasterRefReadsInlineStatsMasterRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load shard state master ref: %v", err)
 	}
-	if !blockIDEqual(got, master) {
+	if !blockproof.BlockIDEqual(got, master) {
 		t.Fatalf("master ref = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(master))
 	}
 }
@@ -703,7 +706,7 @@ func TestLiveStoreNonfinalDropsBlocksTooFarAheadOfCurrentMaster(t *testing.T) {
 	}
 
 	signed, candidates := live.NonfinalPendingShardBlocks(nil)
-	if len(signed) != 1 || !blockIDEqual(signed[0], within.Block) {
+	if len(signed) != 1 || !blockproof.BlockIDEqual(signed[0], within.Block) {
 		t.Fatalf("signed pending = %+v, want only within-lead block", signed)
 	}
 	if len(candidates) != 0 {
@@ -756,7 +759,7 @@ func TestHandleNonfinalPendingShardBlocksEnabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("response type = %T, want ton.NonfinalPendingShardBlocks", resp)
 	}
-	if len(blocks.SignedBlocks) != 1 || !blockIDEqual(*blocks.SignedBlocks[0], pending.Block) {
+	if len(blocks.SignedBlocks) != 1 || !blockproof.BlockIDEqual(*blocks.SignedBlocks[0], pending.Block) {
 		t.Fatalf("signed blocks = %+v, want pending", blocks.SignedBlocks)
 	}
 	if len(blocks.Candidates) != 0 {
@@ -787,7 +790,7 @@ func testNonfinalLiveStoreWithCurrent(t *testing.T) (*LiveStore, storage.LiveBlo
 func testNonfinalLiveStoreWithCurrentStore(t *testing.T, store Store) (*LiveStore, storage.LiveBlockArtifacts) {
 	t.Helper()
 
-	live := NewLiveStore(store, LiveStoreOptions{
+	live := NewLiveStore(store, liveview.Options{
 		MasterBlockCache: 8,
 		ShardBlockCache:  8,
 		NonFinalEnabled:  true,
@@ -1005,4 +1008,61 @@ func testNonfinalStateWithTracedRootRefs(t *testing.T, state *cell.Cell, refsFro
 		t.Fatalf("traced state hash mismatch")
 	}
 	return traced
+}
+
+// The node publishes live block artifacts from the block apply goroutines with
+// background prewarm workers configured, so the query path must be correct
+// while a freshly published block's view is still being prewarmed.
+func TestLiveStoreServesAccountStateWithBackgroundFragmentPrewarm(t *testing.T) {
+	accountID := bytes.Repeat([]byte{0x41}, 32)
+	code := cell.BeginCell().EndCell()
+	data := cell.BeginCell().EndCell()
+	base := ton.BlockIDExt{Workchain: masterchainID, Shard: masterchainShard, SeqNo: 4}
+	stateRoot, _ := testMasterStateWithActiveAccount(t, base, accountID, code, data)
+	block, blockRoot := testBlockForState(t, masterchainID, masterchainShard, base.SeqNo, stateRoot)
+	blockState := storage.BlockState{Block: block, StateRootHash: stateRoot.Hash(0), Cell: stateRoot}
+	backing := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(block): testBlockBOC(blockRoot),
+		},
+		blockStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(block): &blockState,
+		},
+	}
+
+	live := NewLiveStore(backing, liveview.Options{FragmentBuildWorkers: 1})
+	if err := live.PublishLiveBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:     block,
+		Root:      blockRoot,
+		BlockData: testBlockBOC(blockRoot),
+		State:     &blockState,
+	}); err != nil {
+		t.Fatalf("publish live block artifacts: %v", err)
+	}
+	live.SetLiveCurrentState(&storage.CurrentState{Masterchain: blockState})
+
+	srv := testServer(live)
+	state, err := srv.accountState(context.Background(), &block, ton.AccountID{Workchain: masterchainID, ID: accountID}, false)
+	if err != nil {
+		t.Fatalf("get account state while the view is prewarming: %v", err)
+	}
+	if state.State == nil {
+		t.Fatal("account state is empty")
+	}
+
+	// The prewarm still lands, so later queries reuse the published view.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fragments, err := live.BlockFragments(context.Background(), block)
+		if err != nil {
+			t.Fatalf("load block fragments: %v", err)
+		}
+		if fragments != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("block view was never installed")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

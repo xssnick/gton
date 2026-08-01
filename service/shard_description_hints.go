@@ -62,9 +62,6 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 	key := storage.BlockKey(ev.Block)
 
 	s.shardDescriptionMu.Lock()
-	if s.shardDescriptionHints == nil {
-		s.shardDescriptionHints = map[storage.BlockRootHash]shardDescriptionHint{}
-	}
 	if _, ok := s.shardDescriptionHints[key]; !ok {
 		s.shardDescriptionOrder = append(s.shardDescriptionOrder, key)
 	}
@@ -85,10 +82,6 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 }
 
 func (s *Service) rememberShardDescriptionProofs(hint shardDescriptionHint) {
-	if s.node == nil {
-		return
-	}
-
 	desc := hint.Description
 	proofs := make([]p2p.ShardDescriptionProof, 0, len(desc.Chain))
 	for _, link := range desc.Chain {
@@ -102,10 +95,6 @@ func (s *Service) rememberShardDescriptionProofs(hint shardDescriptionHint) {
 }
 
 func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) p2p.ShardBlockDescription {
-	if desc == nil {
-		return p2p.ShardBlockDescription{}
-	}
-
 	cloned := p2p.ShardBlockDescription{
 		Block:            cloneServiceBlockID(desc.Block),
 		CatchainSeqno:    desc.CatchainSeqno,
@@ -204,10 +193,6 @@ func (s *Service) pruneShardDescriptionHintsLocked(now time.Time) {
 }
 
 func (s *Service) signalShardDescriptionWake() {
-	if s.shardDescriptionWake == nil {
-		return
-	}
-
 	select {
 	case s.shardDescriptionWake <- struct{}{}:
 	default:

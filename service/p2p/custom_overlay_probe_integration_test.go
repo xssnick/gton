@@ -65,6 +65,12 @@ func (s *stubDHTBackend) FindAddresses(_ context.Context, key []byte) (*adnladdr
 	if err != nil {
 		return nil, nil, err
 	}
+	switch value := addr.(type) {
+	case *adnladdr.UDP:
+		addr = *value
+	case *adnladdr.UDP6:
+		addr = *value
+	}
 
 	now := int32(time.Now().Unix())
 	return &adnladdr.List{
@@ -140,16 +146,16 @@ func startProbeNodeHarness(t *testing.T, key ed25519.PrivateKey, listenAddr stri
 		privKey: key,
 		localID: probeTestPeerID(t, key),
 		gateway: gw,
-		pool:    newPeerPool(gw),
+		pool:    newPeerPool(gw, nil, nil, nil),
 		peerUse: map[PeerID]peerUse{},
 		dht:     backend,
 		runCtx:  ctx,
 	}
-	sub := &overlaySubscription{
-		node:  node,
-		spec:  spec,
-		log:   discardLogger(),
-		peers: map[PeerID]*overlayPeer{},
+	sub, err := node.newOverlaySubscription(spec)
+	if err != nil {
+		cancel()
+		_ = gw.Close()
+		t.Fatalf("create overlay subscription: %v", err)
 	}
 
 	harness := &probeNodeHarness{
@@ -235,8 +241,19 @@ func TestFixedProbeRecoveryEndToEnd(t *testing.T) {
 		t.Skip("integration test")
 	}
 
-	restore := shrinkFixedProbeTimings()
-	defer restore()
+	probePolicy := fixedProbePolicy{
+		minDelay:              40 * time.Millisecond,
+		timeout:               150 * time.Millisecond,
+		softFailures:          2,
+		silence:               250 * time.Millisecond,
+		softRecoveryCooldown:  200 * time.Millisecond,
+		hardMinSoftAttempts:   2,
+		hardSilence:           900 * time.Millisecond,
+		hardRecoveryCooldown:  500 * time.Millisecond,
+		pendingChannelTimeout: 900 * time.Millisecond,
+		rxStaleThreshold:      time.Hour,
+		rxStaleCooldown:       time.Hour,
+	}
 
 	keyASeed := make([]byte, ed25519.SeedSize)
 	keyBSeed := make([]byte, ed25519.SeedSize)
@@ -267,8 +284,6 @@ func TestFixedProbeRecoveryEndToEnd(t *testing.T) {
 
 	probeCtx, probeCancel := context.WithCancel(context.Background())
 	probeDone := make(chan struct{})
-	// The driver goroutine reads the shrunken timing variables, so it must
-	// finish before the deferred restore rewrites them.
 	defer func() {
 		probeCancel()
 		<-probeDone
@@ -283,10 +298,10 @@ func TestFixedProbeRecoveryEndToEnd(t *testing.T) {
 				// re-attached instead of stalling the harness.
 				nodeA.sub.startPeerDiscovery(probeCtx)
 			}
-			nodeA.sub.probeFixedPeers(probeCtx)
+			nodeA.sub.probeFixedPeers(probeCtx, probePolicy)
 			select {
 			case <-probeCtx.Done():
-			case <-time.After(40 * time.Millisecond):
+			case <-time.After(probePolicy.minDelay):
 			}
 		}
 	}()
@@ -328,47 +343,4 @@ func TestFixedProbeRecoveryEndToEnd(t *testing.T) {
 		}
 		return peer.statsSnapshot().lastPongAt.After(revivedAt)
 	})
-}
-
-func shrinkFixedProbeTimings() func() {
-	prevProbeMinDelay := fixedProbeMinDelay
-	prevProbeJitter := fixedProbeJitter
-	prevProbeTimeout := fixedProbeTimeout
-	prevSoftFailures := fixedProbeSoftFailures
-	prevProbeSilence := fixedProbeSilence
-	prevSoftCooldown := fixedSoftRecoveryCooldown
-	prevHardMinSoft := fixedHardMinSoftAttempts
-	prevHardSilence := fixedHardSilence
-	prevHardCooldown := fixedHardRecoveryCooldown
-	prevPendingChannelTimeout := fixedPendingChannelTimeout
-	prevRxStale := fixedRxStaleThreshold
-	prevRxStaleCooldown := fixedRxStaleCooldown
-
-	fixedProbeMinDelay = 40 * time.Millisecond
-	fixedProbeJitter = 0
-	fixedProbeTimeout = 150 * time.Millisecond
-	fixedProbeSoftFailures = 2
-	fixedProbeSilence = 250 * time.Millisecond
-	fixedSoftRecoveryCooldown = 200 * time.Millisecond
-	fixedHardMinSoftAttempts = 2
-	fixedHardSilence = 900 * time.Millisecond
-	fixedHardRecoveryCooldown = 500 * time.Millisecond
-	fixedPendingChannelTimeout = 900 * time.Millisecond
-	fixedRxStaleThreshold = time.Hour
-	fixedRxStaleCooldown = time.Hour
-
-	return func() {
-		fixedProbeMinDelay = prevProbeMinDelay
-		fixedProbeJitter = prevProbeJitter
-		fixedProbeTimeout = prevProbeTimeout
-		fixedProbeSoftFailures = prevSoftFailures
-		fixedProbeSilence = prevProbeSilence
-		fixedSoftRecoveryCooldown = prevSoftCooldown
-		fixedHardMinSoftAttempts = prevHardMinSoft
-		fixedHardSilence = prevHardSilence
-		fixedHardRecoveryCooldown = prevHardCooldown
-		fixedPendingChannelTimeout = prevPendingChannelTimeout
-		fixedRxStaleThreshold = prevRxStale
-		fixedRxStaleCooldown = prevRxStaleCooldown
-	}
 }

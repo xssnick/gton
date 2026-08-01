@@ -8,17 +8,16 @@ import (
 )
 
 const (
-	messageCacheTTL        = time.Minute
-	messageCacheMaxEntries = 1 << 17
-	messageCacheShards     = 64
+	messageCacheTTL             = time.Minute
+	messageCacheMaxEntries      = 1 << 17
+	messageCacheShards          = 64
+	messageCacheEntriesPerShard = (messageCacheMaxEntries + messageCacheShards - 1) / messageCacheShards
 )
 
 var messageCRC64Table = crc64.MakeTable(crc64.ECMA)
 
 type MessageCache struct {
-	ttl        time.Duration
-	maxEntries int
-	shards     [messageCacheShards]messageCacheShard
+	shards [messageCacheShards]messageCacheShard
 }
 
 type messageCacheShard struct {
@@ -34,10 +33,7 @@ type messageCacheEntry struct {
 }
 
 func NewMessageCache() *MessageCache {
-	cache := &MessageCache{
-		ttl:        messageCacheTTL,
-		maxEntries: messageCacheMaxEntries,
-	}
+	cache := &MessageCache{}
 	for i := range cache.shards {
 		cache.shards[i] = messageCacheShard{
 			seen:  map[uint64]*messageCacheEntry{},
@@ -53,13 +49,13 @@ func (c *MessageCache) Mark(key uint64, now time.Time) bool {
 	defer shard.mx.Unlock()
 
 	if entry := shard.seen[key]; entry != nil {
-		if now.Sub(entry.seenAt) < c.ttl {
+		if now.Sub(entry.seenAt) < messageCacheTTL {
 			return false
 		}
 		entry.seenAt = now
 		shard.order.MoveToBack(entry.element)
-		shard.pruneExpiredLocked(now, c.ttl)
-		shard.pruneOverflowLocked(c.maxEntriesPerShard())
+		shard.pruneExpiredLocked(now, messageCacheTTL)
+		shard.pruneOverflowLocked(messageCacheEntriesPerShard)
 		return true
 	}
 
@@ -70,8 +66,8 @@ func (c *MessageCache) Mark(key uint64, now time.Time) bool {
 	entry.element = shard.order.PushBack(entry)
 	shard.seen[key] = entry
 
-	shard.pruneExpiredLocked(now, c.ttl)
-	shard.pruneOverflowLocked(c.maxEntriesPerShard())
+	shard.pruneExpiredLocked(now, messageCacheTTL)
+	shard.pruneOverflowLocked(messageCacheEntriesPerShard)
 	return true
 }
 
@@ -85,13 +81,6 @@ func (c *MessageCache) Drop(key uint64) {
 
 func (c *MessageCache) shard(key uint64) *messageCacheShard {
 	return &c.shards[key&(messageCacheShards-1)]
-}
-
-func (c *MessageCache) maxEntriesPerShard() int {
-	if c.maxEntries <= 0 {
-		return 0
-	}
-	return (c.maxEntries + messageCacheShards - 1) / messageCacheShards
 }
 
 func MessageCacheKey(body []byte) uint64 {
@@ -116,9 +105,6 @@ func (s *messageCacheShard) pruneOverflowLocked(maxEntries int) {
 	}
 	for len(s.seen) > maxEntries {
 		elem := s.order.Front()
-		if elem == nil {
-			return
-		}
 		s.deleteEntryLocked(elem.Value.(*messageCacheEntry))
 	}
 }
@@ -128,8 +114,6 @@ func (s *messageCacheShard) deleteEntryLocked(entry *messageCacheEntry) {
 		return
 	}
 	delete(s.seen, entry.key)
-	if elem := entry.element; elem != nil {
-		s.order.Remove(elem)
-		entry.element = nil
-	}
+	s.order.Remove(entry.element)
+	entry.element = nil
 }

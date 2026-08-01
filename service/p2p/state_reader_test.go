@@ -403,9 +403,14 @@ func testPersistentStateChunkDownloader(rldpClient *testArchiveRLDP) (persistent
 		node: node,
 		spec: overlaySpec{ShortID: []byte{0x01}},
 	})
+	rldpOverlay := overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01})
 	peer := &overlayPeer{
 		addr:        "state-reader-peer",
-		rldpOverlay: overlay.CreateExtendedRLDP(rldpClient).CreateOverlay([]byte{0x01}),
+		rldpOverlay: rldpOverlay,
+		queryTransport: rldpPeerQueryTransport{
+			overlay:   rldpOverlay,
+			overlayID: []byte{0x01},
+		},
 	}
 	id := PersistentStateIDV2{
 		Block:            block,

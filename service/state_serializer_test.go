@@ -196,7 +196,7 @@ func TestStateSerializerPersistsRawSplitRefs(t *testing.T) {
 		t.Fatalf("serialize split root with effective refs: %v", err)
 	}
 
-	gotRoot, err := cell.FromBOC(got.Bytes())
+	gotRoot, err := cell.FromBOCWithOptions(got.Bytes(), cell.BOCParseOptions{AllowNonZeroLevelRoot: true})
 	if err != nil {
 		t.Fatalf("parse serialized split root: %v", err)
 	}

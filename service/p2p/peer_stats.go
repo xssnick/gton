@@ -26,12 +26,11 @@ type peerStats struct {
 	downloadSlowUntil time.Time
 	lastPongAt        time.Time
 	probeFailures     uint32
+	queryResponds     bool
+	queryIgnoreUntil  time.Time
 }
 
 func (p *overlayPeer) hasOpenConnection() bool {
-	if p == nil || p.overlay == nil {
-		return false
-	}
 	if p.overlay.ADNLWrapper == nil || p.overlay.ADNL == nil {
 		return true
 	}
@@ -74,13 +73,22 @@ func (p *overlayPeer) isAliveKnownOverlayPeer(now time.Time) bool {
 }
 
 func (p *overlayPeer) advertisedNodeSnapshot(now time.Time) *overlay.Node {
+	return cloneOverlayNode(p.advertisedNodeRef(now))
+}
+
+// advertisedNodeRef is advertisedNodeSnapshot without the copy. p.announced is
+// only ever replaced by mergeAnnouncement, never mutated in place, so the
+// returned node is safe to read after the lock is dropped - but it must not be
+// handed to a caller that mutates or retains it, hence the clone above for
+// everyone who does not clone the selection itself.
+func (p *overlayPeer) advertisedNodeRef(now time.Time) *overlay.Node {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
 	if p.pending || p.announced == nil || !announcedNodeIsFresh(p.announced, now) || !p.alive {
 		return nil
 	}
-	return cloneOverlayNode(p.announced)
+	return p.announced
 }
 
 func (p *overlayPeer) mergeAnnouncement(v1 *overlay.Node) {
@@ -112,6 +120,8 @@ func (p *overlayPeer) statsSnapshot() peerStats {
 		downloadSlowUntil: p.downloadSlowUntil,
 		lastPongAt:        p.lastPongAt,
 		probeFailures:     p.probeFailures,
+		queryResponds:     p.queryResponds,
+		queryIgnoreUntil:  p.queryIgnoreUntil,
 	}
 }
 
@@ -124,7 +134,53 @@ func (p *overlayPeer) applyCapabilities(cap Capabilities) {
 	p.capabilitiesFlags = cap.Flags
 }
 
+func (p *overlayPeer) queryProbeSuccess(cap Capabilities, rtt time.Duration) (bool, bool) {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	becameReady := !p.queryResponds
+	p.versionMajor = cap.VersionMajor
+	p.versionMinor = cap.VersionMinor
+	p.capabilitiesFlags = cap.Flags
+	p.queryResponds = true
+
+	promoted := p.noteSuccessLocked(time.Now())
+	if rtt <= 0 {
+		return promoted, becameReady
+	}
+	if p.roundtrip == 0 {
+		p.roundtrip = rtt
+		return promoted, becameReady
+	}
+	p.roundtrip = (p.roundtrip + rtt) / 2
+	return promoted, becameReady
+}
+
+func (p *overlayPeer) queryProbeFailed() bool {
+	p.statsMx.Lock()
+	changed := p.queryResponds
+	p.queryResponds = false
+	p.statsMx.Unlock()
+	return changed
+}
+
+func (p *overlayPeer) ignoreApplicationQueries(until time.Time) {
+	p.statsMx.Lock()
+	p.queryIgnoreUntil = until
+	p.statsMx.Unlock()
+}
+
+func (p *overlayPeer) queryReady(now time.Time, requiredVersionMajor, requiredVersionMinor int32) bool {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	return p.queryResponds &&
+		!now.Before(p.queryIgnoreUntil) &&
+		peerEligibleVersion(p.versionMajor, p.versionMinor, requiredVersionMajor, requiredVersionMinor)
+}
+
 func (p *overlayPeer) querySuccess(rtt time.Duration) bool {
+	p.outboundOK.Store(true)
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
@@ -170,7 +226,6 @@ func (p *overlayPeer) downloadSuccess(bytes int64, elapsed time.Duration, slowTh
 	defer p.statsMx.Unlock()
 
 	now := time.Now()
-	p.noteSuccessLocked(now)
 	p.downloadCount++
 	if p.downloadBytesSec == 0 {
 		p.downloadBytesSec = speed
@@ -274,9 +329,6 @@ func (s *overlaySubscription) preferredPeers(requiredVersionMajor, requiredVersi
 	known := s.knownPeersSnapshot()
 	candidates := make([]*overlayPeer, 0, len(known))
 	for _, peer := range known {
-		if peer.overlay == nil {
-			continue
-		}
 		if !peerEligible(peer.statsSnapshot(), requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
@@ -302,7 +354,15 @@ func (s *overlaySubscription) orderPreferredPeers(candidates []*overlayPeer, req
 
 	selected := make([]*overlayPeer, 0, len(candidates))
 	for len(remaining) > 0 {
-		idx := s.choosePeerIndex(remaining, requiredVersionMajor, requiredVersionMinor)
+		// The weighted draw is quadratic, and no consumer randomises deeper
+		// than a couple of dozen candidates (the largest peer limit in the
+		// tree is 24, and hedgedQueryCandidates already re-sorts the tail
+		// deterministically). Past the limit fall through to the same
+		// preference sort the ineligible-tail branch below uses.
+		idx := -1
+		if len(selected) < weightedPeerDrawLimit {
+			idx = s.choosePeerIndex(remaining, requiredVersionMajor, requiredVersionMinor)
+		}
 		if idx < 0 {
 			sortRankedPeersByPreference(remaining)
 			for _, ranked := range remaining {
@@ -312,7 +372,11 @@ func (s *overlaySubscription) orderPreferredPeers(candidates []*overlayPeer, req
 		}
 
 		selected = append(selected, remaining[idx].peer)
-		remaining = append(remaining[:idx], remaining[idx+1:]...)
+		// Swap-remove: every scan below is order-independent, and the fallback
+		// sort tie-breaks on peer id (a total order), so compacting the slice
+		// would only pay an O(n) memmove per selected peer for nothing.
+		remaining[idx] = remaining[len(remaining)-1]
+		remaining = remaining[:len(remaining)-1]
 	}
 	return selected
 }
@@ -322,13 +386,18 @@ func (s *overlaySubscription) choosePeerIndex(peers []rankedPeer, requiredVersio
 		return -1
 	}
 
+	// Everything below iterates by index: rankedPeer embeds peerStats (five
+	// time.Time fields), so ranging by value copies ~200 bytes per peer per
+	// scan, and this runs once per selected peer — quadratic in the roster,
+	// which is now 300 rather than 20.
 	minUnreliability := math.MaxFloat64
-	for _, ranked := range peers {
-		if !peerEligible(ranked.stats, requiredVersionMajor, requiredVersionMinor) {
+	for i := range peers {
+		stats := &peers[i].stats
+		if !peerEligibleVersion(stats.versionMajor, stats.versionMinor, requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
-		if ranked.stats.unreliability < minUnreliability {
-			minUnreliability = ranked.stats.unreliability
+		if stats.unreliability < minUnreliability {
+			minUnreliability = stats.unreliability
 		}
 	}
 	if minUnreliability == math.MaxFloat64 {
@@ -338,9 +407,9 @@ func (s *overlaySubscription) choosePeerIndex(peers []rankedPeer, requiredVersio
 
 	best := -1
 	var sum uint32
-	for idx, ranked := range peers {
-		stats := ranked.stats
-		if !peerEligible(stats, requiredVersionMajor, requiredVersionMinor) {
+	for idx := range peers {
+		stats := &peers[idx].stats
+		if !peerEligibleVersion(stats.versionMajor, stats.versionMinor, requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
 
@@ -368,12 +437,14 @@ func (s *overlaySubscription) choosePeerIndex(peers []rankedPeer, requiredVersio
 
 func minRankedPeerRoundtrip(peers []rankedPeer, requiredVersionMajor, requiredVersionMinor int32) time.Duration {
 	var minRTT time.Duration
-	for _, ranked := range peers {
-		if !peerEligible(ranked.stats, requiredVersionMajor, requiredVersionMinor) || ranked.stats.roundtrip <= 0 {
+	for i := range peers {
+		stats := &peers[i].stats
+		if stats.roundtrip <= 0 ||
+			!peerEligibleVersion(stats.versionMajor, stats.versionMinor, requiredVersionMajor, requiredVersionMinor) {
 			continue
 		}
-		if minRTT == 0 || ranked.stats.roundtrip < minRTT {
-			minRTT = ranked.stats.roundtrip
+		if minRTT == 0 || stats.roundtrip < minRTT {
+			minRTT = stats.roundtrip
 		}
 	}
 	return minRTT
@@ -397,8 +468,12 @@ func peerRoundtripPenalty(roundtrip, minRoundtrip time.Duration) uint32 {
 }
 
 func peerEligible(stats peerStats, requiredVersionMajor, requiredVersionMinor int32) bool {
-	return stats.versionMajor > requiredVersionMajor ||
-		(stats.versionMajor == requiredVersionMajor && stats.versionMinor >= requiredVersionMinor)
+	return peerEligibleVersion(stats.versionMajor, stats.versionMinor, requiredVersionMajor, requiredVersionMinor)
+}
+
+func peerEligibleVersion(versionMajor, versionMinor, requiredVersionMajor, requiredVersionMinor int32) bool {
+	return versionMajor > requiredVersionMajor ||
+		(versionMajor == requiredVersionMajor && versionMinor >= requiredVersionMinor)
 }
 
 func nextNeighbourReloadDelay() time.Duration {
@@ -466,13 +541,6 @@ func peerRoundtripLess(left, right peerStats) bool {
 	return left.roundtrip < right.roundtrip
 }
 
-func nextPeerPingDelay() time.Duration {
-	if peerPingJitter <= 0 {
-		return peerPingMinDelay
-	}
-	return peerPingMinDelay + time.Duration(rand.Int64N(int64(peerPingJitter)))
-}
-
 func nextDHTSeedCooldownDelay() time.Duration {
 	if dhtSeedCooldownJitter <= 0 {
 		return dhtSeedCooldownMinDelay
@@ -506,16 +574,27 @@ func (s *overlaySubscription) refreshTargets() []*overlayPeer {
 	return peers
 }
 
-func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
+func (s *overlaySubscription) publicQueryCandidates(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
 	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
 	others := s.preferredPeers(requiredVersionMajor, requiredVersionMinor)
-	return mergePeerCandidates(neighbours, others)
+	peers := mergePeerCandidates(neighbours, others)
+	if len(peers) > 0 {
+		return peers
+	}
+
+	// C++ has a direct random-peer fallback after its neighbour roster is
+	// exhausted. It may still return a previously verified alive peer whose
+	// announcement is older than the normal 10-minute admission window.
+	return s.publicRandomQueryFallback(requiredVersionMajor, requiredVersionMinor)
 }
 
 func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requiredVersionMinor int32, limit int) []*overlayPeer {
 	peers := s.queryCandidates(requiredVersionMajor, requiredVersionMinor)
 	if limit <= 0 || len(peers) <= limit {
 		return peers
+	}
+	if s.spec.preservesQueryCandidateOrder() {
+		return peers[:limit]
 	}
 
 	neighbours := s.preferredNeighbourPeers(requiredVersionMajor, requiredVersionMinor)
@@ -540,40 +619,54 @@ func (s *overlaySubscription) hedgedQueryCandidates(requiredVersionMajor, requir
 // may be: FEC relay peer sets are consulted for every received FEC part, so
 // the set is rebuilt at most once per TTL instead of per part. Membership
 // changes additionally invalidate the cache via notifyPeersChangedLocked.
+// weightedPeerDrawLimit bounds how many peers are drawn with the O(n) weighted
+// selection; the remainder is appended in deterministic preference order.
+const weightedPeerDrawLimit = 32
+
 const broadcastTargetsTTL = 200 * time.Millisecond
 
 type broadcastTargetsSnapshot struct {
-	builtAt   time.Time
-	peers     []*overlayPeer
-	broadcast []overlay.BroadcastPeer
+	generation uint64
+	builtAt    time.Time
+	peers      []*overlayPeer
+	broadcast  []overlay.BroadcastPeer
+	// relay is the bounded subset of broadcast used to forward FEC parts of
+	// somebody else's broadcast. It must stay small and independent of the
+	// roster size: the relay fires per received FEC part, so a roster-sized
+	// set multiplies egress by the roster (C++ forwards each part to
+	// propagate_broadcast_to=5 of its neighbours regardless of peer count).
+	relay    []overlay.BroadcastPeer
+	plumtree []PeerID
 }
 
-// rebroadcastCandidates returns the deduplicated union of neighbour and known
-// peers: alive ones when any exist, everything known otherwise. All consumers
-// either contact every returned peer or sample from it randomly, so no
-// preference ordering is computed. The slice is cached and shared between
-// callers - it must not be modified.
-func (s *overlaySubscription) rebroadcastCandidates() []*overlayPeer {
-	return s.broadcastTargetsSnapshot().peers
-}
-
-// broadcastPeersSnapshot is rebroadcastCandidates converted for tonutils-go
-// broadcast senders, under the same shared-slice contract.
-func (s *overlaySubscription) broadcastPeersSnapshot() []overlay.BroadcastPeer {
-	return s.broadcastTargetsSnapshot().broadcast
-}
-
+// broadcastTargetsSnapshot returns the deduplicated union of neighbour and
+// known peers: alive ones when any exist, everything known otherwise. The
+// slices are cached and shared between callers and must not be modified.
 func (s *overlaySubscription) broadcastTargetsSnapshot() *broadcastTargetsSnapshot {
-	if snap := s.broadcastTargets.Load(); snap != nil && time.Since(snap.builtAt) < broadcastTargetsTTL {
+	generation := s.broadcastTargetsGen.Load()
+	if snap := s.broadcastTargets.Load(); snap != nil && snap.generation == generation && time.Since(snap.builtAt) < broadcastTargetsTTL {
 		return snap
 	}
 
+	s.broadcastTargetsMx.Lock()
+	defer s.broadcastTargetsMx.Unlock()
+
+	generation = s.broadcastTargetsGen.Load()
+	if snap := s.broadcastTargets.Load(); snap != nil && snap.generation == generation && time.Since(snap.builtAt) < broadcastTargetsTTL {
+		return snap
+	}
+
+	// A membership change during the build leaves the snapshot stamped with
+	// the older generation, so the next caller rebuilds; consumers already
+	// tolerate snapshots up to the TTL stale.
 	snap := s.buildBroadcastTargetsSnapshot()
+	snap.generation = generation
 	s.broadcastTargets.Store(snap)
 	return snap
 }
 
 func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsSnapshot {
+	now := time.Now()
 	neighbours := s.neighbourPeerSnapshots()
 	known := s.knownPeersSnapshot()
 
@@ -581,32 +674,89 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 	all := make([]*overlayPeer, 0, capacity)
 	alive := make([]*overlayPeer, 0, capacity)
 	seen := make(map[PeerID]struct{}, capacity)
-	for _, list := range [2][]*overlayPeer{neighbours, known} {
+	// Neighbours are iterated first and dedup keeps the first occurrence, so
+	// they form a prefix of both lists; these are the prefix lengths.
+	allNeighbours, aliveNeighbours := 0, 0
+	for listIdx, list := range [2][]*overlayPeer{neighbours, known} {
 		for _, peer := range list {
 			if _, ok := seen[peer.id]; ok {
 				continue
 			}
 			seen[peer.id] = struct{}{}
 			all = append(all, peer)
+			isNeighbour := listIdx == 0
+			if isNeighbour {
+				allNeighbours++
+			}
 			if peer.statsSnapshot().alive {
 				alive = append(alive, peer)
+				if isNeighbour {
+					aliveNeighbours++
+				}
 			}
 		}
 	}
 
-	peers := all
+	peers, neighbourPrefix := all, allNeighbours
 	if len(alive) > 0 {
-		peers = alive
+		peers, neighbourPrefix = alive, aliveNeighbours
 	}
 
+	receivers := make([]*overlayPeer, 0, len(peers))
 	broadcast := make([]overlay.BroadcastPeer, 0, len(peers))
-	for _, peer := range peers {
-		if peer.overlay == nil {
+	plumtree := make([]PeerID, 0, len(peers))
+	// Kept in sync with the neighbour prefix as the fastSync filter drops peers.
+	neighbourTargets := 0
+	for i, peer := range peers {
+		if s.fastSync != nil &&
+			!s.fastSync.peerReceivesBroadcasts(peer.id) {
 			continue
 		}
-		broadcast = append(broadcast, peer.overlay)
+		if i < neighbourPrefix {
+			neighbourTargets++
+		}
+		receivers = append(receivers, peer)
+		broadcast = append(broadcast, peer.broadcastPeer)
+		if peer.route.quicReady(now) {
+			plumtree = append(plumtree, peer.id)
+		}
 	}
-	return &broadcastTargetsSnapshot{builtAt: time.Now(), peers: peers, broadcast: broadcast}
+	return &broadcastTargetsSnapshot{
+		builtAt:   now,
+		peers:     receivers,
+		broadcast: broadcast,
+		relay:     sampleBroadcastRelayTargets(broadcast, neighbourTargets),
+		plumtree:  plumtree,
+	}
+}
+
+// sampleBroadcastRelayTargets picks the bounded relay set: a random sample of
+// the neighbour prefix, topped up from the rest of the roster when there are
+// not enough neighbours. Runs at most once per broadcastTargetsTTL, never per
+// broadcast part.
+func sampleBroadcastRelayTargets(broadcast []overlay.BroadcastPeer, neighbourTargets int) []overlay.BroadcastPeer {
+	if len(broadcast) <= broadcastFECRelayFanout {
+		return broadcast
+	}
+	if neighbourTargets > len(broadcast) {
+		neighbourTargets = len(broadcast)
+	}
+
+	pool := make([]overlay.BroadcastPeer, len(broadcast))
+	copy(pool, broadcast)
+	// Partial Fisher-Yates over the neighbour prefix first, then over the
+	// remainder, so neighbours fill the sample before anyone else.
+	relay := make([]overlay.BroadcastPeer, 0, broadcastFECRelayFanout)
+	take := func(from, to int) {
+		for i := from; i < to && len(relay) < broadcastFECRelayFanout; i++ {
+			j := i + rand.IntN(to-i)
+			pool[i], pool[j] = pool[j], pool[i]
+			relay = append(relay, pool[i])
+		}
+	}
+	take(0, neighbourTargets)
+	take(neighbourTargets, len(pool))
+	return relay
 }
 
 func mergePeerCandidates(first, second []*overlayPeer) []*overlayPeer {

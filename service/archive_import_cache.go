@@ -53,11 +53,6 @@ func newArchiveImportCache() *archiveImportCache {
 }
 
 func (c *archiveImportCache) load(ctx context.Context, key archiveImportCacheKey, load func(context.Context) (*archiveImportResult, error)) (archiveImportDownload, error) {
-	if c == nil {
-		imported, err := load(ctx)
-		return archiveImportDownload{imported: imported}, err
-	}
-
 	for {
 		loaded, err := c.loadOnce(ctx, key, load)
 		if !loaded.retry {
@@ -106,10 +101,17 @@ func (c *archiveImportCache) loadOnce(ctx context.Context, key archiveImportCach
 	result, err := load(ctx)
 
 	c.mu.Lock()
-	if err == nil && result != nil {
-		c.entries[key] = cloneArchiveImportResult(result)
+	// One owned clone serves as both the cache entry and the waiters' source:
+	// every waiter clones it again before returning (see the waiter branch
+	// above), so it is only ever read through a clone and never escapes shared.
+	// On error waiter.result is unreachable, since the waiter branch returns on
+	// waiter.err first.
+	var cached *archiveImportResult
+	if err == nil {
+		cached = cloneArchiveImportResult(result)
+		c.entries[key] = cached
 	}
-	waiter.result = cloneArchiveImportResult(result)
+	waiter.result = cached
 	waiter.err = err
 	delete(c.waiters, key)
 	close(waiter.done)
@@ -119,20 +121,12 @@ func (c *archiveImportCache) loadOnce(ctx context.Context, key archiveImportCach
 }
 
 func (c *archiveImportCache) drop(key archiveImportCacheKey) {
-	if c == nil {
-		return
-	}
-
 	c.mu.Lock()
 	delete(c.entries, key)
 	c.mu.Unlock()
 }
 
 func (c *archiveImportCache) dropBefore(masterchainSeqno uint32) {
-	if c == nil {
-		return
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -144,19 +138,12 @@ func (c *archiveImportCache) dropBefore(masterchainSeqno uint32) {
 }
 
 func (c *archiveImportCache) stats() (int, uint64) {
-	if c == nil {
-		return 0, 0
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.entries), c.hitCount
 }
 
 func cloneImportStats(stats *archive.ImportStats) *archive.ImportStats {
-	if stats == nil {
-		return &archive.ImportStats{}
-	}
 	cloned := *stats
 	return &cloned
 }
@@ -173,9 +160,7 @@ func cloneArchiveImportResult(result *archiveImportResult) *archiveImportResult 
 		cacheKey:   result.cacheKey,
 	}
 	for key, block := range result.blocks {
-		if block.Meta != nil {
-			block.Meta = block.Meta.Clone()
-		}
+		block.Meta = block.Meta.Clone()
 		cloned.blocks[key] = block
 	}
 	return cloned

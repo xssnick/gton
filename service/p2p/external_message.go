@@ -8,26 +8,13 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
+	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
-
-const maxExternalMessageBOCCells = 1 << 17
-
-func (s *overlaySubscription) serveSendExtMessage(ctx context.Context, msg tonnodeapi.ExternalMessage) (tl.Serializable, error) {
-	parsed, err := parseExternalMessageData(msg.Data)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.node.sendExternalMessage(ctx, msg.Data, parsed.address, parsed.root, parsed.message, false, false); err != nil {
-		return nil, err
-	}
-	return Success{}, nil
-}
 
 func (n *Node) SendExternalMessage(ctx context.Context, data []byte, dst *address.Address) error {
 	if n.IsOffline() {
@@ -107,9 +94,6 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 	if err != nil {
 		return err
 	}
-	if n.externalBroadcastPacer == nil {
-		return n.enqueueExternalMessageTargets(addrKey, pending, payload, now)
-	}
 
 	costBytes := externalBroadcastCostBytes(pending, len(payload))
 	if err = n.externalBroadcastPacer.Wait(ctx, costBytes); err != nil {
@@ -134,10 +118,6 @@ func (n *Node) acceptCheckedExternalMessage(ctx context.Context, event ExternalM
 		return nil
 	}
 	return n.externalMessageAdmission.AcceptCheckedExternalMessage(ctx, event)
-}
-
-func (n *Node) runtimeContext() context.Context {
-	return n.runCtx
 }
 
 type externalMessageTarget struct {
@@ -165,7 +145,7 @@ func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets 
 		queued++
 	}
 	if queued == 0 {
-		n.dropExternalMessageAddressLimit(addrKey, now)
+		n.externalMessageLimiter.Remove(addrKey, now)
 		return errors.New("local external message rebroadcast queues are full")
 	}
 	return nil
@@ -174,9 +154,6 @@ func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets 
 func externalBroadcastCostBytes(targets []externalMessageTarget, payloadLen int) int64 {
 	var cost int64
 	for _, target := range targets {
-		if target.sub == nil {
-			continue
-		}
 		req := rebroadcastRequest{
 			subscription: target.sub,
 			kind:         "tonNode.externalMessageBroadcast",
@@ -211,7 +188,7 @@ func (n *Node) customExternalMessageTargets(addrKey extmsg.AddressKey, data []by
 	targets := make([]externalMessageTarget, 0)
 	skipPublic := false
 	for _, sub := range n.subscriptionsSnapshot() {
-		if sub == nil || sub.spec.Kind != overlayKindCustomFixed || !sub.isActive() {
+		if sub == nil || !sub.spec.originatesLocalBroadcasts() || !sub.isActive() {
 			continue
 		}
 		if _, ok := sub.spec.MsgSenders[n.localID]; !ok {
@@ -245,7 +222,10 @@ func (n *Node) subscriptionForWorkchain(workchain int32) (*overlaySubscription, 
 		return nil, err
 	}
 
-	sub, _ := n.getOrCreateSubscription(spec)
+	sub, err := n.getOrCreateSubscription(spec)
+	if err != nil {
+		return nil, err
+	}
 	sub.setActive(true, time.Time{})
 	n.startSubscription(sub)
 	return sub, nil
@@ -258,51 +238,15 @@ type parsedExternalMessage struct {
 }
 
 func parseExternalMessageData(data []byte) (parsedExternalMessage, error) {
-	root, message, err := parseExternalMessageRoot(data)
+	root, message, err := externalmsg.ParseMessage(data)
 	if err != nil {
 		return parsedExternalMessage{}, err
 	}
 	return parsedExternalMessage{
 		root:    root,
 		message: message,
-		address: externalMessageAddressKey(message.DstAddr),
+		address: externalmsg.AddressKey(message.DstAddr),
 	}, nil
-}
-
-func parseExternalMessageRoot(data []byte) (*cell.Cell, *tlb.ExternalMessage, error) {
-	root, err := cell.FromBOCWithOptions(data, cell.BOCParseOptions{
-		MaxCells: maxExternalMessageBOCCells,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse external message BOC: %w", err)
-	}
-
-	loader, err := root.BeginParse()
-	if err != nil {
-		return nil, nil, fmt.Errorf("begin parse external message: %w", err)
-	}
-
-	magic, err := loader.PreloadUInt(2)
-	if err != nil || magic != 0b10 {
-		return nil, nil, errors.New("external message must begin with ext_in_msg_info$10")
-	}
-	var msg tlb.ExternalMessage
-	if err = tlb.LoadFromCell(&msg, loader); err != nil {
-		return nil, nil, fmt.Errorf("parse external message: %w", err)
-	}
-	if msg.DstAddr == nil {
-		return nil, nil, errors.New("external message has no destination address")
-	}
-	if msg.DstAddr.Type() != address.StdAddress || msg.DstAddr.BitsLen() != 256 {
-		return nil, nil, errors.New("external message destination address is not a std 256-bit address")
-	}
-	return root, &msg, nil
-}
-
-func externalMessageAddressKey(addr *address.Address) extmsg.AddressKey {
-	key := extmsg.AddressKey{Workchain: addr.Workchain()}
-	copy(key.Account[:], addr.Data())
-	return key
 }
 
 func checkedExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey, error) {
@@ -312,7 +256,7 @@ func checkedExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey,
 	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
 		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
 	}
-	return externalMessageAddressKey(addr), nil
+	return externalmsg.AddressKey(addr), nil
 }
 
 func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {
@@ -321,8 +265,4 @@ func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Ti
 		return nil
 	}
 	return fmt.Errorf("%w %d:%x", err, key.Workchain, key.Account[:])
-}
-
-func (n *Node) dropExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) {
-	n.externalMessageLimiter.Remove(key, now)
 }

@@ -31,19 +31,16 @@ func TestMessageCacheMarkDropAndExpiry(t *testing.T) {
 
 func TestMessageCachePrunesOverflowPerShard(t *testing.T) {
 	cache := NewMessageCache()
-	cache.maxEntries = messageCacheShards
 	now := time.Unix(1700000000, 0)
 
 	first := uint64(7)
-	second := first + messageCacheShards
-
-	if !cache.Mark(first, now) {
-		t.Fatal("first mark should accept message")
+	for i := 0; i <= messageCacheEntriesPerShard; i++ {
+		key := first + uint64(i*messageCacheShards)
+		if !cache.Mark(key, now.Add(time.Duration(i)*time.Millisecond)) {
+			t.Fatalf("mark %d should accept message", i)
+		}
 	}
-	if !cache.Mark(second, now.Add(time.Second)) {
-		t.Fatal("second mark should accept message")
-	}
-	if !cache.Mark(first, now.Add(2*time.Second)) {
+	if !cache.Mark(first, now.Add(3*time.Second)) {
 		t.Fatal("oldest same-shard message should be pruned on overflow")
 	}
 }

@@ -68,6 +68,9 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				continue
 			}
 
+			// Taken before the attempt so a block published while it runs is
+			// not waited out by the retry below.
+			stateWake := s.currentStateWakeChan()
 			downloadStarted := time.Now()
 			downloaded, err := s.downloadNextChainBlock(ctx, prev)
 			downloadElapsed := time.Since(downloadStarted)
@@ -82,7 +85,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 						Str("target", storage.FormatBlockRef(target)).
 						Dur("retry_in", shardStateCatchUpRetryDelay).
 						Msg("retry chain block download")
-					if err = s.waitShardStateCatchUpRetry(ctx, shardStateCatchUpRetryDelay); err != nil {
+					if err = s.waitShardStateCatchUpRetry(ctx, stateWake, shardStateCatchUpRetryDelay); err != nil {
 						return
 					}
 					continue
@@ -105,7 +108,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 			}
 
 			prepareStarted := time.Now()
-			verified, err := verifyDownloadedBlock(downloaded)
+			verified, err := s.verifyDownloadedBlock(downloaded)
 			if err != nil {
 				s.sendShardStateDownload(ctx, downloads, shardStateDownload{
 					err:             err,
@@ -125,6 +128,9 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 				})
 				return
 			}
+			// Off the serial apply goroutine: pay for the signature batch here
+			// so apply keeps only the hash checks.
+			s.preverifyMasterchainConsensusSignatures(prepared.consensus)
 			prepared.PrepareElapsed = time.Since(prepareStarted)
 
 			item := shardStateDownload{
@@ -241,9 +247,15 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 				var prepareElapsed time.Duration
 				if err == nil {
 					prepareStarted := time.Now()
-					verified, err = verifyDownloadedBlock(downloaded)
+					verified, err = s.verifyDownloadedBlock(downloaded)
 					if err == nil {
 						prepared, err = prepareVerifiedMasterchainBlockForNextSync(job.prev, verified)
+					}
+					if err == nil {
+						// Download workers run in parallel with apply: pay for
+						// the signature batch here so apply keeps only the
+						// hash checks.
+						s.preverifyMasterchainConsensusSignatures(prepared.consensus)
 					}
 					prepareElapsed = time.Since(prepareStarted)
 				}
@@ -331,6 +343,9 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 		started: time.Now(),
 	}
 	for {
+		// Taken before the attempt so a block published while it runs is not
+		// waited out by the retry below.
+		stateWake := s.currentStateWakeChan()
 		attemptStarted := time.Now()
 		downloaded, source, err := s.downloadExactChainBlockProbe(ctx, block, state)
 		attemptElapsed := time.Since(attemptStarted)
@@ -375,20 +390,23 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 			Dur("waited", time.Since(state.started)).
 			Dur("retry_in", shardStateCatchUpRetryDelay).
 			Msg("retry indexed block download")
-		if err = s.waitShardStateCatchUpRetry(ctx, shardStateCatchUpRetryDelay); err != nil {
+		if err = s.waitShardStateCatchUpRetry(ctx, stateWake, shardStateCatchUpRetryDelay); err != nil {
 			return p2p.DownloadedBlock{}, err
 		}
 	}
 }
 
-func (s *Service) waitShardStateCatchUpRetry(ctx context.Context, delay time.Duration) error {
+// waitShardStateCatchUpRetry parks before the next download attempt. The caller
+// passes the wake it took before the attempt that missed, so state published
+// while that attempt ran is not waited out here.
+func (s *Service) waitShardStateCatchUpRetry(ctx context.Context, wake <-chan struct{}, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-s.currentStateWake:
+	case <-wake:
 		return nil
 	case <-timer.C:
 		return nil

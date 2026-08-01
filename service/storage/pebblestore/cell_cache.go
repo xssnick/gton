@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"sync"
 
+	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -80,27 +81,41 @@ func newDecodedCellCache(cfg decodedCellCacheConfig) *decodedCellCache {
 	return cache
 }
 
-func (c *decodedCellCache) get(generation uint64, hash []byte) (*cell.Cell, bool) {
-	if c == nil || len(hash) != 32 {
-		return nil, false
+func (c *decodedCellCache) get(generation uint64, hash []byte) (*cell.Cell, error) {
+	if c == nil {
+		return nil, storage.ErrNotFound
 	}
 
-	key := newDecodedCellCacheKey(generation, hash)
+	return c.getKey(newDecodedCellCacheKey(generation, hash))
+}
+
+func (c *decodedCellCache) getHash(generation uint64, hash cell.Hash) (*cell.Cell, error) {
+	if c == nil {
+		return nil, storage.ErrNotFound
+	}
+
+	return c.getKey(decodedCellCacheKey{
+		generation: generation,
+		hash:       [32]byte(hash),
+	})
+}
+
+func (c *decodedCellCache) getKey(key decodedCellCacheKey) (*cell.Cell, error) {
 	shard := &c.shards[c.shardIndex(key.hash)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	elem := shard.items[key]
 	if elem == nil {
-		return nil, false
+		return nil, storage.ErrNotFound
 	}
 	shard.order.MoveToFront(elem)
 	entry := elem.Value.(decodedCellCacheEntry)
-	return entry.cell, true
+	return entry.cell, nil
 }
 
 func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell) {
-	if c == nil || loaded == nil || len(hash) != 32 {
+	if c == nil {
 		return
 	}
 

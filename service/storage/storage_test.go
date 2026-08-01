@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -405,6 +406,152 @@ func TestPrepareStateUpdateCellsArenaGrowthPreservesRecords(t *testing.T) {
 	}
 }
 
+func TestPrepareReachableStateUpdateCellsMatchesMetadataEncoder(t *testing.T) {
+	leaf := cell.BeginCell().MustStoreUInt(0xBEEF, 16).EndCell()
+	shared := cell.BeginCell().MustStoreUInt(0xA7, 8).MustStoreRef(leaf).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0x55, 8).MustStoreRef(shared).MustStoreRef(shared).EndCell()
+	library, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.LibraryCellType), 8).
+		MustStoreSlice(root.Hash(0), 256).
+		EndCellSpecial(true)
+	if err != nil {
+		t.Fatalf("create library cell: %v", err)
+	}
+
+	levelOnePruned := mustStoragePrunedBranchAtLevel(t, root, 1)
+	levelThreePruned := mustStoragePrunedBranchAtLevel(t, root, 3)
+	nonVirtualProof := mustStorageMerkleProofBody(t, levelOnePruned)
+	virtualProof := mustStorageMerkleProofBody(t, levelThreePruned)
+	nonVirtualUpdate := mustStorageMerkleUpdateBody(t, levelOnePruned, root)
+	virtualUpdate := mustStorageMerkleUpdateBody(t, levelThreePruned, root)
+	if nonVirtualProof.Level() != 0 || nonVirtualUpdate.Level() != 0 {
+		t.Fatal("non-virtual Merkle cases must have level zero")
+	}
+	if virtualProof.Level() == 0 || virtualUpdate.Level() == 0 {
+		t.Fatal("virtualized Merkle cases must have a non-zero level")
+	}
+
+	tests := []struct {
+		name string
+		root *cell.Cell
+	}{
+		{
+			name: "ordinary shared graph",
+			root: root,
+		},
+		{
+			name: "library cell",
+			root: library,
+		},
+		{
+			name: "non-virtual Merkle proof",
+			root: nonVirtualProof,
+		},
+		{
+			name: "virtualized Merkle proof",
+			root: virtualProof,
+		},
+		{
+			name: "non-virtual Merkle update with mixed refs",
+			root: nonVirtualUpdate,
+		},
+		{
+			name: "virtualized Merkle update with mixed refs",
+			root: virtualUpdate,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := prepareReachableStateUpdateCells(tt.root)
+			if err != nil {
+				t.Fatalf("prepare state update cells: %v", err)
+			}
+			want, err := prepareReachableStateUpdateCellsWithMetadata(tt.root)
+			if err != nil {
+				t.Fatalf("prepare reference state update cells: %v", err)
+			}
+
+			gotRecords := got.AppendTo(nil)
+			wantRecords := want.AppendTo(nil)
+			if len(gotRecords) != len(wantRecords) {
+				t.Fatalf("records = %d, want %d", len(gotRecords), len(wantRecords))
+			}
+			for i := range wantRecords {
+				if gotRecords[i].Hash != wantRecords[i].Hash {
+					t.Fatalf(
+						"record %d hash = %x, want %x",
+						i,
+						gotRecords[i].Hash[:],
+						wantRecords[i].Hash[:],
+					)
+				}
+				if !bytes.Equal(gotRecords[i].Data, wantRecords[i].Data) {
+					t.Fatalf("record %d data for %x differs from metadata encoder", i, gotRecords[i].Hash[:])
+				}
+			}
+			if got.ByteSize() != want.ByteSize() {
+				t.Fatalf("record bytes = %d, want %d", got.ByteSize(), want.ByteSize())
+			}
+		})
+	}
+}
+
+func prepareReachableStateUpdateCellsWithMetadata(root *cell.Cell) (StateCellRecords, error) {
+	records := make([]EncodedCellRecord, 0)
+	seen := make(map[cell.Hash]struct{})
+	stack := []*cell.Cell{root.Virtualize(0)}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if current.IsLazy() {
+			loader, err := current.BeginParse()
+			if err != nil {
+				return StateCellRecords{}, err
+			}
+			current = loader.BaseCell()
+		}
+
+		if current.GetType() == cell.PrunedCellType && current.ActualLevel() == current.EffectiveLevel()+1 {
+			continue
+		}
+
+		meta := current.GetMetadata()
+		if _, ok := seen[meta.Hash]; ok {
+			continue
+		}
+		seen[meta.Hash] = struct{}{}
+
+		recordCell := current
+		if current.GetType() == cell.PrunedCellType {
+			var err error
+			recordCell, err = materializePrunedStateCell(current)
+			if err != nil {
+				return StateCellRecords{}, err
+			}
+		}
+		record, err := PrepareEncodedCellRecordFromCellMetadata(recordCell, meta)
+		if err != nil {
+			return StateCellRecords{}, err
+		}
+		records = append(records, record)
+
+		if current.GetType() == cell.PrunedCellType {
+			continue
+		}
+		for i, ref := range meta.Refs {
+			if ref.Lazy {
+				return StateCellRecords{}, fmt.Errorf("ref %d from %x is lazy", i, meta.Hash[:])
+			}
+			refCell, err := current.PeekRef(i)
+			if err != nil {
+				return StateCellRecords{}, err
+			}
+			stack = append(stack, refCell)
+		}
+	}
+	return NewStateCellRecords(records), nil
+}
+
 func TestLargeBOCPrunedMetadataUsesPrunedHashesDepths(t *testing.T) {
 	leaf := cell.BeginCell().MustStoreUInt(0xBEEF, 16).EndCell()
 	hidden := cell.BeginCell().MustStoreUInt(0xA7, 8).MustStoreRef(leaf).EndCell()
@@ -576,6 +723,24 @@ func mustStorageMerkleProofBody(tb testing.TB, body *cell.Cell) *cell.Cell {
 		tb.Fatalf("create merkle proof body: %v", err)
 	}
 	return proof
+}
+
+func mustStorageMerkleUpdateBody(tb testing.TB, from *cell.Cell, to *cell.Cell) *cell.Cell {
+	tb.Helper()
+
+	update, err := cell.BeginCell().
+		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
+		MustStoreSlice(from.Hash(0), 256).
+		MustStoreSlice(to.Hash(0), 256).
+		MustStoreUInt(uint64(from.Depth(0)), 16).
+		MustStoreUInt(uint64(to.Depth(0)), 16).
+		MustStoreRef(from).
+		MustStoreRef(to).
+		EndCellSpecial(true)
+	if err != nil {
+		tb.Fatalf("create merkle update: %v", err)
+	}
+	return update
 }
 
 func (l largeBOCTestLoader) LoadPayload(hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error) {

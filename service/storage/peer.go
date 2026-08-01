@@ -7,15 +7,32 @@ import (
 )
 
 type PeerServingStorage interface {
+	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*BlockMeta, error)
 	BlockFull(ctx context.Context, block ton.BlockIDExt) (*ServedBlockFull, error)
 	NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*ServedBlockFull, error)
 	BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	BlockProof(ctx context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error)
+	ZeroStateSize(ctx context.Context, block ton.BlockIDExt) (int64, error)
 	ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error)
 	PersistentStateSize(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (int64, error)
 	PersistentStateSlice(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64, offset int64, maxSize int64) ([]byte, error)
 	ArchiveInfo(ctx context.Context, masterchainSeqno int32, workchain int32, shard int64) (int64, error)
 	ArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) ([]byte, error)
+}
+
+// OverlayPeerCache persists opaque per-overlay peer snapshots so a restarted
+// node can redial its previous roster without waiting for DHT discovery.
+type OverlayPeerCache interface {
+	SaveOverlayPeerCache(overlayID []byte, snapshot []byte) error
+	LoadOverlayPeerCache(overlayID []byte) ([]byte, error)
+}
+
+// FastSyncCertificateStorage persists the node's validated FastSync member
+// certificates as one opaque snapshot.
+type FastSyncCertificateStorage interface {
+	SaveFastSyncCertificateSnapshot(ctx context.Context, snapshot []byte) error
+	FastSyncCertificateSnapshot(ctx context.Context) ([]byte, error)
+	DeleteFastSyncCertificateSnapshot(ctx context.Context) error
 }
 
 type PeerServingStorageWriter interface {

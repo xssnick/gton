@@ -49,13 +49,7 @@ type ArchiveDownloadOptions struct {
 }
 
 func (n *Node) BeginArchiveSession() *ArchiveSession {
-	parentCtx := n.runtimeContext()
-	if parentCtx == nil {
-		// Archive sessions can be used by offline nodes before Node.Start has
-		// installed its runtime context; Close still owns their lifecycle.
-		parentCtx = context.Background()
-	}
-	opCtx, opCancel := context.WithCancel(parentCtx)
+	opCtx, opCancel := context.WithCancel(n.runCtx)
 
 	return &ArchiveSession{
 		node:          n,
@@ -113,10 +107,10 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 		return nil, ErrOffline
 	}
 
-	// Historical master and shard archives are both served by archival peers on
-	// the masterchain overlay. Availability and performance remain keyed by the
-	// requested shard inside the archive pool.
-	sub, err := a.node.subscriptionForOverlayBlock(ton.BlockIDExt{Workchain: -1, Shard: topShard})
+	sub, err := a.node.querySubscriptionForHistoricalBlock(ton.BlockIDExt{
+		Workchain: shard.Workchain,
+		Shard:     shard.Shard,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +186,7 @@ func (a *ArchiveSession) downloadArchiveRound(ctx context.Context, sub *overlayS
 	var resolveElapsed time.Duration
 	logBootstrapTiming := func(peer string, err error) {
 		event := sub.log.Debug()
-		if err != nil || ensureElapsed >= archiveBootstrapSlowLog || resolveElapsed >= archiveBootstrapSlowLog {
+		if err == nil && (ensureElapsed >= archiveBootstrapSlowLog || resolveElapsed >= archiveBootstrapSlowLog) {
 			event = sub.log.Info()
 		}
 		if !event.Enabled() {
@@ -351,10 +345,6 @@ func (a *ArchiveSession) selectedArchivePeerPool(shard archive.ShardID) *archive
 	defer a.mx.Unlock()
 
 	return a.selectedPools[archivePeerPoolKey(shard)]
-}
-
-func (a *ArchiveSession) selectArchivePeer(shard archive.ShardID, peer *overlayPeer) {
-	a.selectArchivePeerFromPool(shard, peer, nil)
 }
 
 func (a *ArchiveSession) selectArchivePeerFromPool(shard archive.ShardID, peer *overlayPeer, pool *archivePeerPool) {

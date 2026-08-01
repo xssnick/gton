@@ -39,7 +39,7 @@ func formatDBStatus(status pebblestore.DBStatus) string {
 	for _, generation := range status.CellGenerations {
 		role := fallbackString(generation.Role, "open")
 		fmt.Fprintf(&b, "  generation %d role=%s", generation.ID, role)
-		if validBlockID(generation.Origin) {
+		if storage.BlockIDHashesKnown(generation.Origin) {
 			fmt.Fprintf(&b, " origin=%s", formatBlock(&generation.Origin))
 		}
 		fmt.Fprintf(&b, "\n")
@@ -184,6 +184,13 @@ func formatStatusWithNow(snapshot service2.StatusSnapshot, showPeers bool, now t
 	fmt.Fprintf(&b, "  %-20s %s\n", "latest masterchain", formatBlock(snapshot.LatestMasterchain))
 	fmt.Fprintf(&b, "  %-20s %s\n", "latest basechain", formatBlock(snapshot.LatestBasechain))
 	fmt.Fprintf(&b, "  %-20s %d\n", "overlays", len(snapshot.Overlays))
+	fmt.Fprintf(
+		&b,
+		"  %-20s %d current / %d accepted\n",
+		"QUIC peers",
+		snapshot.QUICPeers,
+		snapshot.QUICPeersAccepted,
+	)
 	fmt.Fprintf(&b, "  %-20s %d / %d alive\n", "known peers", totalAliveKnownPeers, totalKnownPeers)
 	fmt.Fprintf(&b, "  %-20s %d / %d alive\n", "neighbours", totalAliveNeighbours, totalNeighbours)
 
@@ -300,21 +307,20 @@ func formatBasechainLagStatus(b *strings.Builder, snapshot service2.StatusSnapsh
 }
 
 func formatRecentTPSStatus(b *strings.Builder, snapshot service2.StatusTPSSnapshot) {
-	if snapshot.WindowMasters == 0 {
+	if snapshot.DurationSeconds == 0 {
 		return
 	}
 	if !snapshot.Complete {
-		fmt.Fprintf(b, "  %-12s window_masters=%d tx=unknown duration=unknown tps=unknown\n", "tps", snapshot.WindowMasters)
+		fmt.Fprintf(b, "  %-12s window=%s tx=unknown tps=unknown\n", "tps", formatLagSeconds(snapshot.DurationSeconds))
 		return
 	}
 
 	fmt.Fprintf(
 		b,
-		"  %-12s window_masters=%d tx=%d duration=%s tps=%.2f\n",
+		"  %-12s window=%s tx=%d tps=%.2f\n",
 		"tps",
-		snapshot.WindowMasters,
-		snapshot.Transactions,
 		formatLagSeconds(snapshot.DurationSeconds),
+		snapshot.Transactions,
 		snapshot.TPS,
 	)
 }

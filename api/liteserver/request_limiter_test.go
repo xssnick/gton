@@ -204,12 +204,7 @@ func (c *fakeTrackedLiteClient) Close() {
 }
 
 func requestLimiterBucketCount(limiter *requestLimiter) int {
-	count := 0
-	limiter.buckets.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-	return count
+	return limiter.limiter.Len()
 }
 
 func BenchmarkRequestLimiterSameIPParallel(b *testing.B) {

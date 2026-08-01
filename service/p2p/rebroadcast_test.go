@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -13,8 +15,9 @@ import (
 )
 
 type mockRebroadcastPeer struct {
-	id   []byte
-	sent []tl.Serializable
+	id        []byte
+	sent      []tl.Serializable
+	afterSend func(int)
 }
 
 func (m *mockRebroadcastPeer) ID() []byte {
@@ -23,6 +26,9 @@ func (m *mockRebroadcastPeer) ID() []byte {
 
 func (m *mockRebroadcastPeer) SendCustomMessage(_ context.Context, req tl.Serializable) error {
 	m.sent = append(m.sent, req)
+	if m.afterSend != nil {
+		m.afterSend(len(m.sent))
+	}
 	return nil
 }
 
@@ -120,10 +126,15 @@ func TestSelectRebroadcastQueueTargetsSamplesFullPool(t *testing.T) {
 func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 	node := newTestNode(t)
 	node.SetRebroadcastQuiet(true)
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{Name: "basechain"},
+	})
 
 	req := &rebroadcastRequest{
-		kind:  "tonNode.externalMessageBroadcast",
-		local: true,
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
+		local:        true,
 	}
 	if !node.allowRebroadcast(req) {
 		t.Fatalf("local rebroadcast must bypass quiet throttle")
@@ -133,7 +144,8 @@ func TestAllowRebroadcastDoesNotThrottleLocalRequests(t *testing.T) {
 	}
 
 	peerReq := &rebroadcastRequest{
-		kind: "tonNode.externalMessageBroadcast",
+		subscription: sub,
+		kind:         "tonNode.externalMessageBroadcast",
 	}
 	if !node.allowRebroadcast(peerReq) {
 		t.Fatalf("first peer rebroadcast should pass quiet throttle")
@@ -367,16 +379,20 @@ func TestRebroadcastFECBackpressurePassesWhenLagClears(t *testing.T) {
 	release()
 }
 
-func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
+func TestSendCustomTwoStepRebroadcastUsesRLDP2(t *testing.T) {
 	node := newTestNode(t)
 	overlayA, connA := newTestOverlayWrapper()
 	overlayB, connB := newTestOverlayWrapper()
+	overlayID := testPeerID("custom-rldp-two-step")
+	rldpA := &testBroadcastRLDP{adnl: connA}
+	rldpB := &testBroadcastRLDP{adnl: connB}
 	now := int32(time.Now().Unix())
 
 	peerA := &overlayPeer{
 		id:            testPeerID("peer-a"),
 		addr:          "peer-a",
 		overlay:       overlayA,
+		rldpOverlay:   overlay.CreateExtendedRLDP(rldpA).CreateOverlay(overlayID[:]),
 		announced:     &overlay.Node{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
@@ -385,6 +401,7 @@ func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
 		id:            testPeerID("peer-b"),
 		addr:          "peer-b",
 		overlay:       overlayB,
+		rldpOverlay:   overlay.CreateExtendedRLDP(rldpB).CreateOverlay(overlayID[:]),
 		announced:     &overlay.Node{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
@@ -392,8 +409,9 @@ func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
 	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{
-			Name: "custom.private-a",
-			Kind: overlayKindCustomFixed,
+			Name:    "custom.private-a",
+			Kind:    overlayKindCustomFixed,
+			ShortID: overlayID[:],
 		},
 		log: discardLogger(),
 		peers: map[PeerID]*overlayPeer{
@@ -402,24 +420,36 @@ func TestSendCustomTwoStepRebroadcastUsesTonutilsGroupSender(t *testing.T) {
 		},
 	})
 
-	ok := sub.sendCustomTwoStepRebroadcast(context.Background(), rebroadcastRequest{
+	ok := sub.sendTwoStepRebroadcast(context.Background(), rebroadcastRequest{
 		subscription: sub,
 		kind:         "tonNode.externalMessageBroadcast",
 		payload:      []byte{0x01, 0x02, 0x03},
+		sourcePeerID: peerA.id,
 		local:        true,
 	})
 	if !ok {
 		t.Fatal("expected custom two-step send to succeed")
 	}
 
-	for name, conn := range map[string]*testOverlayADNL{"peer-a": connA, "peer-b": connB} {
-		if len(conn.sent) != 1 {
-			t.Fatalf("%s sent messages = %d, want 1", name, len(conn.sent))
-		}
-		msg := sentOverlayPayload(conn.sent[0])
-		if _, ok := msg.(*overlay.BroadcastTwoStepSimple); !ok {
-			t.Fatalf("%s sent unexpected message type %T", name, msg)
-		}
+	if len(rldpA.sent) != 0 {
+		t.Fatalf("source peer RLDP messages = %d, want 0", len(rldpA.sent))
+	}
+	if len(rldpB.sent) != 1 {
+		t.Fatalf("target peer RLDP messages = %d, want 1", len(rldpB.sent))
+	}
+	var envelope overlay.Message
+	msg, err := parseQUICOverlayObject(rldpB.sent[0], &envelope)
+	if err != nil {
+		t.Fatalf("parse target RLDP overlay message: %v", err)
+	}
+	if !bytes.Equal(envelope.Overlay, overlayID[:]) {
+		t.Fatalf("target RLDP overlay id = %x, want %x", envelope.Overlay, overlayID)
+	}
+	if _, ok := msg.(overlay.BroadcastTwoStepSimple); !ok {
+		t.Fatalf("target sent unexpected message type %T", msg)
+	}
+	if len(connA.sent) != 0 || len(connB.sent) != 0 {
+		t.Fatal("custom two-step broadcast fell back to ADNL")
 	}
 }
 
@@ -453,7 +483,7 @@ func TestCustomSmallShardRebroadcastUsesOrdinarySimpleQueue(t *testing.T) {
 	if got.kind != "tonNode.newShardBlockBroadcast" || !got.local {
 		t.Fatalf("unexpected queued rebroadcast: %#v", got)
 	}
-	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+	if snapshot, ok := sub.twoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
 		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
 	}
 }
@@ -484,7 +514,7 @@ func TestCustomBlockRebroadcastRequiresLocalBlockSender(t *testing.T) {
 			t.Fatal("custom block rebroadcast reached peer queue without local block sender role")
 		}
 	}
-	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+	if snapshot, ok := sub.twoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
 		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
 	}
 }
@@ -515,7 +545,7 @@ func TestCustomIHRRebroadcastUnsupported(t *testing.T) {
 			t.Fatal("custom IHR rebroadcast reached peer queue")
 		}
 	}
-	if snapshot, ok := sub.customTwoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+	if snapshot, ok := sub.twoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
 		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
 	}
 }
@@ -582,7 +612,7 @@ func TestSendFastFECToPeerSendsReserveParts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fec sender: %v", err)
 	}
-	if err = sendFastFECToPeer(context.Background(), sender, peer, time.Second); err != nil {
+	if err = sendFastFECToPeer(context.Background(), sender, peer, time.Second, 0); err != nil {
 		t.Fatalf("send fast fec: %v", err)
 	}
 
@@ -619,10 +649,10 @@ func TestFastFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
 
 	peerA := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x11}, 32)}
 	peerB := &mockRebroadcastPeer{id: bytes.Repeat([]byte{0x22}, 32)}
-	if err = sendFastFECToPeer(context.Background(), sender, peerA, time.Second); err != nil {
+	if err = sendFastFECToPeer(context.Background(), sender, peerA, time.Second, 0); err != nil {
 		t.Fatalf("send peer A fast fec: %v", err)
 	}
-	if err = sendFastFECToPeer(context.Background(), sender, peerB, time.Second); err != nil {
+	if err = sendFastFECToPeer(context.Background(), sender, peerB, time.Second, 0); err != nil {
 		t.Fatalf("send peer B fast fec: %v", err)
 	}
 
@@ -631,6 +661,112 @@ func TestFastFECRebroadcastReusesPartsAcrossPeerWorkers(t *testing.T) {
 	}
 	if peerA.sent[0] != peerB.sent[0] {
 		t.Fatal("expected peers to reuse the same cached FEC part")
+	}
+}
+
+func TestSendFastFECToPeerPacesFourPartBursts(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	sender, err := overlay.NewBroadcastFECSender(
+		priv,
+		overlay.CertificateEmpty{},
+		bytes.Repeat([]byte{0xAB}, 2000),
+		overlay.BroadcastFlagAnySender,
+		overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
+	)
+	if err != nil {
+		t.Fatalf("create fec sender: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	peer := &mockRebroadcastPeer{
+		id: bytes.Repeat([]byte{0x33}, 32),
+		afterSend: func(sent int) {
+			if sent == int(overlay.DefaultBroadcastFECBurstSize) {
+				cancel()
+			}
+		},
+	}
+
+	err = sendFastFECToPeer(ctx, sender, peer, time.Hour, time.Hour)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("paced send error = %v, want context canceled", err)
+	}
+	if len(peer.sent) != int(overlay.DefaultBroadcastFECBurstSize) {
+		t.Fatalf(
+			"parts sent before pace wait = %d, want %d",
+			len(peer.sent),
+			overlay.DefaultBroadcastFECBurstSize,
+		)
+	}
+}
+
+func TestNormalizeFastSyncBroadcastFECPace(t *testing.T) {
+	tests := []struct {
+		name       string
+		multiplier float64
+		expected   time.Duration
+		wantError  bool
+	}{
+		{
+			name:       "zero uses full node default",
+			multiplier: 0,
+			expected:   overlay.DefaultBroadcastFECPace,
+		},
+		{
+			name:       "one preserves base pace",
+			multiplier: 1,
+			expected:   overlay.DefaultBroadcastFECPace,
+		},
+		{
+			name:       "two halves pace",
+			multiplier: 2,
+			expected:   overlay.DefaultBroadcastFECPace / 2,
+		},
+		{
+			name:       "small value is clamped like cppnode",
+			multiplier: minFastSyncBroadcastSpeedMultiplier / 2,
+			expected: time.Duration(
+				float64(overlay.DefaultBroadcastFECPace) /
+					minFastSyncBroadcastSpeedMultiplier,
+			),
+		},
+		{
+			name:       "negative",
+			multiplier: -1,
+			wantError:  true,
+		},
+		{
+			name:       "nan",
+			multiplier: math.NaN(),
+			wantError:  true,
+		},
+		{
+			name:       "infinity",
+			multiplier: math.Inf(1),
+			wantError:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeFastSyncBroadcastFECPace(tt.multiplier)
+			if tt.wantError {
+				if err == nil {
+					t.Fatal("expected multiplier rejection")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalize pace: %v", err)
+			}
+			if got != tt.expected {
+				t.Fatalf("pace = %s, want %s", got, tt.expected)
+			}
+		})
 	}
 }
 
@@ -1082,10 +1218,11 @@ func TestPeerRebroadcastWorkerDropsStaleQueuedRequest(t *testing.T) {
 
 	for i := 0; i < workers; i++ {
 		if !peer.localRebroadcastQueue.Push(rebroadcastRequest{
-			kind:     "tonNode.externalMessageBroadcast",
-			payload:  []byte{byte(i + 1)},
-			local:    true,
-			queuedAt: time.Now().Add(-rebroadcastQueueMaxAge - time.Second),
+			subscription: sub,
+			kind:         "tonNode.externalMessageBroadcast",
+			payload:      []byte{byte(i + 1)},
+			local:        true,
+			queuedAt:     time.Now().Add(-rebroadcastQueueMaxAge - time.Second),
 		}) {
 			t.Fatalf("enqueue stale local rebroadcast %d", i)
 		}

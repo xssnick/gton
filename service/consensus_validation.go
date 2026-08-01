@@ -46,15 +46,18 @@ type masterchainValidatorCache struct {
 	entries           map[masterchainValidatorCacheKey]*blockproof.PreparedValidatorSet
 }
 
-func (c *masterchainValidatorCache) get(key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, bool) {
+func (c *masterchainValidatorCache) get(key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.initialized || c.prevKeyBlockSeqno != key.prevKeyBlockSeqno {
-		return nil, false
+		return nil, tnstore.ErrNotFound
 	}
 	validators, ok := c.entries[key]
-	return validators, ok
+	if !ok {
+		return nil, tnstore.ErrNotFound
+	}
+	return validators, nil
 }
 
 func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, validators *blockproof.PreparedValidatorSet) *blockproof.PreparedValidatorSet {
@@ -74,9 +77,6 @@ func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, valida
 }
 
 func (s *Service) checkMasterchainBlockConsensusWithProof(current *tnstore.BlockState, proof *masterchainConsensusProof) (*checkedMasterchainConsensus, error) {
-	if proof == nil {
-		return nil, fmt.Errorf("masterchain block has no prepared consensus proof")
-	}
 	if proof.block.Workchain != -1 || proof.block.Shard != topShard {
 		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(proof.block))
 	}
@@ -163,20 +163,83 @@ func (s *Service) checkedConsensusForPreparedBlock(current *tnstore.BlockState, 
 	return s.checkMasterchainBlockConsensusWithProof(current, block.consensus)
 }
 
-func prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, verifiedSignaturesKey []byte) (*masterchainConsensusProof, *blockproof.Parsed, error) {
-	if proofRoot == nil {
-		return nil, nil, fmt.Errorf("masterchain block %s has no parsed proof root", tnstore.FormatBlockRef(block))
+const parsedProofCacheLimit = 32
+
+// parsedProofCache memoizes blockproof.ParseCell by proof-root pointer
+// identity: the p2p pipeline hands the same decoded proof cell to the
+// broadcast signature check and then, through the hot cache, to both the
+// block-sync and the probe verify paths, each of which parsed it again. A
+// cached Parsed is shared between consumers and must be treated as immutable —
+// every mutable derivation (signature sets, the consensus proof with its
+// in-place check memoization) is built per consumer from it.
+type parsedProofCache struct {
+	mu      sync.Mutex
+	entries map[*cell.Cell]*blockproof.Parsed
+	order   []*cell.Cell
+}
+
+func (c *parsedProofCache) parse(block ton.BlockIDExt, proofRoot *cell.Cell) (*blockproof.Parsed, error) {
+	c.mu.Lock()
+	parsed, ok := c.entries[proofRoot]
+	c.mu.Unlock()
+	if ok && parsed.Meta.ID.Equals(&block) {
+		return parsed, nil
 	}
 
 	parsed, err := blockproof.ParseCell(block, proofRoot)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	proof, err := masterchainConsensusProofFromParsed(block, parsed, verifiedSignaturesKey)
+
+	c.mu.Lock()
+	if _, ok = c.entries[proofRoot]; !ok {
+		if c.entries == nil {
+			c.entries = map[*cell.Cell]*blockproof.Parsed{}
+		}
+		c.entries[proofRoot] = parsed
+		c.order = append(c.order, proofRoot)
+		if len(c.order) > parsedProofCacheLimit {
+			evict := c.order[0]
+			delete(c.entries, evict)
+			copy(c.order, c.order[1:])
+			c.order = c.order[:len(c.order)-1]
+		}
+	}
+	c.mu.Unlock()
+	return parsed, nil
+}
+
+func (s *Service) prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, verifiedSignaturesKey []byte) (*masterchainConsensusProof, error) {
+	parsed, err := s.parsedProofs.parse(block, proofRoot)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return proof, parsed, nil
+	return masterchainConsensusProofFromParsed(block, parsed, verifiedSignaturesKey)
+}
+
+// preverifyMasterchainConsensusSignatures runs the Ed25519 batch of a
+// downloaded masterchain block's proof on the caller's parallel prepare stage
+// when the validator set for its epoch is already cached, marking the proof
+// the same way the broadcast path does so the serial apply goroutine keeps
+// only the cheap prev-ref and state-hash checks. On a cache miss, or when the
+// signatures do not verify, the proof is left untouched: apply then performs
+// the full check exactly as before — the hardfork fallback must see the
+// original failure, and the miss path is the one that can populate the cache
+// from the previous state.
+func (s *Service) preverifyMasterchainConsensusSignatures(proof *masterchainConsensusProof) {
+	if proof == nil || proof.signaturesChecked || proof.hardforkChecked {
+		return
+	}
+	if proof.signaturePrepareErr != nil || proof.proofSignatures == nil {
+		return
+	}
+	validators, err := s.validatorCache.get(proof.validatorCacheKey)
+	if err != nil {
+		return
+	}
+	if blockproof.CheckPreparedMasterchainSignatures(proof.block, proof.proofSignatures, validators) == nil {
+		proof.signaturesChecked = true
+	}
 }
 
 func prepareMasterchainConsensusProofBOC(block ton.BlockIDExt, proofBOC []byte) (*masterchainConsensusProof, error) {
@@ -195,7 +258,7 @@ func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproo
 	if block.Workchain != -1 || block.Shard != topShard {
 		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(block))
 	}
-	if parsed == nil || parsed.Proof == nil || parsed.Block == nil || parsed.Meta == nil {
+	if parsed.Proof == nil || parsed.Block == nil || parsed.Meta == nil {
 		return nil, fmt.Errorf("masterchain block proof %s is incomplete", tnstore.FormatBlockRef(block))
 	}
 	if len(parsed.Meta.PrevRefs) != 1 {
@@ -251,8 +314,9 @@ func stateUpdateFromHash(block ton.BlockIDExt, update *cell.Cell) (cell.Hash, er
 }
 
 func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
-	if validators, ok := s.validatorCache.get(key); ok {
-		return validators, nil
+	cached, err := s.validatorCache.get(key)
+	if err == nil {
+		return cached, nil
 	}
 
 	cfg, err := blockproof.ConfigFromMasterchainState(current)

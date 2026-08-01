@@ -99,9 +99,6 @@ func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.
 
 func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block PreparedBlock, applier stateUpdateApplier) (appliedBlockState, error) {
 	stateUpdate := block.StateUpdate
-	if stateUpdate == nil {
-		return appliedBlockState{}, fmt.Errorf("prepared block %s has no state update", block.BlockRef())
-	}
 
 	var result stateUpdateApplyResult
 	var err error

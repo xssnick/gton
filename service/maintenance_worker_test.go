@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/gton/service/storage"
 )
 
 func TestServiceNewKeepsZeroTTLs(t *testing.T) {
@@ -16,6 +17,64 @@ func TestServiceNewKeepsZeroTTLs(t *testing.T) {
 	if svc.archiveTTL != 0 {
 		t.Fatalf("archive ttl = %s, want 0", svc.archiveTTL)
 	}
+	if svc.persistentStateKeepRecent != DefaultPersistentStateKeepRecent {
+		t.Fatalf("persistent state keep recent = %d, want %d", svc.persistentStateKeepRecent, DefaultPersistentStateKeepRecent)
+	}
+}
+
+func TestServiceNewKeepsAllPersistentStates(t *testing.T) {
+	svc := New(zerolog.Nop(), nil, nil, nil, nil, Options{PersistentStateKeepRecent: PersistentStateKeepAll})
+
+	if svc.persistentStateKeepRecent != PersistentStateKeepAll {
+		t.Fatalf("persistent state keep recent = %d, want %d", svc.persistentStateKeepRecent, PersistentStateKeepAll)
+	}
+}
+
+func TestPersistentStateGCUsesConfiguredRetention(t *testing.T) {
+	store := &testPersistentStateGCStore{}
+	svc := &Service{
+		log:                       zerolog.Nop(),
+		storage:                   store,
+		persistentStateKeepRecent: 7,
+	}
+
+	if _, err := svc.runPersistentStateGCOnce(context.Background()); err != nil {
+		t.Fatalf("persistent state gc: %v", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("persistent state gc calls = %d, want 1", store.calls)
+	}
+	if store.keepRecentGroups != 7 {
+		t.Fatalf("persistent state keep recent = %d, want 7", store.keepRecentGroups)
+	}
+}
+
+func TestPersistentStateGCSkipsWhenKeepingAll(t *testing.T) {
+	store := &testPersistentStateGCStore{}
+	svc := &Service{
+		log:                       zerolog.Nop(),
+		storage:                   store,
+		persistentStateKeepRecent: PersistentStateKeepAll,
+	}
+
+	if pruned, err := svc.runPersistentStateGCOnce(context.Background()); err != nil || pruned {
+		t.Fatalf("persistent state gc = (%v, %v), want (false, nil)", pruned, err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("persistent state gc calls = %d, want 0", store.calls)
+	}
+}
+
+type testPersistentStateGCStore struct {
+	storage.Storage
+	calls            int
+	keepRecentGroups int
+}
+
+func (s *testPersistentStateGCStore) PruneExpiredPersistentStateFiles(_ context.Context, _ uint64, keepRecentGroups int, _ int) (storage.PersistentStatePruneStats, error) {
+	s.calls++
+	s.keepRecentGroups = keepRecentGroups
+	return storage.PersistentStatePruneStats{}, nil
 }
 
 func TestServiceMaintenanceStopsAfterSyncUntilFrozen(t *testing.T) {
@@ -25,6 +84,7 @@ func TestServiceMaintenanceStopsAfterSyncUntilFrozen(t *testing.T) {
 		syncUntil:       200,
 		maintenanceWake: make(chan struct{}, 1),
 	}
+	freezeSyncUntil(t, svc)
 
 	svc.runServiceMaintenance(context.Background())
 }
@@ -38,6 +98,7 @@ func TestMaintenanceTasksSkipAfterSyncUntilFrozen(t *testing.T) {
 		maintenanceWake: make(chan struct{}, 1),
 		stateSerializer: &stateSerializer{},
 	}
+	freezeSyncUntil(t, svc)
 
 	if pruned, err := svc.runPersistentStateGCOnce(context.Background()); err != nil || pruned {
 		t.Fatalf("persistent state gc = (%v, %v), want (false, nil)", pruned, err)

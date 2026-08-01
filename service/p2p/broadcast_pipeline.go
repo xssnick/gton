@@ -17,8 +17,6 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-var errBroadcastRejected = errors.New("broadcast rejected")
-
 var externalMessageCRC64Table = crc64.MakeTable(crc64.ECMA)
 
 type customBroadcastRole uint8
@@ -29,14 +27,39 @@ const (
 )
 
 type acceptedBroadcast struct {
-	fingerprint        string
-	deduped            bool
-	block              *ton.BlockIDExt
-	event              *BroadcastEvent
-	extraEvents        []BroadcastEvent
-	masterchainWake    *ton.BlockIDExt
-	rebroadcast        *rebroadcastRequest
-	skipAcceptedMetric bool
+	fingerprint         string
+	deduped             bool
+	delivery            Delivery
+	block               *ton.BlockIDExt
+	event               *BroadcastEvent
+	extraEvents         []BroadcastEvent
+	masterchainWake     *ton.BlockIDExt
+	rebroadcast         *rebroadcastRequest
+	skipAcceptedMetric  bool
+	processedDecodeKind string
+}
+
+type broadcastDisposition uint8
+
+const (
+	broadcastDispositionIgnore broadcastDisposition = iota
+	broadcastDispositionAccept
+)
+
+type broadcastResult struct {
+	disposition broadcastDisposition
+	accepted    acceptedBroadcast
+}
+
+func ignoredBroadcastResult() broadcastResult {
+	return broadcastResult{disposition: broadcastDispositionIgnore}
+}
+
+func acceptedBroadcastResult(accepted acceptedBroadcast) broadcastResult {
+	return broadcastResult{
+		disposition: broadcastDispositionAccept,
+		accepted:    accepted,
+	}
 }
 
 type rebroadcastRequest struct {
@@ -63,18 +86,11 @@ type broadcastPayload struct {
 	err        error
 }
 
-func newKnownBroadcastPayload(payload []byte) *broadcastPayload {
+func newKnownIdentifiedBroadcastPayload(payload, identity []byte) *broadcastPayload {
 	return &broadcastPayload{
 		payload:    payload,
-		identity:   payload,
+		identity:   identity,
 		serialized: true,
-	}
-}
-
-func newIdentifiedBroadcastPayload(msg any, identity []byte) *broadcastPayload {
-	return &broadcastPayload{
-		msg:      msg,
-		identity: identity,
 	}
 }
 
@@ -105,13 +121,6 @@ func (p *broadcastPayload) fingerprint(overlayID []byte) (string, error) {
 		return "", nil
 	}
 	return broadcastFingerprint(overlayID, identity), nil
-}
-
-func (req rebroadcastRequest) overlayName() string {
-	if req.subscription == nil {
-		return ""
-	}
-	return req.subscription.spec.Name
 }
 
 func broadcastEventBytes(event BroadcastEvent) int64 {
@@ -157,53 +166,70 @@ func (req *rebroadcastRequest) materializePayload() error {
 	return nil
 }
 
-func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) error {
-	if !s.isActive() {
-		return nil
-	}
-
+func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) overlay.BroadcastDisposition {
 	kind := broadcastKindLabel(msg)
 	if peer != nil && peer.noteReceive() {
 		s.peerPromoted(peer)
 	}
 	if !s.node.canAcceptBroadcast(kind, false) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "broadcast_admission_closed")
-		if delivery == DeliveryFEC || delivery == DeliveryTwoStep {
-			return errBroadcastRejected
-		}
-		return nil
+		return overlay.BroadcastDispositionRetry
 	}
 
 	classifyStarted := s.node.startBroadcastPipelineStage()
-	accepted, err := s.classifyBroadcastPayload(peer, msg, payload, delivery, trusted, sourcePeerID)
+	result, err := s.classifyBroadcastPayload(peer, msg, payload, delivery, trusted, sourcePeerID)
 	if err != nil {
 		s.node.observeBroadcastPipelineStageSince(classifyStarted, broadcastPipelineStageClassify, kind, delivery, broadcastPipelineResultError)
 		s.log.Debug().Err(err).Msg("failed to classify inbound broadcast payload")
-		return nil
+		return overlay.BroadcastDispositionRetry
 	}
 	classifyResult := broadcastPipelineResultDrop
-	if accepted != nil {
+	if result.disposition == broadcastDispositionAccept {
 		classifyResult = broadcastPipelineResultSuccess
 	}
 	s.node.observeBroadcastPipelineStageSince(classifyStarted, broadcastPipelineStageClassify, kind, delivery, classifyResult)
-	if accepted == nil {
-		if delivery == DeliveryFEC && !trusted && s.broadcastFECRelayEnabled() {
-			return errBroadcastRejected
-		}
-		return nil
+	if result.disposition == broadcastDispositionIgnore {
+		return overlay.BroadcastDispositionIgnore
 	}
 
-	s.node.acceptBroadcast(*accepted)
-	return nil
+	s.node.acceptBroadcast(result.accepted)
+	return overlay.BroadcastDispositionAcceptAndRelay
 }
 
-func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) (*acceptedBroadcast, error) {
+func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) (broadcastResult, error) {
+	if s.spec.restrictsBroadcastKinds() {
+		// We publish DoNotReceiveBroadcasts in our member flags when this
+		// overlay is send-only for us (a validator under plumtree), and drop
+		// what a peer sends anyway. Upstream gates the same six kinds inside
+		// OverlayImpl::process_broadcast — but not the two-step pair, which it
+		// processes regardless, so neither do we. Note this only suppresses
+		// application processing: the transport has already decoded and
+		// relayed by the time classify runs, so it does not save that work.
+		if delivery != DeliveryTwoStep &&
+			s.fastSync != nil && s.fastSync.declinesBroadcasts() {
+			s.node.noteBroadcastDrop(
+				s.spec.Name,
+				broadcastKindLabel(msg),
+				"fast_sync_broadcasts_declined",
+			)
+			return ignoredBroadcastResult(), nil
+		}
+		if !fastSyncBroadcastSupported(msg) {
+			s.node.noteBroadcastDrop(
+				s.spec.Name,
+				broadcastKindLabel(msg),
+				"unsupported_fast_sync_broadcast",
+			)
+			return ignoredBroadcastResult(), nil
+		}
+	}
+
 	if sourcePeerID.IsZero() && peer != nil {
 		sourcePeerID = peer.id
 	}
-	if s.spec.Kind == overlayKindCustomFixed && sourcePeerID == s.node.localID {
+	if s.spec.dropsSelfSourcedBroadcasts() && sourcePeerID == s.node.localID {
 		s.node.noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "self")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
 	switch data := msg.(type) {
@@ -231,19 +257,19 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 	case tonnodeapi.NewShardBlockBroadcast:
 		kind := "tonNode.newShardBlockBroadcast"
 		if !s.allowCustomBroadcastSource(kind, sourcePeerID, customBroadcastRoleBlock) {
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		if !validCompressedBroadcast(data.Block.ID, data.Block.Data) {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		fingerprint, err := payload.fingerprint(s.spec.ShortID)
 		if err != nil {
-			return nil, err
+			return broadcastResult{}, err
 		}
 		if !s.node.deduper.Mark(fingerprint, time.Now()) {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 
 		validateStarted := s.node.startBroadcastPipelineStage()
@@ -257,81 +283,76 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		}
 		s.node.observeBroadcastPipelineStageSince(validateStarted, broadcastPipelineStageShardDescValidate, kind, delivery, validateResult)
 		if err != nil {
-			s.log.Debug().
-				Err(err).
-				Str("block", formatBlockRef(data.Block.ID)).
-				Str("kind", kind).
-				Msg("dropping shard block broadcast because validator signatures are not verified")
-			s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
-			return nil, nil
+			return s.dropUnverifiedBroadcast(fingerprint, kind, data.Block.ID, sourcePeerID, err)
 		}
 		rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 		if err != nil {
 			s.node.deduper.Forget(fingerprint)
-			return nil, err
+			return broadcastResult{}, err
 		}
 		accepted := s.acceptedShardBlockBroadcast(fingerprint, delivery, trusted, data.Block.ID, sourcePeerID, desc)
 		accepted.deduped = true
 		accepted.rebroadcast = rebroadcast
-		return accepted, nil
+		return acceptedBroadcastResult(accepted), nil
 	case tonnodeapi.NewExternalMessageBroadcast:
 		kind := "tonNode.externalMessageBroadcast"
 		if !s.allowCustomBroadcastSource(kind, sourcePeerID, customBroadcastRoleMessage) {
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		if len(data.Message.Data) == 0 {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		if len(data.Message.Data) > maxOverlayPayloadSize {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "oversize_payload")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 
 		hash := externalMessageFingerprint(s.spec.ShortID, data.Message.Data)
 		now := time.Now()
 		if !s.node.processedExternalMessages.Mark(hash, now) {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		if s.node.myExternalMessages.Seen(hash, now) {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		parsed, err := parseExternalMessageData(data.Message.Data)
 		if err != nil {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		addrKey := parsed.address
 		if err = s.node.addExternalMessageAddressLimit(addrKey, now); err != nil {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "address_rate_limited")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
-		if err = s.node.acceptExternalMessage(s.node.runtimeContext(), ExternalMessageEvent{
+		if err = s.node.acceptExternalMessage(s.node.runCtx, ExternalMessageEvent{
 			Body:    data.Message.Data,
 			Root:    parsed.root,
 			Message: parsed.message,
 		}); err != nil {
-			s.node.dropExternalMessageAddressLimit(addrKey, now)
+			s.node.externalMessageLimiter.Remove(addrKey, now)
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "external_message_rejected")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 
 		rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 		if err != nil {
-			s.node.dropExternalMessageAddressLimit(addrKey, now)
-			return nil, err
+			s.node.externalMessageLimiter.Remove(addrKey, now)
+			return broadcastResult{}, err
 		}
 
 		// The crc64 key was already marked in processedExternalMessages above;
 		// reuse it (deduped) instead of hashing the payload again and filling
 		// the shared block deduper with high-rate externals.
-		return &acceptedBroadcast{
+		return acceptedBroadcastResult(acceptedBroadcast{
 			fingerprint: hash,
 			deduped:     true,
+			delivery:    delivery,
 			rebroadcast: rebroadcast,
-		}, nil
+		}), nil
 	case tonnodeapi.NewBlockCandidateBroadcast:
 		return s.classifyBlockCandidateBroadcast(
 			"tonNode.newBlockCandidateBroadcast",
@@ -360,30 +381,35 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			data.SignatureSet,
 			peer, payload, delivery, trusted, sourcePeerID,
 		)
+	case OutMsgQueueProofBroadcast:
+		// cppnode currently leaves application processing disabled, while the
+		// overlay still relays an admitted broadcast.
+		return acceptedBroadcastResult(acceptedBroadcast{}), nil
 	case IhrMessageBroadcast:
 		kind := "tonNode.ihrMessageBroadcast"
-		if s.spec.Kind == overlayKindCustomFixed {
+		if s.spec.dropsIHRBroadcasts() {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "unsupported_custom_broadcast")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		if len(data.Message.Data) == 0 {
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
 		fingerprint, err := payload.fingerprint(s.spec.ShortID)
 		if err != nil {
-			return nil, err
+			return broadcastResult{}, err
 		}
 		rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 		if err != nil {
-			return nil, err
+			return broadcastResult{}, err
 		}
-		return &acceptedBroadcast{
+		return acceptedBroadcastResult(acceptedBroadcast{
 			fingerprint: fingerprint,
+			delivery:    delivery,
 			rebroadcast: rebroadcast,
-		}, nil
+		}), nil
 	default:
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 }
 
@@ -397,22 +423,22 @@ func (s *overlaySubscription) classifyFullBlockBroadcast(
 	delivery Delivery,
 	trusted bool,
 	sourcePeerID PeerID,
-) (*acceptedBroadcast, error) {
+) (broadcastResult, error) {
 	if !s.allowCustomBroadcastSource(kind, sourcePeerID, customBroadcastRoleBlock) {
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 	if !valid {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
-	if s.node.alreadyAppliedMasterchainBroadcast(block) {
+	if s.node.alreadyAppliedBroadcast(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
 	fingerprint, err := payload.fingerprint(s.spec.ShortID)
 	if err != nil {
-		return nil, err
+		return broadcastResult{}, err
 	}
 	return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourcePeerID, msg, payload, peer)
 }
@@ -427,22 +453,22 @@ func (s *overlaySubscription) classifyBlockCandidateBroadcast(
 	delivery Delivery,
 	trusted bool,
 	sourcePeerID PeerID,
-) (*acceptedBroadcast, error) {
+) (broadcastResult, error) {
 	if !s.allowCustomBroadcastSource(kind, sourcePeerID, customBroadcastRoleBlock) {
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 	if !valid {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
-	if s.node.alreadyAppliedMasterchainBroadcast(block) {
+	if s.node.alreadyAppliedBroadcast(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
 	fingerprint, err := payload.fingerprint(s.spec.ShortID)
 	if err != nil {
-		return nil, err
+		return broadcastResult{}, err
 	}
 	return s.acceptedBlockCandidateBroadcast(fingerprint, delivery, trusted, kind, block, msg, payload, peer, sourcePeerID)
 }
@@ -456,45 +482,45 @@ func (s *overlaySubscription) classifyBlockFinalityBroadcast(
 	delivery Delivery,
 	trusted bool,
 	sourcePeerID PeerID,
-) (*acceptedBroadcast, error) {
+) (broadcastResult, error) {
 	if !s.allowCustomBroadcastSource(kind, sourcePeerID, customBroadcastRoleBlock) {
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
-	if !validBlockID(block) {
+	if !storage.BlockIDHashesKnown(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
-	if s.node.alreadyAppliedMasterchainBroadcast(block) {
+	if s.node.alreadyAppliedBroadcast(block) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
 	fingerprint, err := payload.fingerprint(s.spec.ShortID)
 	if err != nil {
-		return nil, err
+		return broadcastResult{}, err
 	}
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
 	signatures, err := broadcastSignatureSetFromTL(signatureSet)
 	if err != nil {
 		s.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(block)).
+			Str("block", storage.FormatBlockRef(block)).
 			Str("kind", kind).
 			Msg("dropping block finality broadcast because validator signatures cannot be parsed")
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 	if !signatures.IsSimplex() {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 	if isMasterchainBlock(block) && !signatures.Final() {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
 	checkStarted := s.node.startBroadcastPipelineStage()
@@ -505,31 +531,23 @@ func (s *overlaySubscription) classifyBlockFinalityBroadcast(
 	}
 	s.node.observeBroadcastPipelineStageSince(checkStarted, broadcastPipelineStageFinalitySigCheck, kind, delivery, checkResult)
 	if err != nil {
-		s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, err)
-		s.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Str("kind", kind).
-			Msg("dropping block finality broadcast because validator signatures are not verified")
-		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
-		return nil, nil
+		return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, err)
 	}
 
 	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 	if err != nil {
 		s.node.deduper.Forget(fingerprint)
-		return nil, err
+		return broadcastResult{}, err
 	}
 	if err = rebroadcast.materializePayload(); err != nil {
 		s.node.deduper.Forget(fingerprint)
-		return nil, err
+		return broadcastResult{}, err
 	}
 
 	payloadLen := rebroadcast.payloadLen()
 	assembleStarted := s.node.startBroadcastPipelineStage()
 	assembled, assembleErr := s.node.rememberBlockFinality(checkedBlockFinality{
 		block:                 block,
-		signatures:            signatures,
 		signaturesCell:        signatureCheck.SignaturesCell,
 		signaturesVerifiedKey: signatureCheck.SignaturesVerifiedKey,
 		sourcePeerID:          sourcePeerID,
@@ -549,11 +567,11 @@ func (s *overlaySubscription) classifyBlockFinalityBroadcast(
 	if len(assembled) > 0 {
 		accepted.event.Downloaded = &assembled[0]
 	}
-	return accepted, nil
+	return acceptedBroadcastResult(accepted), nil
 }
 
 func (s *overlaySubscription) allowCustomBroadcastSource(kind string, sourcePeerID PeerID, role customBroadcastRole) bool {
-	if s.spec.Kind != overlayKindCustomFixed {
+	if !s.spec.authorizesBroadcastSenders() {
 		return true
 	}
 	if sourcePeerID.IsZero() {
@@ -582,11 +600,13 @@ func (s *overlaySubscription) inboundRebroadcast(kind string, payload []byte, pe
 	}
 
 	return &rebroadcastRequest{
-		subscription:           s,
-		kind:                   kind,
-		payload:                payload,
-		sourcePeerID:           sourcePeerID,
-		skipOverlayRebroadcast: delivery == DeliveryTwoStep || (delivery == DeliveryFEC && s.broadcastFECRelayEnabled()),
+		subscription: s,
+		kind:         kind,
+		payload:      payload,
+		sourcePeerID: sourcePeerID,
+		skipOverlayRebroadcast: delivery == DeliveryTwoStep ||
+			delivery == DeliveryPlumtree ||
+			(delivery == DeliveryFEC && s.spec.relaysFECBroadcasts()),
 	}
 }
 
@@ -607,9 +627,10 @@ func (s *overlaySubscription) inboundRebroadcastPayload(kind string, payload *br
 	return rebroadcast, nil
 }
 
-func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID) *acceptedBroadcast {
-	return &acceptedBroadcast{
+func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID) acceptedBroadcast {
+	return acceptedBroadcast{
 		fingerprint: fingerprint,
+		delivery:    delivery,
 		block:       block.Copy(),
 		event: &BroadcastEvent{
 			Overlay:      s.spec.Name,
@@ -623,7 +644,30 @@ func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, deliver
 	}
 }
 
-func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, block ton.BlockIDExt, sourcePeerID PeerID, desc *ShardBlockDescription) *acceptedBroadcast {
+func (s *overlaySubscription) acceptedProcessedBlockBroadcast(
+	fingerprint string,
+	delivery Delivery,
+	kind string,
+	block ton.BlockIDExt,
+	payload *broadcastPayload,
+	peer *overlayPeer,
+) (broadcastResult, error) {
+	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+	if err != nil {
+		s.node.deduper.Forget(fingerprint)
+		return broadcastResult{}, err
+	}
+
+	return acceptedBroadcastResult(acceptedBroadcast{
+		fingerprint: fingerprint,
+		deduped:     true,
+		delivery:    delivery,
+		block:       block.Copy(),
+		rebroadcast: rebroadcast,
+	}), nil
+}
+
+func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, block ton.BlockIDExt, sourcePeerID PeerID, desc *ShardBlockDescription) acceptedBroadcast {
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, "tonNode.newShardBlockBroadcast", block, sourcePeerID)
 	accepted.event.ShardDescription = desc
 	return accepted
@@ -651,37 +695,59 @@ func (s *overlaySubscription) blockFinalityBroadcastEvents(delivery Delivery, tr
 	return events
 }
 
-func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID, msg any, payload *broadcastPayload, peer *overlayPeer) (*acceptedBroadcast, error) {
+func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, sourcePeerID PeerID, msg any, payload *broadcastPayload, peer *overlayPeer) (broadcastResult, error) {
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
-	proofRoot, preSigSet, signaturesChecked, err := predecodeBlockBroadcastSignatureCheck(block, msg)
-	if err != nil {
+	predecodedSignatureCheck, err := predecodeBlockBroadcastSignatureCheck(block, msg)
+	signaturesChecked := false
+	switch {
+	case errors.Is(err, errBlockBroadcastSignatureCheckNotApplicable):
+		err = nil
+	case err != nil:
 		s.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(block)).
+			Str("block", storage.FormatBlockRef(block)).
 			Str("kind", kind).
 			Msg("dropping block broadcast because validator signatures cannot be prepared before decode")
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
+	default:
+		signaturesChecked = true
 	}
+	proofRoot := predecodedSignatureCheck.proofRoot
+	preSigSet := predecodedSignatureCheck.signatureSet
 
-	// the validator-signature pass only needs the parsed proof root and the
-	// signature set, so it runs concurrently with the expensive block decode
-	var sigCheck chan error
+	// Nothing expensive may run on an unverified payload: the signature pass
+	// needs only the proof root and the signature set parsed above, so it goes
+	// first and the decode below is reached by verified broadcasts alone. This
+	// is the reference ordering — process_broadcast(blockBroadcastCompressedV2)
+	// gates obtain_state_for_decompression on validate_block_broadcast_signatures
+	// — and it is what keeps a replayed payload from buying a decode worker.
 	if signaturesChecked {
-		sigCheck = make(chan error, 1)
-		go func() {
-			sigCheck <- s.node.checkBlockBroadcastSignatures(kind, block, proofRoot, preSigSet)
-		}()
+		checkStarted := s.node.startBroadcastPipelineStage()
+		sigErr := s.node.checkBlockBroadcastSignatures(kind, block, proofRoot, preSigSet)
+		checkResult := broadcastPipelineResultSuccess
+		if sigErr != nil {
+			checkResult = broadcastPipelineResultError
+		}
+		s.node.observeBroadcastPipelineStageSince(checkStarted, broadcastPipelineStageBlockSigCheck, kind, delivery, checkResult)
+		if sigErr != nil {
+			return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, sigErr)
+		}
 	}
 
 	// the same block arrives once per delivery path (public FEC + custom
 	// two-step) under different broadcast fingerprints; the decode result is
 	// pinned by the block id, so reuse it instead of decoding again
-	downloaded, sigSet, cached := s.node.cachedDecodedBroadcast(kind, block)
+	downloaded, sigSet, cacheErr := s.node.decodedBroadcasts.get(kind, block)
+	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
+		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	}
+	cached := cacheErr == nil
 	if cached && !signaturesChecked {
 		// v1 tonNode.blockBroadcastCompressed carries its validator
 		// signatures inside the payload, so preSigSet is nil and a cached
@@ -692,35 +758,22 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 		downloaded, sigSet, cached = nil, nil, false
 	}
 	if cached {
-		s.node.noteBroadcast("decode_reused", s.spec.Name, kind)
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
 		if preSigSet != nil {
 			sigSet = preSigSet
 		}
 	}
 
-	// kinds whose signatures are already verified can leave the expensive
-	// decode to the bounded pool: joining the signature check first keeps the
-	// trust gate on this thread (a failure still suppresses FEC relay), while
-	// a nil return right after lets the overlay relay the hash-verified,
-	// signature-verified payload without waiting out a multi-MB decode
+	// kinds whose signatures are verified above can leave the expensive decode
+	// to the bounded pool and return right away, so the overlay relays the
+	// hash-verified, signature-verified payload without waiting out the decode
+	var rebroadcast *rebroadcastRequest
 	if !cached && signaturesChecked {
-		if sigErr := <-sigCheck; sigErr != nil {
-			s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, sigErr)
-			s.log.Debug().
-				Err(sigErr).
-				Str("block", formatBlockRef(block)).
-				Str("kind", kind).
-				Str("source_peer_id", sourcePeerID.String()).
-				Msg("dropping block broadcast because validator signatures are not verified")
-			s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
-			return nil, nil
-		}
-		sigCheck = nil
-
-		rebroadcast, rbErr := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+		var rbErr error
+		rebroadcast, rbErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 		if rbErr != nil {
 			s.node.deduper.Forget(fingerprint)
-			return nil, rbErr
+			return broadcastResult{}, rbErr
 		}
 		if s.node.enqueueBroadcastDecode(offloadedBroadcastDecode{
 			fingerprint:  fingerprint,
@@ -743,9 +796,10 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			// payload does not wait out the decode — the fanout deduper keeps
 			// the worker's completion from fanning out a second time
 			blockCopy := cloneBlockID(block)
-			accepted := &acceptedBroadcast{
+			accepted := acceptedBroadcast{
 				fingerprint: fingerprint,
 				deduped:     true,
+				delivery:    delivery,
 				block:       &blockCopy,
 				rebroadcast: rebroadcast,
 			}
@@ -753,61 +807,64 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 				wake := block
 				accepted.masterchainWake = &wake
 			}
-			return accepted, nil
+			return acceptedBroadcastResult(accepted), nil
 		}
+		// pool refused: the decode below runs inline on this thread
 	}
 
 	if !cached {
-		downloaded, sigSet, err = s.node.decodeBroadcastBlock(s.node.runtimeContext(), msg, proofRoot, preSigSet)
+		// Reached either because the payload kind cannot be offloaded (v1
+		// carries its signatures inside the payload) or because the decode pool
+		// refused it. The latter means this multi-MB decode now runs on a
+		// transport receive goroutine, so it is measured separately from the
+		// pool's decode_async stage.
+		decodeStarted := s.node.startBroadcastPipelineStage()
+		downloaded, sigSet, err = s.node.decodeBroadcastBlock(s.node.runCtx, msg, proofRoot, preSigSet)
+		decodeResult := broadcastPipelineResultSuccess
+		if err != nil {
+			decodeResult = broadcastPipelineResultError
+			if isBroadcastDecompressionStateNotReady(err) {
+				decodeResult = broadcastPipelineResultMiss
+			}
+		}
+		s.node.observeBroadcastPipelineStageSince(decodeStarted, broadcastPipelineStageDecodeInline, kind, delivery, decodeResult)
 		// v1 payloads carry unverified signatures at this point, and their
 		// deliveries never read the cache anyway — cache only verified kinds
-		if err == nil && downloaded != nil && signaturesChecked {
-			s.node.rememberDecodedBroadcast(kind, block, downloaded, sigSet)
-		}
-	}
-	if sigCheck != nil {
-		if sigErr := <-sigCheck; sigErr != nil {
-			s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, sigErr)
-			s.log.Debug().
-				Err(sigErr).
-				Str("block", formatBlockRef(block)).
-				Str("kind", kind).
-				Str("source_peer_id", sourcePeerID.String()).
-				Msg("dropping block broadcast because validator signatures are not verified")
-			s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
-			return nil, nil
+		if err == nil && signaturesChecked {
+			s.node.decodedBroadcasts.put(kind, block, downloaded, sigSet)
 		}
 	}
 	if err != nil {
 		stateNotReady := isBroadcastDecompressionStateNotReady(err)
-		var rebroadcast *rebroadcastRequest
 		if stateNotReady {
 			pendingState, ok := broadcastDecompressionStateNotReady(err)
 			if !ok {
 				s.log.Debug().
 					Err(err).
-					Str("block", formatBlockRef(block)).
+					Str("block", storage.FormatBlockRef(block)).
 					Str("kind", kind).
 					Msg("dropping pending block broadcast because state-ready artifact is missing")
 				s.node.noteBroadcastDrop(s.spec.Name, kind, "state_artifact_missing")
-				return nil, nil
+				return ignoredBroadcastResult(), nil
 			}
 
 			_, isV2 := msg.(tonnodeapi.BlockBroadcastCompressedV2)
 			if !isV2 {
 				s.log.Debug().
 					Err(err).
-					Str("block", formatBlockRef(block)).
+					Str("block", storage.FormatBlockRef(block)).
 					Str("kind", kind).
 					Msg("dropping pending block broadcast because payload type is not compressed-v2")
 				s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
-				return nil, nil
+				return ignoredBroadcastResult(), nil
 			}
-			var payloadErr error
-			rebroadcast, payloadErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
-			if payloadErr != nil {
-				s.node.deduper.Forget(fingerprint)
-				return nil, payloadErr
+			if rebroadcast == nil {
+				var payloadErr error
+				rebroadcast, payloadErr = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+				if payloadErr != nil {
+					s.node.deduper.Forget(fingerprint)
+					return broadcastResult{}, payloadErr
+				}
 			}
 
 			var verifiedSignaturesKey []byte
@@ -831,55 +888,59 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			})
 			s.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(block)).
+				Str("block", storage.FormatBlockRef(block)).
 				Str("kind", kind).
 				Msg("queued block broadcast until previous state is available")
 		} else {
 			s.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(block)).
+				Str("block", storage.FormatBlockRef(block)).
 				Str("kind", kind).
 				Msg("dropping block broadcast because payload decode failed")
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "decode_failed")
 		}
 
 		if !stateNotReady {
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
-		accepted := &acceptedBroadcast{
+		accepted := acceptedBroadcast{
 			fingerprint: fingerprint,
 			deduped:     true,
+			delivery:    delivery,
 			rebroadcast: rebroadcast,
 		}
 		if block.Workchain == -1 && block.Shard == topShard {
 			wake := block
 			accepted.masterchainWake = &wake
 		}
-		return accepted, nil
+		return acceptedBroadcastResult(accepted), nil
 	}
 
-	if !signaturesChecked && (sigSet == nil || downloaded == nil) {
+	if !signaturesChecked && sigSet == nil {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_parse_failed")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 	if !signaturesChecked {
+		// v1 compressed payloads carry their signatures inside the payload, so
+		// this kind alone pays the decode before it can be verified
+		checkStarted := s.node.startBroadcastPipelineStage()
 		err = s.node.checkBlockBroadcastSignatures(kind, block, downloaded.Proof, sigSet)
+		checkResult := broadcastPipelineResultSuccess
+		if err != nil {
+			checkResult = broadcastPipelineResultError
+		}
+		s.node.observeBroadcastPipelineStageSince(checkStarted, broadcastPipelineStageBlockSigCheck, kind, delivery, checkResult)
 	}
 	if err != nil {
-		s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, err)
-		s.log.Debug().
-			Err(err).
-			Str("block", formatBlockRef(block)).
-			Str("kind", kind).
-			Msg("dropping block broadcast because validator signatures are not verified")
-		s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
-		return nil, nil
+		return s.dropUnverifiedBroadcast(fingerprint, kind, block, sourcePeerID, err)
 	}
 
-	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
-	if err != nil {
-		s.node.deduper.Forget(fingerprint)
-		return nil, err
+	if rebroadcast == nil {
+		rebroadcast, err = s.inboundRebroadcastPayload(kind, payload, peer, delivery)
+		if err != nil {
+			s.node.deduper.Forget(fingerprint)
+			return broadcastResult{}, err
+		}
 	}
 
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourcePeerID)
@@ -893,31 +954,30 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	}
 	accepted.event.Downloaded = downloaded
 	accepted.rebroadcast = rebroadcast
-	return accepted, nil
+	if signaturesChecked {
+		accepted.processedDecodeKind = kind
+	}
+	return acceptedBroadcastResult(accepted), nil
 }
 
-// NoteAppliedMasterchainSeqno records the highest applied masterchain seqno.
-// Classify drops masterchain block broadcasts at or below it before any proof
-// parsing or signature verification, mirroring the reference node's
-// validate-broadcast early exit for already-applied blocks.
-func (n *Node) NoteAppliedMasterchainSeqno(seqno uint32) {
-	for {
-		current := n.appliedMasterchainSeqno.Load()
-		if seqno <= current {
-			return
-		}
-		if n.appliedMasterchainSeqno.CompareAndSwap(current, seqno) {
-			return
-		}
-	}
-}
+// dropUnverifiedBroadcast is the single policy point for signature-check
+// failures: retryable ones are forgotten so a later delivery re-runs
+// admission (and propagate err so the receiver retries), permanent ones stay
+// deduplicated and are ignored.
+func (s *overlaySubscription) dropUnverifiedBroadcast(fingerprint, kind string, block ton.BlockIDExt, sourcePeerID PeerID, err error) (broadcastResult, error) {
+	s.node.forgetBroadcastFingerprintIfRetryable(fingerprint, err)
+	s.log.Debug().
+		Err(err).
+		Str("block", storage.FormatBlockRef(block)).
+		Str("kind", kind).
+		Str("source_peer_id", sourcePeerID.String()).
+		Msg("dropping broadcast because validator signatures are not verified")
+	s.node.noteBroadcastDrop(s.spec.Name, kind, "signature_check_failed")
 
-func (n *Node) alreadyAppliedMasterchainBroadcast(block ton.BlockIDExt) bool {
-	if !isMasterchainBlock(block) {
-		return false
+	if errors.Is(err, ErrBroadcastSignatureRetryable) {
+		return broadcastResult{}, err
 	}
-	applied := n.appliedMasterchainSeqno.Load()
-	return applied > 0 && block.SeqNo <= applied
+	return ignoredBroadcastResult(), nil
 }
 
 func (n *Node) forgetBroadcastFingerprintIfRetryable(fingerprint string, err error) {
@@ -928,15 +988,20 @@ func (n *Node) forgetBroadcastFingerprintIfRetryable(fingerprint string, err err
 	n.deduper.Forget(fingerprint)
 }
 
-func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, msg any, payload *broadcastPayload, peer *overlayPeer, sourcePeerID PeerID) (*acceptedBroadcast, error) {
+func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string, delivery Delivery, trusted bool, kind string, block ton.BlockIDExt, msg any, payload *broadcastPayload, peer *overlayPeer, sourcePeerID PeerID) (broadcastResult, error) {
 	if !s.node.deduper.Mark(fingerprint, time.Now()) {
 		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
-		return nil, nil
+		return ignoredBroadcastResult(), nil
 	}
 
-	downloaded, _, cached := s.node.cachedDecodedBroadcast(kind, block)
+	downloaded, _, cacheErr := s.node.decodedBroadcasts.get(kind, block)
+	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
+		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	}
+	cached := cacheErr == nil
 	if cached {
-		s.node.noteBroadcast("decode_reused", s.spec.Name, kind)
+		s.node.noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
 	} else {
 		decodeStarted := s.node.startBroadcastPipelineStage()
 		var err error
@@ -949,19 +1014,19 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 		if err != nil {
 			s.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(block)).
+				Str("block", storage.FormatBlockRef(block)).
 				Str("kind", kind).
 				Msg("dropping block candidate broadcast because payload decode failed")
 			s.node.noteBroadcastDrop(s.spec.Name, kind, "decode_failed")
-			return nil, nil
+			return ignoredBroadcastResult(), nil
 		}
-		s.node.rememberDecodedBroadcast(kind, block, downloaded, nil)
+		s.node.decodedBroadcasts.put(kind, block, downloaded, nil)
 	}
 
 	rebroadcast, err := s.inboundRebroadcastPayload(kind, payload, peer, delivery)
 	if err != nil {
 		s.node.deduper.Forget(fingerprint)
-		return nil, err
+		return broadcastResult{}, err
 	}
 
 	downloaded.SourcePeerID = sourcePeerID
@@ -976,19 +1041,21 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	s.node.observeBroadcastPipelineStageSince(assembleStarted, broadcastPipelineStageFinalityAssemble, kind, delivery, assembleResult)
 	s.node.rememberShardBlockCandidate(downloaded)
 	s.node.publishNonfinalDownloadedBlock(downloaded, storage.LiveBlockNonfinalCandidate)
-	if s.node.blockReceivedHooks && !isMasterchainBlock(downloaded.ID) {
-		s.node.observeBlockReceived(s.node.runtimeContext(), downloaded, false)
+	if !isMasterchainBlock(downloaded.ID) {
+		s.node.observeBlockReceived(s.node.runCtx, downloaded, false)
 	}
 
-	accepted := &acceptedBroadcast{
-		fingerprint: fingerprint,
-		deduped:     true,
-		block:       block.Copy(),
-		rebroadcast: rebroadcast,
+	accepted := acceptedBroadcast{
+		fingerprint:         fingerprint,
+		deduped:             true,
+		delivery:            delivery,
+		block:               block.Copy(),
+		rebroadcast:         rebroadcast,
+		processedDecodeKind: kind,
 	}
 	accepted.extraEvents = s.blockFinalityBroadcastEvents(delivery, trusted, assembled)
 
-	return accepted, nil
+	return acceptedBroadcastResult(accepted), nil
 }
 
 func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
@@ -1014,14 +1081,28 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 
 	if accepted.rebroadcast != nil {
 		if !acceptedNoted && !accepted.skipAcceptedMetric {
-			n.noteBroadcast("accepted", accepted.rebroadcast.overlayName(), accepted.rebroadcast.kind)
+			n.noteBroadcast(
+				"accepted",
+				accepted.rebroadcast.subscription.spec.Name,
+				accepted.rebroadcast.kind,
+				accepted.delivery,
+			)
 		}
 		if !accepted.rebroadcast.skipOverlayRebroadcast {
 			accepted.rebroadcast.subscription.enqueueRebroadcast(*accepted.rebroadcast)
 		}
 	}
 
-	n.enqueueCustomOverlayFanout(accepted)
+	n.enqueueBlockOverlayFanout(accepted)
+	// A rejected application event remains retryable through another delivery, so
+	// only a successfully queued event may release the reusable decoded payload.
+	// An event-free accept (the candidate path, which carries only extraEvents)
+	// releases unconditionally: its payload is already pinned by the candidate
+	// and finality caches, which outlive this entry and are consulted before any
+	// network fetch.
+	if accepted.processedDecodeKind != "" && (accepted.event == nil || acceptedNoted) {
+		n.decodedBroadcasts.markProcessed(accepted.processedDecodeKind, *accepted.block)
+	}
 }
 
 func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric bool) bool {
@@ -1038,36 +1119,41 @@ func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric boo
 		}
 		n.observeBroadcastPipelineStageSince(cacheStarted, broadcastPipelineStageHotCacheNotify, event.Kind, event.Delivery, cacheResult)
 		n.publishNonfinalDownloadedBlock(event.Downloaded, storage.LiveBlockNonfinalSigned)
-		if n.blockReceivedHooks {
-			n.observeBlockReceived(n.runtimeContext(), event.Downloaded, true)
-		}
+		n.observeBroadcastBlockReceived(n.runCtx, event.Downloaded, true)
 	}
 	if !n.eventQueue.Push(event) {
 		return false
 	}
+	if event.Delivery == DeliveryPlumtree {
+		n.plumtreeBroadcastLogOnce.Do(func() {
+			n.log.Debug().
+				Str("overlay", event.Overlay).
+				Str("kind", event.Kind).
+				Str("block", storage.FormatBlockRef(event.Block)).
+				Str("source_peer_id", event.SourcePeerID.String()).
+				Msg("accepted first Plumtree broadcast")
+		})
+	}
 	if !skipAcceptedMetric {
-		n.noteBroadcast("accepted", event.Overlay, event.Kind)
+		n.noteBroadcast("accepted", event.Overlay, event.Kind, event.Delivery)
+		n.noteBroadcastSourcePeer(event.Overlay, event.SourcePeerID)
 	}
 	return true
 }
 
-func (n *Node) enqueueCustomOverlayFanout(accepted acceptedBroadcast) {
-	if n.customFanoutDeduper == nil || accepted.rebroadcast == nil || accepted.block == nil {
+func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) {
+	if accepted.rebroadcast == nil || accepted.block == nil {
 		return
 	}
 
-	class, ok := customFanoutClass(accepted.rebroadcast.kind)
+	class, ok := blockOverlayFanoutClass(accepted.rebroadcast.kind)
 	if !ok {
 		return
 	}
 
-	targets := n.customOverlayFanoutTargets(accepted)
-	if len(targets) == 0 {
-		return
-	}
-
-	key := customFanoutKey(class, *accepted.block)
-	if !n.customFanoutDeduper.Mark(key, time.Now()) {
+	customTargets := n.customOverlayFanoutTargets(accepted)
+	fastSyncTarget := n.fastSyncFanoutTarget(accepted)
+	if len(customTargets) == 0 && fastSyncTarget == nil {
 		return
 	}
 
@@ -1076,14 +1162,19 @@ func (n *Node) enqueueCustomOverlayFanout(accepted acceptedBroadcast) {
 		n.log.Debug().
 			Err(err).
 			Str("kind", source.kind).
-			Msg("dropping custom fanout because payload cannot be serialized")
+			Msg("dropping overlay fanout because payload cannot be serialized")
 		return
 	}
 	if len(source.payload) == 0 {
 		return
 	}
 
-	for _, sub := range targets {
+	key := blockOverlayFanoutKey(class, *accepted.block)
+	if !n.overlayFanoutDeduper.Mark(key, time.Now()) {
+		return
+	}
+
+	for _, sub := range customTargets {
 		req := rebroadcastRequest{
 			subscription: sub,
 			kind:         source.kind,
@@ -1095,6 +1186,14 @@ func (n *Node) enqueueCustomOverlayFanout(accepted acceptedBroadcast) {
 		}
 		sub.enqueueRebroadcast(req)
 	}
+	if fastSyncTarget != nil {
+		n.sendFastSyncFanout(
+			fastSyncTarget,
+			source.kind,
+			source.payload,
+			*accepted.block,
+		)
+	}
 }
 
 func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlaySubscription {
@@ -1103,7 +1202,7 @@ func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlay
 		if sub == nil || sub == accepted.rebroadcast.subscription {
 			continue
 		}
-		if sub.spec.Kind != overlayKindCustomFixed || !sub.isActive() {
+		if !sub.spec.originatesLocalBroadcasts() || !sub.isActive() {
 			continue
 		}
 		if _, ok := sub.spec.BlockSenders[n.localID]; !ok {
@@ -1117,13 +1216,154 @@ func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlay
 	return targets
 }
 
-func customFanoutClass(kind string) (string, bool) {
+// fastSyncFanoutTarget picks the FastSync overlay to re-originate an accepted
+// broadcast into. This is deliberately NOT what the reference node does: its
+// receive path relays into custom overlays only, and its FastSync sends come
+// exclusively from blocks the node produced itself. We have no block-origination
+// API yet, so the only way this node can feed a FastSync overlay is to forward
+// what it accepted elsewhere — a public-to-FastSync gateway. Revisit when a
+// send API exists: with one, a validator should originate its own blocks here
+// instead of re-emitting observed ones, which the FastSync relay already carries.
+func (n *Node) fastSyncFanoutTarget(
+	accepted acceptedBroadcast,
+) *overlaySubscription {
+	var sub *overlaySubscription
+	if accepted.rebroadcast.kind == "tonNode.newShardBlockBroadcast" {
+		sub = n.fastSyncSubscriptionForBlock(ton.BlockIDExt{
+			Workchain: -1,
+			Shard:     topShard,
+		})
+	} else {
+		sub = n.fastSyncSubscriptionForBlock(*accepted.block)
+	}
+	if sub == nil ||
+		sub == accepted.rebroadcast.subscription ||
+		!sub.isActive() ||
+		!sub.fastSync.spec.localValidator {
+		return nil
+	}
+	return sub
+}
+
+func (n *Node) sendFastSyncFanout(
+	sub *overlaySubscription,
+	kind string,
+	payload []byte,
+	block ton.BlockIDExt,
+) {
 	switch kind {
-	case "tonNode.blockBroadcast", "tonNode.blockBroadcastCompressed", "tonNode.blockBroadcastCompressedV2",
-		"tonNode.newBlockCandidateBroadcast", "tonNode.newBlockCandidateBroadcastCompressed",
-		"tonNode.newBlockCandidateBroadcastCompressedV2",
-		blockFinalityBroadcastKind:
+	case "tonNode.newBlockCandidateBroadcast",
+		"tonNode.newBlockCandidateBroadcastCompressed",
+		"tonNode.newBlockCandidateBroadcastCompressedV2":
+		if sub.fastSync.spec.plumtreeEnabled {
+			n.originateFastSyncPlumtreeFEC(sub, kind, payload)
+			return
+		}
+	case blockFinalityBroadcastKind:
+		if !sub.fastSync.spec.plumtreeEnabled {
+			return
+		}
+
+		broadcastID, err := finalityPlumtreeBroadcastID(block)
+		if err != nil {
+			sub.log.Debug().
+				Err(err).
+				Str("kind", kind).
+				Msg("dropping FastSync finality fanout")
+			return
+		}
+		n.originateFastSyncPlumtreeSimple(
+			sub,
+			kind,
+			broadcastID,
+			payload,
+		)
+		return
+	}
+
+	sub.enqueueRebroadcast(rebroadcastRequest{
+		subscription: sub,
+		kind:         kind,
+		payload:      payload,
+		local:        true,
+	})
+}
+
+func (n *Node) originateFastSyncPlumtreeFEC(
+	sub *overlaySubscription,
+	kind string,
+	payload []byte,
+) {
+	if !n.canAcceptBroadcast(kind, true) {
+		n.noteBroadcastDrop(
+			sub.spec.Name,
+			kind,
+			"broadcast_admission_closed",
+		)
+		return
+	}
+	if err := sub.plumtree.OriginateFEC(
+		overlay.BroadcastFlagAnySender,
+		payload,
+	); err != nil {
+		sub.log.Debug().
+			Err(err).
+			Str("kind", kind).
+			Msg("failed to originate FastSync Plumtree FEC broadcast")
+	}
+}
+
+func (n *Node) originateFastSyncPlumtreeSimple(
+	sub *overlaySubscription,
+	kind string,
+	broadcastID [sha256.Size]byte,
+	payload []byte,
+) {
+	if !n.canAcceptBroadcast(kind, true) {
+		n.noteBroadcastDrop(
+			sub.spec.Name,
+			kind,
+			"broadcast_admission_closed",
+		)
+		return
+	}
+	if err := sub.plumtree.OriginateSimple(
+		overlay.BroadcastFlagAnySender,
+		broadcastID,
+		payload,
+	); err != nil {
+		sub.log.Debug().
+			Err(err).
+			Str("kind", kind).
+			Msg("failed to originate FastSync Plumtree broadcast")
+	}
+}
+
+func finalityPlumtreeBroadcastID(
+	block ton.BlockIDExt,
+) ([sha256.Size]byte, error) {
+	hash, err := tl.Hash(FinalityBroadcastID{ID: block})
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+
+	var id [sha256.Size]byte
+	copy(id[:], hash)
+	return id, nil
+}
+
+func blockOverlayFanoutClass(kind string) (string, bool) {
+	switch kind {
+	case "tonNode.blockBroadcast",
+		"tonNode.blockBroadcastCompressed",
+		"tonNode.blockBroadcastCompressedV2":
 		return "block", true
+	case "tonNode.newBlockCandidateBroadcast",
+		"tonNode.newBlockCandidateBroadcastCompressed",
+		"tonNode.newBlockCandidateBroadcastCompressedV2":
+		return "candidate", true
+	case blockFinalityBroadcastKind:
+		return "finality", true
 	case "tonNode.newShardBlockBroadcast":
 		return "shard-desc", true
 	default:
@@ -1131,8 +1371,25 @@ func customFanoutClass(kind string) (string, bool) {
 	}
 }
 
-func customFanoutKey(class string, block ton.BlockIDExt) string {
-	return class + ":" + formatBlockRef(block)
+func blockOverlayFanoutKey(class string, block ton.BlockIDExt) string {
+	return class + ":" + storage.FormatBlockRef(block)
+}
+
+func fastSyncBroadcastSupported(msg any) bool {
+	switch msg.(type) {
+	case tonnodeapi.BlockBroadcast,
+		tonnodeapi.BlockBroadcastCompressed,
+		tonnodeapi.BlockBroadcastCompressedV2,
+		tonnodeapi.NewShardBlockBroadcast,
+		tonnodeapi.NewBlockCandidateBroadcast,
+		tonnodeapi.NewBlockCandidateBroadcastCompressed,
+		tonnodeapi.NewBlockCandidateBroadcastCompressedV2,
+		BlockFinalityBroadcast,
+		OutMsgQueueProofBroadcast:
+		return true
+	default:
+		return false
+	}
 }
 
 func broadcastKindLabel(msg any) string {
@@ -1155,6 +1412,8 @@ func broadcastKindLabel(msg any) string {
 		return "tonNode.newBlockCandidateBroadcastCompressedV2"
 	case BlockFinalityBroadcast:
 		return blockFinalityBroadcastKind
+	case OutMsgQueueProofBroadcast:
+		return "tonNode.outMsgQueueProofBroadcast"
 	case IhrMessageBroadcast:
 		return "tonNode.ihrMessageBroadcast"
 	default:
@@ -1168,7 +1427,7 @@ func (n *Node) noteSeenAcceptedBroadcastDrop(accepted acceptedBroadcast) {
 		return
 	}
 	if accepted.rebroadcast != nil {
-		n.noteBroadcastDrop(accepted.rebroadcast.overlayName(), accepted.rebroadcast.kind, "seen")
+		n.noteBroadcastDrop(accepted.rebroadcast.subscription.spec.Name, accepted.rebroadcast.kind, "seen")
 	}
 }
 
@@ -1192,23 +1451,16 @@ func externalMessageFingerprint(overlayID []byte, data []byte) string {
 }
 
 func validBlockBroadcast(block ton.BlockIDExt, proof []byte, data []byte) bool {
-	return validBlockID(block) && len(proof) > 0 && len(data) > 0
+	return storage.BlockIDHashesKnown(block) && len(proof) > 0 && len(data) > 0
 }
 
 func validCompressedBroadcast(block ton.BlockIDExt, data []byte) bool {
-	return validBlockID(block) && len(data) > 0
+	return storage.BlockIDHashesKnown(block) && len(data) > 0
 }
 
 func validBlockCandidateBroadcast(block ton.BlockIDExt, data []byte) bool {
-	if !validBlockID(block) || len(data) == 0 || len(data) > maxOverlayPayloadSize {
+	if !storage.BlockIDHashesKnown(block) || len(data) == 0 || len(data) > maxOverlayPayloadSize {
 		return false
 	}
 	return bytes.Equal(hashSimpleBroadcastPayload(data), block.FileHash)
-}
-
-func validBlockID(block ton.BlockIDExt) bool {
-	if len(block.RootHash) != 32 || len(block.FileHash) != 32 {
-		return false
-	}
-	return true
 }

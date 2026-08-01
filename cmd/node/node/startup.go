@@ -7,8 +7,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/xssnick/gton/service/hooks"
 	"io"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -20,6 +20,7 @@ import (
 	"github.com/xssnick/gton"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/hooks"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl/keys"
@@ -99,10 +100,17 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		return
 	}
 
+	exitCode := runConfiguredNode(startOpts, cfg, extensions)
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensions []hooks.ExtensionFactory) int {
 	logOutput, logFile, err := newLogOutput(os.Stdout, startOpts.LogFilePath, startOpts.LogFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid log file config: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if logFile != nil {
 		defer func() {
@@ -129,7 +137,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	if startOpts.LiteQueryWorkers < 0 {
 		logger.Error().Int("workers", startOpts.LiteQueryWorkers).Msg("invalid liteserver query workers")
 		fmt.Fprintf(os.Stderr, "liteserver query workers cannot be negative: %d\n", startOpts.LiteQueryWorkers)
-		os.Exit(1)
+		return 1
 	}
 	liteQueryConcurrency := startOpts.LiteQueryWorkers
 	if liteQueryConcurrency == 0 {
@@ -141,18 +149,21 @@ func Run(extensions ...hooks.ExtensionFactory) {
 
 	pprofCtx, stopPprof := context.WithCancel(context.Background())
 	defer stopPprof()
-	startPprof(pprofCtx, logger, strings.TrimSpace(startOpts.PprofAddr))
+	if err = startPprof(pprofCtx, logger, strings.TrimSpace(startOpts.PprofAddr)); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 1
+	}
 
 	runtimeOpts, err := cfg.RuntimeOptions(startOpts.Node)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	globalConfig, err := prepareGlobalConfig(context.Background(), logger, runtimeOpts.GlobalConfigPath, startOpts.GlobalConfigURL, startOpts.ReplaceGlobalConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	runOpts := runtimeOpts.Node
@@ -163,7 +174,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	liteOpts, liteExtension, err := configureLiteserver(&runOpts, cfg, runtimeOpts, globalConfig, liteQueryConcurrency)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	logger.Info().
 		Bool("liteserver", liteOpts.Enabled).
@@ -182,7 +193,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	httpOpts, httpExtension, err := configureHTTPAPI(cfg, runtimeOpts, globalConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	logger.Info().
 		Bool("http_api", httpOpts.Enabled).
@@ -214,10 +225,10 @@ func Run(extensions ...hooks.ExtensionFactory) {
 
 	err = gton.RunNode(context.Background(), runOpts)
 	if err == nil {
-		return
+		return 0
 	}
 	fmt.Fprintf(os.Stderr, "%v\n", err)
-	os.Exit(1)
+	return 1
 }
 
 func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommands, error) {
@@ -248,7 +259,7 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	pprofAddrFlag := flags.String("pprof-addr", "", "listen address for net/http/pprof, disabled by default")
 	liteQueryWorkersFlag := flags.Int("liteserver-query-workers", 0, "liteserver query worker goroutines, 0 uses tonutils default")
 	archiveCheckpointPeriodFlag := flags.Duration("archive-checkpoint-period", runOpts.ArchiveCheckpointPeriod, "archive catch-up current-state checkpoint max interval")
-	archivePrefetchWindowsFlag := flags.Int("archive-prefetch-windows", runOpts.ArchivePrefetchWindows, "archive catch-up imported window prefetch depth")
+	archivePrefetchWindowsFlag := flags.Int("archive-prefetch-windows", runOpts.ArchivePrefetchWindows, "archive catch-up imported window prefetch depth, 0 uses the default")
 	if err := flags.Parse(args); err != nil {
 		return startupOptions{}, cliCommands{}, err
 	}
@@ -263,6 +274,9 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	}
 	if commands.version || commands.lsPubkey || commands.adnlID {
 		return startOpts, commands, nil
+	}
+	if *archivePrefetchWindowsFlag < 0 {
+		return startupOptions{}, cliCommands{}, fmt.Errorf("archive prefetch windows cannot be negative: %d", *archivePrefetchWindowsFlag)
 	}
 
 	level, err := logutil.ParseLevel(*verbosityFlag)
@@ -350,10 +364,32 @@ func globalConfigURLLabel(url string) string {
 	return url
 }
 
-func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
+const (
+	// pprofMutexProfileFraction samples one in N mutex contention events. Off
+	// by default in Go, which left /debug/pprof/mutex empty exactly when a
+	// stalled node needed it; 1/100 keeps the cost negligible while still
+	// showing which lock is contended.
+	pprofMutexProfileFraction = 100
+	// pprofBlockProfileRateNs samples, on average, one blocking event per this
+	// many nanoseconds spent blocked. At 1ms it ignores ordinary channel
+	// traffic and records only the stalls worth explaining.
+	pprofBlockProfileRateNs = 1_000_000
+)
+
+func startPprof(ctx context.Context, logger zerolog.Logger, addr string) error {
 	if addr == "" {
-		return
+		return nil
 	}
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen pprof on %s: %w", addr, err)
+	}
+
+	// Both profiles are inert unless enabled, so they are armed together with
+	// the endpoint that serves them.
+	runtime.SetMutexProfileFraction(pprofMutexProfileFraction)
+	runtime.SetBlockProfileRate(pprofBlockProfileRateNs)
 
 	server := &http.Server{
 		Addr:              addr,
@@ -374,11 +410,15 @@ func startPprof(ctx context.Context, logger zerolog.Logger, addr string) {
 			Str("pprof_addr", addr).
 			Str("heap_url", "http://"+addr+"/debug/pprof/heap").
 			Str("profile_url", "http://"+addr+"/debug/pprof/profile").
+			Str("mutex_url", "http://"+addr+"/debug/pprof/mutex").
+			Str("block_url", "http://"+addr+"/debug/pprof/block").
 			Msg("started pprof server")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error().Err(err).Str("pprof_addr", addr).Msg("pprof server stopped")
 		}
 	}()
+
+	return nil
 }
 
 func writeLiteServerPublicKey(out io.Writer, cfg nodeconfig.Config, path string) error {

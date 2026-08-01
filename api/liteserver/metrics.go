@@ -100,17 +100,13 @@ func (o *prometheusQueryObserver) collectors() []prometheus.Collector {
 }
 
 func (o *prometheusQueryObserver) AddLiteserverInflight(delta int) {
-	if o == nil || o.inflight == nil || delta == 0 {
+	if delta == 0 {
 		return
 	}
 	o.inflight.Add(float64(delta))
 }
 
 func (o *prometheusQueryObserver) ObserveLiteserverQuery(observation QueryObservation) {
-	if o == nil || o.queryDuration == nil || o.queries == nil {
-		return
-	}
-
 	method := observation.Method
 	if method == "" {
 		method = "unknown"
@@ -132,11 +128,9 @@ func (o *prometheusQueryObserver) ObserveLiteserverQuery(observation QueryObserv
 
 	totalDuration := duration + waitDuration
 	o.queryDuration.WithLabelValues(method, response, errorCode, errorReason).Observe(totalDuration.Seconds())
-	if o.queryHandler != nil {
-		o.queryHandler.WithLabelValues(method, response, errorCode, errorReason).Observe(duration.Seconds())
-	}
+	o.queryHandler.WithLabelValues(method, response, errorCode, errorReason).Observe(duration.Seconds())
 	o.queries.WithLabelValues(method, response, errorCode, errorReason).Inc()
-	if waitDuration > 0 && o.queryWait != nil {
+	if waitDuration > 0 {
 		o.queryWait.WithLabelValues(method, response, errorCode, errorReason).Observe(waitDuration.Seconds())
 	}
 }

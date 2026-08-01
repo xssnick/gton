@@ -31,7 +31,7 @@ func NewExtension(node hooks.Node, cfg ExtensionConfig) (*Extension, error) {
 		return nil, err
 	}
 
-	server, err := New(Options{
+	server, err := newServer(Options{
 		Logger:                  &node.Logger,
 		Store:                   node.Store,
 		MessageSender:           node.Network,
@@ -43,7 +43,7 @@ func NewExtension(node hooks.Node, cfg ExtensionConfig) (*Extension, error) {
 		ZeroState:               cfg.ZeroState,
 		RequestLimits:           cfg.RequestLimits,
 		QueryConcurrency:        cfg.QueryConcurrency,
-	})
+	}, node.TVM, node.Network.CheckExternalMessage)
 	if err != nil {
 		return nil, err
 	}

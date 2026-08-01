@@ -2,7 +2,7 @@ package storage
 
 import (
 	"bytes"
-	"container/list"
+	"container/heap"
 	"context"
 	"sync"
 
@@ -15,17 +15,57 @@ const DefaultLiveBlockCacheMaxBlocks = 8192
 // lock-free: entries are immutable once stored, publishers replace them
 // wholesale under publishMu, and eviction runs in publish order (blocks age out
 // naturally, so FIFO matches the access pattern without touching on reads).
+// The eviction heap contains only removable entries: pinned checkpoint blocks
+// never get scanned when the cache temporarily grows beyond its soft limit.
 type LiveBlockCache struct {
 	max int
 
 	blocks     sync.Map // BlockRootHash -> *LiveBlockCacheBlock
 	nextBlocks sync.Map // BlockRootHash of prev -> liveBlockCacheNext
 
-	publishMu  sync.Mutex
-	count      int
-	order      *list.List // publish-order queue of BlockRootHash for eviction
-	orderIndex map[BlockRootHash]*list.Element
-	prevKeys   map[BlockRootHash][]BlockRootHash // BlockRootHash of next -> prev keys pointing at it
+	publishMu sync.Mutex
+	nextOrder uint64
+	entries   map[BlockRootHash]*liveBlockCacheEvictionEntry
+	evictable liveBlockCacheEvictionHeap
+	prevKeys  map[BlockRootHash][]BlockRootHash // BlockRootHash of next -> prev keys pointing at it
+}
+
+type liveBlockCacheEvictionEntry struct {
+	key       BlockRootHash
+	order     uint64
+	heapIndex int
+}
+
+type liveBlockCacheEvictionHeap []*liveBlockCacheEvictionEntry
+
+func (h liveBlockCacheEvictionHeap) Len() int {
+	return len(h)
+}
+
+func (h liveBlockCacheEvictionHeap) Less(i, j int) bool {
+	return h[i].order < h[j].order
+}
+
+func (h liveBlockCacheEvictionHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+
+func (h *liveBlockCacheEvictionHeap) Push(value any) {
+	entry := value.(*liveBlockCacheEvictionEntry)
+	entry.heapIndex = len(*h)
+	*h = append(*h, entry)
+}
+
+func (h *liveBlockCacheEvictionHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	entry := old[last]
+	old[last] = nil
+	entry.heapIndex = -1
+	*h = old[:last]
+	return entry
 }
 
 type LiveBlockCacheBlock struct {
@@ -59,10 +99,9 @@ func NewLiveBlockCache(max int) *LiveBlockCache {
 		max = DefaultLiveBlockCacheMaxBlocks
 	}
 	return &LiveBlockCache{
-		max:        max,
-		order:      list.New(),
-		orderIndex: map[BlockRootHash]*list.Element{},
-		prevKeys:   map[BlockRootHash][]BlockRootHash{},
+		max:      max,
+		entries:  map[BlockRootHash]*liveBlockCacheEvictionEntry{},
+		prevKeys: map[BlockRootHash][]BlockRootHash{},
 	}
 }
 
@@ -82,10 +121,10 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 	defer c.publishMu.Unlock()
 
 	block := &LiveBlockCacheBlock{id: artifacts.Block}
-	isNew := true
-	if loaded, ok := c.blocks.Load(key); ok {
+	entry := c.entries[key]
+	if entry != nil {
+		loaded, _ := c.blocks.Load(key)
 		*block = *loaded.(*LiveBlockCacheBlock)
-		isNew = false
 	}
 	block.artifactFlushed = block.artifactFlushed || artifacts.ArtifactFlushed
 	if len(artifacts.BlockData) > 0 {
@@ -107,9 +146,19 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 	}
 
 	c.blocks.Store(key, block)
-	if isNew {
-		c.count++
-		c.orderIndex[key] = c.order.PushBack(key)
+	if entry == nil {
+		entry = &liveBlockCacheEvictionEntry{
+			key:       key,
+			order:     c.nextOrder,
+			heapIndex: -1,
+		}
+		c.nextOrder++
+		c.entries[key] = entry
+	}
+	if evictable := liveBlockCacheBlockEvictable(block); evictable && entry.heapIndex < 0 {
+		heap.Push(&c.evictable, entry)
+	} else if !evictable && entry.heapIndex >= 0 {
+		heap.Remove(&c.evictable, entry.heapIndex)
 	}
 	if block.meta != nil {
 		for _, prev := range block.meta.PrevRefs {
@@ -140,25 +189,62 @@ func liveBlockCacheProofs(proofs []LiveBlockProofArtifact) map[ServedProofKind][
 }
 
 func (c *LiveBlockCache) BlockFull(_ context.Context, block ton.BlockIDExt) (*ServedBlockFull, error) {
-	cached, kind, ok := c.cachedBlockFull(block)
-	if !ok {
-		return nil, ErrNotFound
+	cached, kind, err := c.cachedBlockFull(block)
+	if err != nil {
+		return nil, err
 	}
 	return &ServedBlockFull{
 		ID:     cached.id,
 		Block:  cached.data,
 		Proof:  cached.proofs[kind],
 		Meta:   cached.meta.Clone(),
-		IsLink: liveBlockCacheProofIsLink(kind),
+		IsLink: kind == ServedProofBlockLink || kind == ServedProofKeyBlockLink,
 	}, nil
 }
 
 func (c *LiveBlockCache) NextBlockFull(ctx context.Context, prev ton.BlockIDExt) (*ServedBlockFull, error) {
-	next, ok := c.nextBlock(prev)
-	if !ok {
-		return nil, ErrNotFound
+	next, err := c.nextBlock(prev)
+	if err != nil {
+		return nil, err
 	}
 	return c.BlockFull(ctx, next)
+}
+
+func (c *LiveBlockCache) BlockMeta(_ context.Context, block ton.BlockIDExt) (*BlockMeta, error) {
+	cached, blockErr := c.cachedBlock(block)
+	next, nextErr := c.nextBlock(block)
+	if blockErr != nil && nextErr != nil {
+		return nil, ErrNotFound
+	}
+
+	meta := &BlockMeta{ID: block}
+	if cached != nil {
+		meta.ID = cached.id
+		meta = MergeBlockMeta(meta, cached.meta)
+
+		if len(cached.data) > 0 {
+			meta.Mark(BlockMetaHasBlockData)
+		}
+		for kind, proof := range cached.proofs {
+			if len(proof) > 0 {
+				meta.Mark(BlockMetaFlagForProof(kind))
+			}
+		}
+
+		if len(cached.data) > 0 {
+			if kind, err := liveBlockCacheProofKind(cached); err == nil {
+				meta.Mark(BlockMetaHasServedFull)
+				if kind == ServedProofBlockLink || kind == ServedProofKeyBlockLink {
+					meta.Mark(BlockMetaServedFullIsLink)
+				}
+			}
+		}
+	}
+	if nextErr == nil {
+		meta.NextRefs = []ton.BlockIDExt{next}
+	}
+
+	return meta, nil
 }
 
 func (c *LiveBlockCache) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
@@ -170,8 +256,8 @@ func (c *LiveBlockCache) BlockData(ctx context.Context, block ton.BlockIDExt) ([
 }
 
 func (c *LiveBlockCache) CachedBlockData(_ context.Context, block ton.BlockIDExt) (CachedBlockData, error) {
-	cached, ok := c.cachedBlock(block)
-	if !ok || len(cached.data) == 0 {
+	cached, err := c.cachedBlock(block)
+	if err != nil || len(cached.data) == 0 {
 		return CachedBlockData{}, ErrNotFound
 	}
 	return CachedBlockData{
@@ -181,14 +267,14 @@ func (c *LiveBlockCache) CachedBlockData(_ context.Context, block ton.BlockIDExt
 }
 
 func (c *LiveBlockCache) HasBlockData(block ton.BlockIDExt) bool {
-	cached, ok := c.cachedBlock(block)
-	return ok && len(cached.data) > 0
+	cached, err := c.cachedBlock(block)
+	return err == nil && len(cached.data) > 0
 }
 
 func (c *LiveBlockCache) BlockProof(_ context.Context, kind ServedProofKind, block ton.BlockIDExt) ([]byte, error) {
-	cached, ok := c.cachedBlock(block)
-	if !ok {
-		return nil, ErrNotFound
+	cached, err := c.cachedBlock(block)
+	if err != nil {
+		return nil, err
 	}
 	proof := cached.proofs[kind]
 	if len(proof) == 0 {
@@ -198,7 +284,7 @@ func (c *LiveBlockCache) BlockProof(_ context.Context, kind ServedProofKind, blo
 }
 
 func (c *LiveBlockCache) MarkBlockFlushed(block ton.BlockIDExt) {
-	if c == nil || !BlockIDHashesKnown(block) {
+	if !BlockIDHashesKnown(block) {
 		return
 	}
 
@@ -208,39 +294,35 @@ func (c *LiveBlockCache) MarkBlockFlushed(block ton.BlockIDExt) {
 	c.publishMu.Unlock()
 }
 
-func (c *LiveBlockCache) cachedBlock(block ton.BlockIDExt) (*LiveBlockCacheBlock, bool) {
-	if c == nil {
-		return nil, false
-	}
-
+func (c *LiveBlockCache) cachedBlock(block ton.BlockIDExt) (*LiveBlockCacheBlock, error) {
 	loaded, ok := c.blocks.Load(BlockKey(block))
 	if !ok {
-		return nil, false
+		return nil, ErrNotFound
 	}
 	cached := loaded.(*LiveBlockCacheBlock)
 	if !blockIDMatchesRootKey(cached.id, block) {
-		return nil, false
+		return nil, ErrNotFound
 	}
-	return cached, true
+	return cached, nil
 }
 
-func (c *LiveBlockCache) cachedBlockFull(block ton.BlockIDExt) (*LiveBlockCacheBlock, ServedProofKind, bool) {
-	cached, ok := c.cachedBlock(block)
-	if !ok || len(cached.data) == 0 {
-		return nil, "", false
+func (c *LiveBlockCache) cachedBlockFull(block ton.BlockIDExt) (*LiveBlockCacheBlock, ServedProofKind, error) {
+	cached, err := c.cachedBlock(block)
+	if err != nil || len(cached.data) == 0 {
+		return nil, "", ErrNotFound
 	}
 
-	kind, ok := liveBlockCacheProofKind(cached)
-	if !ok {
-		return nil, "", false
+	kind, err := liveBlockCacheProofKind(cached)
+	if err != nil {
+		return nil, "", err
 	}
-	return cached, kind, true
+	return cached, kind, nil
 }
 
-func liveBlockCacheProofKind(block *LiveBlockCacheBlock) (ServedProofKind, bool) {
+func liveBlockCacheProofKind(block *LiveBlockCacheBlock) (ServedProofKind, error) {
 	for _, kind := range ProofCandidates(block.meta) {
 		if len(block.proofs[kind]) > 0 {
-			return kind, true
+			return kind, nil
 		}
 	}
 
@@ -251,30 +333,22 @@ func liveBlockCacheProofKind(block *LiveBlockCacheBlock) (ServedProofKind, bool)
 		ServedProofKeyBlockLink,
 	} {
 		if len(block.proofs[kind]) > 0 {
-			return kind, true
+			return kind, nil
 		}
 	}
-	return "", false
+	return "", ErrNotFound
 }
 
-func liveBlockCacheProofIsLink(kind ServedProofKind) bool {
-	return kind == ServedProofBlockLink || kind == ServedProofKeyBlockLink
-}
-
-func (c *LiveBlockCache) nextBlock(prev ton.BlockIDExt) (ton.BlockIDExt, bool) {
-	if c == nil {
-		return ton.BlockIDExt{}, false
-	}
-
+func (c *LiveBlockCache) nextBlock(prev ton.BlockIDExt) (ton.BlockIDExt, error) {
 	loaded, ok := c.nextBlocks.Load(BlockKey(prev))
 	if !ok {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, ErrNotFound
 	}
 	cached := loaded.(liveBlockCacheNext)
 	if !blockIDMatchesRootKey(cached.prev, prev) {
-		return ton.BlockIDExt{}, false
+		return ton.BlockIDExt{}, ErrNotFound
 	}
-	return cached.next, true
+	return cached.next, nil
 }
 
 func (c *LiveBlockCache) setNextBlockLocked(prev ton.BlockIDExt, next ton.BlockIDExt) {
@@ -346,27 +420,9 @@ func liveBlockCacheShardChild(shard int64, left bool) int64 {
 }
 
 func (c *LiveBlockCache) evictLocked() {
-	for c.count > c.max {
-		evicted := false
-		for elem := c.order.Front(); elem != nil; {
-			next := elem.Next()
-			key := elem.Value.(BlockRootHash)
-
-			var block *LiveBlockCacheBlock
-			if loaded, ok := c.blocks.Load(key); ok {
-				block = loaded.(*LiveBlockCacheBlock)
-			}
-			if liveBlockCacheBlockEvictable(block) {
-				c.deleteBlockLocked(key)
-				evicted = true
-				break
-			}
-
-			elem = next
-		}
-		if !evicted {
-			return
-		}
+	for len(c.entries) > c.max && len(c.evictable) > 0 {
+		entry := heap.Pop(&c.evictable).(*liveBlockCacheEvictionEntry)
+		c.deleteBlockLocked(entry.key)
 	}
 }
 
@@ -378,13 +434,13 @@ func liveBlockCacheBlockEvictable(block *LiveBlockCacheBlock) bool {
 }
 
 func (c *LiveBlockCache) deleteBlockLocked(key BlockRootHash) {
-	if _, ok := c.blocks.LoadAndDelete(key); ok {
-		c.count--
+	if entry := c.entries[key]; entry != nil {
+		if entry.heapIndex >= 0 {
+			heap.Remove(&c.evictable, entry.heapIndex)
+		}
+		delete(c.entries, key)
 	}
-	if elem := c.orderIndex[key]; elem != nil {
-		c.order.Remove(elem)
-		delete(c.orderIndex, key)
-	}
+	c.blocks.Delete(key)
 
 	for _, prev := range c.prevKeys[key] {
 		if loaded, ok := c.nextBlocks.Load(prev); ok && BlockKey(loaded.(liveBlockCacheNext).next) == key {

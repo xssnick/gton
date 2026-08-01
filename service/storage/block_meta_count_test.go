@@ -12,25 +12,20 @@ import (
 // so tlb.AugShardAccountBlocks / AugAccountTransactions skippers consume them.
 type testCurrencyAug struct{}
 
-func testZeroCurrencyCollection() *cell.Cell {
-	// 4-bit zero coins length + empty extra-currency dict bit
-	return cell.BeginCell().MustStoreUInt(0, 5).EndCell()
-}
-
 func (testCurrencyAug) SkipExtra(loader *cell.Slice) error {
 	return tlb.LoadFromCell(new(tlb.CurrencyCollection), loader)
 }
 
-func (testCurrencyAug) EmptyExtra() (*cell.Cell, error) {
-	return testZeroCurrencyCollection(), nil
+func (testCurrencyAug) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testCurrencyAug) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testZeroCurrencyCollection(), nil
+func (testCurrencyAug) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testCurrencyAug) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testZeroCurrencyCollection(), nil
+func (testCurrencyAug) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
 // testInlineAugDictRoot unwraps a HashmapAugE cell into the inline root node

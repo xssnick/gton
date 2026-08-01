@@ -1,7 +1,6 @@
 package liteserver
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -40,7 +39,7 @@ const blockHeaderProofModeMask uint32 = 1 | 2 | 16 | 32 | 64
 func (s *Server) blockHeader(ctx context.Context, id ton.BlockIDExt, mode uint32) (ton.BlockHeader, error) {
 	key := liteResponseKey{kind: liteResponseBlockHeader, mode: mode & blockHeaderProofModeMask, a: liteBlockKeyFromBlock(id)}
 	value, err := s.respCache.do(ctx, key, func(ctx context.Context) (any, error) {
-		root, err := s.loadBlockRoot(ctx, id)
+		root, err := s.store.BlockRoot(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -60,7 +59,7 @@ func (s *Server) blockHeader(ctx context.Context, id ton.BlockIDExt, mode uint32
 		return ton.BlockHeader{}, errors.New("invalid block header cache value")
 	}
 	return ton.BlockHeader{
-		ID:          cloneBlockID(id),
+		ID:          blockproof.CloneBlockID(id),
 		Mode:        mode,
 		HeaderProof: headerProof,
 	}, nil
@@ -109,14 +108,6 @@ func accountLeafShard(addr *address.Address) int64 {
 	return int64(binary.BigEndian.Uint64(addr.Data()[:8]) | 1)
 }
 
-func (s *Server) loadBlockRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
-	root, err := s.store.BlockRoot(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return root, nil
-}
-
 func (s *Server) loadStateRoot(ctx context.Context, id ton.BlockIDExt) (*cell.Cell, error) {
 	stateRootHash, err := s.loadStateRootHash(ctx, id)
 	if err != nil {
@@ -138,7 +129,7 @@ func (s *Server) loadStateRootHash(ctx context.Context, id ton.BlockIDExt) ([]by
 	if len(meta.StateRootHash) != 32 {
 		return nil, fmt.Errorf("state root hash is missing for %s", storage.FormatBlockRef(id))
 	}
-	return bytes.Clone(meta.StateRootHash), nil
+	return meta.StateRootHash, nil
 }
 
 func allShardsInfoProof(root *cell.Cell) (*cell.Cell, error) {
@@ -393,19 +384,22 @@ func visitConfigDict(configRoot *cell.Cell, mode uint32, all bool, params []int3
 		}
 	}
 	if mode&configModeNeedSpecialSmc != 0 {
-		if _, err := markConfigParam(paramsDict, int32(tlb.ConfigParamFundamentalSMCAddresses)); err != nil {
+		if err := markConfigParamIfPresent(paramsDict, int32(tlb.ConfigParamFundamentalSMCAddresses)); err != nil {
 			return err
 		}
 	}
 	if mode&configModeNeedWorkchainInfo != 0 {
-		if _, err := markConfigParam(paramsDict, int32(tlb.ConfigParamWorkchains)); err != nil {
+		if err := markConfigParamIfPresent(paramsDict, int32(tlb.ConfigParamWorkchains)); err != nil {
 			return err
 		}
 	}
 	if mode&configModeNeedCapabilities != 0 {
-		if value, err := markConfigParam(paramsDict, int32(tlb.ConfigParamGlobalVersion)); err != nil {
+		value, err := loadAndMarkConfigParam(paramsDict, int32(tlb.ConfigParamGlobalVersion))
+		if err != nil && !errors.Is(err, cell.ErrNoSuchKeyInDict) {
 			return err
-		} else if value != nil {
+		}
+		// Config parameter #8 is optional in proofs.
+		if err == nil {
 			if _, err = globalVersionFromConfigValue(value); err != nil {
 				return err
 			}
@@ -420,7 +414,7 @@ func visitConfigDict(configRoot *cell.Cell, mode uint32, all bool, params []int3
 			if i > 0 && params[i-1] == param {
 				continue
 			}
-			if _, err := markConfigParam(paramsDict, param); err != nil {
+			if err := markConfigParamIfPresent(paramsDict, param); err != nil {
 				return err
 			}
 		}
@@ -429,11 +423,8 @@ func visitConfigDict(configRoot *cell.Cell, mode uint32, all bool, params []int3
 	return nil
 }
 
-func markConfigParam(dict *cell.Dictionary, param int32) (*cell.Slice, error) {
+func loadAndMarkConfigParam(dict *cell.Dictionary, param int32) (*cell.Slice, error) {
 	value, err := dict.LoadValueByIntKey(big.NewInt(int64(param)))
-	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -443,17 +434,24 @@ func markConfigParam(dict *cell.Dictionary, param int32) (*cell.Slice, error) {
 	return value, nil
 }
 
-func markValidatorSetConfigParam(dict *cell.Dictionary) error {
-	if _, err := markConfigParam(dict, int32(tlb.ConfigParamCatchainConfig)); err != nil {
-		return err
+func markConfigParamIfPresent(dict *cell.Dictionary, param int32) error {
+	_, err := loadAndMarkConfigParam(dict, param)
+	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+		return nil
 	}
-
-	if _, err := markConfigParam(dict, int32(tlb.ConfigParamCurrentValidators)); err != nil {
-		return err
-	}
-
-	_, err := markConfigParam(dict, int32(tlb.ConfigParamCurrentTempValidators))
 	return err
+}
+
+func markValidatorSetConfigParam(dict *cell.Dictionary) error {
+	if err := markConfigParamIfPresent(dict, int32(tlb.ConfigParamCatchainConfig)); err != nil {
+		return err
+	}
+
+	if err := markConfigParamIfPresent(dict, int32(tlb.ConfigParamCurrentValidators)); err != nil {
+		return err
+	}
+
+	return markConfigParamIfPresent(dict, int32(tlb.ConfigParamCurrentTempValidators))
 }
 
 func globalVersionFromConfigValue(value *cell.Slice) (tlb.GlobalVersion, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -158,15 +160,58 @@ func TestClassifyBroadcastDoesNotSerializeInvalidPayload(t *testing.T) {
 	})
 	payload := newSerializedBroadcastPayload(make(chan struct{}))
 
-	accepted, err := sub.classifyBroadcastPayload(nil, tonnodeapi.NewExternalMessageBroadcast{}, payload, DeliveryFEC, false, testPeerID("peer"))
+	result, err := sub.classifyBroadcastPayload(nil, tonnodeapi.NewExternalMessageBroadcast{}, payload, DeliveryFEC, false, testPeerID("peer"))
 	if err != nil {
 		t.Fatalf("classify invalid broadcast: %v", err)
 	}
-	if accepted != nil {
-		t.Fatalf("invalid external broadcast was accepted: %+v", accepted)
+	if result.disposition != broadcastDispositionIgnore {
+		t.Fatalf("invalid external broadcast was accepted: %+v", result.accepted)
 	}
 	if payload.serialized {
 		t.Fatal("invalid broadcast serialized payload before cheap drop")
+	}
+}
+
+func TestFastSyncOutMsgQueueProofBroadcastIsRelayOnly(t *testing.T) {
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: newTestNode(t),
+		spec: overlaySpec{
+			Name:    "fast-sync.masterchain",
+			Kind:    overlayKindFastSync,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+	msg := OutMsgQueueProofBroadcast{}
+
+	if !fastSyncBroadcastSupported(msg) {
+		t.Fatal("out-msg queue proof broadcast is not enabled on FastSync")
+	}
+
+	result, err := sub.classifyBroadcastPayload(
+		nil,
+		msg,
+		newKnownBroadcastPayload([]byte{0x01}),
+		DeliverySimple,
+		false,
+		testPeerID("peer"),
+	)
+	if err != nil {
+		t.Fatalf("classify out-msg queue proof broadcast: %v", err)
+	}
+	if result.disposition != broadcastDispositionAccept {
+		t.Fatal("out-msg queue proof broadcast was not admitted for relay")
+	}
+	accepted := result.accepted
+	if accepted.fingerprint != "" ||
+		accepted.deduped ||
+		accepted.block != nil ||
+		accepted.event != nil ||
+		len(accepted.extraEvents) != 0 ||
+		accepted.masterchainWake != nil ||
+		accepted.rebroadcast != nil ||
+		accepted.skipAcceptedMetric {
+		t.Fatalf("relay-only broadcast scheduled application work: %+v", result.accepted)
 	}
 }
 
@@ -190,15 +235,80 @@ func TestClassifyDuplicateIdentifiedBroadcastDoesNotSerializePayload(t *testing.
 	node.deduper.Mark(broadcastFingerprint(sub.spec.ShortID, broadcastID), time.Now())
 	payload := newIdentifiedBroadcastPayload(make(chan struct{}), broadcastID)
 
-	accepted, err := sub.classifyBroadcastPayload(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
+	result, err := sub.classifyBroadcastPayload(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
 	if err != nil {
 		t.Fatalf("classify duplicate identified broadcast: %v", err)
 	}
-	if accepted != nil {
-		t.Fatalf("duplicate identified broadcast was accepted: %+v", accepted)
+	if result.disposition != broadcastDispositionIgnore {
+		t.Fatalf("duplicate identified broadcast was accepted: %+v", result.accepted)
 	}
 	if payload.serialized {
 		t.Fatal("duplicate identified broadcast serialized payload before dedupe")
+	}
+}
+
+func TestProcessedCandidateBroadcastSkipsDecodedPipeline(t *testing.T) {
+	node := newTestNode(t)
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+
+	downloaded := testBlockFinalityCandidate(t, 208)
+	msg := tonnodeapi.NewBlockCandidateBroadcast{
+		ID:   downloaded.ID,
+		Data: downloaded.BlockBOC,
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize candidate broadcast: %v", err)
+	}
+
+	firstSource := testPeerID("first-source")
+	first, err := sub.classifyBroadcastPayload(
+		nil,
+		msg,
+		newKnownIdentifiedBroadcastPayload(payload, bytes.Repeat([]byte{0x11}, 32)),
+		DeliveryFEC,
+		false,
+		firstSource,
+	)
+	if err != nil {
+		t.Fatalf("classify first candidate: %v", err)
+	}
+	if first.disposition != broadcastDispositionAccept {
+		t.Fatal("first candidate was not accepted")
+	}
+	node.acceptBroadcast(first.accepted)
+	if _, _, err = node.decodedBroadcasts.get("tonNode.newBlockCandidateBroadcast", downloaded.ID); !errors.Is(err, errDecodedBroadcastProcessed) {
+		t.Fatalf("first candidate cache state = %v, want processed", err)
+	}
+
+	secondSource := testPeerID("second-source")
+	second, err := sub.classifyBroadcastPayload(
+		nil,
+		msg,
+		newKnownIdentifiedBroadcastPayload(payload, bytes.Repeat([]byte{0x22}, 32)),
+		DeliveryTwoStep,
+		false,
+		secondSource,
+	)
+	if err != nil {
+		t.Fatalf("classify repeated candidate: %v", err)
+	}
+	if second.disposition != broadcastDispositionAccept {
+		t.Fatal("repeated candidate was not accepted for relay")
+	}
+	node.acceptBroadcast(second.accepted)
+
+	key := tnstore.BlockKey(downloaded.ID)
+	cached := node.shardCandidateCache.candidates[key]
+	if cached.block.sourcePeerID != firstSource {
+		t.Fatalf("processed candidate ran pipeline again: source=%x want=%x", cached.block.sourcePeerID, firstSource)
 	}
 }
 
@@ -215,14 +325,14 @@ func TestAcceptedIdentifiedBroadcastWithoutTargetsDoesNotSerializePayload(t *tes
 	msg := IhrMessageBroadcast{Message: IhrMessage{Data: []byte{0x01}}}
 	payload := newIdentifiedBroadcastPayload(msg, bytes.Repeat([]byte{0xBC}, 32))
 
-	accepted, err := sub.classifyBroadcastPayload(nil, msg, payload, DeliveryTwoStep, false, testPeerID("source"))
+	result, err := sub.classifyBroadcastPayload(nil, msg, payload, DeliveryTwoStep, false, testPeerID("source"))
 	if err != nil {
 		t.Fatalf("classify identified broadcast: %v", err)
 	}
-	if accepted == nil || accepted.rebroadcast == nil {
+	if result.disposition != broadcastDispositionAccept || result.accepted.rebroadcast == nil {
 		t.Fatal("identified broadcast was not accepted")
 	}
-	node.acceptBroadcast(*accepted)
+	node.acceptBroadcast(result.accepted)
 
 	if payload.serialized {
 		t.Fatal("accepted broadcast without rebroadcast targets serialized payload")
@@ -252,8 +362,8 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 		ID:   downloaded.ID,
 		Data: downloaded.BlockBOC,
 	}
-	if err := sub.handleOverlayBroadcast(nil, candidate, DeliveryTwoStep, true, sourceID); err != nil {
-		t.Fatalf("handle candidate broadcast: %v", err)
+	if err := sub.handleOverlayBroadcast(nil, candidate, DeliveryTwoStep, true, sourceID); !errors.Is(err, overlay.ErrBroadcastRejected) {
+		t.Fatalf("handle candidate broadcast error = %v, want broadcast rejected", err)
 	}
 	observer.requireStage(t, broadcastPipelineStageClassify, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultDrop)
 	observer.requireStage(t, broadcastPipelineStageCandidateDecode, "tonNode.newBlockCandidateBroadcast", DeliveryTwoStep, broadcastPipelineResultError)
@@ -376,6 +486,171 @@ func TestBroadcastTransientSignatureFailureReleasesDeduper(t *testing.T) {
 	}
 }
 
+func TestHandleShardBroadcastRetryableSignatureFailureReturnsRetry(t *testing.T) {
+	node := newTestNode(t)
+	node.signatureVerifier = testRejectBroadcastSignatureVerifier{
+		err: fmt.Errorf("%w: validator set is not ready", ErrBroadcastSignatureRetryable),
+	}
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			Kind:    overlayKindPublicShard,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      testBlockID(0, topShard, 202),
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize shard broadcast: %v", err)
+	}
+	fingerprint := broadcastFingerprint(sub.spec.ShortID, payload)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		disposition := sub.handleOverlayBroadcastPayload(
+			nil,
+			msg,
+			newKnownBroadcastPayload(payload),
+			DeliveryFEC,
+			false,
+			testPeerID("retryable-source"),
+		)
+		if disposition != overlay.BroadcastDispositionRetry {
+			t.Fatalf("attempt %d disposition=%v, want retry", attempt+1, disposition)
+		}
+		if node.deduper.Seen(fingerprint, time.Now()) {
+			t.Fatalf("attempt %d left retryable fingerprint committed", attempt+1)
+		}
+	}
+}
+
+func TestHandleFullBlockRetryableSignatureFailureReturnsRetry(t *testing.T) {
+	node := newTestNode(t)
+	node.signatureVerifier = testRejectBroadcastSignatureVerifier{
+		err: fmt.Errorf("%w: validator set is not ready", ErrBroadcastSignatureRetryable),
+	}
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			Kind:    overlayKindPublicShard,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+	blockCell := testPeerBlockRoot(t, 0, topShard, 207)
+	blockBOC := serializeCompressedBlockRoot(blockCell)
+	rootHash := blockCell.HashKey()
+	block := ton.BlockIDExt{
+		Workchain: 0,
+		Shard:     topShard,
+		SeqNo:     207,
+		RootHash:  rootHash[:],
+		FileHash:  hashSimpleBroadcastPayload(blockBOC),
+	}
+	msg := tonnodeapi.BlockBroadcastCompressedV2{
+		ID: block,
+		SignatureSet: tonnodeapi.SignatureSetSimplex{
+			SessionID: bytes.Repeat([]byte{0x44}, 32),
+			Candidate: ton.ConsensusCandidateHashDataOrdinary{
+				Block:            block,
+				CollatedFileHash: bytes.Repeat([]byte{0x46}, 32),
+				Parent:           ton.ConsensusCandidateWithoutParents{},
+			},
+		},
+		Proof:          testBlockProofCell(t, block, nil).ToBOC(),
+		DataCompressed: []byte{0x01},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize full block broadcast: %v", err)
+	}
+	fingerprint := broadcastFingerprint(sub.spec.ShortID, payload)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		disposition := sub.handleOverlayBroadcastPayload(
+			nil,
+			msg,
+			newKnownBroadcastPayload(payload),
+			DeliveryFEC,
+			false,
+			testPeerID("retryable-full-source"),
+		)
+		if disposition != overlay.BroadcastDispositionRetry {
+			t.Fatalf("attempt %d disposition=%v, want retry", attempt+1, disposition)
+		}
+		if node.deduper.Seen(fingerprint, time.Now()) {
+			t.Fatalf("attempt %d left retryable full-block fingerprint committed", attempt+1)
+		}
+	}
+}
+
+func TestHandleShardBroadcastPermanentDropsReturnIgnore(t *testing.T) {
+	node := newTestNode(t)
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			Kind:    overlayKindPublicShard,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log: discardLogger(),
+	})
+	sourceID := testPeerID("permanent-drop-source")
+	invalid := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{ID: testBlockID(0, topShard, 205)},
+	}
+	if disposition := sub.handleOverlayBroadcastPayload(
+		nil,
+		invalid,
+		newKnownBroadcastPayload([]byte{0x01}),
+		DeliverySimple,
+		false,
+		sourceID,
+	); disposition != overlay.BroadcastDispositionIgnore {
+		t.Fatalf("invalid payload disposition=%v, want ignore", disposition)
+	}
+
+	valid := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      testBlockID(0, topShard, 206),
+			CCSeqno: 7,
+			Data:    []byte{0x01},
+		},
+	}
+	payload, err := tl.Serialize(valid, true)
+	if err != nil {
+		t.Fatalf("serialize valid shard broadcast: %v", err)
+	}
+	if disposition := sub.handleOverlayBroadcastPayload(
+		nil,
+		valid,
+		newKnownBroadcastPayload(payload),
+		DeliverySimple,
+		false,
+		sourceID,
+	); disposition != overlay.BroadcastDispositionAcceptAndRelay {
+		t.Fatalf("first valid payload disposition=%v, want accept", disposition)
+	}
+	if disposition := sub.handleOverlayBroadcastPayload(
+		nil,
+		valid,
+		newKnownBroadcastPayload(payload),
+		DeliverySimple,
+		false,
+		sourceID,
+	); disposition != overlay.BroadcastDispositionIgnore {
+		t.Fatalf("seen payload disposition=%v, want ignore", disposition)
+	}
+}
+
 func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T) {
 	node := newTestNode(t)
 	source := testRebroadcastQueuePeer("source")
@@ -420,7 +695,13 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 	if _, ok := target.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("target peer should not receive app-level shard block rebroadcast when FEC relay is enabled")
 	}
-	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"basechain",
+		"tonNode.newShardBlockBroadcast",
+		DeliveryFEC,
+	); got != 1 {
 		t.Fatalf("accepted broadcast count = %d, want 1", got)
 	}
 
@@ -431,8 +712,66 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 	if got := testBroadcastDropStatCount(node, "basechain", "tonNode.newShardBlockBroadcast", "seen"); got != 1 {
 		t.Fatalf("seen broadcast drop count = %d, want 1", got)
 	}
-	if got := testBroadcastStatCount(node, "accepted", "basechain", "tonNode.newShardBlockBroadcast"); got != 1 {
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"basechain",
+		"tonNode.newShardBlockBroadcast",
+		DeliveryFEC,
+	); got != 1 {
 		t.Fatalf("duplicate accepted broadcast count = %d, want 1", got)
+	}
+}
+
+func TestAcceptedSimpleBroadcastUsesBoundedAppRebroadcastOnly(t *testing.T) {
+	node := newTestNode(t)
+	source := testRebroadcastQueuePeer("simple-source")
+	peers := []*overlayPeer{source}
+	peerMap := map[PeerID]*overlayPeer{source.id: source}
+	for i := 0; i < rebroadcastFanout+2; i++ {
+		peer := testRebroadcastQueuePeer(fmt.Sprintf("simple-target-%d", i))
+		peers = append(peers, peer)
+		peerMap[peer.id] = peer
+	}
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:    "basechain",
+			Kind:    overlayKindPublicShard,
+			ShortID: []byte{0x01, 0x02, 0x03},
+		},
+		log:   discardLogger(),
+		peers: peerMap,
+	})
+	msg := tonnodeapi.NewShardBlockBroadcast{
+		Block: tonnodeapi.NewShardBlock{
+			ID:      testBlockID(0, topShard, 204),
+			CCSeqno: 7,
+			Data:    []byte{0x01, 0x02},
+		},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize shard broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(source, msg, payload, DeliverySimple, false, source.id)
+	if accepted == nil || accepted.rebroadcast == nil {
+		t.Fatal("expected simple shard broadcast to be accepted")
+	}
+	if accepted.rebroadcast.skipOverlayRebroadcast {
+		t.Fatal("simple broadcast incorrectly skipped the bounded app rebroadcast path")
+	}
+	if fanout := sub.rebroadcastFanoutForRequest(*accepted.rebroadcast); fanout != rebroadcastFanout {
+		t.Fatalf("simple app rebroadcast fanout=%d, want %d", fanout, rebroadcastFanout)
+	}
+
+	node.acceptBroadcast(*accepted)
+	if got := countQueuedRebroadcasts(peerMap, false); got != rebroadcastFanout {
+		t.Fatalf("queued simple app rebroadcasts=%d, want %d", got, rebroadcastFanout)
+	}
+	if _, ok := source.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("simple source received its own app rebroadcast")
 	}
 }
 
@@ -573,9 +912,9 @@ func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
 				t.Fatalf("serialize candidate broadcast: %v", err)
 			}
 
-			err = sub.handleOverlayBroadcastPayload(source, tt.msg, newKnownBroadcastPayload(payload), DeliverySimple, false, source.id)
-			if err != nil {
-				t.Fatalf("handle candidate broadcast: %v", err)
+			disposition := sub.handleOverlayBroadcastPayload(source, tt.msg, newKnownBroadcastPayload(payload), DeliverySimple, false, source.id)
+			if disposition != overlay.BroadcastDispositionIgnore {
+				t.Fatalf("handle candidate broadcast disposition = %v, want ignore", disposition)
 			}
 
 			observer.requireStage(t, broadcastPipelineStageClassify, tt.kind, DeliverySimple, broadcastPipelineResultDrop)
@@ -686,17 +1025,17 @@ func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {
 	publicSpec := overlaySpec{
 		Name:    "basechain",
 		Kind:    overlayKindPublicShard,
-		ShortID: []byte{0x01, 0x02, 0x03},
+		ShortID: bytes.Repeat([]byte{0x01}, PeerIDSize),
 	}
-	publicSub, _ := node.getOrCreateSubscription(publicSpec)
+	publicSub := mustGetOrCreateSubscription(t, node, publicSpec)
 
 	customSpec := overlaySpec{
 		Name:         "custom.private-a",
 		Kind:         overlayKindCustomFixed,
-		ShortID:      []byte{0x04, 0x05, 0x06},
+		ShortID:      bytes.Repeat([]byte{0x04}, PeerIDSize),
 		BlockSenders: map[PeerID]struct{}{node.localID: {}},
 	}
-	customSub, _ := node.getOrCreateSubscription(customSpec)
+	customSub := mustGetOrCreateSubscription(t, node, customSpec)
 	customPeer := testRebroadcastQueuePeer("custom-peer")
 	customSub.peers[customPeer.id] = customPeer
 
@@ -733,9 +1072,9 @@ func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
 	publicSpec := overlaySpec{
 		Name:    "basechain",
 		Kind:    overlayKindPublicShard,
-		ShortID: []byte{0x01, 0x02, 0x03},
+		ShortID: bytes.Repeat([]byte{0x01}, PeerIDSize),
 	}
-	publicSub, _ := node.getOrCreateSubscription(publicSpec)
+	publicSub := mustGetOrCreateSubscription(t, node, publicSpec)
 	source := testRebroadcastQueuePeer("source")
 	target := testRebroadcastQueuePeer("target")
 	publicSub.peers[source.id] = source
@@ -744,10 +1083,10 @@ func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
 	customSpec := overlaySpec{
 		Name:         "custom.private-a",
 		Kind:         overlayKindCustomFixed,
-		ShortID:      []byte{0x04, 0x05, 0x06},
+		ShortID:      bytes.Repeat([]byte{0x04}, PeerIDSize),
 		BlockSenders: map[PeerID]struct{}{node.localID: {}},
 	}
-	customSub, _ := node.getOrCreateSubscription(customSpec)
+	customSub := mustGetOrCreateSubscription(t, node, customSpec)
 	customPeer := testRebroadcastQueuePeer("custom-peer")
 	customSub.peers[customPeer.id] = customPeer
 
@@ -808,7 +1147,7 @@ func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
 	if _, ok := target.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("pending completion repeated same-overlay rebroadcast")
 	}
-	snapshot, ok := customSub.customTwoStepQueueStatusSnapshot()
+	snapshot, ok := customSub.twoStepQueueStatusSnapshot()
 	if !ok {
 		t.Fatal("custom two-step queue was not initialized")
 	}
@@ -882,14 +1221,14 @@ func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 		t.Fatalf("serialize pending broadcast: %v", err)
 	}
 
-	accepted, err := sub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("source"))
+	result, err := sub.classifyBroadcastPayload(nil, msg, newKnownBroadcastPayload(payload), DeliverySimple, false, testPeerID("source"))
 	if err != nil {
 		t.Fatalf("classify pending broadcast: %v", err)
 	}
-	if accepted == nil {
+	if result.disposition != broadcastDispositionAccept {
 		t.Fatal("expected pending broadcast placeholder")
 	}
-	node.acceptBroadcast(*accepted)
+	node.acceptBroadcast(result.accepted)
 
 	eventCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -1018,7 +1357,7 @@ func TestHandleOverlayBroadcastRejectsInvalidUntrustedFECForRelay(t *testing.T) 
 	})
 
 	err := sub.handleOverlayBroadcast(nil, tonnodeapi.NewExternalMessageBroadcast{}, DeliveryFEC, false, testPeerID("peer"))
-	if !errors.Is(err, errBroadcastRejected) {
+	if !errors.Is(err, overlay.ErrBroadcastRejected) {
 		t.Fatalf("expected rejected untrusted FEC broadcast, got %v", err)
 	}
 }
@@ -1110,7 +1449,7 @@ func TestClassifyExternalMessageBroadcastRejectsOversizeData(t *testing.T) {
 }
 
 func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProcessing(t *testing.T) {
-	for _, delivery := range []Delivery{DeliveryFEC, DeliveryTwoStep} {
+	for _, delivery := range []Delivery{DeliverySimple, DeliveryFEC, DeliveryTwoStep} {
 		t.Run(string(delivery), func(t *testing.T) {
 			node := newTestNode(t)
 			node.broadcastAdmission = testBroadcastAdmission(false)
@@ -1134,8 +1473,8 @@ func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProc
 			}
 
 			err = sub.handleOverlayBroadcast(peer, msg, delivery, false, peer.id)
-			if !errors.Is(err, errBroadcastRejected) {
-				t.Fatalf("closed admission error = %v, want %v", err, errBroadcastRejected)
+			if !errors.Is(err, overlay.ErrBroadcastRejected) {
+				t.Fatalf("closed admission error = %v, want %v", err, overlay.ErrBroadcastRejected)
 			}
 			if _, ok := node.eventQueue.TryPop(); ok {
 				t.Fatal("closed admission broadcast reached event queue")
@@ -1150,13 +1489,48 @@ func TestHandleOverlayBroadcastAdmissionClosedRejectsRelayedBroadcastWithoutProc
 	}
 }
 
-func testBroadcastStatCount(node *Node, direction, overlay, kind string) uint64 {
+func testBroadcastStatCount(
+	node *Node,
+	direction string,
+	overlay string,
+	kind string,
+	delivery Delivery,
+) uint64 {
 	for _, stat := range node.broadcastStatusSnapshot() {
-		if stat.Direction == direction && stat.Overlay == overlay && stat.Kind == kind {
+		if stat.Direction == direction &&
+			stat.Overlay == overlay &&
+			stat.Kind == kind &&
+			stat.Delivery == delivery {
 			return stat.Count
 		}
 	}
 	return 0
+}
+
+func TestBroadcastStatusSeparatesDeliveryModes(t *testing.T) {
+	node := newTestNode(t)
+
+	node.noteBroadcast("accepted", "masterchain", "tonNode.blockBroadcast", DeliverySimple)
+	node.noteBroadcast("accepted", "masterchain", "tonNode.blockBroadcast", DeliveryPlumtree)
+
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"masterchain",
+		"tonNode.blockBroadcast",
+		DeliverySimple,
+	); got != 1 {
+		t.Fatalf("simple accepted broadcast count = %d, want 1", got)
+	}
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		"masterchain",
+		"tonNode.blockBroadcast",
+		DeliveryPlumtree,
+	); got != 1 {
+		t.Fatalf("Plumtree accepted broadcast count = %d, want 1", got)
+	}
 }
 
 func testBroadcastDropStatCount(node *Node, overlay, kind, reason string) uint64 {
@@ -1180,4 +1554,99 @@ func testExternalMessageBOCWithBody(t *testing.T, value uint64) []byte {
 		t.Fatalf("build external message: %v", err)
 	}
 	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+}
+
+// blockOverlayFanoutKey feeds overlayFanoutDeduper, so its shape is a dedup
+// contract and not just a log string: it must stay per (class, chain position)
+// and must not start distinguishing competing blocks at the same position.
+func TestBlockOverlayFanoutKeyIsPerClassAndChainPosition(t *testing.T) {
+	block := ton.BlockIDExt{
+		Workchain: -1,
+		Shard:     topShard,
+		SeqNo:     7,
+		RootHash:  bytes.Repeat([]byte{0x01}, 32),
+		FileHash:  bytes.Repeat([]byte{0x02}, 32),
+	}
+	fork := block
+	fork.RootHash = bytes.Repeat([]byte{0x03}, 32)
+	fork.FileHash = bytes.Repeat([]byte{0x04}, 32)
+
+	key := blockOverlayFanoutKey("block", block)
+	if want := "block:" + tnstore.FormatBlockRef(block); key != want {
+		t.Fatalf("fanout key = %q, want %q", key, want)
+	}
+	if got := blockOverlayFanoutKey("block", fork); got != key {
+		t.Fatalf("competing block at the same position got key %q, want the shared %q", got, key)
+	}
+	if got := blockOverlayFanoutKey("candidate", block); got == key {
+		t.Fatalf("candidate class shares the block class key %q", key)
+	}
+
+	next := block
+	next.SeqNo++
+	if got := blockOverlayFanoutKey("block", next); got == key {
+		t.Fatalf("next seqno shares the key %q", key)
+	}
+
+	shard := block
+	shard.Workchain = 0
+	if got := blockOverlayFanoutKey("block", shard); got == key {
+		t.Fatalf("other workchain shares the key %q", key)
+	}
+}
+
+// TestFastSyncDeclinedBroadcastsAreDropped covers the send-only case: when this
+// node publishes DoNotReceiveBroadcasts in its member flags, a peer that
+// ignores the flag must not make us spend decode work on the payload.
+func TestFastSyncDeclinedBroadcastsAreDropped(t *testing.T) {
+	node := newTestNode(t)
+
+	// receiveBroadcasts is false only for a validator under plumtree, which is
+	// exactly when the member flags say DoNotReceiveBroadcasts.
+	newSub := func(receiveBroadcasts bool) *overlaySubscription {
+		return testOverlaySubscription(&overlaySubscription{
+			node: node,
+			spec: overlaySpec{
+				Name:    "fast-sync.0",
+				Kind:    overlayKindFastSync,
+				ShortID: []byte{0x04, 0x05, 0x06},
+			},
+			fastSync: &fastSyncOverlayRuntime{
+				spec: fastSyncOverlaySpec{
+					localValidator:    true,
+					receiveBroadcasts: receiveBroadcasts,
+				},
+			},
+			log: discardLogger(),
+		})
+	}
+
+	msg := tonnodeapi.NewShardBlockBroadcast{}
+	payload := newSerializedBroadcastPayload(make(chan struct{}))
+
+	declined := newSub(false)
+	result, err := declined.classifyBroadcastPayload(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
+	if err != nil {
+		t.Fatalf("classify declined broadcast: %v", err)
+	}
+	if result.disposition != broadcastDispositionIgnore {
+		t.Fatalf("declined broadcast was accepted: %+v", result.accepted)
+	}
+	if payload.serialized {
+		t.Fatal("declined broadcast was serialized before being dropped")
+	}
+
+	// The gate is narrow: it asks the runtime, and a receiving overlay — which
+	// is every overlay that is not a plumtree validator, including one built
+	// from a zero-valued spec — never answers yes.
+	if !declined.fastSync.declinesBroadcasts() {
+		t.Fatal("a validator under plumtree must decline broadcasts")
+	}
+	if newSub(true).fastSync.declinesBroadcasts() {
+		t.Fatal("a receiving overlay must not decline broadcasts")
+	}
+	zeroValued := &fastSyncOverlayRuntime{}
+	if zeroValued.declinesBroadcasts() {
+		t.Fatal("a zero-valued runtime must read as receiving, not declining")
+	}
 }

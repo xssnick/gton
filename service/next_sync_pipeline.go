@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/p2p"
@@ -62,15 +63,25 @@ type nextSyncRunner struct {
 	shardDescriptionPrefetchMu        sync.Mutex
 	shardDescriptionPrefetchScheduled map[storage.BlockRootHash]struct{}
 	shardDescriptionPrefetchOrder     []storage.BlockRootHash
-	shardTarget                       time.Duration
-	shardWall                         time.Duration
-	shardApply                        time.Duration
-	shardApplied                      uint64
-	committed                         uint32
-	lastCheckpointDeferred            time.Time
-	lastBlockUTime                    uint32
-	lastLagSeconds                    int64
-	hasBlockTime                      bool
+	shardAheadWake                    chan struct{}
+	shardAheadMu                      sync.Mutex
+	shardAheadPending                 map[uint32]shardApplyAheadJob
+	shardAheadRecorders               map[storage.BlockRootHash]shardAheadRecorderEntry
+	shardStageMu                      sync.Mutex
+	shardStageDeferred                map[uint32][]deferredShardCheckpointState
+	// committedMasterSeqno is published by the commit stage and read by the
+	// apply-ahead stage to decide whether resolving a master can only touch
+	// shard blocks that master itself includes.
+	committedMasterSeqno   atomic.Uint32
+	shardTarget            time.Duration
+	shardWall              time.Duration
+	shardApply             time.Duration
+	shardApplied           uint64
+	committed              uint32
+	lastCheckpointDeferred time.Time
+	lastBlockUTime         uint32
+	lastLagSeconds         int64
+	hasBlockTime           bool
 }
 
 type nextMasterDownload struct {
@@ -256,7 +267,7 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 	}
 	s.enableAutomaticStateSerialization()
 
-	if err := s.waitSyncDiskSpace(ctx, method); err != nil {
+	if err := s.waitSyncDiskSpace(ctx, method, statFSSyncDiskSpace, syncDiskSpaceRetryDelay); err != nil {
 		return nil, 0, err
 	}
 
@@ -302,6 +313,9 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 		shardPrefetchScheduled:            map[storage.BlockRootHash]struct{}{},
 		shardDescriptionPrefetchScheduled: map[storage.BlockRootHash]struct{}{},
 	}
+	// The starting master is the committed head: the apply-ahead stage may
+	// resolve the block right after it without owning anything older.
+	r.committedMasterSeqno.Store(r.current.Masterchain.Block.SeqNo)
 	r.shardResolver = newShardStateResolver(runCtx, shardStateResolverConfig{
 		current:         r.current.Shards,
 		cache:           r.shardCache,
@@ -316,6 +330,10 @@ func (s *Service) runNextSync(ctx context.Context, current *storage.CurrentState
 func (r *nextSyncRunner) run() (*storage.CurrentState, uint32, error) {
 	r.logStart()
 	r.startShardDescriptionPrefetch()
+	// Cancels the run context and drains the stage, so no shard state is applied
+	// into this run's cell window after it returns.
+	stopShardApplyAhead := r.startShardApplyAhead()
+	defer stopShardApplyAhead()
 
 	downloads := r.startMasterSource()
 	applied := r.startMasterApply(downloads)
@@ -412,6 +430,9 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 		}
 		probeState.liveTail = nextBlockBootstrapLiveTail(prevUTime, time.Now().Unix())
 
+		// Taken before the probe so a block published while it runs is not
+		// waited out by the retry below.
+		stateWake := r.service.currentStateWakeChan()
 		started := time.Now()
 		downloaded, source, prepareElapsed, err := r.service.downloadNextChainBlockProbe(r.ctx, prev, prevUTime, &probeState)
 		elapsed := time.Since(started)
@@ -439,7 +460,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 					Int("consecutive_misses", probeState.consecutiveMisses).
 					Bool("live_tail", probeState.liveTail).
 					Msg("next masterchain block is not available during bootstrap")
-				if !r.waitBootstrapRetry() {
+				if !r.waitBootstrapRetry(stateWake) {
 					return
 				}
 				continue
@@ -460,10 +481,7 @@ func (r *nextSyncRunner) runBootstrapMasterSource(out chan<- nextMasterDownload)
 			return
 		}
 		prev = downloaded.ID
-		prevUTime = 0
-		if downloaded.Meta != nil {
-			prevUTime = int64(downloaded.Meta.GenUTime)
-		}
+		prevUTime = int64(downloaded.Meta.GenUTime)
 		probeState.consecutiveMisses = 0
 		processed++
 		if r.shouldYieldBootstrapToArchive(prevUTime) {
@@ -481,11 +499,13 @@ func (r *nextSyncRunner) shouldYieldBootstrapToArchive(prevUTime int64) bool {
 		return false
 	}
 
-	lagSeconds, ok := masterchainBlockLagSeconds(prevUTime, time.Now().Unix())
-	return ok && shouldSwitchNextToArchiveByLag(lagSeconds)
+	return prevUTime != 0 && shouldSwitchNextToArchiveByLag(time.Now().Unix()-prevUTime)
 }
 
-func (r *nextSyncRunner) waitBootstrapRetry() bool {
+// waitBootstrapRetry parks until there is a reason to probe again. The caller
+// passes the wake it took before the probe that missed, so state published
+// while that probe ran is not waited out here.
+func (r *nextSyncRunner) waitBootstrapRetry(wake <-chan struct{}) bool {
 	if r.service.cellGenerationSwitchRequestActive() {
 		return false
 	}
@@ -496,7 +516,7 @@ func (r *nextSyncRunner) waitBootstrapRetry() bool {
 	select {
 	case <-r.ctx.Done():
 		return false
-	case <-r.service.currentStateWake:
+	case <-wake:
 		return !r.service.cellGenerationSwitchRequestActive()
 	case <-timer.C:
 		return !r.service.cellGenerationSwitchRequestActive()
@@ -519,13 +539,6 @@ func (r *nextSyncRunner) startMasterApply(downloads <-chan nextMasterDownload) <
 	out := make(chan nextAppliedMaster, 2*nextMasterchainPrefetchBlocks)
 	start := storage.CloneBlockState(r.master)
 	applyCells := newNextMasterApplyCellWindow(func(hash cell.Hash) (*cell.Cell, error) {
-		if r.stateCells == nil {
-			base := r.service.stateCellLoader()
-			if base == nil {
-				return nil, storage.ErrNotFound
-			}
-			return base(hash)
-		}
 		return r.stateCells.loader()(hash)
 	}, &r.service.lazyCellLoads)
 	go func() {
@@ -634,10 +647,29 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 		return applied, err
 	}
 
+	// Publish the applied state to the caches the next block waits on before
+	// doing anything else with it: the next masterchain broadcast cannot be
+	// state-decompressed and its consensus proof cannot be validated until this
+	// state is visible, so every millisecond spent here lands on the live head.
+	// The key-block config above stays ahead of it because the FastSync roster
+	// reconcile below reads it.
+	r.service.rememberAppliedMasterCompressedState(nextMaster)
+	// Cheap and ordering-sensitive: the active overlay set is computed at this
+	// depth, and the next shard download resolves its overlay through it.
+	r.service.updateP2PMonitorMinSplitDepth(nextMaster)
+	// Both background consumers below retain this slice; neither may sort,
+	// dedupe or otherwise mutate it, and neither may the commit stage.
+	r.service.scheduleP2PShardOverlayUpdate(nextMaster, targets)
+
 	r.service.publishLiveBlockArtifacts(prepared, nextMaster, liveBlockPublishOptions{})
 	r.service.rememberAppliedMasterchainState(nextMaster)
 	r.service.rememberSeenMasterchainBlock(nextMaster.Block)
-	r.service.rememberMasterState(r.ctx, nextMaster, &prepared, targets)
+	// Strictly after this master is published: the stage stamps the shard blocks
+	// it applies with this master as their inclusion ref, and a proof built for
+	// such a block resolves that ref by seqno, so the master must be visible
+	// first. Everything the commit stage does with these targets afterwards is
+	// then already done or in flight.
+	r.scheduleShardApplyAhead(nextMaster, targets)
 	applyCells.remember(prepared.ID, prepared.StateUpdateToCells)
 	applied.master = nextMaster
 	applied.stateUpdateCells = prepared.StateUpdateToCells
@@ -673,10 +705,6 @@ func (r *nextSyncRunner) shardTargetsForMasterBlock(block PreparedBlock) ([]ton.
 }
 
 func (r *nextSyncRunner) scheduleShardPrefetch(master ton.BlockIDExt, targets []ton.BlockIDExt) int {
-	if r.shardPrefetchScheduled == nil {
-		r.shardPrefetchScheduled = map[storage.BlockRootHash]struct{}{}
-	}
-
 	count := 0
 	for _, target := range targets {
 		key := storage.BlockKey(target)
@@ -692,28 +720,24 @@ func (r *nextSyncRunner) scheduleShardPrefetch(master ton.BlockIDExt, targets []
 	return count
 }
 
-func rememberScheduledShardPrefetch(scheduled map[storage.BlockRootHash]struct{}, scheduledOrder *[]storage.BlockRootHash, key storage.BlockRootHash) bool {
+func rememberScheduledShardPrefetch(scheduled map[storage.BlockRootHash]struct{}, scheduledOrder *[]storage.BlockRootHash, key storage.BlockRootHash) {
 	if _, ok := scheduled[key]; ok {
-		return false
+		return
 	}
 
 	scheduled[key] = struct{}{}
 	*scheduledOrder = append(*scheduledOrder, key)
 	if len(scheduled) <= nextShardPrefetchScheduleLimit {
-		return true
+		return
 	}
 
 	evict := (*scheduledOrder)[0]
 	delete(scheduled, evict)
 	copy(*scheduledOrder, (*scheduledOrder)[1:])
 	*scheduledOrder = (*scheduledOrder)[:len(*scheduledOrder)-1]
-	return true
 }
 
 func (r *nextSyncRunner) prefetchShardTarget(master ton.BlockIDExt, target ton.BlockIDExt) bool {
-	if r.service.node == nil {
-		return false
-	}
 	if !r.tryAcquireShardPrefetchSlot() {
 		return false
 	}
@@ -734,10 +758,6 @@ func (r *nextSyncRunner) prefetchShardTarget(master ton.BlockIDExt, target ton.B
 }
 
 func (r *nextSyncRunner) tryAcquireShardPrefetchSlot() bool {
-	if r.shardPrefetchSlots == nil {
-		return true
-	}
-
 	select {
 	case <-r.ctx.Done():
 		return false
@@ -749,17 +769,10 @@ func (r *nextSyncRunner) tryAcquireShardPrefetchSlot() bool {
 }
 
 func (r *nextSyncRunner) releaseShardPrefetchSlot() {
-	if r.shardPrefetchSlots == nil {
-		return
-	}
 	<-r.shardPrefetchSlots
 }
 
 func (r *nextSyncRunner) startShardDescriptionPrefetch() {
-	if r.service == nil || r.service.shardDescriptionWake == nil {
-		return
-	}
-
 	r.prefetchShardDescriptionHints()
 	go func() {
 		for {
@@ -833,14 +846,6 @@ func (r *nextSyncRunner) prefetchShardDescriptionHints() {
 	}
 }
 
-func (r *nextSyncRunner) validateShardDescriptionPrefetch(desc *p2p.ShardBlockDescription) error {
-	currentBlocks, err := r.shardResolver.currentBlocksForBlock(desc.Block)
-	if err != nil {
-		return err
-	}
-	return validateShardDescriptionPrefetchAgainst(desc, currentBlocks)
-}
-
 func validateShardDescriptionPrefetchAgainst(desc *p2p.ShardBlockDescription, currentBlocks []ton.BlockIDExt) error {
 	currentSeqno := uint32(0)
 	for i, block := range currentBlocks {
@@ -890,15 +895,12 @@ func shardDescriptionContainsPrevRef(desc *p2p.ShardBlockDescription, block ton.
 }
 
 func (r *nextSyncRunner) prefetchShardDescriptionTarget(hint shardDescriptionHint, desc *p2p.ShardBlockDescription) bool {
-	if r.service.node == nil {
-		return false
-	}
 	if !r.tryAcquireShardPrefetchSlot() {
 		return false
 	}
 
 	r.service.log.Debug().
-		Str("block", storage.FormatBlockRef(desc.Block)).
+		Stringer("block", storage.BlockRef(desc.Block)).
 		Str("overlay", hint.Overlay).
 		Int("chain_links", len(desc.Chain)).
 		Msg("prefetching shard block from description broadcast")
@@ -946,10 +948,6 @@ func (r *nextSyncRunner) commitCurrent(applied <-chan nextAppliedMaster) (*stora
 				r.cancel()
 				return r.current, nil
 			}
-			if item.master == nil {
-				return r.current, fmt.Errorf("next-block pipeline applied empty master state")
-			}
-
 			if !item.prev.Equals(&r.current.Masterchain.Block) {
 				return r.current, fmt.Errorf("applied masterchain block %s follows %s while current state is %s", item.block.BlockRef(), storage.FormatBlockRef(item.prev), storage.FormatBlockRef(r.current.Masterchain.Block))
 			}
@@ -1020,7 +1018,10 @@ func (r *nextSyncRunner) flushStaged(mode flushStagedMode, reason string) error 
 
 	checkpoint, artifactPrewriteTarget := r.checkpoint()
 	cells := r.stateCells.beginCheckpoint()
-	releaseCells := r.retainCheckpointCellLoader(cells)
+	releaseCells := func() {}
+	if loader := cells.retainedLoader(r.service.stateCellLoader()); loader != nil {
+		releaseCells = r.service.retainStateCellLoader(loader)
+	}
 	onCommitted := func() {
 		r.completeCheckpoint(checkpoint)
 	}
@@ -1056,7 +1057,8 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	r.timing.persist += item.stageElapsed
 	r.master = item.master
 
-	nextCurrent, shardStats, err := r.service.currentStateForNextMasterState(r.ctx, r.current, item.master, item.shardTargets, r.shardResolver)
+	commitCtx := r.shardApplyAheadContext(r.ctx, item.master.Block)
+	nextCurrent, shardStats, err := r.service.currentStateForNextMasterState(commitCtx, r.current, item.master, item.shardTargets, r.shardResolver)
 	r.observeMasterShardObtain(item, shardStats, err)
 	if err != nil {
 		return err
@@ -1065,13 +1067,19 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	resolverStats := r.takeShardResolverStats()
 	shardStats.apply += resolverStats.applyElapsed
 	shardStats.applied += resolverStats.blocksApplied
-	if err = r.rememberMasterCheckpointState(item); err != nil {
-		return err
-	}
 
 	r.current = nextCurrent
 	r.shardResolver.updateCurrent(r.current.Shards)
+	r.committedMasterSeqno.Store(r.current.Masterchain.Block.SeqNo)
+	// The committed head moved, so a master the stage had to skip may now be
+	// admissible without it receiving a new schedule.
+	r.wakeShardApplyAhead()
 	r.prefetchShardDescriptionHints()
+	// Publish the head before any durability staging: staging below contains
+	// the prewriter enqueues, which block under disk backpressure, and nothing
+	// in the publish path reads state the staging creates — the master's apply
+	// cells stay resolvable through the private apply window until
+	// rememberMasterCheckpointState moves them into the shared one.
 	snapshot := r.service.publishLiveCurrentStateChanged(r.current)
 	if r.service.liveState != nil {
 		if snapshot == nil {
@@ -1081,6 +1089,17 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 		}
 		r.service.liveState.SetLiveCurrentStateSnapshot(snapshot)
 	}
+
+	// Shards strictly before their inclusion master, and both before any
+	// checkpoint this commit can trigger (the flushes below are the only ones
+	// on this runner), so no checkpoint can contain a shard block without its
+	// staged master.
+	if err = r.stageDeferredShardCheckpointStates(item.master.Block.SeqNo); err != nil {
+		return err
+	}
+	if err = r.rememberMasterCheckpointState(item); err != nil {
+		return err
+	}
 	r.shardTarget += shardStats.targetParse
 	r.shardWall += shardStats.wall
 	r.shardApply += shardStats.apply
@@ -1088,11 +1107,7 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	r.committed++
 	r.stagedBlocks++
 
-	if r.reachedTarget() {
-		if err := r.flushStagedCurrent(); err != nil {
-			return err
-		}
-	} else if r.shouldBackpressureStagedCurrent() {
+	if r.reachedTarget() || r.shouldBackpressureStagedCurrent() {
 		if err := r.flushStagedCurrent(); err != nil {
 			return err
 		}
@@ -1103,7 +1118,7 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	}
 
 	r.logShardCommit(item, shardStats, blockStarted, masterPipelineWait, appliedQueue, applyBefore, persistBefore, checkpointsBefore, shardTargetBefore, shardWallBefore, shardApplyBefore, shardAppliedBefore)
-	r.logProgressIfNeeded(item)
+	r.logProgressIfNeeded()
 	return nil
 }
 
@@ -1135,33 +1150,30 @@ func (r *nextSyncRunner) logCheckpointDeferred() {
 		Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 		Uint32("pending_checkpoint_blocks", r.stagedBlocks).
 		Uint64("pending_checkpoint_bytes", r.pendingCheckpointBytes()).
-		Uint32("checkpoint_blocks", r.service.nextCheckpointBlocks()).
-		Uint64("checkpoint_bytes", r.service.checkpointBytesTarget()).
-		Uint32("sync_backpressure_windows", r.service.syncBackpressureWindowCount()).
-		Uint32("checkpoint_backpressure_blocks", checkpointBackpressureBlocks(r.service.nextCheckpointBlocks(), r.service.syncBackpressureWindowCount())).
-		Uint64("checkpoint_backpressure_bytes", checkpointBackpressureBytes(r.service.checkpointBytesTarget(), r.service.syncBackpressureWindowCount())).
+		Uint32("checkpoint_blocks", r.service.nextBlockCheckpointBlocks).
+		Uint64("checkpoint_bytes", r.service.checkpointBytes).
+		Uint32("sync_backpressure_windows", r.service.syncBackpressureWindows).
+		Uint32("checkpoint_backpressure_blocks", checkpointBackpressureBlocks(r.service.nextBlockCheckpointBlocks, r.service.syncBackpressureWindows)).
+		Uint64("checkpoint_backpressure_bytes", checkpointBackpressureBytes(r.service.checkpointBytes, r.service.syncBackpressureWindows)).
 		Msg("next-block checkpoint deferred because current state persist is busy")
 }
 
 func (r *nextSyncRunner) shouldCheckpointStagedCurrent() bool {
-	if r.stagedBlocks >= r.service.nextCheckpointBlocks() {
+	if r.stagedBlocks >= r.service.nextBlockCheckpointBlocks {
 		return true
 	}
-	return r.pendingCheckpointBytes() >= r.service.checkpointBytesTarget()
+	return r.pendingCheckpointBytes() >= r.service.checkpointBytes
 }
 
 func (r *nextSyncRunner) shouldBackpressureStagedCurrent() bool {
-	windows := r.service.syncBackpressureWindowCount()
-	if r.stagedBlocks >= checkpointBackpressureBlocks(r.service.nextCheckpointBlocks(), windows) {
+	windows := r.service.syncBackpressureWindows
+	if r.stagedBlocks >= checkpointBackpressureBlocks(r.service.nextBlockCheckpointBlocks, windows) {
 		return true
 	}
-	return r.pendingCheckpointBytes() >= checkpointBackpressureBytes(r.service.checkpointBytesTarget(), windows)
+	return r.pendingCheckpointBytes() >= checkpointBackpressureBytes(r.service.checkpointBytes, windows)
 }
 
 func (r *nextSyncRunner) pendingCheckpointBytes() uint64 {
-	if r.stateCells == nil {
-		return 0
-	}
 	return r.stateCells.byteSize()
 }
 
@@ -1177,6 +1189,13 @@ func (r *nextSyncRunner) takeShardResolverStats() shardStateResolverStats {
 }
 
 func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storage.BlockState, downloaded PreparedBlock, applyElapsed time.Duration) (err error) {
+	// Resolved before the observation defer on purpose: a missing inclusion
+	// master is a wiring bug, not a sync outcome worth reporting as one.
+	master, err := shardApplyMasterFromContext(ctx)
+	if err != nil {
+		return err
+	}
+
 	observation := SyncBlockObservation{
 		Pipeline:        r.method,
 		Chain:           syncChainLabel(downloaded.ID),
@@ -1195,23 +1214,74 @@ func (r *nextSyncRunner) afterApplyShardState(ctx context.Context, state *storag
 		r.service.observeSyncBlock(observation)
 	}()
 
-	setShardStateMasterchainRef(state, r.master.Block)
-	setPreparedShardMasterchainRef(&downloaded, r.master.Block)
+	setShardStateMasterchainRef(state, master.Block)
+	setShardBlockMasterchainRef(downloaded.Meta, master.Block)
 
-	r.service.publishLiveBlockArtifacts(downloaded, state, liveBlockPublishOptions{})
-	if r.service.rememberCompressedBlockState(state) && r.service.node != nil {
+	// Same reason as the masterchain path: the next shard broadcast for this
+	// shard is state-compressed against this state, so publish it for decode
+	// before the (heavier) live-view publish.
+	if r.service.RememberCompressedBlockState(state) {
 		r.service.node.NotifyCompressedBlockStateReady(state.Block)
 	}
+	r.service.publishLiveBlockArtifacts(downloaded, state, liveBlockPublishOptions{})
 
-	splitDepth, err := r.service.cachedMonitorMinSplitDepth(r.master, downloaded.ID.Workchain)
+	splitDepth, err := r.service.cachedMonitorMinSplitDepth(master, downloaded.ID.Workchain)
 	if err != nil {
 		return err
 	}
-	artifact, links, err := preparedBlockCheckpointArtifacts(downloaded, splitDepth)
-	if err != nil {
-		return err
+	// Durability staging is deferred to the commit of the inclusion master:
+	// everything above is caches and live visibility, but a staged checkpoint
+	// entry would let a checkpoint persist this shard block while the master
+	// its MasterchainRefSeqno points to is still uncommitted, leaving a
+	// dangling ref after an unclean restart.
+	artifact, links := preparedBlockCheckpointArtifacts(downloaded, splitDepth)
+	r.deferShardCheckpointState(master.Block.SeqNo, state, artifact, links)
+	return nil
+}
+
+// deferredShardCheckpointState is a resolved shard block whose checkpoint
+// staging waits for the commit of its inclusion master. The artifact payloads
+// alias the prepared block's immutable buffers and the state is retained by
+// the resolver cache anyway, so deferral adds no copies; the map holds at most
+// the targets of the masters in flight (the apply-ahead stage resolves one
+// master at a time plus the commit's own) and dies with the runner when a run
+// stops before committing them.
+type deferredShardCheckpointState struct {
+	state    *storage.BlockState
+	artifact *storage.ServedBlockFull
+	links    []storage.ServedBlockLink
+}
+
+func (r *nextSyncRunner) deferShardCheckpointState(masterSeqno uint32, state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
+	r.shardStageMu.Lock()
+	if r.shardStageDeferred == nil {
+		r.shardStageDeferred = map[uint32][]deferredShardCheckpointState{}
 	}
-	return r.rememberCheckpointState(state, artifact, links)
+	r.shardStageDeferred[masterSeqno] = append(r.shardStageDeferred[masterSeqno], deferredShardCheckpointState{
+		state:    state,
+		artifact: artifact,
+		links:    links,
+	})
+	r.shardStageMu.Unlock()
+}
+
+// stageDeferredShardCheckpointStates stages the shard blocks resolved for this
+// master. Called by commitOne after the master's shard resolution completed —
+// every afterApplyShardState for these targets runs inside the resolver tasks
+// that resolution waits on, so the deferred set is complete by then, whether
+// the apply-ahead stage or the commit stage owned the tasks.
+func (r *nextSyncRunner) stageDeferredShardCheckpointStates(masterSeqno uint32) error {
+	r.shardStageMu.Lock()
+	deferred := r.shardStageDeferred[masterSeqno]
+	delete(r.shardStageDeferred, masterSeqno)
+	r.shardStageMu.Unlock()
+
+	for _, shard := range deferred {
+		if err := r.rememberCheckpointState(shard.state, shard.artifact, shard.links); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) error {
@@ -1224,28 +1294,28 @@ func (r *nextSyncRunner) rememberMasterCheckpointState(item nextAppliedMaster) e
 	if item.releaseApplyCells != nil {
 		item.releaseApplyCells()
 	}
-	artifact, links, err := preparedBlockCheckpointArtifacts(item.block, 0)
-	if err != nil {
-		return err
-	}
+	artifact, links := preparedBlockCheckpointArtifacts(item.block, 0)
 	return r.rememberCheckpointState(item.master, artifact, links)
 }
 
 func (r *nextSyncRunner) rememberCheckpointState(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) error {
 	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
 	r.checkpointStates.rememberWithArtifacts(state, artifact, links)
 	// Stream the artifact append ahead of the checkpoint while holding
 	// checkpointMu, so a checkpoint snapshot always covers exactly the staged
-	// entries whose prewrite sequence it waits for.
-	seq, err := r.service.artifactPrewrite.enqueue(state, artifact)
+	// entries whose prewrite sequence it waits for. Only the append runs under
+	// the mutex; the queue's backpressure wait runs after the unlock, so a
+	// prewriter stalled on disk still throttles this producer but cannot block
+	// the async checkpoint completion, which takes checkpointMu.
+	seq, wait, err := r.service.artifactPrewrite.enqueueDetached(state, artifact)
+	if err == nil && seq > r.artifactPrewriteSeq {
+		r.artifactPrewriteSeq = seq
+	}
+	r.checkpointMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if seq > r.artifactPrewriteSeq {
-		r.artifactPrewriteSeq = seq
-	}
-	return nil
+	return wait()
 }
 
 func (r *nextSyncRunner) checkpoint() (appliedStateCheckpoint, uint64) {
@@ -1258,13 +1328,6 @@ func (r *nextSyncRunner) completeCheckpoint(checkpoint appliedStateCheckpoint) {
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
 	r.checkpointStates.completeCheckpoint(checkpoint)
-}
-
-func (r *nextSyncRunner) retainCheckpointCellLoader(cells *stateCellCheckpointCache) func() {
-	if cells == nil {
-		return func() {}
-	}
-	return r.service.retainStateCellLoader(cells.retainedLoader(r.service.stateCellLoader()))
 }
 
 func (r *nextSyncRunner) reachedTarget() bool {
@@ -1286,8 +1349,11 @@ func (r *nextSyncRunner) shouldReturnAfterCommit() bool {
 	}
 
 	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
-	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, time.Now().Unix())
-	if !ok || !shouldSwitchNextToArchiveByLag(lagSeconds) {
+	if blockUTime == 0 {
+		return false
+	}
+	lagSeconds := time.Now().Unix() - blockUTime
+	if !shouldSwitchNextToArchiveByLag(lagSeconds) {
 		return false
 	}
 
@@ -1326,6 +1392,14 @@ func (r *nextSyncRunner) latestTarget(currentSeqno uint32) (ton.BlockIDExt, erro
 }
 
 func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
+	// Everything below is log-only: skip the head lookup and the field
+	// formatting entirely when the level is off, since this runs per applied
+	// masterchain block on the live-head path.
+	event := r.service.log.Debug()
+	if !event.Enabled() {
+		return
+	}
+
 	latest, err := r.latestTarget(item.master.Block.SeqNo)
 	if err != nil {
 		latest = item.master.Block
@@ -1334,10 +1408,10 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 		latest = item.master.Block
 	}
 
-	blockUTime, lagSeconds, hasBlockTime := downloadedBlockTimeLag(item.block, time.Now())
+	blockUTime, lagSeconds := downloadedBlockTimeLag(item.block, time.Now())
 	elapsed := item.downloadElapsed + item.prepareElapsed + item.applyTiming.total
 
-	event := r.service.log.Debug().
+	event = event.
 		Str("block", item.block.BlockRef()).
 		Str("latest_masterchain", storage.FormatBlockRef(latest)).
 		Str("catchup_method", r.method).
@@ -1349,7 +1423,7 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 		Dur("master_consensus_elapsed", item.applyTiming.consensus).
 		Dur("master_state_update_elapsed", item.applyTiming.stateUpdate).
 		Dur("elapsed", elapsed)
-	if hasBlockTime {
+	if blockUTime != 0 {
 		event.Uint32("block_utime", blockUTime).Int64("lag_seconds", lagSeconds)
 	}
 	event.Msg("next-block masterchain head applied")
@@ -1357,6 +1431,20 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 
 func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextShardClientApplyStats, blockStarted time.Time, masterPipelineWait time.Duration, appliedQueue int, applyBefore time.Duration, persistBefore time.Duration, checkpointsBefore uint32, shardTargetBefore time.Duration, shardWallBefore time.Duration, shardApplyBefore time.Duration, shardAppliedBefore uint64) {
 	blockElapsed := time.Since(blockStarted)
+
+	// The lag fields feed the periodic Info progress log, so they are computed
+	// unconditionally; everything else here is Debug-only and runs once per
+	// committed masterchain block on the live-head path.
+	blockUTime, lagSeconds := downloadedBlockTimeLag(item.block, time.Now())
+	r.lastBlockUTime = blockUTime
+	r.lastLagSeconds = lagSeconds
+	r.hasBlockTime = blockUTime != 0
+
+	event := r.service.log.Debug()
+	if !event.Enabled() {
+		return
+	}
+
 	latest, err := r.latestTarget(r.current.Masterchain.Block.SeqNo)
 	if err != nil {
 		latest = r.current.Masterchain.Block
@@ -1374,12 +1462,7 @@ func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextS
 		remaining = r.target.SeqNo - r.current.Masterchain.Block.SeqNo
 	}
 
-	blockUTime, lagSeconds, hasBlockTime := downloadedBlockTimeLag(item.block, time.Now())
-	r.lastBlockUTime = blockUTime
-	r.lastLagSeconds = lagSeconds
-	r.hasBlockTime = hasBlockTime
-
-	event := r.service.log.Debug().
+	event = event.
 		Str("block", item.block.BlockRef()).
 		Str("prev", storage.FormatBlockRef(item.prev)).
 		Str("latest_masterchain", storage.FormatBlockRef(latest)).
@@ -1399,7 +1482,7 @@ func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextS
 		Dur("elapsed", blockElapsed).
 		Str("speed", formatBlockRate(1, blockElapsed)).
 		Bool("checkpoint", r.timing.checkpoints > checkpointsBefore)
-	if hasBlockTime {
+	if blockUTime != 0 {
 		event.Uint32("block_utime", blockUTime).Int64("lag_seconds", lagSeconds)
 	}
 	if shardStats.resolverWait > 0 {
@@ -1409,7 +1492,7 @@ func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextS
 	event.Msg("next-block shard-client state synced")
 }
 
-func (r *nextSyncRunner) logProgressIfNeeded(item nextAppliedMaster) {
+func (r *nextSyncRunner) logProgressIfNeeded() {
 	if time.Since(r.lastLog) < 5*time.Second && !r.reachedTarget() {
 		return
 	}
@@ -1439,7 +1522,7 @@ func (r *nextSyncRunner) logProgressIfNeeded(item nextAppliedMaster) {
 	if r.current.Masterchain.Parsed != nil {
 		shardClientLagSeconds = now.Unix() - int64(r.current.Masterchain.Parsed.GenUTime)
 	}
-	basechainLagSeconds, basechainShards, hasBasechainLag := currentBasechainLagSeconds(now, r.current)
+	basechainLagSeconds, basechainShards := currentBasechainLagSeconds(now, r.current)
 
 	event := r.service.log.Info().
 		Str("masterchain_head", storage.FormatBlockRef(r.master.Block)).
@@ -1456,7 +1539,7 @@ func (r *nextSyncRunner) logProgressIfNeeded(item nextAppliedMaster) {
 		event.Uint32("block_utime", r.lastBlockUTime).
 			Int64("master_lag_seconds", masterLagSeconds).
 			Int64("shard_client_lag_seconds", shardClientLagSeconds)
-		if hasBasechainLag {
+		if basechainShards > 0 {
 			event.Int64("basechain_lag_seconds", basechainLagSeconds).
 				Int("basechain_shards", basechainShards)
 		}
@@ -1483,11 +1566,7 @@ func (r *nextSyncRunner) logProgressIfNeeded(item nextAppliedMaster) {
 	r.timing.reset(r.lastLog)
 }
 
-func currentBasechainLagSeconds(now time.Time, current *storage.CurrentState) (int64, int, bool) {
-	if current == nil {
-		return 0, 0, false
-	}
-
+func currentBasechainLagSeconds(now time.Time, current *storage.CurrentState) (int64, int) {
 	var maxLag int64
 	shards := 0
 	for _, shard := range current.Shards {
@@ -1501,5 +1580,5 @@ func currentBasechainLagSeconds(now time.Time, current *storage.CurrentState) (i
 		}
 		shards++
 	}
-	return maxLag, shards, shards > 0
+	return maxLag, shards
 }

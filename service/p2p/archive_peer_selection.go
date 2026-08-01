@@ -85,18 +85,6 @@ func prioritizeArchivePeersWithPerformance(_ archive.ShardID, peers []*overlayPe
 	return ordered
 }
 
-func (s *overlaySubscription) peerByAddr(addr string) *overlayPeer {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	for _, peer := range s.peers {
-		if peer.addr == addr {
-			return peer
-		}
-	}
-	return nil
-}
-
 func archiveSpeedSampleReliable(bytes int64) bool {
 	return bytes >= int64(archiveSliceProbeSize)
 }

@@ -1,22 +1,26 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/blockproof"
 	tnstate "github.com/xssnick/gton/service/state"
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl"
+	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
+
+const maxPeerSliceRequestSize = 1 << 24
 
 func init() {
 	tl.Register(PreparedProofEmpty{}, "tonNode.preparedProofEmpty = tonNode.PreparedProof")
@@ -27,7 +31,6 @@ func init() {
 	tl.Register(Capabilities{}, "tonNode.capabilities#f5bf60c0 version_major:int version_minor:int flags:# = tonNode.Capabilities")
 	tl.Register(ArchiveNotFound{}, "tonNode.archiveNotFound = tonNode.ArchiveInfo")
 	tl.Register(ArchiveInfo{}, "tonNode.archiveInfo id:long = tonNode.ArchiveInfo")
-	tl.Register(archive.ShardID{}, "tonNode.shardId workchain:int shard:long = tonNode.ShardId")
 	tl.Register(ForgetPeer{}, "tonNode.forgetPeer = tonNode.ForgetPeer")
 	tl.Register(GetCapabilities{}, "tonNode.getCapabilities = tonNode.Capabilities")
 	tl.Register(GetArchiveInfo{}, "tonNode.getArchiveInfo masterchain_seqno:int = tonNode.ArchiveInfo")
@@ -68,8 +71,8 @@ type GetArchiveInfo struct {
 }
 
 type GetShardArchiveInfo struct {
-	MasterchainSeqno int32           `tl:"int"`
-	ShardPrefix      archive.ShardID `tl:"struct"`
+	MasterchainSeqno int32              `tl:"int"`
+	ShardPrefix      tonnodeapi.ShardID `tl:"struct"`
 }
 
 type GetArchiveSlice struct {
@@ -116,101 +119,207 @@ type IhrMessageBroadcast struct {
 	Message IhrMessage `tl:"struct"`
 }
 
-func (s *overlaySubscription) answerADNLQuery(peer *overlayPeer, msg *adnl.MessageQuery) error {
-	return s.answerPeerQuery(peer, msg.Data, func(ctx context.Context, resp tl.Serializable) error {
-		return peer.overlay.Answer(ctx, msg.ID, resp)
-	})
+type advertisedPeerCandidate struct {
+	publicKey [ed25519.PublicKeySize]byte
+	overlayID [PeerIDSize]byte
+	signature [ed25519.SignatureSize]byte
+	version   int32
 }
 
-func (s *overlaySubscription) answerRLDPQuery(peer *overlayPeer, transferID []byte, query *rldp.Query) error {
-	return s.answerPeerQuery(peer, query.Data, func(ctx context.Context, resp tl.Serializable) error {
-		return peer.rldpOverlay.SendAnswer(ctx, query.MaxAnswerSize, query.Timeout, query.ID, transferID, resp)
-	})
+var errOverlayInactive = errors.New("overlay is inactive")
+
+// inboundQuery is one served query, independent of whether the sender is
+// attached to this overlay. A detached sender carries no wrappers, so the
+// liveness row and the answer transport are supplied separately.
+type inboundQuery struct {
+	addr   string
+	row    *overlayPeer              // liveness row; nil when unknown
+	forget func(ctx context.Context) // told the overlay is inactive
+	answer func(ctx context.Context, resp tl.Serializable) error
 }
 
-func (s *overlaySubscription) answerPeerQuery(peer *overlayPeer, req any, answer func(context.Context, tl.Serializable) error) error {
+// serveInboundQuery is the shared body of every inbound query path: admission,
+// liveness, dispatch and the answer. Keeping detached senders on exactly this
+// path is what makes it safe to stop attaching every peer — an unattached peer
+// must still be served, or it marks us unreliable and drops us.
+func (s *overlaySubscription) serveInboundQuery(query inboundQuery, data any) error {
 	if !s.node.beginInbound() {
 		return nil
 	}
 	defer s.node.finishInbound()
 
-	if peer != nil && peer.noteReceive() {
-		s.peerPromoted(peer)
+	if query.row != nil && query.row.noteReceive() {
+		s.peerPromoted(query.row)
 	}
+
 	ctx, cancel := context.WithTimeout(s.node.runCtx, peerQueryTimeout)
 	defer cancel()
 
-	startedAt := time.Now()
-	// Event.Type only evaluates the %T reflection when the event is enabled,
-	// keeping the disabled trace/debug paths free of per-query fmt.Sprintf.
-	queryLog := s.log.Trace().
-		Type("kind", req)
-	if peer != nil {
-		queryLog = queryLog.Str("peer", peer.addr)
+	resp, err := s.handlePeerQuery(ctx, query.addr, data)
+	if errors.Is(err, errOverlayInactive) && query.forget != nil {
+		query.forget(ctx)
 	}
-	queryLog.Msg("received overlay query")
-
-	if !s.isActive() {
-		s.sendForgetPeer(ctx, peer)
-		return errors.New("shard is inactive")
+	if errors.Is(err, context.Canceled) {
+		return nil
 	}
-
-	resp, err := s.dispatchPeerQuery(ctx, peer, req)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		logEvt := s.log.Debug().
-			Err(err).
-			Type("kind", req)
-		if peer != nil {
-			logEvt = logEvt.Str("peer", peer.addr)
-		}
-		logEvt.Msg("failed to answer overlay query")
 		return err
 	}
-	answerLog := s.log.Trace().
-		Type("kind", req).
-		Type("response", resp).
-		Dur("elapsed", time.Since(startedAt))
-	if peer != nil {
-		answerLog = answerLog.Str("peer", peer.addr)
-	}
-	answerLog.Msg("answering overlay query")
-
-	if err = answer(ctx, resp); errors.Is(err, context.Canceled) {
+	if err = query.answer(ctx, resp); errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
 }
 
-func (s *overlaySubscription) sendForgetPeer(ctx context.Context, peer *overlayPeer) {
-	if peer == nil || peer.overlay == nil {
-		return
+// serveDetachedADNLQuery answers a query from a peer that holds no attachment to
+// this overlay. Without it, a peer we are not attached to is silently ignored:
+// tonutils drops the query with "got query for unregistered overlay", the peer
+// never gets its blocks, proofs or Pong, marks us unreliable and evicts us.
+func (s *overlaySubscription) serveDetachedADNLQuery(pooled *pooledPeer, msg *adnl.MessageQuery, unwrapped tl.Serializable) error {
+	s.noteDirectoryActivity(pooled.id, pooled.addr)
+	return s.serveInboundQuery(inboundQuery{
+		addr:   pooled.addr,
+		row:    s.rosterRow(pooled.id),
+		forget: func(ctx context.Context) { s.sendDetachedForgetPeer(ctx, pooled) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return pooled.adnl.Answer(ctx, msg.ID, resp)
+		},
+	}, unwrapped)
+}
+
+func (s *overlaySubscription) serveDetachedRLDPQuery(pooled *pooledPeer, transferID []byte, query *rldp.Query, unwrapped tl.Serializable) error {
+	s.noteDirectoryActivity(pooled.id, pooled.addr)
+	return s.serveInboundQuery(inboundQuery{
+		addr:   pooled.addr,
+		row:    s.rosterRow(pooled.id),
+		forget: func(ctx context.Context) { s.sendDetachedForgetPeer(ctx, pooled) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return pooled.rldp.SendAnswer(
+				ctx,
+				query.MaxAnswerSize,
+				query.Timeout,
+				query.ID,
+				transferID,
+				resp,
+			)
+		},
+	}, unwrapped)
+}
+
+// sendDetachedForgetPeer tells an unattached peer to drop us, over its pooled
+// transport: the attached path goes through the overlay broadcast peer, which a
+// detached sender does not have.
+func (s *overlaySubscription) sendDetachedForgetPeer(ctx context.Context, pooled *pooledPeer) {
+	_ = pooled.adnl.SendCustomMessage(ctx, overlay.WrapMessage(s.spec.ShortID, ForgetPeer{}))
+}
+
+func (s *overlaySubscription) rosterRow(id PeerID) *overlayPeer {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	return s.peers[id]
+}
+
+func (s *overlaySubscription) answerADNLQuery(peer *overlayPeer, msg *adnl.MessageQuery) error {
+	return s.serveInboundQuery(inboundQuery{
+		addr:   peer.addr,
+		row:    peer,
+		forget: func(ctx context.Context) { s.sendForgetPeer(ctx, peer) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return peer.overlay.Answer(ctx, msg.ID, resp)
+		},
+	}, msg.Data)
+}
+
+func (s *overlaySubscription) answerRLDPQuery(peer *overlayPeer, transferID []byte, query *rldp.Query) error {
+	return s.serveInboundQuery(inboundQuery{
+		addr:   peer.addr,
+		row:    peer,
+		forget: func(ctx context.Context) { s.sendForgetPeer(ctx, peer) },
+		answer: func(ctx context.Context, resp tl.Serializable) error {
+			return peer.rldpOverlay.SendAnswer(
+				ctx,
+				query.MaxAnswerSize,
+				query.Timeout,
+				query.ID,
+				transferID,
+				resp,
+			)
+		},
+	}, query.Data)
+}
+
+func (s *overlaySubscription) handlePeerQuery(
+	ctx context.Context,
+	peerAddr string,
+	req any,
+) (tl.Serializable, error) {
+	startedAt := time.Now()
+	// Event.Type only evaluates the %T reflection when the event is enabled,
+	// keeping the disabled trace/debug paths free of per-query fmt.Sprintf.
+	queryLog := s.log.Trace().
+		Type("kind", req).
+		Str("peer", peerAddr)
+	queryLog.Msg("received overlay query")
+
+	if !s.isActive() {
+		return nil, errOverlayInactive
 	}
-	_ = peer.overlay.SendCustomMessage(ctx, ForgetPeer{})
+
+	resp, err := s.dispatchPeerQuery(ctx, req)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			logEvt := s.log.Debug().
+				Err(err).
+				Type("kind", req).
+				Str("peer", peerAddr)
+			logEvt.Msg("failed to answer overlay query")
+		}
+		return nil, err
+	}
+	answerLog := s.log.Trace().
+		Type("kind", req).
+		Type("response", resp).
+		Dur("elapsed", time.Since(startedAt)).
+		Str("peer", peerAddr)
+	answerLog.Msg("answering overlay query")
+	return resp, nil
+}
+
+func (s *overlaySubscription) sendForgetPeer(ctx context.Context, peer *overlayPeer) {
+	_ = peer.broadcastPeer.SendCustomMessage(ctx, ForgetPeer{})
 	s.removePeerIfCurrent(peer)
 }
 
-func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overlayPeer, req any) (tl.Serializable, error) {
+func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, req any) (tl.Serializable, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
 
-	if s.spec.Kind == overlayKindCustomFixed {
-		switch req.(type) {
-		case overlay.GetRandomPeers:
+	switch req.(type) {
+	case overlay.Ping:
+		return overlay.Pong{}, nil
+	}
+
+	if s.spec.privatePeerRoster() {
+		if _, ok := req.(overlay.GetRandomPeers); ok {
 			return nil, errors.New("overlay is private")
-		default:
-			return nil, errors.New("overlay query is not supported in private overlay")
 		}
+	}
+	if s.spec.enforcesAcceptQueries() && !s.spec.AcceptQueries {
+		return nil, errors.New("this node does not accept queries")
 	}
 
 	switch query := req.(type) {
 	case overlay.GetRandomPeers:
 		return s.handleGetRandomPeers(ctx, query), nil
+	case overlay.GetRandomPeersV2:
+		if s.fastSync == nil {
+			return nil, errors.New("overlay.getRandomPeersV2 requires a FastSync overlay")
+		}
+		return s.handleFastSyncRandomPeers(query)
 	case GetCapabilities:
 		return Capabilities{
 			VersionMajor: s.spec.ProtoVersionMajor,
@@ -223,6 +332,8 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 		return s.serveNextBlockDescription(ctx, query.PrevBlock)
 	case DownloadNextBlockFull:
 		return s.serveNextBlockFull(ctx, query.PrevBlock)
+	case DownloadNextBlocksFull:
+		return s.serveNextBlocksFull(ctx, query.PrevBlock, query.MaxBlocks)
 	case tonnodeapi.DownloadBlock:
 		return s.serveBlockData(ctx, query.Block)
 	case PrepareBlock:
@@ -236,7 +347,7 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case DownloadKeyBlockProof:
 		return s.serveProofData(ctx, tnstore.ServedProofKeyBlock, query.Block)
 	case DownloadBlockProofLink:
-		return s.serveBlockProofLink(ctx, query.Block)
+		return s.serveProofData(ctx, tnstore.ServedProofBlockLink, query.Block)
 	case DownloadKeyBlockProofLink:
 		return s.serveKeyBlockProofLink(ctx, query.Block)
 	case PrepareZeroState:
@@ -246,7 +357,7 @@ func (s *overlaySubscription) dispatchPeerQuery(ctx context.Context, peer *overl
 	case GetNextKeyBlockIDs:
 		return s.serveNextKeyBlockIDs(ctx, query.Block, query.MaxSize)
 	case SendExtMessage:
-		return s.serveSendExtMessage(ctx, query.Message)
+		return nil, errors.New("query not from full-node master")
 	case GetOutMsgQueueProof:
 		return nil, errors.New("not supported yet")
 	case PreparePersistentState:
@@ -284,18 +395,19 @@ func (s *overlaySubscription) serveBlockFull(ctx context.Context, block ton.Bloc
 }
 
 func (s *overlaySubscription) serveNextBlockDescription(ctx context.Context, prev ton.BlockIDExt) (tl.Serializable, error) {
-	if !s.isMasterchainOverlay() && !isMasterchainBlock(prev) {
+	if !isMasterchainBlock(prev) {
 		return nil, errors.New("next block allowed only for masterchain")
 	}
 
-	full, err := s.node.localNextServedBlockFull(ctx, prev)
+	meta, err := s.localNextBlockMeta(ctx, prev)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return BlockDescriptionEmpty{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return BlockDescription{ID: full.ID}, nil
+
+	return BlockDescription{ID: meta.ID}, nil
 }
 
 func (s *overlaySubscription) serveNextBlockFull(ctx context.Context, prev ton.BlockIDExt) (tl.Serializable, error) {
@@ -327,16 +439,18 @@ func (s *overlaySubscription) serveBlockData(ctx context.Context, block ton.Bloc
 }
 
 func (s *overlaySubscription) servePrepareBlock(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
-	_, err := s.node.localBlockData(ctx, block)
-	if err == nil {
-		return Prepared{}, nil
-	}
-
-	if !errors.Is(err, tnstore.ErrNotFound) {
+	meta, err := s.localBlockMeta(ctx, block, tnstore.BlockMetaHasBlockData)
+	if err != nil {
+		if errors.Is(err, tnstore.ErrNotFound) {
+			return NotFound{}, nil
+		}
 		return nil, err
 	}
+	if !meta.Has(tnstore.BlockMetaHasBlockData) {
+		return NotFound{}, nil
+	}
 
-	return NotFound{}, nil
+	return Prepared{}, nil
 }
 
 func (s *overlaySubscription) servePrepareBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (tl.Serializable, error) {
@@ -344,39 +458,29 @@ func (s *overlaySubscription) servePrepareBlockProof(ctx context.Context, block 
 		return nil, errors.New("cannot download proof for zero state")
 	}
 
-	hasFull, err := s.hasStoredProof(ctx, tnstore.ServedProofBlock, block)
+	meta, err := s.localBlockMeta(ctx, block, tnstore.BlockMetaHasProofBlock)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return PreparedProofEmpty{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	if isMasterchainBlock(block) {
-		if hasFull {
+
+	if meta.Has(tnstore.BlockMetaHasProofBlock) {
+		if isMasterchainBlock(block) {
 			return PreparedProof{}, nil
 		}
-		if allowPartial {
-			hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofBlockLink, block)
-			if err != nil {
-				return nil, err
-			}
-			if hasLink {
-				return PreparedProofLink{}, nil
-			}
-		}
-		return PreparedProofEmpty{}, nil
+		return PreparedProofLink{}, nil
 	}
 
 	if !allowPartial {
 		return PreparedProofEmpty{}, nil
 	}
-
-	hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofBlockLink, block)
-	if err != nil {
-		return nil, err
-	}
-	if hasLink {
-		return PreparedProofLink{}, nil
+	if !meta.Has(tnstore.BlockMetaHasProofBlockLink) {
+		return PreparedProofEmpty{}, nil
 	}
 
-	return PreparedProofEmpty{}, nil
+	return PreparedProofLink{}, nil
 }
 
 func (s *overlaySubscription) servePrepareKeyBlockProof(ctx context.Context, block ton.BlockIDExt, allowPartial bool) (tl.Serializable, error) {
@@ -384,26 +488,23 @@ func (s *overlaySubscription) servePrepareKeyBlockProof(ctx context.Context, blo
 		return nil, errors.New("cannot download proof for zero state")
 	}
 
-	hasFull, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlock, block)
+	meta, err := s.localBlockMeta(ctx, block, tnstore.BlockMetaHasProofKeyBlock)
+	if errors.Is(err, tnstore.ErrNotFound) {
+		return PreparedProofEmpty{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	if !hasFull {
-		if allowPartial {
-			hasLink, err := s.hasStoredProof(ctx, tnstore.ServedProofKeyBlockLink, block)
-			if err != nil {
-				return nil, err
-			}
-			if hasLink {
-				return PreparedProofLink{}, nil
-			}
-		}
-		return PreparedProofEmpty{}, nil
-	}
-	if allowPartial {
+
+	if allowPartial && (meta.Has(tnstore.BlockMetaHasProofKeyBlock) ||
+		meta.Has(tnstore.BlockMetaHasProofKeyBlockLink)) {
 		return PreparedProofLink{}, nil
 	}
-	return PreparedProof{}, nil
+	if meta.Has(tnstore.BlockMetaHasProofKeyBlock) {
+		return PreparedProof{}, nil
+	}
+
+	return PreparedProofEmpty{}, nil
 }
 
 func (s *overlaySubscription) serveKeyBlockProofLink(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
@@ -434,34 +535,6 @@ func (s *overlaySubscription) serveKeyBlockProofLink(ctx context.Context, block 
 	return tl.Raw(link), nil
 }
 
-func (s *overlaySubscription) serveBlockProofLink(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
-	if isMasterchainBlock(block) {
-		link, err := s.node.localBlockProof(ctx, tnstore.ServedProofBlockLink, block)
-		if err == nil {
-			return tl.Raw(link), nil
-		}
-		if !errors.Is(err, tnstore.ErrNotFound) {
-			return nil, err
-		}
-
-		proof, err := s.node.localBlockProof(ctx, tnstore.ServedProofBlock, block)
-		if errors.Is(err, tnstore.ErrNotFound) {
-			return nil, errors.New("unknown block proof")
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		link, err = blockproof.LinkBOC(block, proof)
-		if err != nil {
-			return nil, err
-		}
-		return tl.Raw(link), nil
-	}
-
-	return s.serveProofData(ctx, tnstore.ServedProofBlockLink, block)
-}
-
 func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (tl.Serializable, error) {
 	if block.SeqNo == 0 && isKeyBlockProofKind(kind) {
 		return nil, errors.New("cannot download proof for zero state")
@@ -478,16 +551,14 @@ func (s *overlaySubscription) serveProofData(ctx context.Context, kind tnstore.S
 }
 
 func (s *overlaySubscription) servePrepareZeroState(ctx context.Context, block ton.BlockIDExt) (tl.Serializable, error) {
-	data, err := s.node.peerStorage.ZeroState(ctx, block)
+	_, err := s.node.peerStorage.ZeroStateSize(ctx, block)
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return NotFoundState{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(data) == 0 {
-		return NotFoundState{}, nil
-	}
+
 	return PreparedState{}, nil
 }
 
@@ -506,12 +577,9 @@ func (s *overlaySubscription) serveZeroStateData(ctx context.Context, block ton.
 }
 
 func (s *overlaySubscription) servePreparePersistentState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt) (tl.Serializable, error) {
-	size, err := s.node.peerStorage.PersistentStateSize(ctx, block, master, 0)
-	if err == nil && size > 0 {
-		return PreparedState{}, nil
-	}
+	_, err := s.node.peerStorage.PersistentStateSize(ctx, block, master, 0)
 	if err == nil {
-		return NotFoundState{}, nil
+		return PreparedState{}, nil
 	}
 	if errors.Is(err, tnstore.ErrNotFound) {
 		return NotFoundState{}, nil
@@ -532,7 +600,7 @@ func (s *overlaySubscription) servePersistentStateSize(ctx context.Context, stat
 }
 
 func (s *overlaySubscription) servePersistentStateSlice(ctx context.Context, state PersistentStateIDV2, offset int64, maxSize int64) (tl.Serializable, error) {
-	if maxSize < 0 || maxSize > 1<<24 {
+	if maxSize < 0 || maxSize > maxPeerSliceRequestSize {
 		return nil, fmt.Errorf("invalid max_size %d", maxSize)
 	}
 	effectiveShard := persistentStateEffectiveShardForQuery(state.Block, state.EffectiveShard)
@@ -625,7 +693,7 @@ func (s *overlaySubscription) seenMasterchainSeqnoForKeyBlockScan(ctx context.Co
 	}
 
 	current, err := s.node.storage.CurrentState(ctx)
-	if err == nil && validBlockID(current.Masterchain.Block) {
+	if err == nil && tnstore.BlockIDHashesKnown(current.Masterchain.Block) {
 		return current.Masterchain.Block.SeqNo, nil
 	}
 	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
@@ -646,7 +714,7 @@ func (s *overlaySubscription) serveArchiveInfo(ctx context.Context, masterchainS
 }
 
 func (s *overlaySubscription) serveArchiveSlice(ctx context.Context, archiveID, offset int64, maxSize int32) (tl.Serializable, error) {
-	if maxSize < 0 || maxSize > 1<<24 {
+	if maxSize < 0 || maxSize > maxPeerSliceRequestSize {
 		return nil, fmt.Errorf("invalid archive slice max_size %d", maxSize)
 	}
 	data, err := s.node.peerStorage.ArchiveSlice(ctx, archiveID, offset, maxSize)
@@ -656,15 +724,20 @@ func (s *overlaySubscription) serveArchiveSlice(ctx context.Context, archiveID, 
 	if err != nil {
 		return nil, err
 	}
-	if maxSize > 0 && len(data) > int(maxSize) {
-		data = data[:maxSize]
-	}
 	return tl.Raw(data), nil
 }
 
 func (s *overlaySubscription) handleGetRandomPeers(_ context.Context, query overlay.GetRandomPeers) overlay.NodesList {
-	if len(query.List.List) > 0 {
-		go s.learnAdvertisedPeers(query.List.List)
+	if len(query.List.List) > 0 && s.advertisedPeerLearning.CompareAndSwap(false, true) {
+		peers := copyAdvertisedPeerCandidates(s.spec.ShortID, query.List.List)
+		if len(peers) == 0 {
+			s.advertisedPeerLearning.Store(false)
+		} else {
+			s.node.runAsync(func() {
+				defer s.advertisedPeerLearning.Store(false)
+				s.learnAdvertisedPeers(s.node.runCtx, peers)
+			})
+		}
 	}
 
 	reply, err := s.randomPeerAdvertisement()
@@ -675,14 +748,53 @@ func (s *overlaySubscription) handleGetRandomPeers(_ context.Context, query over
 	return reply
 }
 
-func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
-	for _, peer := range peers {
-		if !s.canLearnAdvertisedPeer(peer) {
+func copyAdvertisedPeerCandidates(overlayID []byte, nodes []overlay.Node) []advertisedPeerCandidate {
+	count := min(len(nodes), maxPeersPerOverlay)
+	peers := make([]advertisedPeerCandidate, 0, count)
+	for i := 0; i < count; i++ {
+		node := nodes[i]
+		publicKey, ok := node.ID.(keys.PublicKeyED25519)
+		if !ok ||
+			len(publicKey.Key) != ed25519.PublicKeySize ||
+			len(node.Overlay) != PeerIDSize ||
+			!bytes.Equal(node.Overlay, overlayID) ||
+			len(node.Signature) != ed25519.SignatureSize {
 			continue
 		}
 
-		connectCtx, cancel := context.WithTimeout(s.node.runCtx, 10*time.Second)
-		_, err := s.connectOverlayNodeV1(connectCtx, peer)
+		var peer advertisedPeerCandidate
+		copy(peer.publicKey[:], publicKey.Key)
+		copy(peer.overlayID[:], node.Overlay)
+		copy(peer.signature[:], node.Signature)
+		peer.version = node.Version
+		peers = append(peers, peer)
+	}
+	return peers
+}
+
+func (s *overlaySubscription) learnAdvertisedPeers(ctx context.Context, peers []advertisedPeerCandidate) {
+	for _, peer := range peers {
+		if ctx.Err() != nil {
+			return
+		}
+		// Bounded by what we know, not by what we hold transports for: the live
+		// tier is capped far below maxPeersPerOverlay, so counting it here would
+		// disable the gate entirely.
+		if s.knownPeerCount() >= maxPeersPerOverlay && !s.hasPeerPublicKey(peer.publicKey) {
+			continue
+		}
+
+		node := overlay.Node{
+			ID:        keys.PublicKeyED25519{Key: peer.publicKey[:]},
+			Overlay:   peer.overlayID[:],
+			Version:   peer.version,
+			Signature: peer.signature[:],
+		}
+
+		// connectOverlayNodeV1 owns the signature check; admission above uses
+		// only the structurally checked public key.
+		connectCtx, cancel := context.WithTimeout(ctx, peerQueryTimeout)
+		_, err := s.connectOverlayNodeV1(connectCtx, node)
 		cancel()
 		if err != nil {
 			s.log.Debug().Err(err).Msg("failed to connect peer learned from overlay query")
@@ -690,19 +802,83 @@ func (s *overlaySubscription) learnAdvertisedPeers(peers []overlay.Node) {
 	}
 }
 
-func (s *overlaySubscription) hasStoredProof(ctx context.Context, kind tnstore.ServedProofKind, block ton.BlockIDExt) (bool, error) {
-	_, err := s.node.localBlockProof(ctx, kind, block)
-	if err == nil {
-		return true, nil
+func (s *overlaySubscription) hasPeerPublicKey(key [ed25519.PublicKeySize]byte) bool {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	for _, peer := range s.peers {
+		if bytes.Equal(peer.pub, key[:]) {
+			return true
+		}
 	}
-	if errors.Is(err, tnstore.ErrNotFound) {
-		return false, nil
-	}
-	return false, err
+	return false
 }
 
-func (s *overlaySubscription) isMasterchainOverlay() bool {
-	return s.spec.Name == "masterchain"
+func (s *overlaySubscription) localBlockMeta(
+	ctx context.Context,
+	block ton.BlockIDExt,
+	required tnstore.BlockMetaFlags,
+) (*tnstore.BlockMeta, error) {
+	live, liveErr := s.node.liveBlockCache.BlockMeta(ctx, block)
+	if liveErr == nil && live.Flags&required == required {
+		return live, nil
+	}
+	if liveErr != nil && !errors.Is(liveErr, tnstore.ErrNotFound) {
+		return nil, liveErr
+	}
+
+	stored, err := s.node.peerStorage.BlockMeta(ctx, block)
+	if err == nil {
+		return tnstore.MergeBlockMeta(stored, live), nil
+	}
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+	if liveErr == nil {
+		return live, nil
+	}
+
+	return nil, tnstore.ErrNotFound
+}
+
+func (s *overlaySubscription) localNextBlockMeta(
+	ctx context.Context,
+	prev ton.BlockIDExt,
+) (*tnstore.BlockMeta, error) {
+	livePrev, err := s.node.liveBlockCache.BlockMeta(ctx, prev)
+	if err == nil && len(livePrev.NextRefs) > 0 {
+		liveNext, nextErr := s.node.liveBlockCache.BlockMeta(ctx, livePrev.NextRefs[0])
+		if nextErr == nil &&
+			liveNext.Has(tnstore.BlockMetaHasBlockData) &&
+			liveNext.Has(tnstore.BlockMetaHasProofBlock) {
+			return liveNext, nil
+		}
+		if nextErr != nil && !errors.Is(nextErr, tnstore.ErrNotFound) {
+			return nil, nextErr
+		}
+	}
+	if err != nil && !errors.Is(err, tnstore.ErrNotFound) {
+		return nil, err
+	}
+
+	storedPrev, err := s.node.peerStorage.BlockMeta(ctx, prev)
+	if err != nil {
+		return nil, err
+	}
+	if len(storedPrev.NextRefs) == 0 {
+		return nil, tnstore.ErrNotFound
+	}
+
+	storedNext, err := s.node.peerStorage.BlockMeta(ctx, storedPrev.NextRefs[0])
+	if err != nil {
+		return nil, err
+	}
+	if !storedNext.Has(tnstore.BlockMetaHasBlockData) ||
+		!storedNext.Has(tnstore.BlockMetaHasProofBlock) {
+		return nil, tnstore.ErrNotFound
+	}
+
+	return storedNext, nil
 }
 
 func isMasterchainBlock(block ton.BlockIDExt) bool {

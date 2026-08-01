@@ -111,7 +111,7 @@ func (n *Node) DownloadState(ctx context.Context, block ton.BlockIDExt, master t
 		return n.downloadZeroStateSnapshot(ctx, block)
 	}
 	if len(stateRootHash) != 32 {
-		return nil, fmt.Errorf("state root hash is required for %s", formatBlockRef(block))
+		return nil, fmt.Errorf("state root hash is required for %s", storage.FormatBlockRef(block))
 	}
 	return n.downloadPersistentStateSnapshot(ctx, block, master, splitDepth, stateRootHash)
 }
@@ -125,7 +125,7 @@ func (n *Node) downloadZeroStateSnapshot(ctx context.Context, block ton.BlockIDE
 	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(block)).
+			Str("block", storage.FormatBlockRef(block)).
 			Msg("failed to load cached zero state")
 	}
 
@@ -135,7 +135,7 @@ func (n *Node) downloadZeroStateSnapshot(ctx context.Context, block ton.BlockIDE
 }
 
 func (n *Node) downloadPersistentStateSnapshot(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32, stateRootHash []byte) (storage.DownloadedState, error) {
-	sub, err := n.subscriptionForBlock(block)
+	sub, err := n.querySubscriptionForHistoricalBlock(block)
 	if err != nil {
 		return nil, err
 	}
@@ -184,8 +184,8 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 	}
 
 	n.log.Info().
-		Str("block", formatBlockRef(d.block)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("block", storage.FormatBlockRef(d.block)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Uint32("split_depth", splitDepth).
 		Int("peers", len(peers)).
 		Msg("trying peers for persistent state snapshot")
@@ -245,8 +245,8 @@ func (d persistentStateSnapshotDownloader) preparePersistentState(ctx context.Co
 			n.log.Debug().
 				Err(err).
 				Str("peer", peer.addr).
-				Str("block", formatBlockRef(d.block)).
-				Str("masterchain", formatBlockRef(d.master)).
+				Str("block", storage.FormatBlockRef(d.block)).
+				Str("masterchain", storage.FormatBlockRef(d.master)).
 				Dur("elapsed", time.Since(startedAt)).
 				Msg("failed to prepare persistent state snapshot")
 		}
@@ -262,8 +262,8 @@ func (d persistentStateSnapshotDownloader) preparePersistentState(ctx context.Co
 	}
 	n.log.Debug().
 		Str("peer", peer.addr).
-		Str("block", formatBlockRef(d.block)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("block", storage.FormatBlockRef(d.block)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Dur("elapsed", time.Since(startedAt)).
 		Msg("persistent state snapshot is prepared")
 	return nil
@@ -275,6 +275,7 @@ type persistentStateCandidate struct {
 	size       int64
 	workers    int
 	chunkCount int64
+	query      *peerQueryOperation
 }
 
 type persistentStateChunkSeed struct {
@@ -298,16 +299,23 @@ type persistentStateSnapshotDownloader struct {
 	peers         []*overlayPeer
 }
 
-func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx context.Context, peer *overlayPeer, effectiveShard int64) (*persistentStateCandidate, error) {
+func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx context.Context, peer *overlayPeer, effectiveShard int64) (candidate *persistentStateCandidate, err error) {
 	if !peer.hasOpenConnection() {
 		return nil, adnl.ErrPeerConnClosed
 	}
 
+	query := d.sub.beginPeerQueryOperation(peer)
+	defer func() {
+		if err != nil {
+			query.finish(err)
+		}
+	}()
+
 	if effectiveShard == 0 {
 		d.node.log.Debug().
 			Str("peer", peer.addr).
-			Str("block", formatBlockRef(d.block)).
-			Str("masterchain", formatBlockRef(d.master)).
+			Str("block", storage.FormatBlockRef(d.block)).
+			Str("masterchain", storage.FormatBlockRef(d.master)).
 			Msg("preparing persistent state snapshot")
 		if err := d.preparePersistentState(ctx, peer); err != nil {
 			return nil, err
@@ -328,7 +336,7 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 				Err(err).
 				Str("peer", peer.addr).
 				Str("block", formatPersistentStateBlockRef(d.block, id.EffectiveShard)).
-				Str("masterchain", formatBlockRef(d.master)).
+				Str("masterchain", storage.FormatBlockRef(d.master)).
 				Int64("effective_shard", id.EffectiveShard).
 				Dur("elapsed", time.Since(startedAt)).
 				Msg("failed to load persistent state snapshot size")
@@ -344,7 +352,7 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 		d.node.log.Debug().
 			Str("peer", peer.addr).
 			Str("block", formatPersistentStateBlockRef(d.block, id.EffectiveShard)).
-			Str("masterchain", formatBlockRef(d.master)).
+			Str("masterchain", storage.FormatBlockRef(d.master)).
 			Int64("effective_shard", id.EffectiveShard).
 			Msg("persistent state snapshot size is not found")
 		return nil, ErrStateNotAvailable
@@ -364,7 +372,7 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 	d.node.log.Debug().
 		Str("peer", peer.addr).
 		Str("block", formatPersistentStateBlockRef(d.block, id.EffectiveShard)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Int64("effective_shard", id.EffectiveShard).
 		Str("size", formatByteSize(size)).
 		Int("workers", workers).
@@ -376,7 +384,14 @@ func (d persistentStateSnapshotDownloader) preparePersistentStateCandidate(ctx c
 		size:       size,
 		workers:    workers,
 		chunkCount: chunkCount,
+		query:      query,
 	}, nil
+}
+
+func (c persistentStateCandidate) finishQuery(err error) {
+	if c.query != nil {
+		c.query.finish(err)
+	}
 }
 
 func persistentStateCandidateProbeChunks(candidates []persistentStateCandidate) int {
@@ -401,11 +416,18 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 	if len(candidates) == 0 {
 		return nil, errors.New("no persistent state candidates")
 	}
+	defer func() {
+		for _, candidate := range candidates {
+			candidate.finishQuery(context.Canceled)
+		}
+	}()
+
 	if len(candidates) == 1 {
 		started := time.Now()
 		releasePeer := d.node.acquireDownloadPeer(candidates[0].peer)
 		staged, err := d.stagePersistentStateFile(ctx, candidates[0], nil, chunkLimiter)
 		releasePeer()
+		candidates[0].finishQuery(err)
 		if err != nil {
 			if errors.Is(err, errPersistentStateDownloadDiskBudget) {
 				return nil, err
@@ -421,7 +443,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 
 	d.node.log.Info().
 		Str("block", formatPersistentStateBlockRef(d.block, candidates[0].id.EffectiveShard)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Int64("effective_shard", candidates[0].id.EffectiveShard).
 		Int("peers", len(candidates)).
 		Int("probe_chunks", probeChunks).
@@ -470,6 +492,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedFromCandidates(ctx cont
 		started := time.Now()
 		staged, err := d.stagePersistentStateFile(ctx, probe.candidate, &probe.seed, chunkLimiter)
 		releasePeer()
+		probe.candidate.finishQuery(err)
 		if err != nil {
 			if errors.Is(err, errPersistentStateDownloadDiskBudget) {
 				attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", probe.candidate.peer.addr, err))
@@ -519,7 +542,7 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 				Err(err).
 				Str("peer", peer.addr).
 				Str("block", formatPersistentStateBlockRef(d.block, effectiveShard)).
-				Str("masterchain", formatBlockRef(d.master)).
+				Str("masterchain", storage.FormatBlockRef(d.master)).
 				Int64("effective_shard", effectiveShard).
 				Msg("peer does not have persistent state snapshot")
 			return
@@ -534,11 +557,17 @@ func (d persistentStateSnapshotDownloader) downloadStagedValidated(ctx context.C
 			Err(err).
 			Str("peer", peer.addr).
 			Str("block", formatPersistentStateBlockRef(d.block, effectiveShard)).
-			Str("masterchain", formatBlockRef(d.master)).
+			Str("masterchain", storage.FormatBlockRef(d.master)).
 			Msg("persistent state snapshot peer failed, trying next peer")
 	}
 
 	var candidates []persistentStateCandidate
+	defer func() {
+		for _, candidate := range candidates {
+			candidate.finishQuery(context.Canceled)
+		}
+	}()
+
 	var diskBudgetErrs []error
 	flushCandidates := func() (*stagedStateFile, bool) {
 		if len(candidates) == 0 {
@@ -619,7 +648,7 @@ func (d persistentStateSnapshotDownloader) probePersistentStateCandidates(ctx co
 		onCollectElapsed: func(ready int, pending int) {
 			d.node.log.Info().
 				Str("block", formatPersistentStateBlockRef(d.block, candidates[0].id.EffectiveShard)).
-				Str("masterchain", formatBlockRef(d.master)).
+				Str("masterchain", storage.FormatBlockRef(d.master)).
 				Int("ready_peers", ready).
 				Int("pending_peers", pending).
 				Dur("grace", persistentStatePeerProbeGrace).
@@ -679,8 +708,8 @@ func (d persistentStateSnapshotDownloader) downloadSplit(ctx context.Context, sp
 	}
 
 	n.log.Info().
-		Str("block", formatBlockRef(d.block)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("block", storage.FormatBlockRef(d.block)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Int("parts", len(parts)).
 		Msg("split persistent state parts staged for import")
 
@@ -712,8 +741,8 @@ func (d persistentStateSnapshotDownloader) downloadSplitHeader(ctx context.Conte
 	}
 
 	n.log.Info().
-		Str("block", formatBlockRef(d.block)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("block", storage.FormatBlockRef(d.block)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Uint32("split_depth", splitDepth).
 		Int64("effective_shard", d.block.Shard).
 		Msg("downloading split persistent state header")
@@ -761,7 +790,7 @@ func (d persistentStateSnapshotDownloader) tryLoadReusableSplitHeader(ctx contex
 
 	n.log.Info().
 		Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Str("size", formatByteSize(staged.size)).
 		Str("path", staged.path).
 		Msg("using reusable staged split persistent state header")
@@ -786,7 +815,7 @@ func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uin
 			Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
 			Int64("size", staged.size).
 			Str("state_file_hash", hex.EncodeToString(staged.fileHash)).
-			Str("prefix", firstBytesHex(staged.prefix, 16)).
+			Str("prefix", firstBytesHex(staged.prefix)).
 			Msg("failed to parse split persistent state header")
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
@@ -794,7 +823,7 @@ func (d persistentStateSnapshotDownloader) parseStagedSplitHeader(splitDepth uin
 	n.log.Info().
 		Str("peer", staged.peerAddr).
 		Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Uint32("split_depth", splitDepth).
 		Int("parts", len(parts)).
 		Int64("header_size", staged.size).
@@ -841,8 +870,8 @@ func (d persistentStateSnapshotDownloader) downloadSplitParts(ctx context.Contex
 		}
 
 		n.log.Info().
-			Str("block", formatBlockRef(d.block)).
-			Str("masterchain", formatBlockRef(d.master)).
+			Str("block", storage.FormatBlockRef(d.block)).
+			Str("masterchain", storage.FormatBlockRef(d.master)).
 			Int("missing_parts", missing).
 			Int("parts", len(parts)).
 			Int("download_streams", 1).
@@ -867,8 +896,8 @@ func (d persistentStateSnapshotDownloader) downloadSplitParts(ctx context.Contex
 			event = n.log.Warn()
 		}
 		event = event.
-			Str("block", formatBlockRef(d.block)).
-			Str("masterchain", formatBlockRef(d.master)).
+			Str("block", storage.FormatBlockRef(d.block)).
+			Str("masterchain", storage.FormatBlockRef(d.master)).
 			Int("downloaded_parts", len(parts)-missingSplitStateParts(downloaded)).
 			Int("missing_parts", missingSplitStateParts(downloaded)).
 			Int("parts", len(parts)).
@@ -990,7 +1019,7 @@ func (d persistentStateSnapshotDownloader) stageSplitPart(ctx context.Context, i
 
 	n.log.Info().
 		Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-		Str("masterchain", formatBlockRef(d.master)).
+		Str("masterchain", storage.FormatBlockRef(d.master)).
 		Int("part", idx+1).
 		Int("parts", partsCount).
 		Int64("effective_shard", int64(part.effectiveShard)).
@@ -1023,7 +1052,7 @@ func (d persistentStateSnapshotDownloader) stageSplitPart(ctx context.Context, i
 
 func (d persistentStateSnapshotDownloader) importSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart, downloaded *downloadedSplitStatePart) error {
 	n := d.node
-	if n.storage == nil || downloaded == nil || downloaded.staged == nil || downloaded.staged.lazyRoot != nil {
+	if n.storage == nil || downloaded.staged.lazyRoot != nil {
 		return nil
 	}
 	staged := downloaded.staged
@@ -1080,17 +1109,17 @@ func (d persistentStateSnapshotDownloader) loadReusableSplitPart(ctx context.Con
 	useStaged := func(staged *stagedStateFile) (*downloadedSplitStatePart, error) {
 		n.log.Info().
 			Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-			Str("masterchain", formatBlockRef(d.master)).
+			Str("masterchain", storage.FormatBlockRef(d.master)).
 			Int("part", idx+1).
 			Int("parts", partsCount).
 			Str("size", formatByteSize(staged.size)).
 			Str("path", staged.path).
 			Msg("using reusable staged split persistent state part")
-		if lazyRoot, err := n.loadImportedSplitStatePartRoot(ctx, d.block, part); err == nil {
+		if lazyRoot, err := n.loadImportedSplitStatePartRoot(ctx, part); err == nil {
 			staged.lazyRoot = lazyRoot
 			n.log.Info().
 				Str("block", formatPersistentStateBlockRef(d.block, int64(part.effectiveShard))).
-				Str("masterchain", formatBlockRef(d.master)).
+				Str("masterchain", storage.FormatBlockRef(d.master)).
 				Int("part", idx+1).
 				Int("parts", partsCount).
 				Str("path", staged.path).
@@ -1123,7 +1152,13 @@ type stateChunkResult struct {
 	err       error
 }
 
-func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.Context, candidate persistentStateCandidate, probeChunks int, chunkLimiter chan struct{}) (persistentStatePeerProbe, error) {
+func (d persistentStateSnapshotDownloader) probePersistentStatePeer(ctx context.Context, candidate persistentStateCandidate, probeChunks int, chunkLimiter chan struct{}) (probe persistentStatePeerProbe, err error) {
+	defer func() {
+		if err != nil {
+			candidate.finishQuery(err)
+		}
+	}()
+
 	if int64(probeChunks) > candidate.chunkCount {
 		probeChunks = int(candidate.chunkCount)
 	}
@@ -1255,9 +1290,9 @@ func formatByteSize(size int64) string {
 	return fmt.Sprintf("%.2f %s", value, units[i])
 }
 
-func firstBytesHex(data []byte, limit int) string {
-	if len(data) > limit {
-		data = data[:limit]
+func firstBytesHex(data []byte) string {
+	if len(data) > 16 {
+		data = data[:16]
 	}
 	return hex.EncodeToString(data)
 }

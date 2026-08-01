@@ -339,19 +339,12 @@ func ParseValidatorSignatureSetCell(signatures *cell.Cell) (*ValidatorSignatureS
 	return &sigSet, nil
 }
 
-func validateMasterchainSignatureInputs(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) error {
+func PrepareMasterchainSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) (*ValidatorSignatureSet, error) {
 	if blockID.Workchain != -1 {
-		return fmt.Errorf("validator signatures are only supported for masterchain blocks, got %s", tnstore.FormatBlockRef(blockID))
+		return nil, fmt.Errorf("validator signatures are only supported for masterchain blocks, got %s", tnstore.FormatBlockRef(blockID))
 	}
 	if signatures == nil {
-		return fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(blockID))
-	}
-	return nil
-}
-
-func PrepareMasterchainSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) (*ValidatorSignatureSet, error) {
-	if err := validateMasterchainSignatureInputs(blockID, block, signatures); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(blockID))
 	}
 
 	sigSet, err := ParseValidatorSignatureSetCell(signatures)

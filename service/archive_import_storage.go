@@ -12,8 +12,12 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.Downloaded, splitDepth uint32) (*archiveImportResult, error) {
-	imported, err := loadDownloadedArchive(ctx, downloaded)
+func (s *Service) importArchiveBlocks(ctx context.Context, importer *archive.Importer, downloaded *archive.Downloaded, splitDepth uint32) (*archiveImportResult, error) {
+	if len(downloaded.Data) == 0 {
+		return nil, fmt.Errorf("import archive: empty downloaded archive data")
+	}
+
+	imported, err := importer.ImportBytes(ctx, downloaded, downloaded.Data)
 	if err != nil {
 		return nil, err
 	}
@@ -25,23 +29,8 @@ func (s *Service) importArchiveBlocks(ctx context.Context, downloaded *archive.D
 	return result, nil
 }
 
-func loadDownloadedArchive(ctx context.Context, downloaded *archive.Downloaded) (*archive.Imported, error) {
-	if downloaded == nil {
-		return nil, archive.ErrNotAvailable
-	}
-	if len(downloaded.Data) == 0 {
-		return nil, fmt.Errorf("import archive: empty downloaded archive data")
-	}
-
-	imported, err := archive.ImportBytes(ctx, downloaded, downloaded.Data)
-	if err != nil {
-		return nil, err
-	}
-	return imported, nil
-}
-
 func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, imported *archive.Imported, result *archiveImportResult) {
-	if s.blockReceivedHooks == nil || imported == nil || result == nil {
+	if s.blockReceivedHooks == nil {
 		return
 	}
 
@@ -61,9 +50,6 @@ func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, impo
 }
 
 func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, splitDepth uint32) (*archiveImportResult, error) {
-	if imported == nil {
-		return nil, fmt.Errorf("import archive: empty imported data")
-	}
 	if imported.Stats == nil {
 		return nil, fmt.Errorf("import archive: empty stats")
 	}
@@ -108,6 +94,10 @@ type archiveShardPrefixInputs struct {
 	splitDepth  uint32
 	startBlocks []ton.BlockIDExt
 	stateBlocks [][]ton.BlockIDExt
+	// stateTargets indexes stateBlocks by master seqno so the apply runner can
+	// reuse the planner's parse instead of re-reading every master state. The
+	// slices are shared between both consumers and must never be mutated.
+	stateTargets map[uint32][]ton.BlockIDExt
 }
 
 type archiveShardImportPlan struct {
@@ -116,12 +106,12 @@ type archiveShardImportPlan struct {
 	needed     []ton.BlockIDExt
 }
 
-func (s *Service) missingArchiveShardImportPlansForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock) ([]archiveShardImportPlan, uint32, error) {
+func (s *Service) missingArchiveShardImportPlansForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock) ([]archiveShardImportPlan, archiveShardPrefixInputs, error) {
 	inputs, err := s.archiveShardPrefixInputsForWindow(start, states)
 	if err != nil {
-		return nil, 0, err
+		return nil, archiveShardPrefixInputs{}, err
 	}
-	return archiveShardImportPlansMissingFromBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks, blocks), inputs.splitDepth, nil
+	return archiveShardImportPlansMissingFromBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks, blocks), inputs, nil
 }
 
 func (s *Service) archiveShardPrefixInputsForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState) (archiveShardPrefixInputs, error) {
@@ -145,6 +135,7 @@ func (s *Service) archiveShardPrefixInputsForWindow(start *storage.BlockState, s
 	sort.Ints(seqnos)
 
 	stateBlocks := make([][]ton.BlockIDExt, 0, len(seqnos))
+	stateTargets := make(map[uint32][]ton.BlockIDExt, len(seqnos))
 	for _, seqno := range seqnos {
 		state := states[uint32(seqno)]
 		blocks, err := state2.ShardBlocksFromMasterState(state)
@@ -152,12 +143,14 @@ func (s *Service) archiveShardPrefixInputsForWindow(start *storage.BlockState, s
 			return archiveShardPrefixInputs{}, fmt.Errorf("load shard blocks from %s: %w", storage.FormatBlockRef(state.Block), err)
 		}
 		stateBlocks = append(stateBlocks, blocks)
+		stateTargets[uint32(seqno)] = blocks
 	}
 
 	return archiveShardPrefixInputs{
-		splitDepth:  splitDepth,
-		startBlocks: startBlocks,
-		stateBlocks: stateBlocks,
+		splitDepth:   splitDepth,
+		startBlocks:  startBlocks,
+		stateBlocks:  stateBlocks,
+		stateTargets: stateTargets,
 	}, nil
 }
 

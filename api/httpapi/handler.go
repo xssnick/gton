@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -47,6 +48,12 @@ type apiError struct {
 	result  any
 }
 
+func (e *apiError) Error() string {
+	return e.message
+}
+
+var errRequestParamNotFound = errors.New("request parameter not found")
+
 type successEnvelope struct {
 	OK     bool   `json:"ok"`
 	Result any    `json:"result"`
@@ -70,7 +77,7 @@ type jsonRPCRequest struct {
 
 func (s *Server) buildRoutes() map[string]route {
 	routes := map[string]route{}
-	add := func(name string, allowGet bool, allowPost bool, handler methodHandler, postFields ...string) {
+	add := func(name string, allowGet bool, handler methodHandler, postFields ...string) {
 		fields := make(map[string]struct{}, len(postFields))
 		for _, field := range postFields {
 			fields[field] = struct{}{}
@@ -78,45 +85,45 @@ func (s *Server) buildRoutes() map[string]route {
 		routes[name] = route{
 			name:       name,
 			allowGet:   allowGet,
-			allowPost:  allowPost,
+			allowPost:  true,
 			handler:    handler,
 			postFields: fields,
 		}
 	}
-	add("detectAddress", true, true, s.handleDetectAddress, "address")
-	add("detectHash", true, true, s.handleDetectHash, "hash")
-	add("packAddress", true, true, s.handlePackAddress, "address")
-	add("unpackAddress", true, true, s.handleUnpackAddress, "address")
-	add("getAddressInformation", true, true, s.handleAddressInformation, "address", "seqno")
-	add("getExtendedAddressInformation", true, true, s.handleExtendedAddressInformation, "address", "seqno")
-	add("getShardAccountCell", true, true, s.handleShardAccountCell, "address", "seqno")
-	add("getWalletInformation", true, true, s.handleWalletInformation, "address", "seqno")
-	add("getAddressBalance", true, true, s.handleAddressBalance, "address", "seqno")
-	add("getAddressState", true, true, s.handleAddressState, "address", "seqno")
-	add("getTokenData", true, true, s.handleTokenData, "address", "seqno")
-	add("getMasterchainInfo", true, true, s.handleMasterchainInfo)
-	add("getMasterchainBlockSignatures", true, true, s.handleMasterchainBlockSignatures, "seqno")
-	add("getShardBlockProof", true, true, s.handleShardBlockProof, "workchain", "shard", "seqno", "from_seqno")
-	add("getConsensusBlock", true, true, s.handleConsensusBlock)
-	add("lookupBlock", true, true, s.handleLookupBlock, "workchain", "shard", "seqno", "lt", "unixtime")
-	add("getShards", true, true, s.handleShards, "seqno")
-	add("getBlockHeader", true, true, s.handleBlockHeader, "workchain", "shard", "seqno", "root_hash", "file_hash")
-	add("getOutMsgQueueSize", true, true, s.handleOutMsgQueueSize)
-	add("getBlockTransactions", true, true, s.handleBlockTransactions, "workchain", "shard", "seqno", "root_hash", "file_hash", "after_lt", "after_hash", "count")
-	add("getBlockTransactionsExt", true, true, s.handleBlockTransactionsExt, "workchain", "shard", "seqno", "root_hash", "file_hash", "after_lt", "after_hash", "count")
-	add("getTransactions", true, true, s.handleTransactions, "address", "lt", "hash", "to_lt", "archival", "limit")
-	add("getTransactionsStd", true, true, s.handleTransactionsStd, "address", "lt", "hash", "to_lt", "archival", "limit")
-	add("tryLocateTx", true, true, s.handleTryLocateTx, "source", "destination", "created_lt")
-	add("tryLocateResultTx", true, true, s.handleTryLocateResultTx, "source", "destination", "created_lt")
-	add("tryLocateSourceTx", true, true, s.handleTryLocateSourceTx, "source", "destination", "created_lt")
-	add("getConfigParam", true, true, s.handleConfigParam, "config_id", "param", "seqno")
-	add("getConfigAll", true, true, s.handleConfigAll, "seqno")
-	add("getLibraries", true, true, s.handleLibraries, "libraries")
-	add("runGetMethod", false, true, s.handleRunGetMethod, "address", "method", "stack", "seqno")
-	add("runGetMethodStd", false, true, s.handleRunGetMethodStd, "address", "method", "stack", "seqno")
-	add("sendBoc", false, true, s.handleSendBoc, "boc")
-	add("sendBocReturnHash", false, true, s.handleSendBocReturnHash, "boc")
-	add("estimateFee", false, true, s.handleEstimateFee, "address", "body", "init_code", "init_data", "ignore_chksig")
+	add("detectAddress", true, s.handleDetectAddress, "address")
+	add("detectHash", true, s.handleDetectHash, "hash")
+	add("packAddress", true, s.handlePackAddress, "address")
+	add("unpackAddress", true, s.handleUnpackAddress, "address")
+	add("getAddressInformation", true, s.handleAddressInformation, "address", "seqno")
+	add("getExtendedAddressInformation", true, s.handleExtendedAddressInformation, "address", "seqno")
+	add("getShardAccountCell", true, s.handleShardAccountCell, "address", "seqno")
+	add("getWalletInformation", true, s.handleWalletInformation, "address", "seqno")
+	add("getAddressBalance", true, s.handleAddressBalance, "address", "seqno")
+	add("getAddressState", true, s.handleAddressState, "address", "seqno")
+	add("getTokenData", true, s.handleTokenData, "address", "seqno")
+	add("getMasterchainInfo", true, s.handleMasterchainInfo)
+	add("getMasterchainBlockSignatures", true, s.handleMasterchainBlockSignatures, "seqno")
+	add("getShardBlockProof", true, s.handleShardBlockProof, "workchain", "shard", "seqno", "from_seqno")
+	add("getConsensusBlock", true, s.handleConsensusBlock)
+	add("lookupBlock", true, s.handleLookupBlock, "workchain", "shard", "seqno", "lt", "unixtime")
+	add("getShards", true, s.handleShards, "seqno")
+	add("getBlockHeader", true, s.handleBlockHeader, "workchain", "shard", "seqno", "root_hash", "file_hash")
+	add("getOutMsgQueueSize", true, s.handleOutMsgQueueSize)
+	add("getBlockTransactions", true, s.handleBlockTransactions, "workchain", "shard", "seqno", "root_hash", "file_hash", "after_lt", "after_hash", "count")
+	add("getBlockTransactionsExt", true, s.handleBlockTransactionsExt, "workchain", "shard", "seqno", "root_hash", "file_hash", "after_lt", "after_hash", "count")
+	add("getTransactions", true, s.handleTransactions, "address", "lt", "hash", "to_lt", "archival", "limit")
+	add("getTransactionsStd", true, s.handleTransactionsStd, "address", "lt", "hash", "to_lt", "archival", "limit")
+	add("tryLocateTx", true, s.handleTryLocateInboundMessageTransaction, "source", "destination", "created_lt")
+	add("tryLocateResultTx", true, s.handleTryLocateInboundMessageTransaction, "source", "destination", "created_lt")
+	add("tryLocateSourceTx", true, s.handleTryLocateSourceTx, "source", "destination", "created_lt")
+	add("getConfigParam", true, s.handleConfigParam, "config_id", "param", "seqno")
+	add("getConfigAll", true, s.handleConfigAll, "seqno")
+	add("getLibraries", true, s.handleLibraries, "libraries")
+	add("runGetMethod", false, s.handleRunGetMethod, "address", "method", "stack", "seqno")
+	add("runGetMethodStd", false, s.handleRunGetMethodStd, "address", "method", "stack", "seqno")
+	add("sendBoc", false, s.handleSendBoc, "boc")
+	add("sendBocReturnHash", false, s.handleSendBocReturnHash, "boc")
+	add("estimateFee", false, s.handleEstimateFee, "address", "body", "init_code", "init_data", "ignore_chksig")
 	return routes
 }
 
@@ -322,166 +329,184 @@ func (p requestParams) requiredFieldError(name string) *apiError {
 	return validationError(fmt.Sprintf("failed to parse request: missing required field %q", name))
 }
 
-func (p requestParams) stringValue(name string) (string, bool, error) {
+func (p requestParams) stringValue(name string) (string, error) {
 	if p.query != nil {
 		value, ok := p.query[name]
 		if !ok || len(value) == 0 {
-			return "", false, nil
+			return "", errRequestParamNotFound
 		}
-		return value[0], true, nil
+		return value[0], nil
 	}
 
 	raw, ok := p.body[name]
 	if !ok {
-		return "", false, nil
+		return "", errRequestParamNotFound
 	}
 
 	var value any
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
-		return "", false, err
+		return "", err
 	}
 
 	switch v := value.(type) {
 	case string:
-		return v, true, nil
+		return v, nil
 	case json.Number:
-		return v.String(), true, nil
+		return v.String(), nil
 	case bool:
 		if v {
-			return "true", true, nil
+			return "true", nil
 		}
-		return "false", true, nil
+		return "false", nil
 	default:
-		return "", false, fmt.Errorf("field %s must be a string", name)
+		return "", fmt.Errorf("field %s must be a string", name)
 	}
 }
 
 func (p requestParams) requiredString(name string) (string, *apiError) {
-	value, ok, err := p.stringValue(name)
+	value, err := p.stringValue(name)
 	if err != nil {
+		if errors.Is(err, errRequestParamNotFound) {
+			return "", p.requiredFieldError(name)
+		}
 		if p.isPost() {
 			return "", p.postFieldError(name, err.Error())
 		}
 		return "", validationError("failed to parse request: " + err.Error())
 	}
-	if !ok || strings.TrimSpace(value) == "" {
+	if strings.TrimSpace(value) == "" {
 		return "", p.requiredFieldError(name)
 	}
 	return value, nil
 }
 
-func (p requestParams) optionalInt32(name string) (int32, bool, *apiError) {
-	raw, ok, apiErr := p.optionalNonEmptyString(name)
-	if apiErr != nil || !ok {
-		return 0, ok, apiErr
+func (p requestParams) optionalInt32(name string) (int32, error) {
+	raw, err := p.optionalNonEmptyString(name)
+	if err != nil {
+		return 0, err
 	}
 
 	value, err := strconv.ParseInt(raw, 10, 32)
 	if err != nil {
-		return 0, false, validationError(fmt.Sprintf("failed to parse request: field %q must be int32", name))
+		return 0, validationError(fmt.Sprintf("failed to parse request: field %q must be int32", name))
 	}
-	return int32(value), true, nil
+	return int32(value), nil
 }
 
 func (p requestParams) requiredInt32(name string) (int32, *apiError) {
-	value, ok, apiErr := p.optionalInt32(name)
-	if apiErr != nil {
-		return 0, apiErr
-	}
-	if !ok {
+	value, err := p.optionalInt32(name)
+	if errors.Is(err, errRequestParamNotFound) {
 		return 0, p.requiredFieldError(name)
+	}
+	if err != nil {
+		return 0, asAPIError(err)
 	}
 	return value, nil
 }
 
-func (p requestParams) optionalInt64(name string) (int64, bool, *apiError) {
-	raw, ok, apiErr := p.optionalNonEmptyString(name)
-	if apiErr != nil || !ok {
-		return 0, ok, apiErr
+func (p requestParams) optionalInt64(name string) (int64, error) {
+	raw, err := p.optionalNonEmptyString(name)
+	if err != nil {
+		return 0, err
 	}
 
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return 0, false, validationError(fmt.Sprintf("failed to parse request: field %q must be int64", name))
-	}
-	return value, true, nil
-}
-
-func (p requestParams) requiredInt64(name string) (int64, *apiError) {
-	value, ok, apiErr := p.optionalInt64(name)
-	if apiErr != nil {
-		return 0, apiErr
-	}
-	if !ok {
-		return 0, p.requiredFieldError(name)
+		return 0, validationError(fmt.Sprintf("failed to parse request: field %q must be int64", name))
 	}
 	return value, nil
 }
 
-func (p requestParams) optionalUint32(name string) (uint32, bool, *apiError) {
-	raw, ok, apiErr := p.optionalNonEmptyString(name)
-	if apiErr != nil || !ok {
-		return 0, ok, apiErr
+func (p requestParams) requiredInt64(name string) (int64, *apiError) {
+	value, err := p.optionalInt64(name)
+	if errors.Is(err, errRequestParamNotFound) {
+		return 0, p.requiredFieldError(name)
+	}
+	if err != nil {
+		return 0, asAPIError(err)
+	}
+	return value, nil
+}
+
+func (p requestParams) optionalUint32(name string) (uint32, error) {
+	raw, err := p.optionalNonEmptyString(name)
+	if err != nil {
+		return 0, err
 	}
 
 	value, err := strconv.ParseUint(raw, 10, 32)
 	if err != nil {
-		return 0, false, validationError(fmt.Sprintf("failed to parse request: field %q must be uint32", name))
+		return 0, validationError(fmt.Sprintf("failed to parse request: field %q must be uint32", name))
 	}
-	return uint32(value), true, nil
+	return uint32(value), nil
 }
 
 func (p requestParams) requiredUint32(name string) (uint32, *apiError) {
-	value, ok, apiErr := p.optionalUint32(name)
-	if apiErr != nil {
-		return 0, apiErr
-	}
-	if !ok {
+	value, err := p.optionalUint32(name)
+	if errors.Is(err, errRequestParamNotFound) {
 		return 0, p.requiredFieldError(name)
+	}
+	if err != nil {
+		return 0, asAPIError(err)
 	}
 	return value, nil
 }
 
-func (p requestParams) optionalUint64(name string) (uint64, bool, *apiError) {
-	raw, ok, apiErr := p.optionalNonEmptyString(name)
-	if apiErr != nil || !ok {
-		return 0, ok, apiErr
+func (p requestParams) optionalUint64(name string) (uint64, error) {
+	raw, err := p.optionalNonEmptyString(name)
+	if err != nil {
+		return 0, err
 	}
 
 	value, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
-		return 0, false, validationError(fmt.Sprintf("failed to parse request: field %q must be uint64", name))
+		return 0, validationError(fmt.Sprintf("failed to parse request: field %q must be uint64", name))
 	}
-	return value, true, nil
+	return value, nil
 }
 
-func (p requestParams) optionalBool(name string) (bool, bool, *apiError) {
-	raw, ok, apiErr := p.optionalNonEmptyString(name)
-	if apiErr != nil || !ok {
-		return false, ok, apiErr
+func (p requestParams) optionalBool(name string) (bool, error) {
+	raw, err := p.optionalNonEmptyString(name)
+	if err != nil {
+		return false, err
 	}
 
 	value, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, false, validationError(fmt.Sprintf("failed to parse request: field %q must be bool", name))
+		return false, validationError(fmt.Sprintf("failed to parse request: field %q must be bool", name))
 	}
-	return value, true, nil
+	return value, nil
 }
 
-func (p requestParams) optionalNonEmptyString(name string) (string, bool, *apiError) {
-	raw, ok, err := p.stringValue(name)
+func (p requestParams) optionalNonEmptyString(name string) (string, error) {
+	raw, err := p.stringValue(name)
 	if err != nil {
-		if p.isPost() {
-			return "", false, p.postFieldError(name, err.Error())
+		if errors.Is(err, errRequestParamNotFound) {
+			return "", err
 		}
-		return "", false, validationError("failed to parse request: " + err.Error())
+		if p.isPost() {
+			return "", p.postFieldError(name, err.Error())
+		}
+		return "", validationError("failed to parse request: " + err.Error())
 	}
-	if !ok || strings.TrimSpace(raw) == "" {
-		return "", false, nil
+	if strings.TrimSpace(raw) == "" {
+		return "", errRequestParamNotFound
 	}
-	return raw, true, nil
+	return raw, nil
+}
+
+func asAPIError(err error) *apiError {
+	if err == nil {
+		return nil
+	}
+
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return internalError(err.Error())
 }
 
 func setCommonHeaders(w http.ResponseWriter) {
@@ -510,17 +535,13 @@ func (s *Server) writeAPIError(w http.ResponseWriter, err *apiError, started tim
 		code = status
 	}
 
-	s.writeFailure(w, status, failureEnvelope{
+	s.writeJSON(w, status, failureEnvelope{
 		OK:     false,
 		Error:  err.message,
 		Result: err.result,
 		Code:   code,
 		Extra:  s.extra(started),
 	})
-}
-
-func (s *Server) writeFailure(w http.ResponseWriter, status int, envelope failureEnvelope) {
-	s.writeJSON(w, status, envelope)
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {

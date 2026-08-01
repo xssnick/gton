@@ -24,9 +24,6 @@ func newExternalBroadcastPacer(opts ExternalBroadcastCapacityOptions) (*external
 	if opts.MaxDelay < 0 {
 		return nil, fmt.Errorf("external broadcast capacity max delay cannot be negative")
 	}
-	if opts.BytesPerSecond == 0 {
-		return nil, nil
-	}
 
 	return &externalBroadcastPacer{
 		bytesPerSecond: opts.BytesPerSecond,
@@ -36,7 +33,7 @@ func newExternalBroadcastPacer(opts ExternalBroadcastCapacityOptions) (*external
 }
 
 func (p *externalBroadcastPacer) Wait(ctx context.Context, costBytes int64) error {
-	if p == nil || costBytes <= 0 {
+	if costBytes <= 0 || p.bytesPerSecond == 0 {
 		return nil
 	}
 

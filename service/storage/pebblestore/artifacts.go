@@ -40,9 +40,13 @@ func (s *Store) prepareCheckpointArtifactWrites(entries []storage.StateCheckpoin
 			continue
 		}
 		links = append(links, entry.Links...)
-		if write, ok := s.takePrewrittenArtifactWrite(entry); ok {
+		write, err := s.takePrewrittenArtifactWrite(entry)
+		if err == nil {
 			writes = append(writes, write)
 			continue
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, nil, err
 		}
 		missIndexes = append(missIndexes, len(writes))
 		writes = append(writes, checkpointArtifactWrite{})
@@ -183,9 +187,6 @@ func (s *Store) setCheckpointArtifactWrites(batch *pebble.Batch, writes []checkp
 }
 
 func servedBlockFullMeta(block *storage.ServedBlockFull) (*storage.BlockMeta, []storage.ServedProofKind, error) {
-	if block == nil {
-		return nil, nil, fmt.Errorf("served block is missing")
-	}
 	if len(block.Block) == 0 && len(block.Proof) == 0 {
 		return nil, nil, fmt.Errorf("served block %s has no block data or proof", storage.FormatBlockRef(block.ID))
 	}
@@ -791,12 +792,24 @@ func (s *Store) BlockProof(ctx context.Context, kind storage.ServedProofKind, bl
 	return s.readArtifact(ctx, hotKeyStoredProofRef(kind, block))
 }
 
-func (s *Store) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+func (s *Store) ZeroStateSize(ctx context.Context, block ton.BlockIDExt) (int64, error) {
 	raw, err := s.getHotCopy(ctx, hotKeyZeroStateRef(block))
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	size, err := decodeStateFileRef(raw)
+	if err != nil {
+		return 0, err
+	}
+	if size <= 0 {
+		return 0, fmt.Errorf("zerostate file ref size is invalid")
+	}
+
+	return size, nil
+}
+
+func (s *Store) ZeroState(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
+	size, err := s.ZeroStateSize(ctx, block)
 	if err != nil {
 		return nil, err
 	}

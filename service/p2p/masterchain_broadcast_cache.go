@@ -26,49 +26,21 @@ func newMasterchainNextBroadcastCache(ttl time.Duration, maxBytes int64, maxItem
 	}
 }
 
-func (c *masterchainNextBroadcastCache) Store(downloaded DownloadedBlock) error {
-	return c.storeAt(downloaded, time.Now())
-}
-
 func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now time.Time) error {
-	if !isMasterchainBlock(downloaded.ID) {
-		return fmt.Errorf("block %s is not a masterchain next broadcast cache candidate", formatBlockRef(downloaded.ID))
-	}
-	if !downloaded.VerifiedRootHash {
-		return fmt.Errorf("block %s is not hash verified", formatBlockRef(downloaded.ID))
-	}
-	if len(downloaded.BlockBOC) == 0 {
-		return fmt.Errorf("block %s has empty block data", formatBlockRef(downloaded.ID))
-	}
-	if len(downloaded.ProofBOC) == 0 {
-		return fmt.Errorf("block %s has empty proof", formatBlockRef(downloaded.ID))
-	}
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return fmt.Errorf("masterchain next broadcast cache is disabled")
 	}
-	if downloaded.Meta == nil {
-		return fmt.Errorf("block %s has no metadata", formatBlockRef(downloaded.ID))
-	}
 	if len(downloaded.Meta.PrevRefs) != 1 {
-		return fmt.Errorf("block %s has %d previous refs", formatBlockRef(downloaded.ID), len(downloaded.Meta.PrevRefs))
+		return fmt.Errorf("block %s has %d previous refs", tnstore.FormatBlockRef(downloaded.ID), len(downloaded.Meta.PrevRefs))
 	}
 	prev := downloaded.Meta.PrevRefs[0]
 	if !isMasterchainBlock(prev) {
-		return fmt.Errorf("block %s previous ref %s is not masterchain", formatBlockRef(downloaded.ID), formatBlockRef(prev))
-	}
-	if downloaded.Block == nil {
-		return fmt.Errorf("block %s has no parsed block root", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Proof == nil {
-		return fmt.Errorf("block %s has no parsed proof root", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.StateUpdate == nil {
-		return fmt.Errorf("block %s has no state update", formatBlockRef(downloaded.ID))
+		return fmt.Errorf("block %s previous ref %s is not masterchain", tnstore.FormatBlockRef(downloaded.ID), tnstore.FormatBlockRef(prev))
 	}
 
 	size := masterchainNextBroadcastBlockCacheSize(downloaded.BlockBOC, downloaded.ProofBOC)
 	if size > c.maxBytes {
-		return fmt.Errorf("block %s is too large for masterchain next broadcast cache: %d > %d", formatBlockRef(downloaded.ID), size, c.maxBytes)
+		return fmt.Errorf("block %s is too large for masterchain next broadcast cache: %d > %d", tnstore.FormatBlockRef(downloaded.ID), size, c.maxBytes)
 	}
 
 	key := tnstore.BlockKey(prev)
@@ -94,14 +66,10 @@ func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now 
 }
 
 func (c *masterchainNextBroadcastCache) BlockAfter(prev ton.BlockIDExt) (*DownloadedBlock, error) {
-	return c.blockAfterAt(prev, time.Now())
-}
-
-func (c *masterchainNextBroadcastCache) blockAfterAt(prev ton.BlockIDExt, now time.Time) (*DownloadedBlock, error) {
 	if !isMasterchainBlock(prev) {
 		return nil, tnstore.ErrNotFound
 	}
-	return c.blockAt(tnstore.BlockKey(prev), now)
+	return c.blockAt(tnstore.BlockKey(prev), time.Now())
 }
 
 func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
@@ -109,24 +77,21 @@ func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) in
 }
 
 func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock) bool {
-	if downloaded == nil {
-		return false
-	}
 	if !isMasterchainBlock(downloaded.ID) {
 		return false
 	}
-	if err := n.masterchainNextBroadcastCache.Store(*downloaded); err != nil {
+	if err := n.masterchainNextBroadcastCache.storeAt(*downloaded, time.Now()); err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(downloaded.ID)).
+			Stringer("block", tnstore.BlockRef(downloaded.ID)).
 			Msg("dropping masterchain block broadcast from next cache")
 		return false
 	}
 
 	prev := downloaded.Meta.PrevRefs[0]
 	n.log.Debug().
-		Str("block", formatBlockRef(downloaded.ID)).
-		Str("prev", formatBlockRef(prev)).
+		Stringer("block", tnstore.BlockRef(downloaded.ID)).
+		Stringer("prev", tnstore.BlockRef(prev)).
 		Msg("cached masterchain block broadcast")
 	n.notifyMasterchainNextBroadcastBlock(prev)
 	return true

@@ -130,22 +130,14 @@ func (c *broadcastBlockCache) pruneExpiredLocked(now time.Time) {
 func (c *broadcastBlockCache) pruneOverflowLocked() {
 	for len(c.entries) > c.maxItems || c.bytes > c.maxBytes {
 		elem := c.order.Front()
-		if elem == nil {
-			return
-		}
 		c.deleteEntryLocked(elem.Value.(*broadcastBlockCacheEntry))
 	}
 }
 
 func (c *broadcastBlockCache) deleteEntryLocked(entry *broadcastBlockCacheEntry) {
-	if entry == nil {
-		return
-	}
 	delete(c.entries, entry.key)
-	if entry.element != nil {
-		c.order.Remove(entry.element)
-		entry.element = nil
-	}
+	c.order.Remove(entry.element)
+	entry.element = nil
 	c.bytes -= entry.bytes
 }
 

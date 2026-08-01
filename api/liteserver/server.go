@@ -42,6 +42,14 @@ type Store interface {
 	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
 }
 
+// prefixLookupStore is an optional capability kept out of Store so released
+// Store implementations remain source compatible.
+type prefixLookupStore interface {
+	LookupBlockBySeqNoForPrefix(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error)
+	LookupBlockByLTForPrefix(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error)
+	LookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error)
+}
+
 type MessageSender interface {
 	SendCheckedExternalMessage(ctx context.Context, body []byte, dst *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error
 }
@@ -86,7 +94,7 @@ type Server struct {
 	log                     zerolog.Logger
 	store                   Store
 	messageSender           MessageSender
-	messageChecker          MessageChecker
+	externalMessageCheck    admission.CheckFunc
 	queryObserver           QueryObserver
 	privateKey              ed25519.PrivateKey
 	listenAddr              string
@@ -101,7 +109,6 @@ type Server struct {
 
 	sendMessageCache       *admission.MessageCache
 	externalMessageSender  *admission.Sender
-	externalMessageChecker *admission.Checker
 	externalMessageLimiter *extmsg.AddressLimiter
 	requestLimiter         *requestLimiter
 	connectionTracker      *clientConnectionTracker
@@ -119,32 +126,22 @@ type Server struct {
 	blockProofBaseLoad  liveLoadGroup[liteBlockKey]
 }
 
+// New preserves the released standalone composition: it owns a TVM and uses
+// the sender's checker when available, otherwise constructing the legacy local
+// checker. Internal composition paths should pass ready dependencies to newServer.
 func New(opts Options) (*Server, error) {
-	if len(opts.PrivateKey) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("liteserver private key must be %d bytes", ed25519.PrivateKeySize)
-	}
-	if opts.ListenAddr == "" {
-		return nil, fmt.Errorf("liteserver listen address is empty")
-	}
-	if opts.Store == nil {
-		return nil, fmt.Errorf("liteserver store is required")
-	}
-
-	log := zerolog.Nop()
-	if opts.Logger != nil {
-		log = opts.Logger.With().Str("component", "liteserver").Logger()
-	}
-
-	if err := validateRequestLimitOptions(opts.RequestLimits); err != nil {
+	if err := validateServerOptions(opts); err != nil {
 		return nil, err
 	}
 
+	log := liteserverLogger(opts.Logger)
 	tvmInstance := tvm.NewTVM()
-	messageChecker, _ := opts.MessageSender.(MessageChecker)
-	var externalMessageChecker *admission.Checker
-	if messageChecker == nil {
-		var err error
-		externalMessageChecker, err = admission.NewChecker(admission.Options{
+
+	var checkExternalMessage admission.CheckFunc
+	if messageChecker, ok := opts.MessageSender.(MessageChecker); ok && messageChecker != nil {
+		checkExternalMessage = messageChecker.CheckExternalMessage
+	} else {
+		externalMessageChecker, err := admission.NewChecker(admission.Options{
 			Logger: &log,
 			Store:  opts.Store,
 			TVM:    tvmInstance,
@@ -152,13 +149,23 @@ func New(opts Options) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
+		checkExternalMessage = externalMessageChecker.Check
 	}
 
+	return newServer(opts, tvmInstance, checkExternalMessage)
+}
+
+func newServer(opts Options, tvmInstance *tvm.TVM, checkExternalMessage admission.CheckFunc) (*Server, error) {
+	if err := validateServerOptions(opts); err != nil {
+		return nil, err
+	}
+
+	log := liteserverLogger(opts.Logger)
 	server := &Server{
 		log:                     log,
 		store:                   opts.Store,
 		messageSender:           opts.MessageSender,
-		messageChecker:          messageChecker,
+		externalMessageCheck:    checkExternalMessage,
 		queryObserver:           opts.QueryObserver,
 		privateKey:              opts.PrivateKey,
 		listenAddr:              opts.ListenAddr,
@@ -171,7 +178,6 @@ func New(opts Options) (*Server, error) {
 		tvm:                     tvmInstance,
 		requestLimits:           opts.RequestLimits,
 		sendMessageCache:        admission.NewMessageCache(),
-		externalMessageChecker:  externalMessageChecker,
 		externalMessageLimiter:  extmsg.NewDefaultAddressLimiter(),
 		requestLimiter:          newRequestLimiter(opts.RequestLimits),
 		connectionTracker:       newClientConnectionTracker(opts.RequestLimits),
@@ -188,6 +194,30 @@ func New(opts Options) (*Server, error) {
 		server.externalMessageSender = externalMessageSender
 	}
 	return server, nil
+}
+
+func validateServerOptions(opts Options) error {
+	if len(opts.PrivateKey) != ed25519.PrivateKeySize {
+		return fmt.Errorf("liteserver private key must be %d bytes", ed25519.PrivateKeySize)
+	}
+	if opts.ListenAddr == "" {
+		return fmt.Errorf("liteserver listen address is empty")
+	}
+	if opts.Store == nil {
+		return fmt.Errorf("liteserver store is required")
+	}
+
+	if err := validateRequestLimitOptions(opts.RequestLimits); err != nil {
+		return err
+	}
+	return nil
+}
+
+func liteserverLogger(logger *zerolog.Logger) zerolog.Logger {
+	if logger == nil {
+		return zerolog.Nop()
+	}
+	return logger.With().Str("component", "liteserver").Logger()
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -267,6 +297,14 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		}()
 	}
+
+	// The head warmer only exists while the liteserver runs, so a node without
+	// this extension never pays for it.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runHeadWarmer(runCtx)
+	}()
 
 	errCh := make(chan error, 1)
 	s.wg.Add(1)

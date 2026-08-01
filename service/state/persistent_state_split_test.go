@@ -86,7 +86,7 @@ func TestSplitPersistentStateBuildsHeaderAndAccountParts(t *testing.T) {
 		}
 	}
 
-	emptyAccounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
+	emptyAccounts, err := cell.NewAugDict(256, tlb.AugShardAccounts{})
 	if err != nil {
 		t.Fatalf("create empty accounts dict: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestSplitPersistentStateHeaderProvesEmptyPrefixes(t *testing.T) {
 func mustTestPersistentStateSplitRoot(t *testing.T, block ton.BlockIDExt, accountIDs ...*big.Int) *cell.Cell {
 	t.Helper()
 
-	accounts, err := cell.NewAugDict(256, shardAccountsAugmentation{})
+	accounts, err := cell.NewAugDict(256, tlb.AugShardAccounts{})
 	if err != nil {
 		t.Fatalf("create accounts dict: %v", err)
 	}
@@ -178,7 +178,7 @@ func mustTestPersistentStateSplitRoot(t *testing.T, block ton.BlockIDExt, accoun
 		if err != nil {
 			t.Fatalf("build account: %v", err)
 		}
-		if err = accounts.Set(cell.BeginCell().MustStoreBigInt(accountID, 256).EndCell(), account); err != nil {
+		if err = accounts.Set(cell.BeginCell().MustStoreSlice(accountID.FillBytes(make([]byte, 32)), 256).EndCell(), account); err != nil {
 			t.Fatalf("set account: %v", err)
 		}
 	}

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -27,21 +29,21 @@ func (n *Node) NextKeyBlocks(ctx context.Context, block ton.BlockIDExt, limit in
 		return KeyBlockBatch{}, ErrOffline
 	}
 	if block.Workchain != -1 || block.Shard != topShard {
-		return KeyBlockBatch{}, fmt.Errorf("next key block lookup requires masterchain block, got %s", formatBlockRef(block))
+		return KeyBlockBatch{}, fmt.Errorf("next key block lookup requires masterchain block, got %s", storage.FormatBlockRef(block))
 	}
 
 	if limit <= 0 {
 		limit = 16
 	}
 
-	sub, err := n.subscriptionForBlock(block)
+	sub, err := n.querySubscriptionForBlock(block)
 	if err != nil {
 		return KeyBlockBatch{}, err
 	}
 	if err = sub.ensurePeers(ctx); err != nil {
 		return KeyBlockBatch{}, fmt.Errorf("bootstrap overlay peers: %w", err)
 	}
-	sub.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
+	sub.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
 
 	resp, err := sub.queryKeyBlocks(ctx, GetNextKeyBlockIDs{
 		Block:   block,
@@ -74,22 +76,36 @@ func (s *overlaySubscription) queryKeyBlocks(ctx context.Context, req tl.Seriali
 	queryCtx, cancel := context.WithTimeout(ctx, keyBlockLookupRoundTimeout)
 	defer cancel()
 
-	return queryKeyBlocksFromPeers(queryCtx, peers, keyBlockLookupParallelism, keyBlockLookupHedgeDelay, func(ctx context.Context, peer *overlayPeer) (tl.Serializable, error) {
-		return s.queryFromPeerWithLimits(ctx, peer, req, keyBlockLookupTimeout, maxKeyBlockLookupAnswerSize)
-	}, func(peer *overlayPeer) {
-		s.markPeerQueryFailed(peer)
+	return queryKeyBlocksFromPeers(queryCtx, peers, keyBlockLookupParallelism, keyBlockLookupHedgeDelay, func(ctx context.Context, peer *overlayPeer) (resp tl.Serializable, err error) {
+		query := s.beginPeerQueryOperation(peer)
+		defer func() {
+			query.finish(err)
+		}()
+
+		resp, err = s.queryFromPeerWithLimits(ctx, peer, req, keyBlockLookupTimeout, maxKeyBlockLookupAnswerSize)
+		if err != nil {
+			return nil, err
+		}
+
+		keyBlocks, ok := resp.(KeyBlocks)
+		if !ok {
+			return nil, fmt.Errorf("unexpected getNextKeyBlockIds response %T", resp)
+		}
+		if keyBlocks.Error {
+			return nil, asPeerQueryNotReady(errors.New("key block lookup error"))
+		}
+		return resp, nil
 	})
 }
 
-func queryKeyBlocksFromPeers(ctx context.Context, peers []*overlayPeer, parallelism int, hedgeDelay time.Duration, query func(context.Context, *overlayPeer) (tl.Serializable, error), semanticFailure func(*overlayPeer)) (tl.Serializable, error) {
+func queryKeyBlocksFromPeers(ctx context.Context, peers []*overlayPeer, parallelism int, hedgeDelay time.Duration, query func(context.Context, *overlayPeer) (tl.Serializable, error)) (tl.Serializable, error) {
 	if len(peers) == 0 {
 		return nil, errors.New("overlay has no connected peers")
 	}
 
 	var (
-		emptyMu    sync.Mutex
-		emptyResp  tl.Serializable
-		emptyPeers []*overlayPeer
+		emptyMu   sync.Mutex
+		emptyResp tl.Serializable
 	)
 
 	results, errs := runPeerRequests(ctx, peers, peerRequestOptions{
@@ -101,35 +117,18 @@ func queryKeyBlocksFromPeers(ctx context.Context, peers []*overlayPeer, parallel
 			return nil, err
 		}
 
-		if keyBlocks, ok := resp.(KeyBlocks); ok {
-			if keyBlocks.Error {
-				if semanticFailure != nil {
-					semanticFailure(peer)
-				}
-				return nil, fmt.Errorf("key block lookup error")
+		if keyBlocks, ok := resp.(KeyBlocks); ok && len(keyBlocks.Blocks) == 0 {
+			emptyMu.Lock()
+			if emptyResp == nil {
+				emptyResp = resp
 			}
-			if len(keyBlocks.Blocks) == 0 {
-				emptyMu.Lock()
-				if emptyResp == nil {
-					emptyResp = resp
-				}
-				emptyPeers = append(emptyPeers, peer)
-				emptyMu.Unlock()
-				return nil, emptyKeyBlockResponse{}
-			}
+			emptyMu.Unlock()
+			return nil, emptyKeyBlockResponse{}
 		}
 
 		return resp, nil
 	})
 	if len(results) > 0 {
-		emptyMu.Lock()
-		if semanticFailure != nil {
-			for _, peer := range emptyPeers {
-				semanticFailure(peer)
-			}
-		}
-		emptyMu.Unlock()
-
 		return results[0].value, nil
 	}
 	emptyMu.Lock()

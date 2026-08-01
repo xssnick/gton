@@ -156,13 +156,6 @@ func loadedBlockFromAppliedEvent(event hooks.BlockAppliedEvent) (loadedBlock, er
 }
 
 func shardStateViewsFromAppliedRoots(block ton.BlockIDExt, previousRoot *cell.Cell, currentRoot *cell.Cell) ([]*shardStateView, *shardStateView, error) {
-	if previousRoot == nil {
-		return nil, nil, fmt.Errorf("previous state root is missing")
-	}
-	if currentRoot == nil {
-		return nil, nil, fmt.Errorf("current state root is missing")
-	}
-
 	previousViews, err := previousShardStateViewsFromRoot(previousRoot)
 	if err != nil {
 		return nil, nil, err
@@ -186,9 +179,6 @@ func configMasterStateForAppliedBlock(ctx context.Context, event hooks.BlockAppl
 	}
 
 	if block.ID.Workchain == masterchainID && block.ID.Shard == masterchainShard {
-		if event.PreviousState == nil {
-			return ton.BlockIDExt{}, nil, fmt.Errorf("applied masterchain block %s has no previous state", storage.FormatBlockRef(block.ID))
-		}
 		return ref, event.PreviousState, nil
 	}
 
@@ -633,21 +623,6 @@ func (v *replayValidator) validateAccountBlock(masterSeqno uint32, previous []*s
 				Msg("transaction emulation failed")
 			break
 		}
-		if res == nil || res.TransactionCell == nil || res.NextAccount == nil {
-			txDetails := v.accountMismatchTxDetails(scope, tx)
-			setFirstTx(currentShard, txDetails)
-			addMismatch(currentShard)
-			v.log.Warn().
-				Uint32("master_seqno", masterSeqno).
-				Str("block", storage.FormatBlockRef(block.ID)).
-				Str("address", addr.StringRaw()).
-				Uint64("lt", tx.Parsed.LT).
-				Int64("gas", gasUsed).
-				Dur("elapsed", elapsed).
-				Msg("transaction emulator returned no transaction")
-			break
-		}
-
 		nextShard := res.NextAccount.ShardAccount()
 		gotTxHash := res.TransactionCell.HashKey()
 		if gotTxHash != tx.Hash {
@@ -843,12 +818,6 @@ func mergeAccountMismatch(dst accountMismatch, src accountMismatch) accountMisma
 }
 
 func mergeAccountMismatchTx(dst, src *accountMismatchTx) *accountMismatchTx {
-	if dst == nil {
-		return src
-	}
-	if src == nil {
-		return dst
-	}
 	if dst.GotTxHash == "" {
 		dst.GotTxHash = src.GotTxHash
 	}
@@ -859,10 +828,6 @@ func mergeAccountMismatchTx(dst, src *accountMismatchTx) *accountMismatchTx {
 }
 
 func expectedShardAccountForMismatch(expected *shardStateView, account []byte) *tlb.ShardAccount {
-	if expected == nil {
-		return nil
-	}
-
 	shard, err := expected.account(account)
 	if err == nil {
 		return shard
@@ -1035,15 +1000,17 @@ type shardStateView struct {
 	parsed *tlb.ShardStateUnsplit
 }
 
+type shardStateUnion struct {
+	Value any `tlb:"[ShardStateUnsplit,ShardStateSplit]"`
+}
+
 func previousShardStateViewsFromRoot(root *cell.Cell) ([]*shardStateView, error) {
 	loader, err := root.BeginParse()
 	if err != nil {
 		return nil, fmt.Errorf("parse state update source root: %w", err)
 	}
 
-	var state struct {
-		Value any `tlb:"[ShardStateUnsplit,ShardStateSplit]"`
-	}
+	var state shardStateUnion
 	if err = tlb.LoadFromCell(&state, loader); err != nil {
 		return nil, fmt.Errorf("load state update source state: %w", err)
 	}
@@ -1072,9 +1039,6 @@ func newShardStateViewFromParsed(block ton.BlockIDExt, root *cell.Cell, parsed *
 }
 
 func blockRefFromParsedShardState(state *tlb.ShardStateUnsplit) ton.BlockIDExt {
-	if state == nil {
-		return ton.BlockIDExt{}
-	}
 	return ton.BlockIDExt{
 		Workchain: state.ShardIdent.WorkchainID,
 		Shard:     int64(state.ShardIdent.ShardPrefix),
@@ -1083,9 +1047,6 @@ func blockRefFromParsedShardState(state *tlb.ShardStateUnsplit) ton.BlockIDExt {
 }
 
 func (v *shardStateView) account(account []byte) (*tlb.ShardAccount, error) {
-	if v == nil || v.parsed == nil {
-		return nil, storage.ErrNotFound
-	}
 	if v.parsed.Accounts.ShardAccounts == nil || v.parsed.Accounts.ShardAccounts.IsEmpty() {
 		return nil, storage.ErrNotFound
 	}

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/archive/packfile"
 	"github.com/xssnick/gton/service/blockproof"
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -25,25 +24,24 @@ import (
 
 type prepareZeroStatePeerStore struct {
 	tnstore.PeerServingStorage
-	data []byte
+	size int64
 	err  error
 }
 
-func (s prepareZeroStatePeerStore) ZeroState(context.Context, ton.BlockIDExt) ([]byte, error) {
-	return s.data, s.err
+func (s prepareZeroStatePeerStore) ZeroStateSize(context.Context, ton.BlockIDExt) (int64, error) {
+	return s.size, s.err
 }
 
 func TestServePrepareZeroStateDistinguishesStorageErrors(t *testing.T) {
 	storageFailure := errors.New("zero state storage failure")
 	tests := []struct {
 		name         string
-		data         []byte
+		size         int64
 		err          error
 		wantPrepared bool
 		wantErr      error
 	}{
-		{name: "available", data: []byte{0x01}, wantPrepared: true},
-		{name: "empty", data: []byte{}},
+		{name: "available", size: 1, wantPrepared: true},
 		{name: "not found", err: tnstore.ErrNotFound},
 		{name: "canceled", err: context.Canceled, wantErr: context.Canceled},
 		{name: "storage failure", err: storageFailure, wantErr: storageFailure},
@@ -53,7 +51,7 @@ func TestServePrepareZeroStateDistinguishesStorageErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			store := prepareZeroStatePeerStore{
 				PeerServingStorage: newTestPeerStore(),
-				data:               tt.data,
+				size:               tt.size,
 				err:                tt.err,
 			}
 			sub := testOverlaySubscription(&overlaySubscription{
@@ -132,7 +130,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("save key block proof: %v", err)
 	}
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: next})
+	resp, err := sub.dispatchPeerQuery(context.Background(), tonnodeapi.DownloadBlockFull{Block: next})
 	if err != nil {
 		t.Fatalf("downloadBlockFull: %v", err)
 	}
@@ -144,7 +142,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected full block payload")
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadNextBlockFull{PrevBlock: block})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadNextBlockFull{PrevBlock: block})
 	if err != nil {
 		t.Fatalf("downloadNextBlockFull: %v", err)
 	}
@@ -156,7 +154,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected next block %v", nextResp.ID.SeqNo)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextBlockDescription{PrevBlock: block})
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetNextBlockDescription{PrevBlock: block})
 	if err != nil {
 		t.Fatalf("getNextBlockDescription: %v", err)
 	}
@@ -168,7 +166,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected next description %v", desc.ID.SeqNo)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlock{Block: next})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareBlock{Block: next})
 	if err != nil {
 		t.Fatalf("prepareBlock: %v", err)
 	}
@@ -176,7 +174,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected prepareBlock response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlockProof{Block: next, AllowPartial: false})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareBlockProof{Block: next, AllowPartial: false})
 	if err != nil {
 		t.Fatalf("prepareBlockProof: %v", err)
 	}
@@ -184,7 +182,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected prepareBlockProof response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlockProof{Block: shardBlock, AllowPartial: true})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareBlockProof{Block: shardBlock, AllowPartial: true})
 	if err != nil {
 		t.Fatalf("prepareBlockProof partial: %v", err)
 	}
@@ -192,7 +190,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected partial prepareBlockProof response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareKeyBlockProof{Block: keyBlock, AllowPartial: true})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareKeyBlockProof{Block: keyBlock, AllowPartial: true})
 	if err != nil {
 		t.Fatalf("prepareKeyBlockProof partial: %v", err)
 	}
@@ -200,7 +198,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected partial prepareKeyBlockProof response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareKeyBlockProof{Block: keyBlock, AllowPartial: false})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareKeyBlockProof{Block: keyBlock, AllowPartial: false})
 	if err != nil {
 		t.Fatalf("prepareKeyBlockProof full: %v", err)
 	}
@@ -208,7 +206,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected full prepareKeyBlockProof response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlockProof{Block: testStoredMasterBlockID(0), AllowPartial: false})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareBlockProof{Block: testStoredMasterBlockID(0), AllowPartial: false})
 	if err == nil {
 		t.Fatal("expected prepareBlockProof zero state error")
 	}
@@ -216,7 +214,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected zero state prepareBlockProof response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlock{Block: next})
+	resp, err = sub.dispatchPeerQuery(context.Background(), tonnodeapi.DownloadBlock{Block: next})
 	if err != nil {
 		t.Fatalf("downloadBlock: %v", err)
 	}
@@ -228,7 +226,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected raw block data")
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadBlockProofLink{Block: shardBlock})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadBlockProofLink{Block: shardBlock})
 	if err != nil {
 		t.Fatalf("downloadBlockProofLink: %v", err)
 	}
@@ -237,7 +235,7 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 		t.Fatalf("unexpected block proof link response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadKeyBlockProof{Block: keyBlock})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadKeyBlockProof{Block: keyBlock})
 	if err != nil {
 		t.Fatalf("downloadKeyBlockProof: %v", err)
 	}
@@ -287,7 +285,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("publish live block: %v", err)
 	}
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlockFull{Block: next})
+	resp, err := sub.dispatchPeerQuery(context.Background(), tonnodeapi.DownloadBlockFull{Block: next})
 	if err != nil {
 		t.Fatalf("downloadBlockFull: %v", err)
 	}
@@ -299,7 +297,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("unexpected live full block payload")
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadNextBlockFull{PrevBlock: prev})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadNextBlockFull{PrevBlock: prev})
 	if err != nil {
 		t.Fatalf("downloadNextBlockFull: %v", err)
 	}
@@ -308,7 +306,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("unexpected live next response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextBlockDescription{PrevBlock: prev})
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetNextBlockDescription{PrevBlock: prev})
 	if err != nil {
 		t.Fatalf("getNextBlockDescription: %v", err)
 	}
@@ -317,7 +315,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("unexpected live next description %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlock{Block: next})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareBlock{Block: next})
 	if err != nil {
 		t.Fatalf("prepareBlock: %v", err)
 	}
@@ -325,7 +323,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("unexpected live prepareBlock response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareBlockProof{Block: next, AllowPartial: false})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareBlockProof{Block: next, AllowPartial: false})
 	if err != nil {
 		t.Fatalf("prepareBlockProof: %v", err)
 	}
@@ -333,7 +331,7 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 		t.Fatalf("unexpected live prepareBlockProof response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlock{Block: next})
+	resp, err = sub.dispatchPeerQuery(context.Background(), tonnodeapi.DownloadBlock{Block: next})
 	if err != nil {
 		t.Fatalf("downloadBlock: %v", err)
 	}
@@ -377,7 +375,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 		t.Fatalf("publish live key proof: %v", err)
 	}
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareKeyBlockProof{Block: keyBlock, AllowPartial: false})
+	resp, err := sub.dispatchPeerQuery(context.Background(), PrepareKeyBlockProof{Block: keyBlock, AllowPartial: false})
 	if err != nil {
 		t.Fatalf("prepareKeyBlockProof full: %v", err)
 	}
@@ -385,7 +383,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 		t.Fatalf("unexpected live key proof prepare response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadKeyBlockProof{Block: keyBlock})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadKeyBlockProof{Block: keyBlock})
 	if err != nil {
 		t.Fatalf("downloadKeyBlockProof: %v", err)
 	}
@@ -405,7 +403,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 		t.Fatalf("publish live key proof link: %v", err)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareKeyBlockProof{Block: linkOnlyBlock, AllowPartial: true})
+	resp, err = sub.dispatchPeerQuery(context.Background(), PrepareKeyBlockProof{Block: linkOnlyBlock, AllowPartial: true})
 	if err != nil {
 		t.Fatalf("prepareKeyBlockProof link-only: %v", err)
 	}
@@ -413,7 +411,7 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 		t.Fatalf("unexpected live key proof link prepare response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadKeyBlockProofLink{Block: linkOnlyBlock})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadKeyBlockProofLink{Block: linkOnlyBlock})
 	if err != nil {
 		t.Fatalf("downloadKeyBlockProofLink: %v", err)
 	}
@@ -446,16 +444,16 @@ func TestDispatchPeerQueryDirectDownloadsErrorWhenMissing(t *testing.T) {
 	})
 
 	block := testStoredMasterBlockID(50)
-	if resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, tonnodeapi.DownloadBlock{Block: block}); err == nil || resp != nil {
+	if resp, err := sub.dispatchPeerQuery(context.Background(), tonnodeapi.DownloadBlock{Block: block}); err == nil || resp != nil {
 		t.Fatalf("downloadBlock missing resp=%T err=%v, want error", resp, err)
 	}
-	if resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadBlockProof{Block: block}); err == nil || resp != nil {
+	if resp, err := sub.dispatchPeerQuery(context.Background(), DownloadBlockProof{Block: block}); err == nil || resp != nil {
 		t.Fatalf("downloadBlockProof missing resp=%T err=%v, want error", resp, err)
 	}
-	if resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadZeroState{Block: block}); err == nil || resp != nil {
+	if resp, err := sub.dispatchPeerQuery(context.Background(), DownloadZeroState{Block: block}); err == nil || resp != nil {
 		t.Fatalf("downloadZeroState missing resp=%T err=%v, want error", resp, err)
 	}
-	if resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetArchiveSlice{ArchiveID: 404, Offset: 0, MaxSize: 1}); err == nil || resp != nil {
+	if resp, err := sub.dispatchPeerQuery(context.Background(), GetArchiveSlice{ArchiveID: 404, Offset: 0, MaxSize: 1}); err == nil || resp != nil {
 		t.Fatalf("getArchiveSlice missing resp=%T err=%v, want error", resp, err)
 	}
 }
@@ -491,7 +489,7 @@ func TestDispatchPeerQueryShardNextDescriptionRequiresMasterchain(t *testing.T) 
 		t.Fatalf("link next block: %v", err)
 	}
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextBlockDescription{PrevBlock: prev})
+	resp, err := sub.dispatchPeerQuery(context.Background(), GetNextBlockDescription{PrevBlock: prev})
 	if err == nil {
 		t.Fatal("expected getNextBlockDescription shard prev error")
 	}
@@ -559,7 +557,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 	shardArchivePath, _ := writePeerQueryArchivePack(t, []byte{6, 5, 4})
 	registerPeerQueryArchivePack(t, storage, 21, 0, topShard, 1, shardArchivePath)
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PrepareZeroState{Block: zeroBlock})
+	resp, err := sub.dispatchPeerQuery(context.Background(), PrepareZeroState{Block: zeroBlock})
 	if err != nil {
 		t.Fatalf("prepareZeroState: %v", err)
 	}
@@ -567,7 +565,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("unexpected prepareZeroState response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadZeroState{Block: zeroBlock})
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadZeroState{Block: zeroBlock})
 	if err != nil {
 		t.Fatalf("downloadZeroState: %v", err)
 	}
@@ -576,10 +574,11 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("unexpected zero state response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, PreparePersistentState{
+	resp, err = sub.dispatchPeerQuery(context.Background(), PreparePersistentState{
 		Block:            block,
 		MasterchainBlock: master,
 	})
+
 	if err != nil {
 		t.Fatalf("preparePersistentState: %v", err)
 	}
@@ -587,7 +586,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("unexpected preparePersistentState response %T", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetPersistentStateSizeV2{State: stateID})
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetPersistentStateSizeV2{State: stateID})
 	if err != nil {
 		t.Fatalf("getPersistentStateSizeV2: %v", err)
 	}
@@ -596,11 +595,12 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("unexpected persistent state size response %#v", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, DownloadPersistentStateSliceV2{
+	resp, err = sub.dispatchPeerQuery(context.Background(), DownloadPersistentStateSliceV2{
 		State:   stateID,
 		Offset:  0,
 		MaxSize: 3,
 	})
+
 	if err != nil {
 		t.Fatalf("downloadPersistentStateSliceV2: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("unexpected persistent state chunk %#v", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetArchiveInfo{MasterchainSeqno: 21})
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetArchiveInfo{MasterchainSeqno: 21})
 	if err != nil {
 		t.Fatalf("getArchiveInfo: %v", err)
 	}
@@ -619,10 +619,11 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 	}
 	masterArchiveID := info.ID
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetShardArchiveInfo{
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetShardArchiveInfo{
 		MasterchainSeqno: 21,
-		ShardPrefix:      archive.ShardID{Workchain: 0, Shard: topShard},
+		ShardPrefix:      tonnodeapi.ShardID{Workchain: 0, Shard: topShard},
 	})
+
 	if err != nil {
 		t.Fatalf("getShardArchiveInfo: %v", err)
 	}
@@ -631,11 +632,12 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 		t.Fatalf("unexpected shard archive info %#v", resp)
 	}
 
-	resp, err = sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetArchiveSlice{
+	resp, err = sub.dispatchPeerQuery(context.Background(), GetArchiveSlice{
 		ArchiveID: masterArchiveID,
 		Offset:    archivePtr.Offset,
 		MaxSize:   2,
 	})
+
 	if err != nil {
 		t.Fatalf("getArchiveSlice: %v", err)
 	}
@@ -674,7 +676,7 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	blockData := []byte{0x10, 0x11, 0x12}
 	blockProof := []byte{0x20, 0x21}
 	keyBlock, keyProof, keyProofLink := testPeerMasterBlockProof(t, 61)
-	masterLinkBlock, masterLinkProof, masterLinkProofLink := testPeerMasterBlockProof(t, 64)
+	masterLinkBlock, _, masterLinkProofLink := testPeerMasterBlockProof(t, 64)
 	blockProofLink := []byte{0x30, 0x31}
 	zeroState := []byte{0x40, 0x41, 0x42}
 	stateData := []byte{0x50, 0x51, 0x52, 0x53}
@@ -689,8 +691,8 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	if err = storage.SaveBlockProof(tnstore.ServedProofKeyBlock, keyBlock, keyProof, nil); err != nil {
 		t.Fatalf("save key block proof: %v", err)
 	}
-	if err = storage.SaveBlockProof(tnstore.ServedProofBlock, masterLinkBlock, masterLinkProof, nil); err != nil {
-		t.Fatalf("save master block proof: %v", err)
+	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, masterLinkBlock, masterLinkProofLink, nil); err != nil {
+		t.Fatalf("save master block proof link: %v", err)
 	}
 	if err = storage.SaveBlockProof(tnstore.ServedProofBlockLink, shardBlock, blockProofLink, nil); err != nil {
 		t.Fatalf("save block proof link: %v", err)
@@ -755,20 +757,16 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var got []byte
-			err := sub.answerPeerQuery(&overlayPeer{addr: "peer"}, tc.req, func(_ context.Context, resp tl.Serializable) error {
-				if _, ok := resp.(tl.Raw); !ok {
-					t.Fatalf("response type = %T, want tl.Raw", resp)
-				}
-				serialized, err := tl.Serialize(resp, true)
-				if err != nil {
-					return err
-				}
-				got = bytes.Clone(serialized)
-				return nil
-			})
+			resp, err := sub.handlePeerQuery(context.Background(), "peer", tc.req)
 			if err != nil {
 				t.Fatalf("answer query: %v", err)
+			}
+			if _, ok := resp.(tl.Raw); !ok {
+				t.Fatalf("response type = %T, want tl.Raw", resp)
+			}
+			got, err := tl.Serialize(resp, true)
+			if err != nil {
+				t.Fatal(err)
 			}
 			if !bytes.Equal(got, tc.want) {
 				t.Fatalf("serialized answer %x, want raw %x", got, tc.want)
@@ -855,10 +853,11 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 	}
 	node.RememberSeenMasterchainBlock(testStoredMasterBlockID(14))
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
+	resp, err := sub.dispatchPeerQuery(context.Background(), GetNextKeyBlockIDs{
 		Block:   testStoredMasterBlockID(10),
 		MaxSize: 2,
 	})
+
 	if err != nil {
 		t.Fatalf("getNextKeyBlockIds: %v", err)
 	}
@@ -908,10 +907,11 @@ func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
+	resp, err := sub.dispatchPeerQuery(context.Background(), GetNextKeyBlockIDs{
 		Block:   anchor,
 		MaxSize: 1,
 	})
+
 	if err != nil {
 		t.Fatalf("getNextKeyBlockIds: %v", err)
 	}
@@ -953,10 +953,11 @@ func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	resp, err := sub.dispatchPeerQuery(context.Background(), &overlayPeer{addr: "peer"}, GetNextKeyBlockIDs{
+	resp, err := sub.dispatchPeerQuery(context.Background(), GetNextKeyBlockIDs{
 		Block:   testStoredMasterBlockID(10),
 		MaxSize: 1,
 	})
+
 	if err != nil {
 		t.Fatalf("getNextKeyBlockIds: %v", err)
 	}
@@ -1035,16 +1036,9 @@ func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	answered := false
-	err = sub.answerPeerQuery(&overlayPeer{addr: "peer"}, GetCapabilities{}, func(context.Context, tl.Serializable) error {
-		answered = true
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("answer peer query: %v", err)
-	}
-	if answered {
-		t.Fatal("query was answered after node context was canceled")
+	_, err = sub.handlePeerQuery(node.runCtx, "peer", GetCapabilities{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("handle peer query error = %v, want context cancellation", err)
 	}
 }
 

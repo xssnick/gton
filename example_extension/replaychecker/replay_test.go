@@ -72,6 +72,7 @@ type loadedFatFixture struct {
 	blockID       ton.BlockIDExt
 	accounts      []accountBlockWork
 	previousViews []*shardStateView
+	expectedView  *shardStateView
 	execCtx       *blockExecutionContext
 	masterSeqno   uint32
 }
@@ -135,6 +136,7 @@ func loadFatFixture(tb testing.TB) *loadedFatFixture {
 		blockID:       loaded.ID,
 		accounts:      accounts,
 		previousViews: []*shardStateView{previousView},
+		expectedView:  &shardStateView{parsed: &tlb.ShardStateUnsplit{}},
 		execCtx:       execCtx,
 		masterSeqno:   masterSeqno,
 	}
@@ -224,7 +226,7 @@ func TestValidateAccountBlockFatFixture(t *testing.T) {
 	block := loadedBlock{ID: loaded.blockID, Parsed: parsedBlock(t, loaded)}
 	machine := tvm.NewTVM()
 	for i := range loaded.accounts {
-		_, n, err := v.validateAccountBlock(loaded.masterSeqno, loaded.previousViews, nil, block, loaded.execCtx, machine, loaded.accounts[i], scope)
+		_, n, err := v.validateAccountBlock(loaded.masterSeqno, loaded.previousViews, loaded.expectedView, block, loaded.execCtx, machine, loaded.accounts[i], scope)
 		if err != nil {
 			t.Fatalf("account %x: %v", loaded.accounts[i].Account, err)
 		}
@@ -271,7 +273,7 @@ func TestValidateAccountBlockDetectsDivergence(t *testing.T) {
 	block := loadedBlock{ID: loaded.blockID, Parsed: parsedBlock(t, loaded)}
 	machine := tvm.NewTVM()
 
-	if _, _, err := v.validateAccountBlock(loaded.masterSeqno, loaded.previousViews, nil, block, loaded.execCtx, machine, *target, scope); err != nil {
+	if _, _, err := v.validateAccountBlock(loaded.masterSeqno, loaded.previousViews, loaded.expectedView, block, loaded.execCtx, machine, *target, scope); err != nil {
 		t.Fatalf("validateAccountBlock returned error: %v", err)
 	}
 	if !scope.has(target.Account) {
@@ -322,7 +324,7 @@ func TestValidateAccountBlockConcurrentLanes(t *testing.T) {
 				if idx >= len(loaded.accounts) {
 					return
 				}
-				_, n, err := v.validateAccountBlock(loaded.masterSeqno, loaded.previousViews, nil, block, loaded.execCtx, machine, loaded.accounts[idx], scope)
+				_, n, err := v.validateAccountBlock(loaded.masterSeqno, loaded.previousViews, loaded.expectedView, block, loaded.execCtx, machine, loaded.accounts[idx], scope)
 				mu.Lock()
 				txs += n
 				if err != nil {
@@ -358,7 +360,7 @@ func TestValidateBlockParallelPath(t *testing.T) {
 	block := loadedBlock{ID: loaded.blockID, Parsed: parsedBlock(t, loaded)}
 	scope := newMismatchScope(loaded.masterSeqno, loaded.blockID.Workchain, v.mismatchLimit)
 
-	res, err := v.validateBlock(context.Background(), loaded.masterSeqno, loaded.accounts, loaded.previousViews, nil, block, loaded.execCtx, scope)
+	res, err := v.validateBlock(context.Background(), loaded.masterSeqno, loaded.accounts, loaded.previousViews, loaded.expectedView, block, loaded.execCtx, scope)
 	if err != nil {
 		t.Fatal(err)
 	}

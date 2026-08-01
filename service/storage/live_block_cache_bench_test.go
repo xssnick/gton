@@ -88,3 +88,29 @@ func BenchmarkLiveBlockCacheMixedParallel(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkLiveBlockCachePublishWithPinnedOverflow(b *testing.B) {
+	const (
+		maxBlocks    = 8192
+		pinnedBlocks = 15000
+	)
+
+	cache, _ := benchFilledLiveBlockCache(b, pinnedBlocks)
+	cache.max = maxBlocks
+	data := []byte{0x01}
+	next := pinnedBlocks
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		block := benchLiveBlockCacheBlock(next)
+		next++
+		if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
+			Block:     block,
+			BlockData: data,
+		}); err != nil {
+			b.Fatalf("publish live block: %v", err)
+		}
+		cache.MarkBlockFlushed(block)
+	}
+}

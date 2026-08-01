@@ -164,28 +164,12 @@ func (s *archiveScoutShared) acquire(ctx context.Context, peerID PeerID) (func()
 	}
 }
 
-func (s *archiveScoutShared) peerBlocked(peerID PeerID, now time.Time) bool {
-	return s.retry.peerBlocked(peerID, now)
-}
-
-func (s *archiveScoutShared) endpointBlocked(endpoint string, now time.Time) bool {
-	return s.retry.endpointBlocked(endpoint, now)
-}
-
-func (s *archiveScoutShared) rememberPeer(peerID PeerID, ttl time.Duration) {
-	s.retry.rememberPeer(peerID, time.Now().Add(ttl))
+func (s *archiveScoutShared) rememberPeer(peerID PeerID) {
+	s.retry.rememberPeer(peerID, time.Now().Add(archivePeerUnreachableTTL))
 }
 
 func (s *archiveScoutShared) rememberEndpoint(endpoint string, ttl time.Duration) {
 	s.retry.rememberEndpoint(endpoint, time.Now().Add(ttl))
-}
-
-func (s *archiveScoutShared) clearPeer(peerID PeerID) {
-	s.retry.clearPeer(peerID)
-}
-
-func (s *archiveScoutShared) clearEndpoint(endpoint string) {
-	s.retry.clearEndpoint(endpoint)
 }
 
 func (c *archivePeerRetryCache) begin(peerID PeerID, now time.Time) bool {
@@ -360,7 +344,7 @@ func (p *archivePeerPool) offerArchiveNode(node overlay.Node) archivePeerOfferSt
 }
 
 func (p *archivePeerPool) offerArchiveLivePeer(peer *overlayPeer) archivePeerOfferStatus {
-	if peer == nil || peer.id.IsZero() || peer.addr == "" || len(peer.pub) != ed25519.PublicKeySize {
+	if peer.id.IsZero() || peer.addr == "" || len(peer.pub) != ed25519.PublicKeySize {
 		return archivePeerOfferInvalid
 	}
 	node := peer.advertisedNodeSnapshot(time.Now())
@@ -375,7 +359,7 @@ func (p *archivePeerPool) offerArchiveLivePeer(peer *overlayPeer) archivePeerOff
 
 func (p *archivePeerPool) offerArchiveIdentity(node *overlay.Node, identity overlayNodeIdentity, endpoint string) archivePeerOfferStatus {
 	now := time.Now()
-	if p.scout.peerBlocked(identity.peerID, now) {
+	if p.scout.retry.peerBlocked(identity.peerID, now) {
 		return archivePeerOfferBackoff
 	}
 
@@ -391,7 +375,7 @@ func (p *archivePeerPool) offerArchiveIdentity(node *overlay.Node, identity over
 		if entry != nil {
 			peer = entry.peer
 		}
-		relayDue := p.sub.spec.RandomPeers && peer == nil && !now.Before(p.randomExpandedUntil[identity.peerID])
+		relayDue := p.sub.spec.usesV1PeerGossip() && peer == nil && !now.Before(p.randomExpandedUntil[identity.peerID])
 		if !relayDue {
 			p.mx.Unlock()
 			if peer != nil {
@@ -441,7 +425,7 @@ func (p *archivePeerPool) offerArchiveValuable(valuable archiveValuablePeer) arc
 		return archivePeerOfferInvalid
 	}
 
-	p.scout.clearPeer(valuable.peerID)
+	p.scout.retry.clearPeer(valuable.peerID)
 	p.mx.Lock()
 	if p.closed || p.peers[valuable.peerID] != nil || len(p.demands) == 0 {
 		p.mx.Unlock()
@@ -526,7 +510,7 @@ func (p *archivePeerPool) scoutExistingArchivePeer(peer *overlayPeer) {
 		return
 	}
 
-	release, ok := p.acquireQuery(peer)
+	release, ok := p.acquire(peer)
 	if !ok {
 		return
 	}
@@ -558,34 +542,34 @@ func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 	endpoint := offer.endpoint
 	if endpoint == "" {
 		addressCtx, cancel := context.WithTimeout(p.ctx, archiveDHTAddressTimeout)
-		addrList, _, err := findPeerAddresses(addressCtx, p.sub.node.dht, offer.identity.peerID[:])
+		addrList, _, err := p.sub.node.resolvePeerAddresses(addressCtx, offer.identity.peerID)
 		cancel()
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
-				p.scout.rememberPeer(offer.identity.peerID, archivePeerUnreachableTTL)
+				p.scout.rememberPeer(offer.identity.peerID)
 				p.scoutStats.transportFailure.Add(1)
 			}
 			return
 		}
 		if len(addrList.Addresses) == 0 {
-			p.scout.rememberPeer(offer.identity.peerID, archivePeerUnreachableTTL)
+			p.scout.rememberPeer(offer.identity.peerID)
 			p.scoutStats.transportFailure.Add(1)
 			return
 		}
 
 		// A PeerID has one canonical endpoint. Do not spend discovery time trying
 		// alternate addresses for the same transport identity.
-		endpoint, err = firstPeerEndpoint(addrList.Addresses)
+		endpoint, err = firstADNLEndpoint(addrList.Addresses)
 		if err != nil {
-			p.scout.rememberPeer(offer.identity.peerID, archivePeerUnreachableTTL)
+			p.scout.rememberPeer(offer.identity.peerID)
 			p.scoutStats.transportFailure.Add(1)
 			return
 		}
 	}
 
 	probes := p.probeSnapshots(4)
-	if p.scout.endpointBlocked(endpoint, time.Now()) {
-		p.scout.rememberPeer(offer.identity.peerID, archivePeerUnreachableTTL)
+	if p.scout.retry.endpointBlocked(endpoint, time.Now()) {
+		p.scout.rememberPeer(offer.identity.peerID)
 		p.scoutStats.transportFailure.Add(1)
 		return
 	}
@@ -597,7 +581,7 @@ func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 			return
 		}
 		p.scout.rememberEndpoint(endpoint, archivePeerUnreachableTTL)
-		p.scout.rememberPeer(offer.identity.peerID, archivePeerUnreachableTTL)
+		p.scout.rememberPeer(offer.identity.peerID)
 		p.scoutStats.transportFailure.Add(1)
 		return
 	}
@@ -606,7 +590,15 @@ func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 	if offer.hasNode && !offer.valuable {
 		announced = &offer.node
 	}
-	peer := p.sub.newOverlayPeer(pooled, announced, false, p.sub.spec.Kind != overlayKindCustomFixed)
+	peer, err := p.sub.newOverlayPeer(pooled, announced, false)
+	if err != nil {
+		p.log.Debug().
+			Err(err).
+			Str("peer", endpoint).
+			Msg("failed to attach transient archive peer to overlay")
+		releaseEndpoint()
+		return
+	}
 	peer.addr = endpoint
 	admitted := p.scoutConnectedTransientArchivePeer(peer, probes, offer.valuable)
 	if !admitted {
@@ -636,11 +628,11 @@ func (p *archivePeerPool) scoutConnectedTransientArchivePeer(peer *overlayPeer, 
 
 		p.scoutStats.transportFailure.Add(1)
 		if reachable {
-			p.rememberTransportBlocked(peer.id, archivePeerUnreachableTTL)
+			p.rememberTransportBlocked(peer.id)
 			return
 		}
 		p.scout.rememberEndpoint(peer.addr, archivePeerUnreachableTTL)
-		p.scout.rememberPeer(peer.id, archivePeerUnreachableTTL)
+		p.scout.rememberPeer(peer.id)
 	}()
 	if p.transportBlocked(peer.id, time.Now()) {
 		return false
@@ -670,7 +662,7 @@ func (p *archivePeerPool) scoutConnectedTransientArchivePeer(peer *overlayPeer, 
 			break
 		}
 
-		p.scout.clearEndpoint(peer.addr)
+		p.scout.retry.clearEndpoint(peer.addr)
 		waitRandomPeers()
 		admission := p.admitArchiveOnlyPeer(peer, result)
 		if admission.evicted != nil {
@@ -701,7 +693,7 @@ func (p *archivePeerPool) scoutConnectedTransientArchivePeer(peer *overlayPeer, 
 }
 
 func (p *archivePeerPool) exchangeTransientRandomPeers(ctx context.Context, peer *overlayPeer) bool {
-	if !p.sub.isActive() || !p.sub.spec.RandomPeers || peer.overlay == nil {
+	if !p.sub.isActive() || !p.sub.spec.usesV1PeerGossip() {
 		return false
 	}
 
@@ -904,7 +896,7 @@ func (p *archivePeerPool) applyArchivePeerEvidence(peer *overlayPeer, result arc
 
 	p.noteArchivePeerEvidence(peer, result)
 	if result.evidence == archivePeerEvidenceProven {
-		p.scout.clearPeer(peerID)
+		p.scout.retry.clearPeer(peerID)
 	}
 	return true
 }
@@ -924,7 +916,7 @@ func (p *archivePeerPool) noteScoutFailure(probe archivePeerProbe, peer *overlay
 		p.recordDemandNoBenefit(probe, peer.id, archivePeerNoBenefitTTL)
 	} else {
 		p.scoutStats.transportFailure.Add(1)
-		p.rememberTransportBlocked(peer.id, archivePeerUnreachableTTL)
+		p.rememberTransportBlocked(peer.id)
 	}
 	verdict := p.noteFailure(probe.shard, peer, archivePeerRejectCandidateFailed)
 	if verdict.useless {
@@ -933,7 +925,7 @@ func (p *archivePeerPool) noteScoutFailure(probe archivePeerProbe, peer *overlay
 }
 
 func (p *archivePeerPool) admitArchiveOnlyPeer(peer *overlayPeer, result archivePeerProbeResult) archivePeerAdmissionResult {
-	if peer == nil || peer.id.IsZero() || !peer.hasOpenConnection() || result.evidence == archivePeerEvidenceUnknown {
+	if peer.id.IsZero() || !peer.hasOpenConnection() || result.evidence == archivePeerEvidenceUnknown {
 		return archivePeerAdmissionResult{}
 	}
 
@@ -943,6 +935,7 @@ func (p *archivePeerPool) admitArchiveOnlyPeer(peer *overlayPeer, result archive
 	}
 	entry := &archivePeer{
 		peer:    peer,
+		owned:   true,
 		addedAt: now,
 	}
 
@@ -976,8 +969,7 @@ func (p *archivePeerPool) admitArchiveOnlyPeer(peer *overlayPeer, result archive
 			return archivePeerAdmissionResult{}
 		}
 		evictedValuable = p.provenPeerLocked(evictID)
-		evicted = p.removePeerLocked(evictID)
-		replaced = evicted != nil
+		evicted, replaced = p.removePeerLocked(evictID)
 		if replaced {
 			evictedID = evictID
 			if evictedValuable {
@@ -1016,7 +1008,7 @@ func (p *archivePeerPool) admitArchiveOnlyPeer(peer *overlayPeer, result archive
 	freshProven := p.provenUsableSizeLocked(now)
 	p.mx.Unlock()
 
-	p.scout.clearPeer(peer.id)
+	p.scout.retry.clearPeer(peer.id)
 	return archivePeerAdmissionResult{
 		admitted:    true,
 		replaced:    replaced,
@@ -1097,7 +1089,7 @@ func (p *archivePeerPool) archivePeerByAddressLocked(addr string) *archivePeer {
 	return nil
 }
 
-func (p *archivePeerPool) archivePeerEvictionCandidateLocked(now time.Time) (PeerID, *archivePeer) {
+func (p *archivePeerPool) archivePeerEvictionCandidateLocked() (PeerID, *archivePeer) {
 	var worstID PeerID
 	var worst *archivePeer
 	for peerID, entry := range p.peers {
@@ -1201,10 +1193,6 @@ func (p *archivePeerPool) archivePeerShouldReplaceLocked(worstID PeerID, worst *
 
 func (p *archivePeerPool) logArchivePeerAdmission(peer *overlayPeer, result archivePeerProbeResult, admission archivePeerAdmissionResult) {
 	event := p.log.Debug()
-	importantRosterSize := admission.freshProven <= 1 || admission.roster == archivePeerRosterLimit
-	if admission.replaced || importantRosterSize {
-		event = p.log.Info()
-	}
 	event.
 		Str("peer", peer.addr).
 		Str("peer_id", peer.id.String()).

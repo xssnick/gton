@@ -18,15 +18,15 @@ func BenchmarkRememberCompressedBlockStateRefresh(b *testing.B) {
 		}
 	}
 
-	service := &Service{}
+	service := newCompressedStateCacheTestService()
 	for i := range states {
-		service.rememberCompressedBlockState(&states[i])
+		service.RememberCompressedBlockState(&states[i])
 	}
 
 	index := 0
 	b.ReportAllocs()
 	for b.Loop() {
-		service.rememberCompressedBlockState(&states[index])
+		service.RememberCompressedBlockState(&states[index])
 		index++
 		if index == len(states) {
 			index = 0
@@ -44,7 +44,7 @@ func BenchmarkRememberMasterStateCacheEviction(b *testing.B) {
 		}
 	}
 
-	service := &Service{}
+	service := newMasterStateCacheTestService(b)
 	for i := 0; i < masterStateCacheLimit; i++ {
 		service.rememberMasterState(b.Context(), &states[i], nil, nil)
 	}

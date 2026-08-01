@@ -117,15 +117,15 @@ func (s *Store) storePrewrittenArtifactWritesLocked(entries []storage.StateCheck
 // takePrewrittenArtifactWrite consumes the streamed append result for the
 // entry when the staged artifact still matches what was appended. Callers must
 // hold artifactPublishMu.
-func (s *Store) takePrewrittenArtifactWrite(entry storage.StateCheckpointBlock) (checkpointArtifactWrite, bool) {
+func (s *Store) takePrewrittenArtifactWrite(entry storage.StateCheckpointBlock) (checkpointArtifactWrite, error) {
 	artifact := entry.Artifact
 	if artifact == nil || len(s.prewrittenArtifacts) == 0 {
-		return checkpointArtifactWrite{}, false
+		return checkpointArtifactWrite{}, storage.ErrNotFound
 	}
 	key := storage.BlockKey(artifact.ID)
 	record, ok := s.prewrittenArtifacts[key]
 	if !ok {
-		return checkpointArtifactWrite{}, false
+		return checkpointArtifactWrite{}, storage.ErrNotFound
 	}
 	delete(s.prewrittenArtifacts, key)
 	if record.blockSize != len(artifact.Block) ||
@@ -134,9 +134,9 @@ func (s *Store) takePrewrittenArtifactWrite(entry storage.StateCheckpointBlock) 
 		record.splitDepth != artifact.ArchiveShardSplitDepth {
 		// The staged artifact was replaced after the prewrite. The appended copy
 		// stays as an unreferenced pack entry; append the current one inline.
-		return checkpointArtifactWrite{}, false
+		return checkpointArtifactWrite{}, storage.ErrNotFound
 	}
-	return record.write, true
+	return record.write, nil
 }
 
 // claimPrewrittenPackRegs seeds claims with the staged, not-yet-committed pack

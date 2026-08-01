@@ -57,10 +57,10 @@ func (s *Server) handleEstimateFee(ctx context.Context, params requestParams) (a
 	}
 
 	ignoreChkSig := true
-	if value, ok, apiErr := params.optionalBool("ignore_chksig"); apiErr != nil {
-		return nil, apiErr
-	} else if ok {
+	if value, err := params.optionalBool("ignore_chksig"); err == nil {
 		ignoreChkSig = value
+	} else if !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
 
 	info, apiErr := s.runMethodAccount(ctx, addr, nil)
@@ -117,14 +117,29 @@ func (s *Server) handleEstimateFee(ctx context.Context, params requestParams) (a
 	if err != nil {
 		return nil, internalError("cannot estimate fee: " + err.Error())
 	}
-	if res != nil && res.TransactionCell != nil {
-		tx, err := res.ParseTransaction()
+
+	result, apiErr := estimateFeeResult(sourceFees, res)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	return result, nil
+}
+
+func estimateFeeResult(sourceFees fees, result *tvm.TransactionExecutionResult) (queryFees, *apiError) {
+	// ton-http-api treats a rejected external message as a successful fee
+	// estimate: import and storage fees are still returned, while gas and
+	// outbound forwarding fees stay zero.
+	if result.Accepted {
+		tx, err := result.ParseTransaction()
 		if err != nil {
-			return nil, internalError("cannot parse emulated transaction: " + err.Error())
+			return queryFees{}, internalError("cannot parse emulated transaction: " + err.Error())
 		}
+
+		var apiErr *apiError
 		sourceFees, apiErr = estimateFeesFromTransaction(sourceFees, tx)
 		if apiErr != nil {
-			return nil, apiErr
+			return queryFees{}, apiErr
 		}
 	}
 
@@ -136,12 +151,12 @@ func (s *Server) handleEstimateFee(ctx context.Context, params requestParams) (a
 }
 
 func estimateFeeStateInit(params requestParams) (*tlb.StateInit, *apiError) {
-	code, hasCode, apiErr := optionalBOCCell(params, "init_code")
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	if !hasCode {
+	code, err := optionalBOCCell(params, "init_code")
+	if errors.Is(err, errRequestParamNotFound) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, asAPIError(err)
 	}
 
 	data, apiErr := requiredBOCCell(params, "init_data")
@@ -273,16 +288,16 @@ func requiredBOCCell(params requestParams, field string) (*cell.Cell, *apiError)
 	return parseBOCCellParam(raw, field)
 }
 
-func optionalBOCCell(params requestParams, field string) (*cell.Cell, bool, *apiError) {
-	raw, ok, apiErr := params.optionalNonEmptyString(field)
-	if apiErr != nil || !ok {
-		return nil, ok, apiErr
+func optionalBOCCell(params requestParams, field string) (*cell.Cell, error) {
+	raw, err := params.optionalNonEmptyString(field)
+	if err != nil {
+		return nil, err
 	}
 	root, apiErr := parseBOCCellParam(raw, field)
 	if apiErr != nil {
-		return nil, false, apiErr
+		return nil, apiErr
 	}
-	return root, true, nil
+	return root, nil
 }
 
 func parseBOCCellParam(raw string, field string) (*cell.Cell, *apiError) {
@@ -300,34 +315,23 @@ func parseBOCCellParam(raw string, field string) (*cell.Cell, *apiError) {
 }
 
 func estimateFeeMessageTailUsage(root *cell.Cell) (messageUsage, error) {
-	usage, rootBits, rootSeen, err := estimateFeeMessageUsage(root)
+	usage, rootBits, err := estimateFeeMessageUsage(root)
 	if err != nil {
 		return messageUsage{}, err
 	}
-	if root == nil || !rootSeen || usage.cells == 0 {
-		return messageUsage{}, nil
-	}
 
 	usage.cells--
-	if usage.bits >= rootBits {
-		usage.bits -= rootBits
-	} else {
-		usage.bits = 0
-	}
+	usage.bits -= rootBits
 	return usage, nil
 }
 
-func estimateFeeMessageUsage(root *cell.Cell) (messageUsage, uint64, bool, error) {
+func estimateFeeMessageUsage(root *cell.Cell) (messageUsage, uint64, error) {
 	seen := map[cell.Hash]struct{}{}
 	var usage messageUsage
 	var rootBits uint64
-	rootSeen := false
 
 	var walk func(*cell.Cell, bool) error
 	walk = func(current *cell.Cell, isRoot bool) error {
-		if current == nil {
-			return nil
-		}
 		slice, err := current.BeginParseWithoutTrace()
 		if err != nil {
 			return err
@@ -343,9 +347,6 @@ func estimateFeeMessageUsage(root *cell.Cell) (messageUsage, uint64, bool, error
 		seen[key] = struct{}{}
 		usage.cells++
 		usage.bits += uint64(loaded.BitsSize())
-		if isRoot {
-			rootSeen = true
-		}
 
 		for slice.RefsNum() > 0 {
 			ref, err := slice.LoadRefCell()
@@ -359,9 +360,9 @@ func estimateFeeMessageUsage(root *cell.Cell) (messageUsage, uint64, bool, error
 		return nil
 	}
 	if err := walk(root, true); err != nil {
-		return messageUsage{}, 0, false, err
+		return messageUsage{}, 0, err
 	}
-	return usage, rootBits, rootSeen, nil
+	return usage, rootBits, nil
 }
 
 func int64FromBig(value *big.Int) (int64, bool) {

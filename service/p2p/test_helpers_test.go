@@ -9,14 +9,16 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 func discardLogger() zerolog.Logger {
-	return logutil.Discard()
+	return zerolog.Nop()
 }
 
 func stdoutLogger(level zerolog.Level) zerolog.Logger {
@@ -40,12 +42,34 @@ func newTestNode(tb testing.TB) *Node {
 	if err != nil {
 		tb.Fatalf("create test node: %v", err)
 	}
+	tb.Cleanup(node.closeSubscriptions)
 	return node
 }
 
 func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
 	if sub.node == nil {
 		sub.node = &Node{}
+	}
+	if sub.quicEnvelope == nil && len(sub.spec.ShortID) == PeerIDSize {
+		envelope, err := newQUICOverlayEnvelope(sub.spec.ShortID, nil)
+		if err != nil {
+			panic(err)
+		}
+		sub.quicEnvelope = envelope
+	}
+	for _, peer := range sub.peers {
+		if peer.route == nil {
+			peer.route = newPeerRoute("")
+		}
+		if peer.overlay == nil {
+			peer.overlay = &overlay.ADNLOverlayWrapper{}
+		}
+		if peer.broadcastPeer == nil {
+			peer.broadcastPeer = peer.overlay
+		}
+		if peer.release == nil {
+			peer.release = func() {}
+		}
 	}
 	if sub.node.runCtx == nil {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -55,8 +79,60 @@ func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
 	if sub.node.pool == nil {
 		sub.node.pool = &peerPool{peers: map[PeerID]*pooledPeer{}}
 	}
+	if sub.peerNotify == nil {
+		sub.peerNotify = make(chan struct{}, 1)
+	}
+	if sub.broadcastReceiver == nil {
+		if len(sub.spec.ShortID) != PeerIDSize {
+			overlayID := testPeerID("test-subscription-overlay:" + string(sub.spec.ShortID))
+			sub.spec.ShortID = overlayID[:]
+		}
+		receiver, err := overlay.NewBroadcastReceiver(
+			sub.spec.ShortID,
+			maxOverlayPayloadSize,
+			sub.spec.Kind != overlayKindCustomFixed,
+			false,
+		)
+		if err != nil {
+			panic(err)
+		}
+		sub.broadcastReceiver = receiver
+	}
 
 	return sub
+}
+
+func mustGetOrCreateSubscription(tb testing.TB, node *Node, spec overlaySpec) *overlaySubscription {
+	tb.Helper()
+
+	sub, err := node.getOrCreateSubscription(spec)
+	if err != nil {
+		tb.Fatalf("create test overlay subscription: %v", err)
+	}
+	return sub
+}
+
+func ensureTestBroadcastReceiver(tb testing.TB, sub *overlaySubscription) {
+	tb.Helper()
+	if sub.broadcastReceiver != nil {
+		return
+	}
+
+	if len(sub.spec.ShortID) != PeerIDSize {
+		overlayID := testPeerID("test-subscription-overlay:" + string(sub.spec.ShortID))
+		sub.spec.ShortID = overlayID[:]
+	}
+	receiver, err := overlay.NewBroadcastReceiver(
+		sub.spec.ShortID,
+		maxOverlayPayloadSize,
+		sub.spec.Kind != overlayKindCustomFixed,
+		false,
+	)
+	if err != nil {
+		tb.Fatalf("create test broadcast receiver: %v", err)
+	}
+	sub.broadcastReceiver = receiver
+	tb.Cleanup(receiver.Close)
 }
 
 func (s *overlaySubscription) inactiveExpiresAt() (time.Time, bool) {
@@ -67,6 +143,80 @@ func (s *overlaySubscription) inactiveExpiresAt() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return s.inactiveDeleteAt, true
+}
+
+func (p *peerPool) snapshot() []*pooledPeer {
+	p.mx.RLock()
+	defer p.mx.RUnlock()
+
+	list := make([]*pooledPeer, 0, len(p.peers))
+	for _, peer := range p.peers {
+		list = append(list, peer)
+	}
+	return list
+}
+
+func (p *archivePeerPool) peerPerformance(shard archive.ShardID, peerID PeerID) (archivePeerPerformance, bool) {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	entry := p.peers[peerID]
+	if entry == nil {
+		return archivePeerPerformance{}, false
+	}
+	return archivePeerPerformanceFromState(p.shards[archivePeerPoolKey(shard)], peerID), true
+}
+
+func (p *archivePeerPool) rememberRejected(peerID PeerID, ttl time.Duration) {
+	p.mx.Lock()
+	if !p.closed {
+		p.rememberRejectedLocked(peerID, time.Now(), ttl)
+	}
+	p.mx.Unlock()
+}
+
+func (p *archivePeerPool) size() int {
+	p.pruneClosedPeers()
+
+	p.mx.Lock()
+	defer p.mx.Unlock()
+	return len(p.peers)
+}
+
+func (p *archivePeerPool) usableSize(now time.Time) int {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if p.closed {
+		return 0
+	}
+
+	count := 0
+	for _, entry := range p.peers {
+		if archivePeerUsable(entry, now) {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *archivePeerPool) provenUsableSize(now time.Time) int {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	return p.provenUsableSizeLocked(now)
+}
+
+func (p *archivePeerPool) probeSnapshot() (archivePeerProbe, bool) {
+	probes := p.probeSnapshots(1)
+	if len(probes) == 0 {
+		return archivePeerProbe{}, false
+	}
+	return probes[0], true
+}
+
+func (a *ArchiveSession) selectArchivePeer(shard archive.ShardID, peer *overlayPeer) {
+	a.selectArchivePeerFromPool(shard, peer, nil)
 }
 
 func (s *overlaySubscription) aliveNeighbourPeers(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {

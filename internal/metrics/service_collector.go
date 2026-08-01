@@ -47,6 +47,8 @@ type serviceCollector struct {
 	p2pFECEvicted       *prometheus.Desc
 	p2pFECCompleted     *prometheus.Desc
 	p2pFECDeliveredHits *prometheus.Desc
+	p2pPlumtreeParts    *prometheus.Desc
+	p2pPlumtreeMessages *prometheus.Desc
 
 	blocksyncQueueItems    *prometheus.Desc
 	blocksyncQueueCapacity *prometheus.Desc
@@ -89,19 +91,19 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		syncRecentTPS: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "sync", "recent_tps"),
-			"Recent local TPS over the service status window.",
+			"Average live applied-block TPS over the last 10 seconds by block generation time.",
 			nil,
 			nil,
 		),
 		syncRecentTx: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "sync", "recent_transactions"),
-			"Recent local transaction count over the service status window.",
+			"Live applied-block transactions in the last 10 seconds by block generation time.",
 			nil,
 			nil,
 		),
 		syncRecentComplete: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "sync", "recent_tps_complete"),
-			"Whether the recent TPS status window was fully available.",
+			"Whether the 10-second live applied-block TPS window was fully observed.",
 			nil,
 			nil,
 		),
@@ -155,8 +157,8 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		p2pBroadcasts: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "broadcasts_total"),
-			"Total P2P broadcasts accepted or successfully sent through the app-level rebroadcast queue by type.",
-			[]string{"direction", "overlay", "kind"},
+			"Total P2P broadcasts received, accepted, or successfully sent through the app-level rebroadcast queue by type and delivery mode.",
+			[]string{"direction", "overlay", "kind", "delivery"},
 			nil,
 		),
 		p2pBroadcastDrops: prometheus.NewDesc(
@@ -231,6 +233,18 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 			[]string{"overlay"},
 			nil,
 		),
+		p2pPlumtreeParts: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "plumtree_fec_parts_received_total"),
+			"Total verified Plumtree FEC parts accepted from direct push or repair recovery.",
+			[]string{"overlay", "source"},
+			nil,
+		),
+		p2pPlumtreeMessages: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "p2p", "plumtree_messages_received_total"),
+			"Total parsed inbound Plumtree messages by protocol type.",
+			[]string{"overlay", "type"},
+			nil,
+		),
 		blocksyncQueueItems: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "blocksync", "queue_items"),
 			"Current block sync queue length.",
@@ -288,6 +302,8 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.p2pFECEvicted
 	ch <- c.p2pFECCompleted
 	ch <- c.p2pFECDeliveredHits
+	ch <- c.p2pPlumtreeParts
+	ch <- c.p2pPlumtreeMessages
 	ch <- c.blocksyncQueueItems
 	ch <- c.blocksyncQueueCapacity
 	ch <- c.blocksyncQueueDropped
@@ -295,7 +311,7 @@ func (c *serviceCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *serviceCollector) Collect(ch chan<- prometheus.Metric) {
-	snapshot := c.metrics.serviceStatus()
+	snapshot := c.metrics.serviceStatusReader()
 
 	now := time.Now()
 	c.collectSync(ch, snapshot, now)
@@ -321,12 +337,12 @@ func (c *serviceCollector) collectSync(ch chan<- prometheus.Metric, snapshot ser
 		}
 	}
 
-	if snapshot.RecentTPS.WindowMasters > 0 {
-		ch <- prometheus.MustNewConstMetric(c.syncRecentTPS, prometheus.GaugeValue, snapshot.RecentTPS.TPS)
-		ch <- prometheus.MustNewConstMetric(c.syncRecentTx, prometheus.GaugeValue, float64(snapshot.RecentTPS.Transactions))
+	if snapshot.RecentTPS.DurationSeconds > 0 {
 		complete := 0.0
 		if snapshot.RecentTPS.Complete {
 			complete = 1
+			ch <- prometheus.MustNewConstMetric(c.syncRecentTPS, prometheus.GaugeValue, snapshot.RecentTPS.TPS)
+			ch <- prometheus.MustNewConstMetric(c.syncRecentTx, prometheus.GaugeValue, float64(snapshot.RecentTPS.Transactions))
 		}
 		ch <- prometheus.MustNewConstMetric(c.syncRecentComplete, prometheus.GaugeValue, complete)
 	}
@@ -399,10 +415,30 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 	}
 
 	for _, broadcast := range snapshot.Broadcasts {
-		ch <- prometheus.MustNewConstMetric(c.p2pBroadcasts, prometheus.CounterValue, float64(broadcast.Count), broadcast.Direction, broadcast.Overlay, broadcast.Kind)
+		ch <- prometheus.MustNewConstMetric(
+			c.p2pBroadcasts,
+			prometheus.CounterValue,
+			float64(broadcast.Count),
+			broadcast.Direction,
+			broadcast.Overlay,
+			broadcast.Kind,
+			string(broadcast.Delivery),
+		)
 	}
 	for _, drop := range snapshot.BroadcastDrops {
 		ch <- prometheus.MustNewConstMetric(c.p2pBroadcastDrops, prometheus.CounterValue, float64(drop.Count), drop.Overlay, drop.Kind, drop.Reason)
+	}
+
+	for _, plumtree := range snapshot.Plumtree {
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeParts, prometheus.CounterValue, float64(plumtree.DirectParts), plumtree.Overlay, "direct")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeParts, prometheus.CounterValue, float64(plumtree.RecoveryParts), plumtree.Overlay, "recovery")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.SimpleMessages), plumtree.Overlay, "simple")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.FECMessages), plumtree.Overlay, "fec")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.IHaveMessages), plumtree.Overlay, "ihave")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.PruneMessages), plumtree.Overlay, "prune")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.UsefulMessages), plumtree.Overlay, "useful")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.StatsPushMessages), plumtree.Overlay, "stats_push")
+		ch <- prometheus.MustNewConstMetric(c.p2pPlumtreeMessages, prometheus.CounterValue, float64(plumtree.RepairQueryMessages), plumtree.Overlay, "repair_query")
 	}
 }
 

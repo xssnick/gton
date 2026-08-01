@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ type shardBlockCandidateCache struct {
 
 	candidates map[tnstore.BlockRootHash]shardBlockCandidateEntry
 	proofs     map[tnstore.BlockRootHash]shardDescriptionProofEntry
+	assembled  map[tnstore.BlockRootHash]shardBlockAssembledEntry
 	bytes      int64
 }
 
@@ -63,6 +65,12 @@ type shardDescriptionProofEntry struct {
 	bytes      int64
 }
 
+type shardBlockAssembledEntry struct {
+	receivedAt time.Time
+	expiresAt  time.Time
+	bytes      int64
+}
+
 func newShardBlockCandidateCache(ttl time.Duration, maxBytes int64, maxItems int) *shardBlockCandidateCache {
 	return &shardBlockCandidateCache{
 		ttl:        ttl,
@@ -70,13 +78,11 @@ func newShardBlockCandidateCache(ttl time.Duration, maxBytes int64, maxItems int
 		maxItems:   maxItems,
 		candidates: map[tnstore.BlockRootHash]shardBlockCandidateEntry{},
 		proofs:     map[tnstore.BlockRootHash]shardDescriptionProofEntry{},
+		assembled:  map[tnstore.BlockRootHash]shardBlockAssembledEntry{},
 	}
 }
 
 func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, now time.Time) ([]DownloadedBlock, error) {
-	if err := validateShardBlockCandidate(downloaded); err != nil {
-		return nil, err
-	}
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return nil, fmt.Errorf("shard block candidate cache is disabled")
 	}
@@ -89,13 +95,16 @@ func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, no
 		bytes:      shardBlockCandidateBytes(downloaded),
 	}
 	if entry.bytes > c.maxBytes {
-		return nil, fmt.Errorf("block candidate %s is too large for shard block candidate cache: %d > %d", formatBlockRef(downloaded.ID), entry.bytes, c.maxBytes)
+		return nil, fmt.Errorf("block candidate %s is too large for shard block candidate cache: %d > %d", tnstore.FormatBlockRef(downloaded.ID), entry.bytes, c.maxBytes)
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.pruneExpiredLocked(now)
+	if _, ok := c.assembled[key]; ok {
+		return nil, nil
+	}
 	if old, ok := c.candidates[key]; ok {
 		c.bytes -= old.bytes
 	}
@@ -112,6 +121,7 @@ func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, no
 		c.pruneOverflowLocked()
 		return nil, err
 	}
+	c.rememberAssemblyLocked(key, now)
 	c.pruneOverflowLocked()
 	return assembled, nil
 }
@@ -138,7 +148,7 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 			bytes:      shardDescriptionProofBytes(proof),
 		}
 		if entry.bytes > c.maxBytes {
-			return nil, fmt.Errorf("shard description proof %s is too large for shard block candidate cache: %d > %d", formatBlockRef(proof.Block), entry.bytes, c.maxBytes)
+			return nil, fmt.Errorf("shard description proof %s is too large for shard block candidate cache: %d > %d", tnstore.FormatBlockRef(proof.Block), entry.bytes, c.maxBytes)
 		}
 		entries = append(entries, entry)
 	}
@@ -150,6 +160,9 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 	assembled := make([]DownloadedBlock, 0, len(entries))
 	for _, entry := range entries {
 		key := tnstore.BlockKey(entry.block)
+		if _, ok := c.assembled[key]; ok {
+			continue
+		}
 		if old, ok := c.proofs[key]; ok {
 			c.bytes -= old.bytes
 		}
@@ -157,33 +170,65 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 		c.bytes += entry.bytes
 	}
 
+	// One unusable link must not discard the rest of the chain: rememberAssembly
+	// already released the payloads of everything assembled above, so abandoning
+	// the batch here would strand those blocks behind their own marker.
+	var errs error
 	for _, entry := range entries {
 		key := tnstore.BlockKey(entry.block)
+		if _, ok := c.assembled[key]; ok {
+			continue
+		}
 		candidate, ok := c.candidates[key]
 		if !ok || !candidate.expiresAt.After(now) {
 			continue
 		}
 		blocks, err := c.assembleLocked(candidate, entry)
 		if err != nil {
-			c.pruneOverflowLocked()
-			return nil, err
+			errs = errors.Join(errs, err)
+			continue
 		}
 		assembled = append(assembled, blocks...)
+		c.rememberAssemblyLocked(key, now)
 	}
 	c.pruneOverflowLocked()
-	return assembled, nil
+	return assembled, errs
 }
 
 func (c *shardBlockCandidateCache) assembleLocked(candidate shardBlockCandidateEntry, proof shardDescriptionProofEntry) ([]DownloadedBlock, error) {
 	if !candidate.block.id.Equals(&proof.block) {
-		return nil, fmt.Errorf("shard candidate %s proof belongs to %s", formatBlockRef(candidate.block.id), formatBlockRef(proof.block))
+		return nil, fmt.Errorf("shard candidate %s proof belongs to %s", tnstore.FormatBlockRef(candidate.block.id), tnstore.FormatBlockRef(proof.block))
 	}
-	if err := blockproof.CheckProofShape(proof.block, proof.proof, true); err != nil {
-		return nil, err
-	}
+	// The proof shape is not re-checked here: c.proofs is only ever populated by
+	// StoreProofs, which runs validateShardDescriptionProof (the same
+	// CheckProofShape call) on every entry before it reaches the map.
 
 	block := candidate.block.downloaded(proof)
 	return []DownloadedBlock{block}, nil
+}
+
+func (c *shardBlockCandidateCache) rememberAssemblyLocked(key tnstore.BlockRootHash, now time.Time) {
+	// The returned DownloadedBlock keeps the pair alive for its immediate caller;
+	// the cache only needs a small marker to suppress duplicate assembly afterward.
+	if candidate, ok := c.candidates[key]; ok {
+		delete(c.candidates, key)
+		c.bytes -= candidate.bytes
+	}
+	if proof, ok := c.proofs[key]; ok {
+		delete(c.proofs, key)
+		c.bytes -= proof.bytes
+	}
+	if assembled, ok := c.assembled[key]; ok {
+		c.bytes -= assembled.bytes
+	}
+
+	assembled := shardBlockAssembledEntry{
+		receivedAt: now,
+		expiresAt:  now.Add(c.ttl),
+		bytes:      shardBlockCandidateCacheOverhead,
+	}
+	c.assembled[key] = assembled
+	c.bytes += assembled.bytes
 }
 
 func (c *shardBlockCandidateCache) pruneExpiredLocked(now time.Time) {
@@ -201,10 +246,17 @@ func (c *shardBlockCandidateCache) pruneExpiredLocked(now time.Time) {
 		delete(c.proofs, key)
 		c.bytes -= entry.bytes
 	}
+	for key, entry := range c.assembled {
+		if entry.expiresAt.After(now) {
+			continue
+		}
+		delete(c.assembled, key)
+		c.bytes -= entry.bytes
+	}
 }
 
 func (c *shardBlockCandidateCache) pruneOverflowLocked() {
-	for len(c.candidates)+len(c.proofs) > c.maxItems || c.bytes > c.maxBytes {
+	for len(c.candidates)+len(c.proofs)+len(c.assembled) > c.maxItems || c.bytes > c.maxBytes {
 		var oldestKey tnstore.BlockRootHash
 		oldestKind := ""
 		var oldestAt time.Time
@@ -222,6 +274,13 @@ func (c *shardBlockCandidateCache) pruneOverflowLocked() {
 				oldestAt = entry.receivedAt
 			}
 		}
+		for key, entry := range c.assembled {
+			if oldestKind == "" || entry.receivedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestKind = "assembled"
+				oldestAt = entry.receivedAt
+			}
+		}
 		if oldestKind == "" {
 			return
 		}
@@ -234,41 +293,23 @@ func (c *shardBlockCandidateCache) pruneOverflowLocked() {
 			entry := c.proofs[oldestKey]
 			delete(c.proofs, oldestKey)
 			c.bytes -= entry.bytes
+		case "assembled":
+			entry := c.assembled[oldestKey]
+			delete(c.assembled, oldestKey)
+			c.bytes -= entry.bytes
 		}
 	}
 }
 
-func validateShardBlockCandidate(downloaded DownloadedBlock) error {
-	if isMasterchainBlock(downloaded.ID) {
-		return fmt.Errorf("masterchain block %s is not a shard candidate cache candidate", formatBlockRef(downloaded.ID))
-	}
-	if !downloaded.VerifiedRootHash {
-		return fmt.Errorf("block candidate %s is not hash verified", formatBlockRef(downloaded.ID))
-	}
-	if len(downloaded.BlockBOC) == 0 {
-		return fmt.Errorf("block candidate %s has empty block data", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Block == nil {
-		return fmt.Errorf("block candidate %s has no parsed block root", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.Meta == nil {
-		return fmt.Errorf("block candidate %s has no metadata", formatBlockRef(downloaded.ID))
-	}
-	if downloaded.StateUpdate == nil {
-		return fmt.Errorf("block candidate %s has no state update", formatBlockRef(downloaded.ID))
-	}
-	return nil
-}
-
 func validateShardDescriptionProof(proof ShardDescriptionProof) error {
 	if isMasterchainBlock(proof.Block) {
-		return fmt.Errorf("masterchain block %s is not a shard description proof candidate", formatBlockRef(proof.Block))
+		return fmt.Errorf("masterchain block %s is not a shard description proof candidate", tnstore.FormatBlockRef(proof.Block))
 	}
 	if proof.Proof == nil {
-		return fmt.Errorf("shard description proof %s has no parsed proof", formatBlockRef(proof.Block))
+		return fmt.Errorf("shard description proof %s has no parsed proof", tnstore.FormatBlockRef(proof.Block))
 	}
 	if len(proof.ProofBOC) == 0 {
-		return fmt.Errorf("shard description proof %s has empty proof data", formatBlockRef(proof.Block))
+		return fmt.Errorf("shard description proof %s has empty proof data", tnstore.FormatBlockRef(proof.Block))
 	}
 	if err := blockproof.CheckProofShape(proof.Block, proof.Proof, true); err != nil {
 		return err
@@ -314,7 +355,7 @@ func shardDescriptionProofBytes(proof ShardDescriptionProof) int64 {
 }
 
 func (n *Node) rememberShardBlockCandidate(downloaded *DownloadedBlock) {
-	if downloaded == nil || isMasterchainBlock(downloaded.ID) {
+	if isMasterchainBlock(downloaded.ID) {
 		return
 	}
 
@@ -322,7 +363,7 @@ func (n *Node) rememberShardBlockCandidate(downloaded *DownloadedBlock) {
 	if err != nil {
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(downloaded.ID)).
+			Str("block", tnstore.FormatBlockRef(downloaded.ID)).
 			Msg("failed to cache shard block candidate broadcast")
 		return
 	}
@@ -334,14 +375,15 @@ func (n *Node) RememberShardDescriptionProofs(proofs []ShardDescriptionProof) {
 		return
 	}
 
+	// A partial failure still hands back the links that did assemble; deliver
+	// them before logging, since their payloads are already released.
 	assembled, err := n.shardCandidateCache.StoreProofs(proofs, time.Now())
+	n.rememberAssembledShardCandidates(assembled)
 	if err != nil {
 		n.log.Debug().
 			Err(err).
 			Msg("failed to cache shard block description proofs")
-		return
 	}
-	n.rememberAssembledShardCandidates(assembled)
 }
 
 func (n *Node) rememberAssembledShardCandidates(blocks []DownloadedBlock) {

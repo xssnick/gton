@@ -21,7 +21,7 @@ func TestBroadcastValidatorCacheResetsByConfigRoot(t *testing.T) {
 	firstSet := &blockproof.PreparedValidatorSet{}
 	cache.put(firstKey, firstSet)
 
-	if set, ok := cache.get(firstKey); !ok || set != firstSet {
+	if set, err := cache.get(firstKey); err != nil || set != firstSet {
 		t.Fatal("expected broadcast validator cache hit before config root reset")
 	}
 
@@ -32,10 +32,10 @@ func TestBroadcastValidatorCacheResetsByConfigRoot(t *testing.T) {
 	secondSet := &blockproof.PreparedValidatorSet{}
 	cache.put(secondKey, secondSet)
 
-	if _, ok := cache.get(firstKey); ok {
+	if _, err := cache.get(firstKey); err == nil {
 		t.Fatal("expected broadcast validator cache miss after config root changed")
 	}
-	if set, ok := cache.get(secondKey); !ok || set != secondSet {
+	if set, err := cache.get(secondKey); err != nil || set != secondSet {
 		t.Fatal("expected broadcast validator cache hit for the new config root")
 	}
 }
@@ -60,10 +60,10 @@ func TestBroadcastValidatorCacheKeepsShardVariants(t *testing.T) {
 	cache.put(baseKey, baseSet)
 	cache.put(shardKey, shardSet)
 
-	if set, ok := cache.get(baseKey); !ok || set != baseSet {
+	if set, err := cache.get(baseKey); err != nil || set != baseSet {
 		t.Fatal("expected first shard validator set to stay cached")
 	}
-	if set, ok := cache.get(shardKey); !ok || set != shardSet {
+	if set, err := cache.get(shardKey); err != nil || set != shardSet {
 		t.Fatal("expected second shard validator set to stay cached")
 	}
 }
@@ -73,7 +73,7 @@ func TestBroadcastValidatorCacheRejectsStaleConfigPut(t *testing.T) {
 
 	oldBlock := testBlockID(-1, topShard, 10)
 	oldConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
-	if _, ok := cache.getConfig(); ok {
+	if _, err := cache.getConfig(); err == nil {
 		t.Fatal("empty broadcast validator config cache returned a hit")
 	}
 	cache.putConfig(oldBlock, oldConfig)
@@ -97,16 +97,16 @@ func TestBroadcastValidatorCacheRejectsStaleConfigPut(t *testing.T) {
 		t.Fatal("stale config put did not return the newer key-block config")
 	}
 
-	got, ok := cache.getConfig()
-	if !ok || got.rootHash != keyConfig.rootHash {
+	got, err := cache.getConfig()
+	if err != nil || got.rootHash != keyConfig.rootHash {
 		t.Fatal("stale config put replaced the newer key-block config")
 	}
-	if _, ok = cache.get(oldKey); ok {
+	if _, err = cache.get(oldKey); err == nil {
 		t.Fatal("old validator entries remained cached after the config root changed")
 	}
 
 	cache.put(oldKey, oldSet)
-	if _, ok = cache.get(oldKey); ok {
+	if _, err = cache.get(oldKey); err == nil {
 		t.Fatal("late validator set put restored an entry from the old config root")
 	}
 
@@ -119,7 +119,7 @@ func TestBroadcastValidatorCacheRejectsStaleConfigPut(t *testing.T) {
 	}
 	keyBlockSet := &blockproof.PreparedValidatorSet{}
 	cache.put(keyBlockKey, keyBlockSet)
-	if set, ok := cache.get(keyBlockKey); !ok || set != keyBlockSet {
+	if set, err := cache.get(keyBlockKey); err != nil || set != keyBlockSet {
 		t.Fatal("new key-block validator set was not cached")
 	}
 }

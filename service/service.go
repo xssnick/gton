@@ -60,8 +60,6 @@ const (
 	nextBlockBootstrapPaceMinDelay = 20 * time.Millisecond
 	nextBlockBootstrapPaceMaxGap   = 30 * time.Second
 	exactBlockDownloadProbePeers   = 4
-	exactBlockDownloadWaitLogDelay = time.Second
-	exactBlockDownloadWaitLogEvery = 2 * time.Second
 	chainBlockDownloadRetries      = 3
 	chainBlockDownloadRetryDelay   = 500 * time.Millisecond
 	nextMasterchainQueueLimit      = 64
@@ -72,7 +70,6 @@ const (
 	syncedBlockPriorityQueueLimit  = 64
 	syncedBlockMasterHotWorkers    = 2
 	syncedBlockMasterHotQueueLimit = 64
-	statusTPSMasterWindow          = 10
 )
 
 const (
@@ -88,6 +85,11 @@ var (
 	errShardDescriptionTooNew  = errors.New("shard block description is too far ahead of current state")
 )
 var errShardCatchUpNeedsSnapshot = errors.New("shard catch-up requires state snapshot")
+
+// errShardApplyMasterMissing guards the shard apply callbacks: they must never
+// fall back to the commit stage's current master, because the resolution they
+// serve can be started by the apply-ahead stage.
+var errShardApplyMasterMissing = errors.New("shard apply is missing its inclusion masterchain state")
 
 type shardBlockLoader func(context.Context, ton.BlockIDExt) (PreparedBlock, error)
 
@@ -158,6 +160,7 @@ type Service struct {
 	externalMessageChecker  *externalmsg.Checker
 	externalMessageHooks    *externalMessageHookRunner
 	blockReceivedHooks      *blockReceivedHookRunner
+	recentTPS               *recentTPSTracker
 
 	stateCellPrewrite *stateCellPrewriter
 	artifactPrewrite  *artifactPrewriter
@@ -178,14 +181,21 @@ type Service struct {
 
 	stateMu sync.Mutex
 
+	// currentStateWake is a close-and-replace broadcast (the rawMasterchainNotify
+	// pattern): at least five sync selectors wait on it concurrently, and a
+	// single-token channel would let any one of them consume a wake meant for
+	// another — e.g. a shard retry eating the wake that should end the parked
+	// master probe hold. Access only through currentStateWakeChan and
+	// broadcastCurrentStateWake.
+	currentStateWakeMu    sync.Mutex
 	currentStateWake      chan struct{}
 	shardDescriptionWake  chan struct{}
 	shardDescriptionMu    sync.Mutex
 	shardDescriptionHints map[storage.BlockRootHash]shardDescriptionHint
 	shardDescriptionOrder []storage.BlockRootHash
 
-	preparedShardBlocks     preparedShardBlockCache
-	preparedShardBlockSlots chan struct{}
+	preparedShardBlocks preparedShardBlockCache
+	shardPrepareQueue   chan shardPrepareRequest
 
 	nextMasterchainMx               sync.Mutex
 	nextMasterchainQueue            map[storage.BlockRootHash]queuedMasterchainBlock
@@ -196,6 +206,7 @@ type Service struct {
 	nextMasterchainCandidateBytes   int64
 	validatorCache                  masterchainValidatorCache
 	broadcastValidatorCache         broadcastValidatorCache
+	parsedProofs                    parsedProofCache
 	masterStateCacheMu              sync.Mutex
 	masterStateCache                map[storage.BlockRootHash]*storage.BlockState
 	masterStateCacheKeys            []storage.BlockRootHash
@@ -208,26 +219,28 @@ type Service struct {
 	monitorSplitDepthMu             sync.Mutex
 	monitorSplitDepth               map[monitorSplitDepthKey]uint32
 
-	currentStatePersistMu              sync.Mutex
-	currentStatePersistErrMu           sync.Mutex
-	currentStatePersistErr             error
-	stateCellLoaderMu                  sync.RWMutex
-	stateCellLoaders                   map[uint64]cell.LazyCellLoader
-	stateCellLoaderSnapshot            atomic.Value
-	lazyCellLoads                      lazyCellLoadCounters
-	nextStateCellLoaderID              uint64
-	stateSerializer                    *stateSerializer
-	automaticStateSerializationReady   atomic.Bool
-	maintenanceWake                    chan struct{}
-	stateTTL                           time.Duration
-	archiveTTL                         time.Duration
-	archiveFromZero                    bool
-	syncUntil                          uint32
+	currentStatePersistMu            sync.Mutex
+	currentStatePersistErrMu         sync.Mutex
+	currentStatePersistErr           error
+	stateCellLoaderMu                sync.RWMutex
+	stateCellLoaders                 map[uint64]cell.LazyCellLoader
+	stateCellLoaderSnapshot          atomic.Value
+	lazyCellLoads                    lazyCellLoadCounters
+	nextStateCellLoaderID            uint64
+	stateSerializer                  *stateSerializer
+	automaticStateSerializationReady atomic.Bool
+	maintenanceWake                  chan struct{}
+	stateTTL                         time.Duration
+	archiveTTL                       time.Duration
+	archiveFromZero                  bool
+	syncUntil                        uint32
+	// syncUntilReached is set once this service decides it has synced up to
+	// ton.sync_until. See syncUntilFrozen.
+	syncUntilReached                   atomic.Bool
 	syncDiskSpacePath                  string
 	minSyncDiskFreeBytes               uint64
 	minStateSerializationDiskFreeBytes uint64
-	syncDiskSpaceProbe                 syncDiskSpaceProbe
-	syncDiskSpaceRetryDelay            time.Duration
+	persistentStateKeepRecent          int
 	exclusiveTaskMu                    sync.Mutex
 	exclusiveTask                      exclusiveServiceTask
 	cellMigrationMu                    sync.Mutex
@@ -236,9 +249,18 @@ type Service struct {
 	cellGenerationSwitchRequested      bool
 	cellGenerationNextBlockYieldAt     time.Time
 	cellGenerationSwitching            bool
+	masterPrepare                      masterPrepareFlight
 	currentStatusMu                    sync.RWMutex
 	currentStatus                      *storage.CurrentState
 	appliedMasterchainStatus           *storage.BlockState
+	shardOverlayMu                     sync.Mutex
+	shardOverlayPending                *masterShardOverlayUpdate
+	shardOverlayRunning                bool
+	shardOverlayReconcileMu            sync.Mutex
+	shardOverlayReconciledSeqno        uint32
+	// reconcileOverlaysHook replaces the overlay reconcile in tests; nil in
+	// production.
+	reconcileOverlaysHook func(context.Context, masterShardOverlayUpdate)
 
 	startOnce sync.Once
 	wg        sync.WaitGroup
@@ -265,6 +287,7 @@ type Options struct {
 	MinStateSerializationDiskFreeBytes      uint64
 	DisableStateSerialization               bool
 	PersistentStateLargeBOCBatchSize        int
+	PersistentStateKeepRecent               int
 	StateSerializeOnePass                   bool
 	SyncObserver                            SyncObserver
 	Extension                               hooks.Extension
@@ -529,6 +552,9 @@ type ShardStatusSnapshot struct {
 }
 
 type StatusTPSSnapshot struct {
+	// WindowMasters is kept for compatibility with the released status API.
+	//
+	// Deprecated: use DurationSeconds to identify the sampling window.
 	WindowMasters   int
 	Transactions    uint64
 	DurationSeconds int64
@@ -564,6 +590,9 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 	if opts.MinStateSerializationDiskFreeBytes == 0 {
 		opts.MinStateSerializationDiskFreeBytes = stateSerializationMinDiskFreeBytes
 	}
+	if opts.PersistentStateKeepRecent == 0 {
+		opts.PersistentStateKeepRecent = DefaultPersistentStateKeepRecent
+	}
 
 	svc := &Service{
 		log:                                logger,
@@ -579,6 +608,7 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		externalMessageChecker:             opts.ExternalMessageChecker,
 		externalMessageHooks:               newExternalMessageHookRunner(logger, opts.Extension),
 		blockReceivedHooks:                 newBlockReceivedHookRunner(logger, opts.Extension),
+		recentTPS:                          newRecentTPSTracker(recentTPSWindow),
 		stateCellPrewrite:                  newStateCellPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		artifactPrewrite:                   newArtifactPrewriter(logger, store, checkpointBackpressureBytes(opts.CheckpointBytes, opts.SyncBackpressureWindows)),
 		archiveCatchUpCheckpointBlocks:     opts.ArchiveCatchUpCheckpointBlocks,
@@ -588,10 +618,18 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		checkpointBytes:                    opts.CheckpointBytes,
 		syncBackpressureWindows:            opts.SyncBackpressureWindows,
 		shutdownContext:                    opts.ShutdownContext,
-		currentStateWake:                   make(chan struct{}, 1),
+		currentStateWake:                   make(chan struct{}),
 		shardDescriptionWake:               make(chan struct{}, 1),
 		shardDescriptionHints:              map[storage.BlockRootHash]shardDescriptionHint{},
-		preparedShardBlockSlots:            make(chan struct{}, preparedShardBlockWorkers),
+		shardPrepareQueue:                  make(chan shardPrepareRequest, preparedShardBlockQueueSize),
+		nextMasterchainQueue:               make(map[storage.BlockRootHash]queuedMasterchainBlock, nextMasterchainQueueLimit),
+		nextMasterchainBySeqno:             make(map[uint32]storage.BlockRootHash, nextMasterchainQueueLimit),
+		nextMasterchainCandidates:          make(map[storage.BlockRootHash]queuedMasterchainCandidate, nextMasterchainQueueLimit),
+		nextMasterchainCandidateBySeqno:    make(map[uint32]storage.BlockRootHash, nextMasterchainQueueLimit),
+		masterStateCache:                   make(map[storage.BlockRootHash]*storage.BlockState, masterStateCacheLimit),
+		compressedStateCache:               make(map[storage.BlockRootHash]compressedBlockStateEntry, compressedBlockStateCacheLimit),
+		monitorSplitDepth:                  make(map[monitorSplitDepthKey]uint32),
+		stateCellLoaders:                   make(map[uint64]cell.LazyCellLoader),
 		maintenanceWake:                    make(chan struct{}, 1),
 		stateTTL:                           opts.StateTTL,
 		archiveTTL:                         opts.ArchiveTTL,
@@ -600,38 +638,19 @@ func New(logger zerolog.Logger, node *p2p.Node, blockSync *blocksync.Service, st
 		syncDiskSpacePath:                  opts.StorageDir,
 		minSyncDiskFreeBytes:               opts.MinSyncDiskFreeBytes,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
+		persistentStateKeepRecent:          opts.PersistentStateKeepRecent,
 	}
 	svc.stateSerializer = newStateSerializer(logger, store, opts.StateFilesDir, opts.DisableStateSerialization, opts.PersistentStateLargeBOCBatchSize, opts.StateSerializeOnePass)
+	svc.storeStateCellLoadersSnapshotLocked()
 	if svc.liveState != nil {
 		svc.liveState.SetNonfinalCellLoader(svc.stateCellLoader())
 	}
 	return svc
 }
 
-func (s *Service) nextCheckpointBlocks() uint32 {
-	if s.nextBlockCheckpointBlocks != 0 {
-		return s.nextBlockCheckpointBlocks
-	}
-	return DefaultNextBlockCheckpointBlocks
-}
-
-func (s *Service) checkpointBytesTarget() uint64 {
-	if s.checkpointBytes != 0 {
-		return s.checkpointBytes
-	}
-	return DefaultCheckpointBytes
-}
-
-func (s *Service) syncBackpressureWindowCount() uint32 {
-	if s.syncBackpressureWindows != 0 {
-		return s.syncBackpressureWindows
-	}
-	return DefaultSyncBackpressureWindows
-}
-
 func checkpointBackpressureBlocks(target uint32, windows uint32) uint32 {
-	if windows == 0 {
-		windows = DefaultSyncBackpressureWindows
+	if target == 0 || windows == 0 {
+		return 0
 	}
 	if target > ^uint32(0)/windows {
 		return ^uint32(0)
@@ -640,8 +659,8 @@ func checkpointBackpressureBlocks(target uint32, windows uint32) uint32 {
 }
 
 func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
-	if windows == 0 {
-		windows = DefaultSyncBackpressureWindows
+	if target == 0 || windows == 0 {
+		return 0
 	}
 	windowCount := uint64(windows)
 	if target > ^uint64(0)/windowCount {
@@ -652,7 +671,10 @@ func checkpointBackpressureBytes(target uint64, windows uint32) uint64 {
 
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
-		s.stateCellPrewrite.start(ctx, s.currentStatePersistContext(), s.runAsync)
+		s.runAsync(func() {
+			s.recentTPS.run(ctx)
+		})
+		s.stateCellPrewrite.start(ctx, s.shutdownContext, s.runAsync)
 		s.artifactPrewrite.start(ctx, s.runAsync)
 		s.runAsync(func() {
 			s.runInitialStateSync(ctx)
@@ -662,6 +684,9 @@ func (s *Service) Start(ctx context.Context) {
 		})
 		s.runAsync(func() {
 			s.runShardDescriptionProcessor(ctx)
+		})
+		s.runAsync(func() {
+			s.runShardPrepareWorkers(ctx)
 		})
 		s.runAsync(func() {
 			s.runDelayedServiceMaintenance(ctx)
@@ -687,6 +712,7 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 		BlockSync:      s.blockSync.StatusSnapshot(),
 		BackgroundTask: s.backgroundTaskStatus(),
 	}
+	snapshot.RecentTPS = s.recentTPS.statusSnapshot()
 
 	ctx := context.Background()
 	current, err := s.currentStatusSnapshot(ctx)
@@ -698,7 +724,6 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 		snapshot.LocalMasterchainUtime = masterMetrics.Utime
 		snapshot.LocalMasterchainTx = masterMetrics.Transactions
 		snapshot.LocalMasterchainHasTx = masterMetrics.HasTransactions
-		snapshot.RecentTPS = s.recentTPSSnapshot(ctx, current, statusTPSMasterWindow)
 		for _, shard := range current.Shards {
 			if shard.Block.Workchain != 0 {
 				continue
@@ -780,10 +805,6 @@ func (s *Service) SyncLagSeconds() (int64, error) {
 }
 
 func (s *Service) populateStatusLatestBasechain(ctx context.Context, snapshot *StatusSnapshot, current *storage.CurrentState) {
-	if snapshot == nil || current == nil {
-		return
-	}
-
 	latestMaster := current.Masterchain.Block
 	if snapshot.LatestMasterchain != nil && snapshot.LatestMasterchain.SeqNo > latestMaster.SeqNo {
 		latestMaster = *snapshot.LatestMasterchain
@@ -866,9 +887,6 @@ func (s *Service) currentStatusSnapshot(ctx context.Context) (*storage.CurrentSt
 }
 
 func blockStateUtime(ctx context.Context, store storage.Storage, state *storage.BlockState) int64 {
-	if state == nil {
-		return 0
-	}
 	if state.Parsed != nil && state.Parsed.GenUTime != 0 {
 		return int64(state.Parsed.GenUTime)
 	}
@@ -876,12 +894,8 @@ func blockStateUtime(ctx context.Context, store storage.Storage, state *storage.
 }
 
 func blockUtimeFromMeta(ctx context.Context, store storage.Storage, block *ton.BlockIDExt) int64 {
-	if store == nil || block == nil {
-		return 0
-	}
-
 	meta, err := store.BlockMeta(ctx, *block)
-	if err != nil || meta == nil || meta.GenUTime == 0 {
+	if err != nil || meta.GenUTime == 0 {
 		return 0
 	}
 	return int64(meta.GenUTime)
@@ -897,6 +911,9 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 	}()
 
 	for {
+		// Taken before the sync attempt so state published while it runs is not
+		// waited out by the poll below.
+		stateWake := s.currentStateWakeChan()
 		err := s.ensureCurrentState(ctx)
 		if errors.Is(err, context.Canceled) {
 			return
@@ -912,7 +929,7 @@ func (s *Service) runInitialStateSync(ctx context.Context) {
 					Msg("current state sync stopped after sync_until")
 				return
 			}
-			if !s.waitCurrentStatePoll(ctx, currentStateLivePollDelay) {
+			if !s.waitCurrentStatePoll(ctx, stateWake, currentStateLivePollDelay) {
 				return
 			}
 			continue
@@ -1083,30 +1100,10 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 
 	prepareStarted := time.Now()
 	downloaded := synced.Downloaded
-	verified, err := verifyDownloadedBlock(downloaded)
+	verified, err := s.verifyDownloadedBlock(downloaded)
 	if err != nil {
 		observation.PrepareDuration = time.Since(prepareStarted)
 		return err
-	}
-
-	if s.log.GetLevel() <= zerolog.DebugLevel {
-		stats, err := StatsFromDownloadedBlock(downloaded)
-		if err != nil {
-			s.log.Debug().
-				Err(err).
-				Str("block", downloaded.BlockRef()).
-				Str("overlay", synced.Trigger.Overlay).
-				Bool("catch_up", synced.CatchUp).
-				Msg("failed to collect block stats")
-		} else {
-			s.log.Debug().
-				Str("block", downloaded.BlockRef()).
-				Uint32("seqno", downloaded.ID.SeqNo).
-				Str("overlay", synced.Trigger.Overlay).
-				Bool("catch_up", synced.CatchUp).
-				Int("transactions", stats.Transactions).
-				Msg("processed synced block")
-		}
 	}
 
 	if downloaded.ID.Workchain == -1 && downloaded.ID.Shard == topShard {
@@ -1121,7 +1118,11 @@ func (s *Service) processSyncedBlock(ctx context.Context, synced blocksync.Synce
 			return err
 		}
 		verified.consensusChecked = checked
-		prepared, err := prepareVerifiedBlockForApply(verified)
+		// Shared with the next-block probe, which reaches the same decoded
+		// broadcast through the p2p hot cache and would otherwise walk the same
+		// state update a second time. Ordering is unchanged: consensus is
+		// validated first, so a deferred block never pays for the cells.
+		prepared, err := s.prepareVerifiedMasterchainBlockShared(ctx, verified)
 		if err != nil {
 			observation.PrepareDuration = time.Since(prepareStarted)
 			return err
@@ -1160,7 +1161,7 @@ func (s *Service) validateVerifiedMasterchainBlock(ctx context.Context, block Ve
 }
 
 func (s *Service) validateMasterchainBlockConsensus(ctx context.Context, block VerifiedBlock, validationLabel string) (ton.BlockIDExt, *checkedMasterchainConsensus, error) {
-	if block.Meta == nil || len(block.Meta.PrevRefs) != 1 {
+	if len(block.Meta.PrevRefs) != 1 {
 		return ton.BlockIDExt{}, nil, fmt.Errorf("masterchain block %s has no single previous ref", block.BlockRef())
 	}
 
@@ -1195,25 +1196,45 @@ func waitRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (s *Service) waitCurrentStatePoll(ctx context.Context, delay time.Duration) bool {
+// waitCurrentStatePoll parks between sync attempts. The caller passes the wake
+// it took before the attempt, so state published while that attempt ran is not
+// waited out here.
+func (s *Service) waitCurrentStatePoll(ctx context.Context, wake <-chan struct{}, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
 		return false
-	case <-s.currentStateWake:
+	case <-wake:
 		return true
 	case <-timer.C:
 		return true
 	}
 }
 
-func (s *Service) wakeCurrentStateSync() {
-	select {
-	case s.currentStateWake <- struct{}{}:
-	default:
+// currentStateWakeChan returns the channel the next wake closes. Waiters that
+// loop must take a fresh channel after each release, and take it before
+// re-checking the state the wake announces, so a wake between the check and the
+// select is never lost.
+func (s *Service) currentStateWakeChan() <-chan struct{} {
+	s.currentStateWakeMu.Lock()
+	ch := s.currentStateWake
+	s.currentStateWakeMu.Unlock()
+	return ch
+}
+
+func (s *Service) broadcastCurrentStateWake() {
+	s.currentStateWakeMu.Lock()
+	if s.currentStateWake != nil {
+		close(s.currentStateWake)
+		s.currentStateWake = make(chan struct{})
 	}
+	s.currentStateWakeMu.Unlock()
+}
+
+func (s *Service) wakeCurrentStateSync() {
+	s.broadcastCurrentStateWake()
 	s.wakeServiceMaintenance()
 }
 

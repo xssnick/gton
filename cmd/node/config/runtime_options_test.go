@@ -38,12 +38,15 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 			MsgSender:         true,
 			MsgSenderPriority: 7,
 			BlockSender:       true,
+			AcceptQueries:     true,
 		}},
 		SenderShards: []CustomOverlayShard{{
 			Workchain: 0,
 			Shard:     testTopShard,
 		}},
 		SkipPublicMsgSend: true,
+		UseQUIC:           true,
+		SendQueries:       true,
 	}}
 
 	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
@@ -75,7 +78,8 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 		t.Fatalf("unexpected custom overlay count %d", len(opts.CustomOverlays))
 	}
 	customOverlay := opts.CustomOverlays[0]
-	if customOverlay.Name != "private-a" || !customOverlay.SkipPublicMsgSend {
+	if customOverlay.Name != "private-a" || !customOverlay.SkipPublicMsgSend ||
+		!customOverlay.UseQUIC || !customOverlay.SendQueries {
 		t.Fatalf("unexpected custom overlay metadata: %+v", customOverlay)
 	}
 	if len(customOverlay.Nodes) != 1 {
@@ -85,7 +89,8 @@ func TestRuntimeOptionsFromConfig(t *testing.T) {
 	if !bytes.Equal(customNode.ADNLID.Bytes(), customNodeID) {
 		t.Fatal("unexpected custom overlay ADNL id")
 	}
-	if !customNode.MsgSender || customNode.MsgSenderPriority != 7 || !customNode.BlockSender {
+	if !customNode.MsgSender || customNode.MsgSenderPriority != 7 ||
+		!customNode.BlockSender || !customNode.AcceptQueries {
 		t.Fatalf("unexpected custom overlay node roles: %+v", customNode)
 	}
 	if len(customOverlay.SenderShards) != 1 || customOverlay.SenderShards[0].Shard != testTopShard {

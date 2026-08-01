@@ -16,10 +16,7 @@ func TestHTTPAPIOptionsFromConfig(t *testing.T) {
 		},
 	}
 
-	opts, err := httpapiOptionsFromConfig(cfg, httpRuntimeOptionsForTest(cfg))
-	if err != nil {
-		t.Fatalf("http api options: %v", err)
-	}
+	opts := httpapiOptionsFromConfig(cfg, httpRuntimeOptionsForTest(cfg))
 	if !opts.Enabled {
 		t.Fatal("expected http api to be enabled")
 	}

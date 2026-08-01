@@ -7,6 +7,8 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -64,6 +66,29 @@ func testShardStateCell(tb testing.TB, block ton.BlockIDExt) *cell.Cell {
 
 type testShardAccountsAugmentation struct{}
 
+func newTestStateCellWindowCache(base cell.LazyCellLoader) *stateCellWindowCache {
+	return newStateCellWindowCache(base, &lazyCellLoadCounters{})
+}
+
+// rememberAppliedForTest stages the records and then drains the prewrite
+// backpressure, which is the two-step the production appliers do around
+// reloading the applied root.
+func rememberAppliedForTest(w *stateCellWindowCache, root *cell.Cell, prepared storage.StateCellRecords) error {
+	wait, err := w.rememberApplied(root, prepared)
+	if err != nil {
+		return err
+	}
+	return wait()
+}
+
+func (w *stateCellWindowCache) addPreparedStateRecords(root cell.Hash, records storage.StateCellRecords) error {
+	wait, err := w.stagePreparedStateRecords(root, records)
+	if err != nil {
+		return err
+	}
+	return wait()
+}
+
 func (testShardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {
 	if _, err := loader.LoadUInt(5); err != nil {
 		return err
@@ -75,18 +100,20 @@ func (testShardAccountsAugmentation) SkipExtra(loader *cell.Slice) error {
 	return err
 }
 
-func (testShardAccountsAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return cell.BeginCell().
-		MustStoreUInt(0, 5).
-		MustStoreBigCoins(big.NewInt(0)).
-		MustStoreDict(nil).
-		EndCell(), nil
+func (testShardAccountsAugmentation) EmptyExtra(dst *cell.Builder) error {
+	if err := dst.StoreUInt(0, 5); err != nil {
+		return err
+	}
+	if err := dst.StoreBigCoins(big.NewInt(0)); err != nil {
+		return err
+	}
+	return dst.StoreDict(nil)
 }
 
-func (testShardAccountsAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return nil, fmt.Errorf("test shard account leaf extra is not implemented")
+func (testShardAccountsAugmentation) LeafExtra(*cell.Slice, *cell.Builder) error {
+	return fmt.Errorf("test shard account leaf extra is not implemented")
 }
 
-func (testShardAccountsAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return nil, fmt.Errorf("test shard account combine extra is not implemented")
+func (testShardAccountsAugmentation) CombineExtra(*cell.Slice, *cell.Slice, *cell.Builder) error {
+	return fmt.Errorf("test shard account combine extra is not implemented")
 }

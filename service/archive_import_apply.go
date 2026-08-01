@@ -20,15 +20,19 @@ type archiveShardBlockLoader struct {
 }
 
 type shardClientArchiveWindow struct {
-	startSeqno       uint32
-	masterStats      *archive.ImportStats
-	totalStats       *archive.ImportStats
-	masterStates     map[uint32]*storage.BlockState
-	masterBlocks     map[uint32]PreparedBlock
-	masterSequence   []PreparedBlock
-	masterProofs     map[uint32]*masterchainConsensusProof
-	archiveBlocks    map[storage.BlockRootHash]PreparedBlock
-	archiveImports   []*archiveImportResult
+	startSeqno     uint32
+	masterStats    *archive.ImportStats
+	totalStats     *archive.ImportStats
+	masterStates   map[uint32]*storage.BlockState
+	masterBlocks   map[uint32]PreparedBlock
+	masterSequence []PreparedBlock
+	masterProofs   map[uint32]*masterchainConsensusProof
+	archiveBlocks  map[storage.BlockRootHash]PreparedBlock
+	archiveImports []*archiveImportResult
+	// shardTargets carries the planner's per-master-seqno shard targets to the
+	// runner (shared-immutable slices; written on the shard import task before
+	// it completes, read by the runner after the window is emitted).
+	shardTargets     map[uint32][]ton.BlockIDExt
 	stateCells       *stateCellWindowCache
 	appliedStates    appliedStateSet
 	shardArchives    int
@@ -53,24 +57,15 @@ func (l archiveShardBlockLoader) load(_ context.Context, block ton.BlockIDExt) (
 	}
 
 	key := storage.BlockKey(block)
-	downloaded, ok := l.block(key)
-	if !ok {
-		return PreparedBlock{}, fmt.Errorf("no archive data/proof for shard block %s", storage.FormatBlockRef(block))
-	}
-	setPreparedShardMasterchainRef(&downloaded, l.master)
-	return downloaded, nil
-}
-
-func (l archiveShardBlockLoader) block(key storage.BlockRootHash) (PreparedBlock, bool) {
-	if l.mu == nil {
-		downloaded, ok := l.blocks[key]
-		return downloaded, ok
-	}
-
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	downloaded, ok := l.blocks[key]
-	return downloaded, ok
+	l.mu.Unlock()
+	if !ok {
+		return PreparedBlock{}, fmt.Errorf("load archive data/proof for shard block %s: %w", storage.FormatBlockRef(block), storage.ErrNotFound)
+	}
+
+	setShardBlockMasterchainRef(downloaded.Meta, l.master)
+	return downloaded, nil
 }
 
 func (r *archiveCatchUpRunner) startArchiveWindowShardImport(ctx context.Context, queue *archiveImportQueue, prepared archivePreparedMasterWindow, priority archiveImportPriority) *archiveWindowShardImportTask {
@@ -94,11 +89,12 @@ func (r *archiveCatchUpRunner) importArchiveWindowShards(ctx context.Context, qu
 	window.splitDepth = splitDepth
 
 	task.setStage("shard_targets")
-	plans, splitDepth, err := r.service.missingArchiveShardImportPlansForWindow(prepared.startMaster, window.masterStates, window.archiveBlocks)
+	plans, inputs, err := r.service.missingArchiveShardImportPlansForWindow(prepared.startMaster, window.masterStates, window.archiveBlocks)
 	if err != nil {
 		return err
 	}
-	window.splitDepth = splitDepth
+	window.splitDepth = inputs.splitDepth
+	window.shardTargets = inputs.stateTargets
 	window.shardArchives = len(plans)
 
 	if len(plans) > 0 {
@@ -145,9 +141,9 @@ func (r *archiveCatchUpRunner) importArchiveWindowShards(ctx context.Context, qu
 
 func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, start *storage.BlockState, window *shardClientArchiveWindow) (*storage.BlockState, error) {
 	master := start
-	applier := window.stateCells.metered(nil)
+	applier := window.stateCells
 	if window.masterSequence == nil {
-		sequence, err := archiveMasterBlockSequence(start, r.target.SeqNo, window.startSeqno, window.masterBlocks)
+		sequence, err := archiveMasterBlockSequence(start.Block, r.target.SeqNo, window.startSeqno, window.masterBlocks)
 		if err != nil {
 			return nil, err
 		}
@@ -202,25 +198,22 @@ func (r *archiveCatchUpRunner) applyArchiveMasterBlocks(ctx context.Context, sta
 		downloaded.releaseStateUpdatePayload()
 		window.archiveBlocks[storage.BlockKey(downloaded.ID)] = downloaded
 		window.masterStates[downloaded.ID.SeqNo] = master
-		if err = window.rememberAppliedArchiveState(master, downloaded, 0); err != nil {
-			return nil, fmt.Errorf("remember archive master checkpoint state %s: %w", downloaded.BlockRef(), err)
-		}
+		window.rememberAppliedArchiveState(master, downloaded, 0)
 	}
 	return master, nil
 }
 
-func (w *shardClientArchiveWindow) rememberAppliedArchiveState(state *storage.BlockState, block PreparedBlock, splitDepth uint32) error {
-	artifact, links, err := preparedBlockCheckpointArtifacts(block, splitDepth)
-	if err != nil {
-		return err
-	}
+func (w *shardClientArchiveWindow) rememberAppliedArchiveState(state *storage.BlockState, block PreparedBlock, splitDepth uint32) {
+	artifact, links := preparedBlockCheckpointArtifacts(block, splitDepth)
 	w.appliedStates.rememberWithArtifacts(state, artifact, links)
-	return nil
 }
 
 func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context, current *storage.CurrentState, window *shardClientArchiveWindow) (*storage.CurrentState, error) {
 	applied := map[storage.BlockRootHash]*storage.BlockState{}
 	next := storage.CloneCurrentState(current)
+	applyStarted := time.Now()
+	progressTicker := time.NewTicker(archiveCatchUpProgressInterval)
+	defer progressTicker.Stop()
 
 	seqno := current.ShardClientSeqno + 1
 	for ; ; seqno++ {
@@ -229,11 +222,15 @@ func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context
 			break
 		}
 
-		targetStarted := time.Now()
-		targets, err := state2.ShardBlocksFromMasterState(masterState)
-		window.shardTargetElapsed += time.Since(targetStarted)
-		if err != nil {
-			return nil, fmt.Errorf("load shard blocks from archive master state %s: %w", storage.FormatBlockRef(masterState.Block), err)
+		targets, ok := window.shardTargets[seqno]
+		if !ok {
+			targetStarted := time.Now()
+			var err error
+			targets, err = state2.ShardBlocksFromMasterState(masterState)
+			window.shardTargetElapsed += time.Since(targetStarted)
+			if err != nil {
+				return nil, fmt.Errorf("load shard blocks from archive master state %s: %w", storage.FormatBlockRef(masterState.Block), err)
+			}
 		}
 
 		prevShards := next.Shards
@@ -244,24 +241,50 @@ func (r *archiveCatchUpRunner) applyShardClientArchiveWindow(ctx context.Context
 			Shards:           make(map[storage.ShardKey]storage.BlockState, len(targets)),
 		}
 
-		shards, err := r.applyArchiveShardTargets(ctx, masterState, prevShards, applied, window.archiveBlocks, targets, window)
+		shards, err := r.applyArchiveShardTargets(
+			ctx,
+			masterState,
+			prevShards,
+			applied,
+			window.archiveBlocks,
+			targets,
+			window,
+			applyStarted,
+			progressTicker.C,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("apply archive shard blocks at masterchain seqno %d: %w", seqno, err)
 		}
 		for key, shard := range shards {
 			next.Shards[key] = *storage.CloneBlockState(shard)
 		}
+
+		select {
+		case now := <-progressTicker.C:
+			r.logArchiveWindowApplyProgress(now, applyStarted, masterState, window, len(targets), len(targets), 0, 0)
+		default:
+		}
 	}
 	return next, nil
 }
 
-func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, masterState *storage.BlockState, current map[storage.ShardKey]storage.BlockState, applied map[storage.BlockRootHash]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock, targets []ton.BlockIDExt, window *shardClientArchiveWindow) (map[storage.ShardKey]*storage.BlockState, error) {
+func (r *archiveCatchUpRunner) applyArchiveShardTargets(
+	ctx context.Context,
+	masterState *storage.BlockState,
+	current map[storage.ShardKey]storage.BlockState,
+	applied map[storage.BlockRootHash]*storage.BlockState,
+	blocks map[storage.BlockRootHash]PreparedBlock,
+	targets []ton.BlockIDExt,
+	window *shardClientArchiveWindow,
+	applyStarted time.Time,
+	progress <-chan time.Time,
+) (map[storage.ShardKey]*storage.BlockState, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
 	master := masterState.Block
 
-	applier := window.stateCells.metered(nil)
+	applier := window.stateCells
 
 	var appliedMu sync.Mutex
 	var blockLoaderMu sync.Mutex
@@ -269,7 +292,7 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 		current: current,
 		cache:   applied,
 		loadState: func(ctx context.Context, state storage.BlockState) (*storage.BlockState, error) {
-			if state.Block.SeqNo == 0 && r.service.stateSync != nil {
+			if state.Block.SeqNo == 0 {
 				return r.service.stateSync.ImportZeroState(ctx, state.Block, master)
 			}
 			return r.service.loadBlockStateForApply(ctx, state)
@@ -287,7 +310,7 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 		},
 		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded PreparedBlock, _ time.Duration) error {
 			setShardStateMasterchainRef(state, master)
-			setPreparedShardMasterchainRef(&downloaded, master)
+			setShardBlockMasterchainRef(downloaded.Meta, master)
 
 			blockLoaderMu.Lock()
 			blocks[storage.BlockKey(downloaded.ID)] = downloaded
@@ -296,9 +319,7 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 			appliedMu.Lock()
 			defer appliedMu.Unlock()
 
-			if err := window.rememberAppliedArchiveState(state, downloaded, window.splitDepth); err != nil {
-				return fmt.Errorf("remember archive shard checkpoint state %s: %w", downloaded.BlockRef(), err)
-			}
+			window.rememberAppliedArchiveState(state, downloaded, window.splitDepth)
 			return nil
 		},
 	})
@@ -356,15 +377,37 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 
 	shards := make(map[storage.ShardKey]*storage.BlockState, len(targets))
 	var firstErr error
-	for res := range results {
-		if res.err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("apply archive shard block %s: %w", storage.FormatBlockRef(res.target), res.err)
-				cancelApply()
+	completedTargets := 0
+	for results != nil {
+		select {
+		case res, ok := <-results:
+			if !ok {
+				results = nil
+				continue
 			}
-			continue
+
+			completedTargets++
+			if res.err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("apply archive shard block %s: %w", storage.FormatBlockRef(res.target), res.err)
+					cancelApply()
+				}
+				continue
+			}
+			shards[storage.ShardKeyFromBlock(res.target)] = res.state
+		case now := <-progress:
+			stats := resolver.statsSnapshot()
+			r.logArchiveWindowApplyProgress(
+				now,
+				applyStarted,
+				masterState,
+				window,
+				completedTargets,
+				len(targets),
+				stats.blocksApplied,
+				stats.blocksReused,
+			)
 		}
-		shards[storage.ShardKeyFromBlock(res.target)] = res.state
 	}
 	stats := resolver.statsSnapshot()
 	window.shardApplyElapsed += stats.applyElapsed
@@ -383,11 +426,40 @@ func (r *archiveCatchUpRunner) applyArchiveShardTargets(ctx context.Context, mas
 	return shards, nil
 }
 
-func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.CurrentState, checkpointBlocks uint32, lockElapsed time.Duration, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (*storage.CurrentState, error) {
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("archive current state has no block states")
-	}
+func (r *archiveCatchUpRunner) logArchiveWindowApplyProgress(
+	now time.Time,
+	started time.Time,
+	masterState *storage.BlockState,
+	window *shardClientArchiveWindow,
+	completedTargets int,
+	totalTargets int,
+	currentBlocksApplied int,
+	currentBlocksReused int,
+) {
+	done := masterState.Block.SeqNo - r.startSeqno
+	total := r.target.SeqNo - r.startSeqno
 
+	r.service.log.Info().
+		Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
+		Str("applying", storage.FormatBlockRef(masterState.Block)).
+		Str("target", storage.FormatBlockRef(r.target)).
+		Str("catchup_method", "archive_shard_client").
+		Str("stage", "apply_shard_targets").
+		Uint32("processed_masterchain_blocks", done).
+		Uint32("total_masterchain_blocks", total).
+		Str("progress", formatCatchUpProgress(done, total)).
+		Str("eta", formatCatchUpETA(done, total, time.Since(r.started))).
+		Uint32("window_start_seqno", window.startSeqno).
+		Int("window_master_blocks", len(window.masterStates)).
+		Int("completed_shard_targets", completedTargets).
+		Int("total_shard_targets", totalTargets).
+		Int("window_shard_blocks_applied", window.shardBlocksApplied+currentBlocksApplied).
+		Int("window_shard_blocks_reused", window.shardBlocksReused+currentBlocksReused).
+		Dur("window_apply_elapsed", now.Sub(started)).
+		Msg("archive shard-client catch-up progress")
+}
+
+func (r *archiveCatchUpRunner) persistArchiveCurrentState(current *storage.CurrentState, checkpointBlocks uint32, lockElapsed time.Duration, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (*storage.CurrentState, error) {
 	storedCurrent := currentStateWithoutCells(current)
 	started := time.Now()
 	// Cells applied through the window caches were already streamed to celldb by

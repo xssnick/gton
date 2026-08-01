@@ -86,10 +86,10 @@ func TestTryLocateResultTransactionFromBlocks(t *testing.T) {
 
 	for _, handler := range []tryLocateTestHandler{
 		{name: "tryLocateTx", run: func(s *Server, ctx context.Context, params requestParams) (any, *apiError) {
-			return s.handleTryLocateTx(ctx, params)
+			return s.handleTryLocateInboundMessageTransaction(ctx, params)
 		}},
 		{name: "tryLocateResultTx", run: func(s *Server, ctx context.Context, params requestParams) (any, *apiError) {
-			return s.handleTryLocateResultTx(ctx, params)
+			return s.handleTryLocateInboundMessageTransaction(ctx, params)
 		}},
 	} {
 		t.Run(handler.name, func(t *testing.T) {
@@ -151,7 +151,7 @@ func TestTryLocateResultTransactionFollowsAccountHistory(t *testing.T) {
 
 	srv := newTestServer()
 	srv.store = store
-	result, apiErr := srv.handleTryLocateResultTx(context.Background(), requestParams{query: mapValues(map[string]string{
+	result, apiErr := srv.handleTryLocateInboundMessageTransaction(context.Background(), requestParams{query: mapValues(map[string]string{
 		"source":      address.NewAddress(0, 0, source).String(),
 		"destination": address.NewAddress(0, 0, destination).String(),
 		"created_lt":  fmt.Sprintf("%d", createdLT),
@@ -175,7 +175,7 @@ func TestTryLocateTransactionNotFoundAfterBoundedProbes(t *testing.T) {
 	srv := newTestServer()
 	srv.store = store
 
-	_, apiErr := srv.handleTryLocateTx(context.Background(), requestParams{query: mapValues(map[string]string{
+	_, apiErr := srv.handleTryLocateInboundMessageTransaction(context.Background(), requestParams{query: mapValues(map[string]string{
 		"source":      address.NewAddress(0, 0, source).String(),
 		"destination": address.NewAddress(0, 0, destination).String(),
 		"created_lt":  fmt.Sprintf("%d", createdLT),
@@ -211,7 +211,7 @@ func TestTryLocateTransactionRequiresFullMessageIdentity(t *testing.T) {
 		srv := newTestServer()
 		srv.store = store
 
-		_, apiErr := srv.handleTryLocateResultTx(context.Background(), requestParams{query: mapValues(map[string]string{
+		_, apiErr := srv.handleTryLocateInboundMessageTransaction(context.Background(), requestParams{query: mapValues(map[string]string{
 			"source":      address.NewAddress(0, 0, expectedSource).String(),
 			"destination": address.NewAddress(0, 0, expectedDestination).String(),
 			"created_lt":  fmt.Sprintf("%d", createdLT),
@@ -276,7 +276,7 @@ func TestTransactionMessageHashesUseOriginalRefStoredCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("format raw transaction: %v", err)
 	}
-	extended, err := extTransactionFromTLB(rawTransactionExtType, 0, tonBlockRef{}, tx, txCell)
+	extended, err := extTransactionFromTLB(rawTransactionExtType, 0, tx, txCell)
 	if err != nil {
 		t.Fatalf("format extended transaction: %v", err)
 	}
@@ -622,20 +622,16 @@ func (testHTTPAPICurrencyCollectionAugmentation) SkipExtra(loader *cell.Slice) e
 	return tlb.LoadFromCell(&extra, loader)
 }
 
-func (testHTTPAPICurrencyCollectionAugmentation) EmptyExtra() (*cell.Cell, error) {
-	return testHTTPAPICurrencyCollectionCell()
+func (testHTTPAPICurrencyCollectionAugmentation) EmptyExtra(dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testHTTPAPICurrencyCollectionAugmentation) LeafExtra(*cell.Slice) (*cell.Cell, error) {
-	return testHTTPAPICurrencyCollectionCell()
+func (testHTTPAPICurrencyCollectionAugmentation) LeafExtra(_ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
-func (testHTTPAPICurrencyCollectionAugmentation) CombineExtra(*cell.Slice, *cell.Slice) (*cell.Cell, error) {
-	return testHTTPAPICurrencyCollectionCell()
-}
-
-func testHTTPAPICurrencyCollectionCell() (*cell.Cell, error) {
-	return tlb.ToCell(&tlb.CurrencyCollection{Coins: tlb.ZeroCoins})
+func (testHTTPAPICurrencyCollectionAugmentation) CombineExtra(_, _ *cell.Slice, dst *cell.Builder) error {
+	return dst.StoreUInt(0, 5)
 }
 
 func testHTTPAPIAugDictRootCell(t testing.TB, dict *cell.AugmentedDictionary) *cell.Cell {
@@ -959,7 +955,7 @@ func TestBlockTransactionsCursorMatchesListTransactions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("serialize reference transaction: %v", err)
 			}
-			formatted, err := extTransactionFromTLB(rawTransactionExtType, block.Workchain, tonBlockRef{block: block}, tx, txCell)
+			formatted, err := extTransactionFromTLB(rawTransactionExtType, block.Workchain, tx, txCell)
 			if err != nil {
 				t.Fatalf("format reference transaction: %v", err)
 			}
@@ -1091,7 +1087,7 @@ func TestTransactionsHistoryWalkReusesCachedBlock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("serialize reference transaction: %v", err)
 			}
-			formatted, err := extTransactionFromTLB(extTransactionType, 0, tonBlockRef{}, tx, txCell)
+			formatted, err := extTransactionFromTLB(extTransactionType, 0, tx, txCell)
 			if err != nil {
 				t.Fatalf("format reference transaction: %v", err)
 			}

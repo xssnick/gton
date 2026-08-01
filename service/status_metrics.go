@@ -18,10 +18,8 @@ type statusBlockMetrics struct {
 }
 
 func (s *Service) blockStatusMetrics(ctx context.Context, state *storage.BlockState) statusBlockMetrics {
-	if state == nil {
-		return statusBlockMetrics{}
-	}
-
+	// Status collection is best-effort: a live-cache miss or malformed cached
+	// block must not make the whole status snapshot unavailable.
 	metrics, _, _ := s.liveBlockStatusMetrics(ctx, state.Block)
 	if state.Parsed != nil && state.Parsed.GenUTime != 0 {
 		metrics.Utime = int64(state.Parsed.GenUTime)
@@ -29,43 +27,6 @@ func (s *Service) blockStatusMetrics(ctx context.Context, state *storage.BlockSt
 		metrics.Utime = blockUtimeFromMeta(ctx, s.storage, &state.Block)
 	}
 	return metrics
-}
-
-func (s *Service) recentTPSSnapshot(ctx context.Context, current *storage.CurrentState, window int) StatusTPSSnapshot {
-	if current == nil || window <= 0 {
-		return StatusTPSSnapshot{}
-	}
-
-	snapshot := StatusTPSSnapshot{WindowMasters: 1}
-	complete := true
-	hasLiveBlock := false
-
-	collect := func(block ton.BlockIDExt) {
-		metrics, _, err := s.liveBlockStatusMetrics(ctx, block)
-		if err != nil || !metrics.HasTransactions || metrics.Utime == 0 {
-			complete = false
-			return
-		}
-
-		hasLiveBlock = true
-		snapshot.Transactions += uint64(metrics.Transactions)
-	}
-
-	if current.Masterchain.Block.Workchain == -1 {
-		collect(current.Masterchain.Block)
-	}
-	for _, shard := range current.Shards {
-		if shard.Block.Workchain == 0 {
-			collect(shard.Block)
-		}
-	}
-
-	if hasLiveBlock {
-		snapshot.DurationSeconds = 1
-		snapshot.TPS = float64(snapshot.Transactions)
-	}
-	snapshot.Complete = complete && hasLiveBlock
-	return snapshot
 }
 
 func (s *Service) liveBlockStatusMetrics(ctx context.Context, block ton.BlockIDExt) (statusBlockMetrics, *storage.BlockMeta, error) {

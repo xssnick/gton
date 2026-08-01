@@ -89,20 +89,8 @@ func (r *archiveCatchUpRunner) pauseArchiveDownloadsForCheckpointBackpressure() 
 	return r.downloadGate.resume
 }
 
-func (r *archiveCatchUpRunner) waitArchiveDownloadBackpressure(ctx context.Context) error {
-	return r.downloadGate.wait(ctx)
-}
-
 func (s *Service) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Duration) uint32 {
-	if current == 0 {
-		current = s.archiveCatchUpCheckpointBlocks
-	}
-
 	base := s.archiveCatchUpCheckpointBlocks
-	if base == 0 {
-		base = DefaultArchiveCatchUpCheckpointBlocks
-	}
-
 	maxBlocks := uint32(archiveCatchUpMaxAdaptiveCheckpointBlocks)
 	if maxBlocks < base {
 		maxBlocks = base
@@ -123,15 +111,6 @@ func (s *Service) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Dura
 	return next
 }
 
-func (r *archiveCatchUpRunner) archiveLiveTailLagSeconds() (int64, bool) {
-	return r.archiveLiveTailLagSecondsAt(time.Now())
-}
-
-func (r *archiveCatchUpRunner) archiveLiveTailLagSecondsAt(now time.Time) (int64, bool) {
-	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
-	return masterchainBlockLagSeconds(blockUTime, now.Unix())
-}
-
 func (r *archiveCatchUpRunner) archiveProgressGoalAt(now time.Time) archiveProgressGoal {
 	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
 
@@ -140,13 +119,12 @@ func (r *archiveCatchUpRunner) archiveProgressGoalAt(now time.Time) archiveProgr
 		return goal
 	}
 
-	lagSeconds, ok := masterchainBlockLagSeconds(blockUTime, now.Unix())
-	if !ok {
+	if blockUTime == 0 {
 		return archiveProgressGoal{}
 	}
 	return archiveProgressGoal{
 		kind:                     archiveProgressGoalLiveTail,
-		remainingSeconds:         remainingLagSeconds(lagSeconds),
+		remainingSeconds:         remainingLagSeconds(now.Unix() - blockUTime),
 		hasKnownRemainingSeconds: true,
 	}
 }
@@ -188,27 +166,15 @@ func (r *archiveCatchUpRunner) shouldWaitArchiveCheckpointBackpressure() bool {
 
 func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBlocks() uint32 {
 	target := r.checkpointBlocksTarget
-	if target == 0 {
-		target = r.service.archiveCatchUpCheckpointBlocks
-	}
-	if target == 0 {
-		target = DefaultArchiveCatchUpCheckpointBlocks
-	}
-
-	return checkpointBackpressureBlocks(target, r.service.syncBackpressureWindowCount())
+	return checkpointBackpressureBlocks(target, r.service.syncBackpressureWindows)
 }
 
 func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBytes() uint64 {
-	return checkpointBackpressureBytes(r.service.checkpointBytesTarget(), r.service.syncBackpressureWindowCount())
+	return checkpointBackpressureBytes(r.service.checkpointBytes, r.service.syncBackpressureWindows)
 }
 
 func (r *archiveCatchUpRunner) pendingArchiveCheckpointBytes() uint64 {
-	var total uint64
-	if r.stateCells == nil {
-		total = 0
-	} else {
-		total = r.stateCells.byteSize()
-	}
+	total := r.stateCells.byteSize()
 	artifactBytes := r.checkpointStates.byteSize()
 	if total > ^uint64(0)-artifactBytes {
 		return ^uint64(0)
@@ -227,33 +193,33 @@ func (r *archiveCatchUpRunner) persistCheckpoint(reason string) (uint32, error) 
 		if r.current.ShardClientSeqno <= r.lastCheckpointSeqno {
 			return checkpointBlocks, nil
 		}
-		if _, err = r.startCheckpoint(reason); err != nil {
+		if err = r.startCheckpoint(reason); err != nil {
 			return checkpointBlocks, err
 		}
 	}
 }
 
-func (r *archiveCatchUpRunner) startCheckpoint(reason string) (uint32, error) {
+func (r *archiveCatchUpRunner) startCheckpoint(reason string) error {
 	if r.checkpointDone != nil || r.current.ShardClientSeqno <= r.lastCheckpointSeqno {
-		return 0, nil
+		return nil
 	}
 	if err := r.service.checkCurrentStatePersistAllowed(); err != nil {
-		return 0, err
+		return err
 	}
 	lockStarted := time.Now()
 	r.service.currentStatePersistMu.Lock()
 	lockElapsed := time.Since(lockStarted)
 	if err := r.service.checkCurrentStatePersistAllowed(); err != nil {
 		r.service.currentStatePersistMu.Unlock()
-		return 0, err
+		return err
 	}
 
 	current := storage.CloneCurrentState(r.current)
 	checkpointStates := r.checkpointStates.checkpoint()
 	checkpointCells := r.stateCells.beginCheckpoint()
 	releaseCheckpointCells := func() {}
-	if checkpointCells != nil {
-		releaseCheckpointCells = r.service.retainStateCellLoader(checkpointCells.retainedLoader(r.service.stateCellLoader()))
+	if loader := checkpointCells.retainedLoader(r.service.stateCellLoader()); loader != nil {
+		releaseCheckpointCells = r.service.retainStateCellLoader(loader)
 	}
 	checkpointBlocks := r.current.ShardClientSeqno - r.lastCheckpointSeqno
 	done := make(chan archiveCheckpointResult, 1)
@@ -300,7 +266,7 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) (uint32, error) {
 			err:              err,
 		}
 	})
-	return checkpointBlocks, nil
+	return nil
 }
 
 func (r *archiveCatchUpRunner) finishCheckpoint(wait bool) (uint32, error) {
@@ -391,7 +357,7 @@ func (r *archiveCatchUpRunner) logCheckpointWait(started time.Time) {
 		Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 		Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 		Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-		Uint64("checkpoint_target_bytes", r.service.checkpointBytesTarget()).
+		Uint64("checkpoint_target_bytes", r.service.checkpointBytes).
 		Uint32("checkpoint_backpressure_blocks", r.archiveCheckpointBackpressureBlocks()).
 		Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 		Dur("wait_elapsed", time.Since(started)).

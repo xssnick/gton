@@ -16,13 +16,30 @@ import (
 )
 
 const (
-	topShard              = int64(-1 << 63)
-	maxPeersPerOverlay    = 20
-	maxQueryNeighbours    = 16
-	maxOverlayPayloadSize = 16 << 20
+	topShard = int64(-1 << 63)
+	// maxPeersPerOverlay matches the C++ reference OverlayOptions::max_peers_
+	// (300 since the plumtree rework; the historical 20 starved broadcast
+	// reception — with so few roster edges, losing a couple of active senders
+	// dropped the node out of everyone's fanout sets).
+	maxPeersPerOverlay = 300
+	// maxLivePeersPerOverlay bounds the peers holding a transport on a public
+	// overlay. Floor: maxQueryNeighbours (16) + plumtreeActiveNeighbourLimit
+	// (20) + the largest transient download/proof set (24) = 60 if fully
+	// disjoint; the rest is rotation headroom. C++ runs a live working set of
+	// ~30-46 per overlay while knowing maxPeersPerOverlay of them.
+	maxLivePeersPerOverlay = 64
+	maxQueryNeighbours     = 16
+	maxOverlayPayloadSize  = 16 << 20
+	peerPoolIdleTTL        = 130 * time.Second
+	// peerPoolMaxIdle is the backstop for unreferenced transports that all
+	// still look recently used; the TTL does the ordinary work. It mirrors
+	// maxOutboundQUICPaths and leaves room above the live working set
+	// (maxLivePeersPerOverlay per subscribed overlay) for rotation and for the
+	// transient download and proof sets. The former 2048 was never reached, so
+	// nothing was ever swept.
+	peerPoolMaxIdle = 256
 	// C++ private overlays set the RLDP2 peer MTU to max broadcast size + 1024.
 	maxRLDPTwoStepTransferSize = maxOverlayPayloadSize + 1024
-	simpleBroadcastSkew        = 20 * time.Second
 	dhtRefreshInterval         = 90 * time.Second
 	peerRefreshMinDelay        = time.Second
 	peerRefreshJitter          = 0
@@ -88,10 +105,10 @@ const (
 	maxDecompressedBlockSize    = 32 << 20
 	maxRandomPeerReply          = 4
 
-	masterchainProtoVersionMajor   = 1
-	masterchainProtoVersionMinor   = 0
+	masterchainProtoVersionMajor   = 3
+	masterchainProtoVersionMinor   = 2
 	shardchainProtoVersionMajor    = 3
-	shardchainProtoVersionMinor    = 1
+	shardchainProtoVersionMinor    = 2
 	ordinarySimpleBroadcastMaxSize = 768
 
 	peerStopUnreliability = 5.0
@@ -105,7 +122,20 @@ const (
 	blockUnavailablePeerPenalty   = 10 * time.Second
 	blockUnavailableConfirmWindow = 3 * time.Second
 	blockSpeedSampleMin           = int64(64 << 10)
+
+	customQueryProbeMinDelay  = time.Second
+	customQueryProbeJitter    = time.Second
+	customQueryProbeTimeout   = time.Second
+	customQueryProbeMaxPeers  = 3
+	customQueryProbeMaxAnswer = 1024
+	fastSyncPingMinDelay      = time.Second
+	fastSyncPingJitter        = time.Second
+	fastSyncPingFanout        = 5
+	fastSyncPingMaxAnswer     = 1024
 )
+
+// inboundQUICQueryParallelism bounds project-local concurrent QUIC query work.
+const inboundQUICQueryParallelism = 64
 
 const (
 	prefetchShardBlockTimeout    = 2500 * time.Millisecond
@@ -117,9 +147,10 @@ const (
 type Delivery string
 
 const (
-	DeliverySimple  Delivery = "simple"
-	DeliveryFEC     Delivery = "fec"
-	DeliveryTwoStep Delivery = "two_step"
+	DeliverySimple   Delivery = "simple"
+	DeliveryFEC      Delivery = "fec"
+	DeliveryTwoStep  Delivery = "two_step"
+	DeliveryPlumtree Delivery = "plumtree"
 )
 
 type BroadcastEvent struct {
@@ -156,32 +187,34 @@ type BroadcastAdmission interface {
 }
 
 func (e BroadcastEvent) BlockRef() string {
-	return formatBlockRef(e.Block)
+	return storage.FormatBlockRef(e.Block)
 }
 
 type Options struct {
-	Logger                    *zerolog.Logger
-	GlobalConfig              *liteclient.GlobalConfig
-	PrivateKey                ed25519.PrivateKey
-	ListenAddr                string
-	ExternalIP                net.IP
-	ExternalPort              uint16
-	DHTPrivateKey             ed25519.PrivateKey
-	DHTListenAddr             string
-	StateFilesDir             string
-	Storage                   storage.Storage
-	PeerServingStorage        storage.PeerServingStorage
-	LiveBlockCache            *storage.LiveBlockCache
-	CompressedState           CompressedBlockStateProvider
-	SyncLag                   SyncLagProvider
-	SignatureVerifier         BroadcastSignatureVerifier
-	BroadcastAdmission        BroadcastAdmission
-	ExternalMessageAdmission  ExternalMessageAdmission
-	BlockReceivedObserver     BlockReceivedObserver
-	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
-	AllowDuplicateExternals   bool
-	LocalExternalFanout       int
-	CustomOverlays            []CustomOverlayConfig
+	Logger                     *zerolog.Logger
+	GlobalConfig               *liteclient.GlobalConfig
+	PrivateKey                 ed25519.PrivateKey
+	ListenAddr                 string
+	ExternalIP                 net.IP
+	ExternalPort               uint16
+	DHTPrivateKey              ed25519.PrivateKey
+	DHTListenAddr              string
+	StateFilesDir              string
+	Storage                    storage.Storage
+	PeerServingStorage         storage.PeerServingStorage
+	LiveBlockCache             *storage.LiveBlockCache
+	CompressedState            CompressedBlockStateProvider
+	SyncLag                    SyncLagProvider
+	SignatureVerifier          BroadcastSignatureVerifier
+	BroadcastAdmission         BroadcastAdmission
+	ExternalMessageAdmission   ExternalMessageAdmission
+	BlockReceivedObserver      BlockReceivedObserver
+	ExternalBroadcastCapacity  ExternalBroadcastCapacityOptions
+	AllowDuplicateExternals    bool
+	LocalExternalFanout        int
+	CustomOverlays             []CustomOverlayConfig
+	PeerCache                  storage.OverlayPeerCache
+	FastSyncCertificateStorage storage.FastSyncCertificateStorage
 }
 
 type ExternalBroadcastCapacityOptions struct {
@@ -263,6 +296,11 @@ type ExternalMessageAdmission interface {
 type BlockReceivedEvent struct {
 	// IsSigned is true for signed block broadcasts and downloaded full blocks.
 	IsSigned bool
+	// FromBroadcast is true when the block arrived as a decoded broadcast
+	// rather than through a download path. Broadcast events are delivered even
+	// when extension hooks are disabled, so the observer can pre-prepare shard
+	// blocks at broadcast-arrival time.
+	FromBroadcast bool
 	// Downloaded contains the received block artifacts.
 	Downloaded *DownloadedBlock
 }
@@ -286,6 +324,8 @@ type CustomOverlayConfig struct {
 	Nodes             []CustomOverlayNodeConfig
 	SenderShards      []CustomOverlayShard
 	SkipPublicMsgSend bool
+	UseQUIC           bool
+	SendQueries       bool
 }
 
 type CustomOverlayNodeConfig struct {
@@ -293,6 +333,7 @@ type CustomOverlayNodeConfig struct {
 	MsgSender         bool
 	MsgSenderPriority int
 	BlockSender       bool
+	AcceptQueries     bool
 }
 
 type CustomOverlayShard struct {
@@ -305,6 +346,7 @@ type overlayKind uint8
 const (
 	overlayKindPublicShard overlayKind = iota
 	overlayKindCustomFixed
+	overlayKindFastSync
 )
 
 type overlaySpec struct {
@@ -318,15 +360,19 @@ type overlaySpec struct {
 	ProtoVersionMinor int32
 	FixedNodes        []PeerID
 	FixedNodeIDs      map[PeerID]struct{}
+	QueryAcceptors    []PeerID
 	MsgSenders        map[PeerID]int
 	BlockSenders      map[PeerID]struct{}
 	AuthorizedKeys    map[string]uint32
 	SenderShards      []CustomOverlayShard
 	SkipPublicMsgSend bool
+	UseQUIC           bool
+	SendQueries       bool
+	AcceptQueries     bool
 	Announce          bool
-	DHTDiscovery      bool
 	RandomPeers       bool
 	QueryCapabilities bool
+	FastSync          *fastSyncOverlaySpec
 }
 
 type DownloadedBlock struct {
@@ -354,11 +400,7 @@ type DownloadedBlock struct {
 }
 
 func (b DownloadedBlock) BlockRef() string {
-	return formatBlockRef(b.ID)
-}
-
-func formatBlockRef(block ton.BlockIDExt) string {
-	return storage.FormatBlockRef(block)
+	return storage.FormatBlockRef(b.ID)
 }
 
 func blockWithEffectiveShard(block ton.BlockIDExt, effectiveShard int64) ton.BlockIDExt {
@@ -369,5 +411,5 @@ func blockWithEffectiveShard(block ton.BlockIDExt, effectiveShard int64) ton.Blo
 }
 
 func formatPersistentStateBlockRef(block ton.BlockIDExt, effectiveShard int64) string {
-	return formatBlockRef(blockWithEffectiveShard(block, effectiveShard))
+	return storage.FormatBlockRef(blockWithEffectiveShard(block, effectiveShard))
 }

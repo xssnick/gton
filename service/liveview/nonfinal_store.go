@@ -66,7 +66,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	if block.Workchain == masterchainID && block.Shard == masterchainShard {
 		return false, nil
 	}
-	if !isFullBlockID(&block) {
+	if !blockproof.IsFullBlockID(block) {
 		return false, storage.ErrNotFound
 	}
 
@@ -194,6 +194,16 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	}
 
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
+	if err == nil {
+		// Kept inline (and its error kept fatal): this state was reconstructed
+		// from a merkle update, and the view build is the last structural check
+		// before it becomes queryable and becomes the base of later non-final
+		// blocks. It also does not run on the block apply path, so the prewarm
+		// stays here too rather than being deferred like the finalized path.
+		if err = prepared.buildFragments(); err == nil && prepared.fragments != nil {
+			err = prewarmFragments(prepared.fragments)
+		}
+	}
 	if err != nil {
 		if keepWaiting {
 			s.deleteNonfinalWaiting(block)
@@ -251,13 +261,16 @@ func (s *Store) nonfinalStateUpdateReadyLocked(key storage.BlockRootHash, block 
 		return true, nil
 	}
 
-	previous, ok := s.nonfinalPreviousStatesLocked(meta)
-	if !ok {
+	previous, err := s.nonfinalPreviousStatesLocked(meta)
+	if errors.Is(err, storage.ErrNotFound) {
 		if keepWaiting {
 			s.rememberNonfinalWaitingLocked(original, kind, validatedStateUpdate)
 			s.trimNonfinalWaitingLocked()
 		}
 		return false, nil
+	}
+	if err != nil {
+		return false, err
 	}
 	if err := nonfinalStateUpdateApplies(previous, update); err != nil {
 		if keepWaiting {
@@ -279,10 +292,10 @@ func (s *Store) NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.Bloc
 			continue
 		}
 		if pending.kind&storage.LiveBlockNonfinalSigned != 0 {
-			signed = append(signed, *cloneBlockID(pending.block))
+			signed = append(signed, cloneBlockID(pending.block))
 		}
 		if pending.kind&storage.LiveBlockNonfinalCandidate != 0 {
-			candidates = append(candidates, *cloneBlockID(pending.block))
+			candidates = append(candidates, cloneBlockID(pending.block))
 		}
 	}
 	sortBlockIDs(signed)
@@ -351,11 +364,14 @@ func (s *Store) nonfinalBlockCellLoader(block ton.BlockIDExt) cell.LazyCellLoade
 
 func (s *Store) loadNonfinalCell(block ton.BlockIDExt, hash cell.Hash, loader cell.LazyCellLoader) (*cell.Cell, error) {
 	s.mu.RLock()
-	cached := s.nonfinalCellDataLocked(block, hash)
+	cached, err := s.nonfinalCellDataLocked(block, hash)
 	base := s.nonFinalCellLoader
 	s.mu.RUnlock()
-	if len(cached) > 0 {
+	if err == nil {
 		return nonfinalLazyCellRecord(hash, cached, loader)
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
 	}
 	if base == nil {
 		return nil, cell.ErrLazyRefNotFound
@@ -363,23 +379,26 @@ func (s *Store) loadNonfinalCell(block ton.BlockIDExt, hash cell.Hash, loader ce
 	return base(hash)
 }
 
-func (s *Store) nonfinalCellDataLocked(block ton.BlockIDExt, hash cell.Hash) []byte {
-	idx := s.nonfinalOrderIndexLocked(storage.BlockKey(block))
-	if idx < 0 {
-		return nil
+func (s *Store) nonfinalCellDataLocked(block ton.BlockIDExt, hash cell.Hash) ([]byte, error) {
+	idx, err := s.nonfinalOrderIndexLocked(storage.BlockKey(block))
+	if err != nil {
+		return nil, err
 	}
 
 	bestIdx := -1
 	var data []byte
 	for _, entry := range s.nonFinalCellIndex[hash] {
-		entryIdx := s.nonfinalOrderIndexLocked(entry.block)
-		if entryIdx < 0 || entryIdx > idx || entryIdx <= bestIdx {
+		entryIdx, err := s.nonfinalOrderIndexLocked(entry.block)
+		if err != nil || entryIdx > idx || entryIdx <= bestIdx {
 			continue
 		}
 		bestIdx = entryIdx
 		data = entry.data
 	}
-	return data
+	if data == nil {
+		return nil, storage.ErrNotFound
+	}
+	return data, nil
 }
 
 func (s *Store) putNonfinalPendingLocked(key storage.BlockRootHash, pending liveNonfinalPending) {
@@ -397,9 +416,6 @@ func (s *Store) putNonfinalPendingLocked(key storage.BlockRootHash, pending live
 func (s *Store) addNonfinalCellIndexLocked(key storage.BlockRootHash, records storage.StateCellRecords) {
 	if records.Empty() {
 		return
-	}
-	if s.nonFinalCellIndex == nil {
-		s.nonFinalCellIndex = map[cell.Hash][]liveNonfinalCellIndexEntry{}
 	}
 
 	seen := map[cell.Hash]struct{}{}
@@ -453,12 +469,12 @@ func (s *Store) removeNonfinalCellIndexLocked(key storage.BlockRootHash, records
 	})
 }
 
-func (s *Store) nonfinalOrderIndexLocked(key storage.BlockRootHash) int {
+func (s *Store) nonfinalOrderIndexLocked(key storage.BlockRootHash) (int, error) {
 	idx, ok := s.nonFinalOrderIndex[key]
 	if !ok {
-		return -1
+		return 0, storage.ErrNotFound
 	}
-	return idx
+	return idx, nil
 }
 
 func (s *Store) nonfinalPrevRefsReadyLocked(meta *storage.BlockMeta) bool {
@@ -495,33 +511,39 @@ func currentBlockStateReady(current *storage.CurrentState, block ton.BlockIDExt)
 	return ok && blockIDEqual(shard.Block, block) && shard.Cell != nil
 }
 
-func (s *Store) nonfinalPreviousStatesLocked(meta *storage.BlockMeta) ([]*storage.BlockState, bool) {
+func (s *Store) nonfinalPreviousStatesLocked(meta *storage.BlockMeta) ([]*storage.BlockState, error) {
 	if meta == nil || len(meta.PrevRefs) == 0 {
-		return nil, false
+		return nil, storage.ErrNotFound
 	}
 
 	previous := make([]*storage.BlockState, 0, len(meta.PrevRefs))
 	for _, prev := range meta.PrevRefs {
-		state := s.nonfinalBlockStateLocked(prev)
-		if state == nil || state.Cell == nil {
-			return nil, false
+		state, err := s.nonfinalBlockStateLocked(prev)
+		if err != nil {
+			return nil, err
+		}
+		if state.Cell == nil {
+			return nil, storage.ErrNotFound
 		}
 		previous = append(previous, state)
 	}
-	return previous, true
+	return previous, nil
 }
 
-func (s *Store) nonfinalBlockStateLocked(block ton.BlockIDExt) *storage.BlockState {
+func (s *Store) nonfinalBlockStateLocked(block ton.BlockIDExt) (*storage.BlockState, error) {
 	key, ok := liveBlockLookupKeyFromBlock(block)
 	if ok {
 		if state, exists := s.states[key]; exists && blockIDEqual(state.Block, block) {
-			return storage.CloneBlockState(&state)
+			return storage.CloneBlockState(&state), nil
 		}
 	}
 	if state := blockStateFromCurrent(s.pendingCurrent, block); state != nil {
-		return state
+		return state, nil
 	}
-	return blockStateFromCurrent(s.current, block)
+	if state := blockStateFromCurrent(s.current, block); state != nil {
+		return state, nil
+	}
+	return nil, storage.ErrNotFound
 }
 
 func (s *Store) removeNonfinalLookupIndexesLocked(block ton.BlockIDExt) {

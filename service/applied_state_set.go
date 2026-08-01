@@ -32,24 +32,35 @@ type appliedStateCheckpoint struct {
 }
 
 func (s *appliedStateSet) rememberWithArtifacts(state *storage.BlockState, artifact *storage.ServedBlockFull, links []storage.ServedBlockLink) {
-	if state == nil {
-		return
-	}
-
-	s.rememberEntry(appliedStateEntry{
+	// checkpointBlockStateMetadata and clone both return owned copies, so the
+	// set can take them directly instead of cloning the same graph twice.
+	s.rememberOwnedEntry(appliedStateEntry{
 		state:    checkpointBlockStateMetadata(state),
 		artifact: appliedBlockArtifactFrom(artifact, links).clone(),
 	})
 }
 
+// rememberAllEntries takes ownership of entries. Its only producer is
+// takeEntries, which hands over the entries a set already owned.
 func (s *appliedStateSet) rememberAllEntries(entries []appliedStateEntry) {
 	for _, entry := range entries {
-		s.rememberEntry(entry)
+		s.rememberOwnedEntry(entry)
 	}
 }
 
+// takeEntries transfers the owned entries out and empties the set, so moving a
+// catch-up window into the service does not re-clone metadata the set already
+// owns exclusively.
 func (s *appliedStateSet) takeEntries() []appliedStateEntry {
-	entries := s.cloneEntries()
+	if len(s.states) == 0 {
+		return nil
+	}
+
+	keys := sortedStateEntryKeys(s.states)
+	entries := make([]appliedStateEntry, 0, len(keys))
+	for _, key := range keys {
+		entries = append(entries, s.states[key])
+	}
 	s.states = nil
 	s.artifactBytes = 0
 	return entries
@@ -105,22 +116,10 @@ func (s *appliedStateSet) cloneEntries() []appliedStateEntry {
 		return nil
 	}
 
-	cloned := make(map[storage.BlockRootHash]appliedStateEntry, len(s.states))
-	for key, entry := range s.states {
-		cloned[key] = cloneAppliedStateEntry(entry)
-	}
-	return sortedClonedStateEntries(cloned)
-}
-
-func sortedClonedStateEntries(entries map[storage.BlockRootHash]appliedStateEntry) []appliedStateEntry {
-	if len(entries) == 0 {
-		return nil
-	}
-	cloned := make([]appliedStateEntry, 0, len(entries))
-	keys := sortedStateEntryKeys(entries)
+	keys := sortedStateEntryKeys(s.states)
+	cloned := make([]appliedStateEntry, 0, len(keys))
 	for _, key := range keys {
-		entry := entries[key]
-		cloned = append(cloned, cloneAppliedStateEntry(entry))
+		cloned = append(cloned, cloneAppliedStateEntry(s.states[key]))
 	}
 	return cloned
 }
@@ -136,25 +135,33 @@ func sortedStateEntryKeys(entries map[storage.BlockRootHash]appliedStateEntry) [
 	return keys
 }
 
+// rememberEntry stores a borrowed entry and is safe for callers that keep using
+// their copy. Callers that already own an exclusive copy should use
+// rememberOwnedEntry instead.
 func (s *appliedStateSet) rememberEntry(entry appliedStateEntry) {
-	if entry.state == nil {
-		return
-	}
+	s.rememberOwnedEntry(cloneAppliedStateEntry(entry))
+}
+
+// rememberOwnedEntry takes ownership of entry and its metadata graph: the
+// caller must not mutate it afterwards. Block and proof payload slices stay
+// shared as immutable data, exactly as cloneAppliedStateEntry already defines.
+func (s *appliedStateSet) rememberOwnedEntry(entry appliedStateEntry) {
 	if s.states == nil {
 		s.states = map[storage.BlockRootHash]appliedStateEntry{}
 	}
 	key := storage.BlockKey(entry.state.Block)
-	cloned := cloneAppliedStateEntry(entry)
 	if existing, ok := s.states[key]; ok {
 		s.artifactBytes -= existing.artifact.bytes
-		if !cloned.artifact.complete() && existing.artifact.complete() {
-			cloned.artifact = existing.artifact.clone()
+		if !entry.artifact.complete() && existing.artifact.complete() {
+			// The replaced entry is dropped from the map here, so its artifact
+			// can move into the new entry instead of being cloned.
+			entry.artifact = existing.artifact
 		}
 	}
 	s.nextVersion++
-	cloned.version = s.nextVersion
-	s.states[key] = cloned
-	s.artifactBytes += cloned.artifact.bytes
+	entry.version = s.nextVersion
+	s.states[key] = entry
+	s.artifactBytes += entry.artifact.bytes
 }
 
 func (s *appliedStateSet) byteSize() uint64 {
@@ -170,9 +177,6 @@ func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
 }
 
 func checkpointBlockStateMetadata(state *storage.BlockState) *storage.BlockState {
-	if state == nil {
-		return nil
-	}
 	metadata := storage.BlockStateWithoutCells(state)
 	if len(metadata.StateRootHash) == 0 && state.Cell != nil {
 		hash := state.Cell.HashKey(0)

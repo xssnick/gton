@@ -113,9 +113,10 @@ func (s *Server) handleRunGetMethodWithStack(ctx context.Context, params request
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	seqno, hasSeqno, apiErr := params.optionalUint32("seqno")
-	if apiErr != nil {
-		return nil, apiErr
+	seqno, err := params.optionalUint32("seqno")
+	hasSeqno := err == nil
+	if err != nil && !errors.Is(err, errRequestParamNotFound) {
+		return nil, asAPIError(err)
 	}
 
 	var values []any
@@ -267,7 +268,7 @@ func (s *Server) runMethodAccount(ctx context.Context, addr *address.Address, se
 }
 
 func runMethodAddress(params requestParams) (*address.Address, *apiError) {
-	addr, _, _, apiErr := parseStdAddressParam(params, "address")
+	addr, _, apiErr := parseStdAddressParam(params, "address")
 	if apiErr != nil {
 		return nil, apiErr
 	}

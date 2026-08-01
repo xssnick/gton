@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	tnstate "github.com/xssnick/gton/service/state"
+	"github.com/xssnick/gton/service/storage"
+
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -82,10 +84,10 @@ func splitStateParts(block ton.BlockIDExt, proof *cell.Cell, splitDepth uint32, 
 func validateSplitStateHeader(block ton.BlockIDExt, state *tlb.ShardStateUnsplit) error {
 	workchain, shard := tlb.ConvertShardIdentToShard(state.ShardIdent)
 	if workchain != block.Workchain || int64(shard) != block.Shard {
-		return fmt.Errorf("split state shard mismatch for %s: got wc=%d shard=%016x", formatBlockRef(block), workchain, shard)
+		return fmt.Errorf("split state shard mismatch for %s: got wc=%d shard=%016x", storage.FormatBlockRef(block), workchain, shard)
 	}
 	if state.Seqno != block.SeqNo {
-		return fmt.Errorf("split state seqno mismatch for %s: got %d", formatBlockRef(block), state.Seqno)
+		return fmt.Errorf("split state seqno mismatch for %s: got %d", storage.FormatBlockRef(block), state.Seqno)
 	}
 	return nil
 }

@@ -2,10 +2,12 @@ package p2p
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"time"
 
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/gton/service/storage"
 
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/ton"
@@ -15,14 +17,21 @@ import (
 const (
 	broadcastDecodeQueueSize = 64
 	// masterchain decodes gate the live sync head, so they get a small
-	// dedicated lane that is never queued behind shard and candidate payloads.
+	// dedicated lane that is never queued behind shard payloads.
 	broadcastMasterDecodeQueueSize = 16
+
+	// broadcastDecodeWorkerMin keeps small nodes at today's parallelism;
+	// broadcastDecodeWorkerMax bounds concurrent decode arenas, since nothing
+	// accounts for the bytes a decode holds (compressed payload, fresh cell
+	// graph, re-serialized BOC, plus the lazily walked previous state).
+	broadcastDecodeWorkerMin = 2
+	broadcastDecodeWorkerMax = 8
 )
 
 // offloadedBroadcastDecode is a full-block broadcast whose validator
-// signatures already passed the predecode check on the listen thread; the
-// expensive payload decode runs on the bounded decode pool so multi-MB
-// blocks do not stall ADNL listeners or delay FEC relay to other peers.
+// signatures the transport thread already verified; the expensive payload
+// decode runs on the bounded decode pool so multi-MB blocks do not stall ADNL
+// listeners or delay FEC relay to other peers.
 type offloadedBroadcastDecode struct {
 	fingerprint  string
 	overlay      string
@@ -39,12 +48,23 @@ type offloadedBroadcastDecode struct {
 }
 
 func broadcastDecodeWorkerCount() int {
-	workers := runtime.GOMAXPROCS(0) / 4
-	if workers < 2 {
-		workers = 2
+	return broadcastDecodeWorkerCountFor(runtime.GOMAXPROCS(0))
+}
+
+// broadcastDecodeWorkerCountFor sizes the shared decode lane. A decode is not
+// pure CPU — a compressed-v2 payload blocks on celldb for the previous state
+// and on lazy state-cell walks — so a CPU-fraction sizing under-subscribes the
+// pool exactly when it matters. It also errs on the generous side because the
+// alternative to a free worker is the inline fallback, which occupies a shared
+// ADNL listener goroutine or a QUIC stream-admission lease for the whole
+// multi-MB decode.
+func broadcastDecodeWorkerCountFor(procs int) int {
+	workers := procs / 2
+	if workers < broadcastDecodeWorkerMin {
+		workers = broadcastDecodeWorkerMin
 	}
-	if workers > 4 {
-		workers = 4
+	if workers > broadcastDecodeWorkerMax {
+		workers = broadcastDecodeWorkerMax
 	}
 	return workers
 }
@@ -54,7 +74,7 @@ func broadcastDecodeWorkerCount() int {
 // The pool is tied to the node's single run: once the run context ends the
 // workers exit and later enqueues are refused.
 func (n *Node) enqueueBroadcastDecode(req offloadedBroadcastDecode) bool {
-	if n.runtimeContext().Err() != nil {
+	if n.runCtx.Err() != nil {
 		return false
 	}
 	n.decodeWorkersOnce.Do(func() {
@@ -79,10 +99,10 @@ func (n *Node) enqueueBroadcastDecode(req offloadedBroadcastDecode) bool {
 }
 
 func (n *Node) runBroadcastDecodeWorker() {
-	ctx := n.runtimeContext()
+	ctx := n.runCtx
 	for {
 		// masterchain decodes gate the live head; drain their lane before
-		// picking up shard or candidate payloads
+		// picking up shard payloads
 		select {
 		case <-ctx.Done():
 			return
@@ -107,7 +127,7 @@ func (n *Node) runBroadcastDecodeWorker() {
 // masterchain lane so a burst of multi-MB shard decodes occupying the shared
 // workers cannot delay the next masterchain head.
 func (n *Node) runMasterchainBroadcastDecodeWorker() {
-	ctx := n.runtimeContext()
+	ctx := n.runCtx
 	for {
 		select {
 		case <-ctx.Done():
@@ -123,14 +143,19 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 		return
 	}
 	if !n.canAcceptBroadcast(req.kind, false) {
+		// forget the fingerprint so a later redelivery re-runs admission
 		n.deduper.Forget(req.fingerprint)
 		n.noteBroadcastDrop(req.overlay, req.kind, "broadcast_admission_closed")
 		return
 	}
 
-	downloaded, sigSet, cached := n.cachedDecodedBroadcast(req.kind, req.block)
-	if cached {
-		n.noteBroadcast("decode_reused", req.overlay, req.kind)
+	downloaded, sigSet, cacheErr := n.decodedBroadcasts.get(req.kind, req.block)
+	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
+		n.noteBroadcast("decode_reused", req.overlay, req.kind, req.delivery)
+		return
+	}
+	if cacheErr == nil {
+		n.noteBroadcast("decode_reused", req.overlay, req.kind, req.delivery)
 		if req.preSigSet != nil {
 			sigSet = req.preSigSet
 		}
@@ -150,11 +175,7 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 			n.handleOffloadedBroadcastDecodeError(req, err)
 			return
 		}
-		n.rememberDecodedBroadcast(req.kind, req.block, downloaded, sigSet)
-	}
-	if downloaded == nil {
-		n.noteBroadcastDrop(req.overlay, req.kind, "decode_failed")
-		return
+		n.decodedBroadcasts.put(req.kind, req.block, downloaded, sigSet)
 	}
 
 	downloaded.SourcePeerID = req.sourcePeerID
@@ -164,11 +185,12 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 
 	block := cloneBlockID(req.block)
 	n.acceptBroadcast(acceptedBroadcast{
-		fingerprint:        req.fingerprint,
-		deduped:            true,
-		skipAcceptedMetric: true,
-		block:              &block,
-		rebroadcast:        pendingBlockBroadcastRebroadcast(req.rebroadcast),
+		fingerprint:         req.fingerprint,
+		deduped:             true,
+		skipAcceptedMetric:  true,
+		block:               &block,
+		rebroadcast:         pendingBlockBroadcastRebroadcast(req.rebroadcast),
+		processedDecodeKind: req.kind,
 		event: &BroadcastEvent{
 			Overlay:      req.overlay,
 			Delivery:     req.delivery,
@@ -208,14 +230,14 @@ func (n *Node) handleOffloadedBroadcastDecodeError(req offloadedBroadcastDecode,
 			})
 			n.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(req.block)).
+				Str("block", storage.FormatBlockRef(req.block)).
 				Str("kind", req.kind).
 				Msg("queued offloaded block broadcast until previous state is available")
 			return
 		}
 		n.log.Debug().
 			Err(err).
-			Str("block", formatBlockRef(req.block)).
+			Str("block", storage.FormatBlockRef(req.block)).
 			Str("kind", req.kind).
 			Msg("dropping offloaded block broadcast because state-ready artifact is missing")
 		n.noteBroadcastDrop(req.overlay, req.kind, "state_artifact_missing")
@@ -224,7 +246,7 @@ func (n *Node) handleOffloadedBroadcastDecodeError(req offloadedBroadcastDecode,
 
 	n.log.Debug().
 		Err(err).
-		Str("block", formatBlockRef(req.block)).
+		Str("block", storage.FormatBlockRef(req.block)).
 		Str("kind", req.kind).
 		Msg("dropping offloaded block broadcast because payload decode failed")
 	n.noteBroadcastDrop(req.overlay, req.kind, "decode_failed")

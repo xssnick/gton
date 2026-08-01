@@ -80,10 +80,6 @@ func CloneBlockState(state *BlockState) *BlockState {
 }
 
 func BlockStateWithoutCells(state *BlockState) BlockState {
-	if state == nil {
-		return BlockState{}
-	}
-
 	return BlockState{
 		Block:          cloneBlockID(state.Block),
 		StateRootHash:  bytes.Clone(state.StateRootHash),

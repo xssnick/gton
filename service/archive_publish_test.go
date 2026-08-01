@@ -15,9 +15,11 @@ func TestImportArchiveBlocksRejectsInvalidNewArchive(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	svc := &Service{storage: store}
 	ctx := context.Background()
+	importer := archive.NewImporter()
+	t.Cleanup(importer.Close)
 
 	badData := []byte{0x00, 0x01, 0x02, 0x03}
-	_, err := svc.importArchiveBlocks(ctx, &archive.Downloaded{
+	_, err := svc.importArchiveBlocks(ctx, importer, &archive.Downloaded{
 		MasterchainSeqno: 21,
 		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
 		ArchiveID:        0,

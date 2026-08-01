@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -14,8 +15,14 @@ const (
 	preparedShardBlockTTL          = 3 * time.Minute
 	preparedShardBlockMaxItems     = 512
 	preparedShardBlockMaxBytes     = int64(256 << 20)
-	preparedShardBlockWorkers      = 3
+	preparedShardBlockWorkers      = 8
 	preparedShardBlockFetchTimeout = 15 * time.Second
+
+	// preparedShardBlockQueueSize bounds the requests parked between the feeds
+	// (decoded broadcasts, description-hint prefetches) and the workers. Queued
+	// payloads reference data already pinned by the p2p broadcast caches, so
+	// the queue itself adds little memory.
+	preparedShardBlockQueueSize = 32
 )
 
 type preparedShardBlockEntry struct {
@@ -36,7 +43,7 @@ type preparedShardBlockCache struct {
 	inflight map[storage.BlockRootHash]struct{}
 }
 
-func (c *preparedShardBlockCache) take(block ton.BlockIDExt) (PreparedBlock, bool) {
+func (c *preparedShardBlockCache) take(block ton.BlockIDExt) (PreparedBlock, error) {
 	key := storage.BlockKey(block)
 
 	c.mu.Lock()
@@ -44,17 +51,14 @@ func (c *preparedShardBlockCache) take(block ton.BlockIDExt) (PreparedBlock, boo
 
 	entry, ok := c.entries[key]
 	if !ok {
-		return PreparedBlock{}, false
+		return PreparedBlock{}, storage.ErrNotFound
 	}
 	delete(c.entries, key)
 	c.bytes -= entry.bytes
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 	if time.Since(entry.storedAt) > preparedShardBlockTTL {
-		return PreparedBlock{}, false
+		return PreparedBlock{}, storage.ErrNotFound
 	}
-	return entry.block, true
+	return entry.block, nil
 }
 
 // beginPrepare reserves the block for a prepare worker. It returns false when
@@ -142,82 +146,122 @@ func (c *preparedShardBlockCache) pruneLocked(now time.Time) {
 			delete(c.entries, key)
 		}
 	}
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
 }
 
-// prepareShardBlockAheadFromVerified prepares an already-verified shard block
-// in the caller's goroutine, bounded by the prepare worker slots; when all
-// slots are busy the block is skipped and the resolver prepares it on demand.
-func (s *Service) prepareShardBlockAheadFromVerified(verified VerifiedBlock) {
-	if verified.ID.Workchain == -1 {
+// known reports the block is already prepared or being prepared. It is a
+// read-only peek used to keep duplicate feed requests out of the bounded
+// queue; beginPrepare stays the one authority a worker reserves through.
+func (c *preparedShardBlockCache) known(block ton.BlockIDExt) bool {
+	key := storage.BlockKey(block)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.entries[key]; ok {
+		return true
+	}
+	_, ok := c.inflight[key]
+	return ok
+}
+
+// shardPrepareRequest is one shard block to verify and pre-prepare. At most
+// one payload field is set: verified comes from an already-verified synced
+// block, downloaded from a decoded broadcast, and neither means the worker
+// fetches the block by id (a hot-cache hit after a description prefetch).
+type shardPrepareRequest struct {
+	block      ton.BlockIDExt
+	verified   *VerifiedBlock
+	downloaded *p2p.DownloadedBlock
+}
+
+// enqueueShardBlockPrepare feeds the pre-prepare workers without blocking the
+// caller (broadcast accept paths and the serial block processor both land
+// here). Refuse-newest on a full queue: the commit stage consumes blocks
+// oldest-first, so under a burst the queued older entries are the ones it
+// needs next, while a refused block stays in the p2p hot cache and is
+// prepared inline by the resolver later — losing an entry only costs latency,
+// never correctness.
+func (s *Service) enqueueShardBlockPrepare(req shardPrepareRequest) {
+	if req.block.Workchain == -1 || s.shardPrepareQueue == nil {
 		return
 	}
-	if !s.preparedShardBlocks.beginPrepare(verified.ID) {
+	if s.preparedShardBlocks.known(req.block) {
 		return
 	}
 	select {
-	case s.preparedShardBlockSlots <- struct{}{}:
+	case s.shardPrepareQueue <- req:
 	default:
-		s.preparedShardBlocks.abortPrepare(verified.ID)
-		return
 	}
-	defer func() { <-s.preparedShardBlockSlots }()
-
-	prepared, err := prepareVerifiedBlockForApply(verified)
-	if err != nil {
-		s.preparedShardBlocks.abortPrepare(verified.ID)
-		s.log.Debug().
-			Err(err).
-			Str("block", verified.BlockRef()).
-			Msg("failed to prepare shard block ahead of apply")
-		return
-	}
-	s.preparedShardBlocks.storePrepared(prepared)
 }
 
-// prepareShardBlockAheadByID fetches a shard block (usually a broadcast-cache
-// hit after a description prefetch) and prepares it ahead of apply.
-func (s *Service) prepareShardBlockAheadByID(ctx context.Context, block ton.BlockIDExt) {
-	if block.Workchain == -1 || s.node == nil {
-		return
+func (s *Service) runShardPrepareWorkers(ctx context.Context) {
+	var wg sync.WaitGroup
+	for i := 0; i < preparedShardBlockWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case req := <-s.shardPrepareQueue:
+					s.prepareShardBlockRequest(ctx, req)
+				}
+			}
+		}()
 	}
-	if !s.preparedShardBlocks.beginPrepare(block) {
-		return
-	}
-	select {
-	case s.preparedShardBlockSlots <- struct{}{}:
-	default:
-		s.preparedShardBlocks.abortPrepare(block)
-		return
-	}
-	defer func() { <-s.preparedShardBlockSlots }()
+	wg.Wait()
+}
 
-	fetchCtx, cancel := context.WithTimeout(ctx, preparedShardBlockFetchTimeout)
-	defer cancel()
+func (s *Service) prepareShardBlockRequest(ctx context.Context, req shardPrepareRequest) {
+	if !s.preparedShardBlocks.beginPrepare(req.block) {
+		return
+	}
 
-	downloaded, err := s.node.DownloadBlockFull(fetchCtx, block)
-	if err == nil && downloaded == nil {
-		err = storage.ErrNotFound
-	}
-	var verified VerifiedBlock
-	if err == nil {
-		verified, err = verifyDownloadedBlock(*downloaded)
-	}
+	verified, err := s.verifiedShardBlockForPrepare(ctx, req)
 	var prepared PreparedBlock
 	if err == nil {
 		prepared, err = prepareVerifiedBlockForApply(verified)
 	}
 	if err != nil {
-		s.preparedShardBlocks.abortPrepare(block)
+		s.preparedShardBlocks.abortPrepare(req.block)
 		if ctx.Err() == nil {
 			s.log.Debug().
 				Err(err).
-				Str("block", storage.FormatBlockRef(block)).
+				Str("block", storage.FormatBlockRef(req.block)).
 				Msg("failed to prepare shard block ahead of apply")
 		}
 		return
 	}
 	s.preparedShardBlocks.storePrepared(prepared)
+}
+
+func (s *Service) verifiedShardBlockForPrepare(ctx context.Context, req shardPrepareRequest) (VerifiedBlock, error) {
+	if req.verified != nil {
+		return *req.verified, nil
+	}
+	if req.downloaded != nil {
+		return s.verifyDownloadedBlock(*req.downloaded)
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, preparedShardBlockFetchTimeout)
+	defer cancel()
+
+	downloaded, err := s.node.DownloadBlockFull(fetchCtx, req.block)
+	if err != nil {
+		return VerifiedBlock{}, err
+	}
+	return s.verifyDownloadedBlock(*downloaded)
+}
+
+// prepareShardBlockAheadFromVerified queues an already-verified shard block so
+// a prepare worker runs PrepareStateUpdateCells off the caller's goroutine.
+func (s *Service) prepareShardBlockAheadFromVerified(verified VerifiedBlock) {
+	s.enqueueShardBlockPrepare(shardPrepareRequest{block: verified.ID, verified: &verified})
+}
+
+// prepareShardBlockAheadByID queues a shard block (usually a broadcast-cache
+// hit after a description prefetch) for fetch and pre-preparation.
+func (s *Service) prepareShardBlockAheadByID(_ context.Context, block ton.BlockIDExt) {
+	s.enqueueShardBlockPrepare(shardPrepareRequest{block: block})
 }

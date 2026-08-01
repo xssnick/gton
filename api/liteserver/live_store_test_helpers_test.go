@@ -17,48 +17,31 @@ type LiveStore struct {
 	*liveview.Store
 }
 
-type LiveStoreOptions = liveview.Options
-type CurrentAccountBlockIDs = liveview.CurrentAccountBlockIDs
-type liveBlockFragments = liveview.BlockView
-
-var (
-	errWaitMasterchainTimeout = liveview.ErrWaitMasterchainTimeout
-	errWaitMasterchainTooFar  = liveview.ErrWaitMasterchainTooFar
-)
-
-func NewLiveStore(store liveview.Backing, opts ...LiveStoreOptions) *LiveStore {
+func NewLiveStore(store liveview.Backing, opts ...liveview.Options) *LiveStore {
 	return &LiveStore{Store: liveview.New(store, opts...)}
 }
 
-func buildLiveBlockFragments(block ton.BlockIDExt, blockRoot *cell.Cell, stateRoot *cell.Cell) (*liveview.BlockView, error) {
-	return liveview.NewBlockView(block, blockRoot, stateRoot)
-}
-
-func parseTrustedBlockBOC(id ton.BlockIDExt, data []byte) (*cell.Cell, error) {
-	return liveview.ParseTrustedBlockBOC(id, data)
-}
-
-func currentAccountBlocksFromState(current *storage.CurrentState, workchain int32, account []byte) (CurrentAccountBlockIDs, error) {
+func currentAccountBlocksFromState(current *storage.CurrentState, workchain int32, account []byte) (liveview.CurrentAccountBlockIDs, error) {
 	if current == nil {
-		return CurrentAccountBlockIDs{}, storage.ErrNotFound
+		return liveview.CurrentAccountBlockIDs{}, storage.ErrNotFound
 	}
 
 	master := current.Masterchain.Block
 	if workchain == masterchainID {
-		return CurrentAccountBlockIDs{Master: master, Account: master}, nil
+		return liveview.CurrentAccountBlockIDs{Master: master, Account: master}, nil
 	}
 	if len(account) != 32 {
-		return CurrentAccountBlockIDs{}, storage.ErrNotFound
+		return liveview.CurrentAccountBlockIDs{}, storage.ErrNotFound
 	}
 
 	candidates := storage.AccountShardCandidates(workchain, account)
 	for i := len(candidates) - 1; i >= 0; i-- {
 		key := storage.ShardKey{Workchain: workchain, Shard: candidates[i]}
 		if shard, ok := current.Shards[key]; ok {
-			return CurrentAccountBlockIDs{Master: master, Account: shard.Block}, nil
+			return liveview.CurrentAccountBlockIDs{Master: master, Account: shard.Block}, nil
 		}
 	}
-	return CurrentAccountBlockIDs{}, storage.ErrNotFound
+	return liveview.CurrentAccountBlockIDs{}, storage.ErrNotFound
 }
 
 func (s *LiveStore) publishLiveBlockData(block ton.BlockIDExt, root *cell.Cell, data []byte, artifactFlushed bool) error {
@@ -91,7 +74,7 @@ func (s *Server) loadStateRootWithBlockRoot(ctx context.Context, id ton.BlockIDE
 		return nil, nil, err
 	}
 
-	blockRoot, err := s.loadBlockRoot(ctx, id)
+	blockRoot, err := s.store.BlockRoot(ctx, id)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load block root for state %s: %w", storage.FormatBlockRef(id), err)
 	}

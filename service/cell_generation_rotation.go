@@ -117,7 +117,7 @@ func (s *Service) StartCellGenerationMigration(ctx context.Context, masterSeqno 
 		return err
 	}
 
-	persistent, err := s.durableMasterchainBlockForMigration(ctx, masterSeqno)
+	persistent, err := s.durableMasterchainBlock(ctx, masterSeqno, "cell generation migration")
 	if err != nil {
 		migrationLease.release()
 		return err
@@ -140,10 +140,6 @@ func (s *Service) StartCellGenerationMigration(ctx context.Context, masterSeqno 
 	return s.startCellGenerationMigrationWithLease(store, persistent, "manual", migrationLease)
 }
 
-func (s *Service) durableMasterchainBlockForMigration(ctx context.Context, masterSeqno uint32) (ton.BlockIDExt, error) {
-	return s.durableMasterchainBlock(ctx, masterSeqno, "cell generation migration")
-}
-
 func (s *Service) queueCellGenerationMigration(ctx context.Context, store storage.Storage, persistent ton.BlockIDExt, source string) error {
 	select {
 	case <-ctx.Done():
@@ -157,7 +153,7 @@ func (s *Service) queueCellGenerationMigration(ctx context.Context, store storag
 		return err
 	}
 
-	generation, err := store.BeginCellGeneration(s.currentStatePersistContext(), persistent)
+	generation, err := store.BeginCellGeneration(s.shutdownContext, persistent)
 	if err != nil {
 		return fmt.Errorf("persist cell generation migration intent: %w", err)
 	}
@@ -172,7 +168,7 @@ func (s *Service) queueCellGenerationMigration(ctx context.Context, store storag
 }
 
 func (s *Service) startCellGenerationMigrationWithLease(store storage.Storage, persistent ton.BlockIDExt, source string, migrationLease *exclusiveServiceTaskLease) error {
-	runCtx, run, err := s.beginCellGenerationMigrationRun(s.currentStatePersistContext())
+	runCtx, run, err := s.beginCellGenerationMigrationRun(s.shutdownContext)
 	if err != nil {
 		migrationLease.release()
 		return err
@@ -432,10 +428,7 @@ func (s *Service) requestCellGenerationSwitch(generation uint64, target ton.Bloc
 			Msg("cell generation switch requested")
 	}
 
-	select {
-	case s.currentStateWake <- struct{}{}:
-	default:
-	}
+	s.broadcastCurrentStateWake()
 }
 
 func (s *Service) clearCellGenerationSwitchRequest() {
@@ -541,7 +534,7 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store storage.
 			message = "leaving pending cell generation migration for startup resume"
 		}
 		if errors.Is(err, errCellGenerationPersistentMissing) {
-			dropErr := store.DropPendingCellGeneration(s.currentStatePersistContext(), generation)
+			dropErr := store.DropPendingCellGeneration(s.shutdownContext, generation)
 			event = s.log.Error()
 			message = "aborting pending cell generation migration because serialized persistent state is missing"
 			if dropErr != nil {
@@ -629,11 +622,8 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store storage.
 		}
 
 		for {
-			didSwitch, latest, oldGeneration, err := s.trySwitchCellGenerationCandidate(ctx, store, candidate, origin)
-			if err != nil {
-				return err
-			}
-			if didSwitch {
+			oldGeneration, err := s.trySwitchCellGenerationCandidate(ctx, store, candidate, origin)
+			if err == nil {
 				switchRequested = false
 				switched = true
 				if oldGeneration != 0 {
@@ -646,8 +636,13 @@ func (s *Service) runCellGenerationMigration(ctx context.Context, store storage.
 				}
 				return nil
 			}
-			if latest == nil {
-				return fmt.Errorf("cell generation switch did not return latest current state")
+			if !errors.Is(err, storage.ErrCurrentStateAdvanced) {
+				return err
+			}
+
+			latest, err := s.storage.CurrentState(ctx)
+			if err != nil {
+				return fmt.Errorf("load durable current state after rejected cell generation switch: %w", err)
 			}
 
 			s.log.Info().
@@ -686,7 +681,7 @@ func (s *Service) catchUpAndFlushCellGenerationCandidate(ctx context.Context, st
 }
 
 func (s *Service) throttleActiveCellGenerationCompactions(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, target *storage.CurrentState) (func(), error) {
-	if candidate == nil || candidate.current == nil || target == nil || target.Masterchain.Block.SeqNo <= candidate.current.Masterchain.Block.SeqNo {
+	if target.Masterchain.Block.SeqNo <= candidate.current.Masterchain.Block.SeqNo {
 		return func() {}, nil
 	}
 
@@ -1059,7 +1054,7 @@ func (s *Service) catchUpCellGenerationCandidate(ctx context.Context, store stor
 			lastLogProcessed = processed
 		}
 
-		if checkpointBlocks >= s.nextCheckpointBlocks() || candidate.cells.activeByteSize() >= s.checkpointBytesTarget() {
+		if checkpointBlocks >= s.nextBlockCheckpointBlocks || candidate.cells.activeByteSize() >= s.checkpointBytes {
 			if checkpointFlush != nil {
 				if err = <-checkpointFlush; err != nil {
 					checkpointFlush = nil
@@ -1113,7 +1108,7 @@ func (s *Service) prefetchCellGenerationCandidateBlock(ctx context.Context, prev
 
 func (s *Service) startCellGenerationCandidateCheckpoint(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate) <-chan error {
 	checkpoint := candidate.cells.beginCheckpoint()
-	if checkpoint == nil {
+	if len(checkpoint.caches) == 0 {
 		return nil
 	}
 
@@ -1243,7 +1238,7 @@ func (s *Service) loadCandidateBlockForApply(ctx context.Context, block ton.Bloc
 
 func (s *Service) flushCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate) error {
 	checkpoint := candidate.cells.beginCheckpoint()
-	if checkpoint == nil {
+	if len(checkpoint.caches) == 0 {
 		return nil
 	}
 
@@ -1318,41 +1313,41 @@ func (s *Service) prepareCellGenerationSwitchCandidate(ctx context.Context, stor
 	return nil
 }
 
-func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (bool, *storage.CurrentState, uint64, error) {
+func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store storage.Storage, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (uint64, error) {
 	s.stateMu.Lock()
 	s.currentStatePersistMu.Lock()
 
 	if err := s.checkCurrentStatePersistAllowed(); err != nil {
 		s.currentStatePersistMu.Unlock()
 		s.stateMu.Unlock()
-		return false, nil, 0, err
+		return 0, err
 	}
 
 	latest, err := s.storage.CurrentState(ctx)
 	if err != nil {
 		s.currentStatePersistMu.Unlock()
 		s.stateMu.Unlock()
-		return false, nil, 0, fmt.Errorf("load durable current state before cell generation switch: %w", err)
+		return 0, fmt.Errorf("load durable current state before cell generation switch: %w", err)
 	}
 	if latest.Masterchain.Block.SeqNo > candidate.current.Masterchain.Block.SeqNo {
 		s.currentStatePersistMu.Unlock()
 		s.stateMu.Unlock()
-		return false, latest, 0, nil
+		return 0, storage.ErrCurrentStateAdvanced
 	}
 	if !currentStateBlockRefsEqual(latest, candidate.current) {
 		s.currentStatePersistMu.Unlock()
 		s.stateMu.Unlock()
-		return false, nil, 0, fmt.Errorf("candidate current state %s does not match durable current state %s", storage.FormatBlockRef(candidate.current.Masterchain.Block), storage.FormatBlockRef(latest.Masterchain.Block))
+		return 0, fmt.Errorf("candidate current state %s does not match durable current state %s", storage.FormatBlockRef(candidate.current.Masterchain.Block), storage.FormatBlockRef(latest.Masterchain.Block))
 	}
 	if !currentStateRootsEqual(latest, candidate.current) {
 		s.currentStatePersistMu.Unlock()
 		s.stateMu.Unlock()
-		return false, nil, 0, fmt.Errorf("candidate current state roots do not match durable current state roots at %s", storage.FormatBlockRef(latest.Masterchain.Block))
+		return 0, fmt.Errorf("candidate current state roots do not match durable current state roots at %s", storage.FormatBlockRef(latest.Masterchain.Block))
 	}
 	if !s.beginCellGenerationSwitch() {
 		s.currentStatePersistMu.Unlock()
 		s.stateMu.Unlock()
-		return false, nil, 0, errCellGenerationMigrationRunning
+		return 0, errCellGenerationMigrationRunning
 	}
 	s.currentStatePersistMu.Unlock()
 	s.stateMu.Unlock()
@@ -1367,13 +1362,9 @@ func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store st
 	oldGeneration, err := store.SwitchCellGeneration(ctx, candidate.generation, origin, latest.Masterchain.Block, currentStateWithoutCells(latest))
 	if err != nil {
 		if errors.Is(err, storage.ErrCurrentStateAdvanced) {
-			latest, loadErr := s.storage.CurrentState(ctx)
-			if loadErr != nil {
-				return false, nil, 0, fmt.Errorf("load durable current state after rejected cell generation switch: %w", loadErr)
-			}
-			return false, latest, 0, nil
+			return 0, storage.ErrCurrentStateAdvanced
 		}
-		return false, nil, 0, err
+		return 0, err
 	}
 	s.publishCommittedCurrentState(candidate.current)
 	s.log.Info().
@@ -1381,13 +1372,10 @@ func (s *Service) trySwitchCellGenerationCandidate(ctx context.Context, store st
 		Uint64("old_cell_generation", oldGeneration).
 		Dur("elapsed", time.Since(switchStarted)).
 		Msg("cell generation switch completed")
-	return true, latest, oldGeneration, nil
+	return oldGeneration, nil
 }
 
 func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
-	if left == nil || right == nil {
-		return left == right
-	}
 	if left.ShardClientSeqno != right.ShardClientSeqno {
 		return false
 	}
@@ -1411,9 +1399,6 @@ func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.Curre
 }
 
 func currentStateRootsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
-	if left == nil || right == nil {
-		return left == right
-	}
 	if !bytes.Equal(left.Masterchain.StateRootHash, right.Masterchain.StateRootHash) {
 		return false
 	}
@@ -1434,9 +1419,6 @@ func currentStateRootsEqual(left *storage.CurrentState, right *storage.CurrentSt
 }
 
 func setCurrentCellGeneration(current *storage.CurrentState, generation uint64) {
-	if current == nil {
-		return
-	}
 	current.Masterchain.CellGeneration = generation
 	for key, shard := range current.Shards {
 		shard.CellGeneration = generation
@@ -1448,15 +1430,13 @@ func emptyBlockID(block ton.BlockIDExt) bool {
 	return block.Workchain == 0 &&
 		block.Shard == 0 &&
 		block.SeqNo == 0 &&
-		zeroHash(block.RootHash) &&
-		zeroHash(block.FileHash)
+		emptyBlockIDHash(block.RootHash) &&
+		emptyBlockIDHash(block.FileHash)
 }
 
-func zeroHash(hash []byte) bool {
-	for _, b := range hash {
-		if b != 0 {
-			return false
-		}
+func emptyBlockIDHash(hash []byte) bool {
+	if len(hash) == 0 {
+		return true
 	}
-	return true
+	return len(hash) == 32 && [32]byte(hash) == [32]byte{}
 }

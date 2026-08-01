@@ -58,6 +58,24 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 			}
 		}
 	})
+
+	b.Run("decode-trusted-lazy-loader", func(b *testing.B) {
+		loader := func(cell.Hash) (*cell.Cell, error) {
+			return nil, cell.ErrLazyRefNotFound
+		}
+
+		b.ReportAllocs()
+		b.SetBytes(int64(len(encoded)))
+		for i := 0; i < b.N; i++ {
+			loaded, err := storage.DecodeLazyCellRecordTrusted(hash, encoded, loader)
+			if err != nil {
+				b.Fatalf("lazy cell record: %v", err)
+			}
+			if loaded.HashKey() != root.HashKey() {
+				b.Fatalf("lazy cell hash mismatch")
+			}
+		}
+	})
 }
 
 func BenchmarkStateCellEncoder(b *testing.B) {
@@ -373,6 +391,93 @@ func BenchmarkPebbleLoadCell(b *testing.B) {
 		}
 	})
 
+}
+
+func BenchmarkLazyCellLoader(b *testing.B) {
+	cl := cell.BeginCell().MustStoreUInt(42, 64).EndCell()
+	record, err := storage.CellRecordFromCell(cl)
+	if err != nil {
+		b.Fatalf("cell record: %v", err)
+	}
+	hash := cl.HashKey()
+
+	b.Run("decoded-cache-hit", func(b *testing.B) {
+		store := openBenchmarkStore(b, Options{})
+		if err := store.SaveCells([]*storage.CellRecord{record}); err != nil {
+			b.Fatalf("save cell: %v", err)
+		}
+
+		loader := store.LazyCellLoader()
+		want, err := loader(hash)
+		if err != nil {
+			b.Fatalf("warm decoded cell cache: %v", err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for b.Loop() {
+			got, err := loader(hash)
+			if err != nil {
+				b.Fatalf("load cached cell: %v", err)
+			}
+			if got != want {
+				b.Fatalf("cached cell pointer changed")
+			}
+		}
+	})
+
+	b.Run("pebble-hit-cache-disabled", func(b *testing.B) {
+		store := openBenchmarkStore(b, Options{DisableDecodedCellCache: true})
+		if err := store.SaveCells([]*storage.CellRecord{record}); err != nil {
+			b.Fatalf("save cell: %v", err)
+		}
+
+		loader := store.LazyCellLoader()
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for b.Loop() {
+			got, err := loader(hash)
+			if err != nil {
+				b.Fatalf("load cell from pebble: %v", err)
+			}
+			if got.HashKey() != hash {
+				b.Fatalf("loaded cell hash mismatch")
+			}
+		}
+	})
+
+	b.Run("pebble-hit-cache-disabled-fanout4", func(b *testing.B) {
+		root, _ := benchmarkCellGraph(b, 256, 4)
+		records, err := collectCellRecordsForBenchmark(root)
+		if err != nil {
+			b.Fatalf("collect cell records: %v", err)
+		}
+		rootHash := root.HashKey()
+
+		store := openBenchmarkStore(b, Options{DisableDecodedCellCache: true})
+		if err := store.SaveCells(records); err != nil {
+			b.Fatalf("save cells: %v", err)
+		}
+
+		loader := store.LazyCellLoader()
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for b.Loop() {
+			got, err := loader(rootHash)
+			if err != nil {
+				b.Fatalf("load cell from pebble: %v", err)
+			}
+			if got.HashKey() != rootHash {
+				b.Fatalf("loaded cell hash mismatch")
+			}
+			if got.RefsNum() != 4 {
+				b.Fatalf("loaded refs = %d, want 4", got.RefsNum())
+			}
+		}
+	})
 }
 
 func openBenchmarkStore(b *testing.B, opts Options) *Store {

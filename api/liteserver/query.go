@@ -182,7 +182,7 @@ func (s *Server) handleBlockData(ctx context.Context, id *ton.BlockIDExt) tl.Ser
 		return errorResponse(err, "cannot load block "+storage.FormatBlockRef(*id))
 	}
 
-	return ton.BlockData{ID: cloneBlockID(*id), Payload: data}
+	return ton.BlockData{ID: blockproof.CloneBlockID(*id), Payload: data}
 }
 
 func (s *Server) handleBlockHeader(ctx context.Context, id *ton.BlockIDExt, mode uint32) tl.Serializable {
@@ -237,7 +237,7 @@ func (s *Server) masterchainInfo(block ton.BlockIDExt, stateRoot []byte) (ton.Ma
 		return ton.MasterchainInfo{}, fmt.Errorf("masterchain state root hash is missing")
 	}
 	return ton.MasterchainInfo{
-		Last:          cloneBlockID(block),
+		Last:          blockproof.CloneBlockID(block),
 		StateRootHash: stateRoot,
 		Init:          cloneZeroStatePtr(s.zeroState),
 	}, nil
@@ -260,15 +260,39 @@ func (s *Server) lookupBlock(ctx context.Context, query ton.LookupBlock) (ton.Bl
 
 	switch selector {
 	case 1:
-		id, err := s.store.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: uint32(query.ID.Seqno)})
+		id, err := s.lookupBlockBySeqNoForPrefix(ctx, storage.BlockSeqRef{Workchain: key.Workchain, Shard: key.Shard, SeqNo: uint32(query.ID.Seqno)})
 		return id, query.Mode >> 4, err
 	case 2:
-		id, err := s.store.LookupBlockByLT(ctx, key, query.LT)
+		id, err := s.lookupBlockByLTForPrefix(ctx, key, query.LT)
 		return id, query.Mode >> 4, err
 	default:
-		id, err := s.store.LookupBlockByUnixTime(ctx, key, query.UTime)
+		id, err := s.lookupBlockByUnixTimeForPrefix(ctx, key, query.UTime)
 		return id, query.Mode >> 4, err
 	}
+}
+
+func (s *Server) lookupBlockBySeqNoForPrefix(ctx context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
+	if store, ok := s.store.(prefixLookupStore); ok {
+		return store.LookupBlockBySeqNoForPrefix(ctx, ref)
+	}
+	// Store predates prefix-aware lookups. The exact-shard method preserves
+	// the behavior of released implementations that do not expose the new
+	// optional capability.
+	return s.store.LookupBlockBySeqNo(ctx, ref)
+}
+
+func (s *Server) lookupBlockByLTForPrefix(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
+	if store, ok := s.store.(prefixLookupStore); ok {
+		return store.LookupBlockByLTForPrefix(ctx, key, lt)
+	}
+	return s.store.LookupBlockByLT(ctx, key, lt)
+}
+
+func (s *Server) lookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
+	if store, ok := s.store.(prefixLookupStore); ok {
+		return store.LookupBlockByUnixTimeForPrefix(ctx, key, utime)
+	}
+	return s.store.LookupBlockByUnixTime(ctx, key, utime)
 }
 
 type accountReference struct {
@@ -351,7 +375,7 @@ func (s *Server) accountState(ctx context.Context, id *ton.BlockIDExt, account t
 	}
 	if !isFullBlockID(&ref.shard) {
 		return ton.AccountState{
-			ID:         cloneBlockID(ref.base),
+			ID:         blockproof.CloneBlockID(ref.base),
 			Shard:      &ton.BlockIDExt{},
 			ShardProof: ref.shardProof,
 		}, nil
@@ -363,8 +387,8 @@ func (s *Server) accountState(ctx context.Context, id *ton.BlockIDExt, account t
 	}
 
 	return ton.AccountState{
-		ID:         cloneBlockID(ref.base),
-		Shard:      cloneBlockID(ref.shard),
+		ID:         blockproof.CloneBlockID(ref.base),
+		Shard:      blockproof.CloneBlockID(ref.shard),
 		ShardProof: ref.shardProof,
 		Proof:      proof,
 		State:      state,

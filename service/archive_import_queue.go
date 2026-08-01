@@ -98,10 +98,6 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 }
 
 func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
-	if q == nil {
-		return archiveImportQueueSnapshot{}
-	}
-
 	snapshot := archiveImportQueueSnapshot{
 		activeDownload:         q.activeDownload.Load(),
 		activePrepare:          q.activePrepare.Load(),
@@ -198,7 +194,11 @@ func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archiveP
 	q.activePrepare.Add(1)
 	defer q.activePrepare.Add(-1)
 
-	imported, err := r.prepareArchiveDownload(job.ctx, job.downloaded.MasterchainSeqno, job.downloaded.Shard, job.splitDepth, job.downloaded)
+	prepareCtx := job.ctx
+	if job.priority == archiveImportPriorityHot {
+		prepareCtx = archive.WithHotImportPrepare(prepareCtx)
+	}
+	imported, err := r.prepareArchiveDownload(prepareCtx, job.downloaded.MasterchainSeqno, job.downloaded.Shard, job.splitDepth, job.downloaded)
 	peer := job.downloaded.Peer
 	archiveID := job.downloaded.ArchiveID
 	releaseDownloadedData()

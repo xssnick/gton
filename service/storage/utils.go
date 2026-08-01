@@ -112,6 +112,16 @@ func FormatBlockRef(block ton.BlockIDExt) string {
 	return fmt.Sprintf("wc=%d shard=%016x seqno=%d", block.Workchain, uint64(block.Shard), block.SeqNo)
 }
 
+// BlockRef renders the same text as FormatBlockRef, but lazily: zerolog field
+// setters return early on a disabled event, so passing this through
+// Event.Stringer keeps the formatting (and its allocations) out of hot paths
+// whose Debug logs are normally off.
+type BlockRef ton.BlockIDExt
+
+func (r BlockRef) String() string {
+	return FormatBlockRef(ton.BlockIDExt(r))
+}
+
 func ParseStateBOC(expected *ton.BlockIDExt, data []byte, wantRootHash []byte, wantFileHash []byte) (*BlockState, error) {
 	root, err := cell.FromBOC(data)
 	if err != nil {

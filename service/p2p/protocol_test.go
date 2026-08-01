@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/pierrec/lz4/v4"
+	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -131,7 +132,7 @@ func TestBlockFinalityBroadcastRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected type after parse: %T", parsed)
 	}
 	if !broadcast.ID.Equals(&msg.ID) {
-		t.Fatalf("unexpected block after parse: %s", formatBlockRef(broadcast.ID))
+		t.Fatalf("unexpected block after parse: %s", storage.FormatBlockRef(broadcast.ID))
 	}
 	if _, ok = broadcast.SignatureSet.(tonnodeapi.SignatureSetSimplex); !ok {
 		t.Fatalf("unexpected signature set type after parse: %T", broadcast.SignatureSet)
@@ -213,7 +214,7 @@ func TestSlaveAndOutMsgQueueTypesRoundTrip(t *testing.T) {
 		{
 			name: "getOutMsgQueueProof",
 			msg: GetOutMsgQueueProof{
-				DstShard: archive.ShardID{Workchain: 0, Shard: topShard},
+				DstShard: tonnodeapi.ShardID{Workchain: 0, Shard: topShard},
 				Blocks: []ton.BlockIDExt{{
 					Workchain: 0,
 					Shard:     topShard,
@@ -238,6 +239,28 @@ func TestSlaveAndOutMsgQueueTypesRoundTrip(t *testing.T) {
 			name: "outMsgQueueProofEmpty",
 			msg:  OutMsgQueueProofEmpty{},
 			want: OutMsgQueueProofEmpty{},
+		},
+		{
+			name: "outMsgQueueProofBroadcast",
+			msg: OutMsgQueueProofBroadcast{
+				DstShard: tonnodeapi.ShardID{
+					Workchain: 0,
+					Shard:     topShard,
+				},
+				Block: ton.BlockIDExt{
+					Workchain: 0,
+					Shard:     topShard,
+					SeqNo:     11,
+					RootHash:  bytes.Repeat([]byte{0x12}, 32),
+					FileHash:  bytes.Repeat([]byte{0x13}, 32),
+				},
+				Limits: ImportedMsgQueueLimits{
+					MaxBytes: 4096,
+					MaxMsgs:  32,
+				},
+				Proof: OutMsgQueueProofEmpty{},
+			},
+			want: OutMsgQueueProofBroadcast{},
 		},
 	}
 
@@ -312,15 +335,38 @@ func TestSimpleBroadcastSignatureMatchesReferenceShape(t *testing.T) {
 		Signature:   ed25519.Sign(priv, toSign),
 	}
 
-	sub := testOverlaySubscription(&overlaySubscription{
-		node: newTestNode(t),
-		spec: overlaySpec{Name: "test"},
-	})
-	if !checkSimpleBroadcastDate(int32(msg.Date)) {
-		t.Fatalf("test timestamp unexpectedly rejected")
+	overlayID := testPeerID("reference-shape-overlay")
+	receiver, err := overlay.NewBroadcastReceiver(overlayID[:], maxOverlayPayloadSize, true, false)
+	if err != nil {
+		t.Fatalf("create broadcast receiver: %v", err)
 	}
-	if err := sub.handleSimpleBroadcast(nil, msg); err != nil {
+	t.Cleanup(receiver.Close)
+	received := false
+	receiver.SetBroadcastHandlerWithInfo(func(got tl.Serializable, info overlay.BroadcastInfo) overlay.BroadcastDisposition {
+		parsed, ok := got.(tonnodeapi.NewShardBlockBroadcast)
+		if !ok || parsed.Block.ID.SeqNo != inner.Block.ID.SeqNo {
+			t.Fatalf("unexpected decoded broadcast: %#v", got)
+		}
+		if !bytes.Equal(info.SourceID, sourceID) || info.Delivery != overlay.BroadcastDeliverySimple {
+			t.Fatalf("unexpected broadcast info: %#v", info)
+		}
+		received = true
+		return overlay.BroadcastDispositionAcceptAndRelay
+	})
+
+	base := newTestOverlayADNL()
+	transport := overlay.CreateExtendedADNL(base)
+	if _, err = transport.AttachOverlay(receiver); err != nil {
+		t.Fatalf("attach broadcast receiver: %v", err)
+	}
+	if err = base.customHandler(&adnl.MessageCustom{Data: []tl.Serializable{
+		overlay.Message{Overlay: overlayID[:]},
+		msg,
+	}}); err != nil {
 		t.Fatalf("handle simple broadcast: %v", err)
+	}
+	if !received {
+		t.Fatal("signed broadcast was not delivered")
 	}
 }
 

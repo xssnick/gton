@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/xssnick/gton/service/storage"
@@ -17,7 +16,7 @@ type stateCheckpointData struct {
 	artifactPrewriteTarget uint64
 }
 
-func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) (stateCheckpointData, error) {
+func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache) stateCheckpointData {
 	// entries always come from appliedStateSet.checkpoint(), which already
 	// produced an independent snapshot (deep-cloned block states, shared immutable
 	// payload bytes) decoupled from the live set. That snapshot is single-use and
@@ -26,9 +25,6 @@ func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.Sta
 	// (persistArchiveCurrentState) already hands the same checkpoint() entries
 	// straight to saveStateCheckpoint without re-cloning; mirror that.
 	appliedEntries := entries
-	if len(appliedEntries) == 0 {
-		return stateCheckpointData{}, fmt.Errorf("state checkpoint has no applied block states")
-	}
 	checkpointCells := storage.StateCellRecords{}
 	cellPrewriteTarget, prewritten := cells.prewriteTarget()
 	if !prewritten {
@@ -40,7 +36,7 @@ func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.Sta
 		entries:            appliedEntries,
 		cells:              checkpointCells,
 		cellPrewriteTarget: cellPrewriteTarget,
-	}, nil
+	}
 }
 
 func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64, artifactPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
@@ -103,9 +99,7 @@ func currentStateWithSavedBlockStates(current *storage.CurrentState, states []*s
 	next := storage.CloneCurrentState(current)
 	byBlock := make(map[storage.BlockRootHash]*storage.BlockState, len(states))
 	for _, state := range states {
-		if state != nil {
-			byBlock[storage.BlockKey(state.Block)] = state
-		}
+		byBlock[storage.BlockKey(state.Block)] = state
 	}
 
 	if state := byBlock[storage.BlockKey(next.Masterchain.Block)]; state != nil {
@@ -126,19 +120,12 @@ func checkpointEntryStates(entries []storage.StateCheckpointBlock) []*storage.Bl
 	}
 	states := make([]*storage.BlockState, 0, len(entries))
 	for _, entry := range entries {
-		if entry.State == nil {
-			continue
-		}
 		states = append(states, storage.CloneBlockState(entry.State))
 	}
 	return states
 }
 
 func currentStateWithoutCells(current *storage.CurrentState) *storage.CurrentState {
-	if current == nil {
-		return nil
-	}
-
 	next := &storage.CurrentState{
 		SyncedAt:         current.SyncedAt,
 		ShardClientSeqno: current.ShardClientSeqno,

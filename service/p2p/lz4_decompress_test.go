@@ -44,7 +44,7 @@ func TestDecompressLZ4BlockSizes(t *testing.T) {
 			original := patterned(tc.size)
 			compressed := lz4CompressBlockForTest(t, original)
 
-			got, err := decompressLZ4Block(compressed, maxDecompressedBlockSize)
+			got, err := decompressLZ4Block(compressed)
 			if err != nil {
 				t.Fatalf("decompress: %v", err)
 			}
@@ -58,14 +58,8 @@ func TestDecompressLZ4BlockSizes(t *testing.T) {
 		original := patterned(maxDecompressedBlockSize + 1)
 		compressed := lz4CompressBlockForTest(t, original)
 
-		if _, err := decompressLZ4Block(compressed, maxDecompressedBlockSize); err == nil {
+		if _, err := decompressLZ4Block(compressed); err == nil {
 			t.Fatal("expected error for payload above the size limit")
-		}
-	})
-
-	t.Run("invalidMaxSize", func(t *testing.T) {
-		if _, err := decompressLZ4Block([]byte{1, 2, 3}, 0); err == nil {
-			t.Fatal("expected error for non-positive max size")
 		}
 	})
 }

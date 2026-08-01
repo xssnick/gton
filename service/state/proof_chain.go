@@ -65,14 +65,14 @@ func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trus
 		return ton.BlockIDExt{}, err
 	}
 
-	block, ok := choosePersistentKeyBlock(candidates, time.Now(), s.syncBefore, s.syncUntil)
-	if ok {
+	block, err := choosePersistentKeyBlock(candidates, time.Now(), s.syncBefore, s.syncUntil)
+	if err == nil {
 		return block, nil
 	}
 
 	return ton.BlockIDExt{}, fmt.Errorf(
 		"%w: latest_verified=%s key_blocks=%d sync_before=%s sync_until=%d download_window=%s",
-		errNoPersistentKeyBlockCandidate,
+		err,
 		storage.FormatBlockRef(trusted.block),
 		len(candidates),
 		s.syncBefore,
@@ -240,7 +240,7 @@ func (s *Syncer) verifyKeyBlockBatch(ctx context.Context, trusted *trustedKeyBlo
 			block: trusted.block,
 			utime: trusted.utime,
 		})
-		*verified = *verified + 1
+		(*verified)++
 		if accepted == 0 {
 			firstAccepted = trusted.block
 		}
@@ -492,118 +492,7 @@ func (s *Syncer) verifyKeyBlockProofFromTrusted(ctx context.Context, trusted tru
 	return next, nil
 }
 
-func (s *Syncer) keyBlockIDs(ctx context.Context, fromBlock ton.BlockIDExt) ([]ton.BlockIDExt, error) {
-	if fromBlock.Workchain != -1 || fromBlock.Shard != masterchainShard {
-		return nil, fmt.Errorf("next key block lookup requires masterchain anchor, got %s", storage.FormatBlockRef(fromBlock))
-	}
-
-	var all []ton.BlockIDExt
-	from := fromBlock
-	retries := 0
-
-	for {
-		logEvent := s.log.Debug()
-		if len(all) == 0 || len(all)%keyBlockProgressInfoEvery == 0 {
-			logEvent = s.log.Info()
-		}
-		logEvent.
-			Str("from", storage.FormatBlockRef(from)).
-			Uint32("from_seqno", from.SeqNo).
-			Int("limit", keyBlockLookupLimit).
-			Msg("requesting next key block ids")
-
-		batch, err := s.source.NextKeyBlocks(ctx, from, keyBlockLookupLimit)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-
-			retries++
-			evt := s.log.Debug()
-			if retries == 1 || retries%keyBlockLookupRetryLogEach == 0 {
-				evt = s.log.Warn()
-			}
-			evt.
-				Err(err).
-				Str("from", storage.FormatBlockRef(from)).
-				Uint32("from_seqno", from.SeqNo).
-				Int("attempt", retries).
-				Dur("retry_in", keyBlockLookupRetryDelay).
-				Msg("next key block id lookup failed, retrying same key block")
-
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(keyBlockLookupRetryDelay):
-			}
-			continue
-		}
-		retries = 0
-
-		if len(batch.Blocks) == 0 {
-			s.log.Info().
-				Str("from", storage.FormatBlockRef(from)).
-				Int("key_blocks", len(all)).
-				Bool("incomplete", batch.Incomplete).
-				Msg("next key block lookup reached tail")
-			break
-		}
-
-		advanced := false
-		firstAccepted := ton.BlockIDExt{}
-		lastAccepted := ton.BlockIDExt{}
-		accepted := 0
-		for _, block := range batch.Blocks {
-			if block.SeqNo <= from.SeqNo {
-				continue
-			}
-
-			if accepted == 0 {
-				firstAccepted = block
-			}
-			lastAccepted = block
-			accepted++
-			all = append(all, block)
-			from = block
-			advanced = true
-		}
-
-		evt := s.log.Debug().
-			Str("current", storage.FormatBlockRef(from)).
-			Int("batch", len(batch.Blocks)).
-			Int("accepted", accepted).
-			Int("key_blocks", len(all)).
-			Bool("incomplete", batch.Incomplete)
-		if accepted > 0 && len(all)%keyBlockProgressInfoEvery == 0 {
-			evt = s.log.Info().
-				Str("current", storage.FormatBlockRef(from)).
-				Int("batch", len(batch.Blocks)).
-				Int("accepted", accepted).
-				Int("key_blocks", len(all)).
-				Bool("incomplete", batch.Incomplete)
-		}
-		if accepted > 0 {
-			evt = evt.
-				Str("first", storage.FormatBlockRef(firstAccepted)).
-				Str("last", storage.FormatBlockRef(lastAccepted)).
-				Uint32("first_seqno", firstAccepted.SeqNo).
-				Uint32("last_seqno", lastAccepted.SeqNo)
-		}
-		evt.Msg("received next key block id batch")
-
-		if !advanced {
-			s.log.Info().
-				Str("from", storage.FormatBlockRef(from)).
-				Int("key_blocks", len(all)).
-				Msg("next key block lookup did not advance")
-			break
-		}
-	}
-
-	return all, nil
-}
-
-func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syncBefore time.Duration, syncUntil uint32) (ton.BlockIDExt, bool) {
+func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syncBefore time.Duration, syncUntil uint32) (ton.BlockIDExt, error) {
 	if syncBefore <= 0 {
 		syncBefore = DefaultSyncBefore
 	}
@@ -631,10 +520,10 @@ func choosePersistentKeyBlock(candidates []keyBlockCandidate, now time.Time, syn
 			continue
 		}
 
-		return candidate.block, true
+		return candidate.block, nil
 	}
 
-	return ton.BlockIDExt{}, false
+	return ton.BlockIDExt{}, errNoPersistentKeyBlockCandidate
 }
 
 func IsPersistentState(ts, prevTS uint32) bool {

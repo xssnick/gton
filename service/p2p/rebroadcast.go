@@ -3,13 +3,14 @@ package p2p
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
-	"github.com/xssnick/tonutils-go/tl"
 )
 
 const (
@@ -23,6 +24,13 @@ const (
 	basePeerRebroadcastWorkers   = 2
 	rebroadcastFanout            = 5
 	quietRebroadcastFanout       = 2
+	// fastSyncBroadcastSpeedMultiplier divides the base delay between FastSync
+	// FEC parts. Kept internal so config does not expose a traffic knob.
+	// Matches the shipped validator-engine default (3.33), not the 1.0 struct
+	// default in full-node.h that no deployment runs with: 10ms per four
+	// symbols divided by the multiplier, i.e. ~3ms.
+	fastSyncBroadcastSpeedMultiplier    = 3.33
+	minFastSyncBroadcastSpeedMultiplier = 1e-9
 )
 
 var quietRebroadcastIntervals = map[string]time.Duration{
@@ -86,9 +94,6 @@ func (n *Node) SetRebroadcastQuiet(quiet bool) {
 }
 
 func (n *Node) allowRebroadcast(req *rebroadcastRequest) bool {
-	if req == nil {
-		return false
-	}
 	if req.local {
 		return true
 	}
@@ -101,10 +106,7 @@ func (n *Node) allowRebroadcast(req *rebroadcastRequest) bool {
 		interval = 250 * time.Millisecond
 	}
 
-	key := req.kind
-	if req.subscription != nil {
-		key = req.subscription.spec.Name + ":" + req.kind
-	}
+	key := req.subscription.spec.Name + ":" + req.kind
 
 	now := time.Now()
 	n.rebroadcastThrottleMu.Lock()
@@ -143,11 +145,25 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 	}
 }
 
-func (s *overlaySubscription) rebroadcastPlan(kind string, payloadLen int) rebroadcastPlan {
-	if s.spec.Kind == overlayKindCustomFixed {
-		return planCustomRebroadcast(kind, payloadLen)
+func planFastSyncRebroadcast(kind string, payloadLen int) rebroadcastPlan {
+	if kind == "tonNode.newShardBlockBroadcast" {
+		if payloadLen <= ordinarySimpleBroadcastMaxSize {
+			return rebroadcastPlan{
+				mode:  rebroadcastModeSimple,
+				flags: overlay.BroadcastFlagNoTwoStep,
+			}
+		}
+		return rebroadcastPlan{
+			mode: rebroadcastModeFEC,
+			flags: overlay.BroadcastFlagAnySender |
+				overlay.BroadcastFlagNoTwoStep,
+		}
 	}
-	return planRebroadcast(kind, payloadLen)
+
+	return rebroadcastPlan{
+		mode:  rebroadcastModeFEC,
+		flags: overlay.BroadcastFlagAnySender,
+	}
 }
 
 func (p *overlayPeer) initRebroadcastQueues() bool {
@@ -221,10 +237,11 @@ func (p *overlayPeer) rebroadcastQueueSnapshots() (QueueStatusSnapshot, QueueSta
 }
 
 func (req rebroadcastRequest) queueName() string {
-	if req.subscription != nil && req.subscription.spec.Kind == overlayKindCustomFixed {
-		payloadLen := req.payloadLen()
-		if payloadLen > 0 && planCustomRebroadcast(req.kind, payloadLen).mode == rebroadcastModeFEC {
-			return customTwoStepRebroadcastQueueName
+	payloadLen := req.payloadLen()
+	if payloadLen > 0 {
+		plan := req.subscription.rebroadcastPlan(req.kind, payloadLen)
+		if req.subscription.usesTwoStepRebroadcast(plan) {
+			return twoStepRebroadcastQueueName
 		}
 	}
 	if req.local {
@@ -233,21 +250,18 @@ func (req rebroadcastRequest) queueName() string {
 	return "rebroadcast"
 }
 
-func (n *Node) closePeerRebroadcastQueues() {
-	for _, sub := range n.subscriptionsSnapshot() {
-		for _, peer := range sub.peersSnapshot() {
-			peer.closeRebroadcastQueues()
-		}
-	}
-}
-
 func (n *Node) noteRebroadcastSent(req rebroadcastRequest) {
 	if req.local {
 		n.localRebroadcastSent.Add(1)
 	} else {
 		n.peerRebroadcastSent.Add(1)
 	}
-	n.noteBroadcast("queue_rebroadcasted", req.overlayName(), req.kind)
+	n.noteBroadcast(
+		"queue_rebroadcasted",
+		req.subscription.spec.Name,
+		req.kind,
+		req.subscription.rebroadcastDelivery(req),
+	)
 }
 
 func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
@@ -259,7 +273,7 @@ func (n *Node) noteRebroadcastDropped(req rebroadcastRequest) {
 }
 
 func (s *overlaySubscription) startPeerRebroadcastWorker(peer *overlayPeer) {
-	if s.node.runCtx.Err() != nil || peer == nil {
+	if s.node.runCtx.Err() != nil {
 		return
 	}
 	if !peer.initRebroadcastQueues() {
@@ -330,7 +344,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 			Msg("dropping custom block rebroadcast because local node is not a block sender")
 		return false
 	}
-	if s.node.rebroadcastBlockedByAdmission(&req) {
+	if !s.node.canAcceptBroadcast(req.kind, req.local) {
 		s.node.noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
@@ -368,8 +382,8 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	}
 
 	plan := s.rebroadcastPlan(req.kind, payloadLen)
-	if s.spec.Kind == overlayKindCustomFixed && plan.mode == rebroadcastModeFEC {
-		return s.enqueueCustomTwoStepRebroadcast(req)
+	if s.usesTwoStepRebroadcast(plan) {
+		return s.enqueueTwoStepRebroadcast(req)
 	}
 	if plan.mode == rebroadcastModeSimple && req.simple == nil {
 		msg, err := s.node.buildSimpleBroadcast(req.payload, plan.flags)
@@ -446,15 +460,41 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	return false
 }
 
+func (s *overlaySubscription) usesTwoStepRebroadcast(
+	plan rebroadcastPlan,
+) bool {
+	if plan.mode != rebroadcastModeFEC {
+		return false
+	}
+	if s.spec.alwaysTwoStepFEC() {
+		return true
+	}
+	return s.spec.twoStepFECUnlessPlanOptsOut() &&
+		plan.flags&overlay.BroadcastFlagNoTwoStep == 0
+}
+
+func (s *overlaySubscription) rebroadcastDelivery(
+	req rebroadcastRequest,
+) Delivery {
+	plan := s.rebroadcastPlan(req.kind, req.payloadLen())
+	if s.usesTwoStepRebroadcast(plan) {
+		return DeliveryTwoStep
+	}
+	if plan.mode == rebroadcastModeSimple {
+		return DeliverySimple
+	}
+	return DeliveryFEC
+}
+
 func (s *overlaySubscription) customRebroadcastUnsupported(kind string) bool {
-	return s.spec.Kind == overlayKindCustomFixed && kind == "tonNode.ihrMessageBroadcast"
+	return s.spec.dropsIHRBroadcasts() && kind == "tonNode.ihrMessageBroadcast"
 }
 
 func (s *overlaySubscription) customBlockRebroadcastBlocked(kind string) bool {
-	if s.spec.Kind != overlayKindCustomFixed {
+	if !s.spec.authorizesBroadcastSenders() {
 		return false
 	}
-	if _, ok := customFanoutClass(kind); !ok {
+	if _, ok := blockOverlayFanoutClass(kind); !ok {
 		return false
 	}
 
@@ -463,7 +503,7 @@ func (s *overlaySubscription) customBlockRebroadcastBlocked(kind string) bool {
 }
 
 func (s *overlaySubscription) rebroadcastCandidatesForRequest(req rebroadcastRequest) []*overlayPeer {
-	candidates := s.rebroadcastCandidates()
+	candidates := s.broadcastTargetsSnapshot().peers
 	if req.sourcePeerID.IsZero() {
 		return candidates
 	}
@@ -504,7 +544,7 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
-		if s.spec.Kind == overlayKindCustomFixed {
+		if s.spec.floodsWholeRoster() {
 			if s.node.rebroadcastLagged() {
 				return laggedExternalFanout
 			}
@@ -522,7 +562,7 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 		}
 		return externalRebroadcastFanout
 	}
-	if s.spec.Kind == overlayKindCustomFixed {
+	if s.spec.floodsWholeRoster() {
 		return s.peerLimit()
 	}
 	if s.node.rebroadcastQuiet.Load() {
@@ -567,7 +607,7 @@ func selectRebroadcastQueueTargetsWithPreferred(candidates []*overlayPeer, tried
 	preferredCandidates := make([]*overlayPeer, 0, len(preferred))
 	others := make([]*overlayPeer, 0, len(candidates))
 	for _, peer := range candidates {
-		if peer == nil || peer.id.IsZero() {
+		if peer.id.IsZero() {
 			continue
 		}
 		if _, ok := tried[peer.id]; ok {
@@ -595,7 +635,7 @@ func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[PeerID]s
 
 	pool := make([]*overlayPeer, 0, len(candidates))
 	for _, peer := range candidates {
-		if peer == nil || peer.id.IsZero() {
+		if peer.id.IsZero() {
 			continue
 		}
 		if _, ok := tried[peer.id]; ok {
@@ -624,7 +664,7 @@ func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[PeerID]s
 
 func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) bool {
 	payloadLen := req.payloadLen()
-	if peer == nil || peer.overlay == nil || payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
+	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
 		return false
 	}
 
@@ -647,8 +687,13 @@ func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer 
 	}
 
 	sendCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
-	err := peer.overlay.SendCustomMessage(sendCtx, *msg)
+	err := peer.broadcastPeer.SendCustomMessage(sendCtx, *msg)
 	cancel()
+	if errors.Is(err, errQUICPeerOffline) {
+		// Offline peer: the send was a no-op, not a failure. Count it as a drop
+		// (false) but do not fault the peer — the ping path owns eviction.
+		return false
+	}
 	if err != nil {
 		s.handlePeerQueryFailure(peer, err)
 		s.log.Debug().
@@ -689,7 +734,24 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 		}
 	}
 
-	if err := sendFastFECToPeer(ctx, sender, peer.overlay, peerRebroadcastTimeout); err != nil {
+	pace := time.Duration(0)
+	if s.spec.pacesFECBursts() {
+		pace = s.node.fastSyncBroadcastFECPace
+	}
+	err := sendFastFECToPeer(
+		ctx,
+		sender,
+		peer.broadcastPeer,
+		peerRebroadcastTimeout,
+		pace,
+	)
+	if errors.Is(err, errQUICPeerOffline) {
+		// Offline peer: sendFastFECToPeer stopped at the first part instead of
+		// pacing through the whole burst. Count the drop without faulting the
+		// peer — the ping path owns eviction.
+		return false
+	}
+	if err != nil {
 		s.markPeerQueryFailed(peer)
 		s.log.Debug().
 			Err(err).
@@ -706,7 +768,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 func (n *Node) waitRebroadcastFECBackpressure(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) (func(), bool) {
 	class := rebroadcastFECBackpressureClass(req.kind)
 	for {
-		if !n.rebroadcastFECBackpressureActive() {
+		if !n.rebroadcastLagged() {
 			return func() {}, true
 		}
 		if req.expiredInQueue(time.Now()) {
@@ -724,10 +786,6 @@ func (n *Node) waitRebroadcastFECBackpressure(ctx context.Context, peer *overlay
 		case <-timer.C:
 		}
 	}
-}
-
-func (n *Node) rebroadcastFECBackpressureActive() bool {
-	return n.rebroadcastLagged()
 }
 
 func (n *Node) rebroadcastLagged() bool {
@@ -750,11 +808,8 @@ func rebroadcastFECBackpressureClass(kind string) rebroadcastFECLimiterClass {
 
 func (n *Node) tryAcquireRebroadcastFECBackpressure(class rebroadcastFECLimiterClass, peer *overlayPeer) (func(), bool) {
 	slots := n.rebroadcastFECSlotLimit(class)
-	if slots == nil {
-		return func() {}, true
-	}
 
-	peerID := rebroadcastBackpressurePeerID(peer)
+	peerID := peer.id
 	peerAcquired := false
 	if !peerID.IsZero() {
 		if !n.tryAcquireRebroadcastFECPeer(class, peerID) {
@@ -780,9 +835,6 @@ func (n *Node) tryAcquireRebroadcastFECBackpressure(class rebroadcastFECLimiterC
 }
 
 func (n *Node) rebroadcastFECSlotLimit(class rebroadcastFECLimiterClass) chan struct{} {
-	if n.rebroadcastFECSlots == nil {
-		n.rebroadcastFECSlots = newRebroadcastFECSlotLimits()
-	}
 	return n.rebroadcastFECSlots[class]
 }
 
@@ -790,14 +842,7 @@ func (n *Node) tryAcquireRebroadcastFECPeer(class rebroadcastFECLimiterClass, pe
 	n.rebroadcastFECMu.Lock()
 	defer n.rebroadcastFECMu.Unlock()
 
-	if n.rebroadcastFECPeers == nil {
-		n.rebroadcastFECPeers = newRebroadcastFECPeerLimits()
-	}
 	peers := n.rebroadcastFECPeers[class]
-	if peers == nil {
-		peers = map[PeerID]struct{}{}
-		n.rebroadcastFECPeers[class] = peers
-	}
 	if _, ok := peers[peerID]; ok {
 		return false
 	}
@@ -809,31 +854,45 @@ func (n *Node) releaseRebroadcastFECPeer(class rebroadcastFECLimiterClass, peerI
 	n.rebroadcastFECMu.Lock()
 	defer n.rebroadcastFECMu.Unlock()
 
-	if n.rebroadcastFECPeers == nil {
-		return
-	}
 	delete(n.rebroadcastFECPeers[class], peerID)
 }
 
-func rebroadcastBackpressurePeerID(peer *overlayPeer) PeerID {
-	if peer == nil {
-		return PeerID{}
-	}
-	return peer.id
-}
-
-func sendFastFECToPeer(ctx context.Context, sender *overlay.BroadcastFECSender, peer overlay.BroadcastPeer, timeout time.Duration) error {
-	if peer == nil {
-		return nil
-	}
-
+func sendFastFECToPeer(
+	ctx context.Context,
+	sender *overlay.BroadcastFECSender,
+	peer overlay.BroadcastPeer,
+	timeout,
+	pace time.Duration,
+) error {
 	sendCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	totalParts := sender.TotalParts()
+	var paceTimer *time.Timer
+	defer func() {
+		if paceTimer != nil {
+			paceTimer.Stop()
+		}
+	}()
+
 	for seqno := uint32(0); seqno < totalParts; seqno++ {
 		if err := sendCtx.Err(); err != nil {
 			return err
+		}
+		// TON ordinary FEC sends four symbols per 10ms/multiplier burst.
+		if pace > 0 &&
+			seqno > 0 &&
+			seqno%overlay.DefaultBroadcastFECBurstSize == 0 {
+			if paceTimer == nil {
+				paceTimer = time.NewTimer(pace)
+			} else {
+				paceTimer.Reset(pace)
+			}
+			select {
+			case <-sendCtx.Done():
+				return sendCtx.Err()
+			case <-paceTimer.C:
+			}
 		}
 
 		part, err := sender.Part(seqno)
@@ -847,46 +906,34 @@ func sendFastFECToPeer(ctx context.Context, sender *overlay.BroadcastFECSender, 
 	return nil
 }
 
+func normalizeFastSyncBroadcastFECPace(multiplier float64) (time.Duration, error) {
+	if multiplier == 0 {
+		multiplier = 1
+	}
+	if multiplier < 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return 0, fmt.Errorf("fast sync broadcast speed multiplier must be finite and positive")
+	}
+	if multiplier < minFastSyncBroadcastSpeedMultiplier {
+		multiplier = minFastSyncBroadcastSpeedMultiplier
+	}
+
+	return time.Duration(float64(overlay.DefaultBroadcastFECPace) / multiplier), nil
+}
+
 func (req rebroadcastRequest) expiredInQueue(now time.Time) bool {
 	return !req.queuedAt.IsZero() && now.Sub(req.queuedAt) > rebroadcastQueueMaxAge
 }
 
 func (n *Node) buildSimpleBroadcast(payload []byte, flags int32) (overlay.Broadcast, error) {
-	pub := n.privKey.Public().(ed25519.PublicKey)
 	msg := overlay.Broadcast{
-		Source:      keys.PublicKeyED25519{Key: pub},
+		Source:      keys.PublicKeyED25519{Key: n.privKey.Public().(ed25519.PublicKey)},
 		Certificate: overlay.CertificateEmpty{},
 		Flags:       flags,
 		Data:        payload,
 		Date:        int32(time.Now().Unix()),
 	}
-
-	sourceID := make([]byte, 32)
-	if msg.Flags&overlay.BroadcastFlagAnySender == 0 {
-		var err error
-		sourceID, err = tl.Hash(msg.Source)
-		if err != nil {
-			return overlay.Broadcast{}, err
-		}
-	}
-
-	broadcastHash, err := tl.Hash(OverlayBroadcastID{
-		Source:   sourceID,
-		DataHash: hashSimpleBroadcastPayload(msg.Data),
-		Flags:    msg.Flags,
-	})
-	if err != nil {
+	if err := msg.Sign(n.privKey); err != nil {
 		return overlay.Broadcast{}, err
 	}
-
-	toSign, err := tl.Serialize(overlay.BroadcastToSign{
-		Hash: broadcastHash,
-		Date: uint32(msg.Date),
-	}, true)
-	if err != nil {
-		return overlay.Broadcast{}, err
-	}
-
-	msg.Signature = ed25519.Sign(n.privKey, toSign)
 	return msg, nil
 }

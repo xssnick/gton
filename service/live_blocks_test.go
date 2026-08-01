@@ -17,6 +17,7 @@ func TestPublishLiveBlockArtifactsAvailabilityPolicy(t *testing.T) {
 		ID:        block,
 		BlockRoot: cell.BeginCell().EndCell(),
 		BlockBOC:  []byte{0x01},
+		Meta:      &tnstore.BlockMeta{ID: block},
 	}
 	state := &tnstore.BlockState{Block: block}
 

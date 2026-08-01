@@ -42,8 +42,8 @@ func (s *Server) handleSendBocReturnHash(ctx context.Context, params requestPara
 	hash := root.Hash()
 	return extMessageInfo{
 		Type:     extMessageInfoType,
-		Hash:     tonHash(hash[:]),
-		HashNorm: tonHash(hash[:]),
+		Hash:     tonHash(hash),
+		HashNorm: tonHash(hash),
 	}, nil
 }
 

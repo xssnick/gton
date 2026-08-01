@@ -50,12 +50,6 @@ func (n *Node) schedulePendingBlockBroadcastDecode(req pendingBlockBroadcastDeco
 	req.bytes = pendingBlockBroadcastDecodeBytes(req)
 
 	n.pendingBroadcastMx.Lock()
-	if n.pendingBroadcasts == nil {
-		n.pendingBroadcasts = map[string]pendingBlockBroadcastDecode{}
-	}
-	if n.pendingBroadcastByPrev == nil {
-		n.pendingBroadcastByPrev = map[tnstore.BlockRootHash]map[string]struct{}{}
-	}
 	n.prunePendingBlockBroadcastDecodesLocked(now)
 	if old, ok := n.pendingBroadcasts[req.fingerprint]; ok {
 		n.deletePendingBlockBroadcastDecodeLocked(old.fingerprint)
@@ -103,7 +97,7 @@ func (n *Node) processPendingBlockBroadcastDecodesForPrevAsync(prev ton.BlockIDE
 
 func (n *Node) runPendingBlockBroadcastDecodeProcessorAsync() {
 	n.runAsync(func() {
-		ctx := n.runtimeContext()
+		ctx := n.runCtx
 
 		for {
 			n.pendingBroadcastMx.Lock()
@@ -162,7 +156,7 @@ func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, r
 			n.forgetPendingBlockBroadcastDecode(req.fingerprint)
 			n.log.Debug().
 				Err(err).
-				Str("block", formatBlockRef(req.block)).
+				Str("block", tnstore.FormatBlockRef(req.block)).
 				Str("kind", req.kind).
 				Msg("dropping pending block broadcast because payload decode failed")
 			continue
@@ -208,7 +202,7 @@ func (n *Node) decodePendingBlockBroadcast(ctx context.Context, req pendingBlock
 	switch data := req.msg.(type) {
 	case tonnodeapi.BlockBroadcastCompressedV2:
 		if req.proofRoot == nil {
-			return nil, fmt.Errorf("pending compressed V2 broadcast %s has no parsed proof root", formatBlockRef(req.block))
+			return nil, fmt.Errorf("pending compressed V2 broadcast %s has no parsed proof root", tnstore.FormatBlockRef(req.block))
 		}
 		downloaded, _, err := n.decodeBlockBroadcastCompressedV2WithProofRoot(ctx, data, req.proofRoot, nil, req.prev)
 		return downloaded, err
@@ -280,9 +274,6 @@ func (n *Node) deletePendingBlockBroadcastDecodeLocked(fingerprint string) {
 
 func (n *Node) addPendingBlockBroadcastPrevIndexLocked(req pendingBlockBroadcastDecode) {
 	key := tnstore.BlockKey(req.prev)
-	if n.pendingBroadcastByPrev == nil {
-		n.pendingBroadcastByPrev = map[tnstore.BlockRootHash]map[string]struct{}{}
-	}
 	fingerprints := n.pendingBroadcastByPrev[key]
 	if fingerprints == nil {
 		fingerprints = map[string]struct{}{}
@@ -305,8 +296,7 @@ func (n *Node) deletePendingBlockBroadcastPrevIndexLocked(req pendingBlockBroadc
 
 func pendingBlockBroadcastDecodeBytes(req pendingBlockBroadcastDecode) int64 {
 	bytes := int64(pendingBroadcastDecodeOverhead)
-	switch msg := req.msg.(type) {
-	case tonnodeapi.BlockBroadcastCompressedV2:
+	if msg, ok := req.msg.(tonnodeapi.BlockBroadcastCompressedV2); ok {
 		bytes += int64(len(msg.Proof) + len(msg.DataCompressed))
 	}
 	if req.rebroadcast != nil {

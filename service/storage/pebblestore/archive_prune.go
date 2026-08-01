@@ -503,13 +503,6 @@ func (s *Store) deleteArchivePackageRecords(ctx context.Context, packages []arch
 	return paths, len(deletePackage), deletedKeys, nil
 }
 
-func (s *Store) removeArchivePackageFiles(paths []string) (int, uint64, error) {
-	s.artifactMu.Lock()
-	defer s.artifactMu.Unlock()
-
-	return s.removeArchivePackageFilesLocked(paths)
-}
-
 func (s *Store) removeArchivePackageFilesLocked(paths []string) (int, uint64, error) {
 	if len(paths) == 0 {
 		return 0, 0, nil

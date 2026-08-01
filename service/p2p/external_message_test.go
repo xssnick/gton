@@ -232,7 +232,7 @@ func TestSendExternalMessageCustomOverlayCanSkipPublic(t *testing.T) {
 		MsgSenders:        map[PeerID]int{node.localID: 3},
 		SkipPublicMsgSend: true,
 	}
-	customSub, _ := node.getOrCreateSubscription(customSpec)
+	customSub := mustGetOrCreateSubscription(t, node, customSpec)
 	customSub.setActive(true, time.Time{})
 	customPeer := testRebroadcastQueuePeer("custom-peer")
 	customSub.peers[customPeer.id] = customPeer
@@ -241,7 +241,7 @@ func TestSendExternalMessageCustomOverlayCanSkipPublic(t *testing.T) {
 	if err := sendTestExternalMessage(t, node, body); err != nil {
 		t.Fatalf("send external message failed: %v", err)
 	}
-	if got, ok := customSub.customTwoStepQueueStatusSnapshot(); !ok {
+	if got, ok := customSub.twoStepQueueStatusSnapshot(); !ok {
 		t.Fatalf("expected custom two-step rebroadcast queue")
 	} else if got.Items != 1 {
 		t.Fatalf("custom two-step queued items = %d, want 1", got.Items)
@@ -325,7 +325,7 @@ func newSendExternalMessageTestNode(t *testing.T) (*Node, *overlaySubscription) 
 	if err != nil {
 		t.Fatalf("build overlay spec: %v", err)
 	}
-	sub, _ := node.getOrCreateSubscription(spec)
+	sub := mustGetOrCreateSubscription(t, node, spec)
 	sub.setActive(true, time.Time{})
 	return node, sub
 }

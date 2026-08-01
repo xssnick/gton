@@ -20,10 +20,6 @@ func (s *Service) observeBroadcastFlushedCurrentState(current *storage.CurrentSt
 }
 
 func (s *Service) observeBroadcastCurrentState(current *storage.CurrentState, flushed bool) {
-	if current == nil {
-		return
-	}
-
 	s.broadcastAdmissionMu.Lock()
 	defer s.broadcastAdmissionMu.Unlock()
 
@@ -48,7 +44,7 @@ func (s *Service) observeBroadcastCurrentState(current *storage.CurrentState, fl
 func (s *Service) updateBroadcastAdmissionLocked() {
 	lag := s.broadcastLiveFlushLagLocked()
 	closeLag := s.broadcastAdmissionCloseLag()
-	openLag := s.broadcastAdmissionOpenLag(closeLag)
+	openLag := closeLag / 2
 	wasClosed := s.broadcastAdmissionClosed
 
 	if wasClosed {
@@ -85,15 +81,11 @@ func (s *Service) broadcastLiveFlushLagLocked() uint32 {
 }
 
 func (s *Service) broadcastAdmissionCloseLag() uint32 {
-	liveWindow := s.nextCheckpointBlocks()
+	liveWindow := s.nextBlockCheckpointBlocks
 	closeLag := checkpointBackpressureBlocks(liveWindow, 2)
-	hardLag := checkpointBackpressureBlocks(liveWindow, s.syncBackpressureWindowCount())
+	hardLag := checkpointBackpressureBlocks(liveWindow, s.syncBackpressureWindows)
 	if closeLag > hardLag {
 		return hardLag
 	}
 	return closeLag
-}
-
-func (s *Service) broadcastAdmissionOpenLag(closeLag uint32) uint32 {
-	return closeLag / 2
 }

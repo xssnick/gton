@@ -22,10 +22,7 @@ type httpapiOptions struct {
 // configureHTTPAPI resolves the HTTP API options and returns the HTTP API
 // extension factory, nil when the API is disabled.
 func configureHTTPAPI(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions, globalConfig *liteclient.GlobalConfig) (httpapiOptions, hooks.ExtensionFactory, error) {
-	opts, err := httpapiOptionsFromConfig(cfg, runtimeOpts)
-	if err != nil {
-		return httpapiOptions{}, nil, err
-	}
+	opts := httpapiOptionsFromConfig(cfg, runtimeOpts)
 	if !opts.Enabled {
 		return opts, nil, nil
 	}
@@ -48,16 +45,15 @@ func httpapiExtensionFactory(opts httpapiOptions) hooks.ExtensionFactory {
 	}
 }
 
-func httpapiOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions) (httpapiOptions, error) {
+func httpapiOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions) httpapiOptions {
 	listenAddr := strings.TrimSpace(cfg.HTTPAPI.ListenAddr)
 	if listenAddr == "" {
 		listenAddr = nodeconfig.DefaultHTTPAPIListen
 	}
 
-	opts := httpapiOptions{
+	return httpapiOptions{
 		Enabled:        cfg.HTTPAPI.Enabled,
 		ListenAddr:     listenAddr,
 		RequestTimeout: runtimeOpts.HTTPAPI.RequestTimeout,
 	}
-	return opts, nil
 }

@@ -29,6 +29,7 @@ func newProbeTestPeer(t *testing.T) (*overlaySubscription, *overlayPeer, *testOv
 		addr:        "127.0.0.1:14001",
 		fixedMember: true,
 		overlay:     wrapper,
+		release:     func() {},
 		attachedAt:  time.Now().Add(-time.Hour),
 	}
 	sub.peers[peer.id] = peer
@@ -61,7 +62,7 @@ func TestFixedProbeSoftRecoveryAfterFailuresAndSilence(t *testing.T) {
 		peer.noteProbeFailed()
 	}
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	if got := base.nops.Load(); got != 1 {
 		t.Fatalf("recovery nops = %d, want 1", got)
@@ -74,7 +75,7 @@ func TestFixedProbeSoftRecoveryAfterFailuresAndSilence(t *testing.T) {
 	}
 
 	// Cooldown suppresses an immediate second soft recovery.
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now.Add(time.Second))
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now.Add(time.Second), defaultFixedProbePolicy())
 	if got := base.nops.Load(); got != 1 {
 		t.Fatalf("recovery nops after cooldown window = %d, want 1", got)
 	}
@@ -93,7 +94,7 @@ func TestFixedProbeNoSoftRecoveryWhilePairInboundFresh(t *testing.T) {
 	peer.lastReceiveAt = now.Add(-time.Minute)
 	peer.statsMx.Unlock()
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	if got := base.nops.Load(); got != 0 {
 		t.Fatalf("recovery nops = %d, want 0 while pair inbound is fresh", got)
@@ -119,7 +120,7 @@ func TestFixedProbeAttachGraceSuppressesRecovery(t *testing.T) {
 		peer.noteProbeFailed()
 	}
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	if got := base.nops.Load(); got != 0 {
 		t.Fatalf("recovery nops = %d, want 0 for freshly attached peer", got)
@@ -138,7 +139,7 @@ func TestFixedProbeHardRecoveryClosesTransportAndRemovesPeer(t *testing.T) {
 	peer.lastSoftRecoveryAt = now.Add(-2 * time.Minute)
 	peer.statsMx.Unlock()
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	select {
 	case <-base.GetCloserCtx().Done():
@@ -177,7 +178,7 @@ func TestFixedProbeHardRecoveryForStuckPendingChannelWithFreshADNL(t *testing.T)
 		}
 	}
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	select {
 	case <-base.GetCloserCtx().Done():
@@ -200,12 +201,12 @@ func TestFixedProbeRxStaleWithLivePairTriggersSingleSoftRecovery(t *testing.T) {
 	peer.lastReceiveAt = now.Add(-11 * time.Minute)
 	peer.statsMx.Unlock()
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 	if got := base.nops.Load(); got != 1 {
 		t.Fatalf("recovery nops = %d, want 1 for stale rx over live pair", got)
 	}
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now.Add(time.Second))
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now.Add(time.Second), defaultFixedProbePolicy())
 	if got := base.nops.Load(); got != 1 {
 		t.Fatalf("recovery nops = %d, want cooldown to suppress the second recovery", got)
 	}
@@ -219,7 +220,7 @@ func TestFixedProbeRxStaleRequiresPriorTraffic(t *testing.T) {
 
 	// The pair is alive, the peer attached long ago, but this overlay never
 	// delivered anything: a legitimately quiet overlay must not churn.
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	if got := base.nops.Load(); got != 0 {
 		t.Fatalf("recovery nops = %d, want 0 when rx never flowed", got)
@@ -267,7 +268,7 @@ func TestFixedProbeFreshPairSignalResetsSoftAttempts(t *testing.T) {
 	peer.lastReceiveAt = now
 	peer.statsMx.Unlock()
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, now)
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, now, defaultFixedProbePolicy())
 
 	peer.statsMx.Lock()
 	softAttempts := peer.softRecoveriesSinceSeen
@@ -289,7 +290,7 @@ func TestFixedProbeQueryOutcomeUpdatesPeerState(t *testing.T) {
 	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
 		return nil
 	}
-	sub.probeFixedPeer(context.Background(), peer)
+	sub.probeFixedPeer(context.Background(), peer, defaultFixedProbePolicy())
 	if stats := peer.statsSnapshot(); stats.lastPongAt.IsZero() || stats.probeFailures != 0 {
 		t.Fatalf("pong was not recorded: %+v", stats)
 	}
@@ -297,7 +298,7 @@ func TestFixedProbeQueryOutcomeUpdatesPeerState(t *testing.T) {
 	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
 		return errors.New("no route")
 	}
-	sub.probeFixedPeer(context.Background(), peer)
+	sub.probeFixedPeer(context.Background(), peer, defaultFixedProbePolicy())
 	// The pair is demonstrably alive (fresh pong just above), so the
 	// watchdog pass inside probeFixedPeer clears the recorded failure:
 	// failures only accumulate against a silent pair.
@@ -362,9 +363,9 @@ func TestFixedProbeSkipsNonFixedOverlays(t *testing.T) {
 		t.Fatal("probe query must not be sent for non-fixed overlays")
 		return nil
 	}
-	sub.probeFixedPeers(context.Background())
+	sub.probeFixedPeers(context.Background(), defaultFixedProbePolicy())
 
-	sub.evaluateFixedPeerRecovery(context.Background(), peer, time.Now())
+	sub.evaluateFixedPeerRecovery(context.Background(), peer, time.Now(), defaultFixedProbePolicy())
 	if got := base.reinits.Load(); got != 0 {
 		t.Fatalf("adnl reinits = %d, want 0 for non-fixed overlay", got)
 	}

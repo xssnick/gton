@@ -55,9 +55,6 @@ type stateCellPrewriter struct {
 }
 
 func newStateCellPrewriter(log zerolog.Logger, store stateCellPrewriteStore, maxBytes uint64) *stateCellPrewriter {
-	if store == nil {
-		return nil
-	}
 	return &stateCellPrewriter{
 		log:      log,
 		store:    store,
@@ -68,9 +65,6 @@ func newStateCellPrewriter(log zerolog.Logger, store stateCellPrewriteStore, max
 }
 
 func (w *stateCellPrewriter) start(ctx context.Context, writeCtx context.Context, runAsync func(func())) {
-	if w == nil {
-		return
-	}
 	w.startOnce.Do(func() {
 		runAsync(func() {
 			w.run(ctx, writeCtx)
@@ -102,30 +96,34 @@ func (w *stateCellPrewriter) run(ctx context.Context, writeCtx context.Context) 
 }
 
 func (w *stateCellPrewriter) enqueue(records storage.StateCellRecords) (uint64, error) {
-	if w == nil || records.Empty() {
-		return 0, nil
+	seq, wait, err := w.enqueueDetached(records)
+	if err != nil {
+		return 0, err
+	}
+	return seq, wait()
+}
+
+// enqueueDetached assigns the sequence and appends the job under the prewriter
+// mutex without ever blocking, so callers may enqueue while holding their own
+// locks. The returned wait is the queue's backpressure (it blocks while the
+// queue is over its limits) and must always be invoked — but only after the
+// caller released any lock its appliers or dependents contend on. Each
+// producer can overshoot the queue bound by at most its own in-flight job.
+func (w *stateCellPrewriter) enqueueDetached(records storage.StateCellRecords) (uint64, func() error, error) {
+	if records.Empty() {
+		return 0, noPrewriteBackpressure, nil
 	}
 
 	jobBytes := records.ByteSize()
 	w.mu.Lock()
-	for {
-		if w.err != nil {
-			err := w.err
-			w.mu.Unlock()
-			return 0, err
-		}
-		if w.closed {
-			w.mu.Unlock()
-			return 0, errStateCellPrewriterClosed
-		}
-		if w.hasQueueRoomLocked(jobBytes) {
-			break
-		}
-
-		done := w.done
+	if w.err != nil {
+		err := w.err
 		w.mu.Unlock()
-		<-done
-		w.mu.Lock()
+		return 0, nil, err
+	}
+	if w.closed {
+		w.mu.Unlock()
+		return 0, nil, errStateCellPrewriterClosed
 	}
 
 	w.next++
@@ -138,25 +136,49 @@ func (w *stateCellPrewriter) enqueue(records storage.StateCellRecords) (uint64, 
 	})
 	w.signalWake()
 	w.mu.Unlock()
-	return seq, nil
+	return seq, w.waitQueueRoom, nil
 }
 
-func (w *stateCellPrewriter) hasQueueRoomLocked(jobBytes uint64) bool {
+func (w *stateCellPrewriter) waitQueueRoom() error {
+	for {
+		w.mu.Lock()
+		if w.err != nil {
+			err := w.err
+			w.mu.Unlock()
+			return err
+		}
+		if w.closed {
+			w.mu.Unlock()
+			return errStateCellPrewriterClosed
+		}
+		if w.queueWithinLimitsLocked() {
+			w.mu.Unlock()
+			return nil
+		}
+
+		done := w.done
+		w.mu.Unlock()
+		<-done
+	}
+}
+
+// queueWithinLimitsLocked is the post-append counterpart of the old admission
+// gate: a single (possibly oversized) queued job never blocks its producer.
+func (w *stateCellPrewriter) queueWithinLimitsLocked() bool {
 	queuedJobs := len(w.jobs) - w.head
-	if queuedJobs == 0 {
+	if queuedJobs <= 1 {
 		return true
 	}
 	if queuedJobs >= stateCellPrewriteQueueJobsLimit {
 		return false
 	}
-	if w.maxBytes > 0 && jobBytes > 0 && w.bytes+jobBytes > w.maxBytes {
-		return false
-	}
-	return true
+	return w.maxBytes == 0 || w.bytes <= w.maxBytes
 }
 
+func noPrewriteBackpressure() error { return nil }
+
 func (w *stateCellPrewriter) wait(ctx context.Context, target uint64) error {
-	if w == nil || target == 0 {
+	if target == 0 {
 		return nil
 	}
 
@@ -197,11 +219,7 @@ func (w *stateCellPrewriter) popJob() (stateCellPrewriteJob, bool) {
 	job := w.jobs[w.head]
 	w.jobs[w.head] = stateCellPrewriteJob{}
 	w.head++
-	if job.bytes > w.bytes {
-		w.bytes = 0
-	} else {
-		w.bytes -= job.bytes
-	}
+	w.bytes -= job.bytes
 	if w.head == len(w.jobs) {
 		w.jobs = nil
 		w.head = 0
@@ -233,12 +251,8 @@ func (w *stateCellPrewriter) popBatch() (stateCellPrewriteBatch, bool) {
 }
 
 func (b *stateCellPrewriteBatch) add(job stateCellPrewriteJob) {
-	bytes := job.records.ByteSize()
 	b.chunks = job.records.AppendChunks(b.chunks)
-	if bytes == 0 {
-		bytes = job.bytes
-	}
-	b.bytes += bytes
+	b.bytes += job.bytes
 	b.jobs++
 	b.lastSeq = job.seq
 }
