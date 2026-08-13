@@ -253,7 +253,7 @@ func requireAssembledShardFinalityBlock(t *testing.T, candidate DownloadedBlock,
 func testBlockFinalityCandidate(t *testing.T, seqno uint32) DownloadedBlock {
 	t.Helper()
 
-	root := testPeerBlockRoot(t, 0, topShard, seqno)
+	root := testPeerBlockRoot(t, 0, seqno)
 	blockBOC := serializeCompressedBlockRoot(root)
 	rootHash := root.HashKey()
 	id := ton.BlockIDExt{

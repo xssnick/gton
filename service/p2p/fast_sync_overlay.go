@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p/internal/fastsync"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
@@ -42,8 +44,8 @@ type fastSyncOverlaySpec struct {
 
 type fastSyncOverlayRuntime struct {
 	spec       fastSyncOverlaySpec
-	membership *fastSyncMembership
-	peers      *fastSyncPeerRuntime
+	membership *fastsync.Membership
+	peers      *fastsync.PeerRuntime
 	envelope   *quicOverlayEnvelope
 
 	certificateMu   sync.Mutex
@@ -52,12 +54,6 @@ type fastSyncOverlayRuntime struct {
 	rootsMu        sync.Mutex
 	aliveRoots     []PeerID
 	aliveRootIndex map[PeerID]int
-}
-
-type fastSyncOverlayCounts struct {
-	ValidatorsAlive int
-	ValidatorsTotal int
-	Peers           fastSyncPeerRuntimeCounts
 }
 
 func newFastSyncOverlayRuntime(
@@ -71,9 +67,13 @@ func newFastSyncOverlayRuntime(
 		return nil, err
 	}
 
-	membership := newFastSyncMembership(spec.roster, spec.permanentFlags)
+	membership := fastsync.NewMembership(
+		spec.roster.rootPublicKeyIDsRef(),
+		spec.roster.adnlIDsRef(),
+		spec.permanentFlags,
+	)
 	certificate := fastSyncCertificateValue(spec.certificate)
-	peers, err := newFastSyncPeerRuntime(
+	peers, err := fastsync.NewPeerRuntime(
 		node.privKey,
 		overlayID,
 		fastSyncLocalMemberFlags(spec.receiveBroadcasts),
@@ -84,7 +84,7 @@ func newFastSyncOverlayRuntime(
 	if err != nil {
 		return nil, err
 	}
-	if peers.LocalID() != node.localID {
+	if PeerID(peers.LocalID()) != node.localID {
 		return nil, errors.New("fast sync local peer id does not match ADNL id")
 	}
 
@@ -166,11 +166,11 @@ func (r *fastSyncOverlayRuntime) updateCertificate(
 }
 
 func (r *fastSyncOverlayRuntime) contains(id PeerID) bool {
-	return r.membership.Contains(id, time.Now())
+	return r.membership.Contains(fastsync.ID(id), time.Now())
 }
 
 func (r *fastSyncOverlayRuntime) permanent(id PeerID) bool {
-	return r.membership.IsPermanent(id)
+	return r.membership.IsPermanent(fastsync.ID(id))
 }
 
 // declinesBroadcasts reports whether this overlay is send-only for us, i.e. we
@@ -182,7 +182,7 @@ func (r *fastSyncOverlayRuntime) declinesBroadcasts() bool {
 }
 
 func (r *fastSyncOverlayRuntime) peerReceivesBroadcasts(id PeerID) bool {
-	flags, err := r.membership.PeerFlags(id)
+	flags, err := r.membership.PeerFlags(fastsync.ID(id))
 	return err == nil && flags&fastSyncDoNotReceiveBroadcasts == 0
 }
 
@@ -269,7 +269,7 @@ func (r *fastSyncOverlayRuntime) setPeerAlive(
 	r.setValidatorAlive(id, alive)
 	// Permanent validators can be queried before they publish NodeV2.
 	// Their readiness lives in aliveRoots; the descriptor state is optional.
-	_ = r.peers.SetAlive(id, alive)
+	_ = r.peers.SetAlive(fastsync.ID(id), alive)
 }
 
 func (r *fastSyncOverlayRuntime) ready() bool {
@@ -332,18 +332,6 @@ func greatestCommonDivisor(left, right int) int {
 	return left
 }
 
-func (r *fastSyncOverlayRuntime) counts() fastSyncOverlayCounts {
-	r.rootsMu.Lock()
-	alive := len(r.aliveRoots)
-	r.rootsMu.Unlock()
-
-	return fastSyncOverlayCounts{
-		ValidatorsAlive: alive,
-		ValidatorsTotal: r.spec.roster.Len(),
-		Peers:           r.peers.Counts(),
-	}
-}
-
 func (n *Node) SetFastSyncOverlays(state FastSyncState) error {
 	n.fastSyncStateMx.Lock()
 	defer n.fastSyncStateMx.Unlock()
@@ -365,7 +353,10 @@ func (n *Node) applyFastSyncOverlaysLocked(state FastSyncState) error {
 		time.Now(),
 	)
 
-	desiredShards := n.fastSyncDesiredShards(state.Shards)
+	desiredShards, err := n.fastSyncDesiredShards(state.Shards)
+	if err != nil {
+		return err
+	}
 	if !localValidator && certificate == nil {
 		desiredShards = nil
 	}
@@ -478,24 +469,31 @@ func cloneFastSyncCertificate(
 
 func (n *Node) fastSyncDesiredShards(
 	shards []FastSyncShard,
-) []FastSyncShard {
+) ([]FastSyncShard, error) {
 	desired := make([]FastSyncShard, 0, len(shards)+1)
 	desired = append(desired, FastSyncShard{
 		Workchain: -1,
 		Shard:     topShard,
 	})
-	for _, shard := range shards {
-		if shard.Shard == 0 || shard.Workchain == -1 {
+	for _, candidate := range shards {
+		prefixLen, err := sharddomain.PrefixLength(candidate.Shard)
+		if err != nil {
+			return nil, fmt.Errorf("invalid fast-sync shard %d:%016x: %w", candidate.Workchain, uint64(candidate.Shard), err)
+		}
+		if candidate.Workchain == -1 {
 			continue
 		}
-
-		depth := n.monitorMinSplitDepthForWorkchain(shard.Workchain)
-		if uint32(fastSyncShardPrefixLength(shard.Shard)) > depth {
-			shard.Shard = shardPrefix(shard.Shard, depth)
+		depth := n.monitorMinSplitDepthForWorkchain(candidate.Workchain)
+		if prefixLen > depth {
+			ancestor, err := sharddomain.Ancestor(candidate.Shard, depth)
+			if err != nil {
+				return nil, fmt.Errorf("normalize fast-sync shard %d:%016x: %w", candidate.Workchain, uint64(candidate.Shard), err)
+			}
+			candidate.Shard = ancestor
 		}
-		desired = append(desired, shard)
+		desired = append(desired, candidate)
 	}
-	return NewFastSyncShardSet(desired).shardsRef()
+	return NewFastSyncShardSet(desired).shardsRef(), nil
 }
 
 func (n *Node) buildFastSyncOverlaySpec(
@@ -844,10 +842,10 @@ func (s *overlaySubscription) exchangeFastSyncRandomPeers(
 			Msg("FastSync random peer exchange failed")
 		return
 	}
-	if len(response.Nodes) > fastSyncRandomPeerResultLimit {
+	if len(response.Nodes) > fastsync.RandomPeerResultLimit {
 		s.log.Debug().
 			Int("nodes", len(response.Nodes)).
-			Int("maximum", fastSyncRandomPeerResultLimit).
+			Int("maximum", fastsync.RandomPeerResultLimit).
 			Str("peer", peer.addr).
 			Msg("rejected oversized FastSync random peer response")
 		return
@@ -859,11 +857,11 @@ func (s *overlaySubscription) exchangeFastSyncRandomPeers(
 func (s *overlaySubscription) handleFastSyncRandomPeers(
 	query overlay.GetRandomPeersV2,
 ) (overlay.NodesV2, error) {
-	if len(query.Peers.Nodes) > fastSyncRandomPeerResultLimit {
+	if len(query.Peers.Nodes) > fastsync.RandomPeerResultLimit {
 		return overlay.NodesV2{}, fmt.Errorf(
 			"FastSync random peer request contains %d nodes, maximum is %d",
 			len(query.Peers.Nodes),
-			fastSyncRandomPeerResultLimit,
+			fastsync.RandomPeerResultLimit,
 		)
 	}
 
@@ -888,7 +886,7 @@ func (s *overlaySubscription) learnFastSyncNodes(
 	learned := make([]PeerID, 0, len(nodes))
 	for _, node := range nodes {
 		id, err := s.fastSync.peers.EnrollNode(node, now)
-		if errors.Is(err, errFastSyncPeerIsLocal) {
+		if errors.Is(err, fastsync.ErrPeerIsLocal) {
 			continue
 		}
 		if err != nil {
@@ -897,7 +895,7 @@ func (s *overlaySubscription) learnFastSyncNodes(
 				Msg("rejected FastSync node descriptor")
 			continue
 		}
-		learned = append(learned, id)
+		learned = append(learned, PeerID(id))
 	}
 
 	if len(learned) == 0 {
@@ -934,23 +932,32 @@ func (s *overlaySubscription) learnFastSyncNodes(
 
 func (n *Node) readyFastSyncQuerySubscription(
 	block ton.BlockIDExt,
-) *overlaySubscription {
-	sub := n.fastSyncSubscriptionForBlock(block)
-	if sub == nil || sub.fastSync == nil || !sub.fastSync.ready() {
-		return nil
+) (*overlaySubscription, error) {
+	sub, err := n.fastSyncSubscriptionForBlock(block)
+	if err != nil {
+		return nil, err
 	}
-	return sub
+	if sub == nil || sub.fastSync == nil || !sub.fastSync.ready() {
+		return nil, nil
+	}
+	return sub, nil
 }
 
 func (n *Node) fastSyncSubscriptionForBlock(
 	block ton.BlockIDExt,
-) *overlaySubscription {
+) (*overlaySubscription, error) {
+	depth, err := sharddomain.PrefixLength(block.Shard)
+	if err != nil {
+		return nil, fmt.Errorf("invalid fast-sync block shard %d:%016x: %w", block.Workchain, uint64(block.Shard), err)
+	}
+
 	shard := FastSyncShard{
 		Workchain: block.Workchain,
 		Shard:     block.Shard,
 	}
 	if shard.Workchain == -1 {
 		shard.Shard = topShard
+		depth = 0
 	}
 
 	n.subscriptionsMx.RLock()
@@ -959,21 +966,16 @@ func (n *Node) fastSyncSubscriptionForBlock(
 	for {
 		sub := n.fastSyncSubscriptions[shard]
 		if sub != nil {
-			return sub
+			return sub, nil
 		}
-		if fastSyncShardPrefixLength(shard.Shard) == 0 {
-			return nil
+		if depth == 0 {
+			return nil, nil
 		}
-		shard.Shard = fastSyncShardParent(shard.Shard)
+		parent, err := sharddomain.Parent(shard.Shard)
+		if err != nil {
+			return nil, fmt.Errorf("parent fast-sync shard %d:%016x: %w", shard.Workchain, uint64(shard.Shard), err)
+		}
+		shard.Shard = parent
+		depth--
 	}
-}
-
-func (s *overlaySubscription) fastSyncCounts() (
-	fastSyncOverlayCounts,
-	error,
-) {
-	if s.fastSync == nil {
-		return fastSyncOverlayCounts{}, ErrFastSyncNotFound
-	}
-	return s.fastSync.counts(), nil
 }

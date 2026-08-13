@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	tnstate "github.com/xssnick/gton/service/state"
+	"github.com/xssnick/gton/internal/shardstate"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
@@ -304,8 +305,8 @@ func TestCacheImportedStagedBlockStateDoesNotPersistMetadata(t *testing.T) {
 
 	store := newTestPebbleStore(t)
 	node := &Node{
-		log:     zerolog.Nop(),
-		storage: store,
+		log:            zerolog.Nop(),
+		stateArtifacts: store,
 	}
 	staged := &stagedStateFile{
 		effectiveShard: 0,
@@ -397,7 +398,7 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	}
 	node := &Node{
 		log:                 zerolog.Nop(),
-		storage:             store,
+		stateArtifacts:      store,
 		peerStorage:         store,
 		stateFilesDir:       dir,
 		stateCellImportSlot: make(chan struct{}, 1),
@@ -426,7 +427,7 @@ func TestTryImportReusableStagedStateFile(t *testing.T) {
 	}
 }
 
-func TestTryImportReusableStagedStateFileUsesPeerStorage(t *testing.T) {
+func TestTryImportReusableStagedStateFileDoesNotFallbackToPeerStorage(t *testing.T) {
 	ctx := context.Background()
 	store := newTestPebbleStore(t)
 	dir := store.StateFilesDir()
@@ -464,25 +465,22 @@ func TestTryImportReusableStagedStateFileUsesPeerStorage(t *testing.T) {
 
 	node := &Node{
 		log:                 zerolog.Nop(),
-		storage:             persistentStateFileMissingStore{Storage: store},
+		stateArtifacts:      persistentStateFileMissingStore{StateArtifactStorage: store},
 		peerStorage:         store,
 		stateFilesDir:       dir,
 		stateCellImportSlot: make(chan struct{}, 1),
 	}
 	staged, lazyRoot, err := node.tryImportReusableStagedStateFile(ctx, block, master, 0, rootHash[:])
-	if err != nil {
-		t.Fatalf("import reusable staged state file from peer storage: %v", err)
+	if !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("import reusable staged state file error = %v, want ErrNotFound", err)
 	}
-	if staged == nil || staged.peerAddr != "local" {
-		t.Fatalf("unexpected staged file %+v", staged)
-	}
-	if lazyRoot == nil || lazyRoot.HashKey(0) != rootHash {
-		t.Fatal("unexpected imported root")
+	if staged != nil || lazyRoot != nil {
+		t.Fatalf("unexpected fallback result staged=%+v root=%v", staged, lazyRoot)
 	}
 }
 
 type persistentStateFileMissingStore struct {
-	tnstore.Storage
+	StateArtifactStorage
 }
 
 func (s persistentStateFileMissingStore) PersistentStateFile(context.Context, ton.BlockIDExt, ton.BlockIDExt, int64) (*tnstore.PersistentStateFile, error) {
@@ -522,10 +520,10 @@ func TestTryLoadReusableSplitPersistentStateHeader(t *testing.T) {
 		t.Fatalf("save reusable split header file metadata: %v", err)
 	}
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       store,
-		peerStorage:   store,
-		stateFilesDir: dir,
+		log:            zerolog.Nop(),
+		stateArtifacts: store,
+		peerStorage:    store,
+		stateFilesDir:  dir,
 	}
 	header, err := persistentStateSnapshotDownloader{
 		node:          node,
@@ -574,9 +572,10 @@ func TestSaveSplitPersistentStateHeaderStoresStateRootHash(t *testing.T) {
 	}
 
 	node := &Node{
-		log:           zerolog.Nop(),
-		peerStorage:   store,
-		stateFilesDir: dir,
+		log:            zerolog.Nop(),
+		stateArtifacts: store,
+		peerStorage:    store,
+		stateFilesDir:  dir,
 	}
 	staged := &stagedStateFile{
 		effectiveShard: block.Shard,
@@ -625,16 +624,14 @@ func TestSplitPersistentStatePartStorageDoesNotCollideWithFullState(t *testing.T
 	}
 	partLevelHash := partRoot.HashKey(0)
 	if err := saveTestBlockState(ctx, store, &tnstore.BlockState{
-		Block:          splitStatePartStorageBlock(block, part),
-		StateRootHash:  partLevelHash[:],
-		CellGeneration: 1,
+		Block:         splitStatePartStorageBlock(block, part),
+		StateRootHash: partLevelHash[:],
 	}); err != nil {
 		t.Fatalf("save split part metadata: %v", err)
 	}
 	if err := saveTestBlockState(ctx, store, &tnstore.BlockState{
-		Block:          block,
-		StateRootHash:  fullRootHash[:],
-		CellGeneration: 1,
+		Block:         block,
+		StateRootHash: fullRootHash[:],
 	}); err != nil {
 		t.Fatalf("save full state metadata: %v", err)
 	}
@@ -714,10 +711,10 @@ func TestStageSplitPartUsesImportedCellsProgress(t *testing.T) {
 	}
 
 	node := &Node{
-		log:           zerolog.Nop(),
-		storage:       store,
-		peerStorage:   store,
-		stateFilesDir: dir,
+		log:            zerolog.Nop(),
+		stateArtifacts: store,
+		peerStorage:    store,
+		stateFilesDir:  dir,
 	}
 	downloader := persistentStateSnapshotDownloader{
 		node:          node,
@@ -781,7 +778,7 @@ func TestImportSplitPartSavesReusableFileAndCells(t *testing.T) {
 
 	node := &Node{
 		log:                      zerolog.Nop(),
-		storage:                  store,
+		stateArtifacts:           store,
 		peerStorage:              store,
 		stateFilesDir:            store.StateFilesDir(),
 		stateCellImportSlot:      make(chan struct{}, 1),
@@ -848,7 +845,7 @@ func TestSplitStatePartRootImportsWhenImporterDisablesPartReuse(t *testing.T) {
 
 	importer := &splitPartReuseDisabledImporter{Store: newTestPebbleStore(t)}
 	artifact := &splitPersistentStateSnapshotArtifact{
-		node:   &Node{log: zerolog.Nop(), storage: oldStore},
+		node:   &Node{log: zerolog.Nop(), stateArtifacts: oldStore},
 		block:  block,
 		master: master,
 	}
@@ -898,8 +895,8 @@ func TestSplitPersistentStateMergeFromPebbleUsesPartRoots(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	node := &Node{
-		log:     zerolog.Nop(),
-		storage: store,
+		log:            zerolog.Nop(),
+		stateArtifacts: store,
 	}
 	header := &downloadedSplitStateHeader{
 		state: &fullState,
@@ -1128,7 +1125,7 @@ func TestMergeSplitStateDoesNotExpandLazySplitPartAccounts(t *testing.T) {
 		t.Fatalf("create counted lazy split part: %v", err)
 	}
 
-	merged, err := tnstate.MergeSplitState(&fullState, []*cell.Cell{lazyPartRoot})
+	merged, err := shardstate.Merge(&fullState, []*cell.Cell{lazyPartRoot})
 	if err != nil {
 		t.Fatalf("merge split state: %v", err)
 	}
@@ -1181,7 +1178,7 @@ func (l *countingLazyCellLoader) LoadCell(hash cell.Hash) (*cell.Cell, error) {
 func mustTestShardStateCell(t *testing.T, block ton.BlockIDExt) *cell.Cell {
 	t.Helper()
 
-	accounts, err := tnstate.NewShardAccountsAugDict()
+	accounts, err := shardstate.NewAccounts()
 	if err != nil {
 		t.Fatalf("create accounts dict: %v", err)
 	}
@@ -1219,7 +1216,7 @@ func mustTestShardStateCellWithAccounts(t *testing.T, block ton.BlockIDExt, keys
 func mustTestShardStateCellWithAccountIDs(t *testing.T, block ton.BlockIDExt, accountIDs ...*big.Int) *cell.Cell {
 	t.Helper()
 
-	accounts, err := tnstate.NewShardAccountsAugDict()
+	accounts, err := shardstate.NewAccounts()
 	if err != nil {
 		t.Fatalf("create accounts dict: %v", err)
 	}
@@ -1270,7 +1267,7 @@ func mustSplitStatePartRoot(t *testing.T, header *tlb.ShardStateUnsplit, part sp
 		t.Fatal("split part root is empty")
 	}
 
-	wrapped, err := tnstate.WrapShardAccountsRoot(partRoot)
+	wrapped, err := shardstate.WrapAccountsRoot(partRoot)
 	if err != nil {
 		t.Fatalf("wrap split part root: %v", err)
 	}
@@ -1280,12 +1277,15 @@ func mustSplitStatePartRoot(t *testing.T, header *tlb.ShardStateUnsplit, part sp
 func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header *tlb.ShardStateUnsplit, splitDepth uint32) []splitStatePart {
 	t.Helper()
 
-	shardPrefixLen := tnstate.ShardPrefixLength(block.Shard)
-	if splitDepth <= uint32(shardPrefixLen) || splitDepth > 63 {
+	shardPrefixLen, err := sharddomain.PrefixLength(block.Shard)
+	if err != nil {
+		t.Fatalf("invalid block shard %016x: %v", uint64(block.Shard), err)
+	}
+	if splitDepth <= shardPrefixLen || splitDepth > sharddomain.MaxPrefixLength {
 		t.Fatalf("invalid split depth %d for shard prefix length %d", splitDepth, shardPrefixLen)
 	}
 
-	partsCount := 1 << (splitDepth - uint32(shardPrefixLen))
+	partsCount := 1 << (splitDepth - shardPrefixLen)
 	effectiveShard := uint64(block.Shard) ^ (uint64(1) << (63 - shardPrefixLen)) ^ (uint64(1) << (63 - splitDepth))
 	increment := uint64(1) << (64 - splitDepth)
 
@@ -1297,7 +1297,7 @@ func mustSplitStatePartsFromFullState(t *testing.T, block ton.BlockIDExt, header
 			t.Fatalf("extract split part %d root: %v", i+1, err)
 		}
 		if partRoot != nil {
-			wrapped, err := tnstate.WrapShardAccountsRoot(partRoot)
+			wrapped, err := shardstate.WrapAccountsRoot(partRoot)
 			if err != nil {
 				t.Fatalf("wrap split part %d root: %v", i+1, err)
 			}
@@ -1321,31 +1321,38 @@ func TestHistoricalOverlayBlockRandomizesPublicAncestorDepth(t *testing.T) {
 	}
 	block := ton.BlockIDExt{
 		Workchain: 0,
-		Shard:     shardPrefix(0x1234567890abcdef, 5),
+		Shard:     testShardAncestor(t, 0x1234567890abcdef, 5),
 	}
 
 	seenDepths := make(map[int]struct{})
 	for range 256 {
-		selected := node.historicalOverlayBlockForDownload(block)
-		depth := tnstate.ShardPrefixLength(selected.Shard)
-		if depth < 0 || depth > 2 {
+		selected, err := node.historicalOverlayBlockForDownload(block)
+		if err != nil {
+			t.Fatalf("select historical overlay: %v", err)
+		}
+		depth, err := sharddomain.PrefixLength(selected.Shard)
+		if err != nil || depth > 2 {
 			t.Fatalf("historical public overlay depth = %d, want [0,2]", depth)
 		}
-		if want := shardPrefix(block.Shard, uint32(depth)); selected.Shard != want {
+		if want := testShardAncestor(t, block.Shard, depth); selected.Shard != want {
 			t.Fatalf(
 				"historical public overlay shard = %016x, want ancestor %016x",
 				uint64(selected.Shard),
 				uint64(want),
 			)
 		}
-		seenDepths[depth] = struct{}{}
+		seenDepths[int(depth)] = struct{}{}
 	}
 	if len(seenDepths) != 3 {
 		t.Fatalf("historical public overlay depths = %v, want 0, 1, and 2", seenDepths)
 	}
 
 	master := ton.BlockIDExt{Workchain: -1, Shard: 0x4000000000000000}
-	if selected := node.historicalOverlayBlockForDownload(master); selected.Shard != topShard {
+	selected, err := node.historicalOverlayBlockForDownload(master)
+	if err != nil {
+		t.Fatalf("select historical masterchain overlay: %v", err)
+	}
+	if selected.Shard != topShard {
 		t.Fatalf("historical masterchain overlay shard = %016x, want top shard", uint64(selected.Shard))
 	}
 }

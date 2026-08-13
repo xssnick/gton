@@ -26,5 +26,8 @@ build-darwin-arm64: prepare-build
 build-windows-amd64: prepare-build
 	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-windows-amd64.exe $(PACKAGE)
 
+native: prepare-build
+	CGO_ENABLED=1 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-native $(PACKAGE)
+
 prepare-build:
 	mkdir -p $(BUILD_DIR)

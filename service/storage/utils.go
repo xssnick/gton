@@ -139,7 +139,7 @@ func ParseStateProof(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, w
 }
 
 func parseStateCell(expected *ton.BlockIDExt, root *cell.Cell, rawBOC []byte, wantRootHash []byte, wantFileHash []byte, proof bool) (*BlockState, error) {
-	rootHash := root.HashKey(0)
+	rootHash := root.HashKeyAt(0)
 
 	var fileHash []byte
 	if len(rawBOC) == 0 && len(wantFileHash) > 0 {

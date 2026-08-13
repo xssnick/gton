@@ -8,8 +8,9 @@ import (
 
 func TestWaitSyncDiskSpaceReturnsWhenEnoughSpace(t *testing.T) {
 	calls := 0
-	svc := &Service{
+	svc := &SyncCoordinator{
 		syncDiskSpacePath:    "/db",
+		maintenance:          &MaintenanceRunner{maintenanceWake: make(chan struct{}, 1)},
 		minSyncDiskFreeBytes: 100,
 	}
 	probe := func(path string) (syncDiskSpaceStatus, error) {
@@ -27,9 +28,9 @@ func TestWaitSyncDiskSpaceReturnsWhenEnoughSpace(t *testing.T) {
 
 func TestWaitSyncDiskSpaceRetriesAndWakesMaintenance(t *testing.T) {
 	calls := 0
-	svc := &Service{
-		maintenanceWake:      make(chan struct{}, 1),
+	svc := &SyncCoordinator{
 		syncDiskSpacePath:    "/db",
+		maintenance:          &MaintenanceRunner{maintenanceWake: make(chan struct{}, 1)},
 		minSyncDiskFreeBytes: 100,
 	}
 	probe := func(path string) (syncDiskSpaceStatus, error) {
@@ -47,7 +48,7 @@ func TestWaitSyncDiskSpaceRetriesAndWakesMaintenance(t *testing.T) {
 		t.Fatalf("probe calls = %d, want 2", calls)
 	}
 	select {
-	case <-svc.maintenanceWake:
+	case <-svc.maintenance.maintenanceWake:
 	default:
 		t.Fatal("maintenance worker was not woken on low disk space")
 	}
@@ -57,8 +58,9 @@ func TestWaitSyncDiskSpaceReturnsContextErrorWhileWaiting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	svc := &Service{
+	svc := &SyncCoordinator{
 		syncDiskSpacePath:    "/db",
+		maintenance:          &MaintenanceRunner{maintenanceWake: make(chan struct{}, 1)},
 		minSyncDiskFreeBytes: 100,
 	}
 	probe := func(path string) (syncDiskSpaceStatus, error) {

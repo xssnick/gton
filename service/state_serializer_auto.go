@@ -40,8 +40,8 @@ type masterBlockMetaForStateSerialization struct {
 	meta  *storage.BlockMeta
 }
 
-func (s *Service) processPersistentStateSerialization(ctx context.Context) error {
-	if s.syncUntilFrozen() || !s.automaticStateSerializationReady.Load() {
+func (s *StateLifecycle) processPersistentStateSerialization(ctx context.Context) error {
+	if s.syncGate.syncUntilFrozen() || !s.maintenance.automaticStateSerializationReady.Load() {
 		return nil
 	}
 
@@ -50,7 +50,7 @@ func (s *Service) processPersistentStateSerialization(ctx context.Context) error
 		return err
 	}
 
-	current, err := s.storage.CurrentState(ctx)
+	current, err := scheduler.CurrentState(ctx)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil
 	}
@@ -136,8 +136,8 @@ func (s *Service) processPersistentStateSerialization(ctx context.Context) error
 	return nil
 }
 
-func (s *Service) initPersistentStateSerializer(ctx context.Context, scheduler storage.Storage, current ton.BlockIDExt) error {
-	latestKey, latestKeyUTime, err := s.initialPersistentStateSerializerWrittenBlock(ctx, current)
+func (s *StateLifecycle) initPersistentStateSerializer(ctx context.Context, scheduler stateSerializerStore, current ton.BlockIDExt) error {
+	latestKey, latestKeyUTime, err := s.initialPersistentStateSerializerWrittenBlock(ctx, scheduler, current)
 	if err != nil {
 		return fmt.Errorf("initialize persistent state serializer cursor: %w", err)
 	}
@@ -159,8 +159,8 @@ func (s *Service) initPersistentStateSerializer(ctx context.Context, scheduler s
 	return nil
 }
 
-func (s *Service) initialPersistentStateSerializerWrittenBlock(ctx context.Context, current ton.BlockIDExt) (ton.BlockIDExt, uint32, error) {
-	latestKey, latestKeyUTime, err := s.latestKnownKeyBlockAtOrBefore(ctx, current)
+func (s *StateLifecycle) initialPersistentStateSerializerWrittenBlock(ctx context.Context, scheduler stateSerializerStore, current ton.BlockIDExt) (ton.BlockIDExt, uint32, error) {
+	latestKey, latestKeyUTime, err := s.latestKnownKeyBlockAtOrBefore(ctx, scheduler, current)
 	if err == nil {
 		return latestKey, latestKeyUTime, nil
 	}
@@ -173,9 +173,9 @@ func (s *Service) initialPersistentStateSerializerWrittenBlock(ctx context.Conte
 	return ton.BlockIDExt{}, 0, err
 }
 
-func (s *Service) processPersistentStateKeyBlock(
+func (s *StateLifecycle) processPersistentStateKeyBlock(
 	ctx context.Context,
-	scheduler storage.Storage,
+	scheduler stateSerializerStore,
 	cursor *storage.PersistentStateSerializerState,
 	block ton.BlockIDExt,
 	meta *storage.BlockMeta,
@@ -251,9 +251,9 @@ func (s *Service) processPersistentStateKeyBlock(
 	return savePersistentStateSerializerCursor(ctx, scheduler, cursor, block, nil, 0)
 }
 
-func (s *Service) tryPersistentStateKeyBlock(
+func (s *StateLifecycle) tryPersistentStateKeyBlock(
 	ctx context.Context,
-	scheduler storage.Storage,
+	scheduler stateSerializerStore,
 	cursor *storage.PersistentStateSerializerState,
 	block ton.BlockIDExt,
 	meta *storage.BlockMeta,
@@ -309,7 +309,7 @@ func (s *Service) tryPersistentStateKeyBlock(
 		return stateSerializationDelayError{delay: delay}
 	}
 
-	lease, err := s.beginExclusiveServiceTask(ctx, exclusiveServiceTaskStateSerialization)
+	lease, err := s.maintenance.beginExclusiveServiceTask(ctx, exclusiveServiceTaskStateSerialization)
 	if err != nil {
 		return err
 	}
@@ -347,7 +347,7 @@ func activePersistentStateSerializationMatches(active *storage.PersistentStateSe
 	return active != nil && active.Block.Equals(&block)
 }
 
-func saveActivePersistentStateSerialization(ctx context.Context, scheduler storage.Storage, block ton.BlockIDExt) error {
+func saveActivePersistentStateSerialization(ctx context.Context, scheduler stateSerializerStore, block ton.BlockIDExt) error {
 	active := &storage.PersistentStateSerializerActive{
 		Block:         block,
 		StartedAtUnix: uint64(time.Now().Unix()),
@@ -358,15 +358,15 @@ func saveActivePersistentStateSerialization(ctx context.Context, scheduler stora
 	return nil
 }
 
-func clearActivePersistentStateSerialization(ctx context.Context, scheduler storage.Storage, block ton.BlockIDExt) error {
+func clearActivePersistentStateSerialization(ctx context.Context, scheduler stateSerializerStore, block ton.BlockIDExt) error {
 	if err := scheduler.DeleteActivePersistentStateSerialization(ctx); err != nil {
 		return fmt.Errorf("clear active persistent state serialization %s: %w", storage.FormatBlockRef(block), err)
 	}
 	return nil
 }
 
-func (s *Service) storePersistentStateDescription(ctx context.Context, scheduler storage.Storage, block ton.BlockIDExt, startTime uint32, endTime uint64) error {
-	masterState, err := s.storage.BlockState(ctx, block)
+func (s *StateLifecycle) storePersistentStateDescription(ctx context.Context, scheduler stateSerializerStore, block ton.BlockIDExt, startTime uint32, endTime uint64) error {
+	masterState, err := scheduler.BlockState(ctx, block)
 	if err != nil {
 		return fmt.Errorf("load masterchain state for persistent state description %s: %w", storage.FormatBlockRef(block), err)
 	}
@@ -425,7 +425,7 @@ func buildPersistentStateDescription(masterState *storage.BlockState, startTime 
 
 func savePersistentStateSerializerCursor(
 	ctx context.Context,
-	scheduler storage.Storage,
+	scheduler stateSerializerStore,
 	cursor *storage.PersistentStateSerializerState,
 	lastBlock ton.BlockIDExt,
 	lastWritten *ton.BlockIDExt,
@@ -442,7 +442,7 @@ func savePersistentStateSerializerCursor(
 	return nil
 }
 
-func (s *Service) latestKnownKeyBlockAtOrBefore(ctx context.Context, block ton.BlockIDExt) (ton.BlockIDExt, uint32, error) {
+func (s *StateLifecycle) latestKnownKeyBlockAtOrBefore(ctx context.Context, scheduler stateSerializerStore, block ton.BlockIDExt) (ton.BlockIDExt, uint32, error) {
 	if block.Workchain != -1 || block.Shard != topShard {
 		return ton.BlockIDExt{}, 0, fmt.Errorf("block is not masterchain: %s", storage.FormatBlockRef(block))
 	}
@@ -457,13 +457,13 @@ func (s *Service) latestKnownKeyBlockAtOrBefore(ctx context.Context, block ton.B
 		current := block
 		if seqno != block.SeqNo {
 			var err error
-			current, err = s.storage.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: seqno})
+			current, err = scheduler.LookupBlockBySeqNo(ctx, storage.BlockSeqRef{Workchain: -1, Shard: topShard, SeqNo: seqno})
 			if err != nil {
 				return ton.BlockIDExt{}, 0, err
 			}
 		}
 
-		meta, err := s.storage.BlockMeta(ctx, current)
+		meta, err := scheduler.BlockMeta(ctx, current)
 		if err != nil {
 			return ton.BlockIDExt{}, 0, err
 		}
@@ -484,7 +484,7 @@ func (s *Service) latestKnownKeyBlockAtOrBefore(ctx context.Context, block ton.B
 // loadStateSerializationKeyBlocks returns the known key blocks with
 // afterSeqno < seqno <= toSeqno in ascending order via the storage key-block
 // index, instead of materializing every masterchain block in the range.
-func (s *Service) loadStateSerializationKeyBlocks(ctx context.Context, afterSeqno uint32, toSeqno uint32) ([]masterBlockMetaForStateSerialization, ton.BlockIDExt, uint32, error) {
+func (s *StateLifecycle) loadStateSerializationKeyBlocks(ctx context.Context, afterSeqno uint32, toSeqno uint32) ([]masterBlockMetaForStateSerialization, ton.BlockIDExt, uint32, error) {
 	const keyBlockScanBatch = 128
 
 	var blocks []masterBlockMetaForStateSerialization
@@ -493,7 +493,7 @@ func (s *Service) loadStateSerializationKeyBlocks(ctx context.Context, afterSeqn
 
 	after := afterSeqno
 	for {
-		batch, err := s.storage.NextKeyBlockMetas(ctx, after, keyBlockScanBatch)
+		batch, err := s.stateSerializer.store.NextKeyBlockMetas(ctx, after, keyBlockScanBatch)
 		if errors.Is(err, storage.ErrNotFound) {
 			break
 		}

@@ -32,7 +32,6 @@ func TestHandleQUICMessageRewrapsCertifiedPlumtreeRelay(t *testing.T) {
 		issuer,
 		node.localID,
 		0,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
 	relayID := testPeerID("certified-plumtree-relay")
@@ -41,7 +40,6 @@ func TestHandleQUICMessageRewrapsCertifiedPlumtreeRelay(t *testing.T) {
 		issuer,
 		relayID,
 		1,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
 	node.fastSyncCertificates = []overlay.MemberCertificate{

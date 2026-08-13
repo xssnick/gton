@@ -340,7 +340,7 @@ func (n *Node) scheduleCompressedStateChain(prevState *cell.Cell, downloaded *Do
 	update := downloaded.StateUpdate
 	stateRootHash := append([]byte(nil), meta.StateRootHash...)
 	n.runAsync(func() {
-		next, _, err := cell.ApplyMerkleUpdate(prevState, update)
+		next, err := cell.ApplyMerkleUpdate(prevState, update)
 		if err != nil {
 			n.log.Debug().
 				Err(err).
@@ -348,7 +348,7 @@ func (n *Node) scheduleCompressedStateChain(prevState *cell.Cell, downloaded *Do
 				Msg("skip compressed state chain: merkle update does not apply")
 			return
 		}
-		nextHash := next.HashKey(0)
+		nextHash := next.HashKeyAt(0)
 		if !bytes.Equal(nextHash[:], stateRootHash) {
 			n.log.Debug().
 				Str("block", tnstore.FormatBlockRef(block)).

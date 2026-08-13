@@ -11,11 +11,6 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 )
 
-var (
-	fastSyncSelectedPeerSink PeerID
-	fastSyncSelectedErrSink  error
-)
-
 func TestNewFastSyncOverlayIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -128,11 +123,11 @@ func TestFastSyncShardSetSelection(t *testing.T) {
 
 	requested := FastSyncShard{
 		Workchain: 0,
-		Shard:     shardPrefix(0x1234567890abcdef, 4),
+		Shard:     testShardAncestor(t, 0x1234567890abcdef, 4),
 	}
 	parent := FastSyncShard{
 		Workchain: requested.Workchain,
-		Shard:     shardPrefix(requested.Shard, 2),
+		Shard:     testShardAncestor(t, requested.Shard, 2),
 	}
 	top := FastSyncShard{Workchain: requested.Workchain, Shard: topShard}
 	input := []FastSyncShard{top, parent, requested, parent}
@@ -163,6 +158,10 @@ func TestFastSyncShardSetSelection(t *testing.T) {
 	if _, err = NewFastSyncShardSet(nil).Select(top); !errors.Is(err, ErrFastSyncNotFound) {
 		t.Fatalf("missing top shard error = %v, want %v", err, ErrFastSyncNotFound)
 	}
+	invalid := FastSyncShard{Workchain: 0, Shard: 0}
+	if _, err = NewFastSyncShardSet([]FastSyncShard{invalid}).Select(invalid); err == nil {
+		t.Fatal("zero fast-sync shard should be rejected even when present in the set")
+	}
 
 	input[0] = FastSyncShard{Workchain: 9, Shard: topShard}
 	got := set.Shards()
@@ -170,17 +169,6 @@ func TestFastSyncShardSetSelection(t *testing.T) {
 	if current := set.Shards(); slices.Contains(current, got[0]) {
 		t.Fatalf("mutated immutable fast sync shard set: %v", current)
 	}
-}
-
-func fastSyncTestRoster(size int) FastSyncValidatorRoster {
-	ids := make([]PeerID, size)
-	for i := range ids {
-		ids[i][28] = byte(uint32(i+1) >> 24)
-		ids[i][29] = byte(uint32(i+1) >> 16)
-		ids[i][30] = byte(uint32(i+1) >> 8)
-		ids[i][31] = byte(i + 1)
-	}
-	return FastSyncValidatorRoster{adnlIDs: ids}
 }
 
 func fastSyncTestPeerID(value byte) PeerID {

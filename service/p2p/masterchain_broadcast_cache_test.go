@@ -145,9 +145,8 @@ func TestAcceptBroadcastCachesMasterchainNextBroadcast(t *testing.T) {
 
 func TestAcceptBroadcastObservesSignedMasterchainBlockReceived(t *testing.T) {
 	node := newTestNode(t)
-	observer := &testBlockReceivedObserver{hooks: true}
+	observer := &testBlockReceivedObserver{}
 	node.blockReceivedObserver = observer
-	node.blockReceivedHooks = observer.BlockReceivedHooksEnabled()
 	prev := testStoredMasterBlockID(240)
 	broadcast := testMasterchainBroadcastDownloadedBlock(t, prev, 241, 0x241)
 

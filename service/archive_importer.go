@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -38,8 +39,8 @@ const (
 	archiveCheckpointWaitLogInterval          = 10 * time.Second
 )
 
-type archiveCatchUpRunner struct {
-	service *Service
+type archiveCatchUpRun struct {
+	archive *ArchiveRunner
 	ctx     context.Context
 	current *storage.CurrentState
 	target  ton.BlockIDExt
@@ -66,53 +67,24 @@ type archiveCatchUpRunner struct {
 	lastProgressStats              archiveCatchUpProgressStats
 	pipelineWaitStarted            time.Time
 	checkpointDone                 chan archiveCheckpointResult
+	checkpointJoined               chan struct{}
 	checkpointStates               appliedStateSet
 	stateCells                     *stateCellWindowCache
 }
 
-func (s *Service) catchUpShardClientFromArchives(ctx context.Context, current *storage.CurrentState, target ton.BlockIDExt) (*storage.CurrentState, error) {
-	current = storage.CloneCurrentState(current)
-	if current.ShardClientSeqno == 0 {
-		current.ShardClientSeqno = current.Masterchain.Block.SeqNo
-	}
-	if current.Masterchain.Block.SeqNo != current.ShardClientSeqno {
-		return nil, fmt.Errorf("current masterchain seqno %d differs from shard client seqno %d", current.Masterchain.Block.SeqNo, current.ShardClientSeqno)
-	}
-	if err := s.waitSyncDiskSpace(ctx, "archive_catchup", statFSSyncDiskSpace, syncDiskSpaceRetryDelay); err != nil {
-		return nil, err
-	}
-
-	started := time.Now()
-	runner := &archiveCatchUpRunner{
-		service:                s,
-		ctx:                    ctx,
-		current:                current,
-		target:                 target,
-		importCache:            newArchiveImportCache(),
-		started:                started,
-		startSeqno:             current.ShardClientSeqno,
-		lastProgress:           started,
-		lastProgressSeqno:      current.ShardClientSeqno,
-		lastCheckpoint:         started,
-		lastCheckpointSeqno:    current.ShardClientSeqno,
-		checkpointBlocksTarget: s.archiveCatchUpCheckpointBlocks,
-		stateCells:             newStateCellWindowCache(s.stateCellLoader(), &s.lazyCellLoads),
-	}
-	runner.stateCells.setPrewriter(s.stateCellPrewrite)
-	runner.startProgressGoal = runner.archiveProgressGoalAt(started)
-
-	return runner.run()
-}
-
-func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
-	s := r.service
+func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
+	a := r.archive
 	r.archiveImporter = archive.NewImporter()
-	defer r.archiveImporter.Close()
 
-	r.archiveSession = s.node.BeginArchiveSession()
-	defer r.archiveSession.Close()
+	r.archiveSession = a.network.BeginArchiveSession()
+	defer func() {
+		if shutdownErr := r.shutdown(); shutdownErr != nil {
+			runErr = errors.Join(runErr, shutdownErr)
+			result = nil
+		}
+	}()
 
-	s.log.Info().
+	a.log.Info().
 		Str("from", storage.FormatBlockRef(r.current.Masterchain.Block)).
 		Str("target", storage.FormatBlockRef(r.target)).
 		Uint32("shard_client_seqno", r.current.ShardClientSeqno).
@@ -120,9 +92,6 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		Msg("starting archive shard-client catch-up")
 
 	r.pipeline = r.startShardClientArchiveWindowPipeline()
-	defer func() {
-		r.pipeline.cancel()
-	}()
 
 	handoffToNext := false
 	yieldToCellGenerationSwitch := false
@@ -131,6 +100,14 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		before := r.current.ShardClientSeqno
 		window, err := r.nextArchiveWindowWithProgress()
 		if err != nil {
+			if errors.Is(err, errArchiveNextBlockReady) {
+				handoffToNext = true
+				break
+			}
+			if window != nil {
+				r.dropArchiveWindowShardImportCache(window)
+				window.releaseImportedData()
+			}
 			if isArchiveCatchUpRetryError(err) {
 				if err = r.restartPipeline(err); err != nil {
 					return nil, err
@@ -145,7 +122,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		if len(window.masterStates) == 0 {
 			if window.syncUntilReached {
 				window.releaseImportedData()
-				s.enterSyncUntilOffline(r.current, PreparedBlock{})
+				a.syncUntilTransitions.enterSyncUntilOffline(r.current, PreparedBlock{})
 				break
 			}
 			window.releaseImportedData()
@@ -155,7 +132,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		applyStarted := time.Now()
 		next, err := r.applyShardClientArchiveWindow(r.ctx, r.current, window)
 		if err != nil {
-			r.dropArchiveWindowImportCache(window)
+			r.dropArchiveWindowShardImportCache(window)
 			window.releaseImportedData()
 			if isArchiveCatchUpRetryError(err) {
 				if err = r.restartPipeline(err); err != nil {
@@ -168,7 +145,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		applyElapsed := time.Since(applyStarted)
 		r.stateCells.adoptRecordsFrom(window.stateCells)
 		window.stateCells.releaseRecordsToBase(r.stateCells.loader())
-		s.log.Debug().
+		a.log.Debug().
 			Uint32("start_seqno", window.startSeqno).
 			Int("master_blocks", len(window.masterStates)).
 			Int("archive_blocks", len(window.archiveBlocks)).
@@ -186,7 +163,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 
 		if next.ShardClientSeqno <= before {
 			if window.syncUntilReached {
-				s.enterSyncUntilOffline(r.current, PreparedBlock{})
+				a.syncUntilTransitions.enterSyncUntilOffline(r.current, PreparedBlock{})
 				break
 			}
 			return nil, fmt.Errorf("archive window #%d did not advance shard client seqno %d", window.startSeqno, before)
@@ -208,19 +185,19 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 					return nil, err
 				}
 			}
-			s.enterSyncUntilOffline(r.current, PreparedBlock{})
+			a.syncUntilTransitions.enterSyncUntilOffline(r.current, PreparedBlock{})
 			break
 		}
-		if s.cellGenerationSwitchRequestActive() {
+		if a.state.cellGenerationSwitchRequestActive() {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
-				s.log.Info().
+				a.log.Info().
 					Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 					Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 					Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 					Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 					Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 					Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-					Uint64("checkpoint_target_bytes", s.checkpointBytes).
+					Uint64("checkpoint_target_bytes", a.state.checkpointTargetBytes()).
 					Bool("checkpoint_in_flight", r.checkpointDone != nil).
 					Msg("persisting archive shard-client checkpoint before cell generation switch")
 				if _, err = r.persistCheckpoint("cell_generation_switch"); err != nil {
@@ -228,23 +205,23 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 				}
 			}
 			yieldToCellGenerationSwitch = true
-			s.log.Info().
+			a.log.Info().
 				Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
 				Str("target", storage.FormatBlockRef(r.target)).
 				Msg("yielding archive shard-client catch-up for cell generation switch")
 			break
 		}
-		blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
+		blockUTime := blockStateUtime(r.ctx, a.storage, &r.current.Masterchain)
 		if lagSeconds := time.Now().Unix() - blockUTime; blockUTime != 0 && shouldSwitchArchiveToNextByLag(lagSeconds) {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
-				s.log.Info().
+				a.log.Info().
 					Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 					Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 					Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 					Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 					Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 					Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-					Uint64("checkpoint_target_bytes", s.checkpointBytes).
+					Uint64("checkpoint_target_bytes", a.state.checkpointTargetBytes()).
 					Uint32("checkpoint_backpressure_blocks", r.archiveCheckpointBackpressureBlocks()).
 					Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 					Bool("checkpoint_in_flight", r.checkpointDone != nil).
@@ -255,7 +232,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 				}
 			}
 			handoffToNext = true
-			s.log.Info().
+			a.log.Info().
 				Str("current", storage.FormatBlockRef(r.current.Masterchain.Block)).
 				Str("target", storage.FormatBlockRef(r.target)).
 				Int64("lag_seconds", lagSeconds).
@@ -265,7 +242,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 				Msg("switching from archive catch-up to next-block pipeline")
 			break
 		}
-		if r.checkpointDone == nil && s.shouldPersistArchiveCatchUpCheckpoint(r.current.ShardClientSeqno, r.target.SeqNo, r.lastCheckpointSeqno, r.lastCheckpoint, r.checkpointBlocksTarget, r.pendingArchiveCheckpointBytes()) {
+		if r.checkpointDone == nil && a.shouldPersistArchiveCatchUpCheckpoint(r.current.ShardClientSeqno, r.target.SeqNo, r.lastCheckpointSeqno, r.lastCheckpoint, r.checkpointBlocksTarget, r.pendingArchiveCheckpointBytes()) {
 			if err = r.startCheckpoint("interval"); err != nil {
 				return nil, err
 			}
@@ -273,14 +250,14 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 		if r.shouldWaitArchiveCheckpointBackpressure() {
 			backpressureBlocks := r.archiveCheckpointBackpressureBlocks()
 			pendingBytes := r.pendingArchiveCheckpointBytes()
-			s.log.Info().
+			a.log.Info().
 				Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 				Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 				Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 				Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 				Uint64("pending_checkpoint_bytes", pendingBytes).
 				Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-				Uint64("checkpoint_target_bytes", s.checkpointBytes).
+				Uint64("checkpoint_target_bytes", a.state.checkpointTargetBytes()).
 				Uint32("checkpoint_backpressure_blocks", backpressureBlocks).
 				Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 				Bool("checkpoint_in_flight", r.checkpointDone != nil).
@@ -299,14 +276,14 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	}
 
 	if r.current.ShardClientSeqno > r.lastCheckpointSeqno {
-		s.log.Info().
+		a.log.Info().
 			Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 			Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 			Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 			Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 			Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 			Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-			Uint64("checkpoint_target_bytes", s.checkpointBytes).
+			Uint64("checkpoint_target_bytes", a.state.checkpointTargetBytes()).
 			Uint32("checkpoint_backpressure_blocks", r.archiveCheckpointBackpressureBlocks()).
 			Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 			Bool("checkpoint_in_flight", r.checkpointDone != nil).
@@ -323,7 +300,7 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	if yieldToCellGenerationSwitch {
 		doneMsg = "archive shard-client catch-up yielded for cell generation switch"
 	}
-	s.log.Info().
+	a.log.Info().
 		Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 		Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 		Int("shards", len(r.current.Shards)).
@@ -331,8 +308,30 @@ func (r *archiveCatchUpRunner) run() (*storage.CurrentState, error) {
 	return r.current, nil
 }
 
-func (r *archiveCatchUpRunner) dropArchiveWindowImportCache(window *shardClientArchiveWindow) {
+func (r *archiveCatchUpRun) shouldHandoffToNextBlock() bool {
+	latest, err := r.archive.network.ObservedMasterchainBlock()
+	return err == nil && shouldPreferNextBlockTarget(r.current.Masterchain.Block.SeqNo, latest.SeqNo)
+}
+
+func (r *archiveCatchUpRun) shutdown() error {
+	if r.pipeline != nil {
+		r.pipeline.stop()
+	}
+	_, checkpointErr := r.finishCheckpoint(true)
+	if r.archiveSession != nil {
+		r.archiveSession.Close()
+	}
+	if r.archiveImporter != nil {
+		r.archiveImporter.Close()
+	}
+	return checkpointErr
+}
+
+func (r *archiveCatchUpRun) dropArchiveWindowShardImportCache(window *shardClientArchiveWindow) {
 	for _, imported := range window.archiveImports {
+		if imported.cacheKey.shard.IsMasterchain() {
+			continue
+		}
 		r.importCache.drop(imported.cacheKey)
 	}
 }

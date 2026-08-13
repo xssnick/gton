@@ -240,7 +240,7 @@ func (req rebroadcastRequest) queueName() string {
 	payloadLen := req.payloadLen()
 	if payloadLen > 0 {
 		plan := req.subscription.rebroadcastPlan(req.kind, payloadLen)
-		if req.subscription.usesTwoStepRebroadcast(plan) {
+		if req.subscription.usesTwoStepForRequest(req, plan) {
 			return twoStepRebroadcastQueueName
 		}
 	}
@@ -382,7 +382,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	}
 
 	plan := s.rebroadcastPlan(req.kind, payloadLen)
-	if s.usesTwoStepRebroadcast(plan) {
+	if s.usesTwoStepForRequest(req, plan) {
 		return s.enqueueTwoStepRebroadcast(req)
 	}
 	if plan.mode == rebroadcastModeSimple && req.simple == nil {
@@ -402,7 +402,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if plan.mode == rebroadcastModeFEC && req.fec == nil {
 		fec, err := overlay.NewBroadcastFECSender(
 			s.node.privKey,
-			overlay.CertificateEmpty{},
+			req.certificate,
 			req.payload,
 			plan.flags,
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
@@ -473,11 +473,18 @@ func (s *overlaySubscription) usesTwoStepRebroadcast(
 		plan.flags&overlay.BroadcastFlagNoTwoStep == 0
 }
 
+func (s *overlaySubscription) usesTwoStepForRequest(
+	req rebroadcastRequest,
+	plan rebroadcastPlan,
+) bool {
+	return !req.forceLegacyFEC && s.usesTwoStepRebroadcast(plan)
+}
+
 func (s *overlaySubscription) rebroadcastDelivery(
 	req rebroadcastRequest,
 ) Delivery {
 	plan := s.rebroadcastPlan(req.kind, req.payloadLen())
-	if s.usesTwoStepRebroadcast(plan) {
+	if s.usesTwoStepForRequest(req, plan) {
 		return DeliveryTwoStep
 	}
 	if plan.mode == rebroadcastModeSimple {
@@ -723,7 +730,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 		var err error
 		sender, err = overlay.NewBroadcastFECSender(
 			s.node.privKey,
-			overlay.CertificateEmpty{},
+			req.certificate,
 			req.payload,
 			plan.flags,
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),

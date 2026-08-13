@@ -18,6 +18,10 @@ type stateUpdateApplier interface {
 	applyBlockStateUpdate(previous []*tnstore.BlockState, block PreparedBlock) (stateUpdateApplyResult, error)
 }
 
+type storedBlockStore interface {
+	BlockFull(context.Context, ton.BlockIDExt) (*tnstore.ServedBlockFull, error)
+}
+
 type stateUpdateApplyResult struct {
 	PreviousRoot *cell.Cell
 	NextRoot     *cell.Cell
@@ -89,7 +93,7 @@ func prepareStoredBlockForApply(id ton.BlockIDExt, full *tnstore.ServedBlockFull
 	return prepared, nil
 }
 
-func loadStoredBlockForApply(ctx context.Context, store tnstore.Storage, id ton.BlockIDExt) (PreparedBlock, error) {
+func loadStoredBlockForApply(ctx context.Context, store storedBlockStore, id ton.BlockIDExt) (PreparedBlock, error) {
 	full, err := store.BlockFull(ctx, id)
 	if err != nil {
 		return PreparedBlock{}, err
@@ -107,7 +111,7 @@ func applyBlockWithPreviousStates(previous []*tnstore.BlockState, block Prepared
 	} else {
 		result.PreviousRoot, err = previousStateRoot(previous)
 		if err == nil {
-			result.NextRoot, _, err = cell.ApplyMerkleUpdate(result.PreviousRoot, stateUpdate)
+			result.NextRoot, err = cell.ApplyMerkleUpdate(result.PreviousRoot, stateUpdate)
 		}
 	}
 	if err != nil {

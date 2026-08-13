@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 )
 
@@ -28,30 +29,40 @@ func TestHTTPAPIOptionsFromConfig(t *testing.T) {
 	}
 }
 
-func TestConfigureHTTPAPIReturnsExtensionFactory(t *testing.T) {
+func TestConfigureHTTPAPISetsTypedNodeOptions(t *testing.T) {
 	cfg := nodeconfig.Config{
 		HTTPAPI: nodeconfig.HTTPAPI{
-			Enabled: true,
+			Enabled:               true,
+			ListenAddr:            "127.0.0.1:8081",
+			RequestTimeoutSeconds: 7,
 		},
 	}
+	var runOpts gton.NodeOptions
 
-	_, factory, err := configureHTTPAPI(cfg, httpRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig())
+	_, err := configureHTTPAPI(&runOpts, cfg, httpRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig())
 	if err != nil {
 		t.Fatalf("configure http api: %v", err)
 	}
-	if factory == nil {
-		t.Fatal("expected http api extension factory")
+	if runOpts.HTTPAPI == nil {
+		t.Fatal("expected typed http api options")
+	}
+	if runOpts.HTTPAPI.ListenAddr != "127.0.0.1:8081" {
+		t.Fatalf("unexpected listen addr %q", runOpts.HTTPAPI.ListenAddr)
+	}
+	if runOpts.HTTPAPI.RequestTimeout != 7*time.Second {
+		t.Fatalf("unexpected request timeout %s", runOpts.HTTPAPI.RequestTimeout)
 	}
 }
 
-func TestConfigureHTTPAPIDisabledReturnsNoFactory(t *testing.T) {
+func TestConfigureHTTPAPIDisabledClearsBuiltInOptions(t *testing.T) {
 	cfg := nodeconfig.Config{}
-	_, factory, err := configureHTTPAPI(cfg, httpRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig())
+	runOpts := gton.NodeOptions{HTTPAPI: &gton.HTTPAPIOptions{ListenAddr: "stale"}}
+	_, err := configureHTTPAPI(&runOpts, cfg, httpRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig())
 	if err != nil {
 		t.Fatalf("configure http api: %v", err)
 	}
-	if factory != nil {
-		t.Fatal("expected no extension factory for disabled http api")
+	if runOpts.HTTPAPI != nil {
+		t.Fatal("expected disabled http api to have no built-in options")
 	}
 }
 

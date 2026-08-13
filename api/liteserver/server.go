@@ -77,6 +77,8 @@ type Options struct {
 	Logger                  *zerolog.Logger
 	Store                   Store
 	MessageSender           MessageSender
+	TVM                     *tvm.TVM
+	CheckExternalMessage    admission.CheckFunc
 	QueryObserver           QueryObserver
 	PrivateKey              ed25519.PrivateKey
 	ListenAddr              string
@@ -126,30 +128,34 @@ type Server struct {
 	blockProofBaseLoad  liveLoadGroup[liteBlockKey]
 }
 
-// New preserves the released standalone composition: it owns a TVM and uses
-// the sender's checker when available, otherwise constructing the legacy local
-// checker. Internal composition paths should pass ready dependencies to newServer.
+// New accepts ready runtime dependencies from the application composition root.
+// The fallback TVM and checker preserve the released standalone API.
 func New(opts Options) (*Server, error) {
 	if err := validateServerOptions(opts); err != nil {
 		return nil, err
 	}
 
 	log := liteserverLogger(opts.Logger)
-	tvmInstance := tvm.NewTVM()
+	tvmInstance := opts.TVM
+	if tvmInstance == nil {
+		tvmInstance = tvm.NewTVM()
+	}
 
-	var checkExternalMessage admission.CheckFunc
-	if messageChecker, ok := opts.MessageSender.(MessageChecker); ok && messageChecker != nil {
-		checkExternalMessage = messageChecker.CheckExternalMessage
-	} else {
-		externalMessageChecker, err := admission.NewChecker(admission.Options{
-			Logger: &log,
-			Store:  opts.Store,
-			TVM:    tvmInstance,
-		})
-		if err != nil {
-			return nil, err
+	checkExternalMessage := opts.CheckExternalMessage
+	if checkExternalMessage == nil {
+		if messageChecker, ok := opts.MessageSender.(MessageChecker); ok && messageChecker != nil {
+			checkExternalMessage = messageChecker.CheckExternalMessage
+		} else {
+			externalMessageChecker, err := admission.NewChecker(admission.Options{
+				Logger: &log,
+				Store:  opts.Store,
+				TVM:    tvmInstance,
+			})
+			if err != nil {
+				return nil, err
+			}
+			checkExternalMessage = externalMessageChecker.Check
 		}
-		checkExternalMessage = externalMessageChecker.Check
 	}
 
 	return newServer(opts, tvmInstance, checkExternalMessage)

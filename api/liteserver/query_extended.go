@@ -12,7 +12,7 @@ import (
 	"github.com/xssnick/gton/internal/extmsg"
 	"github.com/xssnick/gton/service/blockproof"
 	admission "github.com/xssnick/gton/service/externalmsg"
-	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -153,7 +153,7 @@ func sendMessageCheckErrorReason(err error) string {
 }
 
 func sendMessageBroadcastErrorReason(err error) string {
-	if errors.Is(err, p2p.ErrOffline) {
+	if errors.Is(err, extmsg.ErrNetworkOffline) {
 		return sendMessageErrorReasonOffline
 	}
 	if errors.Is(err, extmsg.ErrExternalBroadcastCapacityExceeded) {
@@ -220,7 +220,7 @@ func (s *Server) buildAllShardsInfoParts(ctx context.Context, id ton.BlockIDExt)
 }
 
 func (s *Server) handleShardInfo(ctx context.Context, query ton.GetShardInfo) any {
-	if blockproof.ShardPrefixLen(uint64(query.Shard)) < 0 {
+	if err := shard.Validate(query.Shard); err != nil {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
 	}
 	if !isFullBlockID(query.ID) || query.ID.Workchain != masterchainID {
@@ -998,7 +998,7 @@ func (s *Server) handleBlockOutMsgQueueSize(ctx context.Context, query ton.GetBl
 func (s *Server) handleOutMsgQueueSizes(ctx context.Context, query ton.GetOutMsgQueueSizes) any {
 	var filter *storage.ShardKey
 	if query.Mode&1 != 0 {
-		if blockproof.ShardPrefixLen(uint64(query.Shard)) < 0 {
+		if err := shard.Validate(query.Shard); err != nil {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
 		}
 		filter = &storage.ShardKey{Workchain: query.WC, Shard: query.Shard}
@@ -1010,12 +1010,12 @@ func (s *Server) handleOutMsgQueueSizes(ctx context.Context, query ton.GetOutMsg
 	}
 
 	blocks := make([]ton.BlockIDExt, 0, 1+len(current.Shards))
-	if filter == nil || blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(current.Masterchain.Block)) {
+	if filter == nil || filter.Workchain == current.Masterchain.Block.Workchain && shard.Intersects(filter.Shard, current.Masterchain.Block.Shard) {
 		blocks = append(blocks, current.Masterchain.Block)
 	}
 	for _, key := range storage.SortedShardKeys(current.Shards) {
 		state := current.Shards[key]
-		if filter != nil && !blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(state.Block)) {
+		if filter != nil && (filter.Workchain != state.Block.Workchain || !shard.Intersects(filter.Shard, state.Block.Shard)) {
 			continue
 		}
 		blocks = append(blocks, state.Block)

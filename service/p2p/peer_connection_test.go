@@ -750,7 +750,7 @@ func TestDHTCandidateReplacesBadPeerAtFullLiveLimit(t *testing.T) {
 			id:            id,
 			addr:          "127.0.0.1:24001",
 			pub:           remotePub,
-			route:         newPeerRoute(""),
+			route:         newTestPeerRoute(""),
 			overlay:       &overlay.ADNLOverlayWrapper{},
 			announced:     &overlay.Node{Version: int32(now.Unix())},
 			alive:         true,
@@ -772,6 +772,7 @@ func TestDHTCandidateReplacesBadPeerAtFullLiveLimit(t *testing.T) {
 			"",
 			peer.announced,
 			now,
+			directoryProven,
 		)
 		sub.markDirectoryLiveLocked(id, true)
 	}

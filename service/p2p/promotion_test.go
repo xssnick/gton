@@ -24,7 +24,7 @@ func testPromotionSubscription(t *testing.T, liveRows, directoryRows int) *overl
 	for i := 0; i < liveRows; i++ {
 		peer := testArchiveCandidate(fmt.Sprintf("live-%03d", i))
 		sub.peers[peer.id] = peer
-		sub.rememberDirectoryPeerLocked(peer.id, testDirectoryPub(t), "10.1.0.1:30303", "", nil, now)
+		sub.rememberDirectoryPeerLocked(peer.id, testDirectoryPub(t), "10.1.0.1:30303", "", nil, now, directoryProven)
 		sub.markDirectoryLiveLocked(peer.id, true)
 	}
 	for i := 0; i < directoryRows; i++ {
@@ -43,6 +43,7 @@ func testPromotionSubscription(t *testing.T, liveRows, directoryRows int) *overl
 			"",
 			node,
 			now,
+			directoryProven,
 		)
 	}
 	return sub
@@ -60,21 +61,21 @@ func TestLiveTierRoomTracksTheLiveCap(t *testing.T) {
 	}
 }
 
-// Promotion must never pick a row that is already live, has no address, or
-// carries a stale announcement — each of those would burn a handshake for
-// nothing.
+// Promotion must never pick a row that is already live, that it cannot reach —
+// no address filed and no transport pooled, as here — or that carries a stale
+// announcement. Each of those would burn a handshake for nothing.
 func TestPromotionCandidatesFilterUnusableRows(t *testing.T) {
 	sub := testPromotionSubscription(t, 3, 5)
 
 	// A row with no address and a row with a stale announcement.
 	sub.mx.Lock()
 	noAddr := testPeerID("no-addr")
-	sub.rememberDirectoryPeerLocked(noAddr, testDirectoryPub(t), "", "", nil, time.Now())
+	sub.rememberDirectoryPeerLocked(noAddr, testDirectoryPub(t), "", "", nil, time.Now(), directoryHearsay)
 	staleID := testPeerID("stale-node")
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	staleNode, _ := overlay.NewNode(sub.spec.FullID, priv)
 	staleNode.Version = int32(time.Now().Add(-2 * overlayPeerTTL).Unix())
-	sub.rememberDirectoryPeerLocked(staleID, testDirectoryPub(t), "10.3.0.1:30303", "", staleNode, time.Now())
+	sub.rememberDirectoryPeerLocked(staleID, testDirectoryPub(t), "10.3.0.1:30303", "", staleNode, time.Now(), directoryProven)
 	sub.mx.Unlock()
 
 	candidates := sub.promotionCandidates()
@@ -91,6 +92,34 @@ func TestPromotionCandidatesFilterUnusableRows(t *testing.T) {
 		if entry.id == staleID || entry.id == noAddr {
 			t.Fatalf("unusable row %s selected", entry.id.String())
 		}
+	}
+}
+
+// A peer that reached us first never joins a public roster and the gossip that
+// files its row carries no address, so requiring one hid exactly the peers we
+// already hold an open transport to — and acquirePeerEndpoint reuses a pooled
+// transport by id without ever looking at the endpoint.
+func TestPromotionCandidatesAcceptRowsReachableThroughThePool(t *testing.T) {
+	sub := testPromotionSubscription(t, 0, 0)
+	now := time.Now()
+	announced := freshDirectoryNode(t, sub.spec.FullID)
+
+	pooled, _ := newIdleTestPooledPeer("promotion-pooled-row", now, 0)
+	t.Cleanup(pooled.close)
+	sub.node.pool = &peerPool{peers: map[PeerID]*pooledPeer{pooled.id: pooled}}
+
+	unreachable := testPeerID("promotion-no-transport")
+	sub.mx.Lock()
+	sub.rememberDirectoryPeerLocked(pooled.id, testDirectoryPub(t), "", "", announced, now, directoryHearsay)
+	sub.rememberDirectoryPeerLocked(unreachable, testDirectoryPub(t), "", "", announced, now, directoryHearsay)
+	sub.mx.Unlock()
+
+	candidates := sub.promotionCandidates()
+	if len(candidates) != 1 {
+		t.Fatalf("promotion candidates = %d, want only the pooled row", len(candidates))
+	}
+	if candidates[0].id != pooled.id {
+		t.Fatalf("candidate %s selected, want the row with a pooled transport", candidates[0].id.String())
 	}
 }
 

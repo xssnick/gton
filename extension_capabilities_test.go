@@ -5,5 +5,5 @@ import (
 	"github.com/xssnick/gton/service/liveview"
 )
 
-var _ hooks.Network = extensionNetwork{}
+var _ hooks.Network = externalMessageNetwork{}
 var _ hooks.Store = (*liveview.Store)(nil)

@@ -20,7 +20,7 @@ func TestSenderChecksAddressLimitBeforeAdmission(t *testing.T) {
 	body, _, _ := testExternalMessageBOC(t, addr)
 
 	limiter := extmsg.NewAddressLimiter(1, 10*time.Second, 16)
-	if err := limiter.Add(AddressKey(addr), now); err != nil {
+	if err := limiter.Add(extmsg.AddressKeyFor(addr), now); err != nil {
 		t.Fatalf("preload limiter: %v", err)
 	}
 
@@ -92,6 +92,30 @@ func TestSenderDuplicateSendForHashSkipsAdmission(t *testing.T) {
 	want := root.Hash()
 	if !bytes.Equal(got[:], want[:]) {
 		t.Fatalf("duplicate root hash = %x, want %x", got, want)
+	}
+}
+
+func TestSenderPreservesExternalNetworkError(t *testing.T) {
+	addr := address.MustParseRawAddr("0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe")
+	body, root, msg := testExternalMessageBOC(t, addr)
+	sender, err := NewSender(SenderOptions{
+		Check: func(context.Context, []byte, *cell.Cell, *tlb.ExternalMessage) (CheckResult, error) {
+			return CheckResult{Root: root, Message: msg}, nil
+		},
+		Broadcast: func(context.Context, []byte, *address.Address, *cell.Cell, *tlb.ExternalMessage) error {
+			return extmsg.ErrNetworkOffline
+		},
+	})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+
+	err = sender.Send(context.Background(), body)
+	if !errors.Is(err, ErrBroadcastFailed) {
+		t.Fatalf("send error = %v, want broadcast stage", err)
+	}
+	if !errors.Is(err, extmsg.ErrNetworkOffline) {
+		t.Fatalf("send error = %v, want network offline", err)
 	}
 }
 

@@ -273,6 +273,28 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 	}
 }
 
+func TestMetricsExposeInternalSyncSource(t *testing.T) {
+	const namespace = "testgtoninternal"
+	m := New(namespace)
+	m.ObserveSyncBlock(service.SyncBlockObservation{
+		Pipeline: "blocksync",
+		Chain:    ChainMasterchain,
+		Shard:    "masterchain",
+		Source:   service.SyncBlockSourceInternal,
+		Origin:   service.SyncBlockOriginOther,
+		Result:   "success",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, req)
+
+	want := namespace + `_sync_blocks_total{catch_up="false",chain="masterchain",pipeline="blocksync",result="success",source="internal"} 1`
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("metrics output does not contain %q\n%s", want, rec.Body.String())
+	}
+}
+
 func TestSyncMetricsUseAppliedMasterchainForMasterGap(t *testing.T) {
 	namespace := "testgton"
 	m := New(namespace)

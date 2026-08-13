@@ -78,7 +78,7 @@ func applyTONOptionsFromConfig(nodeOpts *gton.NodeOptions, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	syncUntil, err := uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil)
+	syncUntil, err := syncUntilConfigValue(cfg.TON.SyncUntil)
 	if err != nil {
 		return err
 	}
@@ -392,12 +392,12 @@ func uint32ConfigValue(field string, value int64, defaultValue uint32) (uint32, 
 	return uint32(value), nil
 }
 
-func uint32ConfigValueAllowZero(field string, value int64) (uint32, error) {
+func syncUntilConfigValue(value int64) (uint32, error) {
 	if value < 0 {
-		return 0, fmt.Errorf("%s cannot be negative", field)
+		return 0, fmt.Errorf("ton.sync_until cannot be negative")
 	}
 	if value > int64(^uint32(0)) {
-		return 0, fmt.Errorf("%s is too large", field)
+		return 0, fmt.Errorf("ton.sync_until is too large")
 	}
 	return uint32(value), nil
 }

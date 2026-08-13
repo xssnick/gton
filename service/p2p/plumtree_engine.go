@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"fmt"
 	"math/rand/v2"
@@ -23,11 +24,14 @@ const (
 	plumtreeMissingLimit = 4096
 	// A broadcast is proven by one verified signature; the marker must outlive the
 	// broadcast, so it is sized well past plumtreeMaxActiveStates.
-	plumtreeProvenLimit          = 4096
-	plumtreeActiveRepairLimit    = 512
-	plumtreeRepairTargetLimit    = 5
-	plumtreeActiveNeighbourLimit = 20
-	plumtreeIHaveFanout          = 8
+	plumtreeProvenLimit       = 4096
+	plumtreeActiveRepairLimit = 512
+	plumtreeRepairTargetLimit = 5
+	// OverlayOptions::PlumtreeFecOptions uses five active neighbours. Keeping
+	// this exact matters for validators: every additional lazy destination gets
+	// one IHAVE per FEC part.
+	plumtreeActiveNeighbourLimit = 5
+	plumtreeIHaveFanout          = plumtreeActiveNeighbourLimit
 
 	plumtreeOriginalEagerLimit = 1
 	plumtreeRegularEagerLimit  = 4
@@ -36,7 +40,7 @@ const (
 	// How long a silent eager neighbour keeps its slot. Well under
 	// plumtreeBroadcastLifetime: the slot suppresses repairs for that part, so
 	// waiting too long means losing the broadcast rather than repairing it.
-	plumtreeEagerInactivityTTL = 10 * time.Second
+	plumtreeEagerInactivityTTL = 30 * time.Second
 	plumtreeRepairDelay        = 200 * time.Millisecond
 	plumtreeRepairTimeout      = 5 * time.Second
 	plumtreeRepairMTUOverhead  = 4096
@@ -62,6 +66,34 @@ type plumtreeReceiveVerdicts struct {
 	receives []bool
 }
 
+type plumtreeVerdictScratch struct {
+	peerBuffer    [plumtreeActiveNeighbourLimit]PeerID
+	receiveBuffer [plumtreeActiveNeighbourLimit]bool
+	peers         []PeerID
+	receives      []bool
+}
+
+func (s *plumtreeVerdictScratch) reset() {
+	if s.peers == nil {
+		s.peers = s.peerBuffer[:0]
+	} else {
+		s.peers = s.peers[:0]
+	}
+	if s.receives == nil {
+		s.receives = s.receiveBuffer[:0]
+	} else {
+		s.receives = s.receives[:0]
+	}
+}
+
+func (s *plumtreeVerdictScratch) addUnique(peer PeerID) {
+	if slices.Contains(s.peers, peer) {
+		return
+	}
+
+	s.peers = append(s.peers, peer)
+}
+
 func (v *plumtreeReceiveVerdicts) receivesBroadcasts(peer PeerID) bool {
 	for i, candidate := range v.peers {
 		if candidate == peer {
@@ -71,35 +103,45 @@ func (v *plumtreeReceiveVerdicts) receivesBroadcasts(peer PeerID) bool {
 	return false
 }
 
-func (e *plumtreeEngine) receiveVerdicts(peers []PeerID) plumtreeReceiveVerdicts {
-	verdicts := plumtreeReceiveVerdicts{peers: peers}
-	if len(peers) == 0 {
+func (e *plumtreeEngine) resolveReceiveVerdictsLocked() plumtreeReceiveVerdicts {
+	scratch := &e.verdictScratch
+	scratch.receives = slices.Grow(scratch.receives, len(scratch.peers))
+	scratch.receives = scratch.receives[:len(scratch.peers)]
+	verdicts := plumtreeReceiveVerdicts{
+		peers:    scratch.peers,
+		receives: scratch.receives,
+	}
+	if len(scratch.peers) == 0 {
 		return verdicts
 	}
-	verdicts.receives = make([]bool, len(peers))
-	e.peers.PlumtreePeersReceiveBroadcasts(peers, verdicts.receives)
+
+	e.peers.PlumtreePeersReceiveBroadcasts(scratch.peers, scratch.receives)
 	return verdicts
 }
 
 func (e *plumtreeEngine) slotReceiveVerdictsLocked(
 	slot *plumtreeSlot,
 ) plumtreeReceiveVerdicts {
-	return e.receiveVerdicts(slices.Clone(slot.eager[:slot.eagerCount]))
+	scratch := &e.verdictScratch
+	scratch.reset()
+	count := int(slot.eagerCount)
+	scratch.peers = append(scratch.peers, slot.eager[:count]...)
+	return e.resolveReceiveVerdictsLocked()
 }
 
 // The unique eager peers across every FEC slot, so OriginateFEC resolves the
 // roster once for all 45 parts.
 func (e *plumtreeEngine) fecEagerReceiveVerdictsLocked() plumtreeReceiveVerdicts {
-	var unique []PeerID
+	scratch := &e.verdictScratch
+	scratch.reset()
 	for treeIndex := plumtreeFECTreeOffset; treeIndex < plumtreeTreeSlots; treeIndex++ {
 		slot := &e.slots[treeIndex]
 		for i := range int(slot.eagerCount) {
-			if !slices.Contains(unique, slot.eager[i]) {
-				unique = append(unique, slot.eager[i])
-			}
+			scratch.addUnique(slot.eager[i])
 		}
 	}
-	return e.receiveVerdicts(unique)
+
+	return e.resolveReceiveVerdictsLocked()
 }
 
 type plumtreeVerifier interface {
@@ -225,8 +267,11 @@ type plumtreeRepairAction struct {
 }
 
 type plumtreeDelivery struct {
-	Source PeerID
-	Data   []byte
+	Source      PeerID
+	SourceKey   ed25519.PublicKey
+	Immediate   PeerID
+	BroadcastID [sha256.Size]byte
+	Data        []byte
 }
 
 type plumtreeActions struct {
@@ -241,6 +286,7 @@ type plumtreeActions struct {
 type plumtreeEngineConfig struct {
 	LocalID          PeerID
 	IsOriginalSender bool
+	CanOriginate     bool
 	Now              func() time.Time
 }
 
@@ -361,11 +407,15 @@ type plumtreeEngine struct {
 	budget           *plumtreeMemoryBudget
 	localID          PeerID
 	isOriginalSender bool
+	canOriginate     bool
 	localEagerLimit  int
 	now              func() time.Time
 	peers            plumtreePeerSet
 	verifier         plumtreeVerifier
 	stats            *plumtreeStats
+	// verdictScratch is reused only while mu is held. Returned verdict views
+	// stay valid until the next roster resolution in the same critical section.
+	verdictScratch plumtreeVerdictScratch
 
 	slots      [plumtreeTreeSlots]plumtreeSlot
 	activities map[PeerID]plumtreePeerActivity
@@ -422,6 +472,7 @@ func newPlumtreeEngine(
 		budget:           budget,
 		localID:          config.LocalID,
 		isOriginalSender: config.IsOriginalSender,
+		canOriginate:     config.CanOriginate || config.IsOriginalSender,
 		localEagerLimit:  localEagerLimit,
 		now:              config.Now,
 		peers:            peers,
@@ -466,7 +517,36 @@ func (e *plumtreeEngine) Close() {
 	e.repairs = nil
 	e.delivered = plumtreeRingSet[[sha256.Size]byte]{}
 	e.proven = plumtreeRingSet[[sha256.Size]byte]{}
+	e.verdictScratch = plumtreeVerdictScratch{}
 	e.notFoundBody = nil
+}
+
+// SetOriginalSender updates the public-overlay role derived from an active
+// local validator session. C++ recreates the overlay when this role changes;
+// clearing the peer topology here gives the same routing transition without
+// discarding retained broadcast and repair state.
+func (e *plumtreeEngine) SetOriginalSender(original bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed || e.isOriginalSender == original {
+		return
+	}
+
+	e.isOriginalSender = original
+	e.localEagerLimit = plumtreeRegularEagerLimit
+	if original {
+		e.localEagerLimit = plumtreeOriginalEagerLimit
+	}
+
+	for i := range e.slots {
+		slot := &e.slots[i]
+		for slot.eagerCount > 0 {
+			e.removeEagerAtLocked(slot, int(slot.eagerCount)-1)
+		}
+		slot.pending = [plumtreeRegularEagerLimit]plumtreePendingPeer{}
+		slot.pendingCount = 0
+	}
 }
 
 func (s *plumtreeSlot) hasEager(peer PeerID) bool {
@@ -648,20 +728,19 @@ func (e *plumtreeEngine) promoteEagerLocked(
 // cover the simple tree too: receivesBroadcasts reports false for a peer it was
 // not asked about, which would read as "gone" for a healthy one.
 func (e *plumtreeEngine) expireInactiveEagerLocked(now time.Time) {
-	var unique []PeerID
+	scratch := &e.verdictScratch
+	scratch.reset()
 	for i := range e.slots {
 		slot := &e.slots[i]
 		for j := range int(slot.eagerCount) {
-			if !slices.Contains(unique, slot.eager[j]) {
-				unique = append(unique, slot.eager[j])
-			}
+			scratch.addUnique(slot.eager[j])
 		}
 	}
-	if len(unique) == 0 {
+	if len(scratch.peers) == 0 {
 		return
 	}
 
-	verdicts := e.receiveVerdicts(unique)
+	verdicts := e.resolveReceiveVerdictsLocked()
 	for i := range e.slots {
 		e.removeInactiveEagerLocked(&e.slots[i], now, &verdicts)
 	}

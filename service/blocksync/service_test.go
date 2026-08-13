@@ -20,9 +20,9 @@ const topShard = int64(-1 << 63)
 func TestServiceFillsGapWithNextBlocks(t *testing.T) {
 	node := newStubNode(4)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block11 := testBlockID(-1, topShard, 11)
-	block12 := testBlockID(-1, topShard, 12)
+	block10 := testBlockID(-1, 10)
+	block11 := testBlockID(-1, 11)
+	block12 := testBlockID(-1, 12)
 
 	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 	node.next[blockKey(block10)] = &p2p.DownloadedBlock{ID: block11}
@@ -69,12 +69,104 @@ func TestServiceFillsGapWithNextBlocks(t *testing.T) {
 	}
 }
 
+func TestServiceStartOwnsRunLifecycle(t *testing.T) {
+	node := newStubNode(1)
+	service := New(discardLogger(), node)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	service.Start(ctx)
+	service.Start(ctx)
+	close(node.events)
+	service.Wait()
+
+	if _, open := <-service.Blocks(); open {
+		t.Fatal("blocks channel remains open after Wait")
+	}
+	if _, open := <-service.ShardDescriptions(); open {
+		t.Fatal("shard descriptions channel remains open after Wait")
+	}
+}
+
+func TestServiceSubmitsInternalBlockWithoutWaitingForAcceptance(t *testing.T) {
+	node := newStubNode(1)
+	service := New(discardLogger(), node)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	service.Start(ctx)
+
+	want := p2p.DownloadedBlock{ID: testBlockID(-1, 10)}
+	service.SubmitBlockLocally(want)
+
+	select {
+	case got := <-service.Blocks():
+		if !got.Downloaded.ID.Equals(&want.ID) {
+			t.Fatalf("internal block = %s, want %s", got.Downloaded.BlockRef(), want.BlockRef())
+		}
+		if !got.Internal || !got.Priority || got.CatchUp {
+			t.Fatalf("unexpected internal block flags: %+v", got)
+		}
+		// There is deliberately no acceptance waiter for internal submissions.
+		got.Accept()
+	case <-time.After(time.Second):
+		t.Fatal("internal block was not emitted")
+	}
+
+	cancel()
+	service.Wait()
+}
+
+func TestServiceRetainsInternalBlocksUntilRun(t *testing.T) {
+	service := New(discardLogger(), newStubNode(1))
+	const blocks = 300
+	for i := 0; i < blocks; i++ {
+		service.SubmitBlockLocally(p2p.DownloadedBlock{ID: testBlockID(-1, uint32(i))})
+	}
+
+	status := service.StatusSnapshot()
+	if status.InternalQueueItems != blocks {
+		t.Fatalf("internal queue items = %d, want %d", status.InternalQueueItems, blocks)
+	}
+	if status.InternalQueueCapacity != 0 {
+		t.Fatalf("internal queue capacity = %d, want unbounded", status.InternalQueueCapacity)
+	}
+	if status.InternalQueueDropped != 0 {
+		t.Fatalf("internal queue drops = %d, want 0", status.InternalQueueDropped)
+	}
+	for i := 0; i < blocks; i++ {
+		block, ok := service.takeInternalBlock()
+		if !ok {
+			t.Fatalf("internal queue ended at %d, want %d blocks", i, blocks)
+		}
+		if block.ID.SeqNo != uint32(i) {
+			t.Fatalf("internal block %d has seqno %d", i, block.ID.SeqNo)
+		}
+	}
+	if _, ok := service.takeInternalBlock(); ok {
+		t.Fatal("internal queue has an extra block")
+	}
+}
+
+func BenchmarkServiceSubmitInternalBlock(b *testing.B) {
+	service := New(discardLogger(), newStubNode(1))
+	block := p2p.DownloadedBlock{ID: testBlockID(-1, 1)}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		service.SubmitBlockLocally(block)
+		if _, ok := service.takeInternalBlock(); !ok {
+			b.Fatal("submitted internal block is missing")
+		}
+	}
+}
+
 func TestServiceIgnoresDuplicatesAndOlderBroadcasts(t *testing.T) {
 	node := newStubNode(8)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block11 := testBlockID(-1, topShard, 11)
-	block09 := testBlockID(-1, topShard, 9)
+	block10 := testBlockID(-1, 10)
+	block11 := testBlockID(-1, 11)
+	block09 := testBlockID(-1, 9)
 
 	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 	node.next[blockKey(block10)] = &p2p.DownloadedBlock{ID: block11}
@@ -121,8 +213,8 @@ func TestServiceIgnoresDuplicatesAndOlderBroadcasts(t *testing.T) {
 func TestServiceUsesDecodedBroadcastPayloadWhenPresent(t *testing.T) {
 	node := newStubNode(4)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block11 := testBlockID(-1, topShard, 11)
+	block10 := testBlockID(-1, 10)
+	block11 := testBlockID(-1, 11)
 
 	service := New(discardLogger(), node)
 
@@ -157,8 +249,8 @@ func TestServiceUsesDecodedBroadcastPayloadWhenPresent(t *testing.T) {
 func TestServiceEmitsDecodedMasterchainBroadcastsWithoutCoalescing(t *testing.T) {
 	node := newStubNode(4)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block12 := testBlockID(-1, topShard, 12)
+	block10 := testBlockID(-1, 10)
+	block12 := testBlockID(-1, 12)
 
 	service := New(discardLogger(), node)
 
@@ -204,8 +296,8 @@ func TestServiceEmitsDecodedMasterchainBroadcastsWithoutCoalescing(t *testing.T)
 func TestServiceDoesNotAdvanceAfterRejectedBlock(t *testing.T) {
 	node := newStubNode(4)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block12 := testBlockID(-1, topShard, 12)
+	block10 := testBlockID(-1, 10)
+	block12 := testBlockID(-1, 12)
 
 	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 	node.exact[blockKey(block12)] = &p2p.DownloadedBlock{ID: block12}
@@ -251,7 +343,7 @@ func TestServiceDoesNotAdvanceAfterRejectedBlock(t *testing.T) {
 func TestServiceDropsFullBlockBroadcastWithoutDecodedPayload(t *testing.T) {
 	node := newStubNode(2)
 
-	block10 := testBlockID(-1, topShard, 10)
+	block10 := testBlockID(-1, 10)
 	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 
 	service := New(discardLogger(), node)
@@ -283,8 +375,8 @@ func TestServiceDropsFullBlockBroadcastWithoutDecodedPayload(t *testing.T) {
 func TestServiceIgnoresNonMasterchainBroadcasts(t *testing.T) {
 	node := newStubNode(4)
 
-	base10 := testBlockID(0, topShard, 10)
-	base11 := testBlockID(0, topShard, 11)
+	base10 := testBlockID(0, 10)
+	base11 := testBlockID(0, 11)
 	node.exact[blockKey(base10)] = &p2p.DownloadedBlock{ID: base10}
 	node.next[blockKey(base10)] = &p2p.DownloadedBlock{ID: base11}
 
@@ -318,7 +410,7 @@ func TestServiceIgnoresNonMasterchainBroadcasts(t *testing.T) {
 func TestServiceEmitsShardDescriptionBroadcasts(t *testing.T) {
 	node := newStubNode(1)
 
-	base10 := testBlockID(0, topShard, 10)
+	base10 := testBlockID(0, 10)
 	service := New(discardLogger(), node)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -337,7 +429,6 @@ func TestServiceEmitsShardDescriptionBroadcasts(t *testing.T) {
 		Block:   base10,
 		ShardDescription: &p2p.ShardBlockDescription{
 			CatchainSeqno: 3,
-			Data:          []byte{0xAA},
 		},
 	}
 	close(node.events)
@@ -363,9 +454,9 @@ func TestServiceRetriesGapUntilRecovered(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		node := newStubNode(4)
 
-		block10 := testBlockID(-1, topShard, 10)
-		block11 := testBlockID(-1, topShard, 11)
-		block12 := testBlockID(-1, topShard, 12)
+		block10 := testBlockID(-1, 10)
+		block11 := testBlockID(-1, 11)
+		block12 := testBlockID(-1, 12)
 
 		node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 		node.nextErrors[blockKey(block10)] = []error{
@@ -412,11 +503,11 @@ func TestServiceRetriesGapUntilRecovered(t *testing.T) {
 func TestServiceCoalescesFutureBroadcastsWithoutSkippingBlocks(t *testing.T) {
 	node := newStubNode(8)
 
-	block10 := testBlockID(-1, topShard, 10)
-	block11 := testBlockID(-1, topShard, 11)
-	block12 := testBlockID(-1, topShard, 12)
-	block13 := testBlockID(-1, topShard, 13)
-	block14 := testBlockID(-1, topShard, 14)
+	block10 := testBlockID(-1, 10)
+	block11 := testBlockID(-1, 11)
+	block12 := testBlockID(-1, 12)
+	block13 := testBlockID(-1, 13)
+	block14 := testBlockID(-1, 14)
 
 	node.exact[blockKey(block10)] = &p2p.DownloadedBlock{ID: block10}
 	node.next[blockKey(block10)] = &p2p.DownloadedBlock{ID: block11}
@@ -461,10 +552,10 @@ func TestServiceCoalescesFutureBroadcastsWithoutSkippingBlocks(t *testing.T) {
 
 func TestChainPromotesPendingBroadcastsByNearestSeqno(t *testing.T) {
 	chain := &chain{notify: make(chan struct{}, 1)}
-	block10 := testBlockID(-1, topShard, 10)
-	block11 := testBlockID(-1, topShard, 11)
-	block12 := testBlockID(-1, topShard, 12)
-	block13 := testBlockID(-1, topShard, 13)
+	block10 := testBlockID(-1, 10)
+	block11 := testBlockID(-1, 11)
+	block12 := testBlockID(-1, 12)
+	block13 := testBlockID(-1, 13)
 
 	if !chain.enqueue(p2p.BroadcastEvent{Block: block10}) {
 		t.Fatal("enqueue block10 failed")
@@ -502,7 +593,7 @@ func TestChainPromotesPendingBroadcastsByNearestSeqno(t *testing.T) {
 
 func TestChainPendingBroadcastOverflowKeepsNearestSeqnos(t *testing.T) {
 	chain := &chain{notify: make(chan struct{}, defaultPendingBroadcasts+2)}
-	block10 := testBlockID(-1, topShard, 10)
+	block10 := testBlockID(-1, 10)
 
 	if !chain.enqueue(p2p.BroadcastEvent{Block: block10}) {
 		t.Fatal("enqueue block10 failed")
@@ -510,10 +601,10 @@ func TestChainPendingBroadcastOverflowKeepsNearestSeqnos(t *testing.T) {
 	_ = nextChainEvent(t, chain)
 
 	for seqno := uint32(12); seqno < 12+defaultPendingBroadcasts; seqno++ {
-		chain.enqueue(p2p.BroadcastEvent{Block: testBlockID(-1, topShard, seqno)})
+		chain.enqueue(p2p.BroadcastEvent{Block: testBlockID(-1, seqno)})
 	}
-	near := testBlockID(-1, topShard, 11)
-	far := testBlockID(-1, topShard, 12+defaultPendingBroadcasts)
+	near := testBlockID(-1, 11)
+	far := testBlockID(-1, 12+defaultPendingBroadcasts)
 	chain.enqueue(p2p.BroadcastEvent{Block: far})
 	chain.enqueue(p2p.BroadcastEvent{Block: near})
 
@@ -533,9 +624,9 @@ func TestChainWaitForNextBlockUsesPendingBroadcastDuringDownload(t *testing.T) {
 	node := newBlockingNextNode()
 	service := New(discardLogger(), node)
 
-	prev := testBlockID(-1, topShard, 10)
-	next := testBlockID(-1, topShard, 11)
-	target := testBlockID(-1, topShard, 13)
+	prev := testBlockID(-1, 10)
+	next := testBlockID(-1, 11)
+	target := testBlockID(-1, 13)
 	downloaded := p2p.DownloadedBlock{
 		ID:   next,
 		Kind: "tonNode.blockBroadcast",
@@ -716,10 +807,10 @@ func copyDownloadedBlock(block p2p.DownloadedBlock) p2p.DownloadedBlock {
 	return block
 }
 
-func testBlockID(workchain int32, shard int64, seqno uint32) ton.BlockIDExt {
+func testBlockID(workchain int32, seqno uint32) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: workchain,
-		Shard:     shard,
+		Shard:     topShard,
 		SeqNo:     seqno,
 		RootHash:  []byte{byte(seqno), 0x01},
 		FileHash:  []byte{byte(seqno), 0x02},

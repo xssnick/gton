@@ -37,7 +37,7 @@ type Store struct {
 	retiredGenerations              []uint64
 	nextCellGeneration              uint64
 	cellCache                       *decodedCellCache
-	lazyCellLoaderZero              cell.LazyCellLoader
+	activeCellLoader                cell.LazyCellLoader
 	lazyCellLoads                   lazyCellLoadCounters
 	dir                             string
 	cellCacheSize                   int64

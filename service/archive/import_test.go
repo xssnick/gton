@@ -316,6 +316,7 @@ func TestShardIDContainsBlock(t *testing.T) {
 	right := testBlockID(0, int64(-0x4000000000000000), 1)
 	child := testBlockID(0, int64(0x6000000000000000), 1)
 	otherWorkchain := testBlockID(1, int64(0x6000000000000000), 1)
+	invalid := ShardID{Workchain: 0, Shard: 0}
 
 	if !left.ContainsBlock(child) {
 		t.Fatal("left shard prefix should contain child shard")
@@ -325,6 +326,9 @@ func TestShardIDContainsBlock(t *testing.T) {
 	}
 	if left.ContainsBlock(otherWorkchain) {
 		t.Fatal("shard prefix should not contain another workchain")
+	}
+	if invalid.ContainsBlock(child) {
+		t.Fatal("zero shard id must not contain a block")
 	}
 }
 

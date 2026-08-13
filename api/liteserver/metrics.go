@@ -1,7 +1,6 @@
 package liteserver
 
 import (
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -15,7 +14,8 @@ const (
 	liteserverMetricsUnspecifiedReason    = "unspecified"
 )
 
-type metricsRegistry interface {
+// MetricsRegistry is the metrics capability required by the liteserver.
+type MetricsRegistry interface {
 	Namespace() string
 	RegisterCollector(prometheus.Collector) error
 }
@@ -28,17 +28,9 @@ type prometheusQueryObserver struct {
 	inflight      prometheus.Gauge
 }
 
-func liteserverQueryObserver(metrics any) (QueryObserver, error) {
-	if metrics == nil {
-		return nil, nil
-	}
-	value := reflect.ValueOf(metrics)
-	if value.Kind() == reflect.Pointer && value.IsNil() {
-		return nil, nil
-	}
-
-	registry, ok := metrics.(metricsRegistry)
-	if !ok {
+// NewQueryObserver registers liteserver collectors in registry.
+func NewQueryObserver(registry MetricsRegistry) (QueryObserver, error) {
+	if registry == nil {
 		return nil, nil
 	}
 

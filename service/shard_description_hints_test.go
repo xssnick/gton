@@ -8,11 +8,12 @@ import (
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
 	now := time.Unix(1000, 0)
-	svc := &Service{
+	svc := &SyncCoordinator{
 		shardDescriptionHints: map[storage.BlockRootHash]shardDescriptionHint{},
 	}
 
@@ -50,15 +51,16 @@ func TestPruneShardDescriptionHintsDropsOverflowInOneBatch(t *testing.T) {
 
 func TestRememberShardDescriptionHintSkipsAfterSyncUntilFrozen(t *testing.T) {
 	block := testBlockID(0, topShard, 10)
-	svc := &Service{
+	svc := &SyncCoordinator{
 		node:      newFrozenTestNode(t),
 		syncUntil: 200,
 	}
 	freezeSyncUntil(t, svc)
 
 	svc.rememberShardDescriptionHint(p2p.BroadcastEvent{
-		Block: block,
-		Kind:  "tonNode.newShardBlockBroadcast",
+		Block:                block,
+		Kind:                 "tonNode.newShardBlockBroadcast",
+		ShardDescriptionRoot: cell.BeginCell().EndCell(),
 		ShardDescription: &p2p.ShardBlockDescription{
 			Block: block,
 		},
@@ -82,7 +84,10 @@ func TestCloneShardBlockDescriptionCopiesBlockIDs(t *testing.T) {
 		}},
 	}
 
-	cloned := cloneShardBlockDescription(desc)
+	cloned, err := cloneShardBlockDescription(desc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cloned.Block.RootHash[0] = 0xA1
 	cloned.Chain[0].Block.RootHash[0] = 0xA2
 	cloned.Chain[0].PrevRefs[0].RootHash[0] = 0xA3

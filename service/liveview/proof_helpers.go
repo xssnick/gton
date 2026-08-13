@@ -37,7 +37,7 @@ func stateRootHashFromBlock(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) 
 		return nil, fmt.Errorf("load block state update target %s: %w", storage.FormatBlockRef(id), err)
 	}
 
-	hash := nextState.HashKey(0)
+	hash := nextState.HashKeyAt(0)
 	return bytes.Clone(hash[:]), nil
 }
 
@@ -61,7 +61,7 @@ func accountStateProofAndCell(stateRoot *cell.Cell, accountID []byte) (*cell.Cel
 			return err
 		}
 
-		value, err := dictRoot.AsDict(256).LoadValue(blockproof.AccountKey(accountID))
+		value, extra, err := dictRoot.AsAugDict(256, tlb.AugShardAccounts{}).LoadValueExtra(blockproof.AccountKey(accountID))
 		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 			return nil
 		}
@@ -69,16 +69,11 @@ func accountStateProofAndCell(stateRoot *cell.Cell, accountID []byte) (*cell.Cel
 			return err
 		}
 
-		if err = tlb.LoadFromCell(new(tlb.DepthBalanceInfo), value.Copy()); err != nil {
+		if err = tlb.LoadFromCell(new(tlb.DepthBalanceInfo), extra); err != nil {
 			return err
 		}
 
 		accountValue := value.Copy().WithoutTrace()
-		var balance tlb.DepthBalanceInfo
-		if err = tlb.LoadFromCell(&balance, accountValue); err != nil {
-			return err
-		}
-
 		var account tlb.ShardAccount
 		if err = tlb.LoadFromCell(&account, accountValue); err != nil {
 			return err
@@ -200,14 +195,9 @@ func accountCellFromAccountsRoot(dictRoot *cell.Cell, accountID []byte) (*cell.C
 	if dictRoot == nil {
 		return nil, cell.ErrNoSuchKeyInDict
 	}
-	value, err := dictRoot.AsDict(256).LoadValue(blockproof.AccountKey(accountID))
+	value, err := dictRoot.AsAugDict(256, tlb.AugShardAccounts{}).LoadValue(blockproof.AccountKey(accountID))
 	if err != nil {
 		return nil, fmt.Errorf("load account value from accounts dict: %w", err)
-	}
-
-	var balance tlb.DepthBalanceInfo
-	if err = tlb.LoadFromCell(&balance, value); err != nil {
-		return nil, fmt.Errorf("load account depth balance: %w", err)
 	}
 
 	var account tlb.ShardAccount

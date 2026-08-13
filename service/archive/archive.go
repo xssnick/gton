@@ -3,9 +3,9 @@ package archive
 import (
 	"errors"
 	"fmt"
-	"math/bits"
 	"time"
 
+	"github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -84,18 +84,7 @@ func (s ShardID) ContainsBlock(block ton.BlockIDExt) bool {
 		return block.Shard == s.Shard
 	}
 
-	shard := uint64(s.Shard)
-	if shard == 0 {
-		return uint64(block.Shard) == shard
-	}
-
-	depth := 63 - bits.TrailingZeros64(shard)
-	if depth <= 0 {
-		return true
-	}
-
-	mask := ^uint64(0) << (64 - depth)
-	return uint64(block.Shard)&mask == shard&mask
+	return shard.Contains(s.Shard, block.Shard)
 }
 
 func (s *ImportStats) observe(block ton.BlockIDExt) {

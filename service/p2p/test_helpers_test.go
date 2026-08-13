@@ -10,11 +10,13 @@ import (
 
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/archive"
+	"github.com/xssnick/gton/service/p2p/internal/peerroute"
 	"github.com/xssnick/gton/service/storage/pebblestore"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func discardLogger() zerolog.Logger {
@@ -29,18 +31,37 @@ func testPeerID(label string) PeerID {
 	return PeerID(sha256.Sum256([]byte(label)))
 }
 
+func testShardDescriptionData(marker uint8) []byte {
+	return cell.BeginCell().MustStoreUInt(uint64(marker), 8).EndCell().ToBOC()
+}
+
+func newTestPeerRoute(address string) *peerroute.Route {
+	return peerroute.NewRoute(address, peerRouteRetryPolicy)
+}
+
+func newTestPeerRouteWithRetry(address string, minDelay, maxDelay time.Duration) *peerroute.Route {
+	return peerroute.NewRoute(address, peerroute.RetryPolicy{
+		MinDelay: minDelay,
+		MaxDelay: maxDelay,
+	})
+}
+
 func newTestNode(tb testing.TB) *Node {
 	tb.Helper()
 
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      tb.TempDir(),
-		SignatureVerifier:  testAcceptBroadcastSignatureVerifier{},
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: tb.TempDir(),
 	})
 	if err != nil {
 		tb.Fatalf("create test node: %v", err)
+	}
+	if err = node.BindRuntimeCallbacks(RuntimeCallbacks{
+		SignatureVerifier: testAcceptBroadcastSignatureVerifier{},
+	}); err != nil {
+		tb.Fatalf("bind test runtime callbacks: %v", err)
 	}
 	tb.Cleanup(node.closeSubscriptions)
 	return node
@@ -59,7 +80,7 @@ func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
 	}
 	for _, peer := range sub.peers {
 		if peer.route == nil {
-			peer.route = newPeerRoute("")
+			peer.route = newTestPeerRoute("")
 		}
 		if peer.overlay == nil {
 			peer.overlay = &overlay.ADNLOverlayWrapper{}
@@ -298,15 +319,10 @@ func (a *testExternalMessageAdmission) AcceptCheckedExternalMessage(_ context.Co
 
 type testBlockReceivedObserver struct {
 	events []BlockReceivedEvent
-	hooks  bool
 }
 
 func (o *testBlockReceivedObserver) ObserveBlockReceived(_ context.Context, event BlockReceivedEvent) {
 	o.events = append(o.events, event)
-}
-
-func (o *testBlockReceivedObserver) BlockReceivedHooksEnabled() bool {
-	return o.hooks
 }
 
 func newTestPebbleStore(tb testing.TB) *pebblestore.Store {

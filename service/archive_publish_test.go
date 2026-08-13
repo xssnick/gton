@@ -13,13 +13,13 @@ import (
 
 func TestImportArchiveBlocksRejectsInvalidNewArchive(t *testing.T) {
 	store := openTestPebbleStorage(t)
-	svc := &Service{storage: store}
+	runner := &ArchiveRunner{storage: store}
 	ctx := context.Background()
 	importer := archive.NewImporter()
 	t.Cleanup(importer.Close)
 
 	badData := []byte{0x00, 0x01, 0x02, 0x03}
-	_, err := svc.importArchiveBlocks(ctx, importer, &archive.Downloaded{
+	_, err := runner.importArchiveBlocks(ctx, importer, &archive.Downloaded{
 		MasterchainSeqno: 21,
 		Shard:            archive.ShardID{Workchain: -1, Shard: topShard},
 		ArchiveID:        0,
@@ -31,11 +31,11 @@ func TestImportArchiveBlocksRejectsInvalidNewArchive(t *testing.T) {
 }
 
 func TestObserveImportedArchiveBlocksReceived(t *testing.T) {
-	extension := &testBlockReceivedExtension{}
-	svc := &Service{
-		blockReceivedHooks: &blockReceivedHookRunner{
-			log:       zerolog.Nop(),
-			extension: extension,
+	observer := &testBlockReceivedObserver{}
+	runner := &ArchiveRunner{
+		blockReceivedObserver: &blockReceivedObserverRunner{
+			log:      zerolog.Nop(),
+			observer: observer,
 		},
 	}
 	first := testBlockID(0, topShard, 10)
@@ -64,15 +64,15 @@ func TestObserveImportedArchiveBlocksReceived(t *testing.T) {
 		},
 	}
 
-	svc.observeImportedArchiveBlocksReceived(context.Background(), imported, result)
+	runner.observeImportedArchiveBlocksReceived(context.Background(), imported, result)
 
-	if len(extension.events) != 2 {
-		t.Fatalf("archive block received events = %d, want 2", len(extension.events))
+	if len(observer.events) != 2 {
+		t.Fatalf("archive block received events = %d, want 2", len(observer.events))
 	}
-	if !extension.events[0].Meta.ID.Equals(&first) || !extension.events[1].Meta.ID.Equals(&second) {
-		t.Fatalf("archive block received event order mismatch: %+v", extension.events)
+	if !observer.events[0].Meta.ID.Equals(&first) || !observer.events[1].Meta.ID.Equals(&second) {
+		t.Fatalf("archive block received event order mismatch: %+v", observer.events)
 	}
-	if !extension.events[0].IsSigned || !extension.events[1].IsSigned {
-		t.Fatalf("archive block received events should be signed: %+v", extension.events)
+	if !observer.events[0].IsSigned || !observer.events[1].IsSigned {
+		t.Fatalf("archive block received events should be signed: %+v", observer.events)
 	}
 }

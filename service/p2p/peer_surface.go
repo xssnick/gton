@@ -101,6 +101,19 @@ func (n *Node) attachSubscriptionPeers(sub *overlaySubscription) {
 	}
 }
 
+// attachPrivateOverlayPeer reuses a transport discovered by an ordinary
+// overlay for every matching private fixed-membership overlay. Private
+// consensus overlays may be opened before public discovery finds a roster
+// member; without this handoff they would discard the authenticated transport
+// (and its QUIC route) and unnecessarily wait for a separate DHT lookup.
+func (n *Node) attachPrivateOverlayPeer(peer *pooledPeer) {
+	for _, sub := range n.subscriptionsSnapshot() {
+		if sub.spec.isPrivateOverlay() {
+			sub.attachPooledPeer(peer, nil)
+		}
+	}
+}
+
 func (n *Node) runEventLoop(ctx context.Context) {
 	defer close(n.events)
 

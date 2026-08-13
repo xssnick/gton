@@ -41,7 +41,37 @@ type directoryEntry struct {
 	// live marks rows that currently hold an attachment, so the directory can
 	// report how much of itself is promoted without touching s.peers.
 	live bool
+	// verified marks rows backed by contact with that peer rather than by
+	// hearsay: it queried us over its own authenticated transport, or we dialled
+	// it. Only these rows are protected from eviction, because only these cost
+	// an attacker more than an ed25519 keypair to create.
+	verified bool
 }
+
+// directoryTrust says how much a write may displace when the directory is full.
+//
+// A signed overlay.Node proves nothing about who sent it: identities are free to
+// mint and announcements free to sign, so a peer forwarding a list of 300
+// strangers must not be able to flush the rows we actually gossip with and
+// promote from. Trust is a property of the write, not of the record.
+type directoryTrust uint8
+
+const (
+	// directoryHearsay is an announcement a third party forwarded to us. It may
+	// only take a slot that is itself unproven or already unusable.
+	directoryHearsay directoryTrust = iota
+	// directoryContacted is a row a peer created by talking to us: its transport
+	// authenticated its key, so the row counts as verified and stops being
+	// displaceable from here on. It is admitted on the hearsay allowance all the
+	// same — handshaking from generated keys is cheap enough that granting the
+	// full allowance would let an attacker flush the directory the long way
+	// round. Incumbents keep their slots; newcomers take the dead ones.
+	directoryContacted
+	// directoryProven is a row we created ourselves: we resolved the peer in the
+	// DHT and dialled it, or we attached it. Nothing a remote sends can drive
+	// this, so it may displace another proven row.
+	directoryProven
+)
 
 func (e *directoryEntry) clone() *directoryEntry {
 	if e == nil {
@@ -53,8 +83,8 @@ func (e *directoryEntry) clone() *directoryEntry {
 	return &copied
 }
 
-// rememberDirectoryPeer records or refreshes a directory row. Called with s.mx
-// held.
+// rememberDirectoryPeer records or refreshes a directory row and reports
+// whether the row is now filed. Called with s.mx held.
 func (s *overlaySubscription) rememberDirectoryPeerLocked(
 	id PeerID,
 	pub ed25519.PublicKey,
@@ -62,9 +92,10 @@ func (s *overlaySubscription) rememberDirectoryPeerLocked(
 	quicAddr string,
 	announced *overlay.Node,
 	now time.Time,
-) {
+	trust directoryTrust,
+) bool {
 	if id.IsZero() || len(pub) != ed25519.PublicKeySize {
-		return
+		return false
 	}
 	if s.directory == nil {
 		s.directory = map[PeerID]*directoryEntry{}
@@ -72,7 +103,9 @@ func (s *overlaySubscription) rememberDirectoryPeerLocked(
 
 	entry := s.directory[id]
 	if entry == nil {
-		s.evictDirectoryLocked(now)
+		if !s.evictDirectoryLocked(now, trust) {
+			return false
+		}
 		entry = &directoryEntry{
 			id:  id,
 			pub: append(ed25519.PublicKey(nil), pub...),
@@ -89,28 +122,79 @@ func (s *overlaySubscription) rememberDirectoryPeerLocked(
 		(entry.announced == nil || announced.Version >= entry.announced.Version) {
 		entry.announced = cloneOverlayNode(announced)
 	}
+	if trust >= directoryContacted {
+		entry.verified = true
+	}
 	entry.lastSeenAt = now
+	return true
 }
 
-// evictDirectoryLocked makes room for one new row, dropping the least recently
-// seen entry that is not currently live.
-func (s *overlaySubscription) evictDirectoryLocked(now time.Time) {
+// evictDirectoryLocked makes room for one new row and reports whether the caller
+// may file it. The directory never grows past maxPeersPerOverlay, so a write
+// that finds nothing it is allowed to displace is refused.
+//
+// Victims are taken in classes, cheapest first. Everything a stranger can mint
+// at will - rows whose announcement is stale or missing (unadvertisable and
+// unpromotable anyway), then rows we never had contact with - goes before a row
+// that proved itself, and a proven row is only ever displaced by another proven
+// write. That is what keeps a flood of forged announcements, which is one
+// getRandomPeers away, from flushing the peers we gossip with and promote from:
+// the flood can only recycle its own class.
+func (s *overlaySubscription) evictDirectoryLocked(now time.Time, trust directoryTrust) bool {
 	if len(s.directory) < maxPeersPerOverlay {
-		return
+		return true
 	}
 
-	var victim *directoryEntry
+	var unusable, unverified, proven *directoryEntry
 	for _, entry := range s.directory {
 		if entry.live {
 			continue
 		}
-		if victim == nil || entry.lastSeenAt.Before(victim.lastSeenAt) {
-			victim = entry
+		switch {
+		case !announcedNodeIsFresh(entry.announced, now):
+			unusable = colderDirectoryEntry(unusable, entry)
+		case !entry.verified:
+			unverified = colderDirectoryEntry(unverified, entry)
+		default:
+			proven = colderDirectoryEntry(proven, entry)
 		}
 	}
-	if victim != nil {
-		delete(s.directory, victim.id)
+
+	victim := unusable
+	if victim == nil {
+		victim = unverified
 	}
+	if victim == nil && trust == directoryProven {
+		victim = proven
+	}
+	if victim == nil {
+		return false
+	}
+	delete(s.directory, victim.id)
+	return true
+}
+
+func colderDirectoryEntry(current, candidate *directoryEntry) *directoryEntry {
+	if current == nil || candidate.lastSeenAt.Before(current.lastSeenAt) {
+		return candidate
+	}
+	return current
+}
+
+// directoryEntryReachableLocked reports whether we can contact a row without a
+// DHT lookup: it either carries an address to dial, or the pool still holds a
+// transport for it, which acquirePeerEndpoint reuses by id.
+//
+// Requiring an address alone silently excluded every peer that reached us
+// first. On a public overlay an inbound peer never joins the roster, and the
+// gossip that files its row carries no address - overlay.node has no address
+// field - so those rows were neither gossip targets nor promotion candidates
+// even while their transport sat in the pool.
+func (s *overlaySubscription) directoryEntryReachableLocked(entry *directoryEntry) bool {
+	if entry.adnlAddr != "" {
+		return true
+	}
+	return s.node != nil && s.node.pool != nil && s.node.pool.hasTransport(entry.id)
 }
 
 func (s *overlaySubscription) markDirectoryLiveLocked(id PeerID, live bool) {
@@ -144,15 +228,13 @@ func (s *overlaySubscription) noteDirectoryActivity(id PeerID, addr string) {
 		return
 	}
 	entry.lastSeenAt = time.Now()
+	// Contact over a transport authenticated with this peer's key: that is the
+	// proof directoryProven stands for, so the row stops being displaceable by
+	// forged announcements from here on.
+	entry.verified = true
 	if addr != "" {
 		entry.adnlAddr = addr
 	}
-}
-
-func (s *overlaySubscription) forgetDirectoryPeer(id PeerID) {
-	s.mx.Lock()
-	delete(s.directory, id)
-	s.mx.Unlock()
 }
 
 // directorySnapshot returns copies of the directory rows, newest first.

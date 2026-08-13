@@ -25,9 +25,9 @@ import (
 func TestDispatchPeerQueryCapabilitiesAndStubs(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -116,9 +116,9 @@ func TestCustomFixedOverlayDoesNotAnswerGetRandomPeers(t *testing.T) {
 func TestDispatchPeerQueryRejectsSendExtMessageFromOverlay(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -209,6 +209,8 @@ func TestLocalExternalRebroadcastQueueHasPriority(t *testing.T) {
 
 func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 	node := newTestNode(t)
+	verifier := &testCapturingShardDescriptionVerifier{}
+	node.signatureVerifier = verifier
 	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,
 		spec: overlaySpec{Name: "basechain"},
@@ -216,7 +218,7 @@ func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 	})
 
 	block := testBlockID(0, topShard, 42)
-	data := []byte{0xAA, 0xBB, 0xCC}
+	data := testShardDescriptionData(0xAA)
 	msg := tonnodeapi.NewShardBlockBroadcast{
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
@@ -238,14 +240,34 @@ func TestClassifyNewShardBlockBroadcastCarriesDescription(t *testing.T) {
 	if !accepted.event.ShardDescription.Block.Equals(&block) {
 		t.Fatalf("description block = %s, want %s", tnstore.FormatBlockRef(accepted.event.ShardDescription.Block), tnstore.FormatBlockRef(block))
 	}
+	if verifier.root == nil || accepted.event.ShardDescriptionRoot != verifier.root {
+		t.Fatal("accepted event did not preserve the exact root passed to signature verification")
+	}
+}
+
+type testCapturingShardDescriptionVerifier struct {
+	testAcceptBroadcastSignatureVerifier
+	root *cell.Cell
+}
+
+func (v *testCapturingShardDescriptionVerifier) ValidateShardDescriptionBroadcast(
+	_ context.Context,
+	req ShardDescriptionSignatureCheck,
+) (*ShardBlockDescription, error) {
+	v.root = req.Root
+
+	return &ShardBlockDescription{
+		Block:         req.Block,
+		CatchainSeqno: uint32(req.CatchainSeqno),
+	}, nil
 }
 
 func TestDispatchPeerQuerySendExtMessageRejectsInvalidMessage(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -286,10 +308,10 @@ func testExternalMessageBOC(t *testing.T) []byte {
 func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		ListenAddr:         "127.0.0.1:30303",
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		ListenAddr:    "127.0.0.1:30303",
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -324,7 +346,7 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 		lastReceiveAt: time.Now(),
 	}
 
-	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
+	res := sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{})
 	if len(res.List) < 2 {
 		t.Fatalf("expected self and known peer, got %d entries", len(res.List))
 	}
@@ -405,7 +427,7 @@ func TestHandleGetRandomPeersSkipsMalformedAnnouncement(t *testing.T) {
 		alive:     true,
 	}
 
-	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
+	res := sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{})
 	for _, node := range res.List {
 		if !overlayNodeHasSerializableID(&node) {
 			t.Fatalf("getRandomPeers returned malformed node: %#v", node)
@@ -542,7 +564,7 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		}
 	}
 
-	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
+	res := sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{})
 	if len(res.List) != maxRandomPeerReply {
 		t.Fatalf("getRandomPeers returned %d nodes, want %d", len(res.List), maxRandomPeerReply)
 	}
@@ -600,9 +622,9 @@ func TestConnectOverlayNodeSkipsSelf(t *testing.T) {
 func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -637,7 +659,7 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 		lastReceiveAt: time.Now(),
 	}
 
-	res := sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{})
+	res := sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{})
 	if len(res.List) < 2 {
 		t.Fatalf("expected self and known peer for client node, got %d entries", len(res.List))
 	}
@@ -738,27 +760,13 @@ func TestAcceptBroadcastDropsWhenQueueIsFull(t *testing.T) {
 	}
 }
 
-func TestEventDeduperHasHardCap(t *testing.T) {
-	deduper := newEventDeduper(time.Hour, 16)
-	now := time.Now()
-
-	for i := 0; i < 64; i++ {
-		if !deduper.Mark(fmt.Sprintf("fp-%d", i), now) {
-			t.Fatalf("unexpected duplicate for key %d", i)
-		}
-	}
-	if len(deduper.seen) > 16 {
-		t.Fatalf("deduper exceeded hard cap: got %d want <= 16", len(deduper.seen))
-	}
-}
-
 func TestAcceptBroadcastDoesNotCacheShardBlockInPeerLayer(t *testing.T) {
 	store := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -789,9 +797,9 @@ func TestAcceptBroadcastDoesNotCacheUndecodedMasterchainBlock(t *testing.T) {
 	store := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -852,7 +860,7 @@ func testRebroadcastQueuePeer(id string) *overlayPeer {
 	peer := &overlayPeer{
 		id:      testPeerID(id),
 		addr:    id,
-		route:   newPeerRoute(""),
+		route:   newTestPeerRoute(""),
 		overlay: &overlay.ADNLOverlayWrapper{},
 		announced: &overlay.Node{
 			Version: int32(time.Now().Unix()),

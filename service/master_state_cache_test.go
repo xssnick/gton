@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"math/big"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,26 +15,27 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func newCompressedStateCacheTestService() *Service {
-	return &Service{
+func newCompressedStateCacheTestService() *SyncCoordinator {
+	return &SyncCoordinator{
 		compressedStateCache: make(map[storage.BlockRootHash]compressedBlockStateEntry),
 	}
 }
 
-func newMonitorSplitDepthTestService() *Service {
-	return &Service{
+func newMonitorSplitDepthTestService() *SyncCoordinator {
+	return &SyncCoordinator{
 		monitorSplitDepth: make(map[monitorSplitDepthKey]uint32),
 	}
 }
 
-func newMasterStateCacheTestService(t testing.TB) *Service {
+func newMasterStateCacheTestService(t testing.TB) *SyncCoordinator {
 	t.Helper()
 
 	store := openTestPebbleStorage(t)
-	return &Service{
+	return &SyncCoordinator{
 		log:                  zerolog.Nop(),
 		node:                 newServiceTestNodeWithStorage(t, store),
 		storage:              store,
+		status:               newTestStatusTracker(store, nil),
 		masterStateCache:     make(map[storage.BlockRootHash]*storage.BlockState),
 		compressedStateCache: make(map[storage.BlockRootHash]compressedBlockStateEntry),
 		monitorSplitDepth:    make(map[monitorSplitDepthKey]uint32),
@@ -51,7 +51,7 @@ func TestMasterBlockShardTargetsUsesBlockExtra(t *testing.T) {
 		Meta:      downloaded.Meta,
 	}
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: downloaded.ID}, &prepared, nil)
+	shards, err := (&SyncCoordinator{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: downloaded.ID}, &prepared, nil)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestMasterBlockShardTargetsReusesPrecomputed(t *testing.T) {
 	precomputed := []ton.BlockIDExt{testBlockID(0, topShard, 42)}
 	prepared := PreparedBlock{ID: testBlockID(-1, topShard, 41)}
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: prepared.ID}, &prepared, precomputed)
+	shards, err := (&SyncCoordinator{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: prepared.ID}, &prepared, precomputed)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestMasterBlockShardTargetsUsesLoadedStateBeforePreparedBlock(t *testing.T)
 	state := testShardTargetsMasterState(t, master, shard)
 	prepared := PreparedBlock{ID: master}
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), state, &prepared, nil)
+	shards, err := (&SyncCoordinator{}).masterBlockShardTargets(context.Background(), state, &prepared, nil)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestMasterBlockShardTargetsFallsBackToState(t *testing.T) {
 	shard := testBlockID(0, topShard, 11)
 	state := testShardTargetsMasterState(t, master, shard)
 
-	svc := &Service{storage: openTestPebbleStorage(t)}
+	svc := &SyncCoordinator{storage: openTestPebbleStorage(t)}
 	shards, err := svc.masterBlockShardTargets(context.Background(), state, nil, nil)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
@@ -188,7 +188,7 @@ func TestRememberMasterStateCacheStaysBounded(t *testing.T) {
 		svc.rememberMasterState(context.Background(), &storage.BlockState{
 			Block: testBlockID(-1, topShard, seqno),
 			Cell:  root,
-		}, nil, nil)
+		}, nil)
 	}
 
 	if got := len(svc.masterStateCache); got != masterStateCacheLimit {
@@ -252,7 +252,7 @@ func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testi
 	if err := svc.updateMasterDependentCachesForKeyBlock(nonKeyState, &nonKeyPrepared); err != nil {
 		t.Fatalf("updateMasterDependentCachesForKeyBlock non-key: %v", err)
 	}
-	svc.rememberMasterState(context.Background(), nonKeyState, &nonKeyPrepared, nil)
+	svc.rememberMasterState(context.Background(), nonKeyState, &nonKeyPrepared)
 
 	// A non-key master must not reset the cache: the first master still hits
 	// without a state parse.
@@ -276,7 +276,7 @@ func TestUpdateMasterDependentCachesKeepsMonitorSplitDepthUntilKeyBlock(t *testi
 	if err = svc.updateMasterDependentCachesForKeyBlock(keyState, &keyPrepared); err != nil {
 		t.Fatalf("updateMasterDependentCachesForKeyBlock key: %v", err)
 	}
-	svc.rememberMasterState(context.Background(), keyState, &keyPrepared, nil)
+	svc.rememberMasterState(context.Background(), keyState, &keyPrepared)
 
 	if _, err = svc.cachedMonitorMinSplitDepth(probe, 0); err == nil {
 		t.Fatal("key block did not invalidate the monitor split depth cache")
@@ -303,12 +303,12 @@ func TestUpdateMasterDependentCachesPublishesKeyBlockValidatorConfigBeforeCurren
 	if oldConfig.rootHash == expected.rootHash {
 		t.Fatal("test requires different old and key-block config roots")
 	}
-	svc := &Service{
+	svc := &SyncCoordinator{
 		node: &p2p.Node{},
-		currentStatus: &storage.CurrentState{
+		status: newTestStatusTrackerWithCurrent(nil, &storage.CurrentState{
 			Masterchain: storage.BlockState{Block: old},
 			Shards:      map[storage.ShardKey]storage.BlockState{},
-		},
+		}),
 	}
 	svc.broadcastValidatorCache.putConfig(old, oldConfig)
 
@@ -328,7 +328,7 @@ func TestUpdateMasterDependentCachesPublishesKeyBlockValidatorConfigBeforeCurren
 	if got.rootHash != expected.rootHash {
 		t.Fatal("broadcast validator config was not updated from the applied key-block state")
 	}
-	if !svc.currentStatus.Masterchain.Block.Equals(&old) {
+	if !svc.status.current.Masterchain.Block.Equals(&old) {
 		t.Fatal("test current status unexpectedly advanced to the key block")
 	}
 }
@@ -336,7 +336,7 @@ func TestUpdateMasterDependentCachesPublishesKeyBlockValidatorConfigBeforeCurren
 func TestUpdateMasterDependentCachesKeepsConfigWhenKeyBlockStateIsInvalid(t *testing.T) {
 	old := testBlockID(-1, topShard, 20)
 	oldConfig := broadcastValidatorConfig{rootHash: testBroadcastConfigHash(1)}
-	svc := &Service{}
+	svc := &SyncCoordinator{}
 	svc.broadcastValidatorCache.putConfig(old, oldConfig)
 
 	key := testBlockID(-1, topShard, 21)
@@ -453,7 +453,7 @@ func testMonitorMasterStateWithoutWorkchainConfig(t *testing.T, block ton.BlockI
 	}
 }
 
-func testMonitorMasterInfo(t *testing.T, keyBlock ton.BlockIDExt, afterKeyBlock bool) *cell.Cell {
+func testMonitorMasterInfo(t testing.TB, keyBlock ton.BlockIDExt, afterKeyBlock bool) *cell.Cell {
 	t.Helper()
 
 	prevBlocks, err := cell.NewAugDict(32, testMonitorOldMcBlocksAugmentation{})
@@ -619,7 +619,7 @@ func TestMasterBlockShardTargetsReusesPrecomputedWithoutPreparedBlock(t *testing
 	precomputed := []ton.BlockIDExt{testBlockID(0, topShard, 42)}
 	master := testBlockID(-1, topShard, 41)
 
-	shards, err := (&Service{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: master}, nil, precomputed)
+	shards, err := (&SyncCoordinator{}).masterBlockShardTargets(context.Background(), &storage.BlockState{Block: master}, nil, precomputed)
 	if err != nil {
 		t.Fatalf("masterBlockShardTargets returned error: %v", err)
 	}
@@ -628,15 +628,31 @@ func TestMasterBlockShardTargetsReusesPrecomputedWithoutPreparedBlock(t *testing
 	}
 }
 
-func newShardOverlayUpdateTestService(hook func(context.Context, masterShardOverlayUpdate)) *Service {
-	return &Service{
-		log:                   zerolog.Nop(),
-		shutdownContext:       context.Background(),
-		reconcileOverlaysHook: hook,
+func newShardOverlayUpdateTestService(ctx context.Context) *SyncCoordinator {
+	return &SyncCoordinator{
+		log:             zerolog.Nop(),
+		node:            &p2p.Node{},
+		shutdownContext: ctx,
 	}
 }
 
-func waitForShardOverlayWorkerIdle(t *testing.T, svc *Service) {
+func waitForShardOverlayWorkerDequeued(t *testing.T, svc *SyncCoordinator) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		svc.shardOverlayMu.Lock()
+		dequeued := svc.shardOverlayRunning && svc.shardOverlayPending == nil
+		svc.shardOverlayMu.Unlock()
+		if dequeued {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("shard overlay worker did not dequeue the first update")
+}
+
+func waitForShardOverlayWorkerIdle(t *testing.T, svc *SyncCoordinator) {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -656,79 +672,41 @@ func waitForShardOverlayWorkerIdle(t *testing.T, svc *Service) {
 // updates must never run concurrently and an older one must never land after a
 // newer one. Coalescing intermediate states is correct: the desired set is a
 // pure function of the newest master state.
-func TestScheduleP2PShardOverlayUpdateCoalescesToLatestState(t *testing.T) {
-	release := make(chan struct{})
-	var seen []uint32
-	var mu sync.Mutex
-	entered := make(chan struct{}, 8)
-
-	svc := newShardOverlayUpdateTestService(func(_ context.Context, update masterShardOverlayUpdate) {
-		mu.Lock()
-		seen = append(seen, update.state.Block.SeqNo)
-		mu.Unlock()
-		entered <- struct{}{}
-		if update.state.Block.SeqNo == 10 {
-			<-release
-		}
-	})
-
-	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, nil)
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first overlay update never started")
-	}
-
-	// Both land while the first reconcile is blocked; only the newest survives.
-	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(11)}, nil)
-	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(12)}, nil)
-	close(release)
-
-	waitForShardOverlayWorkerIdle(t, svc)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seen) != 2 {
-		t.Fatalf("overlay reconciles = %v, want the first and the coalesced latest", seen)
-	}
-	if seen[0] != 10 || seen[1] != 12 {
-		t.Fatalf("overlay reconciles = %v, want [10 12]", seen)
-	}
+type shardOverlayUpdateSequenceTest struct {
+	name    string
+	updates []uint32
 }
 
-func TestScheduleP2PShardOverlayUpdateIgnoresOlderState(t *testing.T) {
-	release := make(chan struct{})
-	entered := make(chan struct{}, 8)
-	var seen []uint32
-	var mu sync.Mutex
-
-	svc := newShardOverlayUpdateTestService(func(_ context.Context, update masterShardOverlayUpdate) {
-		mu.Lock()
-		seen = append(seen, update.state.Block.SeqNo)
-		mu.Unlock()
-		entered <- struct{}{}
-		if update.state.Block.SeqNo == 10 {
-			<-release
-		}
-	})
-
-	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, nil)
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first overlay update never started")
+func TestScheduleP2PShardOverlayUpdateKeepsNewestState(t *testing.T) {
+	tests := []shardOverlayUpdateSequenceTest{
+		{name: "coalesces intermediate state", updates: []uint32{11, 12}},
+		{name: "ignores older state", updates: []uint32{12, 11}},
 	}
 
-	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(12)}, nil)
-	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(11)}, nil)
-	close(release)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			svc := newShardOverlayUpdateTestService(context.Background())
+			svc.shardOverlayReconcileMu.Lock()
+			svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, []ton.BlockIDExt{})
+			waitForShardOverlayWorkerDequeued(t, svc)
 
-	waitForShardOverlayWorkerIdle(t, svc)
+			for _, seqno := range test.updates {
+				svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(seqno)}, []ton.BlockIDExt{})
+			}
+			svc.shardOverlayMu.Lock()
+			pending := svc.shardOverlayPending
+			svc.shardOverlayMu.Unlock()
+			if pending == nil || pending.state.Block.SeqNo != 12 {
+				svc.shardOverlayReconcileMu.Unlock()
+				t.Fatalf("pending overlay update = %v, want seqno 12", pending)
+			}
+			svc.shardOverlayReconcileMu.Unlock()
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seen) != 2 || seen[1] != 12 {
-		t.Fatalf("overlay reconciles = %v, want the stale seqno 11 to be dropped", seen)
+			waitForShardOverlayWorkerIdle(t, svc)
+			if svc.shardOverlayReconciledSeqno != 12 {
+				t.Fatalf("last reconciled overlay seqno = %d, want 12", svc.shardOverlayReconciledSeqno)
+			}
+		})
 	}
 }
 
@@ -736,33 +714,26 @@ func TestScheduleP2PShardOverlayUpdateStopsOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	reconciles := 0
-	svc := newShardOverlayUpdateTestService(func(context.Context, masterShardOverlayUpdate) {
-		reconciles++
-	})
-	svc.shutdownContext = ctx
+	svc := newShardOverlayUpdateTestService(ctx)
 
 	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testMasterBlockID(10)}, nil)
 	waitForShardOverlayWorkerIdle(t, svc)
 	svc.Wait()
 
-	if reconciles != 0 {
-		t.Fatalf("overlay reconciles after shutdown = %d, want 0", reconciles)
+	if svc.shardOverlayReconciledSeqno != 0 {
+		t.Fatalf("last reconciled overlay seqno = %d after shutdown, want 0", svc.shardOverlayReconciledSeqno)
 	}
 }
 
 func TestScheduleP2PShardOverlayUpdateSkipsNonMasterchainState(t *testing.T) {
-	reconciles := 0
-	svc := newShardOverlayUpdateTestService(func(context.Context, masterShardOverlayUpdate) {
-		reconciles++
-	})
+	svc := newShardOverlayUpdateTestService(context.Background())
 
 	svc.scheduleP2PShardOverlayUpdate(nil, nil)
 	svc.scheduleP2PShardOverlayUpdate(&storage.BlockState{Block: testBlockID(0, topShard, 10)}, nil)
 	svc.Wait()
 
-	if reconciles != 0 {
-		t.Fatalf("overlay reconciles for non-masterchain states = %d, want 0", reconciles)
+	if svc.shardOverlayReconciledSeqno != 0 {
+		t.Fatalf("last reconciled overlay seqno = %d for non-masterchain states, want 0", svc.shardOverlayReconciledSeqno)
 	}
 }
 

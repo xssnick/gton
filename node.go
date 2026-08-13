@@ -2,12 +2,15 @@ package gton
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
-	"sync"
 	"time"
 
+	"github.com/xssnick/gton/api/httpapi"
+	"github.com/xssnick/gton/api/liteserver"
+	"github.com/xssnick/gton/console"
 	"github.com/xssnick/gton/internal/metrics"
 	"github.com/xssnick/gton/service"
 	"github.com/xssnick/gton/service/blocksync"
@@ -27,9 +30,31 @@ import (
 )
 
 const (
-	maxNodeBOCCells = 4_000_000_000
-	topShard        = int64(-1 << 63)
+	maxNodeBOCCells           = 4_000_000_000
+	topShard                  = int64(-1 << 63)
+	liteserverShutdownTimeout = 10 * time.Second
 )
+
+// ErrShutdownIncomplete reports that the second shutdown signal interrupted
+// durable extension cleanup. Composition roots must not close extension-owned
+// stores after this error: the process is exiting and the operating system is
+// the only safe final owner while an accepted write may still be in flight.
+var ErrShutdownIncomplete = errors.New("node shutdown incomplete")
+
+func waitForLiteserverShutdown(ctx context.Context, wait func()) error {
+	done := make(chan struct{})
+	go func() {
+		wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 type MetricsOptions struct {
 	Enabled    bool
@@ -66,6 +91,8 @@ type NodeOptions struct {
 	Metrics      MetricsOptions
 	Storage      StorageOptions
 	Extension    hooks.ExtensionFactory
+	HTTPAPI      *HTTPAPIOptions
+	Liteserver   *LiteserverOptions
 
 	SyncBefore                time.Duration
 	SyncUntil                 uint32
@@ -96,17 +123,32 @@ func DefaultNodeOptions() NodeOptions {
 }
 
 func applyNodeOptionDefaults(opts NodeOptions) NodeOptions {
+	if opts.NextCheckpointBlocks == 0 {
+		opts.NextCheckpointBlocks = service.DefaultNextBlockCheckpointBlocks
+	}
+	if opts.ArchiveCheckpointBlocks == 0 {
+		opts.ArchiveCheckpointBlocks = service.DefaultArchiveCatchUpCheckpointBlocks
+	}
+	if opts.CheckpointBytes == 0 {
+		opts.CheckpointBytes = service.DefaultCheckpointBytes
+	}
+	if opts.SyncBackpressureWindows == 0 {
+		opts.SyncBackpressureWindows = service.DefaultSyncBackpressureWindows
+	}
 	if opts.ArchiveCheckpointPeriod == 0 {
 		opts.ArchiveCheckpointPeriod = service.DefaultArchiveCatchUpCheckpointPeriod
 	}
 	if opts.ArchivePrefetchWindows == 0 {
 		opts.ArchivePrefetchWindows = service.DefaultArchiveCatchUpPrefetchWindows
 	}
+	if opts.Storage.PersistentStateKeepRecent == 0 {
+		opts.Storage.PersistentStateKeepRecent = service.DefaultPersistentStateKeepRecent
+	}
 	return opts
 }
 
 // RunNode runs the gton node from already resolved startup options.
-func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
+func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 	if runOpts.ArchivePrefetchWindows < 0 {
 		return fmt.Errorf("archive prefetch windows cannot be negative: %d", runOpts.ArchivePrefetchWindows)
 	}
@@ -122,8 +164,10 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		return fmt.Errorf("global config is required")
 	}
 
-	ctx, shutdownCtx, stop := signalContexts(parentCtx)
+	ctx, shutdownCtx, cancelRun, stop := signalContexts(parentCtx)
 	defer stop()
+	networkCtx, cancelNetwork := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelNetwork()
 
 	globalConfigZeroState, err := zeroStateBlockFromGlobalConfig(globalConfig)
 	if err != nil {
@@ -167,6 +211,8 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	archiveCheckpointBlocks := runOpts.ArchiveCheckpointBlocks
 	checkpointBytes := runOpts.CheckpointBytes
 	syncBackpressureWindows := runOpts.SyncBackpressureWindows
+	broadcastAdmissionLogger := baseLogger.With().Str("component", "broadcast_admission").Logger()
+	broadcastAdmission := service.NewBroadcastAdmission(broadcastAdmissionLogger, nextCheckpointBlocks, syncBackpressureWindows)
 
 	storageOpts := runOpts.Storage
 	storageDir := storageOpts.Dir
@@ -216,9 +262,18 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		return fmt.Errorf("open pebble storage %s: %w", storageDir, err)
 	}
 	stateFilesDir := store.StateFilesDir()
-	opts.Storage = store
-	opts.PeerCache = store
-	opts.FastSyncCertificateStorage = store
+	if opts.PeerStorage == nil {
+		opts.PeerStorage = store
+	}
+	if opts.StateArtifactStorage == nil {
+		opts.StateArtifactStorage = store
+	}
+	if opts.PeerCache == nil {
+		opts.PeerCache = store
+	}
+	if opts.FastSyncCertificateStorage == nil {
+		opts.FastSyncCertificateStorage = store
+	}
 	logger.Info().
 		Str("storage", "pebble").
 		Str("dir", storageDir).
@@ -228,6 +283,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
 	opts.LiveBlockCache = liveBlockCache
 	storageClosed := false
+	shutdownAbandoned := false
 	closeStore := func() {
 		if storageClosed {
 			return
@@ -236,7 +292,9 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		storageClosed = true
 	}
 	defer func() {
-		closeStore()
+		if !shutdownAbandoned {
+			closeStore()
+		}
 	}()
 	if err = ensureStoredZeroStateMatchesGlobalConfig(ctx, store, globalConfigZeroState); err != nil {
 		logger.Error().
@@ -303,6 +361,39 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		logger.Error().Err(err).Msg("failed to initialize external message checker")
 		return fmt.Errorf("initialize external message checker: %w", err)
 	}
+	externalMessages := externalMessageNetwork{
+		node:      node,
+		checker:   externalMessageChecker,
+		blockSync: blockSync,
+	}
+
+	serviceLogger := baseLogger.With().Str("component", "service").Logger()
+	statusTracker := service.NewStatusTracker(serviceLogger, store, liveBlockCache)
+	stateLifecycle := service.NewStateLifecycle(serviceLogger, store, statusTracker, service.StateLifecycleOptions{
+		ShutdownContext:                  shutdownCtx,
+		StateFilesDir:                    stateFilesDir,
+		StateTTL:                         stateTTL,
+		StorageDir:                       storageDir,
+		DisableStateSerialization:        runOpts.DisableStateSerialization,
+		PersistentStateLargeBOCBatchSize: persistentStateLargeBOCBatchSize,
+		StateSerializeOnePass:            storageOpts.StateSerializeOnePass,
+		NextBlockCheckpointBlocks:        nextCheckpointBlocks,
+		CheckpointBytes:                  checkpointBytes,
+		SyncBackpressureWindows:          syncBackpressureWindows,
+	})
+	maintenance := service.NewMaintenanceRunner(serviceLogger, store, statusTracker, service.MaintenanceRunnerOptions{
+		ArchiveTTL:                archiveTTL,
+		PersistentStateKeepRecent: storageOpts.PersistentStateKeepRecent,
+		ShutdownContext:           shutdownCtx,
+	})
+	readStatus := func(ctx context.Context) service.StatusSnapshot {
+		snapshot := statusTracker.Snapshot(ctx, node.StatusSnapshot())
+		snapshot.BlockSync = blockSync.StatusSnapshot()
+		snapshot.BackgroundTask = maintenance.BackgroundTaskStatus()
+
+		return snapshot
+	}
+	commandRegistry := &console.Registry{}
 
 	extensionFactory := runOpts.Extension
 	extensionLogger := baseLogger.With().Str("source", "extension").Logger()
@@ -311,53 +402,130 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		metricsCapability = runtimeMetrics
 	}
 	extensionNode := hooks.Node{
-		Network: extensionNetwork{node: node, checker: externalMessageChecker},
-		Store:   liveStore,
-		TVM:     tvmInstance,
-		Logger:  extensionLogger,
-		Metrics: metricsCapability,
+		Network:         externalMessages,
+		PrivateOverlays: node.PrivateOverlays(),
+		BlockBroadcasts: node.BlockBroadcasts(),
+		Store:           liveStore,
+		TVM:             tvmInstance,
+		Logger:          extensionLogger,
+		Metrics:         metricsCapability,
+		Commands:        commandRegistry,
 	}
 	extension, err := extensionFromFactory(extensionFactory, extensionNode)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to initialize static extension")
 		return fmt.Errorf("initialize static extension: %w", err)
 	}
+	extensionClosed := false
+	closeExtension := func(ctx context.Context) error {
+		if extensionClosed || extension == nil {
+			return nil
+		}
+		if closeErr := extension.Close(ctx); closeErr != nil {
+			return closeErr
+		}
+		extensionClosed = true
 
-	serviceLogger := baseLogger.With().Str("component", "service").Logger()
-	svc := service.New(serviceLogger, node, blockSync, store, stateSync, service.Options{
-		ArchiveCatchUpCheckpointBlocks:          archiveCheckpointBlocks,
-		ArchiveCatchUpCheckpointPeriod:          runOpts.ArchiveCheckpointPeriod,
-		ArchiveCatchUpPrefetchWindows:           runOpts.ArchivePrefetchWindows,
-		NextBlockCheckpointBlocks:               nextCheckpointBlocks,
-		CheckpointBytes:                         checkpointBytes,
-		SyncBackpressureWindows:                 syncBackpressureWindows,
+		return nil
+	}
+	defer func() {
+		if shutdownAbandoned {
+			return
+		}
+		if closeErr := closeExtension(shutdownCtx); closeErr != nil {
+			shutdownAbandoned = true
+			returnErr = errors.Join(
+				returnErr,
+				ErrShutdownIncomplete,
+				fmt.Errorf("stop static extension: %w", closeErr),
+			)
+			logger.Error().Err(closeErr).Msg("static extension cleanup is incomplete")
+		}
+	}()
+	eventHandlers := eventHandlersFromExtension(extension)
+
+	coordinator := service.NewSyncCoordinator(serviceLogger, service.SyncCoordinatorDependencies{
+		Node:               node,
+		BlockSync:          blockSync,
+		Storage:            store,
+		StateSync:          stateSync,
+		Status:             statusTracker,
+		State:              stateLifecycle,
+		Maintenance:        maintenance,
+		BroadcastAdmission: broadcastAdmission,
+	}, service.SyncCoordinatorOptions{
 		CurrentStatePublisher:                   liveStore,
 		LiveBlockCache:                          liveBlockCache,
 		CurrentStatePublisherUsesLiveBlockCache: true,
 		ShutdownContext:                         shutdownCtx,
-		StateFilesDir:                           stateFilesDir,
-		StateTTL:                                stateTTL,
-		ArchiveTTL:                              archiveTTL,
 		ArchiveFromZero:                         archiveFromZero,
 		SyncUntil:                               syncUntil,
 		StorageDir:                              storageDir,
-		DisableStateSerialization:               runOpts.DisableStateSerialization,
-		PersistentStateLargeBOCBatchSize:        persistentStateLargeBOCBatchSize,
-		PersistentStateKeepRecent:               storageOpts.PersistentStateKeepRecent,
-		StateSerializeOnePass:                   storageOpts.StateSerializeOnePass,
 		SyncObserver:                            syncObserver,
-		Extension:                               extension,
-		ExternalMessageChecker:                  externalMessageChecker,
+		BlockAppliedProcessor:                   eventHandlers.BlockApplied,
+		BlockReceivedObserver:                   eventHandlers.BlockReceived,
+		ShardTopBlockDescriptionObserver:        eventHandlers.ShardTopBlockDescription,
 	})
-	node.SetRuntimeCallbacks(svc)
+	archiveRunner := service.NewArchiveRunner(
+		serviceLogger,
+		node,
+		store,
+		stateSync,
+		stateLifecycle,
+		eventHandlers.BlockReceived,
+		maintenance,
+		service.ArchiveRunnerOptions{
+			CheckpointBlocks: archiveCheckpointBlocks,
+			CheckpointPeriod: runOpts.ArchiveCheckpointPeriod,
+			PrefetchWindows:  runOpts.ArchivePrefetchWindows,
+			SyncBackpressure: syncBackpressureWindows,
+			SyncUntil:        syncUntil,
+			StorageDir:       storageDir,
+		},
+	)
+	externalAdmission := service.NewExternalMessageAdmission(
+		externalMessageLogger,
+		externalMessageChecker,
+		eventHandlers.ExternalMessage,
+	)
+
+	if err = stateLifecycle.BindTransitions(coordinator, coordinator, coordinator, coordinator, maintenance); err != nil {
+		return fmt.Errorf("bind state lifecycle transitions: %w", err)
+	}
+	if err = maintenance.Bind(stateLifecycle, coordinator); err != nil {
+		return fmt.Errorf("bind maintenance runner: %w", err)
+	}
+	if err = archiveRunner.Bind(coordinator, coordinator, coordinator, coordinator); err != nil {
+		return fmt.Errorf("bind archive runner transitions: %w", err)
+	}
+	if err = coordinator.BindArchiveRunner(archiveRunner); err != nil {
+		return fmt.Errorf("bind archive runner to sync coordinator: %w", err)
+	}
+	if err = registerConsoleCommands(commandRegistry, readStatus, stateLifecycle, store.DBStatus); err != nil {
+		return fmt.Errorf("register console commands: %w", err)
+	}
+
+	liveStore.SetNonfinalCellLoader(stateLifecycle.CellLoader())
+	if err = node.BindRuntimeCallbacks(p2p.RuntimeCallbacks{
+		CompressedState:          coordinator,
+		SyncLag:                  statusTracker,
+		SignatureVerifier:        coordinator,
+		BroadcastAdmission:       broadcastAdmission,
+		ExternalMessageAdmission: externalAdmission,
+		BlockReceivedObserver:    coordinator,
+	}); err != nil {
+		return fmt.Errorf("bind p2p runtime callbacks: %w", err)
+	}
 	node.SetBlockCacheObserver(liveStore)
 	if runtimeMetrics != nil {
 		if err = runtimeMetrics.RegisterRuntimeCollectors(metrics.RuntimeReaders{
-			ServiceStatusReader: svc.StatusSnapshot,
-			DBStatusReader:      store.DBStatus,
-			LazyCellLoadReader:  svc.LazyCellLoadMetrics,
-			ArchivePackagesDir:  filepath.Join(storageDir, "archive", "packages"),
-			StateFilesDir:       stateFilesDir,
+			ServiceStatusReader: func() service.StatusSnapshot {
+				return readStatus(context.Background())
+			},
+			DBStatusReader:     store.DBStatus,
+			LazyCellLoadReader: statusTracker.LazyCellLoadMetrics,
+			ArchivePackagesDir: filepath.Join(storageDir, "archive", "packages"),
+			StateFilesDir:      stateFilesDir,
 		}); err != nil {
 			logger.Error().Err(err).Msg("failed to initialize runtime metrics collectors")
 			return fmt.Errorf("initialize runtime metrics collectors: %w", err)
@@ -365,28 +533,188 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		store.SetArtifactMetricsObserver(runtimeMetrics)
 	}
 
-	if err = node.Start(ctx); err != nil {
+	var httpAPIServer *httpapi.Server
+	var liteserverServer *liteserver.Server
+	var consoleDone <-chan struct{}
+	apiServersClosed := false
+	closeAPIServers := func() {
+		if apiServersClosed {
+			return
+		}
+		apiServersClosed = true
+
+		if httpAPIServer != nil {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if closeErr := httpAPIServer.Close(closeCtx); closeErr != nil {
+				logger.Warn().Err(closeErr).Msg("failed to stop http api")
+			}
+			cancel()
+			httpAPIServer.Wait()
+		}
+		if liteserverServer != nil {
+			if closeErr := liteserverServer.Close(); closeErr != nil {
+				logger.Warn().Err(closeErr).Msg("failed to stop liteserver")
+			}
+
+			closeCtx, cancel := context.WithTimeout(context.Background(), liteserverShutdownTimeout)
+			if waitErr := waitForLiteserverShutdown(closeCtx, liteserverServer.Wait); waitErr != nil {
+				logger.Warn().
+					Err(waitErr).
+					Dur("timeout", liteserverShutdownTimeout).
+					Msg("timed out waiting for liteserver shutdown")
+			}
+			cancel()
+		}
+	}
+	defer closeAPIServers()
+
+	if apiOpts := runOpts.HTTPAPI; apiOpts != nil {
+		httpAPIServer, err = httpapi.New(httpapi.Options{
+			Logger:         &baseLogger,
+			Store:          liveStore,
+			Network:        externalMessages,
+			TVM:            tvmInstance,
+			ListenAddr:     apiOpts.ListenAddr,
+			RequestTimeout: apiOpts.RequestTimeout,
+			ZeroState:      apiOpts.ZeroState,
+		})
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to initialize http api")
+			return fmt.Errorf("initialize http api: %w", err)
+		}
+	}
+
+	if liteOpts := runOpts.Liteserver; liteOpts != nil {
+		var queryObserver liteserver.QueryObserver
+		if runtimeMetrics != nil {
+			queryObserver, err = liteserver.NewQueryObserver(runtimeMetrics)
+			if err != nil {
+				logger.Error().Err(err).Msg("failed to initialize liteserver metrics")
+				return fmt.Errorf("initialize liteserver metrics: %w", err)
+			}
+		}
+
+		liteserverServer, err = liteserver.New(liteserver.Options{
+			Logger:                  &baseLogger,
+			Store:                   liveStore,
+			MessageSender:           externalMessages,
+			TVM:                     tvmInstance,
+			CheckExternalMessage:    externalMessageChecker.Check,
+			QueryObserver:           queryObserver,
+			PrivateKey:              liteOpts.PrivateKey,
+			ListenAddr:              liteOpts.ListenAddr,
+			NonFinal:                liteOpts.NonFinal,
+			AllowDuplicateExternals: liteOpts.AllowDuplicateExternals,
+			ZeroState:               liteOpts.ZeroState,
+			RequestLimits:           liteOpts.RequestLimits,
+			QueryConcurrency:        liteOpts.QueryConcurrency,
+		})
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to initialize liteserver")
+			return fmt.Errorf("initialize liteserver: %w", err)
+		}
+	}
+
+	if err = node.Start(networkCtx); err != nil {
 		logger.Error().Err(err).Msg("failed to start p2p node")
 		return fmt.Errorf("start p2p node: %w", err)
 	}
+	runtimeStopped := false
+	shutdownRuntime := func() error {
+		if runtimeStopped {
+			return nil
+		}
 
-	var blockSyncWG sync.WaitGroup
-	blockSyncWG.Add(1)
-	go func() {
-		defer blockSyncWG.Done()
-		blockSync.Run(ctx)
+		cancelRun()
+		if consoleDone != nil {
+			<-consoleDone
+		}
+		closeAPIServers()
+		coordinator.Wait()
+		blockSync.Wait()
+		maintenance.Wait()
+		stateLifecycle.Wait()
+		statusTracker.Wait()
+		// Stop ordinary extension hook delivery first. Extensions own dynamic
+		// overlays, so retire them while P2P is still alive and their private
+		// callbacks and overlay workers can drain deterministically.
+		eventHandlers.stop()
+		if closeErr := closeExtension(shutdownCtx); closeErr != nil {
+			return closeErr
+		}
+		cancelNetwork()
+		node.Wait()
+		stop()
+		runtimeStopped = true
+
+		return nil
+	}
+	shutdownUntilComplete := func() error {
+		for {
+			shutdownErr := shutdownRuntime()
+			if shutdownErr == nil {
+				return nil
+			}
+			if err := shutdownCtx.Err(); err != nil {
+				return errors.Join(ErrShutdownIncomplete, shutdownErr, err)
+			}
+
+			logger.Warn().Err(shutdownErr).Msg("node runtime cleanup failed; retrying")
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-timer.C:
+			case <-shutdownCtx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+
+				return errors.Join(ErrShutdownIncomplete, shutdownErr, shutdownCtx.Err())
+			}
+		}
+	}
+	defer func() {
+		if runtimeStopped || shutdownAbandoned {
+			return
+		}
+		if shutdownErr := shutdownUntilComplete(); shutdownErr != nil {
+			shutdownAbandoned = true
+			returnErr = errors.Join(returnErr, shutdownErr)
+			logger.Error().Err(shutdownErr).Msg("node runtime cleanup is incomplete")
+		}
 	}()
-
-	svc.Start(ctx)
 
 	if extension != nil {
 		if err = extension.Start(ctx); err != nil {
 			logger.Error().Err(err).Msg("failed to start static extension")
-			stop()
-			svc.Wait()
-			blockSyncWG.Wait()
-			node.Wait()
 			return fmt.Errorf("start static extension: %w", err)
+		}
+	}
+
+	statusTracker.Start(ctx)
+	if err = stateLifecycle.Start(ctx); err != nil {
+		logger.Error().Err(err).Msg("failed to start state lifecycle")
+		return fmt.Errorf("start state lifecycle: %w", err)
+	}
+	if err = maintenance.Start(ctx); err != nil {
+		logger.Error().Err(err).Msg("failed to start maintenance runner")
+		return fmt.Errorf("start maintenance runner: %w", err)
+	}
+	blockSync.Start(ctx)
+	if err = coordinator.Start(ctx); err != nil {
+		logger.Error().Err(err).Msg("failed to start sync coordinator")
+		return fmt.Errorf("start sync coordinator: %w", err)
+	}
+
+	if liteserverServer != nil {
+		if err = liteserverServer.Start(ctx); err != nil {
+			logger.Error().Err(err).Msg("failed to start liteserver")
+			return fmt.Errorf("start liteserver: %w", err)
+		}
+	}
+	if httpAPIServer != nil {
+		if err = httpAPIServer.Start(ctx); err != nil {
+			logger.Error().Err(err).Msg("failed to start http api")
+			return fmt.Errorf("start http api: %w", err)
 		}
 	}
 
@@ -418,7 +746,12 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		Msg("service started")
 
 	if runOpts.ConsoleInput != nil && runOpts.ConsoleOutput != nil {
-		go runConsole(ctx, logger, runOpts.ConsoleInput, runOpts.ConsoleOutput, svc, store.DBStatus)
+		done := make(chan struct{})
+		consoleDone = done
+		go func() {
+			defer close(done)
+			runConsole(ctx, logger, runOpts.ConsoleInput, runOpts.ConsoleOutput, commandRegistry)
+		}()
 	}
 
 	// A node that stopped on its own because a subsystem died must take the
@@ -434,24 +767,23 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) error {
 		logger.Error().
 			Str("reason", nodeFailure).
 			Msg("p2p node stopped unexpectedly, shutting the node down")
-		stop()
+		cancelRun()
 	}
 
 	logger.Info().Msg("shutting down")
-	if extension != nil {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := extension.Close(closeCtx); err != nil {
-			logger.Warn().Err(err).Msg("failed to stop static extension")
-		}
-		cancel()
+	shutdownErr := shutdownUntilComplete()
+	if shutdownErr == nil {
+		closeStore()
+		logger.Info().Msg("shutdown complete")
+	} else {
+		shutdownAbandoned = true
+		logger.Error().Err(shutdownErr).Msg("forced shutdown left durable cleanup incomplete")
 	}
-	svc.Wait()
-	blockSyncWG.Wait()
-	node.Wait()
-	closeStore()
-	logger.Info().Msg("shutdown complete")
 	if nodeFailure != "" {
-		return fmt.Errorf("p2p node stopped unexpectedly: %s", nodeFailure)
+		return errors.Join(
+			fmt.Errorf("p2p node stopped unexpectedly: %s", nodeFailure),
+			shutdownErr,
+		)
 	}
-	return nil
+	return shutdownErr
 }

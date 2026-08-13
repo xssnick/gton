@@ -22,7 +22,6 @@ func TestNewFastSyncMemberCertificateWireRoundTrip(t *testing.T) {
 		issuer,
 		node,
 		1,
-		0,
 		int32(time.Now().Add(time.Hour).Unix()),
 	)
 
@@ -146,7 +145,6 @@ func TestImportFastSyncCertificateRejects(t *testing.T) {
 				test.issuer,
 				test.node(node.localID),
 				test.slot,
-				0,
 				test.expireAt,
 			)
 
@@ -176,7 +174,6 @@ func TestImportFastSyncCertificateNeedsRoster(t *testing.T) {
 		issuer,
 		node.localID,
 		1,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
 
@@ -196,7 +193,7 @@ func TestImportFastSyncCertificateDedupesByIssuer(t *testing.T) {
 	node := fastSyncCertificateTestNode(t, issuer)
 
 	first := fastSyncMembershipTestCertificate(
-		t, issuer, node.localID, 1, 0, int32(now.Add(time.Hour).Unix()),
+		t, issuer, node.localID, 1, int32(now.Add(time.Hour).Unix()),
 	)
 	if err := node.importFastSyncCertificate(first, now); err != nil {
 		t.Fatalf("import first certificate: %v", err)
@@ -207,7 +204,7 @@ func TestImportFastSyncCertificateDedupesByIssuer(t *testing.T) {
 	}
 
 	same := fastSyncMembershipTestCertificate(
-		t, issuer, node.localID, 1, 0, first.ExpireAt,
+		t, issuer, node.localID, 1, first.ExpireAt,
 	)
 	if err := node.importFastSyncCertificate(same, now); !errors.Is(
 		err,
@@ -217,7 +214,7 @@ func TestImportFastSyncCertificateDedupesByIssuer(t *testing.T) {
 	}
 
 	newer := fastSyncMembershipTestCertificate(
-		t, issuer, node.localID, 1, 0, first.ExpireAt+600,
+		t, issuer, node.localID, 1, first.ExpireAt+600,
 	)
 	if err := node.importFastSyncCertificate(newer, now); err != nil {
 		t.Fatalf("import longer-lived certificate: %v", err)
@@ -282,7 +279,7 @@ func TestStoreFastSyncCertificateEvictsUnroutedIssuers(t *testing.T) {
 	for i := 0; i < fastSyncCertificateLimit; i++ {
 		stale := newFastSyncMembershipTestIssuer(t, byte(0x40+i))
 		certificate := fastSyncMembershipTestCertificate(
-			t, stale, node.localID, 1, 0, expireAt,
+			t, stale, node.localID, 1, expireAt,
 		)
 		if err := node.storeFastSyncCertificate(stale.id, certificate, roster, now); err != nil {
 			t.Fatalf("seed certificate %d: %v", i, err)
@@ -294,7 +291,7 @@ func TestStoreFastSyncCertificateEvictsUnroutedIssuers(t *testing.T) {
 
 	// A certificate from the validator that is actually routing must get in.
 	fresh := fastSyncMembershipTestCertificate(
-		t, current, node.localID, 1, 0, expireAt,
+		t, current, node.localID, 1, expireAt,
 	)
 	if err := node.importFastSyncCertificate(fresh, now); err != nil {
 		t.Fatalf("import certificate from a routing validator: %v", err)

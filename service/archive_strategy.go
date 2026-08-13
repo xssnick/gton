@@ -38,7 +38,7 @@ func remainingLagSeconds(lagSeconds int64) int64 {
 	return remaining
 }
 
-func (r *archiveCatchUpRunner) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, plans []archiveShardImportPlan, splitDepth uint32, priority archiveImportPriority) ([]*archiveImportResult, error) {
+func (r *archiveCatchUpRun) downloadAndImportShardArchives(ctx context.Context, queue *archiveImportQueue, masterchainSeqno uint32, plans []archiveShardImportPlan, splitDepth uint32, priority archiveImportPriority) ([]*archiveImportResult, error) {
 	if len(plans) == 0 {
 		return nil, nil
 	}
@@ -196,14 +196,14 @@ func validateArchiveImportCoversPlan(imported *archiveImportResult, plan archive
 	return nil
 }
 
-func (r *archiveCatchUpRunner) rejectArchiveImportPeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
+func (r *archiveCatchUpRun) rejectArchiveImportPeer(shard archive.ShardID, peer string, archiveID int64, reason string, err error) bool {
 	if peer == "" {
 		return false
 	}
 
 	rejected := r.archiveSession.RejectArchivePeer(shard, peer, reason)
-	if rejected && r.service != nil {
-		r.service.log.Debug().
+	if rejected && r.archive != nil {
+		r.archive.log.Debug().
 			Err(err).
 			Str("peer", peer).
 			Int64("archive_id", archiveID).

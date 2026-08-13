@@ -438,6 +438,37 @@ func TestSyncerUsesConfiguredZeroStateWhenInitBlockIsEmpty(t *testing.T) {
 	}
 }
 
+func TestSyncerFallsBackToFreshZeroState(t *testing.T) {
+	emptyInit := ton.BlockIDExt{}
+	zero := testStateBlock(-1, topShard, 0)
+	shard := testStateBlock(0, topShard, 0)
+	masterState := testMasterState(t, zero)
+	masterState.Parsed.McStateExtra = testMcStateExtraWithWorkchains(t, nil, []ton.BlockIDExt{shard})
+	masterState.Parsed.GenUTime = uint32(time.Now().Unix())
+	source := &fakeSource{
+		initBlock: &emptyInit,
+		zeroBlock: &zero,
+		zeroStates: map[storage.BlockRootHash]*storage.BlockState{
+			storage.BlockKey(zero):  masterState,
+			storage.BlockKey(shard): {Block: shard, Cell: cell.BeginCell().EndCell()},
+		},
+	}
+	store := newTestStateStore()
+	syncer := NewSyncer(source, store, SyncerOptions{SyncBefore: 24 * time.Hour})
+
+	current, err := syncer.SyncCurrent(context.Background())
+	if err != nil {
+		t.Fatalf("sync fresh zero state: %v", err)
+	}
+	if !current.Masterchain.Block.Equals(&zero) {
+		t.Fatalf("current master = %s, want %s", storage.FormatBlockRef(current.Masterchain.Block), storage.FormatBlockRef(zero))
+	}
+	currentShard, exists := current.Shards[storage.ShardKeyFromBlock(shard)]
+	if !exists || !currentShard.Block.Equals(&shard) {
+		t.Fatalf("current shard = %s, want %s", storage.FormatBlockRef(currentShard.Block), storage.FormatBlockRef(shard))
+	}
+}
+
 func TestSyncerConfiguredTrustedKeyBlockAnchorPreservesZeroStateError(t *testing.T) {
 	emptyInit := ton.BlockIDExt{}
 	zero := testStateBlock(-1, topShard, 0)
@@ -578,6 +609,14 @@ func testMasterState(t *testing.T, master ton.BlockIDExt, shards ...ton.BlockIDE
 }
 
 func testMcStateExtra(t *testing.T, shards ...ton.BlockIDExt) *cell.Cell {
+	return testMcStateExtraWithWorkchains(t, shards, shards)
+}
+
+func testMcStateExtraWithWorkchains(
+	t *testing.T,
+	shards []ton.BlockIDExt,
+	workchainZeroStates []ton.BlockIDExt,
+) *cell.Cell {
 	t.Helper()
 
 	shardHashes := cell.NewDict(32)
@@ -602,7 +641,7 @@ func testMcStateExtra(t *testing.T, shards ...ton.BlockIDExt) *cell.Cell {
 	}
 	workchains := cell.NewDict(32)
 	workchainSeen := map[int32]struct{}{}
-	for _, shard := range shards {
+	for _, shard := range workchainZeroStates {
 		if shard.Workchain == -1 {
 			continue
 		}
@@ -610,7 +649,20 @@ func testMcStateExtra(t *testing.T, shards ...ton.BlockIDExt) *cell.Cell {
 			continue
 		}
 		workchainSeen[shard.Workchain] = struct{}{}
-		if err := workchains.SetIntKey(big.NewInt(int64(shard.Workchain)), workchainDescriptorCell(0xa6, true, 0)); err != nil {
+		descriptor, err := tlb.ToCell(&tlb.WorkchainDescr{Descr: tlb.WorkchainDescrV1{
+			WorkchainDescrFields: tlb.WorkchainDescrFields{
+				Basic:             true,
+				Active:            true,
+				AcceptMsgs:        true,
+				ZeroStateRootHash: testBlockHash(shard.RootHash),
+				ZeroStateFileHash: testBlockHash(shard.FileHash),
+				Format:            tlb.WorkchainFormatBasic{VMVersion: -1},
+			},
+		}})
+		if err != nil {
+			t.Fatalf("build workchain descriptor %d: %v", shard.Workchain, err)
+		}
+		if err = workchains.SetIntKey(big.NewInt(int64(shard.Workchain)), descriptor); err != nil {
 			t.Fatalf("store workchain descriptor %d: %v", shard.Workchain, err)
 		}
 	}

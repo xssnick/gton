@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	tnstore "github.com/xssnick/gton/service/storage"
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
@@ -21,7 +20,7 @@ import (
 )
 
 type quicZeroStatePeerStore struct {
-	tnstore.PeerServingStorage
+	PeerStorage
 	data []byte
 }
 
@@ -52,6 +51,28 @@ func BenchmarkParseQUICMessageEnvelopePlain(b *testing.B) {
 			err = parseQUICMessageEnvelope(payload)
 		if err != nil {
 			b.Fatalf("parse message envelope: %v", err)
+		}
+	}
+}
+
+func TestQUICHotPathConstructorIDs(t *testing.T) {
+	tests := []struct {
+		schema string
+		id     uint32
+	}{
+		{
+			schema: broadcastTwoStepSimpleSchema,
+			id:     broadcastTwoStepSimpleConstructorID,
+		},
+		{
+			schema: broadcastTwoStepFECSchema,
+			id:     broadcastTwoStepFECConstructorID,
+		},
+	}
+
+	for _, test := range tests {
+		if actual := tl.CRC(test.schema); actual != test.id {
+			t.Fatalf("constructor id for %q = 0x%08x, want 0x%08x", test.schema, actual, test.id)
 		}
 	}
 }
@@ -187,10 +208,9 @@ func TestHandleQUICQueryChecksFastSyncCertificate(t *testing.T) {
 		issuer,
 		member,
 		0,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
-	membership := newFastSyncMembership(
+	membership := newFastSyncTestMembership(
 		fastSyncMembershipTestRoster(
 			[]PeerID{issuer.id},
 			[]PeerID{permanent},
@@ -367,7 +387,7 @@ func TestParseQUICMessageWithMemberCertificate(t *testing.T) {
 
 func TestHandleQUICQueryAllowsAnswerAboveDefaultMessageLimit(t *testing.T) {
 	store := &quicZeroStatePeerStore{
-		PeerServingStorage: newTestPeerStore(),
+		PeerStorage: newTestPeerStore(),
 		data: make(
 			[]byte,
 			adnlquic.MaxPlumtreePayloadSize+1,
@@ -375,9 +395,9 @@ func TestHandleQUICQueryAllowsAnswerAboveDefaultMessageLimit(t *testing.T) {
 	}
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -556,10 +576,10 @@ func TestNewRejectsInconsistentADNLPrivateKey(t *testing.T) {
 	logger := zerolog.Nop()
 
 	if _, err := New(Options{
-		Logger:             &logger,
-		PrivateKey:         privateKey,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PrivateKey:    privateKey,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	}); err == nil {
 		t.Fatal("New accepted an Ed25519 private key with an inconsistent public half")
 	}
@@ -803,7 +823,7 @@ func TestHandleQUICQueryDoesNotDialWhenOverlayIsInactive(t *testing.T) {
 		node:      node,
 		id:        memberID,
 		publicKey: memberPub,
-		route:     node.peerRoutes.get(memberID),
+		route:     node.peerRoutes.Get(memberID),
 	}
 	node.quicPeersMx.Lock()
 	node.quicPeers[memberID] = inbound
@@ -833,7 +853,7 @@ func TestHandleQUICQueryDoesNotDialWhenOverlayIsInactive(t *testing.T) {
 	if calls := stub.calls.Load(); calls != 0 {
 		t.Fatalf("inbound query made %d DHT lookups, want 0", calls)
 	}
-	if addr := inbound.route.quicAddr(); addr != "" {
+	if addr := inbound.route.QUICAddress(); addr != "" {
 		t.Fatalf("inbound query resolved a dial route = %q, want none", addr)
 	}
 }

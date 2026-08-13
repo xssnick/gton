@@ -8,6 +8,7 @@ import (
 	"time"
 
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 )
 
 const (
@@ -180,7 +181,8 @@ func peerAddressResultTTL(
 	if result.err != nil {
 		if ctx.Err() != nil ||
 			errors.Is(result.err, context.Canceled) ||
-			errors.Is(result.err, context.DeadlineExceeded) {
+			errors.Is(result.err, context.DeadlineExceeded) ||
+			errors.Is(result.err, dht.ErrDHTValueIsNotFound) {
 			return 0
 		}
 		return peerAddressErrorCacheTTL

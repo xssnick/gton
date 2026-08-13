@@ -445,6 +445,9 @@ func (c *serviceCollector) collectP2P(ch chan<- prometheus.Metric, snapshot serv
 func (c *serviceCollector) collectBlockSync(ch chan<- prometheus.Metric, snapshot blocksync.StatusSnapshot) {
 	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueItems, prometheus.GaugeValue, float64(snapshot.OutputQueueItems), "output")
 	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueCapacity, prometheus.GaugeValue, float64(snapshot.OutputQueueCapacity), "output")
+	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueItems, prometheus.GaugeValue, float64(snapshot.InternalQueueItems), "internal")
+	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueCapacity, prometheus.GaugeValue, float64(snapshot.InternalQueueCapacity), "internal")
+	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueDropped, prometheus.CounterValue, float64(snapshot.InternalQueueDropped), "internal")
 	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueItems, prometheus.GaugeValue, float64(snapshot.ShardDescriptionQueueItems), "shard_description")
 	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueCapacity, prometheus.GaugeValue, float64(snapshot.ShardDescriptionQueueCapacity), "shard_description")
 	ch <- prometheus.MustNewConstMetric(c.blocksyncQueueDropped, prometheus.CounterValue, float64(snapshot.ShardDescriptionDropped), "shard_description")

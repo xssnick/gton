@@ -240,7 +240,7 @@ func removePackFile(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove archive package %s: %w", path, err)
 	}
-	if err := syncDir(filepath.Dir(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := storage.SyncDir(filepath.Dir(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("sync archive package dir %s: %w", filepath.Dir(path), err)
 	}
 	return nil

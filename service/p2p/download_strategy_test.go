@@ -889,15 +889,15 @@ func TestDownloadBlockFullUsesLocalCacheBeforeOverlay(t *testing.T) {
 	store := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
 
-	blockCell := testPeerBlockRoot(t, -1, topShard, 100)
+	blockCell := testPeerBlockRoot(t, -1, 100)
 	blockData := blockCell.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	rootHash := blockCell.HashKey()
 	fileHash := sha256.Sum256(blockData)
@@ -928,16 +928,16 @@ func TestDownloadNextBlockFullUsesLiveCacheBeforeOverlay(t *testing.T) {
 	store := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
 	}
 
 	prev := testStoredMasterBlockID(100)
-	nextCell := testPeerBlockRoot(t, -1, topShard, 101)
+	nextCell := testPeerBlockRoot(t, -1, 101)
 	blockData := nextCell.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	rootHash := nextCell.HashKey()
 	fileHash := sha256.Sum256(blockData)
@@ -994,9 +994,9 @@ func TestDownloadBlockProofUsesLiveCacheBeforeOverlay(t *testing.T) {
 	store := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

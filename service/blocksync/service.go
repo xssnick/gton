@@ -18,6 +18,8 @@ import (
 
 const (
 	defaultOutputBuffer           = 256
+	defaultInternalQueueCapacity  = 16
+	maxRetainedInternalQueue      = 1024
 	defaultShardDescriptionBuffer = 1024
 	defaultRetryCount             = 3
 	defaultRetryDelay             = 500 * time.Millisecond
@@ -36,6 +38,7 @@ type SyncedBlock struct {
 	Downloaded      p2p.DownloadedBlock
 	CatchUp         bool
 	Priority        bool
+	Internal        bool
 	DownloadElapsed time.Duration
 	ack             chan bool
 }
@@ -64,15 +67,29 @@ type Service struct {
 	node                  Node
 	out                   chan SyncedBlock
 	shardDescriptions     chan p2p.BroadcastEvent
+	internalDrops         atomic.Uint64
 	shardDescriptionDrops atomic.Uint64
+
+	internalMu     sync.Mutex
+	internalQueue  []p2p.DownloadedBlock
+	internalHead   int
+	internalLen    int
+	internalWake   chan struct{}
+	internalClosed bool
 
 	chainsMu sync.Mutex
 	chains   map[string]*chain
+
+	startOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 type StatusSnapshot struct {
 	OutputQueueItems              int
 	OutputQueueCapacity           int
+	InternalQueueItems            int
+	InternalQueueCapacity         int
+	InternalQueueDropped          uint64
 	ShardDescriptionQueueItems    int
 	ShardDescriptionQueueCapacity int
 	ShardDescriptionDropped       uint64
@@ -99,6 +116,8 @@ func New(logger *zerolog.Logger, node Node) *Service {
 		log:               logutil.WithComponent(logger, "blocksync"),
 		node:              node,
 		out:               make(chan SyncedBlock, defaultOutputBuffer),
+		internalQueue:     make([]p2p.DownloadedBlock, defaultInternalQueueCapacity),
+		internalWake:      make(chan struct{}, 1),
 		shardDescriptions: make(chan p2p.BroadcastEvent, defaultShardDescriptionBuffer),
 		chains:            map[string]*chain{},
 	}
@@ -108,14 +127,47 @@ func (s *Service) Blocks() <-chan SyncedBlock {
 	return s.out
 }
 
+// SubmitBlockLocally queues a locally produced block without waiting for its
+// validation or application. The caller transfers immutable ownership of the
+// block and its backing buffers. This trusted ingress is lossless while the
+// service is running: finalization recovery may be the only remaining source
+// of a block after every validator restarts together.
+func (s *Service) SubmitBlockLocally(block p2p.DownloadedBlock) {
+	s.internalMu.Lock()
+	if s.internalClosed {
+		s.internalMu.Unlock()
+		s.internalDrops.Add(1)
+
+		return
+	}
+	if s.internalLen == len(s.internalQueue) {
+		s.growInternalQueueLocked()
+	}
+	tail := (s.internalHead + s.internalLen) % len(s.internalQueue)
+	s.internalQueue[tail] = block
+	s.internalLen++
+	s.internalMu.Unlock()
+
+	select {
+	case s.internalWake <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Service) ShardDescriptions() <-chan p2p.BroadcastEvent {
 	return s.shardDescriptions
 }
 
 func (s *Service) StatusSnapshot() StatusSnapshot {
+	s.internalMu.Lock()
+	internalItems := s.internalLen
+	s.internalMu.Unlock()
+
 	snapshot := StatusSnapshot{
 		OutputQueueItems:              len(s.out),
 		OutputQueueCapacity:           cap(s.out),
+		InternalQueueItems:            internalItems,
+		InternalQueueDropped:          s.internalDrops.Load(),
 		ShardDescriptionQueueItems:    len(s.shardDescriptions),
 		ShardDescriptionQueueCapacity: cap(s.shardDescriptions),
 		ShardDescriptionDropped:       s.shardDescriptionDrops.Load(),
@@ -136,9 +188,27 @@ func (s *Service) StatusSnapshot() StatusSnapshot {
 	return snapshot
 }
 
+// Start begins the block-stream workflow. The service owns and joins the
+// goroutine so callers do not have to add it to another component's lifecycle.
+func (s *Service) Start(ctx context.Context) {
+	s.startOnce.Do(func() {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.Run(ctx)
+		}()
+	})
+}
+
+// Wait joins the block-stream workflow started by Start. Call it after Start.
+func (s *Service) Wait() {
+	s.wg.Wait()
+}
+
 func (s *Service) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	defer func() {
+		s.closeInternalQueue()
 		s.chainsMu.Lock()
 		for _, chain := range s.chains {
 			chain.close()
@@ -150,9 +220,21 @@ func (s *Service) Run(ctx context.Context) {
 	}()
 
 	for {
+		if block, ok := s.takeInternalBlock(); ok {
+			s.emitAsync(ctx, SyncedBlock{
+				Downloaded: block,
+				Priority:   true,
+				Internal:   true,
+			})
+
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
 			return
+		case <-s.internalWake:
+			continue
 		case ev, ok := <-s.node.Events():
 			if !ok {
 				return
@@ -179,6 +261,51 @@ func (s *Service) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *Service) takeInternalBlock() (p2p.DownloadedBlock, bool) {
+	s.internalMu.Lock()
+	defer s.internalMu.Unlock()
+
+	if s.internalLen == 0 {
+		return p2p.DownloadedBlock{}, false
+	}
+
+	block := s.internalQueue[s.internalHead]
+	s.internalQueue[s.internalHead] = p2p.DownloadedBlock{}
+	s.internalHead = (s.internalHead + 1) % len(s.internalQueue)
+	s.internalLen--
+	if s.internalLen == 0 {
+		s.internalHead = 0
+		if len(s.internalQueue) > maxRetainedInternalQueue {
+			s.internalQueue = make([]p2p.DownloadedBlock, defaultInternalQueueCapacity)
+		}
+	}
+
+	return block, true
+}
+
+func (s *Service) growInternalQueueLocked() {
+	next := make([]p2p.DownloadedBlock, max(defaultInternalQueueCapacity, len(s.internalQueue)*2))
+	if s.internalLen != 0 {
+		first := copy(next, s.internalQueue[s.internalHead:])
+		copy(next[first:], s.internalQueue[:s.internalHead])
+	}
+	s.internalQueue = next
+	s.internalHead = 0
+}
+
+func (s *Service) closeInternalQueue() {
+	s.internalMu.Lock()
+	s.internalClosed = true
+	for s.internalLen != 0 {
+		s.internalQueue[s.internalHead] = p2p.DownloadedBlock{}
+		s.internalHead = (s.internalHead + 1) % len(s.internalQueue)
+		s.internalLen--
+	}
+	s.internalQueue = nil
+	s.internalHead = 0
+	s.internalMu.Unlock()
 }
 
 func (s *Service) emitDirectMasterchainBroadcast(ctx context.Context, ev p2p.BroadcastEvent) bool {

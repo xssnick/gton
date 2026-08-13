@@ -11,7 +11,7 @@ import (
 // archive GC and state serialization behind the incident, and logged it as a
 // completed sync_until.
 func TestSyncUntilFrozenIgnoresUnrelatedOffline(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:       zerolog.Nop(),
 		node:      newServiceTestNode(t),
 		syncUntil: 200,
@@ -25,11 +25,11 @@ func TestSyncUntilFrozenIgnoresUnrelatedOffline(t *testing.T) {
 }
 
 func TestSyncUntilFrozenAfterDeliberateStop(t *testing.T) {
-	svc := &Service{
-		log:             zerolog.Nop(),
-		node:            newServiceTestNode(t),
-		syncUntil:       200,
-		maintenanceWake: make(chan struct{}, 1),
+	svc := &SyncCoordinator{
+		log:         zerolog.Nop(),
+		node:        newServiceTestNode(t),
+		syncUntil:   200,
+		maintenance: &MaintenanceRunner{maintenanceWake: make(chan struct{}, 1)},
 	}
 
 	svc.enterSyncUntilOffline(nil, PreparedBlock{})
@@ -44,7 +44,7 @@ func TestSyncUntilFrozenAfterDeliberateStop(t *testing.T) {
 
 // Without ton.sync_until configured nothing ever freezes, whatever the node does.
 func TestSyncUntilFrozenRequiresConfiguredLimit(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:  zerolog.Nop(),
 		node: newServiceTestNode(t),
 	}

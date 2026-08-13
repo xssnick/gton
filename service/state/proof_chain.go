@@ -56,6 +56,7 @@ func (s *Syncer) persistentMasterchainBlock(ctx context.Context) (ton.BlockIDExt
 }
 
 func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trusted trustedKeyBlock) (ton.BlockIDExt, error) {
+	anchor := trusted
 	s.log.Info().
 		Str("from", storage.FormatBlockRef(trusted.block)).
 		Msg("verifying key block chain for persistent state selection")
@@ -68,6 +69,15 @@ func (s *Syncer) persistentMasterchainBlockFromTrusted(ctx context.Context, trus
 	block, err := choosePersistentKeyBlock(candidates, time.Now(), s.syncBefore, s.syncUntil)
 	if err == nil {
 		return block, nil
+	}
+	if errors.Is(err, errNoPersistentKeyBlockCandidate) &&
+		(s.syncUntil == 0 || anchor.utime <= s.syncUntil) {
+		s.log.Info().
+			Str("block", storage.FormatBlockRef(anchor.block)).
+			Uint32("utime", anchor.utime).
+			Msg("no eligible persistent state, using trusted init state")
+
+		return anchor.block, nil
 	}
 
 	return ton.BlockIDExt{}, fmt.Errorf(

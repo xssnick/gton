@@ -125,7 +125,7 @@ func (s *Sender) SendForHash(ctx context.Context, body []byte) (*cell.Cell, erro
 		return nil, err
 	}
 	if attempt.duplicate {
-		root, _, err := ParseMessage(body)
+		root, _, err := extmsg.ParseMessage(body)
 		if err != nil {
 			return nil, senderStageError{stage: ErrParseFailed, err: err}
 		}
@@ -159,13 +159,13 @@ func (s *Sender) send(ctx context.Context, body []byte, attempt sendAttempt) (*c
 		}
 	}
 
-	root, msg, err := ParseMessage(body)
+	root, msg, err := extmsg.ParseMessage(body)
 	if err != nil {
 		dropCached()
 		return nil, senderStageError{stage: ErrParseFailed, err: err}
 	}
 
-	addrKey := AddressKey(msg.DstAddr)
+	addrKey := extmsg.AddressKeyFor(msg.DstAddr)
 	if err = externalMessageAddressLimitError(addrKey, s.limiter.Check(addrKey, s.now())); err != nil {
 		dropCached()
 		return nil, err
@@ -192,12 +192,6 @@ func (s *Sender) send(ctx context.Context, body []byte, attempt sendAttempt) (*c
 	}
 
 	return check.Root, nil
-}
-
-func AddressKey(addr *address.Address) extmsg.AddressKey {
-	key := extmsg.AddressKey{Workchain: addr.Workchain()}
-	copy(key.Account[:], addr.Data())
-	return key
 }
 
 func externalMessageAddressLimitError(key extmsg.AddressKey, err error) error {

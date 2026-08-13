@@ -139,7 +139,7 @@ func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlay
 	pooled := &pooledPeer{
 		id:              id,
 		addr:            label,
-		route:           newPeerRoute(""),
+		route:           newTestPeerRoute(""),
 		adnl:            adnlWrapper,
 		baseRLDP:        baseRLDP,
 		rldp:            rldpWrapper,

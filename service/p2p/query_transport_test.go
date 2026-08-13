@@ -356,7 +356,7 @@ func TestQUICQueryTransportDoesNotFallbackWithoutRoute(t *testing.T) {
 	peer := &overlayPeer{
 		node:      newTestNode(t),
 		pub:       peerPublicKey,
-		route:     newPeerRoute(""),
+		route:     newTestPeerRoute(""),
 		overlayID: []byte{1},
 	}
 	transport := quicPeerQueryTransport{
@@ -382,7 +382,7 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 	node.subscriptions["beta"] = second
 	node.subscriptions["alpha"] = first
 
-	selected, err := node.querySubscriptionForBlock(ton.BlockIDExt{})
+	selected, err := node.querySubscriptionForBlock(ton.BlockIDExt{Workchain: 0, Shard: topShard})
 	if err != nil {
 		t.Fatalf("select custom query overlay: %v", err)
 	}
@@ -413,7 +413,7 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 		t.Fatalf("query cooldown = %s, want %s", delay, customQueryFailureCooldown)
 	}
 
-	selected, err = node.querySubscriptionForBlock(ton.BlockIDExt{})
+	selected, err = node.querySubscriptionForBlock(ton.BlockIDExt{Workchain: 0, Shard: topShard})
 	if err != nil {
 		t.Fatalf("select second custom query overlay: %v", err)
 	}

@@ -243,7 +243,7 @@ func prepareImportedBlock(id ton.BlockIDExt, data []byte) (PreparedBlock, error)
 		return PreparedBlock{}, fmt.Errorf("load block state update target: %w", err)
 	}
 	stateRoot := updateTo.Virtualize(0)
-	stateRootHash := stateRoot.HashKey(0)
+	stateRootHash := stateRoot.HashKeyAt(0)
 
 	started := time.Now()
 	cells, err := storage.PrepareStateUpdateCells(block.StateUpdate)

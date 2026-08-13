@@ -378,7 +378,7 @@ func TestDeletePersistentStateFileRetriesAfterDurableUnlink(t *testing.T) {
 	if err = syncFile(path); err != nil {
 		t.Fatalf("sync persistent state file: %v", err)
 	}
-	if err = syncDir(filepath.Dir(path)); err != nil {
+	if err = storage.SyncDir(filepath.Dir(path)); err != nil {
 		t.Fatalf("sync persistent state dir: %v", err)
 	}
 	if err = store.SavePersistentStateFile(&storage.PersistentStateFile{
@@ -397,7 +397,7 @@ func TestDeletePersistentStateFileRetriesAfterDurableUnlink(t *testing.T) {
 	if err = os.Remove(path); err != nil {
 		t.Fatalf("simulate durable persistent state unlink: %v", err)
 	}
-	if err = syncDir(filepath.Dir(path)); err != nil {
+	if err = storage.SyncDir(filepath.Dir(path)); err != nil {
 		t.Fatalf("sync simulated persistent state unlink: %v", err)
 	}
 
@@ -432,7 +432,7 @@ func TestSyncFileAndDirectory(t *testing.T) {
 	if err := syncFile(path); err != nil {
 		t.Fatalf("sync file: %v", err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := storage.SyncDir(dir); err != nil {
 		t.Fatalf("sync directory: %v", err)
 	}
 }

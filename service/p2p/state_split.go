@@ -3,7 +3,8 @@ package p2p
 import (
 	"fmt"
 
-	tnstate "github.com/xssnick/gton/service/state"
+	"github.com/xssnick/gton/internal/shardstate"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -40,12 +41,15 @@ func splitStateParts(block ton.BlockIDExt, proof *cell.Cell, splitDepth uint32, 
 		return nil, nil, fmt.Errorf("split state header has no accounts dict")
 	}
 
-	shardPrefixLen := tnstate.ShardPrefixLength(block.Shard)
-	if splitDepth <= uint32(shardPrefixLen) || splitDepth > 63 {
+	shardPrefixLen, err := sharddomain.PrefixLength(block.Shard)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid block shard %016x: %w", uint64(block.Shard), err)
+	}
+	if splitDepth <= shardPrefixLen || splitDepth > sharddomain.MaxPrefixLength {
 		return nil, nil, fmt.Errorf("invalid split depth %d for shard prefix length %d", splitDepth, shardPrefixLen)
 	}
 
-	partsCount := 1 << (splitDepth - uint32(shardPrefixLen))
+	partsCount := 1 << (splitDepth - shardPrefixLen)
 	effectiveShard := uint64(block.Shard) ^ (uint64(1) << (63 - shardPrefixLen)) ^ (uint64(1) << (63 - splitDepth))
 	increment := uint64(1) << (64 - splitDepth)
 
@@ -58,7 +62,7 @@ func splitStateParts(block ton.BlockIDExt, proof *cell.Cell, splitDepth uint32, 
 			return nil, nil, fmt.Errorf("cut accounts prefix %016x: %w", effectiveShard, err)
 		}
 		if partRoot != nil {
-			wrappedPartRoot, err := tnstate.WrapShardAccountsRoot(partRoot)
+			wrappedPartRoot, err := shardstate.WrapAccountsRoot(partRoot)
 			if err != nil {
 				return nil, nil, fmt.Errorf("build split state part root %016x: %w", effectiveShard, err)
 			}
@@ -93,7 +97,7 @@ func validateSplitStateHeader(block ton.BlockIDExt, state *tlb.ShardStateUnsplit
 }
 
 func validateSplitStateHeaderPruning(header *tlb.ShardStateUnsplit) error {
-	emptyAccounts, err := tnstate.NewShardAccountsAugDict()
+	emptyAccounts, err := shardstate.NewAccounts()
 	if err != nil {
 		return err
 	}

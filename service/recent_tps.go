@@ -114,9 +114,9 @@ type recentTPSTracker struct {
 	invalidations atomic.Uint64
 }
 
-func newRecentTPSTracker(window time.Duration) *recentTPSTracker {
+func newRecentTPSTracker() *recentTPSTracker {
 	tracker := &recentTPSTracker{
-		window: window,
+		window: recentTPSWindow,
 		blocks: make(chan recentTPSBlock, recentTPSQueueCapacity),
 	}
 	tracker.storeIncomplete()

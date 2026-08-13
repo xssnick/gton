@@ -84,13 +84,13 @@ func (g *archiveDownloadBackpressureGate) wait(ctx context.Context) error {
 	}
 }
 
-func (r *archiveCatchUpRunner) pauseArchiveDownloadsForCheckpointBackpressure() func() {
+func (r *archiveCatchUpRun) pauseArchiveDownloadsForCheckpointBackpressure() func() {
 	r.downloadGate.pause()
 	return r.downloadGate.resume
 }
 
-func (s *Service) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Duration) uint32 {
-	base := s.archiveCatchUpCheckpointBlocks
+func (a *ArchiveRunner) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Duration) uint32 {
+	base := a.checkpointBlocks
 	maxBlocks := uint32(archiveCatchUpMaxAdaptiveCheckpointBlocks)
 	if maxBlocks < base {
 		maxBlocks = base
@@ -111,10 +111,10 @@ func (s *Service) adaptArchiveCheckpointBlocks(current uint32, elapsed time.Dura
 	return next
 }
 
-func (r *archiveCatchUpRunner) archiveProgressGoalAt(now time.Time) archiveProgressGoal {
-	blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain)
+func (r *archiveCatchUpRun) archiveProgressGoalAt(now time.Time) archiveProgressGoal {
+	blockUTime := blockStateUtime(r.ctx, r.archive.storage, &r.current.Masterchain)
 
-	goal := archiveSyncUntilProgressGoal(r.service.syncUntil, blockUTime, now.Unix())
+	goal := archiveSyncUntilProgressGoal(r.archive.syncUntil, blockUTime, now.Unix())
 	if goal.kind != archiveProgressGoalNone {
 		return goal
 	}
@@ -152,7 +152,7 @@ func archiveSyncUntilProgressGoal(syncUntil uint32, blockUTime int64, nowUnix in
 	return goal
 }
 
-func (r *archiveCatchUpRunner) shouldWaitArchiveCheckpointBackpressure() bool {
+func (r *archiveCatchUpRun) shouldWaitArchiveCheckpointBackpressure() bool {
 	if r.checkpointDone == nil {
 		return false
 	}
@@ -164,16 +164,16 @@ func (r *archiveCatchUpRunner) shouldWaitArchiveCheckpointBackpressure() bool {
 	return r.pendingArchiveCheckpointBytes() >= r.archiveCheckpointBackpressureBytes()
 }
 
-func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBlocks() uint32 {
+func (r *archiveCatchUpRun) archiveCheckpointBackpressureBlocks() uint32 {
 	target := r.checkpointBlocksTarget
-	return checkpointBackpressureBlocks(target, r.service.syncBackpressureWindows)
+	return checkpointBackpressureBlocks(target, r.archive.syncBackpressure)
 }
 
-func (r *archiveCatchUpRunner) archiveCheckpointBackpressureBytes() uint64 {
-	return checkpointBackpressureBytes(r.service.checkpointBytes, r.service.syncBackpressureWindows)
+func (r *archiveCatchUpRun) archiveCheckpointBackpressureBytes() uint64 {
+	return checkpointBackpressureBytes(r.archive.state.checkpointTargetBytes(), r.archive.syncBackpressure)
 }
 
-func (r *archiveCatchUpRunner) pendingArchiveCheckpointBytes() uint64 {
+func (r *archiveCatchUpRun) pendingArchiveCheckpointBytes() uint64 {
 	total := r.stateCells.byteSize()
 	artifactBytes := r.checkpointStates.byteSize()
 	if total > ^uint64(0)-artifactBytes {
@@ -182,7 +182,7 @@ func (r *archiveCatchUpRunner) pendingArchiveCheckpointBytes() uint64 {
 	return total + artifactBytes
 }
 
-func (r *archiveCatchUpRunner) persistCheckpoint(reason string) (uint32, error) {
+func (r *archiveCatchUpRun) persistCheckpoint(reason string) (uint32, error) {
 	var checkpointBlocks uint32
 	for {
 		completedBlocks, err := r.finishCheckpoint(true)
@@ -199,40 +199,45 @@ func (r *archiveCatchUpRunner) persistCheckpoint(reason string) (uint32, error) 
 	}
 }
 
-func (r *archiveCatchUpRunner) startCheckpoint(reason string) error {
+func (r *archiveCatchUpRun) startCheckpoint(reason string) error {
 	if r.checkpointDone != nil || r.current.ShardClientSeqno <= r.lastCheckpointSeqno {
 		return nil
 	}
-	if err := r.service.checkCurrentStatePersistAllowed(); err != nil {
-		return err
-	}
 	lockStarted := time.Now()
-	r.service.currentStatePersistMu.Lock()
-	lockElapsed := time.Since(lockStarted)
-	if err := r.service.checkCurrentStatePersistAllowed(); err != nil {
-		r.service.currentStatePersistMu.Unlock()
+	if err := r.archive.state.beginCurrentStatePersist(); err != nil {
 		return err
 	}
+	lockElapsed := time.Since(lockStarted)
 
 	current := storage.CloneCurrentState(r.current)
 	checkpointStates := r.checkpointStates.checkpoint()
 	checkpointCells := r.stateCells.beginCheckpoint()
 	releaseCheckpointCells := func() {}
-	if loader := checkpointCells.retainedLoader(r.service.stateCellLoader()); loader != nil {
-		releaseCheckpointCells = r.service.retainStateCellLoader(loader)
+	if loader := checkpointCells.retainedLoader(r.archive.state.stateCellLoader()); loader != nil {
+		releaseCheckpointCells = r.archive.state.retainStateCellLoader(loader)
 	}
 	checkpointBlocks := r.current.ShardClientSeqno - r.lastCheckpointSeqno
 	done := make(chan archiveCheckpointResult, 1)
+	joined := make(chan struct{})
 	r.checkpointDone = done
+	r.checkpointJoined = joined
 
-	r.service.log.Debug().
+	r.archive.log.Debug().
 		Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
 		Uint32("shard_client_seqno", current.ShardClientSeqno).
 		Uint32("checkpoint_blocks", checkpointBlocks).
 		Str("reason", reason).
 		Msg("archive shard-client checkpoint scheduled")
 
-	r.service.runAsync(func() {
+	go func() {
+		defer close(joined)
+		persistLocked := true
+		defer func() {
+			if persistLocked {
+				r.archive.state.finishCurrentStatePersist()
+			}
+		}()
+
 		var releaseOnce sync.Once
 		release := func() {
 			releaseOnce.Do(releaseCheckpointCells)
@@ -241,10 +246,13 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) error {
 
 		startedCheckpoint := time.Now()
 		persisted, err := r.persistArchiveCurrentState(current, checkpointBlocks, lockElapsed, checkpointStates.entries, checkpointCells)
-		r.service.currentStatePersistMu.Unlock()
 		if err != nil {
-			r.service.setCurrentStatePersistError(err)
-			r.service.log.Error().
+			r.archive.state.setCurrentStatePersistError(err)
+		}
+		r.archive.state.finishCurrentStatePersist()
+		persistLocked = false
+		if err != nil {
+			r.archive.log.Error().
 				Err(err).
 				Str("masterchain", storage.FormatBlockRef(current.Masterchain.Block)).
 				Uint32("shard_client_seqno", current.ShardClientSeqno).
@@ -253,8 +261,7 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) error {
 				Msg("archive shard-client checkpoint failed")
 		}
 		if persisted != nil {
-			r.service.publishLiveCurrentBlockMarkers(persisted)
-			r.service.publishCommittedCurrentState(persisted)
+			r.archive.checkpointTransitions.archiveCheckpointCommitted(persisted, checkpointStates.entries)
 		}
 		release()
 		done <- archiveCheckpointResult{
@@ -265,11 +272,11 @@ func (r *archiveCatchUpRunner) startCheckpoint(reason string) error {
 			reason:           reason,
 			err:              err,
 		}
-	})
+	}()
 	return nil
 }
 
-func (r *archiveCatchUpRunner) finishCheckpoint(wait bool) (uint32, error) {
+func (r *archiveCatchUpRun) finishCheckpoint(wait bool) (uint32, error) {
 	if r.checkpointDone == nil {
 		return 0, nil
 	}
@@ -287,8 +294,6 @@ func (r *archiveCatchUpRunner) finishCheckpoint(wait bool) (uint32, error) {
 				goto checkpointDone
 			case <-ticker.C:
 				r.logCheckpointWait(waitStarted)
-			case <-r.ctx.Done():
-				return 0, r.ctx.Err()
 			}
 		}
 	} else {
@@ -299,7 +304,11 @@ func (r *archiveCatchUpRunner) finishCheckpoint(wait bool) (uint32, error) {
 		}
 	}
 checkpointDone:
+	if r.checkpointJoined != nil {
+		<-r.checkpointJoined
+	}
 	r.checkpointDone = nil
+	r.checkpointJoined = nil
 	if result.err != nil {
 		return result.checkpointBlocks, result.err
 	}
@@ -314,9 +323,9 @@ checkpointDone:
 	}
 
 	previousTarget := r.checkpointBlocksTarget
-	r.checkpointBlocksTarget = r.service.adaptArchiveCheckpointBlocks(r.checkpointBlocksTarget, result.elapsed)
+	r.checkpointBlocksTarget = r.archive.adaptArchiveCheckpointBlocks(r.checkpointBlocksTarget, result.elapsed)
 	if r.checkpointBlocksTarget != previousTarget {
-		r.service.log.Debug().
+		r.archive.log.Debug().
 			Uint32("previous_checkpoint_blocks", previousTarget).
 			Uint32("checkpoint_blocks", r.checkpointBlocksTarget).
 			Dur("checkpoint_elapsed", result.elapsed).
@@ -333,9 +342,9 @@ checkpointDone:
 	r.recordArchiveCheckpointProgress(result.checkpointBlocks, result.elapsed)
 
 	waitElapsed := time.Since(waitStarted)
-	event := r.service.log.Debug()
+	event := r.archive.log.Debug()
 	if wait && waitElapsed >= time.Second {
-		event = r.service.log.Info()
+		event = r.archive.log.Info()
 	}
 	event.
 		Str("masterchain", storage.FormatBlockRef(result.persisted.Masterchain.Block)).
@@ -349,22 +358,22 @@ checkpointDone:
 	return result.checkpointBlocks, nil
 }
 
-func (r *archiveCatchUpRunner) logCheckpointWait(started time.Time) {
-	r.service.log.Info().
+func (r *archiveCatchUpRun) logCheckpointWait(started time.Time) {
+	r.archive.log.Info().
 		Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 		Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 		Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
 		Uint32("pending_checkpoint_blocks", r.current.ShardClientSeqno-r.lastCheckpointSeqno).
 		Uint64("pending_checkpoint_bytes", r.pendingArchiveCheckpointBytes()).
 		Uint32("checkpoint_target_blocks", r.checkpointBlocksTarget).
-		Uint64("checkpoint_target_bytes", r.service.checkpointBytes).
+		Uint64("checkpoint_target_bytes", r.archive.state.checkpointTargetBytes()).
 		Uint32("checkpoint_backpressure_blocks", r.archiveCheckpointBackpressureBlocks()).
 		Uint64("checkpoint_backpressure_bytes", r.archiveCheckpointBackpressureBytes()).
 		Dur("wait_elapsed", time.Since(started)).
 		Msg("waiting for archive shard-client checkpoint")
 }
 
-func (r *archiveCatchUpRunner) persistProgressBeforeRetry(err error) error {
+func (r *archiveCatchUpRun) persistProgressBeforeRetry(err error) error {
 	if err == nil || r.current.ShardClientSeqno <= r.lastCheckpointSeqno || errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -374,33 +383,33 @@ func (r *archiveCatchUpRunner) persistProgressBeforeRetry(err error) error {
 		return fmt.Errorf("persist archive retry checkpoint: %w", persistErr)
 	}
 
-	r.service.log.Info().
+	r.archive.log.Info().
 		Err(err).
 		Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
 		Uint32("shard_client_seqno", r.current.ShardClientSeqno).
 		Uint32("checkpoint_blocks", checkpointBlocks).
 		Msg("persisted archive shard-client progress before retry")
 
-	r.checkpointBlocksTarget = r.service.archiveCatchUpCheckpointBlocks
+	r.checkpointBlocksTarget = r.archive.checkpointBlocks
 	r.importCache.dropBefore(r.current.ShardClientSeqno + 1)
 	return nil
 }
 
-func (r *archiveCatchUpRunner) returnWithProgress(err error) error {
+func (r *archiveCatchUpRun) returnWithProgress(err error) error {
 	if persistErr := r.persistProgressBeforeRetry(err); persistErr != nil {
 		return errors.Join(err, persistErr)
 	}
 	return err
 }
 
-func (r *archiveCatchUpRunner) restartPipeline(err error) error {
+func (r *archiveCatchUpRun) restartPipeline(err error) error {
 	if persistErr := r.persistProgressBeforeRetry(err); persistErr != nil {
 		return errors.Join(err, persistErr)
 	}
 
-	r.pipeline.cancel()
+	r.pipeline.stop()
 	entries, hits := r.importCache.stats()
-	r.service.log.Debug().
+	r.archive.log.Debug().
 		Err(err).
 		Uint32("current_seqno", r.current.ShardClientSeqno).
 		Int("preloaded_archives", entries).

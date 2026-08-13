@@ -10,6 +10,7 @@ import (
 
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/liveview"
+	"github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -128,7 +129,7 @@ func (s *Server) handleNonfinalPendingShardBlocks(query ton.NonfinalGetPendingSh
 
 	var filter *storage.ShardKey
 	if query.Mode&1 != 0 {
-		if blockproof.ShardPrefixLen(uint64(query.Shard)) < 0 {
+		if err := shard.Validate(query.Shard); err != nil {
 			return ton.LSError{Code: errCodeProtoViolation, Text: "requested shard is invalid"}
 		}
 		filter = &storage.ShardKey{Workchain: query.WC, Shard: query.Shard}

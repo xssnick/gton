@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p/internal/peerroute"
+	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
@@ -17,7 +20,10 @@ var errQUICRouteMissing = errors.New("quic peer route is missing")
 var errAuthenticatedQUICPeerNotFound = errors.New("authenticated quic peer is not connected")
 var errQUICDialDeferred = errors.New("QUIC dial retry is deferred")
 
-const quicAddressCacheMaxAge = 30 * time.Second
+const (
+	quicAddressCacheMaxAge      = 30 * time.Second
+	quicPeerDiscoveryRetryDelay = 100 * time.Millisecond
+)
 
 // errQUICPeerOffline reports that a broadcast could not be sent because the peer
 // has no live outbound QUIC connection. Callers treat it as a dropped part, not
@@ -107,22 +113,22 @@ func (p quicRouteBroadcastPeer) SendCustomMessage(ctx context.Context, req tl.Se
 // live peer through the gateway.
 func (p *overlayPeer) requestBackgroundQUICDial() {
 	route := p.route
-	if !route.quicDialPermitted(time.Now()) {
+	if !route.QUICDialPermitted(time.Now()) {
 		return
 	}
-	if !route.quicDialSpawned.CompareAndSwap(false, true) {
+	if !route.ClaimBackgroundQUICDial() {
 		return
 	}
 	node := p.node
 	path := p.quicPath()
 	spawned := node.runAsync(func() {
-		defer route.quicDialSpawned.Store(false)
+		defer route.ReleaseBackgroundQUICDial()
 		ctx, cancel := context.WithTimeout(node.runCtx, quicRelayDialTimeout)
 		defer cancel()
 		_, _ = path.dialGated(ctx)
 	})
 	if !spawned {
-		route.quicDialSpawned.Store(false)
+		route.ReleaseBackgroundQUICDial()
 	}
 }
 
@@ -153,22 +159,40 @@ func resolveQUICRoute(
 	node *Node,
 	id PeerID,
 	publicKey ed25519.PublicKey,
-	route *peerRoute,
+	route *peerroute.Route,
 ) (string, error) {
-	if addr := route.quicAddr(); addr != "" && !route.quicAddrStale() {
+	if addr := route.QUICAddress(); addr != "" && !route.QUICAddressStale() {
 		return addr, nil
 	}
 	if node.dht == nil {
 		return "", errQUICRouteMissing
 	}
 
-	addresses, resolvedPublicKey, err := node.resolvePeerAddressesFresh(
-		ctx,
-		id,
-		quicAddressCacheMaxAge,
+	var (
+		addresses         *adnladdr.List
+		resolvedPublicKey ed25519.PublicKey
+		err               error
 	)
-	if err != nil {
-		return "", fmt.Errorf("resolve QUIC peer: %w", err)
+	for {
+		addresses, resolvedPublicKey, err = node.resolvePeerAddressesFresh(
+			ctx,
+			id,
+			quicAddressCacheMaxAge,
+		)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, dht.ErrDHTValueIsNotFound) {
+			return "", fmt.Errorf("resolve QUIC peer: %w", err)
+		}
+
+		timer := time.NewTimer(quicPeerDiscoveryRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", fmt.Errorf("resolve QUIC peer: %w", ctx.Err())
+		case <-timer.C:
+		}
 	}
 	if !bytes.Equal(resolvedPublicKey, publicKey) {
 		return "", errors.New("QUIC peer public key changed in DHT")
@@ -177,7 +201,7 @@ func resolveQUICRoute(
 	if err != nil {
 		return "", err
 	}
-	route.refreshQUICAddr(addr)
+	route.RefreshQUICAddress(addr)
 	return addr, nil
 }
 
@@ -188,7 +212,7 @@ type quicPeerPath struct {
 	node      *Node
 	id        PeerID
 	publicKey ed25519.PublicKey
-	route     *peerRoute
+	route     *peerroute.Route
 }
 
 func (s *overlaySubscription) quicPeerPath(id PeerID) (quicPeerPath, error) {
@@ -214,7 +238,7 @@ func (p quicPeerPath) dialGated(ctx context.Context) (*adnlquic.Peer, error) {
 		p.id[:],
 		p.publicKey,
 		func(ctx context.Context) (string, error) {
-			if !p.route.beginQUICDial(time.Now()) {
+			if !p.route.BeginQUICDial(time.Now()) {
 				return "", errQUICDialDeferred
 			}
 			claimed = true
@@ -234,7 +258,7 @@ func (p quicPeerPath) dialGated(ctx context.Context) (*adnlquic.Peer, error) {
 		},
 	)
 	if err == nil {
-		p.route.succeedQUICDial(claimed)
+		p.route.SucceedQUICDial(claimed)
 		// Queries, two-step broadcasts, Plumtree fanout, repairs and background
 		// relay dials all meet here, so the idle sweep can account for every
 		// outbound path consistently.
@@ -246,17 +270,17 @@ func (p quicPeerPath) dialGated(ctx context.Context) (*adnlquic.Peer, error) {
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		if claimed {
-			p.route.finishQUICDial()
+			p.route.FinishQUICDial()
 		}
 		return nil, fmt.Errorf("dial QUIC peer: %w", err)
 	}
 	if endpointChosen {
-		p.route.markQUICAddrStale()
+		p.route.MarkQUICAddressStale()
 	}
 	if claimed {
-		p.route.failQUICDial(time.Now())
+		p.route.FailQUICDial(time.Now())
 	} else {
-		p.route.deferQUICDial(time.Now())
+		p.route.DeferQUICDial(time.Now())
 	}
 	return nil, fmt.Errorf("dial QUIC peer: %w", err)
 }

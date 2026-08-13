@@ -34,11 +34,11 @@ const (
 )
 
 type exclusiveServiceTaskLease struct {
-	service *Service
-	task    exclusiveServiceTask
+	maintenance *MaintenanceRunner
+	task        exclusiveServiceTask
 }
 
-func (s *Service) beginExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask) (*exclusiveServiceTaskLease, error) {
+func (s *MaintenanceRunner) beginExclusiveServiceTask(ctx context.Context, task exclusiveServiceTask) (*exclusiveServiceTaskLease, error) {
 	s.exclusiveTaskMu.Lock()
 	if err := s.canStartExclusiveServiceTaskLocked(task); err != nil {
 		s.exclusiveTaskMu.Unlock()
@@ -56,10 +56,10 @@ func (s *Service) beginExclusiveServiceTask(ctx context.Context, task exclusiveS
 		return nil, err
 	}
 	s.exclusiveTask = task
-	return &exclusiveServiceTaskLease{service: s, task: task}, nil
+	return &exclusiveServiceTaskLease{maintenance: s, task: task}, nil
 }
 
-func (s *Service) canStartExclusiveServiceTaskLimits(ctx context.Context, task exclusiveServiceTask) error {
+func (s *MaintenanceRunner) canStartExclusiveServiceTaskLimits(ctx context.Context, task exclusiveServiceTask) error {
 	if exclusiveServiceTaskIsCleanup(task) {
 		return nil
 	}
@@ -73,7 +73,7 @@ func exclusiveServiceTaskIsCleanup(task exclusiveServiceTask) bool {
 	return task == exclusiveServiceTaskPersistentStateGC || task == exclusiveServiceTaskArchiveTTLGC
 }
 
-func (s *Service) canStartExclusiveServiceTaskReadAmp(ctx context.Context) error {
+func (s *MaintenanceRunner) canStartExclusiveServiceTaskReadAmp(ctx context.Context) error {
 	readAmp, err := s.storage.MaxReadAmp(ctx)
 	if err != nil {
 		return fmt.Errorf("check db read amplification: %w", err)
@@ -84,7 +84,7 @@ func (s *Service) canStartExclusiveServiceTaskReadAmp(ctx context.Context) error
 	return nil
 }
 
-func (s *Service) canStartExclusiveServiceTaskLag(ctx context.Context, now time.Time) error {
+func (s *MaintenanceRunner) canStartExclusiveServiceTaskLag(ctx context.Context, now time.Time) error {
 	lag, err := s.exclusiveServiceTaskMaxLag(ctx, now)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil
@@ -98,19 +98,13 @@ func (s *Service) canStartExclusiveServiceTaskLag(ctx context.Context, now time.
 	return nil
 }
 
-func (s *Service) exclusiveServiceTaskMaxLag(ctx context.Context, now time.Time) (time.Duration, error) {
-	s.currentStatusMu.RLock()
-	current := storage.CloneCurrentState(s.currentStatus)
-	s.currentStatusMu.RUnlock()
-	if current == nil {
-		var err error
-		current, err = s.storage.CurrentState(ctx)
-		if errors.Is(err, storage.ErrNotFound) {
-			return 0, storage.ErrNotFound
-		}
-		if err != nil {
-			return 0, fmt.Errorf("load current state for sync lag check: %w", err)
-		}
+func (s *MaintenanceRunner) exclusiveServiceTaskMaxLag(ctx context.Context, now time.Time) (time.Duration, error) {
+	current, err := s.status.currentStateSnapshot(ctx)
+	if errors.Is(err, storage.ErrNotFound) {
+		return 0, storage.ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("load current state for sync lag check: %w", err)
 	}
 
 	var maxLag time.Duration
@@ -144,7 +138,7 @@ func (s *Service) exclusiveServiceTaskMaxLag(ctx context.Context, now time.Time)
 	return maxLag, nil
 }
 
-func exclusiveServiceTaskBlockLag(ctx context.Context, store storage.Storage, state *storage.BlockState, now time.Time) (time.Duration, error) {
+func exclusiveServiceTaskBlockLag(ctx context.Context, store blockMetaStore, state *storage.BlockState, now time.Time) (time.Duration, error) {
 	if state.Parsed != nil && state.Parsed.GenUTime != 0 {
 		return time.Duration(now.Unix()-int64(state.Parsed.GenUTime)) * time.Second, nil
 	}
@@ -162,7 +156,7 @@ func exclusiveServiceTaskBlockLag(ctx context.Context, store storage.Storage, st
 	return time.Duration(now.Unix()-int64(meta.GenUTime)) * time.Second, nil
 }
 
-func (s *Service) canStartExclusiveServiceTaskLocked(task exclusiveServiceTask) error {
+func (s *MaintenanceRunner) canStartExclusiveServiceTaskLocked(task exclusiveServiceTask) error {
 	if task == exclusiveServiceTaskNone {
 		return fmt.Errorf("exclusive service task is empty")
 	}
@@ -172,7 +166,8 @@ func (s *Service) canStartExclusiveServiceTaskLocked(task exclusiveServiceTask) 
 	return exclusiveServiceTaskError(s.exclusiveTask)
 }
 
-func (s *Service) backgroundTaskStatus() string {
+// BackgroundTaskStatus reports the current exclusive maintenance task.
+func (s *MaintenanceRunner) BackgroundTaskStatus() string {
 	s.exclusiveTaskMu.Lock()
 	task := s.exclusiveTask
 	s.exclusiveTaskMu.Unlock()
@@ -197,11 +192,11 @@ func (t exclusiveServiceTask) backgroundStatus() string {
 }
 
 func (l *exclusiveServiceTaskLease) release() {
-	l.service.exclusiveTaskMu.Lock()
-	if l.service.exclusiveTask == l.task {
-		l.service.exclusiveTask = exclusiveServiceTaskNone
+	l.maintenance.exclusiveTaskMu.Lock()
+	if l.maintenance.exclusiveTask == l.task {
+		l.maintenance.exclusiveTask = exclusiveServiceTaskNone
 	}
-	l.service.exclusiveTaskMu.Unlock()
+	l.maintenance.exclusiveTaskMu.Unlock()
 }
 
 func exclusiveServiceTaskError(task exclusiveServiceTask) error {

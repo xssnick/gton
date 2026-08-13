@@ -7,19 +7,6 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-type Storage interface {
-	PeerServingStorage
-	PeerServingStorageWriter
-	PersistentStateFileStorage
-	StateStorage
-	BlockMetaStorage
-	CellStorage
-	MaintenanceStorage
-	PersistentStateSerializationStorage
-	CellGenerationStorage
-	Close() error
-}
-
 type MaintenanceStorage interface {
 	MaxReadAmp(ctx context.Context) (int64, error)
 	ThrottleCellCompactions() func()
@@ -30,14 +17,6 @@ type MaintenanceStorage interface {
 
 type PersistentStateSerializationStorage interface {
 	DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error
-	SaveCellsInGeneration(ctx context.Context, generation uint64, records []*CellRecord) error
-	CellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*CellRecord, error)
-	LargeBOCLoadMeta(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error)
-	LargeBOCLoadPayload(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error)
-	LargeBOCLoadCells(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error)
-	LargeBOCLoadMetaInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error)
-	LargeBOCLoadPayloadInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error)
-	LargeBOCLoadCellsInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error)
 	PersistentStateSerializerState(ctx context.Context) (*PersistentStateSerializerState, error)
 	SavePersistentStateSerializerState(ctx context.Context, state *PersistentStateSerializerState) error
 	ActivePersistentStateSerialization(ctx context.Context) (*PersistentStateSerializerActive, error)
@@ -57,12 +36,25 @@ type CellGenerationStorage interface {
 	DropPendingCellGeneration(ctx context.Context, generation uint64) error
 	CleanupCellGeneration(ctx context.Context, generation uint64) error
 	ThrottleCellGenerationCompactions(ctx context.Context, generation uint64) (func(), error)
-	ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error)
-	ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)
-	LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader
-	SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []EncodedCellRecord, sync bool) error
 	DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Context, origin ton.BlockIDExt, current *CurrentState, preserveStateMeta []ton.BlockIDExt) (int, error)
 	SwitchCellGeneration(ctx context.Context, generation uint64, origin ton.BlockIDExt, expectedCurrent ton.BlockIDExt, current *CurrentState) (uint64, error)
+}
+
+// CellGeneration owns all cell operations scoped to one concrete, non-zero
+// generation. Selecting the generation once keeps active-generation policy out
+// of serializers and migrations, and avoids a generation branch in each batch.
+type CellGeneration interface {
+	ID() uint64
+	Save(ctx context.Context, records []*CellRecord) error
+	SaveEncoded(ctx context.Context, records []EncodedCellRecord, sync bool) error
+	Record(ctx context.Context, hash []byte) (*CellRecord, error)
+	Load(ctx context.Context, hash []byte) (*cell.Cell, error)
+	Loader() cell.LazyCellLoader
+	LoadLargeBOCMeta(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error)
+	LoadLargeBOCPayload(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error)
+	LoadLargeBOCCells(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error)
+	ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error)
+	ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)
 }
 
 type BlockMetaStorage interface {
@@ -79,7 +71,8 @@ type BlockMetaStorage interface {
 }
 
 type CellStorage interface {
-	SaveCells(records []*CellRecord) error
+	ActiveCells() (CellGeneration, error)
+	Cells(generation uint64) (CellGeneration, error)
 	CellRecord(ctx context.Context, hash []byte) (*CellRecord, error)
 	LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error)
 	LazyCellLoader() cell.LazyCellLoader

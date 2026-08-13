@@ -69,7 +69,10 @@ func BenchmarkLiveStoreOverlay(b *testing.B) {
 		b.Run(fmt.Sprintf("current-account-blocks/shards-%d", shards), func(b *testing.B) {
 			live, current, _ := benchmarkLiveStoreWithCurrent(b, shards)
 			account := bytes.Repeat([]byte{0x44}, 32)
-			candidates := storage.AccountShardCandidates(0, account)
+			candidates, err := storage.AccountShardCandidates(0, account)
+			if err != nil {
+				b.Fatal(err)
+			}
 			targetShard := candidates[len(candidates)-1]
 			targetState, targetRoot := benchmarkBlockState(b, 0, targetShard, 3000)
 			current.Shards[storage.ShardKey{Workchain: 0, Shard: targetShard}] = targetState

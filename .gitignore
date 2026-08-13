@@ -6,3 +6,6 @@ build/
 .idea
 *.sh
 .DS_Store
+
+# compiled go test binaries
+*.test

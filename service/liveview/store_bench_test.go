@@ -1,12 +1,56 @@
 package liveview
 
 import (
+	"context"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
+
+func BenchmarkStoreCachedHistoryLookup(b *testing.B) {
+	const historyBlocks = 10_000
+
+	live, _, _, _, key := benchmarkStoreIndexedHistory(b, historyBlocks)
+	ctx := context.Background()
+
+	b.Run("lt", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := live.LookupBlockByLT(ctx, storage.BlockHistoryKey{Workchain: key.workchain, Shard: key.shard}, 15_000); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("unix-time", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := live.LookupBlockByUnixTime(ctx, storage.BlockHistoryKey{Workchain: key.workchain, Shard: key.shard}, 7_500); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("lt-prefix", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := live.LookupBlockByLTForPrefix(ctx, storage.BlockHistoryKey{Workchain: key.workchain, Shard: key.shard}, 15_000); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("unix-time-prefix", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := live.LookupBlockByUnixTimeForPrefix(ctx, storage.BlockHistoryKey{Workchain: key.workchain, Shard: key.shard}, 7_500); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
 
 func BenchmarkStorePublishBlockWithStateIndexedHistory(b *testing.B) {
 	const historyBlocks = 10_000

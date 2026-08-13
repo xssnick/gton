@@ -2,8 +2,9 @@ package state
 
 import (
 	"fmt"
-	"math/bits"
 
+	"github.com/xssnick/gton/internal/shardstate"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	storage2 "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -39,8 +40,11 @@ type PersistentStatePart struct {
 }
 
 func SplitPersistentState(block ton.BlockIDExt, root *cell.Cell, splitDepth uint32) ([]PersistentStatePart, error) {
-	shardPrefixLen := ShardPrefixLength(block.Shard)
-	if block.Workchain == -1 || splitDepth <= uint32(shardPrefixLen) {
+	shardPrefixLen, err := sharddomain.PrefixLength(block.Shard)
+	if err != nil {
+		return nil, fmt.Errorf("invalid block shard %016x: %w", uint64(block.Shard), err)
+	}
+	if block.Workchain == -1 || splitDepth <= shardPrefixLen {
 		return []PersistentStatePart{{
 			Kind:           PersistentStatePartUnsplit,
 			EffectiveShard: 0,
@@ -74,7 +78,7 @@ func SplitPersistentState(block ton.BlockIDExt, root *cell.Cell, splitDepth uint
 
 	observedAccounts := accounts.Copy()
 
-	partsCount := uint64(1) << (splitDepth - uint32(shardPrefixLen))
+	partsCount := uint64(1) << (splitDepth - shardPrefixLen)
 	effectiveShard := uint64(block.Shard) ^ (uint64(1) << (63 - shardPrefixLen)) ^ (uint64(1) << (63 - splitDepth))
 	increment := uint64(1) << (64 - splitDepth)
 
@@ -87,7 +91,7 @@ func SplitPersistentState(block ton.BlockIDExt, root *cell.Cell, splitDepth uint
 			return nil, fmt.Errorf("cut accounts prefix %016x: %w", effectiveShard, err)
 		}
 		if partRoot != nil {
-			wrappedPartRoot, err := WrapShardAccountsRoot(partRoot)
+			wrappedPartRoot, err := shardstate.WrapAccountsRoot(partRoot)
 			if err != nil {
 				return nil, fmt.Errorf("build split state part root %016x: %w", effectiveShard, err)
 			}
@@ -181,75 +185,4 @@ func visitCellRecursiveSeen(root *cell.Cell, seen map[cell.Hash]struct{}) error 
 		}
 	}
 	return nil
-}
-
-func WrapShardAccountsRoot(root *cell.Cell) (*cell.Cell, error) {
-	extra, err := root.AsAugDict(256, tlb.AugShardAccounts{}).LoadRootExtra()
-	if err != nil {
-		return nil, err
-	}
-
-	extraCell, err := extra.ToCell()
-	if err != nil {
-		return nil, err
-	}
-
-	return cell.BeginCell().
-		MustStoreUInt(1, 1).
-		MustStoreRef(root).
-		MustStoreBuilder(extraCell.ToBuilder()).
-		EndCell(), nil
-}
-
-func NewShardAccountsAugDict() (*cell.AugmentedDictionary, error) {
-	return cell.NewAugDict(256, tlb.AugShardAccounts{})
-}
-
-func LoadShardAccountsRoot(root *cell.Cell) (*cell.AugmentedDictionary, error) {
-	loader, err := root.BeginParse()
-	if err != nil {
-		return nil, err
-	}
-	return loader.LoadAugDict(256, cell.ReadOnlyAugmentation{
-		SkipExtraFn: tlb.AugShardAccounts{}.SkipExtra,
-	}, false)
-}
-
-func MergeSplitState(header *tlb.ShardStateUnsplit, parts []*cell.Cell) (*cell.Cell, error) {
-	accounts, err := NewShardAccountsAugDict()
-	if err != nil {
-		return nil, err
-	}
-
-	for i, root := range parts {
-		partAccounts, err := LoadShardAccountsRoot(root)
-		if err != nil {
-			return nil, fmt.Errorf("parse split state part %d accounts: %w", i+1, err)
-		}
-
-		merged, err := accounts.CombineWith(partAccounts)
-		if err != nil {
-			return nil, fmt.Errorf("merge split state part %d accounts: %w", i+1, err)
-		}
-		if !merged {
-			return nil, fmt.Errorf("duplicate account in split state part %d", i+1)
-		}
-	}
-
-	return MergeSplitStateAccounts(header, accounts)
-}
-
-func MergeSplitStateAccounts(header *tlb.ShardStateUnsplit, accounts *cell.AugmentedDictionary) (*cell.Cell, error) {
-	full := *header
-	full.Accounts.ShardAccounts = &tlb.ShardAccountsAugDict{AugmentedDictionary: accounts}
-	return tlb.ToCell(&full)
-}
-
-func ShardPrefixLength(shard int64) int {
-	x := uint64(shard)
-	lowBit := x & -x
-	if lowBit == 0 {
-		return 64
-	}
-	return 63 - bits.TrailingZeros64(lowBit)
 }

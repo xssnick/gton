@@ -231,7 +231,7 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 	if err != nil {
 		return
 	}
-	if !path.route.quicReady(time.Now()) {
+	if !path.route.QUICReady(time.Now()) {
 		return
 	}
 
@@ -284,8 +284,8 @@ func (r *plumtreeRuntime) runOutboundWorker(
 		renewWindow := sendCtx == nil
 		if !renewWindow {
 			deadline, hasDeadline := sendCtx.Deadline()
-			renewWindow = !hasDeadline ||
-				sendCtx.Err() != nil ||
+			renewWindow = sendCtx.Err() != nil ||
+				!hasDeadline ||
 				time.Until(deadline) < plumtreeOutboundTimeout/2
 		}
 		if renewWindow {
@@ -295,10 +295,7 @@ func (r *plumtreeRuntime) runOutboundWorker(
 			// Plumtree fanout is best-effort. Sharing one deadline window
 			// across consecutive jobs keeps every send bounded to 2.5-5s
 			// without allocating a timer and context for every peer batch.
-			sendCtx, cancel = context.WithTimeout(
-				parent,
-				plumtreeOutboundTimeout,
-			)
+			sendCtx, cancel = newPlumtreeOutboundSendWindow(parent)
 		}
 
 		r.sendOutboundBatch(sendCtx, job.peer, job.wires)
@@ -309,4 +306,8 @@ func (r *plumtreeRuntime) runOutboundWorker(
 			return
 		}
 	}
+}
+
+func newPlumtreeOutboundSendWindow(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, plumtreeOutboundTimeout)
 }

@@ -7,7 +7,7 @@ import (
 	"github.com/xssnick/gton/service/storage"
 )
 
-func (s *Service) syncUntilEnabled() bool {
+func (s *SyncCoordinator) syncUntilEnabled() bool {
 	return s.syncUntil != 0
 }
 
@@ -18,11 +18,15 @@ func (s *Service) syncUntilEnabled() bool {
 // offline when a subsystem dies, and reading that as a finished sync silently
 // parked persistent-state GC, archive GC and state serialization behind an
 // incident - with a log line claiming the sync had completed.
-func (s *Service) syncUntilFrozen() bool {
+func (s *SyncCoordinator) syncUntilFrozen() bool {
 	return s.syncUntilEnabled() && s.syncUntilReached.Load()
 }
 
-func (s *Service) checkCurrentBeforeSyncUntil(ctx context.Context, current *storage.CurrentState) error {
+func (s *SyncCoordinator) syncUntilTarget() uint32 {
+	return s.syncUntil
+}
+
+func (s *SyncCoordinator) checkCurrentBeforeSyncUntil(ctx context.Context, current *storage.CurrentState) error {
 	if !s.syncUntilEnabled() || current == nil {
 		return nil
 	}
@@ -39,14 +43,14 @@ func (s *Service) checkCurrentBeforeSyncUntil(ctx context.Context, current *stor
 	)
 }
 
-func (s *Service) preparedMasterBlockAfterSyncUntil(block PreparedBlock) bool {
+func (s *SyncCoordinator) preparedMasterBlockAfterSyncUntil(block PreparedBlock) bool {
 	if !s.syncUntilEnabled() {
 		return false
 	}
 	return block.Meta.GenUTime > s.syncUntil
 }
 
-func (s *Service) enterSyncUntilOffline(current *storage.CurrentState, next PreparedBlock) {
+func (s *SyncCoordinator) enterSyncUntilOffline(current *storage.CurrentState, next PreparedBlock) {
 	event := s.log.Info().
 		Uint32("sync_until", s.syncUntil)
 	if current != nil {
@@ -70,5 +74,5 @@ func (s *Service) enterSyncUntilOffline(current *storage.CurrentState, next Prep
 	// observing that this offline is the deliberate one.
 	s.syncUntilReached.Store(true)
 	s.node.EnterOffline(reason)
-	s.wakeServiceMaintenance()
+	s.maintenance.wake()
 }

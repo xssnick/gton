@@ -72,6 +72,32 @@ func (s *Store) acquireCellStore(ctx context.Context, generation uint64) (*cellS
 	return cells, nil
 }
 
+func (s *Store) acquireActiveCellStore(ctx context.Context) (*cellStore, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return nil, errPebbleClosed
+	}
+	if s.activeCellGeneration == 0 {
+		return nil, fmt.Errorf("active cell generation is zero")
+	}
+	cells := s.cellGenerations[s.activeCellGeneration]
+	if cells == nil {
+		return nil, fmt.Errorf("%w: %d", errCellGenerationNotOpen, s.activeCellGeneration)
+	}
+	if err := cells.acquire(); err != nil {
+		return nil, err
+	}
+	return cells, nil
+}
+
 func (s *Store) ThrottleCellCompactions() func() {
 	s.mu.RLock()
 	releases := make([]func(), 0, len(s.cellGenerations))
@@ -135,7 +161,7 @@ func (s *Store) flushCellDBs(generation uint64) error {
 
 func (s *Store) cellStoreForGenerationLocked(generation uint64) (*cellStore, error) {
 	if generation == 0 {
-		generation = s.activeCellGeneration
+		return nil, fmt.Errorf("cell generation is zero")
 	}
 	cells := s.cellGenerations[generation]
 	if cells == nil {
@@ -474,6 +500,7 @@ func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64
 	if !detached {
 		return nil
 	}
+	s.cellCache.deleteGeneration(generation)
 
 	s.log.Info().
 		Uint64("cell_generation", generation).
@@ -600,7 +627,7 @@ func (s *Store) removeCellGenerationDirs(generation uint64) error {
 			err = errors.Join(err, removeErr)
 		}
 	}
-	if syncErr := syncDir(filepath.Join(s.dir, cellDBRootDir)); syncErr != nil && !errors.Is(syncErr, os.ErrNotExist) {
+	if syncErr := storage.SyncDir(filepath.Join(s.dir, cellDBRootDir)); syncErr != nil && !errors.Is(syncErr, os.ErrNotExist) {
 		err = errors.Join(err, syncErr)
 	}
 	return err
@@ -633,6 +660,7 @@ func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uin
 		delete(s.cellGenerations, generation)
 	}
 	s.mu.Unlock()
+	s.cellCache.deleteGeneration(generation)
 
 	var errs []error
 	if cells != nil {

@@ -14,13 +14,20 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 )
 
-func fillTestArchiveRoster(t *testing.T, pool *archivePeerPool, shard archive.ShardID, speed float64) []*overlayPeer {
+const testArchiveHealthyBytesPerSecond = 4 << 20
+
+func fillTestArchiveRoster(t *testing.T, pool *archivePeerPool, shard archive.ShardID) []*overlayPeer {
 	t.Helper()
 
 	peers := make([]*overlayPeer, 0, archivePeerRosterLimit)
 	for i := 0; i < archivePeerRosterLimit; i++ {
 		peer := testArchiveOnlyPoolPeer(t, pool, fmt.Sprintf("roster-%02d", i))
-		pool.noteArchiveDownload(shard, peer, int64(speed), time.Second)
+		pool.noteArchiveDownload(
+			shard,
+			peer,
+			testArchiveHealthyBytesPerSecond,
+			time.Second,
+		)
 		pool.markSuccess(shard, peer)
 		peers = append(peers, peer)
 	}
@@ -73,7 +80,7 @@ func TestArchiveScoutReplacesWorstPeerInFullRoster(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 
 	pool.mx.Lock()
 	health := pool.shardPeerLocked(archivePeerPoolKey(shard), peers[0].id)
@@ -110,7 +117,7 @@ func TestArchiveScoutCurrentBytesReplaceHistoricallyProvenUnknownPeer(t *testing
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	fillTestArchiveRoster(t, pool, shard, 4<<20)
+	fillTestArchiveRoster(t, pool, shard)
 
 	failed := testArchiveCandidate("failed-newcomer")
 	if got := pool.admitArchiveOnlyPeer(failed, archivePeerProbeResult{}); got.admitted {
@@ -131,7 +138,7 @@ func TestArchiveScoutUnmeasuredCandidateDoesNotEvictCurrentHealthyRoster(t *test
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 	result := provenArchiveScoutResult(t, pool, shard, 0)
 
 	pool.mx.Lock()
@@ -154,7 +161,7 @@ func TestArchiveScoutEvictionProtectsPeerLease(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 
 	pool.mx.Lock()
 	health := pool.shardPeerLocked(archivePeerPoolKey(shard), peers[0].id)
@@ -182,7 +189,7 @@ func TestArchiveScoutRejectsDisconnectedCandidateBeforeEviction(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	fillTestArchiveRoster(t, pool, shard, 4<<20)
+	fillTestArchiveRoster(t, pool, shard)
 
 	wrapper, conn := newTestOverlayWrapper()
 	candidate := testArchiveCandidate("closed-newcomer")
@@ -717,7 +724,7 @@ func TestArchiveHealthyRosterStillWalksDHT(t *testing.T) {
 	pool := testArchivePool(t, sub)
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	beginTestArchiveRequest(t, pool, shard, 1)
-	fillTestArchiveRoster(t, pool, shard, 4<<20)
+	fillTestArchiveRoster(t, pool, shard)
 
 	done := pool.refill(context.Background(), false)
 	if done == nil {
@@ -748,7 +755,7 @@ func TestArchiveUrgentRefillJoinsRunningSeedQuery(t *testing.T) {
 	pool := testArchivePool(t, sub)
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	beginTestArchiveRequest(t, pool, shard, 1)
-	fillTestArchiveRoster(t, pool, shard, 4<<20)
+	fillTestArchiveRoster(t, pool, shard)
 
 	done := pool.refill(context.Background(), false)
 	deadline := time.Now().Add(time.Second)
@@ -1040,7 +1047,7 @@ func TestArchiveZeroStatePreparedCandidateReplacesCurrentNegativeRoster(t *testi
 	shard := archiveShardFromBlock(block)
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 	probe, release, err := pool.beginZeroStateRequest(shard, block)
 	if err != nil {
 		t.Fatalf("begin zero-state demand: %v", err)
@@ -1073,7 +1080,7 @@ func TestArchiveDemandCoverageProtectsUniquePeer(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 	first, releaseFirst, err := pool.beginArchiveRequest(shard, 100)
 	if err != nil {
 		t.Fatalf("begin first demand: %v", err)
@@ -1116,7 +1123,7 @@ func TestArchiveDemandCoverageNeverStarvesExistingDemand(t *testing.T) {
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 
 	releases := make([]func(), 0, len(peers)+1)
 	for i, peer := range peers {
@@ -1167,7 +1174,7 @@ func TestArchiveFullLeasedRosterDefersCandidateWithoutCachingNoBenefit(t *testin
 	shard := archive.ShardID{Workchain: 0, Shard: topShard}
 	sub := testOverlaySubscription(&overlaySubscription{log: discardLogger()})
 	pool := testArchivePool(t, sub)
-	peers := fillTestArchiveRoster(t, pool, shard, 4<<20)
+	peers := fillTestArchiveRoster(t, pool, shard)
 	result := provenArchiveScoutResult(t, pool, shard, 8<<20)
 	releases := make([]func(), 0, len(peers))
 	for _, peer := range peers {

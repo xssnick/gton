@@ -1,0 +1,528 @@
+package validator
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"math"
+
+	"github.com/pierrec/lz4/v4"
+	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
+
+	"github.com/xssnick/gton/service/validator/groups"
+	"github.com/xssnick/gton/service/validator/simplex"
+)
+
+// CandidateLimits bounds candidate decompression before any untrusted buffer
+// is allocated. The values are the max_block_size and max_collated_data_size
+// fields of the active consensus config.
+type CandidateLimits struct {
+	MaxBlockBytes        uint32
+	MaxCollatedDataBytes uint32
+}
+
+func (l CandidateLimits) validate() error {
+	if l.MaxBlockBytes == 0 {
+		return errors.New("validator runtime: max block bytes must be positive")
+	}
+	if l.MaxCollatedDataBytes == 0 {
+		return errors.New("validator runtime: max collated data bytes must be positive")
+	}
+
+	return nil
+}
+
+// CandidateArtifact is the immutable decoded form used by validation and
+// state resolution. The resolver retains the canonical compressed wire
+// separately so persistence never requires a second compression pass.
+type CandidateArtifact struct {
+	Candidate    simplex.Candidate
+	BlockBOC     []byte
+	CollatedData []byte
+
+	// prepared is the compressed payload of this candidate, built by whoever
+	// held its cell roots: the collator for a locally built candidate, the
+	// decoder for a received one. It exists only until the wire is derived from
+	// it and is cleared there, so an artifact that outlives its serialization —
+	// every artifact the resolver caches — never carries a second copy of the
+	// payload it already stores as wire.
+	//
+	// The field is unexported on purpose. A prepared payload is only obtainable
+	// from the roots it serializes, and an artifact reaching this package from
+	// an extension-supplied Pipeline therefore cannot carry one.
+	prepared *simplex.PreparedCandidate
+}
+
+type candidateCodec struct {
+	sessionID       [32]byte
+	shard           groups.ShardID
+	validators      []simplex.Validator
+	schedule        simplex.LeaderSchedule
+	protocolVersion uint8
+	slotsPerWindow  uint32
+	limits          CandidateLimits
+}
+
+func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidateCodec, error) {
+	if err := limits.validate(); err != nil {
+		return nil, err
+	}
+	if len(config.Validators) == 0 {
+		return nil, errors.New("validator runtime: empty validator set")
+	}
+	if config.Protocol.ProtocolVersion < 3 {
+		return nil, fmt.Errorf(
+			"validator runtime: protocol version %d is unsupported, require 3 or newer",
+			config.Protocol.ProtocolVersion,
+		)
+	}
+	if config.Protocol.SlotsPerLeaderWindow == 0 {
+		return nil, errors.New("validator runtime: slots per leader window must be positive")
+	}
+
+	validators := make([]simplex.Validator, len(config.Validators))
+	for i := range config.Validators {
+		validator := &config.Validators[i]
+		validators[i] = simplex.Validator{
+			PublicKey: ed25519.PublicKey(validator.PublicKey[:]),
+			Weight:    validator.Weight,
+		}
+	}
+
+	return &candidateCodec{
+		sessionID:  config.SessionID,
+		shard:      config.Shard,
+		validators: validators,
+		schedule: simplex.RoundRobinSchedule{
+			SlotsPerLeaderWindow: config.Protocol.SlotsPerLeaderWindow,
+			Validators:           uint32(len(validators)),
+		},
+		protocolVersion: config.Protocol.ProtocolVersion,
+		slotsPerWindow:  config.Protocol.SlotsPerLeaderWindow,
+		limits:          limits,
+	}, nil
+}
+
+// encodeForBroadcast derives the resolver wire and the private-overlay FEC
+// payload from one compression pass. Non-delegated wire aliases broadcast.Data;
+// callers and transports must treat both as immutable.
+func (c *candidateCodec) encodeForBroadcast(
+	artifact *CandidateArtifact,
+) ([]byte, simplex.CandidateBroadcast, error) {
+	if err := c.verifyCandidate(&artifact.Candidate); err != nil {
+		return nil, simplex.CandidateBroadcast{}, err
+	}
+	// A locally built candidate arrives with its payload already compressed,
+	// overlapped with signing, persistence and the scheduled broadcast wait.
+	// Everything else — a recovered artifact, an empty candidate, a retry after
+	// the payload was consumed — takes the full path from the BOCs.
+	prepared := artifact.prepared
+	artifact.prepared = nil
+	var broadcast simplex.CandidateBroadcast
+	var err error
+	if prepared != nil {
+		broadcast, err = simplex.SerializeCandidateForBroadcastPrepared(artifact.Candidate, prepared)
+	} else {
+		broadcast, err = simplex.SerializeCandidateForBroadcast(
+			artifact.Candidate,
+			artifact.BlockBOC,
+			artifact.CollatedData,
+		)
+	}
+	if err != nil {
+		return nil, simplex.CandidateBroadcast{}, err
+	}
+	wire, err := broadcast.CandidateWire(artifact.Candidate.Delegation)
+	if err != nil {
+		return nil, simplex.CandidateBroadcast{}, err
+	}
+
+	return wire, broadcast, nil
+}
+
+// decode takes ownership of wire for the duration of the call. Returned BOCs
+// are canonical mode-31/mode-2 serializations and are independently owned.
+func (c *candidateCodec) decode(wire []byte, expected *simplex.CandidateID) (*CandidateArtifact, error) {
+	artifact, _, err := c.decodeWith(wire, expected, false)
+
+	return artifact, err
+}
+
+// decodeCanonical decodes a candidate and returns the canonical wire alongside
+// it. A received candidate is almost always re-serialized right after it is
+// decoded — its own wire may be V2-compressed or non-canonical, while storage,
+// the request path and the resolver's conflict check all compare the canonical
+// form — and rebuilding it from the returned BOCs would parse both of them
+// again and re-serialize both to prove they are canonical. Building it here
+// instead reuses the roots the decode already produced, which is what makes
+// those bytes canonical in the first place.
+func (c *candidateCodec) decodeCanonical(
+	wire []byte,
+	expected *simplex.CandidateID,
+) (*CandidateArtifact, []byte, error) {
+	return c.decodeWith(wire, expected, true)
+}
+
+func (c *candidateCodec) decodeWith(
+	wire []byte,
+	expected *simplex.CandidateID,
+	canonical bool,
+) (*CandidateArtifact, []byte, error) {
+	wrapped, err := simplex.ParseCandidateWrapped(wire)
+	if err != nil {
+		return nil, nil, fmt.Errorf("validator runtime: decode candidate: %w", err)
+	}
+
+	artifact, err := c.decodeData(wrapped.Data, canonical)
+	if err != nil {
+		return nil, nil, err
+	}
+	artifact.Candidate.Delegation = wrapped.Delegation
+	artifact.Candidate.Leader = c.schedule.ExpectedLeader(artifact.Candidate.ID.Slot)
+	if expected != nil && artifact.Candidate.ID != *expected {
+		return nil, nil, errors.New("validator runtime: candidate id mismatch")
+	}
+	if err = c.verifyCandidate(&artifact.Candidate); err != nil {
+		return nil, nil, err
+	}
+	if !canonical {
+		return artifact, nil, nil
+	}
+
+	// An empty candidate has no payload to prepare; its wire is the cheap
+	// path either way.
+	prepared := artifact.prepared
+	artifact.prepared = nil
+	var canonicalWire []byte
+	if prepared != nil {
+		canonicalWire, err = simplex.SerializeCandidatePrepared(artifact.Candidate, prepared)
+	} else {
+		canonicalWire, err = simplex.SerializeCandidate(
+			artifact.Candidate,
+			artifact.BlockBOC,
+			artifact.CollatedData,
+		)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return artifact, canonicalWire, nil
+}
+
+func (c *candidateCodec) decodeData(data any, prepare bool) (*CandidateArtifact, error) {
+	switch candidate := data.(type) {
+	case simplex.ConsensusBlockData:
+		return c.decodeBlock(candidate, prepare)
+	case *simplex.ConsensusBlockData:
+		return c.decodeBlock(*candidate, prepare)
+	case simplex.ConsensusEmptyData:
+		return c.decodeEmpty(candidate)
+	case *simplex.ConsensusEmptyData:
+		return c.decodeEmpty(*candidate)
+	default:
+		return nil, fmt.Errorf("validator runtime: unexpected candidate data type %T", data)
+	}
+}
+
+func (c *candidateCodec) decodeBlock(
+	data simplex.ConsensusBlockData,
+	prepare bool,
+) (*CandidateArtifact, error) {
+	parent, err := candidateParentFromTL(data.Parent)
+	if err != nil {
+		return nil, err
+	}
+
+	payload, err := c.decodePayload(data.Candidate, prepare)
+	if err != nil {
+		return nil, err
+	}
+	block := ton.BlockIDExt{
+		Workchain: c.shard.Workchain,
+		Shard:     c.shard.Shard,
+		SeqNo:     payload.round,
+		RootHash:  payload.rootHash[:],
+		FileHash:  payload.fileHash[:],
+	}
+	candidate := simplex.Candidate{
+		Parent:           parent,
+		Block:            block,
+		CollatedFileHash: payload.collatedFileHash,
+		Signature:        data.Signature,
+	}
+	candidate.ID = candidate.ComputeID(uint32(data.Slot))
+
+	return &CandidateArtifact{
+		Candidate:    candidate,
+		BlockBOC:     payload.blockBOC,
+		CollatedData: payload.collatedData,
+		prepared:     payload.prepared,
+	}, nil
+}
+
+func (c *candidateCodec) decodeEmpty(data simplex.ConsensusEmptyData) (*CandidateArtifact, error) {
+	parent, err := candidateIDFromTL(data.Parent)
+	if err != nil {
+		return nil, err
+	}
+
+	candidate := simplex.Candidate{
+		Parent:    simplex.Parent(parent),
+		Empty:     true,
+		Block:     data.Block,
+		Signature: data.Signature,
+	}
+	candidate.ID = candidate.ComputeID(uint32(data.Slot))
+
+	return &CandidateArtifact{Candidate: candidate}, nil
+}
+
+type decodedCandidatePayload struct {
+	round            uint32
+	rootHash         [32]byte
+	blockBOC         []byte
+	collatedData     []byte
+	fileHash         [32]byte
+	collatedFileHash [32]byte
+	prepared         *simplex.PreparedCandidate
+}
+
+func (c *candidateCodec) decodePayload(data []byte, prepare bool) (decodedCandidatePayload, error) {
+	var payload tl.Serializable
+	rest, err := tl.Parse(&payload, data, true)
+	if err != nil {
+		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: decode compressed candidate: %w", err)
+	}
+	if len(rest) != 0 {
+		return decodedCandidatePayload{}, errors.New("validator runtime: trailing compressed candidate data")
+	}
+
+	maxCombined := uint64(c.limits.MaxBlockBytes) + uint64(c.limits.MaxCollatedDataBytes) + 1024
+	if maxCombined > math.MaxInt {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate size limit overflows int")
+	}
+
+	// tl.Parse never yields a pointer here, but a caller may hand one over.
+	// Normalizing first keeps one branch per constructor: a type switch does not
+	// re-dispatch once its subject is reassigned, so this cannot be folded into
+	// the switch below.
+	switch pointer := payload.(type) {
+	case *simplex.ValidatorSessionCompressedCandidate:
+		payload = *pointer
+	case *simplex.ValidatorSessionCompressedCandidateV2:
+		payload = *pointer
+	}
+
+	var source, rootHash []byte
+	var round int32
+	var roots []*cell.Cell
+	switch compressed := payload.(type) {
+	case simplex.ValidatorSessionCompressedCandidate:
+		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
+		if compressed.DecompressedSize < 0 || uint64(compressed.DecompressedSize) > maxCombined {
+			return decodedCandidatePayload{}, errors.New("validator runtime: decompressed candidate is too large")
+		}
+		decompressed := make([]byte, int(compressed.DecompressedSize))
+		written, decompressErr := lz4.UncompressBlock(compressed.Data, decompressed)
+		if decompressErr != nil {
+			return decodedCandidatePayload{}, fmt.Errorf("validator runtime: decompress candidate: %w", decompressErr)
+		}
+		if written != len(decompressed) {
+			return decodedCandidatePayload{}, errors.New("validator runtime: decompressed candidate size mismatch")
+		}
+		roots, err = cell.FromBOCMultiRoot(decompressed)
+	case simplex.ValidatorSessionCompressedCandidateV2:
+		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
+		if uint64(len(compressed.Data)) > maxCombined {
+			return decodedCandidatePayload{}, errors.New("validator runtime: compressed candidate is too large")
+		}
+		roots, err = cell.DecompressBOC(compressed.Data, int(maxCombined), nil)
+	default:
+		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: unexpected compressed candidate type %T", payload)
+	}
+	if err != nil {
+		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: decode combined candidate boc: %w", err)
+	}
+
+	return c.finishPayload(source, round, rootHash, roots, prepare)
+}
+
+func (c *candidateCodec) finishPayload(
+	source []byte,
+	round int32,
+	rootHash []byte,
+	roots []*cell.Cell,
+	prepare bool,
+) (decodedCandidatePayload, error) {
+	if len(source) != 32 || !allZeroBytes(source) {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate source must be zero")
+	}
+	if len(rootHash) != 32 {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate root hash length is invalid")
+	}
+	if len(roots) == 0 {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate boc is empty")
+	}
+	if !bytes.Equal(roots[0].Hash(), rootHash) {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate root hash mismatch")
+	}
+
+	// This is the byte form emitted by reference std_boc_serialize(root, 31):
+	// its root marker is not set, so WithTopHash must remain disabled.
+	blockBOC, err := roots[0].ToBOCWithOptionsErr(cell.BOCSerializeOptions{
+		WithCRC32C:    true,
+		WithIndex:     true,
+		WithCacheBits: true,
+		WithIntHashes: true,
+	})
+	if err != nil {
+		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: serialize candidate block boc: %w", err)
+	}
+	collatedData, err := cell.ToBOCWithOptionsErr(
+		roots[1:],
+		cell.BOCSerializeOptions{WithCRC32C: true},
+	)
+	if err != nil {
+		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: serialize candidate collated data: %w", err)
+	}
+	if uint64(len(blockBOC)) > uint64(c.limits.MaxBlockBytes) {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate block is too large")
+	}
+	if uint64(len(collatedData)) > uint64(c.limits.MaxCollatedDataBytes) {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate collated data is too large")
+	}
+
+	result := decodedCandidatePayload{
+		round:            uint32(round),
+		blockBOC:         blockBOC,
+		collatedData:     collatedData,
+		fileHash:         sha256.Sum256(blockBOC),
+		collatedFileHash: sha256.Sum256(collatedData),
+	}
+	copy(result.rootHash[:], rootHash)
+	if prepare {
+		// Built here rather than from the two BOCs above, which is the same
+		// combined serialization plus a parse of the bytes these roots just
+		// produced. The size limits above have already bounded both halves.
+		result.prepared, err = simplex.PrepareCandidate(
+			result.round,
+			roots[0],
+			roots[1:],
+			result.fileHash,
+			result.collatedFileHash,
+		)
+		if err != nil {
+			return decodedCandidatePayload{}, err
+		}
+	}
+
+	return result, nil
+}
+
+func (c *candidateCodec) verifyCandidate(candidate *simplex.Candidate) error {
+	leader := c.schedule.ExpectedLeader(candidate.ID.Slot)
+	if int(leader) >= len(c.validators) {
+		return fmt.Errorf("validator runtime: leader %d is out of range", leader)
+	}
+	if candidate.Leader != leader {
+		return fmt.Errorf("validator runtime: candidate leader %d, want %d", candidate.Leader, leader)
+	}
+	if candidate.ComputeID(candidate.ID.Slot) != candidate.ID {
+		return errors.New("validator runtime: candidate id does not match hash data")
+	}
+
+	leaderKey := c.validators[leader].PublicKey
+	if candidate.Delegation == nil {
+		if !simplex.VerifyCandidateSignature(leaderKey, c.sessionID, candidate.ID, candidate.Signature) {
+			return errors.New("validator runtime: candidate signature is invalid")
+		}
+
+		return nil
+	}
+	if c.protocolVersion < 3 {
+		return errors.New("validator runtime: delegated candidate requires protocol version 3")
+	}
+	delegation := candidate.Delegation
+	if len(delegation.CollatorKey) != ed25519.PublicKeySize {
+		return errors.New("validator runtime: delegated collator key is invalid")
+	}
+	windowStart := candidate.ID.Slot - candidate.ID.Slot%c.slotsPerWindow
+	collatorID := simplex.KeyNodeIDShort(delegation.CollatorKey)
+	if !simplex.VerifyDelegationSignature(
+		leaderKey,
+		c.sessionID,
+		windowStart,
+		collatorID,
+		delegation.Signature,
+	) {
+		return errors.New("validator runtime: delegation signature is invalid")
+	}
+	if !simplex.VerifyCandidateSignature(
+		delegation.CollatorKey,
+		c.sessionID,
+		candidate.ID,
+		candidate.Signature,
+	) {
+		return errors.New("validator runtime: delegated candidate signature is invalid")
+	}
+
+	return nil
+}
+
+func candidateParentFromTL(value any) (simplex.ParentID, error) {
+	switch parent := value.(type) {
+	case ton.ConsensusCandidateWithoutParents, *ton.ConsensusCandidateWithoutParents:
+		return simplex.Genesis(), nil
+	case ton.ConsensusCandidateParent:
+		id, err := candidateIDFromTL(parent.ID)
+		if err != nil {
+			return simplex.ParentID{}, err
+		}
+
+		return simplex.Parent(id), nil
+	case *ton.ConsensusCandidateParent:
+		id, err := candidateIDFromTL(parent.ID)
+		if err != nil {
+			return simplex.ParentID{}, err
+		}
+
+		return simplex.Parent(id), nil
+	default:
+		return simplex.ParentID{}, fmt.Errorf("validator runtime: unexpected candidate parent type %T", value)
+	}
+}
+
+func candidateIDFromTL(value any) (simplex.CandidateID, error) {
+	var wire ton.ConsensusCandidateID
+	switch id := value.(type) {
+	case ton.ConsensusCandidateID:
+		wire = id
+	case *ton.ConsensusCandidateID:
+		wire = *id
+	default:
+		return simplex.CandidateID{}, fmt.Errorf("validator runtime: unexpected candidate id type %T", value)
+	}
+	if len(wire.Hash) != 32 {
+		return simplex.CandidateID{}, errors.New("validator runtime: candidate hash length is invalid")
+	}
+
+	id := simplex.CandidateID{Slot: uint32(wire.Slot)}
+	copy(id.Hash[:], wire.Hash)
+
+	return id, nil
+}
+
+func allZeroBytes(data []byte) bool {
+	for _, value := range data {
+		if value != 0 {
+			return false
+		}
+	}
+
+	return true
+}

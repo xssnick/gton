@@ -32,12 +32,9 @@ func TestCellGenerationMigrationCanceledLeavesPendingIntent(t *testing.T) {
 	store := &testCellGenerationMigrationStore{
 		cancelOnBegin: cancel,
 	}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.runCellGenerationMigration(ctx, store, testBlockID(-1, topShard, 100))
+	err := state.runCellGenerationMigration(ctx, testBlockID(-1, topShard, 100))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("migration error = %v, want context.Canceled", err)
 	}
@@ -50,12 +47,9 @@ func TestCellGenerationMigrationFailureLeavesPendingIntent(t *testing.T) {
 	store := &testCellGenerationMigrationStore{
 		blockMetaErr: errCellGenerationMigrationTest,
 	}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.runCellGenerationMigration(context.Background(), store, testBlockID(-1, topShard, 100))
+	err := state.runCellGenerationMigration(context.Background(), testBlockID(-1, topShard, 100))
 	if !errors.Is(err, errCellGenerationMigrationTest) {
 		t.Fatalf("migration error = %v, want test failure", err)
 	}
@@ -71,12 +65,9 @@ func TestCellGenerationMigrationCanceledWithNonContextErrorLeavesPendingIntent(t
 		blockMetaErr:     errCellGenerationMigrationTest,
 		ignoreContextErr: true,
 	}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.runCellGenerationMigration(ctx, store, testBlockID(-1, topShard, 100))
+	err := state.runCellGenerationMigration(ctx, testBlockID(-1, topShard, 100))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("migration error = %v, want context.Canceled", err)
 	}
@@ -111,33 +102,27 @@ func TestLoadCellGenerationMigrationProgressAttachesLazyRoots(t *testing.T) {
 			string(shardCellHash[:]):  shardRoot,
 		},
 	}
-	svc := &Service{log: zerolog.Nop(), storage: store}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	candidate, err := svc.loadCellGenerationMigrationProgress(context.Background(), store, generation)
+	candidate, err := state.loadCellGenerationMigrationProgress(context.Background(), store, generation)
 	if err != nil {
 		t.Fatalf("load migration progress: %v", err)
 	}
 	if candidate.current.Masterchain.Cell == nil {
 		t.Fatal("masterchain progress cell was not restored")
 	}
-	if candidate.current.Masterchain.CellGeneration != generation {
-		t.Fatalf("masterchain cell generation = %d, want %d", candidate.current.Masterchain.CellGeneration, generation)
+	if candidate.generation != generation {
+		t.Fatalf("candidate generation = %d, want %d", candidate.generation, generation)
 	}
 	shardState := candidate.current.Shards[storage.ShardKeyFromBlock(shardBlock)]
 	if shardState.Cell == nil {
 		t.Fatal("shard progress cell was not restored")
 	}
-	if shardState.CellGeneration != generation {
-		t.Fatalf("shard cell generation = %d, want %d", shardState.CellGeneration, generation)
-	}
 }
 
 func TestCellGenerationCandidateResolverTreatsBlockOnlyStateAsMiss(t *testing.T) {
 	store := &testCellGenerationMigrationStore{}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 	candidate := &cellGenerationCandidate{
 		generation: 3,
 		current: &storage.CurrentState{
@@ -146,7 +131,7 @@ func TestCellGenerationCandidateResolverTreatsBlockOnlyStateAsMiss(t *testing.T)
 		cells: newTestStateCellWindowCache(nil),
 	}
 
-	resolver := svc.newCellGenerationShardResolver(context.Background(), store, candidate, nil)
+	resolver := state.newCellGenerationShardResolver(context.Background(), candidate, nil)
 	_, err := resolver.loadState(context.Background(), storage.BlockState{
 		Block: testBlockID(0, topShard, 65640691),
 	})
@@ -166,13 +151,9 @@ func TestStartCellGenerationMigrationPersistsIntentBeforeAsyncRun(t *testing.T) 
 		},
 		blockStateErr: errCellGenerationMigrationTest,
 	}
-	svc := &Service{
-		log:             zerolog.Nop(),
-		storage:         store,
-		shutdownContext: context.Background(),
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.StartCellGenerationMigration(context.Background(), origin.SeqNo)
+	err := state.StartCellGenerationMigration(context.Background(), origin.SeqNo)
 	if err != nil {
 		t.Fatalf("start migration: %v", err)
 	}
@@ -180,7 +161,7 @@ func TestStartCellGenerationMigrationPersistsIntentBeforeAsyncRun(t *testing.T) 
 		t.Fatal("migration intent was not persisted before start returned")
 	}
 
-	svc.Wait()
+	state.Wait()
 }
 
 func TestStartCellGenerationMigrationRejectsMissingPersistentStateBeforeIntent(t *testing.T) {
@@ -194,13 +175,9 @@ func TestStartCellGenerationMigrationRejectsMissingPersistentStateBeforeIntent(t
 		},
 		persistentStateFileErr: storage.ErrNotFound,
 	}
-	svc := &Service{
-		log:             zerolog.Nop(),
-		storage:         store,
-		shutdownContext: context.Background(),
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.StartCellGenerationMigration(context.Background(), origin.SeqNo)
+	err := state.StartCellGenerationMigration(context.Background(), origin.SeqNo)
 	if !errors.Is(err, errCellGenerationPersistentMissing) {
 		t.Fatalf("start migration error = %v, want missing persistent state", err)
 	}
@@ -228,13 +205,9 @@ func TestRunCellGenerationMigrationDropsPendingWhenPersistentStateMissing(t *tes
 			},
 		},
 	}
-	svc := &Service{
-		log:             zerolog.Nop(),
-		storage:         store,
-		shutdownContext: context.Background(),
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.runCellGenerationMigration(context.Background(), store, origin)
+	err := state.runCellGenerationMigration(context.Background(), origin)
 	if !errors.Is(err, errCellGenerationMigrationAborted) {
 		t.Fatalf("run migration error = %v, want aborted", err)
 	}
@@ -256,13 +229,10 @@ func TestStartCellGenerationMigrationRespectsExclusiveTask(t *testing.T) {
 			Shards:           map[storage.ShardKey]storage.BlockState{},
 		},
 	}
-	svc := &Service{
-		log:           zerolog.Nop(),
-		storage:       store,
-		exclusiveTask: exclusiveServiceTaskStateSerialization,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
+	state.maintenance.exclusiveTask = exclusiveServiceTaskStateSerialization
 
-	err := svc.StartCellGenerationMigration(context.Background(), origin.SeqNo)
+	err := state.StartCellGenerationMigration(context.Background(), origin.SeqNo)
 	if !errors.Is(err, errStateSerializationRunning) {
 		t.Fatalf("start migration error = %v, want serialization running", err)
 	}
@@ -280,12 +250,9 @@ func TestStopCellGenerationMigrationAbortsPendingGeneration(t *testing.T) {
 	store := &testCellGenerationMigrationStore{
 		pending: &pending,
 	}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	if err := svc.StopCellGenerationMigration(context.Background()); err != nil {
+	if err := state.StopCellGenerationMigration(context.Background()); err != nil {
 		t.Fatalf("stop migration: %v", err)
 	}
 	if !store.dropped {
@@ -308,17 +275,14 @@ func TestStopCellGenerationMigrationCancelsActiveRunBeforeDrop(t *testing.T) {
 	store := &testCellGenerationMigrationStore{
 		pending: &pending,
 	}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	runCtx, run, err := svc.beginCellGenerationMigrationRun(context.Background())
+	runCtx, run, err := state.beginCellGenerationMigrationRun(context.Background())
 	if err != nil {
 		t.Fatalf("begin migration run: %v", err)
 	}
 
-	if err = svc.StopCellGenerationMigration(context.Background()); err != nil {
+	if err = state.StopCellGenerationMigration(context.Background()); err != nil {
 		t.Fatalf("stop migration: %v", err)
 	}
 	if !errors.Is(context.Cause(runCtx), errCellGenerationMigrationStopped) {
@@ -332,17 +296,14 @@ func TestStopCellGenerationMigrationCancelsActiveRunBeforeDrop(t *testing.T) {
 	if !store.dropped {
 		t.Fatal("pending generation was not dropped")
 	}
-	svc.finishCellGenerationMigrationRun(run)
+	state.finishCellGenerationMigrationRun(run)
 }
 
 func TestStopCellGenerationMigrationWithoutPendingFails(t *testing.T) {
 	store := &testCellGenerationMigrationStore{}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	err := svc.StopCellGenerationMigration(context.Background())
+	err := state.StopCellGenerationMigration(context.Background())
 	if !errors.Is(err, errCellGenerationMigrationNotFound) {
 		t.Fatalf("stop migration error = %v, want not running", err)
 	}
@@ -350,10 +311,12 @@ func TestStopCellGenerationMigrationWithoutPendingFails(t *testing.T) {
 
 func TestLogCellGenerationCandidateCatchUpProgress(t *testing.T) {
 	var out bytes.Buffer
-	svc := &Service{
-		log:                       zerolog.New(&out).Level(zerolog.InfoLevel),
-		nextBlockCheckpointBlocks: 10,
-	}
+	state := NewStateLifecycle(
+		zerolog.New(&out).Level(zerolog.InfoLevel),
+		nil,
+		newTestStatusTracker(nil, nil),
+		StateLifecycleOptions{NextBlockCheckpointBlocks: 10},
+	)
 	candidate := &cellGenerationCandidate{
 		generation: 2,
 		current: &storage.CurrentState{
@@ -369,7 +332,7 @@ func TestLogCellGenerationCandidateCatchUpProgress(t *testing.T) {
 	lastLog := started.Add(2 * time.Second)
 	now := started.Add(10 * time.Second)
 
-	svc.logCellGenerationCandidateCatchUpProgress(
+	state.logCellGenerationCandidateCatchUpProgress(
 		candidate, target, 100, 25, 5, 10,
 		started, lastLog, now, 3, 4, false,
 	)
@@ -418,9 +381,10 @@ func TestCellGenerationCandidateCheckpointKeepsApplyingIntoNextWindow(t *testing
 		started:                          make(chan struct{}),
 		release:                          make(chan struct{}),
 	}
-	svc := &Service{log: zerolog.Nop()}
+	candidate.generationCells, _ = store.Cells(candidate.generation)
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	done := svc.startCellGenerationCandidateCheckpoint(context.Background(), store, candidate)
+	done := state.startCellGenerationCandidateCheckpoint(context.Background(), store, candidate)
 	select {
 	case <-store.started:
 	case <-time.After(time.Second):
@@ -455,15 +419,16 @@ func TestCellGenerationCandidateCheckpointKeepsApplyingIntoNextWindow(t *testing
 }
 
 func TestCellGenerationSwitchRequestLifecycle(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:              zerolog.Nop(),
 		currentStateWake: make(chan struct{}),
 	}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 	target := testBlockID(-1, topShard, 200)
 
 	wake := svc.currentStateWakeChan()
-	svc.requestCellGenerationSwitch(2, target)
-	if !svc.cellGenerationSwitchRequestActive() {
+	state.requestCellGenerationSwitch(2, target)
+	if !state.cellGenerationSwitchRequestActive() {
 		t.Fatal("cell generation switch request is not active")
 	}
 	select {
@@ -472,42 +437,41 @@ func TestCellGenerationSwitchRequestLifecycle(t *testing.T) {
 		t.Fatal("cell generation switch request did not wake current state loop")
 	}
 
-	svc.clearCellGenerationSwitchRequest()
-	if svc.cellGenerationSwitchRequestActive() {
+	state.clearCellGenerationSwitchRequest()
+	if state.cellGenerationSwitchRequestActive() {
 		t.Fatal("cell generation switch request was not cleared")
 	}
 
-	svc.requestCellGenerationSwitch(2, target)
-	if !svc.beginCellGenerationSwitch() {
+	state.requestCellGenerationSwitch(2, target)
+	if !state.beginCellGenerationSwitch() {
 		t.Fatal("cell generation switch did not begin")
 	}
-	svc.finishCellGenerationSwitch()
-	if svc.cellGenerationSwitchRequestActive() {
+	state.finishCellGenerationSwitch()
+	if state.cellGenerationSwitchRequestActive() {
 		t.Fatal("finished cell generation switch left request active")
 	}
-	if svc.cellGenerationSwitchActive() {
+	if state.cellGenerationSwitchActive() {
 		t.Fatal("finished cell generation switch left switch active")
 	}
 }
 
 func TestPendingCellGenerationMigrationLeaseIgnoresStartLimits(t *testing.T) {
-	svc := &Service{
-		storage: exclusiveTaskTestStorage{maxReadAmp: exclusiveServiceTaskMaxReadAmp + 1},
-	}
+	store := exclusiveTaskTestStorage{maxReadAmp: exclusiveServiceTaskMaxReadAmp + 1}
+	maintenance := NewMaintenanceRunner(zerolog.Nop(), store, newTestStatusTracker(store, nil), MaintenanceRunnerOptions{})
 
-	if _, err := svc.beginExclusiveServiceTask(context.Background(), exclusiveServiceTaskCellGenerationMigration); !errors.Is(err, errExclusiveServiceTaskHighReadAmp) {
+	if _, err := maintenance.beginExclusiveServiceTask(context.Background(), exclusiveServiceTaskCellGenerationMigration); !errors.Is(err, errExclusiveServiceTaskHighReadAmp) {
 		t.Fatalf("begin fresh migration error = %v, want high read amp", err)
 	}
 
-	lease, err := svc.beginPendingCellGenerationMigration(context.Background())
+	lease, err := maintenance.beginPendingCellGenerationMigration(context.Background())
 	if err != nil {
 		t.Fatalf("begin pending migration: %v", err)
 	}
-	if !svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
+	if !maintenance.cellGenerationMigrationActive() {
 		t.Fatal("pending migration lease did not mark migration active")
 	}
 	lease.release()
-	if svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
+	if maintenance.cellGenerationMigrationActive() {
 		t.Fatal("pending migration lease did not release")
 	}
 }
@@ -521,13 +485,11 @@ func TestRunPendingCellGenerationMigrationChecksLeaseBeforeMetrics(t *testing.T)
 	store := &testCellGenerationMigrationStore{
 		pending: &pending,
 	}
-	svc := &Service{
-		log:           zerolog.Nop(),
-		storage:       store,
-		exclusiveTask: exclusiveServiceTaskCellGenerationMigration,
-	}
+	svc := &SyncCoordinator{log: zerolog.Nop(), storage: store}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
+	state.maintenance.exclusiveTask = exclusiveServiceTaskCellGenerationMigration
 
-	ran, err := svc.runPendingCellGenerationMigration(context.Background())
+	ran, err := state.maintenance.runPendingCellGenerationMigration(context.Background())
 	if !errors.Is(err, errCellGenerationMigrationRunning) {
 		t.Fatalf("run pending migration error = %v, want migration running", err)
 	}
@@ -554,13 +516,10 @@ func TestRunPendingCellGenerationMigrationOpensGenerationBeforeCompactionWait(t 
 			MaxReadAmp: CellGenerationSwitchMaxReadAmp + 1,
 		},
 	}
-	svc := &Service{
-		log:             zerolog.Nop(),
-		storage:         store,
-		shutdownContext: context.Background(),
-	}
+	svc := &SyncCoordinator{log: zerolog.Nop(), storage: store}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 
-	ran, err := svc.runPendingCellGenerationMigration(context.Background())
+	ran, err := state.maintenance.runPendingCellGenerationMigration(context.Background())
 	if !errors.Is(err, errPendingCellGenerationCompaction) {
 		t.Fatalf("run pending migration error = %v, want pending compaction", err)
 	}
@@ -573,10 +532,10 @@ func TestRunPendingCellGenerationMigrationOpensGenerationBeforeCompactionWait(t 
 	if store.cellGenerationDBMetricsCalls != 1 {
 		t.Fatalf("pending generation metrics calls = %d, want 1", store.cellGenerationDBMetricsCalls)
 	}
-	if svc.exclusiveServiceTaskActive(exclusiveServiceTaskCellGenerationMigration) {
+	if state.maintenance.cellGenerationMigrationActive() {
 		t.Fatal("pending migration lease was not released after compaction wait")
 	}
-	if svc.cellGenerationMigrationRun != nil {
+	if state.cellGenerationMigrationRun != nil {
 		t.Fatal("pending migration run was not finished after compaction wait")
 	}
 }
@@ -597,9 +556,9 @@ func TestPendingCellGenerationCompactionWait(t *testing.T) {
 			CompactionInProgressSize: 256 << 20,
 		},
 	}
-	svc := &Service{storage: store}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	metrics, waiting, err := svc.cellGenerationCompactionWait(context.Background(), store, pending.ID)
+	metrics, waiting, err := state.cellGenerationCompactionWait(context.Background(), pending.ID)
 	if err != nil {
 		t.Fatalf("pending compaction wait: %v", err)
 	}
@@ -611,7 +570,7 @@ func TestPendingCellGenerationCompactionWait(t *testing.T) {
 	}
 
 	store.cellGenerationDBMetrics.MaxReadAmp = CellGenerationSwitchMaxReadAmp
-	_, waiting, err = svc.cellGenerationCompactionWait(context.Background(), store, pending.ID)
+	_, waiting, err = state.cellGenerationCompactionWait(context.Background(), pending.ID)
 	if err != nil {
 		t.Fatalf("pending compaction wait at limit: %v", err)
 	}
@@ -622,10 +581,7 @@ func TestPendingCellGenerationCompactionWait(t *testing.T) {
 
 func TestCellGenerationMigrationThrottlesActiveCompactionsDuringCandidateCatchUp(t *testing.T) {
 	store := &testCellGenerationMigrationStore{}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 	candidate := &cellGenerationCandidate{
 		generation: 2,
 		current: &storage.CurrentState{
@@ -638,7 +594,7 @@ func TestCellGenerationMigrationThrottlesActiveCompactionsDuringCandidateCatchUp
 		Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 101)},
 	}
 
-	release, err := svc.throttleActiveCellGenerationCompactions(context.Background(), store, candidate, target)
+	release, err := state.throttleActiveCellGenerationCompactions(context.Background(), store, candidate, target)
 	if err != nil {
 		t.Fatalf("throttle active generation: %v", err)
 	}
@@ -657,10 +613,7 @@ func TestCellGenerationMigrationThrottlesActiveCompactionsDuringCandidateCatchUp
 
 func TestCellGenerationMigrationDoesNotThrottleActiveCompactionsWithoutCatchUp(t *testing.T) {
 	store := &testCellGenerationMigrationStore{}
-	svc := &Service{
-		log:     zerolog.Nop(),
-		storage: store,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 	block := testBlockID(-1, topShard, 100)
 	candidate := &cellGenerationCandidate{
 		generation: 2,
@@ -674,7 +627,7 @@ func TestCellGenerationMigrationDoesNotThrottleActiveCompactionsWithoutCatchUp(t
 		Masterchain: storage.BlockState{Block: block},
 	}
 
-	release, err := svc.throttleActiveCellGenerationCompactions(context.Background(), store, candidate, target)
+	release, err := state.throttleActiveCellGenerationCompactions(context.Background(), store, candidate, target)
 	if err != nil {
 		t.Fatalf("throttle active generation without catch-up: %v", err)
 	}
@@ -701,9 +654,9 @@ func TestCellGenerationMigrationLoadsFlushedProgress(t *testing.T) {
 			string(rootCellHash[:]): root,
 		},
 	}
-	svc := &Service{}
+	lifecycle := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	candidate, err := svc.loadCellGenerationMigrationProgress(context.Background(), store, 2)
+	candidate, err := lifecycle.loadCellGenerationMigrationProgress(context.Background(), store, 2)
 	if err != nil {
 		t.Fatalf("load migration progress: %v", err)
 	}
@@ -725,9 +678,9 @@ func TestCellGenerationMigrationIgnoresProgressMissingCandidateRoot(t *testing.T
 		migrationProgress: current,
 		lazyRoots:         map[string]*cell.Cell{},
 	}
-	svc := &Service{}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	_, err := svc.loadCellGenerationMigrationProgress(context.Background(), store, 2)
+	_, err := state.loadCellGenerationMigrationProgress(context.Background(), store, 2)
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("load migration progress error = %v, want ErrNotFound", err)
 	}
@@ -749,9 +702,9 @@ func TestCellGenerationMigrationLoadsSelfContainedProgress(t *testing.T) {
 			string(rootCellHash[:]): root,
 		},
 	}
-	svc := &Service{}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	candidate, err := svc.loadCellGenerationMigrationProgress(context.Background(), store, 2)
+	candidate, err := state.loadCellGenerationMigrationProgress(context.Background(), store, 2)
 	if err != nil {
 		t.Fatalf("load migration progress: %v", err)
 	}
@@ -773,9 +726,9 @@ func TestPersistentImportStateMetadataUsesBlockMeta(t *testing.T) {
 			},
 		},
 	}
-	svc := &Service{storage: store}
+	lifecycle := newTestStateLifecycle(store, StateLifecycleOptions{})
 
-	state, err := svc.persistentImportStateMetadata(context.Background(), block)
+	state, err := lifecycle.persistentImportStateMetadata(context.Background(), store, block)
 	if err != nil {
 		t.Fatalf("load persistent import metadata: %v", err)
 	}
@@ -791,16 +744,17 @@ func TestPersistentImportStateMetadataUsesBlockMeta(t *testing.T) {
 }
 
 func TestNextBlockCatchUpYieldsForCellGenerationSwitchRequest(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:              zerolog.Nop(),
 		storage:          openTestPebbleStorage(t),
 		currentStateWake: make(chan struct{}),
 	}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 	current := &storage.CurrentState{
 		Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 125)},
 		Shards:      map[storage.ShardKey]storage.BlockState{},
 	}
-	svc.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
+	state.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
 	runner := &nextSyncRunner{
 		service:    svc,
 		ctx:        context.Background(),
@@ -819,46 +773,48 @@ func TestNextBlockCatchUpYieldsForCellGenerationSwitchRequest(t *testing.T) {
 }
 
 func TestBootstrapRetryStopsForCellGenerationSwitchRequest(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:              zerolog.Nop(),
 		currentStateWake: make(chan struct{}),
 	}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 	runner := &nextSyncRunner{
 		service: svc,
 		ctx:     context.Background(),
 	}
 
-	svc.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
+	state.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
 	if runner.waitBootstrapRetry(svc.currentStateWakeChan()) {
 		t.Fatal("bootstrap retry kept waiting after cell generation switch request")
 	}
 }
 
 func TestCellGenerationSwitchNextBlockYieldThrottle(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:              zerolog.Nop(),
 		currentStateWake: make(chan struct{}),
 	}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 	now := time.Unix(1000, 0)
 
-	if svc.shouldYieldNextBlockForCellGenerationSwitch(now) {
+	if state.shouldYieldNextBlockForCellGenerationSwitch(now) {
 		t.Fatal("next-block yielded without switch request")
 	}
 
-	svc.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
-	if !svc.shouldYieldNextBlockForCellGenerationSwitch(now) {
+	state.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 125))
+	if !state.shouldYieldNextBlockForCellGenerationSwitch(now) {
 		t.Fatal("first next-block yield after switch request was throttled")
 	}
-	if svc.shouldYieldNextBlockForCellGenerationSwitch(now.Add(cellGenerationNextBlockYieldInterval - time.Second)) {
+	if state.shouldYieldNextBlockForCellGenerationSwitch(now.Add(cellGenerationNextBlockYieldInterval - time.Second)) {
 		t.Fatal("next-block yielded before throttle interval")
 	}
-	if !svc.shouldYieldNextBlockForCellGenerationSwitch(now.Add(cellGenerationNextBlockYieldInterval)) {
+	if !state.shouldYieldNextBlockForCellGenerationSwitch(now.Add(cellGenerationNextBlockYieldInterval)) {
 		t.Fatal("next-block did not yield at throttle interval")
 	}
 
-	svc.clearCellGenerationSwitchRequest()
-	svc.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 126))
-	if !svc.shouldYieldNextBlockForCellGenerationSwitch(now.Add(cellGenerationNextBlockYieldInterval + time.Second)) {
+	state.clearCellGenerationSwitchRequest()
+	state.requestCellGenerationSwitch(2, testBlockID(-1, topShard, 126))
+	if !state.shouldYieldNextBlockForCellGenerationSwitch(now.Add(cellGenerationNextBlockYieldInterval + time.Second)) {
 		t.Fatal("new switch request did not reset next-block yield throttle")
 	}
 }
@@ -869,25 +825,26 @@ func TestCatchUpCurrentStateYieldsForActiveCellGenerationSwitch(t *testing.T) {
 		Shards:      map[storage.ShardKey]storage.BlockState{},
 	}
 	store := &testCellGenerationMigrationStore{current: current}
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:              zerolog.Nop(),
 		storage:          store,
 		currentStateWake: make(chan struct{}),
 	}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 
-	if !svc.beginCellGenerationSwitch() {
+	if !state.beginCellGenerationSwitch() {
 		t.Fatal("begin cell generation switch")
 	}
-	defer svc.finishCellGenerationSwitch()
+	defer state.finishCellGenerationSwitch()
 	if err := svc.catchUpCurrentState(context.Background()); err != nil {
 		t.Fatalf("catch up current state: %v", err)
 	}
 
 	locked := make(chan struct{})
 	go func() {
-		svc.stateMu.Lock()
+		state.stateMu.Lock()
 		close(locked)
-		svc.stateMu.Unlock()
+		state.stateMu.Unlock()
 	}()
 
 	select {
@@ -902,22 +859,23 @@ func TestCatchUpCurrentStateYieldsForCellGenerationSwitchRequest(t *testing.T) {
 		Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 125)},
 		Shards:      map[storage.ShardKey]storage.BlockState{},
 	}
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:              zerolog.Nop(),
 		storage:          &testCellGenerationMigrationStore{current: current},
 		currentStateWake: make(chan struct{}),
 	}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{})
 
-	svc.requestCellGenerationSwitch(2, current.Masterchain.Block)
+	state.requestCellGenerationSwitch(2, current.Masterchain.Block)
 	if err := svc.catchUpCurrentState(context.Background()); err != nil {
 		t.Fatalf("catch up current state: %v", err)
 	}
 
 	locked := make(chan struct{})
 	go func() {
-		svc.stateMu.Lock()
+		state.stateMu.Lock()
 		close(locked)
-		svc.stateMu.Unlock()
+		state.stateMu.Unlock()
 	}()
 
 	select {
@@ -928,7 +886,7 @@ func TestCatchUpCurrentStateYieldsForCellGenerationSwitchRequest(t *testing.T) {
 }
 
 type testCellGenerationMigrationStore struct {
-	storage.Storage
+	testStorage
 
 	cancelOnBegin                context.CancelFunc
 	blockStateErr                error
@@ -963,7 +921,87 @@ type blockingCellGenerationCheckpointStore struct {
 	savedRecords int
 }
 
-func (s *blockingCellGenerationCheckpointStore) SaveEncodedCellsInGeneration(ctx context.Context, _ uint64, records []storage.EncodedCellRecord, _ bool) error {
+type testCellGeneration struct {
+	generation  uint64
+	store       *testCellGenerationMigrationStore
+	saveEncoded func(context.Context, []storage.EncodedCellRecord, bool) error
+}
+
+func (c testCellGeneration) ID() uint64 {
+	return c.generation
+}
+
+func (c testCellGeneration) Save(context.Context, []*storage.CellRecord) error {
+	return nil
+}
+
+func (c testCellGeneration) SaveEncoded(ctx context.Context, records []storage.EncodedCellRecord, sync bool) error {
+	if c.saveEncoded != nil {
+		return c.saveEncoded(ctx, records, sync)
+	}
+	return nil
+}
+
+func (c testCellGeneration) Record(context.Context, []byte) (*storage.CellRecord, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (c testCellGeneration) Load(_ context.Context, hash []byte) (*cell.Cell, error) {
+	var key cell.Hash
+	copy(key[:], hash)
+	return c.Loader()(key)
+}
+
+func (c testCellGeneration) Loader() cell.LazyCellLoader {
+	return func(hash cell.Hash) (*cell.Cell, error) {
+		root := c.store.lazyRoots[string(hash[:])]
+		if root == nil {
+			return nil, storage.ErrNotFound
+		}
+		return root, nil
+	}
+}
+
+func (c testCellGeneration) LoadLargeBOCMeta(context.Context, []cell.Hash, []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (c testCellGeneration) LoadLargeBOCPayload(context.Context, []cell.Hash, []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (c testCellGeneration) LoadLargeBOCCells(context.Context, []cell.Hash, []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (c testCellGeneration) ImportStateCellTree(context.Context, ton.BlockIDExt, *cell.Cell, uint64) (*cell.Cell, error) {
+	c.store.importStateCellTreeCalls++
+	return nil, errCellGenerationMigrationTest
+}
+
+func (c testCellGeneration) ImportStateBOCView(context.Context, ton.BlockIDExt, *cell.BOCView) (*cell.Cell, error) {
+	return nil, errCellGenerationMigrationTest
+}
+
+func (s *testCellGenerationMigrationStore) ActiveCells() (storage.CellGeneration, error) {
+	return s.Cells(1)
+}
+
+func (s *testCellGenerationMigrationStore) Cells(generation uint64) (storage.CellGeneration, error) {
+	return testCellGeneration{generation: generation, store: s}, nil
+}
+
+func (s *blockingCellGenerationCheckpointStore) Cells(generation uint64) (storage.CellGeneration, error) {
+	return testCellGeneration{
+		generation: generation,
+		store:      s.testCellGenerationMigrationStore,
+		saveEncoded: func(ctx context.Context, records []storage.EncodedCellRecord, _ bool) error {
+			return s.saveEncoded(ctx, records)
+		},
+	}, nil
+}
+
+func (s *blockingCellGenerationCheckpointStore) saveEncoded(ctx context.Context, records []storage.EncodedCellRecord) error {
 	s.savedRecords = len(records)
 	close(s.started)
 	select {
@@ -1043,29 +1081,6 @@ func (s *testCellGenerationMigrationStore) ThrottleCellGenerationCompactions(_ c
 	return func() {
 		s.throttleReleases++
 	}, nil
-}
-
-func (s *testCellGenerationMigrationStore) ImportStateCellTreeInGeneration(context.Context, uint64, ton.BlockIDExt, *cell.Cell, uint64) (*cell.Cell, error) {
-	s.importStateCellTreeCalls++
-	return nil, errCellGenerationMigrationTest
-}
-
-func (s *testCellGenerationMigrationStore) ImportStateBOCViewInGeneration(context.Context, uint64, ton.BlockIDExt, *cell.BOCView) (*cell.Cell, error) {
-	return nil, errCellGenerationMigrationTest
-}
-
-func (s *testCellGenerationMigrationStore) LazyCellLoaderInGeneration(uint64) cell.LazyCellLoader {
-	return func(hash cell.Hash) (*cell.Cell, error) {
-		root := s.lazyRoots[string(hash[:])]
-		if root == nil {
-			return nil, storage.ErrNotFound
-		}
-		return root, nil
-	}
-}
-
-func (s *testCellGenerationMigrationStore) SaveEncodedCellsInGeneration(context.Context, uint64, []storage.EncodedCellRecord, bool) error {
-	return nil
 }
 
 func (s *testCellGenerationMigrationStore) DeleteStateMetadataBeforeCellGenerationSwitch(context.Context, ton.BlockIDExt, *storage.CurrentState, []ton.BlockIDExt) (int, error) {

@@ -12,10 +12,10 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-	"syscall"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/gton/service/archive/packfile"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -175,7 +175,7 @@ func (s *Store) syncPendingPackFiles(pending map[string]pendingPackWrite, label 
 	}
 	sort.Strings(dirPaths)
 	err = syncPathsParallel(dirPaths, artifactPackSyncWorkers, func(path string) error {
-		if err := syncDir(path); err != nil {
+		if err := storage.SyncDir(path); err != nil {
 			return fmt.Errorf("sync %s pack dir %s: %w", label, path, err)
 		}
 		return nil
@@ -307,25 +307,6 @@ func syncFile(path string) error {
 	}
 	defer func() { _ = file.Close() }()
 	return file.Sync()
-}
-
-func syncDir(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-
-	// Windows does not support flushing directory handles. Opening the
-	// directory above still validates that it exists and is accessible.
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-
-	if err = file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
-		return err
-	}
-	return nil
 }
 
 func (s *Store) appendArchiveEntries(requests []archiveAppendRequest) ([]*storage.ArtifactRef, []archivePackRegistration, error) {
@@ -621,7 +602,10 @@ type archiveEntryLocation struct {
 }
 
 func (s *Store) archiveEntryLocationForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32, claimed *archivePackClaims) (archiveEntryLocation, error) {
-	desc := archiveEntryDescriptorForBase(block, splitDepth, masterSeqno, baseSeqno)
+	desc, err := archiveEntryDescriptorForBase(block, splitDepth, masterSeqno, baseSeqno)
+	if err != nil {
+		return archiveEntryLocation{}, err
+	}
 	archiveID, err := s.archivePackIDForDescriptor(desc, claimed)
 	if err != nil {
 		return archiveEntryLocation{}, err
@@ -635,16 +619,19 @@ func (s *Store) archiveEntryLocationForBase(block ton.BlockIDExt, splitDepth uin
 	}, nil
 }
 
-func archiveEntryDescriptorForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32) archivePackDescriptor {
+func archiveEntryDescriptorForBase(block ton.BlockIDExt, splitDepth uint32, masterSeqno uint32, baseSeqno uint32) (archivePackDescriptor, error) {
 	sliceSeqno := archiveSliceSeqno(baseSeqno, masterSeqno)
-	workchain, shard := archiveEntryShardPrefix(block, splitDepth)
+	workchain, shard, err := archiveEntryShardPrefix(block, splitDepth)
+	if err != nil {
+		return archivePackDescriptor{}, err
+	}
 
 	return archivePackDescriptor{
 		baseSeqno:  baseSeqno,
 		startSeqno: sliceSeqno,
 		workchain:  workchain,
 		shard:      shard,
-	}
+	}, nil
 }
 
 func archiveEntryIsKey(block ton.BlockIDExt, meta *storage.BlockMeta) bool {
@@ -678,18 +665,19 @@ func archiveEntryFirstMaster(block ton.BlockIDExt, meta *storage.BlockMeta) (uin
 	return seqno, utime, lt, nil
 }
 
-func archiveEntryShardPrefix(block ton.BlockIDExt, splitDepth uint32) (int32, int64) {
+func archiveEntryShardPrefix(block ton.BlockIDExt, splitDepth uint32) (int32, int64, error) {
 	if block.Workchain == -1 && block.Shard == topShard {
-		return -1, topShard
+		return -1, topShard, nil
 	}
-	return block.Workchain, archivePackShardPrefix(block.Workchain, block.Shard, splitDepth)
+	prefix, err := archivePackShardPrefix(block.Workchain, block.Shard, splitDepth)
+	return block.Workchain, prefix, err
 }
 
-func archivePackShardPrefix(workchain int32, shard int64, splitDepth uint32) int64 {
+func archivePackShardPrefix(workchain int32, shard int64, splitDepth uint32) (int64, error) {
 	if workchain == -1 && shard == topShard {
-		return topShard
+		return topShard, nil
 	}
-	return storage.ShardPrefix(shard, splitDepth)
+	return sharddomain.Prefix(shard, splitDepth)
 }
 
 func archiveSliceSeqno(baseSeqno uint32, masterSeqno uint32) uint32 {
@@ -943,11 +931,14 @@ func selectShardSplitNextLink(prev ton.BlockIDExt, existing ton.BlockIDExt, next
 	if existing.Shard == next.Shard {
 		return ton.BlockIDExt{}, false
 	}
-	if !storage.ShardIsDirectChild(prev.Shard, existing.Shard) || !storage.ShardIsDirectChild(prev.Shard, next.Shard) {
+	if !sharddomain.IsDirectChild(prev.Shard, existing.Shard) || !sharddomain.IsDirectChild(prev.Shard, next.Shard) {
 		return ton.BlockIDExt{}, false
 	}
 
-	leftShard := storage.ShardChild(prev.Shard, true)
+	leftShard, err := sharddomain.Child(prev.Shard, true)
+	if err != nil {
+		return ton.BlockIDExt{}, false
+	}
 	if existing.Shard == leftShard {
 		return existing, true
 	}
@@ -1298,7 +1289,7 @@ func (s *Store) writeStateArtifactFile(block ton.BlockIDExt, data []byte) (*stor
 	if err = os.Rename(tmpPath, finalPath); err != nil {
 		return nil, err
 	}
-	if err = syncDir(dir); err != nil {
+	if err = storage.SyncDir(dir); err != nil {
 		return nil, err
 	}
 	relPath, err := s.relativeArtifactPath(finalPath)

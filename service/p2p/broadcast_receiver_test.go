@@ -287,7 +287,7 @@ func TestPublicBroadcastReceiverResolverLifecycleAndCustomIsolation(t *testing.T
 	}
 }
 
-func TestReceivedBroadcastMetricsClassifyImmediatePeerRosterMembership(t *testing.T) {
+func TestReceivedBroadcastMetricsUseCommonDirection(t *testing.T) {
 	node := newTestNode(t)
 	rosterPeer := testRebroadcastQueuePeer("metric-roster-peer")
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -329,12 +329,21 @@ func TestReceivedBroadcastMetricsClassifyImmediatePeerRosterMembership(t *testin
 
 	if got := testBroadcastStatCount(
 		node,
+		"received",
+		sub.spec.Name,
+		"tonNode.ihrMessageBroadcast",
+		DeliverySimple,
+	); got != 2 {
+		t.Fatalf("received metric = %d, want 2", got)
+	}
+	if got := testBroadcastStatCount(
+		node,
 		"received_roster",
 		sub.spec.Name,
 		"tonNode.ihrMessageBroadcast",
 		DeliverySimple,
-	); got != 1 {
-		t.Fatalf("received roster metric = %d, want 1", got)
+	); got != 0 {
+		t.Fatalf("received roster metric = %d, want 0", got)
 	}
 	if got := testBroadcastStatCount(
 		node,
@@ -342,8 +351,8 @@ func TestReceivedBroadcastMetricsClassifyImmediatePeerRosterMembership(t *testin
 		sub.spec.Name,
 		"tonNode.ihrMessageBroadcast",
 		DeliverySimple,
-	); got != 1 {
-		t.Fatalf("received unlisted metric = %d, want 1", got)
+	); got != 0 {
+		t.Fatalf("received unlisted metric = %d, want 0", got)
 	}
 }
 

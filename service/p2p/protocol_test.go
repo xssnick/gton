@@ -371,7 +371,7 @@ func TestSimpleBroadcastSignatureMatchesReferenceShape(t *testing.T) {
 }
 
 func TestDecodeCompressedBlock(t *testing.T) {
-	blockCell := testPeerBlockRoot(t, 0, topShard, 1)
+	blockCell := testPeerBlockRoot(t, 0, 1)
 	blockData := serializeCompressedBlockRoot(blockCell)
 	fileHash := sha256.Sum256(blockData)
 	blockHash := blockCell.HashKey()
@@ -424,7 +424,7 @@ func TestDecodeCompressedBlock(t *testing.T) {
 }
 
 func TestDecodeCompressedBlockV2(t *testing.T) {
-	blockCell := testPeerBlockRoot(t, 0, topShard, 2)
+	blockCell := testPeerBlockRoot(t, 0, 2)
 	blockData := serializeCompressedBlockRoot(blockCell)
 	fileHash := sha256.Sum256(blockData)
 	blockHash := blockCell.HashKey()
@@ -464,7 +464,7 @@ func TestDecodeCompressedBlockV2(t *testing.T) {
 }
 
 func TestDecodeShardBlockBroadcastCompressedV2AllowsNonFinalSimplex(t *testing.T) {
-	blockCell := testPeerBlockRoot(t, 0, topShard, 3)
+	blockCell := testPeerBlockRoot(t, 0, 3)
 	blockData := serializeCompressedBlockRoot(blockCell)
 	fileHash := sha256.Sum256(blockData)
 	blockHash := blockCell.HashKey()
@@ -508,7 +508,7 @@ func TestDecodeShardBlockBroadcastCompressedV2AllowsNonFinalSimplex(t *testing.T
 }
 
 func TestDecodeMasterchainBlockBroadcastCompressedV2RejectsNonFinalSimplex(t *testing.T) {
-	blockCell := testPeerBlockRoot(t, -1, topShard, 3)
+	blockCell := testPeerBlockRoot(t, -1, 3)
 	blockData := serializeCompressedBlockRoot(blockCell)
 	fileHash := sha256.Sum256(blockData)
 	blockHash := blockCell.HashKey()

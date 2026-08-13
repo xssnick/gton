@@ -5,16 +5,38 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"github.com/xssnick/gton/service/archive/packfile"
-	"github.com/xssnick/gton/service/storage"
-	"github.com/xssnick/gton/service/storage/pebblestore"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/archive/packfile"
+	sharddomain "github.com/xssnick/gton/service/shard"
+	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/storage/pebblestore"
+
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func mustStorageShardPrefixCandidates(tb testing.TB, prefix uint64) []int64 {
+	tb.Helper()
+
+	candidates, err := storage.ShardPrefixCandidates(0, prefix)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return candidates
+}
+
+func mustStorageAccountShardCandidates(tb testing.TB, workchain int32, account []byte) []int64 {
+	tb.Helper()
+
+	candidates, err := storage.AccountShardCandidates(workchain, account)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return candidates
+}
 
 func TestPebbleStoragePeerServingRoundTrip(t *testing.T) {
 	store := openTestPebbleStorage(t)
@@ -164,7 +186,7 @@ func TestPebbleStorageKeepsMetadataOnlyBlocksOutOfHistoryIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect cell records: %v", err)
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save cells: %v", err)
 	}
 	rootHash := root.HashKey()
@@ -200,104 +222,170 @@ func TestPebbleStorageKeepsMetadataOnlyBlocksOutOfHistoryIndexes(t *testing.T) {
 
 }
 
-func TestPebbleStorageLookupBlockByLTDoesNotSkipMetadataOnlyLowerBound(t *testing.T) {
-	store := openTestPebbleStorage(t)
-	ctx := context.Background()
-	key := storage.BlockHistoryKey{Workchain: 0, Shard: topShard}
+type pebbleHistoryLookup func(
+	context.Context,
+	*pebblestore.Store,
+	storage.BlockHistoryKey,
+	uint64,
+) (ton.BlockIDExt, error)
 
-	metadataOnly := testPebbleBlockID(0, topShard, 12)
-	served := testPebbleBlockID(0, topShard, 13)
+type pebbleHistoryLookupTest struct {
+	name         string
+	metadataOnly storage.BlockMeta
+	served       storage.BlockMeta
+	missingValue uint64
+	servedValue  uint64
+	lookup       pebbleHistoryLookup
+}
 
-	if err := store.SaveBlockMeta(&storage.BlockMeta{
-		ID:       metadataOnly,
-		GenUTime: 130,
-		StartLT:  3000,
-		EndLT:    3999,
-	}); err != nil {
-		t.Fatalf("save metadata-only block meta: %v", err)
+func TestPebbleStorageHistoryLookupDoesNotSkipMetadataOnlyLowerBound(t *testing.T) {
+	tests := []pebbleHistoryLookupTest{
+		{
+			name: "logical time",
+			metadataOnly: storage.BlockMeta{
+				ID:       testPebbleBlockID(0, topShard, 12),
+				GenUTime: 130,
+				StartLT:  3000,
+				EndLT:    3999,
+			},
+			served: storage.BlockMeta{
+				ID:       testPebbleBlockID(0, topShard, 13),
+				GenUTime: 140,
+				StartLT:  4000,
+				EndLT:    4999,
+			},
+			missingValue: 3500,
+			servedValue:  4500,
+			lookup: func(
+				ctx context.Context,
+				store *pebblestore.Store,
+				key storage.BlockHistoryKey,
+				value uint64,
+			) (ton.BlockIDExt, error) {
+				return store.LookupBlockByLT(ctx, key, value)
+			},
+		},
+		{
+			name: "unix time",
+			metadataOnly: storage.BlockMeta{
+				ID:       testPebbleBlockID(0, topShard, 14),
+				GenUTime: 130,
+				StartLT:  5000,
+				EndLT:    5999,
+			},
+			served: storage.BlockMeta{
+				ID:       testPebbleBlockID(0, topShard, 15),
+				GenUTime: 140,
+				StartLT:  6000,
+				EndLT:    6999,
+			},
+			missingValue: 130,
+			servedValue:  140,
+			lookup: func(
+				ctx context.Context,
+				store *pebblestore.Store,
+				key storage.BlockHistoryKey,
+				value uint64,
+			) (ton.BlockIDExt, error) {
+				return store.LookupBlockByUnixTime(ctx, key, uint32(value))
+			},
+		},
 	}
-	saveTestPebbleFullBlockMeta(t, store, &storage.BlockMeta{
-		ID:       served,
-		GenUTime: 140,
-		StartLT:  4000,
-		EndLT:    4999,
-	})
 
-	if _, err := store.LookupBlockByLT(ctx, key, 3500); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("lookup metadata-only lower-bound lt error = %v, want ErrNotFound", err)
-	}
-	got, err := store.LookupBlockByLT(ctx, key, 4500)
-	if err != nil {
-		t.Fatalf("lookup served lt: %v", err)
-	}
-	if !got.Equals(&served) {
-		t.Fatalf("lookup served lt block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(served))
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openTestPebbleStorage(t)
+			ctx := context.Background()
+			key := storage.BlockHistoryKey{Workchain: 0, Shard: topShard}
+
+			if err := store.SaveBlockMeta(&test.metadataOnly); err != nil {
+				t.Fatalf("save metadata-only block meta: %v", err)
+			}
+			saveTestPebbleFullBlockMeta(t, store, &test.served)
+
+			if _, err := test.lookup(ctx, store, key, test.missingValue); !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("lookup metadata-only lower-bound error = %v, want ErrNotFound", err)
+			}
+			got, err := test.lookup(ctx, store, key, test.servedValue)
+			if err != nil {
+				t.Fatalf("lookup served block: %v", err)
+			}
+			if !got.Equals(&test.served.ID) {
+				t.Fatalf("lookup served block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(test.served.ID))
+			}
+		})
 	}
 }
 
-func TestPebbleStorageLookupBlockByUnixTimeDoesNotSkipMetadataOnlyLowerBound(t *testing.T) {
-	store := openTestPebbleStorage(t)
-	ctx := context.Background()
-	key := storage.BlockHistoryKey{Workchain: 0, Shard: topShard}
-
-	metadataOnly := testPebbleBlockID(0, topShard, 14)
-	served := testPebbleBlockID(0, topShard, 15)
-
-	if err := store.SaveBlockMeta(&storage.BlockMeta{
-		ID:       metadataOnly,
-		GenUTime: 130,
-		StartLT:  5000,
-		EndLT:    5999,
-	}); err != nil {
-		t.Fatalf("save metadata-only block meta: %v", err)
-	}
-	saveTestPebbleFullBlockMeta(t, store, &storage.BlockMeta{
-		ID:       served,
-		GenUTime: 140,
-		StartLT:  6000,
-		EndLT:    6999,
-	})
-
-	if _, err := store.LookupBlockByUnixTime(ctx, key, 130); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("lookup metadata-only lower-bound utime error = %v, want ErrNotFound", err)
-	}
-	got, err := store.LookupBlockByUnixTime(ctx, key, 140)
-	if err != nil {
-		t.Fatalf("lookup served utime: %v", err)
-	}
-	if !got.Equals(&served) {
-		t.Fatalf("lookup served utime block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(served))
-	}
+type pebbleAccountPathLookupTest struct {
+	name            string
+	topSeqno        uint32
+	intermediateSeq uint32
+	pathSeqno       uint32
+	siblingSeqno    uint32
+	topEndLT        uint64
+	pathStartLT     uint64
+	siblingStartLT  uint64
+	lookupLT        uint64
 }
 
 func TestPebbleStorageLookupBlockByAccountLTUsesShardPrefixPath(t *testing.T) {
-	store := openTestPebbleStorage(t)
-	ctx := context.Background()
-	account := bytes.Repeat([]byte{0x40}, 32)
-	shards := storage.AccountShardCandidates(0, account)
-	if len(shards) < 3 {
-		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
+	tests := []pebbleAccountPathLookupTest{
+		{
+			name:            "exact interval on shard path",
+			topSeqno:        10,
+			intermediateSeq: 15,
+			pathSeqno:       20,
+			siblingSeqno:    30,
+			topEndLT:        100,
+			pathStartLT:     101,
+			siblingStartLT:  101,
+			lookupLT:        150,
+		},
+		{
+			name:            "lower bound on shard path",
+			topSeqno:        50,
+			intermediateSeq: 40,
+			pathSeqno:       20,
+			siblingSeqno:    10,
+			topEndLT:        500,
+			pathStartLT:     150,
+			siblingStartLT:  1,
+			lookupLT:        125,
+		},
 	}
 
-	topBlock := testPebbleBlockID(0, topShard, 10)
-	intermediateBlock := testPebbleBlockID(0, shards[1], 15)
-	pathBlock := testPebbleBlockID(0, shards[2], 20)
-	siblingBlock := testPebbleBlockID(0, int64(0x2000000000000000), 30)
-	for _, meta := range []*storage.BlockMeta{
-		{ID: topBlock, StartLT: 1, EndLT: 100},
-		{ID: intermediateBlock, StartLT: 1, EndLT: 100},
-		{ID: pathBlock, StartLT: 101, EndLT: 200},
-		{ID: siblingBlock, StartLT: 101, EndLT: 200},
-	} {
-		saveTestPebbleFullBlockMeta(t, store, meta)
-	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openTestPebbleStorage(t)
+			ctx := context.Background()
+			account := bytes.Repeat([]byte{0x40}, 32)
+			shards := mustStorageAccountShardCandidates(t, 0, account)
+			if len(shards) < 3 {
+				t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
+			}
 
-	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 150)
-	if err != nil {
-		t.Fatalf("lookup account lt: %v", err)
-	}
-	if !got.Equals(&pathBlock) {
-		t.Fatalf("lookup account block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(pathBlock))
+			topBlock := testPebbleBlockID(0, topShard, test.topSeqno)
+			intermediateBlock := testPebbleBlockID(0, shards[1], test.intermediateSeq)
+			pathBlock := testPebbleBlockID(0, shards[2], test.pathSeqno)
+			siblingBlock := testPebbleBlockID(0, int64(0x2000000000000000), test.siblingSeqno)
+			for _, meta := range []*storage.BlockMeta{
+				{ID: topBlock, StartLT: 1, EndLT: test.topEndLT},
+				{ID: intermediateBlock, StartLT: 1, EndLT: 100},
+				{ID: pathBlock, StartLT: test.pathStartLT, EndLT: 200},
+				{ID: siblingBlock, StartLT: test.siblingStartLT, EndLT: 200},
+			} {
+				saveTestPebbleFullBlockMeta(t, store, meta)
+			}
+
+			got, err := store.LookupBlockByAccountLT(ctx, 0, account, test.lookupLT)
+			if err != nil {
+				t.Fatalf("lookup account lt: %v", err)
+			}
+			if !got.Equals(&pathBlock) {
+				t.Fatalf("lookup account block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(pathBlock))
+			}
+		})
 	}
 }
 
@@ -305,7 +393,7 @@ func TestPebbleStorageLookupBlockByAccountLTDoesNotSkipMetadataOnlyBestCandidate
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 	account := bytes.Repeat([]byte{0x40}, 32)
-	shards := storage.AccountShardCandidates(0, account)
+	shards := mustStorageAccountShardCandidates(t, 0, account)
 	if len(shards) < 3 {
 		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
 	}
@@ -356,42 +444,11 @@ func TestPebbleStorageLookupBlockByAccountLTDoesNotReturnFloorBlock(t *testing.T
 	}
 }
 
-func TestPebbleStorageLookupBlockByAccountLTReturnsLowerBoundOnShardPath(t *testing.T) {
-	store := openTestPebbleStorage(t)
-	ctx := context.Background()
-	account := bytes.Repeat([]byte{0x40}, 32)
-	shards := storage.AccountShardCandidates(0, account)
-	if len(shards) < 3 {
-		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
-	}
-
-	topBlock := testPebbleBlockID(0, topShard, 50)
-	intermediateBlock := testPebbleBlockID(0, shards[1], 40)
-	pathBlock := testPebbleBlockID(0, shards[2], 20)
-	siblingBlock := testPebbleBlockID(0, int64(0x2000000000000000), 10)
-	for _, meta := range []*storage.BlockMeta{
-		{ID: topBlock, StartLT: 1, EndLT: 500},
-		{ID: intermediateBlock, StartLT: 1, EndLT: 100},
-		{ID: pathBlock, StartLT: 150, EndLT: 200},
-		{ID: siblingBlock, StartLT: 1, EndLT: 200},
-	} {
-		saveTestPebbleFullBlockMeta(t, store, meta)
-	}
-
-	got, err := store.LookupBlockByAccountLT(ctx, 0, account, 125)
-	if err != nil {
-		t.Fatalf("lookup account lt lower-bound: %v", err)
-	}
-	if !got.Equals(&pathBlock) {
-		t.Fatalf("lookup account lower-bound block = %s, want %s", storage.FormatBlockRef(got), storage.FormatBlockRef(pathBlock))
-	}
-}
-
 func TestPebbleStorageLookupBlockForPrefixMatchesCppShardPath(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustStorageShardPrefixCandidates(t, uint64(prefix))
 	if len(shards) < 3 {
 		t.Fatalf("shard prefix candidates = %d, want at least 3", len(shards))
 	}
@@ -451,7 +508,7 @@ func TestPebbleStorageLookupBlockForPrefixDoesNotSkipMetadataOnlyCandidate(t *te
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustStorageShardPrefixCandidates(t, uint64(prefix))
 
 	metadataOnly := testPebbleBlockID(0, shards[2], 20)
 	intermediate := testPebbleBlockID(0, shards[1], 40)
@@ -490,7 +547,7 @@ func TestPebbleStorageLookupBlockForPrefixStopsAfterHistoryGap(t *testing.T) {
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustStorageShardPrefixCandidates(t, uint64(prefix))
 
 	rootBlock := testPebbleBlockID(0, shards[0], 50)
 	deeperBlock := testPebbleBlockID(0, shards[2], 20)
@@ -517,7 +574,7 @@ func TestPebbleStorageLookupBlockBySeqNoForPrefixStopsAfterHistoryGap(t *testing
 	store := openTestPebbleStorage(t)
 	ctx := context.Background()
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustStorageShardPrefixCandidates(t, uint64(prefix))
 
 	rootBlock := testPebbleBlockID(0, shards[0], 10)
 	blockPastGap := testPebbleBlockID(0, shards[2], 20)
@@ -576,11 +633,13 @@ func TestPebbleStorageLookupBlockForPrefixDirectPathPreservesSplitBoundary(t *te
 
 var pebbleLookupBenchSink ton.BlockIDExt
 
+type pebbleLookupBenchmarkTest struct {
+	name  string
+	depth uint32
+}
+
 func BenchmarkPebbleStorageLookupBlockForPrefix(b *testing.B) {
-	tests := []struct {
-		name  string
-		depth uint32
-	}{
+	tests := []pebbleLookupBenchmarkTest{
 		{name: "depth_6", depth: 6},
 		{name: "depth_60", depth: 60},
 	}
@@ -591,7 +650,11 @@ func BenchmarkPebbleStorageLookupBlockForPrefix(b *testing.B) {
 			ctx := context.Background()
 			prefix := int64(0x4000000000000008)
 			for depth := uint32(0); depth < tt.depth; depth++ {
-				ancestor := testPebbleBlockID(0, storage.AccountShardPrefix(uint64(prefix), depth), depth+1)
+				ancestorShard, err := sharddomain.FromAccountPrefix(uint64(prefix), depth)
+				if err != nil {
+					b.Fatal(err)
+				}
+				ancestor := testPebbleBlockID(0, ancestorShard, depth+1)
 				saveTestPebbleFullBlockMeta(b, store, &storage.BlockMeta{
 					ID:       ancestor,
 					StartLT:  uint64(depth) + 1,
@@ -600,7 +663,10 @@ func BenchmarkPebbleStorageLookupBlockForPrefix(b *testing.B) {
 				})
 			}
 
-			shard := storage.AccountShardPrefix(uint64(prefix), tt.depth)
+			shard, err := sharddomain.FromAccountPrefix(uint64(prefix), tt.depth)
+			if err != nil {
+				b.Fatal(err)
+			}
 			previous := testPebbleBlockID(0, shard, 69)
 			block := testPebbleBlockID(0, shard, 70)
 			saveTestPebbleFullBlockMeta(b, store, &storage.BlockMeta{
@@ -834,7 +900,7 @@ func TestPebbleStorageLoadsCellsByRepresentationHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect cell records: %v", err)
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save cells: %v", err)
 	}
 
@@ -859,7 +925,7 @@ func TestPebbleStorageLoadsCellsByRepresentationHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect full cell records: %v", err)
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save full cells: %v", err)
 	}
 
@@ -888,7 +954,7 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect cell records: %v", err)
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save cells: %v", err)
 	}
 
@@ -948,7 +1014,7 @@ func TestPebbleStorageLoadsLazyCells(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect pruned cell records: %v", err)
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save pruned cells: %v", err)
 	}
 

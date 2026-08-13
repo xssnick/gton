@@ -35,14 +35,10 @@ func growLargeBOCRecords[T any](dst []T, n int) []T {
 
 type largeBOCRecordVisitor func(shardIdx int, workerIdx int, index int, hash []byte, value []byte) error
 
-// LargeBOCLoadMeta loads compact cell metadata for tonutils-go large-BOC
-// serialization. The method groups requests by celldb shard and loads shards in
-// parallel while preserving the input order.
-func (s *Store) LargeBOCLoadMeta(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error) {
-	return s.LargeBOCLoadMetaInGeneration(ctx, 0, hashes, dst)
-}
-
-func (s *Store) LargeBOCLoadMetaInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error) {
+// largeBOCLoadMetaInGeneration loads compact cell metadata for tonutils-go
+// large-BOC serialization. It groups requests by celldb shard and loads shards
+// in parallel while preserving the input order.
+func (s *Store) largeBOCLoadMetaInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCMetaRecord) ([]cell.LargeBOCMetaRecord, error) {
 	base := len(dst)
 	dst = growLargeBOCRecords(dst, len(hashes))
 
@@ -61,14 +57,10 @@ func (s *Store) LargeBOCLoadMetaInGeneration(ctx context.Context, generation uin
 	return dst, nil
 }
 
-// LargeBOCLoadPayload loads raw cell payloads for tonutils-go large-BOC
+// largeBOCLoadPayloadInGeneration loads raw cell payloads for tonutils-go large-BOC
 // serialization. Payload bytes are copied out of Pebble values because Pebble
 // invalidates Get buffers after the closer is closed.
-func (s *Store) LargeBOCLoadPayload(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error) {
-	return s.LargeBOCLoadPayloadInGeneration(ctx, 0, hashes, dst)
-}
-
-func (s *Store) LargeBOCLoadPayloadInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error) {
+func (s *Store) largeBOCLoadPayloadInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCPayloadRecord) ([]cell.LargeBOCPayloadRecord, error) {
 	base := len(dst)
 	dst = growLargeBOCRecords(dst, len(hashes))
 
@@ -96,15 +88,11 @@ func (s *Store) LargeBOCLoadPayloadInGeneration(ctx context.Context, generation 
 	return dst, nil
 }
 
-// LargeBOCLoadCells loads compact cell metadata and payloads together for
+// largeBOCLoadCellsInGeneration loads compact cell metadata and payloads together for
 // tonutils-go one-pass large-BOC serialization. Payload bytes are copied out of
 // Pebble values and retained in worker-local arenas owned by the returned
 // records.
-func (s *Store) LargeBOCLoadCells(ctx context.Context, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error) {
-	return s.LargeBOCLoadCellsInGeneration(ctx, 0, hashes, dst)
-}
-
-func (s *Store) LargeBOCLoadCellsInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error) {
+func (s *Store) largeBOCLoadCellsInGeneration(ctx context.Context, generation uint64, hashes []cell.Hash, dst []cell.LargeBOCRecord) ([]cell.LargeBOCRecord, error) {
 	base := len(dst)
 	dst = growLargeBOCRecords(dst, len(hashes))
 

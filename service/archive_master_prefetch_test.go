@@ -57,12 +57,13 @@ func TestNextArchiveMasterDownloadSeqnoUsesActualSequenceBoundary(t *testing.T) 
 func TestArchiveMasterDownloadTaskIsSingleConsumer(t *testing.T) {
 	downloaded := &archive.Downloaded{Data: []byte{1, 2, 3}}
 	taskCtx, cancelTask := context.WithCancel(context.Background())
+	finished := make(chan struct{})
 	task := &archiveMasterDownloadTask{
 		startSeqno: 10,
 		cancel:     cancelTask,
 		done:       make(chan archiveMasterDownloadResult),
+		joined:     finished,
 	}
-	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
 		defer cancelTask()
@@ -87,12 +88,13 @@ func TestArchiveMasterDownloadTaskIsSingleConsumer(t *testing.T) {
 func TestArchiveMasterDownloadTaskDiscardReleasesData(t *testing.T) {
 	downloaded := &archive.Downloaded{Data: make([]byte, 4<<20)}
 	taskCtx, cancelTask := context.WithCancel(context.Background())
+	finished := make(chan struct{})
 	task := &archiveMasterDownloadTask{
 		startSeqno: 10,
 		cancel:     cancelTask,
 		done:       make(chan archiveMasterDownloadResult),
+		joined:     finished,
 	}
-	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
 		defer cancelTask()
@@ -109,12 +111,13 @@ func TestArchiveMasterDownloadTaskDiscardReleasesData(t *testing.T) {
 func TestArchiveMasterDownloadTaskCancellationLetsProducerReleaseResult(t *testing.T) {
 	downloaded := &archive.Downloaded{Data: make([]byte, 1<<20)}
 	taskCtx, cancelTask := context.WithCancel(context.Background())
+	finished := make(chan struct{})
 	task := &archiveMasterDownloadTask{
 		startSeqno: 10,
 		cancel:     cancelTask,
 		done:       make(chan archiveMasterDownloadResult),
+		joined:     finished,
 	}
-	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
 		defer cancelTask()
@@ -186,8 +189,8 @@ func TestArchiveMasterImportDropsInvalidCacheAndRetriesWhenPeerIsGone(t *testing
 				}
 			}()
 
-			runner := &archiveCatchUpRunner{
-				service:        &Service{log: zerolog.Nop()},
+			runner := &archiveCatchUpRun{
+				archive:        &ArchiveRunner{log: zerolog.Nop()},
 				archiveSession: newTestArchiveSession(t),
 				importCache:    cache,
 			}
@@ -241,8 +244,8 @@ func TestArchiveMasterImportDoesNotPrecheckBlockAfterSyncUntil(t *testing.T) {
 		t.Fatalf("seed sync_until cache: %v", err)
 	}
 
-	runner := &archiveCatchUpRunner{
-		service:     &Service{log: zerolog.Nop(), syncUntil: syncUntil},
+	runner := &archiveCatchUpRun{
+		archive:     &ArchiveRunner{log: zerolog.Nop(), syncUntil: syncUntil},
 		importCache: cache,
 	}
 	result, _, err := runner.startArchiveMasterImport(ctx, nil, start.Block, start, 11, nil).wait(ctx)

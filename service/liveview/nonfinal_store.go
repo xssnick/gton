@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/xssnick/gton/service/blockproof"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -288,7 +289,7 @@ func (s *Store) NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.Bloc
 	signed := make([]ton.BlockIDExt, 0)
 	candidates := make([]ton.BlockIDExt, 0)
 	for _, pending := range s.nonFinalPending {
-		if filter != nil && !blockproof.ShardIntersects(*filter, storage.ShardKeyFromBlock(pending.block)) {
+		if filter != nil && (filter.Workchain != pending.block.Workchain || !sharddomain.Intersects(filter.Shard, pending.block.Shard)) {
 			continue
 		}
 		if pending.kind&storage.LiveBlockNonfinalSigned != 0 {
@@ -742,7 +743,7 @@ func (s *Store) nonfinalCoveredByCurrentLocked(block ton.BlockIDExt) bool {
 	key := storage.ShardKeyFromBlock(block)
 	for _, shard := range s.current.Shards {
 		shardKey := storage.ShardKeyFromBlock(shard.Block)
-		if !blockproof.ShardIntersects(key, shardKey) {
+		if key.Workchain != shardKey.Workchain || !sharddomain.Intersects(key.Shard, shardKey.Shard) {
 			continue
 		}
 		if shard.Block.SeqNo >= block.SeqNo {

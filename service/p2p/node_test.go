@@ -17,28 +17,6 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func TestEventDeduperEvictsOldestWithCap(t *testing.T) {
-	deduper := newEventDeduper(time.Hour, 2)
-	now := time.Unix(100, 0)
-
-	if !deduper.Mark("a", now) {
-		t.Fatal("first a mark was not accepted")
-	}
-	if !deduper.Mark("b", now.Add(time.Second)) {
-		t.Fatal("first b mark was not accepted")
-	}
-	if !deduper.Mark("c", now.Add(2*time.Second)) {
-		t.Fatal("first c mark was not accepted")
-	}
-
-	if !deduper.Mark("a", now.Add(3*time.Second)) {
-		t.Fatal("oldest entry was not evicted when cap was exceeded")
-	}
-	if deduper.Mark("c", now.Add(4*time.Second)) {
-		t.Fatal("recent entry was not retained")
-	}
-}
-
 func TestPendingBroadcastExpiryReleasesDeduper(t *testing.T) {
 	node := newTestNode(t)
 	now := time.Unix(100, 0)
@@ -110,18 +88,34 @@ func TestOverlayBlockForDownloadUsesMonitorMinSplitDepth(t *testing.T) {
 	node := newTestNode(t)
 	block := testBlockID(0, int64(-0x2000000000000000), 10)
 
-	if got := node.overlayBlockForDownload(block); got.Shard != topShard {
+	got, err := node.overlayBlockForDownload(block)
+	if err != nil {
+		t.Fatalf("default overlay block: %v", err)
+	}
+	if got.Shard != topShard {
 		t.Fatalf("default overlay shard = %016x, want top shard", uint64(got.Shard))
 	}
 
 	node.SetMonitorMinSplitDepth(0, 1)
-	if got := node.overlayBlockForDownload(block); got.Shard != int64(-0x4000000000000000) {
+	got, err = node.overlayBlockForDownload(block)
+	if err != nil {
+		t.Fatalf("depth 1 overlay block: %v", err)
+	}
+	if got.Shard != int64(-0x4000000000000000) {
 		t.Fatalf("depth 1 overlay shard = %016x, want c000000000000000", uint64(got.Shard))
 	}
 
 	node.SetMonitorMinSplitDepth(0, 2)
-	if got := node.overlayBlockForDownload(block); got.Shard != block.Shard {
+	got, err = node.overlayBlockForDownload(block)
+	if err != nil {
+		t.Fatalf("depth 2 overlay block: %v", err)
+	}
+	if got.Shard != block.Shard {
 		t.Fatalf("depth 2 overlay shard = %016x, want exact %016x", uint64(got.Shard), uint64(block.Shard))
+	}
+
+	if _, err := node.overlayBlockForDownload(ton.BlockIDExt{Workchain: 0}); err == nil {
+		t.Fatal("zero shard overlay block should be rejected")
 	}
 }
 
@@ -155,11 +149,11 @@ func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
 		t.Fatalf("set active left overlay: %v", err)
 	}
 
-	leftSub := testSubscriptionForOverlay(t, node, 0, leftShard)
+	leftSub := testSubscriptionForBasechainOverlay(t, node, leftShard)
 	if !leftSub.isActive() {
 		t.Fatal("left shard overlay should be active")
 	}
-	baseSub := testSubscriptionForOverlay(t, node, 0, topShard)
+	baseSub := testSubscriptionForBasechainOverlay(t, node, topShard)
 	if !baseSub.isActive() {
 		t.Fatal("basechain parent overlay should be active")
 	}
@@ -175,7 +169,7 @@ func TestSetActiveShardOverlaysTracksMonitorPrefixes(t *testing.T) {
 	if !ok || !deleteAt.After(time.Now()) {
 		t.Fatalf("left shard inactive expiry = %v, ok=%v", deleteAt, ok)
 	}
-	rightSub := testSubscriptionForOverlay(t, node, 0, rightShard)
+	rightSub := testSubscriptionForBasechainOverlay(t, node, rightShard)
 	if !rightSub.isActive() {
 		t.Fatal("right shard overlay should be active")
 	}
@@ -263,7 +257,12 @@ func TestStatusSnapshotTracksLatestSplitBasechainBlocks(t *testing.T) {
 func TestRawMasterchainBroadcastDoesNotMoveObservedOrSeen(t *testing.T) {
 	logger := discardLogger()
 	store := newTestPebbleStore(t)
-	node, err := New(Options{Logger: &logger, Storage: store, StateFilesDir: t.TempDir()})
+	node, err := New(Options{
+		Logger:               &logger,
+		PeerStorage:          store,
+		StateArtifactStorage: store,
+		StateFilesDir:        t.TempDir(),
+	})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -444,7 +443,12 @@ func TestNodeIsHardforkRequiresExactFullBlockID(t *testing.T) {
 func TestRememberSeenMasterchainKeepsNewestRuntimeHint(t *testing.T) {
 	logger := discardLogger()
 	store := newTestPebbleStore(t)
-	node, err := New(Options{Logger: &logger, Storage: store, StateFilesDir: t.TempDir()})
+	node, err := New(Options{
+		Logger:               &logger,
+		PeerStorage:          store,
+		StateArtifactStorage: store,
+		StateFilesDir:        t.TempDir(),
+	})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -492,20 +496,15 @@ func TestNewUsesConfiguredADNLKeys(t *testing.T) {
 	}
 
 	node, err := New(Options{
-		PrivateKey:         priv,
-		DHTPrivateKey:      dhtPriv,
-		DHTListenAddr:      "127.0.0.1:30304",
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		PrivateKey:    priv,
+		DHTPrivateKey: dhtPriv,
+		DHTListenAddr: "127.0.0.1:30304",
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
-	t.Cleanup(func() {
-		if node.storage != nil {
-			_ = node.storage.Close()
-		}
-	})
 
 	if !bytes.Equal(node.privKey, priv) {
 		t.Fatal("expected configured ADNL key to be used")
@@ -515,12 +514,12 @@ func TestNewUsesConfiguredADNLKeys(t *testing.T) {
 	}
 }
 
-func testSubscriptionForOverlay(tb testing.TB, node *Node, workchain int32, shard int64) *overlaySubscription {
+func testSubscriptionForBasechainOverlay(tb testing.TB, node *Node, shard int64) *overlaySubscription {
 	tb.Helper()
 
-	sub, ok := findSubscriptionForOverlay(tb, node, workchain, shard)
+	sub, ok := findSubscriptionForOverlay(tb, node, 0, shard)
 	if !ok {
-		tb.Fatalf("missing overlay subscription for %d:%016x", workchain, uint64(shard))
+		tb.Fatalf("missing basechain overlay subscription for %016x", uint64(shard))
 	}
 	return sub
 }

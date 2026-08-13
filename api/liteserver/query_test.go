@@ -18,7 +18,7 @@ import (
 	"github.com/xssnick/gton/service/blockproof"
 	admission "github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/liveview"
-	"github.com/xssnick/gton/service/p2p"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -322,7 +322,7 @@ func TestHandleSendMessageWithLiveStoreCachesBlockFragments(t *testing.T) {
 
 func TestLiveStoreCurrentAccountBlocksUsesSpecificLiveShard(t *testing.T) {
 	accountID := bytes.Repeat([]byte{0x42}, 32)
-	candidates := storage.AccountShardCandidates(0, accountID)
+	candidates := mustAccountShardCandidates(t, 0, accountID)
 	if len(candidates) < 2 {
 		t.Fatal("expected account shard candidates")
 	}
@@ -372,7 +372,7 @@ func TestLiveStoreCurrentAccountBlocksUsesSpecificLiveShard(t *testing.T) {
 
 func TestLiveStoreCurrentAccountBlocksUsesStoredCurrentInit(t *testing.T) {
 	accountID := bytes.Repeat([]byte{0x43}, 32)
-	candidates := storage.AccountShardCandidates(0, accountID)
+	candidates := mustAccountShardCandidates(t, 0, accountID)
 	masterStateRoot := cell.BeginCell().MustStoreUInt(0x43, 8).EndCell()
 	master, masterRoot := testBlockForState(t, masterchainID, masterchainShard, 10, masterStateRoot)
 	masterData := testBlockBOC(masterRoot)
@@ -491,7 +491,7 @@ func TestSendMessageBroadcastCapacityErrorReason(t *testing.T) {
 }
 
 func TestSendMessageOfflineErrorReason(t *testing.T) {
-	got := sendMessageBroadcastErrorReason(p2p.ErrOffline)
+	got := sendMessageBroadcastErrorReason(fmt.Errorf("broadcast external message: %w", extmsg.ErrNetworkOffline))
 	if got != sendMessageErrorReasonOffline {
 		t.Fatalf("broadcast error reason = %q, want %q", got, sendMessageErrorReasonOffline)
 	}
@@ -521,7 +521,7 @@ func TestHandleSendMessageRejectsAddressOverLimitBeforeTVM(t *testing.T) {
 	srv := testServer(&fakeStore{})
 	srv.messageSender = &fakeMessageSender{}
 
-	key := admission.AddressKey(addr)
+	key := extmsg.AddressKeyFor(addr)
 	now := srv.now()
 	for i := 0; i < extmsg.DefaultAddressLimit; i++ {
 		if err := srv.externalMessageLimiter.Add(key, now); err != nil {
@@ -1496,7 +1496,7 @@ func TestLiveStoreHistoryIndexesMatchLookupRules(t *testing.T) {
 func TestLiveStoreLookupBlockByAccountLTUsesLowerBoundShardPath(t *testing.T) {
 	live := NewLiveStore(&fakeStore{})
 	account := bytes.Repeat([]byte{0x40}, 32)
-	shards := storage.AccountShardCandidates(0, account)
+	shards := mustAccountShardCandidates(t, 0, account)
 	if len(shards) < 3 {
 		t.Fatalf("account shard candidates = %d, want at least 3", len(shards))
 	}
@@ -1546,7 +1546,7 @@ func TestLiveStoreLookupBlockForPrefixUsesCppShardPath(t *testing.T) {
 	store := &fakeStore{}
 	live := NewLiveStore(store)
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustShardPrefixCandidates(t, 0, uint64(prefix))
 
 	rootKey := storage.BlockHistoryKey{Workchain: 0, Shard: shards[0]}
 	pathKey := storage.BlockHistoryKey{Workchain: 0, Shard: shards[2]}
@@ -1672,7 +1672,10 @@ func TestLiveStoreLookupBlockBySeqNoForPrefixRejectsFutureBeforeStorage(t *testi
 
 func TestLiveStoreLookupBlockForPrefixAvoidsRedundantMetaReadForFlushedBlock(t *testing.T) {
 	prefix := int64(0x4000000000000008)
-	shard := storage.AccountShardPrefix(uint64(prefix), 6)
+	shard, err := sharddomain.FromAccountPrefix(uint64(prefix), 6)
+	if err != nil {
+		t.Fatal(err)
+	}
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: shard}
 	block := testLiveStoreIndexBlock(20, key)
 	store := &fakeStore{
@@ -2212,7 +2215,7 @@ func TestLookupBlockBySeqnoReturnsBlockHeader(t *testing.T) {
 
 func TestLookupBlockSelectorsUseCppShardPrefixPath(t *testing.T) {
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustShardPrefixCandidates(t, 0, uint64(prefix))
 	target := ton.BlockIDExt{
 		Workchain: 0,
 		Shard:     shards[2],
@@ -2979,7 +2982,7 @@ func TestLookupBlockWithProofIncludesPrevHeaderForLTLookup(t *testing.T) {
 
 func TestLookupBlockWithProofUsesCppShardPrefixPath(t *testing.T) {
 	prefix := int64(0x4000000000000008)
-	shards := storage.ShardPrefixCandidates(0, uint64(prefix))
+	shards := mustShardPrefixCandidates(t, 0, uint64(prefix))
 	target := ton.BlockIDExt{
 		Workchain: 0,
 		Shard:     shards[2],
@@ -4496,7 +4499,7 @@ func TestListBlockTransactionsAndGetOneTransaction(t *testing.T) {
 	account := bytes.Repeat([]byte{0x55}, 32)
 	tx1 := cell.BeginCell().MustStoreUInt(0x1111, 16).EndCell()
 	tx2 := cell.BeginCell().MustStoreUInt(0x2222, 16).EndCell()
-	root := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	root := testBlockWithTransactions(t, account, map[uint64]*cell.Cell{
 		10: tx1,
 		20: tx2,
 	})
@@ -4598,7 +4601,7 @@ func TestGetTransactionsTraversesPreviousChain(t *testing.T) {
 	account := bytes.Repeat([]byte{0x55}, 32)
 	oldTx := testTransactionWithPrev(t, account, 10, 0, bytes.Repeat([]byte{0x00}, 32))
 	newTx := testTransactionWithPrev(t, account, 20, 10, oldTx.Hash())
-	root := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	root := testBlockWithTransactions(t, account, map[uint64]*cell.Cell{
 		10: oldTx,
 		20: newTx,
 	})
@@ -4646,10 +4649,10 @@ func TestGetTransactionsUsesShardHintForPreviousBlock(t *testing.T) {
 	account := bytes.Repeat([]byte{0x5d}, 32)
 	oldTx := testTransactionWithPrev(t, account, 10, 0, bytes.Repeat([]byte{0x00}, 32))
 	newTx := testTransactionWithPrev(t, account, 20, 10, oldTx.Hash())
-	oldRoot := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	oldRoot := testBlockWithTransactions(t, account, map[uint64]*cell.Cell{
 		10: oldTx,
 	})
-	newRoot := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	newRoot := testBlockWithTransactions(t, account, map[uint64]*cell.Cell{
 		20: newTx,
 	})
 	oldID := testBlockIDForRoot(0, masterchainShard, 1, oldRoot)
@@ -4713,36 +4716,71 @@ func TestGetTransactionsCurrentBlockSkipsOutOfHeaderRange(t *testing.T) {
 	}
 }
 
-func TestGetTransactionsMissingFirstReturnsError(t *testing.T) {
-	account := bytes.Repeat([]byte{0x56}, 32)
-	tx := testTransactionWithPrev(t, account, 30, 0, bytes.Repeat([]byte{0x00}, 32))
-	root := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
-		30: tx,
-	})
-	id := testBlockIDForRoot(0, masterchainShard, 1, root)
-	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
-	store := &fakeStore{
-		blocks: map[storage.BlockRootHash][]byte{
-			storage.BlockKey(id): testBlockBOC(root),
-		},
-		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
-			fakeLTKey(key, 20): id,
-		},
-	}
-	srv := testServer(store)
+type getTransactionsInvalidFirstTest struct {
+	name      string
+	account   byte
+	txLT      uint64
+	lookupLT  int64
+	limit     int32
+	queryHash []byte
+	wantText  string
+}
 
-	resp := srv.handleQuery(context.Background(), ton.GetTransactions{
-		Limit:  2,
-		AccID:  &ton.AccountID{Workchain: 0, ID: account},
-		LT:     20,
-		TxHash: bytes.Repeat([]byte{0x11}, 32),
-	})
-	lsErr, ok := resp.(ton.LSError)
-	if !ok {
-		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
+func TestGetTransactionsRejectsInvalidFirstTransaction(t *testing.T) {
+	tests := []getTransactionsInvalidFirstTest{
+		{
+			name:      "missing first transaction at requested lt",
+			account:   0x56,
+			txLT:      30,
+			lookupLT:  20,
+			limit:     2,
+			queryHash: bytes.Repeat([]byte{0x11}, 32),
+			wantText:  "cannot locate transaction in block with specified logical time",
+		},
+		{
+			name:      "hash mismatch for requested transaction",
+			account:   0x58,
+			txLT:      20,
+			lookupLT:  20,
+			limit:     1,
+			queryHash: bytes.Repeat([]byte{0x99}, 32),
+			wantText:  "transaction hash mismatch",
+		},
 	}
-	if lsErr.Code != -400 || lsErr.Text != "cannot locate transaction in block with specified logical time" {
-		t.Fatalf("unexpected error: %+v", lsErr)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			account := bytes.Repeat([]byte{tt.account}, 32)
+			tx := testTransactionWithPrev(t, account, tt.txLT, 0, bytes.Repeat([]byte{0x00}, 32))
+			root := testBlockWithTransactions(t, account, map[uint64]*cell.Cell{
+				tt.txLT: tx,
+			})
+			id := testBlockIDForRoot(0, masterchainShard, 1, root)
+			key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
+			store := &fakeStore{
+				blocks: map[storage.BlockRootHash][]byte{
+					storage.BlockKey(id): testBlockBOC(root),
+				},
+				ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
+					fakeLTKey(key, uint64(tt.lookupLT)): id,
+				},
+			}
+			srv := testServer(store)
+
+			resp := srv.handleQuery(context.Background(), ton.GetTransactions{
+				Limit:  tt.limit,
+				AccID:  &ton.AccountID{Workchain: 0, ID: account},
+				LT:     tt.lookupLT,
+				TxHash: tt.queryHash,
+			})
+			lsErr, ok := resp.(ton.LSError)
+			if !ok {
+				t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
+			}
+			if lsErr.Code != -400 || lsErr.Text != tt.wantText {
+				t.Fatalf("unexpected error: %+v", lsErr)
+			}
+		})
 	}
 }
 
@@ -4769,7 +4807,7 @@ func TestGetTransactionsMissingBlockLookupReturnsLocateError(t *testing.T) {
 func TestGetTransactionsReturnsPartialAfterChainGap(t *testing.T) {
 	account := bytes.Repeat([]byte{0x57}, 32)
 	newTx := testTransactionWithPrev(t, account, 20, 10, bytes.Repeat([]byte{0x77}, 32))
-	root := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	root := testBlockWithTransactions(t, account, map[uint64]*cell.Cell{
 		20: newTx,
 	})
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
@@ -4804,39 +4842,6 @@ func TestGetTransactionsReturnsPartialAfterChainGap(t *testing.T) {
 	}
 }
 
-func TestGetTransactionsRejectsHashMismatch(t *testing.T) {
-	account := bytes.Repeat([]byte{0x58}, 32)
-	tx := testTransactionWithPrev(t, account, 20, 0, bytes.Repeat([]byte{0x00}, 32))
-	root := testBlockWithTransactions(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
-		20: tx,
-	})
-	id := testBlockIDForRoot(0, masterchainShard, 1, root)
-	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
-	store := &fakeStore{
-		blocks: map[storage.BlockRootHash][]byte{
-			storage.BlockKey(id): testBlockBOC(root),
-		},
-		ltLookup: map[fakeLTLookupKey]ton.BlockIDExt{
-			fakeLTKey(key, 20): id,
-		},
-	}
-	srv := testServer(store)
-
-	resp := srv.handleQuery(context.Background(), ton.GetTransactions{
-		Limit:  1,
-		AccID:  &ton.AccountID{Workchain: 0, ID: account},
-		LT:     20,
-		TxHash: bytes.Repeat([]byte{0x99}, 32),
-	})
-	lsErr, ok := resp.(ton.LSError)
-	if !ok {
-		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
-	}
-	if lsErr.Code != -400 || lsErr.Text != "transaction hash mismatch" {
-		t.Fatalf("unexpected error: %+v", lsErr)
-	}
-}
-
 func TestGetTransactionsCapsLimitAtSixteen(t *testing.T) {
 	account := bytes.Repeat([]byte{0x59}, 32)
 	zeroHash := bytes.Repeat([]byte{0x00}, 32)
@@ -4854,7 +4859,7 @@ func TestGetTransactionsCapsLimitAtSixteen(t *testing.T) {
 		prevLT = lt
 		prevHash = tx.Hash()
 	}
-	root := testBlockWithTransactions(t, 0, masterchainShard, account, txs)
+	root := testBlockWithTransactions(t, account, txs)
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 	key := storage.BlockHistoryKey{Workchain: 0, Shard: masterchainShard}
 	store := &fakeStore{
@@ -4916,7 +4921,7 @@ func BenchmarkTransactionSearchBlockRepeatedAccount(b *testing.B) {
 	for i := range transactionCount {
 		txs[uint64(i+1)] = cell.BeginCell().EndCell()
 	}
-	root := testBlockWithTransactions(b, 0, masterchainShard, account, txs)
+	root := testBlockWithTransactions(b, account, txs)
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
 
 	b.ReportAllocs()
@@ -4939,7 +4944,7 @@ func TestListBlockTransactionsMode256ReturnsTransactionMetadata(t *testing.T) {
 	tx, msg := testTransactionWithRefStoredInMsg(t, account, 42)
 	envelope := testMsgEnvelopeWithMetadata(t, msg, initiator, 3, 99)
 	inMsgDesc := testInMsgDescr(t, msg, envelope, tx)
-	root := testBlockWithTransactionsAndInMsgDesc(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	root := testBlockWithTransactionsAndInMsgDesc(t, account, map[uint64]*cell.Cell{
 		42: tx,
 	}, inMsgDesc)
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
@@ -4981,7 +4986,7 @@ func TestListBlockTransactionsMetadataProofPrunesUnusedTransactionRefs(t *testin
 	tx, msg := testTransactionWithRefStoredInMsg(t, account, 42)
 	envelope := testMsgEnvelopeWithMetadata(t, msg, initiator, 3, 99)
 	inMsgDesc := testInMsgDescr(t, msg, envelope, tx)
-	root := testBlockWithTransactionsAndInMsgDesc(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	root := testBlockWithTransactionsAndInMsgDesc(t, account, map[uint64]*cell.Cell{
 		42: tx,
 	}, inMsgDesc)
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
@@ -5032,7 +5037,7 @@ func TestListBlockTransactionsMode256ErrorsWhenInMsgDescrEntryMissing(t *testing
 	otherTx, otherMsg := testTransactionWithInMsg(t, otherAccount, 43)
 	otherEnvelope := testMsgEnvelopeWithMetadata(t, otherMsg, otherAccount, 1, 43)
 	inMsgDesc := testInMsgDescr(t, otherMsg, otherEnvelope, otherTx)
-	root := testBlockWithTransactionsAndInMsgDesc(t, 0, masterchainShard, account, map[uint64]*cell.Cell{
+	root := testBlockWithTransactionsAndInMsgDesc(t, account, map[uint64]*cell.Cell{
 		42: tx,
 	}, inMsgDesc)
 	id := testBlockIDForRoot(0, masterchainShard, 1, root)
@@ -5070,7 +5075,7 @@ func BenchmarkListBlockTransactionsMetadataProof(b *testing.B) {
 	for i := range transactionCount {
 		txs[uint64(i+1)] = tx
 	}
-	root := testBlockWithTransactionsAndInMsgDesc(b, 0, masterchainShard, account, txs, inMsgDesc)
+	root := testBlockWithTransactionsAndInMsgDesc(b, account, txs, inMsgDesc)
 
 	var proofSize int
 	b.ReportAllocs()
@@ -5295,24 +5300,53 @@ func TestHandleDispatchQueueInfoEmptyQueue(t *testing.T) {
 	}
 	srv := testServer(store)
 
-	resp := srv.handleQuery(context.Background(), ton.GetDispatchQueueInfo{
-		Mode:        1,
+	for _, mode := range []uint32{0, 1} {
+		t.Run(fmt.Sprintf("mode_%d", mode), func(t *testing.T) {
+			resp := srv.handleQuery(context.Background(), ton.GetDispatchQueueInfo{
+				Mode:        mode,
+				ID:          blockproof.CloneBlockID(id),
+				MaxAccounts: 1,
+			})
+			info, ok := resp.(ton.DispatchQueueInfo)
+			if !ok {
+				t.Fatalf("response type = %T, want ton.DispatchQueueInfo: %+v", resp, resp)
+			}
+			if !info.Complete || len(info.AccountDispatchQueues) != 0 {
+				t.Fatalf("unexpected dispatch queue info: %+v", info)
+			}
+			if mode == 0 {
+				if len(info.Proof) != 0 {
+					t.Fatalf("proof size = %d without proof mode, want 0", len(info.Proof))
+				}
+				return
+			}
+
+			roots, err := cell.FromBOCMultiRoot(info.Proof)
+			if err != nil {
+				t.Fatalf("load dispatch queue proof: %v", err)
+			}
+			if len(roots) != 2 {
+				t.Fatalf("dispatch queue proof roots = %d, want 2", len(roots))
+			}
+		})
+	}
+}
+
+func TestHandleDispatchQueueInfoPreservesStateLoadFallback(t *testing.T) {
+	id := testBlockIDForRoot(0, masterchainShard, 15, cell.BeginCell().EndCell())
+	srv := testServer(&fakeStore{})
+
+	resp := srv.handleDispatchQueueInfo(context.Background(), ton.GetDispatchQueueInfo{
 		ID:          blockproof.CloneBlockID(id),
 		MaxAccounts: 1,
 	})
-	info, ok := resp.(ton.DispatchQueueInfo)
+	lsErr, ok := resp.(ton.LSError)
 	if !ok {
-		t.Fatalf("response type = %T, want ton.DispatchQueueInfo: %+v", resp, resp)
+		t.Fatalf("response type = %T, want ton.LSError: %+v", resp, resp)
 	}
-	if !info.Complete || len(info.AccountDispatchQueues) != 0 {
-		t.Fatalf("unexpected dispatch queue info: %+v", info)
-	}
-	roots, err := cell.FromBOCMultiRoot(info.Proof)
-	if err != nil {
-		t.Fatalf("load dispatch queue proof: %v", err)
-	}
-	if len(roots) != 2 {
-		t.Fatalf("dispatch queue proof roots = %d, want 2", len(roots))
+	wantPrefix := "cannot load state " + storage.FormatBlockRef(id) + ": "
+	if lsErr.Code != errCodeNotReady || !strings.HasPrefix(lsErr.Text, wantPrefix) {
+		t.Fatalf("state load error = %+v, want code %d text prefix %q", lsErr, errCodeNotReady, wantPrefix)
 	}
 }
 
@@ -6836,12 +6870,19 @@ func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size 
 	return root
 }
 
-func testBlockWithTransactions(t testing.TB, workchain int32, shard int64, account []byte, txs map[uint64]*cell.Cell) *cell.Cell {
-	return testBlockWithTransactionsAndInMsgDesc(t, workchain, shard, account, txs, cell.BeginCell().EndCell())
+func testBlockWithTransactions(t testing.TB, account []byte, txs map[uint64]*cell.Cell) *cell.Cell {
+	return testBlockWithTransactionsAndInMsgDesc(t, account, txs, cell.BeginCell().EndCell())
 }
 
-func testBlockWithTransactionsAndInMsgDesc(t testing.TB, workchain int32, shard int64, account []byte, txs map[uint64]*cell.Cell, inMsgDesc *cell.Cell) *cell.Cell {
+func testBlockWithTransactionsAndInMsgDesc(
+	t testing.TB,
+	account []byte,
+	txs map[uint64]*cell.Cell,
+	inMsgDesc *cell.Cell,
+) *cell.Cell {
 	t.Helper()
+	const workchain = int32(0)
+	shard := int64(masterchainShard)
 
 	txDict, err := cell.NewAugDict(64, testCurrencyCollectionAugmentation{})
 	if err != nil {
@@ -7808,9 +7849,33 @@ func (s *fakeStore) LookupBlockBySeqNo(_ context.Context, ref storage.BlockSeqRe
 	return ton.BlockIDExt{}, storage.ErrNotFound
 }
 
+func mustShardPrefixCandidates(tb testing.TB, workchain int32, prefix uint64) []int64 {
+	tb.Helper()
+
+	candidates, err := storage.ShardPrefixCandidates(workchain, prefix)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return candidates
+}
+
+func mustAccountShardCandidates(tb testing.TB, workchain int32, account []byte) []int64 {
+	tb.Helper()
+
+	candidates, err := storage.AccountShardCandidates(workchain, account)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return candidates
+}
+
 func (s *fakeStore) LookupBlockBySeqNoForPrefix(_ context.Context, ref storage.BlockSeqRef) (ton.BlockIDExt, error) {
 	s.seqLookupCalls++
-	for _, shard := range storage.ShardPrefixCandidates(ref.Workchain, uint64(ref.Shard)) {
+	shards, err := storage.ShardPrefixCandidates(ref.Workchain, uint64(ref.Shard))
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	for _, shard := range shards {
 		key := storage.BlockHistoryKey{Workchain: ref.Workchain, Shard: shard}
 		if block, ok := s.seqLookupByKey[fakeSeqKey(key, ref.SeqNo)]; ok {
 			return *blockproof.CloneBlockID(block), nil
@@ -7831,7 +7896,11 @@ func (s *fakeStore) LookupBlockByLTForPrefix(_ context.Context, key storage.Bloc
 	s.ltLookupCalls++
 	var best ton.BlockIDExt
 	found := false
-	for _, shard := range storage.ShardPrefixCandidates(key.Workchain, uint64(key.Shard)) {
+	shards, err := storage.ShardPrefixCandidates(key.Workchain, uint64(key.Shard))
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	for _, shard := range shards {
 		candidateKey := storage.BlockHistoryKey{Workchain: key.Workchain, Shard: shard}
 		if block, ok := s.ltLookup[fakeLTKey(candidateKey, lt)]; ok && (!found || best.SeqNo > block.SeqNo) {
 			best = block
@@ -7846,7 +7915,11 @@ func (s *fakeStore) LookupBlockByLTForPrefix(_ context.Context, key storage.Bloc
 
 func (s *fakeStore) LookupBlockByAccountLT(_ context.Context, workchain int32, account []byte, lt uint64) (ton.BlockIDExt, error) {
 	s.accountLTLookupCalls++
-	for _, shard := range storage.AccountShardCandidates(workchain, account) {
+	shards, err := storage.AccountShardCandidates(workchain, account)
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	for _, shard := range shards {
 		key := storage.BlockHistoryKey{Workchain: workchain, Shard: shard}
 		if block, ok := s.ltLookup[fakeLTKey(key, lt)]; ok {
 			return *blockproof.CloneBlockID(block), nil
@@ -7867,7 +7940,11 @@ func (s *fakeStore) LookupBlockByUnixTimeForPrefix(_ context.Context, key storag
 	s.utimeLookupCalls++
 	var best ton.BlockIDExt
 	found := false
-	for _, shard := range storage.ShardPrefixCandidates(key.Workchain, uint64(key.Shard)) {
+	shards, err := storage.ShardPrefixCandidates(key.Workchain, uint64(key.Shard))
+	if err != nil {
+		return ton.BlockIDExt{}, err
+	}
+	for _, shard := range shards {
 		candidateKey := storage.BlockHistoryKey{Workchain: key.Workchain, Shard: shard}
 		if block, ok := s.utimeLookup[fakeUnixKey(candidateKey, utime)]; ok && (!found || best.SeqNo > block.SeqNo) {
 			best = block

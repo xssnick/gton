@@ -39,8 +39,8 @@ func TestDirectoryRemembersAndRefreshes(t *testing.T) {
 	now := time.Now()
 
 	sub.mx.Lock()
-	sub.rememberDirectoryPeerLocked(id, pub, "10.0.0.1:30303", "", nil, now)
-	sub.rememberDirectoryPeerLocked(id, pub, "", "10.0.0.1:31303", nil, now.Add(time.Second))
+	sub.rememberDirectoryPeerLocked(id, pub, "10.0.0.1:30303", "", nil, now, directoryProven)
+	sub.rememberDirectoryPeerLocked(id, pub, "", "10.0.0.1:31303", nil, now.Add(time.Second), directoryProven)
 	sub.mx.Unlock()
 
 	if got := sub.directorySize(); got != 1 {
@@ -63,7 +63,7 @@ func TestDirectorySurvivesLiveEviction(t *testing.T) {
 	id := testPeerID("dir-2")
 
 	sub.mx.Lock()
-	sub.rememberDirectoryPeerLocked(id, pub, "10.0.0.2:30303", "", nil, time.Now())
+	sub.rememberDirectoryPeerLocked(id, pub, "10.0.0.2:30303", "", nil, time.Now(), directoryProven)
 	sub.markDirectoryLiveLocked(id, true)
 	sub.markDirectoryLiveLocked(id, false)
 	sub.mx.Unlock()
@@ -83,7 +83,7 @@ func TestDirectoryEvictionPrefersColdNonLiveRows(t *testing.T) {
 		id := testPeerID(fmt.Sprintf("dir-fill-%03d", i))
 		// The oldest row is live and must be kept; the second oldest is the
 		// eviction target.
-		sub.rememberDirectoryPeerLocked(id, testDirectoryPub(t), "", "", nil, base.Add(time.Duration(i)*time.Second))
+		sub.rememberDirectoryPeerLocked(id, testDirectoryPub(t), "", "", nil, base.Add(time.Duration(i)*time.Second), directoryHearsay)
 		switch i {
 		case 0:
 			liveID = id
@@ -94,7 +94,7 @@ func TestDirectoryEvictionPrefersColdNonLiveRows(t *testing.T) {
 		}
 	}
 	// One more row forces an eviction.
-	sub.rememberDirectoryPeerLocked(testPeerID("dir-new"), testDirectoryPub(t), "", "", nil, time.Now())
+	sub.rememberDirectoryPeerLocked(testPeerID("dir-new"), testDirectoryPub(t), "", "", nil, time.Now(), directoryHearsay)
 	_, liveKept := sub.directory[liveID]
 	_, coldKept := sub.directory[coldID]
 	size := len(sub.directory)
@@ -108,6 +108,104 @@ func TestDirectoryEvictionPrefersColdNonLiveRows(t *testing.T) {
 	}
 	if size > maxPeersPerOverlay {
 		t.Fatalf("directory grew past its cap: %d", size)
+	}
+}
+
+// freshDirectoryNode is the signed record a peer advertises for itself right
+// now. Eviction only reads its version, so one record can stand in for many
+// rows.
+func freshDirectoryNode(t *testing.T, overlayID []byte) *overlay.Node {
+	t.Helper()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	node, err := overlay.NewNode(overlayID, priv)
+	if err != nil {
+		t.Fatalf("build overlay node: %v", err)
+	}
+	return node
+}
+
+// A peer forwarding a list of strangers must not be able to flush the rows we
+// gossip with and promote from: an identity costs a keypair and an announcement
+// costs a signature, so hearsay may only ever recycle its own class.
+func TestDirectoryFloodCannotEvictProvenRows(t *testing.T) {
+	sub := testDirectorySubscription(t)
+	sub.spec.FullID = make([]byte, 32)
+	now := time.Now()
+	announced := freshDirectoryNode(t, sub.spec.FullID)
+
+	proven := make([]PeerID, 0, maxPeersPerOverlay)
+	sub.mx.Lock()
+	for i := range maxPeersPerOverlay {
+		id := testPeerID(fmt.Sprintf("proven-%03d", i))
+		if !sub.rememberDirectoryPeerLocked(id, testDirectoryPub(t), "10.0.0.1:30303", "", announced, now, directoryProven) {
+			t.Fatalf("proven row %d was refused", i)
+		}
+		proven = append(proven, id)
+	}
+	sub.mx.Unlock()
+
+	// Both ways in: records forwarded by a third party, and records a stranger
+	// brings by handshaking and querying us itself. Neither buys a slot here.
+	floodPub := testDirectoryPub(t)
+	sub.mx.Lock()
+	for i := range maxPeersPerOverlay {
+		id := testPeerID(fmt.Sprintf("flood-%04d", i))
+		if sub.rememberDirectoryPeerLocked(id, floodPub, "", "", announced, now, directoryHearsay) {
+			t.Fatalf("hearsay row %d was filed, so it displaced a proven row", i)
+		}
+		contacted := testPeerID(fmt.Sprintf("handshake-flood-%04d", i))
+		if sub.rememberDirectoryPeerLocked(contacted, floodPub, "1.2.3.4:1", "", announced, now, directoryContacted) {
+			t.Fatalf("handshake flood row %d was filed, so it displaced a proven row", i)
+		}
+	}
+	kept := 0
+	for _, id := range proven {
+		if sub.directory[id] != nil {
+			kept++
+		}
+	}
+	size := len(sub.directory)
+	sub.mx.Unlock()
+
+	if kept != len(proven) {
+		t.Fatalf("the flood evicted %d proven rows", len(proven)-kept)
+	}
+	if size != maxPeersPerOverlay {
+		t.Fatalf("directory size = %d, want %d", size, maxPeersPerOverlay)
+	}
+}
+
+// The other half of the same rule: refusing everything would freeze the
+// directory, so hearsay still takes the slot of a row that never proved itself.
+func TestDirectoryHearsayRecyclesUnverifiedRows(t *testing.T) {
+	sub := testDirectorySubscription(t)
+	sub.spec.FullID = make([]byte, 32)
+	now := time.Now()
+	announced := freshDirectoryNode(t, sub.spec.FullID)
+
+	sub.mx.Lock()
+	for i := range maxPeersPerOverlay - 1 {
+		id := testPeerID(fmt.Sprintf("proven-%03d", i))
+		sub.rememberDirectoryPeerLocked(id, testDirectoryPub(t), "10.0.0.1:30303", "", announced, now, directoryProven)
+	}
+	unverified := testPeerID("unverified")
+	sub.rememberDirectoryPeerLocked(unverified, testDirectoryPub(t), "", "", announced, now, directoryHearsay)
+
+	learned := testPeerID("learned")
+	filed := sub.rememberDirectoryPeerLocked(learned, testDirectoryPub(t), "", "", announced, now, directoryHearsay)
+	_, unverifiedKept := sub.directory[unverified]
+	_, learnedFiled := sub.directory[learned]
+	sub.mx.Unlock()
+
+	if !filed || !learnedFiled {
+		t.Fatal("a full directory of proven rows must still recycle its unverified slots")
+	}
+	if unverifiedKept {
+		t.Fatal("the unverified row was not the victim")
 	}
 }
 
@@ -129,7 +227,7 @@ func TestAdvertisementDrawsFromDirectory(t *testing.T) {
 			t.Fatalf("build overlay node: %v", err)
 		}
 		sub.mx.Lock()
-		sub.rememberDirectoryPeerLocked(testPeerID(fmt.Sprintf("adv-%d", i)), pub, "", "", node, now)
+		sub.rememberDirectoryPeerLocked(testPeerID(fmt.Sprintf("adv-%d", i)), pub, "", "", node, now, directoryHearsay)
 		sub.mx.Unlock()
 	}
 
@@ -153,7 +251,7 @@ func TestAdvertisementSkipsStaleAnnouncements(t *testing.T) {
 	node.Version = int32(time.Now().Add(-2 * overlayPeerTTL).Unix())
 
 	sub.mx.Lock()
-	sub.rememberDirectoryPeerLocked(testPeerID("stale"), pub, "", "", node, time.Now())
+	sub.rememberDirectoryPeerLocked(testPeerID("stale"), pub, "", "", node, time.Now(), directoryHearsay)
 	sub.mx.Unlock()
 
 	if got := len(sub.overlayNodesSnapshot(maxPeersPerOverlay)); got != 0 {
@@ -213,7 +311,7 @@ func TestLearnAdvertisedPeerRefreshesLivePeerAnnouncement(t *testing.T) {
 	overlayID := testPeerID("gossip-refresh-overlay").Bytes()
 	now := time.Now()
 
-	peer := &overlayPeer{id: peerID, route: &peerRoute{}}
+	peer := &overlayPeer{id: peerID, route: newTestPeerRoute("")}
 	stale := signedOverlayNode(t, private, overlayID, now.Add(-9*time.Minute))
 	peer.mergeAnnouncement(&stale)
 
@@ -262,7 +360,7 @@ func TestAdvertisementSamplesOnlyUpToLimit(t *testing.T) {
 			t.Fatalf("build overlay node: %v", err)
 		}
 		sub.mx.Lock()
-		sub.rememberDirectoryPeerLocked(testPeerID(fmt.Sprintf("adv-%d", i)), pub, "", "", node, now)
+		sub.rememberDirectoryPeerLocked(testPeerID(fmt.Sprintf("adv-%d", i)), pub, "", "", node, now, directoryHearsay)
 		sub.mx.Unlock()
 	}
 
@@ -305,7 +403,7 @@ func TestAdvertisementReturnsDeepCopies(t *testing.T) {
 	}
 	id := testPeerID("deep-copy")
 	sub.mx.Lock()
-	sub.rememberDirectoryPeerLocked(id, pub, "", "", node, now)
+	sub.rememberDirectoryPeerLocked(id, pub, "", "", node, now, directoryHearsay)
 	sub.mx.Unlock()
 
 	list := sub.overlayNodesSnapshot(4)
@@ -357,7 +455,7 @@ func TestDirectoryActivityFloodDoesNotEvictAnnouncedRows(t *testing.T) {
 	}
 	announced := testPeerID("announced")
 	sub.mx.Lock()
-	sub.rememberDirectoryPeerLocked(announced, pub, "", "", node, now)
+	sub.rememberDirectoryPeerLocked(announced, pub, "", "", node, now, directoryHearsay)
 	sub.mx.Unlock()
 
 	for i := range maxPeersPerOverlay * 2 {
@@ -383,7 +481,7 @@ func TestDirectoryActivityRefreshesKnownPeer(t *testing.T) {
 	stale := time.Now().Add(-time.Hour)
 
 	sub.mx.Lock()
-	sub.rememberDirectoryPeerLocked(id, testDirectoryPub(t), "", "", nil, stale)
+	sub.rememberDirectoryPeerLocked(id, testDirectoryPub(t), "", "", nil, stale, directoryHearsay)
 	sub.mx.Unlock()
 
 	sub.noteDirectoryActivity(id, "9.9.9.9:9")

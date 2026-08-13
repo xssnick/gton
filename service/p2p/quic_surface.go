@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p/internal/fastsync"
+	"github.com/xssnick/gton/service/p2p/internal/peerroute"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
@@ -18,6 +20,9 @@ import (
 const quicStartupTimeout = 5 * time.Second
 
 const (
+	broadcastTwoStepSimpleSchema = "overlay.broadcastTwostepSimple flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data:bytes extra:bytes signature:bytes = overlay.Broadcast"
+	broadcastTwoStepFECSchema    = "overlay.broadcastTwostepFec flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data_hash:int256 data_size:int seqno:int part:bytes extra:bytes signature:bytes = overlay.Broadcast"
+
 	overlayQueryConstructorID            = uint32(0xccfd8443)
 	overlayQueryWithExtraConstructorID   = uint32(0x94ffc3e9)
 	overlayMessageConstructorID          = uint32(0x75252420)
@@ -25,12 +30,17 @@ const (
 	plainOverlayMessageEnvelopeSize      = 4 + PeerIDSize
 )
 
+var (
+	broadcastTwoStepSimpleConstructorID = tl.CRC(broadcastTwoStepSimpleSchema)
+	broadcastTwoStepFECConstructorID    = tl.CRC(broadcastTwoStepFECSchema)
+)
+
 var errQUICOverlayNotFound = errors.New("QUIC overlay is not subscribed")
 
 type authenticatedQUICPeer struct {
 	peer      *adnlquic.Peer
 	node      *Node
-	route     *peerRoute
+	route     *peerroute.Route
 	id        PeerID
 	publicKey ed25519.PublicKey
 	addr      string
@@ -211,7 +221,7 @@ func (n *Node) handleInboundQUICPeer(peer *adnlquic.Peer) error {
 		node: n,
 		// Shared with the pooled transport for the same peer: a separate route
 		// would split the learned QUIC address and the single-dial gate.
-		route:        n.peerRoutes.get(peerID),
+		route:        n.peerRoutes.Get(peerID),
 		id:           peerID,
 		publicKey:    peer.PeerKey(),
 		addr:         peer.RemoteAddr(),
@@ -288,9 +298,14 @@ func (n *Node) handleQUICQuery(
 	if err != nil {
 		return nil, err
 	}
-	req, err := parseOneQUICOverlayObject(body)
-	if err != nil {
-		return nil, fmt.Errorf("parse QUIC overlay query body: %w", err)
+	var req tl.Serializable
+	if sub.private != nil {
+		req = tl.Raw(body)
+	} else {
+		req, err = parseOneQUICOverlayObject(body)
+		if err != nil {
+			return nil, fmt.Errorf("parse QUIC overlay query body: %w", err)
+		}
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, peerQueryTimeout)
 	defer cancel()
@@ -311,7 +326,7 @@ func (n *Node) handleQUICQuery(
 		return sub.plumtree.HandleRepairQuery(queryCtx, peer.id, repair)
 	}
 
-	resp, err := sub.handlePeerQuery(queryCtx, peer.addr, req)
+	resp, err := sub.handlePeerQueryFrom(queryCtx, peer.id, peer.addr, req)
 	if err != nil {
 		if errors.Is(err, errOverlayInactive) {
 			sub.sendForgetPeerOverInboundPath(queryCtx, peer)
@@ -344,6 +359,24 @@ func (n *Node) handleQUICMessage(
 		return err
 	}
 
+	if sub.private != nil {
+		if isTwoStepBroadcast(body) {
+			message, err := parseOneQUICOverlayObject(body)
+			if err != nil {
+				return fmt.Errorf("parse QUIC private overlay broadcast: %w", err)
+			}
+			return sub.broadcastReceiver.HandleMessage(quicBroadcastSource{
+				id: &peer.id,
+			}, message)
+		}
+		if len(body) == 4 && binary.LittleEndian.Uint32(body) == forgetPeerConstructorID {
+			if current := sub.peerByID(peer.id); current != nil {
+				sub.removePeerIfCurrent(current)
+			}
+			return nil
+		}
+		return sub.handlePrivateOverlayMessage(ctx, peer.id, tl.Raw(body))
+	}
 	if constructor, isPlumtree := plumtreeBroadcastConstructor(body); isPlumtree {
 		if sub.plumtree == nil {
 			return errPlumtreeDisabled
@@ -375,6 +408,19 @@ func (n *Node) handleQUICMessage(
 	return sub.broadcastReceiver.HandleMessage(quicBroadcastSource{
 		id: &peer.id,
 	}, msg)
+}
+
+func isTwoStepBroadcast(body []byte) bool {
+	if len(body) < 4 {
+		return false
+	}
+
+	switch binary.LittleEndian.Uint32(body) {
+	case broadcastTwoStepSimpleConstructorID, broadcastTwoStepFECConstructorID:
+		return true
+	default:
+		return false
+	}
 }
 
 func parseQUICOverlayBody(payload []byte, envelope tl.Serializable) ([]byte, error) {
@@ -542,12 +588,12 @@ func (s *overlaySubscription) authorizeQUICPeer(
 
 	if header.certificateKind == quicMembershipCertificateMember {
 		return s.fastSync.membership.AuthorizeMember(
-			peerID,
+			fastsync.ID(peerID),
 			header.certificate,
 			now,
 		)
 	}
 	// Empty and omitted are distinct TL states, but C++ resolves both through
 	// the enrolled peer's last verified certificate.
-	return s.fastSync.membership.AuthorizeOmitted(peerID, now)
+	return s.fastSync.membership.AuthorizeOmitted(fastsync.ID(peerID), now)
 }

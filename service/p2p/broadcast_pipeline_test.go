@@ -135,7 +135,7 @@ func TestClassifyBroadcastUsesPeerAsFECSourcePeerID(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 
@@ -372,7 +372,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      downloaded.ID,
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 	if err := sub.handleOverlayBroadcast(nil, desc, DeliveryFEC, true, sourceID); err != nil {
@@ -437,7 +437,7 @@ func TestClassifyShardBlockBroadcastDropsWhenSignaturePrecheckFails(t *testing.T
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 
@@ -504,7 +504,7 @@ func TestHandleShardBroadcastRetryableSignatureFailureReturnsRetry(t *testing.T)
 		Block: tonnodeapi.NewShardBlock{
 			ID:      testBlockID(0, topShard, 202),
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -545,7 +545,7 @@ func TestHandleFullBlockRetryableSignatureFailureReturnsRetry(t *testing.T) {
 		},
 		log: discardLogger(),
 	})
-	blockCell := testPeerBlockRoot(t, 0, topShard, 207)
+	blockCell := testPeerBlockRoot(t, 0, 207)
 	blockBOC := serializeCompressedBlockRoot(blockCell)
 	rootHash := blockCell.HashKey()
 	block := ton.BlockIDExt{
@@ -622,7 +622,7 @@ func TestHandleShardBroadcastPermanentDropsReturnIgnore(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      testBlockID(0, topShard, 206),
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 	payload, err := tl.Serialize(valid, true)
@@ -672,7 +672,7 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 7,
-			Data:    []byte{0x01, 0x02},
+			Data:    testShardDescriptionData(0x02),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -747,7 +747,7 @@ func TestAcceptedSimpleBroadcastUsesBoundedAppRebroadcastOnly(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      testBlockID(0, topShard, 204),
 			CCSeqno: 7,
-			Data:    []byte{0x01, 0x02},
+			Data:    testShardDescriptionData(0x02),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -792,7 +792,7 @@ func TestCustomOverlayRejectsUnauthorizedBlockSender(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -830,7 +830,7 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -979,7 +979,7 @@ func TestCustomOverlayDropsSelfBroadcast(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 7,
-			Data:    []byte{0x01},
+			Data:    testShardDescriptionData(0x01),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -1044,7 +1044,7 @@ func TestAcceptedShardBlockBroadcastFansOutToCustomOverlay(t *testing.T) {
 		Block: tonnodeapi.NewShardBlock{
 			ID:      block,
 			CCSeqno: 8,
-			Data:    []byte{0x02},
+			Data:    testShardDescriptionData(0x02),
 		},
 	}
 	payload, err := tl.Serialize(msg, true)
@@ -1090,7 +1090,7 @@ func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
 	customPeer := testRebroadcastQueuePeer("custom-peer")
 	customSub.peers[customPeer.id] = customPeer
 
-	blockCell := testPeerBlockRoot(t, 0, topShard, 212)
+	blockCell := testPeerBlockRoot(t, 0, 212)
 	blockBOC := serializeCompressedBlockRoot(blockCell)
 	fileHash := hashSimpleBroadcastPayload(blockBOC)
 	blockHash := blockCell.HashKey()
@@ -1158,7 +1158,7 @@ func TestPendingBlockBroadcastDecodeFansOutToCustomOverlay(t *testing.T) {
 
 func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 	node := newTestNode(t)
-	node.storage = newTestPebbleStore(t)
+	node.stateArtifacts = newTestPebbleStore(t)
 
 	state := cell.BeginCell().MustStoreUInt(0x1234, 16).EndCell()
 	provider := &testFailOnceCompressedStateProvider{state: state}
@@ -1175,7 +1175,7 @@ func TestPendingCompressedBroadcastRetriesAfterMissedReadyNotify(t *testing.T) {
 		log: discardLogger(),
 	})
 
-	blockCell := testPeerBlockRoot(t, 0, topShard, 213)
+	blockCell := testPeerBlockRoot(t, 0, 213)
 	blockBOC := serializeCompressedBlockRoot(blockCell)
 	fileHash := hashSimpleBroadcastPayload(blockBOC)
 	blockHash := blockCell.HashKey()
@@ -1556,10 +1556,10 @@ func testExternalMessageBOCWithBody(t *testing.T, value uint64) []byte {
 	return root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 }
 
-// blockOverlayFanoutKey feeds overlayFanoutDeduper, so its shape is a dedup
-// contract and not just a log string: it must stay per (class, chain position)
-// and must not start distinguishing competing blocks at the same position.
-func TestBlockOverlayFanoutKeyIsPerClassAndChainPosition(t *testing.T) {
+// blockOverlayRouteFanoutKey feeds overlayFanoutDeduper, so its shape is a
+// dedup contract and not just a log string: it must stay per (route, class,
+// chain position) and must not distinguish competing blocks at one position.
+func TestBlockOverlayFanoutKeyIsPerRouteClassAndChainPosition(t *testing.T) {
 	block := ton.BlockIDExt{
 		Workchain: -1,
 		Shard:     topShard,
@@ -1571,26 +1571,33 @@ func TestBlockOverlayFanoutKeyIsPerClassAndChainPosition(t *testing.T) {
 	fork.RootHash = bytes.Repeat([]byte{0x03}, 32)
 	fork.FileHash = bytes.Repeat([]byte{0x04}, 32)
 
-	key := blockOverlayFanoutKey("block", block)
-	if want := "block:" + tnstore.FormatBlockRef(block); key != want {
+	key := blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "block", block)
+	if want := "public:block:" + tnstore.FormatBlockRef(block); key != want {
 		t.Fatalf("fanout key = %q, want %q", key, want)
 	}
-	if got := blockOverlayFanoutKey("block", fork); got != key {
+	if got := blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "block", fork); got != key {
 		t.Fatalf("competing block at the same position got key %q, want the shared %q", got, key)
 	}
-	if got := blockOverlayFanoutKey("candidate", block); got == key {
+	if got := blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "candidate", block); got == key {
 		t.Fatalf("candidate class shares the block class key %q", key)
+	}
+	if got := blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "block", block); got == key {
+		t.Fatalf("FastSync route shares the public route key %q", key)
+	}
+	if candidate := blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "candidate", block); candidate !=
+		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "block", block) {
+		t.Fatalf("custom candidate and full-block keys differ: %q", candidate)
 	}
 
 	next := block
 	next.SeqNo++
-	if got := blockOverlayFanoutKey("block", next); got == key {
+	if got := blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "block", next); got == key {
 		t.Fatalf("next seqno shares the key %q", key)
 	}
 
 	shard := block
 	shard.Workchain = 0
-	if got := blockOverlayFanoutKey("block", shard); got == key {
+	if got := blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "block", shard); got == key {
 		t.Fatalf("other workchain shares the key %q", key)
 	}
 }

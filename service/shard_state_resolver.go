@@ -338,13 +338,16 @@ func (r *nextSyncRunner) applyResolvedShardBlock(ctx context.Context, target ton
 	}
 
 	inclusion := master.Block
-	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells, &blockApplyHookMeta{
+	return r.service.applyResolvedShardBlock(ctx, target, previous, downloaded, r.stateCells, &blockAppliedObserverMeta{
 		InclusionMasterRef:   &inclusion,
 		InclusionMasterState: master.Cell,
+		deferEvent: func(event BlockAppliedEvent) {
+			r.deferShardBlockApplied(inclusion.SeqNo, event)
+		},
 	})
 }
 
-func (s *Service) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock, applier stateUpdateApplier, hook *blockApplyHookMeta) (*storage.BlockState, error) {
+func (s *SyncCoordinator) applyResolvedShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock, applier stateUpdateApplier, observerMeta *blockAppliedObserverMeta) (*storage.BlockState, error) {
 	if !downloaded.ID.Equals(&target) {
 		return nil, fmt.Errorf("shard resolver downloaded %s instead of target %s", downloaded.BlockRef(), storage.FormatBlockRef(target))
 	}
@@ -374,15 +377,15 @@ func (s *Service) applyResolvedShardBlock(ctx context.Context, target ton.BlockI
 		event.Msg("applying shard state dependency")
 	}
 
-	next, err := s.applyBlockWithHooks(ctx, previous, downloaded, applier, hook)
+	next, err := s.applyBlockAndObserve(ctx, previous, downloaded, applier, observerMeta)
 	if err != nil {
 		return nil, fmt.Errorf("apply shard block %s: %w", downloaded.BlockRef(), err)
 	}
 	return next, nil
 }
 
-func (s *Service) stateCellLoader() cell.LazyCellLoader {
-	base := s.storage.LazyCellLoader()
+func (s *StateLifecycle) stateCellLoader() cell.LazyCellLoader {
+	base := s.checkpointStore.LazyCellLoader()
 
 	return func(hash cell.Hash) (*cell.Cell, error) {
 		for _, loader := range s.stateCellLoadersSnapshot() {
@@ -398,7 +401,7 @@ func (s *Service) stateCellLoader() cell.LazyCellLoader {
 	}
 }
 
-func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
+func (s *StateLifecycle) retainStateCellLoader(loader cell.LazyCellLoader) func() {
 	s.stateCellLoaderMu.Lock()
 	s.nextStateCellLoaderID++
 	id := s.nextStateCellLoaderID
@@ -417,12 +420,12 @@ func (s *Service) retainStateCellLoader(loader cell.LazyCellLoader) func() {
 	}
 }
 
-func (s *Service) stateCellLoadersSnapshot() []cell.LazyCellLoader {
+func (s *StateLifecycle) stateCellLoadersSnapshot() []cell.LazyCellLoader {
 	loaders, _ := s.stateCellLoaderSnapshot.Load().([]cell.LazyCellLoader)
 	return loaders
 }
 
-func (s *Service) storeStateCellLoadersSnapshotLocked() {
+func (s *StateLifecycle) storeStateCellLoadersSnapshotLocked() {
 	loaders := make([]cell.LazyCellLoader, 0, len(s.stateCellLoaders))
 	for _, loader := range s.stateCellLoaders {
 		loaders = append(loaders, loader)

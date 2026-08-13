@@ -16,6 +16,16 @@ func Open(opts Options) (*Store, error) {
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("storage dir is empty")
 	}
+	// All artifact pack paths are either relative to this directory or
+	// absolute. Keep the store root absolute so an otherwise valid relative
+	// --data-dir cannot leak its prefix into durable archive references.
+	// In particular, pack journaling receives the physical pack path and
+	// derives its archive-relative key from this root.
+	dir, err := filepath.Abs(opts.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve storage dir: %w", err)
+	}
+	opts.Dir = dir
 	logger := logutil.WithComponent(opts.Logger, "pebblestore")
 	started := time.Now()
 	if opts.MetaCacheSize <= 0 {
@@ -234,7 +244,7 @@ func Open(opts Options) (*Store, error) {
 		pendingArchiveSync:              map[string]pendingPackWrite{},
 		pendingKeyProofSync:             map[string]pendingPackWrite{},
 	}
-	store.lazyCellLoaderZero = store.newLazyCellLoaderForGeneration(0)
+	store.activeCellLoader = store.newActiveCellLoader()
 	if !opts.ReadOnly {
 		stageStarted = time.Now()
 		logger.Info().Msg("recovering artifact pack journals")

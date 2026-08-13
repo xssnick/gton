@@ -14,6 +14,21 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+type dispatchQueueState struct {
+	queue        *cell.AugmentedDictionary
+	blockProof   *cell.Cell
+	proofBuilder *cell.MerkleProofBuilder
+}
+
+type dispatchQueueLoadFailure struct {
+	fallback string
+	err      error
+}
+
+func (f *dispatchQueueLoadFailure) response() ton.LSError {
+	return errorResponse(f.err, f.fallback)
+}
+
 func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispatchQueueInfo) any {
 	if !isFullBlockID(query.ID) {
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid BlockIdExt"}
@@ -25,33 +40,9 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid after_addr"}
 	}
 
-	var blockProof *cell.Cell
-	var stateRoot *cell.Cell
-	if query.Mode&1 != 0 {
-		fragments, err := s.store.BlockFragments(ctx, *query.ID)
-		if err != nil {
-			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
-		}
-		stateRoot = fragments.StateRoot()
-		blockProof = fragments.BlockStateRootProof()
-	} else {
-		root, err := s.loadStateRoot(ctx, *query.ID)
-		if err != nil {
-			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
-		}
-		stateRoot = root
-	}
-
-	proofRoot := stateRoot
-	var proofBuilder *cell.MerkleProofBuilder
-	if query.Mode&1 != 0 {
-		proofBuilder = blockproof.NewProofBuilder(stateRoot)
-		proofRoot = proofBuilder.Root()
-	}
-
-	dispatchQueue, err := dispatchQueueFromStateRoot(proofRoot)
-	if err != nil {
-		return errorResponse(err, "cannot load dispatch queue")
+	state, failure := s.loadDispatchQueueState(ctx, *query.ID, query.Mode)
+	if failure != nil {
+		return failure.response()
 	}
 
 	var after []byte
@@ -63,7 +54,7 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 		after = make([]byte, 32)
 	}
 
-	queues, complete, err := collectDispatchQueueInfo(dispatchQueue, after, allowEq, int(query.MaxAccounts))
+	queues, complete, err := collectDispatchQueueInfo(state.queue, after, allowEq, int(query.MaxAccounts))
 	if err != nil {
 		return errorResponse(err, "cannot load dispatch queue info")
 	}
@@ -74,8 +65,8 @@ func (s *Server) handleDispatchQueueInfo(ctx context.Context, query ton.GetDispa
 		AccountDispatchQueues: queues,
 		Complete:              complete,
 	}
-	if proofBuilder != nil {
-		proof, err := dispatchQueueProof(blockProof, proofBuilder)
+	if query.Mode&1 != 0 {
+		proof, err := dispatchQueueProof(state.blockProof, state.proofBuilder)
 		if err != nil {
 			return errorResponse(err, "cannot create dispatch queue proof")
 		}
@@ -95,37 +86,13 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 		return ton.LSError{Code: errCodeProtoViolation, Text: "invalid max_messages"}
 	}
 
-	var blockProof *cell.Cell
-	var stateRoot *cell.Cell
-	if query.Mode&1 != 0 {
-		fragments, err := s.store.BlockFragments(ctx, *query.ID)
-		if err != nil {
-			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
-		}
-		stateRoot = fragments.StateRoot()
-		blockProof = fragments.BlockStateRootProof()
-	} else {
-		root, err := s.loadStateRoot(ctx, *query.ID)
-		if err != nil {
-			return errorResponse(err, "cannot load state "+storage.FormatBlockRef(*query.ID))
-		}
-		stateRoot = root
-	}
-
-	proofRoot := stateRoot
-	var proofBuilder *cell.MerkleProofBuilder
-	if query.Mode&1 != 0 {
-		proofBuilder = blockproof.NewProofBuilder(stateRoot)
-		proofRoot = proofBuilder.Root()
-	}
-
-	dispatchQueue, err := dispatchQueueFromStateRoot(proofRoot)
-	if err != nil {
-		return errorResponse(err, "cannot load dispatch queue")
+	state, failure := s.loadDispatchQueueState(ctx, *query.ID, query.Mode)
+	if failure != nil {
+		return failure.response()
 	}
 
 	messages, roots, complete, err := collectDispatchQueueMessages(
-		dispatchQueue,
+		state.queue,
 		query.Addr,
 		query.AfterLT,
 		int(query.MaxMessages),
@@ -142,8 +109,8 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 		Messages: messages,
 		Complete: complete,
 	}
-	if proofBuilder != nil {
-		proof, err := dispatchQueueProof(blockProof, proofBuilder)
+	if query.Mode&1 != 0 {
+		proof, err := dispatchQueueProof(state.blockProof, state.proofBuilder)
 		if err != nil {
 			return errorResponse(err, "cannot create dispatch queue proof")
 		}
@@ -157,6 +124,56 @@ func (s *Server) handleDispatchQueueMessages(ctx context.Context, query ton.GetD
 		resp.MessagesBOC = data
 	}
 	return resp
+}
+
+func (s *Server) loadDispatchQueueState(
+	ctx context.Context,
+	id ton.BlockIDExt,
+	mode uint32,
+) (dispatchQueueState, *dispatchQueueLoadFailure) {
+	var blockProof *cell.Cell
+	var stateRoot *cell.Cell
+	if mode&1 != 0 {
+		fragments, err := s.store.BlockFragments(ctx, id)
+		if err != nil {
+			return dispatchQueueState{}, &dispatchQueueLoadFailure{
+				fallback: "cannot load state " + storage.FormatBlockRef(id),
+				err:      err,
+			}
+		}
+		stateRoot = fragments.StateRoot()
+		blockProof = fragments.BlockStateRootProof()
+	} else {
+		root, err := s.loadStateRoot(ctx, id)
+		if err != nil {
+			return dispatchQueueState{}, &dispatchQueueLoadFailure{
+				fallback: "cannot load state " + storage.FormatBlockRef(id),
+				err:      err,
+			}
+		}
+		stateRoot = root
+	}
+
+	proofRoot := stateRoot
+	var proofBuilder *cell.MerkleProofBuilder
+	if mode&1 != 0 {
+		proofBuilder = blockproof.NewProofBuilder(stateRoot)
+		proofRoot = proofBuilder.Root()
+	}
+
+	dispatchQueue, err := dispatchQueueFromStateRoot(proofRoot)
+	if err != nil {
+		return dispatchQueueState{}, &dispatchQueueLoadFailure{
+			fallback: "cannot load dispatch queue",
+			err:      err,
+		}
+	}
+
+	return dispatchQueueState{
+		queue:        dispatchQueue,
+		blockProof:   blockProof,
+		proofBuilder: proofBuilder,
+	}, nil
 }
 
 func dispatchQueueProof(blockProof *cell.Cell, proofBuilder *cell.MerkleProofBuilder) ([]byte, error) {

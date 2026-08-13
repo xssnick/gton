@@ -17,7 +17,7 @@ func TestLoadBlockStateForApplyTrustsPublishedBlockOnlyState(t *testing.T) {
 		state:        state,
 		blockFullErr: storage.ErrNotFound,
 	}
-	svc := &Service{storage: store}
+	svc := &SyncCoordinator{storage: store}
 
 	got, err := svc.loadBlockStateForApply(ctx, storage.BlockState{Block: block})
 	if err != nil {
@@ -39,7 +39,7 @@ func TestLoadBlockStateForApplyDoesNotProbeFullBlockForPublishedState(t *testing
 		state:     state,
 		blockFull: &storage.ServedBlockFull{ID: block},
 	}
-	svc := &Service{storage: store}
+	svc := &SyncCoordinator{storage: store}
 
 	got, err := svc.loadBlockStateForApply(ctx, storage.BlockState{Block: block})
 	if err != nil {
@@ -61,7 +61,7 @@ func TestLoadBlockStateForApplyAllowsCurrentBoundaryWithoutFullBlock(t *testing.
 		state:        state,
 		blockFullErr: storage.ErrNotFound,
 	}
-	svc := &Service{storage: store}
+	svc := &SyncCoordinator{storage: store}
 
 	got, err := svc.loadBlockStateForApply(ctx, storage.BlockState{
 		Block:         block,
@@ -91,7 +91,7 @@ func testReplayBlockState(tb testing.TB, block ton.BlockIDExt) *storage.BlockSta
 }
 
 type testReplayStateStore struct {
-	storage.Storage
+	testStorage
 
 	state          *storage.BlockState
 	stateErr       error

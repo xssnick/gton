@@ -60,6 +60,7 @@ const (
 
 var (
 	broadcastNotFoundConstructorID       uint32
+	repairPlumtreePartConstructorID      uint32
 	broadcastPlumtreeSimpleConstructorID uint32
 	broadcastPlumtreeFECConstructorID    uint32
 	broadcastPlumtreeIHaveConstructorID  uint32
@@ -71,7 +72,7 @@ var (
 
 func init() {
 	broadcastNotFoundConstructorID = tl.Register(BroadcastNotFound{}, broadcastNotFoundSchema)
-	tl.Register(RepairPlumtreePart{}, repairPlumtreePartSchema)
+	repairPlumtreePartConstructorID = tl.Register(RepairPlumtreePart{}, repairPlumtreePartSchema)
 	broadcastPlumtreeSimpleConstructorID = tl.Register(
 		BroadcastPlumtreeSimple{},
 		broadcastPlumtreeSimpleSchema,
@@ -398,18 +399,6 @@ func plumtreeInt256IsZero(value []byte) bool {
 		}
 	}
 	return true
-}
-
-func parseRepairPlumtreePart(data []byte) (RepairPlumtreePart, error) {
-	var request RepairPlumtreePart
-	rest, err := tl.ParseNoCopy(&request, data, true)
-	if err != nil {
-		return RepairPlumtreePart{}, fmt.Errorf("parse Plumtree repair request: %w", err)
-	}
-	if len(rest) != 0 {
-		return RepairPlumtreePart{}, fmt.Errorf("unexpected trailing Plumtree repair request data")
-	}
-	return request, nil
 }
 
 // Takes the decoder's two return values rather than the message itself: that

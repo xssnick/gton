@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	plumtreeCertificateAllowFEC uint32 = 1
-	plumtreeCertificateTrusted  uint32 = 2
+	overlayCertificateAllowFEC uint32 = 1
+	overlayCertificateTrusted  uint32 = 2
 
 	plumtreeCertificateCacheLimit       = 100
 	plumtreeCertificateCheckLimit       = 60
@@ -369,7 +369,7 @@ func (v *plumtreeSignatureVerifier) checkCertificateLocked(
 	}
 	if dataSize > fields.maxSize ||
 		int32(now.Unix()) > fields.expireAt ||
-		fields.flags&plumtreeCertificateAllowFEC == 0 {
+		fields.flags&overlayCertificateAllowFEC == 0 {
 		return errPlumtreeSourceNotAllowed
 	}
 
@@ -416,7 +416,7 @@ func (v *plumtreeSignatureVerifier) checkCertificateLocked(
 		limiter.addCheck(now)
 		limiter.checked.add(cacheKey)
 	}
-	if fields.flags&plumtreeCertificateTrusted == 0 {
+	if fields.flags&overlayCertificateTrusted == 0 {
 		return errPlumtreeSourceNotAllowed
 	}
 	return nil
@@ -457,9 +457,9 @@ func plumtreeCertificateData(
 }
 
 func plumtreeLegacyCertificateFlags(maxSize uint32) uint32 {
-	flags := plumtreeCertificateTrusted
+	flags := overlayCertificateTrusted
 	if maxSize > ordinarySimpleBroadcastMaxSize {
-		flags |= plumtreeCertificateAllowFEC
+		flags |= overlayCertificateAllowFEC
 	}
 	return flags
 }

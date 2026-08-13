@@ -14,110 +14,129 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
-func TestCopyAdvertisedPeerCandidatesRejectsMalformedFields(t *testing.T) {
+// One query used to be allowed to teach us maxPeersPerOverlay nodes, each
+// costing a signature check and a directory write. Honest peers send four.
+func TestBoundedAdvertisedNodesCapsOneExchange(t *testing.T) {
+	nodes := make([]overlay.Node, maxAdvertisedPeersPerQuery*4)
+	if got := len(boundedAdvertisedNodes(nodes)); got != maxAdvertisedPeersPerQuery {
+		t.Fatalf("bounded %d nodes, want %d", got, maxAdvertisedPeersPerQuery)
+	}
+
+	short := make([]overlay.Node, maxRandomPeerReply)
+	if got := len(boundedAdvertisedNodes(short)); got != maxRandomPeerReply {
+		t.Fatalf("bounded an honest answer to %d nodes, want %d", got, maxRandomPeerReply)
+	}
+}
+
+// The sender's own announcement plus the address its query arrived from is the
+// one endpoint in an exchange that needs no DHT lookup — and the only way a peer
+// that reached us first ever becomes reachable, since it never joins a public
+// roster and overlay.node carries no address.
+func TestLearnQuerySourceFilesSenderAddressAsVerified(t *testing.T) {
+	sub, spec := testLearningSubscription(t)
+
+	senderPublic, senderPrivate, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate sender key: %v", err)
+	}
+	sender, err := peerIDFromPublicKey(senderPublic)
+	if err != nil {
+		t.Fatalf("sender peer id: %v", err)
+	}
+	node, err := overlay.NewNode(spec.FullID, senderPrivate)
+	if err != nil {
+		t.Fatalf("build sender node: %v", err)
+	}
+
+	// C++ puts its own record first and fills the rest with other peers.
+	sub.learnQuerySource(sender, "10.9.9.9:30303", []overlay.Node{
+		*node,
+		signedAdvertisedPeer(t, spec.FullID),
+	})
+
+	sub.mx.Lock()
+	entry := sub.directory[sender]
+	sub.mx.Unlock()
+	if entry == nil {
+		t.Fatal("the query source was not filed in the directory")
+	}
+	if entry.adnlAddr != "10.9.9.9:30303" {
+		t.Fatalf("filed address = %q, want the address the query arrived from", entry.adnlAddr)
+	}
+	if !entry.verified {
+		t.Fatal("a peer that queried us over its own transport must be filed as verified")
+	}
+	if entry.announced == nil {
+		t.Fatal("the sender's announcement was not kept, so it cannot be advertised")
+	}
+	if size := sub.directorySize(); size != 1 {
+		t.Fatalf("directory holds %d rows, want only the query source", size)
+	}
+}
+
+// Only the sender's own record may claim the sender's address: everything else
+// in the list is hearsay, and a record can be forged for any id.
+func TestLearnQuerySourceRejectsRecordsItCannotAttribute(t *testing.T) {
+	forged := func(t *testing.T, overlayID []byte) overlay.Node {
+		node := signedAdvertisedPeer(t, overlayID)
+		node.Signature[0] ^= 0xFF
+		return node
+	}
+
 	tests := []struct {
-		name   string
-		mutate func(*overlay.Node)
-		want   int
+		name string
+		node func(t *testing.T, overlayID []byte) overlay.Node
 	}{
+		{name: "another peer's record", node: signedAdvertisedPeer},
+		{name: "broken signature", node: forged},
 		{
-			name: "valid",
-			want: 1,
-		},
-		{
-			name: "unsupported key",
-			mutate: func(node *overlay.Node) {
-				node.ID = keys.PublicKeyAES{Key: make([]byte, ed25519.PublicKeySize)}
+			name: "stale version",
+			node: func(t *testing.T, overlayID []byte) overlay.Node {
+				node := signedAdvertisedPeer(t, overlayID)
+				node.Version = int32(time.Now().Add(-2 * overlayPeerTTL).Unix())
+				return node
 			},
 		},
 		{
-			name: "short public key",
-			mutate: func(node *overlay.Node) {
-				node.ID = keys.PublicKeyED25519{Key: make(ed25519.PublicKey, ed25519.PublicKeySize-1)}
-			},
-		},
-		{
-			name: "oversized public key",
-			mutate: func(node *overlay.Node) {
-				node.ID = keys.PublicKeyED25519{Key: make(ed25519.PublicKey, ed25519.PublicKeySize+1)}
-			},
-		},
-		{
-			name: "short overlay id",
-			mutate: func(node *overlay.Node) {
-				node.Overlay = make([]byte, PeerIDSize-1)
-			},
-		},
-		{
-			name: "oversized overlay id",
-			mutate: func(node *overlay.Node) {
-				node.Overlay = make([]byte, PeerIDSize+1)
-			},
-		},
-		{
-			name: "different overlay id",
-			mutate: func(node *overlay.Node) {
-				node.Overlay[0] = 1
-			},
-		},
-		{
-			name: "short signature",
-			mutate: func(node *overlay.Node) {
-				node.Signature = make([]byte, ed25519.SignatureSize-1)
-			},
-		},
-		{
-			name: "oversized signature",
-			mutate: func(node *overlay.Node) {
-				node.Signature = make([]byte, ed25519.SignatureSize+1)
+			name: "another overlay",
+			node: func(t *testing.T, _ []byte) overlay.Node {
+				return signedAdvertisedPeer(t, make([]byte, PeerIDSize))
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			overlayID := make([]byte, PeerIDSize)
-			node := structurallyValidAdvertisedPeer()
-			if test.mutate != nil {
-				test.mutate(&node)
-			}
-
-			if got := len(copyAdvertisedPeerCandidates(overlayID, []overlay.Node{node})); got != test.want {
-				t.Fatalf("candidate count = %d, want %d", got, test.want)
+			sub, spec := testLearningSubscription(t)
+			sub.learnQuerySource(testPeerID("sender"), "10.9.9.9:30303", []overlay.Node{
+				test.node(t, spec.FullID),
+			})
+			if size := sub.directorySize(); size != 0 {
+				t.Fatalf("filed %d rows for a record it cannot attribute to the sender", size)
 			}
 		})
 	}
 }
 
-func TestCopyAdvertisedPeerCandidatesBoundsAndOwnsData(t *testing.T) {
-	node := structurallyValidAdvertisedPeer()
-	publicKey := node.ID.(keys.PublicKeyED25519).Key
-	publicKey[0] = 1
-	node.Overlay[0] = 2
-	node.Signature[0] = 3
+func testLearningSubscription(t *testing.T) (*overlaySubscription, overlaySpec) {
+	t.Helper()
 
-	nodes := make([]overlay.Node, maxPeersPerOverlay+1)
-	for i := range nodes {
-		nodes[i] = node
+	spec, err := buildOverlaySpec(make([]byte, PeerIDSize), -1, topShard, "masterchain")
+	if err != nil {
+		t.Fatalf("build overlay spec: %v", err)
 	}
-
-	peers := copyAdvertisedPeerCandidates(node.Overlay, nodes)
-	if len(peers) != maxPeersPerOverlay {
-		t.Fatalf("candidate count = %d, want %d", len(peers), maxPeersPerOverlay)
+	_, localKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate local key: %v", err)
 	}
 
-	publicKey[0] = 4
-	node.Overlay[0] = 5
-	node.Signature[0] = 6
-	if peers[0].publicKey[0] != 1 {
-		t.Fatalf("copied public key changed to %d", peers[0].publicKey[0])
-	}
-	if peers[0].overlayID[0] != 2 {
-		t.Fatalf("copied overlay id changed to %d", peers[0].overlayID[0])
-	}
-	if peers[0].signature[0] != 3 {
-		t.Fatalf("copied signature changed to %d", peers[0].signature[0])
-	}
+	return testOverlaySubscription(&overlaySubscription{
+		node:      &Node{log: discardLogger(), privKey: localKey},
+		spec:      spec,
+		log:       discardLogger(),
+		peers:     map[PeerID]*overlayPeer{},
+		directory: map[PeerID]*directoryEntry{},
+	}), spec
 }
 
 func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
@@ -155,7 +174,7 @@ func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
 		node.wg.Wait()
 	})
 
-	sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{
+	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
 		List: overlay.NodesList{List: []overlay.Node{first}},
 	})
 	select {
@@ -168,7 +187,7 @@ func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
 	}
 	sub.endRefreshPeers()
 
-	sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{
+	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
 		List: overlay.NodesList{List: []overlay.Node{second}},
 	})
 	if got := dhtBackend.calls.Load(); got != 1 {
@@ -182,7 +201,7 @@ func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
 		t.Fatal("advertised-peer learning gate remained active after the job")
 	}
 
-	sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{
+	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
 		List: overlay.NodesList{List: []overlay.Node{second}},
 	})
 	node.wg.Wait()
@@ -208,7 +227,7 @@ func TestHandleGetRandomPeersReleasesLearningGateForInvalidBatch(t *testing.T) {
 	invalid.Overlay = append([]byte(nil), spec.ShortID...)
 	invalid.Signature = invalid.Signature[:ed25519.SignatureSize-1]
 
-	sub.handleGetRandomPeers(context.Background(), overlay.GetRandomPeers{
+	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
 		List: overlay.NodesList{List: []overlay.Node{invalid}},
 	})
 	if sub.advertisedPeerLearning.Load() {

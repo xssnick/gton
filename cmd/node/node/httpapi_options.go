@@ -4,9 +4,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xssnick/gton/api/httpapi"
+	"github.com/xssnick/gton"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
-	"github.com/xssnick/gton/service/hooks"
 
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/ton"
@@ -19,30 +18,26 @@ type httpapiOptions struct {
 	ZeroState      ton.ZeroStateIDExt
 }
 
-// configureHTTPAPI resolves the HTTP API options and returns the HTTP API
-// extension factory, nil when the API is disabled.
-func configureHTTPAPI(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions, globalConfig *liteclient.GlobalConfig) (httpapiOptions, hooks.ExtensionFactory, error) {
+// configureHTTPAPI resolves the built-in HTTP API configuration. RunNode
+// supplies its runtime Store and Network dependencies.
+func configureHTTPAPI(runOpts *gton.NodeOptions, cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions, globalConfig *liteclient.GlobalConfig) (httpapiOptions, error) {
 	opts := httpapiOptionsFromConfig(cfg, runtimeOpts)
+	runOpts.HTTPAPI = nil
 	if !opts.Enabled {
-		return opts, nil, nil
+		return opts, nil
 	}
 
 	zeroState, err := liteserverZeroStateFromGlobalConfig(globalConfig)
 	if err != nil {
-		return httpapiOptions{}, nil, err
+		return httpapiOptions{}, err
 	}
 	opts.ZeroState = zeroState
-	return opts, httpapiExtensionFactory(opts), nil
-}
-
-func httpapiExtensionFactory(opts httpapiOptions) hooks.ExtensionFactory {
-	return func(node hooks.Node) (hooks.Extension, error) {
-		return httpapi.NewExtension(node, httpapi.ExtensionConfig{
-			ListenAddr:     opts.ListenAddr,
-			RequestTimeout: opts.RequestTimeout,
-			ZeroState:      opts.ZeroState,
-		})
+	runOpts.HTTPAPI = &gton.HTTPAPIOptions{
+		ListenAddr:     opts.ListenAddr,
+		RequestTimeout: opts.RequestTimeout,
+		ZeroState:      opts.ZeroState,
 	}
+	return opts, nil
 }
 
 func httpapiOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions) httpapiOptions {

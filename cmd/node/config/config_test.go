@@ -69,6 +69,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.DisableStateSerialization {
 		t.Fatal("state serialization should be enabled by default")
 	}
+	if cfg.Validator.Enabled {
+		t.Fatal("validator should be disabled by default")
+	}
+	if cfg.Collator.Enabled {
+		t.Fatal("standalone collator should be disabled by default")
+	}
 	if cfg.Metrics.Enabled {
 		t.Fatal("metrics should be disabled by default")
 	}
@@ -148,6 +154,50 @@ func TestLoadDefaults(t *testing.T) {
 	artifactFileMaxOpen := storageOpts.ArtifactFileMaxOpen
 	if int64(artifactFileMaxOpen) != DefaultArtifactFileMaxOpen {
 		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
+	}
+}
+
+func TestLoadEnablesValidator(t *testing.T) {
+	serverSeed := bytes.Repeat([]byte{0x11}, ed25519.SeedSize)
+	clientID := bytes.Repeat([]byte{0x22}, 32)
+	path := writeTestConfig(t, `{"validator":{"enabled":true,"control":{"listen_addr":"127.0.0.1:3030","key":"`+
+		base64.StdEncoding.EncodeToString(serverSeed)+`","clients":[{"id":"`+
+		base64.StdEncoding.EncodeToString(clientID)+`","permissions":15}]}}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Validator.Enabled ||
+		!bytes.Equal(cfg.Validator.Control.Key, serverSeed) ||
+		len(cfg.Validator.Control.Clients) != 1 ||
+		!bytes.Equal(cfg.Validator.Control.Clients[0].ID, clientID) ||
+		cfg.Validator.Control.Clients[0].Permissions != 15 {
+		t.Fatal("validator was not enabled")
+	}
+}
+
+func TestLoadRejectsValidatorKeysInConfig(t *testing.T) {
+	path := writeTestConfig(t, `{"validator":{"enabled":true,"keys":[]}}`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("validator signing keys in config were accepted")
+	}
+}
+
+func TestLoadStandaloneCollatorAllowlist(t *testing.T) {
+	id := bytes.Repeat([]byte{0x44}, 32)
+	path := writeTestConfig(t, `{"collator":{"enabled":true,"validator_allowlist":{"enabled":true,"adnl_ids":["`+
+		base64.StdEncoding.EncodeToString(id)+`"]}}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Collator.Enabled || !cfg.Collator.ValidatorAllowlist.Enabled ||
+		len(cfg.Collator.ValidatorAllowlist.ADNLIDs) != 1 ||
+		!bytes.Equal(cfg.Collator.ValidatorAllowlist.ADNLIDs[0], id) {
+		t.Fatalf("unexpected collator config: %+v", cfg.Collator)
 	}
 }
 
@@ -663,6 +713,18 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if len(cfg.Lite.Key) != ed25519.SeedSize {
 		t.Fatal("expected generated liteserver key")
 	}
+	if len(cfg.Validator.Control.Key) != ed25519.SeedSize {
+		t.Fatalf("generated validator control key has length %d", len(cfg.Validator.Control.Key))
+	}
+	if cfg.Validator.Control.ListenAddr != DefaultValidatorControlListen {
+		t.Fatalf("generated validator control listen addr = %q", cfg.Validator.Control.ListenAddr)
+	}
+	if cfg.Validator.Control.Clients == nil || len(cfg.Validator.Control.Clients) != 0 {
+		t.Fatalf("generated validator control clients = %#v, want empty list", cfg.Validator.Control.Clients)
+	}
+	if cfg.Validator.Enabled || cfg.Collator.Enabled {
+		t.Fatal("generated validator and collator should be disabled")
+	}
 	if cfg.ADNL.ListenAddr != defaultADNLListen {
 		t.Fatalf("unexpected ADNL listen addr %q", cfg.ADNL.ListenAddr)
 	}
@@ -819,6 +881,13 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
 		t.Fatal("generated config should use an empty custom_overlays list")
 	}
+	if !bytes.Contains(data, []byte(`"validator": {`)) ||
+		!bytes.Contains(data, []byte(`"collator": {`)) {
+		t.Fatal("generated config should contain validator and collator sections")
+	}
+	if bytes.Contains(data, []byte(`"enable_validator"`)) {
+		t.Fatal("generated config should not contain the legacy enable_validator field")
+	}
 	if bytes.Contains(data, []byte(`"fast_sync_member_certificates"`)) {
 		t.Fatal("generated config should not contain fast_sync_member_certificates")
 	}
@@ -900,7 +969,7 @@ func TestSyncUntilValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.SyncUntil = 0
 
-	syncUntil, err := uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil)
+	syncUntil, err := syncUntilConfigValue(cfg.TON.SyncUntil)
 	if err != nil {
 		t.Fatalf("zero sync_until should be allowed: %v", err)
 	}
@@ -909,12 +978,12 @@ func TestSyncUntilValidation(t *testing.T) {
 	}
 
 	cfg.TON.SyncUntil = -1
-	if _, err = uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil); err == nil {
+	if _, err = syncUntilConfigValue(cfg.TON.SyncUntil); err == nil {
 		t.Fatal("expected negative sync_until to fail")
 	}
 
 	cfg.TON.SyncUntil = int64(^uint32(0)) + 1
-	if _, err = uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil); err == nil {
+	if _, err = syncUntilConfigValue(cfg.TON.SyncUntil); err == nil {
 		t.Fatal("expected too large sync_until to fail")
 	}
 }

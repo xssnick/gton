@@ -7,6 +7,8 @@ import (
 	"math/big"
 	"sync"
 
+	"github.com/xssnick/gton/service/blockproof"
+
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -233,14 +235,8 @@ func runMethodConfigFromBase(base *runMethodBaseConfig, now uint32, code *cell.C
 	}, nil
 }
 
-type runMethodMasterInfo struct {
-	prevBlocks    *tlb.OldMcBlocksInfoAugDict
-	afterKeyBlock bool
-	lastKeyBlock  *tlb.ExtBlkRef
-}
-
 func runMethodPrevBlocksInfo(master ton.BlockIDExt, extra *tlb.McStateExtra) (tuple.Tuple, error) {
-	info, err := loadRunMethodMasterInfo(extra)
+	info, err := blockproof.LoadMasterStateInfo(extra.Info)
 	if err != nil {
 		return tuple.Tuple{}, err
 	}
@@ -248,7 +244,7 @@ func runMethodPrevBlocksInfo(master ton.BlockIDExt, extra *tlb.McStateExtra) (tu
 		if seqno == master.SeqNo {
 			return master, nil
 		}
-		return runMethodOldMasterBlockID(info.prevBlocks, seqno)
+		return blockproof.OldMasterBlockID(info.PrevBlocks, seqno)
 	}
 
 	lastMCBlocks := []any{runMethodBlockIDTuple(master)}
@@ -261,7 +257,7 @@ func runMethodPrevBlocksInfo(master ton.BlockIDExt, extra *tlb.McStateExtra) (tu
 		lastMCBlocks = append(lastMCBlocks, runMethodBlockIDTuple(block))
 	}
 
-	lastKeyBlock, err := runMethodLastKeyBlock(master, info)
+	lastKeyBlock, err := info.LastKeyBlockID(master)
 	if err != nil {
 		return tuple.Tuple{}, err
 	}
@@ -284,100 +280,6 @@ func runMethodPrevBlocksInfo(master ton.BlockIDExt, extra *tlb.McStateExtra) (tu
 		runMethodBlockIDTuple(lastKeyBlock),
 		tuple.NewTupleValue(lastMCBlocks100...),
 	), nil
-}
-
-func loadRunMethodMasterInfo(extra *tlb.McStateExtra) (runMethodMasterInfo, error) {
-	if extra.Info == nil {
-		return runMethodMasterInfo{}, fmt.Errorf("state is missing mc_state_extra info")
-	}
-
-	loader, err := extra.Info.BeginParse()
-	if err != nil {
-		return runMethodMasterInfo{}, err
-	}
-	if _, err = loader.LoadUInt(16); err != nil {
-		return runMethodMasterInfo{}, err
-	}
-	if _, err = loader.LoadUInt(32); err != nil {
-		return runMethodMasterInfo{}, err
-	}
-	if _, err = loader.LoadUInt(32); err != nil {
-		return runMethodMasterInfo{}, err
-	}
-	if _, err = loader.LoadBoolBit(); err != nil {
-		return runMethodMasterInfo{}, err
-	}
-
-	prevBlocks := &tlb.OldMcBlocksInfoAugDict{}
-	if err = prevBlocks.LoadFromCell(loader); err != nil {
-		return runMethodMasterInfo{}, err
-	}
-
-	afterKeyBlock, err := loader.LoadBoolBit()
-	if err != nil {
-		return runMethodMasterInfo{}, err
-	}
-
-	hasLastKeyBlock, err := loader.LoadBoolBit()
-	if err != nil {
-		return runMethodMasterInfo{}, err
-	}
-
-	var lastKeyBlock *tlb.ExtBlkRef
-	if hasLastKeyBlock {
-		ref := &tlb.ExtBlkRef{}
-		if err = tlb.LoadFromCell(ref, loader); err != nil {
-			return runMethodMasterInfo{}, err
-		}
-		lastKeyBlock = ref
-	}
-
-	return runMethodMasterInfo{
-		prevBlocks:    prevBlocks,
-		afterKeyBlock: afterKeyBlock,
-		lastKeyBlock:  lastKeyBlock,
-	}, nil
-}
-
-func runMethodOldMasterBlockID(prevBlocks *tlb.OldMcBlocksInfoAugDict, seqno uint32) (ton.BlockIDExt, error) {
-	if prevBlocks == nil || prevBlocks.IsEmpty() {
-		return ton.BlockIDExt{}, fmt.Errorf("cannot fetch old mc block")
-	}
-
-	value, err := prevBlocks.LoadValueByIntKey(new(big.Int).SetUint64(uint64(seqno)))
-	if err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("cannot fetch old mc block: %w", err)
-	}
-
-	var ref tlb.KeyExtBlkRef
-	if err = tlb.LoadFromCell(&ref, value); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if ref.BlkRef.SeqNo != seqno {
-		return ton.BlockIDExt{}, fmt.Errorf("old mc block seqno mismatch: got %d want %d", ref.BlkRef.SeqNo, seqno)
-	}
-
-	return runMethodExtBlkRef(ref.BlkRef), nil
-}
-
-func runMethodLastKeyBlock(master ton.BlockIDExt, info runMethodMasterInfo) (ton.BlockIDExt, error) {
-	if info.afterKeyBlock {
-		return master, nil
-	}
-	if info.lastKeyBlock == nil {
-		return ton.BlockIDExt{}, fmt.Errorf("cannot fetch last key block")
-	}
-	return runMethodExtBlkRef(*info.lastKeyBlock), nil
-}
-
-func runMethodExtBlkRef(ref tlb.ExtBlkRef) ton.BlockIDExt {
-	return ton.BlockIDExt{
-		Workchain: masterchainID,
-		Shard:     masterchainShard,
-		SeqNo:     ref.SeqNo,
-		RootHash:  append([]byte(nil), ref.RootHash...),
-		FileHash:  append([]byte(nil), ref.FileHash...),
-	}
 }
 
 func runMethodBlockIDTuple(id ton.BlockIDExt) tuple.Tuple {

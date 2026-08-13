@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math/bits"
 	"sort"
 
 	tnstore "github.com/xssnick/gton/service/storage"
@@ -46,6 +47,7 @@ type PreparedValidatorSet struct {
 type preparedValidator struct {
 	publicKey ed25519.PublicKey
 	weight    uint64
+	ordinal   int
 }
 
 func PrepareValidatorSet(catchainSeqno uint32, validators []*tlb.ValidatorAddr) (*PreparedValidatorSet, error) {
@@ -63,7 +65,7 @@ func PrepareValidatorSet(catchainSeqno uint32, validators []*tlb.ValidatorAddr) 
 		setHash:       setHash,
 		validators:    make(map[[32]byte]preparedValidator, len(validators)),
 	}
-	for _, validator := range validators {
+	for ordinal, validator := range validators {
 		nodeID, err := tl.Hash(keys.PublicKeyED25519{Key: validator.PublicKey.Key})
 		if err != nil {
 			return nil, fmt.Errorf("calc validator key id: %w", err)
@@ -74,11 +76,19 @@ func PrepareValidatorSet(catchainSeqno uint32, validators []*tlb.ValidatorAddr) 
 
 		var nodeIDShort [32]byte
 		copy(nodeIDShort[:], nodeID)
+		if _, exists := prepared.validators[nodeIDShort]; exists {
+			return nil, fmt.Errorf("duplicate validator key id")
+		}
 
-		prepared.totalWeight += validator.Weight
+		var carry uint64
+		prepared.totalWeight, carry = bits.Add64(prepared.totalWeight, validator.Weight, 0)
+		if carry != 0 {
+			return nil, fmt.Errorf("validator set total weight overflow")
+		}
 		prepared.validators[nodeIDShort] = preparedValidator{
 			publicKey: ed25519.PublicKey(bytes.Clone(validator.PublicKey.Key)),
 			weight:    validator.Weight,
+			ordinal:   ordinal,
 		}
 	}
 	return prepared, nil
@@ -144,7 +154,15 @@ func ValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, valida
 	if err != nil {
 		return nil, fmt.Errorf("load catchain config: %w", err)
 	}
+	return validatorsForBlockWithCatchainConfig(block, validatorConfig, ccSeqno, catchainCfg)
+}
 
+func validatorsForBlockWithCatchainConfig(
+	block *ton.BlockIDExt,
+	validatorConfig tlb.ValidatorSetAny,
+	ccSeqno uint32,
+	catchainCfg tlb.CatchainConfig,
+) ([]*tlb.ValidatorAddr, error) {
 	shuffleMasterchain, shardValidatorsNum, err := catchainValidatorOptions(catchainCfg)
 	if err != nil {
 		return nil, err

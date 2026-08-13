@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
+	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
@@ -70,6 +71,60 @@ func TestPlumtreeQUICReachabilityDoesNotGrantOverlayMembership(t *testing.T) {
 	sub.peers[peerID] = &overlayPeer{id: peerID}
 	if !sub.PlumtreePeerReceivesBroadcasts(peerID) {
 		t.Fatal("active overlay roster peer was rejected")
+	}
+}
+
+func TestPlumtreeRuntimeNotesReceivedBeforeApplicationAcceptance(t *testing.T) {
+	node := newTestNode(t)
+	overlayID := testPeerID("plumtree-received-metric")
+	sub, err := node.newOverlaySubscription(overlaySpec{
+		Name:      "plumtree-received-metric",
+		Kind:      overlayKindPublicShard,
+		Workchain: 0,
+		ShortID:   overlayID[:],
+	})
+	if err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	t.Cleanup(sub.close)
+
+	payload, err := tl.Serialize(tonnodeapi.NewExternalMessageBroadcast{}, true)
+	if err != nil {
+		t.Fatalf("serialize external message broadcast: %v", err)
+	}
+	if err = sub.plumtree.deliver(plumtreeDelivery{
+		Source: testPeerID("plumtree-received-source"),
+		Data:   payload,
+	}); err != nil {
+		t.Fatalf("deliver Plumtree broadcast: %v", err)
+	}
+
+	kind := "tonNode.externalMessageBroadcast"
+	if got := testBroadcastStatCount(
+		node,
+		"received",
+		sub.spec.Name,
+		kind,
+		DeliveryPlumtree,
+	); got != 1 {
+		t.Fatalf("received Plumtree broadcast count = %d, want 1", got)
+	}
+	if got := testBroadcastStatCount(
+		node,
+		"accepted",
+		sub.spec.Name,
+		kind,
+		DeliveryPlumtree,
+	); got != 0 {
+		t.Fatalf("accepted Plumtree broadcast count = %d, want 0", got)
+	}
+	if got := testBroadcastDropStatCount(
+		node,
+		sub.spec.Name,
+		kind,
+		"invalid_payload",
+	); got != 1 {
+		t.Fatalf("invalid payload drop count = %d, want 1", got)
 	}
 }
 

@@ -31,7 +31,7 @@ func TestLargeBOCLoadCellsPreservesInputOrderAfterShardSort(t *testing.T) {
 		hashes = append(hashes, hash)
 		byHash[hash] = record
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save cells: %v", err)
 	}
 
@@ -40,7 +40,7 @@ func TestLargeBOCLoadCellsPreservesInputOrderAfterShardSort(t *testing.T) {
 	}
 	hashes = append(hashes, hashes[len(hashes)/2])
 
-	got, err := store.LargeBOCLoadCells(context.Background(), hashes, nil)
+	got, err := loadActiveTestLargeBOCCells(store, context.Background(), hashes, nil)
 	if err != nil {
 		t.Fatalf("load cells: %v", err)
 	}
@@ -78,13 +78,13 @@ func TestLargeBOCLoadCellsReturnsNotFoundWithoutPartialAppend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cell record: %v", err)
 	}
-	if err = store.SaveCells([]*storage.CellRecord{record}); err != nil {
+	if err = saveActiveTestCells(store, []*storage.CellRecord{record}); err != nil {
 		t.Fatalf("save cell: %v", err)
 	}
 
 	missing := cell.BeginCell().MustStoreUInt(3, 8).EndCell().HashKey()
 	prefix := []cell.LargeBOCRecord{{Meta: cell.LargeBOCMetaRecord{D1: 0x7f}}}
-	got, err := store.LargeBOCLoadCells(context.Background(), []cell.Hash{cl.HashKey(), missing}, prefix)
+	got, err := loadActiveTestLargeBOCCells(store, context.Background(), []cell.Hash{cl.HashKey(), missing}, prefix)
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("load error = %v, want ErrNotFound", err)
 	}
@@ -105,19 +105,23 @@ func TestLargeBOCLoadCellsUsesRequestedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin cell generation: %v", err)
 	}
+	generationCells, err := store.Cells(generation)
+	if err != nil {
+		t.Fatalf("select cell generation: %v", err)
+	}
 	cl := cell.BeginCell().MustStoreUInt(2, 8).EndCell()
 	record, err := storage.CellRecordFromCell(cl)
 	if err != nil {
 		t.Fatalf("cell record: %v", err)
 	}
-	if err = store.SaveCellsInGeneration(ctx, generation, []*storage.CellRecord{record}); err != nil {
+	if err = generationCells.Save(ctx, []*storage.CellRecord{record}); err != nil {
 		t.Fatalf("save generation cell: %v", err)
 	}
 
-	if _, err = store.LargeBOCLoadCells(ctx, []cell.Hash{cl.HashKey()}, nil); !errors.Is(err, storage.ErrNotFound) {
+	if _, err = loadActiveTestLargeBOCCells(store, ctx, []cell.Hash{cl.HashKey()}, nil); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("active generation load error = %v, want ErrNotFound", err)
 	}
-	got, err := store.LargeBOCLoadCellsInGeneration(ctx, generation, []cell.Hash{cl.HashKey()}, nil)
+	got, err := generationCells.LoadLargeBOCCells(ctx, []cell.Hash{cl.HashKey()}, nil)
 	if err != nil {
 		t.Fatalf("load requested generation: %v", err)
 	}
@@ -146,13 +150,13 @@ func BenchmarkLargeBOCLoadCells(b *testing.B) {
 		records[i] = record
 		hashes[cells-1-i] = cl.HashKey()
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		b.Fatalf("save cells: %v", err)
 	}
 
 	b.ReportAllocs()
 	for b.Loop() {
-		loaded, err := store.LargeBOCLoadCells(context.Background(), hashes, nil)
+		loaded, err := loadActiveTestLargeBOCCells(store, context.Background(), hashes, nil)
 		if err != nil {
 			b.Fatalf("load cells: %v", err)
 		}

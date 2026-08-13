@@ -25,11 +25,11 @@ func TestStateSerializerFailsOnMissingPrunedBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build root record: %v", err)
 	}
-	if err = store.SaveCells([]*tnstore.CellRecord{record}); err != nil {
+	if err = saveActiveTestCells(store, []*tnstore.CellRecord{record}); err != nil {
 		t.Fatalf("save root record: %v", err)
 	}
 
-	loader := newLargeBOCStateLoader(ctx, store, 0)
+	loader := newLargeBOCStateLoader(ctx, activeTestCellGeneration(t, store))
 	var rootHash cell.Hash
 	copy(rootHash[:], root.Hash())
 	var buf bytes.Buffer
@@ -55,12 +55,10 @@ func TestPersistentStateSerializerInitializesCursorFromZeroState(t *testing.T) {
 		t.Fatalf("save current zero state: %v", err)
 	}
 
-	svc := &Service{
-		storage:         store,
-		stateSerializer: newStateSerializer(zerolog.Nop(), store, t.TempDir(), false, 0, false),
-	}
-	svc.enableAutomaticStateSerialization()
-	if err := svc.processPersistentStateSerialization(ctx); err != nil {
+	svc := &SyncCoordinator{log: zerolog.Nop(), storage: store}
+	state := bindTestStateLifecycle(t, svc, StateLifecycleOptions{StateFilesDir: t.TempDir()})
+	state.maintenance.enableAutomaticStateSerialization()
+	if err := state.processPersistentStateSerialization(ctx); err != nil {
 		t.Fatalf("process persistent state serialization: %v", err)
 	}
 
@@ -93,7 +91,7 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 	if err != nil {
 		t.Fatalf("build branch record: %v", err)
 	}
-	if err = store.SaveCells([]*tnstore.CellRecord{leafRecord, branchRecord}); err != nil {
+	if err = saveActiveTestCells(store, []*tnstore.CellRecord{leafRecord, branchRecord}); err != nil {
 		t.Fatalf("save cell records: %v", err)
 	}
 
@@ -115,11 +113,11 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 	if len(records) != 2 {
 		t.Fatalf("split cell records = %d, want 2", len(records))
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save split cell records: %v", err)
 	}
 
-	loader := newLargeBOCStateLoader(ctx, store, 0)
+	loader := newLargeBOCStateLoader(ctx, activeTestCellGeneration(t, store))
 	rootHash := root.HashKey()
 	var got bytes.Buffer
 	if err = cell.ToLargeBOC(&got, []cell.Hash{rootHash}, persistentStateBOCOptions(), loader, 0, defaultPersistentStateLargeBOCBatchSize); err != nil {
@@ -132,7 +130,7 @@ func TestStateSerializerSerializesPersistedSplitSyntheticRootWithLargeBOC(t *tes
 		t.Fatal("synthetic root boc mismatch")
 	}
 
-	onePassLoader := newLargeBOCStateLoader(ctx, store, 0)
+	onePassLoader := newLargeBOCStateLoader(ctx, activeTestCellGeneration(t, store))
 	var onePass bytes.Buffer
 	if err = cell.ToLargeBOCOnePass(&onePass, []cell.Hash{rootHash}, persistentStateBOCOptions(), onePassLoader, 0, defaultPersistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("one-pass serialize synthetic root: %v", err)
@@ -171,7 +169,7 @@ func TestStateSerializerPersistsRawSplitRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build pruned record: %v", err)
 	}
-	if err = store.SaveCells([]*tnstore.CellRecord{prunedRecord}); err != nil {
+	if err = saveActiveTestCells(store, []*tnstore.CellRecord{prunedRecord}); err != nil {
 		t.Fatalf("save pruned record: %v", err)
 	}
 
@@ -186,11 +184,11 @@ func TestStateSerializerPersistsRawSplitRefs(t *testing.T) {
 	if hasCellRecordRecord(records, effectiveChildHash) {
 		t.Fatalf("split records contain effective child ref %x", effectiveChildHash)
 	}
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		t.Fatalf("save split cell records: %v", err)
 	}
 
-	loader := newLargeBOCStateLoader(ctx, store, 0)
+	loader := newLargeBOCStateLoader(ctx, activeTestCellGeneration(t, store))
 	var got bytes.Buffer
 	if err = cell.ToLargeBOC(&got, []cell.Hash{root.HashKey()}, persistentStateBOCOptions(), loader, 0, defaultPersistentStateLargeBOCBatchSize); err != nil {
 		t.Fatalf("serialize split root with effective refs: %v", err)

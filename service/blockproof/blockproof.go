@@ -7,10 +7,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/bits"
 	"slices"
 	"sort"
 
+	sharddomain "github.com/xssnick/gton/service/shard"
 	tnstore "github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -32,7 +34,10 @@ type Parsed struct {
 	Meta  *tnstore.BlockMeta
 }
 
-const masterchainShard = int64(-1 << 63)
+const (
+	masterchainShard   = int64(-1 << 63)
+	maxBlockSignatures = 1024
+)
 
 func ValidateHardforkBlockHeader(block ton.BlockIDExt, keyBlock bool, vertSeqnoIncr bool) error {
 	if block.Workchain != -1 || block.Shard != masterchainShard {
@@ -105,6 +110,14 @@ type ValidatorSignatureSet struct {
 	simplex          bool
 }
 
+// BlockSignatureSet is the serialized BlockSignatures boundary. Unlike the
+// logical validator signature set used by TL broadcasts, the cell declares
+// the total signer weight and that declaration is part of validation.
+type BlockSignatureSet struct {
+	ValidatorSignatures *ValidatorSignatureSet
+	DeclaredWeight      uint64
+}
+
 func ParseBOC(id ton.BlockIDExt, proofBOC []byte) (*Parsed, error) {
 	if len(proofBOC) == 0 {
 		return nil, fmt.Errorf("block proof %s is empty", tnstore.FormatBlockRef(id))
@@ -134,9 +147,13 @@ func LinkFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, []byte, 
 	if proofRoot == nil {
 		return nil, nil, fmt.Errorf("block proof link %s has no root", tnstore.FormatBlockRef(id))
 	}
+	proofFor, err := blockIDExtTLBFromBlock(id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode block proof link id %s: %w", tnstore.FormatBlockRef(id), err)
+	}
 
 	root, err := tlb.ToCell(&BlockProof{
-		ProofFor: blockIDExtTLBFromBlock(id),
+		ProofFor: proofFor,
 		Root:     proofRoot,
 	})
 	if err != nil {
@@ -146,8 +163,12 @@ func LinkFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell) (*cell.Cell, []byte, 
 }
 
 func ProofFromRoot(id ton.BlockIDExt, proofRoot *cell.Cell, signatures *cell.Cell) (*cell.Cell, []byte, error) {
+	proofFor, err := blockIDExtTLBFromBlock(id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode block proof id %s: %w", tnstore.FormatBlockRef(id), err)
+	}
 	root, err := tlb.ToCell(&BlockProof{
-		ProofFor:   blockIDExtTLBFromBlock(id),
+		ProofFor:   proofFor,
 		Root:       proofRoot,
 		Signatures: signatures,
 	})
@@ -263,10 +284,11 @@ func ConfigFromMasterchainState(current *tnstore.BlockState) (*tlb.BlockchainCon
 }
 
 func CheckMasterchainSignatures(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell, cfg *tlb.BlockchainConfig) error {
-	sigSet, err := PrepareMasterchainSignatureSet(blockID, block, signatures)
+	blockSignatures, err := PrepareMasterchainSignatureSet(blockID, block, signatures)
 	if err != nil {
 		return err
 	}
+	sigSet := blockSignatures.ValidatorSignatures
 
 	validators, err := MasterchainValidatorsForBlock(cfg, &blockID, sigSet.CatchainSeqno())
 	if err != nil {
@@ -276,7 +298,7 @@ func CheckMasterchainSignatures(blockID ton.BlockIDExt, block *tlb.Block, signat
 	if err != nil {
 		return fmt.Errorf("prepare validator set for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
-	return CheckPreparedMasterchainSignatures(blockID, sigSet, prepared)
+	return CheckPreparedMasterchainSignatures(blockID, blockSignatures, prepared)
 }
 
 func LiteSignatureSet(signatures *cell.Cell) (any, error) {
@@ -284,10 +306,11 @@ func LiteSignatureSet(signatures *cell.Cell) (any, error) {
 		return nil, fmt.Errorf("masterchain block proof has no validator signatures")
 	}
 
-	sigSet, err := parseSignatureSet(signatures)
+	blockSignatures, err := parseSignatureSet(signatures)
 	if err != nil {
 		return nil, err
 	}
+	sigSet := blockSignatures.ValidatorSignatures
 	if sigSet.simplex {
 		return ton.SignatureSetSimplex{
 			CCSeqno:          int32(sigSet.catchainSeqno),
@@ -327,7 +350,9 @@ func NewSimplexValidatorSignatureSet(catchainSeqno uint32, validatorSetHash uint
 	}
 }
 
-func ParseValidatorSignatureSetCell(signatures *cell.Cell) (*ValidatorSignatureSet, error) {
+// ParseBlockSignatureSetCell decodes the cell-format set together with its
+// declared signer weight.
+func ParseBlockSignatureSetCell(signatures *cell.Cell) (*BlockSignatureSet, error) {
 	if signatures == nil {
 		return nil, fmt.Errorf("validator signatures are empty")
 	}
@@ -339,7 +364,7 @@ func ParseValidatorSignatureSetCell(signatures *cell.Cell) (*ValidatorSignatureS
 	return &sigSet, nil
 }
 
-func PrepareMasterchainSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) (*ValidatorSignatureSet, error) {
+func PrepareMasterchainSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, signatures *cell.Cell) (*BlockSignatureSet, error) {
 	if blockID.Workchain != -1 {
 		return nil, fmt.Errorf("validator signatures are only supported for masterchain blocks, got %s", tnstore.FormatBlockRef(blockID))
 	}
@@ -347,14 +372,19 @@ func PrepareMasterchainSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, si
 		return nil, fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(blockID))
 	}
 
-	sigSet, err := ParseValidatorSignatureSetCell(signatures)
+	blockSignatures, err := ParseBlockSignatureSetCell(signatures)
 	if err != nil {
 		return nil, fmt.Errorf("parse validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
+	sigSet := blockSignatures.ValidatorSignatures
 	if !sigSet.final {
 		return nil, fmt.Errorf("masterchain block %s has non-final validator signatures", tnstore.FormatBlockRef(blockID))
 	}
-	return PrepareValidatorSignatureSet(blockID, block, sigSet)
+	if _, err = PrepareValidatorSignatureSet(blockID, block, sigSet); err != nil {
+		return nil, err
+	}
+
+	return blockSignatures, nil
 }
 
 func PrepareValidatorSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, sigSet *ValidatorSignatureSet) (*ValidatorSignatureSet, error) {
@@ -373,17 +403,15 @@ func PrepareValidatorSignatureSet(blockID ton.BlockIDExt, block *tlb.Block, sigS
 	return sigSet, nil
 }
 
-func CheckPreparedMasterchainSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) error {
+func CheckPreparedMasterchainSignatures(blockID ton.BlockIDExt, blockSignatures *BlockSignatureSet, validators *PreparedValidatorSet) error {
 	if blockID.Workchain != -1 {
 		return fmt.Errorf("validator signatures are only supported for masterchain blocks, got %s", tnstore.FormatBlockRef(blockID))
 	}
-	if sigSet != nil && !sigSet.final {
+	if blockSignatures != nil && blockSignatures.ValidatorSignatures != nil && !blockSignatures.ValidatorSignatures.final {
 		return fmt.Errorf("masterchain block %s has non-final validator signatures", tnstore.FormatBlockRef(blockID))
 	}
-	if sigSet == nil {
-		return CheckPreparedSignatures(blockID, sigSet, nil)
-	}
-	return CheckPreparedSignatures(blockID, sigSet, validators)
+
+	return CheckPreparedBlockSignatures(blockID, blockSignatures, validators)
 }
 
 func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) error {
@@ -391,13 +419,44 @@ func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureS
 		return fmt.Errorf("block %s has no prepared validator signatures", tnstore.FormatBlockRef(blockID))
 	}
 
-	payload, err := signaturePayload(blockID, sigSet)
-	if err != nil {
-		return fmt.Errorf("build validator signature payload for %s: %w", tnstore.FormatBlockRef(blockID), err)
-	}
-	if err = checkSignaturesPayload(payload, sigSet, sigSet.signatures, validators); err != nil {
+	if _, err := validateSignatureWeight(sigSet, validators); err != nil {
 		return fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
+	if err := verifySignatures(blockID, sigSet, validators); err != nil {
+		return fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	}
+
+	return nil
+}
+
+// CheckPreparedBlockSignatures validates a serialized BlockSignatures value.
+// Its declared weight is checked before the Ed25519 batch, then every listed
+// signature is verified.
+func CheckPreparedBlockSignatures(
+	blockID ton.BlockIDExt,
+	blockSignatures *BlockSignatureSet,
+	validators *PreparedValidatorSet,
+) error {
+	if blockSignatures == nil || blockSignatures.ValidatorSignatures == nil {
+		return fmt.Errorf("block %s has no prepared block signatures", tnstore.FormatBlockRef(blockID))
+	}
+
+	signedWeight, err := validateSignatureWeight(blockSignatures.ValidatorSignatures, validators)
+	if err != nil {
+		return fmt.Errorf("check block signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	}
+	if signedWeight != blockSignatures.DeclaredWeight {
+		return fmt.Errorf(
+			"check block signatures for %s: signature weight mismatch: declared=%d actual=%d",
+			tnstore.FormatBlockRef(blockID),
+			blockSignatures.DeclaredWeight,
+			signedWeight,
+		)
+	}
+	if err = verifySignatures(blockID, blockSignatures.ValidatorSignatures, validators); err != nil {
+		return fmt.Errorf("check block signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	}
+
 	return nil
 }
 
@@ -415,6 +474,11 @@ func (s *ValidatorSignatureSet) ValidatorSetHash() uint32 {
 
 func (s *ValidatorSignatureSet) IsSimplex() bool {
 	return s.simplex
+}
+
+// SignatureCount returns the number of listed validator signatures.
+func (s *ValidatorSignatureSet) SignatureCount() int {
+	return len(s.signatures)
 }
 
 func (s *ValidatorSignatureSet) FinalitySignaturesCell(validators *PreparedValidatorSet) (*cell.Cell, error) {
@@ -457,15 +521,10 @@ func (s *ValidatorSignatureSet) signaturesDict(validators *PreparedValidatorSet)
 		return nil, 0, fmt.Errorf("incorrect validator set hash")
 	}
 
-	signatures := slices.Clone(s.signatures)
-	sort.Slice(signatures, func(i, j int) bool {
-		return bytes.Compare(signatures[i].NodeIDShort, signatures[j].NodeIDShort) < 0
-	})
-
 	dict := cell.NewDict(16)
-	seen := make(map[[32]byte]struct{}, len(signatures))
+	seen := make(map[[32]byte]struct{}, len(s.signatures))
 	var weight uint64
-	for i, sig := range signatures {
+	for i, sig := range s.signatures {
 		var nodeID [32]byte
 		if len(sig.NodeIDShort) != len(nodeID) {
 			return nil, 0, fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
@@ -506,6 +565,7 @@ func (s *ValidatorSignatureSet) signaturesDict(validators *PreparedValidatorSet)
 // verification of an equal set against the same block may be skipped.
 func (s *ValidatorSignatureSet) ContentKey(blockID ton.BlockIDExt) []byte {
 	hasher := sha256.New()
+	hasher.Write([]byte("gton:validator-signatures:v2"))
 	var scratch [8]byte
 	writeUint32 := func(v uint32) {
 		binary.BigEndian.PutUint32(scratch[:4], v)
@@ -517,6 +577,7 @@ func (s *ValidatorSignatureSet) ContentKey(blockID ton.BlockIDExt) []byte {
 	}
 
 	writeBytes(blockID.RootHash)
+	writeBytes(blockID.FileHash)
 	writeUint32(s.catchainSeqno)
 	writeUint32(s.validatorSetHash)
 	flags := uint32(0)
@@ -546,6 +607,21 @@ func (s *ValidatorSignatureSet) ContentKey(blockID ton.BlockIDExt) []byte {
 	return hasher.Sum(nil)
 }
 
+// ContentKey includes both the logical signature set and the weight declared
+// by its BlockSignatures cell. It is safe as a cache key for the complete
+// cell-format verification, unlike the TL signature-set key alone.
+func (s *BlockSignatureSet) ContentKey(blockID ton.BlockIDExt) []byte {
+	hasher := sha256.New()
+	hasher.Write([]byte("gton:block-signatures:v1"))
+	hasher.Write(s.ValidatorSignatures.ContentKey(blockID))
+
+	var weight [8]byte
+	binary.BigEndian.PutUint64(weight[:], s.DeclaredWeight)
+	hasher.Write(weight[:])
+
+	return hasher.Sum(nil)
+}
+
 func MasterchainValidatorsForBlock(cfg *tlb.BlockchainConfig, block *ton.BlockIDExt, ccSeqno uint32) ([]*tlb.ValidatorAddr, error) {
 	if block.Workchain != -1 {
 		return nil, fmt.Errorf("only masterchain blocks are supported, got %s", tnstore.FormatBlockRef(*block))
@@ -568,12 +644,24 @@ func (id blockIDExtTLB) blockID() ton.BlockIDExt {
 	}
 }
 
-func blockIDExtTLBFromBlock(id ton.BlockIDExt) blockIDExtTLB {
-	prefixBits := shardPrefixLength(id.Shard)
-	shardPrefix := uint64(id.Shard)
-	if prefixBits < 64 {
-		shardPrefix &^= uint64(1) << (63 - prefixBits)
+func blockIDExtTLBFromBlock(id ton.BlockIDExt) (blockIDExtTLB, error) {
+	if id.Workchain == math.MinInt32 {
+		return blockIDExtTLB{}, fmt.Errorf("block id workchain is invalid")
 	}
+
+	prefixBits, err := sharddomain.PrefixLength(id.Shard)
+	if err != nil {
+		return blockIDExtTLB{}, err
+	}
+	if prefixBits > 60 {
+		return blockIDExtTLB{}, fmt.Errorf("block id shard prefix length %d exceeds TL-B maximum 60", prefixBits)
+	}
+	if err = tnstore.ValidateBlockIDHashes(id); err != nil {
+		return blockIDExtTLB{}, fmt.Errorf("block id hashes: %w", err)
+	}
+
+	shardPrefix := uint64(id.Shard)
+	shardPrefix &^= uint64(1) << (63 - prefixBits)
 	return blockIDExtTLB{
 		ShardID: tlb.ShardIdent{
 			PrefixBits:  int8(prefixBits),
@@ -583,64 +671,84 @@ func blockIDExtTLBFromBlock(id ton.BlockIDExt) blockIDExtTLB {
 		SeqNo:    id.SeqNo,
 		RootHash: bytes.Clone(id.RootHash),
 		FileHash: bytes.Clone(id.FileHash),
-	}
+	}, nil
 }
 
-func shardPrefixLength(shard int64) int {
-	x := uint64(shard)
-	lowBit := x & -x
-	if lowBit == 0 {
-		return 64
+func parseSignatureSet(root *cell.Cell) (BlockSignatureSet, error) {
+	loader, err := root.BeginParse()
+	if err != nil {
+		return BlockSignatureSet{}, fmt.Errorf("begin parse block signatures: %w", err)
 	}
-	return 63 - bits.TrailingZeros64(lowBit)
-}
+	magic, err := loader.PreloadUInt(8)
+	if err != nil {
+		return BlockSignatureSet{}, fmt.Errorf("load block signatures tag: %w", err)
+	}
 
-func parseSignatureSet(root *cell.Cell) (ValidatorSignatureSet, error) {
-	var ordinary blockSignaturesOrdinary
-	if ordinaryLoader, err := root.BeginParse(); err == nil && tlb.LoadFromCell(&ordinary, ordinaryLoader) == nil {
+	switch magic {
+	case 0x11:
+		var ordinary blockSignaturesOrdinary
+		if err = loadExactTLB(&ordinary, loader); err != nil {
+			return BlockSignatureSet{}, fmt.Errorf("parse ordinary block signatures: %w", err)
+		}
 		signatures, err := parseSignaturesDict(ordinary.Signatures, ordinary.SigCount)
 		if err != nil {
-			return ValidatorSignatureSet{}, err
+			return BlockSignatureSet{}, err
 		}
-		return ValidatorSignatureSet{
-			validatorSetHash: ordinary.ValidatorSetHash,
-			catchainSeqno:    ordinary.CatchainSeqno,
-			signatures:       signatures,
-			final:            true,
+		return BlockSignatureSet{
+			ValidatorSignatures: &ValidatorSignatureSet{
+				validatorSetHash: ordinary.ValidatorSetHash,
+				catchainSeqno:    ordinary.CatchainSeqno,
+				signatures:       signatures,
+				final:            true,
+			},
+			DeclaredWeight: ordinary.SigWeight,
 		}, nil
+
+	case 0x12:
+		var simplex blockSignaturesSimplex
+		if err = loadExactTLB(&simplex, loader); err != nil {
+			return BlockSignatureSet{}, fmt.Errorf("parse simplex block signatures: %w", err)
+		}
+		signatures, err := parseSignaturesDict(simplex.Signatures, simplex.SigCount)
+		if err != nil {
+			return BlockSignatureSet{}, err
+		}
+		candidateLoader, err := simplex.CandidateData.BeginParse()
+		if err != nil {
+			return BlockSignatureSet{}, fmt.Errorf("begin parse simplex candidate data: %w", err)
+		}
+		candidateData, err := candidateLoader.LoadBinarySnake()
+		if err != nil {
+			return BlockSignatureSet{}, fmt.Errorf("load simplex candidate data: %w", err)
+		}
+		return BlockSignatureSet{
+			ValidatorSignatures: &ValidatorSignatureSet{
+				validatorSetHash: simplex.ValidatorSetHash,
+				catchainSeqno:    simplex.CatchainSeqno,
+				signatures:       signatures,
+				sessionID:        bytes.Clone(simplex.SessionID),
+				slot:             int32(simplex.Slot),
+				candidateData:    candidateData,
+				final:            true,
+				simplex:          true,
+			},
+			DeclaredWeight: simplex.SigWeight,
+		}, nil
+
+	default:
+		return BlockSignatureSet{}, fmt.Errorf("unsupported block signatures tag %02x", magic)
+	}
+}
+
+func loadExactTLB[T any](value *T, loader *cell.Slice) error {
+	if err := tlb.LoadFromCell(value, loader); err != nil {
+		return err
+	}
+	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
+		return fmt.Errorf("trailing data: %d bits, %d refs", loader.BitsLeft(), loader.RefsNum())
 	}
 
-	simplexLoader, err := root.BeginParse()
-	if err != nil {
-		return ValidatorSignatureSet{}, fmt.Errorf("begin parse simplex signatures: %w", err)
-	}
-
-	var simplex blockSignaturesSimplex
-	if err := tlb.LoadFromCell(&simplex, simplexLoader); err != nil {
-		return ValidatorSignatureSet{}, err
-	}
-	signatures, err := parseSignaturesDict(simplex.Signatures, simplex.SigCount)
-	if err != nil {
-		return ValidatorSignatureSet{}, err
-	}
-	candidateLoader, err := simplex.CandidateData.BeginParse()
-	if err != nil {
-		return ValidatorSignatureSet{}, fmt.Errorf("begin parse simplex candidate data: %w", err)
-	}
-	candidateData, err := candidateLoader.LoadBinarySnake()
-	if err != nil {
-		return ValidatorSignatureSet{}, fmt.Errorf("load simplex candidate data: %w", err)
-	}
-	return ValidatorSignatureSet{
-		validatorSetHash: simplex.ValidatorSetHash,
-		catchainSeqno:    simplex.CatchainSeqno,
-		signatures:       signatures,
-		sessionID:        bytes.Clone(simplex.SessionID),
-		slot:             int32(simplex.Slot),
-		candidateData:    candidateData,
-		final:            true,
-		simplex:          true,
-	}, nil
+	return nil
 }
 
 func signaturePayload(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet) ([]byte, error) {
@@ -715,73 +823,91 @@ func parseSimplexCandidateBlock(candidate []byte) (*ton.BlockIDExt, error) {
 	return nil, fmt.Errorf("unsupported candidate type: ordinary parse failed: %v; empty parse failed: %v", ordinaryErr, emptyErr)
 }
 
-func checkSignaturesPayload(toSign []byte, sigSet *ValidatorSignatureSet, sigs []ton.Signature, validators *PreparedValidatorSet) error {
-	if len(sigs) == 0 || validators == nil || len(validators.validators) == 0 {
-		return fmt.Errorf("zero signatures or validators")
+func validateSignatureWeight(sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) (uint64, error) {
+	if len(sigSet.signatures) == 0 || validators == nil || len(validators.validators) == 0 {
+		return 0, fmt.Errorf("zero signatures or validators")
 	}
 	if sigSet.catchainSeqno != validators.catchainSeqno {
-		return fmt.Errorf("incorrect validator catchain seqno")
+		return 0, fmt.Errorf("incorrect validator catchain seqno")
 	}
 	if sigSet.validatorSetHash != validators.setHash {
-		return fmt.Errorf("incorrect validator set hash")
+		return 0, fmt.Errorf("incorrect validator set hash")
 	}
 
-	type weightedSignature struct {
-		signature []byte
-		validator preparedValidator
-		nodeID    [32]byte
+	var stackSeen [16]uint64
+	seen := stackSeen[:]
+	if len(validators.validators) > len(stackSeen)*64 {
+		seen = make([]uint64, (len(validators.validators)+63)/64)
 	}
-	entries := make([]weightedSignature, 0, len(sigs))
-	seen := make(map[[32]byte]struct{}, len(sigs))
-	for _, sig := range sigs {
+	var signedWeight uint64
+	for _, sig := range sigSet.signatures {
 		var nodeID [32]byte
 		if len(sig.NodeIDShort) != len(nodeID) {
-			return fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
+			return 0, fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
+		}
+		if len(sig.Signature) != ed25519.SignatureSize {
+			return 0, fmt.Errorf("invalid validator signature len %d", len(sig.Signature))
 		}
 		copy(nodeID[:], sig.NodeIDShort)
 
-		if _, ok := seen[nodeID]; ok {
-			return fmt.Errorf("duplicated node signature")
-		}
-		seen[nodeID] = struct{}{}
-
 		v, ok := validators.validators[nodeID]
 		if !ok {
-			return fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
+			return 0, fmt.Errorf("signature of unknown validator %s", hex.EncodeToString(sig.NodeIDShort))
 		}
-		entries = append(entries, weightedSignature{signature: sig.Signature, validator: v, nodeID: nodeID})
-	}
-
-	// Verify heaviest validators first so the 2/3 cutoff below is reached with
-	// the fewest Ed25519 checks.
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].validator.weight != entries[j].validator.weight {
-			return entries[i].validator.weight > entries[j].validator.weight
+		word := v.ordinal / 64
+		mask := uint64(1) << (v.ordinal % 64)
+		if seen[word]&mask != 0 {
+			return 0, fmt.Errorf("duplicated node signature")
 		}
-		return bytes.Compare(entries[i].nodeID[:], entries[j].nodeID[:]) < 0
-	})
+		seen[word] |= mask
 
-	var signedWeight uint64
-	for _, entry := range entries {
-		if !ed25519.Verify(entry.validator.publicKey, toSign, entry.signature) {
-			return fmt.Errorf("incorrect signature of validator %s", hex.EncodeToString(entry.nodeID[:]))
-		}
-
-		signedWeight += entry.validator.weight
-		// Stop verifying once the 2/3 threshold below is already reached,
-		// matching the reference validator-set check_signatures behavior.
-		if 3*signedWeight > 2*validators.totalWeight {
-			break
+		var carry uint64
+		signedWeight, carry = bits.Add64(signedWeight, v.weight, 0)
+		if carry != 0 {
+			return 0, fmt.Errorf("signed validator weight overflow")
 		}
 	}
 
-	if 3*signedWeight <= 2*validators.totalWeight {
-		return fmt.Errorf("insufficient signed weight (%d/%d)", 3*signedWeight, 2*validators.totalWeight)
+	if !hasSignatureThreshold(signedWeight, validators.totalWeight) {
+		return 0, fmt.Errorf("insufficient signed weight (%d/%d)", signedWeight, validators.totalWeight)
 	}
+
+	return signedWeight, nil
+}
+
+func verifySignatures(
+	blockID ton.BlockIDExt,
+	sigSet *ValidatorSignatureSet,
+	validators *PreparedValidatorSet,
+) error {
+	toSign, err := signaturePayload(blockID, sigSet)
+	if err != nil {
+		return fmt.Errorf("build validator signature payload: %w", err)
+	}
+
+	for _, sig := range sigSet.signatures {
+		var nodeID [32]byte
+		copy(nodeID[:], sig.NodeIDShort)
+		validator := validators.validators[nodeID]
+		if !ed25519.Verify(validator.publicKey, toSign, sig.Signature) {
+			return fmt.Errorf("incorrect signature of validator %s", hex.EncodeToString(nodeID[:]))
+		}
+	}
+
 	return nil
 }
 
+func hasSignatureThreshold(signedWeight, totalWeight uint64) bool {
+	signedHigh, signedLow := bits.Mul64(signedWeight, 3)
+	totalHigh, totalLow := bits.Mul64(totalWeight, 2)
+
+	return signedHigh > totalHigh || signedHigh == totalHigh && signedLow > totalLow
+}
+
 func parseSignaturesDict(dict *cell.Dictionary, expectedCount uint32) ([]ton.Signature, error) {
+	if expectedCount > maxBlockSignatures {
+		return nil, fmt.Errorf("too many validator signatures: %d", expectedCount)
+	}
 	if dict == nil {
 		if expectedCount == 0 {
 			return nil, nil

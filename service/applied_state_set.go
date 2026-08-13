@@ -179,7 +179,7 @@ func cloneAppliedStateEntry(entry appliedStateEntry) appliedStateEntry {
 func checkpointBlockStateMetadata(state *storage.BlockState) *storage.BlockState {
 	metadata := storage.BlockStateWithoutCells(state)
 	if len(metadata.StateRootHash) == 0 && state.Cell != nil {
-		hash := state.Cell.HashKey(0)
+		hash := state.Cell.HashKeyAt(0)
 		metadata.StateRootHash = bytes.Clone(hash[:])
 	}
 	return &metadata

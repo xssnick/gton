@@ -74,13 +74,7 @@ func testArtifactPrewriterBlockState(seqno uint32, seed byte) (*storage.BlockSta
 }
 
 func newTestArtifactPrewriter(store checkpointArtifactPrewriteStore, maxBytes uint64) *artifactPrewriter {
-	return &artifactPrewriter{
-		log:      zerolog.Nop(),
-		store:    store,
-		maxBytes: maxBytes,
-		wake:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
-	}
+	return newArtifactPrewriterWithStore(zerolog.Nop(), store, maxBytes)
 }
 
 func TestArtifactPrewriterWaitsForQueuedArtifacts(t *testing.T) {

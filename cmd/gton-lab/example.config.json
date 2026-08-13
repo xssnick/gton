@@ -1,0 +1,64 @@
+{
+  "run_root": "/srv/localnet/lab-runs",
+  "nodes": [
+    {
+      "name": "go-0",
+      "kind": "go",
+      "log_path": "/srv/localnet/node-0/lab.jsonl",
+      "tmux_session": "localnet-go-0",
+      "start_command": [
+        "/bin/bash",
+        "-lc",
+        "cd /srv/localnet/node-0 && exec {binary} --config config.json --data-dir data --global-config-file global.json"
+      ]
+    },
+    {
+      "name": "go-1",
+      "kind": "go",
+      "log_path": "/srv/localnet/node-1/lab.jsonl",
+      "tmux_session": "localnet-go-1",
+      "start_command": [
+        "/bin/bash",
+        "-lc",
+        "cd /srv/localnet/node-1 && exec {binary} --config config.json --data-dir data --global-config-file global.json"
+      ]
+    },
+    {
+      "name": "cpp-0",
+      "kind": "cpp",
+      "log_path": "/srv/localnet/cpp/validator-engine.log",
+      "tmux_session": "localnet-cpp-0"
+    }
+  ],
+  "load": {
+    "binary": "/srv/localnet/bin/gton-jetton-load",
+    "work_dir": "/srv/localnet",
+    "node_config": "/srv/localnet/node-0/config.json",
+    "lite_address": "127.0.0.1:7445",
+    "state_path": "/srv/localnet/load/sender-{sender}.json",
+    "first_sender": 0,
+    "sender_count": 10,
+    "setup_before_run": false,
+    "rate": 150,
+    "duration": "90s",
+    "drain": "10m",
+    "settle": "3s",
+    "topology_timeout": "10m",
+    "recipients": 256,
+    "message_ton": "0.05",
+    "jettons": "1"
+  },
+  "deploy": {
+    "target_binary": "/srv/localnet/bin/gton-node",
+    "health_timeout": "90s"
+  },
+  "conditions": {
+    "min_masterchain_advance": 5,
+    "max_masterchain_lag": 5,
+    "min_finalized_blocks": 1,
+    "max_hard_errors": 0,
+    "require_split": true,
+    "require_merge": true,
+    "allow_error_patterns": []
+  }
+}

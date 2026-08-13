@@ -4,8 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/xssnick/gton/console"
 	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/gton/service/liveview"
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/rs/zerolog"
@@ -19,18 +21,25 @@ import (
 // Node exposes the node capabilities available to a statically linked
 // extension.
 type Node struct {
-	Network Network
-	Store   Store
-	TVM     *tvm.TVM
-	Logger  zerolog.Logger
-	Metrics any
+	Network         Network
+	PrivateOverlays *p2p.PrivateOverlayRegistry
+	BlockBroadcasts *p2p.BlockBroadcasts
+	Store           Store
+	TVM             *tvm.TVM
+	Logger          zerolog.Logger
+	Metrics         any
+	Commands        *console.Registry
 }
 
-// Network exposes external message sending without exposing the full p2p node.
+// Network exposes node traffic operations without exposing the full p2p node.
 type Network interface {
 	SendExternalMessage(ctx context.Context, body []byte, dst *address.Address) error
 	SendCheckedExternalMessage(ctx context.Context, body []byte, dst *address.Address, root *cell.Cell, msg *tlb.ExternalMessage) error
 	CheckExternalMessage(ctx context.Context, body []byte, root *cell.Cell, msg *tlb.ExternalMessage) (externalmsg.CheckResult, error)
+	// SubmitBlockLocally transfers an immutable, fully decoded local block to the
+	// normal verification and apply pipeline. Submission is best-effort and
+	// never waits for validation, application, or a storage checkpoint.
+	SubmitBlockLocally(block p2p.DownloadedBlock)
 }
 
 // Store exposes the shared read-only live view.

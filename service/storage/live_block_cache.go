@@ -6,6 +6,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/xssnick/gton/service/shard"
+
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -395,7 +397,10 @@ func selectLiveBlockCacheSplitNext(prev ton.BlockIDExt, current ton.BlockIDExt, 
 		return ton.BlockIDExt{}, false
 	}
 
-	left := liveBlockCacheShardChild(prev.Shard, true)
+	left, err := shard.Child(prev.Shard, true)
+	if err != nil {
+		return ton.BlockIDExt{}, false
+	}
 	if current.Shard == left {
 		return current, true
 	}
@@ -403,20 +408,6 @@ func selectLiveBlockCacheSplitNext(prev ton.BlockIDExt, current ton.BlockIDExt, 
 		return next, true
 	}
 	return ton.BlockIDExt{}, false
-}
-
-func liveBlockCacheShardChild(shard int64, left bool) int64 {
-	value := uint64(shard)
-	bit := value & -value
-	if bit <= 1 {
-		return shard
-	}
-	childBit := bit >> 1
-	prefix := value &^ bit
-	if !left {
-		prefix |= bit
-	}
-	return int64(prefix | childBit)
 }
 
 func (c *LiveBlockCache) evictLocked() {

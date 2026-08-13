@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
-	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
@@ -238,14 +237,14 @@ type parsedExternalMessage struct {
 }
 
 func parseExternalMessageData(data []byte) (parsedExternalMessage, error) {
-	root, message, err := externalmsg.ParseMessage(data)
+	root, message, err := extmsg.ParseMessage(data)
 	if err != nil {
 		return parsedExternalMessage{}, err
 	}
 	return parsedExternalMessage{
 		root:    root,
 		message: message,
-		address: externalmsg.AddressKey(message.DstAddr),
+		address: extmsg.AddressKeyFor(message.DstAddr),
 	}, nil
 }
 
@@ -256,7 +255,7 @@ func checkedExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey,
 	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
 		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
 	}
-	return externalmsg.AddressKey(addr), nil
+	return extmsg.AddressKeyFor(addr), nil
 }
 
 func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {

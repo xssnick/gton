@@ -186,29 +186,6 @@ func (w *stateCellWindowCache) setPrewriter(prewriter *stateCellPrewriter) {
 	w.mu.Unlock()
 }
 
-func merkleUpdateToRef(update *cell.Cell) (*cell.Cell, error) {
-	loader, err := update.BeginParse()
-	if err != nil {
-		return nil, fmt.Errorf("load merkle update cell: %w", err)
-	}
-	update = loader.BaseCell()
-	if update.Level() != 0 {
-		return nil, fmt.Errorf("merkle update has non-zero level")
-	}
-	if update.GetType() != cell.MerkleUpdateCellType {
-		return nil, fmt.Errorf("not a MerkleUpdate cell")
-	}
-	if loader.RefsNum() != 2 {
-		return nil, fmt.Errorf("wrong references count for a merkle update special cell")
-	}
-
-	updateTo, err := loader.PeekRefCellAt(1)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load merkle update second ref: %w", err)
-	}
-	return updateTo, nil
-}
-
 func (c *stateCellEncodedCache) stageRecords(records storage.StateCellRecords, prewriter *stateCellPrewriter) stateCellPrewriteRequest {
 	if records.Empty() {
 		return stateCellPrewriteRequest{}
@@ -282,14 +259,6 @@ func (c *stateCellEncodedCache) stagedLayers() int {
 	return len(c.layers)
 }
 
-func (c *stateCellEncodedCache) stageStateRecords(root cell.Hash, records storage.StateCellRecords, prewriter *stateCellPrewriter) (stateCellPrewriteRequest, error) {
-	layer, err := newStateCellRecordLayerForRoot(records, root)
-	if err != nil {
-		return stateCellPrewriteRequest{}, err
-	}
-	return c.stageLayer(layer, prewriter), nil
-}
-
 func (c *stateCellEncodedCache) setRecordLocked(hash cell.Hash, encoded []byte) bool {
 	if len(encoded) == 0 {
 		return false
@@ -355,6 +324,11 @@ func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoa
 	// callee that retains it (the decoded record keeps hash[:]) is heap-copied
 	// on entry to that callee, so probing N layers through one would allocate N
 	// times, misses included. Here only this frame's copy is ever retained.
+	//
+	// For the same reason the error paths below format hash rather than hash[:]:
+	// %x renders both identically, but slicing takes the array's address, and
+	// escape analysis is blind to which branch runs — one hash[:] in a cold
+	// error path moves the parameter to the heap on every call, hits included.
 	for i := len(c.layers) - 1; i >= 0; i-- {
 		layer := c.layers[i]
 		idx, ok := layer.indexOf(hash)
@@ -368,7 +342,7 @@ func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoa
 		}
 		loaded, err := cachedLazyCell(hash, layer.dataAt(idx), loader)
 		if err != nil {
-			return nil, fmt.Errorf("create cached lazy cell %x: %w", hash[:], err)
+			return nil, fmt.Errorf("create cached lazy cell %x: %w", hash, err)
 		}
 		slot.Store(loaded)
 		return loaded, nil
@@ -385,7 +359,7 @@ func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoa
 
 	loaded, err := cachedLazyCell(hash, c.records[idx].Data, loader)
 	if err != nil {
-		return nil, fmt.Errorf("create cached lazy cell %x: %w", hash[:], err)
+		return nil, fmt.Errorf("create cached lazy cell %x: %w", hash, err)
 	}
 	slot.Store(loaded)
 	return loaded, nil
@@ -470,7 +444,7 @@ func (w *stateCellWindowCache) applyBlockStateUpdate(previous []*storage.BlockSt
 }
 
 func (w *stateCellWindowCache) applyPreparedMerkleUpdate(previous []*storage.BlockState, update *cell.Cell, prepared storage.StateCellRecords) (stateUpdateApplyResult, error) {
-	updateTo, err := merkleUpdateToRef(update)
+	updateTo, err := storage.MerkleUpdateTarget(update)
 	if err != nil {
 		return stateUpdateApplyResult{}, err
 	}
@@ -521,11 +495,11 @@ func (w *stateCellWindowCache) reloadAppliedRoot(root *cell.Cell) (*cell.Cell, e
 	hash := root.GetMetadata().Hash
 	loaded, err := w.loader()(hash)
 	if err != nil {
-		return nil, fmt.Errorf("reload applied state root %x from state cell window cache: %w", hash[:], err)
+		return nil, fmt.Errorf("reload applied state root %x from state cell window cache: %w", hash, err)
 	}
 	loadedHash := loaded.GetMetadata().Hash
 	if loadedHash != hash {
-		return nil, fmt.Errorf("reloaded applied state root hash mismatch: got=%x want=%x", loadedHash[:], hash[:])
+		return nil, fmt.Errorf("reloaded applied state root hash mismatch: got=%x want=%x", loadedHash, hash)
 	}
 	return loaded, nil
 }
@@ -630,7 +604,7 @@ func (w *stateCellWindowCache) loader() cell.LazyCellLoader {
 		w.mu.RUnlock()
 
 		if base == nil {
-			return nil, fmt.Errorf("state cell %x is not in state cell window cache and base loader is not set", hash[:])
+			return nil, fmt.Errorf("state cell %x is not in state cell window cache and base loader is not set", hash)
 		}
 		return base(hash)
 	}
@@ -917,7 +891,7 @@ func stateRootWithLoader(state *storage.BlockState, loader cell.LazyCellLoader) 
 
 	view := root.Virtualize(0)
 	if len(state.StateRootHash) > 0 {
-		rootHash := view.HashKey(0)
+		rootHash := view.HashKeyAt(0)
 		if !bytes.Equal(rootHash[:], state.StateRootHash) {
 			return nil, fmt.Errorf("current state root hash mismatch for %s: got=%x want=%x", storage.FormatBlockRef(state.Block), rootHash[:], state.StateRootHash)
 		}

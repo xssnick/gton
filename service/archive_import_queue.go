@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"github.com/xssnick/gton/service/archive"
@@ -23,6 +24,7 @@ type archiveImportQueue struct {
 	preparePrefetch  chan archivePrepareJob
 	activeDownload   atomic.Int64
 	activePrepare    atomic.Int64
+	wg               sync.WaitGroup
 }
 
 type archiveDownloadJob struct {
@@ -63,7 +65,7 @@ func (e *archiveImportPeerError) Unwrap() error {
 	return e.err
 }
 
-func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *archiveImportQueue {
+func (r *archiveCatchUpRun) startArchiveImportQueue(ctx context.Context) *archiveImportQueue {
 	downloadWorkers := archiveDownloadWorkers()
 	prepareWorkers := archiveCPUWorkers()
 	queue := &archiveImportQueue{
@@ -73,7 +75,9 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 		preparePrefetch:  make(chan archivePrepareJob, prepareWorkers),
 	}
 	for worker := 0; worker < downloadWorkers; worker++ {
+		queue.wg.Add(1)
 		go func() {
+			defer queue.wg.Done()
 			for {
 				job, ok := nextArchivePriorityJob(ctx, queue.downloadHot, queue.downloadPrefetch, archiveDownloadJob{})
 				if !ok {
@@ -84,7 +88,9 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 		}()
 	}
 	for worker := 0; worker < prepareWorkers; worker++ {
+		queue.wg.Add(1)
 		go func() {
+			defer queue.wg.Done()
 			for {
 				job, ok := nextArchivePriorityJob(ctx, queue.prepareHot, queue.preparePrefetch, archivePrepareJob{})
 				if !ok {
@@ -95,6 +101,27 @@ func (r *archiveCatchUpRunner) startArchiveImportQueue(ctx context.Context) *arc
 		}()
 	}
 	return queue
+}
+
+// wait joins every queue worker. The owning pipeline cancels the queue context
+// before calling it, so no producer can enqueue after the join completes.
+func (q *archiveImportQueue) wait() {
+	q.wg.Wait()
+	q.releaseQueuedPrepareJobs(q.prepareHot)
+	q.releaseQueuedPrepareJobs(q.preparePrefetch)
+}
+
+func (q *archiveImportQueue) releaseQueuedPrepareJobs(jobs <-chan archivePrepareJob) {
+	for {
+		select {
+		case job := <-jobs:
+			if job.downloaded != nil {
+				job.downloaded.Data = nil
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (q *archiveImportQueue) snapshot() archiveImportQueueSnapshot {
@@ -149,7 +176,7 @@ func (q *archiveImportQueue) submitArchive(ctx context.Context, masterchainSeqno
 	return done, nil
 }
 
-func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archiveDownloadJob) {
+func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRun, job archiveDownloadJob) {
 	if err := job.ctx.Err(); err != nil {
 		job.done <- archiveImportQueueResult{err: err}
 		return
@@ -178,7 +205,7 @@ func (q *archiveImportQueue) runDownloadJob(r *archiveCatchUpRunner, job archive
 	}
 }
 
-func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRunner, job archivePrepareJob) {
+func (q *archiveImportQueue) runPrepareJob(r *archiveCatchUpRun, job archivePrepareJob) {
 	releaseDownloadedData := func() {
 		if job.downloaded != nil {
 			job.downloaded.Data = nil

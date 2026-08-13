@@ -43,7 +43,7 @@ func (n *Node) NextKeyBlocks(ctx context.Context, block ton.BlockIDExt, limit in
 	if err = sub.ensurePeers(ctx); err != nil {
 		return KeyBlockBatch{}, fmt.Errorf("bootstrap overlay peers: %w", err)
 	}
-	sub.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
+	sub.startQueryPeerDiscovery(ctx)
 
 	resp, err := sub.queryKeyBlocks(ctx, GetNextKeyBlockIDs{
 		Block:   block,

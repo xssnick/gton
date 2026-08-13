@@ -18,7 +18,7 @@ import (
 func testCompressedV2Broadcast(t *testing.T, seqno uint32) (tonnodeapi.BlockBroadcastCompressedV2, ton.BlockIDExt) {
 	t.Helper()
 
-	blockCell := testPeerBlockRoot(t, 0, topShard, seqno)
+	blockCell := testPeerBlockRoot(t, 0, seqno)
 	blockBOC := serializeCompressedBlockRoot(blockCell)
 	fileHash := hashSimpleBroadcastPayload(blockBOC)
 	blockHash := blockCell.HashKey()

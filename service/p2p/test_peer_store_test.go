@@ -147,6 +147,14 @@ func (s *testPeerStore) BlockMeta(_ context.Context, block ton.BlockIDExt) (*sto
 	return meta.Clone(), nil
 }
 
+func (s *testPeerStore) NextKeyBlocks(context.Context, uint32, int) ([]ton.BlockIDExt, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (s *testPeerStore) CurrentState(context.Context) (*storage.CurrentState, error) {
+	return nil, storage.ErrNotFound
+}
+
 func (s *testPeerStore) BlockFull(_ context.Context, block ton.BlockIDExt) (*storage.ServedBlockFull, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

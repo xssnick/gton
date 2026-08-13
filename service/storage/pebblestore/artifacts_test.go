@@ -2711,7 +2711,6 @@ func TestPruneExpiredPersistentStateFilesKeepsTwoNewestGroups(t *testing.T) {
 
 	ctx := context.Background()
 	nowUnix := uint64(10_000_000)
-	expiredUTime := uint32(1 << 17)
 
 	masters := []ton.BlockIDExt{
 		testArchivePruneBlock(10, 0x10),
@@ -2721,7 +2720,7 @@ func TestPruneExpiredPersistentStateFilesKeepsTwoNewestGroups(t *testing.T) {
 	}
 	paths := make(map[uint32]string, len(masters))
 	for _, master := range masters {
-		saveTestPersistentStatePruneMasterMeta(t, store, master, expiredUTime)
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
 		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
 	}
 
@@ -2770,7 +2769,6 @@ func TestPruneExpiredPersistentStateFilesKeepsPendingCellGenerationOrigin(t *tes
 
 	ctx := context.Background()
 	nowUnix := uint64(10_000_000)
-	expiredUTime := uint32(1 << 17)
 
 	masters := []ton.BlockIDExt{
 		testArchivePruneBlock(10, 0x10),
@@ -2779,7 +2777,7 @@ func TestPruneExpiredPersistentStateFilesKeepsPendingCellGenerationOrigin(t *tes
 	}
 	paths := make(map[uint32]string, len(masters))
 	for _, master := range masters {
-		saveTestPersistentStatePruneMasterMeta(t, store, master, expiredUTime)
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
 		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
 	}
 	if _, err = store.BeginCellGeneration(ctx, masters[0]); err != nil {
@@ -2814,7 +2812,7 @@ func TestPrunePreviousPersistentStateFilesDeletesLatestOlderGroup(t *testing.T) 
 	}
 	paths := make(map[uint32]string, len(masters))
 	for _, master := range masters {
-		saveTestPersistentStatePruneMasterMeta(t, store, master, 1<<17)
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
 		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
 	}
 
@@ -2850,7 +2848,7 @@ func TestPrunePreviousPersistentStateFilesKeepsPendingCellGenerationOrigin(t *te
 	}
 	paths := make(map[uint32]string, len(masters))
 	for _, master := range masters {
-		saveTestPersistentStatePruneMasterMeta(t, store, master, 1<<17)
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
 		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
 	}
 	if _, err = store.BeginCellGeneration(ctx, masters[2]); err != nil {
@@ -2870,13 +2868,13 @@ func TestPrunePreviousPersistentStateFilesKeepsPendingCellGenerationOrigin(t *te
 	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
 }
 
-func saveTestPersistentStatePruneMasterMeta(t *testing.T, store *Store, master ton.BlockIDExt, genUTime uint32) {
+func saveTestPersistentStatePruneMasterMeta(t *testing.T, store *Store, master ton.BlockIDExt) {
 	t.Helper()
 
 	err := store.withHotBatch(func(batch *pebble.Batch) error {
 		return store.setMergedBlockMeta(batch, &storage.BlockMeta{
 			ID:       master,
-			GenUTime: genUTime,
+			GenUTime: 1 << 17,
 		})
 	})
 	if err != nil {

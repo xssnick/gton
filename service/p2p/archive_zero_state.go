@@ -84,8 +84,8 @@ func (a *ArchiveSession) DownloadZeroState(ctx context.Context, block ton.BlockI
 
 			artifact, err := a.downloadZeroStateFromPeer(ctx, sub, pool, shard, peer, block)
 			if err == nil {
-				if zero, ok := artifact.(*zeroStateSnapshotArtifact); ok {
-					zero.writer, _ = a.node.peerStorage.(storage.PeerServingStorageWriter)
+				if zero, ok := artifact.(*zeroStateSnapshotArtifact); ok && a.node.stateArtifacts != nil {
+					zero.writer = a.node.stateArtifacts
 				}
 				return artifact, nil
 			}

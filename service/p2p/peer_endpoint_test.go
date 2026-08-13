@@ -145,8 +145,8 @@ func TestAcquirePeerEndpointKeepsCanonicalAddress(t *testing.T) {
 	if peer.addr != canonical.adnlAddr {
 		t.Fatalf("committed ADNL endpoint = %s, want %s", peer.addr, canonical.adnlAddr)
 	}
-	if peer.route.quicAddr() != canonical.quicAddr {
-		t.Fatalf("committed QUIC endpoint = %s, want %s", peer.route.quicAddr(), canonical.quicAddr)
+	if peer.route.QUICAddress() != canonical.quicAddr {
+		t.Fatalf("committed QUIC endpoint = %s, want %s", peer.route.QUICAddress(), canonical.quicAddr)
 	}
 	if route := fixture.sendRoute(t); route != canonical.adnlAddr {
 		t.Fatalf("route after alternate announcement = %s, want %s", route, canonical.adnlAddr)
@@ -241,8 +241,8 @@ func TestNewOverlayPeerSharesPooledImmutableRoutingData(t *testing.T) {
 	if peer.route != fixture.peer.route {
 		t.Fatal("overlay peer did not share the pooled peer route")
 	}
-	if peer.route.quicAddr() != fixture.peer.route.quicAddr() {
-		t.Fatalf("overlay QUIC route = %q, want %q", peer.route.quicAddr(), fixture.peer.route.quicAddr())
+	if peer.route.QUICAddress() != fixture.peer.route.QUICAddress() {
+		t.Fatalf("overlay QUIC route = %q, want %q", peer.route.QUICAddress(), fixture.peer.route.QUICAddress())
 	}
 	if &peer.overlayID[0] != &sub.spec.ShortID[0] {
 		t.Fatal("overlay peer did not retain the canonical subscription overlay id")

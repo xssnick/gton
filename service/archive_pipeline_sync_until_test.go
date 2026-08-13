@@ -23,8 +23,8 @@ func TestApplyArchiveMasterBlocksMarksSyncUntilOnWindow(t *testing.T) {
 		archiveBlocks: map[storage.BlockRootHash]PreparedBlock{},
 		stateCells:    newTestStateCellWindowCache(nil),
 	}
-	runner := &archiveCatchUpRunner{
-		service: &Service{syncUntil: syncUntil},
+	runner := &archiveCatchUpRun{
+		archive: &ArchiveRunner{syncUntil: syncUntil},
 	}
 
 	last, err := runner.applyArchiveMasterBlocks(context.Background(), start, window)
@@ -54,7 +54,7 @@ func TestCompletedArchiveWindowShardImportTaskIsReady(t *testing.T) {
 		t.Fatalf("completed shard import task state = %q finished=%v", task.stageSnapshot(), task.finishedSnapshot())
 	}
 
-	runner := &archiveCatchUpRunner{service: &Service{archiveCatchUpPrefetchWindows: 2}}
+	runner := &archiveCatchUpRun{archive: &ArchiveRunner{prefetchWindows: 2}}
 	pending := []archivePendingWindow{{
 		window: &shardClientArchiveWindow{syncUntilReached: true},
 		shards: task,

@@ -98,7 +98,7 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 	}
 	var runOpts gton.NodeOptions
 
-	_, factory, err := configureLiteserver(&runOpts, cfg, liteserverRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig(), 0)
+	_, err := configureLiteserver(&runOpts, cfg, liteserverRuntimeOptionsForTest(cfg), liteserverTestGlobalConfig(), 17, false)
 	if err != nil {
 		t.Fatalf("configure liteserver: %v", err)
 	}
@@ -117,8 +117,84 @@ func TestConfigureLiteserverSetsNodeOptions(t *testing.T) {
 	if !runOpts.P2P.AllowDuplicateExternals {
 		t.Fatal("expected duplicate external messages to be allowed in p2p options")
 	}
-	if factory == nil {
-		t.Fatal("expected liteserver extension factory")
+	if runOpts.Liteserver == nil {
+		t.Fatal("expected typed liteserver options")
+	}
+	if runOpts.Liteserver.ListenAddr != "0.0.0.0:7445" || !runOpts.Liteserver.NonFinal {
+		t.Fatalf("unexpected typed liteserver options: %+v", *runOpts.Liteserver)
+	}
+	if runOpts.Liteserver.QueryConcurrency != 17 {
+		t.Fatalf("unexpected query concurrency %d", runOpts.Liteserver.QueryConcurrency)
+	}
+}
+
+func TestConfigureLiteserverDisabledSetsSharedNodeOptions(t *testing.T) {
+	cfg := nodeconfig.Config{
+		Lite: nodeconfig.Lite{
+			NonFinalEnabled:                    true,
+			AllowDuplicateExternals:            true,
+			MasterBlockCache:                   11,
+			ShardBlockCache:                    22,
+			SendMessageBroadcastBytesPerSecond: 123456,
+			SendMessageBroadcastMaxDelayMS:     75,
+			SendMessageBroadcastFanout:         15,
+		},
+	}
+	runOpts := gton.NodeOptions{Liteserver: &gton.LiteserverOptions{ListenAddr: "stale"}}
+
+	_, err := configureLiteserver(
+		&runOpts,
+		cfg,
+		liteserverRuntimeOptionsForTest(cfg),
+		nil,
+		17,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("configure disabled liteserver: %v", err)
+	}
+	if runOpts.Liteserver != nil {
+		t.Fatal("expected disabled liteserver to have no built-in options")
+	}
+	if runOpts.LiveView == nil {
+		t.Fatal("expected liveview options")
+	}
+	if runOpts.LiveView.MasterBlockCache != 11 || runOpts.LiveView.ShardBlockCache != 22 || !runOpts.LiveView.NonFinalEnabled {
+		t.Fatalf("unexpected liveview options: %+v", *runOpts.LiveView)
+	}
+	if runOpts.P2P.ExternalBroadcastCapacity.BytesPerSecond != 123456 ||
+		runOpts.P2P.ExternalBroadcastCapacity.MaxDelay != 75*time.Millisecond ||
+		runOpts.P2P.LocalExternalFanout != 15 ||
+		!runOpts.P2P.AllowDuplicateExternals {
+		t.Fatalf("unexpected p2p options: %+v", runOpts.P2P)
+	}
+}
+
+func TestConfigureLiteserverRetainsNonfinalStateForValidatorWithoutExposingQueries(t *testing.T) {
+	cfg := nodeconfig.Config{
+		Lite: nodeconfig.Lite{
+			MasterBlockCache: 11,
+			ShardBlockCache:  22,
+		},
+	}
+	var runOpts gton.NodeOptions
+
+	opts, err := configureLiteserver(
+		&runOpts,
+		cfg,
+		liteserverRuntimeOptionsForTest(cfg),
+		nil,
+		17,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("configure disabled liteserver for validator: %v", err)
+	}
+	if runOpts.LiveView == nil || !runOpts.LiveView.NonFinalEnabled {
+		t.Fatal("validator must retain non-final shard states")
+	}
+	if opts.NonFinalEnabled || runOpts.Liteserver != nil {
+		t.Fatal("internal validator state retention exposed non-final liteserver queries")
 	}
 }
 

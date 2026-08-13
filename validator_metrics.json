@@ -1,0 +1,341 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Completed validation attempts per second.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_validator_validations_total{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval]))", "legendFormat": "validations/s", "refId": "A" }
+      ],
+      "title": "Validation rate",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Share of rejected, failed, canceled, or deadline-expired validations.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.01 }, { "color": "red", "value": 0.05 }] }, "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_validator_validations_total{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result!=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_validator_validations_total{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])), 1e-9)", "legendFormat": "non-success", "refId": "A" }
+      ],
+      "title": "Validation non-success ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Candidates currently validating. A sustained increase indicates local state or CPU lag.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "sum(${metric_namespace}_validator_validations_inflight{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"})", "legendFormat": "inflight", "refId": "A" }
+      ],
+      "title": "Validation inflight",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "p95 end-to-end time until a successful candidate is ready for a vote, including ValidAfter.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 2 }] }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p95", "refId": "A" }
+      ],
+      "title": "Validation ready p95",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Time until validation has a semantic decision. This excludes the subsequent ValidAfter wait.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "id": 5,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_validator_validation_decision_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_decision_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_validator_validation_decision_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p99", "refId": "C" }
+      ],
+      "title": "Validation decision latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "End-to-end validation time until the vote continuation is released.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "id": 6,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p99", "refId": "C" }
+      ],
+      "title": "Validation ready latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "p95 validation stage latency. Backend is inclusive; core_* panels split its deterministic internals.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 13 },
+      "id": 7,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,stage))", "legendFormat": "{{chain}} / {{stage}}", "refId": "A" }
+      ],
+      "title": "Validation stages p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Backend attempt outcomes and retry causes expose local-state starvation.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 13 },
+      "id": 8,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_validator_validation_attempt_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (result)", "legendFormat": "attempt {{result}}", "refId": "A" },
+        { "expr": "sum(rate(${metric_namespace}_validator_validation_retries_total{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (reason)", "legendFormat": "retry {{reason}}", "refId": "B" }
+      ],
+      "title": "Validation attempts and retries",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "p95 payload size entering validation, split into block and collated data.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
+      "id": 9,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_candidate_size_bytes_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,part))", "legendFormat": "{{chain}} / {{part}}", "refId": "A" }
+      ],
+      "title": "Validation candidate size p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Integrated collator build completion rate by terminal result.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
+      "id": 10,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_collator_builds_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (chain,result)", "legendFormat": "{{chain}} / {{result}}", "refId": "A" }
+      ],
+      "title": "Integrated collator build rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Integrated collator build latency, including input acquisition and candidate serialization.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "id": 11,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p99", "refId": "C" }
+      ],
+      "title": "Integrated collator build latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "p95 non-overlapping production stages after the candidate build and inside local acquisition.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 30 },
+      "id": 12,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,stage))", "legendFormat": "{{chain}} / {{stage}}", "refId": "A" }
+      ],
+      "title": "Integrated collator stages p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Slot-boundary lateness and soft/hard deadline decisions. Any growth here directly threatens candidate delivery.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 30 },
+      "id": 13,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_schedule_lateness_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,event))", "legendFormat": "{{chain}} / {{event}} p95", "refId": "A" }
+      ],
+      "title": "Integrated collator schedule lateness",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Deadline actions and candidate production result rate.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 39 },
+      "id": 14,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_collator_deadline_events_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (chain,deadline,action)", "legendFormat": "{{chain}} {{deadline}} / {{action}}", "refId": "A" },
+        { "expr": "sum(rate(${metric_namespace}_collator_candidate_production_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result!=\"success\"}[$__rate_interval])) by (chain,kind,result)", "legendFormat": "production {{chain}} {{kind}} / {{result}}", "refId": "B" }
+      ],
+      "title": "Integrated collator deadline and failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "p95 signed-candidate delivery duration through persistence, state commit, schedule wait, and emission.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 39 },
+      "id": 15,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_candidate_production_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain,kind))", "legendFormat": "{{chain}} / {{kind}}", "refId": "A" }
+      ],
+      "title": "Integrated candidate delivery p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "p95 transactions, imported messages, and resulting outbound queue size per produced block.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 39 },
+      "id": 16,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_candidate_transactions_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} tx", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_candidate_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,kind))", "legendFormat": "{{chain}} {{kind}} msg", "refId": "B" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_candidate_out_queue_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} out queue", "refId": "C" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_candidate_gas_used_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} gas", "refId": "D" }
+      ],
+      "title": "Integrated candidate load p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Rates of external-phase stop causes, final load classes, and explicit overload causes.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 18, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 47 },
+      "id": 17,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_collator_external_stop_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (chain,reason)", "legendFormat": "external {{chain}} / {{reason}}", "refId": "A" },
+        { "expr": "sum(rate(${metric_namespace}_collator_load_class_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (chain,class)", "legendFormat": "load {{chain}} / {{class}}", "refId": "B" },
+        { "expr": "sum(rate(${metric_namespace}_collator_overload_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",reason!=\"none\"}[$__rate_interval])) by (chain,reason)", "legendFormat": "overload {{chain}} / {{reason}}", "refId": "C" }
+      ],
+      "title": "Integrated candidate pressure",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": ["gton", "validator", "collator", "prometheus"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data Source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": { "selected": true, "text": "gton", "value": "gton" },
+        "hide": 0,
+        "label": "metric namespace",
+        "name": "metric_namespace",
+        "options": [{ "selected": true, "text": "gton", "value": "gton" }],
+        "query": "gton",
+        "type": "custom"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "$datasource" },
+        "definition": "label_values(${metric_namespace}_validator_validations_total, job)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "job",
+        "multi": true,
+        "name": "job",
+        "options": [],
+        "query": { "query": "label_values(${metric_namespace}_validator_validations_total, job)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "$datasource" },
+        "definition": "label_values(${metric_namespace}_validator_validations_total{job=~\"$job\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": { "query": "label_values(${metric_namespace}_validator_validations_total{job=~\"$job\"}, instance)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "hide": 0,
+        "includeAll": true,
+        "label": "chain",
+        "multi": true,
+        "name": "chain",
+        "options": [
+          { "selected": false, "text": "masterchain", "value": "masterchain" },
+          { "selected": false, "text": "shardchain", "value": "shardchain" }
+        ],
+        "query": "masterchain,shardchain",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m"] },
+  "timezone": "browser",
+  "title": "GTON Validator Metrics",
+  "uid": "gton-validator-metrics",
+  "version": 1,
+  "weekStart": ""
+}

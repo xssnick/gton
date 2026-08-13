@@ -38,6 +38,149 @@ sum(rate(gton_liteserver_queries_total{error_code!="0"}[5m])) by (method, error_
 histogram_quantile(0.95, sum(rate(gton_liteserver_query_handler_duration_seconds_bucket[5m])) by (le, method))
 ```
 
+## Validator
+
+Validator metrics are registered by the validator extension stack. All label
+sets are bounded and pre-bound during extension construction; candidate IDs,
+block hashes, session IDs, peers, shard IDs, and error strings are never metric
+labels. When metrics are disabled, the new stage clocks are skipped entirely.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `gton_validator_validations_total` | counter | `chain`, `kind`, `origin`, `result` | Finished candidate validations. |
+| `gton_validator_validations_inflight` | gauge | `chain`, `kind`, `origin` | Candidate validations currently running. |
+| `gton_validator_validation_decision_duration_seconds` | histogram | `chain`, `kind`, `origin`, `result` | Time until the semantic validation decision, before `ValidAfter` waiting. |
+| `gton_validator_validation_ready_duration_seconds` | histogram | `chain`, `kind`, `origin`, `result` | End-to-end time until the validation continuation is ready to vote. |
+| `gton_validator_validation_stage_duration_seconds` | histogram | `chain`, `stage` | Runtime and deterministic-core stage duration. `backend` contains the nested `core_*` stages. |
+| `gton_validator_validation_attempt_duration_seconds` | histogram | `chain`, `result` | One backend validation attempt. |
+| `gton_validator_validation_retries_total` | counter | `chain`, `reason` | Retries caused by unavailable local state or an attempt deadline. |
+| `gton_validator_candidate_size_bytes` | histogram | `chain`, `part` | Candidate block and collated-data payload sizes entering validation. |
+
+Common values:
+
+- `chain`: `masterchain`, `shardchain`.
+- `kind`: `block`, `empty`.
+- `origin`: `local`, `remote`; local means the candidate leader is this
+  session's validator identity.
+- validation `result`: `success`, `rejected`, `canceled`, `deadline`, `error`.
+- attempt `result`: `success`, `rejected`, `not_ready`, `canceled`, `deadline`,
+  `error`.
+- `stage`: `load_candidate`, `resolve_parent`, `min_block_interval_wait`,
+  `backend`, `retry_wait`, `valid_after_wait`, `core_restore_state`,
+  `core_master_view`, `core_chain_inputs`, `core_decode`, `core_transition`.
+- retry `reason`: `state_not_ready`, `attempt_deadline`.
+
+Useful examples:
+
+```promql
+sum(rate(gton_validator_validations_total[5m])) by (chain, result)
+histogram_quantile(0.95, sum(rate(gton_validator_validation_decision_duration_seconds_bucket{result="success"}[5m])) by (le, chain))
+histogram_quantile(0.95, sum(rate(gton_validator_validation_ready_duration_seconds_bucket{result="success"}[5m])) by (le, chain))
+histogram_quantile(0.95, sum(rate(gton_validator_validation_stage_duration_seconds_bucket[5m])) by (le, chain, stage))
+sum(rate(gton_validator_validation_retries_total[5m])) by (chain, reason)
+```
+
+The C++ reference records whole-query `validateblock` and `collate` wall time
+through `PerfWarningTimer`/manager perf stats, plus generic per-operation CPU
+ticks. These gton histograms retain the same whole-operation boundaries and add
+the stage split needed to tell state waiting, deterministic verification, and
+`ValidAfter` apart.
+
+## Collator
+
+Collator metrics are registered once by the shared validator/collator extension
+stack. `mode="validator"` is the integrated collator; `mode="standalone"` is
+the standalone collator. The two roles can coexist without collector-name
+collisions or dynamic label binding in candidate processing.
+
+The `origin` label separates the two things this node does with a candidate.
+`origin="collation"` covers blocks it produced, counted from the collator's own
+Stats. `origin="validation"` covers blocks another validator produced and this
+node accepted; those counts come out of the semantic replay, which already walks
+the descriptors and transactions to verify them, so reporting them costs no
+extra pass over the block. Rejected candidates are not reported — a block that
+failed verification has no shape worth charting.
+
+The two are defined to line up: `kind="external"` counts `msg_import_ext`
+descriptors, which collation writes once per included external, and
+`kind="internal"` counts `msg_import_fin` plus `msg_import_tr`, the pair it
+writes for an internal taken off a queue. Metrics without an `origin` label are
+collation-only, because they measure work only a producer performs.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `gton_collator_builds_total` | counter | `mode`, `chain`, `result` | Candidate build attempts. |
+| `gton_collator_builds_inflight` | gauge | `mode`, `chain` | Builds currently acquiring inputs or collating. |
+| `gton_collator_build_duration_seconds` | histogram | `mode`, `chain`, `result` | Whole build future: acquisition, core collation, and serialization. |
+| `gton_collator_stage_duration_seconds` | histogram | `mode`, `chain`, `stage` | Non-overlapping acquisition and producer stages. |
+| `gton_collator_candidates_total` | counter | `mode`, `chain`, `kind` | Newly signed block or empty candidates. |
+| `gton_collator_candidate_production_duration_seconds` | histogram | `mode`, `chain`, `kind`, `result` | Candidate production through persistence, state commit, schedule wait, and emission; recovered candidates are a separate kind. |
+| `gton_collator_candidate_size_bytes` | histogram | `mode`, `chain`, `origin`, `part` | Block and collated-data sizes. `origin="collation"` is a block this node built; `origin="validation"` is one it accepted from another validator. |
+| `gton_collator_candidate_transactions` | histogram | `mode`, `chain`, `origin` | Transactions in a non-empty candidate, by `origin`. |
+| `gton_collator_candidate_gas_used` | histogram | `mode`, `chain` | Gas used by a produced block. Collation only: gas is a producer's own metering and is not recoverable from a block. |
+| `gton_collator_candidate_messages` | histogram | `mode`, `chain`, `origin`, `kind` | External and imported internal messages in a candidate, by `origin`. |
+| `gton_collator_candidate_out_queue_messages` | histogram | `mode`, `chain` | Resulting outbound queue size. |
+| `gton_collator_external_wait_duration_seconds` | histogram | `mode`, `chain` | Time waiting for ready external-message batches. |
+| `gton_collator_external_batches` | histogram | `mode`, `chain` | Ready external batches consumed. |
+| `gton_collator_external_stop_total` | counter | `mode`, `chain`, `reason` | External-message phase stop reason. |
+| `gton_collator_load_class_total` | counter | `mode`, `chain`, `class` | Produced candidates by load class. |
+| `gton_collator_overload_total` | counter | `mode`, `chain`, `reason` | Produced candidates by overload cause. |
+| `gton_collator_deadline_events_total` | counter | `mode`, `chain`, `deadline`, `action` | Soft/hard producer deadline decisions. |
+| `gton_collator_retries_total` | counter | `mode`, `chain`, `reason` | Retried producer windows. |
+| `gton_collator_schedule_lateness_seconds` | histogram | `mode`, `chain`, `event` | Positive lateness at build-start or broadcast slot boundaries. |
+| `gton_collator_windows_inflight` | gauge | `mode`, `chain` | Producer windows currently running. |
+| `gton_collator_windows_total` | counter | `mode`, `chain`, `result` | Finished producer windows. |
+| `gton_collator_window_duration_seconds` | histogram | `mode`, `chain`, `result` | Whole producer-window duration, including retries. |
+
+Common values:
+
+- `result`: `success`, `error`, `canceled`, `deadline`.
+- candidate `kind`: `block`, `empty`, `recovered`.
+- `stage`: `acquire_inputs`, `core`, `resolve_state`, `restore`, `sign`,
+  `persist`, `commit`, `broadcast_wait`, `emit`.
+- deadline/action: `soft` or `hard`; `wait`, `emit_empty`, or `abort`.
+- schedule `event`: `build_start`, `broadcast`.
+- retry `reason`: `not_ready`, `other`.
+- external stop `reason`: `unknown`, `ready_drained`, `soft_limit`, `deadline`,
+  `attempt_limit`.
+- load `class`: `underload`, `normal`, `soft`, `medium`, `hard`, `unknown`.
+- overload `reason`: `none`, `block_limit`, `force_split_queue`,
+  `long_collation`, `unknown`.
+
+The standalone extension additionally collects its bounded controller and
+storage status at scrape time. The read is outside collation and has a one
+second timeout.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `gton_collator_status_available` | gauge | `mode` | `1` when standalone status collection succeeded. |
+| `gton_collator_controller_state` | gauge | `mode`, `state` | Controller lifecycle booleans. |
+| `gton_collator_controller_sessions` | gauge | `mode`, `state` | Active, future, backend, and observer session counts. |
+| `gton_collator_status_windows` | gauge | `mode`, `state` | Active and retrying backend windows. |
+| `gton_collator_status_windows_total` | counter | `mode`, `result` | Backend completed and failed window counters. |
+| `gton_collator_storage_records` | gauge | `mode`, `type` | Session, window, pending-window, and candidate records. |
+| `gton_collator_storage_pending_writes` | gauge | `mode` | Writes awaiting completion. |
+| `gton_collator_storage_db_bytes` | gauge | `mode`, `type` | Pebble disk, live, WAL, memtable, and compaction-debt bytes. |
+| `gton_collator_storage_db_read_amp` | gauge | `mode` | Pebble read amplification. |
+| `gton_collator_storage_db_l0_files` | gauge | `mode` | Pebble L0 file count. |
+| `gton_collator_storage_db_l0_sublevels` | gauge | `mode` | Pebble L0 sublevel count. |
+| `gton_collator_storage_db_compactions_in_progress` | gauge | `mode` | Active Pebble compactions. |
+| `gton_collator_last_completed_timestamp_seconds` | gauge | `mode` | Last completed standalone window Unix timestamp. |
+
+Useful examples:
+
+```promql
+histogram_quantile(0.95, sum(rate(gton_collator_build_duration_seconds_bucket{mode="validator",result="success"}[5m])) by (le, chain))
+histogram_quantile(0.95, sum(rate(gton_collator_stage_duration_seconds_bucket{mode="standalone"}[5m])) by (le, chain, stage))
+histogram_quantile(0.95, sum(rate(gton_collator_schedule_lateness_seconds_bucket[5m])) by (le, mode, chain, event))
+sum(rate(gton_collator_deadline_events_total[5m])) by (mode, chain, deadline, action)
+sum(rate(gton_collator_retries_total[5m])) by (mode, chain, reason)
+```
+
+Ready-to-import dashboards are provided in `validator_metrics.json` (validator
+plus its integrated collator) and `collator_metrics.json` (standalone collator
+only).
+
 ## Sync Freshness
 
 These gauges are collected from the current service status at scrape time, so
@@ -94,7 +237,7 @@ Common label values:
 - `pipeline`: `blocksync`, `next_block`, `next_block_bootstrap`.
 - `chain`: `masterchain`, `shardchain`, or `workchain_<id>`.
 - `shard`: `masterchain`, `basechain`, or a 16-digit shard id.
-- `source`: `broadcast`, `broadcast_queue`, `broadcast_candidate`, `broadcast_cache`, `broadcast_hint`, `queue`, `peer_catch_up`, `peer_probe`, `next_block`, `indexed`, `next_description`, `stored`, `unknown`.
+- `source`: `broadcast`, `broadcast_queue`, `broadcast_candidate`, `broadcast_cache`, `broadcast_hint`, `queue`, `peer_catch_up`, `peer_probe`, `next_block`, `indexed`, `next_description`, `stored`, `internal`, `unknown`.
 - `origin`: `broadcast`, `download`, `stored`, `other`, or `unknown`.
 - `stage`: `master` or `shards`.
 - `result`: `success`, `miss`, `timeout`, `canceled`, `retry`, or `error`.
@@ -146,14 +289,13 @@ sync queues.
 Common `queue` values:
 
 - P2P queues: `broadcast`, `rebroadcast`, `local_rebroadcast`.
-- Blocksync queues: `output`, `shard_description`.
+- Blocksync queues: `output`, `internal`, `shard_description`.
 
-Common `direction` values for `gton_p2p_broadcasts_total` are `received_roster`,
-`received_unlisted`, `accepted`, and `queue_rebroadcasted`. The two `received_*`
-series are counted after the overlay signature/FEC checks and distinguish the
-immediate transport peer from the broadcast signer. An unlisted peer is kept as
-an ingress transport but is not promoted into the overlay routing roster.
-Overlay-level relay sends are exported separately via
+Common `direction` values for `gton_p2p_broadcasts_total` are `received`,
+`accepted`, and `queue_rebroadcasted`. The `received` series are counted after
+the transport has reconstructed and parsed the broadcast, before application
+acceptance, for every delivery mode. Peer roster membership is deliberately not
+encoded in this metric. Overlay-level relay sends are exported separately via
 `gton_p2p_broadcast_relay_sent_total`.
 
 Common `delivery` values are `simple`, `fec`, `two_step`, and `plumtree`.

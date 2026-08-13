@@ -67,7 +67,7 @@ func TestPreparedShardBlockCacheTakeAndDedup(t *testing.T) {
 // countingBlockFullStore records every fallback load the resolver would pay
 // for when the pre-prepared entry is missed.
 type countingBlockFullStore struct {
-	tnstore.Storage
+	testStorage
 	blockFullCalls int
 }
 
@@ -100,7 +100,7 @@ func testBroadcastShardBlock(t *testing.T, seqno uint32) *p2p.DownloadedBlock {
 	}
 }
 
-func waitPreparedShardBlock(t *testing.T, svc *Service, block ton.BlockIDExt) {
+func waitPreparedShardBlock(t *testing.T, svc *SyncCoordinator, block ton.BlockIDExt) {
 	t.Helper()
 
 	key := tnstore.BlockKey(block)
@@ -124,7 +124,7 @@ func waitPreparedShardBlock(t *testing.T, svc *Service, block ton.BlockIDExt) {
 // state-update cells instead of paying PrepareStateUpdateCells inline.
 func TestBroadcastShardBlockIsPreparedAheadAndTakenByResolverLoad(t *testing.T) {
 	store := &countingBlockFullStore{}
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:               zerolog.Nop(),
 		storage:           store,
 		shardPrepareQueue: make(chan shardPrepareRequest, preparedShardBlockQueueSize),
@@ -173,7 +173,7 @@ func TestBroadcastShardBlockIsPreparedAheadAndTakenByResolverLoad(t *testing.T) 
 // One preparation per block: the description-hint prefetch and the broadcast
 // feed race for the same blocks, and the prepared store is the single dedupe.
 func TestShardPrepareFeedsDedupeAcrossSources(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:               zerolog.Nop(),
 		shardPrepareQueue: make(chan shardPrepareRequest, preparedShardBlockQueueSize),
 	}
@@ -203,7 +203,7 @@ func TestShardPrepareFeedsDedupeAcrossSources(t *testing.T) {
 // The feed never blocks its caller: broadcast accept paths and the serial
 // block processor both enqueue, and a full queue refuses the newest request.
 func TestShardPrepareQueueRefusesNewestWhenFull(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:               zerolog.Nop(),
 		shardPrepareQueue: make(chan shardPrepareRequest, preparedShardBlockQueueSize),
 	}
@@ -224,7 +224,7 @@ func TestShardPrepareQueueRefusesNewestWhenFull(t *testing.T) {
 // Masterchain blocks are advanced by the sync pipeline itself and must never
 // occupy a shard prepare slot.
 func TestShardPrepareIgnoresMasterchainBroadcast(t *testing.T) {
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:               zerolog.Nop(),
 		shardPrepareQueue: make(chan shardPrepareRequest, preparedShardBlockQueueSize),
 	}

@@ -3969,6 +3969,94 @@
         }
       }
     },
+    "panel-63": {
+      "kind": "Panel",
+      "spec": {
+        "id": 63,
+        "title": "Received broadcast rate",
+        "description": "Inbound P2P broadcasts successfully reconstructed and parsed by the transport, before application acceptance, deduplication, or already-applied filtering.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"received\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} {{kind}} {{delivery}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-61": {
       "kind": "Panel",
       "spec": {
@@ -4993,6 +5081,346 @@
           }
         }
       }
+    },
+    "panel-64": {
+      "kind": "Panel",
+      "spec": {
+        "id": 64,
+        "title": "Candidate block size p95",
+        "description": "95th percentile serialized block size, split by whether this node produced the block (collation) or only checked one (validation). The consensus maximum is a hard ceiling on this series.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin) (rate(${metric_namespace}_collator_candidate_size_bytes_bucket{job=~\"$job\", instance=~\"$instance\", part=\"block\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{chain}} {{origin}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-65": {
+      "kind": "Panel",
+      "spec": {
+        "id": 65,
+        "title": "Candidate collated data size p95",
+        "description": "95th percentile collated-data payload size, split by collation and validation.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin) (rate(${metric_namespace}_collator_candidate_size_bytes_bucket{job=~\"$job\", instance=~\"$instance\", part=\"collated\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{chain}} {{origin}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-66": {
+      "kind": "Panel",
+      "spec": {
+        "id": 66,
+        "title": "Transactions per candidate p95",
+        "description": "95th percentile transaction count per non-empty candidate. A persistent gap between collation and validation means this node builds blocks of a different size than its peers do.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin) (rate(${metric_namespace}_collator_candidate_transactions_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{chain}} {{origin}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "s"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-67": {
+      "kind": "Panel",
+      "spec": {
+        "id": 67,
+        "title": "Candidate message mix p95",
+        "description": "95th percentile external and imported-internal message counts per candidate, split by collation and validation.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "$datasource"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin, kind) (rate(${metric_namespace}_collator_candidate_messages_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{chain}} {{origin}} {{kind}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "s"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
     }
   },
   "layout": {
@@ -5485,6 +5913,19 @@
                     "spec": {
                       "x": 0,
                       "y": 32,
+                      "width": 24,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-63"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 40,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -5497,7 +5938,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 12,
-                      "y": 32,
+                      "y": 40,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -5510,7 +5951,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 0,
-                      "y": 40,
+                      "y": 48,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -5523,7 +5964,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 12,
-                      "y": 40,
+                      "y": 48,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -5536,7 +5977,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 0,
-                      "y": 48,
+                      "y": 56,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -5549,7 +5990,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 12,
-                      "y": 48,
+                      "y": 56,
                       "width": 12,
                       "height": 8,
                       "element": {
@@ -5562,7 +6003,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 0,
-                      "y": 56,
+                      "y": 64,
                       "width": 24,
                       "height": 8,
                       "element": {
@@ -5575,7 +6016,7 @@
                     "kind": "GridLayoutItem",
                     "spec": {
                       "x": 0,
-                      "y": 64,
+                      "y": 72,
                       "width": 24,
                       "height": 8,
                       "element": {
@@ -5804,6 +6245,72 @@
                       "element": {
                         "kind": "ElementReference",
                         "name": "panel-47"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "title": "Candidate Shape",
+            "collapse": false,
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 0,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-64"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 0,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-65"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 0,
+                      "y": 8,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-66"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "x": 12,
+                      "y": 8,
+                      "width": 12,
+                      "height": 8,
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-67"
                       }
                     }
                   }

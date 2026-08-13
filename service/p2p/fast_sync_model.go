@@ -2,13 +2,13 @@ package p2p
 
 import (
 	"bytes"
-	"cmp"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"math/bits"
 	"slices"
+
+	"github.com/xssnick/gton/service/p2p/internal/fastsync"
 )
 
 const (
@@ -20,9 +20,6 @@ const (
 
 	// pub.overlay name:bytes = PublicKey
 	fastSyncOverlayPublicKeyConstructor = uint32(0x34ba45cb)
-
-	// pub.ed25519 key:int256 = PublicKey
-	fastSyncValidatorPublicKeyConstructor = uint32(0x4813b4c6)
 )
 
 var (
@@ -109,7 +106,9 @@ func NewFastSyncValidatorRoster(
 
 	for _, validators := range [3][]FastSyncValidator{previous, current, next} {
 		for _, validator := range validators {
-			validatorID := fastSyncValidatorShortID(validator.PublicKey)
+			validatorID := fastsync.ValidatorID[PeerID](
+				validator.PublicKey,
+			)
 			rootPublicKeyIDs = append(rootPublicKeyIDs, validatorID)
 			if validator.ADNLID.IsZero() {
 				adnlIDs = append(adnlIDs, validatorID)
@@ -152,16 +151,6 @@ func fastSyncRosterFingerprint(
 	return fingerprint
 }
 
-func fastSyncValidatorShortID(publicKey FastSyncValidatorPublicKey) PeerID {
-	var boxed [4 + ed25519.PublicKeySize]byte
-	binary.LittleEndian.PutUint32(
-		boxed[0:4],
-		fastSyncValidatorPublicKeyConstructor,
-	)
-	copy(boxed[4:], publicKey[:])
-	return PeerID(sha256.Sum256(boxed[:]))
-}
-
 func (r FastSyncValidatorRoster) Len() int {
 	return len(r.adnlIDs)
 }
@@ -185,6 +174,12 @@ func (r FastSyncValidatorRoster) ADNLIDs() []PeerID {
 // still only be read through the cloning accessors.
 func (r FastSyncValidatorRoster) rootCount() int {
 	return len(r.rootPublicKeyIDs)
+}
+
+// rootPublicKeyIDsRef returns the immutable backing slice for state owners that
+// copy every ID into their own maps during construction.
+func (r FastSyncValidatorRoster) rootPublicKeyIDsRef() []PeerID {
+	return r.rootPublicKeyIDs
 }
 
 // adnlIDsRef returns the backing slice. Callers must not mutate or retain it
@@ -214,65 +209,4 @@ func sortUniqueFastSyncPeerIDs(ids []PeerID) []PeerID {
 
 func compareFastSyncPeerID(left, right PeerID) int {
 	return bytes.Compare(left[:], right[:])
-}
-
-type FastSyncShardSet struct {
-	shards []FastSyncShard
-}
-
-func NewFastSyncShardSet(shards []FastSyncShard) FastSyncShardSet {
-	shards = slices.Clone(shards)
-	slices.SortFunc(shards, compareFastSyncShard)
-	shards = slices.Compact(shards)
-	return FastSyncShardSet{shards: shards}
-}
-
-func (s FastSyncShardSet) Shards() []FastSyncShard {
-	return slices.Clone(s.shards)
-}
-
-// shardsRef returns the backing slice; see adnlIDsRef for the contract.
-func (s FastSyncShardSet) shardsRef() []FastSyncShard {
-	return s.shards
-}
-
-func (s FastSyncShardSet) Select(requested FastSyncShard) (FastSyncShard, error) {
-	current := requested
-	for {
-		if s.contains(current) {
-			return current, nil
-		}
-		if fastSyncShardPrefixLength(current.Shard) == 0 {
-			return FastSyncShard{}, ErrFastSyncNotFound
-		}
-
-		current.Shard = fastSyncShardParent(current.Shard)
-	}
-}
-
-func (s FastSyncShardSet) contains(shard FastSyncShard) bool {
-	_, found := slices.BinarySearchFunc(s.shards, shard, compareFastSyncShard)
-	return found
-}
-
-func compareFastSyncShard(left, right FastSyncShard) int {
-	if order := cmp.Compare(left.Workchain, right.Workchain); order != 0 {
-		return order
-	}
-	return cmp.Compare(uint64(left.Shard), uint64(right.Shard))
-}
-
-func fastSyncShardPrefixLength(shard int64) int {
-	if shard == 0 {
-		return 0
-	}
-
-	lowBit := uint64(shard) & -uint64(shard)
-	return 63 - bits.TrailingZeros64(lowBit)
-}
-
-func fastSyncShardParent(shard int64) int64 {
-	value := uint64(shard)
-	lowBit := value & -value
-	return int64((value - lowBit) | (lowBit << 1))
 }

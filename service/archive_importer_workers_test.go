@@ -14,9 +14,11 @@ import (
 func newTestArchiveSession(t *testing.T) *p2p.ArchiveSession {
 	t.Helper()
 
+	store := openTestPebbleStorage(t)
 	node, err := p2p.New(p2p.Options{
-		Storage:       openTestPebbleStorage(t),
-		StateFilesDir: t.TempDir(),
+		PeerStorage:          store,
+		StateArtifactStorage: store,
+		StateFilesDir:        t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("new archive session node: %v", err)
@@ -112,8 +114,39 @@ func TestArchiveImportQueueSnapshotReportsActiveAndQueuedJobs(t *testing.T) {
 	}
 }
 
+func TestArchiveImportQueueWaitJoinsCanceledWorkers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := &archiveCatchUpRun{}
+	queue := runner.startArchiveImportQueue(ctx)
+	cancel()
+	downloaded := &archive.Downloaded{Data: make([]byte, 1024)}
+	queue.preparePrefetch <- archivePrepareJob{
+		ctx:        ctx,
+		downloaded: downloaded,
+		done:       make(chan archiveImportQueueResult, 1),
+	}
+
+	joined := make(chan struct{})
+	go func() {
+		queue.wait()
+		close(joined)
+	}()
+
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("archive import queue workers did not join after cancellation")
+	}
+	if queue.activeDownload.Load() != 0 || queue.activePrepare.Load() != 0 {
+		t.Fatalf("archive import queue retained active workers: download=%d prepare=%d", queue.activeDownload.Load(), queue.activePrepare.Load())
+	}
+	if downloaded.Data != nil {
+		t.Fatal("archive import queue retained a queued prepare payload after cancellation")
+	}
+}
+
 func TestArchiveDownloadBackpressureGateWaitsUntilResumed(t *testing.T) {
-	runner := &archiveCatchUpRunner{}
+	runner := &archiveCatchUpRun{}
 	resume := runner.pauseArchiveDownloadsForCheckpointBackpressure()
 	t.Cleanup(resume)
 
@@ -141,7 +174,7 @@ func TestArchiveDownloadBackpressureGateWaitsUntilResumed(t *testing.T) {
 }
 
 func TestArchiveImportQueueDownloadJobWaitsForCheckpointBackpressure(t *testing.T) {
-	runner := &archiveCatchUpRunner{archiveSession: newTestArchiveSession(t)}
+	runner := &archiveCatchUpRun{archiveSession: newTestArchiveSession(t)}
 	resume := runner.pauseArchiveDownloadsForCheckpointBackpressure()
 	t.Cleanup(resume)
 
@@ -216,7 +249,7 @@ func TestArchiveImportQueueReleasesDownloadedDataWhenPrepareContextCanceled(t *t
 	downloaded := &archive.Downloaded{Data: make([]byte, 80)}
 
 	done := make(chan archiveImportQueueResult, 1)
-	queue.runPrepareJob(&archiveCatchUpRunner{}, archivePrepareJob{
+	queue.runPrepareJob(&archiveCatchUpRun{}, archivePrepareJob{
 		ctx:        ctx,
 		downloaded: downloaded,
 		done:       done,
@@ -245,7 +278,7 @@ func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
 		downloadHot:      make(chan archiveDownloadJob, len(plans)),
 		downloadPrefetch: make(chan archiveDownloadJob, len(plans)),
 	}
-	runner := &archiveCatchUpRunner{}
+	runner := &archiveCatchUpRun{}
 	done := make(chan error, 1)
 	go func() {
 		imports, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, plans, 0, archiveImportPriorityPrefetch)
@@ -298,7 +331,7 @@ func TestDownloadAndImportShardArchivesRetriesFailedShardWithoutCancelingWindow(
 		downloadPrefetch: make(chan archiveDownloadJob, len(plans)+1),
 	}
 
-	runner := &archiveCatchUpRunner{}
+	runner := &archiveCatchUpRun{}
 	done := make(chan error, 1)
 	go func() {
 		_, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, plans, 0, archiveImportPriorityPrefetch)

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/externalmsg"
-	"github.com/xssnick/gton/service/hooks"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -406,7 +405,7 @@ func TestSendBocReturnHashChecksAndSendsExternalMessage(t *testing.T) {
 }
 
 type testStore struct {
-	hooks.Store
+	Store
 	block         ton.BlockIDExt
 	stateRootHash []byte
 }

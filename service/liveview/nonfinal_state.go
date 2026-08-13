@@ -185,7 +185,7 @@ func nonfinalStateRoot(state *storage.BlockState) (*cell.Cell, error) {
 
 	root := state.Cell.Virtualize(0)
 	if len(state.StateRootHash) > 0 {
-		hash := root.HashKey(0)
+		hash := root.HashKeyAt(0)
 		if !bytes.Equal(hash[:], state.StateRootHash) {
 			return nil, fmt.Errorf("previous state root hash mismatch for %s: got=%x want=%x", storage.FormatBlockRef(state.Block), hash[:], state.StateRootHash)
 		}

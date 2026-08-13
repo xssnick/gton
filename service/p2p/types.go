@@ -104,6 +104,12 @@ const (
 	maxKeyBlockLookupAnswerSize = 1 << 20
 	maxDecompressedBlockSize    = 32 << 20
 	maxRandomPeerReply          = 4
+	// maxAdvertisedPeersPerQuery bounds how many nodes one peer-gossip exchange
+	// may teach us. An honest peer sends maxRandomPeerReply of them (C++ answers
+	// with OverlayOptions::nodes_to_send_ = 4), so the headroom is generous; the
+	// bound exists because every advertised node costs a signature check and a
+	// directory write, and one query used to be allowed to carry 300.
+	maxAdvertisedPeersPerQuery = 16
 
 	masterchainProtoVersionMajor   = 3
 	masterchainProtoVersionMinor   = 2
@@ -154,15 +160,16 @@ const (
 )
 
 type BroadcastEvent struct {
-	Overlay          string
-	Kind             string
-	Delivery         Delivery
-	Trusted          bool
-	Block            ton.BlockIDExt
-	Downloaded       *DownloadedBlock
-	ShardDescription *ShardBlockDescription
-	SourcePeerID     PeerID
-	ReceivedAt       time.Time
+	Overlay              string
+	Kind                 string
+	Delivery             Delivery
+	Trusted              bool
+	Block                ton.BlockIDExt
+	Downloaded           *DownloadedBlock
+	ShardDescription     *ShardBlockDescription
+	ShardDescriptionRoot *cell.Cell
+	SourcePeerID         PeerID
+	ReceivedAt           time.Time
 }
 
 type BroadcastPipelineObserver interface {
@@ -200,15 +207,9 @@ type Options struct {
 	DHTPrivateKey              ed25519.PrivateKey
 	DHTListenAddr              string
 	StateFilesDir              string
-	Storage                    storage.Storage
-	PeerServingStorage         storage.PeerServingStorage
+	PeerStorage                PeerStorage
+	StateArtifactStorage       StateArtifactStorage
 	LiveBlockCache             *storage.LiveBlockCache
-	CompressedState            CompressedBlockStateProvider
-	SyncLag                    SyncLagProvider
-	SignatureVerifier          BroadcastSignatureVerifier
-	BroadcastAdmission         BroadcastAdmission
-	ExternalMessageAdmission   ExternalMessageAdmission
-	BlockReceivedObserver      BlockReceivedObserver
 	ExternalBroadcastCapacity  ExternalBroadcastCapacityOptions
 	AllowDuplicateExternals    bool
 	LocalExternalFanout        int
@@ -249,14 +250,13 @@ type BlockFinalitySignatureCheckResult struct {
 type ShardDescriptionSignatureCheck struct {
 	Block         ton.BlockIDExt
 	CatchainSeqno int32
-	Data          []byte
+	Root          *cell.Cell
 }
 
 type ShardBlockDescription struct {
 	Block            ton.BlockIDExt
 	CatchainSeqno    uint32
 	ValidatorSetHash uint32
-	Data             []byte
 	Chain            []ShardDescriptionLink
 }
 
@@ -264,8 +264,22 @@ type ShardDescriptionLink struct {
 	Block          ton.BlockIDExt
 	PrevRefs       []ton.BlockIDExt
 	MasterchainRef *ton.BlockIDExt
+	TopBlockProof  *cell.Cell
 	ProofRoot      *cell.Cell
 	ProofBOC       []byte
+	GenUtime       uint32
+	VertSeqno      uint32
+	StartLT        uint64
+	EndLT          uint64
+	MinRefMCSeqno  uint32
+	BeforeSplit    bool
+	AfterSplit     bool
+	AfterMerge     bool
+	WantSplit      bool
+	WantMerge      bool
+	CreatedBy      [32]byte
+	FeesCollected  tlb.CurrencyCollection
+	FundsCreated   tlb.CurrencyCollection
 }
 
 type BlockCacheObserver interface {
@@ -297,9 +311,8 @@ type BlockReceivedEvent struct {
 	// IsSigned is true for signed block broadcasts and downloaded full blocks.
 	IsSigned bool
 	// FromBroadcast is true when the block arrived as a decoded broadcast
-	// rather than through a download path. Broadcast events are delivered even
-	// when extension hooks are disabled, so the observer can pre-prepare shard
-	// blocks at broadcast-arrival time.
+	// rather than through a download path. Broadcast events are always delivered
+	// so the observer can pre-prepare shard blocks at broadcast-arrival time.
 	FromBroadcast bool
 	// Downloaded contains the received block artifacts.
 	Downloaded *DownloadedBlock
@@ -307,16 +320,18 @@ type BlockReceivedEvent struct {
 
 type BlockReceivedObserver interface {
 	ObserveBlockReceived(ctx context.Context, event BlockReceivedEvent)
-	BlockReceivedHooksEnabled() bool
 }
 
-type RuntimeCallbacks interface {
-	CompressedBlockStateProvider
-	SyncLagProvider
-	BroadcastSignatureVerifier
-	BroadcastAdmission
-	ExternalMessageAdmission
-	BlockReceivedObserver
+// RuntimeCallbacks binds the independently owned service components that P2P
+// calls after construction. The named fields keep the composition root from
+// having to manufacture one object that implements every runtime policy.
+type RuntimeCallbacks struct {
+	CompressedState          CompressedBlockStateProvider
+	SyncLag                  SyncLagProvider
+	SignatureVerifier        BroadcastSignatureVerifier
+	BroadcastAdmission       BroadcastAdmission
+	ExternalMessageAdmission ExternalMessageAdmission
+	BlockReceivedObserver    BlockReceivedObserver
 }
 
 type CustomOverlayConfig struct {
@@ -341,40 +356,6 @@ type CustomOverlayShard struct {
 	Shard     int64
 }
 
-type overlayKind uint8
-
-const (
-	overlayKindPublicShard overlayKind = iota
-	overlayKindCustomFixed
-	overlayKindFastSync
-)
-
-type overlaySpec struct {
-	Name              string
-	Kind              overlayKind
-	Workchain         int32
-	Shard             int64
-	FullID            []byte
-	ShortID           []byte
-	ProtoVersionMajor int32
-	ProtoVersionMinor int32
-	FixedNodes        []PeerID
-	FixedNodeIDs      map[PeerID]struct{}
-	QueryAcceptors    []PeerID
-	MsgSenders        map[PeerID]int
-	BlockSenders      map[PeerID]struct{}
-	AuthorizedKeys    map[string]uint32
-	SenderShards      []CustomOverlayShard
-	SkipPublicMsgSend bool
-	UseQUIC           bool
-	SendQueries       bool
-	AcceptQueries     bool
-	Announce          bool
-	RandomPeers       bool
-	QueryCapabilities bool
-	FastSync          *fastSyncOverlaySpec
-}
-
 type DownloadedBlock struct {
 	ID ton.BlockIDExt
 	// Kind is the TL type returned by the peer, for example tonNode.dataFull.
@@ -391,11 +372,10 @@ type DownloadedBlock struct {
 	IsLink bool
 
 	VerifiedRootHash bool
-	// SignaturesVerifiedKey is the blockproof.ValidatorSignatureSet.ContentKey
-	// of a validator signature set that already passed the broadcast-level
-	// signature check for this block; nil when no such check happened.
-	// Consumers may skip re-verifying a signature set whose content key
-	// equals this one.
+	// SignaturesVerifiedKey identifies the exact signature evidence already
+	// checked for this block. For a masterchain BlockSignatures cell it also
+	// commits to the declared signer weight; nil means no check happened.
+	// Consumers may skip only a verification with the same boundary key.
 	SignaturesVerifiedKey []byte
 }
 

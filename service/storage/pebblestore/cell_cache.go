@@ -143,6 +143,25 @@ func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell
 	}
 }
 
+func (c *decodedCellCache) deleteGeneration(generation uint64) {
+	if c == nil {
+		return
+	}
+
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		for key, elem := range shard.items {
+			if key.generation != generation {
+				continue
+			}
+			shard.order.Remove(elem)
+			delete(shard.items, key)
+		}
+		shard.mu.Unlock()
+	}
+}
+
 func (c *decodedCellCache) shardIndex(hash [32]byte) int {
 	return int(binary.BigEndian.Uint32(hash[:4]) % uint32(len(c.shards)))
 }

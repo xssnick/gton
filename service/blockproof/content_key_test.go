@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"math"
 	"strings"
 	"testing"
 
@@ -45,6 +46,11 @@ func TestValidatorSignatureSetContentKeyCanonical(t *testing.T) {
 	if bytes.Equal(key, ordered.ContentKey(otherBlock)) {
 		t.Fatal("content key ignores block root hash")
 	}
+	otherBlock = testBlockID(-1, 123)
+	otherBlock.FileHash[0] = 0xBB
+	if bytes.Equal(key, ordered.ContentKey(otherBlock)) {
+		t.Fatal("content key ignores block file hash")
+	}
 
 	if bytes.Equal(key, NewOrdinaryValidatorSignatureSet(catchainSeqno+1, setHash, signatures).ContentKey(block)) {
 		t.Fatal("content key ignores catchain seqno")
@@ -70,6 +76,11 @@ func TestValidatorSignatureSetContentKeyCanonical(t *testing.T) {
 	simplex := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, true, sessionID, 3, testSimplexCandidate(t, block))
 	if bytes.Equal(key, simplex.ContentKey(block)) {
 		t.Fatal("content key ignores simplex payload")
+	}
+	blockKey := (&BlockSignatureSet{ValidatorSignatures: ordered, DeclaredWeight: 3}).ContentKey(block)
+	forgedWeightKey := (&BlockSignatureSet{ValidatorSignatures: ordered, DeclaredWeight: 4}).ContentKey(block)
+	if bytes.Equal(blockKey, forgedWeightKey) {
+		t.Fatal("block signature content key ignores declared weight")
 	}
 }
 
@@ -110,11 +121,9 @@ func testWeightedValidators(t *testing.T, weights []uint64) ([]*tlb.ValidatorAdd
 	return validators, privateKeys
 }
 
-// TestCheckPreparedSignaturesVerifiesHeaviestFirst pins the weight-descending
-// verification order: once verified weight passes 2/3, remaining (lighter)
-// signatures are not verified, so a corrupted light signature after the
-// threshold does not fail the set, while a corrupted heavy one does.
-func TestCheckPreparedSignaturesVerifiesHeaviestFirst(t *testing.T) {
+// A signature listed after enough valid weight to pass the threshold is still
+// part of the set and must be verified.
+func TestCheckPreparedSignaturesRejectsCorruptTrailingSignature(t *testing.T) {
 	block := testBlockID(-1, 55)
 	validators, privateKeys := testWeightedValidators(t, []uint64{100, 1})
 	catchainSeqno := uint32(3)
@@ -139,8 +148,8 @@ func TestCheckPreparedSignaturesVerifiesHeaviestFirst(t *testing.T) {
 	corruptLight[1].Signature = append([]byte(nil), corruptLight[1].Signature...)
 	corruptLight[1].Signature[0] ^= 1
 	set := NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, corruptLight)
-	if err = CheckPreparedSignatures(block, set, prepared); err != nil {
-		t.Fatalf("corrupted below-threshold light signature failed the set: %v", err)
+	if err = CheckPreparedSignatures(block, set, prepared); err == nil {
+		t.Fatal("corrupted trailing light signature was accepted after the threshold")
 	}
 
 	corruptHeavy := make([]ton.Signature, len(signatures))
@@ -150,6 +159,58 @@ func TestCheckPreparedSignaturesVerifiesHeaviestFirst(t *testing.T) {
 	set = NewOrdinaryValidatorSignatureSet(catchainSeqno, setHash, corruptHeavy)
 	if err = CheckPreparedSignatures(block, set, prepared); err == nil {
 		t.Fatal("corrupted heavy signature was accepted")
+	}
+}
+
+func TestCheckPreparedBlockSignaturesRejectsForgedDeclaredWeight(t *testing.T) {
+	block := testBlockID(0, 58)
+	validators, privateKeys := testWeightedValidators(t, []uint64{100, 1})
+	catchainSeqno := uint32(6)
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	base := NewOrdinaryValidatorSignatureSet(catchainSeqno, prepared.Hash(), nil)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	signed := NewOrdinaryValidatorSignatureSet(
+		catchainSeqno,
+		prepared.Hash(),
+		testSignatures(t, validators, privateKeys, payload),
+	)
+	blockSignatures := &BlockSignatureSet{
+		ValidatorSignatures: signed,
+		DeclaredWeight:      100,
+	}
+
+	err = CheckPreparedBlockSignatures(block, blockSignatures, prepared)
+	if err == nil || !strings.Contains(err.Error(), "declared=100 actual=101") {
+		t.Fatalf("forged signature weight error = %v", err)
+	}
+}
+
+func TestHasSignatureThresholdAvoidsUint64Overflow(t *testing.T) {
+	tests := []struct {
+		name   string
+		signed uint64
+		total  uint64
+		want   bool
+	}{
+		{name: "maximum unanimous", signed: math.MaxUint64, total: math.MaxUint64, want: true},
+		{name: "maximum half", signed: math.MaxUint64 / 2, total: math.MaxUint64},
+		{name: "exact two thirds", signed: 2, total: 3},
+		{name: "above two thirds", signed: 3, total: 3, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasSignatureThreshold(tt.signed, tt.total); got != tt.want {
+				t.Fatalf("threshold(%d, %d) = %t, want %t", tt.signed, tt.total, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -192,7 +253,7 @@ func TestCheckPreparedSignaturesRejectsDuplicatesAndUnknownUpFront(t *testing.T)
 	}
 }
 
-func TestCheckPreparedSignaturesIdentifiesFirstInvalidByWeight(t *testing.T) {
+func TestCheckPreparedSignaturesIdentifiesFirstInvalidListedSignature(t *testing.T) {
 	block := testBlockID(-1, 57)
 	validators, privateKeys := testWeightedValidators(t, []uint64{40, 35, 25})
 	catchainSeqno := uint32(5)
@@ -221,7 +282,7 @@ func TestCheckPreparedSignaturesIdentifiesFirstInvalidByWeight(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid batch was accepted")
 	}
-	wantValidator := hex.EncodeToString(signatures[0].NodeIDShort)
+	wantValidator := hex.EncodeToString(signatures[1].NodeIDShort)
 	if !strings.Contains(err.Error(), wantValidator) {
 		t.Fatalf("error %q does not identify first invalid validator %s", err, wantValidator)
 	}

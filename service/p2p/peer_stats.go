@@ -717,7 +717,7 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 		}
 		receivers = append(receivers, peer)
 		broadcast = append(broadcast, peer.broadcastPeer)
-		if peer.route.quicReady(now) {
+		if peer.route.QUICReady(now) {
 			plumtree = append(plumtree, peer.id)
 		}
 	}

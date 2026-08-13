@@ -252,7 +252,7 @@ func (s *overlaySubscription) savePeerCacheSnapshot() {
 			srcScore: decayedPeerCacheScore(peer.srcScore.Load(), 0),
 		}
 		if peer.route != nil {
-			entry.quicAddr = peer.route.quicAddr()
+			entry.quicAddr = peer.route.QUICAddress()
 		}
 		current = append(current, entry)
 		seen[id] = struct{}{}

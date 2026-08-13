@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -21,10 +22,12 @@ const plumtreeLocalWireOverhead = 256
 // plumtreeLocalOrigin owns the signing key and the local QUIC envelope shared
 // by every payload produced for one overlay.
 type plumtreeLocalOrigin struct {
-	privateKey ed25519.PrivateKey
-	source     keys.PublicKeyED25519
-	sourceID   PeerID
-	envelope   *quicOverlayEnvelope
+	signer      overlay.BroadcastSigner
+	source      keys.PublicKeyED25519
+	sourceID    PeerID
+	certificate any
+	parsedCert  plumtreeCertificate
+	envelope    *quicOverlayEnvelope
 }
 
 func newPlumtreeLocalOrigin(
@@ -52,13 +55,55 @@ func newPlumtreeLocalOrigin(
 	}
 
 	return plumtreeLocalOrigin{
-		privateKey: ownedKey,
+		signer: nodeBroadcastSigner{key: ownedKey},
 		source: keys.PublicKeyED25519{
 			Key: publicKey,
 		},
-		sourceID: sourceID,
-		envelope: envelope,
+		sourceID:    sourceID,
+		certificate: overlay.CertificateEmpty{},
+		parsedCert:  plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		envelope:    envelope,
 	}, nil
+}
+
+func newPlumtreeSignerOrigin(
+	signer overlay.BroadcastSigner,
+	envelope *quicOverlayEnvelope,
+) (plumtreeLocalOrigin, error) {
+	if signer == nil {
+		return plumtreeLocalOrigin{}, errors.New("local Plumtree signer is nil")
+	}
+	publicKey := signer.PublicKey()
+	if len(publicKey) != ed25519.PublicKeySize {
+		return plumtreeLocalOrigin{}, fmt.Errorf(
+			"invalid local Plumtree public key size %d",
+			len(publicKey),
+		)
+	}
+	sourceID, err := peerIDFromED25519PublicKey(publicKey)
+	if err != nil {
+		return plumtreeLocalOrigin{}, err
+	}
+	publicKey = append(ed25519.PublicKey(nil), publicKey...)
+	return plumtreeLocalOrigin{
+		signer:      signer,
+		source:      keys.PublicKeyED25519{Key: publicKey},
+		sourceID:    sourceID,
+		certificate: overlay.CertificateEmpty{},
+		parsedCert:  plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		envelope:    envelope,
+	}, nil
+}
+
+func (o plumtreeLocalOrigin) withCertificate(certificate any) (plumtreeLocalOrigin, error) {
+	_, parsed, err := decodePlumtreeIdentity(o.source, certificate)
+	if err != nil {
+		return plumtreeLocalOrigin{}, err
+	}
+
+	o.certificate = certificate
+	o.parsedCert = parsed
+	return o, nil
 }
 
 func (o plumtreeLocalOrigin) serialize(
@@ -114,13 +159,16 @@ func (e *plumtreeEngine) OriginateSimple(
 			DataHash:  dataHash[:],
 		},
 	)
-	signature := ed25519.Sign(origin.privateKey, signedData)
+	signature, err := signLocalPlumtreePayload(origin.signer, signedData)
+	if err != nil {
+		return plumtreeActions{}, err
+	}
 	wire, err := origin.serialize(
 		BroadcastPlumtreeSimple{
 			Flags:       flags,
 			Timestamp:   timestamp,
 			Source:      origin.source,
-			Certificate: overlay.CertificateEmpty{},
+			Certificate: origin.certificate,
 			BroadcastID: broadcastID[:],
 			TreeIndex:   plumtreeSimpleTree,
 			Data:        data,
@@ -142,7 +190,7 @@ func (e *plumtreeEngine) OriginateSimple(
 		dataSize:    int32(len(data)),
 		dataHash:    dataHash,
 		sourceKey:   origin.source,
-		certificate: plumtreeCertificate{kind: plumtreeCertificateEmpty},
+		certificate: origin.parsedCert,
 		signature:   signature,
 		wire:        wire,
 	}
@@ -240,13 +288,16 @@ func (e *plumtreeEngine) OriginateFEC(
 				DataHash:  dataHash[:],
 			},
 		)
-		signature := ed25519.Sign(origin.privateKey, signedData)
+		signature, signErr := signLocalPlumtreePayload(origin.signer, signedData)
+		if signErr != nil {
+			return signErr
+		}
 		wire, serializeErr := origin.serialize(
 			BroadcastPlumtreeFEC{
 				Flags:        flags,
 				Timestamp:    timestamp,
 				Source:       origin.source,
-				Certificate:  overlay.CertificateEmpty{},
+				Certificate:  origin.certificate,
 				FullDataHash: fullDataHash[:],
 				FullDataSize: fullDataSize,
 				PartIndex:    partIndex,
@@ -271,7 +322,7 @@ func (e *plumtreeEngine) OriginateFEC(
 			dataSize:    partSize,
 			dataHash:    dataHash,
 			sourceKey:   origin.source,
-			certificate: plumtreeCertificate{kind: plumtreeCertificateEmpty},
+			certificate: origin.parsedCert,
 			signature:   signature,
 			wire:        wire,
 		}
@@ -383,13 +434,24 @@ func buildPlumtreeFECParts(buildPart func(partIndex int32) error) error {
 func (e *plumtreeEngine) validateLocalOrigin(
 	origin plumtreeLocalOrigin,
 ) error {
-	if !e.isOriginalSender {
-		return fmt.Errorf("local Plumtree origin requires original-sender engine")
-	}
-	if origin.sourceID != e.localID {
-		return fmt.Errorf("local Plumtree source does not match engine identity")
+	if !e.canOriginate {
+		return fmt.Errorf("local Plumtree origin is disabled")
 	}
 	return nil
+}
+
+func signLocalPlumtreePayload(
+	signer overlay.BroadcastSigner,
+	payload []byte,
+) ([]byte, error) {
+	signature, err := signer.Sign(payload)
+	if err != nil {
+		return nil, fmt.Errorf("sign local Plumtree payload: %w", err)
+	}
+	if len(signature) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("invalid local Plumtree signature size %d", len(signature))
+	}
+	return signature, nil
 }
 
 func (e *plumtreeEngine) checkLocalBroadcastIDLocked(

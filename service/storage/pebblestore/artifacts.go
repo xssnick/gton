@@ -601,7 +601,7 @@ func syncPersistentStateDeleteDirs(files []persistentStateFileDelete) error {
 		dirs[file.dir] = struct{}{}
 	}
 	for dir := range dirs {
-		if err := syncDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := storage.SyncDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -966,7 +966,10 @@ func (s *Store) ArchiveInfo(ctx context.Context, masterchainSeqno int32, workcha
 
 func (s *Store) archiveInfoForSplitShardPrefix(ctx context.Context, baseSeqno uint32, startSeqno uint32, workchain int32, shard int64) ([]byte, error) {
 	for depth := uint32(1); depth <= 60; depth++ {
-		prefix := archivePackShardPrefix(workchain, shard, depth)
+		prefix, err := archivePackShardPrefix(workchain, shard, depth)
+		if err != nil {
+			return nil, err
+		}
 		if prefix == shard {
 			continue
 		}

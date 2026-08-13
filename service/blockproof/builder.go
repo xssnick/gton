@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/bits"
 
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -322,17 +322,22 @@ func OldMasterBlockStateProof(stateRoot *cell.Cell, id ton.BlockIDExt) (*cell.Ce
 			return err
 		}
 
+		info, err := LoadMasterStateInfo(prefix.Info)
+		if err != nil {
+			return err
+		}
+
 		seqno, err := ShardStateSeqno(root)
 		if err != nil {
 			return err
 		}
 		if seqno != 0 {
-			if _, err = oldMasterBlockIDFromInfo(prefix.Info, 0); err != nil {
+			if _, err = OldMasterBlockID(info.PrevBlocks, 0); err != nil {
 				return err
 			}
 		}
 
-		old, err := oldMasterBlockIDFromInfo(prefix.Info, id.SeqNo)
+		old, err := OldMasterBlockID(info.PrevBlocks, id.SeqNo)
 		if err != nil {
 			return err
 		}
@@ -353,7 +358,11 @@ func nextShardProofBlock(current ton.BlockIDExt, root *cell.Cell, target ton.Blo
 		if block.Extra == nil || block.Extra.Custom == nil || block.Extra.Custom.ShardHashes == nil {
 			return ton.BlockIDExt{}, fmt.Errorf("masterchain block is missing shard hashes")
 		}
-		next, _, err := ShardInfoFromHashes(block.Extra.Custom.ShardHashes, target.Workchain, shardProofLookupShard(target.Shard), false)
+		lookupShard, err := shardProofLookupShard(target.Shard)
+		if err != nil {
+			return ton.BlockIDExt{}, fmt.Errorf("target shard: %w", err)
+		}
+		next, _, err := ShardInfoFromHashes(block.Extra.Custom.ShardHashes, target.Workchain, lookupShard, false)
 		if err != nil {
 			return ton.BlockIDExt{}, err
 		}
@@ -365,19 +374,19 @@ func nextShardProofBlock(current ton.BlockIDExt, root *cell.Cell, target ton.Blo
 		return ton.BlockIDExt{}, err
 	}
 	for _, prev := range meta.PrevRefs {
-		if ShardIntersects(storage.ShardKeyFromBlock(prev), storage.ShardKeyFromBlock(target)) {
+		if prev.Workchain == target.Workchain && sharddomain.Intersects(prev.Shard, target.Shard) {
 			return prev, nil
 		}
 	}
 	return ton.BlockIDExt{}, fmt.Errorf("failed to find block chain")
 }
 
-func shardProofLookupShard(shard int64) int64 {
-	prefixLen := ShardPrefixLen(uint64(shard))
-	if prefixLen < 0 {
-		return shard
+func shardProofLookupShard(shard int64) (int64, error) {
+	prefixLen, err := sharddomain.PrefixLength(shard)
+	if err != nil {
+		return 0, err
 	}
-	return int64((uint64(shard) &^ (uint64(1) << (63 - prefixLen))) | 1)
+	return int64((uint64(shard) &^ (uint64(1) << (63 - prefixLen))) | 1), nil
 }
 
 func shardLinkProofBOC(id ton.BlockIDExt, root *cell.Cell) ([]byte, error) {
@@ -725,15 +734,15 @@ func ShardInfoFromHashes(hashes *cell.Dictionary, wc int32, shard int64, exact b
 }
 
 func findShardLeaf(root *cell.Cell, shard uint64, exact bool) (int64, *cell.Cell, error) {
-	prefixLen := ShardPrefixLen(shard)
-	if prefixLen < 0 {
-		return 0, nil, storage.ErrNotFound
+	prefixLen, err := sharddomain.PrefixLength(int64(shard))
+	if err != nil {
+		return 0, nil, err
 	}
 
 	node := root
 	z := shard
 	mask := uint64(math.MaxUint64)
-	remaining := prefixLen
+	remaining := int(prefixLen)
 	for {
 		loader, err := node.BeginParse()
 		if err != nil {
@@ -799,65 +808,6 @@ func BlockIDFromShardLeaf(wc int32, shard int64, leaf *cell.Cell) (ton.BlockIDEx
 	default:
 		return ton.BlockIDExt{}, fmt.Errorf("wrong ShardDesc magic: %x", magic)
 	}
-}
-
-func ShardPrefixLen(shard uint64) int {
-	if shard == 0 {
-		return -1
-	}
-	low := shard & -shard
-	if low == 0 {
-		return -1
-	}
-	return 63 - bits.TrailingZeros64(low)
-}
-
-func ShardIntersects(a, b storage.ShardKey) bool {
-	if a.Workchain != b.Workchain {
-		return false
-	}
-	aLen := ShardPrefixLen(uint64(a.Shard))
-	bLen := ShardPrefixLen(uint64(b.Shard))
-	if aLen < 0 || bLen < 0 {
-		return false
-	}
-	minLen := aLen
-	if bLen < minLen {
-		minLen = bLen
-	}
-	return shardPrefix(uint64(a.Shard), minLen) == shardPrefix(uint64(b.Shard), minLen)
-}
-
-func shardPrefix(shard uint64, length int) uint64 {
-	if length <= 0 {
-		return 0
-	}
-	return shard >> (64 - length)
-}
-
-func oldMasterBlockIDFromInfo(info *cell.Cell, seqno uint32) (ton.BlockIDExt, error) {
-	loader, err := info.BeginParse()
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if _, err := loader.LoadUInt(16); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if _, err := loader.LoadUInt(32); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if _, err := loader.LoadUInt(32); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if _, err := loader.LoadBoolBit(); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-
-	prevBlocks := &tlb.OldMcBlocksInfoAugDict{}
-	if err := prevBlocks.LoadFromCell(loader); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	return oldMasterBlockID(prevBlocks, seqno)
 }
 
 func ShardStateSeqno(stateRoot *cell.Cell) (uint32, error) {

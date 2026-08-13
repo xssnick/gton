@@ -1,0 +1,166 @@
+package validator
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"testing"
+
+	"github.com/xssnick/gton/service/validator/simplex"
+)
+
+func TestCandidateCodecRoundTripValidatorAndDelegatedV3(t *testing.T) {
+	config, leaderKey := runtimeTestConfig(0x61, &runtimeTestJournal{})
+	codec, err := newCandidateCodec(config, CandidateLimits{
+		MaxBlockBytes:        1 << 20,
+		MaxCollatedDataBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary := runtimeOrdinaryArtifact(t, config, leaderKey, 0, simplex.Genesis())
+
+	wire, err := simplex.SerializeCandidate(ordinary.Candidate, ordinary.BlockBOC, ordinary.CollatedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broadcastWire, broadcast, err := codec.encodeForBroadcast(ordinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(broadcastWire, wire) || !bytes.Equal(broadcast.Data, wire) {
+		t.Fatal("plain candidate resolver wire differs from FEC candidate data")
+	}
+	extra, err := simplex.ParseBroadcastExtra(broadcast.Extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extra.Slot != ordinary.Candidate.ID.Slot || extra.Delegation != nil {
+		t.Fatalf("plain candidate broadcast extra = %+v", extra)
+	}
+	decoded, err := codec.decode(wire, &ordinary.Candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCandidateArtifactEqual(t, decoded, ordinary)
+	if decoded.Candidate.Delegation != nil {
+		t.Fatal("validator candidate gained delegation")
+	}
+
+	collatorSeed := bytes.Repeat([]byte{0xc7}, ed25519.SeedSize)
+	collatorKey := ed25519.NewKeyFromSeed(collatorSeed)
+	collatorPublic := collatorKey.Public().(ed25519.PublicKey)
+	delegated := *ordinary
+	delegated.Candidate = ordinary.Candidate
+	delegated.Candidate.Delegation = &simplex.Delegation{CollatorKey: collatorPublic}
+	delegated.Candidate.Delegation.Signature, err = simplex.SignDelegation(
+		runtimeTestSigner{key: leaderKey},
+		config.SessionID,
+		0,
+		simplex.KeyNodeIDShort(collatorPublic),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated.Candidate.Signature, err = simplex.SignCandidate(
+		runtimeTestSigner{key: collatorKey},
+		config.SessionID,
+		delegated.Candidate.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wire, err = simplex.SerializeCandidate(delegated.Candidate, delegated.BlockBOC, delegated.CollatedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broadcastWire, broadcast, err = codec.encodeForBroadcast(&delegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(broadcastWire, wire) || bytes.Equal(broadcast.Data, wire) {
+		t.Fatal("delegated resolver wire was not derived from the bare FEC payload")
+	}
+	extra, err = simplex.ParseBroadcastExtra(broadcast.Extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extra.Slot != delegated.Candidate.ID.Slot || extra.Delegation == nil ||
+		!bytes.Equal(extra.Delegation.CollatorKey, collatorPublic) {
+		t.Fatalf("delegated candidate broadcast extra = %+v", extra)
+	}
+	decoded, err = codec.decode(wire, &delegated.Candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCandidateArtifactEqual(t, decoded, &delegated)
+	if decoded.Candidate.Delegation == nil ||
+		!bytes.Equal(decoded.Candidate.Delegation.CollatorKey, collatorPublic) ||
+		!bytes.Equal(decoded.Candidate.Delegation.Signature, delegated.Candidate.Delegation.Signature) {
+		t.Fatal("delegation changed during candidate round trip")
+	}
+}
+
+func TestCandidateCodecEnforcesDecodeLimitsBeforeAdmission(t *testing.T) {
+	config, leaderKey := runtimeTestConfig(0x62, &runtimeTestJournal{})
+	wide, err := newCandidateCodec(config, CandidateLimits{
+		MaxBlockBytes:        1 << 20,
+		MaxCollatedDataBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := runtimeOrdinaryArtifact(t, config, leaderKey, 0, simplex.Genesis())
+	wire, err := simplex.SerializeCandidate(artifact.Candidate, artifact.BlockBOC, artifact.CollatedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	narrow, err := newCandidateCodec(config, CandidateLimits{MaxBlockBytes: 1, MaxCollatedDataBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = narrow.decode(wire, nil); err == nil {
+		t.Fatal("oversized candidate passed narrow decode limits")
+	}
+
+	wrongID := artifact.Candidate.ID
+	wrongID.Hash[0] ^= 0xff
+	if _, err = wide.decode(wire, &wrongID); err == nil {
+		t.Fatal("candidate decoded for a different requested id")
+	}
+}
+
+func BenchmarkCandidateCodecEncode(b *testing.B) {
+	config, leaderKey := runtimeTestConfig(0x63, &runtimeTestJournal{})
+	codec, err := newCandidateCodec(config, CandidateLimits{
+		MaxBlockBytes:        1 << 20,
+		MaxCollatedDataBytes: 1 << 20,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	artifact := runtimeOrdinaryArtifact(b, config, leaderKey, 0, simplex.Genesis())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(artifact.BlockBOC) + len(artifact.CollatedData)))
+	b.ResetTimer()
+
+	for range b.N {
+		if _, _, err = codec.encodeForBroadcast(artifact); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func assertCandidateArtifactEqual(t *testing.T, got, want *CandidateArtifact) {
+	t.Helper()
+
+	if got.Candidate.ID != want.Candidate.ID || got.Candidate.Parent != want.Candidate.Parent ||
+		got.Candidate.Leader != want.Candidate.Leader || got.Candidate.Empty != want.Candidate.Empty ||
+		!sameBlockID(got.Candidate.Block, want.Candidate.Block) ||
+		got.Candidate.CollatedFileHash != want.Candidate.CollatedFileHash ||
+		!bytes.Equal(got.Candidate.Signature, want.Candidate.Signature) ||
+		!bytes.Equal(got.BlockBOC, want.BlockBOC) || !bytes.Equal(got.CollatedData, want.CollatedData) {
+		t.Fatalf("candidate artifact changed during round trip\ngot:  %+v\nwant: %+v", got.Candidate, want.Candidate)
+	}
+}

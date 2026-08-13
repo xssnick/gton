@@ -36,7 +36,7 @@ func (s *overlaySubscription) directoryGossipTargets() []*directoryEntry {
 	s.mx.Lock()
 	candidates := make([]*directoryEntry, 0, len(s.directory))
 	for id, entry := range s.directory {
-		if entry.live || entry.adnlAddr == "" {
+		if entry.live {
 			continue
 		}
 		if _, attached := s.peers[id]; attached {
@@ -45,6 +45,9 @@ func (s *overlaySubscription) directoryGossipTargets() []*directoryEntry {
 		// Only rows whose announcement is still fresh: a stale row cannot be
 		// re-advertised anyway, and the peer is probably gone.
 		if entry.announced == nil || !announcedNodeIsFresh(entry.announced, now) {
+			continue
+		}
+		if !s.directoryEntryReachableLocked(entry) {
 			continue
 		}
 		candidates = append(candidates, entry.clone())
@@ -98,7 +101,5 @@ func (s *overlaySubscription) exchangeRandomPeersEphemeral(ctx context.Context, 
 	}
 
 	s.noteDirectoryActivity(entry.id, entry.adnlAddr)
-	for _, node := range res.List {
-		s.learnAdvertisedPeer(ctx, node)
-	}
+	s.learnAdvertisedNodes(ctx, res.List)
 }

@@ -18,7 +18,11 @@ func (s *Store) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, r
 	if err != nil {
 		return nil, err
 	}
-	return s.importStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
+	rootHash, err := s.persistStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
+	if err != nil {
+		return nil, err
+	}
+	return s.loadActiveLazyCell(ctx, rootHash[:])
 }
 
 func (s *Store) ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
@@ -26,21 +30,11 @@ func (s *Store) ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, vi
 	if err != nil {
 		return nil, err
 	}
-	return s.importStateBOCViewInGeneration(ctx, generation, block, view)
-}
-
-func (s *Store) ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	if generation == 0 {
-		return nil, fmt.Errorf("cell generation is zero")
+	rootHash, err := s.persistStateBOCViewInGeneration(ctx, generation, block, view)
+	if err != nil {
+		return nil, err
 	}
-	return s.importStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
-}
-
-func (s *Store) ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
-	if generation == 0 {
-		return nil, fmt.Errorf("cell generation is zero")
-	}
-	return s.importStateBOCViewInGeneration(ctx, generation, block, view)
+	return s.loadActiveLazyCell(ctx, rootHash[:])
 }
 
 func (s *Store) TrustImportedStateCellHashes() bool {
@@ -74,66 +68,56 @@ func (s *Store) FlushStateCells(ctx context.Context) error {
 	return s.flushCellDBs(generation)
 }
 
-func (s *Store) importStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	rootCellHash := root.HashKey()
+func (s *Store) persistStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (cell.Hash, error) {
+	rootHash := root.HashKey()
 	if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{
 		block:          block,
 		root:           root,
 		totalCells:     totalCells,
 		cellGeneration: generation,
 	}); err != nil {
-		return nil, err
+		return cell.Hash{}, err
 	}
 	if err := s.flushCellDBs(generation); err != nil {
-		return nil, fmt.Errorf("flush generation %d state cells before returning lazy root: %w", generation, err)
-	}
-
-	lazyRoot, err := s.loadLazyCellFromGeneration(ctx, generation, rootCellHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("load persisted lazy state root: %w", err)
+		return cell.Hash{}, fmt.Errorf("flush generation %d state cells before returning lazy root: %w", generation, err)
 	}
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
 		Uint64("cell_generation", generation).
 		Uint64("cells", totalCells).
-		Msg("state cell tree imported and switched to lazy celldb root")
-	return lazyRoot, nil
+		Msg("state cell tree imported")
+	return rootHash, nil
 }
 
-func (s *Store) importStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
+func (s *Store) persistStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (cell.Hash, error) {
 	roots := view.Roots()
 	if len(roots) != 1 {
-		return nil, fmt.Errorf("state boc should contain exactly one root, got %d", len(roots))
+		return cell.Hash{}, fmt.Errorf("state boc should contain exactly one root, got %d", len(roots))
 	}
 
 	rootCell, _, err := view.ReadCell(roots[0], nil)
 	if err != nil {
-		return nil, fmt.Errorf("load state boc root cell: %w", err)
+		return cell.Hash{}, fmt.Errorf("load state boc root cell: %w", err)
 	}
 	if rootCell.D1&0b1000 != 0 && len(rootCell.Body) > 0 && cell.Type(rootCell.Body[0]) == cell.PrunedCellType {
-		return nil, fmt.Errorf("state cell tree root is pruned")
+		return cell.Hash{}, fmt.Errorf("state cell tree root is pruned")
 	}
 
-	rootCellHash := rootCell.Meta.Hash
+	rootHash := rootCell.Meta.Hash
 	if err = s.saveStateBOCView(ctx, generation, block, view); err != nil {
-		return nil, err
+		return cell.Hash{}, err
 	}
 	if err = s.flushCellDBs(generation); err != nil {
-		return nil, fmt.Errorf("flush generation %d boc state cells before returning lazy root: %w", generation, err)
-	}
-
-	lazyRoot, err := s.loadLazyCellFromGeneration(ctx, generation, rootCellHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("load persisted lazy state root: %w", err)
+		return cell.Hash{}, fmt.Errorf("flush generation %d boc state cells before returning lazy root: %w", generation, err)
 	}
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
 		Uint64("cell_generation", generation).
 		Uint64("cells", uint64(view.Cells())).
-		Msg("boc state cells imported and switched to lazy celldb root")
-	return lazyRoot, nil
+		Msg("boc state cells imported")
+	return rootHash, nil
 }
 
 func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
@@ -146,26 +130,18 @@ func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 		return nil, storage.ErrNotFound
 	}
 
-	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateRootHash)
+	root, err := s.loadActiveLazyCell(ctx, state.StateRootHash)
 	if err != nil {
 		return nil, err
 	}
-	hash := root.HashKey(0)
+	hash := root.HashKeyAt(0)
 	if !bytes.Equal(hash[:], state.StateRootHash) {
 		return nil, storage.ErrNotFound
 	}
 	return root, nil
 }
 
-func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) error {
-	var err error
-	if root == nil {
-		root, err = s.loadLazyCellFromGeneration(context.Background(), saved.CellGeneration, saved.StateRootHash)
-		if err != nil {
-			return fmt.Errorf("load persisted lazy state root: %w", err)
-		}
-	}
-
+func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) {
 	state.Block = saved.Block
 	state.StateRootHash = bytes.Clone(saved.StateRootHash)
 	state.StateFileHash = bytes.Clone(saved.StateFileHash)
@@ -175,9 +151,8 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 		ref := *saved.MasterchainRef
 		state.MasterchainRef = &ref
 	}
-	state.CellGeneration = saved.CellGeneration
 	state.Cell = root
-	state.Parsed = saved.Parsed
+	state.Parsed = nil
 	if parsed != nil {
 		state.Parsed = parsed.Parsed
 	}
@@ -185,14 +160,9 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(saved.Block)).
 		Msg("block state switched to lazy celldb root")
-	return nil
 }
 
-func (s *Store) SaveCells(records []*storage.CellRecord) error {
-	return s.SaveCellsInGeneration(context.Background(), 0, records)
-}
-
-func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error {
+func (s *Store) saveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error {
 	encoded := make([]storage.EncodedCellRecord, 0, len(records))
 	for _, record := range records {
 		if len(record.Hash) != 32 {
@@ -203,7 +173,7 @@ func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, re
 		copy(hash[:], record.Hash)
 		encoded = append(encoded, storage.EncodedCellRecord{
 			Hash: hash,
-			Data: encodeCellRecord(record),
+			Data: storage.EncodeCellRecord(record),
 		})
 	}
 
@@ -211,7 +181,7 @@ func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, re
 	return err
 }
 
-func (s *Store) SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error {
+func (s *Store) saveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error {
 	_, err := s.saveCellRecordBatch(ctx, records, sync, generation, true)
 	return err
 }
@@ -533,48 +503,75 @@ func saveCellRecords(ctx context.Context, cells *cellStore, records storage.Stat
 }
 
 func (s *Store) CellRecord(ctx context.Context, hash []byte) (*storage.CellRecord, error) {
-	return s.CellRecordInGeneration(ctx, 0, hash)
+	cells, err := s.acquireActiveCellStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cells.release()
+
+	return cellRecordFromStore(cells, hash)
 }
 
-func (s *Store) CellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*storage.CellRecord, error) {
-	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
+func (s *Store) cellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*storage.CellRecord, error) {
+	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
 		return nil, err
 	}
-	record, err := decodeCellRecord(hash, raw)
+	defer cells.release()
+
+	return cellRecordFromStore(cells, hash)
+}
+
+func cellRecordFromStore(cells *cellStore, hash []byte) (*storage.CellRecord, error) {
+	raw, err := cells.getCopy(hash)
 	if err != nil {
 		return nil, err
 	}
+
+	record, err := storage.DecodeCellRecord(hash, raw)
+	if err != nil {
+		return nil, err
+	}
+
 	return record, nil
 }
 
 func (s *Store) LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	return s.loadLazyCellFromGeneration(ctx, 0, hash)
+	return s.loadActiveLazyCell(ctx, hash)
 }
 
 func (s *Store) LazyCellLoader() cell.LazyCellLoader {
-	return s.lazyCellLoaderForGeneration(0)
-}
-
-func (s *Store) LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader {
-	return s.lazyCellLoaderForGeneration(generation)
-}
-
-func (s *Store) lazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
-	if generation == 0 && s.lazyCellLoaderZero != nil {
-		return s.lazyCellLoaderZero
-	}
-	return s.newLazyCellLoaderForGeneration(generation)
+	return s.activeCellLoader
 }
 
 func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
+	var loader cell.LazyCellLoader
 	loadMiss := func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := s.loadLazyCellMissFromGeneration(context.Background(), generation, hash[:])
+		loaded, err := s.loadLazyCellMissFromGeneration(context.Background(), generation, hash[:], loader)
 		if err != nil {
 			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
 		}
 		return loaded, nil
 	}
+	loader = s.cachedCellLoader(generation, loadMiss)
+	return loader
+}
+
+const activeCellCacheNamespace uint64 = 0
+
+func (s *Store) newActiveCellLoader() cell.LazyCellLoader {
+	loadMiss := func(hash cell.Hash) (*cell.Cell, error) {
+		loaded, err := s.loadActiveLazyCellMiss(context.Background(), hash[:])
+		if err != nil {
+			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
+		}
+		return loaded, nil
+	}
+
+	return s.cachedCellLoader(activeCellCacheNamespace, loadMiss)
+}
+
+func (s *Store) cachedCellLoader(cacheNamespace uint64, loadMiss cell.LazyCellLoader) cell.LazyCellLoader {
 	// Resolve the cache branch once rather than per lookup.
 	if s.cellCache == nil {
 		return loadMiss
@@ -583,7 +580,7 @@ func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellL
 	return func(hash cell.Hash) (*cell.Cell, error) {
 		// getHash reports storage.ErrNotFound and nothing else, so any error here
 		// is a plain miss.
-		if loaded, err := s.cellCache.getHash(generation, hash); err == nil {
+		if loaded, err := s.cellCache.getHash(cacheNamespace, hash); err == nil {
 			s.lazyCellLoads.observeDecodedCache()
 			return loaded, nil
 		}
@@ -591,10 +588,16 @@ func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellL
 	}
 }
 
-func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
-	// Generation 0 means "the active generation": the decoded-cell cache keys
-	// it as 0 and acquireCellStore resolves it to the active generation under
-	// its own lock, so cache hits never touch the store-wide mutex.
+func (s *Store) loadLazyCellFromGeneration(
+	ctx context.Context,
+	generation uint64,
+	hash []byte,
+	loader cell.LazyCellLoader,
+) (*cell.Cell, error) {
+	if generation == 0 {
+		return nil, fmt.Errorf("cell generation is zero")
+	}
+
 	loaded, err := s.cellCache.get(generation, hash)
 	if err == nil {
 		s.lazyCellLoads.observeDecodedCache()
@@ -604,10 +607,10 @@ func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint6
 		return nil, err
 	}
 
-	return s.loadLazyCellMissFromGeneration(ctx, generation, hash)
+	return s.loadLazyCellMissFromGeneration(ctx, generation, hash, loader)
 }
 
-func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
+func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation uint64, hash []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
 	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
 		return nil, err
@@ -621,10 +624,45 @@ func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation u
 	defer func() { _ = closer.Close() }()
 
 	s.lazyCellLoads.observePebble()
-	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, s.lazyCellLoaderForGeneration(generation))
+	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, loader)
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}
 	s.cellCache.set(generation, hash, loaded)
+	return loaded, nil
+}
+
+func (s *Store) loadActiveLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	loaded, err := s.cellCache.get(activeCellCacheNamespace, hash)
+	if err == nil {
+		s.lazyCellLoads.observeDecodedCache()
+		return loaded, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
+	}
+
+	return s.loadActiveLazyCellMiss(ctx, hash)
+}
+
+func (s *Store) loadActiveLazyCellMiss(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	cells, err := s.acquireActiveCellStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cells.release()
+
+	raw, closer, err := cells.get(hash)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = closer.Close() }()
+
+	s.lazyCellLoads.observePebble()
+	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, s.activeCellLoader)
+	if err != nil {
+		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
+	}
+	s.cellCache.set(activeCellCacheNamespace, hash, loaded)
 	return loaded, nil
 }

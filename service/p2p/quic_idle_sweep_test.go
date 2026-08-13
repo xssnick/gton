@@ -97,24 +97,22 @@ func TestSweepIgnoresInboundPaths(t *testing.T) {
 // grows with every peer id that ever handshaked with us and never shrinks.
 func TestPeerRouteSweepBoundsTheTable(t *testing.T) {
 	node := newTestNode(t)
-	now := time.Now()
-
 	for i := range maxPeerRoutes + 500 {
 		var id PeerID
 		id[0], id[1], id[2] = byte(i), byte(i>>8), byte(i>>16)
-		node.peerRoutes.get(id)
+		node.peerRoutes.Get(id)
 	}
-	if got := node.peerRoutes.size(); got != maxPeerRoutes+500 {
+	if got := node.peerRoutes.Size(); got != maxPeerRoutes+500 {
 		t.Fatalf("filed %d routes, want %d", got, maxPeerRoutes+500)
 	}
 
-	if dropped := node.sweepPeerRoutes(now); dropped != 500 {
+	if dropped := node.sweepPeerRoutes(); dropped != 500 {
 		t.Fatalf("dropped %d routes, want 500", dropped)
 	}
-	if got := node.peerRoutes.size(); got != maxPeerRoutes {
+	if got := node.peerRoutes.Size(); got != maxPeerRoutes {
 		t.Fatalf("table holds %d routes after the sweep, want %d", got, maxPeerRoutes)
 	}
-	if dropped := node.sweepPeerRoutes(now); dropped != 0 {
+	if dropped := node.sweepPeerRoutes(); dropped != 0 {
 		t.Fatalf("sweep dropped %d routes while at the bound", dropped)
 	}
 }
@@ -126,33 +124,29 @@ func TestPeerRouteSweepKeepsHeldAndUsefulRoutes(t *testing.T) {
 	node := newTestNode(t)
 
 	held := testPeerID("held-by-a-live-transport")
-	node.peerRoutes.get(held)
+	heldRoute := node.peerRoutes.Get(held)
 	node.pool.mx.Lock()
 	node.pool.peers[held] = &pooledPeer{id: held}
 	node.pool.mx.Unlock()
 
 	useful := testPeerID("knows-a-quic-address")
-	node.peerRoutes.get(useful).setQUICAddr("1.2.3.4:4278")
+	usefulRoute := node.peerRoutes.Get(useful)
+	usefulRoute.SetQUICAddress("1.2.3.4:4278")
 
 	for i := range maxPeerRoutes + 100 {
 		var id PeerID
 		id[0], id[1], id[2], id[3] = byte(i), byte(i>>8), byte(i>>16), 0xAA
-		node.peerRoutes.get(id)
+		node.peerRoutes.Get(id)
 	}
 
-	if dropped := node.sweepPeerRoutes(time.Now()); dropped == 0 {
+	if dropped := node.sweepPeerRoutes(); dropped == 0 {
 		t.Fatal("sweep dropped nothing while over the bound")
 	}
 
-	node.peerRoutes.mx.RLock()
-	_, keptHeld := node.peerRoutes.routes[held]
-	_, keptUseful := node.peerRoutes.routes[useful]
-	node.peerRoutes.mx.RUnlock()
-
-	if !keptHeld {
+	if node.peerRoutes.Get(held) != heldRoute {
 		t.Fatal("a route held by a live transport was swept")
 	}
-	if !keptUseful {
+	if node.peerRoutes.Get(useful) != usefulRoute {
 		t.Fatal("a route with a learned QUIC address was swept before address-less ones")
 	}
 }

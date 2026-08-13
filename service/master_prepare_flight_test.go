@@ -26,6 +26,7 @@ func TestMasterPrepareFlightCollapsesConcurrentCalls(t *testing.T) {
 	calls := 0
 	produced := map[byte]tnstore.StateCellRecords{}
 
+	//nolint:unparam // masterPrepareFlight.do requires an error result; this fixture is intentionally successful.
 	work := func() (tnstore.StateCellRecords, error) {
 		callsMu.Lock()
 		calls++
@@ -180,7 +181,7 @@ func TestMasterPrepareFlightWaiterRespectsItsOwnContext(t *testing.T) {
 // the consensus proof (whose signature-check memoization is written in place).
 func TestPrepareVerifiedMasterchainBlockSharedGivesEachConsumerItsOwnMeta(t *testing.T) {
 	downloaded := mustLoadFixtureDownloadedBlock(t)
-	svc := &Service{log: zerolog.Nop()}
+	svc := &SyncCoordinator{log: zerolog.Nop()}
 	verified, err := svc.verifyDownloadedBlock(*downloaded)
 	if err != nil {
 		t.Fatalf("verify fixture block: %v", err)

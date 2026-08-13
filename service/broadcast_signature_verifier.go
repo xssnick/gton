@@ -15,7 +15,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-var _ p2p.BroadcastSignatureVerifier = (*Service)(nil)
+var _ p2p.BroadcastSignatureVerifier = (*SyncCoordinator)(nil)
 
 type broadcastValidatorConfig struct {
 	rootHash       cell.Hash
@@ -40,6 +40,7 @@ type broadcastValidatorCache struct {
 	configRootHash cell.Hash
 	initialized    bool
 	entries        map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet
+	shardTopView   *shardTopValidationView
 }
 
 func (c *broadcastValidatorCache) getConfig() (broadcastValidatorConfig, error) {
@@ -71,7 +72,7 @@ func (c *broadcastValidatorCache) putConfig(block ton.BlockIDExt, config broadca
 	return c.config
 }
 
-func (s *Service) publishBroadcastValidatorConfig(
+func (s *SyncCoordinator) publishBroadcastValidatorConfig(
 	block ton.BlockIDExt,
 	config broadcastValidatorConfig,
 ) broadcastValidatorConfig {
@@ -113,7 +114,7 @@ func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *block
 	return set
 }
 
-func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.BlockBroadcastSignatureCheck) error {
+func (s *SyncCoordinator) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.BlockBroadcastSignatureCheck) error {
 	// The same decoded proof cell reaches the verify pipeline again through the
 	// p2p hot cache; share the parse with it.
 	parsed, err := s.parsedProofs.parse(req.Block, req.Proof)
@@ -126,14 +127,19 @@ func (s *Service) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.Blo
 		return err
 	}
 
-	validators, err := s.broadcastValidatorSetForSignatures(ctx, req.Block, signatures.CatchainSeqno(), signatures.ValidatorSetHash())
+	validators, err := s.broadcastValidatorSetForSignatures(
+		ctx,
+		req.Block,
+		signatures.CatchainSeqno(),
+		signatures.ValidatorSetHash(),
+	)
 	if err != nil {
 		return err
 	}
 	return blockproof.CheckPreparedSignatures(req.Block, signatures, validators)
 }
 
-func (s *Service) CheckBlockFinalitySignatures(ctx context.Context, req p2p.BlockFinalitySignatureCheck) (*p2p.BlockFinalitySignatureCheckResult, error) {
+func (s *SyncCoordinator) CheckBlockFinalitySignatures(ctx context.Context, req p2p.BlockFinalitySignatureCheck) (*p2p.BlockFinalitySignatureCheckResult, error) {
 	if !req.Signatures.IsSimplex() {
 		return nil, fmt.Errorf("block finality broadcast %s has non-simplex validator signatures", storage.FormatBlockRef(req.Block))
 	}
@@ -141,7 +147,12 @@ func (s *Service) CheckBlockFinalitySignatures(ctx context.Context, req p2p.Bloc
 		return nil, fmt.Errorf("masterchain block %s has non-final validator signatures", storage.FormatBlockRef(req.Block))
 	}
 
-	validators, err := s.broadcastValidatorSetForSignatures(ctx, req.Block, req.Signatures.CatchainSeqno(), req.Signatures.ValidatorSetHash())
+	validators, err := s.broadcastValidatorSetForSignatures(
+		ctx,
+		req.Block,
+		req.Signatures.CatchainSeqno(),
+		req.Signatures.ValidatorSetHash(),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -150,73 +161,90 @@ func (s *Service) CheckBlockFinalitySignatures(ctx context.Context, req p2p.Bloc
 	}
 
 	var signaturesCell *cell.Cell
+	verifiedKey := req.Signatures.ContentKey(req.Block)
 	if req.Block.Workchain == -1 {
 		signaturesCell, err = req.Signatures.FinalitySignaturesCell(validators)
 		if err != nil {
 			return nil, err
 		}
+		blockSignatures, parseErr := blockproof.ParseBlockSignatureSetCell(signaturesCell)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse serialized finality signatures: %w", parseErr)
+		}
+		verifiedKey = blockSignatures.ContentKey(req.Block)
 	}
 	return &p2p.BlockFinalitySignatureCheckResult{
 		SignaturesCell:        signaturesCell,
-		SignaturesVerifiedKey: req.Signatures.ContentKey(req.Block),
+		SignaturesVerifiedKey: verifiedKey,
 	}, nil
 }
 
-func (s *Service) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p.ShardDescriptionSignatureCheck) (*p2p.ShardBlockDescription, error) {
-	desc, err := parseShardTopBlockDescription(req.Block, req.CatchainSeqno, req.Data)
+func (s *SyncCoordinator) ValidateShardDescriptionBroadcast(ctx context.Context, req p2p.ShardDescriptionSignatureCheck) (*p2p.ShardBlockDescription, error) {
+	parsed, err := p2p.ParseShardTopBlockDescription(req.Block, req.CatchainSeqno, req.Root)
 	if err != nil {
+		return nil, err
+	}
+	desc := parsed.Description
+
+	view, err := s.currentShardTopValidationView(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.validateShardDescriptionAgainstView(ctx, view, parsed); err != nil {
 		return nil, err
 	}
 
-	validators, err := s.broadcastValidatorSetForSignatures(ctx, desc.Block, desc.CatchainSeqno, desc.ValidatorSetHash)
-	if err != nil {
-		return nil, err
-	}
-	if err = blockproof.CheckPreparedSignatures(desc.Block, desc.Signatures, validators); err != nil {
-		return nil, err
-	}
-	out, err := newP2PShardBlockDescription(desc)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return desc, nil
 }
 
-func newP2PShardBlockDescription(desc *shardTopBlockDescription) (*p2p.ShardBlockDescription, error) {
-	out := &p2p.ShardBlockDescription{
-		Block:            desc.Block,
-		CatchainSeqno:    desc.CatchainSeqno,
-		ValidatorSetHash: desc.ValidatorSetHash,
-		Chain:            make([]p2p.ShardDescriptionLink, 0, len(desc.Chain)),
+func (s *SyncCoordinator) validateShardDescriptionAgainstView(
+	ctx context.Context,
+	view *shardTopValidationView,
+	parsed *p2p.ParsedShardTopDescription,
+) error {
+	desc := parsed.Description
+	if err := validateShardTopDescriptionContext(ctx, view, desc); err != nil {
+		return err
 	}
-	for _, link := range desc.Chain {
-		proofRoot, proofBOC, err := blockproof.LinkFromRoot(link.Block, link.ProofRoot)
-		if err != nil {
-			return nil, fmt.Errorf("build shard description proof link for %s: %w", storage.FormatBlockRef(link.Block), err)
-		}
 
-		var masterchainRef *ton.BlockIDExt
-		if link.MasterchainRef != nil {
-			ref := *link.MasterchainRef
-			masterchainRef = &ref
+	validators, err := view.validatorSet(
+		desc.Block,
+		desc.CatchainSeqno,
+		desc.ValidatorSetHash,
+	)
+	if err != nil {
+		if errors.Is(err, blockproof.ErrShardTopValidatorContextNotReady) {
+			return fmt.Errorf("%w: shard top validator context is not ready: %v", p2p.ErrBroadcastSignatureRetryable, err)
 		}
-		out.Chain = append(out.Chain, p2p.ShardDescriptionLink{
-			Block:          link.Block,
-			PrevRefs:       append([]ton.BlockIDExt(nil), link.PrevRefs...),
-			MasterchainRef: masterchainRef,
-			ProofRoot:      proofRoot,
-			ProofBOC:       proofBOC,
-		})
+		return err
 	}
-	return out, nil
+	if err = blockproof.CheckPreparedBlockSignatures(desc.Block, parsed.Signatures, validators); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (s *Service) broadcastValidatorSetForSignatures(ctx context.Context, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) (*blockproof.PreparedValidatorSet, error) {
+func (s *SyncCoordinator) broadcastValidatorSetForSignatures(
+	ctx context.Context,
+	block ton.BlockIDExt,
+	catchainSeqno uint32,
+	validatorSetHash uint32,
+) (*blockproof.PreparedValidatorSet, error) {
 	config, err := s.currentBroadcastValidatorConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	return s.broadcastValidatorSetForConfig(config, block, catchainSeqno, validatorSetHash)
+}
+
+func (s *SyncCoordinator) broadcastValidatorSetForConfig(
+	config broadcastValidatorConfig,
+	block ton.BlockIDExt,
+	catchainSeqno uint32,
+	validatorSetHash uint32,
+) (*blockproof.PreparedValidatorSet, error) {
 	key := broadcastValidatorCacheKeyFromBlock(config.rootHash, block, catchainSeqno, validatorSetHash)
 	set, err := s.broadcastValidatorCache.get(key)
 	if err == nil {
@@ -233,7 +261,12 @@ func (s *Service) broadcastValidatorSetForSignatures(ctx context.Context, block 
 	return s.broadcastValidatorCache.put(key, set), nil
 }
 
-func broadcastValidatorCacheKeyFromBlock(configRootHash cell.Hash, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) broadcastValidatorCacheKey {
+func broadcastValidatorCacheKeyFromBlock(
+	configRootHash cell.Hash,
+	block ton.BlockIDExt,
+	catchainSeqno uint32,
+	validatorSetHash uint32,
+) broadcastValidatorCacheKey {
 	return broadcastValidatorCacheKey{
 		configRootHash:   configRootHash,
 		workchain:        block.Workchain,
@@ -248,9 +281,14 @@ type broadcastValidatorSetCandidate struct {
 	load func() ([]*tlb.ValidatorAddr, error)
 }
 
-func broadcastValidatorSetFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockIDExt, catchainSeqno uint32, validatorSetHash uint32) (*blockproof.PreparedValidatorSet, error) {
-	// Key-block boundaries can leave valid broadcasts signed by a known previous,
-	// current, or next validator set; the hash is checked before any set is used.
+func broadcastValidatorSetFromConfig(
+	cfg *tlb.BlockchainConfig,
+	block ton.BlockIDExt,
+	catchainSeqno uint32,
+	validatorSetHash uint32,
+) (*blockproof.PreparedValidatorSet, error) {
+	// Key-block boundaries can leave ordinary block and finality broadcasts
+	// signed by any validator epoch still named by the current config.
 	candidates := []broadcastValidatorSetCandidate{
 		{
 			name: "current",
@@ -294,7 +332,7 @@ func broadcastValidatorSetFromConfig(cfg *tlb.BlockchainConfig, block ton.BlockI
 	return nil, fmt.Errorf("validator set %08x for %s is not available: %w: %v", validatorSetHash, storage.FormatBlockRef(block), storage.ErrNotFound, lastErr)
 }
 
-func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcastValidatorConfig, error) {
+func (s *SyncCoordinator) currentBroadcastValidatorConfig(ctx context.Context) (broadcastValidatorConfig, error) {
 	config, err := s.broadcastValidatorCache.getConfig()
 	if err == nil {
 		return config, nil
@@ -303,7 +341,7 @@ func (s *Service) currentBroadcastValidatorConfig(ctx context.Context) (broadcas
 		return broadcastValidatorConfig{}, err
 	}
 
-	current, err := s.currentStatusSnapshot(ctx)
+	current, err := s.status.currentStateSnapshot(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return broadcastValidatorConfig{}, fmt.Errorf("%w: load live current state for broadcast signature check: %w", p2p.ErrBroadcastSignatureRetryable, err)
@@ -330,8 +368,16 @@ func broadcastValidatorConfigFromMasterchainState(state *storage.BlockState) (br
 	if err != nil {
 		return broadcastValidatorConfig{}, err
 	}
+
+	return broadcastValidatorConfigForMasterchain(state.Block, cfg)
+}
+
+func broadcastValidatorConfigForMasterchain(
+	block ton.BlockIDExt,
+	cfg *tlb.BlockchainConfig,
+) (broadcastValidatorConfig, error) {
 	if cfg.Root == nil {
-		return broadcastValidatorConfig{}, fmt.Errorf("masterchain state %s has empty validator config root", storage.FormatBlockRef(state.Block))
+		return broadcastValidatorConfig{}, fmt.Errorf("masterchain state %s has empty validator config root", storage.FormatBlockRef(block))
 	}
 
 	fastSync := fastSyncConfigFromConfig(cfg)

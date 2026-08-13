@@ -30,6 +30,109 @@ func TestStoreCheckpointFlushDoesNotRememberMissingBlocks(t *testing.T) {
 	}
 }
 
+func TestStoreLoadsZeroStateCurrentWithoutBlockData(t *testing.T) {
+	block := testLiveBlockID(-1, masterchainShard, 0, 0x21)
+	root := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()
+	state := storage.BlockState{
+		Block:         block,
+		StateRootHash: root.Hash(),
+		Cell:          root,
+	}
+	backing := zeroStateCurrentBacking{
+		current: &storage.CurrentState{Masterchain: state},
+		state:   state,
+	}
+
+	live := New(backing)
+
+	current, err := live.CurrentState(t.Context())
+	if err != nil {
+		t.Fatalf("load current state: %v", err)
+	}
+	if !current.Masterchain.Block.Equals(&block) {
+		t.Fatalf("current masterchain = %s, want %s", storage.FormatBlockRef(current.Masterchain.Block), storage.FormatBlockRef(block))
+	}
+	if _, err = live.BlockState(t.Context(), block); err != nil {
+		t.Fatalf("load zero-state block state: %v", err)
+	}
+	if _, err = live.BlockMeta(t.Context(), block); err != nil {
+		t.Fatalf("load zero-state block metadata: %v", err)
+	}
+	if _, err = live.BlockData(t.Context(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("load zero-state block data error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestStorePublishesDownloadedZeroStatesWithoutBlockData(t *testing.T) {
+	masterBlock := testLiveBlockID(-1, masterchainShard, 0, 0x31)
+	masterRoot := cell.BeginCell().MustStoreUInt(0x32, 8).EndCell()
+	master := storage.BlockState{
+		Block:         masterBlock,
+		StateRootHash: masterRoot.Hash(),
+		Cell:          masterRoot,
+	}
+	shardBlock := testLiveBlockID(0, masterchainShard, 0, 0x33)
+	shardRoot := cell.BeginCell().MustStoreUInt(0x34, 8).EndCell()
+	shard := storage.BlockState{
+		Block:         shardBlock,
+		StateRootHash: shardRoot.Hash(),
+		Cell:          shardRoot,
+	}
+	backing := syncedZeroStateBacking{
+		states: map[storage.BlockRootHash]storage.BlockState{
+			storage.BlockKey(masterBlock): master,
+			storage.BlockKey(shardBlock):  shard,
+		},
+	}
+	live := New(backing)
+
+	currentSnapshot := &storage.CurrentState{
+		Masterchain: storage.BlockStateWithoutCells(&master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shardBlock): storage.BlockStateWithoutCells(&shard),
+		},
+	}
+	live.SetLiveCurrentStateSnapshot(currentSnapshot)
+	if _, err := live.CurrentState(t.Context()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unflushed current state error = %v, want ErrNotFound", err)
+	}
+	live.MarkLiveCurrentStateFlushed(currentSnapshot)
+
+	current, err := live.CurrentState(t.Context())
+	if err != nil {
+		t.Fatalf("published current state: %v", err)
+	}
+	if !current.Masterchain.Block.Equals(&masterBlock) || len(current.Shards) != 1 {
+		t.Fatalf("published current state = %+v", current)
+	}
+	for _, block := range []ton.BlockIDExt{masterBlock, shardBlock} {
+		state, err := live.BlockState(t.Context(), block)
+		if err != nil {
+			t.Fatalf("load published state %s: %v", storage.FormatBlockRef(block), err)
+		}
+		if state.Cell == nil {
+			t.Fatalf("published state %s did not load its durable cell tree", storage.FormatBlockRef(block))
+		}
+		if _, err = live.BlockData(t.Context(), block); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("load zerostate block data %s error = %v, want ErrNotFound", storage.FormatBlockRef(block), err)
+		}
+	}
+}
+
+type syncedZeroStateBacking struct {
+	noopBacking
+	states map[storage.BlockRootHash]storage.BlockState
+}
+
+func (b syncedZeroStateBacking) BlockState(_ context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+	state, ok := b.states[storage.BlockKey(block)]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	return storage.CloneBlockState(&state), nil
+}
+
 func TestStorePublishBlockWithStateMaintainsFinalIndexesAndEvictability(t *testing.T) {
 	block := testLiveBlockID(0, int64(1)<<62, 36, 0x36)
 	state := storage.BlockState{
@@ -354,6 +457,24 @@ func testLiveBlockID(workchain int32, shard int64, seqno uint32, fill byte) ton.
 }
 
 type noopBacking struct{}
+
+type zeroStateCurrentBacking struct {
+	noopBacking
+	current *storage.CurrentState
+	state   storage.BlockState
+}
+
+func (b zeroStateCurrentBacking) CurrentState(context.Context) (*storage.CurrentState, error) {
+	return storage.CloneCurrentState(b.current), nil
+}
+
+func (b zeroStateCurrentBacking) BlockState(_ context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+	if !block.Equals(&b.state.Block) {
+		return nil, storage.ErrNotFound
+	}
+
+	return storage.CloneBlockState(&b.state), nil
+}
 
 func (noopBacking) BlockData(context.Context, ton.BlockIDExt) ([]byte, error) {
 	return nil, storage.ErrNotFound

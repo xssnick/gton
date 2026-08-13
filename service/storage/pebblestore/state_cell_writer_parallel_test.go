@@ -13,7 +13,7 @@ import (
 )
 
 func TestImportStateBOCViewParallel(t *testing.T) {
-	root, _ := benchmarkCellGraph(t, stateBOCImportMinCellsPerWorker*2, 4)
+	root, _ := benchmarkCellGraph(t, stateBOCImportMinCellsPerWorker*2)
 	view := testStateBOCView(t, root, nil)
 	if workers := stateBOCImportWorkerCount(view.Cells()); workers < 2 {
 		t.Fatalf("workers = %d, want at least 2", workers)
@@ -57,7 +57,7 @@ func TestImportStateBOCViewParallel(t *testing.T) {
 }
 
 func TestImportStateBOCViewParallelReturnsReaderError(t *testing.T) {
-	root, _ := benchmarkCellGraph(t, stateBOCImportMinCellsPerWorker*2, 4)
+	root, _ := benchmarkCellGraph(t, stateBOCImportMinCellsPerWorker*2)
 	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithIndex: true})
 	source := &failOnceReaderAt{data: boc}
 	view := testStateBOCView(t, root, source)
@@ -79,7 +79,7 @@ func TestImportStateBOCViewParallelReturnsReaderError(t *testing.T) {
 }
 
 func TestImportStateBOCViewParallelCancellation(t *testing.T) {
-	root, _ := benchmarkCellGraph(t, stateBOCImportMinCellsPerWorker*2, 4)
+	root, _ := benchmarkCellGraph(t, stateBOCImportMinCellsPerWorker*2)
 	view := testStateBOCView(t, root, nil)
 
 	store, err := Open(Options{Dir: t.TempDir()})

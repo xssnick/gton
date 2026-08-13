@@ -448,11 +448,10 @@ func TestPlumtreeLocalOriginRejectsInvalidBoundaries(t *testing.T) {
 		0,
 		plumtreeEngineTestID(2),
 		[]byte{1},
-	); err == nil {
-		t.Fatal("origin with another ADNL identity was accepted")
+	); err != nil {
+		t.Fatalf("per-broadcast signer with another ADNL identity was rejected: %v", err)
 	}
 
-	engine.localID = origin.sourceID
 	if _, err := engine.OriginateSimple(
 		origin,
 		0,

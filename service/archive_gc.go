@@ -15,13 +15,13 @@ const (
 	archiveGCStartGroupsPerRun = 1024
 )
 
-func (s *Service) runArchiveGCOnce(ctx context.Context) (bool, error) {
+func (s *MaintenanceRunner) runArchiveGCOnce(ctx context.Context) (bool, error) {
 	if s.archiveTTL <= 0 {
 		return false, nil
 	}
-	if s.syncUntilFrozen() {
+	if s.sync.syncUntilFrozen() {
 		s.log.Debug().
-			Uint32("sync_until", s.syncUntil).
+			Uint32("sync_until", s.sync.syncUntilTarget()).
 			Msg("skipping archive ttl gc after sync_until")
 		return false, nil
 	}

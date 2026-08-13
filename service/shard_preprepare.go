@@ -181,7 +181,7 @@ type shardPrepareRequest struct {
 // needs next, while a refused block stays in the p2p hot cache and is
 // prepared inline by the resolver later — losing an entry only costs latency,
 // never correctness.
-func (s *Service) enqueueShardBlockPrepare(req shardPrepareRequest) {
+func (s *SyncCoordinator) enqueueShardBlockPrepare(req shardPrepareRequest) {
 	if req.block.Workchain == -1 || s.shardPrepareQueue == nil {
 		return
 	}
@@ -194,7 +194,7 @@ func (s *Service) enqueueShardBlockPrepare(req shardPrepareRequest) {
 	}
 }
 
-func (s *Service) runShardPrepareWorkers(ctx context.Context) {
+func (s *SyncCoordinator) runShardPrepareWorkers(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i := 0; i < preparedShardBlockWorkers; i++ {
 		wg.Add(1)
@@ -213,7 +213,7 @@ func (s *Service) runShardPrepareWorkers(ctx context.Context) {
 	wg.Wait()
 }
 
-func (s *Service) prepareShardBlockRequest(ctx context.Context, req shardPrepareRequest) {
+func (s *SyncCoordinator) prepareShardBlockRequest(ctx context.Context, req shardPrepareRequest) {
 	if !s.preparedShardBlocks.beginPrepare(req.block) {
 		return
 	}
@@ -236,7 +236,7 @@ func (s *Service) prepareShardBlockRequest(ctx context.Context, req shardPrepare
 	s.preparedShardBlocks.storePrepared(prepared)
 }
 
-func (s *Service) verifiedShardBlockForPrepare(ctx context.Context, req shardPrepareRequest) (VerifiedBlock, error) {
+func (s *SyncCoordinator) verifiedShardBlockForPrepare(ctx context.Context, req shardPrepareRequest) (VerifiedBlock, error) {
 	if req.verified != nil {
 		return *req.verified, nil
 	}
@@ -256,12 +256,12 @@ func (s *Service) verifiedShardBlockForPrepare(ctx context.Context, req shardPre
 
 // prepareShardBlockAheadFromVerified queues an already-verified shard block so
 // a prepare worker runs PrepareStateUpdateCells off the caller's goroutine.
-func (s *Service) prepareShardBlockAheadFromVerified(verified VerifiedBlock) {
+func (s *SyncCoordinator) prepareShardBlockAheadFromVerified(verified VerifiedBlock) {
 	s.enqueueShardBlockPrepare(shardPrepareRequest{block: verified.ID, verified: &verified})
 }
 
 // prepareShardBlockAheadByID queues a shard block (usually a broadcast-cache
 // hit after a description prefetch) for fetch and pre-preparation.
-func (s *Service) prepareShardBlockAheadByID(_ context.Context, block ton.BlockIDExt) {
+func (s *SyncCoordinator) prepareShardBlockAheadByID(_ context.Context, block ton.BlockIDExt) {
 	s.enqueueShardBlockPrepare(shardPrepareRequest{block: block})
 }

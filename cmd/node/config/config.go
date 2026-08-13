@@ -50,6 +50,7 @@ const (
 	MaxLiteSendMessageBroadcastFanout       = 20
 	DefaultHTTPAPIListen                    = "0.0.0.0:8081"
 	DefaultHTTPAPIRequestTimeout            = 10 * time.Second
+	DefaultValidatorControlListen           = "127.0.0.1:3030"
 	DefaultMetricsNamespace                 = "gton"
 	defaultStorageDir                       = "data"
 	defaultADNLPort                         = 30303
@@ -71,8 +72,44 @@ type Config struct {
 	HTTPAPI                   HTTPAPI         `json:"http_api"`
 	Storage                   Storage         `json:"storage"`
 	Metrics                   Metrics         `json:"metrics"`
+	Validator                 Validator       `json:"validator"`
+	Collator                  Collator        `json:"collator"`
 	CustomOverlays            []CustomOverlay `json:"custom_overlays"`
 	DisableStateSerialization bool            `json:"disable_state_serialization"`
+}
+
+// Validator contains only operator-owned validator identity and lifecycle
+// policy. Protocol timing and mempool limits follow network and implementation
+// defaults instead of becoming local consensus knobs.
+type Validator struct {
+	Enabled bool             `json:"enabled"`
+	Control ValidatorControl `json:"control"`
+}
+
+// ValidatorControl configures the authenticated validator-engine-compatible
+// TCP endpoint. Validator signing keys are deliberately absent: they live in
+// the validator database and are created through this endpoint.
+type ValidatorControl struct {
+	ListenAddr string                   `json:"listen_addr"`
+	Key        []byte                   `json:"key"`
+	Clients    []ValidatorControlClient `json:"clients"`
+}
+
+type ValidatorControlClient struct {
+	ID          []byte `json:"id"`
+	Permissions uint32 `json:"permissions"`
+}
+
+// Collator configures the independent standalone Delegated-v3 collator. It
+// shares the node ADNL identity but does not serve the local validator mode.
+type Collator struct {
+	Enabled            bool                       `json:"enabled"`
+	ValidatorAllowlist CollatorValidatorAllowlist `json:"validator_allowlist"`
+}
+
+type CollatorValidatorAllowlist struct {
+	Enabled bool     `json:"enabled"`
+	ADNLIDs [][]byte `json:"adnl_ids"`
 }
 
 type TON struct {
@@ -223,6 +260,12 @@ func defaultConfig() Config {
 		Metrics: Metrics{
 			Namespace: DefaultMetricsNamespace,
 		},
+		Validator: Validator{
+			Control: ValidatorControl{
+				ListenAddr: DefaultValidatorControlListen,
+				Clients:    []ValidatorControlClient{},
+			},
+		},
 		CustomOverlays: []CustomOverlay{},
 	}
 }
@@ -241,6 +284,10 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	liteSeed, err := generateSeed()
 	if err != nil {
 		return Config{}, fmt.Errorf("generate liteserver key: %w", err)
+	}
+	validatorControlSeed, err := generateSeed()
+	if err != nil {
+		return Config{}, fmt.Errorf("generate validator control key: %w", err)
 	}
 
 	externalIP, err := externalIPLookup(ctx)
@@ -274,6 +321,7 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	cfg.Lite.Key = liteSeed
 	cfg.Lite.ListenAddr = DefaultLiteListen
 	cfg.Storage.Dir = storageDir
+	cfg.Validator.Control.Key = validatorControlSeed
 
 	return cfg, nil
 }
@@ -411,9 +459,38 @@ func write(path string, cfg Config) error {
 	}
 	data = append(data, '\n')
 
-	if err = os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write config %s: %w", path, err)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".node-config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config in %s: %w", dir, err)
 	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err = tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("chmod temp config %s: %w", tmpPath, err)
+	}
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("write temp config %s: %w", tmpPath, err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("sync temp config %s: %w", tmpPath, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("close temp config %s: %w", tmpPath, err)
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace config %s: %w", path, err)
+	}
+
 	return nil
 }
 

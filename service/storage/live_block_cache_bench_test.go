@@ -114,3 +114,19 @@ func BenchmarkLiveBlockCachePublishWithPinnedOverflow(b *testing.B) {
 		cache.MarkBlockFlushed(block)
 	}
 }
+
+func BenchmarkSelectLiveBlockCacheSplitNext(b *testing.B) {
+	prev := ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 10}
+	left := ton.BlockIDExt{Workchain: 0, Shard: int64(0x4000000000000000), SeqNo: 11}
+	right := ton.BlockIDExt{Workchain: 0, Shard: int64(-0x4000000000000000), SeqNo: 11}
+
+	var selected ton.BlockIDExt
+	var ok bool
+	b.ReportAllocs()
+	for b.Loop() {
+		selected, ok = selectLiveBlockCacheSplitNext(prev, right, left)
+	}
+	if !ok || selected.Shard != left.Shard {
+		b.Fatal("left child was not selected")
+	}
+}

@@ -54,7 +54,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 	if err = sub.ensurePeers(ctx); err != nil {
 		return ProofDownload{}, fmt.Errorf("bootstrap overlay peers: %w", err)
 	}
-	sub.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
+	sub.startQueryPeerDiscovery(ctx)
 
 	tried := map[PeerID]struct{}{}
 	var errs []error
@@ -86,7 +86,7 @@ func (n *Node) downloadProof(ctx context.Context, block ton.BlockIDExt, allowPar
 			errs = append(errs, err)
 			if wave+1 < proofDownloadWaves {
 				sub.reloadNeighbours()
-				sub.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
+				sub.startQueryPeerDiscovery(ctx)
 				if waitErr := sub.waitForProofPeerDiscovery(ctx); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 					errs = append(errs, waitErr)
 				}
@@ -184,7 +184,7 @@ func (s *overlaySubscription) proofQueryCandidates(tried map[PeerID]struct{}) []
 
 func (s *overlaySubscription) waitForProofPeerDiscovery(ctx context.Context) error {
 	notify := s.peerNotifySnapshot()
-	s.startQueryPeerDiscovery(ctx, bootstrapDiscoveryTarget)
+	s.startQueryPeerDiscovery(ctx)
 
 	select {
 	case <-ctx.Done():

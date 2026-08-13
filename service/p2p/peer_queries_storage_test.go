@@ -23,7 +23,7 @@ import (
 )
 
 type prepareZeroStatePeerStore struct {
-	tnstore.PeerServingStorage
+	PeerStorage
 	size int64
 	err  error
 }
@@ -50,9 +50,9 @@ func TestServePrepareZeroStateDistinguishesStorageErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := prepareZeroStatePeerStore{
-				PeerServingStorage: newTestPeerStore(),
-				size:               tt.size,
-				err:                tt.err,
+				PeerStorage: newTestPeerStore(),
+				size:        tt.size,
+				err:         tt.err,
 			}
 			sub := testOverlaySubscription(&overlaySubscription{
 				node: &Node{peerStorage: store},
@@ -89,9 +89,9 @@ func TestDispatchPeerQueryServesStoredBlockAndProofData(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -249,9 +249,9 @@ func TestDispatchPeerQueryServesLiveBlockBeforeCheckpoint(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -345,9 +345,9 @@ func TestDispatchPeerQueryServesLiveKeyBlockProof(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -425,9 +425,9 @@ func TestDispatchPeerQueryDirectDownloadsErrorWhenMissing(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -462,9 +462,9 @@ func TestDispatchPeerQueryShardNextDescriptionRequiresMasterchain(t *testing.T) 
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -502,9 +502,9 @@ func TestDispatchPeerQueryServesZeroStateAndArchiveData(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -651,9 +651,9 @@ func TestAnswerPeerQuerySerializesDataMethodsAsRawBytes(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -819,9 +819,10 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 	store := newTestPebbleStore(t)
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:        &logger,
-		Storage:       store,
-		StateFilesDir: t.TempDir(),
+		Logger:               &logger,
+		PeerStorage:          store,
+		StateArtifactStorage: store,
+		StateFilesDir:        t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -838,13 +839,13 @@ func TestDispatchPeerQueryServesNextKeyBlockIDs(t *testing.T) {
 	})
 
 	anchor := testStoredMasterBlockID(10)
-	saveTestServedMasterBlockMeta(t, store, anchor, true)
+	saveTestServedMasterBlockMeta(t, store, anchor)
 	for seqno := uint32(11); seqno <= 14; seqno++ {
 		block := testStoredMasterBlockID(seqno)
 		meta := &tnstore.BlockMeta{ID: block, GenUTime: seqno}
 		if seqno == 12 || seqno == 14 {
 			meta.Mark(tnstore.BlockMetaIsKeyBlock)
-			saveTestServedMasterBlockMeta(t, store, block, true)
+			saveTestServedMasterBlockMeta(t, store, block)
 			continue
 		}
 		if err = store.SaveBlockMeta(meta); err != nil {
@@ -888,9 +889,10 @@ func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:        &logger,
-		Storage:       store,
-		StateFilesDir: t.TempDir(),
+		Logger:               &logger,
+		PeerStorage:          store,
+		StateArtifactStorage: store,
+		StateFilesDir:        t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -927,16 +929,17 @@ func TestDispatchPeerQueryNextKeyBlockIDsRejectsNonKeyAnchor(t *testing.T) {
 func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 	store := newTestPebbleStore(t)
 	anchor := testStoredMasterBlockID(10)
-	saveTestServedMasterBlockMeta(t, store, anchor, true)
+	saveTestServedMasterBlockMeta(t, store, anchor)
 	keyBlock := testStoredMasterBlockID(500_000)
-	saveTestServedMasterBlockMeta(t, store, keyBlock, true)
+	saveTestServedMasterBlockMeta(t, store, keyBlock)
 
-	countingStore := &countingSeqNoLookupStore{Storage: store}
+	countingStore := &countingSeqNoLookupStore{PeerStorage: store}
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:        &logger,
-		Storage:       countingStore,
-		StateFilesDir: t.TempDir(),
+		Logger:               &logger,
+		PeerStorage:          countingStore,
+		StateArtifactStorage: store,
+		StateFilesDir:        t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -974,21 +977,19 @@ func TestDispatchPeerQueryNextKeyBlockIDsUsesKeyIndexForLargeGap(t *testing.T) {
 }
 
 type countingSeqNoLookupStore struct {
-	tnstore.Storage
+	PeerStorage
 
 	lookupBlockBySeqNoCalls int
 }
 
-func saveTestServedMasterBlockMeta(t *testing.T, store *pebblestore.Store, block ton.BlockIDExt, keyBlock bool) {
+func saveTestServedMasterBlockMeta(t *testing.T, store *pebblestore.Store, block ton.BlockIDExt) {
 	t.Helper()
 
 	meta := &tnstore.BlockMeta{
 		ID:       block,
 		GenUTime: block.SeqNo,
 	}
-	if keyBlock {
-		meta.Mark(tnstore.BlockMetaIsKeyBlock)
-	}
+	meta.Mark(tnstore.BlockMetaIsKeyBlock)
 	if _, err := store.SaveStateCheckpointEntries(context.Background(), []tnstore.StateCheckpointBlock{{
 		State: &tnstore.BlockState{
 			Block:         block,
@@ -1014,9 +1015,9 @@ func TestAnswerPeerQueryStopsSilentlyAfterNodeContextCancel(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -1046,9 +1047,9 @@ func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
 	storage := newTestPeerStore()
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: storage,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   storage,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -1136,7 +1137,7 @@ type testPeerBlockProofEnvelope struct {
 func testPeerMasterBlockProof(t *testing.T, seqno uint32) (ton.BlockIDExt, []byte, []byte) {
 	t.Helper()
 
-	root := testPeerBlockRoot(t, -1, topShard, seqno)
+	root := testPeerBlockRoot(t, -1, seqno)
 	rootHash := root.HashKey(0)
 	id := ton.BlockIDExt{
 		Workchain: -1,
@@ -1153,13 +1154,17 @@ func testPeerMasterBlockProof(t *testing.T, seqno uint32) (ton.BlockIDExt, []byt
 	return id, full, link
 }
 
-func testPeerBlockRoot(t *testing.T, workchain int32, shard int64, seqno uint32) *cell.Cell {
+func testPeerBlockRoot(t *testing.T, workchain int32, seqno uint32) *cell.Cell {
 	t.Helper()
 
 	stateRoot := cell.BeginCell().MustStoreUInt(uint64(seqno), 32).EndCell()
 	var header tlb.BlockHeader
 	header.Version = 1
-	header.Shard = tlb.ShardIdent{PrefixBits: 0, WorkchainID: workchain, ShardPrefix: uint64(shard)}
+	header.Shard = tlb.ShardIdent{
+		PrefixBits:  0,
+		WorkchainID: workchain,
+		ShardPrefix: uint64(1) << 63,
+	}
 	header.SeqNo = seqno
 	header.StartLt = 1
 	header.EndLt = 100

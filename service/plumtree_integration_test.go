@@ -143,6 +143,14 @@ func (livePlumtreePeerStore) BlockProof(
 	return nil, storage.ErrNotFound
 }
 
+func (livePlumtreePeerStore) NextKeyBlocks(context.Context, uint32, int) ([]ton.BlockIDExt, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (livePlumtreePeerStore) CurrentState(context.Context) (*storage.CurrentState, error) {
+	return nil, storage.ErrNotFound
+}
+
 func (livePlumtreePeerStore) ZeroStateSize(
 	context.Context,
 	ton.BlockIDExt,
@@ -270,19 +278,23 @@ func TestIntegrationReceivesPublicPlumtreeBroadcasts(t *testing.T) {
 
 	logger := zerolog.New(zerolog.NewTestWriter(t)).Level(zerolog.InfoLevel)
 	node, err := p2p.New(p2p.Options{
-		Logger:             &logger,
-		GlobalConfig:       globalConfig,
-		ListenAddr:         listen.String(),
-		ExternalIP:         externalIP,
-		ExternalPort:       listen.Port(),
-		PrivateKey:         privateKey,
-		StateFilesDir:      t.TempDir(),
-		PeerServingStorage: livePlumtreePeerStore{},
-		SignatureVerifier:  livePlumtreeSignatureVerifier{config: blockchainConfig},
-		BroadcastAdmission: livePlumtreeAdmission{},
+		Logger:        &logger,
+		GlobalConfig:  globalConfig,
+		ListenAddr:    listen.String(),
+		ExternalIP:    externalIP,
+		ExternalPort:  listen.Port(),
+		PrivateKey:    privateKey,
+		StateFilesDir: t.TempDir(),
+		PeerStorage:   livePlumtreePeerStore{},
 	})
 	if err != nil {
 		t.Fatalf("create public p2p node: %v", err)
+	}
+	if err = node.BindRuntimeCallbacks(p2p.RuntimeCallbacks{
+		SignatureVerifier:  livePlumtreeSignatureVerifier{config: blockchainConfig},
+		BroadcastAdmission: livePlumtreeAdmission{},
+	}); err != nil {
+		t.Fatalf("bind public p2p runtime callbacks: %v", err)
 	}
 	node.SetPlumtreePolicy(policy)
 

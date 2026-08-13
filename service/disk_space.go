@@ -16,7 +16,7 @@ type syncDiskSpaceStatus struct {
 
 type syncDiskSpaceProbe func(path string) (syncDiskSpaceStatus, error)
 
-func (s *Service) waitSyncDiskSpace(ctx context.Context, flow string, probe syncDiskSpaceProbe, retryDelay time.Duration) error {
+func (s *SyncCoordinator) waitSyncDiskSpace(ctx context.Context, flow string, probe syncDiskSpaceProbe, retryDelay time.Duration) error {
 	path := strings.TrimSpace(s.syncDiskSpacePath)
 	if path == "" {
 		return nil
@@ -42,7 +42,7 @@ func (s *Service) waitSyncDiskSpace(ctx context.Context, flow string, probe sync
 				Msg("not enough free disk space before sync")
 		}
 
-		s.wakeServiceMaintenance()
+		s.maintenance.wake()
 		if !sleepContext(ctx, retryDelay) {
 			return ctx.Err()
 		}

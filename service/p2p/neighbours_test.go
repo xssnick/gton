@@ -684,10 +684,10 @@ func TestStartSeedFromDHTRefreshesWhenPeerPoolIsFull(t *testing.T) {
 func TestAnnounceSelfRetriesAfterDHTWarmup(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		ListenAddr:         "127.0.0.1:30303",
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		ListenAddr:    "127.0.0.1:30303",
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -752,10 +752,10 @@ func TestAnnounceSelfRetriesAfterDHTWarmup(t *testing.T) {
 func TestAnnounceSelfSkipsDHTStoreWhenOffline(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		ListenAddr:         "127.0.0.1:30303",
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		ListenAddr:    "127.0.0.1:30303",
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

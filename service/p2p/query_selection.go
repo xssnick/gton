@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	tnstate "github.com/xssnick/gton/service/state"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -16,10 +16,17 @@ import (
 const publicRandomQueryFallbackTTL = time.Hour
 
 func (n *Node) querySubscriptionForBlock(block ton.BlockIDExt) (*overlaySubscription, error) {
+	if err := sharddomain.Validate(block.Shard); err != nil {
+		return nil, err
+	}
 	if selected := n.readyCustomQuerySubscription(time.Now()); selected != nil {
 		return selected, nil
 	}
-	if selected := n.readyFastSyncQuerySubscription(block); selected != nil {
+	selected, err := n.readyFastSyncQuerySubscription(block)
+	if err != nil {
+		return nil, err
+	}
+	if selected != nil {
 		return selected, nil
 	}
 
@@ -36,11 +43,17 @@ func (n *Node) querySubscriptionForBlock(block ton.BlockIDExt) (*overlaySubscrip
 // the public pool's DHT-discovered peer set is the better source even though it
 // costs a few seconds of cold start on the first session.
 func (n *Node) querySubscriptionForHistoricalBlock(block ton.BlockIDExt) (*overlaySubscription, error) {
+	if err := sharddomain.Validate(block.Shard); err != nil {
+		return nil, err
+	}
 	if selected := n.readyCustomQuerySubscription(time.Now()); selected != nil {
 		return selected, nil
 	}
 
-	historical := n.historicalOverlayBlockForDownload(block)
+	historical, err := n.historicalOverlayBlockForDownload(block)
+	if err != nil {
+		return nil, err
+	}
 	return n.subscriptionForOverlayBlock(historical)
 }
 
@@ -64,10 +77,10 @@ func (n *Node) readyCustomQuerySubscription(now time.Time) *overlaySubscription 
 	return selected
 }
 
-func (n *Node) historicalOverlayBlockForDownload(block ton.BlockIDExt) ton.BlockIDExt {
+func (n *Node) historicalOverlayBlockForDownload(block ton.BlockIDExt) (ton.BlockIDExt, error) {
 	if block.Workchain == -1 {
 		block.Shard = topShard
-		return block
+		return block, nil
 	}
 
 	// Historical state is available through every monitored ancestor overlay.
@@ -75,10 +88,17 @@ func (n *Node) historicalOverlayBlockForDownload(block ton.BlockIDExt) ton.Block
 	// the deepest monitored shard overlay.
 	maxDepth := n.monitorMinSplitDepthForWorkchain(block.Workchain)
 	selectedDepth := uint32(rand.Int64N(int64(maxDepth) + 1))
-	if uint32(tnstate.ShardPrefixLength(block.Shard)) > selectedDepth {
-		block.Shard = shardPrefix(block.Shard, selectedDepth)
+	prefixLen, err := sharddomain.PrefixLength(block.Shard)
+	if err != nil {
+		return ton.BlockIDExt{}, err
 	}
-	return block
+	if prefixLen > selectedDepth {
+		block.Shard, err = sharddomain.Ancestor(block.Shard, selectedDepth)
+		if err != nil {
+			return ton.BlockIDExt{}, err
+		}
+	}
+	return block, nil
 }
 
 func (s *overlaySubscription) hasReadyQueryPeer(now time.Time) bool {
@@ -205,12 +225,12 @@ func (p *overlayPeer) publicRandomQueryFallbackReady(
 		nodeVersion <= nowUnix+int64(overlayFutureSkew/time.Second)
 }
 
-func (s *overlaySubscription) startQueryPeerDiscovery(ctx context.Context, target int) {
+func (s *overlaySubscription) startQueryPeerDiscovery(ctx context.Context) {
 	if s.spec.seedsFromFixedNodes() {
 		s.startSeedFromFixedNodes(ctx)
 		return
 	}
-	s.startSeedFromDHTTarget(ctx, target)
+	s.startSeedFromDHTTarget(ctx, bootstrapDiscoveryTarget)
 }
 
 func (s *overlaySubscription) probeCustomQueryPeers(ctx context.Context) {

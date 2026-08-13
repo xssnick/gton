@@ -19,7 +19,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func signalContexts(parent context.Context) (context.Context, context.Context, func()) {
+func signalContexts(parent context.Context) (context.Context, context.Context, context.CancelFunc, func()) {
 	runCtx, cancelRun := context.WithCancel(parent)
 	shutdownCtx, cancelShutdown := context.WithCancel(parent)
 	signals := make(chan os.Signal, 2)
@@ -49,6 +49,7 @@ func signalContexts(parent context.Context) (context.Context, context.Context, f
 		case <-signals:
 			cancelRun()
 		case <-runCtx.Done():
+		case <-stopped:
 			return
 		}
 
@@ -57,10 +58,11 @@ func signalContexts(parent context.Context) (context.Context, context.Context, f
 			cancelShutdown()
 			signal.Stop(signals)
 		case <-shutdownCtx.Done():
+		case <-stopped:
 		}
 	}()
 
-	return runCtx, shutdownCtx, stop
+	return runCtx, shutdownCtx, cancelRun, stop
 }
 
 type storedZeroStateReader interface {

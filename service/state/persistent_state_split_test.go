@@ -1,13 +1,23 @@
 package state
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
+	"github.com/xssnick/gton/internal/shardstate"
+	"github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func TestSplitPersistentStateRejectsZeroShard(t *testing.T) {
+	_, err := SplitPersistentState(ton.BlockIDExt{Workchain: 0}, nil, 1)
+	if !errors.Is(err, shard.ErrInvalidID) {
+		t.Fatalf("SplitPersistentState() error = %v, want ErrInvalidID", err)
+	}
+}
 
 func TestSplitPersistentStateBuildsHeaderAndAccountParts(t *testing.T) {
 	block := ton.BlockIDExt{
@@ -77,7 +87,7 @@ func TestSplitPersistentStateBuildsHeaderAndAccountParts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("extract header part %d: %v", i, err)
 		}
-		wrapped, err := WrapShardAccountsRoot(partRoot)
+		wrapped, err := shardstate.WrapAccountsRoot(partRoot)
 		if err != nil {
 			t.Fatalf("wrap header part %d: %v", i, err)
 		}

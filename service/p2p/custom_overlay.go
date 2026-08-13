@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 )
@@ -23,7 +24,7 @@ func (set twoStepPeerSet) Peers() []overlay.BroadcastPeer {
 	peers := make([]overlay.BroadcastPeer, 0, len(candidates))
 	for _, peer := range candidates {
 		if set.sub.spec.UseQUIC {
-			if peer.route.quicAddr() != "" {
+			if peer.route.QUICAddress() != "" {
 				peers = append(peers, quicRouteBroadcastPeer{
 					peer:     peer,
 					envelope: set.sub.quicEnvelope,
@@ -134,7 +135,7 @@ func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.Bro
 }
 
 func (s *overlaySubscription) startTwoStepRebroadcastWorker(ctx context.Context) {
-	if !s.spec.usesTwoStepDelivery() {
+	if !s.spec.runsTwoStepRebroadcastWorker() {
 		return
 	}
 	queue, ok := s.initTwoStepQueue()
@@ -311,5 +312,5 @@ func shardsIntersect(a CustomOverlayShard, b CustomOverlayShard) bool {
 	if a.Workchain != b.Workchain {
 		return false
 	}
-	return shardIsAncestor(a.Shard, b.Shard) || shardIsAncestor(b.Shard, a.Shard)
+	return sharddomain.Intersects(a.Shard, b.Shard)
 }

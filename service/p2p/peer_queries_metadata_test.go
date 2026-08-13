@@ -20,7 +20,7 @@ type metadataQueryBlobCalls struct {
 }
 
 type metadataQueryCountingStore struct {
-	tnstore.PeerServingStorage
+	PeerStorage
 
 	blockMetaCalls     int
 	zeroStateSizeCalls int
@@ -38,7 +38,7 @@ func (s *metadataQueryCountingStore) BlockMeta(
 		return nil, s.blockMetaErr
 	}
 
-	return s.PeerServingStorage.BlockMeta(ctx, block)
+	return s.PeerStorage.BlockMeta(ctx, block)
 }
 
 func (s *metadataQueryCountingStore) ZeroStateSize(
@@ -50,7 +50,7 @@ func (s *metadataQueryCountingStore) ZeroStateSize(
 		return 0, s.zeroStateSizeErr
 	}
 
-	return s.PeerServingStorage.ZeroStateSize(ctx, block)
+	return s.PeerStorage.ZeroStateSize(ctx, block)
 }
 
 func (s *metadataQueryCountingStore) BlockFull(
@@ -159,8 +159,8 @@ func TestPrepareQueriesPropagateMetadataErrorsWithoutReadingPayloads(t *testing.
 	for _, test := range blockCases {
 		t.Run(test.name, func(t *testing.T) {
 			store := &metadataQueryCountingStore{
-				PeerServingStorage: newTestPeerStore(),
-				blockMetaErr:       metadataFailure,
+				PeerStorage:  newTestPeerStore(),
+				blockMetaErr: metadataFailure,
 			}
 			sub := metadataQueryErrorTestSubscription(store)
 
@@ -179,8 +179,8 @@ func TestPrepareQueriesPropagateMetadataErrorsWithoutReadingPayloads(t *testing.
 
 	t.Run("prepare zerostate", func(t *testing.T) {
 		store := &metadataQueryCountingStore{
-			PeerServingStorage: newTestPeerStore(),
-			zeroStateSizeErr:   metadataFailure,
+			PeerStorage:      newTestPeerStore(),
+			zeroStateSizeErr: metadataFailure,
 		}
 		sub := metadataQueryErrorTestSubscription(store)
 
@@ -259,12 +259,12 @@ func newMetadataQueryTestSubscription(
 		tb.Fatalf("save zerostate: %v", err)
 	}
 
-	store := &metadataQueryCountingStore{PeerServingStorage: base}
+	store := &metadataQueryCountingStore{PeerStorage: base}
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      tb.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: tb.TempDir(),
 	})
 	if err != nil {
 		tb.Fatalf("create node: %v", err)
@@ -312,7 +312,7 @@ func newMetadataQueryTestSubscription(
 }
 
 func metadataQueryErrorTestSubscription(
-	store tnstore.PeerServingStorage,
+	store PeerStorage,
 ) *overlaySubscription {
 	return testOverlaySubscription(&overlaySubscription{
 		node: &Node{

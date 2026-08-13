@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -22,7 +24,7 @@ type shardDescriptionHint struct {
 	ReceivedAt  time.Time
 }
 
-func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
+func (s *SyncCoordinator) runShardDescriptionProcessor(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -34,17 +36,21 @@ func (s *Service) runShardDescriptionProcessor(ctx context.Context) {
 			if s.syncUntilFrozen() {
 				continue
 			}
-			s.rememberShardDescriptionHint(ev)
+			if !s.rememberShardDescriptionHint(ev) {
+				continue
+			}
+			s.observeShardTopBlockDescription(ctx, ev)
 		}
 	}
 }
 
-func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
+func (s *SyncCoordinator) rememberShardDescriptionHint(ev p2p.BroadcastEvent) bool {
 	if s.syncUntilFrozen() {
-		return
+		return false
 	}
-	if ev.ShardDescription == nil || ev.Block.Workchain == -1 || !ev.ShardDescription.Block.Equals(&ev.Block) {
-		return
+	if ev.ShardDescription == nil || ev.ShardDescriptionRoot == nil || ev.Block.Workchain == -1 ||
+		!ev.ShardDescription.Block.Equals(&ev.Block) {
+		return false
 	}
 
 	receivedAt := ev.ReceivedAt
@@ -52,8 +58,16 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 		receivedAt = time.Now()
 	}
 
+	description, err := cloneShardBlockDescription(ev.ShardDescription)
+	if err != nil {
+		s.log.Warn().
+			Err(err).
+			Str("block", storage.FormatBlockRef(ev.Block)).
+			Msg("failed to retain verified shard top block description")
+		return false
+	}
 	hint := shardDescriptionHint{
-		Description: cloneShardBlockDescription(ev.ShardDescription),
+		Description: description,
 		Overlay:     ev.Overlay,
 		Kind:        ev.Kind,
 		ReceivedAt:  receivedAt,
@@ -79,9 +93,27 @@ func (s *Service) rememberShardDescriptionHint(ev p2p.BroadcastEvent) {
 	s.rememberShardDescriptionProofs(hint)
 	s.signalShardDescriptionWake()
 	s.wakeCurrentStateSync()
+	return true
 }
 
-func (s *Service) rememberShardDescriptionProofs(hint shardDescriptionHint) {
+func (s *SyncCoordinator) observeShardTopBlockDescription(ctx context.Context, ev p2p.BroadcastEvent) {
+	if s.shardTopObserver == nil {
+		return
+	}
+
+	if err := s.shardTopObserver.ObserveShardTopBlockDescription(
+		ctx,
+		ev.ShardDescription,
+		ev.ShardDescriptionRoot,
+	); err != nil {
+		s.log.Warn().
+			Err(err).
+			Str("block", storage.FormatBlockRef(ev.Block)).
+			Msg("shard top block description observer failed")
+	}
+}
+
+func (s *SyncCoordinator) rememberShardDescriptionProofs(hint shardDescriptionHint) {
 	desc := hint.Description
 	proofs := make([]p2p.ShardDescriptionProof, 0, len(desc.Chain))
 	for _, link := range desc.Chain {
@@ -94,15 +126,23 @@ func (s *Service) rememberShardDescriptionProofs(hint shardDescriptionHint) {
 	s.node.RememberShardDescriptionProofs(proofs)
 }
 
-func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) p2p.ShardBlockDescription {
+func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) (p2p.ShardBlockDescription, error) {
 	cloned := p2p.ShardBlockDescription{
 		Block:            cloneServiceBlockID(desc.Block),
 		CatchainSeqno:    desc.CatchainSeqno,
 		ValidatorSetHash: desc.ValidatorSetHash,
-		Data:             desc.Data,
 		Chain:            make([]p2p.ShardDescriptionLink, 0, len(desc.Chain)),
 	}
 	for _, link := range desc.Chain {
+		fees, err := cloneShardDescriptionCurrency(link.FeesCollected)
+		if err != nil {
+			return p2p.ShardBlockDescription{}, fmt.Errorf("clone collected fees: %w", err)
+		}
+		created, err := cloneShardDescriptionCurrency(link.FundsCreated)
+		if err != nil {
+			return p2p.ShardBlockDescription{}, fmt.Errorf("clone created funds: %w", err)
+		}
+
 		var masterchainRef *ton.BlockIDExt
 		if link.MasterchainRef != nil {
 			ref := cloneServiceBlockID(*link.MasterchainRef)
@@ -112,11 +152,29 @@ func cloneShardBlockDescription(desc *p2p.ShardBlockDescription) p2p.ShardBlockD
 			Block:          cloneServiceBlockID(link.Block),
 			PrevRefs:       cloneServiceBlockIDs(link.PrevRefs),
 			MasterchainRef: masterchainRef,
+			TopBlockProof:  link.TopBlockProof,
 			ProofRoot:      link.ProofRoot,
 			ProofBOC:       link.ProofBOC,
+			GenUtime:       link.GenUtime,
+			VertSeqno:      link.VertSeqno,
+			StartLT:        link.StartLT,
+			EndLT:          link.EndLT,
+			MinRefMCSeqno:  link.MinRefMCSeqno,
+			BeforeSplit:    link.BeforeSplit,
+			AfterSplit:     link.AfterSplit,
+			AfterMerge:     link.AfterMerge,
+			WantSplit:      link.WantSplit,
+			WantMerge:      link.WantMerge,
+			CreatedBy:      link.CreatedBy,
+			FeesCollected:  fees,
+			FundsCreated:   created,
 		})
 	}
-	return cloned
+	return cloned, nil
+}
+
+func cloneShardDescriptionCurrency(value tlb.CurrencyCollection) (tlb.CurrencyCollection, error) {
+	return value.Add(tlb.CurrencyCollection{})
 }
 
 func cloneServiceBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
@@ -131,7 +189,7 @@ func cloneServiceBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
 	return cloned
 }
 
-func (s *Service) shardDescriptionHintSnapshot(now time.Time) []shardDescriptionHint {
+func (s *SyncCoordinator) shardDescriptionHintSnapshot(now time.Time) []shardDescriptionHint {
 	s.shardDescriptionMu.Lock()
 	defer s.shardDescriptionMu.Unlock()
 
@@ -150,7 +208,7 @@ func (s *Service) shardDescriptionHintSnapshot(now time.Time) []shardDescription
 	return hints
 }
 
-func (s *Service) dropShardDescriptionHint(block ton.BlockIDExt) {
+func (s *SyncCoordinator) dropShardDescriptionHint(block ton.BlockIDExt) {
 	key := storage.BlockKey(block)
 
 	s.shardDescriptionMu.Lock()
@@ -158,7 +216,7 @@ func (s *Service) dropShardDescriptionHint(block ton.BlockIDExt) {
 	s.shardDescriptionMu.Unlock()
 }
 
-func (s *Service) pruneShardDescriptionHintsLocked(now time.Time) {
+func (s *SyncCoordinator) pruneShardDescriptionHintsLocked(now time.Time) {
 	if len(s.shardDescriptionHints) == 0 {
 		s.shardDescriptionOrder = nil
 		return
@@ -192,7 +250,7 @@ func (s *Service) pruneShardDescriptionHintsLocked(now time.Time) {
 	}
 }
 
-func (s *Service) signalShardDescriptionWake() {
+func (s *SyncCoordinator) signalShardDescriptionWake() {
 	select {
 	case s.shardDescriptionWake <- struct{}{}:
 	default:

@@ -5,23 +5,20 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/storage"
 )
 
 func TestEnsurePersistentStateSerializationDiskSpacePassesWhenEnoughSpace(t *testing.T) {
 	store := &testPreviousPersistentStatePruneStore{}
-	svc := &Service{
-		storage:                            store,
-		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
-		syncDiskSpacePath:                  "/db",
-		minStateSerializationDiskFreeBytes: 30 << 30,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{
+		StorageDir:                         "/db",
+		MinStateSerializationDiskFreeBytes: 30 << 30,
+	})
 	probe := func(path string) (syncDiskSpaceStatus, error) {
 		return syncDiskSpaceStatus{Path: path, AvailableBytes: 30 << 30}, nil
 	}
 
-	if err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe); err != nil {
+	if err := state.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe); err != nil {
 		t.Fatalf("ensure disk space: %v", err)
 	}
 	if store.calls != 0 {
@@ -39,12 +36,10 @@ func TestEnsurePersistentStateSerializationDiskSpacePrunesPreviousState(t *testi
 		},
 	}
 	probes := []uint64{1 << 30, 31 << 30}
-	svc := &Service{
-		storage:                            store,
-		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
-		syncDiskSpacePath:                  "/db",
-		minStateSerializationDiskFreeBytes: 30 << 30,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{
+		StorageDir:                         "/db",
+		MinStateSerializationDiskFreeBytes: 30 << 30,
+	})
 	probe := func(path string) (syncDiskSpaceStatus, error) {
 		available := probes[0]
 		probes = probes[1:]
@@ -52,7 +47,7 @@ func TestEnsurePersistentStateSerializationDiskSpacePrunesPreviousState(t *testi
 	}
 
 	target := testBlockID(-1, topShard, 100)
-	if err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), target, probe); err != nil {
+	if err := state.ensurePersistentStateSerializationDiskSpace(context.Background(), target, probe); err != nil {
 		t.Fatalf("ensure disk space: %v", err)
 	}
 	if store.calls != 1 {
@@ -65,17 +60,15 @@ func TestEnsurePersistentStateSerializationDiskSpacePrunesPreviousState(t *testi
 
 func TestEnsurePersistentStateSerializationDiskSpaceFailsAfterPrune(t *testing.T) {
 	store := &testPreviousPersistentStatePruneStore{}
-	svc := &Service{
-		storage:                            store,
-		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
-		syncDiskSpacePath:                  "/db",
-		minStateSerializationDiskFreeBytes: 30 << 30,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{
+		StorageDir:                         "/db",
+		MinStateSerializationDiskFreeBytes: 30 << 30,
+	})
 	probe := func(path string) (syncDiskSpaceStatus, error) {
 		return syncDiskSpaceStatus{Path: path, AvailableBytes: 1 << 30}, nil
 	}
 
-	err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe)
+	err := state.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe)
 	if !errors.Is(err, errStateSerializationLowDiskSpace) {
 		t.Fatalf("ensure disk space error = %v, want low disk space", err)
 	}
@@ -86,18 +79,16 @@ func TestEnsurePersistentStateSerializationDiskSpaceFailsAfterPrune(t *testing.T
 
 func TestEnsurePersistentStateSerializationDiskSpaceKeepsAllStates(t *testing.T) {
 	store := &testPreviousPersistentStatePruneStore{}
-	svc := &Service{
-		storage:                            store,
-		stateSerializer:                    &stateSerializer{log: zerolog.Nop()},
-		persistentStateKeepRecent:          PersistentStateKeepAll,
-		syncDiskSpacePath:                  "/db",
-		minStateSerializationDiskFreeBytes: 30 << 30,
-	}
+	state := newTestStateLifecycle(store, StateLifecycleOptions{
+		StorageDir:                         "/db",
+		MinStateSerializationDiskFreeBytes: 30 << 30,
+	})
+	state.maintenance.persistentStateKeepRecent = PersistentStateKeepAll
 	probe := func(path string) (syncDiskSpaceStatus, error) {
 		return syncDiskSpaceStatus{Path: path, AvailableBytes: 1 << 30}, nil
 	}
 
-	err := svc.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe)
+	err := state.ensurePersistentStateSerializationDiskSpace(context.Background(), testBlockID(-1, topShard, 100), probe)
 	if !errors.Is(err, errStateSerializationLowDiskSpace) {
 		t.Fatalf("ensure disk space error = %v, want low disk space", err)
 	}
@@ -107,7 +98,7 @@ func TestEnsurePersistentStateSerializationDiskSpaceKeepsAllStates(t *testing.T)
 }
 
 type testPreviousPersistentStatePruneStore struct {
-	storage.Storage
+	testStorage
 	stats       storage.PersistentStatePruneStats
 	calls       int
 	beforeSeqno uint32
@@ -119,4 +110,4 @@ func (s *testPreviousPersistentStatePruneStore) PrunePreviousPersistentStateFile
 	return s.stats, nil
 }
 
-var _ storage.Storage = (*testPreviousPersistentStatePruneStore)(nil)
+var _ testStorage = (*testPreviousPersistentStatePruneStore)(nil)

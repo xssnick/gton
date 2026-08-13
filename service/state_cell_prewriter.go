@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/xssnick/gton/service/storage"
 
@@ -12,7 +11,6 @@ import (
 )
 
 const (
-	stateCellPrewriteQueueJobsLimit = 4096
 	stateCellPrewriteBatchJobsLimit = 256
 	stateCellPrewriteBatchBytes     = 128 << 20
 )
@@ -23,12 +21,6 @@ type stateCellPrewriteStore interface {
 	SaveStateCellRecords(ctx context.Context, cells storage.StateCellRecords) error
 }
 
-type stateCellPrewriteJob struct {
-	seq     uint64
-	records storage.StateCellRecords
-	bytes   uint64
-}
-
 type stateCellPrewriteBatch struct {
 	chunks  [][]storage.EncodedCellRecord
 	bytes   uint64
@@ -36,63 +28,60 @@ type stateCellPrewriteBatch struct {
 	lastSeq uint64
 }
 
-type stateCellPrewriter struct {
-	log      zerolog.Logger
-	store    stateCellPrewriteStore
-	maxBytes uint64
+func (b *stateCellPrewriteBatch) add(job prewriteJob[storage.StateCellRecords]) {
+	b.chunks = job.value.AppendChunks(b.chunks)
+	b.bytes += job.bytes
+	b.jobs++
+	b.lastSeq = job.seq
+}
 
-	startOnce sync.Once
-	mu        sync.Mutex
-	wake      chan struct{}
-	done      chan struct{}
-	jobs      []stateCellPrewriteJob
-	head      int
-	bytes     uint64
-	next      uint64
-	written   uint64
-	err       error
-	closed    bool
+// stateCellPrewriter supplies cell-record ownership and batching policy to the
+// common prewriter queue engine.
+type stateCellPrewriter struct {
+	queue *prewriter[storage.StateCellRecords]
+	store stateCellPrewriteStore
 }
 
 func newStateCellPrewriter(log zerolog.Logger, store stateCellPrewriteStore, maxBytes uint64) *stateCellPrewriter {
 	return &stateCellPrewriter{
-		log:      log,
-		store:    store,
-		maxBytes: maxBytes,
-		wake:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
+		queue: newPrewriter[storage.StateCellRecords](log, prewriterConfig{
+			closedError:   errStateCellPrewriterClosed,
+			failureLog:    "state cell prewriter failed",
+			maxQueueBytes: maxBytes,
+			maxBatchJobs:  stateCellPrewriteBatchJobsLimit,
+			maxBatchBytes: stateCellPrewriteBatchBytes,
+		}),
+		store: store,
 	}
 }
 
 func (w *stateCellPrewriter) start(ctx context.Context, writeCtx context.Context, runAsync func(func())) {
-	w.startOnce.Do(func() {
-		runAsync(func() {
-			w.run(ctx, writeCtx)
-		})
-	})
+	w.queue.start(ctx, writeCtx, runAsync, w.processNext)
 }
 
-func (w *stateCellPrewriter) run(ctx context.Context, writeCtx context.Context) {
-	for {
-		batch, ok := w.popBatch()
-		if ok {
-			w.process(writeCtx, batch)
-			continue
-		}
-
-		select {
-		case <-w.wake:
-		case <-ctx.Done():
-			for {
-				batch, ok = w.popBatch()
-				if !ok {
-					w.close(ctx.Err())
-					return
-				}
-				w.process(writeCtx, batch)
-			}
-		}
+func (w *stateCellPrewriter) processNext(ctx context.Context) bool {
+	job, ok := w.queue.popJob()
+	if !ok {
+		return false
 	}
+
+	var batch stateCellPrewriteBatch
+	batch.add(job)
+	for w.queue.batchCanAdd(batch.jobs, batch.bytes) {
+		job, ok = w.queue.popJob()
+		if !ok {
+			break
+		}
+		batch.add(job)
+	}
+
+	records := storage.NewStateCellRecordChunks(batch.chunks, batch.bytes)
+	if err := w.store.SaveStateCellRecords(ctx, records); err != nil {
+		w.queue.fail(fmt.Errorf("prewrite state cells: %w", err))
+		return true
+	}
+	w.queue.markWritten(batch.lastSeq)
+	return true
 }
 
 func (w *stateCellPrewriter) enqueue(records storage.StateCellRecords) (uint64, error) {
@@ -100,218 +89,22 @@ func (w *stateCellPrewriter) enqueue(records storage.StateCellRecords) (uint64, 
 	if err != nil {
 		return 0, err
 	}
+
 	return seq, wait()
 }
 
-// enqueueDetached assigns the sequence and appends the job under the prewriter
-// mutex without ever blocking, so callers may enqueue while holding their own
-// locks. The returned wait is the queue's backpressure (it blocks while the
-// queue is over its limits) and must always be invoked — but only after the
-// caller released any lock its appliers or dependents contend on. Each
-// producer can overshoot the queue bound by at most its own in-flight job.
+// enqueueDetached assigns the sequence and appends without blocking. The
+// returned backpressure wait must run after the caller releases its locks.
 func (w *stateCellPrewriter) enqueueDetached(records storage.StateCellRecords) (uint64, func() error, error) {
 	if records.Empty() {
 		return 0, noPrewriteBackpressure, nil
 	}
 
-	jobBytes := records.ByteSize()
-	w.mu.Lock()
-	if w.err != nil {
-		err := w.err
-		w.mu.Unlock()
-		return 0, nil, err
-	}
-	if w.closed {
-		w.mu.Unlock()
-		return 0, nil, errStateCellPrewriterClosed
-	}
-
-	w.next++
-	seq := w.next
-	w.bytes += jobBytes
-	w.jobs = append(w.jobs, stateCellPrewriteJob{
-		seq:     seq,
-		records: records,
-		bytes:   jobBytes,
-	})
-	w.signalWake()
-	w.mu.Unlock()
-	return seq, w.waitQueueRoom, nil
-}
-
-func (w *stateCellPrewriter) waitQueueRoom() error {
-	for {
-		w.mu.Lock()
-		if w.err != nil {
-			err := w.err
-			w.mu.Unlock()
-			return err
-		}
-		if w.closed {
-			w.mu.Unlock()
-			return errStateCellPrewriterClosed
-		}
-		if w.queueWithinLimitsLocked() {
-			w.mu.Unlock()
-			return nil
-		}
-
-		done := w.done
-		w.mu.Unlock()
-		<-done
-	}
-}
-
-// queueWithinLimitsLocked is the post-append counterpart of the old admission
-// gate: a single (possibly oversized) queued job never blocks its producer.
-func (w *stateCellPrewriter) queueWithinLimitsLocked() bool {
-	queuedJobs := len(w.jobs) - w.head
-	if queuedJobs <= 1 {
-		return true
-	}
-	if queuedJobs >= stateCellPrewriteQueueJobsLimit {
-		return false
-	}
-	return w.maxBytes == 0 || w.bytes <= w.maxBytes
+	return w.queue.enqueueDetached(records, records.ByteSize())
 }
 
 func noPrewriteBackpressure() error { return nil }
 
 func (w *stateCellPrewriter) wait(ctx context.Context, target uint64) error {
-	if target == 0 {
-		return nil
-	}
-
-	for {
-		w.mu.Lock()
-		if w.written >= target {
-			w.mu.Unlock()
-			return nil
-		}
-		if w.err != nil {
-			err := w.err
-			w.mu.Unlock()
-			return err
-		}
-		if w.closed {
-			w.mu.Unlock()
-			return errStateCellPrewriterClosed
-		}
-		done := w.done
-		w.mu.Unlock()
-
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (w *stateCellPrewriter) popJob() (stateCellPrewriteJob, bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.err != nil || len(w.jobs) == 0 {
-		return stateCellPrewriteJob{}, false
-	}
-
-	job := w.jobs[w.head]
-	w.jobs[w.head] = stateCellPrewriteJob{}
-	w.head++
-	w.bytes -= job.bytes
-	if w.head == len(w.jobs) {
-		w.jobs = nil
-		w.head = 0
-	} else if w.head > 1024 && w.head*2 >= len(w.jobs) {
-		copy(w.jobs, w.jobs[w.head:])
-		w.jobs = w.jobs[:len(w.jobs)-w.head]
-		w.head = 0
-	}
-	w.broadcastDone()
-	return job, true
-}
-
-func (w *stateCellPrewriter) popBatch() (stateCellPrewriteBatch, bool) {
-	job, ok := w.popJob()
-	if !ok {
-		return stateCellPrewriteBatch{}, false
-	}
-
-	var batch stateCellPrewriteBatch
-	batch.add(job)
-	for batch.canAddMore() {
-		job, ok = w.popJob()
-		if !ok {
-			break
-		}
-		batch.add(job)
-	}
-	return batch, true
-}
-
-func (b *stateCellPrewriteBatch) add(job stateCellPrewriteJob) {
-	b.chunks = job.records.AppendChunks(b.chunks)
-	b.bytes += job.bytes
-	b.jobs++
-	b.lastSeq = job.seq
-}
-
-func (b stateCellPrewriteBatch) canAddMore() bool {
-	if b.jobs >= stateCellPrewriteBatchJobsLimit {
-		return false
-	}
-	return stateCellPrewriteBatchBytes == 0 || b.bytes < stateCellPrewriteBatchBytes
-}
-
-func (w *stateCellPrewriter) process(ctx context.Context, batch stateCellPrewriteBatch) {
-	records := storage.NewStateCellRecordChunks(batch.chunks, batch.bytes)
-	if err := w.store.SaveStateCellRecords(ctx, records); err != nil {
-		w.fail(fmt.Errorf("prewrite state cells: %w", err))
-		return
-	}
-	w.markWritten(batch.lastSeq)
-}
-
-func (w *stateCellPrewriter) markWritten(seq uint64) {
-	w.mu.Lock()
-	if seq > w.written {
-		w.written = seq
-		w.broadcastDone()
-	}
-	w.mu.Unlock()
-}
-
-func (w *stateCellPrewriter) fail(err error) {
-	w.mu.Lock()
-	if w.err == nil {
-		w.err = err
-		w.log.Error().Err(err).Msg("state cell prewriter failed")
-		w.broadcastDone()
-	}
-	w.mu.Unlock()
-}
-
-func (w *stateCellPrewriter) close(err error) {
-	w.mu.Lock()
-	if !w.closed {
-		w.closed = true
-		if err != nil && !errors.Is(err, context.Canceled) {
-			w.err = err
-		}
-		w.broadcastDone()
-	}
-	w.mu.Unlock()
-}
-
-func (w *stateCellPrewriter) signalWake() {
-	select {
-	case w.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (w *stateCellPrewriter) broadcastDone() {
-	close(w.done)
-	w.done = make(chan struct{})
+	return w.queue.wait(ctx, target)
 }

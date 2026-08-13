@@ -345,6 +345,26 @@ func TestLiveBlockCacheRequiresFullBlockIDOnRead(t *testing.T) {
 	}
 }
 
+func TestSelectLiveBlockCacheSplitNextUsesLeftChild(t *testing.T) {
+	prev := ton.BlockIDExt{Workchain: 0, Shard: int64(-1 << 63), SeqNo: 10}
+	left := ton.BlockIDExt{Workchain: 0, Shard: int64(0x4000000000000000), SeqNo: 11}
+	right := ton.BlockIDExt{Workchain: 0, Shard: int64(-0x4000000000000000), SeqNo: 11}
+
+	selected, ok := selectLiveBlockCacheSplitNext(prev, right, left)
+	if !ok || selected.Shard != left.Shard {
+		t.Fatalf("selected shard = %016x, ok = %t, want left child", uint64(selected.Shard), ok)
+	}
+	selected, ok = selectLiveBlockCacheSplitNext(prev, left, right)
+	if !ok || selected.Shard != left.Shard {
+		t.Fatalf("selected shard = %016x, ok = %t, want existing left child", uint64(selected.Shard), ok)
+	}
+
+	prev.Shard = 0
+	if _, ok = selectLiveBlockCacheSplitNext(prev, left, right); ok {
+		t.Fatal("zero shard must not select a split child")
+	}
+}
+
 func testLiveBlockCacheBlockID(seqno uint32) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: 0,

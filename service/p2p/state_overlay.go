@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/logutil"
-	tnstate "github.com/xssnick/gton/service/state"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/adnl"
@@ -151,8 +151,12 @@ func (n *Node) downloadPersistentStateSnapshot(ctx context.Context, block ton.Bl
 
 func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDepth uint32) (storage.DownloadedState, error) {
 	n := d.node
+	prefixLen, err := sharddomain.PrefixLength(d.block.Shard)
+	if err != nil {
+		return nil, fmt.Errorf("invalid block shard %016x: %w", uint64(d.block.Shard), err)
+	}
 
-	if n.storage != nil && (d.block.Workchain == -1 || splitDepth <= uint32(tnstate.ShardPrefixLength(d.block.Shard))) {
+	if n.stateArtifacts != nil && (d.block.Workchain == -1 || splitDepth <= prefixLen) {
 		staged, lazyRoot, err := n.tryImportReusableStagedStateFile(ctx, d.block, d.master, 0, d.stateRootHash)
 		if err == nil {
 			if err = n.cacheImportedStagedBlockState(d.block, staged, lazyRoot, d.stateRootHash); err != nil {
@@ -191,7 +195,7 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 		Msg("trying peers for persistent state snapshot")
 
 	d.peers = peers
-	if d.block.Workchain != -1 && splitDepth > uint32(tnstate.ShardPrefixLength(d.block.Shard)) {
+	if d.block.Workchain != -1 && splitDepth > prefixLen {
 		return d.downloadSplit(ctx, splitDepth)
 	}
 
@@ -199,7 +203,7 @@ func (d persistentStateSnapshotDownloader) download(ctx context.Context, splitDe
 	if err != nil {
 		return nil, err
 	}
-	if n.storage != nil {
+	if n.stateArtifacts != nil {
 		n.log.Info().
 			Str("peer", staged.peerAddr).
 			Str("block", formatPersistentStateBlockRef(d.block, staged.effectiveShard)).
@@ -1052,7 +1056,7 @@ func (d persistentStateSnapshotDownloader) stageSplitPart(ctx context.Context, i
 
 func (d persistentStateSnapshotDownloader) importSplitPart(ctx context.Context, idx int, partsCount int, part splitStatePart, downloaded *downloadedSplitStatePart) error {
 	n := d.node
-	if n.storage == nil || downloaded.staged.lazyRoot != nil {
+	if n.stateArtifacts == nil || downloaded.staged.lazyRoot != nil {
 		return nil
 	}
 	staged := downloaded.staged

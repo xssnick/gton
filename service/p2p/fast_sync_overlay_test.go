@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p/internal/fastsync"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 )
@@ -194,9 +195,9 @@ func TestFastSyncPeerLimitIncludesCertificateSlots(t *testing.T) {
 }
 
 func TestFastSyncWarmupPromotesLearnedPeerBeforeExchange(t *testing.T) {
-	peers, remoteID := newFastSyncLearnedPeerRuntime(t)
+	membership, peers, remoteID := newFastSyncLearnedPeerRuntime(t)
 	runtime := &fastSyncOverlayRuntime{
-		membership:     peers.membership,
+		membership:     membership,
 		peers:          peers,
 		aliveRootIndex: make(map[PeerID]int),
 	}
@@ -296,9 +297,9 @@ func TestFastSyncWarmupPromotesLearnedPeerBeforeExchange(t *testing.T) {
 }
 
 func TestFastSyncRandomPeersRejectsOversizedResponseBeforeLearning(t *testing.T) {
-	peers, remoteID := newFastSyncLearnedPeerRuntime(t)
+	membership, peers, remoteID := newFastSyncLearnedPeerRuntime(t)
 	runtime := &fastSyncOverlayRuntime{
-		membership:     peers.membership,
+		membership:     membership,
 		peers:          peers,
 		aliveRootIndex: make(map[PeerID]int),
 	}
@@ -323,7 +324,7 @@ func TestFastSyncRandomPeersRejectsOversizedResponseBeforeLearning(t *testing.T)
 		}
 		nodes.Nodes = make(
 			[]overlay.NodeV2,
-			fastSyncRandomPeerResultLimit+1,
+			fastsync.RandomPeerResultLimit+1,
 		)
 		return nil
 	}
@@ -346,9 +347,9 @@ func TestFastSyncRandomPeersRejectsOversizedResponseBeforeLearning(t *testing.T)
 }
 
 func TestFastSyncQueryTimeoutCoalescesCapabilityPing(t *testing.T) {
-	peers, remoteID := newFastSyncLearnedPeerRuntime(t)
+	membership, peers, remoteID := newFastSyncLearnedPeerRuntime(t)
 	runtime := &fastSyncOverlayRuntime{
-		membership:     peers.membership,
+		membership:     membership,
 		peers:          peers,
 		aliveRootIndex: make(map[PeerID]int),
 	}
@@ -453,12 +454,16 @@ func (fastSyncLivenessQueryTransport) QueryRaw(
 
 func newFastSyncLearnedPeerRuntime(
 	t *testing.T,
-) (*fastSyncPeerRuntime, PeerID) {
+) (
+	*fastsync.Membership,
+	*fastsync.PeerRuntime,
+	PeerID,
+) {
 	t.Helper()
 
 	now := time.Now().Truncate(time.Second)
 	overlayID := peerRuntimeTestOverlayID(0xe1)
-	peers, issuerKey := peerRuntimeTestRootRuntime(t, overlayID, now)
+	membership, peers, issuerKey := peerRuntimeTestRootRuntime(t, overlayID, now)
 	remoteKey := peerRuntimeTestKey(0xe2)
 	remoteID := peerRuntimeTestPeerID(
 		remoteKey.Public().(ed25519.PublicKey),
@@ -482,7 +487,7 @@ func newFastSyncLearnedPeerRuntime(
 	if _, err := peers.EnrollNode(node, now); err != nil {
 		t.Fatalf("enroll learned FastSync peer: %v", err)
 	}
-	return peers, remoteID
+	return membership, peers, remoteID
 }
 
 func TestSetFastSyncOverlaysRotatesCertificateInPlace(t *testing.T) {
@@ -506,7 +511,6 @@ func TestSetFastSyncOverlaysRotatesCertificateInPlace(t *testing.T) {
 		issuer,
 		node.localID,
 		0,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
 	node.fastSyncCertificates = []overlay.MemberCertificate{first}
@@ -526,7 +530,6 @@ func TestSetFastSyncOverlaysRotatesCertificateInPlace(t *testing.T) {
 		issuer,
 		node.localID,
 		1,
-		0,
 		int32(now.Add(2*time.Hour).Unix()),
 	)
 	node.fastSyncCertificates = []overlay.MemberCertificate{second}

@@ -104,7 +104,7 @@ func (d nextBlockBootstrapProbeDecision) rawBroadcastBeyondNext() bool {
 	return d.rawBroadcastAhead && d.rawBroadcastSeqno > d.prevSeqno+1
 }
 
-func (s *Service) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (nextBlockBootstrapProbeDecision, <-chan struct{}, error) {
+func (s *SyncCoordinator) nextBlockBootstrapProbeDecision(prev ton.BlockIDExt, prevUTime int64, state nextBlockBootstrapProbeState) (nextBlockBootstrapProbeDecision, <-chan struct{}, error) {
 	decision := nextBlockBootstrapProbeDecision{
 		peerLimit:         nextBlockBootstrapProbePeers,
 		consecutiveMisses: state.consecutiveMisses,
@@ -226,8 +226,8 @@ func nextBlockBootstrapLiveTail(blockUTime int64, nowUnix int64) bool {
 	return blockUTime != 0 && nowUnix-blockUTime <= nextBlockBootstrapLiveLagSeconds
 }
 
-func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
-	s.observeBroadcastFlushedCurrentState(current)
+func (s *SyncCoordinator) publishCommittedCurrentState(current *storage.CurrentState) {
+	s.broadcastAdmission.ObserveFlushedCurrentState(current)
 	s.rememberAppliedMasterchainState(&current.Masterchain)
 	s.rememberAppliedShardHeads(current.Shards)
 	snapshot := s.publishLiveCurrentStateChanged(current)
@@ -238,25 +238,20 @@ func (s *Service) publishCommittedCurrentState(current *storage.CurrentState) {
 		s.liveState.SetLiveCurrentStateSnapshot(snapshot)
 		s.liveState.MarkLiveCurrentStateFlushed(current)
 	}
-	s.wakeServiceMaintenance()
+	s.maintenance.wake()
 }
 
 // publishLiveCurrentStateChanged clones current once, publishes the clone as
 // the node-wide current status and returns it so callers can reuse it as an
 // immutable snapshot (e.g. hand it to the live view without a second clone).
 // Returns nil when current is behind the already-published status.
-func (s *Service) publishLiveCurrentStateChanged(current *storage.CurrentState) *storage.CurrentState {
-	next := storage.CloneCurrentState(current)
-
-	s.currentStatusMu.Lock()
-	if currentStateBehind(next, s.currentStatus) {
-		s.currentStatusMu.Unlock()
+func (s *SyncCoordinator) publishLiveCurrentStateChanged(current *storage.CurrentState) *storage.CurrentState {
+	next := s.status.publishCurrentState(current)
+	if next == nil {
 		return nil
 	}
-	s.currentStatus = next
-	s.currentStatusMu.Unlock()
 
-	s.observeBroadcastLiveCurrentState(next)
+	s.broadcastAdmission.ObserveLiveCurrentState(next)
 
 	s.node.NotifyCompressedBlockStateReady(currentStateCompressedBlockStateRefs(next)...)
 	return next
@@ -275,7 +270,7 @@ func currentStateCompressedBlockStateRefs(current *storage.CurrentState) []ton.B
 // rememberAppliedShardHeads publishes the applied top block of every followed
 // shard to classify, which drops broadcasts at or below them before parsing a
 // proof, checking signatures or decoding a payload.
-func (s *Service) rememberAppliedShardHeads(shards map[storage.ShardKey]storage.BlockState) {
+func (s *SyncCoordinator) rememberAppliedShardHeads(shards map[storage.ShardKey]storage.BlockState) {
 	if len(shards) == 0 {
 		return
 	}
@@ -287,47 +282,12 @@ func (s *Service) rememberAppliedShardHeads(shards map[storage.ShardKey]storage.
 	s.node.NoteAppliedShardHeads(heads)
 }
 
-func (s *Service) rememberAppliedMasterchainState(state *storage.BlockState) {
+func (s *SyncCoordinator) rememberAppliedMasterchainState(state *storage.BlockState) {
 	if state.Block.Workchain != -1 || state.Block.Shard != topShard {
 		return
 	}
 	s.node.NoteAppliedMasterchainSeqno(state.Block.SeqNo)
-
-	next := storage.CloneBlockState(state)
-
-	s.currentStatusMu.Lock()
-	if s.appliedMasterchainStatus != nil && s.appliedMasterchainStatus.Block.SeqNo >= next.Block.SeqNo {
-		s.currentStatusMu.Unlock()
-		return
-	}
-	s.appliedMasterchainStatus = next
-	s.currentStatusMu.Unlock()
-}
-
-func (s *Service) appliedMasterchainStatusSnapshot() *storage.BlockState {
-	s.currentStatusMu.RLock()
-	state := storage.CloneBlockState(s.appliedMasterchainStatus)
-	s.currentStatusMu.RUnlock()
-	return state
-}
-
-func currentStateBehind(next *storage.CurrentState, current *storage.CurrentState) bool {
-	if current == nil {
-		return false
-	}
-
-	nextShardClientSeqno := next.ShardClientSeqno
-	if nextShardClientSeqno == 0 {
-		nextShardClientSeqno = next.Masterchain.Block.SeqNo
-	}
-	currentShardClientSeqno := current.ShardClientSeqno
-	if currentShardClientSeqno == 0 {
-		currentShardClientSeqno = current.Masterchain.Block.SeqNo
-	}
-	if nextShardClientSeqno != currentShardClientSeqno {
-		return nextShardClientSeqno < currentShardClientSeqno
-	}
-	return next.Masterchain.Block.SeqNo < current.Masterchain.Block.SeqNo
+	s.status.rememberAppliedMasterchain(state)
 }
 
 type masterchainApplyTiming struct {
@@ -337,7 +297,7 @@ type masterchainApplyTiming struct {
 	stateUpdate time.Duration
 }
 
-func (s *Service) applyMasterchainTransition(ctx context.Context, current *storage.BlockState, block PreparedBlock, checked *checkedMasterchainConsensus, applier stateUpdateApplier, hook *blockApplyHookMeta) (*storage.BlockState, masterchainApplyTiming, error) {
+func (s *SyncCoordinator) applyMasterchainTransition(ctx context.Context, current *storage.BlockState, block PreparedBlock, checked *checkedMasterchainConsensus, applier stateUpdateApplier, observerMeta *blockAppliedObserverMeta) (*storage.BlockState, masterchainApplyTiming, error) {
 	started := time.Now()
 	var timing masterchainApplyTiming
 	finish := func() masterchainApplyTiming {
@@ -366,7 +326,7 @@ func (s *Service) applyMasterchainTransition(ctx context.Context, current *stora
 	}
 
 	stageStarted := time.Now()
-	next, err := s.applyBlockWithHooks(ctx, []*storage.BlockState{current}, block, applier, hook)
+	next, err := s.applyBlockAndObserve(ctx, []*storage.BlockState{current}, block, applier, observerMeta)
 	timing.stateUpdate += time.Since(stageStarted)
 	if err != nil {
 		return nil, finish(), fmt.Errorf("apply masterchain block %s: %w", block.BlockRef(), err)
@@ -375,33 +335,28 @@ func (s *Service) applyMasterchainTransition(ctx context.Context, current *stora
 	return next, finish(), nil
 }
 
-// beginNextBlockCheckpointLocked validates persist availability and prepares
-// the checkpoint. Called with currentStatePersistMu held; on error the mutex
-// is released before returning.
-func (s *Service) beginNextBlockCheckpointLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64) (stateCheckpointData, error) {
-	if err := s.checkCurrentStatePersistAllowed(); err != nil {
-		s.currentStatePersistMu.Unlock()
-		return stateCheckpointData{}, err
-	}
+// beginNextBlockCheckpointLocked prepares a checkpoint after StateLifecycle
+// granted the caller exclusive persistence ownership.
+func (s *SyncCoordinator) beginNextBlockCheckpointLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64) stateCheckpointData {
 	checkpoint := prepareStateCheckpoint(current, entries, cells)
 	checkpoint.artifactPrewriteTarget = artifactPrewriteTarget
 	timing.checkpoints++
-	return checkpoint, nil
+	return checkpoint
 }
 
 // saveNextBlockCheckpointLocked runs the checkpoint save and is the single
 // owner of releasing currentStatePersistMu: it unlocks exactly once on every
 // path. onError runs before the unlock on the failure path so persist errors
 // become visible to the next flush before the mutex is released.
-func (s *Service) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint stateCheckpointData, cells *stateCellCheckpointCache, onCommitted func(), onError func(error)) (*storage.CurrentState, []SyncPersistStageObservation, time.Duration, error) {
+func (s *SyncCoordinator) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint stateCheckpointData, cells *stateCellCheckpointCache, onCommitted func(), onError func(error)) (*storage.CurrentState, []SyncPersistStageObservation, time.Duration, error) {
 	started := time.Now()
-	committed, stages, err := s.saveStateCheckpoint(ctx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget, checkpoint.artifactPrewriteTarget)
+	committed, stages, err := s.state.saveStateCheckpoint(ctx, checkpoint.persisted, checkpoint.entries, checkpoint.cells, checkpoint.cellPrewriteTarget, checkpoint.artifactPrewriteTarget)
 	elapsed := time.Since(started)
 	if err != nil {
 		if onError != nil {
 			onError(err)
 		}
-		s.currentStatePersistMu.Unlock()
+		s.state.finishCurrentStatePersist()
 		return nil, stages, elapsed, err
 	}
 
@@ -409,15 +364,12 @@ func (s *Service) saveNextBlockCheckpointLocked(ctx context.Context, checkpoint 
 		onCommitted()
 	}
 	cells.complete()
-	s.currentStatePersistMu.Unlock()
+	s.state.finishCurrentStatePersist()
 	return committed, stages, elapsed, nil
 }
 
-func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) (*storage.CurrentState, error) {
-	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
-	if err != nil {
-		return nil, err
-	}
+func (s *SyncCoordinator) persistNextBlockCurrentStateLocked(current *storage.CurrentState, timing *catchUpTiming, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration, queuedAt time.Time) *storage.CurrentState {
+	checkpoint := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
 	master := current.Masterchain.Block
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
@@ -438,7 +390,7 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 		var wrapped error
 		committed, stages, elapsed, err := s.saveNextBlockCheckpointLocked(persistCtx, checkpoint, cells, onCommitted, func(saveErr error) {
 			wrapped = fmt.Errorf("persist next-block current state %s: %w", storage.FormatBlockRef(master), saveErr)
-			s.setCurrentStatePersistError(wrapped)
+			s.state.setCurrentStatePersistError(wrapped)
 		})
 		if err != nil {
 			s.observeSyncPersist(SyncPersistObservation{
@@ -479,14 +431,11 @@ func (s *Service) persistNextBlockCurrentStateLocked(current *storage.CurrentSta
 		s.markLiveCheckpointStatesFlushed(checkpoint.entries)
 	})
 
-	return checkpoint.live, nil
+	return checkpoint.live
 }
 
-func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
-	checkpoint, err := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
-	if err != nil {
-		return nil, err
-	}
+func (s *SyncCoordinator) persistNextBlockCurrentStateSyncLocked(current *storage.CurrentState, timing *catchUpTiming, reason string, entries []storage.StateCheckpointBlock, cells *stateCellCheckpointCache, artifactPrewriteTarget uint64, onCommitted func(), onDone func(), lockElapsed time.Duration) (*storage.CurrentState, error) {
+	checkpoint := s.beginNextBlockCheckpointLocked(current, timing, entries, cells, artifactPrewriteTarget)
 	master := current.Masterchain.Block
 	shardClientSeqno := current.ShardClientSeqno
 	shards := len(current.Shards)
@@ -529,7 +478,7 @@ func (s *Service) persistNextBlockCurrentStateSyncLocked(current *storage.Curren
 	return checkpoint.live, nil
 }
 
-func (s *Service) markLiveCheckpointStatesFlushed(entries []storage.StateCheckpointBlock) {
+func (s *SyncCoordinator) markLiveCheckpointStatesFlushed(entries []storage.StateCheckpointBlock) {
 	if len(entries) == 0 {
 		return
 	}
@@ -559,7 +508,7 @@ func (s *Service) markLiveCheckpointStatesFlushed(entries []storage.StateCheckpo
 	}
 }
 
-func (s *Service) setCurrentStatePersistError(err error) {
+func (s *StateLifecycle) setCurrentStatePersistError(err error) {
 	s.currentStatePersistErrMu.Lock()
 	if s.currentStatePersistErr == nil {
 		s.currentStatePersistErr = err
@@ -567,7 +516,7 @@ func (s *Service) setCurrentStatePersistError(err error) {
 	s.currentStatePersistErrMu.Unlock()
 }
 
-func (s *Service) takeCurrentStatePersistError() error {
+func (s *StateLifecycle) takeCurrentStatePersistError() error {
 	s.currentStatePersistErrMu.Lock()
 	defer s.currentStatePersistErrMu.Unlock()
 
@@ -576,13 +525,12 @@ func (s *Service) takeCurrentStatePersistError() error {
 	return err
 }
 
-func (s *Service) waitCurrentStatePersist(ctx context.Context) error {
+func (s *StateLifecycle) waitCurrentStatePersist(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		if s.currentStatePersistMu.TryLock() {
-			s.currentStatePersistMu.Unlock()
+		if s.currentStatePersistFinished() {
 			return s.takeCurrentStatePersistError()
 		}
 
@@ -594,7 +542,15 @@ func (s *Service) waitCurrentStatePersist(ctx context.Context) error {
 	}
 }
 
-func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, error) {
+func (s *StateLifecycle) currentStatePersistFinished() bool {
+	if !s.currentStatePersistMu.TryLock() {
+		return false
+	}
+	s.currentStatePersistMu.Unlock()
+	return true
+}
+
+func (s *SyncCoordinator) waitCurrentStatePersistOrWake(ctx context.Context) (bool, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -604,18 +560,16 @@ func (s *Service) waitCurrentStatePersistOrWake(ctx context.Context) (bool, erro
 		// the wait — the wake is the only thing that reports "woken" rather
 		// than "the persist finished".
 		wake := s.currentStateWakeChan()
-		if s.currentStatePersistMu.TryLock() {
-			s.currentStatePersistMu.Unlock()
-			return false, s.takeCurrentStatePersistError()
+		if s.state.currentStatePersistFinished() {
+			return false, s.state.takeCurrentStatePersistError()
 		}
 
 		select {
 		case <-ctx.Done():
 			return false, ctx.Err()
 		case <-wake:
-			if s.currentStatePersistMu.TryLock() {
-				s.currentStatePersistMu.Unlock()
-				if err := s.takeCurrentStatePersistError(); err != nil {
+			if s.state.currentStatePersistFinished() {
+				if err := s.state.takeCurrentStatePersistError(); err != nil {
 					return false, err
 				}
 			}
@@ -662,7 +616,7 @@ func nextMasterchainProbeHoldDelay(decision *nextBlockBootstrapProbeDecision, st
 // broadcast for the next block arriving mid-hold extends the park once by the
 // decode grace; a raw broadcast beyond the next block ends the hold so the
 // fallback probe can catch up by download.
-func (s *Service) holdNextMasterchainProbe(ctx context.Context, prev, target ton.BlockIDExt, state *nextBlockBootstrapProbeState, hold time.Duration) (cachedMasterchainBlockForApply, error) {
+func (s *SyncCoordinator) holdNextMasterchainProbe(ctx context.Context, prev, target ton.BlockIDExt, state *nextBlockBootstrapProbeState, hold time.Duration) (cachedMasterchainBlockForApply, error) {
 	deadline := time.Now().Add(hold)
 	timer := time.NewTimer(hold)
 	defer timer.Stop()
@@ -735,8 +689,8 @@ func (s *Service) holdNextMasterchainProbe(ctx context.Context, prev, target ton
 	}
 }
 
-func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state *nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
-	target := masterchainSeqnoTarget(^uint32(0))
+func (s *SyncCoordinator) downloadNextChainBlockProbe(ctx context.Context, prev ton.BlockIDExt, prevUTime int64, state *nextBlockBootstrapProbeState) (PreparedBlock, SyncBlockSource, time.Duration, error) {
+	target := masterchainCatchUpTarget()
 
 	cached, err := s.takeCachedMasterchainBlockForApply(ctx, prev, target)
 	if err == nil {
@@ -824,7 +778,7 @@ func (s *Service) downloadNextChainBlockProbe(ctx context.Context, prev ton.Bloc
 	return prepared, source, prepareElapsed, nil
 }
 
-func (s *Service) waitNextMasterchainApplyCandidate(
+func (s *SyncCoordinator) waitNextMasterchainApplyCandidate(
 	ctx context.Context,
 	queryCtx context.Context,
 	prev, target ton.BlockIDExt,
@@ -914,7 +868,7 @@ type nextBlockProbeResult struct {
 	err            error
 }
 
-func (s *Service) prepareNextBlockProbeResult(ctx context.Context, prev ton.BlockIDExt, downloaded *p2p.DownloadedBlock, err error) nextBlockProbeResult {
+func (s *SyncCoordinator) prepareNextBlockProbeResult(ctx context.Context, prev ton.BlockIDExt, downloaded *p2p.DownloadedBlock, err error) nextBlockProbeResult {
 	if err != nil {
 		return nextBlockProbeResult{err: fmt.Errorf("probe next block after %s: %w", storage.FormatBlockRef(prev), err)}
 	}
@@ -965,7 +919,7 @@ func downloadedBlockTimeLag(downloaded PreparedBlock, now time.Time) (uint32, in
 	return downloaded.Meta.GenUTime, now.Unix() - int64(downloaded.Meta.GenUTime)
 }
 
-func (s *Service) downloadNextChainBlock(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+func (s *SyncCoordinator) downloadNextChainBlock(ctx context.Context, prev ton.BlockIDExt) (p2p.DownloadedBlock, error) {
 	return s.downloadChainBlockWithRetry(ctx, func() string {
 		return "download next block after " + storage.FormatBlockRef(prev)
 	}, func(ctx context.Context) (*p2p.DownloadedBlock, error) {
@@ -975,7 +929,7 @@ func (s *Service) downloadNextChainBlock(ctx context.Context, prev ton.BlockIDEx
 
 // downloadChainBlockWithRetry takes the label lazily: it is only read when
 // every attempt failed.
-func (s *Service) downloadChainBlockWithRetry(ctx context.Context, label func() string, download func(context.Context) (*p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
+func (s *SyncCoordinator) downloadChainBlockWithRetry(ctx context.Context, label func() string, download func(context.Context) (*p2p.DownloadedBlock, error)) (p2p.DownloadedBlock, error) {
 	var lastErr error
 	for attempt := 1; attempt <= chainBlockDownloadRetries; attempt++ {
 		downloaded, err := download(ctx)

@@ -19,7 +19,7 @@ func TestSetActiveShardOverlaysDefersLeasedSubscriptionDeactivation(t *testing.T
 	if err := node.SetActiveShardOverlays([]ton.BlockIDExt{{Workchain: 0, Shard: leftShard}}); err != nil {
 		t.Fatalf("set active left overlay: %v", err)
 	}
-	leftSub := testSubscriptionForOverlay(t, node, 0, leftShard)
+	leftSub := testSubscriptionForBasechainOverlay(t, node, leftShard)
 	release, err := leftSub.beginArchiveUse()
 	if err != nil {
 		t.Fatalf("begin archive use: %v", err)

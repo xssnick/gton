@@ -3,6 +3,7 @@ package hooks
 import (
 	"context"
 
+	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -13,9 +14,16 @@ import (
 // Extension methods may be called concurrently because shard blocks are applied in
 // parallel. Implementations must be thread-safe.
 type Extension interface {
-	// Start runs after the node services are started.
+	// Start runs after the P2P node is ready and before the sync coordinator is
+	// started. Its context is the extension runtime lifetime and is canceled
+	// before network teardown, so network-dependent background work must stop
+	// on ctx.Done rather than wait for Close. Factories must still initialize
+	// event-handler state eagerly.
 	Start(context.Context) error
-	// Close stops the extension and waits until it exits or the context is done.
+	// Close releases everything created by the factory and waits until it exits
+	// or the context is done. It may be called before Start or after Start
+	// returns an error. After an error the owner may retry Close; successful
+	// cleanup must be idempotent and must not be repeated by the implementation.
 	Close(context.Context) error
 	// OnBlockApplied runs after a block is applied and before that block flow
 	// can continue to checkpoint/persist. Returning an error retries only this
@@ -29,6 +37,15 @@ type Extension interface {
 	// or archive imports.
 	// Returning an error only logs it and does not affect block processing.
 	OnBlockReceived(context.Context, BlockReceivedEvent) error
+}
+
+// ShardTopBlockDescriptionObserver is an optional extension capability. It is
+// called only after the node has decoded the exact TopBlockDescr cell and
+// verified its proof chain, current masterchain topology and ancestry,
+// validator set and signatures. Both values are borrowed and must be treated
+// as immutable.
+type ShardTopBlockDescriptionObserver interface {
+	OnShardTopBlockDescription(context.Context, *p2p.ShardBlockDescription, *cell.Cell) error
 }
 
 // ExtensionFactory initializes an extension from node capabilities.

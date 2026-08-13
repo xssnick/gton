@@ -360,7 +360,7 @@ func TestPrepareReachableStateCellsUsesExactRecordBacking(t *testing.T) {
 }
 
 func TestPrepareStateUpdateCellsArenaGrowthPreservesRecords(t *testing.T) {
-	root, cells := benchmarkCellGraph(t, 512, 4)
+	root, cells := benchmarkCellGraph(t, 512)
 	update, err := cell.BeginCell().
 		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
 		MustStoreSlice(root.Hash(0), 256).
@@ -406,6 +406,11 @@ func TestPrepareStateUpdateCellsArenaGrowthPreservesRecords(t *testing.T) {
 	}
 }
 
+type storagePreparedCellRecordTest struct {
+	name string
+	root *cell.Cell
+}
+
 func TestPrepareReachableStateUpdateCellsMatchesMetadataEncoder(t *testing.T) {
 	leaf := cell.BeginCell().MustStoreUInt(0xBEEF, 16).EndCell()
 	shared := cell.BeginCell().MustStoreUInt(0xA7, 8).MustStoreRef(leaf).EndCell()
@@ -431,10 +436,7 @@ func TestPrepareReachableStateUpdateCellsMatchesMetadataEncoder(t *testing.T) {
 		t.Fatal("virtualized Merkle cases must have a non-zero level")
 	}
 
-	tests := []struct {
-		name string
-		root *cell.Cell
-	}{
+	tests := []storagePreparedCellRecordTest{
 		{
 			name: "ordinary shared graph",
 			root: root,
@@ -623,6 +625,49 @@ func TestPrepareReachableStateUpdateCellsUsesCppPrunedBoundaryRule(t *testing.T)
 	}
 }
 
+func TestCellRecordCodecMatchesPreparedEncodedRecord(t *testing.T) {
+	leaf := cell.BeginCell().MustStoreUInt(0xaa, 8).EndCell()
+	ordinary := cell.BeginCell().MustStoreUInt(0xbb, 8).MustStoreRef(leaf).EndCell()
+	pruned := mustStoragePrunedBranchAtLevel(t, ordinary, 2)
+	update := mustStorageMerkleUpdateBody(t, pruned, ordinary)
+
+	tests := []storagePreparedCellRecordTest{
+		{name: "ordinary", root: ordinary},
+		{name: "pruned", root: pruned},
+		{name: "merkle-update", root: update},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := tt.root.GetMetadata()
+			record, err := CellRecordFromCellMetadata(tt.root, meta)
+			if err != nil {
+				t.Fatalf("cell record from metadata: %v", err)
+			}
+
+			encoded, err := PrepareEncodedCellRecordFromCellMetadata(tt.root, meta)
+			if err != nil {
+				t.Fatalf("prepare encoded record: %v", err)
+			}
+
+			if got := EncodeCellRecord(record); !bytes.Equal(got, encoded.Data) {
+				t.Fatalf("encoded bytes mismatch:\ngot:  %x\nwant: %x", got, encoded.Data)
+			}
+
+			appended := append([]byte{0xff}, EncodeCellRecord(record)...)
+			if !bytes.Equal(appended[1:], encoded.Data) {
+				t.Fatalf("appended encoded bytes mismatch:\ngot:  %x\nwant: %x", appended[1:], encoded.Data)
+			}
+
+			decoded, err := DecodeCellRecord(record.Hash, encoded.Data)
+			if err != nil {
+				t.Fatalf("decode encoded record: %v", err)
+			}
+			assertCellRecordEqual(t, decoded, record)
+		})
+	}
+}
+
 func assertLargeBOCMetaMatchesCellMetadataFromEncoded(tb testing.TB, hash []byte, data []byte, want cell.Metadata) {
 	tb.Helper()
 
@@ -650,6 +695,37 @@ func assertLargeBOCMetaMatchesCellMetadata(tb testing.TB, got cell.LargeBOCMetaR
 		}
 		if got.Depths[i] != want.Depths[i] {
 			tb.Fatalf("large boc depth %d mismatch: got=%d want=%d", i, got.Depths[i], want.Depths[i])
+		}
+	}
+}
+
+func assertCellRecordEqual(tb testing.TB, got *CellRecord, want *CellRecord) {
+	tb.Helper()
+
+	if !bytes.Equal(got.Hash, want.Hash) {
+		tb.Fatalf("record hash mismatch:\ngot:  %x\nwant: %x", got.Hash, want.Hash)
+	}
+	if got.D1 != want.D1 {
+		tb.Fatalf("record d1 mismatch: got=%d want=%d", got.D1, want.D1)
+	}
+	if got.D2 != want.D2 {
+		tb.Fatalf("record d2 mismatch: got=%d want=%d", got.D2, want.D2)
+	}
+	if !bytes.Equal(got.Data, want.Data) {
+		tb.Fatalf("record data mismatch:\ngot:  %x\nwant: %x", got.Data, want.Data)
+	}
+	if len(got.Refs) != len(want.Refs) {
+		tb.Fatalf("record refs count mismatch: got=%d want=%d", len(got.Refs), len(want.Refs))
+	}
+	for i := range want.Refs {
+		if got.Refs[i].LevelMask != want.Refs[i].LevelMask {
+			tb.Fatalf("record ref %d level mask mismatch: got=%d want=%d", i, got.Refs[i].LevelMask, want.Refs[i].LevelMask)
+		}
+		if !bytes.Equal(got.Refs[i].Hashes, want.Refs[i].Hashes) {
+			tb.Fatalf("record ref %d hashes mismatch:\ngot:  %x\nwant: %x", i, got.Refs[i].Hashes, want.Refs[i].Hashes)
+		}
+		if !bytes.Equal(got.Refs[i].Depths, want.Refs[i].Depths) {
+			tb.Fatalf("record ref %d depths mismatch:\ngot:  %x\nwant: %x", i, got.Refs[i].Depths, want.Refs[i].Depths)
 		}
 	}
 }

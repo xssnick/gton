@@ -15,6 +15,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 var externalMessageCRC64Table = crc64.MakeTable(crc64.ECMA)
@@ -72,6 +73,8 @@ type rebroadcastRequest struct {
 	fec                    *overlay.BroadcastFECSender
 	sourcePeerID           PeerID
 	local                  bool
+	forceLegacyFEC         bool
+	certificate            any
 	skipOverlayRebroadcast bool
 	queuedAt               time.Time
 }
@@ -273,10 +276,7 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		}
 
 		validateStarted := s.node.startBroadcastPipelineStage()
-		desc, err := s.node.validateShardDescriptionBroadcast(data.Block.ID, data.Block.CCSeqno, data.Block.Data)
-		if err == nil && desc == nil {
-			err = errors.New("validated shard block description is empty")
-		}
+		validated, err := s.node.validateShardDescriptionBroadcast(data.Block.ID, data.Block.CCSeqno, data.Block.Data)
 		validateResult := broadcastPipelineResultSuccess
 		if err != nil {
 			validateResult = broadcastPipelineResultError
@@ -290,7 +290,15 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			s.node.deduper.Forget(fingerprint)
 			return broadcastResult{}, err
 		}
-		accepted := s.acceptedShardBlockBroadcast(fingerprint, delivery, trusted, data.Block.ID, sourcePeerID, desc)
+		accepted := s.acceptedShardBlockBroadcast(
+			fingerprint,
+			delivery,
+			trusted,
+			data.Block.ID,
+			sourcePeerID,
+			validated.description,
+			validated.root,
+		)
 		accepted.deduped = true
 		accepted.rebroadcast = rebroadcast
 		return acceptedBroadcastResult(accepted), nil
@@ -667,9 +675,18 @@ func (s *overlaySubscription) acceptedProcessedBlockBroadcast(
 	}), nil
 }
 
-func (s *overlaySubscription) acceptedShardBlockBroadcast(fingerprint string, delivery Delivery, trusted bool, block ton.BlockIDExt, sourcePeerID PeerID, desc *ShardBlockDescription) acceptedBroadcast {
+func (s *overlaySubscription) acceptedShardBlockBroadcast(
+	fingerprint string,
+	delivery Delivery,
+	trusted bool,
+	block ton.BlockIDExt,
+	sourcePeerID PeerID,
+	desc *ShardBlockDescription,
+	root *cell.Cell,
+) acceptedBroadcast {
 	accepted := s.acceptedBlockBroadcast(fingerprint, delivery, trusted, "tonNode.newShardBlockBroadcast", block, sourcePeerID)
 	accepted.event.ShardDescription = desc
+	accepted.event.ShardDescriptionRoot = root
 	return accepted
 }
 
@@ -1093,7 +1110,12 @@ func (n *Node) acceptBroadcast(accepted acceptedBroadcast) {
 		}
 	}
 
-	n.enqueueBlockOverlayFanout(accepted)
+	if err := n.enqueueBlockOverlayFanout(accepted); err != nil {
+		n.log.Warn().
+			Err(err).
+			Str("block", storage.FormatBlockRef(*accepted.block)).
+			Msg("dropping block overlay fanout with invalid shard")
+	}
 	// A rejected application event remains retryable through another delivery, so
 	// only a successfully queued event may release the reusable decoded payload.
 	// An event-free accept (the candidate path, which carries only extraEvents)
@@ -1141,20 +1163,23 @@ func (n *Node) acceptBroadcastEvent(event BroadcastEvent, skipAcceptedMetric boo
 	return true
 }
 
-func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) {
+func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) error {
 	if accepted.rebroadcast == nil || accepted.block == nil {
-		return
+		return nil
 	}
 
 	class, ok := blockOverlayFanoutClass(accepted.rebroadcast.kind)
 	if !ok {
-		return
+		return nil
 	}
 
 	customTargets := n.customOverlayFanoutTargets(accepted)
-	fastSyncTarget := n.fastSyncFanoutTarget(accepted)
+	fastSyncTarget, err := n.fastSyncFanoutTarget(accepted)
+	if err != nil {
+		return err
+	}
 	if len(customTargets) == 0 && fastSyncTarget == nil {
-		return
+		return nil
 	}
 
 	source := *accepted.rebroadcast
@@ -1163,36 +1188,65 @@ func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) {
 			Err(err).
 			Str("kind", source.kind).
 			Msg("dropping overlay fanout because payload cannot be serialized")
-		return
+		return nil
 	}
 	if len(source.payload) == 0 {
-		return
+		return nil
 	}
 
-	key := blockOverlayFanoutKey(class, *accepted.block)
-	if !n.overlayFanoutDeduper.Mark(key, time.Now()) {
-		return
+	now := time.Now()
+	if class == "finality" {
+		if !n.overlayFanoutDeduper.Mark(
+			blockOverlayFanoutKey(class, *accepted.block),
+			now,
+		) {
+			return nil
+		}
+
+		n.enqueueCustomOverlayFanout(customTargets, source)
+		if fastSyncTarget != nil {
+			n.sendFastSyncFanout(
+				fastSyncTarget,
+				source.kind,
+				source.payload,
+				*accepted.block,
+			)
+		}
+		return nil
 	}
 
-	for _, sub := range customTargets {
-		req := rebroadcastRequest{
-			subscription: sub,
-			kind:         source.kind,
-			payload:      source.payload,
-			local:        true,
-		}
-		if req.payloadLen() == 0 {
-			continue
-		}
-		sub.enqueueRebroadcast(req)
+	if len(customTargets) > 0 && n.overlayFanoutDeduper.Mark(
+		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, class, *accepted.block),
+		now,
+	) {
+		n.enqueueCustomOverlayFanout(customTargets, source)
 	}
-	if fastSyncTarget != nil {
+	if fastSyncTarget != nil && n.overlayFanoutDeduper.Mark(
+		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, class, *accepted.block),
+		now,
+	) {
 		n.sendFastSyncFanout(
 			fastSyncTarget,
 			source.kind,
 			source.payload,
 			*accepted.block,
 		)
+	}
+	return nil
+}
+
+func (n *Node) enqueueCustomOverlayFanout(
+	targets []*overlaySubscription,
+	source rebroadcastRequest,
+) {
+	for _, sub := range targets {
+		req := rebroadcastRequest{
+			subscription: sub,
+			kind:         source.kind,
+			payload:      source.payload,
+			local:        true,
+		}
+		sub.enqueueRebroadcast(req)
 	}
 }
 
@@ -1226,23 +1280,27 @@ func (n *Node) customOverlayFanoutTargets(accepted acceptedBroadcast) []*overlay
 // instead of re-emitting observed ones, which the FastSync relay already carries.
 func (n *Node) fastSyncFanoutTarget(
 	accepted acceptedBroadcast,
-) *overlaySubscription {
+) (*overlaySubscription, error) {
 	var sub *overlaySubscription
+	var err error
 	if accepted.rebroadcast.kind == "tonNode.newShardBlockBroadcast" {
-		sub = n.fastSyncSubscriptionForBlock(ton.BlockIDExt{
+		sub, err = n.fastSyncSubscriptionForBlock(ton.BlockIDExt{
 			Workchain: -1,
 			Shard:     topShard,
 		})
 	} else {
-		sub = n.fastSyncSubscriptionForBlock(*accepted.block)
+		sub, err = n.fastSyncSubscriptionForBlock(*accepted.block)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if sub == nil ||
 		sub == accepted.rebroadcast.subscription ||
 		!sub.isActive() ||
 		!sub.fastSync.spec.localValidator {
-		return nil
+		return nil, nil
 	}
-	return sub
+	return sub, nil
 }
 
 func (n *Node) sendFastSyncFanout(
@@ -1373,6 +1431,24 @@ func blockOverlayFanoutClass(kind string) (string, bool) {
 
 func blockOverlayFanoutKey(class string, block ton.BlockIDExt) string {
 	return class + ":" + storage.FormatBlockRef(block)
+}
+
+const (
+	blockOverlayFanoutRouteCustom   = "custom"
+	blockOverlayFanoutRoutePublic   = "public"
+	blockOverlayFanoutRouteFastSync = "fast-sync"
+)
+
+func blockOverlayRouteFanoutKey(
+	route string,
+	class string,
+	block ton.BlockIDExt,
+) string {
+	if route == blockOverlayFanoutRouteCustom &&
+		(class == "block" || class == "candidate") {
+		class = "block"
+	}
+	return blockOverlayFanoutKey(route+":"+class, block)
 }
 
 func fastSyncBroadcastSupported(msg any) bool {

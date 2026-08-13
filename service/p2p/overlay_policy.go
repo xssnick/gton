@@ -45,20 +45,26 @@ import (
 // membership, discovery, peer lifecycle
 // ---------------------------------------------------------------------------
 
+func (spec *overlaySpec) isPrivateOverlay() bool {
+	return spec.Kind == overlayKindPrivate
+}
+
 // seedsFromFixedNodes reports whether peers are dialled from a configured
 // roster instead of crawled out of the DHT by overlay id. Both roster kinds
 // know every member's ADNL id up front, so discovery would only rediscover what
 // the config already says.
 func (spec *overlaySpec) seedsFromFixedNodes() bool {
 	return spec.Kind == overlayKindCustomFixed ||
-		spec.Kind == overlayKindFastSync
+		spec.Kind == overlayKindFastSync ||
+		spec.Kind == overlayKindPrivate
 }
 
 // restrictsPeerIDs reports whether roster admission is limited to the ids in
 // FixedNodeIDs. FastSync answers the same question from its live roster instead
 // and is handled before this in acceptsPeerID.
 func (spec *overlaySpec) restrictsPeerIDs() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // adoptsInboundPeers reports whether a raw inbound transport joins the roster
@@ -66,14 +72,16 @@ func (spec *overlaySpec) restrictsPeerIDs() bool {
 // broadcast-receiver resolver instead, so an inbound stranger never becomes a
 // member there.
 func (spec *overlaySpec) adoptsInboundPeers() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // membersArePermanent is the per-overlay default for overlayPeer.fixedMember:
 // never evicted for capacity, starts alive=false, pinned in the pool. FastSync
 // overrides it per peer from its roster, so this is only the default.
 func (spec *overlaySpec) membersArePermanent() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // peersStartPending reports whether a freshly attached peer is untrusted until
@@ -102,7 +110,8 @@ func (spec *overlaySpec) shufflesSeedOrder() bool {
 // raise the transport budget to its own size: every member of a custom overlay
 // is expected to be reachable, so the generic cap would silently drop members.
 func (spec *overlaySpec) rosterSizesPeerLimit() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // usesDedicatedQueryPeers reports whether this overlay routes queries through
@@ -130,7 +139,8 @@ func (spec *overlaySpec) usesFastSyncPeerGossip() bool {
 // soft/hard transport recovery run here. A roster peer may carry no organic
 // outbound traffic for hours, so nothing else would ever notice its pair died.
 func (spec *overlaySpec) runsFixedPeerProbes() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // statusListsWholeRoster reports whether the status table renders every roster
@@ -140,7 +150,8 @@ func (spec *overlaySpec) runsFixedPeerProbes() bool {
 // even though they agree today — status formatting must not be coupled to probe
 // policy.
 func (spec *overlaySpec) statusListsWholeRoster() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // followsShardLifecycle reports whether the overlay is torn down by the
@@ -189,7 +200,8 @@ func (spec *overlaySpec) preferredAsQuerySource() bool {
 // privatePeerRoster reports that the roster must not be disclosed through
 // overlay.getRandomPeers.
 func (spec *overlaySpec) privatePeerRoster() bool {
-	return spec.Kind == overlayKindCustomFixed
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindPrivate
 }
 
 // enforcesAcceptQueries reports whether spec.AcceptQueries gates non-ping
@@ -232,13 +244,14 @@ func (spec *overlaySpec) drawsRandomQueryFallback() bool {
 // rather than a chain of predicates because the two durations are paired data:
 // every arm must populate both, and a zero jitter here would either panic in
 // rand.Int64N or spin the ping timer. TestOverlayProbeCadenceIsArmed pins that.
-var overlayProbeCadence = [3]struct {
+var overlayProbeCadence = [4]struct {
 	min    time.Duration
 	jitter time.Duration
 }{
 	overlayKindPublicShard: {min: peerPingMinDelay, jitter: peerPingJitter},
 	overlayKindCustomFixed: {min: customQueryProbeMinDelay, jitter: customQueryProbeJitter},
 	overlayKindFastSync:    {min: fastSyncPingMinDelay, jitter: fastSyncPingJitter},
+	overlayKindPrivate:     {min: customQueryProbeMinDelay, jitter: customQueryProbeJitter},
 }
 
 func (spec *overlaySpec) nextQueryProbeDelay() time.Duration {
@@ -286,6 +299,9 @@ func (spec *overlaySpec) authorizesBroadcastSenders() bool {
 // broadcast must not additionally be enqueued for overlay rebroadcast, or every
 // FEC broadcast is sent twice.
 func (spec *overlaySpec) relaysFECBroadcasts() bool {
+	if spec.Kind == overlayKindPrivate {
+		return spec.PrivateAllowLegacyBroadcasts
+	}
 	return spec.Kind != overlayKindCustomFixed
 }
 
@@ -298,10 +314,23 @@ func (spec *overlaySpec) usesPlumtree() bool {
 		spec.Kind == overlayKindFastSync && spec.FastSync.plumtreeEnabled
 }
 
+// tracksPlumtreeProducerRole reports that active validator sessions switch
+// this overlay between C++'s original-sender and receiver routing modes.
+// FastSync owns the same decision in its membership runtime instead.
+func (spec *overlaySpec) tracksPlumtreeProducerRole() bool {
+	return spec.Kind == overlayKindPublicShard
+}
+
 // usesTwoStepDelivery reports whether whole-roster overlay.broadcastTwostep is
 // available. The receiver wiring and startTwoStepRebroadcastWorker must agree
 // on this or requests queue forever, or the queue is never drained.
 func (spec *overlaySpec) usesTwoStepDelivery() bool {
+	return spec.Kind == overlayKindCustomFixed ||
+		spec.Kind == overlayKindFastSync ||
+		spec.Kind == overlayKindPrivate && spec.PrivateTwoStep
+}
+
+func (spec *overlaySpec) runsTwoStepRebroadcastWorker() bool {
 	return spec.Kind == overlayKindCustomFixed ||
 		spec.Kind == overlayKindFastSync
 }
@@ -366,6 +395,9 @@ func unauthorizedBroadcastLimit(kind overlayKind) uint32 {
 }
 
 func (spec *overlaySpec) unauthorizedBroadcastLimit() uint32 {
+	if spec.Kind == overlayKindPrivate {
+		return spec.PrivateUnauthenticatedBroadcast
+	}
 	return unauthorizedBroadcastLimit(spec.Kind)
 }
 
@@ -399,7 +431,7 @@ func (s *overlaySubscription) rebroadcastPlan(kind string, payloadLen int) rebro
 // gets the enrolment exchange, and a public peer gets capabilities plus gossip.
 func (s *overlaySubscription) warmupPeer(ctx context.Context, peer *overlayPeer) {
 	switch s.spec.Kind {
-	case overlayKindCustomFixed:
+	case overlayKindCustomFixed, overlayKindPrivate:
 		s.warmupCustomFixedPeer(ctx, peer)
 	case overlayKindFastSync:
 		s.warmupFastSyncPeer(ctx, peer)
@@ -412,7 +444,7 @@ func (s *overlaySubscription) warmupPeer(ctx context.Context, peer *overlayPeer)
 // target-selection guards, so this function deliberately has none.
 func (s *overlaySubscription) pingPeers(ctx context.Context) {
 	switch s.spec.Kind {
-	case overlayKindCustomFixed:
+	case overlayKindCustomFixed, overlayKindPrivate:
 		s.probeCustomQueryPeers(ctx)
 	case overlayKindFastSync:
 		s.pingFastSyncValidators(ctx)
@@ -424,7 +456,7 @@ func (s *overlaySubscription) pingPeers(ctx context.Context) {
 // queryCandidates ranks the peers a query may be sent to.
 func (s *overlaySubscription) queryCandidates(requiredVersionMajor, requiredVersionMinor int32) []*overlayPeer {
 	switch s.spec.Kind {
-	case overlayKindCustomFixed:
+	case overlayKindCustomFixed, overlayKindPrivate:
 		return s.customQueryCandidates(requiredVersionMajor, requiredVersionMinor)
 	case overlayKindFastSync:
 		return s.fastSyncQueryCandidates(

@@ -73,7 +73,6 @@ func CloneBlockState(state *BlockState) *BlockState {
 		StateRootHash:  bytes.Clone(state.StateRootHash),
 		StateFileHash:  bytes.Clone(state.StateFileHash),
 		MasterchainRef: cloneBlockIDPtr(state.MasterchainRef),
-		CellGeneration: state.CellGeneration,
 		Cell:           state.Cell,
 		Parsed:         state.Parsed,
 	}
@@ -85,7 +84,6 @@ func BlockStateWithoutCells(state *BlockState) BlockState {
 		StateRootHash:  bytes.Clone(state.StateRootHash),
 		StateFileHash:  bytes.Clone(state.StateFileHash),
 		MasterchainRef: cloneBlockIDPtr(state.MasterchainRef),
-		CellGeneration: state.CellGeneration,
 	}
 }
 
