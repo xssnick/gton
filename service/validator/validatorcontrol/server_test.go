@@ -280,6 +280,70 @@ func TestGetStatsReturnsNotReadyWithoutState(t *testing.T) {
 	assertControlError(t, result, controlNotReadyCode)
 }
 
+func TestGetStatsUsesBlockMetadataDuringInitialSync(t *testing.T) {
+	t.Parallel()
+
+	current := &storage.CurrentState{
+		ShardClientSeqno: 122,
+		Masterchain: storage.BlockState{
+			Block: ton.BlockIDExt{
+				Workchain: -1,
+				Shard:     int64(-1 << 63),
+				SeqNo:     123,
+				RootHash:  repeatedBytes(0xaa, 32),
+				FileHash:  repeatedBytes(0xbb, 32),
+			},
+		},
+	}
+	server := &Server{
+		state: fakeStateReader{
+			current: current,
+			meta:    &storage.BlockMeta{GenUTime: 1_699_999_998},
+		},
+		startedAt: time.Unix(1_699_999_000, 0),
+	}
+
+	stats, err := server.stats(t.Context())
+	if err != nil {
+		t.Fatalf("get stats during initial sync: %v", err)
+	}
+
+	values := make(map[string]string, len(stats.Stats))
+	for _, stat := range stats.Stats {
+		values[stat.Key] = stat.Value
+	}
+	if values["masterchainblocktime"] != "1699999998" {
+		t.Fatalf("masterchainblocktime = %q", values["masterchainblocktime"])
+	}
+	if values["shardclientmasterchainseqno"] != "122" ||
+		values["stateserializermasterchainseqno"] != "123" ||
+		values["last_deleted_mc_state"] != "123" {
+		t.Fatalf("unexpected sync progress stats: %#v", values)
+	}
+	if values["unixtime"] == "" || values["masterchainblock"] == "" {
+		t.Fatalf("missing sync stats: %#v", values)
+	}
+}
+
+func TestGetStatsReturnsNotReadyWithoutMasterchainMetadata(t *testing.T) {
+	t.Parallel()
+
+	server := &Server{
+		keys: &fakeKeys{},
+		state: fakeStateReader{
+			current: &storage.CurrentState{Masterchain: storage.BlockState{Block: ton.BlockIDExt{
+				RootHash: repeatedBytes(0xaa, 32),
+				FileHash: repeatedBytes(0xbb, 32),
+			}}},
+			metaErr: errors.New("metadata not found"),
+		},
+		logger: zerolog.Nop(),
+	}
+
+	result := server.execute(context.Background(), repeatedID(1), PermissionDefault, GetStats{})
+	assertControlError(t, result, controlNotReadyCode)
+}
+
 func startTestServer(
 	t *testing.T,
 	permissions uint32,
@@ -388,10 +452,16 @@ func assertControlError(t *testing.T, value tl.Serializable, code int32) {
 type fakeStateReader struct {
 	current *storage.CurrentState
 	err     error
+	meta    *storage.BlockMeta
+	metaErr error
 }
 
 func (r fakeStateReader) CurrentState(context.Context) (*storage.CurrentState, error) {
 	return r.current, r.err
+}
+
+func (r fakeStateReader) BlockMeta(context.Context, ton.BlockIDExt) (*storage.BlockMeta, error) {
+	return r.meta, r.metaErr
 }
 
 type fakeKeys struct {

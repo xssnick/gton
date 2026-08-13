@@ -16,6 +16,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 const (
@@ -41,6 +42,7 @@ type Keys interface {
 
 type StateReader interface {
 	CurrentState(ctx context.Context) (*storage.CurrentState, error)
+	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
 }
 
 type TrustedClient struct {
